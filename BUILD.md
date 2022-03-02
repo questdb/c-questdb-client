@@ -17,13 +17,15 @@ $ (cd build && make)
 
 The build will generate libraries compiled to `.build/install/`.
 
-You will find a dynamic library (`.dll`, `.dynlib` or `.so`) and either one or
-two static libraries (platform dependent).
+You will find one dynamic library and depending on
+the operating system either one or two static libraries.
 
 On platforms that support compiling with position independent code (Linux, Mac)
 we ship both a static library with `-fPIC` enabled and one with the option
 disabled. Use the former if you intend to link the static library into a dynamic
 library and use the latter if you intend to link it into an executable.
+If you intend to create your own language binding (e.g. for Python), then you
+probably want to use the `-fPIC` static library.
 On Windows there is just one static library you may use for all purposes.
 
 ## Running tests
