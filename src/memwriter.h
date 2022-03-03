@@ -31,7 +31,10 @@ void memwriter_char(memwriter* writer, char c);
 void memwriter_str(memwriter* writer, size_t len, const char* buf);
 
 void memwriter_printf(memwriter* writer, const char* fmt, ...)
-    __attribute__ ((format (printf, 2, 3)));
+#ifndef _MSC_VER
+    __attribute__ ((format (printf, 2, 3)))
+#endif
+    ;
 
 void memwriter_vprintf(memwriter* writer, const char* fmt, va_list ap);
 

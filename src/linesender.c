@@ -4,6 +4,7 @@
 
 #include <questdb/linesender.h>
 
+#include "build_env.h"
 #include "memwriter.h"
 #include "utf8.h"
 #include "aborting_malloc.h"
@@ -15,25 +16,54 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <arpa/inet.h>
+#include <sys/types.h>
+
+#if defined(PLATFORM_UNIX)
 #include <fcntl.h>
+#include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
-#include <sys/types.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#elif defined(PLATFORM_WINDOWS)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#endif
 
-_Static_assert((int)SOCK_STREAM == (int)linesender_tcp, "TCP enum matching");
-_Static_assert((int)SOCK_DGRAM == (int)linesender_udp, "UDP enum matching");
+#if defined(PLATFORM_UNIX)
+typedef int socketfd_t;
+#define CLOSESOCKET close
+typedef int errno_t;
+#ifndef INVALID_SOCKET
+#define INVALID_SOCKET -1
+#endif
+#ifndef SOCKET_ERROR
+#define SOCKET_ERROR -1
+#endif
+#elif defined(PLATFORM_WINDOWS)
+typedef SOCKET socketfd_t;
+#define CLOSESOCKET closesocket
+#endif
 
-// One-shot malloc and checked initialisation of all struct fields.
-#define CONSTRUCT(T, ...)            \
-  memcpy(aborting_malloc(sizeof(T)), \
-         &(T const){ __VA_ARGS__ },  \
-         sizeof(T))
+#if defined(PLATFORM_UNIX)
+typedef ssize_t sock_ssize_t;
+typedef size_t sock_len_t;
+#elif defined(PLATFORM_WINDOWS)
+typedef int sock_ssize_t;
+typedef int sock_len_t;
+#endif
 
-static const size_t max_udp_packet_size = 64000;
+#if defined(COMPILER_MSVC)
+#define UNREACHABLE() __assume(false)
+#elif defined(COMPILER_GNUC)
+#define UNREACHABLE() __builtin_unreachable()
+#endif
+
+STATIC_ASSERT((int)SOCK_STREAM == (int)linesender_tcp, "TCP enum matching");
+STATIC_ASSERT((int)SOCK_DGRAM == (int)linesender_udp, "UDP enum matching");
+
+static const sock_len_t max_udp_packet_size = 64000;
 
 typedef enum linesender_op
 {
@@ -59,7 +89,7 @@ static inline const char* linesender_op_str(linesender_op op)
         case linesender_op_flush:
             return "flush";
     }
-    __builtin_unreachable();
+    UNREACHABLE();
 }
 
 // We encode the state we're in as a bitmask of allowable follow-up API calls.
@@ -91,7 +121,7 @@ static inline const char* linesender_state_next_op_descr(linesender_state state)
         case linesender_state_moribund:
             return "unrecoverable state due to previous error";
     }
-    __builtin_unreachable();
+    UNREACHABLE();
 }
 
 struct linesender_error
@@ -101,11 +131,13 @@ struct linesender_error
     char* msg;
 };
 
+#if defined(COMPILER_GNUC)
 static linesender_error* err_printf(
     linesender_state* state,
     int errnum,
     const char* fmt,
     ...) __attribute__ ((format (printf, 3, 4)));
+#endif
 
 static linesender_error* err_printf(
     linesender_state* state,
@@ -123,12 +155,19 @@ static linesender_error* err_printf(
     va_end(args);
     size_t len = 0;
     char* msg = memwriter_steal_and_close(&msg_writer, &len);
-    return CONSTRUCT(linesender_error, errnum, len, msg);
+
+    linesender_error* err = aborting_malloc(sizeof(linesender_error));
+    err->errnum = errnum;
+    err->len = len;
+    err->msg = msg;
+    return err;
 }
 
-/** Thread-safe variant of `strerror` which mallocs. Follow-up with `free`. */
-static char* strerror_m(int errnum)
+// Threadsafe access to socket error description.
+// Follow-up with call to `sock_err_str`.
+static char* sock_err_str(errno_t errnum)
 {
+#if defined(PLATFORM_UNIX)
     size_t alloc_size = 128;
     char* buf = aborting_malloc(alloc_size);
     while (true)
@@ -149,6 +188,53 @@ static char* strerror_m(int errnum)
                 return buf;
         }
     }
+#elif defined(PLATFORM_WINDOWS)
+    char *msg = NULL;
+    if (!FormatMessage(
+        FORMAT_MESSAGE_FROM_SYSTEM
+            | FORMAT_MESSAGE_ALLOCATE_BUFFER
+            | FORMAT_MESSAGE_IGNORE_INSERTS,
+        NULL,
+        errnum,
+        MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+        (LPSTR)&msg,
+        0,
+        NULL))
+    {
+        const errno_t fmt_error = GetLastError();
+        // 64 > (len('Error  whilst formatting socket error ')
+        //       + (2 * len(str(max_len_errno))) + 1)
+        // where: max_len_errno == -2 ** 31
+        const size_t alloc_size = 64;
+        msg = LocalAlloc(LMEM_FIXED, alloc_size);
+        if (!msg)
+            abort();
+        snprintf(
+            msg,
+            alloc_size,
+            "Error %d whilst formatting socket error %d",
+            fmt_error, errnum);
+    }
+    return msg;
+#endif
+}
+
+static void sock_err_str_free(char* msg)
+{
+#if defined(PLATFORM_UNIX)
+    free(msg);
+#elif defined(PLATFORM_WINDOWS)
+    LocalFree(msg);
+#endif
+}
+
+static errno_t get_last_sock_err()
+{
+#if defined(PLATFORM_UNIX)
+    return errno;
+#elif defined(PLATFORM_WINDOWS)
+    return WSAGetLastError();
+#endif
 }
 
 int linesender_error_errnum(const linesender_error* err)
@@ -252,7 +338,7 @@ static struct addrinfo* resolve_addr(
     hints.ai_family = AF_INET;
     hints.ai_socktype = transport;  // matches SOCK_STREAM or SOCK_DGRAM
     struct addrinfo* addr = NULL;
-    int gai_err_code = getaddrinfo(host, port, &hints, &addr);
+    errno_t gai_err_code = getaddrinfo(host, port, &hints, &addr);
     if (gai_err_code)
     {
         size_t host_descr_len = 0;
@@ -262,6 +348,13 @@ static struct addrinfo* resolve_addr(
             size_t port_descr_len = 0;
             char* port_descr = describe_buf(
                 strlen(port), port, &port_descr_len);
+#if defined(PLATFORM_UNIX)
+            const char* gai_err_descr = gai_strerror(gai_err_code);
+#elif defined(PLATFORM_WINDOWS)
+            // `gai_strerror` is thread-safe on Linux, but not Windows
+            // where we need to use `FormatMessage` instead.
+            char* gai_err_descr = sock_err_str(gai_err_code);
+#endif
             *err_out = err_printf(
                 NULL,
                 0,  // Note: gai_err_code != errno
@@ -270,9 +363,12 @@ static struct addrinfo* resolve_addr(
                 host_descr,
                 (int)port_descr_len,
                 port_descr,
-                gai_strerror(gai_err_code));
+                gai_err_descr);
             free(host_descr);
             free(port_descr);
+#if defined(PLATFORM_WINDOWS)
+            sock_err_str_free(gai_err_descr);
+#endif
         }
         else
         {
@@ -312,7 +408,7 @@ static inline bool check_state(
 struct linesender
 {
     linesender_transport transport;
-    int sock_fd;
+    socketfd_t sock_fd;
     struct addrinfo* dest_info;
     linesender_state state;
     memwriter writer;
@@ -321,7 +417,7 @@ struct linesender
 
 linesender* linesender_connect(
     linesender_transport transport,
-    const char* interface,
+    const char* net_interface,
     const char* host,
     const char* port,
     int udp_multicast_ttl,
@@ -343,7 +439,7 @@ linesender* linesender_connect(
 
     struct addrinfo* dest_info = NULL;
     struct addrinfo* if_info = NULL;
-    int sock_fd = 0;
+    socketfd_t sock_fd = 0;
 
     dest_info = resolve_addr(
         transport, host, port, err_out);
@@ -351,7 +447,7 @@ linesender* linesender_connect(
         goto error_cleanup;
 
     if_info = resolve_addr(
-        transport, interface, NULL, err_out);
+        transport, net_interface, NULL, err_out);
     if (!if_info)
         goto error_cleanup;
 
@@ -359,29 +455,33 @@ linesender* linesender_connect(
         dest_info->ai_family,
         dest_info->ai_socktype,
         dest_info->ai_protocol);
-    if (sock_fd == -1)
+    if (sock_fd == INVALID_SOCKET)
     {
-        char* err_descr = strerror_m(errno);
+        const errno_t errnum = get_last_sock_err();
+        char* err_descr = sock_err_str(errnum);
         *err_out = err_printf(
             NULL,
-            errno,
+            errnum,
             "Could not open TCP socket: %s.",
             err_descr);
-        free(err_descr);
+        sock_err_str_free(err_descr);
         goto error_cleanup;
     }
 
+#if defined(PLATFORM_UNIX)
     if (fcntl(sock_fd, F_SETFD, FD_CLOEXEC) == -1)
     {
-        char* err_descr = strerror_m(errno);
+        const errno_t errnum = get_last_sock_err();
+        char* err_descr = sock_err_str(errnum);
         *err_out = err_printf(
             NULL,
-            errno,
+            errnum,
             "Could not set FD_CLOEXEC on socket: %s.",
             err_descr);
-        free(err_descr);
+        sock_err_str_free(err_descr);
         goto error_cleanup;
     }
+#endif
 
     if (transport == linesender_tcp)
     {
@@ -397,15 +497,16 @@ linesender* linesender_connect(
             IPPROTO_TCP,
             TCP_NODELAY,
             (char *) &no_delay,
-            sizeof(int)) == -1)
+            sizeof(int)) == SOCKET_ERROR)
         {
-            char* err_descr = strerror_m(errno);
+            const errno_t errnum = get_last_sock_err();
+            char* err_descr = sock_err_str(errnum);
             *err_out = err_printf(
                 NULL,
-                errno,
+                errnum,
                 "Could not set TCP_NODELAY: %s.",
                 err_descr);
-            free(err_descr);
+            sock_err_str_free(err_descr);
             goto error_cleanup;
         }
     }
@@ -420,7 +521,7 @@ linesender* linesender_connect(
                 sock_fd,
                 IPPROTO_IP,
                 IP_MULTICAST_IF,
-                ip_address,
+                (const void*)ip_address,
                 sizeof(struct in_addr));
         }
         else  // IPv6
@@ -431,20 +532,21 @@ linesender* linesender_connect(
                 sock_fd,
                 IPPROTO_IP,
                 IPV6_MULTICAST_IF,
-                ip_address,
+                (const void*)ip_address,
                 sizeof(struct in6_addr));
         }
 
-        if (set_res == -1)
+        if (set_res == SOCKET_ERROR)
         {
-            char* err_descr = strerror_m(errno);
+            const errno_t errnum = get_last_sock_err();
+            char* err_descr = sock_err_str(errnum);
             *err_out = err_printf(
                 NULL,
-                errno,
+                errnum,
                 "Could not set UDP sending-from address to `%s`: %s.",
-                interface,
+                net_interface,
                 err_descr);
-            free(err_descr);
+            sock_err_str_free(err_descr);
             goto error_cleanup;
         }
 
@@ -454,7 +556,7 @@ linesender* linesender_connect(
                 sock_fd,
                 IPPROTO_IP,
                 IP_MULTICAST_TTL,
-                &udp_multicast_ttl,
+                (const void*)&udp_multicast_ttl,
                 sizeof(int));
         }
         else  // IPv6
@@ -463,50 +565,54 @@ linesender* linesender_connect(
                 sock_fd,
                 IPPROTO_IP,
                 IPV6_MULTICAST_HOPS,
-                &udp_multicast_ttl,
+                (const void*)&udp_multicast_ttl,
                 sizeof(int));
         }
 
-        if (set_res == -1)
+        if (set_res == SOCKET_ERROR)
         {
-            char* err_descr = strerror_m(errno);
+            const errno_t errnum = get_last_sock_err();
+            char* err_descr = sock_err_str(errnum);
             *err_out = err_printf(
                 NULL,
-                errno,
+                errnum,
                 "Could not set UDP TTL (max network hops) to `%d`: %s.",
                 udp_multicast_ttl,
                 err_descr);
-            free(err_descr);
+            sock_err_str_free(err_descr);
             goto error_cleanup;
         }
     }
 
-    if (bind(sock_fd, if_info->ai_addr, dest_info->ai_addrlen) == -1)
+    sock_len_t addrlen = (sock_len_t)dest_info->ai_addrlen;
+    if (bind(sock_fd, if_info->ai_addr, addrlen) == SOCKET_ERROR)
     {
-        char* err_descr = strerror_m(errno);
+        const errno_t errnum = get_last_sock_err();
+        char* err_descr = sock_err_str(errnum);
         *err_out = err_printf(
             NULL,
-            errno,
+            errnum,
             "Could not bind to interface address `%s`: %s.",
-            interface,
+            net_interface,
             err_descr);
-        free(err_descr);
+        sock_err_str_free(err_descr);
         goto error_cleanup;
     }
 
     if (transport == linesender_tcp)
     {
-        if (connect(sock_fd, dest_info->ai_addr, dest_info->ai_addrlen) == -1)
+        if (connect(sock_fd, dest_info->ai_addr, addrlen) == SOCKET_ERROR)
         {
-            char* err_descr = strerror_m(errno);
+            const errno_t errnum = get_last_sock_err();
+            char* err_descr = sock_err_str(errnum);
             *err_out = err_printf(
                 NULL,
-                errno,
+                errnum,
                 "Could not connect to `%s:%s`: %s.",
                 host,
                 port,
                 err_descr);
-            free(err_descr);
+            sock_err_str_free(err_descr);
             goto error_cleanup;
         }
     }
@@ -516,15 +622,14 @@ linesender* linesender_connect(
 
     memwriter writer;
     memwriter_open(&writer, max_udp_packet_size);
-    linesender* sender = CONSTRUCT(
-        linesender,
-        transport,
-        sock_fd,
-        dest_info,
-        linesender_state_connected,
-        writer,
-        0);
 
+    linesender* sender = aborting_malloc(sizeof(linesender));
+    sender->transport = transport;
+    sender->sock_fd = sock_fd;
+    sender->dest_info = dest_info;
+    sender->state = linesender_state_connected;
+    sender->writer = writer;
+    sender->last_line_start = 0;
     return sender;
 
 error_cleanup:
@@ -533,7 +638,7 @@ error_cleanup:
     if (if_info)
         freeaddrinfo(if_info);
     if (sock_fd)
-        close(sock_fd);
+        CLOSESOCKET(sock_fd);
     return NULL;
 }
 
@@ -556,7 +661,7 @@ static inline bool check_utf8(
                 "Bad string \"%.*s\": "
                 "Invalid UTF-8. "
                 "Incomplete multi-byte codepoint at end of string. "
-                "Bad codepoint starting at byte index %zu.",
+                "Bad codepoint starting at byte index %" PRI_SIZET ".",
                 (int)buf_descr_len,
                 buf_descr,
                 u8err.valid_up_to);
@@ -568,7 +673,7 @@ static inline bool check_utf8(
                 0,
                 "Bad string \"%.*s\": "
                 "Invalid UTF-8. "
-                "Illegal codepoint starting at byte index %zu.",
+                "Illegal codepoint starting at byte index %" PRI_SIZET ".",
                 (int)buf_descr_len,
                 buf_descr,
                 u8err.valid_up_to);
@@ -640,7 +745,8 @@ static inline bool check_key_name(
                         0,
                         "Bad string \"%.*s\": "
                         "metric, tag and field names can't contain a '%.*s' "
-                        "character, which was found at byte position %zu.",
+                        "character, which was found at byte position "
+                        "%" PRI_SIZET ".",
                         (int)name_descr_len,
                         name_descr,
                         (int)escaped_len,
@@ -667,7 +773,8 @@ static inline bool check_key_name(
                 0,
                 "Bad string \"%.*s\": "
                 "metric, tag and field names can't contain a UTF-8 BOM "
-                "character, which was found at byte position %zu.",
+                "character, which was found at byte position "
+                "%" PRI_SIZET ".",
                 (int)name_descr_len,
                 name_descr,
                 index);
@@ -875,15 +982,15 @@ static inline bool check_udp_max_line_len(
         const size_t current_line_len =
             linesender_pending_size(sender) - sender->last_line_start;
 
-        if (current_line_len > max_udp_packet_size)
+        if (current_line_len > (size_t)max_udp_packet_size)
         {
             *err_out = err_printf(
                 &sender->state,
                 0,
                 "Current line is too long to be sent via UDP. "
-                "Byte size %zu > %zu.",
+                "Byte size %" PRI_SIZET " > %" PRI_SIZET ".",
                 current_line_len,
-                max_udp_packet_size);
+                (size_t)max_udp_packet_size);
             return false;
         }
     }
@@ -934,16 +1041,16 @@ size_t linesender_pending_size(linesender* sender)
         : 0;
 }
 
-static inline bool send_tcp(linesender* sender, size_t len, const char* buf)
+static inline bool send_tcp(linesender* sender, sock_len_t len, const char* buf)
 {
     while (len)
     {
-        ssize_t send_res = send(
+        sock_ssize_t send_res = send(
             sender->sock_fd,
             buf,
             len,
             0);
-        if (send_res != -1)
+        if (send_res != SOCKET_ERROR)
         {
             buf += (size_t)send_res;
             len -= (size_t)send_res;
@@ -956,15 +1063,15 @@ static inline bool send_tcp(linesender* sender, size_t len, const char* buf)
     return true;
 }
 
-static inline bool send_udp(linesender* sender, size_t len, const char* buf)
+static inline bool send_udp(linesender* sender, sock_len_t len, const char* buf)
 {
     while (len)
     {
-        size_t boundary = (len < max_udp_packet_size)
+        sock_len_t boundary = (len < max_udp_packet_size)
             ? len
             : max_udp_packet_size;
 
-        for (size_t index = boundary; index-- > 0;)
+        for (sock_len_t index = boundary; index-- > 0;)
         {
             const char last = buf[index];
 
@@ -980,18 +1087,18 @@ static inline bool send_udp(linesender* sender, size_t len, const char* buf)
             }
         }
 
-        ssize_t send_res = sendto(
+        sock_ssize_t send_res = sendto(
             sender->sock_fd,
             buf,
             boundary,
             0,
             sender->dest_info->ai_addr,
-            sender->dest_info->ai_addrlen);
+            (sock_len_t)sender->dest_info->ai_addrlen);
 
         // We're sending UDP where `sendto` can't send less than a full packet.
         // As we've validated our buffer to be less than a maximum packet size,
         // we don't need to be concerned with partial writes.
-        if (send_res != -1)
+        if (send_res != SOCKET_ERROR)
         {
             buf += boundary;
             len -= boundary;
@@ -1015,17 +1122,18 @@ bool linesender_flush(
     const char* buf = memwriter_peek(&sender->writer, &len);
 
     const bool send_ok = (sender->transport == linesender_tcp)
-        ? send_tcp(sender, len, buf)
-        : send_udp(sender, len, buf);
+        ? send_tcp(sender, (sock_len_t)len, buf)
+        : send_udp(sender, (sock_len_t)len, buf);
     if (!send_ok)
     {
-        char* err_descr = strerror_m(errno);
+        const errno_t errnum = get_last_sock_err();
+        char* err_descr = sock_err_str(errnum);
         *err_out = err_printf(
             &sender->state,
-            errno,
+            errnum,
             "Could not flush buffered messages: %s.",
             err_descr);
-        free(err_descr);
+        sock_err_str_free(err_descr);
         return false;
     }
 
@@ -1042,7 +1150,7 @@ bool linesender_must_close(linesender* sender)
 void linesender_close(linesender* sender)
 {
     memwriter_close(&sender->writer);
-    close(sender->sock_fd);
+    CLOSESOCKET(sender->sock_fd);
     freeaddrinfo(sender->dest_info);
     free(sender);
 }

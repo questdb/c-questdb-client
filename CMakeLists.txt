@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.10.0)
+cmake_minimum_required(VERSION 3.15.0)
 project(c-questdb-client VERSION 1.0.0)
 
 set(CPACK_PROJECT_NAME ${PROJECT_NAME})
@@ -27,9 +27,18 @@ set(lib_sources
 
 function(set_compile_flags TARGET_NAME)
     if(MSVC)
+        # We disable warning C5105 via `/wd5105`
+        # to work around non-C11-compliant 
+        # code in WinBase.h which is included from
+        # #include <winsock2.h>
+        # See: https://docs.microsoft.com/en-us/cpp/
+        #   error-messages/compiler-warnings/c5105?view=msvc-170
+        # And: https://developercommunity2.visualstudio.com/t/
+        #   std:c17-generates-warning-compiling-Win/1249671?preview=true
+        # The warning is not applicable in new releases of the Windows SDK.
         target_compile_options(
             ${TARGET_NAME} PRIVATE
-            /W4 /WX)
+            /W4 /WX $<$<COMPILE_LANGUAGE:C>:/wd5105>)
     else()
         target_compile_options(
             ${TARGET_NAME} PRIVATE
@@ -45,6 +54,9 @@ target_include_directories(
     c_questdb_client
     PUBLIC ${CMAKE_SOURCE_DIR}/include)
 set_compile_flags(c_questdb_client)
+if(WIN32)
+  target_link_libraries(c_questdb_client wsock32 ws2_32)
+endif()
 
 # Static Library
 add_library(
@@ -54,6 +66,9 @@ target_include_directories(
     c_questdb_client_static
     PUBLIC ${CMAKE_SOURCE_DIR}/include)
 set_compile_flags(c_questdb_client_static)
+if(WIN32)
+  target_link_libraries(c_questdb_client_static wsock32 ws2_32)
+endif()
 
 # Static Library w/ -fPIC
 if (UNIX)
@@ -73,6 +88,7 @@ endif (UNIX)
 add_executable(
     test_linesender
     test/mock_server.cpp
+    test/wsastartup_guard.cpp
     test/test_linesender.cpp)
 target_link_libraries(
     test_linesender

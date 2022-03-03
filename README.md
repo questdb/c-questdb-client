@@ -13,12 +13,14 @@
 
 Prepare your system with:
   * A C/C++ compiler which supports C11 and C++17.
-  * CMake 3.10.0 or greater.
+  * CMake 3.15.0 or greater.
 
 Then follow the [build instructions](BUILD.md).
 
 If you happen to also use CMake in your own project, you can include it as an
 [external cmake dependency](CMAKE_DEPENDENCY.md).
+
+**Note**: The code currently only targets 64-bit platforms.
   
 ## Usage
 
@@ -56,7 +58,7 @@ auto sender = questdb::proto::line::sender{
 
 ```
 
-See a [complete example in C++](examples/linesender_example.c).
+See a [complete example in C++](examples/linesender_example.cpp).
 
 ### How to use the API
 The API is sequentially coupled, meaning that methods need to be called in a
@@ -171,7 +173,7 @@ settings.
 
 ### Ingestion protocol behaviour
 If you're still not succeeding, note that the same port is used for both TCP
-and UDP and once data is sent using once transport the other transport will be
+and UDP and once data is sent using one transport the other transport will be
 ignored.
 
 ### API usage

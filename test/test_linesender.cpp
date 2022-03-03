@@ -2,6 +2,7 @@
 #include "doctest.h"
 
 #include "mock_server.hpp"
+#include "wsastartup_guard.hpp"
 
 #include <questdb/linesender.h>
 #include <questdb/linesender.hpp>
@@ -9,9 +10,31 @@
 
 #include <vector>
 
+extern "C"
+{
+#include "../src/next_pow2.inc.c"
+}
+
+TEST_CASE("next_pow2")
+{
+    CHECK(next_pow2(2) == 2);
+    CHECK(next_pow2(3) == 4);
+    CHECK(next_pow2(4) == 4);
+    CHECK(next_pow2(5) == 8);
+    CHECK(next_pow2(6) == 8);
+    CHECK(next_pow2(7) == 8);
+    CHECK(next_pow2(8) == 8);
+    CHECK(next_pow2(9) == 16);
+    CHECK(next_pow2(64000) == 65536);
+    CHECK(next_pow2(65535) == 65536);
+    CHECK(next_pow2(65536) == 65536);
+    CHECK(next_pow2(65537) == 131072);
+    CHECK(next_pow2(100000) == 131072);
+}
 
 TEST_CASE("utf8: good ascii")
 {
+    WSASTARTUP_GUARD;
     const char buf[] = "abc";
     const size_t len = sizeof(buf) - 1;
     CHECK(len == 3);
@@ -22,6 +45,7 @@ TEST_CASE("utf8: good ascii")
 
 TEST_CASE("utf8: ff ff - bad byte 2")
 {
+    WSASTARTUP_GUARD;
     const char buf[] = "\xff\xff";
     const size_t len = sizeof(buf) - 1;
 
@@ -35,6 +59,7 @@ TEST_CASE("utf8: ff ff - bad byte 2")
 
 TEST_CASE("utf8: partial infinity symbol - need more")
 {
+    WSASTARTUP_GUARD;
     // First 2 chars of infinity symbol.
     const char buf[] = "\xe2\x88";  // \x9e
     const size_t len = sizeof(buf) - 1;
@@ -49,6 +74,7 @@ TEST_CASE("utf8: partial infinity symbol - need more")
 
 TEST_CASE("utf8: Error after valid text")
 {
+    WSASTARTUP_GUARD;
     // 'abc' + First 2 chars of infinity symbol.
     const char buf[] = "abc\xe2\x88";  // \x9e
     const size_t len = sizeof(buf) - 1;
@@ -73,8 +99,9 @@ private:
 
 TEST_CASE("linesender c api basics")
 {
+    WSASTARTUP_GUARD;
     for (auto transport : {linesender_tcp, linesender_udp})
-    {
+    {    
         questdb::proto::line::test::mock_server
             server{transport == linesender_tcp};
         linesender_error* err = nullptr;
@@ -105,12 +132,13 @@ TEST_CASE("linesender c api basics")
         CHECK(linesender_pending_size(sender) == 27);
         CHECK(linesender_flush(sender, &err));
         CHECK(server.recv() == 1);
-        CHECK(server.msgs().front() == "test,t1=v1 f1=0.5 10000000\n");
+        CHECK(server.msgs().front() == "test,t1=v1 f1=0.5 10000000\n");    
     }
 }
 
 TEST_CASE("linesender c++ api basics")
 {
+    WSASTARTUP_GUARD;
     const auto transports = {
         questdb::proto::line::transport::tcp,
         questdb::proto::line::transport::udp};
@@ -142,6 +170,7 @@ TEST_CASE("linesender c++ api basics")
 
 TEST_CASE("State machine testing -- flush without data.")
 {
+    WSASTARTUP_GUARD;
     questdb::proto::line::sender sender{
         questdb::proto::line::transport::udp,
         "localhost",
@@ -160,6 +189,7 @@ TEST_CASE("State machine testing -- flush without data.")
 
 TEST_CASE("State machine testing -- endline without fields.")
 {
+    WSASTARTUP_GUARD;
     questdb::proto::line::sender sender{
         questdb::proto::line::transport::udp,
         "localhost",
@@ -178,6 +208,7 @@ TEST_CASE("State machine testing -- endline without fields.")
 
 TEST_CASE("Bad UTF-8 in metric")
 {
+    WSASTARTUP_GUARD;
     questdb::proto::line::sender sender{
         questdb::proto::line::transport::udp,
         "localhost",
@@ -192,6 +223,7 @@ TEST_CASE("Bad UTF-8 in metric")
 
 TEST_CASE("Validation of overly large UDP line.")
 {
+    WSASTARTUP_GUARD;
     questdb::proto::line::sender sender{
         questdb::proto::line::transport::udp,
         "localhost",
@@ -225,6 +257,7 @@ TEST_CASE("Validation of overly large UDP line.")
 
 TEST_CASE("Validation of bad chars in key names.")
 {
+    WSASTARTUP_GUARD;
     {
         questdb::proto::line::sender sender{
             questdb::proto::line::transport::udp,
@@ -273,6 +306,7 @@ TEST_CASE("Validation of bad chars in key names.")
 
 TEST_CASE("Move testing.")
 {
+    WSASTARTUP_GUARD;
     questdb::proto::line::sender sender1{
         questdb::proto::line::transport::udp,
         "localhost",

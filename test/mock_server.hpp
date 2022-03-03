@@ -1,9 +1,19 @@
 #pragma once
 
+#include "../src/build_env.h"
+
 #include <vector>
 #include <string>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
+
+#if defined(PLATFORM_UNIX)
+typedef int socketfd_t;
+#elif defined(PLATFORM_WINDOWS)
+#include <winsock2.h>
+typedef SOCKET socketfd_t;
+#endif
 
 namespace questdb::proto::line::test
 {
@@ -34,8 +44,8 @@ private:
     bool wait_for_data(std::optional<double> wait_timeout_sec = std::nullopt);
 
     bool _tcp;
-    int _listen_fd;
-    int _conn_fd;
+    socketfd_t _listen_fd;
+    socketfd_t _conn_fd;
     uint16_t _port;
     std::vector<std::string> _msgs;
 };

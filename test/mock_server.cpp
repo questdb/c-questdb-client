@@ -1,22 +1,48 @@
 #include "mock_server.hpp"
 
 #include <string.h>
-#include <arpa/inet.h>
+
+#if defined(PLATFORM_UNIX)
 #include <fcntl.h>
+#include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#elif defined(PLATFORM_WINDOWS)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#endif
+
+#if defined(PLATFORM_UNIX)
+#define CLOSESOCKET close
+typedef const void* setsockopt_arg_t;
+#ifndef INVALID_SOCKET
+#define INVALID_SOCKET -1
+#endif
+#elif defined(PLATFORM_WINDOWS)
+#define CLOSESOCKET closesocket
+typedef const char* setsockopt_arg_t;
+typedef long suseconds_t;
+#endif
+
+#if defined(PLATFORM_UNIX)
+typedef ssize_t sock_ssize_t;
+typedef size_t sock_len_t;
+#elif defined(PLATFORM_WINDOWS)
+typedef int sock_ssize_t;
+typedef int sock_len_t;
+#endif
 
 namespace questdb::proto::line::test
 {
 
 mock_server::mock_server(bool tcp)  // false for `udp`.
     : _tcp{tcp}
-    , _listen_fd{-1}
-    , _conn_fd{-1}
+    , _listen_fd{0}
+    , _conn_fd{0}
     , _port{0}
     , _msgs{}
 {
@@ -30,9 +56,18 @@ mock_server::mock_server(bool tcp)  // false for `udp`.
             _listen_fd,
             SOL_SOCKET,
             SO_REUSEADDR,
-            &reuse_addr,
-            sizeof(reuse_addr)) == -1)
+            static_cast<setsockopt_arg_t>(static_cast<const void*>(
+                &reuse_addr)),
+            sizeof(reuse_addr)) != 0)
+    {
+#if defined(PLATFORM_UNIX)
+        perror("Bad SO_REUSEADDR");
         throw std::runtime_error{"Bad SO_REUSEADDR."};
+#elif defined(PLATFORM_WINDOWS)
+        std::string last_err_num = std::to_string(WSAGetLastError());
+        throw std::runtime_error("Bad SO_REUSEADDR: " + last_err_num);
+#endif
+    }
 
     sockaddr_in listen_addr;
     memset(&listen_addr, 0, sizeof(listen_addr));
@@ -61,7 +96,7 @@ mock_server::mock_server(bool tcp)  // false for `udp`.
     if (!_tcp)
     {
         _conn_fd = _listen_fd;
-        _listen_fd = -1;
+        _listen_fd = 0;
     }
 }
 
@@ -75,9 +110,14 @@ void mock_server::accept()
             _listen_fd,
             (sockaddr *)&remote_addr,
             &remote_addr_len);
-        if (_conn_fd == -1)
+        if (_conn_fd == INVALID_SOCKET)
             throw std::runtime_error{"Bad `accept()`."};
+#if defined(PLATFORM_UNIX)
         fcntl(_conn_fd, F_SETFL, O_NONBLOCK);
+#elif defined(PLATFORM_WINDOWS)
+        u_long mode = 1;
+        ioctlsocket(_conn_fd, FIONBIO, &mode);
+#endif
     }
 }
 
@@ -90,14 +130,18 @@ bool mock_server::wait_for_data(std::optional<double> wait_timeout_sec)
     timeval timeout;
     if (wait_timeout_sec)
     {
+#if defined(PLATFORM_UNIX)
         const time_t secs = static_cast<time_t>(*wait_timeout_sec);
+#elif defined(PLATFORM_WINDOWS)
+        const long secs = static_cast<long>(*wait_timeout_sec);
+#endif
         const suseconds_t usec =
             static_cast<suseconds_t>(
                 1000000.0 * (*wait_timeout_sec - static_cast<double>(secs)));
         timeout = timeval{secs, usec};
         timeout_ptr = &timeout;
     }
-    int nfds = _conn_fd + 1;
+    int nfds = static_cast<int>(_conn_fd) + 1;
     int count = ::select(nfds, &read_set, nullptr, nullptr, timeout_ptr);
     if (count == -1)
         throw std::runtime_error{"Bad `select()`."};
@@ -115,10 +159,14 @@ size_t mock_server::recv(double wait_timeout_sec)
     for (;;)
     {
         wait_for_data();
-        ssize_t count = 0;
+        sock_ssize_t count = 0;
         if (_tcp)
         {
-            count = ::recv(_conn_fd, &chunk, chunk_len, 0);
+            count = ::recv(
+                _conn_fd,
+                &chunk[0],
+                static_cast<sock_len_t>(chunk_len),
+                0);
         }
         else
         {
@@ -126,8 +174,8 @@ size_t mock_server::recv(double wait_timeout_sec)
             socklen_t src_addr_len{sizeof(src_addr)};
             count = ::recvfrom(
                 _conn_fd,
-                &chunk,
-                chunk_len,
+                &chunk[0],
+                static_cast<sock_len_t>(chunk_len),
                 0,
                 (sockaddr *)&src_addr,
                 &src_addr_len);
@@ -162,10 +210,10 @@ size_t mock_server::recv(double wait_timeout_sec)
 
 mock_server::~mock_server()
 {
-    if (_conn_fd != -1)
-        close(_conn_fd);
-    if (_listen_fd != -1)
-        close(_listen_fd);
+    if (_conn_fd)
+        CLOSESOCKET(_conn_fd);
+    if (_listen_fd)
+        CLOSESOCKET(_listen_fd);
 }
 
 }

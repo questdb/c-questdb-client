@@ -9,30 +9,7 @@
 #define __STDC_FORMAT_MACROS
 #include <inttypes.h>
 
-/**
- * Calculate the next power of two.
- *
- * Here are some example inputs / outputs to understand behaviour:
- *     next_pow2(0): 1
- *     next_pow2(1): 2
- *     next_pow2(2): 2
- *     next_pow2(3): 4
- *     next_pow2(4): 4
- *     next_pow2(5): 8
- *     next_pow2(6): 8
- *     next_pow2(7): 8
- *     next_pow2(8): 8
- *
- * Note that 0 is a special case that returns 1.
- */
-static size_t next_pow2(size_t n)
-{
-    // See: https://jameshfisher.com/2018/03/30/round-up-power-2/
-    // We don't care about the 0 case as we ensure our malloc
-    // size is never below 64.
-    _Static_assert(sizeof(size_t) == 8, "64-bit only support");
-    return ((size_t)1) << (64 - __builtin_clzl(n - 1));
-}
+#include "next_pow2.inc.c"
 
 void memwriter_open(memwriter* writer, size_t capacity)
 {
@@ -73,7 +50,11 @@ void memwriter_rewind(memwriter* writer)
     writer->tail = writer->head;
 }
 
-#define unlikely(x) __builtin_expect((x),0)
+#if defined(COMPILER_GNUC)
+#define unlikely(x) __builtin_expect((x), 0)
+#elif defined(COMPILER_MSVC)
+#define unlikely(x) (x)
+#endif
 
 char* memwriter_book(memwriter* writer, size_t needed)
 {
