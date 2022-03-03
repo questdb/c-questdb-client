@@ -1,7 +1,3 @@
-Build Infra
------------
-  * Enable: `-Wall -Werror -pedanic` flags (or MSVC equivalents).
-
 Implementation
 --------------
   * Add Windows support (MSVC).

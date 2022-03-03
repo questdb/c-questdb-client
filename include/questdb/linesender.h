@@ -3,18 +3,6 @@
 /**
  * Connect to QuestDB and send data using the InfluxDB Line Protocol.
  *
- * Sequential coupling of the APIs is documented in an EBNF-style grammar as:
- *
- *     linesender_connect,
- *     (
- *       linesender_metric,
- *       linesender_tag*,
- *       linesender_field...+
- *       linesender_end_line...,
- *       linesender_flush?
- *     )*,
- *     linesender_close
- *
  * Functions return `true` to indicate success.
  * In case of errors, you must always follow-up any error-yeilding call
  * with `linesender_close`.

@@ -25,6 +25,18 @@ set(lib_sources
     src/memwriter.c
     src/utf8.c)
 
+function(set_compile_flags TARGET_NAME)
+    if(MSVC)
+        target_compile_options(
+            ${TARGET_NAME} PRIVATE
+            /W4 /WX)
+    else()
+        target_compile_options(
+            ${TARGET_NAME} PRIVATE
+            -Wall -Wextra -Wpedantic -Werror)
+    endif()
+endfunction()
+
 # Shared Library
 add_library(
     c_questdb_client SHARED
@@ -32,6 +44,7 @@ add_library(
 target_include_directories(
     c_questdb_client
     PUBLIC ${CMAKE_SOURCE_DIR}/include)
+set_compile_flags(c_questdb_client)
 
 # Static Library
 add_library(
@@ -40,6 +53,7 @@ add_library(
 target_include_directories(
     c_questdb_client_static
     PUBLIC ${CMAKE_SOURCE_DIR}/include)
+set_compile_flags(c_questdb_client_static)
 
 # Static Library w/ -fPIC
 if (UNIX)
@@ -52,6 +66,7 @@ if (UNIX)
     target_include_directories(
         c_questdb_client_static_pic
         PUBLIC ${CMAKE_SOURCE_DIR}/include)
+    set_compile_flags(c_questdb_client_static_pic)
 endif (UNIX)
 
 # Test binary.
@@ -65,6 +80,8 @@ target_link_libraries(
 target_include_directories(
     test_linesender
     PUBLIC ${CMAKE_SOURCE_DIR}/include)
-add_test(NAME test_linesender
+set_compile_flags(test_linesender)
+add_test(
+    NAME test_linesender
     COMMAND test_linesender)
 

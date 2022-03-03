@@ -9,7 +9,7 @@
 
 ```bash
 $ cmake -S . -B build \
-  -DCMAKE_BUILD_TYPE=Release  # .. or -DCMAKE_BUILD_TYPE=Debug
+  -DCMAKE_BUILD_TYPE=Release  # .. or -DCMAKE_BUILD_TYPE=Debug for debugging.
 $ (cd build && make)
 ```
 
@@ -31,13 +31,14 @@ On Windows there is just one static library you may use for all purposes.
 ## Running tests
 
 ```bash
-$ (cd build && make test)
+$ (cd build && ctest)
 ```
 
 ## Cleaning
 
+Delete the `./build` directory.
+
 ```bash
-$ (cd build && make clean)
+$ rm -fR build
 ```
 
-Or more simply just delete the `./build` directory.
