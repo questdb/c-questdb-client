@@ -181,6 +181,21 @@ is called.
 
 *Closing the connection will not auto-flush.*
 
+## Windows Dynamic Library Linkage Issues
+
+If you depend on this library as a dynamic library on Windows you need to
+define `LINESENDER_DYN_LIB` before importing the header.
+
+```c
+#define LINESENDER_DYN_LIB
+#include <questdb/linesender.h>  // or .hpp
+```
+
+The `LINESENDER_DYN_LIB` define is to allow the header to mark all public APIs
+as `__declspec(dllimport)` and have symbols resolve correctly at runtime.
+
+*You don't need to do any of this if you're using this library as a static lib.*
+
 ## License
 
 The code is released under the [Apache License](LICENSE).

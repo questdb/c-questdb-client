@@ -19,7 +19,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/install)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/install)
 
-set(lib_sources
+set(LIB_SOURCES
     src/aborting_malloc.c
     src/linesender.c
     src/memwriter.c
@@ -49,32 +49,42 @@ endfunction()
 # Shared Library
 add_library(
     c_questdb_client SHARED
-    ${lib_sources})
+    ${LIB_SOURCES})
 target_include_directories(
     c_questdb_client
     PUBLIC ${CMAKE_SOURCE_DIR}/include)
 set_compile_flags(c_questdb_client)
 if(WIN32)
-  target_link_libraries(c_questdb_client wsock32 ws2_32)
-endif()
+    set_target_properties(
+        c_questdb_client
+        PROPERTIES
+        DEFINE_SYMBOL "LINESENDER_DYN_LIB"
+        DEFINE_SYMBOL "LINESENDER_EXPORTS")
+    target_link_libraries(c_questdb_client wsock32 ws2_32)
+endif(WIN32)
+if(UNIX)
+    target_compile_options(
+        c_questdb_client PRIVATE
+        -fvisibility=hidden)
+endif(UNIX)
 
 # Static Library
 add_library(
     c_questdb_client_static STATIC
-    ${lib_sources})
+    ${LIB_SOURCES})
 target_include_directories(
     c_questdb_client_static
     PUBLIC ${CMAKE_SOURCE_DIR}/include)
 set_compile_flags(c_questdb_client_static)
 if(WIN32)
-  target_link_libraries(c_questdb_client_static wsock32 ws2_32)
-endif()
+    target_link_libraries(c_questdb_client_static wsock32 ws2_32)
+endif(WIN32)
 
 # Static Library w/ -fPIC
-if (UNIX)
+if(UNIX)
     add_library(
         c_questdb_client_static_pic STATIC
-        ${lib_sources})
+        ${LIB_SOURCES})
     set_property(
         TARGET c_questdb_client_static_pic
         PROPERTY POSITION_INDEPENDENT_CODE ON)
@@ -82,7 +92,7 @@ if (UNIX)
         c_questdb_client_static_pic
         PUBLIC ${CMAKE_SOURCE_DIR}/include)
     set_compile_flags(c_questdb_client_static_pic)
-endif (UNIX)
+endif(UNIX)
 
 # Test binary.
 add_executable(
@@ -100,4 +110,3 @@ set_compile_flags(test_linesender)
 add_test(
     NAME test_linesender
     COMMAND test_linesender)
-
