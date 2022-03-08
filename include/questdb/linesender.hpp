@@ -96,20 +96,20 @@ namespace questdb::proto::line
         sender(const sender&) = delete;
         sender& operator=(const sender&) = delete;
 
-        sender& metric(std::string_view name)
+        sender& table(std::string_view name)
         {
             sender_error::wrapped_call(
-                linesender_metric,
+                linesender_table,
                 _impl,
                 name.size(),
                 name.data());
             return *this;
         }
 
-        sender& tag(std::string_view name, std::string_view value)
+        sender& symbol(std::string_view name, std::string_view value)
         {
             sender_error::wrapped_call(
-                linesender_tag,
+                linesender_symbol,
                 _impl,
                 name.size(),
                 name.data(),
@@ -118,10 +118,10 @@ namespace questdb::proto::line
             return *this;
         }
 
-        sender& field(std::string_view name, bool value)
+        sender& column(std::string_view name, bool value)
         {
             sender_error::wrapped_call(
-                linesender_field_bool,
+                linesender_column_bool,
                 _impl,
                 name.size(),
                 name.data(),
@@ -129,10 +129,10 @@ namespace questdb::proto::line
             return *this;
         }
 
-        sender& field(std::string_view name, int64_t value)
+        sender& column(std::string_view name, int64_t value)
         {
             sender_error::wrapped_call(
-                linesender_field_i64,
+                linesender_column_i64,
                 _impl,
                 name.size(),
                 name.data(),
@@ -140,10 +140,10 @@ namespace questdb::proto::line
             return *this;
         }
 
-        sender& field(std::string_view name, double value)
+        sender& column(std::string_view name, double value)
         {
             sender_error::wrapped_call(
-                linesender_field_f64,
+                linesender_column_f64,
                 _impl,
                 name.size(),
                 name.data(),
@@ -151,10 +151,10 @@ namespace questdb::proto::line
             return *this;
         }
 
-        sender& field(std::string_view name, std::string_view value)
+        sender& column(std::string_view name, std::string_view value)
         {
             sender_error::wrapped_call(
-                linesender_field_str,
+                linesender_column_str,
                 _impl,
                 name.size(),
                 name.data(),
@@ -163,18 +163,18 @@ namespace questdb::proto::line
             return *this;
         }
 
-        void end_line(int64_t timestamp_epoch_nanos)
+        void at(int64_t timestamp_epoch_nanos)
         {
             sender_error::wrapped_call(
-                linesender_end_line_timestamp,
+                linesender_at,
                 _impl,
                 timestamp_epoch_nanos);
         }
 
-        void end_line()
+        void at_now()
         {
             sender_error::wrapped_call(
-                linesender_end_line,
+                linesender_at_now,
                 _impl);
         }
 

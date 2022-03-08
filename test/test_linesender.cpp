@@ -124,10 +124,10 @@ TEST_CASE("linesender c api basics")
             }};
         server.accept();
         CHECK(server.recv() == 0);
-        CHECK(linesender_metric(sender, 4, "test", &err));
-        CHECK(linesender_tag(sender, 2, "t1", 2, "v1", &err));
-        CHECK(linesender_field_f64(sender, 2, "f1", 0.5, &err));
-        CHECK(linesender_end_line_timestamp(sender, 10000000, &err));
+        CHECK(linesender_table(sender, 4, "test", &err));
+        CHECK(linesender_symbol(sender, 2, "t1", 2, "v1", &err));
+        CHECK(linesender_column_f64(sender, 2, "f1", 0.5, &err));
+        CHECK(linesender_at(sender, 10000000, &err));
         CHECK(server.recv() == 0);
         CHECK(linesender_pending_size(sender) == 27);
         CHECK(linesender_flush(sender, &err));
@@ -155,10 +155,10 @@ TEST_CASE("linesender c++ api basics")
         CHECK(server.recv() == 0);
 
         sender
-            .metric("test")
-            .tag("t1", "v1")
-            .field("f1", 0.5)
-            .end_line(10000000);
+            .table("test")
+            .symbol("t1", "v1")
+            .column("f1", 0.5)
+            .at(10000000);
 
         CHECK(server.recv() == 0);
         CHECK(sender.pending_size() == 27);
@@ -180,14 +180,14 @@ TEST_CASE("State machine testing -- flush without data.")
     CHECK_THROWS_WITH_AS(
         sender.flush(),
         "State error: Bad call to `flush`, "
-        "should have called `metric` instead. "
+        "should have called `table` instead. "
         "Must now call `close`.",
         questdb::proto::line::sender_error);
     CHECK(sender.must_close());
     sender.close();
 }
 
-TEST_CASE("State machine testing -- endline without fields.")
+TEST_CASE("State machine testing -- endline without columns.")
 {
     WSASTARTUP_GUARD;
     questdb::proto::line::sender sender{
@@ -195,18 +195,18 @@ TEST_CASE("State machine testing -- endline without fields.")
         "localhost",
         "9009"};
     
-    sender.metric("test").tag("t1", "v1");
+    sender.table("test").symbol("t1", "v1");
     CHECK_THROWS_WITH_AS(
-        sender.end_line(),
-        "State error: Bad call to `end_line`, "
-        "should have called `tag` or `field` instead. "
+        sender.at_now(),
+        "State error: Bad call to `at`, "
+        "should have called `symbol` or `column` instead. "
         "Must now call `close`.",
         questdb::proto::line::sender_error);
     CHECK(sender.must_close());
     sender.close();
 }
 
-TEST_CASE("Bad UTF-8 in metric")
+TEST_CASE("Bad UTF-8 in table")
 {
     WSASTARTUP_GUARD;
     questdb::proto::line::sender sender{
@@ -215,7 +215,7 @@ TEST_CASE("Bad UTF-8 in metric")
         "9009"};
     
     CHECK_THROWS_WITH_AS(
-        sender.metric("\xff\xff"),
+        sender.table("\xff\xff"),
         "Bad string \"\\xff\\xff\": "
         "Invalid UTF-8. Illegal codepoint starting at byte index 0.",
         questdb::proto::line::sender_error);
@@ -229,12 +229,12 @@ TEST_CASE("Validation of overly large UDP line.")
         "localhost",
         "9009"};
 
-    sender.metric("test");
+    sender.table("test");
     while (sender.pending_size() < 1048576)
-        sender.field("f1", 10000000.5);
+        sender.column("f1", 10000000.5);
 
     CHECK_THROWS_WITH_AS(
-        sender.end_line(),
+        sender.at_now(),
         "Current line is too long to be sent via UDP. "
         "Byte size 1048576 > 64000.",
         questdb::proto::line::sender_error);
@@ -265,8 +265,8 @@ TEST_CASE("Validation of bad chars in key names.")
             "9009"};
 
         CHECK_THROWS_WITH_AS(
-            sender.metric("a*b"),
-            "Bad string \"a*b\": metric, tag and field names "
+            sender.table("a*b"),
+            "Bad string \"a*b\": table, symbol and column names "
             "can't contain a '*' character, "
             "which was found at byte position 1.",
             questdb::proto::line::sender_error);
@@ -278,10 +278,10 @@ TEST_CASE("Validation of bad chars in key names.")
             "localhost",
             "9009"};
 
-        sender.metric("test");
+        sender.table("test");
         CHECK_THROWS_WITH_AS(
-            sender.tag("a+b", "v1"),
-            "Bad string \"a+b\": metric, tag and field names "
+            sender.symbol("a+b", "v1"),
+            "Bad string \"a+b\": table, symbol and column names "
             "can't contain a '+' character, "
             "which was found at byte position 1.",
             questdb::proto::line::sender_error);
@@ -293,11 +293,11 @@ TEST_CASE("Validation of bad chars in key names.")
             "localhost",
             "9009"};
 
-        sender.metric("test");
-        std::string_view field_name{"a\0b", 3};
+        sender.table("test");
+        std::string_view column_name{"a\0b", 3};
         CHECK_THROWS_WITH_AS(
-            sender.field(field_name, false),
-            "Bad string \"a\\0b\": metric, tag and field names "
+            sender.column(column_name, false),
+            "Bad string \"a\\0b\": table, symbol and column names "
             "can't contain a '\\0' character, "
             "which was found at byte position 1.",
             questdb::proto::line::sender_error);
@@ -313,7 +313,7 @@ TEST_CASE("Move testing.")
         "9009"};
 
     CHECK_THROWS_AS(
-        sender1.end_line(),
+        sender1.at_now(),
         questdb::proto::line::sender_error);
     CHECK(sender1.must_close());
 
@@ -326,7 +326,7 @@ TEST_CASE("Move testing.")
         questdb::proto::line::transport::udp,
         "localhost",
         "9009"};
-    sender3.metric("test");
+    sender3.table("test");
     CHECK(sender3.pending_size() == 4);
     CHECK_FALSE(sender3.must_close());
 

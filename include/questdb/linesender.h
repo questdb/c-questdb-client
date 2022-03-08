@@ -59,13 +59,13 @@ void linesender_close(linesender*);
 
 
 /////////// Preparing line messages.
-bool linesender_metric(  // "metric" is also known as "measurement".
+bool linesender_table(
     linesender*,
     size_t name_len,
     const char* name,
     linesender_error** err_out);
 
-bool linesender_tag(
+bool linesender_symbol(
     linesender*,
     size_t name_len,
     const char* name,
@@ -73,28 +73,28 @@ bool linesender_tag(
     const char* value,
     linesender_error** err_out);
 
-bool linesender_field_bool(
+bool linesender_column_bool(
     linesender*,
     size_t name_len,
     const char* name,
     bool value,
     linesender_error** err_out);
 
-bool linesender_field_i64(
+bool linesender_column_i64(
     linesender*,
     size_t name_len,
     const char* name,
     int64_t value,
     linesender_error** err_out);
 
-bool linesender_field_f64(
+bool linesender_column_f64(
     linesender*,
     size_t name_len,
     const char* name,
     double value,
     linesender_error** err_out);
 
-bool linesender_field_str(
+bool linesender_column_str(
     linesender*,
     size_t name_len,
     const char* name,
@@ -102,12 +102,12 @@ bool linesender_field_str(
     const char* value,
     linesender_error** err_out);
 
-bool linesender_end_line_timestamp(
+bool linesender_at(
     linesender*,
     int64_t epoch_nanos,
     linesender_error** err_out);
 
-bool linesender_end_line(
+bool linesender_at_now(
     linesender*,
     linesender_error** err_out);
 

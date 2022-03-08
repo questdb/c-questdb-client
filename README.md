@@ -64,8 +64,6 @@ See a [complete example in C++](examples/linesender_example.cpp).
 The API is sequentially coupled, meaning that methods need to be called in a
 specific order.
 
-
-
 This may be summaried as follows:
 
 ```
@@ -74,10 +72,10 @@ Grammar:
     // C                              // C++
     linesender_connect,               sender::sender
     (                                 (
-        linesender_metric,                sender::metric,
-        linesender_tag*,                  sender::tag*
-        linesender_field...+              sender::field+,
-        linesender_end_line...,           sender::end_line,
+        linesender_table,                 sender::table,
+        linesender_symbol*,               sender::symbol*
+        linesender_column...+             sender::column+,
+        linesender_at...,                 sender::at,
         linesender_flush?                 sender::flush?
     )*,                               )*,
     linesender_close                  sender::close*,
@@ -124,7 +122,7 @@ Here's a complete example on how to handle errors:
 ```c
 linesender* sender = ...;
 linesender_error* err = NULL;
-if (!linesender_metric(
+if (!linesender_table(
       sender,
       10,
       "table_name",
@@ -132,7 +130,7 @@ if (!linesender_metric(
 {
   size_t msg_len = 0;
   const char* msg = linesender_error_msg(err, &msg_len);
-  fprintf(stderr, "Could not set metric: %.*s", (int)msg_len, msg);
+  fprintf(stderr, "Could not set table name: %.*s", (int)msg_len, msg);
 
   // Clean-up
   linesender_error_free(err);

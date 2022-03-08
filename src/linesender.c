@@ -67,10 +67,10 @@ static const sock_len_t max_udp_packet_size = 64000;
 
 typedef enum linesender_op
 {
-    linesender_op_metric = 1,
-    linesender_op_tag = 1 << 1,
-    linesender_op_field = 1 << 2,
-    linesender_op_end_line = 1 << 3,
+    linesender_op_table = 1,
+    linesender_op_symbol = 1 << 1,
+    linesender_op_column = 1 << 2,
+    linesender_op_at = 1 << 3,
     linesender_op_flush = 1 << 4
 } linesender_op;
 
@@ -78,14 +78,14 @@ static inline const char* linesender_op_str(linesender_op op)
 {
     switch (op)
     {
-        case linesender_op_metric:
-            return "metric";
-        case linesender_op_tag:
-            return "tag";
-        case linesender_op_field:
-            return "field";
-        case linesender_op_end_line:
-            return "end_line";
+        case linesender_op_table:
+            return "table";
+        case linesender_op_symbol:
+            return "symbol";
+        case linesender_op_column:
+            return "column";
+        case linesender_op_at:
+            return "at";
         case linesender_op_flush:
             return "flush";
     }
@@ -96,13 +96,13 @@ static inline const char* linesender_op_str(linesender_op op)
 typedef enum linesender_state
 {
     linesender_state_connected =
-        linesender_op_metric,
-    linesender_state_metric_or_tag_written =
-        linesender_op_tag | linesender_op_field,
-    linesender_state_next_field_or_end =
-        linesender_op_field | linesender_op_end_line,
-    linesender_state_may_flush_or_metric =
-        linesender_op_flush | linesender_op_metric,
+        linesender_op_table,
+    linesender_state_table_or_symbol_written =
+        linesender_op_symbol | linesender_op_column,
+    linesender_state_next_column_or_end =
+        linesender_op_column | linesender_op_at,
+    linesender_state_may_flush_or_table =
+        linesender_op_flush | linesender_op_table,
     linesender_state_moribund = 0,
 } linesender_state;
 
@@ -111,13 +111,13 @@ static inline const char* linesender_state_next_op_descr(linesender_state state)
     switch (state)
     {
         case linesender_state_connected:
-            return "should have called `metric` instead";
-        case linesender_state_metric_or_tag_written:
-            return "should have called `tag` or `field` instead";
-        case linesender_state_next_field_or_end:
-            return "should have called `field` or `end_line` instead";
-        case linesender_state_may_flush_or_metric:
-            return "should have called `flush` or `metric` instead";
+            return "should have called `table` instead";
+        case linesender_state_table_or_symbol_written:
+            return "should have called `symbol` or `column` instead";
+        case linesender_state_next_column_or_end:
+            return "should have called `column` or `at` instead";
+        case linesender_state_may_flush_or_table:
+            return "should have called `flush` or `table` instead";
         case linesender_state_moribund:
             return "unrecoverable state due to previous error";
     }
@@ -695,7 +695,7 @@ static inline bool check_key_name(
         *err_out = err_printf(
             state,
             0,
-            "metric, tag and field names must have a non-zero length.");
+            "table, symbol and column names must have a non-zero length.");
         return false;
     }
 
@@ -703,7 +703,7 @@ static inline bool check_key_name(
         return false;
 
     // TODO: Review for correctness.
-    // Specifically, this logic is also used to validate metric names.
+    // Specifically, this logic is also used to validate table names.
     // The validation logic is lifted from:
     // src/main/java/io/questdb/cairo/TableUtils.java's `isValidColumnName`.
     // Note that this differs from the InfluxDB spec since it allows names
@@ -744,7 +744,7 @@ static inline bool check_key_name(
                         state,
                         0,
                         "Bad string \"%.*s\": "
-                        "metric, tag and field names can't contain a '%.*s' "
+                        "table, symbol and column names can't contain a '%.*s' "
                         "character, which was found at byte position "
                         "%" PRI_SIZET ".",
                         (int)name_descr_len,
@@ -772,7 +772,7 @@ static inline bool check_key_name(
                 state,
                 0,
                 "Bad string \"%.*s\": "
-                "metric, tag and field names can't contain a UTF-8 BOM "
+                "table, symbol and column names can't contain a UTF-8 BOM "
                 "character, which was found at byte position "
                 "%" PRI_SIZET ".",
                 (int)name_descr_len,
@@ -854,24 +854,24 @@ DEFINE_WRITE_ESCAPED_FN(
     must_escape_quoted,
     (memwriter_char(writer, '"')))
 
-bool linesender_metric(
+bool linesender_table(
     linesender* sender,
     size_t name_len,
     const char* name,
     linesender_error** err_out)
 {
-    if (!check_state(&sender->state, linesender_op_metric, err_out))
+    if (!check_state(&sender->state, linesender_op_table, err_out))
         return false;
     if (!check_key_name(&sender->state, name_len, name, err_out))
         return false;
 
     write_escaped_unquoted(&sender->writer, name_len, name);
 
-    sender->state = linesender_state_metric_or_tag_written;
+    sender->state = linesender_state_table_or_symbol_written;
     return true;
 }
 
-bool linesender_tag(
+bool linesender_symbol(
     linesender* sender,
     size_t name_len,
     const char* name,
@@ -879,7 +879,7 @@ bool linesender_tag(
     const char* value,
     linesender_error** err_out)
 {
-    if (!check_state(&sender->state, linesender_op_tag, err_out))
+    if (!check_state(&sender->state, linesender_op_symbol, err_out))
         return false;
     if (!check_key_name(&sender->state, name_len, name, err_out))
         return false;
@@ -894,70 +894,70 @@ bool linesender_tag(
     return true;
 }
 
-static inline bool write_field_key(
+static inline bool write_column_key(
     linesender* sender,
     size_t name_len,
     const char* name,
     linesender_error** err_out)
 {
-    if (!check_state(&sender->state, linesender_op_field, err_out))
+    if (!check_state(&sender->state, linesender_op_column, err_out))
         return false;
 
     if (!check_key_name(&sender->state, name_len, name, err_out))
         return false;
 
     const char separator =
-        (sender->state == linesender_state_metric_or_tag_written)
+        (sender->state == linesender_state_table_or_symbol_written)
             ? ' '
             : ',';
     memwriter_char(&sender->writer, separator);
     write_escaped_unquoted(&sender->writer, name_len, name);
     memwriter_char(&sender->writer, '=');
-    sender->state = linesender_state_next_field_or_end;
+    sender->state = linesender_state_next_column_or_end;
     return true;
 }
 
-bool linesender_field_bool(
+bool linesender_column_bool(
     linesender* sender,
     size_t name_len,
     const char* name,
     bool value,
     linesender_error** err_out)
 {
-    if (!write_field_key(sender, name_len, name, err_out))
+    if (!write_column_key(sender, name_len, name, err_out))
         return false;
     memwriter_char(&sender->writer, value ? 't' : 'f');
     return true;
 }
 
-bool linesender_field_i64(
+bool linesender_column_i64(
     linesender* sender,
     size_t name_len,
     const char* name,
     int64_t value,
     linesender_error** err_out)
 {
-    if (!write_field_key(sender, name_len, name, err_out))
+    if (!write_column_key(sender, name_len, name, err_out))
         return false;
     memwriter_i64(&sender->writer, value);
     memwriter_char(&sender->writer, 'i');
     return true;
 }
 
-bool linesender_field_f64(
+bool linesender_column_f64(
     linesender* sender,
     size_t name_len,
     const char* name,
     double value,
     linesender_error** err_out)
 {
-    if (!write_field_key(sender, name_len, name, err_out))
+    if (!write_column_key(sender, name_len, name, err_out))
         return false;
     memwriter_f64(&sender->writer, value);
     return true;
 }
 
-bool linesender_field_str(
+bool linesender_column_str(
     linesender* sender,
     size_t name_len,
     const char* name,
@@ -967,7 +967,7 @@ bool linesender_field_str(
 {
     if (!check_utf8(&sender->state, value_len, value, err_out))
         return false;
-    if (!write_field_key(sender, name_len, name, err_out))
+    if (!write_column_key(sender, name_len, name, err_out))
         return false;
     write_escaped_quoted(&sender->writer, value_len, value);
     return true;
@@ -1002,12 +1002,12 @@ static inline void update_last_line_start(linesender* sender)
     sender->last_line_start = linesender_pending_size(sender);
 }
 
-bool linesender_end_line_timestamp(
+bool linesender_at(
     linesender* sender,
     int64_t epoch_nanos,
     linesender_error** err_out)
 {
-    if (!check_state(&sender->state, linesender_op_end_line, err_out))
+    if (!check_state(&sender->state, linesender_op_at, err_out))
         return false;
     if (!check_udp_max_line_len(sender, err_out))
         return false;
@@ -1016,21 +1016,21 @@ bool linesender_end_line_timestamp(
     memwriter_i64(writer, epoch_nanos);
     memwriter_char(&sender->writer, '\n');
     update_last_line_start(sender);
-    sender->state = linesender_state_may_flush_or_metric;
+    sender->state = linesender_state_may_flush_or_table;
     return true;
 }
 
-bool linesender_end_line(
+bool linesender_at_now(
     linesender* sender,
     linesender_error** err_out)
 {
-    if (!check_state(&sender->state, linesender_op_end_line, err_out))
+    if (!check_state(&sender->state, linesender_op_at, err_out))
         return false;
     if (!check_udp_max_line_len(sender, err_out))
         return false;
     memwriter_char(&sender->writer, '\n');
     update_last_line_start(sender);
-    sender->state = linesender_state_may_flush_or_metric;
+    sender->state = linesender_state_may_flush_or_table;
     return true;
 }
 
@@ -1077,7 +1077,7 @@ static inline bool send_udp(linesender* sender, sock_len_t len, const char* buf)
 
             // Note: No need to validate here.
             // `buf[index - 1]` can't fail due to state machine logic and UDP
-            // max line len validation in `linesender_end_line_*` functions.
+            // max line len validation in `linesender_at_*` functions.
             const char penultimate = buf[index - 1];
 
             if ((last == '\n') && (penultimate != '\\'))
