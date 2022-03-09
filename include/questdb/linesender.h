@@ -52,21 +52,13 @@ LINESENDER_API
 void linesender_error_free(linesender_error*);
 
 /////////// Connecting and disconnecting.
-typedef enum
-{
-    linesender_tcp = 1,
-    linesender_udp = 2
-} linesender_transport;
-
 typedef struct linesender linesender;
 
 LINESENDER_API
 linesender* linesender_connect(
-    linesender_transport transport,
-    const char* interface,
+    const char* interface,  // if unsure pass "0.0.0.0"
     const char* host,
     const char* port,
-    int udp_multicast_ttl,  // UDP-only param. Ignored if `transport` is TCP.
     linesender_error** err_out);
 
 /** True indicates an error occured previously and the sender must be closed. */
@@ -148,9 +140,6 @@ size_t linesender_pending_size(linesender*);
 
 /**
  * Send prepared line messages to the QuestDB server.
- *
- * When the connection was established with `linesender_udp`,
- * no single line can exceed 64000 bytes.
  */
 LINESENDER_API
 bool linesender_flush(

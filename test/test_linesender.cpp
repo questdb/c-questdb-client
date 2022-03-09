@@ -100,81 +100,67 @@ private:
 TEST_CASE("linesender c api basics")
 {
     WSASTARTUP_GUARD;
-    for (auto transport : {linesender_tcp, linesender_udp})
-    {    
-        questdb::proto::line::test::mock_server
-            server{transport == linesender_tcp};
-        linesender_error* err = nullptr;
-        on_scope_exit error_free_guard{[&]{
-                if (err) linesender_error_free(err);
-            }};
-        linesender* sender = linesender_connect(
-            transport,
-            "0.0.0.0",
-            "localhost",
-            std::to_string(server.port()).c_str(),
-            1,
-            &err);
-        CHECK(sender != nullptr);
-        CHECK_FALSE(linesender_must_close(sender));
-        on_scope_exit sender_close_guard{[&]
-            {
-                linesender_close(sender);
-                sender = nullptr;
-            }};
-        server.accept();
-        CHECK(server.recv() == 0);
-        CHECK(linesender_table(sender, 4, "test", &err));
-        CHECK(linesender_symbol(sender, 2, "t1", 2, "v1", &err));
-        CHECK(linesender_column_f64(sender, 2, "f1", 0.5, &err));
-        CHECK(linesender_at(sender, 10000000, &err));
-        CHECK(server.recv() == 0);
-        CHECK(linesender_pending_size(sender) == 27);
-        CHECK(linesender_flush(sender, &err));
-        CHECK(server.recv() == 1);
-        CHECK(server.msgs().front() == "test,t1=v1 f1=0.5 10000000\n");    
-    }
+    questdb::proto::line::test::mock_server server;
+    linesender_error* err = nullptr;
+    on_scope_exit error_free_guard{[&]{
+            if (err) linesender_error_free(err);
+        }};
+    linesender* sender = linesender_connect(
+        "0.0.0.0",
+        "localhost",
+        std::to_string(server.port()).c_str(),
+        &err);
+    CHECK(sender != nullptr);
+    CHECK_FALSE(linesender_must_close(sender));
+    on_scope_exit sender_close_guard{[&]
+        {
+            linesender_close(sender);
+            sender = nullptr;
+        }};
+    server.accept();
+    CHECK(server.recv() == 0);
+    CHECK(linesender_table(sender, 4, "test", &err));
+    CHECK(linesender_symbol(sender, 2, "t1", 2, "v1", &err));
+    CHECK(linesender_column_f64(sender, 2, "f1", 0.5, &err));
+    CHECK(linesender_at(sender, 10000000, &err));
+    CHECK(server.recv() == 0);
+    CHECK(linesender_pending_size(sender) == 27);
+    CHECK(linesender_flush(sender, &err));
+    CHECK(server.recv() == 1);
+    CHECK(server.msgs().front() == "test,t1=v1 f1=0.5 10000000\n");    
 }
 
 TEST_CASE("linesender c++ api basics")
 {
     WSASTARTUP_GUARD;
-    const auto transports = {
-        questdb::proto::line::transport::tcp,
-        questdb::proto::line::transport::udp};
-    for (auto transport : transports)
-    {
-        questdb::proto::line::test::mock_server server{
-            transport == questdb::proto::line::transport::tcp};
-        questdb::proto::line::sender sender{
-            transport,
-            "localhost",
-            std::to_string(server.port()).c_str()};
-        CHECK_FALSE(sender.must_close());
-        server.accept();
-        CHECK(server.recv() == 0);
+    questdb::proto::line::test::mock_server server;
+    questdb::proto::line::sender sender{
+        "localhost",
+        std::to_string(server.port()).c_str()};
+    CHECK_FALSE(sender.must_close());
+    server.accept();
+    CHECK(server.recv() == 0);
 
-        sender
-            .table("test")
-            .symbol("t1", "v1")
-            .column("f1", 0.5)
-            .at(10000000);
+    sender
+        .table("test")
+        .symbol("t1", "v1")
+        .column("f1", 0.5)
+        .at(10000000);
 
-        CHECK(server.recv() == 0);
-        CHECK(sender.pending_size() == 27);
-        sender.flush();
-        CHECK(server.recv() == 1);
-        CHECK(server.msgs().front() == "test,t1=v1 f1=0.5 10000000\n");
-    }
+    CHECK(server.recv() == 0);
+    CHECK(sender.pending_size() == 27);
+    sender.flush();
+    CHECK(server.recv() == 1);
+    CHECK(server.msgs().front() == "test,t1=v1 f1=0.5 10000000\n");
 }
 
 TEST_CASE("State machine testing -- flush without data.")
 {
     WSASTARTUP_GUARD;
+    questdb::proto::line::test::mock_server server;
     questdb::proto::line::sender sender{
-        questdb::proto::line::transport::udp,
         "localhost",
-        "9009"};
+        std::to_string(server.port()).c_str()};
     
     CHECK(sender.pending_size() == 0);
     CHECK_THROWS_WITH_AS(
@@ -190,10 +176,10 @@ TEST_CASE("State machine testing -- flush without data.")
 TEST_CASE("State machine testing -- endline without columns.")
 {
     WSASTARTUP_GUARD;
+    questdb::proto::line::test::mock_server server;
     questdb::proto::line::sender sender{
-        questdb::proto::line::transport::udp,
         "localhost",
-        "9009"};
+        std::to_string(server.port()).c_str()};
     
     sender.table("test").symbol("t1", "v1");
     CHECK_THROWS_WITH_AS(
@@ -209,34 +195,15 @@ TEST_CASE("State machine testing -- endline without columns.")
 TEST_CASE("Bad UTF-8 in table")
 {
     WSASTARTUP_GUARD;
+    questdb::proto::line::test::mock_server server;
     questdb::proto::line::sender sender{
-        questdb::proto::line::transport::udp,
         "localhost",
-        "9009"};
+        std::to_string(server.port()).c_str()};
     
     CHECK_THROWS_WITH_AS(
         sender.table("\xff\xff"),
         "Bad string \"\\xff\\xff\": "
         "Invalid UTF-8. Illegal codepoint starting at byte index 0.",
-        questdb::proto::line::sender_error);
-}
-
-TEST_CASE("Validation of overly large UDP line.")
-{
-    WSASTARTUP_GUARD;
-    questdb::proto::line::sender sender{
-        questdb::proto::line::transport::udp,
-        "localhost",
-        "9009"};
-
-    sender.table("test");
-    while (sender.pending_size() < 1048576)
-        sender.column("f1", 10000000.5);
-
-    CHECK_THROWS_WITH_AS(
-        sender.at_now(),
-        "Current line is too long to be sent via UDP. "
-        "Byte size 1048576 > 64000.",
         questdb::proto::line::sender_error);
 
     CHECK(sender.must_close());
@@ -258,11 +225,12 @@ TEST_CASE("Validation of overly large UDP line.")
 TEST_CASE("Validation of bad chars in key names.")
 {
     WSASTARTUP_GUARD;
+
     {
+        questdb::proto::line::test::mock_server server;
         questdb::proto::line::sender sender{
-            questdb::proto::line::transport::udp,
             "localhost",
-            "9009"};
+            std::to_string(server.port()).c_str()};
 
         CHECK_THROWS_WITH_AS(
             sender.table("a*b"),
@@ -273,10 +241,10 @@ TEST_CASE("Validation of bad chars in key names.")
     }
 
     {
+        questdb::proto::line::test::mock_server server;
         questdb::proto::line::sender sender{
-            questdb::proto::line::transport::udp,
             "localhost",
-            "9009"};
+            std::to_string(server.port()).c_str()};
 
         sender.table("test");
         CHECK_THROWS_WITH_AS(
@@ -288,10 +256,10 @@ TEST_CASE("Validation of bad chars in key names.")
     }
 
     {
+        questdb::proto::line::test::mock_server server;
         questdb::proto::line::sender sender{
-            questdb::proto::line::transport::udp,
             "localhost",
-            "9009"};
+            std::to_string(server.port()).c_str()};
 
         sender.table("test");
         std::string_view column_name{"a\0b", 3};
@@ -307,10 +275,12 @@ TEST_CASE("Validation of bad chars in key names.")
 TEST_CASE("Move testing.")
 {
     WSASTARTUP_GUARD;
+    questdb::proto::line::test::mock_server server1;
+    questdb::proto::line::test::mock_server server2;
+
     questdb::proto::line::sender sender1{
-        questdb::proto::line::transport::udp,
         "localhost",
-        "9009"};
+        std::to_string(server1.port()).c_str()};
 
     CHECK_THROWS_AS(
         sender1.at_now(),
@@ -323,9 +293,8 @@ TEST_CASE("Move testing.")
     CHECK(sender2.must_close());
 
     questdb::proto::line::sender sender3{
-        questdb::proto::line::transport::udp,
         "localhost",
-        "9009"};
+        std::to_string(server2.port()).c_str()};
     sender3.table("test");
     CHECK(sender3.pending_size() == 4);
     CHECK_FALSE(sender3.must_close());

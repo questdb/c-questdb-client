@@ -19,13 +19,13 @@ namespace questdb::proto::line::test
 {
 
 /**
- * Bug-ridden mock server to handle TCP and UDP.
+ * Bug-ridden mock server to handle line requests.
  * YMMV, but should be just good enough for testing.
 */
 class mock_server
 {
 public:
-    explicit mock_server(bool tcp);  // false for `udp`.
+    mock_server();
 
     uint16_t port() const { return _port; }
 
@@ -43,7 +43,6 @@ public:
 private:
     bool wait_for_data(std::optional<double> wait_timeout_sec = std::nullopt);
 
-    bool _tcp;
     socketfd_t _listen_fd;
     socketfd_t _conn_fd;
     uint16_t _port;

@@ -39,17 +39,13 @@ typedef int sock_len_t;
 namespace questdb::proto::line::test
 {
 
-mock_server::mock_server(bool tcp)  // false for `udp`.
-    : _tcp{tcp}
-    , _listen_fd{0}
+mock_server::mock_server()
+    : _listen_fd{0}
     , _conn_fd{0}
     , _port{0}
     , _msgs{}
 {
-    if (_tcp)
-        _listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    else
-        _listen_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    _listen_fd = socket(AF_INET, SOCK_STREAM, 0);
 
     const int reuse_addr = 1;
     if (setsockopt(
@@ -80,7 +76,7 @@ mock_server::mock_server(bool tcp)  // false for `udp`.
             sizeof(listen_addr)) == -1)
         throw std::runtime_error{"Bad `bind()`."};
 
-    if (tcp && (listen(_listen_fd, 1) == -1))
+    if (listen(_listen_fd, 1) == -1)
         throw std::runtime_error{"Bad `listen()`."};
 
     sockaddr_in resolved_addr;
@@ -92,33 +88,24 @@ mock_server::mock_server(bool tcp)  // false for `udp`.
             &resolved_addr_len) == -1)
         throw std::runtime_error{"Bad `getsockname()`."};
     _port = ntohs(resolved_addr.sin_port);
-
-    if (!_tcp)
-    {
-        _conn_fd = _listen_fd;
-        _listen_fd = 0;
-    }
 }
 
 void mock_server::accept()
 {
-    if (_tcp)
-    {
-        sockaddr_in remote_addr;
-        socklen_t remote_addr_len = sizeof(remote_addr);
-        _conn_fd = ::accept(
-            _listen_fd,
-            (sockaddr *)&remote_addr,
-            &remote_addr_len);
-        if (_conn_fd == INVALID_SOCKET)
-            throw std::runtime_error{"Bad `accept()`."};
+    sockaddr_in remote_addr;
+    socklen_t remote_addr_len = sizeof(remote_addr);
+    _conn_fd = ::accept(
+        _listen_fd,
+        (sockaddr *)&remote_addr,
+        &remote_addr_len);
+    if (_conn_fd == INVALID_SOCKET)
+        throw std::runtime_error{"Bad `accept()`."};
 #if defined(PLATFORM_UNIX)
-        fcntl(_conn_fd, F_SETFL, O_NONBLOCK);
+    fcntl(_conn_fd, F_SETFL, O_NONBLOCK);
 #elif defined(PLATFORM_WINDOWS)
-        u_long mode = 1;
-        ioctlsocket(_conn_fd, FIONBIO, &mode);
+    u_long mode = 1;
+    ioctlsocket(_conn_fd, FIONBIO, &mode);
 #endif
-    }
 }
 
 bool mock_server::wait_for_data(std::optional<double> wait_timeout_sec)
@@ -159,27 +146,11 @@ size_t mock_server::recv(double wait_timeout_sec)
     for (;;)
     {
         wait_for_data();
-        sock_ssize_t count = 0;
-        if (_tcp)
-        {
-            count = ::recv(
-                _conn_fd,
-                &chunk[0],
-                static_cast<sock_len_t>(chunk_len),
-                0);
-        }
-        else
-        {
-            sockaddr_in src_addr;
-            socklen_t src_addr_len{sizeof(src_addr)};
-            count = ::recvfrom(
-                _conn_fd,
-                &chunk[0],
-                static_cast<sock_len_t>(chunk_len),
-                0,
-                (sockaddr *)&src_addr,
-                &src_addr_len);
-        }
+        sock_ssize_t count = ::recv(
+            _conn_fd,
+            &chunk[0],
+            static_cast<sock_len_t>(chunk_len),
+            0);
         if (count == -1)
             throw std::runtime_error{"Bad `recv()`."};
         const size_t u_count = static_cast<size_t>(count);

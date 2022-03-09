@@ -60,11 +60,6 @@ typedef int sock_len_t;
 #define UNREACHABLE() __builtin_unreachable()
 #endif
 
-STATIC_ASSERT((int)SOCK_STREAM == (int)linesender_tcp, "TCP enum matching");
-STATIC_ASSERT((int)SOCK_DGRAM == (int)linesender_udp, "UDP enum matching");
-
-static const sock_len_t max_udp_packet_size = 64000;
-
 typedef enum linesender_op
 {
     linesender_op_table = 1,
@@ -322,7 +317,6 @@ static char* describe_buf(size_t len, const char* buf, size_t* descr_len_out)
 }
 
 static struct addrinfo* resolve_addr(
-    linesender_transport transport,
     const char* host,
     const char* port,
     linesender_error** err_out)
@@ -336,7 +330,7 @@ static struct addrinfo* resolve_addr(
     // That said - barring testing - this should be the only code that
     // prevents the sender to work with both IPv4 and IPv6.
     hints.ai_family = AF_INET;
-    hints.ai_socktype = transport;  // matches SOCK_STREAM or SOCK_DGRAM
+    hints.ai_socktype = SOCK_STREAM;
     struct addrinfo* addr = NULL;
     errno_t gai_err_code = getaddrinfo(host, port, &hints, &addr);
     if (gai_err_code)
@@ -407,7 +401,6 @@ static inline bool check_state(
 
 struct linesender
 {
-    linesender_transport transport;
     socketfd_t sock_fd;
     struct addrinfo* dest_info;
     linesender_state state;
@@ -416,38 +409,20 @@ struct linesender
 };
 
 linesender* linesender_connect(
-    linesender_transport transport,
     const char* net_interface,
     const char* host,
     const char* port,
-    int udp_multicast_ttl,
     linesender_error** err_out)
 {
-    switch (transport)
-    {
-        case linesender_tcp:
-        case linesender_udp:
-            break;
-        default:
-            *err_out = err_printf(
-                NULL,
-                0,
-                "Bad transport value `%d`.",
-                (int)transport);
-            return NULL;
-    }
-
     struct addrinfo* dest_info = NULL;
     struct addrinfo* if_info = NULL;
     socketfd_t sock_fd = 0;
 
-    dest_info = resolve_addr(
-        transport, host, port, err_out);
+    dest_info = resolve_addr(host, port, err_out);
     if (!dest_info)
         goto error_cleanup;
 
-    if_info = resolve_addr(
-        transport, net_interface, NULL, err_out);
+    if_info = resolve_addr(net_interface, NULL, err_out);
     if (!if_info)
         goto error_cleanup;
 
@@ -483,105 +458,29 @@ linesender* linesender_connect(
     }
 #endif
 
-    if (transport == linesender_tcp)
+    // TODO: Review suitability for intended use case.
+    // Compromise: We rely on the client to batch a sufficient number of
+    // lines for decent throughput. This still allows for decent
+    // timeliness.
+    // This is bad if the client sends batch sizes of 1.
+    // Maybe the answer here is to expose `nodelay` as an arg.
+    int no_delay = 1;
+    if (setsockopt(
+        sock_fd,
+        IPPROTO_TCP,
+        TCP_NODELAY,
+        (char *) &no_delay,
+        sizeof(int)) == SOCKET_ERROR)
     {
-        // TODO: Review suitability for intended use case.
-        // Compromise: We rely on the client to batch a sufficient number of
-        // lines for decent throughput. This still allows for decent
-        // timeliness.
-        // This is bad if the client sends batch sizes of 1.
-        // Maybe the answer here is to expose `nodelay` as an arg.
-        int no_delay = 1;
-        if (setsockopt(
-            sock_fd,
-            IPPROTO_TCP,
-            TCP_NODELAY,
-            (char *) &no_delay,
-            sizeof(int)) == SOCKET_ERROR)
-        {
-            const errno_t errnum = get_last_sock_err();
-            char* err_descr = sock_err_str(errnum);
-            *err_out = err_printf(
-                NULL,
-                errnum,
-                "Could not set TCP_NODELAY: %s.",
-                err_descr);
-            sock_err_str_free(err_descr);
-            goto error_cleanup;
-        }
-    }
-    else // if (transport == linesender_udp)
-    {
-        int set_res = 0;
-        if (if_info->ai_family == AF_INET)  // IPv4
-        {
-            struct in_addr* ip_address =
-                &((struct sockaddr_in*)if_info->ai_addr)->sin_addr;
-            set_res = setsockopt(
-                sock_fd,
-                IPPROTO_IP,
-                IP_MULTICAST_IF,
-                (const void*)ip_address,
-                sizeof(struct in_addr));
-        }
-        else  // IPv6
-        {
-            struct in6_addr* ip_address =
-                &((struct sockaddr_in6*)if_info->ai_addr)->sin6_addr;
-            set_res = setsockopt(
-                sock_fd,
-                IPPROTO_IP,
-                IPV6_MULTICAST_IF,
-                (const void*)ip_address,
-                sizeof(struct in6_addr));
-        }
-
-        if (set_res == SOCKET_ERROR)
-        {
-            const errno_t errnum = get_last_sock_err();
-            char* err_descr = sock_err_str(errnum);
-            *err_out = err_printf(
-                NULL,
-                errnum,
-                "Could not set UDP sending-from address to `%s`: %s.",
-                net_interface,
-                err_descr);
-            sock_err_str_free(err_descr);
-            goto error_cleanup;
-        }
-
-        if (if_info->ai_family == AF_INET)  // IPv4
-        {
-            set_res = setsockopt(
-                sock_fd,
-                IPPROTO_IP,
-                IP_MULTICAST_TTL,
-                (const void*)&udp_multicast_ttl,
-                sizeof(int));
-        }
-        else  // IPv6
-        {
-            set_res = setsockopt(
-                sock_fd,
-                IPPROTO_IP,
-                IPV6_MULTICAST_HOPS,
-                (const void*)&udp_multicast_ttl,
-                sizeof(int));
-        }
-
-        if (set_res == SOCKET_ERROR)
-        {
-            const errno_t errnum = get_last_sock_err();
-            char* err_descr = sock_err_str(errnum);
-            *err_out = err_printf(
-                NULL,
-                errnum,
-                "Could not set UDP TTL (max network hops) to `%d`: %s.",
-                udp_multicast_ttl,
-                err_descr);
-            sock_err_str_free(err_descr);
-            goto error_cleanup;
-        }
+        const errno_t errnum = get_last_sock_err();
+        char* err_descr = sock_err_str(errnum);
+        *err_out = err_printf(
+            NULL,
+            errnum,
+            "Could not set TCP_NODELAY: %s.",
+            err_descr);
+        sock_err_str_free(err_descr);
+        goto error_cleanup;
     }
 
     sock_len_t addrlen = (sock_len_t)dest_info->ai_addrlen;
@@ -599,32 +498,28 @@ linesender* linesender_connect(
         goto error_cleanup;
     }
 
-    if (transport == linesender_tcp)
+    if (connect(sock_fd, dest_info->ai_addr, addrlen) == SOCKET_ERROR)
     {
-        if (connect(sock_fd, dest_info->ai_addr, addrlen) == SOCKET_ERROR)
-        {
-            const errno_t errnum = get_last_sock_err();
-            char* err_descr = sock_err_str(errnum);
-            *err_out = err_printf(
-                NULL,
-                errnum,
-                "Could not connect to `%s:%s`: %s.",
-                host,
-                port,
-                err_descr);
-            sock_err_str_free(err_descr);
-            goto error_cleanup;
-        }
+        const errno_t errnum = get_last_sock_err();
+        char* err_descr = sock_err_str(errnum);
+        *err_out = err_printf(
+            NULL,
+            errnum,
+            "Could not connect to `%s:%s`: %s.",
+            host,
+            port,
+            err_descr);
+        sock_err_str_free(err_descr);
+        goto error_cleanup;
     }
 
     freeaddrinfo(if_info);
     if_info = NULL;
 
     memwriter writer;
-    memwriter_open(&writer, max_udp_packet_size);
+    memwriter_open(&writer, 65536);  // 64KB initial buffer size.
 
     linesender* sender = aborting_malloc(sizeof(linesender));
-    sender->transport = transport;
     sender->sock_fd = sock_fd;
     sender->dest_info = dest_info;
     sender->state = linesender_state_connected;
@@ -717,7 +612,7 @@ static inline bool check_key_name(
         {
             // TODO: Review for correctness.
             // Do we really want to allow non-printable chars,
-            // like \1\r \t \f etc in this context?
+            // like \1 \r \t \f etc in this context?
             case ' ':
             case '?':
             case '.':
@@ -973,30 +868,6 @@ bool linesender_column_str(
     return true;
 }
 
-static inline bool check_udp_max_line_len(
-    linesender* sender,
-    linesender_error** err_out)
-{
-    if (sender->transport == linesender_udp)
-    {
-        const size_t current_line_len =
-            linesender_pending_size(sender) - sender->last_line_start;
-
-        if (current_line_len > (size_t)max_udp_packet_size)
-        {
-            *err_out = err_printf(
-                &sender->state,
-                0,
-                "Current line is too long to be sent via UDP. "
-                "Byte size %" PRI_SIZET " > %" PRI_SIZET ".",
-                current_line_len,
-                (size_t)max_udp_packet_size);
-            return false;
-        }
-    }
-    return true;
-}
-
 static inline void update_last_line_start(linesender* sender)
 {
     sender->last_line_start = linesender_pending_size(sender);
@@ -1008,8 +879,6 @@ bool linesender_at(
     linesender_error** err_out)
 {
     if (!check_state(&sender->state, linesender_op_at, err_out))
-        return false;
-    if (!check_udp_max_line_len(sender, err_out))
         return false;
     memwriter* writer = &sender->writer;
     memwriter_char(writer, ' ');
@@ -1026,8 +895,6 @@ bool linesender_at_now(
 {
     if (!check_state(&sender->state, linesender_op_at, err_out))
         return false;
-    if (!check_udp_max_line_len(sender, err_out))
-        return false;
     memwriter_char(&sender->writer, '\n');
     update_last_line_start(sender);
     sender->state = linesender_state_may_flush_or_table;
@@ -1041,7 +908,7 @@ size_t linesender_pending_size(linesender* sender)
         : 0;
 }
 
-static inline bool send_tcp(linesender* sender, sock_len_t len, const char* buf)
+static inline bool send_all(linesender* sender, sock_len_t len, const char* buf)
 {
     while (len)
     {
@@ -1063,54 +930,6 @@ static inline bool send_tcp(linesender* sender, sock_len_t len, const char* buf)
     return true;
 }
 
-static inline bool send_udp(linesender* sender, sock_len_t len, const char* buf)
-{
-    while (len)
-    {
-        sock_len_t boundary = (len < max_udp_packet_size)
-            ? len
-            : max_udp_packet_size;
-
-        for (sock_len_t index = boundary; index-- > 0;)
-        {
-            const char last = buf[index];
-
-            // Note: No need to validate here.
-            // `buf[index - 1]` can't fail due to state machine logic and UDP
-            // max line len validation in `linesender_at_*` functions.
-            const char penultimate = buf[index - 1];
-
-            if ((last == '\n') && (penultimate != '\\'))
-            {
-                boundary = index + 1;
-                break;
-            }
-        }
-
-        sock_ssize_t send_res = sendto(
-            sender->sock_fd,
-            buf,
-            boundary,
-            0,
-            sender->dest_info->ai_addr,
-            (sock_len_t)sender->dest_info->ai_addrlen);
-
-        // We're sending UDP where `sendto` can't send less than a full packet.
-        // As we've validated our buffer to be less than a maximum packet size,
-        // we don't need to be concerned with partial writes.
-        if (send_res != SOCKET_ERROR)
-        {
-            buf += boundary;
-            len -= boundary;
-        }
-        else
-        {
-            return false;
-        }
-    }
-    return true;
-}
-
 bool linesender_flush(
     linesender* sender,
     linesender_error** err_out)
@@ -1121,9 +940,7 @@ bool linesender_flush(
     size_t len = 0;
     const char* buf = memwriter_peek(&sender->writer, &len);
 
-    const bool send_ok = (sender->transport == linesender_tcp)
-        ? send_tcp(sender, (sock_len_t)len, buf)
-        : send_udp(sender, (sock_len_t)len, buf);
+    const bool send_ok = send_all(sender, (sock_len_t)len, buf);
     if (!send_ok)
     {
         const errno_t errnum = get_last_sock_err();

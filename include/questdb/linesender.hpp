@@ -46,30 +46,20 @@ namespace questdb::proto::line
         int _errnum;
     };
 
-    enum class transport : uint8_t
-    {
-        tcp = linesender_tcp,
-        udp = linesender_udp
-    };
-
     class sender
     {
     public:
         sender(
-            transport t,
             const char* host,
             const char* port,
-            const char* interface = inaddr_any,
-            int udp_multicast_ttl = 1)
+            const char* interface = inaddr_any)
                 : _impl{nullptr}
         {
             linesender_error* c_err{nullptr};
             _impl = linesender_connect(
-                static_cast<linesender_transport>(static_cast<int>(t)),
                 interface,
                 host,
                 port,
-                udp_multicast_ttl,
                 &c_err);
             if (!_impl)
                 throw sender_error::from_c(c_err);

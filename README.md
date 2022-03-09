@@ -1,4 +1,4 @@
-# QuestDB - Influx DB Line Protocol - Ingestion Client Library for C and C++
+# QuestDB - Line Protocol - Ingestion Client Library for C and C++
 
 * Implementation is in C11, with no dependency on the C++ standard library
   for simpler inclusion into other projects.
@@ -6,8 +6,48 @@
 
 ## Protocol
 
+This client library implements the input line protocol over TCP.
+
 * Reference docs: https://questdb.io/docs/reference/api/ilp/overview/
 
+Whilst this library performs as much validation ahead of time as possible,
+the protocol does not report errors or report progress.
+
+As such, due to error in the database or crashes, not all the data may end up
+being written. You can however expect well-formed data to be written so long as
+it has been received by the database.
+
+Data will be written in the order it is sent, unless the
+[out-of-order feature](https://questdb.io/docs/guides/out-of-order-commit-lag/#how-to-configure-out-of-order-ingestion)
+is used in QuestDB which will reorder records based on timestamp.
+
+The protocol does not implement authentication and does not resume in case
+of a client-side crash. If you want to be certain that your data has been
+written you will need to:
+
+* Wait for your data to be written, as per the
+  [Load balancing](https://questdb.io/docs/reference/configuration/#load-balancing)
+  configuration section.
+
+* Execute a `select` SQL query to check for the presence of your data.
+
+## Rules for well-formed data
+
+When inserting data through the API, you must follow a set of rules.
+Some are validated by the client library, others will cause the engine to fail silently.
+
+### Library-validated rules
+
+* Strings and symbols must be passed in as valid UTF-8 which
+  need not be nul-terminated.
+* Table names, symbol and column names can't contain the characters `?`, `.`,
+  `,`, `'`, `"`, `\`, `/`, `:`, `(`, `)`, `+`, `-`, `*`, `%`, `~`,
+  `' '` (space), `\0` (nul terminator),
+  [ZERO WIDTH NO-BREAK SPACE](https://unicode-explorer.com/c/FEFF).
+
+### Non-validated rules
+
+TODO: document me.
 
 ## Building
 
@@ -19,8 +59,6 @@ Then follow the [build instructions](BUILD.md).
 
 If you happen to also use CMake in your own project, you can include it as an
 [external cmake dependency](CMAKE_DEPENDENCY.md).
-
-**Note**: The code currently only targets 64-bit platforms.
   
 ## Usage
 
@@ -33,11 +71,9 @@ If you happen to also use CMake in your own project, you can include it as an
 
 linesender_error* err = NULL;
 linesender* sender = linesender_connect(
-  linesender_tcp,
   "0.0.0.0",   // bind to all interfaces
   "127.0.0.1", // QuestDB hostname
   "9009",      // QuestDB port
-  0,  // ignored for TCP
   &err);
 ```
 
@@ -52,7 +88,6 @@ See a [complete example in C](examples/linesender_example.c).
 
 // Automatically connects on object construction.
 auto sender = questdb::proto::line::sender{
-  questdb::proto::line::transport::tcp,
   "127.0.0.1",  // QuestDB hostname
   "9009"};      // QuestDB port
 
@@ -144,19 +179,6 @@ if (!linesender_table(
 If you intend to retry, you must call close the existing sender object and
 create a new one. The same sender object can't be reused.
 
-### TCP or UDP reliability and performance
-
-Data send over TCP is going to be written reliably.
-
-The UDP protocol should provide higher throughput, but by contrast,
-makes no such guarantees and may result in dropped packets.
-The line protocol does *not* verify if data has been written
-and does *not* resend dropped lines. When using UDP you should also be aware
-that `linesender_flush(..)` will fail if
-`linesender_pending_size(sender) > 64000`. This logic is in place to avoid
-corrupting lines. In other words, when using UDP you may end up with missing
-data, but not corrupt data.
-
 ## If you don't see any data
 
 You may be experiencing one of these three issues.
@@ -168,11 +190,6 @@ These settings can be changed. Tune the `cairo.max.uncommitted.rows`,
 `line.tcp.commit.timeout` and `line.tcp.maintenance.job.interval`
 [Load balancing](https://questdb.io/docs/reference/configuration/#load-balancing)
 settings.
-
-### Ingestion protocol behaviour
-If you're still not succeeding, note that the same port is used for both TCP
-and UDP and once data is sent using one transport the other transport will be
-ignored.
 
 ### API usage
 The API doesn't send any data over the network until the `linesender_flush`
