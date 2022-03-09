@@ -131,7 +131,14 @@ bool mock_server::wait_for_data(std::optional<double> wait_timeout_sec)
     int nfds = static_cast<int>(_conn_fd) + 1;
     int count = ::select(nfds, &read_set, nullptr, nullptr, timeout_ptr);
     if (count == -1)
-        throw std::runtime_error{"Bad `select()`."};
+    {
+#if defined(PLATFORM_UNIX)
+        int errnum = errno;
+#elif defined(PLATFORM_WINDOWS)
+        int errnum = WSAGetLastError();
+#endif
+        throw std::runtime_error{"Bad `select()`: " + std::to_string(errnum)};
+    }
     return !!count;
 }
 

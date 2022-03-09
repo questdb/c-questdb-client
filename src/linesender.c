@@ -295,7 +295,7 @@ static char* describe_buf(size_t len, const char* buf, size_t* descr_len_out)
     const size_t max_len = 100;
     const bool trim = len >= max_len;
     const size_t working_len = trim
-        ? max_len - 3  // 3 here for trailing `...`
+        ? max_len - 3  // 3 here for trailing "..."
         : len;
     memwriter writer;
 
@@ -352,7 +352,7 @@ static struct addrinfo* resolve_addr(
             *err_out = err_printf(
                 NULL,
                 0,  // Note: gai_err_code != errno
-                "Could not resolve \"%.*s:%.*s\": %s.",
+                "Could not resolve \"%.*s:%.*s\": %s",
                 (int)host_descr_len,
                 host_descr,
                 (int)port_descr_len,
@@ -369,7 +369,7 @@ static struct addrinfo* resolve_addr(
             *err_out = err_printf(
                 NULL,
                 0,  // Note: gai_err_code != errno
-                "Could not resolve \"%.*s\": %s.",
+                "Could not resolve \"%.*s\": %s",
                 (int)host_descr_len,
                 host_descr,
                 gai_strerror(gai_err_code));
@@ -491,7 +491,7 @@ linesender* linesender_connect(
         *err_out = err_printf(
             NULL,
             errnum,
-            "Could not bind to interface address `%s`: %s.",
+            "Could not bind to interface address \"%s\": %s.",
             net_interface,
             err_descr);
         sock_err_str_free(err_descr);
@@ -505,7 +505,7 @@ linesender* linesender_connect(
         *err_out = err_printf(
             NULL,
             errnum,
-            "Could not connect to `%s:%s`: %s.",
+            "Could not connect to \"%s:%s\": %s.",
             host,
             port,
             err_descr);

@@ -9,11 +9,14 @@
 #include "../src/utf8.h"
 
 #include <vector>
+#include <sstream>
 
 extern "C"
 {
 #include "../src/next_pow2.inc.c"
 }
+
+using namespace std::string_literals;
 
 TEST_CASE("next_pow2")
 {
@@ -154,6 +157,47 @@ TEST_CASE("linesender c++ api basics")
     CHECK(server.msgs().front() == "test,t1=v1 f1=0.5 10000000\n");
 }
 
+TEST_CASE("test multiple lines")
+{
+    WSASTARTUP_GUARD;
+    questdb::proto::line::test::mock_server server;
+    questdb::proto::line::sender sender{
+        "localhost",
+        std::to_string(server.port()).c_str()};
+    CHECK_FALSE(sender.must_close());
+    server.accept();
+    CHECK(server.recv() == 0);
+
+    sender
+        .table("metric1")
+        .symbol("t1", std::string{"val1"})
+        .symbol("t2", std::string_view{"val2"})
+        .column("f1", true)
+        .column("f2", static_cast<int64_t>(12345))
+        .column("f3", 10.75)
+        .column("f4", "val3")
+        .column("f5", std::string{"val4"})
+        .column("f6", std::string_view{"val5"})
+        .at(111222233333);
+    sender
+        .table("metric1")
+        .symbol("tag3", "value 3")
+        .symbol("tag\n4", "value:4")
+        .column("field\t5", false)
+        .at_now();
+
+    CHECK(server.recv() == 0);
+    CHECK(sender.pending_size() == 138);
+    sender.flush();
+    CHECK(server.recv() == 2);
+    CHECK(server.msgs()[0] ==
+        ("metric1,t1=val1,t2=val2 f1=t,f2=12345i,"
+         "f3=10.75,f4=\"val3\",f5=\"val4\",f6=\"val5\" 111222233333\n"));
+    CHECK(server.msgs()[1] ==
+        ("metric1,tag3=value\\ 3,tag\\\n"
+         "4=value:4 field\t5=f\n"));
+}
+
 TEST_CASE("State machine testing -- flush without data.")
 {
     WSASTARTUP_GUARD;
@@ -270,6 +314,55 @@ TEST_CASE("Validation of bad chars in key names.")
             "which was found at byte position 1.",
             questdb::proto::line::sender_error);
     }
+
+    auto test_bad_name = [](std::string bad_name)
+        {
+            questdb::proto::line::test::mock_server server;
+            questdb::proto::line::sender sender{
+                "localhost",
+                std::to_string(server.port()).c_str()};
+
+            try
+            {
+                sender.table(bad_name);
+                std::stringstream ss;
+                ss << "Name `" << bad_name << "` (";
+                for (const char& c : bad_name)
+                {
+                    ss << "\\x"
+                       << std::hex
+                       << std::setw(2)
+                       << std::setfill('0')
+                       << c;
+                }
+                ss << ") did not raise.";
+                CHECK_MESSAGE(false, ss.str());
+            }
+            catch (const questdb::proto::line::sender_error&)
+            {
+                return;
+            }
+            catch (...)
+            {
+                CHECK_MESSAGE(false, "Other exception raised.");
+            }
+        };
+
+    std::vector<std::string> bad_chars{
+        " "s, "?"s, "."s, ","s, "'"s, "\""s, "\\"s, "/"s, "\0"s, ":"s,
+        ")"s, "("s, "+"s, "-"s, "*"s, "%"s, "~"s, "\xef\xbb\xbf"s};
+
+    for (const auto& bad_char : bad_chars)
+    {
+        std::vector<std::string> bad_names{
+            bad_char + "abc",
+            "ab" + bad_char + "c",
+            "abc" + bad_char};
+        for (const auto& bad_name : bad_names)
+        {
+            test_bad_name(bad_name);
+        }
+    }
 }
 
 TEST_CASE("Move testing.")
@@ -302,4 +395,103 @@ TEST_CASE("Move testing.")
     sender3 = std::move(sender2);
     CHECK(sender3.pending_size() == 0);
     CHECK(sender3.must_close());
+}
+
+TEST_CASE("Bad hostname")
+{
+    WSASTARTUP_GUARD;
+
+    try
+    {
+        questdb::proto::line::sender sender{"dummy_hostname", "9009"};
+        CHECK_MESSAGE(false, "Expected exception");
+    }
+    catch (const questdb::proto::line::sender_error& se)
+    {
+        std::string msg{se.what()};
+        CHECK(msg.rfind("Could not resolve \"dummy_hostname:9009\": ", 0) == 0);
+    }
+    catch (...)
+    {
+        CHECK_MESSAGE(false, "Other exception raised.");
+    }
+}
+
+TEST_CASE("Bad interface")
+{
+    WSASTARTUP_GUARD;
+
+    try
+    {
+        questdb::proto::line::sender sender{
+            "localhost",
+            "9009",
+            "dummy_hostname"};
+        CHECK_MESSAGE(false, "Expected exception");
+    }
+    catch (const questdb::proto::line::sender_error& se)
+    {
+        std::string msg{se.what()};
+        CHECK(msg.rfind("Could not resolve \"dummy_hostname\": ", 0) == 0);
+    }
+    catch (...)
+    {
+        CHECK_MESSAGE(false, "Other exception raised.");
+    }
+}
+
+TEST_CASE("Bad port")
+{
+    WSASTARTUP_GUARD;
+
+    const auto test_bad_port = [](std::string bad_port)
+        {
+            try
+            {
+                questdb::proto::line::sender sender{
+                    "localhost",
+                    bad_port};
+                CHECK_MESSAGE(false, "Expected exception");
+            }
+            catch (const questdb::proto::line::sender_error& se)
+            {
+                std::string msg{se.what()};
+                std::string exp_msg{"\"localhost:" + bad_port + "\": "};
+                CHECK(msg.find(exp_msg) != std::string::npos);
+            }
+            catch (...)
+            {
+                CHECK_MESSAGE(false, "Other exception raised.");
+            }
+        };
+
+    test_bad_port("wombat");
+    test_bad_port("0");
+
+    // On Windows this *actually* resolves, but fails to connect.
+    test_bad_port("-1");
+}
+
+TEST_CASE("Bad connect")
+{
+    WSASTARTUP_GUARD;
+
+    try
+    {
+        // Port 1 is generally the tcpmux service which one would
+        // very much expect to never be running.
+        questdb::proto::line::sender sender{
+            "127.0.0.1",
+            1};
+        CHECK_MESSAGE(false, "Expected exception");
+    }
+    catch (const questdb::proto::line::sender_error& se)
+    {
+        std::string msg{se.what()};
+        CHECK(msg.rfind("Could not connect", 0) == 0);
+    }
+    catch (...)
+    {
+        CHECK_MESSAGE(false, "Other exception raised.");
+    }
 }

@@ -5,6 +5,7 @@
 #include <string>
 #include <string_view>
 #include <stdexcept>
+#include <cstdint>
 
 namespace questdb::proto::line
 {
@@ -52,18 +53,48 @@ namespace questdb::proto::line
         sender(
             const char* host,
             const char* port,
-            const char* interface = inaddr_any)
+            const char* net_interface = inaddr_any)
                 : _impl{nullptr}
         {
             linesender_error* c_err{nullptr};
             _impl = linesender_connect(
-                interface,
+                net_interface,
                 host,
                 port,
                 &c_err);
             if (!_impl)
                 throw sender_error::from_c(c_err);
         }
+
+        sender(
+            std::string_view host,
+            std::string_view port,
+            std::string_view net_interface = inaddr_any)
+                : sender{
+                    std::string{host}.c_str(),
+                    std::string{port}.c_str(),
+                    std::string{net_interface}.c_str()}
+        {}
+
+        sender(
+            std::string_view host,
+            uint16_t port,
+            std::string_view net_interface = inaddr_any)
+                : sender{
+                    std::string{host}.c_str(),
+                    std::to_string(port).c_str(),
+                    std::string{net_interface}.c_str()}
+        {}
+
+        sender(
+            const char* host,
+            uint16_t port,
+            const char* net_interface = inaddr_any)
+                : sender{
+                    host,
+                    std::to_string(port).c_str(),
+                    net_interface}
+        {}
 
         sender(sender&& other)
             : _impl{other._impl}
@@ -108,6 +139,11 @@ namespace questdb::proto::line
             return *this;
         }
 
+        // Require specific overloads of `column` to avoid
+        // involuntary usage of the `bool` overload.
+        template <typename T>
+        sender& column(std::string_view name, T value) = delete;
+
         sender& column(std::string_view name, bool value)
         {
             sender_error::wrapped_call(
@@ -151,6 +187,16 @@ namespace questdb::proto::line
                 value.size(),
                 value.data());
             return *this;
+        }
+
+        sender& column(std::string_view name, const char* value)
+        {
+            return column(name, std::string_view{value});
+        }
+
+        sender& column(std::string_view name, const std::string& value)
+        {
+            return column(name, std::string_view{value});
         }
 
         void at(int64_t timestamp_epoch_nanos)
