@@ -16,9 +16,6 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/install)
-set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/install)
-
 set(LIB_SOURCES
     src/aborting_malloc.c
     src/linesender.c
@@ -54,11 +51,14 @@ target_include_directories(
     c_questdb_client
     PUBLIC ${CMAKE_SOURCE_DIR}/include)
 set_compile_flags(c_questdb_client)
+target_compile_definitions(
+    c_questdb_client
+    PUBLIC
+    LINESENDER_DYN_LIB)
 if(WIN32)
     set_target_properties(
         c_questdb_client
         PROPERTIES
-        DEFINE_SYMBOL "LINESENDER_DYN_LIB"
         DEFINE_SYMBOL "LINESENDER_EXPORTS")
     target_link_libraries(c_questdb_client wsock32 ws2_32)
 endif(WIN32)
@@ -94,7 +94,7 @@ if(UNIX)
     set_compile_flags(c_questdb_client_static_pic)
 endif(UNIX)
 
-# Test binary.
+# Unit test binary.
 add_executable(
     test_linesender
     test/mock_server.cpp
@@ -110,3 +110,23 @@ set_compile_flags(test_linesender)
 add_test(
     NAME test_linesender
     COMMAND test_linesender)
+
+# System testing Python3 script.
+# This will download the latest QuestDB instance from Github,
+# thus will also require a Java 11 installation to run the tests.
+if(QUESTDB_SYSTEM_TESTING)
+    find_package(
+        Python3
+        REQUIRED
+        COMPONENTS Interpreter)
+    find_package(
+        Java
+        11
+        REQUIRED)
+    add_test(
+        NAME system_test
+        COMMAND python3 ${CMAKE_SOURCE_DIR}/system_test/test.py)
+    set_tests_properties(
+        system_test PROPERTIES
+        ENVIRONMENT BUILD_DIR_PATH=${CMAKE_BINARY_DIR})
+endif(QUESTDB_SYSTEM_TESTING)

@@ -1,0 +1,235 @@
+import sys
+sys.dont_write_bytecode = True
+
+import os
+import pathlib
+import textwrap
+import json
+import tarfile
+import shutil
+import subprocess
+import time
+import socket
+import atexit
+import shlex
+import urllib.request
+import urllib.parse
+import urllib.error
+
+def retry(predicate_task, timeout_sec=30, every=0.05, msg='Timed out retrying'):
+    """
+    Repeat task every `interval` until it returns a truthy value or times out.
+    """
+    begin = time.monotonic()
+    threshold = begin + timeout_sec
+    while True:
+        res = predicate_task()
+        if res:
+            return res
+        elif time.monotonic() < threshold:
+            time.sleep(every)
+        else:
+            raise TimeoutError(msg)
+
+
+def discover_avail_ports(num_required):
+    """Discover available TCP listening ports."""
+    # We need to find free ports.
+    # Note: This a hack. We bind and then close.
+    # There's obviously a race condition here.
+    sockets = [
+        socket.socket()
+        for _ in range(num_required)]
+    for sock in sockets:
+        sock.bind(('', 0))
+    free_ports = [
+        sock.getsockname()[1]
+        for sock in sockets]
+    for sock in sockets:
+        sock.close()
+    return free_ports
+
+
+class Project:
+    def __init__(self):
+        self.system_test_dir = pathlib.Path(__file__).absolute().parent
+        self.root_dir = self.system_test_dir.parent
+        self.build_dir = pathlib.Path(os.environ.get(
+            'BUILD_DIR_PATH',
+            self.root_dir / 'build'))
+        if not self.build_dir.exists():
+            raise RuntimeError('Build before running tests.')
+        self.questdb_dir = self.build_dir / 'questdb'
+        self.questdb_dir.mkdir(exist_ok=True)
+        self.questdb_downloads_dir = self.questdb_dir / 'downloads'
+        self.questdb_downloads_dir.mkdir(exist_ok=True)
+
+
+def list_questdb_releases(max_results=1):
+    url = (
+        'https://api.github.com/repos/questdb/questdb/releases?' +
+        urllib.parse.urlencode({'per_page': max_results}))
+    req = urllib.request.Request(
+        url,
+        headers={
+            'User-Agent': 'system-testing-script',
+            'Accept': "Accept: application/vnd.github.v3+json"},
+        method='GET')
+    resp = urllib.request.urlopen(req)
+    data = resp.read()
+    releases = json.loads(data.decode('utf8'))
+    for release in releases:
+        vers = release['name']
+        no_jre_assets = [
+            asset for asset
+            in release['assets']
+            if 'no-jre' in asset['name']]
+        if no_jre_assets:
+            download_url = no_jre_assets[0]['browser_download_url']
+            yield (vers, download_url)
+
+
+def install_questdb(vers: str, download_url: str):
+    proj = Project()
+    version_dir = proj.questdb_dir / vers
+    if version_dir.exists():
+        sys.stderr.write(f'Resetting pre-existing QuestDB v.{vers} install.\n')
+        shutil.rmtree(version_dir / 'data')
+        (version_dir / 'data' / 'log').mkdir(parents=True)
+        return version_dir
+    sys.stderr.write(f'Downloading QuestDB v.{vers} from {download_url!r}.\n')
+    archive_path = proj.questdb_downloads_dir / f'{vers}.tar.gz'
+
+    response = urllib.request.urlopen(download_url)
+    data = response.read()
+    with open(archive_path, 'wb') as archive_file:
+        archive_file.write(data)
+    tmp_version_dir = proj.questdb_dir / f'_tmp_{vers}'
+    try:
+        archive = tarfile.open(archive_path)
+        archive.extractall(tmp_version_dir)
+        archive.close()
+    except:
+        shutil.rmtree(tmp_version_dir, ignore_errors=True)
+        raise
+    bin_dir = tmp_version_dir / 'bin'
+    next(tmp_version_dir.glob("**/questdb.jar")).parent.rename(bin_dir)
+    (tmp_version_dir / 'data' / 'log').mkdir(parents=True)
+    tmp_version_dir.rename(version_dir)
+    return version_dir
+
+
+def _parse_version(vers_str):
+    def try_int(vers_part):
+        try:
+            return int(vers_part)
+        except ValueError:
+            return vers_part
+
+    return tuple(
+        try_int(vers_part)
+        for vers_part in vers_str.split('.'))
+
+
+def _find_java():
+    search_path = None
+    java_home = os.environ.get('JAVA_HOME')
+    if java_home:
+        search_path = pathlib.Path(java_home) / 'bin'
+    return shutil.which('java', path=search_path)
+
+
+class QuestDbFixture:
+    def __init__(self, root_dir: pathlib.Path):
+        self._root_dir = root_dir
+        self.version = _parse_version(self._root_dir.name)
+        self._data_dir = self._root_dir / 'data'
+        self._log_path = self._data_dir / 'log' / 'log.txt'
+        conf_dir = self._data_dir / 'conf'
+        conf_dir.mkdir()
+        self._conf_path = conf_dir / 'server.conf'
+        self._log = None
+        self._proc = None
+        self.http_server_port = None
+        self.line_tcp_port = None
+        self.pg_port = None
+
+    def start(self):
+        ports = discover_avail_ports(3)
+        self.http_server_port, self.line_tcp_port, self.pg_port = ports
+        with open(self._conf_path, 'w', encoding='utf-8') as conf_file:
+            conf_file.write(textwrap.dedent(rf'''
+                http.bind.to=0.0.0.0:{self.http_server_port}
+                line.tcp.net.bind.to=0.0.0.0:{self.line_tcp_port}
+                pg.net.bind.to=0.0.0.0:{self.pg_port}
+                http.min.enabled=false
+                line.udp.enabled=false
+                cairo.max.uncommitted.rows=1
+                line.tcp.maintenance.job.interval=100
+                ''').lstrip('\n'))
+
+        java = _find_java()
+        launch_args = [
+            java,
+            '-DQuestDB-Runtime-0',
+            '-ea',
+            '-Dnoebug',
+            '-XX:+UnlockExperimentalVMOptions',
+            '-XX:+AlwaysPreTouch',
+            '-XX:+UseParallelOldGC',
+            '-p', str(self._root_dir / 'bin' / 'questdb.jar'),
+            '-m', 'io.questdb/io.questdb.ServerMain',
+            '-d', str(self._data_dir)]
+        sys.stderr.write(f'Starting QuestDB: {shlex.join(launch_args)}\n')
+        self._log = open(self._log_path, 'ab')
+        try:
+            self._proc = subprocess.Popen(
+                launch_args,
+                close_fds=True,
+                cwd=self._data_dir,
+                # env=launch_env,
+                stdout=self._log,
+                stderr=subprocess.STDOUT)
+
+            def check_http_up():
+                if self._proc.poll() is not None:
+                    raise RuntimeError('QuestDB died during startup.')
+                req = urllib.request.Request(
+                    f'http://localhost:{self.http_server_port}',
+                    method='HEAD')
+                try:
+                    resp = urllib.request.urlopen(req, timeout=1)
+                    if resp.status == 200:
+                        return True
+                except socket.timeout:
+                    pass
+                except urllib.error.URLError:
+                    pass
+                return False
+
+            sys.stderr.write('Waiting until HTTP service is up.\n')
+            retry(
+                check_http_up,
+                timeout_sec=20,
+                msg='Timed out waiting for HTTP service to come up.')
+        except:
+            sys.stderr.write(f'Failed to start, see: {self._log_path}\n')
+            raise
+
+        atexit.register(self.stop)
+        sys.stderr.write('QuestDB fixture instance is ready.\n')
+
+    def __enter__(self):
+        self.start()
+
+    def stop(self):
+        if self._proc:
+            self._proc.terminate()
+            self._proc.wait()
+            self._proc = None
+        if self._log:
+            self._log.close()
+            self._log = None
+
+    def __exit__(self, _ty, _value, _tb):
+        self.stop()

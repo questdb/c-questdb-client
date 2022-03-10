@@ -92,9 +92,11 @@ typedef enum linesender_state
 {
     linesender_state_connected =
         linesender_op_table,
-    linesender_state_table_or_symbol_written =
+    linesender_state_table_written =
         linesender_op_symbol | linesender_op_column,
-    linesender_state_next_column_or_end =
+    linesender_state_symbol_written =
+        linesender_op_symbol | linesender_op_column | linesender_op_at,
+    linesender_state_column_written =
         linesender_op_column | linesender_op_at,
     linesender_state_may_flush_or_table =
         linesender_op_flush | linesender_op_table,
@@ -107,9 +109,11 @@ static inline const char* linesender_state_next_op_descr(linesender_state state)
     {
         case linesender_state_connected:
             return "should have called `table` instead";
-        case linesender_state_table_or_symbol_written:
+        case linesender_state_table_written:
             return "should have called `symbol` or `column` instead";
-        case linesender_state_next_column_or_end:
+        case linesender_state_symbol_written:
+            return "should have called `symbol`, `column` or `at` instead";
+        case linesender_state_column_written:
             return "should have called `column` or `at` instead";
         case linesender_state_may_flush_or_table:
             return "should have called `flush` or `table` instead";
@@ -324,11 +328,6 @@ static struct addrinfo* resolve_addr(
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
 
-    // TODO: Review suitability for intended use case.
-    // IPv4 Address resolution only at this point, no IPv6.
-    // This is for feature parity with the Java implementation.
-    // That said - barring testing - this should be the only code that
-    // prevents the sender to work with both IPv4 and IPv6.
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
     struct addrinfo* addr = NULL;
@@ -458,12 +457,6 @@ linesender* linesender_connect(
     }
 #endif
 
-    // TODO: Review suitability for intended use case.
-    // Compromise: We rely on the client to batch a sufficient number of
-    // lines for decent throughput. This still allows for decent
-    // timeliness.
-    // This is bad if the client sends batch sizes of 1.
-    // Maybe the answer here is to expose `nodelay` as an arg.
     int no_delay = 1;
     if (setsockopt(
         sock_fd,
@@ -597,22 +590,11 @@ static inline bool check_key_name(
     if (!check_utf8(state, len, name, err_out))
         return false;
 
-    // TODO: Review for correctness.
-    // Specifically, this logic is also used to validate table names.
-    // The validation logic is lifted from:
-    // src/main/java/io/questdb/cairo/TableUtils.java's `isValidColumnName`.
-    // Note that this differs from the InfluxDB spec since it allows names
-    // that start with an underscore. See:
-    // As per: https://docs.influxdata.com/influxdb/v2.0/reference/
-    //   syntax/line-protocol/#naming-restrictions
     for (size_t index = 0; index < len; ++index)
     {
         const char c = name[index];
         switch (c)
         {
-            // TODO: Review for correctness.
-            // Do we really want to allow non-printable chars,
-            // like \1 \r \t \f etc in this context?
             case ' ':
             case '?':
             case '.':
@@ -762,7 +744,7 @@ bool linesender_table(
 
     write_escaped_unquoted(&sender->writer, name_len, name);
 
-    sender->state = linesender_state_table_or_symbol_written;
+    sender->state = linesender_state_table_written;
     return true;
 }
 
@@ -786,6 +768,7 @@ bool linesender_symbol(
     memwriter_char(&sender->writer, '=');
     write_escaped_unquoted(&sender->writer, value_len, value);
 
+    sender->state = linesender_state_symbol_written;
     return true;
 }
 
@@ -802,13 +785,13 @@ static inline bool write_column_key(
         return false;
 
     const char separator =
-        (sender->state == linesender_state_table_or_symbol_written)
+        (sender->state & linesender_op_symbol)
             ? ' '
             : ',';
     memwriter_char(&sender->writer, separator);
     write_escaped_unquoted(&sender->writer, name_len, name);
     memwriter_char(&sender->writer, '=');
-    sender->state = linesender_state_next_column_or_end;
+    sender->state = linesender_state_column_written;
     return true;
 }
 

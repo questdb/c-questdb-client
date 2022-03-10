@@ -217,7 +217,7 @@ TEST_CASE("State machine testing -- flush without data.")
     sender.close();
 }
 
-TEST_CASE("State machine testing -- endline without columns.")
+TEST_CASE("One symbol only - flush before server accept")
 {
     WSASTARTUP_GUARD;
     questdb::proto::line::test::mock_server server;
@@ -225,15 +225,39 @@ TEST_CASE("State machine testing -- endline without columns.")
         "localhost",
         std::to_string(server.port()).c_str()};
     
-    sender.table("test").symbol("t1", "v1");
-    CHECK_THROWS_WITH_AS(
-        sender.at_now(),
-        "State error: Bad call to `at`, "
-        "should have called `symbol` or `column` instead. "
-        "Must now call `close`.",
-        questdb::proto::line::sender_error);
-    CHECK(sender.must_close());
+    // Does not raise - this is unlike InfluxDB spec that disallows this.
+    sender.table("test").symbol("t1", "v1").at_now();
+    CHECK(!sender.must_close());
+    CHECK(sender.pending_size() == 11);
+    sender.flush();
     sender.close();
+
+    // Note the client has closed already,
+    // but the server hasn't actually accepted the client connection yet.
+    server.accept();
+    CHECK(server.recv() == 1);
+    CHECK(server.msgs()[0] == "test,t1=v1\n");
+}
+
+TEST_CASE("One column only - server.accept() after flush, before close")
+{
+    WSASTARTUP_GUARD;
+    questdb::proto::line::test::mock_server server;
+    questdb::proto::line::sender sender{
+        "localhost",
+        server.port()};
+
+    // Does not raise - this is unlike InfluxDB spec that disallows this.
+    sender.table("test").column("t1", "v1").at_now();
+    CHECK(!sender.must_close());
+    CHECK(sender.pending_size() == 13);
+    sender.flush();
+
+    server.accept();
+    sender.close();
+
+    CHECK(server.recv() == 1);
+    CHECK(server.msgs()[0] == "test t1=\"v1\"\n");
 }
 
 TEST_CASE("Bad UTF-8 in table")

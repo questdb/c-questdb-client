@@ -201,17 +201,15 @@ is called.
 ## Windows Dynamic Library Linkage Issues
 
 If you depend on this library as a dynamic library on Windows you need to
-define `LINESENDER_DYN_LIB` before importing the header.
+define `LINESENDER_DYN_LIB` as compiler argument when compiling your code.
 
-```c
-#define LINESENDER_DYN_LIB
-#include <questdb/linesender.h>  // or .hpp
-```
+If you're depending on the cmake infrastructure, this should be added for you
+automatically.
 
 The `LINESENDER_DYN_LIB` define is to allow the header to mark all public APIs
 as `__declspec(dllimport)` and have symbols resolve correctly at runtime.
 
-*You don't need to do any of this if you're using this library as a static lib.*
+*Don't do any of this if you're linking the library statically.*
 
 ## License
 

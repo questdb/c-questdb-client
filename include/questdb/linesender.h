@@ -27,6 +27,8 @@ extern "C" {
 #        endif
 #    elif (__GNUC__ >= 4)
 #        define LINESENDER_API __attribute__ ((visibility("default")))
+#    else
+#        error "Compiler unsupported or badly detected."
 #    endif
 #else
 #    define LINESENDER_API
