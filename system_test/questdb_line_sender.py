@@ -54,7 +54,7 @@ def _setup_cdll():
         fn.argtypes = argtypes
 
     set_sig(
-        dll.line_sender_error_errnum,
+        dll.line_sender_error_get_code,
         c_line_sender_error_p,
         c_int,
         c_void_p)
@@ -163,8 +163,7 @@ _PY_DLL.PyUnicode_FromKindAndData.argtypes = [c_int, c_void_p, c_ssize_t]
 
 class LineSenderError(Exception):
     """An error whilst using the line sender."""
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    pass
 
 
 def _c_err_to_py(err_p):

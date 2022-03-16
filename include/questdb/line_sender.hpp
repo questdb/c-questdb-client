@@ -13,25 +13,37 @@ namespace questdb
 
     class line_sender;
 
+    enum class line_sender_error_code
+    {
+        could_not_resolve_addr,
+        invalid_api_call,
+        socket_error,
+        invalid_utf8,
+        invalid_identifier
+    };
+
     class line_sender_error : public std::runtime_error
     {
     public:
-        line_sender_error(int errnum, const std::string& what)
+        line_sender_error(line_sender_error_code code, const std::string& what)
                 : std::runtime_error{what}
-                , _errnum{errnum}
+                , _code{code}
         {}
 
         /** Returns 0 if there is no associated error number. */
-        int errnum() const { return _errnum; }
+        line_sender_error_code code() const { return _code; }
 
     private:
         inline static line_sender_error from_c(::line_sender_error* c_err)
         {
-            int errnum{::line_sender_error_errnum(c_err)};
+            line_sender_error_code code =
+                static_cast<line_sender_error_code>(
+                    static_cast<int>(
+                        ::line_sender_error_get_code(c_err)));
             size_t c_len{0};
             const char* c_msg{::line_sender_error_msg(c_err, &c_len)};
             std::string msg{c_msg, c_len};
-            line_sender_error err{errnum, msg};
+            line_sender_error err{code, msg};
             ::line_sender_error_free(c_err);
             return err;
         }
@@ -46,7 +58,7 @@ namespace questdb
 
         friend class line_sender;
 
-        int _errnum;
+        line_sender_error_code _code;
     };
 
     class line_sender

@@ -125,7 +125,7 @@ static inline const char* line_sender_state_next_op_descr(line_sender_state stat
 
 struct line_sender_error
 {
-    int errnum;
+    line_sender_error_code code;
     size_t len;
     char* msg;
 };
@@ -133,14 +133,14 @@ struct line_sender_error
 #if defined(COMPILER_GNUC)
 static line_sender_error* err_printf(
     line_sender_state* state,
-    int errnum,
+    line_sender_error_code code,
     const char* fmt,
     ...) __attribute__ ((format (printf, 3, 4)));
 #endif
 
 static line_sender_error* err_printf(
     line_sender_state* state,
-    int errnum,
+    line_sender_error_code code,
     const char* fmt,
     ...)
 {
@@ -156,7 +156,7 @@ static line_sender_error* err_printf(
     char* msg = mem_writer_steal_and_close(&msg_writer, &len);
 
     line_sender_error* err = aborting_malloc(sizeof(line_sender_error));
-    err->errnum = errnum;
+    err->code = code;
     err->len = len;
     err->msg = msg;
     return err;
@@ -236,9 +236,9 @@ static errno_t get_last_sock_err()
 #endif
 }
 
-int line_sender_error_errnum(const line_sender_error* err)
+line_sender_error_code line_sender_error_get_code(const line_sender_error* err)
 {
-    return err->errnum;
+    return err->code;
 }
 
 const char* line_sender_error_msg(const line_sender_error* err, size_t* len_out)
@@ -350,7 +350,7 @@ static struct addrinfo* resolve_addr(
 #endif
             *err_out = err_printf(
                 NULL,
-                0,  // Note: gai_err_code != errno
+                line_sender_error_could_not_resolve_addr,
                 "Could not resolve \"%.*s:%.*s\": %s",
                 (int)host_descr_len,
                 host_descr,
@@ -367,7 +367,7 @@ static struct addrinfo* resolve_addr(
         {
             *err_out = err_printf(
                 NULL,
-                0,  // Note: gai_err_code != errno
+                line_sender_error_could_not_resolve_addr,
                 "Could not resolve \"%.*s\": %s",
                 (int)host_descr_len,
                 host_descr,
@@ -391,7 +391,7 @@ static inline bool check_state(
     const char* next_op_descr = line_sender_state_next_op_descr(*state);
     *err_out = err_printf(
         state,
-        0,
+        line_sender_error_invalid_api_call,
         "State error: Bad call to `%s`, %s. Must now call `close`.",
         op_descr,
         next_op_descr);
@@ -435,7 +435,7 @@ line_sender* line_sender_connect(
         char* err_descr = sock_err_str(errnum);
         *err_out = err_printf(
             NULL,
-            errnum,
+            line_sender_error_socket_error,
             "Could not open TCP socket: %s.",
             err_descr);
         sock_err_str_free(err_descr);
@@ -449,7 +449,7 @@ line_sender* line_sender_connect(
         char* err_descr = sock_err_str(errnum);
         *err_out = err_printf(
             NULL,
-            errnum,
+            line_sender_error_socket_error,
             "Could not set FD_CLOEXEC on socket: %s.",
             err_descr);
         sock_err_str_free(err_descr);
@@ -469,7 +469,7 @@ line_sender* line_sender_connect(
         char* err_descr = sock_err_str(errnum);
         *err_out = err_printf(
             NULL,
-            errnum,
+            line_sender_error_socket_error,
             "Could not set TCP_NODELAY: %s.",
             err_descr);
         sock_err_str_free(err_descr);
@@ -483,7 +483,7 @@ line_sender* line_sender_connect(
         char* err_descr = sock_err_str(errnum);
         *err_out = err_printf(
             NULL,
-            errnum,
+            line_sender_error_socket_error,
             "Could not bind to interface address \"%s\": %s.",
             net_interface,
             err_descr);
@@ -497,7 +497,7 @@ line_sender* line_sender_connect(
         char* err_descr = sock_err_str(errnum);
         *err_out = err_printf(
             NULL,
-            errnum,
+            line_sender_error_socket_error,
             "Could not connect to \"%s:%s\": %s.",
             host,
             port,
@@ -545,7 +545,7 @@ static inline bool check_utf8(
         {
             *err_out = err_printf(
                 state,
-                0,
+                line_sender_error_invalid_utf8,
                 "Bad string \"%.*s\": "
                 "Invalid UTF-8. "
                 "Incomplete multi-byte codepoint at end of string. "
@@ -558,7 +558,7 @@ static inline bool check_utf8(
         {
             *err_out = err_printf(
                 state,
-                0,
+                line_sender_error_invalid_utf8,
                 "Bad string \"%.*s\": "
                 "Invalid UTF-8. "
                 "Illegal codepoint starting at byte index %" PRI_SIZET ".",
@@ -582,7 +582,7 @@ static inline bool check_key_name(
     {
         *err_out = err_printf(
             state,
-            0,
+            line_sender_error_invalid_identifier,
             "table, symbol and column names must have a non-zero length.");
         return false;
     }
@@ -619,7 +619,7 @@ static inline bool check_key_name(
                     const size_t escaped_len = escape_char(escaped_buf, c);
                     *err_out = err_printf(
                         state,
-                        0,
+                        line_sender_error_invalid_identifier,
                         "Bad string \"%.*s\": "
                         "table, symbol and column names can't contain a '%.*s' "
                         "character, which was found at byte position "
@@ -647,7 +647,7 @@ static inline bool check_key_name(
             char* name_descr = describe_buf(len, name, &name_descr_len);
             *err_out = err_printf(
                 state,
-                0,
+                line_sender_error_invalid_identifier,
                 "Bad string \"%.*s\": "
                 "table, symbol and column names can't contain a UTF-8 BOM "
                 "character, which was found at byte position "
@@ -930,7 +930,7 @@ bool line_sender_flush(
         char* err_descr = sock_err_str(errnum);
         *err_out = err_printf(
             &sender->state,
-            errnum,
+            line_sender_error_socket_error,
             "Could not flush buffered messages: %s.",
             err_descr);
         sock_err_str_free(err_descr);

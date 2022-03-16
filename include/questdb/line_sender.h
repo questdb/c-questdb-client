@@ -37,14 +37,18 @@ extern "C" {
 /////////// Error handling.
 typedef struct line_sender_error line_sender_error;
 
-/**
- * An error message may optionally be associated with an OS error.
- * Such error can then be looked up with library functions such as `strerror`.
- * An errnum of 0 indicates there was no associated OS error and it does not
- * indicate there is no error.
- */
+typedef enum line_sender_error_code
+{
+    line_sender_error_could_not_resolve_addr,
+    line_sender_error_invalid_api_call,
+    line_sender_error_socket_error,
+    line_sender_error_invalid_utf8,
+    line_sender_error_invalid_identifier
+} line_sender_error_code;
+
+/** Error code describing the error. */
 LINESENDER_API
-int line_sender_error_errnum(const line_sender_error*);  // Returns 0 if unset.
+line_sender_error_code line_sender_error_get_code(const line_sender_error*);
 
 /** ASCII encoded error message. Never returns NULL. */
 LINESENDER_API
