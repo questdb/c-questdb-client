@@ -18,8 +18,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 set(LIB_SOURCES
     src/aborting_malloc.c
-    src/linesender.c
-    src/memwriter.c
+    src/line_sender.c
+    src/mem_writer.c
     src/utf8.c)
 
 function(set_compile_flags TARGET_NAME)
@@ -96,20 +96,20 @@ endif(UNIX)
 
 # Unit test binary.
 add_executable(
-    test_linesender
+    test_line_sender
     test/mock_server.cpp
     test/wsastartup_guard.cpp
-    test/test_linesender.cpp)
+    test/test_line_sender.cpp)
 target_link_libraries(
-    test_linesender
+    test_line_sender
     c_questdb_client_static)
 target_include_directories(
-    test_linesender
+    test_line_sender
     PUBLIC ${CMAKE_SOURCE_DIR}/include)
-set_compile_flags(test_linesender)
+set_compile_flags(test_line_sender)
 add_test(
-    NAME test_linesender
-    COMMAND test_linesender)
+    NAME test_line_sender
+    COMMAND test_line_sender)
 
 # System testing Python3 script.
 # This will download the latest QuestDB instance from Github,

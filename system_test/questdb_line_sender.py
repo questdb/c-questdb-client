@@ -20,16 +20,16 @@ from ctypes import (
 from typing import Union
 
 
-class c_linesender(ctypes.Structure):
+class c_line_sender(ctypes.Structure):
     pass
 
-class c_linesender_error(ctypes.Structure):
+class c_line_sender_error(ctypes.Structure):
     pass
 
 c_size_t_p = ctypes.POINTER(c_size_t)
-c_linesender_p = ctypes.POINTER(c_linesender)
-c_linesender_error_p = ctypes.POINTER(c_linesender_error)
-c_linesender_error_p_p = ctypes.POINTER(c_linesender_error_p)
+c_line_sender_p = ctypes.POINTER(c_line_sender)
+c_line_sender_error_p = ctypes.POINTER(c_line_sender_error)
+c_line_sender_error_p_p = ctypes.POINTER(c_line_sender_error_p)
 
 
 def _setup_cdll():
@@ -54,103 +54,103 @@ def _setup_cdll():
         fn.argtypes = argtypes
 
     set_sig(
-        dll.linesender_error_errnum,
-        c_linesender_error_p,
+        dll.line_sender_error_errnum,
+        c_line_sender_error_p,
         c_int,
         c_void_p)
     set_sig(
-        dll.linesender_error_msg,
-        c_linesender_error_p,
+        dll.line_sender_error_msg,
+        c_line_sender_error_p,
         c_void_p,
         c_size_t_p)
     set_sig(
-        dll.linesender_error_free,
+        dll.line_sender_error_free,
         None,
-        c_linesender_error_p)
+        c_line_sender_error_p)
     set_sig(
-        dll.linesender_connect,
-        c_linesender_p,
+        dll.line_sender_connect,
+        c_line_sender_p,
         c_char_p,
         c_char_p,
         c_char_p,
-        c_linesender_error_p_p)
+        c_line_sender_error_p_p)
     set_sig(
-        dll.linesender_must_close,
+        dll.line_sender_must_close,
         None,
-        c_linesender_p)
+        c_line_sender_p)
     set_sig(
-        dll.linesender_close,
+        dll.line_sender_close,
         None,
-        c_linesender_p)
+        c_line_sender_p)
     set_sig(
-        dll.linesender_table,
+        dll.line_sender_table,
         c_bool,
-        c_linesender_p,
+        c_line_sender_p,
         c_size_t,
         c_char_p,
-        c_linesender_error_p_p)
+        c_line_sender_error_p_p)
     set_sig(
-        dll.linesender_symbol,
+        dll.line_sender_symbol,
         c_bool,
-        c_linesender_p,
+        c_line_sender_p,
         c_size_t,
         c_char_p,
         c_size_t,
         c_char_p,
-        c_linesender_error_p_p)
+        c_line_sender_error_p_p)
     set_sig(
-        dll.linesender_column_bool,
+        dll.line_sender_column_bool,
         c_bool,
-        c_linesender_p,
+        c_line_sender_p,
         c_size_t,
         c_char_p,
         c_bool,
-        c_linesender_error_p_p)
+        c_line_sender_error_p_p)
     set_sig(
-        dll.linesender_column_i64,
+        dll.line_sender_column_i64,
         c_bool,
-        c_linesender_p,
+        c_line_sender_p,
         c_size_t,
         c_char_p,
         c_int64,
-        c_linesender_error_p_p)
+        c_line_sender_error_p_p)
     set_sig(
-        dll.linesender_column_f64,
+        dll.line_sender_column_f64,
         c_bool,
-        c_linesender_p,
+        c_line_sender_p,
         c_size_t,
         c_char_p,
         c_double,
-        c_linesender_error_p_p)
+        c_line_sender_error_p_p)
     set_sig(
-        dll.linesender_column_str,
+        dll.line_sender_column_str,
         c_bool,
-        c_linesender_p,
+        c_line_sender_p,
         c_size_t,
         c_char_p,
         c_size_t,
         c_char_p,
-        c_linesender_error_p_p)
+        c_line_sender_error_p_p)
     set_sig(
-        dll.linesender_at,
+        dll.line_sender_at,
         c_bool,
-        c_linesender_p,
+        c_line_sender_p,
         c_int64,
-        c_linesender_error_p_p)
+        c_line_sender_error_p_p)
     set_sig(
-        dll.linesender_at_now,
+        dll.line_sender_at_now,
         c_bool,
-        c_linesender_p,
-        c_linesender_error_p_p)
+        c_line_sender_p,
+        c_line_sender_error_p_p)
     set_sig(
-        dll.linesender_pending_size,
+        dll.line_sender_pending_size,
         c_size_t,
-        c_linesender_p)
+        c_line_sender_p)
     set_sig(
-        dll.linesender_flush,
+        dll.line_sender_flush,
         c_bool,
-        c_linesender_p,
-        c_linesender_error_p_p)
+        c_line_sender_p,
+        c_line_sender_error_p_p)
     return dll
 
 
@@ -161,7 +161,7 @@ _PY_DLL.PyUnicode_FromKindAndData.restype = ctypes.py_object
 _PY_DLL.PyUnicode_FromKindAndData.argtypes = [c_int, c_void_p, c_ssize_t]
 
 
-class SenderError(ConnectionError):
+class LineSenderError(Exception):
     """An error whilst using the line sender."""
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -170,18 +170,18 @@ class SenderError(ConnectionError):
 def _c_err_to_py(err_p):
     try:
         c_len = c_size_t(0)
-        msg_p = _DLL.linesender_error_msg(err_p, ctypes.byref(c_len))
+        msg_p = _DLL.line_sender_error_msg(err_p, ctypes.byref(c_len))
         py_msg = _PY_DLL.PyUnicode_FromKindAndData(
             1,  # PyUnicode_1BYTE_KIND
             msg_p,
             c_ssize_t(c_len.value))
-        return SenderError(py_msg)
+        return LineSenderError(py_msg)
     finally:
-        _DLL.linesender_error_free(err_p)
+        _DLL.line_sender_error_free(err_p)
 
 
 def _error_wrapped_call(c_fn, *args):
-    err_p = c_linesender_error_p()
+    err_p = c_line_sender_error_p()
     ok = c_fn(
         *args,
         ctypes.byref(err_p))
@@ -201,7 +201,7 @@ def _fully_qual_name(obj):
         return module + '.' + qn
 
 
-class Sender:
+class LineSender:
     def __init__(
             self,
             host,
@@ -216,10 +216,10 @@ class Sender:
 
     def connect(self):
         if self._impl:
-            raise SenderError('Already connected')
+            raise LineSenderError('Already connected')
 
         self._impl = _error_wrapped_call(
-            _DLL.linesender_connect,
+            _DLL.line_sender_connect,
             self._connect_args[0],
             self._connect_args[1],
             self._connect_args[2])
@@ -230,12 +230,12 @@ class Sender:
 
     def _check_connected(self):
         if not self._impl:
-            raise SenderError('Not connected.')
+            raise LineSenderError('Not connected.')
 
     def table(self, table: str):
         table_b = table.encode('utf-8')
         _error_wrapped_call(
-            _DLL.linesender_table,
+            _DLL.line_sender_table,
             self._impl,
             len(table_b),
             table_b)
@@ -245,7 +245,7 @@ class Sender:
         name_b = name.encode('utf-8')
         value_b = value.encode('utf-8')
         _error_wrapped_call(
-            _DLL.linesender_symbol,
+            _DLL.line_sender_symbol,
             self._impl,
             len(name_b),
             name_b,
@@ -258,21 +258,21 @@ class Sender:
         name_len = len(name_b)
         if isinstance(value, bool):
             _error_wrapped_call(
-                _DLL.linesender_column_bool,
+                _DLL.line_sender_column_bool,
                 self._impl,
                 name_len,
                 name_b,
                 bool(value))
         elif isinstance(value, int):
             _error_wrapped_call(
-                _DLL.linesender_column_i64,
+                _DLL.line_sender_column_i64,
                 self._impl,
                 name_len,
                 name_b,
                 int(value))
         elif isinstance(value, float):
             _error_wrapped_call(
-                _DLL.linesender_column_f64,
+                _DLL.line_sender_column_f64,
                 self._impl,
                 name_len,
                 name_b,
@@ -280,7 +280,7 @@ class Sender:
         elif isinstance(value, str):
             value_b = value.encode('utf-8')
             _error_wrapped_call(
-                _DLL.linesender_column_str,
+                _DLL.line_sender_column_str,
                     self._impl,
                     name_len,
                     name_b,
@@ -295,19 +295,19 @@ class Sender:
 
     def at_now(self):
         _error_wrapped_call(
-            _DLL.linesender_at_now,
+            _DLL.line_sender_at_now,
             self._impl)
 
     def at(self, timestamp: int):
         _error_wrapped_call(
-            _DLL.linesender_at,
+            _DLL.line_sender_at,
             self._impl,
             timestamp)
 
     @property
     def pending_size(self):
         if self._impl:
-            return _DLL.linesender_pending_size(self._impl)
+            return _DLL.line_sender_pending_size(self._impl)
         else:
             return 0
 
@@ -316,14 +316,14 @@ class Sender:
         if self.pending_size == 0:
             return
         _error_wrapped_call(
-            _DLL.linesender_flush,
+            _DLL.line_sender_flush,
             self._impl)
 
     def close(self, flush=True):
-        if self._impl and not _DLL.linesender_must_close(self._impl) and flush:
+        if self._impl and not _DLL.line_sender_must_close(self._impl) and flush:
             self.flush()
         if self._impl:
-            _DLL.linesender_close(self._impl)
+            _DLL.line_sender_close(self._impl)
             self._impl = None
 
     def __exit__(self, exc_type, _exc_val, _exc_tb):

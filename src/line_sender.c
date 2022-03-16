@@ -2,10 +2,10 @@
 #define _POSIX_C_SOURCE 200809L
 #endif
 
-#include <questdb/linesender.h>
+#include <questdb/line_sender.h>
 
 #include "build_env.h"
-#include "memwriter.h"
+#include "mem_writer.h"
 #include "utf8.h"
 #include "aborting_malloc.h"
 
@@ -60,70 +60,70 @@ typedef int sock_len_t;
 #define UNREACHABLE() __builtin_unreachable()
 #endif
 
-typedef enum linesender_op
+typedef enum line_sender_op
 {
-    linesender_op_table = 1,
-    linesender_op_symbol = 1 << 1,
-    linesender_op_column = 1 << 2,
-    linesender_op_at = 1 << 3,
-    linesender_op_flush = 1 << 4
-} linesender_op;
+    line_sender_op_table = 1,
+    line_sender_op_symbol = 1 << 1,
+    line_sender_op_column = 1 << 2,
+    line_sender_op_at = 1 << 3,
+    line_sender_op_flush = 1 << 4
+} line_sender_op;
 
-static inline const char* linesender_op_str(linesender_op op)
+static inline const char* line_sender_op_str(line_sender_op op)
 {
     switch (op)
     {
-        case linesender_op_table:
+        case line_sender_op_table:
             return "table";
-        case linesender_op_symbol:
+        case line_sender_op_symbol:
             return "symbol";
-        case linesender_op_column:
+        case line_sender_op_column:
             return "column";
-        case linesender_op_at:
+        case line_sender_op_at:
             return "at";
-        case linesender_op_flush:
+        case line_sender_op_flush:
             return "flush";
     }
     UNREACHABLE();
 }
 
 // We encode the state we're in as a bitmask of allowable follow-up API calls.
-typedef enum linesender_state
+typedef enum line_sender_state
 {
-    linesender_state_connected =
-        linesender_op_table,
-    linesender_state_table_written =
-        linesender_op_symbol | linesender_op_column,
-    linesender_state_symbol_written =
-        linesender_op_symbol | linesender_op_column | linesender_op_at,
-    linesender_state_column_written =
-        linesender_op_column | linesender_op_at,
-    linesender_state_may_flush_or_table =
-        linesender_op_flush | linesender_op_table,
-    linesender_state_moribund = 0,
-} linesender_state;
+    line_sender_state_connected =
+        line_sender_op_table,
+    line_sender_state_table_written =
+        line_sender_op_symbol | line_sender_op_column,
+    line_sender_state_symbol_written =
+        line_sender_op_symbol | line_sender_op_column | line_sender_op_at,
+    line_sender_state_column_written =
+        line_sender_op_column | line_sender_op_at,
+    line_sender_state_may_flush_or_table =
+        line_sender_op_flush | line_sender_op_table,
+    line_sender_state_moribund = 0,
+} line_sender_state;
 
-static inline const char* linesender_state_next_op_descr(linesender_state state)
+static inline const char* line_sender_state_next_op_descr(line_sender_state state)
 {
     switch (state)
     {
-        case linesender_state_connected:
+        case line_sender_state_connected:
             return "should have called `table` instead";
-        case linesender_state_table_written:
+        case line_sender_state_table_written:
             return "should have called `symbol` or `column` instead";
-        case linesender_state_symbol_written:
+        case line_sender_state_symbol_written:
             return "should have called `symbol`, `column` or `at` instead";
-        case linesender_state_column_written:
+        case line_sender_state_column_written:
             return "should have called `column` or `at` instead";
-        case linesender_state_may_flush_or_table:
+        case line_sender_state_may_flush_or_table:
             return "should have called `flush` or `table` instead";
-        case linesender_state_moribund:
+        case line_sender_state_moribund:
             return "unrecoverable state due to previous error";
     }
     UNREACHABLE();
 }
 
-struct linesender_error
+struct line_sender_error
 {
     int errnum;
     size_t len;
@@ -131,31 +131,31 @@ struct linesender_error
 };
 
 #if defined(COMPILER_GNUC)
-static linesender_error* err_printf(
-    linesender_state* state,
+static line_sender_error* err_printf(
+    line_sender_state* state,
     int errnum,
     const char* fmt,
     ...) __attribute__ ((format (printf, 3, 4)));
 #endif
 
-static linesender_error* err_printf(
-    linesender_state* state,
+static line_sender_error* err_printf(
+    line_sender_state* state,
     int errnum,
     const char* fmt,
     ...)
 {
     if (state)
-        *state = linesender_state_moribund;
-    memwriter msg_writer;
-    memwriter_open(&msg_writer, 256);
+        *state = line_sender_state_moribund;
+    mem_writer msg_writer;
+    mem_writer_open(&msg_writer, 256);
     va_list args;
     va_start(args, fmt);
-    memwriter_vprintf(&msg_writer, fmt, args);
+    mem_writer_vprintf(&msg_writer, fmt, args);
     va_end(args);
     size_t len = 0;
-    char* msg = memwriter_steal_and_close(&msg_writer, &len);
+    char* msg = mem_writer_steal_and_close(&msg_writer, &len);
 
-    linesender_error* err = aborting_malloc(sizeof(linesender_error));
+    line_sender_error* err = aborting_malloc(sizeof(line_sender_error));
     err->errnum = errnum;
     err->len = len;
     err->msg = msg;
@@ -236,18 +236,18 @@ static errno_t get_last_sock_err()
 #endif
 }
 
-int linesender_error_errnum(const linesender_error* err)
+int line_sender_error_errnum(const line_sender_error* err)
 {
     return err->errnum;
 }
 
-const char* linesender_error_msg(const linesender_error* err, size_t* len_out)
+const char* line_sender_error_msg(const line_sender_error* err, size_t* len_out)
 {
     *len_out = err->len;
     return err->msg;
 }
 
-void linesender_error_free(linesender_error* err)
+void line_sender_error_free(line_sender_error* err)
 {
     free(err->msg);
     free(err);
@@ -301,29 +301,29 @@ static char* describe_buf(size_t len, const char* buf, size_t* descr_len_out)
     const size_t working_len = trim
         ? max_len - 3  // 3 here for trailing "..."
         : len;
-    memwriter writer;
+    mem_writer writer;
 
     // If every byte needs escaping we'll need to 4 times as many bytes,
     // + 1 for trailing \0 added by printf functions.
-    memwriter_open(&writer, working_len * 4 + 1);
+    mem_writer_open(&writer, working_len * 4 + 1);
     for (size_t index = 0; index < working_len; ++index)
     {
         const char c = buf[index];
         char escaped_buf[5];
         const size_t escaped_len = escape_char(escaped_buf, c);
-        memwriter_str(&writer, escaped_len, escaped_buf);
+        mem_writer_str(&writer, escaped_len, escaped_buf);
     }
 
     if (trim)
-        memwriter_str(&writer, 3, "...");
+        mem_writer_str(&writer, 3, "...");
 
-    return memwriter_steal_and_close(&writer, descr_len_out);
+    return mem_writer_steal_and_close(&writer, descr_len_out);
 }
 
 static struct addrinfo* resolve_addr(
     const char* host,
     const char* port,
-    linesender_error** err_out)
+    line_sender_error** err_out)
 {
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
@@ -380,15 +380,15 @@ static struct addrinfo* resolve_addr(
 }
 
 static inline bool check_state(
-    linesender_state* state,
-    linesender_op op,
-    linesender_error** err_out)
+    line_sender_state* state,
+    line_sender_op op,
+    line_sender_error** err_out)
 {
     if (*state & op)
         return true;
 
-    const char* op_descr = linesender_op_str(op);
-    const char* next_op_descr = linesender_state_next_op_descr(*state);
+    const char* op_descr = line_sender_op_str(op);
+    const char* next_op_descr = line_sender_state_next_op_descr(*state);
     *err_out = err_printf(
         state,
         0,
@@ -398,20 +398,20 @@ static inline bool check_state(
     return false;
 }
 
-struct linesender
+struct line_sender
 {
     socketfd_t sock_fd;
     struct addrinfo* dest_info;
-    linesender_state state;
-    memwriter writer;
+    line_sender_state state;
+    mem_writer writer;
     size_t last_line_start;
 };
 
-linesender* linesender_connect(
+line_sender* line_sender_connect(
     const char* net_interface,
     const char* host,
     const char* port,
-    linesender_error** err_out)
+    line_sender_error** err_out)
 {
     struct addrinfo* dest_info = NULL;
     struct addrinfo* if_info = NULL;
@@ -509,13 +509,13 @@ linesender* linesender_connect(
     freeaddrinfo(if_info);
     if_info = NULL;
 
-    memwriter writer;
-    memwriter_open(&writer, 65536);  // 64KB initial buffer size.
+    mem_writer writer;
+    mem_writer_open(&writer, 65536);  // 64KB initial buffer size.
 
-    linesender* sender = aborting_malloc(sizeof(linesender));
+    line_sender* sender = aborting_malloc(sizeof(line_sender));
     sender->sock_fd = sock_fd;
     sender->dest_info = dest_info;
-    sender->state = linesender_state_connected;
+    sender->state = line_sender_state_connected;
     sender->writer = writer;
     sender->last_line_start = 0;
     return sender;
@@ -531,10 +531,10 @@ error_cleanup:
 }
 
 static inline bool check_utf8(
-    linesender_state* state,
+    line_sender_state* state,
     size_t len,
     const char* buf,
-    linesender_error** err_out)
+    line_sender_error** err_out)
 {
     utf8_error u8err;
     if (!utf8_check(len, buf, &u8err))
@@ -573,10 +573,10 @@ static inline bool check_utf8(
 }
 
 static inline bool check_key_name(
-    linesender_state* state,
+    line_sender_state* state,
     size_t len,
     const char* name,
-    linesender_error** err_out)
+    line_sender_error** err_out)
 {
     if (!len)
     {
@@ -694,7 +694,7 @@ static inline bool must_escape_quoted(char c)
 }
 
 #define DEFINE_WRITE_ESCAPED_FN(FN_NAME, CHECK_ESCAPE_FN, QUOTING_FN)          \
-    static void FN_NAME(memwriter* writer, size_t len, const char* s)          \
+    static void FN_NAME(mem_writer* writer, size_t len, const char* s)          \
     {                                                                          \
         size_t to_escape = 0;                                                  \
         for (size_t index = 0; index < len; ++index)                           \
@@ -703,11 +703,11 @@ static inline bool must_escape_quoted(char c)
         QUOTING_FN;                                                            \
         if (!to_escape)                                                        \
         {                                                                      \
-            memwriter_str(writer, len, s);                                     \
+            mem_writer_str(writer, len, s);                                     \
         }                                                                      \
         else                                                                   \
         {                                                                      \
-            char* buf = memwriter_book(writer, len + to_escape);               \
+            char* buf = mem_writer_book(writer, len + to_escape);               \
             const char* init_buf = buf;                                        \
             for (size_t index = 0; index < len; ++index)                       \
             {                                                                  \
@@ -716,7 +716,7 @@ static inline bool must_escape_quoted(char c)
                     *buf++ = '\\';                                             \
                 *buf++ = c;                                                    \
             }                                                                  \
-            memwriter_advance(writer, (size_t)(buf - init_buf));               \
+            mem_writer_advance(writer, (size_t)(buf - init_buf));               \
         }                                                                      \
         QUOTING_FN;                                                            \
     }
@@ -729,119 +729,119 @@ DEFINE_WRITE_ESCAPED_FN(
 DEFINE_WRITE_ESCAPED_FN(
     write_escaped_quoted,
     must_escape_quoted,
-    (memwriter_char(writer, '"')))
+    (mem_writer_char(writer, '"')))
 
-bool linesender_table(
-    linesender* sender,
+bool line_sender_table(
+    line_sender* sender,
     size_t name_len,
     const char* name,
-    linesender_error** err_out)
+    line_sender_error** err_out)
 {
-    if (!check_state(&sender->state, linesender_op_table, err_out))
+    if (!check_state(&sender->state, line_sender_op_table, err_out))
         return false;
     if (!check_key_name(&sender->state, name_len, name, err_out))
         return false;
 
     write_escaped_unquoted(&sender->writer, name_len, name);
 
-    sender->state = linesender_state_table_written;
+    sender->state = line_sender_state_table_written;
     return true;
 }
 
-bool linesender_symbol(
-    linesender* sender,
+bool line_sender_symbol(
+    line_sender* sender,
     size_t name_len,
     const char* name,
     size_t value_len,
     const char* value,
-    linesender_error** err_out)
+    line_sender_error** err_out)
 {
-    if (!check_state(&sender->state, linesender_op_symbol, err_out))
+    if (!check_state(&sender->state, line_sender_op_symbol, err_out))
         return false;
     if (!check_key_name(&sender->state, name_len, name, err_out))
         return false;
     if (!check_utf8(&sender->state, value_len, value, err_out))
         return false;
 
-    memwriter_char(&sender->writer, ',');
+    mem_writer_char(&sender->writer, ',');
     write_escaped_unquoted(&sender->writer, name_len, name);
-    memwriter_char(&sender->writer, '=');
+    mem_writer_char(&sender->writer, '=');
     write_escaped_unquoted(&sender->writer, value_len, value);
 
-    sender->state = linesender_state_symbol_written;
+    sender->state = line_sender_state_symbol_written;
     return true;
 }
 
 static inline bool write_column_key(
-    linesender* sender,
+    line_sender* sender,
     size_t name_len,
     const char* name,
-    linesender_error** err_out)
+    line_sender_error** err_out)
 {
-    if (!check_state(&sender->state, linesender_op_column, err_out))
+    if (!check_state(&sender->state, line_sender_op_column, err_out))
         return false;
 
     if (!check_key_name(&sender->state, name_len, name, err_out))
         return false;
 
     const char separator =
-        (sender->state & linesender_op_symbol)
+        (sender->state & line_sender_op_symbol)
             ? ' '
             : ',';
-    memwriter_char(&sender->writer, separator);
+    mem_writer_char(&sender->writer, separator);
     write_escaped_unquoted(&sender->writer, name_len, name);
-    memwriter_char(&sender->writer, '=');
-    sender->state = linesender_state_column_written;
+    mem_writer_char(&sender->writer, '=');
+    sender->state = line_sender_state_column_written;
     return true;
 }
 
-bool linesender_column_bool(
-    linesender* sender,
+bool line_sender_column_bool(
+    line_sender* sender,
     size_t name_len,
     const char* name,
     bool value,
-    linesender_error** err_out)
+    line_sender_error** err_out)
 {
     if (!write_column_key(sender, name_len, name, err_out))
         return false;
-    memwriter_char(&sender->writer, value ? 't' : 'f');
+    mem_writer_char(&sender->writer, value ? 't' : 'f');
     return true;
 }
 
-bool linesender_column_i64(
-    linesender* sender,
+bool line_sender_column_i64(
+    line_sender* sender,
     size_t name_len,
     const char* name,
     int64_t value,
-    linesender_error** err_out)
+    line_sender_error** err_out)
 {
     if (!write_column_key(sender, name_len, name, err_out))
         return false;
-    memwriter_i64(&sender->writer, value);
-    memwriter_char(&sender->writer, 'i');
+    mem_writer_i64(&sender->writer, value);
+    mem_writer_char(&sender->writer, 'i');
     return true;
 }
 
-bool linesender_column_f64(
-    linesender* sender,
+bool line_sender_column_f64(
+    line_sender* sender,
     size_t name_len,
     const char* name,
     double value,
-    linesender_error** err_out)
+    line_sender_error** err_out)
 {
     if (!write_column_key(sender, name_len, name, err_out))
         return false;
-    memwriter_f64(&sender->writer, value);
+    mem_writer_f64(&sender->writer, value);
     return true;
 }
 
-bool linesender_column_str(
-    linesender* sender,
+bool line_sender_column_str(
+    line_sender* sender,
     size_t name_len,
     const char* name,
     size_t value_len,
     const char* value,
-    linesender_error** err_out)
+    line_sender_error** err_out)
 {
     if (!check_utf8(&sender->state, value_len, value, err_out))
         return false;
@@ -851,47 +851,47 @@ bool linesender_column_str(
     return true;
 }
 
-static inline void update_last_line_start(linesender* sender)
+static inline void update_last_line_start(line_sender* sender)
 {
-    sender->last_line_start = linesender_pending_size(sender);
+    sender->last_line_start = line_sender_pending_size(sender);
 }
 
-bool linesender_at(
-    linesender* sender,
+bool line_sender_at(
+    line_sender* sender,
     int64_t epoch_nanos,
-    linesender_error** err_out)
+    line_sender_error** err_out)
 {
-    if (!check_state(&sender->state, linesender_op_at, err_out))
+    if (!check_state(&sender->state, line_sender_op_at, err_out))
         return false;
-    memwriter* writer = &sender->writer;
-    memwriter_char(writer, ' ');
-    memwriter_i64(writer, epoch_nanos);
-    memwriter_char(&sender->writer, '\n');
+    mem_writer* writer = &sender->writer;
+    mem_writer_char(writer, ' ');
+    mem_writer_i64(writer, epoch_nanos);
+    mem_writer_char(&sender->writer, '\n');
     update_last_line_start(sender);
-    sender->state = linesender_state_may_flush_or_table;
+    sender->state = line_sender_state_may_flush_or_table;
     return true;
 }
 
-bool linesender_at_now(
-    linesender* sender,
-    linesender_error** err_out)
+bool line_sender_at_now(
+    line_sender* sender,
+    line_sender_error** err_out)
 {
-    if (!check_state(&sender->state, linesender_op_at, err_out))
+    if (!check_state(&sender->state, line_sender_op_at, err_out))
         return false;
-    memwriter_char(&sender->writer, '\n');
+    mem_writer_char(&sender->writer, '\n');
     update_last_line_start(sender);
-    sender->state = linesender_state_may_flush_or_table;
+    sender->state = line_sender_state_may_flush_or_table;
     return true;
 }
 
-size_t linesender_pending_size(linesender* sender)
+size_t line_sender_pending_size(line_sender* sender)
 {
-    return (sender->state != linesender_state_moribund)
-        ? memwriter_len(&sender->writer)
+    return (sender->state != line_sender_state_moribund)
+        ? mem_writer_len(&sender->writer)
         : 0;
 }
 
-static inline bool send_all(linesender* sender, sock_len_t len, const char* buf)
+static inline bool send_all(line_sender* sender, sock_len_t len, const char* buf)
 {
     while (len)
     {
@@ -913,15 +913,15 @@ static inline bool send_all(linesender* sender, sock_len_t len, const char* buf)
     return true;
 }
 
-bool linesender_flush(
-    linesender* sender,
-    linesender_error** err_out)
+bool line_sender_flush(
+    line_sender* sender,
+    line_sender_error** err_out)
 {
-    if (!check_state(&sender->state, linesender_op_flush, err_out))
+    if (!check_state(&sender->state, line_sender_op_flush, err_out))
         return false;
 
     size_t len = 0;
-    const char* buf = memwriter_peek(&sender->writer, &len);
+    const char* buf = mem_writer_peek(&sender->writer, &len);
 
     const bool send_ok = send_all(sender, (sock_len_t)len, buf);
     if (!send_ok)
@@ -937,19 +937,19 @@ bool linesender_flush(
         return false;
     }
 
-    memwriter_rewind(&sender->writer);
-    sender->state = linesender_state_connected;
+    mem_writer_rewind(&sender->writer);
+    sender->state = line_sender_state_connected;
     return true;
 }
 
-bool linesender_must_close(linesender* sender)
+bool line_sender_must_close(line_sender* sender)
 {
-    return sender->state == linesender_state_moribund;
+    return sender->state == line_sender_state_moribund;
 }
 
-void linesender_close(linesender* sender)
+void line_sender_close(line_sender* sender)
 {
-    memwriter_close(&sender->writer);
+    mem_writer_close(&sender->writer);
     CLOSESOCKET(sender->sock_fd);
     freeaddrinfo(sender->dest_info);
     free(sender);

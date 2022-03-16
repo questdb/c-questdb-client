@@ -7,7 +7,7 @@ import time
 import datetime
 import argparse
 import unittest
-import questdb_linesender as qls
+import questdb_line_sender as qls
 import uuid
 from fixture import (
     QuestDbFixture,
@@ -64,7 +64,7 @@ def retry_check_table(table_name, min_rows=1, timeout_sec=5):
 class TestSomething(unittest.TestCase):
     def test_insert_three_rows(self):
         table_name = uuid.uuid4().hex
-        with qls.Sender('localhost', QDB_FIXTURE.line_tcp_port) as sender:
+        with qls.LineSender('localhost', QDB_FIXTURE.line_tcp_port) as sender:
             for _ in range(3):
                 (sender
                     .table(table_name)
@@ -97,7 +97,7 @@ class TestSomething(unittest.TestCase):
             self.skipTest('No support for duplicate column names.')
             return
         table_name = uuid.uuid4().hex
-        with qls.Sender('localhost', QDB_FIXTURE.line_tcp_port) as sender:
+        with qls.LineSender('localhost', QDB_FIXTURE.line_tcp_port) as sender:
             (sender
                 .table(table_name)
                 .symbol('a', 'A')
@@ -122,7 +122,7 @@ class TestSomething(unittest.TestCase):
             self.skipTest('No support for duplicate column names.')
             return
         table_name = uuid.uuid4().hex
-        with qls.Sender('localhost', QDB_FIXTURE.line_tcp_port) as sender:
+        with qls.LineSender('localhost', QDB_FIXTURE.line_tcp_port) as sender:
             (sender
                 .table(table_name)
                 .symbol('a', 'A')
@@ -141,7 +141,7 @@ class TestSomething(unittest.TestCase):
 
     def test_single_symbol(self):
         table_name = uuid.uuid4().hex
-        with qls.Sender('localhost', QDB_FIXTURE.line_tcp_port) as sender:
+        with qls.LineSender('localhost', QDB_FIXTURE.line_tcp_port) as sender:
             (sender
                 .table(table_name)
                 .symbol('a', 'A')
@@ -159,7 +159,7 @@ class TestSomething(unittest.TestCase):
 
     def test_two_columns(self):
         table_name = uuid.uuid4().hex
-        with qls.Sender('localhost', QDB_FIXTURE.line_tcp_port) as sender:
+        with qls.LineSender('localhost', QDB_FIXTURE.line_tcp_port) as sender:
             (sender
                 .table(table_name)
                 .column('a', 'A')
@@ -179,7 +179,7 @@ class TestSomething(unittest.TestCase):
 
     def test_mismatched_types_across_rows(self):
         table_name = uuid.uuid4().hex
-        with qls.Sender('localhost', QDB_FIXTURE.line_tcp_port) as sender:
+        with qls.LineSender('localhost', QDB_FIXTURE.line_tcp_port) as sender:
             (sender
                 .table(table_name)
                 .symbol('a', 'A')  # SYMBOL
@@ -210,7 +210,7 @@ class TestSomething(unittest.TestCase):
             return
         table_name = uuid.uuid4().hex
         at_ts_ns = 1647357688714369403
-        with qls.Sender('localhost', QDB_FIXTURE.line_tcp_port) as sender:
+        with qls.LineSender('localhost', QDB_FIXTURE.line_tcp_port) as sender:
             (sender
                 .table(table_name)
                 .symbol('a', 'A')
@@ -228,7 +228,7 @@ class TestSomething(unittest.TestCase):
 
     def test_underscores(self):
         table_name = f'_{uuid.uuid4().hex}_'
-        with qls.Sender('localhost', QDB_FIXTURE.line_tcp_port) as sender:
+        with qls.LineSender('localhost', QDB_FIXTURE.line_tcp_port) as sender:
             (sender
                 .table(table_name)
                 .symbol('_a_b_c_', 'A')
@@ -252,7 +252,7 @@ class TestSomething(unittest.TestCase):
             return
         table_name = uuid.uuid4().hex
         smilie = b'\xf0\x9f\x98\x81'.decode('utf-8')
-        with qls.Sender('localhost', QDB_FIXTURE.line_tcp_port) as sender:
+        with qls.LineSender('localhost', QDB_FIXTURE.line_tcp_port) as sender:
             sender.table(table_name)
             sender.symbol(smilie, smilie)
             # for num in range(1, 32):

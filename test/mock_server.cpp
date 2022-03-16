@@ -36,7 +36,7 @@ typedef int sock_ssize_t;
 typedef int sock_len_t;
 #endif
 
-namespace questdb::proto::line::test
+namespace questdb::test
 {
 
 mock_server::mock_server()

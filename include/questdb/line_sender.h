@@ -5,7 +5,7 @@
  *
  * Functions return `true` to indicate success.
  * In case of errors, you must always follow-up any error-yeilding call
- * with `linesender_close`.
+ * with `line_sender_close`.
  * 
  * Don't forget to call `flush()` or no data will be sent.
  */
@@ -35,7 +35,7 @@ extern "C" {
 #endif
 
 /////////// Error handling.
-typedef struct linesender_error linesender_error;
+typedef struct line_sender_error line_sender_error;
 
 /**
  * An error message may optionally be associated with an OS error.
@@ -44,109 +44,109 @@ typedef struct linesender_error linesender_error;
  * indicate there is no error.
  */
 LINESENDER_API
-int linesender_error_errnum(const linesender_error*);  // Returns 0 if unset.
+int line_sender_error_errnum(const line_sender_error*);  // Returns 0 if unset.
 
 /** ASCII encoded error message. Never returns NULL. */
 LINESENDER_API
-const char* linesender_error_msg(const linesender_error*, size_t* len_out);
+const char* line_sender_error_msg(const line_sender_error*, size_t* len_out);
 
 LINESENDER_API
-void linesender_error_free(linesender_error*);
+void line_sender_error_free(line_sender_error*);
 
 /////////// Connecting and disconnecting.
-typedef struct linesender linesender;
+typedef struct line_sender line_sender;
 
 LINESENDER_API
-linesender* linesender_connect(
+line_sender* line_sender_connect(
     const char* interface,  // if unsure pass "0.0.0.0"
     const char* host,
     const char* port,
-    linesender_error** err_out);
+    line_sender_error** err_out);
 
 /** True indicates an error occured previously and the sender must be closed. */
 LINESENDER_API
-bool linesender_must_close(linesender*);
+bool line_sender_must_close(line_sender*);
 
 /** Close the connection. Does not flush. Non-idempotent. */
 LINESENDER_API
-void linesender_close(linesender*);
+void line_sender_close(line_sender*);
 
 
 /////////// Preparing line messages.
 LINESENDER_API
-bool linesender_table(
-    linesender*,
+bool line_sender_table(
+    line_sender*,
     size_t name_len,
     const char* name,
-    linesender_error** err_out);
+    line_sender_error** err_out);
 
 LINESENDER_API
-bool linesender_symbol(
-    linesender*,
+bool line_sender_symbol(
+    line_sender*,
     size_t name_len,
     const char* name,
     size_t value_len,
     const char* value,
-    linesender_error** err_out);
+    line_sender_error** err_out);
 
 LINESENDER_API
-bool linesender_column_bool(
-    linesender*,
+bool line_sender_column_bool(
+    line_sender*,
     size_t name_len,
     const char* name,
     bool value,
-    linesender_error** err_out);
+    line_sender_error** err_out);
 
 LINESENDER_API
-bool linesender_column_i64(
-    linesender*,
+bool line_sender_column_i64(
+    line_sender*,
     size_t name_len,
     const char* name,
     int64_t value,
-    linesender_error** err_out);
+    line_sender_error** err_out);
 
 LINESENDER_API
-bool linesender_column_f64(
-    linesender*,
+bool line_sender_column_f64(
+    line_sender*,
     size_t name_len,
     const char* name,
     double value,
-    linesender_error** err_out);
+    line_sender_error** err_out);
 
 LINESENDER_API
-bool linesender_column_str(
-    linesender*,
+bool line_sender_column_str(
+    line_sender*,
     size_t name_len,
     const char* name,
     size_t value_len,
     const char* value,
-    linesender_error** err_out);
+    line_sender_error** err_out);
 
 LINESENDER_API
-bool linesender_at(
-    linesender*,
+bool line_sender_at(
+    line_sender*,
     int64_t epoch_nanos,
-    linesender_error** err_out);
+    line_sender_error** err_out);
 
 LINESENDER_API
-bool linesender_at_now(
-    linesender*,
-    linesender_error** err_out);
+bool line_sender_at_now(
+    line_sender*,
+    line_sender_error** err_out);
 
 
 /////////// Committing to network.
 
-/** Number of bytes that will be sent at next call to `linesender_flush`. */
+/** Number of bytes that will be sent at next call to `line_sender_flush`. */
 LINESENDER_API
-size_t linesender_pending_size(linesender*);
+size_t line_sender_pending_size(line_sender*);
 
 /**
  * Send prepared line messages to the QuestDB server.
  */
 LINESENDER_API
-bool linesender_flush(
-    linesender*,
-    linesender_error** err_out);
+bool line_sender_flush(
+    line_sender*,
+    line_sender_error** err_out);
 
 #ifdef __cplusplus
 }

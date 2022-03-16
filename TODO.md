@@ -1,8 +1,7 @@
 Implementation
 --------------
-  * New `linesender_column_str_unchecked` API to avoid double-checking UTF-8 buffers in wrapper libs (optional).
-  * C++20 module wrapper in `include/linesender.hpp` (optional).
-  * Rename C++ namespace to simply "questdb".
+  * New `line_sender_column_str_unchecked` API to avoid double-checking UTF-8 buffers in wrapper libs (optional).
+  * C++20 module wrapper in `include/line_sender.hpp` (optional).
   * Introduce new reason error code / scrap OS error code.
   * [last thing] non-strictly monotonically increasing check for timestamp `at`.
 

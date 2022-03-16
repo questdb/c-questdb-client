@@ -65,35 +65,35 @@ If you happen to also use CMake in your own project, you can include it as an
 ### From a C program
 
 ```c
-#include <questdb/linesender.h>
+#include <questdb/line_sender.h>
 
 ...
 
-linesender_error* err = NULL;
-linesender* sender = linesender_connect(
+line_sender_error* err = NULL;
+line_sender* sender = line_sender_connect(
   "0.0.0.0",   // bind to all interfaces
   "127.0.0.1", // QuestDB hostname
   "9009",      // QuestDB port
   &err);
 ```
 
-See a [complete example in C](examples/linesender_example.c).
+See a [complete example in C](examples/line_sender_example.c).
 
 ### From a C++ program
 
 ```cpp
-#include <questdb/linesender.hpp>
+#include <questdb/line_sender.hpp>
 
 ...
 
 // Automatically connects on object construction.
-auto sender = questdb::proto::line::sender{
+questdb::line_sender sender{
   "127.0.0.1",  // QuestDB hostname
   "9009"};      // QuestDB port
 
 ```
 
-See a [complete example in C++](examples/linesender_example.cpp).
+See a [complete example in C++](examples/line_sender_example.cpp).
 
 ### How to use the API
 The API is sequentially coupled, meaning that methods need to be called in a
@@ -105,16 +105,16 @@ This may be summaried as follows:
 Grammar:
 
     // C                              // C++
-    linesender_connect,               sender::sender
-    (                                 (
-        linesender_table,                 sender::table,
-        linesender_symbol*,               sender::symbol*
-        linesender_column...+             sender::column+,
-        linesender_at...,                 sender::at,
-        linesender_flush?                 sender::flush?
-    )*,                               )*,
-    linesender_close                  sender::close*,
-                                      sender::~sender
+    line_sender_connect,               line_sender::line_sender
+    (                                  (
+        line_sender_table,                 line_sender::table,
+        line_sender_symbol*,               line_sender::symbol*
+        line_sender_column...+             line_sender::column+,
+        line_sender_at...,                 line_sender::at,
+        line_sender_flush?                 line_sender::flush?
+    )*,                                )*,
+    line_sender_close                  line_sender::close*,
+                                       line_sender::~line_sender
 
 Legend:
 
@@ -130,7 +130,7 @@ Legend:
 
 Note how if you're using C++, `.close()` can be called multiple times and will
 also be called automatically on object destruction whilst in C,
-`linesender_close(sender)` will release memory and therefore must be called
+`line_sender_close(sender)` will release memory and therefore must be called
 exactly once.
 
 
@@ -138,38 +138,38 @@ exactly once.
 
 #### C++
 
-Most methods in C++ may throw `questdb::proto::line::sender_error`
-exceptions. The `sender_error` type inherits from `std::runtime_error`.
+Most methods in C++ may throw `questdb::line_sender_error`
+exceptions. The C++ `line_sender_error` type inherits from `std::runtime_error`.
 
 #### C
 
-In C you must provide a pointer to a pointer to a `linesender_error` and check
+In C you must provide a pointer to a pointer to a `line_sender_error` and check
 the return value of functions that can go wrong.
 
-You may call `linesender_error_errnum(err)` and `linesender_error_errnum(err)`
+You may call `line_sender_error_errnum(err)` and `line_sender_error_errnum(err)`
 to extract error details.
 
 Once handled, the error object must be disposed by calling
-`linesender_error_free(err)`.
+`line_sender_error_free(err)`.
 
 Here's a complete example on how to handle errors:
 
 ```c
-linesender* sender = ...;
-linesender_error* err = NULL;
-if (!linesender_table(
+line_sender* sender = ...;
+line_sender_error* err = NULL;
+if (!line_sender_table(
       sender,
       10,
       "table_name",
       &err))
 {
   size_t msg_len = 0;
-  const char* msg = linesender_error_msg(err, &msg_len);
+  const char* msg = line_sender_error_msg(err, &msg_len);
   fprintf(stderr, "Could not set table name: %.*s", (int)msg_len, msg);
 
   // Clean-up
-  linesender_error_free(err);
-  linesender_close(sender);
+  line_sender_error_free(err);
+  line_sender_close(sender);
   return;
 }
 ```
@@ -192,7 +192,7 @@ These settings can be changed. Tune the `cairo.max.uncommitted.rows`,
 settings.
 
 ### API usage
-The API doesn't send any data over the network until the `linesender_flush`
+The API doesn't send any data over the network until the `line_sender_flush`
 function (if using the C API) or `.flush()` method (if using the C++ API API)
 is called.
 

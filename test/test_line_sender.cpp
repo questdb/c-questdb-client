@@ -4,8 +4,8 @@
 #include "mock_server.hpp"
 #include "wsastartup_guard.hpp"
 
-#include <questdb/linesender.h>
-#include <questdb/linesender.hpp>
+#include <questdb/line_sender.h>
+#include <questdb/line_sender.hpp>
 #include "../src/utf8.h"
 
 #include <vector>
@@ -100,44 +100,45 @@ private:
     F _f;
 };
 
-TEST_CASE("linesender c api basics")
+TEST_CASE("line_sender c api basics")
 {
     WSASTARTUP_GUARD;
-    questdb::proto::line::test::mock_server server;
-    linesender_error* err = nullptr;
+    questdb::test::mock_server server;
+    ::line_sender_error* err = nullptr;
     on_scope_exit error_free_guard{[&]{
-            if (err) linesender_error_free(err);
+            if (err)
+                ::line_sender_error_free(err);
         }};
-    linesender* sender = linesender_connect(
+    ::line_sender* sender = ::line_sender_connect(
         "0.0.0.0",
         "localhost",
         std::to_string(server.port()).c_str(),
         &err);
     CHECK(sender != nullptr);
-    CHECK_FALSE(linesender_must_close(sender));
+    CHECK_FALSE(::line_sender_must_close(sender));
     on_scope_exit sender_close_guard{[&]
         {
-            linesender_close(sender);
+            ::line_sender_close(sender);
             sender = nullptr;
         }};
     server.accept();
     CHECK(server.recv() == 0);
-    CHECK(linesender_table(sender, 4, "test", &err));
-    CHECK(linesender_symbol(sender, 2, "t1", 2, "v1", &err));
-    CHECK(linesender_column_f64(sender, 2, "f1", 0.5, &err));
-    CHECK(linesender_at(sender, 10000000, &err));
+    CHECK(::line_sender_table(sender, 4, "test", &err));
+    CHECK(::line_sender_symbol(sender, 2, "t1", 2, "v1", &err));
+    CHECK(::line_sender_column_f64(sender, 2, "f1", 0.5, &err));
+    CHECK(::line_sender_at(sender, 10000000, &err));
     CHECK(server.recv() == 0);
-    CHECK(linesender_pending_size(sender) == 27);
-    CHECK(linesender_flush(sender, &err));
+    CHECK(::line_sender_pending_size(sender) == 27);
+    CHECK(::line_sender_flush(sender, &err));
     CHECK(server.recv() == 1);
     CHECK(server.msgs().front() == "test,t1=v1 f1=0.5 10000000\n");    
 }
 
-TEST_CASE("linesender c++ api basics")
+TEST_CASE("line_sender c++ api basics")
 {
     WSASTARTUP_GUARD;
-    questdb::proto::line::test::mock_server server;
-    questdb::proto::line::sender sender{
+    questdb::test::mock_server server;
+    questdb::line_sender sender{
         "localhost",
         std::to_string(server.port()).c_str()};
     CHECK_FALSE(sender.must_close());
@@ -160,8 +161,8 @@ TEST_CASE("linesender c++ api basics")
 TEST_CASE("test multiple lines")
 {
     WSASTARTUP_GUARD;
-    questdb::proto::line::test::mock_server server;
-    questdb::proto::line::sender sender{
+    questdb::test::mock_server server;
+    questdb::line_sender sender{
         "localhost",
         std::to_string(server.port()).c_str()};
     CHECK_FALSE(sender.must_close());
@@ -201,8 +202,8 @@ TEST_CASE("test multiple lines")
 TEST_CASE("State machine testing -- flush without data.")
 {
     WSASTARTUP_GUARD;
-    questdb::proto::line::test::mock_server server;
-    questdb::proto::line::sender sender{
+    questdb::test::mock_server server;
+    questdb::line_sender sender{
         "localhost",
         std::to_string(server.port()).c_str()};
     
@@ -212,7 +213,7 @@ TEST_CASE("State machine testing -- flush without data.")
         "State error: Bad call to `flush`, "
         "should have called `table` instead. "
         "Must now call `close`.",
-        questdb::proto::line::sender_error);
+        questdb::line_sender_error);
     CHECK(sender.must_close());
     sender.close();
 }
@@ -220,8 +221,8 @@ TEST_CASE("State machine testing -- flush without data.")
 TEST_CASE("One symbol only - flush before server accept")
 {
     WSASTARTUP_GUARD;
-    questdb::proto::line::test::mock_server server;
-    questdb::proto::line::sender sender{
+    questdb::test::mock_server server;
+    questdb::line_sender sender{
         "localhost",
         std::to_string(server.port()).c_str()};
     
@@ -242,8 +243,8 @@ TEST_CASE("One symbol only - flush before server accept")
 TEST_CASE("One column only - server.accept() after flush, before close")
 {
     WSASTARTUP_GUARD;
-    questdb::proto::line::test::mock_server server;
-    questdb::proto::line::sender sender{
+    questdb::test::mock_server server;
+    questdb::line_sender sender{
         "localhost",
         server.port()};
 
@@ -263,8 +264,8 @@ TEST_CASE("One column only - server.accept() after flush, before close")
 TEST_CASE("Bad UTF-8 in table")
 {
     WSASTARTUP_GUARD;
-    questdb::proto::line::test::mock_server server;
-    questdb::proto::line::sender sender{
+    questdb::test::mock_server server;
+    questdb::line_sender sender{
         "localhost",
         std::to_string(server.port()).c_str()};
     
@@ -272,7 +273,7 @@ TEST_CASE("Bad UTF-8 in table")
         sender.table("\xff\xff"),
         "Bad string \"\\xff\\xff\": "
         "Invalid UTF-8. Illegal codepoint starting at byte index 0.",
-        questdb::proto::line::sender_error);
+        questdb::line_sender_error);
 
     CHECK(sender.must_close());
 
@@ -281,7 +282,7 @@ TEST_CASE("Bad UTF-8 in table")
         "State error: Bad call to `flush`, "
         "unrecoverable state due to previous error. "
         "Must now call `close`.",
-        questdb::proto::line::sender_error);
+        questdb::line_sender_error);
 
     // Check idempotency of close.
     sender.close();
@@ -295,8 +296,8 @@ TEST_CASE("Validation of bad chars in key names.")
     WSASTARTUP_GUARD;
 
     {
-        questdb::proto::line::test::mock_server server;
-        questdb::proto::line::sender sender{
+        questdb::test::mock_server server;
+        questdb::line_sender sender{
             "localhost",
             std::to_string(server.port()).c_str()};
 
@@ -305,12 +306,12 @@ TEST_CASE("Validation of bad chars in key names.")
             "Bad string \"a*b\": table, symbol and column names "
             "can't contain a '*' character, "
             "which was found at byte position 1.",
-            questdb::proto::line::sender_error);
+            questdb::line_sender_error);
     }
 
     {
-        questdb::proto::line::test::mock_server server;
-        questdb::proto::line::sender sender{
+        questdb::test::mock_server server;
+        questdb::line_sender sender{
             "localhost",
             std::to_string(server.port()).c_str()};
 
@@ -320,12 +321,12 @@ TEST_CASE("Validation of bad chars in key names.")
             "Bad string \"a+b\": table, symbol and column names "
             "can't contain a '+' character, "
             "which was found at byte position 1.",
-            questdb::proto::line::sender_error);
+            questdb::line_sender_error);
     }
 
     {
-        questdb::proto::line::test::mock_server server;
-        questdb::proto::line::sender sender{
+        questdb::test::mock_server server;
+        questdb::line_sender sender{
             "localhost",
             std::to_string(server.port()).c_str()};
 
@@ -336,13 +337,13 @@ TEST_CASE("Validation of bad chars in key names.")
             "Bad string \"a\\0b\": table, symbol and column names "
             "can't contain a '\\0' character, "
             "which was found at byte position 1.",
-            questdb::proto::line::sender_error);
+            questdb::line_sender_error);
     }
 
     auto test_bad_name = [](std::string bad_name)
         {
-            questdb::proto::line::test::mock_server server;
-            questdb::proto::line::sender sender{
+            questdb::test::mock_server server;
+            questdb::line_sender sender{
                 "localhost",
                 std::to_string(server.port()).c_str()};
 
@@ -362,7 +363,7 @@ TEST_CASE("Validation of bad chars in key names.")
                 ss << ") did not raise.";
                 CHECK_MESSAGE(false, ss.str());
             }
-            catch (const questdb::proto::line::sender_error&)
+            catch (const questdb::line_sender_error&)
             {
                 return;
             }
@@ -392,24 +393,24 @@ TEST_CASE("Validation of bad chars in key names.")
 TEST_CASE("Move testing.")
 {
     WSASTARTUP_GUARD;
-    questdb::proto::line::test::mock_server server1;
-    questdb::proto::line::test::mock_server server2;
+    questdb::test::mock_server server1;
+    questdb::test::mock_server server2;
 
-    questdb::proto::line::sender sender1{
+    questdb::line_sender sender1{
         "localhost",
         std::to_string(server1.port()).c_str()};
 
     CHECK_THROWS_AS(
         sender1.at_now(),
-        questdb::proto::line::sender_error);
+        questdb::line_sender_error);
     CHECK(sender1.must_close());
 
-    questdb::proto::line::sender sender2{std::move(sender1)};
+    questdb::line_sender sender2{std::move(sender1)};
 
     CHECK_FALSE(sender1.must_close());
     CHECK(sender2.must_close());
 
-    questdb::proto::line::sender sender3{
+    questdb::line_sender sender3{
         "localhost",
         std::to_string(server2.port()).c_str()};
     sender3.table("test");
@@ -427,10 +428,10 @@ TEST_CASE("Bad hostname")
 
     try
     {
-        questdb::proto::line::sender sender{"dummy_hostname", "9009"};
+        questdb::line_sender sender{"dummy_hostname", "9009"};
         CHECK_MESSAGE(false, "Expected exception");
     }
-    catch (const questdb::proto::line::sender_error& se)
+    catch (const questdb::line_sender_error& se)
     {
         std::string msg{se.what()};
         CHECK(msg.rfind("Could not resolve \"dummy_hostname:9009\": ", 0) == 0);
@@ -447,13 +448,13 @@ TEST_CASE("Bad interface")
 
     try
     {
-        questdb::proto::line::sender sender{
+        questdb::line_sender sender{
             "localhost",
             "9009",
             "dummy_hostname"};
         CHECK_MESSAGE(false, "Expected exception");
     }
-    catch (const questdb::proto::line::sender_error& se)
+    catch (const questdb::line_sender_error& se)
     {
         std::string msg{se.what()};
         CHECK(msg.rfind("Could not resolve \"dummy_hostname\": ", 0) == 0);
@@ -472,12 +473,12 @@ TEST_CASE("Bad port")
         {
             try
             {
-                questdb::proto::line::sender sender{
+                questdb::line_sender sender{
                     "localhost",
                     bad_port};
                 CHECK_MESSAGE(false, "Expected exception");
             }
-            catch (const questdb::proto::line::sender_error& se)
+            catch (const questdb::line_sender_error& se)
             {
                 std::string msg{se.what()};
                 std::string exp_msg{"\"localhost:" + bad_port + "\": "};
@@ -504,12 +505,12 @@ TEST_CASE("Bad connect")
     {
         // Port 1 is generally the tcpmux service which one would
         // very much expect to never be running.
-        questdb::proto::line::sender sender{
+        questdb::line_sender sender{
             "127.0.0.1",
             1};
         CHECK_MESSAGE(false, "Expected exception");
     }
-    catch (const questdb::proto::line::sender_error& se)
+    catch (const questdb::line_sender_error& se)
     {
         std::string msg{se.what()};
         CHECK(msg.rfind("Could not connect", 0) == 0);
