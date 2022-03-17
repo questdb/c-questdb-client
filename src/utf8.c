@@ -1,3 +1,42 @@
+/**
+ * Permission is hereby granted, free of charge, to any
+ * person obtaining a copy of this software and associated
+ * documentation files (the "Software"), to deal in the
+ * Software without restriction, including without
+ * limitation the rights to use, copy, modify, merge,
+ * publish, distribute, sublicense, and/or sell copies of
+ * the Software, and to permit persons to whom the Software
+ * is furnished to do so, subject to the following
+ * conditions:
+ *
+ * The above copyright notice and this permission notice
+ * shall be included in all copies or substantial portions
+ * of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ * ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+ * TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+ * PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+ * SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+ * CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+ * OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+ * IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+ * DEALINGS IN THE SOFTWARE.
+ */
+
+// This code is a simplified port of part of the code from Rust's
+// implementation to validate buffers for UTF-8 compliance.
+// It is, as such derivate work.
+// The original code is present here:
+//     https://github.com/rust-lang/
+//         rust/blob/master/library/core/src/str/validations.rs
+//
+// That code is released under the MIT license:
+// See: https://github.com/rust-lang/rust/blob/master/LICENSE-MIT
+//
+// We include that copyright notice here which also applies to this port at
+// the top of the implementation file and its header.
+
 #include "utf8.h"
 
 #include <stdint.h>
@@ -64,11 +103,6 @@ static inline bool valid_first_two_bytes_of_four(uint8_t b1, uint8_t b2)
 // From:
 //     https://github.com/rust-lang/
 //         rust/blob/master/library/core/src/str/validations.rs
-//
-// That code is released under the MIT license:
-// See: https://github.com/rust-lang/rust/blob/master/LICENSE-MIT
-//
-// The Rust code is retained here in comments for easier maintenance.
 //
 // Due to complexity of porting, this code skips aligned-pointer optimisations
 // that can walk through ascii portions of buffers more efficiently.
