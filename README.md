@@ -99,60 +99,30 @@ See a [complete example in C++](examples/line_sender_cpp_example.cpp).
 The API is sequentially coupled, meaning that methods need to be called in a
 specific order.
 
-This may be summaried as follows:
+For each row you need to specify a table name and at least one symbol or
+column. Symbols must be specified before columns.
+Once you're done with a row you must add a timestamp calling `at` or `at_now`.
 
-```
-Grammar:
+This ordering of operations is documented for both the C and C++ APIs below.
 
-    // C                              // C++
-    line_sender_connect,               line_sender::line_sender
-    (                                  (
-        line_sender_table,                 line_sender::table,
-        line_sender_symbol*,               line_sender::symbol*
-        line_sender_column...+             line_sender::column+,
-        line_sender_at...,                 line_sender::at,
-        line_sender_flush?                 line_sender::flush?
-    )*,                                )*,
-    line_sender_close                  line_sender::close*,
-                                       line_sender::~line_sender
+#### C function calling order
 
-Legend:
+![C API Sequential Coupling](api_seq/c.svg)
 
-    Syntax          Description
-    -------------------------------------
-    <no suffix>     Call exactly once.
-    ?               Call 0 or 1 times.
-    *               Call 0 or more times.
-    +               Call 1 or more times.
-    ()              Repeating group.
-    ,               Separator.
-```
+Note that this diagram excludes error handling paths: One can call `line_sender_close(sender)` after any operation.
 
-Note how if you're using C++, `.close()` can be called multiple times and will
-also be called automatically on object destruction whilst in C,
-`line_sender_close(sender)` will release memory and therefore must be called
-exactly once.
+The `line_sender_close(sender)` function will release memory and therefore must be called
+exactly once per created object.
 
+Error handling with the C api works by providing a `line_sender_error**` parameter as last argument and check the return value of functions that can go wrong.
 
-### Error handling
-
-#### C++
-
-Most methods in C++ may throw `questdb::line_sender_error`
-exceptions. The C++ `line_sender_error` type inherits from `std::runtime_error`.
-
-#### C
-
-In C you must provide a pointer to a pointer to a `line_sender_error` and check
-the return value of functions that can go wrong.
-
-You may call `line_sender_error_msg(err)` and `line_sender_error_get_code(err)`
+You may then call `line_sender_error_msg(err)` and `line_sender_error_get_code(err)`
 to extract error details.
 
 Once handled, the error object must be disposed by calling
 `line_sender_error_free(err)`.
 
-Here's a complete example on how to handle errors:
+Here's a complete example on how to handle an error:
 
 ```c
 line_sender* sender = ...;
@@ -177,10 +147,19 @@ if (!line_sender_table(
 This type of error handling can get verbose, so you may want to use a `goto`
 to simplify handling (see [example](examples/line_sender_c_example.c)).
 
+#### C++ method calling order
+
+![C++ API Sequential Coupling](api_seq/cpp.svg)
+
+Note how if you're using C++, `.close()` can be called multiple times and will
+also be called automatically on object destruction.
+
+Note that most methods in C++ may throw `questdb::line_sender_error`
+exceptions. The C++ `line_sender_error` type inherits from `std::runtime_error` and you can obtain an error message description by calling `.what()`.
+
 #### Resuming after an error
 
-If you intend to retry, you must call close the existing sender object and
-create a new one. The same sender object can't be reused.
+If you intend to retry, you must create a new sender object: The same sender object can't be reused.
 
 ## If you don't see any data
 

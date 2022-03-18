@@ -8,13 +8,10 @@ Documentation
   * API docs for nul-terminator handling and len semantics.
   * Document duplicate column names.
   * Document timestamp field can either be set via .column() or .at(), not both.
-  * Write a C example.
-  * Write an equivalent C++ example.
   * Document usage from another CMake project
     (follow https://github.com/doctest/doctest/blob/master/doc/markdown/build-systems.md).
   * Review "Library-validated rules" and write "Non-validated rules" sections.
   * Reword section around config. It's no longer correct.
-  * Docs for updated API sequential coupling allowing symbol without column.
 
 Tests
 -----
