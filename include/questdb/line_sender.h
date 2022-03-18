@@ -86,7 +86,7 @@ typedef struct line_sender line_sender;
 
 LINESENDER_API
 line_sender* line_sender_connect(
-    const char* interface,  // if unsure pass "0.0.0.0"
+    const char* net_interface,  // if unsure pass "0.0.0.0"
     const char* host,
     const char* port,
     line_sender_error** err_out);

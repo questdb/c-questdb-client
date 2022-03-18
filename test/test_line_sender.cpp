@@ -26,7 +26,6 @@
 #include "doctest.h"
 
 #include "mock_server.hpp"
-#include "wsastartup_guard.hpp"
 
 #include <questdb/line_sender.h>
 #include <questdb/line_sender.hpp>
@@ -61,7 +60,6 @@ TEST_CASE("next_pow2")
 
 TEST_CASE("utf8: good ascii")
 {
-    WSASTARTUP_GUARD;
     const char buf[] = "abc";
     const size_t len = sizeof(buf) - 1;
     CHECK(len == 3);
@@ -72,7 +70,6 @@ TEST_CASE("utf8: good ascii")
 
 TEST_CASE("utf8: ff ff - bad byte 2")
 {
-    WSASTARTUP_GUARD;
     const char buf[] = "\xff\xff";
     const size_t len = sizeof(buf) - 1;
 
@@ -86,7 +83,6 @@ TEST_CASE("utf8: ff ff - bad byte 2")
 
 TEST_CASE("utf8: partial infinity symbol - need more")
 {
-    WSASTARTUP_GUARD;
     // First 2 chars of infinity symbol.
     const char buf[] = "\xe2\x88";  // \x9e
     const size_t len = sizeof(buf) - 1;
@@ -101,7 +97,6 @@ TEST_CASE("utf8: partial infinity symbol - need more")
 
 TEST_CASE("utf8: Error after valid text")
 {
-    WSASTARTUP_GUARD;
     // 'abc' + First 2 chars of infinity symbol.
     const char buf[] = "abc\xe2\x88";  // \x9e
     const size_t len = sizeof(buf) - 1;
@@ -126,7 +121,6 @@ private:
 
 TEST_CASE("line_sender c api basics")
 {
-    WSASTARTUP_GUARD;
     questdb::test::mock_server server;
     ::line_sender_error* err = nullptr;
     on_scope_exit error_free_guard{[&]{
@@ -160,7 +154,6 @@ TEST_CASE("line_sender c api basics")
 
 TEST_CASE("line_sender c++ api basics")
 {
-    WSASTARTUP_GUARD;
     questdb::test::mock_server server;
     questdb::line_sender sender{
         "localhost",
@@ -184,7 +177,6 @@ TEST_CASE("line_sender c++ api basics")
 
 TEST_CASE("test multiple lines")
 {
-    WSASTARTUP_GUARD;
     questdb::test::mock_server server;
     questdb::line_sender sender{
         "localhost",
@@ -225,7 +217,6 @@ TEST_CASE("test multiple lines")
 
 TEST_CASE("State machine testing -- flush without data.")
 {
-    WSASTARTUP_GUARD;
     questdb::test::mock_server server;
     questdb::line_sender sender{
         "localhost",
@@ -244,7 +235,6 @@ TEST_CASE("State machine testing -- flush without data.")
 
 TEST_CASE("One symbol only - flush before server accept")
 {
-    WSASTARTUP_GUARD;
     questdb::test::mock_server server;
     questdb::line_sender sender{
         "localhost",
@@ -266,7 +256,6 @@ TEST_CASE("One symbol only - flush before server accept")
 
 TEST_CASE("One column only - server.accept() after flush, before close")
 {
-    WSASTARTUP_GUARD;
     questdb::test::mock_server server;
     questdb::line_sender sender{
         "localhost",
@@ -287,7 +276,6 @@ TEST_CASE("One column only - server.accept() after flush, before close")
 
 TEST_CASE("Bad UTF-8 in table")
 {
-    WSASTARTUP_GUARD;
     questdb::test::mock_server server;
     questdb::line_sender sender{
         "localhost",
@@ -317,8 +305,6 @@ TEST_CASE("Bad UTF-8 in table")
 
 TEST_CASE("Validation of bad chars in key names.")
 {
-    WSASTARTUP_GUARD;
-
     {
         questdb::test::mock_server server;
         questdb::line_sender sender{
@@ -416,7 +402,6 @@ TEST_CASE("Validation of bad chars in key names.")
 
 TEST_CASE("Move testing.")
 {
-    WSASTARTUP_GUARD;
     questdb::test::mock_server server1;
     questdb::test::mock_server server2;
 
@@ -448,8 +433,6 @@ TEST_CASE("Move testing.")
 
 TEST_CASE("Bad hostname")
 {
-    WSASTARTUP_GUARD;
-
     try
     {
         questdb::line_sender sender{"dummy_hostname", "9009"};
@@ -468,8 +451,6 @@ TEST_CASE("Bad hostname")
 
 TEST_CASE("Bad interface")
 {
-    WSASTARTUP_GUARD;
-
     try
     {
         questdb::line_sender sender{
@@ -491,8 +472,6 @@ TEST_CASE("Bad interface")
 
 TEST_CASE("Bad port")
 {
-    WSASTARTUP_GUARD;
-
     const auto test_bad_port = [](std::string bad_port)
         {
             try
@@ -523,8 +502,6 @@ TEST_CASE("Bad port")
 
 TEST_CASE("Bad connect")
 {
-    WSASTARTUP_GUARD;
-
     try
     {
         // Port 1 is generally the tcpmux service which one would

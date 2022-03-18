@@ -60,6 +60,35 @@ typedef int sock_ssize_t;
 typedef int sock_len_t;
 #endif
 
+#if defined(PLATFORM_WINDOWS)
+static void init_winsock()
+{
+    WORD vers_req = MAKEWORD(2, 2);
+    WSADATA wsa_data;
+    int err = WSAStartup(vers_req, &wsa_data);
+    if (err != 0)
+    {
+        fprintf(
+            stderr,
+            "Socket init failed. WSAStartup failed with error: %d",
+            err);
+        abort();
+    }
+}
+
+static void release_winsock()
+{
+    if (WSACleanup() != 0)
+    {
+        fprintf(
+            stderr, 
+            "Releasing sockets failed: WSACleanup failed with error: %d",
+            WSAGetLastError());
+        abort();
+    }
+}
+#endif
+
 namespace questdb::test
 {
 
@@ -69,6 +98,9 @@ mock_server::mock_server()
     , _port{0}
     , _msgs{}
 {
+#if defined(PLATFORM_WINDOWS)
+    init_winsock();
+#endif
     _listen_fd = socket(AF_INET, SOCK_STREAM, 0);
 
     const int reuse_addr = 1;
@@ -216,6 +248,10 @@ mock_server::~mock_server()
         CLOSESOCKET(_conn_fd);
     if (_listen_fd)
         CLOSESOCKET(_listen_fd);
+
+#if defined(PLATFORM_WINDOWS)
+    release_winsock();
+#endif
 }
 
 }

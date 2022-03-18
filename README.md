@@ -77,7 +77,7 @@ line_sender* sender = line_sender_connect(
   &err);
 ```
 
-See a [complete example in C](examples/line_sender_example.c).
+See a [complete example in C](examples/line_sender_c_example.c).
 
 ### From a C++ program
 
@@ -93,7 +93,7 @@ questdb::line_sender sender{
 
 ```
 
-See a [complete example in C++](examples/line_sender_example.cpp).
+See a [complete example in C++](examples/line_sender_cpp_example.cpp).
 
 ### How to use the API
 The API is sequentially coupled, meaning that methods need to be called in a
@@ -146,7 +146,7 @@ exceptions. The C++ `line_sender_error` type inherits from `std::runtime_error`.
 In C you must provide a pointer to a pointer to a `line_sender_error` and check
 the return value of functions that can go wrong.
 
-You may call `line_sender_error_errnum(err)` and `line_sender_error_errnum(err)`
+You may call `line_sender_error_msg(err)` and `line_sender_error_get_code(err)`
 to extract error details.
 
 Once handled, the error object must be disposed by calling
@@ -173,6 +173,9 @@ if (!line_sender_table(
   return;
 }
 ```
+
+This type of error handling can get verbose, so you may want to use a `goto`
+to simplify handling (see [example](examples/line_sender_c_example.c)).
 
 #### Resuming after an error
 

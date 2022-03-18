@@ -94,11 +94,24 @@ if(UNIX)
     set_compile_flags(c_questdb_client_static_pic)
 endif(UNIX)
 
+# Examples
+add_executable(
+    line_sender_c_example
+    examples/line_sender_c_example.c)
+target_link_libraries(
+    line_sender_c_example
+    c_questdb_client_static)  # example depending on static lib.
+add_executable(
+    line_sender_cpp_example
+    examples/line_sender_cpp_example.cpp)
+target_link_libraries(
+    line_sender_cpp_example
+    c_questdb_client)  # example depending on dynamic lib.
+
 # Unit test binary.
 add_executable(
     test_line_sender
     test/mock_server.cpp
-    test/wsastartup_guard.cpp
     test/test_line_sender.cpp)
 target_link_libraries(
     test_line_sender

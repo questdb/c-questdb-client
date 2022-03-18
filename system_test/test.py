@@ -27,13 +27,13 @@
 import sys
 sys.dont_write_bytecode = True
 
-import time
 import datetime
 import argparse
 import unittest
 import questdb_line_sender as qls
 import uuid
 from fixture import (
+    Project,
     QuestDbFixture,
     install_questdb,
     list_questdb_releases,
@@ -41,6 +41,8 @@ from fixture import (
 import urllib.request
 import urllib.parse
 import json
+import subprocess
+
 
 QDB_FIXTURE: QuestDbFixture = None
 
@@ -293,6 +295,42 @@ class TestSomething(unittest.TestCase):
         exp_dataset = [[smilie]]  # Comparison excludes timestamp column.
         scrubbed_dataset = [row[:-1] for row in resp['dataset']]
         self.assertEqual(scrubbed_dataset, exp_dataset)
+
+    def _test_example(self, bin_name, table_name):
+        # Call the example program.
+        proj = Project()
+        ext = '.exe' if sys.platform == 'win32' else ''
+        bin_path = next(proj.build_dir.glob(f'**/{bin_name}{ext}'))
+        args = [str(bin_path), "localhost", str(QDB_FIXTURE.line_tcp_port)]
+        subprocess.check_call(args, cwd=bin_path.parent)
+
+        # Check inserted data.
+        resp = retry_check_table(table_name)
+        exp_columns = [
+            {'name': 'id', 'type': 'SYMBOL'},
+            {'name': 'x', 'type': 'DOUBLE'},
+            {'name': 'y', 'type': 'DOUBLE'},
+            {'name': 'booked', 'type': 'BOOLEAN'},
+            {'name': 'passengers', 'type': 'LONG'},
+            {'name': 'driver', 'type': 'STRING'},
+            {'name': 'timestamp', 'type': 'TIMESTAMP'}]
+        self.assertEqual(resp['columns'], exp_columns)
+
+        exp_dataset = [[
+            'd6e5fe92-d19f-482a-a97a-c105f547f721',
+            30.5,
+            -150.25,
+            True,
+            3,
+            'Ranjit Singh']]  # Comparison excludes timestamp column.
+        scrubbed_dataset = [row[:-1] for row in resp['dataset']]
+        self.assertEqual(scrubbed_dataset, exp_dataset)
+
+    def test_c_example(self):
+        self._test_example('line_sender_c_example', 'c_cars')
+
+    def test_cpp_example(self):
+        self._test_example('line_sender_cpp_example', 'cpp_cars')
 
 
 def parse_args():

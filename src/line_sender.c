@@ -422,6 +422,35 @@ static inline bool check_state(
     return false;
 }
 
+#if defined(PLATFORM_WINDOWS)
+static void init_winsock()
+{
+    WORD vers_req = MAKEWORD(2, 2);
+    WSADATA wsa_data;
+    int err = WSAStartup(vers_req, &wsa_data);
+    if (err != 0)
+    {
+        fprintf(
+            stderr,
+            "Socket init failed. WSAStartup failed with error: %d",
+            err);
+        abort();
+    }
+}
+
+static void release_winsock()
+{
+    if (WSACleanup() != 0)
+    {
+        fprintf(
+            stderr, 
+            "Releasing sockets failed: WSACleanup failed with error: %d",
+            WSAGetLastError());
+        abort();
+    }
+}
+#endif
+
 struct line_sender
 {
     socketfd_t sock_fd;
@@ -437,6 +466,10 @@ line_sender* line_sender_connect(
     const char* port,
     line_sender_error** err_out)
 {
+#if defined(PLATFORM_WINDOWS)
+    init_winsock();
+#endif
+
     struct addrinfo* dest_info = NULL;
     struct addrinfo* if_info = NULL;
     socketfd_t sock_fd = 0;
@@ -977,4 +1010,7 @@ void line_sender_close(line_sender* sender)
     CLOSESOCKET(sender->sock_fd);
     freeaddrinfo(sender->dest_info);
     free(sender);
+#if defined(PLATFORM_WINDOWS)
+    release_winsock();
+#endif
 }
