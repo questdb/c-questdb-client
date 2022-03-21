@@ -1,6 +1,7 @@
 #include <questdb/line_sender.h>
 #include <stdio.h>
 #include <stdbool.h>
+#include <string.h>
 
 static bool example(const char* host, const char* port)
 {
@@ -48,7 +49,7 @@ static bool example(const char* host, const char* port)
 
     return true;
 
-on_error:
+on_error: ;
     size_t err_len = 0;
     const char* err_msg = line_sender_error_msg(err, &err_len);
     fprintf(stderr, "Error running example: %.*s\n", (int)err_len, err_msg);
@@ -63,7 +64,7 @@ static bool displayed_help(int argc, const char* argv[])
     for (int index = 1; index < argc; ++index)
     {
         const char* arg = argv[index];
-        if ((strncmp(arg, "-h") == 0) || (strncmp(arg, "--help") == 0))
+        if ((strncmp(arg, "-h", 2) == 0) || (strncmp(arg, "--help", 6) == 0))
         {
             fprintf(stderr, "Usage:\n");
             fprintf(stderr, "line_sender_c_example: [HOST [PORT]]\n");
