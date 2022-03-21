@@ -1,6 +1,7 @@
 Implementation
 --------------
   * [last thing] non-strictly monotonically increasing check for timestamp `at`.
+  * Decouple utf8 and key-name checking in API for faster reuse of strings.
 
 Documentation
 -------------
@@ -8,10 +9,7 @@ Documentation
   * API docs for nul-terminator handling and len semantics.
   * Document duplicate column names.
   * Document timestamp field can either be set via .column() or .at(), not both.
-  * Document usage from another CMake project
-    (follow https://github.com/doctest/doctest/blob/master/doc/markdown/build-systems.md).
   * Review "Library-validated rules" and write "Non-validated rules" sections.
-  * Reword section around config. It's no longer correct.
 
 Tests
 -----

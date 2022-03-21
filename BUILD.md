@@ -1,11 +1,20 @@
 # Build Instructions
 
+This page describes how to build this project.
+
+Also make sure to read the page on
+[integrating this library into your project](DEPENDENCY.md).
+
 ## Pre-requisites
 
-* A modern C++ compiler
-* CMake
+* A modern C11/C++17 compiler.
+* CMake 3.15 or newer.
 
 ## Build steps
+
+### Linux / MacOS
+
+Tested compilers are GCC and Clang.
 
 ```bash
 $ cmake -S . -B build \
@@ -13,9 +22,23 @@ $ cmake -S . -B build \
 $ (cd build && make)
 ```
 
+### Windows
+
+The project should compile with Visual Studio 2017 and newer. It should
+also work with MinGW-w64.
+
+Building on Windows is usually easier done through an IDE.
+
+### IDEs
+
+Open Visual Studio 2017 or CLion and import as CMake project.
+Visual Studio Code should also work well provided you have the "C/C++",
+"CMake Tools" and "CMake Test Explorer" extensions installed.
+
 ## Build outputs
 
-The build will generate libraries compiled to `.build/`.
+The build will generate libraries compiled to `.build/`
+(or your otherwise selected build directory).
 
 You will find one dynamic library and depending on
 the operating system either one or two static libraries.
@@ -32,11 +55,14 @@ On Windows there is just one static library you may use for all purposes.
 
 ### Unit Tests
 C++ unit tests are compiled by default.
-You can run them through `ctest` as so:
+
+In Linux and MacOS you can run these through `ctest` via the command line.
 
 ```bash
 $ (cd build && ctest)
 ```
+
+On Windows it's usually easier to run tests through your IDE.
 
 ### System Tests (optional)
 If you also want to run the system tests which test the client

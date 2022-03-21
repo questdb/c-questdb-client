@@ -1,40 +1,60 @@
 # QuestDB - Line Protocol - Ingestion Client Library for C and C++
 
+This library makes it easy to insert data into [QuestDB](https://questdb.io/).
+
 * Implementation is in C11, with no dependency on the C++ standard library
-  for simpler inclusion into other projects.
+  for simpler inclusion into your projects.
 * The C++ API is a header-only wrapper written in C++17.
+
+## Community
+
+If you need help, have additional questions or want to provide feedback, you
+may find us on [Slack](https://slack.questdb.io).
+
+You can also [sign up to our mailing list](https://questdb.io/community/)
+to get notified of new releases.
 
 ## Protocol
 
-This client library implements the input line protocol over TCP.
+This client library implements the input line protocol (ILP) over TCP.
 
-* Reference docs: https://questdb.io/docs/reference/api/ilp/overview/
+To understand the benefits and limitations of using the protocol, you may want
+to consult the
+[protocol reference docs](https://questdb.io/docs/reference/api/ilp/overview/).
 
-Whilst this library performs as much validation ahead of time as possible,
-the protocol does not report errors or report progress.
+Whilst this library performs significant input validation upfront,
+it can't report errors that happen in the server as the protocol is not designed
+to report them.
 
-As such, due to error in the database or crashes, not all the data may end up
-being written. You can however expect well-formed data to be written so long as
-it has been received by the database.
+For example, the client library will report that a supplied string isn't encoded
+in UTF-8, but will not report that a column previously used to record `BOOLEAN`
+data in a previous row is used in a later row to record a `STRING`.
 
-Data will be written in the order it is sent, unless the
+Unreported errors such as this one usually result in the row not being written
+and skipped silently to the client.
+
+Other errors, such as the database running out of disk space or crashing, mean
+that.
+
+With these caveats out of the way, you can however expect well-formed data to be
+written so long as it has been received by the database.
+
+The input line protocol is currently the fastest way to insert data into
+QuestDB, but if the lack of confirmation of written data is a concern to you,
+you may want to consider alternatives such as inserting via CSV uploads or
+through the PostgreSQL interface.
+
+When using the input line protocol, data will be written in the order it is
+sent, unless you configured the
 [out-of-order feature](https://questdb.io/docs/guides/out-of-order-commit-lag/#how-to-configure-out-of-order-ingestion)
-is used in QuestDB which will reorder records based on timestamp.
+in QuestDB which will reorder records based on timestamp for a given insertion
+time window.
 
-The protocol does not implement authentication and does not resume in case
-of a client-side crash. If you want to be certain that your data has been
-written you will need to:
-
-* Wait for your data to be written, as per the
-  [Load balancing](https://questdb.io/docs/reference/configuration/#load-balancing)
-  configuration section.
-
-* Execute a `select` SQL query to check for the presence of your data.
-
-## Rules for well-formed data
+## Avoiding data input errors and skipped rows
 
 When inserting data through the API, you must follow a set of rules.
-Some are validated by the client library, others will cause the engine to fail silently.
+Some are validated by the client library, others will cause the engine to fail
+silently resulting in rows not getting inserted.
 
 ### Library-validated rules
 
@@ -49,18 +69,32 @@ Some are validated by the client library, others will cause the engine to fail s
 
 TODO: document me.
 
-## Building
+* Different types across rows.
+* Reused column names and symbols.
 
-Prepare your system with:
+## Building this library
+
+We do not ship binaries. To build, prepare your system with:
   * A C/C++ compiler which supports C11 and C++17.
   * CMake 3.15.0 or greater.
 
-Then follow the [build instructions](BUILD.md).
+Then follow the [build instructions](BUILD.md). It covers:
+  * Compiling on Windows / Linux and MacOS.
+  * The build different outputs (dynamic, static, static `-fPIC`).
+  * Running unit tests.
+  * Running system tests.
 
-If you happen to also use CMake in your own project, you can include it as an
-[external cmake dependency](CMAKE_DEPENDENCY.md).
+## Including `c-questdb-client` into your project
+
+Once you know you can build the library, you can learn how to
+[add it as a dependency to your project](DEPENDENCY.md). Here we cover:
+  * Github tags and which version of the code you should use.
+  * Integrating via CMake `FetchContent`.
+  * Integrating via CMake `add_subdirectory`.
+  * Notes on keeping code up to date with `git subtree` and `git submodule`.
+  * Integrating build systems other than CMake.
   
-## Usage
+## Usage and Examples
 
 ### From a C program
 
@@ -109,20 +143,26 @@ This ordering of operations is documented for both the C and C++ APIs below.
 
 ![C API Sequential Coupling](api_seq/c.svg)
 
-Note that this diagram excludes error handling paths: One can call `line_sender_close(sender)` after any operation.
+Note that this diagram excludes error handling paths: One can call
+`line_sender_close(sender)` after any operation.
 
-The `line_sender_close(sender)` function will release memory and therefore must be called
-exactly once per created object.
+The `line_sender_close(sender)` function will release memory and therefore
+must be called exactly once per created object.
 
-Error handling with the C api works by providing a `line_sender_error**` parameter as last argument and check the return value of functions that can go wrong.
+In the C API, functions that can result in errors take a `line_sender_error**`
+parameter as last argument. When calling such functions you must check the
+return value for errors. Functions that return `bool` use `false` to indicate
+a failure.
 
-You may then call `line_sender_error_msg(err)` and `line_sender_error_get_code(err)`
-to extract error details.
+You may then call `line_sender_error_msg(err)` and
+`line_sender_error_get_code(err)` to extract error details.
 
-Once handled, the error object must be disposed by calling
+Once handled, the error object *must* be disposed by calling
 `line_sender_error_free(err)`.
 
-Here's a complete example on how to handle an error:
+On error you must also call `line_sender_close(sender)`.
+
+Here's a complete example on how to handle an error without leaks:
 
 ```c
 line_sender* sender = ...;
@@ -144,8 +184,9 @@ if (!line_sender_table(
 }
 ```
 
-This type of error handling can get verbose, so you may want to use a `goto`
-to simplify handling (see [example](examples/line_sender_c_example.c)).
+This type of error handling can get error-prone and verbose,
+so you may want to use a `goto` to simplify handling
+(see [example](examples/line_sender_c_example.c)).
 
 #### C++ method calling order
 
@@ -154,24 +195,41 @@ to simplify handling (see [example](examples/line_sender_c_example.c)).
 Note how if you're using C++, `.close()` can be called multiple times and will
 also be called automatically on object destruction.
 
+For simplicity the the diagram above does not show that the `.close()` method
+and the `~line_sender` destructor.
+
 Note that most methods in C++ may throw `questdb::line_sender_error`
-exceptions. The C++ `line_sender_error` type inherits from `std::runtime_error` and you can obtain an error message description by calling `.what()`.
+exceptions. The C++ `line_sender_error` type inherits from `std::runtime_error`
+and you can obtain an error message description by calling `.what()`.
 
 #### Resuming after an error
 
-If you intend to retry, you must create a new sender object: The same sender object can't be reused.
+If you intend to retry, you must create a new sender object: The same sender
+object can't be reused.
 
 ## If you don't see any data
 
 You may be experiencing one of these three issues.
 
 ### QuestDB configuration
-QuestDB (as of writing) defaults to a rather long timeout and high row count for
-when data is committed and can by processed by SQL `select` queries.
-These settings can be changed. Tune the `cairo.max.uncommitted.rows`,
-`line.tcp.commit.timeout` and `line.tcp.maintenance.job.interval`
-[Load balancing](https://questdb.io/docs/reference/configuration/#load-balancing)
-settings.
+
+If you can't initially see your data through a `select` query straight away,
+his is normal: by default the database will only commit data it receives
+though the input line protocol periodically to maximize throughput.
+
+For dev/testing you may want to tune the following database configuration
+parameters as so:
+
+```ini
+# server.conf
+cairo.max.uncommitted.rows=1
+line.tcp.maintenance.job.interval=100
+```
+
+The defaults are more applicable for a production environment.
+
+For these and more configuration parameters refer to [database configuration
+](https://questdb.io/docs/reference/configuration/)documentation.
 
 ### API usage
 The API doesn't send any data over the network until the `line_sender_flush`
@@ -179,19 +237,6 @@ function (if using the C API) or `.flush()` method (if using the C++ API API)
 is called.
 
 *Closing the connection will not auto-flush.*
-
-## Windows Dynamic Library Linkage Issues
-
-If you depend on this library as a dynamic library on Windows you need to
-define `LINESENDER_DYN_LIB` as compiler argument when compiling your code.
-
-If you're depending on the cmake infrastructure, this should be added for you
-automatically.
-
-The `LINESENDER_DYN_LIB` define is to allow the header to mark all public APIs
-as `__declspec(dllimport)` and have symbols resolve correctly at runtime.
-
-*Don't do any of this if you're linking the library statically.*
 
 ## License
 

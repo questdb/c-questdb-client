@@ -1,6 +1,6 @@
 digraph line_sender_c_api {
 
-  node [shape=box];
+  node [shape=box, fontname=monospace];
 
   line_sender_connect -> line_sender_table;
   line_sender_connect -> line_sender_close;
