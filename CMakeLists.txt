@@ -25,7 +25,7 @@ set(LIB_SOURCES
 function(set_compile_flags TARGET_NAME)
     if(MSVC)
         # We disable warning C5105 via `/wd5105`
-        # to work around non-C11-compliant 
+        # to work around non-C11-compliant
         # code in WinBase.h which is included from
         # #include <winsock2.h>
         # See: https://docs.microsoft.com/en-us/cpp/

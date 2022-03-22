@@ -124,11 +124,11 @@ typedef struct line_sender_name
 /**
  * Check the provided buffer is a valid UTF-8 encoded string that can be
  * used as a table name, symbol name or column name.
- * 
+ *
  * The string must not contain the following characters:
  * `?`, `.`,  `,`, `'`, `"`, `\`, `/`, `:`, `(`, `)`, `+`, `-`, `*`, `%`, `~`,
  * `' '` (space), `\0` (nul terminator), \uFEFF (ZERO WIDTH NO-BREAK SPACE).
- * 
+ *
  * @param[out] name The object to be initialized.
  * @param[in] len Length in bytes of the buffer.
  * @param[in] buf UTF-8 encoded buffer.
@@ -147,7 +147,7 @@ bool line_sender_name_init(
 
 /**
  * Insert data into QuestDB via the input line protocol.
- * 
+ *
  * Batch up rows, then call `line_sender_flush` to send.
  */
 typedef struct line_sender line_sender;
@@ -275,11 +275,11 @@ bool line_sender_column_str(
 
 /**
  * Complete the row with a specified timestamp.
- * 
- * After this call, you can start batching the next row by calling 
+ *
+ * After this call, you can start batching the next row by calling
  * `line_sender_table` again, or you can send the accumulated batch by
  * calling `line_sender_flush`.
- * 
+ *
  * @param[in] sender Line sender object.
  * @param[in] epoch_nanos Number of nanoseconds since 1st Jan 1970 UTC.
  * @param[out] err_out Set on error.
@@ -294,11 +294,11 @@ bool line_sender_at(
 /**
  * Complete the row without providing a timestamp.
  * The QuestDB instance will insert its own timestamp.
- * 
- * After this call, you can start batching the next row by calling 
+ *
+ * After this call, you can start batching the next row by calling
  * `line_sender_table` again, or you can send the accumulated batch by
  * calling `line_sender_flush`.
- * 
+ *
  * @param[in] sender Line sender object.
  * @param[out] err_out Set on error.
  * @return true on success, false on error.
@@ -313,7 +313,7 @@ bool line_sender_at_now(
 
 /**
  * Number of bytes that will be sent at next call to `line_sender_flush`.
- * 
+ *
  * @param[in] sender Line sender object.
  * @return Accumulated batch size.
  */
@@ -322,10 +322,10 @@ size_t line_sender_pending_size(line_sender* sender);
 
 /**
  * Send batch-up rows messages to the QuestDB server.
- * 
+ *
  * After sending a batch, you can close the connection or begin preparing
  * a new batch by calling `line_sender_table`.
- * 
+ *
  * @param[in] sender Line sender object.
  * @return true on success, false on error.
  */

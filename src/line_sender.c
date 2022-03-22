@@ -444,7 +444,7 @@ static void release_winsock()
     if (WSACleanup() != 0)
     {
         fprintf(
-            stderr, 
+            stderr,
             "Releasing sockets failed: WSACleanup failed with error: %d",
             WSAGetLastError());
         abort();

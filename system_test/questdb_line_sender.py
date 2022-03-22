@@ -77,7 +77,7 @@ def _setup_cdll():
         'win32': 'dll'}[sys.platform]
     dll_path = next(
        build_dir.glob(f'**/*questdb_client*.{dll_ext}'))
-    
+
     dll = ctypes.CDLL(str(dll_path))
 
     def set_sig(fn, restype, *argtypes):

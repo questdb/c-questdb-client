@@ -45,20 +45,20 @@ namespace questdb
 
         /** Called methods in the wrong order. E.g. `symbol` after `column`. */
         invalid_api_call,
-        
+
         /** A network error connecting of flushing data out. */
         socket_error,
-        
+
         /** The string or symbol field is not encoded in valid UTF-8. */
         invalid_utf8,
-        
+
         /** The table name, symbol name or column name contains bad characters. */
         invalid_name
     };
 
     /**
      * An error that occured when using the line sender.
-     * 
+     *
      * Call `.what()` to obtain ASCII encoded error message.
      */
     class line_sender_error : public std::runtime_error
@@ -183,7 +183,7 @@ namespace questdb
 
     /**
      * Insert data into QuestDB via the input line protocol.
-     * 
+     *
      * Batch up rows, then call `.flush()` to send.
      */
     class line_sender
@@ -353,11 +353,11 @@ namespace questdb
 
         /**
          * Complete the row with a specified timestamp.
-         * 
-         * After this call, you can start batching the next row by calling 
+         *
+         * After this call, you can start batching the next row by calling
          * `.table(..)` again, or you can send the accumulated batch by
          * calling `.flush(..)`.
-         * 
+         *
          * @param epoch_nanos Number of nanoseconds since 1st Jan 1970 UTC.
          */
         void at(int64_t epoch_nanos)
@@ -393,7 +393,7 @@ namespace questdb
 
         /**
          * Send batch-up rows messages to the QuestDB server.
-         * 
+         *
          * After sending a batch, you can close the connection or begin
          * preparing a new batch by calling `.table(..)` again.
          */

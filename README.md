@@ -93,7 +93,7 @@ Once you know you can build the library, you can learn how to
   * Integrating via CMake `add_subdirectory`.
   * Notes on keeping code up to date with `git subtree` and `git submodule`.
   * Integrating build systems other than CMake.
-  
+
 ## Usage and Examples
 
 ### From a C program

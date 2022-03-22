@@ -158,7 +158,7 @@ TEST_CASE("line_sender c api basics")
     CHECK(::line_sender_pending_size(sender) == 27);
     CHECK(::line_sender_flush(sender, &err));
     CHECK(server.recv() == 1);
-    CHECK(server.msgs().front() == "test,t1=v1 f1=0.5 10000000\n");    
+    CHECK(server.msgs().front() == "test,t1=v1 f1=0.5 10000000\n");
 }
 
 TEST_CASE("line_sender c++ connect disconnect")
@@ -242,7 +242,7 @@ TEST_CASE("State machine testing -- flush without data.")
     questdb::line_sender sender{
         "localhost",
         std::to_string(server.port()).c_str()};
-    
+
     CHECK(sender.pending_size() == 0);
     CHECK_THROWS_WITH_AS(
         sender.flush(),
@@ -260,7 +260,7 @@ TEST_CASE("One symbol only - flush before server accept")
     questdb::line_sender sender{
         "localhost",
         std::to_string(server.port()).c_str()};
-    
+
     // Does not raise - this is unlike InfluxDB spec that disallows this.
     sender.table("test"_name).symbol("t1"_name, "v1"_utf8).at_now();
     CHECK(!sender.must_close());
