@@ -40,6 +40,7 @@ extern "C"
 }
 
 using namespace std::string_literals;
+using namespace questdb::literals;
 
 TEST_CASE("next_pow2")
 {
@@ -141,15 +142,34 @@ TEST_CASE("line_sender c api basics")
         }};
     server.accept();
     CHECK(server.recv() == 0);
-    CHECK(::line_sender_table(sender, 4, "test", &err));
-    CHECK(::line_sender_symbol(sender, 2, "t1", 2, "v1", &err));
-    CHECK(::line_sender_column_f64(sender, 2, "f1", 0.5, &err));
+    ::line_sender_name table_name{0, nullptr};
+    CHECK(::line_sender_name_init(&table_name, 4, "test", &err));
+    ::line_sender_name t1_name{0, nullptr};
+    CHECK(::line_sender_name_init(&t1_name, 2, "t1", &err));
+    ::line_sender_utf8 v1_utf8{0, nullptr};
+    CHECK(::line_sender_utf8_init(&v1_utf8, 2, "v1", &err));
+    ::line_sender_name f1_name{0, nullptr};
+    CHECK(::line_sender_name_init(&f1_name, 2, "f1", &err));
+    CHECK(::line_sender_table(sender, table_name, &err));
+    CHECK(::line_sender_symbol(sender, t1_name, v1_utf8, &err));
+    CHECK(::line_sender_column_f64(sender, f1_name, 0.5, &err));
     CHECK(::line_sender_at(sender, 10000000, &err));
     CHECK(server.recv() == 0);
     CHECK(::line_sender_pending_size(sender) == 27);
     CHECK(::line_sender_flush(sender, &err));
     CHECK(server.recv() == 1);
     CHECK(server.msgs().front() == "test,t1=v1 f1=0.5 10000000\n");    
+}
+
+TEST_CASE("line_sender c++ connect disconnect")
+{
+    questdb::test::mock_server server;
+    questdb::line_sender sender{
+        "localhost",
+        std::to_string(server.port()).c_str()};
+    CHECK_FALSE(sender.must_close());
+    server.accept();
+    CHECK(server.recv() == 0);
 }
 
 TEST_CASE("line_sender c++ api basics")
@@ -163,9 +183,9 @@ TEST_CASE("line_sender c++ api basics")
     CHECK(server.recv() == 0);
 
     sender
-        .table("test")
-        .symbol("t1", "v1")
-        .column("f1", 0.5)
+        .table("test"_name)
+        .symbol("t1"_name, "v1"_utf8)
+        .column("f1"_name, 0.5)
         .at(10000000);
 
     CHECK(server.recv() == 0);
@@ -185,22 +205,23 @@ TEST_CASE("test multiple lines")
     server.accept();
     CHECK(server.recv() == 0);
 
+    auto table_name = "metric1"_name;
     sender
-        .table("metric1")
-        .symbol("t1", std::string{"val1"})
-        .symbol("t2", std::string_view{"val2"})
-        .column("f1", true)
-        .column("f2", static_cast<int64_t>(12345))
-        .column("f3", 10.75)
-        .column("f4", "val3")
-        .column("f5", std::string{"val4"})
-        .column("f6", std::string_view{"val5"})
+        .table(table_name)
+        .symbol("t1"_name, "val1"_utf8)
+        .symbol("t2"_name, "val2"_utf8)
+        .column("f1"_name, true)
+        .column("f2"_name, static_cast<int64_t>(12345))
+        .column("f3"_name, 10.75)
+        .column("f4"_name, "val3"_utf8)
+        .column("f5"_name, "val4"_utf8)
+        .column("f6"_name, "val5"_utf8)
         .at(111222233333);
     sender
-        .table("metric1")
-        .symbol("tag3", "value 3")
-        .symbol("tag\n4", "value:4")
-        .column("field\t5", false)
+        .table(table_name)
+        .symbol("tag3"_name, "value 3"_utf8)
+        .symbol("tag\n4"_name, "value:4"_utf8)
+        .column("field\t5"_name, false)
         .at_now();
 
     CHECK(server.recv() == 0);
@@ -241,7 +262,7 @@ TEST_CASE("One symbol only - flush before server accept")
         std::to_string(server.port()).c_str()};
     
     // Does not raise - this is unlike InfluxDB spec that disallows this.
-    sender.table("test").symbol("t1", "v1").at_now();
+    sender.table("test"_name).symbol("t1"_name, "v1"_utf8).at_now();
     CHECK(!sender.must_close());
     CHECK(sender.pending_size() == 11);
     sender.flush();
@@ -262,7 +283,7 @@ TEST_CASE("One column only - server.accept() after flush, before close")
         server.port()};
 
     // Does not raise - this is unlike InfluxDB spec that disallows this.
-    sender.table("test").column("t1", "v1").at_now();
+    sender.table("test"_name).column("t1"_name, "v1"_utf8).at_now();
     CHECK(!sender.must_close());
     CHECK(sender.pending_size() == 13);
     sender.flush();
@@ -274,17 +295,17 @@ TEST_CASE("One column only - server.accept() after flush, before close")
     CHECK(server.msgs()[0] == "test t1=\"v1\"\n");
 }
 
-TEST_CASE("Bad UTF-8 in table")
+TEST_CASE("Symbol after column")
 {
     questdb::test::mock_server server;
     questdb::line_sender sender{
         "localhost",
-        std::to_string(server.port()).c_str()};
-    
-    CHECK_THROWS_WITH_AS(
-        sender.table("\xff\xff"),
-        "Bad string \"\\xff\\xff\": "
-        "Invalid UTF-8. Illegal codepoint starting at byte index 0.",
+        server.port()};
+
+    sender.table("test"_name).column("t1"_name, "v1"_utf8);
+
+    CHECK_THROWS_AS(
+        sender.symbol("t2"_name, "v2"_utf8),
         questdb::line_sender_error);
 
     CHECK(sender.must_close());
@@ -303,16 +324,20 @@ TEST_CASE("Bad UTF-8 in table")
     sender.close();
 }
 
+TEST_CASE("Bad UTF-8")
+{
+    CHECK_THROWS_WITH_AS(
+        "\xff\xff"_utf8,
+        "Bad string \"\\xff\\xff\": "
+        "Invalid UTF-8. Illegal codepoint starting at byte index 0.",
+        questdb::line_sender_error);
+}
+
 TEST_CASE("Validation of bad chars in key names.")
 {
     {
-        questdb::test::mock_server server;
-        questdb::line_sender sender{
-            "localhost",
-            std::to_string(server.port()).c_str()};
-
         CHECK_THROWS_WITH_AS(
-            sender.table("a*b"),
+            "a*b"_name,
             "Bad string \"a*b\": table, symbol and column names "
             "can't contain a '*' character, "
             "which was found at byte position 1.",
@@ -320,14 +345,8 @@ TEST_CASE("Validation of bad chars in key names.")
     }
 
     {
-        questdb::test::mock_server server;
-        questdb::line_sender sender{
-            "localhost",
-            std::to_string(server.port()).c_str()};
-
-        sender.table("test");
         CHECK_THROWS_WITH_AS(
-            sender.symbol("a+b", "v1"),
+            "a+b"_name,
             "Bad string \"a+b\": table, symbol and column names "
             "can't contain a '+' character, "
             "which was found at byte position 1.",
@@ -335,15 +354,9 @@ TEST_CASE("Validation of bad chars in key names.")
     }
 
     {
-        questdb::test::mock_server server;
-        questdb::line_sender sender{
-            "localhost",
-            std::to_string(server.port()).c_str()};
-
-        sender.table("test");
         std::string_view column_name{"a\0b", 3};
         CHECK_THROWS_WITH_AS(
-            sender.column(column_name, false),
+            questdb::name_view{column_name},
             "Bad string \"a\\0b\": table, symbol and column names "
             "can't contain a '\\0' character, "
             "which was found at byte position 1.",
@@ -352,14 +365,9 @@ TEST_CASE("Validation of bad chars in key names.")
 
     auto test_bad_name = [](std::string bad_name)
         {
-            questdb::test::mock_server server;
-            questdb::line_sender sender{
-                "localhost",
-                std::to_string(server.port()).c_str()};
-
             try
             {
-                sender.table(bad_name);
+                questdb::name_view{bad_name};
                 std::stringstream ss;
                 ss << "Name `" << bad_name << "` (";
                 for (const char& c : bad_name)
@@ -422,7 +430,7 @@ TEST_CASE("Move testing.")
     questdb::line_sender sender3{
         "localhost",
         std::to_string(server2.port()).c_str()};
-    sender3.table("test");
+    sender3.table("test"_name);
     CHECK(sender3.pending_size() == 4);
     CHECK_FALSE(sender3.must_close());
 

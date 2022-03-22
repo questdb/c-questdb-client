@@ -43,7 +43,7 @@ namespace questdb
         invalid_api_call,
         socket_error,
         invalid_utf8,
-        invalid_identifier
+        invalid_name
     };
 
     class line_sender_error : public std::runtime_error
@@ -81,9 +81,76 @@ namespace questdb
         }
 
         friend class line_sender;
+        friend class utf8_view;
+        friend class name_view;
 
         line_sender_error_code _code;
     };
+
+    class utf8_view
+    {
+    public:
+        utf8_view(const char* buf, size_t len)
+            : _impl{0, nullptr}
+        {
+            line_sender_error::wrapped_call(
+                ::line_sender_utf8_init,
+                &_impl,
+                len,
+                buf);
+        }
+
+        explicit utf8_view(std::string_view s_view)
+            : utf8_view{s_view.data(), s_view.size()}
+        {}
+
+        size_t size() const { return _impl.len; }
+        const char* data() const { return _impl.buf; }
+
+    private:
+        ::line_sender_utf8 _impl;
+
+        friend class line_sender;
+    };
+
+    class name_view
+    {
+    public:
+        name_view(const char* buf, size_t len)
+            : _impl{0, nullptr}
+        {
+            line_sender_error::wrapped_call(
+                ::line_sender_name_init,
+                &_impl,
+                len,
+                buf);
+        }
+
+        explicit name_view(std::string_view s_view)
+            : name_view{s_view.data(), s_view.size()}
+        {}
+
+        size_t size() const { return _impl.len; }
+        const char* data() const { return _impl.buf; }
+
+    private:
+        ::line_sender_name _impl;
+
+        friend class line_sender;
+    };
+
+    namespace literals
+    {
+        utf8_view operator "" _utf8(const char* buf, size_t len)
+        {
+            return utf8_view{buf, len};
+        }
+
+        name_view operator "" _name(const char* buf, size_t len)
+        {
+            return name_view{buf, len};
+        }
+    }
 
     class line_sender
     {
@@ -155,86 +222,68 @@ namespace questdb
         line_sender(const line_sender&) = delete;
         line_sender& operator=(const line_sender&) = delete;
 
-        line_sender& table(std::string_view name)
+        line_sender& table(name_view name)
         {
             line_sender_error::wrapped_call(
                 ::line_sender_table,
                 _impl,
-                name.size(),
-                name.data());
+                name._impl);
             return *this;
         }
 
-        line_sender& symbol(std::string_view name, std::string_view value)
+        line_sender& symbol(name_view name, utf8_view value)
         {
             line_sender_error::wrapped_call(
                 ::line_sender_symbol,
                 _impl,
-                name.size(),
-                name.data(),
-                value.size(),
-                value.data());
+                name._impl,
+                value._impl);
             return *this;
         }
 
         // Require specific overloads of `column` to avoid
         // involuntary usage of the `bool` overload.
         template <typename T>
-        line_sender& column(std::string_view name, T value) = delete;
+        line_sender& column(name_view name, T value) = delete;
 
-        line_sender& column(std::string_view name, bool value)
+        line_sender& column(name_view name, bool value)
         {
             line_sender_error::wrapped_call(
                 ::line_sender_column_bool,
                 _impl,
-                name.size(),
-                name.data(),
+                name._impl,
                 value);
             return *this;
         }
 
-        line_sender& column(std::string_view name, int64_t value)
+        line_sender& column(name_view name, int64_t value)
         {
             line_sender_error::wrapped_call(
                 ::line_sender_column_i64,
                 _impl,
-                name.size(),
-                name.data(),
+                name._impl,
                 value);
             return *this;
         }
 
-        line_sender& column(std::string_view name, double value)
+        line_sender& column(name_view name, double value)
         {
             line_sender_error::wrapped_call(
                 ::line_sender_column_f64,
                 _impl,
-                name.size(),
-                name.data(),
+                name._impl,
                 value);
             return *this;
         }
 
-        line_sender& column(std::string_view name, std::string_view value)
+        line_sender& column(name_view name, utf8_view value)
         {
             line_sender_error::wrapped_call(
                 ::line_sender_column_str,
                 _impl,
-                name.size(),
-                name.data(),
-                value.size(),
-                value.data());
+                name._impl,
+                value._impl);
             return *this;
-        }
-
-        line_sender& column(std::string_view name, const char* value)
-        {
-            return column(name, std::string_view{value});
-        }
-
-        line_sender& column(std::string_view name, const std::string& value)
-        {
-            return column(name, std::string_view{value});
         }
 
         void at(int64_t timestamp_epoch_nanos)

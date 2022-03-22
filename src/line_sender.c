@@ -127,7 +127,8 @@ typedef enum line_sender_state
     line_sender_state_moribund = 0,
 } line_sender_state;
 
-static inline const char* line_sender_state_next_op_descr(line_sender_state state)
+static inline const char* line_sender_state_next_op_descr(
+    line_sender_state state)
 {
     switch (state)
     {
@@ -587,8 +588,8 @@ error_cleanup:
     return NULL;
 }
 
-static inline bool check_utf8(
-    line_sender_state* state,
+bool line_sender_utf8_init(
+    line_sender_utf8* str,
     size_t len,
     const char* buf,
     line_sender_error** err_out)
@@ -601,7 +602,7 @@ static inline bool check_utf8(
         if (u8err.need_more)
         {
             *err_out = err_printf(
-                state,
+                NULL,
                 line_sender_error_invalid_utf8,
                 "Bad string \"%.*s\": "
                 "Invalid UTF-8. "
@@ -614,7 +615,7 @@ static inline bool check_utf8(
         else
         {
             *err_out = err_printf(
-                state,
+                NULL,
                 line_sender_error_invalid_utf8,
                 "Bad string \"%.*s\": "
                 "Invalid UTF-8. "
@@ -626,30 +627,33 @@ static inline bool check_utf8(
         free(buf_descr);
         return false;
     }
+    str->len = len;
+    str->buf = buf;
     return true;
 }
 
-static inline bool check_key_name(
-    line_sender_state* state,
+bool line_sender_name_init(
+    line_sender_name* name,
     size_t len,
-    const char* name,
+    const char* buf,
     line_sender_error** err_out)
 {
     if (!len)
     {
         *err_out = err_printf(
-            state,
-            line_sender_error_invalid_identifier,
+            NULL,
+            line_sender_error_invalid_name,
             "table, symbol and column names must have a non-zero length.");
         return false;
     }
 
-    if (!check_utf8(state, len, name, err_out))
+    line_sender_utf8 str;
+    if (!line_sender_utf8_init(&str, len, buf, err_out))
         return false;
 
     for (size_t index = 0; index < len; ++index)
     {
-        const char c = name[index];
+        const char c = buf[index];
         switch (c)
         {
             case ' ':
@@ -670,23 +674,23 @@ static inline bool check_key_name(
             case '%':
             case '~':
                 {
-                    size_t name_descr_len = 0;
-                    char* name_descr = describe_buf(len, name, &name_descr_len);
-                    char escaped_buf[5];
-                    const size_t escaped_len = escape_char(escaped_buf, c);
+                    size_t buf_descr_len = 0;
+                    char* buf_descr = describe_buf(len, buf, &buf_descr_len);
+                    char escaped[5];
+                    const size_t escaped_len = escape_char(escaped, c);
                     *err_out = err_printf(
-                        state,
-                        line_sender_error_invalid_identifier,
+                        NULL,
+                        line_sender_error_invalid_name,
                         "Bad string \"%.*s\": "
                         "table, symbol and column names can't contain a '%.*s' "
                         "character, which was found at byte position "
                         "%" PRI_SIZET ".",
-                        (int)name_descr_len,
-                        name_descr,
+                        (int)buf_descr_len,
+                        buf_descr,
                         (int)escaped_len,
-                        escaped_buf,
+                        escaped,
                         index);
-                    free(name_descr);
+                    free(buf_descr);
                 }
                 return false;
             default:
@@ -697,25 +701,27 @@ static inline bool check_key_name(
         // if it appears anywhere in the string.
         if ((c == '\xef') &&
             ((index + 2) < len) &&
-            (name[index + 1] == '\xbb') &&
-            (name[index + 2] == '\xbf'))
+            (buf[index + 1] == '\xbb') &&
+            (buf[index + 2] == '\xbf'))
         {
-            size_t name_descr_len = 0;
-            char* name_descr = describe_buf(len, name, &name_descr_len);
+            size_t buf_descr_len = 0;
+            char* buf_descr = describe_buf(len, buf, &buf_descr_len);
             *err_out = err_printf(
-                state,
-                line_sender_error_invalid_identifier,
+                NULL,
+                line_sender_error_invalid_name,
                 "Bad string \"%.*s\": "
                 "table, symbol and column names can't contain a UTF-8 BOM "
                 "character, which was found at byte position "
                 "%" PRI_SIZET ".",
-                (int)name_descr_len,
-                name_descr,
+                (int)buf_descr_len,
+                buf_descr,
                 index);
-            free(name_descr);
+            free(buf_descr);
             return false;
         }
     }
+    name->len = len;
+    name->buf = buf;
     return true;
 }
 
@@ -751,7 +757,7 @@ static inline bool must_escape_quoted(char c)
 }
 
 #define DEFINE_WRITE_ESCAPED_FN(FN_NAME, CHECK_ESCAPE_FN, QUOTING_FN)          \
-    static void FN_NAME(mem_writer* writer, size_t len, const char* s)          \
+    static void FN_NAME(mem_writer* writer, size_t len, const char* s)         \
     {                                                                          \
         size_t to_escape = 0;                                                  \
         for (size_t index = 0; index < len; ++index)                           \
@@ -760,11 +766,11 @@ static inline bool must_escape_quoted(char c)
         QUOTING_FN;                                                            \
         if (!to_escape)                                                        \
         {                                                                      \
-            mem_writer_str(writer, len, s);                                     \
+            mem_writer_str(writer, len, s);                                    \
         }                                                                      \
         else                                                                   \
         {                                                                      \
-            char* buf = mem_writer_book(writer, len + to_escape);               \
+            char* buf = mem_writer_book(writer, len + to_escape);              \
             const char* init_buf = buf;                                        \
             for (size_t index = 0; index < len; ++index)                       \
             {                                                                  \
@@ -773,7 +779,7 @@ static inline bool must_escape_quoted(char c)
                     *buf++ = '\\';                                             \
                 *buf++ = c;                                                    \
             }                                                                  \
-            mem_writer_advance(writer, (size_t)(buf - init_buf));               \
+            mem_writer_advance(writer, (size_t)(buf - init_buf));              \
         }                                                                      \
         QUOTING_FN;                                                            \
     }
@@ -790,16 +796,13 @@ DEFINE_WRITE_ESCAPED_FN(
 
 bool line_sender_table(
     line_sender* sender,
-    size_t name_len,
-    const char* name,
+    line_sender_name name,
     line_sender_error** err_out)
 {
     if (!check_state(&sender->state, line_sender_op_table, err_out))
         return false;
-    if (!check_key_name(&sender->state, name_len, name, err_out))
-        return false;
 
-    write_escaped_unquoted(&sender->writer, name_len, name);
+    write_escaped_unquoted(&sender->writer, name.len, name.buf);
 
     sender->state = line_sender_state_table_written;
     return true;
@@ -807,23 +810,17 @@ bool line_sender_table(
 
 bool line_sender_symbol(
     line_sender* sender,
-    size_t name_len,
-    const char* name,
-    size_t value_len,
-    const char* value,
+    line_sender_name name,
+    line_sender_utf8 value,
     line_sender_error** err_out)
 {
     if (!check_state(&sender->state, line_sender_op_symbol, err_out))
         return false;
-    if (!check_key_name(&sender->state, name_len, name, err_out))
-        return false;
-    if (!check_utf8(&sender->state, value_len, value, err_out))
-        return false;
 
     mem_writer_char(&sender->writer, ',');
-    write_escaped_unquoted(&sender->writer, name_len, name);
+    write_escaped_unquoted(&sender->writer, name.len, name.buf);
     mem_writer_char(&sender->writer, '=');
-    write_escaped_unquoted(&sender->writer, value_len, value);
+    write_escaped_unquoted(&sender->writer, value.len, value.buf);
 
     sender->state = line_sender_state_symbol_written;
     return true;
@@ -831,14 +828,10 @@ bool line_sender_symbol(
 
 static inline bool write_column_key(
     line_sender* sender,
-    size_t name_len,
-    const char* name,
+    line_sender_name name,
     line_sender_error** err_out)
 {
     if (!check_state(&sender->state, line_sender_op_column, err_out))
-        return false;
-
-    if (!check_key_name(&sender->state, name_len, name, err_out))
         return false;
 
     const char separator =
@@ -846,7 +839,7 @@ static inline bool write_column_key(
             ? ' '
             : ',';
     mem_writer_char(&sender->writer, separator);
-    write_escaped_unquoted(&sender->writer, name_len, name);
+    write_escaped_unquoted(&sender->writer, name.len, name.buf);
     mem_writer_char(&sender->writer, '=');
     sender->state = line_sender_state_column_written;
     return true;
@@ -854,12 +847,11 @@ static inline bool write_column_key(
 
 bool line_sender_column_bool(
     line_sender* sender,
-    size_t name_len,
-    const char* name,
+    line_sender_name name,
     bool value,
     line_sender_error** err_out)
 {
-    if (!write_column_key(sender, name_len, name, err_out))
+    if (!write_column_key(sender, name, err_out))
         return false;
     mem_writer_char(&sender->writer, value ? 't' : 'f');
     return true;
@@ -867,12 +859,11 @@ bool line_sender_column_bool(
 
 bool line_sender_column_i64(
     line_sender* sender,
-    size_t name_len,
-    const char* name,
+    line_sender_name name,
     int64_t value,
     line_sender_error** err_out)
 {
-    if (!write_column_key(sender, name_len, name, err_out))
+    if (!write_column_key(sender, name, err_out))
         return false;
     mem_writer_i64(&sender->writer, value);
     mem_writer_char(&sender->writer, 'i');
@@ -881,12 +872,11 @@ bool line_sender_column_i64(
 
 bool line_sender_column_f64(
     line_sender* sender,
-    size_t name_len,
-    const char* name,
+    line_sender_name name,
     double value,
     line_sender_error** err_out)
 {
-    if (!write_column_key(sender, name_len, name, err_out))
+    if (!write_column_key(sender, name, err_out))
         return false;
     mem_writer_f64(&sender->writer, value);
     return true;
@@ -894,17 +884,13 @@ bool line_sender_column_f64(
 
 bool line_sender_column_str(
     line_sender* sender,
-    size_t name_len,
-    const char* name,
-    size_t value_len,
-    const char* value,
+    line_sender_name name,
+    line_sender_utf8 value,
     line_sender_error** err_out)
 {
-    if (!check_utf8(&sender->state, value_len, value, err_out))
+    if (!write_column_key(sender, name, err_out))
         return false;
-    if (!write_column_key(sender, name_len, name, err_out))
-        return false;
-    write_escaped_quoted(&sender->writer, value_len, value);
+    write_escaped_quoted(&sender->writer, value.len, value.buf);
     return true;
 }
 
@@ -948,7 +934,10 @@ size_t line_sender_pending_size(line_sender* sender)
         : 0;
 }
 
-static inline bool send_all(line_sender* sender, sock_len_t len, const char* buf)
+static inline bool send_all(
+    line_sender* sender,
+    sock_len_t len,
+    const char* buf)
 {
     while (len)
     {

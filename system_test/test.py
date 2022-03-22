@@ -101,6 +101,8 @@ class TestSomething(unittest.TestCase):
                     .column('name_e', 'val_b')
                     .at_now())
 
+            sender.flush()
+
         resp = retry_check_table(table_name)
         exp_columns = [
             {'name': 'name_a', 'type': 'SYMBOL'},

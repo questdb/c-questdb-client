@@ -167,11 +167,7 @@ Here's a complete example on how to handle an error without leaks:
 ```c
 line_sender* sender = ...;
 line_sender_error* err = NULL;
-if (!line_sender_table(
-      sender,
-      10,
-      "table_name",
-      &err))
+if (!line_sender_flush(sender, &err))
 {
   size_t msg_len = 0;
   const char* msg = line_sender_error_msg(err, &msg_len);

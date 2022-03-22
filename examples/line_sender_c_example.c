@@ -12,29 +12,72 @@ static bool example(const char* host, const char* port)
     if (!sender)
         goto on_error;
 
-    if (!line_sender_table(sender, 6, "c_cars", &err))
+    // We prepare all our table names and colum names in advance.
+    // If we're inserting multiple rows, this allows us to avoid
+    // re-validating the same strings over and over again.
+    line_sender_name table_name;
+    if (!line_sender_name_init(&table_name, 6, "c_cars", &err))
         goto on_error;
 
-    if (!line_sender_symbol(
-        sender,
-        2, "id",
-        36, "d6e5fe92-d19f-482a-a97a-c105f547f721",
+    line_sender_name id_name;
+    if (!line_sender_name_init(&id_name, 2, "id", &err))
+        goto on_error;
+
+    line_sender_name x_name;
+    if (!line_sender_name_init(&x_name, 1, "x", &err))
+        goto on_error;
+
+    line_sender_name y_name;
+    if (!line_sender_name_init(&y_name, 1, "y", &err))
+        goto on_error;
+
+    line_sender_name booked_name;
+    if (!line_sender_name_init(&booked_name, 6, "booked", &err))
+        goto on_error;
+
+    line_sender_name passengers_name;
+    if (!line_sender_name_init(&passengers_name, 10, "passengers", &err))
+        goto on_error;
+
+    line_sender_name driver_name;
+    if (!line_sender_name_init(&driver_name, 6, "driver", &err))
+        goto on_error;
+
+    if (!line_sender_table(sender, table_name, &err))
+        goto on_error;
+
+    line_sender_utf8 id_value;
+    if (!line_sender_utf8_init(
+        &id_value,
+        36,
+        "d6e5fe92-d19f-482a-a97a-c105f547f721",
         &err))
         goto on_error;
-    
-    if (!line_sender_column_f64(sender, 1, "x", 30.5, &err))
+
+    if (!line_sender_symbol(sender, id_name, id_value, &err))
         goto on_error;
 
-    if (!line_sender_column_f64(sender, 1, "y", -150.25, &err))
+    if (!line_sender_column_f64(sender, x_name, 30.5, &err))
         goto on_error;
 
-    if (!line_sender_column_bool(sender, 6, "booked", true, &err))
+    if (!line_sender_column_f64(sender, y_name, -150.25, &err))
         goto on_error;
 
-    if (!line_sender_column_i64(sender, 10, "passengers", 3, &err))
+    if (!line_sender_column_bool(sender, booked_name, true, &err))
         goto on_error;
 
-    if (!line_sender_column_str(sender, 6, "driver", 12, "Ranjit Singh", &err))
+    if (!line_sender_column_i64(sender, passengers_name, 3, &err))
+        goto on_error;
+
+    line_sender_utf8 driver_value;
+    if (!line_sender_utf8_init(
+        &driver_value,
+        12,
+        "Ranjit Singh",
+        &err))
+        goto on_error;
+
+    if (!line_sender_column_str(sender, driver_name, driver_value, &err))
         goto on_error;
 
     if (!line_sender_at_now(sender, &err))

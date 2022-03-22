@@ -58,19 +58,31 @@ extern "C" {
 #    define LINESENDER_API
 #endif
 
+
 /////////// Error handling.
+/** An error that occured when using the line sender. */
 typedef struct line_sender_error line_sender_error;
 
+/** Category of error. */
 typedef enum line_sender_error_code
 {
+    /** The host, port, or interface was incorrect. */
     line_sender_error_could_not_resolve_addr,
+
+    /** Called methods in the wrong order. E.g. `symbol` after `column`. */
     line_sender_error_invalid_api_call,
+
+    /** A network error connecting of flushing data out. */
     line_sender_error_socket_error,
+
+    /** The string or symbol field is not encoded in valid UTF-8. */
     line_sender_error_invalid_utf8,
-    line_sender_error_invalid_identifier
+
+    /** The table name, symbol name or column name contains bad characters. */
+    line_sender_error_invalid_name
 } line_sender_error_code;
 
-/** Error code describing the error. */
+/** Error code categorising the error. */
 LINESENDER_API
 line_sender_error_code line_sender_error_get_code(const line_sender_error*);
 
@@ -78,102 +90,251 @@ line_sender_error_code line_sender_error_get_code(const line_sender_error*);
 LINESENDER_API
 const char* line_sender_error_msg(const line_sender_error*, size_t* len_out);
 
+/** Clean up the error. */
 LINESENDER_API
 void line_sender_error_free(line_sender_error*);
 
+
+/////////// Preparing strings and names
+
+/** Validated UTF-8 encoded string. */
+typedef struct line_sender_utf8
+{
+    // Don't initialize fields directly.
+    // Call `line_sender_utf8_validate` instead.
+    size_t len;
+    const char* buf;
+} line_sender_utf8;
+
+/**
+ * Check the provided buffer is a valid UTF-8 encoded string.
+ *
+ * @param[out] str The object to be initialized.
+ * @param[in] len Length in bytes of the buffer.
+ * @param[in] buf UTF-8 encoded buffer.
+ * @param[out] err_out Set on error.
+ * @return true on success, false on error.
+ */
+LINESENDER_API
+bool line_sender_utf8_init(
+    line_sender_utf8* str,
+    size_t len,
+    const char* buf,
+    line_sender_error** err_out);
+
+/** Validated table, symbol or column name. UTF-8 encoded. */
+typedef struct line_sender_name
+{
+    // Don't initialize fields directly.
+    // Call `line_sender_name_validate` instead.
+    size_t len;
+    const char* buf;
+} line_sender_name;
+
+/**
+ * Check the provided buffer is a valid UTF-8 encoded string that can be
+ * used as a table name, symbol name or column name.
+ * 
+ * The string must not contain the following characters:
+ * `?`, `.`,  `,`, `'`, `"`, `\`, `/`, `:`, `(`, `)`, `+`, `-`, `*`, `%`, `~`,
+ * `' '` (space), `\0` (nul terminator), \uFEFF (ZERO WIDTH NO-BREAK SPACE).
+ * 
+ * @param[out] name The object to be initialized.
+ * @param[in] len Length in bytes of the buffer.
+ * @param[in] buf UTF-8 encoded buffer.
+ * @param[out] err_out Set on error.
+ * @return true on success, false on error.
+ */
+LINESENDER_API
+bool line_sender_name_init(
+    line_sender_name* name,
+    size_t len,
+    const char* buf,
+    line_sender_error** err_out);
+
+
 /////////// Connecting and disconnecting.
+
+/** Insert data into QuestDB via the input line protocol. */
 typedef struct line_sender line_sender;
 
+/**
+ * Synchronously connect to the QuestDB database.
+ * @param[in] net_interface Network interface to bind to.
+ * If unsure, to bind to all specify "0.0.0.0".
+ * @param[in] host QuestDB host, e.g. "localhost". nul-terminated.
+ * @param[in] port QuestDB port, e.g. "9009". nul-terminated.
+ * @param[out] err_out Set on error.
+ * @return Connected sender object or NULL on error.
+ */
 LINESENDER_API
 line_sender* line_sender_connect(
-    const char* net_interface,  // if unsure pass "0.0.0.0"
+    const char* net_interface,
     const char* host,
     const char* port,
     line_sender_error** err_out);
 
-/** True indicates an error occured previously and the sender must be closed. */
+/**
+ * True indicates an error occured previously and the sender must be closed.
+ * @param[in] sender Line sender object.
+ * @return true if an error occured with a sender and it must be closed.
+ */
 LINESENDER_API
-bool line_sender_must_close(line_sender*);
+bool line_sender_must_close(line_sender* sender);
 
-/** Close the connection. Does not flush. Non-idempotent. */
+/**
+ * Close the connection. Does not flush. Non-idempotent.
+ * @param[in] sender Line sender object.
+ */
 LINESENDER_API
-void line_sender_close(line_sender*);
+void line_sender_close(line_sender* sender);
 
 
 /////////// Preparing line messages.
+
+/** Start batching the next row of input for the named table.
+ * @param[in] sender Line sender object.
+ * @param[in] name Table name.
+ */
 LINESENDER_API
 bool line_sender_table(
-    line_sender*,
-    size_t name_len,
-    const char* name,
+    line_sender* sender,
+    line_sender_name name,
     line_sender_error** err_out);
 
+/**
+ * Append a value for a SYMBOL column.
+ * Symbol columns must always be written before other columns for any given row.
+ * @param[in] sender Line sender object.
+ * @param name Column name.
+ * @param value Column value.
+ * @param[out] err_out Set on error.
+ * @return true on success, false on error.
+ */
 LINESENDER_API
 bool line_sender_symbol(
-    line_sender*,
-    size_t name_len,
-    const char* name,
-    size_t value_len,
-    const char* value,
+    line_sender* sender,
+    line_sender_name name,
+    line_sender_utf8 value,
     line_sender_error** err_out);
 
+/**
+ * Append a value for a BOOLEAN column.
+ * @param[in] sender Line sender object.
+ * @param name Column name.
+ * @param value Column value.
+ * @param[out] err_out Set on error.
+ * @return true on success, false on error.
+ */
 LINESENDER_API
 bool line_sender_column_bool(
-    line_sender*,
-    size_t name_len,
-    const char* name,
+    line_sender* sender,
+    line_sender_name name,
     bool value,
     line_sender_error** err_out);
 
+/**
+ * Append a value for a LONG column.
+ * @param[in] sender Line sender object.
+ * @param name Column name.
+ * @param value Column value.
+ * @param[out] err_out Set on error.
+ * @return true on success, false on error.
+ */
 LINESENDER_API
 bool line_sender_column_i64(
-    line_sender*,
-    size_t name_len,
-    const char* name,
+    line_sender* sender,
+    line_sender_name name,
     int64_t value,
     line_sender_error** err_out);
 
+/**
+ * Append a value for a DOUBLE column.
+ * @param[in] sender Line sender object.
+ * @param name Column name.
+ * @param value Column value.
+ * @param[out] err_out Set on error.
+ * @return true on success, false on error.
+ */
 LINESENDER_API
 bool line_sender_column_f64(
-    line_sender*,
-    size_t name_len,
-    const char* name,
+    line_sender* sender,
+    line_sender_name name,
     double value,
     line_sender_error** err_out);
 
+/**
+ * Append a value for a STRING column.
+ * @param[in] sender Line sender object.
+ * @param name Column name.
+ * @param value Column value.
+ * @param[out] err_out Set on error.
+ * @return true on success, false on error.
+ */
 LINESENDER_API
 bool line_sender_column_str(
-    line_sender*,
-    size_t name_len,
-    const char* name,
-    size_t value_len,
-    const char* value,
+    line_sender* sender,
+    line_sender_name name,
+    line_sender_utf8 value,
     line_sender_error** err_out);
 
+/**
+ * Complete the row with a specified timestamp.
+ * 
+ * After this call, you can start batching the next row (calling table)
+ * or you can send the accumulated batch by calling flush.
+ * 
+ * @param[in] sender Line sender object.
+ * @param[in] epoch_nanos Number of nanoseconds since 1st Jan 1970 UTC.
+ * @param[out] err_out Set on error.
+ * @return true on success, false on error.
+ */
 LINESENDER_API
 bool line_sender_at(
-    line_sender*,
+    line_sender* sender,
     int64_t epoch_nanos,
     line_sender_error** err_out);
 
+/**
+ * Complete the row without providing a timestamp.
+ * The QuestDB instance will insert its own timestamp.
+ * 
+ * After this call, you can start batching the next row (calling table)
+ * or you can send the accumulated batch by calling flush.
+ * 
+ * @param[in] sender Line sender object.
+ * @param[out] err_out Set on error.
+ * @return true on success, false on error.
+ */
 LINESENDER_API
 bool line_sender_at_now(
-    line_sender*,
+    line_sender* sender,
     line_sender_error** err_out);
 
 
 /////////// Committing to network.
 
-/** Number of bytes that will be sent at next call to `line_sender_flush`. */
+/**
+ * Number of bytes that will be sent at next call to `line_sender_flush`.
+ * 
+ * @param[in] sender Line sender object.
+ * @return Accumulated batch size.
+ */
 LINESENDER_API
-size_t line_sender_pending_size(line_sender*);
+size_t line_sender_pending_size(line_sender* sender);
 
 /**
- * Send prepared line messages to the QuestDB server.
+ * Send batch-up rows messages to the QuestDB server.
+ * 
+ * After sending a batch, you can close the connection or begin preparing
+ * a new batch by calling `line_sender_table`.
+ * 
+ * @param[in] sender Line sender object.
+ * @return true on success, false on error.
  */
 LINESENDER_API
 bool line_sender_flush(
-    line_sender*,
+    line_sender* sender,
     line_sender_error** err_out);
 
 #ifdef __cplusplus

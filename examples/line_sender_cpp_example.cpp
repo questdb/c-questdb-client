@@ -2,6 +2,7 @@
 #include <iostream>
 
 using namespace std::literals::string_view_literals;
+using namespace questdb::literals;
 
 static bool example(std::string_view host, std::string_view port)
 {
@@ -9,14 +10,25 @@ static bool example(std::string_view host, std::string_view port)
     {
         questdb::line_sender sender{host, port};
 
+        // We prepare all our table names and colum names in advance.
+        // If we're inserting multiple rows, this allows us to avoid
+        // re-validating the same strings over and over again.
+        auto table_name = "cpp_cars"_name;
+        auto id_name = "id"_name;
+        auto x_name = "x"_name;
+        auto y_name = "y"_name;
+        auto booked_name = "booked"_name;
+        auto passengers_name = "passengers"_name;
+        auto driver_name = "driver"_name;
+
         sender
-            .table("cpp_cars"sv)
-            .symbol("id"sv, "d6e5fe92-d19f-482a-a97a-c105f547f721"sv)
-            .column("x"sv, 30.5)
-            .column("y"sv, -150.25)
-            .column("booked"sv, true)
-            .column("passengers"sv, int64_t{3})
-            .column("driver"sv, "Ranjit Singh"sv)
+            .table(table_name)
+            .symbol(id_name, "d6e5fe92-d19f-482a-a97a-c105f547f721"_utf8)
+            .column(x_name, 30.5)
+            .column(y_name, -150.25)
+            .column(booked_name, true)
+            .column(passengers_name, int64_t{3})
+            .column(driver_name, "Ranjit Singh"_utf8)
             .at_now();
 
         // To insert more records, call `sender.table(..)...` again.
