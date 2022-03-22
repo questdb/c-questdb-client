@@ -24,16 +24,6 @@
 
 #pragma once
 
-/**
- * Connect to QuestDB and send data using the InfluxDB Line Protocol.
- *
- * Functions return `true` to indicate success.
- * In case of errors, you must always follow-up any error-yeilding call
- * with `line_sender_close`.
- * 
- * Don't forget to call `flush()` or no data will be sent.
- */
-
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -97,7 +87,7 @@ void line_sender_error_free(line_sender_error*);
 
 /////////// Preparing strings and names
 
-/** Validated UTF-8 encoded string. */
+/** Non-owning validated UTF-8 encoded string. */
 typedef struct line_sender_utf8
 {
     // Don't initialize fields directly.
@@ -122,7 +112,7 @@ bool line_sender_utf8_init(
     const char* buf,
     line_sender_error** err_out);
 
-/** Validated table, symbol or column name. UTF-8 encoded. */
+/** Non-owning validated table, symbol or column name. UTF-8 encoded. */
 typedef struct line_sender_name
 {
     // Don't initialize fields directly.
@@ -155,7 +145,11 @@ bool line_sender_name_init(
 
 /////////// Connecting and disconnecting.
 
-/** Insert data into QuestDB via the input line protocol. */
+/**
+ * Insert data into QuestDB via the input line protocol.
+ * 
+ * Batch up rows, then call `line_sender_flush` to send.
+ */
 typedef struct line_sender line_sender;
 
 /**
@@ -175,7 +169,7 @@ line_sender* line_sender_connect(
     line_sender_error** err_out);
 
 /**
- * True indicates an error occured previously and the sender must be closed.
+ * Check if an error occured previously and the sender must be closed.
  * @param[in] sender Line sender object.
  * @return true if an error occured with a sender and it must be closed.
  */
@@ -192,7 +186,8 @@ void line_sender_close(line_sender* sender);
 
 /////////// Preparing line messages.
 
-/** Start batching the next row of input for the named table.
+/**
+ * Start batching the next row of input for the named table.
  * @param[in] sender Line sender object.
  * @param[in] name Table name.
  */
@@ -206,8 +201,8 @@ bool line_sender_table(
  * Append a value for a SYMBOL column.
  * Symbol columns must always be written before other columns for any given row.
  * @param[in] sender Line sender object.
- * @param name Column name.
- * @param value Column value.
+ * @param[in] name Column name.
+ * @param[in] value Column value.
  * @param[out] err_out Set on error.
  * @return true on success, false on error.
  */
@@ -221,8 +216,8 @@ bool line_sender_symbol(
 /**
  * Append a value for a BOOLEAN column.
  * @param[in] sender Line sender object.
- * @param name Column name.
- * @param value Column value.
+ * @param[in] name Column name.
+ * @param[in] value Column value.
  * @param[out] err_out Set on error.
  * @return true on success, false on error.
  */
@@ -236,8 +231,8 @@ bool line_sender_column_bool(
 /**
  * Append a value for a LONG column.
  * @param[in] sender Line sender object.
- * @param name Column name.
- * @param value Column value.
+ * @param[in] name Column name.
+ * @param[in] value Column value.
  * @param[out] err_out Set on error.
  * @return true on success, false on error.
  */
@@ -251,8 +246,8 @@ bool line_sender_column_i64(
 /**
  * Append a value for a DOUBLE column.
  * @param[in] sender Line sender object.
- * @param name Column name.
- * @param value Column value.
+ * @param[in] name Column name.
+ * @param[in] value Column value.
  * @param[out] err_out Set on error.
  * @return true on success, false on error.
  */
@@ -266,8 +261,8 @@ bool line_sender_column_f64(
 /**
  * Append a value for a STRING column.
  * @param[in] sender Line sender object.
- * @param name Column name.
- * @param value Column value.
+ * @param[in] name Column name.
+ * @param[in] value Column value.
  * @param[out] err_out Set on error.
  * @return true on success, false on error.
  */
@@ -281,8 +276,9 @@ bool line_sender_column_str(
 /**
  * Complete the row with a specified timestamp.
  * 
- * After this call, you can start batching the next row (calling table)
- * or you can send the accumulated batch by calling flush.
+ * After this call, you can start batching the next row by calling 
+ * `line_sender_table` again, or you can send the accumulated batch by
+ * calling `line_sender_flush`.
  * 
  * @param[in] sender Line sender object.
  * @param[in] epoch_nanos Number of nanoseconds since 1st Jan 1970 UTC.
@@ -299,8 +295,9 @@ bool line_sender_at(
  * Complete the row without providing a timestamp.
  * The QuestDB instance will insert its own timestamp.
  * 
- * After this call, you can start batching the next row (calling table)
- * or you can send the accumulated batch by calling flush.
+ * After this call, you can start batching the next row by calling 
+ * `line_sender_table` again, or you can send the accumulated batch by
+ * calling `line_sender_flush`.
  * 
  * @param[in] sender Line sender object.
  * @param[out] err_out Set on error.

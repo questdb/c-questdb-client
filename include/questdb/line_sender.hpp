@@ -37,15 +37,30 @@ namespace questdb
 
     class line_sender;
 
+    /** Category of error. */
     enum class line_sender_error_code
     {
+        /** The host, port, or interface was incorrect. */
         could_not_resolve_addr,
+
+        /** Called methods in the wrong order. E.g. `symbol` after `column`. */
         invalid_api_call,
+        
+        /** A network error connecting of flushing data out. */
         socket_error,
+        
+        /** The string or symbol field is not encoded in valid UTF-8. */
         invalid_utf8,
+        
+        /** The table name, symbol name or column name contains bad characters. */
         invalid_name
     };
 
+    /**
+     * An error that occured when using the line sender.
+     * 
+     * Call `.what()` to obtain ASCII encoded error message.
+     */
     class line_sender_error : public std::runtime_error
     {
     public:
@@ -54,7 +69,7 @@ namespace questdb
                 , _code{code}
         {}
 
-        /** Returns 0 if there is no associated error number. */
+        /** Error code categorising the error. */
         line_sender_error_code code() const { return _code; }
 
     private:
@@ -87,6 +102,7 @@ namespace questdb
         line_sender_error_code _code;
     };
 
+    /** Non-owning validated UTF-8 encoded string. */
     class utf8_view
     {
     public:
@@ -113,6 +129,7 @@ namespace questdb
         friend class line_sender;
     };
 
+    /** Non-owning validated table, symbol or column name. UTF-8 encoded. */
     class name_view
     {
     public:
@@ -141,17 +158,34 @@ namespace questdb
 
     namespace literals
     {
+        /**
+         * Utility to construct `utf8_view` objects from string literals.
+         * @code {.cpp}
+         * auto validated = "A UTF-8 encoded string"_utf8;
+         * @endcode
+         */
         utf8_view operator "" _utf8(const char* buf, size_t len)
         {
             return utf8_view{buf, len};
         }
 
+        /**
+         * Utility to construct `name_view` objects from string literals.
+         * @code {.cpp}
+         * auto table_name = "events"_name;
+         * @endcode
+         */
         name_view operator "" _name(const char* buf, size_t len)
         {
             return name_view{buf, len};
         }
     }
 
+    /**
+     * Insert data into QuestDB via the input line protocol.
+     * 
+     * Batch up rows, then call `.flush()` to send.
+     */
     class line_sender
     {
     public:
@@ -222,6 +256,10 @@ namespace questdb
         line_sender(const line_sender&) = delete;
         line_sender& operator=(const line_sender&) = delete;
 
+        /**
+         * Start batching the next row of input for the named table.
+         * @param name Table name.
+         */
         line_sender& table(name_view name)
         {
             line_sender_error::wrapped_call(
@@ -231,6 +269,13 @@ namespace questdb
             return *this;
         }
 
+        /**
+         * Append a value for a SYMBOL column.
+         * Symbol columns must always be written before other columns for any
+         * given row.
+         * @param name Column name.
+         * @param value Column value.
+         */
         line_sender& symbol(name_view name, utf8_view value)
         {
             line_sender_error::wrapped_call(
@@ -246,6 +291,11 @@ namespace questdb
         template <typename T>
         line_sender& column(name_view name, T value) = delete;
 
+        /**
+         * Append a value for a BOOLEAN column.
+         * @param name Column name.
+         * @param value Column value.
+         */
         line_sender& column(name_view name, bool value)
         {
             line_sender_error::wrapped_call(
@@ -256,6 +306,11 @@ namespace questdb
             return *this;
         }
 
+        /**
+         * Append a value for a LONG column.
+         * @param name Column name.
+         * @param value Column value.
+         */
         line_sender& column(name_view name, int64_t value)
         {
             line_sender_error::wrapped_call(
@@ -266,6 +321,11 @@ namespace questdb
             return *this;
         }
 
+        /**
+         * Append a value for a DOUBLE column.
+         * @param name Column name.
+         * @param value Column value.
+         */
         line_sender& column(name_view name, double value)
         {
             line_sender_error::wrapped_call(
@@ -276,6 +336,11 @@ namespace questdb
             return *this;
         }
 
+        /**
+         * Append a value for a STRING column.
+         * @param name Column name.
+         * @param value Column value.
+         */
         line_sender& column(name_view name, utf8_view value)
         {
             line_sender_error::wrapped_call(
@@ -286,7 +351,16 @@ namespace questdb
             return *this;
         }
 
-        void at(int64_t timestamp_epoch_nanos)
+        /**
+         * Complete the row with a specified timestamp.
+         * 
+         * After this call, you can start batching the next row by calling 
+         * `.table(..)` again, or you can send the accumulated batch by
+         * calling `.flush(..)`.
+         * 
+         * @param epoch_nanos Number of nanoseconds since 1st Jan 1970 UTC.
+         */
+        void at(int64_t epoch_nanos)
         {
             line_sender_error::wrapped_call(
                 ::line_sender_at,
@@ -294,6 +368,10 @@ namespace questdb
                 timestamp_epoch_nanos);
         }
 
+        /**
+         * Complete the row without providing a timestamp.
+         * The QuestDB instance will insert its own timestamp.
+         */
         void at_now()
         {
             line_sender_error::wrapped_call(
@@ -301,6 +379,11 @@ namespace questdb
                 _impl);
         }
 
+        /**
+         * Number of bytes that will be sent at next call to `.flush()`.
+         *
+         * @return Accumulated batch size.
+         */
         size_t pending_size()
         {
             return _impl
@@ -308,6 +391,12 @@ namespace questdb
                 : 0;
         }
 
+        /**
+         * Send batch-up rows messages to the QuestDB server.
+         * 
+         * After sending a batch, you can close the connection or begin
+         * preparing a new batch by calling `.table(..)` again.
+         */
         void flush()
         {
             line_sender_error::wrapped_call(
@@ -315,6 +404,10 @@ namespace questdb
                 _impl);
         }
 
+        /**
+         * Check if an error occured previously and the sender must be closed.
+         * @return true if an error occured with a sender and it must be closed.
+         */
         bool must_close() noexcept
         {
             return _impl
@@ -322,6 +415,9 @@ namespace questdb
                 : false;
         }
 
+        /**
+         * Close the connection. Does not flush. Idempotent.
+         */
         void close() noexcept
         {
             if (_impl)
