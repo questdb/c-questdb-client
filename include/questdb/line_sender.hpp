@@ -365,7 +365,7 @@ namespace questdb
             line_sender_error::wrapped_call(
                 ::line_sender_at,
                 _impl,
-                timestamp_epoch_nanos);
+                epoch_nanos);
         }
 
         /**
