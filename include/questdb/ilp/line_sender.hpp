@@ -31,7 +31,7 @@
 #include <stdexcept>
 #include <cstdint>
 
-namespace questdb
+namespace questdb::ilp
 {
     constexpr const char* inaddr_any = "0.0.0.0";
 

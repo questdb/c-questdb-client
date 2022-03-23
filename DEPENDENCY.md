@@ -38,11 +38,11 @@ In all examples below, we will attempt to compile:
 
 ```cpp
 // main.cpp
-#include <questdb/line_sender.hpp>
+#include <questdb/ilp/line_sender.hpp>
 
 int main()
 {
-    questdb::line_sender sender{"localhost", 9009};
+    questdb::ilp::line_sender sender{"localhost", 9009};
     return 0;
 }
 ```

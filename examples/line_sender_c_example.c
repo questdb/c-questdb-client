@@ -1,4 +1,4 @@
-#include <questdb/line_sender.h>
+#include <questdb/ilp/line_sender.h>
 #include <stdio.h>
 #include <stdbool.h>
 #include <string.h>

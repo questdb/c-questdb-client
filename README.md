@@ -130,7 +130,7 @@ Once you know you can build the library, you can learn how to
 ### From a C program
 
 ```c
-#include <questdb/line_sender.h>
+#include <questdb/ilp/line_sender.h>
 
 ...
 
@@ -147,12 +147,12 @@ See a [complete example in C](examples/line_sender_c_example.c).
 ### From a C++ program
 
 ```cpp
-#include <questdb/line_sender.hpp>
+#include <questdb/ilp/line_sender.hpp>
 
 ...
 
 // Automatically connects on object construction.
-questdb::line_sender sender{
+questdb::ilp::line_sender sender{
   "127.0.0.1",  // QuestDB hostname
   "9009"};      // QuestDB port
 
@@ -225,7 +225,7 @@ also be called automatically on object destruction.
 For simplicity the the diagram above does not show that the `.close()` method
 and the `~line_sender` destructor.
 
-Note that most methods in C++ may throw `questdb::line_sender_error`
+Note that most methods in C++ may throw `questdb::ilp::line_sender_error`
 exceptions. The C++ `line_sender_error` type inherits from `std::runtime_error`
 and you can obtain an error message description by calling `.what()`.
 

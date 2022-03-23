@@ -1,14 +1,14 @@
-#include <questdb/line_sender.hpp>
+#include <questdb/ilp/line_sender.hpp>
 #include <iostream>
 
 using namespace std::literals::string_view_literals;
-using namespace questdb::literals;
+using namespace questdb::ilp::literals;
 
 static bool example(std::string_view host, std::string_view port)
 {
     try
     {
-        questdb::line_sender sender{host, port};
+        questdb::ilp::line_sender sender{host, port};
 
         // We prepare all our table names and colum names in advance.
         // If we're inserting multiple rows, this allows us to avoid
@@ -37,7 +37,7 @@ static bool example(std::string_view host, std::string_view port)
 
         return true;
     }
-    catch (const questdb::line_sender_error& err)
+    catch (const questdb::ilp::line_sender_error& err)
     {
         std::cerr
             << "Error running example: "

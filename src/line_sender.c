@@ -26,7 +26,7 @@
 #define _POSIX_C_SOURCE 200809L
 #endif
 
-#include <questdb/line_sender.h>
+#include <questdb/ilp/line_sender.h>
 
 #include "build_env.h"
 #include "mem_writer.h"
