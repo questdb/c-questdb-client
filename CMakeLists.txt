@@ -127,6 +127,7 @@ add_test(
 # System testing Python3 script.
 # This will download the latest QuestDB instance from Github,
 # thus will also require a Java 11 installation to run the tests.
+option(QUESTDB_SYSTEM_TESTING "Run system tests" OFF)
 if(QUESTDB_SYSTEM_TESTING)
     find_package(
         Python3

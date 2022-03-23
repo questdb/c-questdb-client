@@ -82,11 +82,11 @@ The following is a non-exhaustive of guidelines to follow:
 * For a given row, a column name should not be repeated.
   If it's repeated, only the first value will be kept.
   This also applies to symbols.
-* Values for a given colum should always have the same type.
+* Values for a given column should always have the same type.
   If changing types the whole row will be dropped (unless we can cast).
 * If supplying timestamps these need to be at least equal to
   previous ones in the same table, unless using the out of order
-  feature. Such rows would be dropped.
+  feature. Out of order rows would be dropped.
 * The timestamp column should be written out through the provided
   `line_sender_at` function (in C) or or `.at()` method in (C++).
   It is also possible to write out additional timestamps values
@@ -94,7 +94,7 @@ The following is a non-exhaustive of guidelines to follow:
 
 *Refer to the
 [protocol reference docs](https://questdb.io/docs/reference/api/ilp/overview/)
-for details and more usage guidelines.*
+for more details and usage guidelines.*
 
 ### Data type conversions
 
@@ -102,6 +102,9 @@ The ILP protocol has its own set of data types which is smaller
 that the set supported by QuestDB.
 We map these types into QuestDB types and perform conversions
 as necessary wherever possible.
+
+For more details see our
+[datatypes](https://questdb.io/docs/reference/sql/datatypes) page.
 
 ## Building this library
 
@@ -223,11 +226,12 @@ Note how if you're using C++, `.close()` can be called multiple times and will
 also be called automatically on object destruction.
 
 For simplicity the the diagram above does not show that the `.close()` method
-and the `~line_sender` destructor.
+and the `~line_sender` destructor at any time.
 
 Note that most methods in C++ may throw `questdb::ilp::line_sender_error`
 exceptions. The C++ `line_sender_error` type inherits from `std::runtime_error`
-and you can obtain an error message description by calling `.what()`.
+and you can obtain an error message description by calling `.what()` and an
+error code calling `.code()`.
 
 #### Resuming after an error
 
@@ -249,12 +253,12 @@ For more details see our
 
 ## If you don't see any data
 
-You may be experiencing one of these three issues.
+You may be experiencing one of these issues:
 
 ### QuestDB configuration
 
 If you can't initially see your data through a `select` query straight away,
-his is normal: by default the database will only commit data it receives
+this is normal: by default the database will only commit data it receives
 though the line protocol periodically to maximize throughput.
 
 For dev/testing you may want to tune the following database configuration

@@ -38,7 +38,7 @@ Visual Studio Code should also work well provided you have the "C/C++",
 ## Build outputs
 
 The build will generate libraries compiled to `./build`
-(or your otherwise selected build directory).
+(or your otherwise selected CMake build directory).
 
 You will find one dynamic library and depending on
 the operating system either one or two static libraries.
@@ -85,5 +85,5 @@ libraries against a live instance of QuestDB you need to:
 Delete the `./build` directory.
 
 ```bash
-$ rm -fR build
+$ rm -fR build  # or your otherwise selected CMake build directory.
 ```

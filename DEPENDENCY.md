@@ -10,7 +10,7 @@ how we tag releases.
 
 We do not ship binaries.
 
-Instead you should obtain a copy of the code sync'ed up
+Instead you should rely on a copy of the code sync'ed up
 to the latest annotated tag. You can find the list of tags on
 the [project's GitHub tag page](tags) or by listing the annotated tags in git
 from a checked out copy of the code.
@@ -22,8 +22,8 @@ git tag -n99 --sort=-creatordate
 
 Examples below will use a dummy name of `CHOSEN_RELEASE_TAG` that you will have
 to substitute for one of these tag names. During development you may also
-substitute it to a specific commit or just `main`, but we don't recommend this
-for production use.
+substitute it to a specific commit or just `main`, but we don't recommend
+running non-tagged code for production use.
 
 ## Getting notified of new releases
 
@@ -32,7 +32,8 @@ our [community page](https://questdb.io/community/).
 
 ## main.cpp
 
-We will cover various approaches.
+We will cover various approaches of including `c-questdb-client` into your
+project.
 
 In all examples below, we will attempt to compile:
 
@@ -50,8 +51,8 @@ int main()
 ## Option 1: CMake & FetchContent integration
 
 If your project already uses CMake, you may use its `FetchContent` feature to
-automatically clone the repository into your build directory when compiling your
-project.
+automatically clone the repository into your temporary build directory when
+compiling your project.
 
 Approach upsides:
 * Easiest setup.
@@ -65,8 +66,9 @@ Approach downsides:
 * Slightly slows down your clean-build time as it runs `git clone` every time
   you configure your CMake project (no impact on rebuild).
 
-In the example CMake below, you need to substitute `CHOSEN_RELEASE_TAG` for one
-of our releases. Don't forget to also update `your_project_name`.
+In the example `CMakeLists.txt` configuration below, you need to substitute
+`CHOSEN_RELEASE_TAG` for one of our releases. Don't forget to also update
+`your_project_name`.
 
 ```cmake
 # CMakeLists.txt
@@ -119,7 +121,8 @@ Grafting can be accomplished via either one of:
 Pick either approach to obtain a copy of this library's code into
 the `deps/c-questdb-client` directory within your git repository.
 
-Once done, the `CMakeLists.txt` config is the same.
+Once done, [configuring `CMakeLists.txt`](cmakeliststxt_with_subdirectory)
+config is the same.
 
 ### Grafting via `git subtree` (recommended)
 
@@ -142,7 +145,8 @@ from the command below and run it from your project's root:
 git subtree add --prefix deps/c-questdb-client https://github.com/questdb/c-questdb-client.git CHOSEN_RELEASE_TAG --squash
 ```
 
-Anyone else in the team who will `git clone` your repo will get all files.
+Anyone else in the team who will `git clone` your repo will obtain all necessary
+files to build the project without additional steps.
 
 At a later date, to upgrade to a newer release (or to revert back to an older
 one) pick a new release tag and run the following command, editing
@@ -197,7 +201,7 @@ git add deps/c-questdb-client
 git commit -m "Updated submodule: c-questdb-client @ NEWLY_CHOSEN_RELEASE_TAG"
 ```
 
-### CMakeLists.txt
+### CMakeLists.txt with subdirectory
 
 Now that our library's code is accessible within your project's
 `deps/c-questdb-client` path we will try and build with it.
