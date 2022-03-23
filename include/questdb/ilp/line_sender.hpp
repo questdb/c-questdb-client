@@ -70,7 +70,7 @@ namespace questdb::ilp
         {}
 
         /** Error code categorising the error. */
-        line_sender_error_code code() const { return _code; }
+        line_sender_error_code code() const noexcept { return _code; }
 
     private:
         inline static line_sender_error from_c(::line_sender_error* c_err)
@@ -120,8 +120,8 @@ namespace questdb::ilp
             : utf8_view{s_view.data(), s_view.size()}
         {}
 
-        size_t size() const { return _impl.len; }
-        const char* data() const { return _impl.buf; }
+        size_t size() const noexcept { return _impl.len; }
+        const char* data() const noexcept { return _impl.buf; }
 
     private:
         ::line_sender_utf8 _impl;
@@ -147,8 +147,8 @@ namespace questdb::ilp
             : name_view{s_view.data(), s_view.size()}
         {}
 
-        size_t size() const { return _impl.len; }
-        const char* data() const { return _impl.buf; }
+        size_t size() const noexcept { return _impl.len; }
+        const char* data() const noexcept { return _impl.buf; }
 
     private:
         ::line_sender_name _impl;
@@ -235,14 +235,14 @@ namespace questdb::ilp
                     net_interface}
         {}
 
-        line_sender(line_sender&& other)
+        line_sender(line_sender&& other) noexcept
             : _impl{other._impl}
         {
             if (this != &other)
                 other._impl = nullptr;
         }
 
-        line_sender& operator=(line_sender&& other)
+        line_sender& operator=(line_sender&& other) noexcept
         {
             if (this != &other)
             {
@@ -384,7 +384,7 @@ namespace questdb::ilp
          *
          * @return Accumulated batch size.
          */
-        size_t pending_size()
+        size_t pending_size() const noexcept
         {
             return _impl
                 ? ::line_sender_pending_size(_impl)
@@ -408,7 +408,7 @@ namespace questdb::ilp
          * Check if an error occured previously and the sender must be closed.
          * @return true if an error occured with a sender and it must be closed.
          */
-        bool must_close() noexcept
+        bool must_close() const noexcept
         {
             return _impl
                 ? ::line_sender_must_close(_impl)

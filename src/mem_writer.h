@@ -36,9 +36,9 @@ typedef struct mem_writer {
 
 void mem_writer_open(mem_writer* writer, size_t capacity);
 
-size_t mem_writer_len(mem_writer* writer);
+size_t mem_writer_len(const mem_writer* writer);
 
-const char* mem_writer_peek(mem_writer* writer, size_t* len_out);
+const char* mem_writer_peek(const mem_writer* writer, size_t* len_out);
 
 char* mem_writer_steal_and_close(mem_writer* writer, size_t* len_out);
 

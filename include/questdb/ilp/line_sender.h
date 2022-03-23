@@ -174,7 +174,7 @@ line_sender* line_sender_connect(
  * @return true if an error occured with a sender and it must be closed.
  */
 LINESENDER_API
-bool line_sender_must_close(line_sender* sender);
+bool line_sender_must_close(const line_sender* sender);
 
 /**
  * Close the connection. Does not flush. Non-idempotent.
@@ -318,7 +318,7 @@ bool line_sender_at_now(
  * @return Accumulated batch size.
  */
 LINESENDER_API
-size_t line_sender_pending_size(line_sender* sender);
+size_t line_sender_pending_size(const line_sender* sender);
 
 /**
  * Send batch-up rows messages to the QuestDB server.

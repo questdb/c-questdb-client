@@ -44,12 +44,12 @@ void mem_writer_open(mem_writer* writer, size_t capacity)
     writer->end = writer->head + capacity;
 }
 
-size_t mem_writer_len(mem_writer* writer)
+size_t mem_writer_len(const mem_writer* writer)
 {
     return (size_t)(writer->tail - writer->head);
 }
 
-const char* mem_writer_peek(mem_writer* writer, size_t* len_out)
+const char* mem_writer_peek(const mem_writer* writer, size_t* len_out)
 {
     *len_out = mem_writer_len(writer);
     return writer->head;

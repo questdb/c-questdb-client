@@ -927,7 +927,7 @@ bool line_sender_at_now(
     return true;
 }
 
-size_t line_sender_pending_size(line_sender* sender)
+size_t line_sender_pending_size(const line_sender* sender)
 {
     return (sender->state != line_sender_state_moribund)
         ? mem_writer_len(&sender->writer)
@@ -988,7 +988,7 @@ bool line_sender_flush(
     return true;
 }
 
-bool line_sender_must_close(line_sender* sender)
+bool line_sender_must_close(const line_sender* sender)
 {
     return sender->state == line_sender_state_moribund;
 }
