@@ -87,7 +87,15 @@ def retry_check_table(table_name, min_rows=1, timeout_sec=5):
     return retry(check_table, timeout_sec=timeout_sec)
 
 
-class TestSomething(unittest.TestCase):
+def ns_to_qdb_date(at_ts_ns):
+    # We first need to match QuestDB's internal microsecond resolution.
+    at_ts_us = int(at_ts_ns / 1000.0)
+    at_ts_sec = at_ts_us / 1000000.0
+    at_td = datetime.datetime.fromtimestamp(at_ts_sec)
+    return at_td.isoformat() + 'Z'
+
+
+class TestLineSender(unittest.TestCase):
     def test_insert_three_rows(self):
         table_name = uuid.uuid4().hex
         with qls.LineSender('localhost', QDB_FIXTURE.line_tcp_port) as sender:
@@ -244,15 +252,35 @@ class TestSomething(unittest.TestCase):
                 .symbol('a', 'A')
                 .at(at_ts_ns))
 
-        # We first need to match QuestDB's internal microsecond resolution.
-        at_ts_us = int(at_ts_ns / 1000.0)
-        at_ts_sec = at_ts_us / 1000000.0
-        at_td = datetime.datetime.fromtimestamp(at_ts_sec)
-        at_str = at_td.isoformat() + 'Z'
+        resp = retry_check_table(table_name)
+        exp_dataset = [['A', ns_to_qdb_date(at_ts_ns)]]
+        self.assertEqual(resp['dataset'], exp_dataset)
+
+    def test_bad_at(self):
+        if QDB_FIXTURE.version <= (6, 0, 7, 1):
+            self.skipTest('No support for user-provided timestamps.')
+            return
+        table_name = uuid.uuid4().hex
+        at_ts_ns1 = 1648032959100000000
+        at_ts_ns2 = 1648032958100000000  # A second before `at_ts_ns1`.
+        with qls.LineSender('localhost', QDB_FIXTURE.line_tcp_port) as sender:
+            (sender
+                .table(table_name)
+                .symbol('a', 'A')
+                .at(at_ts_ns1))
+            (sender
+                .table(table_name)
+                .symbol('a', 'B')
+                .at(at_ts_ns2))
 
         resp = retry_check_table(table_name)
-        exp_dataset = [['A', at_str]]
+        exp_dataset = [['A', ns_to_qdb_date(at_ts_ns1)]]
         self.assertEqual(resp['dataset'], exp_dataset)
+
+        # The second time stamp is dropped and will not appear in results.
+        with self.assertRaises(TimeoutError):
+            retry_check_table(table_name, min_rows=2, timeout_sec=1)
+
 
     def test_underscores(self):
         table_name = f'_{uuid.uuid4().hex}_'

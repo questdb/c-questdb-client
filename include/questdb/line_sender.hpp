@@ -182,7 +182,7 @@ namespace questdb
     }
 
     /**
-     * Insert data into QuestDB via the input line protocol.
+     * Insert data into QuestDB via the InfluxDB Line Protocol.
      *
      * Batch up rows, then call `.flush()` to send.
      */

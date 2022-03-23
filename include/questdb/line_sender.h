@@ -146,7 +146,7 @@ bool line_sender_name_init(
 /////////// Connecting and disconnecting.
 
 /**
- * Insert data into QuestDB via the input line protocol.
+ * Insert data into QuestDB via the InfluxDB Line Protocol.
  *
  * Batch up rows, then call `line_sender_flush` to send.
  */
