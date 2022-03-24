@@ -3,6 +3,8 @@
 
 This library makes it easy to insert data into [QuestDB](https://questdb.io/).
 
+This client library implements the InfluxDB Line Protocol (ILP) over TCP.
+
 * Implementation is in C11, with no dependency on the C++ standard library
   for simpler inclusion into your projects.
 * The C++ API is a header-only wrapper written in C++17.
@@ -14,97 +16,6 @@ may find us on [Slack](https://slack.questdb.io).
 
 You can also [sign up to our mailing list](https://questdb.io/community/)
 to get notified of new releases.
-
-## Protocol
-
-This client library implements the InfluxDB Line Protocol (ILP) over TCP.
-
-To understand the benefits and limitations of using the protocol, you may want
-to consult the
-[protocol reference docs](https://questdb.io/docs/reference/api/ilp/overview/).
-
-Whilst this library performs significant input validation upfront,
-it can't report errors that happen in the server as the protocol is not designed
-to report them.
-
-For example, the client library will report that a supplied string isn't encoded
-in UTF-8, but will not report that a column previously used to record a
-`BOOLEAN` is later incorrectly used to record a `STRING`.
-
-Unreported errors such as this one usually result in skipped rows that don't
-get saved.
-
-Other errors, such as the database running out of disk space or crashing will
-result in a TCP connection drop, but also uncertainty from the client's
-perspective on which records were written.
-
-With these caveats out of the way, you can however expect well-formed data to be
-written so long as it has been received by the database, caveat bugs and system
-errors.
-
-The line protocol is currently the fastest way to insert data into
-QuestDB, but if the lack of confirmation of written data is a concern to you,
-you may want to consider alternatives such as inserting via CSV uploads or
-through the PostgreSQL interface. Those alternatives are slower but more robust.
-The choice of input mechanism will depend on your use case.
-
-When using the line protocol, data will be written in the order it is
-sent, unless you configured the
-[out-of-order feature](https://questdb.io/docs/guides/out-of-order-commit-lag/#how-to-configure-out-of-order-ingestion)
-in QuestDB which will reorder records based on timestamp for a given insertion
-time window.
-
-## Avoiding data input errors and skipped rows
-
-When inserting data through the API, you must follow a set of rules.
-Some are validated by the client library, others will cause the engine to fail
-silently resulting in rows not getting inserted.
-
-### Library-validated rules
-
-* Strings and symbols must be passed in as valid UTF-8 which
-  need not be nul-terminated.
-* Table names, symbol and column names can't contain the characters `?`, `.`,
-  `,`, `'`, `"`, `\`, `/`, `:`, `(`, `)`, `+`, `-`, `*`, `%`, `~`,
-  `' '` (space), `\0` (nul terminator),
-  [ZERO WIDTH NO-BREAK SPACE](https://unicode-explorer.com/c/FEFF).
-* Each row should contain, *in order*:
-  * table name
-  * at least one of:
-    * symbols, zero or more
-    * columns, zero or more
-  * timestamp, optionally
-
-### Non-validated rules
-
-The following is a non-exhaustive of guidelines to follow:
-
-* For a given row, a column name should not be repeated.
-  If it's repeated, only the first value will be kept.
-  This also applies to symbols.
-* Values for a given column should always have the same type.
-  If changing types the whole row will be dropped (unless we can cast).
-* If supplying timestamps these need to be at least equal to
-  previous ones in the same table, unless using the out of order
-  feature. Out of order rows would be dropped.
-* The timestamp column should be written out through the provided
-  `line_sender_at` function (in C) or or `.at()` method in (C++).
-  It is also possible to write out additional timestamps values
-  as columns.
-
-*Refer to the
-[protocol reference docs](https://questdb.io/docs/reference/api/ilp/overview/)
-for more details and usage guidelines.*
-
-### Data type conversions
-
-The ILP protocol has its own set of data types which is smaller
-that the set supported by QuestDB.
-We map these types into QuestDB types and perform conversions
-as necessary wherever possible.
-
-For more details see our
-[datatypes](https://questdb.io/docs/reference/sql/datatypes) page.
 
 ## Building this library
 
@@ -237,6 +148,95 @@ error code calling `.code()`.
 
 If you intend to retry, you must create a new sender object: The same sender
 object can't be reused.
+
+## Protocol
+
+To understand the benefits and limitations of using the protocol, you may want
+to consult the
+[protocol reference docs](https://questdb.io/docs/reference/api/ilp/overview/).
+
+Whilst this library performs significant input validation upfront,
+it can't report errors that happen in the server as the protocol is not designed
+to report them.
+
+For example, the client library will report that a supplied string isn't encoded
+in UTF-8, but will not report that a column previously used to record a
+`BOOLEAN` is later incorrectly used to record a `STRING`.
+
+Unreported errors such as this one usually result in skipped rows that don't
+get saved.
+
+Other errors, such as the database running out of disk space or crashing will
+result in a TCP connection drop, but also uncertainty from the client's
+perspective on which records were written.
+
+With these caveats out of the way, you can however expect well-formed data to be
+written so long as it has been received by the database, caveat bugs and system
+errors.
+
+The line protocol is currently the fastest way to insert data into
+QuestDB, but if the lack of confirmation of written data is a concern to you,
+you may want to consider alternatives such as inserting via CSV uploads or
+through the PostgreSQL interface. Those alternatives are slower but more robust.
+The choice of input mechanism will depend on your use case.
+
+When using the line protocol, data will be written in the order it is
+sent, unless you configured the
+[out-of-order feature](https://questdb.io/docs/guides/out-of-order-commit-lag/#how-to-configure-out-of-order-ingestion)
+in QuestDB which will reorder records based on timestamp for a given insertion
+time window.
+
+## Avoiding data input errors and skipped rows
+
+When inserting data through the API, you must follow a set of rules.
+Some are validated by the client library, others will cause the engine to fail
+silently resulting in rows not getting inserted.
+
+### Library-validated rules
+
+* Strings and symbols must be passed in as valid UTF-8 which
+  need not be nul-terminated.
+* Table names, symbol and column names can't contain the characters `?`, `.`,
+  `,`, `'`, `"`, `\`, `/`, `:`, `(`, `)`, `+`, `-`, `*`, `%`, `~`,
+  `' '` (space), `\0` (nul terminator),
+  [ZERO WIDTH NO-BREAK SPACE](https://unicode-explorer.com/c/FEFF).
+* Each row should contain, *in order*:
+  * table name
+  * at least one of:
+    * symbols, zero or more
+    * columns, zero or more
+  * timestamp, optionally
+
+### Non-validated rules
+
+The following is a non-exhaustive of guidelines to follow:
+
+* For a given row, a column name should not be repeated.
+  If it's repeated, only the first value will be kept.
+  This also applies to symbols.
+* Values for a given column should always have the same type.
+  If changing types the whole row will be dropped (unless we can cast).
+* If supplying timestamps these need to be at least equal to
+  previous ones in the same table, unless using the out of order
+  feature. Out of order rows would be dropped.
+* The timestamp column should be written out through the provided
+  `line_sender_at` function (in C) or or `.at()` method in (C++).
+  It is also possible to write out additional timestamps values
+  as columns.
+
+*Refer to the
+[protocol reference docs](https://questdb.io/docs/reference/api/ilp/overview/)
+for more details and usage guidelines.*
+
+### Data type conversions
+
+The ILP protocol has its own set of data types which is smaller
+that the set supported by QuestDB.
+We map these types into QuestDB types and perform conversions
+as necessary wherever possible.
+
+For more details see our
+[datatypes](https://questdb.io/docs/reference/sql/datatypes) page.
 
 ## Symbols or Strings
 
