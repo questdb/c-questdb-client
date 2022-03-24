@@ -8,151 +8,150 @@
  viewBox="0.00 0.00 532.00 550.00" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
 <g id="graph0" class="graph" transform="scale(1 1) rotate(0) translate(4 546)">
 <title>line_sender_cpp_api</title>
-<polygon fill="white" stroke="transparent" points="-4,4 -4,-546 528,-546 528,4 -4,4"/>
 <!-- line_sender -->
 <g id="node1" class="node">
 <title>line_sender</title>
-<polygon fill="none" stroke="black" points="524,-542 120,-542 120,-506 524,-506 524,-542"/>
-<text text-anchor="middle" x="322" y="-520.3" font-family="monospace" font-size="14.00">line_sender::line_sender(host, port, interface)</text>
+<polygon fill="#343942" stroke="black" points="524,-542 120,-542 120,-506 524,-506 524,-542"/>
+<text text-anchor="middle" x="322" y="-520.3" font-family="monospace" font-size="14.00" fill="#c9d1d9">line_sender::line_sender(host, port, interface)</text>
 </g>
 <!-- table -->
 <g id="node2" class="node">
 <title>table</title>
-<polygon fill="none" stroke="black" points="337,-470 221,-470 221,-434 337,-434 337,-470"/>
-<text text-anchor="middle" x="279" y="-448.3" font-family="monospace" font-size="14.00">.table(name)</text>
+<polygon fill="#343942" stroke="black" points="337,-470 221,-470 221,-434 337,-434 337,-470"/>
+<text text-anchor="middle" x="279" y="-448.3" font-family="monospace" font-size="14.00" fill="#c9d1d9">.table(name)</text>
 </g>
 <!-- line_sender&#45;&gt;table -->
 <g id="edge1" class="edge">
 <title>line_sender&#45;&gt;table</title>
-<path fill="none" stroke="black" d="M311.37,-505.7C306.37,-497.56 300.31,-487.69 294.79,-478.7"/>
-<polygon fill="black" stroke="black" points="297.72,-476.79 289.51,-470.1 291.76,-480.46 297.72,-476.79"/>
+<path fill="none" stroke="#343942" d="M311.37,-505.7C306.37,-497.56 300.31,-487.69 294.79,-478.7"/>
+<polygon fill="#343942" stroke="#343942" points="297.72,-476.79 289.51,-470.1 291.76,-480.46 297.72,-476.79"/>
 </g>
 <!-- dtor -->
 <g id="node3" class="node">
 <title>dtor</title>
-<polygon fill="none" stroke="black" points="396.5,-36 157.5,-36 157.5,0 396.5,0 396.5,-36"/>
-<text text-anchor="middle" x="277" y="-14.3" font-family="monospace" font-size="14.00">line_sender::~line_sender()</text>
+<polygon fill="#343942" stroke="black" points="396.5,-36 157.5,-36 157.5,0 396.5,0 396.5,-36"/>
+<text text-anchor="middle" x="277" y="-14.3" font-family="monospace" font-size="14.00" fill="#c9d1d9">line_sender::~line_sender()</text>
 </g>
 <!-- line_sender&#45;&gt;dtor -->
 <g id="edge2" class="edge">
 <title>line_sender&#45;&gt;dtor</title>
-<path fill="none" stroke="black" d="M330.91,-505.58C343.5,-479.3 365,-427.62 365,-381 365,-381 365,-381 365,-161 365,-120.55 367.59,-106.2 346,-72 338.61,-60.29 327.67,-50.18 316.67,-42.01"/>
-<polygon fill="black" stroke="black" points="318.5,-39.02 308.3,-36.15 314.48,-44.76 318.5,-39.02"/>
+<path fill="none" stroke="#343942" d="M330.91,-505.58C343.5,-479.3 365,-427.62 365,-381 365,-381 365,-381 365,-161 365,-120.55 367.59,-106.2 346,-72 338.61,-60.29 327.67,-50.18 316.67,-42.01"/>
+<polygon fill="#343942" stroke="#343942" points="318.5,-39.02 308.3,-36.15 314.48,-44.76 318.5,-39.02"/>
 </g>
 <!-- symbol -->
 <g id="node4" class="node">
 <title>symbol</title>
-<polygon fill="none" stroke="black" points="238,-398 56,-398 56,-362 238,-362 238,-398"/>
-<text text-anchor="middle" x="147" y="-376.3" font-family="monospace" font-size="14.00">.symbol(name, value)</text>
+<polygon fill="#343942" stroke="black" points="238,-398 56,-398 56,-362 238,-362 238,-398"/>
+<text text-anchor="middle" x="147" y="-376.3" font-family="monospace" font-size="14.00" fill="#c9d1d9">.symbol(name, value)</text>
 </g>
 <!-- table&#45;&gt;symbol -->
 <g id="edge3" class="edge">
 <title>table&#45;&gt;symbol</title>
-<path fill="none" stroke="black" d="M246.71,-433.88C229.13,-424.55 207.19,-412.92 188.37,-402.94"/>
-<polygon fill="black" stroke="black" points="189.89,-399.78 179.41,-398.19 186.61,-405.97 189.89,-399.78"/>
+<path fill="none" stroke="#343942" d="M246.71,-433.88C229.13,-424.55 207.19,-412.92 188.37,-402.94"/>
+<polygon fill="#343942" stroke="#343942" points="189.89,-399.78 179.41,-398.19 186.61,-405.97 189.89,-399.78"/>
 </g>
 <!-- column -->
 <g id="node5" class="node">
 <title>column</title>
-<polygon fill="none" stroke="black" points="182,-326 0,-326 0,-290 182,-290 182,-326"/>
-<text text-anchor="middle" x="91" y="-304.3" font-family="monospace" font-size="14.00">.column(name, value)</text>
+<polygon fill="#343942" stroke="black" points="182,-326 0,-326 0,-290 182,-290 182,-326"/>
+<text text-anchor="middle" x="91" y="-304.3" font-family="monospace" font-size="14.00" fill="#c9d1d9">.column(name, value)</text>
 </g>
 <!-- table&#45;&gt;column -->
 <g id="edge7" class="edge">
 <title>table&#45;&gt;column</title>
-<path fill="none" stroke="black" d="M220.79,-445.87C159.31,-439.09 68.35,-424.77 47,-398 31.49,-378.54 47.47,-352.72 64.35,-333.91"/>
-<polygon fill="black" stroke="black" points="67.21,-335.98 71.55,-326.31 62.13,-331.16 67.21,-335.98"/>
+<path fill="none" stroke="#343942" d="M220.79,-445.87C159.31,-439.09 68.35,-424.77 47,-398 31.49,-378.54 47.47,-352.72 64.35,-333.91"/>
+<polygon fill="#343942" stroke="#343942" points="67.21,-335.98 71.55,-326.31 62.13,-331.16 67.21,-335.98"/>
 </g>
 <!-- symbol&#45;&gt;symbol -->
 <g id="edge4" class="edge">
 <title>symbol&#45;&gt;symbol</title>
-<path fill="none" stroke="black" d="M238.04,-391.6C248.9,-389.49 256,-385.62 256,-380 256,-376.31 252.94,-373.37 247.77,-371.2"/>
-<polygon fill="black" stroke="black" points="248.62,-367.8 238.04,-368.4 246.68,-374.53 248.62,-367.8"/>
+<path fill="none" stroke="#343942" d="M238.04,-391.6C248.9,-389.49 256,-385.62 256,-380 256,-376.31 252.94,-373.37 247.77,-371.2"/>
+<polygon fill="#343942" stroke="#343942" points="248.62,-367.8 238.04,-368.4 246.68,-374.53 248.62,-367.8"/>
 </g>
 <!-- symbol&#45;&gt;column -->
 <g id="edge5" class="edge">
 <title>symbol&#45;&gt;column</title>
-<path fill="none" stroke="black" d="M133.16,-361.7C126.51,-353.39 118.42,-343.28 111.11,-334.14"/>
-<polygon fill="black" stroke="black" points="113.66,-331.73 104.68,-326.1 108.2,-336.1 113.66,-331.73"/>
+<path fill="none" stroke="#343942" d="M133.16,-361.7C126.51,-353.39 118.42,-343.28 111.11,-334.14"/>
+<polygon fill="#343942" stroke="#343942" points="113.66,-331.73 104.68,-326.1 108.2,-336.1 113.66,-331.73"/>
 </g>
 <!-- at -->
 <g id="node6" class="node">
 <title>at</title>
-<polygon fill="none" stroke="black" points="294,-254 162,-254 162,-216 294,-216 294,-254"/>
-<text text-anchor="middle" x="228" y="-238.8" font-family="monospace" font-size="14.00">.at(timestamp)</text>
-<text text-anchor="middle" x="228" y="-223.8" font-family="monospace" font-size="14.00">.at_now()</text>
+<polygon fill="#343942" stroke="black" points="294,-254 162,-254 162,-216 294,-216 294,-254"/>
+<text text-anchor="middle" x="228" y="-238.8" font-family="monospace" font-size="14.00" fill="#c9d1d9">.at(timestamp)</text>
+<text text-anchor="middle" x="228" y="-223.8" font-family="monospace" font-size="14.00" fill="#c9d1d9">.at_now()</text>
 </g>
 <!-- symbol&#45;&gt;at -->
 <g id="edge6" class="edge">
 <title>symbol&#45;&gt;at</title>
-<path fill="none" stroke="black" d="M174.19,-361.93C186.63,-352.75 200.47,-340.37 209,-326 220.16,-307.2 224.82,-282.77 226.74,-264.11"/>
-<polygon fill="black" stroke="black" points="230.22,-264.4 227.56,-254.14 223.25,-263.82 230.22,-264.4"/>
+<path fill="none" stroke="#343942" d="M174.19,-361.93C186.63,-352.75 200.47,-340.37 209,-326 220.16,-307.2 224.82,-282.77 226.74,-264.11"/>
+<polygon fill="#343942" stroke="#343942" points="230.22,-264.4 227.56,-254.14 223.25,-263.82 230.22,-264.4"/>
 </g>
 <!-- column&#45;&gt;column -->
 <g id="edge8" class="edge">
 <title>column&#45;&gt;column</title>
-<path fill="none" stroke="black" d="M182.04,-319.6C192.9,-317.49 200,-313.62 200,-308 200,-304.31 196.94,-301.37 191.77,-299.2"/>
-<polygon fill="black" stroke="black" points="192.62,-295.8 182.04,-296.4 190.68,-302.53 192.62,-295.8"/>
+<path fill="none" stroke="#343942" d="M182.04,-319.6C192.9,-317.49 200,-313.62 200,-308 200,-304.31 196.94,-301.37 191.77,-299.2"/>
+<polygon fill="#343942" stroke="#343942" points="192.62,-295.8 182.04,-296.4 190.68,-302.53 192.62,-295.8"/>
 </g>
 <!-- column&#45;&gt;at -->
 <g id="edge9" class="edge">
 <title>column&#45;&gt;at</title>
-<path fill="none" stroke="black" d="M123.81,-289.99C141.86,-280.64 164.48,-268.92 184.03,-258.79"/>
-<polygon fill="black" stroke="black" points="185.79,-261.82 193.06,-254.11 182.57,-255.6 185.79,-261.82"/>
+<path fill="none" stroke="#343942" d="M123.81,-289.99C141.86,-280.64 164.48,-268.92 184.03,-258.79"/>
+<polygon fill="#343942" stroke="#343942" points="185.79,-261.82 193.06,-254.11 182.57,-255.6 185.79,-261.82"/>
 </g>
 <!-- at&#45;&gt;table -->
 <g id="edge13" class="edge">
 <title>at&#45;&gt;table</title>
-<path fill="none" stroke="black" d="M234.14,-254.17C242.18,-278.49 256.26,-323.07 265,-362 269.6,-382.47 273.22,-405.93 275.63,-423.62"/>
-<polygon fill="black" stroke="black" points="272.19,-424.36 276.97,-433.81 279.13,-423.44 272.19,-424.36"/>
+<path fill="none" stroke="#343942" d="M234.14,-254.17C242.18,-278.49 256.26,-323.07 265,-362 269.6,-382.47 273.22,-405.93 275.63,-423.62"/>
+<polygon fill="#343942" stroke="#343942" points="272.19,-424.36 276.97,-433.81 279.13,-423.44 272.19,-424.36"/>
 </g>
 <!-- flush -->
 <g id="node7" class="node">
 <title>flush</title>
-<polygon fill="none" stroke="black" points="291.5,-180 208.5,-180 208.5,-144 291.5,-144 291.5,-180"/>
-<text text-anchor="middle" x="250" y="-158.3" font-family="monospace" font-size="14.00">.flush()</text>
+<polygon fill="#343942" stroke="black" points="291.5,-180 208.5,-180 208.5,-144 291.5,-144 291.5,-180"/>
+<text text-anchor="middle" x="250" y="-158.3" font-family="monospace" font-size="14.00" fill="#c9d1d9">.flush()</text>
 </g>
 <!-- at&#45;&gt;flush -->
 <g id="edge10" class="edge">
 <title>at&#45;&gt;flush</title>
-<path fill="none" stroke="black" d="M233.67,-215.72C236.12,-207.8 239.04,-198.38 241.72,-189.71"/>
-<polygon fill="black" stroke="black" points="245.11,-190.59 244.73,-180 238.43,-188.52 245.11,-190.59"/>
+<path fill="none" stroke="#343942" d="M233.67,-215.72C236.12,-207.8 239.04,-198.38 241.72,-189.71"/>
+<polygon fill="#343942" stroke="#343942" points="245.11,-190.59 244.73,-180 238.43,-188.52 245.11,-190.59"/>
 </g>
 <!-- flush&#45;&gt;table -->
 <g id="edge14" class="edge">
 <title>flush&#45;&gt;table</title>
-<path fill="none" stroke="black" d="M274.48,-180.23C285.4,-189.44 297.12,-201.81 303,-216 332.34,-286.83 306.03,-379.53 289.7,-424.38"/>
-<polygon fill="black" stroke="black" points="286.34,-423.37 286.1,-433.96 292.9,-425.84 286.34,-423.37"/>
+<path fill="none" stroke="#343942" d="M274.48,-180.23C285.4,-189.44 297.12,-201.81 303,-216 332.34,-286.83 306.03,-379.53 289.7,-424.38"/>
+<polygon fill="#343942" stroke="#343942" points="286.34,-423.37 286.1,-433.96 292.9,-425.84 286.34,-423.37"/>
 </g>
 <!-- flush&#45;&gt;dtor -->
 <g id="edge12" class="edge">
 <title>flush&#45;&gt;dtor</title>
-<path fill="none" stroke="black" d="M239.3,-143.87C229.35,-125.65 217.4,-96.18 227,-72 231.29,-61.2 238.94,-51.32 246.99,-43.1"/>
-<polygon fill="black" stroke="black" points="249.58,-45.47 254.4,-36.04 244.75,-40.4 249.58,-45.47"/>
+<path fill="none" stroke="#343942" d="M239.3,-143.87C229.35,-125.65 217.4,-96.18 227,-72 231.29,-61.2 238.94,-51.32 246.99,-43.1"/>
+<polygon fill="#343942" stroke="#343942" points="249.58,-45.47 254.4,-36.04 244.75,-40.4 249.58,-45.47"/>
 </g>
 <!-- close -->
 <g id="node8" class="node">
 <title>close</title>
-<polygon fill="none" stroke="black" points="318.5,-108 235.5,-108 235.5,-72 318.5,-72 318.5,-108"/>
-<text text-anchor="middle" x="277" y="-86.3" font-family="monospace" font-size="14.00">.close()</text>
+<polygon fill="#343942" stroke="black" points="318.5,-108 235.5,-108 235.5,-72 318.5,-72 318.5,-108"/>
+<text text-anchor="middle" x="277" y="-86.3" font-family="monospace" font-size="14.00" fill="#c9d1d9">.close()</text>
 </g>
 <!-- flush&#45;&gt;close -->
 <g id="edge11" class="edge">
 <title>flush&#45;&gt;close</title>
-<path fill="none" stroke="black" d="M256.67,-143.7C259.71,-135.81 263.38,-126.3 266.76,-117.55"/>
-<polygon fill="black" stroke="black" points="270.07,-118.69 270.4,-108.1 263.54,-116.17 270.07,-118.69"/>
+<path fill="none" stroke="#343942" d="M256.67,-143.7C259.71,-135.81 263.38,-126.3 266.76,-117.55"/>
+<polygon fill="#343942" stroke="#343942" points="270.07,-118.69 270.4,-108.1 263.54,-116.17 270.07,-118.69"/>
 </g>
 <!-- close&#45;&gt;dtor -->
 <g id="edge16" class="edge">
 <title>close&#45;&gt;dtor</title>
-<path fill="none" stroke="black" d="M277,-71.7C277,-63.98 277,-54.71 277,-46.11"/>
-<polygon fill="black" stroke="black" points="280.5,-46.1 277,-36.1 273.5,-46.1 280.5,-46.1"/>
+<path fill="none" stroke="#343942" d="M277,-71.7C277,-63.98 277,-54.71 277,-46.11"/>
+<polygon fill="#343942" stroke="#343942" points="280.5,-46.1 277,-36.1 273.5,-46.1 280.5,-46.1"/>
 </g>
 <!-- close&#45;&gt;close -->
 <g id="edge15" class="edge">
 <title>close&#45;&gt;close</title>
-<path fill="none" stroke="black" d="M318.71,-103.29C328.91,-102.3 336.5,-97.88 336.5,-90 336.5,-84.96 333.38,-81.32 328.46,-79.11"/>
-<polygon fill="black" stroke="black" points="329.25,-75.7 318.71,-76.71 327.58,-82.5 329.25,-75.7"/>
+<path fill="none" stroke="#343942" d="M318.71,-103.29C328.91,-102.3 336.5,-97.88 336.5,-90 336.5,-84.96 333.38,-81.32 328.46,-79.11"/>
+<polygon fill="#343942" stroke="#343942" points="329.25,-75.7 318.71,-76.71 327.58,-82.5 329.25,-75.7"/>
 </g>
 </g>
 </svg>

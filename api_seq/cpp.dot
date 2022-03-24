@@ -1,6 +1,13 @@
 digraph line_sender_cpp_api {
 
-  node [shape=box, fontname=monospace];
+  graph [bgcolor=transparent];
+  node [
+    style=filled,
+    shape=box,
+    fillcolor="#343942",
+    fontcolor="#C9D1D9",
+    fontname=monospace];
+  edge [color="#343942"];
 
   line_sender -> table;
   line_sender -> dtor;

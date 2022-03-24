@@ -3,43 +3,45 @@
 
 This library makes it easy to insert data into [QuestDB](https://questdb.io/).
 
-This client library implements the InfluxDB Line Protocol (ILP) over TCP.
+This client library implements the [InfluxDB Line Protocol](
+https://questdb.io/docs/reference/api/ilp/overview/) (ILP) over TCP.
 
 * Implementation is in C11, with no dependency on the C++ standard library
   for simpler inclusion into your projects.
 * The C++ API is a header-only wrapper written in C++17.
 
-## Community
+## Protocol
 
-If you need help, have additional questions or want to provide feedback, you
-may find us on [Slack](https://slack.questdb.io).
+Inserting data into QuestDB can be done via one of three protocols.
 
-You can also [sign up to our mailing list](https://questdb.io/community/)
-to get notified of new releases.
+| Protocol | Record Insertion Reporting | Data Insertion Performance |
+| -------- | -------------------------- | -------------------------- |
+| [ILP](https://questdb.io/docs/reference/api/ilp/overview/)| None | **Best** |
+| [CSV Upload via HTTP](https://questdb.io/docs/reference/api/rest/#imp---import-data) | Configurable | Very Good |
+| [PostgreSQL](https://questdb.io/docs/reference/api/postgres/) | Transaction-level | Good |
 
-## Building this library
+This library mitigates the lack of confirmation and error reporting by
+validating data ahead of time, before any data is sent to the database instance.
 
-We do not ship binaries. To build, prepare your system with:
-  * A C/C++ compiler which supports C11 and C++17.
-  * CMake 3.15.0 or greater.
+For example, the client library will report that a supplied string isn't encoded
+in UTF-8. Some issues unfortunately can't be caught by the library and require
+some [care and diligence to avoid data problems](#data-quality-considerations).
 
-Then follow the [build instructions](BUILD.md). It covers:
-  * Compiling on Windows / Linux and MacOS.
-  * The build different outputs (dynamic, static, static `-fPIC`).
-  * Running unit tests.
-  * Running system tests.
+In the absence of data, network, database or OS failures, ILP guarantees that
+data is persisted. Data is written in the order it is sent, unless you configured the
+[out-of-order feature](https://questdb.io/docs/guides/out-of-order-commit-lag/#how-to-configure-out-of-order-ingestion)
+in QuestDB which will reorder records based on timestamp for a given insertion
+time window.
 
-## Including `c-questdb-client` into your project
+To understand the protocol in more depth consult the
+[protocol reference docs](https://questdb.io/docs/reference/api/ilp/overview/).
 
-Once you know you can build the library, you can learn how to
-[add it as a dependency to your project](DEPENDENCY.md). Here we cover:
-  * Github tags and which version of the code you should use.
-  * Integrating via CMake `FetchContent`.
-  * Integrating via CMake `add_subdirectory`.
-  * Notes on keeping code up to date with `git subtree` and `git submodule`.
-  * Integrating build systems other than CMake.
+## Using this Library
 
-## Usage and Examples
+Start off with the [build instructions](BUILD.md), then read guide for including
+this library as a [dependency to your project](DEPENDENCY.md).
+
+Once you've all set up, you can take a look at our examples:
 
 ### From a C program
 
@@ -144,55 +146,31 @@ exceptions. The C++ `line_sender_error` type inherits from `std::runtime_error`
 and you can obtain an error message description by calling `.what()` and an
 error code calling `.code()`.
 
-#### Resuming after an error
+### Data types
 
-If you intend to retry, you must create a new sender object: The same sender
-object can't be reused.
+The ILP protocol has its own set of data types which is smaller
+that the set supported by QuestDB.
+We map these types into QuestDB types and perform conversions
+as necessary wherever possible.
 
-## Protocol
+Strings may be recorded as either the `STRING` type or the `SYMBOL` type.
 
-To understand the benefits and limitations of using the protocol, you may want
-to consult the
-[protocol reference docs](https://questdb.io/docs/reference/api/ilp/overview/).
+`SYMBOL`s are strings with which are automatically
+[interned](https://en.wikipedia.org/wiki/String_interning) by the database on a
+per-column basis.
+You should use this type if you expect the string to be re-used over and over.
+This is common for identifiers, etc.
 
-Whilst this library performs significant input validation upfront,
-it can't report errors that happen in the server as the protocol is not designed
-to report them.
+For one-off strings use `STRING` columns which aren't interned.
 
-For example, the client library will report that a supplied string isn't encoded
-in UTF-8, but will not report that a column previously used to record a
-`BOOLEAN` is later incorrectly used to record a `STRING`.
+For more details see our
+[datatypes](https://questdb.io/docs/reference/sql/datatypes) page.
 
-Unreported errors such as this one usually result in skipped rows that don't
-get saved.
+## Data quality considerations
 
-Other errors, such as the database running out of disk space or crashing will
-result in a TCP connection drop, but also uncertainty from the client's
-perspective on which records were written.
+When inserting data through the API, you must follow a set of considerations.
 
-With these caveats out of the way, you can however expect well-formed data to be
-written so long as it has been received by the database, caveat bugs and system
-errors.
-
-The line protocol is currently the fastest way to insert data into
-QuestDB, but if the lack of confirmation of written data is a concern to you,
-you may want to consider alternatives such as inserting via CSV uploads or
-through the PostgreSQL interface. Those alternatives are slower but more robust.
-The choice of input mechanism will depend on your use case.
-
-When using the line protocol, data will be written in the order it is
-sent, unless you configured the
-[out-of-order feature](https://questdb.io/docs/guides/out-of-order-commit-lag/#how-to-configure-out-of-order-ingestion)
-in QuestDB which will reorder records based on timestamp for a given insertion
-time window.
-
-## Avoiding data input errors and skipped rows
-
-When inserting data through the API, you must follow a set of rules.
-Some are validated by the client library, others will cause the engine to fail
-silently resulting in rows not getting inserted.
-
-### Library-validated rules
+### Library-validated considerations
 
 * Strings and symbols must be passed in as valid UTF-8 which
   need not be nul-terminated.
@@ -207,9 +185,11 @@ silently resulting in rows not getting inserted.
     * columns, zero or more
   * timestamp, optionally
 
-### Non-validated rules
+Breaking these rules above will result in an error in the client library.
 
-The following is a non-exhaustive of guidelines to follow:
+### Additional considerations
+
+Additionally you should also ensure that:
 
 * For a given row, a column name should not be repeated.
   If it's repeated, only the first value will be kept.
@@ -224,32 +204,14 @@ The following is a non-exhaustive of guidelines to follow:
   It is also possible to write out additional timestamps values
   as columns.
 
-*Refer to the
-[protocol reference docs](https://questdb.io/docs/reference/api/ilp/overview/)
-for more details and usage guidelines.*
+The client library will not check any of these types of data issues.
 
-### Data type conversions
+To debug these issues you may consult the QuestDB instance logs.
 
-The ILP protocol has its own set of data types which is smaller
-that the set supported by QuestDB.
-We map these types into QuestDB types and perform conversions
-as necessary wherever possible.
+#### Resuming after an error
 
-For more details see our
-[datatypes](https://questdb.io/docs/reference/sql/datatypes) page.
-
-## Symbols or Strings
-
-SYMBOLs are strings with which are automatically
-[interned](https://en.wikipedia.org/wiki/String_interning) by the database on a
-per-column basis.
-You should use this type if you expect the string to be re-used over and over.
-This is common for identifiers, etc.
-
-For one-off strings use STRING columns.
-
-For more details see our
-[datatypes](https://questdb.io/docs/reference/sql/datatypes) page.
+If you intend to retry, you must create a new sender object: The same sender
+object can't be reused.
 
 ## If you don't see any data
 
@@ -281,6 +243,14 @@ function (if using the C API) or `.flush()` method (if using the C++ API API)
 is called.
 
 *Closing the connection will not auto-flush.*
+
+## Community
+
+If you need help, have additional questions or want to provide feedback, you
+may find us on [Slack](https://slack.questdb.io).
+
+You can also [sign up to our mailing list](https://questdb.io/community/)
+to get notified of new releases.
 
 ## License
 
