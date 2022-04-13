@@ -174,6 +174,7 @@ class QuestDbFixture:
         self._conf_path = conf_dir / 'server.conf'
         self._log = None
         self._proc = None
+        self.host = 'localhost'
         self.http_server_port = None
         self.line_tcp_port = None
         self.pg_port = None

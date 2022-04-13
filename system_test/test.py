@@ -42,6 +42,7 @@ import urllib.request
 import urllib.parse
 import json
 import subprocess
+from collections import namedtuple
 
 
 QDB_FIXTURE: QuestDbFixture = None
@@ -52,8 +53,9 @@ class QueryError(Exception):
 
 
 def http_sql_query(sql_query):
+    host, port = QDB_FIXTURE.host, QDB_FIXTURE.http_server_port
     url = (
-        f'http://localhost:{QDB_FIXTURE.http_server_port}/exec?' +
+        f'http://{host}:{port}/exec?' +
         urllib.parse.urlencode({'query': sql_query}))
     resp = urllib.request.urlopen(url, timeout=0.2)
     if resp.status != 200:
@@ -96,9 +98,14 @@ def ns_to_qdb_date(at_ts_ns):
 
 
 class TestLineSender(unittest.TestCase):
+    def _mk_linesender(self):
+        return qls.LineSender(
+            QDB_FIXTURE.host,
+            QDB_FIXTURE.line_tcp_port)
+
     def test_insert_three_rows(self):
         table_name = uuid.uuid4().hex
-        with qls.LineSender('localhost', QDB_FIXTURE.line_tcp_port) as sender:
+        with self._mk_linesender() as sender:
             for _ in range(3):
                 (sender
                     .table(table_name)
@@ -133,7 +140,7 @@ class TestLineSender(unittest.TestCase):
             self.skipTest('No support for duplicate column names.')
             return
         table_name = uuid.uuid4().hex
-        with qls.LineSender('localhost', QDB_FIXTURE.line_tcp_port) as sender:
+        with self._mk_linesender() as sender:
             (sender
                 .table(table_name)
                 .symbol('a', 'A')
@@ -158,7 +165,7 @@ class TestLineSender(unittest.TestCase):
             self.skipTest('No support for duplicate column names.')
             return
         table_name = uuid.uuid4().hex
-        with qls.LineSender('localhost', QDB_FIXTURE.line_tcp_port) as sender:
+        with self._mk_linesender() as sender:
             (sender
                 .table(table_name)
                 .symbol('a', 'A')
@@ -177,7 +184,7 @@ class TestLineSender(unittest.TestCase):
 
     def test_single_symbol(self):
         table_name = uuid.uuid4().hex
-        with qls.LineSender('localhost', QDB_FIXTURE.line_tcp_port) as sender:
+        with self._mk_linesender() as sender:
             (sender
                 .table(table_name)
                 .symbol('a', 'A')
@@ -195,7 +202,7 @@ class TestLineSender(unittest.TestCase):
 
     def test_two_columns(self):
         table_name = uuid.uuid4().hex
-        with qls.LineSender('localhost', QDB_FIXTURE.line_tcp_port) as sender:
+        with self._mk_linesender() as sender:
             (sender
                 .table(table_name)
                 .column('a', 'A')
@@ -215,7 +222,7 @@ class TestLineSender(unittest.TestCase):
 
     def test_mismatched_types_across_rows(self):
         table_name = uuid.uuid4().hex
-        with qls.LineSender('localhost', QDB_FIXTURE.line_tcp_port) as sender:
+        with self._mk_linesender() as sender:
             (sender
                 .table(table_name)
                 .symbol('a', 'A')  # SYMBOL
@@ -263,7 +270,7 @@ class TestLineSender(unittest.TestCase):
         table_name = uuid.uuid4().hex
         at_ts_ns1 = 1648032959100000000
         at_ts_ns2 = 1648032958100000000  # A second before `at_ts_ns1`.
-        with qls.LineSender('localhost', QDB_FIXTURE.line_tcp_port) as sender:
+        with self._mk_linesender() as sender:
             (sender
                 .table(table_name)
                 .symbol('a', 'A')
@@ -284,7 +291,7 @@ class TestLineSender(unittest.TestCase):
 
     def test_underscores(self):
         table_name = f'_{uuid.uuid4().hex}_'
-        with qls.LineSender('localhost', QDB_FIXTURE.line_tcp_port) as sender:
+        with self._mk_linesender() as sender:
             (sender
                 .table(table_name)
                 .symbol('_a_b_c_', 'A')
@@ -308,7 +315,7 @@ class TestLineSender(unittest.TestCase):
             return
         table_name = uuid.uuid4().hex
         smilie = b'\xf0\x9f\x98\x81'.decode('utf-8')
-        with qls.LineSender('localhost', QDB_FIXTURE.line_tcp_port) as sender:
+        with self._mk_linesender() as sender:
             sender.table(table_name)
             sender.symbol(smilie, smilie)
             # for num in range(1, 32):
@@ -380,7 +387,13 @@ def parse_args():
         '--versions',
         type=str,
         nargs='+',
-        help='List of versions, e.g. `6.1.2`.')
+        help='List of versions, e.g. `6.1.2`')
+    version_g.add_argument(
+        '--existing',
+        type=str,
+        metavar='HOST:ILP_PORT:HTTP_PORT',
+        help=('Test against existing running instance. ' +
+              'e.g. `localhost:9009:9000`'))
     list_p = sub_p.add_parser('list', help='List latest -n releases.')
     list_p.set_defaults(command='list')
     list_p.add_argument('-n', type=int, default=30, help='number of releases')
@@ -393,11 +406,22 @@ def list(args):
         print(f'    {vers}')
 
 
-def run(args, show_help=False):
-    if show_help:
-        sys.argv.append('--help')
-        unittest.main()
-        return
+def run_with_existing(args):
+    global QDB_FIXTURE
+    MockFixture = namedtuple(
+        'MockFixture',
+        ('host', 'line_tcp_port', 'http_server_port', 'version'))
+    host, line_tcp_port, http_server_port = args.existing.split(':')
+    QDB_FIXTURE = MockFixture(
+        host,
+        int(line_tcp_port),
+        int(http_server_port),
+        (999, 999, 999))
+    unittest.main()
+
+
+def run_with_fixtures(args):
+    global QDB_FIXTURE
 
     last_n = 1
     if getattr(args, 'last_n', None):
@@ -414,7 +438,6 @@ def run(args, show_help=False):
             vers: versions[vers]
             for vers in versions_args}
 
-    global QDB_FIXTURE
     for version, download_url in versions.items():
         questdb_dir = install_questdb(version, download_url)
         QDB_FIXTURE = QuestDbFixture(questdb_dir)
@@ -425,6 +448,19 @@ def run(args, show_help=False):
                 sys.exit(1)
         finally:
             QDB_FIXTURE.stop()
+
+
+def run(args, show_help=False):
+    if show_help:
+        sys.argv.append('--help')
+        unittest.main()
+        return
+
+    existing_instance = getattr(args, 'existing', None)
+    if existing_instance:
+        run_with_existing(args)
+    else:
+        run_with_fixtures(args)
 
 
 def main():
