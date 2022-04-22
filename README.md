@@ -16,7 +16,7 @@ Inserting data into QuestDB can be done via one of three protocols.
 
 | Protocol | Record Insertion Reporting | Data Insertion Performance |
 | -------- | -------------------------- | -------------------------- |
-| [ILP](https://questdb.io/docs/reference/api/ilp/overview/)| None | **Best** |
+| [ILP](https://questdb.io/docs/reference/api/ilp/overview/)| Errors in logs; Disconnect on error | **Best** |
 | [CSV Upload via HTTP](https://questdb.io/docs/reference/api/rest/#imp---import-data) | Configurable | Very Good |
 | [PostgreSQL](https://questdb.io/docs/reference/api/postgres/) | Transaction-level | Good |
 
@@ -27,18 +27,15 @@ For example, the client library will report that a supplied string isn't encoded
 in UTF-8. Some issues unfortunately can't be caught by the library and require
 some [care and diligence to avoid data problems](#data-quality-considerations).
 
-In the absence of data, network, database or OS failures, ILP guarantees that
-data is persisted. Data is written in the order it is sent, unless you configured the
-[out-of-order feature](https://questdb.io/docs/guides/out-of-order-commit-lag/#how-to-configure-out-of-order-ingestion)
-in QuestDB which will reorder records based on timestamp for a given insertion
-time window.
+For an overview and code examples, see the
+[ILP page of the developer docs](https://questdb.io/docs/develop/insert-data/#influxdb-line-protocol).
 
-To understand the protocol in more depth consult the
+To understand the protocol in more depth, consult the
 [protocol reference docs](https://questdb.io/docs/reference/api/ilp/overview/).
 
 ## Using this Library
 
-Start off with the [build instructions](BUILD.md), then read guide for including
+Start with the [build instructions](BUILD.md), then read guide for including
 this library as a [dependency to your project](DEPENDENCY.md).
 
 Once you've all set up, you can take a look at our examples:
