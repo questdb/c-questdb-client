@@ -935,7 +935,7 @@ size_t line_sender_pending_size(const line_sender* sender)
 }
 
 static inline bool send_all(
-    line_sender* sender,
+    const line_sender* sender,
     sock_len_t len,
     const char* buf)
 {
