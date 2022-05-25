@@ -40,6 +40,7 @@ from fixture import (
     retry)
 import urllib.request
 import urllib.parse
+import urllib.error
 import json
 import subprocess
 from collections import namedtuple
@@ -57,10 +58,12 @@ def http_sql_query(sql_query):
     url = (
         f'http://{host}:{port}/exec?' +
         urllib.parse.urlencode({'query': sql_query}))
-    resp = urllib.request.urlopen(url, timeout=0.2)
-    if resp.status != 200:
-        raise RuntimeError(f'Error response {resp.status} from {sql_query!r}')
-    buf = resp.read()
+    buf = None
+    try:
+        resp = urllib.request.urlopen(url, timeout=0.2)
+        buf = resp.read()
+    except urllib.error.HTTPError as http_error:
+        buf = http_error.read()
     try:
         data = json.loads(buf)
     except json.JSONDecodeError as jde:
