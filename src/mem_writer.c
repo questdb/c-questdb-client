@@ -35,6 +35,8 @@
 
 #include "next_pow2.inc.c"
 
+#include "dota.inc.c"
+
 void mem_writer_open(mem_writer* writer, size_t capacity)
 {
     if (capacity < 64)
@@ -139,8 +141,106 @@ void mem_writer_i64(mem_writer* writer, int64_t num)
 
 void mem_writer_f64(mem_writer* writer, double num)
 {
-    // TODO: This is a candidate for optimisation by avoiding printf.
-    // The Ryu project sees appropriate here: https://github.com/ulfjack/ryu
-    // Specifically the `int d2s_buffered_n(double f, char* result);` function.
-    mem_writer_printf(writer, "%g", num);
+    // Note, this code will never emit exponent notation.
+    // TODO: Multi-threading locks.
+
+    // Shortest string that yields `d` when read in and rounded to nearest.
+    const int mode = 0;
+
+    // Do not limit the number of significant digits.
+    const int ndigits = 0;
+
+    // position of the decimal point in the returned result.
+    int decpt = 0;
+
+    // Set to non-zero if negative.
+    int sign = 0;
+
+    // Set to the end of the buffer.
+    char* buf_end = NULL;
+
+    // Returns buffer of integer digits or special value, no '.' chars.
+    char* buf = dtoa(num, mode, ndigits, &decpt, &sign, &buf_end);
+    assert((buf_end != NULL) && (buf_end >= buf));
+
+    const size_t len = buf_end - buf;
+    assert(len != 0);
+
+    if (buf[0] == 'N')
+    {
+        mem_writer_str(writer, 3, "NaN");
+    }
+    else if (buf[0] == 'I')
+    {
+        if (sign)
+            mem_writer_str(writer, 9, "-Infinity");
+        else
+            mem_writer_str(writer, 8, "Infinity");
+    }
+    else if (decpt <= 0)
+    {
+        char* dest = NULL;
+        const size_t leading_zeros = (size_t)(-decpt);
+        size_t book_len = 2 + leading_zeros + len;
+        if (sign)
+        {
+            ++book_len;
+            dest = mem_writer_book(writer, book_len);
+            *dest++ = '-';
+        }
+        else
+        {
+            dest = mem_writer_book(writer, book_len);
+        }
+        *dest++ = '0';
+        *dest++ = '.';
+        memset(dest, '0', leading_zeros);
+        memcpy(dest + leading_zeros, buf, len);
+        mem_writer_advance(writer, book_len);
+    }
+    else if (decpt >= (int)len)
+    {
+        char* dest = NULL;
+        const size_t trailing_zeros = ((size_t)decpt) - len;
+        size_t book_len = len + trailing_zeros + 2;
+        if (sign)
+        {
+            ++book_len;
+            dest = mem_writer_book(writer, book_len);
+            *dest++ = '-';
+        }
+        else
+        {
+            dest = mem_writer_book(writer, book_len);
+        }
+        memcpy(dest, buf, len);
+        dest += len;
+        memset(dest, '0', trailing_zeros);
+        dest += trailing_zeros;
+        *dest++ = '.';
+        *dest++ = '0';
+        mem_writer_advance(writer, book_len);
+    }
+    else  // ((0 < decpt) && (decpt < (int)len))
+    {
+        char* dest = NULL;
+        size_t book_len = len + 1;
+        if (sign)
+        {
+            ++book_len;
+            dest = mem_writer_book(writer, book_len);
+            *dest++ = '-';
+        }
+        else
+        {
+            dest = mem_writer_book(writer, book_len);
+        }
+        memcpy(dest, buf, (size_t)decpt);
+        dest += (size_t)decpt;
+        *dest++ = '.';
+        memcpy(dest, buf + (size_t)decpt, len - decpt);
+        mem_writer_advance(writer, book_len);
+    }
+ 
+    freedtoa(buf);
 }

@@ -43,6 +43,7 @@ import urllib.parse
 import urllib.error
 import json
 import subprocess
+import math
 from collections import namedtuple
 
 
@@ -78,6 +79,8 @@ def http_sql_query(sql_query):
 
 
 def retry_check_table(table_name, min_rows=1, timeout_sec=5):
+    last_error = [None]
+
     def check_table():
         try:
             resp = http_sql_query(f"select * from '{table_name}'")
@@ -86,10 +89,17 @@ def retry_check_table(table_name, min_rows=1, timeout_sec=5):
             elif len(resp['dataset']) < min_rows:
                 return False
             return resp
-        except QueryError:
+        except QueryError as qe:
+            last_error[0] = qe
             return None
 
-    return retry(check_table, timeout_sec=timeout_sec)
+    try:
+        return retry(check_table, timeout_sec=timeout_sec)
+    except TimeoutError as toe:
+        if last_error[0]:
+            raise toe from last_error[0]
+        else:
+            raise
 
 
 def ns_to_qdb_date(at_ts_ns):
@@ -333,6 +343,60 @@ class TestLineSender(unittest.TestCase):
         self.assertEqual(resp['columns'], exp_columns)
 
         exp_dataset = [[smilie]]  # Comparison excludes timestamp column.
+        scrubbed_dataset = [row[:-1] for row in resp['dataset']]
+        self.assertEqual(scrubbed_dataset, exp_dataset)
+
+    def test_floats(self):
+        numbers = [
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            10.0,
+            0.1,
+            0.01,
+            0.000001,
+            -0.000001,
+            100.0,
+            1.2,
+            1234.5678,
+            -1234.5678,
+            1.23456789012,
+            1000000000000000000000000.0,
+            -1000000000000000000000000.0,
+            float("nan"),   # Converted to `None`.
+            float("inf"),   # Converted to `None`.
+            float("-inf")]  # Converted to `None`.
+
+            # These values below do not round-trip properly: QuestDB limitation.
+            # 1.2345678901234567,
+            # 2.2250738585072014e-308,
+            # -2.2250738585072014e-308,
+            # 1.7976931348623157e+308,
+            # -1.7976931348623157e+308]
+        table_name = uuid.uuid4().hex
+        with self._mk_linesender() as sender:
+            for num in numbers:
+                sender.table(table_name)
+                sender.column('n', num)
+                sender.at_now()
+
+        resp = retry_check_table(table_name, len(numbers))
+        exp_columns = [
+            {'name': 'n', 'type': 'DOUBLE'},
+            {'name': 'timestamp', 'type': 'TIMESTAMP'}]
+        self.assertEqual(resp['columns'], exp_columns)
+
+        def massage(num):
+            if math.isnan(num) or math.isinf(num):
+                return None
+            elif num == -0.0:
+                return 0.0
+            else:
+                return num
+
+        # Comparison excludes timestamp column.
+        exp_dataset = [[massage(num)] for num in numbers]
         scrubbed_dataset = [row[:-1] for row in resp['dataset']]
         self.assertEqual(scrubbed_dataset, exp_dataset)
 

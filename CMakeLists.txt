@@ -108,7 +108,7 @@ target_link_libraries(
     line_sender_cpp_example
     c_questdb_client)  # example depending on dynamic lib.
 
-# Unit test binary.
+# Unit test binaries.
 add_executable(
     test_line_sender
     test/mock_server.cpp
@@ -123,6 +123,20 @@ set_compile_flags(test_line_sender)
 add_test(
     NAME test_line_sender
     COMMAND test_line_sender)
+
+add_executable(
+    test_mem_writer
+    test/test_mem_writer.cpp)
+target_link_libraries(
+    test_mem_writer
+    c_questdb_client_static)
+target_include_directories(
+    test_mem_writer
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+set_compile_flags(test_mem_writer)
+add_test(
+    NAME test_mem_writer
+    COMMAND test_mem_writer)
 
 # System testing Python3 script.
 # This will download the latest QuestDB instance from Github,
