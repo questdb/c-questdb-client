@@ -1,5 +1,13 @@
 #include "build_env.h"
 
+// ================== dota.c's `strtod` naming conflict ======================
+// The `strtod` is also sometimes defined in `stdlib.h`. Workaround:
+// (1) First including the conflicting library ahead of time.
+#include <stdlib.h>
+// (2) Using a define to use another name during the compile time of `dota.c`.
+#define strtod dota_strtod
+// ===========================================================================
+
 #define IEEE_8087 1
 
 #define MALLOC aborting_malloc
@@ -30,3 +38,4 @@
 
 #undef MALLOC
 #undef REALLOC
+#undef strtod
