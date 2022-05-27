@@ -54,7 +54,7 @@ static size_t next_pow2(size_t n)
 
 #ifdef TARGET_64
     STATIC_ASSERT(sizeof(size_t) == 8, "64-bit `size_t` expected");
-#    if defined(COMPILER_GNUC)
+#    if defined(COMPILER_GCC_LIKE)
     STATIC_ASSERT(sizeof(unsigned long long) == 8,
         "64-bit `unsized long long` expected");
     const int n_leading_zeros = (size_t)__builtin_clzll(prev);
@@ -67,7 +67,7 @@ static size_t next_pow2(size_t n)
 
 #ifdef TARGET_32
     STATIC_ASSERT(sizeof(size_t) == 4, "32-bit `size_t` expected");
-#    if defined(COMPILER_GNUC)
+#    if defined(COMPILER_GCC_LIKE)
     STATIC_ASSERT(sizeof(unsigned int) == 4,
         "64-bit `unsigned long long` expected");
     const int n_leading_zeros = (size_t)__builtin_clz(prev);
@@ -78,7 +78,7 @@ static size_t next_pow2(size_t n)
 #    endif
 #endif
 
-#if defined(COMPILER_GNUC)
+#if defined(COMPILER_GCC_LIKE)
     return ((size_t)1) << (width - n_leading_zeros);
 #else
     return ((size_t)1) << (bit_index + 1);

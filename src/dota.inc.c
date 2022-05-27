@@ -8,6 +8,7 @@
 #define strtod dota_strtod
 // ===========================================================================
 
+// This should work for most ARM and Intel.
 #define IEEE_8087 1
 
 #define MALLOC aborting_malloc
@@ -24,16 +25,25 @@
 #    pragma warning( disable : 4703 )
 #endif
 
-#if defined(COMPILER_GNUC)
+#if defined(COMPILER_GCC)
+#    pragma GCC diagnostic push
 #    pragma GCC diagnostic ignored "-Wsign-compare"
 #    pragma GCC diagnostic ignored "-Wimplicit-fallthrough="
 #endif
 
+#if defined(COMPILER_CLANG)
+#    pragma clang diagnostic push
+#    pragma clang diagnostic ignored "-Wsign-compare"
+#endif
+
 #include "dota.c"
 
-#if defined(COMPILER_GNUC)
+#if defined(COMPILER_GCC)
 #    pragma GCC diagnostic pop
-#    pragma GCC diagnostic pop
+#endif
+
+#if defined(COMPILER_CLANG)
+#    pragma clang diagnostic pop
 #endif
 
 #undef MALLOC

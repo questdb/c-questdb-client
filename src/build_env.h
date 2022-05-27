@@ -36,11 +36,16 @@
 #endif
 
 #if defined(__GNUC__) || defined(__clang__)
-#    define COMPILER_GNUC
+#    define COMPILER_GCC_LIKE
 #    ifdef __cplusplus
 #        define STATIC_ASSERT static_assert
 #    else
 #        define STATIC_ASSERT _Static_assert
+#    endif
+#    if defined(__clang__)
+#        define COMPILER_CLANG
+#    else
+#        define COMPILER_GCC
 #    endif
 #elif defined(_MSC_VER)
 #    define COMPILER_MSVC

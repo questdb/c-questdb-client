@@ -80,7 +80,7 @@ typedef int sock_len_t;
 
 #if defined(COMPILER_MSVC)
 #define UNREACHABLE() __assume(false)
-#elif defined(COMPILER_GNUC)
+#elif defined(COMPILER_GCC_LIKE)
 #define UNREACHABLE() __builtin_unreachable()
 #endif
 
@@ -155,7 +155,7 @@ struct line_sender_error
     char* msg;
 };
 
-#if defined(COMPILER_GNUC)
+#if defined(COMPILER_GCC_LIKE)
 static line_sender_error* err_printf(
     line_sender_state* state,
     line_sender_error_code code,

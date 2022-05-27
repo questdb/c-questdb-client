@@ -76,7 +76,7 @@ void mem_writer_rewind(mem_writer* writer)
     writer->tail = writer->head;
 }
 
-#if defined(COMPILER_GNUC)
+#if defined(COMPILER_GCC_LIKE)
 #define unlikely(x) __builtin_expect((x), 0)
 #elif defined(COMPILER_MSVC)
 #define unlikely(x) (x)
@@ -241,6 +241,6 @@ void mem_writer_f64(mem_writer* writer, double num)
         memcpy(dest, buf + (size_t)decpt, len - decpt);
         mem_writer_advance(writer, book_len);
     }
- 
+
     freedtoa(buf);
 }
