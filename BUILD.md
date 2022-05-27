@@ -8,7 +8,7 @@ Also make sure to read the page on
 ## Pre-requisites
 
 * A modern C11/C++17 compiler.
-* CMake 3.15 or newer.
+* CMake 3.12 or newer.
 
 ## Build steps
 
