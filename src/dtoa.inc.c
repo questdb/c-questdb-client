@@ -8,7 +8,7 @@
 #define strtod dtoa_strtod
 // ===========================================================================
 
-// This should work for most ARM and Intel.
+// This should work on all architectures with little-endian doubles.
 #define IEEE_8087 1
 
 #define MALLOC aborting_malloc

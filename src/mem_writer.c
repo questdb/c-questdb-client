@@ -144,6 +144,24 @@ void mem_writer_f64(mem_writer* writer, double num)
     // Note, this code will never emit exponent notation.
     // TODO: Multi-threading locks.
 
+    if (isnan(num))
+    {
+        mem_writer_str(writer, 3, "NaN");
+        return;
+    }
+
+    switch (isinf(num))
+    {
+        case 1:
+            mem_writer_str(writer, 8, "Infinity");
+            return;
+        case -1:
+            mem_writer_str(writer, 9, "-Infinity");
+            return;
+        default:
+            break;
+    }
+
     // Shortest string that yields `d` when read in and rounded to nearest.
     const int mode = 0;
 
@@ -159,6 +177,9 @@ void mem_writer_f64(mem_writer* writer, double num)
     // Set to the end of the buffer.
     char* buf_end = NULL;
 
+    // NB: We don't call `_control87` to enforce precision is set to 53 bits.
+    //     We rely on this to be the default case.
+
     // Returns buffer of integer digits or special value, no '.' chars.
     char* buf = dtoa(num, mode, ndigits, &decpt, &sign, &buf_end);
     assert((buf_end != NULL) && (buf_end >= buf));
@@ -166,32 +187,13 @@ void mem_writer_f64(mem_writer* writer, double num)
     const size_t len = buf_end - buf;
     assert(len != 0);
 
-    if (buf[0] == 'N')
+    if (decpt <= 0)
     {
-        mem_writer_str(writer, 3, "NaN");
-    }
-    else if (buf[0] == 'I')
-    {
-        if (sign)
-            mem_writer_str(writer, 9, "-Infinity");
-        else
-            mem_writer_str(writer, 8, "Infinity");
-    }
-    else if (decpt <= 0)
-    {
-        char* dest = NULL;
         const size_t leading_zeros = (size_t)(-decpt);
-        size_t book_len = 2 + leading_zeros + len;
+        size_t book_len = !!sign + 2 + leading_zeros + len;
+        char* dest = mem_writer_book(writer, book_len);
         if (sign)
-        {
-            ++book_len;
-            dest = mem_writer_book(writer, book_len);
             *dest++ = '-';
-        }
-        else
-        {
-            dest = mem_writer_book(writer, book_len);
-        }
         *dest++ = '0';
         *dest++ = '.';
         memset(dest, '0', leading_zeros);
@@ -200,19 +202,11 @@ void mem_writer_f64(mem_writer* writer, double num)
     }
     else if (decpt >= (int)len)
     {
-        char* dest = NULL;
         const size_t trailing_zeros = ((size_t)decpt) - len;
-        size_t book_len = len + trailing_zeros + 2;
+        size_t book_len = !!sign + len + trailing_zeros + 2;
+        char* dest = mem_writer_book(writer, book_len);
         if (sign)
-        {
-            ++book_len;
-            dest = mem_writer_book(writer, book_len);
             *dest++ = '-';
-        }
-        else
-        {
-            dest = mem_writer_book(writer, book_len);
-        }
         memcpy(dest, buf, len);
         dest += len;
         memset(dest, '0', trailing_zeros);
@@ -223,24 +217,16 @@ void mem_writer_f64(mem_writer* writer, double num)
     }
     else  // ((0 < decpt) && (decpt < (int)len))
     {
-        char* dest = NULL;
-        size_t book_len = len + 1;
+        size_t book_len = !!sign + len + 1;
+        char* dest = mem_writer_book(writer, book_len);
         if (sign)
-        {
-            ++book_len;
-            dest = mem_writer_book(writer, book_len);
             *dest++ = '-';
-        }
-        else
-        {
-            dest = mem_writer_book(writer, book_len);
-        }
         memcpy(dest, buf, (size_t)decpt);
         dest += (size_t)decpt;
         *dest++ = '.';
         memcpy(dest, buf + (size_t)decpt, len - decpt);
         mem_writer_advance(writer, book_len);
     }
-
+ 
     freedtoa(buf);
 }
