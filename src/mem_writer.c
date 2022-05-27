@@ -35,7 +35,7 @@
 
 #include "next_pow2.inc.c"
 
-#include "dota.inc.c"
+#include "dtoa.inc.c"
 
 void mem_writer_open(mem_writer* writer, size_t capacity)
 {
