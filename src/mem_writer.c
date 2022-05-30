@@ -181,7 +181,8 @@ void mem_writer_f64(mem_writer* writer, double num)
     //     We rely on this to be the default case.
 
     // Returns buffer of integer digits or special value, no '.' chars.
-    char* buf = dtoa(num, mode, ndigits, &decpt, &sign, &buf_end);
+    // NB: `dota.inc.c` renames `dtoa` to `dtoalib_dtoa`.
+    char* buf = dtoalib_dtoa(num, mode, ndigits, &decpt, &sign, &buf_end);
     assert((buf_end != NULL) && (buf_end >= buf));
 
     const size_t len = buf_end - buf;

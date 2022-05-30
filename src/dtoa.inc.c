@@ -1,12 +1,17 @@
 #include "build_env.h"
 
-// ================== dtoa.c's `strtod` naming conflict ======================
-// The `strtod` is also sometimes defined in `stdlib.h`. Workaround:
-// (1) First including the conflicting library ahead of time.
+// =============================  naming conflicts =============================
+// The `strtod` is also sometimes defined in `stdlib.h` (Mingw64).
+// As a work-around we include the conflicting library ahead of time.
 #include <stdlib.h>
-// (2) Using a define to use another name during the compile time of `dtoa.c`.
-#define strtod dtoa_strtod
-// ===========================================================================
+// We then re-name the conflicting symbol, along with all the other ones in case
+// third party libraries that are being linked also define these symbols.
+#define gethex   dtoalib_gethex
+#define strtod   dtoalib_strtod
+#define freedtoa dtoalib_freedtoa
+#define dtoa_r   dtoalib_dtoa_r
+#define dtoa     dtoalib_dtoa
+// =============================================================================
 
 // This should work on all architectures with little-endian doubles.
 #define IEEE_8087 1
