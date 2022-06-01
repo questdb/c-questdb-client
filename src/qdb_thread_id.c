@@ -54,12 +54,12 @@ int qdb_thread_id()
 // The mapping between threads and their ID is held as a thread local:
 // as such this logic does not need to keep any hashmap between thread IDs
 // and the counters we return.
-static size_t buckets_size = 8;
+static size_t buckets_size;
 static size_t* buckets = NULL;
 
 // Points to the first available slot, or `buckets_size` if none
 // are available.
-static size_t first_avail = 0;
+static size_t first_avail;
 
 // A lock for accessing or mutating the buckets.
 // This is only needed at thread creation / destruction.
@@ -89,10 +89,15 @@ static void release_thread_id(void* value)
 {
     size_t id = (size_t)value - 1;
     QDB_LOCK_ACQUIRE(&lock);
-    // Push free bucket into "stack".
-    const size_t new_first_avail = buckets[id];
+    fprintf(stderr, "release_thread_id :: (A) id: %zu, first_avail: %zu, buckets[id]: %zu\n",
+        id, first_avail, buckets[id]);
+    for (size_t index = 0; index < buckets_size; ++index)
+        fprintf(stderr, "    [%zu]: %zu\n", index, buckets[index]);
+    // Push-front free bucket into linked list "stack", headed by "first_avail".
     buckets[id] = first_avail;
-    first_avail = new_first_avail;
+    first_avail = id;
+    fprintf(stderr, "release_thread_id :: (B) id: %zu, first_avail: %zu, buckets[id]: %zu\n",
+        id, first_avail, buckets[id]);
     QDB_LOCK_RELEASE(&lock);
 }
 
@@ -100,8 +105,10 @@ static void init_impl()
 {
     QDB_LOCK_INIT(&lock);
 
+    buckets_size = 8;
     buckets = aborting_malloc(buckets_size * sizeof(size_t));
     buckets_init(0, buckets_size);
+    first_avail = 0;
 
     // We leak the key this until application end by never calling `tss_delete`.
     // We clean up any associated IDs (and buckets) each time a thread exits.
@@ -111,6 +118,12 @@ static void init_impl()
         fprintf(stderr, "Failed to create thread local key. Error: %d.", error);
         abort();
     }
+}
+
+void qdb_thread_id_reset_for_testing()
+{
+    free(buckets);
+    init_impl();
 }
 
 void qdb_thread_id_init()

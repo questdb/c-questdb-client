@@ -131,34 +131,35 @@ target_link_libraries(
 
 
 # Unit test binaries.
-add_executable(
+function(compile_test TARGET_NAME)
+    list(POP_FRONT ARGV)  # compile_test
+    add_executable(
+        ${TARGET_NAME}
+        ${ARGV})
+    target_link_libraries(
+        ${TARGET_NAME}
+        c_questdb_client_static)
+    target_include_directories(
+        ${TARGET_NAME}
+        PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    set_compile_flags(${TARGET_NAME})
+    add_test(
+        NAME ${TARGET_NAME}
+        COMMAND ${TARGET_NAME})
+endfunction()
+
+compile_test(
     test_line_sender
     test/mock_server.cpp
     test/test_line_sender.cpp)
-target_link_libraries(
-    test_line_sender
-    c_questdb_client_static)
-target_include_directories(
-    test_line_sender
-    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-set_compile_flags(test_line_sender)
-add_test(
-    NAME test_line_sender
-    COMMAND test_line_sender)
 
-add_executable(
+compile_test(
     test_mem_writer
     test/test_mem_writer.cpp)
-target_link_libraries(
-    test_mem_writer
-    c_questdb_client_static)
-target_include_directories(
-    test_mem_writer
-    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-set_compile_flags(test_mem_writer)
-add_test(
-    NAME test_mem_writer
-    COMMAND test_mem_writer)
+
+compile_test(
+    test_thread_id
+    test/test_thread_id.cpp)
 
 
 # System testing Python3 script.
