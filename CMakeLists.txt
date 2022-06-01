@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.12.0)
 project(c-questdb-client VERSION 1.0.0)
 
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
+
 set(CPACK_PROJECT_NAME ${PROJECT_NAME})
 set(CPACK_PROJECT_VERSION ${PROJECT_VERSION})
 include(CPack)
@@ -16,11 +19,6 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-set(LIB_SOURCES
-    src/aborting_malloc.c
-    src/line_sender.c
-    src/mem_writer.c
-    src/utf8.c)
 
 function(set_compile_flags TARGET_NAME)
     if(MSVC)
@@ -43,6 +41,16 @@ function(set_compile_flags TARGET_NAME)
     endif()
 endfunction()
 
+
+set(LIB_SOURCES
+    src/aborting_malloc.c
+    src/line_sender.c
+    src/mem_writer.c
+    src/utf8.c
+    src/qdb_thread_id.c
+    src/qdb_call_once.c)
+
+
 # Shared Library
 add_library(
     c_questdb_client SHARED
@@ -55,6 +63,9 @@ target_compile_definitions(
     c_questdb_client
     PUBLIC
     LINESENDER_DYN_LIB)
+target_link_libraries(
+    c_questdb_client
+    Threads::Threads)
 if(WIN32)
     set_target_properties(
         c_questdb_client
@@ -68,6 +79,7 @@ if(UNIX)
         -fvisibility=hidden)
 endif(UNIX)
 
+
 # Static Library
 add_library(
     c_questdb_client_static STATIC
@@ -76,9 +88,13 @@ target_include_directories(
     c_questdb_client_static
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 set_compile_flags(c_questdb_client_static)
+target_link_libraries(
+    c_questdb_client_static
+    Threads::Threads)
 if(WIN32)
     target_link_libraries(c_questdb_client_static wsock32 ws2_32)
 endif(WIN32)
+
 
 # Static Library w/ -fPIC
 if(UNIX)
@@ -92,7 +108,11 @@ if(UNIX)
         c_questdb_client_static_pic
         PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
     set_compile_flags(c_questdb_client_static_pic)
+    target_link_libraries(
+        c_questdb_client_static_pic
+        Threads::Threads)
 endif(UNIX)
+
 
 # Examples
 add_executable(
@@ -101,12 +121,14 @@ add_executable(
 target_link_libraries(
     line_sender_c_example
     c_questdb_client_static)  # example depending on static lib.
+
 add_executable(
     line_sender_cpp_example
     examples/line_sender_cpp_example.cpp)
 target_link_libraries(
     line_sender_cpp_example
     c_questdb_client)  # example depending on dynamic lib.
+
 
 # Unit test binaries.
 add_executable(
@@ -137,6 +159,7 @@ set_compile_flags(test_mem_writer)
 add_test(
     NAME test_mem_writer
     COMMAND test_mem_writer)
+
 
 # System testing Python3 script.
 # This will download the latest QuestDB instance from Github,

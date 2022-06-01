@@ -39,6 +39,7 @@
 
 void mem_writer_open(mem_writer* writer, size_t capacity)
 {
+    dtoa_inc_init();
     if (capacity < 64)
         capacity = 64;
     capacity = next_pow2(capacity);
@@ -142,7 +143,6 @@ void mem_writer_i64(mem_writer* writer, int64_t num)
 void mem_writer_f64(mem_writer* writer, double num)
 {
     // Note, this code will never emit exponent notation.
-    // TODO: Multi-threading locks.
 
     if (isnan(num))
     {
@@ -229,5 +229,5 @@ void mem_writer_f64(mem_writer* writer, double num)
         mem_writer_advance(writer, book_len);
     }
  
-    freedtoa(buf);
+    dtoalib_freedtoa(buf);
 }
