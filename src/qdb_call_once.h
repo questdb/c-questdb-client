@@ -24,8 +24,7 @@
 
 #pragma once
 
-#include <stdatomic.h>
-
+#include "build_env.h"
 typedef enum
 {
     qdb_not_called = 0,
@@ -33,7 +32,13 @@ typedef enum
     qdb_called
 } qdb_call_once_flag_state;
 
-typedef _Atomic qdb_call_once_flag_state qdb_call_once_flag;
+typedef
+#if defined(PLATFORM_WINDOWS)
+    volatile long
+#else
+    _Atomic enum qdb_call_once_flag_state
+#endif
+  qdb_call_once_flag;
 typedef void(*qdb_call_once_callback)();
 
 /**

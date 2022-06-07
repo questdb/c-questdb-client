@@ -106,8 +106,8 @@ static void dtoa_inc_free_lock(int n)
 
 static void init_impl()
 {
-    QDB_LOCK_INIT(&mutex_0);
-    QDB_LOCK_INIT(&mutex_1);
+    QDB_LOCK_INIT(&lock0);
+    QDB_LOCK_INIT(&lock1);
 
     qdb_thread_id_init();
     dtoalib_set_max_dtoa_threads(16);

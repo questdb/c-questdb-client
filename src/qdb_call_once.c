@@ -28,10 +28,16 @@
 #include <stdbool.h>
 
 #if defined(PLATFORM_WINDOWS)
+#    include <Windows.h>
 #    include <processthreadsapi.h>
+#    define ATOMIC_LOAD(flag) *flag
+#    define ATOMIC_STORE(flag, value) *flag = value
 #    define YIELD_THREAD SwitchToThread
 #else
+#    include <stdatomic.h>
 #    include <sched.h>
+#    define ATOMIC_LOAD atomic_load
+#    define ATOMIC_STORE atomic_store
 #    define YIELD_THREAD sched_yield
 #endif
 
@@ -39,23 +45,32 @@ static const qdb_call_once_flag_state state_not_called = qdb_not_called;
 
 void qdb_call_once(qdb_call_once_flag* flag, qdb_call_once_callback cb)
 {
-    if (((qdb_call_once_flag_state) atomic_load(flag)) == qdb_called)
+    if (((qdb_call_once_flag_state) ATOMIC_LOAD(flag)) == qdb_called)
         return;
 
-    bool exchanged = atomic_compare_exchange_strong(
+#if defined(PLATFORM_WINDOWS)
+    const bool exchanged =
+        InterlockedCompareExchange(
+            flag,
+            qdb_calling,
+            qdb_not_called
+        ) == qdb_not_called;
+#else
+    const bool exchanged = atomic_compare_exchange_strong(
         flag,
         &state_not_called,
         qdb_calling);
+#endif
     if (exchanged)
     {
         // This thread won the lock. It gets to call the function.
         cb();
         // and then set the "called" flag.
-        atomic_store(flag, qdb_called);
+        ATOMIC_STORE(flag, qdb_called);
     }
     else
     {
-        while (((qdb_call_once_flag_state) atomic_load(flag)) == qdb_calling)
+        while (((qdb_call_once_flag_state) ATOMIC_LOAD(flag)) == qdb_calling)
         {
             YIELD_THREAD();
         }

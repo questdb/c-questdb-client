@@ -24,6 +24,8 @@
 
 #pragma once
 
+typedef unsigned int qdb_thread_id_t;
+
 void qdb_thread_id_init();
 
 /**
@@ -39,4 +41,4 @@ void qdb_thread_id_init();
  * If thread 1 exits and another one is started, the new thread will be
  * assigned id 1 again.
  */
-int qdb_thread_id();
+qdb_thread_id_t qdb_thread_id();

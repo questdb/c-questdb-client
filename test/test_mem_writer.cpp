@@ -33,6 +33,8 @@ extern "C"
 #include "../src/mem_writer.h"
 }
 
+using namespace std::literals::string_view_literals;
+
 static std::string d2s(double d) {
     mem_writer writer;
     mem_writer_open(&writer, 1024);
@@ -46,118 +48,118 @@ static std::string d2s(double d) {
 
 TEST_CASE("d2s 0.0")
 {
-    CHECK(d2s(0.0) == "0.0");
+    CHECK(d2s(0.0) == "0.0"sv);
 }
 
 TEST_CASE("d2s -0.0")
 {
-    CHECK(d2s(-0.0) == "-0.0");
+    CHECK(d2s(-0.0) == "-0.0"sv);
 }
 
 TEST_CASE("d2s 1.0")
 {
-    CHECK(d2s(1.0) == "1.0");
+    CHECK(d2s(1.0) == "1.0"sv);
 }
 
 TEST_CASE("d2s -1.0")
 {
-    CHECK(d2s(-1.0) == "-1.0");
+    CHECK(d2s(-1.0) == "-1.0"sv);
 }
 
 TEST_CASE("d2s 10.0")
 {
-    CHECK(d2s(10.0) == "10.0");
+    CHECK(d2s(10.0) == "10.0"sv);
 }
 
 TEST_CASE("d2s 0.1")
 {
-    CHECK(d2s(0.1) == "0.1");
+    CHECK(d2s(0.1) == "0.1"sv);
 }
 
 TEST_CASE("d2s 0.01")
 {
-    CHECK(d2s(0.01) == "0.01");
+    CHECK(d2s(0.01) == "0.01"sv);
 }
 
 TEST_CASE("d2s 0.000001")
 {
-    CHECK(d2s(0.000001) == "0.000001");
+    CHECK(d2s(0.000001) == "0.000001"sv);
 }
 
 TEST_CASE("d2s -0.000001")
 {
-    CHECK(d2s(-0.000001) == "-0.000001");
+    CHECK(d2s(-0.000001) == "-0.000001"sv);
 }
 
 TEST_CASE("d2s 100.0")
 {
-    CHECK(d2s(100.0) == "100.0");
+    CHECK(d2s(100.0) == "100.0"sv);
 }
 
 TEST_CASE("d2s 1.2")
 {
-    CHECK(d2s(1.2) == "1.2");
+    CHECK(d2s(1.2) == "1.2"sv);
 }
 
 TEST_CASE("d2s 1234.5678")
 {
-    CHECK(d2s(1234.5678) == "1234.5678");
+    CHECK(d2s(1234.5678) == "1234.5678"sv);
 }
 
 TEST_CASE("d2s -1234.5678")
 {
-    CHECK(d2s(-1234.5678) == "-1234.5678");
+    CHECK(d2s(-1234.5678) == "-1234.5678"sv);
 }
 
 TEST_CASE("d2s 1.2345678901234567")
 {
-    CHECK(d2s(1.2345678901234567) == "1.2345678901234567");
+    CHECK(d2s(1.2345678901234567) == "1.2345678901234567"sv);
 }
 
 TEST_CASE("d2s 1000000000000000000000000.0")
 {
-    CHECK(d2s(1000000000000000000000000.0) == "1000000000000000000000000.0");
+    CHECK(d2s(1000000000000000000000000.0) == "1000000000000000000000000.0"sv);
 }
 
 TEST_CASE("d2s -1000000000000000000000000.0")
 {
-    CHECK(d2s(-1000000000000000000000000.0) == "-1000000000000000000000000.0");
+    CHECK(d2s(-1000000000000000000000000.0) == "-1000000000000000000000000.0"sv);
 }
 
 TEST_CASE("d2s qNaN")
 {
     double qnan = std::numeric_limits<double>::quiet_NaN();
-    CHECK(d2s(qnan) == "NaN");
+    CHECK(d2s(qnan) == "NaN"sv);
 }
 
 TEST_CASE("d2s -qNaN")
 {
     double qnan = - std::numeric_limits<double>::quiet_NaN();
-    CHECK(d2s(qnan) == "NaN");
+    CHECK(d2s(qnan) == "NaN"sv);
 }
 
 TEST_CASE("d2s sNaN")
 {
     double snan = std::numeric_limits<double>::signaling_NaN();
-    CHECK(d2s(snan) == "NaN");
+    CHECK(d2s(snan) == "NaN"sv);
 }
 
 TEST_CASE("d2s -sNaN")
 {
     double snan = - std::numeric_limits<double>::signaling_NaN();
-    CHECK(d2s(snan) == "NaN");
+    CHECK(d2s(snan) == "NaN"sv);
 }
 
 TEST_CASE("d2s Infinity")
 {
     double inf = std::numeric_limits<double>::infinity();
-    CHECK(d2s(inf) == "Infinity");
+    CHECK(d2s(inf) == "Infinity"sv);
 }
 
 TEST_CASE("d2s -Infinity")
 {
     double inf = -std::numeric_limits<double>::infinity();
-    CHECK(d2s(inf) == "-Infinity");
+    CHECK(d2s(inf) == "-Infinity"sv);
 }
 
 TEST_CASE("d2s min")
@@ -168,7 +170,8 @@ TEST_CASE("d2s min")
                        "0000000000000000000000000000000000000000000000000000000"
                        "0000000000000000000000000000000000000000000000000000000"
                        "0000000000000000000000000000000000000000000000000000000"
-                       "0000000000000000000000000000000000022250738585072014"));
+                       "00000000000000000000000000000000000"
+                       "22250738585072014"sv));
 }
 
 TEST_CASE("d2s -min")
@@ -179,7 +182,8 @@ TEST_CASE("d2s -min")
                        "0000000000000000000000000000000000000000000000000000000"
                        "0000000000000000000000000000000000000000000000000000000"
                        "0000000000000000000000000000000000000000000000000000000"
-                       "0000000000000000000000000000000000022250738585072014"));
+                       "00000000000000000000000000000000000"
+                       "22250738585072014"sv));
 }
 
 TEST_CASE("d2s max")
@@ -190,7 +194,7 @@ TEST_CASE("d2s max")
                        "0000000000000000000000000000000000000000000000000000000"
                        "0000000000000000000000000000000000000000000000000000000"
                        "0000000000000000000000000000000000000000000000000000000"
-                       "00000000000000000000000000000000000.0"));
+                       "00000000000000000000000000000000000.0"sv));
 }
 
 TEST_CASE("d2s -max")
@@ -201,5 +205,5 @@ TEST_CASE("d2s -max")
                        "0000000000000000000000000000000000000000000000000000000"
                        "0000000000000000000000000000000000000000000000000000000"
                        "0000000000000000000000000000000000000000000000000000000"
-                       "00000000000000000000000000000000000.0"));
+                       "00000000000000000000000000000000000.0"sv));
 }

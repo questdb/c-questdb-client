@@ -24,7 +24,10 @@
 
 #pragma once
 
+#include "build_env.h"
+
 #if defined(PLATFORM_WINDOWS)
+#    include <Windows.h>
 #    include <synchapi.h>
 typedef CRITICAL_SECTION qdb_lock_t;
 #    define QDB_LOCK_INIT InitializeCriticalSection

@@ -150,6 +150,20 @@ void mem_writer_f64(mem_writer* writer, double num)
         return;
     }
 
+#if defined(PLATFORM_WINDOWS)
+    if (isinf(num))  // returns a bool instead of an int on Windows.
+    {
+        if (num > 0)
+        {
+            mem_writer_str(writer, 8, "Infinity");
+        }
+        else
+        {
+            mem_writer_str(writer, 9, "-Infinity");
+        }
+        return;
+    }
+#else
     switch (isinf(num))
     {
         case 1:
@@ -161,6 +175,7 @@ void mem_writer_f64(mem_writer* writer, double num)
         default:
             break;
     }
+#endif
 
     // Shortest string that yields `d` when read in and rounded to nearest.
     const int mode = 0;
