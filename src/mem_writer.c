@@ -45,6 +45,7 @@ void mem_writer_open(mem_writer* writer, size_t capacity)
     capacity = next_pow2(capacity);
     writer->head = writer->tail = aborting_malloc(capacity);
     writer->end = writer->head + capacity;
+    writer->id = dtoalib_acquire_thread_id();
 }
 
 size_t mem_writer_len(const mem_writer* writer)
@@ -63,6 +64,8 @@ char* mem_writer_steal_and_close(mem_writer* writer, size_t* len_out)
     *len_out = mem_writer_len(writer);
     char* buf = writer->head;
     writer->head = writer->tail = writer->end = NULL;
+    dtoalib_release_thread_id(writer->id);
+    writer->id = (dtoalib_tid)-1;
     return buf;
 }
 
@@ -197,6 +200,7 @@ void mem_writer_f64(mem_writer* writer, double num)
 
     // Returns buffer of integer digits or special value, no '.' chars.
     // NB: `dota.inc.c` renames `dtoa` to `dtoalib_dtoa`.
+    dtoalib_set_current_thread_id(writer->id);
     char* buf = dtoalib_dtoa(num, mode, ndigits, &decpt, &sign, &buf_end);
     assert((buf_end != NULL) && (buf_end >= buf));
 

@@ -28,10 +28,13 @@
 #include <stddef.h>
 #include <stdarg.h>
 
+typedef unsigned int dtoalib_tid;
+
 typedef struct mem_writer {
     char* head;
     char* tail;
     char* end;
+    dtoalib_tid id;
 } mem_writer;
 
 void mem_writer_open(mem_writer* writer, size_t capacity);

@@ -1,7 +1,12 @@
 #include "build_env.h"
 #include "qdb_lock.h"
 #include "qdb_call_once.h"
-#include "qdb_thread_id.h"
+
+#if defined(PLATFORM_WINDOWS)
+#    include <Windows.h>
+#else
+#    include <pthread.h>
+#endif
 
 // =============================  naming conflicts =============================
 // The `strtod` is also sometimes defined in `stdlib.h` (Mingw64).
@@ -19,6 +24,148 @@
 
 // This should work on all architectures with little-endian doubles.
 #define IEEE_8087 1
+
+// A fake thread id.
+// We use a counter and re-use values if they fall out of use.
+// The counter is accessed by `dtoa` through the `dtoalib_get_current_thread_id`
+// which in turn obtains its ID from a thread local.
+// We associate one ID per `mem_writer` object, NOT per thread.
+// This allows us to clean up ID values despite windows not proving a callback
+// on thread exit on thread locals.
+typedef unsigned int dtoalib_tid;
+
+static qdb_lock_t dtoalib_tid_lock;
+static dtoalib_tid dtoalib_tid_counter = 0;
+static size_t dtoalib_tid_free_list_len;
+static size_t dtoalib_tid_free_list_capacity;
+static dtoalib_tid* dtoalib_tid_free_list;
+
+static void dtoalib_tid_free_list_init()
+{
+    dtoalib_tid_free_list_len = 0;
+    dtoalib_tid_free_list_capacity = 8;
+    dtoalib_tid_free_list = aborting_malloc(
+        dtoalib_tid_free_list_capacity * sizeof(dtoalib_tid));
+}
+
+static int dtoalib_tid_reverse_compare(const void* lhs, const void* rhs)
+{
+    dtoalib_tid left = (dtoalib_tid)(size_t)lhs;
+    dtoalib_tid right = (dtoalib_tid)(size_t)rhs;
+    return (int)right - (int)left;
+}
+
+static dtoalib_tid dtoalib_acquire_thread_id()
+{
+    QDB_LOCK_ACQUIRE(&dtoalib_tid_lock);
+    if (dtoalib_tid_free_list_len)
+    {
+        qsort(
+            dtoalib_tid_free_list,
+            dtoalib_tid_free_list_len,
+            sizeof(dtoalib_tid),
+            dtoalib_tid_reverse_compare);
+        dtoalib_tid id = dtoalib_tid_free_list[--dtoalib_tid_free_list_len];
+        QDB_LOCK_RELEASE(&dtoalib_tid_lock);
+        return id;
+    }
+    else
+    {
+        dtoalib_tid id = dtoalib_tid_counter;
+        ++dtoalib_tid_counter;
+        QDB_LOCK_RELEASE(&dtoalib_tid_lock);
+        return id;
+    }
+}
+
+static void dtoalib_release_thread_id(dtoalib_tid id)
+{
+    if (dtoalib_tid_free_list_capacity == dtoalib_tid_free_list_len)
+    {
+        dtoalib_tid_free_list_capacity *= 2;
+        dtoalib_tid_free_list = aborting_realloc(
+            dtoalib_tid_free_list,
+            dtoalib_tid_free_list_capacity * sizeof(dtoalib_tid));
+    }
+    dtoalib_tid_free_list[dtoalib_tid_free_list_len++] = id;
+}
+
+#if defined(PLATFORM_WINDOWS)
+static DWORD tls_key;
+
+static void dtoalib_init_current_thread_id()
+{
+    tls_key = TlsAlloc();
+    if (tls_key == TLS_OUT_OF_INDEXES)
+    {
+        fprintf(
+            stderr,
+            "Failed to allocate thread local. GetLastError: %d.\n",
+            GetLastError());
+        abort();
+    }
+}
+
+static void dtoalib_set_current_thread_id(dtoalib_tid id)
+{
+    if (!TlsSetValue(tls_key, (void*)(size_t)(id + 1)))
+    {
+        fprintf(
+            stderr, 
+            "Failed setting thread ID local. Error: %d.\n", 
+            GetLastError());
+        abort();
+    }
+}
+
+static dtoalib_tid dtoalib_get_current_thread_id()
+{
+    dtoalib_tid id = (dtoalib_tid)(size_t)TlsGetValue(tls_key);
+    if (!id)
+    {
+        fprintf(
+            stderr, 
+            "Failed getting thread ID local. Error: %d.\n", 
+            GetLastError());
+        abort();
+    }
+    fprintf(stderr, "dtoalib_get_current_thread_id :: (A) %d\n", id - 1);
+    return id - 1;
+}
+#else
+static pthread_key_t tls_key;
+
+static void dtoalib_init_current_thread_id()
+{
+    const int error = pthread_key_create(&tls_key, NULL);
+    if (error)
+    {
+        fprintf(
+            stderr, 
+            "Failed to create thread local key. Error: %d.\n", 
+            error);
+        abort();
+    }
+}
+
+static void dtoalib_set_current_thread_id(dtoalib_tid id)
+{
+    int error = pthread_setspecific(tls_key, (void*)(id + 1));
+    if (error)
+    {
+        fprintf(
+            stderr, 
+            "Failed setting thread ID local. Error: %d\n", 
+            error);
+        abort();
+    }
+}
+
+static dtoalib_tid dtoalib_get_current_thread_id()
+{
+    return ((dtoalib_tid)pthread_getspecific(tls_key)) - 1;
+}
+#endif
 
 static void* malloc_log(size_t size)
 {
@@ -70,7 +217,7 @@ static void dtoa_inc_free_lock(int n)
 #define ACQUIRE_DTOA_LOCK dtoa_inc_lock
 #define FREE_DTOA_LOCK dtoa_inc_free_lock
 
-#define dtoa_get_threadno qdb_thread_id
+#define dtoa_get_threadno dtoalib_get_current_thread_id
 
 #if defined(COMPILER_MSVC)
 #    pragma warning( push )
@@ -106,11 +253,13 @@ static void dtoa_inc_free_lock(int n)
 
 static void init_impl()
 {
+    QDB_LOCK_INIT(&dtoalib_tid_lock);
     QDB_LOCK_INIT(&lock0);
     QDB_LOCK_INIT(&lock1);
 
-    qdb_thread_id_init();
-    dtoalib_set_max_dtoa_threads(16);
+    dtoalib_tid_free_list_init();
+    dtoalib_init_current_thread_id();
+    dtoalib_set_max_dtoa_threads(32);
 }
 
 static qdb_call_once_flag init_flag;
