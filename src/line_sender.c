@@ -775,7 +775,7 @@ static inline bool must_escape_quoted(char c)
             for (size_t index = 0; index < len; ++index)                       \
             {                                                                  \
                 const char c = s[index];                                       \
-                if (must_escape_unquoted(c))                                   \
+                if (CHECK_ESCAPE_FN(c))                                        \
                     *buf++ = '\\';                                             \
                 *buf++ = c;                                                    \
             }                                                                  \
