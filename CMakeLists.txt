@@ -47,7 +47,6 @@ set(LIB_SOURCES
     src/line_sender.c
     src/mem_writer.c
     src/utf8.c
-    src/qdb_thread_id.c
     src/qdb_call_once.c)
 
 
@@ -158,8 +157,8 @@ compile_test(
     test/test_mem_writer.cpp)
 
 compile_test(
-    test_thread_id
-    test/test_thread_id.cpp)
+    test_dtoa_thread_id
+    test/test_dtoa_thread_id.cpp)
 
 
 # System testing Python3 script.
