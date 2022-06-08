@@ -29,86 +29,12 @@
 
 #include <questdb/ilp/line_sender.h>
 #include <questdb/ilp/line_sender.hpp>
-#include "../src/utf8.h"
 
 #include <vector>
 #include <sstream>
 
-extern "C"
-{
-#include "../src/next_pow2.inc.c"
-}
-
 using namespace std::string_literals;
 using namespace questdb::ilp::literals;
-
-TEST_CASE("next_pow2")
-{
-    CHECK(next_pow2(2) == 2);
-    CHECK(next_pow2(3) == 4);
-    CHECK(next_pow2(4) == 4);
-    CHECK(next_pow2(5) == 8);
-    CHECK(next_pow2(6) == 8);
-    CHECK(next_pow2(7) == 8);
-    CHECK(next_pow2(8) == 8);
-    CHECK(next_pow2(9) == 16);
-    CHECK(next_pow2(64000) == 65536);
-    CHECK(next_pow2(65535) == 65536);
-    CHECK(next_pow2(65536) == 65536);
-    CHECK(next_pow2(65537) == 131072);
-    CHECK(next_pow2(100000) == 131072);
-}
-
-TEST_CASE("utf8: good ascii")
-{
-    const char buf[] = "abc";
-    const size_t len = sizeof(buf) - 1;
-    CHECK(len == 3);
-
-    utf8_error err;
-    CHECK(utf8_check(len, buf, &err));
-}
-
-TEST_CASE("utf8: ff ff - bad byte 2")
-{
-    const char buf[] = "\xff\xff";
-    const size_t len = sizeof(buf) - 1;
-
-    utf8_error err;
-    CHECK_FALSE(utf8_check(len, buf, &err));
-
-    CHECK(err.valid_up_to == 0);
-    CHECK(err.need_more == false);
-    CHECK(err.error_len == 1);
-}
-
-TEST_CASE("utf8: partial infinity symbol - need more")
-{
-    // First 2 chars of infinity symbol.
-    const char buf[] = "\xe2\x88";  // \x9e
-    const size_t len = sizeof(buf) - 1;
-
-    utf8_error err;
-    CHECK_FALSE(utf8_check(len, buf, &err));
-
-    CHECK(err.valid_up_to == 0);
-    CHECK(err.need_more == true);
-    CHECK(err.error_len == 0);
-}
-
-TEST_CASE("utf8: Error after valid text")
-{
-    // 'abc' + First 2 chars of infinity symbol.
-    const char buf[] = "abc\xe2\x88";  // \x9e
-    const size_t len = sizeof(buf) - 1;
-
-    utf8_error err;
-    CHECK_FALSE(utf8_check(len, buf, &err));
-
-    CHECK(err.valid_up_to == 3);
-    CHECK(err.need_more == true);
-    CHECK(err.error_len == 0);
-}
 
 template <typename F>
     class on_scope_exit
@@ -143,7 +69,10 @@ TEST_CASE("line_sender c api basics")
     server.accept();
     CHECK(server.recv() == 0);
     ::line_sender_name table_name{0, nullptr};
+    const char* test_buf = "test";
     CHECK(::line_sender_name_init(&table_name, 4, "test", &err));
+    CHECK(table_name.len == 4);
+    CHECK(table_name.buf == test_buf);
     ::line_sender_name t1_name{0, nullptr};
     CHECK(::line_sender_name_init(&t1_name, 2, "t1", &err));
     ::line_sender_utf8 v1_utf8{0, nullptr};
@@ -493,7 +422,7 @@ TEST_CASE("Bad port")
             {
                 std::string msg{se.what()};
                 std::string exp_msg{"\"localhost:" + bad_port + "\": "};
-                CHECK(msg.find(exp_msg) != std::string::npos);
+                CHECK_MESSAGE(msg.find(exp_msg) != std::string::npos, msg);
             }
             catch (...)
             {

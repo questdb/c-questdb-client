@@ -91,7 +91,7 @@ void line_sender_error_free(line_sender_error*);
 typedef struct line_sender_utf8
 {
     // Don't initialize fields directly.
-    // Call `line_sender_utf8_validate` instead.
+    // Call `line_sender_utf8_init` instead.
     size_t len;
     const char* buf;
 } line_sender_utf8;
@@ -116,7 +116,7 @@ bool line_sender_utf8_init(
 typedef struct line_sender_name
 {
     // Don't initialize fields directly.
-    // Call `line_sender_name_validate` instead.
+    // Call `line_sender_name_init` instead.
     size_t len;
     const char* buf;
 } line_sender_name;

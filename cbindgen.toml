@@ -1,0 +1,77 @@
+language = "C"
+
+header = """/*******************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \\ _   _  ___  ___| |_|  _ \\| __ )
+ *   | | | | | | |/ _ \\/ __| __| | | |  _ \\
+ *   | |_| | |_| |  __/\\__ \\ |_| |_| | |_) |
+ *    \\__\\_\\\\__,_|\\___||___/\\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2022 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/"""
+
+pragma_once = true
+
+autogen_warning = "// This header is auto-generated. Do not edit directly!"
+
+# A list of sys headers to #include (with angle brackets)
+# default: []
+sys_includes = ["stdint.h", "stddef.h", "stdbool.h"]
+
+# A list of headers to #include (with quotes)
+# default: []
+includes = []  # ["my_great_lib.h"]
+
+# Suppress cbindgen's default includes.
+no_includes = true
+
+after_includes = """
+#if defined(LINESENDER_DYN_LIB)
+#    if defined(_MSC_VER)
+#        if defined(LINESENDER_EXPORTS)
+#            define LINESENDER_API __declspec(dllexport)
+#        else
+#            define LINESENDER_API __declspec(dllimport)
+#        endif
+#    elif (__GNUC__ >= 4)
+#        define LINESENDER_API __attribute__ ((visibility("default")))
+#    else
+#        error "Compiler unsupported or badly detected."
+#    endif
+#else
+#    define LINESENDER_API
+#endif"""
+
+# #ifdef __cplusplus
+# extern "C" {
+# #endif // __cplusplus
+cpp_compat = true
+
+# Code Style Options
+braces = "NextLine"
+line_length = 79
+tab_width = 4
+documentation = true
+documentation_style = "doxy"
+
+# Codegen Options
+style = "type"
+usize_is_size_t = true
+
+[fn]
+prefix = "LINESENDER_API"
+args = "vertical"

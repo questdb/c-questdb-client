@@ -24,13 +24,13 @@
 
 #pragma once
 
-#include "../src/build_env.h"
-
 #include <vector>
 #include <string>
 #include <cstdint>
 #include <optional>
 #include <stdexcept>
+
+#include "build_env.h"
 
 #if defined(PLATFORM_UNIX)
 typedef int socketfd_t;

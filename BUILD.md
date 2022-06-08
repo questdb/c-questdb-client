@@ -7,6 +7,7 @@ Also make sure to read the page on
 
 ## Pre-requisites
 
+* Rust 1.61 or newer (get it from [https://rustup.rs/](https://rustup.rs/))
 * A modern C11/C++17 compiler.
 * CMake 3.15 or newer.
 
@@ -37,19 +38,8 @@ Visual Studio Code should also work well provided you have the "C/C++",
 
 ## Build outputs
 
-The build will generate libraries compiled to `./build`
+The build will generate both static and dynamic libraries compiled to `./build`
 (or your otherwise selected CMake build directory).
-
-You will find one dynamic library and depending on
-the operating system either one or two static libraries.
-
-On platforms that support compiling with position independent code (Linux, Mac)
-we ship both a static library with `-fPIC` enabled and one with the option
-disabled. Use the former if you intend to link the static library into a dynamic
-library and use the latter if you intend to link it into an executable.
-If you intend to create your own language binding (e.g. for Python), then you
-probably want to use the `-fPIC` static library.
-On Windows there is just one static library you may use for all purposes.
 
 ## Running tests
 
@@ -87,3 +77,20 @@ Delete the `./build` directory.
 ```bash
 $ rm -fR build  # or your otherwise selected CMake build directory.
 ```
+
+## Building Rust Code
+
+You may find that you need to build the Rust code directly.
+
+From the root:
+
+```
+cargo build --release --features ffi
+```
+
+Note that this will build binaries in `./target` rather than `./build`.
+
+This will also refresh the `line_sender.h` header file.
+
+Call this command if you want to integrate the library within your project and
+you use a build system other than CMake.

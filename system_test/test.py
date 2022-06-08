@@ -27,6 +27,7 @@
 import sys
 sys.dont_write_bytecode = True
 
+import math
 import datetime
 import argparse
 import unittest
@@ -333,6 +334,60 @@ class TestLineSender(unittest.TestCase):
         self.assertEqual(resp['columns'], exp_columns)
 
         exp_dataset = [[smilie]]  # Comparison excludes timestamp column.
+        scrubbed_dataset = [row[:-1] for row in resp['dataset']]
+        self.assertEqual(scrubbed_dataset, exp_dataset)
+
+    def test_floats(self):
+        numbers = [
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            10.0,
+            0.1,
+            0.01,
+            0.000001,
+            -0.000001,
+            100.0,
+            1.2,
+            1234.5678,
+            -1234.5678,
+            1.23456789012,
+            1000000000000000000000000.0,
+            -1000000000000000000000000.0,
+            float("nan"),   # Converted to `None`.
+            float("inf"),   # Converted to `None`.
+            float("-inf")]  # Converted to `None`.
+
+            # These values below do not round-trip properly: QuestDB limitation.
+            # 1.2345678901234567,
+            # 2.2250738585072014e-308,
+            # -2.2250738585072014e-308,
+            # 1.7976931348623157e+308,
+            # -1.7976931348623157e+308]
+        table_name = uuid.uuid4().hex
+        with self._mk_linesender() as sender:
+            for num in numbers:
+                sender.table(table_name)
+                sender.column('n', num)
+                sender.at_now()
+
+        resp = retry_check_table(table_name, len(numbers))
+        exp_columns = [
+            {'name': 'n', 'type': 'DOUBLE'},
+            {'name': 'timestamp', 'type': 'TIMESTAMP'}]
+        self.assertEqual(resp['columns'], exp_columns)
+
+        def massage(num):
+            if math.isnan(num) or math.isinf(num):
+                return None
+            elif num == -0.0:
+                return 0.0
+            else:
+                return num
+
+        # Comparison excludes timestamp column.
+        exp_dataset = [[massage(num)] for num in numbers]
         scrubbed_dataset = [row[:-1] for row in resp['dataset']]
         self.assertEqual(scrubbed_dataset, exp_dataset)
 

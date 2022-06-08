@@ -6,8 +6,10 @@ This library makes it easy to insert data into [QuestDB](https://questdb.io/).
 This client library implements the [InfluxDB Line Protocol](
 https://questdb.io/docs/reference/api/ilp/overview/) (ILP) over TCP.
 
-* Implementation is in C11, with no dependency on the C++ standard library
-  for simpler inclusion into your projects.
+* Implementation is in Rust, with no additional run-time or link-time dependency
+  on the C++ standard library or other libraries.
+* We ship both a static and a dynamic library.
+* The library exposes both a C and a C++17 API.
 * The C++ API is a header-only wrapper written in C++17.
 
 ## Protocol
@@ -21,7 +23,7 @@ Inserting data into QuestDB can be done via one of three protocols.
 | [PostgreSQL](https://questdb.io/docs/reference/api/postgres/) | Transaction-level | Good |
 
 This library mitigates the lack of confirmation and error reporting by
-validating data ahead of time, before any data is sent to the database instance.
+validating data ahead of time before any data is sent to the database instance.
 
 For example, the client library will report that a supplied string isn't encoded
 in UTF-8. Some issues unfortunately can't be caught by the library and require

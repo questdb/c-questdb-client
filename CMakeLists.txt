@@ -16,11 +16,19 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-set(LIB_SOURCES
-    src/aborting_malloc.c
-    src/line_sender.c
-    src/mem_writer.c
-    src/utf8.c)
+# Build static and dynamic lib written in Rust by invoking `cargo`.
+include(FetchContent)
+FetchContent_Declare(
+    Corrosion
+    GIT_REPOSITORY https://github.com/corrosion-rs/corrosion.git
+    GIT_TAG v0.2.1)
+FetchContent_MakeAvailable(Corrosion)
+corrosion_import_crate(
+    MANIFEST_PATH Cargo.toml
+    FEATURES ffi)
+target_include_directories(
+    questdb_client INTERFACE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 function(set_compile_flags TARGET_NAME)
     if(MSVC)
@@ -43,86 +51,42 @@ function(set_compile_flags TARGET_NAME)
     endif()
 endfunction()
 
-# Shared Library
-add_library(
-    c_questdb_client SHARED
-    ${LIB_SOURCES})
-target_include_directories(
-    c_questdb_client
-    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-set_compile_flags(c_questdb_client)
-target_compile_definitions(
-    c_questdb_client
-    PUBLIC
-    LINESENDER_DYN_LIB)
-if(WIN32)
-    set_target_properties(
-        c_questdb_client
-        PROPERTIES
-        DEFINE_SYMBOL "LINESENDER_EXPORTS")
-    target_link_libraries(c_questdb_client wsock32 ws2_32)
-endif(WIN32)
-if(UNIX)
-    target_compile_options(
-        c_questdb_client PRIVATE
-        -fvisibility=hidden)
-endif(UNIX)
-
-# Static Library
-add_library(
-    c_questdb_client_static STATIC
-    ${LIB_SOURCES})
-target_include_directories(
-    c_questdb_client_static
-    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-set_compile_flags(c_questdb_client_static)
-if(WIN32)
-    target_link_libraries(c_questdb_client_static wsock32 ws2_32)
-endif(WIN32)
-
-# Static Library w/ -fPIC
-if(UNIX)
-    add_library(
-        c_questdb_client_static_pic STATIC
-        ${LIB_SOURCES})
-    set_property(
-        TARGET c_questdb_client_static_pic
-        PROPERTY POSITION_INDEPENDENT_CODE ON)
-    target_include_directories(
-        c_questdb_client_static_pic
-        PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    set_compile_flags(c_questdb_client_static_pic)
-endif(UNIX)
-
 # Examples
 add_executable(
     line_sender_c_example
     examples/line_sender_c_example.c)
 target_link_libraries(
     line_sender_c_example
-    c_questdb_client_static)  # example depending on static lib.
+    questdb_client)
 add_executable(
     line_sender_cpp_example
     examples/line_sender_cpp_example.cpp)
 target_link_libraries(
     line_sender_cpp_example
-    c_questdb_client)  # example depending on dynamic lib.
+    questdb_client)
 
-# Unit test binary.
-add_executable(
+# Unit test binaries.
+function(compile_test TARGET_NAME)
+    list(POP_FRONT ARGV)  # compile_test
+    add_executable(
+        ${TARGET_NAME}
+        ${ARGV})
+    target_link_libraries(
+        ${TARGET_NAME}
+        questdb_client)
+    target_include_directories(
+        ${TARGET_NAME}
+        PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    set_compile_flags(${TARGET_NAME})
+    add_test(
+        NAME ${TARGET_NAME}
+        COMMAND ${TARGET_NAME})
+endfunction()
+
+compile_test(
     test_line_sender
     test/mock_server.cpp
     test/test_line_sender.cpp)
-target_link_libraries(
-    test_line_sender
-    c_questdb_client_static)
-target_include_directories(
-    test_line_sender
-    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-set_compile_flags(test_line_sender)
-add_test(
-    NAME test_line_sender
-    COMMAND test_line_sender)
 
 # System testing Python3 script.
 # This will download the latest QuestDB instance from Github,
