@@ -16,6 +16,11 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+option(
+    BUILD_SHARED_LIBS
+    "Build shared library dependencies instead of static."
+    OFF)
+
 # Build static and dynamic lib written in Rust by invoking `cargo`.
 add_subdirectory(corrosion)
 corrosion_import_crate(
