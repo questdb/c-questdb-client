@@ -32,25 +32,15 @@ extern "C" {
 #include <stddef.h>
 #include <stdbool.h>
 
-#if defined(LINESENDER_DYN_LIB)
-#    if defined(_MSC_VER)
-#        if defined(LINESENDER_EXPORTS)
-#            define LINESENDER_API __declspec(dllexport)
-#        else
-#            define LINESENDER_API __declspec(dllimport)
-#        endif
-#    elif (__GNUC__ >= 4)
-#        define LINESENDER_API __attribute__ ((visibility("default")))
-#    else
-#        error "Compiler unsupported or badly detected."
-#    endif
+#if defined(LINESENDER_DYN_LIB) && defined(_MSC_VER)
+#    define LINESENDER_API __declspec(dllimport)
 #else
 #    define LINESENDER_API
 #endif
 
 
 /////////// Error handling.
-/** An error that occured when using the line sender. */
+/** An error that occurred when using the line sender. */
 typedef struct line_sender_error line_sender_error;
 
 /** Category of error. */
