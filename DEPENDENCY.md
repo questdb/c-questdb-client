@@ -83,7 +83,6 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-find_package(Git REQUIRED)
 include(FetchContent)
 
 FetchContent_Declare(
@@ -91,22 +90,17 @@ FetchContent_Declare(
     GIT_REPOSITORY https://github.com/questdb/c-questdb-client.git
     GIT_TAG CHOSEN_RELEASE_TAG)   # CHANGE ME!
 
-FetchContent_GetProperties(c_questdb_client_proj)
-if(NOT c_questdb_client_proj_POPULATED)
-  FetchContent_Populate(c_questdb_client_proj)
-  add_subdirectory(
-      ${c_questdb_client_proj_SOURCE_DIR}
-      ${c_questdb_client_proj_BINARY_DIR}
-      EXCLUDE_FROM_ALL)
-endif()
+FetchContent_MakeAvailable(c_questdb_client)
 
 add_executable(
     main
     main.cpp)
 target_link_libraries(
     main
-    c_questdb_client_static)
+    questdb_client)
 ```
+
+*Note:* By default, the library will be linked statically. Call `cmake .. -DBUILD_SHARED_LIBS=ON` to depend on the dynamic library.
 
 ## Option 2: CMake add_subdirectory & Git source code grafting
 
@@ -231,7 +225,7 @@ add_executable(
     main.cpp)
 target_link_libraries(
     main
-    c_questdb_client_static)
+    questdb_client)
 ```
 
 ## Option 3: Other build systems
@@ -250,6 +244,8 @@ If you use a build system other than CMake, the following tips should help you:
 * Whilst *building* the library on Windows also define `LINESENDER_EXPORTS`
   to mark `__declspec(dllexport)`:
   This define should *not* be present when *using* the library.
+
+*Note:* By default, the library will be linked statically. Call `cmake .. -DBUILD_SHARED_LIBS=ON` to depend on the dynamic library.
 
 ## Package Managers
 
