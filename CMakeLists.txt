@@ -17,15 +17,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Build static and dynamic lib written in Rust by invoking `cargo`.
-include(FetchContent)
-FetchContent_Declare(
-    Corrosion
-    GIT_REPOSITORY https://github.com/corrosion-rs/corrosion.git
-    GIT_TAG v0.2.1)
-FetchContent_MakeAvailable(Corrosion)
+add_subdirectory(corrosion)
 corrosion_import_crate(
     MANIFEST_PATH Cargo.toml
-    FEATURES ffi)
+    FEATURES ffi
+    LINKER_LANGUAGE C)
 target_include_directories(
     questdb_client INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}/include)
