@@ -40,6 +40,11 @@ import urllib.request
 import urllib.parse
 import urllib.error
 
+
+AUTH_TXT = """testUser1 ec-p-256-sha256 fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac
+# [key/user id] [key type] {keyX keyY}"""
+
+
 def retry(predicate_task, timeout_sec=30, every=0.05, msg='Timed out retrying'):
     """
     Repeat task every `interval` until it returns a truthy value or times out.
@@ -164,14 +169,14 @@ def _find_java():
 
 
 class QuestDbFixture:
-    def __init__(self, root_dir: pathlib.Path):
+    def __init__(self, root_dir: pathlib.Path, auth=False):
         self._root_dir = root_dir
         self.version = _parse_version(self._root_dir.name)
         self._data_dir = self._root_dir / 'data'
         self._log_path = self._data_dir / 'log' / 'log.txt'
-        conf_dir = self._data_dir / 'conf'
-        conf_dir.mkdir()
-        self._conf_path = conf_dir / 'server.conf'
+        self._conf_dir = self._data_dir / 'conf'
+        self._conf_dir.mkdir()
+        self._conf_path = self._conf_dir / 'server.conf'
         self._log = None
         self._proc = None
         self.host = 'localhost'
@@ -179,9 +184,17 @@ class QuestDbFixture:
         self.line_tcp_port = None
         self.pg_port = None
 
+        self.auth = auth
+        if self.auth:
+            auth_txt_path = self._conf_dir / 'auth.txt'
+            with open(auth_txt_path, 'w', encoding='utf-8') as auth_file:
+                auth_file.write(AUTH_TXT)
+
+
     def start(self):
         ports = discover_avail_ports(3)
         self.http_server_port, self.line_tcp_port, self.pg_port = ports
+        auth_config = 'line.tcp.auth.db.path=conf/auth.txt' if self.auth else ''
         with open(self._conf_path, 'w', encoding='utf-8') as conf_file:
             conf_file.write(textwrap.dedent(rf'''
                 http.bind.to=0.0.0.0:{self.http_server_port}
@@ -191,6 +204,7 @@ class QuestDbFixture:
                 line.udp.enabled=false
                 cairo.max.uncommitted.rows=1
                 line.tcp.maintenance.job.interval=100
+                {auth_config}
                 ''').lstrip('\n'))
 
         java = _find_java()

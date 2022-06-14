@@ -50,6 +50,16 @@ from collections import namedtuple
 QDB_FIXTURE: QuestDbFixture = None
 
 
+AUTH_CLIENT_KEYS = {
+  "kty": "EC",
+  "d": "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48",  # PRIVATE_KEY
+  "crv": "P-256",
+  "kid": "testUser1",
+  "x": "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU",  # PUBLIC_KEY.x
+  "y": "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac"   # PUBLIC_KEY.y
+}
+
+
 class QueryError(Exception):
     pass
 
@@ -498,14 +508,15 @@ def run_with_fixtures(args):
 
     for version, download_url in versions.items():
         questdb_dir = install_questdb(version, download_url)
-        QDB_FIXTURE = QuestDbFixture(questdb_dir)
-        try:
-            QDB_FIXTURE.start()
-            test_prog = unittest.TestProgram(exit=False)
-            if not test_prog.result.wasSuccessful():
-                sys.exit(1)
-        finally:
-            QDB_FIXTURE.stop()
+        for auth in (False, True):
+            QDB_FIXTURE = QuestDbFixture(questdb_dir, auth=auth)
+            try:
+                QDB_FIXTURE.start()
+                test_prog = unittest.TestProgram(exit=False)
+                if not test_prog.result.wasSuccessful():
+                    sys.exit(1)
+            finally:
+                QDB_FIXTURE.stop()
 
 
 def run(args, show_help=False):

@@ -258,14 +258,36 @@ pub struct LineSender {
     last_line_start: usize
 }
 
-impl LineSender {
-    pub fn connect(host: &str, port: &str, net_interface: Option<&str>) -> Result<Self> {
-        let addr: SockAddr = gai::resolve_host_port(host, port)?;
+#[derive(Debug, Clone)]
+pub struct LineSenderBuilder<'a> {
+    host: &'a str,
+    port: &'a str,
+    net_interface: Option<&'a str>,
+    auth: Option<(&'a str, &'a str)>  // (username, private key)
+}
+
+impl <'a> LineSenderBuilder<'a> {
+    pub fn new(host: &'a str, port: &'a str) -> Self {
+        Self { host: host, port: port, net_interface: None, auth: None }
+    }
+
+    pub fn net_interface(&mut self, addr: &'a str) -> &mut Self {
+        self.net_interface = Some(addr);
+        self
+    }
+
+    pub fn auth(&mut self, username: &'a str, private_key: &'a str) -> &mut Self {
+        self.auth = Some((username, private_key));
+        self
+    }
+
+    pub fn connect(self) -> Result<LineSender> {
+        let addr: SockAddr = gai::resolve_host_port(self.host, self.port)?;
         let sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
             .map_err(|io_err| map_io_to_socket_err("Could not open TCP socket: ", io_err))?;
         sock.set_nodelay(true)
             .map_err(|io_err| map_io_to_socket_err("Could not set TCP_NODELAY: ", io_err))?;
-        if let Some(host) = net_interface {
+        if let Some(host) = self.net_interface {
             let bind_addr = gai::resolve_host(host)?;
             sock.bind(&bind_addr)
             .map_err(|io_err| map_io_to_socket_err(
@@ -273,18 +295,21 @@ impl LineSender {
         }
         sock.connect(&addr)
             .map_err(|io_err| {
-                let host_port = format!("{}:{}", host, port);
+                let host_port = format!("{}:{}", self.host, self.port);
                 let prefix = format!("Could not connect to {:?}: ", host_port);
                 map_io_to_socket_err(&prefix, io_err)
             })?;
-        Ok(Self {
+        Ok(LineSender {
             sock: sock,
             state: State::Connected,
             output: String::with_capacity(65536),
             last_line_start: 0usize
         })
     }
+}
 
+
+impl LineSender {
     fn check_state(&mut self, op: Op) -> Result<()> {
         if (self.state as isize & op as isize) > 0 {
             return Ok(());

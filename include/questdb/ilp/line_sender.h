@@ -142,6 +142,18 @@ bool line_sender_name_init(
  */
 typedef struct line_sender line_sender;
 
+/*
+ * Authentication options.
+ */
+typedef struct line_sender_sec_opts
+{
+    /** Authentication username. Auth is disabled if NULL. */
+    const char* auth_user_name;
+
+    /** Authentication private key. Auth is disabled if NULL. */
+    const char* auth_private_key;
+} line_sender_sec_opts;
+
 /**
  * Synchronously connect to the QuestDB database.
  * @param[in] net_interface Network interface to bind to.
@@ -156,6 +168,24 @@ line_sender* line_sender_connect(
     const char* net_interface,
     const char* host,
     const char* port,
+    line_sender_error** err_out);
+
+/**
+ * Synchronously connect securely to the QuestDB database.
+ * @param[in] net_interface Network interface to bind to.
+ * If unsure, to bind to all specify "0.0.0.0".
+ * @param[in] host QuestDB host, e.g. "localhost". nul-terminated.
+ * @param[in] port QuestDB port, e.g. "9009". nul-terminated.
+ * @param[in] sec_opts Security options for authentication.
+ * @param[out] err_out Set on error.
+ * @return Connected sender object or NULL on error.
+ */
+LINESENDER_API
+line_sender* line_sender_connect_secure(
+    const char* net_interface,
+    const char* host,
+    const char* port,
+    const line_sender_sec_opts* sec_opts,
     line_sender_error** err_out);
 
 /**

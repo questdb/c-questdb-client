@@ -229,6 +229,18 @@ macro_rules! bubble_err_to_c {
     };
 }
 
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct line_sender_sec_opts
+{
+    /// Authentication username. Auth is disabled if NULL.
+    auth_username : *const libc::c_char,
+
+    /// Authentication private key. Auth is disabled if NULL.
+    auth_private_key : *const libc::c_char,
+}
+
+
 /// Check the provided buffer is a valid UTF-8 encoded string that can be
 /// used as a table name, symbol name or column name.
 ///
@@ -284,6 +296,30 @@ pub extern "C" fn line_sender_connect(
     port: *const libc::c_char,
     err_out: *mut *mut line_sender_error) -> *mut line_sender
 {
+    line_sender_connect_secure(
+        net_interface,
+        host,
+        port,
+        std::ptr::null(),
+        err_out)
+}
+
+/// Synchronously connect securely to the QuestDB database.
+/// @param[in] net_interface Network interface to bind to.
+/// If unsure, to bind to all specify "0.0.0.0".
+/// @param[in] host QuestDB host, e.g. "localhost". nul-terminated.
+/// @param[in] port QuestDB port, e.g. "9009". nul-terminated.
+/// @param[in] sec_opts Security options for authentication.
+/// @param[out] err_out Set on error.
+/// @return Connected sender object or NULL on error.
+#[no_mangle]
+pub extern "C" fn line_sender_connect_secure(
+    net_interface: *const libc::c_char,
+    host: *const libc::c_char,
+    port: *const libc::c_char,
+    sec_opts: *const line_sender_sec_opts,
+    err_out: *mut *mut line_sender_error) -> *mut line_sender
+{
     let host: &str =
         if let Some(str_ref) = unwrap_utf8(unsafe {CStr::from_ptr(host)}.to_bytes(), err_out) {
             str_ref
@@ -311,8 +347,11 @@ pub extern "C" fn line_sender_connect(
             return std::ptr::null_mut();
         };
 
-    let sender =
-        match super::LineSender::connect(host, port, net_interface) {
+    let mut builder = super::LineSenderBuilder::new(host, port);
+    if let Some(net_interface) = net_interface {
+        builder.net_interface(net_interface);
+    }
+    let sender = match builder.connect() {
             Ok(sender) => sender,
             Err(err) => {
                 let err = line_sender_error(err);
