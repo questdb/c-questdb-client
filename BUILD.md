@@ -5,10 +5,25 @@ This page describes how to build this project.
 Also make sure to read the page on
 [integrating this library into your project](DEPENDENCY.md).
 
-## Pre-requisites
+## Pre-requisites and dependencies
 
-* A modern C11/C++17 compiler.
+* Rust 1.61 or newer (get it from [https://rustup.rs/](https://rustup.rs/))
+* A modern C11 or C++17 compiler.
 * CMake 3.15 or newer.
+
+The library statically links all its dependencies.
+
+```
+$ ls build/libquestdb_client.*
+build/libquestdb_client.a  build/libquestdb_client.so
+$ ldd build/libquestdb_client.so
+        linux-vdso.so.1 (0x00007ffddd344000)
+        libgcc_s.so.1 => /lib/x86_64-linux-gnu/libgcc_s.so.1 (0x00007fe61d252000)
+        libpthread.so.0 => /lib/x86_64-linux-gnu/libpthread.so.0 (0x00007fe61d22f000)
+        libdl.so.2 => /lib/x86_64-linux-gnu/libdl.so.2 (0x00007fe61d229000)
+        libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x00007fe61d037000)
+        /lib64/ld-linux-x86-64.so.2 (0x00007fe61d2ee000)
+```
 
 ## Build steps
 
@@ -37,19 +52,8 @@ Visual Studio Code should also work well provided you have the "C/C++",
 
 ## Build outputs
 
-The build will generate libraries compiled to `./build`
+The build will generate both static and dynamic libraries compiled to `./build`
 (or your otherwise selected CMake build directory).
-
-You will find one dynamic library and depending on
-the operating system either one or two static libraries.
-
-On platforms that support compiling with position independent code (Linux, Mac)
-we ship both a static library with `-fPIC` enabled and one with the option
-disabled. Use the former if you intend to link the static library into a dynamic
-library and use the latter if you intend to link it into an executable.
-If you intend to create your own language binding (e.g. for Python), then you
-probably want to use the `-fPIC` static library.
-On Windows there is just one static library you may use for all purposes.
 
 ## Running tests
 
@@ -87,3 +91,20 @@ Delete the `./build` directory.
 ```bash
 $ rm -fR build  # or your otherwise selected CMake build directory.
 ```
+
+## Building Rust Code
+
+You may find that you need to build the Rust code directly.
+
+From the root:
+
+```
+cargo build --release --features ffi
+```
+
+Note that this will build binaries in `./target` rather than `./build`.
+
+This will also refresh the `line_sender.h` header file.
+
+Call this command if you want to integrate the library within your project and
+you use a build system other than CMake.

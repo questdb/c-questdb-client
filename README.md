@@ -6,9 +6,12 @@ This library makes it easy to insert data into [QuestDB](https://questdb.io/).
 This client library implements the [InfluxDB Line Protocol](
 https://questdb.io/docs/reference/api/ilp/overview/) (ILP) over TCP.
 
-* Implementation is in C11, with no dependency on the C++ standard library
-  for simpler inclusion into your projects.
-* The C++ API is a header-only wrapper written in C++17.
+* Implementation is in Rust, with no additional
+  [run-time or link-time dependencies](BUILD.md#pre-requisites-and-dependencies)
+  on the C++ standard library or other libraries.
+* We ship both a static and a dynamic library.
+* The library exposes both a C and a C++17 API.
+* The C++ API is a header-only wrapper over the C API.
 
 ## Protocol
 
@@ -21,7 +24,7 @@ Inserting data into QuestDB can be done via one of three protocols.
 | [PostgreSQL](https://questdb.io/docs/reference/api/postgres/) | Transaction-level | Good |
 
 This library mitigates the lack of confirmation and error reporting by
-validating data ahead of time, before any data is sent to the database instance.
+validating data ahead of time before any data is sent to the database instance.
 
 For example, the client library will report that a supplied string isn't encoded
 in UTF-8. Some issues unfortunately can't be caught by the library and require
@@ -35,8 +38,8 @@ To understand the protocol in more depth, consult the
 
 ## Using this Library
 
-Start with the [build instructions](BUILD.md), then read guide for including
-this library as a [dependency to your project](DEPENDENCY.md).
+Start with the [build instructions](BUILD.md), then read the guide for including
+this library as a [dependency from your project](DEPENDENCY.md).
 
 Once you've all set up, you can take a look at our examples:
 
@@ -77,7 +80,7 @@ See a [complete example in C++](examples/line_sender_cpp_example.cpp).
 The API is sequentially coupled, meaning that methods need to be called in a
 specific order.
 
-For each row you need to specify a table name and at least one symbol or
+For each row, you need to specify a table name and at least one symbol or
 column. Symbols must be specified before columns.
 Once you're done with a row you must add a timestamp calling `at` or `at_now`.
 
@@ -101,7 +104,7 @@ a failure.
 You may then call `line_sender_error_msg(err)` and
 `line_sender_error_get_code(err)` to extract error details.
 
-Once handled, the error object *must* be disposed by calling
+Once handled, the error object *must* be disposed of by calling
 `line_sender_error_free(err)`.
 
 On error you must also call `line_sender_close(sender)`.
