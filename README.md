@@ -6,11 +6,12 @@ This library makes it easy to insert data into [QuestDB](https://questdb.io/).
 This client library implements the [InfluxDB Line Protocol](
 https://questdb.io/docs/reference/api/ilp/overview/) (ILP) over TCP.
 
-* Implementation is in Rust, with no additional run-time or link-time dependency
+* Implementation is in Rust, with no additional
+  [run-time or link-time dependencies](BUILD.md#pre-requisites-and-dependencies)
   on the C++ standard library or other libraries.
 * We ship both a static and a dynamic library.
 * The library exposes both a C and a C++17 API.
-* The C++ API is a header-only wrapper written in C++17.
+* The C++ API is a header-only wrapper over the C API.
 
 ## Protocol
 

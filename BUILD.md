@@ -5,11 +5,25 @@ This page describes how to build this project.
 Also make sure to read the page on
 [integrating this library into your project](DEPENDENCY.md).
 
-## Pre-requisites
+## Pre-requisites and dependencies
 
 * Rust 1.61 or newer (get it from [https://rustup.rs/](https://rustup.rs/))
-* A modern C11/C++17 compiler.
+* A modern C11 or C++17 compiler.
 * CMake 3.15 or newer.
+
+The library statically links all its dependencies.
+
+```
+$ ls build/libquestdb_client.*
+build/libquestdb_client.a  build/libquestdb_client.so
+$ ldd build/libquestdb_client.so
+        linux-vdso.so.1 (0x00007ffddd344000)
+        libgcc_s.so.1 => /lib/x86_64-linux-gnu/libgcc_s.so.1 (0x00007fe61d252000)
+        libpthread.so.0 => /lib/x86_64-linux-gnu/libpthread.so.0 (0x00007fe61d22f000)
+        libdl.so.2 => /lib/x86_64-linux-gnu/libdl.so.2 (0x00007fe61d229000)
+        libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x00007fe61d037000)
+        /lib64/ld-linux-x86-64.so.2 (0x00007fe61d2ee000)
+```
 
 ## Build steps
 
