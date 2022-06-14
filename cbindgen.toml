@@ -40,21 +40,12 @@ includes = []  # ["my_great_lib.h"]
 no_includes = true
 
 after_includes = """
-#if defined(LINESENDER_DYN_LIB)
-#    if defined(_MSC_VER)
-#        if defined(LINESENDER_EXPORTS)
-#            define LINESENDER_API __declspec(dllexport)
-#        else
-#            define LINESENDER_API __declspec(dllimport)
-#        endif
-#    elif (__GNUC__ >= 4)
-#        define LINESENDER_API __attribute__ ((visibility("default")))
-#    else
-#        error "Compiler unsupported or badly detected."
-#    endif
+#if defined(LINESENDER_DYN_LIB) && defined(_MSC_VER)
+#    define LINESENDER_API __declspec(dllimport)
 #else
 #    define LINESENDER_API
-#endif"""
+#endif
+"""
 
 # #ifdef __cplusplus
 # extern "C" {
