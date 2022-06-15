@@ -175,7 +175,7 @@ class QuestDbFixture:
         self._data_dir = self._root_dir / 'data'
         self._log_path = self._data_dir / 'log' / 'log.txt'
         self._conf_dir = self._data_dir / 'conf'
-        self._conf_dir.mkdir()
+        self._conf_dir.mkdir(exist_ok=True)
         self._conf_path = self._conf_dir / 'server.conf'
         self._log = None
         self._proc = None

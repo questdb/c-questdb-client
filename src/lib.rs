@@ -22,10 +22,12 @@
  *
  ******************************************************************************/
 
+use core::time::Duration;
 use std::convert::{TryFrom, TryInto, Infallible};
 use std::fmt;
 use std::fmt::{Write, Display, Formatter};
 use std::io;
+use std::io::{Read, BufRead, BufReader};
 use std::io::Write as IoWrite;
 use socket2::{Domain, Socket, SockAddr, Type, Protocol};
 
@@ -293,23 +295,74 @@ impl <'a> LineSenderBuilder<'a> {
             .map_err(|io_err| map_io_to_socket_err(
                 &format!("Could not bind to interface address {:?}: ", host), io_err))?;
         }
+        eprintln!("connect :: (A)!");
         sock.connect(&addr)
             .map_err(|io_err| {
                 let host_port = format!("{}:{}", self.host, self.port);
                 let prefix = format!("Could not connect to {:?}: ", host_port);
                 map_io_to_socket_err(&prefix, io_err)
             })?;
-        Ok(LineSender {
+        eprintln!("connect :: (B)");
+        let mut sender = LineSender {
             sock: sock,
             state: State::Connected,
             output: String::with_capacity(65536),
             last_line_start: 0usize
-        })
+        };
+        if let Some((username, private_key)) = self.auth {
+            eprintln!("connect :: (C)");
+            sender.authenticate(username, private_key)?;
+        }
+        eprintln!("connect :: (D)");
+        Ok(sender)
     }
 }
 
 
 impl LineSender {
+    fn send_username(&mut self, username: &str) -> Result<()> {
+        write!(&mut self.sock, "{}\n", username)
+            .map_err(|io_err| map_io_to_socket_err("Failed to send username: ", io_err))?;
+        Ok(())
+    }
+
+    fn read_challenge(&mut self) -> Result<Vec<u8>> {
+        eprintln!("read_challenge :: (A)");
+        self.sock.set_read_timeout(Some(Duration::from_secs(90)))
+        .map_err(|io_err| map_io_to_socket_err(
+            "Failed to set read timeout on socket: ", io_err))?;
+        eprintln!("read_challenge :: (B)");
+        let mut buf = [0u8; 1024];
+        let size = self.sock.read(&mut buf)
+            .map_err(|io_err| map_io_to_socket_err(
+                "Failed to read from socket: ", io_err))?;
+        // let mut reader = BufReader::new(&mut self.sock);
+        // let mut buf = Vec::new();
+        // reader.read_until(b'\n', &mut buf)
+        //     .map_err(|io_err| map_io_to_socket_err(
+        //         format!("Failed to read authentication challenge {:?}: ", std::str::from_utf8(&buf[..]).unwrap()).as_str(), io_err))?;
+        // eprintln!("read_challenge :: (C)");
+        // if buf.last().map(|c| *c).unwrap_or(b'\0') != b'\n' {
+        //     return Err(Error {
+        //         code: ErrorCode::SocketError,
+        //         msg: format!("Received incomplete auth challenge {:?}.", buf)});
+        // }
+        // buf.pop();  // b'\n'
+        eprintln!("read_challenge :: (D)");
+        let str_buf = std::str::from_utf8(&buf[..size]).unwrap();
+        eprintln!("read_challenge :: (E) buf: {:?}", str_buf);
+        Ok(buf.to_vec())
+    }
+
+    fn authenticate(&mut self, username: &str, private_key: &str) -> Result<()> {
+        eprintln!("authenticate :: (A)");
+        self.send_username(username)?;
+        eprintln!("authenticate :: (B)");
+        self.read_challenge()?;
+        eprintln!("authenticate :: (C)");
+        Err(Error{code: ErrorCode::InvalidApiCall, msg: "nyi".to_owned()})
+    }
+
     fn check_state(&mut self, op: Op) -> Result<()> {
         if (self.state as isize & op as isize) > 0 {
             return Ok(());

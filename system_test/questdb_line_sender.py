@@ -61,6 +61,10 @@ class c_line_sender_name(ctypes.Structure):
     _fields_ = [("len", c_size_t),
                 ("buf", c_char_p)]
 c_line_sender_name_p = ctypes.POINTER(c_line_sender_name)
+class c_line_sender_sec_opts(ctypes.Structure):
+    _fields_ = [("auth_username", c_char_p),
+                ("auth_private_key", c_char_p)]
+c_line_sender_sec_opts_p = ctypes.POINTER(c_line_sender_sec_opts)
 
 
 def _setup_cdll():
@@ -118,6 +122,14 @@ def _setup_cdll():
         c_char_p,
         c_char_p,
         c_char_p,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_connect_secure,
+        c_line_sender_p,
+        c_char_p,
+        c_char_p,
+        c_char_p,
+        c_line_sender_sec_opts_p,
         c_line_sender_error_p_p)
     set_sig(
         dll.line_sender_must_close,
@@ -273,22 +285,35 @@ class LineSender:
             host,
             port,
             *,
-            interface='0.0.0.0'):
+            interface='0.0.0.0',
+            auth=None):
         self._impl = None
-        self._connect_args = (
+        if auth:
+            # We need to keep bytes objects around or they get GCd before
+            # native C call.
+            self._c_auth = (
+                auth[0].encode('utf-8'),
+                auth[1].encode('utf-8'))
+            self._sec_opts = c_line_sender_sec_opts(
+                self._c_auth[0], self._c_auth[1])
+        else:
+            self._sec_opts = None
+        self._connect_secure_args = (
             interface.encode('ascii'),
             host.encode('ascii'),
-            str(port).encode('ascii'))
+            str(port).encode('ascii'),
+            self._sec_opts)
 
     def connect(self):
         if self._impl:
             raise LineSenderError('Already connected')
 
         self._impl = _error_wrapped_call(
-            _DLL.line_sender_connect,
-            self._connect_args[0],
-            self._connect_args[1],
-            self._connect_args[2])
+            _DLL.line_sender_connect_secure,
+            self._connect_secure_args[0],
+            self._connect_secure_args[1],
+            self._connect_secure_args[2],
+            self._connect_secure_args[3])
 
     def __enter__(self):
         self.connect()

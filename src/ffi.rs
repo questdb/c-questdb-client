@@ -139,6 +139,14 @@ fn describe_buf(buf: &[u8]) -> String {
     output
 }
 
+fn set_err_out(err_out: *mut *mut line_sender_error, code: super::ErrorCode, msg: String) {
+    let err = line_sender_error(super::Error{
+        code: code,
+        msg: msg});
+    let err_ptr = Box::into_raw(Box::new(err));
+    unsafe { *err_out = err_ptr };
+}
+
 fn unwrap_utf8(buf: &[u8], err_out: *mut *mut line_sender_error) -> Option<&str> {
     match str::from_utf8(buf) {
         Ok(str_ref) => {
@@ -163,11 +171,7 @@ fn unwrap_utf8(buf: &[u8], err_out: *mut *mut line_sender_error) -> Option<&str>
                         buf_descr,
                         u8err.valid_up_to())
                 };
-            let err = line_sender_error(super::Error{
-                code: super::ErrorCode::InvalidUtf8,
-                msg: msg});
-            let err_ptr = Box::into_raw(Box::new(err));
-            unsafe { *err_out = err_ptr };
+            set_err_out(err_out, super::ErrorCode::InvalidUtf8, msg);
             None
         }
     }
@@ -304,6 +308,53 @@ pub extern "C" fn line_sender_connect(
         err_out)
 }
 
+fn set_sec_opts(
+    builder: &mut super::LineSenderBuilder,
+    sec_opts: *const line_sender_sec_opts,
+    err_out: *mut *mut line_sender_error) -> bool
+{
+    if sec_opts.is_null() {
+        return true;
+    }
+
+    let auth_username = unsafe { (*sec_opts).auth_username };
+    let auth_private_key = unsafe { (*sec_opts).auth_private_key };
+
+    if auth_username.is_null() && auth_private_key.is_null() {
+        return true;
+    }
+    else if auth_username.is_null() || auth_private_key.is_null() {
+        set_err_out(
+            err_out,
+            super::ErrorCode::InvalidApiCall,
+            if auth_username.is_null() {
+                "Must specify 'auth_username' if auth_private_key is set."
+            } else {
+                "Must specify 'auth_private_key' if auth_username is set."
+            }.to_owned());
+        return false;
+    }
+
+    let auth_username =
+        if let Some(str_ref) = unwrap_utf8(unsafe {CStr::from_ptr(auth_username)}.to_bytes(), err_out) {
+            str_ref
+        }
+        else {
+            return false;
+        };
+
+    let auth_private_key =
+        if let Some(str_ref) = unwrap_utf8(unsafe {CStr::from_ptr(auth_private_key)}.to_bytes(), err_out) {
+            str_ref
+        }
+        else {
+            return false;
+        };
+
+    builder.auth(auth_username, auth_private_key);
+    true
+}
+
 /// Synchronously connect securely to the QuestDB database.
 /// @param[in] net_interface Network interface to bind to.
 /// If unsure, to bind to all specify "0.0.0.0".
@@ -351,6 +402,11 @@ pub extern "C" fn line_sender_connect_secure(
     if let Some(net_interface) = net_interface {
         builder.net_interface(net_interface);
     }
+
+    if !set_sec_opts(&mut builder, sec_opts, err_out) {
+        return std::ptr::null_mut();
+    }
+
     let sender = match builder.connect() {
             Ok(sender) => sender,
             Err(err) => {

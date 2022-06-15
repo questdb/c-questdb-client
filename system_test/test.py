@@ -115,7 +115,8 @@ class TestLineSender(unittest.TestCase):
     def _mk_linesender(self):
         return qls.LineSender(
             QDB_FIXTURE.host,
-            QDB_FIXTURE.line_tcp_port)
+            QDB_FIXTURE.line_tcp_port,
+            auth=('a', 'b') if QDB_FIXTURE.auth else None)
 
     def test_insert_three_rows(self):
         table_name = uuid.uuid4().hex
