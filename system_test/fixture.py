@@ -36,6 +36,7 @@ import time
 import socket
 import atexit
 import shlex
+import textwrap
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -238,7 +239,12 @@ class QuestDbFixture:
                 timeout_sec=20,
                 msg='Timed out waiting for HTTP service to come up.')
         except:
-            sys.stderr.write(f'Failed to start, see: {self._log_path}\n')
+            sys.stderr.write(f'Failed to start, see full log: {self._log_path}\n')
+            with open(self._log_path, 'r', encoding='utf-8') as log_file:
+                lines = log_file.readlines()
+                buf = '\n'.join(lines[-100:])
+                sys.stderr.write(textwrap.indent(buf, '    '))
+                sys.stderr.write('\n')
             raise
 
         atexit.register(self.stop)
