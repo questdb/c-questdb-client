@@ -78,7 +78,7 @@ def http_sql_query(sql_query):
     return data
 
 
-def retry_check_table(table_name, min_rows=1, timeout_sec=5):
+def retry_check_table(table_name, min_rows=1, timeout_sec=10):
     def check_table():
         try:
             resp = http_sql_query(f"select * from '{table_name}'")
@@ -442,10 +442,16 @@ class TestLineSender(unittest.TestCase):
         self.assertEqual(scrubbed_dataset, exp_dataset)
 
     def test_c_example(self):
-        self._test_example('line_sender_c_example', 'c_cars')
+        suffix = '_auth' if QDB_FIXTURE.auth else ''
+        self._test_example(
+            f'line_sender_c_example{suffix}',
+            f'c_cars{suffix}')
 
     def test_cpp_example(self):
-        self._test_example('line_sender_cpp_example', 'cpp_cars')
+        suffix = '_auth' if QDB_FIXTURE.auth else ''
+        self._test_example(
+            f'line_sender_cpp_example{suffix}',
+            f'cpp_cars{suffix}')
 
 
 def parse_args():

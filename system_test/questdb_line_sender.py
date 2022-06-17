@@ -62,7 +62,7 @@ class c_line_sender_name(ctypes.Structure):
                 ("buf", c_char_p)]
 c_line_sender_name_p = ctypes.POINTER(c_line_sender_name)
 class c_line_sender_sec_opts(ctypes.Structure):
-    _fields_ = [("auth_username", c_char_p),
+    _fields_ = [("auth_key_id", c_char_p),
                 ("auth_priv_key", c_char_p),
                 ("auth_pub_key_x", c_char_p),
                 ("auth_pub_key_y", c_char_p)]

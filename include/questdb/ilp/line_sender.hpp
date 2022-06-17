@@ -185,6 +185,35 @@ namespace questdb::ilp
     }
 
     /**
+     * Authentication options.
+     */
+    struct sec_opts
+    {
+        sec_opts(
+            std::string_view auth_key_id_,
+            std::string_view auth_priv_key_,
+            std::string_view auth_pub_key_x_,
+            std::string_view auth_pub_key_y_)
+                : auth_key_id{auth_key_id_}
+                , auth_priv_key{auth_priv_key_}
+                , auth_pub_key_x{auth_pub_key_x_}
+                , auth_pub_key_y{auth_pub_key_y_}
+        {}
+
+        /** Authentication key id. AKA "kid". */
+        std::string auth_key_id;
+
+        /** Authentication private key. AKA "d". */
+        std::string auth_priv_key;
+
+        /** Authentication public key X coordinate. AKA "x". */
+        std::string auth_pub_key_x;
+
+        /** Authentication public key Y coordinate. AKA "y". */
+        std::string auth_pub_key_y;
+    };
+
+    /**
      * Insert data into QuestDB via the InfluxDB Line Protocol.
      *
      * Batch up rows, then call `.flush()` to send.
@@ -209,6 +238,29 @@ namespace questdb::ilp
         }
 
         line_sender(
+            const char* host,
+            const char* port,
+            const sec_opts& sec_opts,
+            const char* net_interface = inaddr_any)
+                : _impl{nullptr}
+        {
+            ::line_sender_error* c_err{nullptr};
+            ::line_sender_sec_opts c_sec_opts;
+            c_sec_opts.auth_key_id = sec_opts.auth_key_id.c_str();
+            c_sec_opts.auth_priv_key = sec_opts.auth_priv_key.c_str();
+            c_sec_opts.auth_pub_key_x = sec_opts.auth_pub_key_x.c_str();
+            c_sec_opts.auth_pub_key_y = sec_opts.auth_pub_key_y.c_str();
+            _impl = ::line_sender_connect_secure(
+                net_interface,
+                host,
+                port,
+                &c_sec_opts,
+                &c_err);
+            if (!_impl)
+                throw line_sender_error::from_c(c_err);
+        }
+
+        line_sender(
             std::string_view host,
             std::string_view port,
             std::string_view net_interface = inaddr_any)
@@ -220,11 +272,35 @@ namespace questdb::ilp
 
         line_sender(
             std::string_view host,
+            std::string_view port,
+            const sec_opts& sec_opts,
+            std::string_view net_interface = inaddr_any)
+                : line_sender{
+                    std::string{host}.c_str(),
+                    std::string{port}.c_str(),
+                    sec_opts,
+                    std::string{net_interface}.c_str()}
+        {}
+
+        line_sender(
+            std::string_view host,
             uint16_t port,
             std::string_view net_interface = inaddr_any)
                 : line_sender{
                     std::string{host}.c_str(),
                     std::to_string(port).c_str(),
+                    std::string{net_interface}.c_str()}
+        {}
+
+        line_sender(
+            std::string_view host,
+            uint16_t port,
+            const sec_opts& sec_opts,
+            std::string_view net_interface = inaddr_any)
+                : line_sender{
+                    std::string{host}.c_str(),
+                    std::to_string(port).c_str(),
+                    sec_opts,
                     std::string{net_interface}.c_str()}
         {}
 
@@ -235,6 +311,18 @@ namespace questdb::ilp
                 : line_sender{
                     host,
                     std::to_string(port).c_str(),
+                    net_interface}
+        {}
+
+        line_sender(
+            const char* host,
+            uint16_t port,
+            const sec_opts& sec_opts,
+            const char* net_interface = inaddr_any)
+                : line_sender{
+                    host,
+                    std::to_string(port).c_str(),
+                    sec_opts,
                     net_interface}
         {}
 

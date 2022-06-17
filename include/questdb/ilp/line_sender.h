@@ -145,21 +145,21 @@ bool line_sender_name_init(
  */
 typedef struct line_sender line_sender;
 
-/*
+/**
  * Authentication options.
  */
 typedef struct line_sender_sec_opts
 {
-    /** Authentication username. */
-    const char* auth_username;
+    /** Authentication key id. AKA "kid". */
+    const char* auth_key_id;
 
-    /** Authentication private key. */
+    /** Authentication private key. AKA "d". */
     const char* auth_priv_key;
 
-    /** Authentication public key X coordinate. */
+    /** Authentication public key X coordinate. AKA "x". */
     const char* auth_pub_key_x;
 
-    /** Authentication public key Y coordinate. */
+    /** Authentication public key Y coordinate. AKA "y". */
     const char* auth_pub_key_y;
 } line_sender_sec_opts;
 

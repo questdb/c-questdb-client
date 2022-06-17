@@ -238,20 +238,21 @@ macro_rules! bubble_err_to_c {
     };
 }
 
+/// Authentication options.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct line_sender_sec_opts
 {
-    /// Authentication username. Auth is disabled if NULL.
-    auth_username : *const libc::c_char,
+    /// Authentication key_id. AKA "kid".
+    auth_key_id : *const libc::c_char,
 
-    /// Authentication private key. Auth is disabled if NULL.
+    /// Authentication private key. AKA "d".
     auth_priv_key : *const libc::c_char,
 
-    /// Authentication public key X coordinate.
+    /// Authentication public key X coordinate. AKA "x".
     auth_pub_key_x : * const libc::c_char,
 
-    /// Authentication public key Y coordinate.
+    /// Authentication public key Y coordinate. AKA "y".
     auth_pub_key_y : * const libc::c_char
 }
 
@@ -328,16 +329,16 @@ fn set_sec_opts(
         return true;
     }
 
-    let auth_username = unsafe { (*sec_opts).auth_username };
+    let auth_key_id = unsafe { (*sec_opts).auth_key_id };
     let auth_priv_key = unsafe { (*sec_opts).auth_priv_key };
     let auth_pub_key_x = unsafe { (*sec_opts).auth_pub_key_x };
     let auth_pub_key_y = unsafe { (*sec_opts).auth_pub_key_y };
 
-    if auth_username.is_null() && auth_priv_key.is_null() &&
+    if auth_key_id.is_null() && auth_priv_key.is_null() &&
        auth_pub_key_x.is_null() && auth_pub_key_y.is_null() {
         return true;
     }
-    else if auth_username.is_null() || auth_priv_key.is_null() ||
+    else if auth_key_id.is_null() || auth_priv_key.is_null() ||
             auth_pub_key_x.is_null() || auth_pub_key_y.is_null() {
         set_err_out(
             err_out,
@@ -346,8 +347,8 @@ fn set_sec_opts(
         return false;
     }
 
-    let auth_username =
-        if let Some(str_ref) = unwrap_utf8(unsafe {CStr::from_ptr(auth_username)}.to_bytes(), err_out) {
+    let auth_key_id =
+        if let Some(str_ref) = unwrap_utf8(unsafe {CStr::from_ptr(auth_key_id)}.to_bytes(), err_out) {
             str_ref
         }
         else {
@@ -378,7 +379,7 @@ fn set_sec_opts(
             return false;
         };
 
-    builder.auth(auth_username, auth_priv_key, auth_pub_key_x, auth_pub_key_y);
+    builder.auth(auth_key_id, auth_priv_key, auth_pub_key_x, auth_pub_key_y);
     true
 }
 
