@@ -35,6 +35,11 @@ stages:
             fetchDepth: 1
             lfs: false
             submodules: false
+          - task: JavaToolInstaller@0
+            inputs:
+            versionSpec: '11'
+            jdkArchitectureOption: 'x64'
+            jdkSourceOption: 'PreInstalled'
           - bash: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DQUESTDB_SYSTEM_TESTING=ON
             displayName: "Build Makefile with CMake"
           - bash: (cd build && make)
