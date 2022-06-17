@@ -9,8 +9,8 @@ variables:
   Linux-X64: linux
 
 stages:
-  - stage: BuildBinaries
-    displayName: "Building binaries"
+  - stage: BuildAndTest
+    displayName: "Building and testing"
     jobs:
       - job: RunOn
         displayName: "on"
