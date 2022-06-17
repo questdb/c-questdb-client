@@ -59,10 +59,13 @@ typedef enum line_sender_error_code
     line_sender_error_invalid_utf8,
 
     /** The table name, symbol name or column name contains bad characters. */
-    line_sender_error_invalid_name
+    line_sender_error_invalid_name,
+
+    /** Error during the authentication process. */
+    line_sender_error_auth_error
 } line_sender_error_code;
 
-/** Error code categorising the error. */
+/** Error code categorizing the error. */
 LINESENDER_API
 line_sender_error_code line_sender_error_get_code(const line_sender_error*);
 
@@ -147,11 +150,17 @@ typedef struct line_sender line_sender;
  */
 typedef struct line_sender_sec_opts
 {
-    /** Authentication username. Auth is disabled if NULL. */
-    const char* auth_user_name;
+    /** Authentication username. */
+    const char* auth_username;
 
-    /** Authentication private key. Auth is disabled if NULL. */
-    const char* auth_private_key;
+    /** Authentication private key. */
+    const char* auth_priv_key;
+
+    /** Authentication public key X coordinate. */
+    const char* auth_pub_key_x;
+
+    /** Authentication public key Y coordinate. */
+    const char* auth_pub_key_y;
 } line_sender_sec_opts;
 
 /**

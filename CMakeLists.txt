@@ -40,6 +40,11 @@ if(WIN32)
         questdb_client-shared
         INTERFACE wsock32 ws2_32)
 endif(WIN32)
+if(APPLE)
+    target_link_libraries(
+        questdb_client
+        INTERFACE "-framework Security")
+endif()
 
 function(set_compile_flags TARGET_NAME)
     if(MSVC)

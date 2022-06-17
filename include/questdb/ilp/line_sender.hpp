@@ -53,11 +53,14 @@ namespace questdb::ilp
         invalid_utf8,
 
         /** The table name, symbol name or column name contains bad characters. */
-        invalid_name
+        invalid_name,
+
+        /** Error during the authentication process. */
+        auth_error
     };
 
     /**
-     * An error that occured when using the line sender.
+     * An error that occurred when using the line sender.
      *
      * Call `.what()` to obtain ASCII encoded error message.
      */

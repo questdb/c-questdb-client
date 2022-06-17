@@ -51,7 +51,10 @@ pub enum line_sender_error_code {
     line_sender_error_invalid_utf8,
 
     /// The table name, symbol name or column name contains bad characters.
-    line_sender_error_invalid_name
+    line_sender_error_invalid_name,
+
+    /** Error during the authentication process. */
+    line_sender_error_auth_error
 }
 
 impl From<super::ErrorCode> for line_sender_error_code {
@@ -67,6 +70,8 @@ impl From<super::ErrorCode> for line_sender_error_code {
                 line_sender_error_code::line_sender_error_invalid_utf8,
             super::ErrorCode::InvalidName =>
                 line_sender_error_code::line_sender_error_invalid_name,
+            super::ErrorCode::AuthError =>
+                line_sender_error_code::line_sender_error_auth_error
         }
     }
 }
@@ -241,7 +246,13 @@ pub struct line_sender_sec_opts
     auth_username : *const libc::c_char,
 
     /// Authentication private key. Auth is disabled if NULL.
-    auth_private_key : *const libc::c_char,
+    auth_priv_key : *const libc::c_char,
+
+    /// Authentication public key X coordinate.
+    auth_pub_key_x : * const libc::c_char,
+
+    /// Authentication public key Y coordinate.
+    auth_pub_key_y : * const libc::c_char
 }
 
 
@@ -318,20 +329,20 @@ fn set_sec_opts(
     }
 
     let auth_username = unsafe { (*sec_opts).auth_username };
-    let auth_private_key = unsafe { (*sec_opts).auth_private_key };
+    let auth_priv_key = unsafe { (*sec_opts).auth_priv_key };
+    let auth_pub_key_x = unsafe { (*sec_opts).auth_pub_key_x };
+    let auth_pub_key_y = unsafe { (*sec_opts).auth_pub_key_y };
 
-    if auth_username.is_null() && auth_private_key.is_null() {
+    if auth_username.is_null() && auth_priv_key.is_null() &&
+       auth_pub_key_x.is_null() && auth_pub_key_y.is_null() {
         return true;
     }
-    else if auth_username.is_null() || auth_private_key.is_null() {
+    else if auth_username.is_null() || auth_priv_key.is_null() ||
+            auth_pub_key_x.is_null() || auth_pub_key_y.is_null() {
         set_err_out(
             err_out,
             super::ErrorCode::InvalidApiCall,
-            if auth_username.is_null() {
-                "Must specify 'auth_username' if auth_private_key is set."
-            } else {
-                "Must specify 'auth_private_key' if auth_username is set."
-            }.to_owned());
+            "Must specify all or no auth parameters.".to_owned());
         return false;
     }
 
@@ -343,15 +354,31 @@ fn set_sec_opts(
             return false;
         };
 
-    let auth_private_key =
-        if let Some(str_ref) = unwrap_utf8(unsafe {CStr::from_ptr(auth_private_key)}.to_bytes(), err_out) {
+    let auth_priv_key =
+        if let Some(str_ref) = unwrap_utf8(unsafe {CStr::from_ptr(auth_priv_key)}.to_bytes(), err_out) {
             str_ref
         }
         else {
             return false;
         };
 
-    builder.auth(auth_username, auth_private_key);
+    let auth_pub_key_x =
+        if let Some(str_ref) = unwrap_utf8(unsafe {CStr::from_ptr(auth_pub_key_x)}.to_bytes(), err_out) {
+            str_ref
+        }
+        else {
+            return false;
+        };
+
+    let auth_pub_key_y =
+        if let Some(str_ref) = unwrap_utf8(unsafe {CStr::from_ptr(auth_pub_key_y)}.to_bytes(), err_out) {
+            str_ref
+        }
+        else {
+            return false;
+        };
+
+    builder.auth(auth_username, auth_priv_key, auth_pub_key_x, auth_pub_key_y);
     true
 }
 

@@ -63,7 +63,9 @@ class c_line_sender_name(ctypes.Structure):
 c_line_sender_name_p = ctypes.POINTER(c_line_sender_name)
 class c_line_sender_sec_opts(ctypes.Structure):
     _fields_ = [("auth_username", c_char_p),
-                ("auth_private_key", c_char_p)]
+                ("auth_priv_key", c_char_p),
+                ("auth_pub_key_x", c_char_p),
+                ("auth_pub_key_y", c_char_p)]
 c_line_sender_sec_opts_p = ctypes.POINTER(c_line_sender_sec_opts)
 
 
@@ -289,13 +291,18 @@ class LineSender:
             auth=None):
         self._impl = None
         if auth:
-            # We need to keep bytes objects around or they get GCd before
+            # We need to keep bytes objects around or they get GCd before the
             # native C call.
             self._c_auth = (
-                auth[0].encode('utf-8'),
-                auth[1].encode('utf-8'))
+                auth[0].encode('ascii'),
+                auth[1].encode('ascii'),
+                auth[2].encode('ascii'),
+                auth[3].encode('ascii'))
             self._sec_opts = c_line_sender_sec_opts(
-                self._c_auth[0], self._c_auth[1])
+                self._c_auth[0],
+                self._c_auth[1],
+                self._c_auth[2],
+                self._c_auth[3])
         else:
             self._sec_opts = None
         self._connect_secure_args = (

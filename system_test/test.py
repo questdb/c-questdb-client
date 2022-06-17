@@ -50,16 +50,6 @@ from collections import namedtuple
 QDB_FIXTURE: QuestDbFixture = None
 
 
-AUTH_CLIENT_KEYS = {
-  "kty": "EC",
-  "d": "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48",  # PRIVATE_KEY
-  "crv": "P-256",
-  "kid": "testUser1",
-  "x": "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU",  # PUBLIC_KEY.x
-  "y": "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac"   # PUBLIC_KEY.y
-}
-
-
 class QueryError(Exception):
     pass
 
@@ -111,12 +101,31 @@ def ns_to_qdb_date(at_ts_ns):
     return at_td.isoformat() + 'Z'
 
 
+# JWK
+AUTH_CLIENT_KEYS = {
+  "kty": "EC",
+  "d": "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48",  # PRIVATE_KEY
+  "crv": "P-256",
+  "kid": "testUser1",
+  "x": "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU",  # PUBLIC_KEY.x
+  "y": "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac"   # PUBLIC_KEY.y
+}
+
+
+# Py Params
+AUTH = (
+    AUTH_CLIENT_KEYS['kid'],
+    AUTH_CLIENT_KEYS['d'],
+    AUTH_CLIENT_KEYS['x'],
+    AUTH_CLIENT_KEYS['y'])
+
+
 class TestLineSender(unittest.TestCase):
     def _mk_linesender(self):
         return qls.LineSender(
             QDB_FIXTURE.host,
             QDB_FIXTURE.line_tcp_port,
-            auth=('a', 'b') if QDB_FIXTURE.auth else None)
+            auth=AUTH if QDB_FIXTURE.auth else None)
 
     def test_insert_three_rows(self):
         table_name = uuid.uuid4().hex
@@ -268,7 +277,7 @@ class TestLineSender(unittest.TestCase):
             return
         table_name = uuid.uuid4().hex
         at_ts_ns = 1647357688714369403
-        with qls.LineSender('localhost', QDB_FIXTURE.line_tcp_port) as sender:
+        with self._mk_linesender() as sender:
             (sender
                 .table(table_name)
                 .symbol('a', 'A')
