@@ -10,7 +10,7 @@ variables:
 
 stages:
   - stage: BuildBinaries
-    displayName: "Building C++ binaries"
+    displayName: "Building binaries"
     jobs:
       - job: RunOn
         displayName: "on"
@@ -26,7 +26,6 @@ stages:
               poolName: "Azure Pipelines"
               os: macOS
               generator: "CodeBlocks - Unix Makefiles"
-
         pool:
           name: $(poolName)
           vmImage: $(imageName)
@@ -36,8 +35,8 @@ stages:
             fetchDepth: 1
             lfs: false
             submodules: false
-          - bash: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-            displayName: "Build binaries with cmake"
-
+          - bash: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DQUESTDB_SYSTEM_TESTING=ON
+            displayName: "Build Makefile with CMake"
           - bash: (cd build && make)
             displayName: "Make"
+          - bash: (cd build && ctest --verbose)
