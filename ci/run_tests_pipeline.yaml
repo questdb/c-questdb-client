@@ -1,0 +1,47 @@
+trigger: none
+
+variables:
+  OS_MAPPING: none
+  Windows_NT-X86: windows
+  Darwin-X64: osx
+  Darwin-ARM: armosx
+  Linux-ARM: armlinux
+  Linux-X64: linux
+
+stages:
+  - stage: BuildBinaries
+    displayName: "Building C++ binaries"
+    jobs:
+      - job: RunOn
+        displayName: "on"
+        strategy:
+          matrix:
+            linux:
+              imageName: "ubuntu-latest"
+              poolName: "Azure Pipelines"
+              os: Linux
+              jdk: "1.11"
+              generator: "CodeBlocks - Unix Makefiles"
+#            mac:
+#              imageName: "macos-latest"
+#              poolName: "Azure Pipelines"
+#              os: macOS
+#              jdk: "1.11"
+#              generator: "CodeBlocks - Unix Makefiles"
+
+        pool:
+          name: $(poolName)
+          vmImage: $(imageName)
+        timeoutInMinutes: 60
+        steps:
+          - checkout: self
+            fetchDepth: 1
+            lfs: false
+            submodules: false
+          - bash: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+            condition: eq(variables['Agent.OS'], 'Linux')
+            displayName: "Build binaries with cmake"
+
+          - bash: (cd build && make)
+            condition: eq(variables['Agent.OS'], 'Linux')
+            displayName: "Make"
