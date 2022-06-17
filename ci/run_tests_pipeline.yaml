@@ -35,14 +35,9 @@ stages:
             fetchDepth: 1
             lfs: false
             submodules: false
-          # - task: JavaToolInstaller@0
-          #   inputs:
-          #   versionSpec: '11'
-          #   jdkArchitectureOption: 'x64'
-          #   jdkSourceOption: 'PreInstalled'
-          - bash: echo $JAVA_HOME_11_X64
-          - bash: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release #-DQUESTDB_SYSTEM_TESTING=ON
+          - bash: env JAVA_HOME=$JAVA_HOME_11_X64 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DQUESTDB_SYSTEM_TESTING=ON
             displayName: "Build Makefile with CMake"
           - bash: (cd build && make)
             displayName: "Make"
           - bash: (cd build && ctest --verbose)
+            displayName: "Tests"
