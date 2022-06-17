@@ -22,12 +22,6 @@ stages:
               os: Linux
               jdk: "1.11"
               generator: "CodeBlocks - Unix Makefiles"
-#            mac:
-#              imageName: "macos-latest"
-#              poolName: "Azure Pipelines"
-#              os: macOS
-#              jdk: "1.11"
-#              generator: "CodeBlocks - Unix Makefiles"
 
         pool:
           name: $(poolName)
