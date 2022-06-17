@@ -460,10 +460,10 @@ impl LineSender {
         Err(error)
     }
 
-    pub fn table<'a, N, E>(&mut self, name: N) -> Result<()>
+    pub fn table<'a, N>(&mut self, name: N) -> Result<()>
         where
-            N: TryInto<Name<'a>, Error=E>,
-            Error: From<E>
+            N: TryInto<Name<'a>>,
+            Error: From<N::Error>
     {
         let name: Name<'a> = name.try_into()?;
         self.check_state(Op::Table)?;
@@ -472,10 +472,10 @@ impl LineSender {
         Ok(())
     }
 
-    pub fn symbol<'a, N, E>(&mut self, name: N, value: &str) -> Result<()>
+    pub fn symbol<'a, N>(&mut self, name: N, value: &str) -> Result<()>
         where
-            N: TryInto<Name<'a>, Error=E>,
-            Error: From<E>
+            N: TryInto<Name<'a>>,
+            Error: From<N::Error>
     {
         let name: Name<'a> = name.try_into()?;
         self.check_state(Op::Symbol)?;
@@ -487,10 +487,10 @@ impl LineSender {
         Ok(())
     }
 
-    fn write_column_key<'a, N, E>(&mut self, name: N) -> Result<()>
+    fn write_column_key<'a, N>(&mut self, name: N) -> Result<()>
         where
-            N: TryInto<Name<'a>, Error=E>,
-            Error: From<E>
+            N: TryInto<Name<'a>>,
+            Error: From<N::Error>
     {
         let name: Name<'a> = name.try_into()?;
         self.check_state(Op::Column)?;
@@ -506,30 +506,30 @@ impl LineSender {
         Ok(())
     }
 
-    pub fn column_bool<'a, N, E>(&mut self, name: N, value: bool) -> Result<()>
+    pub fn column_bool<'a, N>(&mut self, name: N, value: bool) -> Result<()>
         where
-            N: TryInto<Name<'a>, Error=E>,
-            Error: From<E>
+            N: TryInto<Name<'a>>,
+            Error: From<N::Error>
     {
         self.write_column_key(name)?;
         self.output.push(if value {'t'} else {'f'});
         Ok(())
     }
 
-    pub fn column_i64<'a, N, E>(&mut self, name: N, value: i64) -> Result<()>
+    pub fn column_i64<'a, N>(&mut self, name: N, value: i64) -> Result<()>
         where
-            N: TryInto<Name<'a>, Error=E>,
-            Error: From<E>
+            N: TryInto<Name<'a>>,
+            Error: From<N::Error>
     {
         self.write_column_key(name)?;
         write!(&mut self.output, "{}i", value).unwrap();
         Ok(())
     }
 
-    pub fn column_f64<'a, N, E>(&mut self, name: N, value: f64) -> Result<()>
+    pub fn column_f64<'a, N>(&mut self, name: N, value: f64) -> Result<()>
         where
-            N: TryInto<Name<'a>, Error=E>,
-            Error: From<E>
+            N: TryInto<Name<'a>>,
+            Error: From<N::Error>
     {
         self.write_column_key(name)?;
         if value == f64::INFINITY {
@@ -544,10 +544,10 @@ impl LineSender {
         Ok(())
     }
 
-    pub fn column_str<'a, N, E>(&mut self, name: N, value: &str) -> Result<()>
+    pub fn column_str<'a, N>(&mut self, name: N, value: &str) -> Result<()>
         where
-            N: TryInto<Name<'a>, Error=E>,
-            Error: From<E>
+            N: TryInto<Name<'a>>,
+            Error: From<N::Error>
     {
         self.write_column_key(name)?;
         write_escaped_quoted(&mut self.output, value);
