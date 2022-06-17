@@ -37,9 +37,7 @@ stages:
             lfs: false
             submodules: false
           - bash: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-            condition: eq(variables['Agent.OS'], 'Linux')
             displayName: "Build binaries with cmake"
 
           - bash: (cd build && make)
-            condition: eq(variables['Agent.OS'], 'Linux')
             displayName: "Make"
