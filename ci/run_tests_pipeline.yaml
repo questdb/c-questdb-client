@@ -49,8 +49,7 @@ stages:
               JAVA_HOME: $(JAVA_HOME_11_X64)
             displayName: "Make"
           - script: |
-              cd build
-              ctest -C Release --rerun-failed --output-on-failure
+              cmake --build build --target test
             env:
               JAVA_HOME: $(JAVA_HOME_11_X64)
             displayName: "Tests"
