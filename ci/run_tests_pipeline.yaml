@@ -35,15 +35,17 @@ stages:
             fetchDepth: 1
             lfs: false
             submodules: false
-          - bash: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DQUESTDB_SYSTEM_TESTING=ON
+          - script: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DQUESTDB_SYSTEM_TESTING=ON
             env:
               JAVA_HOME: $(JAVA_HOME_11_X64)
             displayName: "Build Makefile with CMake"
-          - bash: (cd build && make)
+          - script: |
+              cd build
+              make
             env:
               JAVA_HOME: $(JAVA_HOME_11_X64)
             displayName: "Make"
-          - bash: (cd build && ctest --verbose)
+          - script: (cd build && ctest --verbose)
             env:
               JAVA_HOME: $(JAVA_HOME_11_X64)
             displayName: "Tests"
