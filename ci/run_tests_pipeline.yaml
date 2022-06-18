@@ -31,16 +31,23 @@ stages:
           vmImage: $(imageName)
         timeoutInMinutes: 60
         steps:
-          - task: JavaToolInstaller@0
-            inputs:
-              versionSpec: '11'
-              jdkArchitectureOption: 'x86'
-              jdkSourceOption: 'PreInstalled'
           - checkout: self
             fetchDepth: 1
             lfs: false
             submodules: false
-          - bash: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DQUESTDB_SYSTEM_TESTING=ON
+          - script: |
+              java -version
+            env:
+              JAVA_HOME: $(JAVA_HOME_8_X64)
+              PATH: $(JAVA_HOME_8_X64)/bin:$(PATH)
+            displayName: "Setting java version"
+          # - script: |
+          #     java -version
+          #   env:
+          #     JAVA_HOME: $(JAVA_HOME_8_X64)
+          #     PATH: $(JAVA_HOME_8_X64)/bin;$(PATH)  # windows
+          #   displayName: "Setting java version"
+          - bash: env JAVA_HOME=$JAVA_HOME_11_X64 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DQUESTDB_SYSTEM_TESTING=ON
             displayName: "Build Makefile with CMake"
           - bash: (cd build && make)
             displayName: "Make"
