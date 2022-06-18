@@ -50,7 +50,7 @@ stages:
             displayName: "Make"
           - script: |
               cd build
-              ctest -C Release
+              ctest -C Release --rerun-failed --output-on-failure
             env:
               JAVA_HOME: $(JAVA_HOME_11_X64)
             displayName: "Tests"
