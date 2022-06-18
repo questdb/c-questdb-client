@@ -40,7 +40,7 @@ stages:
             fetchDepth: 1
             lfs: false
             submodules: false
-          - script: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DQUESTDB_SYSTEM_TESTING=ON
+          - script: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
             env:
               JAVA_HOME: $(JAVA_HOME_11_X64)
             displayName: "Build Makefile with CMake"
@@ -48,9 +48,7 @@ stages:
             env:
               JAVA_HOME: $(JAVA_HOME_11_X64)
             displayName: "Make"
-          - script: |
-              cd build
-              ctest -C Release -L tests --rerun-failed --output-on-failure
+          - script: python3 ci/run_all_tests.py
             env:
               JAVA_HOME: $(JAVA_HOME_11_X64)
             displayName: "Tests"
