@@ -44,13 +44,13 @@ stages:
             env:
               JAVA_HOME: $(JAVA_HOME_11_X64)
             displayName: "Build Makefile with CMake"
-          - script: |
-              cd build
-              make
+          - script: cmake --build build
             env:
               JAVA_HOME: $(JAVA_HOME_11_X64)
             displayName: "Make"
-          - script: (cd build && ctest --verbose)
+          - script: |
+              cd build
+              ctest
             env:
               JAVA_HOME: $(JAVA_HOME_11_X64)
             displayName: "Tests"
