@@ -92,6 +92,9 @@ function(compile_test TARGET_NAME)
     add_test(
         NAME ${TARGET_NAME}
         COMMAND ${TARGET_NAME})
+    set_tests_properties(
+        ${TARGET_NAME}
+        PROPERTIES LABELS "tests")
 endfunction()
 
 compile_test(
