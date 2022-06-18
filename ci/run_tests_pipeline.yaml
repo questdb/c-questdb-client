@@ -38,8 +38,8 @@ stages:
           - script: |
               java -version
             env:
-              JAVA_HOME: $(JAVA_HOME_8_X64)
-              PATH: $(JAVA_HOME_8_X64)/bin:$(PATH)
+              JAVA_HOME: $(JAVA_HOME_11_X64)
+              PATH: $(JAVA_HOME_11_X64)/bin:$(PATH)
             displayName: "Setting java version"
           # - script: |
           #     java -version
@@ -47,7 +47,7 @@ stages:
           #     JAVA_HOME: $(JAVA_HOME_8_X64)
           #     PATH: $(JAVA_HOME_8_X64)/bin;$(PATH)  # windows
           #   displayName: "Setting java version"
-          - bash: env JAVA_HOME=$JAVA_HOME_11_X64 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DQUESTDB_SYSTEM_TESTING=ON
+          - bash: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DQUESTDB_SYSTEM_TESTING=ON
             displayName: "Build Makefile with CMake"
           - bash: (cd build && make)
             displayName: "Make"
