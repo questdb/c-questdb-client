@@ -35,21 +35,15 @@ stages:
             fetchDepth: 1
             lfs: false
             submodules: false
-          - script: |
-              java -version
+          - bash: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DQUESTDB_SYSTEM_TESTING=ON
             env:
               JAVA_HOME: $(JAVA_HOME_11_X64)
-              PATH: $(JAVA_HOME_11_X64)/bin:$(PATH)
-            displayName: "Setting java version"
-          # - script: |
-          #     java -version
-          #   env:
-          #     JAVA_HOME: $(JAVA_HOME_8_X64)
-          #     PATH: $(JAVA_HOME_8_X64)/bin;$(PATH)  # windows
-          #   displayName: "Setting java version"
-          - bash: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DQUESTDB_SYSTEM_TESTING=ON
             displayName: "Build Makefile with CMake"
           - bash: (cd build && make)
+            env:
+              JAVA_HOME: $(JAVA_HOME_11_X64)
             displayName: "Make"
           - bash: (cd build && ctest --verbose)
+            env:
+              JAVA_HOME: $(JAVA_HOME_11_X64)
             displayName: "Tests"
