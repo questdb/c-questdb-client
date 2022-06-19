@@ -78,7 +78,7 @@ def http_sql_query(sql_query):
     return data
 
 
-def retry_check_table(table_name, min_rows=1, timeout_sec=10):
+def retry_check_table(table_name, min_rows=1, timeout_sec=30):
     def check_table():
         try:
             resp = http_sql_query(f"select * from '{table_name}'")
@@ -122,7 +122,7 @@ class TestLineSender(unittest.TestCase):
 
             sender.flush()
 
-        resp = retry_check_table(table_name)
+        resp = retry_check_table(table_name, min_rows=3)
         exp_columns = [
             {'name': 'name_a', 'type': 'SYMBOL'},
             {'name': 'name_b', 'type': 'BOOLEAN'},
