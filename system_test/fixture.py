@@ -161,7 +161,7 @@ def _find_java():
     java_home = os.environ.get('JAVA_HOME')
     if java_home:
         search_path = pathlib.Path(java_home) / 'bin'
-    return shutil.which('java', path=search_path)
+    return shutil.which('java', path=str(search_path))
 
 
 class QuestDbFixture:
