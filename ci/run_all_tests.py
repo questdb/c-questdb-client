@@ -22,17 +22,25 @@ import platform
 import subprocess
 
 
+def run_cmd(*args):
+    sys.stderr.write(f'About to run: {args!r}:\n')
+    try:
+        subprocess.check_call(args)
+        sys.stderr.write(f'Success running: {args!r}.\n')
+    except subprocess.CalledProcessError as cpe:
+        sys.stderr.write(f'Command {args!r} failed with return code {cpe.returncode}.\n')
+        sys.exit(cpe.returncode)
+
+
 def main():
     build_dir = pathlib.Path('build')
     exe_suffix = '.exe' if platform.system() == 'Windows' else ''
     test_line_sender_path = next(iter(
         build_dir.glob(f'**/test_line_sender{exe_suffix}')))
     system_test_path = pathlib.Path('system_test') / 'test.py'
-    try:
-        subprocess.check_call([str(test_line_sender_path)])
-        subprocess.check_call(['python3', str(system_test_path), 'run', '-v'])
-    except subprocess.CalledProcessError as cpe:
-        sys.exit(cpe.returncode)
+
+    run_cmd(str(test_line_sender_path))
+    run_cmd('python3', str(system_test_path), 'run', '-v')
 
 
 if __name__ == '__main__':
