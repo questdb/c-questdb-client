@@ -29,8 +29,8 @@ def main():
         build_dir.glob(f'**/test_line_sender{exe_suffix}')))
     system_test_path = pathlib.Path('system_test') / 'test.py'
     try:
-        subprocess.check_call([test_line_sender_path])
-        subprocess.check_call(['python3', system_test_path, 'run', '-v'])
+        subprocess.check_call([str(test_line_sender_path)])
+        subprocess.check_call(['python3', str(system_test_path), 'run', '-v'])
     except subprocess.CalledProcessError as cpe:
         sys.exit(cpe.returncode)
 
