@@ -61,7 +61,7 @@ def http_sql_query(sql_query):
         urllib.parse.urlencode({'query': sql_query}))
     buf = None
     try:
-        resp = urllib.request.urlopen(url, timeout=2)
+        resp = urllib.request.urlopen(url, timeout=5)
         buf = resp.read()
     except urllib.error.HTTPError as http_error:
         buf = http_error.read()

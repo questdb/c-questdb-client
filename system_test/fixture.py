@@ -100,7 +100,7 @@ def list_questdb_releases(max_results=1):
             'User-Agent': 'system-testing-script',
             'Accept': "Accept: application/vnd.github.v3+json"},
         method='GET')
-    resp = urllib.request.urlopen(req)
+    resp = urllib.request.urlopen(req, timeout=30)
     data = resp.read()
     releases = json.loads(data.decode('utf8'))
     for release in releases:
@@ -125,7 +125,7 @@ def install_questdb(vers: str, download_url: str):
     sys.stderr.write(f'Downloading QuestDB v.{vers} from {download_url!r}.\n')
     archive_path = proj.questdb_downloads_dir / f'{vers}.tar.gz'
 
-    response = urllib.request.urlopen(download_url)
+    response = urllib.request.urlopen(download_url, timeout=300)
     data = response.read()
     with open(archive_path, 'wb') as archive_file:
         archive_file.write(data)
