@@ -20,17 +20,18 @@ stages:
               imageName: "ubuntu-latest"
               poolName: "Azure Pipelines"
               os: Linux
-              generator: "CodeBlocks - Unix Makefiles"
             mac:
               imageName: "macos-latest"
               poolName: "Azure Pipelines"
               os: macOS
-              generator: "CodeBlocks - Unix Makefiles"
-            windows:
-              imageName: "windows-latest"
+            windows2022:
+              imageName: "windows-2022"
               poolName: "Azure Pipelines"
               os: Windows
-              generator: "CodeBlocks - Unix Makefiles"
+            windows2019:
+              imageName: "windows-2019"
+              poolName: "Azure Pipelines"
+              os: Windows
         pool:
           name: $(poolName)
           vmImage: $(imageName)
