@@ -19,23 +19,23 @@ stages:
             linux:
               imageName: "ubuntu-latest"
               poolName: "Azure Pipelines"
-              BUILD_WITH_MINGW: false
+              BUILD_WITH_MINGW: "0"
             mac:
               imageName: "macos-latest"
               poolName: "Azure Pipelines"
-              BUILD_WITH_MINGW: false
+              BUILD_WITH_MINGW: "0"
             windows-msvc-2022:
               imageName: "windows-2022"
               poolName: "Azure Pipelines"
-              BUILD_WITH_MINGW: false
+              BUILD_WITH_MINGW: "0"
             windows-msvc-2019:
               imageName: "windows-2019"
               poolName: "Azure Pipelines"
-              BUILD_WITH_MINGW: false
+              BUILD_WITH_MINGW: "0"
             windows-mingw:
               imageName: "windows-2022"
               poolName: "Azure Pipelines"
-              BUILD_WITH_MINGW: true
+              BUILD_WITH_MINGW: "1"
         pool:
           name: $(poolName)
           vmImage: $(imageName)
@@ -49,12 +49,12 @@ stages:
             env:
               JAVA_HOME: $(JAVA_HOME_11_X64)
             displayName: "Build Makefile with CMake"
-            condition: eq(variables['BUILD_WITH_MINGW'], false)
+            condition: eq(variables['BUILD_WITH_MINGW'], '0')
           - script: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -G "MinGW Makefiles"
             env:
               JAVA_HOME: $(JAVA_HOME_11_X64)
             displayName: "Build Makefile with CMake"
-            condition: eq(variables['BUILD_WITH_MINGW'], true)
+            condition: eq(variables['BUILD_WITH_MINGW'], '1')
           - script: cmake --build build
             env:
               JAVA_HOME: $(JAVA_HOME_11_X64)
