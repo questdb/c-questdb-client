@@ -51,6 +51,7 @@ stages:
             displayName: "Build Makefile with CMake"
             condition: eq(variables['BUILD_WITH_MINGW'], '0')
           - script: |
+              choco install mingw -y
               rustup target add x86_64-pc-windows-gnu
               cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -G "MinGW Makefiles"
             env:
