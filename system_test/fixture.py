@@ -36,6 +36,7 @@ import time
 import socket
 import atexit
 import shlex
+import textwrap
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -99,7 +100,7 @@ def list_questdb_releases(max_results=1):
             'User-Agent': 'system-testing-script',
             'Accept': "Accept: application/vnd.github.v3+json"},
         method='GET')
-    resp = urllib.request.urlopen(req)
+    resp = urllib.request.urlopen(req, timeout=30)
     data = resp.read()
     releases = json.loads(data.decode('utf8'))
     for release in releases:
@@ -124,7 +125,7 @@ def install_questdb(vers: str, download_url: str):
     sys.stderr.write(f'Downloading QuestDB v.{vers} from {download_url!r}.\n')
     archive_path = proj.questdb_downloads_dir / f'{vers}.tar.gz'
 
-    response = urllib.request.urlopen(download_url)
+    response = urllib.request.urlopen(download_url, timeout=300)
     data = response.read()
     with open(archive_path, 'wb') as archive_file:
         archive_file.write(data)
@@ -160,7 +161,7 @@ def _find_java():
     java_home = os.environ.get('JAVA_HOME')
     if java_home:
         search_path = pathlib.Path(java_home) / 'bin'
-    return shutil.which('java', path=search_path)
+    return shutil.which('java', path=str(search_path))
 
 
 class QuestDbFixture:
@@ -205,7 +206,7 @@ class QuestDbFixture:
             '-p', str(self._root_dir / 'bin' / 'questdb.jar'),
             '-m', 'io.questdb/io.questdb.ServerMain',
             '-d', str(self._data_dir)]
-        sys.stderr.write(f'Starting QuestDB: {shlex.join(launch_args)}\n')
+        sys.stderr.write(f'Starting QuestDB: {launch_args!r}\n')
         self._log = open(self._log_path, 'ab')
         try:
             self._proc = subprocess.Popen(
@@ -235,10 +236,15 @@ class QuestDbFixture:
             sys.stderr.write('Waiting until HTTP service is up.\n')
             retry(
                 check_http_up,
-                timeout_sec=20,
+                timeout_sec=45,
                 msg='Timed out waiting for HTTP service to come up.')
         except:
-            sys.stderr.write(f'Failed to start, see: {self._log_path}\n')
+            sys.stderr.write(f'Failed to start, see full log: `{self._log_path}`. Tail:\n')
+            with open(self._log_path, 'r', encoding='utf-8') as log_file:
+                lines = log_file.readlines()
+                buf = ''.join(lines[-100:])
+                sys.stderr.write(textwrap.indent(buf, '    '))
+                sys.stderr.write('\n\n')
             raise
 
         atexit.register(self.stop)

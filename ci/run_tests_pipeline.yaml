@@ -9,8 +9,8 @@ variables:
   Linux-X64: linux
 
 stages:
-  - stage: BuildBinaries
-    displayName: "Building C++ binaries"
+  - stage: BuildAndTest
+    displayName: "Building and testing"
     jobs:
       - job: RunOn
         displayName: "on"
@@ -19,16 +19,23 @@ stages:
             linux:
               imageName: "ubuntu-latest"
               poolName: "Azure Pipelines"
-              os: Linux
-              jdk: "1.11"
-              generator: "CodeBlocks - Unix Makefiles"
-#            mac:
-#              imageName: "macos-latest"
-#              poolName: "Azure Pipelines"
-#              os: macOS
-#              jdk: "1.11"
-#              generator: "CodeBlocks - Unix Makefiles"
-
+              BUILD_WITH_MINGW: "0"
+            mac:
+              imageName: "macos-latest"
+              poolName: "Azure Pipelines"
+              BUILD_WITH_MINGW: "0"
+            windows-msvc-2022:
+              imageName: "windows-2022"
+              poolName: "Azure Pipelines"
+              BUILD_WITH_MINGW: "0"
+            windows-msvc-2019:
+              imageName: "windows-2019"
+              poolName: "Azure Pipelines"
+              BUILD_WITH_MINGW: "0"
+            # windows-mingw:
+            #   imageName: "windows-2022"
+            #   poolName: "Azure Pipelines"
+            #   BUILD_WITH_MINGW: "1"
         pool:
           name: $(poolName)
           vmImage: $(imageName)
@@ -38,10 +45,29 @@ stages:
             fetchDepth: 1
             lfs: false
             submodules: false
-          - bash: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-            condition: eq(variables['Agent.OS'], 'Linux')
-            displayName: "Build binaries with cmake"
-
-          - bash: (cd build && make)
-            condition: eq(variables['Agent.OS'], 'Linux')
+          - script: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+            env:
+              JAVA_HOME: $(JAVA_HOME_11_X64)
+            displayName: "Build Makefile with CMake"
+            condition: eq(variables['BUILD_WITH_MINGW'], '0')
+          # - script: |
+          #     choco upgrade mingw -y
+          #     rustup target add x86_64-pc-windows-gnu
+          #     cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -G "MinGW Makefiles"
+          #   env:
+          #     JAVA_HOME: $(JAVA_HOME_11_X64)
+          #   displayName: "Build Makefile with CMake"
+          #   condition: eq(variables['BUILD_WITH_MINGW'], '1')
+          - script: cmake --build build
+            env:
+              JAVA_HOME: $(JAVA_HOME_11_X64)
             displayName: "Make"
+          - script: python3 ci/run_all_tests.py
+            env:
+              JAVA_HOME: $(JAVA_HOME_11_X64)
+            displayName: "Tests"
+          - task: PublishBuildArtifacts@1
+            inputs:
+              pathToPublish: ./build
+            displayName: "Publish build directory"
+            condition: eq(variables['BUILD_WITH_MINGW'], '1')

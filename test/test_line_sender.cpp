@@ -70,7 +70,7 @@ TEST_CASE("line_sender c api basics")
     CHECK(server.recv() == 0);
     ::line_sender_name table_name{0, nullptr};
     const char* test_buf = "test";
-    CHECK(::line_sender_name_init(&table_name, 4, "test", &err));
+    CHECK(::line_sender_name_init(&table_name, 4, test_buf, &err));
     CHECK(table_name.len == 4);
     CHECK(table_name.buf == test_buf);
     ::line_sender_name t1_name{0, nullptr};
