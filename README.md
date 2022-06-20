@@ -213,6 +213,45 @@ To debug these issues you may consult the QuestDB instance logs.
 If you intend to retry, you must create a new sender object: The same sender
 object can't be reused.
 
+## Authentication
+
+We support QuestDB's ECDSA P256 SHA256 signing-based authentication.
+
+To create your own keys, follow the QuestDB's [authentication documentation](https://questdb.io/docs/reference/api/ilp/authenticate/).
+
+### C API
+
+In C, populate a `line_sender_sec_opts` struct and call the `line_sender_connect_secure` function.
+
+```c
+line_sender_sec_opts sec_opts;
+sec_opts.auth_key_id = "testUser1";
+sec_opts.auth_priv_key = "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48";
+sec_opts.auth_pub_key_x = "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU";
+sec_opts.auth_pub_key_y = "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac";
+
+line_sender_error* err = NULL;
+line_sender* sender = line_sender_connect_secure("0.0.0.0", host, port, &sec_opts, &err);
+```
+
+For a complete example, see [examples/line_sender_c_example_auth.c](examples/line_sender_c_example_auth.c)
+
+### C++ API
+
+In C++, construct a `questdb::ilp::sec_opts` object and pass it as the 3rd argument
+of any of the `questdb::ilp::line_sender` constructor overloads.
+
+```cpp
+questdb::ilp::sec_opts sec_opts{
+    "testUser1",  // auth_key_id
+    "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48",  // auth_priv_key
+    "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU",  // auth_pub_key_x
+    "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac"};  // auth_pub_key_y
+questdb::ilp::line_sender sender{host, port, sec_opts};
+```
+
+For a complete example, see [examples/line_sender_cpp_example_auth.cpp](examples/line_sender_c_example_auth.c)
+
 ## If you don't see any data
 
 You may be experiencing one of these issues:
