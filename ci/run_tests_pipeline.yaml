@@ -32,10 +32,10 @@ stages:
               imageName: "windows-2019"
               poolName: "Azure Pipelines"
               BUILD_WITH_MINGW: "0"
-            windows-mingw:
-              imageName: "windows-2022"
-              poolName: "Azure Pipelines"
-              BUILD_WITH_MINGW: "1"
+            # windows-mingw:
+            #   imageName: "windows-2022"
+            #   poolName: "Azure Pipelines"
+            #   BUILD_WITH_MINGW: "1"
         pool:
           name: $(poolName)
           vmImage: $(imageName)
@@ -50,14 +50,14 @@ stages:
               JAVA_HOME: $(JAVA_HOME_11_X64)
             displayName: "Build Makefile with CMake"
             condition: eq(variables['BUILD_WITH_MINGW'], '0')
-          - script: |
-              choco upgrade mingw -y
-              rustup target add x86_64-pc-windows-gnu
-              cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -G "MinGW Makefiles"
-            env:
-              JAVA_HOME: $(JAVA_HOME_11_X64)
-            displayName: "Build Makefile with CMake"
-            condition: eq(variables['BUILD_WITH_MINGW'], '1')
+          # - script: |
+          #     choco upgrade mingw -y
+          #     rustup target add x86_64-pc-windows-gnu
+          #     cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -G "MinGW Makefiles"
+          #   env:
+          #     JAVA_HOME: $(JAVA_HOME_11_X64)
+          #   displayName: "Build Makefile with CMake"
+          #   condition: eq(variables['BUILD_WITH_MINGW'], '1')
           - script: cmake --build build
             env:
               JAVA_HOME: $(JAVA_HOME_11_X64)
