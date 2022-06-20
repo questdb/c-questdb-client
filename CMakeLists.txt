@@ -129,7 +129,7 @@ if(QUESTDB_SYSTEM_TESTING)
         REQUIRED)
     add_test(
         NAME system_test
-        COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/system_test/test.py)
+        COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/system_test/test.py run -v)
     set_tests_properties(
         system_test PROPERTIES
         ENVIRONMENT BUILD_DIR_PATH=${CMAKE_BINARY_DIR})
