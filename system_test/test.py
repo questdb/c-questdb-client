@@ -332,6 +332,8 @@ class TestLineSender(unittest.TestCase):
         self.assertEqual(scrubbed_dataset, exp_dataset)
 
     def test_floats(self):
+        if QDB_FIXTURE.version <= (6, 1, 2):
+            self.skipTest('Float issues support')
         numbers = [
             0.0,
             -0.0,
@@ -480,22 +482,23 @@ def run_with_existing(args):
 
 def run_with_fixtures(args):
     global QDB_FIXTURE
-
-    last_n = 1
-    if getattr(args, 'last_n', None):
-        last_n = args.last_n
-    elif getattr(args, 'versions', None):
-        last_n = 30  # Hack, can't test older releases.
-    versions = {
-        vers: download_url
-        for vers, download_url
-        in list_questdb_releases(last_n)}
+    versions = None
     versions_args = getattr(args, 'versions', None)
     if versions_args:
         versions = {
-            vers: versions[vers]
-            for vers in versions_args}
-
+            version: (
+                'https://github.com/questdb/questdb/releases/download/' +
+                version +
+                '/questdb-' +
+                version +
+                '-no-jre-bin.tar.gz')
+            for version in versions_args}
+    else:
+        last_n = getattr(args, 'last_n', None) or 1
+        versions = {
+            vers: download_url
+            for vers, download_url
+            in list_questdb_releases(last_n)}
     for version, download_url in versions.items():
         questdb_dir = install_questdb(version, download_url)
         for auth in (False, True):
