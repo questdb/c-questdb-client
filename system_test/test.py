@@ -78,7 +78,7 @@ def http_sql_query(sql_query):
     return data
 
 
-def retry_check_table(table_name, min_rows=1, timeout_sec=60):
+def retry_check_table(table_name, min_rows=1, timeout_sec=120):
     def check_table():
         try:
             resp = http_sql_query(f"select * from '{table_name}'")
