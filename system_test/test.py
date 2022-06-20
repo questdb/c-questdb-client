@@ -267,32 +267,6 @@ class TestLineSender(unittest.TestCase):
         exp_dataset = [['A', ns_to_qdb_date(at_ts_ns)]]
         self.assertEqual(resp['dataset'], exp_dataset)
 
-    def test_bad_at(self):
-        if QDB_FIXTURE.version <= (6, 0, 7, 1):
-            self.skipTest('No support for user-provided timestamps.')
-            return
-        table_name = uuid.uuid4().hex
-        at_ts_ns1 = 1648032959100000000
-        at_ts_ns2 = 1648032958100000000  # A second before `at_ts_ns1`.
-        with self._mk_linesender() as sender:
-            (sender
-                .table(table_name)
-                .symbol('a', 'A')
-                .at(at_ts_ns1))
-            (sender
-                .table(table_name)
-                .symbol('a', 'B')
-                .at(at_ts_ns2))
-
-        resp = retry_check_table(table_name)
-        exp_dataset = [['A', ns_to_qdb_date(at_ts_ns1)]]
-        self.assertEqual(resp['dataset'], exp_dataset)
-
-        # The second time stamp is dropped and will not appear in results.
-        with self.assertRaises(TimeoutError):
-            retry_check_table(table_name, min_rows=2, timeout_sec=1)
-
-
     def test_underscores(self):
         table_name = f'_{uuid.uuid4().hex}_'
         with self._mk_linesender() as sender:
