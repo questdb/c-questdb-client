@@ -220,7 +220,8 @@ class QuestDbFixture:
             '-p', str(self._root_dir / 'bin' / 'questdb.jar'),
             '-m', 'io.questdb/io.questdb.ServerMain',
             '-d', str(self._data_dir)]
-        sys.stderr.write(f'Starting QuestDB: {launch_args!r}\n')
+        sys.stderr.write(
+            f'Starting QuestDB: {launch_args!r} (auth: {self.auth})\n')
         self._log = open(self._log_path, 'ab')
         try:
             self._proc = subprocess.Popen(
