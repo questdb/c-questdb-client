@@ -290,6 +290,7 @@ pub struct AuthParams<'a> {
 
 #[derive(Debug, Clone)]
 pub struct LineSenderBuilder<'a> {
+    capacity: usize,
     host: &'a str,
     port: &'a str,
     net_interface: Option<&'a str>,
@@ -297,15 +298,29 @@ pub struct LineSenderBuilder<'a> {
 }
 
 impl <'a> LineSenderBuilder<'a> {
+    /// QuestDB server and port.
     pub fn new(host: &'a str, port: &'a str) -> Self {
-        Self { host: host, port: port, net_interface: None, auth: None }
+        Self {
+            capacity: 65536,
+            host: host,
+            port: port,
+            net_interface: None,
+            auth: None }
     }
 
+    /// Set the initial buffer capacity.
+    pub fn capacity(&mut self, byte_count: usize) -> &mut Self {
+        self.capacity = byte_count;
+        self
+    }
+
+    /// Select local outbound interface.
     pub fn net_interface(&mut self, addr: &'a str) -> &mut Self {
         self.net_interface = Some(addr);
         self
     }
 
+    /// Authentication Parameters.
     pub fn auth(
         &mut self, key_id: &'a str,
         priv_key: &'a str,
@@ -321,6 +336,7 @@ impl <'a> LineSenderBuilder<'a> {
         self
     }
 
+    /// Connect synchronously.
     pub fn connect(self) -> Result<LineSender> {
         let addr: SockAddr = gai::resolve_host_port(self.host, self.port)?;
         let sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
@@ -347,7 +363,7 @@ impl <'a> LineSenderBuilder<'a> {
         let mut sender = LineSender {
             sock: sock,
             state: State::Connected,
-            output: String::with_capacity(65536),
+            output: String::with_capacity(self.capacity),
             last_line_start: 0usize
         };
         if let Some(auth) = self.auth {
