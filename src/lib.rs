@@ -32,6 +32,7 @@ use std::io::Write as IoWrite;
 use socket2::{Domain, Socket, SockAddr, Type, Protocol};
 use base64ct::{Base64, Base64UrlUnpadded, Encoding};
 use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
+use rustls;
 
 #[derive(Debug, Copy, Clone)]
 enum Op {
@@ -289,16 +290,30 @@ pub struct AuthParams<'a> {
 }
 
 #[derive(Debug, Clone)]
+pub enum Tls {
+    Disabled,
+    Enabled,
+    InsecureSkipVerify
+}
+
+#[derive(Debug, Clone)]
 pub struct LineSenderBuilder<'a> {
     host: &'a str,
     port: &'a str,
     net_interface: Option<&'a str>,
-    auth: Option<AuthParams<'a>>
+    auth: Option<AuthParams<'a>>,
+    tls: Tls,
 }
 
 impl <'a> LineSenderBuilder<'a> {
     pub fn new(host: &'a str, port: &'a str) -> Self {
-        Self { host: host, port: port, net_interface: None, auth: None }
+        Self {
+            host: host,
+            port: port,
+            net_interface: None,
+            auth: None,
+            tls: Tls::Disabled
+        }
     }
 
     pub fn net_interface(&mut self, addr: &'a str) -> &mut Self {
@@ -307,7 +322,8 @@ impl <'a> LineSenderBuilder<'a> {
     }
 
     pub fn auth(
-        &mut self, key_id: &'a str,
+        &mut self,
+        key_id: &'a str,
         priv_key: &'a str,
         pub_key_x: &'a str,
         pub_key_y: &'a str) -> &mut Self
@@ -318,6 +334,11 @@ impl <'a> LineSenderBuilder<'a> {
             pub_key_x: pub_key_x,
             pub_key_y: pub_key_y
         });
+        self
+    }
+
+    pub fn tls(&mut self, tls: Tls) -> &mut Self {
+        self.tls = tls;
         self
     }
 

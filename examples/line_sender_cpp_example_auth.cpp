@@ -14,7 +14,8 @@ static bool example(std::string_view host, std::string_view port)
             "testUser1",  // auth_key_id
             "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48",  // auth_priv_key
             "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU",  // auth_pub_key_x
-            "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac"};  // auth_pub_key_y
+            "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac",
+            questdb::ilp::tls::disabled};  // auth_pub_key_y
         questdb::ilp::line_sender sender{host, port, sec_opts};
 
         // We prepare all our table names and colum names in advance.

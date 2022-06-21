@@ -145,6 +145,13 @@ bool line_sender_name_init(
  */
 typedef struct line_sender line_sender;
 
+typedef enum line_sender_tls
+{
+    line_sender_tls_disabled,
+    line_sender_tls_enabled,
+    line_sender_tls_insecure_skip_verify
+} line_sender_tls;
+
 /**
  * Authentication options.
  */
@@ -161,6 +168,9 @@ typedef struct line_sender_sec_opts
 
     /** Authentication public key Y coordinate. AKA "y". */
     const char* auth_pub_key_y;
+
+    /** Settings for secure connection over TLS. */
+    line_sender_tls tls;
 } line_sender_sec_opts;
 
 /**

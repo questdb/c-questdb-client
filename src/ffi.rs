@@ -238,6 +238,14 @@ macro_rules! bubble_err_to_c {
     };
 }
 
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub enum line_sender_tls {
+    line_sender_tls_disabled,
+    line_sender_tls_enabled,
+    line_sender_tls_insecure_skip_verify
+}
+
 /// Authentication options.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -253,7 +261,10 @@ pub struct line_sender_sec_opts
     auth_pub_key_x : * const libc::c_char,
 
     /// Authentication public key Y coordinate. AKA "y".
-    auth_pub_key_y : * const libc::c_char
+    auth_pub_key_y : * const libc::c_char,
+
+    /// Settings for secure connection over TLS.
+    tls: line_sender_tls
 }
 
 
@@ -320,6 +331,28 @@ pub extern "C" fn line_sender_connect(
         err_out)
 }
 
+const DISABLED: libc::c_int =
+    line_sender_tls::line_sender_tls_disabled as libc::c_int;
+const ENABLED: libc::c_int =
+    line_sender_tls::line_sender_tls_enabled as libc::c_int;
+const INSECURE_SKIP_VERIFY: libc::c_int =
+    line_sender_tls::line_sender_tls_insecure_skip_verify as libc::c_int;
+
+fn parse_tls_int(tls: libc::c_int) -> super::Result<super::Tls> {
+    match tls {
+        DISABLED =>
+            Ok(super::Tls::Disabled),
+        ENABLED =>
+            Ok(super::Tls::Enabled),
+        INSECURE_SKIP_VERIFY =>
+            Ok(super::Tls::InsecureSkipVerify),
+        other =>
+            Err(super::Error {
+                code: super::ErrorCode::InvalidApiCall,
+                msg: format!("Invalid value {} set as tls field.", other)})
+    }
+}
+
 fn set_sec_opts(
     builder: &mut super::LineSenderBuilder,
     sec_opts: *const line_sender_sec_opts,
@@ -380,6 +413,15 @@ fn set_sec_opts(
         };
 
     builder.auth(auth_key_id, auth_priv_key, auth_pub_key_x, auth_pub_key_y);
+
+    let tls = match parse_tls_int(unsafe { (*sec_opts).tls as libc::c_int }) {
+        Ok(tls) => tls,
+        Err(err) => {
+            set_err_out(err_out, err.code, err.msg);
+            return false;
+        }
+    };
+    builder.tls(tls);
     true
 }
 

@@ -36,6 +36,7 @@ import uuid
 from fixture import (
     Project,
     QuestDbFixture,
+    HaProxyFixture,
     install_questdb,
     list_questdb_releases,
     retry)
@@ -44,10 +45,20 @@ import urllib.parse
 import urllib.error
 import json
 import subprocess
+import shutil
 from collections import namedtuple
 
 
 QDB_FIXTURE: QuestDbFixture = None
+HA_PROXY_FIXTURE: HaProxyFixture = None
+
+
+def try_ha_proxy():
+    """Create a fixture if `haproxy` is available in the PATH."""
+    if shutil.which('haproxy'):
+        return HaProxyFixture(QDB_FIXTURE.line_tcp_port)
+    else:
+        return None
 
 
 class QueryError(Exception):
@@ -482,6 +493,7 @@ def run_with_existing(args):
 
 def run_with_fixtures(args):
     global QDB_FIXTURE
+    global HA_PROXY_FIXTURE
     versions = None
     versions_args = getattr(args, 'versions', None)
     if versions_args:
@@ -503,12 +515,20 @@ def run_with_fixtures(args):
         questdb_dir = install_questdb(version, download_url)
         for auth in (False, True):
             QDB_FIXTURE = QuestDbFixture(questdb_dir, auth=auth)
+            HA_PROXY_FIXTURE = None
             try:
                 QDB_FIXTURE.start()
+                HA_PROXY_FIXTURE = try_ha_proxy()
+                if HA_PROXY_FIXTURE:
+                    sys.stderr.write('Starting `haproxy` for ILP/TLS.')
+                    HA_PROXY_FIXTURE.start()
+
                 test_prog = unittest.TestProgram(exit=False)
                 if not test_prog.result.wasSuccessful():
                     sys.exit(1)
             finally:
+                if HA_PROXY_FIXTURE:
+                    HA_PROXY_FIXTURE.stop()
                 QDB_FIXTURE.stop()
 
 
@@ -530,7 +550,7 @@ def main():
     if args.command == 'list':
         list(args)
     else:
-        # Repackage args for unittests own arg parser.
+        # Repackage args for unittest's own arg parser.
         sys.argv[:] = sys.argv[:1] + extra_args
         show_help = getattr(args, 'unittest_help', False)
         run(args, show_help)

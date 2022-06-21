@@ -184,6 +184,13 @@ namespace questdb::ilp
         }
     }
 
+    enum class tls
+    {
+        disabled,
+        enabled,
+        insecure_skip_verify
+    };
+
     /**
      * Authentication options.
      */
@@ -193,11 +200,13 @@ namespace questdb::ilp
             std::string_view auth_key_id_,
             std::string_view auth_priv_key_,
             std::string_view auth_pub_key_x_,
-            std::string_view auth_pub_key_y_)
+            std::string_view auth_pub_key_y_,
+            tls tls_)
                 : auth_key_id{auth_key_id_}
                 , auth_priv_key{auth_priv_key_}
                 , auth_pub_key_x{auth_pub_key_x_}
                 , auth_pub_key_y{auth_pub_key_y_}
+                , tls{tls_}
         {}
 
         /** Authentication key id. AKA "kid". */
@@ -211,6 +220,9 @@ namespace questdb::ilp
 
         /** Authentication public key Y coordinate. AKA "y". */
         std::string auth_pub_key_y;
+
+        /** Settings for secure connection over TLS. */
+        tls tls;
     };
 
     /**
@@ -250,6 +262,7 @@ namespace questdb::ilp
             c_sec_opts.auth_priv_key = sec_opts.auth_priv_key.c_str();
             c_sec_opts.auth_pub_key_x = sec_opts.auth_pub_key_x.c_str();
             c_sec_opts.auth_pub_key_y = sec_opts.auth_pub_key_y.c_str();
+            c_sec_opts.tls = static_cast<::line_sender_tls>(sec_opts.tls);
             _impl = ::line_sender_connect_secure(
                 net_interface,
                 host,
