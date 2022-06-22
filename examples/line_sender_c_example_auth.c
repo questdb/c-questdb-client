@@ -11,11 +11,11 @@ static bool example(const char* host, const char* port)
     // Follow our authentication documentation to generate your own keys:
     // https://questdb.io/docs/reference/api/ilp/authenticate
     line_sender_sec_opts sec_opts;
+    memset(&sec_opts, 0, sizeof(sec_opts));
     sec_opts.auth_key_id = "testUser1";
     sec_opts.auth_priv_key = "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48";
     sec_opts.auth_pub_key_x = "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU";
     sec_opts.auth_pub_key_y = "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac";
-    sec_opts.tls = line_sender_tls_disabled;
 
     sender = line_sender_connect_secure("0.0.0.0", host, port, &sec_opts, &err);
     if (!sender)
