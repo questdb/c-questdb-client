@@ -31,6 +31,7 @@ import math
 import datetime
 import argparse
 import unittest
+import time
 import questdb_line_sender as qls
 import uuid
 from fixture import (
@@ -428,6 +429,45 @@ class TestLineSender(unittest.TestCase):
         self._test_example(
             f'line_sender_cpp_example{suffix}',
             f'cpp_cars{suffix}')
+
+    def test_opposite_auth(self):
+        """
+        We simulate incorrectly connecting either:
+          * An authenticating client to a non-authenticating DB instance.
+          * Or a non-authenticating client to an authenticating DB instance.
+        """
+        client_auth = None if QDB_FIXTURE.auth else AUTH
+        sender = qls.LineSender(
+            QDB_FIXTURE.host,
+            QDB_FIXTURE.line_tcp_port,
+            auth=client_auth)
+        if client_auth:
+            with self.assertRaisesRegex(
+                    qls.LineSenderError,
+                    r'.*not receive auth challenge.*'):
+                sender.connect()
+        else:
+            table_name = uuid.uuid4().hex
+            with sender:  # Connecting will not fail.
+
+                # The sending the first line will not fail.
+                (sender
+                    .table(table_name)
+                    .symbol('s1', 'v1')
+                    .at_now())
+                sender.flush()
+
+                # Eventually the server will disconnect.
+                with self.assertRaisesRegex(
+                        qls.LineSenderError,
+                        r'.*Could not flush buffered messages'):
+                    for _ in range(1000):
+                        time.sleep(0.1)
+                        (sender
+                            .table(table_name)
+                            .symbol('s1', 'v1')
+                            .at_now())
+                        sender.flush()
 
 
 def parse_args():

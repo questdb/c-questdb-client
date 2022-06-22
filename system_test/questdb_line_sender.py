@@ -338,7 +338,7 @@ class LineSender:
             table_name)
         return self
 
-    def symbol(self, name, value: str):
+    def symbol(self, name: str, value: str):
         _error_wrapped_call(
             _DLL.line_sender_symbol,
             self._impl,
