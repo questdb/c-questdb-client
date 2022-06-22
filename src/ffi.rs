@@ -25,6 +25,7 @@
 use std::ascii;
 use std::boxed::Box;
 use std::convert::{From, Into};
+use std::path::Path;
 use std::slice;
 use std::str;
 use std::ffi::CStr;
@@ -44,7 +45,7 @@ pub enum line_sender_error_code {
     /// Called methods in the wrong order. E.g. `symbol` after `column`.
     line_sender_error_invalid_api_call,
 
-    /// A network error connecting of flushing data out.
+    /// A network error connecting or flushing data out.
     line_sender_error_socket_error,
 
     /// The string or symbol field is not encoded in valid UTF-8.
@@ -53,8 +54,11 @@ pub enum line_sender_error_code {
     /// The table name, symbol name or column name contains bad characters.
     line_sender_error_invalid_name,
 
-    /** Error during the authentication process. */
-    line_sender_error_auth_error
+    /// Error during the authentication process.
+    line_sender_error_auth_error,
+
+    /// Error during TLS negotiation.
+    line_sender_error_tls_error,
 }
 
 impl From<super::ErrorCode> for line_sender_error_code {
@@ -71,7 +75,9 @@ impl From<super::ErrorCode> for line_sender_error_code {
             super::ErrorCode::InvalidName =>
                 line_sender_error_code::line_sender_error_invalid_name,
             super::ErrorCode::AuthError =>
-                line_sender_error_code::line_sender_error_auth_error
+                line_sender_error_code::line_sender_error_auth_error,
+            super::ErrorCode::TlsError =>
+                line_sender_error_code::line_sender_error_tls_error,
         }
     }
 }
@@ -252,19 +258,24 @@ pub enum line_sender_tls {
 pub struct line_sender_sec_opts
 {
     /// Authentication key_id. AKA "kid".
-    auth_key_id : *const libc::c_char,
+    pub auth_key_id : *const libc::c_char,
 
     /// Authentication private key. AKA "d".
-    auth_priv_key : *const libc::c_char,
+    pub auth_priv_key : *const libc::c_char,
 
     /// Authentication public key X coordinate. AKA "x".
-    auth_pub_key_x : * const libc::c_char,
+    pub auth_pub_key_x : *const libc::c_char,
 
     /// Authentication public key Y coordinate. AKA "y".
-    auth_pub_key_y : * const libc::c_char,
+    pub auth_pub_key_y : *const libc::c_char,
 
     /// Settings for secure connection over TLS.
-    tls: line_sender_tls
+    pub tls: line_sender_tls,
+
+    /// Set a custom CA file path to use for verification.
+    /// If NULL, defaults to `webpki-roots` certificates.
+    pub tls_ca: *const libc::c_char
+    
 }
 
 
@@ -331,6 +342,48 @@ pub extern "C" fn line_sender_connect(
         err_out)
 }
 
+macro_rules! c_str_to_ref {
+    ($c_str:expr, $err_out:expr) => {
+        if let Some(str_ref) = unwrap_utf8(unsafe {CStr::from_ptr($c_str)}.to_bytes(), $err_out) {
+            str_ref
+        }
+        else {
+            return false;
+        }
+    }
+}
+
+fn set_auth_sec_opts(
+    builder: &mut super::LineSenderBuilder,
+    sec_opts: *const line_sender_sec_opts,
+    err_out: *mut *mut line_sender_error) -> bool
+{
+    let auth_key_id = unsafe { (*sec_opts).auth_key_id };
+    let auth_priv_key = unsafe { (*sec_opts).auth_priv_key };
+    let auth_pub_key_x = unsafe { (*sec_opts).auth_pub_key_x };
+    let auth_pub_key_y = unsafe { (*sec_opts).auth_pub_key_y };
+
+    if auth_key_id.is_null() && auth_priv_key.is_null() &&
+       auth_pub_key_x.is_null() && auth_pub_key_y.is_null() {
+        return true;    // No auth fields to set.
+    }
+    else if auth_key_id.is_null() || auth_priv_key.is_null() ||
+            auth_pub_key_x.is_null() || auth_pub_key_y.is_null() {
+        set_err_out(
+            err_out,
+            super::ErrorCode::InvalidApiCall,
+            "Must specify all or no auth parameters.".to_owned());
+        return false;
+    }
+
+    let auth_key_id = c_str_to_ref!(auth_key_id, err_out);
+    let auth_priv_key = c_str_to_ref!(auth_priv_key, err_out);
+    let auth_pub_key_x = c_str_to_ref!(auth_pub_key_x, err_out);
+    let auth_pub_key_y = c_str_to_ref!(auth_pub_key_y, err_out);
+    builder.auth(auth_key_id, auth_priv_key, auth_pub_key_x, auth_pub_key_y);
+    true
+}
+
 const DISABLED: libc::c_int =
     line_sender_tls::line_sender_tls_disabled as libc::c_int;
 const ENABLED: libc::c_int =
@@ -338,19 +391,39 @@ const ENABLED: libc::c_int =
 const INSECURE_SKIP_VERIFY: libc::c_int =
     line_sender_tls::line_sender_tls_insecure_skip_verify as libc::c_int;
 
-fn parse_tls_int(tls: libc::c_int) -> super::Result<super::Tls> {
-    match tls {
-        DISABLED =>
-            Ok(super::Tls::Disabled),
-        ENABLED =>
-            Ok(super::Tls::Enabled),
-        INSECURE_SKIP_VERIFY =>
-            Ok(super::Tls::InsecureSkipVerify),
-        other =>
-            Err(super::Error {
-                code: super::ErrorCode::InvalidApiCall,
-                msg: format!("Invalid value {} set as tls field.", other)})
-    }
+fn set_tls_sec_opts(
+    builder: &mut super::LineSenderBuilder,
+    sec_opts: *const line_sender_sec_opts,
+    err_out: *mut *mut line_sender_error) -> bool
+{
+    let tls = unsafe { (*sec_opts).tls as libc::c_int };
+    let tls_ca = unsafe { (*sec_opts).tls_ca };
+
+    let tls = match tls {
+            DISABLED =>
+                super::Tls::Disabled,
+            ENABLED =>
+                super::Tls::Enabled(
+                    if tls_ca.is_null() {
+                        super::CertificateAuthority::WebpkiRoots
+                    }
+                    else {
+                        let tls_ca = c_str_to_ref!(tls_ca, err_out);
+                        super::CertificateAuthority::File(Path::new(tls_ca))
+                    }),
+            INSECURE_SKIP_VERIFY =>
+                super::Tls::InsecureSkipVerify,
+            other => {
+                set_err_out(
+                    err_out,
+                    super::ErrorCode::InvalidApiCall,
+                    format!("Invalid value {} set as tls field.", other));
+                return false;
+            }
+        };
+
+    builder.tls(tls);
+    true
 }
 
 fn set_sec_opts(
@@ -362,66 +435,14 @@ fn set_sec_opts(
         return true;
     }
 
-    let auth_key_id = unsafe { (*sec_opts).auth_key_id };
-    let auth_priv_key = unsafe { (*sec_opts).auth_priv_key };
-    let auth_pub_key_x = unsafe { (*sec_opts).auth_pub_key_x };
-    let auth_pub_key_y = unsafe { (*sec_opts).auth_pub_key_y };
-
-    if auth_key_id.is_null() && auth_priv_key.is_null() &&
-       auth_pub_key_x.is_null() && auth_pub_key_y.is_null() {
-        return true;
-    }
-    else if auth_key_id.is_null() || auth_priv_key.is_null() ||
-            auth_pub_key_x.is_null() || auth_pub_key_y.is_null() {
-        set_err_out(
-            err_out,
-            super::ErrorCode::InvalidApiCall,
-            "Must specify all or no auth parameters.".to_owned());
+    if !set_auth_sec_opts(builder, sec_opts, err_out) {
         return false;
     }
 
-    let auth_key_id =
-        if let Some(str_ref) = unwrap_utf8(unsafe {CStr::from_ptr(auth_key_id)}.to_bytes(), err_out) {
-            str_ref
-        }
-        else {
-            return false;
-        };
+    if !set_tls_sec_opts(builder, sec_opts, err_out) {
+        return false;
+    }
 
-    let auth_priv_key =
-        if let Some(str_ref) = unwrap_utf8(unsafe {CStr::from_ptr(auth_priv_key)}.to_bytes(), err_out) {
-            str_ref
-        }
-        else {
-            return false;
-        };
-
-    let auth_pub_key_x =
-        if let Some(str_ref) = unwrap_utf8(unsafe {CStr::from_ptr(auth_pub_key_x)}.to_bytes(), err_out) {
-            str_ref
-        }
-        else {
-            return false;
-        };
-
-    let auth_pub_key_y =
-        if let Some(str_ref) = unwrap_utf8(unsafe {CStr::from_ptr(auth_pub_key_y)}.to_bytes(), err_out) {
-            str_ref
-        }
-        else {
-            return false;
-        };
-
-    builder.auth(auth_key_id, auth_priv_key, auth_pub_key_x, auth_pub_key_y);
-
-    let tls = match parse_tls_int(unsafe { (*sec_opts).tls as libc::c_int }) {
-        Ok(tls) => tls,
-        Err(err) => {
-            set_err_out(err_out, err.code, err.msg);
-            return false;
-        }
-    };
-    builder.tls(tls);
     true
 }
 

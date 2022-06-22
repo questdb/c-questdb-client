@@ -30,6 +30,7 @@
 #include <string_view>
 #include <stdexcept>
 #include <cstdint>
+#include <optional>
 
 namespace questdb::ilp
 {
@@ -46,7 +47,7 @@ namespace questdb::ilp
         /** Called methods in the wrong order. E.g. `symbol` after `column`. */
         invalid_api_call,
 
-        /** A network error connecting of flushing data out. */
+        /** A network error connecting or flushing data out. */
         socket_error,
 
         /** The string or symbol field is not encoded in valid UTF-8. */
@@ -56,7 +57,10 @@ namespace questdb::ilp
         invalid_name,
 
         /** Error during the authentication process. */
-        auth_error
+        auth_error,
+
+        /** Error during TLS negotiation. */
+        tls_error
     };
 
     /**
@@ -192,37 +196,60 @@ namespace questdb::ilp
     };
 
     /**
-     * Authentication options.
+     * * Connection security options.
      */
-    struct sec_opts
+    class sec_opts
     {
+    public:
+        /** Construct with auth parameters and optionally with TLS. */
         sec_opts(
-            std::string_view auth_key_id_,
-            std::string_view auth_priv_key_,
-            std::string_view auth_pub_key_x_,
-            std::string_view auth_pub_key_y_,
-            tls tls_)
-                : auth_key_id{auth_key_id_}
-                , auth_priv_key{auth_priv_key_}
-                , auth_pub_key_x{auth_pub_key_x_}
-                , auth_pub_key_y{auth_pub_key_y_}
-                , tls{tls_}
+            std::string_view auth_key_id,
+            std::string_view auth_priv_key,
+            std::string_view auth_pub_key_x,
+            std::string_view auth_pub_key_y,
+            tls tls = tls::disabled,
+            std::optional<std::string_view> tls_ca = std::nullopt)
+                : _auth_key_id{auth_key_id}
+                , _auth_priv_key{auth_priv_key}
+                , _auth_pub_key_x{auth_pub_key_x}
+                , _auth_pub_key_y{auth_pub_key_y}
+                , _tls{tls}
+                , _tls_ca{tls_ca}
         {}
 
+        /** Construct with TLS parameters only. */
+        sec_opts(tls tls, std::optional<std::string_view> tls_ca = std::nullopt)
+            : _auth_key_id(std::nullopt)
+            , _auth_priv_key(std::nullopt)
+            , _auth_pub_key_x(std::nullopt)
+            , _auth_pub_key_y(std::nullopt)
+            , _tls(tls)
+            , _tls_ca(tls_ca)
+        {}
+
+    private:
+        friend class line_sender;
+
         /** Authentication key id. AKA "kid". */
-        std::string auth_key_id;
+        std::optional<std::string> _auth_key_id;
 
         /** Authentication private key. AKA "d". */
-        std::string auth_priv_key;
+        std::optional<std::string> _auth_priv_key;
 
         /** Authentication public key X coordinate. AKA "x". */
-        std::string auth_pub_key_x;
+        std::optional<std::string> _auth_pub_key_x;
 
         /** Authentication public key Y coordinate. AKA "y". */
-        std::string auth_pub_key_y;
+        std::optional<std::string> _auth_pub_key_y;
 
         /** Settings for secure connection over TLS. */
-        tls tls;
+        tls _tls;
+
+        /**
+         * Set a custom CA file path to use for verification.
+         * If an empty string, defaults to `webpki-roots` certificates.
+         */
+        std::optional<std::string> _tls_ca;
     };
 
     /**
@@ -258,11 +285,20 @@ namespace questdb::ilp
         {
             ::line_sender_error* c_err{nullptr};
             ::line_sender_sec_opts c_sec_opts;
-            c_sec_opts.auth_key_id = sec_opts.auth_key_id.c_str();
-            c_sec_opts.auth_priv_key = sec_opts.auth_priv_key.c_str();
-            c_sec_opts.auth_pub_key_x = sec_opts.auth_pub_key_x.c_str();
-            c_sec_opts.auth_pub_key_y = sec_opts.auth_pub_key_y.c_str();
-            c_sec_opts.tls = static_cast<::line_sender_tls>(sec_opts.tls);
+
+            auto to_c_str = [](const std::optional<std::string>& str)
+                {
+                    return str
+                        ? str->c_str()
+                        : nullptr;                
+                };
+
+            c_sec_opts.auth_key_id = to_c_str(sec_opts._auth_key_id);
+            c_sec_opts.auth_priv_key = to_c_str(sec_opts._auth_priv_key);
+            c_sec_opts.auth_pub_key_x = to_c_str(sec_opts._auth_pub_key_x);
+            c_sec_opts.auth_pub_key_y = to_c_str(sec_opts._auth_pub_key_y);
+            c_sec_opts.tls = static_cast<::line_sender_tls>(sec_opts._tls);
+            c_sec_opts.tls_ca = to_c_str(sec_opts._tls_ca);
             _impl = ::line_sender_connect_secure(
                 net_interface,
                 host,

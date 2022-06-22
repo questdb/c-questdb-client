@@ -24,15 +24,16 @@
 
 use core::time::Duration;
 use std::convert::{TryFrom, TryInto, Infallible};
-use std::fmt;
-use std::fmt::{Write, Display, Formatter};
-use std::io;
-use std::io::{BufRead, BufReader};
+use std::fmt::{self, Write, Display, Formatter};
+use std::io::{self, BufRead, BufReader};
 use std::io::Write as IoWrite;
+use std::sync::Arc;
+use std::path::Path;
+
 use socket2::{Domain, Socket, SockAddr, Type, Protocol};
 use base64ct::{Base64, Base64UrlUnpadded, Encoding};
 use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
-use rustls;
+use rustls::{OwnedTrustAnchor, RootCertStore};
 
 #[derive(Debug, Copy, Clone)]
 enum Op {
@@ -98,7 +99,7 @@ pub enum ErrorCode {
     /// Called methods in the wrong order. E.g. `symbol` after `column`.
     InvalidApiCall,
 
-    /// A network error connecting of flushing data out.
+    /// A network error connecting or flushing data out.
     SocketError,
 
     /// The string or symbol field is not encoded in valid UTF-8.
@@ -108,7 +109,10 @@ pub enum ErrorCode {
     InvalidName,
 
     /// Error during the authentication process.
-    AuthError
+    AuthError,
+
+    /// Error during TLS negotiation.
+    TlsError
 }
 
 #[derive(Debug)]
@@ -282,7 +286,7 @@ pub struct LineSender {
 }
 
 #[derive(Debug, Clone)]
-pub struct AuthParams<'a> {
+struct AuthParams<'a> {
     key_id: &'a str,
     priv_key: &'a str,
     pub_key_x: &'a str,
@@ -290,10 +294,27 @@ pub struct AuthParams<'a> {
 }
 
 #[derive(Debug, Clone)]
-pub enum Tls {
+pub enum CertificateAuthority<'a> {
+    WebpkiRoots,
+    File(&'a Path)
+}
+
+#[derive(Debug, Clone)]
+pub enum Tls<'a> {
     Disabled,
-    Enabled,
+    Enabled(CertificateAuthority<'a>),
+
+    #[cfg(feature = "insecure_skip_verify")]
     InsecureSkipVerify
+}
+
+impl <'a> Tls<'a> {
+    pub fn is_disabled(&self) -> bool {
+        match self {
+            Tls::Disabled => true,
+            _ => false
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -303,7 +324,96 @@ pub struct LineSenderBuilder<'a> {
     port: &'a str,
     net_interface: Option<&'a str>,
     auth: Option<AuthParams<'a>>,
-    tls: Tls,
+    tls: Tls<'a>,
+}
+
+#[cfg(feature = "insecure_skip_verify")]
+mod danger {
+    pub struct NoCertificateVerification {}
+
+    impl rustls::client::ServerCertVerifier for NoCertificateVerification {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::Certificate,
+            _intermediates: &[rustls::Certificate],
+            _server_name: &rustls::ServerName,
+            _scts: &mut dyn Iterator<Item = &[u8]>,
+            _ocsp: &[u8],
+            _now: std::time::SystemTime,
+        ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::ServerCertVerified::assertion())
+        }
+    }
+}
+
+fn map_rustls_err(descr: &str, err: rustls::Error) -> Error {
+    Error {
+        code: ErrorCode::TlsError,
+        msg: format!("{}: {}", descr, err)
+    }
+}
+
+fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
+    if tls.is_disabled() {
+        return Ok(None);
+    }
+
+    let mut root_store = RootCertStore::empty();
+
+    if let Tls::Enabled(ca) = tls {
+        match ca {
+            CertificateAuthority::WebpkiRoots => {
+                root_store.add_server_trust_anchors(
+                    webpki_roots::TLS_SERVER_ROOTS
+                        .0
+                        .iter()
+                        .map(|ta| {
+                            OwnedTrustAnchor::from_subject_spki_name_constraints(
+                                ta.subject,
+                                ta.spki,
+                                ta.name_constraints,
+                            )}));
+            },
+            CertificateAuthority::File(ca_file) => {
+                let certfile = std::fs::File::open(ca_file)
+                    .map_err(|io_err| Error {
+                        code: ErrorCode::TlsError,
+                        msg: format!(
+                            "Could not open certificate authority file from path {:?}: {}",
+                            ca_file,
+                            io_err)})?;
+                let mut reader = BufReader::new(certfile);
+                let der_certs = &rustls_pemfile::certs(&mut reader)
+                    .map_err(|io_err| Error {
+                        code: ErrorCode::TlsError,
+                        msg: format!(
+                            "Could not read certificate authority file from path {:?}: {}",
+                            ca_file,
+                            io_err)})?;
+                root_store.add_parsable_certificates(der_certs);
+            }
+        }
+    }
+
+    let mut config = rustls::ClientConfig::builder()
+        .with_safe_default_cipher_suites()
+        .with_safe_default_kx_groups()
+        .with_safe_default_protocol_versions()
+        .map_err(|rustls_err| map_rustls_err("Bad protocol version selection", rustls_err))?
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
+    // TLS log file for debugging.
+    // Use use, set the SSLKEYLOGFILE env variable to a writable location.
+    config.key_log = Arc::new(rustls::KeyLogFile::new());
+
+    #[cfg(feature = "insecure_skip_verify")]
+    if let Tls::InsecureSkipVerify = tls {
+        config.dangerous().set_certificate_verifier(
+            Arc::new(danger::NoCertificateVerification {}));
+    }
+
+    Ok(Some(Arc::new(config)))
 }
 
 impl <'a> LineSenderBuilder<'a> {
@@ -348,7 +458,8 @@ impl <'a> LineSenderBuilder<'a> {
         self
     }
 
-    pub fn tls(&mut self, tls: Tls) -> &mut Self {
+    /// Configure TLS negotiation.
+    pub fn tls(&mut self, tls: Tls<'a>) -> &mut Self {
         self.tls = tls;
         self
     }
@@ -377,6 +488,7 @@ impl <'a> LineSenderBuilder<'a> {
                 let prefix = format!("Could not connect to {:?}: ", host_port);
                 map_io_to_socket_err(&prefix, io_err)
             })?;
+        let _tls_config = configure_tls(&self.tls)?;
         let mut sender = LineSender {
             sock: sock,
             state: State::Connected,

@@ -52,7 +52,7 @@ typedef enum line_sender_error_code
     /** Called methods in the wrong order. E.g. `symbol` after `column`. */
     line_sender_error_invalid_api_call,
 
-    /** A network error connecting of flushing data out. */
+    /** A network error connecting or flushing data out. */
     line_sender_error_socket_error,
 
     /** The string or symbol field is not encoded in valid UTF-8. */
@@ -62,7 +62,10 @@ typedef enum line_sender_error_code
     line_sender_error_invalid_name,
 
     /** Error during the authentication process. */
-    line_sender_error_auth_error
+    line_sender_error_auth_error,
+
+    /** Error during TLS negotiation. */
+    line_sender_error_tls_error,
 } line_sender_error_code;
 
 /** Error code categorizing the error. */
@@ -153,7 +156,7 @@ typedef enum line_sender_tls
 } line_sender_tls;
 
 /**
- * Authentication options.
+ * Connection security options.
  */
 typedef struct line_sender_sec_opts
 {
@@ -171,6 +174,12 @@ typedef struct line_sender_sec_opts
 
     /** Settings for secure connection over TLS. */
     line_sender_tls tls;
+
+    /**
+     * Set a custom CA file path to use for verification.
+     * If NULL, defaults to `webpki-roots` certificates.
+     */
+    const char* tls_ca;
 } line_sender_sec_opts;
 
 /**

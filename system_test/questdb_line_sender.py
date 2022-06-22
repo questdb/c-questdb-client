@@ -67,7 +67,8 @@ class c_line_sender_sec_opts(ctypes.Structure):
                 ("auth_priv_key", c_char_p),
                 ("auth_pub_key_x", c_char_p),
                 ("auth_pub_key_y", c_char_p),
-                ("tls", c_int)]
+                ("tls", c_int),
+                ("tls_ca", c_char_p)]
 c_line_sender_sec_opts_p = ctypes.POINTER(c_line_sender_sec_opts)
 
 
@@ -297,7 +298,8 @@ class LineSender:
             *,
             interface='0.0.0.0',
             auth=None,
-            tls=Tls.Disabled):
+            tls=Tls.Disabled,
+            tls_ca=None):
         self._impl = None
         if auth or (tls != tls.Disabled):
             # We need to keep bytes objects around or they get GCd before the
@@ -308,12 +310,14 @@ class LineSender:
                     auth[1].encode('ascii'),
                     auth[2].encode('ascii'),
                     auth[3].encode('ascii'))
+            self._tls_ca = tls_ca.encode('utf-8') if tls_ca else None
             self._sec_opts = c_line_sender_sec_opts(
                 self._c_auth[0] if auth else None,
                 self._c_auth[1] if auth else None,
                 self._c_auth[2] if auth else None,
                 self._c_auth[3] if auth else None,
-                tls.value)
+                tls.value,
+                self._tls_ca)
         else:
             self._sec_opts = None
         self._connect_secure_args = (
