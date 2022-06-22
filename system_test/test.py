@@ -101,24 +101,28 @@ def ns_to_qdb_date(at_ts_ns):
     at_td = datetime.datetime.fromtimestamp(at_ts_sec)
     return at_td.isoformat() + 'Z'
 
-
-# JWK
-AUTH_CLIENT_KEYS = {
-  "kty": "EC",
-  "d": "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48",  # PRIVATE_KEY
-  "crv": "P-256",
-  "kid": "testUser1",
-  "x": "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU",  # PUBLIC_KEY.x
-  "y": "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac"   # PUBLIC_KEY.y
-}
-
-
-# Py Params
+# Valid keys as registered with the QuestDB fixture.
 AUTH = (
-    AUTH_CLIENT_KEYS['kid'],
-    AUTH_CLIENT_KEYS['d'],
-    AUTH_CLIENT_KEYS['x'],
-    AUTH_CLIENT_KEYS['y'])
+    "testUser1",
+    "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48",
+    "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU",
+    "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac")
+
+
+# Valid keys, but not registered with the QuestDB fixture.
+AUTH_UNRECOGNIZED = (
+    "testUser2",
+    "xiecEl-2zbg6aYCFbxDMVWaly9BlCTaEChvcxCH5BCk",
+    "-nSHz3evuPl-rGLIlbIZjwOJeWao0rbk53Cll6XEgak",
+    "9iYksF4L5mfmArupv0CMoyVAWjQ4gNIoupdg6N5noG8")
+
+
+# Bad malformed key
+AUTH_MALFORMED = (
+    "testUser3",
+    "xiecEl-zzbg6aYCFbxDMVWaly9BlCTaEChvcxCH5BCk",
+    "-nSHz3evuPl-rGLIlbIZjwOJeWao0rbk53Cll6XEgak",
+    "9iYksF4L6mfmArupv0CMoyVAWjQ4gNIoupdg6N5noG8")
 
 
 class TestLineSender(unittest.TestCase):
@@ -127,6 +131,18 @@ class TestLineSender(unittest.TestCase):
             QDB_FIXTURE.host,
             QDB_FIXTURE.line_tcp_port,
             auth=AUTH if QDB_FIXTURE.auth else None)
+
+    def _expect_eventual_disconnect(self, sender):
+        with self.assertRaisesRegex(
+                qls.LineSenderError, r'.*Could not flush buffered messages'):
+            table_name = uuid.uuid4().hex
+            for _ in range(1000):
+                time.sleep(0.1)
+                (sender
+                    .table(table_name)
+                    .symbol('s1', 'v1')
+                    .at_now())
+                sender.flush()
 
     def test_insert_three_rows(self):
         table_name = uuid.uuid4().hex
@@ -457,18 +473,33 @@ class TestLineSender(unittest.TestCase):
                     .at_now())
                 sender.flush()
 
-                # Eventually the server will disconnect.
-                with self.assertRaisesRegex(
-                        qls.LineSenderError,
-                        r'.*Could not flush buffered messages'):
-                    for _ in range(1000):
-                        time.sleep(0.1)
-                        (sender
-                            .table(table_name)
-                            .symbol('s1', 'v1')
-                            .at_now())
-                        sender.flush()
+                self._expect_eventual_disconnect(sender)
 
+    def test_unrecognized_auth(self):
+        if not QDB_FIXTURE.auth:
+            self.skipTest('No auth')
+
+        sender = qls.LineSender(
+            QDB_FIXTURE.host,
+            QDB_FIXTURE.line_tcp_port,
+            auth=AUTH_UNRECOGNIZED)
+
+        with sender:
+            self._expect_eventual_disconnect(sender)
+
+    def test_malformed_auth(self):
+        if not QDB_FIXTURE.auth:
+            self.skipTest('No auth')
+
+        sender = qls.LineSender(
+            QDB_FIXTURE.host,
+            QDB_FIXTURE.line_tcp_port,
+            auth=AUTH_MALFORMED)
+
+        with self.assertRaisesRegex(
+                qls.LineSenderError,
+                r'.*Bad private key.*'):
+            sender.connect()
 
 def parse_args():
     parser = argparse.ArgumentParser('Run system tests.')
