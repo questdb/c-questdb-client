@@ -33,7 +33,7 @@ use std::path::Path;
 use socket2::{Domain, Socket, SockAddr, Type, Protocol};
 use base64ct::{Base64, Base64UrlUnpadded, Encoding};
 use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
-use rustls::{OwnedTrustAnchor, RootCertStore};
+use rustls::{OwnedTrustAnchor, RootCertStore, ClientConnection, ServerName};
 
 #[derive(Debug, Copy, Clone)]
 enum Op {
@@ -278,11 +278,47 @@ fn write_escaped_quoted(output: &mut String, s: &str) {
         s)
 }
 
-pub struct LineSender {
+struct Connection {
     sock: Socket,
+    tls_conn: Option<ClientConnection>
+}
+
+impl io::Read for Connection {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        if let Some(tls_conn) = &mut self.tls_conn {
+            tls_conn.reader().read(bytes)
+        }
+        else {
+            self.sock.read(bytes)
+        }
+    }
+}
+
+impl io::Write for Connection {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if let Some(tls_conn) = &mut self.tls_conn {
+            tls_conn.writer().write(bytes)
+        }
+        else {
+            self.sock.write(bytes)
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if let Some(tls_conn) = &mut self.tls_conn {
+            tls_conn.writer().flush()
+        }
+        else {
+            self.sock.flush()
+        }
+    }
+}
+
+pub struct LineSender {
+    conn: Connection,
     state: State,
     output: String,
-    last_line_start: usize
+    last_line_start: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -488,13 +524,26 @@ impl <'a> LineSenderBuilder<'a> {
                 let prefix = format!("Could not connect to {:?}: ", host_port);
                 map_io_to_socket_err(&prefix, io_err)
             })?;
-        let _tls_config = configure_tls(&self.tls)?;
         let mut sender = LineSender {
-            sock: sock,
+            conn: Connection{ sock: sock, tls_conn: None},
             state: State::Connected,
             output: String::with_capacity(self.capacity),
             last_line_start: 0usize
         };
+        if let Some(tls_config) = configure_tls(&self.tls)? {
+            let server_name: ServerName = self.host.try_into()
+                .map_err(|inv_dns_err| Error {
+                    code: ErrorCode::TlsError,
+                    msg: format!("Bad host: {}", inv_dns_err)})?;
+            sender.conn.tls_conn = Some(
+                ClientConnection::new(tls_config, server_name)
+                    .map_err(|rustls_err| Error {
+                        code: ErrorCode::TlsError,
+                        msg: format!(
+                            "Could not create TLS client: {}",
+                            rustls_err)})?);
+            
+        }
         if let Some(auth) = self.auth {
             sender.authenticate(auth)?;
         }
@@ -537,18 +586,19 @@ fn parse_key_pair<'a>(auth: &AuthParams<'a>) -> Result<EcdsaKeyPair> {
 }
 
 impl LineSender {
+
     fn send_key_id(&mut self, key_id: &str) -> Result<()> {
-        write!(&mut self.sock, "{}\n", key_id)
+        write!(&mut self.conn, "{}\n", key_id)
             .map_err(|io_err| map_io_to_socket_err("Failed to send key_id: ", io_err))?;
         Ok(())
     }
 
     fn read_challenge(&mut self) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
-        self.sock.set_read_timeout(Some(Duration::from_secs(15)))
+        self.conn.sock.set_read_timeout(Some(Duration::from_secs(15)))
             .map_err(|io_err| map_io_to_socket_err(
                 "Failed to set read timeout on socket: ", io_err))?;
-        let mut reader = BufReader::new(&mut self.sock);
+        let mut reader = BufReader::new(&mut self.conn);
         reader.read_until(b'\n', &mut buf)
             .map_err(|io_err| map_io_to_socket_err(
                 "Failed to read authentication challenge (timed out?): ",
@@ -583,7 +633,7 @@ impl LineSender {
         let mut encoded_sig = Base64::encode_string(signature.as_ref());
         encoded_sig.push('\n');
         let buf = encoded_sig.as_bytes();
-        if let Err(io_err) = self.sock.write_all(buf) {
+        if let Err(io_err) = self.conn.write_all(buf) {
             return Err(map_io_to_socket_err(
                 "Could not send signed challenge: ",
                 io_err));
@@ -731,7 +781,7 @@ impl LineSender {
     pub fn flush(&mut self) -> Result<()> {
         self.check_state(Op::Flush)?;
         let buf = self.output.as_bytes();
-        if let Err(io_err) = self.sock.write_all(buf) {
+        if let Err(io_err) = self.conn.write_all(buf) {
             self.state = State::Moribund;
             return Err(map_io_to_socket_err(
                 "Could not flush buffered messages: ",
