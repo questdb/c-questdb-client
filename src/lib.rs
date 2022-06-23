@@ -280,7 +280,14 @@ fn write_escaped_quoted(output: &mut String, s: &str) {
 
 struct Connection {
     sock: Socket,
-    tls_conn: Option<ClientConnection>
+    tls_conn: Option<ClientConnection>,
+    tls_stream: Option<rustls::Stream>
+}
+
+impl Connection {
+    fn new(sock: Socket) -> Self {
+        Self { sock: sock, tls_conn: None, tls_stream: None }
+    }
 }
 
 impl io::Read for Connection {
