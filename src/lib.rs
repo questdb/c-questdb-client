@@ -605,8 +605,15 @@ impl LineSender {
                 io_err))?;
         if buf.last().map(|c| *c).unwrap_or(b'\0') != b'\n' {
             return Err(Error {
-                code: ErrorCode::SocketError,
-                msg: format!("Received incomplete auth challenge: {:?}", buf)});
+                code: ErrorCode::AuthError,
+                msg: if buf.len() == 0 {
+                    concat!(
+                        "Did not receive auth challenge. ",
+                        "Is the database configured to require authentication?"
+                    ).to_owned()
+                } else {
+                    format!("Received incomplete auth challenge: {:?}", buf)
+                }});
         }
         buf.pop();  // b'\n'
         Ok(buf)
@@ -756,6 +763,10 @@ impl LineSender {
         else {
             0
         }
+    }
+
+    pub fn peek_pending(&self) -> &str {
+        self.output.as_str()
     }
 
     fn update_last_line_start(&mut self) {

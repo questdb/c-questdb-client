@@ -532,6 +532,25 @@ namespace questdb::ilp
         }
 
         /**
+         * Peek into the accumulated buffer that is to be sent out at the next `flush`.
+         *
+         * @return UTF-8 encoded buffer. The buffer is not nul-terminated.
+         */
+        std::string_view peek_pending() const noexcept
+        {
+            if (_impl)
+            {
+                size_t len = 0;
+                const char* buf = ::line_sender_peek_pending(_impl, &len);
+                return {buf, len};
+            }
+            else
+            {
+                return {};
+            }
+        }
+
+        /**
          * Send batch-up rows messages to the QuestDB server.
          *
          * After sending a batch, you can close the connection or begin

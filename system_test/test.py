@@ -25,12 +25,14 @@
 ################################################################################
 
 import sys
+import textwrap
 sys.dont_write_bytecode = True
 
 import math
 import datetime
 import argparse
 import unittest
+import time
 import questdb_line_sender as qls
 import uuid
 from fixture import (
@@ -89,10 +91,17 @@ def http_sql_query(sql_query):
     return data
 
 
-def retry_check_table(table_name, min_rows=1, timeout_sec=120):
+def retry_check_table(
+        table_name,
+        *,
+        min_rows=1,
+        timeout_sec=60,
+        log=True,
+        log_ctx=None):
+    sql_query = f"select * from '{table_name}'"
     def check_table():
         try:
-            resp = http_sql_query(f"select * from '{table_name}'")
+            resp = http_sql_query(sql_query)
             if not resp.get('dataset'):
                 return False
             elif len(resp['dataset']) < min_rows:
@@ -101,7 +110,19 @@ def retry_check_table(table_name, min_rows=1, timeout_sec=120):
         except QueryError:
             return None
 
-    return retry(check_table, timeout_sec=timeout_sec)
+    try:
+        return retry(check_table, timeout_sec=timeout_sec)
+    except TimeoutError as toe:
+        if log:
+            if log_ctx:
+                log_ctx = f'\n{textwrap.indent(log_ctx, "    ")}\n'
+            sys.stderr.write(
+                f'Timed out after {timeout_sec} seconds ' +
+                f'waiting for query {sql_query!r}. ' +
+                f'Context: {log_ctx}'
+                f'Tail of QuestDB log:\n')
+            QDB_FIXTURE.print_log_tail()
+        raise toe
 
 
 def ns_to_qdb_date(at_ts_ns):
@@ -111,24 +132,28 @@ def ns_to_qdb_date(at_ts_ns):
     at_td = datetime.datetime.fromtimestamp(at_ts_sec)
     return at_td.isoformat() + 'Z'
 
-
-# JWK
-AUTH_CLIENT_KEYS = {
-  "kty": "EC",
-  "d": "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48",  # PRIVATE_KEY
-  "crv": "P-256",
-  "kid": "testUser1",
-  "x": "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU",  # PUBLIC_KEY.x
-  "y": "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac"   # PUBLIC_KEY.y
-}
-
-
-# Py Params
+# Valid keys as registered with the QuestDB fixture.
 AUTH = (
-    AUTH_CLIENT_KEYS['kid'],
-    AUTH_CLIENT_KEYS['d'],
-    AUTH_CLIENT_KEYS['x'],
-    AUTH_CLIENT_KEYS['y'])
+    "testUser1",
+    "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48",
+    "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU",
+    "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac")
+
+
+# Valid keys, but not registered with the QuestDB fixture.
+AUTH_UNRECOGNIZED = (
+    "testUser2",
+    "xiecEl-2zbg6aYCFbxDMVWaly9BlCTaEChvcxCH5BCk",
+    "-nSHz3evuPl-rGLIlbIZjwOJeWao0rbk53Cll6XEgak",
+    "9iYksF4L5mfmArupv0CMoyVAWjQ4gNIoupdg6N5noG8")
+
+
+# Bad malformed key
+AUTH_MALFORMED = (
+    "testUser3",
+    "xiecEl-zzbg6aYCFbxDMVWaly9BlCTaEChvcxCH5BCk",
+    "-nSHz3evuPl-rGLIlbIZjwOJeWao0rbk53Cll6XEgak",
+    "9iYksF4L6mfmArupv0CMoyVAWjQ4gNIoupdg6N5noG8")
 
 
 class TestLineSender(unittest.TestCase):
@@ -138,8 +163,21 @@ class TestLineSender(unittest.TestCase):
             QDB_FIXTURE.line_tcp_port,
             auth=AUTH if QDB_FIXTURE.auth else None)
 
+    def _expect_eventual_disconnect(self, sender):
+        with self.assertRaisesRegex(
+                qls.LineSenderError, r'.*Could not flush buffered messages'):
+            table_name = uuid.uuid4().hex
+            for _ in range(1000):
+                time.sleep(0.1)
+                (sender
+                    .table(table_name)
+                    .symbol('s1', 'v1')
+                    .at_now())
+                sender.flush()
+
     def test_insert_three_rows(self):
         table_name = uuid.uuid4().hex
+        pending = None
         with self._mk_linesender() as sender:
             for _ in range(3):
                 (sender
@@ -150,10 +188,10 @@ class TestLineSender(unittest.TestCase):
                     .column('name_d', 2.5)
                     .column('name_e', 'val_b')
                     .at_now())
-
+            pending = sender.peek_pending()
             sender.flush()
 
-        resp = retry_check_table(table_name, min_rows=3)
+        resp = retry_check_table(table_name, min_rows=3, log_ctx=pending)
         exp_columns = [
             {'name': 'name_a', 'type': 'SYMBOL'},
             {'name': 'name_b', 'type': 'BOOLEAN'},
@@ -175,6 +213,7 @@ class TestLineSender(unittest.TestCase):
             self.skipTest('No support for duplicate column names.')
             return
         table_name = uuid.uuid4().hex
+        pending = None
         with self._mk_linesender() as sender:
             (sender
                 .table(table_name)
@@ -183,8 +222,9 @@ class TestLineSender(unittest.TestCase):
                 .column('b', False)
                 .column('b', 'C')
                 .at_now())
+            pending = sender.peek_pending()
 
-        resp = retry_check_table(table_name)
+        resp = retry_check_table(table_name, log_ctx=pending)
         exp_columns = [
             {'name': 'a', 'type': 'SYMBOL'},
             {'name': 'b', 'type': 'BOOLEAN'},
@@ -200,14 +240,16 @@ class TestLineSender(unittest.TestCase):
             self.skipTest('No support for duplicate column names.')
             return
         table_name = uuid.uuid4().hex
+        pending = None
         with self._mk_linesender() as sender:
             (sender
                 .table(table_name)
                 .symbol('a', 'A')
                 .column('a', 'B')
                 .at_now())
+            pending = sender.peek_pending()
 
-        resp = retry_check_table(table_name)
+        resp = retry_check_table(table_name, log_ctx=pending)
         exp_columns = [
             {'name': 'a', 'type': 'SYMBOL'},
             {'name': 'timestamp', 'type': 'TIMESTAMP'}]
@@ -219,13 +261,15 @@ class TestLineSender(unittest.TestCase):
 
     def test_single_symbol(self):
         table_name = uuid.uuid4().hex
+        pending = None
         with self._mk_linesender() as sender:
             (sender
                 .table(table_name)
                 .symbol('a', 'A')
                 .at_now())
+            pending = sender.peek_pending()
 
-        resp = retry_check_table(table_name)
+        resp = retry_check_table(table_name, log_ctx=pending)
         exp_columns = [
             {'name': 'a', 'type': 'SYMBOL'},
             {'name': 'timestamp', 'type': 'TIMESTAMP'}]
@@ -237,14 +281,16 @@ class TestLineSender(unittest.TestCase):
 
     def test_two_columns(self):
         table_name = uuid.uuid4().hex
+        pending = None
         with self._mk_linesender() as sender:
             (sender
                 .table(table_name)
                 .column('a', 'A')
                 .column('b', 'B')
                 .at_now())
+            pending = sender.peek_pending()
 
-        resp = retry_check_table(table_name)
+        resp = retry_check_table(table_name, log_ctx=pending)
         exp_columns = [
             {'name': 'a', 'type': 'STRING'},
             {'name': 'b', 'type': 'STRING'},
@@ -257,6 +303,7 @@ class TestLineSender(unittest.TestCase):
 
     def test_mismatched_types_across_rows(self):
         table_name = uuid.uuid4().hex
+        pending = None
         with self._mk_linesender() as sender:
             (sender
                 .table(table_name)
@@ -266,9 +313,10 @@ class TestLineSender(unittest.TestCase):
                 .table(table_name)
                 .column('a', 'B')  # STRING
                 .at_now())
+            pending = sender.peek_pending()
 
         # We only ever get the first row back.
-        resp = retry_check_table(table_name)
+        resp = retry_check_table(table_name, log_ctx=pending)
         exp_columns = [
             {'name': 'a', 'type': 'SYMBOL'},
             {'name': 'timestamp', 'type': 'TIMESTAMP'}]
@@ -280,7 +328,7 @@ class TestLineSender(unittest.TestCase):
 
         # The second one is dropped and will not appear in results.
         with self.assertRaises(TimeoutError):
-            retry_check_table(table_name, min_rows=2, timeout_sec=1)
+            retry_check_table(table_name, min_rows=2, timeout_sec=1, log=False)
 
     def test_at(self):
         if QDB_FIXTURE.version <= (6, 0, 7, 1):
@@ -288,26 +336,30 @@ class TestLineSender(unittest.TestCase):
             return
         table_name = uuid.uuid4().hex
         at_ts_ns = 1647357688714369403
+        pending = None
         with self._mk_linesender() as sender:
             (sender
                 .table(table_name)
                 .symbol('a', 'A')
                 .at(at_ts_ns))
+            pending = sender.peek_pending()
 
-        resp = retry_check_table(table_name)
+        resp = retry_check_table(table_name, log_ctx=pending)
         exp_dataset = [['A', ns_to_qdb_date(at_ts_ns)]]
         self.assertEqual(resp['dataset'], exp_dataset)
 
     def test_underscores(self):
         table_name = f'_{uuid.uuid4().hex}_'
+        pending = None
         with self._mk_linesender() as sender:
             (sender
                 .table(table_name)
                 .symbol('_a_b_c_', 'A')
                 .column('_d_e_f_', True)
                 .at_now())
+            pending = sender.peek_pending()
 
-        resp = retry_check_table(table_name)
+        resp = retry_check_table(table_name, log_ctx=pending)
         exp_columns = [
             {'name': '_a_b_c_', 'type': 'SYMBOL'},
             {'name': '_d_e_f_', 'type': 'BOOLEAN'},
@@ -324,6 +376,7 @@ class TestLineSender(unittest.TestCase):
             return
         table_name = uuid.uuid4().hex
         smilie = b'\xf0\x9f\x98\x81'.decode('utf-8')
+        pending = None
         with self._mk_linesender() as sender:
             sender.table(table_name)
             sender.symbol(smilie, smilie)
@@ -331,8 +384,9 @@ class TestLineSender(unittest.TestCase):
             #     char = chr(num)
             #     sender.column(char, char)
             sender.at_now()
+            pending = sender.peek_pending()
 
-        resp = retry_check_table(table_name)
+        resp = retry_check_table(table_name, log_ctx=pending)
         exp_columns = [
             {'name': smilie, 'type': 'SYMBOL'},
             {'name': 'timestamp', 'type': 'TIMESTAMP'}]
@@ -373,13 +427,18 @@ class TestLineSender(unittest.TestCase):
             # 1.7976931348623157e+308,
             # -1.7976931348623157e+308]
         table_name = uuid.uuid4().hex
+        pending = None
         with self._mk_linesender() as sender:
             for num in numbers:
                 sender.table(table_name)
                 sender.column('n', num)
                 sender.at_now()
+            pending = sender.peek_pending()
 
-        resp = retry_check_table(table_name, len(numbers))
+        resp = retry_check_table(
+            table_name,
+            min_rows=len(numbers),
+            log_ctx=pending)
         exp_columns = [
             {'name': 'n', 'type': 'DOUBLE'},
             {'name': 'timestamp', 'type': 'TIMESTAMP'}]
@@ -440,6 +499,60 @@ class TestLineSender(unittest.TestCase):
             f'line_sender_cpp_example{suffix}',
             f'cpp_cars{suffix}')
 
+    def test_opposite_auth(self):
+        """
+        We simulate incorrectly connecting either:
+          * An authenticating client to a non-authenticating DB instance.
+          * Or a non-authenticating client to an authenticating DB instance.
+        """
+        client_auth = None if QDB_FIXTURE.auth else AUTH
+        sender = qls.LineSender(
+            QDB_FIXTURE.host,
+            QDB_FIXTURE.line_tcp_port,
+            auth=client_auth)
+        if client_auth:
+            with self.assertRaisesRegex(
+                    qls.LineSenderError,
+                    r'.*not receive auth challenge.*'):
+                sender.connect()
+        else:
+            table_name = uuid.uuid4().hex
+            with sender:  # Connecting will not fail.
+
+                # The sending the first line will not fail.
+                (sender
+                    .table(table_name)
+                    .symbol('s1', 'v1')
+                    .at_now())
+                sender.flush()
+
+                self._expect_eventual_disconnect(sender)
+
+    def test_unrecognized_auth(self):
+        if not QDB_FIXTURE.auth:
+            self.skipTest('No auth')
+
+        sender = qls.LineSender(
+            QDB_FIXTURE.host,
+            QDB_FIXTURE.line_tcp_port,
+            auth=AUTH_UNRECOGNIZED)
+
+        with sender:
+            self._expect_eventual_disconnect(sender)
+
+    def test_malformed_auth(self):
+        if not QDB_FIXTURE.auth:
+            self.skipTest('No auth')
+
+        sender = qls.LineSender(
+            QDB_FIXTURE.host,
+            QDB_FIXTURE.line_tcp_port,
+            auth=AUTH_MALFORMED)
+
+        with self.assertRaisesRegex(
+                qls.LineSenderError,
+                r'.*Bad private key.*'):
+            sender.connect()
 
 def parse_args():
     parser = argparse.ArgumentParser('Run system tests.')

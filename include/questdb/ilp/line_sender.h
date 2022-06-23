@@ -369,6 +369,18 @@ LINESENDER_API
 size_t line_sender_pending_size(const line_sender* sender);
 
 /**
+ * Peek into the accumulated buffer that is to be sent out at the next `flush`.
+ *
+ * @param[in] sender Line sender object.
+ * @param[out] len_out The length in bytes of the accumulated buffer.
+ * @return UTF-8 encoded buffer. The buffer is not nul-terminated.
+ */
+LINESENDER_API
+const char* line_sender_peek_pending(
+    const line_sender* sender,
+    size_t* len_out);
+
+/**
  * Send batch-up rows messages to the QuestDB server.
  *
  * After sending a batch, you can close the connection or begin preparing
