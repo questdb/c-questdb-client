@@ -322,6 +322,19 @@ class HaProxyFixture:
         args = ['haproxy', '-f', str(self.haproxy_cfg_path)]
         self._proc = subprocess.Popen(args)
 
+        def connect_to_listening_port():
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                sock.connect(('127.0.0.1', self.listen_port))
+            except ConnectionRefusedError:
+                return False
+            finally:
+                sock.close()
+            return True
+
+        retry(connect_to_listening_port, msg='Timed out waiting for `haproxy`')
+        atexit.register(self.stop)
+
     def stop(self):
         if self._proc:
             self._proc.terminate()

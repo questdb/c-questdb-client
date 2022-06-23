@@ -434,6 +434,10 @@ fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
             }
         }
     }
+    // else if let Tls::InsecureSkipVerify {
+    //    We don't need to set up any certificates.
+    //    An empty root is fine if we're going to ignore validity anyways.
+    // }
 
     let mut config = rustls::ClientConfig::builder()
         .with_safe_default_cipher_suites()

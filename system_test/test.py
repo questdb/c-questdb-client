@@ -264,10 +264,10 @@ class TestLineSender(unittest.TestCase):
         scrubbed_dataset = [row[:-1] for row in resp['dataset']]
         self.assertEqual(scrubbed_dataset, exp_dataset)
 
-    def test_single_symbol(self):
+    def _test_single_symbol_impl(self, sender):
         table_name = uuid.uuid4().hex
         pending = None
-        with self._mk_linesender() as sender:
+        with sender:
             (sender
                 .table(table_name)
                 .symbol('a', 'A')
@@ -283,6 +283,9 @@ class TestLineSender(unittest.TestCase):
         exp_dataset = [['A']]  # Comparison excludes timestamp column.
         scrubbed_dataset = [row[:-1] for row in resp['dataset']]
         self.assertEqual(scrubbed_dataset, exp_dataset)
+
+    def test_single_symbol(self):
+        self._test_single_symbol_impl(self._mk_linesender())
 
     def test_two_columns(self):
         table_name = uuid.uuid4().hex
@@ -559,6 +562,17 @@ class TestLineSender(unittest.TestCase):
                 r'.*Bad private key.*'):
             sender.connect()
 
+    def test_tls_insecure_skip_verify(self):
+        if not HA_PROXY_FIXTURE:
+            self.skipTest('No `haproxy` fixture running.')
+        sender = qls.LineSender(
+            QDB_FIXTURE.host,
+            HA_PROXY_FIXTURE.listen_port,
+            auth=AUTH if QDB_FIXTURE.auth else None,
+            tls=qls.Tls.InsecureSkipVerify)
+        self._test_single_symbol_impl(sender)
+
+
 def parse_args():
     parser = argparse.ArgumentParser('Run system tests.')
     sub_p = parser.add_subparsers(dest='command')
@@ -638,7 +652,7 @@ def run_with_fixtures(args):
                 QDB_FIXTURE.start()
                 HA_PROXY_FIXTURE = try_ha_proxy()
                 if HA_PROXY_FIXTURE:
-                    sys.stderr.write('Starting `haproxy` for ILP/TLS.')
+                    sys.stderr.write('Starting `haproxy` for ILP/TLS.\n')
                     HA_PROXY_FIXTURE.start()
 
                 test_prog = unittest.TestProgram(exit=False)
