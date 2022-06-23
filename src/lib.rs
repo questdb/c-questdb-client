@@ -33,7 +33,8 @@ use std::path::Path;
 use socket2::{Domain, Socket, SockAddr, Type, Protocol};
 use base64ct::{Base64, Base64UrlUnpadded, Encoding};
 use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
-use rustls::{OwnedTrustAnchor, RootCertStore, ClientConnection, ServerName};
+use rustls::{
+    OwnedTrustAnchor, RootCertStore, ClientConnection, ServerName, StreamOwned};
 
 #[derive(Debug, Copy, Clone)]
 enum Op {
@@ -278,45 +279,41 @@ fn write_escaped_quoted(output: &mut String, s: &str) {
         s)
 }
 
-struct Connection {
-    sock: Socket,
-    tls_conn: Option<ClientConnection>,
-    tls_stream: Option<rustls::Stream>
+enum Connection {
+    Direct(Socket),
+    Tls(StreamOwned<ClientConnection, Socket>)
 }
 
 impl Connection {
-    fn new(sock: Socket) -> Self {
-        Self { sock: sock, tls_conn: None, tls_stream: None }
+    fn sock(&self) -> &Socket {
+        match self {
+            Self::Direct(sock) => sock,
+            Self::Tls(stream) => &stream.sock
+        }
     }
 }
 
 impl io::Read for Connection {
-    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        if let Some(tls_conn) = &mut self.tls_conn {
-            tls_conn.reader().read(bytes)
-        }
-        else {
-            self.sock.read(bytes)
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Direct(sock) => sock.read(buf),
+            Self::Tls(stream) => stream.read(buf)
         }
     }
 }
 
 impl io::Write for Connection {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if let Some(tls_conn) = &mut self.tls_conn {
-            tls_conn.writer().write(bytes)
-        }
-        else {
-            self.sock.write(bytes)
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Direct(sock) => sock.write(buf),
+            Self::Tls(stream) => stream.write(buf)
         }
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        if let Some(tls_conn) = &mut self.tls_conn {
-            tls_conn.writer().flush()
-        }
-        else {
-            self.sock.flush()
+        match self {
+            Self::Direct(sock) => sock.flush(),
+            Self::Tls(stream) => stream.flush()
         }
     }
 }
@@ -531,26 +528,29 @@ impl <'a> LineSenderBuilder<'a> {
                 let prefix = format!("Could not connect to {:?}: ", host_port);
                 map_io_to_socket_err(&prefix, io_err)
             })?;
+        let conn = match configure_tls(&self.tls)? {
+                Some(tls_config) => {
+                    let server_name: ServerName = self.host.try_into()
+                        .map_err(|inv_dns_err| Error {
+                            code: ErrorCode::TlsError,
+                            msg: format!("Bad host: {}", inv_dns_err)})?;
+                    let tls_conn = ClientConnection::new(
+                        tls_config, server_name)
+                            .map_err(|rustls_err| Error {
+                                code: ErrorCode::TlsError,
+                                msg: format!(
+                                    "Could not create TLS client: {}",
+                                    rustls_err)})?;
+                    Connection::Tls(StreamOwned::new(tls_conn, sock))
+                },
+                None => Connection::Direct(sock)
+            };
         let mut sender = LineSender {
-            conn: Connection{ sock: sock, tls_conn: None},
+            conn: conn,
             state: State::Connected,
             output: String::with_capacity(self.capacity),
             last_line_start: 0usize
         };
-        if let Some(tls_config) = configure_tls(&self.tls)? {
-            let server_name: ServerName = self.host.try_into()
-                .map_err(|inv_dns_err| Error {
-                    code: ErrorCode::TlsError,
-                    msg: format!("Bad host: {}", inv_dns_err)})?;
-            sender.conn.tls_conn = Some(
-                ClientConnection::new(tls_config, server_name)
-                    .map_err(|rustls_err| Error {
-                        code: ErrorCode::TlsError,
-                        msg: format!(
-                            "Could not create TLS client: {}",
-                            rustls_err)})?);
-            
-        }
         if let Some(auth) = self.auth {
             sender.authenticate(auth)?;
         }
@@ -602,7 +602,7 @@ impl LineSender {
 
     fn read_challenge(&mut self) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
-        self.conn.sock.set_read_timeout(Some(Duration::from_secs(15)))
+        self.conn.sock().set_read_timeout(Some(Duration::from_secs(15)))
             .map_err(|io_err| map_io_to_socket_err(
                 "Failed to set read timeout on socket: ", io_err))?;
         let mut reader = BufReader::new(&mut self.conn);
