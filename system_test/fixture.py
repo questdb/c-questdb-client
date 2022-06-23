@@ -204,7 +204,7 @@ class QuestDbFixture:
                 http.min.enabled=false
                 line.udp.enabled=false
                 cairo.max.uncommitted.rows=1
-                line.tcp.maintenance.job.interval=100
+                # line.tcp.maintenance.job.interval=100
                 {auth_config}
                 ''').lstrip('\n'))
 
