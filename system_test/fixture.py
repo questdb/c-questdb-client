@@ -211,6 +211,7 @@ class QuestDbFixture:
                 line.udp.enabled=false
                 cairo.max.uncommitted.rows=1
                 line.tcp.maintenance.job.interval=100
+                line.tcp.min.idle.ms.before.writer.release=300
                 {auth_config}
                 ''').lstrip('\n'))
 
@@ -219,7 +220,8 @@ class QuestDbFixture:
             java,
             '-DQuestDB-Runtime-0',
             '-ea',
-            '-Dnoebug',
+            #'-Dnoebug',
+            '-Debug',
             '-XX:+UnlockExperimentalVMOptions',
             '-XX:+AlwaysPreTouch',
             '-XX:+UseParallelOldGC',

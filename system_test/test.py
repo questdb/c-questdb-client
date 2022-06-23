@@ -85,7 +85,7 @@ def retry_check_table(
         table_name,
         *,
         min_rows=1,
-        timeout_sec=60,
+        timeout_sec=15,
         log=True,
         log_ctx=None):
     sql_query = f"select * from '{table_name}'"
