@@ -198,6 +198,11 @@ def _setup_cdll():
         c_size_t,
         c_line_sender_p)
     set_sig(
+        dll.line_sender_peek_pending,
+        c_char_p,
+        c_line_sender_p,
+        c_size_t_p)
+    set_sig(
         dll.line_sender_flush,
         c_bool,
         c_line_sender_p,
@@ -210,6 +215,8 @@ _DLL = _setup_cdll()
 _PY_DLL = ctypes.pythonapi
 _PY_DLL.PyUnicode_FromKindAndData.restype = ctypes.py_object
 _PY_DLL.PyUnicode_FromKindAndData.argtypes = [c_int, c_void_p, c_ssize_t]
+_PY_DLL.PyUnicode_FromStringAndSize.restype = ctypes.py_object
+_PY_DLL.PyUnicode_FromStringAndSize.argtypes = [c_char_p, c_ssize_t]
 
 
 class LineSenderError(Exception):
@@ -393,6 +400,15 @@ class LineSender:
     def pending_size(self):
         if self._impl:
             return _DLL.line_sender_pending_size(self._impl)
+        else:
+            return 0
+
+    def peek_pending(self) -> str:
+        if self._impl:
+            len = c_size_t(0)
+            buf = _DLL.line_sender_peek_pending(self._impl, ctypes.byref(len))
+            len = c_ssize_t(len.value)
+            return _PY_DLL.PyUnicode_FromStringAndSize(buf, len)
         else:
             return 0
 

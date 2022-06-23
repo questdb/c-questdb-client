@@ -586,6 +586,10 @@ impl LineSender {
         }
     }
 
+    pub fn peek_pending(&self) -> &str {
+        self.output.as_str()
+    }
+
     fn update_last_line_start(&mut self) {
         self.last_line_start = self.pending_size();
     }

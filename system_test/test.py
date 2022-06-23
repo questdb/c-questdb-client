@@ -25,6 +25,7 @@
 ################################################################################
 
 import sys
+import textwrap
 sys.dont_write_bytecode = True
 
 import math
@@ -79,7 +80,13 @@ def http_sql_query(sql_query):
     return data
 
 
-def retry_check_table(table_name, min_rows=1, timeout_sec=60):
+def retry_check_table(
+        table_name,
+        *,
+        min_rows=1,
+        timeout_sec=60,
+        log=True,
+        log_ctx=None):
     sql_query = f"select * from '{table_name}'"
     def check_table():
         try:
@@ -95,11 +102,15 @@ def retry_check_table(table_name, min_rows=1, timeout_sec=60):
     try:
         return retry(check_table, timeout_sec=timeout_sec)
     except TimeoutError as toe:
-        sys.stderr.write(
-            f'Timed out after {timeout_sec} ' +
-            f'waiting for query {sql_query!r}. ' +
-            f'Tail of QuestDB log: ')
-        QDB_FIXTURE.print_log_tail()
+        if log:
+            if log_ctx:
+                log_ctx = f'\n{textwrap.indent(log_ctx, "    ")}\n'
+            sys.stderr.write(
+                f'Timed out after {timeout_sec} seconds ' +
+                f'waiting for query {sql_query!r}. ' +
+                f'Context: {log_ctx}'
+                f'Tail of QuestDB log:\n')
+            QDB_FIXTURE.print_log_tail()
         raise toe
 
 
@@ -155,6 +166,7 @@ class TestLineSender(unittest.TestCase):
 
     def test_insert_three_rows(self):
         table_name = uuid.uuid4().hex
+        pending = None
         with self._mk_linesender() as sender:
             for _ in range(3):
                 (sender
@@ -165,10 +177,10 @@ class TestLineSender(unittest.TestCase):
                     .column('name_d', 2.5)
                     .column('name_e', 'val_b')
                     .at_now())
-
+            pending = sender.peek_pending()
             sender.flush()
 
-        resp = retry_check_table(table_name, min_rows=3)
+        resp = retry_check_table(table_name, min_rows=3, log_ctx=pending)
         exp_columns = [
             {'name': 'name_a', 'type': 'SYMBOL'},
             {'name': 'name_b', 'type': 'BOOLEAN'},
@@ -190,6 +202,7 @@ class TestLineSender(unittest.TestCase):
             self.skipTest('No support for duplicate column names.')
             return
         table_name = uuid.uuid4().hex
+        pending = None
         with self._mk_linesender() as sender:
             (sender
                 .table(table_name)
@@ -198,8 +211,9 @@ class TestLineSender(unittest.TestCase):
                 .column('b', False)
                 .column('b', 'C')
                 .at_now())
+            pending = sender.peek_pending()
 
-        resp = retry_check_table(table_name)
+        resp = retry_check_table(table_name, log_ctx=pending)
         exp_columns = [
             {'name': 'a', 'type': 'SYMBOL'},
             {'name': 'b', 'type': 'BOOLEAN'},
@@ -215,14 +229,16 @@ class TestLineSender(unittest.TestCase):
             self.skipTest('No support for duplicate column names.')
             return
         table_name = uuid.uuid4().hex
+        pending = None
         with self._mk_linesender() as sender:
             (sender
                 .table(table_name)
                 .symbol('a', 'A')
                 .column('a', 'B')
                 .at_now())
+            pending = sender.peek_pending()
 
-        resp = retry_check_table(table_name)
+        resp = retry_check_table(table_name, log_ctx=pending)
         exp_columns = [
             {'name': 'a', 'type': 'SYMBOL'},
             {'name': 'timestamp', 'type': 'TIMESTAMP'}]
@@ -234,13 +250,15 @@ class TestLineSender(unittest.TestCase):
 
     def test_single_symbol(self):
         table_name = uuid.uuid4().hex
+        pending = None
         with self._mk_linesender() as sender:
             (sender
                 .table(table_name)
                 .symbol('a', 'A')
                 .at_now())
+            pending = sender.peek_pending()
 
-        resp = retry_check_table(table_name)
+        resp = retry_check_table(table_name, log_ctx=pending)
         exp_columns = [
             {'name': 'a', 'type': 'SYMBOL'},
             {'name': 'timestamp', 'type': 'TIMESTAMP'}]
@@ -252,14 +270,16 @@ class TestLineSender(unittest.TestCase):
 
     def test_two_columns(self):
         table_name = uuid.uuid4().hex
+        pending = None
         with self._mk_linesender() as sender:
             (sender
                 .table(table_name)
                 .column('a', 'A')
                 .column('b', 'B')
                 .at_now())
+            pending = sender.peek_pending()
 
-        resp = retry_check_table(table_name)
+        resp = retry_check_table(table_name, log_ctx=pending)
         exp_columns = [
             {'name': 'a', 'type': 'STRING'},
             {'name': 'b', 'type': 'STRING'},
@@ -272,6 +292,7 @@ class TestLineSender(unittest.TestCase):
 
     def test_mismatched_types_across_rows(self):
         table_name = uuid.uuid4().hex
+        pending = None
         with self._mk_linesender() as sender:
             (sender
                 .table(table_name)
@@ -281,9 +302,10 @@ class TestLineSender(unittest.TestCase):
                 .table(table_name)
                 .column('a', 'B')  # STRING
                 .at_now())
+            pending = sender.peek_pending()
 
         # We only ever get the first row back.
-        resp = retry_check_table(table_name)
+        resp = retry_check_table(table_name, log_ctx=pending)
         exp_columns = [
             {'name': 'a', 'type': 'SYMBOL'},
             {'name': 'timestamp', 'type': 'TIMESTAMP'}]
@@ -295,7 +317,7 @@ class TestLineSender(unittest.TestCase):
 
         # The second one is dropped and will not appear in results.
         with self.assertRaises(TimeoutError):
-            retry_check_table(table_name, min_rows=2, timeout_sec=1)
+            retry_check_table(table_name, min_rows=2, timeout_sec=1, log=False)
 
     def test_at(self):
         if QDB_FIXTURE.version <= (6, 0, 7, 1):
@@ -303,26 +325,30 @@ class TestLineSender(unittest.TestCase):
             return
         table_name = uuid.uuid4().hex
         at_ts_ns = 1647357688714369403
+        pending = None
         with self._mk_linesender() as sender:
             (sender
                 .table(table_name)
                 .symbol('a', 'A')
                 .at(at_ts_ns))
+            pending = sender.peek_pending()
 
-        resp = retry_check_table(table_name)
+        resp = retry_check_table(table_name, log_ctx=pending)
         exp_dataset = [['A', ns_to_qdb_date(at_ts_ns)]]
         self.assertEqual(resp['dataset'], exp_dataset)
 
     def test_underscores(self):
         table_name = f'_{uuid.uuid4().hex}_'
+        pending = None
         with self._mk_linesender() as sender:
             (sender
                 .table(table_name)
                 .symbol('_a_b_c_', 'A')
                 .column('_d_e_f_', True)
                 .at_now())
+            pending = sender.peek_pending()
 
-        resp = retry_check_table(table_name)
+        resp = retry_check_table(table_name, log_ctx=pending)
         exp_columns = [
             {'name': '_a_b_c_', 'type': 'SYMBOL'},
             {'name': '_d_e_f_', 'type': 'BOOLEAN'},
@@ -339,6 +365,7 @@ class TestLineSender(unittest.TestCase):
             return
         table_name = uuid.uuid4().hex
         smilie = b'\xf0\x9f\x98\x81'.decode('utf-8')
+        pending = None
         with self._mk_linesender() as sender:
             sender.table(table_name)
             sender.symbol(smilie, smilie)
@@ -346,8 +373,9 @@ class TestLineSender(unittest.TestCase):
             #     char = chr(num)
             #     sender.column(char, char)
             sender.at_now()
+            pending = sender.peek_pending()
 
-        resp = retry_check_table(table_name)
+        resp = retry_check_table(table_name, log_ctx=pending)
         exp_columns = [
             {'name': smilie, 'type': 'SYMBOL'},
             {'name': 'timestamp', 'type': 'TIMESTAMP'}]
@@ -388,13 +416,18 @@ class TestLineSender(unittest.TestCase):
             # 1.7976931348623157e+308,
             # -1.7976931348623157e+308]
         table_name = uuid.uuid4().hex
+        pending = None
         with self._mk_linesender() as sender:
             for num in numbers:
                 sender.table(table_name)
                 sender.column('n', num)
                 sender.at_now()
+            pending = sender.peek_pending()
 
-        resp = retry_check_table(table_name, len(numbers))
+        resp = retry_check_table(
+            table_name,
+            min_rows=len(numbers),
+            log_ctx=pending)
         exp_columns = [
             {'name': 'n', 'type': 'DOUBLE'},
             {'name': 'timestamp', 'type': 'TIMESTAMP'}]
