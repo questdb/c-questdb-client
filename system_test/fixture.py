@@ -194,7 +194,7 @@ class QuestDbFixture:
     def print_log_tail(self):
         with open(self._log_path, 'r', encoding='utf-8') as log_file:
             lines = log_file.readlines()
-            buf = ''.join(lines[-100:])
+            buf = ''.join(lines[-300:])
             sys.stderr.write(textwrap.indent(buf, '    '))
             sys.stderr.write('\n\n')
 

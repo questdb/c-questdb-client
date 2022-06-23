@@ -46,6 +46,7 @@ import urllib.parse
 import urllib.error
 import json
 import subprocess
+from pprint import pformat
 from collections import namedtuple
 
 
@@ -88,9 +89,11 @@ def retry_check_table(
         log=True,
         log_ctx=None):
     sql_query = f"select * from '{table_name}'"
+    http_response_log = []
     def check_table():
         try:
             resp = http_sql_query(sql_query)
+            http_response_log.append((time.time(), resp))
             if not resp.get('dataset'):
                 return False
             elif len(resp['dataset']) < min_rows:
@@ -108,8 +111,10 @@ def retry_check_table(
             sys.stderr.write(
                 f'Timed out after {timeout_sec} seconds ' +
                 f'waiting for query {sql_query!r}. ' +
-                f'Context: {log_ctx}'
-                f'Tail of QuestDB log:\n')
+                f'Context: {log_ctx}' +
+                f'Client response log:\n' +
+                pformat(http_response_log) +
+                f'\nTail of QuestDB log:\n')
             QDB_FIXTURE.print_log_tail()
         raise toe
 
