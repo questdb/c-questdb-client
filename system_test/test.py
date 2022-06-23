@@ -48,6 +48,7 @@ import urllib.error
 import json
 import subprocess
 import shutil
+from pprint import pformat
 from collections import namedtuple
 
 
@@ -95,13 +96,15 @@ def retry_check_table(
         table_name,
         *,
         min_rows=1,
-        timeout_sec=60,
+        timeout_sec=15,
         log=True,
         log_ctx=None):
     sql_query = f"select * from '{table_name}'"
+    http_response_log = []
     def check_table():
         try:
             resp = http_sql_query(sql_query)
+            http_response_log.append((time.time(), resp))
             if not resp.get('dataset'):
                 return False
             elif len(resp['dataset']) < min_rows:
@@ -119,8 +122,10 @@ def retry_check_table(
             sys.stderr.write(
                 f'Timed out after {timeout_sec} seconds ' +
                 f'waiting for query {sql_query!r}. ' +
-                f'Context: {log_ctx}'
-                f'Tail of QuestDB log:\n')
+                f'Context: {log_ctx}' +
+                f'Client response log:\n' +
+                pformat(http_response_log) +
+                f'\nTail of QuestDB log:\n')
             QDB_FIXTURE.print_log_tail()
         raise toe
 
@@ -462,7 +467,7 @@ class TestLineSender(unittest.TestCase):
         proj = Project()
         ext = '.exe' if sys.platform == 'win32' else ''
         bin_path = next(proj.build_dir.glob(f'**/{bin_name}{ext}'))
-        args = [str(bin_path), "localhost", str(QDB_FIXTURE.line_tcp_port)]
+        args = [str(bin_path), "127.0.0.1", str(QDB_FIXTURE.line_tcp_port)]
         subprocess.check_call(args, cwd=bin_path.parent)
 
         # Check inserted data.
@@ -577,7 +582,7 @@ def parse_args():
         type=str,
         metavar='HOST:ILP_PORT:HTTP_PORT',
         help=('Test against existing running instance. ' +
-              'e.g. `localhost:9009:9000`'))
+              'e.g. `127.0.0.1:9009:9000`'))
     list_p = sub_p.add_parser('list', help='List latest -n releases.')
     list_p.set_defaults(command='list')
     list_p.add_argument('-n', type=int, default=30, help='number of releases')

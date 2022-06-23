@@ -180,7 +180,7 @@ class QuestDbFixture:
         self._conf_path = self._conf_dir / 'server.conf'
         self._log = None
         self._proc = None
-        self.host = 'localhost'
+        self.host = '127.0.0.1'
         self.http_server_port = None
         self.line_tcp_port = None
         self.pg_port = None
@@ -194,7 +194,7 @@ class QuestDbFixture:
     def print_log_tail(self):
         with open(self._log_path, 'r', encoding='utf-8') as log_file:
             lines = log_file.readlines()
-            buf = ''.join(lines[-100:])
+            buf = ''.join(lines[-300:])
             sys.stderr.write(textwrap.indent(buf, '    '))
             sys.stderr.write('\n\n')
 
@@ -211,6 +211,7 @@ class QuestDbFixture:
                 line.udp.enabled=false
                 cairo.max.uncommitted.rows=1
                 line.tcp.maintenance.job.interval=100
+                line.tcp.min.idle.ms.before.writer.release=300
                 {auth_config}
                 ''').lstrip('\n'))
 
@@ -219,7 +220,8 @@ class QuestDbFixture:
             java,
             '-DQuestDB-Runtime-0',
             '-ea',
-            '-Dnoebug',
+            #'-Dnoebug',
+            '-Debug',
             '-XX:+UnlockExperimentalVMOptions',
             '-XX:+AlwaysPreTouch',
             '-XX:+UseParallelOldGC',
@@ -242,7 +244,7 @@ class QuestDbFixture:
                 if self._proc.poll() is not None:
                     raise RuntimeError('QuestDB died during startup.')
                 req = urllib.request.Request(
-                    f'http://localhost:{self.http_server_port}',
+                    f'http://127.0.0.1:{self.http_server_port}',
                     method='HEAD')
                 try:
                     resp = urllib.request.urlopen(req, timeout=1)
