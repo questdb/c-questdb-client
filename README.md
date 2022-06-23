@@ -250,7 +250,7 @@ questdb::ilp::sec_opts sec_opts{
 questdb::ilp::line_sender sender{host, port, sec_opts};
 ```
 
-For a complete example, see [examples/line_sender_cpp_example_auth.cpp](examples/line_sender_c_example_auth.c)
+For a complete example, see [examples/line_sender_cpp_example_auth.cpp](examples/line_sender_cpp_example_auth.cpp)
 
 ## If you don't see any data
 

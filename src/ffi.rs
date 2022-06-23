@@ -642,6 +642,22 @@ pub extern "C" fn line_sender_pending_size(
     sender.pending_size()
 }
 
+/// Peek into the accumulated buffer that is to be sent out at the next `flush`.
+///
+/// @param[in] sender Line sender object.
+/// @param[out] len_out The length in bytes of the accumulated buffer.
+/// @return UTF-8 encoded buffer. The buffer is not nul-terminated.
+#[no_mangle]
+pub extern "C" fn line_sender_peek_pending(
+    sender: *const line_sender,
+    len_out: *mut libc::size_t) -> *const libc::c_char
+{
+    let sender = unwrap_sender(sender);
+    let buf: &[u8] = sender.peek_pending().as_bytes();
+    unsafe { *len_out = buf.len() };
+    buf.as_ptr() as *const libc::c_char
+}
+
 /// Send batch-up rows messages to the QuestDB server.
 ///
 /// After sending a batch, you can close the connection or begin preparing
