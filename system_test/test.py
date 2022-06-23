@@ -451,7 +451,7 @@ class TestLineSender(unittest.TestCase):
         proj = Project()
         ext = '.exe' if sys.platform == 'win32' else ''
         bin_path = next(proj.build_dir.glob(f'**/{bin_name}{ext}'))
-        args = [str(bin_path), "localhost", str(QDB_FIXTURE.line_tcp_port)]
+        args = [str(bin_path), "127.0.0.1", str(QDB_FIXTURE.line_tcp_port)]
         subprocess.check_call(args, cwd=bin_path.parent)
 
         # Check inserted data.
@@ -566,7 +566,7 @@ def parse_args():
         type=str,
         metavar='HOST:ILP_PORT:HTTP_PORT',
         help=('Test against existing running instance. ' +
-              'e.g. `localhost:9009:9000`'))
+              'e.g. `127.0.0.1:9009:9000`'))
     list_p = sub_p.add_parser('list', help='List latest -n releases.')
     list_p.set_defaults(command='list')
     list_p.add_argument('-n', type=int, default=30, help='number of releases')
