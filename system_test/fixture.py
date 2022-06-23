@@ -191,6 +191,12 @@ class QuestDbFixture:
             with open(auth_txt_path, 'w', encoding='utf-8') as auth_file:
                 auth_file.write(AUTH_TXT)
 
+    def print_log_tail(self):
+        with open(self._log_path, 'r', encoding='utf-8') as log_file:
+            lines = log_file.readlines()
+            buf = ''.join(lines[-100:])
+            sys.stderr.write(textwrap.indent(buf, '    '))
+            sys.stderr.write('\n\n')
 
     def start(self):
         ports = discover_avail_ports(3)
@@ -255,11 +261,7 @@ class QuestDbFixture:
                 msg='Timed out waiting for HTTP service to come up.')
         except:
             sys.stderr.write(f'Failed to start, see full log: `{self._log_path}`. Tail:\n')
-            with open(self._log_path, 'r', encoding='utf-8') as log_file:
-                lines = log_file.readlines()
-                buf = ''.join(lines[-100:])
-                sys.stderr.write(textwrap.indent(buf, '    '))
-                sys.stderr.write('\n\n')
+            self.print_log_tail()
             raise
 
         atexit.register(self.stop)

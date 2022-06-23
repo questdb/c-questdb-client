@@ -80,9 +80,10 @@ def http_sql_query(sql_query):
 
 
 def retry_check_table(table_name, min_rows=1, timeout_sec=300):
+    sql_query = f"select * from '{table_name}'"
     def check_table():
         try:
-            resp = http_sql_query(f"select * from '{table_name}'")
+            resp = http_sql_query(sql_query)
             if not resp.get('dataset'):
                 return False
             elif len(resp['dataset']) < min_rows:
@@ -91,7 +92,15 @@ def retry_check_table(table_name, min_rows=1, timeout_sec=300):
         except QueryError:
             return None
 
-    return retry(check_table, timeout_sec=timeout_sec)
+    try:
+        return retry(check_table, timeout_sec=timeout_sec)
+    except TimeoutError as toe:
+        sys.stderr.write(
+            f'Timed out after {timeout_sec} ' +
+            f'waiting for query {sql_query!r}. ' +
+            f'Tail of QuestDB log: ')
+        QDB_FIXTURE.print_log_tail()
+        raise toe
 
 
 def ns_to_qdb_date(at_ts_ns):
