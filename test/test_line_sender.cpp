@@ -444,7 +444,7 @@ TEST_CASE("Bad connect")
         // Port 1 is generally the tcpmux service which one would
         // very much expect to never be running.
         questdb::ilp::line_sender sender{
-            "127.0.0.1",
+            "localhost",
             1};
         CHECK_MESSAGE(false, "Expected exception");
     }

@@ -53,7 +53,7 @@ Once you've all set up, you can take a look at our examples:
 line_sender_error* err = NULL;
 line_sender* sender = line_sender_connect(
   "0.0.0.0",   // bind to all interfaces
-  "127.0.0.1", // QuestDB hostname
+  "localhost", // QuestDB hostname
   "9009",      // QuestDB port
   &err);
 ```
@@ -69,7 +69,7 @@ See a [complete example in C](examples/line_sender_c_example.c).
 
 // Automatically connects on object construction.
 questdb::ilp::line_sender sender{
-  "127.0.0.1",  // QuestDB hostname
+  "localhost",  // QuestDB hostname
   "9009"};      // QuestDB port
 
 ```

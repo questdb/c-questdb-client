@@ -180,7 +180,7 @@ class QuestDbFixture:
         self._conf_path = self._conf_dir / 'server.conf'
         self._log = None
         self._proc = None
-        self.host = '127.0.0.1'
+        self.host = 'localhost'
         self.http_server_port = None
         self.line_tcp_port = None
         self.pg_port = None
@@ -244,7 +244,7 @@ class QuestDbFixture:
                 if self._proc.poll() is not None:
                     raise RuntimeError('QuestDB died during startup.')
                 req = urllib.request.Request(
-                    f'http://127.0.0.1:{self.http_server_port}',
+                    f'http://localhost:{self.http_server_port}',
                     method='HEAD')
                 try:
                     resp = urllib.request.urlopen(req, timeout=1)
