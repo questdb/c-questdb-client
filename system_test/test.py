@@ -114,8 +114,8 @@ def retry_check_table(
                 f'Context: {log_ctx}' +
                 f'Client response log:\n' +
                 pformat(http_response_log) +
-                f'\nTail of QuestDB log:\n')
-            QDB_FIXTURE.print_log_tail()
+                f'\nQuestDB log:\n')
+            QDB_FIXTURE.print_log()
         raise toe
 
 
