@@ -402,6 +402,7 @@ namespace questdb::ilp
          */
         line_sender& table(name_view name)
         {
+            ensure_impl();
             line_sender_error::wrapped_call(
                 ::line_sender_table,
                 _impl,
@@ -418,6 +419,7 @@ namespace questdb::ilp
          */
         line_sender& symbol(name_view name, utf8_view value)
         {
+            ensure_impl();
             line_sender_error::wrapped_call(
                 ::line_sender_symbol,
                 _impl,
@@ -438,6 +440,7 @@ namespace questdb::ilp
          */
         line_sender& column(name_view name, bool value)
         {
+            ensure_impl();
             line_sender_error::wrapped_call(
                 ::line_sender_column_bool,
                 _impl,
@@ -453,6 +456,7 @@ namespace questdb::ilp
          */
         line_sender& column(name_view name, int64_t value)
         {
+            ensure_impl();
             line_sender_error::wrapped_call(
                 ::line_sender_column_i64,
                 _impl,
@@ -468,6 +472,7 @@ namespace questdb::ilp
          */
         line_sender& column(name_view name, double value)
         {
+            ensure_impl();
             line_sender_error::wrapped_call(
                 ::line_sender_column_f64,
                 _impl,
@@ -483,6 +488,7 @@ namespace questdb::ilp
          */
         line_sender& column(name_view name, utf8_view value)
         {
+            ensure_impl();
             line_sender_error::wrapped_call(
                 ::line_sender_column_str,
                 _impl,
@@ -502,6 +508,7 @@ namespace questdb::ilp
          */
         void at(int64_t epoch_nanos)
         {
+            ensure_impl();
             line_sender_error::wrapped_call(
                 ::line_sender_at,
                 _impl,
@@ -514,6 +521,7 @@ namespace questdb::ilp
          */
         void at_now()
         {
+            ensure_impl();
             line_sender_error::wrapped_call(
                 ::line_sender_at_now,
                 _impl);
@@ -558,6 +566,7 @@ namespace questdb::ilp
          */
         void flush()
         {
+            ensure_impl();
             line_sender_error::wrapped_call(
                 ::line_sender_flush,
                 _impl);
@@ -592,6 +601,14 @@ namespace questdb::ilp
         }
 
     private:
+        void ensure_impl()
+        {
+            if (!_impl)
+                throw line_sender_error{
+                    line_sender_error_code::invalid_api_call,
+                    "Sender closed."};
+        }
+
         ::line_sender* _impl;
     };
 
