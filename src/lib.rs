@@ -511,7 +511,7 @@ impl <'a> LineSenderBuilder<'a> {
     /// Connect synchronously.
     pub fn connect(self) -> Result<LineSender> {
         let addr: SockAddr = gai::resolve_host_port(self.host, self.port)?;
-        let sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
+        let mut sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
             .map_err(|io_err| map_io_to_socket_err(
                 "Could not open TCP socket: ", io_err))?;
         sock.set_nodelay(true)
@@ -538,14 +538,21 @@ impl <'a> LineSenderBuilder<'a> {
                         .map_err(|inv_dns_err| Error {
                             code: ErrorCode::TlsError,
                             msg: format!("Bad host: {}", inv_dns_err)})?;
-                    let tls_conn = ClientConnection::new(
+                    let mut tls_conn = ClientConnection::new(
                         tls_config, server_name)
                             .map_err(|rustls_err| Error {
                                 code: ErrorCode::TlsError,
                                 msg: format!(
                                     "Could not create TLS client: {}",
                                     rustls_err)})?;
+                    tls_conn.complete_io(&mut sock)
+                        .map_err(|io_err| Error {
+                            code: ErrorCode::TlsError,
+                            msg: format!(
+                                "Failed to complete TLS handshake: {}",
+                                io_err)})?;
                     Connection::Tls(StreamOwned::new(tls_conn, sock))
+
                 },
                 None => Connection::Direct(sock)
             };
