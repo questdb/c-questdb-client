@@ -46,18 +46,28 @@ AUTH_TXT = """testUser1 ec-p-256-sha256 fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWS
 # [key/user id] [key type] {keyX keyY}"""
 
 
-def retry(predicate_task, timeout_sec=30, every=0.05, msg='Timed out retrying'):
+def retry(
+    predicate_task,
+    timeout_sec=30,
+    every=0.05,
+    msg='Timed out retrying',
+    backoff_till=5.0,
+    lead_sleep=0.1):
     """
     Repeat task every `interval` until it returns a truthy value or times out.
     """
     begin = time.monotonic()
     threshold = begin + timeout_sec
+    if lead_sleep:
+        time.sleep(lead_sleep)
     while True:
         res = predicate_task()
         if res:
             return res
         elif time.monotonic() < threshold:
             time.sleep(every)
+            if backoff_till:
+                every = min(backoff_till, every * 1.25)
         else:
             raise TimeoutError(msg)
 
