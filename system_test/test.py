@@ -96,7 +96,7 @@ def retry_check_table(
         table_name,
         *,
         min_rows=1,
-        timeout_sec=15,
+        timeout_sec=30,
         log=True,
         log_ctx=None):
     sql_query = f"select * from '{table_name}'"
@@ -125,8 +125,8 @@ def retry_check_table(
                 f'Context: {log_ctx}' +
                 f'Client response log:\n' +
                 pformat(http_response_log) +
-                f'\nTail of QuestDB log:\n')
-            QDB_FIXTURE.print_log_tail()
+                f'\nQuestDB log:\n')
+            QDB_FIXTURE.print_log()
         raise toe
 
 

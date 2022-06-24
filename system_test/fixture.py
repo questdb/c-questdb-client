@@ -46,18 +46,28 @@ AUTH_TXT = """testUser1 ec-p-256-sha256 fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWS
 # [key/user id] [key type] {keyX keyY}"""
 
 
-def retry(predicate_task, timeout_sec=30, every=0.05, msg='Timed out retrying'):
+def retry(
+    predicate_task,
+    timeout_sec=30,
+    every=0.05,
+    msg='Timed out retrying',
+    backoff_till=5.0,
+    lead_sleep=0.1):
     """
     Repeat task every `interval` until it returns a truthy value or times out.
     """
     begin = time.monotonic()
     threshold = begin + timeout_sec
+    if lead_sleep:
+        time.sleep(lead_sleep)
     while True:
         res = predicate_task()
         if res:
             return res
         elif time.monotonic() < threshold:
             time.sleep(every)
+            if backoff_till:
+                every = min(backoff_till, every * 1.25)
         else:
             raise TimeoutError(msg)
 
@@ -191,11 +201,10 @@ class QuestDbFixture:
             with open(auth_txt_path, 'w', encoding='utf-8') as auth_file:
                 auth_file.write(AUTH_TXT)
 
-    def print_log_tail(self):
+    def print_log(self):
         with open(self._log_path, 'r', encoding='utf-8') as log_file:
-            lines = log_file.readlines()
-            buf = ''.join(lines[-300:])
-            sys.stderr.write(textwrap.indent(buf, '    '))
+            log = log_file.read()
+            sys.stderr.write(textwrap.indent(log, '    '))
             sys.stderr.write('\n\n')
 
     def start(self):
@@ -262,8 +271,8 @@ class QuestDbFixture:
                 timeout_sec=45,
                 msg='Timed out waiting for HTTP service to come up.')
         except:
-            sys.stderr.write(f'Failed to start, see full log: `{self._log_path}`. Tail:\n')
-            self.print_log_tail()
+            sys.stderr.write(f'QuestDB log at `{self._log_path}`:\n')
+            self.print_log()
             raise
 
         atexit.register(self.stop)
