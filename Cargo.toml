@@ -14,7 +14,6 @@ dns-lookup = "1.0.8"
 base64ct = { version = "1.5.0", features = ["alloc"] }
 ring = "0.16.20"
 rustls = "0.20.6"
-# rustls = { path = "./rustls/rustls" }
 rustls-pemfile = "1.0.0"
 webpki-roots = "0.22.3"
 
