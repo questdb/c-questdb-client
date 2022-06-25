@@ -90,6 +90,9 @@ compile_example(
 compile_example(
     line_sender_cpp_example_auth
     examples/line_sender_cpp_example_auth.cpp)
+compile_example(
+    line_sender_cpp_example_tls
+    examples/line_sender_cpp_example_tls.cpp)
 
 # Unit test binaries.
 function(compile_test TARGET_NAME)

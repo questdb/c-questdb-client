@@ -565,6 +565,9 @@ class TestLineSender(unittest.TestCase):
     def test_tls_insecure_skip_verify(self):
         if not HA_PROXY_FIXTURE:
             self.skipTest('No `haproxy` fixture running.')
+        #     print(f'\nILP port: {QDB_FIXTURE.line_tcp_port}')
+        #     print(f'HTTP port: {QDB_FIXTURE.http_server_port}')
+        #     print(f'HAPROXY port: {HA_PROXY_FIXTURE.listen_port}')
         sender = qls.LineSender(
             QDB_FIXTURE.host,
             HA_PROXY_FIXTURE.listen_port,

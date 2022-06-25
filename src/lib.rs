@@ -28,7 +28,7 @@ use std::fmt::{self, Write, Display, Formatter};
 use std::io::{self, BufRead, BufReader};
 use std::io::Write as IoWrite;
 use std::sync::Arc;
-use std::path::Path;
+use std::path::PathBuf;
 
 use socket2::{Domain, Socket, SockAddr, Type, Protocol};
 use base64ct::{Base64, Base64UrlUnpadded, Encoding};
@@ -304,16 +304,31 @@ impl io::Read for Connection {
 
 impl io::Write for Connection {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        eprintln!("io::Write/Connection::write :: (A) buf: {:?}", std::str::from_utf8(buf).unwrap());
         match self {
             Self::Direct(sock) => sock.write(buf),
-            Self::Tls(stream) => stream.write(buf)
+            Self::Tls(stream) => {
+                eprintln!("io::Write/Connection::write :: (B) wants_read: {}, wants_write: {}", stream.conn.wants_read(), stream.conn.wants_write());
+                let written = stream.write(buf)?;
+                eprintln!("io::Write/Connection::write :: (C) wants_read: {}, wants_write: {}", stream.conn.wants_read(), stream.conn.wants_write());
+                // stream.conn.complete_io(&mut stream.sock)?;
+                eprintln!("io::Write/Connection::write :: (D) wants_read: {}, wants_write: {}", stream.conn.wants_read(), stream.conn.wants_write());
+                // stream.conn.complete_io(&mut stream.sock)?;
+                eprintln!("io::Write/Connection::write :: (E) wants_read: {}, wants_write: {}", stream.conn.wants_read(), stream.conn.wants_write());
+                Ok(written)
+            }
         }
     }
 
     fn flush(&mut self) -> io::Result<()> {
         match self {
             Self::Direct(sock) => sock.flush(),
-            Self::Tls(stream) => stream.flush()
+            Self::Tls(stream) => {
+                eprintln!("io::Write/Connection::flush :: (A)");
+                stream.flush()?;
+                eprintln!("io::Write/Connection::flush :: (B)");
+                Ok(())
+            }
         }
     }
 }
@@ -326,29 +341,29 @@ pub struct LineSender {
 }
 
 #[derive(Debug, Clone)]
-struct AuthParams<'a> {
-    key_id: &'a str,
-    priv_key: &'a str,
-    pub_key_x: &'a str,
-    pub_key_y: &'a str
+struct AuthParams {
+    key_id: String,
+    priv_key: String,
+    pub_key_x: String,
+    pub_key_y: String
 }
 
 #[derive(Debug, Clone)]
-pub enum CertificateAuthority<'a> {
+pub enum CertificateAuthority {
     WebpkiRoots,
-    File(&'a Path)
+    File(PathBuf)
 }
 
 #[derive(Debug, Clone)]
-pub enum Tls<'a> {
+pub enum Tls {
     Disabled,
-    Enabled(CertificateAuthority<'a>),
+    Enabled(CertificateAuthority),
 
     #[cfg(feature = "insecure_skip_verify")]
     InsecureSkipVerify
 }
 
-impl <'a> Tls<'a> {
+impl Tls {
     pub fn is_disabled(&self) -> bool {
         match self {
             Tls::Disabled => true,
@@ -357,14 +372,34 @@ impl <'a> Tls<'a> {
     }
 }
 
+pub struct Service(String);
+
+impl From<String> for Service {
+    fn from(s: String) -> Self {
+        Service(s)
+    }
+}
+
+impl From<&str> for Service {
+    fn from(s: &str) -> Self {
+        Service(s.to_owned())
+    }
+}
+
+impl From<u16> for Service {
+    fn from(p: u16) -> Self {
+        Service(p.to_string())
+    }
+}
+
 #[derive(Debug, Clone)]
-pub struct LineSenderBuilder<'a> {
+pub struct LineSenderBuilder {
     capacity: usize,
-    host: &'a str,
-    port: &'a str,
-    net_interface: Option<&'a str>,
-    auth: Option<AuthParams<'a>>,
-    tls: Tls<'a>,
+    host: String,
+    port: String,
+    net_interface: Option<String>,
+    auth: Option<AuthParams>,
+    tls: Tls,
 }
 
 #[cfg(feature = "insecure_skip_verify")]
@@ -460,13 +495,14 @@ fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
     Ok(Some(Arc::new(config)))
 }
 
-impl <'a> LineSenderBuilder<'a> {
+impl LineSenderBuilder {
     /// QuestDB server and port.
-    pub fn new(host: &'a str, port: &'a str) -> Self {
+    pub fn new<H: Into<String>, P: Into<Service>>(host: H, port: P) -> Self {
+        let service: Service = port.into();
         Self {
             capacity: 65536,
-            host: host,
-            port: port,
+            host: host.into(),
+            port: service.0,
             net_interface: None,
             auth: None,
             tls: Tls::Disabled
@@ -480,37 +516,42 @@ impl <'a> LineSenderBuilder<'a> {
     }
 
     /// Select local outbound interface.
-    pub fn net_interface(&mut self, addr: &'a str) -> &mut Self {
-        self.net_interface = Some(addr);
+    pub fn net_interface<I: Into<String>>(&mut self, addr: I) -> &mut Self {
+        self.net_interface = Some(addr.into());
         self
     }
 
     /// Authentication Parameters.
-    pub fn auth(
+    pub fn auth<A, B, C, D>(
         &mut self,
-        key_id: &'a str,
-        priv_key: &'a str,
-        pub_key_x: &'a str,
-        pub_key_y: &'a str) -> &mut Self
+        key_id: A,
+        priv_key: B,
+        pub_key_x: C,
+        pub_key_y: D) -> &mut Self
+            where
+                A: Into<String>,
+                B: Into<String>,
+                C: Into<String>,
+                D: Into<String>
     {
         self.auth = Some(AuthParams {
-            key_id: key_id,
-            priv_key: priv_key,
-            pub_key_x: pub_key_x,
-            pub_key_y: pub_key_y
+            key_id: key_id.into(),
+            priv_key: priv_key.into(),
+            pub_key_x: pub_key_x.into(),
+            pub_key_y: pub_key_y.into()
         });
         self
     }
 
     /// Configure TLS negotiation.
-    pub fn tls(&mut self, tls: Tls<'a>) -> &mut Self {
+    pub fn tls(&mut self, tls: Tls) -> &mut Self {
         self.tls = tls;
         self
     }
 
     /// Connect synchronously.
     pub fn connect(self) -> Result<LineSender> {
-        let addr: SockAddr = gai::resolve_host_port(self.host, self.port)?;
+        let addr: SockAddr = gai::resolve_host_port(self.host.as_str(), self.port.as_str())?;
         let mut sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
             .map_err(|io_err| map_io_to_socket_err(
                 "Could not open TCP socket: ", io_err))?;
@@ -518,13 +559,13 @@ impl <'a> LineSenderBuilder<'a> {
             .map_err(|io_err| map_io_to_socket_err(
                 "Could not set TCP_NODELAY: ", io_err))?;
         if let Some(host) = self.net_interface {
-            let bind_addr = gai::resolve_host(host)?;
+            let bind_addr = gai::resolve_host(host.as_str())?;
             sock.bind(&bind_addr)
-            .map_err(|io_err| map_io_to_socket_err(
-                &format!(
-                    "Could not bind to interface address {:?}: ",
-                    host),
-                io_err))?;
+                .map_err(|io_err| map_io_to_socket_err(
+                    &format!(
+                        "Could not bind to interface address {:?}: ",
+                        host),
+                    io_err))?;
         }
         sock.connect(&addr)
             .map_err(|io_err| {
@@ -534,7 +575,7 @@ impl <'a> LineSenderBuilder<'a> {
             })?;
         let conn = match configure_tls(&self.tls)? {
                 Some(tls_config) => {
-                    let server_name: ServerName = self.host.try_into()
+                    let server_name: ServerName = self.host.as_str().try_into()
                         .map_err(|inv_dns_err| Error {
                             code: ErrorCode::TlsError,
                             msg: format!("Bad host: {}", inv_dns_err)})?;
@@ -545,14 +586,15 @@ impl <'a> LineSenderBuilder<'a> {
                                 msg: format!(
                                     "Could not create TLS client: {}",
                                     rustls_err)})?;
-                    tls_conn.complete_io(&mut sock)
-                        .map_err(|io_err| Error {
-                            code: ErrorCode::TlsError,
-                            msg: format!(
-                                "Failed to complete TLS handshake: {}",
-                                io_err)})?;
+                    while tls_conn.wants_write() || tls_conn.is_handshaking() {
+                        tls_conn.complete_io(&mut sock)
+                            .map_err(|io_err| Error {
+                                code: ErrorCode::TlsError,
+                                msg: format!(
+                                    "Failed to complete TLS handshake: {}",
+                                    io_err)})?;
+                    }
                     Connection::Tls(StreamOwned::new(tls_conn, sock))
-
                 },
                 None => Connection::Direct(sock)
             };
@@ -562,7 +604,7 @@ impl <'a> LineSenderBuilder<'a> {
             output: String::with_capacity(self.capacity),
             last_line_start: 0usize
         };
-        if let Some(auth) = self.auth {
+        if let Some(auth) = self.auth.as_ref() {
             sender.authenticate(auth)?;
         }
         Ok(sender)
@@ -591,9 +633,9 @@ fn parse_public_key(pub_key_x: &str, pub_key_y: &str) -> Result<Vec<u8>> {
     Ok(encoded)
 }
 
-fn parse_key_pair<'a>(auth: &AuthParams<'a>) -> Result<EcdsaKeyPair> {
-    let private_key = b64_decode("private authentication key", auth.priv_key)?;
-    let public_key = parse_public_key(auth.pub_key_x, auth.pub_key_y)?;
+fn parse_key_pair(auth: &AuthParams) -> Result<EcdsaKeyPair> {
+    let private_key = b64_decode("private authentication key", auth.priv_key.as_str())?;
+    let public_key = parse_public_key(auth.pub_key_x.as_str(), auth.pub_key_y.as_str())?;
     EcdsaKeyPair::from_private_key_and_public_key(
         &ECDSA_P256_SHA256_FIXED_SIGNING,
         &private_key[..],
@@ -637,7 +679,7 @@ impl LineSender {
         Ok(buf)
     }
 
-    fn authenticate<'a>(&mut self, auth: AuthParams<'a>) -> Result<()> {
+    fn authenticate(&mut self, auth: &AuthParams) -> Result<()> {
         if auth.key_id.contains('\n') {
             return Err(Error {
                 code: ErrorCode::AuthError,
@@ -646,7 +688,7 @@ impl LineSender {
                     auth.key_id)});
         }
         let key_pair = parse_key_pair(&auth)?;
-        self.send_key_id(auth.key_id)?;
+        self.send_key_id(auth.key_id.as_str())?;
         let challenge = self.read_challenge()?;
         let rng = ring::rand::SystemRandom::new();
         let signature = key_pair.sign(&rng, &challenge[..]).
@@ -680,7 +722,7 @@ impl LineSender {
         Err(error)
     }
 
-    pub fn table<'a, N>(&mut self, name: N) -> Result<()>
+    pub fn table<'a, N>(&mut self, name: N) -> Result<&mut Self>
         where
             N: TryInto<Name<'a>>,
             Error: From<N::Error>
@@ -689,10 +731,10 @@ impl LineSender {
         self.check_state(Op::Table)?;
         write_escaped_unquoted(&mut self.output, name.name);
         self.state = State::TableWritten;
-        Ok(())
+        Ok(self)
     }
 
-    pub fn symbol<'a, N>(&mut self, name: N, value: &str) -> Result<()>
+    pub fn symbol<'a, N>(&mut self, name: N, value: &str) -> Result<&mut Self>
         where
             N: TryInto<Name<'a>>,
             Error: From<N::Error>
@@ -704,10 +746,10 @@ impl LineSender {
         self.output.push('=');
         write_escaped_unquoted(&mut self.output, value);
         self.state = State::SymbolWritten;
-        Ok(())
+        Ok(self)
     }
 
-    fn write_column_key<'a, N>(&mut self, name: N) -> Result<()>
+    fn write_column_key<'a, N>(&mut self, name: N) -> Result<&mut Self>
         where
             N: TryInto<Name<'a>>,
             Error: From<N::Error>
@@ -723,30 +765,30 @@ impl LineSender {
         write_escaped_unquoted(&mut self.output, name.name);
         self.output.push('=');
         self.state = State::ColumnWritten;
-        Ok(())
+        Ok(self)
     }
 
-    pub fn column_bool<'a, N>(&mut self, name: N, value: bool) -> Result<()>
+    pub fn column_bool<'a, N>(&mut self, name: N, value: bool) -> Result<&mut Self>
         where
             N: TryInto<Name<'a>>,
             Error: From<N::Error>
     {
         self.write_column_key(name)?;
         self.output.push(if value {'t'} else {'f'});
-        Ok(())
+        Ok(self)
     }
 
-    pub fn column_i64<'a, N>(&mut self, name: N, value: i64) -> Result<()>
+    pub fn column_i64<'a, N>(&mut self, name: N, value: i64) -> Result<&mut Self>
         where
             N: TryInto<Name<'a>>,
             Error: From<N::Error>
     {
         self.write_column_key(name)?;
         write!(&mut self.output, "{}i", value).unwrap();
-        Ok(())
+        Ok(self)
     }
 
-    pub fn column_f64<'a, N>(&mut self, name: N, value: f64) -> Result<()>
+    pub fn column_f64<'a, N>(&mut self, name: N, value: f64) -> Result<&mut Self>
         where
             N: TryInto<Name<'a>>,
             Error: From<N::Error>
@@ -761,17 +803,17 @@ impl LineSender {
         else {
             write!(&mut self.output, "{}", value).unwrap();
         }
-        Ok(())
+        Ok(self)
     }
 
-    pub fn column_str<'a, N>(&mut self, name: N, value: &str) -> Result<()>
+    pub fn column_str<'a, N>(&mut self, name: N, value: &str) -> Result<&mut Self>
         where
             N: TryInto<Name<'a>>,
             Error: From<N::Error>
     {
         self.write_column_key(name)?;
         write_escaped_quoted(&mut self.output, value);
-        Ok(())
+        Ok(self)
     }
 
     pub fn pending_size(&self) -> usize {
@@ -808,14 +850,17 @@ impl LineSender {
     }
 
     pub fn flush(&mut self) -> Result<()> {
+        eprintln!("sender.flush :: (A)");
         self.check_state(Op::Flush)?;
         let buf = self.output.as_bytes();
         if let Err(io_err) = self.conn.write_all(buf) {
+            eprintln!("sender.flush :: (B)");
             self.state = State::Moribund;
             return Err(map_io_to_socket_err(
                 "Could not flush buffered messages: ",
                 io_err));
         }
+        eprintln!("sender.flush :: (C)");
         self.output.clear();
         self.state = State::Connected;
         Ok(())
@@ -831,3 +876,6 @@ mod gai;
 #[allow(non_camel_case_types)]
 #[cfg(feature = "ffi")]
 pub mod ffi;
+
+#[cfg(test)]
+mod tests;

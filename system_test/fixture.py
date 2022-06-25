@@ -295,6 +295,9 @@ class QuestDbFixture:
 
 
 HAPROXY_CFG = """
+global
+    log stderr format raw local0 debug
+
 defaults
     timeout connect 5s
     timeout client 600s
@@ -303,6 +306,7 @@ defaults
 frontend ilpfront
     bind 0.0.0.0:{listen_port} ssl crt {pem_path}
     mode tcp
+    option tcplog
     default_backend ilp
 
 backend ilp
@@ -323,7 +327,7 @@ class HaProxyFixture:
         with open(self.haproxy_cfg_path, 'w', encoding='utf-8') as haproxy_cfg:
             haproxy_cfg.write(HAPROXY_CFG.format(
                 listen_port=self.listen_port,
-                pem_path=str(proj.system_test_dir / 'haproxy.pem'),
+                pem_path=str(proj.system_test_dir / 'certs' / 'server.pem'),
                 qdb_ilp_port=qdb_ilp_port))
         self._proc = None
 

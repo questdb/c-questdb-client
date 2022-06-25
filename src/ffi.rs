@@ -25,7 +25,7 @@
 use std::ascii;
 use std::boxed::Box;
 use std::convert::{From, Into};
-use std::path::Path;
+use std::path::PathBuf;
 use std::slice;
 use std::str;
 use std::ffi::CStr;
@@ -409,7 +409,7 @@ fn set_tls_sec_opts(
                     }
                     else {
                         let tls_ca = c_str_to_ref!(tls_ca, err_out);
-                        super::CertificateAuthority::File(Path::new(tls_ca))
+                        super::CertificateAuthority::File(PathBuf::from(tls_ca))
                     }),
             INSECURE_SKIP_VERIFY =>
                 super::Tls::InsecureSkipVerify,
@@ -738,13 +738,4 @@ pub extern "C" fn line_sender_flush(
         err_out,
         sender.flush());
     true
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn it_works() {
-        let result = 2 + 2;
-        assert_eq!(result, 4);
-    }
 }
