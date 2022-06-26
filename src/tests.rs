@@ -1,3 +1,27 @@
+/*******************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2022 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
 use super::*;
 
 use std::path::Path;
@@ -60,8 +84,7 @@ fn load_private_key(filename: &Path) -> rustls::PrivateKey {
 
 fn certs_dir() -> std::path::PathBuf {
     let mut certs_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    certs_dir.push("system_test");
-    certs_dir.push("certs");
+    certs_dir.push("tls_certs");
     certs_dir
 }
 
@@ -239,9 +262,7 @@ fn test_basics() -> TestResult {
 
 #[test]
 fn test_tls_with_file_ca() -> TestResult {
-    let mut ca_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    ca_path.push("system_test");
-    ca_path.push("certs");
+    let mut ca_path = certs_dir();
     ca_path.push("server_rootCA.pem");
 
     let server = MockServer::new()?;

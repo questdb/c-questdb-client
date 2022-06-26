@@ -327,7 +327,7 @@ class HaProxyFixture:
         with open(self.haproxy_cfg_path, 'w', encoding='utf-8') as haproxy_cfg:
             haproxy_cfg.write(HAPROXY_CFG.format(
                 listen_port=self.listen_port,
-                pem_path=str(proj.system_test_dir / 'certs' / 'server.pem'),
+                pem_path=str(proj.root_dir / 'tls_certs' / 'server.pem'),
                 qdb_ilp_port=qdb_ilp_port))
         self._proc = None
 
