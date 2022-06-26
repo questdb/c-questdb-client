@@ -112,28 +112,30 @@ impl MockServer {
         self.store_client(client)
     }
 
-    pub fn accept_tls(mut self) -> io::Result<Self> {
-        self.accept()?;
-        let client = self.client.as_mut().unwrap();
-        self.poll.registry().reregister(
-            client, CLIENT, Interest::READABLE | Interest::WRITABLE)?;
-        let mut tls_conn = ServerConnection::new(tls_config()).unwrap();
-        let mut stream = Stream::new(&mut tls_conn, client);
-        while stream.conn.is_handshaking() {
-            match stream.conn.complete_io(&mut stream.sock) {
-                Ok(_) => {
-                },
-                Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
-                    self.poll.poll(&mut self.events, None)?;
-                },
-                Err(err) => {
-                    return Err(err)
+    pub fn accept_tls(mut self) -> std::thread::JoinHandle<io::Result<Self>> {
+        std::thread::spawn(|| {
+            self.accept()?;
+            let client = self.client.as_mut().unwrap();
+            self.poll.registry().reregister(
+                client, CLIENT, Interest::READABLE | Interest::WRITABLE)?;
+            let mut tls_conn = ServerConnection::new(tls_config()).unwrap();
+            let mut stream = Stream::new(&mut tls_conn, client);
+            while stream.conn.is_handshaking() {
+                match stream.conn.complete_io(&mut stream.sock) {
+                    Ok(_) => {
+                    },
+                    Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        self.poll.poll(&mut self.events, None)?;
+                    },
+                    Err(err) => {
+                        return Err(err)
+                    }
                 }
             }
-        }
-        self.poll.registry().reregister(client, CLIENT, Interest::READABLE)?;
-        self.tls_conn = Some(tls_conn);
-        Ok(self)
+            self.poll.registry().reregister(client, CLIENT, Interest::READABLE)?;
+            self.tls_conn = Some(tls_conn);
+            Ok(self)
+        })
     }
 
     pub fn wait_for_data(&mut self, wait_timeout_sec: Option<f64>) -> io::Result<bool> {
@@ -165,7 +167,6 @@ impl MockServer {
         let mut accum = Vec::<u8>::new();
         let mut chunk = [0u8; 1024];
         loop {
-            eprintln!("recv :: (A)");
             let count = match self.do_read(&mut chunk[..]) {
                 Ok(count) => count,
                 Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
@@ -174,22 +175,15 @@ impl MockServer {
                 },
                 Err(err) => return Err(err)
             };
-            eprintln!("recv :: (B)");
             accum.extend(&chunk[..count]);
             if accum.len() < 2 {
-                eprintln!("recv :: (C)");
                 continue;
             }
             if (accum[accum.len() - 1] == b'\n') &&
                 (accum[accum.len() - 2] != b'\\') {
-                eprintln!("recv :: (D)");
                 break;
             }
-            let accum_str: String = accum.iter().map(|&c| c as char).collect();  //std::str::from_utf8(&accum[..]).unwrap();
-            eprintln!("recv :: (E) accum: {:?}", accum_str);
         }
-        let accum_str = std::str::from_utf8(&accum[..]).unwrap();
-        eprintln!("recv :: (F) accum: {:?}", accum_str);
 
         let mut received_count = 0usize;
         let mut head = 0usize;
@@ -204,7 +198,6 @@ impl MockServer {
                 received_count += 1;
             }
         }
-        eprintln!("recv :: (G) receive_count: {}, msgs: {:?}", received_count, self.msgs);
         Ok(received_count)
     }
 
@@ -247,22 +240,12 @@ fn test_basics() -> TestResult {
 #[cfg(feature = "insecure_skip_verify")]
 #[test]
 fn test_tls_insecure_skip_verify() -> TestResult {
-    eprintln!("test_tls_insecure_skip_verify :: (A)");
     let server = MockServer::new()?;
-    eprintln!("test_tls_insecure_skip_verify :: (B)");
     let mut lsb = server.lsb();
-    eprintln!("test_tls_insecure_skip_verify :: (C)");
     lsb.tls(Tls::InsecureSkipVerify);
-    let jh = std::thread::spawn(|| -> io::Result<MockServer> {
-        eprintln!("test_tls_insecure_skip_verify.accept :: (A)");
-        let server = server.accept_tls()?;
-        eprintln!("test_tls_insecure_skip_verify.accept :: (B)");
-        Ok(server)
-    });
-    eprintln!("test_tls_insecure_skip_verify :: (D)");
+    let server_jh = server.accept_tls();
     let mut sender = lsb.connect()?;
-    eprintln!("test_tls_insecure_skip_verify :: (E)");
-    let mut server: MockServer = jh.join().unwrap()?;
+    let mut server: MockServer = server_jh.join().unwrap()?;
 
     sender
         .table("test")?
@@ -274,14 +257,8 @@ fn test_tls_insecure_skip_verify() -> TestResult {
     let exp = "test,t1=v1 f1=0.5 10000000\n";
     assert_eq!(sender.peek_pending(), exp);
     assert_eq!(sender.pending_size(), exp.len());
-
-    eprintln!("test_tls_insecure_skip_verify :: (F)");
     sender.flush()?;
-
-    eprintln!("test_tls_insecure_skip_verify :: (G)");
     assert_eq!(server.recv_q()?, 1);
-    eprintln!("test_tls_insecure_skip_verify :: (H)");
     assert_eq!(server.msgs[0].as_str(), exp);
-    eprintln!("test_tls_insecure_skip_verify :: (I)");
     Ok(())
 }

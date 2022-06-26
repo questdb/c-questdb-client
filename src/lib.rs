@@ -304,31 +304,16 @@ impl io::Read for Connection {
 
 impl io::Write for Connection {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        eprintln!("io::Write/Connection::write :: (A) buf: {:?}", std::str::from_utf8(buf).unwrap());
         match self {
             Self::Direct(sock) => sock.write(buf),
-            Self::Tls(stream) => {
-                eprintln!("io::Write/Connection::write :: (B) wants_read: {}, wants_write: {}", stream.conn.wants_read(), stream.conn.wants_write());
-                let written = stream.write(buf)?;
-                eprintln!("io::Write/Connection::write :: (C) wants_read: {}, wants_write: {}", stream.conn.wants_read(), stream.conn.wants_write());
-                // stream.conn.complete_io(&mut stream.sock)?;
-                eprintln!("io::Write/Connection::write :: (D) wants_read: {}, wants_write: {}", stream.conn.wants_read(), stream.conn.wants_write());
-                // stream.conn.complete_io(&mut stream.sock)?;
-                eprintln!("io::Write/Connection::write :: (E) wants_read: {}, wants_write: {}", stream.conn.wants_read(), stream.conn.wants_write());
-                Ok(written)
-            }
+            Self::Tls(stream) => stream.write(buf)
         }
     }
 
     fn flush(&mut self) -> io::Result<()> {
         match self {
             Self::Direct(sock) => sock.flush(),
-            Self::Tls(stream) => {
-                eprintln!("io::Write/Connection::flush :: (A)");
-                stream.flush()?;
-                eprintln!("io::Write/Connection::flush :: (B)");
-                Ok(())
-            }
+            Self::Tls(stream) => stream.flush()
         }
     }
 }
@@ -850,17 +835,14 @@ impl LineSender {
     }
 
     pub fn flush(&mut self) -> Result<()> {
-        eprintln!("sender.flush :: (A)");
         self.check_state(Op::Flush)?;
         let buf = self.output.as_bytes();
         if let Err(io_err) = self.conn.write_all(buf) {
-            eprintln!("sender.flush :: (B)");
             self.state = State::Moribund;
             return Err(map_io_to_socket_err(
                 "Could not flush buffered messages: ",
                 io_err));
         }
-        eprintln!("sender.flush :: (C)");
         self.output.clear();
         self.state = State::Connected;
         Ok(())
