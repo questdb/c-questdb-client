@@ -61,6 +61,12 @@ class c_line_sender_name(ctypes.Structure):
     _fields_ = [("len", c_size_t),
                 ("buf", c_char_p)]
 c_line_sender_name_p = ctypes.POINTER(c_line_sender_name)
+class c_line_sender_sec_opts(ctypes.Structure):
+    _fields_ = [("auth_key_id", c_char_p),
+                ("auth_priv_key", c_char_p),
+                ("auth_pub_key_x", c_char_p),
+                ("auth_pub_key_y", c_char_p)]
+c_line_sender_sec_opts_p = ctypes.POINTER(c_line_sender_sec_opts)
 
 
 def _setup_cdll():
@@ -118,6 +124,14 @@ def _setup_cdll():
         c_char_p,
         c_char_p,
         c_char_p,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_connect_secure,
+        c_line_sender_p,
+        c_char_p,
+        c_char_p,
+        c_char_p,
+        c_line_sender_sec_opts_p,
         c_line_sender_error_p_p)
     set_sig(
         dll.line_sender_must_close,
@@ -184,6 +198,11 @@ def _setup_cdll():
         c_size_t,
         c_line_sender_p)
     set_sig(
+        dll.line_sender_peek_pending,
+        c_char_p,
+        c_line_sender_p,
+        c_size_t_p)
+    set_sig(
         dll.line_sender_flush,
         c_bool,
         c_line_sender_p,
@@ -196,6 +215,8 @@ _DLL = _setup_cdll()
 _PY_DLL = ctypes.pythonapi
 _PY_DLL.PyUnicode_FromKindAndData.restype = ctypes.py_object
 _PY_DLL.PyUnicode_FromKindAndData.argtypes = [c_int, c_void_p, c_ssize_t]
+_PY_DLL.PyUnicode_FromStringAndSize.restype = ctypes.py_object
+_PY_DLL.PyUnicode_FromStringAndSize.argtypes = [c_char_p, c_ssize_t]
 
 
 class LineSenderError(Exception):
@@ -273,22 +294,40 @@ class LineSender:
             host,
             port,
             *,
-            interface='0.0.0.0'):
+            interface='0.0.0.0',
+            auth=None):
         self._impl = None
-        self._connect_args = (
+        if auth:
+            # We need to keep bytes objects around or they get GCd before the
+            # native C call.
+            self._c_auth = (
+                auth[0].encode('ascii'),
+                auth[1].encode('ascii'),
+                auth[2].encode('ascii'),
+                auth[3].encode('ascii'))
+            self._sec_opts = c_line_sender_sec_opts(
+                self._c_auth[0],
+                self._c_auth[1],
+                self._c_auth[2],
+                self._c_auth[3])
+        else:
+            self._sec_opts = None
+        self._connect_secure_args = (
             interface.encode('ascii'),
             host.encode('ascii'),
-            str(port).encode('ascii'))
+            str(port).encode('ascii'),
+            self._sec_opts)
 
     def connect(self):
         if self._impl:
             raise LineSenderError('Already connected')
 
         self._impl = _error_wrapped_call(
-            _DLL.line_sender_connect,
-            self._connect_args[0],
-            self._connect_args[1],
-            self._connect_args[2])
+            _DLL.line_sender_connect_secure,
+            self._connect_secure_args[0],
+            self._connect_secure_args[1],
+            self._connect_secure_args[2],
+            self._connect_secure_args[3])
 
     def __enter__(self):
         self.connect()
@@ -306,7 +345,7 @@ class LineSender:
             table_name)
         return self
 
-    def symbol(self, name, value: str):
+    def symbol(self, name: str, value: str):
         _error_wrapped_call(
             _DLL.line_sender_symbol,
             self._impl,
@@ -361,6 +400,15 @@ class LineSender:
     def pending_size(self):
         if self._impl:
             return _DLL.line_sender_pending_size(self._impl)
+        else:
+            return 0
+
+    def peek_pending(self) -> str:
+        if self._impl:
+            len = c_size_t(0)
+            buf = _DLL.line_sender_peek_pending(self._impl, ctypes.byref(len))
+            len = c_ssize_t(len.value)
+            return _PY_DLL.PyUnicode_FromStringAndSize(buf, len)
         else:
             return 0
 

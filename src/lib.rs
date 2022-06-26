@@ -22,12 +22,16 @@
  *
  ******************************************************************************/
 
+use core::time::Duration;
 use std::convert::{TryFrom, TryInto, Infallible};
 use std::fmt;
 use std::fmt::{Write, Display, Formatter};
 use std::io;
+use std::io::{BufRead, BufReader};
 use std::io::Write as IoWrite;
 use socket2::{Domain, Socket, SockAddr, Type, Protocol};
+use base64ct::{Base64, Base64UrlUnpadded, Encoding};
+use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
 
 #[derive(Debug, Copy, Clone)]
 enum Op {
@@ -68,12 +72,18 @@ enum State {
 impl State {
     fn next_op_descr(self) -> &'static str {
         match self {
-            State::Connected => "should have called `table` instead",
-            State::TableWritten => "should have called `symbol` or `column` instead",
-            State::SymbolWritten => "should have called `symbol`, `column` or `at` instead",
-            State::ColumnWritten => "should have called `column` or `at` instead",
-            State::MayFlushOrTable => "should have called `flush` or `table` instead",
-            State::Moribund => "unrecoverable state due to previous error"
+            State::Connected =>
+                "should have called `table` instead",
+            State::TableWritten =>
+                "should have called `symbol` or `column` instead",
+            State::SymbolWritten =>
+                "should have called `symbol`, `column` or `at` instead",
+            State::ColumnWritten =>
+                "should have called `column` or `at` instead",
+            State::MayFlushOrTable =>
+                "should have called `flush` or `table` instead",
+            State::Moribund =>
+                "unrecoverable state due to previous error"
         }
     }
 }
@@ -94,7 +104,10 @@ pub enum ErrorCode {
     InvalidUtf8,
 
     /// The table name, symbol name or column name contains bad characters.
-    InvalidName
+    InvalidName,
+
+    /// Error during the authentication process.
+    AuthError
 }
 
 #[derive(Debug)]
@@ -139,7 +152,9 @@ impl <'a> Name<'a> {
         if name.is_empty() {
             return Err(Error{
                 code: ErrorCode::InvalidName,
-                msg: "table, symbol and column names must have a non-zero length.".to_owned()});
+                msg: concat!(
+                    "table, symbol and column names ",
+                    "must have a non-zero length.").to_owned()});
         }
 
         for (index, c) in name.chars().enumerate() {
@@ -151,22 +166,24 @@ impl <'a> Name<'a> {
                         msg: format!(
                             concat!(
                                 "Bad string {:?}: ",
-                                "table, symbol and column names can't contain a {:?} ",
-                                "character, which was found at byte position {}."),
+                                "table, symbol and column names can't contain ",
+                                "a {:?} character, which was found at ",
+                                "byte position {}."),
                             name,
                             c,
                             index)});
                 },
                 '\u{FEFF}' => {
-                    // Reject unicode char 'ZERO WIDTH NO-BREAK SPACE', aka UTF-8 BOM
-                    // if it appears anywhere in the string.
+                    // Reject unicode char 'ZERO WIDTH NO-BREAK SPACE',
+                    // aka UTF-8 BOM if it appears anywhere in the string.
                     return Err(Error{
                         code: ErrorCode::InvalidName,
                         msg: format!(
                             concat!(
                                 "Bad string {:?}: ",
-                                "table, symbol and column names can't contain a UTF-8 BOM ",
-                                "character, which was found at byte position {}."),
+                                "table, symbol and column names can't contain ",
+                                "a UTF-8 BOM character, which was found at ",
+                                "byte position {}."),
                             name,
                             index)});
                 },
@@ -192,10 +209,15 @@ impl From<Infallible> for Error {
     }
 }
 
-fn write_escaped_impl<Q, C>(check_escape_fn: C, quoting_fn: Q, output: &mut String, s: &str)
-    where
-        C: Fn(char) -> bool,
-        Q: Fn(&mut String) -> () {
+fn write_escaped_impl<Q, C>(
+    check_escape_fn: C,
+    quoting_fn: Q,
+    output: &mut String,
+    s: &str)
+        where
+            C: Fn(char) -> bool,
+            Q: Fn(&mut String) -> ()
+{
     let mut to_escape = 0usize;
     for c in s.chars() {
         if check_escape_fn(c) {
@@ -258,31 +280,193 @@ pub struct LineSender {
     last_line_start: usize
 }
 
-impl LineSender {
-    pub fn connect(host: &str, port: &str, net_interface: Option<&str>) -> Result<Self> {
-        let addr: SockAddr = gai::resolve_host_port(host, port)?;
+#[derive(Debug, Clone)]
+pub struct AuthParams<'a> {
+    key_id: &'a str,
+    priv_key: &'a str,
+    pub_key_x: &'a str,
+    pub_key_y: &'a str
+}
+
+#[derive(Debug, Clone)]
+pub struct LineSenderBuilder<'a> {
+    capacity: usize,
+    host: &'a str,
+    port: &'a str,
+    net_interface: Option<&'a str>,
+    auth: Option<AuthParams<'a>>
+}
+
+impl <'a> LineSenderBuilder<'a> {
+    /// QuestDB server and port.
+    pub fn new(host: &'a str, port: &'a str) -> Self {
+        Self {
+            capacity: 65536,
+            host: host,
+            port: port,
+            net_interface: None,
+            auth: None }
+    }
+
+    /// Set the initial buffer capacity.
+    pub fn capacity(&mut self, byte_count: usize) -> &mut Self {
+        self.capacity = byte_count;
+        self
+    }
+
+    /// Select local outbound interface.
+    pub fn net_interface(&mut self, addr: &'a str) -> &mut Self {
+        self.net_interface = Some(addr);
+        self
+    }
+
+    /// Authentication Parameters.
+    pub fn auth(
+        &mut self, key_id: &'a str,
+        priv_key: &'a str,
+        pub_key_x: &'a str,
+        pub_key_y: &'a str) -> &mut Self
+    {
+        self.auth = Some(AuthParams {
+            key_id: key_id,
+            priv_key: priv_key,
+            pub_key_x: pub_key_x,
+            pub_key_y: pub_key_y
+        });
+        self
+    }
+
+    /// Connect synchronously.
+    pub fn connect(self) -> Result<LineSender> {
+        let addr: SockAddr = gai::resolve_host_port(self.host, self.port)?;
         let sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
-            .map_err(|io_err| map_io_to_socket_err("Could not open TCP socket: ", io_err))?;
+            .map_err(|io_err| map_io_to_socket_err(
+                "Could not open TCP socket: ", io_err))?;
         sock.set_nodelay(true)
-            .map_err(|io_err| map_io_to_socket_err("Could not set TCP_NODELAY: ", io_err))?;
-        if let Some(host) = net_interface {
+            .map_err(|io_err| map_io_to_socket_err(
+                "Could not set TCP_NODELAY: ", io_err))?;
+        if let Some(host) = self.net_interface {
             let bind_addr = gai::resolve_host(host)?;
             sock.bind(&bind_addr)
             .map_err(|io_err| map_io_to_socket_err(
-                &format!("Could not bind to interface address {:?}: ", host), io_err))?;
+                &format!(
+                    "Could not bind to interface address {:?}: ",
+                    host),
+                io_err))?;
         }
         sock.connect(&addr)
             .map_err(|io_err| {
-                let host_port = format!("{}:{}", host, port);
+                let host_port = format!("{}:{}", self.host, self.port);
                 let prefix = format!("Could not connect to {:?}: ", host_port);
                 map_io_to_socket_err(&prefix, io_err)
             })?;
-        Ok(Self {
+        let mut sender = LineSender {
             sock: sock,
             state: State::Connected,
-            output: String::with_capacity(65536),
+            output: String::with_capacity(self.capacity),
             last_line_start: 0usize
-        })
+        };
+        if let Some(auth) = self.auth {
+            sender.authenticate(auth)?;
+        }
+        Ok(sender)
+    }
+}
+
+fn b64_decode(descr: &'static str, buf: &str) -> Result<Vec<u8>> {
+    Base64UrlUnpadded::decode_vec(buf)
+        .map_err(|b64_err| Error{
+            code: ErrorCode::AuthError,
+            msg: format!(
+                "Could not decode {}: {}", descr, b64_err)})
+}
+
+fn parse_public_key(pub_key_x: &str, pub_key_y: &str) -> Result<Vec<u8>> {
+    let mut pub_key_x = b64_decode("public key x", pub_key_x)?;
+    let mut pub_key_y = b64_decode("public key y", pub_key_y)?;
+
+    // SEC 1 Uncompressed Octet-String-to-Elliptic-Curve-Point Encoding
+    let mut encoded = Vec::new();
+    encoded.push(4u8);  // 0x04 magic byte that identifies this as uncompressed.
+    encoded.resize((32 - pub_key_x.len()) + 1, 0u8);
+    encoded.append(&mut pub_key_x);
+    encoded.resize((32 - pub_key_y.len()) + 1 + 32, 0u8);
+    encoded.append(&mut pub_key_y);
+    Ok(encoded)
+}
+
+fn parse_key_pair<'a>(auth: &AuthParams<'a>) -> Result<EcdsaKeyPair> {
+    let private_key = b64_decode("private authentication key", auth.priv_key)?;
+    let public_key = parse_public_key(auth.pub_key_x, auth.pub_key_y)?;
+    EcdsaKeyPair::from_private_key_and_public_key(
+        &ECDSA_P256_SHA256_FIXED_SIGNING,
+        &private_key[..],
+        &public_key[..])
+            .map_err(|key_rejected| Error{
+                code: ErrorCode::AuthError,
+                msg: format!("Bad private key: {}", key_rejected)})
+}
+
+impl LineSender {
+    fn send_key_id(&mut self, key_id: &str) -> Result<()> {
+        write!(&mut self.sock, "{}\n", key_id)
+            .map_err(|io_err| map_io_to_socket_err("Failed to send key_id: ", io_err))?;
+        Ok(())
+    }
+
+    fn read_challenge(&mut self) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        self.sock.set_read_timeout(Some(Duration::from_secs(15)))
+            .map_err(|io_err| map_io_to_socket_err(
+                "Failed to set read timeout on socket: ", io_err))?;
+        let mut reader = BufReader::new(&mut self.sock);
+        reader.read_until(b'\n', &mut buf)
+            .map_err(|io_err| map_io_to_socket_err(
+                "Failed to read authentication challenge (timed out?): ",
+                io_err))?;
+        if buf.last().map(|c| *c).unwrap_or(b'\0') != b'\n' {
+            return Err(Error {
+                code: ErrorCode::AuthError,
+                msg: if buf.len() == 0 {
+                    concat!(
+                        "Did not receive auth challenge. ",
+                        "Is the database configured to require authentication?"
+                    ).to_owned()
+                } else {
+                    format!("Received incomplete auth challenge: {:?}", buf)
+                }});
+        }
+        buf.pop();  // b'\n'
+        Ok(buf)
+    }
+
+    fn authenticate<'a>(&mut self, auth: AuthParams<'a>) -> Result<()> {
+        if auth.key_id.contains('\n') {
+            return Err(Error {
+                code: ErrorCode::AuthError,
+                msg: format!(
+                    "Bad key id {:?}: Should not contain new-line char.",
+                    auth.key_id)});
+        }
+        let key_pair = parse_key_pair(&auth)?;
+        self.send_key_id(auth.key_id)?;
+        let challenge = self.read_challenge()?;
+        let rng = ring::rand::SystemRandom::new();
+        let signature = key_pair.sign(&rng, &challenge[..]).
+            map_err(|unspecified_err| Error{
+                code: ErrorCode::AuthError,
+                msg: format!(
+                    "Failed to sign challenge: {}",
+                    unspecified_err)})?;
+        let mut encoded_sig = Base64::encode_string(signature.as_ref());
+        encoded_sig.push('\n');
+        let buf = encoded_sig.as_bytes();
+        if let Err(io_err) = self.sock.write_all(buf) {
+            return Err(map_io_to_socket_err(
+                "Could not send signed challenge: ",
+                io_err));
+        }
+        Ok(())
     }
 
     fn check_state(&mut self, op: Op) -> Result<()> {
@@ -299,10 +483,10 @@ impl LineSender {
         Err(error)
     }
 
-    pub fn table<'a, N, E>(&mut self, name: N) -> Result<()>
+    pub fn table<'a, N>(&mut self, name: N) -> Result<()>
         where
-            N: TryInto<Name<'a>, Error=E>,
-            Error: From<E>
+            N: TryInto<Name<'a>>,
+            Error: From<N::Error>
     {
         let name: Name<'a> = name.try_into()?;
         self.check_state(Op::Table)?;
@@ -311,10 +495,10 @@ impl LineSender {
         Ok(())
     }
 
-    pub fn symbol<'a, N, E>(&mut self, name: N, value: &str) -> Result<()>
+    pub fn symbol<'a, N>(&mut self, name: N, value: &str) -> Result<()>
         where
-            N: TryInto<Name<'a>, Error=E>,
-            Error: From<E>
+            N: TryInto<Name<'a>>,
+            Error: From<N::Error>
     {
         let name: Name<'a> = name.try_into()?;
         self.check_state(Op::Symbol)?;
@@ -326,10 +510,10 @@ impl LineSender {
         Ok(())
     }
 
-    fn write_column_key<'a, N, E>(&mut self, name: N) -> Result<()>
+    fn write_column_key<'a, N>(&mut self, name: N) -> Result<()>
         where
-            N: TryInto<Name<'a>, Error=E>,
-            Error: From<E>
+            N: TryInto<Name<'a>>,
+            Error: From<N::Error>
     {
         let name: Name<'a> = name.try_into()?;
         self.check_state(Op::Column)?;
@@ -345,30 +529,30 @@ impl LineSender {
         Ok(())
     }
 
-    pub fn column_bool<'a, N, E>(&mut self, name: N, value: bool) -> Result<()>
+    pub fn column_bool<'a, N>(&mut self, name: N, value: bool) -> Result<()>
         where
-            N: TryInto<Name<'a>, Error=E>,
-            Error: From<E>
+            N: TryInto<Name<'a>>,
+            Error: From<N::Error>
     {
         self.write_column_key(name)?;
         self.output.push(if value {'t'} else {'f'});
         Ok(())
     }
 
-    pub fn column_i64<'a, N, E>(&mut self, name: N, value: i64) -> Result<()>
+    pub fn column_i64<'a, N>(&mut self, name: N, value: i64) -> Result<()>
         where
-            N: TryInto<Name<'a>, Error=E>,
-            Error: From<E>
+            N: TryInto<Name<'a>>,
+            Error: From<N::Error>
     {
         self.write_column_key(name)?;
         write!(&mut self.output, "{}i", value).unwrap();
         Ok(())
     }
 
-    pub fn column_f64<'a, N, E>(&mut self, name: N, value: f64) -> Result<()>
+    pub fn column_f64<'a, N>(&mut self, name: N, value: f64) -> Result<()>
         where
-            N: TryInto<Name<'a>, Error=E>,
-            Error: From<E>
+            N: TryInto<Name<'a>>,
+            Error: From<N::Error>
     {
         self.write_column_key(name)?;
         if value == f64::INFINITY {
@@ -383,10 +567,10 @@ impl LineSender {
         Ok(())
     }
 
-    pub fn column_str<'a, N, E>(&mut self, name: N, value: &str) -> Result<()>
+    pub fn column_str<'a, N>(&mut self, name: N, value: &str) -> Result<()>
         where
-            N: TryInto<Name<'a>, Error=E>,
-            Error: From<E>
+            N: TryInto<Name<'a>>,
+            Error: From<N::Error>
     {
         self.write_column_key(name)?;
         write_escaped_quoted(&mut self.output, value);
@@ -400,6 +584,10 @@ impl LineSender {
         else {
             0
         }
+    }
+
+    pub fn peek_pending(&self) -> &str {
+        self.output.as_str()
     }
 
     fn update_last_line_start(&mut self) {

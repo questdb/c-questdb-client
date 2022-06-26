@@ -41,18 +41,33 @@ import urllib.request
 import urllib.parse
 import urllib.error
 
-def retry(predicate_task, timeout_sec=30, every=0.05, msg='Timed out retrying'):
+
+AUTH_TXT = """testUser1 ec-p-256-sha256 fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac
+# [key/user id] [key type] {keyX keyY}"""
+
+
+def retry(
+    predicate_task,
+    timeout_sec=30,
+    every=0.05,
+    msg='Timed out retrying',
+    backoff_till=5.0,
+    lead_sleep=0.1):
     """
     Repeat task every `interval` until it returns a truthy value or times out.
     """
     begin = time.monotonic()
     threshold = begin + timeout_sec
+    if lead_sleep:
+        time.sleep(lead_sleep)
     while True:
         res = predicate_task()
         if res:
             return res
         elif time.monotonic() < threshold:
             time.sleep(every)
+            if backoff_till:
+                every = min(backoff_till, every * 1.25)
         else:
             raise TimeoutError(msg)
 
@@ -165,24 +180,37 @@ def _find_java():
 
 
 class QuestDbFixture:
-    def __init__(self, root_dir: pathlib.Path):
+    def __init__(self, root_dir: pathlib.Path, auth=False):
         self._root_dir = root_dir
         self.version = _parse_version(self._root_dir.name)
         self._data_dir = self._root_dir / 'data'
         self._log_path = self._data_dir / 'log' / 'log.txt'
-        conf_dir = self._data_dir / 'conf'
-        conf_dir.mkdir()
-        self._conf_path = conf_dir / 'server.conf'
+        self._conf_dir = self._data_dir / 'conf'
+        self._conf_dir.mkdir(exist_ok=True)
+        self._conf_path = self._conf_dir / 'server.conf'
         self._log = None
         self._proc = None
-        self.host = 'localhost'
+        self.host = '127.0.0.1'
         self.http_server_port = None
         self.line_tcp_port = None
         self.pg_port = None
 
+        self.auth = auth
+        if self.auth:
+            auth_txt_path = self._conf_dir / 'auth.txt'
+            with open(auth_txt_path, 'w', encoding='utf-8') as auth_file:
+                auth_file.write(AUTH_TXT)
+
+    def print_log(self):
+        with open(self._log_path, 'r', encoding='utf-8') as log_file:
+            log = log_file.read()
+            sys.stderr.write(textwrap.indent(log, '    '))
+            sys.stderr.write('\n\n')
+
     def start(self):
         ports = discover_avail_ports(3)
         self.http_server_port, self.line_tcp_port, self.pg_port = ports
+        auth_config = 'line.tcp.auth.db.path=conf/auth.txt' if self.auth else ''
         with open(self._conf_path, 'w', encoding='utf-8') as conf_file:
             conf_file.write(textwrap.dedent(rf'''
                 http.bind.to=0.0.0.0:{self.http_server_port}
@@ -192,6 +220,8 @@ class QuestDbFixture:
                 line.udp.enabled=false
                 cairo.max.uncommitted.rows=1
                 line.tcp.maintenance.job.interval=100
+                line.tcp.min.idle.ms.before.writer.release=300
+                {auth_config}
                 ''').lstrip('\n'))
 
         java = _find_java()
@@ -199,14 +229,16 @@ class QuestDbFixture:
             java,
             '-DQuestDB-Runtime-0',
             '-ea',
-            '-Dnoebug',
+            #'-Dnoebug',
+            '-Debug',
             '-XX:+UnlockExperimentalVMOptions',
             '-XX:+AlwaysPreTouch',
             '-XX:+UseParallelOldGC',
             '-p', str(self._root_dir / 'bin' / 'questdb.jar'),
             '-m', 'io.questdb/io.questdb.ServerMain',
             '-d', str(self._data_dir)]
-        sys.stderr.write(f'Starting QuestDB: {launch_args!r}\n')
+        sys.stderr.write(
+            f'Starting QuestDB: {launch_args!r} (auth: {self.auth})\n')
         self._log = open(self._log_path, 'ab')
         try:
             self._proc = subprocess.Popen(
@@ -221,7 +253,7 @@ class QuestDbFixture:
                 if self._proc.poll() is not None:
                     raise RuntimeError('QuestDB died during startup.')
                 req = urllib.request.Request(
-                    f'http://localhost:{self.http_server_port}',
+                    f'http://127.0.0.1:{self.http_server_port}',
                     method='HEAD')
                 try:
                     resp = urllib.request.urlopen(req, timeout=1)
@@ -239,12 +271,8 @@ class QuestDbFixture:
                 timeout_sec=45,
                 msg='Timed out waiting for HTTP service to come up.')
         except:
-            sys.stderr.write(f'Failed to start, see full log: `{self._log_path}`. Tail:\n')
-            with open(self._log_path, 'r', encoding='utf-8') as log_file:
-                lines = log_file.readlines()
-                buf = ''.join(lines[-100:])
-                sys.stderr.write(textwrap.indent(buf, '    '))
-                sys.stderr.write('\n\n')
+            sys.stderr.write(f'QuestDB log at `{self._log_path}`:\n')
+            self.print_log()
             raise
 
         atexit.register(self.stop)

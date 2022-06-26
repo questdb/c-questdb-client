@@ -40,6 +40,11 @@ if(WIN32)
         questdb_client-shared
         INTERFACE wsock32 ws2_32)
 endif(WIN32)
+if(APPLE)
+    target_link_libraries(
+        questdb_client
+        INTERFACE "-framework Security")
+endif()
 
 function(set_compile_flags TARGET_NAME)
     if(MSVC)
@@ -63,18 +68,28 @@ function(set_compile_flags TARGET_NAME)
 endfunction()
 
 # Examples
-add_executable(
+function(compile_example TARGET_NAME)
+    list(POP_FRONT ARGV)
+    add_executable(
+        ${TARGET_NAME}
+        ${ARGV})
+    target_link_libraries(
+        ${TARGET_NAME}
+        questdb_client)
+endfunction()
+
+compile_example(
     line_sender_c_example
     examples/line_sender_c_example.c)
-target_link_libraries(
-    line_sender_c_example
-    questdb_client)
-add_executable(
+compile_example(
+    line_sender_c_example_auth
+    examples/line_sender_c_example_auth.c)
+compile_example(
     line_sender_cpp_example
     examples/line_sender_cpp_example.cpp)
-target_link_libraries(
-    line_sender_cpp_example
-    questdb_client)
+compile_example(
+    line_sender_cpp_example_auth
+    examples/line_sender_cpp_example_auth.cpp)
 
 # Unit test binaries.
 function(compile_test TARGET_NAME)

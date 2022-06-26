@@ -51,7 +51,10 @@ pub enum line_sender_error_code {
     line_sender_error_invalid_utf8,
 
     /// The table name, symbol name or column name contains bad characters.
-    line_sender_error_invalid_name
+    line_sender_error_invalid_name,
+
+    /** Error during the authentication process. */
+    line_sender_error_auth_error
 }
 
 impl From<super::ErrorCode> for line_sender_error_code {
@@ -67,6 +70,8 @@ impl From<super::ErrorCode> for line_sender_error_code {
                 line_sender_error_code::line_sender_error_invalid_utf8,
             super::ErrorCode::InvalidName =>
                 line_sender_error_code::line_sender_error_invalid_name,
+            super::ErrorCode::AuthError =>
+                line_sender_error_code::line_sender_error_auth_error
         }
     }
 }
@@ -139,6 +144,14 @@ fn describe_buf(buf: &[u8]) -> String {
     output
 }
 
+fn set_err_out(err_out: *mut *mut line_sender_error, code: super::ErrorCode, msg: String) {
+    let err = line_sender_error(super::Error{
+        code: code,
+        msg: msg});
+    let err_ptr = Box::into_raw(Box::new(err));
+    unsafe { *err_out = err_ptr };
+}
+
 fn unwrap_utf8(buf: &[u8], err_out: *mut *mut line_sender_error) -> Option<&str> {
     match str::from_utf8(buf) {
         Ok(str_ref) => {
@@ -163,11 +176,7 @@ fn unwrap_utf8(buf: &[u8], err_out: *mut *mut line_sender_error) -> Option<&str>
                         buf_descr,
                         u8err.valid_up_to())
                 };
-            let err = line_sender_error(super::Error{
-                code: super::ErrorCode::InvalidUtf8,
-                msg: msg});
-            let err_ptr = Box::into_raw(Box::new(err));
-            unsafe { *err_out = err_ptr };
+            set_err_out(err_out, super::ErrorCode::InvalidUtf8, msg);
             None
         }
     }
@@ -229,6 +238,25 @@ macro_rules! bubble_err_to_c {
     };
 }
 
+/// Authentication options.
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct line_sender_sec_opts
+{
+    /// Authentication key_id. AKA "kid".
+    auth_key_id : *const libc::c_char,
+
+    /// Authentication private key. AKA "d".
+    auth_priv_key : *const libc::c_char,
+
+    /// Authentication public key X coordinate. AKA "x".
+    auth_pub_key_x : * const libc::c_char,
+
+    /// Authentication public key Y coordinate. AKA "y".
+    auth_pub_key_y : * const libc::c_char
+}
+
+
 /// Check the provided buffer is a valid UTF-8 encoded string that can be
 /// used as a table name, symbol name or column name.
 ///
@@ -284,6 +312,93 @@ pub extern "C" fn line_sender_connect(
     port: *const libc::c_char,
     err_out: *mut *mut line_sender_error) -> *mut line_sender
 {
+    line_sender_connect_secure(
+        net_interface,
+        host,
+        port,
+        std::ptr::null(),
+        err_out)
+}
+
+fn set_sec_opts(
+    builder: &mut super::LineSenderBuilder,
+    sec_opts: *const line_sender_sec_opts,
+    err_out: *mut *mut line_sender_error) -> bool
+{
+    if sec_opts.is_null() {
+        return true;
+    }
+
+    let auth_key_id = unsafe { (*sec_opts).auth_key_id };
+    let auth_priv_key = unsafe { (*sec_opts).auth_priv_key };
+    let auth_pub_key_x = unsafe { (*sec_opts).auth_pub_key_x };
+    let auth_pub_key_y = unsafe { (*sec_opts).auth_pub_key_y };
+
+    if auth_key_id.is_null() && auth_priv_key.is_null() &&
+       auth_pub_key_x.is_null() && auth_pub_key_y.is_null() {
+        return true;
+    }
+    else if auth_key_id.is_null() || auth_priv_key.is_null() ||
+            auth_pub_key_x.is_null() || auth_pub_key_y.is_null() {
+        set_err_out(
+            err_out,
+            super::ErrorCode::InvalidApiCall,
+            "Must specify all or no auth parameters.".to_owned());
+        return false;
+    }
+
+    let auth_key_id =
+        if let Some(str_ref) = unwrap_utf8(unsafe {CStr::from_ptr(auth_key_id)}.to_bytes(), err_out) {
+            str_ref
+        }
+        else {
+            return false;
+        };
+
+    let auth_priv_key =
+        if let Some(str_ref) = unwrap_utf8(unsafe {CStr::from_ptr(auth_priv_key)}.to_bytes(), err_out) {
+            str_ref
+        }
+        else {
+            return false;
+        };
+
+    let auth_pub_key_x =
+        if let Some(str_ref) = unwrap_utf8(unsafe {CStr::from_ptr(auth_pub_key_x)}.to_bytes(), err_out) {
+            str_ref
+        }
+        else {
+            return false;
+        };
+
+    let auth_pub_key_y =
+        if let Some(str_ref) = unwrap_utf8(unsafe {CStr::from_ptr(auth_pub_key_y)}.to_bytes(), err_out) {
+            str_ref
+        }
+        else {
+            return false;
+        };
+
+    builder.auth(auth_key_id, auth_priv_key, auth_pub_key_x, auth_pub_key_y);
+    true
+}
+
+/// Synchronously connect securely to the QuestDB database.
+/// @param[in] net_interface Network interface to bind to.
+/// If unsure, to bind to all specify "0.0.0.0".
+/// @param[in] host QuestDB host, e.g. "localhost". nul-terminated.
+/// @param[in] port QuestDB port, e.g. "9009". nul-terminated.
+/// @param[in] sec_opts Security options for authentication.
+/// @param[out] err_out Set on error.
+/// @return Connected sender object or NULL on error.
+#[no_mangle]
+pub extern "C" fn line_sender_connect_secure(
+    net_interface: *const libc::c_char,
+    host: *const libc::c_char,
+    port: *const libc::c_char,
+    sec_opts: *const line_sender_sec_opts,
+    err_out: *mut *mut line_sender_error) -> *mut line_sender
+{
     let host: &str =
         if let Some(str_ref) = unwrap_utf8(unsafe {CStr::from_ptr(host)}.to_bytes(), err_out) {
             str_ref
@@ -311,8 +426,16 @@ pub extern "C" fn line_sender_connect(
             return std::ptr::null_mut();
         };
 
-    let sender =
-        match super::LineSender::connect(host, port, net_interface) {
+    let mut builder = super::LineSenderBuilder::new(host, port);
+    if let Some(net_interface) = net_interface {
+        builder.net_interface(net_interface);
+    }
+
+    if !set_sec_opts(&mut builder, sec_opts, err_out) {
+        return std::ptr::null_mut();
+    }
+
+    let sender = match builder.connect() {
             Ok(sender) => sender,
             Err(err) => {
                 let err = line_sender_error(err);
@@ -517,6 +640,22 @@ pub extern "C" fn line_sender_pending_size(
 {
     let sender = unwrap_sender(sender);
     sender.pending_size()
+}
+
+/// Peek into the accumulated buffer that is to be sent out at the next `flush`.
+///
+/// @param[in] sender Line sender object.
+/// @param[out] len_out The length in bytes of the accumulated buffer.
+/// @return UTF-8 encoded buffer. The buffer is not nul-terminated.
+#[no_mangle]
+pub extern "C" fn line_sender_peek_pending(
+    sender: *const line_sender,
+    len_out: *mut libc::size_t) -> *const libc::c_char
+{
+    let sender = unwrap_sender(sender);
+    let buf: &[u8] = sender.peek_pending().as_bytes();
+    unsafe { *len_out = buf.len() };
+    buf.as_ptr() as *const libc::c_char
 }
 
 /// Send batch-up rows messages to the QuestDB server.

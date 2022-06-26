@@ -59,10 +59,13 @@ typedef enum line_sender_error_code
     line_sender_error_invalid_utf8,
 
     /** The table name, symbol name or column name contains bad characters. */
-    line_sender_error_invalid_name
+    line_sender_error_invalid_name,
+
+    /** Error during the authentication process. */
+    line_sender_error_auth_error
 } line_sender_error_code;
 
-/** Error code categorising the error. */
+/** Error code categorizing the error. */
 LINESENDER_API
 line_sender_error_code line_sender_error_get_code(const line_sender_error*);
 
@@ -143,6 +146,24 @@ bool line_sender_name_init(
 typedef struct line_sender line_sender;
 
 /**
+ * Authentication options.
+ */
+typedef struct line_sender_sec_opts
+{
+    /** Authentication key id. AKA "kid". */
+    const char* auth_key_id;
+
+    /** Authentication private key. AKA "d". */
+    const char* auth_priv_key;
+
+    /** Authentication public key X coordinate. AKA "x". */
+    const char* auth_pub_key_x;
+
+    /** Authentication public key Y coordinate. AKA "y". */
+    const char* auth_pub_key_y;
+} line_sender_sec_opts;
+
+/**
  * Synchronously connect to the QuestDB database.
  * @param[in] net_interface Network interface to bind to.
  * If unsure, to bind to all specify "0.0.0.0".
@@ -156,6 +177,24 @@ line_sender* line_sender_connect(
     const char* net_interface,
     const char* host,
     const char* port,
+    line_sender_error** err_out);
+
+/**
+ * Synchronously connect securely to the QuestDB database.
+ * @param[in] net_interface Network interface to bind to.
+ * If unsure, to bind to all specify "0.0.0.0".
+ * @param[in] host QuestDB host, e.g. "localhost". nul-terminated.
+ * @param[in] port QuestDB port, e.g. "9009". nul-terminated.
+ * @param[in] sec_opts Security options for authentication.
+ * @param[out] err_out Set on error.
+ * @return Connected sender object or NULL on error.
+ */
+LINESENDER_API
+line_sender* line_sender_connect_secure(
+    const char* net_interface,
+    const char* host,
+    const char* port,
+    const line_sender_sec_opts* sec_opts,
     line_sender_error** err_out);
 
 /**
@@ -309,6 +348,18 @@ bool line_sender_at_now(
  */
 LINESENDER_API
 size_t line_sender_pending_size(const line_sender* sender);
+
+/**
+ * Peek into the accumulated buffer that is to be sent out at the next `flush`.
+ *
+ * @param[in] sender Line sender object.
+ * @param[out] len_out The length in bytes of the accumulated buffer.
+ * @return UTF-8 encoded buffer. The buffer is not nul-terminated.
+ */
+LINESENDER_API
+const char* line_sender_peek_pending(
+    const line_sender* sender,
+    size_t* len_out);
 
 /**
  * Send batch-up rows messages to the QuestDB server.

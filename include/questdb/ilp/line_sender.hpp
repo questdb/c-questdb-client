@@ -53,11 +53,14 @@ namespace questdb::ilp
         invalid_utf8,
 
         /** The table name, symbol name or column name contains bad characters. */
-        invalid_name
+        invalid_name,
+
+        /** Error during the authentication process. */
+        auth_error
     };
 
     /**
-     * An error that occured when using the line sender.
+     * An error that occurred when using the line sender.
      *
      * Call `.what()` to obtain ASCII encoded error message.
      */
@@ -182,6 +185,35 @@ namespace questdb::ilp
     }
 
     /**
+     * Authentication options.
+     */
+    struct sec_opts
+    {
+        sec_opts(
+            std::string_view auth_key_id_,
+            std::string_view auth_priv_key_,
+            std::string_view auth_pub_key_x_,
+            std::string_view auth_pub_key_y_)
+                : auth_key_id{auth_key_id_}
+                , auth_priv_key{auth_priv_key_}
+                , auth_pub_key_x{auth_pub_key_x_}
+                , auth_pub_key_y{auth_pub_key_y_}
+        {}
+
+        /** Authentication key id. AKA "kid". */
+        std::string auth_key_id;
+
+        /** Authentication private key. AKA "d". */
+        std::string auth_priv_key;
+
+        /** Authentication public key X coordinate. AKA "x". */
+        std::string auth_pub_key_x;
+
+        /** Authentication public key Y coordinate. AKA "y". */
+        std::string auth_pub_key_y;
+    };
+
+    /**
      * Insert data into QuestDB via the InfluxDB Line Protocol.
      *
      * Batch up rows, then call `.flush()` to send.
@@ -206,6 +238,29 @@ namespace questdb::ilp
         }
 
         line_sender(
+            const char* host,
+            const char* port,
+            const sec_opts& sec_opts,
+            const char* net_interface = inaddr_any)
+                : _impl{nullptr}
+        {
+            ::line_sender_error* c_err{nullptr};
+            ::line_sender_sec_opts c_sec_opts;
+            c_sec_opts.auth_key_id = sec_opts.auth_key_id.c_str();
+            c_sec_opts.auth_priv_key = sec_opts.auth_priv_key.c_str();
+            c_sec_opts.auth_pub_key_x = sec_opts.auth_pub_key_x.c_str();
+            c_sec_opts.auth_pub_key_y = sec_opts.auth_pub_key_y.c_str();
+            _impl = ::line_sender_connect_secure(
+                net_interface,
+                host,
+                port,
+                &c_sec_opts,
+                &c_err);
+            if (!_impl)
+                throw line_sender_error::from_c(c_err);
+        }
+
+        line_sender(
             std::string_view host,
             std::string_view port,
             std::string_view net_interface = inaddr_any)
@@ -217,11 +272,35 @@ namespace questdb::ilp
 
         line_sender(
             std::string_view host,
+            std::string_view port,
+            const sec_opts& sec_opts,
+            std::string_view net_interface = inaddr_any)
+                : line_sender{
+                    std::string{host}.c_str(),
+                    std::string{port}.c_str(),
+                    sec_opts,
+                    std::string{net_interface}.c_str()}
+        {}
+
+        line_sender(
+            std::string_view host,
             uint16_t port,
             std::string_view net_interface = inaddr_any)
                 : line_sender{
                     std::string{host}.c_str(),
                     std::to_string(port).c_str(),
+                    std::string{net_interface}.c_str()}
+        {}
+
+        line_sender(
+            std::string_view host,
+            uint16_t port,
+            const sec_opts& sec_opts,
+            std::string_view net_interface = inaddr_any)
+                : line_sender{
+                    std::string{host}.c_str(),
+                    std::to_string(port).c_str(),
+                    sec_opts,
                     std::string{net_interface}.c_str()}
         {}
 
@@ -232,6 +311,18 @@ namespace questdb::ilp
                 : line_sender{
                     host,
                     std::to_string(port).c_str(),
+                    net_interface}
+        {}
+
+        line_sender(
+            const char* host,
+            uint16_t port,
+            const sec_opts& sec_opts,
+            const char* net_interface = inaddr_any)
+                : line_sender{
+                    host,
+                    std::to_string(port).c_str(),
+                    sec_opts,
                     net_interface}
         {}
 
@@ -262,6 +353,7 @@ namespace questdb::ilp
          */
         line_sender& table(name_view name)
         {
+            ensure_impl();
             line_sender_error::wrapped_call(
                 ::line_sender_table,
                 _impl,
@@ -278,6 +370,7 @@ namespace questdb::ilp
          */
         line_sender& symbol(name_view name, utf8_view value)
         {
+            ensure_impl();
             line_sender_error::wrapped_call(
                 ::line_sender_symbol,
                 _impl,
@@ -298,6 +391,7 @@ namespace questdb::ilp
          */
         line_sender& column(name_view name, bool value)
         {
+            ensure_impl();
             line_sender_error::wrapped_call(
                 ::line_sender_column_bool,
                 _impl,
@@ -313,6 +407,7 @@ namespace questdb::ilp
          */
         line_sender& column(name_view name, int64_t value)
         {
+            ensure_impl();
             line_sender_error::wrapped_call(
                 ::line_sender_column_i64,
                 _impl,
@@ -328,6 +423,7 @@ namespace questdb::ilp
          */
         line_sender& column(name_view name, double value)
         {
+            ensure_impl();
             line_sender_error::wrapped_call(
                 ::line_sender_column_f64,
                 _impl,
@@ -343,6 +439,7 @@ namespace questdb::ilp
          */
         line_sender& column(name_view name, utf8_view value)
         {
+            ensure_impl();
             line_sender_error::wrapped_call(
                 ::line_sender_column_str,
                 _impl,
@@ -362,6 +459,7 @@ namespace questdb::ilp
          */
         void at(int64_t epoch_nanos)
         {
+            ensure_impl();
             line_sender_error::wrapped_call(
                 ::line_sender_at,
                 _impl,
@@ -374,6 +472,7 @@ namespace questdb::ilp
          */
         void at_now()
         {
+            ensure_impl();
             line_sender_error::wrapped_call(
                 ::line_sender_at_now,
                 _impl);
@@ -392,6 +491,25 @@ namespace questdb::ilp
         }
 
         /**
+         * Peek into the accumulated buffer that is to be sent out at the next `flush`.
+         *
+         * @return UTF-8 encoded buffer. The buffer is not nul-terminated.
+         */
+        std::string_view peek_pending() const noexcept
+        {
+            if (_impl)
+            {
+                size_t len = 0;
+                const char* buf = ::line_sender_peek_pending(_impl, &len);
+                return {buf, len};
+            }
+            else
+            {
+                return {};
+            }
+        }
+
+        /**
          * Send batch-up rows messages to the QuestDB server.
          *
          * After sending a batch, you can close the connection or begin
@@ -399,6 +517,7 @@ namespace questdb::ilp
          */
         void flush()
         {
+            ensure_impl();
             line_sender_error::wrapped_call(
                 ::line_sender_flush,
                 _impl);
@@ -433,6 +552,14 @@ namespace questdb::ilp
         }
 
     private:
+        void ensure_impl()
+        {
+            if (!_impl)
+                throw line_sender_error{
+                    line_sender_error_code::invalid_api_call,
+                    "Sender closed."};
+        }
+
         ::line_sender* _impl;
     };
 
