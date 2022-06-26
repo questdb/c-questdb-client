@@ -388,7 +388,10 @@ class TlsProxyFixture:
                         return port
             return None
 
-        self.listen_port = retry(check_started)
+        self.listen_port = retry(
+            check_started,
+            timeout_sec=180,  # time to compile.
+            msg='Timed out waiting for `tls_proxy` to start.',)
 
         def connect_to_listening_port():
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -401,7 +404,9 @@ class TlsProxyFixture:
                 sock.close()
             return True
 
-        retry(connect_to_listening_port, msg='Timed out connecting to `tls_proxy`')
+        retry(
+            connect_to_listening_port,
+            msg='Timed out connecting to `tls_proxy`')
         atexit.register(self.stop)
 
     def stop(self):
