@@ -237,6 +237,36 @@ fn test_basics() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn test_tls_with_file_ca() -> TestResult {
+    let mut ca_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    ca_path.push("system_test");
+    ca_path.push("certs");
+    ca_path.push("server_rootCA.pem");
+
+    let server = MockServer::new()?;
+    let mut lsb = server.lsb();
+    lsb.tls(Tls::Enabled(CertificateAuthority::File(ca_path)));
+    let server_jh = server.accept_tls();
+    let mut sender = lsb.connect()?;
+    let mut server: MockServer = server_jh.join().unwrap()?;
+
+    sender
+        .table("test")?
+        .symbol("t1", "v1")?
+        .column_f64("f1", 0.5)?
+        .at(10000000)?;
+
+    assert_eq!(server.recv_q()?, 0);
+    let exp = "test,t1=v1 f1=0.5 10000000\n";
+    assert_eq!(sender.peek_pending(), exp);
+    assert_eq!(sender.pending_size(), exp.len());
+    sender.flush()?;
+    assert_eq!(server.recv_q()?, 1);
+    assert_eq!(server.msgs[0].as_str(), exp);
+    Ok(())
+}
+
 #[cfg(feature = "insecure_skip_verify")]
 #[test]
 fn test_tls_insecure_skip_verify() -> TestResult {

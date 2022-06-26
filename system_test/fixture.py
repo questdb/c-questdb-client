@@ -390,14 +390,13 @@ class TlsProxyFixture:
 
         self.listen_port = retry(
             check_started,
-            timeout_sec=180,  # time to compile.
+            timeout_sec=180,  # Longer to include time to compile.
             msg='Timed out waiting for `tls_proxy` to start.',)
 
         def connect_to_listening_port():
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             try:
                 sock.connect(('localhost', self.listen_port))
-                # sock.connect(('127.0.0.1', self.listen_port))
             except ConnectionRefusedError:
                 return False
             finally:
