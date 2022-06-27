@@ -297,11 +297,8 @@ fn test_tls_to_plain_server() -> TestResult {
             server.accept()?;
             Ok(server)
         });
-    eprintln!("test_tls_to_plain_server :: (A)");
     let maybe_sender = lsb.connect();
-    eprintln!("test_tls_to_plain_server :: (B)");
     let _server: MockServer = server_jh.join().unwrap()?;
-    eprintln!("test_tls_to_plain_server :: (C)");
     let err = maybe_sender.unwrap_err();
     assert_eq!(err, Error {
         code: ErrorCode::TlsError,
