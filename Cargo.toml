@@ -19,6 +19,8 @@ winapi = "0.3.9"
 
 [build-dependencies]
 cbindgen = { version = "0.24.2", optional = true, default-features = false }
+serde_json = "1.0.81"
+serde = { version = "1.0.137", features = ["derive"] }
 
 [features]
 # Build C bindings, but don't generate the header file.
@@ -27,3 +29,5 @@ ffi = []
 # Auto-generate the header. This is for dev-debugging-diffing only.
 # A hand-crafted header is easier on the eyes.
 gen_h = ["ffi", "cbindgen"]
+
+json_tests = []
