@@ -99,6 +99,7 @@ class Project:
             self.root_dir / 'build'))
         if not self.build_dir.exists():
             raise RuntimeError('Build before running tests.')
+        self.tls_certs_dir = self.root_dir / 'tls_certs'
         self.questdb_dir = self.build_dir / 'questdb'
         self.questdb_dir.mkdir(exist_ok=True)
         self.questdb_downloads_dir = self.questdb_dir / 'downloads'

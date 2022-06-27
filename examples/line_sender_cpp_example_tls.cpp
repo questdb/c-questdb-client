@@ -4,7 +4,10 @@
 using namespace std::literals::string_view_literals;
 using namespace questdb::ilp::literals;
 
-static bool example(std::string_view host, std::string_view port)
+static bool example(
+    std::string_view ca_path,
+    std::string_view host,
+    std::string_view port)
 {
     try
     {
@@ -15,13 +18,14 @@ static bool example(std::string_view host, std::string_view port)
             "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48",  // auth_priv_key
             "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU",  // auth_pub_key_x
             "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac",  // auth_pub_key_y
-            questdb::ilp::tls::insecure_skip_verify};
+            questdb::ilp::tls::enabled,
+            ca_path};  // Required only for self-signed certificates.
         questdb::ilp::line_sender sender{host, port, sec_opts};
 
         // We prepare all our table names and colum names in advance.
         // If we're inserting multiple rows, this allows us to avoid
         // re-validating the same strings over and over again.
-        auto table_name = "cpp_cars_auth"_name;
+        auto table_name = "cpp_cars_tls"_name;
         auto id_name = "id"_name;
         auto x_name = "x"_name;
         auto y_name = "y"_name;
@@ -64,8 +68,9 @@ static bool displayed_help(int argc, const char* argv[])
         if ((arg == "-h"sv) || (arg == "--help"sv))
         {
             std::cerr
-                <<  "Usage:\n"
-                <<  "line_sender_c_example: [HOST [PORT]]\n"
+                << "Usage:\n"
+                << "line_sender_c_example: CA_PATH [HOST [PORT]]\n"
+                << "    CA_PATH: Certificate authority pem file.\n"
                 << "    HOST: ILP host (defaults to \"localhost\".\n"
                 << "    PORT: ILP port (defaults to \"9009\"."
                 << std::endl;
@@ -80,12 +85,19 @@ int main(int argc, const char* argv[])
     if (displayed_help(argc, argv))
         return 0;
 
-    auto host = "localhost"sv;
-    if (argc >= 2)
-        host = std::string_view{argv[1]};
-    auto port = "9009"sv;
-    if (argc >= 3)
-        port = std::string_view{argv[2]};
+    if (argc < 2)
+    {
+        std::cerr << "CA_PATH required." << std::endl;
+        return 1;
+    }
+    auto ca_path = std::string_view{argv[1]};
 
-    return !example(host, port);
+    auto host = "localhost"sv;
+    if (argc >= 3)
+        host = std::string_view{argv[2]};
+    auto port = "9009"sv;
+    if (argc >= 4)
+        port = std::string_view{argv[3]};
+
+    return !example(ca_path, host, port);
 }

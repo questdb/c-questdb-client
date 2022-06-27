@@ -457,12 +457,20 @@ class TestLineSender(unittest.TestCase):
         scrubbed_dataset = [row[:-1] for row in resp['dataset']]
         self.assertEqual(scrubbed_dataset, exp_dataset)
 
-    def _test_example(self, bin_name, table_name):
+    def _test_example(self, bin_name, table_name, tls=False):
+        if tls and not QDB_FIXTURE.auth:
+            self.skipTest('No auth')
         # Call the example program.
         proj = Project()
         ext = '.exe' if sys.platform == 'win32' else ''
         bin_path = next(proj.build_dir.glob(f'**/{bin_name}{ext}'))
-        args = [str(bin_path), 'localhost', str(QDB_FIXTURE.line_tcp_port)]
+        port = QDB_FIXTURE.line_tcp_port
+        args = [str(bin_path)]
+        if tls:
+            ca_path = proj.tls_certs_dir / 'server_rootCA.pem'
+            args.append(str(ca_path))
+            port = TLS_PROXY_FIXTURE.listen_port
+        args.extend(['localhost', str(port)])
         subprocess.check_call(args, cwd=bin_path.parent)
 
         # Check inserted data.
@@ -498,6 +506,18 @@ class TestLineSender(unittest.TestCase):
         self._test_example(
             f'line_sender_cpp_example{suffix}',
             f'cpp_cars{suffix}')
+
+    def test_c_tls_example(self):
+        self._test_example(
+            'line_sender_c_example_tls',
+            'c_cars_tls',
+            tls=True)
+
+    def test_cpp_tls_example(self):
+        self._test_example(
+            'line_sender_cpp_example_tls',
+            'cpp_cars_tls',
+            tls=True)
 
     def test_opposite_auth(self):
         """
