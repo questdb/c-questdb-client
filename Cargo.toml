@@ -22,6 +22,8 @@ winapi = "0.3.9"
 
 [build-dependencies]
 cbindgen = { version = "0.24.2", optional = true, default-features = false }
+serde_json = "1.0.81"
+serde = { version = "1.0.137", features = ["derive"] }
 
 [dev-dependencies]
 mio = { version = "0.8.4", features = ["os-poll", "net"] }
@@ -36,3 +38,5 @@ ffi = ["insecure_skip_verify"]
 # Auto-generate the header. This is for dev-debugging-diffing only.
 # A hand-crafted header is easier on the eyes.
 gen_h = ["ffi", "cbindgen"]
+
+json_tests = []
