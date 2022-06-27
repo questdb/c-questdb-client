@@ -120,7 +120,8 @@ impl MockServer {
             msgs: Vec::new()})
     }
 
-    fn store_client(&mut self, client: Socket) -> io::Result<()> {
+    pub fn accept(&mut self) -> io::Result<()> {
+        let (client, _) = self.listener.accept()?;
         client.set_nonblocking(true)?;
         let client: std::net::TcpStream = client.into();
         let mut client = TcpStream::from_std(client);
@@ -128,11 +129,6 @@ impl MockServer {
             Interest::READABLE)?;
         self.client = Some(client);
         Ok(())
-    }
-
-    pub fn accept(&mut self) -> io::Result<()> {
-        let (client, _) = self.listener.accept()?;
-        self.store_client(client)
     }
 
     pub fn accept_tls(mut self) -> std::thread::JoinHandle<io::Result<Self>> {
