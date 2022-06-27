@@ -496,24 +496,24 @@ impl LineSenderBuilder {
     }
 
     /// Set the initial buffer capacity.
-    pub fn capacity(&mut self, byte_count: usize) -> &mut Self {
+    pub fn capacity(mut self, byte_count: usize) -> Self {
         self.capacity = byte_count;
         self
     }
 
     /// Select local outbound interface.
-    pub fn net_interface<I: Into<String>>(&mut self, addr: I) -> &mut Self {
+    pub fn net_interface<I: Into<String>>(mut self, addr: I) -> Self {
         self.net_interface = Some(addr.into());
         self
     }
 
     /// Authentication Parameters.
     pub fn auth<A, B, C, D>(
-        &mut self,
+        mut self,
         key_id: A,
         priv_key: B,
         pub_key_x: C,
-        pub_key_y: D) -> &mut Self
+        pub_key_y: D) -> Self
             where
                 A: Into<String>,
                 B: Into<String>,
@@ -530,7 +530,7 @@ impl LineSenderBuilder {
     }
 
     /// Configure TLS handshake.
-    pub fn tls(&mut self, tls: Tls) -> &mut Self {
+    pub fn tls(mut self, tls: Tls) -> Self {
         self.tls = tls;
         self
     }
@@ -538,7 +538,7 @@ impl LineSenderBuilder {
     /// Configure how long to wait for messages from the QuestDB server during
     /// the TLS handshake and authentication process.
     /// The default is 15 seconds.
-    pub fn read_timeout(&mut self, value: Duration) -> &mut Self {
+    pub fn read_timeout(mut self, value: Duration) -> Self {
         self.read_timeout = value;
         self
     }

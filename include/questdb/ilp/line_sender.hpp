@@ -59,7 +59,7 @@ namespace questdb::ilp
         /** Error during the authentication process. */
         auth_error,
 
-        /** Error during TLS negotiation. */
+        /** Error during TLS handshake. */
         tls_error
     };
 

@@ -64,7 +64,7 @@ typedef enum line_sender_error_code
     /** Error during the authentication process. */
     line_sender_error_auth_error,
 
-    /** Error during TLS negotiation. */
+    /** Error during TLS handshake. */
     line_sender_error_tls_error,
 } line_sender_error_code;
 

@@ -262,8 +262,8 @@ fn test_tls_with_file_ca() -> TestResult {
     ca_path.push("server_rootCA.pem");
 
     let server = MockServer::new()?;
-    let mut lsb = server.lsb();
-    lsb.tls(Tls::Enabled(CertificateAuthority::File(ca_path)));
+    let lsb = server.lsb()
+        .tls(Tls::Enabled(CertificateAuthority::File(ca_path)));
     let server_jh = server.accept_tls();
     let mut sender = lsb.connect()?;
     let mut server: MockServer = server_jh.join().unwrap()?;
@@ -290,9 +290,9 @@ fn test_tls_to_plain_server() -> TestResult {
     ca_path.push("server_rootCA.pem");
 
     let mut server = MockServer::new()?;
-    let mut lsb = server.lsb();
-    lsb.read_timeout(Duration::from_millis(500));
-    lsb.tls(Tls::Enabled(CertificateAuthority::File(ca_path)));
+    let lsb = server.lsb()
+        .read_timeout(Duration::from_millis(500))
+        .tls(Tls::Enabled(CertificateAuthority::File(ca_path)));
     let server_jh = std::thread::spawn(move || -> io::Result<MockServer> {
             server.accept()?;
             Ok(server)
@@ -312,8 +312,8 @@ fn test_tls_to_plain_server() -> TestResult {
 #[test]
 fn test_tls_insecure_skip_verify() -> TestResult {
     let server = MockServer::new()?;
-    let mut lsb = server.lsb();
-    lsb.tls(Tls::InsecureSkipVerify);
+    let lsb = server.lsb()
+        .tls(Tls::InsecureSkipVerify);
     let server_jh = server.accept_tls();
     let mut sender = lsb.connect()?;
     let mut server: MockServer = server_jh.join().unwrap()?;
