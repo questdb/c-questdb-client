@@ -294,66 +294,6 @@ class QuestDbFixture:
         self.stop()
 
 
-HAPROXY_CFG = """
-global
-    log stderr format raw local0 debug
-
-defaults
-    timeout connect 5s
-    timeout client 600s
-    timeout server 600s
-
-frontend ilpfront
-    bind 0.0.0.0:{listen_port} ssl crt {pem_path}
-    mode tcp
-    option tcplog
-    default_backend ilp
-
-backend ilp
-    mode tcp
-    balance leastconn
-    server questdb localhost:{qdb_ilp_port} verify none
-"""
-
-
-class HaProxyFixture:
-    def __init__(self, qdb_ilp_port):
-        proj = Project()
-        self.listen_port = discover_avail_ports(1)[0]
-        self.qdb_ilp_port = qdb_ilp_port
-        haproxy_dir = proj.build_dir / 'haproxy'
-        haproxy_dir.mkdir(exist_ok=True)
-        self.haproxy_cfg_path = haproxy_dir / 'haproxy.cfg'
-        with open(self.haproxy_cfg_path, 'w', encoding='utf-8') as haproxy_cfg:
-            haproxy_cfg.write(HAPROXY_CFG.format(
-                listen_port=self.listen_port,
-                pem_path=str(proj.root_dir / 'tls_certs' / 'server.pem'),
-                qdb_ilp_port=qdb_ilp_port))
-        self._proc = None
-
-    def start(self):
-        args = ['haproxy', '-f', str(self.haproxy_cfg_path)]
-        self._proc = subprocess.Popen(args)
-
-        def connect_to_listening_port():
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            try:
-                sock.connect(('127.0.0.1', self.listen_port))
-            except ConnectionRefusedError:
-                return False
-            finally:
-                sock.close()
-            return True
-
-        retry(connect_to_listening_port, msg='Timed out waiting for `haproxy`')
-        atexit.register(self.stop)
-
-    def stop(self):
-        if self._proc:
-            self._proc.terminate()
-            self._proc.wait()
-            self._proc = None
-
 class TlsProxyFixture:
     def __init__(self, qdb_ilp_port):
         self.qdb_ilp_port = qdb_ilp_port

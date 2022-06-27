@@ -38,7 +38,6 @@ import uuid
 from fixture import (
     Project,
     QuestDbFixture,
-    HaProxyFixture,
     TlsProxyFixture,
     install_questdb,
     list_questdb_releases,
@@ -54,16 +53,7 @@ from collections import namedtuple
 
 
 QDB_FIXTURE: QuestDbFixture = None
-HA_PROXY_FIXTURE: HaProxyFixture = None
 TLS_PROXY_FIXTURE: TlsProxyFixture = None
-
-
-def try_ha_proxy():
-    """Create a fixture if `haproxy` is available in the PATH."""
-    if shutil.which('haproxy'):
-        return HaProxyFixture(QDB_FIXTURE.line_tcp_port)
-    else:
-        return None
 
 
 class QueryError(Exception):
@@ -565,14 +555,9 @@ class TestLineSender(unittest.TestCase):
             sender.connect()
 
     def test_tls_insecure_skip_verify(self):
-        # if not HA_PROXY_FIXTURE:
-        #     self.skipTest('No `haproxy` fixture running.')
-        #     print(f'\nILP port: {QDB_FIXTURE.line_tcp_port}')
-        #     print(f'HTTP port: {QDB_FIXTURE.http_server_port}')
-        #     print(f'HAPROXY port: {HA_PROXY_FIXTURE.listen_port}')
         sender = qls.LineSender(
             QDB_FIXTURE.host,
-            TLS_PROXY_FIXTURE.listen_port,  # HA_PROXY_FIXTURE.listen_port,
+            TLS_PROXY_FIXTURE.listen_port,
             auth=AUTH if QDB_FIXTURE.auth else None,
             tls=qls.Tls.InsecureSkipVerify)
         self._test_single_symbol_impl(sender)
@@ -630,7 +615,6 @@ def run_with_existing(args):
 
 def run_with_fixtures(args):
     global QDB_FIXTURE
-    global HA_PROXY_FIXTURE
     global TLS_PROXY_FIXTURE
     versions = None
     versions_args = getattr(args, 'versions', None)
@@ -653,15 +637,10 @@ def run_with_fixtures(args):
         questdb_dir = install_questdb(version, download_url)
         for auth in (False, True):
             QDB_FIXTURE = QuestDbFixture(questdb_dir, auth=auth)
-            HA_PROXY_FIXTURE = None
             TLS_PROXY_FIXTURE = None
             try:
                 QDB_FIXTURE.start()
-                HA_PROXY_FIXTURE = try_ha_proxy()
                 TLS_PROXY_FIXTURE = TlsProxyFixture(QDB_FIXTURE.line_tcp_port)
-                if HA_PROXY_FIXTURE:
-                    sys.stderr.write('Starting `haproxy` for ILP/TLS.\n')
-                    HA_PROXY_FIXTURE.start()
                 TLS_PROXY_FIXTURE.start()
 
                 test_prog = unittest.TestProgram(exit=False)
@@ -669,8 +648,6 @@ def run_with_fixtures(args):
                     sys.exit(1)
             finally:
                 TLS_PROXY_FIXTURE.stop()
-                if HA_PROXY_FIXTURE:
-                    HA_PROXY_FIXTURE.stop()
                 QDB_FIXTURE.stop()
 
 
