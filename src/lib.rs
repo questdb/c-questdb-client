@@ -603,7 +603,8 @@ impl LineSenderBuilder {
                             .map_err(|io_err| Error{
                                 code: ErrorCode::TlsError,
                                 msg:
-                                    if io_err.kind() == io::ErrorKind::WouldBlock {
+                                    if (io_err.kind() == io::ErrorKind::TimedOut) ||
+                                       (io_err.kind() == io::ErrorKind::WouldBlock) {
                                         format!(
                                             concat!(
                                                 "Failed to complete TLS handshake: ",
