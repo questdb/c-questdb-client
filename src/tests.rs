@@ -284,6 +284,33 @@ fn test_tls_with_file_ca() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn test_tls_to_plain_server() -> TestResult {
+    let mut ca_path = certs_dir();
+    ca_path.push("server_rootCA.pem");
+
+    let mut server = MockServer::new()?;
+    let mut lsb = server.lsb();
+    lsb.read_timeout(Duration::from_millis(500));
+    lsb.tls(Tls::Enabled(CertificateAuthority::File(ca_path)));
+    let server_jh = std::thread::spawn(move || -> io::Result<MockServer> {
+            server.accept()?;
+            Ok(server)
+        });
+    eprintln!("test_tls_to_plain_server :: (A)");
+    let maybe_sender = lsb.connect();
+    eprintln!("test_tls_to_plain_server :: (B)");
+    let _server: MockServer = server_jh.join().unwrap()?;
+    eprintln!("test_tls_to_plain_server :: (C)");
+    let err = maybe_sender.unwrap_err();
+    assert_eq!(err, Error {
+        code: ErrorCode::TlsError,
+        msg: "Failed to complete TLS handshake: \
+              Timed out waiting for server response after 500ms.".to_owned()
+    });
+    Ok(())
+}
+
 #[cfg(feature = "insecure_skip_verify")]
 #[test]
 fn test_tls_insecure_skip_verify() -> TestResult {

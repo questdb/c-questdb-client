@@ -92,7 +92,7 @@ impl State {
 }
 
 /// Category of error.
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub enum ErrorCode {
     /// The host, port, or interface was incorrect.
     CouldNotResolveAddr,
@@ -112,11 +112,11 @@ pub enum ErrorCode {
     /// Error during the authentication process.
     AuthError,
 
-    /// Error during TLS negotiation.
+    /// Error during TLS handshake.
     TlsError
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct Error {
     code: ErrorCode,
     msg: String
@@ -284,15 +284,6 @@ enum Connection {
     Tls(StreamOwned<ClientConnection, Socket>)
 }
 
-impl Connection {
-    fn sock(&self) -> &Socket {
-        match self {
-            Self::Direct(sock) => sock,
-            Self::Tls(stream) => &stream.sock
-        }
-    }
-}
-
 impl io::Read for Connection {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
@@ -319,10 +310,18 @@ impl io::Write for Connection {
 }
 
 pub struct LineSender {
+    descr: String,
     conn: Connection,
     state: State,
-    output: String,
-    last_line_start: usize,
+    output: String
+}
+
+impl std::fmt::Debug for LineSender {
+    fn fmt(&self, f: &mut Formatter<'_>)
+        -> std::result::Result<(), std::fmt::Error>
+    {
+        f.write_str(self.descr.as_str())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -380,6 +379,7 @@ impl From<u16> for Service {
 #[derive(Debug, Clone)]
 pub struct LineSenderBuilder {
     capacity: usize,
+    read_timeout: Duration,
     host: String,
     port: String,
     net_interface: Option<String>,
@@ -486,6 +486,7 @@ impl LineSenderBuilder {
         let service: Service = port.into();
         Self {
             capacity: 65536,
+            read_timeout: Duration::from_secs(15),
             host: host.into(),
             port: service.0,
             net_interface: None,
@@ -528,14 +529,23 @@ impl LineSenderBuilder {
         self
     }
 
-    /// Configure TLS negotiation.
+    /// Configure TLS handshake.
     pub fn tls(&mut self, tls: Tls) -> &mut Self {
         self.tls = tls;
         self
     }
 
+    /// Configure how long to wait for messages from the QuestDB server during
+    /// the TLS handshake and authentication process.
+    /// The default is 15 seconds.
+    pub fn read_timeout(&mut self, value: Duration) -> &mut Self {
+        self.read_timeout = value;
+        self
+    }
+
     /// Connect synchronously.
     pub fn connect(self) -> Result<LineSender> {
+        let mut descr = format!("LineSender[host={:?},port={:?},", self.host, self.port);
         let addr: SockAddr = gai::resolve_host_port(self.host.as_str(), self.port.as_str())?;
         let mut sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
             .map_err(|io_err| map_io_to_socket_err(
@@ -558,6 +568,23 @@ impl LineSenderBuilder {
                 let prefix = format!("Could not connect to {:?}: ", host_port);
                 map_io_to_socket_err(&prefix, io_err)
             })?;
+
+        // We read during both TLS handshake and authentication.
+        // We set up a read timeout to prevent the client from "hanging"
+        // should we be connecting to a server configured in a different way
+        // from the client.
+        sock.set_read_timeout(Some(self.read_timeout))
+            .map_err(|io_err| map_io_to_socket_err(
+                "Failed to set read timeout on socket: ", io_err))?;
+
+        match self.tls {
+            Tls::Disabled => write!(descr, "tls=enabled,").unwrap(),
+            Tls::Enabled(_) => write!(descr, "tls=enabled,").unwrap(),
+
+            #[cfg(feature="insecure_skip_verify")]
+            Tls::InsecureSkipVerify => write!(descr, "tls=insecure_skip_verify,").unwrap(),
+        }
+
         let conn = match configure_tls(&self.tls)? {
                 Some(tls_config) => {
                     let server_name: ServerName = self.host.as_str().try_into()
@@ -573,21 +600,37 @@ impl LineSenderBuilder {
                                     rustls_err)})?;
                     while tls_conn.wants_write() || tls_conn.is_handshaking() {
                         tls_conn.complete_io(&mut sock)
-                            .map_err(|io_err| Error {
+                            .map_err(|io_err| Error{
                                 code: ErrorCode::TlsError,
-                                msg: format!(
-                                    "Failed to complete TLS handshake: {}",
-                                    io_err)})?;
+                                msg:
+                                    if io_err.kind() == io::ErrorKind::WouldBlock {
+                                        format!(
+                                            concat!(
+                                                "Failed to complete TLS handshake: ",
+                                                "Timed out waiting for server response ",
+                                                "after {:?}."),
+                                            self.read_timeout)
+                                    } else {
+                                        format!(
+                                            "Failed to complete TLS handshake: {}",
+                                            io_err)
+                                    }})?;
                     }
                     Connection::Tls(StreamOwned::new(tls_conn, sock))
                 },
                 None => Connection::Direct(sock)
             };
+        if self.auth.is_some() {
+            descr.push_str("auth=on]");
+        }
+        else {
+            descr.push_str("auth=off]");
+        }
         let mut sender = LineSender {
+            descr: descr,
             conn: conn,
             state: State::Connected,
-            output: String::with_capacity(self.capacity),
-            last_line_start: 0usize
+            output: String::with_capacity(self.capacity)
         };
         if let Some(auth) = self.auth.as_ref() {
             sender.authenticate(auth)?;
@@ -640,9 +683,6 @@ impl LineSender {
 
     fn read_challenge(&mut self) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
-        self.conn.sock().set_read_timeout(Some(Duration::from_secs(15)))
-            .map_err(|io_err| map_io_to_socket_err(
-                "Failed to set read timeout on socket: ", io_err))?;
         let mut reader = BufReader::new(&mut self.conn);
         reader.read_until(b'\n', &mut buf)
             .map_err(|io_err| map_io_to_socket_err(
@@ -814,14 +854,9 @@ impl LineSender {
         self.output.as_str()
     }
 
-    fn update_last_line_start(&mut self) {
-        self.last_line_start = self.pending_size();
-    }
-
     pub fn at(&mut self, epoch_nanos: i64) -> Result<()> {
         self.check_state(Op::At)?;
         write!(&mut self.output, " {}\n", epoch_nanos).unwrap();
-        self.update_last_line_start();
         self.state = State::MayFlushOrTable;
         Ok(())
     }
@@ -829,7 +864,6 @@ impl LineSender {
     pub fn at_now(&mut self) -> Result<()> {
         self.check_state(Op::At)?;
         self.output.push('\n');
-        self.update_last_line_start();
         self.state = State::MayFlushOrTable;
         Ok(())
     }
