@@ -418,8 +418,19 @@ fn set_tls_sec_opts(
     let tls_ca = unsafe { (*sec_opts).tls_ca };
 
     let tls = match tls {
-            DISABLED =>
-                Tls::Disabled,
+            DISABLED => {
+                    if !tls_ca.is_null() {
+                        set_err_out(
+                            err_out,
+                            ErrorCode::InvalidApiCall,
+                            concat!(
+                                "Invalid configuration: `tls_ca` was specified",
+                                " despite setting TLS as disabled.")
+                                .to_owned());
+                        return Err(());
+                    }
+                    Tls::Disabled
+                },
             ENABLED =>
                 Tls::Enabled(
                     if tls_ca.is_null() {
@@ -429,8 +440,19 @@ fn set_tls_sec_opts(
                         let tls_ca = c_str_to_ref!(tls_ca, err_out);
                         CertificateAuthority::File(PathBuf::from(tls_ca))
                     }),
-            INSECURE_SKIP_VERIFY =>
-                Tls::InsecureSkipVerify,
+            INSECURE_SKIP_VERIFY => {
+                    if !tls_ca.is_null() {
+                        set_err_out(
+                            err_out,
+                            ErrorCode::InvalidApiCall,
+                            concat!(
+                                "Invalid configuration: `tls_ca` was specified",
+                                " but has no meaning when TLS is set to ",
+                                "`insecure_skip_verify`.").to_owned());
+                        return Err(());
+                    }
+                    Tls::InsecureSkipVerify
+                },
             other => {
                 set_err_out(
                     err_out,

@@ -458,3 +458,33 @@ TEST_CASE("Bad connect")
         CHECK_MESSAGE(false, "Other exception raised.");
     }
 }
+
+void check_invalid_ca_set(questdb::ilp::tls tls, std::string_view exp_msg) {
+    try
+    {
+        questdb::ilp::sec_opts sec_opts{tls, "/a/path/to/ca.pem"};
+        questdb::ilp::line_sender sender{"localhost", 1, sec_opts};
+    }
+    catch(const questdb::ilp::line_sender_error& se)
+    {
+        std::string msg{se.what()};
+        CHECK_EQ(msg, exp_msg);
+    }
+    catch (...)
+    {
+        CHECK_MESSAGE(false, "Other exception raised.");
+    }
+}
+
+
+TEST_CASE("Invalid TLS CA set")
+{
+    check_invalid_ca_set(
+        questdb::ilp::tls::disabled,
+        ("Invalid configuration: `tls_ca` was specified "
+          "despite setting TLS as disabled."));
+    check_invalid_ca_set(
+        questdb::ilp::tls::insecure_skip_verify,
+        ("Invalid configuration: `tls_ca` was specified but has "
+         "no meaning when TLS is set to `insecure_skip_verify`."));
+}
