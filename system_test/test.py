@@ -667,7 +667,8 @@ def run_with_fixtures(args):
                 if not test_prog.result.wasSuccessful():
                     sys.exit(1)
             finally:
-                TLS_PROXY_FIXTURE.stop()
+                if TLS_PROXY_FIXTURE:
+                    TLS_PROXY_FIXTURE.stop()
                 QDB_FIXTURE.stop()
 
 

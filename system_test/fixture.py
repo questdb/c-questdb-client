@@ -269,7 +269,7 @@ class QuestDbFixture:
             sys.stderr.write('Waiting until HTTP service is up.\n')
             retry(
                 check_http_up,
-                timeout_sec=45,
+                timeout_sec=60,
                 msg='Timed out waiting for HTTP service to come up.')
         except:
             sys.stderr.write(f'QuestDB log at `{self._log_path}`:\n')
