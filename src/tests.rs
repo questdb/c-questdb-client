@@ -40,6 +40,7 @@ use rustls::{
 
 const CLIENT: Token = Token(0);
 
+#[derive(Debug)]
 struct MockServer {
     poll: Poll,
     events: Events,
@@ -139,15 +140,23 @@ impl MockServer {
                 client, CLIENT, Interest::READABLE | Interest::WRITABLE)?;
             let mut tls_conn = ServerConnection::new(tls_config()).unwrap();
             let mut stream = Stream::new(&mut tls_conn, client);
+            let begin = std::time::Instant::now();
             while stream.conn.is_handshaking() {
                 match stream.conn.complete_io(&mut stream.sock) {
-                    Ok(_) => {
-                    },
-                    Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
-                        self.poll.poll(&mut self.events, None)?;
-                    },
+                    Ok(_) => (),
                     Err(err) => {
-                        return Err(err)
+                        if err.kind() == io::ErrorKind::WouldBlock {
+                            let now = std::time::Instant::now();
+                            let elapsed = now.duration_since(begin);
+                            if elapsed > Duration::from_secs(2) {
+                                return Err(err);
+                            }
+                            self.poll.poll(&mut self.events,
+                                Some(Duration::from_millis(200)))?;
+                        }
+                        else {
+                            return Err(err);
+                        }
                     }
                 }
             }
@@ -305,6 +314,46 @@ fn test_tls_to_plain_server() -> TestResult {
         msg: "Failed to complete TLS handshake: \
               Timed out waiting for server response after 500ms.".to_owned()
     });
+    Ok(())
+}
+
+fn expect_eventual_disconnect(sender: &mut LineSender) {
+    let mut retry = || {
+        for _ in 0..1000 {
+            std::thread::sleep(Duration::from_millis(100));
+            sender
+                .table("test_table")?
+                .symbol("s1", "v1")?
+                .at_now()?;
+            sender.flush()?;
+        }
+        Ok(())
+    };
+
+    let err: Error = retry().unwrap_err();
+    assert_eq!(err.code, ErrorCode::SocketError);
+}
+
+#[test]
+fn test_plain_to_tls_server() -> TestResult {
+    let server = MockServer::new()?;
+    let lsb = server.lsb()
+        .read_timeout(Duration::from_millis(500))
+        .tls(Tls::Disabled);
+    let server_jh = server.accept_tls();
+    let maybe_sender = lsb.connect();
+    let server_err = server_jh.join().unwrap().unwrap_err();
+
+    // The server failed to handshake, so disconnected the client.
+    assert!(
+        (server_err.kind() == io::ErrorKind::TimedOut) ||
+        (server_err.kind() == io::ErrorKind::WouldBlock));
+
+    // The client nevertheless connected successfully.
+    let mut sender = maybe_sender.unwrap();
+
+    // Eventually, the client fail to flush.
+    expect_eventual_disconnect(&mut sender);
     Ok(())
 }
 
