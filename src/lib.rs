@@ -25,8 +25,7 @@
 use core::time::Duration;
 use std::convert::{TryFrom, TryInto, Infallible};
 use std::fmt::{self, Write, Display, Formatter};
-use std::io::{self, BufRead, BufReader};
-use std::io::Write as IoWrite;
+use std::io::{self, BufRead, BufReader, Write as IoWrite};
 use std::sync::Arc;
 use std::path::PathBuf;
 
@@ -896,3 +895,6 @@ pub mod ffi;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, feature = "json_tests"))]
+mod json_tests;
