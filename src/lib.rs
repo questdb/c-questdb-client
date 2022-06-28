@@ -26,9 +26,7 @@ use core::time::Duration;
 use std::convert::{TryFrom, TryInto, Infallible};
 use std::fmt;
 use std::fmt::{Write, Display, Formatter};
-use std::io;
-use std::io::{BufRead, BufReader};
-use std::io::Write as IoWrite;
+use std::io::{self, BufRead, BufReader, Write as IoWrite};
 use socket2::{Domain, Socket, SockAddr, Type, Protocol};
 use base64ct::{Base64, Base64UrlUnpadded, Encoding};
 use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
@@ -634,3 +632,9 @@ mod gai;
 #[allow(non_camel_case_types)]
 #[cfg(feature = "ffi")]
 pub mod ffi;
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(all(test, feature = "json_tests"))]
+mod json_tests;
