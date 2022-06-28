@@ -188,10 +188,20 @@ namespace questdb::ilp
         }
     }
 
+    /** Whole connection encryption options. */
     enum class tls
     {
+        /** No TLS connection encryption. */
         disabled,
+
+        /** Enable TLS. See `sec_opts::tls_ca` for behaviour. */
         enabled,
+
+        /**
+         * Enable TLS whilst dangerously accepting any certificate as valid.
+         * This should only be used for debugging.
+         * Consider using `enabled` and supplying a self-signed `tls_ca` instead.
+         */
         insecure_skip_verify
     };
 
@@ -247,7 +257,10 @@ namespace questdb::ilp
 
         /**
          * Set a custom CA file path to use for verification.
-         * If an empty string, defaults to `webpki-roots` certificates.
+         * If set to a nullopt, defaults to `webpki-roots` certificates which
+         * accepts most well-know certificate authorities.
+         *
+         * This argument is generally only specified during dev-testing.
          */
         std::optional<std::string> _tls_ca;
     };

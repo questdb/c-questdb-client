@@ -252,11 +252,19 @@ macro_rules! bubble_err_to_c {
     };
 }
 
+/// Whole connection encryption options.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub enum line_sender_tls {
+    /// No TLS connection encryption.
     line_sender_tls_disabled,
+
+    /// Enable TLS. See `line_sender_sec_opts::tls_ca` for behaviour.
     line_sender_tls_enabled,
+
+    /// Enable TLS whilst dangerously accepting any certificate as valid.
+    /// This should only be used for debugging.
+    /// Consider using `enabled` and specifying a self-signed `tls_ca` instead.
     line_sender_tls_insecure_skip_verify
 }
 
@@ -281,7 +289,10 @@ pub struct line_sender_sec_opts
     pub tls: line_sender_tls,
 
     /// Set a custom CA file path to use for verification.
-    /// If NULL, defaults to `webpki-roots` certificates.
+    /// If NULL, defaults to `webpki-roots` certificates which accepts
+    /// most well-know certificate authorities.
+    ///
+    /// This argument is generally only specified during dev-testing.
     pub tls_ca: *const libc::c_char
     
 }
