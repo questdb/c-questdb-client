@@ -148,30 +148,99 @@ fn map_io_to_socket_err(prefix: &str, io_err: io::Error) -> Error {
     }
 }
 
-pub struct Name<'a> {
+pub struct TableName<'a> {
     name: &'a str
 }
 
-impl <'a> Name<'a> {
+impl <'a> TableName<'a> {
     pub fn new(name: &'a str) -> Result<Self> {
         if name.is_empty() {
             return Err(Error{
                 code: ErrorCode::InvalidName,
-                msg: concat!(
-                    "table, symbol and column names ",
-                    "must have a non-zero length.").to_owned()});
+                msg: "Table names must have a non-zero length.".to_owned()});
         }
 
+        let mut prev = '\0';
         for (index, c) in name.chars().enumerate() {
             match c {
-                ' ' | '?' | '.' | ',' | '\'' | '\"' | '\\' | '/' | '\0' |
-                ':' | ')' | '(' | '+' | '-' | '*' | '%' | '~' => {
+                '.' => {
+                    if index == 0 || index == name.len() - 1 || prev == '.' {
+                        return Err(Error{
+                            code: ErrorCode::InvalidName,
+                            msg: format!(
+                                concat!(
+                                    "Bad string {:?}: ",
+                                    "Found invalid dot `.` at position {}."),
+                                name, index)});
+                    }
+                },
+                '?' | ',' | '\'' | '\"' | '\\' | '/' | ':' | ')' |
+                '(' | '+' | '*' | '%' | '~' | '\r' | '\n' | '\0' |
+                '\u{0001}' | '\u{0002}' | '\u{0003}' | '\u{0004}' | '\u{0005}' |
+                '\u{0006}' | '\u{0007}' | '\u{0008}' | '\u{0009}' | '\u{000b}' |
+                '\u{000c}' | '\u{000e}' | '\u{000f}' | '\u{007f}' => {
                     return Err(Error{
                         code: ErrorCode::InvalidName,
                         msg: format!(
                             concat!(
                                 "Bad string {:?}: ",
-                                "table, symbol and column names can't contain ",
+                                "Table names can't contain ",
+                                "a {:?} character, which was found at ",
+                                "byte position {}."),
+                            name,
+                            c,
+                            index)});
+                },
+                '\u{feff}' => {
+                    // Reject unicode char 'ZERO WIDTH NO-BREAK SPACE',
+                    // aka UTF-8 BOM if it appears anywhere in the string.
+                    return Err(Error{
+                        code: ErrorCode::InvalidName,
+                        msg: format!(
+                            concat!(
+                                "Bad string {:?}: ",
+                                "Table names can't contain ",
+                                "a UTF-8 BOM character, which was found at ",
+                                "byte position {}."),
+                            name,
+                            index)});
+                },
+                _ => ()
+            }
+            prev = c;
+        }
+
+        Ok(Self { name: name })
+    }
+}
+
+pub struct ColumnName<'a> {
+    name: &'a str
+}
+
+impl <'a> ColumnName<'a> {
+    pub fn new(name: &'a str) -> Result<Self> {
+        if name.is_empty() {
+            return Err(Error{
+                code: ErrorCode::InvalidName,
+                msg: concat!(
+                    "Symbol and column names ",
+                    "must have a non-zero length.").to_owned()});
+        }
+
+        for (index, c) in name.chars().enumerate() {
+            match c {
+                '?' | '.' | ',' | '\'' | '\"' | '\\' | '/' | ':' | ')' | '(' |
+                '+' | '-' | '*' | '%' | '~' | '\r' | '\n' | '\0' |
+                '\u{0001}' | '\u{0002}' | '\u{0003}' | '\u{0004}' | '\u{0005}' |
+                '\u{0006}' | '\u{0007}' | '\u{0008}' | '\u{0009}' | '\u{000b}' |
+                '\u{000c}' | '\u{000e}' | '\u{000f}' | '\u{007f}' => {
+                    return Err(Error{
+                        code: ErrorCode::InvalidName,
+                        msg: format!(
+                            concat!(
+                                "Bad string {:?}: ",
+                                "Symbol and column names can't contain ",
                                 "a {:?} character, which was found at ",
                                 "byte position {}."),
                             name,
@@ -200,11 +269,19 @@ impl <'a> Name<'a> {
     }
 }
 
-impl <'a> TryFrom<&'a str> for Name<'a> {
+impl <'a> TryFrom<&'a str> for TableName<'a> {
     type Error = self::Error;
 
     fn try_from(name: &'a str) -> Result<Self> {
-        Name::new(name)
+        Self::new(name)
+    }
+}
+
+impl <'a> TryFrom<&'a str> for ColumnName<'a> {
+    type Error = self::Error;
+
+    fn try_from(name: &'a str) -> Result<Self> {
+        Self::new(name)
     }
 }
 
@@ -250,7 +327,7 @@ fn write_escaped_impl<Q, C>(
 
 fn must_escape_unquoted(c: char) -> bool {
     match c {
-        ' ' | ',' | '=' | '\n' | '\r' | '"' | '\\' => true,
+        ' ' | ',' | '=' | '\n' | '\r' | '\\' => true,
         _ => false
     }
 }
@@ -788,37 +865,38 @@ impl LineSender {
 
     pub fn table<'a, N>(&mut self, name: N) -> Result<&mut Self>
         where
-            N: TryInto<Name<'a>>,
+            N: TryInto<TableName<'a>>,
             Error: From<N::Error>
     {
-        let name: Name<'a> = name.try_into()?;
+        let name: TableName<'a> = name.try_into()?;
         self.check_state(Op::Table)?;
         write_escaped_unquoted(&mut self.output, name.name);
         self.state = State::TableWritten;
         Ok(self)
     }
 
-    pub fn symbol<'a, N>(&mut self, name: N, value: &str) -> Result<&mut Self>
+    pub fn symbol<'a, N, S>(&mut self, name: N, value: S) -> Result<&mut Self>
         where
-            N: TryInto<Name<'a>>,
+            N: TryInto<ColumnName<'a>>,
+            S: AsRef<str>,
             Error: From<N::Error>
     {
-        let name: Name<'a> = name.try_into()?;
+        let name: ColumnName<'a> = name.try_into()?;
         self.check_state(Op::Symbol)?;
         self.output.push(',');
         write_escaped_unquoted(&mut self.output, name.name);
         self.output.push('=');
-        write_escaped_unquoted(&mut self.output, value);
+        write_escaped_unquoted(&mut self.output, value.as_ref());
         self.state = State::SymbolWritten;
         Ok(self)
     }
 
     fn write_column_key<'a, N>(&mut self, name: N) -> Result<&mut Self>
         where
-            N: TryInto<Name<'a>>,
+            N: TryInto<ColumnName<'a>>,
             Error: From<N::Error>
     {
-        let name: Name<'a> = name.try_into()?;
+        let name: ColumnName<'a> = name.try_into()?;
         self.check_state(Op::Column)?;
         self.output.push(
             if (self.state as isize & Op::Symbol as isize) > 0 {
@@ -834,7 +912,7 @@ impl LineSender {
 
     pub fn column_bool<'a, N>(&mut self, name: N, value: bool) -> Result<&mut Self>
         where
-            N: TryInto<Name<'a>>,
+            N: TryInto<ColumnName<'a>>,
             Error: From<N::Error>
     {
         self.write_column_key(name)?;
@@ -844,7 +922,7 @@ impl LineSender {
 
     pub fn column_i64<'a, N>(&mut self, name: N, value: i64) -> Result<&mut Self>
         where
-            N: TryInto<Name<'a>>,
+            N: TryInto<ColumnName<'a>>,
             Error: From<N::Error>
     {
         self.write_column_key(name)?;
@@ -854,7 +932,7 @@ impl LineSender {
 
     pub fn column_f64<'a, N>(&mut self, name: N, value: f64) -> Result<&mut Self>
         where
-            N: TryInto<Name<'a>>,
+            N: TryInto<ColumnName<'a>>,
             Error: From<N::Error>
     {
         self.write_column_key(name)?;
@@ -863,13 +941,14 @@ impl LineSender {
         Ok(self)
     }
 
-    pub fn column_str<'a, N>(&mut self, name: N, value: &str) -> Result<&mut Self>
+    pub fn column_str<'a, N, S>(&mut self, name: N, value: S) -> Result<&mut Self>
         where
-            N: TryInto<Name<'a>>,
+            N: TryInto<ColumnName<'a>>,
+            S: AsRef<str>,
             Error: From<N::Error>
     {
         self.write_column_key(name)?;
-        write_escaped_quoted(&mut self.output, value);
+        write_escaped_quoted(&mut self.output, value.as_ref());
         Ok(self)
     }
 
