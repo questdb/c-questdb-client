@@ -3,4 +3,4 @@ Cargo.lock
 build
 .vs
 .vscode
-src/json_tests.rs
+src/tests/json_tests.rs

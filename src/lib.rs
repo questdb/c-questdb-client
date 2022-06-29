@@ -673,6 +673,45 @@ fn parse_key_pair(auth: &AuthParams) -> Result<EcdsaKeyPair> {
                 msg: format!("Bad private key: {}", key_rejected)})
 }
 
+struct F64Serializer {
+    buf: ryu::Buffer,
+    n: f64
+}
+
+impl F64Serializer {
+    fn new(n: f64) -> Self {
+        F64Serializer {
+            buf: ryu::Buffer::new(),
+            n: n
+        }
+    }
+
+    // This function was taken and customized from the ryu crate.
+    #[cold]
+    #[cfg_attr(feature = "no-panic", inline)]
+    fn format_nonfinite(&self) -> &'static str {
+        const MANTISSA_MASK: u64 = 0x000fffffffffffff;
+        const SIGN_MASK: u64 = 0x8000000000000000;
+        let bits = self.n.to_bits();
+        if bits & MANTISSA_MASK != 0 {
+            "NaN"
+        } else if bits & SIGN_MASK != 0 {
+            "-Infinity"
+        } else {
+            "Infinity"
+        }
+    }
+
+    fn to_str(&mut self) -> &str {
+        if self.n.is_finite() {
+            self.buf.format_finite(self.n)
+        }
+        else {
+            self.format_nonfinite()
+        }
+    }
+}
+
 impl LineSender {
 
     fn send_key_id(&mut self, key_id: &str) -> Result<()> {
@@ -819,15 +858,8 @@ impl LineSender {
             Error: From<N::Error>
     {
         self.write_column_key(name)?;
-        if value == f64::INFINITY {
-            self.output.push_str("Infinity");
-        }
-        else if value == f64::NEG_INFINITY {
-            self.output.push_str("-Infinity");
-        }
-        else {
-            write!(&mut self.output, "{}", value).unwrap();
-        }
+        let mut ser = F64Serializer::new(value);
+        self.output.push_str(ser.to_str());
         Ok(self)
     }
 
@@ -895,6 +927,3 @@ pub mod ffi;
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(all(test, feature = "json_tests"))]
-mod json_tests;
