@@ -24,14 +24,17 @@
 
 use core::time::Duration;
 use std::convert::{TryFrom, TryInto, Infallible};
-use std::fmt;
-use std::fmt::{Write, Display, Formatter};
-use std::io;
-use std::io::{BufRead, BufReader};
+use std::fmt::{self, Write, Display, Formatter};
+use std::io::{self, BufRead, BufReader};
 use std::io::Write as IoWrite;
+use std::sync::Arc;
+use std::path::PathBuf;
+
 use socket2::{Domain, Socket, SockAddr, Type, Protocol};
 use base64ct::{Base64, Base64UrlUnpadded, Encoding};
 use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
+use rustls::{
+    OwnedTrustAnchor, RootCertStore, ClientConnection, ServerName, StreamOwned};
 
 #[derive(Debug, Copy, Clone)]
 enum Op {
@@ -89,7 +92,7 @@ impl State {
 }
 
 /// Category of error.
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub enum ErrorCode {
     /// The host, port, or interface was incorrect.
     CouldNotResolveAddr,
@@ -97,7 +100,7 @@ pub enum ErrorCode {
     /// Called methods in the wrong order. E.g. `symbol` after `column`.
     InvalidApiCall,
 
-    /// A network error connecting of flushing data out.
+    /// A network error connecting or flushing data out.
     SocketError,
 
     /// The string or symbol field is not encoded in valid UTF-8.
@@ -107,10 +110,13 @@ pub enum ErrorCode {
     InvalidName,
 
     /// Error during the authentication process.
-    AuthError
+    AuthError,
+
+    /// Error during TLS handshake.
+    TlsError
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct Error {
     code: ErrorCode,
     msg: String
@@ -273,86 +279,288 @@ fn write_escaped_quoted(output: &mut String, s: &str) {
         s)
 }
 
+enum Connection {
+    Direct(Socket),
+    Tls(StreamOwned<ClientConnection, Socket>)
+}
+
+impl io::Read for Connection {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Direct(sock) => sock.read(buf),
+            Self::Tls(stream) => stream.read(buf)
+        }
+    }
+}
+
+impl io::Write for Connection {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Direct(sock) => sock.write(buf),
+            Self::Tls(stream) => stream.write(buf)
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Direct(sock) => sock.flush(),
+            Self::Tls(stream) => stream.flush()
+        }
+    }
+}
+
 pub struct LineSender {
-    sock: Socket,
+    descr: String,
+    conn: Connection,
     state: State,
-    output: String,
-    last_line_start: usize
+    output: String
+}
+
+impl std::fmt::Debug for LineSender {
+    fn fmt(&self, f: &mut Formatter<'_>)
+        -> std::result::Result<(), std::fmt::Error>
+    {
+        f.write_str(self.descr.as_str())
+    }
 }
 
 #[derive(Debug, Clone)]
-pub struct AuthParams<'a> {
-    key_id: &'a str,
-    priv_key: &'a str,
-    pub_key_x: &'a str,
-    pub_key_y: &'a str
+struct AuthParams {
+    key_id: String,
+    priv_key: String,
+    pub_key_x: String,
+    pub_key_y: String
 }
 
 #[derive(Debug, Clone)]
-pub struct LineSenderBuilder<'a> {
+pub enum CertificateAuthority {
+    WebpkiRoots,
+    File(PathBuf)
+}
+
+#[derive(Debug, Clone)]
+pub enum Tls {
+    Disabled,
+    Enabled(CertificateAuthority),
+
+    #[cfg(feature = "insecure_skip_verify")]
+    InsecureSkipVerify
+}
+
+impl Tls {
+    pub fn is_disabled(&self) -> bool {
+        match self {
+            Tls::Disabled => true,
+            _ => false
+        }
+    }
+}
+
+pub struct Service(String);
+
+impl From<String> for Service {
+    fn from(s: String) -> Self {
+        Service(s)
+    }
+}
+
+impl From<&str> for Service {
+    fn from(s: &str) -> Self {
+        Service(s.to_owned())
+    }
+}
+
+impl From<u16> for Service {
+    fn from(p: u16) -> Self {
+        Service(p.to_string())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LineSenderBuilder {
     capacity: usize,
-    host: &'a str,
-    port: &'a str,
-    net_interface: Option<&'a str>,
-    auth: Option<AuthParams<'a>>
+    read_timeout: Duration,
+    host: String,
+    port: String,
+    net_interface: Option<String>,
+    auth: Option<AuthParams>,
+    tls: Tls,
 }
 
-impl <'a> LineSenderBuilder<'a> {
+#[cfg(feature = "insecure_skip_verify")]
+mod danger {
+    pub struct NoCertificateVerification {}
+
+    impl rustls::client::ServerCertVerifier for NoCertificateVerification {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::Certificate,
+            _intermediates: &[rustls::Certificate],
+            _server_name: &rustls::ServerName,
+            _scts: &mut dyn Iterator<Item = &[u8]>,
+            _ocsp: &[u8],
+            _now: std::time::SystemTime,
+        ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::ServerCertVerified::assertion())
+        }
+    }
+}
+
+fn map_rustls_err(descr: &str, err: rustls::Error) -> Error {
+    Error {
+        code: ErrorCode::TlsError,
+        msg: format!("{}: {}", descr, err)
+    }
+}
+
+fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
+    if tls.is_disabled() {
+        return Ok(None);
+    }
+
+    let mut root_store = RootCertStore::empty();
+
+    if let Tls::Enabled(ca) = tls {
+        match ca {
+            CertificateAuthority::WebpkiRoots => {
+                root_store.add_server_trust_anchors(
+                    webpki_roots::TLS_SERVER_ROOTS
+                        .0
+                        .iter()
+                        .map(|ta| {
+                            OwnedTrustAnchor::from_subject_spki_name_constraints(
+                                ta.subject,
+                                ta.spki,
+                                ta.name_constraints,
+                            )}));
+            },
+            CertificateAuthority::File(ca_file) => {
+                let certfile = std::fs::File::open(ca_file)
+                    .map_err(|io_err| Error {
+                        code: ErrorCode::TlsError,
+                        msg: format!(
+                            "Could not open certificate authority file from path {:?}: {}",
+                            ca_file,
+                            io_err)})?;
+                let mut reader = BufReader::new(certfile);
+                let der_certs = &rustls_pemfile::certs(&mut reader)
+                    .map_err(|io_err| Error {
+                        code: ErrorCode::TlsError,
+                        msg: format!(
+                            "Could not read certificate authority file from path {:?}: {}",
+                            ca_file,
+                            io_err)})?;
+                root_store.add_parsable_certificates(der_certs);
+            }
+        }
+    }
+    // else if let Tls::InsecureSkipVerify {
+    //    We don't need to set up any certificates.
+    //    An empty root is fine if we're going to ignore validity anyways.
+    // }
+
+    let mut config = rustls::ClientConfig::builder()
+        .with_safe_default_cipher_suites()
+        .with_safe_default_kx_groups()
+        .with_safe_default_protocol_versions()
+        .map_err(|rustls_err| map_rustls_err("Bad protocol version selection", rustls_err))?
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
+    // TLS log file for debugging.
+    // Set the SSLKEYLOGFILE env variable to a writable location.
+    config.key_log = Arc::new(rustls::KeyLogFile::new());
+
+    #[cfg(feature = "insecure_skip_verify")]
+    if let Tls::InsecureSkipVerify = tls {
+        config.dangerous().set_certificate_verifier(
+            Arc::new(danger::NoCertificateVerification {}));
+    }
+
+    Ok(Some(Arc::new(config)))
+}
+
+impl LineSenderBuilder {
     /// QuestDB server and port.
-    pub fn new(host: &'a str, port: &'a str) -> Self {
+    pub fn new<H: Into<String>, P: Into<Service>>(host: H, port: P) -> Self {
+        let service: Service = port.into();
         Self {
             capacity: 65536,
-            host: host,
-            port: port,
+            read_timeout: Duration::from_secs(15),
+            host: host.into(),
+            port: service.0,
             net_interface: None,
-            auth: None }
+            auth: None,
+            tls: Tls::Disabled
+        }
     }
 
     /// Set the initial buffer capacity.
-    pub fn capacity(&mut self, byte_count: usize) -> &mut Self {
+    pub fn capacity(mut self, byte_count: usize) -> Self {
         self.capacity = byte_count;
         self
     }
 
     /// Select local outbound interface.
-    pub fn net_interface(&mut self, addr: &'a str) -> &mut Self {
-        self.net_interface = Some(addr);
+    pub fn net_interface<I: Into<String>>(mut self, addr: I) -> Self {
+        self.net_interface = Some(addr.into());
         self
     }
 
     /// Authentication Parameters.
-    pub fn auth(
-        &mut self, key_id: &'a str,
-        priv_key: &'a str,
-        pub_key_x: &'a str,
-        pub_key_y: &'a str) -> &mut Self
+    pub fn auth<A, B, C, D>(
+        mut self,
+        key_id: A,
+        priv_key: B,
+        pub_key_x: C,
+        pub_key_y: D) -> Self
+            where
+                A: Into<String>,
+                B: Into<String>,
+                C: Into<String>,
+                D: Into<String>
     {
         self.auth = Some(AuthParams {
-            key_id: key_id,
-            priv_key: priv_key,
-            pub_key_x: pub_key_x,
-            pub_key_y: pub_key_y
+            key_id: key_id.into(),
+            priv_key: priv_key.into(),
+            pub_key_x: pub_key_x.into(),
+            pub_key_y: pub_key_y.into()
         });
+        self
+    }
+
+    /// Configure TLS handshake.
+    pub fn tls(mut self, tls: Tls) -> Self {
+        self.tls = tls;
+        self
+    }
+
+    /// Configure how long to wait for messages from the QuestDB server during
+    /// the TLS handshake and authentication process.
+    /// The default is 15 seconds.
+    pub fn read_timeout(mut self, value: Duration) -> Self {
+        self.read_timeout = value;
         self
     }
 
     /// Connect synchronously.
     pub fn connect(self) -> Result<LineSender> {
-        let addr: SockAddr = gai::resolve_host_port(self.host, self.port)?;
-        let sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
+        let mut descr = format!("LineSender[host={:?},port={:?},", self.host, self.port);
+        let addr: SockAddr = gai::resolve_host_port(self.host.as_str(), self.port.as_str())?;
+        let mut sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
             .map_err(|io_err| map_io_to_socket_err(
                 "Could not open TCP socket: ", io_err))?;
         sock.set_nodelay(true)
             .map_err(|io_err| map_io_to_socket_err(
                 "Could not set TCP_NODELAY: ", io_err))?;
         if let Some(host) = self.net_interface {
-            let bind_addr = gai::resolve_host(host)?;
+            let bind_addr = gai::resolve_host(host.as_str())?;
             sock.bind(&bind_addr)
-            .map_err(|io_err| map_io_to_socket_err(
-                &format!(
-                    "Could not bind to interface address {:?}: ",
-                    host),
-                io_err))?;
+                .map_err(|io_err| map_io_to_socket_err(
+                    &format!(
+                        "Could not bind to interface address {:?}: ",
+                        host),
+                    io_err))?;
         }
         sock.connect(&addr)
             .map_err(|io_err| {
@@ -360,13 +568,72 @@ impl <'a> LineSenderBuilder<'a> {
                 let prefix = format!("Could not connect to {:?}: ", host_port);
                 map_io_to_socket_err(&prefix, io_err)
             })?;
+
+        // We read during both TLS handshake and authentication.
+        // We set up a read timeout to prevent the client from "hanging"
+        // should we be connecting to a server configured in a different way
+        // from the client.
+        sock.set_read_timeout(Some(self.read_timeout))
+            .map_err(|io_err| map_io_to_socket_err(
+                "Failed to set read timeout on socket: ", io_err))?;
+
+        match self.tls {
+            Tls::Disabled => write!(descr, "tls=enabled,").unwrap(),
+            Tls::Enabled(_) => write!(descr, "tls=enabled,").unwrap(),
+
+            #[cfg(feature="insecure_skip_verify")]
+            Tls::InsecureSkipVerify => write!(descr, "tls=insecure_skip_verify,").unwrap(),
+        }
+
+        let conn = match configure_tls(&self.tls)? {
+                Some(tls_config) => {
+                    let server_name: ServerName = self.host.as_str().try_into()
+                        .map_err(|inv_dns_err| Error {
+                            code: ErrorCode::TlsError,
+                            msg: format!("Bad host: {}", inv_dns_err)})?;
+                    let mut tls_conn = ClientConnection::new(
+                        tls_config, server_name)
+                            .map_err(|rustls_err| Error {
+                                code: ErrorCode::TlsError,
+                                msg: format!(
+                                    "Could not create TLS client: {}",
+                                    rustls_err)})?;
+                    while tls_conn.wants_write() || tls_conn.is_handshaking() {
+                        tls_conn.complete_io(&mut sock)
+                            .map_err(|io_err| Error{
+                                code: ErrorCode::TlsError,
+                                msg:
+                                    if (io_err.kind() == io::ErrorKind::TimedOut) ||
+                                       (io_err.kind() == io::ErrorKind::WouldBlock) {
+                                        format!(
+                                            concat!(
+                                                "Failed to complete TLS handshake: ",
+                                                "Timed out waiting for server response ",
+                                                "after {:?}."),
+                                            self.read_timeout)
+                                    } else {
+                                        format!(
+                                            "Failed to complete TLS handshake: {}",
+                                            io_err)
+                                    }})?;
+                    }
+                    Connection::Tls(StreamOwned::new(tls_conn, sock))
+                },
+                None => Connection::Direct(sock)
+            };
+        if self.auth.is_some() {
+            descr.push_str("auth=on]");
+        }
+        else {
+            descr.push_str("auth=off]");
+        }
         let mut sender = LineSender {
-            sock: sock,
+            descr: descr,
+            conn: conn,
             state: State::Connected,
-            output: String::with_capacity(self.capacity),
-            last_line_start: 0usize
+            output: String::with_capacity(self.capacity)
         };
-        if let Some(auth) = self.auth {
+        if let Some(auth) = self.auth.as_ref() {
             sender.authenticate(auth)?;
         }
         Ok(sender)
@@ -395,9 +662,9 @@ fn parse_public_key(pub_key_x: &str, pub_key_y: &str) -> Result<Vec<u8>> {
     Ok(encoded)
 }
 
-fn parse_key_pair<'a>(auth: &AuthParams<'a>) -> Result<EcdsaKeyPair> {
-    let private_key = b64_decode("private authentication key", auth.priv_key)?;
-    let public_key = parse_public_key(auth.pub_key_x, auth.pub_key_y)?;
+fn parse_key_pair(auth: &AuthParams) -> Result<EcdsaKeyPair> {
+    let private_key = b64_decode("private authentication key", auth.priv_key.as_str())?;
+    let public_key = parse_public_key(auth.pub_key_x.as_str(), auth.pub_key_y.as_str())?;
     EcdsaKeyPair::from_private_key_and_public_key(
         &ECDSA_P256_SHA256_FIXED_SIGNING,
         &private_key[..],
@@ -408,18 +675,16 @@ fn parse_key_pair<'a>(auth: &AuthParams<'a>) -> Result<EcdsaKeyPair> {
 }
 
 impl LineSender {
+
     fn send_key_id(&mut self, key_id: &str) -> Result<()> {
-        write!(&mut self.sock, "{}\n", key_id)
+        write!(&mut self.conn, "{}\n", key_id)
             .map_err(|io_err| map_io_to_socket_err("Failed to send key_id: ", io_err))?;
         Ok(())
     }
 
     fn read_challenge(&mut self) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
-        self.sock.set_read_timeout(Some(Duration::from_secs(15)))
-            .map_err(|io_err| map_io_to_socket_err(
-                "Failed to set read timeout on socket: ", io_err))?;
-        let mut reader = BufReader::new(&mut self.sock);
+        let mut reader = BufReader::new(&mut self.conn);
         reader.read_until(b'\n', &mut buf)
             .map_err(|io_err| map_io_to_socket_err(
                 "Failed to read authentication challenge (timed out?): ",
@@ -440,7 +705,7 @@ impl LineSender {
         Ok(buf)
     }
 
-    fn authenticate<'a>(&mut self, auth: AuthParams<'a>) -> Result<()> {
+    fn authenticate(&mut self, auth: &AuthParams) -> Result<()> {
         if auth.key_id.contains('\n') {
             return Err(Error {
                 code: ErrorCode::AuthError,
@@ -449,7 +714,7 @@ impl LineSender {
                     auth.key_id)});
         }
         let key_pair = parse_key_pair(&auth)?;
-        self.send_key_id(auth.key_id)?;
+        self.send_key_id(auth.key_id.as_str())?;
         let challenge = self.read_challenge()?;
         let rng = ring::rand::SystemRandom::new();
         let signature = key_pair.sign(&rng, &challenge[..]).
@@ -461,7 +726,7 @@ impl LineSender {
         let mut encoded_sig = Base64::encode_string(signature.as_ref());
         encoded_sig.push('\n');
         let buf = encoded_sig.as_bytes();
-        if let Err(io_err) = self.sock.write_all(buf) {
+        if let Err(io_err) = self.conn.write_all(buf) {
             return Err(map_io_to_socket_err(
                 "Could not send signed challenge: ",
                 io_err));
@@ -483,7 +748,7 @@ impl LineSender {
         Err(error)
     }
 
-    pub fn table<'a, N>(&mut self, name: N) -> Result<()>
+    pub fn table<'a, N>(&mut self, name: N) -> Result<&mut Self>
         where
             N: TryInto<Name<'a>>,
             Error: From<N::Error>
@@ -492,10 +757,10 @@ impl LineSender {
         self.check_state(Op::Table)?;
         write_escaped_unquoted(&mut self.output, name.name);
         self.state = State::TableWritten;
-        Ok(())
+        Ok(self)
     }
 
-    pub fn symbol<'a, N>(&mut self, name: N, value: &str) -> Result<()>
+    pub fn symbol<'a, N>(&mut self, name: N, value: &str) -> Result<&mut Self>
         where
             N: TryInto<Name<'a>>,
             Error: From<N::Error>
@@ -507,10 +772,10 @@ impl LineSender {
         self.output.push('=');
         write_escaped_unquoted(&mut self.output, value);
         self.state = State::SymbolWritten;
-        Ok(())
+        Ok(self)
     }
 
-    fn write_column_key<'a, N>(&mut self, name: N) -> Result<()>
+    fn write_column_key<'a, N>(&mut self, name: N) -> Result<&mut Self>
         where
             N: TryInto<Name<'a>>,
             Error: From<N::Error>
@@ -526,30 +791,30 @@ impl LineSender {
         write_escaped_unquoted(&mut self.output, name.name);
         self.output.push('=');
         self.state = State::ColumnWritten;
-        Ok(())
+        Ok(self)
     }
 
-    pub fn column_bool<'a, N>(&mut self, name: N, value: bool) -> Result<()>
+    pub fn column_bool<'a, N>(&mut self, name: N, value: bool) -> Result<&mut Self>
         where
             N: TryInto<Name<'a>>,
             Error: From<N::Error>
     {
         self.write_column_key(name)?;
         self.output.push(if value {'t'} else {'f'});
-        Ok(())
+        Ok(self)
     }
 
-    pub fn column_i64<'a, N>(&mut self, name: N, value: i64) -> Result<()>
+    pub fn column_i64<'a, N>(&mut self, name: N, value: i64) -> Result<&mut Self>
         where
             N: TryInto<Name<'a>>,
             Error: From<N::Error>
     {
         self.write_column_key(name)?;
         write!(&mut self.output, "{}i", value).unwrap();
-        Ok(())
+        Ok(self)
     }
 
-    pub fn column_f64<'a, N>(&mut self, name: N, value: f64) -> Result<()>
+    pub fn column_f64<'a, N>(&mut self, name: N, value: f64) -> Result<&mut Self>
         where
             N: TryInto<Name<'a>>,
             Error: From<N::Error>
@@ -564,17 +829,17 @@ impl LineSender {
         else {
             write!(&mut self.output, "{}", value).unwrap();
         }
-        Ok(())
+        Ok(self)
     }
 
-    pub fn column_str<'a, N>(&mut self, name: N, value: &str) -> Result<()>
+    pub fn column_str<'a, N>(&mut self, name: N, value: &str) -> Result<&mut Self>
         where
             N: TryInto<Name<'a>>,
             Error: From<N::Error>
     {
         self.write_column_key(name)?;
         write_escaped_quoted(&mut self.output, value);
-        Ok(())
+        Ok(self)
     }
 
     pub fn pending_size(&self) -> usize {
@@ -590,14 +855,9 @@ impl LineSender {
         self.output.as_str()
     }
 
-    fn update_last_line_start(&mut self) {
-        self.last_line_start = self.pending_size();
-    }
-
     pub fn at(&mut self, epoch_nanos: i64) -> Result<()> {
         self.check_state(Op::At)?;
         write!(&mut self.output, " {}\n", epoch_nanos).unwrap();
-        self.update_last_line_start();
         self.state = State::MayFlushOrTable;
         Ok(())
     }
@@ -605,7 +865,6 @@ impl LineSender {
     pub fn at_now(&mut self) -> Result<()> {
         self.check_state(Op::At)?;
         self.output.push('\n');
-        self.update_last_line_start();
         self.state = State::MayFlushOrTable;
         Ok(())
     }
@@ -613,7 +872,7 @@ impl LineSender {
     pub fn flush(&mut self) -> Result<()> {
         self.check_state(Op::Flush)?;
         let buf = self.output.as_bytes();
-        if let Err(io_err) = self.sock.write_all(buf) {
+        if let Err(io_err) = self.conn.write_all(buf) {
             self.state = State::Moribund;
             return Err(map_io_to_socket_err(
                 "Could not flush buffered messages: ",
@@ -634,3 +893,6 @@ mod gai;
 #[allow(non_camel_case_types)]
 #[cfg(feature = "ffi")]
 pub mod ffi;
+
+#[cfg(test)]
+mod tests;

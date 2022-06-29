@@ -38,6 +38,7 @@ import uuid
 from fixture import (
     Project,
     QuestDbFixture,
+    TlsProxyFixture,
     install_questdb,
     list_questdb_releases,
     retry)
@@ -46,11 +47,13 @@ import urllib.parse
 import urllib.error
 import json
 import subprocess
+import shutil
 from pprint import pformat
 from collections import namedtuple
 
 
 QDB_FIXTURE: QuestDbFixture = None
+TLS_PROXY_FIXTURE: TlsProxyFixture = None
 
 
 class QueryError(Exception):
@@ -253,10 +256,10 @@ class TestLineSender(unittest.TestCase):
         scrubbed_dataset = [row[:-1] for row in resp['dataset']]
         self.assertEqual(scrubbed_dataset, exp_dataset)
 
-    def test_single_symbol(self):
+    def _test_single_symbol_impl(self, sender):
         table_name = uuid.uuid4().hex
         pending = None
-        with self._mk_linesender() as sender:
+        with sender:
             (sender
                 .table(table_name)
                 .symbol('a', 'A')
@@ -272,6 +275,9 @@ class TestLineSender(unittest.TestCase):
         exp_dataset = [['A']]  # Comparison excludes timestamp column.
         scrubbed_dataset = [row[:-1] for row in resp['dataset']]
         self.assertEqual(scrubbed_dataset, exp_dataset)
+
+    def test_single_symbol(self):
+        self._test_single_symbol_impl(self._mk_linesender())
 
     def test_two_columns(self):
         table_name = uuid.uuid4().hex
@@ -451,12 +457,20 @@ class TestLineSender(unittest.TestCase):
         scrubbed_dataset = [row[:-1] for row in resp['dataset']]
         self.assertEqual(scrubbed_dataset, exp_dataset)
 
-    def _test_example(self, bin_name, table_name):
+    def _test_example(self, bin_name, table_name, tls=False):
+        if tls and not QDB_FIXTURE.auth:
+            self.skipTest('No auth')
         # Call the example program.
         proj = Project()
         ext = '.exe' if sys.platform == 'win32' else ''
         bin_path = next(proj.build_dir.glob(f'**/{bin_name}{ext}'))
-        args = [str(bin_path), "127.0.0.1", str(QDB_FIXTURE.line_tcp_port)]
+        port = QDB_FIXTURE.line_tcp_port
+        args = [str(bin_path)]
+        if tls:
+            ca_path = proj.tls_certs_dir / 'server_rootCA.pem'
+            args.append(str(ca_path))
+            port = TLS_PROXY_FIXTURE.listen_port
+        args.extend(['localhost', str(port)])
         subprocess.check_call(args, cwd=bin_path.parent)
 
         # Check inserted data.
@@ -492,6 +506,18 @@ class TestLineSender(unittest.TestCase):
         self._test_example(
             f'line_sender_cpp_example{suffix}',
             f'cpp_cars{suffix}')
+
+    def test_c_tls_example(self):
+        self._test_example(
+            'line_sender_c_example_tls',
+            'c_cars_tls',
+            tls=True)
+
+    def test_cpp_tls_example(self):
+        self._test_example(
+            'line_sender_cpp_example_tls',
+            'cpp_cars_tls',
+            tls=True)
 
     def test_opposite_auth(self):
         """
@@ -548,6 +574,15 @@ class TestLineSender(unittest.TestCase):
                 r'.*Bad private key.*'):
             sender.connect()
 
+    def test_tls_insecure_skip_verify(self):
+        sender = qls.LineSender(
+            QDB_FIXTURE.host,
+            TLS_PROXY_FIXTURE.listen_port,
+            auth=AUTH if QDB_FIXTURE.auth else None,
+            tls=qls.Tls.InsecureSkipVerify)
+        self._test_single_symbol_impl(sender)
+
+
 def parse_args():
     parser = argparse.ArgumentParser('Run system tests.')
     sub_p = parser.add_subparsers(dest='command')
@@ -571,7 +606,7 @@ def parse_args():
         type=str,
         metavar='HOST:ILP_PORT:HTTP_PORT',
         help=('Test against existing running instance. ' +
-              'e.g. `127.0.0.1:9009:9000`'))
+              'e.g. `localhost:9009:9000`'))
     list_p = sub_p.add_parser('list', help='List latest -n releases.')
     list_p.set_defaults(command='list')
     list_p.add_argument('-n', type=int, default=30, help='number of releases')
@@ -600,6 +635,7 @@ def run_with_existing(args):
 
 def run_with_fixtures(args):
     global QDB_FIXTURE
+    global TLS_PROXY_FIXTURE
     versions = None
     versions_args = getattr(args, 'versions', None)
     if versions_args:
@@ -621,12 +657,18 @@ def run_with_fixtures(args):
         questdb_dir = install_questdb(version, download_url)
         for auth in (False, True):
             QDB_FIXTURE = QuestDbFixture(questdb_dir, auth=auth)
+            TLS_PROXY_FIXTURE = None
             try:
                 QDB_FIXTURE.start()
+                TLS_PROXY_FIXTURE = TlsProxyFixture(QDB_FIXTURE.line_tcp_port)
+                TLS_PROXY_FIXTURE.start()
+
                 test_prog = unittest.TestProgram(exit=False)
                 if not test_prog.result.wasSuccessful():
                     sys.exit(1)
             finally:
+                if TLS_PROXY_FIXTURE:
+                    TLS_PROXY_FIXTURE.stop()
                 QDB_FIXTURE.stop()
 
 
@@ -648,7 +690,7 @@ def main():
     if args.command == 'list':
         list(args)
     else:
-        # Repackage args for unittests own arg parser.
+        # Repackage args for unittest's own arg parser.
         sys.argv[:] = sys.argv[:1] + extra_args
         show_help = getattr(args, 'unittest_help', False)
         run(args, show_help)

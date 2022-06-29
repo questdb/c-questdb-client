@@ -13,6 +13,9 @@ socket2 = "0.4.4"
 dns-lookup = "1.0.8"
 base64ct = { version = "1.5.0", features = ["alloc"] }
 ring = "0.16.20"
+rustls = "0.20.6"
+rustls-pemfile = "1.0.0"
+webpki-roots = "0.22.3"
 
 [target.'cfg(windows)'.dependencies]
 winapi = "0.3.9"
@@ -20,9 +23,15 @@ winapi = "0.3.9"
 [build-dependencies]
 cbindgen = { version = "0.24.2", optional = true, default-features = false }
 
+[dev-dependencies]
+mio = { version = "0.8.4", features = ["os-poll", "net"] }
+
 [features]
+# Allow skipping verification of insecure certificates.
+insecure_skip_verify = ["rustls/dangerous_configuration"]
+
 # Build C bindings, but don't generate the header file.
-ffi = []
+ffi = ["insecure_skip_verify"]
 
 # Auto-generate the header. This is for dev-debugging-diffing only.
 # A hand-crafted header is easier on the eyes.

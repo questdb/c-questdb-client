@@ -52,7 +52,7 @@ typedef enum line_sender_error_code
     /** Called methods in the wrong order. E.g. `symbol` after `column`. */
     line_sender_error_invalid_api_call,
 
-    /** A network error connecting of flushing data out. */
+    /** A network error connecting or flushing data out. */
     line_sender_error_socket_error,
 
     /** The string or symbol field is not encoded in valid UTF-8. */
@@ -62,7 +62,10 @@ typedef enum line_sender_error_code
     line_sender_error_invalid_name,
 
     /** Error during the authentication process. */
-    line_sender_error_auth_error
+    line_sender_error_auth_error,
+
+    /** Error during TLS handshake. */
+    line_sender_error_tls_error,
 } line_sender_error_code;
 
 /** Error code categorizing the error. */
@@ -145,8 +148,25 @@ bool line_sender_name_init(
  */
 typedef struct line_sender line_sender;
 
+/** Whole connection encryption options. */
+typedef enum line_sender_tls
+{
+    /** No TLS connection encryption. */
+    line_sender_tls_disabled,
+
+    /** Enable TLS. See `line_sender_sec_opts::tls_ca` for behaviour. */
+    line_sender_tls_enabled,
+
+    /**
+     * Enable TLS whilst dangerously accepting any certificate as valid.
+     * This should only be used for debugging.
+     * Consider using `enabled` and specifying a self-signed `tls_ca` instead.
+     */
+    line_sender_tls_insecure_skip_verify
+} line_sender_tls;
+
 /**
- * Authentication options.
+ * Connection security options.
  */
 typedef struct line_sender_sec_opts
 {
@@ -161,6 +181,18 @@ typedef struct line_sender_sec_opts
 
     /** Authentication public key Y coordinate. AKA "y". */
     const char* auth_pub_key_y;
+
+    /** Settings for secure connection over TLS. */
+    line_sender_tls tls;
+
+    /**
+     * Set a custom CA file path to use for verification.
+     * If NULL, defaults to `webpki-roots` certificates which accepts
+     * most well-know certificate authorities.
+     *
+     * This argument is generally only specified during dev-testing.
+     */
+    const char* tls_ca;
 } line_sender_sec_opts;
 
 /**

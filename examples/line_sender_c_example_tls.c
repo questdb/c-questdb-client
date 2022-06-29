@@ -3,7 +3,7 @@
 #include <stdbool.h>
 #include <string.h>
 
-static bool example(const char* host, const char* port)
+static bool example(const char* ca_path, const char* host, const char* port)
 {
     line_sender_error* err = NULL;
     line_sender* sender = NULL;
@@ -16,6 +16,8 @@ static bool example(const char* host, const char* port)
     sec_opts.auth_priv_key = "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48";
     sec_opts.auth_pub_key_x = "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU";
     sec_opts.auth_pub_key_y = "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac";
+    sec_opts.tls = line_sender_tls_enabled;
+    sec_opts.tls_ca = ca_path;
 
     sender = line_sender_connect_secure("0.0.0.0", host, port, &sec_opts, &err);
     if (!sender)
@@ -25,7 +27,7 @@ static bool example(const char* host, const char* port)
     // If we're inserting multiple rows, this allows us to avoid
     // re-validating the same strings over and over again.
     line_sender_name table_name;
-    if (!line_sender_name_init(&table_name, 11, "c_cars_auth", &err))
+    if (!line_sender_name_init(&table_name, 10, "c_cars_tls", &err))
         goto on_error;
 
     line_sender_name id_name;
@@ -133,12 +135,19 @@ int main(int argc, const char* argv[])
     if (displayed_help(argc, argv))
         return 0;
 
-    const char* host = "localhost";
-    if (argc >= 2)
-        host = argv[1];
-    const char* port = "9009";
-    if (argc >= 3)
-        port = argv[2];
+    if (argc < 2)
+    {
+        fprintf(stderr, "CA_PATH required.\n");
+        return 1;
+    }
+    const char* ca_path = argv[1];
 
-    return !example(host, port);
+    const char* host = "localhost";
+    if (argc >= 3)
+        host = argv[2];
+    const char* port = "9009";
+    if (argc >= 4)
+        port = argv[3];
+
+    return !example(ca_path, host, port);
 }

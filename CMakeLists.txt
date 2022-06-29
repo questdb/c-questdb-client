@@ -90,6 +90,18 @@ compile_example(
 compile_example(
     line_sender_cpp_example_auth
     examples/line_sender_cpp_example_auth.cpp)
+compile_example(
+    line_sender_c_example_tls
+    examples/line_sender_c_example_tls.c)
+compile_example(
+    line_sender_cpp_example_tls
+    examples/line_sender_cpp_example_tls.cpp)
+
+# Include Rust tests as part of the tests run
+add_test(
+    NAME rust_tests
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    COMMAND cargo test --features insecure_skip_verify -- --nocapture)
 
 # Unit test binaries.
 function(compile_test TARGET_NAME)

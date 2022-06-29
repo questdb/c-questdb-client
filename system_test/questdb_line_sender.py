@@ -29,6 +29,7 @@ sys.dont_write_bytecode = True
 import pathlib
 import ctypes
 import os
+from enum import Enum
 
 from ctypes import (
     c_bool,
@@ -65,7 +66,9 @@ class c_line_sender_sec_opts(ctypes.Structure):
     _fields_ = [("auth_key_id", c_char_p),
                 ("auth_priv_key", c_char_p),
                 ("auth_pub_key_x", c_char_p),
-                ("auth_pub_key_y", c_char_p)]
+                ("auth_pub_key_y", c_char_p),
+                ("tls", c_int),
+                ("tls_ca", c_char_p)]
 c_line_sender_sec_opts_p = ctypes.POINTER(c_line_sender_sec_opts)
 
 
@@ -284,6 +287,12 @@ def _fully_qual_name(obj):
         return module + '.' + qn
 
 
+class Tls(Enum):
+    Disabled = 0
+    Enabled = 1
+    InsecureSkipVerify = 2
+
+
 # This code is *just good enough* for testing purposes and is not intended to
 # be used as Python bindings. If you are looking for Python bindings and come
 # across this code, contact us on https://slack.questdb.io/ where we may offer
@@ -295,21 +304,27 @@ class LineSender:
             port,
             *,
             interface='0.0.0.0',
-            auth=None):
+            auth=None,
+            tls=Tls.Disabled,
+            tls_ca=None):
         self._impl = None
-        if auth:
+        if auth or (tls != tls.Disabled):
             # We need to keep bytes objects around or they get GCd before the
             # native C call.
-            self._c_auth = (
-                auth[0].encode('ascii'),
-                auth[1].encode('ascii'),
-                auth[2].encode('ascii'),
-                auth[3].encode('ascii'))
+            if auth:
+                self._c_auth = (
+                    auth[0].encode('ascii'),
+                    auth[1].encode('ascii'),
+                    auth[2].encode('ascii'),
+                    auth[3].encode('ascii'))
+            self._tls_ca = tls_ca.encode('utf-8') if tls_ca else None
             self._sec_opts = c_line_sender_sec_opts(
-                self._c_auth[0],
-                self._c_auth[1],
-                self._c_auth[2],
-                self._c_auth[3])
+                self._c_auth[0] if auth else None,
+                self._c_auth[1] if auth else None,
+                self._c_auth[2] if auth else None,
+                self._c_auth[3] if auth else None,
+                tls.value,
+                self._tls_ca)
         else:
             self._sec_opts = None
         self._connect_secure_args = (

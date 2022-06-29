@@ -99,6 +99,7 @@ class Project:
             self.root_dir / 'build'))
         if not self.build_dir.exists():
             raise RuntimeError('Build before running tests.')
+        self.tls_certs_dir = self.root_dir / 'tls_certs'
         self.questdb_dir = self.build_dir / 'questdb'
         self.questdb_dir.mkdir(exist_ok=True)
         self.questdb_downloads_dir = self.questdb_dir / 'downloads'
@@ -190,7 +191,7 @@ class QuestDbFixture:
         self._conf_path = self._conf_dir / 'server.conf'
         self._log = None
         self._proc = None
-        self.host = '127.0.0.1'
+        self.host = 'localhost'
         self.http_server_port = None
         self.line_tcp_port = None
         self.pg_port = None
@@ -253,7 +254,7 @@ class QuestDbFixture:
                 if self._proc.poll() is not None:
                     raise RuntimeError('QuestDB died during startup.')
                 req = urllib.request.Request(
-                    f'http://127.0.0.1:{self.http_server_port}',
+                    f'http://localhost:{self.http_server_port}',
                     method='HEAD')
                 try:
                     resp = urllib.request.urlopen(req, timeout=1)
@@ -268,7 +269,7 @@ class QuestDbFixture:
             sys.stderr.write('Waiting until HTTP service is up.\n')
             retry(
                 check_http_up,
-                timeout_sec=45,
+                timeout_sec=60,
                 msg='Timed out waiting for HTTP service to come up.')
         except:
             sys.stderr.write(f'QuestDB log at `{self._log_path}`:\n')
@@ -292,3 +293,64 @@ class QuestDbFixture:
 
     def __exit__(self, _ty, _value, _tb):
         self.stop()
+
+
+class TlsProxyFixture:
+    def __init__(self, qdb_ilp_port):
+        self.qdb_ilp_port = qdb_ilp_port
+        self.listen_port = None
+        proj = Project()
+        self._code_dir = proj.root_dir / 'system_test' / 'tls_proxy'
+        self._target_dir = proj.build_dir / 'tls_proxy'
+        self._log_path = self._target_dir / 'log.txt'
+        self._log_file = None
+        self._proc = None
+
+    def start(self):
+        self._target_dir.mkdir(exist_ok=True)
+        env = dict(os.environ)
+        env['CARGO_TARGET_DIR'] = str(self._target_dir)
+        self._log_file = open(self._log_path, 'wb')
+        self._proc = subprocess.Popen(
+            ['cargo', 'run', str(self.qdb_ilp_port)],
+            cwd=self._code_dir,
+            env=env,
+            stdout=self._log_file,
+            stderr=subprocess.STDOUT)
+
+        def check_started():
+            with open(self._log_path, 'r', encoding='utf-8') as log_reader:
+                lines = log_reader.readlines()
+                for line in lines:
+                    listening_msg = 'TLS Proxy is listening on localhost:'
+                    if line.startswith(listening_msg) and line.endswith('.\n'):
+                        port_str = line[len(listening_msg):-2]
+                        port = int(port_str)
+                        return port
+            return None
+
+        self.listen_port = retry(
+            check_started,
+            timeout_sec=180,  # Longer to include time to compile.
+            msg='Timed out waiting for `tls_proxy` to start.',)
+
+        def connect_to_listening_port():
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                sock.connect(('localhost', self.listen_port))
+            except ConnectionRefusedError:
+                return False
+            finally:
+                sock.close()
+            return True
+
+        retry(
+            connect_to_listening_port,
+            msg='Timed out connecting to `tls_proxy`')
+        atexit.register(self.stop)
+
+    def stop(self):
+        if self._proc:
+            self._proc.terminate()
+            self._proc.wait()
+            self._proc = None

@@ -25,14 +25,23 @@
 use std::ascii;
 use std::boxed::Box;
 use std::convert::{From, Into};
+use std::path::PathBuf;
 use std::slice;
 use std::str;
 use std::ffi::CStr;
 use libc::c_char;
 
+use super::{
+    Error,
+    ErrorCode,
+    Name,
+    LineSender,
+    LineSenderBuilder,
+    Tls,
+    CertificateAuthority};
 
 /// An error that occurred when using the line sender.
-pub struct line_sender_error(super::Error);
+pub struct line_sender_error(Error);
 
 /// Category of error.
 #[repr(C)]
@@ -44,7 +53,7 @@ pub enum line_sender_error_code {
     /// Called methods in the wrong order. E.g. `symbol` after `column`.
     line_sender_error_invalid_api_call,
 
-    /// A network error connecting of flushing data out.
+    /// A network error connecting or flushing data out.
     line_sender_error_socket_error,
 
     /// The string or symbol field is not encoded in valid UTF-8.
@@ -53,25 +62,30 @@ pub enum line_sender_error_code {
     /// The table name, symbol name or column name contains bad characters.
     line_sender_error_invalid_name,
 
-    /** Error during the authentication process. */
-    line_sender_error_auth_error
+    /// Error during the authentication process.
+    line_sender_error_auth_error,
+
+    /// Error during TLS handshake.
+    line_sender_error_tls_error,
 }
 
-impl From<super::ErrorCode> for line_sender_error_code {
-    fn from(code: super::ErrorCode) -> Self {
+impl From<ErrorCode> for line_sender_error_code {
+    fn from(code: ErrorCode) -> Self {
         match code {
-            super::ErrorCode::CouldNotResolveAddr =>
+            ErrorCode::CouldNotResolveAddr =>
                 line_sender_error_code::line_sender_error_could_not_resolve_addr,
-            super::ErrorCode::InvalidApiCall =>
+            ErrorCode::InvalidApiCall =>
                 line_sender_error_code::line_sender_error_invalid_api_call,
-            super::ErrorCode::SocketError =>
+            ErrorCode::SocketError =>
                 line_sender_error_code::line_sender_error_socket_error,
-            super::ErrorCode::InvalidUtf8 =>
+            ErrorCode::InvalidUtf8 =>
                 line_sender_error_code::line_sender_error_invalid_utf8,
-            super::ErrorCode::InvalidName =>
+            ErrorCode::InvalidName =>
                 line_sender_error_code::line_sender_error_invalid_name,
-            super::ErrorCode::AuthError =>
-                line_sender_error_code::line_sender_error_auth_error
+            ErrorCode::AuthError =>
+                line_sender_error_code::line_sender_error_auth_error,
+            ErrorCode::TlsError =>
+                line_sender_error_code::line_sender_error_tls_error,
         }
     }
 }
@@ -144,8 +158,8 @@ fn describe_buf(buf: &[u8]) -> String {
     output
 }
 
-fn set_err_out(err_out: *mut *mut line_sender_error, code: super::ErrorCode, msg: String) {
-    let err = line_sender_error(super::Error{
+fn set_err_out(err_out: *mut *mut line_sender_error, code: ErrorCode, msg: String) {
+    let err = line_sender_error(Error{
         code: code,
         msg: msg});
     let err_ptr = Box::into_raw(Box::new(err));
@@ -176,7 +190,7 @@ fn unwrap_utf8(buf: &[u8], err_out: *mut *mut line_sender_error) -> Option<&str>
                         buf_descr,
                         u8err.valid_up_to())
                 };
-            set_err_out(err_out, super::ErrorCode::InvalidUtf8, msg);
+            set_err_out(err_out, ErrorCode::InvalidUtf8, msg);
             None
         }
     }
@@ -221,10 +235,10 @@ pub struct line_sender_name
 }
 
 impl line_sender_name {
-    fn as_name<'a>(&self) -> super::Name<'a> {
+    fn as_name<'a>(&self) -> Name<'a> {
         let str_name = unsafe { std::str::from_utf8_unchecked(
             slice::from_raw_parts(self.buf as *const u8, self.len)) };
-        super::Name{ name: str_name }
+        Name{ name: str_name }
     }
 }
 
@@ -238,22 +252,49 @@ macro_rules! bubble_err_to_c {
     };
 }
 
+/// Whole connection encryption options.
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub enum line_sender_tls {
+    /// No TLS connection encryption.
+    line_sender_tls_disabled,
+
+    /// Enable TLS. See `line_sender_sec_opts::tls_ca` for behaviour.
+    line_sender_tls_enabled,
+
+    /// Enable TLS whilst dangerously accepting any certificate as valid.
+    /// This should only be used for debugging.
+    /// Consider using `enabled` and specifying a self-signed `tls_ca` instead.
+    line_sender_tls_insecure_skip_verify
+}
+
 /// Authentication options.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct line_sender_sec_opts
 {
     /// Authentication key_id. AKA "kid".
-    auth_key_id : *const libc::c_char,
+    pub auth_key_id : *const libc::c_char,
 
     /// Authentication private key. AKA "d".
-    auth_priv_key : *const libc::c_char,
+    pub auth_priv_key : *const libc::c_char,
 
     /// Authentication public key X coordinate. AKA "x".
-    auth_pub_key_x : * const libc::c_char,
+    pub auth_pub_key_x : *const libc::c_char,
 
     /// Authentication public key Y coordinate. AKA "y".
-    auth_pub_key_y : * const libc::c_char
+    pub auth_pub_key_y : *const libc::c_char,
+
+    /// Settings for secure connection over TLS.
+    pub tls: line_sender_tls,
+
+    /// Set a custom CA file path to use for verification.
+    /// If NULL, defaults to `webpki-roots` certificates which accepts
+    /// most well-know certificate authorities.
+    ///
+    /// This argument is generally only specified during dev-testing.
+    pub tls_ca: *const libc::c_char
+    
 }
 
 
@@ -284,7 +325,7 @@ pub extern "C" fn line_sender_name_init(
     let str_name = unsafe { std::str::from_utf8_unchecked(
         slice::from_raw_parts(buf as *const u8, len)) };
 
-    bubble_err_to_c!(err_out, super::Name::new(str_name));
+    bubble_err_to_c!(err_out, Name::new(str_name));
 
     unsafe {
         (*name).len = len;
@@ -296,7 +337,7 @@ pub extern "C" fn line_sender_name_init(
 /// Insert data into QuestDB via the InfluxDB Line Protocol.
 ///
 /// Batch up rows, then call `line_sender_flush` to send.
-pub struct line_sender(super::LineSender);
+pub struct line_sender(LineSender);
 
 /// Synchronously connect to the QuestDB database.
 /// @param[in] net_interface Network interface to bind to.
@@ -320,15 +361,22 @@ pub extern "C" fn line_sender_connect(
         err_out)
 }
 
-fn set_sec_opts(
-    builder: &mut super::LineSenderBuilder,
-    sec_opts: *const line_sender_sec_opts,
-    err_out: *mut *mut line_sender_error) -> bool
-{
-    if sec_opts.is_null() {
-        return true;
+macro_rules! c_str_to_ref {
+    ($c_str:expr, $err_out:expr) => {
+        if let Some(str_ref) = unwrap_utf8(unsafe {CStr::from_ptr($c_str)}.to_bytes(), $err_out) {
+            str_ref
+        }
+        else {
+            return Err(());
+        }
     }
+}
 
+fn set_auth_sec_opts(
+    builder: LineSenderBuilder,
+    sec_opts: *const line_sender_sec_opts,
+    err_out: *mut *mut line_sender_error) -> Result<LineSenderBuilder, ()>
+{
     let auth_key_id = unsafe { (*sec_opts).auth_key_id };
     let auth_priv_key = unsafe { (*sec_opts).auth_priv_key };
     let auth_pub_key_x = unsafe { (*sec_opts).auth_pub_key_x };
@@ -336,51 +384,99 @@ fn set_sec_opts(
 
     if auth_key_id.is_null() && auth_priv_key.is_null() &&
        auth_pub_key_x.is_null() && auth_pub_key_y.is_null() {
-        return true;
+        return Ok(builder);    // No auth fields to set.
     }
     else if auth_key_id.is_null() || auth_priv_key.is_null() ||
             auth_pub_key_x.is_null() || auth_pub_key_y.is_null() {
         set_err_out(
             err_out,
-            super::ErrorCode::InvalidApiCall,
+            ErrorCode::InvalidApiCall,
             "Must specify all or no auth parameters.".to_owned());
-        return false;
+        return Err(());
     }
 
-    let auth_key_id =
-        if let Some(str_ref) = unwrap_utf8(unsafe {CStr::from_ptr(auth_key_id)}.to_bytes(), err_out) {
-            str_ref
-        }
-        else {
-            return false;
+    let auth_key_id = c_str_to_ref!(auth_key_id, err_out);
+    let auth_priv_key = c_str_to_ref!(auth_priv_key, err_out);
+    let auth_pub_key_x = c_str_to_ref!(auth_pub_key_x, err_out);
+    let auth_pub_key_y = c_str_to_ref!(auth_pub_key_y, err_out);
+    Ok(builder.auth(auth_key_id, auth_priv_key, auth_pub_key_x, auth_pub_key_y))
+}
+
+const DISABLED: libc::c_int =
+    line_sender_tls::line_sender_tls_disabled as libc::c_int;
+const ENABLED: libc::c_int =
+    line_sender_tls::line_sender_tls_enabled as libc::c_int;
+const INSECURE_SKIP_VERIFY: libc::c_int =
+    line_sender_tls::line_sender_tls_insecure_skip_verify as libc::c_int;
+
+fn set_tls_sec_opts(
+    builder: LineSenderBuilder,
+    sec_opts: *const line_sender_sec_opts,
+    err_out: *mut *mut line_sender_error) -> Result<LineSenderBuilder, ()>
+{
+    let tls = unsafe { (*sec_opts).tls as libc::c_int };
+    let tls_ca = unsafe { (*sec_opts).tls_ca };
+
+    let tls = match tls {
+            DISABLED => {
+                    if !tls_ca.is_null() {
+                        set_err_out(
+                            err_out,
+                            ErrorCode::InvalidApiCall,
+                            concat!(
+                                "Invalid configuration: `tls_ca` was specified",
+                                " despite setting TLS as disabled.")
+                                .to_owned());
+                        return Err(());
+                    }
+                    Tls::Disabled
+                },
+            ENABLED =>
+                Tls::Enabled(
+                    if tls_ca.is_null() {
+                        CertificateAuthority::WebpkiRoots
+                    }
+                    else {
+                        let tls_ca = c_str_to_ref!(tls_ca, err_out);
+                        CertificateAuthority::File(PathBuf::from(tls_ca))
+                    }),
+            INSECURE_SKIP_VERIFY => {
+                    if !tls_ca.is_null() {
+                        set_err_out(
+                            err_out,
+                            ErrorCode::InvalidApiCall,
+                            concat!(
+                                "Invalid configuration: `tls_ca` was specified",
+                                " but has no meaning when TLS is set to ",
+                                "`insecure_skip_verify`.").to_owned());
+                        return Err(());
+                    }
+                    Tls::InsecureSkipVerify
+                },
+            other => {
+                set_err_out(
+                    err_out,
+                    ErrorCode::InvalidApiCall,
+                    format!("Invalid value {} set as tls field.", other));
+                return Err(());
+            }
         };
 
-    let auth_priv_key =
-        if let Some(str_ref) = unwrap_utf8(unsafe {CStr::from_ptr(auth_priv_key)}.to_bytes(), err_out) {
-            str_ref
-        }
-        else {
-            return false;
-        };
+    Ok(builder.tls(tls))
+}
 
-    let auth_pub_key_x =
-        if let Some(str_ref) = unwrap_utf8(unsafe {CStr::from_ptr(auth_pub_key_x)}.to_bytes(), err_out) {
-            str_ref
-        }
-        else {
-            return false;
-        };
+fn set_sec_opts(
+    mut builder: LineSenderBuilder,
+    sec_opts: *const line_sender_sec_opts,
+    err_out: *mut *mut line_sender_error) -> Result<LineSenderBuilder, ()>
+{
+    if sec_opts.is_null() {
+        return Ok(builder);
+    }
 
-    let auth_pub_key_y =
-        if let Some(str_ref) = unwrap_utf8(unsafe {CStr::from_ptr(auth_pub_key_y)}.to_bytes(), err_out) {
-            str_ref
-        }
-        else {
-            return false;
-        };
-
-    builder.auth(auth_key_id, auth_priv_key, auth_pub_key_x, auth_pub_key_y);
-    true
+    builder = set_auth_sec_opts(builder, sec_opts, err_out)?;
+    builder = set_tls_sec_opts(builder, sec_opts, err_out)?;
+    Ok(builder)
 }
 
 /// Synchronously connect securely to the QuestDB database.
@@ -426,13 +522,14 @@ pub extern "C" fn line_sender_connect_secure(
             return std::ptr::null_mut();
         };
 
-    let mut builder = super::LineSenderBuilder::new(host, port);
+    let mut builder = LineSenderBuilder::new(host, port);
     if let Some(net_interface) = net_interface {
-        builder.net_interface(net_interface);
+        builder = builder.net_interface(net_interface);
     }
 
-    if !set_sec_opts(&mut builder, sec_opts, err_out) {
-        return std::ptr::null_mut();
+    match set_sec_opts(builder, sec_opts, err_out) {
+        Ok(b) => { builder = b; },
+        Err(_) => { return std::ptr::null_mut(); }
     }
 
     let sender = match builder.connect() {
@@ -447,11 +544,11 @@ pub extern "C" fn line_sender_connect_secure(
     Box::into_raw(Box::new(line_sender(sender)))
 }
 
-fn unwrap_sender<'a>(sender: *const line_sender) -> &'a super::LineSender {
+fn unwrap_sender<'a>(sender: *const line_sender) -> &'a LineSender {
     &(unsafe { &*sender }).0
 }
 
-fn unwrap_sender_mut<'a>(sender: *mut line_sender) -> &'a mut super::LineSender {
+fn unwrap_sender_mut<'a>(sender: *mut line_sender) -> &'a mut LineSender {
     &mut (unsafe { &mut *sender }).0
 }
 
@@ -675,13 +772,4 @@ pub extern "C" fn line_sender_flush(
         err_out,
         sender.flush());
     true
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn it_works() {
-        let result = 2 + 2;
-        assert_eq!(result, 4);
-    }
 }
