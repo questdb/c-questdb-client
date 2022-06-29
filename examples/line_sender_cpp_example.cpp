@@ -10,7 +10,7 @@ static bool example(std::string_view host, std::string_view port)
     {
         questdb::ilp::line_sender sender{host, port};
 
-        // We prepare all our table names and colum names in advance.
+        // We prepare all our table names and column names in advance.
         // If we're inserting multiple rows, this allows us to avoid
         // re-validating the same strings over and over again.
         auto table_name = "cpp_cars"_name;
