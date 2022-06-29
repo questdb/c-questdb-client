@@ -12,7 +12,7 @@ static bool example(const char* host, const char* port)
     if (!sender)
         goto on_error;
 
-    // We prepare all our table names and colum names in advance.
+    // We prepare all our table names and column names in advance.
     // If we're inserting multiple rows, this allows us to avoid
     // re-validating the same strings over and over again.
     line_sender_name table_name;

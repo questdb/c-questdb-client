@@ -468,7 +468,7 @@ fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
         .with_no_client_auth();
 
     // TLS log file for debugging.
-    // Use use, set the SSLKEYLOGFILE env variable to a writable location.
+    // Set the SSLKEYLOGFILE env variable to a writable location.
     config.key_log = Arc::new(rustls::KeyLogFile::new());
 
     #[cfg(feature = "insecure_skip_verify")]
