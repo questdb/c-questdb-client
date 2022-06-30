@@ -223,9 +223,7 @@ impl <'a> ColumnName<'a> {
         if name.is_empty() {
             return Err(Error{
                 code: ErrorCode::InvalidName,
-                msg: concat!(
-                    "Symbol and column names ",
-                    "must have a non-zero length.").to_owned()});
+                msg: "Column names must have a non-zero length.".to_owned()});
         }
 
         for (index, c) in name.chars().enumerate() {
@@ -240,7 +238,7 @@ impl <'a> ColumnName<'a> {
                         msg: format!(
                             concat!(
                                 "Bad string {:?}: ",
-                                "Symbol and column names can't contain ",
+                                "Column names can't contain ",
                                 "a {:?} character, which was found at ",
                                 "byte position {}."),
                             name,
@@ -255,7 +253,7 @@ impl <'a> ColumnName<'a> {
                         msg: format!(
                             concat!(
                                 "Bad string {:?}: ",
-                                "table, symbol and column names can't contain ",
+                                "Column names can't contain ",
                                 "a UTF-8 BOM character, which was found at ",
                                 "byte position {}."),
                             name,

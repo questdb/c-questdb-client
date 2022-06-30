@@ -285,7 +285,7 @@ TEST_CASE("Validation of bad chars in key names.")
         std::string_view column_name{"a\0b", 3};
         CHECK_THROWS_WITH_AS(
             questdb::ilp::column_name_view{column_name},
-            "Bad string \"a\\0b\": Symbol and column names "
+            "Bad string \"a\\0b\": Column names "
             "can't contain a '\\0' character, "
             "which was found at byte position 1.",
             questdb::ilp::line_sender_error);

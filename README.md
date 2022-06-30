@@ -188,10 +188,9 @@ When inserting data through the API, you must follow a set of considerations.
 
 * Strings and symbols must be passed in as valid UTF-8 which
   need not be nul-terminated.
-* Table names, symbol and column names can't contain the characters `?`, `.`,
-  `,`, `'`, `"`, `\`, `/`, `:`, `(`, `)`, `+`, `-`, `*`, `%`, `~`,
-  `' '` (space), `\0` (nul terminator),
-  [ZERO WIDTH NO-BREAK SPACE](https://unicode-explorer.com/c/FEFF).
+* Table names and column names must conform to valid names as accepted by the
+  database (see `isValidTableName` and `isValidColumnName` in the QuestDB java
+  [codebase](https://github.com/questdb/questdb) for details).
 * Each row should contain, *in order*:
   * table name
   * at least one of:
