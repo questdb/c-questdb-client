@@ -387,7 +387,8 @@ pub struct LineSender {
     descr: String,
     conn: Connection,
     state: State,
-    output: String
+    output: String,
+    max_name_len: usize,
 }
 
 impl std::fmt::Debug for LineSender {
@@ -448,17 +449,6 @@ impl From<u16> for Service {
     fn from(p: u16) -> Self {
         Service(p.to_string())
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct LineSenderBuilder {
-    capacity: usize,
-    read_timeout: Duration,
-    host: String,
-    port: String,
-    net_interface: Option<String>,
-    auth: Option<AuthParams>,
-    tls: Tls,
 }
 
 #[cfg(feature = "insecure_skip_verify")]
@@ -554,6 +544,18 @@ fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
     Ok(Some(Arc::new(config)))
 }
 
+#[derive(Debug, Clone)]
+pub struct LineSenderBuilder {
+    capacity: usize,
+    read_timeout: Duration,
+    host: String,
+    port: String,
+    net_interface: Option<String>,
+    auth: Option<AuthParams>,
+    tls: Tls,
+    max_name_len: usize,
+}
+
 impl LineSenderBuilder {
     /// QuestDB server and port.
     pub fn new<H: Into<String>, P: Into<Service>>(host: H, port: P) -> Self {
@@ -565,7 +567,8 @@ impl LineSenderBuilder {
             port: service.0,
             net_interface: None,
             auth: None,
-            tls: Tls::Disabled
+            tls: Tls::Disabled,
+            max_name_len: 127,
         }
     }
 
@@ -614,6 +617,15 @@ impl LineSenderBuilder {
     /// The default is 15 seconds.
     pub fn read_timeout(mut self, value: Duration) -> Self {
         self.read_timeout = value;
+        self
+    }
+
+    /// Set the maximum length for table and column names.
+    /// This should match the `cairo.max.file.name.length` setting of the
+    /// QuestDB instance you're connecting to.
+    /// The default value is 127, which is the same as the QuestDB default.
+    pub fn max_name_len(mut self, value: usize) -> Self {
+        self.max_name_len = value;
         self
     }
 
@@ -705,7 +717,8 @@ impl LineSenderBuilder {
             descr: descr,
             conn: conn,
             state: State::Connected,
-            output: String::with_capacity(self.capacity)
+            output: String::with_capacity(self.capacity),
+            max_name_len: self.max_name_len,
         };
         if let Some(auth) = self.auth.as_ref() {
             sender.authenticate(auth)?;
@@ -861,12 +874,24 @@ impl LineSender {
         Err(error)
     }
 
+    fn validate_max_name_len(&self, name: &str) -> Result<()> {
+        if name.len() > self.max_name_len {
+            return Err(Error {
+                code: ErrorCode::InvalidApiCall,
+                msg: format!(
+                    "Bad name: {:?}: Too long (max {} characters)",
+                    name, self.max_name_len)});
+        }
+        Ok(())
+    }
+
     pub fn table<'a, N>(&mut self, name: N) -> Result<&mut Self>
         where
             N: TryInto<TableName<'a>>,
             Error: From<N::Error>
     {
         let name: TableName<'a> = name.try_into()?;
+        self.validate_max_name_len(name.name)?;
         self.check_state(Op::Table)?;
         write_escaped_unquoted(&mut self.output, name.name);
         self.state = State::TableWritten;
@@ -880,6 +905,7 @@ impl LineSender {
             Error: From<N::Error>
     {
         let name: ColumnName<'a> = name.try_into()?;
+        self.validate_max_name_len(name.name)?;
         self.check_state(Op::Symbol)?;
         self.output.push(',');
         write_escaped_unquoted(&mut self.output, name.name);
@@ -895,6 +921,7 @@ impl LineSender {
             Error: From<N::Error>
     {
         let name: ColumnName<'a> = name.try_into()?;
+        self.validate_max_name_len(name.name)?;
         self.check_state(Op::Column)?;
         self.output.push(
             if (self.state as isize & Op::Symbol as isize) > 0 {

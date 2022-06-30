@@ -29,7 +29,7 @@ use crate::{
     Error,
     ErrorCode};
 
-use crate::tests::{TestResult, mock::{MockServer, certs_dir}};
+use crate::tests::{TestResult, TestError, mock::{MockServer, certs_dir}};
 
 use core::time::Duration;
 use std::io;
@@ -57,6 +57,71 @@ fn test_basics() -> TestResult {
     assert_eq!(server.recv_q()?, 1);
     assert_eq!(server.msgs[0].as_str(), exp);
     Ok(())
+}
+
+fn name_too_long_setup() -> Result<LineSender, TestError> {
+    let mut server = MockServer::new()?;
+    let sender = server
+        .lsb()
+        .max_name_len(4)
+        .connect()?;
+    server.accept()?;
+    Ok(sender)
+}
+
+#[test]
+fn test_table_name_too_long() -> TestResult {
+    let mut sender = name_too_long_setup()?;
+    let name = "a name too long";
+    let err = sender.table(name).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert_eq!(
+        err.msg(),
+        r#"Bad name: "a name too long": Too long (max 4 characters)"#);
+    Ok(())
+}
+
+macro_rules! column_name_too_long_test_impl {
+    ($column_fn:ident, $value:expr) => {
+        {
+            let mut sender = name_too_long_setup()?;
+            let name = "a name too long";
+            let err = sender
+                .table("tbl")?
+                .$column_fn(name, $value)
+                .unwrap_err();
+            assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+            assert_eq!(
+                err.msg(),
+                r#"Bad name: "a name too long": Too long (max 4 characters)"#);
+            Ok(())
+        }
+    };
+}
+
+#[test]
+fn test_symbol_column_name_too_long() -> TestResult {
+    column_name_too_long_test_impl!(symbol, "v1")
+}
+
+#[test]
+fn test_bool_column_name_too_long() -> TestResult {
+    column_name_too_long_test_impl!(column_bool, true)
+}
+
+#[test]
+fn test_i64_column_name_too_long() -> TestResult {
+    column_name_too_long_test_impl!(column_i64, 1)
+}
+
+#[test]
+fn test_f64_column_name_too_long() -> TestResult {
+    column_name_too_long_test_impl!(column_f64, 0.5)
+}
+
+#[test]
+fn test_str_column_name_too_long() -> TestResult {
+    column_name_too_long_test_impl!(column_str, "value")
 }
 
 #[test]
