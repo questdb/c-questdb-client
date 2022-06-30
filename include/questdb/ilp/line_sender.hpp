@@ -325,7 +325,7 @@ namespace questdb::ilp
                 {
                     return str
                         ? str->c_str()
-                        : nullptr;                
+                        : nullptr;
                 };
 
             c_sec_opts.auth_key_id = to_c_str(sec_opts._auth_key_id);

@@ -149,20 +149,19 @@ TEST_CASE("test multiple lines")
     sender
         .table(table_name)
         .symbol("tag3"_cn, "value 3"_utf8)
-        .symbol("tag\n4"_cn, "value:4"_utf8)
-        .column("field\t5"_cn, false)
+        .symbol("tag 4"_cn, "value:4"_utf8)
+        .column("field5"_cn, false)
         .at_now();
 
     CHECK(server.recv() == 0);
-    CHECK(sender.pending_size() == 138);
+    CHECK(sender.pending_size() == 137);
     sender.flush();
     CHECK(server.recv() == 2);
     CHECK(server.msgs()[0] ==
         ("metric1,t1=val1,t2=val2 f1=t,f2=12345i,"
          "f3=10.75,f4=\"val3\",f5=\"val4\",f6=\"val5\" 111222233333\n"));
     CHECK(server.msgs()[1] ==
-        ("metric1,tag3=value\\ 3,tag\\\n"
-         "4=value:4 field\t5=f\n"));
+        "metric1,tag3=value\\ 3,tag\\ 4=value:4 field5=f\n");
 }
 
 TEST_CASE("State machine testing -- flush without data.")
@@ -267,7 +266,7 @@ TEST_CASE("Validation of bad chars in key names.")
     {
         CHECK_THROWS_WITH_AS(
             "a*b"_tn,
-            "Bad string \"a*b\": table, symbol and column names "
+            "Bad string \"a*b\": Table names "
             "can't contain a '*' character, "
             "which was found at byte position 1.",
             questdb::ilp::line_sender_error);
@@ -276,7 +275,7 @@ TEST_CASE("Validation of bad chars in key names.")
     {
         CHECK_THROWS_WITH_AS(
             "a+b"_tn,
-            "Bad string \"a+b\": table, symbol and column names "
+            "Bad string \"a+b\": Table names "
             "can't contain a '+' character, "
             "which was found at byte position 1.",
             questdb::ilp::line_sender_error);
@@ -286,7 +285,7 @@ TEST_CASE("Validation of bad chars in key names.")
         std::string_view column_name{"a\0b", 3};
         CHECK_THROWS_WITH_AS(
             questdb::ilp::column_name_view{column_name},
-            "Bad string \"a\\0b\": table, symbol and column names "
+            "Bad string \"a\\0b\": Symbol and column names "
             "can't contain a '\\0' character, "
             "which was found at byte position 1.",
             questdb::ilp::line_sender_error);
@@ -305,7 +304,7 @@ TEST_CASE("Validation of bad chars in key names.")
                        << std::hex
                        << std::setw(2)
                        << std::setfill('0')
-                       << c;
+                       << (int)c;
                 }
                 ss << ") did not raise.";
                 CHECK_MESSAGE(false, ss.str());
@@ -321,7 +320,7 @@ TEST_CASE("Validation of bad chars in key names.")
         };
 
     std::vector<std::string> bad_chars{
-        " "s, "?"s, "."s, ","s, "'"s, "\""s, "\\"s, "/"s, "\0"s, ":"s,
+        "?"s, "."s, ","s, "'"s, "\""s, "\\"s, "/"s, "\0"s, ":"s,
         ")"s, "("s, "+"s, "-"s, "*"s, "%"s, "~"s, "\xef\xbb\xbf"s};
 
     for (const auto& bad_char : bad_chars)
