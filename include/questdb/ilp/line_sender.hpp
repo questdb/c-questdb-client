@@ -76,7 +76,7 @@ namespace questdb::ilp
                 , _code{code}
         {}
 
-        /** Error code categorising the error. */
+        /** Error code categorizing the error. */
         line_sender_error_code code() const noexcept { return _code; }
 
     private:
@@ -103,65 +103,76 @@ namespace questdb::ilp
         }
 
         friend class line_sender;
-        friend class utf8_view;
-        friend class name_view;
+
+        template <
+            typename T,
+            bool (*F)(T*, size_t, const char*, ::line_sender_error**)>
+        friend class basic_view;
 
         line_sender_error_code _code;
     };
 
-    /** Non-owning validated UTF-8 encoded string. */
-    class utf8_view
+    /**
+     * Non-owning validated string.
+     *
+     * See `table_name_view`, `column_name_view` and `utf8_view` along with the
+     * `_utf8`, `_tn` and `_cn` literal suffixes in the `literals` namespace.
+     */
+    template <
+        typename T,
+        bool (*F)(T*, size_t, const char*, ::line_sender_error**)>
+    class basic_view
     {
     public:
-        utf8_view(const char* buf, size_t len)
+        basic_view(const char* buf, size_t len)
             : _impl{0, nullptr}
         {
             line_sender_error::wrapped_call(
-                ::line_sender_utf8_init,
+                F,
                 &_impl,
                 len,
                 buf);
         }
 
-        explicit utf8_view(std::string_view s_view)
-            : utf8_view{s_view.data(), s_view.size()}
+        template <size_t N>
+        basic_view(const char (&buf)[N])
+            : basic_view{buf, N - 1}
+        {}
+
+        basic_view(std::string_view s_view)
+            : basic_view{s_view.data(), s_view.size()}
+        {}
+
+        basic_view(const std::string& s)
+            : basic_view{s.data(), s.size()}
         {}
 
         size_t size() const noexcept { return _impl.len; }
+
         const char* data() const noexcept { return _impl.buf; }
 
-    private:
-        ::line_sender_utf8 _impl;
-
-        friend class line_sender;
-    };
-
-    /** Non-owning validated table, symbol or column name. UTF-8 encoded. */
-    class name_view
-    {
-    public:
-        name_view(const char* buf, size_t len)
-            : _impl{0, nullptr}
+        std::string_view to_string_view() const noexcept
         {
-            line_sender_error::wrapped_call(
-                ::line_sender_name_init,
-                &_impl,
-                len,
-                buf);
+            return std::string_view{_impl.buf, _impl.len};
         }
 
-        explicit name_view(std::string_view s_view)
-            : name_view{s_view.data(), s_view.size()}
-        {}
-
-        size_t size() const noexcept { return _impl.len; }
-        const char* data() const noexcept { return _impl.buf; }
-
     private:
-        ::line_sender_name _impl;
+        T _impl;
 
         friend class line_sender;
     };
+
+    using utf8_view = basic_view<
+        ::line_sender_utf8,
+        ::line_sender_utf8_init>;
+
+    using table_name_view = basic_view<
+        ::line_sender_table_name,
+        ::line_sender_table_name_init>;
+
+    using column_name_view = basic_view<
+        ::line_sender_column_name,
+        ::line_sender_column_name_init>;
 
     namespace literals
     {
@@ -177,14 +188,25 @@ namespace questdb::ilp
         }
 
         /**
-         * Utility to construct `name_view` objects from string literals.
+         * Utility to construct `table_name_view` objects from string literals.
          * @code {.cpp}
-         * auto table_name = "events"_name;
+         * auto table_name = "events"_tn;
          * @endcode
          */
-        name_view operator "" _name(const char* buf, size_t len)
+        table_name_view operator "" _tn(const char* buf, size_t len)
         {
-            return name_view{buf, len};
+            return table_name_view{buf, len};
+        }
+
+        /**
+         * Utility to construct `column_name_view` objects from string literals.
+         * @code {.cpp}
+         * auto column_name = "events"_cn;
+         * @endcode
+         */
+        column_name_view operator "" _cn(const char* buf, size_t len)
+        {
+            return column_name_view{buf, len};
         }
     }
 
@@ -413,7 +435,7 @@ namespace questdb::ilp
          * Start batching the next row of input for the named table.
          * @param name Table name.
          */
-        line_sender& table(name_view name)
+        line_sender& table(table_name_view name)
         {
             ensure_impl();
             line_sender_error::wrapped_call(
@@ -430,7 +452,7 @@ namespace questdb::ilp
          * @param name Column name.
          * @param value Column value.
          */
-        line_sender& symbol(name_view name, utf8_view value)
+        line_sender& symbol(column_name_view name, utf8_view value)
         {
             ensure_impl();
             line_sender_error::wrapped_call(
@@ -444,14 +466,14 @@ namespace questdb::ilp
         // Require specific overloads of `column` to avoid
         // involuntary usage of the `bool` overload.
         template <typename T>
-        line_sender& column(name_view name, T value) = delete;
+        line_sender& column(column_name_view name, T value) = delete;
 
         /**
          * Append a value for a BOOLEAN column.
          * @param name Column name.
          * @param value Column value.
          */
-        line_sender& column(name_view name, bool value)
+        line_sender& column(column_name_view name, bool value)
         {
             ensure_impl();
             line_sender_error::wrapped_call(
@@ -467,7 +489,7 @@ namespace questdb::ilp
          * @param name Column name.
          * @param value Column value.
          */
-        line_sender& column(name_view name, int64_t value)
+        line_sender& column(column_name_view name, int64_t value)
         {
             ensure_impl();
             line_sender_error::wrapped_call(
@@ -483,7 +505,7 @@ namespace questdb::ilp
          * @param name Column name.
          * @param value Column value.
          */
-        line_sender& column(name_view name, double value)
+        line_sender& column(column_name_view name, double value)
         {
             ensure_impl();
             line_sender_error::wrapped_call(
@@ -499,7 +521,7 @@ namespace questdb::ilp
          * @param name Column name.
          * @param value Column value.
          */
-        line_sender& column(name_view name, utf8_view value)
+        line_sender& column(column_name_view name, utf8_view value)
         {
             ensure_impl();
             line_sender_error::wrapped_call(
@@ -508,6 +530,22 @@ namespace questdb::ilp
                 name._impl,
                 value._impl);
             return *this;
+        }
+
+        template <size_t N>
+        line_sender& column(column_name_view name, const char (&value)[N])
+        {
+            return column(name, utf8_view{value});
+        }
+
+        line_sender& column(column_name_view name, std::string_view value)
+        {
+            return column(name, utf8_view{value});
+        }
+
+        line_sender& column(column_name_view name, const std::string& value)
+        {
+            return column(name, utf8_view{value});
         }
 
         /**

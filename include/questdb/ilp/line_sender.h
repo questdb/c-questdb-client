@@ -109,21 +109,17 @@ bool line_sender_utf8_init(
     line_sender_error** err_out);
 
 /** Non-owning validated table, symbol or column name. UTF-8 encoded. */
-typedef struct line_sender_name
+typedef struct line_sender_table_name
 {
     // Don't initialize fields directly.
-    // Call `line_sender_name_init` instead.
+    // Call `line_sender_table_name_init` instead.
     size_t len;
     const char* buf;
-} line_sender_name;
+} line_sender_table_name;
 
 /**
  * Check the provided buffer is a valid UTF-8 encoded string that can be
- * used as a table name, symbol name or column name.
- *
- * The string must not contain the following characters:
- * `?`, `.`,  `,`, `'`, `"`, `\`, `/`, `:`, `(`, `)`, `+`, `-`, `*`, `%`, `~`,
- * `' '` (space), `\0` (nul terminator), \uFEFF (ZERO WIDTH NO-BREAK SPACE).
+ * used as a table name.
  *
  * @param[out] name The object to be initialized.
  * @param[in] len Length in bytes of the buffer.
@@ -132,8 +128,34 @@ typedef struct line_sender_name
  * @return true on success, false on error.
  */
 LINESENDER_API
-bool line_sender_name_init(
-    line_sender_name* name,
+bool line_sender_table_name_init(
+    line_sender_table_name* name,
+    size_t len,
+    const char* buf,
+    line_sender_error** err_out);
+
+/** Non-owning validated table, symbol or column name. UTF-8 encoded. */
+typedef struct line_sender_column_name
+{
+    // Don't initialize fields directly.
+    // Call `line_sender_column_name_init` instead.
+    size_t len;
+    const char* buf;
+} line_sender_column_name;
+
+/**
+ * Check the provided buffer is a valid UTF-8 encoded string that can be
+ * used as a symbol name or column name.
+ *
+ * @param[out] name The object to be initialized.
+ * @param[in] len Length in bytes of the buffer.
+ * @param[in] buf UTF-8 encoded buffer.
+ * @param[out] err_out Set on error.
+ * @return true on success, false on error.
+ */
+LINESENDER_API
+bool line_sender_column_name_init(
+    line_sender_column_name* name,
     size_t len,
     const char* buf,
     line_sender_error** err_out);
@@ -255,7 +277,7 @@ void line_sender_close(line_sender* sender);
 LINESENDER_API
 bool line_sender_table(
     line_sender* sender,
-    line_sender_name name,
+    line_sender_table_name name,
     line_sender_error** err_out);
 
 /**
@@ -270,7 +292,7 @@ bool line_sender_table(
 LINESENDER_API
 bool line_sender_symbol(
     line_sender* sender,
-    line_sender_name name,
+    line_sender_column_name name,
     line_sender_utf8 value,
     line_sender_error** err_out);
 
@@ -285,7 +307,7 @@ bool line_sender_symbol(
 LINESENDER_API
 bool line_sender_column_bool(
     line_sender* sender,
-    line_sender_name name,
+    line_sender_column_name name,
     bool value,
     line_sender_error** err_out);
 
@@ -300,7 +322,7 @@ bool line_sender_column_bool(
 LINESENDER_API
 bool line_sender_column_i64(
     line_sender* sender,
-    line_sender_name name,
+    line_sender_column_name name,
     int64_t value,
     line_sender_error** err_out);
 
@@ -315,7 +337,7 @@ bool line_sender_column_i64(
 LINESENDER_API
 bool line_sender_column_f64(
     line_sender* sender,
-    line_sender_name name,
+    line_sender_column_name name,
     double value,
     line_sender_error** err_out);
 
@@ -330,7 +352,7 @@ bool line_sender_column_f64(
 LINESENDER_API
 bool line_sender_column_str(
     line_sender* sender,
-    line_sender_name name,
+    line_sender_column_name name,
     line_sender_utf8 value,
     line_sender_error** err_out);
 

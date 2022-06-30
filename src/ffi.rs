@@ -34,7 +34,8 @@ use libc::c_char;
 use super::{
     Error,
     ErrorCode,
-    Name,
+    TableName,
+    ColumnName,
     LineSender,
     LineSenderBuilder,
     Tls,
@@ -223,22 +224,41 @@ pub extern "C" fn line_sender_utf8_init(
     }
 }
 
-/// Non-owning validated table, symbol or column name. UTF-8 encoded.
+/// Non-owning validated table name. UTF-8 encoded.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
-pub struct line_sender_name
+pub struct line_sender_table_name
 {
     /// Don't initialize fields directly.
-    /// Call `line_sender_name_init` instead.
+    /// Call `line_sender_table_name_init` instead.
     len: libc::size_t,
     buf: *const c_char
 }
 
-impl line_sender_name {
-    fn as_name<'a>(&self) -> Name<'a> {
+impl line_sender_table_name {
+    fn as_name<'a>(&self) -> TableName<'a> {
         let str_name = unsafe { std::str::from_utf8_unchecked(
             slice::from_raw_parts(self.buf as *const u8, self.len)) };
-        Name{ name: str_name }
+        TableName{ name: str_name }
+    }
+}
+
+/// Non-owning validated symbol or column name. UTF-8 encoded.
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct line_sender_column_name
+{
+    /// Don't initialize fields directly.
+    /// Call `line_sender_column_name_init` instead.
+    len: libc::size_t,
+    buf: *const c_char
+}
+
+impl line_sender_column_name {
+    fn as_name<'a>(&self) -> ColumnName<'a> {
+        let str_name = unsafe { std::str::from_utf8_unchecked(
+            slice::from_raw_parts(self.buf as *const u8, self.len)) };
+        ColumnName{ name: str_name }
     }
 }
 
@@ -299,11 +319,7 @@ pub struct line_sender_sec_opts
 
 
 /// Check the provided buffer is a valid UTF-8 encoded string that can be
-/// used as a table name, symbol name or column name.
-///
-/// The string must not contain the following characters:
-/// `?`, `.`,  `,`, `'`, `"`, `\`, `/`, `:`, `(`, `)`, `+`, `-`, `*`, `%`, `~`,
-/// `' '` (space), `\0` (nul terminator), \uFEFF (ZERO WIDTH NO-BREAK SPACE).
+/// used as a table name.
 ///
 /// @param[out] name The object to be initialized.
 /// @param[in] len Length in bytes of the buffer.
@@ -311,8 +327,8 @@ pub struct line_sender_sec_opts
 /// @param[out] err_out Set on error.
 /// @return true on success, false on error.
 #[no_mangle]
-pub extern "C" fn line_sender_name_init(
-    name: *mut line_sender_name,
+pub extern "C" fn line_sender_table_name_init(
+    name: *mut line_sender_table_name,
     len: libc::size_t,
     buf: *const c_char,
     err_out: *mut *mut line_sender_error) -> bool
@@ -325,7 +341,39 @@ pub extern "C" fn line_sender_name_init(
     let str_name = unsafe { std::str::from_utf8_unchecked(
         slice::from_raw_parts(buf as *const u8, len)) };
 
-    bubble_err_to_c!(err_out, Name::new(str_name));
+    bubble_err_to_c!(err_out, TableName::new(str_name));
+
+    unsafe {
+        (*name).len = len;
+        (*name).buf = buf;
+    }
+    true
+}
+
+/// Check the provided buffer is a valid UTF-8 encoded string that can be
+/// used as a symbol or column name.
+///
+/// @param[out] name The object to be initialized.
+/// @param[in] len Length in bytes of the buffer.
+/// @param[in] buf UTF-8 encoded buffer.
+/// @param[out] err_out Set on error.
+/// @return true on success, false on error.
+#[no_mangle]
+pub extern "C" fn line_sender_column_name_init(
+    name: *mut line_sender_column_name,
+    len: libc::size_t,
+    buf: *const c_char,
+    err_out: *mut *mut line_sender_error) -> bool
+{
+    let mut u8str = line_sender_utf8{len: 0usize, buf: std::ptr::null_mut()};
+    if !line_sender_utf8_init(&mut u8str, len, buf, err_out) {
+        return false;
+    }
+
+    let str_name = unsafe { std::str::from_utf8_unchecked(
+        slice::from_raw_parts(buf as *const u8, len)) };
+
+    bubble_err_to_c!(err_out, ColumnName::new(str_name));
 
     unsafe {
         (*name).len = len;
@@ -573,7 +621,7 @@ pub extern "C" fn line_sender_close(sender: *mut line_sender) {
 #[no_mangle]
 pub extern "C" fn line_sender_table(
     sender: *mut line_sender,
-    name: line_sender_name,
+    name: line_sender_table_name,
     err_out: *mut *mut line_sender_error) -> bool
 {
     let sender = unwrap_sender_mut(sender);
@@ -591,7 +639,7 @@ pub extern "C" fn line_sender_table(
 #[no_mangle]
 pub extern "C" fn line_sender_symbol(
     sender: *mut line_sender,
-    name: line_sender_name,
+    name: line_sender_column_name,
     value: line_sender_utf8,
     err_out: *mut *mut line_sender_error) -> bool
 {
@@ -611,7 +659,7 @@ pub extern "C" fn line_sender_symbol(
 #[no_mangle]
 pub extern "C" fn line_sender_column_bool(
     sender: *mut line_sender,
-    name: line_sender_name,
+    name: line_sender_column_name,
     value: bool,
     err_out: *mut *mut line_sender_error) -> bool
 {
@@ -631,7 +679,7 @@ pub extern "C" fn line_sender_column_bool(
 #[no_mangle]
 pub extern "C" fn line_sender_column_i64(
     sender: *mut line_sender,
-    name: line_sender_name,
+    name: line_sender_column_name,
     value: i64,
     err_out: *mut *mut line_sender_error) -> bool
 {
@@ -651,7 +699,7 @@ pub extern "C" fn line_sender_column_i64(
 #[no_mangle]
 pub extern "C" fn line_sender_column_f64(
     sender: *mut line_sender,
-    name: line_sender_name,
+    name: line_sender_column_name,
     value: f64,
     err_out: *mut *mut line_sender_error) -> bool
 {
@@ -671,7 +719,7 @@ pub extern "C" fn line_sender_column_f64(
 #[no_mangle]
 pub extern "C" fn line_sender_column_str(
     sender: *mut line_sender,
-    name: line_sender_name,
+    name: line_sender_column_name,
     value: line_sender_utf8,
     err_out: *mut *mut line_sender_error) -> bool
 {
