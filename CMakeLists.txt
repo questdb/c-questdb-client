@@ -123,8 +123,8 @@ endfunction()
 
 compile_test(
     test_line_sender
-    test/mock_server.cpp
-    test/test_line_sender.cpp)
+    cpp_test/mock_server.cpp
+    cpp_test/test_line_sender.cpp)
 
 # System testing Python3 script.
 # This will download the latest QuestDB instance from Github,
