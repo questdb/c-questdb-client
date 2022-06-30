@@ -58,10 +58,14 @@ class c_line_sender_utf8(ctypes.Structure):
     _fields_ = [("len", c_size_t),
                 ("buf", c_char_p)]
 c_line_sender_utf8_p = ctypes.POINTER(c_line_sender_utf8)
-class c_line_sender_name(ctypes.Structure):
+class c_line_sender_table_name(ctypes.Structure):
     _fields_ = [("len", c_size_t),
                 ("buf", c_char_p)]
-c_line_sender_name_p = ctypes.POINTER(c_line_sender_name)
+c_line_sender_table_name_p = ctypes.POINTER(c_line_sender_table_name)
+class c_line_sender_column_name(ctypes.Structure):
+    _fields_ = [("len", c_size_t),
+                ("buf", c_char_p)]
+c_line_sender_column_name_p = ctypes.POINTER(c_line_sender_column_name)
 class c_line_sender_sec_opts(ctypes.Structure):
     _fields_ = [("auth_key_id", c_char_p),
                 ("auth_priv_key", c_char_p),
@@ -115,9 +119,16 @@ def _setup_cdll():
         c_char_p,
         c_line_sender_error_p_p)
     set_sig(
-        dll.line_sender_name_init,
+        dll.line_sender_table_name_init,
         c_bool,
-        c_line_sender_name_p,
+        c_line_sender_table_name_p,
+        c_size_t,
+        c_char_p,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_column_name_init,
+        c_bool,
+        c_line_sender_column_name_p,
         c_size_t,
         c_char_p,
         c_line_sender_error_p_p)
@@ -148,41 +159,41 @@ def _setup_cdll():
         dll.line_sender_table,
         c_bool,
         c_line_sender_p,
-        c_line_sender_name,
+        c_line_sender_table_name,
         c_line_sender_error_p_p)
     set_sig(
         dll.line_sender_symbol,
         c_bool,
         c_line_sender_p,
-        c_line_sender_name,
+        c_line_sender_column_name,
         c_line_sender_utf8,
         c_line_sender_error_p_p)
     set_sig(
         dll.line_sender_column_bool,
         c_bool,
         c_line_sender_p,
-        c_line_sender_name,
+        c_line_sender_column_name,
         c_bool,
         c_line_sender_error_p_p)
     set_sig(
         dll.line_sender_column_i64,
         c_bool,
         c_line_sender_p,
-        c_line_sender_name,
+        c_line_sender_column_name,
         c_int64,
         c_line_sender_error_p_p)
     set_sig(
         dll.line_sender_column_f64,
         c_bool,
         c_line_sender_p,
-        c_line_sender_name,
+        c_line_sender_column_name,
         c_double,
         c_line_sender_error_p_p)
     set_sig(
         dll.line_sender_column_str,
         c_bool,
         c_line_sender_p,
-        c_line_sender_name,
+        c_line_sender_column_name,
         c_line_sender_utf8,
         c_line_sender_error_p_p)
     set_sig(
@@ -264,13 +275,26 @@ def _utf8(s: str):
     return c_utf8
 
 
-def _name(s: str):
-    c_name = c_line_sender_name(0, None)
+def _table_name(s: str):
+    c_name = c_line_sender_table_name(0, None)
     # We attach the object to the struct to extend the parent object's lifetime.
     # If we didn't do this we'd end up with a use-after-free.
     c_name._py_obj = s.encode('utf-8')
     _error_wrapped_call(
-        _DLL.line_sender_name_init,
+        _DLL.line_sender_table_name_init,
+        ctypes.byref(c_name),
+        len(c_name._py_obj),
+        c_name._py_obj)
+    return c_name
+
+
+def _column_name(s: str):
+    c_name = c_line_sender_column_name(0, None)
+    # We attach the object to the struct to extend the parent object's lifetime.
+    # If we didn't do this we'd end up with a use-after-free.
+    c_name._py_obj = s.encode('utf-8')
+    _error_wrapped_call(
+        _DLL.line_sender_column_name_init,
         ctypes.byref(c_name),
         len(c_name._py_obj),
         c_name._py_obj)
@@ -353,7 +377,7 @@ class LineSender:
             raise LineSenderError('Not connected.')
 
     def table(self, table: str):
-        table_name = _name(table)
+        table_name = _table_name(table)
         _error_wrapped_call(
             _DLL.line_sender_table,
             self._impl,
@@ -364,7 +388,7 @@ class LineSender:
         _error_wrapped_call(
             _DLL.line_sender_symbol,
             self._impl,
-            _name(name),
+            _column_name(name),
             _utf8(value))
         return self
 
@@ -373,25 +397,25 @@ class LineSender:
             _error_wrapped_call(
                 _DLL.line_sender_column_bool,
                 self._impl,
-                _name(name),
+                _column_name(name),
                 bool(value))
         elif isinstance(value, int):
             _error_wrapped_call(
                 _DLL.line_sender_column_i64,
                 self._impl,
-                _name(name),
+                _column_name(name),
                 int(value))
         elif isinstance(value, float):
             _error_wrapped_call(
                 _DLL.line_sender_column_f64,
                 self._impl,
-                _name(name),
+                _column_name(name),
                 float(value))
         elif isinstance(value, str):
             _error_wrapped_call(
                 _DLL.line_sender_column_str,
                 self._impl,
-                _name(name),
+                _column_name(name),
                 _utf8(value))
         else:
             fqn = _fully_qual_name(value)
