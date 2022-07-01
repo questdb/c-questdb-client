@@ -624,8 +624,8 @@ namespace questdb::ilp
         }
 
         /**
-         * Check if an error occured previously and the sender must be closed.
-         * @return true if an error occured with a sender and it must be closed.
+         * Check if an error occurred previously and the sender must be closed.
+         * @return true if an error occurred with a sender and it must be closed.
          */
         bool must_close() const noexcept
         {

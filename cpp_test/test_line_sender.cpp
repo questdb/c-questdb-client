@@ -114,6 +114,7 @@ TEST_CASE("line_sender c++ api basics")
     sender
         .table("test")
         .symbol("t1", "v1")
+        .symbol("t2", "")
         .column("f1", 0.5)
         .at(10000000);
 
@@ -121,7 +122,7 @@ TEST_CASE("line_sender c++ api basics")
     CHECK(sender.pending_size() == 27);
     sender.flush();
     CHECK(server.recv() == 1);
-    CHECK(server.msgs().front() == "test,t1=v1 f1=0.5 10000000\n");
+    CHECK(server.msgs().front() == "test,t1=v1,t2= f1=0.5 10000000\n");
 }
 
 TEST_CASE("test multiple lines")

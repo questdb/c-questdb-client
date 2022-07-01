@@ -35,6 +35,15 @@ use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
 use rustls::{
     OwnedTrustAnchor, RootCertStore, ClientConnection, ServerName, StreamOwned};
 
+macro_rules! fmt_err {
+    ($code:ident, $($arg:tt)*) => {
+        Error {
+            code: ErrorCode::$code,
+            msg: format!($($arg)*)
+        }
+    }
+}
+
 #[derive(Debug, Copy, Clone)]
 enum Op {
     Table = 1,
@@ -142,10 +151,7 @@ impl std::error::Error for Error {}
 pub type Result<T> = std::result::Result<T, Error>;
 
 fn map_io_to_socket_err(prefix: &str, io_err: io::Error) -> Error {
-    Error {
-        code: ErrorCode::SocketError,
-        msg: format!("{}{}", prefix, io_err)
-    }
+    fmt_err!(SocketError, "{}{}", prefix, io_err)
 }
 
 pub struct TableName<'a> {
@@ -155,9 +161,8 @@ pub struct TableName<'a> {
 impl <'a> TableName<'a> {
     pub fn new(name: &'a str) -> Result<Self> {
         if name.is_empty() {
-            return Err(Error{
-                code: ErrorCode::InvalidName,
-                msg: "Table names must have a non-zero length.".to_owned()});
+            return Err(fmt_err!(
+                InvalidName, "Table names must have a non-zero length."));
         }
 
         let mut prev = '\0';
@@ -165,13 +170,12 @@ impl <'a> TableName<'a> {
             match c {
                 '.' => {
                     if index == 0 || index == name.len() - 1 || prev == '.' {
-                        return Err(Error{
-                            code: ErrorCode::InvalidName,
-                            msg: format!(
-                                concat!(
-                                    "Bad string {:?}: ",
-                                    "Found invalid dot `.` at position {}."),
-                                name, index)});
+                        return Err(fmt_err!(
+                            InvalidName,
+                            concat!(
+                                "Bad string {:?}: ",
+                                "Found invalid dot `.` at position {}."),
+                            name, index));
                     }
                 },
                 '?' | ',' | '\'' | '\"' | '\\' | '/' | ':' | ')' |
@@ -179,31 +183,29 @@ impl <'a> TableName<'a> {
                 '\u{0001}' | '\u{0002}' | '\u{0003}' | '\u{0004}' | '\u{0005}' |
                 '\u{0006}' | '\u{0007}' | '\u{0008}' | '\u{0009}' | '\u{000b}' |
                 '\u{000c}' | '\u{000e}' | '\u{000f}' | '\u{007f}' => {
-                    return Err(Error{
-                        code: ErrorCode::InvalidName,
-                        msg: format!(
-                            concat!(
-                                "Bad string {:?}: ",
-                                "Table names can't contain ",
-                                "a {:?} character, which was found at ",
-                                "byte position {}."),
-                            name,
-                            c,
-                            index)});
+                    return Err(fmt_err!(
+                        InvalidName,
+                        concat!(
+                            "Bad string {:?}: ",
+                            "Table names can't contain ",
+                            "a {:?} character, which was found at ",
+                            "byte position {}."),
+                        name,
+                        c,
+                        index));
                 },
                 '\u{feff}' => {
                     // Reject unicode char 'ZERO WIDTH NO-BREAK SPACE',
                     // aka UTF-8 BOM if it appears anywhere in the string.
-                    return Err(Error{
-                        code: ErrorCode::InvalidName,
-                        msg: format!(
-                            concat!(
-                                "Bad string {:?}: ",
-                                "Table names can't contain ",
-                                "a UTF-8 BOM character, which was found at ",
-                                "byte position {}."),
-                            name,
-                            index)});
+                    return Err(fmt_err!(
+                        InvalidName,
+                        concat!(
+                            "Bad string {:?}: ",
+                            "Table names can't contain ",
+                            "a UTF-8 BOM character, which was found at ",
+                            "byte position {}."),
+                        name,
+                        index));
                 },
                 _ => ()
             }
@@ -221,9 +223,9 @@ pub struct ColumnName<'a> {
 impl <'a> ColumnName<'a> {
     pub fn new(name: &'a str) -> Result<Self> {
         if name.is_empty() {
-            return Err(Error{
-                code: ErrorCode::InvalidName,
-                msg: "Column names must have a non-zero length.".to_owned()});
+            return Err(fmt_err!(
+                InvalidName,
+                "Column names must have a non-zero length."));
         }
 
         for (index, c) in name.chars().enumerate() {
@@ -233,31 +235,29 @@ impl <'a> ColumnName<'a> {
                 '\u{0001}' | '\u{0002}' | '\u{0003}' | '\u{0004}' | '\u{0005}' |
                 '\u{0006}' | '\u{0007}' | '\u{0008}' | '\u{0009}' | '\u{000b}' |
                 '\u{000c}' | '\u{000e}' | '\u{000f}' | '\u{007f}' => {
-                    return Err(Error{
-                        code: ErrorCode::InvalidName,
-                        msg: format!(
-                            concat!(
-                                "Bad string {:?}: ",
-                                "Column names can't contain ",
-                                "a {:?} character, which was found at ",
-                                "byte position {}."),
-                            name,
-                            c,
-                            index)});
+                    return Err(fmt_err!(
+                        InvalidName,
+                        concat!(
+                            "Bad string {:?}: ",
+                            "Column names can't contain ",
+                            "a {:?} character, which was found at ",
+                            "byte position {}."),
+                        name,
+                        c,
+                        index));
                 },
                 '\u{FEFF}' => {
                     // Reject unicode char 'ZERO WIDTH NO-BREAK SPACE',
                     // aka UTF-8 BOM if it appears anywhere in the string.
-                    return Err(Error{
-                        code: ErrorCode::InvalidName,
-                        msg: format!(
+                    return Err(fmt_err!(
+                        InvalidName,
                             concat!(
                                 "Bad string {:?}: ",
                                 "Column names can't contain ",
                                 "a UTF-8 BOM character, which was found at ",
                                 "byte position {}."),
                             name,
-                            index)});
+                            index));
                 },
                 _ => ()
             }
@@ -471,10 +471,7 @@ mod danger {
 }
 
 fn map_rustls_err(descr: &str, err: rustls::Error) -> Error {
-    Error {
-        code: ErrorCode::TlsError,
-        msg: format!("{}: {}", descr, err)
-    }
+    fmt_err!(TlsError, "{}: {}", descr, err)
 }
 
 fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
@@ -500,20 +497,18 @@ fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
             },
             CertificateAuthority::File(ca_file) => {
                 let certfile = std::fs::File::open(ca_file)
-                    .map_err(|io_err| Error {
-                        code: ErrorCode::TlsError,
-                        msg: format!(
-                            "Could not open certificate authority file from path {:?}: {}",
-                            ca_file,
-                            io_err)})?;
+                    .map_err(|io_err| fmt_err!(
+                        TlsError,
+                        "Could not open certificate authority file from path {:?}: {}",
+                        ca_file,
+                        io_err))?;
                 let mut reader = BufReader::new(certfile);
                 let der_certs = &rustls_pemfile::certs(&mut reader)
-                    .map_err(|io_err| Error {
-                        code: ErrorCode::TlsError,
-                        msg: format!(
-                            "Could not read certificate authority file from path {:?}: {}",
-                            ca_file,
-                            io_err)})?;
+                    .map_err(|io_err| fmt_err!(
+                        TlsError,
+                        "Could not read certificate authority file from path {:?}: {}",
+                        ca_file,
+                        io_err))?;
                 root_store.add_parsable_certificates(der_certs);
             }
         }
@@ -572,7 +567,8 @@ impl LineSenderBuilder {
         }
     }
 
-    /// Set the initial buffer capacity.
+    /// Set the initial buffer capacity (byte count).
+    /// The default is 65536.
     pub fn capacity(mut self, byte_count: usize) -> Self {
         self.capacity = byte_count;
         self
@@ -585,6 +581,11 @@ impl LineSenderBuilder {
     }
 
     /// Authentication Parameters.
+    /// Takes:
+    ///   * Key id. AKA "kid"
+    ///   * Private key. AKA "d".
+    ///   * Public key X coordinate. AKA "x".
+    ///   * Public key Y coordinate. AKA "y".
     pub fn auth<A, B, C, D>(
         mut self,
         key_id: A,
@@ -630,7 +631,7 @@ impl LineSenderBuilder {
     }
 
     /// Connect synchronously.
-    pub fn connect(self) -> Result<LineSender> {
+    pub fn connect(&self) -> Result<LineSender> {
         let mut descr = format!("LineSender[host={:?},port={:?},", self.host, self.port);
         let addr: SockAddr = gai::resolve_host_port(self.host.as_str(), self.port.as_str())?;
         let mut sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
@@ -639,7 +640,7 @@ impl LineSenderBuilder {
         sock.set_nodelay(true)
             .map_err(|io_err| map_io_to_socket_err(
                 "Could not set TCP_NODELAY: ", io_err))?;
-        if let Some(host) = self.net_interface {
+        if let Some(ref host) = self.net_interface {
             let bind_addr = gai::resolve_host(host.as_str())?;
             sock.bind(&bind_addr)
                 .map_err(|io_err| map_io_to_socket_err(
@@ -674,34 +675,33 @@ impl LineSenderBuilder {
         let conn = match configure_tls(&self.tls)? {
                 Some(tls_config) => {
                     let server_name: ServerName = self.host.as_str().try_into()
-                        .map_err(|inv_dns_err| Error {
-                            code: ErrorCode::TlsError,
-                            msg: format!("Bad host: {}", inv_dns_err)})?;
+                        .map_err(|inv_dns_err| fmt_err!(
+                            TlsError,
+                            "Bad host: {}",
+                            inv_dns_err))?;
                     let mut tls_conn = ClientConnection::new(
                         tls_config, server_name)
-                            .map_err(|rustls_err| Error {
-                                code: ErrorCode::TlsError,
-                                msg: format!(
-                                    "Could not create TLS client: {}",
-                                    rustls_err)})?;
+                            .map_err(|rustls_err| fmt_err!(
+                                TlsError,
+                                "Could not create TLS client: {}",
+                                rustls_err))?;
                     while tls_conn.wants_write() || tls_conn.is_handshaking() {
                         tls_conn.complete_io(&mut sock)
-                            .map_err(|io_err| Error{
-                                code: ErrorCode::TlsError,
-                                msg:
-                                    if (io_err.kind() == io::ErrorKind::TimedOut) ||
-                                       (io_err.kind() == io::ErrorKind::WouldBlock) {
-                                        format!(
-                                            concat!(
-                                                "Failed to complete TLS handshake: ",
-                                                "Timed out waiting for server response ",
-                                                "after {:?}."),
-                                            self.read_timeout)
-                                    } else {
-                                        format!(
-                                            "Failed to complete TLS handshake: {}",
-                                            io_err)
-                                    }})?;
+                            .map_err(|io_err|
+                                if (io_err.kind() == io::ErrorKind::TimedOut) ||
+                                    (io_err.kind() == io::ErrorKind::WouldBlock) {
+                                    fmt_err!(TlsError,
+                                        concat!(
+                                            "Failed to complete TLS handshake: ",
+                                            "Timed out waiting for server response ",
+                                            "after {:?}."),
+                                        self.read_timeout)
+                                } else {
+                                    fmt_err!(
+                                        TlsError,
+                                        "Failed to complete TLS handshake: {}",
+                                        io_err)
+                                })?;
                     }
                     Connection::Tls(StreamOwned::new(tls_conn, sock))
                 },
@@ -729,10 +729,8 @@ impl LineSenderBuilder {
 
 fn b64_decode(descr: &'static str, buf: &str) -> Result<Vec<u8>> {
     Base64UrlUnpadded::decode_vec(buf)
-        .map_err(|b64_err| Error{
-            code: ErrorCode::AuthError,
-            msg: format!(
-                "Could not decode {}: {}", descr, b64_err)})
+        .map_err(|b64_err| fmt_err!(
+            AuthError, "Could not decode {}: {}", descr, b64_err))
 }
 
 fn parse_public_key(pub_key_x: &str, pub_key_y: &str) -> Result<Vec<u8>> {
@@ -756,9 +754,8 @@ fn parse_key_pair(auth: &AuthParams) -> Result<EcdsaKeyPair> {
         &ECDSA_P256_SHA256_FIXED_SIGNING,
         &private_key[..],
         &public_key[..])
-            .map_err(|key_rejected| Error{
-                code: ErrorCode::AuthError,
-                msg: format!("Bad private key: {}", key_rejected)})
+            .map_err(|key_rejected| fmt_err!(
+                AuthError, "Bad private key: {}", key_rejected))
 }
 
 struct F64Serializer {
@@ -816,16 +813,20 @@ impl LineSender {
                 "Failed to read authentication challenge (timed out?): ",
                 io_err))?;
         if buf.last().map(|c| *c).unwrap_or(b'\0') != b'\n' {
-            return Err(Error {
-                code: ErrorCode::AuthError,
-                msg: if buf.len() == 0 {
-                    concat!(
-                        "Did not receive auth challenge. ",
-                        "Is the database configured to require authentication?"
-                    ).to_owned()
+            return Err(if buf.len() == 0 {
+                    fmt_err!(
+                        AuthError,
+                        concat!(
+                            "Did not receive auth challenge. ",
+                            "Is the database configured to require ",
+                            "authentication?"
+                        ))
                 } else {
-                    format!("Received incomplete auth challenge: {:?}", buf)
-                }});
+                    fmt_err!(
+                        AuthError,
+                        "Received incomplete auth challenge: {:?}",
+                        buf)
+                });
         }
         buf.pop();  // b'\n'
         Ok(buf)
@@ -833,22 +834,20 @@ impl LineSender {
 
     fn authenticate(&mut self, auth: &AuthParams) -> Result<()> {
         if auth.key_id.contains('\n') {
-            return Err(Error {
-                code: ErrorCode::AuthError,
-                msg: format!(
-                    "Bad key id {:?}: Should not contain new-line char.",
-                    auth.key_id)});
+            return Err(fmt_err!(
+                AuthError,
+                "Bad key id {:?}: Should not contain new-line char.",
+                auth.key_id));
         }
         let key_pair = parse_key_pair(&auth)?;
         self.send_key_id(auth.key_id.as_str())?;
         let challenge = self.read_challenge()?;
         let rng = ring::rand::SystemRandom::new();
         let signature = key_pair.sign(&rng, &challenge[..]).
-            map_err(|unspecified_err| Error{
-                code: ErrorCode::AuthError,
-                msg: format!(
-                    "Failed to sign challenge: {}",
-                    unspecified_err)})?;
+            map_err(|unspecified_err| fmt_err!(
+                AuthError,
+                "Failed to sign challenge: {}",
+                unspecified_err))?;
         let mut encoded_sig = Base64::encode_string(signature.as_ref());
         encoded_sig.push('\n');
         let buf = encoded_sig.as_bytes();
@@ -864,23 +863,22 @@ impl LineSender {
         if (self.state as isize & op as isize) > 0 {
             return Ok(());
         }
-        let error = Error{
-            code: ErrorCode::InvalidApiCall,
-            msg: format!(
-                "State error: Bad call to `{}`, {}. Must now call `close`.",
-                op.descr(),
-                self.state.next_op_descr())};
+        let error = fmt_err!(
+            InvalidApiCall,
+            "State error: Bad call to `{}`, {}. Must now call `close`.",
+            op.descr(),
+            self.state.next_op_descr());
         self.state = State::Moribund;
         Err(error)
     }
 
     fn validate_max_name_len(&self, name: &str) -> Result<()> {
         if name.len() > self.max_name_len {
-            return Err(Error {
-                code: ErrorCode::InvalidApiCall,
-                msg: format!(
-                    "Bad name: {:?}: Too long (max {} characters)",
-                    name, self.max_name_len)});
+            return Err(fmt_err!(
+                InvalidApiCall,
+                "Bad name: {:?}: Too long (max {} characters)",
+                name,
+                self.max_name_len));
         }
         Ok(())
     }

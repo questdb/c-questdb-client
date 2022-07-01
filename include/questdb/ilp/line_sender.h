@@ -170,91 +170,135 @@ bool line_sender_column_name_init(
  */
 typedef struct line_sender line_sender;
 
-/** Whole connection encryption options. */
-typedef enum line_sender_tls
-{
-    /** No TLS connection encryption. */
-    line_sender_tls_disabled,
-
-    /** Enable TLS. See `line_sender_sec_opts::tls_ca` for behaviour. */
-    line_sender_tls_enabled,
-
-    /**
-     * Enable TLS whilst dangerously accepting any certificate as valid.
-     * This should only be used for debugging.
-     * Consider using `enabled` and specifying a self-signed `tls_ca` instead.
-     */
-    line_sender_tls_insecure_skip_verify
-} line_sender_tls;
+/**
+ * Accumulates parameters for creating a line sender connection.
+ */
+typedef struct line_sender_opts line_sender_opts;
 
 /**
- * Connection security options.
+ * A new set of options for a line sender connection.
+ * @param[in] host The QuestDB database host.
+ * @param[in] port The QuestDB database port as service name.
  */
-typedef struct line_sender_sec_opts
-{
-    /** Authentication key id. AKA "kid". */
-    const char* auth_key_id;
+LINESENDER_API
+line_sender_opts* line_sender_opts_new_service(
+    const char* host,
+    const char* port,
+    line_sender_error** err_out);
 
-    /** Authentication private key. AKA "d". */
-    const char* auth_priv_key;
+/**
+ * A new set of options for a line sender connection.
+ * @param[in] host The QuestDB database host.
+ * @param[in] port The QuestDB database port.
+ */
+LINESENDER_API
+line_sender_opts* line_sender_opts_new(
+    const char* host,
+    uint16_t port,
+    line_sender_error** err_out);
 
-    /** Authentication public key X coordinate. AKA "x". */
-    const char* auth_pub_key_x;
+/**
+ * Set the initial buffer capacity (byte count).
+ * The default is 65536.
+ */
+LINESENDER_API
+void line_sender_opts_capacity(
+    line_sender_opts* opts,
+    size_t capacity);
 
-    /** Authentication public key Y coordinate. AKA "y". */
-    const char* auth_pub_key_y;
+/**
+ * Select local outbound interface.
+ */
+LINESENDER_API
+bool line_sender_opts_net_interface(
+    line_sender_opts* opts,
+    const char* net_interface,
+    line_sender_error** err_out);
 
-    /** Settings for secure connection over TLS. */
-    line_sender_tls tls;
+/**
+ * Authentication Parameters.
+ * @param[in] key_id Key id. AKA "kid"
+ * @param[in] priv_key Private key. AKA "d".
+ * @param[in] pub_key_x Public key X coordinate. AKA "x".
+ * @param[in] pub_key_y Public key Y coordinate. AKA "y".
+ */
+LINESENDER_API
+bool line_sender_opts_auth(
+    line_sender_opts* opts,
+    const char* key_id,
+    const char* priv_key,
+    const char* pub_key_x,
+    const char* pub_key_y,
+    line_sender_error** err_out);
 
-    /**
-     * Set a custom CA file path to use for verification.
-     * If NULL, defaults to `webpki-roots` certificates which accepts
-     * most well-know certificate authorities.
-     *
-     * This argument is generally only specified during dev-testing.
-     */
-    const char* tls_ca;
-} line_sender_sec_opts;
+/**
+ * Enable full connection encryption via TLS.
+ * The connection will accept certificates by well-known certificate
+ * authorities as per the "webpki-roots" Rust crate.
+ */
+LINESENDER_API
+void line_sender_opts_enable_tls(line_sender_opts* opts);
+
+/**
+ * Enable full connection encryption via TLS.
+ * The connection will accept certificates by the specified certificate
+ * authority file.
+ */
+LINESENDER_API
+bool line_sender_opts_enable_tls_ca(
+    line_sender_opts* opts,
+    const char* ca_path,
+    line_sender_error** err_out);
+
+/**
+ * Enable TLS whilst dangerously accepting any certificate as valid.
+ * This should only be used for debugging.
+ * Consider using calling "enable_tls_ca" instead.
+ */
+LINESENDER_API
+void line_sender_opts_enable_tls_insecure_skip_verify(line_sender_opts* opts);
+
+/**
+ * Configure how long to wait for messages from the QuestDB server during
+ * the TLS handshake and authentication process.
+ * The default is 15 seconds.
+ */
+LINESENDER_API
+void line_sender_opts_read_timeout(
+    line_sender_opts* opts,
+    uint64_t timeout_millis);
+
+/**
+ * Set the maximum length for table and column names.
+ * This should match the `cairo.max.file.name.length` setting of the
+ * QuestDB instance you're connecting to.
+ * The default value is 127, which is the same as the QuestDB default.
+ */
+LINESENDER_API
+void line_sender_opts_max_name_len(
+    line_sender_opts* opts,
+    size_t value);
+
+/**
+ * Release the opts object.
+ */
+LINESENDER_API
+void line_sender_opts_free(line_sender_opts* opts);
 
 /**
  * Synchronously connect to the QuestDB database.
- * @param[in] net_interface Network interface to bind to.
- * If unsure, to bind to all specify "0.0.0.0".
- * @param[in] host QuestDB host, e.g. "localhost". nul-terminated.
- * @param[in] port QuestDB port, e.g. "9009". nul-terminated.
- * @param[out] err_out Set on error.
- * @return Connected sender object or NULL on error.
+ * The connection should be accessed by only a single thread a time.
+ * @param[in] opts Options for the connection.
  */
 LINESENDER_API
-line_sender* line_sender_connect(
-    const char* net_interface,
-    const char* host,
-    const char* port,
+line_sender *line_sender_connect(
+    const line_sender_opts* opts,
     line_sender_error** err_out);
 
 /**
- * Synchronously connect securely to the QuestDB database.
- * @param[in] net_interface Network interface to bind to.
- * If unsure, to bind to all specify "0.0.0.0".
- * @param[in] host QuestDB host, e.g. "localhost". nul-terminated.
- * @param[in] port QuestDB port, e.g. "9009". nul-terminated.
- * @param[in] sec_opts Security options for authentication.
- * @param[out] err_out Set on error.
- * @return Connected sender object or NULL on error.
- */
-LINESENDER_API
-line_sender* line_sender_connect_secure(
-    const char* net_interface,
-    const char* host,
-    const char* port,
-    const line_sender_sec_opts* sec_opts,
-    line_sender_error** err_out);
-
-/**
- * Check if an error occured previously and the sender must be closed.
+ * Check if an error occurred previously and the sender must be closed.
  * @param[in] sender Line sender object.
- * @return true if an error occured with a sender and it must be closed.
+ * @return true if an error occurred with a sender and it must be closed.
  */
 LINESENDER_API
 bool line_sender_must_close(const line_sender* sender);
