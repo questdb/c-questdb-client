@@ -365,6 +365,20 @@ pub struct line_sender_opts(LineSenderBuilder);
 
 /// A new set of options for a line sender connection.
 /// @param[in] host The QuestDB database host.
+/// @param[in] port The QuestDB database port.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_new(
+    host: *const libc::c_char,
+    port: u16,
+    err_out: *mut *mut line_sender_error) -> *mut line_sender_opts
+{
+    let host: &str = c_str_to_ref!(host, err_out, ptr::null_mut());
+    let builder = LineSenderBuilder::new(host, port);
+    Box::into_raw(Box::new(line_sender_opts(builder)))
+}
+
+/// A new set of options for a line sender connection.
+/// @param[in] host The QuestDB database host.
 /// @param[in] port The QuestDB database port as service name.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_opts_new_service(
@@ -374,20 +388,6 @@ pub unsafe extern "C" fn line_sender_opts_new_service(
 {
     let host: &str = c_str_to_ref!(host, err_out, ptr::null_mut());
     let port: &str = c_str_to_ref!(port, err_out, ptr::null_mut());
-    let builder = LineSenderBuilder::new(host, port);
-    Box::into_raw(Box::new(line_sender_opts(builder)))
-}
-
-/// A new set of options for a line sender connection.
-/// @param[in] host The QuestDB database host.
-/// @param[in] port The QuestDB database port.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_new(
-    host: *const libc::c_char,
-    port: u16,
-    err_out: *mut *mut line_sender_error) -> *mut line_sender_opts
-{
-    let host: &str = c_str_to_ref!(host, err_out, ptr::null_mut());
     let builder = LineSenderBuilder::new(host, port);
     Box::into_raw(Box::new(line_sender_opts(builder)))
 }
@@ -440,7 +440,7 @@ pub unsafe extern "C" fn line_sender_opts_auth(
 /// The connection will accept certificates by well-known certificate
 /// authorities as per the "webpki-roots" Rust crate.
 #[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_enable_tls(
+pub unsafe extern "C" fn line_sender_opts_tls(
     opts: *mut line_sender_opts)
 {
     upd_opts!(opts, tls,
@@ -451,7 +451,7 @@ pub unsafe extern "C" fn line_sender_opts_enable_tls(
 /// The connection will accept certificates by the specified certificate
 /// authority file.
 #[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_enable_tls_ca(
+pub unsafe extern "C" fn line_sender_opts_tls_ca(
     opts: *mut line_sender_opts,
     ca_path: *const libc::c_char,
     err_out: *mut *mut line_sender_error) -> bool
@@ -465,9 +465,9 @@ pub unsafe extern "C" fn line_sender_opts_enable_tls_ca(
 
 /// Enable TLS whilst dangerously accepting any certificate as valid.
 /// This should only be used for debugging.
-/// Consider using calling "enable_tls_ca" instead.
+/// Consider using calling "tls_ca" instead.
 #[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_enable_tls_insecure_skip_verify(
+pub unsafe extern "C" fn line_sender_opts_tls_insecure_skip_verify(
     opts: *mut line_sender_opts)
 {
     upd_opts!(opts, tls, Tls::InsecureSkipVerify);

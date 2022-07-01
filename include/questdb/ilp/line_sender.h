@@ -178,23 +178,23 @@ typedef struct line_sender_opts line_sender_opts;
 /**
  * A new set of options for a line sender connection.
  * @param[in] host The QuestDB database host.
- * @param[in] port The QuestDB database port as service name.
- */
-LINESENDER_API
-line_sender_opts* line_sender_opts_new_service(
-    const char* host,
-    const char* port,
-    line_sender_error** err_out);
-
-/**
- * A new set of options for a line sender connection.
- * @param[in] host The QuestDB database host.
  * @param[in] port The QuestDB database port.
  */
 LINESENDER_API
 line_sender_opts* line_sender_opts_new(
     const char* host,
     uint16_t port,
+    line_sender_error** err_out);
+
+/**
+ * A new set of options for a line sender connection.
+ * @param[in] host The QuestDB database host.
+ * @param[in] port The QuestDB database port as service name.
+ */
+LINESENDER_API
+line_sender_opts* line_sender_opts_new_service(
+    const char* host,
+    const char* port,
     line_sender_error** err_out);
 
 /**
@@ -206,9 +206,7 @@ void line_sender_opts_capacity(
     line_sender_opts* opts,
     size_t capacity);
 
-/**
- * Select local outbound interface.
- */
+/** Select local outbound interface. */
 LINESENDER_API
 bool line_sender_opts_net_interface(
     line_sender_opts* opts,
@@ -237,7 +235,7 @@ bool line_sender_opts_auth(
  * authorities as per the "webpki-roots" Rust crate.
  */
 LINESENDER_API
-void line_sender_opts_enable_tls(line_sender_opts* opts);
+void line_sender_opts_tls(line_sender_opts* opts);
 
 /**
  * Enable full connection encryption via TLS.
@@ -245,7 +243,7 @@ void line_sender_opts_enable_tls(line_sender_opts* opts);
  * authority file.
  */
 LINESENDER_API
-bool line_sender_opts_enable_tls_ca(
+bool line_sender_opts_tls_ca(
     line_sender_opts* opts,
     const char* ca_path,
     line_sender_error** err_out);
@@ -253,10 +251,10 @@ bool line_sender_opts_enable_tls_ca(
 /**
  * Enable TLS whilst dangerously accepting any certificate as valid.
  * This should only be used for debugging.
- * Consider using calling "enable_tls_ca" instead.
+ * Consider using calling "tls_ca" instead.
  */
 LINESENDER_API
-void line_sender_opts_enable_tls_insecure_skip_verify(line_sender_opts* opts);
+void line_sender_opts_tls_insecure_skip_verify(line_sender_opts* opts);
 
 /**
  * Configure how long to wait for messages from the QuestDB server during

@@ -95,14 +95,18 @@ namespace questdb::ilp
         }
 
         template <typename F, typename... Args>
-            inline static void wrapped_call(F&& f, Args&&... args)
+        inline static auto wrapped_call(F&&, Args&&... args)
         {
             ::line_sender_error* c_err{nullptr};
-            if (!f(std::forward<Args>(args)..., &c_err))
+            auto obj = f(std::forward<Args>(args)..., &c_err);
+            if (obj)
+                return obj;
+            else
                 throw from_c(c_err);
         }
 
         friend class line_sender;
+        friend class line_sender_opts;
 
         template <
             typename T,
@@ -210,81 +214,250 @@ namespace questdb::ilp
         }
     }
 
-    /** Whole connection encryption options. */
-    enum class tls
+    class opts
     {
-        /** No TLS connection encryption. */
-        disabled,
+        public:
+            /**
+             * A new set of options for a line sender connection.
+             * @param[in] host The QuestDB database host.
+             * @param[in] port The QuestDB database port.
+             */
+            opts(
+                std::string_view host,
+                uint16_t port)
+                : opts{host.data(), port}
+            {}
 
-        /** Enable TLS. See `sec_opts::tls_ca` for behaviour. */
-        enabled,
+            /**
+             * A new set of options for a line sender connection.
+             * @param[in] host The QuestDB database host.
+             * @param[in] port The QuestDB database port.
+             */
+            opts(
+                const char* host,
+                uint16_t port)
+                : _impl{nullptr}
+            {
+                _impl = line_sender_error::wrapped_call(
+                    ::line_sender_opts_new, host, port);
+            }
 
-        /**
-         * Enable TLS whilst dangerously accepting any certificate as valid.
-         * This should only be used for debugging.
-         * Consider using `enabled` and supplying a self-signed `tls_ca` instead.
-         */
-        insecure_skip_verify
-    };
+            /**
+             * A new set of options for a line sender connection.
+             * @param[in] host The QuestDB database host.
+             * @param[in] port The QuestDB database port as service name.
+             */
+            opts(
+                std::string_view host,
+                std::string_view port)
+                : opts{host.data(), port.data()}
+            {}
 
-    /**
-     * * Connection security options.
-     */
-    class sec_opts
-    {
-    public:
-        /** Construct with auth parameters and optionally with TLS. */
-        sec_opts(
-            std::string_view auth_key_id,
-            std::string_view auth_priv_key,
-            std::string_view auth_pub_key_x,
-            std::string_view auth_pub_key_y,
-            tls tls = tls::disabled,
-            std::optional<std::string_view> tls_ca = std::nullopt)
-                : _auth_key_id{auth_key_id}
-                , _auth_priv_key{auth_priv_key}
-                , _auth_pub_key_x{auth_pub_key_x}
-                , _auth_pub_key_y{auth_pub_key_y}
-                , _tls{tls}
-                , _tls_ca{tls_ca}
-        {}
+            /**
+             * A new set of options for a line sender connection.
+             * @param[in] host The QuestDB database host.
+             * @param[in] port The QuestDB database port as service name.
+             */
+            opts(
+                const char* host,
+                const char* port)
+                : _impl{nullptr}
+            {
+                _impl = line_sender_error::wrapped_call(
+                    ::line_sender_opts_new_service, host, port);
+            }
 
-        /** Construct with TLS parameters only. */
-        sec_opts(tls tls, std::optional<std::string_view> tls_ca = std::nullopt)
-            : _auth_key_id(std::nullopt)
-            , _auth_priv_key(std::nullopt)
-            , _auth_pub_key_x(std::nullopt)
-            , _auth_pub_key_y(std::nullopt)
-            , _tls(tls)
-            , _tls_ca(tls_ca)
-        {}
+            /**
+             * Set the initial buffer capacity (byte count).
+             * The default is 65536.
+             */
+            opts& capacity(size_t capacity) noexcept
+            {
+                ::line_sender_opts_capacity(_impl, capacity);
+                return *this;
+            }
 
-    private:
-        friend class line_sender;
+            /** Select local outbound interface. */
+            opts& net_interface(std::string_view net_interface)
+            {
+                return this->net_interface(net_interface.data());
+            }
 
-        /** Authentication key id. AKA "kid". */
-        std::optional<std::string> _auth_key_id;
+            /** Select local outbound interface. */
+            opts& net_interface(const char* net_interface)
+            {
+                line_sender_error::wrapped_call(
+                    ::line_sender_opts_net_interface,
+                    _impl,
+                    net_interface);
+                return *this;
+            }
 
-        /** Authentication private key. AKA "d". */
-        std::optional<std::string> _auth_priv_key;
+            /**
+             * Authentication Parameters.
+             * @param[in] key_id Key id. AKA "kid"
+             * @param[in] priv_key Private key. AKA "d".
+             * @param[in] pub_key_x Public key X coordinate. AKA "x".
+             * @param[in] pub_key_y Public key Y coordinate. AKA "y".
+             */
+            opts& auth(
+                std::string_view key_id,
+                std::string_view priv_key,
+                std::string_view pub_key_x,
+                std::string_view pub_key_y)
+            {
+                return this->auth(
+                    key_id.data(),
+                    priv_key.data(),
+                    pub_key_x.data(),
+                    pub_key_y.data());
+            }
 
-        /** Authentication public key X coordinate. AKA "x". */
-        std::optional<std::string> _auth_pub_key_x;
+            /**
+             * Authentication Parameters.
+             * @param[in] key_id Key id. AKA "kid"
+             * @param[in] priv_key Private key. AKA "d".
+             * @param[in] pub_key_x Public key X coordinate. AKA "x".
+             * @param[in] pub_key_y Public key Y coordinate. AKA "y".
+             */
+            opts& auth(
+                const char* key_id,
+                const char* priv_key,
+                const char* pub_key_x,
+                const char* pub_key_y)
+            {
+                line_sender_error::wrapped_call(
+                    ::line_sender_opts_auth,
+                    _impl,
+                    key_id,
+                    priv_key,
+                    pub_key_x,
+                    pub_key_y);
+                return *this;
+            }
 
-        /** Authentication public key Y coordinate. AKA "y". */
-        std::optional<std::string> _auth_pub_key_y;
+            /**
+             * Enable full connection encryption via TLS.
+             * The connection will accept certificates by well-known certificate
+             * authorities as per the "webpki-roots" Rust crate.
+             */
+            opts& tls() noexcept
+            {
+                ::line_sender_opts_tls(_impl);
+                return *this;
+            }
 
-        /** Settings for secure connection over TLS. */
-        tls _tls;
+            /**
+             * Enable full connection encryption via TLS.
+             * The connection will accept certificates by the specified certificate
+             * authority file.
+             */
+            opts& tls(std::string_view ca_file)
+            {
+                return this->tls(ca_file.data());
+            }
 
-        /**
-         * Set a custom CA file path to use for verification.
-         * If set to a nullopt, defaults to `webpki-roots` certificates which
-         * accepts most well-know certificate authorities.
-         *
-         * This argument is generally only specified during dev-testing.
-         */
-        std::optional<std::string> _tls_ca;
+            /**
+             * Enable full connection encryption via TLS.
+             * The connection will accept certificates by the specified certificate
+             * authority file.
+             */
+            opts& tls(const char* ca_file)
+            {
+                line_sender_error::wrapped_call(
+                    ::line_sender_opts_tls_ca,
+                    _impl,
+                    ca_file);
+                return *this;
+            }
+
+            /**
+             * Enable TLS whilst dangerously accepting any certificate as valid.
+             * This should only be used for debugging.
+             * Consider using calling "tls_ca" instead.
+             */
+            opts& tls_insecure_skip_verify() noexcept
+            {
+                ::line_sender_opts_tls_insecure_skip_verify(_impl);
+                return *this;
+            }
+
+            /**
+             * Configure how long to wait for messages from the QuestDB server
+             * during the TLS handshake and authentication process.
+             * The default is 15 seconds.
+             */
+            opts& read_timeout(uint64_t timeout_millis) noexcept
+            {
+                ::line_sender_opts_read_timeout(_impl, timeout_millis);
+                return *this;
+            }
+
+            /**
+             * Set the maximum length for table and column names.
+             * This should match the `cairo.max.file.name.length` setting of
+             * the QuestDB instance you're connecting to.
+             * The default value is 127, which is the same as the QuestDB
+             * default.
+             */
+            opts& max_name_len(size_t max_name_len) noexcept
+            {
+                ::line_sender_opts_max_name_len(_impl, max_name_len);
+                return *this;
+            }
+
+            opts(opts&& other) noexcept
+            {
+                if (this != &other)
+                {
+                    _impl = other._impl;
+                    other._impl = nullptr;
+                }
+            }
+
+            opts& operator=(opts&& other) noexcept
+            {
+                if (this != &other)
+                {
+                    reset();
+                    _impl = other._impl;
+                    other._impl = nullptr;
+                }
+                return *this;
+            }
+
+            opts(const opts& other)
+                : _impl{::line_sender_opts_clone(other._impl)}
+            {
+            }
+
+            opts& operator=(const opts& other)
+            {
+                if (this != &other)
+                {
+                    reset();
+                    _impl = ::line_sender_opts_clone(other._impl);
+                }
+                return *this;
+            }
+
+            ~opts() noexcept
+            {
+                reset();
+            }
+        private:
+            void reset() noexcept
+            {
+                if (_impl)
+                {
+                    ::line_sender_opts_free(_impl);
+                    _impl = nullptr;
+                }
+            }
+
+            friend class line_sender;
+
+            ::line_sender_opts* _impl;
     };
 
     /**
@@ -295,120 +468,12 @@ namespace questdb::ilp
     class line_sender
     {
     public:
-        line_sender(
-            const char* host,
-            const char* port,
-            const char* net_interface = inaddr_any)
-                : _impl{nullptr}
+        line_sender(const opts& opts)
+            : _impl{nullptr}
         {
-            ::line_sender_error* c_err{nullptr};
-            _impl = ::line_sender_connect(
-                net_interface,
-                host,
-                port,
-                &c_err);
-            if (!_impl)
-                throw line_sender_error::from_c(c_err);
+            _impl = line_sender_error::wrapped_call(
+                ::line_sender_connect, opts._impl);
         }
-
-        line_sender(
-            const char* host,
-            const char* port,
-            const sec_opts& sec_opts,
-            const char* net_interface = inaddr_any)
-                : _impl{nullptr}
-        {
-            ::line_sender_error* c_err{nullptr};
-            ::line_sender_sec_opts c_sec_opts;
-
-            auto to_c_str = [](const std::optional<std::string>& str)
-                {
-                    return str
-                        ? str->c_str()
-                        : nullptr;
-                };
-
-            c_sec_opts.auth_key_id = to_c_str(sec_opts._auth_key_id);
-            c_sec_opts.auth_priv_key = to_c_str(sec_opts._auth_priv_key);
-            c_sec_opts.auth_pub_key_x = to_c_str(sec_opts._auth_pub_key_x);
-            c_sec_opts.auth_pub_key_y = to_c_str(sec_opts._auth_pub_key_y);
-            c_sec_opts.tls = static_cast<::line_sender_tls>(sec_opts._tls);
-            c_sec_opts.tls_ca = to_c_str(sec_opts._tls_ca);
-            _impl = ::line_sender_connect_secure(
-                net_interface,
-                host,
-                port,
-                &c_sec_opts,
-                &c_err);
-            if (!_impl)
-                throw line_sender_error::from_c(c_err);
-        }
-
-        line_sender(
-            std::string_view host,
-            std::string_view port,
-            std::string_view net_interface = inaddr_any)
-                : line_sender{
-                    std::string{host}.c_str(),
-                    std::string{port}.c_str(),
-                    std::string{net_interface}.c_str()}
-        {}
-
-        line_sender(
-            std::string_view host,
-            std::string_view port,
-            const sec_opts& sec_opts,
-            std::string_view net_interface = inaddr_any)
-                : line_sender{
-                    std::string{host}.c_str(),
-                    std::string{port}.c_str(),
-                    sec_opts,
-                    std::string{net_interface}.c_str()}
-        {}
-
-        line_sender(
-            std::string_view host,
-            uint16_t port,
-            std::string_view net_interface = inaddr_any)
-                : line_sender{
-                    std::string{host}.c_str(),
-                    std::to_string(port).c_str(),
-                    std::string{net_interface}.c_str()}
-        {}
-
-        line_sender(
-            std::string_view host,
-            uint16_t port,
-            const sec_opts& sec_opts,
-            std::string_view net_interface = inaddr_any)
-                : line_sender{
-                    std::string{host}.c_str(),
-                    std::to_string(port).c_str(),
-                    sec_opts,
-                    std::string{net_interface}.c_str()}
-        {}
-
-        line_sender(
-            const char* host,
-            uint16_t port,
-            const char* net_interface = inaddr_any)
-                : line_sender{
-                    host,
-                    std::to_string(port).c_str(),
-                    net_interface}
-        {}
-
-        line_sender(
-            const char* host,
-            uint16_t port,
-            const sec_opts& sec_opts,
-            const char* net_interface = inaddr_any)
-                : line_sender{
-                    host,
-                    std::to_string(port).c_str(),
-                    sec_opts,
-                    net_interface}
-        {}
 
         line_sender(line_sender&& other) noexcept
             : _impl{other._impl}
