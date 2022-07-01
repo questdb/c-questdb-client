@@ -6,9 +6,15 @@
 static bool example(const char* host, const char* port)
 {
     line_sender_error* err = NULL;
+    line_sender_opts* opts = NULL;
     line_sender* sender = NULL;
 
-    sender = line_sender_connect("0.0.0.0", host, port, &err);
+    // Call `line_sender_opts_new` if instead you have an integer port.
+    opts = line_sender_opts_new_service(host, port, &err);
+    if (!opts)
+        goto on_error;
+
+    sender = line_sender_connect(opts, &err);
     if (!sender)
         goto on_error;
 
@@ -93,6 +99,7 @@ static bool example(const char* host, const char* port)
     return true;
 
 on_error: ;
+    line_sender_opts_free(opts);
     size_t err_len = 0;
     const char* err_msg = line_sender_error_msg(err, &err_len);
     fprintf(stderr, "Error running example: %.*s\n", (int)err_len, err_msg);

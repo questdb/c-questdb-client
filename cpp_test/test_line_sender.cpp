@@ -54,12 +54,12 @@ TEST_CASE("line_sender c api basics")
             if (err)
                 ::line_sender_error_free(err);
         }};
-    ::line_sender* sender = ::line_sender_connect(
-        "0.0.0.0",
-        "localhost",
-        std::to_string(server.port()).c_str(),
-        &err);
-    CHECK(sender != nullptr);
+    ::line_sender_opts* opts = ::line_sender_opts_new(
+        "localhost", server.port(), &err);
+    CHECK_NE(opts, nullptr);
+    ::line_sender* sender = ::line_sender_connect(opts, &err);
+    line_sender_opts_free(opts);
+    CHECK_NE(sender, nullptr);
     CHECK_FALSE(::line_sender_must_close(sender));
     on_scope_exit sender_close_guard{[&]
         {
@@ -93,9 +93,7 @@ TEST_CASE("line_sender c api basics")
 TEST_CASE("line_sender c++ connect disconnect")
 {
     questdb::ilp::test::mock_server server;
-    questdb::ilp::line_sender sender{
-        "localhost",
-        std::to_string(server.port()).c_str()};
+    questdb::ilp::line_sender sender{"localhost", server.port()};
     CHECK_FALSE(sender.must_close());
     server.accept();
     CHECK(server.recv() == 0);
@@ -105,7 +103,7 @@ TEST_CASE("line_sender c++ api basics")
 {
     questdb::ilp::test::mock_server server;
     questdb::ilp::line_sender sender{
-        "localhost",
+        std::string("localhost"),
         std::to_string(server.port()).c_str()};
     CHECK_FALSE(sender.must_close());
     server.accept();
@@ -119,7 +117,7 @@ TEST_CASE("line_sender c++ api basics")
         .at(10000000);
 
     CHECK(server.recv() == 0);
-    CHECK(sender.pending_size() == 27);
+    CHECK(sender.pending_size() == 31);
     sender.flush();
     CHECK(server.recv() == 1);
     CHECK(server.msgs().front() == "test,t1=v1,t2= f1=0.5 10000000\n");
@@ -390,10 +388,9 @@ TEST_CASE("Bad interface")
 {
     try
     {
-        questdb::ilp::line_sender sender{
-            "localhost",
-            "9009",
-            "dummy_hostname"};
+        questdb::ilp::opts opts{"localhost", "9009"};
+        opts.net_interface("dummy_hostname");
+        questdb::ilp::line_sender sender{opts};
         CHECK_MESSAGE(false, "Expected exception");
     }
     catch (const questdb::ilp::line_sender_error& se)
@@ -459,32 +456,22 @@ TEST_CASE("Bad connect")
     }
 }
 
-void check_invalid_ca_set(questdb::ilp::tls tls, std::string_view exp_msg) {
+TEST_CASE("Bad CA path")
+{
     try
     {
-        questdb::ilp::sec_opts sec_opts{tls, "/a/path/to/ca.pem"};
-        questdb::ilp::line_sender sender{"localhost", 1, sec_opts};
+        questdb::ilp::test::mock_server server;
+        questdb::ilp::opts opts{"localhost", server.port()};
+        opts.tls("/an/invalid/path/to/ca.pem");
+        questdb::ilp::line_sender sender{opts};
     }
     catch(const questdb::ilp::line_sender_error& se)
     {
         std::string msg{se.what()};
-        CHECK_EQ(msg, exp_msg);
+        CHECK(msg.rfind("Could not open certificate authority file", 0) == 0);
     }
     catch (...)
     {
         CHECK_MESSAGE(false, "Other exception raised.");
     }
-}
-
-
-TEST_CASE("Invalid TLS CA set")
-{
-    check_invalid_ca_set(
-        questdb::ilp::tls::disabled,
-        ("Invalid configuration: `tls_ca` was specified "
-          "despite setting TLS as disabled."));
-    check_invalid_ca_set(
-        questdb::ilp::tls::insecure_skip_verify,
-        ("Invalid configuration: `tls_ca` was specified but has "
-         "no meaning when TLS is set to `insecure_skip_verify`."));
 }

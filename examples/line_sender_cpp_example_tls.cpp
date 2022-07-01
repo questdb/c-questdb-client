@@ -11,16 +11,23 @@ static bool example(
 {
     try
     {
+        questdb::ilp::opts opts{host, port};
+
+        // This example uses a custom certificate authority file.
+        // You can use the default certificate authority by calling the `.tls()`
+        // overload that takes no arguments.
+        opts.tls(ca_path);
+
         // Follow our authentication documentation to generate your own keys:
         // https://questdb.io/docs/reference/api/ilp/authenticate
-        questdb::ilp::sec_opts sec_opts{
-            "testUser1",  // auth_key_id
-            "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48",  // auth_priv_key
-            "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU",  // auth_pub_key_x
-            "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac",  // auth_pub_key_y
-            questdb::ilp::tls::enabled,
-            ca_path};  // Required only for self-signed certificates.
-        questdb::ilp::line_sender sender{host, port, sec_opts};
+        opts.auth(
+            "testUser1",  // key_id
+            "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48",  // priv_key
+            "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU",  // pub_key_x
+            "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac");  // pub_key_y
+
+        // Connect.
+        questdb::ilp::line_sender sender{opts};
 
         // We prepare all our table names and column names in advance.
         // If we're inserting multiple rows, this allows us to avoid

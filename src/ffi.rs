@@ -513,7 +513,9 @@ pub unsafe extern "C" fn line_sender_opts_clone(
 pub unsafe extern "C" fn line_sender_opts_free(
     opts: *mut line_sender_opts)
 {
-    drop(Box::from_raw(opts));
+    if !opts.is_null() {
+        drop(Box::from_raw(opts));
+    }
 }
 
 /// Insert data into QuestDB via the InfluxDB Line Protocol.

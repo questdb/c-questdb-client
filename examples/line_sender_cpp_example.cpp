@@ -8,6 +8,7 @@ static bool example(std::string_view host, std::string_view port)
 {
     try
     {
+        // Connect.
         questdb::ilp::line_sender sender{host, port};
 
         // We prepare all our table names and column names in advance.

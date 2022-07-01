@@ -6,18 +6,31 @@
 static bool example(const char* host, const char* port)
 {
     line_sender_error* err = NULL;
+    line_sender_opts* opts = NULL;
     line_sender* sender = NULL;
+
+    // Call `line_sender_opts_new` if instead you have an integer port.
+    opts = line_sender_opts_new_service(host, port, &err);
+    if (!opts)
+        goto on_error;
 
     // Follow our authentication documentation to generate your own keys:
     // https://questdb.io/docs/reference/api/ilp/authenticate
-    line_sender_sec_opts sec_opts;
-    memset(&sec_opts, 0, sizeof(sec_opts));
-    sec_opts.auth_key_id = "testUser1";
-    sec_opts.auth_priv_key = "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48";
-    sec_opts.auth_pub_key_x = "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU";
-    sec_opts.auth_pub_key_y = "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac";
+    if (!line_sender_opts_auth(
+        opts,
+        "testUser1",                                    // key_id      (kid)
+        "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48",  // priv_key    (d)
+        "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU",  // pub_key_x   (x)
+        "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac",  // pub_key_y   (y)
+        &err))
+        goto on_error;
 
-    sender = line_sender_connect_secure("0.0.0.0", host, port, &sec_opts, &err);
+    sender = line_sender_connect(opts, &err);
+    line_sender_opts_free(opts);
+    if (!sender)
+        goto on_error;
+
+    sender = line_sender_connect(opts, &err);
     if (!sender)
         goto on_error;
 
@@ -102,6 +115,7 @@ static bool example(const char* host, const char* port)
     return true;
 
 on_error: ;
+    line_sender_opts_free(opts);
     size_t err_len = 0;
     const char* err_msg = line_sender_error_msg(err, &err_len);
     fprintf(stderr, "Error running example: %.*s\n", (int)err_len, err_msg);

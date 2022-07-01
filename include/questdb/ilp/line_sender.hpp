@@ -37,6 +37,7 @@ namespace questdb::ilp
     constexpr const char* inaddr_any = "0.0.0.0";
 
     class line_sender;
+    class opts;
 
     /** Category of error. */
     enum class line_sender_error_code
@@ -95,7 +96,7 @@ namespace questdb::ilp
         }
 
         template <typename F, typename... Args>
-        inline static auto wrapped_call(F&&, Args&&... args)
+        inline static auto wrapped_call(F&& f, Args&&... args)
         {
             ::line_sender_error* c_err{nullptr};
             auto obj = f(std::forward<Args>(args)..., &c_err);
@@ -106,7 +107,7 @@ namespace questdb::ilp
         }
 
         friend class line_sender;
-        friend class line_sender_opts;
+        friend class opts;
 
         template <
             typename T,
@@ -468,6 +469,21 @@ namespace questdb::ilp
     class line_sender
     {
     public:
+        line_sender(std::string_view host, uint16_t port)
+            : line_sender{opts{host, port}}
+        {
+        }
+
+        line_sender(std::string_view host, std::string_view port)
+            : line_sender{opts{host, port}}
+        {
+        }
+
+        line_sender(const char* host, const char* port)
+            : line_sender{opts{host, port}}
+        {
+        }
+
         line_sender(const opts& opts)
             : _impl{nullptr}
         {
