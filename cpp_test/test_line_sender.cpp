@@ -475,3 +475,28 @@ TEST_CASE("Bad CA path")
         CHECK_MESSAGE(false, "Other exception raised.");
     }
 }
+
+TEST_CASE("Opts copy ctor, assignment and move testing.")
+{
+    {
+        questdb::ilp::opts opts1{"localhost", "9009"};
+        questdb::ilp::opts opts2{std::move(opts1)};
+    }
+
+    {
+        questdb::ilp::opts opts1{"localhost", "9009"};
+        questdb::ilp::opts opts2{opts1};
+    }
+
+    {
+        questdb::ilp::opts opts1{"localhost", "9009"};
+        questdb::ilp::opts opts2{"altavista.digital.com", "9009"};
+        opts1 = std::move(opts2);
+    }
+
+    {
+        questdb::ilp::opts opts1{"localhost", "9009"};
+        questdb::ilp::opts opts2{"altavista.digital.com", "9009"};
+        opts1 = opts2;
+    }
+}
