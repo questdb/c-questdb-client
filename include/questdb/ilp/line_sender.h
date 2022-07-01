@@ -278,8 +278,14 @@ void line_sender_opts_max_name_len(
     size_t value);
 
 /**
- * Release the opts object.
+ * Duplicate the opts object.
+ * Both old and new objects will have to be freed.
  */
+LINESENDER_API
+line_sender_opts* line_sender_opts_clone(
+    line_sender_opts* opts);
+
+/** Release the opts object. */
 LINESENDER_API
 void line_sender_opts_free(line_sender_opts* opts);
 
@@ -287,6 +293,7 @@ void line_sender_opts_free(line_sender_opts* opts);
  * Synchronously connect to the QuestDB database.
  * The connection should be accessed by only a single thread a time.
  * @param[in] opts Options for the connection.
+ * @note The opts object is freed.
  */
 LINESENDER_API
 line_sender *line_sender_connect(

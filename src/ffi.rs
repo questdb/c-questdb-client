@@ -497,6 +497,17 @@ pub unsafe extern "C" fn line_sender_opts_max_name_len(
     upd_opts!(opts, max_name_len, value);
 }
 
+/// Duplicate the opts object.
+/// Both old and new objects will have to be freed.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_clone(
+    opts: *const line_sender_opts) -> *mut line_sender_opts
+{
+    let builder = &(*opts).0;
+    let new_builder = builder.clone();
+    Box::into_raw(Box::new(line_sender_opts(new_builder)))
+}
+
 /// Release the opts object.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_opts_free(
