@@ -51,15 +51,26 @@ Once you've all set up, you can take a look at our examples:
 ...
 
 line_sender_error* err = NULL;
-line_sender* sender = line_sender_connect(
-  "0.0.0.0",   // bind to all interfaces
-  "localhost", // QuestDB hostname
-  "9009",      // QuestDB port
-  &err);
+line_sender_opts* opts = NULL;
+line_sender* sender = NULL;
+
+opts = line_sender_opts_new(
+    "localhost", 9009, &err);
+if (!opts) {
+    /* ... handle error ... */
+}
+
+sender = line_sender_connect(opts, &err);
+line_sender_opts_free(opts);
+opts = NULL;
+if (!sender) {
+    /* ... handle error ... */
+}
+
 ```
 
-Additionally, there's a `line_sender_connect_secure` function that takes a
-`line_sender_sec_opts` struct with authentication and TLS options.
+The `opts` object can additionally take parameters for the outbound interface,
+authentication, full-connection encryption via TLS and more.
 
 Examples:
 * [Basic example in C](examples/line_sender_c_example.c).
@@ -75,13 +86,15 @@ Examples:
 
 // Automatically connects on object construction.
 questdb::ilp::line_sender sender{
-  "localhost",  // QuestDB hostname
-  "9009"};      // QuestDB port
+    "localhost",  // QuestDB hostname
+    9009};        // QuestDB port
 
 ```
 
-Additionally, there are constructor overloads that accept int ports and a
-`sec_opts` object with authentication and TLS options.
+For more advanced use cases, such as those requiring authentication or
+full-connection encryption via TLS, first, create an `opts` object then call its
+methods to populate its options and then pass the `opts` object to the
+`line_sender` constructor.
 
 Examples:
 * [Basic example in C++](examples/line_sender_cpp_example.cpp).
@@ -111,9 +124,10 @@ The `line_sender_close(sender)` function will release memory and therefore
 must be called exactly once per created object.
 
 In the C API, functions that can result in errors take a `line_sender_error**`
-parameter as last argument. When calling such functions you must check the
+parameter as the last argument. When calling such functions you must check the
 return value for errors. Functions that return `bool` use `false` to indicate
-a failure.
+a failure, whilst functions that return a pointer use NULL as the failure
+sentinel value.
 
 You may then call `line_sender_error_msg(err)` and
 `line_sender_error_get_code(err)` to extract error details.
