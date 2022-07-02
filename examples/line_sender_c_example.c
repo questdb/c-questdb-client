@@ -15,6 +15,8 @@ static bool example(const char* host, const char* port)
         goto on_error;
 
     sender = line_sender_connect(opts, &err);
+    line_sender_opts_free(opts);
+    opts = NULL;
     if (!sender)
         goto on_error;
 
@@ -104,8 +106,7 @@ on_error: ;
     const char* err_msg = line_sender_error_msg(err, &err_len);
     fprintf(stderr, "Error running example: %.*s\n", (int)err_len, err_msg);
     line_sender_error_free(err);
-    if (sender)
-        line_sender_close(sender);
+    line_sender_close(sender);
     return false;
 }
 

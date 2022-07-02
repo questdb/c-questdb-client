@@ -579,7 +579,7 @@ class TestLineSender(unittest.TestCase):
             QDB_FIXTURE.host,
             TLS_PROXY_FIXTURE.listen_port,
             auth=AUTH if QDB_FIXTURE.auth else None,
-            tls=qls.Tls.InsecureSkipVerify)
+            tls='insecure_skip_verify')
         self._test_single_symbol_impl(sender)
 
 

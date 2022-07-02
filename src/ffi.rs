@@ -148,7 +148,9 @@ pub unsafe extern "C" fn line_sender_error_msg(error: *const line_sender_error, 
 /// Clean up the error.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_error_free(error: *mut line_sender_error) {
-    drop(Box::from_raw(error));
+    if !error.is_null() {
+        drop(Box::from_raw(error));
+    }
 }
 
 /// Non-owning validated UTF-8 encoded string.
@@ -556,7 +558,9 @@ pub unsafe extern "C" fn line_sender_must_close(sender: *const line_sender) -> b
 /// @param[in] sender Line sender object.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_close(sender: *mut line_sender) {
-    drop(Box::from_raw(sender));
+    if !sender.is_null() {
+        drop(Box::from_raw(sender));
+    }
 }
 
 /// Start batching the next row of input for the named table.
