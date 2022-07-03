@@ -11,12 +11,12 @@ static bool example(const char* host, const char* port)
 
     // Declare and validate a UTF-8 string from a `const char*`.
     // This macro expands to:
-    //     line_sender_utf8 hostname;
-    //     const char* hostname____STR_EXPR = (host);
+    //     line_sender_utf8 host_utf8;
+    //     const char* host_utf8____STR_EXPR = (host);
     //     if (!line_sender_utf8_init(
-    //             &table_name,
-    //             strlen(hostname____STR_EXPR),
-    //             hostname____STR_EXPR,
+    //             &host_utf8,
+    //             strlen(host_utf8____STR_EXPR),
+    //             host_utf8____STR_EXPR,
     //             &err))
     //         goto on_error;
     QDB_UTF_8_FROM_STR_OR(host_utf8, host, &err)
