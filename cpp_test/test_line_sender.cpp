@@ -54,8 +54,9 @@ TEST_CASE("line_sender c api basics")
             if (err)
                 ::line_sender_error_free(err);
         }};
-    ::line_sender_opts* opts = ::line_sender_opts_new(
-        "localhost", server.port(), &err);
+    ::line_sender_utf8 host;
+    CHECK(::line_sender_utf8_init(&host, 9, "localhost", &err));
+    ::line_sender_opts* opts = ::line_sender_opts_new(host, server.port());
     CHECK_NE(opts, nullptr);
     ::line_sender* sender = ::line_sender_connect(opts, &err);
     line_sender_opts_free(opts);
@@ -104,7 +105,7 @@ TEST_CASE("line_sender c++ api basics")
     questdb::ilp::test::mock_server server;
     questdb::ilp::line_sender sender{
         std::string("localhost"),
-        std::to_string(server.port()).c_str()};
+        std::to_string(server.port())};
     CHECK_FALSE(sender.must_close());
     server.accept();
     CHECK(server.recv() == 0);
@@ -128,7 +129,7 @@ TEST_CASE("test multiple lines")
     questdb::ilp::test::mock_server server;
     questdb::ilp::line_sender sender{
         "localhost",
-        std::to_string(server.port()).c_str()};
+        server.port()};
     CHECK_FALSE(sender.must_close());
     server.accept();
     CHECK(server.recv() == 0);
@@ -167,8 +168,8 @@ TEST_CASE("State machine testing -- flush without data.")
 {
     questdb::ilp::test::mock_server server;
     questdb::ilp::line_sender sender{
-        "localhost",
-        std::to_string(server.port()).c_str()};
+        std::string_view{"localhost"},
+        std::to_string(server.port())};
 
     CHECK(sender.pending_size() == 0);
     CHECK_THROWS_WITH_AS(
@@ -185,8 +186,8 @@ TEST_CASE("One symbol only - flush before server accept")
 {
     questdb::ilp::test::mock_server server;
     questdb::ilp::line_sender sender{
-        "localhost",
-        std::to_string(server.port()).c_str()};
+        std::string{"localhost"},
+        server.port()};
 
     // Does not raise - this is unlike InfluxDB spec that disallows this.
     sender.table("test").symbol("t1", std::string{"v1"}).at_now();
@@ -340,9 +341,12 @@ TEST_CASE("Move testing.")
     questdb::ilp::test::mock_server server1;
     questdb::ilp::test::mock_server server2;
 
+    questdb::ilp::utf8_view host{"localhost"};
+    const questdb::ilp::utf8_view& host_ref = host;
+
     questdb::ilp::line_sender sender1{
-        "localhost",
-        std::to_string(server1.port()).c_str()};
+        host_ref,
+        server1.port()};
 
     CHECK_THROWS_AS(
         sender1.at_now(),
@@ -356,7 +360,7 @@ TEST_CASE("Move testing.")
 
     questdb::ilp::line_sender sender3{
         "localhost",
-        std::to_string(server2.port()).c_str()};
+        server2.port()};
     sender3.table("test");
     CHECK(sender3.pending_size() == 4);
     CHECK_FALSE(sender3.must_close());

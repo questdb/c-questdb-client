@@ -43,7 +43,7 @@ from ctypes import (
     c_void_p,
     c_ssize_t)
 
-from typing import Literal, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 
 
 class c_line_sender(ctypes.Structure):
@@ -133,15 +133,13 @@ def _setup_cdll():
     set_sig(
         dll.line_sender_opts_new,
         c_line_sender_opts_p,
-        c_char_p,
-        c_uint16,
-        c_line_sender_error_p_p)
+        c_line_sender_utf8,
+        c_uint16)
     set_sig(
         dll.line_sender_opts_new_service,
         c_line_sender_opts_p,
-        c_char_p,
-        c_char_p,
-        c_line_sender_error_p_p)
+        c_line_sender_utf8,
+        c_line_sender_utf8)
     set_sig(
         dll.line_sender_opts_capacity,
         None,
@@ -149,29 +147,26 @@ def _setup_cdll():
         c_size_t)
     set_sig(
         dll.line_sender_opts_net_interface,
-        c_bool,
+        None,
         c_line_sender_opts_p,
-        c_char_p,
-        c_line_sender_error_p)
+        c_line_sender_utf8)
     set_sig(
         dll.line_sender_opts_auth,
-        c_bool,
+        None,
         c_line_sender_opts_p,
-        c_char_p,
-        c_char_p,
-        c_char_p,
-        c_char_p,
-        c_line_sender_error_p_p)
+        c_line_sender_utf8,
+        c_line_sender_utf8,
+        c_line_sender_utf8,
+        c_line_sender_utf8)
     set_sig(
         dll.line_sender_opts_tls,
         None,
         c_line_sender_opts_p)
     set_sig(
         dll.line_sender_opts_tls_ca,
-        c_bool,
+        None,
         c_line_sender_opts_p,
-        c_char_p,
-        c_line_sender_error_p_p)
+        c_line_sender_utf8)
     set_sig(
         dll.line_sender_opts_tls_insecure_skip_verify,
         None,
@@ -365,20 +360,16 @@ def _fully_qual_name(obj):
 
 class _Opts:
     def __init__(self, host, port):
-        host = str(host)
-        port = str(port)
-        chost = c_char_p(host.encode('utf-8'))
-        cport = c_char_p(port.encode('utf-8'))
         self.impl = _error_wrapped_call(
             _DLL.line_sender_opts_new_service,
-            chost,
-            cport)
+            _utf8(str(host)),
+            _utf8(str(port)))
 
     def __getattr__(self, name: str):
         fn = getattr(_DLL, 'line_sender_opts_' + name)
         def wrapper(*args):
             mapped_args = [
-                (arg.encode('utf-8') if isinstance(arg, str) else arg)
+                (_utf8(arg) if isinstance(arg, str) else arg)
                 for arg in args]
             if fn.argtypes[-1] == c_line_sender_error_p_p:
                 return _error_wrapped_call(fn, self.impl, *mapped_args)
@@ -402,15 +393,18 @@ class LineSender:
             *,
             interface: Optional[str] = None,
             auth: Optional[Tuple[str, str, str, str]] = None,
-            tls: Union[bool, str, Literal['insecure_skip_verify']] = False,
+            tls: Union[bool, str] = False,
             capacity: Optional[int] = None,
             read_timeout: Optional[int] = None,
             max_name_len: Optional[int] = None):
+
         opts = _Opts(host, port)
         if interface:
             opts.net_interface(interface)
+
         if auth:
             opts.auth(*auth)
+
         if tls:
             if tls is True:
                 opts.tls()
@@ -418,12 +412,16 @@ class LineSender:
                 opts.tls_insecure_skip_verify()
             else:
                 opts.tls_ca(str(tls))
+
         if capacity is not None:
             opts.capacity(capacity)
+
         if read_timeout is not None:
             opts.read_timeout(read_timeout)
+
         if max_name_len is not None:
             opts.max_name_len(max_name_len)
+
         self._opts = opts
         self._impl = None
 

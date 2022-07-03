@@ -165,6 +165,7 @@ namespace questdb::ilp
         T _impl;
 
         friend class line_sender;
+        friend class opts;
     };
 
     using utf8_view = basic_view<
@@ -224,48 +225,51 @@ namespace questdb::ilp
              * @param[in] port The QuestDB database port.
              */
             opts(
-                std::string_view host,
-                uint16_t port)
-                : opts{host.data(), port}
+                utf8_view host,
+                uint16_t port) noexcept
+                : _impl{::line_sender_opts_new(host._impl, port)}
             {}
 
             /**
              * A new set of options for a line sender connection.
              * @param[in] host The QuestDB database host.
-             * @param[in] port The QuestDB database port.
+             * @param[in] port The QuestDB database port as service name.
              */
             opts(
-                const char* host,
-                uint16_t port)
-                : _impl{nullptr}
+                utf8_view host,
+                utf8_view port) noexcept
+                : _impl{::line_sender_opts_new_service(host._impl, port._impl)}
+            {}
+
+            opts(const opts& other)
+                : _impl{::line_sender_opts_clone(other._impl)}
+            {}
+
+            opts(opts&& other) noexcept
+                : _impl{other._impl}
             {
-                _impl = line_sender_error::wrapped_call(
-                    ::line_sender_opts_new, host, port);
+                other._impl = nullptr;
             }
 
-            /**
-             * A new set of options for a line sender connection.
-             * @param[in] host The QuestDB database host.
-             * @param[in] port The QuestDB database port as service name.
-             */
-            opts(
-                std::string_view host,
-                std::string_view port)
-                : opts{host.data(), port.data()}
-            {}
-
-            /**
-             * A new set of options for a line sender connection.
-             * @param[in] host The QuestDB database host.
-             * @param[in] port The QuestDB database port as service name.
-             */
-            opts(
-                const char* host,
-                const char* port)
-                : _impl{nullptr}
+            opts& operator=(const opts& other)
             {
-                _impl = line_sender_error::wrapped_call(
-                    ::line_sender_opts_new_service, host, port);
+                if (this != &other)
+                {
+                    reset();
+                    _impl = ::line_sender_opts_clone(other._impl);
+                }
+                return *this;
+            }
+
+            opts& operator=(opts&& other) noexcept
+            {
+                if (this != &other)
+                {
+                    reset();
+                    _impl = other._impl;
+                    other._impl = nullptr;
+                }
+                return *this;
             }
 
             /**
@@ -279,18 +283,11 @@ namespace questdb::ilp
             }
 
             /** Select local outbound interface. */
-            opts& net_interface(std::string_view net_interface)
+            opts& net_interface(utf8_view net_interface) noexcept
             {
-                return this->net_interface(net_interface.data());
-            }
-
-            /** Select local outbound interface. */
-            opts& net_interface(const char* net_interface)
-            {
-                line_sender_error::wrapped_call(
-                    ::line_sender_opts_net_interface,
+                ::line_sender_opts_net_interface(
                     _impl,
-                    net_interface);
+                    net_interface._impl);
                 return *this;
             }
 
@@ -302,38 +299,17 @@ namespace questdb::ilp
              * @param[in] pub_key_y Public key Y coordinate. AKA "y".
              */
             opts& auth(
-                std::string_view key_id,
-                std::string_view priv_key,
-                std::string_view pub_key_x,
-                std::string_view pub_key_y)
+                utf8_view key_id,
+                utf8_view priv_key,
+                utf8_view pub_key_x,
+                utf8_view pub_key_y) noexcept
             {
-                return this->auth(
-                    key_id.data(),
-                    priv_key.data(),
-                    pub_key_x.data(),
-                    pub_key_y.data());
-            }
-
-            /**
-             * Authentication Parameters.
-             * @param[in] key_id Key id. AKA "kid"
-             * @param[in] priv_key Private key. AKA "d".
-             * @param[in] pub_key_x Public key X coordinate. AKA "x".
-             * @param[in] pub_key_y Public key Y coordinate. AKA "y".
-             */
-            opts& auth(
-                const char* key_id,
-                const char* priv_key,
-                const char* pub_key_x,
-                const char* pub_key_y)
-            {
-                line_sender_error::wrapped_call(
-                    ::line_sender_opts_auth,
+                ::line_sender_opts_auth(
                     _impl,
-                    key_id,
-                    priv_key,
-                    pub_key_x,
-                    pub_key_y);
+                    key_id._impl,
+                    priv_key._impl,
+                    pub_key_x._impl,
+                    pub_key_y._impl);
                 return *this;
             }
 
@@ -353,22 +329,9 @@ namespace questdb::ilp
              * The connection will accept certificates by the specified certificate
              * authority file.
              */
-            opts& tls(std::string_view ca_file)
+            opts& tls(utf8_view ca_file) noexcept
             {
-                return this->tls(ca_file.data());
-            }
-
-            /**
-             * Enable full connection encryption via TLS.
-             * The connection will accept certificates by the specified certificate
-             * authority file.
-             */
-            opts& tls(const char* ca_file)
-            {
-                line_sender_error::wrapped_call(
-                    ::line_sender_opts_tls_ca,
-                    _impl,
-                    ca_file);
+                ::line_sender_opts_tls_ca(_impl, ca_file._impl);
                 return *this;
             }
 
@@ -407,41 +370,6 @@ namespace questdb::ilp
                 return *this;
             }
 
-            opts(opts&& other) noexcept
-            {
-                if (this != &other)
-                {
-                    _impl = other._impl;
-                    other._impl = nullptr;
-                }
-            }
-
-            opts& operator=(opts&& other) noexcept
-            {
-                if (this != &other)
-                {
-                    reset();
-                    _impl = other._impl;
-                    other._impl = nullptr;
-                }
-                return *this;
-            }
-
-            opts(const opts& other)
-                : _impl{::line_sender_opts_clone(other._impl)}
-            {
-            }
-
-            opts& operator=(const opts& other)
-            {
-                if (this != &other)
-                {
-                    reset();
-                    _impl = ::line_sender_opts_clone(other._impl);
-                }
-                return *this;
-            }
-
             ~opts() noexcept
             {
                 reset();
@@ -469,34 +397,28 @@ namespace questdb::ilp
     class line_sender
     {
     public:
-        line_sender(std::string_view host, uint16_t port)
+        line_sender(utf8_view host, uint16_t port)
             : line_sender{opts{host, port}}
-        {
-        }
+        {}
 
-        line_sender(std::string_view host, std::string_view port)
+        line_sender(utf8_view host, utf8_view port)
             : line_sender{opts{host, port}}
-        {
-        }
-
-        line_sender(const char* host, const char* port)
-            : line_sender{opts{host, port}}
-        {
-        }
+        {}
 
         line_sender(const opts& opts)
-            : _impl{nullptr}
-        {
-            _impl = line_sender_error::wrapped_call(
-                ::line_sender_connect, opts._impl);
-        }
+            : _impl{line_sender_error::wrapped_call(
+                ::line_sender_connect, opts._impl)}
+        {}
+
+        line_sender(const line_sender&) = delete;
 
         line_sender(line_sender&& other) noexcept
             : _impl{other._impl}
         {
-            if (this != &other)
-                other._impl = nullptr;
+            other._impl = nullptr;
         }
+
+        line_sender& operator=(const line_sender&) = delete;
 
         line_sender& operator=(line_sender&& other) noexcept
         {
@@ -508,9 +430,6 @@ namespace questdb::ilp
             }
             return *this;
         }
-
-        line_sender(const line_sender&) = delete;
-        line_sender& operator=(const line_sender&) = delete;
 
         /**
          * Start batching the next row of input for the named table.

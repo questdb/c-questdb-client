@@ -9,22 +9,55 @@ static bool example(const char* host, const char* port)
     line_sender_opts* opts = NULL;
     line_sender* sender = NULL;
 
+    // Declare and validate a UTF-8 string from a `const char*`.
+    // This macro expands to:
+    //     line_sender_utf8 hostname;
+    //     const char* hostname____STR_EXPR = (host);
+    //     if (!line_sender_utf8_init(
+    //             &table_name,
+    //             strlen(hostname____STR_EXPR),
+    //             hostname____STR_EXPR,
+    //             &err))
+    //         goto on_error;
+    QDB_UTF_8_FROM_STR_OR(host_utf8, host, &err)
+        goto on_error;
+
+    QDB_UTF_8_FROM_STR_OR(port_utf8, port, &err)
+        goto on_error;
+
     // Call `line_sender_opts_new` if instead you have an integer port.
-    opts = line_sender_opts_new_service(host, port, &err);
-    if (!opts)
+    opts = line_sender_opts_new_service(host_utf8, port_utf8);
+
+    QDB_UTF8_FROM_LIT_OR(
+            key_id,
+            "testUser1",
+            &err)
         goto on_error;
 
-    // Follow our authentication documentation to generate your own keys:
-    // https://questdb.io/docs/reference/api/ilp/authenticate
-    if (!line_sender_opts_auth(
+    QDB_UTF8_FROM_LIT_OR(
+            priv_key,
+            "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48",
+            &err)
+        goto on_error;
+
+    QDB_UTF8_FROM_LIT_OR(
+            pub_key_x,
+            "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU",
+            &err)
+        goto on_error;
+
+    QDB_UTF8_FROM_LIT_OR(
+            pub_key_y,
+            "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac",
+            &err)
+        goto on_error;
+
+    line_sender_opts_auth(
         opts,
-        "testUser1",                                    // key_id      (kid)
-        "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48",  // priv_key    (d)
-        "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU",  // pub_key_x   (x)
-        "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac",  // pub_key_y   (y)
-        &err))
-        goto on_error;
-
+        key_id,      // kid
+        priv_key,    // d
+        pub_key_x,   // x
+        pub_key_y);  // y
     sender = line_sender_connect(opts, &err);
     line_sender_opts_free(opts);
     opts = NULL;
@@ -34,43 +67,41 @@ static bool example(const char* host, const char* port)
     // We prepare all our table names and column names in advance.
     // If we're inserting multiple rows, this allows us to avoid
     // re-validating the same strings over and over again.
-    line_sender_table_name table_name;
-    if (!line_sender_table_name_init(&table_name, 11, "c_cars_auth", &err))
+
+    // This macro expands to:
+    //     line_sender_table_name table_name;
+    //     if (!line_sender_table_name_init(
+    //             &table_name,
+    //             sizeof("c_cars_auth") - 1,
+    //             "c_cars_auth",
+    //             &err))
+    //         goto on_error;
+    QDB_TABLE_NAME_FROM_LIT_OR(table_name, "c_cars_auth", &err)
         goto on_error;
 
-    line_sender_column_name id_name;
-    if (!line_sender_column_name_init(&id_name, 2, "id", &err))
+    // Same, but for the `line_sender_column_name` type.
+    QDB_COLUMN_NAME_FROM_LIT_OR(id_name, "id", &err)
         goto on_error;
 
-    line_sender_column_name x_name;
-    if (!line_sender_column_name_init(&x_name, 1, "x", &err))
+    QDB_COLUMN_NAME_FROM_LIT_OR(x_name, "x", &err)
         goto on_error;
 
-    line_sender_column_name y_name;
-    if (!line_sender_column_name_init(&y_name, 1, "y", &err))
+    QDB_COLUMN_NAME_FROM_LIT_OR(y_name, "y", &err)
         goto on_error;
 
-    line_sender_column_name booked_name;
-    if (!line_sender_column_name_init(&booked_name, 6, "booked", &err))
+    QDB_COLUMN_NAME_FROM_LIT_OR(booked_name, "booked", &err)
         goto on_error;
 
-    line_sender_column_name passengers_name;
-    if (!line_sender_column_name_init(&passengers_name, 10, "passengers", &err))
+    QDB_COLUMN_NAME_FROM_LIT_OR(passengers_name, "passengers", &err)
         goto on_error;
 
-    line_sender_column_name driver_name;
-    if (!line_sender_column_name_init(&driver_name, 6, "driver", &err))
+    QDB_COLUMN_NAME_FROM_LIT_OR(driver_name, "driver", &err)
         goto on_error;
 
     if (!line_sender_table(sender, table_name, &err))
         goto on_error;
 
-    line_sender_utf8 id_value;
-    if (!line_sender_utf8_init(
-        &id_value,
-        36,
-        "d6e5fe92-d19f-482a-a97a-c105f547f721",
-        &err))
+    QDB_UTF8_FROM_LIT_OR(id_value, "d6e5fe92-d19f-482a-a97a-c105f547f721", &err)
         goto on_error;
 
     if (!line_sender_symbol(sender, id_name, id_value, &err))
@@ -88,12 +119,7 @@ static bool example(const char* host, const char* port)
     if (!line_sender_column_i64(sender, passengers_name, 3, &err))
         goto on_error;
 
-    line_sender_utf8 driver_value;
-    if (!line_sender_utf8_init(
-        &driver_value,
-        12,
-        "Ranjit Singh",
-        &err))
+    QDB_UTF8_FROM_LIT_OR(driver_value, "Ranjit Singh", &err)
         goto on_error;
 
     if (!line_sender_column_str(sender, driver_name, driver_value, &err))

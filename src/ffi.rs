@@ -28,8 +28,7 @@ use std::convert::{From, Into};
 use std::path::PathBuf;
 use std::slice;
 use std::str;
-use std::ffi::CStr;
-use libc::c_char;
+use libc::{c_char, size_t};
 use std::ptr;
 
 use super::{
@@ -41,19 +40,6 @@ use super::{
     LineSenderBuilder,
     Tls,
     CertificateAuthority};
-
-macro_rules! c_str_to_ref {
-    ($c_str:expr, $err_out:expr, $sentinel:expr) => {
-        if let Some(str_ref) = unwrap_utf8(
-                CStr::from_ptr($c_str).to_bytes(),
-                $err_out) {
-            str_ref
-        }
-        else {
-            return $sentinel;
-        }
-    }
-}
 
 macro_rules! bubble_err_to_c {
     ($err_out:expr, $expression:expr) => {
@@ -139,7 +125,7 @@ pub unsafe extern "C" fn line_sender_error_get_code(error: *const line_sender_er
 
 /// ASCII encoded error message. Never returns NULL.
 #[no_mangle]
-pub unsafe extern "C" fn line_sender_error_msg(error: *const line_sender_error, len_out: *mut libc::size_t) -> *const c_char {
+pub unsafe extern "C" fn line_sender_error_msg(error: *const line_sender_error, len_out: *mut size_t) -> *const c_char {
     let msg: &str = &(&*error).0.msg;
     *len_out = msg.len();
     msg.as_ptr() as *mut i8
@@ -159,7 +145,7 @@ pub unsafe extern "C" fn line_sender_error_free(error: *mut line_sender_error) {
 pub struct line_sender_utf8 {
     /// Don't initialize fields directly.
     /// Call `line_sender_utf8_init` instead.
-    len: libc::size_t,
+    len: size_t,
     buf: *const c_char
 }
 
@@ -249,7 +235,7 @@ unsafe fn unwrap_utf8(buf: &[u8], err_out: *mut *mut line_sender_error) -> Optio
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_utf8_init(
     string: *mut line_sender_utf8,
-    len: libc::size_t,
+    len: size_t,
     buf: *const c_char,
     err_out: *mut *mut line_sender_error) -> bool
 {
@@ -271,7 +257,7 @@ pub struct line_sender_table_name
 {
     /// Don't initialize fields directly.
     /// Call `line_sender_table_name_init` instead.
-    len: libc::size_t,
+    len: size_t,
     buf: *const c_char
 }
 
@@ -290,7 +276,7 @@ pub struct line_sender_column_name
 {
     /// Don't initialize fields directly.
     /// Call `line_sender_column_name_init` instead.
-    len: libc::size_t,
+    len: size_t,
     buf: *const c_char
 }
 
@@ -313,7 +299,7 @@ impl line_sender_column_name {
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_table_name_init(
     name: *mut line_sender_table_name,
-    len: libc::size_t,
+    len: size_t,
     buf: *const c_char,
     err_out: *mut *mut line_sender_error) -> bool
 {
@@ -343,7 +329,7 @@ pub unsafe extern "C" fn line_sender_table_name_init(
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_column_name_init(
     name: *mut line_sender_column_name,
-    len: libc::size_t,
+    len: size_t,
     buf: *const c_char,
     err_out: *mut *mut line_sender_error) -> bool
 {
@@ -370,12 +356,10 @@ pub struct line_sender_opts(LineSenderBuilder);
 /// @param[in] port The QuestDB database port.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_opts_new(
-    host: *const libc::c_char,
-    port: u16,
-    err_out: *mut *mut line_sender_error) -> *mut line_sender_opts
+    host: line_sender_utf8,
+    port: u16) -> *mut line_sender_opts
 {
-    let host: &str = c_str_to_ref!(host, err_out, ptr::null_mut());
-    let builder = LineSenderBuilder::new(host, port);
+    let builder = LineSenderBuilder::new(host.as_str(), port);
     Box::into_raw(Box::new(line_sender_opts(builder)))
 }
 
@@ -384,13 +368,10 @@ pub unsafe extern "C" fn line_sender_opts_new(
 /// @param[in] port The QuestDB database port as service name.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_opts_new_service(
-    host: *const libc::c_char,
-    port: *const libc::c_char,
-    err_out: *mut *mut line_sender_error) -> *mut line_sender_opts
+    host: line_sender_utf8,
+    port: line_sender_utf8) -> *mut line_sender_opts
 {
-    let host: &str = c_str_to_ref!(host, err_out, ptr::null_mut());
-    let port: &str = c_str_to_ref!(port, err_out, ptr::null_mut());
-    let builder = LineSenderBuilder::new(host, port);
+    let builder = LineSenderBuilder::new(host.as_str(), port.as_str());
     Box::into_raw(Box::new(line_sender_opts(builder)))
 }
 
@@ -399,7 +380,7 @@ pub unsafe extern "C" fn line_sender_opts_new_service(
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_opts_capacity(
     opts: *mut line_sender_opts,
-    capacity: libc::size_t)
+    capacity: size_t)
 {
     upd_opts!(opts, capacity, capacity);
 }
@@ -408,12 +389,9 @@ pub unsafe extern "C" fn line_sender_opts_capacity(
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_opts_net_interface(
     opts: *mut line_sender_opts,
-    net_interface: *const libc::c_char,
-    err_out: *mut *mut line_sender_error) -> bool
+    net_interface: line_sender_utf8)
 {
-    let net_interface: &str = c_str_to_ref!(net_interface, err_out, false);
-    upd_opts!(opts, net_interface, net_interface);
-    true
+    upd_opts!(opts, net_interface, net_interface.as_str());
 }
 
 /// Authentication Parameters.
@@ -424,18 +402,16 @@ pub unsafe extern "C" fn line_sender_opts_net_interface(
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_opts_auth(
     opts: *mut line_sender_opts,
-    key_id: *const libc::c_char,
-    priv_key: *const libc::c_char,
-    pub_key_x: *const libc::c_char,
-    pub_key_y: *const libc::c_char,
-    err_out: *mut *mut line_sender_error) -> bool
+    key_id: line_sender_utf8,
+    priv_key: line_sender_utf8,
+    pub_key_x: line_sender_utf8,
+    pub_key_y: line_sender_utf8)
 {
-    let key_id: &str = c_str_to_ref!(key_id, err_out, false);
-    let priv_key: &str = c_str_to_ref!(priv_key, err_out, false);
-    let pub_key_x: &str = c_str_to_ref!(pub_key_x, err_out, false);
-    let pub_key_y: &str = c_str_to_ref!(pub_key_y, err_out, false);
-    upd_opts!(opts, auth, key_id, priv_key, pub_key_x, pub_key_y);
-    true
+    upd_opts!(opts, auth,
+        key_id.as_str(),
+        priv_key.as_str(),
+        pub_key_x.as_str(),
+        pub_key_y.as_str());
 }
 
 /// Enable full connection encryption via TLS.
@@ -455,14 +431,11 @@ pub unsafe extern "C" fn line_sender_opts_tls(
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_opts_tls_ca(
     opts: *mut line_sender_opts,
-    ca_path: *const libc::c_char,
-    err_out: *mut *mut line_sender_error) -> bool
+    ca_path: line_sender_utf8)
 {
-    let ca_path = c_str_to_ref!(ca_path, err_out, false);
-    let ca_path = PathBuf::from(ca_path);
+    let ca_path = PathBuf::from(ca_path.as_str());
     upd_opts!(opts, tls,
         Tls::Enabled(CertificateAuthority::File(ca_path)));
-    true
 }
 
 /// Enable TLS whilst dangerously accepting any certificate as valid.
@@ -494,7 +467,7 @@ pub unsafe extern "C" fn line_sender_opts_read_timeout(
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_opts_max_name_len(
     opts: *mut line_sender_opts,
-    value: libc::size_t)
+    value: size_t)
 {
     upd_opts!(opts, max_name_len, value);
 }
@@ -729,7 +702,7 @@ pub unsafe extern "C" fn line_sender_at_now(
 /// @return Accumulated batch size.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_pending_size(
-    sender: *const line_sender) -> libc::size_t
+    sender: *const line_sender) -> size_t
 {
     let sender = unwrap_sender(sender);
     sender.pending_size()
@@ -743,12 +716,12 @@ pub unsafe extern "C" fn line_sender_pending_size(
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_peek_pending(
     sender: *const line_sender,
-    len_out: *mut libc::size_t) -> *const libc::c_char
+    len_out: *mut size_t) -> *const c_char
 {
     let sender = unwrap_sender(sender);
     let buf: &[u8] = sender.peek_pending().as_bytes();
     *len_out = buf.len();
-    buf.as_ptr() as *const libc::c_char
+    buf.as_ptr() as *const c_char
 }
 
 /// Send batch-up rows messages to the QuestDB server.

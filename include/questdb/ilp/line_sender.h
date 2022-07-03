@@ -83,6 +83,9 @@ void line_sender_error_free(line_sender_error*);
 
 /////////// Preparing strings and names
 
+#define QDB_CONCAT_INNER(a, b) a ## b
+#define QDB_CONCAT(a, b) QDB_CONCAT_INNER(a, b)
+
 /** Non-owning validated UTF-8 encoded string. */
 typedef struct line_sender_utf8
 {
@@ -107,6 +110,23 @@ bool line_sender_utf8_init(
     size_t len,
     const char* buf,
     line_sender_error** err_out);
+
+#define QDB_UTF_8_FROM_STR_OR(var_name, const_char_p_expr, err_p_p)            \
+    line_sender_utf8 var_name = {0, NULL};                                     \
+    const char* QDB_CONCAT(var_name, ____STR_EXPR) = (const_char_p_expr);      \
+    if (!line_sender_utf8_init(                                                \
+        &var_name,                                                             \
+        strlen(QDB_CONCAT(var_name, ____STR_EXPR)),                            \
+        QDB_CONCAT(var_name, ____STR_EXPR),                                    \
+        err_p_p))
+
+#define QDB_UTF8_FROM_LIT_OR(var_name, literal, err_p_p)                       \
+    line_sender_utf8 var_name = {0, NULL};                                     \
+    if (!line_sender_utf8_init(                                                \
+        &var_name,                                                             \
+        sizeof(literal) - 1,                                                   \
+        literal,                                                               \
+        err_p_p))
 
 /** Non-owning validated table, symbol or column name. UTF-8 encoded. */
 typedef struct line_sender_table_name
@@ -134,6 +154,23 @@ bool line_sender_table_name_init(
     const char* buf,
     line_sender_error** err_out);
 
+#define QDB_TABLE_NAME_FROM_STR_OR(var_name, const_char_p_expr, err_p_p)       \
+    line_sender_table_name var_name = {0, NULL};                               \
+    const char* QDB_CONCAT(var_name, ____STR_EXPR) = (const_char_p_expr);      \
+    if (!line_sender_table_name_init(                                          \
+        &var_name,                                                             \
+        strlen(QDB_CONCAT(var_name, ____STR_EXPR)),                            \
+        QDB_CONCAT(var_name, ____STR_EXPR),                                    \
+        err_p_p))
+
+#define QDB_TABLE_NAME_FROM_LIT_OR(var_name, literal, err_p_p)                 \
+    line_sender_table_name var_name = {0, NULL};                               \
+    if (!line_sender_table_name_init(                                          \
+        &var_name,                                                             \
+        sizeof(literal) - 1,                                                   \
+        literal,                                                               \
+        err_p_p))
+
 /** Non-owning validated table, symbol or column name. UTF-8 encoded. */
 typedef struct line_sender_column_name
 {
@@ -160,6 +197,22 @@ bool line_sender_column_name_init(
     const char* buf,
     line_sender_error** err_out);
 
+#define QDB_COLUMN_NAME_FROM_STR_OR(var_name, const_char_p_expr, err_p_p)      \
+    line_sender_column_name var_name = {0, NULL};                              \
+    const char* QDB_CONCAT(var_name, ____STR_EXPR) = (const_char_p_expr);      \
+    if (!line_sender_column_name_init(                                         \
+        &var_name,                                                             \
+        strlen(QDB_CONCAT(var_name, ____STR_EXPR)),                            \
+        QDB_CONCAT(var_name, ____STR_EXPR),                                    \
+        err_p_p))
+
+#define QDB_COLUMN_NAME_FROM_LIT_OR(var_name, literal, err_p_p)                \
+    line_sender_column_name var_name = {0, NULL};                              \
+    if (!line_sender_column_name_init(                                         \
+        &var_name,                                                             \
+        sizeof(literal) - 1,                                                   \
+        literal,                                                               \
+        err_p_p))
 
 /////////// Connecting and disconnecting.
 
@@ -182,9 +235,8 @@ typedef struct line_sender_opts line_sender_opts;
  */
 LINESENDER_API
 line_sender_opts* line_sender_opts_new(
-    const char* host,
-    uint16_t port,
-    line_sender_error** err_out);
+    line_sender_utf8 host,
+    uint16_t port);
 
 /**
  * A new set of options for a line sender connection.
@@ -193,9 +245,8 @@ line_sender_opts* line_sender_opts_new(
  */
 LINESENDER_API
 line_sender_opts* line_sender_opts_new_service(
-    const char* host,
-    const char* port,
-    line_sender_error** err_out);
+    line_sender_utf8 host,
+    line_sender_utf8 port);
 
 /**
  * Set the initial buffer capacity (byte count).
@@ -208,10 +259,9 @@ void line_sender_opts_capacity(
 
 /** Select local outbound interface. */
 LINESENDER_API
-bool line_sender_opts_net_interface(
+void line_sender_opts_net_interface(
     line_sender_opts* opts,
-    const char* net_interface,
-    line_sender_error** err_out);
+    line_sender_utf8 net_interface);
 
 /**
  * Authentication Parameters.
@@ -221,13 +271,12 @@ bool line_sender_opts_net_interface(
  * @param[in] pub_key_y Public key Y coordinate. AKA "y".
  */
 LINESENDER_API
-bool line_sender_opts_auth(
+void line_sender_opts_auth(
     line_sender_opts* opts,
-    const char* key_id,
-    const char* priv_key,
-    const char* pub_key_x,
-    const char* pub_key_y,
-    line_sender_error** err_out);
+    line_sender_utf8 key_id,
+    line_sender_utf8 priv_key,
+    line_sender_utf8 pub_key_x,
+    line_sender_utf8 pub_key_y);
 
 /**
  * Enable full connection encryption via TLS.
@@ -243,10 +292,9 @@ void line_sender_opts_tls(line_sender_opts* opts);
  * authority file.
  */
 LINESENDER_API
-bool line_sender_opts_tls_ca(
+void line_sender_opts_tls_ca(
     line_sender_opts* opts,
-    const char* ca_path,
-    line_sender_error** err_out);
+    line_sender_utf8 ca_path);
 
 /**
  * Enable TLS whilst dangerously accepting any certificate as valid.
