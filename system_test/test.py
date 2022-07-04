@@ -491,7 +491,7 @@ class TestLineSender(unittest.TestCase):
             -150.25,
             True,
             3,
-            'Ranjit Singh']]  # Comparison excludes timestamp column.
+            'John Doe']]  # Comparison excludes timestamp column.
         scrubbed_dataset = [row[:-1] for row in resp['dataset']]
         self.assertEqual(scrubbed_dataset, exp_dataset)
 

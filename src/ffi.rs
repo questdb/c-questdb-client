@@ -187,7 +187,11 @@ fn describe_buf(buf: &[u8]) -> String {
     output
 }
 
-unsafe fn set_err_out(err_out: *mut *mut line_sender_error, code: ErrorCode, msg: String) {
+unsafe fn set_err_out(
+    err_out: *mut *mut line_sender_error,
+    code: ErrorCode,
+    msg: String)
+{
     let err = line_sender_error(Error{
         code: code,
         msg: msg});
@@ -195,10 +199,10 @@ unsafe fn set_err_out(err_out: *mut *mut line_sender_error, code: ErrorCode, msg
     *err_out = err_ptr;
 }
 
-unsafe fn unwrap_utf8(buf: &[u8], err_out: *mut *mut line_sender_error) -> Option<&str> {
-    match str::from_utf8(buf) {
+unsafe fn unwrap_utf8_or_str(buf: &[u8]) -> std::result::Result<&str, String> {
+    match std::str::from_utf8(buf) {
         Ok(str_ref) => {
-            Some(str_ref)
+            Ok(str_ref)
         },
         Err(u8err) => {
             let buf_descr = describe_buf(buf);
@@ -213,12 +217,24 @@ unsafe fn unwrap_utf8(buf: &[u8], err_out: *mut *mut line_sender_error) -> Optio
                 else {  // needs more input
                     format!(
                         concat!(
-                            "Bad string \"{}\": Invalid UTF-8. ",
-                            "Incomplete multi-byte codepoint at end of string. ",
+                            "Bad string \"{}\": Invalid UTF-8. Incomplete ",
+                            "multi-byte codepoint at end of string. ",
                             "Bad codepoint starting at byte index {}."),
                         buf_descr,
                         u8err.valid_up_to())
                 };
+            Err(msg)
+        }
+    }
+}
+
+unsafe fn unwrap_utf8(
+    buf: &[u8],
+    err_out: *mut *mut line_sender_error) -> Option<&str>
+{
+    match unwrap_utf8_or_str(buf) {
+        Ok(str_ref) => Some(str_ref),
+        Err(msg) => {
             set_err_out(err_out, ErrorCode::InvalidUtf8, msg);
             None
         }
@@ -247,6 +263,23 @@ pub unsafe extern "C" fn line_sender_utf8_init(
     }
     else {
         false
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_utf8_assert(
+    len: size_t,
+    buf: *const c_char) -> line_sender_utf8
+{
+    let slice = slice::from_raw_parts(buf as *const u8, len);
+    match unwrap_utf8_or_str(slice) {
+        Ok(str_ref) => line_sender_utf8 {
+            len: str_ref.len(),
+            buf: str_ref.as_ptr() as *const c_char
+        },
+        Err(msg) => {
+            panic!("{}", msg);
+        }
     }
 }
 
@@ -318,6 +351,23 @@ pub unsafe extern "C" fn line_sender_table_name_init(
     true
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_table_name_assert(
+    len: size_t,
+    buf: *const c_char) -> line_sender_table_name
+{
+    let u8str = line_sender_utf8_assert(len, buf);
+    match TableName::new(u8str.as_str()) {
+        Ok(_) => line_sender_table_name {
+            len: len,
+            buf: buf
+        },
+        Err(msg) => {
+            panic!("{}", msg);
+        }
+    }
+}
+
 /// Check the provided buffer is a valid UTF-8 encoded string that can be
 /// used as a symbol or column name.
 ///
@@ -346,6 +396,23 @@ pub unsafe extern "C" fn line_sender_column_name_init(
     (*name).len = len;
     (*name).buf = buf;
     true
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_column_name_assert(
+    len: size_t,
+    buf: *const c_char) -> line_sender_table_name
+{
+    let u8str = line_sender_utf8_assert(len, buf);
+    match ColumnName::new(u8str.as_str()) {
+        Ok(_) => line_sender_table_name {
+            len: len,
+            buf: buf
+        },
+        Err(msg) => {
+            panic!("{}", msg);
+        }
+    }
 }
 
 /// Accumulates parameters for creating a line sender connection.

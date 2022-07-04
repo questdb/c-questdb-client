@@ -29,7 +29,7 @@ static bool example(std::string_view host, std::string_view port)
             .column(y_name, -150.25)
             .column(booked_name, true)
             .column(passengers_name, int64_t{3})
-            .column(driver_name, "Ranjit Singh"_utf8)
+            .column(driver_name, "John Doe"_utf8)
             .at_now();
 
         // To insert more records, call `sender.table(..)...` again.

@@ -9,16 +9,6 @@ static bool example(const char* host, const char* port)
     line_sender_opts* opts = NULL;
     line_sender* sender = NULL;
 
-    // Declare and validate a UTF-8 string from a `const char*`.
-    // This macro expands to:
-    //     line_sender_utf8 host_utf8;
-    //     const char* host_utf8____STR_EXPR = (host);
-    //     if (!line_sender_utf8_init(
-    //             &host_utf8,
-    //             strlen(host_utf8____STR_EXPR),
-    //             host_utf8____STR_EXPR,
-    //             &err))
-    //         goto on_error;
     QDB_UTF_8_FROM_STR_OR(host_utf8, host, &err)
         goto on_error;
 
@@ -28,29 +18,14 @@ static bool example(const char* host, const char* port)
     // Call `line_sender_opts_new` if instead you have an integer port.
     opts = line_sender_opts_new_service(host_utf8, port_utf8);
 
-    QDB_UTF8_FROM_LIT_OR(
-            key_id,
-            "testUser1",
-            &err)
-        goto on_error;
-
-    QDB_UTF8_FROM_LIT_OR(
-            priv_key,
-            "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48",
-            &err)
-        goto on_error;
-
-    QDB_UTF8_FROM_LIT_OR(
-            pub_key_x,
-            "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU",
-            &err)
-        goto on_error;
-
-    QDB_UTF8_FROM_LIT_OR(
-            pub_key_y,
-            "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac",
-            &err)
-        goto on_error;
+    // Use `QDB_UTF_8_FROM_STR_OR` to init from `const char*`.
+    line_sender_utf8 key_id = QDB_UTF8_LITERAL("testUser1");
+    line_sender_utf8 priv_key = QDB_UTF8_LITERAL(
+        "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48");
+    line_sender_utf8 pub_key_x = QDB_UTF8_LITERAL(
+        "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU");
+    line_sender_utf8 pub_key_y = QDB_UTF8_LITERAL(
+        "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac");
 
     line_sender_opts_auth(
         opts,
@@ -68,42 +43,20 @@ static bool example(const char* host, const char* port)
     // If we're inserting multiple rows, this allows us to avoid
     // re-validating the same strings over and over again.
 
-    // This macro expands to:
-    //     line_sender_table_name table_name;
-    //     if (!line_sender_table_name_init(
-    //             &table_name,
-    //             sizeof("c_cars_auth") - 1,
-    //             "c_cars_auth",
-    //             &err))
-    //         goto on_error;
-    QDB_TABLE_NAME_FROM_LIT_OR(table_name, "c_cars_auth", &err)
-        goto on_error;
-
-    // Same, but for the `line_sender_column_name` type.
-    QDB_COLUMN_NAME_FROM_LIT_OR(id_name, "id", &err)
-        goto on_error;
-
-    QDB_COLUMN_NAME_FROM_LIT_OR(x_name, "x", &err)
-        goto on_error;
-
-    QDB_COLUMN_NAME_FROM_LIT_OR(y_name, "y", &err)
-        goto on_error;
-
-    QDB_COLUMN_NAME_FROM_LIT_OR(booked_name, "booked", &err)
-        goto on_error;
-
-    QDB_COLUMN_NAME_FROM_LIT_OR(passengers_name, "passengers", &err)
-        goto on_error;
-
-    QDB_COLUMN_NAME_FROM_LIT_OR(driver_name, "driver", &err)
-        goto on_error;
+    line_sender_table_name table_name = QDB_TABLE_NAME_LITERAL("c_cars_tls");
+    line_sender_column_name id_name = QDB_COLUMN_NAME_LITERAL("id");
+    line_sender_column_name x_name = QDB_COLUMN_NAME_LITERAL("x");
+    line_sender_column_name y_name = QDB_COLUMN_NAME_LITERAL("y");
+    line_sender_column_name booked_name = QDB_COLUMN_NAME_LITERAL("booked");
+    line_sender_column_name passengers_name = QDB_COLUMN_NAME_LITERAL(
+        "passengers");
+    line_sender_column_name driver_name = QDB_COLUMN_NAME_LITERAL("driver");
 
     if (!line_sender_table(sender, table_name, &err))
         goto on_error;
 
-    QDB_UTF8_FROM_LIT_OR(id_value, "d6e5fe92-d19f-482a-a97a-c105f547f721", &err)
-        goto on_error;
-
+    line_sender_utf8 id_value = QDB_UTF8_LITERAL(
+        "d6e5fe92-d19f-482a-a97a-c105f547f721");
     if (!line_sender_symbol(sender, id_name, id_value, &err))
         goto on_error;
 
@@ -119,9 +72,7 @@ static bool example(const char* host, const char* port)
     if (!line_sender_column_i64(sender, passengers_name, 3, &err))
         goto on_error;
 
-    QDB_UTF8_FROM_LIT_OR(driver_value, "Ranjit Singh", &err)
-        goto on_error;
-
+    line_sender_utf8 driver_value = QDB_UTF8_LITERAL("John Doe");
     if (!line_sender_column_str(sender, driver_name, driver_value, &err))
         goto on_error;
 

@@ -111,6 +111,16 @@ bool line_sender_utf8_init(
     const char* buf,
     line_sender_error** err_out);
 
+/**
+ * Construct a UTF-8 object from UTF-8 encoded buffer and length.
+ * If the passed in buffer is not valid UTF-8, the program will abort.
+ *
+ * @param[in] len Length in bytes of the buffer.
+ * @param[in] buf UTF-8 encoded buffer.
+ */
+LINESENDER_API
+line_sender_utf8 line_sender_utf8_assert(size_t len, const char* buf);
+
 #define QDB_UTF_8_FROM_STR_OR(var_name, const_char_p_expr, err_p_p)            \
     line_sender_utf8 var_name = {0, NULL};                                     \
     const char* QDB_CONCAT(var_name, ____STR_EXPR) = (const_char_p_expr);      \
@@ -120,13 +130,8 @@ bool line_sender_utf8_init(
         QDB_CONCAT(var_name, ____STR_EXPR),                                    \
         err_p_p))
 
-#define QDB_UTF8_FROM_LIT_OR(var_name, literal, err_p_p)                       \
-    line_sender_utf8 var_name = {0, NULL};                                     \
-    if (!line_sender_utf8_init(                                                \
-        &var_name,                                                             \
-        sizeof(literal) - 1,                                                   \
-        literal,                                                               \
-        err_p_p))
+#define QDB_UTF8_LITERAL(literal)                                              \
+    line_sender_utf8_assert(sizeof(literal) - 1, (literal))
 
 /** Non-owning validated table, symbol or column name. UTF-8 encoded. */
 typedef struct line_sender_table_name
@@ -154,6 +159,19 @@ bool line_sender_table_name_init(
     const char* buf,
     line_sender_error** err_out);
 
+/**
+ * Construct a table name object from UTF-8 encoded buffer and length.
+ * If the passed in buffer is not valid UTF-8, or is not a valid table name,
+ * the program will abort.
+ *
+ * @param[in] len Length in bytes of the buffer.
+ * @param[in] buf UTF-8 encoded buffer.
+ */
+LINESENDER_API
+line_sender_table_name line_sender_table_name_assert(
+    size_t len,
+    const char* buf);
+
 #define QDB_TABLE_NAME_FROM_STR_OR(var_name, const_char_p_expr, err_p_p)       \
     line_sender_table_name var_name = {0, NULL};                               \
     const char* QDB_CONCAT(var_name, ____STR_EXPR) = (const_char_p_expr);      \
@@ -163,13 +181,8 @@ bool line_sender_table_name_init(
         QDB_CONCAT(var_name, ____STR_EXPR),                                    \
         err_p_p))
 
-#define QDB_TABLE_NAME_FROM_LIT_OR(var_name, literal, err_p_p)                 \
-    line_sender_table_name var_name = {0, NULL};                               \
-    if (!line_sender_table_name_init(                                          \
-        &var_name,                                                             \
-        sizeof(literal) - 1,                                                   \
-        literal,                                                               \
-        err_p_p))
+#define QDB_TABLE_NAME_LITERAL(literal)                                        \
+    line_sender_table_name_assert(sizeof(literal) - 1, (literal))
 
 /** Non-owning validated table, symbol or column name. UTF-8 encoded. */
 typedef struct line_sender_column_name
@@ -197,6 +210,19 @@ bool line_sender_column_name_init(
     const char* buf,
     line_sender_error** err_out);
 
+/**
+ * Construct a column name object from UTF-8 encoded buffer and length.
+ * If the passed in buffer is not valid UTF-8, or is not a valid column name,
+ * the program will abort.
+ *
+ * @param[in] len Length in bytes of the buffer.
+ * @param[in] buf UTF-8 encoded buffer.
+ */
+LINESENDER_API
+line_sender_column_name line_sender_column_name_assert(
+    size_t len,
+    const char* buf);
+
 #define QDB_COLUMN_NAME_FROM_STR_OR(var_name, const_char_p_expr, err_p_p)      \
     line_sender_column_name var_name = {0, NULL};                              \
     const char* QDB_CONCAT(var_name, ____STR_EXPR) = (const_char_p_expr);      \
@@ -206,13 +232,8 @@ bool line_sender_column_name_init(
         QDB_CONCAT(var_name, ____STR_EXPR),                                    \
         err_p_p))
 
-#define QDB_COLUMN_NAME_FROM_LIT_OR(var_name, literal, err_p_p)                \
-    line_sender_column_name var_name = {0, NULL};                              \
-    if (!line_sender_column_name_init(                                         \
-        &var_name,                                                             \
-        sizeof(literal) - 1,                                                   \
-        literal,                                                               \
-        err_p_p))
+#define QDB_COLUMN_NAME_LITERAL(literal)                                       \
+    line_sender_column_name_assert(sizeof(literal) - 1, (literal))
 
 /////////// Connecting and disconnecting.
 
