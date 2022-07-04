@@ -485,7 +485,7 @@ def run_tests(args):
         sys.stderr.write(f'\n\nAttempt {n}/{repeat}\n')
         test_prog = unittest.TestProgram(exit=False)
         if not test_prog.result.wasSuccessful():
-            sys.exit()
+            sys.exit(1)
 
 
 def run_with_existing(args):
