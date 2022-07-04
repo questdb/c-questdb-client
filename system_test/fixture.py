@@ -51,8 +51,8 @@ def retry(
     timeout_sec=30,
     every=0.05,
     msg='Timed out retrying',
-    backoff_till=5.0,
-    lead_sleep=0.1):
+    backoff_till=2.5,
+    lead_sleep=0.01):
     """
     Repeat task every `interval` until it returns a truthy value or times out.
     """
@@ -185,7 +185,7 @@ class QuestDbFixture:
         self._root_dir = root_dir
         self.version = _parse_version(self._root_dir.name)
         self._data_dir = self._root_dir / 'data'
-        self._log_path = self._data_dir / 'log' / 'log.txt'
+        self.log_path = self._data_dir / 'log' / 'log.txt'
         self._conf_dir = self._data_dir / 'conf'
         self._conf_dir.mkdir(exist_ok=True)
         self._conf_path = self._conf_dir / 'server.conf'
@@ -203,7 +203,7 @@ class QuestDbFixture:
                 auth_file.write(AUTH_TXT)
 
     def print_log(self):
-        with open(self._log_path, 'r', encoding='utf-8') as log_file:
+        with open(self.log_path, 'r', encoding='utf-8') as log_file:
             log = log_file.read()
             sys.stderr.write(textwrap.indent(log, '    '))
             sys.stderr.write('\n\n')
@@ -240,7 +240,7 @@ class QuestDbFixture:
             '-d', str(self._data_dir)]
         sys.stderr.write(
             f'Starting QuestDB: {launch_args!r} (auth: {self.auth})\n')
-        self._log = open(self._log_path, 'ab')
+        self._log = open(self.log_path, 'ab')
         try:
             self._proc = subprocess.Popen(
                 launch_args,
@@ -272,7 +272,7 @@ class QuestDbFixture:
                 timeout_sec=60,
                 msg='Timed out waiting for HTTP service to come up.')
         except:
-            sys.stderr.write(f'QuestDB log at `{self._log_path}`:\n')
+            sys.stderr.write(f'QuestDB log at `{self.log_path}`:\n')
             self.print_log()
             raise
 

@@ -52,6 +52,7 @@ from collections import namedtuple
 
 QDB_FIXTURE: QuestDbFixture = None
 
+PDB_FLAG = False
 
 class QueryError(Exception):
     pass
@@ -85,7 +86,7 @@ def retry_check_table(
         table_name,
         *,
         min_rows=1,
-        timeout_sec=30,
+        timeout_sec=20,
         log=True,
         log_ctx=None):
     sql_query = f"select * from '{table_name}'"
@@ -114,8 +115,12 @@ def retry_check_table(
                 f'Context: {log_ctx}' +
                 f'Client response log:\n' +
                 pformat(http_response_log) +
-                f'\nQuestDB log:\n')
-            QDB_FIXTURE.print_log()
+                f'\nQuestDB log: {QDB_FIXTURE.log_path}\n')
+            if PDB_FLAG:
+                import pdb
+                pdb.set_trace(header=f'Dropping into Python debugger.')
+            elif QDB_FIXTURE.log_path:
+                QDB_FIXTURE.print_log()
         raise toe
 
 
@@ -298,35 +303,6 @@ class TestLineSender(unittest.TestCase):
         scrubbed_dataset = [row[:-1] for row in resp['dataset']]
         self.assertEqual(scrubbed_dataset, exp_dataset)
 
-    def test_mismatched_types_across_rows(self):
-        table_name = uuid.uuid4().hex
-        pending = None
-        with self._mk_linesender() as sender:
-            (sender
-                .table(table_name)
-                .symbol('a', 'A')  # SYMBOL
-                .at_now())
-            (sender
-                .table(table_name)
-                .column('a', 'B')  # STRING
-                .at_now())
-            pending = sender.peek_pending()
-
-        # We only ever get the first row back.
-        resp = retry_check_table(table_name, log_ctx=pending)
-        exp_columns = [
-            {'name': 'a', 'type': 'SYMBOL'},
-            {'name': 'timestamp', 'type': 'TIMESTAMP'}]
-        self.assertEqual(resp['columns'], exp_columns)
-
-        exp_dataset = [['A']]  # Comparison excludes timestamp column.
-        scrubbed_dataset = [row[:-1] for row in resp['dataset']]
-        self.assertEqual(scrubbed_dataset, exp_dataset)
-
-        # The second one is dropped and will not appear in results.
-        with self.assertRaises(TimeoutError):
-            retry_check_table(table_name, min_rows=2, timeout_sec=1, log=False)
-
     def test_at(self):
         if QDB_FIXTURE.version <= (6, 0, 7, 1):
             self.skipTest('No support for user-provided timestamps.')
@@ -463,6 +439,15 @@ def parse_args():
         '--unittest-help',
         action='store_true',
         help='Show unittest --help')
+    run_p.add_argument(
+        '--repeat',
+        type=int,
+        default=1,
+        help='Repeat tests this many times.')
+    run_p.add_argument(
+        '--pdb',
+        action='store_true',
+        help='Drop into pdb on failure.')
     version_g = run_p.add_mutually_exclusive_group()
     version_g.add_argument(
         '--last-n',
@@ -491,18 +476,33 @@ def list(args):
         print(f'    {vers}')
 
 
+def run_tests(args):
+    repeat = getattr(args, 'repeat', 1)
+    pdb = getattr(args, 'pdb', False)
+    global PDB_FLAG
+    PDB_FLAG = pdb
+    for n in range(1, repeat + 1):
+        sys.stderr.write(f'\n\nAttempt {n}/{repeat}\n')
+        test_prog = unittest.TestProgram(exit=False)
+        if not test_prog.result.wasSuccessful():
+            sys.exit()
+
+
 def run_with_existing(args):
     global QDB_FIXTURE
     MockFixture = namedtuple(
         'MockFixture',
-        ('host', 'line_tcp_port', 'http_server_port', 'version'))
+        ('host', 'line_tcp_port', 'http_server_port',
+         'version', 'auth', 'log_path'))
     host, line_tcp_port, http_server_port = args.existing.split(':')
     QDB_FIXTURE = MockFixture(
         host,
         int(line_tcp_port),
         int(http_server_port),
-        (999, 999, 999))
-    unittest.main()
+        (999, 999, 999),
+        False,
+        None)
+    run_tests(args)
 
 
 def run_with_fixtures(args):
@@ -529,9 +529,7 @@ def run_with_fixtures(args):
         QDB_FIXTURE = QuestDbFixture(questdb_dir, auth=False)
         try:
             QDB_FIXTURE.start()
-            test_prog = unittest.TestProgram(exit=False)
-            if not test_prog.result.wasSuccessful():
-                sys.exit(1)
+            run_tests(args)
         finally:
             QDB_FIXTURE.stop()
 

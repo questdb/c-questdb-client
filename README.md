@@ -11,10 +11,24 @@ $ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build
 
 ## Run tests
 ```bash
-$ python3 ci/run_all_tests.py --repeat 100
+$ python3 system_test/test.py run -v --repeat 100 --pdb
+```
+
+The `--pdb` flag will drop you in a Python debugger when the timeout happens.
+This should allow you to attach/break a java debugger to
+the running process.
+
+## Running against an existing instance
+
+To run the tests against a specific running instance, use the `--existing` flag.
+
+```bash
+$ python3 system_test/test.py run -v --repeat 100 --existing localhost:9009:9000
 ```
 
 ## QuestDB Config
+
+When the tests spawn an instance, the config is generated as so:
 
 ```python
 # fixture.py

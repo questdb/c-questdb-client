@@ -62,7 +62,7 @@ stages:
             env:
               JAVA_HOME: $(JAVA_HOME_11_X64)
             displayName: "Make"
-          - script: python3 ci/run_all_tests.py --repeat 100
+          - script: python3 system_test/test.py run -v --repeat 100
             env:
               JAVA_HOME: $(JAVA_HOME_11_X64)
             displayName: "Tests"
