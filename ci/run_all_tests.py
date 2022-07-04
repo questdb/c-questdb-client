@@ -31,11 +31,19 @@ def run_cmd(*args):
         sys.stderr.write(f'Command {args!r} failed with return code {cpe.returncode}.\n')
         sys.exit(cpe.returncode)
 
+def parse_args():
+    import argparse
+    parser = argparse.ArgumentParser(description='Run QuestDB system tests.')
+    parser.add_argument('--repeat', type=int, default=1, help='Repeat the test this many times.')
+    return parser.parse_args()
 
 def main():
     system_test_path = pathlib.Path('system_test') / 'test.py'
     qdb_v = '6.4.1'  # The version of QuestDB we'll test against.
-    run_cmd('python3', str(system_test_path), 'run', '--versions', qdb_v, '-v')
+    total = parse_args().repeat
+    for n in range(1, total + 1):
+        print(f'Running attempt #{n}/{total}.')
+        run_cmd('python3', str(system_test_path), 'run', '--versions', qdb_v, '-v')
 
 
 if __name__ == '__main__':
