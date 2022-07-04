@@ -63,7 +63,9 @@ pub(super) fn resolve_host(host: &str) -> super::Result<SockAddr> {
         dns_lookup::getaddrinfo(Some(host), None, Some(hints)))
 }
 
-pub(super) fn resolve_host_port(host: &str, port: &str) -> super::Result<SockAddr> {
+pub(super) fn resolve_host_port(
+    host: &str, port: &str) -> super::Result<SockAddr>
+{
     let hints = AddrInfoHints {
         socktype: SOCK_STREAM,
         address: AF_INET,

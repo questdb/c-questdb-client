@@ -64,14 +64,19 @@ fn load_certs(filename: &Path) -> Vec<Certificate> {
 }
 
 fn load_private_key(filename: &Path) -> rustls::PrivateKey {
-    let keyfile = std::fs::File::open(filename).expect("cannot open private key file");
+    let keyfile = std::fs::File::open(filename)
+        .expect("cannot open private key file");
     let mut reader = BufReader::new(keyfile);
 
     loop {
-        match rustls_pemfile::read_one(&mut reader).expect("cannot parse private key .pem file") {
-            Some(rustls_pemfile::Item::RSAKey(key)) => return rustls::PrivateKey(key),
-            Some(rustls_pemfile::Item::PKCS8Key(key)) => return rustls::PrivateKey(key),
-            Some(rustls_pemfile::Item::ECKey(key)) => return rustls::PrivateKey(key),
+        match rustls_pemfile::read_one(&mut reader)
+                .expect("cannot parse private key .pem file") {
+            Some(rustls_pemfile::Item::RSAKey(key)) =>
+                return rustls::PrivateKey(key),
+            Some(rustls_pemfile::Item::PKCS8Key(key)) =>
+                return rustls::PrivateKey(key),
+            Some(rustls_pemfile::Item::ECKey(key)) =>
+                return rustls::PrivateKey(key),
             None => break,
             _ => {}
         }
@@ -105,7 +110,8 @@ fn tls_config() -> Arc<ServerConfig> {
 
 impl MockServer {
     pub fn new() -> io::Result<Self> {
-        let listener = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+        let listener = Socket::new(
+            Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
         let address: SocketAddr = "127.0.0.1:0".parse().unwrap();
         listener.bind(&address.into())?;
         listener.listen(128)?;
@@ -160,14 +166,18 @@ impl MockServer {
                     }
                 }
             }
-            self.poll.registry().reregister(client, CLIENT, Interest::READABLE)?;
+            self.poll.registry().reregister(
+                client, CLIENT, Interest::READABLE)?;
             self.tls_conn = Some(tls_conn);
             Ok(self)
         })
     }
 
-    pub fn wait_for_data(&mut self, wait_timeout_sec: Option<f64>) -> io::Result<bool> {
-        self.client.as_ref().unwrap();  // To ensure a clean death if accept wasn't called.
+    pub fn wait_for_data(
+        &mut self, wait_timeout_sec: Option<f64>) -> io::Result<bool>
+    {
+        // To ensure a clean death if accept wasn't called.
+        self.client.as_ref().unwrap();
         let timeout = wait_timeout_sec.map(|sec| {
             Duration::from_micros((sec * 1000000.0) as u64)
         });
@@ -198,7 +208,8 @@ impl MockServer {
             let count = match self.do_read(&mut chunk[..]) {
                 Ok(count) => count,
                 Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
-                    self.poll.poll(&mut self.events, Some(Duration::from_millis(200)))?;
+                    let poll_timeout = Some(Duration::from_millis(200));
+                    self.poll.poll(&mut self.events, poll_timeout)?;
                     continue;
                 },
                 Err(err) => return Err(err)

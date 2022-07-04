@@ -25,7 +25,7 @@
 use core::time::Duration;
 use std::convert::{TryFrom, TryInto, Infallible};
 use std::fmt::{self, Write, Display, Formatter};
-use std::io::{self, BufRead, BufReader, Write as IoWrite};
+use std::io::{self, BufRead, BufReader, Write as IoWrite, ErrorKind};
 use std::sync::Arc;
 use std::path::PathBuf;
 
@@ -474,6 +474,19 @@ fn map_rustls_err(descr: &str, err: rustls::Error) -> Error {
     fmt_err!(TlsError, "{}: {}", descr, err)
 }
 
+fn add_webpki_roots(root_store: &mut rustls::RootCertStore) {
+    root_store.add_server_trust_anchors(
+        webpki_roots::TLS_SERVER_ROOTS
+            .0
+            .iter()
+            .map(|ta| {
+                OwnedTrustAnchor::from_subject_spki_name_constraints(
+                    ta.subject,
+                    ta.spki,
+                    ta.name_constraints,
+                )}));
+}
+
 fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
     if tls.is_disabled() {
         return Ok(None);
@@ -484,29 +497,24 @@ fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
     if let Tls::Enabled(ca) = tls {
         match ca {
             CertificateAuthority::WebpkiRoots => {
-                root_store.add_server_trust_anchors(
-                    webpki_roots::TLS_SERVER_ROOTS
-                        .0
-                        .iter()
-                        .map(|ta| {
-                            OwnedTrustAnchor::from_subject_spki_name_constraints(
-                                ta.subject,
-                                ta.spki,
-                                ta.name_constraints,
-                            )}));
+                add_webpki_roots(&mut root_store);
             },
             CertificateAuthority::File(ca_file) => {
                 let certfile = std::fs::File::open(ca_file)
                     .map_err(|io_err| fmt_err!(
                         TlsError,
-                        "Could not open certificate authority file from path {:?}: {}",
+                        concat!(
+                            "Could not open certificate authority ",
+                            "file from path {:?}: {}"),
                         ca_file,
                         io_err))?;
                 let mut reader = BufReader::new(certfile);
                 let der_certs = &rustls_pemfile::certs(&mut reader)
                     .map_err(|io_err| fmt_err!(
                         TlsError,
-                        "Could not read certificate authority file from path {:?}: {}",
+                        concat!(
+                            "Could not read certificate authority ",
+                            "file from path {:?}: {}"),
                         ca_file,
                         io_err))?;
                 root_store.add_parsable_certificates(der_certs);
@@ -522,7 +530,8 @@ fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
         .with_safe_default_cipher_suites()
         .with_safe_default_kx_groups()
         .with_safe_default_protocol_versions()
-        .map_err(|rustls_err| map_rustls_err("Bad protocol version selection", rustls_err))?
+        .map_err(|rustls_err| map_rustls_err(
+            "Bad protocol version selection", rustls_err))?
         .with_root_certificates(root_store)
         .with_no_client_auth();
 
@@ -632,9 +641,12 @@ impl LineSenderBuilder {
 
     /// Connect synchronously.
     pub fn connect(&self) -> Result<LineSender> {
-        let mut descr = format!("LineSender[host={:?},port={:?},", self.host, self.port);
-        let addr: SockAddr = gai::resolve_host_port(self.host.as_str(), self.port.as_str())?;
-        let mut sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
+        let mut descr = format!(
+            "LineSender[host={:?},port={:?},", self.host, self.port);
+        let addr: SockAddr = gai::resolve_host_port(
+            self.host.as_str(), self.port.as_str())?;
+        let mut sock = Socket::new(
+            Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
             .map_err(|io_err| map_io_to_socket_err(
                 "Could not open TCP socket: ", io_err))?;
         sock.set_nodelay(true)
@@ -669,7 +681,8 @@ impl LineSenderBuilder {
             Tls::Enabled(_) => write!(descr, "tls=enabled,").unwrap(),
 
             #[cfg(feature="insecure_skip_verify")]
-            Tls::InsecureSkipVerify => write!(descr, "tls=insecure_skip_verify,").unwrap(),
+            Tls::InsecureSkipVerify => write!(
+                descr, "tls=insecure_skip_verify,").unwrap(),
         }
 
         let conn = match configure_tls(&self.tls)? {
@@ -688,13 +701,13 @@ impl LineSenderBuilder {
                     while tls_conn.wants_write() || tls_conn.is_handshaking() {
                         tls_conn.complete_io(&mut sock)
                             .map_err(|io_err|
-                                if (io_err.kind() == io::ErrorKind::TimedOut) ||
-                                    (io_err.kind() == io::ErrorKind::WouldBlock) {
+                                if (io_err.kind() == ErrorKind::TimedOut) ||
+                                    (io_err.kind() == ErrorKind::WouldBlock) {
                                     fmt_err!(TlsError,
                                         concat!(
-                                            "Failed to complete TLS handshake: ",
-                                            "Timed out waiting for server response ",
-                                            "after {:?}."),
+                                            "Failed to complete TLS handshake:",
+                                            " Timed out waiting for server ",
+                                            "response after {:?}."),
                                         self.read_timeout)
                                 } else {
                                     fmt_err!(
@@ -748,8 +761,10 @@ fn parse_public_key(pub_key_x: &str, pub_key_y: &str) -> Result<Vec<u8>> {
 }
 
 fn parse_key_pair(auth: &AuthParams) -> Result<EcdsaKeyPair> {
-    let private_key = b64_decode("private authentication key", auth.priv_key.as_str())?;
-    let public_key = parse_public_key(auth.pub_key_x.as_str(), auth.pub_key_y.as_str())?;
+    let private_key = b64_decode(
+        "private authentication key", auth.priv_key.as_str())?;
+    let public_key = parse_public_key(
+        auth.pub_key_x.as_str(), auth.pub_key_y.as_str())?;
     EcdsaKeyPair::from_private_key_and_public_key(
         &ECDSA_P256_SHA256_FIXED_SIGNING,
         &private_key[..],
@@ -801,7 +816,8 @@ impl LineSender {
 
     fn send_key_id(&mut self, key_id: &str) -> Result<()> {
         write!(&mut self.conn, "{}\n", key_id)
-            .map_err(|io_err| map_io_to_socket_err("Failed to send key_id: ", io_err))?;
+            .map_err(|io_err|
+                map_io_to_socket_err("Failed to send key_id: ", io_err))?;
         Ok(())
     }
 
@@ -933,7 +949,8 @@ impl LineSender {
         Ok(self)
     }
 
-    pub fn column_bool<'a, N>(&mut self, name: N, value: bool) -> Result<&mut Self>
+    pub fn column_bool<'a, N>(
+        &mut self, name: N, value: bool) -> Result<&mut Self>
         where
             N: TryInto<ColumnName<'a>>,
             Error: From<N::Error>
@@ -943,7 +960,8 @@ impl LineSender {
         Ok(self)
     }
 
-    pub fn column_i64<'a, N>(&mut self, name: N, value: i64) -> Result<&mut Self>
+    pub fn column_i64<'a, N>(
+        &mut self, name: N, value: i64) -> Result<&mut Self>
         where
             N: TryInto<ColumnName<'a>>,
             Error: From<N::Error>
@@ -953,7 +971,8 @@ impl LineSender {
         Ok(self)
     }
 
-    pub fn column_f64<'a, N>(&mut self, name: N, value: f64) -> Result<&mut Self>
+    pub fn column_f64<'a, N>(
+        &mut self, name: N, value: f64) -> Result<&mut Self>
         where
             N: TryInto<ColumnName<'a>>,
             Error: From<N::Error>
@@ -964,7 +983,8 @@ impl LineSender {
         Ok(self)
     }
 
-    pub fn column_str<'a, N, S>(&mut self, name: N, value: S) -> Result<&mut Self>
+    pub fn column_str<'a, N, S>(
+        &mut self, name: N, value: S) -> Result<&mut Self>
         where
             N: TryInto<ColumnName<'a>>,
             S: AsRef<str>,

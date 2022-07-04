@@ -100,7 +100,8 @@ impl From<ErrorCode> for line_sender_error_code {
     fn from(code: ErrorCode) -> Self {
         match code {
             ErrorCode::CouldNotResolveAddr =>
-                line_sender_error_code::line_sender_error_could_not_resolve_addr,
+                line_sender_error_code::
+                    line_sender_error_could_not_resolve_addr,
             ErrorCode::InvalidApiCall =>
                 line_sender_error_code::line_sender_error_invalid_api_call,
             ErrorCode::SocketError =>
@@ -119,13 +120,18 @@ impl From<ErrorCode> for line_sender_error_code {
 
 /** Error code categorizing the error. */
 #[no_mangle]
-pub unsafe extern "C" fn line_sender_error_get_code(error: *const line_sender_error) -> line_sender_error_code {
+pub unsafe extern "C" fn line_sender_error_get_code(
+    error: *const line_sender_error) -> line_sender_error_code
+{
     (&*error).0.code().into()
 }
 
 /// ASCII encoded error message. Never returns NULL.
 #[no_mangle]
-pub unsafe extern "C" fn line_sender_error_msg(error: *const line_sender_error, len_out: *mut size_t) -> *const c_char {
+pub unsafe extern "C" fn line_sender_error_msg(
+    error: *const line_sender_error,
+    len_out: *mut size_t) -> *const c_char
+{
     let msg: &str = &(&*error).0.msg;
     *len_out = msg.len();
     msg.as_ptr() as *mut i8
@@ -582,7 +588,9 @@ unsafe fn unwrap_sender<'a>(sender: *const line_sender) -> &'a LineSender {
     &(&*sender).0
 }
 
-unsafe fn unwrap_sender_mut<'a>(sender: *mut line_sender) -> &'a mut LineSender {
+unsafe fn unwrap_sender_mut<'a>(
+    sender: *mut line_sender) -> &'a mut LineSender
+{
     &mut (&mut *sender).0
 }
 
@@ -590,7 +598,9 @@ unsafe fn unwrap_sender_mut<'a>(sender: *mut line_sender) -> &'a mut LineSender 
 /// @param[in] sender Line sender object.
 /// @return true if an error occurred with a sender and it must be closed.
 #[no_mangle]
-pub unsafe extern "C" fn line_sender_must_close(sender: *const line_sender) -> bool {
+pub unsafe extern "C" fn line_sender_must_close(
+    sender: *const line_sender) -> bool
+{
     unwrap_sender(sender).must_close()
 }
 
@@ -618,7 +628,8 @@ pub unsafe extern "C" fn line_sender_table(
 }
 
 /// Append a value for a SYMBOL column.
-/// Symbol columns must always be written before other columns for any given row.
+/// Symbol columns must always be written before other columns for any given
+/// row.
 /// @param[in] sender Line sender object.
 /// @param[in] name Column name.
 /// @param[in] value Column value.
