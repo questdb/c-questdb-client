@@ -36,9 +36,7 @@ import time
 import questdb_line_sender as qls
 import uuid
 from fixture import (
-    Project,
     QuestDbFixture,
-    TlsProxyFixture,
     install_questdb,
     list_questdb_releases,
     retry)
@@ -53,7 +51,6 @@ from collections import namedtuple
 
 
 QDB_FIXTURE: QuestDbFixture = None
-TLS_PROXY_FIXTURE: TlsProxyFixture = None
 
 
 class QueryError(Exception):
@@ -457,131 +454,6 @@ class TestLineSender(unittest.TestCase):
         scrubbed_dataset = [row[:-1] for row in resp['dataset']]
         self.assertEqual(scrubbed_dataset, exp_dataset)
 
-    def _test_example(self, bin_name, table_name, tls=False):
-        if tls and not QDB_FIXTURE.auth:
-            self.skipTest('No auth')
-        # Call the example program.
-        proj = Project()
-        ext = '.exe' if sys.platform == 'win32' else ''
-        bin_path = next(proj.build_dir.glob(f'**/{bin_name}{ext}'))
-        port = QDB_FIXTURE.line_tcp_port
-        args = [str(bin_path)]
-        if tls:
-            ca_path = proj.tls_certs_dir / 'server_rootCA.pem'
-            args.append(str(ca_path))
-            port = TLS_PROXY_FIXTURE.listen_port
-        args.extend(['localhost', str(port)])
-        subprocess.check_call(args, cwd=bin_path.parent)
-
-        # Check inserted data.
-        resp = retry_check_table(table_name)
-        exp_columns = [
-            {'name': 'id', 'type': 'SYMBOL'},
-            {'name': 'x', 'type': 'DOUBLE'},
-            {'name': 'y', 'type': 'DOUBLE'},
-            {'name': 'booked', 'type': 'BOOLEAN'},
-            {'name': 'passengers', 'type': 'LONG'},
-            {'name': 'driver', 'type': 'STRING'},
-            {'name': 'timestamp', 'type': 'TIMESTAMP'}]
-        self.assertEqual(resp['columns'], exp_columns)
-
-        exp_dataset = [[
-            'd6e5fe92-d19f-482a-a97a-c105f547f721',
-            30.5,
-            -150.25,
-            True,
-            3,
-            'Ranjit Singh']]  # Comparison excludes timestamp column.
-        scrubbed_dataset = [row[:-1] for row in resp['dataset']]
-        self.assertEqual(scrubbed_dataset, exp_dataset)
-
-    def test_c_example(self):
-        suffix = '_auth' if QDB_FIXTURE.auth else ''
-        self._test_example(
-            f'line_sender_c_example{suffix}',
-            f'c_cars{suffix}')
-
-    def test_cpp_example(self):
-        suffix = '_auth' if QDB_FIXTURE.auth else ''
-        self._test_example(
-            f'line_sender_cpp_example{suffix}',
-            f'cpp_cars{suffix}')
-
-    def test_c_tls_example(self):
-        self._test_example(
-            'line_sender_c_example_tls',
-            'c_cars_tls',
-            tls=True)
-
-    def test_cpp_tls_example(self):
-        self._test_example(
-            'line_sender_cpp_example_tls',
-            'cpp_cars_tls',
-            tls=True)
-
-    def test_opposite_auth(self):
-        """
-        We simulate incorrectly connecting either:
-          * An authenticating client to a non-authenticating DB instance.
-          * Or a non-authenticating client to an authenticating DB instance.
-        """
-        client_auth = None if QDB_FIXTURE.auth else AUTH
-        sender = qls.LineSender(
-            QDB_FIXTURE.host,
-            QDB_FIXTURE.line_tcp_port,
-            auth=client_auth)
-        if client_auth:
-            with self.assertRaisesRegex(
-                    qls.LineSenderError,
-                    r'.*not receive auth challenge.*'):
-                sender.connect()
-        else:
-            table_name = uuid.uuid4().hex
-            with sender:  # Connecting will not fail.
-
-                # The sending the first line will not fail.
-                (sender
-                    .table(table_name)
-                    .symbol('s1', 'v1')
-                    .at_now())
-                sender.flush()
-
-                self._expect_eventual_disconnect(sender)
-
-    def test_unrecognized_auth(self):
-        if not QDB_FIXTURE.auth:
-            self.skipTest('No auth')
-
-        sender = qls.LineSender(
-            QDB_FIXTURE.host,
-            QDB_FIXTURE.line_tcp_port,
-            auth=AUTH_UNRECOGNIZED)
-
-        with sender:
-            self._expect_eventual_disconnect(sender)
-
-    def test_malformed_auth(self):
-        if not QDB_FIXTURE.auth:
-            self.skipTest('No auth')
-
-        sender = qls.LineSender(
-            QDB_FIXTURE.host,
-            QDB_FIXTURE.line_tcp_port,
-            auth=AUTH_MALFORMED)
-
-        with self.assertRaisesRegex(
-                qls.LineSenderError,
-                r'.*Bad private key.*'):
-            sender.connect()
-
-    def test_tls_insecure_skip_verify(self):
-        sender = qls.LineSender(
-            QDB_FIXTURE.host,
-            TLS_PROXY_FIXTURE.listen_port,
-            auth=AUTH if QDB_FIXTURE.auth else None,
-            tls=qls.Tls.InsecureSkipVerify)
-        self._test_single_symbol_impl(sender)
-
 
 def parse_args():
     parser = argparse.ArgumentParser('Run system tests.')
@@ -635,7 +507,6 @@ def run_with_existing(args):
 
 def run_with_fixtures(args):
     global QDB_FIXTURE
-    global TLS_PROXY_FIXTURE
     versions = None
     versions_args = getattr(args, 'versions', None)
     if versions_args:
@@ -655,21 +526,14 @@ def run_with_fixtures(args):
             in list_questdb_releases(last_n)}
     for version, download_url in versions.items():
         questdb_dir = install_questdb(version, download_url)
-        for auth in (False, True):
-            QDB_FIXTURE = QuestDbFixture(questdb_dir, auth=auth)
-            TLS_PROXY_FIXTURE = None
-            try:
-                QDB_FIXTURE.start()
-                TLS_PROXY_FIXTURE = TlsProxyFixture(QDB_FIXTURE.line_tcp_port)
-                TLS_PROXY_FIXTURE.start()
-
-                test_prog = unittest.TestProgram(exit=False)
-                if not test_prog.result.wasSuccessful():
-                    sys.exit(1)
-            finally:
-                if TLS_PROXY_FIXTURE:
-                    TLS_PROXY_FIXTURE.stop()
-                QDB_FIXTURE.stop()
+        QDB_FIXTURE = QuestDbFixture(questdb_dir, auth=False)
+        try:
+            QDB_FIXTURE.start()
+            test_prog = unittest.TestProgram(exit=False)
+            if not test_prog.result.wasSuccessful():
+                sys.exit(1)
+        finally:
+            QDB_FIXTURE.stop()
 
 
 def run(args, show_help=False):
