@@ -510,12 +510,23 @@ TEST_CASE("Test timestamp column.")
     questdb::ilp::test::mock_server server;
     questdb::ilp::line_sender sender{"localhost", server.port()};
 
+    const auto now = std::chrono::system_clock::now();
+    const auto now_micros =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            now.time_since_epoch()).count();
+    const auto now_nanos =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            now.time_since_epoch()).count();
+
     sender
         .table("test")
         .column("ts1", questdb::ilp::timestamp_micros{12345})
-        .at_now();
+        .column("ts2", questdb::ilp::timestamp_micros{now})
+        .at(now);
 
-    const auto exp = std::string_view{"test ts1=12345t\n"};
+    std::stringstream ss;
+    ss << "test ts1=12345t,ts2=" << now_micros << "t " << now_nanos << "\n";
+    const auto exp = ss.str();
     CHECK(sender.peek_pending() == exp);
 
     sender.flush();

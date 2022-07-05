@@ -31,6 +31,7 @@
 #include <stdexcept>
 #include <cstdint>
 #include <optional>
+#include <chrono>
 
 namespace questdb::ilp
 {
@@ -222,6 +223,12 @@ namespace questdb::ilp
     class timestamp_micros
     {
     public:
+        template <typename ClockT, typename DurationT>
+        timestamp_micros(std::chrono::time_point<ClockT, DurationT> tp)
+            : _ts{std::chrono::duration_cast<std::chrono::microseconds>(
+                tp.time_since_epoch()).count()}
+        {}
+
         explicit timestamp_micros(int64_t ts)
             : _ts{ts}
         {}
@@ -235,6 +242,12 @@ namespace questdb::ilp
     class timestamp_nanos
     {
     public:
+        template <typename ClockT, typename DurationT>
+        timestamp_nanos(std::chrono::time_point<ClockT, DurationT> tp)
+            : _ts{std::chrono::duration_cast<std::chrono::nanoseconds>(
+                tp.time_since_epoch()).count()}
+        {}
+
         explicit timestamp_nanos(int64_t ts)
             : _ts{ts}
         {}
@@ -420,6 +433,9 @@ namespace questdb::ilp
 
     /**
      * Insert data into QuestDB via the InfluxDB Line Protocol.
+     * 
+     * A `line_sender` object connects on construction.
+     * If you want to connect later, wrap it up in an std::optional.
      *
      * Batch up rows, then call `.flush()` to send.
      */
