@@ -25,7 +25,8 @@ digraph line_sender_c_api {
       label="line_sender_column_bool(sender, name, value, err_out)
 line_sender_column_i64(sender, name, value, err_out)
 line_sender_column_f64(sender, name, value, err_out)
-line_sender_column_str(sender, name, value, err_out)"];
+line_sender_column_str(sender, name, value, err_out)
+line_sender_column_ts(sender, name, micros, err_out)"];
   line_sender_at [
       label="line_sender_at(sender, timestamp, err_out)
 line_sender_at_now(sender, err_out)"];
