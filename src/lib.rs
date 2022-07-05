@@ -28,6 +28,7 @@ use std::fmt::{self, Write, Display, Formatter};
 use std::io::{self, BufRead, BufReader, Write as IoWrite, ErrorKind};
 use std::sync::Arc;
 use std::path::PathBuf;
+use itoa;
 
 use socket2::{Domain, Socket, SockAddr, Type, Protocol};
 use base64ct::{Base64, Base64UrlUnpadded, Encoding};
@@ -35,10 +36,12 @@ use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
 use rustls::{
     OwnedTrustAnchor, RootCertStore, ClientConnection, ServerName, StreamOwned};
 
+pub use crate::timestamp::{TimestampMicros, TimestampNanos};
+
 macro_rules! fmt_err {
     ($code:ident, $($arg:tt)*) => {
-        Error {
-            code: ErrorCode::$code,
+        crate::Error {
+            code: crate::ErrorCode::$code,
             msg: format!($($arg)*)
         }
     }
@@ -114,8 +117,11 @@ pub enum ErrorCode {
     /// The string or symbol field is not encoded in valid UTF-8.
     InvalidUtf8,
 
-    /// The table name, symbol name or column name contains bad characters.
+    /// The table name or column name contains bad characters.
     InvalidName,
+
+    /// The supplied timestamp is invalid.
+    InvalidTimestamp,
 
     /// Error during the authentication process.
     AuthError,
@@ -967,7 +973,10 @@ impl LineSender {
             Error: From<N::Error>
     {
         self.write_column_key(name)?;
-        write!(&mut self.output, "{}i", value).unwrap();
+        let mut buf = itoa::Buffer::new();
+        let printed = buf.format(value);
+        self.output.push_str(printed);
+        self.output.push('i');
         Ok(self)
     }
 
@@ -995,6 +1004,23 @@ impl LineSender {
         Ok(self)
     }
 
+    pub fn column_ts<'a, N, T>(
+        &mut self, name: N, value: T) -> Result<&mut Self>
+        where
+            N: TryInto<ColumnName<'a>>,
+            T: TryInto<TimestampMicros>,
+            Error: From<N::Error>,
+            Error: From<T::Error>
+    {
+        self.write_column_key(name)?;
+        let timestamp: TimestampMicros = value.try_into()?;
+        let mut buf = itoa::Buffer::new();
+        let printed = buf.format(timestamp.as_i64());
+        self.output.push_str(printed);
+        self.output.push('t');
+        Ok(self)
+    }
+
     pub fn pending_size(&self) -> usize {
         if self.state != State::Moribund {
             self.output.len()
@@ -1008,9 +1034,19 @@ impl LineSender {
         self.output.as_str()
     }
 
-    pub fn at(&mut self, epoch_nanos: i64) -> Result<()> {
+    pub fn at<T>(&mut self, timestamp: T) -> Result<()>
+        where
+            T: TryInto<TimestampNanos>,
+            Error: From<T::Error>
+    {
         self.check_state(Op::At)?;
-        write!(&mut self.output, " {}\n", epoch_nanos).unwrap();
+        let mut buf = itoa::Buffer::new();
+        let timestamp: TimestampNanos = timestamp.try_into()?;
+        let epoch_nanos = timestamp.as_i64();
+        let printed = buf.format(epoch_nanos);
+        self.output.push(' ');
+        self.output.push_str(printed);
+        self.output.push('\n');
         self.state = State::MayFlushOrTable;
         Ok(())
     }
@@ -1042,6 +1078,7 @@ impl LineSender {
 }
 
 mod gai;
+mod timestamp;
 
 #[allow(non_camel_case_types)]
 #[cfg(feature = "ffi")]

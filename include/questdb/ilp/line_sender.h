@@ -58,8 +58,11 @@ typedef enum line_sender_error_code
     /** The string or symbol field is not encoded in valid UTF-8. */
     line_sender_error_invalid_utf8,
 
-    /** The table name, symbol name or column name contains bad characters. */
+    /** The table name or column name contains bad characters. */
     line_sender_error_invalid_name,
+
+    /** The supplied timestamp is invalid. */
+    line_sender_error_invalid_timestamp,
 
     /** Error during the authentication process. */
     line_sender_error_auth_error,
@@ -82,9 +85,6 @@ void line_sender_error_free(line_sender_error*);
 
 
 /////////// Preparing strings and names
-
-#define QDB_CONCAT_INNER(a, b) a ## b
-#define QDB_CONCAT(a, b) QDB_CONCAT_INNER(a, b)
 
 /** Non-owning validated UTF-8 encoded string. */
 typedef struct line_sender_utf8
@@ -120,15 +120,6 @@ bool line_sender_utf8_init(
  */
 LINESENDER_API
 line_sender_utf8 line_sender_utf8_assert(size_t len, const char* buf);
-
-#define QDB_UTF_8_FROM_STR_OR(var_name, const_char_p_expr, err_p_p)            \
-    line_sender_utf8 var_name = {0, NULL};                                     \
-    const char* QDB_CONCAT(var_name, ____STR_EXPR) = (const_char_p_expr);      \
-    if (!line_sender_utf8_init(                                                \
-        &var_name,                                                             \
-        strlen(QDB_CONCAT(var_name, ____STR_EXPR)),                            \
-        QDB_CONCAT(var_name, ____STR_EXPR),                                    \
-        err_p_p))
 
 #define QDB_UTF8_LITERAL(literal)                                              \
     line_sender_utf8_assert(sizeof(literal) - 1, (literal))
@@ -172,15 +163,6 @@ line_sender_table_name line_sender_table_name_assert(
     size_t len,
     const char* buf);
 
-#define QDB_TABLE_NAME_FROM_STR_OR(var_name, const_char_p_expr, err_p_p)       \
-    line_sender_table_name var_name = {0, NULL};                               \
-    const char* QDB_CONCAT(var_name, ____STR_EXPR) = (const_char_p_expr);      \
-    if (!line_sender_table_name_init(                                          \
-        &var_name,                                                             \
-        strlen(QDB_CONCAT(var_name, ____STR_EXPR)),                            \
-        QDB_CONCAT(var_name, ____STR_EXPR),                                    \
-        err_p_p))
-
 #define QDB_TABLE_NAME_LITERAL(literal)                                        \
     line_sender_table_name_assert(sizeof(literal) - 1, (literal))
 
@@ -222,15 +204,6 @@ LINESENDER_API
 line_sender_column_name line_sender_column_name_assert(
     size_t len,
     const char* buf);
-
-#define QDB_COLUMN_NAME_FROM_STR_OR(var_name, const_char_p_expr, err_p_p)      \
-    line_sender_column_name var_name = {0, NULL};                              \
-    const char* QDB_CONCAT(var_name, ____STR_EXPR) = (const_char_p_expr);      \
-    if (!line_sender_column_name_init(                                         \
-        &var_name,                                                             \
-        strlen(QDB_CONCAT(var_name, ____STR_EXPR)),                            \
-        QDB_CONCAT(var_name, ____STR_EXPR),                                    \
-        err_p_p))
 
 #define QDB_COLUMN_NAME_LITERAL(literal)                                       \
     line_sender_column_name_assert(sizeof(literal) - 1, (literal))
@@ -472,6 +445,21 @@ bool line_sender_column_str(
     line_sender* sender,
     line_sender_column_name name,
     line_sender_utf8 value,
+    line_sender_error** err_out);
+
+/**
+ * Append a value for a TIMESTAMP column.
+ * @param[in] sender Line sender object.
+ * @param[in] name Column name.
+ * @param[in] micros The timestamp in microseconds since the unix epoch.
+ * @param[out] err_out Set on error.
+ * @return true on success, false on error.
+ */
+LINESENDER_API
+bool line_sender_column_ts(
+    line_sender* sender,
+    line_sender_column_name name,
+    int64_t micros,
     line_sender_error** err_out);
 
 /**

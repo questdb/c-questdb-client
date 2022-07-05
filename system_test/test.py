@@ -457,6 +457,26 @@ class TestLineSender(unittest.TestCase):
         scrubbed_dataset = [row[:-1] for row in resp['dataset']]
         self.assertEqual(scrubbed_dataset, exp_dataset)
 
+    def test_timestamp_column(self):
+        table_name = uuid.uuid4().hex
+        pending = None
+        ts = qls.TimestampMicros(3600000000)  # One hour past epoch.
+        with self._mk_linesender() as sender:
+            (sender
+                .table(table_name)
+                .column('ts1', ts)
+                .at_now())
+            pending = sender.peek_pending()
+        
+        resp = retry_check_table(table_name, log_ctx=pending)
+        exp_columns = [
+            {'name': 'ts1', 'type': 'TIMESTAMP'},
+            {'name': 'timestamp', 'type': 'TIMESTAMP'}]
+        self.assertEqual(resp['columns'], exp_columns)
+        exp_dataset = [['1970-01-01T01:00:00.000000Z']]
+        scrubbed_dataset = [row[:-1] for row in resp['dataset']]
+        self.assertEqual(scrubbed_dataset, exp_dataset)
+
     def _test_example(self, bin_name, table_name, tls=False):
         if tls and not QDB_FIXTURE.auth:
             self.skipTest('No auth')

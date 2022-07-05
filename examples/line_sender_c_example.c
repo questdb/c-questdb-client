@@ -9,10 +9,12 @@ static bool example(const char* host, const char* port)
     line_sender_opts* opts = NULL;
     line_sender* sender = NULL;
 
-    QDB_UTF_8_FROM_STR_OR(host_utf8, host, &err)
+    line_sender_utf8 host_utf8 = { 0, NULL };
+    if (!line_sender_utf8_init(&host_utf8, strlen(host), host, &err))
         goto on_error;
 
-    QDB_UTF_8_FROM_STR_OR(port_utf8, port, &err)
+    line_sender_utf8 port_utf8 = { 0, NULL };
+    if (!line_sender_utf8_init(&port_utf8, strlen(port), port, &err))
         goto on_error;
 
     // Call `line_sender_opts_new` if instead you have an integer port.

@@ -54,8 +54,11 @@ namespace questdb::ilp
         /** The string or symbol field is not encoded in valid UTF-8. */
         invalid_utf8,
 
-        /** The table name, symbol name or column name contains bad characters. */
+        /** The table name or column name contains bad characters. */
         invalid_name,
+
+        /** The supplied timestamp is invalid. */
+        invalid_timestamp,
 
         /** Error during the authentication process. */
         auth_error,
@@ -215,6 +218,32 @@ namespace questdb::ilp
             return column_name_view{buf, len};
         }
     }
+
+    class timestamp_micros
+    {
+    public:
+        explicit timestamp_micros(int64_t ts)
+            : _ts{ts}
+        {}
+
+        int64_t as_micros() const noexcept { return _ts; }
+
+    private:
+        int64_t _ts;
+    };
+
+    class timestamp_nanos
+    {
+    public:
+        explicit timestamp_nanos(int64_t ts)
+            : _ts{ts}
+        {}
+
+        int64_t as_nanos() const noexcept { return _ts; }
+
+    private:
+        int64_t _ts;
+    };
 
     class opts
     {
@@ -548,6 +577,17 @@ namespace questdb::ilp
             return column(name, utf8_view{value});
         }
 
+        line_sender& column(column_name_view name, timestamp_micros value)
+        {
+            ensure_impl();
+            line_sender_error::wrapped_call(
+                ::line_sender_column_ts,
+                _impl,
+                name._impl,
+                value.as_micros());
+            return *this;
+        }
+
         /**
          * Complete the row with a specified timestamp.
          *
@@ -555,15 +595,15 @@ namespace questdb::ilp
          * `.table(..)` again, or you can send the accumulated batch by
          * calling `.flush(..)`.
          *
-         * @param epoch_nanos Number of nanoseconds since 1st Jan 1970 UTC.
+         * @param timestamp Number of nanoseconds since 1st Jan 1970 UTC.
          */
-        void at(int64_t epoch_nanos)
+        void at(timestamp_nanos timestamp)
         {
             ensure_impl();
             line_sender_error::wrapped_call(
                 ::line_sender_at,
                 _impl,
-                epoch_nanos);
+                timestamp.as_nanos());
         }
 
         /**

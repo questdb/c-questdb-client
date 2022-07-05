@@ -115,7 +115,7 @@ TEST_CASE("line_sender c++ api basics")
         .symbol("t1", "v1")
         .symbol("t2", "")
         .column("f1", 0.5)
-        .at(10000000);
+        .at(questdb::ilp::timestamp_nanos{10000000});
 
     CHECK(server.recv() == 0);
     CHECK(sender.pending_size() == 31);
@@ -145,7 +145,7 @@ TEST_CASE("test multiple lines")
         .column("f4"_cn, "val3"_utf8)
         .column("f5"_cn, "val4"_utf8)
         .column("f6"_cn, "val5"_utf8)
-        .at(111222233333);
+        .at(questdb::ilp::timestamp_nanos{111222233333});
     sender
         .table(table_name)
         .symbol("tag3"_cn, "value 3"_utf8)
@@ -503,4 +503,26 @@ TEST_CASE("Opts copy ctor, assignment and move testing.")
         questdb::ilp::opts opts2{"altavista.digital.com", "9009"};
         opts1 = opts2;
     }
+}
+
+TEST_CASE("Test timestamp column.")
+{
+    questdb::ilp::test::mock_server server;
+    questdb::ilp::line_sender sender{"localhost", server.port()};
+
+    sender
+        .table("test")
+        .column("ts1", questdb::ilp::timestamp_micros{12345})
+        .at_now();
+
+    const auto exp = std::string_view{"test ts1=12345t\n"};
+    CHECK(sender.peek_pending() == exp);
+
+    sender.flush();
+
+    server.accept();
+    sender.close();
+
+    CHECK(server.recv() == 1);
+    CHECK(server.msgs()[0] == exp);
 }

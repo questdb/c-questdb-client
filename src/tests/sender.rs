@@ -27,7 +27,9 @@ use crate::{
     CertificateAuthority,
     Tls,
     Error,
-    ErrorCode};
+    ErrorCode,
+    TimestampMicros,
+    TimestampNanos};
 
 use crate::tests::{TestResult, TestError, mock::{MockServer, certs_dir}};
 
@@ -43,14 +45,21 @@ fn test_basics() -> TestResult {
 
     assert_eq!(server.recv_q()?, 0);
 
+    let ts = std::time::SystemTime::now();
+    let ts_micros = ts.duration_since(
+        std::time::SystemTime::UNIX_EPOCH)?.as_micros() as i64;
+
     sender
         .table("test")?
         .symbol("t1", "v1")?
         .column_f64("f1", 0.5)?
-        .at(10000000)?;
+        .column_ts("ts1", TimestampMicros::new(12345)?)?
+        .column_ts("ts2", ts)?
+        .at(TimestampNanos::new(10000000)?)?;
 
     assert_eq!(server.recv_q()?, 0);
-    let exp = "test,t1=v1 f1=0.5 10000000\n";
+    let exp = format!(
+        "test,t1=v1 f1=0.5,ts1=12345t,ts2={}t 10000000\n", ts_micros);
     assert_eq!(sender.peek_pending(), exp);
     assert_eq!(sender.pending_size(), exp.len());
     sender.flush()?;
@@ -140,7 +149,7 @@ fn test_tls_with_file_ca() -> TestResult {
         .table("test")?
         .symbol("t1", "v1")?
         .column_f64("f1", 0.5)?
-        .at(10000000)?;
+        .at(TimestampNanos::new(10000000)?)?;
 
     assert_eq!(server.recv_q()?, 0);
     let exp = "test,t1=v1 f1=0.5 10000000\n";
@@ -230,7 +239,7 @@ fn test_tls_insecure_skip_verify() -> TestResult {
         .table("test")?
         .symbol("t1", "v1")?
         .column_f64("f1", 0.5)?
-        .at(10000000)?;
+        .at(TimestampNanos::new(10000000)?)?;
 
     assert_eq!(server.recv_q()?, 0);
     let exp = "test,t1=v1 f1=0.5 10000000\n";

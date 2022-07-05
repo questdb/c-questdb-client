@@ -39,7 +39,9 @@ use super::{
     LineSender,
     LineSenderBuilder,
     Tls,
-    CertificateAuthority};
+    CertificateAuthority,
+    TimestampMicros,
+    TimestampNanos};
 
 macro_rules! bubble_err_to_c {
     ($err_out:expr, $expression:expr) => {
@@ -86,8 +88,11 @@ pub enum line_sender_error_code {
     /// The string or symbol field is not encoded in valid UTF-8.
     line_sender_error_invalid_utf8,
 
-    /// The table name, symbol name or column name contains bad characters.
+    /// The table name or column name contains bad characters.
     line_sender_error_invalid_name,
+
+    /// The supplied timestamp is invalid.
+    line_sender_error_invalid_timestamp,
 
     /// Error during the authentication process.
     line_sender_error_auth_error,
@@ -110,6 +115,8 @@ impl From<ErrorCode> for line_sender_error_code {
                 line_sender_error_code::line_sender_error_invalid_utf8,
             ErrorCode::InvalidName =>
                 line_sender_error_code::line_sender_error_invalid_name,
+            ErrorCode::InvalidTimestamp =>
+                line_sender_error_code::line_sender_error_invalid_timestamp,
             ErrorCode::AuthError =>
                 line_sender_error_code::line_sender_error_auth_error,
             ErrorCode::TlsError =>
@@ -729,6 +736,29 @@ pub unsafe extern "C" fn line_sender_column_str(
     true
 }
 
+/// Append a value for a TIMESTAMP column.
+/// @param[in] sender Line sender object.
+/// @param[in] name Column name.
+/// @param[in] micros The timestamp in microseconds since the unix epoch.
+/// @param[out] err_out Set on error.
+/// @return true on success, false on error.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_column_ts(
+    sender: *mut line_sender,
+    name: line_sender_column_name,
+    micros: i64,
+    err_out: *mut *mut line_sender_error) -> bool
+{
+    let sender = unwrap_sender_mut(sender);
+    let timestamp = bubble_err_to_c!(
+        err_out,
+        TimestampMicros::new(micros));
+    bubble_err_to_c!(
+        err_out,
+        sender.column_ts(name.as_name(), timestamp));
+    true
+}
+
 /// Complete the row with a specified timestamp.
 ///
 /// After this call, you can start batching the next row by calling
@@ -746,9 +776,12 @@ pub unsafe extern "C" fn line_sender_at(
     err_out: *mut *mut line_sender_error) -> bool
 {
     let sender = unwrap_sender_mut(sender);
+    let timestamp = bubble_err_to_c!(
+        err_out,
+        TimestampNanos::new(epoch_nanos));
     bubble_err_to_c!(
         err_out,
-        sender.at(epoch_nanos));
+        sender.at(timestamp));
     true
 }
 

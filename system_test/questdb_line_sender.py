@@ -30,6 +30,7 @@ sys.dont_write_bytecode = True
 import pathlib
 import ctypes
 import os
+from datetime import datetime
 
 from ctypes import (
     c_bool,
@@ -244,6 +245,13 @@ def _setup_cdll():
         c_line_sender_utf8,
         c_line_sender_error_p_p)
     set_sig(
+        dll.line_sender_column_ts,
+        c_bool,
+        c_line_sender_p,
+        c_line_sender_column_name,
+        c_int64,
+        c_line_sender_error_p_p)
+    set_sig(
         dll.line_sender_at,
         c_bool,
         c_line_sender_p,
@@ -381,6 +389,11 @@ class _Opts:
         _DLL.line_sender_opts_free(self.impl)
 
 
+class TimestampMicros:
+    def __init__(self, micros: int):
+        self.value = micros
+
+
 # This code is *just good enough* for testing purposes and is not intended to
 # be used as Python bindings. If you are looking for Python bindings and come
 # across this code, contact us on https://slack.questdb.io/ where we may offer
@@ -456,7 +469,9 @@ class LineSender:
             _utf8(value))
         return self
 
-    def column(self, name: str, value: Union[bool, int, float, str]):
+    def column(
+            self, name: str,
+            value: Union[bool, int, float, str, TimestampMicros, datetime]):
         if isinstance(value, bool):
             _error_wrapped_call(
                 _DLL.line_sender_column_bool,
@@ -481,6 +496,19 @@ class LineSender:
                 self._impl,
                 _column_name(name),
                 _utf8(value))
+        elif isinstance(value, TimestampMicros):
+            _error_wrapped_call(
+                _DLL.line_sender_column_ts,
+                self._impl,
+                _column_name(name),
+                value.value)
+        elif isinstance(value, datetime):
+            micros_epoch = int(value.timestamp()) * 1e6 + value.microsecond
+            _error_wrapped_call(
+                _DLL.line_sender_column_ts,
+                self._impl,
+                _column_name(name),
+                micros_epoch)
         else:
             fqn = _fully_qual_name(value)
             raise ValueError(
