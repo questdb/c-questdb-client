@@ -6,65 +6,66 @@
 static bool example(const char* ca_path, const char* host, const char* port)
 {
     line_sender_error* err = NULL;
+    line_sender_opts* opts = NULL;
     line_sender* sender = NULL;
 
-    // Follow our authentication documentation to generate your own keys:
-    // https://questdb.io/docs/reference/api/ilp/authenticate
-    line_sender_sec_opts sec_opts;
-    memset(&sec_opts, 0, sizeof(sec_opts));
-    sec_opts.auth_key_id = "testUser1";
-    sec_opts.auth_priv_key = "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48";
-    sec_opts.auth_pub_key_x = "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU";
-    sec_opts.auth_pub_key_y = "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac";
-    sec_opts.tls = line_sender_tls_enabled;
-    sec_opts.tls_ca = ca_path;
+    line_sender_utf8 host_utf8 = { 0, NULL };
+    if (!line_sender_utf8_init(&host_utf8, strlen(host), host, &err))
+        goto on_error;
 
-    sender = line_sender_connect_secure("0.0.0.0", host, port, &sec_opts, &err);
+    line_sender_utf8 port_utf8 = { 0, NULL };
+    if (!line_sender_utf8_init(&port_utf8, strlen(port), port, &err))
+        goto on_error;
+
+    // Call `line_sender_opts_new` if instead you have an integer port.
+    opts = line_sender_opts_new_service(host_utf8, port_utf8);
+
+    // This example uses a custom certificate authority file.
+    // You can use the default certificate authority by instead calling
+    // `line_sender_opts_tls` which takes no arguments.
+    line_sender_utf8 ca_path_utf8 = { 0, NULL };
+    if (!line_sender_utf8_init(&ca_path_utf8, strlen(ca_path), ca_path, &err))
+        goto on_error;
+    line_sender_opts_tls_ca(opts, ca_path_utf8);
+
+    // Use `QDB_UTF_8_FROM_STR_OR` to init from `const char*`.
+    line_sender_utf8 key_id = QDB_UTF8_LITERAL("testUser1");
+    line_sender_utf8 priv_key = QDB_UTF8_LITERAL(
+        "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48");
+    line_sender_utf8 pub_key_x = QDB_UTF8_LITERAL(
+        "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU");
+    line_sender_utf8 pub_key_y = QDB_UTF8_LITERAL(
+        "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac");
+
+    line_sender_opts_auth(
+        opts,
+        key_id,      // kid
+        priv_key,    // d
+        pub_key_x,   // x
+        pub_key_y);  // y
+    sender = line_sender_connect(opts, &err);
+    line_sender_opts_free(opts);
+    opts = NULL;
     if (!sender)
         goto on_error;
 
     // We prepare all our table names and column names in advance.
     // If we're inserting multiple rows, this allows us to avoid
     // re-validating the same strings over and over again.
-    line_sender_name table_name;
-    if (!line_sender_name_init(&table_name, 10, "c_cars_tls", &err))
-        goto on_error;
-
-    line_sender_name id_name;
-    if (!line_sender_name_init(&id_name, 2, "id", &err))
-        goto on_error;
-
-    line_sender_name x_name;
-    if (!line_sender_name_init(&x_name, 1, "x", &err))
-        goto on_error;
-
-    line_sender_name y_name;
-    if (!line_sender_name_init(&y_name, 1, "y", &err))
-        goto on_error;
-
-    line_sender_name booked_name;
-    if (!line_sender_name_init(&booked_name, 6, "booked", &err))
-        goto on_error;
-
-    line_sender_name passengers_name;
-    if (!line_sender_name_init(&passengers_name, 10, "passengers", &err))
-        goto on_error;
-
-    line_sender_name driver_name;
-    if (!line_sender_name_init(&driver_name, 6, "driver", &err))
-        goto on_error;
+    line_sender_table_name table_name = QDB_TABLE_NAME_LITERAL("c_cars_tls");
+    line_sender_column_name id_name = QDB_COLUMN_NAME_LITERAL("id");
+    line_sender_column_name x_name = QDB_COLUMN_NAME_LITERAL("x");
+    line_sender_column_name y_name = QDB_COLUMN_NAME_LITERAL("y");
+    line_sender_column_name booked_name = QDB_COLUMN_NAME_LITERAL("booked");
+    line_sender_column_name passengers_name = QDB_COLUMN_NAME_LITERAL(
+        "passengers");
+    line_sender_column_name driver_name = QDB_COLUMN_NAME_LITERAL("driver");
 
     if (!line_sender_table(sender, table_name, &err))
         goto on_error;
 
-    line_sender_utf8 id_value;
-    if (!line_sender_utf8_init(
-        &id_value,
-        36,
-        "d6e5fe92-d19f-482a-a97a-c105f547f721",
-        &err))
-        goto on_error;
-
+    line_sender_utf8 id_value = QDB_UTF8_LITERAL(
+        "d6e5fe92-d19f-482a-a97a-c105f547f721");
     if (!line_sender_symbol(sender, id_name, id_value, &err))
         goto on_error;
 
@@ -80,14 +81,7 @@ static bool example(const char* ca_path, const char* host, const char* port)
     if (!line_sender_column_i64(sender, passengers_name, 3, &err))
         goto on_error;
 
-    line_sender_utf8 driver_value;
-    if (!line_sender_utf8_init(
-        &driver_value,
-        12,
-        "Ranjit Singh",
-        &err))
-        goto on_error;
-
+    line_sender_utf8 driver_value = QDB_UTF8_LITERAL("John Doe");
     if (!line_sender_column_str(sender, driver_name, driver_value, &err))
         goto on_error;
 
@@ -104,12 +98,12 @@ static bool example(const char* ca_path, const char* host, const char* port)
     return true;
 
 on_error: ;
+    line_sender_opts_free(opts);
     size_t err_len = 0;
     const char* err_msg = line_sender_error_msg(err, &err_len);
     fprintf(stderr, "Error running example: %.*s\n", (int)err_len, err_msg);
     line_sender_error_free(err);
-    if (sender)
-        line_sender_close(sender);
+    line_sender_close(sender);
     return false;
 }
 

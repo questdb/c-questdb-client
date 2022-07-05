@@ -31,12 +31,14 @@
 #include <stdexcept>
 #include <cstdint>
 #include <optional>
+#include <chrono>
 
 namespace questdb::ilp
 {
     constexpr const char* inaddr_any = "0.0.0.0";
 
     class line_sender;
+    class opts;
 
     /** Category of error. */
     enum class line_sender_error_code
@@ -53,8 +55,11 @@ namespace questdb::ilp
         /** The string or symbol field is not encoded in valid UTF-8. */
         invalid_utf8,
 
-        /** The table name, symbol name or column name contains bad characters. */
+        /** The table name or column name contains bad characters. */
         invalid_name,
+
+        /** The supplied timestamp is invalid. */
+        invalid_timestamp,
 
         /** Error during the authentication process. */
         auth_error,
@@ -76,7 +81,7 @@ namespace questdb::ilp
                 , _code{code}
         {}
 
-        /** Error code categorising the error. */
+        /** Error code categorizing the error. */
         line_sender_error_code code() const noexcept { return _code; }
 
     private:
@@ -95,73 +100,89 @@ namespace questdb::ilp
         }
 
         template <typename F, typename... Args>
-            inline static void wrapped_call(F&& f, Args&&... args)
+        inline static auto wrapped_call(F&& f, Args&&... args)
         {
             ::line_sender_error* c_err{nullptr};
-            if (!f(std::forward<Args>(args)..., &c_err))
+            auto obj = f(std::forward<Args>(args)..., &c_err);
+            if (obj)
+                return obj;
+            else
                 throw from_c(c_err);
         }
 
         friend class line_sender;
-        friend class utf8_view;
-        friend class name_view;
+        friend class opts;
+
+        template <
+            typename T,
+            bool (*F)(T*, size_t, const char*, ::line_sender_error**)>
+        friend class basic_view;
 
         line_sender_error_code _code;
     };
 
-    /** Non-owning validated UTF-8 encoded string. */
-    class utf8_view
+    /**
+     * Non-owning validated string.
+     *
+     * See `table_name_view`, `column_name_view` and `utf8_view` along with the
+     * `_utf8`, `_tn` and `_cn` literal suffixes in the `literals` namespace.
+     */
+    template <
+        typename T,
+        bool (*F)(T*, size_t, const char*, ::line_sender_error**)>
+    class basic_view
     {
     public:
-        utf8_view(const char* buf, size_t len)
+        basic_view(const char* buf, size_t len)
             : _impl{0, nullptr}
         {
             line_sender_error::wrapped_call(
-                ::line_sender_utf8_init,
+                F,
                 &_impl,
                 len,
                 buf);
         }
 
-        explicit utf8_view(std::string_view s_view)
-            : utf8_view{s_view.data(), s_view.size()}
+        template <size_t N>
+        basic_view(const char (&buf)[N])
+            : basic_view{buf, N - 1}
+        {}
+
+        basic_view(std::string_view s_view)
+            : basic_view{s_view.data(), s_view.size()}
+        {}
+
+        basic_view(const std::string& s)
+            : basic_view{s.data(), s.size()}
         {}
 
         size_t size() const noexcept { return _impl.len; }
+
         const char* data() const noexcept { return _impl.buf; }
 
-    private:
-        ::line_sender_utf8 _impl;
-
-        friend class line_sender;
-    };
-
-    /** Non-owning validated table, symbol or column name. UTF-8 encoded. */
-    class name_view
-    {
-    public:
-        name_view(const char* buf, size_t len)
-            : _impl{0, nullptr}
+        std::string_view to_string_view() const noexcept
         {
-            line_sender_error::wrapped_call(
-                ::line_sender_name_init,
-                &_impl,
-                len,
-                buf);
+            return std::string_view{_impl.buf, _impl.len};
         }
 
-        explicit name_view(std::string_view s_view)
-            : name_view{s_view.data(), s_view.size()}
-        {}
-
-        size_t size() const noexcept { return _impl.len; }
-        const char* data() const noexcept { return _impl.buf; }
-
     private:
-        ::line_sender_name _impl;
+        T _impl;
 
         friend class line_sender;
+        friend class opts;
     };
+
+    using utf8_view = basic_view<
+        ::line_sender_utf8,
+        ::line_sender_utf8_init>;
+
+    using table_name_view = basic_view<
+        ::line_sender_table_name,
+        ::line_sender_table_name_init>;
+
+    using column_name_view = basic_view<
+        ::line_sender_column_name,
+        ::line_sender_column_name_init>;
 
     namespace literals
     {
@@ -177,223 +198,272 @@ namespace questdb::ilp
         }
 
         /**
-         * Utility to construct `name_view` objects from string literals.
+         * Utility to construct `table_name_view` objects from string literals.
          * @code {.cpp}
-         * auto table_name = "events"_name;
+         * auto table_name = "events"_tn;
          * @endcode
          */
-        name_view operator "" _name(const char* buf, size_t len)
+        table_name_view operator "" _tn(const char* buf, size_t len)
         {
-            return name_view{buf, len};
+            return table_name_view{buf, len};
+        }
+
+        /**
+         * Utility to construct `column_name_view` objects from string literals.
+         * @code {.cpp}
+         * auto column_name = "events"_cn;
+         * @endcode
+         */
+        column_name_view operator "" _cn(const char* buf, size_t len)
+        {
+            return column_name_view{buf, len};
         }
     }
 
-    /** Whole connection encryption options. */
-    enum class tls
-    {
-        /** No TLS connection encryption. */
-        disabled,
-
-        /** Enable TLS. See `sec_opts::tls_ca` for behaviour. */
-        enabled,
-
-        /**
-         * Enable TLS whilst dangerously accepting any certificate as valid.
-         * This should only be used for debugging.
-         * Consider using `enabled` and supplying a self-signed `tls_ca` instead.
-         */
-        insecure_skip_verify
-    };
-
-    /**
-     * * Connection security options.
-     */
-    class sec_opts
+    class timestamp_micros
     {
     public:
-        /** Construct with auth parameters and optionally with TLS. */
-        sec_opts(
-            std::string_view auth_key_id,
-            std::string_view auth_priv_key,
-            std::string_view auth_pub_key_x,
-            std::string_view auth_pub_key_y,
-            tls tls = tls::disabled,
-            std::optional<std::string_view> tls_ca = std::nullopt)
-                : _auth_key_id{auth_key_id}
-                , _auth_priv_key{auth_priv_key}
-                , _auth_pub_key_x{auth_pub_key_x}
-                , _auth_pub_key_y{auth_pub_key_y}
-                , _tls{tls}
-                , _tls_ca{tls_ca}
+        template <typename ClockT, typename DurationT>
+        timestamp_micros(std::chrono::time_point<ClockT, DurationT> tp)
+            : _ts{std::chrono::duration_cast<std::chrono::microseconds>(
+                tp.time_since_epoch()).count()}
         {}
 
-        /** Construct with TLS parameters only. */
-        sec_opts(tls tls, std::optional<std::string_view> tls_ca = std::nullopt)
-            : _auth_key_id(std::nullopt)
-            , _auth_priv_key(std::nullopt)
-            , _auth_pub_key_x(std::nullopt)
-            , _auth_pub_key_y(std::nullopt)
-            , _tls(tls)
-            , _tls_ca(tls_ca)
+        explicit timestamp_micros(int64_t ts)
+            : _ts{ts}
         {}
+
+        int64_t as_micros() const noexcept { return _ts; }
 
     private:
-        friend class line_sender;
+        int64_t _ts;
+    };
 
-        /** Authentication key id. AKA "kid". */
-        std::optional<std::string> _auth_key_id;
+    class timestamp_nanos
+    {
+    public:
+        template <typename ClockT, typename DurationT>
+        timestamp_nanos(std::chrono::time_point<ClockT, DurationT> tp)
+            : _ts{std::chrono::duration_cast<std::chrono::nanoseconds>(
+                tp.time_since_epoch()).count()}
+        {}
 
-        /** Authentication private key. AKA "d". */
-        std::optional<std::string> _auth_priv_key;
+        explicit timestamp_nanos(int64_t ts)
+            : _ts{ts}
+        {}
 
-        /** Authentication public key X coordinate. AKA "x". */
-        std::optional<std::string> _auth_pub_key_x;
+        int64_t as_nanos() const noexcept { return _ts; }
 
-        /** Authentication public key Y coordinate. AKA "y". */
-        std::optional<std::string> _auth_pub_key_y;
+    private:
+        int64_t _ts;
+    };
 
-        /** Settings for secure connection over TLS. */
-        tls _tls;
+    class opts
+    {
+        public:
+            /**
+             * A new set of options for a line sender connection.
+             * @param[in] host The QuestDB database host.
+             * @param[in] port The QuestDB database port.
+             */
+            opts(
+                utf8_view host,
+                uint16_t port) noexcept
+                : _impl{::line_sender_opts_new(host._impl, port)}
+            {}
 
-        /**
-         * Set a custom CA file path to use for verification.
-         * If set to a nullopt, defaults to `webpki-roots` certificates which
-         * accepts most well-know certificate authorities.
-         *
-         * This argument is generally only specified during dev-testing.
-         */
-        std::optional<std::string> _tls_ca;
+            /**
+             * A new set of options for a line sender connection.
+             * @param[in] host The QuestDB database host.
+             * @param[in] port The QuestDB database port as service name.
+             */
+            opts(
+                utf8_view host,
+                utf8_view port) noexcept
+                : _impl{::line_sender_opts_new_service(host._impl, port._impl)}
+            {}
+
+            opts(const opts& other)
+                : _impl{::line_sender_opts_clone(other._impl)}
+            {}
+
+            opts(opts&& other) noexcept
+                : _impl{other._impl}
+            {
+                other._impl = nullptr;
+            }
+
+            opts& operator=(const opts& other)
+            {
+                if (this != &other)
+                {
+                    reset();
+                    _impl = ::line_sender_opts_clone(other._impl);
+                }
+                return *this;
+            }
+
+            opts& operator=(opts&& other) noexcept
+            {
+                if (this != &other)
+                {
+                    reset();
+                    _impl = other._impl;
+                    other._impl = nullptr;
+                }
+                return *this;
+            }
+
+            /**
+             * Set the initial buffer capacity (byte count).
+             * The default is 65536.
+             */
+            opts& capacity(size_t capacity) noexcept
+            {
+                ::line_sender_opts_capacity(_impl, capacity);
+                return *this;
+            }
+
+            /** Select local outbound interface. */
+            opts& net_interface(utf8_view net_interface) noexcept
+            {
+                ::line_sender_opts_net_interface(
+                    _impl,
+                    net_interface._impl);
+                return *this;
+            }
+
+            /**
+             * Authentication Parameters.
+             * @param[in] key_id Key id. AKA "kid"
+             * @param[in] priv_key Private key. AKA "d".
+             * @param[in] pub_key_x Public key X coordinate. AKA "x".
+             * @param[in] pub_key_y Public key Y coordinate. AKA "y".
+             */
+            opts& auth(
+                utf8_view key_id,
+                utf8_view priv_key,
+                utf8_view pub_key_x,
+                utf8_view pub_key_y) noexcept
+            {
+                ::line_sender_opts_auth(
+                    _impl,
+                    key_id._impl,
+                    priv_key._impl,
+                    pub_key_x._impl,
+                    pub_key_y._impl);
+                return *this;
+            }
+
+            /**
+             * Enable full connection encryption via TLS.
+             * The connection will accept certificates by well-known certificate
+             * authorities as per the "webpki-roots" Rust crate.
+             */
+            opts& tls() noexcept
+            {
+                ::line_sender_opts_tls(_impl);
+                return *this;
+            }
+
+            /**
+             * Enable full connection encryption via TLS.
+             * The connection will accept certificates by the specified certificate
+             * authority file.
+             */
+            opts& tls(utf8_view ca_file) noexcept
+            {
+                ::line_sender_opts_tls_ca(_impl, ca_file._impl);
+                return *this;
+            }
+
+            /**
+             * Enable TLS whilst dangerously accepting any certificate as valid.
+             * This should only be used for debugging.
+             * Consider using calling "tls_ca" instead.
+             */
+            opts& tls_insecure_skip_verify() noexcept
+            {
+                ::line_sender_opts_tls_insecure_skip_verify(_impl);
+                return *this;
+            }
+
+            /**
+             * Configure how long to wait for messages from the QuestDB server
+             * during the TLS handshake and authentication process.
+             * The default is 15 seconds.
+             */
+            opts& read_timeout(uint64_t timeout_millis) noexcept
+            {
+                ::line_sender_opts_read_timeout(_impl, timeout_millis);
+                return *this;
+            }
+
+            /**
+             * Set the maximum length for table and column names.
+             * This should match the `cairo.max.file.name.length` setting of
+             * the QuestDB instance you're connecting to.
+             * The default value is 127, which is the same as the QuestDB
+             * default.
+             */
+            opts& max_name_len(size_t max_name_len) noexcept
+            {
+                ::line_sender_opts_max_name_len(_impl, max_name_len);
+                return *this;
+            }
+
+            ~opts() noexcept
+            {
+                reset();
+            }
+        private:
+            void reset() noexcept
+            {
+                if (_impl)
+                {
+                    ::line_sender_opts_free(_impl);
+                    _impl = nullptr;
+                }
+            }
+
+            friend class line_sender;
+
+            ::line_sender_opts* _impl;
     };
 
     /**
      * Insert data into QuestDB via the InfluxDB Line Protocol.
+     * 
+     * A `line_sender` object connects on construction.
+     * If you want to connect later, wrap it up in an std::optional.
      *
      * Batch up rows, then call `.flush()` to send.
      */
     class line_sender
     {
     public:
-        line_sender(
-            const char* host,
-            const char* port,
-            const char* net_interface = inaddr_any)
-                : _impl{nullptr}
-        {
-            ::line_sender_error* c_err{nullptr};
-            _impl = ::line_sender_connect(
-                net_interface,
-                host,
-                port,
-                &c_err);
-            if (!_impl)
-                throw line_sender_error::from_c(c_err);
-        }
-
-        line_sender(
-            const char* host,
-            const char* port,
-            const sec_opts& sec_opts,
-            const char* net_interface = inaddr_any)
-                : _impl{nullptr}
-        {
-            ::line_sender_error* c_err{nullptr};
-            ::line_sender_sec_opts c_sec_opts;
-
-            auto to_c_str = [](const std::optional<std::string>& str)
-                {
-                    return str
-                        ? str->c_str()
-                        : nullptr;                
-                };
-
-            c_sec_opts.auth_key_id = to_c_str(sec_opts._auth_key_id);
-            c_sec_opts.auth_priv_key = to_c_str(sec_opts._auth_priv_key);
-            c_sec_opts.auth_pub_key_x = to_c_str(sec_opts._auth_pub_key_x);
-            c_sec_opts.auth_pub_key_y = to_c_str(sec_opts._auth_pub_key_y);
-            c_sec_opts.tls = static_cast<::line_sender_tls>(sec_opts._tls);
-            c_sec_opts.tls_ca = to_c_str(sec_opts._tls_ca);
-            _impl = ::line_sender_connect_secure(
-                net_interface,
-                host,
-                port,
-                &c_sec_opts,
-                &c_err);
-            if (!_impl)
-                throw line_sender_error::from_c(c_err);
-        }
-
-        line_sender(
-            std::string_view host,
-            std::string_view port,
-            std::string_view net_interface = inaddr_any)
-                : line_sender{
-                    std::string{host}.c_str(),
-                    std::string{port}.c_str(),
-                    std::string{net_interface}.c_str()}
+        line_sender(utf8_view host, uint16_t port)
+            : line_sender{opts{host, port}}
         {}
 
-        line_sender(
-            std::string_view host,
-            std::string_view port,
-            const sec_opts& sec_opts,
-            std::string_view net_interface = inaddr_any)
-                : line_sender{
-                    std::string{host}.c_str(),
-                    std::string{port}.c_str(),
-                    sec_opts,
-                    std::string{net_interface}.c_str()}
+        line_sender(utf8_view host, utf8_view port)
+            : line_sender{opts{host, port}}
         {}
 
-        line_sender(
-            std::string_view host,
-            uint16_t port,
-            std::string_view net_interface = inaddr_any)
-                : line_sender{
-                    std::string{host}.c_str(),
-                    std::to_string(port).c_str(),
-                    std::string{net_interface}.c_str()}
+        line_sender(const opts& opts)
+            : _impl{line_sender_error::wrapped_call(
+                ::line_sender_connect, opts._impl)}
         {}
 
-        line_sender(
-            std::string_view host,
-            uint16_t port,
-            const sec_opts& sec_opts,
-            std::string_view net_interface = inaddr_any)
-                : line_sender{
-                    std::string{host}.c_str(),
-                    std::to_string(port).c_str(),
-                    sec_opts,
-                    std::string{net_interface}.c_str()}
-        {}
-
-        line_sender(
-            const char* host,
-            uint16_t port,
-            const char* net_interface = inaddr_any)
-                : line_sender{
-                    host,
-                    std::to_string(port).c_str(),
-                    net_interface}
-        {}
-
-        line_sender(
-            const char* host,
-            uint16_t port,
-            const sec_opts& sec_opts,
-            const char* net_interface = inaddr_any)
-                : line_sender{
-                    host,
-                    std::to_string(port).c_str(),
-                    sec_opts,
-                    net_interface}
-        {}
+        line_sender(const line_sender&) = delete;
 
         line_sender(line_sender&& other) noexcept
             : _impl{other._impl}
         {
-            if (this != &other)
-                other._impl = nullptr;
+            other._impl = nullptr;
         }
+
+        line_sender& operator=(const line_sender&) = delete;
 
         line_sender& operator=(line_sender&& other) noexcept
         {
@@ -406,14 +476,11 @@ namespace questdb::ilp
             return *this;
         }
 
-        line_sender(const line_sender&) = delete;
-        line_sender& operator=(const line_sender&) = delete;
-
         /**
          * Start batching the next row of input for the named table.
          * @param name Table name.
          */
-        line_sender& table(name_view name)
+        line_sender& table(table_name_view name)
         {
             ensure_impl();
             line_sender_error::wrapped_call(
@@ -430,7 +497,7 @@ namespace questdb::ilp
          * @param name Column name.
          * @param value Column value.
          */
-        line_sender& symbol(name_view name, utf8_view value)
+        line_sender& symbol(column_name_view name, utf8_view value)
         {
             ensure_impl();
             line_sender_error::wrapped_call(
@@ -444,14 +511,14 @@ namespace questdb::ilp
         // Require specific overloads of `column` to avoid
         // involuntary usage of the `bool` overload.
         template <typename T>
-        line_sender& column(name_view name, T value) = delete;
+        line_sender& column(column_name_view name, T value) = delete;
 
         /**
          * Append a value for a BOOLEAN column.
          * @param name Column name.
          * @param value Column value.
          */
-        line_sender& column(name_view name, bool value)
+        line_sender& column(column_name_view name, bool value)
         {
             ensure_impl();
             line_sender_error::wrapped_call(
@@ -467,7 +534,7 @@ namespace questdb::ilp
          * @param name Column name.
          * @param value Column value.
          */
-        line_sender& column(name_view name, int64_t value)
+        line_sender& column(column_name_view name, int64_t value)
         {
             ensure_impl();
             line_sender_error::wrapped_call(
@@ -483,7 +550,7 @@ namespace questdb::ilp
          * @param name Column name.
          * @param value Column value.
          */
-        line_sender& column(name_view name, double value)
+        line_sender& column(column_name_view name, double value)
         {
             ensure_impl();
             line_sender_error::wrapped_call(
@@ -499,7 +566,7 @@ namespace questdb::ilp
          * @param name Column name.
          * @param value Column value.
          */
-        line_sender& column(name_view name, utf8_view value)
+        line_sender& column(column_name_view name, utf8_view value)
         {
             ensure_impl();
             line_sender_error::wrapped_call(
@@ -510,6 +577,33 @@ namespace questdb::ilp
             return *this;
         }
 
+        template <size_t N>
+        line_sender& column(column_name_view name, const char (&value)[N])
+        {
+            return column(name, utf8_view{value});
+        }
+
+        line_sender& column(column_name_view name, std::string_view value)
+        {
+            return column(name, utf8_view{value});
+        }
+
+        line_sender& column(column_name_view name, const std::string& value)
+        {
+            return column(name, utf8_view{value});
+        }
+
+        line_sender& column(column_name_view name, timestamp_micros value)
+        {
+            ensure_impl();
+            line_sender_error::wrapped_call(
+                ::line_sender_column_ts,
+                _impl,
+                name._impl,
+                value.as_micros());
+            return *this;
+        }
+
         /**
          * Complete the row with a specified timestamp.
          *
@@ -517,15 +611,15 @@ namespace questdb::ilp
          * `.table(..)` again, or you can send the accumulated batch by
          * calling `.flush(..)`.
          *
-         * @param epoch_nanos Number of nanoseconds since 1st Jan 1970 UTC.
+         * @param timestamp Number of nanoseconds since 1st Jan 1970 UTC.
          */
-        void at(int64_t epoch_nanos)
+        void at(timestamp_nanos timestamp)
         {
             ensure_impl();
             line_sender_error::wrapped_call(
                 ::line_sender_at,
                 _impl,
-                epoch_nanos);
+                timestamp.as_nanos());
         }
 
         /**
@@ -586,8 +680,8 @@ namespace questdb::ilp
         }
 
         /**
-         * Check if an error occured previously and the sender must be closed.
-         * @return true if an error occured with a sender and it must be closed.
+         * Check if an error occurred previously and the sender must be closed.
+         * @return true if an error occurred with a sender and it must be closed.
          */
         bool must_close() const noexcept
         {

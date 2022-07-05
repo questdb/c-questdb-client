@@ -23,13 +23,14 @@
 ################################################################################
 
 
+from ast import arg
 import sys
 sys.dont_write_bytecode = True
 
 import pathlib
 import ctypes
 import os
-from enum import Enum
+from datetime import datetime
 
 from ctypes import (
     c_bool,
@@ -38,13 +39,18 @@ from ctypes import (
     c_int,
     c_int64,
     c_double,
+    c_uint16,
+    c_uint64,
     c_void_p,
     c_ssize_t)
 
-from typing import Union
+from typing import Optional, Tuple, Union
 
 
 class c_line_sender(ctypes.Structure):
+    pass
+
+class c_line_sender_opts(ctypes.Structure):
     pass
 
 class c_line_sender_error(ctypes.Structure):
@@ -52,24 +58,21 @@ class c_line_sender_error(ctypes.Structure):
 
 c_size_t_p = ctypes.POINTER(c_size_t)
 c_line_sender_p = ctypes.POINTER(c_line_sender)
+c_line_sender_opts_p = ctypes.POINTER(c_line_sender_opts)
 c_line_sender_error_p = ctypes.POINTER(c_line_sender_error)
 c_line_sender_error_p_p = ctypes.POINTER(c_line_sender_error_p)
 class c_line_sender_utf8(ctypes.Structure):
     _fields_ = [("len", c_size_t),
                 ("buf", c_char_p)]
 c_line_sender_utf8_p = ctypes.POINTER(c_line_sender_utf8)
-class c_line_sender_name(ctypes.Structure):
+class c_line_sender_table_name(ctypes.Structure):
     _fields_ = [("len", c_size_t),
                 ("buf", c_char_p)]
-c_line_sender_name_p = ctypes.POINTER(c_line_sender_name)
-class c_line_sender_sec_opts(ctypes.Structure):
-    _fields_ = [("auth_key_id", c_char_p),
-                ("auth_priv_key", c_char_p),
-                ("auth_pub_key_x", c_char_p),
-                ("auth_pub_key_y", c_char_p),
-                ("tls", c_int),
-                ("tls_ca", c_char_p)]
-c_line_sender_sec_opts_p = ctypes.POINTER(c_line_sender_sec_opts)
+c_line_sender_table_name_p = ctypes.POINTER(c_line_sender_table_name)
+class c_line_sender_column_name(ctypes.Structure):
+    _fields_ = [("len", c_size_t),
+                ("buf", c_char_p)]
+c_line_sender_column_name_p = ctypes.POINTER(c_line_sender_column_name)
 
 
 def _setup_cdll():
@@ -115,26 +118,82 @@ def _setup_cdll():
         c_char_p,
         c_line_sender_error_p_p)
     set_sig(
-        dll.line_sender_name_init,
+        dll.line_sender_table_name_init,
         c_bool,
-        c_line_sender_name_p,
+        c_line_sender_table_name_p,
         c_size_t,
         c_char_p,
         c_line_sender_error_p_p)
     set_sig(
-        dll.line_sender_connect,
-        c_line_sender_p,
-        c_char_p,
-        c_char_p,
+        dll.line_sender_column_name_init,
+        c_bool,
+        c_line_sender_column_name_p,
+        c_size_t,
         c_char_p,
         c_line_sender_error_p_p)
     set_sig(
-        dll.line_sender_connect_secure,
+        dll.line_sender_opts_new,
+        c_line_sender_opts_p,
+        c_line_sender_utf8,
+        c_uint16)
+    set_sig(
+        dll.line_sender_opts_new_service,
+        c_line_sender_opts_p,
+        c_line_sender_utf8,
+        c_line_sender_utf8)
+    set_sig(
+        dll.line_sender_opts_capacity,
+        None,
+        c_line_sender_opts_p,
+        c_size_t)
+    set_sig(
+        dll.line_sender_opts_net_interface,
+        None,
+        c_line_sender_opts_p,
+        c_line_sender_utf8)
+    set_sig(
+        dll.line_sender_opts_auth,
+        None,
+        c_line_sender_opts_p,
+        c_line_sender_utf8,
+        c_line_sender_utf8,
+        c_line_sender_utf8,
+        c_line_sender_utf8)
+    set_sig(
+        dll.line_sender_opts_tls,
+        None,
+        c_line_sender_opts_p)
+    set_sig(
+        dll.line_sender_opts_tls_ca,
+        None,
+        c_line_sender_opts_p,
+        c_line_sender_utf8)
+    set_sig(
+        dll.line_sender_opts_tls_insecure_skip_verify,
+        None,
+        c_line_sender_opts_p)
+    set_sig(
+        dll.line_sender_opts_read_timeout,
+        None,
+        c_line_sender_opts_p,
+        c_uint64)
+    set_sig(
+        dll.line_sender_opts_max_name_len,
+        None,
+        c_line_sender_opts_p,
+        c_size_t)
+    set_sig(
+        dll.line_sender_opts_clone,
+        c_line_sender_opts_p,
+        c_line_sender_opts_p)
+    set_sig(
+        dll.line_sender_opts_free,
+        None,
+        c_line_sender_opts_p)
+    set_sig(
+        dll.line_sender_connect,
         c_line_sender_p,
-        c_char_p,
-        c_char_p,
-        c_char_p,
-        c_line_sender_sec_opts_p,
+        c_line_sender_opts_p,
         c_line_sender_error_p_p)
     set_sig(
         dll.line_sender_must_close,
@@ -148,42 +207,49 @@ def _setup_cdll():
         dll.line_sender_table,
         c_bool,
         c_line_sender_p,
-        c_line_sender_name,
+        c_line_sender_table_name,
         c_line_sender_error_p_p)
     set_sig(
         dll.line_sender_symbol,
         c_bool,
         c_line_sender_p,
-        c_line_sender_name,
+        c_line_sender_column_name,
         c_line_sender_utf8,
         c_line_sender_error_p_p)
     set_sig(
         dll.line_sender_column_bool,
         c_bool,
         c_line_sender_p,
-        c_line_sender_name,
+        c_line_sender_column_name,
         c_bool,
         c_line_sender_error_p_p)
     set_sig(
         dll.line_sender_column_i64,
         c_bool,
         c_line_sender_p,
-        c_line_sender_name,
+        c_line_sender_column_name,
         c_int64,
         c_line_sender_error_p_p)
     set_sig(
         dll.line_sender_column_f64,
         c_bool,
         c_line_sender_p,
-        c_line_sender_name,
+        c_line_sender_column_name,
         c_double,
         c_line_sender_error_p_p)
     set_sig(
         dll.line_sender_column_str,
         c_bool,
         c_line_sender_p,
-        c_line_sender_name,
+        c_line_sender_column_name,
         c_line_sender_utf8,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_column_ts,
+        c_bool,
+        c_line_sender_p,
+        c_line_sender_column_name,
+        c_int64,
         c_line_sender_error_p_p)
     set_sig(
         dll.line_sender_at,
@@ -264,13 +330,26 @@ def _utf8(s: str):
     return c_utf8
 
 
-def _name(s: str):
-    c_name = c_line_sender_name(0, None)
+def _table_name(s: str):
+    c_name = c_line_sender_table_name(0, None)
     # We attach the object to the struct to extend the parent object's lifetime.
     # If we didn't do this we'd end up with a use-after-free.
     c_name._py_obj = s.encode('utf-8')
     _error_wrapped_call(
-        _DLL.line_sender_name_init,
+        _DLL.line_sender_table_name_init,
+        ctypes.byref(c_name),
+        len(c_name._py_obj),
+        c_name._py_obj)
+    return c_name
+
+
+def _column_name(s: str):
+    c_name = c_line_sender_column_name(0, None)
+    # We attach the object to the struct to extend the parent object's lifetime.
+    # If we didn't do this we'd end up with a use-after-free.
+    c_name._py_obj = s.encode('utf-8')
+    _error_wrapped_call(
+        _DLL.line_sender_column_name_init,
         ctypes.byref(c_name),
         len(c_name._py_obj),
         c_name._py_obj)
@@ -287,10 +366,32 @@ def _fully_qual_name(obj):
         return module + '.' + qn
 
 
-class Tls(Enum):
-    Disabled = 0
-    Enabled = 1
-    InsecureSkipVerify = 2
+class _Opts:
+    def __init__(self, host, port):
+        self.impl = _error_wrapped_call(
+            _DLL.line_sender_opts_new_service,
+            _utf8(str(host)),
+            _utf8(str(port)))
+
+    def __getattr__(self, name: str):
+        fn = getattr(_DLL, 'line_sender_opts_' + name)
+        def wrapper(*args):
+            mapped_args = [
+                (_utf8(arg) if isinstance(arg, str) else arg)
+                for arg in args]
+            if fn.argtypes[-1] == c_line_sender_error_p_p:
+                return _error_wrapped_call(fn, self.impl, *mapped_args)
+            else:
+                return fn(self.impl, *mapped_args)
+        return wrapper
+
+    def __del__(self):
+        _DLL.line_sender_opts_free(self.impl)
+
+
+class TimestampMicros:
+    def __init__(self, micros: int):
+        self.value = micros
 
 
 # This code is *just good enough* for testing purposes and is not intended to
@@ -300,49 +401,49 @@ class Tls(Enum):
 class LineSender:
     def __init__(
             self,
-            host,
-            port,
+            host: str,
+            port: Union[str, int],
             *,
-            interface='0.0.0.0',
-            auth=None,
-            tls=Tls.Disabled,
-            tls_ca=None):
+            interface: Optional[str] = None,
+            auth: Optional[Tuple[str, str, str, str]] = None,
+            tls: Union[bool, str] = False,
+            capacity: Optional[int] = None,
+            read_timeout: Optional[int] = None,
+            max_name_len: Optional[int] = None):
+
+        opts = _Opts(host, port)
+        if interface:
+            opts.net_interface(interface)
+
+        if auth:
+            opts.auth(*auth)
+
+        if tls:
+            if tls is True:
+                opts.tls()
+            elif tls == 'insecure_skip_verify':
+                opts.tls_insecure_skip_verify()
+            else:
+                opts.tls_ca(str(tls))
+
+        if capacity is not None:
+            opts.capacity(capacity)
+
+        if read_timeout is not None:
+            opts.read_timeout(read_timeout)
+
+        if max_name_len is not None:
+            opts.max_name_len(max_name_len)
+
+        self._opts = opts
         self._impl = None
-        if auth or (tls != tls.Disabled):
-            # We need to keep bytes objects around or they get GCd before the
-            # native C call.
-            if auth:
-                self._c_auth = (
-                    auth[0].encode('ascii'),
-                    auth[1].encode('ascii'),
-                    auth[2].encode('ascii'),
-                    auth[3].encode('ascii'))
-            self._tls_ca = tls_ca.encode('utf-8') if tls_ca else None
-            self._sec_opts = c_line_sender_sec_opts(
-                self._c_auth[0] if auth else None,
-                self._c_auth[1] if auth else None,
-                self._c_auth[2] if auth else None,
-                self._c_auth[3] if auth else None,
-                tls.value,
-                self._tls_ca)
-        else:
-            self._sec_opts = None
-        self._connect_secure_args = (
-            interface.encode('ascii'),
-            host.encode('ascii'),
-            str(port).encode('ascii'),
-            self._sec_opts)
 
     def connect(self):
         if self._impl:
             raise LineSenderError('Already connected')
-
         self._impl = _error_wrapped_call(
-            _DLL.line_sender_connect_secure,
-            self._connect_secure_args[0],
-            self._connect_secure_args[1],
-            self._connect_secure_args[2],
-            self._connect_secure_args[3])
+            _DLL.line_sender_connect,
+            self._opts.impl)
 
     def __enter__(self):
         self.connect()
@@ -353,7 +454,7 @@ class LineSender:
             raise LineSenderError('Not connected.')
 
     def table(self, table: str):
-        table_name = _name(table)
+        table_name = _table_name(table)
         _error_wrapped_call(
             _DLL.line_sender_table,
             self._impl,
@@ -364,35 +465,50 @@ class LineSender:
         _error_wrapped_call(
             _DLL.line_sender_symbol,
             self._impl,
-            _name(name),
+            _column_name(name),
             _utf8(value))
         return self
 
-    def column(self, name: str, value: Union[bool, int, float, str]):
+    def column(
+            self, name: str,
+            value: Union[bool, int, float, str, TimestampMicros, datetime]):
         if isinstance(value, bool):
             _error_wrapped_call(
                 _DLL.line_sender_column_bool,
                 self._impl,
-                _name(name),
+                _column_name(name),
                 bool(value))
         elif isinstance(value, int):
             _error_wrapped_call(
                 _DLL.line_sender_column_i64,
                 self._impl,
-                _name(name),
+                _column_name(name),
                 int(value))
         elif isinstance(value, float):
             _error_wrapped_call(
                 _DLL.line_sender_column_f64,
                 self._impl,
-                _name(name),
+                _column_name(name),
                 float(value))
         elif isinstance(value, str):
             _error_wrapped_call(
                 _DLL.line_sender_column_str,
                 self._impl,
-                _name(name),
+                _column_name(name),
                 _utf8(value))
+        elif isinstance(value, TimestampMicros):
+            _error_wrapped_call(
+                _DLL.line_sender_column_ts,
+                self._impl,
+                _column_name(name),
+                value.value)
+        elif isinstance(value, datetime):
+            micros_epoch = int(value.timestamp()) * 1e6 + value.microsecond
+            _error_wrapped_call(
+                _DLL.line_sender_column_ts,
+                self._impl,
+                _column_name(name),
+                micros_epoch)
         else:
             fqn = _fully_qual_name(value)
             raise ValueError(

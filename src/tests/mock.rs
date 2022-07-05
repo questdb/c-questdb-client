@@ -22,13 +22,13 @@
  *
  ******************************************************************************/
 
-use super::*;
+use crate::LineSenderBuilder;
 
 use std::path::Path;
 use core::time::Duration;
 use mio::{Poll, Token, Events, Interest};
 use mio::net::{TcpStream};
-use std::io::{self, Read};
+use std::io::{self, Read, BufReader};
 use std::net::{SocketAddr};
 use std::sync::Arc;
 use socket2::{Domain, Type, Protocol, Socket};
@@ -41,7 +41,7 @@ use rustls::{
 const CLIENT: Token = Token(0);
 
 #[derive(Debug)]
-struct MockServer {
+pub struct MockServer {
     poll: Poll,
     events: Events,
     listener: Socket,
@@ -64,14 +64,19 @@ fn load_certs(filename: &Path) -> Vec<Certificate> {
 }
 
 fn load_private_key(filename: &Path) -> rustls::PrivateKey {
-    let keyfile = std::fs::File::open(filename).expect("cannot open private key file");
+    let keyfile = std::fs::File::open(filename)
+        .expect("cannot open private key file");
     let mut reader = BufReader::new(keyfile);
 
     loop {
-        match rustls_pemfile::read_one(&mut reader).expect("cannot parse private key .pem file") {
-            Some(rustls_pemfile::Item::RSAKey(key)) => return rustls::PrivateKey(key),
-            Some(rustls_pemfile::Item::PKCS8Key(key)) => return rustls::PrivateKey(key),
-            Some(rustls_pemfile::Item::ECKey(key)) => return rustls::PrivateKey(key),
+        match rustls_pemfile::read_one(&mut reader)
+                .expect("cannot parse private key .pem file") {
+            Some(rustls_pemfile::Item::RSAKey(key)) =>
+                return rustls::PrivateKey(key),
+            Some(rustls_pemfile::Item::PKCS8Key(key)) =>
+                return rustls::PrivateKey(key),
+            Some(rustls_pemfile::Item::ECKey(key)) =>
+                return rustls::PrivateKey(key),
             None => break,
             _ => {}
         }
@@ -83,7 +88,7 @@ fn load_private_key(filename: &Path) -> rustls::PrivateKey {
     );
 }
 
-fn certs_dir() -> std::path::PathBuf {
+pub fn certs_dir() -> std::path::PathBuf {
     let mut certs_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     certs_dir.push("tls_certs");
     certs_dir
@@ -105,7 +110,8 @@ fn tls_config() -> Arc<ServerConfig> {
 
 impl MockServer {
     pub fn new() -> io::Result<Self> {
-        let listener = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+        let listener = Socket::new(
+            Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
         let address: SocketAddr = "127.0.0.1:0".parse().unwrap();
         listener.bind(&address.into())?;
         listener.listen(128)?;
@@ -160,14 +166,18 @@ impl MockServer {
                     }
                 }
             }
-            self.poll.registry().reregister(client, CLIENT, Interest::READABLE)?;
+            self.poll.registry().reregister(
+                client, CLIENT, Interest::READABLE)?;
             self.tls_conn = Some(tls_conn);
             Ok(self)
         })
     }
 
-    pub fn wait_for_data(&mut self, wait_timeout_sec: Option<f64>) -> io::Result<bool> {
-        self.client.as_ref().unwrap();  // To ensure a clean death if accept wasn't called.
+    pub fn wait_for_data(
+        &mut self, wait_timeout_sec: Option<f64>) -> io::Result<bool>
+    {
+        // To ensure a clean death if accept wasn't called.
+        self.client.as_ref().unwrap();
         let timeout = wait_timeout_sec.map(|sec| {
             Duration::from_micros((sec * 1000000.0) as u64)
         });
@@ -198,7 +208,8 @@ impl MockServer {
             let count = match self.do_read(&mut chunk[..]) {
                 Ok(count) => count,
                 Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
-                    self.poll.poll(&mut self.events, Some(Duration::from_millis(200)))?;
+                    let poll_timeout = Some(Duration::from_millis(200));
+                    self.poll.poll(&mut self.events, poll_timeout)?;
                     continue;
                 },
                 Err(err) => return Err(err)
@@ -236,149 +247,4 @@ impl MockServer {
     pub fn lsb(&self) -> LineSenderBuilder {
         LineSenderBuilder::new(self.host, self.port)
     }
-}
-
-type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
-
-#[test]
-fn test_basics() -> TestResult {
-    let mut server = MockServer::new()?;
-    let mut sender = server.lsb().connect()?;
-    assert_eq!(sender.must_close(), false);
-    server.accept()?;
-
-    assert_eq!(server.recv_q()?, 0);
-
-    sender
-        .table("test")?
-        .symbol("t1", "v1")?
-        .column_f64("f1", 0.5)?
-        .at(10000000)?;
-
-    assert_eq!(server.recv_q()?, 0);
-    let exp = "test,t1=v1 f1=0.5 10000000\n";
-    assert_eq!(sender.peek_pending(), exp);
-    assert_eq!(sender.pending_size(), exp.len());
-    sender.flush()?;
-    assert_eq!(server.recv_q()?, 1);
-    assert_eq!(server.msgs[0].as_str(), exp);
-    Ok(())
-}
-
-#[test]
-fn test_tls_with_file_ca() -> TestResult {
-    let mut ca_path = certs_dir();
-    ca_path.push("server_rootCA.pem");
-
-    let server = MockServer::new()?;
-    let lsb = server.lsb()
-        .tls(Tls::Enabled(CertificateAuthority::File(ca_path)));
-    let server_jh = server.accept_tls();
-    let mut sender = lsb.connect()?;
-    let mut server: MockServer = server_jh.join().unwrap()?;
-
-    sender
-        .table("test")?
-        .symbol("t1", "v1")?
-        .column_f64("f1", 0.5)?
-        .at(10000000)?;
-
-    assert_eq!(server.recv_q()?, 0);
-    let exp = "test,t1=v1 f1=0.5 10000000\n";
-    assert_eq!(sender.peek_pending(), exp);
-    assert_eq!(sender.pending_size(), exp.len());
-    sender.flush()?;
-    assert_eq!(server.recv_q()?, 1);
-    assert_eq!(server.msgs[0].as_str(), exp);
-    Ok(())
-}
-
-#[test]
-fn test_tls_to_plain_server() -> TestResult {
-    let mut ca_path = certs_dir();
-    ca_path.push("server_rootCA.pem");
-
-    let mut server = MockServer::new()?;
-    let lsb = server.lsb()
-        .read_timeout(Duration::from_millis(500))
-        .tls(Tls::Enabled(CertificateAuthority::File(ca_path)));
-    let server_jh = std::thread::spawn(move || -> io::Result<MockServer> {
-            server.accept()?;
-            Ok(server)
-        });
-    let maybe_sender = lsb.connect();
-    let _server: MockServer = server_jh.join().unwrap()?;
-    let err = maybe_sender.unwrap_err();
-    assert_eq!(err, Error {
-        code: ErrorCode::TlsError,
-        msg: "Failed to complete TLS handshake: \
-              Timed out waiting for server response after 500ms.".to_owned()
-    });
-    Ok(())
-}
-
-fn expect_eventual_disconnect(sender: &mut LineSender) {
-    let mut retry = || {
-        for _ in 0..1000 {
-            std::thread::sleep(Duration::from_millis(100));
-            sender
-                .table("test_table")?
-                .symbol("s1", "v1")?
-                .at_now()?;
-            sender.flush()?;
-        }
-        Ok(())
-    };
-
-    let err: Error = retry().unwrap_err();
-    assert_eq!(err.code, ErrorCode::SocketError);
-}
-
-#[test]
-fn test_plain_to_tls_server() -> TestResult {
-    let server = MockServer::new()?;
-    let lsb = server.lsb()
-        .read_timeout(Duration::from_millis(500))
-        .tls(Tls::Disabled);
-    let server_jh = server.accept_tls();
-    let maybe_sender = lsb.connect();
-    let server_err = server_jh.join().unwrap().unwrap_err();
-
-    // The server failed to handshake, so disconnected the client.
-    assert!(
-        (server_err.kind() == io::ErrorKind::TimedOut) ||
-        (server_err.kind() == io::ErrorKind::WouldBlock));
-
-    // The client nevertheless connected successfully.
-    let mut sender = maybe_sender.unwrap();
-
-    // Eventually, the client fail to flush.
-    expect_eventual_disconnect(&mut sender);
-    Ok(())
-}
-
-#[cfg(feature = "insecure_skip_verify")]
-#[test]
-fn test_tls_insecure_skip_verify() -> TestResult {
-    let server = MockServer::new()?;
-    let lsb = server.lsb()
-        .tls(Tls::InsecureSkipVerify);
-    let server_jh = server.accept_tls();
-    let mut sender = lsb.connect()?;
-    let mut server: MockServer = server_jh.join().unwrap()?;
-
-    sender
-        .table("test")?
-        .symbol("t1", "v1")?
-        .column_f64("f1", 0.5)?
-        .at(10000000)?;
-
-    assert_eq!(server.recv_q()?, 0);
-    let exp = "test,t1=v1 f1=0.5 10000000\n";
-    assert_eq!(sender.peek_pending(), exp);
-    assert_eq!(sender.pending_size(), exp.len());
-    sender.flush()?;
-    assert_eq!(server.recv_q()?, 1);
-    assert_eq!(server.msgs[0].as_str(), exp);
-    Ok(())
 }

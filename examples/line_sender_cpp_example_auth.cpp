@@ -10,23 +10,26 @@ static bool example(std::string_view host, std::string_view port)
     {
         // Follow our authentication documentation to generate your own keys:
         // https://questdb.io/docs/reference/api/ilp/authenticate
-        questdb::ilp::sec_opts sec_opts{
-            "testUser1",  // auth_key_id
-            "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48",  // auth_priv_key
-            "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU",  // auth_pub_key_x
-            "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac"};  // auth_pub_key_y
-        questdb::ilp::line_sender sender{host, port, sec_opts};
+        questdb::ilp::opts opts{host, port};
+        opts.auth(
+            "testUser1",  // key_id
+            "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48",  // priv_key
+            "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU",  // pub_key_x
+            "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac");  // pub_key_y
+
+        // Connect.
+        questdb::ilp::line_sender sender{opts};
 
         // We prepare all our table names and column names in advance.
         // If we're inserting multiple rows, this allows us to avoid
         // re-validating the same strings over and over again.
-        auto table_name = "cpp_cars_auth"_name;
-        auto id_name = "id"_name;
-        auto x_name = "x"_name;
-        auto y_name = "y"_name;
-        auto booked_name = "booked"_name;
-        auto passengers_name = "passengers"_name;
-        auto driver_name = "driver"_name;
+        const auto table_name = "cpp_cars_auth"_tn;
+        const auto id_name = "id"_cn;
+        const auto x_name = "x"_cn;
+        const auto y_name = "y"_cn;
+        const auto booked_name = "booked"_cn;
+        const auto passengers_name = "passengers"_cn;
+        const auto driver_name = "driver"_cn;
 
         sender
             .table(table_name)
@@ -35,7 +38,7 @@ static bool example(std::string_view host, std::string_view port)
             .column(y_name, -150.25)
             .column(booked_name, true)
             .column(passengers_name, int64_t{3})
-            .column(driver_name, "Ranjit Singh"_utf8)
+            .column(driver_name, "John Doe"_utf8)
             .at_now();
 
         // To insert more records, call `sender.table(..)...` again.

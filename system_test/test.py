@@ -457,6 +457,26 @@ class TestLineSender(unittest.TestCase):
         scrubbed_dataset = [row[:-1] for row in resp['dataset']]
         self.assertEqual(scrubbed_dataset, exp_dataset)
 
+    def test_timestamp_column(self):
+        table_name = uuid.uuid4().hex
+        pending = None
+        ts = qls.TimestampMicros(3600000000)  # One hour past epoch.
+        with self._mk_linesender() as sender:
+            (sender
+                .table(table_name)
+                .column('ts1', ts)
+                .at_now())
+            pending = sender.peek_pending()
+        
+        resp = retry_check_table(table_name, log_ctx=pending)
+        exp_columns = [
+            {'name': 'ts1', 'type': 'TIMESTAMP'},
+            {'name': 'timestamp', 'type': 'TIMESTAMP'}]
+        self.assertEqual(resp['columns'], exp_columns)
+        exp_dataset = [['1970-01-01T01:00:00.000000Z']]
+        scrubbed_dataset = [row[:-1] for row in resp['dataset']]
+        self.assertEqual(scrubbed_dataset, exp_dataset)
+
     def _test_example(self, bin_name, table_name, tls=False):
         if tls and not QDB_FIXTURE.auth:
             self.skipTest('No auth')
@@ -491,7 +511,7 @@ class TestLineSender(unittest.TestCase):
             -150.25,
             True,
             3,
-            'Ranjit Singh']]  # Comparison excludes timestamp column.
+            'John Doe']]  # Comparison excludes timestamp column.
         scrubbed_dataset = [row[:-1] for row in resp['dataset']]
         self.assertEqual(scrubbed_dataset, exp_dataset)
 
@@ -579,7 +599,7 @@ class TestLineSender(unittest.TestCase):
             QDB_FIXTURE.host,
             TLS_PROXY_FIXTURE.listen_port,
             auth=AUTH if QDB_FIXTURE.auth else None,
-            tls=qls.Tls.InsecureSkipVerify)
+            tls='insecure_skip_verify')
         self._test_single_symbol_impl(sender)
 
 

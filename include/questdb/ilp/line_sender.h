@@ -58,8 +58,11 @@ typedef enum line_sender_error_code
     /** The string or symbol field is not encoded in valid UTF-8. */
     line_sender_error_invalid_utf8,
 
-    /** The table name, symbol name or column name contains bad characters. */
+    /** The table name or column name contains bad characters. */
     line_sender_error_invalid_name,
+
+    /** The supplied timestamp is invalid. */
+    line_sender_error_invalid_timestamp,
 
     /** Error during the authentication process. */
     line_sender_error_auth_error,
@@ -108,22 +111,31 @@ bool line_sender_utf8_init(
     const char* buf,
     line_sender_error** err_out);
 
+/**
+ * Construct a UTF-8 object from UTF-8 encoded buffer and length.
+ * If the passed in buffer is not valid UTF-8, the program will abort.
+ *
+ * @param[in] len Length in bytes of the buffer.
+ * @param[in] buf UTF-8 encoded buffer.
+ */
+LINESENDER_API
+line_sender_utf8 line_sender_utf8_assert(size_t len, const char* buf);
+
+#define QDB_UTF8_LITERAL(literal)                                              \
+    line_sender_utf8_assert(sizeof(literal) - 1, (literal))
+
 /** Non-owning validated table, symbol or column name. UTF-8 encoded. */
-typedef struct line_sender_name
+typedef struct line_sender_table_name
 {
     // Don't initialize fields directly.
-    // Call `line_sender_name_init` instead.
+    // Call `line_sender_table_name_init` instead.
     size_t len;
     const char* buf;
-} line_sender_name;
+} line_sender_table_name;
 
 /**
  * Check the provided buffer is a valid UTF-8 encoded string that can be
- * used as a table name, symbol name or column name.
- *
- * The string must not contain the following characters:
- * `?`, `.`,  `,`, `'`, `"`, `\`, `/`, `:`, `(`, `)`, `+`, `-`, `*`, `%`, `~`,
- * `' '` (space), `\0` (nul terminator), \uFEFF (ZERO WIDTH NO-BREAK SPACE).
+ * used as a table name.
  *
  * @param[out] name The object to be initialized.
  * @param[in] len Length in bytes of the buffer.
@@ -132,12 +144,69 @@ typedef struct line_sender_name
  * @return true on success, false on error.
  */
 LINESENDER_API
-bool line_sender_name_init(
-    line_sender_name* name,
+bool line_sender_table_name_init(
+    line_sender_table_name* name,
     size_t len,
     const char* buf,
     line_sender_error** err_out);
 
+/**
+ * Construct a table name object from UTF-8 encoded buffer and length.
+ * If the passed in buffer is not valid UTF-8, or is not a valid table name,
+ * the program will abort.
+ *
+ * @param[in] len Length in bytes of the buffer.
+ * @param[in] buf UTF-8 encoded buffer.
+ */
+LINESENDER_API
+line_sender_table_name line_sender_table_name_assert(
+    size_t len,
+    const char* buf);
+
+#define QDB_TABLE_NAME_LITERAL(literal)                                        \
+    line_sender_table_name_assert(sizeof(literal) - 1, (literal))
+
+/** Non-owning validated table, symbol or column name. UTF-8 encoded. */
+typedef struct line_sender_column_name
+{
+    // Don't initialize fields directly.
+    // Call `line_sender_column_name_init` instead.
+    size_t len;
+    const char* buf;
+} line_sender_column_name;
+
+/**
+ * Check the provided buffer is a valid UTF-8 encoded string that can be
+ * used as a symbol name or column name.
+ *
+ * @param[out] name The object to be initialized.
+ * @param[in] len Length in bytes of the buffer.
+ * @param[in] buf UTF-8 encoded buffer.
+ * @param[out] err_out Set on error.
+ * @return true on success, false on error.
+ */
+LINESENDER_API
+bool line_sender_column_name_init(
+    line_sender_column_name* name,
+    size_t len,
+    const char* buf,
+    line_sender_error** err_out);
+
+/**
+ * Construct a column name object from UTF-8 encoded buffer and length.
+ * If the passed in buffer is not valid UTF-8, or is not a valid column name,
+ * the program will abort.
+ *
+ * @param[in] len Length in bytes of the buffer.
+ * @param[in] buf UTF-8 encoded buffer.
+ */
+LINESENDER_API
+line_sender_column_name line_sender_column_name_assert(
+    size_t len,
+    const char* buf);
+
+#define QDB_COLUMN_NAME_LITERAL(literal)                                       \
+    line_sender_column_name_assert(sizeof(literal) - 1, (literal))
 
 /////////// Connecting and disconnecting.
 
@@ -148,91 +217,135 @@ bool line_sender_name_init(
  */
 typedef struct line_sender line_sender;
 
-/** Whole connection encryption options. */
-typedef enum line_sender_tls
-{
-    /** No TLS connection encryption. */
-    line_sender_tls_disabled,
-
-    /** Enable TLS. See `line_sender_sec_opts::tls_ca` for behaviour. */
-    line_sender_tls_enabled,
-
-    /**
-     * Enable TLS whilst dangerously accepting any certificate as valid.
-     * This should only be used for debugging.
-     * Consider using `enabled` and specifying a self-signed `tls_ca` instead.
-     */
-    line_sender_tls_insecure_skip_verify
-} line_sender_tls;
+/**
+ * Accumulates parameters for creating a line sender connection.
+ */
+typedef struct line_sender_opts line_sender_opts;
 
 /**
- * Connection security options.
+ * A new set of options for a line sender connection.
+ * @param[in] host The QuestDB database host.
+ * @param[in] port The QuestDB database port.
  */
-typedef struct line_sender_sec_opts
-{
-    /** Authentication key id. AKA "kid". */
-    const char* auth_key_id;
+LINESENDER_API
+line_sender_opts* line_sender_opts_new(
+    line_sender_utf8 host,
+    uint16_t port);
 
-    /** Authentication private key. AKA "d". */
-    const char* auth_priv_key;
+/**
+ * A new set of options for a line sender connection.
+ * @param[in] host The QuestDB database host.
+ * @param[in] port The QuestDB database port as service name.
+ */
+LINESENDER_API
+line_sender_opts* line_sender_opts_new_service(
+    line_sender_utf8 host,
+    line_sender_utf8 port);
 
-    /** Authentication public key X coordinate. AKA "x". */
-    const char* auth_pub_key_x;
+/**
+ * Set the initial buffer capacity (byte count).
+ * The default is 65536.
+ */
+LINESENDER_API
+void line_sender_opts_capacity(
+    line_sender_opts* opts,
+    size_t capacity);
 
-    /** Authentication public key Y coordinate. AKA "y". */
-    const char* auth_pub_key_y;
+/** Select local outbound interface. */
+LINESENDER_API
+void line_sender_opts_net_interface(
+    line_sender_opts* opts,
+    line_sender_utf8 net_interface);
 
-    /** Settings for secure connection over TLS. */
-    line_sender_tls tls;
+/**
+ * Authentication Parameters.
+ * @param[in] key_id Key id. AKA "kid"
+ * @param[in] priv_key Private key. AKA "d".
+ * @param[in] pub_key_x Public key X coordinate. AKA "x".
+ * @param[in] pub_key_y Public key Y coordinate. AKA "y".
+ */
+LINESENDER_API
+void line_sender_opts_auth(
+    line_sender_opts* opts,
+    line_sender_utf8 key_id,
+    line_sender_utf8 priv_key,
+    line_sender_utf8 pub_key_x,
+    line_sender_utf8 pub_key_y);
 
-    /**
-     * Set a custom CA file path to use for verification.
-     * If NULL, defaults to `webpki-roots` certificates which accepts
-     * most well-know certificate authorities.
-     *
-     * This argument is generally only specified during dev-testing.
-     */
-    const char* tls_ca;
-} line_sender_sec_opts;
+/**
+ * Enable full connection encryption via TLS.
+ * The connection will accept certificates by well-known certificate
+ * authorities as per the "webpki-roots" Rust crate.
+ */
+LINESENDER_API
+void line_sender_opts_tls(line_sender_opts* opts);
+
+/**
+ * Enable full connection encryption via TLS.
+ * The connection will accept certificates by the specified certificate
+ * authority file.
+ */
+LINESENDER_API
+void line_sender_opts_tls_ca(
+    line_sender_opts* opts,
+    line_sender_utf8 ca_path);
+
+/**
+ * Enable TLS whilst dangerously accepting any certificate as valid.
+ * This should only be used for debugging.
+ * Consider using calling "tls_ca" instead.
+ */
+LINESENDER_API
+void line_sender_opts_tls_insecure_skip_verify(line_sender_opts* opts);
+
+/**
+ * Configure how long to wait for messages from the QuestDB server during
+ * the TLS handshake and authentication process.
+ * The default is 15 seconds.
+ */
+LINESENDER_API
+void line_sender_opts_read_timeout(
+    line_sender_opts* opts,
+    uint64_t timeout_millis);
+
+/**
+ * Set the maximum length for table and column names.
+ * This should match the `cairo.max.file.name.length` setting of the
+ * QuestDB instance you're connecting to.
+ * The default value is 127, which is the same as the QuestDB default.
+ */
+LINESENDER_API
+void line_sender_opts_max_name_len(
+    line_sender_opts* opts,
+    size_t value);
+
+/**
+ * Duplicate the opts object.
+ * Both old and new objects will have to be freed.
+ */
+LINESENDER_API
+line_sender_opts* line_sender_opts_clone(
+    line_sender_opts* opts);
+
+/** Release the opts object. */
+LINESENDER_API
+void line_sender_opts_free(line_sender_opts* opts);
 
 /**
  * Synchronously connect to the QuestDB database.
- * @param[in] net_interface Network interface to bind to.
- * If unsure, to bind to all specify "0.0.0.0".
- * @param[in] host QuestDB host, e.g. "localhost". nul-terminated.
- * @param[in] port QuestDB port, e.g. "9009". nul-terminated.
- * @param[out] err_out Set on error.
- * @return Connected sender object or NULL on error.
+ * The connection should be accessed by only a single thread a time.
+ * @param[in] opts Options for the connection.
+ * @note The opts object is freed.
  */
 LINESENDER_API
-line_sender* line_sender_connect(
-    const char* net_interface,
-    const char* host,
-    const char* port,
+line_sender *line_sender_connect(
+    const line_sender_opts* opts,
     line_sender_error** err_out);
 
 /**
- * Synchronously connect securely to the QuestDB database.
- * @param[in] net_interface Network interface to bind to.
- * If unsure, to bind to all specify "0.0.0.0".
- * @param[in] host QuestDB host, e.g. "localhost". nul-terminated.
- * @param[in] port QuestDB port, e.g. "9009". nul-terminated.
- * @param[in] sec_opts Security options for authentication.
- * @param[out] err_out Set on error.
- * @return Connected sender object or NULL on error.
- */
-LINESENDER_API
-line_sender* line_sender_connect_secure(
-    const char* net_interface,
-    const char* host,
-    const char* port,
-    const line_sender_sec_opts* sec_opts,
-    line_sender_error** err_out);
-
-/**
- * Check if an error occured previously and the sender must be closed.
+ * Check if an error occurred previously and the sender must be closed.
  * @param[in] sender Line sender object.
- * @return true if an error occured with a sender and it must be closed.
+ * @return true if an error occurred with a sender and it must be closed.
  */
 LINESENDER_API
 bool line_sender_must_close(const line_sender* sender);
@@ -255,7 +368,7 @@ void line_sender_close(line_sender* sender);
 LINESENDER_API
 bool line_sender_table(
     line_sender* sender,
-    line_sender_name name,
+    line_sender_table_name name,
     line_sender_error** err_out);
 
 /**
@@ -270,7 +383,7 @@ bool line_sender_table(
 LINESENDER_API
 bool line_sender_symbol(
     line_sender* sender,
-    line_sender_name name,
+    line_sender_column_name name,
     line_sender_utf8 value,
     line_sender_error** err_out);
 
@@ -285,7 +398,7 @@ bool line_sender_symbol(
 LINESENDER_API
 bool line_sender_column_bool(
     line_sender* sender,
-    line_sender_name name,
+    line_sender_column_name name,
     bool value,
     line_sender_error** err_out);
 
@@ -300,7 +413,7 @@ bool line_sender_column_bool(
 LINESENDER_API
 bool line_sender_column_i64(
     line_sender* sender,
-    line_sender_name name,
+    line_sender_column_name name,
     int64_t value,
     line_sender_error** err_out);
 
@@ -315,7 +428,7 @@ bool line_sender_column_i64(
 LINESENDER_API
 bool line_sender_column_f64(
     line_sender* sender,
-    line_sender_name name,
+    line_sender_column_name name,
     double value,
     line_sender_error** err_out);
 
@@ -330,8 +443,23 @@ bool line_sender_column_f64(
 LINESENDER_API
 bool line_sender_column_str(
     line_sender* sender,
-    line_sender_name name,
+    line_sender_column_name name,
     line_sender_utf8 value,
+    line_sender_error** err_out);
+
+/**
+ * Append a value for a TIMESTAMP column.
+ * @param[in] sender Line sender object.
+ * @param[in] name Column name.
+ * @param[in] micros The timestamp in microseconds since the unix epoch.
+ * @param[out] err_out Set on error.
+ * @return true on success, false on error.
+ */
+LINESENDER_API
+bool line_sender_column_ts(
+    line_sender* sender,
+    line_sender_column_name name,
+    int64_t micros,
     line_sender_error** err_out);
 
 /**

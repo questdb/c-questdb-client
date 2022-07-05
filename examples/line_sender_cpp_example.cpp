@@ -8,18 +8,19 @@ static bool example(std::string_view host, std::string_view port)
 {
     try
     {
+        // Connect.
         questdb::ilp::line_sender sender{host, port};
 
         // We prepare all our table names and column names in advance.
         // If we're inserting multiple rows, this allows us to avoid
         // re-validating the same strings over and over again.
-        auto table_name = "cpp_cars"_name;
-        auto id_name = "id"_name;
-        auto x_name = "x"_name;
-        auto y_name = "y"_name;
-        auto booked_name = "booked"_name;
-        auto passengers_name = "passengers"_name;
-        auto driver_name = "driver"_name;
+        const auto table_name = "cpp_cars"_tn;
+        const auto id_name = "id"_cn;
+        const auto x_name = "x"_cn;
+        const auto y_name = "y"_cn;
+        const auto booked_name = "booked"_cn;
+        const auto passengers_name = "passengers"_cn;
+        const auto driver_name = "driver"_cn;
 
         sender
             .table(table_name)
@@ -28,7 +29,7 @@ static bool example(std::string_view host, std::string_view port)
             .column(y_name, -150.25)
             .column(booked_name, true)
             .column(passengers_name, int64_t{3})
-            .column(driver_name, "Ranjit Singh"_utf8)
+            .column(driver_name, "John Doe"_utf8)
             .at_now();
 
         // To insert more records, call `sender.table(..)...` again.

@@ -26,7 +26,7 @@ digraph line_sender_cpp_api {
   close -> close;
   close -> dtor;
 
-  line_sender [label="line_sender::line_sender(host, port, interface)"];
+  line_sender [label="line_sender::line_sender(opts)"];
   table [label=".table(name)"];
   symbol [label=".symbol(name, value)"];
   column [label=".column(name, value)"]

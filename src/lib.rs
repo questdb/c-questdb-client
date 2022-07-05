@@ -25,16 +25,27 @@
 use core::time::Duration;
 use std::convert::{TryFrom, TryInto, Infallible};
 use std::fmt::{self, Write, Display, Formatter};
-use std::io::{self, BufRead, BufReader};
-use std::io::Write as IoWrite;
+use std::io::{self, BufRead, BufReader, Write as IoWrite, ErrorKind};
 use std::sync::Arc;
 use std::path::PathBuf;
+use itoa;
 
 use socket2::{Domain, Socket, SockAddr, Type, Protocol};
 use base64ct::{Base64, Base64UrlUnpadded, Encoding};
 use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
 use rustls::{
     OwnedTrustAnchor, RootCertStore, ClientConnection, ServerName, StreamOwned};
+
+pub use crate::timestamp::{TimestampMicros, TimestampNanos};
+
+macro_rules! fmt_err {
+    ($code:ident, $($arg:tt)*) => {
+        crate::Error {
+            code: crate::ErrorCode::$code,
+            msg: format!($($arg)*)
+        }
+    }
+}
 
 #[derive(Debug, Copy, Clone)]
 enum Op {
@@ -106,8 +117,11 @@ pub enum ErrorCode {
     /// The string or symbol field is not encoded in valid UTF-8.
     InvalidUtf8,
 
-    /// The table name, symbol name or column name contains bad characters.
+    /// The table name or column name contains bad characters.
     InvalidName,
+
+    /// The supplied timestamp is invalid.
+    InvalidTimestamp,
 
     /// Error during the authentication process.
     AuthError,
@@ -143,55 +157,113 @@ impl std::error::Error for Error {}
 pub type Result<T> = std::result::Result<T, Error>;
 
 fn map_io_to_socket_err(prefix: &str, io_err: io::Error) -> Error {
-    Error {
-        code: ErrorCode::SocketError,
-        msg: format!("{}{}", prefix, io_err)
-    }
+    fmt_err!(SocketError, "{}{}", prefix, io_err)
 }
 
-pub struct Name<'a> {
+pub struct TableName<'a> {
     name: &'a str
 }
 
-impl <'a> Name<'a> {
+impl <'a> TableName<'a> {
     pub fn new(name: &'a str) -> Result<Self> {
         if name.is_empty() {
-            return Err(Error{
-                code: ErrorCode::InvalidName,
-                msg: concat!(
-                    "table, symbol and column names ",
-                    "must have a non-zero length.").to_owned()});
+            return Err(fmt_err!(
+                InvalidName, "Table names must have a non-zero length."));
+        }
+
+        let mut prev = '\0';
+        for (index, c) in name.chars().enumerate() {
+            match c {
+                '.' => {
+                    if index == 0 || index == name.len() - 1 || prev == '.' {
+                        return Err(fmt_err!(
+                            InvalidName,
+                            concat!(
+                                "Bad string {:?}: ",
+                                "Found invalid dot `.` at position {}."),
+                            name, index));
+                    }
+                },
+                '?' | ',' | '\'' | '\"' | '\\' | '/' | ':' | ')' |
+                '(' | '+' | '*' | '%' | '~' | '\r' | '\n' | '\0' |
+                '\u{0001}' | '\u{0002}' | '\u{0003}' | '\u{0004}' | '\u{0005}' |
+                '\u{0006}' | '\u{0007}' | '\u{0008}' | '\u{0009}' | '\u{000b}' |
+                '\u{000c}' | '\u{000e}' | '\u{000f}' | '\u{007f}' => {
+                    return Err(fmt_err!(
+                        InvalidName,
+                        concat!(
+                            "Bad string {:?}: ",
+                            "Table names can't contain ",
+                            "a {:?} character, which was found at ",
+                            "byte position {}."),
+                        name,
+                        c,
+                        index));
+                },
+                '\u{feff}' => {
+                    // Reject unicode char 'ZERO WIDTH NO-BREAK SPACE',
+                    // aka UTF-8 BOM if it appears anywhere in the string.
+                    return Err(fmt_err!(
+                        InvalidName,
+                        concat!(
+                            "Bad string {:?}: ",
+                            "Table names can't contain ",
+                            "a UTF-8 BOM character, which was found at ",
+                            "byte position {}."),
+                        name,
+                        index));
+                },
+                _ => ()
+            }
+            prev = c;
+        }
+
+        Ok(Self { name: name })
+    }
+}
+
+pub struct ColumnName<'a> {
+    name: &'a str
+}
+
+impl <'a> ColumnName<'a> {
+    pub fn new(name: &'a str) -> Result<Self> {
+        if name.is_empty() {
+            return Err(fmt_err!(
+                InvalidName,
+                "Column names must have a non-zero length."));
         }
 
         for (index, c) in name.chars().enumerate() {
             match c {
-                ' ' | '?' | '.' | ',' | '\'' | '\"' | '\\' | '/' | '\0' |
-                ':' | ')' | '(' | '+' | '-' | '*' | '%' | '~' => {
-                    return Err(Error{
-                        code: ErrorCode::InvalidName,
-                        msg: format!(
-                            concat!(
-                                "Bad string {:?}: ",
-                                "table, symbol and column names can't contain ",
-                                "a {:?} character, which was found at ",
-                                "byte position {}."),
-                            name,
-                            c,
-                            index)});
+                '?' | '.' | ',' | '\'' | '\"' | '\\' | '/' | ':' | ')' | '(' |
+                '+' | '-' | '*' | '%' | '~' | '\r' | '\n' | '\0' |
+                '\u{0001}' | '\u{0002}' | '\u{0003}' | '\u{0004}' | '\u{0005}' |
+                '\u{0006}' | '\u{0007}' | '\u{0008}' | '\u{0009}' | '\u{000b}' |
+                '\u{000c}' | '\u{000e}' | '\u{000f}' | '\u{007f}' => {
+                    return Err(fmt_err!(
+                        InvalidName,
+                        concat!(
+                            "Bad string {:?}: ",
+                            "Column names can't contain ",
+                            "a {:?} character, which was found at ",
+                            "byte position {}."),
+                        name,
+                        c,
+                        index));
                 },
                 '\u{FEFF}' => {
                     // Reject unicode char 'ZERO WIDTH NO-BREAK SPACE',
                     // aka UTF-8 BOM if it appears anywhere in the string.
-                    return Err(Error{
-                        code: ErrorCode::InvalidName,
-                        msg: format!(
+                    return Err(fmt_err!(
+                        InvalidName,
                             concat!(
                                 "Bad string {:?}: ",
-                                "table, symbol and column names can't contain ",
+                                "Column names can't contain ",
                                 "a UTF-8 BOM character, which was found at ",
                                 "byte position {}."),
                             name,
-                            index)});
+                            index));
                 },
                 _ => ()
             }
@@ -201,11 +273,19 @@ impl <'a> Name<'a> {
     }
 }
 
-impl <'a> TryFrom<&'a str> for Name<'a> {
+impl <'a> TryFrom<&'a str> for TableName<'a> {
     type Error = self::Error;
 
     fn try_from(name: &'a str) -> Result<Self> {
-        Name::new(name)
+        Self::new(name)
+    }
+}
+
+impl <'a> TryFrom<&'a str> for ColumnName<'a> {
+    type Error = self::Error;
+
+    fn try_from(name: &'a str) -> Result<Self> {
+        Self::new(name)
     }
 }
 
@@ -251,7 +331,7 @@ fn write_escaped_impl<Q, C>(
 
 fn must_escape_unquoted(c: char) -> bool {
     match c {
-        ' ' | ',' | '=' | '\n' | '\r' | '"' | '\\' => true,
+        ' ' | ',' | '=' | '\n' | '\r' | '\\' => true,
         _ => false
     }
 }
@@ -313,7 +393,8 @@ pub struct LineSender {
     descr: String,
     conn: Connection,
     state: State,
-    output: String
+    output: String,
+    max_name_len: usize,
 }
 
 impl std::fmt::Debug for LineSender {
@@ -376,17 +457,6 @@ impl From<u16> for Service {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct LineSenderBuilder {
-    capacity: usize,
-    read_timeout: Duration,
-    host: String,
-    port: String,
-    net_interface: Option<String>,
-    auth: Option<AuthParams>,
-    tls: Tls,
-}
-
 #[cfg(feature = "insecure_skip_verify")]
 mod danger {
     pub struct NoCertificateVerification {}
@@ -407,10 +477,20 @@ mod danger {
 }
 
 fn map_rustls_err(descr: &str, err: rustls::Error) -> Error {
-    Error {
-        code: ErrorCode::TlsError,
-        msg: format!("{}: {}", descr, err)
-    }
+    fmt_err!(TlsError, "{}: {}", descr, err)
+}
+
+fn add_webpki_roots(root_store: &mut rustls::RootCertStore) {
+    root_store.add_server_trust_anchors(
+        webpki_roots::TLS_SERVER_ROOTS
+            .0
+            .iter()
+            .map(|ta| {
+                OwnedTrustAnchor::from_subject_spki_name_constraints(
+                    ta.subject,
+                    ta.spki,
+                    ta.name_constraints,
+                )}));
 }
 
 fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
@@ -423,33 +503,26 @@ fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
     if let Tls::Enabled(ca) = tls {
         match ca {
             CertificateAuthority::WebpkiRoots => {
-                root_store.add_server_trust_anchors(
-                    webpki_roots::TLS_SERVER_ROOTS
-                        .0
-                        .iter()
-                        .map(|ta| {
-                            OwnedTrustAnchor::from_subject_spki_name_constraints(
-                                ta.subject,
-                                ta.spki,
-                                ta.name_constraints,
-                            )}));
+                add_webpki_roots(&mut root_store);
             },
             CertificateAuthority::File(ca_file) => {
                 let certfile = std::fs::File::open(ca_file)
-                    .map_err(|io_err| Error {
-                        code: ErrorCode::TlsError,
-                        msg: format!(
-                            "Could not open certificate authority file from path {:?}: {}",
-                            ca_file,
-                            io_err)})?;
+                    .map_err(|io_err| fmt_err!(
+                        TlsError,
+                        concat!(
+                            "Could not open certificate authority ",
+                            "file from path {:?}: {}"),
+                        ca_file,
+                        io_err))?;
                 let mut reader = BufReader::new(certfile);
                 let der_certs = &rustls_pemfile::certs(&mut reader)
-                    .map_err(|io_err| Error {
-                        code: ErrorCode::TlsError,
-                        msg: format!(
-                            "Could not read certificate authority file from path {:?}: {}",
-                            ca_file,
-                            io_err)})?;
+                    .map_err(|io_err| fmt_err!(
+                        TlsError,
+                        concat!(
+                            "Could not read certificate authority ",
+                            "file from path {:?}: {}"),
+                        ca_file,
+                        io_err))?;
                 root_store.add_parsable_certificates(der_certs);
             }
         }
@@ -463,7 +536,8 @@ fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
         .with_safe_default_cipher_suites()
         .with_safe_default_kx_groups()
         .with_safe_default_protocol_versions()
-        .map_err(|rustls_err| map_rustls_err("Bad protocol version selection", rustls_err))?
+        .map_err(|rustls_err| map_rustls_err(
+            "Bad protocol version selection", rustls_err))?
         .with_root_certificates(root_store)
         .with_no_client_auth();
 
@@ -480,6 +554,18 @@ fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
     Ok(Some(Arc::new(config)))
 }
 
+#[derive(Debug, Clone)]
+pub struct LineSenderBuilder {
+    capacity: usize,
+    read_timeout: Duration,
+    host: String,
+    port: String,
+    net_interface: Option<String>,
+    auth: Option<AuthParams>,
+    tls: Tls,
+    max_name_len: usize,
+}
+
 impl LineSenderBuilder {
     /// QuestDB server and port.
     pub fn new<H: Into<String>, P: Into<Service>>(host: H, port: P) -> Self {
@@ -491,11 +577,13 @@ impl LineSenderBuilder {
             port: service.0,
             net_interface: None,
             auth: None,
-            tls: Tls::Disabled
+            tls: Tls::Disabled,
+            max_name_len: 127,
         }
     }
 
-    /// Set the initial buffer capacity.
+    /// Set the initial buffer capacity (byte count).
+    /// The default is 65536.
     pub fn capacity(mut self, byte_count: usize) -> Self {
         self.capacity = byte_count;
         self
@@ -508,6 +596,11 @@ impl LineSenderBuilder {
     }
 
     /// Authentication Parameters.
+    /// Takes:
+    ///   * Key id. AKA "kid"
+    ///   * Private key. AKA "d".
+    ///   * Public key X coordinate. AKA "x".
+    ///   * Public key Y coordinate. AKA "y".
     pub fn auth<A, B, C, D>(
         mut self,
         key_id: A,
@@ -543,17 +636,29 @@ impl LineSenderBuilder {
         self
     }
 
+    /// Set the maximum length for table and column names.
+    /// This should match the `cairo.max.file.name.length` setting of the
+    /// QuestDB instance you're connecting to.
+    /// The default value is 127, which is the same as the QuestDB default.
+    pub fn max_name_len(mut self, value: usize) -> Self {
+        self.max_name_len = value;
+        self
+    }
+
     /// Connect synchronously.
-    pub fn connect(self) -> Result<LineSender> {
-        let mut descr = format!("LineSender[host={:?},port={:?},", self.host, self.port);
-        let addr: SockAddr = gai::resolve_host_port(self.host.as_str(), self.port.as_str())?;
-        let mut sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
+    pub fn connect(&self) -> Result<LineSender> {
+        let mut descr = format!(
+            "LineSender[host={:?},port={:?},", self.host, self.port);
+        let addr: SockAddr = gai::resolve_host_port(
+            self.host.as_str(), self.port.as_str())?;
+        let mut sock = Socket::new(
+            Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
             .map_err(|io_err| map_io_to_socket_err(
                 "Could not open TCP socket: ", io_err))?;
         sock.set_nodelay(true)
             .map_err(|io_err| map_io_to_socket_err(
                 "Could not set TCP_NODELAY: ", io_err))?;
-        if let Some(host) = self.net_interface {
+        if let Some(ref host) = self.net_interface {
             let bind_addr = gai::resolve_host(host.as_str())?;
             sock.bind(&bind_addr)
                 .map_err(|io_err| map_io_to_socket_err(
@@ -582,40 +687,40 @@ impl LineSenderBuilder {
             Tls::Enabled(_) => write!(descr, "tls=enabled,").unwrap(),
 
             #[cfg(feature="insecure_skip_verify")]
-            Tls::InsecureSkipVerify => write!(descr, "tls=insecure_skip_verify,").unwrap(),
+            Tls::InsecureSkipVerify => write!(
+                descr, "tls=insecure_skip_verify,").unwrap(),
         }
 
         let conn = match configure_tls(&self.tls)? {
                 Some(tls_config) => {
                     let server_name: ServerName = self.host.as_str().try_into()
-                        .map_err(|inv_dns_err| Error {
-                            code: ErrorCode::TlsError,
-                            msg: format!("Bad host: {}", inv_dns_err)})?;
+                        .map_err(|inv_dns_err| fmt_err!(
+                            TlsError,
+                            "Bad host: {}",
+                            inv_dns_err))?;
                     let mut tls_conn = ClientConnection::new(
                         tls_config, server_name)
-                            .map_err(|rustls_err| Error {
-                                code: ErrorCode::TlsError,
-                                msg: format!(
-                                    "Could not create TLS client: {}",
-                                    rustls_err)})?;
+                            .map_err(|rustls_err| fmt_err!(
+                                TlsError,
+                                "Could not create TLS client: {}",
+                                rustls_err))?;
                     while tls_conn.wants_write() || tls_conn.is_handshaking() {
                         tls_conn.complete_io(&mut sock)
-                            .map_err(|io_err| Error{
-                                code: ErrorCode::TlsError,
-                                msg:
-                                    if (io_err.kind() == io::ErrorKind::TimedOut) ||
-                                       (io_err.kind() == io::ErrorKind::WouldBlock) {
-                                        format!(
-                                            concat!(
-                                                "Failed to complete TLS handshake: ",
-                                                "Timed out waiting for server response ",
-                                                "after {:?}."),
-                                            self.read_timeout)
-                                    } else {
-                                        format!(
-                                            "Failed to complete TLS handshake: {}",
-                                            io_err)
-                                    }})?;
+                            .map_err(|io_err|
+                                if (io_err.kind() == ErrorKind::TimedOut) ||
+                                    (io_err.kind() == ErrorKind::WouldBlock) {
+                                    fmt_err!(TlsError,
+                                        concat!(
+                                            "Failed to complete TLS handshake:",
+                                            " Timed out waiting for server ",
+                                            "response after {:?}."),
+                                        self.read_timeout)
+                                } else {
+                                    fmt_err!(
+                                        TlsError,
+                                        "Failed to complete TLS handshake: {}",
+                                        io_err)
+                                })?;
                     }
                     Connection::Tls(StreamOwned::new(tls_conn, sock))
                 },
@@ -631,7 +736,8 @@ impl LineSenderBuilder {
             descr: descr,
             conn: conn,
             state: State::Connected,
-            output: String::with_capacity(self.capacity)
+            output: String::with_capacity(self.capacity),
+            max_name_len: self.max_name_len,
         };
         if let Some(auth) = self.auth.as_ref() {
             sender.authenticate(auth)?;
@@ -642,10 +748,8 @@ impl LineSenderBuilder {
 
 fn b64_decode(descr: &'static str, buf: &str) -> Result<Vec<u8>> {
     Base64UrlUnpadded::decode_vec(buf)
-        .map_err(|b64_err| Error{
-            code: ErrorCode::AuthError,
-            msg: format!(
-                "Could not decode {}: {}", descr, b64_err)})
+        .map_err(|b64_err| fmt_err!(
+            AuthError, "Could not decode {}: {}", descr, b64_err))
 }
 
 fn parse_public_key(pub_key_x: &str, pub_key_y: &str) -> Result<Vec<u8>> {
@@ -663,22 +767,63 @@ fn parse_public_key(pub_key_x: &str, pub_key_y: &str) -> Result<Vec<u8>> {
 }
 
 fn parse_key_pair(auth: &AuthParams) -> Result<EcdsaKeyPair> {
-    let private_key = b64_decode("private authentication key", auth.priv_key.as_str())?;
-    let public_key = parse_public_key(auth.pub_key_x.as_str(), auth.pub_key_y.as_str())?;
+    let private_key = b64_decode(
+        "private authentication key", auth.priv_key.as_str())?;
+    let public_key = parse_public_key(
+        auth.pub_key_x.as_str(), auth.pub_key_y.as_str())?;
     EcdsaKeyPair::from_private_key_and_public_key(
         &ECDSA_P256_SHA256_FIXED_SIGNING,
         &private_key[..],
         &public_key[..])
-            .map_err(|key_rejected| Error{
-                code: ErrorCode::AuthError,
-                msg: format!("Bad private key: {}", key_rejected)})
+            .map_err(|key_rejected| fmt_err!(
+                AuthError, "Bad private key: {}", key_rejected))
+}
+
+struct F64Serializer {
+    buf: ryu::Buffer,
+    n: f64
+}
+
+impl F64Serializer {
+    fn new(n: f64) -> Self {
+        F64Serializer {
+            buf: ryu::Buffer::new(),
+            n: n
+        }
+    }
+
+    // This function was taken and customized from the ryu crate.
+    #[cold]
+    #[cfg_attr(feature = "no-panic", inline)]
+    fn format_nonfinite(&self) -> &'static str {
+        const MANTISSA_MASK: u64 = 0x000fffffffffffff;
+        const SIGN_MASK: u64 = 0x8000000000000000;
+        let bits = self.n.to_bits();
+        if bits & MANTISSA_MASK != 0 {
+            "NaN"
+        } else if bits & SIGN_MASK != 0 {
+            "-Infinity"
+        } else {
+            "Infinity"
+        }
+    }
+
+    fn to_str(&mut self) -> &str {
+        if self.n.is_finite() {
+            self.buf.format_finite(self.n)
+        }
+        else {
+            self.format_nonfinite()
+        }
+    }
 }
 
 impl LineSender {
 
     fn send_key_id(&mut self, key_id: &str) -> Result<()> {
         write!(&mut self.conn, "{}\n", key_id)
-            .map_err(|io_err| map_io_to_socket_err("Failed to send key_id: ", io_err))?;
+            .map_err(|io_err|
+                map_io_to_socket_err("Failed to send key_id: ", io_err))?;
         Ok(())
     }
 
@@ -690,16 +835,20 @@ impl LineSender {
                 "Failed to read authentication challenge (timed out?): ",
                 io_err))?;
         if buf.last().map(|c| *c).unwrap_or(b'\0') != b'\n' {
-            return Err(Error {
-                code: ErrorCode::AuthError,
-                msg: if buf.len() == 0 {
-                    concat!(
-                        "Did not receive auth challenge. ",
-                        "Is the database configured to require authentication?"
-                    ).to_owned()
+            return Err(if buf.len() == 0 {
+                    fmt_err!(
+                        AuthError,
+                        concat!(
+                            "Did not receive auth challenge. ",
+                            "Is the database configured to require ",
+                            "authentication?"
+                        ))
                 } else {
-                    format!("Received incomplete auth challenge: {:?}", buf)
-                }});
+                    fmt_err!(
+                        AuthError,
+                        "Received incomplete auth challenge: {:?}",
+                        buf)
+                });
         }
         buf.pop();  // b'\n'
         Ok(buf)
@@ -707,22 +856,20 @@ impl LineSender {
 
     fn authenticate(&mut self, auth: &AuthParams) -> Result<()> {
         if auth.key_id.contains('\n') {
-            return Err(Error {
-                code: ErrorCode::AuthError,
-                msg: format!(
-                    "Bad key id {:?}: Should not contain new-line char.",
-                    auth.key_id)});
+            return Err(fmt_err!(
+                AuthError,
+                "Bad key id {:?}: Should not contain new-line char.",
+                auth.key_id));
         }
         let key_pair = parse_key_pair(&auth)?;
         self.send_key_id(auth.key_id.as_str())?;
         let challenge = self.read_challenge()?;
         let rng = ring::rand::SystemRandom::new();
         let signature = key_pair.sign(&rng, &challenge[..]).
-            map_err(|unspecified_err| Error{
-                code: ErrorCode::AuthError,
-                msg: format!(
-                    "Failed to sign challenge: {}",
-                    unspecified_err)})?;
+            map_err(|unspecified_err| fmt_err!(
+                AuthError,
+                "Failed to sign challenge: {}",
+                unspecified_err))?;
         let mut encoded_sig = Base64::encode_string(signature.as_ref());
         encoded_sig.push('\n');
         let buf = encoded_sig.as_bytes();
@@ -738,49 +885,63 @@ impl LineSender {
         if (self.state as isize & op as isize) > 0 {
             return Ok(());
         }
-        let error = Error{
-            code: ErrorCode::InvalidApiCall,
-            msg: format!(
-                "State error: Bad call to `{}`, {}. Must now call `close`.",
-                op.descr(),
-                self.state.next_op_descr())};
+        let error = fmt_err!(
+            InvalidApiCall,
+            "State error: Bad call to `{}`, {}. Must now call `close`.",
+            op.descr(),
+            self.state.next_op_descr());
         self.state = State::Moribund;
         Err(error)
     }
 
+    fn validate_max_name_len(&self, name: &str) -> Result<()> {
+        if name.len() > self.max_name_len {
+            return Err(fmt_err!(
+                InvalidApiCall,
+                "Bad name: {:?}: Too long (max {} characters)",
+                name,
+                self.max_name_len));
+        }
+        Ok(())
+    }
+
     pub fn table<'a, N>(&mut self, name: N) -> Result<&mut Self>
         where
-            N: TryInto<Name<'a>>,
+            N: TryInto<TableName<'a>>,
             Error: From<N::Error>
     {
-        let name: Name<'a> = name.try_into()?;
+        let name: TableName<'a> = name.try_into()?;
+        self.validate_max_name_len(name.name)?;
         self.check_state(Op::Table)?;
         write_escaped_unquoted(&mut self.output, name.name);
         self.state = State::TableWritten;
         Ok(self)
     }
 
-    pub fn symbol<'a, N>(&mut self, name: N, value: &str) -> Result<&mut Self>
+    pub fn symbol<'a, N, S>(&mut self, name: N, value: S) -> Result<&mut Self>
         where
-            N: TryInto<Name<'a>>,
+            N: TryInto<ColumnName<'a>>,
+            S: AsRef<str>,
             Error: From<N::Error>
     {
-        let name: Name<'a> = name.try_into()?;
+        let name: ColumnName<'a> = name.try_into()?;
+        self.validate_max_name_len(name.name)?;
         self.check_state(Op::Symbol)?;
         self.output.push(',');
         write_escaped_unquoted(&mut self.output, name.name);
         self.output.push('=');
-        write_escaped_unquoted(&mut self.output, value);
+        write_escaped_unquoted(&mut self.output, value.as_ref());
         self.state = State::SymbolWritten;
         Ok(self)
     }
 
     fn write_column_key<'a, N>(&mut self, name: N) -> Result<&mut Self>
         where
-            N: TryInto<Name<'a>>,
+            N: TryInto<ColumnName<'a>>,
             Error: From<N::Error>
     {
-        let name: Name<'a> = name.try_into()?;
+        let name: ColumnName<'a> = name.try_into()?;
+        self.validate_max_name_len(name.name)?;
         self.check_state(Op::Column)?;
         self.output.push(
             if (self.state as isize & Op::Symbol as isize) > 0 {
@@ -794,9 +955,10 @@ impl LineSender {
         Ok(self)
     }
 
-    pub fn column_bool<'a, N>(&mut self, name: N, value: bool) -> Result<&mut Self>
+    pub fn column_bool<'a, N>(
+        &mut self, name: N, value: bool) -> Result<&mut Self>
         where
-            N: TryInto<Name<'a>>,
+            N: TryInto<ColumnName<'a>>,
             Error: From<N::Error>
     {
         self.write_column_key(name)?;
@@ -804,41 +966,58 @@ impl LineSender {
         Ok(self)
     }
 
-    pub fn column_i64<'a, N>(&mut self, name: N, value: i64) -> Result<&mut Self>
+    pub fn column_i64<'a, N>(
+        &mut self, name: N, value: i64) -> Result<&mut Self>
         where
-            N: TryInto<Name<'a>>,
+            N: TryInto<ColumnName<'a>>,
             Error: From<N::Error>
     {
         self.write_column_key(name)?;
-        write!(&mut self.output, "{}i", value).unwrap();
+        let mut buf = itoa::Buffer::new();
+        let printed = buf.format(value);
+        self.output.push_str(printed);
+        self.output.push('i');
         Ok(self)
     }
 
-    pub fn column_f64<'a, N>(&mut self, name: N, value: f64) -> Result<&mut Self>
+    pub fn column_f64<'a, N>(
+        &mut self, name: N, value: f64) -> Result<&mut Self>
         where
-            N: TryInto<Name<'a>>,
+            N: TryInto<ColumnName<'a>>,
             Error: From<N::Error>
     {
         self.write_column_key(name)?;
-        if value == f64::INFINITY {
-            self.output.push_str("Infinity");
-        }
-        else if value == f64::NEG_INFINITY {
-            self.output.push_str("-Infinity");
-        }
-        else {
-            write!(&mut self.output, "{}", value).unwrap();
-        }
+        let mut ser = F64Serializer::new(value);
+        self.output.push_str(ser.to_str());
         Ok(self)
     }
 
-    pub fn column_str<'a, N>(&mut self, name: N, value: &str) -> Result<&mut Self>
+    pub fn column_str<'a, N, S>(
+        &mut self, name: N, value: S) -> Result<&mut Self>
         where
-            N: TryInto<Name<'a>>,
+            N: TryInto<ColumnName<'a>>,
+            S: AsRef<str>,
             Error: From<N::Error>
     {
         self.write_column_key(name)?;
-        write_escaped_quoted(&mut self.output, value);
+        write_escaped_quoted(&mut self.output, value.as_ref());
+        Ok(self)
+    }
+
+    pub fn column_ts<'a, N, T>(
+        &mut self, name: N, value: T) -> Result<&mut Self>
+        where
+            N: TryInto<ColumnName<'a>>,
+            T: TryInto<TimestampMicros>,
+            Error: From<N::Error>,
+            Error: From<T::Error>
+    {
+        self.write_column_key(name)?;
+        let timestamp: TimestampMicros = value.try_into()?;
+        let mut buf = itoa::Buffer::new();
+        let printed = buf.format(timestamp.as_i64());
+        self.output.push_str(printed);
+        self.output.push('t');
         Ok(self)
     }
 
@@ -855,9 +1034,19 @@ impl LineSender {
         self.output.as_str()
     }
 
-    pub fn at(&mut self, epoch_nanos: i64) -> Result<()> {
+    pub fn at<T>(&mut self, timestamp: T) -> Result<()>
+        where
+            T: TryInto<TimestampNanos>,
+            Error: From<T::Error>
+    {
         self.check_state(Op::At)?;
-        write!(&mut self.output, " {}\n", epoch_nanos).unwrap();
+        let mut buf = itoa::Buffer::new();
+        let timestamp: TimestampNanos = timestamp.try_into()?;
+        let epoch_nanos = timestamp.as_i64();
+        let printed = buf.format(epoch_nanos);
+        self.output.push(' ');
+        self.output.push_str(printed);
+        self.output.push('\n');
         self.state = State::MayFlushOrTable;
         Ok(())
     }
@@ -889,6 +1078,7 @@ impl LineSender {
 }
 
 mod gai;
+mod timestamp;
 
 #[allow(non_camel_case_types)]
 #[cfg(feature = "ffi")]
