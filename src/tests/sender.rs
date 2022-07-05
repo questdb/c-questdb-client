@@ -24,6 +24,7 @@
 
 use crate::{
     LineSender,
+    LineSenderBuffer,
     CertificateAuthority,
     Tls,
     Error,
@@ -31,7 +32,7 @@ use crate::{
     TimestampMicros,
     TimestampNanos};
 
-use crate::tests::{TestResult, TestError, mock::{MockServer, certs_dir}};
+use crate::tests::{TestResult, mock::{MockServer, certs_dir}};
 
 use core::time::Duration;
 use std::io;
@@ -49,7 +50,8 @@ fn test_basics() -> TestResult {
     let ts_micros = ts.duration_since(
         std::time::SystemTime::UNIX_EPOCH)?.as_micros() as i64;
 
-    sender
+    let mut buffer = LineSenderBuffer::new();
+    buffer
         .table("test")?
         .symbol("t1", "v1")?
         .column_f64("f1", 0.5)?
@@ -60,29 +62,21 @@ fn test_basics() -> TestResult {
     assert_eq!(server.recv_q()?, 0);
     let exp = format!(
         "test,t1=v1 f1=0.5,ts1=12345t,ts2={}t 10000000\n", ts_micros);
-    assert_eq!(sender.peek_pending(), exp);
-    assert_eq!(sender.pending_size(), exp.len());
-    sender.flush()?;
+    assert_eq!(buffer.as_str(), exp);
+    assert_eq!(buffer.len(), exp.len());
+    sender.flush(&mut buffer)?;
+    assert_eq!(buffer.len(), 0);
+    assert_eq!(buffer.as_str(), "");
     assert_eq!(server.recv_q()?, 1);
     assert_eq!(server.msgs[0].as_str(), exp);
     Ok(())
 }
 
-fn name_too_long_setup() -> Result<LineSender, TestError> {
-    let mut server = MockServer::new()?;
-    let sender = server
-        .lsb()
-        .max_name_len(4)
-        .connect()?;
-    server.accept()?;
-    Ok(sender)
-}
-
 #[test]
 fn test_table_name_too_long() -> TestResult {
-    let mut sender = name_too_long_setup()?;
+    let mut buffer = LineSenderBuffer::with_max_name_len(4);
     let name = "a name too long";
-    let err = sender.table(name).unwrap_err();
+    let err = buffer.table(name).unwrap_err();
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
     assert_eq!(
         err.msg(),
@@ -93,9 +87,9 @@ fn test_table_name_too_long() -> TestResult {
 macro_rules! column_name_too_long_test_impl {
     ($column_fn:ident, $value:expr) => {
         {
-            let mut sender = name_too_long_setup()?;
+            let mut buffer = LineSenderBuffer::with_max_name_len(4);
             let name = "a name too long";
-            let err = sender
+            let err = buffer
                 .table("tbl")?
                 .$column_fn(name, $value)
                 .unwrap_err();
@@ -145,7 +139,8 @@ fn test_tls_with_file_ca() -> TestResult {
     let mut sender = lsb.connect()?;
     let mut server: MockServer = server_jh.join().unwrap()?;
 
-    sender
+    let mut buffer = LineSenderBuffer::new();
+    buffer
         .table("test")?
         .symbol("t1", "v1")?
         .column_f64("f1", 0.5)?
@@ -153,9 +148,9 @@ fn test_tls_with_file_ca() -> TestResult {
 
     assert_eq!(server.recv_q()?, 0);
     let exp = "test,t1=v1 f1=0.5 10000000\n";
-    assert_eq!(sender.peek_pending(), exp);
-    assert_eq!(sender.pending_size(), exp.len());
-    sender.flush()?;
+    assert_eq!(buffer.as_str(), exp);
+    assert_eq!(buffer.len(), exp.len());
+    sender.flush(&mut buffer)?;
     assert_eq!(server.recv_q()?, 1);
     assert_eq!(server.msgs[0].as_str(), exp);
     Ok(())
@@ -189,11 +184,12 @@ fn expect_eventual_disconnect(sender: &mut LineSender) {
     let mut retry = || {
         for _ in 0..1000 {
             std::thread::sleep(Duration::from_millis(100));
-            sender
+            let mut buffer = LineSenderBuffer::new();
+            buffer
                 .table("test_table")?
                 .symbol("s1", "v1")?
                 .at_now()?;
-            sender.flush()?;
+            sender.flush(&mut buffer)?;
         }
         Ok(())
     };
@@ -235,7 +231,8 @@ fn test_tls_insecure_skip_verify() -> TestResult {
     let mut sender = lsb.connect()?;
     let mut server: MockServer = server_jh.join().unwrap()?;
 
-    sender
+    let mut buffer = LineSenderBuffer::new();
+    buffer
         .table("test")?
         .symbol("t1", "v1")?
         .column_f64("f1", 0.5)?
@@ -243,9 +240,9 @@ fn test_tls_insecure_skip_verify() -> TestResult {
 
     assert_eq!(server.recv_q()?, 0);
     let exp = "test,t1=v1 f1=0.5 10000000\n";
-    assert_eq!(sender.peek_pending(), exp);
-    assert_eq!(sender.pending_size(), exp.len());
-    sender.flush()?;
+    assert_eq!(buffer.as_str(), exp);
+    assert_eq!(buffer.len(), exp.len());
+    sender.flush(&mut buffer)?;
     assert_eq!(server.recv_q()?, 1);
     assert_eq!(server.msgs[0].as_str(), exp);
     Ok(())

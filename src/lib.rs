@@ -68,40 +68,6 @@ impl Op {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq)]
-enum State {
-    Connected =
-        Op::Table as isize,
-    TableWritten =
-        Op::Symbol as isize | Op::Column as isize,
-    SymbolWritten =
-        Op::Symbol as isize | Op::Column as isize | Op::At as isize,
-    ColumnWritten =
-        Op::Column as isize | Op::At as isize,
-    MayFlushOrTable =
-        Op::Flush as isize | Op::Table as isize,
-    Moribund = 0,
-}
-
-impl State {
-    fn next_op_descr(self) -> &'static str {
-        match self {
-            State::Connected =>
-                "should have called `table` instead",
-            State::TableWritten =>
-                "should have called `symbol` or `column` instead",
-            State::SymbolWritten =>
-                "should have called `symbol`, `column` or `at` instead",
-            State::ColumnWritten =>
-                "should have called `column` or `at` instead",
-            State::MayFlushOrTable =>
-                "should have called `flush` or `table` instead",
-            State::Moribund =>
-                "unrecoverable state due to previous error"
-        }
-    }
-}
-
 /// Category of error.
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum ErrorCode {
@@ -389,12 +355,253 @@ impl io::Write for Connection {
     }
 }
 
-pub struct LineSender {
-    descr: String,
-    conn: Connection,
+#[derive(Debug, Copy, Clone, PartialEq)]
+enum State {
+    Init =
+        Op::Table as isize,
+    TableWritten =
+        Op::Symbol as isize | Op::Column as isize,
+    SymbolWritten =
+        Op::Symbol as isize | Op::Column as isize | Op::At as isize,
+    ColumnWritten =
+        Op::Column as isize | Op::At as isize,
+    MayFlushOrTable =
+        Op::Flush as isize | Op::Table as isize
+}
+
+impl State {
+    fn next_op_descr(self) -> &'static str {
+        match self {
+            State::Init =>
+                "should have called `table` instead",
+            State::TableWritten =>
+                "should have called `symbol` or `column` instead",
+            State::SymbolWritten =>
+                "should have called `symbol`, `column` or `at` instead",
+            State::ColumnWritten =>
+                "should have called `column` or `at` instead",
+            State::MayFlushOrTable =>
+                "should have called `flush` or `table` instead"
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LineSenderBuffer {
     state: State,
     output: String,
     max_name_len: usize,
+}
+
+impl LineSenderBuffer {
+    /// Construct an instance with a `max_name_len` of `127`,
+    /// which is the same as the QuestDB default.
+    pub fn new() -> Self {
+        Self {
+            state: State::Init,
+            output: String::with_capacity(64 * 1024),
+            max_name_len: 127
+        }
+    }
+
+    /// Construct with a custom maximum length for table and column names.
+    /// This should match the `cairo.max.file.name.length` setting of the
+    /// QuestDB instance you're connecting to.
+    pub fn with_max_name_len(max_name_len: usize) -> Self {
+        let mut buffer = Self::new();
+        buffer.max_name_len = max_name_len;
+        buffer
+    }
+
+    pub fn reserve(&mut self, additional: usize) {
+        self.output.reserve(additional);
+    }
+
+    pub fn len(&self) -> usize {
+        self.output.len()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.output.capacity()
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.output
+    }
+
+    pub fn clear(&mut self) {
+        self.output.clear();
+        self.state = State::Init;
+    }
+
+    fn check_state(&self, op: Op) -> Result<()> {
+        if (self.state as isize & op as isize) > 0 {
+            return Ok(());
+        }
+        let error = fmt_err!(
+            InvalidApiCall,
+            "State error: Bad call to `{}`, {}.",
+            op.descr(),
+            self.state.next_op_descr());
+        Err(error)
+    }
+
+    fn validate_max_name_len(&self, name: &str) -> Result<()> {
+        if name.len() > self.max_name_len {
+            return Err(fmt_err!(
+                InvalidApiCall,
+                "Bad name: {:?}: Too long (max {} characters)",
+                name,
+                self.max_name_len));
+        }
+        Ok(())
+    }
+
+    pub fn table<'a, N>(&mut self, name: N) -> Result<&mut Self>
+        where
+            N: TryInto<TableName<'a>>,
+            Error: From<N::Error>
+    {
+        let name: TableName<'a> = name.try_into()?;
+        self.validate_max_name_len(name.name)?;
+        self.check_state(Op::Table)?;
+        write_escaped_unquoted(&mut self.output, name.name);
+        self.state = State::TableWritten;
+        Ok(self)
+    }
+
+    pub fn symbol<'a, N, S>(&mut self, name: N, value: S) -> Result<&mut Self>
+        where
+            N: TryInto<ColumnName<'a>>,
+            S: AsRef<str>,
+            Error: From<N::Error>
+    {
+        let name: ColumnName<'a> = name.try_into()?;
+        self.validate_max_name_len(name.name)?;
+        self.check_state(Op::Symbol)?;
+        self.output.push(',');
+        write_escaped_unquoted(&mut self.output, name.name);
+        self.output.push('=');
+        write_escaped_unquoted(&mut self.output, value.as_ref());
+        self.state = State::SymbolWritten;
+        Ok(self)
+    }
+
+    fn write_column_key<'a, N>(&mut self, name: N) -> Result<&mut Self>
+        where
+            N: TryInto<ColumnName<'a>>,
+            Error: From<N::Error>
+    {
+        let name: ColumnName<'a> = name.try_into()?;
+        self.validate_max_name_len(name.name)?;
+        self.check_state(Op::Column)?;
+        self.output.push(
+            if (self.state as isize & Op::Symbol as isize) > 0 {
+                ' '
+            } else {
+                ','
+            });
+        write_escaped_unquoted(&mut self.output, name.name);
+        self.output.push('=');
+        self.state = State::ColumnWritten;
+        Ok(self)
+    }
+
+    pub fn column_bool<'a, N>(
+        &mut self, name: N, value: bool) -> Result<&mut Self>
+        where
+            N: TryInto<ColumnName<'a>>,
+            Error: From<N::Error>
+    {
+        self.write_column_key(name)?;
+        self.output.push(if value {'t'} else {'f'});
+        Ok(self)
+    }
+
+    pub fn column_i64<'a, N>(
+        &mut self, name: N, value: i64) -> Result<&mut Self>
+        where
+            N: TryInto<ColumnName<'a>>,
+            Error: From<N::Error>
+    {
+        self.write_column_key(name)?;
+        let mut buf = itoa::Buffer::new();
+        let printed = buf.format(value);
+        self.output.push_str(printed);
+        self.output.push('i');
+        Ok(self)
+    }
+
+    pub fn column_f64<'a, N>(
+        &mut self, name: N, value: f64) -> Result<&mut Self>
+        where
+            N: TryInto<ColumnName<'a>>,
+            Error: From<N::Error>
+    {
+        self.write_column_key(name)?;
+        let mut ser = F64Serializer::new(value);
+        self.output.push_str(ser.to_str());
+        Ok(self)
+    }
+
+    pub fn column_str<'a, N, S>(
+        &mut self, name: N, value: S) -> Result<&mut Self>
+        where
+            N: TryInto<ColumnName<'a>>,
+            S: AsRef<str>,
+            Error: From<N::Error>
+    {
+        self.write_column_key(name)?;
+        write_escaped_quoted(&mut self.output, value.as_ref());
+        Ok(self)
+    }
+
+    pub fn column_ts<'a, N, T>(
+        &mut self, name: N, value: T) -> Result<&mut Self>
+        where
+            N: TryInto<ColumnName<'a>>,
+            T: TryInto<TimestampMicros>,
+            Error: From<N::Error>,
+            Error: From<T::Error>
+    {
+        self.write_column_key(name)?;
+        let timestamp: TimestampMicros = value.try_into()?;
+        let mut buf = itoa::Buffer::new();
+        let printed = buf.format(timestamp.as_i64());
+        self.output.push_str(printed);
+        self.output.push('t');
+        Ok(self)
+    }
+
+    pub fn at<T>(&mut self, timestamp: T) -> Result<()>
+        where
+            T: TryInto<TimestampNanos>,
+            Error: From<T::Error>
+    {
+        self.check_state(Op::At)?;
+        let mut buf = itoa::Buffer::new();
+        let timestamp: TimestampNanos = timestamp.try_into()?;
+        let epoch_nanos = timestamp.as_i64();
+        let printed = buf.format(epoch_nanos);
+        self.output.push(' ');
+        self.output.push_str(printed);
+        self.output.push('\n');
+        self.state = State::MayFlushOrTable;
+        Ok(())
+    }
+
+    pub fn at_now(&mut self) -> Result<()> {
+        self.check_state(Op::At)?;
+        self.output.push('\n');
+        self.state = State::MayFlushOrTable;
+        Ok(())
+    }
+}
+
+pub struct LineSender {
+    descr: String,
+    conn: Connection,
+    connected: bool
 }
 
 impl std::fmt::Debug for LineSender {
@@ -562,8 +769,7 @@ pub struct LineSenderBuilder {
     port: String,
     net_interface: Option<String>,
     auth: Option<AuthParams>,
-    tls: Tls,
-    max_name_len: usize,
+    tls: Tls
 }
 
 impl LineSenderBuilder {
@@ -577,8 +783,7 @@ impl LineSenderBuilder {
             port: service.0,
             net_interface: None,
             auth: None,
-            tls: Tls::Disabled,
-            max_name_len: 127,
+            tls: Tls::Disabled
         }
     }
 
@@ -633,15 +838,6 @@ impl LineSenderBuilder {
     /// The default is 15 seconds.
     pub fn read_timeout(mut self, value: Duration) -> Self {
         self.read_timeout = value;
-        self
-    }
-
-    /// Set the maximum length for table and column names.
-    /// This should match the `cairo.max.file.name.length` setting of the
-    /// QuestDB instance you're connecting to.
-    /// The default value is 127, which is the same as the QuestDB default.
-    pub fn max_name_len(mut self, value: usize) -> Self {
-        self.max_name_len = value;
         self
     }
 
@@ -735,9 +931,7 @@ impl LineSenderBuilder {
         let mut sender = LineSender {
             descr: descr,
             conn: conn,
-            state: State::Connected,
-            output: String::with_capacity(self.capacity),
-            max_name_len: self.max_name_len,
+            connected: true
         };
         if let Some(auth) = self.auth.as_ref() {
             sender.authenticate(auth)?;
@@ -881,199 +1075,26 @@ impl LineSender {
         Ok(())
     }
 
-    fn check_state(&mut self, op: Op) -> Result<()> {
-        if (self.state as isize & op as isize) > 0 {
-            return Ok(());
-        }
-        let error = fmt_err!(
-            InvalidApiCall,
-            "State error: Bad call to `{}`, {}. Must now call `close`.",
-            op.descr(),
-            self.state.next_op_descr());
-        self.state = State::Moribund;
-        Err(error)
-    }
-
-    fn validate_max_name_len(&self, name: &str) -> Result<()> {
-        if name.len() > self.max_name_len {
+    pub fn flush(&mut self, buf: &mut LineSenderBuffer) -> Result<()> {
+        if !self.connected {
             return Err(fmt_err!(
-                InvalidApiCall,
-                "Bad name: {:?}: Too long (max {} characters)",
-                name,
-                self.max_name_len));
+                SocketError,
+                "Cannot flush buffer: not connected to database."));
         }
-        Ok(())
-    }
-
-    pub fn table<'a, N>(&mut self, name: N) -> Result<&mut Self>
-        where
-            N: TryInto<TableName<'a>>,
-            Error: From<N::Error>
-    {
-        let name: TableName<'a> = name.try_into()?;
-        self.validate_max_name_len(name.name)?;
-        self.check_state(Op::Table)?;
-        write_escaped_unquoted(&mut self.output, name.name);
-        self.state = State::TableWritten;
-        Ok(self)
-    }
-
-    pub fn symbol<'a, N, S>(&mut self, name: N, value: S) -> Result<&mut Self>
-        where
-            N: TryInto<ColumnName<'a>>,
-            S: AsRef<str>,
-            Error: From<N::Error>
-    {
-        let name: ColumnName<'a> = name.try_into()?;
-        self.validate_max_name_len(name.name)?;
-        self.check_state(Op::Symbol)?;
-        self.output.push(',');
-        write_escaped_unquoted(&mut self.output, name.name);
-        self.output.push('=');
-        write_escaped_unquoted(&mut self.output, value.as_ref());
-        self.state = State::SymbolWritten;
-        Ok(self)
-    }
-
-    fn write_column_key<'a, N>(&mut self, name: N) -> Result<&mut Self>
-        where
-            N: TryInto<ColumnName<'a>>,
-            Error: From<N::Error>
-    {
-        let name: ColumnName<'a> = name.try_into()?;
-        self.validate_max_name_len(name.name)?;
-        self.check_state(Op::Column)?;
-        self.output.push(
-            if (self.state as isize & Op::Symbol as isize) > 0 {
-                ' '
-            } else {
-                ','
-            });
-        write_escaped_unquoted(&mut self.output, name.name);
-        self.output.push('=');
-        self.state = State::ColumnWritten;
-        Ok(self)
-    }
-
-    pub fn column_bool<'a, N>(
-        &mut self, name: N, value: bool) -> Result<&mut Self>
-        where
-            N: TryInto<ColumnName<'a>>,
-            Error: From<N::Error>
-    {
-        self.write_column_key(name)?;
-        self.output.push(if value {'t'} else {'f'});
-        Ok(self)
-    }
-
-    pub fn column_i64<'a, N>(
-        &mut self, name: N, value: i64) -> Result<&mut Self>
-        where
-            N: TryInto<ColumnName<'a>>,
-            Error: From<N::Error>
-    {
-        self.write_column_key(name)?;
-        let mut buf = itoa::Buffer::new();
-        let printed = buf.format(value);
-        self.output.push_str(printed);
-        self.output.push('i');
-        Ok(self)
-    }
-
-    pub fn column_f64<'a, N>(
-        &mut self, name: N, value: f64) -> Result<&mut Self>
-        where
-            N: TryInto<ColumnName<'a>>,
-            Error: From<N::Error>
-    {
-        self.write_column_key(name)?;
-        let mut ser = F64Serializer::new(value);
-        self.output.push_str(ser.to_str());
-        Ok(self)
-    }
-
-    pub fn column_str<'a, N, S>(
-        &mut self, name: N, value: S) -> Result<&mut Self>
-        where
-            N: TryInto<ColumnName<'a>>,
-            S: AsRef<str>,
-            Error: From<N::Error>
-    {
-        self.write_column_key(name)?;
-        write_escaped_quoted(&mut self.output, value.as_ref());
-        Ok(self)
-    }
-
-    pub fn column_ts<'a, N, T>(
-        &mut self, name: N, value: T) -> Result<&mut Self>
-        where
-            N: TryInto<ColumnName<'a>>,
-            T: TryInto<TimestampMicros>,
-            Error: From<N::Error>,
-            Error: From<T::Error>
-    {
-        self.write_column_key(name)?;
-        let timestamp: TimestampMicros = value.try_into()?;
-        let mut buf = itoa::Buffer::new();
-        let printed = buf.format(timestamp.as_i64());
-        self.output.push_str(printed);
-        self.output.push('t');
-        Ok(self)
-    }
-
-    pub fn pending_size(&self) -> usize {
-        if self.state != State::Moribund {
-            self.output.len()
-        }
-        else {
-            0
-        }
-    }
-
-    pub fn peek_pending(&self) -> &str {
-        self.output.as_str()
-    }
-
-    pub fn at<T>(&mut self, timestamp: T) -> Result<()>
-        where
-            T: TryInto<TimestampNanos>,
-            Error: From<T::Error>
-    {
-        self.check_state(Op::At)?;
-        let mut buf = itoa::Buffer::new();
-        let timestamp: TimestampNanos = timestamp.try_into()?;
-        let epoch_nanos = timestamp.as_i64();
-        let printed = buf.format(epoch_nanos);
-        self.output.push(' ');
-        self.output.push_str(printed);
-        self.output.push('\n');
-        self.state = State::MayFlushOrTable;
-        Ok(())
-    }
-
-    pub fn at_now(&mut self) -> Result<()> {
-        self.check_state(Op::At)?;
-        self.output.push('\n');
-        self.state = State::MayFlushOrTable;
-        Ok(())
-    }
-
-    pub fn flush(&mut self) -> Result<()> {
-        self.check_state(Op::Flush)?;
-        let buf = self.output.as_bytes();
-        if let Err(io_err) = self.conn.write_all(buf) {
-            self.state = State::Moribund;
+        buf.check_state(Op::Flush)?;
+        let bytes = buf.as_str().as_bytes();
+        if let Err(io_err) = self.conn.write_all(bytes) {
+            self.connected = false;
             return Err(map_io_to_socket_err(
                 "Could not flush buffered messages: ",
                 io_err));
         }
-        self.output.clear();
-        self.state = State::Connected;
+        buf.clear();
         Ok(())
     }
 
     pub fn must_close(&self) -> bool {
-        self.state == State::Moribund
+        !self.connected
     }
 }
 
