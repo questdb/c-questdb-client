@@ -1,5 +1,20 @@
 # Developer notes
 
+## JSON Tests
+The library shares some test cases with other ILP clients.
+
+These tests were added as so:
+
+```
+git subtree add --prefix src/tests/interop https://github.com/questdb/questdb-client-test.git main --squash
+```
+
+These should be updated with:
+
+```
+git subtree pull --prefix src/tests/interop https://github.com/questdb/questdb-client-test.git main --squash
+```
+
 ## CMake Integration
 We temporarily use a forked version of https://github.com/corrosion-rs/corrosion
 to enable linking the Rust crate as C rather than C++.
@@ -13,7 +28,7 @@ git subtree add --prefix corrosion https://github.com/amunra/corrosion master --
 and is being maintained as:
 
 ```
-git subtree add --prefix corrosion https://github.com/amunra/corrosion master --squash
+git subtree pull --prefix corrosion https://github.com/amunra/corrosion master --squash
 ```
 
 Until our outstanding pull request with the upstream project is resolved.
