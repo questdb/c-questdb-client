@@ -53,7 +53,9 @@ pub mod json_tests {
     #[derive(Debug, Serialize, Deserialize)]
     struct Expected {
         line: Option<String>,
-        any: Option<Vec<String>>
+
+        #[serde(rename = "anyLines")]
+        any_lines: Option<Vec<String>>
     }
 
     #[derive(Debug, Serialize, Deserialize)]
@@ -162,7 +164,7 @@ pub mod json_tests {
                     writeln!(output, "    assert_eq!(sender.peek_pending(), exp);")?;
                 }
                 else {
-                    let any: Vec<String> = expected.any.as_ref().unwrap()
+                    let any: Vec<String> = expected.any_lines.as_ref().unwrap()
                         .iter()
                         .map(|line| format!("{}\n", line))
                         .collect();
