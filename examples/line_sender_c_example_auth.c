@@ -48,7 +48,7 @@ static bool example(const char* host, const char* port)
     // We prepare all our table names and column names in advance.
     // If we're inserting multiple rows, this allows us to avoid
     // re-validating the same strings over and over again.
-    line_sender_table_name table_name = QDB_TABLE_NAME_LITERAL("c_cars_tls");
+    line_sender_table_name table_name = QDB_TABLE_NAME_LITERAL("c_cars_auth");
     line_sender_column_name id_name = QDB_COLUMN_NAME_LITERAL("id");
     line_sender_column_name x_name = QDB_COLUMN_NAME_LITERAL("x");
     line_sender_column_name y_name = QDB_COLUMN_NAME_LITERAL("y");

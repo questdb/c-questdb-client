@@ -338,7 +338,7 @@ namespace questdb::ilp
         size_t size() const noexcept
         {
             if (_impl)
-                return ::line_sender_buffer_len(_impl);
+                return ::line_sender_buffer_size(_impl);
             else
                 return 0;
         }
@@ -705,7 +705,7 @@ namespace questdb::ilp
 
     /**
      * Insert data into QuestDB via the InfluxDB Line Protocol.
-     * 
+     *
      * A `line_sender` object connects on construction.
      * If you want to connect later, wrap it up in an std::optional.
      *

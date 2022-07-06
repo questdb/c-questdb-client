@@ -851,6 +851,9 @@ impl LineSenderBuilder {
             Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
             .map_err(|io_err| map_io_to_socket_err(
                 "Could not open TCP socket: ", io_err))?;
+        sock.set_linger(Some(Duration::from_secs(120)))
+            .map_err(|io_err| map_io_to_socket_err(
+                "Could not set socket linger: ", io_err))?;
         sock.set_nodelay(true)
             .map_err(|io_err| map_io_to_socket_err(
                 "Could not set TCP_NODELAY: ", io_err))?;
@@ -1081,14 +1084,14 @@ impl LineSender {
         if !self.connected {
             return Err(fmt_err!(
                 SocketError,
-                "Cannot flush buffer: not connected to database."));
+                "Could not flush buffer: not connected to database."));
         }
         buf.check_state(Op::Flush)?;
         let bytes = buf.as_str().as_bytes();
         if let Err(io_err) = self.conn.write_all(bytes) {
             self.connected = false;
             return Err(map_io_to_socket_err(
-                "Could not flush buffered messages: ",
+                "Could not flush buffer: ",
                 io_err));
         }
         Ok(())

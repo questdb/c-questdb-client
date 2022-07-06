@@ -646,7 +646,7 @@ pub unsafe extern "C" fn line_sender_buffer_clear(
 
 /// Number of bytes in the accumulated buffer.
 #[no_mangle]
-pub unsafe extern "C" fn line_sender_buffer_len(
+pub unsafe extern "C" fn line_sender_buffer_size(
     buffer: *const line_sender_buffer) -> size_t
 {
     let buffer = unwrap_buffer(buffer);

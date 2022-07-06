@@ -256,7 +256,7 @@ void line_sender_buffer_clear(line_sender_buffer* buffer);
 
 /** Number of bytes in the accumulated buffer. */
 LINESENDER_API
-size_t line_sender_buffer_len(const line_sender_buffer* buffer);
+size_t line_sender_buffer_size(const line_sender_buffer* buffer);
 
 /**
  * Peek into the accumulated buffer that is to be sent out at the next `flush`.
