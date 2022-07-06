@@ -550,6 +550,9 @@ impl LineSenderBuilder {
         let mut sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
             .map_err(|io_err| map_io_to_socket_err(
                 "Could not open TCP socket: ", io_err))?;
+        sock.set_linger(None)
+            .map_err(|io_err| map_io_to_socket_err(
+                "Could not set socket linger: ", io_err))?;
         sock.set_nodelay(true)
             .map_err(|io_err| map_io_to_socket_err(
                 "Could not set TCP_NODELAY: ", io_err))?;
