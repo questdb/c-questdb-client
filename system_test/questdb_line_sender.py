@@ -598,18 +598,31 @@ class LineSender:
     def at(self, timestamp: int):
         self._buffer.at(timestamp)
 
-    def flush(self, buffer: Optional[LineSenderBuffer]=None):
+    def flush(self, buffer: Optional[LineSenderBuffer]=None, clear=True):
+        if (buffer is None) and not clear:
+            raise ValueError(
+                'Clear flag must be True when using internal buffer')
         buffer = buffer or self._buffer
         self._check_connected()
         if len(buffer) == 0:
             return
         try:
-            _error_wrapped_call(
-                _DLL.line_sender_flush_and_keep,
-                self._impl,
-                buffer._impl)
-        finally:
-            buffer.clear()
+            if clear:
+                _error_wrapped_call(
+                    _DLL.line_sender_flush,
+                    self._impl,
+                    buffer._impl)
+            else:
+                _error_wrapped_call(
+                    _DLL.line_sender_flush_and_keep,
+                    self._impl,
+                    buffer._impl)
+        except:
+            # Prevent `.close()` from erroring if it was called
+            # after a flush exception was raised, trapped and discarded.
+            if buffer is self._buffer:
+                self._buffer.clear()
+            raise
 
     def close(self, flush=True):
         if self._impl and not _DLL.line_sender_must_close(self._impl) and flush:
