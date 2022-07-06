@@ -246,7 +246,7 @@ class QuestDbFixture:
                 launch_args,
                 close_fds=True,
                 cwd=self._data_dir,
-                # env=launch_env,
+                env={"QDB_CAIRO_COMMIT_LAG":"100", "QDB_LINE_TCP_COMMIT_INTERVAL_FRACTION":"0.1"},
                 stdout=self._log,
                 stderr=subprocess.STDOUT)
 
