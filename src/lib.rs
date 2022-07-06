@@ -1075,7 +1075,9 @@ impl LineSender {
         Ok(())
     }
 
-    pub fn flush(&mut self, buf: &mut LineSenderBuffer) -> Result<()> {
+    /// Send accumulated lines to the QuestDB server, without clearing the
+    /// buffer.
+    pub fn flush_and_keep(&mut self, buf: &LineSenderBuffer) -> Result<()> {
         if !self.connected {
             return Err(fmt_err!(
                 SocketError,
@@ -1089,6 +1091,11 @@ impl LineSender {
                 "Could not flush buffered messages: ",
                 io_err));
         }
+        Ok(())
+    }
+
+    pub fn flush(&mut self, buf: &mut LineSenderBuffer) -> Result<()> {
+        self.flush_and_keep(buf)?;
         buf.clear();
         Ok(())
     }

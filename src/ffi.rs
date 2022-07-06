@@ -562,6 +562,8 @@ pub unsafe extern "C" fn line_sender_opts_free(
     }
 }
 
+/// Prepare rows for sending via the line sender's `flush` function.
+/// Buffer objects are re-usable and cleared automatically when flushing.
 pub struct line_sender_buffer(LineSenderBuffer);
 
 /// Create a buffer for serializing ILP messages.
@@ -603,6 +605,7 @@ unsafe fn unwrap_buffer_mut<'a>(
     &mut (&mut *buffer).0
 }
 
+/// Create a new copy of the buffer.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_buffer_clone(
     buffer: *const line_sender_buffer) -> *mut line_sender_buffer
@@ -611,6 +614,9 @@ pub unsafe extern "C" fn line_sender_buffer_clone(
     Box::into_raw(Box::new(line_sender_buffer(new_buffer)))
 }
 
+/// Pre-allocate to ensure the buffer has enough capacity for at least the
+/// specified additional byte count. This may be rounded up.
+/// See: `capacity`.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_buffer_reserve(
     buffer: *mut line_sender_buffer,
@@ -620,6 +626,7 @@ pub unsafe extern "C" fn line_sender_buffer_reserve(
     buffer.reserve(additional);
 }
 
+/// Get the current capacity of the buffer.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_buffer_capacity(
     buffer: *const line_sender_buffer) -> size_t
@@ -627,6 +634,8 @@ pub unsafe extern "C" fn line_sender_buffer_capacity(
     unwrap_buffer(buffer).capacity()
 }
 
+/// Remove all accumulated data and prepare the buffer for new lines.
+/// This does not affect the buffer's capacity.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_buffer_clear(
     buffer: *mut line_sender_buffer)
@@ -636,9 +645,6 @@ pub unsafe extern "C" fn line_sender_buffer_clear(
 }
 
 /// Number of bytes in the accumulated buffer.
-///
-/// @param[in] buffer Line buffer object.
-/// @return Accumulated batch size.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_buffer_len(
     buffer: *const line_sender_buffer) -> size_t
@@ -838,7 +844,7 @@ pub unsafe extern "C" fn line_sender_buffer_at_now(
 
 /// Insert data into QuestDB via the InfluxDB Line Protocol.
 ///
-/// Batch up rows, then call `line_sender_flush` to send.
+/// Batch up rows in `buffer` objects, then call `flush` to send them.
 pub struct line_sender(LineSender);
 
 /// Synchronously connect to the QuestDB database.
@@ -883,12 +889,13 @@ pub unsafe extern "C" fn line_sender_close(sender: *mut line_sender) {
     }
 }
 
-/// Send batch-up rows messages to the QuestDB server.
+/// Send buffer of rows to the QuestDB server.
 ///
-/// After sending a batch, you can close the connection or begin preparing
-/// a new batch by calling `line_sender_table`.
+/// The buffer will be automatically cleared, ready for re-use.
+/// If instead you want to preserve the buffer contents, call `flush_and_keep`.
 ///
 /// @param[in] sender Line sender object.
+/// @param[in] buffer Line buffer object.
 /// @return true on success, false on error.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_flush(
@@ -901,5 +908,26 @@ pub unsafe extern "C" fn line_sender_flush(
     bubble_err_to_c!(
         err_out,
         sender.flush(buffer));
+    true
+}
+
+/// Send buffer of rows to the QuestDB server.
+///
+/// The buffer will left untouched and must be cleared before re-use.
+/// To send and clear in one single step, `flush` instead.
+/// @param[in] sender Line sender object.
+/// @param[in] buffer Line buffer object.
+/// @return true on success, false on error.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_flush_and_keep(
+    sender: *mut line_sender,
+    buffer: *const line_sender_buffer,
+    err_out: *mut *mut line_sender_error) -> bool
+{
+    let sender = unwrap_sender_mut(sender);
+    let buffer = unwrap_buffer(buffer);
+    bubble_err_to_c!(
+        err_out,
+        sender.flush_and_keep(buffer));
     true
 }
