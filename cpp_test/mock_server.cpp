@@ -255,15 +255,15 @@ void mock_server::close()
         CLOSESOCKET(_listen_fd);
         _listen_fd = INVALID_SOCKET;
     }
-
-#if defined(PLATFORM_WINDOWS)
-    release_winsock();
-#endif
 }
 
 mock_server::~mock_server()
 {
     this->close();
+
+#if defined(PLATFORM_WINDOWS)
+    release_winsock();
+#endif
 }
 
 }
