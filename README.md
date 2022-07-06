@@ -130,7 +130,7 @@ re-usable, but a buffer may only be flushed via the sender after a `.at()` or
 
 ![Sequential Coupling](api_seq/seq.svg)
 
-#### Threading Considerations
+#### Threading Considerations
 
 By design, the sender and buffer objects perform all operations on the current
 thread. The library will not spawn any threads internally.
