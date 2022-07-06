@@ -344,6 +344,48 @@ TEST_CASE("Validation of bad chars in key names.")
     }
 }
 
+TEST_CASE("Buffer move and copy ctor testing")
+{
+    const size_t init_capacity = 128;
+
+    questdb::ilp::line_sender_buffer buffer1{init_capacity};
+    buffer1.table("buffer1");
+    CHECK(buffer1.peek() == "buffer1");
+
+    questdb::ilp::line_sender_buffer buffer2{2 * init_capacity};
+    buffer2.table("buffer2");
+    CHECK(buffer2.peek() == "buffer2");
+
+    questdb::ilp::line_sender_buffer buffer3{3 * init_capacity};
+    buffer3.table("buffer3");
+    CHECK(buffer3.peek() == "buffer3");
+
+    questdb::ilp::line_sender_buffer buffer4{buffer3};
+    buffer4.symbol("t1", "v1");
+    CHECK(buffer4.peek() == "buffer3,t1=v1");
+    CHECK(buffer3.peek() == "buffer3");
+
+    questdb::ilp::line_sender_buffer buffer5{std::move(buffer4)};
+    CHECK(buffer5.peek() == "buffer3,t1=v1");
+    CHECK(buffer4.peek() == "");
+
+    buffer4.table("buffer4");
+    CHECK(buffer4.peek() == "buffer4");
+
+    buffer1 = buffer2;
+    CHECK(buffer1.peek() == "buffer2");
+    CHECK(buffer2.peek() == "buffer2");
+
+    buffer1 = std::move(buffer3);
+    CHECK(buffer1.peek() == "buffer3");
+    CHECK(buffer3.peek() == "");
+    CHECK(buffer3.size() == 0);
+    CHECK(buffer3.capacity() == 3 * init_capacity);
+    CHECK(buffer3.peek() == "");
+
+
+}
+
 TEST_CASE("Sender move testing.")
 {
     questdb::ilp::test::mock_server server1;

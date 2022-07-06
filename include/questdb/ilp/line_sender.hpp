@@ -272,16 +272,22 @@ namespace questdb::ilp
             size_t init_capacity,
             size_t max_name_len) noexcept
             : _impl{::line_sender_buffer_with_max_name_len(max_name_len)}
+            , _init_capacity{init_capacity}
+            , _max_name_len{max_name_len}
         {
             ::line_sender_buffer_reserve(_impl, init_capacity);
         }
 
         line_sender_buffer(const line_sender_buffer& other) noexcept
             : _impl{::line_sender_buffer_clone(other._impl)}
+            , _init_capacity{other._init_capacity}
+            , _max_name_len{other._max_name_len}
         {}
 
         line_sender_buffer(line_sender_buffer&& other) noexcept
             : _impl{other._impl}
+            , _init_capacity{other._init_capacity}
+            , _max_name_len{other._max_name_len}
         {
             other._impl = nullptr;
         }
@@ -292,6 +298,8 @@ namespace questdb::ilp
             {
                 ::line_sender_buffer_free(_impl);
                 _impl = ::line_sender_buffer_clone(other._impl);
+                _init_capacity = other._init_capacity;
+                _max_name_len = other._max_name_len;
             }
             return *this;
         }
@@ -302,6 +310,8 @@ namespace questdb::ilp
             {
                 ::line_sender_buffer_free(_impl);
                 _impl = other._impl;
+                _init_capacity = other._init_capacity;
+                _max_name_len = other._max_name_len;
                 other._impl = nullptr;
             }
             return *this;
@@ -309,29 +319,50 @@ namespace questdb::ilp
 
         void reserve(size_t additional)
         {
+            may_init();
             ::line_sender_buffer_reserve(_impl, additional);
         }
 
         size_t capacity() const noexcept
         {
-            return ::line_sender_buffer_capacity(_impl);
+            if (_impl)
+            {
+                return ::line_sender_buffer_capacity(_impl);
+            }
+            else
+            {
+                return _init_capacity;
+            }
         }
 
         size_t size() const noexcept
         {
-            return ::line_sender_buffer_len(_impl);
+            if (_impl)
+                return ::line_sender_buffer_len(_impl);
+            else
+                return 0;
         }
 
         std::string_view peek() const noexcept
         {
-            size_t len = 0;
-            const char* buf = ::line_sender_buffer_peek(_impl, &len);
-            return {buf, len};
+            if (_impl)
+            {
+                size_t len = 0;
+                const char* buf = ::line_sender_buffer_peek(_impl, &len);
+                return {buf, len};
+            }
+            else
+            {
+                return {};
+            }
         }
 
         void clear() noexcept
         {
-            ::line_sender_buffer_clear(_impl);
+            if (_impl)
+            {
+                ::line_sender_buffer_clear(_impl);
+            }
         }
 
         /**
@@ -340,6 +371,7 @@ namespace questdb::ilp
          */
         line_sender_buffer& table(table_name_view name)
         {
+            may_init();
             line_sender_error::wrapped_call(
                 ::line_sender_buffer_table,
                 _impl,
@@ -356,6 +388,7 @@ namespace questdb::ilp
          */
         line_sender_buffer& symbol(column_name_view name, utf8_view value)
         {
+            may_init();
             line_sender_error::wrapped_call(
                 ::line_sender_buffer_symbol,
                 _impl,
@@ -376,6 +409,7 @@ namespace questdb::ilp
          */
         line_sender_buffer& column(column_name_view name, bool value)
         {
+            may_init();
             line_sender_error::wrapped_call(
                 ::line_sender_buffer_column_bool,
                 _impl,
@@ -391,6 +425,7 @@ namespace questdb::ilp
          */
         line_sender_buffer& column(column_name_view name, int64_t value)
         {
+            may_init();
             line_sender_error::wrapped_call(
                 ::line_sender_buffer_column_i64,
                 _impl,
@@ -406,6 +441,7 @@ namespace questdb::ilp
          */
         line_sender_buffer& column(column_name_view name, double value)
         {
+            may_init();
             line_sender_error::wrapped_call(
                 ::line_sender_buffer_column_f64,
                 _impl,
@@ -421,6 +457,7 @@ namespace questdb::ilp
          */
         line_sender_buffer& column(column_name_view name, utf8_view value)
         {
+            may_init();
             line_sender_error::wrapped_call(
                 ::line_sender_buffer_column_str,
                 _impl,
@@ -455,6 +492,7 @@ namespace questdb::ilp
             column_name_view name,
             timestamp_micros value)
         {
+            may_init();
             line_sender_error::wrapped_call(
                 ::line_sender_buffer_column_ts,
                 _impl,
@@ -474,6 +512,7 @@ namespace questdb::ilp
          */
         void at(timestamp_nanos timestamp)
         {
+            may_init();
             line_sender_error::wrapped_call(
                 ::line_sender_buffer_at,
                 _impl,
@@ -486,6 +525,7 @@ namespace questdb::ilp
          */
         void at_now()
         {
+            may_init();
             line_sender_error::wrapped_call(
                 ::line_sender_buffer_at_now,
                 _impl);
@@ -497,7 +537,18 @@ namespace questdb::ilp
                 ::line_sender_buffer_free(_impl);
         }
     private:
+        void may_init()
+        {
+            if (!_impl)
+            {
+                _impl = ::line_sender_buffer_with_max_name_len(_max_name_len);
+                ::line_sender_buffer_reserve(_impl, _init_capacity);
+            }
+        }
+
         ::line_sender_buffer* _impl;
+        size_t _init_capacity;
+        size_t _max_name_len;
 
         friend class line_sender;
     };
