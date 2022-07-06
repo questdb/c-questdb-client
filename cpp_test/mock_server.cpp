@@ -41,13 +41,13 @@
 #endif
 
 #if defined(PLATFORM_UNIX)
-#define CLOSESOCKET close
+#define CLOSESOCKET ::close
 typedef const void* setsockopt_arg_t;
 #ifndef INVALID_SOCKET
 #define INVALID_SOCKET -1
 #endif
 #elif defined(PLATFORM_WINDOWS)
-#define CLOSESOCKET closesocket
+#define CLOSESOCKET ::closesocket
 typedef const char* setsockopt_arg_t;
 typedef long suseconds_t;
 #endif
@@ -93,8 +93,8 @@ namespace questdb::ilp::test
 {
 
 mock_server::mock_server()
-    : _listen_fd{0}
-    , _conn_fd{0}
+    : _listen_fd{INVALID_SOCKET}
+    , _conn_fd{INVALID_SOCKET}
     , _port{0}
     , _msgs{}
 {
@@ -242,16 +242,28 @@ size_t mock_server::recv(double wait_timeout_sec)
     return received_count;
 }
 
-mock_server::~mock_server()
+void mock_server::close()
 {
-    if (_conn_fd)
+    if (_conn_fd != INVALID_SOCKET)
+    {
         CLOSESOCKET(_conn_fd);
-    if (_listen_fd)
+        _conn_fd = INVALID_SOCKET;
+    }
+
+    if (_listen_fd != INVALID_SOCKET)
+    {
         CLOSESOCKET(_listen_fd);
+        _listen_fd = INVALID_SOCKET;
+    }
 
 #if defined(PLATFORM_WINDOWS)
     release_winsock();
 #endif
+}
+
+mock_server::~mock_server()
+{
+    this->close();
 }
 
 }

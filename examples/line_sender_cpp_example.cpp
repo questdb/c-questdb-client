@@ -22,7 +22,8 @@ static bool example(std::string_view host, std::string_view port)
         const auto passengers_name = "passengers"_cn;
         const auto driver_name = "driver"_cn;
 
-        sender
+        questdb::ilp::line_sender_buffer buffer;
+        buffer
             .table(table_name)
             .symbol(id_name, "d6e5fe92-d19f-482a-a97a-c105f547f721"_utf8)
             .column(x_name, 30.5)
@@ -32,9 +33,9 @@ static bool example(std::string_view host, std::string_view port)
             .column(driver_name, "John Doe"_utf8)
             .at_now();
 
-        // To insert more records, call `sender.table(..)...` again.
+        // To insert more records, call `buffer.table(..)...` again.
 
-        sender.flush();
+        sender.flush(buffer);
 
         return true;
     }

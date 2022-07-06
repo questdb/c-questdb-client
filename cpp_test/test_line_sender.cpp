@@ -32,6 +32,8 @@
 
 #include <vector>
 #include <sstream>
+#include <chrono>
+#include <thread>
 
 using namespace std::string_literals;
 using namespace questdb::ilp::literals;
@@ -80,13 +82,16 @@ TEST_CASE("line_sender c api basics")
     CHECK(::line_sender_utf8_init(&v1_utf8, 2, "v1", &err));
     ::line_sender_column_name f1_name{0, nullptr};
     CHECK(::line_sender_column_name_init(&f1_name, 2, "f1", &err));
-    CHECK(::line_sender_table(sender, table_name, &err));
-    CHECK(::line_sender_symbol(sender, t1_name, v1_utf8, &err));
-    CHECK(::line_sender_column_f64(sender, f1_name, 0.5, &err));
-    CHECK(::line_sender_at(sender, 10000000, &err));
+    ::line_sender_buffer* buffer = line_sender_buffer_new();
+    CHECK(buffer != nullptr);
+    CHECK(::line_sender_buffer_table(buffer, table_name, &err));
+    CHECK(::line_sender_buffer_symbol(buffer, t1_name, v1_utf8, &err));
+    CHECK(::line_sender_buffer_column_f64(buffer, f1_name, 0.5, &err));
+    CHECK(::line_sender_buffer_at(buffer, 10000000, &err));
     CHECK(server.recv() == 0);
-    CHECK(::line_sender_pending_size(sender) == 27);
-    CHECK(::line_sender_flush(sender, &err));
+    CHECK(::line_sender_buffer_len(buffer) == 27);
+    CHECK(::line_sender_flush(sender, buffer, &err));
+    ::line_sender_buffer_free(buffer);
     CHECK(server.recv() == 1);
     CHECK(server.msgs().front() == "test,t1=v1 f1=0.5 10000000\n");
 }
@@ -110,7 +115,8 @@ TEST_CASE("line_sender c++ api basics")
     server.accept();
     CHECK(server.recv() == 0);
 
-    sender
+    questdb::ilp::line_sender_buffer buffer;
+    buffer
         .table("test")
         .symbol("t1", "v1")
         .symbol("t2", "")
@@ -118,8 +124,8 @@ TEST_CASE("line_sender c++ api basics")
         .at(questdb::ilp::timestamp_nanos{10000000});
 
     CHECK(server.recv() == 0);
-    CHECK(sender.pending_size() == 31);
-    sender.flush();
+    CHECK(buffer.size() == 31);
+    sender.flush(buffer);
     CHECK(server.recv() == 1);
     CHECK(server.msgs().front() == "test,t1=v1,t2= f1=0.5 10000000\n");
 }
@@ -135,7 +141,8 @@ TEST_CASE("test multiple lines")
     CHECK(server.recv() == 0);
 
     const auto table_name = "metric1"_tn;
-    sender
+    questdb::ilp::line_sender_buffer buffer;
+    buffer
         .table(table_name)
         .symbol("t1"_cn, "val1"_utf8)
         .symbol("t2"_cn, "val2"_utf8)
@@ -146,7 +153,7 @@ TEST_CASE("test multiple lines")
         .column("f5"_cn, "val4"_utf8)
         .column("f6"_cn, "val5"_utf8)
         .at(questdb::ilp::timestamp_nanos{111222233333});
-    sender
+    buffer
         .table(table_name)
         .symbol("tag3"_cn, "value 3"_utf8)
         .symbol("tag 4"_cn, "value:4"_utf8)
@@ -154,8 +161,8 @@ TEST_CASE("test multiple lines")
         .at_now();
 
     CHECK(server.recv() == 0);
-    CHECK(sender.pending_size() == 137);
-    sender.flush();
+    CHECK(buffer.size() == 137);
+    sender.flush(buffer);
     CHECK(server.recv() == 2);
     CHECK(server.msgs()[0] ==
         ("metric1,t1=val1,t2=val2 f1=t,f2=12345i,"
@@ -171,14 +178,13 @@ TEST_CASE("State machine testing -- flush without data.")
         std::string_view{"localhost"},
         std::to_string(server.port())};
 
-    CHECK(sender.pending_size() == 0);
+    questdb::ilp::line_sender_buffer buffer;
+    CHECK(buffer.size() == 0);
     CHECK_THROWS_WITH_AS(
-        sender.flush(),
-        "State error: Bad call to `flush`, "
-        "should have called `table` instead. "
-        "Must now call `close`.",
+        sender.flush(buffer),
+        "State error: Bad call to `flush`, should have called `table` instead.",
         questdb::ilp::line_sender_error);
-    CHECK(sender.must_close());
+    CHECK(!sender.must_close());
     sender.close();
 }
 
@@ -190,10 +196,11 @@ TEST_CASE("One symbol only - flush before server accept")
         server.port()};
 
     // Does not raise - this is unlike InfluxDB spec that disallows this.
-    sender.table("test").symbol("t1", std::string{"v1"}).at_now();
+    questdb::ilp::line_sender_buffer buffer;
+    buffer.table("test").symbol("t1", std::string{"v1"}).at_now();
     CHECK(!sender.must_close());
-    CHECK(sender.pending_size() == 11);
-    sender.flush();
+    CHECK(buffer.size() == 11);
+    sender.flush(buffer);
     sender.close();
 
     // Note the client has closed already,
@@ -211,10 +218,11 @@ TEST_CASE("One column only - server.accept() after flush, before close")
         server.port()};
 
     // Does not raise - this is unlike InfluxDB spec that disallows this.
-    sender.table("test").column("t1", "v1").at_now();
+    questdb::ilp::line_sender_buffer buffer;
+    buffer.table("test").column("t1", "v1").at_now();
     CHECK(!sender.must_close());
-    CHECK(sender.pending_size() == 13);
-    sender.flush();
+    CHECK(buffer.size() == 13);
+    sender.flush(buffer);
 
     server.accept();
     sender.close();
@@ -230,19 +238,19 @@ TEST_CASE("Symbol after column")
         "localhost",
         server.port()};
 
-    sender.table("test").column("t1", "v1");
+    questdb::ilp::line_sender_buffer buffer;
+    buffer.table("test").column("t1", "v1");
 
     CHECK_THROWS_AS(
-        sender.symbol("t2", "v2"),
+        buffer.symbol("t2", "v2"),
         questdb::ilp::line_sender_error);
 
-    CHECK(sender.must_close());
+    CHECK(!sender.must_close());
 
     CHECK_THROWS_WITH_AS(
-        sender.flush(),
+        sender.flush(buffer),
         "State error: Bad call to `flush`, "
-        "unrecoverable state due to previous error. "
-        "Must now call `close`.",
+        "should have called `column` or `at` instead.",
         questdb::ilp::line_sender_error);
 
     // Check idempotency of close.
@@ -336,7 +344,7 @@ TEST_CASE("Validation of bad chars in key names.")
     }
 }
 
-TEST_CASE("Move testing.")
+TEST_CASE("Sender move testing.")
 {
     questdb::ilp::test::mock_server server1;
     questdb::ilp::test::mock_server server2;
@@ -348,8 +356,21 @@ TEST_CASE("Move testing.")
         host_ref,
         server1.port()};
 
+    questdb::ilp::line_sender_buffer buffer;
+    buffer.table("test").column("t1", "v1").at_now();
+
+    server1.close();
+
+    auto fail_to_flush_eventually = [&]() {
+        for (size_t counter = 0; counter < 1000; ++counter)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            sender1.flush_and_keep(buffer);
+        }
+    };
+
     CHECK_THROWS_AS(
-        sender1.at_now(),
+        fail_to_flush_eventually(),
         questdb::ilp::line_sender_error);
     CHECK(sender1.must_close());
 
@@ -361,12 +382,9 @@ TEST_CASE("Move testing.")
     questdb::ilp::line_sender sender3{
         "localhost",
         server2.port()};
-    sender3.table("test");
-    CHECK(sender3.pending_size() == 4);
     CHECK_FALSE(sender3.must_close());
 
     sender3 = std::move(sender2);
-    CHECK(sender3.pending_size() == 0);
     CHECK(sender3.must_close());
 }
 
@@ -518,7 +536,8 @@ TEST_CASE("Test timestamp column.")
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             now.time_since_epoch()).count();
 
-    sender
+    questdb::ilp::line_sender_buffer buffer;
+    buffer
         .table("test")
         .column("ts1", questdb::ilp::timestamp_micros{12345})
         .column("ts2", questdb::ilp::timestamp_micros{now})
@@ -527,9 +546,11 @@ TEST_CASE("Test timestamp column.")
     std::stringstream ss;
     ss << "test ts1=12345t,ts2=" << now_micros << "t " << now_nanos << "\n";
     const auto exp = ss.str();
-    CHECK(sender.peek_pending() == exp);
+    CHECK(buffer.peek() == exp);
 
-    sender.flush();
+    sender.flush_and_keep(buffer);
+
+    CHECK(buffer.peek() == exp);
 
     server.accept();
     sender.close();

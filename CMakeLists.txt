@@ -85,14 +85,14 @@ compile_example(
     line_sender_c_example_auth
     examples/line_sender_c_example_auth.c)
 compile_example(
+    line_sender_c_example_tls
+    examples/line_sender_c_example_tls.c)
+compile_example(
     line_sender_cpp_example
     examples/line_sender_cpp_example.cpp)
 compile_example(
     line_sender_cpp_example_auth
     examples/line_sender_cpp_example_auth.cpp)
-compile_example(
-    line_sender_c_example_tls
-    examples/line_sender_c_example_tls.c)
 compile_example(
     line_sender_cpp_example_tls
     examples/line_sender_cpp_example_tls.cpp)
