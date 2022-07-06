@@ -162,7 +162,7 @@ class TestLineSender(unittest.TestCase):
 
     def _expect_eventual_disconnect(self, sender):
         with self.assertRaisesRegex(
-                qls.LineSenderError, r'.*Could not flush buffered messages'):
+                qls.LineSenderError, r'.*Could not flush buffer'):
             table_name = uuid.uuid4().hex
             for _ in range(1000):
                 time.sleep(0.1)
@@ -185,7 +185,7 @@ class TestLineSender(unittest.TestCase):
                     .column('name_d', 2.5)
                     .column('name_e', 'val_b')
                     .at_now())
-            pending = sender.peek_pending()
+            pending = sender.buffer.peek()
             sender.flush()
 
         resp = retry_check_table(table_name, min_rows=3, log_ctx=pending)
@@ -219,7 +219,7 @@ class TestLineSender(unittest.TestCase):
                 .column('b', False)
                 .column('b', 'C')
                 .at_now())
-            pending = sender.peek_pending()
+            pending = sender.buffer.peek()
 
         resp = retry_check_table(table_name, log_ctx=pending)
         exp_columns = [
@@ -244,7 +244,7 @@ class TestLineSender(unittest.TestCase):
                 .symbol('a', 'A')
                 .column('a', 'B')
                 .at_now())
-            pending = sender.peek_pending()
+            pending = sender.buffer.peek()
 
         resp = retry_check_table(table_name, log_ctx=pending)
         exp_columns = [
@@ -264,7 +264,7 @@ class TestLineSender(unittest.TestCase):
                 .table(table_name)
                 .symbol('a', 'A')
                 .at_now())
-            pending = sender.peek_pending()
+            pending = sender.buffer.peek()
 
         resp = retry_check_table(table_name, log_ctx=pending)
         exp_columns = [
@@ -288,7 +288,7 @@ class TestLineSender(unittest.TestCase):
                 .column('a', 'A')
                 .column('b', 'B')
                 .at_now())
-            pending = sender.peek_pending()
+            pending = sender.buffer.peek()
 
         resp = retry_check_table(table_name, log_ctx=pending)
         exp_columns = [
@@ -313,7 +313,7 @@ class TestLineSender(unittest.TestCase):
                 .table(table_name)
                 .column('a', 'B')  # STRING
                 .at_now())
-            pending = sender.peek_pending()
+            pending = sender.buffer.peek()
 
         # We only ever get the first row back.
         resp = retry_check_table(table_name, log_ctx=pending)
@@ -342,7 +342,7 @@ class TestLineSender(unittest.TestCase):
                 .table(table_name)
                 .symbol('a', 'A')
                 .at(at_ts_ns))
-            pending = sender.peek_pending()
+            pending = sender.buffer.peek()
 
         resp = retry_check_table(table_name, log_ctx=pending)
         exp_dataset = [['A', ns_to_qdb_date(at_ts_ns)]]
@@ -357,7 +357,7 @@ class TestLineSender(unittest.TestCase):
                 .symbol('_a_b_c_', 'A')
                 .column('_d_e_f_', True)
                 .at_now())
-            pending = sender.peek_pending()
+            pending = sender.buffer.peek()
 
         resp = retry_check_table(table_name, log_ctx=pending)
         exp_columns = [
@@ -384,7 +384,7 @@ class TestLineSender(unittest.TestCase):
             #     char = chr(num)
             #     sender.column(char, char)
             sender.at_now()
-            pending = sender.peek_pending()
+            pending = sender.buffer.peek()
 
         resp = retry_check_table(table_name, log_ctx=pending)
         exp_columns = [
@@ -433,7 +433,7 @@ class TestLineSender(unittest.TestCase):
                 sender.table(table_name)
                 sender.column('n', num)
                 sender.at_now()
-            pending = sender.peek_pending()
+            pending = sender.buffer.peek()
 
         resp = retry_check_table(
             table_name,
@@ -466,8 +466,8 @@ class TestLineSender(unittest.TestCase):
                 .table(table_name)
                 .column('ts1', ts)
                 .at_now())
-            pending = sender.peek_pending()
-        
+            pending = sender.buffer.peek()
+
         resp = retry_check_table(table_name, log_ctx=pending)
         exp_columns = [
             {'name': 'ts1', 'type': 'TIMESTAMP'},

@@ -1,0 +1,25 @@
+digraph line_sender_c_api {
+
+  graph [bgcolor=transparent];
+  node [style=filled, shape=box, fillcolor="#343942", fontcolor="#C9D1D9", fontname=monospace];
+  edge [color="#343942"];
+
+  new -> table;
+  table -> symbol;
+  symbol -> symbol;
+  symbol -> column;
+  symbol -> at;
+  table -> column;
+  column -> column;
+  column -> at;
+  at -> sender_flush;
+  at -> table;
+  sender_flush -> table;
+
+  new [label="new line_sender_buffer"];
+  table [label=".table(..)"];
+  symbol [label=".symbol(..)"];
+  column [label=".column(..)"];
+  at [label=".at(..) or .at_now()"];
+  sender_flush [label="sender.flush(buffer)"];
+}

@@ -37,6 +37,7 @@ use super::{
     TableName,
     ColumnName,
     LineSender,
+    LineSenderBuffer,
     LineSenderBuilder,
     Tls,
     CertificateAuthority,
@@ -540,18 +541,6 @@ pub unsafe extern "C" fn line_sender_opts_read_timeout(
     upd_opts!(opts, read_timeout, timeout);
 }
 
-/// Set the maximum length for table and column names.
-/// This should match the `cairo.max.file.name.length` setting of the
-/// QuestDB instance you're connecting to.
-/// The default value is 127, which is the same as the QuestDB default.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_max_name_len(
-    opts: *mut line_sender_opts,
-    value: size_t)
-{
-    upd_opts!(opts, max_name_len, value);
-}
-
 /// Duplicate the opts object.
 /// Both old and new objects will have to be freed.
 #[no_mangle]
@@ -573,9 +562,289 @@ pub unsafe extern "C" fn line_sender_opts_free(
     }
 }
 
+/// Prepare rows for sending via the line sender's `flush` function.
+/// Buffer objects are re-usable and cleared automatically when flushing.
+pub struct line_sender_buffer(LineSenderBuffer);
+
+/// Create a buffer for serializing ILP messages.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_buffer_new() -> *mut line_sender_buffer
+{
+    let buffer = LineSenderBuffer::new();
+    Box::into_raw(Box::new(line_sender_buffer(buffer)))
+}
+
+/// Create a buffer for serializing ILP messages.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_buffer_with_max_name_len(
+    max_name_len: size_t) -> *mut line_sender_buffer
+{
+    let buffer = LineSenderBuffer::with_max_name_len(max_name_len);
+    Box::into_raw(Box::new(line_sender_buffer(buffer)))
+}
+
+/// Release the buffer object.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_buffer_free(
+    buffer: *mut line_sender_buffer)
+{
+    if !buffer.is_null() {
+        drop(Box::from_raw(buffer));
+    }
+}
+
+unsafe fn unwrap_buffer<'a>(
+    buffer: *const line_sender_buffer) -> &'a LineSenderBuffer
+{
+    &(&*buffer).0
+}
+
+unsafe fn unwrap_buffer_mut<'a>(
+    buffer: *mut line_sender_buffer) -> &'a mut LineSenderBuffer
+{
+    &mut (&mut *buffer).0
+}
+
+/// Create a new copy of the buffer.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_buffer_clone(
+    buffer: *const line_sender_buffer) -> *mut line_sender_buffer
+{
+    let new_buffer = unwrap_buffer(buffer).clone();
+    Box::into_raw(Box::new(line_sender_buffer(new_buffer)))
+}
+
+/// Pre-allocate to ensure the buffer has enough capacity for at least the
+/// specified additional byte count. This may be rounded up.
+/// See: `capacity`.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_buffer_reserve(
+    buffer: *mut line_sender_buffer,
+    additional: size_t)
+{
+    let buffer = unwrap_buffer_mut(buffer);
+    buffer.reserve(additional);
+}
+
+/// Get the current capacity of the buffer.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_buffer_capacity(
+    buffer: *const line_sender_buffer) -> size_t
+{
+    unwrap_buffer(buffer).capacity()
+}
+
+/// Remove all accumulated data and prepare the buffer for new lines.
+/// This does not affect the buffer's capacity.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_buffer_clear(
+    buffer: *mut line_sender_buffer)
+{
+    let buffer = unwrap_buffer_mut(buffer);
+    buffer.clear();
+}
+
+/// Number of bytes in the accumulated buffer.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_buffer_size(
+    buffer: *const line_sender_buffer) -> size_t
+{
+    let buffer = unwrap_buffer(buffer);
+    buffer.len()
+}
+
+/// Peek into the accumulated buffer that is to be sent out at the next `flush`.
+///
+/// @param[in] buffer Line buffer object.
+/// @param[out] len_out The length in bytes of the accumulated buffer.
+/// @return UTF-8 encoded buffer. The buffer is not nul-terminated.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_buffer_peek(
+    buffer: *const line_sender_buffer,
+    len_out: *mut size_t) -> *const c_char
+{
+    let buffer = unwrap_buffer(buffer);
+    let buf: &[u8] = buffer.as_str().as_bytes();
+    *len_out = buf.len();
+    buf.as_ptr() as *const c_char
+}
+
+/// Start batching the next row of input for the named table.
+/// @param[in] buffer Line buffer object.
+/// @param[in] name Table name.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_buffer_table(
+    buffer: *mut line_sender_buffer,
+    name: line_sender_table_name,
+    err_out: *mut *mut line_sender_error) -> bool
+{
+    let buffer = unwrap_buffer_mut(buffer);
+    bubble_err_to_c!(err_out, buffer.table(name.as_name()));
+    true
+}
+
+/// Append a value for a SYMBOL column.
+/// Symbol columns must always be written before other columns for any given
+/// row.
+/// @param[in] buffer Line buffer object.
+/// @param[in] name Column name.
+/// @param[in] value Column value.
+/// @param[out] err_out Set on error.
+/// @return true on success, false on error.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_buffer_symbol(
+    buffer: *mut line_sender_buffer,
+    name: line_sender_column_name,
+    value: line_sender_utf8,
+    err_out: *mut *mut line_sender_error) -> bool
+{
+    let buffer = unwrap_buffer_mut(buffer);
+    bubble_err_to_c!(err_out, buffer.symbol(name.as_name(), value.as_str()));
+    true
+}
+
+/// Append a value for a BOOLEAN column.
+/// @param[in] buffer Line buffer object.
+/// @param[in] name Column name.
+/// @param[in] value Column value.
+/// @param[out] err_out Set on error.
+/// @return true on success, false on error.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_buffer_column_bool(
+    buffer: *mut line_sender_buffer,
+    name: line_sender_column_name,
+    value: bool,
+    err_out: *mut *mut line_sender_error) -> bool
+{
+    let buffer = unwrap_buffer_mut(buffer);
+    bubble_err_to_c!(err_out, buffer.column_bool(name.as_name(), value));
+    true
+}
+
+/// Append a value for a LONG column.
+/// @param[in] buffer Line buffer object.
+/// @param[in] name Column name.
+/// @param[in] value Column value.
+/// @param[out] err_out Set on error.
+/// @return true on success, false on error.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_buffer_column_i64(
+    buffer: *mut line_sender_buffer,
+    name: line_sender_column_name,
+    value: i64,
+    err_out: *mut *mut line_sender_error) -> bool
+{
+    let buffer = unwrap_buffer_mut(buffer);
+    bubble_err_to_c!(err_out, buffer.column_i64(name.as_name(), value));
+    true
+}
+
+/// Append a value for a DOUBLE column.
+/// @param[in] buffer Line buffer object.
+/// @param[in] name Column name.
+/// @param[in] value Column value.
+/// @param[out] err_out Set on error.
+/// @return true on success, false on error.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_buffer_column_f64(
+    buffer: *mut line_sender_buffer,
+    name: line_sender_column_name,
+    value: f64,
+    err_out: *mut *mut line_sender_error) -> bool
+{
+    let buffer = unwrap_buffer_mut(buffer);
+    bubble_err_to_c!(err_out, buffer.column_f64(name.as_name(), value));
+    true
+}
+
+/// Append a value for a STRING column.
+/// @param[in] buffer Line buffer object.
+/// @param[in] name Column name.
+/// @param[in] value Column value.
+/// @param[out] err_out Set on error.
+/// @return true on success, false on error.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_buffer_column_str(
+    buffer: *mut line_sender_buffer,
+    name: line_sender_column_name,
+    value: line_sender_utf8,
+    err_out: *mut *mut line_sender_error) -> bool
+{
+    let buffer = unwrap_buffer_mut(buffer);
+    let name = name.as_name();
+    let value = value.as_str();
+    bubble_err_to_c!(err_out, buffer.column_str(name, value));
+    true
+}
+
+/// Append a value for a TIMESTAMP column.
+/// @param[in] buffer Line buffer object.
+/// @param[in] name Column name.
+/// @param[in] micros The timestamp in microseconds since the unix epoch.
+/// @param[out] err_out Set on error.
+/// @return true on success, false on error.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_buffer_column_ts(
+    buffer: *mut line_sender_buffer,
+    name: line_sender_column_name,
+    micros: i64,
+    err_out: *mut *mut line_sender_error) -> bool
+{
+    let buffer = unwrap_buffer_mut(buffer);
+    let timestamp = bubble_err_to_c!(
+        err_out,
+        TimestampMicros::new(micros));
+    bubble_err_to_c!(err_out, buffer.column_ts(name.as_name(), timestamp));
+    true
+}
+
+/// Complete the row with a specified timestamp.
+///
+/// After this call, you can start batching the next row by calling
+/// `table` again, or you can send the accumulated batch by
+/// calling `flush`.
+///
+/// @param[in] buffer Line buffer object.
+/// @param[in] epoch_nanos Number of nanoseconds since 1st Jan 1970 UTC.
+/// @param[out] err_out Set on error.
+/// @return true on success, false on error.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_buffer_at(
+    buffer: *mut line_sender_buffer,
+    epoch_nanos: i64,
+    err_out: *mut *mut line_sender_error) -> bool
+{
+    let buffer = unwrap_buffer_mut(buffer);
+    let timestamp = bubble_err_to_c!(
+        err_out,
+        TimestampNanos::new(epoch_nanos));
+    bubble_err_to_c!(err_out, buffer.at(timestamp));
+    true
+}
+
+/// Complete the row without providing a timestamp.
+/// The QuestDB instance will insert its own timestamp.
+///
+/// After this call, you can start batching the next row by calling
+/// `table` again, or you can send the accumulated batch by
+/// calling `flush`.
+///
+/// @param[in] buffer Line buffer object.
+/// @param[out] err_out Set on error.
+/// @return true on success, false on error.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_buffer_at_now(
+    buffer: *mut line_sender_buffer,
+    err_out: *mut *mut line_sender_error) -> bool
+{
+    let buffer = unwrap_buffer_mut(buffer);
+    bubble_err_to_c!(err_out, buffer.at_now());
+    true
+}
+
 /// Insert data into QuestDB via the InfluxDB Line Protocol.
 ///
-/// Batch up rows, then call `line_sender_flush` to send.
+/// Batch up rows in `buffer` objects, then call `flush` to send them.
 pub struct line_sender(LineSender);
 
 /// Synchronously connect to the QuestDB database.
@@ -620,236 +889,45 @@ pub unsafe extern "C" fn line_sender_close(sender: *mut line_sender) {
     }
 }
 
-/// Start batching the next row of input for the named table.
-/// @param[in] sender Line sender object.
-/// @param[in] name Table name.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_table(
-    sender: *mut line_sender,
-    name: line_sender_table_name,
-    err_out: *mut *mut line_sender_error) -> bool
-{
-    let sender = unwrap_sender_mut(sender);
-    bubble_err_to_c!(err_out, sender.table(name.as_name()));
-    true
-}
-
-/// Append a value for a SYMBOL column.
-/// Symbol columns must always be written before other columns for any given
-/// row.
-/// @param[in] sender Line sender object.
-/// @param[in] name Column name.
-/// @param[in] value Column value.
-/// @param[out] err_out Set on error.
-/// @return true on success, false on error.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_symbol(
-    sender: *mut line_sender,
-    name: line_sender_column_name,
-    value: line_sender_utf8,
-    err_out: *mut *mut line_sender_error) -> bool
-{
-    let sender = unwrap_sender_mut(sender);
-    bubble_err_to_c!(
-        err_out,
-        sender.symbol(name.as_name(), value.as_str()));
-    true
-}
-
-/// Append a value for a BOOLEAN column.
-/// @param[in] sender Line sender object.
-/// @param[in] name Column name.
-/// @param[in] value Column value.
-/// @param[out] err_out Set on error.
-/// @return true on success, false on error.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_column_bool(
-    sender: *mut line_sender,
-    name: line_sender_column_name,
-    value: bool,
-    err_out: *mut *mut line_sender_error) -> bool
-{
-    let sender = unwrap_sender_mut(sender);
-    bubble_err_to_c!(
-        err_out,
-        sender.column_bool(name.as_name(), value));
-    true
-}
-
-/// Append a value for a LONG column.
-/// @param[in] sender Line sender object.
-/// @param[in] name Column name.
-/// @param[in] value Column value.
-/// @param[out] err_out Set on error.
-/// @return true on success, false on error.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_column_i64(
-    sender: *mut line_sender,
-    name: line_sender_column_name,
-    value: i64,
-    err_out: *mut *mut line_sender_error) -> bool
-{
-    let sender = unwrap_sender_mut(sender);
-    bubble_err_to_c!(
-        err_out,
-        sender.column_i64(name.as_name(), value));
-    true
-}
-
-/// Append a value for a DOUBLE column.
-/// @param[in] sender Line sender object.
-/// @param[in] name Column name.
-/// @param[in] value Column value.
-/// @param[out] err_out Set on error.
-/// @return true on success, false on error.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_column_f64(
-    sender: *mut line_sender,
-    name: line_sender_column_name,
-    value: f64,
-    err_out: *mut *mut line_sender_error) -> bool
-{
-    let sender = unwrap_sender_mut(sender);
-    bubble_err_to_c!(
-        err_out,
-        sender.column_f64(name.as_name(), value));
-    true
-}
-
-/// Append a value for a STRING column.
-/// @param[in] sender Line sender object.
-/// @param[in] name Column name.
-/// @param[in] value Column value.
-/// @param[out] err_out Set on error.
-/// @return true on success, false on error.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_column_str(
-    sender: *mut line_sender,
-    name: line_sender_column_name,
-    value: line_sender_utf8,
-    err_out: *mut *mut line_sender_error) -> bool
-{
-    let sender = unwrap_sender_mut(sender);
-    bubble_err_to_c!(
-        err_out,
-        sender.column_str(name.as_name(), value.as_str()));
-    true
-}
-
-/// Append a value for a TIMESTAMP column.
-/// @param[in] sender Line sender object.
-/// @param[in] name Column name.
-/// @param[in] micros The timestamp in microseconds since the unix epoch.
-/// @param[out] err_out Set on error.
-/// @return true on success, false on error.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_column_ts(
-    sender: *mut line_sender,
-    name: line_sender_column_name,
-    micros: i64,
-    err_out: *mut *mut line_sender_error) -> bool
-{
-    let sender = unwrap_sender_mut(sender);
-    let timestamp = bubble_err_to_c!(
-        err_out,
-        TimestampMicros::new(micros));
-    bubble_err_to_c!(
-        err_out,
-        sender.column_ts(name.as_name(), timestamp));
-    true
-}
-
-/// Complete the row with a specified timestamp.
+/// Send buffer of rows to the QuestDB server.
 ///
-/// After this call, you can start batching the next row by calling
-/// `line_sender_table` again, or you can send the accumulated batch by
-/// calling `line_sender_flush`.
+/// The buffer will be automatically cleared, ready for re-use.
+/// If instead you want to preserve the buffer contents, call `flush_and_keep`.
 ///
 /// @param[in] sender Line sender object.
-/// @param[in] epoch_nanos Number of nanoseconds since 1st Jan 1970 UTC.
-/// @param[out] err_out Set on error.
-/// @return true on success, false on error.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_at(
-    sender: *mut line_sender,
-    epoch_nanos: i64,
-    err_out: *mut *mut line_sender_error) -> bool
-{
-    let sender = unwrap_sender_mut(sender);
-    let timestamp = bubble_err_to_c!(
-        err_out,
-        TimestampNanos::new(epoch_nanos));
-    bubble_err_to_c!(
-        err_out,
-        sender.at(timestamp));
-    true
-}
-
-/// Complete the row without providing a timestamp.
-/// The QuestDB instance will insert its own timestamp.
-///
-/// After this call, you can start batching the next row by calling
-/// `line_sender_table` again, or you can send the accumulated batch by
-/// calling `line_sender_flush`.
-///
-/// @param[in] sender Line sender object.
-/// @param[out] err_out Set on error.
-/// @return true on success, false on error.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_at_now(
-    sender: *mut line_sender,
-    err_out: *mut *mut line_sender_error) -> bool
-{
-    let sender = unwrap_sender_mut(sender);
-    bubble_err_to_c!(
-        err_out,
-        sender.at_now());
-    true
-}
-
-/// Number of bytes that will be sent at next call to `line_sender_flush`.
-///
-/// @param[in] sender Line sender object.
-/// @return Accumulated batch size.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_pending_size(
-    sender: *const line_sender) -> size_t
-{
-    let sender = unwrap_sender(sender);
-    sender.pending_size()
-}
-
-/// Peek into the accumulated buffer that is to be sent out at the next `flush`.
-///
-/// @param[in] sender Line sender object.
-/// @param[out] len_out The length in bytes of the accumulated buffer.
-/// @return UTF-8 encoded buffer. The buffer is not nul-terminated.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_peek_pending(
-    sender: *const line_sender,
-    len_out: *mut size_t) -> *const c_char
-{
-    let sender = unwrap_sender(sender);
-    let buf: &[u8] = sender.peek_pending().as_bytes();
-    *len_out = buf.len();
-    buf.as_ptr() as *const c_char
-}
-
-/// Send batch-up rows messages to the QuestDB server.
-///
-/// After sending a batch, you can close the connection or begin preparing
-/// a new batch by calling `line_sender_table`.
-///
-/// @param[in] sender Line sender object.
+/// @param[in] buffer Line buffer object.
 /// @return true on success, false on error.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_flush(
     sender: *mut line_sender,
+    buffer: *mut line_sender_buffer,
     err_out: *mut *mut line_sender_error) -> bool
 {
     let sender = unwrap_sender_mut(sender);
+    let buffer = unwrap_buffer_mut(buffer);
     bubble_err_to_c!(
         err_out,
-        sender.flush());
+        sender.flush(buffer));
+    true
+}
+
+/// Send buffer of rows to the QuestDB server.
+///
+/// The buffer will left untouched and must be cleared before re-use.
+/// To send and clear in one single step, `flush` instead.
+/// @param[in] sender Line sender object.
+/// @param[in] buffer Line buffer object.
+/// @return true on success, false on error.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_flush_and_keep(
+    sender: *mut line_sender,
+    buffer: *const line_sender_buffer,
+    err_out: *mut *mut line_sender_error) -> bool
+{
+    let sender = unwrap_sender_mut(sender);
+    let buffer = unwrap_buffer(buffer);
+    bubble_err_to_c!(
+        err_out,
+        sender.flush_and_keep(buffer));
     true
 }

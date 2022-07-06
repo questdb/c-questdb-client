@@ -50,6 +50,9 @@ from typing import Optional, Tuple, Union
 class c_line_sender(ctypes.Structure):
     pass
 
+class c_line_sender_buffer(ctypes.Structure):
+    pass
+
 class c_line_sender_opts(ctypes.Structure):
     pass
 
@@ -58,6 +61,7 @@ class c_line_sender_error(ctypes.Structure):
 
 c_size_t_p = ctypes.POINTER(c_size_t)
 c_line_sender_p = ctypes.POINTER(c_line_sender)
+c_line_sender_buffer_p = ctypes.POINTER(c_line_sender_buffer)
 c_line_sender_opts_p = ctypes.POINTER(c_line_sender_opts)
 c_line_sender_error_p = ctypes.POINTER(c_line_sender_error)
 c_line_sender_error_p_p = ctypes.POINTER(c_line_sender_error_p)
@@ -132,6 +136,90 @@ def _setup_cdll():
         c_char_p,
         c_line_sender_error_p_p)
     set_sig(
+        dll.line_sender_buffer_with_max_name_len,
+        c_line_sender_buffer_p,
+        c_size_t)
+    set_sig(
+        dll.line_sender_buffer_free,
+        None,
+        c_line_sender_buffer_p)
+    set_sig(
+        dll.line_sender_buffer_size,
+        c_size_t,
+        c_line_sender_buffer_p)
+    set_sig(
+        dll.line_sender_buffer_capacity,
+        c_size_t,
+        c_line_sender_buffer_p)
+    set_sig(
+        dll.line_sender_buffer_peek,
+        c_char_p,
+        c_line_sender_buffer_p,
+        c_size_t_p)
+    set_sig(
+        dll.line_sender_buffer_clear,
+        None,
+        c_line_sender_buffer_p)
+    set_sig(
+        dll.line_sender_buffer_table,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_table_name,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_symbol,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        c_line_sender_utf8,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_bool,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        c_bool,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_i64,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        c_int64,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_f64,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        c_double,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_str,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        c_line_sender_utf8,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_ts,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        c_int64,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_at,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_int64,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_at_now,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_error_p_p)
+    set_sig(
         dll.line_sender_opts_new,
         c_line_sender_opts_p,
         c_line_sender_utf8,
@@ -141,11 +229,6 @@ def _setup_cdll():
         c_line_sender_opts_p,
         c_line_sender_utf8,
         c_line_sender_utf8)
-    set_sig(
-        dll.line_sender_opts_capacity,
-        None,
-        c_line_sender_opts_p,
-        c_size_t)
     set_sig(
         dll.line_sender_opts_net_interface,
         None,
@@ -178,11 +261,6 @@ def _setup_cdll():
         c_line_sender_opts_p,
         c_uint64)
     set_sig(
-        dll.line_sender_opts_max_name_len,
-        None,
-        c_line_sender_opts_p,
-        c_size_t)
-    set_sig(
         dll.line_sender_opts_clone,
         c_line_sender_opts_p,
         c_line_sender_opts_p)
@@ -204,77 +282,16 @@ def _setup_cdll():
         None,
         c_line_sender_p)
     set_sig(
-        dll.line_sender_table,
-        c_bool,
-        c_line_sender_p,
-        c_line_sender_table_name,
-        c_line_sender_error_p_p)
-    set_sig(
-        dll.line_sender_symbol,
-        c_bool,
-        c_line_sender_p,
-        c_line_sender_column_name,
-        c_line_sender_utf8,
-        c_line_sender_error_p_p)
-    set_sig(
-        dll.line_sender_column_bool,
-        c_bool,
-        c_line_sender_p,
-        c_line_sender_column_name,
-        c_bool,
-        c_line_sender_error_p_p)
-    set_sig(
-        dll.line_sender_column_i64,
-        c_bool,
-        c_line_sender_p,
-        c_line_sender_column_name,
-        c_int64,
-        c_line_sender_error_p_p)
-    set_sig(
-        dll.line_sender_column_f64,
-        c_bool,
-        c_line_sender_p,
-        c_line_sender_column_name,
-        c_double,
-        c_line_sender_error_p_p)
-    set_sig(
-        dll.line_sender_column_str,
-        c_bool,
-        c_line_sender_p,
-        c_line_sender_column_name,
-        c_line_sender_utf8,
-        c_line_sender_error_p_p)
-    set_sig(
-        dll.line_sender_column_ts,
-        c_bool,
-        c_line_sender_p,
-        c_line_sender_column_name,
-        c_int64,
-        c_line_sender_error_p_p)
-    set_sig(
-        dll.line_sender_at,
-        c_bool,
-        c_line_sender_p,
-        c_int64,
-        c_line_sender_error_p_p)
-    set_sig(
-        dll.line_sender_at_now,
-        c_bool,
-        c_line_sender_p,
-        c_line_sender_error_p_p)
-    set_sig(
-        dll.line_sender_pending_size,
-        c_size_t,
-        c_line_sender_p)
-    set_sig(
-        dll.line_sender_peek_pending,
-        c_char_p,
-        c_line_sender_p,
-        c_size_t_p)
-    set_sig(
         dll.line_sender_flush,
         c_bool,
         c_line_sender_p,
+        c_line_sender_buffer_p,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_flush_and_keep,
+        c_bool,
+        c_line_sender_p,
+        c_line_sender_buffer_p,
         c_line_sender_error_p_p)
     return dll
 
@@ -394,6 +411,117 @@ class TimestampMicros:
         self.value = micros
 
 
+class LineSenderBuffer:
+    def __init__(self, init_capacity=65536, max_name_len=127):
+        self._impl = _DLL.line_sender_buffer_with_max_name_len(
+            c_size_t(max_name_len))
+        _DLL.line_sender_buffer_reserve(self._impl, c_size_t(init_capacity))
+
+    def __len__(self):
+        return _DLL.line_sender_buffer_size(self._impl)
+
+    def peek(self) -> str:
+        # This is a hacky way of doing it because it copies the whole buffer.
+        # Instead the `buffer` should be made to support the buffer protocol:
+        # https://docs.python.org/3/c-api/buffer.html
+        # This way we would not need to `bytes(..)` the object to keep it alive.
+        # Then we could call `PyMemoryView_FromObject`.
+        size = c_size_t(0)
+        buf = _DLL.line_sender_buffer_peek(self._impl, ctypes.byref(size))
+        if size:
+            size = c_ssize_t(size.value)
+            return _PY_DLL.PyUnicode_FromStringAndSize(buf, size)
+        else:
+            return ''
+
+    def reserve(self, additional):
+        _DLL.line_sender_buffer_reserve(self._impl, c_size_t(additional))
+
+    @property
+    def capacity(self):
+        return _DLL.line_sender_buffer_capacity(self._impl)
+
+    def clear(self):
+        _DLL.line_sender_buffer_clear(self._impl)
+
+    def table(self, table: str):
+        table_name = _table_name(table)
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_table,
+            self._impl,
+            table_name)
+        return self
+
+    def symbol(self, name: str, value: str):
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_symbol,
+            self._impl,
+            _column_name(name),
+            _utf8(value))
+        return self
+
+    def column(
+            self, name: str,
+            value: Union[bool, int, float, str, TimestampMicros, datetime]):
+        if isinstance(value, bool):
+            _error_wrapped_call(
+                _DLL.line_sender_buffer_column_bool,
+                self._impl,
+                _column_name(name),
+                bool(value))
+        elif isinstance(value, int):
+            _error_wrapped_call(
+                _DLL.line_sender_buffer_column_i64,
+                self._impl,
+                _column_name(name),
+                int(value))
+        elif isinstance(value, float):
+            _error_wrapped_call(
+                _DLL.line_sender_buffer_column_f64,
+                self._impl,
+                _column_name(name),
+                float(value))
+        elif isinstance(value, str):
+            _error_wrapped_call(
+                _DLL.line_sender_buffer_column_str,
+                self._impl,
+                _column_name(name),
+                _utf8(value))
+        elif isinstance(value, TimestampMicros):
+            _error_wrapped_call(
+                _DLL.line_sender_buffer_column_ts,
+                self._impl,
+                _column_name(name),
+                value.value)
+        elif isinstance(value, datetime):
+            micros_epoch = int(value.timestamp()) * 1e6 + value.microsecond
+            _error_wrapped_call(
+                _DLL.line_sender_buffer_column_ts,
+                self._impl,
+                _column_name(name),
+                micros_epoch)
+        else:
+            fqn = _fully_qual_name(value)
+            raise ValueError(
+                f'Bad field value of type {fqn}: Expected one of '
+                '`bool`, `int`, `float` or `str`.')
+        return self
+
+    def at_now(self):
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_at_now,
+            self._impl)
+
+    def at(self, timestamp: int):
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_at,
+            self._impl,
+            timestamp)
+
+    def __del__(self):
+        _DLL.line_sender_buffer_free(self._impl)
+
+
 # This code is *just good enough* for testing purposes and is not intended to
 # be used as Python bindings. If you are looking for Python bindings and come
 # across this code, contact us on https://slack.questdb.io/ where we may offer
@@ -407,9 +535,7 @@ class LineSender:
             interface: Optional[str] = None,
             auth: Optional[Tuple[str, str, str, str]] = None,
             tls: Union[bool, str] = False,
-            capacity: Optional[int] = None,
-            read_timeout: Optional[int] = None,
-            max_name_len: Optional[int] = None):
+            read_timeout: Optional[int] = None):
 
         opts = _Opts(host, port)
         if interface:
@@ -426,17 +552,16 @@ class LineSender:
             else:
                 opts.tls_ca(str(tls))
 
-        if capacity is not None:
-            opts.capacity(capacity)
-
         if read_timeout is not None:
             opts.read_timeout(read_timeout)
 
-        if max_name_len is not None:
-            opts.max_name_len(max_name_len)
-
+        self._buffer = LineSenderBuffer()
         self._opts = opts
         self._impl = None
+
+    @property
+    def buffer(self):
+        return self._buffer
 
     def connect(self):
         if self._impl:
@@ -454,102 +579,50 @@ class LineSender:
             raise LineSenderError('Not connected.')
 
     def table(self, table: str):
-        table_name = _table_name(table)
-        _error_wrapped_call(
-            _DLL.line_sender_table,
-            self._impl,
-            table_name)
+        self._buffer.table(table)
         return self
 
     def symbol(self, name: str, value: str):
-        _error_wrapped_call(
-            _DLL.line_sender_symbol,
-            self._impl,
-            _column_name(name),
-            _utf8(value))
+        self._buffer.symbol(name, value)
         return self
 
     def column(
             self, name: str,
             value: Union[bool, int, float, str, TimestampMicros, datetime]):
-        if isinstance(value, bool):
-            _error_wrapped_call(
-                _DLL.line_sender_column_bool,
-                self._impl,
-                _column_name(name),
-                bool(value))
-        elif isinstance(value, int):
-            _error_wrapped_call(
-                _DLL.line_sender_column_i64,
-                self._impl,
-                _column_name(name),
-                int(value))
-        elif isinstance(value, float):
-            _error_wrapped_call(
-                _DLL.line_sender_column_f64,
-                self._impl,
-                _column_name(name),
-                float(value))
-        elif isinstance(value, str):
-            _error_wrapped_call(
-                _DLL.line_sender_column_str,
-                self._impl,
-                _column_name(name),
-                _utf8(value))
-        elif isinstance(value, TimestampMicros):
-            _error_wrapped_call(
-                _DLL.line_sender_column_ts,
-                self._impl,
-                _column_name(name),
-                value.value)
-        elif isinstance(value, datetime):
-            micros_epoch = int(value.timestamp()) * 1e6 + value.microsecond
-            _error_wrapped_call(
-                _DLL.line_sender_column_ts,
-                self._impl,
-                _column_name(name),
-                micros_epoch)
-        else:
-            fqn = _fully_qual_name(value)
-            raise ValueError(
-                f'Bad field value of type {fqn}: Expected one of '
-                '`bool`, `int`, `float` or `str`.')
+        self._buffer.column(name, value)
         return self
 
     def at_now(self):
-        _error_wrapped_call(
-            _DLL.line_sender_at_now,
-            self._impl)
+        self._buffer.at_now()
 
     def at(self, timestamp: int):
-        _error_wrapped_call(
-            _DLL.line_sender_at,
-            self._impl,
-            timestamp)
+        self._buffer.at(timestamp)
 
-    @property
-    def pending_size(self):
-        if self._impl:
-            return _DLL.line_sender_pending_size(self._impl)
-        else:
-            return 0
-
-    def peek_pending(self) -> str:
-        if self._impl:
-            len = c_size_t(0)
-            buf = _DLL.line_sender_peek_pending(self._impl, ctypes.byref(len))
-            len = c_ssize_t(len.value)
-            return _PY_DLL.PyUnicode_FromStringAndSize(buf, len)
-        else:
-            return 0
-
-    def flush(self):
+    def flush(self, buffer: Optional[LineSenderBuffer]=None, clear=True):
+        if (buffer is None) and not clear:
+            raise ValueError(
+                'Clear flag must be True when using internal buffer')
+        buffer = buffer or self._buffer
         self._check_connected()
-        if self.pending_size == 0:
+        if len(buffer) == 0:
             return
-        _error_wrapped_call(
-            _DLL.line_sender_flush,
-            self._impl)
+        try:
+            if clear:
+                _error_wrapped_call(
+                    _DLL.line_sender_flush,
+                    self._impl,
+                    buffer._impl)
+            else:
+                _error_wrapped_call(
+                    _DLL.line_sender_flush_and_keep,
+                    self._impl,
+                    buffer._impl)
+        except:
+            # Prevent `.close()` from erroring if it was called
+            # after a flush exception was raised, trapped and discarded.
+            if buffer is self._buffer:
+                self._buffer.clear()
+            raise
 
     def close(self, flush=True):
         if self._impl and not _DLL.line_sender_must_close(self._impl) and flush:

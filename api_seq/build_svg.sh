@@ -1,2 +1,1 @@
-dot -Tsvg -o c.svg c.dot
-dot -Tsvg -o cpp.svg cpp.dot
+dot -Tsvg -o seq.svg seq.dot

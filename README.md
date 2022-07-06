@@ -113,15 +113,38 @@ Once you're done with a row you must add a timestamp calling `at` or `at_now`.
 
 This ordering of operations is documented for both the C and C++ APIs below.
 
-#### C function calling order
+#### Buffer API
 
-![C API Sequential Coupling](api_seq/c.svg)
+The `line_sender` object is responsible for connecting to the network and
+sending data.
 
-Note that this diagram excludes error handling paths: One can call
-`line_sender_close(sender)` after any operation.
+The buffer it sends is constructed separately through a `line_sender_buffer`
+object.
 
-The `line_sender_close(sender)` function will release memory and therefore
-must be called exactly once per created object.
+To avoid malformed messages, this object's methods (`line_sender_buffer_*`
+functions in C) must be called in a specific order.
+
+You can accumulate multiple lines (rows) with a given buffer and a buffer is
+re-usable, but a buffer may only be flushed via the sender after a `.at()` or
+`.at_now()` method call (or equivalent C function).
+
+![Sequential Coupling](api_seq/seq.svg)
+
+#### Threading Considerations
+
+By design, the sender and buffer objects perform all operations on the current
+thread. The library will not spawn any threads internally.
+
+By constructing multiple buffers you can design your application to build ILP
+messages on multiple threads whilst handling network connectivity in a separate
+part of your application on a different thread (for example by passing buffers
+that need sending over a concurrent queue and sending flushed buffers back over
+another queue).
+
+Buffer and sender objects don't use any locks, so it's down to you to ensure
+that a single thread owns a buffer or sender at any given point in time.
+
+#### Error handling in the C API
 
 In the C API, functions that can result in errors take a `line_sender_error**`
 parameter as the last argument. When calling such functions you must check the
@@ -135,9 +158,9 @@ You may then call `line_sender_error_msg(err)` and
 Once handled, the error object *must* be disposed of by calling
 `line_sender_error_free(err)`.
 
-On error you must also call `line_sender_close(sender)`.
+On error, you must also call `line_sender_close(sender)`.
 
-Here's a complete example on how to handle an error without leaks:
+Here's a complete example of how to handle an error without leaks:
 
 ```c
 line_sender* sender = ...;
@@ -159,15 +182,7 @@ This type of error handling can get error-prone and verbose,
 so you may want to use a `goto` to simplify handling
 (see [example](examples/line_sender_c_example.c)).
 
-#### C++ method calling order
-
-![C++ API Sequential Coupling](api_seq/cpp.svg)
-
-Note how if you're using C++, `.close()` can be called multiple times and will
-also be called automatically on object destruction.
-
-For simplicity the the diagram above does not show that the `.close()` method
-and the `~line_sender` destructor at any time.
+#### Error handling in the C++ API
 
 Note that most methods in C++ may throw `questdb::ilp::line_sender_error`
 exceptions. The C++ `line_sender_error` type inherits from `std::runtime_error`

@@ -38,6 +38,7 @@ namespace questdb::ilp
     constexpr const char* inaddr_any = "0.0.0.0";
 
     class line_sender;
+    class line_sender_buffer;
     class opts;
 
     /** Category of error. */
@@ -111,6 +112,7 @@ namespace questdb::ilp
         }
 
         friend class line_sender;
+        friend class line_sender_buffer;
         friend class opts;
 
         template <
@@ -169,6 +171,7 @@ namespace questdb::ilp
         T _impl;
 
         friend class line_sender;
+        friend class line_sender_buffer;
         friend class opts;
     };
 
@@ -229,7 +232,7 @@ namespace questdb::ilp
                 tp.time_since_epoch()).count()}
         {}
 
-        explicit timestamp_micros(int64_t ts)
+        explicit timestamp_micros(int64_t ts) noexcept
             : _ts{ts}
         {}
 
@@ -248,7 +251,7 @@ namespace questdb::ilp
                 tp.time_since_epoch()).count()}
         {}
 
-        explicit timestamp_nanos(int64_t ts)
+        explicit timestamp_nanos(int64_t ts) noexcept
             : _ts{ts}
         {}
 
@@ -256,6 +259,298 @@ namespace questdb::ilp
 
     private:
         int64_t _ts;
+    };
+
+    class line_sender_buffer
+    {
+    public:
+        explicit line_sender_buffer(size_t init_capacity = 64 * 1024) noexcept
+            : line_sender_buffer{init_capacity, 127}
+        {}
+
+        line_sender_buffer(
+            size_t init_capacity,
+            size_t max_name_len) noexcept
+            : _impl{::line_sender_buffer_with_max_name_len(max_name_len)}
+            , _init_capacity{init_capacity}
+            , _max_name_len{max_name_len}
+        {
+            ::line_sender_buffer_reserve(_impl, init_capacity);
+        }
+
+        line_sender_buffer(const line_sender_buffer& other) noexcept
+            : _impl{::line_sender_buffer_clone(other._impl)}
+            , _init_capacity{other._init_capacity}
+            , _max_name_len{other._max_name_len}
+        {}
+
+        line_sender_buffer(line_sender_buffer&& other) noexcept
+            : _impl{other._impl}
+            , _init_capacity{other._init_capacity}
+            , _max_name_len{other._max_name_len}
+        {
+            other._impl = nullptr;
+        }
+
+        line_sender_buffer& operator=(const line_sender_buffer& other) noexcept
+        {
+            if (this != &other)
+            {
+                ::line_sender_buffer_free(_impl);
+                _impl = ::line_sender_buffer_clone(other._impl);
+                _init_capacity = other._init_capacity;
+                _max_name_len = other._max_name_len;
+            }
+            return *this;
+        }
+
+        line_sender_buffer& operator=(line_sender_buffer&& other) noexcept
+        {
+            if (this != &other)
+            {
+                ::line_sender_buffer_free(_impl);
+                _impl = other._impl;
+                _init_capacity = other._init_capacity;
+                _max_name_len = other._max_name_len;
+                other._impl = nullptr;
+            }
+            return *this;
+        }
+
+        void reserve(size_t additional)
+        {
+            may_init();
+            ::line_sender_buffer_reserve(_impl, additional);
+        }
+
+        size_t capacity() const noexcept
+        {
+            if (_impl)
+            {
+                return ::line_sender_buffer_capacity(_impl);
+            }
+            else
+            {
+                return _init_capacity;
+            }
+        }
+
+        size_t size() const noexcept
+        {
+            if (_impl)
+                return ::line_sender_buffer_size(_impl);
+            else
+                return 0;
+        }
+
+        std::string_view peek() const noexcept
+        {
+            if (_impl)
+            {
+                size_t len = 0;
+                const char* buf = ::line_sender_buffer_peek(_impl, &len);
+                return {buf, len};
+            }
+            else
+            {
+                return {};
+            }
+        }
+
+        void clear() noexcept
+        {
+            if (_impl)
+            {
+                ::line_sender_buffer_clear(_impl);
+            }
+        }
+
+        /**
+         * Start batching the next row of input for the named table.
+         * @param name Table name.
+         */
+        line_sender_buffer& table(table_name_view name)
+        {
+            may_init();
+            line_sender_error::wrapped_call(
+                ::line_sender_buffer_table,
+                _impl,
+                name._impl);
+            return *this;
+        }
+
+        /**
+         * Append a value for a SYMBOL column.
+         * Symbol columns must always be written before other columns for any
+         * given row.
+         * @param name Column name.
+         * @param value Column value.
+         */
+        line_sender_buffer& symbol(column_name_view name, utf8_view value)
+        {
+            may_init();
+            line_sender_error::wrapped_call(
+                ::line_sender_buffer_symbol,
+                _impl,
+                name._impl,
+                value._impl);
+            return *this;
+        }
+
+        // Require specific overloads of `column` to avoid
+        // involuntary usage of the `bool` overload.
+        template <typename T>
+        line_sender_buffer& column(column_name_view name, T value) = delete;
+
+        /**
+         * Append a value for a BOOLEAN column.
+         * @param name Column name.
+         * @param value Column value.
+         */
+        line_sender_buffer& column(column_name_view name, bool value)
+        {
+            may_init();
+            line_sender_error::wrapped_call(
+                ::line_sender_buffer_column_bool,
+                _impl,
+                name._impl,
+                value);
+            return *this;
+        }
+
+        /**
+         * Append a value for a LONG column.
+         * @param name Column name.
+         * @param value Column value.
+         */
+        line_sender_buffer& column(column_name_view name, int64_t value)
+        {
+            may_init();
+            line_sender_error::wrapped_call(
+                ::line_sender_buffer_column_i64,
+                _impl,
+                name._impl,
+                value);
+            return *this;
+        }
+
+        /**
+         * Append a value for a DOUBLE column.
+         * @param name Column name.
+         * @param value Column value.
+         */
+        line_sender_buffer& column(column_name_view name, double value)
+        {
+            may_init();
+            line_sender_error::wrapped_call(
+                ::line_sender_buffer_column_f64,
+                _impl,
+                name._impl,
+                value);
+            return *this;
+        }
+
+        /**
+         * Append a value for a STRING column.
+         * @param name Column name.
+         * @param value Column value.
+         */
+        line_sender_buffer& column(column_name_view name, utf8_view value)
+        {
+            may_init();
+            line_sender_error::wrapped_call(
+                ::line_sender_buffer_column_str,
+                _impl,
+                name._impl,
+                value._impl);
+            return *this;
+        }
+
+        template <size_t N>
+        line_sender_buffer& column(
+            column_name_view name,
+            const char (&value)[N])
+        {
+            return column(name, utf8_view{value});
+        }
+
+        line_sender_buffer& column(
+            column_name_view name,
+            std::string_view value)
+        {
+            return column(name, utf8_view{value});
+        }
+
+        line_sender_buffer& column(
+            column_name_view name,
+            const std::string& value)
+        {
+            return column(name, utf8_view{value});
+        }
+
+        line_sender_buffer& column(
+            column_name_view name,
+            timestamp_micros value)
+        {
+            may_init();
+            line_sender_error::wrapped_call(
+                ::line_sender_buffer_column_ts,
+                _impl,
+                name._impl,
+                value.as_micros());
+            return *this;
+        }
+
+        /**
+         * Complete the row with a specified timestamp.
+         *
+         * After this call, you can start batching the next row by calling
+         * `.table(..)` again, or you can send the accumulated batch by
+         * calling `.flush(..)`.
+         *
+         * @param timestamp Number of nanoseconds since 1st Jan 1970 UTC.
+         */
+        void at(timestamp_nanos timestamp)
+        {
+            may_init();
+            line_sender_error::wrapped_call(
+                ::line_sender_buffer_at,
+                _impl,
+                timestamp.as_nanos());
+        }
+
+        /**
+         * Complete the row without providing a timestamp.
+         * The QuestDB instance will insert its own timestamp.
+         */
+        void at_now()
+        {
+            may_init();
+            line_sender_error::wrapped_call(
+                ::line_sender_buffer_at_now,
+                _impl);
+        }
+
+        ~line_sender_buffer() noexcept
+        {
+            if (_impl)
+                ::line_sender_buffer_free(_impl);
+        }
+    private:
+        void may_init()
+        {
+            if (!_impl)
+            {
+                _impl = ::line_sender_buffer_with_max_name_len(_max_name_len);
+                ::line_sender_buffer_reserve(_impl, _init_capacity);
+            }
+        }
+
+        ::line_sender_buffer* _impl;
+        size_t _init_capacity;
+        size_t _max_name_len;
+
+        friend class line_sender;
     };
 
     class opts
@@ -283,7 +578,7 @@ namespace questdb::ilp
                 : _impl{::line_sender_opts_new_service(host._impl, port._impl)}
             {}
 
-            opts(const opts& other)
+            opts(const opts& other) noexcept
                 : _impl{::line_sender_opts_clone(other._impl)}
             {}
 
@@ -293,7 +588,7 @@ namespace questdb::ilp
                 other._impl = nullptr;
             }
 
-            opts& operator=(const opts& other)
+            opts& operator=(const opts& other) noexcept
             {
                 if (this != &other)
                 {
@@ -311,16 +606,6 @@ namespace questdb::ilp
                     _impl = other._impl;
                     other._impl = nullptr;
                 }
-                return *this;
-            }
-
-            /**
-             * Set the initial buffer capacity (byte count).
-             * The default is 65536.
-             */
-            opts& capacity(size_t capacity) noexcept
-            {
-                ::line_sender_opts_capacity(_impl, capacity);
                 return *this;
             }
 
@@ -399,19 +684,6 @@ namespace questdb::ilp
                 return *this;
             }
 
-            /**
-             * Set the maximum length for table and column names.
-             * This should match the `cairo.max.file.name.length` setting of
-             * the QuestDB instance you're connecting to.
-             * The default value is 127, which is the same as the QuestDB
-             * default.
-             */
-            opts& max_name_len(size_t max_name_len) noexcept
-            {
-                ::line_sender_opts_max_name_len(_impl, max_name_len);
-                return *this;
-            }
-
             ~opts() noexcept
             {
                 reset();
@@ -433,7 +705,7 @@ namespace questdb::ilp
 
     /**
      * Insert data into QuestDB via the InfluxDB Line Protocol.
-     * 
+     *
      * A `line_sender` object connects on construction.
      * If you want to connect later, wrap it up in an std::optional.
      *
@@ -477,206 +749,36 @@ namespace questdb::ilp
         }
 
         /**
-         * Start batching the next row of input for the named table.
-         * @param name Table name.
-         */
-        line_sender& table(table_name_view name)
-        {
-            ensure_impl();
-            line_sender_error::wrapped_call(
-                ::line_sender_table,
-                _impl,
-                name._impl);
-            return *this;
-        }
-
-        /**
-         * Append a value for a SYMBOL column.
-         * Symbol columns must always be written before other columns for any
-         * given row.
-         * @param name Column name.
-         * @param value Column value.
-         */
-        line_sender& symbol(column_name_view name, utf8_view value)
-        {
-            ensure_impl();
-            line_sender_error::wrapped_call(
-                ::line_sender_symbol,
-                _impl,
-                name._impl,
-                value._impl);
-            return *this;
-        }
-
-        // Require specific overloads of `column` to avoid
-        // involuntary usage of the `bool` overload.
-        template <typename T>
-        line_sender& column(column_name_view name, T value) = delete;
-
-        /**
-         * Append a value for a BOOLEAN column.
-         * @param name Column name.
-         * @param value Column value.
-         */
-        line_sender& column(column_name_view name, bool value)
-        {
-            ensure_impl();
-            line_sender_error::wrapped_call(
-                ::line_sender_column_bool,
-                _impl,
-                name._impl,
-                value);
-            return *this;
-        }
-
-        /**
-         * Append a value for a LONG column.
-         * @param name Column name.
-         * @param value Column value.
-         */
-        line_sender& column(column_name_view name, int64_t value)
-        {
-            ensure_impl();
-            line_sender_error::wrapped_call(
-                ::line_sender_column_i64,
-                _impl,
-                name._impl,
-                value);
-            return *this;
-        }
-
-        /**
-         * Append a value for a DOUBLE column.
-         * @param name Column name.
-         * @param value Column value.
-         */
-        line_sender& column(column_name_view name, double value)
-        {
-            ensure_impl();
-            line_sender_error::wrapped_call(
-                ::line_sender_column_f64,
-                _impl,
-                name._impl,
-                value);
-            return *this;
-        }
-
-        /**
-         * Append a value for a STRING column.
-         * @param name Column name.
-         * @param value Column value.
-         */
-        line_sender& column(column_name_view name, utf8_view value)
-        {
-            ensure_impl();
-            line_sender_error::wrapped_call(
-                ::line_sender_column_str,
-                _impl,
-                name._impl,
-                value._impl);
-            return *this;
-        }
-
-        template <size_t N>
-        line_sender& column(column_name_view name, const char (&value)[N])
-        {
-            return column(name, utf8_view{value});
-        }
-
-        line_sender& column(column_name_view name, std::string_view value)
-        {
-            return column(name, utf8_view{value});
-        }
-
-        line_sender& column(column_name_view name, const std::string& value)
-        {
-            return column(name, utf8_view{value});
-        }
-
-        line_sender& column(column_name_view name, timestamp_micros value)
-        {
-            ensure_impl();
-            line_sender_error::wrapped_call(
-                ::line_sender_column_ts,
-                _impl,
-                name._impl,
-                value.as_micros());
-            return *this;
-        }
-
-        /**
-         * Complete the row with a specified timestamp.
+         * Send batched-up rows to the QuestDB server.
          *
-         * After this call, you can start batching the next row by calling
-         * `.table(..)` again, or you can send the accumulated batch by
-         * calling `.flush(..)`.
-         *
-         * @param timestamp Number of nanoseconds since 1st Jan 1970 UTC.
-         */
-        void at(timestamp_nanos timestamp)
-        {
-            ensure_impl();
-            line_sender_error::wrapped_call(
-                ::line_sender_at,
-                _impl,
-                timestamp.as_nanos());
-        }
-
-        /**
-         * Complete the row without providing a timestamp.
-         * The QuestDB instance will insert its own timestamp.
-         */
-        void at_now()
-        {
-            ensure_impl();
-            line_sender_error::wrapped_call(
-                ::line_sender_at_now,
-                _impl);
-        }
-
-        /**
-         * Number of bytes that will be sent at next call to `.flush()`.
-         *
-         * @return Accumulated batch size.
-         */
-        size_t pending_size() const noexcept
-        {
-            return _impl
-                ? ::line_sender_pending_size(_impl)
-                : 0;
-        }
-
-        /**
-         * Peek into the accumulated buffer that is to be sent out at the next `flush`.
-         *
-         * @return UTF-8 encoded buffer. The buffer is not nul-terminated.
-         */
-        std::string_view peek_pending() const noexcept
-        {
-            if (_impl)
-            {
-                size_t len = 0;
-                const char* buf = ::line_sender_peek_pending(_impl, &len);
-                return {buf, len};
-            }
-            else
-            {
-                return {};
-            }
-        }
-
-        /**
-         * Send batch-up rows messages to the QuestDB server.
+         * This method automatically clears the buffer.
+         * See `flush_and_keep` if you want to retain the buffer contents.
          *
          * After sending a batch, you can close the connection or begin
-         * preparing a new batch by calling `.table(..)` again.
+         * preparing a new batch by calling `.table(..)` on the buffer again.
          */
-        void flush()
+        void flush(line_sender_buffer& buffer)
         {
             ensure_impl();
             line_sender_error::wrapped_call(
                 ::line_sender_flush,
-                _impl);
+                _impl,
+                buffer._impl);
+        }
+
+        /**
+         * Send batched-up rows to the QuestDB server.
+         *
+         * This method does not affect the buffer and its contains
+         * will be retained.
+         */
+        void flush_and_keep(const line_sender_buffer& buffer)
+        {
+            ensure_impl();
+            line_sender_error::wrapped_call(
+                ::line_sender_flush_and_keep,
+                _impl,
+                buffer._impl);
         }
 
         /**

@@ -62,6 +62,8 @@ public:
         return _msgs;
     }
 
+    void close();
+
     ~mock_server();
 
 private:

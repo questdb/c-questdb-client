@@ -208,12 +208,212 @@ line_sender_column_name line_sender_column_name_assert(
 #define QDB_COLUMN_NAME_LITERAL(literal)                                       \
     line_sender_column_name_assert(sizeof(literal) - 1, (literal))
 
-/////////// Connecting and disconnecting.
+
+/////////// Constructing ILP messages.
+
+/**
+ * Prepare rows for sending via the line sender's `flush` function.
+ * Buffer objects are re-usable and cleared automatically when flushing.
+ */
+typedef struct line_sender_buffer line_sender_buffer;
+
+/** Create a buffer for serializing ILP messages. */
+LINESENDER_API
+line_sender_buffer* line_sender_buffer_new();
+
+/** Create a buffer for serializing ILP messages. */
+LINESENDER_API
+line_sender_buffer* line_sender_buffer_with_max_name_len(size_t max_name_len);
+
+/** Release the buffer object. */
+LINESENDER_API
+void line_sender_buffer_free(line_sender_buffer* buffer);
+
+/** Create a new copy of the buffer. */
+LINESENDER_API
+line_sender_buffer* line_sender_buffer_clone(const line_sender_buffer* buffer);
+
+/**
+ * Pre-allocate to ensure the buffer has enough capacity for at least the
+ * specified additional byte count. This may be rounded up.
+ * See: `capacity`.
+ */
+LINESENDER_API
+void line_sender_buffer_reserve(
+    line_sender_buffer* buffer,
+    size_t additional);
+
+/** Get the current capacity of the buffer. */
+LINESENDER_API
+size_t line_sender_buffer_capacity(const line_sender_buffer* buffer);
+
+/**
+ * Remove all accumulated data and prepare the buffer for new lines.
+ * This does not affect the buffer's capacity.
+ */
+LINESENDER_API
+void line_sender_buffer_clear(line_sender_buffer* buffer);
+
+/** Number of bytes in the accumulated buffer. */
+LINESENDER_API
+size_t line_sender_buffer_size(const line_sender_buffer* buffer);
+
+/**
+ * Peek into the accumulated buffer that is to be sent out at the next `flush`.
+ *
+ * @param[in] buffer Line buffer object.
+ * @param[out] len_out The length in bytes of the accumulated buffer.
+ * @return UTF-8 encoded buffer. The buffer is not nul-terminated.
+ */
+LINESENDER_API
+const char* line_sender_buffer_peek(
+    const line_sender_buffer* buffer,
+    size_t* len_out);
+
+/**
+ * Start batching the next row of input for the named table.
+ * @param[in] buffer Line buffer object.
+ * @param[in] name Table name.
+ */
+LINESENDER_API
+bool line_sender_buffer_table(
+    line_sender_buffer* buffer,
+    line_sender_table_name name,
+    line_sender_error** err_out);
+
+/**
+ * Append a value for a SYMBOL column.
+ * Symbol columns must always be written before other columns for any given
+ * row.
+ * @param[in] buffer Line buffer object.
+ * @param[in] name Column name.
+ * @param[in] value Column value.
+ * @param[out] err_out Set on error.
+ * @return true on success, false on error.
+ */
+LINESENDER_API
+bool line_sender_buffer_symbol(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    line_sender_utf8 value,
+    line_sender_error** err_out);
+
+/**
+ * Append a value for a BOOLEAN column.
+ * @param[in] buffer Line buffer object.
+ * @param[in] name Column name.
+ * @param[in] value Column value.
+ * @param[out] err_out Set on error.
+ * @return true on success, false on error.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_bool(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    bool value,
+    line_sender_error** err_out);
+
+/**
+ * Append a value for a LONG column.
+ * @param[in] buffer Line buffer object.
+ * @param[in] name Column name.
+ * @param[in] value Column value.
+ * @param[out] err_out Set on error.
+ * @return true on success, false on error.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_i64(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    int64_t value,
+    line_sender_error** err_out);
+
+/**
+ * Append a value for a DOUBLE column.
+ * @param[in] buffer Line buffer object.
+ * @param[in] name Column name.
+ * @param[in] value Column value.
+ * @param[out] err_out Set on error.
+ * @return true on success, false on error.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_f64(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    double value,
+    line_sender_error** err_out);
+
+/**
+ * Append a value for a STRING column.
+ * @param[in] buffer Line buffer object.
+ * @param[in] name Column name.
+ * @param[in] value Column value.
+ * @param[out] err_out Set on error.
+ * @return true on success, false on error.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_str(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    line_sender_utf8 value,
+    line_sender_error** err_out);
+
+/**
+ * Append a value for a TIMESTAMP column.
+ * @param[in] buffer Line buffer object.
+ * @param[in] name Column name.
+ * @param[in] micros The timestamp in microseconds since the unix epoch.
+ * @param[out] err_out Set on error.
+ * @return true on success, false on error.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_ts(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    int64_t micros,
+    line_sender_error** err_out);
+
+/**
+ * Complete the row with a specified timestamp.
+ *
+ * After this call, you can start batching the next row by calling
+ * `table` again, or you can send the accumulated batch by
+ * calling `flush`.
+ *
+ * @param[in] buffer Line buffer object.
+ * @param[in] epoch_nanos Number of nanoseconds since 1st Jan 1970 UTC.
+ * @param[out] err_out Set on error.
+ * @return true on success, false on error.
+ */
+LINESENDER_API
+bool line_sender_buffer_at(
+    line_sender_buffer *buffer,
+    int64_t epoch_nanos,
+    line_sender_error** err_out);
+
+/**
+ * Complete the row without providing a timestamp.
+ * The QuestDB instance will insert its own timestamp.
+ *
+ * After this call, you can start batching the next row by calling
+ * `table` again, or you can send the accumulated batch by
+ * calling `flush`.
+ *
+ * @param[in] buffer Line buffer object.
+ * @param[out] err_out Set on error.
+ * @return true on success, false on error.
+ */
+LINESENDER_API
+bool line_sender_buffer_at_now(
+    line_sender_buffer* buffer,
+    line_sender_error** err_out);
+
+/////////// Connecting, sending and disconnecting.
 
 /**
  * Insert data into QuestDB via the InfluxDB Line Protocol.
  *
- * Batch up rows, then call `line_sender_flush` to send.
+ * Batch up rows in `buffer` objects, then call `flush` to send them.
  */
 typedef struct line_sender line_sender;
 
@@ -241,15 +441,6 @@ LINESENDER_API
 line_sender_opts* line_sender_opts_new_service(
     line_sender_utf8 host,
     line_sender_utf8 port);
-
-/**
- * Set the initial buffer capacity (byte count).
- * The default is 65536.
- */
-LINESENDER_API
-void line_sender_opts_capacity(
-    line_sender_opts* opts,
-    size_t capacity);
 
 /** Select local outbound interface. */
 LINESENDER_API
@@ -309,17 +500,6 @@ void line_sender_opts_read_timeout(
     uint64_t timeout_millis);
 
 /**
- * Set the maximum length for table and column names.
- * This should match the `cairo.max.file.name.length` setting of the
- * QuestDB instance you're connecting to.
- * The default value is 127, which is the same as the QuestDB default.
- */
-LINESENDER_API
-void line_sender_opts_max_name_len(
-    line_sender_opts* opts,
-    size_t value);
-
-/**
  * Duplicate the opts object.
  * Both old and new objects will have to be freed.
  */
@@ -343,6 +523,37 @@ line_sender *line_sender_connect(
     line_sender_error** err_out);
 
 /**
+ * Send buffer of rows to the QuestDB server.
+ *
+ * The buffer will be automatically cleared, ready for re-use.
+ * If instead you want to preserve the buffer contents, call `flush_and_keep`.
+ *
+ * @param[in] sender Line sender object.
+ * @param[in] buffer Line buffer object.
+ * @return true on success, false on error.
+ */
+LINESENDER_API
+bool line_sender_flush(
+    line_sender* sender,
+    line_sender_buffer* buffer,
+    line_sender_error** err_out);
+
+/**
+ * Send buffer of rows to the QuestDB server.
+ *
+ * The buffer will left untouched and must be cleared before re-use.
+ * To send and clear in one single step, `flush` instead.
+ * @param[in] sender Line sender object.
+ * @param[in] buffer Line buffer object.
+ * @return true on success, false on error.
+ */
+LINESENDER_API
+bool line_sender_flush_and_keep(
+    line_sender *sender,
+    const line_sender_buffer* buffer,
+    line_sender_error** err_out);
+
+/**
  * Check if an error occurred previously and the sender must be closed.
  * @param[in] sender Line sender object.
  * @return true if an error occurred with a sender and it must be closed.
@@ -356,184 +567,6 @@ bool line_sender_must_close(const line_sender* sender);
  */
 LINESENDER_API
 void line_sender_close(line_sender* sender);
-
-
-/////////// Preparing line messages.
-
-/**
- * Start batching the next row of input for the named table.
- * @param[in] sender Line sender object.
- * @param[in] name Table name.
- */
-LINESENDER_API
-bool line_sender_table(
-    line_sender* sender,
-    line_sender_table_name name,
-    line_sender_error** err_out);
-
-/**
- * Append a value for a SYMBOL column.
- * Symbol columns must always be written before other columns for any given row.
- * @param[in] sender Line sender object.
- * @param[in] name Column name.
- * @param[in] value Column value.
- * @param[out] err_out Set on error.
- * @return true on success, false on error.
- */
-LINESENDER_API
-bool line_sender_symbol(
-    line_sender* sender,
-    line_sender_column_name name,
-    line_sender_utf8 value,
-    line_sender_error** err_out);
-
-/**
- * Append a value for a BOOLEAN column.
- * @param[in] sender Line sender object.
- * @param[in] name Column name.
- * @param[in] value Column value.
- * @param[out] err_out Set on error.
- * @return true on success, false on error.
- */
-LINESENDER_API
-bool line_sender_column_bool(
-    line_sender* sender,
-    line_sender_column_name name,
-    bool value,
-    line_sender_error** err_out);
-
-/**
- * Append a value for a LONG column.
- * @param[in] sender Line sender object.
- * @param[in] name Column name.
- * @param[in] value Column value.
- * @param[out] err_out Set on error.
- * @return true on success, false on error.
- */
-LINESENDER_API
-bool line_sender_column_i64(
-    line_sender* sender,
-    line_sender_column_name name,
-    int64_t value,
-    line_sender_error** err_out);
-
-/**
- * Append a value for a DOUBLE column.
- * @param[in] sender Line sender object.
- * @param[in] name Column name.
- * @param[in] value Column value.
- * @param[out] err_out Set on error.
- * @return true on success, false on error.
- */
-LINESENDER_API
-bool line_sender_column_f64(
-    line_sender* sender,
-    line_sender_column_name name,
-    double value,
-    line_sender_error** err_out);
-
-/**
- * Append a value for a STRING column.
- * @param[in] sender Line sender object.
- * @param[in] name Column name.
- * @param[in] value Column value.
- * @param[out] err_out Set on error.
- * @return true on success, false on error.
- */
-LINESENDER_API
-bool line_sender_column_str(
-    line_sender* sender,
-    line_sender_column_name name,
-    line_sender_utf8 value,
-    line_sender_error** err_out);
-
-/**
- * Append a value for a TIMESTAMP column.
- * @param[in] sender Line sender object.
- * @param[in] name Column name.
- * @param[in] micros The timestamp in microseconds since the unix epoch.
- * @param[out] err_out Set on error.
- * @return true on success, false on error.
- */
-LINESENDER_API
-bool line_sender_column_ts(
-    line_sender* sender,
-    line_sender_column_name name,
-    int64_t micros,
-    line_sender_error** err_out);
-
-/**
- * Complete the row with a specified timestamp.
- *
- * After this call, you can start batching the next row by calling
- * `line_sender_table` again, or you can send the accumulated batch by
- * calling `line_sender_flush`.
- *
- * @param[in] sender Line sender object.
- * @param[in] epoch_nanos Number of nanoseconds since 1st Jan 1970 UTC.
- * @param[out] err_out Set on error.
- * @return true on success, false on error.
- */
-LINESENDER_API
-bool line_sender_at(
-    line_sender* sender,
-    int64_t epoch_nanos,
-    line_sender_error** err_out);
-
-/**
- * Complete the row without providing a timestamp.
- * The QuestDB instance will insert its own timestamp.
- *
- * After this call, you can start batching the next row by calling
- * `line_sender_table` again, or you can send the accumulated batch by
- * calling `line_sender_flush`.
- *
- * @param[in] sender Line sender object.
- * @param[out] err_out Set on error.
- * @return true on success, false on error.
- */
-LINESENDER_API
-bool line_sender_at_now(
-    line_sender* sender,
-    line_sender_error** err_out);
-
-
-/////////// Committing to network.
-
-/**
- * Number of bytes that will be sent at next call to `line_sender_flush`.
- *
- * @param[in] sender Line sender object.
- * @return Accumulated batch size.
- */
-LINESENDER_API
-size_t line_sender_pending_size(const line_sender* sender);
-
-/**
- * Peek into the accumulated buffer that is to be sent out at the next `flush`.
- *
- * @param[in] sender Line sender object.
- * @param[out] len_out The length in bytes of the accumulated buffer.
- * @return UTF-8 encoded buffer. The buffer is not nul-terminated.
- */
-LINESENDER_API
-const char* line_sender_peek_pending(
-    const line_sender* sender,
-    size_t* len_out);
-
-/**
- * Send batch-up rows messages to the QuestDB server.
- *
- * After sending a batch, you can close the connection or begin preparing
- * a new batch by calling `line_sender_table`.
- *
- * @param[in] sender Line sender object.
- * @return true on success, false on error.
- */
-LINESENDER_API
-bool line_sender_flush(
-    line_sender* sender,
-    line_sender_error** err_out);
 
 #ifdef __cplusplus
 }
