@@ -440,7 +440,9 @@ TEST_CASE("Bad hostname")
     catch (const questdb::ilp::line_sender_error& se)
     {
         std::string msg{se.what()};
-        CHECK(msg.rfind("Could not resolve \"dummy_hostname:9009\": ", 0) == 0);
+        CHECK_MESSAGE(
+            msg.rfind("Could not resolve \"dummy_hostname:9009\": ", 0) == 0,
+            msg);
     }
     catch (...)
     {
@@ -460,7 +462,9 @@ TEST_CASE("Bad interface")
     catch (const questdb::ilp::line_sender_error& se)
     {
         std::string msg{se.what()};
-        CHECK(msg.rfind("Could not resolve \"dummy_hostname\": ", 0) == 0);
+        CHECK_MESSAGE(
+            msg.rfind("Could not resolve \"dummy_hostname\": ", 0) == 0,
+            msg);
     }
     catch (...)
     {
@@ -512,7 +516,9 @@ TEST_CASE("Bad connect")
     catch (const questdb::ilp::line_sender_error& se)
     {
         std::string msg{se.what()};
-        CHECK(msg.rfind("Could not connect", 0) == 0);
+        CHECK_MESSAGE(
+            msg.rfind("Could not connect", 0) == 0,
+            msg);
     }
     catch (...)
     {
@@ -532,7 +538,9 @@ TEST_CASE("Bad CA path")
     catch(const questdb::ilp::line_sender_error& se)
     {
         std::string msg{se.what()};
-        CHECK(msg.rfind("Could not open certificate authority file", 0) == 0);
+        CHECK_MESSAGE(
+            msg.rfind("Could not open certificate authority file", 0) == 0,
+            msg);
     }
     catch (...)
     {
