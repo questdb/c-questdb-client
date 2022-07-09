@@ -357,6 +357,28 @@ namespace questdb::ilp
             }
         }
 
+        void set_marker()
+        {
+            may_init();
+            line_sender_error::wrapped_call(
+                ::line_sender_buffer_set_marker, _impl);
+        }
+
+        void rewind_to_marker()
+        {
+            may_init();
+            line_sender_error::wrapped_call(
+                ::line_sender_buffer_rewind_to_marker, _impl);
+        }
+
+        void clear_marker() noexcept
+        {
+            if (_impl)
+            {
+                ::line_sender_buffer_clear_marker(_impl);
+            }
+        }
+
         void clear() noexcept
         {
             if (_impl)

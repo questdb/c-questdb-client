@@ -390,6 +390,7 @@ impl State {
 pub struct LineSenderBuffer {
     state: State,
     output: String,
+    marker: Option<(usize, State)>,
     max_name_len: usize,
 }
 
@@ -399,7 +400,8 @@ impl LineSenderBuffer {
     pub fn new() -> Self {
         Self {
             state: State::Init,
-            output: String::with_capacity(64 * 1024),
+            output: String::new(),
+            marker: None,
             max_name_len: 127
         }
     }
@@ -429,8 +431,48 @@ impl LineSenderBuffer {
         &self.output
     }
 
+    /// Mark a rewind point.
+    /// This allows undoing accumulated changes to the buffer for one or more
+    /// rows by calling `rewind_to_marker`.
+    /// Any previous marker will be discarded.
+    /// Once the marker is no longer needed, call `clear_marker`.
+    pub fn set_marker(&mut self) -> Result<()> {
+        if (self.state as isize & Op::Table as isize) == 0 {
+            return Err(fmt_err!(
+                InvalidApiCall,
+                concat!(
+                    "Can't set the marker whilst constructing a line. ",
+                    "A marker may only be set on an empty buffer or after ",
+                    "`at` or `at_now` is called.")));
+        }
+        self.marker = Some((self.output.len(), self.state));
+        Ok(())
+    }
+
+    /// Undo all changes since the last `set_marker` call.
+    /// As a side-effect, this also clears the marker.
+    pub fn rewind_to_marker(&mut self) -> Result<()> {
+        if let Some((position, state)) = self.marker {
+            self.output.truncate(position);
+            self.state = state;
+            self.marker = None;
+            Ok(())
+        }
+        else {
+            Err(fmt_err!(
+                InvalidApiCall,
+                "Can't rewind to the marker: No marker set."))
+        }
+    }
+
+    /// Discard the marker.
+    pub fn clear_marker(&mut self) {
+        self.marker = None;
+    }
+
     pub fn clear(&mut self) {
         self.output.clear();
+        self.marker = None;
         self.state = State::Init;
     }
 

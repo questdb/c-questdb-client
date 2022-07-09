@@ -608,3 +608,45 @@ TEST_CASE("Test timestamp column.")
     CHECK(server.recv() == 1);
     CHECK(server.msgs()[0] == exp);
 }
+
+TEST_CASE("Test Marker")
+{
+    questdb::ilp::line_sender_buffer buffer;
+    buffer.clear_marker();
+    buffer.clear_marker();
+
+    buffer.set_marker();
+    buffer.table("test");
+    CHECK(buffer.peek() == "test");
+    CHECK(buffer.size() == 4);
+
+    buffer.rewind_to_marker();
+    CHECK(buffer.peek() == "");
+    CHECK(buffer.size() == 0);
+
+    // Can't rewind, no marker set: Cleared by `rewind_to_marker`.
+    CHECK_THROWS_AS(buffer.rewind_to_marker(), questdb::ilp::line_sender_error);
+
+    buffer.table("a").symbol("b", "c");
+    CHECK_THROWS_AS(buffer.set_marker(), questdb::ilp::line_sender_error);
+    CHECK_THROWS_AS(buffer.rewind_to_marker(), questdb::ilp::line_sender_error);
+    CHECK(buffer.peek() == "a,b=c");
+
+    buffer.at_now();
+    CHECK(buffer.peek() == "a,b=c\n");
+
+    buffer.set_marker();
+    buffer.clear_marker();
+    buffer.clear_marker();
+    CHECK_THROWS_AS(buffer.rewind_to_marker(), questdb::ilp::line_sender_error);
+    buffer.set_marker();
+    buffer.table("d").symbol("e", "f");
+    CHECK(buffer.peek() == "a,b=c\nd,e=f");
+
+    buffer.rewind_to_marker();
+    CHECK(buffer.peek() == "a,b=c\n");
+
+    buffer.clear();
+    CHECK(buffer.peek() == "");
+    CHECK_THROWS_AS(buffer.rewind_to_marker(), questdb::ilp::line_sender_error);
+}

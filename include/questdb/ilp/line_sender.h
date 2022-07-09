@@ -248,6 +248,32 @@ LINESENDER_API
 size_t line_sender_buffer_capacity(const line_sender_buffer* buffer);
 
 /**
+ * Mark a rewind point.
+ * This allows undoing accumulated changes to the buffer for one or more
+ * rows by calling `rewind_to_marker`.
+ * Any previous marker will be discarded.
+ * Once the marker is no longer needed, call `clear_marker`.
+ */
+LINESENDER_API
+bool line_sender_buffer_set_marker(
+    line_sender_buffer* buffer,
+    line_sender_error** err_out);
+
+/**
+ * Undo all changes since the last `set_marker` call.
+ * As a side-effect, this also clears the marker.
+ */
+LINESENDER_API
+bool line_sender_buffer_rewind_to_marker(
+    line_sender_buffer* buffer,
+    line_sender_error** err_out);
+
+/** Discard the marker. */
+LINESENDER_API
+void line_sender_buffer_clear_marker(
+    line_sender_buffer* buffer);
+
+/**
  * Remove all accumulated data and prepare the buffer for new lines.
  * This does not affect the buffer's capacity.
  */
