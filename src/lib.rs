@@ -415,6 +415,10 @@ impl LineSenderBuffer {
         buffer
     }
 
+    /// Pre-allocate to ensure the buffer has enough capacity for at least the
+    /// specified additional byte count. This may be rounded up.
+    /// This does not allocate if such additional capacity is already satisfied.
+    /// See: `capacity`.
     pub fn reserve(&mut self, additional: usize) {
         self.output.reserve(additional);
     }
