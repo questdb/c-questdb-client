@@ -40,7 +40,8 @@ from fixture import (
     QuestDbFixture,
     TlsProxyFixture,
     install_questdb,
-    list_questdb_releases)
+    list_questdb_releases,
+    AUTH)
 import subprocess
 from collections import namedtuple
 
@@ -59,13 +60,6 @@ def ns_to_qdb_date(at_ts_ns):
     at_ts_sec = at_ts_us / 1000000.0
     at_td = datetime.datetime.fromtimestamp(at_ts_sec)
     return at_td.isoformat() + 'Z'
-
-# Valid keys as registered with the QuestDB fixture.
-AUTH = (
-    "testUser1",
-    "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48",
-    "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU",
-    "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac")
 
 
 # Valid keys, but not registered with the QuestDB fixture.
