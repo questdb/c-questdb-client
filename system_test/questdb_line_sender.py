@@ -23,6 +23,21 @@
 ################################################################################
 
 
+"""
+
+    WARNING: This is a lower-level API that's not intended for general use.
+
+    If you're after Python bindings for QuestDB, see the official bindings:
+
+        https://py-questdb.readthedocs.io/en/latest/
+
+        https://github.com/questdb/py-questdb-client
+
+        https://pypi.org/project/questdb/
+
+"""
+
+
 from ast import arg
 import sys
 sys.dont_write_bytecode = True
@@ -522,10 +537,6 @@ class LineSenderBuffer:
         _DLL.line_sender_buffer_free(self._impl)
 
 
-# This code is *just good enough* for testing purposes and is not intended to
-# be used as Python bindings. If you are looking for Python bindings and come
-# across this code, contact us on https://slack.questdb.io/ where we may offer
-# you more robust alternatives.
 class LineSender:
     def __init__(
             self,

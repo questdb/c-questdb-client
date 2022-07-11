@@ -40,15 +40,8 @@ from fixture import (
     QuestDbFixture,
     TlsProxyFixture,
     install_questdb,
-    list_questdb_releases,
-    retry)
-import urllib.request
-import urllib.parse
-import urllib.error
-import json
+    list_questdb_releases)
 import subprocess
-import shutil
-from pprint import pformat
 from collections import namedtuple
 
 
@@ -56,70 +49,8 @@ QDB_FIXTURE: QuestDbFixture = None
 TLS_PROXY_FIXTURE: TlsProxyFixture = None
 
 
-class QueryError(Exception):
-    pass
-
-
-def http_sql_query(sql_query):
-    host, port = QDB_FIXTURE.host, QDB_FIXTURE.http_server_port
-    url = (
-        f'http://{host}:{port}/exec?' +
-        urllib.parse.urlencode({'query': sql_query}))
-    buf = None
-    try:
-        resp = urllib.request.urlopen(url, timeout=5)
-        buf = resp.read()
-    except urllib.error.HTTPError as http_error:
-        buf = http_error.read()
-    try:
-        data = json.loads(buf)
-    except json.JSONDecodeError as jde:
-        # Include buffer in error message for easier debugging.
-        raise json.JSONDecodeError(
-            f'Could not parse response: {buf!r}: {jde.msg}',
-            jde.doc,
-            jde.pos)
-    if 'error' in data:
-        raise QueryError(data['error'])
-    return data
-
-
-def retry_check_table(
-        table_name,
-        *,
-        min_rows=1,
-        timeout_sec=30,
-        log=True,
-        log_ctx=None):
-    sql_query = f"select * from '{table_name}'"
-    http_response_log = []
-    def check_table():
-        try:
-            resp = http_sql_query(sql_query)
-            http_response_log.append((time.time(), resp))
-            if not resp.get('dataset'):
-                return False
-            elif len(resp['dataset']) < min_rows:
-                return False
-            return resp
-        except QueryError:
-            return None
-
-    try:
-        return retry(check_table, timeout_sec=timeout_sec)
-    except TimeoutError as toe:
-        if log:
-            if log_ctx:
-                log_ctx = f'\n{textwrap.indent(log_ctx, "    ")}\n'
-            sys.stderr.write(
-                f'Timed out after {timeout_sec} seconds ' +
-                f'waiting for query {sql_query!r}. ' +
-                f'Context: {log_ctx}' +
-                f'Client response log:\n' +
-                pformat(http_response_log) +
-                f'\nQuestDB log:\n')
-            QDB_FIXTURE.print_log()
-        raise toe
+def retry_check_table(*args, **kwargs):
+    return QDB_FIXTURE.retry_check_table(*args, **kwargs)
 
 
 def ns_to_qdb_date(at_ts_ns):
