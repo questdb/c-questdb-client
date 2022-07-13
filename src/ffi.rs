@@ -142,7 +142,7 @@ pub unsafe extern "C" fn line_sender_error_msg(
 {
     let msg: &str = &(&*error).0.msg;
     *len_out = msg.len();
-    msg.as_ptr() as *mut i8
+    msg.as_ptr() as *mut c_char
 }
 
 /// Clean up the error.
