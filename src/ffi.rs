@@ -134,7 +134,9 @@ pub unsafe extern "C" fn line_sender_error_get_code(
     (&*error).0.code().into()
 }
 
-/// ASCII encoded error message. Never returns NULL.
+/// UTF-8 encoded error message. Never returns NULL.
+/// The `len_out` argument is set to the number of bytes in the string.
+/// The string is NOT null-terminated.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_error_msg(
     error: *const line_sender_error,
@@ -154,6 +156,7 @@ pub unsafe extern "C" fn line_sender_error_free(error: *mut line_sender_error) {
 }
 
 /// Non-owning validated UTF-8 encoded string.
+/// The string need not be null-terminated.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct line_sender_utf8 {
@@ -259,7 +262,7 @@ unsafe fn unwrap_utf8(
 ///
 /// @param[out] str The object to be initialized.
 /// @param[in] len Length in bytes of the buffer.
-/// @param[in] buf UTF-8 encoded buffer.
+/// @param[in] buf UTF-8 encoded buffer. Need not be null-terminated.
 /// @param[out] err_out Set on error.
 /// @return true on success, false on error.
 #[no_mangle]
@@ -298,6 +301,7 @@ pub unsafe extern "C" fn line_sender_utf8_assert(
 }
 
 /// Non-owning validated table name. UTF-8 encoded.
+/// Need not be null-terminated.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct line_sender_table_name
@@ -317,6 +321,7 @@ impl line_sender_table_name {
 }
 
 /// Non-owning validated symbol or column name. UTF-8 encoded.
+/// Need not be null-terminated.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct line_sender_column_name
@@ -340,7 +345,7 @@ impl line_sender_column_name {
 ///
 /// @param[out] name The object to be initialized.
 /// @param[in] len Length in bytes of the buffer.
-/// @param[in] buf UTF-8 encoded buffer.
+/// @param[in] buf UTF-8 encoded buffer. Need not be null-terminated.
 /// @param[out] err_out Set on error.
 /// @return true on success, false on error.
 #[no_mangle]
@@ -387,7 +392,7 @@ pub unsafe extern "C" fn line_sender_table_name_assert(
 ///
 /// @param[out] name The object to be initialized.
 /// @param[in] len Length in bytes of the buffer.
-/// @param[in] buf UTF-8 encoded buffer.
+/// @param[in] buf UTF-8 encoded buffer. Need not be null-terminated.
 /// @param[out] err_out Set on error.
 /// @return true on success, false on error.
 #[no_mangle]
