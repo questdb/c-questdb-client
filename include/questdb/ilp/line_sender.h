@@ -75,7 +75,11 @@ typedef enum line_sender_error_code
 LINESENDER_API
 line_sender_error_code line_sender_error_get_code(const line_sender_error*);
 
-/** ASCII encoded error message. Never returns NULL. */
+/**
+ * UTF-8 encoded error message. Never returns NULL.
+ * The `len_out` argument is set to the number of bytes in the string.
+ * The string is NOT null-terminated.
+ */
 LINESENDER_API
 const char* line_sender_error_msg(const line_sender_error*, size_t* len_out);
 
@@ -86,7 +90,10 @@ void line_sender_error_free(line_sender_error*);
 
 /////////// Preparing strings and names
 
-/** Non-owning validated UTF-8 encoded string. */
+/**
+ * Non-owning validated UTF-8 encoded string.
+ * The string need not be null-terminated.
+ */
 typedef struct line_sender_utf8
 {
     // Don't initialize fields directly.
@@ -100,7 +107,7 @@ typedef struct line_sender_utf8
  *
  * @param[out] str The object to be initialized.
  * @param[in] len Length in bytes of the buffer.
- * @param[in] buf UTF-8 encoded buffer.
+ * @param[in] buf UTF-8 encoded buffer. Need not be null-terminated.
  * @param[out] err_out Set on error.
  * @return true on success, false on error.
  */
@@ -124,7 +131,10 @@ line_sender_utf8 line_sender_utf8_assert(size_t len, const char* buf);
 #define QDB_UTF8_LITERAL(literal)                                              \
     line_sender_utf8_assert(sizeof(literal) - 1, (literal))
 
-/** Non-owning validated table, symbol or column name. UTF-8 encoded. */
+/**
+ * Non-owning validated table, symbol or column name. UTF-8 encoded.
+ * Need not be null-terminated.
+ */
 typedef struct line_sender_table_name
 {
     // Don't initialize fields directly.
@@ -139,7 +149,7 @@ typedef struct line_sender_table_name
  *
  * @param[out] name The object to be initialized.
  * @param[in] len Length in bytes of the buffer.
- * @param[in] buf UTF-8 encoded buffer.
+ * @param[in] buf UTF-8 encoded buffer. Need not be null-terminated.
  * @param[out] err_out Set on error.
  * @return true on success, false on error.
  */
@@ -166,7 +176,10 @@ line_sender_table_name line_sender_table_name_assert(
 #define QDB_TABLE_NAME_LITERAL(literal)                                        \
     line_sender_table_name_assert(sizeof(literal) - 1, (literal))
 
-/** Non-owning validated table, symbol or column name. UTF-8 encoded. */
+/**
+ * Non-owning validated table, symbol or column name. UTF-8 encoded.
+ * Need not be null-terminated.
+ */
 typedef struct line_sender_column_name
 {
     // Don't initialize fields directly.
@@ -181,7 +194,7 @@ typedef struct line_sender_column_name
  *
  * @param[out] name The object to be initialized.
  * @param[in] len Length in bytes of the buffer.
- * @param[in] buf UTF-8 encoded buffer.
+ * @param[in] buf UTF-8 encoded buffer. Need not be null-terminated.
  * @param[out] err_out Set on error.
  * @return true on success, false on error.
  */
@@ -236,6 +249,7 @@ line_sender_buffer* line_sender_buffer_clone(const line_sender_buffer* buffer);
 /**
  * Pre-allocate to ensure the buffer has enough capacity for at least the
  * specified additional byte count. This may be rounded up.
+ * This does not allocate if such additional capacity is already satisfied.
  * See: `capacity`.
  */
 LINESENDER_API
@@ -246,6 +260,32 @@ void line_sender_buffer_reserve(
 /** Get the current capacity of the buffer. */
 LINESENDER_API
 size_t line_sender_buffer_capacity(const line_sender_buffer* buffer);
+
+/**
+ * Mark a rewind point.
+ * This allows undoing accumulated changes to the buffer for one or more
+ * rows by calling `rewind_to_marker`.
+ * Any previous marker will be discarded.
+ * Once the marker is no longer needed, call `clear_marker`.
+ */
+LINESENDER_API
+bool line_sender_buffer_set_marker(
+    line_sender_buffer* buffer,
+    line_sender_error** err_out);
+
+/**
+ * Undo all changes since the last `set_marker` call.
+ * As a side-effect, this also clears the marker.
+ */
+LINESENDER_API
+bool line_sender_buffer_rewind_to_marker(
+    line_sender_buffer* buffer,
+    line_sender_error** err_out);
+
+/** Discard the marker. */
+LINESENDER_API
+void line_sender_buffer_clear_marker(
+    line_sender_buffer* buffer);
 
 /**
  * Remove all accumulated data and prepare the buffer for new lines.

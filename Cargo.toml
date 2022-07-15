@@ -42,3 +42,6 @@ ffi = ["insecure_skip_verify"]
 # Auto-generate the header. This is for dev-debugging-diffing only.
 # A hand-crafted header is easier on the eyes.
 gen_h = ["ffi", "cbindgen"]
+
+# Auto-generate a Cython .pxd file.
+gen_cython = ["ffi", "cbindgen"]

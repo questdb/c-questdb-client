@@ -317,6 +317,13 @@ namespace questdb::ilp
             return *this;
         }
 
+        /**
+         * Pre-allocate to ensure the buffer has enough capacity for at least
+         * the specified additional byte count. This may be rounded up.
+         * This does not allocate if such additional capacity is already
+         * satisfied.
+         * See: `capacity`.
+         */
         void reserve(size_t additional)
         {
             may_init();
@@ -354,6 +361,28 @@ namespace questdb::ilp
             else
             {
                 return {};
+            }
+        }
+
+        void set_marker()
+        {
+            may_init();
+            line_sender_error::wrapped_call(
+                ::line_sender_buffer_set_marker, _impl);
+        }
+
+        void rewind_to_marker()
+        {
+            may_init();
+            line_sender_error::wrapped_call(
+                ::line_sender_buffer_rewind_to_marker, _impl);
+        }
+
+        void clear_marker() noexcept
+        {
+            if (_impl)
+            {
+                ::line_sender_buffer_clear_marker(_impl);
             }
         }
 

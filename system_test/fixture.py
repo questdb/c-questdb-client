@@ -35,15 +35,27 @@ import subprocess
 import time
 import socket
 import atexit
-import shlex
 import textwrap
 import urllib.request
 import urllib.parse
 import urllib.error
+from pprint import pformat
 
 
 AUTH_TXT = """testUser1 ec-p-256-sha256 fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac
 # [key/user id] [key type] {keyX keyY}"""
+
+
+# Valid keys as registered with the QuestDB fixture.
+AUTH = (
+    "testUser1",
+    "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48",
+    "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU",
+    "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac")
+
+
+CA_PATH = (pathlib.Path(__file__).parent.parent /
+    'tls_certs' / 'server_rootCA.pem')
 
 
 def retry(
@@ -98,7 +110,7 @@ class Project:
             'BUILD_DIR_PATH',
             self.root_dir / 'build'))
         if not self.build_dir.exists():
-            raise RuntimeError('Build before running tests.')
+            self.build_dir.mkdir()
         self.tls_certs_dir = self.root_dir / 'tls_certs'
         self.questdb_dir = self.build_dir / 'questdb'
         self.questdb_dir.mkdir(exist_ok=True)
@@ -180,8 +192,14 @@ def _find_java():
     return shutil.which('java', path=str(search_path))
 
 
+
+class QueryError(Exception):
+    """An error querying the database with SQL over HTTP."""
+    pass
+
+
 class QuestDbFixture:
-    def __init__(self, root_dir: pathlib.Path, auth=False):
+    def __init__(self, root_dir: pathlib.Path, auth=False, wrap_tls=False):
         self._root_dir = root_dir
         self.version = _parse_version(self._root_dir.name)
         self._data_dir = self._root_dir / 'data'
@@ -195,6 +213,10 @@ class QuestDbFixture:
         self.http_server_port = None
         self.line_tcp_port = None
         self.pg_port = None
+
+        self.wrap_tls = wrap_tls
+        self._tls_proxy = None
+        self.tls_line_tcp_port = None
 
         self.auth = auth
         if self.auth:
@@ -281,10 +303,77 @@ class QuestDbFixture:
         atexit.register(self.stop)
         sys.stderr.write('QuestDB fixture instance is ready.\n')
 
+        if self.wrap_tls:
+            self._tls_proxy = TlsProxyFixture(self.line_tcp_port)
+            self._tls_proxy.start()
+            self.tls_line_tcp_port = self._tls_proxy.listen_port
+
+    def http_sql_query(self, sql_query):
+        url = (
+            f'http://{self.host}:{self.http_server_port}/exec?' +
+            urllib.parse.urlencode({'query': sql_query}))
+        buf = None
+        try:
+            resp = urllib.request.urlopen(url, timeout=5)
+            buf = resp.read()
+        except urllib.error.HTTPError as http_error:
+            buf = http_error.read()
+        try:
+            data = json.loads(buf)
+        except json.JSONDecodeError as jde:
+            # Include buffer in error message for easier debugging.
+            raise json.JSONDecodeError(
+                f'Could not parse response: {buf!r}: {jde.msg}',
+                jde.doc,
+                jde.pos)
+        if 'error' in data:
+            raise QueryError(data['error'])
+        return data
+
+    def retry_check_table(
+            self,
+            table_name,
+            *,
+            min_rows=1,
+            timeout_sec=30,
+            log=True,
+            log_ctx=None):
+        sql_query = f"select * from '{table_name}'"
+        http_response_log = []
+        def check_table():
+            try:
+                resp = self.http_sql_query(sql_query)
+                http_response_log.append((time.time(), resp))
+                if not resp.get('dataset'):
+                    return False
+                elif len(resp['dataset']) < min_rows:
+                    return False
+                return resp
+            except QueryError:
+                return None
+
+        try:
+            return retry(check_table, timeout_sec=timeout_sec)
+        except TimeoutError as toe:
+            if log:
+                if log_ctx:
+                    log_ctx = f'\n{textwrap.indent(log_ctx, "    ")}\n'
+                sys.stderr.write(
+                    f'Timed out after {timeout_sec} seconds ' +
+                    f'waiting for query {sql_query!r}. ' +
+                    f'Context: {log_ctx}' +
+                    f'Client response log:\n' +
+                    pformat(http_response_log) +
+                    f'\nQuestDB log:\n')
+                self.print_log()
+            raise toe
+
     def __enter__(self):
         self.start()
 
     def stop(self):
+        if self._tls_proxy:
+            self._tls_proxy.stop()
         if self._proc:
             self._proc.terminate()
             self._proc.wait()
