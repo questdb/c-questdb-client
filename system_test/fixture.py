@@ -219,9 +219,11 @@ class QuestDbFixture:
                 pg.net.bind.to=0.0.0.0:{self.pg_port}
                 http.min.enabled=false
                 line.udp.enabled=false
-                cairo.max.uncommitted.rows=1
                 line.tcp.maintenance.job.interval=100
                 line.tcp.min.idle.ms.before.writer.release=300
+                telemetry.enabled=false
+                cairo.commit.lag=100
+                lne.tcp.commit.interval.fraction=0.1
                 {auth_config}
                 ''').lstrip('\n'))
 
