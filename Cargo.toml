@@ -5,7 +5,7 @@ edition = "2021"
 
 [lib]
 name = "questdb_client"
-crate-type = ["cdylib", "staticlib"]
+crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
 libc = "0.2"
