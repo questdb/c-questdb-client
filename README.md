@@ -1,5 +1,5 @@
 # c-questdb-client
-**QuestDB - InfluxDB Line Protocol - Ingestion Client Library for C and C++**
+**QuestDB - InfluxDB Line Protocol - Ingestion Client Library for C, C++, Rust**
 
 This library makes it easy to insert data into [QuestDB](https://questdb.io/).
 
@@ -102,6 +102,30 @@ Examples:
 * [With authentication and TLS](examples/line_sender_cpp_example_tls.cpp).
 
 See a [complete example in C++](examples/line_sender_cpp_example.cpp).
+
+### From a Rust program
+```rust
+// Cargo.toml
+[dependencies]
+rs-questdb-client = { git = "https://github.com/questdb/c-questdb-client.git" }
+
+...
+
+// main.rs
+use questdb_client::{LineSenderBuilder, LineSenderBuffer, TimestampNanos, TimestampMicros};
+
+let mut sender = LineSenderBuilder::new("127.0.0.1", "9009").connect()?;
+let ts = std::time::SystemTime::now();
+let mut buffer = LineSenderBuffer::new();
+buffer
+    .table("test")?
+    .symbol("t1", "v1")?
+    .column_f64("f1", 0.5)?
+    .column_ts("ts1", TimestampMicros::new(12345)?)?
+    .column_ts("ts2", ts)?
+    .at(TimestampNanos::new(10000000)?)?;
+sender.flush(&mut buffer)?;
+```
 
 ### How to use the API
 The API is sequentially coupled, meaning that methods need to be called in a
