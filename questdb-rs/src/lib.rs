@@ -725,7 +725,7 @@ impl From<u16> for Service {
     }
 }
 
-#[cfg(feature = "insecure_skip_verify")]
+#[cfg(feature = "insecure-skip-verify")]
 mod danger {
     pub struct NoCertificateVerification {}
 
@@ -813,7 +813,7 @@ fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
     // Set the SSLKEYLOGFILE env variable to a writable location.
     config.key_log = Arc::new(rustls::KeyLogFile::new());
 
-    #[cfg(feature = "insecure_skip_verify")]
+    #[cfg(feature = "insecure-skip-verify")]
     if let Tls::InsecureSkipVerify = tls {
         config.dangerous().set_certificate_verifier(
             Arc::new(danger::NoCertificateVerification {}));

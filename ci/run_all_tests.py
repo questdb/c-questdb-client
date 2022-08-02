@@ -41,7 +41,7 @@ def main():
     qdb_v = '6.4.2'  # The version of QuestDB we'll test against.
 
     run_cmd('cargo', 'test',
-        '--features', 'insecure_skip_verify',
+        '--features', 'insecure-skip-verify',
         '--', '--nocapture',
         cwd='questdb-rs')
     run_cmd(str(test_line_sender_path))

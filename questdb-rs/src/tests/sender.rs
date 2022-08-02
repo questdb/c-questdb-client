@@ -221,7 +221,7 @@ fn test_plain_to_tls_server() -> TestResult {
     Ok(())
 }
 
-#[cfg(feature = "insecure_skip_verify")]
+#[cfg(feature = "insecure-skip-verify")]
 #[test]
 fn test_tls_insecure_skip_verify() -> TestResult {
     let server = MockServer::new()?;
