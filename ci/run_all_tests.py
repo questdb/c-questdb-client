@@ -38,7 +38,7 @@ def main():
     test_line_sender_path = next(iter(
         build_dir.glob(f'**/test_line_sender{exe_suffix}')))
     system_test_path = pathlib.Path('system_test') / 'test.py'
-    qdb_v = '6.4.2'  # The version of QuestDB we'll test against.
+    qdb_v = '6.4.3'  # The version of QuestDB we'll test against.
 
     run_cmd('cargo', 'test',
         '--features', 'insecure-skip-verify',
