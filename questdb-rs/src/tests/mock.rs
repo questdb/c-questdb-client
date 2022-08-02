@@ -90,6 +90,7 @@ fn load_private_key(filename: &Path) -> rustls::PrivateKey {
 
 pub fn certs_dir() -> std::path::PathBuf {
     let mut certs_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    certs_dir.pop();
     certs_dir.push("tls_certs");
     certs_dir
 }

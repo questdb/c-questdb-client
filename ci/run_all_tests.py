@@ -22,10 +22,10 @@ import platform
 import subprocess
 
 
-def run_cmd(*args):
+def run_cmd(*args, cwd=None):
     sys.stderr.write(f'About to run: {args!r}:\n')
     try:
-        subprocess.check_call(args)
+        subprocess.check_call(args, cwd=cwd)
         sys.stderr.write(f'Success running: {args!r}.\n')
     except subprocess.CalledProcessError as cpe:
         sys.stderr.write(f'Command {args!r} failed with return code {cpe.returncode}.\n')
@@ -42,7 +42,8 @@ def main():
 
     run_cmd('cargo', 'test',
         '--features', 'insecure_skip_verify',
-        '--', '--nocapture')
+        '--', '--nocapture',
+        cwd='questdb-rs')
     run_cmd(str(test_line_sender_path))
     run_cmd('python3', str(system_test_path), 'run', '--versions', qdb_v, '-v')
 

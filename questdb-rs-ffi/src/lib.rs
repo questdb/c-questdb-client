@@ -21,6 +21,8 @@
  *  limitations under the License.
  *
  ******************************************************************************/
+ 
+#![allow(non_camel_case_types)]
 
 use std::ascii;
 use std::boxed::Box;
@@ -31,7 +33,7 @@ use std::str;
 use libc::{c_char, size_t};
 use std::ptr;
 
-use super::{
+use questdb::{
     Error,
     ErrorCode,
     TableName,
@@ -142,7 +144,7 @@ pub unsafe extern "C" fn line_sender_error_msg(
     error: *const line_sender_error,
     len_out: *mut size_t) -> *const c_char
 {
-    let msg: &str = &(&*error).0.msg;
+    let msg: &str = &(&*error).0.msg();
     *len_out = msg.len();
     msg.as_ptr() as *mut c_char
 }
@@ -209,9 +211,7 @@ unsafe fn set_err_out(
     code: ErrorCode,
     msg: String)
 {
-    let err = line_sender_error(Error{
-        code: code,
-        msg: msg});
+    let err = line_sender_error(Error::new(code, msg));
     let err_ptr = Box::into_raw(Box::new(err));
     *err_out = err_ptr;
 }
@@ -313,10 +313,10 @@ pub struct line_sender_table_name
 }
 
 impl line_sender_table_name {
-    fn as_name<'a>(&self) -> TableName<'a> {
-        let str_name = unsafe { std::str::from_utf8_unchecked(
-            slice::from_raw_parts(self.buf as *const u8, self.len)) };
-        TableName{ name: str_name }
+    unsafe fn as_name<'a>(&self) -> TableName<'a> {
+        let str_name = std::str::from_utf8_unchecked(
+            slice::from_raw_parts(self.buf as *const u8, self.len));
+        TableName::new_unchecked(str_name)
     }
 }
 
@@ -333,10 +333,10 @@ pub struct line_sender_column_name
 }
 
 impl line_sender_column_name {
-    fn as_name<'a>(&self) -> ColumnName<'a> {
-        let str_name = unsafe { std::str::from_utf8_unchecked(
-            slice::from_raw_parts(self.buf as *const u8, self.len)) };
-        ColumnName{ name: str_name }
+    unsafe fn as_name<'a>(&self) -> ColumnName<'a> {
+        let str_name = std::str::from_utf8_unchecked(
+            slice::from_raw_parts(self.buf as *const u8, self.len));
+        ColumnName::new_unchecked(str_name)
     }
 }
 

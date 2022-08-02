@@ -2,4 +2,6 @@ target
 build
 .vs
 .vscode
+questdb-rs/Cargo.lock
+/Cargo.lock
 src/tests/json_tests.rs

@@ -103,6 +103,13 @@ pub struct Error {
 }
 
 impl Error {
+    pub fn new<S: Into<String>>(code: ErrorCode, msg: S) -> Error {
+        Error {
+            code: code,
+            msg: msg.into()
+        }
+    }
+
     pub fn code(&self) -> ErrorCode {
         self.code
     }
@@ -186,6 +193,10 @@ impl <'a> TableName<'a> {
 
         Ok(Self { name: name })
     }
+
+    pub unsafe fn new_unchecked(name: &'a str) -> Self {
+        Self { name: name }
+    }
 }
 
 pub struct ColumnName<'a> {
@@ -236,6 +247,10 @@ impl <'a> ColumnName<'a> {
         }
 
         Ok(Self { name: name })
+    }
+
+    pub unsafe fn new_unchecked(name: &'a str) -> Self {
+        Self { name: name }
     }
 }
 
@@ -677,7 +692,7 @@ pub enum Tls {
     Disabled,
     Enabled(CertificateAuthority),
 
-    #[cfg(feature = "insecure_skip_verify")]
+    #[cfg(feature = "insecure-skip-verify")]
     InsecureSkipVerify
 }
 
@@ -931,7 +946,7 @@ impl LineSenderBuilder {
             Tls::Disabled => write!(descr, "tls=enabled,").unwrap(),
             Tls::Enabled(_) => write!(descr, "tls=enabled,").unwrap(),
 
-            #[cfg(feature="insecure_skip_verify")]
+            #[cfg(feature="insecure-skip-verify")]
             Tls::InsecureSkipVerify => write!(
                 descr, "tls=insecure_skip_verify,").unwrap(),
         }
@@ -1156,10 +1171,6 @@ impl LineSender {
 
 mod gai;
 mod timestamp;
-
-#[allow(non_camel_case_types)]
-#[cfg(feature = "ffi")]
-pub mod ffi;
 
 #[cfg(test)]
 mod tests;

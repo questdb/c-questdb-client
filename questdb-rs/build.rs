@@ -1,6 +1,3 @@
-#[cfg(feature = "gen_h")]
-extern crate cbindgen;
-
 pub mod json_tests {
     use std::fs::File;
     use std::io::{BufWriter, Write};
@@ -78,6 +75,7 @@ pub mod json_tests {
     fn parse() -> Vec<TestSpec> {
         let mut json_path = PathBuf::from(
             std::env::var("CARGO_MANIFEST_DIR").unwrap());
+        json_path.pop();
         json_path.push("src");
         json_path.push("tests");
         json_path.push("interop");
@@ -182,34 +180,7 @@ pub mod json_tests {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=Cargo.lock");
-    println!("cargo:rerun-if-changed=test/interop/ilp-client-interop-test.json");
-
-    #[cfg(feature = "gen_h")]
-    {
-        let crate_dir = std::env::var("CARGO_MANIFEST_DIR")?;
-        let bindings = cbindgen::generate(crate_dir)?;
-        bindings.write_to_file("include/questdb/ilp/line_sender.h");
-    }
-
-    #[cfg(feature = "gen_cython")]
-    {
-        let crate_dir = std::env::var("CARGO_MANIFEST_DIR")?;
-
-        let config = cbindgen::Config {
-            language: cbindgen::Language::Cython,
-            documentation: false,
-            cython: cbindgen::CythonConfig {
-                header: Some("questdb/ilp/line_sender.h".to_owned()),
-                cimports: std::collections::BTreeMap::new()},
-            ..Default::default()
-        };
-
-        let bindings = cbindgen::Builder::new()
-            .with_crate(crate_dir)
-            .with_config(config)
-            .generate()?;
-        bindings.write_to_file("cython/questdb/ilp/line_sender.pxd");
-    }
+    println!("cargo:rerun-if-changed=../src/test/interop/ilp-client-interop-test.json");
 
     json_tests::build()?;
 
