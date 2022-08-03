@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-use crate::LineSenderBuilder;
+use crate::ingress::SenderBuilder;
 
 use std::path::Path;
 use core::time::Duration;
@@ -245,7 +245,7 @@ impl MockServer {
         self.recv(0.1)
     }
 
-    pub fn lsb(&self) -> LineSenderBuilder {
-        LineSenderBuilder::new(self.host, self.port)
+    pub fn lsb(&self) -> SenderBuilder {
+        SenderBuilder::new(self.host, self.port)
     }
 }

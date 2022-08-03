@@ -320,7 +320,7 @@ _PY_DLL.PyUnicode_FromStringAndSize.restype = ctypes.py_object
 _PY_DLL.PyUnicode_FromStringAndSize.argtypes = [c_char_p, c_ssize_t]
 
 
-class LineSenderError(Exception):
+class SenderError(Exception):
     """An error whilst using the line sender."""
     pass
 
@@ -333,7 +333,7 @@ def _c_err_to_py(err_p):
             1,  # PyUnicode_1BYTE_KIND
             msg_p,
             c_ssize_t(c_len.value))
-        return LineSenderError(py_msg)
+        return SenderError(py_msg)
     finally:
         _DLL.line_sender_error_free(err_p)
 
@@ -426,7 +426,7 @@ class TimestampMicros:
         self.value = micros
 
 
-class LineSenderBuffer:
+class Buffer:
     def __init__(self, init_capacity=65536, max_name_len=127):
         self._impl = _DLL.line_sender_buffer_with_max_name_len(
             c_size_t(max_name_len))
@@ -537,7 +537,7 @@ class LineSenderBuffer:
         _DLL.line_sender_buffer_free(self._impl)
 
 
-class LineSender:
+class Sender:
     def __init__(
             self,
             host: str,
@@ -566,7 +566,7 @@ class LineSender:
         if read_timeout is not None:
             opts.read_timeout(read_timeout)
 
-        self._buffer = LineSenderBuffer()
+        self._buffer = Buffer()
         self._opts = opts
         self._impl = None
 
@@ -576,7 +576,7 @@ class LineSender:
 
     def connect(self):
         if self._impl:
-            raise LineSenderError('Already connected')
+            raise SenderError('Already connected')
         self._impl = _error_wrapped_call(
             _DLL.line_sender_connect,
             self._opts.impl)
@@ -587,7 +587,7 @@ class LineSender:
 
     def _check_connected(self):
         if not self._impl:
-            raise LineSenderError('Not connected.')
+            raise SenderError('Not connected.')
 
     def table(self, table: str):
         self._buffer.table(table)
@@ -609,7 +609,7 @@ class LineSender:
     def at(self, timestamp: int):
         self._buffer.at(timestamp)
 
-    def flush(self, buffer: Optional[LineSenderBuffer]=None, clear=True):
+    def flush(self, buffer: Optional[Buffer]=None, clear=True):
         if (buffer is None) and not clear:
             raise ValueError(
                 'Clear flag must be True when using internal buffer')

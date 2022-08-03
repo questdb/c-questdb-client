@@ -78,16 +78,16 @@ AUTH_MALFORMED = (
     "9iYksF4L6mfmArupv0CMoyVAWjQ4gNIoupdg6N5noG8")
 
 
-class TestLineSender(unittest.TestCase):
+class TestSender(unittest.TestCase):
     def _mk_linesender(self):
-        return qls.LineSender(
+        return qls.Sender(
             QDB_FIXTURE.host,
             QDB_FIXTURE.line_tcp_port,
             auth=AUTH if QDB_FIXTURE.auth else None)
 
     def _expect_eventual_disconnect(self, sender):
         with self.assertRaisesRegex(
-                qls.LineSenderError, r'.*Could not flush buffer'):
+                qls.SenderError, r'.*Could not flush buffer'):
             table_name = uuid.uuid4().hex
             for _ in range(1000):
                 time.sleep(0.1)
@@ -471,13 +471,13 @@ class TestLineSender(unittest.TestCase):
           * Or a non-authenticating client to an authenticating DB instance.
         """
         client_auth = None if QDB_FIXTURE.auth else AUTH
-        sender = qls.LineSender(
+        sender = qls.Sender(
             QDB_FIXTURE.host,
             QDB_FIXTURE.line_tcp_port,
             auth=client_auth)
         if client_auth:
             with self.assertRaisesRegex(
-                    qls.LineSenderError,
+                    qls.SenderError,
                     r'.*not receive auth challenge.*'):
                 sender.connect()
         else:
@@ -497,7 +497,7 @@ class TestLineSender(unittest.TestCase):
         if not QDB_FIXTURE.auth:
             self.skipTest('No auth')
 
-        sender = qls.LineSender(
+        sender = qls.Sender(
             QDB_FIXTURE.host,
             QDB_FIXTURE.line_tcp_port,
             auth=AUTH_UNRECOGNIZED)
@@ -509,18 +509,18 @@ class TestLineSender(unittest.TestCase):
         if not QDB_FIXTURE.auth:
             self.skipTest('No auth')
 
-        sender = qls.LineSender(
+        sender = qls.Sender(
             QDB_FIXTURE.host,
             QDB_FIXTURE.line_tcp_port,
             auth=AUTH_MALFORMED)
 
         with self.assertRaisesRegex(
-                qls.LineSenderError,
+                qls.SenderError,
                 r'.*Bad private key.*'):
             sender.connect()
 
     def test_tls_insecure_skip_verify(self):
-        sender = qls.LineSender(
+        sender = qls.Sender(
             QDB_FIXTURE.host,
             TLS_PROXY_FIXTURE.listen_port,
             auth=AUTH if QDB_FIXTURE.auth else None,

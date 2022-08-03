@@ -23,14 +23,15 @@
  ******************************************************************************/
 
 use crate::{
-    LineSender,
-    LineSenderBuffer,
-    CertificateAuthority,
-    Tls,
     Error,
     ErrorCode,
-    TimestampMicros,
-    TimestampNanos};
+    ingress::{
+        Sender,
+        Buffer,
+        CertificateAuthority,
+        Tls,
+        TimestampMicros,
+        TimestampNanos}};
 
 use crate::tests::{TestResult, mock::{MockServer, certs_dir}};
 
@@ -50,7 +51,7 @@ fn test_basics() -> TestResult {
     let ts_micros = ts.duration_since(
         std::time::SystemTime::UNIX_EPOCH)?.as_micros() as i64;
 
-    let mut buffer = LineSenderBuffer::new();
+    let mut buffer = Buffer::new();
     buffer
         .table("test")?
         .symbol("t1", "v1")?
@@ -74,7 +75,7 @@ fn test_basics() -> TestResult {
 
 #[test]
 fn test_table_name_too_long() -> TestResult {
-    let mut buffer = LineSenderBuffer::with_max_name_len(4);
+    let mut buffer = Buffer::with_max_name_len(4);
     let name = "a name too long";
     let err = buffer.table(name).unwrap_err();
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
@@ -87,7 +88,7 @@ fn test_table_name_too_long() -> TestResult {
 macro_rules! column_name_too_long_test_impl {
     ($column_fn:ident, $value:expr) => {
         {
-            let mut buffer = LineSenderBuffer::with_max_name_len(4);
+            let mut buffer = Buffer::with_max_name_len(4);
             let name = "a name too long";
             let err = buffer
                 .table("tbl")?
@@ -139,7 +140,7 @@ fn test_tls_with_file_ca() -> TestResult {
     let mut sender = lsb.connect()?;
     let mut server: MockServer = server_jh.join().unwrap()?;
 
-    let mut buffer = LineSenderBuffer::new();
+    let mut buffer = Buffer::new();
     buffer
         .table("test")?
         .symbol("t1", "v1")?
@@ -172,19 +173,18 @@ fn test_tls_to_plain_server() -> TestResult {
     let maybe_sender = lsb.connect();
     let _server: MockServer = server_jh.join().unwrap()?;
     let err = maybe_sender.unwrap_err();
-    assert_eq!(err, Error {
-        code: ErrorCode::TlsError,
-        msg: "Failed to complete TLS handshake: \
-              Timed out waiting for server response after 500ms.".to_owned()
-    });
+    assert_eq!(err, Error::new(
+        ErrorCode::TlsError,
+        "Failed to complete TLS handshake: \
+         Timed out waiting for server response after 500ms.".to_owned()));
     Ok(())
 }
 
-fn expect_eventual_disconnect(sender: &mut LineSender) {
+fn expect_eventual_disconnect(sender: &mut Sender) {
     let mut retry = || {
         for _ in 0..1000 {
             std::thread::sleep(Duration::from_millis(100));
-            let mut buffer = LineSenderBuffer::new();
+            let mut buffer = Buffer::new();
             buffer
                 .table("test_table")?
                 .symbol("s1", "v1")?
@@ -195,7 +195,7 @@ fn expect_eventual_disconnect(sender: &mut LineSender) {
     };
 
     let err: Error = retry().unwrap_err();
-    assert_eq!(err.code, ErrorCode::SocketError);
+    assert_eq!(err.code(), ErrorCode::SocketError);
 }
 
 #[test]
@@ -231,7 +231,7 @@ fn test_tls_insecure_skip_verify() -> TestResult {
     let mut sender = lsb.connect()?;
     let mut server: MockServer = server_jh.join().unwrap()?;
 
-    let mut buffer = LineSenderBuffer::new();
+    let mut buffer = Buffer::new();
     buffer
         .table("test")?
         .symbol("t1", "v1")?

@@ -1,3 +1,4 @@
+use crate::error;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const TIMESTAMP_MAX: i64 = i64::MAX - 1;
@@ -10,7 +11,7 @@ impl TimestampMicros {
         if micros >= 0 {
             Ok(Self(micros))
         } else {
-            Err(fmt_err!(
+            Err(error::fmt!(
                 InvalidTimestamp,
                 "Timestamp {} is negative. It must be >= 0.",
                 micros))
@@ -27,7 +28,7 @@ impl TryFrom<SystemTime> for TimestampMicros {
 
     fn try_from(time: SystemTime) -> crate::Result<Self> {
         let duration = time.duration_since(UNIX_EPOCH)
-            .map_err(|e| fmt_err!(
+            .map_err(|e| error::fmt!(
                 // This will fail if before UNIX_EPOCH,
                 // so this check also guarantees that the
                 // eventual micros result will be >= 0.
@@ -41,7 +42,7 @@ impl TryFrom<SystemTime> for TimestampMicros {
         if micros <= (TIMESTAMP_MAX as u128) {
             Ok(Self(micros as i64))
         } else {
-            Err(fmt_err!(
+            Err(error::fmt!(
                 InvalidTimestamp,
                 concat!(
                     "Timestamp {:?} is too large to fit in a ",
@@ -65,7 +66,7 @@ impl TimestampNanos {
         if nanos >= 0 {
             Ok(Self(nanos))
         } else {
-            Err(fmt_err!(
+            Err(error::fmt!(
                 InvalidTimestamp,
                 "Timestamp {} is negative. It must be >= 0.",
                 nanos))
@@ -82,7 +83,7 @@ impl TryFrom<SystemTime> for TimestampNanos {
 
     fn try_from(time: SystemTime) -> crate::Result<Self> {
         let duration = time.duration_since(UNIX_EPOCH)
-            .map_err(|e| fmt_err!(
+            .map_err(|e| error::fmt!(
                 // This will fail if before UNIX_EPOCH,
                 // so this check also guarantees that the
                 // eventual nanos result will be >= 0.
@@ -96,7 +97,7 @@ impl TryFrom<SystemTime> for TimestampNanos {
         if nanos <= (TIMESTAMP_MAX as u128) {
             Ok(Self(nanos as i64))
         } else {
-            Err(fmt_err!(
+            Err(error::fmt!(
                 InvalidTimestamp,
                 concat!(
                     "Timestamp {:?} is too large to fit in a ",
