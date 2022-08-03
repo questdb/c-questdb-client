@@ -36,6 +36,7 @@ pub enum ErrorCode {
     TlsError
 }
 
+/// An error that occurred when using QuestDB client library.
 #[derive(Debug, PartialEq)]
 pub struct Error {
     code: ErrorCode,
@@ -43,6 +44,7 @@ pub struct Error {
 }
 
 impl Error {
+    /// Create an error with the given code and message.
     pub fn new<S: Into<String>>(code: ErrorCode, msg: S) -> Error {
         Error {
             code: code,
@@ -50,10 +52,12 @@ impl Error {
         }
     }
 
+    /// Get the error code (category) of this error.
     pub fn code(&self) -> ErrorCode {
         self.code
     }
 
+    /// Get the string message of this error.
     pub fn msg(&self) -> &str {
         &self.msg
     }

@@ -22,6 +22,118 @@
  *
  ******************************************************************************/
 
+//! # Fast Ingestion of data into QuestDB
+//! 
+//! The `ingress` module implements QuestDB's variant of the
+//! [InfluxDB Line Protocol](https://questdb.io/docs/reference/api/ilp/overview/)
+//! (ILP) over TCP.
+//!
+//! To get started:
+//!   * Connect to QuestDB by creating a [`Sender`] object.
+//!   * Populate a [`Buffer`] with one or more rows of data.
+//!   * Send the buffer via the Sender's [`flush`](Sender::flush) method.
+//! 
+//! ```rust
+//! use questdb::{
+//!     Result,
+//!     ingress::{
+//!         Sender,
+//!         SenderBuilder}};
+//! 
+//! fn main() -> Result<()> {
+//!    let mut sender = SenderBuilder::new("localhost", 9009).connect()?;
+//!    let mut buffer = Buffer::new();
+//!    buffer
+//!        .table("sensors")?
+//!        .symbol("id", "toronto1")?
+//!        .column_f64("temperature", 20.0)?
+//!        .column_i64("humidity", 50)?
+//!        .at_now()?;
+//!    sender.flush(&mut buffer)?;
+//!    Ok(())
+//! }
+//! ```
+//! 
+//! # Flushing
+//! 
+//! The Sender's [`flush`](Sender::flush) method will clear the buffer
+//! which is then reusable for another batch of rows.
+//! 
+//! Dropping the sender will close the connection to QuestDB and any unflushed
+//! messages will be lost: In other words, *do not forget to
+//! [`flush`](Sender::flush) before closing the connection!*
+//!
+//! A common technique is to flush periodically on a timer and/or once the
+//! buffer exceeds a certain size.
+//! You can check the buffer's size by the calling Buffer's [`len`](Buffer::len)
+//! method.
+//! 
+//! Note that flushing will automatically clear the buffer's contents.
+//! If you'd rather preserve the contents (for example, to send the same data to
+//! multiple QuestDB instances), you can call
+//! [`flush_and_keep`](Sender::flush_and_keep) instead.
+//!
+//! # Connection Security Options
+//! 
+//! To establish an [authenticated](https://questdb.io/docs/reference/api/ilp/authenticate)
+//! and TLS-encrypted connection, call the SenderBuilder's
+//! [`auth`](SenderBuilder::auth) and [`tls`](SenderBuilder::tls) methods.
+//! 
+//! Here's an example that uses full security:
+//! 
+//! ```rust
+//! use questdb::ingress::{Tls, CertificateAuthority};
+//! 
+//! // See: https://questdb.io/docs/reference/api/ilp/authenticate
+//! let mut sender = SenderBuilder::new("localhost", 9009)
+//!     .auth(
+//!         "testUser1",                                    // kid
+//!         "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48",  // d
+//!         "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU",  // x
+//!         "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac")  // y
+//!     .tls(Tls::Enabled(CertificateAuthority::WebpkiRoots))
+//!     .connect()?;
+//! ```
+//! 
+//! Note that as of writing QuestDB does not natively support TLS encryption.
+//! To use TLS use a TLS proxy such as [HAProxy](http://www.haproxy.org/).
+//! 
+//! For testing, you can use a self-signed certificate and key.
+//! 
+//! See our notes on [how to generate keys that this library will
+//! accept](https://github.com/questdb/c-questdb-client/tree/main/tls_certs).
+//! 
+//! From the API, you can then point to a custom CA file:
+//! 
+//! ```rust
+//! let mut sender = SenderBuilder::new("localhost", 9009)
+//!     .tls(Tls::Enabled(CertificateAuthority::File("server_rootCA.pem")))
+//!     .connect()?;
+//! ```
+//! 
+//! # Avoiding revalidating names
+//! To avoid re-validating table and column names, consider re-using them across
+//! rows.
+//! 
+//! ```rust
+//! use questdb::ingress::{
+//!     TableName,
+//!     ColumnName,
+//!     Buffer};
+//! 
+//! let mut buffer = Buffer::new();
+//! let tide_name = TableName::new("tide");
+//! let water_level_name = ColumnName::new("water_level");
+//! buffer.table(tide_name)?.column_f64(water_level_name, 20.4)?.at_now()?;
+//! buffer.table(tide_name)?.column_f64(water_level_name, 17.2)?.at_now()?;
+//! ```
+//!
+//! # Buffer API sequential coupling
+//! 
+//! Symbols must always be written before rows. See the [`Buffer`] documentation
+//! for details. Each row must be terminated with a call to either
+//! [`at`](Buffer::at) or [`at_now`](Buffer::at_now).
+
 pub use self::timestamp::{TimestampNanos, TimestampMicros};
 
 use crate::error::{self, Error, Result};
@@ -66,11 +178,18 @@ fn map_io_to_socket_err(prefix: &str, io_err: io::Error) -> Error {
     error::fmt!(SocketError, "{}{}", prefix, io_err)
 }
 
+/// A validated table name.
+/// 
+/// This type simply wraps a `&str`.
+/// 
+/// You can use it to construct it explicitly to avoid re-validating the same
+/// names over and over.
 pub struct TableName<'a> {
     name: &'a str
 }
 
 impl <'a> TableName<'a> {
+    /// Construct a validated table name.
     pub fn new(name: &'a str) -> Result<Self> {
         if name.is_empty() {
             return Err(error::fmt!(
@@ -127,16 +246,24 @@ impl <'a> TableName<'a> {
         Ok(Self { name: name })
     }
 
+    #[doc(hidden)]
     pub unsafe fn new_unchecked(name: &'a str) -> Self {
         Self { name: name }
     }
 }
 
+/// A validated column name.
+/// 
+/// This type simply wraps a `&str`.
+/// 
+/// You can use it to construct it explicitly to avoid re-validating the same
+/// names over and over.
 pub struct ColumnName<'a> {
     name: &'a str
 }
 
 impl <'a> ColumnName<'a> {
+    /// Construct a validated table name.
     pub fn new(name: &'a str) -> Result<Self> {
         if name.is_empty() {
             return Err(error::fmt!(
@@ -182,6 +309,7 @@ impl <'a> ColumnName<'a> {
         Ok(Self { name: name })
     }
 
+    #[doc(hidden)]
     pub unsafe fn new_unchecked(name: &'a str) -> Self {
         Self { name: name }
     }
@@ -334,6 +462,87 @@ impl State {
     }
 }
 
+/// A reusable buffer to prepare ILP messages.
+/// 
+/// # Example
+/// 
+/// ```rust
+/// use questdb::ingress::Buffer;
+/// 
+/// let mut buffer = Buffer::new();
+/// 
+/// // first row
+/// buffer
+///     .table("table1")?
+///     .symbol("bar", "baz")?
+///     .column_bool("a", false)?
+///     .column_i64("b", 42)?
+///     .column_f64("c", 3.14)?
+///     .column_str("d", "hello")?
+///     .column_ts("e", std::time::SystemTime::now())?
+///     .at(std::time::SystemTime::now())?;
+/// 
+/// // second row
+/// buffer
+///     .table("table2")?
+///     .symbol("foo", "bar")?
+///     .at_now()?;
+/// ```
+/// 
+/// The buffer can then be sent with the Sender's [`flush`](Sender::flush)
+/// method.
+/// 
+/// # Sequential Coupling
+/// The Buffer API is sequentially coupled:
+///   * A row always starts with [`table`](Buffer::table).
+///   * A row must contain at least one [`symbol`](Buffer::symbol) or
+///     column (
+///       [`column_bool`](Buffer::column_bool),
+///       [`column_i64`](Buffer::column_i64),
+///       [`column_f64`](Buffer::column_f64),
+///       [`column_str`](Buffer::column_str),
+///       [`column_ts`](Buffer::column_ts)).
+///   * Symbols must always appear before columns.
+///   * A row must be terminated with either [`at`](Buffer::at) or
+///     [`at_now`](Buffer::at_now).
+/// 
+/// This diagram might help:
+/// 
+/// <img src="https://raw.githubusercontent.com/questdb/c-questdb-client/main/api_seq/seq.svg">
+/// 
+/// # Buffer method calls, Serialized ILP types and QuestDB types
+/// 
+/// | Buffer Method | Serialized as ILP type (Click on link to see possible casts) |
+/// |---------------|--------------------------------------------------------------|
+/// | [`symbol`](Buffer::symbol) | [`SYMBOL`](https://questdb.io/docs/concept/symbol/) |
+/// | [`column_bool`](Buffer::column_bool) | [`BOOLEAN`](https://questdb.io/docs/reference/api/ilp/columnset-types#boolean) |
+/// | [`column_i64`](Buffer::column_i64) | [`INTEGER`](https://questdb.io/docs/reference/api/ilp/columnset-types#integer) |
+/// | [`column_f64`](Buffer::column_f64) | [`FLOAT`](https://questdb.io/docs/reference/api/ilp/columnset-types#float) |
+/// | [`column_str`](Buffer::column_str) | [`STRING`](https://questdb.io/docs/reference/api/ilp/columnset-types#string) |
+/// | [`column_ts`](Buffer::column_ts) | [`TIMESTAMP`](https://questdb.io/docs/reference/api/ilp/columnset-types#timestamp) |
+/// 
+/// QuestDB supports both `STRING` columns and `SYMBOL` column types.
+/// 
+/// To understand the difference refer to the
+/// [QuestDB documentation](https://questdb.io/docs/concept/symbol/), but in
+/// short symbols are interned strings that are most suitable for identifiers
+/// that you expect to be repeated throughout the column.
+/// 
+/// # Inserting NULL values
+/// 
+/// To insert a NULL value, skip the symbol or column for that row.
+///
+/// # Recovering from validation errors.
+/// 
+/// If you want to recover from potential validation errors, you can use the
+/// [`set_marker`](Buffer::set_marker) method to track a last known good state,
+/// append as many rows or parts of rows as you like and then call
+/// [`clear_marker`](Buffer::clear_marker) on success.
+/// 
+/// If there was an error in one of the table names or other, you can use the
+/// [`rewind_to_marker`](Buffer::rewind_to_marker) method to go back to the
+/// marked last known good state.
+/// 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Buffer {
     state: State,
@@ -355,8 +564,12 @@ impl Buffer {
     }
 
     /// Construct with a custom maximum length for table and column names.
+    ///
     /// This should match the `cairo.max.file.name.length` setting of the
     /// QuestDB instance you're connecting to.
+    ///
+    /// If the server does not configure it the default is `127` and you might
+    /// as well call [`new`](Buffer::new).
     pub fn with_max_name_len(max_name_len: usize) -> Self {
         let mut buffer = Self::new();
         buffer.max_name_len = max_name_len;
@@ -371,23 +584,28 @@ impl Buffer {
         self.output.reserve(additional);
     }
 
+    /// Number of bytes accumulated in the buffer.
     pub fn len(&self) -> usize {
         self.output.len()
     }
 
+    /// Number of bytes that can be written to the buffer before it needs to
+    /// resize.
     pub fn capacity(&self) -> usize {
         self.output.capacity()
     }
 
+    /// Inspect the contents of the buffer.
     pub fn as_str(&self) -> &str {
         &self.output
     }
 
     /// Mark a rewind point.
     /// This allows undoing accumulated changes to the buffer for one or more
-    /// rows by calling `rewind_to_marker`.
+    /// rows by calling [`rewind_to_marker`](Buffer::rewind_to_marker).
     /// Any previous marker will be discarded.
-    /// Once the marker is no longer needed, call `clear_marker`.
+    /// Once the marker is no longer needed, call
+    /// [`clear_marker`](Buffer::clear_marker).
     pub fn set_marker(&mut self) -> Result<()> {
         if (self.state as isize & Op::Table as isize) == 0 {
             return Err(error::fmt!(
@@ -401,7 +619,9 @@ impl Buffer {
         Ok(())
     }
 
-    /// Undo all changes since the last `set_marker` call.
+    /// Undo all changes since the last [`set_marker`](Buffer::set_marker)
+    /// call.
+    /// 
     /// As a side-effect, this also clears the marker.
     pub fn rewind_to_marker(&mut self) -> Result<()> {
         if let Some((position, state)) = self.marker {
@@ -417,11 +637,16 @@ impl Buffer {
         }
     }
 
-    /// Discard the marker.
+    /// Discard any marker as may have been set by
+    /// [`set_marker`](Buffer::set_marker).
+    /// 
+    /// Idempodent.
     pub fn clear_marker(&mut self) {
         self.marker = None;
     }
 
+    /// Reset the buffer and clear contents whilst retaining
+    /// [`capacity`](Buffer::capacity).
     pub fn clear(&mut self) {
         self.output.clear();
         self.marker = None;
@@ -451,6 +676,18 @@ impl Buffer {
         Ok(())
     }
 
+    /// Begin recording a row for a given table.
+    /// 
+    /// ```rust
+    /// buf.table("table_name")?;
+    /// ```
+    /// 
+    /// or
+    /// 
+    /// ```rust
+    /// let table_name = TableName::new("table_name");
+    /// buf.table(table_name)?;
+    /// ```
     pub fn table<'a, N>(&mut self, name: N) -> Result<&mut Self>
         where
             N: TryInto<TableName<'a>>,
@@ -464,6 +701,26 @@ impl Buffer {
         Ok(self)
     }
 
+    /// Record a symbol for a given column.
+    /// 
+    /// ```rust
+    /// buf.symbol("col_name", "value")?;
+    /// ```
+    /// 
+    /// or
+    /// 
+    /// ```rust
+    /// let value: String = "value".to_owned();
+    /// buf.symbol("col_name", value)?;
+    /// ```
+    /// 
+    /// or
+    /// 
+    /// ```rust
+    /// let col_name = ColumnName::new("col_name");
+    /// buf.symbol(col_name, "value")?;
+    /// ```
+    /// 
     pub fn symbol<'a, N, S>(&mut self, name: N, value: S) -> Result<&mut Self>
         where
             N: TryInto<ColumnName<'a>>,
@@ -501,6 +758,18 @@ impl Buffer {
         Ok(self)
     }
 
+    /// Record a boolean value for a column.
+    /// 
+    /// ```rust
+    /// buf.column_bool("col_name", true)?;
+    /// ```
+    /// 
+    /// or
+    /// 
+    /// ```rust
+    /// let col_name = ColumnName::new("col_name");
+    /// buf.column_bool(col_name, true)?;
+    /// ```
     pub fn column_bool<'a, N>(
         &mut self, name: N, value: bool) -> Result<&mut Self>
         where
@@ -512,6 +781,18 @@ impl Buffer {
         Ok(self)
     }
 
+    /// Record an integer value for a column.
+    /// 
+    /// ```rust
+    /// buf.column_i64("col_name", 42)
+    /// ```
+    /// 
+    /// or
+    /// 
+    /// ```rust
+    /// let col_name = ColumnName::new("col_name");
+    /// buf.column_i64(col_name, 42);
+    /// ```
     pub fn column_i64<'a, N>(
         &mut self, name: N, value: i64) -> Result<&mut Self>
         where
@@ -526,6 +807,18 @@ impl Buffer {
         Ok(self)
     }
 
+    /// Record a floating point value for a column.
+    /// 
+    /// ```rust
+    /// buf.column_f64("col_name", 3.14)?;
+    /// ```
+    /// 
+    /// or
+    /// 
+    /// ```rust
+    /// let col_name = ColumnName::new("col_name");
+    /// buf.column_f64(col_name, 3.14)?;
+    /// ```
     pub fn column_f64<'a, N>(
         &mut self, name: N, value: f64) -> Result<&mut Self>
         where
@@ -538,6 +831,23 @@ impl Buffer {
         Ok(self)
     }
 
+    /// ```rust
+    /// buf.column_str("col_name", "value")?;
+    /// ```
+    /// 
+    /// or
+    /// 
+    /// ```rust
+    /// let value: String = "value".to_owned();
+    /// buf.column_str("col_name", value)?;
+    /// ```
+    /// 
+    /// or
+    /// 
+    /// ```rust
+    /// let col_name = ColumnName::new("col_name");
+    /// buf.column_str(col_name, "value")?;
+    /// ```
     pub fn column_str<'a, N, S>(
         &mut self, name: N, value: S) -> Result<&mut Self>
         where
@@ -550,6 +860,28 @@ impl Buffer {
         Ok(self)
     }
 
+    /// Record a timestamp for a column.
+    /// 
+    /// ```rust
+    /// buf.column_ts("col_name", std::time::SystemTime::now())?;
+    /// ```
+    /// 
+    /// or
+    /// 
+    /// ```rust
+    /// use questdb::ingress::TimestampMicros;
+    /// 
+    /// buf.column_ts("col_name", TimestampMicros::new(1659548204354448))?;
+    /// ```
+    /// 
+    /// or
+    /// 
+    /// ```rust
+    /// let col_name = ColumnName::new("col_name");
+    /// buf.column_ts(col_name, std::time::SystemTime::now())?;
+    /// ```
+    /// 
+    /// The timestamp should be in UTC.
     pub fn column_ts<'a, N, T>(
         &mut self, name: N, value: T) -> Result<&mut Self>
         where
@@ -567,6 +899,19 @@ impl Buffer {
         Ok(self)
     }
 
+    /// Terminate the row with a specified timestamp.
+    /// 
+    /// ```rust
+    /// buf.at(std::time::SystemTime::now())?;
+    /// ```
+    /// 
+    /// or
+    /// 
+    /// ```rust
+    /// buf.at(TimestampNanos::new(1659548315647406592))?;
+    /// ```
+    /// 
+    /// The timestamp should be in UTC.
     pub fn at<T>(&mut self, timestamp: T) -> Result<()>
         where
             T: TryInto<TimestampNanos>,
@@ -584,6 +929,16 @@ impl Buffer {
         Ok(())
     }
 
+    /// Terminate the row with a server-specified timestamp.
+    /// 
+    /// ```rust
+    /// buf.at_now()?;
+    /// ```
+    /// 
+    /// The QuestDB instance will set the timestamp once it receives the row.
+    /// If you're [`flushing`](Sender::flush) infrequently, the assigned
+    /// timestamp may drift significantly from when the data was recorded in
+    /// the buffer.
     pub fn at_now(&mut self) -> Result<()> {
         self.check_state(Op::At)?;
         self.output.push('\n');
@@ -592,6 +947,11 @@ impl Buffer {
     }
 }
 
+/// Connects to a QuestDB instance and inserts data via the ILP protocol.
+/// 
+/// * To construct an instance, use the [`SenderBuilder`].
+/// * To prepare messages, use [`Buffer`] objects.
+/// * To send messages, call the [`flush`](Sender::flush) method.
 pub struct Sender {
     descr: String,
     conn: Connection,
@@ -614,30 +974,58 @@ struct AuthParams {
     pub_key_y: String
 }
 
+/// How to validate the server's TLS certificate.
 #[derive(Debug, Clone)]
 pub enum CertificateAuthority {
     WebpkiRoots,
     File(PathBuf)
 }
 
+/// Options for full-connection encryption via TLS.
 #[derive(Debug, Clone)]
 pub enum Tls {
+    /// No TLS encryption.
     Disabled,
+
+    /// Use TLS encryption, verifying the server's certificate.
     Enabled(CertificateAuthority),
 
+    /// Use TLS encryption, whilst dangerously ignoring the server's certificate.
+    /// This should only be used for deubgging purposes.
+    /// For testing consider specifying a [`CertificateAuthority::File`] instead.
+    /// 
+    /// *This option requires the `insecure-skip-verify` feature.*
     #[cfg(feature = "insecure-skip-verify")]
     InsecureSkipVerify
 }
 
 impl Tls {
-    pub fn is_disabled(&self) -> bool {
+    /// Returns true if TLS is enabled.
+    pub fn is_enabled(&self) -> bool {
         match self {
-            Tls::Disabled => true,
-            _ => false
+            Tls::Disabled => false,
+            _ => true
         }
     }
 }
 
+/// A `u16` port number or `String` port service name as is registered with
+/// `/etc/services` or equivalent.
+/// 
+/// ```rust
+/// use std::convert::Into;
+/// 
+/// let service: Service = 9009.into();
+/// ```
+/// 
+/// or
+/// 
+/// ```rust
+/// use std::convert::Into;
+/// 
+/// // Assuming the service name is registered.
+/// let service: Service = "questdb".into();
+/// ```
 pub struct Service(String);
 
 impl From<String> for Service {
@@ -695,7 +1083,7 @@ fn add_webpki_roots(root_store: &mut rustls::RootCertStore) {
 }
 
 fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
-    if tls.is_disabled() {
+    if !tls.is_enabled() {
         return Ok(None);
     }
 
@@ -757,7 +1145,6 @@ fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
 
 #[derive(Debug, Clone)]
 pub struct SenderBuilder {
-    capacity: usize,
     read_timeout: Duration,
     host: String,
     port: String,
@@ -771,7 +1158,6 @@ impl SenderBuilder {
     pub fn new<H: Into<String>, P: Into<Service>>(host: H, port: P) -> Self {
         let service: Service = port.into();
         Self {
-            capacity: 65536,
             read_timeout: Duration::from_secs(15),
             host: host.into(),
             port: service.0,
@@ -779,13 +1165,6 @@ impl SenderBuilder {
             auth: None,
             tls: Tls::Disabled
         }
-    }
-
-    /// Set the initial buffer capacity (byte count).
-    /// The default is 65536.
-    pub fn capacity(mut self, byte_count: usize) -> Self {
-        self.capacity = byte_count;
-        self
     }
 
     /// Select local outbound interface.

@@ -22,6 +22,34 @@
  *
  ******************************************************************************/
 
+//! # QuestDB Client Library for Rust
+//! 
+//! To start using `questdb-rs` add it to your `Cargo.toml`:
+//! 
+//! ```toml
+//! [dependencies]
+//! questdb-rs = "0.0.1"
+//! ```
+//! 
+//! See the [ingress] module to insert data into QuestDB via the ILP protocol.
+//!
+//! # C, C++ and Python APIs
+//! 
+//! This crate is also exposed as a C and C++ API and in turn exposed to Python.
+//! 
+//! See this project's
+//! [GitHub page](https://github.com/questdb/c-questdb-client) for C and C++ and
+//! the related [Python bindings](https://github.com/questdb/py-questdb-client).
+//! 
+//! # Community
+//! 
+//! If you need help, have additional questions or want to provide feedback, you
+//! may find us on [Slack](https://slack.questdb.io/).
+//! 
+//! You can also sign up to our [mailing list](https://questdb.io/community/) to
+//! get notified of new releases.
+//!
+
 mod error;
 pub mod ingress;
 mod gai;
