@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-use crate::F64Serializer;
+use crate::ingress::F64Serializer;
 
 fn f2s(n: f64) -> String {
     F64Serializer::new(n).to_str().to_owned()

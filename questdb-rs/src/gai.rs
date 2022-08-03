@@ -22,6 +22,7 @@
  *
  ******************************************************************************/
 
+use crate::error;
 use socket2::SockAddr;
 use dns_lookup::{AddrInfoHints, AddrInfo, AddrInfoIter, LookupError};
 
@@ -33,22 +34,23 @@ use winapi::shared::ws2def::{AF_INET, SOCK_STREAM};
 
 fn map_getaddrinfo_result(
     dest: &str,
-    result: Result<AddrInfoIter, LookupError>) -> super::Result<SockAddr>
+    result: Result<AddrInfoIter, LookupError>) -> crate::Result<SockAddr>
 {
     match result {
         Ok(mut addrs) => {
             let addr: AddrInfo = addrs.next().unwrap().map_err(
-                |io_err| super::Error {
-                    code: super::ErrorCode::CouldNotResolveAddr,
-                    msg: format!("Could not resolve {:?}: {}", dest, io_err)
-                })?;
+                |io_err| error::fmt!(
+                    CouldNotResolveAddr,
+                    "Could not resolve {:?}: {}",
+                    dest,
+                    io_err))?;
             Ok(addr.sockaddr.into())
         },
         Err(lookup_err) => {
             let io_err: std::io::Error = lookup_err.into();
-            Err(super::Error{
-                code: super::ErrorCode::CouldNotResolveAddr,
-                msg: format!("Could not resolve {:?}: {}", dest, io_err)})
+            Err(error::fmt!(
+                CouldNotResolveAddr,
+                "Could not resolve {:?}: {}", dest, io_err))
         }
     }
 }

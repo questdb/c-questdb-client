@@ -22,9 +22,13 @@
  *
  ******************************************************************************/
 
+pub use self::timestamp::{TimestampNanos, TimestampMicros};
+
+use crate::error::{self, Error, Result};
+use crate::gai;
 use core::time::Duration;
 use std::convert::{TryFrom, TryInto, Infallible};
-use std::fmt::{self, Write, Display, Formatter};
+use std::fmt::{Write, Formatter};
 use std::io::{self, BufRead, BufReader, Write as IoWrite, ErrorKind};
 use std::sync::Arc;
 use std::path::PathBuf;
@@ -35,17 +39,6 @@ use base64ct::{Base64, Base64UrlUnpadded, Encoding};
 use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
 use rustls::{
     OwnedTrustAnchor, RootCertStore, ClientConnection, ServerName, StreamOwned};
-
-pub use crate::timestamp::{TimestampMicros, TimestampNanos};
-
-macro_rules! fmt_err {
-    ($code:ident, $($arg:tt)*) => {
-        crate::Error {
-            code: crate::ErrorCode::$code,
-            msg: format!($($arg)*)
-        }
-    }
-}
 
 #[derive(Debug, Copy, Clone)]
 enum Op {
@@ -68,62 +61,9 @@ impl Op {
     }
 }
 
-/// Category of error.
-#[derive(Debug, Copy, Clone, PartialEq)]
-pub enum ErrorCode {
-    /// The host, port, or interface was incorrect.
-    CouldNotResolveAddr,
-
-    /// Called methods in the wrong order. E.g. `symbol` after `column`.
-    InvalidApiCall,
-
-    /// A network error connecting or flushing data out.
-    SocketError,
-
-    /// The string or symbol field is not encoded in valid UTF-8.
-    InvalidUtf8,
-
-    /// The table name or column name contains bad characters.
-    InvalidName,
-
-    /// The supplied timestamp is invalid.
-    InvalidTimestamp,
-
-    /// Error during the authentication process.
-    AuthError,
-
-    /// Error during TLS handshake.
-    TlsError
-}
-
-#[derive(Debug, PartialEq)]
-pub struct Error {
-    code: ErrorCode,
-    msg: String
-}
-
-impl Error {
-    pub fn code(&self) -> ErrorCode {
-        self.code
-    }
-
-    pub fn msg(&self) -> &str {
-        &self.msg
-    }
-}
-
-impl Display for Error {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.msg)
-    }
-}
-
-impl std::error::Error for Error {}
-
-pub type Result<T> = std::result::Result<T, Error>;
 
 fn map_io_to_socket_err(prefix: &str, io_err: io::Error) -> Error {
-    fmt_err!(SocketError, "{}{}", prefix, io_err)
+    error::fmt!(SocketError, "{}{}", prefix, io_err)
 }
 
 pub struct TableName<'a> {
@@ -133,7 +73,7 @@ pub struct TableName<'a> {
 impl <'a> TableName<'a> {
     pub fn new(name: &'a str) -> Result<Self> {
         if name.is_empty() {
-            return Err(fmt_err!(
+            return Err(error::fmt!(
                 InvalidName, "Table names must have a non-zero length."));
         }
 
@@ -142,7 +82,7 @@ impl <'a> TableName<'a> {
             match c {
                 '.' => {
                     if index == 0 || index == name.len() - 1 || prev == '.' {
-                        return Err(fmt_err!(
+                        return Err(error::fmt!(
                             InvalidName,
                             concat!(
                                 "Bad string {:?}: ",
@@ -155,7 +95,7 @@ impl <'a> TableName<'a> {
                 '\u{0001}' | '\u{0002}' | '\u{0003}' | '\u{0004}' | '\u{0005}' |
                 '\u{0006}' | '\u{0007}' | '\u{0008}' | '\u{0009}' | '\u{000b}' |
                 '\u{000c}' | '\u{000e}' | '\u{000f}' | '\u{007f}' => {
-                    return Err(fmt_err!(
+                    return Err(error::fmt!(
                         InvalidName,
                         concat!(
                             "Bad string {:?}: ",
@@ -169,7 +109,7 @@ impl <'a> TableName<'a> {
                 '\u{feff}' => {
                     // Reject unicode char 'ZERO WIDTH NO-BREAK SPACE',
                     // aka UTF-8 BOM if it appears anywhere in the string.
-                    return Err(fmt_err!(
+                    return Err(error::fmt!(
                         InvalidName,
                         concat!(
                             "Bad string {:?}: ",
@@ -186,6 +126,10 @@ impl <'a> TableName<'a> {
 
         Ok(Self { name: name })
     }
+
+    pub unsafe fn new_unchecked(name: &'a str) -> Self {
+        Self { name: name }
+    }
 }
 
 pub struct ColumnName<'a> {
@@ -195,7 +139,7 @@ pub struct ColumnName<'a> {
 impl <'a> ColumnName<'a> {
     pub fn new(name: &'a str) -> Result<Self> {
         if name.is_empty() {
-            return Err(fmt_err!(
+            return Err(error::fmt!(
                 InvalidName,
                 "Column names must have a non-zero length."));
         }
@@ -207,7 +151,7 @@ impl <'a> ColumnName<'a> {
                 '\u{0001}' | '\u{0002}' | '\u{0003}' | '\u{0004}' | '\u{0005}' |
                 '\u{0006}' | '\u{0007}' | '\u{0008}' | '\u{0009}' | '\u{000b}' |
                 '\u{000c}' | '\u{000e}' | '\u{000f}' | '\u{007f}' => {
-                    return Err(fmt_err!(
+                    return Err(error::fmt!(
                         InvalidName,
                         concat!(
                             "Bad string {:?}: ",
@@ -221,7 +165,7 @@ impl <'a> ColumnName<'a> {
                 '\u{FEFF}' => {
                     // Reject unicode char 'ZERO WIDTH NO-BREAK SPACE',
                     // aka UTF-8 BOM if it appears anywhere in the string.
-                    return Err(fmt_err!(
+                    return Err(error::fmt!(
                         InvalidName,
                             concat!(
                                 "Bad string {:?}: ",
@@ -236,6 +180,10 @@ impl <'a> ColumnName<'a> {
         }
 
         Ok(Self { name: name })
+    }
+
+    pub unsafe fn new_unchecked(name: &'a str) -> Self {
+        Self { name: name }
     }
 }
 
@@ -387,14 +335,14 @@ impl State {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct LineSenderBuffer {
+pub struct Buffer {
     state: State,
     output: String,
     marker: Option<(usize, State)>,
     max_name_len: usize,
 }
 
-impl LineSenderBuffer {
+impl Buffer {
     /// Construct an instance with a `max_name_len` of `127`,
     /// which is the same as the QuestDB default.
     pub fn new() -> Self {
@@ -442,7 +390,7 @@ impl LineSenderBuffer {
     /// Once the marker is no longer needed, call `clear_marker`.
     pub fn set_marker(&mut self) -> Result<()> {
         if (self.state as isize & Op::Table as isize) == 0 {
-            return Err(fmt_err!(
+            return Err(error::fmt!(
                 InvalidApiCall,
                 concat!(
                     "Can't set the marker whilst constructing a line. ",
@@ -463,7 +411,7 @@ impl LineSenderBuffer {
             Ok(())
         }
         else {
-            Err(fmt_err!(
+            Err(error::fmt!(
                 InvalidApiCall,
                 "Can't rewind to the marker: No marker set."))
         }
@@ -484,7 +432,7 @@ impl LineSenderBuffer {
         if (self.state as isize & op as isize) > 0 {
             return Ok(());
         }
-        let error = fmt_err!(
+        let error = error::fmt!(
             InvalidApiCall,
             "State error: Bad call to `{}`, {}.",
             op.descr(),
@@ -494,7 +442,7 @@ impl LineSenderBuffer {
 
     fn validate_max_name_len(&self, name: &str) -> Result<()> {
         if name.len() > self.max_name_len {
-            return Err(fmt_err!(
+            return Err(error::fmt!(
                 InvalidApiCall,
                 "Bad name: {:?}: Too long (max {} characters)",
                 name,
@@ -644,13 +592,13 @@ impl LineSenderBuffer {
     }
 }
 
-pub struct LineSender {
+pub struct Sender {
     descr: String,
     conn: Connection,
     connected: bool
 }
 
-impl std::fmt::Debug for LineSender {
+impl std::fmt::Debug for Sender {
     fn fmt(&self, f: &mut Formatter<'_>)
         -> std::result::Result<(), std::fmt::Error>
     {
@@ -677,7 +625,7 @@ pub enum Tls {
     Disabled,
     Enabled(CertificateAuthority),
 
-    #[cfg(feature = "insecure_skip_verify")]
+    #[cfg(feature = "insecure-skip-verify")]
     InsecureSkipVerify
 }
 
@@ -710,7 +658,7 @@ impl From<u16> for Service {
     }
 }
 
-#[cfg(feature = "insecure_skip_verify")]
+#[cfg(feature = "insecure-skip-verify")]
 mod danger {
     pub struct NoCertificateVerification {}
 
@@ -730,7 +678,7 @@ mod danger {
 }
 
 fn map_rustls_err(descr: &str, err: rustls::Error) -> Error {
-    fmt_err!(TlsError, "{}: {}", descr, err)
+    error::fmt!(TlsError, "{}: {}", descr, err)
 }
 
 fn add_webpki_roots(root_store: &mut rustls::RootCertStore) {
@@ -760,7 +708,7 @@ fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
             },
             CertificateAuthority::File(ca_file) => {
                 let certfile = std::fs::File::open(ca_file)
-                    .map_err(|io_err| fmt_err!(
+                    .map_err(|io_err| error::fmt!(
                         TlsError,
                         concat!(
                             "Could not open certificate authority ",
@@ -769,7 +717,7 @@ fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
                         io_err))?;
                 let mut reader = BufReader::new(certfile);
                 let der_certs = &rustls_pemfile::certs(&mut reader)
-                    .map_err(|io_err| fmt_err!(
+                    .map_err(|io_err| error::fmt!(
                         TlsError,
                         concat!(
                             "Could not read certificate authority ",
@@ -798,7 +746,7 @@ fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
     // Set the SSLKEYLOGFILE env variable to a writable location.
     config.key_log = Arc::new(rustls::KeyLogFile::new());
 
-    #[cfg(feature = "insecure_skip_verify")]
+    #[cfg(feature = "insecure-skip-verify")]
     if let Tls::InsecureSkipVerify = tls {
         config.dangerous().set_certificate_verifier(
             Arc::new(danger::NoCertificateVerification {}));
@@ -808,7 +756,7 @@ fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
 }
 
 #[derive(Debug, Clone)]
-pub struct LineSenderBuilder {
+pub struct SenderBuilder {
     capacity: usize,
     read_timeout: Duration,
     host: String,
@@ -818,7 +766,7 @@ pub struct LineSenderBuilder {
     tls: Tls
 }
 
-impl LineSenderBuilder {
+impl SenderBuilder {
     /// QuestDB server and port.
     pub fn new<H: Into<String>, P: Into<Service>>(host: H, port: P) -> Self {
         let service: Service = port.into();
@@ -888,9 +836,9 @@ impl LineSenderBuilder {
     }
 
     /// Connect synchronously.
-    pub fn connect(&self) -> Result<LineSender> {
+    pub fn connect(&self) -> Result<Sender> {
         let mut descr = format!(
-            "LineSender[host={:?},port={:?},", self.host, self.port);
+            "Sender[host={:?},port={:?},", self.host, self.port);
         let addr: SockAddr = gai::resolve_host_port(
             self.host.as_str(), self.port.as_str())?;
         let mut sock = Socket::new(
@@ -931,7 +879,7 @@ impl LineSenderBuilder {
             Tls::Disabled => write!(descr, "tls=enabled,").unwrap(),
             Tls::Enabled(_) => write!(descr, "tls=enabled,").unwrap(),
 
-            #[cfg(feature="insecure_skip_verify")]
+            #[cfg(feature="insecure-skip-verify")]
             Tls::InsecureSkipVerify => write!(
                 descr, "tls=insecure_skip_verify,").unwrap(),
         }
@@ -939,13 +887,13 @@ impl LineSenderBuilder {
         let conn = match configure_tls(&self.tls)? {
                 Some(tls_config) => {
                     let server_name: ServerName = self.host.as_str().try_into()
-                        .map_err(|inv_dns_err| fmt_err!(
+                        .map_err(|inv_dns_err| error::fmt!(
                             TlsError,
                             "Bad host: {}",
                             inv_dns_err))?;
                     let mut tls_conn = ClientConnection::new(
                         tls_config, server_name)
-                            .map_err(|rustls_err| fmt_err!(
+                            .map_err(|rustls_err| error::fmt!(
                                 TlsError,
                                 "Could not create TLS client: {}",
                                 rustls_err))?;
@@ -954,14 +902,14 @@ impl LineSenderBuilder {
                             .map_err(|io_err|
                                 if (io_err.kind() == ErrorKind::TimedOut) ||
                                     (io_err.kind() == ErrorKind::WouldBlock) {
-                                    fmt_err!(TlsError,
+                                    error::fmt!(TlsError,
                                         concat!(
                                             "Failed to complete TLS handshake:",
                                             " Timed out waiting for server ",
                                             "response after {:?}."),
                                         self.read_timeout)
                                 } else {
-                                    fmt_err!(
+                                    error::fmt!(
                                         TlsError,
                                         "Failed to complete TLS handshake: {}",
                                         io_err)
@@ -977,7 +925,7 @@ impl LineSenderBuilder {
         else {
             descr.push_str("auth=off]");
         }
-        let mut sender = LineSender {
+        let mut sender = Sender {
             descr: descr,
             conn: conn,
             connected: true
@@ -991,7 +939,7 @@ impl LineSenderBuilder {
 
 fn b64_decode(descr: &'static str, buf: &str) -> Result<Vec<u8>> {
     Base64UrlUnpadded::decode_vec(buf)
-        .map_err(|b64_err| fmt_err!(
+        .map_err(|b64_err| error::fmt!(
             AuthError, "Could not decode {}: {}", descr, b64_err))
 }
 
@@ -1018,17 +966,17 @@ fn parse_key_pair(auth: &AuthParams) -> Result<EcdsaKeyPair> {
         &ECDSA_P256_SHA256_FIXED_SIGNING,
         &private_key[..],
         &public_key[..])
-            .map_err(|key_rejected| fmt_err!(
+            .map_err(|key_rejected| error::fmt!(
                 AuthError, "Bad private key: {}", key_rejected))
 }
 
-struct F64Serializer {
+pub(crate) struct F64Serializer {
     buf: ryu::Buffer,
     n: f64
 }
 
 impl F64Serializer {
-    fn new(n: f64) -> Self {
+    pub(crate) fn new(n: f64) -> Self {
         F64Serializer {
             buf: ryu::Buffer::new(),
             n: n
@@ -1051,7 +999,7 @@ impl F64Serializer {
         }
     }
 
-    fn to_str(&mut self) -> &str {
+    pub(crate) fn to_str(&mut self) -> &str {
         if self.n.is_finite() {
             self.buf.format_finite(self.n)
         }
@@ -1061,7 +1009,7 @@ impl F64Serializer {
     }
 }
 
-impl LineSender {
+impl Sender {
 
     fn send_key_id(&mut self, key_id: &str) -> Result<()> {
         write!(&mut self.conn, "{}\n", key_id)
@@ -1079,7 +1027,7 @@ impl LineSender {
                 io_err))?;
         if buf.last().map(|c| *c).unwrap_or(b'\0') != b'\n' {
             return Err(if buf.len() == 0 {
-                    fmt_err!(
+                    error::fmt!(
                         AuthError,
                         concat!(
                             "Did not receive auth challenge. ",
@@ -1087,7 +1035,7 @@ impl LineSender {
                             "authentication?"
                         ))
                 } else {
-                    fmt_err!(
+                    error::fmt!(
                         AuthError,
                         "Received incomplete auth challenge: {:?}",
                         buf)
@@ -1099,7 +1047,7 @@ impl LineSender {
 
     fn authenticate(&mut self, auth: &AuthParams) -> Result<()> {
         if auth.key_id.contains('\n') {
-            return Err(fmt_err!(
+            return Err(error::fmt!(
                 AuthError,
                 "Bad key id {:?}: Should not contain new-line char.",
                 auth.key_id));
@@ -1109,7 +1057,7 @@ impl LineSender {
         let challenge = self.read_challenge()?;
         let rng = ring::rand::SystemRandom::new();
         let signature = key_pair.sign(&rng, &challenge[..]).
-            map_err(|unspecified_err| fmt_err!(
+            map_err(|unspecified_err| error::fmt!(
                 AuthError,
                 "Failed to sign challenge: {}",
                 unspecified_err))?;
@@ -1126,9 +1074,9 @@ impl LineSender {
 
     /// Send accumulated lines to the QuestDB server, without clearing the
     /// buffer.
-    pub fn flush_and_keep(&mut self, buf: &LineSenderBuffer) -> Result<()> {
+    pub fn flush_and_keep(&mut self, buf: &Buffer) -> Result<()> {
         if !self.connected {
-            return Err(fmt_err!(
+            return Err(error::fmt!(
                 SocketError,
                 "Could not flush buffer: not connected to database."));
         }
@@ -1143,7 +1091,7 @@ impl LineSender {
         Ok(())
     }
 
-    pub fn flush(&mut self, buf: &mut LineSenderBuffer) -> Result<()> {
+    pub fn flush(&mut self, buf: &mut Buffer) -> Result<()> {
         self.flush_and_keep(buf)?;
         buf.clear();
         Ok(())
@@ -1154,12 +1102,4 @@ impl LineSender {
     }
 }
 
-mod gai;
 mod timestamp;
-
-#[allow(non_camel_case_types)]
-#[cfg(feature = "ffi")]
-pub mod ffi;
-
-#[cfg(test)]
-mod tests;

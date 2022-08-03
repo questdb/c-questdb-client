@@ -1,0 +1,36 @@
+[package]
+name = "questdb-rs"
+version = "0.0.1"
+edition = "2021"
+
+[lib]
+name = "questdb"
+crate-type = ["lib"]
+
+[dependencies]
+libc = "0.2"
+socket2 = "0.4.4"
+dns-lookup = "1.0.8"
+base64ct = { version = "1.5.1", features = ["alloc"] }
+ring = "0.16.20"
+rustls = "0.20.6"
+rustls-pemfile = "1.0.0"
+webpki-roots = "0.22.4"
+ryu = "1.0.10"
+itoa = "1.0.2"
+
+[target.'cfg(windows)'.dependencies]
+winapi = "0.3.9"
+
+[build-dependencies]
+serde_json = { version = "1.0.82" }
+serde = { version = "1.0.141", features = ["derive"] }
+slugify = "0.1.0"
+indoc = "1.0.7"
+
+[dev-dependencies]
+mio = { version = "0.8.4", features = ["os-poll", "net"] }
+
+[features]
+# Allow skipping verification of insecure certificates.
+insecure-skip-verify = ["rustls/dangerous_configuration"]
