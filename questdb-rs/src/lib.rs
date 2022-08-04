@@ -37,9 +37,9 @@
 //! 
 //! This crate is also exposed as a C and C++ API and in turn exposed to Python.
 //! 
-//! See this project's
-//! [GitHub page](https://github.com/questdb/c-questdb-client) for C and C++ and
-//! the related [Python bindings](https://github.com/questdb/py-questdb-client).
+//! * This project's [GitHub page](https://github.com/questdb/c-questdb-client)
+//!   for the C and C++ API.
+//! * [Python bindings](https://github.com/questdb/py-questdb-client).
 //! 
 //! # Community
 //! 

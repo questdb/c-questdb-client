@@ -9,6 +9,8 @@ macro_rules! fmt {
 }
 
 /// Category of error.
+/// 
+/// Accessible via Error's [`code`](Error::code) method.
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum ErrorCode {
     /// The host, port, or interface was incorrect.
@@ -21,6 +23,9 @@ pub enum ErrorCode {
     SocketError,
 
     /// The string or symbol field is not encoded in valid UTF-8.
+    /// 
+    /// *This error is reserved for the
+    /// [C and C++ API](https://github.com/questdb/c-questdb-client/).*
     InvalidUtf8,
 
     /// The table name or column name contains bad characters.
@@ -71,6 +76,7 @@ impl Display for Error {
 
 impl std::error::Error for Error {}
 
+/// A specialized `Result` type for the crate's [`Error`] type.
 pub type Result<T> = std::result::Result<T, Error>;
 
 pub(crate) use fmt;

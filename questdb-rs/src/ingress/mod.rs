@@ -106,8 +106,11 @@
 //! From the API, you can then point to a custom CA file:
 //! 
 //! ```rust
+//! use std::path::PathBuf;
+//! 
 //! let mut sender = SenderBuilder::new("localhost", 9009)
-//!     .tls(Tls::Enabled(CertificateAuthority::File("server_rootCA.pem")))
+//!     .tls(Tls::Enabled(CertificateAuthority::File(
+//!         PathBuf::from("/path/to/server_rootCA.pem"))))
 //!     .connect()?;
 //! ```
 //! 
@@ -133,6 +136,39 @@
 //! Symbols must always be written before rows. See the [`Buffer`] documentation
 //! for details. Each row must be terminated with a call to either
 //! [`at`](Buffer::at) or [`at_now`](Buffer::at_now).
+//! 
+//! # Troubleshooting Common Issues
+//! 
+//! ## Production-optimized QuestDB configuration
+//! 
+//! If you can’t initially see your data through a `select` SQL query straight
+//! away, this is normal: by default the database will only commit data it
+//! receives though the line protocol periodically to maximize throughput.
+//! 
+//! For dev/testing you may want to tune the following database configuration
+//! parameters as so in
+//! [`server.conf`](https://questdb.io/docs/reference/configuration/):
+//! 
+//! ```ini
+//! cairo.max.uncommitted.rows=1
+//! line.tcp.maintenance.job.interval=100
+//! ```
+//! 
+//! ## Infrequent Flushing
+//! 
+//! You may not see data appear in a timely manner because you’re not calling
+//! the [`flush`](Sender::flush) method often enough.
+//! 
+//! ## Debugging disconnects and inspecting errors
+//! 
+//! The ILP protocol does not send errors back to the client.
+//! Instead, on error, the QuestDB server will disconnect and any error messages
+//! will be present in the
+//! [server logs](https://questdb.io/docs/concept/root-directory-structure#log-directory).
+//! 
+//! If you want to inspect or log a buffer's contents before it is sent, you
+//! can call its [`as_str`](Buffer::as_str) method.
+//! 
 
 pub use self::timestamp::{TimestampNanos, TimestampMicros};
 
@@ -246,8 +282,13 @@ impl <'a> TableName<'a> {
         Ok(Self { name: name })
     }
 
-    #[doc(hidden)]
-    pub unsafe fn new_unchecked(name: &'a str) -> Self {
+    /// Construct an unvalidated table name.
+    /// 
+    /// This breaks API encapsulation and is only intended for use
+    /// when the the string was already previously validated.
+    /// 
+    /// Invalid table names will be rejected by the QuestDB server.
+    pub fn new_unchecked(name: &'a str) -> Self {
         Self { name: name }
     }
 }
@@ -309,8 +350,13 @@ impl <'a> ColumnName<'a> {
         Ok(Self { name: name })
     }
 
-    #[doc(hidden)]
-    pub unsafe fn new_unchecked(name: &'a str) -> Self {
+    /// Construct an unvalidated column name.
+    /// 
+    /// This breaks API encapsulation and is only intended for use
+    /// when the the string was already previously validated.
+    /// 
+    /// Invalid column names will be rejected by the QuestDB server.
+    pub fn new_unchecked(name: &'a str) -> Self {
         Self { name: name }
     }
 }
@@ -532,7 +578,7 @@ impl State {
 /// 
 /// To insert a NULL value, skip the symbol or column for that row.
 ///
-/// # Recovering from validation errors.
+/// # Recovering from validation errors
 /// 
 /// If you want to recover from potential validation errors, you can use the
 /// [`set_marker`](Buffer::set_marker) method to track a last known good state,
@@ -871,7 +917,7 @@ impl Buffer {
     /// ```rust
     /// use questdb::ingress::TimestampMicros;
     /// 
-    /// buf.column_ts("col_name", TimestampMicros::new(1659548204354448))?;
+    /// buf.column_ts("col_name", TimestampMicros::new(1659548204354448)?)?;
     /// ```
     /// 
     /// or
@@ -936,9 +982,9 @@ impl Buffer {
     /// ```
     /// 
     /// The QuestDB instance will set the timestamp once it receives the row.
-    /// If you're [`flushing`](Sender::flush) infrequently, the assigned
-    /// timestamp may drift significantly from when the data was recorded in
-    /// the buffer.
+    /// If you're [`flushing`](Sender::flush) infrequently, the timestamp
+    /// assigned by the server may drift significantly from when the data
+    /// was recorded in the buffer.
     pub fn at_now(&mut self) -> Result<()> {
         self.check_state(Op::At)?;
         self.output.push('\n');
@@ -974,10 +1020,16 @@ struct AuthParams {
     pub_key_y: String
 }
 
-/// How to validate the server's TLS certificate.
+/// Root used to determine how to validate the server's TLS certificate.
+/// 
+/// Used when configuring the [`tls`](SenderBuilder::tls) option.
 #[derive(Debug, Clone)]
 pub enum CertificateAuthority {
+    /// Use the root certificates provided by the
+    /// [`webpki-roots`](https://crates.io/crates/webpki-roots) crate.
     WebpkiRoots,
+
+    /// Use the root certificates provided by a PEM-encoded file.
     File(PathBuf)
 }
 
@@ -1024,7 +1076,7 @@ impl Tls {
 /// use std::convert::Into;
 /// 
 /// // Assuming the service name is registered.
-/// let service: Service = "questdb".into();
+/// let service: Service = "qdb_ilp".into();
 /// ```
 pub struct Service(String);
 
@@ -1143,6 +1195,20 @@ fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
     Ok(Some(Arc::new(config)))
 }
 
+/// Accumulate parameters for a new `Sender` instance.
+/// 
+/// ```rust
+/// use questdb::ingress::SenderBuilder;
+/// 
+/// let mut sender = SenderBuilder::new("localhost", 9009).connect()?;
+/// ```
+/// 
+/// Additional options for:
+///   * Binding a specific [outbound network address](SenderBuilder::net_interface).
+///   * Connection security
+///     ([authentication](SenderBuilder::auth), [encryption](SenderBuilder::tls)).
+///   * Authentication [timeouts](SenderBuilder::read_timeout).
+/// 
 #[derive(Debug, Clone)]
 pub struct SenderBuilder {
     read_timeout: Duration,
@@ -1155,6 +1221,12 @@ pub struct SenderBuilder {
 
 impl SenderBuilder {
     /// QuestDB server and port.
+    /// 
+    /// ```rust
+    /// use questdb::ingress::SenderBuilder;
+    /// 
+    /// let mut sender = SenderBuilder::new("localhost", 9009).connect()?;
+    /// ```
     pub fn new<H: Into<String>, P: Into<Service>>(host: H, port: P) -> Self {
         let service: Service = port.into();
         Self {
@@ -1168,17 +1240,47 @@ impl SenderBuilder {
     }
 
     /// Select local outbound interface.
+    /// 
+    /// This may be relevant if your machine has multiple network interfaces.
+    /// 
+    /// If unspecified, the default is to use any available interface and is
+    /// equivalent to calling:
+    /// 
+    /// ```rust
+    /// let mut sender = SenderBuilder::new("localhost", 9009)
+    ///     .net_interface("0.0.0.0")
+    ///     .connect()?;
+    /// ```
     pub fn net_interface<I: Into<String>>(mut self, addr: I) -> Self {
         self.net_interface = Some(addr.into());
         self
     }
 
     /// Authentication Parameters.
-    /// Takes:
-    ///   * Key id. AKA "kid"
-    ///   * Private key. AKA "d".
-    ///   * Public key X coordinate. AKA "x".
-    ///   * Public key Y coordinate. AKA "y".
+    /// 
+    /// If not called, authentication is disabled.
+    /// 
+    /// # Arguments
+    /// * `key_id` - Key identifier, AKA "kid" in JWT. This is sometimes
+    ///   referred to as the username.
+    /// * `priv_key` - Private key, AKA "d" in JWT.
+    /// * `pub_key_x` - X coordinate of the public key, AKA "x" in JWT.
+    /// * `pub_key_y` - Y coordinate of the public key, AKA "y" in JWT.
+    /// 
+    /// # Example
+    /// 
+    /// ```rust
+    /// let mut sender = SenderBuilder::new("localhost", 9009)
+    ///     .auth(
+    ///         "testUser1",                                    // kid
+    ///         "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48",  // d
+    ///         "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU",  // x
+    ///         "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac")  // y 
+    /// ```
+    /// 
+    /// Follow the QuestDB [authentication
+    /// documentation](https://questdb.io/docs/reference/api/ilp/authenticate)
+    /// for instructions on generating keys.
     pub fn auth<A, B, C, D>(
         mut self,
         key_id: A,
@@ -1201,6 +1303,40 @@ impl SenderBuilder {
     }
 
     /// Configure TLS handshake.
+    /// 
+    /// The default is [`Tls::Disabled`].
+    /// 
+    /// ```rust
+    /// let mut sender = SenderBuilder::new("localhost", 9009)
+    ///     .tls(Tls::Disabled)
+    ///     .connect()?;
+    /// ```
+    /// 
+    /// To enable with commonly accepted certificates, use:
+    /// 
+    /// ```rust
+    /// let mut sender = SenderBuilder::new("localhost", 9009)
+    ///     .tls(Tls::Enabled(CertificateAuthority::WebPkiRoots))
+    ///     .connect()?;
+    /// ```
+    /// 
+    /// To use [self-signed certificates](https://github.com/questdb/c-questdb-client/tree/main/tls_certs):
+    /// 
+    /// ```rust
+    /// let mut sender = SenderBuilder::new("localhost", 9009)
+    ///     .tls(Tls::Enabled(CertificateAuthority::File(
+    ///         PathBuf::from("/path/to/server_rootCA.pem"))))
+    ///     .connect()?;
+    /// ```
+    /// 
+    /// If you're still struggling you may temporarily enable the dangerous
+    /// `insecure-skip-verify` feature to skip the certificate verification:
+    /// 
+    /// ```rust
+    /// let mut sender = SenderBuilder::new("localhost", 9009)
+    ///    .tls(Tls::InsecureSkipVerify)
+    ///    .connect()?;
+    /// ```
     pub fn tls(mut self, tls: Tls) -> Self {
         self.tls = tls;
         self
@@ -1209,12 +1345,22 @@ impl SenderBuilder {
     /// Configure how long to wait for messages from the QuestDB server during
     /// the TLS handshake and authentication process.
     /// The default is 15 seconds.
+    /// 
+    /// ```rust
+    /// let mut sender = SenderBuilder::new("localhost", 9009)
+    ///    .read_timeout(Duration::from_secs(15))
+    ///    .connect()?;
+    /// ```
     pub fn read_timeout(mut self, value: Duration) -> Self {
         self.read_timeout = value;
         self
     }
 
     /// Connect synchronously.
+    /// 
+    /// Will return once the connection is fully established:
+    /// If the connection requires authentication or TLS, these will also be
+    /// completed before returning.
     pub fn connect(&self) -> Result<Sender> {
         let mut descr = format!(
             "Sender[host={:?},port={:?},", self.host, self.port);
@@ -1451,8 +1597,12 @@ impl Sender {
         Ok(())
     }
 
-    /// Send accumulated lines to the QuestDB server, without clearing the
+    /// Send buffer to the QuestDB server, without clearing the
     /// buffer.
+    /// 
+    /// This will block until the buffer is flushed to the network socket.
+    /// This does not guarantee that the buffer will be sent to the server
+    /// or that the server has received it.
     pub fn flush_and_keep(&mut self, buf: &Buffer) -> Result<()> {
         if !self.connected {
             return Err(error::fmt!(
@@ -1470,12 +1620,20 @@ impl Sender {
         Ok(())
     }
 
+    /// Send buffer to the QuestDB server, clearing the buffer.
+    /// 
+    /// This will block until the buffer is flushed to the network socket.
+    /// This does not guarantee that the buffer will be sent to the server
+    /// or that the server has received it.
     pub fn flush(&mut self, buf: &mut Buffer) -> Result<()> {
         self.flush_and_keep(buf)?;
         buf.clear();
         Ok(())
     }
 
+    /// The sender is no longer usable and must be dropped.
+    /// 
+    /// This is caused if there was an earlier failure.
     pub fn must_close(&self) -> bool {
         !self.connected
     }
