@@ -9,19 +9,27 @@ const TIMESTAMP_MAX: i64 = i64::MAX - 1;
 /// 
 /// # Examples
 /// 
-/// ```rust
+/// ```
+/// # use questdb::Result;
 /// use questdb::ingress::TimestampMicros;
 /// 
+/// # fn main() -> Result<()> {
 /// let ts = TimestampMicros::new(1659548204354448)?;
+/// # Ok(())
+/// # }
 /// ```
 /// 
 /// or
 /// 
-/// ```rust
+/// ```
+/// # use questdb::Result;
 /// use questdb::ingress::TimestampMicros;
 /// use std::convert::TryInto;
 /// 
+/// # fn main() -> Result<()> {
 /// let ts: TimestampMicros = std::time::SystemTime::now().try_into()?;
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Copy, Clone, Debug)]
 pub struct TimestampMicros(i64);
@@ -87,19 +95,27 @@ impl From<TimestampMicros> for SystemTime {
 /// 
 /// # Examples
 /// 
-/// ```rust
+/// ```
+/// # use questdb::Result;
 /// use questdb::ingress::TimestampNanos;
 /// 
+/// # fn main() -> Result<()> {
 /// let ts = TimestampNanos::new(1659548315647406592)?;
+/// # Ok(())
+/// # }
 /// ```
 /// 
 /// or
 /// 
-/// ```rust
+/// ```
+/// # use questdb::Result;
 /// use questdb::ingress::TimestampNanos;
 /// use std::convert::TryInto;
 /// 
+/// # fn main() -> Result<()> {
 /// let ts: TimestampNanos = std::time::SystemTime::now().try_into()?;
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Copy, Clone, Debug)]
 pub struct TimestampNanos(i64);

@@ -462,16 +462,6 @@ pub unsafe extern "C" fn line_sender_opts_new_service(
     Box::into_raw(Box::new(line_sender_opts(builder)))
 }
 
-/// Set the initial buffer capacity (byte count).
-/// The default is 65536.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_capacity(
-    opts: *mut line_sender_opts,
-    capacity: size_t)
-{
-    upd_opts!(opts, capacity, capacity);
-}
-
 /// Select local outbound interface.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_opts_net_interface(

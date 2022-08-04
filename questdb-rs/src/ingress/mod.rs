@@ -33,11 +33,12 @@
 //!   * Populate a [`Buffer`] with one or more rows of data.
 //!   * Send the buffer via the Sender's [`flush`](Sender::flush) method.
 //! 
-//! ```rust
+//! ```no_run
 //! use questdb::{
 //!     Result,
 //!     ingress::{
 //!         Sender,
+//!         Buffer,
 //!         SenderBuilder}};
 //! 
 //! fn main() -> Result<()> {
@@ -81,9 +82,11 @@
 //! 
 //! Here's an example that uses full security:
 //! 
-//! ```rust
-//! use questdb::ingress::{Tls, CertificateAuthority};
+//! ```no_run
+//! # use questdb::Result;
+//! use questdb::ingress::{SenderBuilder, Tls, CertificateAuthority};
 //! 
+//! # fn main() -> Result<()> {
 //! // See: https://questdb.io/docs/reference/api/ilp/authenticate
 //! let mut sender = SenderBuilder::new("localhost", 9009)
 //!     .auth(
@@ -93,6 +96,8 @@
 //!         "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac")  // y
 //!     .tls(Tls::Enabled(CertificateAuthority::WebpkiRoots))
 //!     .connect()?;
+//! # Ok(())
+//! # }
 //! ```
 //! 
 //! Note that as of writing QuestDB does not natively support TLS encryption.
@@ -105,30 +110,39 @@
 //! 
 //! From the API, you can then point to a custom CA file:
 //! 
-//! ```rust
+//! ```no_run
+//! # use questdb::Result;
 //! use std::path::PathBuf;
+//! use questdb::ingress::{SenderBuilder, Tls, CertificateAuthority};
 //! 
+//! # fn main() -> Result<()> {
 //! let mut sender = SenderBuilder::new("localhost", 9009)
 //!     .tls(Tls::Enabled(CertificateAuthority::File(
 //!         PathBuf::from("/path/to/server_rootCA.pem"))))
 //!     .connect()?;
+//! # Ok(())
+//! # }
 //! ```
 //! 
 //! # Avoiding revalidating names
 //! To avoid re-validating table and column names, consider re-using them across
 //! rows.
 //! 
-//! ```rust
+//! ```
+//! # use questdb::Result;
 //! use questdb::ingress::{
 //!     TableName,
 //!     ColumnName,
 //!     Buffer};
 //! 
+//! # fn main() -> Result<()> {
 //! let mut buffer = Buffer::new();
-//! let tide_name = TableName::new("tide");
-//! let water_level_name = ColumnName::new("water_level");
+//! let tide_name = TableName::new("tide")?;
+//! let water_level_name = ColumnName::new("water_level")?;
 //! buffer.table(tide_name)?.column_f64(water_level_name, 20.4)?.at_now()?;
 //! buffer.table(tide_name)?.column_f64(water_level_name, 17.2)?.at_now()?;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! # Buffer API sequential coupling
@@ -220,6 +234,7 @@ fn map_io_to_socket_err(prefix: &str, io_err: io::Error) -> Error {
 /// 
 /// You can use it to construct it explicitly to avoid re-validating the same
 /// names over and over.
+#[derive(Clone, Copy)]
 pub struct TableName<'a> {
     name: &'a str
 }
@@ -299,6 +314,7 @@ impl <'a> TableName<'a> {
 /// 
 /// You can use it to construct it explicitly to avoid re-validating the same
 /// names over and over.
+#[derive(Clone, Copy)]
 pub struct ColumnName<'a> {
     name: &'a str
 }
@@ -512,9 +528,12 @@ impl State {
 /// 
 /// # Example
 /// 
-/// ```rust
+/// ```
+/// # use questdb::Result;
 /// use questdb::ingress::Buffer;
+/// use std::time::SystemTime;
 /// 
+/// # fn main() -> Result<()> {
 /// let mut buffer = Buffer::new();
 /// 
 /// // first row
@@ -525,14 +544,16 @@ impl State {
 ///     .column_i64("b", 42)?
 ///     .column_f64("c", 3.14)?
 ///     .column_str("d", "hello")?
-///     .column_ts("e", std::time::SystemTime::now())?
-///     .at(std::time::SystemTime::now())?;
+///     .column_ts("e", SystemTime::now())?
+///     .at(SystemTime::now())?;
 /// 
 /// // second row
 /// buffer
 ///     .table("table2")?
 ///     .symbol("foo", "bar")?
 ///     .at_now()?;
+/// # Ok(())
+/// # }
 /// ```
 /// 
 /// The buffer can then be sent with the Sender's [`flush`](Sender::flush)
@@ -724,15 +745,29 @@ impl Buffer {
 
     /// Begin recording a row for a given table.
     /// 
-    /// ```rust
-    /// buf.table("table_name")?;
+    /// ```
+    /// # use questdb::Result;
+    /// # use questdb::ingress::Buffer;
+    /// # fn main() -> Result<()> {
+    /// # let mut buffer = Buffer::new();
+    /// buffer.table("table_name")?;
+    /// # Ok(())
+    /// # }
     /// ```
     /// 
     /// or
     /// 
-    /// ```rust
-    /// let table_name = TableName::new("table_name");
-    /// buf.table(table_name)?;
+    /// ```
+    /// # use questdb::Result;
+    /// # use questdb::ingress::Buffer;
+    /// use questdb::ingress::TableName;
+    /// 
+    /// # fn main() -> Result<()> {
+    /// # let mut buffer = Buffer::new();
+    /// let table_name = TableName::new("table_name")?;
+    /// buffer.table(table_name)?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn table<'a, N>(&mut self, name: N) -> Result<&mut Self>
         where
@@ -749,22 +784,45 @@ impl Buffer {
 
     /// Record a symbol for a given column.
     /// 
-    /// ```rust
-    /// buf.symbol("col_name", "value")?;
+    /// ```
+    /// # use questdb::Result;
+    /// # use questdb::ingress::Buffer;
+    /// # fn main() -> Result<()> {
+    /// # let mut buffer = Buffer::new();
+    /// # buffer.table("x")?;
+    /// buffer.symbol("col_name", "value")?;
+    /// # Ok(())
+    /// # }
     /// ```
     /// 
     /// or
     /// 
-    /// ```rust
+    /// ```
+    /// # use questdb::Result;
+    /// # use questdb::ingress::Buffer;
+    /// # fn main() -> Result<()> {
+    /// # let mut buffer = Buffer::new();
+    /// # buffer.table("x")?;
     /// let value: String = "value".to_owned();
-    /// buf.symbol("col_name", value)?;
+    /// buffer.symbol("col_name", value)?;
+    /// # Ok(())
+    /// # }
     /// ```
     /// 
     /// or
     /// 
-    /// ```rust
-    /// let col_name = ColumnName::new("col_name");
-    /// buf.symbol(col_name, "value")?;
+    /// ```
+    /// # use questdb::Result;
+    /// # use questdb::ingress::Buffer;
+    /// use questdb::ingress::ColumnName;
+    /// 
+    /// # fn main() -> Result<()> {
+    /// # let mut buffer = Buffer::new();
+    /// # buffer.table("x")?;
+    /// let col_name = ColumnName::new("col_name")?;
+    /// buffer.symbol(col_name, "value")?;
+    /// # Ok(())
+    /// # }
     /// ```
     /// 
     pub fn symbol<'a, N, S>(&mut self, name: N, value: S) -> Result<&mut Self>
@@ -806,15 +864,31 @@ impl Buffer {
 
     /// Record a boolean value for a column.
     /// 
-    /// ```rust
-    /// buf.column_bool("col_name", true)?;
+    /// ```
+    /// # use questdb::Result;
+    /// # use questdb::ingress::Buffer;
+    /// # fn main() -> Result<()> {
+    /// # let mut buffer = Buffer::new();
+    /// # buffer.table("x")?;
+    /// buffer.column_bool("col_name", true)?;
+    /// # Ok(())
+    /// # }
     /// ```
     /// 
     /// or
     /// 
-    /// ```rust
-    /// let col_name = ColumnName::new("col_name");
-    /// buf.column_bool(col_name, true)?;
+    /// ```
+    /// # use questdb::Result;
+    /// # use questdb::ingress::Buffer;
+    /// use questdb::ingress::ColumnName;
+    /// 
+    /// # fn main() -> Result<()> {
+    /// # let mut buffer = Buffer::new();
+    /// # buffer.table("x")?;
+    /// let col_name = ColumnName::new("col_name")?;
+    /// buffer.column_bool(col_name, true)?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn column_bool<'a, N>(
         &mut self, name: N, value: bool) -> Result<&mut Self>
@@ -829,15 +903,31 @@ impl Buffer {
 
     /// Record an integer value for a column.
     /// 
-    /// ```rust
-    /// buf.column_i64("col_name", 42)
+    /// ```
+    /// # use questdb::Result;
+    /// # use questdb::ingress::Buffer;
+    /// # fn main() -> Result<()> {
+    /// # let mut buffer = Buffer::new();
+    /// # buffer.table("x")?;
+    /// buffer.column_i64("col_name", 42)?;
+    /// # Ok(())
+    /// # }
     /// ```
     /// 
     /// or
     /// 
-    /// ```rust
-    /// let col_name = ColumnName::new("col_name");
-    /// buf.column_i64(col_name, 42);
+    /// ```
+    /// # use questdb::Result;
+    /// # use questdb::ingress::Buffer;
+    /// use questdb::ingress::ColumnName;
+    /// 
+    /// # fn main() -> Result<()> {
+    /// # let mut buffer = Buffer::new();
+    /// # buffer.table("x")?;
+    /// let col_name = ColumnName::new("col_name")?;
+    /// buffer.column_i64(col_name, 42);
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn column_i64<'a, N>(
         &mut self, name: N, value: i64) -> Result<&mut Self>
@@ -855,15 +945,31 @@ impl Buffer {
 
     /// Record a floating point value for a column.
     /// 
-    /// ```rust
-    /// buf.column_f64("col_name", 3.14)?;
+    /// ```
+    /// # use questdb::Result;
+    /// # use questdb::ingress::Buffer;
+    /// # fn main() -> Result<()> {
+    /// # let mut buffer = Buffer::new();
+    /// # buffer.table("x")?;
+    /// buffer.column_f64("col_name", 3.14)?;
+    /// # Ok(())
+    /// # }
     /// ```
     /// 
     /// or
     /// 
-    /// ```rust
-    /// let col_name = ColumnName::new("col_name");
-    /// buf.column_f64(col_name, 3.14)?;
+    /// ```
+    /// # use questdb::Result;
+    /// # use questdb::ingress::Buffer;
+    /// use questdb::ingress::ColumnName;
+    /// 
+    /// # fn main() -> Result<()> {
+    /// # let mut buffer = Buffer::new();
+    /// # buffer.table("x")?;
+    /// let col_name = ColumnName::new("col_name")?;
+    /// buffer.column_f64(col_name, 3.14)?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn column_f64<'a, N>(
         &mut self, name: N, value: f64) -> Result<&mut Self>
@@ -877,22 +983,47 @@ impl Buffer {
         Ok(self)
     }
 
-    /// ```rust
-    /// buf.column_str("col_name", "value")?;
+    /// Record a string value for a column.
+    ///
+    /// ```
+    /// # use questdb::Result;
+    /// # use questdb::ingress::Buffer;
+    /// # fn main() -> Result<()> {
+    /// # let mut buffer = Buffer::new();
+    /// # buffer.table("x")?;
+    /// buffer.column_str("col_name", "value")?;
+    /// # Ok(())
+    /// # }
     /// ```
     /// 
     /// or
     /// 
-    /// ```rust
+    /// ```
+    /// # use questdb::Result;
+    /// # use questdb::ingress::Buffer;
+    /// # fn main() -> Result<()> {
+    /// # let mut buffer = Buffer::new();
+    /// # buffer.table("x")?;
     /// let value: String = "value".to_owned();
-    /// buf.column_str("col_name", value)?;
+    /// buffer.column_str("col_name", value)?;
+    /// # Ok(())
+    /// # }
     /// ```
     /// 
     /// or
     /// 
-    /// ```rust
-    /// let col_name = ColumnName::new("col_name");
-    /// buf.column_str(col_name, "value")?;
+    /// ```
+    /// # use questdb::Result;
+    /// # use questdb::ingress::Buffer;
+    /// use questdb::ingress::ColumnName;
+    /// 
+    /// # fn main() -> Result<()> {
+    /// # let mut buffer = Buffer::new();
+    /// # buffer.table("x")?;
+    /// let col_name = ColumnName::new("col_name")?;
+    /// buffer.column_str(col_name, "value")?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn column_str<'a, N, S>(
         &mut self, name: N, value: S) -> Result<&mut Self>
@@ -908,23 +1039,46 @@ impl Buffer {
 
     /// Record a timestamp for a column.
     /// 
-    /// ```rust
-    /// buf.column_ts("col_name", std::time::SystemTime::now())?;
+    /// ```
+    /// # use questdb::Result;
+    /// # use questdb::ingress::Buffer;
+    /// # fn main() -> Result<()> {
+    /// # let mut buffer = Buffer::new();
+    /// # buffer.table("x")?;
+    /// buffer.column_ts("col_name", std::time::SystemTime::now())?;
+    /// # Ok(())
+    /// # }
     /// ```
     /// 
     /// or
     /// 
-    /// ```rust
+    /// ```
+    /// # use questdb::Result;
+    /// # use questdb::ingress::Buffer;
     /// use questdb::ingress::TimestampMicros;
     /// 
-    /// buf.column_ts("col_name", TimestampMicros::new(1659548204354448)?)?;
+    /// # fn main() -> Result<()> {
+    /// # let mut buffer = Buffer::new();
+    /// # buffer.table("x")?;
+    /// buffer.column_ts("col_name", TimestampMicros::new(1659548204354448)?)?;
+    /// # Ok(())
+    /// # }
     /// ```
     /// 
     /// or
     /// 
-    /// ```rust
-    /// let col_name = ColumnName::new("col_name");
-    /// buf.column_ts(col_name, std::time::SystemTime::now())?;
+    /// ```
+    /// # use questdb::Result;
+    /// # use questdb::ingress::Buffer;
+    /// use questdb::ingress::ColumnName;
+    /// 
+    /// # fn main() -> Result<()> {
+    /// # let mut buffer = Buffer::new();
+    /// # buffer.table("x")?;
+    /// let col_name = ColumnName::new("col_name")?;
+    /// buffer.column_ts(col_name, std::time::SystemTime::now())?;
+    /// # Ok(())
+    /// # }
     /// ```
     /// 
     /// The timestamp should be in UTC.
@@ -947,14 +1101,30 @@ impl Buffer {
 
     /// Terminate the row with a specified timestamp.
     /// 
-    /// ```rust
-    /// buf.at(std::time::SystemTime::now())?;
+    /// ```
+    /// # use questdb::Result;
+    /// # use questdb::ingress::Buffer;
+    /// # fn main() -> Result<()> {
+    /// # let mut buffer = Buffer::new();
+    /// # buffer.table("x")?.symbol("a", "b")?;
+    /// buffer.at(std::time::SystemTime::now())?;
+    /// # Ok(())
+    /// # }
     /// ```
     /// 
     /// or
     /// 
-    /// ```rust
-    /// buf.at(TimestampNanos::new(1659548315647406592))?;
+    /// ```
+    /// # use questdb::Result;
+    /// # use questdb::ingress::Buffer;
+    /// use questdb::ingress::TimestampNanos;
+    /// 
+    /// # fn main() -> Result<()> {
+    /// # let mut buffer = Buffer::new();
+    /// # buffer.table("x")?.symbol("a", "b")?;
+    /// buffer.at(TimestampNanos::new(1659548315647406592)?)?;
+    /// # Ok(())
+    /// # }
     /// ```
     /// 
     /// The timestamp should be in UTC.
@@ -977,8 +1147,15 @@ impl Buffer {
 
     /// Terminate the row with a server-specified timestamp.
     /// 
-    /// ```rust
-    /// buf.at_now()?;
+    /// ```
+    /// # use questdb::Result;
+    /// # use questdb::ingress::Buffer;
+    /// # fn main() -> Result<()> {
+    /// # let mut buffer = Buffer::new();
+    /// # buffer.table("x")?.symbol("a", "b")?;
+    /// buffer.at_now()?;
+    /// # Ok(())
+    /// # }
     /// ```
     /// 
     /// The QuestDB instance will set the timestamp once it receives the row.
@@ -1064,7 +1241,8 @@ impl Tls {
 /// A `u16` port number or `String` port service name as is registered with
 /// `/etc/services` or equivalent.
 /// 
-/// ```rust
+/// ```
+/// use questdb::ingress::Service;
 /// use std::convert::Into;
 /// 
 /// let service: Service = 9009.into();
@@ -1072,11 +1250,12 @@ impl Tls {
 /// 
 /// or
 /// 
-/// ```rust
+/// ```
+/// use questdb::ingress::Service;
 /// use std::convert::Into;
 /// 
 /// // Assuming the service name is registered.
-/// let service: Service = "qdb_ilp".into();
+/// let service: Service = "qdb_ilp".into();  // or with a String too.
 /// ```
 pub struct Service(String);
 
@@ -1197,10 +1376,14 @@ fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
 
 /// Accumulate parameters for a new `Sender` instance.
 /// 
-/// ```rust
+/// ```no_run
+/// # use questdb::Result;
 /// use questdb::ingress::SenderBuilder;
 /// 
+/// # fn main() -> Result<()> {
 /// let mut sender = SenderBuilder::new("localhost", 9009).connect()?;
+/// # Ok(())
+/// # }
 /// ```
 /// 
 /// Additional options for:
@@ -1222,10 +1405,14 @@ pub struct SenderBuilder {
 impl SenderBuilder {
     /// QuestDB server and port.
     /// 
-    /// ```rust
+    /// ```no_run
+    /// # use questdb::Result;
     /// use questdb::ingress::SenderBuilder;
     /// 
+    /// # fn main() -> Result<()> {
     /// let mut sender = SenderBuilder::new("localhost", 9009).connect()?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn new<H: Into<String>, P: Into<Service>>(host: H, port: P) -> Self {
         let service: Service = port.into();
@@ -1246,10 +1433,15 @@ impl SenderBuilder {
     /// If unspecified, the default is to use any available interface and is
     /// equivalent to calling:
     /// 
-    /// ```rust
+    /// ```no_run
+    /// # use questdb::Result;
+    /// # use questdb::ingress::SenderBuilder;
+    /// # fn main() -> Result<()> {
     /// let mut sender = SenderBuilder::new("localhost", 9009)
     ///     .net_interface("0.0.0.0")
     ///     .connect()?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn net_interface<I: Into<String>>(mut self, addr: I) -> Self {
         self.net_interface = Some(addr.into());
@@ -1269,13 +1461,19 @@ impl SenderBuilder {
     /// 
     /// # Example
     /// 
-    /// ```rust
+    /// ```no_run
+    /// # use questdb::Result;
+    /// # use questdb::ingress::SenderBuilder;
+    /// # fn main() -> Result<()> {
     /// let mut sender = SenderBuilder::new("localhost", 9009)
     ///     .auth(
     ///         "testUser1",                                    // kid
     ///         "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48",  // d
     ///         "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU",  // x
     ///         "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac")  // y 
+    ///     .connect()?;
+    /// # Ok(())
+    /// # }
     /// ```
     /// 
     /// Follow the QuestDB [authentication
@@ -1306,33 +1504,56 @@ impl SenderBuilder {
     /// 
     /// The default is [`Tls::Disabled`].
     /// 
-    /// ```rust
+    /// ```no_run
+    /// # use questdb::Result;
+    /// # use questdb::ingress::SenderBuilder;
+    /// # use questdb::ingress::Tls;
+    /// # fn main() -> Result<()> {
     /// let mut sender = SenderBuilder::new("localhost", 9009)
     ///     .tls(Tls::Disabled)
     ///     .connect()?;
+    /// # Ok(())
+    /// # }
     /// ```
     /// 
     /// To enable with commonly accepted certificates, use:
     /// 
-    /// ```rust
+    /// ```no_run
+    /// # use questdb::Result;
+    /// # use questdb::ingress::SenderBuilder;
+    /// # use questdb::ingress::Tls;
+    /// use questdb::ingress::CertificateAuthority;
+    /// 
+    /// # fn main() -> Result<()> {
     /// let mut sender = SenderBuilder::new("localhost", 9009)
-    ///     .tls(Tls::Enabled(CertificateAuthority::WebPkiRoots))
+    ///     .tls(Tls::Enabled(CertificateAuthority::WebpkiRoots))
     ///     .connect()?;
+    /// # Ok(())
+    /// # }
     /// ```
     /// 
     /// To use [self-signed certificates](https://github.com/questdb/c-questdb-client/tree/main/tls_certs):
     /// 
-    /// ```rust
+    /// ```no_run
+    /// # use questdb::Result;
+    /// # use questdb::ingress::SenderBuilder;
+    /// # use questdb::ingress::Tls;
+    /// use questdb::ingress::CertificateAuthority;
+    /// use std::path::PathBuf;
+    /// 
+    /// # fn main() -> Result<()> {
     /// let mut sender = SenderBuilder::new("localhost", 9009)
     ///     .tls(Tls::Enabled(CertificateAuthority::File(
     ///         PathBuf::from("/path/to/server_rootCA.pem"))))
     ///     .connect()?;
+    /// # Ok(())
+    /// # }
     /// ```
     /// 
     /// If you're still struggling you may temporarily enable the dangerous
     /// `insecure-skip-verify` feature to skip the certificate verification:
     /// 
-    /// ```rust
+    /// ```ignore
     /// let mut sender = SenderBuilder::new("localhost", 9009)
     ///    .tls(Tls::InsecureSkipVerify)
     ///    .connect()?;
@@ -1346,10 +1567,17 @@ impl SenderBuilder {
     /// the TLS handshake and authentication process.
     /// The default is 15 seconds.
     /// 
-    /// ```rust
+    /// ```no_run
+    /// # use questdb::Result;
+    /// # use questdb::ingress::SenderBuilder;
+    /// use std::time::Duration;
+    /// 
+    /// # fn main() -> Result<()> {
     /// let mut sender = SenderBuilder::new("localhost", 9009)
     ///    .read_timeout(Duration::from_secs(15))
     ///    .connect()?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn read_timeout(mut self, value: Duration) -> Self {
         self.read_timeout = value;
