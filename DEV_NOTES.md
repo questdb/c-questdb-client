@@ -6,13 +6,13 @@ The library shares some test cases with other ILP clients.
 These tests were added as so:
 
 ```
-git subtree add --prefix src/tests/interop https://github.com/questdb/questdb-client-test.git main --squash
+git subtree add --prefix questdb-rs/src/tests/interop https://github.com/questdb/questdb-client-test.git main --squash
 ```
 
 These should be updated with:
 
 ```
-git subtree pull --prefix src/tests/interop https://github.com/questdb/questdb-client-test.git main --squash
+git subtree pull --prefix questdb-rs/src/tests/interop https://github.com/questdb/questdb-client-test.git main --squash
 ```
 
 ## CMake Integration

@@ -75,7 +75,6 @@ pub mod json_tests {
     fn parse() -> Vec<TestSpec> {
         let mut json_path = PathBuf::from(
             std::env::var("CARGO_MANIFEST_DIR").unwrap());
-        json_path.pop();
         json_path.push("src");
         json_path.push("tests");
         json_path.push("interop");
