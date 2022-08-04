@@ -25,8 +25,7 @@ option(
 # Imports `questdb_client` target.
 add_subdirectory(corrosion)
 corrosion_import_crate(
-    MANIFEST_PATH Cargo.toml
-    FEATURES ffi
+    MANIFEST_PATH questdb-rs-ffi/Cargo.toml
     LINK_AS C)
 target_include_directories(
     questdb_client INTERFACE
@@ -100,8 +99,8 @@ compile_example(
 # Include Rust tests as part of the tests run
 add_test(
     NAME rust_tests
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    COMMAND cargo test --features insecure_skip_verify -- --nocapture)
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/questdb-rs
+    COMMAND cargo test --features insecure-skip-verify -- --nocapture)
 
 # Unit test binaries.
 function(compile_test TARGET_NAME)

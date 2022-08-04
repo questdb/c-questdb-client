@@ -21,6 +21,8 @@
  *  limitations under the License.
  *
  ******************************************************************************/
+ 
+#![allow(non_camel_case_types)]
 
 use std::ascii;
 use std::boxed::Box;
@@ -31,18 +33,19 @@ use std::str;
 use libc::{c_char, size_t};
 use std::ptr;
 
-use super::{
+use questdb::{
     Error,
     ErrorCode,
-    TableName,
-    ColumnName,
-    LineSender,
-    LineSenderBuffer,
-    LineSenderBuilder,
-    Tls,
-    CertificateAuthority,
-    TimestampMicros,
-    TimestampNanos};
+    ingress::{
+        TableName,
+        ColumnName,
+        Sender,
+        Buffer,
+        SenderBuilder,
+        Tls,
+        CertificateAuthority,
+        TimestampMicros,
+        TimestampNanos}};
 
 macro_rules! bubble_err_to_c {
     ($err_out:expr, $expression:expr) => {
@@ -142,7 +145,7 @@ pub unsafe extern "C" fn line_sender_error_msg(
     error: *const line_sender_error,
     len_out: *mut size_t) -> *const c_char
 {
-    let msg: &str = &(&*error).0.msg;
+    let msg: &str = &(&*error).0.msg();
     *len_out = msg.len();
     msg.as_ptr() as *mut c_char
 }
@@ -209,9 +212,7 @@ unsafe fn set_err_out(
     code: ErrorCode,
     msg: String)
 {
-    let err = line_sender_error(Error{
-        code: code,
-        msg: msg});
+    let err = line_sender_error(Error::new(code, msg));
     let err_ptr = Box::into_raw(Box::new(err));
     *err_out = err_ptr;
 }
@@ -313,10 +314,10 @@ pub struct line_sender_table_name
 }
 
 impl line_sender_table_name {
-    fn as_name<'a>(&self) -> TableName<'a> {
-        let str_name = unsafe { std::str::from_utf8_unchecked(
-            slice::from_raw_parts(self.buf as *const u8, self.len)) };
-        TableName{ name: str_name }
+    unsafe fn as_name<'a>(&self) -> TableName<'a> {
+        let str_name = std::str::from_utf8_unchecked(
+            slice::from_raw_parts(self.buf as *const u8, self.len));
+        TableName::new_unchecked(str_name)
     }
 }
 
@@ -333,10 +334,10 @@ pub struct line_sender_column_name
 }
 
 impl line_sender_column_name {
-    fn as_name<'a>(&self) -> ColumnName<'a> {
-        let str_name = unsafe { std::str::from_utf8_unchecked(
-            slice::from_raw_parts(self.buf as *const u8, self.len)) };
-        ColumnName{ name: str_name }
+    unsafe fn as_name<'a>(&self) -> ColumnName<'a> {
+        let str_name = std::str::from_utf8_unchecked(
+            slice::from_raw_parts(self.buf as *const u8, self.len));
+        ColumnName::new_unchecked(str_name)
     }
 }
 
@@ -435,7 +436,7 @@ pub unsafe extern "C" fn line_sender_column_name_assert(
 }
 
 /// Accumulates parameters for creating a line sender connection.
-pub struct line_sender_opts(LineSenderBuilder);
+pub struct line_sender_opts(SenderBuilder);
 
 /// A new set of options for a line sender connection.
 /// @param[in] host The QuestDB database host.
@@ -445,7 +446,7 @@ pub unsafe extern "C" fn line_sender_opts_new(
     host: line_sender_utf8,
     port: u16) -> *mut line_sender_opts
 {
-    let builder = LineSenderBuilder::new(host.as_str(), port);
+    let builder = SenderBuilder::new(host.as_str(), port);
     Box::into_raw(Box::new(line_sender_opts(builder)))
 }
 
@@ -457,18 +458,8 @@ pub unsafe extern "C" fn line_sender_opts_new_service(
     host: line_sender_utf8,
     port: line_sender_utf8) -> *mut line_sender_opts
 {
-    let builder = LineSenderBuilder::new(host.as_str(), port.as_str());
+    let builder = SenderBuilder::new(host.as_str(), port.as_str());
     Box::into_raw(Box::new(line_sender_opts(builder)))
-}
-
-/// Set the initial buffer capacity (byte count).
-/// The default is 65536.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_capacity(
-    opts: *mut line_sender_opts,
-    capacity: size_t)
-{
-    upd_opts!(opts, capacity, capacity);
 }
 
 /// Select local outbound interface.
@@ -569,13 +560,13 @@ pub unsafe extern "C" fn line_sender_opts_free(
 
 /// Prepare rows for sending via the line sender's `flush` function.
 /// Buffer objects are re-usable and cleared automatically when flushing.
-pub struct line_sender_buffer(LineSenderBuffer);
+pub struct line_sender_buffer(Buffer);
 
 /// Create a buffer for serializing ILP messages.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_buffer_new() -> *mut line_sender_buffer
 {
-    let buffer = LineSenderBuffer::new();
+    let buffer = Buffer::new();
     Box::into_raw(Box::new(line_sender_buffer(buffer)))
 }
 
@@ -584,7 +575,7 @@ pub unsafe extern "C" fn line_sender_buffer_new() -> *mut line_sender_buffer
 pub unsafe extern "C" fn line_sender_buffer_with_max_name_len(
     max_name_len: size_t) -> *mut line_sender_buffer
 {
-    let buffer = LineSenderBuffer::with_max_name_len(max_name_len);
+    let buffer = Buffer::with_max_name_len(max_name_len);
     Box::into_raw(Box::new(line_sender_buffer(buffer)))
 }
 
@@ -599,13 +590,13 @@ pub unsafe extern "C" fn line_sender_buffer_free(
 }
 
 unsafe fn unwrap_buffer<'a>(
-    buffer: *const line_sender_buffer) -> &'a LineSenderBuffer
+    buffer: *const line_sender_buffer) -> &'a Buffer
 {
     &(&*buffer).0
 }
 
 unsafe fn unwrap_buffer_mut<'a>(
-    buffer: *mut line_sender_buffer) -> &'a mut LineSenderBuffer
+    buffer: *mut line_sender_buffer) -> &'a mut Buffer
 {
     &mut (&mut *buffer).0
 }
@@ -886,7 +877,7 @@ pub unsafe extern "C" fn line_sender_buffer_at_now(
 /// Insert data into QuestDB via the InfluxDB Line Protocol.
 ///
 /// Batch up rows in `buffer` objects, then call `flush` to send them.
-pub struct line_sender(LineSender);
+pub struct line_sender(Sender);
 
 /// Synchronously connect to the QuestDB database.
 /// The connection should be accessed by only a single thread a time.
@@ -901,12 +892,12 @@ pub unsafe extern "C" fn line_sender_connect(
     Box::into_raw(Box::new(line_sender(sender)))
 }
 
-unsafe fn unwrap_sender<'a>(sender: *const line_sender) -> &'a LineSender {
+unsafe fn unwrap_sender<'a>(sender: *const line_sender) -> &'a Sender {
     &(&*sender).0
 }
 
 unsafe fn unwrap_sender_mut<'a>(
-    sender: *mut line_sender) -> &'a mut LineSender
+    sender: *mut line_sender) -> &'a mut Sender
 {
     &mut (&mut *sender).0
 }

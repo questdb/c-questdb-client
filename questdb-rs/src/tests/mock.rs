@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-use crate::LineSenderBuilder;
+use crate::ingress::SenderBuilder;
 
 use std::path::Path;
 use core::time::Duration;
@@ -90,6 +90,7 @@ fn load_private_key(filename: &Path) -> rustls::PrivateKey {
 
 pub fn certs_dir() -> std::path::PathBuf {
     let mut certs_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    certs_dir.pop();
     certs_dir.push("tls_certs");
     certs_dir
 }
@@ -244,7 +245,7 @@ impl MockServer {
         self.recv(0.1)
     }
 
-    pub fn lsb(&self) -> LineSenderBuilder {
-        LineSenderBuilder::new(self.host, self.port)
+    pub fn lsb(&self) -> SenderBuilder {
+        SenderBuilder::new(self.host, self.port)
     }
 }

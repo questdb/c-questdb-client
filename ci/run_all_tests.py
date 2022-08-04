@@ -22,10 +22,10 @@ import platform
 import subprocess
 
 
-def run_cmd(*args):
+def run_cmd(*args, cwd=None):
     sys.stderr.write(f'About to run: {args!r}:\n')
     try:
-        subprocess.check_call(args)
+        subprocess.check_call(args, cwd=cwd)
         sys.stderr.write(f'Success running: {args!r}.\n')
     except subprocess.CalledProcessError as cpe:
         sys.stderr.write(f'Command {args!r} failed with return code {cpe.returncode}.\n')
@@ -38,11 +38,12 @@ def main():
     test_line_sender_path = next(iter(
         build_dir.glob(f'**/test_line_sender{exe_suffix}')))
     system_test_path = pathlib.Path('system_test') / 'test.py'
-    qdb_v = '6.4.2'  # The version of QuestDB we'll test against.
+    qdb_v = '6.4.3'  # The version of QuestDB we'll test against.
 
     run_cmd('cargo', 'test',
-        '--features', 'insecure_skip_verify',
-        '--', '--nocapture')
+        '--features', 'insecure-skip-verify',
+        '--', '--nocapture',
+        cwd='questdb-rs')
     run_cmd(str(test_line_sender_path))
     run_cmd('python3', str(system_test_path), 'run', '--versions', qdb_v, '-v')
 

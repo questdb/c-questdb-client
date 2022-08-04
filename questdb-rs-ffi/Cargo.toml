@@ -1,0 +1,24 @@
+[package]
+name = "questdb-rs-ffi"
+version = "0.0.1"
+edition = "2021"
+
+[lib]
+name = "questdb_client"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+questdb-rs = { path = "../questdb-rs", features = ["insecure-skip-verify"] }
+libc = "0.2"
+
+[build-dependencies]
+cbindgen = { version = "0.24.2", optional = true, default-features = false }
+
+[features]
+
+# Auto-generate the header. This is for dev-debugging-diffing only.
+# A hand-crafted header is easier on the eyes.
+gen_h = ["cbindgen"]
+
+# Auto-generate a Cython .pxd file.
+gen_cython = ["cbindgen"]
