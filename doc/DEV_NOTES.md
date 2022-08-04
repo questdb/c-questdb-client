@@ -36,12 +36,20 @@ See: https://github.com/corrosion-rs/corrosion/pull/188.
 
 
 ## Building without CMake
-For development, you may also call `cargo build` directly.
-By default, this will not build the `C` FFI layer.
+For development, you may also call `cargo build` (`cargo test` etc) directly in
+either of the two Rust projects:
+* [questdb-rs](../questdb-rs/) - Core library
+* [questdb-rs-ffi](../questdb-rs-ffi/) - C bindings layer.
 
-For that, call `cargo build --features ffi`.
+If you are editing the C functions in the `questdb-rs-ffi` project and what to
+see the resulting generated header file, call `cargo build --features gen_h`.
 
-If you are editing the C functions and what to see the resulting generated
-header file, call `cargo build --features cbindgen`.
+Note that to reduce compile time we don't use cbindgen in the header we ship,
+which also contains additional formatting and comments.
 
-Note that to reduce compile time we don't use cbindgen in the header we ship.
+Similarly, we also support generating Cython bindings via the `gen_cython`
+feature.
+
+This generated files should be not be checked in:
+* `include/questdb/ilp/line_sender.gen.h`
+* `cython/questdb/ilp/line_sender.pxd`

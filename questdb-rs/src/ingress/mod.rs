@@ -151,6 +151,10 @@
 //! for details. Each row must be terminated with a call to either
 //! [`at`](Buffer::at) or [`at_now`](Buffer::at_now).
 //! 
+//! # Data quality and threading considerations
+//! 
+//! * [Library considerations](https://github.com/questdb/c-questdb-client/blob/main/doc/CONSIDERATIONS.md) documentation.
+//! 
 //! # Troubleshooting Common Issues
 //! 
 //! ## Production-optimized QuestDB configuration
