@@ -75,7 +75,6 @@ pub mod json_tests {
     fn parse() -> Vec<TestSpec> {
         let mut json_path = PathBuf::from(
             std::env::var("CARGO_MANIFEST_DIR").unwrap());
-        json_path.pop();
         json_path.push("src");
         json_path.push("tests");
         json_path.push("interop");
@@ -87,9 +86,7 @@ pub mod json_tests {
     pub fn build() -> Result<(), Box<dyn std::error::Error>> {
         let specs = parse();
         // eprintln!("Parsed JSON: {:#?}", specs);
-        let mut file_path = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
-        file_path.push("src");
-        file_path.push("tests");
+        let mut file_path = PathBuf::from(std::env::var("OUT_DIR")?);
         file_path.push("json_tests.rs");
         let mut output = BufWriter::new(File::create(file_path)?);
         // let mut output = String::new();
@@ -180,7 +177,7 @@ pub mod json_tests {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=Cargo.lock");
-    println!("cargo:rerun-if-changed=../src/test/interop/ilp-client-interop-test.json");
+    println!("cargo:rerun-if-changed=src/test/interop/ilp-client-interop-test.json");
 
     json_tests::build()?;
 

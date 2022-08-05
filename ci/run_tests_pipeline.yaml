@@ -20,6 +20,21 @@ stages:
               imageName: "ubuntu-latest"
               poolName: "Azure Pipelines"
               BUILD_WITH_MINGW: "0"
+            linux-stable:
+              imageName: "ubuntu-latest"
+              poolName: "Azure Pipelines"
+              BUILD_WITH_MINGW: "0"
+              toolchain: "stable"
+            linux-beta:
+              imageName: "ubuntu-latest"
+              poolName: "Azure Pipelines"
+              BUILD_WITH_MINGW: "0"
+              toolchain: "beta"
+            linux-nightly:
+              imageName: "ubuntu-latest"
+              poolName: "Azure Pipelines"
+              BUILD_WITH_MINGW: "0"
+              toolchain: "nightly"
             mac:
               imageName: "macos-latest"
               poolName: "Azure Pipelines"
@@ -45,6 +60,11 @@ stages:
             fetchDepth: 1
             lfs: false
             submodules: false
+          - script: |
+              rustup update $(toolchain)
+              rustup default $(toolchain)
+            condition: ne(variables['toolchain'], '')
+            displayName: "Update and set Rust toolchain"
           - script: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
             env:
               JAVA_HOME: $(JAVA_HOME_11_X64)

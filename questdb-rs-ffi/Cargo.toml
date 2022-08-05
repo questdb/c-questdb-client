@@ -1,7 +1,8 @@
 [package]
 name = "questdb-rs-ffi"
-version = "0.0.1"
+version = "2.1.0"
 edition = "2021"
+publish = false
 
 [lib]
 name = "questdb_client"

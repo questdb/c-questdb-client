@@ -3,4 +3,5 @@ build
 .vs
 .vscode
 questdb-rs/Cargo.lock
-questdb-rs/src/tests/json_tests.rs
+include/questdb/ilp/line_sender.gen.h
+cython/questdb/ilp/line_sender.pxd

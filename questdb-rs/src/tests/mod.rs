@@ -21,11 +21,13 @@
  *  limitations under the License.
  *
  ******************************************************************************/
-
 mod f64_serializer;
 mod sender;
-mod json_tests;
 mod mock;
+
+mod json_tests {
+    include!(concat!(env!("OUT_DIR"), "/json_tests.rs"));
+}
 
 pub type TestError = Box<dyn std::error::Error>;
 pub type TestResult = std::result::Result<(), TestError>;
