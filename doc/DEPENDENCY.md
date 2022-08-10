@@ -12,7 +12,7 @@ We do not ship binaries.
 
 Instead you should rely on a copy of the code sync'ed up
 to the latest annotated tag. You can find the list of tags on
-the [project's GitHub tag page](tags) or by listing the annotated tags in git
+the [project's GitHub tag page](../tags) or by listing the annotated tags in git
 from a checked out copy of the code.
 
 ```bash
@@ -115,7 +115,7 @@ Grafting can be accomplished via either one of:
 Pick either approach to obtain a copy of this library's code into
 the `deps/c-questdb-client` directory within your git repository.
 
-Once done, [configuring `CMakeLists.txt`](cmakeliststxt_with_subdirectory)
+Once done, [configuring `CMakeLists.txt`](#cmakeliststxt-with-subdirectory)
 config is the same.
 
 ### Grafting via `git subtree` (recommended)
