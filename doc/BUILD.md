@@ -91,20 +91,3 @@ Delete the `./build` directory.
 ```bash
 $ rm -fR build  # or your otherwise selected CMake build directory.
 ```
-
-## Building Rust Code
-
-You may find that you need to build the Rust code directly.
-
-From the root:
-
-```
-cargo build --release --features ffi
-```
-
-Note that this will build binaries in `./target` rather than `./build`.
-
-This will also refresh the `line_sender.h` header file.
-
-Call this command if you want to integrate the library within your project and
-you use a build system other than CMake.
