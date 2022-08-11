@@ -1,0 +1,15 @@
+- id: ilp
+  lang: c
+  path: examples/line_sender_c_example.c
+  md_header: |-
+    [C client library docs](https://github.com/questdb/c-questdb-client/blob/main/doc/C.md)
+- id: ilp
+  lang: cpp
+  path: examples/line_sender_cpp_example.cpp
+  md_header: |-
+    [C++ client library docs](https://github.com/questdb/c-questdb-client/blob/main/doc/CPP.md)
+- id: ilp
+  lang: rust
+  path: questdb-rs/examples/basic.rs
+  md_header: |-
+    [Rust client library docs](https://docs.rs/crate/questdb-rs/latest)

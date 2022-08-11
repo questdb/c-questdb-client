@@ -37,6 +37,7 @@ indoc = "1.0.7"
 
 [dev-dependencies]
 mio = { version = "0.8.4", features = ["os-poll", "net"] }
+clap = { version = "3.2.16", features = ["derive"] }
 
 [features]
 # Allow skipping verification of insecure certificates.
