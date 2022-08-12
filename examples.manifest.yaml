@@ -17,8 +17,8 @@
   header: |-
     [Rust client library docs](https://docs.rs/crate/questdb-rs/latest)
 
-# ILP Cloud Examples
-- name: ilp-cloud
+# ILP Auth + TLS Examples
+- name: ilp-auth-tls
   lang: c
   path: examples/line_sender_c_example_tls.c
   header: |-
@@ -29,7 +29,7 @@
     x: fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU
     y: Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac
 
-- name: ilp-cloud
+- name: ilp-auth-tls
   lang: cpp
   path: examples/line_sender_cpp_example_tls.cpp
   header: |-
@@ -40,7 +40,7 @@
     x: fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU
     y: Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac
 
-- name: ilp-cloud
+- name: ilp-auth-tls
   lang: rust
   path: questdb-rs/examples/auth_tls.rs
   header: |-
