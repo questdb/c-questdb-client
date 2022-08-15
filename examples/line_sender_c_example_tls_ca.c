@@ -120,9 +120,10 @@ static bool displayed_help(int argc, const char* argv[])
         if ((strncmp(arg, "-h", 2) == 0) || (strncmp(arg, "--help", 6) == 0))
         {
             fprintf(stderr, "Usage:\n");
-            fprintf(stderr, "line_sender_c_example_auth: [HOST [PORT]]\n");
-            fprintf(stderr,"    HOST: ILP host (defaults to \"localhost\".\n");
-            fprintf(stderr,"    PORT: ILP port (defaults to \"9009\".\n");
+            fprintf(stderr, "line_sender_c_example_tls_ca: CA_PATH [HOST [PORT]]\n");
+            fprintf(stderr, "    CA_PATH: Certificate authority pem file.\n");
+            fprintf(stderr, "    HOST: ILP host (defaults to \"localhost\").\n");
+            fprintf(stderr, "    PORT: ILP port (defaults to \"9009\").\n");
             return true;
         }
     }

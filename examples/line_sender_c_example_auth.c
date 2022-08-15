@@ -113,8 +113,8 @@ static bool displayed_help(int argc, const char* argv[])
         {
             fprintf(stderr, "Usage:\n");
             fprintf(stderr, "line_sender_c_example_auth: [HOST [PORT]]\n");
-            fprintf(stderr,"    HOST: ILP host (defaults to \"localhost\".\n");
-            fprintf(stderr,"    PORT: ILP port (defaults to \"9009\".\n");
+            fprintf(stderr, "    HOST: ILP host (defaults to \"localhost\").\n");
+            fprintf(stderr, "    PORT: ILP port (defaults to \"9009\").\n");
             return true;
         }
     }

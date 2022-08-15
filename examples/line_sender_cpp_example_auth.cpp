@@ -69,8 +69,8 @@ static bool displayed_help(int argc, const char* argv[])
             std::cerr
                 <<  "Usage:\n"
                 <<  "line_sender_c_example: [HOST [PORT]]\n"
-                << "    HOST: ILP host (defaults to \"localhost\".\n"
-                << "    PORT: ILP port (defaults to \"9009\"."
+                << "    HOST: ILP host (defaults to \"localhost\").\n"
+                << "    PORT: ILP port (defaults to \"9009\")."
                 << std::endl;
             return true;
         }

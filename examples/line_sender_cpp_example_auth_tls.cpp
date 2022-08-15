@@ -5,7 +5,6 @@ using namespace std::literals::string_view_literals;
 using namespace questdb::ilp::literals;
 
 static bool example(
-    std::string_view ca_path,
     std::string_view host,
     std::string_view port)
 {
@@ -13,10 +12,8 @@ static bool example(
     {
         questdb::ilp::opts opts{host, port};
 
-        // This example uses a custom certificate authority file.
-        // You can use the default certificate authority by calling the `.tls()`
-        // overload that takes no arguments.
-        opts.tls(ca_path);
+        // Enable TLS to accept connections using common trusted CAs.
+        opts.tls();
 
         // Follow our authentication documentation to generate your own keys:
         // https://questdb.io/docs/reference/api/ilp/authenticate
@@ -78,9 +75,8 @@ static bool displayed_help(int argc, const char* argv[])
             std::cerr
                 << "Usage:\n"
                 << "line_sender_c_example: CA_PATH [HOST [PORT]]\n"
-                << "    CA_PATH: Certificate authority pem file.\n"
-                << "    HOST: ILP host (defaults to \"localhost\".\n"
-                << "    PORT: ILP port (defaults to \"9009\"."
+                << "    HOST: ILP host (defaults to \"localhost\").\n"
+                << "    PORT: ILP port (defaults to \"9009\")."
                 << std::endl;
             return true;
         }
@@ -93,19 +89,12 @@ int main(int argc, const char* argv[])
     if (displayed_help(argc, argv))
         return 0;
 
-    if (argc < 2)
-    {
-        std::cerr << "CA_PATH required." << std::endl;
-        return 1;
-    }
-    auto ca_path = std::string_view{argv[1]};
-
     auto host = "localhost"sv;
-    if (argc >= 3)
-        host = std::string_view{argv[2]};
+    if (argc >= 2)
+        host = std::string_view{argv[1]};
     auto port = "9009"sv;
-    if (argc >= 4)
-        port = std::string_view{argv[3]};
+    if (argc >= 3)
+        port = std::string_view{argv[2]};
 
-    return !example(ca_path, host, port);
+    return !example(host, port);
 }
