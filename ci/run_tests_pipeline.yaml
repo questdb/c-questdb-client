@@ -65,6 +65,11 @@ stages:
               rustup default $(toolchain)
             condition: ne(variables['toolchain'], '')
             displayName: "Update and set Rust toolchain"
+          - script: |
+              cd questdb-rs
+              cargo build --example basic
+              cargo build --example auth_tls
+            displayName: Build Rust examples.
           - script: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
             env:
               JAVA_HOME: $(JAVA_HOME_11_X64)

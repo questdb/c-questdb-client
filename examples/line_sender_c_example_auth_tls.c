@@ -20,6 +20,25 @@ static bool example(const char* host, const char* port)
 
     // Call `line_sender_opts_new` if instead you have an integer port.
     opts = line_sender_opts_new_service(host_utf8, port_utf8);
+
+    // Enable TLS to accept connections using common trusted CAs.
+    line_sender_opts_tls(opts);
+
+    // Use `QDB_UTF_8_FROM_STR_OR` to init from `const char*`.
+    line_sender_utf8 key_id = QDB_UTF8_LITERAL("testUser1");
+    line_sender_utf8 priv_key = QDB_UTF8_LITERAL(
+        "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48");
+    line_sender_utf8 pub_key_x = QDB_UTF8_LITERAL(
+        "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU");
+    line_sender_utf8 pub_key_y = QDB_UTF8_LITERAL(
+        "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac");
+
+    line_sender_opts_auth(
+        opts,
+        key_id,      // kid
+        priv_key,    // d
+        pub_key_x,   // x
+        pub_key_y);  // y
     sender = line_sender_connect(opts, &err);
     line_sender_opts_free(opts);
     opts = NULL;
@@ -32,7 +51,7 @@ static bool example(const char* host, const char* port)
     // We prepare all our table names and column names in advance.
     // If we're inserting multiple rows, this allows us to avoid
     // re-validating the same strings over and over again.
-    line_sender_table_name table_name = QDB_TABLE_NAME_LITERAL("c_cars");
+    line_sender_table_name table_name = QDB_TABLE_NAME_LITERAL("c_cars_tls");
     line_sender_column_name id_name = QDB_COLUMN_NAME_LITERAL("id");
     line_sender_column_name x_name = QDB_COLUMN_NAME_LITERAL("x");
     line_sender_column_name y_name = QDB_COLUMN_NAME_LITERAL("y");
@@ -96,7 +115,7 @@ static bool displayed_help(int argc, const char* argv[])
         if ((strncmp(arg, "-h", 2) == 0) || (strncmp(arg, "--help", 6) == 0))
         {
             fprintf(stderr, "Usage:\n");
-            fprintf(stderr, "line_sender_c_example: [HOST [PORT]]\n");
+            fprintf(stderr, "line_sender_c_example_auth_tls: [HOST [PORT]]\n");
             fprintf(stderr, "    HOST: ILP host (defaults to \"localhost\").\n");
             fprintf(stderr, "    PORT: ILP port (defaults to \"9009\").\n");
             return true;
