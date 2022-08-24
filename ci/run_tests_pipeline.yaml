@@ -68,6 +68,7 @@ stages:
           - script: |
               cd questdb-rs
               cargo build --example basic
+              cargo build --example auth
               cargo build --example auth_tls
             displayName: Build Rust examples.
           - script: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
