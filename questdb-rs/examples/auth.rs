@@ -2,9 +2,7 @@ use questdb::{
     Result,
     ingress::{
         Buffer,
-        SenderBuilder,
-        Tls,
-        CertificateAuthority}};
+        SenderBuilder}};
 
 fn main() -> Result<()> {
     let host: String = std::env::args().nth(1)
