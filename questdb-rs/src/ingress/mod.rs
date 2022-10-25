@@ -1602,6 +1602,14 @@ impl SenderBuilder {
             Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
             .map_err(|io_err| map_io_to_socket_err(
                 "Could not open TCP socket: ", io_err))?;
+
+        // See: https://idea.popcount.org/2014-04-03-bind-before-connect/
+        // We set `SO_REUSEADDR` on the outbound socket to avoid issues where a client may exhaust
+        // their interface's ports. See: https://github.com/questdb/py-questdb-client/issues/21
+        sock.set_reuse_address(true)
+            .map_err(|io_err| map_io_to_socket_err(
+                "Could not set SO_REUSEADDR: ", io_err))?;
+
         sock.set_linger(Some(Duration::from_secs(120)))
             .map_err(|io_err| map_io_to_socket_err(
                 "Could not set socket linger: ", io_err))?;
