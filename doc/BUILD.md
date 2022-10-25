@@ -34,7 +34,7 @@ Tested compilers are GCC and Clang.
 ```bash
 $ cmake -S . -B build \
   -DCMAKE_BUILD_TYPE=Release  # .. or -DCMAKE_BUILD_TYPE=Debug for debugging.
-$ (cd build && make)
+$ cmake --build build
 ```
 
 ### Windows
