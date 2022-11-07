@@ -306,7 +306,10 @@ namespace questdb::ilp
             if (this != &other)
             {
                 ::line_sender_buffer_free(_impl);
-                _impl = ::line_sender_buffer_clone(other._impl);
+                if (other._impl)
+                    _impl = ::line_sender_buffer_clone(other._impl);
+                else
+                    _impl = nullptr;
                 _init_capacity = other._init_capacity;
                 _max_name_len = other._max_name_len;
             }
