@@ -158,9 +158,19 @@ namespace questdb::ilp
             : basic_view{s.data(), s.size()}
         {}
 
-        size_t size() const noexcept { return _impl.len; }
+        size_t size() const noexcept {
+            if (_impl)
+                return _impl.len;
+            else
+                return 0;
+        }
 
-        const char* data() const noexcept { return _impl.buf; }
+        const char* data() const noexcept {
+            if (_impl)
+                return _impl.buf;
+            else
+                return "";
+        }
 
         std::string_view to_string_view() const noexcept
         {
