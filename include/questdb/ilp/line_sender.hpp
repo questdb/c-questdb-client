@@ -195,7 +195,7 @@ namespace questdb::ilp
          * auto validated = "A UTF-8 encoded string"_utf8;
          * @endcode
          */
-        utf8_view operator "" _utf8(const char* buf, size_t len)
+        inline utf8_view operator "" _utf8(const char* buf, size_t len)
         {
             return utf8_view{buf, len};
         }
@@ -206,7 +206,7 @@ namespace questdb::ilp
          * auto table_name = "events"_tn;
          * @endcode
          */
-        table_name_view operator "" _tn(const char* buf, size_t len)
+        inline table_name_view operator "" _tn(const char* buf, size_t len)
         {
             return table_name_view{buf, len};
         }
@@ -217,7 +217,7 @@ namespace questdb::ilp
          * auto column_name = "events"_cn;
          * @endcode
          */
-        column_name_view operator "" _cn(const char* buf, size_t len)
+        inline column_name_view operator "" _cn(const char* buf, size_t len)
         {
             return column_name_view{buf, len};
         }
@@ -271,11 +271,10 @@ namespace questdb::ilp
         line_sender_buffer(
             size_t init_capacity,
             size_t max_name_len) noexcept
-            : _impl{::line_sender_buffer_with_max_name_len(max_name_len)}
+            : _impl{nullptr}
             , _init_capacity{init_capacity}
             , _max_name_len{max_name_len}
         {
-            ::line_sender_buffer_reserve(_impl, init_capacity);
         }
 
         line_sender_buffer(const line_sender_buffer& other) noexcept
@@ -566,7 +565,7 @@ namespace questdb::ilp
                 ::line_sender_buffer_free(_impl);
         }
     private:
-        void may_init()
+        inline void may_init()
         {
             if (!_impl)
             {
