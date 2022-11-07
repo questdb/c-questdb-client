@@ -797,6 +797,7 @@ namespace questdb::ilp
          */
         void flush(line_sender_buffer& buffer)
         {
+            buffer.may_init();
             ensure_impl();
             line_sender_error::wrapped_call(
                 ::line_sender_flush,
@@ -812,11 +813,23 @@ namespace questdb::ilp
          */
         void flush_and_keep(const line_sender_buffer& buffer)
         {
-            ensure_impl();
-            line_sender_error::wrapped_call(
-                ::line_sender_flush_and_keep,
-                _impl,
-                buffer._impl);
+            if (buffer._impl)
+            {
+                ensure_impl();
+                line_sender_error::wrapped_call(
+                    ::line_sender_flush_and_keep,
+                    _impl,
+                    buffer._impl);
+            }
+            else
+            {
+                line_sender_buffer buffer2;
+                buffer2.may_init();
+                line_sender_error::wrapped_call(
+                    ::line_sender_flush_and_keep,
+                    _impl,
+                    buffer2._impl);
+            }
         }
 
         /**
