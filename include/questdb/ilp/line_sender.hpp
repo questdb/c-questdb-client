@@ -159,17 +159,11 @@ namespace questdb::ilp
         {}
 
         size_t size() const noexcept {
-            if (_impl)
-                return _impl.len;
-            else
-                return 0;
+            return _impl.len;
         }
 
         const char* data() const noexcept {
-            if (_impl)
-                return _impl.buf;
-            else
-                return "";
+            return _impl.buf;
         }
 
         std::string_view to_string_view() const noexcept
