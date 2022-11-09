@@ -380,7 +380,7 @@ TEST_CASE("Buffer move and copy ctor testing")
     CHECK(buffer1.peek() == "buffer3");
     CHECK(buffer3.peek() == "");
     CHECK(buffer3.size() == 0);
-    CHECK(buffer3.capacity() == 3 * init_capacity);
+    CHECK(buffer3.capacity() == 0);
     CHECK(buffer3.peek() == "");
 
 

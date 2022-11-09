@@ -335,13 +335,9 @@ namespace questdb::ilp
         size_t capacity() const noexcept
         {
             if (_impl)
-            {
                 return ::line_sender_buffer_capacity(_impl);
-            }
             else
-            {
-                return _init_capacity;
-            }
+                return 0;
         }
 
         size_t size() const noexcept
@@ -383,17 +379,13 @@ namespace questdb::ilp
         void clear_marker() noexcept
         {
             if (_impl)
-            {
                 ::line_sender_buffer_clear_marker(_impl);
-            }
         }
 
         void clear() noexcept
         {
             if (_impl)
-            {
                 ::line_sender_buffer_clear(_impl);
-            }
         }
 
         /**
