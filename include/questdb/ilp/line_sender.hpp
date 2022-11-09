@@ -808,7 +808,7 @@ namespace questdb::ilp
             }
             else
             {
-                line_sender_buffer buffer2;
+                line_sender_buffer buffer2{0};
                 buffer2.may_init();
                 line_sender_error::wrapped_call(
                     ::line_sender_flush_and_keep,
