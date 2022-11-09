@@ -195,7 +195,7 @@ namespace questdb::ilp
          * auto validated = "A UTF-8 encoded string"_utf8;
          * @endcode
          */
-        utf8_view operator "" _utf8(const char* buf, size_t len)
+        inline utf8_view operator "" _utf8(const char* buf, size_t len)
         {
             return utf8_view{buf, len};
         }
@@ -206,7 +206,7 @@ namespace questdb::ilp
          * auto table_name = "events"_tn;
          * @endcode
          */
-        table_name_view operator "" _tn(const char* buf, size_t len)
+        inline table_name_view operator "" _tn(const char* buf, size_t len)
         {
             return table_name_view{buf, len};
         }
@@ -217,7 +217,7 @@ namespace questdb::ilp
          * auto column_name = "events"_cn;
          * @endcode
          */
-        column_name_view operator "" _cn(const char* buf, size_t len)
+        inline column_name_view operator "" _cn(const char* buf, size_t len)
         {
             return column_name_view{buf, len};
         }
@@ -271,11 +271,10 @@ namespace questdb::ilp
         line_sender_buffer(
             size_t init_capacity,
             size_t max_name_len) noexcept
-            : _impl{::line_sender_buffer_with_max_name_len(max_name_len)}
+            : _impl{nullptr}
             , _init_capacity{init_capacity}
             , _max_name_len{max_name_len}
         {
-            ::line_sender_buffer_reserve(_impl, init_capacity);
         }
 
         line_sender_buffer(const line_sender_buffer& other) noexcept
@@ -297,7 +296,10 @@ namespace questdb::ilp
             if (this != &other)
             {
                 ::line_sender_buffer_free(_impl);
-                _impl = ::line_sender_buffer_clone(other._impl);
+                if (other._impl)
+                    _impl = ::line_sender_buffer_clone(other._impl);
+                else
+                    _impl = nullptr;
                 _init_capacity = other._init_capacity;
                 _max_name_len = other._max_name_len;
             }
@@ -333,13 +335,9 @@ namespace questdb::ilp
         size_t capacity() const noexcept
         {
             if (_impl)
-            {
                 return ::line_sender_buffer_capacity(_impl);
-            }
             else
-            {
-                return _init_capacity;
-            }
+                return 0;
         }
 
         size_t size() const noexcept
@@ -381,17 +379,13 @@ namespace questdb::ilp
         void clear_marker() noexcept
         {
             if (_impl)
-            {
                 ::line_sender_buffer_clear_marker(_impl);
-            }
         }
 
         void clear() noexcept
         {
             if (_impl)
-            {
                 ::line_sender_buffer_clear(_impl);
-            }
         }
 
         /**
@@ -566,7 +560,7 @@ namespace questdb::ilp
                 ::line_sender_buffer_free(_impl);
         }
     private:
-        void may_init()
+        inline void may_init()
         {
             if (!_impl)
             {
@@ -788,6 +782,7 @@ namespace questdb::ilp
          */
         void flush(line_sender_buffer& buffer)
         {
+            buffer.may_init();
             ensure_impl();
             line_sender_error::wrapped_call(
                 ::line_sender_flush,
@@ -803,11 +798,23 @@ namespace questdb::ilp
          */
         void flush_and_keep(const line_sender_buffer& buffer)
         {
-            ensure_impl();
-            line_sender_error::wrapped_call(
-                ::line_sender_flush_and_keep,
-                _impl,
-                buffer._impl);
+            if (buffer._impl)
+            {
+                ensure_impl();
+                line_sender_error::wrapped_call(
+                    ::line_sender_flush_and_keep,
+                    _impl,
+                    buffer._impl);
+            }
+            else
+            {
+                line_sender_buffer buffer2{0};
+                buffer2.may_init();
+                line_sender_error::wrapped_call(
+                    ::line_sender_flush_and_keep,
+                    _impl,
+                    buffer2._impl);
+            }
         }
 
         /**

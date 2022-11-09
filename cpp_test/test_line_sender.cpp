@@ -380,7 +380,7 @@ TEST_CASE("Buffer move and copy ctor testing")
     CHECK(buffer1.peek() == "buffer3");
     CHECK(buffer3.peek() == "");
     CHECK(buffer3.size() == 0);
-    CHECK(buffer3.capacity() == 3 * init_capacity);
+    CHECK(buffer3.capacity() == 0);
     CHECK(buffer3.peek() == "");
 
 
@@ -649,4 +649,42 @@ TEST_CASE("Test Marker")
     buffer.clear();
     CHECK(buffer.peek() == "");
     CHECK_THROWS_AS(buffer.rewind_to_marker(), questdb::ilp::line_sender_error);
+}
+
+TEST_CASE("Moved View") {
+    auto v1 = "abc"_tn;
+    CHECK(v1.size() == 3);
+    questdb::ilp::table_name_view v2{std::move(v1)};
+    CHECK(v2.size() == 3);
+    CHECK(v1.size() == 3);
+    CHECK(v1.data() == v2.data());
+}
+
+TEST_CASE("Empty Buffer") {
+    questdb::ilp::line_sender_buffer b1;
+    CHECK(b1.size() == 0);
+    questdb::ilp::line_sender_buffer b2{std::move(b1)};
+    CHECK(b1.size() == 0);
+    CHECK(b2.size() == 0);
+    questdb::ilp::line_sender_buffer b3;
+    b3 = std::move(b2);
+    CHECK(b2.size() == 0);
+    CHECK(b3.size() == 0);
+    questdb::ilp::line_sender_buffer b4;
+    b4.table("test").symbol("a", "b").at_now();
+    questdb::ilp::line_sender_buffer b5;
+    b5 = std::move(b4);
+    CHECK(b4.size() == 0);
+    CHECK(b5.size() == 9);
+
+    questdb::ilp::test::mock_server server;
+    questdb::ilp::line_sender sender{"localhost", server.port()};
+    CHECK_THROWS_WITH_AS(
+        sender.flush(b1),
+        "State error: Bad call to `flush`, should have called `table` instead.",
+        questdb::ilp::line_sender_error);
+    CHECK_THROWS_WITH_AS(
+        sender.flush_and_keep(b1),
+        "State error: Bad call to `flush`, should have called `table` instead.",
+        questdb::ilp::line_sender_error);
 }
