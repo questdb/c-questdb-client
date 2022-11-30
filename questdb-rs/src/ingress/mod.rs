@@ -433,10 +433,15 @@ fn write_escaped_impl<Q, C>(
         unsafe { output_vec.set_len(index + additional) };
         for b in s.bytes() {
             if check_escape_fn(b) {
-                output_vec[index] = b'\\';
+                unsafe {
+                    *output_vec.get_unchecked_mut(index) = b'\\';
+                }
                 index += 1;
             }
-            output_vec[index] = b;
+
+            unsafe {
+                *output_vec.get_unchecked_mut(index) = b;
+            }
             index += 1;
         }
     }
