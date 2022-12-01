@@ -409,44 +409,56 @@ fn write_escaped_impl<Q, C>(
     output: &mut String,
     s: &str)
         where
-            C: Fn(char) -> bool,
-            Q: Fn(&mut String) -> ()
+            C: Fn(u8) -> bool,
+            Q: Fn(&mut Vec<u8>) -> ()
 {
+    let output_vec = unsafe { output.as_mut_vec() };
     let mut to_escape = 0usize;
-    for c in s.chars() {
-        if check_escape_fn(c) {
+    for b in s.bytes() {
+        if check_escape_fn(b) {
             to_escape += 1;
         }
     }
 
-    quoting_fn(output);
+    quoting_fn(output_vec);
 
     if to_escape == 0 {
-        output.push_str(s);
+        // output.push_str(s);
+        output_vec.extend_from_slice(s.as_bytes());
     }
     else {
-        output.reserve(s.len() + to_escape);
-        for c in s.chars() {
-            if check_escape_fn(c) {
-                output.push('\\');
+        let additional = s.len() + to_escape;
+        output_vec.reserve(additional);
+        let mut index = output_vec.len();
+        unsafe { output_vec.set_len(index + additional) };
+        for b in s.bytes() {
+            if check_escape_fn(b) {
+                unsafe {
+                    *output_vec.get_unchecked_mut(index) = b'\\';
+                }
+                index += 1;
             }
-            output.push(c);
+
+            unsafe {
+                *output_vec.get_unchecked_mut(index) = b;
+            }
+            index += 1;
         }
     }
 
-    quoting_fn(output);
+    quoting_fn(output_vec);
 }
 
-fn must_escape_unquoted(c: char) -> bool {
+fn must_escape_unquoted(c: u8) -> bool {
     match c {
-        ' ' | ',' | '=' | '\n' | '\r' | '\\' => true,
+        b' ' | b',' | b'=' | b'\n' | b'\r' | b'\\' => true,
         _ => false
     }
 }
 
-fn must_escape_quoted(c: char) -> bool {
+fn must_escape_quoted(c: u8) -> bool {
     match c {
-        '\n' | '\r' | '"' | '\\' => true,
+        b'\n' | b'\r' | b'"' | b'\\' => true,
         _ => false
     }
 }
@@ -462,7 +474,7 @@ fn write_escaped_unquoted(output: &mut String, s: &str) {
 fn write_escaped_quoted(output: &mut String, s: &str) {
     write_escaped_impl(
         must_escape_quoted,
-        |output| output.push('"'),
+        |output| output.push(b'"'),
         output,
         s)
 }
@@ -724,6 +736,7 @@ impl Buffer {
         self.state = State::Init;
     }
 
+    #[inline(always)]
     fn check_state(&self, op: Op) -> Result<()> {
         if (self.state as isize & op as isize) > 0 {
             return Ok(());
@@ -736,6 +749,7 @@ impl Buffer {
         Err(error)
     }
 
+    #[inline(always)]
     fn validate_max_name_len(&self, name: &str) -> Result<()> {
         if name.len() > self.max_name_len {
             return Err(error::fmt!(
