@@ -736,6 +736,7 @@ impl Buffer {
         self.state = State::Init;
     }
 
+    #[inline(always)]
     fn check_state(&self, op: Op) -> Result<()> {
         if (self.state as isize & op as isize) > 0 {
             return Ok(());
@@ -748,6 +749,7 @@ impl Buffer {
         Err(error)
     }
 
+    #[inline(always)]
     fn validate_max_name_len(&self, name: &str) -> Result<()> {
         if name.len() > self.max_name_len {
             return Err(error::fmt!(
