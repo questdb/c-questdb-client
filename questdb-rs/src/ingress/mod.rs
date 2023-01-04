@@ -753,7 +753,7 @@ impl Buffer {
     fn validate_max_name_len(&self, name: &str) -> Result<()> {
         if name.len() > self.max_name_len {
             return Err(error::fmt!(
-                InvalidApiCall,
+                InvalidName,
                 "Bad name: {:?}: Too long (max {} characters)",
                 name,
                 self.max_name_len));
