@@ -66,70 +66,76 @@ function(set_compile_flags TARGET_NAME)
     endif()
 endfunction()
 
-# Examples
-function(compile_example TARGET_NAME)
-    list(POP_FRONT ARGV)
-    add_executable(
-        ${TARGET_NAME}
-        ${ARGV})
-    target_link_libraries(
-        ${TARGET_NAME}
-        questdb_client)
-endfunction()
+option(BUILD_EXAMPLES "Build examples." ON)
+if(BUILD_EXAMPLES)
+    # Examples
+    function(compile_example TARGET_NAME)
+        list(POP_FRONT ARGV)
+        add_executable(
+            ${TARGET_NAME}
+            ${ARGV})
+        target_link_libraries(
+            ${TARGET_NAME}
+            questdb_client)
+    endfunction()
 
-compile_example(
-    line_sender_c_example
-    examples/line_sender_c_example.c)
-compile_example(
-    line_sender_c_example_auth
-    examples/line_sender_c_example_auth.c)
-compile_example(
-    line_sender_c_example_tls_ca
-    examples/line_sender_c_example_tls_ca.c)
-compile_example(
-    line_sender_c_example_auth_tls
-    examples/line_sender_c_example_auth_tls.c)
-compile_example(
-    line_sender_cpp_example
-    examples/line_sender_cpp_example.cpp)
-compile_example(
-    line_sender_cpp_example_auth
-    examples/line_sender_cpp_example_auth.cpp)
-compile_example(
-    line_sender_cpp_example_tls_ca
-    examples/line_sender_cpp_example_tls_ca.cpp)
-compile_example(
-    line_sender_cpp_example_auth_tls
-    examples/line_sender_cpp_example_auth_tls.cpp)
+    compile_example(
+        line_sender_c_example
+        examples/line_sender_c_example.c)
+    compile_example(
+        line_sender_c_example_auth
+        examples/line_sender_c_example_auth.c)
+    compile_example(
+        line_sender_c_example_tls_ca
+        examples/line_sender_c_example_tls_ca.c)
+    compile_example(
+        line_sender_c_example_auth_tls
+        examples/line_sender_c_example_auth_tls.c)
+    compile_example(
+        line_sender_cpp_example
+        examples/line_sender_cpp_example.cpp)
+    compile_example(
+        line_sender_cpp_example_auth
+        examples/line_sender_cpp_example_auth.cpp)
+    compile_example(
+        line_sender_cpp_example_tls_ca
+        examples/line_sender_cpp_example_tls_ca.cpp)
+    compile_example(
+        line_sender_cpp_example_auth_tls
+        examples/line_sender_cpp_example_auth_tls.cpp)
+endif()
 
-# Include Rust tests as part of the tests run
-add_test(
-    NAME rust_tests
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/questdb-rs
-    COMMAND cargo test --features insecure-skip-verify -- --nocapture)
-
-# Unit test binaries.
-function(compile_test TARGET_NAME)
-    list(POP_FRONT ARGV)  # compile_test
-    add_executable(
-        ${TARGET_NAME}
-        ${ARGV})
-    target_link_libraries(
-        ${TARGET_NAME}
-        questdb_client)
-    target_include_directories(
-        ${TARGET_NAME}
-        PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    set_compile_flags(${TARGET_NAME})
+option(BUILD_TESTS "Build tests." ON)
+if(BUILD_TESTS)
+    # Include Rust tests as part of the tests run
     add_test(
-        NAME ${TARGET_NAME}
-        COMMAND ${TARGET_NAME})
-endfunction()
+        NAME rust_tests
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/questdb-rs
+        COMMAND cargo test --features insecure-skip-verify -- --nocapture)
 
-compile_test(
-    test_line_sender
-    cpp_test/mock_server.cpp
-    cpp_test/test_line_sender.cpp)
+    # Unit test binaries.
+    function(compile_test TARGET_NAME)
+        list(POP_FRONT ARGV)  # compile_test
+        add_executable(
+            ${TARGET_NAME}
+            ${ARGV})
+        target_link_libraries(
+            ${TARGET_NAME}
+            questdb_client)
+        target_include_directories(
+            ${TARGET_NAME}
+            PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        set_compile_flags(${TARGET_NAME})
+        add_test(
+            NAME ${TARGET_NAME}
+            COMMAND ${TARGET_NAME})
+    endfunction()
+
+    compile_test(
+        test_line_sender
+        cpp_test/mock_server.cpp
+        cpp_test/test_line_sender.cpp)
+endif()
 
 # System testing Python3 script.
 # This will download the latest QuestDB instance from Github,
