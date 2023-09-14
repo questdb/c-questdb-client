@@ -9,7 +9,7 @@ macro_rules! fmt {
 }
 
 /// Category of error.
-/// 
+///
 /// Accessible via Error's [`code`](Error::code) method.
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum ErrorCode {
@@ -23,7 +23,7 @@ pub enum ErrorCode {
     SocketError,
 
     /// The string or symbol field is not encoded in valid UTF-8.
-    /// 
+    ///
     /// *This error is reserved for the
     /// [C and C++ API](https://github.com/questdb/c-questdb-client/).*
     InvalidUtf8,
@@ -38,14 +38,14 @@ pub enum ErrorCode {
     AuthError,
 
     /// Error during TLS handshake.
-    TlsError
+    TlsError,
 }
 
 /// An error that occurred when using QuestDB client library.
 #[derive(Debug, PartialEq)]
 pub struct Error {
     code: ErrorCode,
-    msg: String
+    msg: String,
 }
 
 impl Error {
@@ -53,7 +53,7 @@ impl Error {
     pub fn new<S: Into<String>>(code: ErrorCode, msg: S) -> Error {
         Error {
             code: code,
-            msg: msg.into()
+            msg: msg.into(),
         }
     }
 

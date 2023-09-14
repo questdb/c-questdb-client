@@ -21,31 +21,25 @@
  *  limitations under the License.
  *
  ******************************************************************************/
- 
+
 #![allow(non_camel_case_types)]
 
+use libc::{c_char, size_t};
 use std::ascii;
 use std::boxed::Box;
 use std::convert::{From, Into};
 use std::path::PathBuf;
+use std::ptr;
 use std::slice;
 use std::str;
-use libc::{c_char, size_t};
-use std::ptr;
 
 use questdb::{
-    Error,
-    ErrorCode,
     ingress::{
-        TableName,
-        ColumnName,
-        Sender,
-        Buffer,
-        SenderBuilder,
-        Tls,
-        CertificateAuthority,
-        TimestampMicros,
-        TimestampNanos}};
+        Buffer, CertificateAuthority, ColumnName, Sender, SenderBuilder, TableName,
+        TimestampMicros, TimestampNanos, Tls,
+    },
+    Error, ErrorCode,
+};
 
 macro_rules! bubble_err_to_c {
     ($err_out:expr, $expression:expr) => {
@@ -108,23 +102,18 @@ pub enum line_sender_error_code {
 impl From<ErrorCode> for line_sender_error_code {
     fn from(code: ErrorCode) -> Self {
         match code {
-            ErrorCode::CouldNotResolveAddr =>
-                line_sender_error_code::
-                    line_sender_error_could_not_resolve_addr,
-            ErrorCode::InvalidApiCall =>
-                line_sender_error_code::line_sender_error_invalid_api_call,
-            ErrorCode::SocketError =>
-                line_sender_error_code::line_sender_error_socket_error,
-            ErrorCode::InvalidUtf8 =>
-                line_sender_error_code::line_sender_error_invalid_utf8,
-            ErrorCode::InvalidName =>
-                line_sender_error_code::line_sender_error_invalid_name,
-            ErrorCode::InvalidTimestamp =>
-                line_sender_error_code::line_sender_error_invalid_timestamp,
-            ErrorCode::AuthError =>
-                line_sender_error_code::line_sender_error_auth_error,
-            ErrorCode::TlsError =>
-                line_sender_error_code::line_sender_error_tls_error,
+            ErrorCode::CouldNotResolveAddr => {
+                line_sender_error_code::line_sender_error_could_not_resolve_addr
+            }
+            ErrorCode::InvalidApiCall => line_sender_error_code::line_sender_error_invalid_api_call,
+            ErrorCode::SocketError => line_sender_error_code::line_sender_error_socket_error,
+            ErrorCode::InvalidUtf8 => line_sender_error_code::line_sender_error_invalid_utf8,
+            ErrorCode::InvalidName => line_sender_error_code::line_sender_error_invalid_name,
+            ErrorCode::InvalidTimestamp => {
+                line_sender_error_code::line_sender_error_invalid_timestamp
+            }
+            ErrorCode::AuthError => line_sender_error_code::line_sender_error_auth_error,
+            ErrorCode::TlsError => line_sender_error_code::line_sender_error_tls_error,
         }
     }
 }
@@ -132,8 +121,8 @@ impl From<ErrorCode> for line_sender_error_code {
 /** Error code categorizing the error. */
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_error_get_code(
-    error: *const line_sender_error) -> line_sender_error_code
-{
+    error: *const line_sender_error,
+) -> line_sender_error_code {
     (&*error).0.code().into()
 }
 
@@ -143,8 +132,8 @@ pub unsafe extern "C" fn line_sender_error_get_code(
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_error_msg(
     error: *const line_sender_error,
-    len_out: *mut size_t) -> *const c_char
-{
+    len_out: *mut size_t,
+) -> *const c_char {
     let msg: &str = &(&*error).0.msg();
     *len_out = msg.len();
     msg.as_ptr() as *mut c_char
@@ -166,16 +155,13 @@ pub struct line_sender_utf8 {
     /// Don't initialize fields directly.
     /// Call `line_sender_utf8_init` instead.
     len: size_t,
-    buf: *const c_char
+    buf: *const c_char,
 }
 
 impl line_sender_utf8 {
     fn as_str(&self) -> &str {
         unsafe {
-            std::str::from_utf8_unchecked(
-                slice::from_raw_parts(
-                    self.buf as *const u8,
-                    self.len))
+            std::str::from_utf8_unchecked(slice::from_raw_parts(self.buf as *const u8, self.len))
         }
     }
 }
@@ -185,10 +171,10 @@ fn describe_buf(buf: &[u8]) -> String {
     let max_len = 100usize;
     let trim = buf.len() >= max_len;
     let working_len = if trim {
-            max_len - 3  // 3 here for trailing "..."
-        } else {
-            buf.len()
-        };
+        max_len - 3 // 3 here for trailing "..."
+    } else {
+        buf.len()
+    };
     let sliced = &buf[0..working_len];
     // If every byte needs escaping we'll need to 4 times as many bytes,
     // + 1 for trailing \0 added by printf functions.
@@ -207,11 +193,7 @@ fn describe_buf(buf: &[u8]) -> String {
     output
 }
 
-unsafe fn set_err_out(
-    err_out: *mut *mut line_sender_error,
-    code: ErrorCode,
-    msg: String)
-{
+unsafe fn set_err_out(err_out: *mut *mut line_sender_error, code: ErrorCode, msg: String) {
     let err = line_sender_error(Error::new(code, msg));
     let err_ptr = Box::into_raw(Box::new(err));
     *err_out = err_ptr;
@@ -219,37 +201,36 @@ unsafe fn set_err_out(
 
 unsafe fn unwrap_utf8_or_str(buf: &[u8]) -> std::result::Result<&str, String> {
     match std::str::from_utf8(buf) {
-        Ok(str_ref) => {
-            Ok(str_ref)
-        },
+        Ok(str_ref) => Ok(str_ref),
         Err(u8err) => {
             let buf_descr = describe_buf(buf);
             let msg = if let Some(_err_len) = u8err.error_len() {
-                    format!(
-                        concat!(
-                            "Bad string \"{}\": Invalid UTF-8. ",
-                            "Illegal codepoint starting at byte index {}."),
-                        buf_descr,
-                        u8err.valid_up_to())
-                }
-                else {  // needs more input
-                    format!(
-                        concat!(
-                            "Bad string \"{}\": Invalid UTF-8. Incomplete ",
-                            "multi-byte codepoint at end of string. ",
-                            "Bad codepoint starting at byte index {}."),
-                        buf_descr,
-                        u8err.valid_up_to())
-                };
+                format!(
+                    concat!(
+                        "Bad string \"{}\": Invalid UTF-8. ",
+                        "Illegal codepoint starting at byte index {}."
+                    ),
+                    buf_descr,
+                    u8err.valid_up_to()
+                )
+            } else {
+                // needs more input
+                format!(
+                    concat!(
+                        "Bad string \"{}\": Invalid UTF-8. Incomplete ",
+                        "multi-byte codepoint at end of string. ",
+                        "Bad codepoint starting at byte index {}."
+                    ),
+                    buf_descr,
+                    u8err.valid_up_to()
+                )
+            };
             Err(msg)
         }
     }
 }
 
-unsafe fn unwrap_utf8(
-    buf: &[u8],
-    err_out: *mut *mut line_sender_error) -> Option<&str>
-{
+unsafe fn unwrap_utf8(buf: &[u8], err_out: *mut *mut line_sender_error) -> Option<&str> {
     match unwrap_utf8_or_str(buf) {
         Ok(str_ref) => Some(str_ref),
         Err(msg) => {
@@ -271,15 +252,14 @@ pub unsafe extern "C" fn line_sender_utf8_init(
     string: *mut line_sender_utf8,
     len: size_t,
     buf: *const c_char,
-    err_out: *mut *mut line_sender_error) -> bool
-{
+    err_out: *mut *mut line_sender_error,
+) -> bool {
     let slice = slice::from_raw_parts(buf as *const u8, len);
     if let Some(str_ref) = unwrap_utf8(slice, err_out) {
         (*string).len = str_ref.len();
         (*string).buf = str_ref.as_ptr() as *const c_char;
         true
-    }
-    else {
+    } else {
         false
     }
 }
@@ -287,13 +267,13 @@ pub unsafe extern "C" fn line_sender_utf8_init(
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_utf8_assert(
     len: size_t,
-    buf: *const c_char) -> line_sender_utf8
-{
+    buf: *const c_char,
+) -> line_sender_utf8 {
     let slice = slice::from_raw_parts(buf as *const u8, len);
     match unwrap_utf8_or_str(slice) {
         Ok(str_ref) => line_sender_utf8 {
             len: str_ref.len(),
-            buf: str_ref.as_ptr() as *const c_char
+            buf: str_ref.as_ptr() as *const c_char,
         },
         Err(msg) => {
             panic!("{}", msg);
@@ -305,18 +285,17 @@ pub unsafe extern "C" fn line_sender_utf8_assert(
 /// Need not be null-terminated.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
-pub struct line_sender_table_name
-{
+pub struct line_sender_table_name {
     /// Don't initialize fields directly.
     /// Call `line_sender_table_name_init` instead.
     len: size_t,
-    buf: *const c_char
+    buf: *const c_char,
 }
 
 impl line_sender_table_name {
     unsafe fn as_name<'a>(&self) -> TableName<'a> {
-        let str_name = std::str::from_utf8_unchecked(
-            slice::from_raw_parts(self.buf as *const u8, self.len));
+        let str_name =
+            std::str::from_utf8_unchecked(slice::from_raw_parts(self.buf as *const u8, self.len));
         TableName::new_unchecked(str_name)
     }
 }
@@ -325,18 +304,17 @@ impl line_sender_table_name {
 /// Need not be null-terminated.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
-pub struct line_sender_column_name
-{
+pub struct line_sender_column_name {
     /// Don't initialize fields directly.
     /// Call `line_sender_column_name_init` instead.
     len: size_t,
-    buf: *const c_char
+    buf: *const c_char,
 }
 
 impl line_sender_column_name {
     unsafe fn as_name<'a>(&self) -> ColumnName<'a> {
-        let str_name = std::str::from_utf8_unchecked(
-            slice::from_raw_parts(self.buf as *const u8, self.len));
+        let str_name =
+            std::str::from_utf8_unchecked(slice::from_raw_parts(self.buf as *const u8, self.len));
         ColumnName::new_unchecked(str_name)
     }
 }
@@ -354,15 +332,17 @@ pub unsafe extern "C" fn line_sender_table_name_init(
     name: *mut line_sender_table_name,
     len: size_t,
     buf: *const c_char,
-    err_out: *mut *mut line_sender_error) -> bool
-{
-    let mut u8str = line_sender_utf8{len: 0usize, buf: ptr::null_mut()};
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    let mut u8str = line_sender_utf8 {
+        len: 0usize,
+        buf: ptr::null_mut(),
+    };
     if !line_sender_utf8_init(&mut u8str, len, buf, err_out) {
         return false;
     }
 
-    let str_name = std::str::from_utf8_unchecked(
-        slice::from_raw_parts(buf as *const u8, len));
+    let str_name = std::str::from_utf8_unchecked(slice::from_raw_parts(buf as *const u8, len));
 
     bubble_err_to_c!(err_out, TableName::new(str_name));
 
@@ -374,14 +354,11 @@ pub unsafe extern "C" fn line_sender_table_name_init(
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_table_name_assert(
     len: size_t,
-    buf: *const c_char) -> line_sender_table_name
-{
+    buf: *const c_char,
+) -> line_sender_table_name {
     let u8str = line_sender_utf8_assert(len, buf);
     match TableName::new(u8str.as_str()) {
-        Ok(_) => line_sender_table_name {
-            len: len,
-            buf: buf
-        },
+        Ok(_) => line_sender_table_name { len: len, buf: buf },
         Err(msg) => {
             panic!("{}", msg);
         }
@@ -401,15 +378,17 @@ pub unsafe extern "C" fn line_sender_column_name_init(
     name: *mut line_sender_column_name,
     len: size_t,
     buf: *const c_char,
-    err_out: *mut *mut line_sender_error) -> bool
-{
-    let mut u8str = line_sender_utf8{len: 0usize, buf: ptr::null_mut()};
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    let mut u8str = line_sender_utf8 {
+        len: 0usize,
+        buf: ptr::null_mut(),
+    };
     if !line_sender_utf8_init(&mut u8str, len, buf, err_out) {
         return false;
     }
 
-    let str_name = std::str::from_utf8_unchecked(
-        slice::from_raw_parts(buf as *const u8, len));
+    let str_name = std::str::from_utf8_unchecked(slice::from_raw_parts(buf as *const u8, len));
 
     bubble_err_to_c!(err_out, ColumnName::new(str_name));
 
@@ -421,14 +400,11 @@ pub unsafe extern "C" fn line_sender_column_name_init(
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_column_name_assert(
     len: size_t,
-    buf: *const c_char) -> line_sender_table_name
-{
+    buf: *const c_char,
+) -> line_sender_table_name {
     let u8str = line_sender_utf8_assert(len, buf);
     match ColumnName::new(u8str.as_str()) {
-        Ok(_) => line_sender_table_name {
-            len: len,
-            buf: buf
-        },
+        Ok(_) => line_sender_table_name { len: len, buf: buf },
         Err(msg) => {
             panic!("{}", msg);
         }
@@ -444,8 +420,8 @@ pub struct line_sender_opts(SenderBuilder);
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_opts_new(
     host: line_sender_utf8,
-    port: u16) -> *mut line_sender_opts
-{
+    port: u16,
+) -> *mut line_sender_opts {
     let builder = SenderBuilder::new(host.as_str(), port);
     Box::into_raw(Box::new(line_sender_opts(builder)))
 }
@@ -456,8 +432,8 @@ pub unsafe extern "C" fn line_sender_opts_new(
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_opts_new_service(
     host: line_sender_utf8,
-    port: line_sender_utf8) -> *mut line_sender_opts
-{
+    port: line_sender_utf8,
+) -> *mut line_sender_opts {
     let builder = SenderBuilder::new(host.as_str(), port.as_str());
     Box::into_raw(Box::new(line_sender_opts(builder)))
 }
@@ -466,8 +442,8 @@ pub unsafe extern "C" fn line_sender_opts_new_service(
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_opts_net_interface(
     opts: *mut line_sender_opts,
-    net_interface: line_sender_utf8)
-{
+    net_interface: line_sender_utf8,
+) {
     upd_opts!(opts, net_interface, net_interface.as_str());
 }
 
@@ -482,24 +458,24 @@ pub unsafe extern "C" fn line_sender_opts_auth(
     key_id: line_sender_utf8,
     priv_key: line_sender_utf8,
     pub_key_x: line_sender_utf8,
-    pub_key_y: line_sender_utf8)
-{
-    upd_opts!(opts, auth,
+    pub_key_y: line_sender_utf8,
+) {
+    upd_opts!(
+        opts,
+        auth,
         key_id.as_str(),
         priv_key.as_str(),
         pub_key_x.as_str(),
-        pub_key_y.as_str());
+        pub_key_y.as_str()
+    );
 }
 
 /// Enable full connection encryption via TLS.
 /// The connection will accept certificates by well-known certificate
 /// authorities as per the "webpki-roots" Rust crate.
 #[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_tls(
-    opts: *mut line_sender_opts)
-{
-    upd_opts!(opts, tls,
-        Tls::Enabled(CertificateAuthority::WebpkiRoots));
+pub unsafe extern "C" fn line_sender_opts_tls(opts: *mut line_sender_opts) {
+    upd_opts!(opts, tls, Tls::Enabled(CertificateAuthority::WebpkiRoots));
 }
 
 /// Enable full connection encryption via TLS.
@@ -508,20 +484,17 @@ pub unsafe extern "C" fn line_sender_opts_tls(
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_opts_tls_ca(
     opts: *mut line_sender_opts,
-    ca_path: line_sender_utf8)
-{
+    ca_path: line_sender_utf8,
+) {
     let ca_path = PathBuf::from(ca_path.as_str());
-    upd_opts!(opts, tls,
-        Tls::Enabled(CertificateAuthority::File(ca_path)));
+    upd_opts!(opts, tls, Tls::Enabled(CertificateAuthority::File(ca_path)));
 }
 
 /// Enable TLS whilst dangerously accepting any certificate as valid.
 /// This should only be used for debugging.
 /// Consider using calling "tls_ca" instead.
 #[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_tls_insecure_skip_verify(
-    opts: *mut line_sender_opts)
-{
+pub unsafe extern "C" fn line_sender_opts_tls_insecure_skip_verify(opts: *mut line_sender_opts) {
     upd_opts!(opts, tls, Tls::InsecureSkipVerify);
 }
 
@@ -531,8 +504,8 @@ pub unsafe extern "C" fn line_sender_opts_tls_insecure_skip_verify(
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_opts_read_timeout(
     opts: *mut line_sender_opts,
-    timeout_millis: u64)
-{
+    timeout_millis: u64,
+) {
     let timeout = std::time::Duration::from_millis(timeout_millis);
     upd_opts!(opts, read_timeout, timeout);
 }
@@ -541,8 +514,8 @@ pub unsafe extern "C" fn line_sender_opts_read_timeout(
 /// Both old and new objects will have to be freed.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_opts_clone(
-    opts: *const line_sender_opts) -> *mut line_sender_opts
-{
+    opts: *const line_sender_opts,
+) -> *mut line_sender_opts {
     let builder = &(*opts).0;
     let new_builder = builder.clone();
     Box::into_raw(Box::new(line_sender_opts(new_builder)))
@@ -550,9 +523,7 @@ pub unsafe extern "C" fn line_sender_opts_clone(
 
 /// Release the opts object.
 #[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_free(
-    opts: *mut line_sender_opts)
-{
+pub unsafe extern "C" fn line_sender_opts_free(opts: *mut line_sender_opts) {
     if !opts.is_null() {
         drop(Box::from_raw(opts));
     }
@@ -564,8 +535,7 @@ pub struct line_sender_buffer(Buffer);
 
 /// Create a buffer for serializing ILP messages.
 #[no_mangle]
-pub unsafe extern "C" fn line_sender_buffer_new() -> *mut line_sender_buffer
-{
+pub unsafe extern "C" fn line_sender_buffer_new() -> *mut line_sender_buffer {
     let buffer = Buffer::new();
     Box::into_raw(Box::new(line_sender_buffer(buffer)))
 }
@@ -573,39 +543,33 @@ pub unsafe extern "C" fn line_sender_buffer_new() -> *mut line_sender_buffer
 /// Create a buffer for serializing ILP messages.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_buffer_with_max_name_len(
-    max_name_len: size_t) -> *mut line_sender_buffer
-{
+    max_name_len: size_t,
+) -> *mut line_sender_buffer {
     let buffer = Buffer::with_max_name_len(max_name_len);
     Box::into_raw(Box::new(line_sender_buffer(buffer)))
 }
 
 /// Release the buffer object.
 #[no_mangle]
-pub unsafe extern "C" fn line_sender_buffer_free(
-    buffer: *mut line_sender_buffer)
-{
+pub unsafe extern "C" fn line_sender_buffer_free(buffer: *mut line_sender_buffer) {
     if !buffer.is_null() {
         drop(Box::from_raw(buffer));
     }
 }
 
-unsafe fn unwrap_buffer<'a>(
-    buffer: *const line_sender_buffer) -> &'a Buffer
-{
+unsafe fn unwrap_buffer<'a>(buffer: *const line_sender_buffer) -> &'a Buffer {
     &(&*buffer).0
 }
 
-unsafe fn unwrap_buffer_mut<'a>(
-    buffer: *mut line_sender_buffer) -> &'a mut Buffer
-{
+unsafe fn unwrap_buffer_mut<'a>(buffer: *mut line_sender_buffer) -> &'a mut Buffer {
     &mut (&mut *buffer).0
 }
 
 /// Create a new copy of the buffer.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_buffer_clone(
-    buffer: *const line_sender_buffer) -> *mut line_sender_buffer
-{
+    buffer: *const line_sender_buffer,
+) -> *mut line_sender_buffer {
     let new_buffer = unwrap_buffer(buffer).clone();
     Box::into_raw(Box::new(line_sender_buffer(new_buffer)))
 }
@@ -616,17 +580,15 @@ pub unsafe extern "C" fn line_sender_buffer_clone(
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_buffer_reserve(
     buffer: *mut line_sender_buffer,
-    additional: size_t)
-{
+    additional: size_t,
+) {
     let buffer = unwrap_buffer_mut(buffer);
     buffer.reserve(additional);
 }
 
 /// Get the current capacity of the buffer.
 #[no_mangle]
-pub unsafe extern "C" fn line_sender_buffer_capacity(
-    buffer: *const line_sender_buffer) -> size_t
-{
+pub unsafe extern "C" fn line_sender_buffer_capacity(buffer: *const line_sender_buffer) -> size_t {
     unwrap_buffer(buffer).capacity()
 }
 
@@ -638,8 +600,8 @@ pub unsafe extern "C" fn line_sender_buffer_capacity(
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_buffer_set_marker(
     buffer: *mut line_sender_buffer,
-    err_out: *mut *mut line_sender_error) -> bool
-{
+    err_out: *mut *mut line_sender_error,
+) -> bool {
     let buffer = unwrap_buffer_mut(buffer);
     bubble_err_to_c!(err_out, buffer.set_marker());
     true
@@ -650,8 +612,8 @@ pub unsafe extern "C" fn line_sender_buffer_set_marker(
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_buffer_rewind_to_marker(
     buffer: *mut line_sender_buffer,
-    err_out: *mut *mut line_sender_error) -> bool
-{
+    err_out: *mut *mut line_sender_error,
+) -> bool {
     let buffer = unwrap_buffer_mut(buffer);
     bubble_err_to_c!(err_out, buffer.rewind_to_marker());
     true
@@ -659,9 +621,7 @@ pub unsafe extern "C" fn line_sender_buffer_rewind_to_marker(
 
 /// Discard the marker.
 #[no_mangle]
-pub unsafe extern "C" fn line_sender_buffer_clear_marker(
-    buffer: *mut line_sender_buffer)
-{
+pub unsafe extern "C" fn line_sender_buffer_clear_marker(buffer: *mut line_sender_buffer) {
     let buffer = unwrap_buffer_mut(buffer);
     buffer.clear_marker();
 }
@@ -669,18 +629,14 @@ pub unsafe extern "C" fn line_sender_buffer_clear_marker(
 /// Remove all accumulated data and prepare the buffer for new lines.
 /// This does not affect the buffer's capacity.
 #[no_mangle]
-pub unsafe extern "C" fn line_sender_buffer_clear(
-    buffer: *mut line_sender_buffer)
-{
+pub unsafe extern "C" fn line_sender_buffer_clear(buffer: *mut line_sender_buffer) {
     let buffer = unwrap_buffer_mut(buffer);
     buffer.clear();
 }
 
 /// Number of bytes in the accumulated buffer.
 #[no_mangle]
-pub unsafe extern "C" fn line_sender_buffer_size(
-    buffer: *const line_sender_buffer) -> size_t
-{
+pub unsafe extern "C" fn line_sender_buffer_size(buffer: *const line_sender_buffer) -> size_t {
     let buffer = unwrap_buffer(buffer);
     buffer.len()
 }
@@ -693,8 +649,8 @@ pub unsafe extern "C" fn line_sender_buffer_size(
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_buffer_peek(
     buffer: *const line_sender_buffer,
-    len_out: *mut size_t) -> *const c_char
-{
+    len_out: *mut size_t,
+) -> *const c_char {
     let buffer = unwrap_buffer(buffer);
     let buf: &[u8] = buffer.as_str().as_bytes();
     *len_out = buf.len();
@@ -708,8 +664,8 @@ pub unsafe extern "C" fn line_sender_buffer_peek(
 pub unsafe extern "C" fn line_sender_buffer_table(
     buffer: *mut line_sender_buffer,
     name: line_sender_table_name,
-    err_out: *mut *mut line_sender_error) -> bool
-{
+    err_out: *mut *mut line_sender_error,
+) -> bool {
     let buffer = unwrap_buffer_mut(buffer);
     bubble_err_to_c!(err_out, buffer.table(name.as_name()));
     true
@@ -728,8 +684,8 @@ pub unsafe extern "C" fn line_sender_buffer_symbol(
     buffer: *mut line_sender_buffer,
     name: line_sender_column_name,
     value: line_sender_utf8,
-    err_out: *mut *mut line_sender_error) -> bool
-{
+    err_out: *mut *mut line_sender_error,
+) -> bool {
     let buffer = unwrap_buffer_mut(buffer);
     bubble_err_to_c!(err_out, buffer.symbol(name.as_name(), value.as_str()));
     true
@@ -746,8 +702,8 @@ pub unsafe extern "C" fn line_sender_buffer_column_bool(
     buffer: *mut line_sender_buffer,
     name: line_sender_column_name,
     value: bool,
-    err_out: *mut *mut line_sender_error) -> bool
-{
+    err_out: *mut *mut line_sender_error,
+) -> bool {
     let buffer = unwrap_buffer_mut(buffer);
     bubble_err_to_c!(err_out, buffer.column_bool(name.as_name(), value));
     true
@@ -764,8 +720,8 @@ pub unsafe extern "C" fn line_sender_buffer_column_i64(
     buffer: *mut line_sender_buffer,
     name: line_sender_column_name,
     value: i64,
-    err_out: *mut *mut line_sender_error) -> bool
-{
+    err_out: *mut *mut line_sender_error,
+) -> bool {
     let buffer = unwrap_buffer_mut(buffer);
     bubble_err_to_c!(err_out, buffer.column_i64(name.as_name(), value));
     true
@@ -782,8 +738,8 @@ pub unsafe extern "C" fn line_sender_buffer_column_f64(
     buffer: *mut line_sender_buffer,
     name: line_sender_column_name,
     value: f64,
-    err_out: *mut *mut line_sender_error) -> bool
-{
+    err_out: *mut *mut line_sender_error,
+) -> bool {
     let buffer = unwrap_buffer_mut(buffer);
     bubble_err_to_c!(err_out, buffer.column_f64(name.as_name(), value));
     true
@@ -800,8 +756,8 @@ pub unsafe extern "C" fn line_sender_buffer_column_str(
     buffer: *mut line_sender_buffer,
     name: line_sender_column_name,
     value: line_sender_utf8,
-    err_out: *mut *mut line_sender_error) -> bool
-{
+    err_out: *mut *mut line_sender_error,
+) -> bool {
     let buffer = unwrap_buffer_mut(buffer);
     let name = name.as_name();
     let value = value.as_str();
@@ -820,12 +776,10 @@ pub unsafe extern "C" fn line_sender_buffer_column_ts(
     buffer: *mut line_sender_buffer,
     name: line_sender_column_name,
     micros: i64,
-    err_out: *mut *mut line_sender_error) -> bool
-{
+    err_out: *mut *mut line_sender_error,
+) -> bool {
     let buffer = unwrap_buffer_mut(buffer);
-    let timestamp = bubble_err_to_c!(
-        err_out,
-        TimestampMicros::new(micros));
+    let timestamp = bubble_err_to_c!(err_out, TimestampMicros::new(micros));
     bubble_err_to_c!(err_out, buffer.column_ts(name.as_name(), timestamp));
     true
 }
@@ -844,12 +798,10 @@ pub unsafe extern "C" fn line_sender_buffer_column_ts(
 pub unsafe extern "C" fn line_sender_buffer_at(
     buffer: *mut line_sender_buffer,
     epoch_nanos: i64,
-    err_out: *mut *mut line_sender_error) -> bool
-{
+    err_out: *mut *mut line_sender_error,
+) -> bool {
     let buffer = unwrap_buffer_mut(buffer);
-    let timestamp = bubble_err_to_c!(
-        err_out,
-        TimestampNanos::new(epoch_nanos));
+    let timestamp = bubble_err_to_c!(err_out, TimestampNanos::new(epoch_nanos));
     bubble_err_to_c!(err_out, buffer.at(timestamp));
     true
 }
@@ -867,8 +819,8 @@ pub unsafe extern "C" fn line_sender_buffer_at(
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_buffer_at_now(
     buffer: *mut line_sender_buffer,
-    err_out: *mut *mut line_sender_error) -> bool
-{
+    err_out: *mut *mut line_sender_error,
+) -> bool {
     let buffer = unwrap_buffer_mut(buffer);
     bubble_err_to_c!(err_out, buffer.at_now());
     true
@@ -885,8 +837,8 @@ pub struct line_sender(Sender);
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_connect(
     opts: *const line_sender_opts,
-    err_out: *mut *mut line_sender_error) -> *mut line_sender
-{
+    err_out: *mut *mut line_sender_error,
+) -> *mut line_sender {
     let builder = &(*opts).0;
     let sender = bubble_err_to_c!(err_out, builder.connect(), ptr::null_mut());
     Box::into_raw(Box::new(line_sender(sender)))
@@ -896,9 +848,7 @@ unsafe fn unwrap_sender<'a>(sender: *const line_sender) -> &'a Sender {
     &(&*sender).0
 }
 
-unsafe fn unwrap_sender_mut<'a>(
-    sender: *mut line_sender) -> &'a mut Sender
-{
+unsafe fn unwrap_sender_mut<'a>(sender: *mut line_sender) -> &'a mut Sender {
     &mut (&mut *sender).0
 }
 
@@ -906,9 +856,7 @@ unsafe fn unwrap_sender_mut<'a>(
 /// @param[in] sender Line sender object.
 /// @return true if an error occurred with a sender and it must be closed.
 #[no_mangle]
-pub unsafe extern "C" fn line_sender_must_close(
-    sender: *const line_sender) -> bool
-{
+pub unsafe extern "C" fn line_sender_must_close(sender: *const line_sender) -> bool {
     unwrap_sender(sender).must_close()
 }
 
@@ -933,13 +881,11 @@ pub unsafe extern "C" fn line_sender_close(sender: *mut line_sender) {
 pub unsafe extern "C" fn line_sender_flush(
     sender: *mut line_sender,
     buffer: *mut line_sender_buffer,
-    err_out: *mut *mut line_sender_error) -> bool
-{
+    err_out: *mut *mut line_sender_error,
+) -> bool {
     let sender = unwrap_sender_mut(sender);
     let buffer = unwrap_buffer_mut(buffer);
-    bubble_err_to_c!(
-        err_out,
-        sender.flush(buffer));
+    bubble_err_to_c!(err_out, sender.flush(buffer));
     true
 }
 
@@ -954,12 +900,10 @@ pub unsafe extern "C" fn line_sender_flush(
 pub unsafe extern "C" fn line_sender_flush_and_keep(
     sender: *mut line_sender,
     buffer: *const line_sender_buffer,
-    err_out: *mut *mut line_sender_error) -> bool
-{
+    err_out: *mut *mut line_sender_error,
+) -> bool {
     let sender = unwrap_sender_mut(sender);
     let buffer = unwrap_buffer(buffer);
-    bubble_err_to_c!(
-        err_out,
-        sender.flush_and_keep(buffer));
+    bubble_err_to_c!(err_out, sender.flush_and_keep(buffer));
     true
 }

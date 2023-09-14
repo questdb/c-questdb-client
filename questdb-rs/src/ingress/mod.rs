@@ -23,7 +23,7 @@
  ******************************************************************************/
 
 //! # Fast Ingestion of data into QuestDB
-//! 
+//!
 //! The `ingress` module implements QuestDB's variant of the
 //! [InfluxDB Line Protocol](https://questdb.io/docs/reference/api/ilp/overview/)
 //! (ILP) over TCP.
@@ -32,7 +32,7 @@
 //!   * Connect to QuestDB by creating a [`Sender`] object.
 //!   * Populate a [`Buffer`] with one or more rows of data.
 //!   * Send the buffer via the Sender's [`flush`](Sender::flush) method.
-//! 
+//!
 //! ```no_run
 //! use questdb::{
 //!     Result,
@@ -40,7 +40,7 @@
 //!         Sender,
 //!         Buffer,
 //!         SenderBuilder}};
-//! 
+//!
 //! fn main() -> Result<()> {
 //!    let mut sender = SenderBuilder::new("localhost", 9009).connect()?;
 //!    let mut buffer = Buffer::new();
@@ -54,12 +54,12 @@
 //!    Ok(())
 //! }
 //! ```
-//! 
+//!
 //! # Flushing
-//! 
+//!
 //! The Sender's [`flush`](Sender::flush) method will clear the buffer
 //! which is then reusable for another batch of rows.
-//! 
+//!
 //! Dropping the sender will close the connection to QuestDB and any unflushed
 //! messages will be lost: In other words, *do not forget to
 //! [`flush`](Sender::flush) before closing the connection!*
@@ -68,24 +68,24 @@
 //! buffer exceeds a certain size.
 //! You can check the buffer's size by the calling Buffer's [`len`](Buffer::len)
 //! method.
-//! 
+//!
 //! Note that flushing will automatically clear the buffer's contents.
 //! If you'd rather preserve the contents (for example, to send the same data to
 //! multiple QuestDB instances), you can call
 //! [`flush_and_keep`](Sender::flush_and_keep) instead.
 //!
 //! # Connection Security Options
-//! 
+//!
 //! To establish an [authenticated](https://questdb.io/docs/reference/api/ilp/authenticate)
 //! and TLS-encrypted connection, call the SenderBuilder's
 //! [`auth`](SenderBuilder::auth) and [`tls`](SenderBuilder::tls) methods.
-//! 
+//!
 //! Here's an example that uses full security:
-//! 
+//!
 //! ```no_run
 //! # use questdb::Result;
 //! use questdb::ingress::{SenderBuilder, Tls, CertificateAuthority};
-//! 
+//!
 //! # fn main() -> Result<()> {
 //! // See: https://questdb.io/docs/reference/api/ilp/authenticate
 //! let mut sender = SenderBuilder::new("localhost", 9009)
@@ -99,22 +99,22 @@
 //! # Ok(())
 //! # }
 //! ```
-//! 
+//!
 //! Note that as of writing QuestDB does not natively support TLS encryption.
 //! To use TLS use a TLS proxy such as [HAProxy](http://www.haproxy.org/).
-//! 
+//!
 //! For testing, you can use a self-signed certificate and key.
-//! 
+//!
 //! See our notes on [how to generate keys that this library will
 //! accept](https://github.com/questdb/c-questdb-client/tree/main/tls_certs).
-//! 
+//!
 //! From the API, you can then point to a custom CA file:
-//! 
+//!
 //! ```no_run
 //! # use questdb::Result;
 //! use std::path::PathBuf;
 //! use questdb::ingress::{SenderBuilder, Tls, CertificateAuthority};
-//! 
+//!
 //! # fn main() -> Result<()> {
 //! let mut sender = SenderBuilder::new("localhost", 9009)
 //!     .tls(Tls::Enabled(CertificateAuthority::File(
@@ -123,18 +123,18 @@
 //! # Ok(())
 //! # }
 //! ```
-//! 
+//!
 //! # Avoiding revalidating names
 //! To avoid re-validating table and column names, consider re-using them across
 //! rows.
-//! 
+//!
 //! ```
 //! # use questdb::Result;
 //! use questdb::ingress::{
 //!     TableName,
 //!     ColumnName,
 //!     Buffer};
-//! 
+//!
 //! # fn main() -> Result<()> {
 //! let mut buffer = Buffer::new();
 //! let tide_name = TableName::new("tide")?;
@@ -146,65 +146,64 @@
 //! ```
 //!
 //! # Buffer API sequential coupling
-//! 
+//!
 //! Symbols must always be written before rows. See the [`Buffer`] documentation
 //! for details. Each row must be terminated with a call to either
 //! [`at`](Buffer::at) or [`at_now`](Buffer::at_now).
-//! 
+//!
 //! # Data quality and threading considerations
-//! 
+//!
 //! * [Library considerations](https://github.com/questdb/c-questdb-client/blob/main/doc/CONSIDERATIONS.md) documentation.
-//! 
+//!
 //! # Troubleshooting Common Issues
-//! 
+//!
 //! ## Production-optimized QuestDB configuration
-//! 
+//!
 //! If you can’t initially see your data through a `select` SQL query straight
 //! away, this is normal: by default the database will only commit data it
 //! receives though the line protocol periodically to maximize throughput.
-//! 
+//!
 //! For dev/testing you may want to tune the following database configuration
 //! parameters as so in
 //! [`server.conf`](https://questdb.io/docs/reference/configuration/):
-//! 
+//!
 //! ```ini
 //! cairo.max.uncommitted.rows=1
 //! line.tcp.maintenance.job.interval=100
 //! ```
-//! 
+//!
 //! ## Infrequent Flushing
-//! 
+//!
 //! You may not see data appear in a timely manner because you’re not calling
 //! the [`flush`](Sender::flush) method often enough.
-//! 
+//!
 //! ## Debugging disconnects and inspecting errors
-//! 
+//!
 //! The ILP protocol does not send errors back to the client.
 //! Instead, on error, the QuestDB server will disconnect and any error messages
 //! will be present in the
 //! [server logs](https://questdb.io/docs/concept/root-directory-structure#log-directory).
-//! 
+//!
 //! If you want to inspect or log a buffer's contents before it is sent, you
 //! can call its [`as_str`](Buffer::as_str) method.
-//! 
+//!
 
-pub use self::timestamp::{TimestampNanos, TimestampMicros};
+pub use self::timestamp::{TimestampMicros, TimestampNanos};
 
 use crate::error::{self, Error, Result};
 use crate::gai;
 use core::time::Duration;
-use std::convert::{TryFrom, TryInto, Infallible};
-use std::fmt::{Write, Formatter};
-use std::io::{self, BufRead, BufReader, Write as IoWrite, ErrorKind};
-use std::sync::Arc;
-use std::path::PathBuf;
 use itoa;
+use std::convert::{Infallible, TryFrom, TryInto};
+use std::fmt::{Formatter, Write};
+use std::io::{self, BufRead, BufReader, ErrorKind, Write as IoWrite};
+use std::path::PathBuf;
+use std::sync::Arc;
 
-use socket2::{Domain, Socket, SockAddr, Type, Protocol};
 use base64ct::{Base64, Base64UrlUnpadded, Encoding};
 use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
-use rustls::{
-    OwnedTrustAnchor, RootCertStore, ClientConnection, ServerName, StreamOwned};
+use rustls::{ClientConnection, OwnedTrustAnchor, RootCertStore, ServerName, StreamOwned};
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 #[derive(Debug, Copy, Clone)]
 enum Op {
@@ -212,7 +211,7 @@ enum Op {
     Symbol = 1 << 1,
     Column = 1 << 2,
     At = 1 << 3,
-    Flush = 1 << 4
+    Flush = 1 << 4,
 }
 
 impl Op {
@@ -222,33 +221,34 @@ impl Op {
             Op::Symbol => "symbol",
             Op::Column => "column",
             Op::At => "at",
-            Op::Flush => "flush"
+            Op::Flush => "flush",
         }
     }
 }
-
 
 fn map_io_to_socket_err(prefix: &str, io_err: io::Error) -> Error {
     error::fmt!(SocketError, "{}{}", prefix, io_err)
 }
 
 /// A validated table name.
-/// 
+///
 /// This type simply wraps a `&str`.
-/// 
+///
 /// You can use it to construct it explicitly to avoid re-validating the same
 /// names over and over.
 #[derive(Clone, Copy)]
 pub struct TableName<'a> {
-    name: &'a str
+    name: &'a str,
 }
 
-impl <'a> TableName<'a> {
+impl<'a> TableName<'a> {
     /// Construct a validated table name.
     pub fn new(name: &'a str) -> Result<Self> {
         if name.is_empty() {
             return Err(error::fmt!(
-                InvalidName, "Table names must have a non-zero length."));
+                InvalidName,
+                "Table names must have a non-zero length."
+            ));
         }
 
         let mut prev = '\0';
@@ -258,28 +258,29 @@ impl <'a> TableName<'a> {
                     if index == 0 || index == name.len() - 1 || prev == '.' {
                         return Err(error::fmt!(
                             InvalidName,
-                            concat!(
-                                "Bad string {:?}: ",
-                                "Found invalid dot `.` at position {}."),
-                            name, index));
+                            concat!("Bad string {:?}: ", "Found invalid dot `.` at position {}."),
+                            name,
+                            index
+                        ));
                     }
-                },
-                '?' | ',' | '\'' | '\"' | '\\' | '/' | ':' | ')' |
-                '(' | '+' | '*' | '%' | '~' | '\r' | '\n' | '\0' |
-                '\u{0001}' | '\u{0002}' | '\u{0003}' | '\u{0004}' | '\u{0005}' |
-                '\u{0006}' | '\u{0007}' | '\u{0008}' | '\u{0009}' | '\u{000b}' |
-                '\u{000c}' | '\u{000e}' | '\u{000f}' | '\u{007f}' => {
+                }
+                '?' | ',' | '\'' | '\"' | '\\' | '/' | ':' | ')' | '(' | '+' | '*' | '%' | '~'
+                | '\r' | '\n' | '\0' | '\u{0001}' | '\u{0002}' | '\u{0003}' | '\u{0004}'
+                | '\u{0005}' | '\u{0006}' | '\u{0007}' | '\u{0008}' | '\u{0009}' | '\u{000b}'
+                | '\u{000c}' | '\u{000e}' | '\u{000f}' | '\u{007f}' => {
                     return Err(error::fmt!(
                         InvalidName,
                         concat!(
                             "Bad string {:?}: ",
                             "Table names can't contain ",
                             "a {:?} character, which was found at ",
-                            "byte position {}."),
+                            "byte position {}."
+                        ),
                         name,
                         c,
-                        index));
-                },
+                        index
+                    ));
+                }
                 '\u{feff}' => {
                     // Reject unicode char 'ZERO WIDTH NO-BREAK SPACE',
                     // aka UTF-8 BOM if it appears anywhere in the string.
@@ -289,11 +290,13 @@ impl <'a> TableName<'a> {
                             "Bad string {:?}: ",
                             "Table names can't contain ",
                             "a UTF-8 BOM character, which was found at ",
-                            "byte position {}."),
+                            "byte position {}."
+                        ),
                         name,
-                        index));
-                },
-                _ => ()
+                        index
+                    ));
+                }
+                _ => (),
             }
             prev = c;
         }
@@ -302,10 +305,10 @@ impl <'a> TableName<'a> {
     }
 
     /// Construct an unvalidated table name.
-    /// 
+    ///
     /// This breaks API encapsulation and is only intended for use
     /// when the the string was already previously validated.
-    /// 
+    ///
     /// Invalid table names will be rejected by the QuestDB server.
     pub fn new_unchecked(name: &'a str) -> Self {
         Self { name: name }
@@ -313,57 +316,61 @@ impl <'a> TableName<'a> {
 }
 
 /// A validated column name.
-/// 
+///
 /// This type simply wraps a `&str`.
-/// 
+///
 /// You can use it to construct it explicitly to avoid re-validating the same
 /// names over and over.
 #[derive(Clone, Copy)]
 pub struct ColumnName<'a> {
-    name: &'a str
+    name: &'a str,
 }
 
-impl <'a> ColumnName<'a> {
+impl<'a> ColumnName<'a> {
     /// Construct a validated table name.
     pub fn new(name: &'a str) -> Result<Self> {
         if name.is_empty() {
             return Err(error::fmt!(
                 InvalidName,
-                "Column names must have a non-zero length."));
+                "Column names must have a non-zero length."
+            ));
         }
 
         for (index, c) in name.chars().enumerate() {
             match c {
-                '?' | '.' | ',' | '\'' | '\"' | '\\' | '/' | ':' | ')' | '(' |
-                '+' | '-' | '*' | '%' | '~' | '\r' | '\n' | '\0' |
-                '\u{0001}' | '\u{0002}' | '\u{0003}' | '\u{0004}' | '\u{0005}' |
-                '\u{0006}' | '\u{0007}' | '\u{0008}' | '\u{0009}' | '\u{000b}' |
-                '\u{000c}' | '\u{000e}' | '\u{000f}' | '\u{007f}' => {
+                '?' | '.' | ',' | '\'' | '\"' | '\\' | '/' | ':' | ')' | '(' | '+' | '-' | '*'
+                | '%' | '~' | '\r' | '\n' | '\0' | '\u{0001}' | '\u{0002}' | '\u{0003}'
+                | '\u{0004}' | '\u{0005}' | '\u{0006}' | '\u{0007}' | '\u{0008}' | '\u{0009}'
+                | '\u{000b}' | '\u{000c}' | '\u{000e}' | '\u{000f}' | '\u{007f}' => {
                     return Err(error::fmt!(
                         InvalidName,
                         concat!(
                             "Bad string {:?}: ",
                             "Column names can't contain ",
                             "a {:?} character, which was found at ",
-                            "byte position {}."),
+                            "byte position {}."
+                        ),
                         name,
                         c,
-                        index));
-                },
+                        index
+                    ));
+                }
                 '\u{FEFF}' => {
                     // Reject unicode char 'ZERO WIDTH NO-BREAK SPACE',
                     // aka UTF-8 BOM if it appears anywhere in the string.
                     return Err(error::fmt!(
                         InvalidName,
-                            concat!(
-                                "Bad string {:?}: ",
-                                "Column names can't contain ",
-                                "a UTF-8 BOM character, which was found at ",
-                                "byte position {}."),
-                            name,
-                            index));
-                },
-                _ => ()
+                        concat!(
+                            "Bad string {:?}: ",
+                            "Column names can't contain ",
+                            "a UTF-8 BOM character, which was found at ",
+                            "byte position {}."
+                        ),
+                        name,
+                        index
+                    ));
+                }
+                _ => (),
             }
         }
 
@@ -371,17 +378,17 @@ impl <'a> ColumnName<'a> {
     }
 
     /// Construct an unvalidated column name.
-    /// 
+    ///
     /// This breaks API encapsulation and is only intended for use
     /// when the the string was already previously validated.
-    /// 
+    ///
     /// Invalid column names will be rejected by the QuestDB server.
     pub fn new_unchecked(name: &'a str) -> Self {
         Self { name: name }
     }
 }
 
-impl <'a> TryFrom<&'a str> for TableName<'a> {
+impl<'a> TryFrom<&'a str> for TableName<'a> {
     type Error = self::Error;
 
     fn try_from(name: &'a str) -> Result<Self> {
@@ -389,7 +396,7 @@ impl <'a> TryFrom<&'a str> for TableName<'a> {
     }
 }
 
-impl <'a> TryFrom<&'a str> for ColumnName<'a> {
+impl<'a> TryFrom<&'a str> for ColumnName<'a> {
     type Error = self::Error;
 
     fn try_from(name: &'a str) -> Result<Self> {
@@ -403,14 +410,10 @@ impl From<Infallible> for Error {
     }
 }
 
-fn write_escaped_impl<Q, C>(
-    check_escape_fn: C,
-    quoting_fn: Q,
-    output: &mut String,
-    s: &str)
-        where
-            C: Fn(char) -> bool,
-            Q: Fn(&mut String) -> ()
+fn write_escaped_impl<Q, C>(check_escape_fn: C, quoting_fn: Q, output: &mut String, s: &str)
+where
+    C: Fn(char) -> bool,
+    Q: Fn(&mut String) -> (),
 {
     let mut to_escape = 0usize;
     for c in s.chars() {
@@ -423,8 +426,7 @@ fn write_escaped_impl<Q, C>(
 
     if to_escape == 0 {
         output.push_str(s);
-    }
-    else {
+    } else {
         output.reserve(s.len() + to_escape);
         for c in s.chars() {
             if check_escape_fn(c) {
@@ -440,43 +442,35 @@ fn write_escaped_impl<Q, C>(
 fn must_escape_unquoted(c: char) -> bool {
     match c {
         ' ' | ',' | '=' | '\n' | '\r' | '\\' => true,
-        _ => false
+        _ => false,
     }
 }
 
 fn must_escape_quoted(c: char) -> bool {
     match c {
         '\n' | '\r' | '"' | '\\' => true,
-        _ => false
+        _ => false,
     }
 }
 
 fn write_escaped_unquoted(output: &mut String, s: &str) {
-    write_escaped_impl(
-        must_escape_unquoted,
-        |_output| (),
-        output,
-        s);
+    write_escaped_impl(must_escape_unquoted, |_output| (), output, s);
 }
 
 fn write_escaped_quoted(output: &mut String, s: &str) {
-    write_escaped_impl(
-        must_escape_quoted,
-        |output| output.push('"'),
-        output,
-        s)
+    write_escaped_impl(must_escape_quoted, |output| output.push('"'), output, s)
 }
 
 enum Connection {
     Direct(Socket),
-    Tls(StreamOwned<ClientConnection, Socket>)
+    Tls(StreamOwned<ClientConnection, Socket>),
 }
 
 impl io::Read for Connection {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             Self::Direct(sock) => sock.read(buf),
-            Self::Tls(stream) => stream.read(buf)
+            Self::Tls(stream) => stream.read(buf),
         }
     }
 }
@@ -485,61 +479,51 @@ impl io::Write for Connection {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
             Self::Direct(sock) => sock.write(buf),
-            Self::Tls(stream) => stream.write(buf)
+            Self::Tls(stream) => stream.write(buf),
         }
     }
 
     fn flush(&mut self) -> io::Result<()> {
         match self {
             Self::Direct(sock) => sock.flush(),
-            Self::Tls(stream) => stream.flush()
+            Self::Tls(stream) => stream.flush(),
         }
     }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 enum State {
-    Init =
-        Op::Table as isize,
-    TableWritten =
-        Op::Symbol as isize | Op::Column as isize,
-    SymbolWritten =
-        Op::Symbol as isize | Op::Column as isize | Op::At as isize,
-    ColumnWritten =
-        Op::Column as isize | Op::At as isize,
-    MayFlushOrTable =
-        Op::Flush as isize | Op::Table as isize
+    Init = Op::Table as isize,
+    TableWritten = Op::Symbol as isize | Op::Column as isize,
+    SymbolWritten = Op::Symbol as isize | Op::Column as isize | Op::At as isize,
+    ColumnWritten = Op::Column as isize | Op::At as isize,
+    MayFlushOrTable = Op::Flush as isize | Op::Table as isize,
 }
 
 impl State {
     fn next_op_descr(self) -> &'static str {
         match self {
-            State::Init =>
-                "should have called `table` instead",
-            State::TableWritten =>
-                "should have called `symbol` or `column` instead",
-            State::SymbolWritten =>
-                "should have called `symbol`, `column` or `at` instead",
-            State::ColumnWritten =>
-                "should have called `column` or `at` instead",
-            State::MayFlushOrTable =>
-                "should have called `flush` or `table` instead"
+            State::Init => "should have called `table` instead",
+            State::TableWritten => "should have called `symbol` or `column` instead",
+            State::SymbolWritten => "should have called `symbol`, `column` or `at` instead",
+            State::ColumnWritten => "should have called `column` or `at` instead",
+            State::MayFlushOrTable => "should have called `flush` or `table` instead",
         }
     }
 }
 
 /// A reusable buffer to prepare ILP messages.
-/// 
+///
 /// # Example
-/// 
+///
 /// ```
 /// # use questdb::Result;
 /// use questdb::ingress::Buffer;
 /// use std::time::SystemTime;
-/// 
+///
 /// # fn main() -> Result<()> {
 /// let mut buffer = Buffer::new();
-/// 
+///
 /// // first row
 /// buffer
 ///     .table("table1")?
@@ -550,7 +534,7 @@ impl State {
 ///     .column_str("d", "hello")?
 ///     .column_ts("e", SystemTime::now())?
 ///     .at(SystemTime::now())?;
-/// 
+///
 /// // second row
 /// buffer
 ///     .table("table2")?
@@ -559,10 +543,10 @@ impl State {
 /// # Ok(())
 /// # }
 /// ```
-/// 
+///
 /// The buffer can then be sent with the Sender's [`flush`](Sender::flush)
 /// method.
-/// 
+///
 /// # Sequential Coupling
 /// The Buffer API is sequentially coupled:
 ///   * A row always starts with [`table`](Buffer::table).
@@ -576,13 +560,13 @@ impl State {
 ///   * Symbols must always appear before columns.
 ///   * A row must be terminated with either [`at`](Buffer::at) or
 ///     [`at_now`](Buffer::at_now).
-/// 
+///
 /// This diagram might help:
-/// 
+///
 /// <img src="https://raw.githubusercontent.com/questdb/c-questdb-client/main/api_seq/seq.svg">
-/// 
+///
 /// # Buffer method calls, Serialized ILP types and QuestDB types
-/// 
+///
 /// | Buffer Method | Serialized as ILP type (Click on link to see possible casts) |
 /// |---------------|--------------------------------------------------------------|
 /// | [`symbol`](Buffer::symbol) | [`SYMBOL`](https://questdb.io/docs/concept/symbol/) |
@@ -591,29 +575,29 @@ impl State {
 /// | [`column_f64`](Buffer::column_f64) | [`FLOAT`](https://questdb.io/docs/reference/api/ilp/columnset-types#float) |
 /// | [`column_str`](Buffer::column_str) | [`STRING`](https://questdb.io/docs/reference/api/ilp/columnset-types#string) |
 /// | [`column_ts`](Buffer::column_ts) | [`TIMESTAMP`](https://questdb.io/docs/reference/api/ilp/columnset-types#timestamp) |
-/// 
+///
 /// QuestDB supports both `STRING` columns and `SYMBOL` column types.
-/// 
+///
 /// To understand the difference refer to the
 /// [QuestDB documentation](https://questdb.io/docs/concept/symbol/), but in
 /// short symbols are interned strings that are most suitable for identifiers
 /// that you expect to be repeated throughout the column.
-/// 
+///
 /// # Inserting NULL values
-/// 
+///
 /// To insert a NULL value, skip the symbol or column for that row.
 ///
 /// # Recovering from validation errors
-/// 
+///
 /// If you want to recover from potential validation errors, you can use the
 /// [`set_marker`](Buffer::set_marker) method to track a last known good state,
 /// append as many rows or parts of rows as you like and then call
 /// [`clear_marker`](Buffer::clear_marker) on success.
-/// 
+///
 /// If there was an error in one of the table names or other, you can use the
 /// [`rewind_to_marker`](Buffer::rewind_to_marker) method to go back to the
 /// marked last known good state.
-/// 
+///
 #[derive(Debug, Clone, PartialEq)]
 pub struct Buffer {
     state: State,
@@ -630,7 +614,7 @@ impl Buffer {
             state: State::Init,
             output: String::new(),
             marker: None,
-            max_name_len: 127
+            max_name_len: 127,
         }
     }
 
@@ -684,7 +668,9 @@ impl Buffer {
                 concat!(
                     "Can't set the marker whilst constructing a line. ",
                     "A marker may only be set on an empty buffer or after ",
-                    "`at` or `at_now` is called.")));
+                    "`at` or `at_now` is called."
+                )
+            ));
         }
         self.marker = Some((self.output.len(), self.state));
         Ok(())
@@ -692,7 +678,7 @@ impl Buffer {
 
     /// Undo all changes since the last [`set_marker`](Buffer::set_marker)
     /// call.
-    /// 
+    ///
     /// As a side-effect, this also clears the marker.
     pub fn rewind_to_marker(&mut self) -> Result<()> {
         if let Some((position, state)) = self.marker {
@@ -700,17 +686,17 @@ impl Buffer {
             self.state = state;
             self.marker = None;
             Ok(())
-        }
-        else {
+        } else {
             Err(error::fmt!(
                 InvalidApiCall,
-                "Can't rewind to the marker: No marker set."))
+                "Can't rewind to the marker: No marker set."
+            ))
         }
     }
 
     /// Discard any marker as may have been set by
     /// [`set_marker`](Buffer::set_marker).
-    /// 
+    ///
     /// Idempodent.
     pub fn clear_marker(&mut self) {
         self.marker = None;
@@ -732,7 +718,8 @@ impl Buffer {
             InvalidApiCall,
             "State error: Bad call to `{}`, {}.",
             op.descr(),
-            self.state.next_op_descr());
+            self.state.next_op_descr()
+        );
         Err(error)
     }
 
@@ -742,13 +729,14 @@ impl Buffer {
                 InvalidApiCall,
                 "Bad name: {:?}: Too long (max {} characters)",
                 name,
-                self.max_name_len));
+                self.max_name_len
+            ));
         }
         Ok(())
     }
 
     /// Begin recording a row for a given table.
-    /// 
+    ///
     /// ```
     /// # use questdb::Result;
     /// # use questdb::ingress::Buffer;
@@ -758,14 +746,14 @@ impl Buffer {
     /// # Ok(())
     /// # }
     /// ```
-    /// 
+    ///
     /// or
-    /// 
+    ///
     /// ```
     /// # use questdb::Result;
     /// # use questdb::ingress::Buffer;
     /// use questdb::ingress::TableName;
-    /// 
+    ///
     /// # fn main() -> Result<()> {
     /// # let mut buffer = Buffer::new();
     /// let table_name = TableName::new("table_name")?;
@@ -774,9 +762,9 @@ impl Buffer {
     /// # }
     /// ```
     pub fn table<'a, N>(&mut self, name: N) -> Result<&mut Self>
-        where
-            N: TryInto<TableName<'a>>,
-            Error: From<N::Error>
+    where
+        N: TryInto<TableName<'a>>,
+        Error: From<N::Error>,
     {
         let name: TableName<'a> = name.try_into()?;
         self.validate_max_name_len(name.name)?;
@@ -787,7 +775,7 @@ impl Buffer {
     }
 
     /// Record a symbol for a given column.
-    /// 
+    ///
     /// ```
     /// # use questdb::Result;
     /// # use questdb::ingress::Buffer;
@@ -798,9 +786,9 @@ impl Buffer {
     /// # Ok(())
     /// # }
     /// ```
-    /// 
+    ///
     /// or
-    /// 
+    ///
     /// ```
     /// # use questdb::Result;
     /// # use questdb::ingress::Buffer;
@@ -812,14 +800,14 @@ impl Buffer {
     /// # Ok(())
     /// # }
     /// ```
-    /// 
+    ///
     /// or
-    /// 
+    ///
     /// ```
     /// # use questdb::Result;
     /// # use questdb::ingress::Buffer;
     /// use questdb::ingress::ColumnName;
-    /// 
+    ///
     /// # fn main() -> Result<()> {
     /// # let mut buffer = Buffer::new();
     /// # buffer.table("x")?;
@@ -828,12 +816,12 @@ impl Buffer {
     /// # Ok(())
     /// # }
     /// ```
-    /// 
+    ///
     pub fn symbol<'a, N, S>(&mut self, name: N, value: S) -> Result<&mut Self>
-        where
-            N: TryInto<ColumnName<'a>>,
-            S: AsRef<str>,
-            Error: From<N::Error>
+    where
+        N: TryInto<ColumnName<'a>>,
+        S: AsRef<str>,
+        Error: From<N::Error>,
     {
         let name: ColumnName<'a> = name.try_into()?;
         self.validate_max_name_len(name.name)?;
@@ -847,15 +835,15 @@ impl Buffer {
     }
 
     fn write_column_key<'a, N>(&mut self, name: N) -> Result<&mut Self>
-        where
-            N: TryInto<ColumnName<'a>>,
-            Error: From<N::Error>
+    where
+        N: TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
     {
         let name: ColumnName<'a> = name.try_into()?;
         self.validate_max_name_len(name.name)?;
         self.check_state(Op::Column)?;
-        self.output.push(
-            if (self.state as isize & Op::Symbol as isize) > 0 {
+        self.output
+            .push(if (self.state as isize & Op::Symbol as isize) > 0 {
                 ' '
             } else {
                 ','
@@ -867,7 +855,7 @@ impl Buffer {
     }
 
     /// Record a boolean value for a column.
-    /// 
+    ///
     /// ```
     /// # use questdb::Result;
     /// # use questdb::ingress::Buffer;
@@ -878,14 +866,14 @@ impl Buffer {
     /// # Ok(())
     /// # }
     /// ```
-    /// 
+    ///
     /// or
-    /// 
+    ///
     /// ```
     /// # use questdb::Result;
     /// # use questdb::ingress::Buffer;
     /// use questdb::ingress::ColumnName;
-    /// 
+    ///
     /// # fn main() -> Result<()> {
     /// # let mut buffer = Buffer::new();
     /// # buffer.table("x")?;
@@ -894,19 +882,18 @@ impl Buffer {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn column_bool<'a, N>(
-        &mut self, name: N, value: bool) -> Result<&mut Self>
-        where
-            N: TryInto<ColumnName<'a>>,
-            Error: From<N::Error>
+    pub fn column_bool<'a, N>(&mut self, name: N, value: bool) -> Result<&mut Self>
+    where
+        N: TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
     {
         self.write_column_key(name)?;
-        self.output.push(if value {'t'} else {'f'});
+        self.output.push(if value { 't' } else { 'f' });
         Ok(self)
     }
 
     /// Record an integer value for a column.
-    /// 
+    ///
     /// ```
     /// # use questdb::Result;
     /// # use questdb::ingress::Buffer;
@@ -917,14 +904,14 @@ impl Buffer {
     /// # Ok(())
     /// # }
     /// ```
-    /// 
+    ///
     /// or
-    /// 
+    ///
     /// ```
     /// # use questdb::Result;
     /// # use questdb::ingress::Buffer;
     /// use questdb::ingress::ColumnName;
-    /// 
+    ///
     /// # fn main() -> Result<()> {
     /// # let mut buffer = Buffer::new();
     /// # buffer.table("x")?;
@@ -933,11 +920,10 @@ impl Buffer {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn column_i64<'a, N>(
-        &mut self, name: N, value: i64) -> Result<&mut Self>
-        where
-            N: TryInto<ColumnName<'a>>,
-            Error: From<N::Error>
+    pub fn column_i64<'a, N>(&mut self, name: N, value: i64) -> Result<&mut Self>
+    where
+        N: TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
     {
         self.write_column_key(name)?;
         let mut buf = itoa::Buffer::new();
@@ -948,7 +934,7 @@ impl Buffer {
     }
 
     /// Record a floating point value for a column.
-    /// 
+    ///
     /// ```
     /// # use questdb::Result;
     /// # use questdb::ingress::Buffer;
@@ -959,14 +945,14 @@ impl Buffer {
     /// # Ok(())
     /// # }
     /// ```
-    /// 
+    ///
     /// or
-    /// 
+    ///
     /// ```
     /// # use questdb::Result;
     /// # use questdb::ingress::Buffer;
     /// use questdb::ingress::ColumnName;
-    /// 
+    ///
     /// # fn main() -> Result<()> {
     /// # let mut buffer = Buffer::new();
     /// # buffer.table("x")?;
@@ -975,11 +961,10 @@ impl Buffer {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn column_f64<'a, N>(
-        &mut self, name: N, value: f64) -> Result<&mut Self>
-        where
-            N: TryInto<ColumnName<'a>>,
-            Error: From<N::Error>
+    pub fn column_f64<'a, N>(&mut self, name: N, value: f64) -> Result<&mut Self>
+    where
+        N: TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
     {
         self.write_column_key(name)?;
         let mut ser = F64Serializer::new(value);
@@ -999,9 +984,9 @@ impl Buffer {
     /// # Ok(())
     /// # }
     /// ```
-    /// 
+    ///
     /// or
-    /// 
+    ///
     /// ```
     /// # use questdb::Result;
     /// # use questdb::ingress::Buffer;
@@ -1013,14 +998,14 @@ impl Buffer {
     /// # Ok(())
     /// # }
     /// ```
-    /// 
+    ///
     /// or
-    /// 
+    ///
     /// ```
     /// # use questdb::Result;
     /// # use questdb::ingress::Buffer;
     /// use questdb::ingress::ColumnName;
-    /// 
+    ///
     /// # fn main() -> Result<()> {
     /// # let mut buffer = Buffer::new();
     /// # buffer.table("x")?;
@@ -1029,12 +1014,11 @@ impl Buffer {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn column_str<'a, N, S>(
-        &mut self, name: N, value: S) -> Result<&mut Self>
-        where
-            N: TryInto<ColumnName<'a>>,
-            S: AsRef<str>,
-            Error: From<N::Error>
+    pub fn column_str<'a, N, S>(&mut self, name: N, value: S) -> Result<&mut Self>
+    where
+        N: TryInto<ColumnName<'a>>,
+        S: AsRef<str>,
+        Error: From<N::Error>,
     {
         self.write_column_key(name)?;
         write_escaped_quoted(&mut self.output, value.as_ref());
@@ -1042,7 +1026,7 @@ impl Buffer {
     }
 
     /// Record a timestamp for a column.
-    /// 
+    ///
     /// ```
     /// # use questdb::Result;
     /// # use questdb::ingress::Buffer;
@@ -1053,14 +1037,14 @@ impl Buffer {
     /// # Ok(())
     /// # }
     /// ```
-    /// 
+    ///
     /// or
-    /// 
+    ///
     /// ```
     /// # use questdb::Result;
     /// # use questdb::ingress::Buffer;
     /// use questdb::ingress::TimestampMicros;
-    /// 
+    ///
     /// # fn main() -> Result<()> {
     /// # let mut buffer = Buffer::new();
     /// # buffer.table("x")?;
@@ -1068,14 +1052,14 @@ impl Buffer {
     /// # Ok(())
     /// # }
     /// ```
-    /// 
+    ///
     /// or
-    /// 
+    ///
     /// ```
     /// # use questdb::Result;
     /// # use questdb::ingress::Buffer;
     /// use questdb::ingress::ColumnName;
-    /// 
+    ///
     /// # fn main() -> Result<()> {
     /// # let mut buffer = Buffer::new();
     /// # buffer.table("x")?;
@@ -1084,15 +1068,14 @@ impl Buffer {
     /// # Ok(())
     /// # }
     /// ```
-    /// 
+    ///
     /// The timestamp should be in UTC.
-    pub fn column_ts<'a, N, T>(
-        &mut self, name: N, value: T) -> Result<&mut Self>
-        where
-            N: TryInto<ColumnName<'a>>,
-            T: TryInto<TimestampMicros>,
-            Error: From<N::Error>,
-            Error: From<T::Error>
+    pub fn column_ts<'a, N, T>(&mut self, name: N, value: T) -> Result<&mut Self>
+    where
+        N: TryInto<ColumnName<'a>>,
+        T: TryInto<TimestampMicros>,
+        Error: From<N::Error>,
+        Error: From<T::Error>,
     {
         self.write_column_key(name)?;
         let timestamp: TimestampMicros = value.try_into()?;
@@ -1104,7 +1087,7 @@ impl Buffer {
     }
 
     /// Terminate the row with a specified timestamp.
-    /// 
+    ///
     /// ```
     /// # use questdb::Result;
     /// # use questdb::ingress::Buffer;
@@ -1115,14 +1098,14 @@ impl Buffer {
     /// # Ok(())
     /// # }
     /// ```
-    /// 
+    ///
     /// or
-    /// 
+    ///
     /// ```
     /// # use questdb::Result;
     /// # use questdb::ingress::Buffer;
     /// use questdb::ingress::TimestampNanos;
-    /// 
+    ///
     /// # fn main() -> Result<()> {
     /// # let mut buffer = Buffer::new();
     /// # buffer.table("x")?.symbol("a", "b")?;
@@ -1130,12 +1113,12 @@ impl Buffer {
     /// # Ok(())
     /// # }
     /// ```
-    /// 
+    ///
     /// The timestamp should be in UTC.
     pub fn at<T>(&mut self, timestamp: T) -> Result<()>
-        where
-            T: TryInto<TimestampNanos>,
-            Error: From<T::Error>
+    where
+        T: TryInto<TimestampNanos>,
+        Error: From<T::Error>,
     {
         self.check_state(Op::At)?;
         let mut buf = itoa::Buffer::new();
@@ -1150,7 +1133,7 @@ impl Buffer {
     }
 
     /// Terminate the row with a server-specified timestamp.
-    /// 
+    ///
     /// ```
     /// # use questdb::Result;
     /// # use questdb::ingress::Buffer;
@@ -1161,7 +1144,7 @@ impl Buffer {
     /// # Ok(())
     /// # }
     /// ```
-    /// 
+    ///
     /// The QuestDB instance will set the timestamp once it receives the row.
     /// If you're [`flushing`](Sender::flush) infrequently, the timestamp
     /// assigned by the server may drift significantly from when the data
@@ -1175,20 +1158,18 @@ impl Buffer {
 }
 
 /// Connects to a QuestDB instance and inserts data via the ILP protocol.
-/// 
+///
 /// * To construct an instance, use the [`SenderBuilder`].
 /// * To prepare messages, use [`Buffer`] objects.
 /// * To send messages, call the [`flush`](Sender::flush) method.
 pub struct Sender {
     descr: String,
     conn: Connection,
-    connected: bool
+    connected: bool,
 }
 
 impl std::fmt::Debug for Sender {
-    fn fmt(&self, f: &mut Formatter<'_>)
-        -> std::result::Result<(), std::fmt::Error>
-    {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
         f.write_str(self.descr.as_str())
     }
 }
@@ -1198,11 +1179,11 @@ struct AuthParams {
     key_id: String,
     priv_key: String,
     pub_key_x: String,
-    pub_key_y: String
+    pub_key_y: String,
 }
 
 /// Root used to determine how to validate the server's TLS certificate.
-/// 
+///
 /// Used when configuring the [`tls`](SenderBuilder::tls) option.
 #[derive(Debug, Clone)]
 pub enum CertificateAuthority {
@@ -1211,7 +1192,7 @@ pub enum CertificateAuthority {
     WebpkiRoots,
 
     /// Use the root certificates provided by a PEM-encoded file.
-    File(PathBuf)
+    File(PathBuf),
 }
 
 /// Options for full-connection encryption via TLS.
@@ -1226,10 +1207,10 @@ pub enum Tls {
     /// Use TLS encryption, whilst dangerously ignoring the server's certificate.
     /// This should only be used for deubgging purposes.
     /// For testing consider specifying a [`CertificateAuthority::File`] instead.
-    /// 
+    ///
     /// *This option requires the `insecure-skip-verify` feature.*
     #[cfg(feature = "insecure-skip-verify")]
-    InsecureSkipVerify
+    InsecureSkipVerify,
 }
 
 impl Tls {
@@ -1237,27 +1218,27 @@ impl Tls {
     pub fn is_enabled(&self) -> bool {
         match self {
             Tls::Disabled => false,
-            _ => true
+            _ => true,
         }
     }
 }
 
 /// A `u16` port number or `String` port service name as is registered with
 /// `/etc/services` or equivalent.
-/// 
+///
 /// ```
 /// use questdb::ingress::Service;
 /// use std::convert::Into;
-/// 
+///
 /// let service: Service = 9009.into();
 /// ```
-/// 
+///
 /// or
-/// 
+///
 /// ```
 /// use questdb::ingress::Service;
 /// use std::convert::Into;
-/// 
+///
 /// // Assuming the service name is registered.
 /// let service: Service = "qdb_ilp".into();  // or with a String too.
 /// ```
@@ -1305,16 +1286,13 @@ fn map_rustls_err(descr: &str, err: rustls::Error) -> Error {
 }
 
 fn add_webpki_roots(root_store: &mut rustls::RootCertStore) {
-    root_store.add_server_trust_anchors(
-        webpki_roots::TLS_SERVER_ROOTS
-            .0
-            .iter()
-            .map(|ta| {
-                OwnedTrustAnchor::from_subject_spki_name_constraints(
-                    ta.subject,
-                    ta.spki,
-                    ta.name_constraints,
-                )}));
+    root_store.add_server_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta| {
+        OwnedTrustAnchor::from_subject_spki_name_constraints(
+            ta.subject,
+            ta.spki,
+            ta.name_constraints,
+        )
+    }));
 }
 
 fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
@@ -1328,25 +1306,31 @@ fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
         match ca {
             CertificateAuthority::WebpkiRoots => {
                 add_webpki_roots(&mut root_store);
-            },
+            }
             CertificateAuthority::File(ca_file) => {
-                let certfile = std::fs::File::open(ca_file)
-                    .map_err(|io_err| error::fmt!(
+                let certfile = std::fs::File::open(ca_file).map_err(|io_err| {
+                    error::fmt!(
                         TlsError,
                         concat!(
                             "Could not open certificate authority ",
-                            "file from path {:?}: {}"),
+                            "file from path {:?}: {}"
+                        ),
                         ca_file,
-                        io_err))?;
+                        io_err
+                    )
+                })?;
                 let mut reader = BufReader::new(certfile);
-                let der_certs = &rustls_pemfile::certs(&mut reader)
-                    .map_err(|io_err| error::fmt!(
+                let der_certs = &rustls_pemfile::certs(&mut reader).map_err(|io_err| {
+                    error::fmt!(
                         TlsError,
                         concat!(
                             "Could not read certificate authority ",
-                            "file from path {:?}: {}"),
+                            "file from path {:?}: {}"
+                        ),
                         ca_file,
-                        io_err))?;
+                        io_err
+                    )
+                })?;
                 root_store.add_parsable_certificates(der_certs);
             }
         }
@@ -1360,8 +1344,7 @@ fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
         .with_safe_default_cipher_suites()
         .with_safe_default_kx_groups()
         .with_safe_default_protocol_versions()
-        .map_err(|rustls_err| map_rustls_err(
-            "Bad protocol version selection", rustls_err))?
+        .map_err(|rustls_err| map_rustls_err("Bad protocol version selection", rustls_err))?
         .with_root_certificates(root_store)
         .with_no_client_auth();
 
@@ -1371,31 +1354,32 @@ fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
 
     #[cfg(feature = "insecure-skip-verify")]
     if let Tls::InsecureSkipVerify = tls {
-        config.dangerous().set_certificate_verifier(
-            Arc::new(danger::NoCertificateVerification {}));
+        config
+            .dangerous()
+            .set_certificate_verifier(Arc::new(danger::NoCertificateVerification {}));
     }
 
     Ok(Some(Arc::new(config)))
 }
 
 /// Accumulate parameters for a new `Sender` instance.
-/// 
+///
 /// ```no_run
 /// # use questdb::Result;
 /// use questdb::ingress::SenderBuilder;
-/// 
+///
 /// # fn main() -> Result<()> {
 /// let mut sender = SenderBuilder::new("localhost", 9009).connect()?;
 /// # Ok(())
 /// # }
 /// ```
-/// 
+///
 /// Additional options for:
 ///   * Binding a specific [outbound network address](SenderBuilder::net_interface).
 ///   * Connection security
 ///     ([authentication](SenderBuilder::auth), [encryption](SenderBuilder::tls)).
 ///   * Authentication [timeouts](SenderBuilder::read_timeout).
-/// 
+///
 #[derive(Debug, Clone)]
 pub struct SenderBuilder {
     read_timeout: Duration,
@@ -1403,16 +1387,16 @@ pub struct SenderBuilder {
     port: String,
     net_interface: Option<String>,
     auth: Option<AuthParams>,
-    tls: Tls
+    tls: Tls,
 }
 
 impl SenderBuilder {
     /// QuestDB server and port.
-    /// 
+    ///
     /// ```no_run
     /// # use questdb::Result;
     /// use questdb::ingress::SenderBuilder;
-    /// 
+    ///
     /// # fn main() -> Result<()> {
     /// let mut sender = SenderBuilder::new("localhost", 9009).connect()?;
     /// # Ok(())
@@ -1426,17 +1410,17 @@ impl SenderBuilder {
             port: service.0,
             net_interface: None,
             auth: None,
-            tls: Tls::Disabled
+            tls: Tls::Disabled,
         }
     }
 
     /// Select local outbound interface.
-    /// 
+    ///
     /// This may be relevant if your machine has multiple network interfaces.
-    /// 
+    ///
     /// If unspecified, the default is to use any available interface and is
     /// equivalent to calling:
-    /// 
+    ///
     /// ```no_run
     /// # use questdb::Result;
     /// # use questdb::ingress::SenderBuilder;
@@ -1453,18 +1437,18 @@ impl SenderBuilder {
     }
 
     /// Authentication Parameters.
-    /// 
+    ///
     /// If not called, authentication is disabled.
-    /// 
+    ///
     /// # Arguments
     /// * `key_id` - Key identifier, AKA "kid" in JWT. This is sometimes
     ///   referred to as the username.
     /// * `priv_key` - Private key, AKA "d" in JWT.
     /// * `pub_key_x` - X coordinate of the public key, AKA "x" in JWT.
     /// * `pub_key_y` - Y coordinate of the public key, AKA "y" in JWT.
-    /// 
+    ///
     /// # Example
-    /// 
+    ///
     /// ```no_run
     /// # use questdb::Result;
     /// # use questdb::ingress::SenderBuilder;
@@ -1474,40 +1458,35 @@ impl SenderBuilder {
     ///         "testUser1",                                    // kid
     ///         "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48",  // d
     ///         "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU",  // x
-    ///         "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac")  // y 
+    ///         "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac")  // y
     ///     .connect()?;
     /// # Ok(())
     /// # }
     /// ```
-    /// 
+    ///
     /// Follow the QuestDB [authentication
     /// documentation](https://questdb.io/docs/reference/api/ilp/authenticate)
     /// for instructions on generating keys.
-    pub fn auth<A, B, C, D>(
-        mut self,
-        key_id: A,
-        priv_key: B,
-        pub_key_x: C,
-        pub_key_y: D) -> Self
-            where
-                A: Into<String>,
-                B: Into<String>,
-                C: Into<String>,
-                D: Into<String>
+    pub fn auth<A, B, C, D>(mut self, key_id: A, priv_key: B, pub_key_x: C, pub_key_y: D) -> Self
+    where
+        A: Into<String>,
+        B: Into<String>,
+        C: Into<String>,
+        D: Into<String>,
     {
         self.auth = Some(AuthParams {
             key_id: key_id.into(),
             priv_key: priv_key.into(),
             pub_key_x: pub_key_x.into(),
-            pub_key_y: pub_key_y.into()
+            pub_key_y: pub_key_y.into(),
         });
         self
     }
 
     /// Configure TLS handshake.
-    /// 
+    ///
     /// The default is [`Tls::Disabled`].
-    /// 
+    ///
     /// ```no_run
     /// # use questdb::Result;
     /// # use questdb::ingress::SenderBuilder;
@@ -1519,15 +1498,15 @@ impl SenderBuilder {
     /// # Ok(())
     /// # }
     /// ```
-    /// 
+    ///
     /// To enable with commonly accepted certificates, use:
-    /// 
+    ///
     /// ```no_run
     /// # use questdb::Result;
     /// # use questdb::ingress::SenderBuilder;
     /// # use questdb::ingress::Tls;
     /// use questdb::ingress::CertificateAuthority;
-    /// 
+    ///
     /// # fn main() -> Result<()> {
     /// let mut sender = SenderBuilder::new("localhost", 9009)
     ///     .tls(Tls::Enabled(CertificateAuthority::WebpkiRoots))
@@ -1535,16 +1514,16 @@ impl SenderBuilder {
     /// # Ok(())
     /// # }
     /// ```
-    /// 
+    ///
     /// To use [self-signed certificates](https://github.com/questdb/c-questdb-client/tree/main/tls_certs):
-    /// 
+    ///
     /// ```no_run
     /// # use questdb::Result;
     /// # use questdb::ingress::SenderBuilder;
     /// # use questdb::ingress::Tls;
     /// use questdb::ingress::CertificateAuthority;
     /// use std::path::PathBuf;
-    /// 
+    ///
     /// # fn main() -> Result<()> {
     /// let mut sender = SenderBuilder::new("localhost", 9009)
     ///     .tls(Tls::Enabled(CertificateAuthority::File(
@@ -1553,10 +1532,10 @@ impl SenderBuilder {
     /// # Ok(())
     /// # }
     /// ```
-    /// 
+    ///
     /// If you're still struggling you may temporarily enable the dangerous
     /// `insecure-skip-verify` feature to skip the certificate verification:
-    /// 
+    ///
     /// ```ignore
     /// let mut sender = SenderBuilder::new("localhost", 9009)
     ///    .tls(Tls::InsecureSkipVerify)
@@ -1570,12 +1549,12 @@ impl SenderBuilder {
     /// Configure how long to wait for messages from the QuestDB server during
     /// the TLS handshake and authentication process.
     /// The default is 15 seconds.
-    /// 
+    ///
     /// ```no_run
     /// # use questdb::Result;
     /// # use questdb::ingress::SenderBuilder;
     /// use std::time::Duration;
-    /// 
+    ///
     /// # fn main() -> Result<()> {
     /// let mut sender = SenderBuilder::new("localhost", 9009)
     ///    .read_timeout(Duration::from_secs(15))
@@ -1589,103 +1568,93 @@ impl SenderBuilder {
     }
 
     /// Connect synchronously.
-    /// 
+    ///
     /// Will return once the connection is fully established:
     /// If the connection requires authentication or TLS, these will also be
     /// completed before returning.
     pub fn connect(&self) -> Result<Sender> {
-        let mut descr = format!(
-            "Sender[host={:?},port={:?},", self.host, self.port);
-        let addr: SockAddr = gai::resolve_host_port(
-            self.host.as_str(), self.port.as_str())?;
-        let mut sock = Socket::new(
-            Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
-            .map_err(|io_err| map_io_to_socket_err(
-                "Could not open TCP socket: ", io_err))?;
+        let mut descr = format!("Sender[host={:?},port={:?},", self.host, self.port);
+        let addr: SockAddr = gai::resolve_host_port(self.host.as_str(), self.port.as_str())?;
+        let mut sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
+            .map_err(|io_err| map_io_to_socket_err("Could not open TCP socket: ", io_err))?;
         sock.set_linger(Some(Duration::from_secs(120)))
-            .map_err(|io_err| map_io_to_socket_err(
-                "Could not set socket linger: ", io_err))?;
+            .map_err(|io_err| map_io_to_socket_err("Could not set socket linger: ", io_err))?;
         sock.set_nodelay(true)
-            .map_err(|io_err| map_io_to_socket_err(
-                "Could not set TCP_NODELAY: ", io_err))?;
+            .map_err(|io_err| map_io_to_socket_err("Could not set TCP_NODELAY: ", io_err))?;
         if let Some(ref host) = self.net_interface {
             let bind_addr = gai::resolve_host(host.as_str())?;
-            sock.bind(&bind_addr)
-                .map_err(|io_err| map_io_to_socket_err(
-                    &format!(
-                        "Could not bind to interface address {:?}: ",
-                        host),
-                    io_err))?;
-        }
-        sock.connect(&addr)
-            .map_err(|io_err| {
-                let host_port = format!("{}:{}", self.host, self.port);
-                let prefix = format!("Could not connect to {:?}: ", host_port);
-                map_io_to_socket_err(&prefix, io_err)
+            sock.bind(&bind_addr).map_err(|io_err| {
+                map_io_to_socket_err(
+                    &format!("Could not bind to interface address {:?}: ", host),
+                    io_err,
+                )
             })?;
+        }
+        sock.connect(&addr).map_err(|io_err| {
+            let host_port = format!("{}:{}", self.host, self.port);
+            let prefix = format!("Could not connect to {:?}: ", host_port);
+            map_io_to_socket_err(&prefix, io_err)
+        })?;
 
         // We read during both TLS handshake and authentication.
         // We set up a read timeout to prevent the client from "hanging"
         // should we be connecting to a server configured in a different way
         // from the client.
         sock.set_read_timeout(Some(self.read_timeout))
-            .map_err(|io_err| map_io_to_socket_err(
-                "Failed to set read timeout on socket: ", io_err))?;
+            .map_err(|io_err| {
+                map_io_to_socket_err("Failed to set read timeout on socket: ", io_err)
+            })?;
 
         match self.tls {
             Tls::Disabled => write!(descr, "tls=enabled,").unwrap(),
             Tls::Enabled(_) => write!(descr, "tls=enabled,").unwrap(),
 
-            #[cfg(feature="insecure-skip-verify")]
-            Tls::InsecureSkipVerify => write!(
-                descr, "tls=insecure_skip_verify,").unwrap(),
+            #[cfg(feature = "insecure-skip-verify")]
+            Tls::InsecureSkipVerify => write!(descr, "tls=insecure_skip_verify,").unwrap(),
         }
 
         let conn = match configure_tls(&self.tls)? {
-                Some(tls_config) => {
-                    let server_name: ServerName = self.host.as_str().try_into()
-                        .map_err(|inv_dns_err| error::fmt!(
-                            TlsError,
-                            "Bad host: {}",
-                            inv_dns_err))?;
-                    let mut tls_conn = ClientConnection::new(
-                        tls_config, server_name)
-                            .map_err(|rustls_err| error::fmt!(
+            Some(tls_config) => {
+                let server_name: ServerName =
+                    self.host.as_str().try_into().map_err(|inv_dns_err| {
+                        error::fmt!(TlsError, "Bad host: {}", inv_dns_err)
+                    })?;
+                let mut tls_conn =
+                    ClientConnection::new(tls_config, server_name).map_err(|rustls_err| {
+                        error::fmt!(TlsError, "Could not create TLS client: {}", rustls_err)
+                    })?;
+                while tls_conn.wants_write() || tls_conn.is_handshaking() {
+                    tls_conn.complete_io(&mut sock).map_err(|io_err| {
+                        if (io_err.kind() == ErrorKind::TimedOut)
+                            || (io_err.kind() == ErrorKind::WouldBlock)
+                        {
+                            error::fmt!(
                                 TlsError,
-                                "Could not create TLS client: {}",
-                                rustls_err))?;
-                    while tls_conn.wants_write() || tls_conn.is_handshaking() {
-                        tls_conn.complete_io(&mut sock)
-                            .map_err(|io_err|
-                                if (io_err.kind() == ErrorKind::TimedOut) ||
-                                    (io_err.kind() == ErrorKind::WouldBlock) {
-                                    error::fmt!(TlsError,
-                                        concat!(
-                                            "Failed to complete TLS handshake:",
-                                            " Timed out waiting for server ",
-                                            "response after {:?}."),
-                                        self.read_timeout)
-                                } else {
-                                    error::fmt!(
-                                        TlsError,
-                                        "Failed to complete TLS handshake: {}",
-                                        io_err)
-                                })?;
-                    }
-                    Connection::Tls(StreamOwned::new(tls_conn, sock))
-                },
-                None => Connection::Direct(sock)
-            };
+                                concat!(
+                                    "Failed to complete TLS handshake:",
+                                    " Timed out waiting for server ",
+                                    "response after {:?}."
+                                ),
+                                self.read_timeout
+                            )
+                        } else {
+                            error::fmt!(TlsError, "Failed to complete TLS handshake: {}", io_err)
+                        }
+                    })?;
+                }
+                Connection::Tls(StreamOwned::new(tls_conn, sock))
+            }
+            None => Connection::Direct(sock),
+        };
         if self.auth.is_some() {
             descr.push_str("auth=on]");
-        }
-        else {
+        } else {
             descr.push_str("auth=off]");
         }
         let mut sender = Sender {
             descr: descr,
             conn: conn,
-            connected: true
+            connected: true,
         };
         if let Some(auth) = self.auth.as_ref() {
             sender.authenticate(auth)?;
@@ -1696,8 +1665,7 @@ impl SenderBuilder {
 
 fn b64_decode(descr: &'static str, buf: &str) -> Result<Vec<u8>> {
     Base64UrlUnpadded::decode_vec(buf)
-        .map_err(|b64_err| error::fmt!(
-            AuthError, "Could not decode {}: {}", descr, b64_err))
+        .map_err(|b64_err| error::fmt!(AuthError, "Could not decode {}: {}", descr, b64_err))
 }
 
 fn parse_public_key(pub_key_x: &str, pub_key_y: &str) -> Result<Vec<u8>> {
@@ -1706,7 +1674,7 @@ fn parse_public_key(pub_key_x: &str, pub_key_y: &str) -> Result<Vec<u8>> {
 
     // SEC 1 Uncompressed Octet-String-to-Elliptic-Curve-Point Encoding
     let mut encoded = Vec::new();
-    encoded.push(4u8);  // 0x04 magic byte that identifies this as uncompressed.
+    encoded.push(4u8); // 0x04 magic byte that identifies this as uncompressed.
     encoded.resize((32 - pub_key_x.len()) + 1, 0u8);
     encoded.append(&mut pub_key_x);
     encoded.resize((32 - pub_key_y.len()) + 1 + 32, 0u8);
@@ -1715,28 +1683,26 @@ fn parse_public_key(pub_key_x: &str, pub_key_y: &str) -> Result<Vec<u8>> {
 }
 
 fn parse_key_pair(auth: &AuthParams) -> Result<EcdsaKeyPair> {
-    let private_key = b64_decode(
-        "private authentication key", auth.priv_key.as_str())?;
-    let public_key = parse_public_key(
-        auth.pub_key_x.as_str(), auth.pub_key_y.as_str())?;
+    let private_key = b64_decode("private authentication key", auth.priv_key.as_str())?;
+    let public_key = parse_public_key(auth.pub_key_x.as_str(), auth.pub_key_y.as_str())?;
     EcdsaKeyPair::from_private_key_and_public_key(
         &ECDSA_P256_SHA256_FIXED_SIGNING,
         &private_key[..],
-        &public_key[..])
-            .map_err(|key_rejected| error::fmt!(
-                AuthError, "Bad private key: {}", key_rejected))
+        &public_key[..],
+    )
+    .map_err(|key_rejected| error::fmt!(AuthError, "Bad private key: {}", key_rejected))
 }
 
 pub(crate) struct F64Serializer {
     buf: ryu::Buffer,
-    n: f64
+    n: f64,
 }
 
 impl F64Serializer {
     pub(crate) fn new(n: f64) -> Self {
         F64Serializer {
             buf: ryu::Buffer::new(),
-            n: n
+            n: n,
         }
     }
 
@@ -1759,46 +1725,43 @@ impl F64Serializer {
     pub(crate) fn to_str(&mut self) -> &str {
         if self.n.is_finite() {
             self.buf.format_finite(self.n)
-        }
-        else {
+        } else {
             self.format_nonfinite()
         }
     }
 }
 
 impl Sender {
-
     fn send_key_id(&mut self, key_id: &str) -> Result<()> {
         write!(&mut self.conn, "{}\n", key_id)
-            .map_err(|io_err|
-                map_io_to_socket_err("Failed to send key_id: ", io_err))?;
+            .map_err(|io_err| map_io_to_socket_err("Failed to send key_id: ", io_err))?;
         Ok(())
     }
 
     fn read_challenge(&mut self) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
         let mut reader = BufReader::new(&mut self.conn);
-        reader.read_until(b'\n', &mut buf)
-            .map_err(|io_err| map_io_to_socket_err(
+        reader.read_until(b'\n', &mut buf).map_err(|io_err| {
+            map_io_to_socket_err(
                 "Failed to read authentication challenge (timed out?): ",
-                io_err))?;
+                io_err,
+            )
+        })?;
         if buf.last().map(|c| *c).unwrap_or(b'\0') != b'\n' {
             return Err(if buf.len() == 0 {
-                    error::fmt!(
-                        AuthError,
-                        concat!(
-                            "Did not receive auth challenge. ",
-                            "Is the database configured to require ",
-                            "authentication?"
-                        ))
-                } else {
-                    error::fmt!(
-                        AuthError,
-                        "Received incomplete auth challenge: {:?}",
-                        buf)
-                });
+                error::fmt!(
+                    AuthError,
+                    concat!(
+                        "Did not receive auth challenge. ",
+                        "Is the database configured to require ",
+                        "authentication?"
+                    )
+                )
+            } else {
+                error::fmt!(AuthError, "Received incomplete auth challenge: {:?}", buf)
+            });
         }
-        buf.pop();  // b'\n'
+        buf.pop(); // b'\n'
         Ok(buf)
     }
 
@@ -1807,31 +1770,33 @@ impl Sender {
             return Err(error::fmt!(
                 AuthError,
                 "Bad key id {:?}: Should not contain new-line char.",
-                auth.key_id));
+                auth.key_id
+            ));
         }
         let key_pair = parse_key_pair(&auth)?;
         self.send_key_id(auth.key_id.as_str())?;
         let challenge = self.read_challenge()?;
         let rng = ring::rand::SystemRandom::new();
-        let signature = key_pair.sign(&rng, &challenge[..]).
-            map_err(|unspecified_err| error::fmt!(
-                AuthError,
-                "Failed to sign challenge: {}",
-                unspecified_err))?;
+        let signature = key_pair
+            .sign(&rng, &challenge[..])
+            .map_err(|unspecified_err| {
+                error::fmt!(AuthError, "Failed to sign challenge: {}", unspecified_err)
+            })?;
         let mut encoded_sig = Base64::encode_string(signature.as_ref());
         encoded_sig.push('\n');
         let buf = encoded_sig.as_bytes();
         if let Err(io_err) = self.conn.write_all(buf) {
             return Err(map_io_to_socket_err(
                 "Could not send signed challenge: ",
-                io_err));
+                io_err,
+            ));
         }
         Ok(())
     }
 
     /// Send buffer to the QuestDB server, without clearing the
     /// buffer.
-    /// 
+    ///
     /// This will block until the buffer is flushed to the network socket.
     /// This does not guarantee that the buffer will be sent to the server
     /// or that the server has received it.
@@ -1839,21 +1804,20 @@ impl Sender {
         if !self.connected {
             return Err(error::fmt!(
                 SocketError,
-                "Could not flush buffer: not connected to database."));
+                "Could not flush buffer: not connected to database."
+            ));
         }
         buf.check_state(Op::Flush)?;
         let bytes = buf.as_str().as_bytes();
         if let Err(io_err) = self.conn.write_all(bytes) {
             self.connected = false;
-            return Err(map_io_to_socket_err(
-                "Could not flush buffer: ",
-                io_err));
+            return Err(map_io_to_socket_err("Could not flush buffer: ", io_err));
         }
         Ok(())
     }
 
     /// Send buffer to the QuestDB server, clearing the buffer.
-    /// 
+    ///
     /// This will block until the buffer is flushed to the network socket.
     /// This does not guarantee that the buffer will be sent to the server
     /// or that the server has received it.
@@ -1864,7 +1828,7 @@ impl Sender {
     }
 
     /// The sender is no longer usable and must be dropped.
-    /// 
+    ///
     /// This is caused if there was an earlier failure.
     pub fn must_close(&self) -> bool {
         !self.connected

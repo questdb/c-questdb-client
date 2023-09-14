@@ -22,12 +22,12 @@
  *
  ******************************************************************************/
 
- #![doc = include_str!("../README.md")]
+#![doc = include_str!("../README.md")]
 
 mod error;
-pub mod ingress;
 mod gai;
- 
+pub mod ingress;
+
 pub use error::*;
 
 #[cfg(test)]

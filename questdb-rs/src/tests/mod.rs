@@ -22,8 +22,8 @@
  *
  ******************************************************************************/
 mod f64_serializer;
-mod sender;
 mod mock;
+mod sender;
 
 mod json_tests {
     include!(concat!(env!("OUT_DIR"), "/json_tests.rs"));

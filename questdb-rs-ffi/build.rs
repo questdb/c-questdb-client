@@ -21,7 +21,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             documentation: false,
             cython: cbindgen::CythonConfig {
                 header: Some("questdb/ilp/line_sender.h".to_owned()),
-                cimports: std::collections::BTreeMap::new()},
+                cimports: std::collections::BTreeMap::new(),
+            },
             ..Default::default()
         };
 

@@ -4,28 +4,28 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const TIMESTAMP_MAX: i64 = i64::MAX - 1;
 
 /// A `i64` timestamp expressed as microseconds since the UNIX epoch (UTC).
-/// 
+///
 /// The number can't be negative (i.e. can't be before 1970-01-01 00:00:00).
-/// 
+///
 /// # Examples
-/// 
+///
 /// ```
 /// # use questdb::Result;
 /// use questdb::ingress::TimestampMicros;
-/// 
+///
 /// # fn main() -> Result<()> {
 /// let ts = TimestampMicros::new(1659548204354448)?;
 /// # Ok(())
 /// # }
 /// ```
-/// 
+///
 /// or
-/// 
+///
 /// ```
 /// # use questdb::Result;
 /// use questdb::ingress::TimestampMicros;
 /// use std::convert::TryInto;
-/// 
+///
 /// # fn main() -> Result<()> {
 /// let ts: TimestampMicros = std::time::SystemTime::now().try_into()?;
 /// # Ok(())
@@ -44,7 +44,8 @@ impl TimestampMicros {
             Err(error::fmt!(
                 InvalidTimestamp,
                 "Timestamp {} is negative. It must be >= 0.",
-                micros))
+                micros
+            ))
         }
     }
 
@@ -58,17 +59,20 @@ impl TryFrom<SystemTime> for TimestampMicros {
     type Error = crate::Error;
 
     fn try_from(time: SystemTime) -> crate::Result<Self> {
-        let duration = time.duration_since(UNIX_EPOCH)
-            .map_err(|e| error::fmt!(
+        let duration = time.duration_since(UNIX_EPOCH).map_err(|e| {
+            error::fmt!(
                 // This will fail if before UNIX_EPOCH,
                 // so this check also guarantees that the
                 // eventual micros result will be >= 0.
                 InvalidTimestamp,
                 concat!(
                     "Could not calulate duration since UNIX_EPOCH",
-                    " for timestamp {:?}: {}"),
+                    " for timestamp {:?}: {}"
+                ),
                 time,
-                e))?;
+                e
+            )
+        })?;
         let micros: u128 = duration.as_micros();
         if micros <= (TIMESTAMP_MAX as u128) {
             Ok(Self(micros as i64))
@@ -77,8 +81,10 @@ impl TryFrom<SystemTime> for TimestampMicros {
                 InvalidTimestamp,
                 concat!(
                     "Timestamp {:?} is too large to fit in a ",
-                    "64-bit signed integer."),
-                time))
+                    "64-bit signed integer."
+                ),
+                time
+            ))
         }
     }
 }
@@ -90,28 +96,28 @@ impl From<TimestampMicros> for SystemTime {
 }
 
 /// A `i64` timestamp expressed as nanoseconds since the UNIX epoch (UTC).
-/// 
+///
 /// The number can't be negative (i.e. can't be before 1970-01-01 00:00:00).
-/// 
+///
 /// # Examples
-/// 
+///
 /// ```
 /// # use questdb::Result;
 /// use questdb::ingress::TimestampNanos;
-/// 
+///
 /// # fn main() -> Result<()> {
 /// let ts = TimestampNanos::new(1659548315647406592)?;
 /// # Ok(())
 /// # }
 /// ```
-/// 
+///
 /// or
-/// 
+///
 /// ```
 /// # use questdb::Result;
 /// use questdb::ingress::TimestampNanos;
 /// use std::convert::TryInto;
-/// 
+///
 /// # fn main() -> Result<()> {
 /// let ts: TimestampNanos = std::time::SystemTime::now().try_into()?;
 /// # Ok(())
@@ -130,7 +136,8 @@ impl TimestampNanos {
             Err(error::fmt!(
                 InvalidTimestamp,
                 "Timestamp {} is negative. It must be >= 0.",
-                nanos))
+                nanos
+            ))
         }
     }
 
@@ -144,17 +151,20 @@ impl TryFrom<SystemTime> for TimestampNanos {
     type Error = crate::Error;
 
     fn try_from(time: SystemTime) -> crate::Result<Self> {
-        let duration = time.duration_since(UNIX_EPOCH)
-            .map_err(|e| error::fmt!(
+        let duration = time.duration_since(UNIX_EPOCH).map_err(|e| {
+            error::fmt!(
                 // This will fail if before UNIX_EPOCH,
                 // so this check also guarantees that the
                 // eventual nanos result will be >= 0.
                 InvalidTimestamp,
                 concat!(
                     "Could not calulate duration since UNIX_EPOCH",
-                    " for timestamp {:?}: {}"),
+                    " for timestamp {:?}: {}"
+                ),
                 time,
-                e))?;
+                e
+            )
+        })?;
         let nanos: u128 = duration.as_nanos();
         if nanos <= (TIMESTAMP_MAX as u128) {
             Ok(Self(nanos as i64))
@@ -163,8 +173,10 @@ impl TryFrom<SystemTime> for TimestampNanos {
                 InvalidTimestamp,
                 concat!(
                     "Timestamp {:?} is too large to fit in a ",
-                    "64-bit signed integer."),
-                time))
+                    "64-bit signed integer."
+                ),
+                time
+            ))
         }
     }
 }

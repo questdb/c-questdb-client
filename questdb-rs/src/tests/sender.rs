@@ -23,17 +23,14 @@
  ******************************************************************************/
 
 use crate::{
-    Error,
-    ErrorCode,
-    ingress::{
-        Sender,
-        Buffer,
-        CertificateAuthority,
-        Tls,
-        TimestampMicros,
-        TimestampNanos}};
+    ingress::{Buffer, CertificateAuthority, Sender, TimestampMicros, TimestampNanos, Tls},
+    Error, ErrorCode,
+};
 
-use crate::tests::{TestResult, mock::{MockServer, certs_dir}};
+use crate::tests::{
+    mock::{certs_dir, MockServer},
+    TestResult,
+};
 
 use core::time::Duration;
 use std::io;
@@ -48,8 +45,9 @@ fn test_basics() -> TestResult {
     assert_eq!(server.recv_q()?, 0);
 
     let ts = std::time::SystemTime::now();
-    let ts_micros = ts.duration_since(
-        std::time::SystemTime::UNIX_EPOCH)?.as_micros() as i64;
+    let ts_micros = ts
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)?
+        .as_micros() as i64;
 
     let mut buffer = Buffer::new();
     buffer
@@ -61,8 +59,7 @@ fn test_basics() -> TestResult {
         .at(TimestampNanos::new(10000000)?)?;
 
     assert_eq!(server.recv_q()?, 0);
-    let exp = format!(
-        "test,t1=v1 f1=0.5,ts1=12345t,ts2={}t 10000000\n", ts_micros);
+    let exp = format!("test,t1=v1 f1=0.5,ts1=12345t,ts2={}t 10000000\n", ts_micros);
     assert_eq!(buffer.as_str(), exp);
     assert_eq!(buffer.len(), exp.len());
     sender.flush(&mut buffer)?;
@@ -81,26 +78,23 @@ fn test_table_name_too_long() -> TestResult {
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
     assert_eq!(
         err.msg(),
-        r#"Bad name: "a name too long": Too long (max 4 characters)"#);
+        r#"Bad name: "a name too long": Too long (max 4 characters)"#
+    );
     Ok(())
 }
 
 macro_rules! column_name_too_long_test_impl {
-    ($column_fn:ident, $value:expr) => {
-        {
-            let mut buffer = Buffer::with_max_name_len(4);
-            let name = "a name too long";
-            let err = buffer
-                .table("tbl")?
-                .$column_fn(name, $value)
-                .unwrap_err();
-            assert_eq!(err.code(), ErrorCode::InvalidApiCall);
-            assert_eq!(
-                err.msg(),
-                r#"Bad name: "a name too long": Too long (max 4 characters)"#);
-            Ok(())
-        }
-    };
+    ($column_fn:ident, $value:expr) => {{
+        let mut buffer = Buffer::with_max_name_len(4);
+        let name = "a name too long";
+        let err = buffer.table("tbl")?.$column_fn(name, $value).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert_eq!(
+            err.msg(),
+            r#"Bad name: "a name too long": Too long (max 4 characters)"#
+        );
+        Ok(())
+    }};
 }
 
 #[test]
@@ -134,7 +128,8 @@ fn test_tls_with_file_ca() -> TestResult {
     ca_path.push("server_rootCA.pem");
 
     let server = MockServer::new()?;
-    let lsb = server.lsb()
+    let lsb = server
+        .lsb()
         .tls(Tls::Enabled(CertificateAuthority::File(ca_path)));
     let server_jh = server.accept_tls();
     let mut sender = lsb.connect()?;
@@ -163,20 +158,26 @@ fn test_tls_to_plain_server() -> TestResult {
     ca_path.push("server_rootCA.pem");
 
     let mut server = MockServer::new()?;
-    let lsb = server.lsb()
+    let lsb = server
+        .lsb()
         .read_timeout(Duration::from_millis(500))
         .tls(Tls::Enabled(CertificateAuthority::File(ca_path)));
     let server_jh = std::thread::spawn(move || -> io::Result<MockServer> {
-            server.accept()?;
-            Ok(server)
-        });
+        server.accept()?;
+        Ok(server)
+    });
     let maybe_sender = lsb.connect();
     let _server: MockServer = server_jh.join().unwrap()?;
     let err = maybe_sender.unwrap_err();
-    assert_eq!(err, Error::new(
-        ErrorCode::TlsError,
-        "Failed to complete TLS handshake: \
-         Timed out waiting for server response after 500ms.".to_owned()));
+    assert_eq!(
+        err,
+        Error::new(
+            ErrorCode::TlsError,
+            "Failed to complete TLS handshake: \
+         Timed out waiting for server response after 500ms."
+                .to_owned()
+        )
+    );
     Ok(())
 }
 
@@ -185,10 +186,7 @@ fn expect_eventual_disconnect(sender: &mut Sender) {
         for _ in 0..1000 {
             std::thread::sleep(Duration::from_millis(100));
             let mut buffer = Buffer::new();
-            buffer
-                .table("test_table")?
-                .symbol("s1", "v1")?
-                .at_now()?;
+            buffer.table("test_table")?.symbol("s1", "v1")?.at_now()?;
             sender.flush(&mut buffer)?;
         }
         Ok(())
@@ -201,7 +199,8 @@ fn expect_eventual_disconnect(sender: &mut Sender) {
 #[test]
 fn test_plain_to_tls_server() -> TestResult {
     let server = MockServer::new()?;
-    let lsb = server.lsb()
+    let lsb = server
+        .lsb()
         .read_timeout(Duration::from_millis(500))
         .tls(Tls::Disabled);
     let server_jh = server.accept_tls();
@@ -210,8 +209,9 @@ fn test_plain_to_tls_server() -> TestResult {
 
     // The server failed to handshake, so disconnected the client.
     assert!(
-        (server_err.kind() == io::ErrorKind::TimedOut) ||
-        (server_err.kind() == io::ErrorKind::WouldBlock));
+        (server_err.kind() == io::ErrorKind::TimedOut)
+            || (server_err.kind() == io::ErrorKind::WouldBlock)
+    );
 
     // The client nevertheless connected successfully.
     let mut sender = maybe_sender.unwrap();
@@ -225,8 +225,7 @@ fn test_plain_to_tls_server() -> TestResult {
 #[test]
 fn test_tls_insecure_skip_verify() -> TestResult {
     let server = MockServer::new()?;
-    let lsb = server.lsb()
-        .tls(Tls::InsecureSkipVerify);
+    let lsb = server.lsb().tls(Tls::InsecureSkipVerify);
     let server_jh = server.accept_tls();
     let mut sender = lsb.connect()?;
     let mut server: MockServer = server_jh.join().unwrap()?;

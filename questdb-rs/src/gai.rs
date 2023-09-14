@@ -23,8 +23,8 @@
  ******************************************************************************/
 
 use crate::error;
+use dns_lookup::{AddrInfo, AddrInfoHints, AddrInfoIter, LookupError};
 use socket2::SockAddr;
-use dns_lookup::{AddrInfoHints, AddrInfo, AddrInfoIter, LookupError};
 
 #[cfg(unix)]
 use libc::{AF_INET, SOCK_STREAM};
@@ -34,23 +34,28 @@ use winapi::shared::ws2def::{AF_INET, SOCK_STREAM};
 
 fn map_getaddrinfo_result(
     dest: &str,
-    result: Result<AddrInfoIter, LookupError>) -> crate::Result<SockAddr>
-{
+    result: Result<AddrInfoIter, LookupError>,
+) -> crate::Result<SockAddr> {
     match result {
         Ok(mut addrs) => {
-            let addr: AddrInfo = addrs.next().unwrap().map_err(
-                |io_err| error::fmt!(
+            let addr: AddrInfo = addrs.next().unwrap().map_err(|io_err| {
+                error::fmt!(
                     CouldNotResolveAddr,
                     "Could not resolve {:?}: {}",
                     dest,
-                    io_err))?;
+                    io_err
+                )
+            })?;
             Ok(addr.sockaddr.into())
-        },
+        }
         Err(lookup_err) => {
             let io_err: std::io::Error = lookup_err.into();
             Err(error::fmt!(
                 CouldNotResolveAddr,
-                "Could not resolve {:?}: {}", dest, io_err))
+                "Could not resolve {:?}: {}",
+                dest,
+                io_err
+            ))
         }
     }
 }
@@ -59,21 +64,20 @@ pub(super) fn resolve_host(host: &str) -> super::Result<SockAddr> {
     let hints = AddrInfoHints {
         socktype: SOCK_STREAM,
         address: AF_INET,
-        ..AddrInfoHints::default()};
-    map_getaddrinfo_result(
-        host,
-        dns_lookup::getaddrinfo(Some(host), None, Some(hints)))
+        ..AddrInfoHints::default()
+    };
+    map_getaddrinfo_result(host, dns_lookup::getaddrinfo(Some(host), None, Some(hints)))
 }
 
-pub(super) fn resolve_host_port(
-    host: &str, port: &str) -> super::Result<SockAddr>
-{
+pub(super) fn resolve_host_port(host: &str, port: &str) -> super::Result<SockAddr> {
     let hints = AddrInfoHints {
         socktype: SOCK_STREAM,
         address: AF_INET,
-        ..AddrInfoHints::default()};
+        ..AddrInfoHints::default()
+    };
     let host_port = format!("{}:{}", host, port);
     map_getaddrinfo_result(
         &host_port,
-        dns_lookup::getaddrinfo(Some(host), Some(port), Some(hints)))
+        dns_lookup::getaddrinfo(Some(host), Some(port), Some(hints)),
+    )
 }
