@@ -454,13 +454,13 @@ class TestSender(unittest.TestCase):
 
     def test_c_tls_example(self):
         self._test_example(
-            'line_sender_c_example_tls',
+            'line_sender_c_example_tls_ca',
             'c_cars_tls',
             tls=True)
 
     def test_cpp_tls_example(self):
         self._test_example(
-            'line_sender_cpp_example_tls',
+            'line_sender_cpp_example_tls_ca',
             'cpp_cars_tls',
             tls=True)
 

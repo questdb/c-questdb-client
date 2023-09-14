@@ -11,7 +11,8 @@
 
 * [Basic example in C++](../examples/line_sender_cpp_example.cpp).
 * [With authentication](../examples/line_sender_cpp_example_auth.cpp).
-* [With authentication and TLS](../examples/line_sender_cpp_example_tls.cpp).
+* [With authentication and TLS](../examples/line_sender_cpp_example_auth_tls.cpp).
+* [Custom certificate authority file](../examples/line_sender_c_example_tls_ca.c).
 
 ## API Overview
 

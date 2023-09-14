@@ -11,7 +11,8 @@
 
 * [Basic example in C](../examples/line_sender_c_example.c).
 * [With authentication](../examples/line_sender_c_example_auth.c).
-* [With authentication and TLS](../examples/line_sender_c_example_tls.c).
+* [With authentication and TLS](../examples/line_sender_c_example_auth_tls.c).
+* [Custom certificate authority file](../examples/line_sender_c_example_tls_ca.c).
 
 ## API Overview
 

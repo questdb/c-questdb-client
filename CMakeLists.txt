@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15.0)
-project(c-questdb-client VERSION 2.1.0)
+project(c-questdb-client VERSION 2.1.3)
 
 set(CPACK_PROJECT_NAME ${PROJECT_NAME})
 set(CPACK_PROJECT_VERSION ${PROJECT_VERSION})
@@ -84,8 +84,11 @@ compile_example(
     line_sender_c_example_auth
     examples/line_sender_c_example_auth.c)
 compile_example(
-    line_sender_c_example_tls
-    examples/line_sender_c_example_tls.c)
+    line_sender_c_example_tls_ca
+    examples/line_sender_c_example_tls_ca.c)
+compile_example(
+    line_sender_c_example_auth_tls
+    examples/line_sender_c_example_auth_tls.c)
 compile_example(
     line_sender_cpp_example
     examples/line_sender_cpp_example.cpp)
@@ -93,8 +96,11 @@ compile_example(
     line_sender_cpp_example_auth
     examples/line_sender_cpp_example_auth.cpp)
 compile_example(
-    line_sender_cpp_example_tls
-    examples/line_sender_cpp_example_tls.cpp)
+    line_sender_cpp_example_tls_ca
+    examples/line_sender_cpp_example_tls_ca.cpp)
+compile_example(
+    line_sender_cpp_example_auth_tls
+    examples/line_sender_cpp_example_auth_tls.cpp)
 
 # Include Rust tests as part of the tests run
 add_test(

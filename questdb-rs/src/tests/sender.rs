@@ -75,7 +75,7 @@ fn test_table_name_too_long() -> TestResult {
     let mut buffer = Buffer::with_max_name_len(4);
     let name = "a name too long";
     let err = buffer.table(name).unwrap_err();
-    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert_eq!(err.code(), ErrorCode::InvalidName);
     assert_eq!(
         err.msg(),
         r#"Bad name: "a name too long": Too long (max 4 characters)"#
@@ -88,7 +88,7 @@ macro_rules! column_name_too_long_test_impl {
         let mut buffer = Buffer::with_max_name_len(4);
         let name = "a name too long";
         let err = buffer.table("tbl")?.$column_fn(name, $value).unwrap_err();
-        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert_eq!(err.code(), ErrorCode::InvalidName);
         assert_eq!(
             err.msg(),
             r#"Bad name: "a name too long": Too long (max 4 characters)"#
