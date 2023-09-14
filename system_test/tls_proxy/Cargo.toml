@@ -6,8 +6,8 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-tokio = { version = "1.19.2", features = ["full"] }
-tokio-rustls = "0.23.4"
-rustls = "0.20.6"
-rustls-pemfile = "1.0.0"
-argh = "0.1.7"
+tokio = { version = "1.32.0", features = ["full"] }
+tokio-rustls = "0.24.1"
+rustls = "0.21.7"
+rustls-pemfile = "1.0.3"
+argh = "0.1.12"

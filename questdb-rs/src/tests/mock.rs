@@ -97,7 +97,7 @@ fn tls_config() -> Arc<ServerConfig> {
         .with_safe_default_kx_groups()
         .with_safe_default_protocol_versions()
         .unwrap()
-        .with_client_cert_verifier(NoClientAuth::new())
+        .with_client_cert_verifier(NoClientAuth::boxed())
         .with_single_cert(cert_chain, key_der)
         .unwrap();
     Arc::new(config)
