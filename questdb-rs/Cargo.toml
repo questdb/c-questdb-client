@@ -27,7 +27,7 @@ ryu = "1.0.15"
 itoa = "1.0.9"
 
 [target.'cfg(windows)'.dependencies]
-winapi = "0.3.9"
+winapi = { version = "0.3.9", features = ["ws2def"] }
 
 [build-dependencies]
 serde_json = { version = "1.0.107" }
