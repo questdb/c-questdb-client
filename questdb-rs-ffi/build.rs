@@ -12,26 +12,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         bindings.write_to_file("../include/questdb/ilp/line_sender.gen.h");
     }
 
-    #[cfg(feature = "gen_cython")]
-    {
-        let crate_dir = std::env::var("CARGO_MANIFEST_DIR")?;
-
-        let config = cbindgen::Config {
-            language: cbindgen::Language::Cython,
-            documentation: false,
-            cython: cbindgen::CythonConfig {
-                header: Some("questdb/ilp/line_sender.h".to_owned()),
-                cimports: std::collections::BTreeMap::new(),
-            },
-            ..Default::default()
-        };
-
-        let bindings = cbindgen::Builder::new()
-            .with_crate(crate_dir)
-            .with_config(config)
-            .generate()?;
-        bindings.write_to_file("../cython/questdb/ilp/line_sender.pxd");
-    }
-
     Ok(())
 }

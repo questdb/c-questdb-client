@@ -1,5 +1,6 @@
 target
 build
+cmake-build-debug
 .vs
 .vscode
 questdb-rs/Cargo.lock

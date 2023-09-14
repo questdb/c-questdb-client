@@ -20,6 +20,3 @@ cbindgen = { version = "0.26.0", optional = true, default-features = false }
 # Auto-generate the header. This is for dev-debugging-diffing only.
 # A hand-crafted header is easier on the eyes.
 gen_h = ["cbindgen"]
-
-# Auto-generate a Cython .pxd file.
-gen_cython = ["cbindgen"]

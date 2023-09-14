@@ -52,7 +52,7 @@ impl Error {
     /// Create an error with the given code and message.
     pub fn new<S: Into<String>>(code: ErrorCode, msg: S) -> Error {
         Error {
-            code: code,
+            code,
             msg: msg.into(),
         }
     }

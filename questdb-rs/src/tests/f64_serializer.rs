@@ -25,7 +25,7 @@
 use crate::ingress::F64Serializer;
 
 fn f2s(n: f64) -> String {
-    F64Serializer::new(n).to_str().to_owned()
+    F64Serializer::new(n).as_str().to_owned()
 }
 
 #[test]

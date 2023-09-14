@@ -301,7 +301,7 @@ impl<'a> TableName<'a> {
             prev = c;
         }
 
-        Ok(Self { name: name })
+        Ok(Self { name })
     }
 
     /// Construct an unvalidated table name.
@@ -311,7 +311,7 @@ impl<'a> TableName<'a> {
     ///
     /// Invalid table names will be rejected by the QuestDB server.
     pub fn new_unchecked(name: &'a str) -> Self {
-        Self { name: name }
+        Self { name }
     }
 }
 
@@ -374,7 +374,7 @@ impl<'a> ColumnName<'a> {
             }
         }
 
-        Ok(Self { name: name })
+        Ok(Self { name })
     }
 
     /// Construct an unvalidated column name.
@@ -384,7 +384,7 @@ impl<'a> ColumnName<'a> {
     ///
     /// Invalid column names will be rejected by the QuestDB server.
     pub fn new_unchecked(name: &'a str) -> Self {
-        Self { name: name }
+        Self { name }
     }
 }
 
@@ -413,7 +413,7 @@ impl From<Infallible> for Error {
 fn write_escaped_impl<Q, C>(check_escape_fn: C, quoting_fn: Q, output: &mut String, s: &str)
 where
     C: Fn(char) -> bool,
-    Q: Fn(&mut String) -> (),
+    Q: Fn(&mut String),
 {
     let mut to_escape = 0usize;
     for c in s.chars() {
@@ -440,17 +440,11 @@ where
 }
 
 fn must_escape_unquoted(c: char) -> bool {
-    match c {
-        ' ' | ',' | '=' | '\n' | '\r' | '\\' => true,
-        _ => false,
-    }
+    matches!(c, ' ' | ',' | '=' | '\n' | '\r' | '\\')
 }
 
 fn must_escape_quoted(c: char) -> bool {
-    match c {
-        '\n' | '\r' | '"' | '\\' => true,
-        _ => false,
-    }
+    matches!(c, '\n' | '\r' | '"' | '\\')
 }
 
 fn write_escaped_unquoted(output: &mut String, s: &str) {
@@ -463,7 +457,7 @@ fn write_escaped_quoted(output: &mut String, s: &str) {
 
 enum Connection {
     Direct(Socket),
-    Tls(StreamOwned<ClientConnection, Socket>),
+    Tls(Box<StreamOwned<ClientConnection, Socket>>),
 }
 
 impl io::Read for Connection {
@@ -642,6 +636,10 @@ impl Buffer {
     /// Number of bytes accumulated in the buffer.
     pub fn len(&self) -> usize {
         self.output.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.output.is_empty()
     }
 
     /// Number of bytes that can be written to the buffer before it needs to
@@ -968,7 +966,7 @@ impl Buffer {
     {
         self.write_column_key(name)?;
         let mut ser = F64Serializer::new(value);
-        self.output.push_str(ser.to_str());
+        self.output.push_str(ser.as_str());
         Ok(self)
     }
 
@@ -1157,6 +1155,12 @@ impl Buffer {
     }
 }
 
+impl Default for Buffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Connects to a QuestDB instance and inserts data via the ILP protocol.
 ///
 /// * To construct an instance, use the [`SenderBuilder`].
@@ -1216,10 +1220,7 @@ pub enum Tls {
 impl Tls {
     /// Returns true if TLS is enabled.
     pub fn is_enabled(&self) -> bool {
-        match self {
-            Tls::Disabled => false,
-            _ => true,
-        }
+        !matches!(self, Tls::Disabled)
     }
 }
 
@@ -1642,7 +1643,7 @@ impl SenderBuilder {
                         }
                     })?;
                 }
-                Connection::Tls(StreamOwned::new(tls_conn, sock))
+                Connection::Tls(StreamOwned::new(tls_conn, sock).into())
             }
             None => Connection::Direct(sock),
         };
@@ -1652,8 +1653,8 @@ impl SenderBuilder {
             descr.push_str("auth=off]");
         }
         let mut sender = Sender {
-            descr: descr,
-            conn: conn,
+            descr,
+            conn,
             connected: true,
         };
         if let Some(auth) = self.auth.as_ref() {
@@ -1702,7 +1703,7 @@ impl F64Serializer {
     pub(crate) fn new(n: f64) -> Self {
         F64Serializer {
             buf: ryu::Buffer::new(),
-            n: n,
+            n,
         }
     }
 
@@ -1722,7 +1723,7 @@ impl F64Serializer {
         }
     }
 
-    pub(crate) fn to_str(&mut self) -> &str {
+    pub(crate) fn as_str(&mut self) -> &str {
         if self.n.is_finite() {
             self.buf.format_finite(self.n)
         } else {
@@ -1733,7 +1734,7 @@ impl F64Serializer {
 
 impl Sender {
     fn send_key_id(&mut self, key_id: &str) -> Result<()> {
-        write!(&mut self.conn, "{}\n", key_id)
+        writeln!(&mut self.conn, "{}", key_id)
             .map_err(|io_err| map_io_to_socket_err("Failed to send key_id: ", io_err))?;
         Ok(())
     }
@@ -1747,8 +1748,8 @@ impl Sender {
                 io_err,
             )
         })?;
-        if buf.last().map(|c| *c).unwrap_or(b'\0') != b'\n' {
-            return Err(if buf.len() == 0 {
+        if buf.last().copied().unwrap_or(b'\0') != b'\n' {
+            return Err(if buf.is_empty() {
                 error::fmt!(
                     AuthError,
                     concat!(
@@ -1773,7 +1774,7 @@ impl Sender {
                 auth.key_id
             ));
         }
-        let key_pair = parse_key_pair(&auth)?;
+        let key_pair = parse_key_pair(auth)?;
         self.send_key_id(auth.key_id.as_str())?;
         let challenge = self.read_challenge()?;
         let rng = ring::rand::SystemRandom::new();

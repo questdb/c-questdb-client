@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-#![allow(non_camel_case_types)]
+#![allow(non_camel_case_types, clippy::missing_safety_doc)]
 
 use libc::{c_char, size_t};
 use std::ascii;
@@ -123,7 +123,7 @@ impl From<ErrorCode> for line_sender_error_code {
 pub unsafe extern "C" fn line_sender_error_get_code(
     error: *const line_sender_error,
 ) -> line_sender_error_code {
-    (&*error).0.code().into()
+    (*error).0.code().into()
 }
 
 /// UTF-8 encoded error message. Never returns NULL.
@@ -134,7 +134,7 @@ pub unsafe extern "C" fn line_sender_error_msg(
     error: *const line_sender_error,
     len_out: *mut size_t,
 ) -> *const c_char {
-    let msg: &str = &(&*error).0.msg();
+    let msg: &str = (*error).0.msg();
     *len_out = msg.len();
     msg.as_ptr() as *mut c_char
 }
@@ -160,9 +160,7 @@ pub struct line_sender_utf8 {
 
 impl line_sender_utf8 {
     fn as_str(&self) -> &str {
-        unsafe {
-            std::str::from_utf8_unchecked(slice::from_raw_parts(self.buf as *const u8, self.len))
-        }
+        unsafe { str::from_utf8_unchecked(slice::from_raw_parts(self.buf as *const u8, self.len)) }
     }
 }
 
@@ -199,8 +197,8 @@ unsafe fn set_err_out(err_out: *mut *mut line_sender_error, code: ErrorCode, msg
     *err_out = err_ptr;
 }
 
-unsafe fn unwrap_utf8_or_str(buf: &[u8]) -> std::result::Result<&str, String> {
-    match std::str::from_utf8(buf) {
+unsafe fn unwrap_utf8_or_str(buf: &[u8]) -> Result<&str, String> {
+    match str::from_utf8(buf) {
         Ok(str_ref) => Ok(str_ref),
         Err(u8err) => {
             let buf_descr = describe_buf(buf);
@@ -295,7 +293,7 @@ pub struct line_sender_table_name {
 impl line_sender_table_name {
     unsafe fn as_name<'a>(&self) -> TableName<'a> {
         let str_name =
-            std::str::from_utf8_unchecked(slice::from_raw_parts(self.buf as *const u8, self.len));
+            str::from_utf8_unchecked(slice::from_raw_parts(self.buf as *const u8, self.len));
         TableName::new_unchecked(str_name)
     }
 }
@@ -314,7 +312,7 @@ pub struct line_sender_column_name {
 impl line_sender_column_name {
     unsafe fn as_name<'a>(&self) -> ColumnName<'a> {
         let str_name =
-            std::str::from_utf8_unchecked(slice::from_raw_parts(self.buf as *const u8, self.len));
+            str::from_utf8_unchecked(slice::from_raw_parts(self.buf as *const u8, self.len));
         ColumnName::new_unchecked(str_name)
     }
 }
@@ -342,7 +340,7 @@ pub unsafe extern "C" fn line_sender_table_name_init(
         return false;
     }
 
-    let str_name = std::str::from_utf8_unchecked(slice::from_raw_parts(buf as *const u8, len));
+    let str_name = str::from_utf8_unchecked(slice::from_raw_parts(buf as *const u8, len));
 
     bubble_err_to_c!(err_out, TableName::new(str_name));
 
@@ -358,7 +356,7 @@ pub unsafe extern "C" fn line_sender_table_name_assert(
 ) -> line_sender_table_name {
     let u8str = line_sender_utf8_assert(len, buf);
     match TableName::new(u8str.as_str()) {
-        Ok(_) => line_sender_table_name { len: len, buf: buf },
+        Ok(_) => line_sender_table_name { len, buf },
         Err(msg) => {
             panic!("{}", msg);
         }
@@ -388,7 +386,7 @@ pub unsafe extern "C" fn line_sender_column_name_init(
         return false;
     }
 
-    let str_name = std::str::from_utf8_unchecked(slice::from_raw_parts(buf as *const u8, len));
+    let str_name = str::from_utf8_unchecked(slice::from_raw_parts(buf as *const u8, len));
 
     bubble_err_to_c!(err_out, ColumnName::new(str_name));
 
@@ -404,7 +402,7 @@ pub unsafe extern "C" fn line_sender_column_name_assert(
 ) -> line_sender_table_name {
     let u8str = line_sender_utf8_assert(len, buf);
     match ColumnName::new(u8str.as_str()) {
-        Ok(_) => line_sender_table_name { len: len, buf: buf },
+        Ok(_) => line_sender_table_name { len, buf },
         Err(msg) => {
             panic!("{}", msg);
         }
@@ -558,11 +556,11 @@ pub unsafe extern "C" fn line_sender_buffer_free(buffer: *mut line_sender_buffer
 }
 
 unsafe fn unwrap_buffer<'a>(buffer: *const line_sender_buffer) -> &'a Buffer {
-    &(&*buffer).0
+    &(*buffer).0
 }
 
 unsafe fn unwrap_buffer_mut<'a>(buffer: *mut line_sender_buffer) -> &'a mut Buffer {
-    &mut (&mut *buffer).0
+    &mut (*buffer).0
 }
 
 /// Create a new copy of the buffer.
@@ -845,11 +843,11 @@ pub unsafe extern "C" fn line_sender_connect(
 }
 
 unsafe fn unwrap_sender<'a>(sender: *const line_sender) -> &'a Sender {
-    &(&*sender).0
+    &(*sender).0
 }
 
 unsafe fn unwrap_sender_mut<'a>(sender: *mut line_sender) -> &'a mut Sender {
-    &mut (&mut *sender).0
+    &mut (*sender).0
 }
 
 /// Check if an error occurred previously and the sender must be closed.

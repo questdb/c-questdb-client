@@ -166,7 +166,7 @@ pub mod json_tests {
                 }
             }
             writeln!(output, "{}        .at_now()?;", indent)?;
-            if let Some(ref expected) = expected {
+            if let Some(expected) = expected {
                 if let Some(ref line) = expected.line {
                     let exp_ln = format!("{}\n", line);
                     writeln!(output, "    let exp = {:?};", exp_ln)?;
