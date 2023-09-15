@@ -23,7 +23,7 @@
  ******************************************************************************/
 
 use crate::{
-    ingress::{Buffer, CertificateAuthority, Sender, TimestampMicros, TimestampNanos, Tls},
+    ingress::{Buffer, CertificateAuthority, Sender, Timestamp, TimestampMicros, TimestampNanos, Tls, TableName},
     Error, ErrorCode,
 };
 
@@ -33,7 +33,7 @@ use crate::tests::{
 };
 
 use core::time::Duration;
-use std::io;
+use std::{io, time::SystemTime};
 
 #[test]
 fn test_basics() -> TestResult {
@@ -80,6 +80,34 @@ fn test_table_name_too_long() -> TestResult {
         err.msg(),
         r#"Bad name: "a name too long": Too long (max 4 characters)"#
     );
+    Ok(())
+}
+
+#[test]
+fn test_timestamp_overloads() -> TestResult {
+    let tbl_name = TableName::new("tbl_name")?;
+
+    let mut buffer = Buffer::new();
+    buffer
+        .table(tbl_name)?
+        .column_ts("a", TimestampMicros::new(12345)?)?
+        .column_ts("b", TimestampMicros::new(-100000000)?)?
+        .column_ts("c", TimestampNanos::new(12345678)?)?
+        .column_ts("d", TimestampNanos::new(-12345678)?)?
+        .column_ts("e", Timestamp::Micros(TimestampMicros::new(-1)?))?
+        .column_ts("f", Timestamp::Nanos(TimestampNanos::new(-10000)?))?
+        .at(TimestampMicros::new(1)?)?;
+    buffer
+        .table(tbl_name)?
+        .column_ts("a", SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(1)).unwrap())?
+        .at(SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(5)).unwrap())?;
+
+    let exp = concat!(
+        "tbl_name a=12345t,b=-100000000t,c=12345t,d=-12345t,e=-1t,f=-10t 1000\n",
+        "tbl_name a=1000000t 5000000000\n"
+    );
+    assert_eq!(buffer.as_str(), exp);
+
     Ok(())
 }
 
