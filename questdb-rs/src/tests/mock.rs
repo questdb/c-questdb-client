@@ -113,11 +113,11 @@ impl MockServer {
         Ok(Self {
             poll: Poll::new()?,
             events: Events::with_capacity(128),
-            listener: listener,
+            listener,
             client: None,
             tls_conn: None,
             host: "localhost",
-            port: port,
+            port,
             msgs: Vec::new(),
         })
     }

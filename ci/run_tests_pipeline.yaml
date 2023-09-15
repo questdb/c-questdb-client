@@ -98,7 +98,7 @@ stages:
             displayName: "Publish build directory"
             condition: eq(variables['BUILD_WITH_MINGW'], '1')
       - job: CargoFmtAndClippy
-        displayName: "on"
+        displayName: "cargo fmt and clippy"
         pool:
           vmImage: 'ubuntu-latest'
         timeoutInMinutes: 10

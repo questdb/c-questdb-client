@@ -39,7 +39,7 @@ use std::io;
 fn test_basics() -> TestResult {
     let mut server = MockServer::new()?;
     let mut sender = server.lsb().connect()?;
-    assert_eq!(sender.must_close(), false);
+    assert!(!sender.must_close());
     server.accept()?;
 
     assert_eq!(server.recv_q()?, 0);
