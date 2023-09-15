@@ -763,14 +763,33 @@ pub unsafe extern "C" fn line_sender_buffer_column_str(
     true
 }
 
-/// Append a value for a TIMESTAMP column.
+/// Append a value for a TIMESTAMP column from nanoseconds.
 /// @param[in] buffer Line buffer object.
 /// @param[in] name Column name.
-/// @param[in] micros The timestamp in microseconds since the unix epoch.
+/// @param[in] nanos The timestamp in nanoseconds before or since the unix epoch.
 /// @param[out] err_out Set on error.
 /// @return true on success, false on error.
 #[no_mangle]
-pub unsafe extern "C" fn line_sender_buffer_column_ts(
+pub unsafe extern "C" fn line_sender_buffer_column_ts_nanos(
+    buffer: *mut line_sender_buffer,
+    name: line_sender_column_name,
+    nanos: i64,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    let buffer = unwrap_buffer_mut(buffer);
+    let timestamp = bubble_err_to_c!(err_out, TimestampNanos::new(nanos));
+    bubble_err_to_c!(err_out, buffer.column_ts(name.as_name(), timestamp));
+    true
+}
+
+/// Append a value for a TIMESTAMP column from microseconds.
+/// @param[in] buffer Line buffer object.
+/// @param[in] name Column name.
+/// @param[in] micros The timestamp in microseconds before or since the unix epoch.
+/// @param[out] err_out Set on error.
+/// @return true on success, false on error.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_buffer_column_ts_micros(
     buffer: *mut line_sender_buffer,
     name: line_sender_column_name,
     micros: i64,
@@ -780,9 +799,9 @@ pub unsafe extern "C" fn line_sender_buffer_column_ts(
     let timestamp = bubble_err_to_c!(err_out, TimestampMicros::new(micros));
     bubble_err_to_c!(err_out, buffer.column_ts(name.as_name(), timestamp));
     true
-}
+}   
 
-/// Complete the row with a specified timestamp.
+/// Complete the row with a timestamp specified as nanoseconds.
 ///
 /// After this call, you can start batching the next row by calling
 /// `table` again, or you can send the accumulated batch by
@@ -793,13 +812,35 @@ pub unsafe extern "C" fn line_sender_buffer_column_ts(
 /// @param[out] err_out Set on error.
 /// @return true on success, false on error.
 #[no_mangle]
-pub unsafe extern "C" fn line_sender_buffer_at(
+pub unsafe extern "C" fn line_sender_buffer_at_nanos(
     buffer: *mut line_sender_buffer,
     epoch_nanos: i64,
     err_out: *mut *mut line_sender_error,
-) -> bool {
+) -> bool {    
     let buffer = unwrap_buffer_mut(buffer);
     let timestamp = bubble_err_to_c!(err_out, TimestampNanos::new(epoch_nanos));
+    bubble_err_to_c!(err_out, buffer.at(timestamp));
+    true
+}
+
+/// Complete the row with a timestamp specified as microseconds.
+///
+/// After this call, you can start batching the next row by calling
+/// `table` again, or you can send the accumulated batch by
+/// calling `flush`.
+///
+/// @param[in] buffer Line buffer object.
+/// @param[in] epoch_micros Number of microseconds since 1st Jan 1970 UTC.
+/// @param[out] err_out Set on error.
+/// @return true on success, false on error.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_buffer_at_micros(
+    buffer: *mut line_sender_buffer,
+    epoch_micros: i64,
+    err_out: *mut *mut line_sender_error,
+) -> bool {    
+    let buffer = unwrap_buffer_mut(buffer);
+    let timestamp = bubble_err_to_c!(err_out, TimestampMicros::new(epoch_micros));
     bubble_err_to_c!(err_out, buffer.at(timestamp));
     true
 }

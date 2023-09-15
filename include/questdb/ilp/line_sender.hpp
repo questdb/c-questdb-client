@@ -511,21 +511,68 @@ namespace questdb::ilp
             return column(name, utf8_view{value});
         }
 
+        template <typename ClockT>
+        line_sender_buffer& column(
+            column_name_view name,
+            std::chrono::time_point<ClockT, std::chrono::nanoseconds> tp)
+        {
+            timestamp_nanos nanos{tp};
+            return column(name, nanos);
+        }
+
+        template <typename ClockT, typename DurationT>
+        line_sender_buffer& column(
+            column_name_view name,
+            std::chrono::time_point<ClockT, DurationT> tp)
+        {
+            timestamp_micros micros{tp};
+            return column(name, micros);
+        }
+
+        line_sender_buffer& column(
+            column_name_view name,
+            timestamp_nanos value)
+        {
+            may_init();
+            line_sender_error::wrapped_call(
+                ::line_sender_buffer_column_ts_nanos,
+                _impl,
+                name._impl,
+                value.as_nanos());
+            return *this;
+        }
+
         line_sender_buffer& column(
             column_name_view name,
             timestamp_micros value)
         {
             may_init();
             line_sender_error::wrapped_call(
-                ::line_sender_buffer_column_ts,
+                ::line_sender_buffer_column_ts_micros,
                 _impl,
                 name._impl,
                 value.as_micros());
             return *this;
         }
 
+        template <typename ClockT>
+        void at(
+            std::chrono::time_point<ClockT, std::chrono::nanoseconds> tp)
+        {
+            timestamp_nanos nanos{tp};
+            return at(nanos);
+        }
+
+        template <typename ClockT, typename DurationT>
+        void at(
+            std::chrono::time_point<ClockT, DurationT> tp)
+        {
+            timestamp_micros micros{tp};
+            return at(micros);
+        }
+
         /**
-         * Complete the row with a specified timestamp.
+         * Complete the row with a timestamp specified as nanoseconds.
          *
          * After this call, you can start batching the next row by calling
          * `.table(..)` again, or you can send the accumulated batch by
@@ -537,9 +584,27 @@ namespace questdb::ilp
         {
             may_init();
             line_sender_error::wrapped_call(
-                ::line_sender_buffer_at,
+                ::line_sender_buffer_at_nanos,
                 _impl,
                 timestamp.as_nanos());
+        }
+
+        /**
+         * Complete the row with a timestamp specified as microseconds.
+         *
+         * After this call, you can start batching the next row by calling
+         * `.table(..)` again, or you can send the accumulated batch by
+         * calling `.flush(..)`.
+         *
+         * @param timestamp Number of microseconds since 1st Jan 1970 UTC.
+         */
+        void at(timestamp_micros timestamp)
+        {
+            may_init();
+            line_sender_error::wrapped_call(
+                ::line_sender_buffer_at_micros,
+                _impl,
+                timestamp.as_micros());
         }
 
         /**

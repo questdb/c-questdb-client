@@ -188,7 +188,7 @@
 //! can call its [`as_str`](Buffer::as_str) method.
 //!
 
-pub use self::timestamp::{TimestampMicros, TimestampNanos};
+pub use self::timestamp::{Timestamp, TimestampMicros, TimestampNanos};
 
 use crate::error::{self, Error, Result};
 use crate::gai;
@@ -1085,12 +1085,13 @@ impl Buffer {
     pub fn column_ts<'a, N, T>(&mut self, name: N, value: T) -> Result<&mut Self>
     where
         N: TryInto<ColumnName<'a>>,
-        T: TryInto<TimestampMicros>,
+        T: TryInto<Timestamp>,
         Error: From<N::Error>,
         Error: From<T::Error>,
     {
         self.write_column_key(name)?;
-        let timestamp: TimestampMicros = value.try_into()?;
+        let timestamp: Timestamp = value.try_into()?;
+        let timestamp: TimestampMicros = timestamp.try_into()?;
         let mut buf = itoa::Buffer::new();
         let printed = buf.format(timestamp.as_i64());
         self.output.push_str(printed);
@@ -1129,13 +1130,25 @@ impl Buffer {
     /// The timestamp should be in UTC.
     pub fn at<T>(&mut self, timestamp: T) -> Result<()>
     where
-        T: TryInto<TimestampNanos>,
+        T: TryInto<Timestamp>,
         Error: From<T::Error>,
     {
         self.check_state(Op::At)?;
-        let mut buf = itoa::Buffer::new();
-        let timestamp: TimestampNanos = timestamp.try_into()?;
+        let timestamp: Timestamp = timestamp.try_into()?;
+
+        // https://github.com/rust-lang/rust/issues/115880
+        let timestamp: Result<TimestampNanos> = timestamp.try_into();
+        let timestamp: TimestampNanos = timestamp?;
+
         let epoch_nanos = timestamp.as_i64();
+        if epoch_nanos < 0 {
+            return Err(error::fmt!(
+                InvalidTimestamp,
+                "Timestamp {} is negative. It must be >= 0.",
+                epoch_nanos
+            ));
+        }
+        let mut buf = itoa::Buffer::new();
         let printed = buf.format(epoch_nanos);
         self.output.push(' ');
         self.output.push_str(printed);

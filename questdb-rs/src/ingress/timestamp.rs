@@ -1,7 +1,34 @@
 use crate::error;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const TIMESTAMP_MAX: i64 = i64::MAX - 1;
+const TIMESTAMP_NEG_BOUND: i128 = -9223372036854775808i128; // (i64::MIN * -1i64) as u128;
+const TIMESTAMP_POS_BOUND: i128 = i64::MAX as i128;
+
+/// Convert a `SystemTime` to a `Duration` to/from the UNIX epoch.
+/// Returns a tuple of (is_negative, duration).
+fn sys_time_to_duration(time: SystemTime, extract_fn: impl FnOnce(Duration) -> u128) -> i128 {
+    if time >= UNIX_EPOCH {
+        extract_fn(time.duration_since(UNIX_EPOCH).expect("time >= UNIX_EPOCH")) as i128
+    } else {
+        -1i128 * extract_fn(UNIX_EPOCH.duration_since(time).expect("time < UNIX_EPOCH")) as i128
+    }
+}
+
+fn sys_time_convert(
+    time: SystemTime,
+    extract_fn: impl FnOnce(Duration) -> u128,
+) -> crate::Result<i64> {
+    let number = sys_time_to_duration(time, extract_fn);
+    if number >= TIMESTAMP_NEG_BOUND && number <= TIMESTAMP_POS_BOUND {
+        Ok(number as i64)
+    } else {
+        Err(error::fmt!(
+            InvalidTimestamp,
+            "Timestamp {:?} is out of range",
+            time
+        ))
+    }
+}
 
 /// A `i64` timestamp expressed as microseconds since the UNIX epoch (UTC).
 ///
@@ -38,15 +65,7 @@ impl TimestampMicros {
     /// Create a new timestamp from the given number of microseconds
     /// since the UNIX epoch (UTC).
     pub fn new(micros: i64) -> crate::Result<Self> {
-        if micros >= 0 {
-            Ok(Self(micros))
-        } else {
-            Err(error::fmt!(
-                InvalidTimestamp,
-                "Timestamp {} is negative. It must be >= 0.",
-                micros
-            ))
-        }
+        Ok(Self(micros))
     }
 
     /// Get the numeric value of the timestamp.
@@ -59,33 +78,7 @@ impl TryFrom<SystemTime> for TimestampMicros {
     type Error = crate::Error;
 
     fn try_from(time: SystemTime) -> crate::Result<Self> {
-        let duration = time.duration_since(UNIX_EPOCH).map_err(|e| {
-            error::fmt!(
-                // This will fail if before UNIX_EPOCH,
-                // so this check also guarantees that the
-                // eventual micros result will be >= 0.
-                InvalidTimestamp,
-                concat!(
-                    "Could not calulate duration since UNIX_EPOCH",
-                    " for timestamp {:?}: {}"
-                ),
-                time,
-                e
-            )
-        })?;
-        let micros: u128 = duration.as_micros();
-        if micros <= (TIMESTAMP_MAX as u128) {
-            Ok(Self(micros as i64))
-        } else {
-            Err(error::fmt!(
-                InvalidTimestamp,
-                concat!(
-                    "Timestamp {:?} is too large to fit in a ",
-                    "64-bit signed integer."
-                ),
-                time
-            ))
-        }
+        sys_time_convert(time, |d| d.as_micros()).map(Self)
     }
 }
 
@@ -96,8 +89,6 @@ impl From<TimestampMicros> for SystemTime {
 }
 
 /// A `i64` timestamp expressed as nanoseconds since the UNIX epoch (UTC).
-///
-/// The number can't be negative (i.e. can't be before 1970-01-01 00:00:00).
 ///
 /// # Examples
 ///
@@ -130,15 +121,7 @@ impl TimestampNanos {
     /// Create a new timestamp from the given number of nanoseconds
     /// since the UNIX epoch (UTC).
     pub fn new(nanos: i64) -> crate::Result<Self> {
-        if nanos >= 0 {
-            Ok(Self(nanos))
-        } else {
-            Err(error::fmt!(
-                InvalidTimestamp,
-                "Timestamp {} is negative. It must be >= 0.",
-                nanos
-            ))
-        }
+        Ok(Self(nanos))
     }
 
     /// Get the numeric value of the timestamp.
@@ -151,32 +134,76 @@ impl TryFrom<SystemTime> for TimestampNanos {
     type Error = crate::Error;
 
     fn try_from(time: SystemTime) -> crate::Result<Self> {
-        let duration = time.duration_since(UNIX_EPOCH).map_err(|e| {
-            error::fmt!(
-                // This will fail if before UNIX_EPOCH,
-                // so this check also guarantees that the
-                // eventual nanos result will be >= 0.
+        sys_time_convert(time, |d| d.as_nanos()).map(Self)
+    }
+}
+
+impl TryFrom<TimestampMicros> for TimestampNanos {
+    type Error = crate::Error;
+
+    fn try_from(ts: TimestampMicros) -> crate::Result<Self> {
+        let nanos = ts.as_i64().checked_mul(1000i64);
+        match nanos {
+            Some(nanos) => Ok(Self(nanos)),
+            None => Err(error::fmt!(
                 InvalidTimestamp,
-                concat!(
-                    "Could not calulate duration since UNIX_EPOCH",
-                    " for timestamp {:?}: {}"
-                ),
-                time,
-                e
-            )
-        })?;
-        let nanos: u128 = duration.as_nanos();
-        if nanos <= (TIMESTAMP_MAX as u128) {
-            Ok(Self(nanos as i64))
-        } else {
-            Err(error::fmt!(
-                InvalidTimestamp,
-                concat!(
-                    "Timestamp {:?} is too large to fit in a ",
-                    "64-bit signed integer."
-                ),
-                time
-            ))
+                "Timestamp {:?} is out of range",
+                ts
+            )),
+        }
+    }
+}
+
+impl From<TimestampNanos> for TimestampMicros {
+    fn from(ts: TimestampNanos) -> Self {
+        Self(ts.as_i64() / 1000i64)
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+pub enum Timestamp {
+    Micros(TimestampMicros),
+    Nanos(TimestampNanos),
+}
+
+impl From<TimestampMicros> for Timestamp {
+    fn from(ts: TimestampMicros) -> Self {
+        Self::Micros(ts)
+    }
+}
+
+impl From<TimestampNanos> for Timestamp {
+    fn from(ts: TimestampNanos) -> Self {
+        Self::Nanos(ts)
+    }
+}
+
+impl TryFrom<SystemTime> for Timestamp {
+    type Error = crate::Error;
+
+    fn try_from(time: SystemTime) -> crate::Result<Self> {
+        Ok(Self::Nanos(time.try_into()?))
+    }
+}
+
+impl TryFrom<Timestamp> for TimestampMicros {
+    type Error = crate::Error;
+
+    fn try_from(ts: Timestamp) -> crate::Result<Self> {
+        match ts {
+            Timestamp::Micros(ts) => Ok(ts),
+            Timestamp::Nanos(ts) => Ok(ts.into()),
+        }
+    }
+}
+
+impl TryFrom<Timestamp> for TimestampNanos {
+    type Error = crate::Error;
+
+    fn try_from(ts: Timestamp) -> crate::Result<Self> {
+        match ts {
+            Timestamp::Micros(ts) => Ok(ts.try_into()?),
+            Timestamp::Nanos(ts) => Ok(ts),
         }
     }
 }

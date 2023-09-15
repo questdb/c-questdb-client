@@ -399,7 +399,22 @@ bool line_sender_buffer_column_str(
     line_sender_error** err_out);
 
 /**
- * Append a value for a TIMESTAMP column.
+ * Append a value for a TIMESTAMP column from nanoseconds.
+ * @param[in] buffer Line buffer object.
+ * @param[in] name Column name.
+ * @param[in] nanos The timestamp in nanoseconds since the unix epoch.
+ * @param[out] err_out Set on error.
+ * @return true on success, false on error.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_ts_nanos(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    int64_t nanos,
+    line_sender_error** err_out);
+
+/**
+ * Append a value for a TIMESTAMP column from microseconds.
  * @param[in] buffer Line buffer object.
  * @param[in] name Column name.
  * @param[in] micros The timestamp in microseconds since the unix epoch.
@@ -407,14 +422,14 @@ bool line_sender_buffer_column_str(
  * @return true on success, false on error.
  */
 LINESENDER_API
-bool line_sender_buffer_column_ts(
+bool line_sender_buffer_column_ts_micros(
     line_sender_buffer* buffer,
     line_sender_column_name name,
     int64_t micros,
     line_sender_error** err_out);
 
 /**
- * Complete the row with a specified timestamp.
+ * Complete the row with a timestamp specified as nanoseconds.
  *
  * After this call, you can start batching the next row by calling
  * `table` again, or you can send the accumulated batch by
@@ -426,9 +441,27 @@ bool line_sender_buffer_column_ts(
  * @return true on success, false on error.
  */
 LINESENDER_API
-bool line_sender_buffer_at(
+bool line_sender_buffer_at_nanos(
     line_sender_buffer *buffer,
     int64_t epoch_nanos,
+    line_sender_error** err_out);
+
+/**
+ * Complete the row with a timestamp specified as microseconds.
+ *
+ * After this call, you can start batching the next row by calling
+ * `table` again, or you can send the accumulated batch by
+ * calling `flush`.
+ *
+ * @param[in] buffer Line buffer object.
+ * @param[in] epoch_micros Number of microseconds since 1st Jan 1970 UTC.
+ * @param[out] err_out Set on error.
+ * @return true on success, false on error.
+ */
+LINESENDER_API
+bool line_sender_buffer_at_micros(
+    line_sender_buffer *buffer,
+    int64_t epoch_micros,
     line_sender_error** err_out);
 
 /**

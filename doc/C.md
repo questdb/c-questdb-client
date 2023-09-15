@@ -65,7 +65,7 @@ column. Symbols must be specified before columns.
 
 You can accumulate multiple lines (rows) with a given buffer and a buffer is
 re-usable, but a buffer may only be flushed via the sender after a call to
-`line_sender_buffer_at(..)` or `line_sender_buffer_at_now()`.
+`line_sender_buffer_at_*(..)` or `line_sender_buffer_at_now()`.
 
 ```c
 line_sender_table_name table_name = QDB_TABLE_NAME_LITERAL("c_cars");

@@ -282,6 +282,48 @@ class TestSender(unittest.TestCase):
         exp_dataset = [['A', ns_to_qdb_date(at_ts_ns)]]
         self.assertEqual(resp['dataset'], exp_dataset)
 
+    def test_neg_at(self):
+        if QDB_FIXTURE.version <= (6, 0, 7, 1):
+            self.skipTest('No support for user-provided timestamps.')
+            return
+        table_name = uuid.uuid4().hex
+        at_ts_ns = -10000000
+        with self.assertRaisesRegex(qls.SenderError, r'Bad call to'):
+            with self._mk_linesender() as sender:
+                with self.assertRaisesRegex(qls.SenderError, r'.*Timestamp .* is negative.*'):
+                    (sender
+                        .table(table_name)
+                        .symbol('a', 'A')
+                        .at(at_ts_ns))
+
+    def test_timestamp_col(self):
+        if QDB_FIXTURE.version <= (6, 0, 7, 1):
+            self.skipTest('No support for user-provided timestamps.')
+            return
+        table_name = uuid.uuid4().hex
+        pending = None
+        with self._mk_linesender() as sender:
+            (sender
+                .table(table_name)
+                .column('a', qls.TimestampMicros(-1000000))
+                .at_now())
+            (sender
+                .table(table_name)
+                .column('a', qls.TimestampMicros(1000000))
+                .at_now())
+            pending = sender.buffer.peek()
+
+        resp = retry_check_table(table_name, log_ctx=pending)
+        exp_columns = [
+            {'name': 'a', 'type': 'TIMESTAMP'},
+            {'name': 'timestamp', 'type': 'TIMESTAMP'}]
+        self.assertEqual(resp['columns'], exp_columns)
+
+        exp_dataset = [['1969-12-31T23:59:59.000000Z'], ['1970-01-01T00:00:01.000000Z']]
+        scrubbed_dataset = [row[:-1] for row in resp['dataset']]
+        self.assertEqual(scrubbed_dataset, exp_dataset)
+        
+
     def test_underscores(self):
         table_name = f'_{uuid.uuid4().hex}_'
         pending = None

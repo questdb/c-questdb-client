@@ -87,7 +87,7 @@ TEST_CASE("line_sender c api basics")
     CHECK(::line_sender_buffer_table(buffer, table_name, &err));
     CHECK(::line_sender_buffer_symbol(buffer, t1_name, v1_utf8, &err));
     CHECK(::line_sender_buffer_column_f64(buffer, f1_name, 0.5, &err));
-    CHECK(::line_sender_buffer_at(buffer, 10000000, &err));
+    CHECK(::line_sender_buffer_at_nanos(buffer, 10000000, &err));
     CHECK(server.recv() == 0);
     CHECK(::line_sender_buffer_size(buffer) == 27);
     CHECK(::line_sender_flush(sender, buffer, &err));

@@ -3,6 +3,7 @@ build
 cmake-build-debug
 .vs
 .vscode
+.idea
 questdb-rs/Cargo.lock
 include/questdb/ilp/line_sender.gen.h
 cython/questdb/ilp/line_sender.pxd
