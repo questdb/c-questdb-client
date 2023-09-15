@@ -71,11 +71,19 @@ AUTH_UNRECOGNIZED = (
 
 
 # Bad malformed key
-AUTH_MALFORMED = (
+AUTH_MALFORMED1 = (
     "testUser3",
     "xiecEl-zzbg6aYCFbxDMVWaly9BlCTaEChvcxCH5BCk",
     "-nSHz3evuPl-rGLIlbIZjwOJeWao0rbk53Cll6XEgak",
     "9iYksF4L6mfmArupv0CMoyVAWjQ4gNIoupdg6N5noG8")
+
+
+# Another malformed key where the keys invalid base 64.
+AUTH_MALFORMED2 = (
+    "testUser4",
+    "xiecEl-zzbg6aYCFbxDMVWaly9BlCTaECH5BCk",
+    "-nSHz3evuPl-rGLIlbIZjwOJeWao0rbk5XEgak",
+    "9iYksF4L6mfmArupv0CMoyVAWjQ4gNIou5noG8")
 
 
 class TestSender(unittest.TestCase):
@@ -232,18 +240,19 @@ class TestSender(unittest.TestCase):
         with self._mk_linesender() as sender:
             (sender
                 .table(table_name)
-                .symbol('a', 'A')  # SYMBOL
+                .column('a', 'A')  # STRING
                 .at_now())
             (sender
                 .table(table_name)
-                .column('a', 'B')  # STRING
+                .symbol('a', 'B')  # SYMBOL
                 .at_now())
+
             pending = sender.buffer.peek()
 
         # We only ever get the first row back.
         resp = retry_check_table(table_name, log_ctx=pending)
         exp_columns = [
-            {'name': 'a', 'type': 'SYMBOL'},
+            {'name': 'a', 'type': 'STRING'},
             {'name': 'timestamp', 'type': 'TIMESTAMP'}]
         self.assertEqual(resp['columns'], exp_columns)
 
@@ -505,18 +514,32 @@ class TestSender(unittest.TestCase):
         with sender:
             self._expect_eventual_disconnect(sender)
 
-    def test_malformed_auth(self):
+    def test_malformed_auth1(self):
         if not QDB_FIXTURE.auth:
             self.skipTest('No auth')
 
         sender = qls.Sender(
             QDB_FIXTURE.host,
             QDB_FIXTURE.line_tcp_port,
-            auth=AUTH_MALFORMED)
+            auth=AUTH_MALFORMED1)
 
         with self.assertRaisesRegex(
                 qls.SenderError,
                 r'.*Bad private key.*'):
+            sender.connect()
+
+    def test_malformed_auth2(self):
+        if not QDB_FIXTURE.auth:
+            self.skipTest('No auth')
+
+        sender = qls.Sender(
+            QDB_FIXTURE.host,
+            QDB_FIXTURE.line_tcp_port,
+            auth=AUTH_MALFORMED2)
+
+        with self.assertRaisesRegex(
+                qls.SenderError,
+                r'.*invalid Base64.*'):
             sender.connect()
 
     def test_tls_insecure_skip_verify(self):
