@@ -107,7 +107,7 @@ stages:
           - script: |
               rustup component add clippy
               rustup component add rustfmt
-            displayName: "Cargo fmt and clippy"
+            displayName: "Install clippy and rustfmt"
           - script: |
               cd questdb-rs
               cargo fmt --all -- --check

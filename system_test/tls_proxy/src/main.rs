@@ -34,11 +34,7 @@ use tokio::io as tio;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tokio::select;
-use tokio_rustls::rustls::{
-    self,
-    Certificate,
-    ServerConfig,
-    server::NoClientAuth};
+use tokio_rustls::rustls::{self, server::NoClientAuth, Certificate, ServerConfig};
 use tokio_rustls::TlsAcceptor;
 
 /// Options for TLS localhost proxy
@@ -50,8 +46,7 @@ struct Options {
 }
 
 fn load_certs(filename: &Path) -> Vec<Certificate> {
-    let certfile = std::fs::File::open(filename)
-        .expect("cannot open certificate file");
+    let certfile = std::fs::File::open(filename).expect("cannot open certificate file");
     let mut reader = BufReader::new(certfile);
     rustls_pemfile::certs(&mut reader)
         .unwrap()
@@ -95,7 +90,8 @@ fn tls_config() -> Arc<ServerConfig> {
     let config = ServerConfig::builder()
         .with_safe_default_cipher_suites()
         .with_safe_default_kx_groups()
-        .with_safe_default_protocol_versions().unwrap()
+        .with_safe_default_protocol_versions()
+        .unwrap()
         .with_client_cert_verifier(NoClientAuth::boxed())
         .with_single_cert(cert_chain, key_der)
         .unwrap();
@@ -105,8 +101,8 @@ fn tls_config() -> Arc<ServerConfig> {
 async fn handle_conn(
     listener: &TcpListener,
     acceptor: &TlsAcceptor,
-    dest_addr: &str) -> Result<(), Box<dyn std::error::Error>>
-{
+    dest_addr: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Waiting for a connection.");
     let (inbound_conn, _) = listener.accept().await?;
     eprintln!("Accepted a client connection.");
@@ -119,10 +115,8 @@ async fn handle_conn(
     let (mut in_read, mut in_write) = tio::split(inbound_conn);
     let (mut out_read, mut out_write) = outbound_conn.into_split();
 
-    let in_to_out = tokio::spawn(async move {
-        tio::copy(&mut in_read, &mut out_write).await });
-    let out_to_in = tokio::spawn(async move {
-        tio::copy(&mut out_read, &mut in_write).await });
+    let in_to_out = tokio::spawn(async move { tio::copy(&mut in_read, &mut out_write).await });
+    let out_to_in = tokio::spawn(async move { tio::copy(&mut out_read, &mut in_write).await });
 
     select! {
         _ = in_to_out => eprintln!("in_to_out shut down."),
