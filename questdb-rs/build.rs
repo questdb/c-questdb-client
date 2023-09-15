@@ -1,3 +1,4 @@
+#[cfg(feature = "json_tests")]
 pub mod json_tests {
     use indoc::indoc;
     use serde::{Deserialize, Serialize};
@@ -201,11 +202,14 @@ pub mod json_tests {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=Cargo.lock");
-    println!("cargo:rerun-if-changed=src/test/interop/ilp-client-interop-test.json");
+    #[cfg(feature = "json_tests")]
+    {
+        println!("cargo:rerun-if-changed=build.rs");
+        println!("cargo:rerun-if-changed=Cargo.lock");
+        println!("cargo:rerun-if-changed=src/test/interop/ilp-client-interop-test.json");
 
-    json_tests::build()?;
+        json_tests::build()?;
+    }
 
     Ok(())
 }

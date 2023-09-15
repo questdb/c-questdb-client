@@ -41,3 +41,6 @@ mio = { version = "0.8.8", features = ["os-poll", "net"] }
 [features]
 # Allow skipping verification of insecure certificates.
 insecure-skip-verify = ["rustls/dangerous_configuration"]
+
+# Enable code-generation in `build.rs` for additional tests.
+json_tests = []
