@@ -97,3 +97,40 @@ stages:
               pathToPublish: ./build
             displayName: "Publish build directory"
             condition: eq(variables['BUILD_WITH_MINGW'], '1')
+      - job: CargoFmtAndClippy
+        displayName: "on"
+        pool:
+          vmImage: 'ubuntu-latest'
+        timeoutInMinutes: 10
+        steps:
+          - checkout: self
+          - script: |
+              rustup component add clippy
+              rustup component add rustfmt
+            displayName: "Cargo fmt and clippy"
+          - script: |
+              cd questdb-rs
+              cargo fmt --all -- --check
+            displayName: "questdb-rs: fmt"
+          - script: |
+              cd questdb-rs
+              cargo clippy --all-targets --all-features -- -D warnings
+            displayName: "questdb-rs: clippy"
+          - script: |
+              cd questdb-rs-ffi
+              cargo fmt --all -- --check
+            displayName: "questdb-rs-ffi: fmt"
+          - script: |
+              cd questdb-rs-ffi
+              cargo clippy --all-targets --all-features -- -D warnings
+            displayName: "questdb-rs-ffi: clippy"
+          - script: |
+              cd system_test
+              cd tls_proxy
+              cargo fmt --all -- --check
+            displayName: "tls_proxy: fmt"
+          - script: |
+              cd system_test
+              cd tls_proxy
+              cargo clippy --all-targets --all-features -- -D warnings
+            displayName: "tls_proxy: clippy"
