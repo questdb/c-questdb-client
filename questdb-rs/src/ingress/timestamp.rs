@@ -10,7 +10,7 @@ fn sys_time_to_duration(time: SystemTime, extract_fn: impl FnOnce(Duration) -> u
     if time >= UNIX_EPOCH {
         extract_fn(time.duration_since(UNIX_EPOCH).expect("time >= UNIX_EPOCH")) as i128
     } else {
-        -1i128 * extract_fn(UNIX_EPOCH.duration_since(time).expect("time < UNIX_EPOCH")) as i128
+        -(extract_fn(UNIX_EPOCH.duration_since(time).expect("time < UNIX_EPOCH")) as i128)
     }
 }
 
@@ -19,7 +19,7 @@ fn sys_time_convert(
     extract_fn: impl FnOnce(Duration) -> u128,
 ) -> crate::Result<i64> {
     let number = sys_time_to_duration(time, extract_fn);
-    if number >= TIMESTAMP_NEG_BOUND && number <= TIMESTAMP_POS_BOUND {
+    if (TIMESTAMP_NEG_BOUND..=TIMESTAMP_POS_BOUND).contains(&number) {
         Ok(number as i64)
     } else {
         Err(error::fmt!(
@@ -160,6 +160,14 @@ impl From<TimestampNanos> for TimestampMicros {
     }
 }
 
+/// A timestamp expressed as micros or nanos.
+/// You should seldom use this directly. Instead use one of:
+///   * `TimestampNanos`
+///   * `TimestampMicros`
+///   * `std::time::SystemTime`
+///   * `chrono::DateTime`  -- requires the "chrono" feature enabled.
+///
+/// All these types can `try_into()` the `Timestamp` type.
 #[derive(Copy, Clone, Debug)]
 pub enum Timestamp {
     Micros(TimestampMicros),
@@ -204,6 +212,22 @@ impl TryFrom<Timestamp> for TimestampNanos {
         match ts {
             Timestamp::Micros(ts) => Ok(ts.try_into()?),
             Timestamp::Nanos(ts) => Ok(ts),
+        }
+    }
+}
+
+#[cfg(feature = "chrono_timestamp")]
+pub(crate) mod chrono_timestamp {
+    use super::*;
+
+    use chrono::DateTime;
+
+    impl<T: chrono::TimeZone> From<DateTime<T>> for Timestamp {
+        fn from(dt: DateTime<T>) -> Self {
+            match dt.timestamp_nanos_opt() {
+                Some(nanos) => Self::Nanos(TimestampNanos(nanos)),
+                None => Self::Micros(TimestampMicros(dt.timestamp_micros())),
+            }
         }
     }
 }

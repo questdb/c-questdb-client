@@ -188,7 +188,10 @@
 //! can call its [`as_str`](Buffer::as_str) method.
 //!
 
-pub use self::timestamp::{Timestamp, TimestampMicros, TimestampNanos};
+pub use self::timestamp::*;
+
+#[cfg(feature = "chrono_timestamp")]
+pub use self::timestamp::chrono_timestamp::*;
 
 use crate::error::{self, Error, Result};
 use crate::gai;

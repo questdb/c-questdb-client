@@ -23,7 +23,10 @@
  ******************************************************************************/
 
 use crate::{
-    ingress::{Buffer, CertificateAuthority, Sender, Timestamp, TimestampMicros, TimestampNanos, Tls, TableName},
+    ingress::{
+        Buffer, CertificateAuthority, Sender, TableName, Timestamp, TimestampMicros,
+        TimestampNanos, Tls,
+    },
     Error, ErrorCode,
 };
 
@@ -99,13 +102,37 @@ fn test_timestamp_overloads() -> TestResult {
         .at(TimestampMicros::new(1)?)?;
     buffer
         .table(tbl_name)?
-        .column_ts("a", SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(1)).unwrap())?
-        .at(SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(5)).unwrap())?;
+        .column_ts(
+            "a",
+            SystemTime::UNIX_EPOCH
+                .checked_add(Duration::from_secs(1))
+                .unwrap(),
+        )?
+        .at(SystemTime::UNIX_EPOCH
+            .checked_add(Duration::from_secs(5))
+            .unwrap())?;
 
     let exp = concat!(
         "tbl_name a=12345t,b=-100000000t,c=12345t,d=-12345t,e=-1t,f=-10t 1000\n",
         "tbl_name a=1000000t 5000000000\n"
     );
+    assert_eq!(buffer.as_str(), exp);
+
+    Ok(())
+}
+
+#[cfg(feature = "chrono_timestamp")]
+#[test]
+fn test_chrono_timestamp() -> TestResult {
+    use chrono::{DateTime, TimeZone, Utc};
+
+    let tbl_name = TableName::new("tbl_name")?;
+    let ts: DateTime<Utc> = Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 1).unwrap();
+
+    let mut buffer = Buffer::new();
+    buffer.table(tbl_name)?.column_ts("a", ts)?.at(ts)?;
+
+    let exp = "tbl_name a=1000000t 1000000000\n";
     assert_eq!(buffer.as_str(), exp);
 
     Ok(())

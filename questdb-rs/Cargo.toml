@@ -25,6 +25,7 @@ rustls-pemfile = "1.0.3"
 webpki-roots = "0.25.2"
 ryu = "1.0.15"
 itoa = "1.0.9"
+chrono = { version = "0.4.30", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3.9", features = ["ws2def"] }
@@ -44,3 +45,6 @@ insecure-skip-verify = ["rustls/dangerous_configuration"]
 
 # Enable code-generation in `build.rs` for additional tests.
 json_tests = []
+
+# Enable chrono::DateTime objects to passed in as timestamps.
+chrono_timestamp = ["chrono"]
