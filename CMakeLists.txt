@@ -25,8 +25,8 @@ option(
 # Imports `questdb_client` target.
 add_subdirectory(corrosion)
 corrosion_import_crate(
-    MANIFEST_PATH questdb-rs-ffi/Cargo.toml
-    LINK_AS C)
+    MANIFEST_PATH questdb-rs-ffi/Cargo.toml)
+corrosion_set_linker(questdb_client C)
 target_include_directories(
     questdb_client INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -154,3 +154,18 @@ if(QUESTDB_SYSTEM_TESTING)
         system_test PROPERTIES
         ENVIRONMENT BUILD_DIR_PATH=${CMAKE_BINARY_DIR})
 endif(QUESTDB_SYSTEM_TESTING)
+
+function(print_all_targets DIR)
+    get_property(TGTS DIRECTORY "${DIR}" PROPERTY BUILDSYSTEM_TARGETS)
+    foreach(TGT IN LISTS TGTS)
+        message(STATUS "Target: ${TGT}")
+        # TODO: Do something about it
+    endforeach()
+
+    get_property(SUBDIRS DIRECTORY "${DIR}" PROPERTY SUBDIRECTORIES)
+    foreach(SUBDIR IN LISTS SUBDIRS)
+        print_all_targets("${SUBDIR}")
+    endforeach()
+endfunction()
+
+print_all_targets(.)
