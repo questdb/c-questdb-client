@@ -16,23 +16,20 @@ git subtree pull --prefix questdb-rs/src/tests/interop https://github.com/questd
 ```
 
 ## CMake Integration
-We temporarily use a forked version of https://github.com/corrosion-rs/corrosion
-to enable linking the Rust crate as C rather than C++.
+We use the [Corrosion](https://corrosion-rs.github.io/corrosion/) CMake library to compile Rust
+from C and C++ projects.
 
 The "corrosion" directory has been added as:
 
 ```
-git subtree add --prefix corrosion https://github.com/amunra/corrosion master --squash
+git subtree add --prefix corrosion https://github.com/corrosion-rs/corrosion 0.4.3 --squash
 ```
 
 and is being maintained as:
 
 ```
-git subtree pull --prefix corrosion https://github.com/amunra/corrosion master --squash
+git subtree pull --prefix corrosion https://github.com/corrosion-rs/corrosion NEXT_VERSION --squash
 ```
-
-Until our outstanding pull request with the upstream project is resolved.
-See: https://github.com/corrosion-rs/corrosion/pull/188.
 
 
 ## Building without CMake
