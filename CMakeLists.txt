@@ -37,7 +37,10 @@ if(WIN32)
         DEFINE_SYMBOL "LINESENDER_DYN_LIB")
     target_link_libraries(
         questdb_client-shared
-        INTERFACE wsock32 ws2_32)
+        INTERFACE wsock32 ws2_32 ntdll)
+    target_link_libraries(
+        questdb_client-static
+        INTERFACE wsock32 ws2_32 ntdll)
 endif(WIN32)
 if(APPLE)
     target_link_libraries(
