@@ -22,7 +22,7 @@ from C and C++ projects.
 The "corrosion" directory has been added as:
 
 ```
-git subtree add --prefix corrosion https://github.com/corrosion-rs/corrosion 0.4.3 --squash
+git subtree add --prefix corrosion https://github.com/corrosion-rs/corrosion v0.4.3 --squash
 ```
 
 and is being maintained as:
