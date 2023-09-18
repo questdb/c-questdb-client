@@ -265,7 +265,7 @@ namespace questdb::ilp
     template <typename DurationT>
     struct better_than_microsec_precision {
         static constexpr bool value =
-            std::chrono::duration_cast<std::chrono::microseconds>(typename DurationT(1))
+            std::chrono::duration_cast<std::chrono::microseconds>(DurationT(1))
                 < std::chrono::microseconds(1);
     };
 
