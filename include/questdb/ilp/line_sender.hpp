@@ -32,6 +32,7 @@
 #include <cstdint>
 #include <optional>
 #include <chrono>
+#include <type_traits>
 
 namespace questdb::ilp
 {
@@ -260,6 +261,32 @@ namespace questdb::ilp
     private:
         int64_t _ts;
     };
+
+    template <typename DurationT>
+    struct better_than_microsec_precision
+    {
+        static constexpr bool value =
+            std::chrono::duration_cast<std::chrono::microseconds>(DurationT(1))
+                < std::chrono::microseconds(1);
+    };
+
+    template <typename ClockT, typename DurationT>
+    std::enable_if_t<
+        questdb::ilp::better_than_microsec_precision<DurationT>::value,
+        questdb::ilp::timestamp_nanos>
+    chrono_to_timestamp(std::chrono::time_point<ClockT, DurationT> tp)
+    {
+        return { tp };
+    }
+
+    template <typename ClockT, typename DurationT>
+    std::enable_if_t<
+        !questdb::ilp::better_than_microsec_precision<DurationT>::value,
+        questdb::ilp::timestamp_micros>
+    chrono_to_timestamp(std::chrono::time_point<ClockT, DurationT> tp)
+    {
+        return { tp };
+    }
 
     class line_sender_buffer
     {
@@ -555,20 +582,12 @@ namespace questdb::ilp
             return *this;
         }
 
-        template <typename ClockT>
-        void at(
-            std::chrono::time_point<ClockT, std::chrono::nanoseconds> tp)
-        {
-            timestamp_nanos nanos{tp};
-            return at(nanos);
-        }
-
         template <typename ClockT, typename DurationT>
         void at(
             std::chrono::time_point<ClockT, DurationT> tp)
         {
-            timestamp_micros micros{tp};
-            return at(micros);
+            auto timestamp = questdb::ilp::chrono_to_timestamp(tp);
+            return at(timestamp);
         }
 
         /**

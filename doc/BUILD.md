@@ -37,6 +37,11 @@ $ cmake -S . -B build \
 $ cmake --build build
 ```
 
+**Note**: Tests and examples are not built by default. To build them add
+`-DQUESTDB_TESTS_AND_EXAMPLES=ON` to the `cmake` command line above.
+
+```bash
+
 ### Windows
 
 The project should compile with Visual Studio 2017 and newer. It should
