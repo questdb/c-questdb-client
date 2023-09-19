@@ -71,7 +71,7 @@ stages:
               cargo build --example auth
               cargo build --example auth_tls
             displayName: Build Rust examples.
-          - script: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          - script: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DQUESTDB_TESTS_AND_EXAMPLES=ON
             env:
               JAVA_HOME: $(JAVA_HOME_11_X64)
             displayName: "Build Makefile with CMake"
