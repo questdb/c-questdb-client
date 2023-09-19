@@ -1,3 +1,4 @@
+use chrono::{TimeZone, Utc};
 use questdb::{
     ingress::{Buffer, SenderBuilder},
     Result,
@@ -19,12 +20,19 @@ fn main() -> Result<()> {
         ) // y
         .connect()?;
     let mut buffer = Buffer::new();
+    let designated_timestamp = Utc.with_ymd_and_hms(1997, 7, 4, 4, 56, 55).unwrap();
     buffer
         .table("sensors")?
         .symbol("id", "toronto1")?
         .column_f64("temperature", 20.0)?
         .column_i64("humidity", 50)?
-        .at_now()?;
+        .at(designated_timestamp)?;
+    // Instead of `.at` you call `.at_now()?` to let the server set the designated timestamp.
+
+    // You can add multiple rows before flushing.
+    // It's recommended to keep a timer and/or a buffer size before flushing.
     sender.flush(&mut buffer)?;
+
+    // The buffer is now reusable. No need to reallocate a new one.
     Ok(())
 }

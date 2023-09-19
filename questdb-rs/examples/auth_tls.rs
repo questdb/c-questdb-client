@@ -1,3 +1,4 @@
+use chrono::{TimeZone, Utc};
 use questdb::{
     ingress::{Buffer, CertificateAuthority, SenderBuilder, Tls},
     Result,
@@ -20,12 +21,16 @@ fn main() -> Result<()> {
         .tls(Tls::Enabled(CertificateAuthority::WebpkiRoots))
         .connect()?;
     let mut buffer = Buffer::new();
+    let designated_timestamp = Utc.with_ymd_and_hms(1997, 7, 4, 4, 56, 55).unwrap();
     buffer
         .table("sensors")?
         .symbol("id", "toronto1")?
         .column_f64("temperature", 20.0)?
         .column_i64("humidity", 50)?
         .at_now()?;
+
+    // You can add multiple rows before flushing.
+    // It's recommended to keep a timer and/or a buffer size before flushing.
     sender.flush(&mut buffer)?;
     Ok(())
 }

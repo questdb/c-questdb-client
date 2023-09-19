@@ -38,6 +38,7 @@ indoc = "2.0.3"
 
 [dev-dependencies]
 mio = { version = "0.8.8", features = ["os-poll", "net"] }
+chrono = "0.4.30"
 
 [features]
 # Allow skipping verification of insecure certificates.
@@ -48,3 +49,15 @@ json_tests = []
 
 # Enable chrono::DateTime objects to passed in as timestamps.
 chrono_timestamp = ["chrono"]
+
+[[example]]
+name = "basic"
+required-features = ["chrono_timestamp"]
+
+[[example]]
+name = "auth"
+required-features = ["chrono_timestamp"]
+
+[[example]]
+name = "auth_tls"
+required-features = ["chrono_timestamp"]
