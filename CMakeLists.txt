@@ -26,7 +26,6 @@ option(
 add_subdirectory(corrosion)
 corrosion_import_crate(
     MANIFEST_PATH questdb-rs-ffi/Cargo.toml)
-corrosion_set_linker(questdb_client C)
 target_include_directories(
     questdb_client INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}/include)
