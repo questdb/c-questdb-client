@@ -27,7 +27,8 @@ fn main() -> Result<()> {
         .symbol("id", "toronto1")?
         .column_f64("temperature", 20.0)?
         .column_i64("humidity", 50)?
-        .at_now()?;
+        .at(designated_timestamp)?;
+    // Instead of `.at` you call `.at_now()?` to let the server set the designated timestamp.
 
     // You can add multiple rows before flushing.
     // It's recommended to keep a timer and/or a buffer size before flushing.
