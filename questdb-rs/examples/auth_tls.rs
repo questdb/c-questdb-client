@@ -32,5 +32,7 @@ fn main() -> Result<()> {
     // You can add multiple rows before flushing.
     // It's recommended to keep a timer and/or a buffer size before flushing.
     sender.flush(&mut buffer)?;
+
+    // The buffer is now reusable. No need to reallocate a new one.
     Ok(())
 }
