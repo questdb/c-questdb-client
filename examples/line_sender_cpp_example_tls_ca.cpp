@@ -41,6 +41,8 @@ static bool example(
         const auto driver_name = "driver"_cn;
 
         questdb::ilp::line_sender_buffer buffer;
+        // 1997-07-04 04:56:55 UTC
+        questdb::ilp::timestamp_nanos designated_timestamp{867992215000000000};
         buffer
             .table(table_name)
             .symbol(id_name, "d6e5fe92-d19f-482a-a97a-c105f547f721"_utf8)
@@ -49,11 +51,15 @@ static bool example(
             .column(booked_name, true)
             .column(passengers_name, int64_t{3})
             .column(driver_name, "John Doe"_utf8)
-            .at_now();
+            .at(designated_timestamp);  // call `.at_now()` to let the server
+                                        // timestamp the record
 
         // To insert more records, call `buffer.table(..)...` again.
 
         sender.flush(buffer);
+
+        // It's recommended to keep a timer and/or maximum buffer size to flush
+        // the buffer periodically with any accumulated records.
 
         return true;
     }
