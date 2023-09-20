@@ -1083,10 +1083,10 @@ impl Buffer {
     /// # Ok(())
     /// # }
     /// ```
-    /// 
-    /// or you can also pass in a `TimestampNanos`, a `SystemTime`,
+    ///
+    /// or you can also pass in a `TimestampNanos`
     /// or a `chrono::DateTime` object.
-    /// 
+    ///
     /// This last option requires the `chrono_timestamp` feature.
     pub fn column_ts<'a, N, T>(&mut self, name: N, value: T) -> Result<&mut Self>
     where
@@ -1132,10 +1132,10 @@ impl Buffer {
     /// # Ok(())
     /// # }
     /// ```
-    /// 
-    /// or you can also pass in a `TimestampMicros`, a `SystemTime`,
+    ///
+    /// or you can also pass in a `TimestampMicros`
     /// or a `chrono::DateTime` object.
-    /// 
+    ///
     /// This last option requires the `chrono_timestamp` feature.
     ///
     pub fn at<T>(&mut self, timestamp: T) -> Result<()>
