@@ -151,26 +151,18 @@
 //! for details. Each row must be terminated with a call to either
 //! [`at`](Buffer::at) or [`at_now`](Buffer::at_now).
 //!
-//! # Data quality and threading considerations
+//! # Considerations
 //!
-//! * [Library considerations](https://github.com/questdb/c-questdb-client/blob/main/doc/CONSIDERATIONS.md) documentation.
+//! The [Library considerations](https://github.com/questdb/c-questdb-client/blob/main/doc/CONSIDERATIONS.md) documentation
+//! goes through:
+//!   * Threading.
+//!   * Differences between ILP vs QuestDB Data Types.
+//!   * Data Quality
+//!   * Client-side checks and server errors
+//!   * Flushing
+//!   * Disconnections, data errors and troubleshooting
 //!
 //! # Troubleshooting Common Issues
-//!
-//! ## Production-optimized QuestDB configuration
-//!
-//! If you can’t initially see your data through a `select` SQL query straight
-//! away, this is normal: by default the database will only commit data it
-//! receives though the line protocol periodically to maximize throughput.
-//!
-//! For dev/testing you may want to tune the following database configuration
-//! parameters as so in
-//! [`server.conf`](https://questdb.io/docs/reference/configuration/):
-//!
-//! ```ini
-//! cairo.max.uncommitted.rows=1
-//! line.tcp.maintenance.job.interval=100
-//! ```
 //!
 //! ## Infrequent Flushing
 //!
@@ -182,7 +174,7 @@
 //! The ILP protocol does not send errors back to the client.
 //! Instead, on error, the QuestDB server will disconnect and any error messages
 //! will be present in the
-//! [server logs](https://questdb.io/docs/concept/root-directory-structure#log-directory).
+//! [server logs](https://questdb.io/docs/troubleshooting/log/).
 //!
 //! If you want to inspect or log a buffer's contents before it is sent, you
 //! can call its [`as_str`](Buffer::as_str) method.

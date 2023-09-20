@@ -85,4 +85,3 @@ error code calling `.code()`.
 
 * [Data quality and threading considerations](CONSIDERATIONS.md)
 * [Authentication and TLS encryption](SECURITY.md)
-* [Troubleshooting](TROUBLESHOOTING.md)

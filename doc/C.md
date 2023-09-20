@@ -142,4 +142,3 @@ so you may want to use a `goto` to simplify handling
 
 * [Data quality and threading considerations](CONSIDERATIONS.md)
 * [Authentication and TLS encryption](SECURITY.md)
-* [Troubleshooting](TROUBLESHOOTING.md)

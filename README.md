@@ -66,7 +66,6 @@ To get started, read the language-specific guides.
 
 * [Data quality and threading considerations](doc/CONSIDERATIONS.md)
 * [Authentication and TLS encryption](doc/SECURITY.md)
-* [Troubleshooting](doc/TROUBLESHOOTING.md)
 
 ## Community
 
