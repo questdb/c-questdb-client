@@ -239,6 +239,11 @@ namespace questdb::ilp
 
         int64_t as_micros() const noexcept { return _ts; }
 
+        static inline timestamp_micros now() noexcept
+        {
+            return timestamp_micros{::line_sender_now_micros()};
+        }
+
     private:
         int64_t _ts;
     };
@@ -257,6 +262,11 @@ namespace questdb::ilp
         {}
 
         int64_t as_nanos() const noexcept { return _ts; }
+
+        static inline timestamp_nanos now() noexcept
+        {
+            return timestamp_nanos{::line_sender_now_micros()};
+        }
 
     private:
         int64_t _ts;

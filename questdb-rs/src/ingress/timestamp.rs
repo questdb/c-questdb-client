@@ -62,6 +62,11 @@ fn sys_time_convert(
 pub struct TimestampMicros(i64);
 
 impl TimestampMicros {
+    /// Current UTC timestamp in microseconds.
+    pub fn now() -> Self {
+        SystemTime::now().try_into().expect("now in range of micros")
+    }
+
     /// Create a new timestamp from the given number of microseconds
     /// since the UNIX epoch (UTC).
     pub fn new(micros: i64) -> crate::Result<Self> {
@@ -118,6 +123,11 @@ impl From<TimestampMicros> for SystemTime {
 pub struct TimestampNanos(i64);
 
 impl TimestampNanos {
+    /// Current UTC timestamp in nanoseconds.
+    pub fn now() -> Self {
+        SystemTime::now().try_into().expect("now in range of nanos")
+    }
+
     /// Create a new timestamp from the given number of nanoseconds
     /// since the UNIX epoch (UTC).
     pub fn new(nanos: i64) -> crate::Result<Self> {

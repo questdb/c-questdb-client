@@ -641,6 +641,18 @@ bool line_sender_must_close(const line_sender* sender);
 LINESENDER_API
 void line_sender_close(line_sender* sender);
 
+
+/////////// Getting the current timestamp.
+
+/** Get the current time in nanoseconds since the unix epoch (UTC). */
+LINESENDER_API
+int64_t line_sender_now_nanos();
+
+/** Get the current time in microseconds since the unix epoch (UTC). */
+LINESENDER_API
+int64_t line_sender_now_micros();
+
+
 #ifdef __cplusplus
 }
 #endif

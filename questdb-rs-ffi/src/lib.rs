@@ -946,3 +946,15 @@ pub unsafe extern "C" fn line_sender_flush_and_keep(
     bubble_err_to_c!(err_out, sender.flush_and_keep(buffer));
     true
 }
+
+/// Get the current time in nanoseconds since the unix epoch (UTC).
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_now_nanos() -> i64 {
+    TimestampNanos::now().as_i64()
+}
+
+/// Get the current time in microseconds since the unix epoch (UTC).
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_now_micros() -> i64 {
+    TimestampMicros::now().as_i64()
+}

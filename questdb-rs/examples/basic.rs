@@ -20,7 +20,9 @@ fn main() -> Result<()> {
         .column_f64("temperature", 20.0)?
         .column_i64("humidity", 50)?
         .at(designated_timestamp)?;
-    // Instead of `.at` you call `.at_now()?` to let the server set the designated timestamp.
+
+    //// If you want to pass the current system timestamp, replace with:
+    // .at(std::time::SystemTime::now())?;
 
     // You can add multiple rows before flushing.
     // It's recommended to keep a timer and/or a buffer size before flushing.

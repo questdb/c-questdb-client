@@ -70,8 +70,8 @@ static bool example(const char* host, const char* port)
     if (!line_sender_buffer_at_nanos(buffer, designated_timestamp, &err))
         goto on_error;
 
-    //// If instead you want to let the server set the designated timestamp:
-    // if (!line_sender_buffer_at_now(buffer, &err))
+    //// If you want to get the current system timestamp as nanos, call:
+    // if (!line_sender_buffer_at_nanos(buffer, line_sender_now_nanos(), &err))
     //     goto on_error;
 
     // To insert more records, call `line_sender_buffer_table(..)...` again.

@@ -42,8 +42,9 @@ static bool example(std::string_view host, std::string_view port)
             .column(booked_name, true)
             .column(passengers_name, int64_t{3})
             .column(driver_name, "John Doe"_utf8)
-            .at(designated_timestamp);  // call `.at_now()` to let the server
-                                        // timestamp the record
+            .at(designated_timestamp);
+
+        // Call `.at(timestamp_nanos::now())` to use the current system time.
 
         // To insert more records, call `buffer.table(..)...` again.
 
