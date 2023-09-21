@@ -70,7 +70,8 @@ fn test_basics() -> TestResult {
         .at(ts_nanos)?;
 
     assert_eq!(server.recv_q()?, 0);
-    let exp = format!("test,t1=v1 f1=0.5,ts1=12345t,ts2={}t,ts3={}t {}\n",
+    let exp = format!(
+        "test,t1=v1 f1=0.5,ts1=12345t,ts2={}t,ts3={}t {}\n",
         ts_micros_num,
         ts_nanos_num / 1000i64,
         ts_nanos_num
@@ -117,13 +118,16 @@ fn test_timestamp_overloads() -> TestResult {
         .column_ts(
             "a",
             TimestampMicros::from_systemtime(
-            SystemTime::UNIX_EPOCH
-                .checked_add(Duration::from_secs(1))
-                .unwrap())?,
+                SystemTime::UNIX_EPOCH
+                    .checked_add(Duration::from_secs(1))
+                    .unwrap(),
+            )?,
         )?
-        .at(TimestampNanos::from_systemtime(SystemTime::UNIX_EPOCH
-            .checked_add(Duration::from_secs(5))
-            .unwrap())?)?;
+        .at(TimestampNanos::from_systemtime(
+            SystemTime::UNIX_EPOCH
+                .checked_add(Duration::from_secs(5))
+                .unwrap(),
+        )?)?;
 
     let exp = concat!(
         "tbl_name a=12345t,b=-100000000t,c=12345t,d=-12345t,e=-1t,f=-10t 1000\n",
