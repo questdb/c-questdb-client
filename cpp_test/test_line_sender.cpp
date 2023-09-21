@@ -609,6 +609,20 @@ TEST_CASE("Test timestamp column.")
     CHECK(server.msgs()[0] == exp);
 }
 
+TEST_CASE("test timestamp_micros and timestamp_nanos::now()") {
+    questdb::ilp::timestamp_micros micros_now{questdb::ilp::timestamp_micros::now()};
+    questdb::ilp::timestamp_nanos nanos_now{questdb::ilp::timestamp_nanos::now()};
+
+    // Check both are not zero.
+    CHECK(micros_now.as_micros() != 0);
+    CHECK(nanos_now.as_nanos() != 0);
+
+    // Check both are within half second of each other.
+    const int64_t micros_of_nanos = nanos_now.as_nanos() / 1000;
+    const int64_t half_second_micros = 500000;
+    CHECK(std::abs(micros_of_nanos - micros_now.as_micros()) < half_second_micros);
+}
+
 TEST_CASE("Test Marker")
 {
     questdb::ilp::line_sender_buffer buffer;

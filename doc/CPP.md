@@ -55,7 +55,7 @@ column. Symbols must be specified before columns.
 
 You can accumulate multiple lines (rows) with a given buffer and a buffer is
 re-usable, but a buffer may only be flushed via the sender after a call to
-`buffer.at(..)` or `buffer.at_now()`.
+`buffer.at(..)` (preferred) or `buffer.at_now()`.
 
 ```cpp
 questdb::ilp::line_sender_buffer buffer;
@@ -63,7 +63,7 @@ buffer
     .table("cpp_cars")
     .symbol("id", "d6e5fe92-d19f-482a-a97a-c105f547f721")
     .column("x", 30.5)
-    .at_now();
+    .at(timestamp_nanos::now());
 
 // To insert more records, call `buffer.table(..)...` again.
 

@@ -34,6 +34,7 @@
 //!   * Send the buffer via the Sender's [`flush`](Sender::flush) method.
 //!
 //! ```no_run
+//! use std::time::SystemTime;
 //! use questdb::{
 //!     Result,
 //!     ingress::{
@@ -49,7 +50,7 @@
 //!        .symbol("id", "toronto1")?
 //!        .column_f64("temperature", 20.0)?
 //!        .column_i64("humidity", 50)?
-//!        .at_now()?;
+//!        .at(SystemTime::now())?;
 //!    sender.flush(&mut buffer)?;
 //!    Ok(())
 //! }
@@ -130,6 +131,7 @@
 //!
 //! ```
 //! # use questdb::Result;
+//! use std::time::SystemTime;
 //! use questdb::ingress::{
 //!     TableName,
 //!     ColumnName,
@@ -139,8 +141,8 @@
 //! let mut buffer = Buffer::new();
 //! let tide_name = TableName::new("tide")?;
 //! let water_level_name = ColumnName::new("water_level")?;
-//! buffer.table(tide_name)?.column_f64(water_level_name, 20.4)?.at_now()?;
-//! buffer.table(tide_name)?.column_f64(water_level_name, 17.2)?.at_now()?;
+//! buffer.table(tide_name)?.column_f64(water_level_name, 20.4)?.at(SystemTime::now())?;
+//! buffer.table(tide_name)?.column_f64(water_level_name, 17.2)?.at(SystemTime::now())?;
 //! # Ok(())
 //! # }
 //! ```
@@ -540,7 +542,7 @@ impl State {
 /// buffer
 ///     .table("table2")?
 ///     .symbol("foo", "bar")?
-///     .at_now()?;
+///     .at(SystemTime::now())?;
 /// # Ok(())
 /// # }
 /// ```
@@ -1160,6 +1162,15 @@ impl Buffer {
     }
 
     /// Terminate the row with a server-specified timestamp.
+    ///
+    /// This is NOT equivalent to calling [`at`](Buffer::at) with the current time.
+    /// There's a trade-off: Letting the server assign the timestamp can be faster
+    /// since it a reliable way to avoid out-of-order operations in the database
+    /// for maximum ingestion throughput.
+    ///
+    /// On the other hand, it removes the ability to deduplicate rows.
+    ///
+    /// In almost all cases, you should prefer [`at`](Buffer::at) over this method.
     ///
     /// ```
     /// # use questdb::Result;

@@ -1,9 +1,6 @@
 use crate::error;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const TIMESTAMP_NEG_BOUND: i128 = -9223372036854775808i128; // (i64::MIN * -1i64) as u128;
-const TIMESTAMP_POS_BOUND: i128 = i64::MAX as i128;
-
 /// Convert a `SystemTime` to a `Duration` to/from the UNIX epoch.
 /// Returns a tuple of (is_negative, duration).
 fn sys_time_to_duration(time: SystemTime, extract_fn: impl FnOnce(Duration) -> u128) -> i128 {
@@ -19,14 +16,13 @@ fn sys_time_convert(
     extract_fn: impl FnOnce(Duration) -> u128,
 ) -> crate::Result<i64> {
     let number = sys_time_to_duration(time, extract_fn);
-    if (TIMESTAMP_NEG_BOUND..=TIMESTAMP_POS_BOUND).contains(&number) {
-        Ok(number as i64)
-    } else {
-        Err(error::fmt!(
+    match i64::try_from(number) {
+        Ok(number) => Ok(number),
+        Err(_) => Err(error::fmt!(
             InvalidTimestamp,
             "Timestamp {:?} is out of range",
             time
-        ))
+        )),
     }
 }
 
@@ -64,7 +60,9 @@ pub struct TimestampMicros(i64);
 impl TimestampMicros {
     /// Current UTC timestamp in microseconds.
     pub fn now() -> Self {
-        SystemTime::now().try_into().expect("now in range of micros")
+        SystemTime::now()
+            .try_into()
+            .expect("now in range of micros")
     }
 
     /// Create a new timestamp from the given number of microseconds

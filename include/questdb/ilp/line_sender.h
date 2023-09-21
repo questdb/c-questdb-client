@@ -435,6 +435,9 @@ bool line_sender_buffer_column_ts_micros(
  * `table` again, or you can send the accumulated batch by
  * calling `flush`.
  *
+ * If you want to pass the current system timestamp,
+ * see `line_sender_now_nanos`.
+ *
  * @param[in] buffer Line buffer object.
  * @param[in] epoch_nanos Number of nanoseconds since 1st Jan 1970 UTC.
  * @param[out] err_out Set on error.
@@ -453,6 +456,9 @@ bool line_sender_buffer_at_nanos(
  * `table` again, or you can send the accumulated batch by
  * calling `flush`.
  *
+ * If you want to pass the current system timestamp,
+ * see `line_sender_now_micros`.
+ *
  * @param[in] buffer Line buffer object.
  * @param[in] epoch_micros Number of microseconds since 1st Jan 1970 UTC.
  * @param[out] err_out Set on error.
@@ -467,6 +473,15 @@ bool line_sender_buffer_at_micros(
 /**
  * Complete the row without providing a timestamp.
  * The QuestDB instance will insert its own timestamp.
+ *
+ * This is NOT equivalent to calling `line_sender_buffer_at_nanos` or
+ * `line_sender_buffer_at_micros` with the current time.
+ * There's a trade-off: Letting the server assign the timestamp can be faster
+ * since it a reliable way to avoid out-of-order operations in the database
+ * for maximum ingestion throughput.
+ * On the other hand, it removes the ability to deduplicate rows.
+ *
+ * In almost all cases, you should prefer the `line_sender_at_*` functions.
  *
  * After this call, you can start batching the next row by calling
  * `table` again, or you can send the accumulated batch by

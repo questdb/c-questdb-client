@@ -272,6 +272,8 @@ namespace questdb::ilp
         int64_t _ts;
     };
 
+    // Used to convert chrono timestamps to the closest of either
+    // `timestamp_micros` or `timestamp_nanos`.
     template <typename DurationT>
     struct better_than_microsec_precision
     {
@@ -639,6 +641,15 @@ namespace questdb::ilp
         /**
          * Complete the row without providing a timestamp.
          * The QuestDB instance will insert its own timestamp.
+         *
+         * This is NOT equivalent to calling `at()` with the
+         * current system time.
+         * There's a trade-off: Letting the server assign the timestamp
+         * can be faster since it a reliable way to avoid out-of-order
+         * operations in the database for maximum ingestion throughput.
+         * On the other hand, it removes the ability to deduplicate rows.
+         *
+         * In almost all cases, you should prefer the `at()` method.
          */
         void at_now()
         {
