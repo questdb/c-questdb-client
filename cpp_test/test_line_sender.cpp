@@ -586,15 +586,19 @@ TEST_CASE("Test timestamp column.")
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             now.time_since_epoch()).count();
 
+    const auto now_nanos_ts = questdb::ilp::timestamp_nanos{now_nanos};
+    const auto now_micros_ts = questdb::ilp::timestamp_micros{now_micros};
+
     questdb::ilp::line_sender_buffer buffer;
     buffer
         .table("test")
         .column("ts1", questdb::ilp::timestamp_micros{12345})
-        .column("ts2", questdb::ilp::timestamp_micros{now})
-        .at(now);
+        .column("ts2", now_micros_ts)
+        .column("ts3", now_nanos_ts)
+        .at(now_nanos_ts);
 
     std::stringstream ss;
-    ss << "test ts1=12345t,ts2=" << now_micros << "t " << now_nanos << "\n";
+    ss << "test ts1=12345t,ts2=" << now_micros << "t,ts3=" << now_micros << "t " << now_nanos << "\n";
     const auto exp = ss.str();
     CHECK(buffer.peek() == exp);
 
@@ -610,6 +614,7 @@ TEST_CASE("Test timestamp column.")
 }
 
 TEST_CASE("test timestamp_micros and timestamp_nanos::now()") {
+    // Explicit in tests, just to be sure we haven't messed up the return types :-)
     questdb::ilp::timestamp_micros micros_now{questdb::ilp::timestamp_micros::now()};
     questdb::ilp::timestamp_nanos nanos_now{questdb::ilp::timestamp_nanos::now()};
 

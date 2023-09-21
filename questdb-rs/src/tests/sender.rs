@@ -48,21 +48,33 @@ fn test_basics() -> TestResult {
     assert_eq!(server.recv_q()?, 0);
 
     let ts = std::time::SystemTime::now();
-    let ts_micros = ts
+    let ts_micros_num = ts
         .duration_since(std::time::SystemTime::UNIX_EPOCH)?
         .as_micros() as i64;
+    let ts_nanos_num = ts
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)?
+        .as_nanos() as i64;
+    let ts_micros = TimestampMicros::from_systemtime(ts)?;
+    assert_eq!(ts_micros.as_i64(), ts_micros_num);
+    let ts_nanos = TimestampNanos::from_systemtime(ts)?;
+    assert_eq!(ts_nanos.as_i64(), ts_nanos_num);
 
     let mut buffer = Buffer::new();
     buffer
         .table("test")?
         .symbol("t1", "v1")?
         .column_f64("f1", 0.5)?
-        .column_ts("ts1", TimestampMicros::new(12345)?)?
-        .column_ts("ts2", ts)?
-        .at(TimestampNanos::new(10000000)?)?;
+        .column_ts("ts1", TimestampMicros::new(12345))?
+        .column_ts("ts2", ts_micros)?
+        .column_ts("ts3", ts_nanos)?
+        .at(ts_nanos)?;
 
     assert_eq!(server.recv_q()?, 0);
-    let exp = format!("test,t1=v1 f1=0.5,ts1=12345t,ts2={}t 10000000\n", ts_micros);
+    let exp = format!("test,t1=v1 f1=0.5,ts1=12345t,ts2={}t,ts3={}t {}\n",
+        ts_micros_num,
+        ts_nanos_num / 1000i64,
+        ts_nanos_num
+    );
     assert_eq!(buffer.as_str(), exp);
     assert_eq!(buffer.len(), exp.len());
     sender.flush(&mut buffer)?;
@@ -93,24 +105,25 @@ fn test_timestamp_overloads() -> TestResult {
     let mut buffer = Buffer::new();
     buffer
         .table(tbl_name)?
-        .column_ts("a", TimestampMicros::new(12345)?)?
-        .column_ts("b", TimestampMicros::new(-100000000)?)?
-        .column_ts("c", TimestampNanos::new(12345678)?)?
-        .column_ts("d", TimestampNanos::new(-12345678)?)?
-        .column_ts("e", Timestamp::Micros(TimestampMicros::new(-1)?))?
-        .column_ts("f", Timestamp::Nanos(TimestampNanos::new(-10000)?))?
-        .at(TimestampMicros::new(1)?)?;
+        .column_ts("a", TimestampMicros::new(12345))?
+        .column_ts("b", TimestampMicros::new(-100000000))?
+        .column_ts("c", TimestampNanos::new(12345678))?
+        .column_ts("d", TimestampNanos::new(-12345678))?
+        .column_ts("e", Timestamp::Micros(TimestampMicros::new(-1)))?
+        .column_ts("f", Timestamp::Nanos(TimestampNanos::new(-10000)))?
+        .at(TimestampMicros::new(1))?;
     buffer
         .table(tbl_name)?
         .column_ts(
             "a",
+            TimestampMicros::from_systemtime(
             SystemTime::UNIX_EPOCH
                 .checked_add(Duration::from_secs(1))
-                .unwrap(),
+                .unwrap())?,
         )?
-        .at(SystemTime::UNIX_EPOCH
+        .at(TimestampNanos::from_systemtime(SystemTime::UNIX_EPOCH
             .checked_add(Duration::from_secs(5))
-            .unwrap())?;
+            .unwrap())?)?;
 
     let exp = concat!(
         "tbl_name a=12345t,b=-100000000t,c=12345t,d=-12345t,e=-1t,f=-10t 1000\n",
@@ -128,6 +141,7 @@ fn test_chrono_timestamp() -> TestResult {
 
     let tbl_name = TableName::new("tbl_name")?;
     let ts: DateTime<Utc> = Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 1).unwrap();
+    let ts = TimestampNanos::from_datetime(ts)?;
 
     let mut buffer = Buffer::new();
     buffer.table(tbl_name)?.column_ts("a", ts)?.at(ts)?;
@@ -195,7 +209,7 @@ fn test_tls_with_file_ca() -> TestResult {
         .table("test")?
         .symbol("t1", "v1")?
         .column_f64("f1", 0.5)?
-        .at(TimestampNanos::new(10000000)?)?;
+        .at(TimestampNanos::new(10000000))?;
 
     assert_eq!(server.recv_q()?, 0);
     let exp = "test,t1=v1 f1=0.5 10000000\n";
@@ -290,7 +304,7 @@ fn test_tls_insecure_skip_verify() -> TestResult {
         .table("test")?
         .symbol("t1", "v1")?
         .column_f64("f1", 0.5)?
-        .at(TimestampNanos::new(10000000)?)?;
+        .at(TimestampNanos::new(10000000))?;
 
     assert_eq!(server.recv_q()?, 0);
     let exp = "test,t1=v1 f1=0.5 10000000\n";

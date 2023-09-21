@@ -34,13 +34,13 @@
 //!   * Send the buffer via the Sender's [`flush`](Sender::flush) method.
 //!
 //! ```no_run
-//! use std::time::SystemTime;
 //! use questdb::{
 //!     Result,
 //!     ingress::{
 //!         Sender,
 //!         Buffer,
-//!         SenderBuilder}};
+//!         SenderBuilder,
+//!         TimestampNanos}};
 //!
 //! fn main() -> Result<()> {
 //!    let mut sender = SenderBuilder::new("localhost", 9009).connect()?;
@@ -50,7 +50,7 @@
 //!        .symbol("id", "toronto1")?
 //!        .column_f64("temperature", 20.0)?
 //!        .column_i64("humidity", 50)?
-//!        .at(SystemTime::now())?;
+//!        .at(TimestampNanos::now())?;
 //!    sender.flush(&mut buffer)?;
 //!    Ok(())
 //! }
@@ -131,18 +131,18 @@
 //!
 //! ```
 //! # use questdb::Result;
-//! use std::time::SystemTime;
 //! use questdb::ingress::{
 //!     TableName,
 //!     ColumnName,
-//!     Buffer};
+//!     Buffer,
+//!     TimestampNanos};
 //!
 //! # fn main() -> Result<()> {
 //! let mut buffer = Buffer::new();
 //! let tide_name = TableName::new("tide")?;
 //! let water_level_name = ColumnName::new("water_level")?;
-//! buffer.table(tide_name)?.column_f64(water_level_name, 20.4)?.at(SystemTime::now())?;
-//! buffer.table(tide_name)?.column_f64(water_level_name, 17.2)?.at(SystemTime::now())?;
+//! buffer.table(tide_name)?.column_f64(water_level_name, 20.4)?.at(TimestampNanos::now())?;
+//! buffer.table(tide_name)?.column_f64(water_level_name, 17.2)?.at(TimestampNanos::now())?;
 //! # Ok(())
 //! # }
 //! ```
@@ -183,9 +183,6 @@
 //!
 
 pub use self::timestamp::*;
-
-#[cfg(feature = "chrono_timestamp")]
-pub use self::timestamp::chrono_timestamp::*;
 
 use crate::error::{self, Error, Result};
 use crate::gai;
@@ -521,8 +518,7 @@ impl State {
 ///
 /// ```
 /// # use questdb::Result;
-/// use questdb::ingress::Buffer;
-/// use std::time::SystemTime;
+/// use questdb::ingress::{Buffer, TimestampMicros, TimestampNanos};
 ///
 /// # fn main() -> Result<()> {
 /// let mut buffer = Buffer::new();
@@ -535,14 +531,14 @@ impl State {
 ///     .column_i64("b", 42)?
 ///     .column_f64("c", 3.14)?
 ///     .column_str("d", "hello")?
-///     .column_ts("e", SystemTime::now())?
-///     .at(SystemTime::now())?;
+///     .column_ts("e", TimestampMicros::now())?
+///     .at(TimestampNanos::now())?;
 ///
 /// // second row
 /// buffer
 ///     .table("table2")?
 ///     .symbol("foo", "bar")?
-///     .at(SystemTime::now())?;
+///     .at(TimestampNanos::now())?;
 /// # Ok(())
 /// # }
 /// ```
@@ -1039,10 +1035,11 @@ impl Buffer {
     /// ```
     /// # use questdb::Result;
     /// # use questdb::ingress::Buffer;
+    /// use questdb::ingress::TimestampMicros;
     /// # fn main() -> Result<()> {
     /// # let mut buffer = Buffer::new();
     /// # buffer.table("x")?;
-    /// buffer.column_ts("col_name", std::time::SystemTime::now())?;
+    /// buffer.column_ts("col_name", TimestampMicros::now())?;
     /// # Ok(())
     /// # }
     /// ```
@@ -1057,7 +1054,7 @@ impl Buffer {
     /// # fn main() -> Result<()> {
     /// # let mut buffer = Buffer::new();
     /// # buffer.table("x")?;
-    /// buffer.column_ts("col_name", TimestampMicros::new(1659548204354448)?)?;
+    /// buffer.column_ts("col_name", TimestampMicros::new(1659548204354448))?;
     /// # Ok(())
     /// # }
     /// ```
@@ -1067,19 +1064,22 @@ impl Buffer {
     /// ```
     /// # use questdb::Result;
     /// # use questdb::ingress::Buffer;
+    /// use questdb::ingress::TimestampMicros;
     /// use questdb::ingress::ColumnName;
     ///
     /// # fn main() -> Result<()> {
     /// # let mut buffer = Buffer::new();
     /// # buffer.table("x")?;
     /// let col_name = ColumnName::new("col_name")?;
-    /// buffer.column_ts(col_name, std::time::SystemTime::now())?;
+    /// buffer.column_ts(col_name, TimestampMicros::now())?;
     /// # Ok(())
     /// # }
     /// ```
     ///
-    /// or you can also pass in a `TimestampNanos`
-    /// or a `chrono::DateTime` object.
+    /// or you can also pass in a `TimestampNanos`.
+    ///
+    /// Note that both `TimestampMicros` and `TimestampNanos` can be constructed
+    /// easily from either `chrono::DateTime` and `std::time::SystemTime`.
     ///
     /// This last option requires the `chrono_timestamp` feature.
     pub fn column_ts<'a, N, T>(&mut self, name: N, value: T) -> Result<&mut Self>
@@ -1104,10 +1104,11 @@ impl Buffer {
     /// ```
     /// # use questdb::Result;
     /// # use questdb::ingress::Buffer;
+    /// use questdb::ingress::TimestampNanos;
     /// # fn main() -> Result<()> {
     /// # let mut buffer = Buffer::new();
     /// # buffer.table("x")?.symbol("a", "b")?;
-    /// buffer.at(std::time::SystemTime::now())?;
+    /// buffer.at(TimestampNanos::now())?;
     /// # Ok(())
     /// # }
     /// ```
@@ -1122,15 +1123,15 @@ impl Buffer {
     /// # fn main() -> Result<()> {
     /// # let mut buffer = Buffer::new();
     /// # buffer.table("x")?.symbol("a", "b")?;
-    /// buffer.at(TimestampNanos::new(1659548315647406592)?)?;
+    /// buffer.at(TimestampNanos::new(1659548315647406592))?;
     /// # Ok(())
     /// # }
     /// ```
     ///
-    /// or you can also pass in a `TimestampMicros`
-    /// or a `chrono::DateTime` object.
+    /// You can also pass in a `TimestampMicros`.
     ///
-    /// This last option requires the `chrono_timestamp` feature.
+    /// Note that both `TimestampMicros` and `TimestampNanos` can be constructed
+    /// easily from either `chrono::DateTime` and `std::time::SystemTime`.
     ///
     pub fn at<T>(&mut self, timestamp: T) -> Result<()>
     where

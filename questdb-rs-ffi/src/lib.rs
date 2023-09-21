@@ -777,7 +777,7 @@ pub unsafe extern "C" fn line_sender_buffer_column_ts_nanos(
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     let buffer = unwrap_buffer_mut(buffer);
-    let timestamp = bubble_err_to_c!(err_out, TimestampNanos::new(nanos));
+    let timestamp = TimestampNanos::new(nanos);
     bubble_err_to_c!(err_out, buffer.column_ts(name.as_name(), timestamp));
     true
 }
@@ -796,7 +796,7 @@ pub unsafe extern "C" fn line_sender_buffer_column_ts_micros(
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     let buffer = unwrap_buffer_mut(buffer);
-    let timestamp = bubble_err_to_c!(err_out, TimestampMicros::new(micros));
+    let timestamp = TimestampMicros::new(micros);
     bubble_err_to_c!(err_out, buffer.column_ts(name.as_name(), timestamp));
     true
 }
@@ -818,7 +818,7 @@ pub unsafe extern "C" fn line_sender_buffer_at_nanos(
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     let buffer = unwrap_buffer_mut(buffer);
-    let timestamp = bubble_err_to_c!(err_out, TimestampNanos::new(epoch_nanos));
+    let timestamp = TimestampNanos::new(epoch_nanos);
     bubble_err_to_c!(err_out, buffer.at(timestamp));
     true
 }
@@ -840,7 +840,7 @@ pub unsafe extern "C" fn line_sender_buffer_at_micros(
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     let buffer = unwrap_buffer_mut(buffer);
-    let timestamp = bubble_err_to_c!(err_out, TimestampMicros::new(epoch_micros));
+    let timestamp = TimestampMicros::new(epoch_micros);
     bubble_err_to_c!(err_out, buffer.at(timestamp));
     true
 }

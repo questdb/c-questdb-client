@@ -47,7 +47,7 @@ insecure-skip-verify = ["rustls/dangerous_configuration"]
 # Enable code-generation in `build.rs` for additional tests.
 json_tests = []
 
-# Enable chrono::DateTime objects to passed in as timestamps.
+# Enable methods to create timestamp objects from chrono::DateTime objects.
 chrono_timestamp = ["chrono"]
 
 [[example]]

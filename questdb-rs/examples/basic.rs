@@ -1,6 +1,6 @@
 use chrono::{TimeZone, Utc};
 use questdb::{
-    ingress::{Buffer, SenderBuilder},
+    ingress::{Buffer, SenderBuilder, TimestampNanos},
     Result,
 };
 
@@ -13,7 +13,8 @@ fn main() -> Result<()> {
         .unwrap();
     let mut sender = SenderBuilder::new(host, port).connect()?;
     let mut buffer = Buffer::new();
-    let designated_timestamp = Utc.with_ymd_and_hms(1997, 7, 4, 4, 56, 55).unwrap();
+    let designated_timestamp =
+        TimestampNanos::from_datetime(Utc.with_ymd_and_hms(1997, 7, 4, 4, 56, 55).unwrap())?;
     buffer
         .table("sensors")?
         .symbol("id", "toronto1")?
@@ -22,7 +23,7 @@ fn main() -> Result<()> {
         .at(designated_timestamp)?;
 
     //// If you want to pass the current system timestamp, replace with:
-    // .at(std::time::SystemTime::now())?;
+    // .at(TimestampNanos::now())?;
 
     // You can add multiple rows before flushing.
     // It's recommended to keep a timer and/or a buffer size before flushing.

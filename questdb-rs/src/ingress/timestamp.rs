@@ -1,8 +1,12 @@
 use crate::error;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(feature = "chrono_timestamp")]
+use chrono::{DateTime, TimeZone};
+
 /// Convert a `SystemTime` to a `Duration` to/from the UNIX epoch.
 /// Returns a tuple of (is_negative, duration).
+#[inline]
 fn sys_time_to_duration(time: SystemTime, extract_fn: impl FnOnce(Duration) -> u128) -> i128 {
     if time >= UNIX_EPOCH {
         extract_fn(time.duration_since(UNIX_EPOCH).expect("time >= UNIX_EPOCH")) as i128
@@ -11,6 +15,7 @@ fn sys_time_to_duration(time: SystemTime, extract_fn: impl FnOnce(Duration) -> u
     }
 }
 
+#[inline]
 fn sys_time_convert(
     time: SystemTime,
     extract_fn: impl FnOnce(Duration) -> u128,
@@ -26,9 +31,13 @@ fn sys_time_convert(
     }
 }
 
+#[inline]
+fn extract_current_timestamp(extract_fn: impl FnOnce(Duration) -> u128) -> crate::Result<i64> {
+    let time = SystemTime::now();
+    sys_time_convert(time, extract_fn)
+}
+
 /// A `i64` timestamp expressed as microseconds since the UNIX epoch (UTC).
-///
-/// The number can't be negative (i.e. can't be before 1970-01-01 00:00:00).
 ///
 /// # Examples
 ///
@@ -37,7 +46,7 @@ fn sys_time_convert(
 /// use questdb::ingress::TimestampMicros;
 ///
 /// # fn main() -> Result<()> {
-/// let ts = TimestampMicros::new(1659548204354448)?;
+/// let ts = TimestampMicros::now();
 /// # Ok(())
 /// # }
 /// ```
@@ -47,10 +56,33 @@ fn sys_time_convert(
 /// ```
 /// # use questdb::Result;
 /// use questdb::ingress::TimestampMicros;
-/// use std::convert::TryInto;
 ///
 /// # fn main() -> Result<()> {
-/// let ts: TimestampMicros = std::time::SystemTime::now().try_into()?;
+/// let ts = TimestampMicros::new(1695312859886554);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// or
+///
+/// ```
+/// # use questdb::Result;
+/// use questdb::ingress::TimestampMicros;
+///
+/// # fn main() -> Result<()> {
+/// let ts = TimestampMicros::from_systemtime(std::time::SystemTime::now())?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// or
+///
+/// ```
+/// # use questdb::Result;
+/// use questdb::ingress::TimestampMicros;
+///
+/// # fn main() -> Result<()> {
+/// let ts = TimestampMicros::from_datetime(chrono::Utc::now());
 /// # Ok(())
 /// # }
 /// ```
@@ -60,34 +92,27 @@ pub struct TimestampMicros(i64);
 impl TimestampMicros {
     /// Current UTC timestamp in microseconds.
     pub fn now() -> Self {
-        SystemTime::now()
-            .try_into()
-            .expect("now in range of micros")
+        Self(extract_current_timestamp(|d| d.as_micros()).expect("now in range of micros"))
     }
 
     /// Create a new timestamp from the given number of microseconds
     /// since the UNIX epoch (UTC).
-    pub fn new(micros: i64) -> crate::Result<Self> {
-        Ok(Self(micros))
+    pub fn new(micros: i64) -> Self {
+        Self(micros)
+    }
+
+    #[cfg(feature = "chrono_timestamp")]
+    pub fn from_datetime<T: TimeZone>(dt: DateTime<T>) -> Self {
+        Self::new(dt.timestamp_micros())
+    }
+
+    pub fn from_systemtime(time: SystemTime) -> crate::Result<Self> {
+        sys_time_convert(time, |d| d.as_micros()).map(Self)
     }
 
     /// Get the numeric value of the timestamp.
     pub fn as_i64(&self) -> i64 {
         self.0
-    }
-}
-
-impl TryFrom<SystemTime> for TimestampMicros {
-    type Error = crate::Error;
-
-    fn try_from(time: SystemTime) -> crate::Result<Self> {
-        sys_time_convert(time, |d| d.as_micros()).map(Self)
-    }
-}
-
-impl From<TimestampMicros> for SystemTime {
-    fn from(timestamp: TimestampMicros) -> Self {
-        UNIX_EPOCH + Duration::from_micros(timestamp.0 as u64)
     }
 }
 
@@ -100,7 +125,7 @@ impl From<TimestampMicros> for SystemTime {
 /// use questdb::ingress::TimestampNanos;
 ///
 /// # fn main() -> Result<()> {
-/// let ts = TimestampNanos::new(1659548315647406592)?;
+/// let ts = TimestampNanos::now();
 /// # Ok(())
 /// # }
 /// ```
@@ -110,39 +135,71 @@ impl From<TimestampMicros> for SystemTime {
 /// ```
 /// # use questdb::Result;
 /// use questdb::ingress::TimestampNanos;
-/// use std::convert::TryInto;
 ///
 /// # fn main() -> Result<()> {
-/// let ts: TimestampNanos = std::time::SystemTime::now().try_into()?;
+/// let ts = TimestampNanos::new(1659548315647406592);
 /// # Ok(())
 /// # }
 /// ```
+///
+/// or
+///
+/// ```
+/// # use questdb::Result;
+/// use questdb::ingress::TimestampNanos;
+///
+/// # fn main() -> Result<()> {
+/// let ts = TimestampNanos::from_systemtime(std::time::SystemTime::now())?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// or
+///
+/// ```
+/// # use questdb::Result;
+/// use questdb::ingress::TimestampNanos;
+///
+/// # fn main() -> Result<()> {
+/// let ts = TimestampNanos::from_datetime(chrono::Utc::now());
+/// # Ok(())
+/// # }
+/// ```
+///
 #[derive(Copy, Clone, Debug)]
 pub struct TimestampNanos(i64);
 
 impl TimestampNanos {
     /// Current UTC timestamp in nanoseconds.
     pub fn now() -> Self {
-        SystemTime::now().try_into().expect("now in range of nanos")
+        Self(extract_current_timestamp(|d| d.as_nanos()).expect("now in range of nanos"))
     }
 
     /// Create a new timestamp from the given number of nanoseconds
     /// since the UNIX epoch (UTC).
-    pub fn new(nanos: i64) -> crate::Result<Self> {
-        Ok(Self(nanos))
+    pub fn new(nanos: i64) -> Self {
+        Self(nanos)
+    }
+
+    #[cfg(feature = "chrono_timestamp")]
+    pub fn from_datetime<T: TimeZone>(dt: DateTime<T>) -> crate::Result<Self> {
+        match dt.timestamp_nanos_opt() {
+            Some(nanos) => Ok(Self::new(nanos)),
+            None => Err(error::fmt!(
+                InvalidTimestamp,
+                "Timestamp {:?} is out of range",
+                dt
+            )),
+        }
+    }
+
+    pub fn from_systemtime(time: SystemTime) -> crate::Result<Self> {
+        sys_time_convert(time, |d| d.as_nanos()).map(Self)
     }
 
     /// Get the numeric value of the timestamp.
     pub fn as_i64(&self) -> i64 {
         self.0
-    }
-}
-
-impl TryFrom<SystemTime> for TimestampNanos {
-    type Error = crate::Error;
-
-    fn try_from(time: SystemTime) -> crate::Result<Self> {
-        sys_time_convert(time, |d| d.as_nanos()).map(Self)
     }
 }
 
@@ -172,10 +229,11 @@ impl From<TimestampNanos> for TimestampMicros {
 /// You should seldom use this directly. Instead use one of:
 ///   * `TimestampNanos`
 ///   * `TimestampMicros`
-///   * `std::time::SystemTime`
-///   * `chrono::DateTime`  -- requires the "chrono" feature enabled.
 ///
-/// All these types can `try_into()` the `Timestamp` type.
+/// Both of these types can `try_into()` the `Timestamp` type.
+///
+/// Both of these can be constructed from `std::time::SystemTime`,
+/// or from `chrono::DateTime`.
 #[derive(Copy, Clone, Debug)]
 pub enum Timestamp {
     Micros(TimestampMicros),
@@ -191,14 +249,6 @@ impl From<TimestampMicros> for Timestamp {
 impl From<TimestampNanos> for Timestamp {
     fn from(ts: TimestampNanos) -> Self {
         Self::Nanos(ts)
-    }
-}
-
-impl TryFrom<SystemTime> for Timestamp {
-    type Error = crate::Error;
-
-    fn try_from(time: SystemTime) -> crate::Result<Self> {
-        Ok(Self::Nanos(time.try_into()?))
     }
 }
 
@@ -220,22 +270,6 @@ impl TryFrom<Timestamp> for TimestampNanos {
         match ts {
             Timestamp::Micros(ts) => Ok(ts.try_into()?),
             Timestamp::Nanos(ts) => Ok(ts),
-        }
-    }
-}
-
-#[cfg(feature = "chrono_timestamp")]
-pub(crate) mod chrono_timestamp {
-    use super::*;
-
-    use chrono::DateTime;
-
-    impl<T: chrono::TimeZone> From<DateTime<T>> for Timestamp {
-        fn from(dt: DateTime<T>) -> Self {
-            match dt.timestamp_nanos_opt() {
-                Some(nanos) => Self::Nanos(TimestampNanos(nanos)),
-                None => Self::Micros(TimestampMicros(dt.timestamp_micros())),
-            }
         }
     }
 }
