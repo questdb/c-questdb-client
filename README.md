@@ -44,11 +44,11 @@ To get started, read the language-specific guides.
 
 **C**
 * [Getting started with C](doc/C.md)
-* [`.h` header file](include/questdb/ilp/line_sender.h)
+* [`.h` header file](include/questdb/ingress/line_sender.h)
 
 **C++**
 * [Getting started with C++](doc/CPP.md)
-* [`.hpp` header file](include/questdb/ilp/line_sender.hpp)
+* [`.hpp` header file](include/questdb/ingress/line_sender.hpp)
 
 **Rust**
 * [Getting started with Rust](questdb-rs/README.md)

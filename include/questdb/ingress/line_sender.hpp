@@ -34,7 +34,7 @@
 #include <chrono>
 #include <type_traits>
 
-namespace questdb::ilp
+namespace questdb::ingress
 {
     constexpr const char* inaddr_any = "0.0.0.0";
 

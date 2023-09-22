@@ -39,7 +39,7 @@ typedef int socketfd_t;
 typedef SOCKET socketfd_t;
 #endif
 
-namespace questdb::ilp::test
+namespace questdb::ingress::test
 {
 
 /**

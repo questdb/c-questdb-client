@@ -18,12 +18,12 @@
 
 ### Header
 
-* [`.h` header file](../include/questdb/ilp/line_sender.h)
+* [`.h` header file](../include/questdb/ingress/line_sender.h)
 
 ### Connecting
 
 ```c
-#include <questdb/ilp/line_sender.h>
+#include <questdb/ingress/line_sender.h>
 
 ...
 
