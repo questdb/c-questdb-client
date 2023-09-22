@@ -89,7 +89,7 @@ static void release_winsock()
 }
 #endif
 
-namespace questdb::ilp::test
+namespace questdb::ingress::test
 {
 
 mock_server::mock_server()

@@ -27,8 +27,8 @@
 
 #include "mock_server.hpp"
 
-#include <questdb/ilp/line_sender.h>
-#include <questdb/ilp/line_sender.hpp>
+#include <questdb/ingress/line_sender.h>
+#include <questdb/ingress/line_sender.hpp>
 
 #include <vector>
 #include <sstream>
@@ -36,7 +36,7 @@
 #include <thread>
 
 using namespace std::string_literals;
-using namespace questdb::ilp::literals;
+using namespace questdb::ingress::literals;
 
 template <typename F>
     class on_scope_exit
@@ -50,7 +50,7 @@ private:
 
 TEST_CASE("line_sender c api basics")
 {
-    questdb::ilp::test::mock_server server;
+    questdb::ingress::test::mock_server server;
     ::line_sender_error* err = nullptr;
     on_scope_exit error_free_guard{[&]{
             if (err)
@@ -98,8 +98,8 @@ TEST_CASE("line_sender c api basics")
 
 TEST_CASE("line_sender c++ connect disconnect")
 {
-    questdb::ilp::test::mock_server server;
-    questdb::ilp::line_sender sender{"localhost", server.port()};
+    questdb::ingress::test::mock_server server;
+    questdb::ingress::line_sender sender{"localhost", server.port()};
     CHECK_FALSE(sender.must_close());
     server.accept();
     CHECK(server.recv() == 0);
@@ -107,21 +107,21 @@ TEST_CASE("line_sender c++ connect disconnect")
 
 TEST_CASE("line_sender c++ api basics")
 {
-    questdb::ilp::test::mock_server server;
-    questdb::ilp::line_sender sender{
+    questdb::ingress::test::mock_server server;
+    questdb::ingress::line_sender sender{
         std::string("localhost"),
         std::to_string(server.port())};
     CHECK_FALSE(sender.must_close());
     server.accept();
     CHECK(server.recv() == 0);
 
-    questdb::ilp::line_sender_buffer buffer;
+    questdb::ingress::line_sender_buffer buffer;
     buffer
         .table("test")
         .symbol("t1", "v1")
         .symbol("t2", "")
         .column("f1", 0.5)
-        .at(questdb::ilp::timestamp_nanos{10000000});
+        .at(questdb::ingress::timestamp_nanos{10000000});
 
     CHECK(server.recv() == 0);
     CHECK(buffer.size() == 31);
@@ -132,8 +132,8 @@ TEST_CASE("line_sender c++ api basics")
 
 TEST_CASE("test multiple lines")
 {
-    questdb::ilp::test::mock_server server;
-    questdb::ilp::line_sender sender{
+    questdb::ingress::test::mock_server server;
+    questdb::ingress::line_sender sender{
         "localhost",
         server.port()};
     CHECK_FALSE(sender.must_close());
@@ -141,7 +141,7 @@ TEST_CASE("test multiple lines")
     CHECK(server.recv() == 0);
 
     const auto table_name = "metric1"_tn;
-    questdb::ilp::line_sender_buffer buffer;
+    questdb::ingress::line_sender_buffer buffer;
     buffer
         .table(table_name)
         .symbol("t1"_cn, "val1"_utf8)
@@ -152,7 +152,7 @@ TEST_CASE("test multiple lines")
         .column("f4"_cn, "val3"_utf8)
         .column("f5"_cn, "val4"_utf8)
         .column("f6"_cn, "val5"_utf8)
-        .at(questdb::ilp::timestamp_nanos{111222233333});
+        .at(questdb::ingress::timestamp_nanos{111222233333});
     buffer
         .table(table_name)
         .symbol("tag3"_cn, "value 3"_utf8)
@@ -173,30 +173,30 @@ TEST_CASE("test multiple lines")
 
 TEST_CASE("State machine testing -- flush without data.")
 {
-    questdb::ilp::test::mock_server server;
-    questdb::ilp::line_sender sender{
+    questdb::ingress::test::mock_server server;
+    questdb::ingress::line_sender sender{
         std::string_view{"localhost"},
         std::to_string(server.port())};
 
-    questdb::ilp::line_sender_buffer buffer;
+    questdb::ingress::line_sender_buffer buffer;
     CHECK(buffer.size() == 0);
     CHECK_THROWS_WITH_AS(
         sender.flush(buffer),
         "State error: Bad call to `flush`, should have called `table` instead.",
-        questdb::ilp::line_sender_error);
+        questdb::ingress::line_sender_error);
     CHECK(!sender.must_close());
     sender.close();
 }
 
 TEST_CASE("One symbol only - flush before server accept")
 {
-    questdb::ilp::test::mock_server server;
-    questdb::ilp::line_sender sender{
+    questdb::ingress::test::mock_server server;
+    questdb::ingress::line_sender sender{
         std::string{"localhost"},
         server.port()};
 
     // Does not raise - this is unlike InfluxDB spec that disallows this.
-    questdb::ilp::line_sender_buffer buffer;
+    questdb::ingress::line_sender_buffer buffer;
     buffer.table("test").symbol("t1", std::string{"v1"}).at_now();
     CHECK(!sender.must_close());
     CHECK(buffer.size() == 11);
@@ -212,13 +212,13 @@ TEST_CASE("One symbol only - flush before server accept")
 
 TEST_CASE("One column only - server.accept() after flush, before close")
 {
-    questdb::ilp::test::mock_server server;
-    questdb::ilp::line_sender sender{
+    questdb::ingress::test::mock_server server;
+    questdb::ingress::line_sender sender{
         "localhost",
         server.port()};
 
     // Does not raise - this is unlike InfluxDB spec that disallows this.
-    questdb::ilp::line_sender_buffer buffer;
+    questdb::ingress::line_sender_buffer buffer;
     buffer.table("test").column("t1", "v1").at_now();
     CHECK(!sender.must_close());
     CHECK(buffer.size() == 13);
@@ -233,17 +233,17 @@ TEST_CASE("One column only - server.accept() after flush, before close")
 
 TEST_CASE("Symbol after column")
 {
-    questdb::ilp::test::mock_server server;
-    questdb::ilp::line_sender sender{
+    questdb::ingress::test::mock_server server;
+    questdb::ingress::line_sender sender{
         "localhost",
         server.port()};
 
-    questdb::ilp::line_sender_buffer buffer;
+    questdb::ingress::line_sender_buffer buffer;
     buffer.table("test").column("t1", "v1");
 
     CHECK_THROWS_AS(
         buffer.symbol("t2", "v2"),
-        questdb::ilp::line_sender_error);
+        questdb::ingress::line_sender_error);
 
     CHECK(!sender.must_close());
 
@@ -251,7 +251,7 @@ TEST_CASE("Symbol after column")
         sender.flush(buffer),
         "State error: Bad call to `flush`, "
         "should have called `column` or `at` instead.",
-        questdb::ilp::line_sender_error);
+        questdb::ingress::line_sender_error);
 
     // Check idempotency of close.
     sender.close();
@@ -266,7 +266,7 @@ TEST_CASE("Bad UTF-8")
         "\xff\xff"_utf8,
         "Bad string \"\\xff\\xff\": "
         "Invalid UTF-8. Illegal codepoint starting at byte index 0.",
-        questdb::ilp::line_sender_error);
+        questdb::ingress::line_sender_error);
 }
 
 TEST_CASE("Validation of bad chars in key names.")
@@ -277,7 +277,7 @@ TEST_CASE("Validation of bad chars in key names.")
             "Bad string \"a*b\": Table names "
             "can't contain a '*' character, "
             "which was found at byte position 1.",
-            questdb::ilp::line_sender_error);
+            questdb::ingress::line_sender_error);
     }
 
     {
@@ -286,24 +286,24 @@ TEST_CASE("Validation of bad chars in key names.")
             "Bad string \"a+b\": Table names "
             "can't contain a '+' character, "
             "which was found at byte position 1.",
-            questdb::ilp::line_sender_error);
+            questdb::ingress::line_sender_error);
     }
 
     {
         std::string_view column_name{"a\0b", 3};
         CHECK_THROWS_WITH_AS(
-            questdb::ilp::column_name_view{column_name},
+            questdb::ingress::column_name_view{column_name},
             "Bad string \"a\\0b\": Column names "
             "can't contain a '\\0' character, "
             "which was found at byte position 1.",
-            questdb::ilp::line_sender_error);
+            questdb::ingress::line_sender_error);
     }
 
     auto test_bad_name = [](std::string bad_name)
         {
             try
             {
-                questdb::ilp::column_name_view{bad_name};
+                questdb::ingress::column_name_view{bad_name};
                 std::stringstream ss;
                 ss << "Name `" << bad_name << "` (";
                 for (const char& c : bad_name)
@@ -317,7 +317,7 @@ TEST_CASE("Validation of bad chars in key names.")
                 ss << ") did not raise.";
                 CHECK_MESSAGE(false, ss.str());
             }
-            catch (const questdb::ilp::line_sender_error&)
+            catch (const questdb::ingress::line_sender_error&)
             {
                 return;
             }
@@ -348,24 +348,24 @@ TEST_CASE("Buffer move and copy ctor testing")
 {
     const size_t init_capacity = 128;
 
-    questdb::ilp::line_sender_buffer buffer1{init_capacity};
+    questdb::ingress::line_sender_buffer buffer1{init_capacity};
     buffer1.table("buffer1");
     CHECK(buffer1.peek() == "buffer1");
 
-    questdb::ilp::line_sender_buffer buffer2{2 * init_capacity};
+    questdb::ingress::line_sender_buffer buffer2{2 * init_capacity};
     buffer2.table("buffer2");
     CHECK(buffer2.peek() == "buffer2");
 
-    questdb::ilp::line_sender_buffer buffer3{3 * init_capacity};
+    questdb::ingress::line_sender_buffer buffer3{3 * init_capacity};
     buffer3.table("buffer3");
     CHECK(buffer3.peek() == "buffer3");
 
-    questdb::ilp::line_sender_buffer buffer4{buffer3};
+    questdb::ingress::line_sender_buffer buffer4{buffer3};
     buffer4.symbol("t1", "v1");
     CHECK(buffer4.peek() == "buffer3,t1=v1");
     CHECK(buffer3.peek() == "buffer3");
 
-    questdb::ilp::line_sender_buffer buffer5{std::move(buffer4)};
+    questdb::ingress::line_sender_buffer buffer5{std::move(buffer4)};
     CHECK(buffer5.peek() == "buffer3,t1=v1");
     CHECK(buffer4.peek() == "");
 
@@ -388,17 +388,17 @@ TEST_CASE("Buffer move and copy ctor testing")
 
 TEST_CASE("Sender move testing.")
 {
-    questdb::ilp::test::mock_server server1;
-    questdb::ilp::test::mock_server server2;
+    questdb::ingress::test::mock_server server1;
+    questdb::ingress::test::mock_server server2;
 
-    questdb::ilp::utf8_view host{"localhost"};
-    const questdb::ilp::utf8_view& host_ref = host;
+    questdb::ingress::utf8_view host{"localhost"};
+    const questdb::ingress::utf8_view& host_ref = host;
 
-    questdb::ilp::line_sender sender1{
+    questdb::ingress::line_sender sender1{
         host_ref,
         server1.port()};
 
-    questdb::ilp::line_sender_buffer buffer;
+    questdb::ingress::line_sender_buffer buffer;
     buffer.table("test").column("t1", "v1").at_now();
 
     server1.close();
@@ -413,15 +413,15 @@ TEST_CASE("Sender move testing.")
 
     CHECK_THROWS_AS(
         fail_to_flush_eventually(),
-        questdb::ilp::line_sender_error);
+        questdb::ingress::line_sender_error);
     CHECK(sender1.must_close());
 
-    questdb::ilp::line_sender sender2{std::move(sender1)};
+    questdb::ingress::line_sender sender2{std::move(sender1)};
 
     CHECK_FALSE(sender1.must_close());
     CHECK(sender2.must_close());
 
-    questdb::ilp::line_sender sender3{
+    questdb::ingress::line_sender sender3{
         "localhost",
         server2.port()};
     CHECK_FALSE(sender3.must_close());
@@ -434,10 +434,10 @@ TEST_CASE("Bad hostname")
 {
     try
     {
-        questdb::ilp::line_sender sender{"dummy_hostname", "9009"};
+        questdb::ingress::line_sender sender{"dummy_hostname", "9009"};
         CHECK_MESSAGE(false, "Expected exception");
     }
-    catch (const questdb::ilp::line_sender_error& se)
+    catch (const questdb::ingress::line_sender_error& se)
     {
         std::string msg{se.what()};
         CHECK_MESSAGE(
@@ -454,12 +454,12 @@ TEST_CASE("Bad interface")
 {
     try
     {
-        questdb::ilp::opts opts{"localhost", "9009"};
+        questdb::ingress::opts opts{"localhost", "9009"};
         opts.net_interface("dummy_hostname");
-        questdb::ilp::line_sender sender{opts};
+        questdb::ingress::line_sender sender{opts};
         CHECK_MESSAGE(false, "Expected exception");
     }
-    catch (const questdb::ilp::line_sender_error& se)
+    catch (const questdb::ingress::line_sender_error& se)
     {
         std::string msg{se.what()};
         CHECK_MESSAGE(
@@ -478,12 +478,12 @@ TEST_CASE("Bad port")
         {
             try
             {
-                questdb::ilp::line_sender sender{
+                questdb::ingress::line_sender sender{
                     "localhost",
                     bad_port};
                 CHECK_MESSAGE(false, "Expected exception");
             }
-            catch (const questdb::ilp::line_sender_error& se)
+            catch (const questdb::ingress::line_sender_error& se)
             {
                 std::string msg{se.what()};
                 std::string exp_msg{"\"localhost:" + bad_port + "\": "};
@@ -508,12 +508,12 @@ TEST_CASE("Bad connect")
     {
         // Port 1 is generally the tcpmux service which one would
         // very much expect to never be running.
-        questdb::ilp::line_sender sender{
+        questdb::ingress::line_sender sender{
             "localhost",
             1};
         CHECK_MESSAGE(false, "Expected exception");
     }
-    catch (const questdb::ilp::line_sender_error& se)
+    catch (const questdb::ingress::line_sender_error& se)
     {
         std::string msg{se.what()};
         CHECK_MESSAGE(
@@ -530,12 +530,12 @@ TEST_CASE("Bad CA path")
 {
     try
     {
-        questdb::ilp::test::mock_server server;
-        questdb::ilp::opts opts{"localhost", server.port()};
+        questdb::ingress::test::mock_server server;
+        questdb::ingress::opts opts{"localhost", server.port()};
         opts.tls("/an/invalid/path/to/ca.pem");
-        questdb::ilp::line_sender sender{opts};
+        questdb::ingress::line_sender sender{opts};
     }
-    catch(const questdb::ilp::line_sender_error& se)
+    catch(const questdb::ingress::line_sender_error& se)
     {
         std::string msg{se.what()};
         CHECK_MESSAGE(
@@ -551,32 +551,32 @@ TEST_CASE("Bad CA path")
 TEST_CASE("Opts copy ctor, assignment and move testing.")
 {
     {
-        questdb::ilp::opts opts1{"localhost", "9009"};
-        questdb::ilp::opts opts2{std::move(opts1)};
+        questdb::ingress::opts opts1{"localhost", "9009"};
+        questdb::ingress::opts opts2{std::move(opts1)};
     }
 
     {
-        questdb::ilp::opts opts1{"localhost", "9009"};
-        questdb::ilp::opts opts2{opts1};
+        questdb::ingress::opts opts1{"localhost", "9009"};
+        questdb::ingress::opts opts2{opts1};
     }
 
     {
-        questdb::ilp::opts opts1{"localhost", "9009"};
-        questdb::ilp::opts opts2{"altavista.digital.com", "9009"};
+        questdb::ingress::opts opts1{"localhost", "9009"};
+        questdb::ingress::opts opts2{"altavista.digital.com", "9009"};
         opts1 = std::move(opts2);
     }
 
     {
-        questdb::ilp::opts opts1{"localhost", "9009"};
-        questdb::ilp::opts opts2{"altavista.digital.com", "9009"};
+        questdb::ingress::opts opts1{"localhost", "9009"};
+        questdb::ingress::opts opts2{"altavista.digital.com", "9009"};
         opts1 = opts2;
     }
 }
 
 TEST_CASE("Test timestamp column.")
 {
-    questdb::ilp::test::mock_server server;
-    questdb::ilp::line_sender sender{"localhost", server.port()};
+    questdb::ingress::test::mock_server server;
+    questdb::ingress::line_sender sender{"localhost", server.port()};
 
     const auto now = std::chrono::system_clock::now();
     const auto now_micros =
@@ -586,13 +586,13 @@ TEST_CASE("Test timestamp column.")
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             now.time_since_epoch()).count();
 
-    const auto now_nanos_ts = questdb::ilp::timestamp_nanos{now_nanos};
-    const auto now_micros_ts = questdb::ilp::timestamp_micros{now_micros};
+    const auto now_nanos_ts = questdb::ingress::timestamp_nanos{now_nanos};
+    const auto now_micros_ts = questdb::ingress::timestamp_micros{now_micros};
 
-    questdb::ilp::line_sender_buffer buffer;
+    questdb::ingress::line_sender_buffer buffer;
     buffer
         .table("test")
-        .column("ts1", questdb::ilp::timestamp_micros{12345})
+        .column("ts1", questdb::ingress::timestamp_micros{12345})
         .column("ts2", now_micros_ts)
         .column("ts3", now_nanos_ts)
         .at(now_nanos_ts);
@@ -615,8 +615,8 @@ TEST_CASE("Test timestamp column.")
 
 TEST_CASE("test timestamp_micros and timestamp_nanos::now()") {
     // Explicit in tests, just to be sure we haven't messed up the return types :-)
-    questdb::ilp::timestamp_micros micros_now{questdb::ilp::timestamp_micros::now()};
-    questdb::ilp::timestamp_nanos nanos_now{questdb::ilp::timestamp_nanos::now()};
+    questdb::ingress::timestamp_micros micros_now{questdb::ingress::timestamp_micros::now()};
+    questdb::ingress::timestamp_nanos nanos_now{questdb::ingress::timestamp_nanos::now()};
 
     // Check both are not zero.
     CHECK(micros_now.as_micros() != 0);
@@ -630,7 +630,7 @@ TEST_CASE("test timestamp_micros and timestamp_nanos::now()") {
 
 TEST_CASE("Test Marker")
 {
-    questdb::ilp::line_sender_buffer buffer;
+    questdb::ingress::line_sender_buffer buffer;
     buffer.clear_marker();
     buffer.clear_marker();
 
@@ -644,11 +644,11 @@ TEST_CASE("Test Marker")
     CHECK(buffer.size() == 0);
 
     // Can't rewind, no marker set: Cleared by `rewind_to_marker`.
-    CHECK_THROWS_AS(buffer.rewind_to_marker(), questdb::ilp::line_sender_error);
+    CHECK_THROWS_AS(buffer.rewind_to_marker(), questdb::ingress::line_sender_error);
 
     buffer.table("a").symbol("b", "c");
-    CHECK_THROWS_AS(buffer.set_marker(), questdb::ilp::line_sender_error);
-    CHECK_THROWS_AS(buffer.rewind_to_marker(), questdb::ilp::line_sender_error);
+    CHECK_THROWS_AS(buffer.set_marker(), questdb::ingress::line_sender_error);
+    CHECK_THROWS_AS(buffer.rewind_to_marker(), questdb::ingress::line_sender_error);
     CHECK(buffer.peek() == "a,b=c");
 
     buffer.at_now();
@@ -657,7 +657,7 @@ TEST_CASE("Test Marker")
     buffer.set_marker();
     buffer.clear_marker();
     buffer.clear_marker();
-    CHECK_THROWS_AS(buffer.rewind_to_marker(), questdb::ilp::line_sender_error);
+    CHECK_THROWS_AS(buffer.rewind_to_marker(), questdb::ingress::line_sender_error);
     buffer.set_marker();
     buffer.table("d").symbol("e", "f");
     CHECK(buffer.peek() == "a,b=c\nd,e=f");
@@ -667,43 +667,43 @@ TEST_CASE("Test Marker")
 
     buffer.clear();
     CHECK(buffer.peek() == "");
-    CHECK_THROWS_AS(buffer.rewind_to_marker(), questdb::ilp::line_sender_error);
+    CHECK_THROWS_AS(buffer.rewind_to_marker(), questdb::ingress::line_sender_error);
 }
 
 TEST_CASE("Moved View") {
     auto v1 = "abc"_tn;
     CHECK(v1.size() == 3);
-    questdb::ilp::table_name_view v2{std::move(v1)};
+    questdb::ingress::table_name_view v2{std::move(v1)};
     CHECK(v2.size() == 3);
     CHECK(v1.size() == 3);
     CHECK(v1.data() == v2.data());
 }
 
 TEST_CASE("Empty Buffer") {
-    questdb::ilp::line_sender_buffer b1;
+    questdb::ingress::line_sender_buffer b1;
     CHECK(b1.size() == 0);
-    questdb::ilp::line_sender_buffer b2{std::move(b1)};
+    questdb::ingress::line_sender_buffer b2{std::move(b1)};
     CHECK(b1.size() == 0);
     CHECK(b2.size() == 0);
-    questdb::ilp::line_sender_buffer b3;
+    questdb::ingress::line_sender_buffer b3;
     b3 = std::move(b2);
     CHECK(b2.size() == 0);
     CHECK(b3.size() == 0);
-    questdb::ilp::line_sender_buffer b4;
+    questdb::ingress::line_sender_buffer b4;
     b4.table("test").symbol("a", "b").at_now();
-    questdb::ilp::line_sender_buffer b5;
+    questdb::ingress::line_sender_buffer b5;
     b5 = std::move(b4);
     CHECK(b4.size() == 0);
     CHECK(b5.size() == 9);
 
-    questdb::ilp::test::mock_server server;
-    questdb::ilp::line_sender sender{"localhost", server.port()};
+    questdb::ingress::test::mock_server server;
+    questdb::ingress::line_sender sender{"localhost", server.port()};
     CHECK_THROWS_WITH_AS(
         sender.flush(b1),
         "State error: Bad call to `flush`, should have called `table` instead.",
-        questdb::ilp::line_sender_error);
+        questdb::ingress::line_sender_error);
     CHECK_THROWS_WITH_AS(
         sender.flush_and_keep(b1),
         "State error: Bad call to `flush`, should have called `table` instead.",
-        questdb::ilp::line_sender_error);
+        questdb::ingress::line_sender_error);
 }

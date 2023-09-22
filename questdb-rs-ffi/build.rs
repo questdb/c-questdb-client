@@ -9,7 +9,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let crate_dir = std::env::var("CARGO_MANIFEST_DIR")?;
         let bindings = cbindgen::generate(crate_dir)?;
-        bindings.write_to_file("../include/questdb/ilp/line_sender.gen.h");
+        bindings.write_to_file("../include/questdb/ingress/line_sender.gen.h");
     }
 
     Ok(())

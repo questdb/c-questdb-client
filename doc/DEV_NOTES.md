@@ -48,8 +48,8 @@ Similarly, we also support generating Cython bindings via the `gen_cython`
 feature.
 
 This generated files should be not be checked in:
-* `include/questdb/ilp/line_sender.gen.h`
-* `cython/questdb/ilp/line_sender.pxd`
+* `include/questdb/ingress/line_sender.gen.h`
+* `cython/questdb/ingress/line_sender.pxd`
 
 ## Updating version in the codebase before releasing
 

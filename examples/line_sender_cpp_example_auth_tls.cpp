@@ -1,8 +1,8 @@
-#include <questdb/ilp/line_sender.hpp>
+#include <questdb/ingress/line_sender.hpp>
 #include <iostream>
 
 using namespace std::literals::string_view_literals;
-using namespace questdb::ilp::literals;
+using namespace questdb::ingress::literals;
 
 static bool example(
     std::string_view host,
@@ -10,7 +10,7 @@ static bool example(
 {
     try
     {
-        questdb::ilp::opts opts{host, port};
+        questdb::ingress::opts opts{host, port};
 
         // Enable TLS to accept connections using common trusted CAs.
         opts.tls();
@@ -24,7 +24,7 @@ static bool example(
             "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac");  // pub_key_y
 
         // Connect.
-        questdb::ilp::line_sender sender{opts};
+        questdb::ingress::line_sender sender{opts};
 
         // We prepare all our table names and column names in advance.
         // If we're inserting multiple rows, this allows us to avoid
@@ -37,9 +37,9 @@ static bool example(
         const auto passengers_name = "passengers"_cn;
         const auto driver_name = "driver"_cn;
 
-        questdb::ilp::line_sender_buffer buffer;
+        questdb::ingress::line_sender_buffer buffer;
         // 1997-07-04 04:56:55 UTC
-        questdb::ilp::timestamp_nanos designated_timestamp{867992215000000000};
+        questdb::ingress::timestamp_nanos designated_timestamp{867992215000000000};
         buffer
             .table(table_name)
             .symbol(id_name, "d6e5fe92-d19f-482a-a97a-c105f547f721"_utf8)
@@ -61,7 +61,7 @@ static bool example(
 
         return true;
     }
-    catch (const questdb::ilp::line_sender_error& err)
+    catch (const questdb::ingress::line_sender_error& err)
     {
         std::cerr
             << "Error running example: "

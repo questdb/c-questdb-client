@@ -6,5 +6,5 @@ cmake-build-release
 .vscode
 .idea
 questdb-rs/Cargo.lock
-include/questdb/ilp/line_sender.gen.h
-cython/questdb/ilp/line_sender.pxd
+include/questdb/ingress/line_sender.gen.h
+cython/questdb/ingress/line_sender.pxd

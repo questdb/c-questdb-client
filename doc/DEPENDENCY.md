@@ -39,11 +39,11 @@ In all examples below, we will attempt to compile:
 
 ```cpp
 // main.cpp
-#include <questdb/ilp/line_sender.hpp>
+#include <questdb/ingress/line_sender.hpp>
 
 int main()
 {
-    questdb::ilp::line_sender sender{"localhost", 9009};
+    questdb::ingress::line_sender sender{"localhost", 9009};
     return 0;
 }
 ```

@@ -18,17 +18,17 @@
 
 ### Header
 
-* [`.hpp` header file](../include/questdb/ilp/line_sender.hpp)
+* [`.hpp` header file](../include/questdb/ingress/line_sender.hpp)
 
 ### Connnecting
 
 ```cpp
-#include <questdb/ilp/line_sender.hpp>
+#include <questdb/ingress/line_sender.hpp>
 
 ...
 
 // Automatically connects on object construction.
-questdb::ilp::line_sender sender{
+questdb::ingress::line_sender sender{
     "localhost",  // QuestDB hostname
     9009};        // QuestDB port
 
@@ -58,7 +58,7 @@ re-usable, but a buffer may only be flushed via the sender after a call to
 `buffer.at(..)` (preferred) or `buffer.at_now()`.
 
 ```cpp
-questdb::ilp::line_sender_buffer buffer;
+questdb::ingress::line_sender_buffer buffer;
 buffer
     .table("cpp_cars")
     .symbol("id", "d6e5fe92-d19f-482a-a97a-c105f547f721")
@@ -76,7 +76,7 @@ Diagram of valid call order of the buffer API.
 
 ## Error handling
 
-Note that most methods in C++ may throw `questdb::ilp::line_sender_error`
+Note that most methods in C++ may throw `questdb::ingress::line_sender_error`
 exceptions. The C++ `line_sender_error` type inherits from `std::runtime_error`
 and you can obtain an error message description by calling `.what()` and an
 error code calling `.code()`.
