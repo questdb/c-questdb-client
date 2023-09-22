@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15.0)
-project(c-questdb-client VERSION 2.1.3)
+project(c-questdb-client VERSION 3.0.0)
 
 set(CPACK_PROJECT_NAME ${PROJECT_NAME})
 set(CPACK_PROJECT_VERSION ${PROJECT_VERSION})
@@ -29,7 +29,8 @@ option(
 # Imports `questdb_client` target.
 add_subdirectory(corrosion)
 corrosion_import_crate(
-    MANIFEST_PATH questdb-rs-ffi/Cargo.toml)
+    MANIFEST_PATH questdb-rs-ffi/Cargo.toml
+    LOCKED)   # Use `Cargo.lock`
 target_include_directories(
     questdb_client INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}/include)
