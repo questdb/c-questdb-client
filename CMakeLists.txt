@@ -29,7 +29,8 @@ option(
 # Imports `questdb_client` target.
 add_subdirectory(corrosion)
 corrosion_import_crate(
-    MANIFEST_PATH questdb-rs-ffi/Cargo.toml)
+    MANIFEST_PATH questdb-rs-ffi/Cargo.toml
+    LOCKED)   # Use `Cargo.lock`
 target_include_directories(
     questdb_client INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}/include)
