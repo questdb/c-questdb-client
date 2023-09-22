@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2023 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -32,6 +32,7 @@
 #include <cstdint>
 #include <optional>
 #include <chrono>
+#include <type_traits>
 
 namespace questdb::ilp
 {
@@ -227,7 +228,7 @@ namespace questdb::ilp
     {
     public:
         template <typename ClockT, typename DurationT>
-        timestamp_micros(std::chrono::time_point<ClockT, DurationT> tp)
+        explicit timestamp_micros(std::chrono::time_point<ClockT, DurationT> tp)
             : _ts{std::chrono::duration_cast<std::chrono::microseconds>(
                 tp.time_since_epoch()).count()}
         {}
@@ -238,6 +239,11 @@ namespace questdb::ilp
 
         int64_t as_micros() const noexcept { return _ts; }
 
+        static inline timestamp_micros now() noexcept
+        {
+            return timestamp_micros{::line_sender_now_micros()};
+        }
+
     private:
         int64_t _ts;
     };
@@ -246,7 +252,7 @@ namespace questdb::ilp
     {
     public:
         template <typename ClockT, typename DurationT>
-        timestamp_nanos(std::chrono::time_point<ClockT, DurationT> tp)
+        explicit timestamp_nanos(std::chrono::time_point<ClockT, DurationT> tp)
             : _ts{std::chrono::duration_cast<std::chrono::nanoseconds>(
                 tp.time_since_epoch()).count()}
         {}
@@ -256,6 +262,11 @@ namespace questdb::ilp
         {}
 
         int64_t as_nanos() const noexcept { return _ts; }
+
+        static inline timestamp_nanos now() noexcept
+        {
+            return timestamp_nanos{::line_sender_now_nanos()};
+        }
 
     private:
         int64_t _ts;
@@ -511,13 +522,44 @@ namespace questdb::ilp
             return column(name, utf8_view{value});
         }
 
+        template <typename ClockT>
+        line_sender_buffer& column(
+            column_name_view name,
+            std::chrono::time_point<ClockT, std::chrono::nanoseconds> tp)
+        {
+            timestamp_nanos nanos{tp};
+            return column(name, nanos);
+        }
+
+        template <typename ClockT, typename DurationT>
+        line_sender_buffer& column(
+            column_name_view name,
+            std::chrono::time_point<ClockT, DurationT> tp)
+        {
+            timestamp_micros micros{tp};
+            return column(name, micros);
+        }
+
+        line_sender_buffer& column(
+            column_name_view name,
+            timestamp_nanos value)
+        {
+            may_init();
+            line_sender_error::wrapped_call(
+                ::line_sender_buffer_column_ts_nanos,
+                _impl,
+                name._impl,
+                value.as_nanos());
+            return *this;
+        }
+
         line_sender_buffer& column(
             column_name_view name,
             timestamp_micros value)
         {
             may_init();
             line_sender_error::wrapped_call(
-                ::line_sender_buffer_column_ts,
+                ::line_sender_buffer_column_ts_micros,
                 _impl,
                 name._impl,
                 value.as_micros());
@@ -525,7 +567,7 @@ namespace questdb::ilp
         }
 
         /**
-         * Complete the row with a specified timestamp.
+         * Complete the row with a timestamp specified as nanoseconds.
          *
          * After this call, you can start batching the next row by calling
          * `.table(..)` again, or you can send the accumulated batch by
@@ -537,14 +579,41 @@ namespace questdb::ilp
         {
             may_init();
             line_sender_error::wrapped_call(
-                ::line_sender_buffer_at,
+                ::line_sender_buffer_at_nanos,
                 _impl,
                 timestamp.as_nanos());
         }
 
         /**
+         * Complete the row with a timestamp specified as microseconds.
+         *
+         * After this call, you can start batching the next row by calling
+         * `.table(..)` again, or you can send the accumulated batch by
+         * calling `.flush(..)`.
+         *
+         * @param timestamp Number of microseconds since 1st Jan 1970 UTC.
+         */
+        void at(timestamp_micros timestamp)
+        {
+            may_init();
+            line_sender_error::wrapped_call(
+                ::line_sender_buffer_at_micros,
+                _impl,
+                timestamp.as_micros());
+        }
+
+        /**
          * Complete the row without providing a timestamp.
          * The QuestDB instance will insert its own timestamp.
+         *
+         * This is NOT equivalent to calling `at()` with the
+         * current system time.
+         * There's a trade-off: Letting the server assign the timestamp
+         * can be faster since it a reliable way to avoid out-of-order
+         * operations in the database for maximum ingestion throughput.
+         * On the other hand, it removes the ability to deduplicate rows.
+         *
+         * In almost all cases, you should prefer the `at()` method.
          */
         void at_now()
         {

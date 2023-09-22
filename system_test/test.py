@@ -8,7 +8,7 @@
 ##    \__\_\\__,_|\___||___/\__|____/|____/
 ##
 ##  Copyright (c) 2014-2019 Appsicle
-##  Copyright (c) 2019-2022 QuestDB
+##  Copyright (c) 2019-2023 QuestDB
 ##
 ##  Licensed under the Apache License, Version 2.0 (the "License");
 ##  you may not use this file except in compliance with the License.
@@ -71,11 +71,19 @@ AUTH_UNRECOGNIZED = (
 
 
 # Bad malformed key
-AUTH_MALFORMED = (
+AUTH_MALFORMED1 = (
     "testUser3",
     "xiecEl-zzbg6aYCFbxDMVWaly9BlCTaEChvcxCH5BCk",
     "-nSHz3evuPl-rGLIlbIZjwOJeWao0rbk53Cll6XEgak",
     "9iYksF4L6mfmArupv0CMoyVAWjQ4gNIoupdg6N5noG8")
+
+
+# Another malformed key where the keys invalid base 64.
+AUTH_MALFORMED2 = (
+    "testUser4",
+    "xiecEl-zzbg6aYCFbxDMVWaly9BlCTaECH5BCk",
+    "-nSHz3evuPl-rGLIlbIZjwOJeWao0rbk5XEgak",
+    "9iYksF4L6mfmArupv0CMoyVAWjQ4gNIou5noG8")
 
 
 class TestSender(unittest.TestCase):
@@ -232,18 +240,19 @@ class TestSender(unittest.TestCase):
         with self._mk_linesender() as sender:
             (sender
                 .table(table_name)
-                .symbol('a', 'A')  # SYMBOL
+                .column('a', 'A')  # STRING
                 .at_now())
             (sender
                 .table(table_name)
-                .column('a', 'B')  # STRING
+                .symbol('a', 'B')  # SYMBOL
                 .at_now())
+
             pending = sender.buffer.peek()
 
         # We only ever get the first row back.
         resp = retry_check_table(table_name, log_ctx=pending)
         exp_columns = [
-            {'name': 'a', 'type': 'SYMBOL'},
+            {'name': 'a', 'type': 'STRING'},
             {'name': 'timestamp', 'type': 'TIMESTAMP'}]
         self.assertEqual(resp['columns'], exp_columns)
 
@@ -272,6 +281,48 @@ class TestSender(unittest.TestCase):
         resp = retry_check_table(table_name, log_ctx=pending)
         exp_dataset = [['A', ns_to_qdb_date(at_ts_ns)]]
         self.assertEqual(resp['dataset'], exp_dataset)
+
+    def test_neg_at(self):
+        if QDB_FIXTURE.version <= (6, 0, 7, 1):
+            self.skipTest('No support for user-provided timestamps.')
+            return
+        table_name = uuid.uuid4().hex
+        at_ts_ns = -10000000
+        with self.assertRaisesRegex(qls.SenderError, r'Bad call to'):
+            with self._mk_linesender() as sender:
+                with self.assertRaisesRegex(qls.SenderError, r'.*Timestamp .* is negative.*'):
+                    (sender
+                        .table(table_name)
+                        .symbol('a', 'A')
+                        .at(at_ts_ns))
+
+    def test_timestamp_col(self):
+        if QDB_FIXTURE.version <= (6, 0, 7, 1):
+            self.skipTest('No support for user-provided timestamps.')
+            return
+        table_name = uuid.uuid4().hex
+        pending = None
+        with self._mk_linesender() as sender:
+            (sender
+                .table(table_name)
+                .column('a', qls.TimestampMicros(-1000000))
+                .at_now())
+            (sender
+                .table(table_name)
+                .column('a', qls.TimestampMicros(1000000))
+                .at_now())
+            pending = sender.buffer.peek()
+
+        resp = retry_check_table(table_name, log_ctx=pending)
+        exp_columns = [
+            {'name': 'a', 'type': 'TIMESTAMP'},
+            {'name': 'timestamp', 'type': 'TIMESTAMP'}]
+        self.assertEqual(resp['columns'], exp_columns)
+
+        exp_dataset = [['1969-12-31T23:59:59.000000Z'], ['1970-01-01T00:00:01.000000Z']]
+        scrubbed_dataset = [row[:-1] for row in resp['dataset']]
+        self.assertEqual(scrubbed_dataset, exp_dataset)
+        
 
     def test_underscores(self):
         table_name = f'_{uuid.uuid4().hex}_'
@@ -505,18 +556,32 @@ class TestSender(unittest.TestCase):
         with sender:
             self._expect_eventual_disconnect(sender)
 
-    def test_malformed_auth(self):
+    def test_malformed_auth1(self):
         if not QDB_FIXTURE.auth:
             self.skipTest('No auth')
 
         sender = qls.Sender(
             QDB_FIXTURE.host,
             QDB_FIXTURE.line_tcp_port,
-            auth=AUTH_MALFORMED)
+            auth=AUTH_MALFORMED1)
 
         with self.assertRaisesRegex(
                 qls.SenderError,
                 r'.*Bad private key.*'):
+            sender.connect()
+
+    def test_malformed_auth2(self):
+        if not QDB_FIXTURE.auth:
+            self.skipTest('No auth')
+
+        sender = qls.Sender(
+            QDB_FIXTURE.host,
+            QDB_FIXTURE.line_tcp_port,
+            auth=AUTH_MALFORMED2)
+
+        with self.assertRaisesRegex(
+                qls.SenderError,
+                r'.*invalid Base64.*'):
             sender.connect()
 
     def test_tls_insecure_skip_verify(self):

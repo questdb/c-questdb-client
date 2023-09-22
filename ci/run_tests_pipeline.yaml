@@ -67,11 +67,11 @@ stages:
             displayName: "Update and set Rust toolchain"
           - script: |
               cd questdb-rs
-              cargo build --example basic
-              cargo build --example auth
-              cargo build --example auth_tls
+              cargo build --example basic --features=chrono_timestamp
+              cargo build --example auth --features=chrono_timestamp
+              cargo build --example auth_tls --features=chrono_timestamp
             displayName: Build Rust examples.
-          - script: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          - script: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DQUESTDB_TESTS_AND_EXAMPLES=ON
             env:
               JAVA_HOME: $(JAVA_HOME_11_X64)
             displayName: "Build Makefile with CMake"
@@ -97,3 +97,40 @@ stages:
               pathToPublish: ./build
             displayName: "Publish build directory"
             condition: eq(variables['BUILD_WITH_MINGW'], '1')
+      - job: CargoFmtAndClippy
+        displayName: "cargo fmt and clippy"
+        pool:
+          vmImage: 'ubuntu-latest'
+        timeoutInMinutes: 10
+        steps:
+          - checkout: self
+          - script: |
+              rustup component add clippy
+              rustup component add rustfmt
+            displayName: "Install clippy and rustfmt"
+          - script: |
+              cd questdb-rs
+              cargo fmt --all -- --check
+            displayName: "questdb-rs: fmt"
+          - script: |
+              cd questdb-rs
+              cargo clippy --all-targets --all-features -- -D warnings
+            displayName: "questdb-rs: clippy"
+          - script: |
+              cd questdb-rs-ffi
+              cargo fmt --all -- --check
+            displayName: "questdb-rs-ffi: fmt"
+          - script: |
+              cd questdb-rs-ffi
+              cargo clippy --all-targets --all-features -- -D warnings
+            displayName: "questdb-rs-ffi: clippy"
+          - script: |
+              cd system_test
+              cd tls_proxy
+              cargo fmt --all -- --check
+            displayName: "tls_proxy: fmt"
+          - script: |
+              cd system_test
+              cd tls_proxy
+              cargo clippy --all-targets --all-features -- -D warnings
+            displayName: "tls_proxy: clippy"

@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2023 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -399,7 +399,22 @@ bool line_sender_buffer_column_str(
     line_sender_error** err_out);
 
 /**
- * Append a value for a TIMESTAMP column.
+ * Append a value for a TIMESTAMP column from nanoseconds.
+ * @param[in] buffer Line buffer object.
+ * @param[in] name Column name.
+ * @param[in] nanos The timestamp in nanoseconds since the unix epoch.
+ * @param[out] err_out Set on error.
+ * @return true on success, false on error.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_ts_nanos(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    int64_t nanos,
+    line_sender_error** err_out);
+
+/**
+ * Append a value for a TIMESTAMP column from microseconds.
  * @param[in] buffer Line buffer object.
  * @param[in] name Column name.
  * @param[in] micros The timestamp in microseconds since the unix epoch.
@@ -407,18 +422,21 @@ bool line_sender_buffer_column_str(
  * @return true on success, false on error.
  */
 LINESENDER_API
-bool line_sender_buffer_column_ts(
+bool line_sender_buffer_column_ts_micros(
     line_sender_buffer* buffer,
     line_sender_column_name name,
     int64_t micros,
     line_sender_error** err_out);
 
 /**
- * Complete the row with a specified timestamp.
+ * Complete the row with a timestamp specified as nanoseconds.
  *
  * After this call, you can start batching the next row by calling
  * `table` again, or you can send the accumulated batch by
  * calling `flush`.
+ *
+ * If you want to pass the current system timestamp,
+ * see `line_sender_now_nanos`.
  *
  * @param[in] buffer Line buffer object.
  * @param[in] epoch_nanos Number of nanoseconds since 1st Jan 1970 UTC.
@@ -426,14 +444,44 @@ bool line_sender_buffer_column_ts(
  * @return true on success, false on error.
  */
 LINESENDER_API
-bool line_sender_buffer_at(
+bool line_sender_buffer_at_nanos(
     line_sender_buffer *buffer,
     int64_t epoch_nanos,
     line_sender_error** err_out);
 
 /**
+ * Complete the row with a timestamp specified as microseconds.
+ *
+ * After this call, you can start batching the next row by calling
+ * `table` again, or you can send the accumulated batch by
+ * calling `flush`.
+ *
+ * If you want to pass the current system timestamp,
+ * see `line_sender_now_micros`.
+ *
+ * @param[in] buffer Line buffer object.
+ * @param[in] epoch_micros Number of microseconds since 1st Jan 1970 UTC.
+ * @param[out] err_out Set on error.
+ * @return true on success, false on error.
+ */
+LINESENDER_API
+bool line_sender_buffer_at_micros(
+    line_sender_buffer *buffer,
+    int64_t epoch_micros,
+    line_sender_error** err_out);
+
+/**
  * Complete the row without providing a timestamp.
  * The QuestDB instance will insert its own timestamp.
+ *
+ * This is NOT equivalent to calling `line_sender_buffer_at_nanos` or
+ * `line_sender_buffer_at_micros` with the current time.
+ * There's a trade-off: Letting the server assign the timestamp can be faster
+ * since it a reliable way to avoid out-of-order operations in the database
+ * for maximum ingestion throughput.
+ * On the other hand, it removes the ability to deduplicate rows.
+ *
+ * In almost all cases, you should prefer the `line_sender_at_*` functions.
  *
  * After this call, you can start batching the next row by calling
  * `table` again, or you can send the accumulated batch by
@@ -607,6 +655,18 @@ bool line_sender_must_close(const line_sender* sender);
  */
 LINESENDER_API
 void line_sender_close(line_sender* sender);
+
+
+/////////// Getting the current timestamp.
+
+/** Get the current time in nanoseconds since the unix epoch (UTC). */
+LINESENDER_API
+int64_t line_sender_now_nanos();
+
+/** Get the current time in microseconds since the unix epoch (UTC). */
+LINESENDER_API
+int64_t line_sender_now_micros();
+
 
 #ifdef __cplusplus
 }

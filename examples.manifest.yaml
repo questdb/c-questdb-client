@@ -15,7 +15,7 @@
   lang: rust
   path: questdb-rs/examples/basic.rs
   header: |-
-    [Rust client library docs](https://docs.rs/crate/questdb-rs/latest)
+    [Rust client library docs](https://docs.rs/questdb-rs/latest/questdb/)
 
 # ILP Auth Examples
 - name: ilp-auth

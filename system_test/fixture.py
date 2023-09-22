@@ -6,7 +6,7 @@
 ##    \__\_\\__,_|\___||___/\__|____/|____/
 ##
 ##  Copyright (c) 2014-2019 Appsicle
-##  Copyright (c) 2019-2022 QuestDB
+##  Copyright (c) 2019-2023 QuestDB
 ##
 ##  Licensed under the Apache License, Version 2.0 (the "License");
 ##  you may not use this file except in compliance with the License.
@@ -189,8 +189,12 @@ def _find_java():
     java_home = os.environ.get('JAVA_HOME')
     if java_home:
         search_path = pathlib.Path(java_home) / 'bin'
-    return shutil.which('java', path=str(search_path))
-
+    res = shutil.which('java', path=str(search_path))
+    if res is None:
+        res = shutil.which('java')
+    if res is None:
+        raise RuntimeError('Could not find `java` executable.')
+    return res
 
 
 class QueryError(Exception):

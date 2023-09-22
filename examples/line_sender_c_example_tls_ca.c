@@ -89,11 +89,18 @@ static bool example(const char* ca_path, const char* host, const char* port)
     if (!line_sender_buffer_column_str(buffer, driver_name, driver_value, &err))
         goto on_error;
 
-    if (!line_sender_buffer_at_now(buffer, &err))
+    // 1997-07-04 04:56:55 UTC
+    int64_t designated_timestamp = 867992215000000000;
+    if (!line_sender_buffer_at_nanos(buffer, designated_timestamp, &err))
         goto on_error;
 
-    // To insert more records, call `line_sender_buffer_table(..)...` again.
+    //// If you want to get the current system timestamp as nanos, call:
+    // if (!line_sender_buffer_at_nanos(buffer, line_sender_now_nanos(), &err))
+    //     goto on_error;
 
+    // To insert more records, call `line_sender_buffer_table(..)...` again.
+    // It's recommended to keep a timer and/or maximum buffer size to flush
+    // the buffer periodically with any accumulated records.
     if (!line_sender_flush(sender, buffer, &err))
         goto on_error;
 

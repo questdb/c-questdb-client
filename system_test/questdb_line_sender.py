@@ -6,7 +6,7 @@
 ##    \__\_\\__,_|\___||___/\__|____/|____/
 ##
 ##  Copyright (c) 2014-2019 Appsicle
-##  Copyright (c) 2019-2022 QuestDB
+##  Copyright (c) 2019-2023 QuestDB
 ##
 ##  Licensed under the Apache License, Version 2.0 (the "License");
 ##  you may not use this file except in compliance with the License.
@@ -217,14 +217,27 @@ def _setup_cdll():
         c_line_sender_utf8,
         c_line_sender_error_p_p)
     set_sig(
-        dll.line_sender_buffer_column_ts,
+        dll.line_sender_buffer_column_ts_nanos,
         c_bool,
         c_line_sender_buffer_p,
         c_line_sender_column_name,
         c_int64,
         c_line_sender_error_p_p)
     set_sig(
-        dll.line_sender_buffer_at,
+        dll.line_sender_buffer_column_ts_micros,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        c_int64,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_at_nanos,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_int64,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_at_micros,
         c_bool,
         c_line_sender_buffer_p,
         c_int64,
@@ -504,14 +517,14 @@ class Buffer:
                 _utf8(value))
         elif isinstance(value, TimestampMicros):
             _error_wrapped_call(
-                _DLL.line_sender_buffer_column_ts,
+                _DLL.line_sender_buffer_column_ts_micros,
                 self._impl,
                 _column_name(name),
                 value.value)
         elif isinstance(value, datetime):
             micros_epoch = int(value.timestamp()) * 1e6 + value.microsecond
             _error_wrapped_call(
-                _DLL.line_sender_buffer_column_ts,
+                _DLL.line_sender_buffer_column_ts_micros,
                 self._impl,
                 _column_name(name),
                 micros_epoch)
@@ -529,7 +542,7 @@ class Buffer:
 
     def at(self, timestamp: int):
         _error_wrapped_call(
-            _DLL.line_sender_buffer_at,
+            _DLL.line_sender_buffer_at_nanos,
             self._impl,
             timestamp)
 

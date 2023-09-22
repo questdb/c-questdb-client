@@ -65,7 +65,7 @@ column. Symbols must be specified before columns.
 
 You can accumulate multiple lines (rows) with a given buffer and a buffer is
 re-usable, but a buffer may only be flushed via the sender after a call to
-`line_sender_buffer_at(..)` or `line_sender_buffer_at_now()`.
+`line_sender_buffer_at_*(..)` (preferred) or `line_sender_buffer_at_now()`.
 
 ```c
 line_sender_table_name table_name = QDB_TABLE_NAME_LITERAL("c_cars");
@@ -85,7 +85,7 @@ if (!line_sender_buffer_symbol(buffer, id_name, id_value, &err))
 if (!line_sender_buffer_column_f64(buffer, x_name, 30.5, &err))
     goto on_error;
 
-if (!line_sender_buffer_at_now(buffer, &err))
+if (!line_sender_buffer_at_nanos(buffer, line_sender_now_nanos(), &err))
     goto on_error;
 
 // To insert more records, call `line_sender_buffer_table(..)...` again.
@@ -142,4 +142,3 @@ so you may want to use a `goto` to simplify handling
 
 * [Data quality and threading considerations](CONSIDERATIONS.md)
 * [Authentication and TLS encryption](SECURITY.md)
-* [Troubleshooting](TROUBLESHOOTING.md)

@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2023 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,19 +24,18 @@
 
 use crate::ingress::SenderBuilder;
 
-use std::path::Path;
 use core::time::Duration;
-use mio::{Poll, Token, Events, Interest};
-use mio::net::{TcpStream};
-use std::io::{self, Read, BufReader};
-use std::net::{SocketAddr};
-use std::sync::Arc;
-use socket2::{Domain, Type, Protocol, Socket};
+use mio::net::TcpStream;
+use mio::{Events, Interest, Poll, Token};
 use rustls::{
-    Certificate,
-    ServerConfig,
-    Stream,
-    server::{ServerConnection, NoClientAuth}};
+    server::{NoClientAuth, ServerConnection},
+    Certificate, ServerConfig, Stream,
+};
+use socket2::{Domain, Protocol, Socket, Type};
+use std::io::{self, BufReader, Read};
+use std::net::SocketAddr;
+use std::path::Path;
+use std::sync::Arc;
 
 const CLIENT: Token = Token(0);
 
@@ -49,12 +48,11 @@ pub struct MockServer {
     tls_conn: Option<ServerConnection>,
     pub host: &'static str,
     pub port: u16,
-    pub msgs: Vec<String>
+    pub msgs: Vec<String>,
 }
 
 fn load_certs(filename: &Path) -> Vec<Certificate> {
-    let certfile = std::fs::File::open(filename)
-        .expect("cannot open certificate file");
+    let certfile = std::fs::File::open(filename).expect("cannot open certificate file");
     let mut reader = BufReader::new(certfile);
     rustls_pemfile::certs(&mut reader)
         .unwrap()
@@ -64,19 +62,14 @@ fn load_certs(filename: &Path) -> Vec<Certificate> {
 }
 
 fn load_private_key(filename: &Path) -> rustls::PrivateKey {
-    let keyfile = std::fs::File::open(filename)
-        .expect("cannot open private key file");
+    let keyfile = std::fs::File::open(filename).expect("cannot open private key file");
     let mut reader = BufReader::new(keyfile);
 
     loop {
-        match rustls_pemfile::read_one(&mut reader)
-                .expect("cannot parse private key .pem file") {
-            Some(rustls_pemfile::Item::RSAKey(key)) =>
-                return rustls::PrivateKey(key),
-            Some(rustls_pemfile::Item::PKCS8Key(key)) =>
-                return rustls::PrivateKey(key),
-            Some(rustls_pemfile::Item::ECKey(key)) =>
-                return rustls::PrivateKey(key),
+        match rustls_pemfile::read_one(&mut reader).expect("cannot parse private key .pem file") {
+            Some(rustls_pemfile::Item::RSAKey(key)) => return rustls::PrivateKey(key),
+            Some(rustls_pemfile::Item::PKCS8Key(key)) => return rustls::PrivateKey(key),
+            Some(rustls_pemfile::Item::ECKey(key)) => return rustls::PrivateKey(key),
             None => break,
             _ => {}
         }
@@ -102,8 +95,9 @@ fn tls_config() -> Arc<ServerConfig> {
     let config = ServerConfig::builder()
         .with_safe_default_cipher_suites()
         .with_safe_default_kx_groups()
-        .with_safe_default_protocol_versions().unwrap()
-        .with_client_cert_verifier(NoClientAuth::new())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_client_cert_verifier(NoClientAuth::boxed())
         .with_single_cert(cert_chain, key_der)
         .unwrap();
     Arc::new(config)
@@ -111,8 +105,7 @@ fn tls_config() -> Arc<ServerConfig> {
 
 impl MockServer {
     pub fn new() -> io::Result<Self> {
-        let listener = Socket::new(
-            Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+        let listener = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
         let address: SocketAddr = "127.0.0.1:0".parse().unwrap();
         listener.bind(&address.into())?;
         listener.listen(128)?;
@@ -120,12 +113,13 @@ impl MockServer {
         Ok(Self {
             poll: Poll::new()?,
             events: Events::with_capacity(128),
-            listener: listener,
+            listener,
             client: None,
             tls_conn: None,
             host: "localhost",
-            port: port,
-            msgs: Vec::new()})
+            port,
+            msgs: Vec::new(),
+        })
     }
 
     pub fn accept(&mut self) -> io::Result<()> {
@@ -133,8 +127,9 @@ impl MockServer {
         client.set_nonblocking(true)?;
         let client: std::net::TcpStream = client.into();
         let mut client = TcpStream::from_std(client);
-        self.poll.registry().register(&mut client, CLIENT,
-            Interest::READABLE)?;
+        self.poll
+            .registry()
+            .register(&mut client, CLIENT, Interest::READABLE)?;
         self.client = Some(client);
         Ok(())
     }
@@ -144,7 +139,10 @@ impl MockServer {
             self.accept()?;
             let client = self.client.as_mut().unwrap();
             self.poll.registry().reregister(
-                client, CLIENT, Interest::READABLE | Interest::WRITABLE)?;
+                client,
+                CLIENT,
+                Interest::READABLE | Interest::WRITABLE,
+            )?;
             let mut tls_conn = ServerConnection::new(tls_config()).unwrap();
             let mut stream = Stream::new(&mut tls_conn, client);
             let begin = std::time::Instant::now();
@@ -158,30 +156,26 @@ impl MockServer {
                             if elapsed > Duration::from_secs(2) {
                                 return Err(err);
                             }
-                            self.poll.poll(&mut self.events,
-                                Some(Duration::from_millis(200)))?;
-                        }
-                        else {
+                            self.poll
+                                .poll(&mut self.events, Some(Duration::from_millis(200)))?;
+                        } else {
                             return Err(err);
                         }
                     }
                 }
             }
-            self.poll.registry().reregister(
-                client, CLIENT, Interest::READABLE)?;
+            self.poll
+                .registry()
+                .reregister(client, CLIENT, Interest::READABLE)?;
             self.tls_conn = Some(tls_conn);
             Ok(self)
         })
     }
 
-    pub fn wait_for_data(
-        &mut self, wait_timeout_sec: Option<f64>) -> io::Result<bool>
-    {
+    pub fn wait_for_data(&mut self, wait_timeout_sec: Option<f64>) -> io::Result<bool> {
         // To ensure a clean death if accept wasn't called.
         self.client.as_ref().unwrap();
-        let timeout = wait_timeout_sec.map(|sec| {
-            Duration::from_micros((sec * 1000000.0) as u64)
-        });
+        let timeout = wait_timeout_sec.map(|sec| Duration::from_micros((sec * 1000000.0) as u64));
         self.poll.poll(&mut self.events, timeout)?;
         let ready_for_read = !self.events.is_empty();
         Ok(ready_for_read)
@@ -192,15 +186,14 @@ impl MockServer {
         if let Some(tls_conn) = self.tls_conn.as_mut() {
             let mut stream = Stream::new(tls_conn, client);
             stream.read(buf)
-        }
-        else {
+        } else {
             client.read(buf)
         }
     }
 
     pub fn recv(&mut self, wait_timeout_sec: f64) -> io::Result<usize> {
         if !self.wait_for_data(Some(wait_timeout_sec))? {
-            return Ok(0)
+            return Ok(0);
         }
 
         let mut accum = Vec::<u8>::new();
@@ -212,15 +205,14 @@ impl MockServer {
                     let poll_timeout = Some(Duration::from_millis(200));
                     self.poll.poll(&mut self.events, poll_timeout)?;
                     continue;
-                },
-                Err(err) => return Err(err)
+                }
+                Err(err) => return Err(err),
             };
             accum.extend(&chunk[..count]);
             if accum.len() < 2 {
                 continue;
             }
-            if (accum[accum.len() - 1] == b'\n') &&
-                (accum[accum.len() - 2] != b'\\') {
+            if (accum[accum.len() - 1] == b'\n') && (accum[accum.len() - 2] != b'\\') {
                 break;
             }
         }

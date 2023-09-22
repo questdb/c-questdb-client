@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2022 QuestDB
+ *  Copyright (c) 2019-2023 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -87,7 +87,7 @@ TEST_CASE("line_sender c api basics")
     CHECK(::line_sender_buffer_table(buffer, table_name, &err));
     CHECK(::line_sender_buffer_symbol(buffer, t1_name, v1_utf8, &err));
     CHECK(::line_sender_buffer_column_f64(buffer, f1_name, 0.5, &err));
-    CHECK(::line_sender_buffer_at(buffer, 10000000, &err));
+    CHECK(::line_sender_buffer_at_nanos(buffer, 10000000, &err));
     CHECK(server.recv() == 0);
     CHECK(::line_sender_buffer_size(buffer) == 27);
     CHECK(::line_sender_flush(sender, buffer, &err));
@@ -586,15 +586,19 @@ TEST_CASE("Test timestamp column.")
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             now.time_since_epoch()).count();
 
+    const auto now_nanos_ts = questdb::ilp::timestamp_nanos{now_nanos};
+    const auto now_micros_ts = questdb::ilp::timestamp_micros{now_micros};
+
     questdb::ilp::line_sender_buffer buffer;
     buffer
         .table("test")
         .column("ts1", questdb::ilp::timestamp_micros{12345})
-        .column("ts2", questdb::ilp::timestamp_micros{now})
-        .at(now);
+        .column("ts2", now_micros_ts)
+        .column("ts3", now_nanos_ts)
+        .at(now_nanos_ts);
 
     std::stringstream ss;
-    ss << "test ts1=12345t,ts2=" << now_micros << "t " << now_nanos << "\n";
+    ss << "test ts1=12345t,ts2=" << now_micros << "t,ts3=" << now_micros << "t " << now_nanos << "\n";
     const auto exp = ss.str();
     CHECK(buffer.peek() == exp);
 
@@ -607,6 +611,21 @@ TEST_CASE("Test timestamp column.")
 
     CHECK(server.recv() == 1);
     CHECK(server.msgs()[0] == exp);
+}
+
+TEST_CASE("test timestamp_micros and timestamp_nanos::now()") {
+    // Explicit in tests, just to be sure we haven't messed up the return types :-)
+    questdb::ilp::timestamp_micros micros_now{questdb::ilp::timestamp_micros::now()};
+    questdb::ilp::timestamp_nanos nanos_now{questdb::ilp::timestamp_nanos::now()};
+
+    // Check both are not zero.
+    CHECK(micros_now.as_micros() != 0);
+    CHECK(nanos_now.as_nanos() != 0);
+
+    // Check both are within half second of each other.
+    const int64_t micros_of_nanos = nanos_now.as_nanos() / 1000;
+    const int64_t half_second_micros = 500000;
+    CHECK(std::abs(micros_of_nanos - micros_now.as_micros()) < half_second_micros);
 }
 
 TEST_CASE("Test Marker")
