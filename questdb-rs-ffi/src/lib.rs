@@ -487,7 +487,11 @@ pub unsafe extern "C" fn line_sender_opts_tls_os_certs(opts: *mut line_sender_op
 /// the "webpki-roots" Rust crate.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_opts_tls_webpki_and_os_certs(opts: *mut line_sender_opts) {
-    upd_opts!(opts, tls, Tls::Enabled(CertificateAuthority::WebpkiAndOsRoots));
+    upd_opts!(
+        opts,
+        tls,
+        Tls::Enabled(CertificateAuthority::WebpkiAndOsRoots)
+    );
 }
 
 /// Enable full connection encryption via TLS.
