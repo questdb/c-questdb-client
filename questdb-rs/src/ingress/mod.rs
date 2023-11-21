@@ -202,9 +202,6 @@ use rustls::{
 };
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
-#[cfg(feature = "tls-native-certs")]
-use rustls_native_certs::load_native_certs;
-
 #[derive(Debug, Copy, Clone)]
 enum Op {
     Table = 1,
@@ -1240,12 +1237,15 @@ struct AuthParams {
 pub enum CertificateAuthority {
     /// Use the root certificates provided by the
     /// [`webpki-roots`](https://crates.io/crates/webpki-roots) crate.
+    #[cfg(feature = "tls-webpki-certs")]
     WebpkiRoots,
 
     /// Use the root certificates provided by the OS
+    #[cfg(feature = "tls-native-certs")]
     OsRoots,
 
     /// Use the root certificates provided by both the OS and the `webpki-roots` crate.
+    #[cfg(all(feature = "tls-webpki-certs", feature = "tls-native-certs"))]
     WebpkiAndOsRoots,
 
     /// Use the root certificates provided by a PEM-encoded file.
@@ -1339,6 +1339,7 @@ fn map_rustls_err(descr: &str, err: rustls::Error) -> Error {
     error::fmt!(TlsError, "{}: {}", descr, err)
 }
 
+#[cfg(feature = "tls-webpki-certs")]
 fn add_webpki_roots(root_store: &mut RootCertStore) {
     root_store.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
         OwnedTrustAnchor::from_subject_spki_name_constraints(
@@ -1351,7 +1352,7 @@ fn add_webpki_roots(root_store: &mut RootCertStore) {
 
 #[cfg(feature = "tls-native-certs")]
 fn add_os_roots(root_store: &mut RootCertStore) -> Result<()> {
-    let os_certs = load_native_certs().map_err(|io_err| {
+    let os_certs = rustls_native_certs::load_native_certs().map_err(|io_err| {
         error::fmt!(TlsError, "Could not OS native TLS certificates: {}", io_err)
     })?;
     for cert in os_certs {
@@ -1371,6 +1372,7 @@ fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
 
     if let Tls::Enabled(ca) = tls {
         match ca {
+            #[cfg(feature = "tls-webpki-certs")]
             CertificateAuthority::WebpkiRoots => {
                 add_webpki_roots(&mut root_store);
             }

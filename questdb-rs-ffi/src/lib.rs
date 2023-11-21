@@ -476,6 +476,20 @@ pub unsafe extern "C" fn line_sender_opts_tls(opts: *mut line_sender_opts) {
     upd_opts!(opts, tls, Tls::Enabled(CertificateAuthority::WebpkiRoots));
 }
 
+/// Enable full connection encryption via TLS, using OS-provided certificate roots.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_tls_os_certs(opts: *mut line_sender_opts) {
+    upd_opts!(opts, tls, Tls::Enabled(CertificateAuthority::OsRoots));
+}
+
+/// Enable full connection encryption via TLS, accepting certificates signed by either
+/// the OS-provided certificate roots or well-known certificate authorities as per
+/// the "webpki-roots" Rust crate.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_tls_webpki_and_os_certs(opts: *mut line_sender_opts) {
+    upd_opts!(opts, tls, Tls::Enabled(CertificateAuthority::WebpkiAndOsRoots));
+}
+
 /// Enable full connection encryption via TLS.
 /// The connection will accept certificates by the specified certificate
 /// authority file.
