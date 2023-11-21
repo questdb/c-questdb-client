@@ -1380,7 +1380,7 @@ fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
             CertificateAuthority::OsRoots => {
                 add_os_roots(&mut root_store)?;
             }
-            #[cfg(feature = "tls-native-certs")]
+            #[cfg(all(feature = "tls-webpki-certs", feature = "tls-native-certs"))]
             CertificateAuthority::WebpkiAndOsRoots => {
                 add_webpki_roots(&mut root_store);
                 add_os_roots(&mut root_store)?;
