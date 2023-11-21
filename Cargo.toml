@@ -1,8 +1,0 @@
-[workspace]
-resolver = "2"
-
-members = [
-    "questdb-rs",
-    "questdb-rs-ffi",
-    "system_test/tls_proxy"
-]
