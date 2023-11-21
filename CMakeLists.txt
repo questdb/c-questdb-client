@@ -50,6 +50,9 @@ if(APPLE)
     target_link_libraries(
         questdb_client
         INTERFACE "-framework Security")
+    target_link_libraries(
+        questdb_client
+        INTERFACE "-framework CoreFoundation")
 endif()
 
 function(set_compile_flags TARGET_NAME)
