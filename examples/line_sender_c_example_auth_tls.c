@@ -24,6 +24,9 @@ static bool example(const char* host, const char* port)
     // Enable TLS to accept connections using common trusted CAs.
     line_sender_opts_tls(opts);
 
+    //// Alternatively, to use the OS-provided root certificates:
+    // line_sender_opts_tls_os_roots(opts);
+
     // Use `QDB_UTF_8_FROM_STR_OR` to init from `const char*`.
     line_sender_utf8 key_id = QDB_UTF8_LITERAL("testUser1");
     line_sender_utf8 priv_key = QDB_UTF8_LITERAL(

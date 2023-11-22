@@ -15,6 +15,9 @@ static bool example(
         // Enable TLS to accept connections using common trusted CAs.
         opts.tls();
 
+        //// Alternatively, to use the OS-provided root certificates:
+        // opts.tls_os_roots(opts);
+
         // Follow our authentication documentation to generate your own keys:
         // https://questdb.io/docs/reference/api/ilp/authenticate
         opts.auth(
