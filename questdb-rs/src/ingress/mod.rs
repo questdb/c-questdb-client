@@ -1363,7 +1363,7 @@ fn add_os_roots(root_store: &mut RootCertStore) -> Result<()> {
     if valid_count == 0 && invalid_count > 0 {
         return Err(error::fmt!(
             TlsError,
-            "zero valid certificates found in native root store ({} found but were invalid)",
+            "No valid certificates found in native root store ({} found but were invalid)",
             invalid_count
         ));
     }
