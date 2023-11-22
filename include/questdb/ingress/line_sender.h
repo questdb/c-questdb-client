@@ -563,7 +563,7 @@ void line_sender_opts_tls(line_sender_opts* opts);
  * Enable full connection encryption via TLS, using OS-provided certificate roots.
  */
 LINESENDER_API
-void line_sender_opts_tls_os_certs(line_sender_opts* opts);
+void line_sender_opts_tls_os_roots(line_sender_opts* opts);
 
 /*
  * Enable full connection encryption via TLS, accepting certificates signed by either
@@ -571,7 +571,7 @@ void line_sender_opts_tls_os_certs(line_sender_opts* opts);
  * the "webpki-roots" Rust crate.
  */
 LINESENDER_API
-void line_sender_opts_tls_webpki_and_os_certs(line_sender_opts* opts);
+void line_sender_opts_tls_webpki_and_os_roots(line_sender_opts* opts);
 
 /**
  * Enable full connection encryption via TLS.

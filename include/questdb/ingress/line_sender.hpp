@@ -746,9 +746,9 @@ namespace questdb::ingress
             /*
              * Enable full connection encryption via TLS, using OS-provided certificate roots.
              */
-            opts& tls_os_certs() noexcept
+            opts& tls_os_roots() noexcept
             {
-                ::line_sender_opts_tls_os_certs(_impl);
+                ::line_sender_opts_tls_os_roots(_impl);
                 return *this;
             }
 
@@ -757,9 +757,9 @@ namespace questdb::ingress
              * the OS-provided certificate roots or well-known certificate authorities as per
              * the "webpki-roots" Rust crate.
              */
-            opts& tls_webpki_and_os_certs() noexcept
+            opts& tls_webpki_and_os_roots() noexcept
             {
-                ::line_sender_opts_tls_webpki_and_os_certs(_impl);
+                ::line_sender_opts_tls_webpki_and_os_roots(_impl);
                 return *this;
             }
 
