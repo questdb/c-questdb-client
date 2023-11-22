@@ -25,8 +25,9 @@
 ################################################################################
 
 import sys
-import textwrap
 sys.dont_write_bytecode = True
+import os
+import textwrap
 
 import math
 import datetime
@@ -592,6 +593,36 @@ class TestSender(unittest.TestCase):
             tls='insecure_skip_verify')
         self._test_single_symbol_impl(sender)
 
+    def test_tls_ca(self):
+        sender = qls.Sender(
+            QDB_FIXTURE.host,
+            TLS_PROXY_FIXTURE.listen_port,
+            auth=AUTH if QDB_FIXTURE.auth else None,
+            tls=Project().tls_certs_dir / 'server_rootCA.pem')
+        self._test_single_symbol_impl(sender)
+
+    def _test_tls_special(self, tls_mode):
+        prev_ssl_cert_file = os.environ.get('SSL_CERT_FILE')
+        try:
+            os.environ['SSL_CERT_FILE'] = str(
+                Project().tls_certs_dir / 'server_rootCA.pem')
+            sender = qls.Sender(
+                QDB_FIXTURE.host,
+                TLS_PROXY_FIXTURE.listen_port,
+                auth=AUTH if QDB_FIXTURE.auth else None,
+                tls=tls_mode)
+            self._test_single_symbol_impl(sender)
+        finally:
+            if prev_ssl_cert_file:
+                os.environ['SSL_CERT_FILE'] = prev_ssl_cert_file
+            else:
+                del os.environ['SSL_CERT_FILE']
+
+    def test_tls_os_roots(self):
+        self._test_tls_special('os_roots')
+
+    def test_tls_webpki_and_os_roots(self):
+        self._test_tls_special('webpki_and_os_roots')
 
 def parse_args():
     parser = argparse.ArgumentParser('Run system tests.')
