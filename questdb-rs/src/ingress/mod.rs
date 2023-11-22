@@ -1351,7 +1351,11 @@ fn add_webpki_roots(root_store: &mut RootCertStore) {
 #[cfg(feature = "tls-native-certs")]
 fn add_os_roots(root_store: &mut RootCertStore) -> Result<()> {
     let os_certs = rustls_native_certs::load_native_certs().map_err(|io_err| {
-        error::fmt!(TlsError, "Could not OS native TLS certificates: {}", io_err)
+        error::fmt!(
+            TlsError,
+            "Could not load OS native TLS certificates: {}",
+            io_err
+        )
     })?;
     for cert in os_certs {
         root_store
