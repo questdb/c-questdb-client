@@ -9,7 +9,7 @@ name = "questdb_client"
 crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
-questdb-rs = { path = "../questdb-rs", features = ["insecure-skip-verify"] }
+questdb-rs = { path = "../questdb-rs", features = ["insecure-skip-verify", "tls-native-certs"] }
 libc = "0.2"
 
 [build-dependencies]

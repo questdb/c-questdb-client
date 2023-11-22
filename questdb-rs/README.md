@@ -23,7 +23,8 @@ use questdb::{
     ingress::{
         Sender,
         Buffer,
-        SenderBuilder}};
+        SenderBuilder,
+        TimestampNanos}};
 
 fn main() -> Result<()> {
    let mut sender = SenderBuilder::new("localhost", 9009).connect()?;
@@ -33,7 +34,7 @@ fn main() -> Result<()> {
        .symbol("id", "toronto1")?
        .column_f64("temperature", 20.0)?
        .column_i64("humidity", 50)?
-       .at_now()?;
+       .at(TimestampNanos::now())?;
    sender.flush(&mut buffer)?;
    Ok(())
 }

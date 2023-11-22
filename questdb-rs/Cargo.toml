@@ -19,13 +19,14 @@ libc = "0.2"
 socket2 = "0.5.4"
 dns-lookup = "2.0.2"
 base64ct = { version = "1.6.0", features = ["alloc"] }
-ring = "0.16.20"
+ring = "0.17.5"
 rustls = "0.21.7"
 rustls-pemfile = "1.0.3"
-webpki-roots = "0.25.2"
+webpki-roots = { version = "0.25.2", optional = true }
 ryu = "1.0.15"
 itoa = "1.0.9"
 chrono = { version = "0.4.30", optional = true }
+rustls-native-certs = { version = "0.6.3", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3.9", features = ["ws2def"] }
@@ -41,6 +42,14 @@ mio = { version = "0.8.8", features = ["os-poll", "net"] }
 chrono = "0.4.30"
 
 [features]
+default = ["tls-webpki-certs"]
+
+# Allow use OS-provided root TLS certificates
+tls-native-certs = ["dep:rustls-native-certs"]
+
+# Allow use of the `webpki-roots` crate to validate TLS certificates.
+tls-webpki-certs = ["dep:webpki-roots"]
+
 # Allow skipping verification of insecure certificates.
 insecure-skip-verify = ["rustls/dangerous_configuration"]
 

@@ -82,6 +82,7 @@ fn extract_current_timestamp(extract_fn: impl FnOnce(Duration) -> u128) -> crate
 /// use questdb::ingress::TimestampMicros;
 ///
 /// # fn main() -> Result<()> {
+/// #[cfg(feature = "chrono_timestamp")]
 /// let ts = TimestampMicros::from_datetime(chrono::Utc::now());
 /// # Ok(())
 /// # }
@@ -161,6 +162,7 @@ impl TimestampMicros {
 /// use questdb::ingress::TimestampNanos;
 ///
 /// # fn main() -> Result<()> {
+/// # #[cfg(feature = "chrono_timestamp")]
 /// let ts = TimestampNanos::from_datetime(chrono::Utc::now());
 /// # Ok(())
 /// # }

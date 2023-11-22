@@ -195,6 +195,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use base64ct::{Base64, Base64UrlUnpadded, Encoding};
+use ring::rand::SystemRandom;
 use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
 use rustls::{ClientConnection, OwnedTrustAnchor, RootCertStore, ServerName, StreamOwned};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
@@ -1234,7 +1235,16 @@ struct AuthParams {
 pub enum CertificateAuthority {
     /// Use the root certificates provided by the
     /// [`webpki-roots`](https://crates.io/crates/webpki-roots) crate.
+    #[cfg(feature = "tls-webpki-certs")]
     WebpkiRoots,
+
+    /// Use the root certificates provided by the OS
+    #[cfg(feature = "tls-native-certs")]
+    OsRoots,
+
+    /// Use the root certificates provided by both the OS and the `webpki-roots` crate.
+    #[cfg(all(feature = "tls-webpki-certs", feature = "tls-native-certs"))]
+    WebpkiAndOsRoots,
 
     /// Use the root certificates provided by a PEM-encoded file.
     File(PathBuf),
@@ -1327,7 +1337,8 @@ fn map_rustls_err(descr: &str, err: rustls::Error) -> Error {
     error::fmt!(TlsError, "{}: {}", descr, err)
 }
 
-fn add_webpki_roots(root_store: &mut rustls::RootCertStore) {
+#[cfg(feature = "tls-webpki-certs")]
+fn add_webpki_roots(root_store: &mut RootCertStore) {
     root_store.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
         OwnedTrustAnchor::from_subject_spki_name_constraints(
             ta.subject,
@@ -1335,6 +1346,28 @@ fn add_webpki_roots(root_store: &mut rustls::RootCertStore) {
             ta.name_constraints,
         )
     }));
+}
+
+#[cfg(feature = "tls-native-certs")]
+fn add_os_roots(root_store: &mut RootCertStore) -> Result<()> {
+    let os_certs = rustls_native_certs::load_native_certs().map_err(|io_err| {
+        error::fmt!(
+            TlsError,
+            "Could not load OS native TLS certificates: {}",
+            io_err
+        )
+    })?;
+
+    let os_certs: Vec<Vec<u8>> = os_certs.into_iter().map(|cert| cert.0).collect();
+    let (valid_count, invalid_count) = root_store.add_parsable_certificates(&os_certs[..]);
+    if valid_count == 0 && invalid_count > 0 {
+        return Err(error::fmt!(
+            TlsError,
+            "No valid certificates found in native root store ({} found but were invalid)",
+            invalid_count
+        ));
+    }
+    Ok(())
 }
 
 fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
@@ -1346,8 +1379,18 @@ fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
 
     if let Tls::Enabled(ca) = tls {
         match ca {
+            #[cfg(feature = "tls-webpki-certs")]
             CertificateAuthority::WebpkiRoots => {
                 add_webpki_roots(&mut root_store);
+            }
+            #[cfg(feature = "tls-native-certs")]
+            CertificateAuthority::OsRoots => {
+                add_os_roots(&mut root_store)?;
+            }
+            #[cfg(all(feature = "tls-webpki-certs", feature = "tls-native-certs"))]
+            CertificateAuthority::WebpkiAndOsRoots => {
+                add_webpki_roots(&mut root_store);
+                add_os_roots(&mut root_store)?;
             }
             CertificateAuthority::File(ca_file) => {
                 let certfile = std::fs::File::open(ca_file).map_err(|io_err| {
@@ -1736,10 +1779,12 @@ fn parse_public_key(pub_key_x: &str, pub_key_y: &str) -> Result<Vec<u8>> {
 fn parse_key_pair(auth: &AuthParams) -> Result<EcdsaKeyPair> {
     let private_key = b64_decode("private authentication key", auth.priv_key.as_str())?;
     let public_key = parse_public_key(auth.pub_key_x.as_str(), auth.pub_key_y.as_str())?;
+    let system_random = SystemRandom::new();
     EcdsaKeyPair::from_private_key_and_public_key(
         &ECDSA_P256_SHA256_FIXED_SIGNING,
         &private_key[..],
         &public_key[..],
+        &system_random,
     )
     .map_err(|key_rejected| error::fmt!(AuthError, "Bad private key: {}", key_rejected))
 }

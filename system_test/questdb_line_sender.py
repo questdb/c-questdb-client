@@ -275,6 +275,14 @@ def _setup_cdll():
         None,
         c_line_sender_opts_p)
     set_sig(
+        dll.line_sender_opts_tls_os_roots,
+        None,
+        c_line_sender_opts_p)
+    set_sig(
+        dll.line_sender_opts_tls_webpki_and_os_roots,
+        None,
+        c_line_sender_opts_p)
+    set_sig(
         dll.line_sender_opts_tls_ca,
         None,
         c_line_sender_opts_p,
@@ -571,6 +579,10 @@ class Sender:
         if tls:
             if tls is True:
                 opts.tls()
+            elif tls == 'os_roots':
+                opts.tls_os_roots()
+            elif tls == 'webpki_and_os_roots':
+                opts.tls_webpki_and_os_roots()
             elif tls == 'insecure_skip_verify':
                 opts.tls_insecure_skip_verify()
             else:

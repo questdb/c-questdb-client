@@ -41,15 +41,18 @@ if(WIN32)
         DEFINE_SYMBOL "LINESENDER_DYN_LIB")
     target_link_libraries(
         questdb_client-shared
-        INTERFACE wsock32 ws2_32 ntdll)
+        INTERFACE wsock32 ws2_32 ntdll crypt32 Secur32 Ncrypt)
     target_link_libraries(
         questdb_client-static
-        INTERFACE wsock32 ws2_32 ntdll)
+        INTERFACE wsock32 ws2_32 ntdll crypt32 Secur32 Ncrypt)
 endif(WIN32)
 if(APPLE)
     target_link_libraries(
         questdb_client
         INTERFACE "-framework Security")
+    target_link_libraries(
+        questdb_client
+        INTERFACE "-framework CoreFoundation")
 endif()
 
 function(set_compile_flags TARGET_NAME)

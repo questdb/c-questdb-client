@@ -16,9 +16,10 @@ fn main() -> Result<()> {
             "testUser1",                                   // kid
             "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48", // d
             "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU", // x
-            "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac",
-        ) // y
+            "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac", // y
+        )
         .tls(Tls::Enabled(CertificateAuthority::WebpkiRoots))
+        // Alternatively: .tls(Tls::Enabled(CertificateAuthority::OsRoots))
         .connect()?;
     let mut buffer = Buffer::new();
     let designated_timestamp =
