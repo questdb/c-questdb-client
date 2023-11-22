@@ -1357,12 +1357,15 @@ fn add_os_roots(root_store: &mut RootCertStore) -> Result<()> {
             io_err
         )
     })?;
-    for cert in os_certs {
-        root_store
-            .add(&rustls::Certificate(cert.0))
-            .map_err(|rustls_err| {
-                error::fmt!(TlsError, "Could not load OS certificate: {}", rustls_err)
-            })?;
+
+    let os_certs: Vec<Vec<u8>> = os_certs.into_iter().map(|cert| cert.0).collect();
+    let (valid_count, invalid_count) = root_store.add_parsable_certificates(&os_certs[..]);
+    if valid_count == 0 && invalid_count > 0 {
+        return Err(error::fmt!(
+            TlsError,
+            "zero valid certificates found in native root store ({} found but were invalid)",
+            invalid_count
+        ));
     }
     Ok(())
 }
