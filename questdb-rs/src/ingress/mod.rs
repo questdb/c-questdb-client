@@ -197,9 +197,7 @@ use std::sync::Arc;
 use base64ct::{Base64, Base64UrlUnpadded, Encoding};
 use ring::rand::SystemRandom;
 use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
-use rustls::{
-    Certificate, ClientConnection, OwnedTrustAnchor, RootCertStore, ServerName, StreamOwned,
-};
+use rustls::{ClientConnection, OwnedTrustAnchor, RootCertStore, ServerName, StreamOwned};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 #[derive(Debug, Copy, Clone)]
@@ -1356,9 +1354,11 @@ fn add_os_roots(root_store: &mut RootCertStore) -> Result<()> {
         error::fmt!(TlsError, "Could not OS native TLS certificates: {}", io_err)
     })?;
     for cert in os_certs {
-        root_store.add(&Certificate(cert.0)).map_err(|rustls_err| {
-            error::fmt!(TlsError, "Could not load OS certificate: {}", rustls_err)
-        })?;
+        root_store
+            .add(&rustls::Certificate(cert.0))
+            .map_err(|rustls_err| {
+                error::fmt!(TlsError, "Could not load OS certificate: {}", rustls_err)
+            })?;
     }
     Ok(())
 }
