@@ -168,21 +168,31 @@ fn test_auth_bad_base64_public_key_y() -> TestResult {
     )
 }
 
-fn test_bad_key(priv_key: &str, pub_key_x: &str, pub_key_y: &str, expected_error_msg : &str) -> TestResult {
+fn test_bad_key(
+    priv_key: &str,
+    pub_key_x: &str,
+    pub_key_y: &str,
+    expected_error_msg: &str,
+) -> TestResult {
     let server = MockServer::new()?;
-    let lsb = server.lsb().auth(
-        "testUser1",
-        priv_key,
-        pub_key_x,
-        pub_key_y,
-    );
+    let lsb = server
+        .lsb()
+        .auth("testUser1", priv_key, pub_key_x, pub_key_y);
     let sender = lsb.connect();
 
     match sender {
         Ok(_) => panic!("Expected an error due to bad key, but connect succeeded."),
         Err(err) => {
-            assert_eq!(err.code(), ErrorCode::AuthError, "Expected an ErrorCode::AuthError");
-            assert_eq!(err.msg(), expected_error_msg, "Error message did not match expected message.");
+            assert_eq!(
+                err.code(),
+                ErrorCode::AuthError,
+                "Expected an ErrorCode::AuthError"
+            );
+            assert_eq!(
+                err.msg(),
+                expected_error_msg,
+                "Error message did not match expected message."
+            );
         }
     }
     Ok(())
