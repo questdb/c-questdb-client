@@ -6,12 +6,12 @@ To start using `questdb-rs` add it to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-questdb-rs = "3.0.0"
+questdb-rs = "3.1.0"
 ```
 
 ## Docs
 
-See documentation for the [`ingress`](https://docs.rs/questdb-rs/3.0.0/questdb/ingress/) module to insert data into QuestDB via the ILP protocol.
+See documentation for the [`ingress`](https://docs.rs/questdb-rs/3.1.0/questdb/ingress/) module to insert data into QuestDB via the ILP protocol.
 
 * Latest API docs: [https://docs.rs/questdb-rs/latest/](https://docs.rs/questdb-rs/latest/)
 
