@@ -568,7 +568,7 @@ class TestSender(unittest.TestCase):
 
         with self.assertRaisesRegex(
                 qls.SenderError,
-                r'.*Bad private key.*'):
+                r'Misconfigured ILP authentication keys: InconsistentComponents. Hint: Check the keys for a possible typo.'):
             sender.connect()
 
     def test_malformed_auth2(self):
