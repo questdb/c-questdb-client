@@ -100,6 +100,95 @@ fn test_table_name_too_long() -> TestResult {
 }
 
 #[test]
+fn test_auth_inconsistent_keys() -> TestResult {
+    test_bad_key("fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU", // d
+                 "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU", // x
+                 "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac",
+                 "Misconfigured ILP authentication keys: InconsistentComponents. Hint: Check the keys for a possible typo."
+    )
+}
+
+#[test]
+fn test_auth_bad_base64_private_key() -> TestResult {
+    test_bad_key(
+        "bad key",                                     // d
+        "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU", // x
+        "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac", // y
+        "Misconfigured ILP authentication keys. Could not decode private authentication key: invalid Base64 encoding. Hint: Check the keys for a possible typo."
+    )
+}
+
+#[test]
+fn test_auth_private_key_too_long() -> TestResult {
+    test_bad_key(
+        "ZkxLWUVhb0ViOWxybjNua3dMREEtTV94bnVGT2RTdDl5MFo3X3ZXU0hMVWZMS1lFYW9FYjlscm4zbmt3TERBLU1feG51Rk9kU3Q5eTBaN192V1NITFU",
+        "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU", // x
+        "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac", // y
+        "Misconfigured ILP authentication keys: InvalidComponent. Hint: Check the keys for a possible typo."
+    )
+}
+
+#[test]
+fn test_auth_public_key_x_too_long() -> TestResult {
+    test_bad_key(
+        "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU",
+        "ZkxLWUVhb0ViOWxybjNua3dMREEtTV94bnVGT2RTdDl5MFo3X3ZXU0hMVWZMS1lFYW9FYjlscm4zbmt3TERBLU1feG51Rk9kU3Q5eTBaN192V1NITFU", // x
+        "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac", // y
+        "Misconfigured ILP authentication keys. Public key x is too long. Hint: Check the keys for a possible typo."
+    )
+}
+
+#[test]
+fn test_auth_public_key_y_too_long() -> TestResult {
+    test_bad_key(
+        "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU",
+        "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac", // x
+        "ZkxLWUVhb0ViOWxybjNua3dMREEtTV94bnVGT2RTdDl5MFo3X3ZXU0hMVWZMS1lFYW9FYjlscm4zbmt3TERBLU1feG51Rk9kU3Q5eTBaN192V1NITFU", // y
+        "Misconfigured ILP authentication keys. Public key y is too long. Hint: Check the keys for a possible typo."
+    )
+}
+
+#[test]
+fn test_auth_bad_base64_public_key_x() -> TestResult {
+    test_bad_key(
+        "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU", // d
+        "bad base64 encoding",                       // x
+        "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac", // y
+        "Misconfigured ILP authentication keys. Could not decode public key x: invalid Base64 encoding. Hint: Check the keys for a possible typo."
+    )
+}
+
+#[test]
+fn test_auth_bad_base64_public_key_y() -> TestResult {
+    test_bad_key(
+        "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU", // d
+        "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac", // x
+        "bad base64 encoding", // y
+        "Misconfigured ILP authentication keys. Could not decode public key y: invalid Base64 encoding. Hint: Check the keys for a possible typo."
+    )
+}
+
+fn test_bad_key(priv_key: &str, pub_key_x: &str, pub_key_y: &str, expected_error_msg : &str) -> TestResult {
+    let server = MockServer::new()?;
+    let lsb = server.lsb().auth(
+        "testUser1",
+        priv_key,
+        pub_key_x,
+        pub_key_y,
+    );
+    let sender = lsb.connect();
+
+    match sender {
+        Ok(_) => panic!("Expected an error due to bad key, but connect succeeded."),
+        Err(err) => {
+            assert_eq!(err.code(), ErrorCode::AuthError, "Expected an ErrorCode::AuthError");
+            assert_eq!(err.msg(), expected_error_msg, "Error message did not match expected message.");
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn test_timestamp_overloads() -> TestResult {
     let tbl_name = TableName::new("tbl_name")?;
 

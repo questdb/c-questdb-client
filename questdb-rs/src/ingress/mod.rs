@@ -1759,7 +1759,7 @@ impl SenderBuilder {
 
 fn b64_decode(descr: &'static str, buf: &str) -> Result<Vec<u8>> {
     Base64UrlUnpadded::decode_vec(buf)
-        .map_err(|b64_err| error::fmt!(AuthError, "Could not decode {}: {}", descr, b64_err))
+        .map_err(|b64_err| error::fmt!(AuthError, "Misconfigured ILP authentication keys. Could not decode {}: {}. Hint: Check the keys for a possible typo.", descr, b64_err))
 }
 
 fn parse_public_key(pub_key_x: &str, pub_key_y: &str) -> Result<Vec<u8>> {
@@ -1769,9 +1769,23 @@ fn parse_public_key(pub_key_x: &str, pub_key_y: &str) -> Result<Vec<u8>> {
     // SEC 1 Uncompressed Octet-String-to-Elliptic-Curve-Point Encoding
     let mut encoded = Vec::new();
     encoded.push(4u8); // 0x04 magic byte that identifies this as uncompressed.
-    encoded.resize((32 - pub_key_x.len()) + 1, 0u8);
+    let pub_key_x_ken = pub_key_x.len();
+    if pub_key_x_ken > 32 {
+        return Err(error::fmt!(
+            AuthError,
+            "Misconfigured ILP authentication keys. Public key x is too long. Hint: Check the keys for a possible typo."
+        ));
+    }
+    let pub_key_y_len = pub_key_y.len();
+    if pub_key_y_len > 32 {
+        return Err(error::fmt!(
+            AuthError,
+            "Misconfigured ILP authentication keys. Public key y is too long. Hint: Check the keys for a possible typo."
+        ));
+    }
+    encoded.resize((32 - pub_key_x_ken) + 1, 0u8);
     encoded.append(&mut pub_key_x);
-    encoded.resize((32 - pub_key_y.len()) + 1 + 32, 0u8);
+    encoded.resize((32 - pub_key_y_len) + 1 + 32, 0u8);
     encoded.append(&mut pub_key_y);
     Ok(encoded)
 }
@@ -1786,7 +1800,13 @@ fn parse_key_pair(auth: &AuthParams) -> Result<EcdsaKeyPair> {
         &public_key[..],
         &system_random,
     )
-    .map_err(|key_rejected| error::fmt!(AuthError, "Bad private key: {}", key_rejected))
+    .map_err(|key_rejected| {
+        error::fmt!(
+            AuthError,
+            "Misconfigured ILP authentication keys: {}. Hint: Check the keys for a possible typo.",
+            key_rejected
+        )
+    })
 }
 
 pub(crate) struct F64Serializer {
