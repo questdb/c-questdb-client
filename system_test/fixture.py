@@ -262,7 +262,6 @@ class QuestDbFixture:
             '-Debug',
             '-XX:+UnlockExperimentalVMOptions',
             '-XX:+AlwaysPreTouch',
-            '-XX:+UseParallelOldGC',
             '-p', str(self._root_dir / 'bin' / 'questdb.jar'),
             '-m', 'io.questdb/io.questdb.ServerMain',
             '-d', str(self._data_dir)]

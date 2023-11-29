@@ -59,7 +59,7 @@ def ns_to_qdb_date(at_ts_ns):
     # We first need to match QuestDB's internal microsecond resolution.
     at_ts_us = int(at_ts_ns / 1000.0)
     at_ts_sec = at_ts_us / 1000000.0
-    at_td = datetime.datetime.fromtimestamp(at_ts_sec)
+    at_td = datetime.datetime.utcfromtimestamp(at_ts_sec)
     return at_td.isoformat() + 'Z'
 
 
@@ -568,7 +568,7 @@ class TestSender(unittest.TestCase):
 
         with self.assertRaisesRegex(
                 qls.SenderError,
-                r'.*Bad private key.*'):
+                r'Misconfigured ILP authentication keys: InconsistentComponents. Hint: Check the keys for a possible typo.'):
             sender.connect()
 
     def test_malformed_auth2(self):
