@@ -39,6 +39,9 @@ pub enum ErrorCode {
 
     /// Error during TLS handshake.
     TlsError,
+
+    /// Error sent back from the server during flush.
+    ServerFlushError,
 }
 
 /// An error that occurred when using QuestDB client library.

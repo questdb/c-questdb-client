@@ -467,6 +467,80 @@ enum Connection {
     Tls(Box<StreamOwned<ClientConnection, Socket>>),
 }
 
+impl Connection {
+    fn send_key_id(&mut self, key_id: &str) -> Result<()> {
+        writeln!(self, "{}", key_id)
+            .map_err(|io_err| map_io_to_socket_err("Failed to send key_id: ", io_err))?;
+        Ok(())
+    }
+
+    fn read_challenge(&mut self) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        let mut reader = BufReader::new(self);
+        reader.read_until(b'\n', &mut buf).map_err(|io_err| {
+            map_io_to_socket_err(
+                "Failed to read authentication challenge (timed out?): ",
+                io_err,
+            )
+        })?;
+        if buf.last().copied().unwrap_or(b'\0') != b'\n' {
+            return Err(if buf.is_empty() {
+                error::fmt!(
+                    AuthError,
+                    concat!(
+                        "Did not receive auth challenge. ",
+                        "Is the database configured to require ",
+                        "authentication?"
+                    )
+                )
+            } else {
+                error::fmt!(AuthError, "Received incomplete auth challenge: {:?}", buf)
+            });
+        }
+        buf.pop(); // b'\n'
+        Ok(buf)
+    }
+
+    fn authenticate(&mut self, auth: &AuthParams) -> Result<()> {
+        if auth.key_id.contains('\n') {
+            return Err(error::fmt!(
+                AuthError,
+                "Bad key id {:?}: Should not contain new-line char.",
+                auth.key_id
+            ));
+        }
+        let key_pair = parse_key_pair(auth)?;
+        self.send_key_id(auth.key_id.as_str())?;
+        let challenge = self.read_challenge()?;
+        let rng = SystemRandom::new();
+        let signature = key_pair
+            .sign(&rng, &challenge[..])
+            .map_err(|unspecified_err| {
+                error::fmt!(AuthError, "Failed to sign challenge: {}", unspecified_err)
+            })?;
+        let mut encoded_sig = Base64::encode_string(signature.as_ref());
+        encoded_sig.push('\n');
+        let buf = encoded_sig.as_bytes();
+        if let Err(io_err) = self.write_all(buf) {
+            return Err(map_io_to_socket_err(
+                "Could not send signed challenge: ",
+                io_err,
+            ));
+        }
+        Ok(())
+    }
+}
+
+enum ProtocolHandler {
+    Socket(Connection),
+
+    #[cfg(feature = "ilp-over-http")]
+    Http {
+        agent: ureq::Agent,
+        url: String,
+    },
+}
+
 impl io::Read for Connection {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
@@ -1210,7 +1284,7 @@ impl Default for Buffer {
 /// * To send messages, call the [`flush`](Sender::flush) method.
 pub struct Sender {
     descr: String,
-    conn: Connection,
+    handler: ProtocolHandler,
     connected: bool,
 }
 
@@ -1447,6 +1521,17 @@ fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
     Ok(Some(Arc::new(config)))
 }
 
+/// Protocol used to communicate with the QuestDB server.
+#[derive(Debug, Clone, Copy)]
+pub enum SenderProtocol {
+    /// ILP over TCP (streaming).
+    IlpOverTcp,
+
+    #[cfg(feature = "ilp-over-http")]
+    /// ILP over HTTP (request-response, InfluxDB-compatible).
+    IlpOverHttp,
+}
+
 /// Accumulate parameters for a new `Sender` instance.
 ///
 /// ```no_run
@@ -1473,6 +1558,7 @@ pub struct SenderBuilder {
     net_interface: Option<String>,
     auth: Option<AuthParams>,
     tls: Tls,
+    protocol: SenderProtocol,
 }
 
 impl SenderBuilder {
@@ -1496,6 +1582,7 @@ impl SenderBuilder {
             net_interface: None,
             auth: None,
             tls: Tls::Disabled,
+            protocol: SenderProtocol::IlpOverTcp,
         }
     }
 
@@ -1652,6 +1739,14 @@ impl SenderBuilder {
         self
     }
 
+    /// Configure the protocol to use for communication with the QuestDB server.
+    ///
+    /// The default is [`SenderProtocol::IlpOverTcp`].
+    pub fn protocol(mut self, protocol: SenderProtocol) -> Self {
+        self.protocol = protocol;
+        self
+    }
+
     /// Connect synchronously.
     ///
     /// Will return once the connection is fully established:
@@ -1659,45 +1754,6 @@ impl SenderBuilder {
     /// completed before returning.
     pub fn connect(&self) -> Result<Sender> {
         let mut descr = format!("Sender[host={:?},port={:?},", self.host, self.port);
-        let addr: SockAddr = gai::resolve_host_port(self.host.as_str(), self.port.as_str())?;
-        let mut sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
-            .map_err(|io_err| map_io_to_socket_err("Could not open TCP socket: ", io_err))?;
-
-        // See: https://idea.popcount.org/2014-04-03-bind-before-connect/
-        // We set `SO_REUSEADDR` on the outbound socket to avoid issues where a client may exhaust
-        // their interface's ports. See: https://github.com/questdb/py-questdb-client/issues/21
-        sock.set_reuse_address(true)
-            .map_err(|io_err| map_io_to_socket_err("Could not set SO_REUSEADDR: ", io_err))?;
-
-        sock.set_linger(Some(Duration::from_secs(120)))
-            .map_err(|io_err| map_io_to_socket_err("Could not set socket linger: ", io_err))?;
-        sock.set_keepalive(true)
-            .map_err(|io_err| map_io_to_socket_err("Could not set SO_KEEPALIVE: ", io_err))?;
-        sock.set_nodelay(true)
-            .map_err(|io_err| map_io_to_socket_err("Could not set TCP_NODELAY: ", io_err))?;
-        if let Some(ref host) = self.net_interface {
-            let bind_addr = gai::resolve_host(host.as_str())?;
-            sock.bind(&bind_addr).map_err(|io_err| {
-                map_io_to_socket_err(
-                    &format!("Could not bind to interface address {:?}: ", host),
-                    io_err,
-                )
-            })?;
-        }
-        sock.connect(&addr).map_err(|io_err| {
-            let host_port = format!("{}:{}", self.host, self.port);
-            let prefix = format!("Could not connect to {:?}: ", host_port);
-            map_io_to_socket_err(&prefix, io_err)
-        })?;
-
-        // We read during both TLS handshake and authentication.
-        // We set up a read timeout to prevent the client from "hanging"
-        // should we be connecting to a server configured in a different way
-        // from the client.
-        sock.set_read_timeout(Some(self.read_timeout))
-            .map_err(|io_err| {
-                map_io_to_socket_err("Failed to set read timeout on socket: ", io_err)
-            })?;
 
         match self.tls {
             Tls::Disabled => write!(descr, "tls=enabled,").unwrap(),
@@ -1707,39 +1763,116 @@ impl SenderBuilder {
             Tls::InsecureSkipVerify => write!(descr, "tls=insecure_skip_verify,").unwrap(),
         }
 
-        let conn = match configure_tls(&self.tls)? {
-            Some(tls_config) => {
-                let server_name: ServerName =
-                    self.host.as_str().try_into().map_err(|inv_dns_err| {
-                        error::fmt!(TlsError, "Bad host: {}", inv_dns_err)
+        let handler = match self.protocol {
+            SenderProtocol::IlpOverTcp => {
+                let addr: SockAddr =
+                    gai::resolve_host_port(self.host.as_str(), self.port.as_str())?;
+                let mut sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
+                    .map_err(|io_err| {
+                        map_io_to_socket_err("Could not open TCP socket: ", io_err)
                     })?;
-                let mut tls_conn =
-                    ClientConnection::new(tls_config, server_name).map_err(|rustls_err| {
-                        error::fmt!(TlsError, "Could not create TLS client: {}", rustls_err)
+
+                // See: https://idea.popcount.org/2014-04-03-bind-before-connect/
+                // We set `SO_REUSEADDR` on the outbound socket to avoid issues where a client may exhaust
+                // their interface's ports. See: https://github.com/questdb/py-questdb-client/issues/21
+                sock.set_reuse_address(true).map_err(|io_err| {
+                    map_io_to_socket_err("Could not set SO_REUSEADDR: ", io_err)
+                })?;
+
+                sock.set_linger(Some(Duration::from_secs(120)))
+                    .map_err(|io_err| {
+                        map_io_to_socket_err("Could not set socket linger: ", io_err)
                     })?;
-                while tls_conn.wants_write() || tls_conn.is_handshaking() {
-                    tls_conn.complete_io(&mut sock).map_err(|io_err| {
-                        if (io_err.kind() == ErrorKind::TimedOut)
-                            || (io_err.kind() == ErrorKind::WouldBlock)
-                        {
-                            error::fmt!(
-                                TlsError,
-                                concat!(
-                                    "Failed to complete TLS handshake:",
-                                    " Timed out waiting for server ",
-                                    "response after {:?}."
-                                ),
-                                self.read_timeout
-                            )
-                        } else {
-                            error::fmt!(TlsError, "Failed to complete TLS handshake: {}", io_err)
-                        }
+                sock.set_keepalive(true).map_err(|io_err| {
+                    map_io_to_socket_err("Could not set SO_KEEPALIVE: ", io_err)
+                })?;
+                sock.set_nodelay(true).map_err(|io_err| {
+                    map_io_to_socket_err("Could not set TCP_NODELAY: ", io_err)
+                })?;
+                if let Some(ref host) = self.net_interface {
+                    let bind_addr = gai::resolve_host(host.as_str())?;
+                    sock.bind(&bind_addr).map_err(|io_err| {
+                        map_io_to_socket_err(
+                            &format!("Could not bind to interface address {:?}: ", host),
+                            io_err,
+                        )
                     })?;
                 }
-                Connection::Tls(StreamOwned::new(tls_conn, sock).into())
+                sock.connect(&addr).map_err(|io_err| {
+                    let host_port = format!("{}:{}", self.host, self.port);
+                    let prefix = format!("Could not connect to {:?}: ", host_port);
+                    map_io_to_socket_err(&prefix, io_err)
+                })?;
+
+                // We read during both TLS handshake and authentication.
+                // We set up a read timeout to prevent the client from "hanging"
+                // should we be connecting to a server configured in a different way
+                // from the client.
+                sock.set_read_timeout(Some(self.read_timeout))
+                    .map_err(|io_err| {
+                        map_io_to_socket_err("Failed to set read timeout on socket: ", io_err)
+                    })?;
+
+                ProtocolHandler::Socket(match configure_tls(&self.tls)? {
+                    Some(tls_config) => {
+                        let server_name: ServerName =
+                            self.host.as_str().try_into().map_err(|inv_dns_err| {
+                                error::fmt!(TlsError, "Bad host: {}", inv_dns_err)
+                            })?;
+                        let mut tls_conn = ClientConnection::new(tls_config, server_name).map_err(
+                            |rustls_err| {
+                                error::fmt!(TlsError, "Could not create TLS client: {}", rustls_err)
+                            },
+                        )?;
+                        while tls_conn.wants_write() || tls_conn.is_handshaking() {
+                            tls_conn.complete_io(&mut sock).map_err(|io_err| {
+                                if (io_err.kind() == ErrorKind::TimedOut)
+                                    || (io_err.kind() == ErrorKind::WouldBlock)
+                                {
+                                    error::fmt!(
+                                        TlsError,
+                                        concat!(
+                                            "Failed to complete TLS handshake:",
+                                            " Timed out waiting for server ",
+                                            "response after {:?}."
+                                        ),
+                                        self.read_timeout
+                                    )
+                                } else {
+                                    error::fmt!(
+                                        TlsError,
+                                        "Failed to complete TLS handshake: {}",
+                                        io_err
+                                    )
+                                }
+                            })?;
+                        }
+                        Connection::Tls(StreamOwned::new(tls_conn, sock).into())
+                    }
+                    None => Connection::Direct(sock),
+                })
             }
-            None => Connection::Direct(sock),
+            #[cfg(feature = "ilp-over-http")]
+            SenderProtocol::IlpOverHttp => {
+                let agent_builder = ureq::AgentBuilder::new()
+                    // TODO: Use proper timeouts!
+                    .timeout(self.read_timeout)
+                    .no_delay(true);
+                let agent_builder = match configure_tls(&self.tls)? {
+                    Some(tls_config) => agent_builder.tls_config(tls_config),
+                    None => agent_builder,
+                };
+                let agent = agent_builder.build();
+                let proto = if self.tls.is_enabled() {
+                    "https"
+                } else {
+                    "http"
+                };
+                let url = format!("{}://{}:{}/write", proto, self.host, self.port);
+                ProtocolHandler::Http { agent, url }
+            }
         };
+
         if self.auth.is_some() {
             descr.push_str("auth=on]");
         } else {
@@ -1747,11 +1880,14 @@ impl SenderBuilder {
         }
         let mut sender = Sender {
             descr,
-            conn,
+            handler,
             connected: true,
         };
         if let Some(auth) = self.auth.as_ref() {
-            sender.authenticate(auth)?;
+            #[allow(irrefutable_let_patterns)]
+            if let ProtocolHandler::Socket(conn) = &mut sender.handler {
+                conn.authenticate(auth)?;
+            }
         }
         Ok(sender)
     }
@@ -1847,69 +1983,45 @@ impl F64Serializer {
     }
 }
 
+#[cfg(feature = "ilp-over-http")]
+fn parse_http_error(response: ureq::Response) -> Error {
+    let error_code = response.header("questdb-error-code").map(str::to_string);
+    let error_id = response.header("questdb-error-id").map(str::to_string);
+    let error_line = response.header("questdb-error-line").map(str::to_string);
+    let mut msg = response
+        .into_string()
+        .unwrap_or_else(|_| "server sent error that could not be parsed".to_string());
+    let mut printed_header = false;
+    if error_code.is_some() || error_id.is_some() || error_line.is_some() {
+        msg.push_str(" [");
+        if let Some(error_code) = error_code {
+            msg.push_str("error_code=");
+            msg.push_str(&error_code);
+            printed_header = true;
+        }
+
+        if let Some(error_id) = error_id {
+            if printed_header {
+                msg.push_str(", ");
+            }
+            msg.push_str("error_id=");
+            msg.push_str(&error_id);
+            printed_header = true;
+        }
+
+        if let Some(error_line) = error_line {
+            if printed_header {
+                msg.push_str(", ");
+            }
+            msg.push_str("error_line=");
+            msg.push_str(&error_line);
+        }
+        msg.push(']');
+    }
+    error::fmt!(ServerFlushError, "Could not flush buffer: {}", msg)
+}
+
 impl Sender {
-    fn send_key_id(&mut self, key_id: &str) -> Result<()> {
-        writeln!(&mut self.conn, "{}", key_id)
-            .map_err(|io_err| map_io_to_socket_err("Failed to send key_id: ", io_err))?;
-        Ok(())
-    }
-
-    fn read_challenge(&mut self) -> Result<Vec<u8>> {
-        let mut buf = Vec::new();
-        let mut reader = BufReader::new(&mut self.conn);
-        reader.read_until(b'\n', &mut buf).map_err(|io_err| {
-            map_io_to_socket_err(
-                "Failed to read authentication challenge (timed out?): ",
-                io_err,
-            )
-        })?;
-        if buf.last().copied().unwrap_or(b'\0') != b'\n' {
-            return Err(if buf.is_empty() {
-                error::fmt!(
-                    AuthError,
-                    concat!(
-                        "Did not receive auth challenge. ",
-                        "Is the database configured to require ",
-                        "authentication?"
-                    )
-                )
-            } else {
-                error::fmt!(AuthError, "Received incomplete auth challenge: {:?}", buf)
-            });
-        }
-        buf.pop(); // b'\n'
-        Ok(buf)
-    }
-
-    fn authenticate(&mut self, auth: &AuthParams) -> Result<()> {
-        if auth.key_id.contains('\n') {
-            return Err(error::fmt!(
-                AuthError,
-                "Bad key id {:?}: Should not contain new-line char.",
-                auth.key_id
-            ));
-        }
-        let key_pair = parse_key_pair(auth)?;
-        self.send_key_id(auth.key_id.as_str())?;
-        let challenge = self.read_challenge()?;
-        let rng = ring::rand::SystemRandom::new();
-        let signature = key_pair
-            .sign(&rng, &challenge[..])
-            .map_err(|unspecified_err| {
-                error::fmt!(AuthError, "Failed to sign challenge: {}", unspecified_err)
-            })?;
-        let mut encoded_sig = Base64::encode_string(signature.as_ref());
-        encoded_sig.push('\n');
-        let buf = encoded_sig.as_bytes();
-        if let Err(io_err) = self.conn.write_all(buf) {
-            return Err(map_io_to_socket_err(
-                "Could not send signed challenge: ",
-                io_err,
-            ));
-        }
-        Ok(())
-    }
-
     /// Send buffer to the QuestDB server, without clearing the
     /// buffer.
     ///
@@ -1925,9 +2037,36 @@ impl Sender {
         }
         buf.check_state(Op::Flush)?;
         let bytes = buf.as_str().as_bytes();
-        if let Err(io_err) = self.conn.write_all(bytes) {
-            self.connected = false;
-            return Err(map_io_to_socket_err("Could not flush buffer: ", io_err));
+        match self.handler {
+            ProtocolHandler::Socket(ref mut conn) => {
+                conn.write_all(bytes).map_err(|io_err| {
+                    self.connected = false;
+                    map_io_to_socket_err("Could not flush buffer: ", io_err)
+                })?;
+            }
+            #[cfg(feature = "ilp-over-http")]
+            ProtocolHandler::Http { ref agent, ref url } => {
+                let response_or_err = agent
+                    .post(url)
+                    .set("Content-Type", "text/plain; charset=utf-8")
+                    .set("questdb-error-content-type", "text/plain")
+                    .send_string(buf.as_str());
+                match response_or_err {
+                    Ok(_response) => {
+                        // on success, there's no information in the response.
+                    }
+                    Err(ureq::Error::Status(_http_status_code, response)) => {
+                        return Err(parse_http_error(response));
+                    }
+                    Err(ureq::Error::Transport(transport)) => {
+                        return Err(error::fmt!(
+                            SocketError,
+                            "Could not flush buffer: {}",
+                            transport
+                        ));
+                    }
+                }
+            }
         }
         Ok(())
     }
