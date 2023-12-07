@@ -1739,6 +1739,7 @@ impl SenderBuilder {
         self
     }
 
+    #[cfg(feature = "ilp-over-http")]
     /// Configure to use HTTP instead of TCP.
     pub fn http(mut self) -> Self {
         self.protocol = SenderProtocol::IlpOverHttp;

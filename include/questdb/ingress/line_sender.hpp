@@ -732,6 +732,12 @@ namespace questdb::ingress
                 return *this;
             }
 
+            opts& http() noexcept
+            {
+                ::line_sender_opts_http(_impl);
+                return *this;
+            }
+
             /**
              * Enable full connection encryption via TLS.
              * The connection will accept certificates by well-known certificate

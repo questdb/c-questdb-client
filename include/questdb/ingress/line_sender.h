@@ -551,6 +551,9 @@ void line_sender_opts_auth(
     line_sender_utf8 pub_key_x,
     line_sender_utf8 pub_key_y);
 
+LINESENDER_API
+void line_sender_opts_http(line_sender_opts* opts);
+
 /**
  * Enable full connection encryption via TLS.
  * The connection will accept certificates by well-known certificate

@@ -60,10 +60,10 @@ macro_rules! bubble_err_to_c {
 /// Update the Rust builder inside the C opts object
 /// after calling a method that takes ownership of the builder.
 macro_rules! upd_opts {
-    ($opts:expr, $func:ident, $($args:expr),*) => {
+    ($opts:expr, $func:ident $(, $($args:expr),*)?) => {
         ptr::write(
             &mut (*$opts).0,
-            ptr::read(&(*$opts).0).$func($($args),*));
+            ptr::read(&(*$opts).0).$func($($($args),*)?));
     };
 }
 
@@ -97,6 +97,9 @@ pub enum line_sender_error_code {
 
     /// Error during TLS handshake.
     line_sender_error_tls_error,
+
+    /// Error sent back from the server during flush.
+    line_sender_error_server_flush_error,
 }
 
 impl From<ErrorCode> for line_sender_error_code {
@@ -114,6 +117,9 @@ impl From<ErrorCode> for line_sender_error_code {
             }
             ErrorCode::AuthError => line_sender_error_code::line_sender_error_auth_error,
             ErrorCode::TlsError => line_sender_error_code::line_sender_error_tls_error,
+            ErrorCode::ServerFlushError => {
+                line_sender_error_code::line_sender_error_server_flush_error
+            }
         }
     }
 }
@@ -466,6 +472,11 @@ pub unsafe extern "C" fn line_sender_opts_auth(
         pub_key_x.as_str(),
         pub_key_y.as_str()
     );
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_http(opts: *mut line_sender_opts) {
+    upd_opts!(opts, http);
 }
 
 /// Enable full connection encryption via TLS.
