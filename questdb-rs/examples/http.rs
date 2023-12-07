@@ -1,13 +1,10 @@
-use questdb::ingress::SenderProtocol;
 use questdb::{
     ingress::{Buffer, SenderBuilder, TimestampNanos},
     Result,
 };
 
 fn main() -> Result<()> {
-    let mut sender = SenderBuilder::new("localhost", 9000)
-        .protocol(SenderProtocol::IlpOverHttp)
-        .connect()?;
+    let mut sender = SenderBuilder::new("localhost", 9000).http().connect()?;
     let mut buffer = Buffer::new();
     buffer
         .table("sensors")?

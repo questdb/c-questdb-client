@@ -1739,11 +1739,9 @@ impl SenderBuilder {
         self
     }
 
-    /// Configure the protocol to use for communication with the QuestDB server.
-    ///
-    /// The default is [`SenderProtocol::IlpOverTcp`].
-    pub fn protocol(mut self, protocol: SenderProtocol) -> Self {
-        self.protocol = protocol;
+    /// Configure to use HTTP instead of TCP.
+    pub fn http(mut self) -> Self {
+        self.protocol = SenderProtocol::IlpOverHttp;
         self
     }
 
