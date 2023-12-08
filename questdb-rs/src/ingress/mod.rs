@@ -201,6 +201,8 @@ use rustls::{ClientConnection, OwnedTrustAnchor, RootCertStore, ServerName, Stre
 use serde_json::Value;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[derive(Debug, Copy, Clone)]
 enum Op {
     Table = 1,
@@ -1892,6 +1894,7 @@ impl SenderBuilder {
             #[cfg(feature = "ilp-over-http")]
             SenderProtocol::IlpOverHttp => {
                 let agent_builder = ureq::AgentBuilder::new()
+                    .user_agent(&format!("c-questdb-client/{VERSION}"))
                     // TODO: Use proper timeouts!
                     .timeout(self.read_timeout)
                     .no_delay(true);
@@ -2091,6 +2094,13 @@ fn parse_http_error(http_status_code: u16, response: ureq::Response) -> Error {
             HttpNotSupported,
             "Could not flush buffer: HTTP endpoint does not support ILP."
         );
+    } else if [401, 403].contains(&http_status_code) {
+        return error::fmt!(
+            AuthError,
+            "Could not flush buffer: HTTP endpoint authentication error: {} [code: {}]",
+            response.into_string().unwrap_or("".to_string()),
+            http_status_code
+        );
     }
 
     let is_json = response
@@ -2154,8 +2164,7 @@ impl Sender {
             } => {
                 let request = agent
                     .post(url)
-                    .set("Content-Type", "text/plain; charset=utf-8")
-                    .set("questdb-error-content-type", "text/plain");
+                    .set("Content-Type", "text/plain; charset=utf-8");
                 let request = match auth {
                     Some(auth) => request.set("Authorization", auth),
                     None => request,

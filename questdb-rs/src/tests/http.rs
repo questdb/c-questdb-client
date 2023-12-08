@@ -215,7 +215,7 @@ fn test_no_connection() -> TestResult {
 }
 
 #[test]
-fn test_old_server_without_http_support() -> TestResult {
+fn test_old_server_without_ilp_http_support() -> TestResult {
     let mut buffer = Buffer::new();
     buffer
         .table("test")?
@@ -246,6 +246,9 @@ fn test_old_server_without_http_support() -> TestResult {
 
     Ok(())
 }
+
+// #[test]
+// fn test_http_auth() -> TestResult {}
 
 // TODO:
 //  * Test timeouts.
