@@ -198,6 +198,7 @@ use base64ct::{Base64, Base64UrlUnpadded, Encoding};
 use ring::rand::SystemRandom;
 use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
 use rustls::{ClientConnection, OwnedTrustAnchor, RootCertStore, ServerName, StreamOwned};
+use serde_json::Value;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 #[derive(Debug, Copy, Clone)]
@@ -1983,6 +1984,48 @@ impl F64Serializer {
 }
 
 #[cfg(feature = "ilp-over-http")]
+fn parse_json_error(json: &Value, msg: &str) -> Error {
+    let mut description = msg.to_string();
+    error::fmt!(ServerFlushError, "Could not flush buffer: {}", msg);
+
+    let error_id = json.get("errorId").and_then(|v| v.as_str());
+    let code = json.get("code").and_then(|v| v.as_str());
+    let line = json.get("line").and_then(|v| v.as_i64());
+
+    let mut printed_detail = false;
+    if error_id.is_some() || code.is_some() || line.is_some() {
+        description.push_str(" [");
+
+        if let Some(error_id) = error_id {
+            description.push_str("id: ");
+            description.push_str(error_id);
+            printed_detail = true;
+        }
+
+        if let Some(code) = code {
+            if printed_detail {
+                description.push_str(", ");
+            }
+            description.push_str("code: ");
+            description.push_str(code);
+            printed_detail = true;
+        }
+
+        if let Some(line) = line {
+            if printed_detail {
+                description.push_str(", ");
+            }
+            description.push_str("line: ");
+            write!(description, "{}", line).unwrap();
+        }
+
+        description.push(']');
+    }
+
+    error::fmt!(ServerFlushError, "Could not flush buffer: {}", description)
+}
+
+#[cfg(feature = "ilp-over-http")]
 fn parse_http_error(http_status_code: u16, response: ureq::Response) -> Error {
     if http_status_code == 404 {
         return error::fmt!(
@@ -1990,40 +2033,35 @@ fn parse_http_error(http_status_code: u16, response: ureq::Response) -> Error {
             "Could not flush buffer: HTTP endpoint does not support ILP."
         );
     }
-    let error_code = response.header("questdb-error-code").map(str::to_string);
-    let error_id = response.header("questdb-error-id").map(str::to_string);
-    let error_line = response.header("questdb-error-line").map(str::to_string);
-    let mut msg = response
-        .into_string()
-        .unwrap_or_else(|_| "server sent error that could not be parsed".to_string());
-    let mut printed_header = false;
-    if error_code.is_some() || error_id.is_some() || error_line.is_some() {
-        msg.push_str(" [");
-        if let Some(error_code) = error_code {
-            msg.push_str("code: ");
-            msg.push_str(&error_code);
-            printed_header = true;
-        }
 
-        if let Some(error_id) = error_id {
-            if printed_header {
-                msg.push_str(", ");
-            }
-            msg.push_str("id: ");
-            msg.push_str(&error_id);
-            printed_header = true;
-        }
+    let is_json = response
+        .content_type()
+        .eq_ignore_ascii_case("application/json");
+    match response.into_string() {
+        Ok(msg) => {
+            let string_err = || error::fmt!(ServerFlushError, "Could not flush buffer: {}", msg);
 
-        if let Some(error_line) = error_line {
-            if printed_header {
-                msg.push_str(", ");
+            if !is_json {
+                return string_err();
             }
-            msg.push_str("line: ");
-            msg.push_str(&error_line);
+
+            let json: serde_json::Value = match serde_json::from_str(&msg) {
+                Ok(json) => json,
+                Err(_) => {
+                    return string_err();
+                }
+            };
+
+            return if let Some(Value::String(ref msg)) = json.get("message") {
+                parse_json_error(&json, msg)
+            } else {
+                string_err()
+            };
         }
-        msg.push(']');
+        Err(err) => {
+            error::fmt!(SocketError, "Could not flush buffer: {}", err)
+        }
     }
-    error::fmt!(ServerFlushError, "Could not flush buffer: {}", msg)
 }
 
 impl Sender {

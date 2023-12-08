@@ -78,7 +78,7 @@ fn test_two_lines() -> TestResult {
 }
 
 #[test]
-fn test_two_lines_with_server_error() -> TestResult {
+fn test_text_plain_error() -> TestResult {
     let mut buffer = Buffer::new();
     buffer
         .table("test")?
@@ -90,12 +90,40 @@ fn test_two_lines_with_server_error() -> TestResult {
     let mut server = mockito::Server::new();
     server
         .mock("POST", "/write")
-        .with_status(400)
+        .with_status(500)
         .with_header("content-type", "text/plain")
-        .with_header("questdb-error-code", "invalid")
-        .with_header("questdb-error-id", "ABCDEFG-1")
-        .with_header("questdb-error-line", "2")
-        .with_body("bad symbol yada yada")
+        .with_body("too many connections")
+        .match_body(buffer.as_str())
+        .create();
+
+    let mut sender = SenderBuilder::new(server.host(), server.port())
+        .http()
+        .connect()?;
+    let res = sender.flush_and_keep(&buffer);
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ServerFlushError);
+    assert_eq!(err.msg(), "Could not flush buffer: too many connections");
+
+    Ok(())
+}
+
+#[test]
+fn test_bad_json_error() -> TestResult {
+    let mut buffer = Buffer::new();
+    buffer
+        .table("test")?
+        .symbol("sym", "bol")?
+        .column_f64("x", 1.0)?
+        .at_now()?;
+    buffer.table("test")?.column_f64("sym", 2.0)?.at_now()?;
+
+    let mut server = mockito::Server::new();
+    server
+        .mock("POST", "/write")
+        .with_status(500)
+        .with_header("content-type", "application/json")
+        .with_body("{\"error\":\"too many connections\"}")
         .match_body(buffer.as_str())
         .create();
 
@@ -108,7 +136,59 @@ fn test_two_lines_with_server_error() -> TestResult {
     assert_eq!(err.code(), ErrorCode::ServerFlushError);
     assert_eq!(
         err.msg(),
-        "Could not flush buffer: bad symbol yada yada [code: invalid, id: ABCDEFG-1, line: 2]"
+        "Could not flush buffer: {\"error\":\"too many connections\"}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_json_error() -> TestResult {
+    let mut buffer = Buffer::new();
+    buffer
+        .table("test")?
+        .symbol("sym", "bol")?
+        .column_f64("x", 1.0)?
+        .at_now()?;
+    buffer.table("test")?.column_f64("sym", 2.0)?.at_now()?;
+
+    let mut server = mockito::Server::new();
+    server
+        .mock("POST", "/write")
+        .with_status(400)
+        .with_header("content-type", "application/json")
+        /*
+        public void formatJsonError(Utf8Sink sink) {
+            sink.putAscii("{\"code\":\"").putAscii(currentStatus.codeStr);
+            sink.putAscii("\",\"message\":\"").putAscii("failed to parse line protocol: ");
+            sink.put(error);
+            if (errorLine > -1) {
+                sink.putAscii("\",\"line\":").put(errorLine);
+            }
+            sink.putAscii(",\"errorId\":\"").putAscii(ERROR_ID).put('-').put(errorId).putAscii("\"").putAscii('}');
+        }
+        */
+        .with_body(concat!(
+            "{",
+            "\"code\":\"invalid\",",
+            "\"message\":\"failed to parse line protocol: invalid field format\",",
+            "\"errorId\":\"ABC-2\",",
+            "\"line\":2",
+            "}"
+        ))
+        .match_body(buffer.as_str())
+        .create();
+
+    let mut sender = SenderBuilder::new(server.host(), server.port())
+        .http()
+        .connect()?;
+    let res = sender.flush_and_keep(&buffer);
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ServerFlushError);
+    assert_eq!(
+        err.msg(),
+        "Could not flush buffer: failed to parse line protocol: invalid field format [id: ABC-2, code: invalid, line: 2]"
     );
 
     Ok(())
