@@ -98,6 +98,9 @@ pub enum line_sender_error_code {
     /// Error during TLS handshake.
     line_sender_error_tls_error,
 
+    /// The server does not support ILP over HTTP.
+    line_sender_error_http_not_supported,
+
     /// Error sent back from the server during flush.
     line_sender_error_server_flush_error,
 }
@@ -117,6 +120,9 @@ impl From<ErrorCode> for line_sender_error_code {
             }
             ErrorCode::AuthError => line_sender_error_code::line_sender_error_auth_error,
             ErrorCode::TlsError => line_sender_error_code::line_sender_error_tls_error,
+            ErrorCode::HttpNotSupported => {
+                line_sender_error_code::line_sender_error_http_not_supported
+            }
             ErrorCode::ServerFlushError => {
                 line_sender_error_code::line_sender_error_server_flush_error
             }
