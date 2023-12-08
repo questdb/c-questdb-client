@@ -502,7 +502,7 @@ impl Connection {
         Ok(buf)
     }
 
-    fn authenticate(&mut self, auth: &AuthParams) -> Result<()> {
+    fn authenticate(&mut self, auth: &EcdsaAuthParams) -> Result<()> {
         if auth.key_id.contains('\n') {
             return Err(error::fmt!(
                 AuthError,
@@ -539,6 +539,9 @@ enum ProtocolHandler {
     Http {
         agent: ureq::Agent,
         url: String,
+
+        /// The content of the `Authorization` HTTP header.
+        auth: Option<String>,
     },
 }
 
@@ -1296,11 +1299,31 @@ impl std::fmt::Debug for Sender {
 }
 
 #[derive(Debug, Clone)]
-struct AuthParams {
+struct EcdsaAuthParams {
     key_id: String,
     priv_key: String,
     pub_key_x: String,
     pub_key_y: String,
+}
+
+#[derive(Debug, Clone)]
+struct BasicAuthParams {
+    username: String,
+    password: String,
+}
+
+impl BasicAuthParams {
+    fn to_header_string(&self) -> String {
+        let pair = format!("{}:{}", self.username, self.password);
+        let encoded = Base64::encode_string(pair.as_bytes());
+        format!("Basic {encoded}")
+    }
+}
+
+#[derive(Debug, Clone)]
+enum AuthParams {
+    Ecdsa(EcdsaAuthParams),
+    Basic(BasicAuthParams),
 }
 
 /// Root used to determine how to validate the server's TLS certificate.
@@ -1609,9 +1632,10 @@ impl SenderBuilder {
         self
     }
 
-    /// Authentication Parameters.
+    /// Elliptic curve P-256 Authentication Parameters for ILP over TCP.
+    /// These will be ignored for ILP over HTTP.
     ///
-    /// If not called, authentication is disabled.
+    /// If not called, authentication is disabled for ILP over TCP.
     ///
     /// # Arguments
     /// * `key_id` - Key identifier, AKA "kid" in JWT. This is sometimes
@@ -1647,12 +1671,24 @@ impl SenderBuilder {
         C: Into<String>,
         D: Into<String>,
     {
-        self.auth = Some(AuthParams {
+        self.auth = Some(AuthParams::Ecdsa(EcdsaAuthParams {
             key_id: key_id.into(),
             priv_key: priv_key.into(),
             pub_key_x: pub_key_x.into(),
             pub_key_y: pub_key_y.into(),
-        });
+        }));
+        self
+    }
+
+    pub fn basic_auth<A, B>(mut self, username: A, password: B) -> Self
+    where
+        A: Into<String>,
+        B: Into<String>,
+    {
+        self.auth = Some(AuthParams::Basic(BasicAuthParams {
+            username: username.into(),
+            password: password.into(),
+        }));
         self
     }
 
@@ -1742,6 +1778,7 @@ impl SenderBuilder {
 
     #[cfg(feature = "ilp-over-http")]
     /// Configure to use HTTP instead of TCP.
+    /// If you want to configure additional HTTP options, use `http_with_opts` instead.
     pub fn http(mut self) -> Self {
         self.protocol = SenderProtocol::IlpOverHttp;
         self
@@ -1862,6 +1899,17 @@ impl SenderBuilder {
                     Some(tls_config) => agent_builder.tls_config(tls_config),
                     None => agent_builder,
                 };
+                let auth = match self.auth.clone() {
+                    Some(AuthParams::Basic(auth)) => Some(auth.to_header_string()),
+                    Some(AuthParams::Ecdsa(_)) => {
+                        return Err(error::fmt!(
+                            AuthError,
+                            "ECDSA authentication is not supported for ILP over HTTP. \
+                            Please use Basic authentication instead."
+                        ));
+                    }
+                    None => None,
+                };
                 let agent = agent_builder.build();
                 let proto = if self.tls.is_enabled() {
                     "https"
@@ -1869,7 +1917,7 @@ impl SenderBuilder {
                     "http"
                 };
                 let url = format!("{}://{}:{}/write", proto, self.host, self.port);
-                ProtocolHandler::Http { agent, url }
+                ProtocolHandler::Http { agent, url, auth }
             }
         };
 
@@ -1886,7 +1934,18 @@ impl SenderBuilder {
         if let Some(auth) = self.auth.as_ref() {
             #[allow(irrefutable_let_patterns)]
             if let ProtocolHandler::Socket(conn) = &mut sender.handler {
-                conn.authenticate(auth)?;
+                match auth {
+                    AuthParams::Ecdsa(auth) => {
+                        conn.authenticate(auth)?;
+                    }
+                    AuthParams::Basic(_auth) => {
+                        return Err(error::fmt!(
+                            AuthError,
+                            "Basic authentication is not supported for ILP over TCP. \
+                            Please use ECDSA authentication instead."
+                        ));
+                    }
+                }
             }
         }
         Ok(sender)
@@ -1926,7 +1985,7 @@ fn parse_public_key(pub_key_x: &str, pub_key_y: &str) -> Result<Vec<u8>> {
     Ok(encoded)
 }
 
-fn parse_key_pair(auth: &AuthParams) -> Result<EcdsaKeyPair> {
+fn parse_key_pair(auth: &EcdsaAuthParams) -> Result<EcdsaKeyPair> {
     let private_key = b64_decode("private authentication key", auth.priv_key.as_str())?;
     let public_key = parse_public_key(auth.pub_key_x.as_str(), auth.pub_key_y.as_str())?;
     let system_random = SystemRandom::new();
@@ -2088,12 +2147,20 @@ impl Sender {
                 })?;
             }
             #[cfg(feature = "ilp-over-http")]
-            ProtocolHandler::Http { ref agent, ref url } => {
-                let response_or_err = agent
+            ProtocolHandler::Http {
+                ref agent,
+                ref url,
+                ref auth,
+            } => {
+                let request = agent
                     .post(url)
                     .set("Content-Type", "text/plain; charset=utf-8")
-                    .set("questdb-error-content-type", "text/plain")
-                    .send_string(buf.as_str());
+                    .set("questdb-error-content-type", "text/plain");
+                let request = match auth {
+                    Some(auth) => request.set("Authorization", auth),
+                    None => request,
+                };
+                let response_or_err = request.send_string(buf.as_str());
                 match response_or_err {
                     Ok(_response) => {
                         // on success, there's no information in the response.
