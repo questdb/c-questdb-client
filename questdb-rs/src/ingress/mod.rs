@@ -544,6 +544,8 @@ enum ProtocolHandler {
 
         /// The content of the `Authorization` HTTP header.
         auth: Option<String>,
+
+        min_throughput_bps: u64,
     },
 }
 
@@ -1585,6 +1587,7 @@ pub struct SenderBuilder {
     auth: Option<AuthParams>,
     tls: Tls,
     protocol: SenderProtocol,
+    min_throughput_bps: u64,
 }
 
 impl SenderBuilder {
@@ -1609,6 +1612,7 @@ impl SenderBuilder {
             auth: None,
             tls: Tls::Disabled,
             protocol: SenderProtocol::IlpOverTcp,
+            min_throughput_bps: 102400, // 100 KiB/s
         }
     }
 
@@ -1790,6 +1794,16 @@ impl SenderBuilder {
         self
     }
 
+    #[cfg(feature = "ilp-over-http")]
+    /// Minimum expected throughput in bytes per second for HTTP requests.
+    /// If the throughput is lower than this value, the connection will time out.
+    /// The default is 100 KiB/s.
+    /// The value is expressed as a number of bytes per second.
+    pub fn min_throughput_bps(mut self, value: u64) -> Self {
+        self.min_throughput_bps = value;
+        self
+    }
+
     /// Connect synchronously.
     ///
     /// Will return once the connection is fully established:
@@ -1907,8 +1921,6 @@ impl SenderBuilder {
 
                 let agent_builder = ureq::AgentBuilder::new()
                     .user_agent(&format!("c-questdb-client/{VERSION}"))
-                    // TODO: Use proper timeouts!
-                    .timeout(self.read_timeout)
                     .no_delay(true);
                 let agent_builder = match configure_tls(&self.tls)? {
                     Some(tls_config) => agent_builder.tls_config(tls_config),
@@ -1932,7 +1944,12 @@ impl SenderBuilder {
                     "http"
                 };
                 let url = format!("{}://{}:{}/write", proto, self.host, self.port);
-                ProtocolHandler::Http { agent, url, auth }
+                ProtocolHandler::Http {
+                    agent,
+                    url,
+                    auth,
+                    min_throughput_bps: self.min_throughput_bps,
+                }
             }
         };
 
@@ -2177,9 +2194,15 @@ impl Sender {
                 ref agent,
                 ref url,
                 ref auth,
+                min_throughput_bps,
             } => {
+                let grace_period = Duration::from_secs(5);
+                let timeout =
+                    Duration::from_secs_f64((bytes.len() as f64) / (min_throughput_bps as f64))
+                        + grace_period;
                 let request = agent
                     .post(url)
+                    .timeout(timeout)
                     .set("Content-Type", "text/plain; charset=utf-8");
                 let request = match auth {
                     Some(auth) => request.set("Authorization", auth),
