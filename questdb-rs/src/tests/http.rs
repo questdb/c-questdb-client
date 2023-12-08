@@ -157,17 +157,6 @@ fn test_json_error() -> TestResult {
         .mock("POST", "/write")
         .with_status(400)
         .with_header("content-type", "application/json")
-        /*
-        public void formatJsonError(Utf8Sink sink) {
-            sink.putAscii("{\"code\":\"").putAscii(currentStatus.codeStr);
-            sink.putAscii("\",\"message\":\"").putAscii("failed to parse line protocol: ");
-            sink.put(error);
-            if (errorLine > -1) {
-                sink.putAscii("\",\"line\":").put(errorLine);
-            }
-            sink.putAscii(",\"errorId\":\"").putAscii(ERROR_ID).put('-').put(errorId).putAscii("\"").putAscii('}');
-        }
-        */
         .with_body(concat!(
             "{",
             "\"code\":\"invalid\",",
