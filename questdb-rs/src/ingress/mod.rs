@@ -1943,7 +1943,7 @@ impl SenderBuilder {
                 } else {
                     "http"
                 };
-                let url = format!("{}://{}:{}/write?precision=u", proto, self.host, self.port);
+                let url = format!("{}://{}:{}/write", proto, self.host, self.port);
                 ProtocolHandler::Http {
                     agent,
                     url,
@@ -2202,6 +2202,7 @@ impl Sender {
                         + grace_period;
                 let request = agent
                     .post(url)
+                    .query_pairs([("precision", "u")])
                     .timeout(timeout)
                     .set("Content-Type", "text/plain; charset=utf-8");
                 let request = match auth {

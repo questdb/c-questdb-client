@@ -63,7 +63,7 @@ fn test_two_lines() -> TestResult {
 
     let mut server = mockito::Server::new();
     server
-        .mock("POST", "/write")
+        .mock("POST", "/write?precision=u")
         .with_status(204)
         .with_header("content-type", "text/plain")
         .match_body(buffer.as_str())
@@ -89,7 +89,7 @@ fn test_text_plain_error() -> TestResult {
 
     let mut server = mockito::Server::new();
     server
-        .mock("POST", "/write")
+        .mock("POST", "/write?precision=u")
         .with_status(500)
         .with_header("content-type", "text/plain")
         .with_body("too many connections")
@@ -120,7 +120,7 @@ fn test_bad_json_error() -> TestResult {
 
     let mut server = mockito::Server::new();
     server
-        .mock("POST", "/write")
+        .mock("POST", "/write?precision=u")
         .with_status(500)
         .with_header("content-type", "application/json")
         .with_body("{\"error\":\"too many connections\"}")
@@ -154,7 +154,7 @@ fn test_json_error() -> TestResult {
 
     let mut server = mockito::Server::new();
     server
-        .mock("POST", "/write")
+        .mock("POST", "/write?precision=u")
         .with_status(400)
         .with_header("content-type", "application/json")
         .with_body(concat!(
@@ -197,9 +197,9 @@ fn test_no_connection() -> TestResult {
     assert!(res.is_err());
     let err = res.unwrap_err();
     assert_eq!(err.code(), ErrorCode::SocketError);
-    assert!(err
-        .msg()
-        .starts_with("Could not flush buffer: http://127.0.0.1:1/write: Connection Failed"));
+    assert!(err.msg().starts_with(
+        "Could not flush buffer: http://127.0.0.1:1/write?precision=u: Connection Failed"
+    ));
     Ok(())
 }
 
@@ -214,7 +214,7 @@ fn test_old_server_without_ilp_http_support() -> TestResult {
 
     let mut server = mockito::Server::new();
     server
-        .mock("POST", "/write")
+        .mock("POST", "/write?precision=u")
         .with_status(404)
         .with_header("content-type", "text/plain")
         .with_body("Not Found")
@@ -247,7 +247,7 @@ fn test_http_auth() -> TestResult {
 
     let mut server = mockito::Server::new();
     server
-        .mock("POST", "/write")
+        .mock("POST", "/write?precision=u")
         .match_header("Authorization", "Basic QWxhZGRpbjpPcGVuU2VzYW1l")
         .with_status(204)
         .with_header("content-type", "text/plain")
@@ -275,7 +275,7 @@ fn test_unauthenticated() -> TestResult {
 
     let mut server = mockito::Server::new();
     server
-        .mock("POST", "/write")
+        .mock("POST", "/write?precision=u")
         .with_status(401)
         .with_header("content-type", "text/plain")
         .with_header("WWW-Authenticate", "Basic realm=\"Our Site\"")
