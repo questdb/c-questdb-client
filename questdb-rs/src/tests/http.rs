@@ -247,11 +247,70 @@ fn test_old_server_without_ilp_http_support() -> TestResult {
     Ok(())
 }
 
-// #[test]
-// fn test_http_auth() -> TestResult {}
+#[test]
+fn test_http_auth() -> TestResult {
+    let mut buffer = Buffer::new();
+    buffer
+        .table("test")?
+        .symbol("sym", "bol")?
+        .column_f64("x", 1.0)?
+        .at_now()?;
+
+    let mut server = mockito::Server::new();
+    server
+        .mock("POST", "/write")
+        .match_header("Authorization", "Basic QWxhZGRpbjpPcGVuU2VzYW1l")
+        .with_status(204)
+        .with_header("content-type", "text/plain")
+        .match_body(buffer.as_str())
+        .create();
+
+    let mut sender = SenderBuilder::new(server.host(), server.port())
+        .http()
+        .basic_auth("Aladdin", "OpenSesame")
+        .connect()?;
+    sender.flush_and_keep(&buffer)?;
+
+    Ok(())
+}
+
+#[test]
+fn test_unauthenticated() -> TestResult {
+    // WWW-Authenticate: Basic realm="Our Site"
+    let mut buffer = Buffer::new();
+    buffer
+        .table("test")?
+        .symbol("sym", "bol")?
+        .column_f64("x", 1.0)?
+        .at_now()?;
+
+    let mut server = mockito::Server::new();
+    server
+        .mock("POST", "/write")
+        .with_status(401)
+        .with_header("content-type", "text/plain")
+        .with_header("WWW-Authenticate", "Basic realm=\"Our Site\"")
+        .with_body("Unauthorized")
+        .match_body(buffer.as_str())
+        .create();
+
+    let mut sender = SenderBuilder::new(server.host(), server.port())
+        .http()
+        .connect()?;
+
+    let res = sender.flush_and_keep(&buffer);
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::AuthError);
+    assert_eq!(
+        err.msg(),
+        "Could not flush buffer: HTTP endpoint authentication error: Unauthorized [code: 401]"
+    );
+
+    Ok(())
+}
 
 // TODO:
 //  * Test timeouts.
 //  * Test TLS.
-//  * Test AUTH.
 //  * Test compression.
