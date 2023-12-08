@@ -67,7 +67,13 @@ namespace questdb::ingress
         auth_error,
 
         /** Error during TLS handshake. */
-        tls_error
+        tls_error,
+
+        /** The server does not support ILP over HTTP. */
+        http_not_supported,
+
+        /** Error sent back from the server during flush. */
+        server_flush_error,
     };
 
     /**

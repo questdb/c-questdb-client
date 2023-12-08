@@ -1983,7 +1983,13 @@ impl F64Serializer {
 }
 
 #[cfg(feature = "ilp-over-http")]
-fn parse_http_error(response: ureq::Response) -> Error {
+fn parse_http_error(http_status_code: u16, response: ureq::Response) -> Error {
+    if http_status_code == 404 {
+        return error::fmt!(
+            HttpNotSupported,
+            "Could not flush buffer: HTTP endpoint does not support ILP."
+        );
+    }
     let error_code = response.header("questdb-error-code").map(str::to_string);
     let error_id = response.header("questdb-error-id").map(str::to_string);
     let error_line = response.header("questdb-error-line").map(str::to_string);
@@ -1994,7 +2000,7 @@ fn parse_http_error(response: ureq::Response) -> Error {
     if error_code.is_some() || error_id.is_some() || error_line.is_some() {
         msg.push_str(" [");
         if let Some(error_code) = error_code {
-            msg.push_str("error_code=");
+            msg.push_str("code: ");
             msg.push_str(&error_code);
             printed_header = true;
         }
@@ -2003,7 +2009,7 @@ fn parse_http_error(response: ureq::Response) -> Error {
             if printed_header {
                 msg.push_str(", ");
             }
-            msg.push_str("error_id=");
+            msg.push_str("id: ");
             msg.push_str(&error_id);
             printed_header = true;
         }
@@ -2012,7 +2018,7 @@ fn parse_http_error(response: ureq::Response) -> Error {
             if printed_header {
                 msg.push_str(", ");
             }
-            msg.push_str("error_line=");
+            msg.push_str("line: ");
             msg.push_str(&error_line);
         }
         msg.push(']');
@@ -2054,8 +2060,8 @@ impl Sender {
                     Ok(_response) => {
                         // on success, there's no information in the response.
                     }
-                    Err(ureq::Error::Status(_http_status_code, response)) => {
-                        return Err(parse_http_error(response));
+                    Err(ureq::Error::Status(http_status_code, response)) => {
+                        return Err(parse_http_error(http_status_code, response));
                     }
                     Err(ureq::Error::Transport(transport)) => {
                         return Err(error::fmt!(

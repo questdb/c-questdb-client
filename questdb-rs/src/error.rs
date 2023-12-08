@@ -40,6 +40,9 @@ pub enum ErrorCode {
     /// Error during TLS handshake.
     TlsError,
 
+    /// The server does not support ILP-over-HTTP.
+    HttpNotSupported,
+
     /// Error sent back from the server during flush.
     ServerFlushError,
 }

@@ -41,9 +41,10 @@ indoc = "2.0.3"
 [dev-dependencies]
 mio = { version = "0.8.8", features = ["os-poll", "net"] }
 chrono = "0.4.30"
+mockito = "1.2.0"
 
 [features]
-default = ["tls-webpki-certs"]
+default = ["tls-webpki-certs", "ilp-over-http"]
 
 # Include support for ILP over HTTP.
 ilp-over-http = ["dep:ureq"]
