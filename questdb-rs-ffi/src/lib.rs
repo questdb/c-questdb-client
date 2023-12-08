@@ -457,7 +457,9 @@ pub unsafe extern "C" fn line_sender_opts_net_interface(
     upd_opts!(opts, net_interface, net_interface.as_str());
 }
 
-/// Authentication Parameters.
+/// ECDSA Authentication Parameters for ILP over TCP.
+/// For HTTP, use `basic_auth` instead.
+///
 /// @param[in] key_id Key id. AKA "kid"
 /// @param[in] priv_key Private key. AKA "d".
 /// @param[in] pub_key_x Public key X coordinate. AKA "x".
@@ -480,6 +482,21 @@ pub unsafe extern "C" fn line_sender_opts_auth(
     );
 }
 
+/// Basic Authentication Parameters for ILP over HTTP.
+/// For TCP, use `auth` instead.
+///
+/// @param[in] username Username.
+/// @param[in] password Password.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_basic_auth(
+    opts: *mut line_sender_opts,
+    username: line_sender_utf8,
+    password: line_sender_utf8,
+) {
+    upd_opts!(opts, basic_auth, username.as_str(), password.as_str());
+}
+
+/// Enable ILP over HTTP.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_opts_http(opts: *mut line_sender_opts) {
     upd_opts!(opts, http);

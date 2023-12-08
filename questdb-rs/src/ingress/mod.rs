@@ -1634,8 +1634,8 @@ impl SenderBuilder {
         self
     }
 
-    /// Elliptic curve P-256 Authentication Parameters for ILP over TCP.
-    /// These will be ignored for ILP over HTTP.
+    /// ECDSA Authentication Parameters for ILP over TCP.
+    /// For HTTP, use [`basic_auth`](SenderBuilder::basic_auth).
     ///
     /// If not called, authentication is disabled for ILP over TCP.
     ///
@@ -1682,6 +1682,10 @@ impl SenderBuilder {
         self
     }
 
+    /// Basic Authentication Parameters for ILP over HTTP.
+    /// For TCP, use [`auth`](SenderBuilder::auth).
+    ///
+    /// If not called, authentication is disabled for ILP over HTTP.
     pub fn basic_auth<A, B>(mut self, username: A, password: B) -> Self
     where
         A: Into<String>,
@@ -1893,6 +1897,14 @@ impl SenderBuilder {
             }
             #[cfg(feature = "ilp-over-http")]
             SenderProtocol::IlpOverHttp => {
+                if self.net_interface.is_some() {
+                    // See: https://github.com/algesten/ureq/issues/692
+                    return Err(error::fmt!(
+                        InvalidApiCall,
+                        "net_interface is not supported for ILP over HTTP."
+                    ));
+                }
+
                 let agent_builder = ureq::AgentBuilder::new()
                     .user_agent(&format!("c-questdb-client/{VERSION}"))
                     // TODO: Use proper timeouts!

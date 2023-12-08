@@ -543,7 +543,9 @@ void line_sender_opts_net_interface(
     line_sender_utf8 net_interface);
 
 /**
- * Authentication Parameters.
+ * ECDSA Authentication Parameters for ILP over TCP.
+ * For HTTP, use `basic_auth` instead.
+ *
  * @param[in] key_id Key id. AKA "kid"
  * @param[in] priv_key Private key. AKA "d".
  * @param[in] pub_key_x Public key X coordinate. AKA "x".
@@ -556,6 +558,19 @@ void line_sender_opts_auth(
     line_sender_utf8 priv_key,
     line_sender_utf8 pub_key_x,
     line_sender_utf8 pub_key_y);
+
+/**
+ * Basic Authentication Parameters for ILP over HTTP.
+ * For TCP, use `auth` instead.
+ *
+ * @param[in] username Username.
+ * @param[in] password Password.
+ */
+LINESENDER_API
+void line_sender_opts_basic_auth(
+    line_sender_opts* opts,
+    line_sender_utf8 username,
+    line_sender_utf8 password);
 
 LINESENDER_API
 void line_sender_opts_http(line_sender_opts* opts);

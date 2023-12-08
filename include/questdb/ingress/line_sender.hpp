@@ -717,7 +717,9 @@ namespace questdb::ingress
             }
 
             /**
-             * Authentication Parameters.
+             * ECDSA Authentication Parameters for ILP over TCP.
+             * For HTTP, use `basic_auth` instead.
+             *
              * @param[in] key_id Key id. AKA "kid"
              * @param[in] priv_key Private key. AKA "d".
              * @param[in] pub_key_x Public key X coordinate. AKA "x".
@@ -738,6 +740,27 @@ namespace questdb::ingress
                 return *this;
             }
 
+            /**
+             * Basic Authentication Parameters for ILP over HTTP.
+             * For TCP, use `auth` instead.
+             *
+             * @param[in] username Username.
+             * @param[in] password Password.
+             */
+            opts& basic_auth(
+                utf8_view username,
+                utf8_view password) noexcept
+            {
+                ::line_sender_opts_basic_auth(
+                    _impl,
+                    username._impl,
+                    password._impl);
+                return *this;
+            }
+
+            /**
+             * Enable ILP over HTTP.
+             */
             opts& http() noexcept
             {
                 ::line_sender_opts_http(_impl);
