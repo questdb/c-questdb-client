@@ -1920,7 +1920,7 @@ impl SenderBuilder {
                 }
 
                 let agent_builder = ureq::AgentBuilder::new()
-                    .user_agent(&format!("c-questdb-client/{VERSION}"))
+                    .user_agent(&format!("questdb/rust/{VERSION}"))
                     .no_delay(true);
                 let agent_builder = match configure_tls(&self.tls)? {
                     Some(tls_config) => agent_builder.tls_config(tls_config),
