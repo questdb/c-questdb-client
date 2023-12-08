@@ -2107,10 +2107,14 @@ fn parse_http_error(http_status_code: u16, response: ureq::Response) -> Error {
             "Could not flush buffer: HTTP endpoint does not support ILP."
         );
     } else if [401, 403].contains(&http_status_code) {
+        let description = match response.into_string() {
+            Ok(msg) if !msg.is_empty() => format!(": {}", msg),
+            _ => "".to_string(),
+        };
         return error::fmt!(
             AuthError,
-            "Could not flush buffer: HTTP endpoint authentication error: {} [code: {}]",
-            response.into_string().unwrap_or("".to_string()),
+            "Could not flush buffer: HTTP endpoint authentication error{} [code: {}]",
+            description,
             http_status_code
         );
     }
@@ -2175,7 +2179,7 @@ impl Sender {
                 ref auth,
             } => {
                 let request = agent
-                    .post(url)
+                    .get(url)
                     .set("Content-Type", "text/plain; charset=utf-8");
                 let request = match auth {
                     Some(auth) => request.set("Authorization", auth),
