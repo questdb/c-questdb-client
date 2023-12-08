@@ -2179,7 +2179,7 @@ impl Sender {
                 ref auth,
             } => {
                 let request = agent
-                    .get(url)
+                    .post(url)
                     .set("Content-Type", "text/plain; charset=utf-8");
                 let request = match auth {
                     Some(auth) => request.set("Authorization", auth),
