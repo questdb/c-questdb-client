@@ -22,8 +22,10 @@
  *
  ******************************************************************************/
 
+use std::time::Duration;
 use crate::ingress::{Buffer, SenderBuilder};
 use crate::ErrorCode;
+use crate::tests::mock::MockServer;
 
 use crate::tests::TestResult;
 
@@ -326,7 +328,34 @@ fn test_token_auth() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn test_timeout() -> TestResult {
+    let mut buffer = Buffer::new();
+    buffer
+        .table("test")?
+        .symbol("sym", "bol")?
+        .column_f64("x", 1.0)?
+        .at_now()?;
+
+    // Here we use a mock (tcp) server instead and don't send a response back.
+    let server = MockServer::new()?;
+
+    let grace = Duration::from_millis(50);
+    let time_start = std::time::Instant::now();
+    let mut sender = SenderBuilder::new(server.host, server.port)
+        .http()
+        .read_timeout(grace)
+        .connect()?;
+    let res = sender.flush_and_keep(&buffer);
+    let time_elapsed = time_start.elapsed();
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::SocketError);
+    assert!(err.msg().contains("timed out reading response"));
+    assert!(time_elapsed >= grace);
+    Ok(())
+}
+
 // TODO:
-//  * Test timeouts.
 //  * Test TLS.
-//  * Test compression.
+

@@ -545,6 +545,10 @@ enum ProtocolHandler {
         /// The content of the `Authorization` HTTP header.
         auth: Option<String>,
 
+        /// Additional grace period added to the timeout as calculated via `min_throughput_bps`.
+        timeout_grace_period: Duration,
+
+        /// Minimum throughput in bytes per second: Used to calculate the total request timeout.
         min_throughput_bps: u64,
     },
 }
@@ -1998,6 +2002,7 @@ impl SenderBuilder {
                     agent,
                     url,
                     auth,
+                    timeout_grace_period: self.read_timeout,
                     min_throughput_bps: self.min_throughput_bps,
                 }
             }
@@ -2255,12 +2260,12 @@ impl Sender {
                 ref agent,
                 ref url,
                 ref auth,
+                timeout_grace_period,
                 min_throughput_bps,
             } => {
-                let grace_period = Duration::from_secs(5);
                 let timeout =
                     Duration::from_secs_f64((bytes.len() as f64) / (min_throughput_bps as f64))
-                        + grace_period;
+                        + timeout_grace_period;
                 let request = agent
                     .post(url)
                     .query_pairs([("precision", "u")])
