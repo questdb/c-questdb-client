@@ -155,7 +155,7 @@ fn recv_port(port_receiver: &mut tokio::sync::oneshot::Receiver<u16>) -> anyhow:
 }
 
 pub struct TlsProxy {
-    runtime: tokio::runtime::Runtime,
+    _runtime: tokio::runtime::Runtime,
     loop_handle: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
     dest_port: u16,
     listen_port: u16,
@@ -172,7 +172,7 @@ impl TlsProxy {
             Some(runtime.spawn(async move { loop_server(dest_port, port_sender).await }));
         let listen_port = recv_port(&mut port_receiver)?;
         Ok(Self {
-            runtime,
+            _runtime: runtime,
             loop_handle,
             dest_port,
             listen_port,
@@ -183,9 +183,9 @@ impl TlsProxy {
         if self.loop_handle.is_none() {
             return Err(anyhow::anyhow!("TlsProxy already stopped"));
         }
-        self.runtime.block_on(async {
-            self.loop_handle.take().unwrap().await??;
-            Ok(())
+        let loop_handle = self.loop_handle.take().unwrap();
+        futures::executor::block_on(async {
+            loop_handle.await?
         })
     }
 
@@ -203,7 +203,7 @@ impl Drop for TlsProxy {
         if self.loop_handle.is_none() {
             return;
         }
-        self.runtime.block_on(async {
+        futures::executor::block_on(async {
             self.loop_handle.take().unwrap().abort();
         });
     }
