@@ -22,10 +22,10 @@
  *
  ******************************************************************************/
 
-use std::time::Duration;
 use crate::ingress::{Buffer, SenderBuilder};
-use crate::ErrorCode;
 use crate::tests::mock::MockServer;
+use crate::ErrorCode;
+use std::time::Duration;
 
 use crate::tests::TestResult;
 
@@ -358,4 +358,3 @@ fn test_timeout() -> TestResult {
 
 // TODO:
 //  * Test TLS.
-
