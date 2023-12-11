@@ -198,9 +198,9 @@ use base64ct::{Base64, Base64UrlUnpadded, Encoding};
 use ring::rand::SystemRandom;
 use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
 use rustls::{ClientConnection, OwnedTrustAnchor, RootCertStore, ServerName, StreamOwned};
-use serde_json::Value;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
+#[cfg(feature = "ilp-over-http")]
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Copy, Clone)]
@@ -1310,12 +1310,14 @@ struct EcdsaAuthParams {
     pub_key_y: String,
 }
 
+#[cfg(feature = "ilp-over-http")]
 #[derive(Debug, Clone)]
 struct BasicAuthParams {
     username: String,
     password: String,
 }
 
+#[cfg(feature = "ilp-over-http")]
 impl BasicAuthParams {
     fn to_header_string(&self) -> String {
         let pair = format!("{}:{}", self.username, self.password);
@@ -1324,10 +1326,34 @@ impl BasicAuthParams {
     }
 }
 
+#[cfg(feature = "ilp-over-http")]
+#[derive(Debug, Clone)]
+struct TokenAuthParams {
+    token: String,
+}
+
+#[cfg(feature = "ilp-over-http")]
+impl TokenAuthParams {
+    fn to_header_string(&self) -> Result<String> {
+        if self.token.contains('\n') {
+            return Err(error::fmt!(
+                AuthError,
+                "Bad auth token: Should not contain new-line char."
+            ));
+        }
+        Ok(format!("Bearer {}", self.token))
+    }
+}
+
 #[derive(Debug, Clone)]
 enum AuthParams {
     Ecdsa(EcdsaAuthParams),
+
+    #[cfg(feature = "ilp-over-http")]
     Basic(BasicAuthParams),
+
+    #[cfg(feature = "ilp-over-http")]
+    Token(TokenAuthParams),
 }
 
 /// Root used to determine how to validate the server's TLS certificate.
@@ -1587,6 +1613,8 @@ pub struct SenderBuilder {
     auth: Option<AuthParams>,
     tls: Tls,
     protocol: SenderProtocol,
+
+    #[cfg(feature = "ilp-over-http")]
     min_throughput_bps: u64,
 }
 
@@ -1612,6 +1640,8 @@ impl SenderBuilder {
             auth: None,
             tls: Tls::Disabled,
             protocol: SenderProtocol::IlpOverTcp,
+
+            #[cfg(feature = "ilp-over-http")]
             min_throughput_bps: 102400, // 100 KiB/s
         }
     }
@@ -1689,7 +1719,8 @@ impl SenderBuilder {
     /// Basic Authentication Parameters for ILP over HTTP.
     /// For TCP, use [`auth`](SenderBuilder::auth).
     ///
-    /// If not called, authentication is disabled for ILP over HTTP.
+    /// For HTTP you can also use [`token_auth`](SenderBuilder::token_auth).
+    #[cfg(feature = "ilp-over-http")]
     pub fn basic_auth<A, B>(mut self, username: A, password: B) -> Self
     where
         A: Into<String>,
@@ -1699,6 +1730,20 @@ impl SenderBuilder {
             username: username.into(),
             password: password.into(),
         }));
+        self
+    }
+
+    /// Tokene (Bearer) Authentication Parameters for ILP over HTTP.
+    /// For TCP, use [`auth`](SenderBuilder::auth).
+    ///
+    /// For HTTP you can also use [`basic_auth`](SenderBuilder::basic_auth).
+    #[cfg(feature = "ilp-over-http")]
+    pub fn token_auth<A>(mut self, token: A) -> Self
+    where
+        A: Into<String>,
+    {
+        let token: String = token.into();
+        self.auth = Some(AuthParams::Token(TokenAuthParams { token }));
         self
     }
 
@@ -1794,11 +1839,11 @@ impl SenderBuilder {
         self
     }
 
-    #[cfg(feature = "ilp-over-http")]
     /// Minimum expected throughput in bytes per second for HTTP requests.
     /// If the throughput is lower than this value, the connection will time out.
     /// The default is 100 KiB/s.
     /// The value is expressed as a number of bytes per second.
+    #[cfg(feature = "ilp-over-http")]
     pub fn min_throughput_bps(mut self, value: u64) -> Self {
         self.min_throughput_bps = value;
         self
@@ -1927,7 +1972,12 @@ impl SenderBuilder {
                     None => agent_builder,
                 };
                 let auth = match self.auth.clone() {
+                    #[cfg(feature = "ilp-over-http")]
                     Some(AuthParams::Basic(auth)) => Some(auth.to_header_string()),
+
+                    #[cfg(feature = "ilp-over-http")]
+                    Some(AuthParams::Token(auth)) => Some(auth.to_header_string()?),
+
                     Some(AuthParams::Ecdsa(_)) => {
                         return Err(error::fmt!(
                             AuthError,
@@ -1970,10 +2020,21 @@ impl SenderBuilder {
                     AuthParams::Ecdsa(auth) => {
                         conn.authenticate(auth)?;
                     }
+
+                    #[cfg(feature = "ilp-over-http")]
                     AuthParams::Basic(_auth) => {
                         return Err(error::fmt!(
                             AuthError,
                             "Basic authentication is not supported for ILP over TCP. \
+                            Please use ECDSA authentication instead."
+                        ));
+                    }
+
+                    #[cfg(feature = "ilp-over-http")]
+                    AuthParams::Token(_auth) => {
+                        return Err(error::fmt!(
+                            AuthError,
+                            "Token authentication is not supported for ILP over TCP. \
                             Please use ECDSA authentication instead."
                         ));
                     }
@@ -2075,7 +2136,7 @@ impl F64Serializer {
 }
 
 #[cfg(feature = "ilp-over-http")]
-fn parse_json_error(json: &Value, msg: &str) -> Error {
+fn parse_json_error(json: &serde_json::Value, msg: &str) -> Error {
     let mut description = msg.to_string();
     error::fmt!(ServerFlushError, "Could not flush buffer: {}", msg);
 
@@ -2154,7 +2215,7 @@ fn parse_http_error(http_status_code: u16, response: ureq::Response) -> Error {
                 }
             };
 
-            return if let Some(Value::String(ref msg)) = json.get("message") {
+            return if let Some(serde_json::Value::String(ref msg)) = json.get("message") {
                 parse_json_error(&json, msg)
             } else {
                 string_err()
