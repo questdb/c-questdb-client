@@ -759,6 +759,19 @@ namespace questdb::ingress
             }
 
             /**
+             * Token (Bearer) Authentication Parameters for ILP over HTTP.
+             *
+             * @param[in] token Token.
+             */
+            opts& token_auth(utf8_view token) noexcept
+            {
+                ::line_sender_opts_token_auth(
+                        _impl,
+                        token._impl);
+                return *this;
+            }
+
+            /**
              * Enable ILP over HTTP.
              */
             opts& http() noexcept

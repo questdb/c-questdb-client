@@ -45,7 +45,7 @@ chrono = "0.4.31"
 mockito = "1.2.0"
 
 [features]
-default = ["tls-webpki-certs"]  #, "ilp-over-http"]
+default = ["tls-webpki-certs"]
 
 # Include support for ILP over HTTP.
 ilp-over-http = ["dep:ureq", "dep:serde_json"]
