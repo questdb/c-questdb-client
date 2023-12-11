@@ -299,6 +299,33 @@ fn test_unauthenticated() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn test_token_auth() -> TestResult {
+    let mut buffer = Buffer::new();
+    buffer
+        .table("test")?
+        .symbol("sym", "bol")?
+        .column_f64("x", 1.0)?
+        .at_now()?;
+
+    let mut server = mockito::Server::new();
+    server
+        .mock("POST", "/write?precision=u")
+        .match_header("Authorization", "Bearer 1234567890")
+        .with_status(204)
+        .with_header("content-type", "text/plain")
+        .match_body(buffer.as_str())
+        .create();
+
+    let mut sender = SenderBuilder::new(server.host(), server.port())
+        .http()
+        .token_auth("1234567890")
+        .connect()?;
+    sender.flush_and_keep(&buffer)?;
+
+    Ok(())
+}
+
 // TODO:
 //  * Test timeouts.
 //  * Test TLS.
