@@ -54,6 +54,10 @@ fn test_two_lines() -> TestResult {
         let req = server.recv_http_q()?;
         assert_eq!(req.method(), "POST");
         assert_eq!(req.path(), "/write?precision=u");
+        assert_eq!(
+            req.header("user-agent"),
+            Some(concat!("questdb/rust/", env!("CARGO_PKG_VERSION")))
+        );
         assert_eq!(req.body_str().unwrap(), buffer2.as_str());
 
         server.send_http_response_q(HttpResponse::empty())?;
@@ -463,6 +467,45 @@ fn test_tls() -> TestResult {
         let req = server.recv_http_q()?;
         assert_eq!(req.method(), "POST");
         assert_eq!(req.path(), "/write?precision=u");
+        assert_eq!(req.body_str().unwrap(), buffer2.as_str());
+
+        server.send_http_response_q(HttpResponse::empty())?;
+
+        Ok(())
+    });
+
+    let res = sender.flush_and_keep(&buffer);
+
+    server_thread.join().unwrap()?;
+
+    // Unpacking the error here allows server errors to bubble first.
+    res?;
+
+    Ok(())
+}
+
+#[test]
+fn test_user_agent() -> TestResult {
+    let mut buffer = Buffer::new();
+    buffer
+        .table("test")?
+        .symbol("t1", "v1")?
+        .column_f64("f1", 0.5)?
+        .at(TimestampNanos::new(10000000))?;
+    let buffer2 = buffer.clone();
+
+    let mut server = MockServer::new()?;
+    let mut sender = server
+        .lsb()
+        .http()
+        .user_agent("wallabies/1.2.99")
+        .connect()?;
+
+    let server_thread = std::thread::spawn(move || -> io::Result<()> {
+        server.accept()?;
+
+        let req = server.recv_http_q()?;
+        assert_eq!(req.header("user-agent"), Some("wallabies/1.2.99"));
         assert_eq!(req.body_str().unwrap(), buffer2.as_str());
 
         server.send_http_response_q(HttpResponse::empty())?;

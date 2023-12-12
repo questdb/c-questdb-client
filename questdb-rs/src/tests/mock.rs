@@ -134,7 +134,7 @@ impl HttpRequest {
     }
 
     pub fn body_str(&self) -> Result<&str, std::str::Utf8Error> {
-        std::str::from_utf8(&self.body())
+        std::str::from_utf8(self.body())
     }
 }
 
@@ -197,13 +197,13 @@ impl HttpResponse {
         self.with_body_str(&body.to_string())
     }
 
-    pub fn to_string(&self) -> String {
+    pub fn as_string(&self) -> String {
         let mut s = format!("HTTP/1.1 {} {}\r\n", self.status_code, self.status_text);
         for (key, value) in &self.headers {
             s.push_str(&format!("{}: {}\r\n", key, value));
         }
         s.push_str("\r\n");
-        s.push_str(&std::str::from_utf8(&self.body).unwrap());
+        s.push_str(std::str::from_utf8(&self.body).unwrap());
         s
     }
 }
@@ -296,7 +296,7 @@ impl MockServer {
     {
         // To ensure a clean death if accept wasn't called.
         self.client.as_ref().unwrap();
-        let timeout = wait_timeout_sec.map(|sec| Duration::from_secs_f64(sec));
+        let timeout = wait_timeout_sec.map(Duration::from_secs_f64);
         self.poll.poll(&mut self.events, timeout)?;
         let ready_for_read = self.events.iter().any(event_predicate);
         Ok(ready_for_read)
@@ -472,7 +472,7 @@ impl MockServer {
         response: HttpResponse,
         timeout_sec: Option<f64>,
     ) -> io::Result<()> {
-        self.do_write_all(&response.to_string().as_bytes(), timeout_sec)?;
+        self.do_write_all(response.as_string().as_bytes(), timeout_sec)?;
         Ok(())
     }
 

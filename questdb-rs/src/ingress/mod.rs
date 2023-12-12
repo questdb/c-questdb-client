@@ -192,6 +192,7 @@ use std::convert::{Infallible, TryFrom, TryInto};
 use std::fmt::{Formatter, Write};
 use std::io::{self, BufRead, BufReader, ErrorKind, Write as IoWrite};
 use std::path::PathBuf;
+use std::string::ToString;
 use std::sync::Arc;
 
 use base64ct::{Base64, Base64UrlUnpadded, Encoding};
@@ -199,9 +200,6 @@ use ring::rand::SystemRandom;
 use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
 use rustls::{ClientConnection, OwnedTrustAnchor, RootCertStore, ServerName, StreamOwned};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
-
-#[cfg(feature = "ilp-over-http")]
-const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Copy, Clone)]
 enum Op {
@@ -1620,6 +1618,9 @@ pub struct SenderBuilder {
 
     #[cfg(feature = "ilp-over-http")]
     min_throughput_bps: u64,
+
+    #[cfg(feature = "ilp-over-http")]
+    http_user_agent: Option<String>,
 }
 
 impl SenderBuilder {
@@ -1647,6 +1648,9 @@ impl SenderBuilder {
 
             #[cfg(feature = "ilp-over-http")]
             min_throughput_bps: 102400, // 100 KiB/s
+
+            #[cfg(feature = "ilp-over-http")]
+            http_user_agent: None,
         }
     }
 
@@ -1843,6 +1847,19 @@ impl SenderBuilder {
         self
     }
 
+    /// Internal API, do not use.
+    /// This is exposed exclusively for the Python client.
+    /// We (QuestDB) use this to help us debug which client is being used if we encounter issues.
+    #[cfg(feature = "ilp-over-http")]
+    #[doc(hidden)]
+    pub fn user_agent(mut self, value: &str) -> Self {
+        if value.contains('\n') {
+            panic!("User agent should not contain new-line char.");
+        }
+        self.http_user_agent = Some(value.to_string());
+        self
+    }
+
     /// Minimum expected throughput in bytes per second for HTTP requests.
     /// If the throughput is lower than this value, the connection will time out.
     /// The default is 100 KiB/s.
@@ -1968,8 +1985,12 @@ impl SenderBuilder {
                     ));
                 }
 
+                let user_agent = self
+                    .http_user_agent
+                    .as_deref()
+                    .unwrap_or(concat!("questdb/rust/", env!("CARGO_PKG_VERSION")));
                 let agent_builder = ureq::AgentBuilder::new()
-                    .user_agent(&format!("questdb/rust/{VERSION}"))
+                    .user_agent(user_agent)
                     .no_delay(true);
                 let agent_builder = match configure_tls(&self.tls)? {
                     Some(tls_config) => agent_builder.tls_config(tls_config),
@@ -2248,6 +2269,9 @@ impl Sender {
         }
         buf.check_state(Op::Flush)?;
         let bytes = buf.as_str().as_bytes();
+        if bytes.is_empty() {
+            return Ok(());
+        }
         match self.handler {
             ProtocolHandler::Socket(ref mut conn) => {
                 conn.write_all(bytes).map_err(|io_err| {

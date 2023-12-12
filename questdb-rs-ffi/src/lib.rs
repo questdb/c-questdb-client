@@ -502,6 +502,16 @@ pub unsafe extern "C" fn line_sender_opts_http(opts: *mut line_sender_opts) {
     upd_opts!(opts, http);
 }
 
+/// Set the HTTP user agent. Internal API. Do not use.
+#[doc(hidden)]
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_user_agent(
+    opts: *mut line_sender_opts,
+    user_agent: line_sender_utf8,
+) {
+    upd_opts!(opts, user_agent, user_agent.as_str());
+}
+
 /// Enable full connection encryption via TLS.
 /// The connection will accept certificates by well-known certificate
 /// authorities as per the "webpki-roots" Rust crate.
