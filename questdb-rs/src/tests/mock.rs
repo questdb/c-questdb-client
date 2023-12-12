@@ -554,7 +554,7 @@ impl MockServer {
     }
 
     pub fn recv_q(&mut self) -> io::Result<usize> {
-        self.recv(0.1)
+        self.recv(1.0)
     }
 
     pub fn lsb(&self) -> SenderBuilder {
