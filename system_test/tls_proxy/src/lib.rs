@@ -184,9 +184,7 @@ impl TlsProxy {
             return Err(anyhow::anyhow!("TlsProxy already stopped"));
         }
         let loop_handle = self.loop_handle.take().unwrap();
-        futures::executor::block_on(async {
-            loop_handle.await?
-        })
+        futures::executor::block_on(async { loop_handle.await? })
     }
 
     pub fn dest_port(&self) -> u16 {
