@@ -25,6 +25,7 @@
 use crate::ingress::SenderBuilder;
 
 use core::time::Duration;
+use mio::event::Event;
 use mio::net::TcpStream;
 use mio::{Events, Interest, Poll, Token};
 use rustls::{
@@ -32,14 +33,13 @@ use rustls::{
     Certificate, ServerConfig, Stream,
 };
 use socket2::{Domain, Protocol, Socket, Type};
-use std::collections::HashMap;
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, BufReader, Read};
 use std::net::SocketAddr;
 use std::path::Path;
-use std::str::Utf8Error;
 use std::sync::Arc;
-use std::time::Instant;
-use mio::event::Event;
+
+#[cfg(feature = "ilp-over-http")]
+use std::io::Write;
 
 const CLIENT: Token = Token(0);
 
@@ -111,7 +111,7 @@ fn tls_config() -> Arc<ServerConfig> {
 pub struct HttpRequest {
     method: String,
     path: String,
-    headers: HashMap<String, String>,
+    headers: std::collections::HashMap<String, String>,
     body: Vec<u8>,
 }
 
@@ -133,8 +133,8 @@ impl HttpRequest {
         &self.body
     }
 
-    pub fn body_str(&self) -> Result<&str, Utf8Error> {
-        std::str::from_utf8(&self.body)
+    pub fn body_str(&self) -> Result<&str, std::str::Utf8Error> {
+        std::str::from_utf8(&self.body())
     }
 }
 
@@ -142,7 +142,7 @@ impl HttpRequest {
 pub struct HttpResponse {
     status_code: u16,
     status_text: String,
-    headers: HashMap<String, String>,
+    headers: std::collections::HashMap<String, String>,
     body: Vec<u8>,
 }
 
@@ -152,7 +152,7 @@ impl HttpResponse {
         HttpResponse {
             status_code: 204,
             status_text: "No Content".to_string(),
-            headers: HashMap::new(),
+            headers: std::collections::HashMap::new(),
             body: Vec::new(),
         }
     }
@@ -175,16 +175,25 @@ impl HttpResponse {
             self.status_text = "OK".to_string();
         }
         if !self.headers.contains_key("content-length") {
-            self.headers.insert("content-length".to_string(), self.body.len().to_string());
+            self.headers
+                .insert("content-length".to_string(), self.body.len().to_string());
         }
         self
     }
 
     pub fn with_body_str(mut self, body: &str) -> Self {
+        if !self.headers.contains_key("content-type") {
+            self.headers
+                .insert("content-type".to_string(), "text/plain".to_string());
+        }
         self.with_body(body.as_bytes())
     }
 
     pub fn with_body_json(mut self, body: &serde_json::Value) -> Self {
+        if !self.headers.contains_key("content-type") {
+            self.headers
+                .insert("content-type".to_string(), "application/json".to_string());
+        }
         self.with_body_str(&body.to_string())
     }
 
@@ -201,12 +210,16 @@ impl HttpResponse {
 
 #[cfg(feature = "ilp-over-http")]
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack.windows(needle.len()).any(|window| window == needle)
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 #[cfg(feature = "ilp-over-http")]
 fn position(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|window| window == needle)
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 impl MockServer {
@@ -233,9 +246,11 @@ impl MockServer {
         client.set_nonblocking(true)?;
         let client: std::net::TcpStream = client.into();
         let mut client = TcpStream::from_std(client);
-        self.poll
-            .registry()
-            .register(&mut client, CLIENT, Interest::READABLE | Interest::WRITABLE)?;
+        self.poll.registry().register(
+            &mut client,
+            CLIENT,
+            Interest::READABLE | Interest::WRITABLE,
+        )?;
         self.client = Some(client);
         Ok(())
     }
@@ -243,9 +258,6 @@ impl MockServer {
     pub fn accept_tls_sync(&mut self) -> io::Result<()> {
         self.accept()?;
         let client = self.client.as_mut().unwrap();
-        self.poll
-            .registry()
-            .reregister(client, CLIENT, Interest::READABLE | Interest::WRITABLE)?;
         let mut tls_conn = ServerConnection::new(tls_config()).unwrap();
         let mut stream = Stream::new(&mut tls_conn, client);
         let begin = std::time::Instant::now();
@@ -267,9 +279,6 @@ impl MockServer {
                 }
             }
         }
-        self.poll
-            .registry()
-            .reregister(client, CLIENT, Interest::READABLE)?;
         self.tls_conn = Some(tls_conn);
         Ok(())
     }
@@ -282,8 +291,8 @@ impl MockServer {
     }
 
     fn wait_for<P>(&mut self, wait_timeout_sec: Option<f64>, event_predicate: P) -> io::Result<bool>
-        where
-            P: FnMut(&Event) -> bool,
+    where
+        P: FnMut(&Event) -> bool,
     {
         // To ensure a clean death if accept wasn't called.
         self.client.as_ref().unwrap();
@@ -297,6 +306,7 @@ impl MockServer {
         self.wait_for(wait_timeout_sec, |event| event.is_readable())
     }
 
+    #[cfg(feature = "ilp-over-http")]
     pub fn wait_for_send(&mut self, wait_timeout_sec: Option<f64>) -> io::Result<bool> {
         self.wait_for(wait_timeout_sec, |event| event.is_writable())
     }
@@ -311,6 +321,7 @@ impl MockServer {
         }
     }
 
+    #[cfg(feature = "ilp-over-http")]
     fn do_write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let client = self.client.as_mut().unwrap();
         if let Some(tls_conn) = self.tls_conn.as_mut() {
@@ -321,36 +332,52 @@ impl MockServer {
         }
     }
 
+    #[cfg(feature = "ilp-over-http")]
     fn do_write_all(&mut self, buf: &[u8], timeout_sec: Option<f64>) -> io::Result<()> {
-        let deadline = timeout_sec.map(|sec| Instant::now() + Duration::from_secs_f64(sec));
+        let deadline =
+            timeout_sec.map(|sec| std::time::Instant::now() + Duration::from_secs_f64(sec));
         let mut pos = 0usize;
-        while pos < buf.len() {
+        loop {
+            // `self.poll` is edge-triggered, so we need to write first
+            // until we get an EAGAIN, then wait for the socket to become writable again.
+            match self.do_write(&buf[pos..]) {
+                Ok(count) => pos += count,
+                Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => (),
+                Err(err) => return Err(err),
+            }
+
+            if pos == buf.len() {
+                break;
+            }
+
             let timeout = match deadline {
-                Some(deadline) => Some(deadline
-                    .checked_duration_since(Instant::now())
-                    .map(|d| d.as_secs_f64())
-                    .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "Timed out while waiting for send",
-                        )
-                    })?),
+                Some(deadline) => Some(
+                    deadline
+                        .checked_duration_since(std::time::Instant::now())
+                        .map(|d| d.as_secs_f64())
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "Timed out while waiting for send",
+                            )
+                        })?,
+                ),
                 None => None,
             };
-            let ready = !self.wait_for_send(timeout)?;
-            if !ready {
-                continue;
-            }
-            let count = self.do_write(&buf[pos..])?;
-            pos += count;
+            let _ = !self.wait_for_send(timeout)?;
         }
         Ok(())
     }
 
     #[cfg(feature = "ilp-over-http")]
-    fn read_more(&mut self, accum: &mut Vec<u8>, deadline: Instant, stage: &str) -> io::Result<()> {
+    fn read_more(
+        &mut self,
+        accum: &mut Vec<u8>,
+        deadline: std::time::Instant,
+        stage: &str,
+    ) -> io::Result<()> {
         let wait_timeout_sec = match deadline
-            .checked_duration_since(Instant::now())
+            .checked_duration_since(std::time::Instant::now())
             .map(|d| d.as_secs_f64())
         {
             Some(wait_timeout_sec) => wait_timeout_sec,
@@ -364,10 +391,9 @@ impl MockServer {
                     io::ErrorKind::TimedOut,
                     format!(
                         "{} timed out while waiting for data. Received so far: {}",
-                        stage,
-                        so_far
+                        stage, so_far
                     ),
-                ))
+                ));
             }
         };
 
@@ -386,7 +412,7 @@ impl MockServer {
     fn recv_http_method(
         &mut self,
         accum: &mut Vec<u8>,
-        deadline: Instant,
+        deadline: std::time::Instant,
     ) -> io::Result<(usize, String, String)> {
         let end_of_line_separator = b"\r\n";
         while !contains(&accum[..], end_of_line_separator) {
@@ -416,9 +442,9 @@ impl MockServer {
         &mut self,
         pos: usize,
         accum: &mut Vec<u8>,
-        deadline: Instant,
-    ) -> io::Result<(usize, HashMap<String, String>)> {
-        let mut headers = HashMap::<String, String>::new();
+        deadline: std::time::Instant,
+    ) -> io::Result<(usize, std::collections::HashMap<String, String>)> {
+        let mut headers = std::collections::HashMap::<String, String>::new();
 
         let header_section_sep = b"\r\n\r\n";
         while !contains(&accum[pos..], header_section_sep) {
@@ -441,20 +467,24 @@ impl MockServer {
     }
 
     #[cfg(feature = "ilp-over-http")]
-    pub fn send_http_response(&mut self, response: HttpResponse, timeout_sec: Option<f64>) -> io::Result<()> {
+    pub fn send_http_response(
+        &mut self,
+        response: HttpResponse,
+        timeout_sec: Option<f64>,
+    ) -> io::Result<()> {
         self.do_write_all(&response.to_string().as_bytes(), timeout_sec)?;
         Ok(())
     }
 
     #[cfg(feature = "ilp-over-http")]
     pub fn send_http_response_q(&mut self, response: HttpResponse) -> io::Result<()> {
-        self.send_http_response(response, Some(1.0))
+        self.send_http_response(response, Some(5.0))
     }
 
     #[cfg(feature = "ilp-over-http")]
     pub fn recv_http(&mut self, wait_timeout_sec: f64) -> io::Result<HttpRequest> {
         let mut accum = Vec::<u8>::new();
-        let deadline = Instant::now() + Duration::from_secs_f64(wait_timeout_sec);
+        let deadline = std::time::Instant::now() + Duration::from_secs_f64(wait_timeout_sec);
         let (pos, method, path) = self.recv_http_method(&mut accum, deadline)?;
         let (pos, headers) = self.recv_http_headers(pos, &mut accum, deadline)?;
         let content_length = headers
@@ -478,7 +508,7 @@ impl MockServer {
 
     #[cfg(feature = "ilp-over-http")]
     pub fn recv_http_q(&mut self) -> io::Result<HttpRequest> {
-        self.recv_http(1.0)
+        self.recv_http(5.0)
     }
 
     pub fn recv(&mut self, wait_timeout_sec: f64) -> io::Result<usize> {

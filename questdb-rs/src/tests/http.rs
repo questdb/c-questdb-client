@@ -30,26 +30,6 @@ use std::time::Duration;
 
 use crate::tests::TestResult;
 
-trait MockitoServerExt {
-    fn host(&self) -> &str;
-    fn port(&self) -> u16;
-}
-
-impl MockitoServerExt for mockito::Server {
-    fn host(&self) -> &str {
-        "127.0.0.1"
-    }
-
-    fn port(&self) -> u16 {
-        self.host_with_port()
-            .split(':')
-            .nth(1)
-            .unwrap()
-            .parse()
-            .unwrap()
-    }
-}
-
 #[test]
 fn test_two_lines() -> TestResult {
     let mut buffer = Buffer::new();
@@ -63,19 +43,31 @@ fn test_two_lines() -> TestResult {
         .symbol("sym", "bol")?
         .column_f64("x", 2.0)?
         .at_now()?;
+    let buffer2 = buffer.clone();
 
-    let mut server = mockito::Server::new();
-    server
-        .mock("POST", "/write?precision=u")
-        .with_status(204)
-        .with_header("content-type", "text/plain")
-        .match_body(buffer.as_str())
-        .create();
+    let mut server = MockServer::new()?;
+    let mut sender = server.lsb().http().connect()?;
 
-    let mut sender = SenderBuilder::new(server.host(), server.port())
-        .http()
-        .connect()?;
-    sender.flush_and_keep(&buffer)?;
+    let server_thread = std::thread::spawn(move || -> io::Result<()> {
+        server.accept()?;
+
+        let req = server.recv_http_q()?;
+        assert_eq!(req.method(), "POST");
+        assert_eq!(req.path(), "/write?precision=u");
+        assert_eq!(req.body_str().unwrap(), buffer2.as_str());
+
+        server.send_http_response_q(HttpResponse::empty())?;
+
+        Ok(())
+    });
+
+    let res = sender.flush(&mut buffer);
+
+    server_thread.join().unwrap()?;
+
+    res?;
+
+    assert!(buffer.is_empty());
 
     Ok(())
 }
@@ -90,23 +82,38 @@ fn test_text_plain_error() -> TestResult {
         .at_now()?;
     buffer.table("test")?.column_f64("sym", 2.0)?.at_now()?;
 
-    let mut server = mockito::Server::new();
-    server
-        .mock("POST", "/write?precision=u")
-        .with_status(500)
-        .with_header("content-type", "text/plain")
-        .with_body("too many connections")
-        .match_body(buffer.as_str())
-        .create();
+    let mut server = MockServer::new()?;
+    let mut sender = server.lsb().http().connect()?;
 
-    let mut sender = SenderBuilder::new(server.host(), server.port())
-        .http()
-        .connect()?;
-    let res = sender.flush_and_keep(&buffer);
+    let buffer2 = buffer.clone();
+    let server_thread = std::thread::spawn(move || -> io::Result<()> {
+        server.accept()?;
+
+        let req = server.recv_http_q()?;
+        assert_eq!(req.method(), "POST");
+        assert_eq!(req.path(), "/write?precision=u");
+        assert_eq!(req.body_str().unwrap(), buffer2.as_str());
+
+        server.send_http_response_q(
+            HttpResponse::empty()
+                .with_status(500, "Internal Server Error")
+                .with_header("content-type", "text/plain")
+                .with_body_str("too many connections"),
+        )?;
+
+        Ok(())
+    });
+
+    let res = sender.flush(&mut buffer);
+
+    server_thread.join().unwrap()?;
+
     assert!(res.is_err());
     let err = res.unwrap_err();
     assert_eq!(err.code(), ErrorCode::ServerFlushError);
     assert_eq!(err.msg(), "Could not flush buffer: too many connections");
+
+    assert!(!buffer.is_empty());
 
     Ok(())
 }
@@ -121,19 +128,33 @@ fn test_bad_json_error() -> TestResult {
         .at_now()?;
     buffer.table("test")?.column_f64("sym", 2.0)?.at_now()?;
 
-    let mut server = mockito::Server::new();
-    server
-        .mock("POST", "/write?precision=u")
-        .with_status(500)
-        .with_header("content-type", "application/json")
-        .with_body("{\"error\":\"too many connections\"}")
-        .match_body(buffer.as_str())
-        .create();
+    let mut server = MockServer::new()?;
+    let mut sender = server.lsb().http().connect()?;
 
-    let mut sender = SenderBuilder::new(server.host(), server.port())
-        .http()
-        .connect()?;
+    let buffer2 = buffer.clone();
+    let server_thread = std::thread::spawn(move || -> io::Result<()> {
+        server.accept()?;
+
+        let req = server.recv_http_q()?;
+        assert_eq!(req.method(), "POST");
+        assert_eq!(req.path(), "/write?precision=u");
+        assert_eq!(req.body_str().unwrap(), buffer2.as_str());
+
+        server.send_http_response_q(
+            HttpResponse::empty()
+                .with_status(500, "Internal Server Error")
+                .with_body_json(&serde_json::json!({
+                    "error": "too many connections",
+                })),
+        )?;
+
+        Ok(())
+    });
+
     let res = sender.flush_and_keep(&buffer);
+
+    server_thread.join().unwrap()?;
+
     assert!(res.is_err());
     let err = res.unwrap_err();
     assert_eq!(err.code(), ErrorCode::ServerFlushError);
@@ -155,26 +176,36 @@ fn test_json_error() -> TestResult {
         .at_now()?;
     buffer.table("test")?.column_f64("sym", 2.0)?.at_now()?;
 
-    let mut server = mockito::Server::new();
-    server
-        .mock("POST", "/write?precision=u")
-        .with_status(400)
-        .with_header("content-type", "application/json")
-        .with_body(concat!(
-            "{",
-            "\"code\":\"invalid\",",
-            "\"message\":\"failed to parse line protocol: invalid field format\",",
-            "\"errorId\":\"ABC-2\",",
-            "\"line\":2",
-            "}"
-        ))
-        .match_body(buffer.as_str())
-        .create();
+    let mut server = MockServer::new()?;
+    let mut sender = server.lsb().http().connect()?;
 
-    let mut sender = SenderBuilder::new(server.host(), server.port())
-        .http()
-        .connect()?;
+    let buffer2 = buffer.clone();
+    let server_thread = std::thread::spawn(move || -> io::Result<()> {
+        server.accept()?;
+
+        let req = server.recv_http_q()?;
+        assert_eq!(req.method(), "POST");
+        assert_eq!(req.path(), "/write?precision=u");
+        assert_eq!(req.body_str().unwrap(), buffer2.as_str());
+
+        server.send_http_response_q(
+            HttpResponse::empty()
+                .with_status(400, "Bad Request")
+                .with_body_json(&serde_json::json!({
+                    "code": "invalid",
+                    "message": "failed to parse line protocol: invalid field format",
+                    "errorId": "ABC-2",
+                    "line": 2,
+                })),
+        )?;
+
+        Ok(())
+    });
+
     let res = sender.flush_and_keep(&buffer);
+
+    server_thread.join().unwrap()?;
+
     assert!(res.is_err());
     let err = res.unwrap_err();
     assert_eq!(err.code(), ErrorCode::ServerFlushError);
@@ -215,19 +246,32 @@ fn test_old_server_without_ilp_http_support() -> TestResult {
         .column_f64("x", 1.0)?
         .at_now()?;
 
-    let mut server = mockito::Server::new();
-    server
-        .mock("POST", "/write?precision=u")
-        .with_status(404)
-        .with_header("content-type", "text/plain")
-        .with_body("Not Found")
-        .match_body(buffer.as_str())
-        .create();
+    let mut server = MockServer::new()?;
+    let mut sender = server.lsb().http().connect()?;
 
-    let mut sender = SenderBuilder::new(server.host(), server.port())
-        .http()
-        .connect()?;
+    let buffer2 = buffer.clone();
+    let server_thread = std::thread::spawn(move || -> io::Result<()> {
+        server.accept()?;
+
+        let req = server.recv_http_q()?;
+        assert_eq!(req.method(), "POST");
+        assert_eq!(req.path(), "/write?precision=u");
+        assert_eq!(req.body_str().unwrap(), buffer2.as_str());
+
+        server.send_http_response_q(
+            HttpResponse::empty()
+                .with_status(404, "Not Found")
+                .with_header("content-type", "text/plain")
+                .with_body_str("Not Found"),
+        )?;
+
+        Ok(())
+    });
+
     let res = sender.flush_and_keep(&buffer);
+
+    server_thread.join().unwrap()?;
+
     assert!(res.is_err());
     let err = res.unwrap_err();
     assert_eq!(err.code(), ErrorCode::HttpNotSupported);
@@ -240,7 +284,7 @@ fn test_old_server_without_ilp_http_support() -> TestResult {
 }
 
 #[test]
-fn test_http_auth() -> TestResult {
+fn test_http_basic_auth() -> TestResult {
     let mut buffer = Buffer::new();
     buffer
         .table("test")?
@@ -248,27 +292,44 @@ fn test_http_auth() -> TestResult {
         .column_f64("x", 1.0)?
         .at_now()?;
 
-    let mut server = mockito::Server::new();
-    server
-        .mock("POST", "/write?precision=u")
-        .match_header("Authorization", "Basic QWxhZGRpbjpPcGVuU2VzYW1l")
-        .with_status(204)
-        .with_header("content-type", "text/plain")
-        .match_body(buffer.as_str())
-        .create();
-
-    let mut sender = SenderBuilder::new(server.host(), server.port())
+    let mut server = MockServer::new()?;
+    let mut sender = server
+        .lsb()
         .http()
         .basic_auth("Aladdin", "OpenSesame")
         .connect()?;
-    sender.flush_and_keep(&buffer)?;
+
+    let buffer2 = buffer.clone();
+    let server_thread = std::thread::spawn(move || -> io::Result<()> {
+        server.accept()?;
+
+        let req = server.recv_http_q()?;
+        assert_eq!(req.method(), "POST");
+        assert_eq!(req.path(), "/write?precision=u");
+        assert_eq!(
+            req.header("authorization"),
+            Some("Basic QWxhZGRpbjpPcGVuU2VzYW1l")
+        );
+        assert_eq!(req.body_str().unwrap(), buffer2.as_str());
+
+        server.send_http_response_q(HttpResponse::empty())?;
+
+        Ok(())
+    });
+
+    let res = sender.flush(&mut buffer);
+
+    server_thread.join().unwrap()?;
+
+    res?;
+
+    assert!(buffer.is_empty());
 
     Ok(())
 }
 
 #[test]
 fn test_unauthenticated() -> TestResult {
-    // WWW-Authenticate: Basic realm="Our Site"
     let mut buffer = Buffer::new();
     buffer
         .table("test")?
@@ -276,21 +337,32 @@ fn test_unauthenticated() -> TestResult {
         .column_f64("x", 1.0)?
         .at_now()?;
 
-    let mut server = mockito::Server::new();
-    server
-        .mock("POST", "/write?precision=u")
-        .with_status(401)
-        .with_header("content-type", "text/plain")
-        .with_header("WWW-Authenticate", "Basic realm=\"Our Site\"")
-        .with_body("Unauthorized")
-        .match_body(buffer.as_str())
-        .create();
+    let mut server = MockServer::new()?;
+    let mut sender = server.lsb().http().connect()?;
 
-    let mut sender = SenderBuilder::new(server.host(), server.port())
-        .http()
-        .connect()?;
+    let buffer2 = buffer.clone();
+    let server_thread = std::thread::spawn(move || -> io::Result<()> {
+        server.accept()?;
 
-    let res = sender.flush_and_keep(&buffer);
+        let req = server.recv_http_q()?;
+        assert_eq!(req.method(), "POST");
+        assert_eq!(req.path(), "/write?precision=u");
+        assert_eq!(req.body_str().unwrap(), buffer2.as_str());
+
+        server.send_http_response_q(
+            HttpResponse::empty()
+                .with_status(401, "Unauthorized")
+                .with_body_str("Unauthorized")
+                .with_header("WWW-Authenticate", "Basic realm=\"Our Site\""),
+        )?;
+
+        Ok(())
+    });
+
+    let res = sender.flush(&mut buffer);
+
+    server_thread.join().unwrap()?;
+
     assert!(res.is_err());
     let err = res.unwrap_err();
     assert_eq!(err.code(), ErrorCode::AuthError);
@@ -298,6 +370,8 @@ fn test_unauthenticated() -> TestResult {
         err.msg(),
         "Could not flush buffer: HTTP endpoint authentication error: Unauthorized [code: 401]"
     );
+
+    assert!(!buffer.is_empty());
 
     Ok(())
 }
@@ -311,20 +385,29 @@ fn test_token_auth() -> TestResult {
         .column_f64("x", 1.0)?
         .at_now()?;
 
-    let mut server = mockito::Server::new();
-    server
-        .mock("POST", "/write?precision=u")
-        .match_header("Authorization", "Bearer 1234567890")
-        .with_status(204)
-        .with_header("content-type", "text/plain")
-        .match_body(buffer.as_str())
-        .create();
+    let mut server = MockServer::new()?;
+    let mut sender = server.lsb().http().token_auth("0123456789").connect()?;
 
-    let mut sender = SenderBuilder::new(server.host(), server.port())
-        .http()
-        .token_auth("1234567890")
-        .connect()?;
-    sender.flush_and_keep(&buffer)?;
+    let buffer2 = buffer.clone();
+    let server_thread = std::thread::spawn(move || -> io::Result<()> {
+        server.accept()?;
+
+        let req = server.recv_http_q()?;
+        assert_eq!(req.method(), "POST");
+        assert_eq!(req.path(), "/write?precision=u");
+        assert_eq!(req.header("authorization"), Some("Bearer 0123456789"));
+        assert_eq!(req.body_str().unwrap(), buffer2.as_str());
+
+        server.send_http_response_q(HttpResponse::empty())?;
+
+        Ok(())
+    });
+
+    let res = sender.flush(&mut buffer);
+
+    server_thread.join().unwrap()?;
+
+    res?;
 
     Ok(())
 }
@@ -343,10 +426,7 @@ fn test_timeout() -> TestResult {
 
     let grace = Duration::from_millis(50);
     let time_start = std::time::Instant::now();
-    let mut sender = SenderBuilder::new(server.host, server.port)
-        .http()
-        .read_timeout(grace)
-        .connect()?;
+    let mut sender = server.lsb().http().read_timeout(grace).connect()?;
     let res = sender.flush_and_keep(&buffer);
     let time_elapsed = time_start.elapsed();
     assert!(res.is_err());
@@ -380,8 +460,6 @@ fn test_tls() -> TestResult {
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
         server.accept_tls_sync()?;
 
-        eprintln!("server: waiting for request");
-
         let req = server.recv_http_q()?;
         assert_eq!(req.method(), "POST");
         assert_eq!(req.path(), "/write?precision=u");
@@ -396,11 +474,12 @@ fn test_tls() -> TestResult {
 
     server_thread.join().unwrap()?;
 
-    // Unpacking the error here allows server errors to be printed.
+    // Unpacking the error here allows server errors to bubble first.
     res?;
 
     Ok(())
 }
 
 // TODO:
-//  * Test TLS.
+//  * Test HTTP keepalive (and keepalive timeout)
+//  * Test user agent.

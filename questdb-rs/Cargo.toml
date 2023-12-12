@@ -42,7 +42,6 @@ indoc = "2.0.4"
 [dev-dependencies]
 mio = { version = "0.8.10", features = ["os-poll", "net"] }
 chrono = "0.4.31"
-mockito = "1.2.0"
 
 [features]
 default = ["tls-webpki-certs"]
