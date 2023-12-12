@@ -22,9 +22,10 @@
  *
  ******************************************************************************/
 
-use crate::ingress::{Buffer, SenderBuilder};
-use crate::tests::mock::MockServer;
+use crate::ingress::{Buffer, CertificateAuthority, SenderBuilder, TimestampNanos, Tls};
+use crate::tests::mock::{certs_dir, HttpResponse, MockServer};
 use crate::ErrorCode;
+use std::io;
 use std::time::Duration;
 
 use crate::tests::TestResult;
@@ -353,6 +354,51 @@ fn test_timeout() -> TestResult {
     assert_eq!(err.code(), ErrorCode::SocketError);
     assert!(err.msg().contains("timed out reading response"));
     assert!(time_elapsed >= grace);
+    Ok(())
+}
+
+#[test]
+fn test_tls() -> TestResult {
+    let mut ca_path = certs_dir();
+    ca_path.push("server_rootCA.pem");
+
+    let mut buffer = Buffer::new();
+    buffer
+        .table("test")?
+        .symbol("t1", "v1")?
+        .column_f64("f1", 0.5)?
+        .at(TimestampNanos::new(10000000))?;
+    let buffer2 = buffer.clone();
+
+    let mut server = MockServer::new()?;
+    let mut sender = server
+        .lsb()
+        .http()
+        .tls(Tls::Enabled(CertificateAuthority::File(ca_path)))
+        .connect()?;
+
+    let server_thread = std::thread::spawn(move || -> io::Result<()> {
+        server.accept_tls_sync()?;
+
+        eprintln!("server: waiting for request");
+
+        let req = server.recv_http_q()?;
+        assert_eq!(req.method(), "POST");
+        assert_eq!(req.path(), "/write?precision=u");
+        assert_eq!(req.body_str().unwrap(), buffer2.as_str());
+
+        server.send_http_response_q(HttpResponse::empty())?;
+
+        Ok(())
+    });
+
+    let res = sender.flush_and_keep(&buffer);
+
+    server_thread.join().unwrap()?;
+
+    // Unpacking the error here allows server errors to be printed.
+    res?;
+
     Ok(())
 }
 
