@@ -308,6 +308,7 @@ fn test_http_basic_auth() -> TestResult {
         server.accept()?;
 
         let req = server.recv_http_q()?;
+
         assert_eq!(req.method(), "POST");
         assert_eq!(req.path(), "/write?precision=u");
         assert_eq!(
@@ -463,7 +464,6 @@ fn test_tls() -> TestResult {
 
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
         server.accept_tls_sync()?;
-
         let req = server.recv_http_q()?;
         assert_eq!(req.method(), "POST");
         assert_eq!(req.path(), "/write?precision=u");
@@ -525,4 +525,3 @@ fn test_user_agent() -> TestResult {
 
 // TODO:
 //  * Test HTTP keepalive (and keepalive timeout)
-//  * Test user agent.

@@ -37,6 +37,7 @@ use std::io::{self, BufReader, Read};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 #[cfg(feature = "ilp-over-http")]
 use std::io::Write;
@@ -260,13 +261,13 @@ impl MockServer {
         let client = self.client.as_mut().unwrap();
         let mut tls_conn = ServerConnection::new(tls_config()).unwrap();
         let mut stream = Stream::new(&mut tls_conn, client);
-        let begin = std::time::Instant::now();
+        let begin = Instant::now();
         while stream.conn.is_handshaking() {
             match stream.conn.complete_io(&mut stream.sock) {
                 Ok(_) => (),
                 Err(err) => {
                     if err.kind() == io::ErrorKind::WouldBlock {
-                        let now = std::time::Instant::now();
+                        let now = Instant::now();
                         let elapsed = now.duration_since(begin);
                         if elapsed > Duration::from_secs(2) {
                             return Err(err);
@@ -290,25 +291,24 @@ impl MockServer {
         })
     }
 
-    fn wait_for<P>(&mut self, wait_timeout_sec: Option<f64>, event_predicate: P) -> io::Result<bool>
+    fn wait_for<P>(&mut self, timeout: Option<Duration>, event_predicate: P) -> io::Result<bool>
     where
         P: FnMut(&Event) -> bool,
     {
         // To ensure a clean death if accept wasn't called.
         self.client.as_ref().unwrap();
-        let timeout = wait_timeout_sec.map(Duration::from_secs_f64);
         self.poll.poll(&mut self.events, timeout)?;
         let ready_for_read = self.events.iter().any(event_predicate);
         Ok(ready_for_read)
     }
 
-    pub fn wait_for_recv(&mut self, wait_timeout_sec: Option<f64>) -> io::Result<bool> {
-        self.wait_for(wait_timeout_sec, |event| event.is_readable())
+    pub fn wait_for_recv(&mut self, timeout: Option<Duration>) -> io::Result<bool> {
+        self.wait_for(timeout, |event| event.is_readable())
     }
 
     #[cfg(feature = "ilp-over-http")]
-    pub fn wait_for_send(&mut self, wait_timeout_sec: Option<f64>) -> io::Result<bool> {
-        self.wait_for(wait_timeout_sec, |event| event.is_writable())
+    pub fn wait_for_send(&mut self, duration: Option<Duration>) -> io::Result<bool> {
+        self.wait_for(duration, |event| event.is_writable())
     }
 
     fn do_read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -334,8 +334,7 @@ impl MockServer {
 
     #[cfg(feature = "ilp-over-http")]
     fn do_write_all(&mut self, buf: &[u8], timeout_sec: Option<f64>) -> io::Result<()> {
-        let deadline =
-            timeout_sec.map(|sec| std::time::Instant::now() + Duration::from_secs_f64(sec));
+        let deadline = timeout_sec.map(|sec| Instant::now() + Duration::from_secs_f64(sec));
         let mut pos = 0usize;
         loop {
             // `self.poll` is edge-triggered, so we need to write first
@@ -353,8 +352,7 @@ impl MockServer {
             let timeout = match deadline {
                 Some(deadline) => Some(
                     deadline
-                        .checked_duration_since(std::time::Instant::now())
-                        .map(|d| d.as_secs_f64())
+                        .checked_duration_since(Instant::now())
                         .ok_or_else(|| {
                             io::Error::new(
                                 io::ErrorKind::TimedOut,
@@ -370,39 +368,38 @@ impl MockServer {
     }
 
     #[cfg(feature = "ilp-over-http")]
-    fn read_more(
-        &mut self,
-        accum: &mut Vec<u8>,
-        deadline: std::time::Instant,
-        stage: &str,
-    ) -> io::Result<()> {
-        let wait_timeout_sec = match deadline
-            .checked_duration_since(std::time::Instant::now())
-            .map(|d| d.as_secs_f64())
-        {
-            Some(wait_timeout_sec) => wait_timeout_sec,
-            None => {
-                let mut so_far = String::new();
-                for &b in accum.iter() {
-                    let part: Vec<u8> = std::ascii::escape_default(b).collect();
-                    so_far.push_str(std::str::from_utf8(&part).unwrap());
-                }
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!(
-                        "{} timed out while waiting for data. Received so far: {}",
-                        stage, so_far
-                    ),
-                ));
-            }
-        };
-
-        if !self.wait_for_recv(Some(wait_timeout_sec))? {
-            return Ok(()); // No more data
-        }
-
+    fn read_more(&mut self, accum: &mut Vec<u8>, deadline: Instant, stage: &str) -> io::Result<()> {
         let mut chunk = [0u8; 1024];
-        let count = self.do_read(&mut chunk[..])?;
+        let count = match self.do_read(&mut chunk[..]) {
+            Ok(count) => count,
+            Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
+                let timeout = match deadline.checked_duration_since(Instant::now()) {
+                    Some(timeout) => timeout,
+                    None => {
+                        let mut so_far = String::new();
+                        for &b in accum.iter() {
+                            let part: Vec<u8> = std::ascii::escape_default(b).collect();
+                            so_far.push_str(std::str::from_utf8(&part).unwrap());
+                        }
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!(
+                                "{} timed out while waiting for data. Received so far: {}",
+                                stage, so_far
+                            ),
+                        ));
+                    }
+                };
+                if self.wait_for_recv(Some(timeout))? {
+                    // After blocking on poll, we've received a READABLE event.
+                    // So we try again.
+                    self.do_read(&mut chunk[..])?
+                } else {
+                    return Ok(()); // No more data
+                }
+            }
+            Err(err) => return Err(err),
+        };
         accum.extend(&chunk[..count]);
 
         Ok(())
@@ -412,7 +409,7 @@ impl MockServer {
     fn recv_http_method(
         &mut self,
         accum: &mut Vec<u8>,
-        deadline: std::time::Instant,
+        deadline: Instant,
     ) -> io::Result<(usize, String, String)> {
         let end_of_line_separator = b"\r\n";
         while !contains(&accum[..], end_of_line_separator) {
@@ -442,7 +439,7 @@ impl MockServer {
         &mut self,
         pos: usize,
         accum: &mut Vec<u8>,
-        deadline: std::time::Instant,
+        deadline: Instant,
     ) -> io::Result<(usize, std::collections::HashMap<String, String>)> {
         let mut headers = std::collections::HashMap::<String, String>::new();
 
@@ -484,7 +481,7 @@ impl MockServer {
     #[cfg(feature = "ilp-over-http")]
     pub fn recv_http(&mut self, wait_timeout_sec: f64) -> io::Result<HttpRequest> {
         let mut accum = Vec::<u8>::new();
-        let deadline = std::time::Instant::now() + Duration::from_secs_f64(wait_timeout_sec);
+        let deadline = Instant::now() + Duration::from_secs_f64(wait_timeout_sec);
         let (pos, method, path) = self.recv_http_method(&mut accum, deadline)?;
         let (pos, headers) = self.recv_http_headers(pos, &mut accum, deadline)?;
         let content_length = headers
@@ -512,9 +509,7 @@ impl MockServer {
     }
 
     pub fn recv(&mut self, wait_timeout_sec: f64) -> io::Result<usize> {
-        if !self.wait_for_recv(Some(wait_timeout_sec))? {
-            return Ok(0);
-        }
+        let deadline = Instant::now() + Duration::from_secs_f64(wait_timeout_sec);
 
         let mut accum = Vec::<u8>::new();
         let mut chunk = [0u8; 1024];
@@ -522,8 +517,14 @@ impl MockServer {
             let count = match self.do_read(&mut chunk[..]) {
                 Ok(count) => count,
                 Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
-                    let poll_timeout = Some(Duration::from_millis(200));
-                    self.poll.poll(&mut self.events, poll_timeout)?;
+                    let poll_timeout = match Instant::now().checked_duration_since(deadline) {
+                        Some(remain) => remain,
+                        None => break,
+                    };
+                    if !self.wait_for_recv(Some(poll_timeout))? {
+                        // Timed out waiting for data.
+                        break;
+                    }
                     continue;
                 }
                 Err(err) => return Err(err),
@@ -554,7 +555,7 @@ impl MockServer {
     }
 
     pub fn recv_q(&mut self) -> io::Result<usize> {
-        self.recv(1.0)
+        self.recv(0.1)
     }
 
     pub fn lsb(&self) -> SenderBuilder {
