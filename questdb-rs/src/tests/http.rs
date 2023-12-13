@@ -100,9 +100,9 @@ fn test_text_plain_error() -> TestResult {
 
         server.send_http_response_q(
             HttpResponse::empty()
-                .with_status(500, "Internal Server Error")
+                .with_status(400, "Bad Request")
                 .with_header("content-type", "text/plain")
-                .with_body_str("too many connections"),
+                .with_body_str("bad wombat"),
         )?;
 
         Ok(())
@@ -115,7 +115,7 @@ fn test_text_plain_error() -> TestResult {
     assert!(res.is_err());
     let err = res.unwrap_err();
     assert_eq!(err.code(), ErrorCode::ServerFlushError);
-    assert_eq!(err.msg(), "Could not flush buffer: too many connections");
+    assert_eq!(err.msg(), "Could not flush buffer: bad wombat");
 
     assert!(!buffer.is_empty());
 
@@ -146,9 +146,9 @@ fn test_bad_json_error() -> TestResult {
 
         server.send_http_response_q(
             HttpResponse::empty()
-                .with_status(500, "Internal Server Error")
+                .with_status(400, "Bad Request")
                 .with_body_json(&serde_json::json!({
-                    "error": "too many connections",
+                    "error": "bad wombat",
                 })),
         )?;
 
@@ -164,7 +164,7 @@ fn test_bad_json_error() -> TestResult {
     assert_eq!(err.code(), ErrorCode::ServerFlushError);
     assert_eq!(
         err.msg(),
-        "Could not flush buffer: {\"error\":\"too many connections\"}"
+        "Could not flush buffer: {\"error\":\"bad wombat\"}"
     );
 
     Ok(())

@@ -194,6 +194,7 @@ use std::io::{self, BufRead, BufReader, ErrorKind, Write as IoWrite};
 use std::path::PathBuf;
 use std::string::ToString;
 use std::sync::Arc;
+use std::thread::sleep;
 
 use base64ct::{Base64, Base64UrlUnpadded, Encoding};
 use ring::rand::SystemRandom;
@@ -2253,6 +2254,64 @@ fn parse_http_error(http_status_code: u16, response: ureq::Response) -> Error {
     }
 }
 
+#[cfg(feature = "ilp-over-http")]
+fn is_retriable_error(err: &ureq::Error) -> bool {
+    use ureq::Error::*;
+    match err {
+        Transport(_) => true,
+
+        // Official HTTP codes
+        Status(500, _) |  // Internal Server Error
+        Status(503, _) |  // Service Unavailable
+        Status(504, _) |  // Gateway Timeout
+
+        // Unofficial extensions
+        Status(507, _) | // Insufficient Storage
+        Status(509, _) | // Bandwidth Limit Exceeded
+        Status(523, _) | // Origin is Unreachable
+        Status(524, _) | // A Timeout Occurred
+        Status(529, _) | // Site is overloaded
+        Status(599, _) => { // Network Connect Timeout Error
+            true
+        }
+        _ => false
+    }
+}
+
+#[cfg(feature = "ilp-over-http")]
+#[allow(clippy::result_large_err)]  // `ureq::Error` is large enough to cause this warning.
+fn retry_http_send(
+    request: ureq::Request,
+    buf: &str,
+) -> std::result::Result<ureq::Response, ureq::Error> {
+    let max_retries = 3;
+    let mut retry_interval = Duration::from_millis(200); // doubled on each retry
+
+    let mut counter = 0;
+
+    loop {
+        let response_or_err = request.clone().send_string(buf);
+        let last_err = match response_or_err {
+            Ok(res) => return Ok(res),
+            Err(err) => {
+                if is_retriable_error(&err) {
+                    err
+                } else {
+                    return Err(err);
+                }
+            }
+        };
+
+        sleep(retry_interval);
+        counter += 1;
+        retry_interval *= 2;
+
+        if counter > max_retries {
+            return Err(last_err);
+        }
+    }
+}
+
 impl Sender {
     /// Send buffer to the QuestDB server, without clearing the
     /// buffer.
@@ -2299,7 +2358,7 @@ impl Sender {
                     Some(auth) => request.set("Authorization", auth),
                     None => request,
                 };
-                let response_or_err = request.send_string(buf.as_str());
+                let response_or_err = retry_http_send(request, buf.as_str());
                 match response_or_err {
                     Ok(_response) => {
                         // on success, there's no information in the response.
