@@ -293,13 +293,27 @@ impl MockServer {
 
     fn wait_for<P>(&mut self, timeout: Option<Duration>, event_predicate: P) -> io::Result<bool>
     where
-        P: FnMut(&Event) -> bool,
+        P: Fn(&Event) -> bool,
     {
         // To ensure a clean death if accept wasn't called.
         self.client.as_ref().unwrap();
-        self.poll.poll(&mut self.events, timeout)?;
-        let ready_for_read = self.events.iter().any(event_predicate);
-        Ok(ready_for_read)
+        let deadline = timeout.map(|d| Instant::now() + d);
+        loop {
+            let timeout = match deadline {
+                Some(deadline) => {
+                    let timeout = deadline.checked_duration_since(Instant::now());
+                    if timeout.is_none() {
+                        return Ok(false);  // timed out
+                    }
+                    timeout
+                }
+                None => None
+            };
+            self.poll.poll(&mut self.events, timeout)?;
+            if self.events.iter().any(&event_predicate) {
+                return Ok(true);  // evt matched
+            }
+        }
     }
 
     pub fn wait_for_recv(&mut self, timeout: Option<Duration>) -> io::Result<bool> {
@@ -517,7 +531,7 @@ impl MockServer {
             let count = match self.do_read(&mut chunk[..]) {
                 Ok(count) => count,
                 Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
-                    let poll_timeout = match Instant::now().checked_duration_since(deadline) {
+                    let poll_timeout = match deadline.checked_duration_since(Instant::now()) {
                         Some(remain) => remain,
                         None => break,
                     };
