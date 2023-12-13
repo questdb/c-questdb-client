@@ -303,15 +303,15 @@ impl MockServer {
                 Some(deadline) => {
                     let timeout = deadline.checked_duration_since(Instant::now());
                     if timeout.is_none() {
-                        return Ok(false);  // timed out
+                        return Ok(false); // timed out
                     }
                     timeout
                 }
-                None => None
+                None => None,
             };
             self.poll.poll(&mut self.events, timeout)?;
             if self.events.iter().any(&event_predicate) {
-                return Ok(true);  // evt matched
+                return Ok(true); // evt matched
             }
         }
     }
