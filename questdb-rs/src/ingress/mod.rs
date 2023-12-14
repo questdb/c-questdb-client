@@ -2279,7 +2279,7 @@ fn is_retriable_error(err: &ureq::Error) -> bool {
 }
 
 #[cfg(feature = "ilp-over-http")]
-#[allow(clippy::result_large_err)]  // `ureq::Error` is large enough to cause this warning.
+#[allow(clippy::result_large_err)] // `ureq::Error` is large enough to cause this warning.
 fn retry_http_send(
     request: ureq::Request,
     buf: &str,
