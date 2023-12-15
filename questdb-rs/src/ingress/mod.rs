@@ -2399,7 +2399,8 @@ impl Sender {
                     Some(auth) => request.set("Authorization", auth),
                     None => request,
                 };
-                let response_or_err = retry_http_send(request, buf.as_str(), max_retries, retry_interval);
+                let response_or_err =
+                    retry_http_send(request, buf.as_str(), max_retries, retry_interval);
                 match response_or_err {
                     Ok(_response) => {
                         // on success, there's no information in the response.

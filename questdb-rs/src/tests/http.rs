@@ -550,9 +550,11 @@ fn test_retry_on_500_err() -> TestResult {
         let req = server.recv_http_q()?;
         assert_eq!(req.body_str().unwrap(), buffer2.as_str());
 
-        server.send_http_response_q(HttpResponse::empty()
-            .with_status(500, "Internal Server Error")
-            .with_body_str("client should retry"))?;
+        server.send_http_response_q(
+            HttpResponse::empty()
+                .with_status(500, "Internal Server Error")
+                .with_body_str("client should retry"),
+        )?;
 
         let start_time = std::time::Instant::now();
 
@@ -562,9 +564,11 @@ fn test_retry_on_500_err() -> TestResult {
         assert!(elapsed > retry_interval);
         assert!(elapsed < (retry_interval * 3 / 2));
 
-        server.send_http_response_q(HttpResponse::empty()
-            .with_status(500, "Internal Server Error")
-            .with_body_str("client should retry"))?;
+        server.send_http_response_q(
+            HttpResponse::empty()
+                .with_status(500, "Internal Server Error")
+                .with_body_str("client should retry"),
+        )?;
 
         let start_time = std::time::Instant::now();
 
