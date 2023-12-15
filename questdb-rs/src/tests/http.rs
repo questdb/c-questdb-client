@@ -525,7 +525,7 @@ fn test_user_agent() -> TestResult {
 
 #[test]
 fn test_retry_on_500_err() -> TestResult {
-    // Note: This also tests that the _same_ connection is being reused.
+    // Note: This also tests that the _same_ connection is being reused, i.e. tests keepalive.
 
     let mut buffer = Buffer::new();
     buffer
@@ -535,7 +535,11 @@ fn test_retry_on_500_err() -> TestResult {
         .at(TimestampNanos::new(10000000))?;
     let buffer2 = buffer.clone();
 
-    let retry_interval = Duration::from_millis(100);
+    let mut retry_interval = Duration::from_millis(20);
+    if std::env::var("TF_BUILD").is_ok() {
+        // Slow everything down on the CI. The boxes can be _very_ slow there.
+        retry_interval = Duration::from_secs(2);
+    }
 
     let mut server = MockServer::new()?;
     let mut sender = server
@@ -590,6 +594,3 @@ fn test_retry_on_500_err() -> TestResult {
 
     Ok(())
 }
-
-// TODO:
-//  * Test HTTP keepalive (and keepalive timeout)
