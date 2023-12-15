@@ -535,7 +535,7 @@ fn test_retry_on_500_err() -> TestResult {
         .at(TimestampNanos::new(10000000))?;
     let buffer2 = buffer.clone();
 
-    let retry_interval = Duration::from_millis(10);
+    let retry_interval = Duration::from_millis(100);
 
     let mut server = MockServer::new()?;
     let mut sender = server
