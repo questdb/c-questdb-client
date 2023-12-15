@@ -596,7 +596,6 @@ fn test_retry_on_500_err() -> TestResult {
     Ok(())
 }
 
-
 #[test]
 fn test_max_retry() -> TestResult {
     let mut buffer = Buffer::new();
@@ -641,7 +640,12 @@ fn test_max_retry() -> TestResult {
         let req = server.recv_http(2.0);
 
         let err = match req {
-            Ok(_) => return Err(io::Error::new(ErrorKind::InvalidInput, "unexpected retry response")),
+            Ok(_) => {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "unexpected retry response",
+                ))
+            }
             Err(err) => err,
         };
         assert_eq!(err.kind(), ErrorKind::TimedOut);
