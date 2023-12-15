@@ -194,7 +194,6 @@ use std::io::{self, BufRead, BufReader, ErrorKind, Write as IoWrite};
 use std::path::PathBuf;
 use std::string::ToString;
 use std::sync::Arc;
-use std::thread::sleep;
 
 use base64ct::{Base64, Base64UrlUnpadded, Encoding};
 use ring::rand::SystemRandom;
@@ -549,6 +548,12 @@ enum ProtocolHandler {
 
         /// Minimum throughput in bytes per second: Used to calculate the total request timeout.
         min_throughput_bps: u64,
+
+        /// The maximum number of retries to attempt a failed request.
+        max_retries: u32,
+
+        /// The initial delay before retrying a failed request, then doubled.
+        retry_interval: Duration,
     },
 }
 
@@ -1622,6 +1627,12 @@ pub struct SenderBuilder {
 
     #[cfg(feature = "ilp-over-http")]
     http_user_agent: Option<String>,
+
+    #[cfg(feature = "ilp-over-http")]
+    max_retries: u32,
+
+    #[cfg(feature = "ilp-over-http")]
+    retry_interval: Duration,
 }
 
 impl SenderBuilder {
@@ -1652,6 +1663,12 @@ impl SenderBuilder {
 
             #[cfg(feature = "ilp-over-http")]
             http_user_agent: None,
+
+            #[cfg(feature = "ilp-over-http")]
+            max_retries: 3,
+
+            #[cfg(feature = "ilp-over-http")]
+            retry_interval: Duration::from_millis(100),
         }
     }
 
@@ -1848,6 +1865,27 @@ impl SenderBuilder {
         self
     }
 
+    #[cfg(feature = "ilp-over-http")]
+    /// The maximum number of retries.
+    /// The default is 3.
+    /// Set to 0 to disable retries.
+    /// Also see [`retry_interval`](SenderBuilder::retry_interval).
+    pub fn max_retries(mut self, value: u32) -> Self {
+        self.max_retries = value;
+        self
+    }
+
+    #[cfg(feature = "ilp-over-http")]
+    /// The initial retry interval.
+    /// This the default is 100 milliseconds.
+    /// The retry interval is doubled after each failed attempt,
+    /// up to the maximum number of retries.
+    /// Also see [`max_retries`](SenderBuilder::max_retries).
+    pub fn retry_interval(mut self, value: Duration) -> Self {
+        self.retry_interval = value;
+        self
+    }
+
     /// Internal API, do not use.
     /// This is exposed exclusively for the Python client.
     /// We (QuestDB) use this to help us debug which client is being used if we encounter issues.
@@ -2026,6 +2064,8 @@ impl SenderBuilder {
                     auth,
                     timeout_grace_period: self.read_timeout,
                     min_throughput_bps: self.min_throughput_bps,
+                    max_retries: self.max_retries,
+                    retry_interval: self.retry_interval,
                 }
             }
         };
@@ -2283,10 +2323,9 @@ fn is_retriable_error(err: &ureq::Error) -> bool {
 fn retry_http_send(
     request: ureq::Request,
     buf: &str,
+    max_retries: u32,
+    mut retry_interval: Duration,
 ) -> std::result::Result<ureq::Response, ureq::Error> {
-    let max_retries = 3;
-    let mut retry_interval = Duration::from_millis(200); // doubled on each retry
-
     let mut counter = 0;
 
     loop {
@@ -2302,7 +2341,7 @@ fn retry_http_send(
             }
         };
 
-        sleep(retry_interval);
+        std::thread::sleep(retry_interval);
         counter += 1;
         retry_interval *= 2;
 
@@ -2345,6 +2384,8 @@ impl Sender {
                 ref auth,
                 timeout_grace_period,
                 min_throughput_bps,
+                max_retries,
+                retry_interval,
             } => {
                 let timeout =
                     Duration::from_secs_f64((bytes.len() as f64) / (min_throughput_bps as f64))
@@ -2358,7 +2399,7 @@ impl Sender {
                     Some(auth) => request.set("Authorization", auth),
                     None => request,
                 };
-                let response_or_err = retry_http_send(request, buf.as_str());
+                let response_or_err = retry_http_send(request, buf.as_str(), max_retries, retry_interval);
                 match response_or_err {
                     Ok(_response) => {
                         // on success, there's no information in the response.

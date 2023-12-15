@@ -523,5 +523,69 @@ fn test_user_agent() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn test_retry_on_500_err() -> TestResult {
+    // Note: This also tests that the _same_ connection is being reused.
+
+    let mut buffer = Buffer::new();
+    buffer
+        .table("test")?
+        .symbol("t1", "v1")?
+        .column_f64("f1", 0.5)?
+        .at(TimestampNanos::new(10000000))?;
+    let buffer2 = buffer.clone();
+
+    let retry_interval = Duration::from_millis(10);
+
+    let mut server = MockServer::new()?;
+    let mut sender = server
+        .lsb()
+        .http()
+        .retry_interval(retry_interval)
+        .connect()?;
+
+    let server_thread = std::thread::spawn(move || -> io::Result<()> {
+        server.accept()?;
+
+        let req = server.recv_http_q()?;
+        assert_eq!(req.body_str().unwrap(), buffer2.as_str());
+
+        server.send_http_response_q(HttpResponse::empty()
+            .with_status(500, "Internal Server Error")
+            .with_body_str("client should retry"))?;
+
+        let start_time = std::time::Instant::now();
+
+        let req = server.recv_http_q()?;
+        assert_eq!(req.body_str().unwrap(), buffer2.as_str());
+        let elapsed = std::time::Instant::now().duration_since(start_time);
+        assert!(elapsed > retry_interval);
+        assert!(elapsed < (retry_interval * 3 / 2));
+
+        server.send_http_response_q(HttpResponse::empty()
+            .with_status(500, "Internal Server Error")
+            .with_body_str("client should retry"))?;
+
+        let start_time = std::time::Instant::now();
+
+        let req = server.recv_http_q()?;
+        assert_eq!(req.body_str().unwrap(), buffer2.as_str());
+        assert!(std::time::Instant::now().duration_since(start_time) > (retry_interval * 2));
+
+        server.send_http_response_q(HttpResponse::empty())?;
+
+        Ok(())
+    });
+
+    let res = sender.flush_and_keep(&buffer);
+
+    server_thread.join().unwrap()?;
+
+    // Unpacking the error here allows server errors to bubble first.
+    res?;
+
+    Ok(())
+}
+
 // TODO:
 //  * Test HTTP keepalive (and keepalive timeout)
