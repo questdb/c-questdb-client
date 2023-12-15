@@ -603,6 +603,8 @@ impl State {
     }
 }
 
+pub type RowCount = u64;
+
 /// A reusable buffer to prepare ILP messages.
 ///
 /// # Example
@@ -690,9 +692,10 @@ impl State {
 ///
 #[derive(Debug, Clone, PartialEq)]
 pub struct Buffer {
-    state: State,
     output: String,
-    marker: Option<(usize, State)>,
+    state: State,
+    row_count: RowCount,
+    marker: Option<(usize, State, RowCount)>,
     max_name_len: usize,
 }
 
@@ -701,8 +704,9 @@ impl Buffer {
     /// which is the same as the QuestDB default.
     pub fn new() -> Self {
         Self {
-            state: State::Init,
             output: String::new(),
+            state: State::Init,
+            row_count: 0,
             marker: None,
             max_name_len: 127,
         }
@@ -732,6 +736,11 @@ impl Buffer {
     /// Number of bytes accumulated in the buffer.
     pub fn len(&self) -> usize {
         self.output.len()
+    }
+
+    /// The number of rows accumulated in the buffer.
+    pub fn row_count(&self) -> RowCount {
+        self.row_count
     }
 
     pub fn is_empty(&self) -> bool {
@@ -766,7 +775,7 @@ impl Buffer {
                 )
             ));
         }
-        self.marker = Some((self.output.len(), self.state));
+        self.marker = Some((self.output.len(), self.state, self.row_count));
         Ok(())
     }
 
@@ -775,9 +784,10 @@ impl Buffer {
     ///
     /// As a side-effect, this also clears the marker.
     pub fn rewind_to_marker(&mut self) -> Result<()> {
-        if let Some((position, state)) = self.marker {
+        if let Some((position, state, row_count)) = self.marker {
             self.output.truncate(position);
             self.state = state;
+            self.row_count = row_count;
             self.marker = None;
             Ok(())
         } else {
@@ -802,6 +812,7 @@ impl Buffer {
         self.output.clear();
         self.marker = None;
         self.state = State::Init;
+        self.row_count = 0;
     }
 
     #[inline(always)]
@@ -1250,6 +1261,7 @@ impl Buffer {
         self.output.push_str(printed);
         self.output.push('\n');
         self.state = State::MayFlushOrTable;
+        self.row_count += 1;
         Ok(())
     }
 
@@ -1283,6 +1295,7 @@ impl Buffer {
         self.check_state(Op::At)?;
         self.output.push('\n');
         self.state = State::MayFlushOrTable;
+        self.row_count += 1;
         Ok(())
     }
 }
