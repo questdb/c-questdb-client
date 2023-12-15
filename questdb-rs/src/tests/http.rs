@@ -26,6 +26,7 @@ use crate::ingress::{Buffer, CertificateAuthority, SenderBuilder, TimestampNanos
 use crate::tests::mock::{certs_dir, HttpResponse, MockServer};
 use crate::ErrorCode;
 use std::io;
+use std::io::ErrorKind;
 use std::time::Duration;
 
 use crate::tests::TestResult;
@@ -535,7 +536,7 @@ fn test_retry_on_500_err() -> TestResult {
         .at(TimestampNanos::new(10000000))?;
     let buffer2 = buffer.clone();
 
-    let mut retry_interval = Duration::from_millis(20);
+    let mut retry_interval = Duration::from_millis(50);
     if std::env::var("TF_BUILD").is_ok() {
         // Slow everything down on the CI. The boxes can be _very_ slow there.
         retry_interval = Duration::from_secs(2);
@@ -591,6 +592,70 @@ fn test_retry_on_500_err() -> TestResult {
 
     // Unpacking the error here allows server errors to bubble first.
     res?;
+
+    Ok(())
+}
+
+
+#[test]
+fn test_max_retry() -> TestResult {
+    let mut buffer = Buffer::new();
+    buffer
+        .table("test")?
+        .symbol("t1", "v1")?
+        .column_f64("f1", 0.5)?
+        .at(TimestampNanos::new(10000000))?;
+    let buffer2 = buffer.clone();
+
+    let retry_interval = Duration::from_millis(1);
+
+    let mut server = MockServer::new()?;
+    let mut sender = server
+        .lsb()
+        .http()
+        .retry_interval(retry_interval)
+        .max_retries(1)
+        .connect()?;
+
+    let server_thread = std::thread::spawn(move || -> io::Result<()> {
+        server.accept()?;
+
+        let req = server.recv_http_q()?;
+        assert_eq!(req.body_str().unwrap(), buffer2.as_str());
+
+        server.send_http_response_q(
+            HttpResponse::empty()
+                .with_status(500, "Internal Server Error")
+                .with_body_str("error 1"),
+        )?;
+
+        let req = server.recv_http_q()?;
+        assert_eq!(req.body_str().unwrap(), buffer2.as_str());
+
+        server.send_http_response_q(
+            HttpResponse::empty()
+                .with_status(500, "Internal Server Error")
+                .with_body_str("error 2"),
+        )?;
+
+        let req = server.recv_http(2.0);
+
+        let err = match req {
+            Ok(_) => return Err(io::Error::new(ErrorKind::InvalidInput, "unexpected retry response")),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::TimedOut);
+
+        Ok(())
+    });
+
+    let res = sender.flush_and_keep(&buffer);
+
+    server_thread.join().unwrap()?;
+
+    let err = res.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ServerFlushError);
+    assert_eq!(err.msg(), "Could not flush buffer: error 2");
 
     Ok(())
 }
