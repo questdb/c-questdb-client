@@ -188,6 +188,7 @@ use crate::error::{self, Error, Result};
 use crate::gai;
 use core::time::Duration;
 use itoa;
+use std::collections::BTreeSet;
 use std::convert::{Infallible, TryFrom, TryInto};
 use std::fmt::{Formatter, Write};
 use std::io::{self, BufRead, BufReader, ErrorKind, Write as IoWrite};
@@ -554,6 +555,9 @@ enum ProtocolHandler {
 
         /// The initial delay before retrying a failed request, then doubled.
         retry_interval: Duration,
+
+        /// Ensure that each flushed batch targets a single table.
+        transactional: bool,
     },
 }
 
@@ -583,7 +587,7 @@ impl io::Write for Connection {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
-enum State {
+enum OpCase {
     Init = Op::Table as isize,
     TableWritten = Op::Symbol as isize | Op::Column as isize,
     SymbolWritten = Op::Symbol as isize | Op::Column as isize | Op::At as isize,
@@ -591,19 +595,42 @@ enum State {
     MayFlushOrTable = Op::Flush as isize | Op::Table as isize,
 }
 
-impl State {
+impl OpCase {
     fn next_op_descr(self) -> &'static str {
         match self {
-            State::Init => "should have called `table` instead",
-            State::TableWritten => "should have called `symbol` or `column` instead",
-            State::SymbolWritten => "should have called `symbol`, `column` or `at` instead",
-            State::ColumnWritten => "should have called `column` or `at` instead",
-            State::MayFlushOrTable => "should have called `flush` or `table` instead",
+            OpCase::Init => "should have called `table` instead",
+            OpCase::TableWritten => "should have called `symbol` or `column` instead",
+            OpCase::SymbolWritten => "should have called `symbol`, `column` or `at` instead",
+            OpCase::ColumnWritten => "should have called `column` or `at` instead",
+            OpCase::MayFlushOrTable => "should have called `flush` or `table` instead",
         }
     }
 }
 
 pub type RowCount = u64;
+
+#[derive(Debug, Clone)]
+struct BufferState {
+    op_case: OpCase,
+    row_count: RowCount,
+    table_names: BTreeSet<Box<str>>,
+}
+
+impl BufferState {
+    fn new() -> Self {
+        Self {
+            op_case: OpCase::Init,
+            row_count: 0,
+            table_names: BTreeSet::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.op_case = OpCase::Init;
+        self.row_count = 0;
+        self.table_names.clear();
+    }
+}
 
 /// A reusable buffer to prepare ILP messages.
 ///
@@ -690,12 +717,11 @@ pub type RowCount = u64;
 /// [`rewind_to_marker`](Buffer::rewind_to_marker) method to go back to the
 /// marked last known good state.
 ///
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct Buffer {
     output: String,
-    state: State,
-    row_count: RowCount,
-    marker: Option<(usize, State, RowCount)>,
+    state: BufferState,
+    marker: Option<(usize, BufferState)>,
     max_name_len: usize,
 }
 
@@ -705,8 +731,7 @@ impl Buffer {
     pub fn new() -> Self {
         Self {
             output: String::new(),
-            state: State::Init,
-            row_count: 0,
+            state: BufferState::new(),
             marker: None,
             max_name_len: 127,
         }
@@ -740,7 +765,12 @@ impl Buffer {
 
     /// The number of rows accumulated in the buffer.
     pub fn row_count(&self) -> RowCount {
-        self.row_count
+        self.state.row_count
+    }
+
+    /// The number of tables that will be written to in this buffer.
+    pub fn table_count(&self) -> usize {
+        self.state.table_names.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -765,7 +795,7 @@ impl Buffer {
     /// Once the marker is no longer needed, call
     /// [`clear_marker`](Buffer::clear_marker).
     pub fn set_marker(&mut self) -> Result<()> {
-        if (self.state as isize & Op::Table as isize) == 0 {
+        if (self.state.op_case as isize & Op::Table as isize) == 0 {
             return Err(error::fmt!(
                 InvalidApiCall,
                 concat!(
@@ -775,7 +805,7 @@ impl Buffer {
                 )
             ));
         }
-        self.marker = Some((self.output.len(), self.state, self.row_count));
+        self.marker = Some((self.output.len(), self.state.clone()));
         Ok(())
     }
 
@@ -784,11 +814,9 @@ impl Buffer {
     ///
     /// As a side-effect, this also clears the marker.
     pub fn rewind_to_marker(&mut self) -> Result<()> {
-        if let Some((position, state, row_count)) = self.marker {
+        if let Some((position, state)) = self.marker.take() {
             self.output.truncate(position);
             self.state = state;
-            self.row_count = row_count;
-            self.marker = None;
             Ok(())
         } else {
             Err(error::fmt!(
@@ -801,7 +829,7 @@ impl Buffer {
     /// Discard any marker as may have been set by
     /// [`set_marker`](Buffer::set_marker).
     ///
-    /// Idempodent.
+    /// Idempotent.
     pub fn clear_marker(&mut self) {
         self.marker = None;
     }
@@ -810,23 +838,23 @@ impl Buffer {
     /// [`capacity`](Buffer::capacity).
     pub fn clear(&mut self) {
         self.output.clear();
+        self.state.clear();
         self.marker = None;
-        self.state = State::Init;
-        self.row_count = 0;
     }
 
+    /// Check if the next API operation is allowed as per the OP case state machine.
     #[inline(always)]
-    fn check_state(&self, op: Op) -> Result<()> {
-        if (self.state as isize & op as isize) > 0 {
-            return Ok(());
+    fn check_op(&self, op: Op) -> Result<()> {
+        if (self.state.op_case as isize & op as isize) > 0 {
+            Ok(())
+        } else {
+            Err(error::fmt!(
+                InvalidApiCall,
+                "State error: Bad call to `{}`, {}.",
+                op.descr(),
+                self.state.op_case.next_op_descr()
+            ))
         }
-        let error = error::fmt!(
-            InvalidApiCall,
-            "State error: Bad call to `{}`, {}.",
-            op.descr(),
-            self.state.next_op_descr()
-        );
-        Err(error)
     }
 
     #[inline(always)]
@@ -875,9 +903,15 @@ impl Buffer {
     {
         let name: TableName<'a> = name.try_into()?;
         self.validate_max_name_len(name.name)?;
-        self.check_state(Op::Table)?;
+        self.check_op(Op::Table)?;
         write_escaped_unquoted(&mut self.output, name.name);
-        self.state = State::TableWritten;
+        self.state.op_case = OpCase::TableWritten;
+        if !self.state.table_names.contains(name.name) {
+            // N.B.: https://github.com/rust-lang/rfcs/issues/1490
+            self.state
+                .table_names
+                .insert(name.name.to_owned().into_boxed_str());
+        }
         Ok(self)
     }
 
@@ -932,12 +966,12 @@ impl Buffer {
     {
         let name: ColumnName<'a> = name.try_into()?;
         self.validate_max_name_len(name.name)?;
-        self.check_state(Op::Symbol)?;
+        self.check_op(Op::Symbol)?;
         self.output.push(',');
         write_escaped_unquoted(&mut self.output, name.name);
         self.output.push('=');
         write_escaped_unquoted(&mut self.output, value.as_ref());
-        self.state = State::SymbolWritten;
+        self.state.op_case = OpCase::SymbolWritten;
         Ok(self)
     }
 
@@ -948,16 +982,16 @@ impl Buffer {
     {
         let name: ColumnName<'a> = name.try_into()?;
         self.validate_max_name_len(name.name)?;
-        self.check_state(Op::Column)?;
+        self.check_op(Op::Column)?;
         self.output
-            .push(if (self.state as isize & Op::Symbol as isize) > 0 {
+            .push(if (self.state.op_case as isize & Op::Symbol as isize) > 0 {
                 ' '
             } else {
                 ','
             });
         write_escaped_unquoted(&mut self.output, name.name);
         self.output.push('=');
-        self.state = State::ColumnWritten;
+        self.state.op_case = OpCase::ColumnWritten;
         Ok(self)
     }
 
@@ -1240,7 +1274,7 @@ impl Buffer {
         T: TryInto<Timestamp>,
         Error: From<T::Error>,
     {
-        self.check_state(Op::At)?;
+        self.check_op(Op::At)?;
         let timestamp: Timestamp = timestamp.try_into()?;
 
         // https://github.com/rust-lang/rust/issues/115880
@@ -1260,8 +1294,8 @@ impl Buffer {
         self.output.push(' ');
         self.output.push_str(printed);
         self.output.push('\n');
-        self.state = State::MayFlushOrTable;
-        self.row_count += 1;
+        self.state.op_case = OpCase::MayFlushOrTable;
+        self.state.row_count += 1;
         Ok(())
     }
 
@@ -1292,10 +1326,10 @@ impl Buffer {
     /// assigned by the server may drift significantly from when the data
     /// was recorded in the buffer.
     pub fn at_now(&mut self) -> Result<()> {
-        self.check_state(Op::At)?;
+        self.check_op(Op::At)?;
         self.output.push('\n');
-        self.state = State::MayFlushOrTable;
-        self.row_count += 1;
+        self.state.op_case = OpCase::MayFlushOrTable;
+        self.state.row_count += 1;
         Ok(())
     }
 }
@@ -1646,6 +1680,9 @@ pub struct SenderBuilder {
 
     #[cfg(feature = "ilp-over-http")]
     retry_interval: Duration,
+
+    #[cfg(feature = "ilp-over-http")]
+    transactional: bool,
 }
 
 impl SenderBuilder {
@@ -1682,6 +1719,9 @@ impl SenderBuilder {
 
             #[cfg(feature = "ilp-over-http")]
             retry_interval: Duration::from_millis(100),
+
+            #[cfg(feature = "ilp-over-http")]
+            transactional: false,
         }
     }
 
@@ -1922,6 +1962,15 @@ impl SenderBuilder {
         self
     }
 
+    /// Enable transactional flushes.
+    /// This is only relevant for HTTP.
+    /// This works by ensuring that the buffer contains lines for a single table.
+    #[cfg(feature = "ilp-over-http")]
+    pub fn transactional(mut self) -> Self {
+        self.transactional = true;
+        self
+    }
+
     /// Connect synchronously.
     ///
     /// Will return once the connection is fully established:
@@ -1940,6 +1989,14 @@ impl SenderBuilder {
 
         let handler = match self.protocol {
             SenderProtocol::IlpOverTcp => {
+                #[cfg(feature = "ilp-over-http")]
+                if self.transactional {
+                    return Err(error::fmt!(
+                        InvalidApiCall,
+                        "Transactional flushes are not supported for ILP over TCP."
+                    ));
+                }
+
                 let addr: SockAddr =
                     gai::resolve_host_port(self.host.as_str(), self.port.as_str())?;
                 let mut sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
@@ -2079,6 +2136,7 @@ impl SenderBuilder {
                     min_throughput_bps: self.min_throughput_bps,
                     max_retries: self.max_retries,
                     retry_interval: self.retry_interval,
+                    transactional: self.transactional,
                 }
             }
         };
@@ -2335,14 +2393,14 @@ fn is_retriable_error(err: &ureq::Error) -> bool {
 #[allow(clippy::result_large_err)] // `ureq::Error` is large enough to cause this warning.
 fn retry_http_send(
     request: ureq::Request,
-    buf: &str,
+    buf: &[u8],
     max_retries: u32,
     mut retry_interval: Duration,
 ) -> std::result::Result<ureq::Response, ureq::Error> {
     let mut counter = 0;
 
     loop {
-        let response_or_err = request.clone().send_string(buf);
+        let response_or_err = request.clone().send_bytes(buf);
         let last_err = match response_or_err {
             Ok(res) => return Ok(res),
             Err(err) => {
@@ -2378,7 +2436,7 @@ impl Sender {
                 "Could not flush buffer: not connected to database."
             ));
         }
-        buf.check_state(Op::Flush)?;
+        buf.check_op(Op::Flush)?;
         let bytes = buf.as_str().as_bytes();
         if bytes.is_empty() {
             return Ok(());
@@ -2399,7 +2457,15 @@ impl Sender {
                 min_throughput_bps,
                 max_retries,
                 retry_interval,
+                transactional,
             } => {
+                if transactional && buf.state.table_names.len() > 1 {
+                    return Err(error::fmt!(
+                        InvalidApiCall,
+                        "Buffer contains lines for multiple tables. \
+                        Transactional flushes are only supported for buffers containing lines for a single table."
+                    ));
+                }
                 let timeout =
                     Duration::from_secs_f64((bytes.len() as f64) / (min_throughput_bps as f64))
                         + timeout_grace_period;
@@ -2412,8 +2478,7 @@ impl Sender {
                     Some(auth) => request.set("Authorization", auth),
                     None => request,
                 };
-                let response_or_err =
-                    retry_http_send(request, buf.as_str(), max_retries, retry_interval);
+                let response_or_err = retry_http_send(request, bytes, max_retries, retry_interval);
                 match response_or_err {
                     Ok(_response) => {
                         // on success, there's no information in the response.
