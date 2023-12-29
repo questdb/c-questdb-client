@@ -502,6 +502,50 @@ pub unsafe extern "C" fn line_sender_opts_http(opts: *mut line_sender_opts) {
     upd_opts!(opts, http);
 }
 
+/// Maxmimum number of HTTP request retries.
+/// Defaults to 3.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_max_retries(
+    opts: *mut line_sender_opts,
+    max_retries: u32,
+) {
+    upd_opts!(opts, max_retries, max_retries);
+}
+
+/// The initial retry interval (specified in milliseconds).
+/// This the default is 100 milliseconds.
+/// The retry interval is doubled after each failed attempt,
+/// up to the maximum number of retries.
+/// Also see `max_retries`.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_retry_interval(
+    opts: *mut line_sender_opts,
+    retry_interval_millis: u64,
+) {
+    let retry_interval = std::time::Duration::from_millis(retry_interval_millis);
+    upd_opts!(opts, retry_interval, retry_interval);
+}
+
+/// Minimum expected throughput in bytes per second for HTTP requests.
+/// If the throughput is lower than this value, the connection will time out.
+/// The default is 100 KiB/s.
+/// The value is expressed as a number of bytes per second.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_min_throughput(
+    opts: *mut line_sender_opts,
+    bytes_per_sec: u64,
+) {
+    upd_opts!(opts, min_throughput, bytes_per_sec);
+}
+
+/// Enable transactional flushes.
+/// This is only relevant for HTTP.
+/// This works by ensuring that the buffer contains lines for a single table.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_transactional(opts: *mut line_sender_opts) {
+    upd_opts!(opts, transactional);
+}
+
 /// Set the HTTP user agent. Internal API. Do not use.
 #[doc(hidden)]
 #[no_mangle]
@@ -699,6 +743,22 @@ pub unsafe extern "C" fn line_sender_buffer_clear(buffer: *mut line_sender_buffe
 pub unsafe extern "C" fn line_sender_buffer_size(buffer: *const line_sender_buffer) -> size_t {
     let buffer = unwrap_buffer(buffer);
     buffer.len()
+}
+
+/// The number of rows accumulated in the buffer.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_buffer_row_count(buffer: *const line_sender_buffer) -> size_t {
+    let buffer = unwrap_buffer(buffer);
+    buffer.row_count()
+}
+
+/// The number of tables that will be written to in this buffer.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_buffer_table_count(
+    buffer: *const line_sender_buffer,
+) -> size_t {
+    let buffer = unwrap_buffer(buffer);
+    buffer.table_count()
 }
 
 /// Peek into the accumulated buffer that is to be sent out at the next `flush`.

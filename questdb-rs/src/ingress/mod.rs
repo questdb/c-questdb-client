@@ -544,11 +544,11 @@ enum ProtocolHandler {
         /// The content of the `Authorization` HTTP header.
         auth: Option<String>,
 
-        /// Additional grace period added to the timeout as calculated via `min_throughput_bps`.
+        /// Additional grace period added to the timeout as calculated via `min_throughput`.
         timeout_grace_period: Duration,
 
         /// Minimum throughput in bytes per second: Used to calculate the total request timeout.
-        min_throughput_bps: u64,
+        min_throughput: u64,
 
         /// The maximum number of retries to attempt a failed request.
         max_retries: u32,
@@ -607,7 +607,7 @@ impl OpCase {
     }
 }
 
-pub type RowCount = u64;
+pub type RowCount = usize;
 
 #[derive(Debug, Clone)]
 struct BufferState {
@@ -1670,7 +1670,7 @@ pub struct SenderBuilder {
     protocol: SenderProtocol,
 
     #[cfg(feature = "ilp-over-http")]
-    min_throughput_bps: u64,
+    min_throughput: u64,
 
     #[cfg(feature = "ilp-over-http")]
     http_user_agent: Option<String>,
@@ -1709,7 +1709,7 @@ impl SenderBuilder {
             protocol: SenderProtocol::IlpOverTcp,
 
             #[cfg(feature = "ilp-over-http")]
-            min_throughput_bps: 102400, // 100 KiB/s
+            min_throughput: 102400, // 100 KiB/s
 
             #[cfg(feature = "ilp-over-http")]
             http_user_agent: None,
@@ -1957,8 +1957,8 @@ impl SenderBuilder {
     /// The default is 100 KiB/s.
     /// The value is expressed as a number of bytes per second.
     #[cfg(feature = "ilp-over-http")]
-    pub fn min_throughput_bps(mut self, value: u64) -> Self {
-        self.min_throughput_bps = value;
+    pub fn min_throughput(mut self, value: u64) -> Self {
+        self.min_throughput = value;
         self
     }
 
@@ -2133,7 +2133,7 @@ impl SenderBuilder {
                     url,
                     auth,
                     timeout_grace_period: self.read_timeout,
-                    min_throughput_bps: self.min_throughput_bps,
+                    min_throughput: self.min_throughput,
                     max_retries: self.max_retries,
                     retry_interval: self.retry_interval,
                     transactional: self.transactional,
@@ -2454,7 +2454,7 @@ impl Sender {
                 ref url,
                 ref auth,
                 timeout_grace_period,
-                min_throughput_bps,
+                min_throughput,
                 max_retries,
                 retry_interval,
                 transactional,
@@ -2467,7 +2467,7 @@ impl Sender {
                     ));
                 }
                 let timeout =
-                    Duration::from_secs_f64((bytes.len() as f64) / (min_throughput_bps as f64))
+                    Duration::from_secs_f64((bytes.len() as f64) / (min_throughput as f64))
                         + timeout_grace_period;
                 let request = agent
                     .post(url)
