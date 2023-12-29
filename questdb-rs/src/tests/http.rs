@@ -663,3 +663,63 @@ fn test_max_retry() -> TestResult {
 
     Ok(())
 }
+
+#[test]
+fn test_transactional() -> TestResult {
+    // A buffer with a two tables.
+    let mut buffer1 = Buffer::new();
+    buffer1
+        .table("tab1")?
+        .symbol("t1", "v1")?
+        .column_f64("f1", 0.5)?
+        .at(TimestampNanos::new(10000001))?;
+    buffer1
+        .table("tab2")?
+        .symbol("t1", "v1")?
+        .column_f64("f1", 0.6)?
+        .at(TimestampNanos::new(10000002))?;
+    assert_eq!(buffer1.table_count(), 2);
+
+    // A buffer with a single table.
+    let mut buffer2 = Buffer::new();
+    buffer2
+        .table("test")?
+        .symbol("t1", "v1")?
+        .column_f64("f1", 0.5)?
+        .at(TimestampNanos::new(10000000))?;
+    let buffer3 = buffer2.clone();
+    assert_eq!(buffer2.table_count(), 1);
+
+    let mut server = MockServer::new()?;
+    let mut sender = server.lsb().http().transactional().connect()?;
+
+    let server_thread = std::thread::spawn(move || -> io::Result<()> {
+        server.accept()?;
+
+        let req = server.recv_http_q()?;
+        assert_eq!(req.body_str().unwrap(), buffer3.as_str());
+
+        server.send_http_response_q(HttpResponse::empty())?;
+
+        Ok(())
+    });
+
+    let res = sender.flush_and_keep(&buffer1);
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert_eq!(
+        err.msg(),
+        "Buffer contains lines for multiple tables. \
+        Transactional flushes are only supported for buffers containing lines for a single table."
+    );
+
+    let res = sender.flush_and_keep(&buffer2);
+
+    server_thread.join().unwrap()?;
+
+    // Unpacking the error here allows server errors to bubble first.
+    res?;
+
+    Ok(())
+}
