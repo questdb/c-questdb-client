@@ -496,6 +496,18 @@ pub unsafe extern "C" fn line_sender_opts_basic_auth(
     upd_opts!(opts, basic_auth, username.as_str(), password.as_str());
 }
 
+/// Token (Bearer) Authentication Parameters for ILP over HTTP.
+/// For TCP, use `auth` instead.
+///
+/// @param[in] token Token.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_token_auth(
+    opts: *mut line_sender_opts,
+    token: line_sender_utf8,
+) {
+    upd_opts!(opts, token_auth, token.as_str());
+}
+
 /// Enable ILP over HTTP.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_opts_http(opts: *mut line_sender_opts) {

@@ -584,8 +584,6 @@ void line_sender_opts_basic_auth(
 /**
  * Token (Bearer) Authentication Parameters for ILP over HTTP.
  * For TCP, use `auth` instead.
- *
- * @param[in] token Token.
  */
 LINESENDER_API
 void line_sender_opts_token_auth(
