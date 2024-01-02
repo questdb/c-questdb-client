@@ -204,7 +204,7 @@ class QueryError(Exception):
 
 
 class QuestDbFixture:
-    def __init__(self, root_dir: pathlib.Path, auth=False, wrap_tls=False):
+    def __init__(self, root_dir: pathlib.Path, auth=False, wrap_tls=False, http=False):
         self._root_dir = root_dir
         self.version = _parse_version(self._root_dir.name)
         self._data_dir = self._root_dir / 'data'
@@ -228,6 +228,7 @@ class QuestDbFixture:
             auth_txt_path = self._conf_dir / 'auth.txt'
             with open(auth_txt_path, 'w', encoding='utf-8') as auth_file:
                 auth_file.write(AUTH_TXT)
+        self.http = http
 
     def print_log(self):
         with open(self._log_path, 'r', encoding='utf-8') as log_file:
@@ -239,6 +240,7 @@ class QuestDbFixture:
         ports = discover_avail_ports(3)
         self.http_server_port, self.line_tcp_port, self.pg_port = ports
         auth_config = 'line.tcp.auth.db.path=conf/auth.txt' if self.auth else ''
+        ilp_over_http_config = 'line.http.enabled=true' if self.http else ''
         with open(self._conf_path, 'w', encoding='utf-8') as conf_file:
             conf_file.write(textwrap.dedent(rf'''
                 http.bind.to=0.0.0.0:{self.http_server_port}
@@ -252,6 +254,7 @@ class QuestDbFixture:
                 cairo.commit.lag=100
                 line.tcp.commit.interval.fraction=0.1
                 {auth_config}
+                {ilp_over_http_config}
                 ''').lstrip('\n'))
 
         java = _find_java()
@@ -267,7 +270,7 @@ class QuestDbFixture:
             '-m', 'io.questdb/io.questdb.ServerMain',
             '-d', str(self._data_dir)]
         sys.stderr.write(
-            f'Starting QuestDB: {launch_args!r} (auth: {self.auth})\n')
+            f'Starting QuestDB: {launch_args!r} (auth: {self.auth}, http: {self.http})\n')
         self._log = open(self._log_path, 'ab')
         try:
             self._proc = subprocess.Popen(

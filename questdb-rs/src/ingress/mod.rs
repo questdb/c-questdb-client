@@ -2116,7 +2116,7 @@ impl SenderBuilder {
                         return Err(error::fmt!(
                             AuthError,
                             "ECDSA authentication is not supported for ILP over HTTP. \
-                            Please use Basic authentication instead."
+                            Please use basic or token authentication instead."
                         ));
                     }
                     None => None,
@@ -2471,7 +2471,7 @@ impl Sender {
                         + timeout_grace_period;
                 let request = agent
                     .post(url)
-                    .query_pairs([("precision", "u")])
+                    .query_pairs([("precision", "n")])
                     .timeout(timeout)
                     .set("Content-Type", "text/plain; charset=utf-8");
                 let request = match auth {

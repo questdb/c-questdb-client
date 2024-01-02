@@ -92,8 +92,9 @@ class TestSender(unittest.TestCase):
     def _mk_linesender(self):
         return qls.Sender(
             QDB_FIXTURE.host,
-            QDB_FIXTURE.line_tcp_port,
-            auth=AUTH if QDB_FIXTURE.auth else None)
+            QDB_FIXTURE.http_server_port if QDB_FIXTURE.http else QDB_FIXTURE.line_tcp_port,
+            auth=AUTH if QDB_FIXTURE.auth else None,
+            http=QDB_FIXTURE.http)
 
     def _expect_eventual_disconnect(self, sender):
         with self.assertRaisesRegex(
@@ -251,20 +252,36 @@ class TestSender(unittest.TestCase):
 
             pending = sender.buffer.peek()
 
-        # We only ever get the first row back.
-        resp = retry_check_table(table_name, log_ctx=pending)
-        exp_columns = [
-            {'name': 'a', 'type': 'STRING'},
-            {'name': 'timestamp', 'type': 'TIMESTAMP'}]
-        self.assertEqual(resp['columns'], exp_columns)
+            try:
+                sender.flush()
+            except qls.SenderError as e:
+                if not QDB_FIXTURE.http:
+                    raise e
+                self.assertIn('Could not flush buffer', str(e))
+                self.assertIn('cast error from', str(e))
+                self.assertIn('STRING', str(e))
+                self.assertIn('code: invalid, line: 2', str(e))
 
-        exp_dataset = [['A']]  # Comparison excludes timestamp column.
-        scrubbed_dataset = [row[:-1] for row in resp['dataset']]
-        self.assertEqual(scrubbed_dataset, exp_dataset)
+        if QDB_FIXTURE.http:
+            # If HTTP, the error should cause the whole batch to be ignored.
+            # We assert that the table is empty.
+            with self.assertRaises(TimeoutError):
+                retry_check_table(table_name, timeout_sec=1, log=False)
+        else:
+            # We only ever get the first row back.
+            resp = retry_check_table(table_name, log_ctx=pending)
+            exp_columns = [
+                {'name': 'a', 'type': 'STRING'},
+                {'name': 'timestamp', 'type': 'TIMESTAMP'}]
+            self.assertEqual(resp['columns'], exp_columns)
 
-        # The second one is dropped and will not appear in results.
-        with self.assertRaises(TimeoutError):
-            retry_check_table(table_name, min_rows=2, timeout_sec=1, log=False)
+            exp_dataset = [['A']]  # Comparison excludes timestamp column.
+            scrubbed_dataset = [row[:-1] for row in resp['dataset']]
+            self.assertEqual(scrubbed_dataset, exp_dataset)
+
+            # The second one is dropped and will not appear in results.
+            with self.assertRaises(TimeoutError):
+                retry_check_table(table_name, min_rows=2, timeout_sec=1, log=False)
 
     def test_at(self):
         if QDB_FIXTURE.version <= (6, 0, 7, 1):
@@ -279,7 +296,6 @@ class TestSender(unittest.TestCase):
                 .symbol('a', 'A')
                 .at(at_ts_ns))
             pending = sender.buffer.peek()
-
         resp = retry_check_table(table_name, log_ctx=pending)
         exp_dataset = [['A', ns_to_qdb_date(at_ts_ns)]]
         self.assertEqual(resp['dataset'], exp_dataset)
@@ -672,13 +688,14 @@ def run_with_existing(args):
     global QDB_FIXTURE
     MockFixture = namedtuple(
         'MockFixture',
-        ('host', 'line_tcp_port', 'http_server_port', 'version'))
+        ('host', 'line_tcp_port', 'http_server_port', 'version', 'http'))
     host, line_tcp_port, http_server_port = args.existing.split(':')
     QDB_FIXTURE = MockFixture(
         host,
         int(line_tcp_port),
         int(http_server_port),
-        (999, 999, 999))
+        (999, 999, 999),
+        True)
     unittest.main()
 
 
@@ -696,35 +713,21 @@ def iter_versions(args):
         print(f'Starting QuestDB from jar {repo_jar}')
         proj = Project()
         vers = 'repo'
-        version_dir = proj.questdb_dir / vers
-        if version_dir.exists():
-            shutil.rmtree(version_dir)
-        (version_dir / 'data' / 'log').mkdir(parents=True)
-        bin_dir = version_dir / 'bin'
+        questdb_dir = proj.questdb_dir / vers
+        if questdb_dir.exists():
+            shutil.rmtree(questdb_dir)
+        (questdb_dir / 'data' / 'log').mkdir(parents=True)
+        bin_dir = questdb_dir / 'bin'
         bin_dir.mkdir(parents=True)
-        conf_dir = version_dir / 'conf'
+        conf_dir = questdb_dir / 'conf'
         conf_dir.mkdir(parents=True)
-        data_conf_dir = version_dir / 'data' / 'conf'
+        data_conf_dir = questdb_dir / 'data' / 'conf'
         data_conf_dir.mkdir(parents=True)
         shutil.copy(repo_jar, bin_dir / 'questdb.jar')
         repo_conf_dir = target_dir / 'classes' / 'io' / 'questdb' / 'site' / 'conf'
         shutil.copy(repo_conf_dir / 'server.conf', conf_dir / 'server.conf')
         shutil.copy(repo_conf_dir / 'mime.types', data_conf_dir / 'mime.types')
-
-        # tmp_version_dir = proj.questdb_dir / f'_tmp_{vers}'
-        # try:
-        #     archive = tarfile.open(archive_path)
-        #     archive.extractall(tmp_version_dir)
-        #     archive.close()
-        # except:
-        #     shutil.rmtree(tmp_version_dir, ignore_errors=True)
-        #     raise
-        # bin_dir = tmp_version_dir / 'bin'
-        # next(tmp_version_dir.glob("**/questdb.jar")).parent.rename(bin_dir)
-        # (tmp_version_dir / 'data' / 'log').mkdir(parents=True)
-        # tmp_version_dir.rename(version_dir)
-
-        yield version_dir
+        yield questdb_dir
         return
 
     versions = None
@@ -749,26 +752,36 @@ def iter_versions(args):
         yield questdb_dir
 
 
-
 def run_with_fixtures(args):
     global QDB_FIXTURE
     global TLS_PROXY_FIXTURE
+    last_version = None
     for questdb_dir in iter_versions(args):
         for auth in (False, True):
-            QDB_FIXTURE = QuestDbFixture(questdb_dir, auth=auth)
-            TLS_PROXY_FIXTURE = None
-            try:
-                QDB_FIXTURE.start()
-                TLS_PROXY_FIXTURE = TlsProxyFixture(QDB_FIXTURE.line_tcp_port)
-                TLS_PROXY_FIXTURE.start()
+            for http in (False, True):
+                if http and last_version <= (7, 3, 7):
+                    print('Skipping ILP/HTTP tests for versions <= 7.3.7')
+                    continue
+                if http and auth:
+                    print('Skipping auth for ILP/HTTP tests')
+                    continue
+                QDB_FIXTURE = QuestDbFixture(questdb_dir, auth=auth, http=http)
+                TLS_PROXY_FIXTURE = None
+                try:
+                    QDB_FIXTURE.start()
+                    # Read the version _after_ a first start so it can rely
+                    # on the live one from the `select build` query.
+                    last_version = QDB_FIXTURE.version
+                    TLS_PROXY_FIXTURE = TlsProxyFixture(QDB_FIXTURE.line_tcp_port)
+                    TLS_PROXY_FIXTURE.start()
 
-                test_prog = unittest.TestProgram(exit=False)
-                if not test_prog.result.wasSuccessful():
-                    sys.exit(1)
-            finally:
-                if TLS_PROXY_FIXTURE:
-                    TLS_PROXY_FIXTURE.stop()
-                QDB_FIXTURE.stop()
+                    test_prog = unittest.TestProgram(exit=False)
+                    if not test_prog.result.wasSuccessful():
+                        sys.exit(1)
+                finally:
+                    if TLS_PROXY_FIXTURE:
+                        TLS_PROXY_FIXTURE.stop()
+                    QDB_FIXTURE.stop()
 
 
 def run(args, show_help=False):
