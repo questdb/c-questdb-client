@@ -26,6 +26,7 @@ import sys
 sys.dont_write_bytecode = True
 
 import os
+import re
 import pathlib
 import textwrap
 import json
@@ -249,7 +250,7 @@ class QuestDbFixture:
                 line.tcp.min.idle.ms.before.writer.release=300
                 telemetry.enabled=false
                 cairo.commit.lag=100
-                lne.tcp.commit.interval.fraction=0.1
+                line.tcp.commit.interval.fraction=0.1
                 {auth_config}
                 ''').lstrip('\n'))
 
@@ -306,6 +307,11 @@ class QuestDbFixture:
         atexit.register(self.stop)
         sys.stderr.write('QuestDB fixture instance is ready.\n')
 
+        # Read the actual version from the running process.
+        # This is to support a version like `7.3.2-SNAPSHOT`
+        # from an externally started QuestDB instance.
+        self.version = self.query_version()
+
         if self.wrap_tls:
             self._tls_proxy = TlsProxyFixture(self.line_tcp_port)
             self._tls_proxy.start()
@@ -332,6 +338,22 @@ class QuestDbFixture:
         if 'error' in data:
             raise QueryError(data['error'])
         return data
+    
+    def query_version(self):
+        try:
+            res = self.http_sql_query('select build')
+        except QueryError as qe:
+            # For old versions that don't support `build` yet, parse from path.
+            return self.version
+
+        vers = res['dataset'][0][0]
+        print(vers)
+
+        # This returns a string like:
+        # 'Build Information: QuestDB 7.3.2, JDK 11.0.8, Commit Hash 19059deec7b0fd19c53182b297a5d59774a51892'
+        # We want the '7.3.2' part.
+        vers = re.compile(r'.*QuestDB ([0-9.]+).*').search(vers).group(1)
+        return _parse_version(vers)
 
     def retry_check_table(
             self,

@@ -27,8 +27,9 @@
 import sys
 sys.dont_write_bytecode = True
 import os
-import textwrap
 
+import shutil
+import pathlib
 import math
 import datetime
 import argparse
@@ -648,6 +649,13 @@ def parse_args():
         metavar='HOST:ILP_PORT:HTTP_PORT',
         help=('Test against existing running instance. ' +
               'e.g. `localhost:9009:9000`'))
+    version_g.add_argument(
+        '--repo',
+        type=str,
+        metavar='PATH',
+        help=('Test against existing jar from a ' +
+              '`mvn install -DskipTests -P build-web-console`' +
+              '-ed questdb repo such as `~/questdb/repos/questdb/`'))
     list_p = sub_p.add_parser('list', help='List latest -n releases.')
     list_p.set_defaults(command='list')
     list_p.add_argument('-n', type=int, default=30, help='number of releases')
@@ -674,9 +682,51 @@ def run_with_existing(args):
     unittest.main()
 
 
-def run_with_fixtures(args):
-    global QDB_FIXTURE
-    global TLS_PROXY_FIXTURE
+def iter_versions(args):
+    """
+    Iterate target versions.
+    Returns a generator of prepared questdb directories.
+    Ensure that the DB is stopped after each use.
+    """
+    if getattr(args, 'repo', None):
+        # A specific repo path was provided.
+        repo = pathlib.Path(args.repo).absolute()
+        target_dir = repo / 'core' / 'target'
+        repo_jar = next(target_dir.glob("**/questdb*-SNAPSHOT.jar"))
+        print(f'Starting QuestDB from jar {repo_jar}')
+        proj = Project()
+        vers = 'repo'
+        version_dir = proj.questdb_dir / vers
+        if version_dir.exists():
+            shutil.rmtree(version_dir)
+        (version_dir / 'data' / 'log').mkdir(parents=True)
+        bin_dir = version_dir / 'bin'
+        bin_dir.mkdir(parents=True)
+        conf_dir = version_dir / 'conf'
+        conf_dir.mkdir(parents=True)
+        data_conf_dir = version_dir / 'data' / 'conf'
+        data_conf_dir.mkdir(parents=True)
+        shutil.copy(repo_jar, bin_dir / 'questdb.jar')
+        repo_conf_dir = target_dir / 'classes' / 'io' / 'questdb' / 'site' / 'conf'
+        shutil.copy(repo_conf_dir / 'server.conf', conf_dir / 'server.conf')
+        shutil.copy(repo_conf_dir / 'mime.types', data_conf_dir / 'mime.types')
+
+        # tmp_version_dir = proj.questdb_dir / f'_tmp_{vers}'
+        # try:
+        #     archive = tarfile.open(archive_path)
+        #     archive.extractall(tmp_version_dir)
+        #     archive.close()
+        # except:
+        #     shutil.rmtree(tmp_version_dir, ignore_errors=True)
+        #     raise
+        # bin_dir = tmp_version_dir / 'bin'
+        # next(tmp_version_dir.glob("**/questdb.jar")).parent.rename(bin_dir)
+        # (tmp_version_dir / 'data' / 'log').mkdir(parents=True)
+        # tmp_version_dir.rename(version_dir)
+
+        yield version_dir
+        return
+
     versions = None
     versions_args = getattr(args, 'versions', None)
     if versions_args:
@@ -696,6 +746,14 @@ def run_with_fixtures(args):
             in list_questdb_releases(last_n)}
     for version, download_url in versions.items():
         questdb_dir = install_questdb(version, download_url)
+        yield questdb_dir
+
+
+
+def run_with_fixtures(args):
+    global QDB_FIXTURE
+    global TLS_PROXY_FIXTURE
+    for questdb_dir in iter_versions(args):
         for auth in (False, True):
             QDB_FIXTURE = QuestDbFixture(questdb_dir, auth=auth)
             TLS_PROXY_FIXTURE = None
