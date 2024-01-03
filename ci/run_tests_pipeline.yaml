@@ -98,7 +98,7 @@ stages:
               cargo clippy --all-targets --all-features -- -D warnings
             displayName: "tls_proxy: clippy"
       - job: TestVsQuestDBMaster
-        displayName: "Test against the latest QuestDB 'master' branch"
+        displayName: "Vs QuestDB 'master'"
         pool:
           vmImage: 'ubuntu-latest'
         timeoutInMinutes: 60
@@ -108,10 +108,9 @@ stages:
             lfs: false
             submodules: false
           - template: compile.yaml
-            parameters:
-              BUILD_RUST_EXAMPLES: "0"
           - script: |
-              git clone https://github.com/questdb/questdb.git
+              git clone --depth 1 https://github.com/questdb/questdb.git
+            displayName: git clone questdb
           - task: Maven@3
             displayName: "Compile QuestDB"
             inputs:
