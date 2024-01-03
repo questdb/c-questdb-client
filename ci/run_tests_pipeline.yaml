@@ -56,7 +56,11 @@ stages:
           vmImage: $(imageName)
         timeoutInMinutes: 60
         steps:
-          - template: checkout-and-compile.yaml
+          - checkout: self
+            fetchDepth: 1
+            lfs: false
+            submodules: false
+          - template: compile.yaml
           - script: python3 ci/run_all_tests.py
             env:
               JAVA_HOME: $(JAVA_HOME_11_X64)
@@ -109,7 +113,11 @@ stages:
           vmImage: 'ubuntu-latest'
         timeoutInMinutes: 60
         steps:
-          - template: checkout-and-compile.yaml
+          - checkout: self
+            fetchDepth: 1
+            lfs: false
+            submodules: false
+          - template: compile.yaml
           - script: |
               git clone https://github.com/questdb/questdb.git
           - task: Maven3
