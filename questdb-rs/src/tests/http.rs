@@ -54,7 +54,7 @@ fn test_two_lines() -> TestResult {
 
         let req = server.recv_http_q()?;
         assert_eq!(req.method(), "POST");
-        assert_eq!(req.path(), "/write?precision=u");
+        assert_eq!(req.path(), "/write?precision=n");
         assert_eq!(
             req.header("user-agent"),
             Some(concat!("questdb/rust/", env!("CARGO_PKG_VERSION")))
@@ -96,7 +96,7 @@ fn test_text_plain_error() -> TestResult {
 
         let req = server.recv_http_q()?;
         assert_eq!(req.method(), "POST");
-        assert_eq!(req.path(), "/write?precision=u");
+        assert_eq!(req.path(), "/write?precision=n");
         assert_eq!(req.body_str().unwrap(), buffer2.as_str());
 
         server.send_http_response_q(
@@ -142,7 +142,7 @@ fn test_bad_json_error() -> TestResult {
 
         let req = server.recv_http_q()?;
         assert_eq!(req.method(), "POST");
-        assert_eq!(req.path(), "/write?precision=u");
+        assert_eq!(req.path(), "/write?precision=n");
         assert_eq!(req.body_str().unwrap(), buffer2.as_str());
 
         server.send_http_response_q(
@@ -190,7 +190,7 @@ fn test_json_error() -> TestResult {
 
         let req = server.recv_http_q()?;
         assert_eq!(req.method(), "POST");
-        assert_eq!(req.path(), "/write?precision=u");
+        assert_eq!(req.path(), "/write?precision=n");
         assert_eq!(req.body_str().unwrap(), buffer2.as_str());
 
         server.send_http_response_q(
@@ -237,7 +237,7 @@ fn test_no_connection() -> TestResult {
     let err = res.unwrap_err();
     assert_eq!(err.code(), ErrorCode::SocketError);
     assert!(err.msg().starts_with(
-        "Could not flush buffer: http://127.0.0.1:1/write?precision=u: Connection Failed"
+        "Could not flush buffer: http://127.0.0.1:1/write?precision=n: Connection Failed"
     ));
     Ok(())
 }
@@ -260,7 +260,7 @@ fn test_old_server_without_ilp_http_support() -> TestResult {
 
         let req = server.recv_http_q()?;
         assert_eq!(req.method(), "POST");
-        assert_eq!(req.path(), "/write?precision=u");
+        assert_eq!(req.path(), "/write?precision=n");
         assert_eq!(req.body_str().unwrap(), buffer2.as_str());
 
         server.send_http_response_q(
@@ -311,7 +311,7 @@ fn test_http_basic_auth() -> TestResult {
         let req = server.recv_http_q()?;
 
         assert_eq!(req.method(), "POST");
-        assert_eq!(req.path(), "/write?precision=u");
+        assert_eq!(req.path(), "/write?precision=n");
         assert_eq!(
             req.header("authorization"),
             Some("Basic QWxhZGRpbjpPcGVuU2VzYW1l")
@@ -352,7 +352,7 @@ fn test_unauthenticated() -> TestResult {
 
         let req = server.recv_http_q()?;
         assert_eq!(req.method(), "POST");
-        assert_eq!(req.path(), "/write?precision=u");
+        assert_eq!(req.path(), "/write?precision=n");
         assert_eq!(req.body_str().unwrap(), buffer2.as_str());
 
         server.send_http_response_q(
@@ -400,7 +400,7 @@ fn test_token_auth() -> TestResult {
 
         let req = server.recv_http_q()?;
         assert_eq!(req.method(), "POST");
-        assert_eq!(req.path(), "/write?precision=u");
+        assert_eq!(req.path(), "/write?precision=n");
         assert_eq!(req.header("authorization"), Some("Bearer 0123456789"));
         assert_eq!(req.body_str().unwrap(), buffer2.as_str());
 
@@ -467,7 +467,7 @@ fn test_tls() -> TestResult {
         server.accept_tls_sync()?;
         let req = server.recv_http_q()?;
         assert_eq!(req.method(), "POST");
-        assert_eq!(req.path(), "/write?precision=u");
+        assert_eq!(req.path(), "/write?precision=n");
         assert_eq!(req.body_str().unwrap(), buffer2.as_str());
 
         server.send_http_response_q(HttpResponse::empty())?;
