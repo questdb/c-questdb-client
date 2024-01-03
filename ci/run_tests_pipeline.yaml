@@ -120,7 +120,7 @@ stages:
           - template: compile.yaml
           - script: |
               git clone https://github.com/questdb/questdb.git
-          - task: Maven3
+          - task: Maven@3
             displayName: "Compile QuestDB"
             inputs:
               mavenPOMFile: 'questdb/pom.xml'
