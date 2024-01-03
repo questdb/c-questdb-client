@@ -56,38 +56,7 @@ stages:
           vmImage: $(imageName)
         timeoutInMinutes: 60
         steps:
-          - checkout: self
-            fetchDepth: 1
-            lfs: false
-            submodules: false
-          - script: |
-              rustup update $(toolchain)
-              rustup default $(toolchain)
-            condition: ne(variables['toolchain'], '')
-            displayName: "Update and set Rust toolchain"
-          - script: |
-              cd questdb-rs
-              cargo build --example basic --features=chrono_timestamp
-              cargo build --example auth --features=chrono_timestamp
-              cargo build --example auth_tls --features=chrono_timestamp
-            displayName: Build Rust examples.
-          - script: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DQUESTDB_TESTS_AND_EXAMPLES=ON
-            env:
-              JAVA_HOME: $(JAVA_HOME_11_X64)
-            displayName: "Build Makefile with CMake"
-            condition: eq(variables['BUILD_WITH_MINGW'], '0')
-          # - script: |
-          #     choco upgrade mingw -y
-          #     rustup target add x86_64-pc-windows-gnu
-          #     cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -G "MinGW Makefiles"
-          #   env:
-          #     JAVA_HOME: $(JAVA_HOME_11_X64)
-          #   displayName: "Build Makefile with CMake"
-          #   condition: eq(variables['BUILD_WITH_MINGW'], '1')
-          - script: cmake --build build
-            env:
-              JAVA_HOME: $(JAVA_HOME_11_X64)
-            displayName: "Make"
+          - template: checkout-and-compile.yaml
           - script: python3 ci/run_all_tests.py
             env:
               JAVA_HOME: $(JAVA_HOME_11_X64)
@@ -134,3 +103,18 @@ stages:
               cd tls_proxy
               cargo clippy --all-targets --all-features -- -D warnings
             displayName: "tls_proxy: clippy"
+      - job: TestVsQuestDBMaster
+        displayName: "Test against the latest QuestDB 'master' branch"
+        pool:
+          vmImage: 'ubuntu-latest'
+        timeoutInMinutes: 60
+        steps:
+          - template: checkout-and-compile.yaml
+          - script: |
+              git clone https://github.com/questdb/questdb.git
+          - task: Maven3
+            displayName: "Compile QuestDB"
+            inputs:
+              mavenPOMFile: 'questdb/pom.xml'
+              jdkVersionOption: '1.11'
+              options: "install -DskipTests -Pbuild-web-console"
