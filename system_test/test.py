@@ -477,8 +477,11 @@ class TestSender(unittest.TestCase):
         # Call the example program.
         proj = Project()
         ext = '.exe' if sys.platform == 'win32' else ''
-        bin_path = next(proj.build_dir.glob(f'**/{bin_name}{ext}'))
-        port = QDB_FIXTURE.line_tcp_port
+        try:
+            bin_path = next(proj.build_dir.glob(f'**/{bin_name}{ext}'))
+        except StopIteration:
+            raise RuntimeError(f'Could not find {bin_name}{ext} in {proj.build_dir}')
+        port = QDB_FIXTURE.http_server_port if QDB_FIXTURE.http else QDB_FIXTURE.line_tcp_port
         args = [str(bin_path)]
         if tls:
             ca_path = proj.tls_certs_dir / 'server_rootCA.pem'
@@ -511,12 +514,14 @@ class TestSender(unittest.TestCase):
 
     def test_c_example(self):
         suffix = '_auth' if QDB_FIXTURE.auth else ''
+        suffix += '_http' if QDB_FIXTURE.http else ''
         self._test_example(
             f'line_sender_c_example{suffix}',
             f'c_cars{suffix}')
 
     def test_cpp_example(self):
         suffix = '_auth' if QDB_FIXTURE.auth else ''
+        suffix += '_http' if QDB_FIXTURE.http else ''
         self._test_example(
             f'line_sender_cpp_example{suffix}',
             f'cpp_cars{suffix}')
