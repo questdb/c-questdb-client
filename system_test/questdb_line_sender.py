@@ -275,6 +275,10 @@ def _setup_cdll():
         None,
         c_line_sender_opts_p)
     set_sig(
+        dll.line_sender_opts_transactional,
+        None,
+        c_line_sender_opts_p)
+    set_sig(
         dll.line_sender_opts_tls,
         None,
         c_line_sender_opts_p)
@@ -571,6 +575,7 @@ class Sender:
             interface: Optional[str] = None,
             auth: Optional[Tuple[str, str, str, str]] = None,
             http: bool = False,
+            transactional: bool = False,
             tls: Union[bool, str] = False,
             read_timeout: Optional[int] = None):
 
@@ -583,6 +588,9 @@ class Sender:
 
         if http:
             opts.http()
+
+        if transactional:
+            opts.transactional()
 
         if tls:
             if tls is True:

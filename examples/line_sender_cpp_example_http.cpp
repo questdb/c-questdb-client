@@ -10,8 +10,12 @@ static bool example(std::string_view host, std::string_view port)
     {
         questdb::ingress::opts opts{host, port};
 
-        // Connect via HTTP which provides better error feedback.
-        opts.http();
+        opts
+            // Connect via HTTP which provides better error feedback.
+            .http()
+
+            // Ensure that each buffer contains lines for a single table on each flush.
+            .transactional();
 
         questdb::ingress::line_sender sender{opts};
 

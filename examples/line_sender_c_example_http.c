@@ -24,6 +24,9 @@ static bool example(const char* host, const char* port)
     // Use ILP/HTTP instead of ILP/TCP for better error messages.
     line_sender_opts_http(opts);
 
+    // Ensure that each buffer contains lines for a single table on each flush.
+    line_sender_opts_transactional(opts);
+
     sender = line_sender_connect(opts, &err);
     line_sender_opts_free(opts);
     opts = NULL;

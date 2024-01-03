@@ -89,12 +89,13 @@ AUTH_MALFORMED2 = (
 
 
 class TestSender(unittest.TestCase):
-    def _mk_linesender(self):
+    def _mk_linesender(self, transactional=False):
         return qls.Sender(
             QDB_FIXTURE.host,
             QDB_FIXTURE.http_server_port if QDB_FIXTURE.http else QDB_FIXTURE.line_tcp_port,
             auth=AUTH if QDB_FIXTURE.auth else None,
-            http=QDB_FIXTURE.http)
+            http=QDB_FIXTURE.http,
+            transactional=transactional)
 
     def _expect_eventual_disconnect(self, sender):
         with self.assertRaisesRegex(
@@ -645,6 +646,40 @@ class TestSender(unittest.TestCase):
 
     def test_tls_webpki_and_os_roots(self):
         self._test_tls_special('webpki_and_os_roots')
+
+    def test_http_transactions(self):
+        if not QDB_FIXTURE.http:
+            self.skipTest('HTTP-only test')
+        if QDB_FIXTURE.version <= (7, 3, 7):
+            self.skipTest('No ILP/HTTP support')
+        table_name = uuid.uuid4().hex
+        with self._mk_linesender(transactional=True) as sender:
+            sender.table(table_name).column('col1', 'v1').at(time.time_ns())
+            sender.table(table_name).column('col1', 'v2').at(time.time_ns())
+            sender.table(table_name).column('col1', 42.5).at(time.time_ns())
+
+            try:
+                sender.flush()
+            except qls.SenderError as e:
+                if not QDB_FIXTURE.http:
+                    raise e
+                self.assertIn('Could not flush buffer', str(e))
+                self.assertIn('cast error from', str(e))
+                self.assertIn('STRING', str(e))
+                self.assertIn('code: invalid, line: 3', str(e))
+
+        with self.assertRaises(TimeoutError):
+            retry_check_table(table_name, timeout_sec=1, log=False)
+
+    def test_tcp_transactions(self):
+        if QDB_FIXTURE.http:
+            self.skipTest('TCP-only test')
+        if QDB_FIXTURE.version <= (7, 3, 7):
+            self.skipTest('No ILP/HTTP support')
+        with self.assertRaisesRegex(qls.SenderError, r'.*Transactional .* not supported.*'):
+            with self._mk_linesender(transactional=True) as sender:
+                pass
+
 
 def parse_args():
     parser = argparse.ArgumentParser('Run system tests.')
