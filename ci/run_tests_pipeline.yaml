@@ -50,8 +50,12 @@ stages:
             lfs: false
             submodules: false
           - template: compile.yaml
-            parameters:
-              BUILD_RUST_EXAMPLES: "1"
+          - script: |
+              cd questdb-rs
+              cargo build --example basic --features=chrono_timestamp
+              cargo build --example auth --features=chrono_timestamp
+              cargo build --example auth_tls --features=chrono_timestamp
+            displayName: "Build Rust examples"
           - script: python3 ci/run_all_tests.py
             env:
               JAVA_HOME: $(JAVA_HOME_11_X64)

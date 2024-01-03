@@ -1,25 +1,9 @@
-parameters:
-  - name: BUILD_RUST_EXAMPLES
-    type: string
-    default: "0"
-
-variables:
-  - name: BUILD_RUST_EXAMPLES
-    value: ${{ parameters.BUILD_RUST_EXAMPLES }}
-
 steps:
   - script: |
       rustup update $(toolchain)
       rustup default $(toolchain)
     condition: ne(variables['toolchain'], '')
     displayName: "Update and set Rust toolchain"
-  - script: |
-      cd questdb-rs
-      cargo build --example basic --features=chrono_timestamp
-      cargo build --example auth --features=chrono_timestamp
-      cargo build --example auth_tls --features=chrono_timestamp
-    displayName: Build Rust examples
-    condition: eq(variables['BUILD_RUST_EXAMPLES'], '1')
   - script: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DQUESTDB_TESTS_AND_EXAMPLES=ON
     env:
       JAVA_HOME: $(JAVA_HOME_11_X64)
