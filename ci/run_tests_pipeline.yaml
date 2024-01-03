@@ -52,9 +52,7 @@ stages:
           - template: compile.yaml
           - script: |
               cd questdb-rs
-              cargo build --example basic --features=chrono_timestamp
-              cargo build --example auth --features=chrono_timestamp
-              cargo build --example auth_tls --features=chrono_timestamp
+              cargo build --examples --all-features
             displayName: "Build Rust examples"
           - script: python3 ci/run_all_tests.py
             env:
