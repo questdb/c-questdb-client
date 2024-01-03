@@ -1,0 +1,29 @@
+steps:
+  - script: |
+      rustup update $(toolchain)
+      rustup default $(toolchain)
+    condition: ne(variables['toolchain'], '')
+    displayName: "Update and set Rust toolchain"
+  - script: |
+      cd questdb-rs
+      cargo build --example basic --features=chrono_timestamp
+      cargo build --example auth --features=chrono_timestamp
+      cargo build --example auth_tls --features=chrono_timestamp
+    displayName: Build Rust examples.
+  - script: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DQUESTDB_TESTS_AND_EXAMPLES=ON
+    env:
+      JAVA_HOME: $(JAVA_HOME_11_X64)
+    displayName: "Build Makefile with CMake"
+    condition: eq(variables['BUILD_WITH_MINGW'], '0')
+  # - script: |
+  #     choco upgrade mingw -y
+  #     rustup target add x86_64-pc-windows-gnu
+  #     cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -G "MinGW Makefiles"
+  #   env:
+  #     JAVA_HOME: $(JAVA_HOME_11_X64)
+  #   displayName: "Build Makefile with CMake"
+  #   condition: eq(variables['BUILD_WITH_MINGW'], '1')
+  - script: cmake --build build
+    env:
+      JAVA_HOME: $(JAVA_HOME_11_X64)
+    displayName: "Make"
