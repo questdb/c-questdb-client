@@ -19,38 +19,27 @@ stages:
             linux:
               imageName: "ubuntu-latest"
               poolName: "Azure Pipelines"
-              BUILD_WITH_MINGW: "0"
             linux-stable:
               imageName: "ubuntu-latest"
               poolName: "Azure Pipelines"
-              BUILD_WITH_MINGW: "0"
               toolchain: "stable"
             linux-beta:
               imageName: "ubuntu-latest"
               poolName: "Azure Pipelines"
-              BUILD_WITH_MINGW: "0"
               toolchain: "beta"
             linux-nightly:
               imageName: "ubuntu-latest"
               poolName: "Azure Pipelines"
-              BUILD_WITH_MINGW: "0"
               toolchain: "nightly"
             mac:
               imageName: "macos-latest"
               poolName: "Azure Pipelines"
-              BUILD_WITH_MINGW: "0"
             windows-msvc-2022:
               imageName: "windows-2022"
               poolName: "Azure Pipelines"
-              BUILD_WITH_MINGW: "0"
             windows-msvc-2019:
               imageName: "windows-2019"
               poolName: "Azure Pipelines"
-              BUILD_WITH_MINGW: "0"
-            # windows-mingw:
-            #   imageName: "windows-2022"
-            #   poolName: "Azure Pipelines"
-            #   BUILD_WITH_MINGW: "1"
         pool:
           name: $(poolName)
           vmImage: $(imageName)
@@ -61,6 +50,8 @@ stages:
             lfs: false
             submodules: false
           - template: compile.yaml
+            parameters:
+              BUILD_RUST_EXAMPLES: "1"
           - script: python3 ci/run_all_tests.py
             env:
               JAVA_HOME: $(JAVA_HOME_11_X64)
@@ -69,7 +60,6 @@ stages:
             inputs:
               pathToPublish: ./build
             displayName: "Publish build directory"
-            condition: eq(variables['BUILD_WITH_MINGW'], '1')
       - job: CargoFmtAndClippy
         displayName: "cargo fmt and clippy"
         pool:
@@ -118,6 +108,8 @@ stages:
             lfs: false
             submodules: false
           - template: compile.yaml
+            parameters:
+              BUILD_RUST_EXAMPLES: "0"
           - script: |
               git clone https://github.com/questdb/questdb.git
           - task: Maven@3
