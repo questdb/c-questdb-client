@@ -376,11 +376,14 @@ namespace questdb::ingress
                 return 0;
         }
 
-        /** The number of tables that will be written to in this buffer. */
-        size_t table_count() const noexcept
+        /**
+         * The buffer is transactional if sent over HTTP.
+         * A buffer stops being transactional if it contains rows for multiple tables.
+         */
+        bool transactional() const noexcept
         {
             if (_impl)
-                return ::line_sender_buffer_table_count(_impl);
+                return ::line_sender_buffer_transactional(_impl);
             else
                 return 0;
         }

@@ -764,13 +764,14 @@ pub unsafe extern "C" fn line_sender_buffer_row_count(buffer: *const line_sender
     buffer.row_count()
 }
 
-/// The number of tables that will be written to in this buffer.
+/// The buffer is transactional if sent over HTTP.
+/// A buffer stops being transactional if it contains rows for multiple tables.
 #[no_mangle]
-pub unsafe extern "C" fn line_sender_buffer_table_count(
+pub unsafe extern "C" fn line_sender_buffer_transactional(
     buffer: *const line_sender_buffer,
-) -> size_t {
+) -> bool {
     let buffer = unwrap_buffer(buffer);
-    buffer.table_count()
+    buffer.transactional()
 }
 
 /// Peek into the accumulated buffer that is to be sent out at the next `flush`.

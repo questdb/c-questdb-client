@@ -678,7 +678,7 @@ fn test_transactional() -> TestResult {
         .symbol("t1", "v1")?
         .column_f64("f1", 0.6)?
         .at(TimestampNanos::new(10000002))?;
-    assert_eq!(buffer1.table_count(), 2);
+    assert!(!buffer1.transactional());
 
     // A buffer with a single table.
     let mut buffer2 = Buffer::new();
@@ -688,7 +688,7 @@ fn test_transactional() -> TestResult {
         .column_f64("f1", 0.5)?
         .at(TimestampNanos::new(10000000))?;
     let buffer3 = buffer2.clone();
-    assert_eq!(buffer2.table_count(), 1);
+    assert!(buffer2.transactional());
 
     let mut server = MockServer::new()?;
     let mut sender = server.lsb().http().transactional().connect()?;

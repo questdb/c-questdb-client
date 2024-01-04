@@ -308,9 +308,12 @@ size_t line_sender_buffer_size(const line_sender_buffer* buffer);
 LINESENDER_API
 size_t line_sender_buffer_row_count(const line_sender_buffer* buffer);
 
-/** The number of tables that will be written to in this buffer. */
+/**
+ * The buffer is transactional if sent over HTTP.
+ * A buffer stops being transactional if it contains rows for multiple tables.
+ */
 LINESENDER_API
-size_t line_sender_buffer_table_count(const line_sender_buffer* buffer);
+bool line_sender_buffer_transactional(const line_sender_buffer* buffer);
 
 /**
  * Peek into the accumulated buffer that is to be sent out at the next `flush`.

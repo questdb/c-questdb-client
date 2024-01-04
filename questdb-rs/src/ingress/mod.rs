@@ -188,7 +188,6 @@ use crate::error::{self, Error, Result};
 use crate::gai;
 use core::time::Duration;
 use itoa;
-use std::collections::BTreeSet;
 use std::convert::{Infallible, TryFrom, TryInto};
 use std::fmt::{Formatter, Write};
 use std::io::{self, BufRead, BufReader, ErrorKind, Write as IoWrite};
@@ -590,7 +589,8 @@ impl OpCase {
 struct BufferState {
     op_case: OpCase,
     row_count: usize,
-    table_names: BTreeSet<Box<str>>,
+    first_table: Option<String>,
+    transactional: bool,
 }
 
 impl BufferState {
@@ -598,14 +598,16 @@ impl BufferState {
         Self {
             op_case: OpCase::Init,
             row_count: 0,
-            table_names: BTreeSet::new(),
+            first_table: None,
+            transactional: true,
         }
     }
 
     fn clear(&mut self) {
         self.op_case = OpCase::Init;
         self.row_count = 0;
-        self.table_names.clear();
+        self.first_table = None;
+        self.transactional = true;
     }
 }
 
@@ -745,9 +747,10 @@ impl Buffer {
         self.state.row_count
     }
 
-    /// The number of tables that will be written to in this buffer.
-    pub fn table_count(&self) -> usize {
-        self.state.table_names.len()
+    /// The buffer is transactional if sent over HTTP.
+    /// A buffer stops being transactional if it contains rows for multiple tables.
+    pub fn transactional(&self) -> bool {
+        self.state.transactional
     }
 
     pub fn is_empty(&self) -> bool {
@@ -883,11 +886,14 @@ impl Buffer {
         self.check_op(Op::Table)?;
         write_escaped_unquoted(&mut self.output, name.name);
         self.state.op_case = OpCase::TableWritten;
-        if !self.state.table_names.contains(name.name) {
-            // N.B.: https://github.com/rust-lang/rfcs/issues/1490
-            self.state
-                .table_names
-                .insert(name.name.to_owned().into_boxed_str());
+
+        // A buffer stops being transactional if it targets multiple tables.
+        if let Some(first_table) = &self.state.first_table {
+            if first_table != name.name {
+                self.state.transactional = false;
+            }
+        } else {
+            self.state.first_table = Some(name.name.to_owned());
         }
         Ok(self)
     }
@@ -2223,7 +2229,7 @@ impl Sender {
             }
             #[cfg(feature = "ilp-over-http")]
             ProtocolHandler::Http(ref state) => {
-                if state.config.transactional && buf.state.table_names.len() > 1 {
+                if state.config.transactional && !buf.transactional() {
                     return Err(error::fmt!(
                         InvalidApiCall,
                         "Buffer contains lines for multiple tables. \
