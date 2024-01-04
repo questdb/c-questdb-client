@@ -537,28 +537,7 @@ enum ProtocolHandler {
     Socket(Connection),
 
     #[cfg(feature = "ilp-over-http")]
-    Http {
-        agent: ureq::Agent,
-        url: String,
-
-        /// The content of the `Authorization` HTTP header.
-        auth: Option<String>,
-
-        /// Additional grace period added to the timeout as calculated via `min_throughput`.
-        timeout_grace_period: Duration,
-
-        /// Minimum throughput in bytes per second: Used to calculate the total request timeout.
-        min_throughput: u64,
-
-        /// The maximum number of retries to attempt a failed request.
-        max_retries: u32,
-
-        /// The initial delay before retrying a failed request, then doubled.
-        retry_interval: Duration,
-
-        /// Ensure that each flushed batch targets a single table.
-        transactional: bool,
-    },
+    Http(HttpHandlerState),
 }
 
 impl io::Read for Connection {
@@ -1365,41 +1344,6 @@ struct EcdsaAuthParams {
     pub_key_y: String,
 }
 
-#[cfg(feature = "ilp-over-http")]
-#[derive(Debug, Clone)]
-struct BasicAuthParams {
-    username: String,
-    password: String,
-}
-
-#[cfg(feature = "ilp-over-http")]
-impl BasicAuthParams {
-    fn to_header_string(&self) -> String {
-        let pair = format!("{}:{}", self.username, self.password);
-        let encoded = Base64::encode_string(pair.as_bytes());
-        format!("Basic {encoded}")
-    }
-}
-
-#[cfg(feature = "ilp-over-http")]
-#[derive(Debug, Clone)]
-struct TokenAuthParams {
-    token: String,
-}
-
-#[cfg(feature = "ilp-over-http")]
-impl TokenAuthParams {
-    fn to_header_string(&self) -> Result<String> {
-        if self.token.contains('\n') {
-            return Err(error::fmt!(
-                AuthError,
-                "Bad auth token: Should not contain new-line char."
-            ));
-        }
-        Ok(format!("Bearer {}", self.token))
-    }
-}
-
 #[derive(Debug, Clone)]
 enum AuthParams {
     Ecdsa(EcdsaAuthParams),
@@ -1632,7 +1576,7 @@ fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
 
 /// Protocol used to communicate with the QuestDB server.
 #[derive(Debug, Clone, Copy)]
-pub enum SenderProtocol {
+pub(crate) enum SenderProtocol {
     /// ILP over TCP (streaming).
     IlpOverTcp,
 
@@ -1670,19 +1614,7 @@ pub struct SenderBuilder {
     protocol: SenderProtocol,
 
     #[cfg(feature = "ilp-over-http")]
-    min_throughput: u64,
-
-    #[cfg(feature = "ilp-over-http")]
-    http_user_agent: Option<String>,
-
-    #[cfg(feature = "ilp-over-http")]
-    max_retries: u32,
-
-    #[cfg(feature = "ilp-over-http")]
-    retry_interval: Duration,
-
-    #[cfg(feature = "ilp-over-http")]
-    transactional: bool,
+    http: HttpConfig,
 }
 
 impl SenderBuilder {
@@ -1709,19 +1641,13 @@ impl SenderBuilder {
             protocol: SenderProtocol::IlpOverTcp,
 
             #[cfg(feature = "ilp-over-http")]
-            min_throughput: 102400, // 100 KiB/s
-
-            #[cfg(feature = "ilp-over-http")]
-            http_user_agent: None,
-
-            #[cfg(feature = "ilp-over-http")]
-            max_retries: 3,
-
-            #[cfg(feature = "ilp-over-http")]
-            retry_interval: Duration::from_millis(100),
-
-            #[cfg(feature = "ilp-over-http")]
-            transactional: false,
+            http: HttpConfig {
+                min_throughput: 102400, // 100 KiB/s
+                user_agent: None,
+                max_retries: 3,
+                retry_interval: Duration::from_millis(100),
+                transactional: false,
+            },
         }
     }
 
@@ -1924,7 +1850,7 @@ impl SenderBuilder {
     /// Set to 0 to disable retries.
     /// Also see [`retry_interval`](SenderBuilder::retry_interval).
     pub fn max_retries(mut self, value: u32) -> Self {
-        self.max_retries = value;
+        self.http.max_retries = value;
         self
     }
 
@@ -1935,7 +1861,7 @@ impl SenderBuilder {
     /// up to the maximum number of retries.
     /// Also see [`max_retries`](SenderBuilder::max_retries).
     pub fn retry_interval(mut self, value: Duration) -> Self {
-        self.retry_interval = value;
+        self.http.retry_interval = value;
         self
     }
 
@@ -1948,7 +1874,7 @@ impl SenderBuilder {
         if value.contains('\n') {
             panic!("User agent should not contain new-line char.");
         }
-        self.http_user_agent = Some(value.to_string());
+        self.http.user_agent = Some(value.to_string());
         self
     }
 
@@ -1958,7 +1884,7 @@ impl SenderBuilder {
     /// The value is expressed as a number of bytes per second.
     #[cfg(feature = "ilp-over-http")]
     pub fn min_throughput(mut self, value: u64) -> Self {
-        self.min_throughput = value;
+        self.http.min_throughput = value;
         self
     }
 
@@ -1967,7 +1893,7 @@ impl SenderBuilder {
     /// This works by ensuring that the buffer contains lines for a single table.
     #[cfg(feature = "ilp-over-http")]
     pub fn transactional(mut self) -> Self {
-        self.transactional = true;
+        self.http.transactional = true;
         self
     }
 
@@ -1990,7 +1916,7 @@ impl SenderBuilder {
         let handler = match self.protocol {
             SenderProtocol::IlpOverTcp => {
                 #[cfg(feature = "ilp-over-http")]
-                if self.transactional {
+                if self.http.transactional {
                     return Err(error::fmt!(
                         InvalidApiCall,
                         "Transactional flushes are not supported for ILP over TCP."
@@ -2095,7 +2021,8 @@ impl SenderBuilder {
                 }
 
                 let user_agent = self
-                    .http_user_agent
+                    .http
+                    .user_agent
                     .as_deref()
                     .unwrap_or(concat!("questdb/rust/", env!("CARGO_PKG_VERSION")));
                 let agent_builder = ureq::AgentBuilder::new()
@@ -2128,16 +2055,13 @@ impl SenderBuilder {
                     "http"
                 };
                 let url = format!("{}://{}:{}/write", proto, self.host, self.port);
-                ProtocolHandler::Http {
+                ProtocolHandler::Http(HttpHandlerState {
                     agent,
                     url,
                     auth,
                     timeout_grace_period: self.read_timeout,
-                    min_throughput: self.min_throughput,
-                    max_retries: self.max_retries,
-                    retry_interval: self.retry_interval,
-                    transactional: self.transactional,
-                }
+                    config: self.http.clone(),
+                })
             }
         };
 
@@ -2273,155 +2197,6 @@ impl F64Serializer {
     }
 }
 
-#[cfg(feature = "ilp-over-http")]
-fn parse_json_error(json: &serde_json::Value, msg: &str) -> Error {
-    let mut description = msg.to_string();
-    error::fmt!(ServerFlushError, "Could not flush buffer: {}", msg);
-
-    let error_id = json.get("errorId").and_then(|v| v.as_str());
-    let code = json.get("code").and_then(|v| v.as_str());
-    let line = json.get("line").and_then(|v| v.as_i64());
-
-    let mut printed_detail = false;
-    if error_id.is_some() || code.is_some() || line.is_some() {
-        description.push_str(" [");
-
-        if let Some(error_id) = error_id {
-            description.push_str("id: ");
-            description.push_str(error_id);
-            printed_detail = true;
-        }
-
-        if let Some(code) = code {
-            if printed_detail {
-                description.push_str(", ");
-            }
-            description.push_str("code: ");
-            description.push_str(code);
-            printed_detail = true;
-        }
-
-        if let Some(line) = line {
-            if printed_detail {
-                description.push_str(", ");
-            }
-            description.push_str("line: ");
-            write!(description, "{}", line).unwrap();
-        }
-
-        description.push(']');
-    }
-
-    error::fmt!(ServerFlushError, "Could not flush buffer: {}", description)
-}
-
-#[cfg(feature = "ilp-over-http")]
-fn parse_http_error(http_status_code: u16, response: ureq::Response) -> Error {
-    if http_status_code == 404 {
-        return error::fmt!(
-            HttpNotSupported,
-            "Could not flush buffer: HTTP endpoint does not support ILP."
-        );
-    } else if [401, 403].contains(&http_status_code) {
-        let description = match response.into_string() {
-            Ok(msg) if !msg.is_empty() => format!(": {}", msg),
-            _ => "".to_string(),
-        };
-        return error::fmt!(
-            AuthError,
-            "Could not flush buffer: HTTP endpoint authentication error{} [code: {}]",
-            description,
-            http_status_code
-        );
-    }
-
-    let is_json = response
-        .content_type()
-        .eq_ignore_ascii_case("application/json");
-    match response.into_string() {
-        Ok(msg) => {
-            let string_err = || error::fmt!(ServerFlushError, "Could not flush buffer: {}", msg);
-
-            if !is_json {
-                return string_err();
-            }
-
-            let json: serde_json::Value = match serde_json::from_str(&msg) {
-                Ok(json) => json,
-                Err(_) => {
-                    return string_err();
-                }
-            };
-
-            return if let Some(serde_json::Value::String(ref msg)) = json.get("message") {
-                parse_json_error(&json, msg)
-            } else {
-                string_err()
-            };
-        }
-        Err(err) => {
-            error::fmt!(SocketError, "Could not flush buffer: {}", err)
-        }
-    }
-}
-
-#[cfg(feature = "ilp-over-http")]
-fn is_retriable_error(err: &ureq::Error) -> bool {
-    use ureq::Error::*;
-    match err {
-        Transport(_) => true,
-
-        // Official HTTP codes
-        Status(500, _) |  // Internal Server Error
-        Status(503, _) |  // Service Unavailable
-        Status(504, _) |  // Gateway Timeout
-
-        // Unofficial extensions
-        Status(507, _) | // Insufficient Storage
-        Status(509, _) | // Bandwidth Limit Exceeded
-        Status(523, _) | // Origin is Unreachable
-        Status(524, _) | // A Timeout Occurred
-        Status(529, _) | // Site is overloaded
-        Status(599, _) => { // Network Connect Timeout Error
-            true
-        }
-        _ => false
-    }
-}
-
-#[cfg(feature = "ilp-over-http")]
-#[allow(clippy::result_large_err)] // `ureq::Error` is large enough to cause this warning.
-fn retry_http_send(
-    request: ureq::Request,
-    buf: &[u8],
-    max_retries: u32,
-    mut retry_interval: Duration,
-) -> std::result::Result<ureq::Response, ureq::Error> {
-    let mut counter = 0;
-
-    loop {
-        let response_or_err = request.clone().send_bytes(buf);
-        let last_err = match response_or_err {
-            Ok(res) => return Ok(res),
-            Err(err) => {
-                if is_retriable_error(&err) {
-                    err
-                } else {
-                    return Err(err);
-                }
-            }
-        };
-
-        counter += 1;
-        if counter > max_retries {
-            return Err(last_err);
-        }
-
-        std::thread::sleep(retry_interval);
-        retry_interval *= 2;
-    }
-}
-
 impl Sender {
     /// Send buffer to the QuestDB server, without clearing the
     /// buffer.
@@ -2449,36 +2224,33 @@ impl Sender {
                 })?;
             }
             #[cfg(feature = "ilp-over-http")]
-            ProtocolHandler::Http {
-                ref agent,
-                ref url,
-                ref auth,
-                timeout_grace_period,
-                min_throughput,
-                max_retries,
-                retry_interval,
-                transactional,
-            } => {
-                if transactional && buf.state.table_names.len() > 1 {
+            ProtocolHandler::Http(ref state) => {
+                if state.config.transactional && buf.state.table_names.len() > 1 {
                     return Err(error::fmt!(
                         InvalidApiCall,
                         "Buffer contains lines for multiple tables. \
                         Transactional flushes are only supported for buffers containing lines for a single table."
                     ));
                 }
-                let timeout =
-                    Duration::from_secs_f64((bytes.len() as f64) / (min_throughput as f64))
-                        + timeout_grace_period;
-                let request = agent
-                    .post(url)
+                let timeout = Duration::from_secs_f64(
+                    (bytes.len() as f64) / (state.config.min_throughput as f64),
+                ) + state.timeout_grace_period;
+                let request = state
+                    .agent
+                    .post(&state.url)
                     .query_pairs([("precision", "n")])
                     .timeout(timeout)
                     .set("Content-Type", "text/plain; charset=utf-8");
-                let request = match auth {
+                let request = match state.auth.as_ref() {
                     Some(auth) => request.set("Authorization", auth),
                     None => request,
                 };
-                let response_or_err = retry_http_send(request, bytes, max_retries, retry_interval);
+                let response_or_err = retry_http_send(
+                    request,
+                    bytes,
+                    state.config.max_retries,
+                    state.config.retry_interval,
+                );
                 match response_or_err {
                     Ok(_response) => {
                         // on success, there's no information in the response.
@@ -2519,3 +2291,9 @@ impl Sender {
 }
 
 mod timestamp;
+
+#[cfg(feature = "ilp-over-http")]
+mod http;
+
+#[cfg(feature = "ilp-over-http")]
+use http::*;
