@@ -2412,13 +2412,13 @@ fn retry_http_send(
             }
         };
 
-        std::thread::sleep(retry_interval);
         counter += 1;
-        retry_interval *= 2;
-
         if counter > max_retries {
             return Err(last_err);
         }
+
+        std::thread::sleep(retry_interval);
+        retry_interval *= 2;
     }
 }
 
