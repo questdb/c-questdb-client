@@ -43,7 +43,7 @@ fn load_certs(filename: &Path) -> Vec<Certificate> {
     rustls_pemfile::certs(&mut reader)
         .unwrap()
         .into_iter()
-        .map(|v| Certificate(v))
+        .map(Certificate)
         .collect()
 }
 
