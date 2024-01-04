@@ -42,8 +42,8 @@ fn load_certs(filename: &Path) -> Vec<Certificate> {
     let mut reader = BufReader::new(certfile);
     rustls_pemfile::certs(&mut reader)
         .unwrap()
-        .iter()
-        .map(|v| Certificate(v.clone()))
+        .into_iter()
+        .map(|v| Certificate(v))
         .collect()
 }
 
