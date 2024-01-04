@@ -173,6 +173,35 @@ def install_questdb(vers: str, download_url: str):
     return version_dir
 
 
+def install_questdb_from_repo(repo: pathlib.Path):
+    repo = repo.absolute()
+    target_dir = repo / 'core' / 'target'
+    try:
+        repo_jar = next(target_dir.glob("**/questdb*-SNAPSHOT.jar"))
+    except StopIteration:
+        raise RuntimeError(
+            f'Could not find QuestDB jar in repo {repo}. ' +
+            'Check path and ensure you built correctly.')
+    print(f'Starting QuestDB from jar {repo_jar}')
+    proj = Project()
+    vers = 'repo'
+    questdb_dir = proj.questdb_dir / vers
+    if questdb_dir.exists():
+        shutil.rmtree(questdb_dir)
+    (questdb_dir / 'data' / 'log').mkdir(parents=True)
+    bin_dir = questdb_dir / 'bin'
+    bin_dir.mkdir(parents=True)
+    conf_dir = questdb_dir / 'conf'
+    conf_dir.mkdir(parents=True)
+    data_conf_dir = questdb_dir / 'data' / 'conf'
+    data_conf_dir.mkdir(parents=True)
+    shutil.copy(repo_jar, bin_dir / 'questdb.jar')
+    repo_conf_dir = target_dir / 'classes' / 'io' / 'questdb' / 'site' / 'conf'
+    shutil.copy(repo_conf_dir / 'server.conf', conf_dir / 'server.conf')
+    shutil.copy(repo_conf_dir / 'mime.types', data_conf_dir / 'mime.types')
+    return questdb_dir
+
+
 def _parse_version(vers_str):
     def try_int(vers_part):
         try:

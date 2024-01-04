@@ -42,6 +42,7 @@ from fixture import (
     QuestDbFixture,
     TlsProxyFixture,
     install_questdb,
+    install_questdb_from_repo,
     list_questdb_releases,
     AUTH)
 import subprocess
@@ -747,27 +748,8 @@ def iter_versions(args):
     """
     if getattr(args, 'repo', None):
         # A specific repo path was provided.
-        repo = pathlib.Path(args.repo).absolute()
-        target_dir = repo / 'core' / 'target'
-        repo_jar = next(target_dir.glob("**/questdb*-SNAPSHOT.jar"))
-        print(f'Starting QuestDB from jar {repo_jar}')
-        proj = Project()
-        vers = 'repo'
-        questdb_dir = proj.questdb_dir / vers
-        if questdb_dir.exists():
-            shutil.rmtree(questdb_dir)
-        (questdb_dir / 'data' / 'log').mkdir(parents=True)
-        bin_dir = questdb_dir / 'bin'
-        bin_dir.mkdir(parents=True)
-        conf_dir = questdb_dir / 'conf'
-        conf_dir.mkdir(parents=True)
-        data_conf_dir = questdb_dir / 'data' / 'conf'
-        data_conf_dir.mkdir(parents=True)
-        shutil.copy(repo_jar, bin_dir / 'questdb.jar')
-        repo_conf_dir = target_dir / 'classes' / 'io' / 'questdb' / 'site' / 'conf'
-        shutil.copy(repo_conf_dir / 'server.conf', conf_dir / 'server.conf')
-        shutil.copy(repo_conf_dir / 'mime.types', data_conf_dir / 'mime.types')
-        yield questdb_dir
+        repo = pathlib.Path(args.repo)
+        yield install_questdb_from_repo(repo)
         return
 
     versions = None
