@@ -586,12 +586,10 @@ impl OpCase {
     }
 }
 
-pub type RowCount = usize;
-
 #[derive(Debug, Clone)]
 struct BufferState {
     op_case: OpCase,
-    row_count: RowCount,
+    row_count: usize,
     table_names: BTreeSet<Box<str>>,
 }
 
@@ -743,7 +741,7 @@ impl Buffer {
     }
 
     /// The number of rows accumulated in the buffer.
-    pub fn row_count(&self) -> RowCount {
+    pub fn row_count(&self) -> usize {
         self.state.row_count
     }
 
