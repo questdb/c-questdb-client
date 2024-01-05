@@ -100,6 +100,36 @@ fn test_table_name_too_long() -> TestResult {
 }
 
 #[test]
+fn test_row_count() -> TestResult {
+    let mut buffer = Buffer::new();
+    assert_eq!(buffer.row_count(), 0);
+
+    buffer.table("x")?.symbol("y", "z1")?.at_now()?;
+    buffer
+        .table("x")?
+        .symbol("y", "z2")?
+        .at(TimestampNanos::now())?;
+    assert_eq!(buffer.row_count(), 2);
+
+    buffer.set_marker()?;
+
+    buffer.table("x")?.symbol("y", "z3")?.at_now()?;
+    buffer
+        .table("x")?
+        .symbol("y", "z4")?
+        .at(TimestampNanos::now())?;
+    buffer.table("x")?.symbol("y", "z5")?.at_now()?;
+    assert_eq!(buffer.row_count(), 5);
+
+    buffer.rewind_to_marker()?;
+    assert_eq!(buffer.row_count(), 2);
+
+    buffer.clear();
+    assert_eq!(buffer.row_count(), 0);
+    Ok(())
+}
+
+#[test]
 fn test_auth_inconsistent_keys() -> TestResult {
     test_bad_key("fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU", // d
                  "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU", // x

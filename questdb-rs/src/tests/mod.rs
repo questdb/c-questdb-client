@@ -22,6 +22,10 @@
  *
  ******************************************************************************/
 mod f64_serializer;
+
+#[cfg(feature = "ilp-over-http")]
+mod http;
+
 mod mock;
 mod sender;
 

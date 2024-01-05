@@ -192,6 +192,7 @@ use std::convert::{Infallible, TryFrom, TryInto};
 use std::fmt::{Formatter, Write};
 use std::io::{self, BufRead, BufReader, ErrorKind, Write as IoWrite};
 use std::path::PathBuf;
+use std::string::ToString;
 use std::sync::Arc;
 
 use base64ct::{Base64, Base64UrlUnpadded, Encoding};
@@ -467,6 +468,77 @@ enum Connection {
     Tls(Box<StreamOwned<ClientConnection, Socket>>),
 }
 
+impl Connection {
+    fn send_key_id(&mut self, key_id: &str) -> Result<()> {
+        writeln!(self, "{}", key_id)
+            .map_err(|io_err| map_io_to_socket_err("Failed to send key_id: ", io_err))?;
+        Ok(())
+    }
+
+    fn read_challenge(&mut self) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        let mut reader = BufReader::new(self);
+        reader.read_until(b'\n', &mut buf).map_err(|io_err| {
+            map_io_to_socket_err(
+                "Failed to read authentication challenge (timed out?): ",
+                io_err,
+            )
+        })?;
+        if buf.last().copied().unwrap_or(b'\0') != b'\n' {
+            return Err(if buf.is_empty() {
+                error::fmt!(
+                    AuthError,
+                    concat!(
+                        "Did not receive auth challenge. ",
+                        "Is the database configured to require ",
+                        "authentication?"
+                    )
+                )
+            } else {
+                error::fmt!(AuthError, "Received incomplete auth challenge: {:?}", buf)
+            });
+        }
+        buf.pop(); // b'\n'
+        Ok(buf)
+    }
+
+    fn authenticate(&mut self, auth: &EcdsaAuthParams) -> Result<()> {
+        if auth.key_id.contains('\n') {
+            return Err(error::fmt!(
+                AuthError,
+                "Bad key id {:?}: Should not contain new-line char.",
+                auth.key_id
+            ));
+        }
+        let key_pair = parse_key_pair(auth)?;
+        self.send_key_id(auth.key_id.as_str())?;
+        let challenge = self.read_challenge()?;
+        let rng = SystemRandom::new();
+        let signature = key_pair
+            .sign(&rng, &challenge[..])
+            .map_err(|unspecified_err| {
+                error::fmt!(AuthError, "Failed to sign challenge: {}", unspecified_err)
+            })?;
+        let mut encoded_sig = Base64::encode_string(signature.as_ref());
+        encoded_sig.push('\n');
+        let buf = encoded_sig.as_bytes();
+        if let Err(io_err) = self.write_all(buf) {
+            return Err(map_io_to_socket_err(
+                "Could not send signed challenge: ",
+                io_err,
+            ));
+        }
+        Ok(())
+    }
+}
+
+enum ProtocolHandler {
+    Socket(Connection),
+
+    #[cfg(feature = "ilp-over-http")]
+    Http(HttpHandlerState),
+}
+
 impl io::Read for Connection {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
@@ -493,7 +565,7 @@ impl io::Write for Connection {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
-enum State {
+enum OpCase {
     Init = Op::Table as isize,
     TableWritten = Op::Symbol as isize | Op::Column as isize,
     SymbolWritten = Op::Symbol as isize | Op::Column as isize | Op::At as isize,
@@ -501,15 +573,41 @@ enum State {
     MayFlushOrTable = Op::Flush as isize | Op::Table as isize,
 }
 
-impl State {
+impl OpCase {
     fn next_op_descr(self) -> &'static str {
         match self {
-            State::Init => "should have called `table` instead",
-            State::TableWritten => "should have called `symbol` or `column` instead",
-            State::SymbolWritten => "should have called `symbol`, `column` or `at` instead",
-            State::ColumnWritten => "should have called `column` or `at` instead",
-            State::MayFlushOrTable => "should have called `flush` or `table` instead",
+            OpCase::Init => "should have called `table` instead",
+            OpCase::TableWritten => "should have called `symbol` or `column` instead",
+            OpCase::SymbolWritten => "should have called `symbol`, `column` or `at` instead",
+            OpCase::ColumnWritten => "should have called `column` or `at` instead",
+            OpCase::MayFlushOrTable => "should have called `flush` or `table` instead",
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BufferState {
+    op_case: OpCase,
+    row_count: usize,
+    first_table: Option<String>,
+    transactional: bool,
+}
+
+impl BufferState {
+    fn new() -> Self {
+        Self {
+            op_case: OpCase::Init,
+            row_count: 0,
+            first_table: None,
+            transactional: true,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.op_case = OpCase::Init;
+        self.row_count = 0;
+        self.first_table = None;
+        self.transactional = true;
     }
 }
 
@@ -598,11 +696,11 @@ impl State {
 /// [`rewind_to_marker`](Buffer::rewind_to_marker) method to go back to the
 /// marked last known good state.
 ///
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct Buffer {
-    state: State,
     output: String,
-    marker: Option<(usize, State)>,
+    state: BufferState,
+    marker: Option<(usize, BufferState)>,
     max_name_len: usize,
 }
 
@@ -611,8 +709,8 @@ impl Buffer {
     /// which is the same as the QuestDB default.
     pub fn new() -> Self {
         Self {
-            state: State::Init,
             output: String::new(),
+            state: BufferState::new(),
             marker: None,
             max_name_len: 127,
         }
@@ -644,6 +742,17 @@ impl Buffer {
         self.output.len()
     }
 
+    /// The number of rows accumulated in the buffer.
+    pub fn row_count(&self) -> usize {
+        self.state.row_count
+    }
+
+    /// The buffer is transactional if sent over HTTP.
+    /// A buffer stops being transactional if it contains rows for multiple tables.
+    pub fn transactional(&self) -> bool {
+        self.state.transactional
+    }
+
     pub fn is_empty(&self) -> bool {
         self.output.is_empty()
     }
@@ -666,7 +775,7 @@ impl Buffer {
     /// Once the marker is no longer needed, call
     /// [`clear_marker`](Buffer::clear_marker).
     pub fn set_marker(&mut self) -> Result<()> {
-        if (self.state as isize & Op::Table as isize) == 0 {
+        if (self.state.op_case as isize & Op::Table as isize) == 0 {
             return Err(error::fmt!(
                 InvalidApiCall,
                 concat!(
@@ -676,7 +785,7 @@ impl Buffer {
                 )
             ));
         }
-        self.marker = Some((self.output.len(), self.state));
+        self.marker = Some((self.output.len(), self.state.clone()));
         Ok(())
     }
 
@@ -685,10 +794,9 @@ impl Buffer {
     ///
     /// As a side-effect, this also clears the marker.
     pub fn rewind_to_marker(&mut self) -> Result<()> {
-        if let Some((position, state)) = self.marker {
+        if let Some((position, state)) = self.marker.take() {
             self.output.truncate(position);
             self.state = state;
-            self.marker = None;
             Ok(())
         } else {
             Err(error::fmt!(
@@ -701,7 +809,7 @@ impl Buffer {
     /// Discard any marker as may have been set by
     /// [`set_marker`](Buffer::set_marker).
     ///
-    /// Idempodent.
+    /// Idempotent.
     pub fn clear_marker(&mut self) {
         self.marker = None;
     }
@@ -710,22 +818,23 @@ impl Buffer {
     /// [`capacity`](Buffer::capacity).
     pub fn clear(&mut self) {
         self.output.clear();
+        self.state.clear();
         self.marker = None;
-        self.state = State::Init;
     }
 
+    /// Check if the next API operation is allowed as per the OP case state machine.
     #[inline(always)]
-    fn check_state(&self, op: Op) -> Result<()> {
-        if (self.state as isize & op as isize) > 0 {
-            return Ok(());
+    fn check_op(&self, op: Op) -> Result<()> {
+        if (self.state.op_case as isize & op as isize) > 0 {
+            Ok(())
+        } else {
+            Err(error::fmt!(
+                InvalidApiCall,
+                "State error: Bad call to `{}`, {}.",
+                op.descr(),
+                self.state.op_case.next_op_descr()
+            ))
         }
-        let error = error::fmt!(
-            InvalidApiCall,
-            "State error: Bad call to `{}`, {}.",
-            op.descr(),
-            self.state.next_op_descr()
-        );
-        Err(error)
     }
 
     #[inline(always)]
@@ -774,9 +883,18 @@ impl Buffer {
     {
         let name: TableName<'a> = name.try_into()?;
         self.validate_max_name_len(name.name)?;
-        self.check_state(Op::Table)?;
+        self.check_op(Op::Table)?;
         write_escaped_unquoted(&mut self.output, name.name);
-        self.state = State::TableWritten;
+        self.state.op_case = OpCase::TableWritten;
+
+        // A buffer stops being transactional if it targets multiple tables.
+        if let Some(first_table) = &self.state.first_table {
+            if first_table != name.name {
+                self.state.transactional = false;
+            }
+        } else {
+            self.state.first_table = Some(name.name.to_owned());
+        }
         Ok(self)
     }
 
@@ -831,12 +949,12 @@ impl Buffer {
     {
         let name: ColumnName<'a> = name.try_into()?;
         self.validate_max_name_len(name.name)?;
-        self.check_state(Op::Symbol)?;
+        self.check_op(Op::Symbol)?;
         self.output.push(',');
         write_escaped_unquoted(&mut self.output, name.name);
         self.output.push('=');
         write_escaped_unquoted(&mut self.output, value.as_ref());
-        self.state = State::SymbolWritten;
+        self.state.op_case = OpCase::SymbolWritten;
         Ok(self)
     }
 
@@ -847,16 +965,16 @@ impl Buffer {
     {
         let name: ColumnName<'a> = name.try_into()?;
         self.validate_max_name_len(name.name)?;
-        self.check_state(Op::Column)?;
+        self.check_op(Op::Column)?;
         self.output
-            .push(if (self.state as isize & Op::Symbol as isize) > 0 {
+            .push(if (self.state.op_case as isize & Op::Symbol as isize) > 0 {
                 ' '
             } else {
                 ','
             });
         write_escaped_unquoted(&mut self.output, name.name);
         self.output.push('=');
-        self.state = State::ColumnWritten;
+        self.state.op_case = OpCase::ColumnWritten;
         Ok(self)
     }
 
@@ -1139,7 +1257,7 @@ impl Buffer {
         T: TryInto<Timestamp>,
         Error: From<T::Error>,
     {
-        self.check_state(Op::At)?;
+        self.check_op(Op::At)?;
         let timestamp: Timestamp = timestamp.try_into()?;
 
         // https://github.com/rust-lang/rust/issues/115880
@@ -1159,7 +1277,8 @@ impl Buffer {
         self.output.push(' ');
         self.output.push_str(printed);
         self.output.push('\n');
-        self.state = State::MayFlushOrTable;
+        self.state.op_case = OpCase::MayFlushOrTable;
+        self.state.row_count += 1;
         Ok(())
     }
 
@@ -1190,9 +1309,10 @@ impl Buffer {
     /// assigned by the server may drift significantly from when the data
     /// was recorded in the buffer.
     pub fn at_now(&mut self) -> Result<()> {
-        self.check_state(Op::At)?;
+        self.check_op(Op::At)?;
         self.output.push('\n');
-        self.state = State::MayFlushOrTable;
+        self.state.op_case = OpCase::MayFlushOrTable;
+        self.state.row_count += 1;
         Ok(())
     }
 }
@@ -1210,7 +1330,7 @@ impl Default for Buffer {
 /// * To send messages, call the [`flush`](Sender::flush) method.
 pub struct Sender {
     descr: String,
-    conn: Connection,
+    handler: ProtocolHandler,
     connected: bool,
 }
 
@@ -1221,11 +1341,22 @@ impl std::fmt::Debug for Sender {
 }
 
 #[derive(Debug, Clone)]
-struct AuthParams {
+struct EcdsaAuthParams {
     key_id: String,
     priv_key: String,
     pub_key_x: String,
     pub_key_y: String,
+}
+
+#[derive(Debug, Clone)]
+enum AuthParams {
+    Ecdsa(EcdsaAuthParams),
+
+    #[cfg(feature = "ilp-over-http")]
+    Basic(BasicAuthParams),
+
+    #[cfg(feature = "ilp-over-http")]
+    Token(TokenAuthParams),
 }
 
 /// Root used to determine how to validate the server's TLS certificate.
@@ -1447,6 +1578,17 @@ fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
     Ok(Some(Arc::new(config)))
 }
 
+/// Protocol used to communicate with the QuestDB server.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SenderProtocol {
+    /// ILP over TCP (streaming).
+    IlpOverTcp,
+
+    #[cfg(feature = "ilp-over-http")]
+    /// ILP over HTTP (request-response, InfluxDB-compatible).
+    IlpOverHttp,
+}
+
 /// Accumulate parameters for a new `Sender` instance.
 ///
 /// ```no_run
@@ -1473,6 +1615,10 @@ pub struct SenderBuilder {
     net_interface: Option<String>,
     auth: Option<AuthParams>,
     tls: Tls,
+    protocol: SenderProtocol,
+
+    #[cfg(feature = "ilp-over-http")]
+    http: HttpConfig,
 }
 
 impl SenderBuilder {
@@ -1496,6 +1642,16 @@ impl SenderBuilder {
             net_interface: None,
             auth: None,
             tls: Tls::Disabled,
+            protocol: SenderProtocol::IlpOverTcp,
+
+            #[cfg(feature = "ilp-over-http")]
+            http: HttpConfig {
+                min_throughput: 102400, // 100 KiB/s
+                user_agent: None,
+                max_retries: 3,
+                retry_interval: Duration::from_millis(100),
+                transactional: false,
+            },
         }
     }
 
@@ -1521,9 +1677,10 @@ impl SenderBuilder {
         self
     }
 
-    /// Authentication Parameters.
+    /// ECDSA Authentication Parameters for ILP over TCP.
+    /// For HTTP, use [`basic_auth`](SenderBuilder::basic_auth).
     ///
-    /// If not called, authentication is disabled.
+    /// If not called, authentication is disabled for ILP over TCP.
     ///
     /// # Arguments
     /// * `key_id` - Key identifier, AKA "kid" in JWT. This is sometimes
@@ -1559,12 +1716,43 @@ impl SenderBuilder {
         C: Into<String>,
         D: Into<String>,
     {
-        self.auth = Some(AuthParams {
+        self.auth = Some(AuthParams::Ecdsa(EcdsaAuthParams {
             key_id: key_id.into(),
             priv_key: priv_key.into(),
             pub_key_x: pub_key_x.into(),
             pub_key_y: pub_key_y.into(),
-        });
+        }));
+        self
+    }
+
+    /// Basic Authentication Parameters for ILP over HTTP.
+    /// For TCP, use [`auth`](SenderBuilder::auth).
+    ///
+    /// For HTTP you can also use [`token_auth`](SenderBuilder::token_auth).
+    #[cfg(feature = "ilp-over-http")]
+    pub fn basic_auth<A, B>(mut self, username: A, password: B) -> Self
+    where
+        A: Into<String>,
+        B: Into<String>,
+    {
+        self.auth = Some(AuthParams::Basic(BasicAuthParams {
+            username: username.into(),
+            password: password.into(),
+        }));
+        self
+    }
+
+    /// Tokene (Bearer) Authentication Parameters for ILP over HTTP.
+    /// For TCP, use [`auth`](SenderBuilder::auth).
+    ///
+    /// For HTTP you can also use [`basic_auth`](SenderBuilder::basic_auth).
+    #[cfg(feature = "ilp-over-http")]
+    pub fn token_auth<A>(mut self, token: A) -> Self
+    where
+        A: Into<String>,
+    {
+        let token: String = token.into();
+        self.auth = Some(AuthParams::Token(TokenAuthParams { token }));
         self
     }
 
@@ -1652,6 +1840,67 @@ impl SenderBuilder {
         self
     }
 
+    #[cfg(feature = "ilp-over-http")]
+    /// Configure to use HTTP instead of TCP.
+    /// If you want to configure additional HTTP options, use `http_with_opts` instead.
+    pub fn http(mut self) -> Self {
+        self.protocol = SenderProtocol::IlpOverHttp;
+        self
+    }
+
+    #[cfg(feature = "ilp-over-http")]
+    /// The maximum number of retries.
+    /// The default is 3.
+    /// Set to 0 to disable retries.
+    /// Also see [`retry_interval`](SenderBuilder::retry_interval).
+    pub fn max_retries(mut self, value: u32) -> Self {
+        self.http.max_retries = value;
+        self
+    }
+
+    #[cfg(feature = "ilp-over-http")]
+    /// The initial retry interval.
+    /// This the default is 100 milliseconds.
+    /// The retry interval is doubled after each failed attempt,
+    /// up to the maximum number of retries.
+    /// Also see [`max_retries`](SenderBuilder::max_retries).
+    pub fn retry_interval(mut self, value: Duration) -> Self {
+        self.http.retry_interval = value;
+        self
+    }
+
+    /// Internal API, do not use.
+    /// This is exposed exclusively for the Python client.
+    /// We (QuestDB) use this to help us debug which client is being used if we encounter issues.
+    #[cfg(feature = "ilp-over-http")]
+    #[doc(hidden)]
+    pub fn user_agent(mut self, value: &str) -> Self {
+        if value.contains('\n') {
+            panic!("User agent should not contain new-line char.");
+        }
+        self.http.user_agent = Some(value.to_string());
+        self
+    }
+
+    /// Minimum expected throughput in bytes per second for HTTP requests.
+    /// If the throughput is lower than this value, the connection will time out.
+    /// The default is 100 KiB/s.
+    /// The value is expressed as a number of bytes per second.
+    #[cfg(feature = "ilp-over-http")]
+    pub fn min_throughput(mut self, value: u64) -> Self {
+        self.http.min_throughput = value;
+        self
+    }
+
+    /// Enable transactional flushes.
+    /// This is only relevant for HTTP.
+    /// This works by ensuring that the buffer contains lines for a single table.
+    #[cfg(feature = "ilp-over-http")]
+    pub fn transactional(mut self) -> Self {
+        self.http.transactional = true;
+        self
+    }
+
     /// Connect synchronously.
     ///
     /// Will return once the connection is fully established:
@@ -1659,45 +1908,6 @@ impl SenderBuilder {
     /// completed before returning.
     pub fn connect(&self) -> Result<Sender> {
         let mut descr = format!("Sender[host={:?},port={:?},", self.host, self.port);
-        let addr: SockAddr = gai::resolve_host_port(self.host.as_str(), self.port.as_str())?;
-        let mut sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
-            .map_err(|io_err| map_io_to_socket_err("Could not open TCP socket: ", io_err))?;
-
-        // See: https://idea.popcount.org/2014-04-03-bind-before-connect/
-        // We set `SO_REUSEADDR` on the outbound socket to avoid issues where a client may exhaust
-        // their interface's ports. See: https://github.com/questdb/py-questdb-client/issues/21
-        sock.set_reuse_address(true)
-            .map_err(|io_err| map_io_to_socket_err("Could not set SO_REUSEADDR: ", io_err))?;
-
-        sock.set_linger(Some(Duration::from_secs(120)))
-            .map_err(|io_err| map_io_to_socket_err("Could not set socket linger: ", io_err))?;
-        sock.set_keepalive(true)
-            .map_err(|io_err| map_io_to_socket_err("Could not set SO_KEEPALIVE: ", io_err))?;
-        sock.set_nodelay(true)
-            .map_err(|io_err| map_io_to_socket_err("Could not set TCP_NODELAY: ", io_err))?;
-        if let Some(ref host) = self.net_interface {
-            let bind_addr = gai::resolve_host(host.as_str())?;
-            sock.bind(&bind_addr).map_err(|io_err| {
-                map_io_to_socket_err(
-                    &format!("Could not bind to interface address {:?}: ", host),
-                    io_err,
-                )
-            })?;
-        }
-        sock.connect(&addr).map_err(|io_err| {
-            let host_port = format!("{}:{}", self.host, self.port);
-            let prefix = format!("Could not connect to {:?}: ", host_port);
-            map_io_to_socket_err(&prefix, io_err)
-        })?;
-
-        // We read during both TLS handshake and authentication.
-        // We set up a read timeout to prevent the client from "hanging"
-        // should we be connecting to a server configured in a different way
-        // from the client.
-        sock.set_read_timeout(Some(self.read_timeout))
-            .map_err(|io_err| {
-                map_io_to_socket_err("Failed to set read timeout on socket: ", io_err)
-            })?;
 
         match self.tls {
             Tls::Disabled => write!(descr, "tls=enabled,").unwrap(),
@@ -1707,39 +1917,158 @@ impl SenderBuilder {
             Tls::InsecureSkipVerify => write!(descr, "tls=insecure_skip_verify,").unwrap(),
         }
 
-        let conn = match configure_tls(&self.tls)? {
-            Some(tls_config) => {
-                let server_name: ServerName =
-                    self.host.as_str().try_into().map_err(|inv_dns_err| {
-                        error::fmt!(TlsError, "Bad host: {}", inv_dns_err)
+        let handler = match self.protocol {
+            SenderProtocol::IlpOverTcp => {
+                #[cfg(feature = "ilp-over-http")]
+                if self.http.transactional {
+                    return Err(error::fmt!(
+                        InvalidApiCall,
+                        "Transactional flushes are not supported for ILP over TCP."
+                    ));
+                }
+
+                let addr: SockAddr =
+                    gai::resolve_host_port(self.host.as_str(), self.port.as_str())?;
+                let mut sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
+                    .map_err(|io_err| {
+                        map_io_to_socket_err("Could not open TCP socket: ", io_err)
                     })?;
-                let mut tls_conn =
-                    ClientConnection::new(tls_config, server_name).map_err(|rustls_err| {
-                        error::fmt!(TlsError, "Could not create TLS client: {}", rustls_err)
+
+                // See: https://idea.popcount.org/2014-04-03-bind-before-connect/
+                // We set `SO_REUSEADDR` on the outbound socket to avoid issues where a client may exhaust
+                // their interface's ports. See: https://github.com/questdb/py-questdb-client/issues/21
+                sock.set_reuse_address(true).map_err(|io_err| {
+                    map_io_to_socket_err("Could not set SO_REUSEADDR: ", io_err)
+                })?;
+
+                sock.set_linger(Some(Duration::from_secs(120)))
+                    .map_err(|io_err| {
+                        map_io_to_socket_err("Could not set socket linger: ", io_err)
                     })?;
-                while tls_conn.wants_write() || tls_conn.is_handshaking() {
-                    tls_conn.complete_io(&mut sock).map_err(|io_err| {
-                        if (io_err.kind() == ErrorKind::TimedOut)
-                            || (io_err.kind() == ErrorKind::WouldBlock)
-                        {
-                            error::fmt!(
-                                TlsError,
-                                concat!(
-                                    "Failed to complete TLS handshake:",
-                                    " Timed out waiting for server ",
-                                    "response after {:?}."
-                                ),
-                                self.read_timeout
-                            )
-                        } else {
-                            error::fmt!(TlsError, "Failed to complete TLS handshake: {}", io_err)
-                        }
+                sock.set_keepalive(true).map_err(|io_err| {
+                    map_io_to_socket_err("Could not set SO_KEEPALIVE: ", io_err)
+                })?;
+                sock.set_nodelay(true).map_err(|io_err| {
+                    map_io_to_socket_err("Could not set TCP_NODELAY: ", io_err)
+                })?;
+                if let Some(ref host) = self.net_interface {
+                    let bind_addr = gai::resolve_host(host.as_str())?;
+                    sock.bind(&bind_addr).map_err(|io_err| {
+                        map_io_to_socket_err(
+                            &format!("Could not bind to interface address {:?}: ", host),
+                            io_err,
+                        )
                     })?;
                 }
-                Connection::Tls(StreamOwned::new(tls_conn, sock).into())
+                sock.connect(&addr).map_err(|io_err| {
+                    let host_port = format!("{}:{}", self.host, self.port);
+                    let prefix = format!("Could not connect to {:?}: ", host_port);
+                    map_io_to_socket_err(&prefix, io_err)
+                })?;
+
+                // We read during both TLS handshake and authentication.
+                // We set up a read timeout to prevent the client from "hanging"
+                // should we be connecting to a server configured in a different way
+                // from the client.
+                sock.set_read_timeout(Some(self.read_timeout))
+                    .map_err(|io_err| {
+                        map_io_to_socket_err("Failed to set read timeout on socket: ", io_err)
+                    })?;
+
+                ProtocolHandler::Socket(match configure_tls(&self.tls)? {
+                    Some(tls_config) => {
+                        let server_name: ServerName =
+                            self.host.as_str().try_into().map_err(|inv_dns_err| {
+                                error::fmt!(TlsError, "Bad host: {}", inv_dns_err)
+                            })?;
+                        let mut tls_conn = ClientConnection::new(tls_config, server_name).map_err(
+                            |rustls_err| {
+                                error::fmt!(TlsError, "Could not create TLS client: {}", rustls_err)
+                            },
+                        )?;
+                        while tls_conn.wants_write() || tls_conn.is_handshaking() {
+                            tls_conn.complete_io(&mut sock).map_err(|io_err| {
+                                if (io_err.kind() == ErrorKind::TimedOut)
+                                    || (io_err.kind() == ErrorKind::WouldBlock)
+                                {
+                                    error::fmt!(
+                                        TlsError,
+                                        concat!(
+                                            "Failed to complete TLS handshake:",
+                                            " Timed out waiting for server ",
+                                            "response after {:?}."
+                                        ),
+                                        self.read_timeout
+                                    )
+                                } else {
+                                    error::fmt!(
+                                        TlsError,
+                                        "Failed to complete TLS handshake: {}",
+                                        io_err
+                                    )
+                                }
+                            })?;
+                        }
+                        Connection::Tls(StreamOwned::new(tls_conn, sock).into())
+                    }
+                    None => Connection::Direct(sock),
+                })
             }
-            None => Connection::Direct(sock),
+            #[cfg(feature = "ilp-over-http")]
+            SenderProtocol::IlpOverHttp => {
+                if self.net_interface.is_some() {
+                    // See: https://github.com/algesten/ureq/issues/692
+                    return Err(error::fmt!(
+                        InvalidApiCall,
+                        "net_interface is not supported for ILP over HTTP."
+                    ));
+                }
+
+                let user_agent = self
+                    .http
+                    .user_agent
+                    .as_deref()
+                    .unwrap_or(concat!("questdb/rust/", env!("CARGO_PKG_VERSION")));
+                let agent_builder = ureq::AgentBuilder::new()
+                    .user_agent(user_agent)
+                    .no_delay(true);
+                let agent_builder = match configure_tls(&self.tls)? {
+                    Some(tls_config) => agent_builder.tls_config(tls_config),
+                    None => agent_builder,
+                };
+                let auth = match self.auth.clone() {
+                    #[cfg(feature = "ilp-over-http")]
+                    Some(AuthParams::Basic(auth)) => Some(auth.to_header_string()),
+
+                    #[cfg(feature = "ilp-over-http")]
+                    Some(AuthParams::Token(auth)) => Some(auth.to_header_string()?),
+
+                    Some(AuthParams::Ecdsa(_)) => {
+                        return Err(error::fmt!(
+                            AuthError,
+                            "ECDSA authentication is not supported for ILP over HTTP. \
+                            Please use basic or token authentication instead."
+                        ));
+                    }
+                    None => None,
+                };
+                let agent = agent_builder.build();
+                let proto = if self.tls.is_enabled() {
+                    "https"
+                } else {
+                    "http"
+                };
+                let url = format!("{}://{}:{}/write", proto, self.host, self.port);
+                ProtocolHandler::Http(HttpHandlerState {
+                    agent,
+                    url,
+                    auth,
+                    timeout_grace_period: self.read_timeout,
+                    config: self.http.clone(),
+                })
+            }
         };
+
         if self.auth.is_some() {
             descr.push_str("auth=on]");
         } else {
@@ -1747,11 +2076,36 @@ impl SenderBuilder {
         }
         let mut sender = Sender {
             descr,
-            conn,
+            handler,
             connected: true,
         };
         if let Some(auth) = self.auth.as_ref() {
-            sender.authenticate(auth)?;
+            #[allow(irrefutable_let_patterns)]
+            if let ProtocolHandler::Socket(conn) = &mut sender.handler {
+                match auth {
+                    AuthParams::Ecdsa(auth) => {
+                        conn.authenticate(auth)?;
+                    }
+
+                    #[cfg(feature = "ilp-over-http")]
+                    AuthParams::Basic(_auth) => {
+                        return Err(error::fmt!(
+                            AuthError,
+                            "Basic authentication is not supported for ILP over TCP. \
+                            Please use ECDSA authentication instead."
+                        ));
+                    }
+
+                    #[cfg(feature = "ilp-over-http")]
+                    AuthParams::Token(_auth) => {
+                        return Err(error::fmt!(
+                            AuthError,
+                            "Token authentication is not supported for ILP over TCP. \
+                            Please use ECDSA authentication instead."
+                        ));
+                    }
+                }
+            }
         }
         Ok(sender)
     }
@@ -1790,7 +2144,7 @@ fn parse_public_key(pub_key_x: &str, pub_key_y: &str) -> Result<Vec<u8>> {
     Ok(encoded)
 }
 
-fn parse_key_pair(auth: &AuthParams) -> Result<EcdsaKeyPair> {
+fn parse_key_pair(auth: &EcdsaAuthParams) -> Result<EcdsaKeyPair> {
     let private_key = b64_decode("private authentication key", auth.priv_key.as_str())?;
     let public_key = parse_public_key(auth.pub_key_x.as_str(), auth.pub_key_y.as_str())?;
     let system_random = SystemRandom::new();
@@ -1848,68 +2202,6 @@ impl F64Serializer {
 }
 
 impl Sender {
-    fn send_key_id(&mut self, key_id: &str) -> Result<()> {
-        writeln!(&mut self.conn, "{}", key_id)
-            .map_err(|io_err| map_io_to_socket_err("Failed to send key_id: ", io_err))?;
-        Ok(())
-    }
-
-    fn read_challenge(&mut self) -> Result<Vec<u8>> {
-        let mut buf = Vec::new();
-        let mut reader = BufReader::new(&mut self.conn);
-        reader.read_until(b'\n', &mut buf).map_err(|io_err| {
-            map_io_to_socket_err(
-                "Failed to read authentication challenge (timed out?): ",
-                io_err,
-            )
-        })?;
-        if buf.last().copied().unwrap_or(b'\0') != b'\n' {
-            return Err(if buf.is_empty() {
-                error::fmt!(
-                    AuthError,
-                    concat!(
-                        "Did not receive auth challenge. ",
-                        "Is the database configured to require ",
-                        "authentication?"
-                    )
-                )
-            } else {
-                error::fmt!(AuthError, "Received incomplete auth challenge: {:?}", buf)
-            });
-        }
-        buf.pop(); // b'\n'
-        Ok(buf)
-    }
-
-    fn authenticate(&mut self, auth: &AuthParams) -> Result<()> {
-        if auth.key_id.contains('\n') {
-            return Err(error::fmt!(
-                AuthError,
-                "Bad key id {:?}: Should not contain new-line char.",
-                auth.key_id
-            ));
-        }
-        let key_pair = parse_key_pair(auth)?;
-        self.send_key_id(auth.key_id.as_str())?;
-        let challenge = self.read_challenge()?;
-        let rng = ring::rand::SystemRandom::new();
-        let signature = key_pair
-            .sign(&rng, &challenge[..])
-            .map_err(|unspecified_err| {
-                error::fmt!(AuthError, "Failed to sign challenge: {}", unspecified_err)
-            })?;
-        let mut encoded_sig = Base64::encode_string(signature.as_ref());
-        encoded_sig.push('\n');
-        let buf = encoded_sig.as_bytes();
-        if let Err(io_err) = self.conn.write_all(buf) {
-            return Err(map_io_to_socket_err(
-                "Could not send signed challenge: ",
-                io_err,
-            ));
-        }
-        Ok(())
-    }
-
     /// Send buffer to the QuestDB server, without clearing the
     /// buffer.
     ///
@@ -1923,11 +2215,62 @@ impl Sender {
                 "Could not flush buffer: not connected to database."
             ));
         }
-        buf.check_state(Op::Flush)?;
+        buf.check_op(Op::Flush)?;
         let bytes = buf.as_str().as_bytes();
-        if let Err(io_err) = self.conn.write_all(bytes) {
-            self.connected = false;
-            return Err(map_io_to_socket_err("Could not flush buffer: ", io_err));
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        match self.handler {
+            ProtocolHandler::Socket(ref mut conn) => {
+                conn.write_all(bytes).map_err(|io_err| {
+                    self.connected = false;
+                    map_io_to_socket_err("Could not flush buffer: ", io_err)
+                })?;
+            }
+            #[cfg(feature = "ilp-over-http")]
+            ProtocolHandler::Http(ref state) => {
+                if state.config.transactional && !buf.transactional() {
+                    return Err(error::fmt!(
+                        InvalidApiCall,
+                        "Buffer contains lines for multiple tables. \
+                        Transactional flushes are only supported for buffers containing lines for a single table."
+                    ));
+                }
+                let timeout = Duration::from_secs_f64(
+                    (bytes.len() as f64) / (state.config.min_throughput as f64),
+                ) + state.timeout_grace_period;
+                let request = state
+                    .agent
+                    .post(&state.url)
+                    .query_pairs([("precision", "n")])
+                    .timeout(timeout)
+                    .set("Content-Type", "text/plain; charset=utf-8");
+                let request = match state.auth.as_ref() {
+                    Some(auth) => request.set("Authorization", auth),
+                    None => request,
+                };
+                let response_or_err = retry_http_send(
+                    request,
+                    bytes,
+                    state.config.max_retries,
+                    state.config.retry_interval,
+                );
+                match response_or_err {
+                    Ok(_response) => {
+                        // on success, there's no information in the response.
+                    }
+                    Err(ureq::Error::Status(http_status_code, response)) => {
+                        return Err(parse_http_error(http_status_code, response));
+                    }
+                    Err(ureq::Error::Transport(transport)) => {
+                        return Err(error::fmt!(
+                            SocketError,
+                            "Could not flush buffer: {}",
+                            transport
+                        ));
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -1952,3 +2295,9 @@ impl Sender {
 }
 
 mod timestamp;
+
+#[cfg(feature = "ilp-over-http")]
+mod http;
+
+#[cfg(feature = "ilp-over-http")]
+use http::*;

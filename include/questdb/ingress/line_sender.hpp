@@ -67,7 +67,13 @@ namespace questdb::ingress
         auth_error,
 
         /** Error during TLS handshake. */
-        tls_error
+        tls_error,
+
+        /** The server does not support ILP over HTTP. */
+        http_not_supported,
+
+        /** Error sent back from the server during flush. */
+        server_flush_error,
     };
 
     /**
@@ -343,6 +349,7 @@ namespace questdb::ingress
             ::line_sender_buffer_reserve(_impl, additional);
         }
 
+        /** Get the current capacity of the buffer. */
         size_t capacity() const noexcept
         {
             if (_impl)
@@ -351,6 +358,7 @@ namespace questdb::ingress
                 return 0;
         }
 
+        /** Number of bytes in the accumulated buffer. */
         size_t size() const noexcept
         {
             if (_impl)
@@ -359,6 +367,31 @@ namespace questdb::ingress
                 return 0;
         }
 
+        /** The number of rows accumulated in the buffer. */
+        size_t row_count() const noexcept
+        {
+            if (_impl)
+                return ::line_sender_buffer_row_count(_impl);
+            else
+                return 0;
+        }
+
+        /**
+         * The buffer is transactional if sent over HTTP.
+         * A buffer stops being transactional if it contains rows for multiple tables.
+         */
+        bool transactional() const noexcept
+        {
+            if (_impl)
+                return ::line_sender_buffer_transactional(_impl);
+            else
+                return 0;
+        }
+
+        /**
+         * Get a view of the accumulated buffer.
+         * This is useful for debugging.
+         */
         std::string_view peek() const noexcept
         {
             if (_impl)
@@ -373,6 +406,13 @@ namespace questdb::ingress
             }
         }
 
+        /**
+         * Mark a rewind point.
+         * This allows undoing accumulated changes to the buffer for one or more
+         * rows by calling `rewind_to_marker`.
+         * Any previous marker will be discarded.
+         * Once the marker is no longer needed, call `clear_marker`.
+         */
         void set_marker()
         {
             may_init();
@@ -380,6 +420,10 @@ namespace questdb::ingress
                 ::line_sender_buffer_set_marker, _impl);
         }
 
+        /**
+         * Undo all changes since the last `set_marker` call.
+         * As a side-effect, this also clears the marker.
+         */
         void rewind_to_marker()
         {
             may_init();
@@ -387,12 +431,17 @@ namespace questdb::ingress
                 ::line_sender_buffer_rewind_to_marker, _impl);
         }
 
+        /** Discard the marker. */
         void clear_marker() noexcept
         {
             if (_impl)
                 ::line_sender_buffer_clear_marker(_impl);
         }
 
+        /**
+         * Remove all accumulated data and prepare the buffer for new lines.
+         * This does not affect the buffer's capacity.
+         */
         void clear() noexcept
         {
             if (_impl)
@@ -711,7 +760,9 @@ namespace questdb::ingress
             }
 
             /**
-             * Authentication Parameters.
+             * ECDSA Authentication Parameters for ILP over TCP.
+             * For HTTP, use `basic_auth` instead.
+             *
              * @param[in] key_id Key id. AKA "kid"
              * @param[in] priv_key Private key. AKA "d".
              * @param[in] pub_key_x Public key X coordinate. AKA "x".
@@ -729,6 +780,94 @@ namespace questdb::ingress
                     priv_key._impl,
                     pub_key_x._impl,
                     pub_key_y._impl);
+                return *this;
+            }
+
+            /**
+             * Basic Authentication Parameters for ILP over HTTP.
+             * For TCP, use `auth` instead.
+             *
+             * @param[in] username Username.
+             * @param[in] password Password.
+             */
+            opts& basic_auth(
+                utf8_view username,
+                utf8_view password) noexcept
+            {
+                ::line_sender_opts_basic_auth(
+                    _impl,
+                    username._impl,
+                    password._impl);
+                return *this;
+            }
+
+            /**
+             * Token (Bearer) Authentication Parameters for ILP over HTTP.
+             *
+             * @param[in] token Token.
+             */
+            opts& token_auth(utf8_view token) noexcept
+            {
+                ::line_sender_opts_token_auth(
+                        _impl,
+                        token._impl);
+                return *this;
+            }
+
+            /**
+             * Enable ILP over HTTP.
+             */
+            opts& http() noexcept
+            {
+                ::line_sender_opts_http(_impl);
+                return *this;
+            }
+
+            /**
+             * Maxmimum number of HTTP request retries.
+             * Defaults to 3.
+             */
+            opts& max_retries(uint32_t max_retries) noexcept
+            {
+                ::line_sender_opts_max_retries(_impl, max_retries);
+                return *this;
+            }
+
+            /**
+             * The initial retry interval (specified in milliseconds).
+             * This the default is 100 milliseconds.
+             * The retry interval is doubled after each failed attempt,
+             * up to the maximum number of retries.
+             * Also see `max_retries`.
+             */
+            opts& retry_interval(uint64_t retry_interval_millis) noexcept
+            {
+                ::line_sender_opts_retry_interval(
+                    _impl,
+                    retry_interval_millis);
+                return *this;
+            }
+
+            /**
+             * Minimum expected throughput in bytes per second for HTTP requests.
+             * If the throughput is lower than this value, the connection will time out.
+             * The default is 100 KiB/s.
+             * The value is expressed as a number of bytes per second.
+             */
+            opts& min_throughput(uint64_t bytes_per_sec) noexcept
+            {
+                ::line_sender_opts_min_throughput(_impl, bytes_per_sec);
+                return *this;
+            }
+
+            /**
+             * Enable transactional flushes.
+             * This is only relevant for HTTP.
+             * This works by ensuring that the buffer contains lines for a single table.
+             */
+            opts& transactional() noexcept
+            {
+                ::line_sender_opts_transactional(_impl);
                 return *this;
             }
 

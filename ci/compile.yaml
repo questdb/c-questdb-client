@@ -1,0 +1,14 @@
+steps:
+  - script: |
+      rustup update $(toolchain)
+      rustup default $(toolchain)
+    condition: ne(variables['toolchain'], '')
+    displayName: "Update and set Rust toolchain"
+  - script: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DQUESTDB_TESTS_AND_EXAMPLES=ON
+    env:
+      JAVA_HOME: $(JAVA_HOME_11_X64)
+    displayName: "Build Makefile with CMake"
+  - script: cmake --build build
+    env:
+      JAVA_HOME: $(JAVA_HOME_11_X64)
+    displayName: "Make"

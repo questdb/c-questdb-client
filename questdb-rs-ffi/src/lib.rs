@@ -60,10 +60,10 @@ macro_rules! bubble_err_to_c {
 /// Update the Rust builder inside the C opts object
 /// after calling a method that takes ownership of the builder.
 macro_rules! upd_opts {
-    ($opts:expr, $func:ident, $($args:expr),*) => {
+    ($opts:expr, $func:ident $(, $($args:expr),*)?) => {
         ptr::write(
             &mut (*$opts).0,
-            ptr::read(&(*$opts).0).$func($($args),*));
+            ptr::read(&(*$opts).0).$func($($($args),*)?));
     };
 }
 
@@ -97,6 +97,12 @@ pub enum line_sender_error_code {
 
     /// Error during TLS handshake.
     line_sender_error_tls_error,
+
+    /// The server does not support ILP over HTTP.
+    line_sender_error_http_not_supported,
+
+    /// Error sent back from the server during flush.
+    line_sender_error_server_flush_error,
 }
 
 impl From<ErrorCode> for line_sender_error_code {
@@ -114,6 +120,12 @@ impl From<ErrorCode> for line_sender_error_code {
             }
             ErrorCode::AuthError => line_sender_error_code::line_sender_error_auth_error,
             ErrorCode::TlsError => line_sender_error_code::line_sender_error_tls_error,
+            ErrorCode::HttpNotSupported => {
+                line_sender_error_code::line_sender_error_http_not_supported
+            }
+            ErrorCode::ServerFlushError => {
+                line_sender_error_code::line_sender_error_server_flush_error
+            }
         }
     }
 }
@@ -445,7 +457,9 @@ pub unsafe extern "C" fn line_sender_opts_net_interface(
     upd_opts!(opts, net_interface, net_interface.as_str());
 }
 
-/// Authentication Parameters.
+/// ECDSA Authentication Parameters for ILP over TCP.
+/// For HTTP, use `basic_auth` instead.
+///
 /// @param[in] key_id Key id. AKA "kid"
 /// @param[in] priv_key Private key. AKA "d".
 /// @param[in] pub_key_x Public key X coordinate. AKA "x".
@@ -466,6 +480,92 @@ pub unsafe extern "C" fn line_sender_opts_auth(
         pub_key_x.as_str(),
         pub_key_y.as_str()
     );
+}
+
+/// Basic Authentication Parameters for ILP over HTTP.
+/// For TCP, use `auth` instead.
+///
+/// @param[in] username Username.
+/// @param[in] password Password.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_basic_auth(
+    opts: *mut line_sender_opts,
+    username: line_sender_utf8,
+    password: line_sender_utf8,
+) {
+    upd_opts!(opts, basic_auth, username.as_str(), password.as_str());
+}
+
+/// Token (Bearer) Authentication Parameters for ILP over HTTP.
+/// For TCP, use `auth` instead.
+///
+/// @param[in] token Token.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_token_auth(
+    opts: *mut line_sender_opts,
+    token: line_sender_utf8,
+) {
+    upd_opts!(opts, token_auth, token.as_str());
+}
+
+/// Enable ILP over HTTP.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_http(opts: *mut line_sender_opts) {
+    upd_opts!(opts, http);
+}
+
+/// Maxmimum number of HTTP request retries.
+/// Defaults to 3.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_max_retries(
+    opts: *mut line_sender_opts,
+    max_retries: u32,
+) {
+    upd_opts!(opts, max_retries, max_retries);
+}
+
+/// The initial retry interval (specified in milliseconds).
+/// This the default is 100 milliseconds.
+/// The retry interval is doubled after each failed attempt,
+/// up to the maximum number of retries.
+/// Also see `max_retries`.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_retry_interval(
+    opts: *mut line_sender_opts,
+    retry_interval_millis: u64,
+) {
+    let retry_interval = std::time::Duration::from_millis(retry_interval_millis);
+    upd_opts!(opts, retry_interval, retry_interval);
+}
+
+/// Minimum expected throughput in bytes per second for HTTP requests.
+/// If the throughput is lower than this value, the connection will time out.
+/// The default is 100 KiB/s.
+/// The value is expressed as a number of bytes per second.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_min_throughput(
+    opts: *mut line_sender_opts,
+    bytes_per_sec: u64,
+) {
+    upd_opts!(opts, min_throughput, bytes_per_sec);
+}
+
+/// Enable transactional flushes.
+/// This is only relevant for HTTP.
+/// This works by ensuring that the buffer contains lines for a single table.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_transactional(opts: *mut line_sender_opts) {
+    upd_opts!(opts, transactional);
+}
+
+/// Set the HTTP user agent. Internal API. Do not use.
+#[doc(hidden)]
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_user_agent(
+    opts: *mut line_sender_opts,
+    user_agent: line_sender_utf8,
+) {
+    upd_opts!(opts, user_agent, user_agent.as_str());
 }
 
 /// Enable full connection encryption via TLS.
@@ -655,6 +755,23 @@ pub unsafe extern "C" fn line_sender_buffer_clear(buffer: *mut line_sender_buffe
 pub unsafe extern "C" fn line_sender_buffer_size(buffer: *const line_sender_buffer) -> size_t {
     let buffer = unwrap_buffer(buffer);
     buffer.len()
+}
+
+/// The number of rows accumulated in the buffer.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_buffer_row_count(buffer: *const line_sender_buffer) -> size_t {
+    let buffer = unwrap_buffer(buffer);
+    buffer.row_count()
+}
+
+/// The buffer is transactional if sent over HTTP.
+/// A buffer stops being transactional if it contains rows for multiple tables.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_buffer_transactional(
+    buffer: *const line_sender_buffer,
+) -> bool {
+    let buffer = unwrap_buffer(buffer);
+    buffer.transactional()
 }
 
 /// Peek into the accumulated buffer that is to be sent out at the next `flush`.

@@ -26,6 +26,7 @@ import sys
 sys.dont_write_bytecode = True
 
 import os
+import re
 import pathlib
 import textwrap
 import json
@@ -172,6 +173,35 @@ def install_questdb(vers: str, download_url: str):
     return version_dir
 
 
+def install_questdb_from_repo(repo: pathlib.Path):
+    repo = repo.absolute()
+    target_dir = repo / 'core' / 'target'
+    try:
+        repo_jar = next(target_dir.glob("**/questdb*-SNAPSHOT.jar"))
+    except StopIteration:
+        raise RuntimeError(
+            f'Could not find QuestDB jar in repo {repo}. ' +
+            'Check path and ensure you built correctly.')
+    print(f'Starting QuestDB from jar {repo_jar}')
+    proj = Project()
+    vers = 'repo'
+    questdb_dir = proj.questdb_dir / vers
+    if questdb_dir.exists():
+        shutil.rmtree(questdb_dir)
+    (questdb_dir / 'data' / 'log').mkdir(parents=True)
+    bin_dir = questdb_dir / 'bin'
+    bin_dir.mkdir(parents=True)
+    conf_dir = questdb_dir / 'conf'
+    conf_dir.mkdir(parents=True)
+    data_conf_dir = questdb_dir / 'data' / 'conf'
+    data_conf_dir.mkdir(parents=True)
+    shutil.copy(repo_jar, bin_dir / 'questdb.jar')
+    repo_conf_dir = target_dir / 'classes' / 'io' / 'questdb' / 'site' / 'conf'
+    shutil.copy(repo_conf_dir / 'server.conf', conf_dir / 'server.conf')
+    shutil.copy(repo_conf_dir / 'mime.types', data_conf_dir / 'mime.types')
+    return questdb_dir
+
+
 def _parse_version(vers_str):
     def try_int(vers_part):
         try:
@@ -203,7 +233,7 @@ class QueryError(Exception):
 
 
 class QuestDbFixture:
-    def __init__(self, root_dir: pathlib.Path, auth=False, wrap_tls=False):
+    def __init__(self, root_dir: pathlib.Path, auth=False, wrap_tls=False, http=False):
         self._root_dir = root_dir
         self.version = _parse_version(self._root_dir.name)
         self._data_dir = self._root_dir / 'data'
@@ -227,6 +257,7 @@ class QuestDbFixture:
             auth_txt_path = self._conf_dir / 'auth.txt'
             with open(auth_txt_path, 'w', encoding='utf-8') as auth_file:
                 auth_file.write(AUTH_TXT)
+        self.http = http
 
     def print_log(self):
         with open(self._log_path, 'r', encoding='utf-8') as log_file:
@@ -238,6 +269,7 @@ class QuestDbFixture:
         ports = discover_avail_ports(3)
         self.http_server_port, self.line_tcp_port, self.pg_port = ports
         auth_config = 'line.tcp.auth.db.path=conf/auth.txt' if self.auth else ''
+        ilp_over_http_config = 'line.http.enabled=true' if self.http else ''
         with open(self._conf_path, 'w', encoding='utf-8') as conf_file:
             conf_file.write(textwrap.dedent(rf'''
                 http.bind.to=0.0.0.0:{self.http_server_port}
@@ -249,8 +281,9 @@ class QuestDbFixture:
                 line.tcp.min.idle.ms.before.writer.release=300
                 telemetry.enabled=false
                 cairo.commit.lag=100
-                lne.tcp.commit.interval.fraction=0.1
+                line.tcp.commit.interval.fraction=0.1
                 {auth_config}
+                {ilp_over_http_config}
                 ''').lstrip('\n'))
 
         java = _find_java()
@@ -266,7 +299,7 @@ class QuestDbFixture:
             '-m', 'io.questdb/io.questdb.ServerMain',
             '-d', str(self._data_dir)]
         sys.stderr.write(
-            f'Starting QuestDB: {launch_args!r} (auth: {self.auth})\n')
+            f'Starting QuestDB: {launch_args!r} (auth: {self.auth}, http: {self.http})\n')
         self._log = open(self._log_path, 'ab')
         try:
             self._proc = subprocess.Popen(
@@ -306,6 +339,11 @@ class QuestDbFixture:
         atexit.register(self.stop)
         sys.stderr.write('QuestDB fixture instance is ready.\n')
 
+        # Read the actual version from the running process.
+        # This is to support a version like `7.3.2-SNAPSHOT`
+        # from an externally started QuestDB instance.
+        self.version = self.query_version()
+
         if self.wrap_tls:
             self._tls_proxy = TlsProxyFixture(self.line_tcp_port)
             self._tls_proxy.start()
@@ -332,6 +370,22 @@ class QuestDbFixture:
         if 'error' in data:
             raise QueryError(data['error'])
         return data
+    
+    def query_version(self):
+        try:
+            res = self.http_sql_query('select build')
+        except QueryError as qe:
+            # For old versions that don't support `build` yet, parse from path.
+            return self.version
+
+        vers = res['dataset'][0][0]
+        print(vers)
+
+        # This returns a string like:
+        # 'Build Information: QuestDB 7.3.2, JDK 11.0.8, Commit Hash 19059deec7b0fd19c53182b297a5d59774a51892'
+        # We want the '7.3.2' part.
+        vers = re.compile(r'.*QuestDB ([0-9.]+).*').search(vers).group(1)
+        return _parse_version(vers)
 
     def retry_check_table(
             self,

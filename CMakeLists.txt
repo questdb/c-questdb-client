@@ -101,6 +101,9 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
         line_sender_c_example_auth_tls
         examples/line_sender_c_example_auth_tls.c)
     compile_example(
+        line_sender_c_example_http
+        examples/line_sender_c_example_http.c)
+    compile_example(
         line_sender_cpp_example
         examples/line_sender_cpp_example.cpp)
     compile_example(
@@ -112,6 +115,9 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
     compile_example(
         line_sender_cpp_example_auth_tls
         examples/line_sender_cpp_example_auth_tls.cpp)
+    compile_example(
+        line_sender_cpp_example_http
+        examples/line_sender_cpp_example_http.cpp)
 
     # Include Rust tests as part of the tests run
     add_test(
