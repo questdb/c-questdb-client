@@ -111,14 +111,18 @@ stages:
             submodules: false
           - template: compile.yaml
           - script: |
-              git clone --depth 1 https://github.com/questdb/questdb.git
+              git clone https://github.com/questdb/questdb.git
+              cd questdb
+              git checkout 4ec709d82bb364621654e947336c346035cc9eaa
+              cd ..
             displayName: git clone questdb
+          # git clone --depth 1 https://github.com/questdb/questdb.git
           - task: Maven@3
             displayName: "Compile QuestDB"
             inputs:
               mavenPOMFile: 'questdb/pom.xml'
               jdkVersionOption: '1.11'
-              options: "install -e -X -DskipTests -Pbuild-web-console"
+              options: "-DskipTests -Pbuild-web-console"
           - script: |
               python3 system_test/test.py run --repo ./questdb -v
             displayName: "integration test"
