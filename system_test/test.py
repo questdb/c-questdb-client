@@ -27,8 +27,9 @@
 import sys
 sys.dont_write_bytecode = True
 import os
-import textwrap
 
+import shutil
+import pathlib
 import math
 import datetime
 import argparse
@@ -41,6 +42,7 @@ from fixture import (
     QuestDbFixture,
     TlsProxyFixture,
     install_questdb,
+    install_questdb_from_repo,
     list_questdb_releases,
     AUTH)
 import subprocess
@@ -88,11 +90,13 @@ AUTH_MALFORMED2 = (
 
 
 class TestSender(unittest.TestCase):
-    def _mk_linesender(self):
+    def _mk_linesender(self, transactional=False):
         return qls.Sender(
             QDB_FIXTURE.host,
-            QDB_FIXTURE.line_tcp_port,
-            auth=AUTH if QDB_FIXTURE.auth else None)
+            QDB_FIXTURE.http_server_port if QDB_FIXTURE.http else QDB_FIXTURE.line_tcp_port,
+            auth=AUTH if QDB_FIXTURE.auth else None,
+            http=QDB_FIXTURE.http,
+            transactional=transactional)
 
     def _expect_eventual_disconnect(self, sender):
         with self.assertRaisesRegex(
@@ -250,20 +254,36 @@ class TestSender(unittest.TestCase):
 
             pending = sender.buffer.peek()
 
-        # We only ever get the first row back.
-        resp = retry_check_table(table_name, log_ctx=pending)
-        exp_columns = [
-            {'name': 'a', 'type': 'STRING'},
-            {'name': 'timestamp', 'type': 'TIMESTAMP'}]
-        self.assertEqual(resp['columns'], exp_columns)
+            try:
+                sender.flush()
+            except qls.SenderError as e:
+                if not QDB_FIXTURE.http:
+                    raise e
+                self.assertIn('Could not flush buffer', str(e))
+                self.assertIn('cast error from', str(e))
+                self.assertIn('STRING', str(e))
+                self.assertIn('code: invalid, line: 2', str(e))
 
-        exp_dataset = [['A']]  # Comparison excludes timestamp column.
-        scrubbed_dataset = [row[:-1] for row in resp['dataset']]
-        self.assertEqual(scrubbed_dataset, exp_dataset)
+        if QDB_FIXTURE.http:
+            # If HTTP, the error should cause the whole batch to be ignored.
+            # We assert that the table is empty.
+            with self.assertRaises(TimeoutError):
+                retry_check_table(table_name, timeout_sec=1, log=False)
+        else:
+            # We only ever get the first row back.
+            resp = retry_check_table(table_name, log_ctx=pending)
+            exp_columns = [
+                {'name': 'a', 'type': 'STRING'},
+                {'name': 'timestamp', 'type': 'TIMESTAMP'}]
+            self.assertEqual(resp['columns'], exp_columns)
 
-        # The second one is dropped and will not appear in results.
-        with self.assertRaises(TimeoutError):
-            retry_check_table(table_name, min_rows=2, timeout_sec=1, log=False)
+            exp_dataset = [['A']]  # Comparison excludes timestamp column.
+            scrubbed_dataset = [row[:-1] for row in resp['dataset']]
+            self.assertEqual(scrubbed_dataset, exp_dataset)
+
+            # The second one is dropped and will not appear in results.
+            with self.assertRaises(TimeoutError):
+                retry_check_table(table_name, min_rows=2, timeout_sec=1, log=False)
 
     def test_at(self):
         if QDB_FIXTURE.version <= (6, 0, 7, 1):
@@ -278,7 +298,6 @@ class TestSender(unittest.TestCase):
                 .symbol('a', 'A')
                 .at(at_ts_ns))
             pending = sender.buffer.peek()
-
         resp = retry_check_table(table_name, log_ctx=pending)
         exp_dataset = [['A', ns_to_qdb_date(at_ts_ns)]]
         self.assertEqual(resp['dataset'], exp_dataset)
@@ -460,8 +479,11 @@ class TestSender(unittest.TestCase):
         # Call the example program.
         proj = Project()
         ext = '.exe' if sys.platform == 'win32' else ''
-        bin_path = next(proj.build_dir.glob(f'**/{bin_name}{ext}'))
-        port = QDB_FIXTURE.line_tcp_port
+        try:
+            bin_path = next(proj.build_dir.glob(f'**/{bin_name}{ext}'))
+        except StopIteration:
+            raise RuntimeError(f'Could not find {bin_name}{ext} in {proj.build_dir}')
+        port = QDB_FIXTURE.http_server_port if QDB_FIXTURE.http else QDB_FIXTURE.line_tcp_port
         args = [str(bin_path)]
         if tls:
             ca_path = proj.tls_certs_dir / 'server_rootCA.pem'
@@ -494,12 +516,14 @@ class TestSender(unittest.TestCase):
 
     def test_c_example(self):
         suffix = '_auth' if QDB_FIXTURE.auth else ''
+        suffix += '_http' if QDB_FIXTURE.http else ''
         self._test_example(
             f'line_sender_c_example{suffix}',
             f'c_cars{suffix}')
 
     def test_cpp_example(self):
         suffix = '_auth' if QDB_FIXTURE.auth else ''
+        suffix += '_http' if QDB_FIXTURE.http else ''
         self._test_example(
             f'line_sender_cpp_example{suffix}',
             f'cpp_cars{suffix}')
@@ -624,6 +648,40 @@ class TestSender(unittest.TestCase):
     def test_tls_webpki_and_os_roots(self):
         self._test_tls_special('webpki_and_os_roots')
 
+    def test_http_transactions(self):
+        if not QDB_FIXTURE.http:
+            self.skipTest('HTTP-only test')
+        if QDB_FIXTURE.version <= (7, 3, 7):
+            self.skipTest('No ILP/HTTP support')
+        table_name = uuid.uuid4().hex
+        with self._mk_linesender(transactional=True) as sender:
+            sender.table(table_name).column('col1', 'v1').at(time.time_ns())
+            sender.table(table_name).column('col1', 'v2').at(time.time_ns())
+            sender.table(table_name).column('col1', 42.5).at(time.time_ns())
+
+            try:
+                sender.flush()
+            except qls.SenderError as e:
+                if not QDB_FIXTURE.http:
+                    raise e
+                self.assertIn('Could not flush buffer', str(e))
+                self.assertIn('cast error from', str(e))
+                self.assertIn('STRING', str(e))
+                self.assertIn('code: invalid, line: 3', str(e))
+
+        with self.assertRaises(TimeoutError):
+            retry_check_table(table_name, timeout_sec=1, log=False)
+
+    def test_tcp_transactions(self):
+        if QDB_FIXTURE.http:
+            self.skipTest('TCP-only test')
+        if QDB_FIXTURE.version <= (7, 3, 7):
+            self.skipTest('No ILP/HTTP support')
+        with self.assertRaisesRegex(qls.SenderError, r'.*Transactional .* not supported.*'):
+            with self._mk_linesender(transactional=True) as sender:
+                pass
+
+
 def parse_args():
     parser = argparse.ArgumentParser('Run system tests.')
     sub_p = parser.add_subparsers(dest='command')
@@ -648,6 +706,13 @@ def parse_args():
         metavar='HOST:ILP_PORT:HTTP_PORT',
         help=('Test against existing running instance. ' +
               'e.g. `localhost:9009:9000`'))
+    version_g.add_argument(
+        '--repo',
+        type=str,
+        metavar='PATH',
+        help=('Test against existing jar from a ' +
+              '`mvn install -DskipTests -P build-web-console`' +
+              '-ed questdb repo such as `~/questdb/repos/questdb/`'))
     list_p = sub_p.add_parser('list', help='List latest -n releases.')
     list_p.set_defaults(command='list')
     list_p.add_argument('-n', type=int, default=30, help='number of releases')
@@ -664,19 +729,29 @@ def run_with_existing(args):
     global QDB_FIXTURE
     MockFixture = namedtuple(
         'MockFixture',
-        ('host', 'line_tcp_port', 'http_server_port', 'version'))
+        ('host', 'line_tcp_port', 'http_server_port', 'version', 'http'))
     host, line_tcp_port, http_server_port = args.existing.split(':')
     QDB_FIXTURE = MockFixture(
         host,
         int(line_tcp_port),
         int(http_server_port),
-        (999, 999, 999))
+        (999, 999, 999),
+        True)
     unittest.main()
 
 
-def run_with_fixtures(args):
-    global QDB_FIXTURE
-    global TLS_PROXY_FIXTURE
+def iter_versions(args):
+    """
+    Iterate target versions.
+    Returns a generator of prepared questdb directories.
+    Ensure that the DB is stopped after each use.
+    """
+    if getattr(args, 'repo', None):
+        # A specific repo path was provided.
+        repo = pathlib.Path(args.repo)
+        yield install_questdb_from_repo(repo)
+        return
+
     versions = None
     versions_args = getattr(args, 'versions', None)
     if versions_args:
@@ -696,21 +771,39 @@ def run_with_fixtures(args):
             in list_questdb_releases(last_n)}
     for version, download_url in versions.items():
         questdb_dir = install_questdb(version, download_url)
-        for auth in (False, True):
-            QDB_FIXTURE = QuestDbFixture(questdb_dir, auth=auth)
-            TLS_PROXY_FIXTURE = None
-            try:
-                QDB_FIXTURE.start()
-                TLS_PROXY_FIXTURE = TlsProxyFixture(QDB_FIXTURE.line_tcp_port)
-                TLS_PROXY_FIXTURE.start()
+        yield questdb_dir
 
-                test_prog = unittest.TestProgram(exit=False)
-                if not test_prog.result.wasSuccessful():
-                    sys.exit(1)
-            finally:
-                if TLS_PROXY_FIXTURE:
-                    TLS_PROXY_FIXTURE.stop()
-                QDB_FIXTURE.stop()
+
+def run_with_fixtures(args):
+    global QDB_FIXTURE
+    global TLS_PROXY_FIXTURE
+    last_version = None
+    for questdb_dir in iter_versions(args):
+        for auth in (False, True):
+            for http in (False, True):
+                if http and last_version <= (7, 3, 7):
+                    print('Skipping ILP/HTTP tests for versions <= 7.3.7')
+                    continue
+                if http and auth:
+                    print('Skipping auth for ILP/HTTP tests')
+                    continue
+                QDB_FIXTURE = QuestDbFixture(questdb_dir, auth=auth, http=http)
+                TLS_PROXY_FIXTURE = None
+                try:
+                    QDB_FIXTURE.start()
+                    # Read the version _after_ a first start so it can rely
+                    # on the live one from the `select build` query.
+                    last_version = QDB_FIXTURE.version
+                    TLS_PROXY_FIXTURE = TlsProxyFixture(QDB_FIXTURE.line_tcp_port)
+                    TLS_PROXY_FIXTURE.start()
+
+                    test_prog = unittest.TestProgram(exit=False)
+                    if not test_prog.result.wasSuccessful():
+                        sys.exit(1)
+                finally:
+                    if TLS_PROXY_FIXTURE:
+                        TLS_PROXY_FIXTURE.stop()
+                    QDB_FIXTURE.stop()
 
 
 def run(args, show_help=False):

@@ -69,6 +69,12 @@ typedef enum line_sender_error_code
 
     /** Error during TLS handshake. */
     line_sender_error_tls_error,
+
+    /** The server does not support ILP over HTTP. */
+    line_sender_error_http_not_supported,
+
+    /** Error sent back from the server during flush. */
+    line_sender_error_server_flush_error,
 } line_sender_error_code;
 
 /** Error code categorizing the error. */
@@ -297,6 +303,17 @@ void line_sender_buffer_clear(line_sender_buffer* buffer);
 /** Number of bytes in the accumulated buffer. */
 LINESENDER_API
 size_t line_sender_buffer_size(const line_sender_buffer* buffer);
+
+/** The number of rows accumulated in the buffer. */
+LINESENDER_API
+size_t line_sender_buffer_row_count(const line_sender_buffer* buffer);
+
+/**
+ * The buffer is transactional if sent over HTTP.
+ * A buffer stops being transactional if it contains rows for multiple tables.
+ */
+LINESENDER_API
+bool line_sender_buffer_transactional(const line_sender_buffer* buffer);
 
 /**
  * Peek into the accumulated buffer that is to be sent out at the next `flush`.
@@ -537,7 +554,9 @@ void line_sender_opts_net_interface(
     line_sender_utf8 net_interface);
 
 /**
- * Authentication Parameters.
+ * ECDSA Authentication Parameters for ILP over TCP.
+ * For HTTP, use `basic_auth` instead.
+ *
  * @param[in] key_id Key id. AKA "kid"
  * @param[in] priv_key Private key. AKA "d".
  * @param[in] pub_key_x Public key X coordinate. AKA "x".
@@ -550,6 +569,75 @@ void line_sender_opts_auth(
     line_sender_utf8 priv_key,
     line_sender_utf8 pub_key_x,
     line_sender_utf8 pub_key_y);
+
+/**
+ * Basic Authentication Parameters for ILP over HTTP.
+ * For TCP, use `auth` instead.
+ *
+ * @param[in] username Username.
+ * @param[in] password Password.
+ */
+LINESENDER_API
+void line_sender_opts_basic_auth(
+    line_sender_opts* opts,
+    line_sender_utf8 username,
+    line_sender_utf8 password);
+
+
+/**
+ * Token (Bearer) Authentication Parameters for ILP over HTTP.
+ * For TCP, use `auth` instead.
+ */
+LINESENDER_API
+void line_sender_opts_token_auth(
+    line_sender_opts* opts,
+    line_sender_utf8 token);
+
+/**
+ * Enable ILP over HTTP.
+ */
+LINESENDER_API
+void line_sender_opts_http(line_sender_opts* opts);
+
+/**
+ * Maxmimum number of HTTP request retries.
+ * Defaults to 3.
+ */
+LINESENDER_API
+void line_sender_opts_max_retries(
+    line_sender_opts* opts,
+    uint32_t max_retries);
+
+/**
+ * The initial retry interval (specified in milliseconds).
+ * This the default is 100 milliseconds.
+ * The retry interval is doubled after each failed attempt,
+ * up to the maximum number of retries.
+ * Also see `max_retries`.
+ */
+LINESENDER_API
+void line_sender_opts_retry_interval(
+    line_sender_opts* opts,
+    uint64_t retry_interval_millis);
+
+/**
+ * Minimum expected throughput in bytes per second for HTTP requests.
+ * If the throughput is lower than this value, the connection will time out.
+ * The default is 100 KiB/s.
+ * The value is expressed as a number of bytes per second.
+ */
+LINESENDER_API
+void line_sender_opts_min_throughput(
+    line_sender_opts* opts,
+    uint64_t bytes_per_sec);
+
+/**
+ * Enable transactional flushes.
+ * This is only relevant for HTTP.
+ * This works by ensuring that the buffer contains lines for a single table.
+ */
+LINESENDER_API
+void line_sender_opts_transactional(line_sender_opts* opts);
 
 /**
  * Enable full connection encryption via TLS.

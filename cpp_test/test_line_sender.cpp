@@ -716,3 +716,18 @@ TEST_CASE("Empty Buffer") {
         "State error: Bad call to `flush`, should have called `table` instead.",
         questdb::ingress::line_sender_error);
 }
+
+TEST_CASE("HTTP basics") {
+    questdb::ingress::opts opts1{"localhost", 1};
+    questdb::ingress::opts opts2{"localhost", 1};
+    opts1.http().transactional().max_retries(5).retry_interval(10).basic_auth("user", "pass");
+    opts2.http().token_auth("token").min_throughput(1000);
+    questdb::ingress::line_sender sender1{opts1};
+    questdb::ingress::line_sender sender2{opts2};
+
+    questdb::ingress::line_sender_buffer b1;
+    b1.table("test").symbol("a", "b").at_now();
+
+    CHECK_THROWS_AS(sender1.flush(b1), questdb::ingress::line_sender_error);
+    CHECK_THROWS_AS(sender2.flush(b1), questdb::ingress::line_sender_error);
+}
