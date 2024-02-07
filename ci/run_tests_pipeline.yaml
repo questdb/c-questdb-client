@@ -110,11 +110,6 @@ stages:
             lfs: false
             submodules: false
           - template: compile.yaml
-          # - script: |
-          #     git clone https://github.com/questdb/questdb.git
-          #     cd questdb
-          #     git checkout 4ec709d82bb364621654e947336c346035cc9eaa
-          #   displayName: git clone questdb
           - script: |
               git clone --depth 1 https://github.com/questdb/questdb.git
             displayName: git clone questdb
