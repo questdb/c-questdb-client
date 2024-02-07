@@ -1486,7 +1486,9 @@ mod danger {
         }
 
         fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-            todo!() // https://github.com/algesten/ureq/pull/690#issuecomment-1845204126
+            rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
         }
     }
 }
