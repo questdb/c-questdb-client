@@ -118,7 +118,7 @@ stages:
             inputs:
               mavenPOMFile: 'questdb/pom.xml'
               jdkVersionOption: '1.11'
-              options: "install -DskipTests -Pbuild-web-console"
+              options: "install -e -X -DskipTests -Pbuild-web-console"
           - script: |
               python3 system_test/test.py run --repo ./questdb -v
             displayName: "integration test"
