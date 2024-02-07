@@ -63,9 +63,9 @@ pub fn certs_dir() -> std::path::PathBuf {
 fn tls_config() -> Arc<ServerConfig> {
     let certs_dir = certs_dir();
     let mut cert_file =
-        File::open(&certs_dir.join("server.crt")).expect("cannot open certificate file");
+        File::open(certs_dir.join("server.crt")).expect("cannot open certificate file");
     let mut private_key_file =
-        File::open(&certs_dir.join("server.key")).expect("cannot open private key file");
+        File::open(certs_dir.join("server.key")).expect("cannot open private key file");
     let certs = rustls_pemfile::certs(&mut BufReader::new(&mut cert_file))
         .collect::<Result<Vec<_>, _>>()
         .expect("cannot read certificate file");
