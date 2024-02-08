@@ -419,7 +419,7 @@ fn test_token_auth() -> TestResult {
 }
 
 #[test]
-fn test_timeout() -> TestResult {
+fn test_grace_timeout() -> TestResult {
     let mut buffer = Buffer::new();
     buffer
         .table("test")?
@@ -432,7 +432,7 @@ fn test_timeout() -> TestResult {
 
     let grace = Duration::from_millis(50);
     let time_start = std::time::Instant::now();
-    let mut sender = server.lsb().http().read_timeout(grace).connect()?;
+    let mut sender = server.lsb().http().grace_timeout(grace).connect()?;
     let res = sender.flush_and_keep(&buffer);
     let time_elapsed = time_start.elapsed();
     assert!(res.is_err());
@@ -525,7 +525,7 @@ fn test_user_agent() -> TestResult {
 }
 
 #[test]
-fn test_retry_on_500_err() -> TestResult {
+fn test_two_retries() -> TestResult {
     // Note: This also tests that the _same_ connection is being reused, i.e. tests keepalive.
 
     let mut buffer = Buffer::new();
@@ -536,17 +536,11 @@ fn test_retry_on_500_err() -> TestResult {
         .at(TimestampNanos::new(10000000))?;
     let buffer2 = buffer.clone();
 
-    let mut retry_interval = Duration::from_millis(50);
-    if std::env::var("TF_BUILD").is_ok() {
-        // Slow everything down on the CI. The boxes can be _very_ slow there.
-        retry_interval = Duration::from_secs(2);
-    }
-
     let mut server = MockServer::new()?;
     let mut sender = server
         .lsb()
         .http()
-        .retry_interval(retry_interval)
+        .retry_timeout(Duration::from_secs(30))
         .connect()?;
 
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
@@ -566,8 +560,8 @@ fn test_retry_on_500_err() -> TestResult {
         let req = server.recv_http_q()?;
         assert_eq!(req.body_str().unwrap(), buffer2.as_str());
         let elapsed = std::time::Instant::now().duration_since(start_time);
-        assert!(elapsed > retry_interval);
-        assert!(elapsed < (retry_interval * 3 / 2));
+        assert!(elapsed > Duration::from_millis(5));
+        assert!(elapsed < Duration::from_millis(25)); // theoretically 15ms, but we allow some slack.
 
         server.send_http_response_q(
             HttpResponse::empty()
@@ -579,7 +573,9 @@ fn test_retry_on_500_err() -> TestResult {
 
         let req = server.recv_http_q()?;
         assert_eq!(req.body_str().unwrap(), buffer2.as_str());
-        assert!(std::time::Instant::now().duration_since(start_time) > (retry_interval * 2));
+        let elapsed = std::time::Instant::now().duration_since(start_time);
+        assert!(elapsed > Duration::from_millis(15));
+        assert!(elapsed < Duration::from_millis(35)); // theoretically 25ms, but we allow some slack.
 
         server.send_http_response_q(HttpResponse::empty())?;
 
@@ -597,7 +593,7 @@ fn test_retry_on_500_err() -> TestResult {
 }
 
 #[test]
-fn test_max_retry() -> TestResult {
+fn test_one_retry() -> TestResult {
     let mut buffer = Buffer::new();
     buffer
         .table("test")?
@@ -606,14 +602,11 @@ fn test_max_retry() -> TestResult {
         .at(TimestampNanos::new(10000000))?;
     let buffer2 = buffer.clone();
 
-    let retry_interval = Duration::from_millis(1);
-
     let mut server = MockServer::new()?;
     let mut sender = server
         .lsb()
         .http()
-        .retry_interval(retry_interval)
-        .max_retries(1)
+        .retry_timeout(Duration::from_millis(19))
         .connect()?;
 
     let server_thread = std::thread::spawn(move || -> io::Result<()> {

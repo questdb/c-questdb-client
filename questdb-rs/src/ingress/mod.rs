@@ -1666,8 +1666,8 @@ impl SenderBuilder {
             http: HttpConfig {
                 min_throughput: 102400, // 100 KiB/s
                 user_agent: None,
-                max_retries: 3,
-                retry_interval: Duration::from_millis(100),
+                retry_timeout: Duration::from_secs(10),
+                grace_timeout: Duration::from_secs(5),
                 transactional: false,
             },
         }
@@ -1867,23 +1867,10 @@ impl SenderBuilder {
     }
 
     #[cfg(feature = "ilp-over-http")]
-    /// The maximum number of retries.
-    /// The default is 3.
-    /// Set to 0 to disable retries.
-    /// Also see [`retry_interval`](SenderBuilder::retry_interval).
-    pub fn max_retries(mut self, value: u32) -> Self {
-        self.http.max_retries = value;
-        self
-    }
-
-    #[cfg(feature = "ilp-over-http")]
-    /// The initial retry interval.
-    /// This the default is 100 milliseconds.
-    /// The retry interval is doubled after each failed attempt,
-    /// up to the maximum number of retries.
-    /// Also see [`max_retries`](SenderBuilder::max_retries).
-    pub fn retry_interval(mut self, value: Duration) -> Self {
-        self.http.retry_interval = value;
+    /// Cumulative duration spent in retries.
+    /// Default is 10 seconds.
+    pub fn retry_timeout(mut self, value: Duration) -> Self {
+        self.http.retry_timeout = value;
         self
     }
 
@@ -1904,9 +1891,20 @@ impl SenderBuilder {
     /// If the throughput is lower than this value, the connection will time out.
     /// The default is 100 KiB/s.
     /// The value is expressed as a number of bytes per second.
+    /// This is used to calculate additional request timeout, on top of
+    /// the [`grace_timeout`](SenderBuilder::grace_timeout).
     #[cfg(feature = "ilp-over-http")]
     pub fn min_throughput(mut self, value: u64) -> Self {
         self.http.min_throughput = value;
+        self
+    }
+
+    #[cfg(feature = "ilp-over-http")]
+    /// Grace request timeout before relying on the minimum throughput logic.
+    /// The default is 5 seconds.
+    /// See [`min_throughput`](SenderBuilder::min_throughput) for more details.
+    pub fn grace_timeout(mut self, value: Duration) -> Self {
+        self.http.grace_timeout = value;
         self
     }
 
@@ -2082,7 +2080,7 @@ impl SenderBuilder {
                     agent,
                     url,
                     auth,
-                    timeout_grace_period: self.read_timeout,
+                    grace_timeout: self.http.grace_timeout,
                     config: self.http.clone(),
                 })
             }
@@ -2257,7 +2255,7 @@ impl Sender {
                 }
                 let timeout = Duration::from_secs_f64(
                     (bytes.len() as f64) / (state.config.min_throughput as f64),
-                ) + state.timeout_grace_period;
+                ) + state.grace_timeout;
                 let request = state
                     .agent
                     .post(&state.url)
@@ -2268,12 +2266,8 @@ impl Sender {
                     Some(auth) => request.set("Authorization", auth),
                     None => request,
                 };
-                let response_or_err = retry_http_send(
-                    request,
-                    bytes,
-                    state.config.max_retries,
-                    state.config.retry_interval,
-                );
+                let response_or_err =
+                    http_send_with_retries(request, bytes, state.config.retry_timeout);
                 match response_or_err {
                     Ok(_response) => {
                         // on success, there's no information in the response.
