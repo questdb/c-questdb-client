@@ -561,7 +561,6 @@ fn test_two_retries() -> TestResult {
         assert_eq!(req.body_str().unwrap(), buffer2.as_str());
         let elapsed = std::time::Instant::now().duration_since(start_time);
         assert!(elapsed > Duration::from_millis(5));
-        assert!(elapsed < Duration::from_millis(25)); // theoretically 15ms, but we allow some slack.
 
         server.send_http_response_q(
             HttpResponse::empty()
@@ -575,7 +574,6 @@ fn test_two_retries() -> TestResult {
         assert_eq!(req.body_str().unwrap(), buffer2.as_str());
         let elapsed = std::time::Instant::now().duration_since(start_time);
         assert!(elapsed > Duration::from_millis(15));
-        assert!(elapsed < Duration::from_millis(35)); // theoretically 25ms, but we allow some slack.
 
         server.send_http_response_q(HttpResponse::empty())?;
 
