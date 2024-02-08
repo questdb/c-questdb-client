@@ -198,7 +198,8 @@ use std::sync::Arc;
 use base64ct::{Base64, Base64UrlUnpadded, Encoding};
 use ring::rand::SystemRandom;
 use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
-use rustls::{ClientConnection, OwnedTrustAnchor, RootCertStore, ServerName, StreamOwned};
+use rustls::{ClientConnection, RootCertStore, StreamOwned};
+use rustls_pki_types::ServerName;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 #[derive(Debug, Copy, Clone)]
@@ -1447,36 +1448,56 @@ impl From<u16> for Service {
 
 #[cfg(feature = "insecure-skip-verify")]
 mod danger {
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::{DigitallySignedStruct, Error, SignatureScheme};
+    use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
+
+    #[derive(Debug)]
     pub struct NoCertificateVerification {}
 
-    impl rustls::client::ServerCertVerifier for NoCertificateVerification {
+    impl ServerCertVerifier for NoCertificateVerification {
         fn verify_server_cert(
             &self,
-            _end_entity: &rustls::Certificate,
-            _intermediates: &[rustls::Certificate],
-            _server_name: &rustls::ServerName,
-            _scts: &mut dyn Iterator<Item = &[u8]>,
-            _ocsp: &[u8],
-            _now: std::time::SystemTime,
-        ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
-            Ok(rustls::client::ServerCertVerified::assertion())
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
         }
     }
 }
 
-fn map_rustls_err(descr: &str, err: rustls::Error) -> Error {
-    error::fmt!(TlsError, "{}: {}", descr, err)
-}
-
 #[cfg(feature = "tls-webpki-certs")]
 fn add_webpki_roots(root_store: &mut RootCertStore) {
-    root_store.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
-        OwnedTrustAnchor::from_subject_spki_name_constraints(
-            ta.subject,
-            ta.spki,
-            ta.name_constraints,
-        )
-    }));
+    root_store
+        .roots
+        .extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
 }
 
 #[cfg(feature = "tls-native-certs")]
@@ -1489,8 +1510,7 @@ fn add_os_roots(root_store: &mut RootCertStore) -> Result<()> {
         )
     })?;
 
-    let os_certs: Vec<Vec<u8>> = os_certs.into_iter().map(|cert| cert.0).collect();
-    let (valid_count, invalid_count) = root_store.add_parsable_certificates(&os_certs[..]);
+    let (valid_count, invalid_count) = root_store.add_parsable_certificates(os_certs);
     if valid_count == 0 && invalid_count > 0 {
         return Err(error::fmt!(
             TlsError,
@@ -1536,17 +1556,19 @@ fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
                     )
                 })?;
                 let mut reader = BufReader::new(certfile);
-                let der_certs = &rustls_pemfile::certs(&mut reader).map_err(|io_err| {
-                    error::fmt!(
-                        TlsError,
-                        concat!(
-                            "Could not read certificate authority ",
-                            "file from path {:?}: {}"
-                        ),
-                        ca_file,
-                        io_err
-                    )
-                })?;
+                let der_certs = rustls_pemfile::certs(&mut reader)
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(|io_err| {
+                        error::fmt!(
+                            TlsError,
+                            concat!(
+                                "Could not read certificate authority ",
+                                "file from path {:?}: {}"
+                            ),
+                            ca_file,
+                            io_err
+                        )
+                    })?;
                 root_store.add_parsable_certificates(der_certs);
             }
         }
@@ -1557,10 +1579,6 @@ fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
     // }
 
     let mut config = rustls::ClientConfig::builder()
-        .with_safe_default_cipher_suites()
-        .with_safe_default_kx_groups()
-        .with_safe_default_protocol_versions()
-        .map_err(|rustls_err| map_rustls_err("Bad protocol version selection", rustls_err))?
         .with_root_certificates(root_store)
         .with_no_client_auth();
 
@@ -1977,10 +1995,11 @@ impl SenderBuilder {
 
                 ProtocolHandler::Socket(match configure_tls(&self.tls)? {
                     Some(tls_config) => {
-                        let server_name: ServerName =
-                            self.host.as_str().try_into().map_err(|inv_dns_err| {
+                        let server_name: ServerName = ServerName::try_from(self.host.as_str())
+                            .map_err(|inv_dns_err| {
                                 error::fmt!(TlsError, "Bad host: {}", inv_dns_err)
-                            })?;
+                            })?
+                            .to_owned();
                         let mut tls_conn = ClientConnection::new(tls_config, server_name).map_err(
                             |rustls_err| {
                                 error::fmt!(TlsError, "Could not create TLS client: {}", rustls_err)

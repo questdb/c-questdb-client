@@ -28,14 +28,11 @@ use core::time::Duration;
 use mio::event::Event;
 use mio::net::TcpStream;
 use mio::{Events, Interest, Poll, Token};
-use rustls::{
-    server::{NoClientAuth, ServerConnection},
-    Certificate, ServerConfig, Stream,
-};
+use rustls::{server::ServerConnection, ServerConfig, Stream};
 use socket2::{Domain, Protocol, Socket, Type};
+use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::net::SocketAddr;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -56,36 +53,6 @@ pub struct MockServer {
     pub msgs: Vec<String>,
 }
 
-fn load_certs(filename: &Path) -> Vec<Certificate> {
-    let certfile = std::fs::File::open(filename).expect("cannot open certificate file");
-    let mut reader = BufReader::new(certfile);
-    rustls_pemfile::certs(&mut reader)
-        .unwrap()
-        .iter()
-        .map(|v| Certificate(v.clone()))
-        .collect()
-}
-
-fn load_private_key(filename: &Path) -> rustls::PrivateKey {
-    let keyfile = std::fs::File::open(filename).expect("cannot open private key file");
-    let mut reader = BufReader::new(keyfile);
-
-    loop {
-        match rustls_pemfile::read_one(&mut reader).expect("cannot parse private key .pem file") {
-            Some(rustls_pemfile::Item::RSAKey(key)) => return rustls::PrivateKey(key),
-            Some(rustls_pemfile::Item::PKCS8Key(key)) => return rustls::PrivateKey(key),
-            Some(rustls_pemfile::Item::ECKey(key)) => return rustls::PrivateKey(key),
-            None => break,
-            _ => {}
-        }
-    }
-
-    panic!(
-        "no keys found in {:?} (encrypted keys not supported)",
-        filename
-    );
-}
-
 pub fn certs_dir() -> std::path::PathBuf {
     let mut certs_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     certs_dir.pop();
@@ -95,15 +62,19 @@ pub fn certs_dir() -> std::path::PathBuf {
 
 fn tls_config() -> Arc<ServerConfig> {
     let certs_dir = certs_dir();
-    let cert_chain = load_certs(&certs_dir.join("server.crt"));
-    let key_der = load_private_key(&certs_dir.join("server.key"));
+    let mut cert_file =
+        File::open(certs_dir.join("server.crt")).expect("cannot open certificate file");
+    let mut private_key_file =
+        File::open(certs_dir.join("server.key")).expect("cannot open private key file");
+    let certs = rustls_pemfile::certs(&mut BufReader::new(&mut cert_file))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("cannot read certificate file");
+    let private_key = rustls_pemfile::private_key(&mut BufReader::new(&mut private_key_file))
+        .expect("cannot read private key file")
+        .expect("no private key found");
     let config = ServerConfig::builder()
-        .with_safe_default_cipher_suites()
-        .with_safe_default_kx_groups()
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_client_cert_verifier(NoClientAuth::boxed())
-        .with_single_cert(cert_chain, key_der)
+        .with_no_client_auth()
+        .with_single_cert(certs, private_key)
         .unwrap();
     Arc::new(config)
 }
