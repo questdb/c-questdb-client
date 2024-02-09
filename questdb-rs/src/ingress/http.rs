@@ -1,7 +1,9 @@
 use crate::{error, Error};
 use base64ct::Base64;
 use base64ct::Encoding;
+use rand::Rng;
 use std::fmt::Write;
+use std::thread::sleep;
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
@@ -39,8 +41,8 @@ impl TokenAuthParams {
 pub(super) struct HttpConfig {
     pub(super) min_throughput: u64,
     pub(super) user_agent: Option<String>,
-    pub(super) max_retries: u32,
-    pub(super) retry_interval: Duration,
+    pub(super) retry_timeout: Duration,
+    pub(super) grace_timeout: Duration,
     pub(super) transactional: bool,
 }
 
@@ -55,7 +57,7 @@ pub(super) struct HttpHandlerState {
     pub(super) auth: Option<String>,
 
     /// Additional grace period added to the timeout as calculated via `min_throughput`.
-    pub(super) timeout_grace_period: Duration,
+    pub(super) grace_timeout: Duration,
 
     /// HTTP params configured via the `SenderBuilder`.
     pub(super) config: HttpConfig,
@@ -175,33 +177,50 @@ pub(super) fn is_retriable_error(err: &ureq::Error) -> bool {
 }
 
 #[allow(clippy::result_large_err)] // `ureq::Error` is large enough to cause this warning.
-pub(super) fn retry_http_send(
+fn retry_http_send(
     request: ureq::Request,
     buf: &[u8],
-    max_retries: u32,
-    mut retry_interval: Duration,
+    retry_timeout: Duration,
+    mut last_err: ureq::Error,
 ) -> Result<ureq::Response, ureq::Error> {
-    let mut counter = 0;
-
+    let mut rng = rand::thread_rng();
+    let retry_end = std::time::Instant::now() + retry_timeout;
+    let mut retry_interval_ms = 10;
     loop {
-        let response_or_err = request.clone().send_bytes(buf);
-        let last_err = match response_or_err {
-            Ok(res) => return Ok(res),
-            Err(err) => {
-                if is_retriable_error(&err) {
-                    err
-                } else {
-                    return Err(err);
-                }
-            }
-        };
-
-        counter += 1;
-        if counter > max_retries {
+        let jitter_ms = rng.gen_range(-5i32..5);
+        let to_sleep_ms = retry_interval_ms + jitter_ms;
+        let to_sleep = Duration::from_millis(to_sleep_ms as u64);
+        if (std::time::Instant::now() + to_sleep) > retry_end {
             return Err(last_err);
         }
-
-        std::thread::sleep(retry_interval);
-        retry_interval *= 2;
+        sleep(to_sleep);
+        last_err = match request.clone().send_bytes(buf) {
+            Ok(res) => return Ok(res),
+            Err(err) => {
+                if !is_retriable_error(&err) {
+                    return Err(err);
+                }
+                err
+            }
+        };
+        retry_interval_ms = (retry_interval_ms * 2).min(1000);
     }
+}
+
+#[allow(clippy::result_large_err)] // `ureq::Error` is large enough to cause this warning.
+pub(super) fn http_send_with_retries(
+    request: ureq::Request,
+    buf: &[u8],
+    retry_timeout: Duration,
+) -> Result<ureq::Response, ureq::Error> {
+    let last_err = match request.clone().send_bytes(buf) {
+        Ok(res) => return Ok(res),
+        Err(err) => err,
+    };
+
+    if retry_timeout.is_zero() || !is_retriable_error(&last_err) {
+        return Err(last_err);
+    }
+
+    retry_http_send(request, buf, retry_timeout, last_err)
 }
