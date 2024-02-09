@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2023 QuestDB
+ *  Copyright (c) 2019-2024 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -186,15 +186,16 @@ pub use self::timestamp::*;
 
 use crate::error::{self, Error, Result};
 use crate::gai;
+use crate::ingress::conf::ConfigSetting;
 use core::time::Duration;
 use itoa;
 use std::convert::{Infallible, TryFrom, TryInto};
 use std::fmt::{Formatter, Write};
 use std::io::{self, BufRead, BufReader, ErrorKind, Write as IoWrite};
-use std::ops::Deref;
 use std::path::PathBuf;
 use std::string::ToString;
 use std::sync::Arc;
+use std::ops::Deref;
 
 use base64ct::{Base64, Base64UrlUnpadded, Encoding};
 use ring::rand::SystemRandom;
@@ -1412,38 +1413,38 @@ impl Tls {
 /// `/etc/services` or equivalent.
 ///
 /// ```
-/// use questdb::ingress::Service;
+/// use questdb::ingress::Port;
 /// use std::convert::Into;
 ///
-/// let service: Service = 9009.into();
+/// let service: Port = 9009.into();
 /// ```
 ///
 /// or
 ///
 /// ```
-/// use questdb::ingress::Service;
+/// use questdb::ingress::Port;
 /// use std::convert::Into;
 ///
 /// // Assuming the service name is registered.
-/// let service: Service = "qdb_ilp".into();  // or with a String too.
+/// let service: Port = "qdb_ilp".into();  // or with a String too.
 /// ```
-pub struct Service(String);
+pub struct Port(String);
 
-impl From<String> for Service {
+impl From<String> for Port {
     fn from(s: String) -> Self {
-        Service(s)
+        Port(s)
     }
 }
 
-impl From<&str> for Service {
+impl From<&str> for Port {
     fn from(s: &str) -> Self {
-        Service(s.to_owned())
+        Port(s.to_owned())
     }
 }
 
-impl From<u16> for Service {
+impl From<u16> for Port {
     fn from(p: u16) -> Self {
-        Service(p.to_string())
+        Port(p.to_string())
     }
 }
 
@@ -1608,60 +1609,6 @@ pub(crate) enum SenderProtocol {
     IlpOverHttp,
 }
 
-/// Wraps a SenderBuilder config setting with the intent of tracking
-/// whether the value was user-specified or defaulted.
-/// The API then ensures the following rules:
-/// * A defaulted value can be changed to another defaulted value,
-///   or to a user-specified value.
-/// * A user-specified value can't be changed once set.
-#[derive(Debug, Clone)]
-enum ConfigSetting<T> {
-    Defaulted(T),
-    Specified(T),
-}
-
-impl<T> ConfigSetting<T> {
-    fn new(value: T) -> Self {
-        ConfigSetting::Defaulted(value)
-    }
-
-    /// Update the default value, usually because
-    /// another setting was triggered.
-    /// Does nothing if the value was already specified.
-    /// Returns true if the value was updated.
-    fn set_default(&mut self, value: T) -> bool {
-        if let ConfigSetting::Defaulted(_) = self {
-            *self = ConfigSetting::Defaulted(value);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Set the user-defined value.
-    /// Note that it can't be changed once set.
-    /// Returns true if the value was updated, false if already specified.
-    fn set_specified(&mut self, _setting_name: &str, value: T) -> bool {
-        if let ConfigSetting::Defaulted(_) = self {
-            *self = ConfigSetting::Specified(value);
-            true
-        } else {
-            false
-        }
-    }
-}
-
-impl<T> Deref for ConfigSetting<T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        match self {
-            ConfigSetting::Defaulted(v) => v,
-            ConfigSetting::Specified(v) => v,
-        }
-    }
-}
-
 /// Accumulate parameters for a new `Sender` instance.
 ///
 /// ```no_run
@@ -1706,8 +1653,8 @@ impl SenderBuilder {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn new<H: Into<String>, P: Into<Service>>(host: H, port: P) -> Self {
-        let service: Service = port.into();
+    pub fn new<H: Into<String>, P: Into<Port>>(host: H, port: P) -> Self {
+        let service: Port = port.into();
         Self {
             read_timeout: ConfigSetting::new(Duration::from_secs(15)),
             host: ConfigSetting::new(host.into()),
@@ -2382,6 +2329,7 @@ impl Sender {
     }
 }
 
+mod conf;
 mod timestamp;
 
 #[cfg(feature = "ilp-over-http")]
