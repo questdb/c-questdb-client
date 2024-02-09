@@ -191,6 +191,7 @@ use itoa;
 use std::convert::{Infallible, TryFrom, TryInto};
 use std::fmt::{Formatter, Write};
 use std::io::{self, BufRead, BufReader, ErrorKind, Write as IoWrite};
+use std::ops::Deref;
 use std::path::PathBuf;
 use std::string::ToString;
 use std::sync::Arc;
@@ -1607,6 +1608,60 @@ pub(crate) enum SenderProtocol {
     IlpOverHttp,
 }
 
+/// Wraps a SenderBuilder config setting with the intent of tracking
+/// whether the value was user-specified or defaulted.
+/// The API then ensures the following rules:
+/// * A defaulted value can be changed to another defaulted value,
+///   or to a user-specified value.
+/// * A user-specified value can't be changed once set.
+#[derive(Debug, Clone)]
+enum ConfigSetting<T> {
+    Defaulted(T),
+    Specified(T),
+}
+
+impl<T> ConfigSetting<T> {
+    fn new(value: T) -> Self {
+        ConfigSetting::Defaulted(value)
+    }
+
+    /// Update the default value, usually because
+    /// another setting was triggered.
+    /// Does nothing if the value was already specified.
+    /// Returns true if the value was updated.
+    fn set_default(&mut self, value: T) -> bool {
+        if let ConfigSetting::Defaulted(_) = self {
+            *self = ConfigSetting::Defaulted(value);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Set the user-defined value.
+    /// Note that it can't be changed once set.
+    /// Returns true if the value was updated, false if already specified.
+    fn set_specified(&mut self, _setting_name: &str, value: T) -> bool {
+        if let ConfigSetting::Defaulted(_) = self {
+            *self = ConfigSetting::Specified(value);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl<T> Deref for ConfigSetting<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            ConfigSetting::Defaulted(v) => v,
+            ConfigSetting::Specified(v) => v,
+        }
+    }
+}
+
 /// Accumulate parameters for a new `Sender` instance.
 ///
 /// ```no_run
@@ -1627,13 +1682,13 @@ pub(crate) enum SenderProtocol {
 ///
 #[derive(Debug, Clone)]
 pub struct SenderBuilder {
-    read_timeout: Duration,
-    host: String,
-    port: String,
-    net_interface: Option<String>,
-    auth: Option<AuthParams>,
-    tls: Tls,
-    protocol: SenderProtocol,
+    read_timeout: ConfigSetting<Duration>,
+    host: ConfigSetting<String>,
+    port: ConfigSetting<String>,
+    net_interface: ConfigSetting<Option<String>>,
+    auth: ConfigSetting<Option<AuthParams>>,
+    tls: ConfigSetting<Tls>,
+    protocol: ConfigSetting<SenderProtocol>,
 
     #[cfg(feature = "ilp-over-http")]
     http: HttpConfig,
@@ -1654,13 +1709,13 @@ impl SenderBuilder {
     pub fn new<H: Into<String>, P: Into<Service>>(host: H, port: P) -> Self {
         let service: Service = port.into();
         Self {
-            read_timeout: Duration::from_secs(15),
-            host: host.into(),
-            port: service.0,
-            net_interface: None,
-            auth: None,
-            tls: Tls::Disabled,
-            protocol: SenderProtocol::IlpOverTcp,
+            read_timeout: ConfigSetting::new(Duration::from_secs(15)),
+            host: ConfigSetting::new(host.into()),
+            port: ConfigSetting::new(service.0),
+            net_interface: ConfigSetting::new(None),
+            auth: ConfigSetting::new(None),
+            tls: ConfigSetting::new(Tls::Disabled),
+            protocol: ConfigSetting::new(SenderProtocol::IlpOverTcp),
 
             #[cfg(feature = "ilp-over-http")]
             http: HttpConfig {
@@ -1691,7 +1746,8 @@ impl SenderBuilder {
     /// # }
     /// ```
     pub fn net_interface<I: Into<String>>(mut self, addr: I) -> Self {
-        self.net_interface = Some(addr.into());
+        self.net_interface
+            .set_specified("net_interface", Some(addr.into()));
         self
     }
 
@@ -1734,12 +1790,15 @@ impl SenderBuilder {
         C: Into<String>,
         D: Into<String>,
     {
-        self.auth = Some(AuthParams::Ecdsa(EcdsaAuthParams {
-            key_id: key_id.into(),
-            priv_key: priv_key.into(),
-            pub_key_x: pub_key_x.into(),
-            pub_key_y: pub_key_y.into(),
-        }));
+        self.auth.set_specified(
+            "auth",
+            Some(AuthParams::Ecdsa(EcdsaAuthParams {
+                key_id: key_id.into(),
+                priv_key: priv_key.into(),
+                pub_key_x: pub_key_x.into(),
+                pub_key_y: pub_key_y.into(),
+            })),
+        );
         self
     }
 
@@ -1753,10 +1812,13 @@ impl SenderBuilder {
         A: Into<String>,
         B: Into<String>,
     {
-        self.auth = Some(AuthParams::Basic(BasicAuthParams {
-            username: username.into(),
-            password: password.into(),
-        }));
+        self.auth.set_specified(
+            "auth",
+            Some(AuthParams::Basic(BasicAuthParams {
+                username: username.into(),
+                password: password.into(),
+            })),
+        );
         self
     }
 
@@ -1770,7 +1832,8 @@ impl SenderBuilder {
         A: Into<String>,
     {
         let token: String = token.into();
-        self.auth = Some(AuthParams::Token(TokenAuthParams { token }));
+        self.auth
+            .set_specified("auth", Some(AuthParams::Token(TokenAuthParams { token })));
         self
     }
 
@@ -1833,7 +1896,7 @@ impl SenderBuilder {
     ///    .connect()?;
     /// ```
     pub fn tls(mut self, tls: Tls) -> Self {
-        self.tls = tls;
+        self.tls.set_specified("tls", tls);
         self
     }
 
@@ -1854,7 +1917,7 @@ impl SenderBuilder {
     /// # }
     /// ```
     pub fn read_timeout(mut self, value: Duration) -> Self {
-        self.read_timeout = value;
+        self.read_timeout.set_specified("read_timeout", value);
         self
     }
 
@@ -1862,7 +1925,8 @@ impl SenderBuilder {
     /// Configure to use HTTP instead of TCP.
     /// If you want to configure additional HTTP options, use `http_with_opts` instead.
     pub fn http(mut self) -> Self {
-        self.protocol = SenderProtocol::IlpOverHttp;
+        self.protocol
+            .set_specified("http", SenderProtocol::IlpOverHttp);
         self
     }
 
@@ -1927,7 +1991,7 @@ impl SenderBuilder {
     pub fn connect(&self) -> Result<Sender> {
         let mut descr = format!("Sender[host={:?},port={:?},", self.host, self.port);
 
-        match self.tls {
+        match self.tls.deref() {
             Tls::Disabled => write!(descr, "tls=enabled,").unwrap(),
             Tls::Enabled(_) => write!(descr, "tls=enabled,").unwrap(),
 
@@ -1935,7 +1999,7 @@ impl SenderBuilder {
             Tls::InsecureSkipVerify => write!(descr, "tls=insecure_skip_verify,").unwrap(),
         }
 
-        let handler = match self.protocol {
+        let handler = match *self.protocol {
             SenderProtocol::IlpOverTcp => {
                 #[cfg(feature = "ilp-over-http")]
                 if self.http.transactional {
@@ -1969,7 +2033,7 @@ impl SenderBuilder {
                 sock.set_nodelay(true).map_err(|io_err| {
                     map_io_to_socket_err("Could not set TCP_NODELAY: ", io_err)
                 })?;
-                if let Some(ref host) = self.net_interface {
+                if let Some(ref host) = self.net_interface.deref() {
                     let bind_addr = gai::resolve_host(host.as_str())?;
                     sock.bind(&bind_addr).map_err(|io_err| {
                         map_io_to_socket_err(
@@ -1979,7 +2043,7 @@ impl SenderBuilder {
                     })?;
                 }
                 sock.connect(&addr).map_err(|io_err| {
-                    let host_port = format!("{}:{}", self.host, self.port);
+                    let host_port = format!("{}:{}", self.host.deref(), *self.port);
                     let prefix = format!("Could not connect to {:?}: ", host_port);
                     map_io_to_socket_err(&prefix, io_err)
                 })?;
@@ -1988,7 +2052,7 @@ impl SenderBuilder {
                 // We set up a read timeout to prevent the client from "hanging"
                 // should we be connecting to a server configured in a different way
                 // from the client.
-                sock.set_read_timeout(Some(self.read_timeout))
+                sock.set_read_timeout(Some(*self.read_timeout))
                     .map_err(|io_err| {
                         map_io_to_socket_err("Failed to set read timeout on socket: ", io_err)
                     })?;
@@ -2055,7 +2119,7 @@ impl SenderBuilder {
                     Some(tls_config) => agent_builder.tls_config(tls_config),
                     None => agent_builder,
                 };
-                let auth = match self.auth.clone() {
+                let auth = match self.auth.deref().clone() {
                     #[cfg(feature = "ilp-over-http")]
                     Some(AuthParams::Basic(auth)) => Some(auth.to_header_string()),
 
@@ -2077,12 +2141,17 @@ impl SenderBuilder {
                 } else {
                     "http"
                 };
-                let url = format!("{}://{}:{}/write", proto, self.host, self.port);
+                let url = format!(
+                    "{}://{}:{}/write",
+                    proto,
+                    self.host.deref(),
+                    self.port.deref()
+                );
                 ProtocolHandler::Http(HttpHandlerState {
                     agent,
                     url,
                     auth,
-                    timeout_grace_period: self.read_timeout,
+                    timeout_grace_period: *self.read_timeout,
                     config: self.http.clone(),
                 })
             }
