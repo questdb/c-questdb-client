@@ -39,7 +39,7 @@ impl TokenAuthParams {
 
 #[derive(Debug, Clone)]
 pub(super) struct HttpConfig {
-    pub(super) min_throughput: u64,  // Wrap in `ConfigSetting` to track user-specified/defaulted.
+    pub(super) min_throughput: u64, // Wrap in `ConfigSetting` to track user-specified/defaulted.
     pub(super) user_agent: Option<String>,
     pub(super) retry_timeout: Duration,
     pub(super) grace_timeout: Duration,
