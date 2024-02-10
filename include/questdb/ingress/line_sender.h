@@ -600,25 +600,13 @@ LINESENDER_API
 void line_sender_opts_http(line_sender_opts* opts);
 
 /**
- * Maxmimum number of HTTP request retries.
- * Defaults to 3.
+ * Cumulative duration spent in retries.
+ * Default is 10 seconds.
  */
 LINESENDER_API
-void line_sender_opts_max_retries(
+void line_sender_opts_retry_timeout(
     line_sender_opts* opts,
-    uint32_t max_retries);
-
-/**
- * The initial retry interval (specified in milliseconds).
- * This the default is 100 milliseconds.
- * The retry interval is doubled after each failed attempt,
- * up to the maximum number of retries.
- * Also see `max_retries`.
- */
-LINESENDER_API
-void line_sender_opts_retry_interval(
-    line_sender_opts* opts,
-    uint64_t retry_interval_millis);
+    uint64_t millis);
 
 /**
  * Minimum expected throughput in bytes per second for HTTP requests.
@@ -630,6 +618,15 @@ LINESENDER_API
 void line_sender_opts_min_throughput(
     line_sender_opts* opts,
     uint64_t bytes_per_sec);
+
+/**
+ * Grace request timeout before relying on the minimum throughput logic.
+ * The default is 5 seconds.
+ */
+LINESENDER_API
+void line_sender_opts_grace_timeout(
+    line_sender_opts* opts,
+    uint64_t millis);
 
 /**
  * Enable transactional flushes.

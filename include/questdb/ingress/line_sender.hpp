@@ -824,27 +824,12 @@ namespace questdb::ingress
             }
 
             /**
-             * Maxmimum number of HTTP request retries.
-             * Defaults to 3.
+             * Cumulative duration spent in retries.
+             * Default is 10 seconds.
              */
-            opts& max_retries(uint32_t max_retries) noexcept
+            opts& retry_timeout(uint64_t millis) noexcept
             {
-                ::line_sender_opts_max_retries(_impl, max_retries);
-                return *this;
-            }
-
-            /**
-             * The initial retry interval (specified in milliseconds).
-             * This the default is 100 milliseconds.
-             * The retry interval is doubled after each failed attempt,
-             * up to the maximum number of retries.
-             * Also see `max_retries`.
-             */
-            opts& retry_interval(uint64_t retry_interval_millis) noexcept
-            {
-                ::line_sender_opts_retry_interval(
-                    _impl,
-                    retry_interval_millis);
+                ::line_sender_opts_retry_timeout(_impl, millis);
                 return *this;
             }
 
@@ -857,6 +842,16 @@ namespace questdb::ingress
             opts& min_throughput(uint64_t bytes_per_sec) noexcept
             {
                 ::line_sender_opts_min_throughput(_impl, bytes_per_sec);
+                return *this;
+            }
+
+            /**
+             * Grace request timeout before relying on the minimum throughput logic.
+             * The default is 5 seconds.
+             */
+            opts& grace_timeout(uint64_t millis) noexcept
+            {
+                ::line_sender_opts_grace_timeout(_impl, millis);
                 return *this;
             }
 

@@ -720,8 +720,17 @@ TEST_CASE("Empty Buffer") {
 TEST_CASE("HTTP basics") {
     questdb::ingress::opts opts1{"localhost", 1};
     questdb::ingress::opts opts2{"localhost", 1};
-    opts1.http().transactional().max_retries(5).retry_interval(10).basic_auth("user", "pass");
-    opts2.http().token_auth("token").min_throughput(1000);
+    opts1
+        .http()
+        .transactional()
+        .grace_timeout(5000)
+        .retry_timeout(5)
+        .basic_auth("user", "pass");
+    opts2
+        .http()
+        .token_auth("token")
+        .min_throughput(1000)
+        .retry_timeout(0);
     questdb::ingress::line_sender sender1{opts1};
     questdb::ingress::line_sender sender2{opts2};
 

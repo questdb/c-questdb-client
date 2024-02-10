@@ -60,9 +60,9 @@ impl<T> ConfigSetting<T> {
     pub(crate) fn set_specified(&mut self, _setting_name: &str, value: T) -> bool {
         if let ConfigSetting::Defaulted(_) = self {
             *self = ConfigSetting::Specified(value);
-            true
+            true // TODO: Return `Ok(())` instead of `true`, then update all signatures that don't compile.
         } else {
-            false
+            false // TODO: Return `Err(..)` instead of `false`
         }
     }
 }

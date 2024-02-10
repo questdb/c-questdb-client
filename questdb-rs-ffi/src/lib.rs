@@ -103,6 +103,9 @@ pub enum line_sender_error_code {
 
     /// Error sent back from the server during flush.
     line_sender_error_server_flush_error,
+
+    /// Bad configuration.
+    line_sender_error_config_error,
 }
 
 impl From<ErrorCode> for line_sender_error_code {
@@ -126,6 +129,7 @@ impl From<ErrorCode> for line_sender_error_code {
             ErrorCode::ServerFlushError => {
                 line_sender_error_code::line_sender_error_server_flush_error
             }
+            ErrorCode::ConfigError => line_sender_error_code::line_sender_error_config_error,
         }
     }
 }
@@ -514,28 +518,12 @@ pub unsafe extern "C" fn line_sender_opts_http(opts: *mut line_sender_opts) {
     upd_opts!(opts, http);
 }
 
-/// Maxmimum number of HTTP request retries.
-/// Defaults to 3.
+/// Cumulative duration spent in retries.
+/// Default is 10 seconds.
 #[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_max_retries(
-    opts: *mut line_sender_opts,
-    max_retries: u32,
-) {
-    upd_opts!(opts, max_retries, max_retries);
-}
-
-/// The initial retry interval (specified in milliseconds).
-/// This the default is 100 milliseconds.
-/// The retry interval is doubled after each failed attempt,
-/// up to the maximum number of retries.
-/// Also see `max_retries`.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_retry_interval(
-    opts: *mut line_sender_opts,
-    retry_interval_millis: u64,
-) {
-    let retry_interval = std::time::Duration::from_millis(retry_interval_millis);
-    upd_opts!(opts, retry_interval, retry_interval);
+pub unsafe extern "C" fn line_sender_opts_retry_timeout(opts: *mut line_sender_opts, millis: u64) {
+    let retry_timeout = std::time::Duration::from_millis(millis);
+    upd_opts!(opts, retry_timeout, retry_timeout);
 }
 
 /// Minimum expected throughput in bytes per second for HTTP requests.
@@ -548,6 +536,14 @@ pub unsafe extern "C" fn line_sender_opts_min_throughput(
     bytes_per_sec: u64,
 ) {
     upd_opts!(opts, min_throughput, bytes_per_sec);
+}
+
+/// Grace request timeout before relying on the minimum throughput logic.
+/// The default is 5 seconds.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_grace_timeout(opts: *mut line_sender_opts, millis: u64) {
+    let grace_timeout = std::time::Duration::from_millis(millis);
+    upd_opts!(opts, grace_timeout, grace_timeout);
 }
 
 /// Enable transactional flushes.
