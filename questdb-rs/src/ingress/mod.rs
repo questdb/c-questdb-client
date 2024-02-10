@@ -188,6 +188,7 @@ use crate::error::{self, Error, Result};
 use crate::gai;
 use crate::ingress::conf::ConfigSetting;
 use core::time::Duration;
+use std::collections::HashMap;
 use itoa;
 use std::convert::{Infallible, TryFrom, TryInto};
 use std::fmt::{Formatter, Write};
@@ -1609,6 +1610,16 @@ pub(crate) enum SenderProtocol {
     IlpOverHttp,
 }
 
+impl SenderProtocol {
+    fn default_port(&self) -> &str {
+        match self {
+            SenderProtocol::IlpOverTcp => "9009",
+            #[cfg(feature = "ilp-over-http")]
+            SenderProtocol::IlpOverHttp => "9000",
+        }
+    }
+}
+
 /// Accumulate parameters for a new `Sender` instance.
 ///
 /// ```no_run
@@ -1642,6 +1653,68 @@ pub struct SenderBuilder {
 }
 
 impl SenderBuilder {
+    /// Create a new `SenderBuilder` instance from configuration parameters.
+    pub fn from_conf<T: AsRef<str>>(conf: T) -> Result<SenderBuilder> {
+        let conf = conf.as_ref();
+        let conf = questdb_confstr::parse_conf_str(conf).map_err(|e| {
+            error::fmt!(
+                ConfigError,
+                "Config parse error: {}",
+                e
+            )
+        })?;
+        let service = conf.service().to_lowercase();
+        let params = conf.params()
+            .iter()
+            .map(|(k, v)| (k.to_lowercase(), v))
+            .collect::<HashMap<_, _>>();
+        let protocol = match service.as_ref() {
+            "tcp" | "tcps" => SenderProtocol::IlpOverTcp,
+            #[cfg(feature = "ilp-over-http")]
+            "http" | "https" => SenderProtocol::IlpOverHttp,
+            _ => {
+                return Err(error::fmt!(
+                    ConfigError,
+                    "Unsupported service: {}",
+                    service
+                ))
+            }
+        };
+        let with_tls = service.ends_with('s');
+        let Some(addr) = params.get("addr") else {
+            return Err(error::fmt!(
+                ConfigError,
+                "Missing 'addr' parameter in config string."
+            ))
+        };
+        let (host, port) = match addr.split_once(':') {
+            Some((h, p)) => (h, p),
+            None => {
+                (addr.as_str(), protocol.default_port())
+            }
+        };
+        let mut builder = SenderBuilder::new(host, port);
+        builder.protocol.set_specified("protocol", protocol);
+        if with_tls {
+            builder.tls.set_default(Tls::Enabled(CertificateAuthority::WebpkiRoots));
+        }
+        // TODO: Map the rest of the parameters.
+        // TODO: Validate param inconsistencies.
+        Ok(builder)
+    }
+
+    /// Create a new `SenderBuilder` instance from the 
+    /// `QDB_CLIENT_CONF` environment variable.
+    pub fn from_env() -> Result<SenderBuilder> {
+        let conf = std::env::var("QDB_CLIENT_CONF").map_err(|_| {
+            error::fmt!(
+                ConfigError,
+                "Environment variable QDB_CLIENT_CONF not set."
+            )
+        })?;
+        Self::from_conf(conf)
+    }
+
     /// QuestDB server and port.
     ///
     /// ```no_run

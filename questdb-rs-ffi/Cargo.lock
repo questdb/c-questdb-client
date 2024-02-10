@@ -282,6 +282,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "questdb-confstr"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a85ae0d477308986d89496bce6227833e11490cd27b98b809e4704b105000fd8"
+
+[[package]]
 name = "questdb-rs"
 version = "3.1.0"
 dependencies = [
@@ -290,6 +296,7 @@ dependencies = [
  "indoc",
  "itoa",
  "libc",
+ "questdb-confstr",
  "ring",
  "rustls",
  "rustls-native-certs",

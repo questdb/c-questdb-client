@@ -544,6 +544,6 @@ impl MockServer {
     }
 
     pub fn lsb(&self) -> SenderBuilder {
-        SenderBuilder::new(self.host, self.port)
+        SenderBuilder::new_tcp(self.host, self.port)
     }
 }
