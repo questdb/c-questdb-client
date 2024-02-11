@@ -2350,6 +2350,16 @@ impl F64Serializer {
 }
 
 impl Sender {
+    /// Create a new `Sender` from configuration parameters.
+    pub fn from_conf<T: AsRef<str>>(conf: T) -> Result<Self> {
+        SenderBuilder::from_conf(conf)?.connect()
+    }
+
+    /// Create a new `Sender` from the `QDB_CLIENT_CONF` environment variable.
+    pub fn from_env() -> Result<Self> {
+        SenderBuilder::from_env()?.connect()
+    }
+
     /// Send buffer to the QuestDB server, without clearing the
     /// buffer.
     ///
