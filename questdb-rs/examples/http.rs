@@ -9,7 +9,7 @@ fn main() -> Result<()> {
         .http()?
         .tls(Tls::Enabled(CertificateAuthority::WebpkiRoots))?
         .basic_auth("foo", "bar")?
-        .connect()?;
+        .build()?;
     let mut buffer = Buffer::new();
     buffer
         .table("sensors")?

@@ -11,7 +11,7 @@ fn main() -> Result<()> {
         .unwrap_or("9009".to_string())
         .parse()
         .unwrap();
-    let mut sender = SenderBuilder::new_tcp(host, port)?.connect()?;
+    let mut sender = SenderBuilder::new_tcp(host, port)?.build()?;
     let mut buffer = Buffer::new();
     let designated_timestamp =
         TimestampNanos::from_datetime(Utc.with_ymd_and_hms(1997, 7, 4, 4, 56, 55).unwrap())?;

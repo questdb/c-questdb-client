@@ -18,7 +18,7 @@ fn main() -> Result<()> {
             "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU", // x
             "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac", // y
         )?
-        .connect()?;
+        .build()?;
     let mut buffer = Buffer::new();
     let designated_timestamp =
         TimestampNanos::from_datetime(Utc.with_ymd_and_hms(1997, 7, 4, 4, 56, 55).unwrap())?;

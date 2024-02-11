@@ -2045,7 +2045,7 @@ impl SenderBuilder {
     /// Will return once the connection is fully established:
     /// If the connection requires authentication or TLS, these will also be
     /// completed before returning.
-    pub fn connect(&self) -> Result<Sender> {
+    pub fn build(&self) -> Result<Sender> {
         let mut descr = format!("Sender[host={:?},port={:?},", self.host, self.port);
 
         match self.tls.deref() {
@@ -2352,12 +2352,12 @@ impl F64Serializer {
 impl Sender {
     /// Create a new `Sender` from configuration parameters.
     pub fn from_conf<T: AsRef<str>>(conf: T) -> Result<Self> {
-        SenderBuilder::from_conf(conf)?.connect()
+        SenderBuilder::from_conf(conf)?.build()
     }
 
     /// Create a new `Sender` from the `QDB_CLIENT_CONF` environment variable.
     pub fn from_env() -> Result<Self> {
-        SenderBuilder::from_env()?.connect()
+        SenderBuilder::from_env()?.build()
     }
 
     /// Send buffer to the QuestDB server, without clearing the

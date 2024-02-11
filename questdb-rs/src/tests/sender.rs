@@ -41,7 +41,7 @@ use std::{io, time::SystemTime};
 #[test]
 fn test_basics() -> TestResult {
     let mut server = MockServer::new()?;
-    let mut sender = server.lsb()?.connect()?;
+    let mut sender = server.lsb()?.build()?;
     assert!(!sender.must_close());
     server.accept()?;
 
@@ -208,7 +208,7 @@ fn test_bad_key(
     let lsb = server
         .lsb()?
         .auth("testUser1", priv_key, pub_key_x, pub_key_y)?;
-    let sender = lsb.connect();
+    let sender = lsb.build();
 
     match sender {
         Ok(_) => panic!("Expected an error due to bad key, but connect succeeded."),
@@ -334,7 +334,7 @@ fn test_tls_with_file_ca() -> TestResult {
         .lsb()?
         .tls(Tls::Enabled(CertificateAuthority::File(ca_path)))?;
     let server_jh = server.accept_tls();
-    let mut sender = lsb.connect()?;
+    let mut sender = lsb.build()?;
     let mut server: MockServer = server_jh.join().unwrap()?;
 
     let mut buffer = Buffer::new();
@@ -368,7 +368,7 @@ fn test_tls_to_plain_server() -> TestResult {
         server.accept()?;
         Ok(server)
     });
-    let maybe_sender = lsb.connect();
+    let maybe_sender = lsb.build();
     let _server: MockServer = server_jh.join().unwrap()?;
     let err = maybe_sender.unwrap_err();
     assert_eq!(
@@ -406,7 +406,7 @@ fn test_plain_to_tls_server() -> TestResult {
         .read_timeout(Duration::from_millis(500))?
         .tls(Tls::Disabled)?;
     let server_jh = server.accept_tls();
-    let maybe_sender = lsb.connect();
+    let maybe_sender = lsb.build();
     let server_err = server_jh.join().unwrap().unwrap_err();
 
     // The server failed to handshake, so disconnected the client.
@@ -429,7 +429,7 @@ fn test_tls_insecure_skip_verify() -> TestResult {
     let server = MockServer::new()?;
     let lsb = server.lsb()?.tls(Tls::InsecureSkipVerify)?;
     let server_jh = server.accept_tls();
-    let mut sender = lsb.connect()?;
+    let mut sender = lsb.build()?;
     let mut server: MockServer = server_jh.join().unwrap()?;
 
     let mut buffer = Buffer::new();

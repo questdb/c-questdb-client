@@ -20,7 +20,7 @@ fn main() -> Result<()> {
         )?
         .tls(Tls::Enabled(CertificateAuthority::WebpkiRoots))?
         // Alternatively: .tls(Tls::Enabled(CertificateAuthority::OsRoots))
-        .connect()?;
+        .build()?;
     let mut buffer = Buffer::new();
     let designated_timestamp =
         TimestampNanos::from_datetime(Utc.with_ymd_and_hms(1997, 7, 4, 4, 56, 55).unwrap())?;
