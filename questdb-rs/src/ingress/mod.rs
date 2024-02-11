@@ -1649,7 +1649,7 @@ pub struct SenderBuilder {
     protocol: ConfigSetting<SenderProtocol>,
 
     #[cfg(feature = "ilp-over-http")]
-    http: HttpConfig,
+    http: Option<HttpConfig>,
 }
 
 impl SenderBuilder {
@@ -1728,6 +1728,10 @@ impl SenderBuilder {
             auth: ConfigSetting::new(None),
             tls: ConfigSetting::new(Tls::Disabled),
             protocol: ConfigSetting::new(SenderProtocol::IlpOverTcp),
+            #[cfg(feature = "ilp-over-http")]
+            http: None,
+        }
+    }
 
     /// Create a new `SenderBuilder` HTTP instance from the provided QuestDB
     /// server and port.
@@ -1968,32 +1972,44 @@ impl SenderBuilder {
     /// Cumulative duration spent in retries.
     /// Default is 10 seconds.
     pub fn retry_timeout(mut self, value: Duration) -> Self {
-        self.http.retry_timeout = value;
+        if let Some(http) = &mut self.http {
+            http.retry_timeout = value;
+        } else {
+            panic!("retry_timeout is supported only in ILP over HTTP.")
+        }
         self
     }
 
+    #[cfg(feature = "ilp-over-http")]
     /// Internal API, do not use.
     /// This is exposed exclusively for the Python client.
     /// We (QuestDB) use this to help us debug which client is being used if we encounter issues.
-    #[cfg(feature = "ilp-over-http")]
     #[doc(hidden)]
     pub fn user_agent(mut self, value: &str) -> Self {
         if value.contains('\n') {
             panic!("User agent should not contain new-line char.");
         }
-        self.http.user_agent = Some(value.to_string());
+        if let Some(http) = &mut self.http {
+            http.user_agent = Some(value.to_string());
+        } else {
+            panic!("user_agent is supported only in ILP over HTTP.")
+        }
         self
     }
 
+    #[cfg(feature = "ilp-over-http")]
     /// Minimum expected throughput in bytes per second for HTTP requests.
     /// If the throughput is lower than this value, the connection will time out.
     /// The default is 100 KiB/s.
     /// The value is expressed as a number of bytes per second.
     /// This is used to calculate additional request timeout, on top of
     /// the [`grace_timeout`](SenderBuilder::grace_timeout).
-    #[cfg(feature = "ilp-over-http")]
     pub fn min_throughput(mut self, value: u64) -> Self {
-        self.http.min_throughput = value;
+        if let Some(http) = &mut self.http {
+            http.min_throughput = value;
+        } else {
+            panic!("min_throughput is supported only in ILP over HTTP.")
+        }
         self
     }
 
@@ -2002,16 +2018,24 @@ impl SenderBuilder {
     /// The default is 5 seconds.
     /// See [`min_throughput`](SenderBuilder::min_throughput) for more details.
     pub fn grace_timeout(mut self, value: Duration) -> Self {
-        self.http.grace_timeout = value;
+        if let Some(http) = &mut self.http {
+            http.grace_timeout = value;
+        } else {
+            panic!("grace_timeout is supported only in ILP over HTTP.")
+        }
         self
     }
 
+    #[cfg(feature = "ilp-over-http")]
     /// Enable transactional flushes.
     /// This is only relevant for HTTP.
     /// This works by ensuring that the buffer contains lines for a single table.
-    #[cfg(feature = "ilp-over-http")]
     pub fn transactional(mut self) -> Self {
-        self.http.transactional = true;
+        if let Some(http) = &mut self.http {
+            http.transactional = true;
+        } else {
+            panic!("Transactional flushes are supported only in ILP over HTTP.")
+        }
         self
     }
 
@@ -2033,14 +2057,6 @@ impl SenderBuilder {
 
         let handler = match *self.protocol {
             SenderProtocol::IlpOverTcp => {
-                #[cfg(feature = "ilp-over-http")]
-                if self.http.transactional {
-                    return Err(error::fmt!(
-                        InvalidApiCall,
-                        "Transactional flushes are not supported for ILP over TCP."
-                    ));
-                }
-
                 let addr: SockAddr =
                     gai::resolve_host_port(self.host.as_str(), self.port.as_str())?;
                 let mut sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
@@ -2141,6 +2157,8 @@ impl SenderBuilder {
 
                 let user_agent = self
                     .http
+                    .as_ref()
+                    .unwrap()
                     .user_agent
                     .as_deref()
                     .unwrap_or(concat!("questdb/rust/", env!("CARGO_PKG_VERSION")));
@@ -2184,7 +2202,7 @@ impl SenderBuilder {
                     url,
                     auth,
 
-                    config: self.http.clone(),
+                    config: self.http.as_ref().unwrap().clone(),
                 })
             }
         };
