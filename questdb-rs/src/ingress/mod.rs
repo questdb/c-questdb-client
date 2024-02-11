@@ -2250,8 +2250,15 @@ impl SenderBuilder {
 }
 
 fn b64_decode(descr: &'static str, buf: &str) -> Result<Vec<u8>> {
-    Base64UrlUnpadded::decode_vec(buf)
-        .map_err(|b64_err| error::fmt!(AuthError, "Misconfigured ILP authentication keys. Could not decode {}: {}. Hint: Check the keys for a possible typo.", descr, b64_err))
+    Base64UrlUnpadded::decode_vec(buf).map_err(|b64_err| {
+        error::fmt!(
+            AuthError,
+            "Misconfigured ILP authentication keys. Could not decode {}: {}. \
+            Hint: Check the keys for a possible typo.",
+            descr,
+            b64_err
+        )
+    })
 }
 
 fn parse_public_key(pub_key_x: &str, pub_key_y: &str) -> Result<Vec<u8>> {
@@ -2265,14 +2272,16 @@ fn parse_public_key(pub_key_x: &str, pub_key_y: &str) -> Result<Vec<u8>> {
     if pub_key_x_ken > 32 {
         return Err(error::fmt!(
             AuthError,
-            "Misconfigured ILP authentication keys. Public key x is too long. Hint: Check the keys for a possible typo."
+            "Misconfigured ILP authentication keys. Public key x is too long. \
+            Hint: Check the keys for a possible typo."
         ));
     }
     let pub_key_y_len = pub_key_y.len();
     if pub_key_y_len > 32 {
         return Err(error::fmt!(
             AuthError,
-            "Misconfigured ILP authentication keys. Public key y is too long. Hint: Check the keys for a possible typo."
+            "Misconfigured ILP authentication keys. Public key y is too long. \
+            Hint: Check the keys for a possible typo."
         ));
     }
     encoded.resize((32 - pub_key_x_ken) + 1, 0u8);
