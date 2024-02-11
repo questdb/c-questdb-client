@@ -1981,23 +1981,6 @@ impl SenderBuilder {
     }
 
     #[cfg(feature = "ilp-over-http")]
-    /// Internal API, do not use.
-    /// This is exposed exclusively for the Python client.
-    /// We (QuestDB) use this to help us debug which client is being used if we encounter issues.
-    #[doc(hidden)]
-    pub fn user_agent(mut self, value: &str) -> Self {
-        if value.contains('\n') {
-            panic!("User agent should not contain new-line char.");
-        }
-        if let Some(http) = &mut self.http {
-            http.user_agent = Some(value.to_string());
-        } else {
-            panic!("user_agent is supported only in ILP over HTTP.")
-        }
-        self
-    }
-
-    #[cfg(feature = "ilp-over-http")]
     /// Minimum expected throughput in bytes per second for HTTP requests.
     /// If the throughput is lower than this value, the connection will time out.
     /// The default is 100 KiB/s.
@@ -2035,6 +2018,23 @@ impl SenderBuilder {
             http.transactional = true;
         } else {
             panic!("Transactional flushes are supported only in ILP over HTTP.")
+        }
+        self
+    }
+
+    #[cfg(feature = "ilp-over-http")]
+    /// Internal API, do not use.
+    /// This is exposed exclusively for the Python client.
+    /// We (QuestDB) use this to help us debug which client is being used if we encounter issues.
+    #[doc(hidden)]
+    pub fn user_agent(mut self, value: &str) -> Self {
+        if value.contains('\n') {
+            panic!("User agent should not contain new-line char.");
+        }
+        if let Some(http) = &mut self.http {
+            http.user_agent = Some(value.to_string());
+        } else {
+            panic!("user_agent is supported only in ILP over HTTP.")
         }
         self
     }
