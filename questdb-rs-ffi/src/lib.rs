@@ -1010,7 +1010,7 @@ pub unsafe extern "C" fn line_sender_connect(
     err_out: *mut *mut line_sender_error,
 ) -> *mut line_sender {
     let builder = &(*opts).0;
-    let sender = bubble_err_to_c!(err_out, builder.connect(), ptr::null_mut());
+    let sender = bubble_err_to_c!(err_out, builder.build(), ptr::null_mut());
     Box::into_raw(Box::new(line_sender(sender)))
 }
 
