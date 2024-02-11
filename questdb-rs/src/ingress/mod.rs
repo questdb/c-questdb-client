@@ -1756,13 +1756,7 @@ impl SenderBuilder {
             auth: ConfigSetting::new(None),
             tls: ConfigSetting::new(Tls::Disabled),
             protocol: ConfigSetting::new(SenderProtocol::IlpOverHttp),
-            http: Some(HttpConfig {
-                min_throughput: 102400, // 100 KiB/s
-                user_agent: None,
-                retry_timeout: Duration::from_secs(10),
-                grace_timeout: Duration::from_secs(5),
-                transactional: false,
-            }),
+            http: Some(HttpConfig::default()),
         }
     }
 
@@ -1965,6 +1959,7 @@ impl SenderBuilder {
     pub fn http(mut self) -> Self {
         self.protocol
             .set_specified("http", SenderProtocol::IlpOverHttp);
+        self.http = Some(HttpConfig::default());
         self
     }
 

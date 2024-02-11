@@ -46,6 +46,18 @@ pub(super) struct HttpConfig {
     pub(super) transactional: bool,
 }
 
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self {
+            min_throughput: 102400, // 100 KiB/s
+            user_agent: None,
+            retry_timeout: Duration::from_secs(10),
+            grace_timeout: Duration::from_secs(5),
+            transactional: false,
+        }
+    }
+}
+
 pub(super) struct HttpHandlerState {
     /// Maintains a pool of open HTTP connections to the endpoint.
     pub(super) agent: ureq::Agent,
