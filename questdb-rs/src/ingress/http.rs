@@ -56,9 +56,6 @@ pub(super) struct HttpHandlerState {
     /// The content of the `Authorization` HTTP header.
     pub(super) auth: Option<String>,
 
-    /// Additional grace period added to the timeout as calculated via `min_throughput`.
-    pub(super) grace_timeout: Duration,
-
     /// HTTP params configured via the `SenderBuilder`.
     pub(super) config: HttpConfig,
 }

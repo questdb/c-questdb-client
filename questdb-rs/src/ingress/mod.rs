@@ -2156,7 +2156,7 @@ impl SenderBuilder {
                     agent,
                     url,
                     auth,
-                    grace_timeout: self.http.grace_timeout,
+
                     config: self.http.clone(),
                 })
             }
@@ -2331,7 +2331,7 @@ impl Sender {
                 }
                 let timeout = Duration::from_secs_f64(
                     (bytes.len() as f64) / (state.config.min_throughput as f64),
-                ) + state.grace_timeout;
+                ) + state.config.grace_timeout;
                 let request = state
                     .agent
                     .post(&state.url)
