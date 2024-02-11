@@ -1654,7 +1654,7 @@ pub struct SenderBuilder {
 
 impl SenderBuilder {
     /// Create a new `SenderBuilder` instance from configuration parameters.
-    pub fn from_conf<T: AsRef<str>>(conf: T) -> Result<SenderBuilder> {
+    pub fn from_conf<T: AsRef<str>>(conf: T) -> Result<Self> {
         let conf = conf.as_ref();
         let conf = questdb_confstr::parse_conf_str(conf)
             .map_err(|e| error::fmt!(ConfigError, "Config parse error: {}", e))?;
@@ -1699,7 +1699,7 @@ impl SenderBuilder {
 
     /// Create a new `SenderBuilder` instance from the
     /// `QDB_CLIENT_CONF` environment variable.
-    pub fn from_env() -> Result<SenderBuilder> {
+    pub fn from_env() -> Result<Self> {
         let conf = std::env::var("QDB_CLIENT_CONF").map_err(|_| {
             error::fmt!(ConfigError, "Environment variable QDB_CLIENT_CONF not set.")
         })?;
