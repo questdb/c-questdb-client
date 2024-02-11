@@ -1681,7 +1681,11 @@ impl SenderBuilder {
             Some((h, p)) => (h, p),
             None => (addr.as_str(), protocol.default_port()),
         };
+        let mut builder = match protocol {
             SenderProtocol::IlpOverTcp => SenderBuilder::new_tcp(host, port),
+            #[cfg(feature = "ilp-over-http")]
+            SenderProtocol::IlpOverHttp => SenderBuilder::new_http(host, port),
+        };
         builder.protocol.set_specified("protocol", protocol);
         if with_tls {
             builder
@@ -1725,14 +1729,36 @@ impl SenderBuilder {
             tls: ConfigSetting::new(Tls::Disabled),
             protocol: ConfigSetting::new(SenderProtocol::IlpOverTcp),
 
-            #[cfg(feature = "ilp-over-http")]
-            http: HttpConfig {
+    /// Create a new `SenderBuilder` HTTP instance from the provided QuestDB
+    /// server and port.
+    ///
+    /// ```no_run
+    /// # use questdb::Result;
+    /// use questdb::ingress::SenderBuilder;
+    ///
+    /// # fn main() -> Result<()> {
+    /// let mut sender = SenderBuilder::new_http("localhost", 9009).connect()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "ilp-over-http")]
+    pub fn new_http<H: Into<String>, P: Into<Port>>(host: H, port: P) -> Self {
+        let service: Port = port.into();
+        Self {
+            read_timeout: ConfigSetting::new(Duration::from_secs(15)),
+            host: ConfigSetting::new(host.into()),
+            port: ConfigSetting::new(service.0),
+            net_interface: ConfigSetting::new(None),
+            auth: ConfigSetting::new(None),
+            tls: ConfigSetting::new(Tls::Disabled),
+            protocol: ConfigSetting::new(SenderProtocol::IlpOverHttp),
+            http: Some(HttpConfig {
                 min_throughput: 102400, // 100 KiB/s
                 user_agent: None,
                 retry_timeout: Duration::from_secs(10),
                 grace_timeout: Duration::from_secs(5),
                 transactional: false,
-            },
+            }),
         }
     }
 
