@@ -5,10 +5,10 @@ use questdb::{
 };
 
 fn main() -> Result<()> {
-    let mut sender = SenderBuilder::new_tcp("localhost", 9000)
-        .http()
-        .tls(Tls::Enabled(CertificateAuthority::WebpkiRoots))
-        .basic_auth("foo", "bar")
+    let mut sender = SenderBuilder::new_tcp("localhost", 9000)?
+        .http()?
+        .tls(Tls::Enabled(CertificateAuthority::WebpkiRoots))?
+        .basic_auth("foo", "bar")?
         .connect()?;
     let mut buffer = Buffer::new();
     buffer

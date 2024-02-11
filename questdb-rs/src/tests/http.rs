@@ -47,7 +47,7 @@ fn test_two_lines() -> TestResult {
     let buffer2 = buffer.clone();
 
     let mut server = MockServer::new()?;
-    let mut sender = server.lsb().http().connect()?;
+    let mut sender = server.lsb()?.http()?.connect()?;
 
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
         server.accept()?;
@@ -88,7 +88,7 @@ fn test_text_plain_error() -> TestResult {
     buffer.table("test")?.column_f64("sym", 2.0)?.at_now()?;
 
     let mut server = MockServer::new()?;
-    let mut sender = server.lsb().http().connect()?;
+    let mut sender = server.lsb()?.http()?.connect()?;
 
     let buffer2 = buffer.clone();
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
@@ -134,7 +134,7 @@ fn test_bad_json_error() -> TestResult {
     buffer.table("test")?.column_f64("sym", 2.0)?.at_now()?;
 
     let mut server = MockServer::new()?;
-    let mut sender = server.lsb().http().connect()?;
+    let mut sender = server.lsb()?.http()?.connect()?;
 
     let buffer2 = buffer.clone();
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
@@ -182,7 +182,7 @@ fn test_json_error() -> TestResult {
     buffer.table("test")?.column_f64("sym", 2.0)?.at_now()?;
 
     let mut server = MockServer::new()?;
-    let mut sender = server.lsb().http().connect()?;
+    let mut sender = server.lsb()?.http()?.connect()?;
 
     let buffer2 = buffer.clone();
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
@@ -231,7 +231,7 @@ fn test_no_connection() -> TestResult {
         .column_f64("x", 1.0)?
         .at_now()?;
 
-    let mut sender = SenderBuilder::new_tcp("127.0.0.1", 1).http().connect()?;
+    let mut sender = SenderBuilder::new_tcp("127.0.0.1", 1)?.http()?.connect()?;
     let res = sender.flush_and_keep(&buffer);
     assert!(res.is_err());
     let err = res.unwrap_err();
@@ -252,7 +252,7 @@ fn test_old_server_without_ilp_http_support() -> TestResult {
         .at_now()?;
 
     let mut server = MockServer::new()?;
-    let mut sender = server.lsb().http().connect()?;
+    let mut sender = server.lsb()?.http()?.connect()?;
 
     let buffer2 = buffer.clone();
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
@@ -299,9 +299,9 @@ fn test_http_basic_auth() -> TestResult {
 
     let mut server = MockServer::new()?;
     let mut sender = server
-        .lsb()
-        .http()
-        .basic_auth("Aladdin", "OpenSesame")
+        .lsb()?
+        .http()?
+        .basic_auth("Aladdin", "OpenSesame")?
         .connect()?;
 
     let buffer2 = buffer.clone();
@@ -344,7 +344,7 @@ fn test_unauthenticated() -> TestResult {
         .at_now()?;
 
     let mut server = MockServer::new()?;
-    let mut sender = server.lsb().http().connect()?;
+    let mut sender = server.lsb()?.http()?.connect()?;
 
     let buffer2 = buffer.clone();
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
@@ -392,7 +392,7 @@ fn test_token_auth() -> TestResult {
         .at_now()?;
 
     let mut server = MockServer::new()?;
-    let mut sender = server.lsb().http().token_auth("0123456789").connect()?;
+    let mut sender = server.lsb()?.http()?.token_auth("0123456789")?.connect()?;
 
     let buffer2 = buffer.clone();
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
@@ -432,7 +432,7 @@ fn test_grace_timeout() -> TestResult {
 
     let grace = Duration::from_millis(50);
     let time_start = std::time::Instant::now();
-    let mut sender = server.lsb().http().grace_timeout(grace).connect()?;
+    let mut sender = server.lsb()?.http()?.grace_timeout(grace)?.connect()?;
     let res = sender.flush_and_keep(&buffer);
     let time_elapsed = time_start.elapsed();
     assert!(res.is_err());
@@ -458,9 +458,9 @@ fn test_tls() -> TestResult {
 
     let mut server = MockServer::new()?;
     let mut sender = server
-        .lsb()
-        .http()
-        .tls(Tls::Enabled(CertificateAuthority::File(ca_path)))
+        .lsb()?
+        .http()?
+        .tls(Tls::Enabled(CertificateAuthority::File(ca_path)))?
         .connect()?;
 
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
@@ -497,9 +497,9 @@ fn test_user_agent() -> TestResult {
 
     let mut server = MockServer::new()?;
     let mut sender = server
-        .lsb()
-        .http()
-        .user_agent("wallabies/1.2.99")
+        .lsb()?
+        .http()?
+        .user_agent("wallabies/1.2.99")?
         .connect()?;
 
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
@@ -538,9 +538,9 @@ fn test_two_retries() -> TestResult {
 
     let mut server = MockServer::new()?;
     let mut sender = server
-        .lsb()
-        .http()
-        .retry_timeout(Duration::from_secs(30))
+        .lsb()?
+        .http()?
+        .retry_timeout(Duration::from_secs(30))?
         .connect()?;
 
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
@@ -602,9 +602,9 @@ fn test_one_retry() -> TestResult {
 
     let mut server = MockServer::new()?;
     let mut sender = server
-        .lsb()
-        .http()
-        .retry_timeout(Duration::from_millis(19))
+        .lsb()?
+        .http()?
+        .retry_timeout(Duration::from_millis(19))?
         .connect()?;
 
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
@@ -682,7 +682,7 @@ fn test_transactional() -> TestResult {
     assert!(buffer2.transactional());
 
     let mut server = MockServer::new()?;
-    let mut sender = server.lsb().http().transactional().connect()?;
+    let mut sender = server.lsb()?.http()?.transactional()?.connect()?;
 
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
         server.accept()?;

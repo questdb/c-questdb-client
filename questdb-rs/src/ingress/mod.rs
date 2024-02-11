@@ -1685,7 +1685,7 @@ impl SenderBuilder {
             SenderProtocol::IlpOverTcp => SenderBuilder::new_tcp(host, port),
             #[cfg(feature = "ilp-over-http")]
             SenderProtocol::IlpOverHttp => SenderBuilder::new_http(host, port),
-        };
+        }?;
         builder.protocol.set_specified("protocol", protocol);
         if with_tls {
             builder
@@ -1718,9 +1718,9 @@ impl SenderBuilder {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn new_tcp<H: Into<String>, P: Into<Port>>(host: H, port: P) -> Self {
+    pub fn new_tcp<H: Into<String>, P: Into<Port>>(host: H, port: P) -> Result<Self> {
         let service: Port = port.into();
-        Self {
+        Ok(Self {
             read_timeout: ConfigSetting::new(Duration::from_secs(15)),
             host: ConfigSetting::new(host.into()),
             port: ConfigSetting::new(service.0),
@@ -1730,7 +1730,7 @@ impl SenderBuilder {
             protocol: ConfigSetting::new(SenderProtocol::IlpOverTcp),
             #[cfg(feature = "ilp-over-http")]
             http: None,
-        }
+        })
     }
 
     /// Create a new `SenderBuilder` HTTP instance from the provided QuestDB
@@ -1746,9 +1746,9 @@ impl SenderBuilder {
     /// # }
     /// ```
     #[cfg(feature = "ilp-over-http")]
-    pub fn new_http<H: Into<String>, P: Into<Port>>(host: H, port: P) -> Self {
+    pub fn new_http<H: Into<String>, P: Into<Port>>(host: H, port: P) -> Result<Self> {
         let service: Port = port.into();
-        Self {
+        Ok(Self {
             read_timeout: ConfigSetting::new(Duration::from_secs(15)),
             host: ConfigSetting::new(host.into()),
             port: ConfigSetting::new(service.0),
@@ -1757,7 +1757,7 @@ impl SenderBuilder {
             tls: ConfigSetting::new(Tls::Disabled),
             protocol: ConfigSetting::new(SenderProtocol::IlpOverHttp),
             http: Some(HttpConfig::default()),
-        }
+        })
     }
 
     /// Select local outbound interface.
@@ -1777,10 +1777,10 @@ impl SenderBuilder {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn net_interface<I: Into<String>>(mut self, addr: I) -> Self {
+    pub fn net_interface<I: Into<String>>(mut self, addr: I) -> Result<Self> {
         self.net_interface
             .set_specified("net_interface", Some(addr.into()));
-        self
+        Ok(self)
     }
 
     /// ECDSA Authentication Parameters for ILP over TCP.
@@ -1815,7 +1815,13 @@ impl SenderBuilder {
     /// Follow the QuestDB [authentication
     /// documentation](https://questdb.io/docs/reference/api/ilp/authenticate)
     /// for instructions on generating keys.
-    pub fn auth<A, B, C, D>(mut self, key_id: A, priv_key: B, pub_key_x: C, pub_key_y: D) -> Self
+    pub fn auth<A, B, C, D>(
+        mut self,
+        key_id: A,
+        priv_key: B,
+        pub_key_x: C,
+        pub_key_y: D,
+    ) -> Result<Self>
     where
         A: Into<String>,
         B: Into<String>,
@@ -1831,7 +1837,7 @@ impl SenderBuilder {
                 pub_key_y: pub_key_y.into(),
             })),
         );
-        self
+        Ok(self)
     }
 
     /// Basic Authentication Parameters for ILP over HTTP.
@@ -1839,7 +1845,7 @@ impl SenderBuilder {
     ///
     /// For HTTP you can also use [`token_auth`](SenderBuilder::token_auth).
     #[cfg(feature = "ilp-over-http")]
-    pub fn basic_auth<A, B>(mut self, username: A, password: B) -> Self
+    pub fn basic_auth<A, B>(mut self, username: A, password: B) -> Result<Self>
     where
         A: Into<String>,
         B: Into<String>,
@@ -1851,7 +1857,7 @@ impl SenderBuilder {
                 password: password.into(),
             })),
         );
-        self
+        Ok(self)
     }
 
     /// Tokene (Bearer) Authentication Parameters for ILP over HTTP.
@@ -1859,14 +1865,14 @@ impl SenderBuilder {
     ///
     /// For HTTP you can also use [`basic_auth`](SenderBuilder::basic_auth).
     #[cfg(feature = "ilp-over-http")]
-    pub fn token_auth<A>(mut self, token: A) -> Self
+    pub fn token_auth<A>(mut self, token: A) -> Result<Self>
     where
         A: Into<String>,
     {
         let token: String = token.into();
         self.auth
             .set_specified("auth", Some(AuthParams::Token(TokenAuthParams { token })));
-        self
+        Ok(self)
     }
 
     /// Configure TLS handshake.
@@ -1927,9 +1933,9 @@ impl SenderBuilder {
     ///    .tls(Tls::InsecureSkipVerify)
     ///    .connect()?;
     /// ```
-    pub fn tls(mut self, tls: Tls) -> Self {
+    pub fn tls(mut self, tls: Tls) -> Result<Self> {
         self.tls.set_specified("tls", tls);
-        self
+        Ok(self)
     }
 
     /// Configure how long to wait for messages from the QuestDB server during
@@ -1948,31 +1954,31 @@ impl SenderBuilder {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn read_timeout(mut self, value: Duration) -> Self {
+    pub fn read_timeout(mut self, value: Duration) -> Result<Self> {
         self.read_timeout.set_specified("read_timeout", value);
-        self
+        Ok(self)
     }
 
     #[cfg(feature = "ilp-over-http")]
     /// Configure to use HTTP instead of TCP.
     /// If you want to configure additional HTTP options, use `http_with_opts` instead.
-    pub fn http(mut self) -> Self {
+    pub fn http(mut self) -> Result<Self> {
         self.protocol
             .set_specified("http", SenderProtocol::IlpOverHttp);
         self.http = Some(HttpConfig::default());
-        self
+        Ok(self)
     }
 
     #[cfg(feature = "ilp-over-http")]
     /// Cumulative duration spent in retries.
     /// Default is 10 seconds.
-    pub fn retry_timeout(mut self, value: Duration) -> Self {
+    pub fn retry_timeout(mut self, value: Duration) -> Result<Self> {
         if let Some(http) = &mut self.http {
             http.retry_timeout = value;
         } else {
             panic!("retry_timeout is supported only in ILP over HTTP.")
         }
-        self
+        Ok(self)
     }
 
     #[cfg(feature = "ilp-over-http")]
@@ -1982,39 +1988,39 @@ impl SenderBuilder {
     /// The value is expressed as a number of bytes per second.
     /// This is used to calculate additional request timeout, on top of
     /// the [`grace_timeout`](SenderBuilder::grace_timeout).
-    pub fn min_throughput(mut self, value: u64) -> Self {
+    pub fn min_throughput(mut self, value: u64) -> Result<Self> {
         if let Some(http) = &mut self.http {
             http.min_throughput = value;
         } else {
             panic!("min_throughput is supported only in ILP over HTTP.")
         }
-        self
+        Ok(self)
     }
 
     #[cfg(feature = "ilp-over-http")]
     /// Grace request timeout before relying on the minimum throughput logic.
     /// The default is 5 seconds.
     /// See [`min_throughput`](SenderBuilder::min_throughput) for more details.
-    pub fn grace_timeout(mut self, value: Duration) -> Self {
+    pub fn grace_timeout(mut self, value: Duration) -> Result<Self> {
         if let Some(http) = &mut self.http {
             http.grace_timeout = value;
         } else {
             panic!("grace_timeout is supported only in ILP over HTTP.")
         }
-        self
+        Ok(self)
     }
 
     #[cfg(feature = "ilp-over-http")]
     /// Enable transactional flushes.
     /// This is only relevant for HTTP.
     /// This works by ensuring that the buffer contains lines for a single table.
-    pub fn transactional(mut self) -> Self {
+    pub fn transactional(mut self) -> Result<Self> {
         if let Some(http) = &mut self.http {
             http.transactional = true;
         } else {
             panic!("Transactional flushes are supported only in ILP over HTTP.")
         }
-        self
+        Ok(self)
     }
 
     #[cfg(feature = "ilp-over-http")]
@@ -2022,7 +2028,7 @@ impl SenderBuilder {
     /// This is exposed exclusively for the Python client.
     /// We (QuestDB) use this to help us debug which client is being used if we encounter issues.
     #[doc(hidden)]
-    pub fn user_agent(mut self, value: &str) -> Self {
+    pub fn user_agent(mut self, value: &str) -> Result<Self> {
         if value.contains('\n') {
             panic!("User agent should not contain new-line char.");
         }
@@ -2031,7 +2037,7 @@ impl SenderBuilder {
         } else {
             panic!("user_agent is supported only in ILP over HTTP.")
         }
-        self
+        Ok(self)
     }
 
     /// Connect synchronously.

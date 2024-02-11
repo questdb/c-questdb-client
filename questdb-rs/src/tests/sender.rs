@@ -41,7 +41,7 @@ use std::{io, time::SystemTime};
 #[test]
 fn test_basics() -> TestResult {
     let mut server = MockServer::new()?;
-    let mut sender = server.lsb().connect()?;
+    let mut sender = server.lsb()?.connect()?;
     assert!(!sender.must_close());
     server.accept()?;
 
@@ -206,8 +206,8 @@ fn test_bad_key(
 ) -> TestResult {
     let server = MockServer::new()?;
     let lsb = server
-        .lsb()
-        .auth("testUser1", priv_key, pub_key_x, pub_key_y);
+        .lsb()?
+        .auth("testUser1", priv_key, pub_key_x, pub_key_y)?;
     let sender = lsb.connect();
 
     match sender {
@@ -331,8 +331,8 @@ fn test_tls_with_file_ca() -> TestResult {
 
     let server = MockServer::new()?;
     let lsb = server
-        .lsb()
-        .tls(Tls::Enabled(CertificateAuthority::File(ca_path)));
+        .lsb()?
+        .tls(Tls::Enabled(CertificateAuthority::File(ca_path)))?;
     let server_jh = server.accept_tls();
     let mut sender = lsb.connect()?;
     let mut server: MockServer = server_jh.join().unwrap()?;
@@ -361,9 +361,9 @@ fn test_tls_to_plain_server() -> TestResult {
 
     let mut server = MockServer::new()?;
     let lsb = server
-        .lsb()
-        .read_timeout(Duration::from_millis(500))
-        .tls(Tls::Enabled(CertificateAuthority::File(ca_path)));
+        .lsb()?
+        .read_timeout(Duration::from_millis(500))?
+        .tls(Tls::Enabled(CertificateAuthority::File(ca_path)))?;
     let server_jh = std::thread::spawn(move || -> io::Result<MockServer> {
         server.accept()?;
         Ok(server)
@@ -402,9 +402,9 @@ fn expect_eventual_disconnect(sender: &mut Sender) {
 fn test_plain_to_tls_server() -> TestResult {
     let server = MockServer::new()?;
     let lsb = server
-        .lsb()
-        .read_timeout(Duration::from_millis(500))
-        .tls(Tls::Disabled);
+        .lsb()?
+        .read_timeout(Duration::from_millis(500))?
+        .tls(Tls::Disabled)?;
     let server_jh = server.accept_tls();
     let maybe_sender = lsb.connect();
     let server_err = server_jh.join().unwrap().unwrap_err();
@@ -427,7 +427,7 @@ fn test_plain_to_tls_server() -> TestResult {
 #[test]
 fn test_tls_insecure_skip_verify() -> TestResult {
     let server = MockServer::new()?;
-    let lsb = server.lsb().tls(Tls::InsecureSkipVerify);
+    let lsb = server.lsb()?.tls(Tls::InsecureSkipVerify)?;
     let server_jh = server.accept_tls();
     let mut sender = lsb.connect()?;
     let mut server: MockServer = server_jh.join().unwrap()?;

@@ -63,7 +63,7 @@ macro_rules! upd_opts {
     ($opts:expr, $func:ident $(, $($args:expr),*)?) => {
         ptr::write(
             &mut (*$opts).0,
-            ptr::read(&(*$opts).0).$func($($($args),*)?));
+            ptr::read(&(*$opts).0).$func($($($args),*)?).unwrap());
     };
 }
 
@@ -436,7 +436,7 @@ pub unsafe extern "C" fn line_sender_opts_new(
     host: line_sender_utf8,
     port: u16,
 ) -> *mut line_sender_opts {
-    let builder = SenderBuilder::new_tcp(host.as_str(), port);
+    let builder = SenderBuilder::new_tcp(host.as_str(), port).unwrap();
     Box::into_raw(Box::new(line_sender_opts(builder)))
 }
 
@@ -448,7 +448,7 @@ pub unsafe extern "C" fn line_sender_opts_new_service(
     host: line_sender_utf8,
     port: line_sender_utf8,
 ) -> *mut line_sender_opts {
-    let builder = SenderBuilder::new_tcp(host.as_str(), port.as_str());
+    let builder = SenderBuilder::new_tcp(host.as_str(), port.as_str()).unwrap();
     Box::into_raw(Box::new(line_sender_opts(builder)))
 }
 
