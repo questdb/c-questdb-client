@@ -436,7 +436,7 @@ pub unsafe extern "C" fn line_sender_opts_new(
     host: line_sender_utf8,
     port: u16,
 ) -> *mut line_sender_opts {
-    let builder = SenderBuilder::new(host.as_str(), port);
+    let builder = SenderBuilder::new_tcp(host.as_str(), port);
     Box::into_raw(Box::new(line_sender_opts(builder)))
 }
 
@@ -448,7 +448,7 @@ pub unsafe extern "C" fn line_sender_opts_new_service(
     host: line_sender_utf8,
     port: line_sender_utf8,
 ) -> *mut line_sender_opts {
-    let builder = SenderBuilder::new(host.as_str(), port.as_str());
+    let builder = SenderBuilder::new_tcp(host.as_str(), port.as_str());
     Box::into_raw(Box::new(line_sender_opts(builder)))
 }
 

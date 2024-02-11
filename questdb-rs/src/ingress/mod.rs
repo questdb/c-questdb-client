@@ -43,7 +43,7 @@
 //!         TimestampNanos}};
 //!
 //! fn main() -> Result<()> {
-//!    let mut sender = SenderBuilder::new("localhost", 9009).connect()?;
+//!    let mut sender = SenderBuilder::new_tcp("localhost", 9009).connect()?;
 //!    let mut buffer = Buffer::new();
 //!    buffer
 //!        .table("sensors")?
@@ -1681,7 +1681,7 @@ impl SenderBuilder {
             Some((h, p)) => (h, p),
             None => (addr.as_str(), protocol.default_port()),
         };
-        let mut builder = SenderBuilder::new(host, port);
+            SenderProtocol::IlpOverTcp => SenderBuilder::new_tcp(host, port),
         builder.protocol.set_specified("protocol", protocol);
         if with_tls {
             builder
@@ -1702,18 +1702,19 @@ impl SenderBuilder {
         Self::from_conf(conf)
     }
 
-    /// QuestDB server and port.
+    /// Create a new `SenderBuilder` TCP instance from the provided QuestDB
+    /// server and port.
     ///
     /// ```no_run
     /// # use questdb::Result;
     /// use questdb::ingress::SenderBuilder;
     ///
     /// # fn main() -> Result<()> {
-    /// let mut sender = SenderBuilder::new("localhost", 9009).connect()?;
+    /// let mut sender = SenderBuilder::new_tcp("localhost", 9009).connect()?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn new<H: Into<String>, P: Into<Port>>(host: H, port: P) -> Self {
+    pub fn new_tcp<H: Into<String>, P: Into<Port>>(host: H, port: P) -> Self {
         let service: Port = port.into();
         Self {
             read_timeout: ConfigSetting::new(Duration::from_secs(15)),
