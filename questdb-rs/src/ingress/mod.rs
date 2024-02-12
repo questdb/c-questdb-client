@@ -2037,7 +2037,7 @@ impl SenderBuilder {
         if let Some(http) = &mut self.http {
             http.retry_timeout.set_specified("retry_timeout", value)?;
         } else {
-            return err_config("retry_timeout is supported only in ILP over HTTP.");
+            return config_err("retry_timeout is supported only in ILP over HTTP.");
         }
         Ok(self)
     }
@@ -2053,7 +2053,7 @@ impl SenderBuilder {
         if let Some(http) = &mut self.http {
             http.min_throughput.set_specified("min_throughput", value)?;
         } else {
-            return err_config("min_throughput is supported only in ILP over HTTP.");
+            return config_err("min_throughput is supported only in ILP over HTTP.");
         }
         Ok(self)
     }
@@ -2066,7 +2066,7 @@ impl SenderBuilder {
         if let Some(http) = &mut self.http {
             http.grace_timeout.set_specified("grace_timeout", value)?;
         } else {
-            return err_config("grace_timeout is supported only in ILP over HTTP.");
+            return config_err("grace_timeout is supported only in ILP over HTTP.");
         }
         Ok(self)
     }
@@ -2079,7 +2079,7 @@ impl SenderBuilder {
         if let Some(http) = &mut self.http {
             http.transactional.set_specified("transactional", true)?;
         } else {
-            return err_config("Transactional flushes are supported only in ILP over HTTP.");
+            return config_err("Transactional flushes are supported only in ILP over HTTP.");
         }
         Ok(self)
     }
@@ -2098,7 +2098,7 @@ impl SenderBuilder {
             http.user_agent
                 .set_specified("user_agent", Some(value.to_string()))?;
         } else {
-            return err_config("user_agent is supported only in ILP over HTTP.");
+            return config_err("user_agent is supported only in ILP over HTTP.");
         }
         Ok(self)
     }
@@ -2317,13 +2317,13 @@ fn validate_value<V: Into<String>>(value_str: V) -> Result<String> {
     let value_str: String = value_str.into();
     for (p, c) in value_str.chars().enumerate() {
         if matches!(c, '\u{0}'..='\u{1f}' | '\u{7f}'..='\u{9f}') {
-            return err_config(format!("Invalid character at position {p}"));
+            return config_err(format!("Invalid character at position {p}"));
         }
     }
     Ok(value_str)
 }
 
-fn err_config<T, M: Into<String>>(msg: M) -> Result<T> {
+fn config_err<T, M: Into<String>>(msg: M) -> Result<T> {
     Err(Error::new(ErrorCode::ConfigError, msg))
 }
 
