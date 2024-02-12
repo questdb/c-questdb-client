@@ -1366,7 +1366,7 @@ enum AuthParams {
 /// Root used to determine how to validate the server's TLS certificate.
 ///
 /// Used when configuring the [`tls`](SenderBuilder::tls) option.
-#[derive(Debug, Clone)]
+#[derive(PartialEq, Debug, Clone)]
 pub enum CertificateAuthority {
     /// Use the root certificates provided by the
     /// [`webpki-roots`](https://crates.io/crates/webpki-roots) crate.
@@ -1386,7 +1386,7 @@ pub enum CertificateAuthority {
 }
 
 /// Options for full-connection encryption via TLS.
-#[derive(Debug, Clone)]
+#[derive(PartialEq, Debug, Clone)]
 pub enum Tls {
     /// No TLS encryption.
     Disabled,
@@ -1600,7 +1600,7 @@ fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
 }
 
 /// Protocol used to communicate with the QuestDB server.
-#[derive(Debug, Clone, Copy)]
+#[derive(PartialEq, Debug, Clone, Copy)]
 pub(crate) enum SenderProtocol {
     /// ILP over TCP (streaming).
     IlpOverTcp,
@@ -1838,7 +1838,7 @@ impl SenderBuilder {
         Ok(self)
     }
 
-    /// Tokene (Bearer) Authentication Parameters for ILP over HTTP.
+    /// Token (Bearer) Authentication Parameters for ILP over HTTP.
     /// For TCP, use [`auth`](SenderBuilder::auth).
     ///
     /// For HTTP you can also use [`basic_auth`](SenderBuilder::basic_auth).
@@ -1915,6 +1915,7 @@ impl SenderBuilder {
     ///    .build()?;
     /// ```
     pub fn tls(mut self, tls: Tls) -> Result<Self> {
+        // TODO: Decouple the `specified` state of "TLS enabled" and "Root CA to use"
         self.tls.set_specified("tls", tls);
         Ok(self)
     }
@@ -2459,3 +2460,110 @@ mod http;
 
 #[cfg(feature = "ilp-over-http")]
 use http::*;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{error::Result, ErrorCode};
+
+    #[test]
+    fn http_simple() {
+        let builder = assert_ok(SenderBuilder::from_conf("http::addr=localhost;"));
+        assert_specified(builder.protocol, SenderProtocol::IlpOverHttp);
+        assert_specified(builder.host, "localhost");
+        assert_specified(builder.tls, Tls::Disabled);
+    }
+
+    #[test]
+    fn https_simple() {
+        let builder = assert_ok(SenderBuilder::from_conf("https::addr=localhost;"));
+        assert_specified(builder.protocol, SenderProtocol::IlpOverHttp);
+        assert_specified(builder.host, "localhost");
+        assert_specified(builder.tls, Tls::Enabled(CertificateAuthority::WebpkiRoots));
+    }
+
+    #[test]
+    fn tcp_simple() {
+        let builder = assert_ok(SenderBuilder::from_conf("tcp::addr=localhost;"));
+        assert_specified(builder.protocol, SenderProtocol::IlpOverTcp);
+        assert_specified(builder.host, "localhost");
+        assert_specified(builder.tls, Tls::Disabled);
+    }
+
+    #[test]
+    fn tcps_simple() {
+        let builder = assert_ok(SenderBuilder::from_conf("tcps::addr=localhost;"));
+        assert_specified(builder.protocol, SenderProtocol::IlpOverTcp);
+        assert_specified(builder.host, "localhost");
+        assert_specified(builder.tls, Tls::Enabled(CertificateAuthority::WebpkiRoots));
+    }
+
+    #[test]
+    fn missing_addr() {
+        assert_conf_err(
+            SenderBuilder::from_conf("http::"),
+            "Missing 'addr' parameter in config string.",
+        );
+    }
+
+    #[test]
+    fn unsupported_service() {
+        assert_conf_err(
+            SenderBuilder::from_conf("xaxa::addr=localhost;"),
+            "Unsupported service: xaxa",
+        );
+    }
+
+    #[test]
+    fn http_basic_auth() {
+        assert_ok(SenderBuilder::from_conf(
+            "http::addr=localhost;user=meme;pass=emem;",
+        ));
+    }
+
+    #[test]
+    fn http_token_auth() {
+        assert_ok(SenderBuilder::from_conf(
+            "http::addr=localhost:9000;token=ehehemem;",
+        ));
+    }
+
+    fn assert_ok(result: Result<SenderBuilder>) -> SenderBuilder {
+        if let Err(err) = result {
+            panic!("{:?}", err);
+        }
+        result.unwrap()
+    }
+
+    fn assert_specified<V: PartialEq + std::fmt::Debug, IntoV: Into<V>>(
+        actual: ConfigSetting<V>,
+        expected: IntoV,
+    ) {
+        let expected = expected.into();
+        if let ConfigSetting::Specified(actual_value) = actual {
+            assert_eq!(actual_value, expected);
+        } else {
+            panic!("Expected Specified({:?}), but got {:?}", expected, actual);
+        }
+    }
+
+    fn assert_defaulted<V: PartialEq + std::fmt::Debug, IntoV: Into<V>>(
+        actual: ConfigSetting<V>,
+        expected: IntoV,
+    ) {
+        let expected = expected.into();
+        if let ConfigSetting::Defaulted(actual_value) = actual {
+            assert_eq!(actual_value, expected);
+        } else {
+            panic!("Expected Defaulted({:?}), but got {:?}", expected, actual);
+        }
+    }
+
+    fn assert_conf_err<M: AsRef<str>>(result: Result<SenderBuilder>, expect_msg: M) {
+        let Err(err) = result else {
+            panic!("Got Ok, expected ConfigError: {}", expect_msg.as_ref());
+        };
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+        assert_eq!(err.msg(), expect_msg.as_ref());
+    }
+}
