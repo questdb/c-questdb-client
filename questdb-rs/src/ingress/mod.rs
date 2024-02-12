@@ -43,7 +43,7 @@
 //!         TimestampNanos}};
 //!
 //! fn main() -> Result<()> {
-//!    let mut sender = SenderBuilder::new_tcp("localhost", 9009)?.build()?;
+//!    let mut sender = SenderBuilder::new("localhost", 9009)?.build()?;
 //!    let mut buffer = Buffer::new();
 //!    buffer
 //!        .table("sensors")?
@@ -89,7 +89,7 @@
 //!
 //! # fn main() -> Result<()> {
 //! // See: https://questdb.io/docs/reference/api/ilp/authenticate
-//! let mut sender = SenderBuilder::new_tcp("localhost", 9009)?
+//! let mut sender = SenderBuilder::new("localhost", 9009)?
 //!     .auth(
 //!         "testUser1",                                    // kid
 //!         "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48",  // d
@@ -117,7 +117,7 @@
 //! use questdb::ingress::{SenderBuilder, Tls, CertificateAuthority};
 //!
 //! # fn main() -> Result<()> {
-//! let mut sender = SenderBuilder::new_tcp("localhost", 9009)?
+//! let mut sender = SenderBuilder::new("localhost", 9009)?
 //!     .tls(Tls::Enabled(CertificateAuthority::File(
 //!         PathBuf::from("/path/to/server_rootCA.pem"))))?
 //!     .build()?;
@@ -1627,7 +1627,7 @@ impl SenderProtocol {
 /// use questdb::ingress::SenderBuilder;
 ///
 /// # fn main() -> Result<()> {
-/// let mut sender = SenderBuilder::new_tcp("localhost", 9009)?.build()?;
+/// let mut sender = SenderBuilder::new("localhost", 9009)?.build()?;
 /// # Ok(())
 /// # }
 /// ```
@@ -1681,17 +1681,20 @@ impl SenderBuilder {
             Some((h, p)) => (h, p),
             None => (addr.as_str(), protocol.default_port()),
         };
-        let mut builder = match protocol {
-            SenderProtocol::IlpOverTcp => SenderBuilder::new_tcp(host, port),
+        let mut builder = SenderBuilder::new(host, port)?;
+        builder = match protocol {
+            SenderProtocol::IlpOverTcp => builder.tcp()?,
             #[cfg(feature = "ilp-over-http")]
-            SenderProtocol::IlpOverHttp => SenderBuilder::new_http(host, port),
-        }?;
-        builder.protocol.set_specified("protocol", protocol);
-        if with_tls {
-            builder
-                .tls
-                .set_default(Tls::Enabled(CertificateAuthority::WebpkiRoots));
-        }
+            SenderProtocol::IlpOverHttp => builder.http()?,
+        };
+        builder.tls.set_specified(
+            "tls",
+            if with_tls {
+                Tls::Enabled(CertificateAuthority::WebpkiRoots)
+            } else {
+                Tls::Disabled
+            },
+        );
         // TODO: Map the rest of the parameters.
         // TODO: Validate param inconsistencies.
         Ok(builder)
@@ -1706,19 +1709,19 @@ impl SenderBuilder {
         Self::from_conf(conf)
     }
 
-    /// Create a new `SenderBuilder` TCP instance from the provided QuestDB
-    /// server and port.
+    /// Create a new `SenderBuilder` instance from the provided QuestDB
+    /// server and port. By default, it will use the TCP protocol.
     ///
     /// ```no_run
     /// # use questdb::Result;
     /// use questdb::ingress::SenderBuilder;
     ///
     /// # fn main() -> Result<()> {
-    /// let mut sender = SenderBuilder::new_tcp("localhost", 9009)?.build()?;
+    /// let mut sender = SenderBuilder::new("localhost", 9009)?.build()?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn new_tcp<H: Into<String>, P: Into<Port>>(host: H, port: P) -> Result<Self> {
+    pub fn new<H: Into<String>, P: Into<Port>>(host: H, port: P) -> Result<Self> {
         let host = validate_value(host)?;
         let port: Port = port.into();
         let port = validate_value(port.0)?;
@@ -1735,35 +1738,6 @@ impl SenderBuilder {
         })
     }
 
-    /// Create a new `SenderBuilder` HTTP instance from the provided QuestDB
-    /// server and port.
-    ///
-    /// ```no_run
-    /// # use questdb::Result;
-    /// use questdb::ingress::SenderBuilder;
-    ///
-    /// # fn main() -> Result<()> {
-    /// let mut sender = SenderBuilder::new_http("localhost", 9009).connect()?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    #[cfg(feature = "ilp-over-http")]
-    pub fn new_http<H: Into<String>, P: Into<Port>>(host: H, port: P) -> Result<Self> {
-        let host = validate_value(host)?;
-        let port: Port = port.into();
-        let port = validate_value(port.0)?;
-        Ok(Self {
-            read_timeout: ConfigSetting::new(Duration::from_secs(15)),
-            host: ConfigSetting::new(host),
-            port: ConfigSetting::new(port),
-            net_interface: ConfigSetting::new(None),
-            auth: ConfigSetting::new(None),
-            tls: ConfigSetting::new(Tls::Disabled),
-            protocol: ConfigSetting::new(SenderProtocol::IlpOverHttp),
-            http: Some(HttpConfig::default()),
-        })
-    }
-
     /// Select local outbound interface.
     ///
     /// This may be relevant if your machine has multiple network interfaces.
@@ -1775,7 +1749,7 @@ impl SenderBuilder {
     /// # use questdb::Result;
     /// # use questdb::ingress::SenderBuilder;
     /// # fn main() -> Result<()> {
-    /// let mut sender = SenderBuilder::new_tcp("localhost", 9009)?
+    /// let mut sender = SenderBuilder::new("localhost", 9009)?
     ///     .net_interface("0.0.0.0")?
     ///     .build()?;
     /// # Ok(())
@@ -1805,7 +1779,7 @@ impl SenderBuilder {
     /// # use questdb::Result;
     /// # use questdb::ingress::SenderBuilder;
     /// # fn main() -> Result<()> {
-    /// let mut sender = SenderBuilder::new_tcp("localhost", 9009)?
+    /// let mut sender = SenderBuilder::new("localhost", 9009)?
     ///     .auth(
     ///         "testUser1",                                    // kid
     ///         "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48",  // d
@@ -1891,7 +1865,7 @@ impl SenderBuilder {
     /// # use questdb::ingress::SenderBuilder;
     /// # use questdb::ingress::Tls;
     /// # fn main() -> Result<()> {
-    /// let mut sender = SenderBuilder::new_tcp("localhost", 9009)?
+    /// let mut sender = SenderBuilder::new("localhost", 9009)?
     ///     .tls(Tls::Disabled)?
     ///     .build()?;
     /// # Ok(())
@@ -1907,7 +1881,7 @@ impl SenderBuilder {
     /// use questdb::ingress::CertificateAuthority;
     ///
     /// # fn main() -> Result<()> {
-    /// let mut sender = SenderBuilder::new_tcp("localhost", 9009)?
+    /// let mut sender = SenderBuilder::new("localhost", 9009)?
     ///     .tls(Tls::Enabled(CertificateAuthority::WebpkiRoots))?
     ///     .build()?;
     /// # Ok(())
@@ -1924,7 +1898,7 @@ impl SenderBuilder {
     /// use std::path::PathBuf;
     ///
     /// # fn main() -> Result<()> {
-    /// let mut sender = SenderBuilder::new_tcp("localhost", 9009)?
+    /// let mut sender = SenderBuilder::new("localhost", 9009)?
     ///     .tls(Tls::Enabled(CertificateAuthority::File(
     ///         PathBuf::from("/path/to/server_rootCA.pem"))))?
     ///     .build()?;
@@ -1936,7 +1910,7 @@ impl SenderBuilder {
     /// `insecure-skip-verify` feature to skip the certificate verification:
     ///
     /// ```ignore
-    /// let mut sender = SenderBuilder::new_tcp("localhost", 9009)?
+    /// let mut sender = SenderBuilder::new("localhost", 9009)?
     ///    .tls(Tls::InsecureSkipVerify)?
     ///    .build()?;
     /// ```
@@ -1955,7 +1929,7 @@ impl SenderBuilder {
     /// use std::time::Duration;
     ///
     /// # fn main() -> Result<()> {
-    /// let mut sender = SenderBuilder::new_tcp("localhost", 9009)?
+    /// let mut sender = SenderBuilder::new("localhost", 9009)?
     ///    .read_timeout(Duration::from_secs(15))?
     ///    .build()?;
     /// # Ok(())
@@ -1966,12 +1940,19 @@ impl SenderBuilder {
         Ok(self)
     }
 
+    /// Configure to the TCP protocol.
+    pub fn tcp(mut self) -> Result<Self> {
+        self.protocol
+            .set_specified("protocol", SenderProtocol::IlpOverTcp);
+        self.http = None;
+        Ok(self)
+    }
+
     #[cfg(feature = "ilp-over-http")]
-    /// Configure to use HTTP instead of TCP.
-    /// If you want to configure additional HTTP options, use `http_with_opts` instead.
+    /// Configure to use the HTTP protocol.
     pub fn http(mut self) -> Result<Self> {
         self.protocol
-            .set_specified("http", SenderProtocol::IlpOverHttp);
+            .set_specified("protocol", SenderProtocol::IlpOverHttp);
         self.http = Some(HttpConfig::default());
         Ok(self)
     }

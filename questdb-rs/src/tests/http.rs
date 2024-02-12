@@ -231,7 +231,7 @@ fn test_no_connection() -> TestResult {
         .column_f64("x", 1.0)?
         .at_now()?;
 
-    let mut sender = SenderBuilder::new_tcp("127.0.0.1", 1)?.http()?.build()?;
+    let mut sender = SenderBuilder::new("127.0.0.1", 1)?.http()?.build()?;
     let res = sender.flush_and_keep(&buffer);
     assert!(res.is_err());
     let err = res.unwrap_err();

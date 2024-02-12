@@ -11,7 +11,7 @@ fn main() -> Result<()> {
         .unwrap_or("9009".to_string())
         .parse()
         .unwrap();
-    let mut sender = SenderBuilder::new_tcp(host, port)?
+    let mut sender = SenderBuilder::new(host, port)?
         .auth(
             "testUser1",                                   // kid
             "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48", // d
