@@ -2546,37 +2546,37 @@ mod tests {
     #[test]
     fn http_simple() {
         let builder = assert_ok(SenderBuilder::from_conf("http::addr=localhost;"));
-        assert_specified(builder.protocol, SenderProtocol::IlpOverHttp);
-        assert_specified(builder.host, "localhost");
-        assert_specified(builder.port, SenderProtocol::IlpOverHttp.default_port());
-        assert_specified(builder.tls, Tls::Disabled);
+        assert_specified_eq(builder.protocol, SenderProtocol::IlpOverHttp);
+        assert_specified_eq(builder.host, "localhost");
+        assert_specified_eq(builder.port, SenderProtocol::IlpOverHttp.default_port());
+        assert_specified_eq(builder.tls, Tls::Disabled);
     }
 
     #[test]
     fn https_simple() {
         let builder = assert_ok(SenderBuilder::from_conf("https::addr=localhost;"));
-        assert_specified(builder.protocol, SenderProtocol::IlpOverHttp);
-        assert_specified(builder.host, "localhost");
-        assert_specified(builder.port, SenderProtocol::IlpOverHttp.default_port());
-        assert_specified(builder.tls, Tls::Enabled(CertificateAuthority::WebpkiRoots));
+        assert_specified_eq(builder.protocol, SenderProtocol::IlpOverHttp);
+        assert_specified_eq(builder.host, "localhost");
+        assert_specified_eq(builder.port, SenderProtocol::IlpOverHttp.default_port());
+        assert_specified_eq(builder.tls, Tls::Enabled(CertificateAuthority::WebpkiRoots));
     }
 
     #[test]
     fn tcp_simple() {
         let builder = assert_ok(SenderBuilder::from_conf("tcp::addr=localhost;"));
-        assert_specified(builder.protocol, SenderProtocol::IlpOverTcp);
-        assert_specified(builder.port, SenderProtocol::IlpOverTcp.default_port());
-        assert_specified(builder.host, "localhost");
-        assert_specified(builder.tls, Tls::Disabled);
+        assert_specified_eq(builder.protocol, SenderProtocol::IlpOverTcp);
+        assert_specified_eq(builder.port, SenderProtocol::IlpOverTcp.default_port());
+        assert_specified_eq(builder.host, "localhost");
+        assert_specified_eq(builder.tls, Tls::Disabled);
     }
 
     #[test]
     fn tcps_simple() {
         let builder = assert_ok(SenderBuilder::from_conf("tcps::addr=localhost;"));
-        assert_specified(builder.protocol, SenderProtocol::IlpOverTcp);
-        assert_specified(builder.host, "localhost");
-        assert_specified(builder.port, SenderProtocol::IlpOverTcp.default_port());
-        assert_specified(builder.tls, Tls::Enabled(CertificateAuthority::WebpkiRoots));
+        assert_specified_eq(builder.protocol, SenderProtocol::IlpOverTcp);
+        assert_specified_eq(builder.host, "localhost");
+        assert_specified_eq(builder.port, SenderProtocol::IlpOverTcp.default_port());
+        assert_specified_eq(builder.tls, Tls::Enabled(CertificateAuthority::WebpkiRoots));
     }
 
     #[test]
@@ -2597,26 +2597,53 @@ mod tests {
 
     #[test]
     fn http_basic_auth() {
-        assert_ok(SenderBuilder::from_conf(
+        let builder = assert_ok(SenderBuilder::from_conf(
             "http::addr=localhost;user=meme;pass=emem;",
         ));
+        let auth = assert_specified(builder.auth).expect("builder.auth was set to None");
+        match auth {
+            AuthParams::Basic(BasicAuthParams { username, password }) => {
+                assert_eq!(username, "meme");
+                assert_eq!(password, "emem");
+            }
+            _ => {
+                panic!("Expected AuthParams::Basic");
+            }
+        }
     }
 
     #[test]
     fn http_token_auth() {
-        assert_ok(SenderBuilder::from_conf(
-            "http::addr=localhost:9000;token=ehehemem;",
+        let builder = assert_ok(SenderBuilder::from_conf(
+            "http::addr=localhost:9000;token=hemem;",
         ));
+        let auth = assert_specified(builder.auth).expect("builder.auth was set to None");
+        match auth {
+            AuthParams::Token(TokenAuthParams { token }) => {
+                assert_eq!(token, "hemem");
+            }
+            _ => {
+                panic!("Expected AuthParams::Basic");
+            }
+        }
     }
 
     fn assert_ok(result: Result<SenderBuilder>) -> SenderBuilder {
         if let Err(err) = result {
-            panic!("{:?}", err);
+            panic!("Expected an Ok result, but got {:?}", err);
         }
         result.unwrap()
     }
 
-    fn assert_specified<V: PartialEq + std::fmt::Debug, IntoV: Into<V>>(
+    fn assert_specified<V: std::fmt::Debug>(actual: ConfigSetting<V>) -> V {
+        if let ConfigSetting::Specified(actual_value) = actual {
+            actual_value
+        } else {
+            panic!("Expected Specified(_), but got {:?}", actual);
+        }
+    }
+
+    fn assert_specified_eq<V: PartialEq + std::fmt::Debug, IntoV: Into<V>>(
         actual: ConfigSetting<V>,
         expected: IntoV,
     ) {
@@ -2628,7 +2655,7 @@ mod tests {
         }
     }
 
-    fn assert_defaulted<V: PartialEq + std::fmt::Debug, IntoV: Into<V>>(
+    fn assert_defaulted_eq<V: PartialEq + std::fmt::Debug, IntoV: Into<V>>(
         actual: ConfigSetting<V>,
         expected: IntoV,
     ) {
