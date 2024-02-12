@@ -2138,7 +2138,7 @@ impl SenderBuilder {
                                             " Timed out waiting for server ",
                                             "response after {:?}."
                                         ),
-                                        self.read_timeout
+                                        *self.read_timeout
                                     )
                                 } else {
                                     error::fmt!(
