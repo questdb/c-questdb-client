@@ -24,6 +24,8 @@
 
 use std::ops::Deref;
 
+use crate::{Error, ErrorCode, Result};
+
 /// Wraps a SenderBuilder config setting with the intent of tracking
 /// whether the value was user-specified or defaulted.
 /// The API then ensures the following rules:
@@ -49,24 +51,30 @@ impl<T> ConfigSetting<T> {
     /// another setting was triggered.
     /// Does nothing if the value was already specified.
     /// Returns true if the value was updated.
-    pub(crate) fn set_default(&mut self, value: T) -> bool {
+    pub(crate) fn set_default(&mut self, value: T) -> Result<()> {
         if let ConfigSetting::Defaulted(_) = self {
             *self = ConfigSetting::Defaulted(value);
-            true
+            Ok(())
         } else {
-            false
+            Err(Error::new(
+                ErrorCode::ConfigError,
+                "set_default() called on a specified value",
+            ))
         }
     }
 
     /// Set the user-defined value.
     /// Note that it can't be changed once set.
     /// Returns true if the value was updated, false if already specified.
-    pub(crate) fn set_specified(&mut self, _setting_name: &str, value: T) -> bool {
+    pub(crate) fn set_specified(&mut self, setting_name: &str, value: T) -> Result<()> {
         if let ConfigSetting::Defaulted(_) = self {
             *self = ConfigSetting::Specified(value);
-            true // TODO: Return `Ok(())` instead of `true`, then update all signatures that don't compile.
+            Ok(())
         } else {
-            false // TODO: Return `Err(..)` instead of `false`
+            Err(Error::new(
+                ErrorCode::ConfigError,
+                format!("{setting_name} is already specified"),
+            ))
         }
     }
 }

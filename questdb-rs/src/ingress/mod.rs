@@ -1694,7 +1694,7 @@ impl SenderBuilder {
             } else {
                 Tls::Disabled
             },
-        );
+        )?;
         // TODO: Map the rest of the parameters.
         // TODO: Validate param inconsistencies.
         Ok(builder)
@@ -1757,7 +1757,7 @@ impl SenderBuilder {
     /// ```
     pub fn net_interface<I: Into<String>>(mut self, addr: I) -> Result<Self> {
         self.net_interface
-            .set_specified("net_interface", Some(validate_value(addr)?));
+            .set_specified("net_interface", Some(validate_value(addr)?))?;
         Ok(self)
     }
 
@@ -1814,7 +1814,7 @@ impl SenderBuilder {
                 pub_key_x: validate_value(pub_key_x)?,
                 pub_key_y: validate_value(pub_key_y)?,
             })),
-        );
+        )?;
         Ok(self)
     }
 
@@ -1834,7 +1834,7 @@ impl SenderBuilder {
                 username: validate_value(username)?,
                 password: validate_value(password)?,
             })),
-        );
+        )?;
         Ok(self)
     }
 
@@ -1852,7 +1852,7 @@ impl SenderBuilder {
             Some(AuthParams::Token(TokenAuthParams {
                 token: validate_value(token)?,
             })),
-        );
+        )?;
         Ok(self)
     }
 
@@ -1916,7 +1916,7 @@ impl SenderBuilder {
     /// ```
     pub fn tls(mut self, tls: Tls) -> Result<Self> {
         // TODO: Decouple the `specified` state of "TLS enabled" and "Root CA to use"
-        self.tls.set_specified("tls", tls);
+        self.tls.set_specified("tls", tls)?;
         Ok(self)
     }
 
@@ -1937,30 +1937,24 @@ impl SenderBuilder {
     /// # }
     /// ```
     pub fn read_timeout(mut self, value: Duration) -> Result<Self> {
-        self.read_timeout.set_specified("read_timeout", value);
+        self.read_timeout.set_specified("read_timeout", value)?;
         Ok(self)
     }
 
     /// Configure to the TCP protocol.
     pub fn tcp(mut self) -> Result<Self> {
-        if self
-            .protocol
-            .set_specified("protocol", SenderProtocol::IlpOverTcp)
-        {
-            self.http = None;
-        }
+        self.protocol
+            .set_specified("protocol", SenderProtocol::IlpOverTcp)?;
+        self.http = None;
         Ok(self)
     }
 
     #[cfg(feature = "ilp-over-http")]
     /// Configure to use the HTTP protocol.
     pub fn http(mut self) -> Result<Self> {
-        if self
-            .protocol
-            .set_specified("protocol", SenderProtocol::IlpOverHttp)
-        {
-            self.http = Some(HttpConfig::default());
-        }
+        self.protocol
+            .set_specified("protocol", SenderProtocol::IlpOverHttp)?;
+        self.http = Some(HttpConfig::default());
         Ok(self)
     }
 
@@ -1969,7 +1963,7 @@ impl SenderBuilder {
     /// Default is 10 seconds.
     pub fn retry_timeout(mut self, value: Duration) -> Result<Self> {
         if let Some(http) = &mut self.http {
-            http.retry_timeout.set_specified("retry_timeout", value);
+            http.retry_timeout.set_specified("retry_timeout", value)?;
         } else {
             return err_config("retry_timeout is supported only in ILP over HTTP.");
         }
@@ -1985,7 +1979,7 @@ impl SenderBuilder {
     /// the [`grace_timeout`](SenderBuilder::grace_timeout).
     pub fn min_throughput(mut self, value: u64) -> Result<Self> {
         if let Some(http) = &mut self.http {
-            http.min_throughput.set_specified("min_throughput", value);
+            http.min_throughput.set_specified("min_throughput", value)?;
         } else {
             return err_config("min_throughput is supported only in ILP over HTTP.");
         }
@@ -1998,7 +1992,7 @@ impl SenderBuilder {
     /// See [`min_throughput`](SenderBuilder::min_throughput) for more details.
     pub fn grace_timeout(mut self, value: Duration) -> Result<Self> {
         if let Some(http) = &mut self.http {
-            http.grace_timeout.set_specified("grace_timeout", value);
+            http.grace_timeout.set_specified("grace_timeout", value)?;
         } else {
             return err_config("grace_timeout is supported only in ILP over HTTP.");
         }
@@ -2011,7 +2005,7 @@ impl SenderBuilder {
     /// This works by ensuring that the buffer contains lines for a single table.
     pub fn transactional(mut self) -> Result<Self> {
         if let Some(http) = &mut self.http {
-            http.transactional.set_specified("transactional", true);
+            http.transactional.set_specified("transactional", true)?;
         } else {
             return err_config("Transactional flushes are supported only in ILP over HTTP.");
         }
@@ -2030,7 +2024,7 @@ impl SenderBuilder {
         }
         if let Some(http) = &mut self.http {
             http.user_agent
-                .set_specified("user_agent", Some(value.to_string()));
+                .set_specified("user_agent", Some(value.to_string()))?;
         } else {
             return err_config("user_agent is supported only in ILP over HTTP.");
         }
