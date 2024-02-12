@@ -2098,9 +2098,6 @@ impl SenderBuilder {
     #[doc(hidden)]
     pub fn user_agent(mut self, value: &str) -> Result<Self> {
         let value = validate_value(value)?;
-        if value.contains('\n') {
-            return err_config("User agent must not contain a newline char.");
-        }
         if let Some(http) = &mut self.http {
             http.user_agent
                 .set_specified("user_agent", Some(value.to_string()))?;
