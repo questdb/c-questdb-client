@@ -1695,6 +1695,78 @@ impl SenderBuilder {
                 Tls::Disabled
             },
         )?;
+
+        match protocol {
+            // user= token= token_x= token_y=
+            SenderProtocol::IlpOverTcp => {
+                match (
+                    params.get("user"),
+                    params.get("token"),
+                    params.get("token_x"),
+                    params.get("token_y"),
+                ) {
+                    (Some(key_id), Some(priv_key), Some(pub_key_x), Some(pub_key_y)) => {
+                        builder.auth.set_specified(
+                            "auth",
+                            Some(AuthParams::Ecdsa(EcdsaAuthParams {
+                                key_id: key_id.to_string(),
+                                priv_key: priv_key.to_string(),
+                                pub_key_x: pub_key_x.to_string(),
+                                pub_key_y: pub_key_y.to_string(),
+                            })),
+                        )?;
+                    }
+                    (None, None, None, None) => {}
+                    (_, _, _, _) => {
+                        return config_err(
+                            "Incomplete authentication parameters. Specify either all or none of: \
+                            'user', 'token', 'token_x', 'token_y'",
+                        )
+                    }
+                }
+            }
+
+            // user= pass= or token=
+            SenderProtocol::IlpOverHttp => {
+                match (params.get("user"), params.get("pass"), params.get("token")) {
+                    (Some(username), Some(password), None) => {
+                        builder.auth.set_specified(
+                            "auth",
+                            Some(AuthParams::Basic(BasicAuthParams {
+                                username: username.to_string(),
+                                password: password.to_string(),
+                            })),
+                        )?;
+                    }
+                    (None, None, Some(token)) => {
+                        builder.auth.set_specified(
+                            "auth",
+                            Some(AuthParams::Token(TokenAuthParams {
+                                token: token.to_string(),
+                            })),
+                        )?;
+                    }
+                    (None, None, None) => {}
+                    (None, Some(_), None) => {
+                        return config_err(
+                            "Authentication parameter 'pass' is present, but 'user' is missing",
+                        );
+                    }
+                    (Some(_), None, None) => {
+                        return config_err(
+                            "Authentication parameter 'user' is present, but 'pass' is missing",
+                        );
+                    }
+                    (_, _, _) => {
+                        return config_err(
+                            "Inconsistent authentication parameters. \
+                            Specify either 'user' and 'pass', or just 'token'",
+                        );
+                    }
+                }
+            }
+        }
+
         // TODO: Map the rest of the parameters.
         // TODO: Validate param inconsistencies.
         Ok(builder)
