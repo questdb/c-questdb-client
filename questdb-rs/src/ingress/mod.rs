@@ -185,8 +185,8 @@
 pub use self::timestamp::*;
 
 use crate::error::{self, Error, Result};
-use crate::gai;
 use crate::ingress::conf::ConfigSetting;
+use crate::{gai, ErrorCode};
 use core::time::Duration;
 use itoa;
 use std::collections::HashMap;
@@ -1719,11 +1719,13 @@ impl SenderBuilder {
     /// # }
     /// ```
     pub fn new_tcp<H: Into<String>, P: Into<Port>>(host: H, port: P) -> Result<Self> {
-        let service: Port = port.into();
+        let host = validate_value(host)?;
+        let port: Port = port.into();
+        let port = validate_value(port.0)?;
         Ok(Self {
             read_timeout: ConfigSetting::new(Duration::from_secs(15)),
-            host: ConfigSetting::new(host.into()),
-            port: ConfigSetting::new(service.0),
+            host: ConfigSetting::new(host),
+            port: ConfigSetting::new(port),
             net_interface: ConfigSetting::new(None),
             auth: ConfigSetting::new(None),
             tls: ConfigSetting::new(Tls::Disabled),
@@ -1747,11 +1749,13 @@ impl SenderBuilder {
     /// ```
     #[cfg(feature = "ilp-over-http")]
     pub fn new_http<H: Into<String>, P: Into<Port>>(host: H, port: P) -> Result<Self> {
-        let service: Port = port.into();
+        let host = validate_value(host)?;
+        let port: Port = port.into();
+        let port = validate_value(port.0)?;
         Ok(Self {
             read_timeout: ConfigSetting::new(Duration::from_secs(15)),
-            host: ConfigSetting::new(host.into()),
-            port: ConfigSetting::new(service.0),
+            host: ConfigSetting::new(host),
+            port: ConfigSetting::new(port),
             net_interface: ConfigSetting::new(None),
             auth: ConfigSetting::new(None),
             tls: ConfigSetting::new(Tls::Disabled),
@@ -1779,7 +1783,7 @@ impl SenderBuilder {
     /// ```
     pub fn net_interface<I: Into<String>>(mut self, addr: I) -> Result<Self> {
         self.net_interface
-            .set_specified("net_interface", Some(addr.into()));
+            .set_specified("net_interface", Some(validate_value(addr)?));
         Ok(self)
     }
 
@@ -1831,10 +1835,10 @@ impl SenderBuilder {
         self.auth.set_specified(
             "auth",
             Some(AuthParams::Ecdsa(EcdsaAuthParams {
-                key_id: key_id.into(),
-                priv_key: priv_key.into(),
-                pub_key_x: pub_key_x.into(),
-                pub_key_y: pub_key_y.into(),
+                key_id: validate_value(key_id)?,
+                priv_key: validate_value(priv_key)?,
+                pub_key_x: validate_value(pub_key_x)?,
+                pub_key_y: validate_value(pub_key_y)?,
             })),
         );
         Ok(self)
@@ -1853,8 +1857,8 @@ impl SenderBuilder {
         self.auth.set_specified(
             "auth",
             Some(AuthParams::Basic(BasicAuthParams {
-                username: username.into(),
-                password: password.into(),
+                username: validate_value(username)?,
+                password: validate_value(password)?,
             })),
         );
         Ok(self)
@@ -1869,9 +1873,12 @@ impl SenderBuilder {
     where
         A: Into<String>,
     {
-        let token: String = token.into();
-        self.auth
-            .set_specified("auth", Some(AuthParams::Token(TokenAuthParams { token })));
+        self.auth.set_specified(
+            "auth",
+            Some(AuthParams::Token(TokenAuthParams {
+                token: validate_value(token)?,
+            })),
+        );
         Ok(self)
     }
 
@@ -1976,7 +1983,7 @@ impl SenderBuilder {
         if let Some(http) = &mut self.http {
             http.retry_timeout = value;
         } else {
-            panic!("retry_timeout is supported only in ILP over HTTP.")
+            return err_config("retry_timeout is supported only in ILP over HTTP.");
         }
         Ok(self)
     }
@@ -1992,7 +1999,7 @@ impl SenderBuilder {
         if let Some(http) = &mut self.http {
             http.min_throughput = value;
         } else {
-            panic!("min_throughput is supported only in ILP over HTTP.")
+            return err_config("min_throughput is supported only in ILP over HTTP.");
         }
         Ok(self)
     }
@@ -2005,7 +2012,7 @@ impl SenderBuilder {
         if let Some(http) = &mut self.http {
             http.grace_timeout = value;
         } else {
-            panic!("grace_timeout is supported only in ILP over HTTP.")
+            return err_config("grace_timeout is supported only in ILP over HTTP.");
         }
         Ok(self)
     }
@@ -2018,7 +2025,7 @@ impl SenderBuilder {
         if let Some(http) = &mut self.http {
             http.transactional = true;
         } else {
-            panic!("Transactional flushes are supported only in ILP over HTTP.")
+            return err_config("Transactional flushes are supported only in ILP over HTTP.");
         }
         Ok(self)
     }
@@ -2029,13 +2036,14 @@ impl SenderBuilder {
     /// We (QuestDB) use this to help us debug which client is being used if we encounter issues.
     #[doc(hidden)]
     pub fn user_agent(mut self, value: &str) -> Result<Self> {
+        let value = validate_value(value)?;
         if value.contains('\n') {
-            panic!("User agent should not contain new-line char.");
+            return err_config("User agent must not contain a newline char.");
         }
         if let Some(http) = &mut self.http {
             http.user_agent = Some(value.to_string());
         } else {
-            panic!("user_agent is supported only in ILP over HTTP.")
+            return err_config("user_agent is supported only in ILP over HTTP.");
         }
         Ok(self)
     }
@@ -2248,6 +2256,20 @@ impl SenderBuilder {
         }
         Ok(sender)
     }
+}
+
+fn validate_value<V: Into<String>>(value_str: V) -> Result<String> {
+    let value_str: String = value_str.into();
+    for (p, c) in value_str.chars().enumerate() {
+        if matches!(c, '\u{0}'..='\u{1f}' | '\u{7f}'..='\u{9f}') {
+            return err_config(format!("Invalid character at position {p}"));
+        }
+    }
+    Ok(value_str)
+}
+
+fn err_config<T, M: Into<String>>(msg: M) -> Result<T> {
+    Err(Error::new(ErrorCode::ConfigError, msg))
 }
 
 fn b64_decode(descr: &'static str, buf: &str) -> Result<Vec<u8>> {
