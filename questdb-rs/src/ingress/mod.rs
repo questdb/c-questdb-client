@@ -1943,18 +1943,24 @@ impl SenderBuilder {
 
     /// Configure to the TCP protocol.
     pub fn tcp(mut self) -> Result<Self> {
-        self.protocol
-            .set_specified("protocol", SenderProtocol::IlpOverTcp);
-        self.http = None;
+        if self
+            .protocol
+            .set_specified("protocol", SenderProtocol::IlpOverTcp)
+        {
+            self.http = None;
+        }
         Ok(self)
     }
 
     #[cfg(feature = "ilp-over-http")]
     /// Configure to use the HTTP protocol.
     pub fn http(mut self) -> Result<Self> {
-        self.protocol
-            .set_specified("protocol", SenderProtocol::IlpOverHttp);
-        self.http = Some(HttpConfig::default());
+        if self
+            .protocol
+            .set_specified("protocol", SenderProtocol::IlpOverHttp)
+        {
+            self.http = Some(HttpConfig::default());
+        }
         Ok(self)
     }
 
@@ -1963,7 +1969,7 @@ impl SenderBuilder {
     /// Default is 10 seconds.
     pub fn retry_timeout(mut self, value: Duration) -> Result<Self> {
         if let Some(http) = &mut self.http {
-            http.retry_timeout = value;
+            http.retry_timeout.set_specified("retry_timeout", value);
         } else {
             return err_config("retry_timeout is supported only in ILP over HTTP.");
         }
@@ -1979,7 +1985,7 @@ impl SenderBuilder {
     /// the [`grace_timeout`](SenderBuilder::grace_timeout).
     pub fn min_throughput(mut self, value: u64) -> Result<Self> {
         if let Some(http) = &mut self.http {
-            http.min_throughput = value;
+            http.min_throughput.set_specified("min_throughput", value);
         } else {
             return err_config("min_throughput is supported only in ILP over HTTP.");
         }
@@ -1992,7 +1998,7 @@ impl SenderBuilder {
     /// See [`min_throughput`](SenderBuilder::min_throughput) for more details.
     pub fn grace_timeout(mut self, value: Duration) -> Result<Self> {
         if let Some(http) = &mut self.http {
-            http.grace_timeout = value;
+            http.grace_timeout.set_specified("grace_timeout", value);
         } else {
             return err_config("grace_timeout is supported only in ILP over HTTP.");
         }
@@ -2005,7 +2011,7 @@ impl SenderBuilder {
     /// This works by ensuring that the buffer contains lines for a single table.
     pub fn transactional(mut self) -> Result<Self> {
         if let Some(http) = &mut self.http {
-            http.transactional = true;
+            http.transactional.set_specified("transactional", true);
         } else {
             return err_config("Transactional flushes are supported only in ILP over HTTP.");
         }
@@ -2023,7 +2029,8 @@ impl SenderBuilder {
             return err_config("User agent must not contain a newline char.");
         }
         if let Some(http) = &mut self.http {
-            http.user_agent = Some(value.to_string());
+            http.user_agent
+                .set_specified("user_agent", Some(value.to_string()));
         } else {
             return err_config("user_agent is supported only in ILP over HTTP.");
         }
@@ -2391,7 +2398,7 @@ impl Sender {
             }
             #[cfg(feature = "ilp-over-http")]
             ProtocolHandler::Http(ref state) => {
-                if state.config.transactional && !buf.transactional() {
+                if *state.config.transactional && !buf.transactional() {
                     return Err(error::fmt!(
                         InvalidApiCall,
                         "Buffer contains lines for multiple tables. \
@@ -2399,8 +2406,8 @@ impl Sender {
                     ));
                 }
                 let timeout = Duration::from_secs_f64(
-                    (bytes.len() as f64) / (state.config.min_throughput as f64),
-                ) + state.config.grace_timeout;
+                    (bytes.len() as f64) / (*state.config.min_throughput as f64),
+                ) + *state.config.grace_timeout;
                 let request = state
                     .agent
                     .post(&state.url)
@@ -2412,7 +2419,7 @@ impl Sender {
                     None => request,
                 };
                 let response_or_err =
-                    http_send_with_retries(request, bytes, state.config.retry_timeout);
+                    http_send_with_retries(request, bytes, *state.config.retry_timeout);
                 match response_or_err {
                     Ok(_response) => {
                         // on success, there's no information in the response.
@@ -2471,6 +2478,7 @@ mod tests {
         let builder = assert_ok(SenderBuilder::from_conf("http::addr=localhost;"));
         assert_specified(builder.protocol, SenderProtocol::IlpOverHttp);
         assert_specified(builder.host, "localhost");
+        assert_specified(builder.port, SenderProtocol::IlpOverHttp.default_port());
         assert_specified(builder.tls, Tls::Disabled);
     }
 
@@ -2479,6 +2487,7 @@ mod tests {
         let builder = assert_ok(SenderBuilder::from_conf("https::addr=localhost;"));
         assert_specified(builder.protocol, SenderProtocol::IlpOverHttp);
         assert_specified(builder.host, "localhost");
+        assert_specified(builder.port, SenderProtocol::IlpOverHttp.default_port());
         assert_specified(builder.tls, Tls::Enabled(CertificateAuthority::WebpkiRoots));
     }
 
@@ -2486,6 +2495,7 @@ mod tests {
     fn tcp_simple() {
         let builder = assert_ok(SenderBuilder::from_conf("tcp::addr=localhost;"));
         assert_specified(builder.protocol, SenderProtocol::IlpOverTcp);
+        assert_specified(builder.port, SenderProtocol::IlpOverTcp.default_port());
         assert_specified(builder.host, "localhost");
         assert_specified(builder.tls, Tls::Disabled);
     }
@@ -2495,6 +2505,7 @@ mod tests {
         let builder = assert_ok(SenderBuilder::from_conf("tcps::addr=localhost;"));
         assert_specified(builder.protocol, SenderProtocol::IlpOverTcp);
         assert_specified(builder.host, "localhost");
+        assert_specified(builder.port, SenderProtocol::IlpOverTcp.default_port());
         assert_specified(builder.tls, Tls::Enabled(CertificateAuthority::WebpkiRoots));
     }
 

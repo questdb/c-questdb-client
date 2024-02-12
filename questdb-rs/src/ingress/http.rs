@@ -6,6 +6,8 @@ use std::fmt::Write;
 use std::thread::sleep;
 use std::time::Duration;
 
+use super::conf::ConfigSetting;
+
 #[derive(Debug, Clone)]
 pub(super) struct BasicAuthParams {
     pub(super) username: String,
@@ -39,21 +41,21 @@ impl TokenAuthParams {
 
 #[derive(Debug, Clone)]
 pub(super) struct HttpConfig {
-    pub(super) min_throughput: u64, // Wrap in `ConfigSetting` to track user-specified/defaulted.
-    pub(super) user_agent: Option<String>,
-    pub(super) retry_timeout: Duration,
-    pub(super) grace_timeout: Duration,
-    pub(super) transactional: bool,
+    pub(super) min_throughput: ConfigSetting<u64>,
+    pub(super) user_agent: ConfigSetting<Option<String>>,
+    pub(super) retry_timeout: ConfigSetting<Duration>,
+    pub(super) grace_timeout: ConfigSetting<Duration>,
+    pub(super) transactional: ConfigSetting<bool>,
 }
 
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
-            min_throughput: 102400, // 100 KiB/s
-            user_agent: None,
-            retry_timeout: Duration::from_secs(10),
-            grace_timeout: Duration::from_secs(5),
-            transactional: false,
+            min_throughput: ConfigSetting::new_default(102400), // 100 KiB/s
+            user_agent: ConfigSetting::new_default(None),
+            retry_timeout: ConfigSetting::new_default(Duration::from_secs(10)),
+            grace_timeout: ConfigSetting::new_default(Duration::from_secs(5)),
+            transactional: ConfigSetting::new_default(false),
         }
     }
 }
