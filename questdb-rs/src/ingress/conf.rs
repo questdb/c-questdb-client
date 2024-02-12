@@ -37,8 +37,12 @@ pub(crate) enum ConfigSetting<T> {
 }
 
 impl<T> ConfigSetting<T> {
-    pub(crate) fn new(value: T) -> Self {
+    pub(crate) fn new_default(value: T) -> Self {
         ConfigSetting::Defaulted(value)
+    }
+
+    pub(crate) fn new_specified(value: T) -> Self {
+        ConfigSetting::Specified(value)
     }
 
     /// Update the default value, usually because

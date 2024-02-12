@@ -1726,13 +1726,13 @@ impl SenderBuilder {
         let port: Port = port.into();
         let port = validate_value(port.0)?;
         Ok(Self {
-            read_timeout: ConfigSetting::new(Duration::from_secs(15)),
-            host: ConfigSetting::new(host),
-            port: ConfigSetting::new(port),
-            net_interface: ConfigSetting::new(None),
-            auth: ConfigSetting::new(None),
-            tls: ConfigSetting::new(Tls::Disabled),
-            protocol: ConfigSetting::new(SenderProtocol::IlpOverTcp),
+            read_timeout: ConfigSetting::new_default(Duration::from_secs(15)),
+            host: ConfigSetting::new_specified(host),
+            port: ConfigSetting::new_specified(port),
+            net_interface: ConfigSetting::new_default(None),
+            auth: ConfigSetting::new_default(None),
+            tls: ConfigSetting::new_default(Tls::Disabled),
+            protocol: ConfigSetting::new_default(SenderProtocol::IlpOverTcp),
             #[cfg(feature = "ilp-over-http")]
             http: None,
         })
