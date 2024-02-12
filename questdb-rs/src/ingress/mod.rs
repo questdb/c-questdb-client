@@ -1664,6 +1664,8 @@ impl SenderBuilder {
             .iter()
             .map(|(k, v)| (k.to_lowercase(), v))
             .collect::<HashMap<_, _>>();
+
+        // schema::
         let protocol = match service.as_ref() {
             "tcp" | "tcps" => SenderProtocol::IlpOverTcp,
             #[cfg(feature = "ilp-over-http")]
@@ -1671,6 +1673,8 @@ impl SenderBuilder {
             _ => return Err(error::fmt!(ConfigError, "Unsupported service: {}", service)),
         };
         let with_tls = service.ends_with('s');
+
+        // addr=
         let Some(addr) = params.get("addr") else {
             return Err(error::fmt!(
                 ConfigError,
@@ -1687,6 +1691,8 @@ impl SenderBuilder {
             #[cfg(feature = "ilp-over-http")]
             SenderProtocol::IlpOverHttp => builder.http()?,
         };
+
+        // tls=
         builder.tls.set_specified(
             "tls",
             if with_tls {
@@ -1987,7 +1993,8 @@ impl SenderBuilder {
     ///    .build()?;
     /// ```
     pub fn tls(mut self, tls: Tls) -> Result<Self> {
-        // TODO: Decouple the `specified` state of "TLS enabled" and "Root CA to use"
+        // TODO: Decouple the `specified` state of "Root CA to use" from the
+        // `specified` state of "TLS enabled"
         self.tls.set_specified("tls", tls)?;
         Ok(self)
     }
