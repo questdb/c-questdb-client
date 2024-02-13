@@ -1528,36 +1528,6 @@ fn add_os_roots(root_store: &mut RootCertStore) -> Result<()> {
     Ok(())
 }
 
-fn tls_config(params: &HashMap<String, &String>) -> Result<Tls> {
-    if let Some(&tls_verify) = params.get("tls_verify") {
-        match tls_verify.as_str() {
-            #[cfg(feature = "insecure-skip-verify")]
-            "unsafe_off" => {
-                return Ok(Tls::InsecureSkipVerify);
-            }
-            "on" => {}
-            _ => {
-                return config_err(
-                    "Config parameter 'tls_verify' must be either 'on' or 'unsafe_off'",
-                )
-            }
-        }
-    }
-    let roots = match params.get("tls_roots") {
-        Some(&value) => match value.as_str() {
-            "webpki" => CertificateAuthority::WebpkiRoots,
-            #[cfg(feature = "tls-native-certs")]
-            "os-certs" => CertificateAuthority::OsRoots,
-            path => CertificateAuthority::File {
-                path: PathBuf::from_str(path).unwrap(),
-                password: params.get("tls_roots_password").map(|&p| p.clone()),
-            },
-        },
-        None => CertificateAuthority::WebpkiRoots,
-    };
-    Ok(Tls::Enabled(roots))
-}
-
 fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
     if !tls.is_enabled() {
         return Ok(None);
@@ -1631,6 +1601,111 @@ fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
     }
 
     Ok(Some(Arc::new(config)))
+}
+
+fn handle_tls_config(params: &HashMap<String, &String>) -> Result<Tls> {
+    if let Some(&tls_verify) = params.get("tls_verify") {
+        match tls_verify.as_str() {
+            #[cfg(feature = "insecure-skip-verify")]
+            "unsafe_off" => {
+                return Ok(Tls::InsecureSkipVerify);
+            }
+            "on" => {}
+            _ => {
+                return config_err(
+                    "Config parameter 'tls_verify' must be either 'on' or 'unsafe_off'",
+                )
+            }
+        }
+    }
+    let roots = match params.get("tls_roots") {
+        Some(&value) => match value.as_str() {
+            "webpki" => CertificateAuthority::WebpkiRoots,
+            #[cfg(feature = "tls-native-certs")]
+            "os-certs" => CertificateAuthority::OsRoots,
+            path => CertificateAuthority::File {
+                path: PathBuf::from_str(path).unwrap(),
+                password: params.get("tls_roots_password").map(|&p| p.clone()),
+            },
+        },
+        None => CertificateAuthority::WebpkiRoots,
+    };
+    Ok(Tls::Enabled(roots))
+}
+
+fn handle_auth(
+    auth: &mut ConfigSetting<Option<AuthParams>>,
+    protocol: &SenderProtocol,
+    params: &HashMap<String, &String>,
+) -> Result<()> {
+    match protocol {
+        SenderProtocol::IlpOverTcp => {
+            match (
+                params.get("user"),
+                params.get("token"),
+                params.get("token_x"),
+                params.get("token_y"),
+            ) {
+                (Some(key_id), Some(priv_key), Some(pub_key_x), Some(pub_key_y)) => {
+                    auth.set_specified(
+                        "auth",
+                        Some(AuthParams::Ecdsa(EcdsaAuthParams {
+                            key_id: key_id.to_string(),
+                            priv_key: priv_key.to_string(),
+                            pub_key_x: pub_key_x.to_string(),
+                            pub_key_y: pub_key_y.to_string(),
+                        })),
+                    )?;
+                }
+                (None, None, None, None) => {}
+                (_, _, _, _) => return config_err(
+                    "Incomplete ECDSA authentication parameters. Specify either all or none of: \
+                    'user', 'token', 'token_x', 'token_y'",
+                ),
+            }
+        }
+
+        #[cfg(feature = "ilp-over-http")]
+        SenderProtocol::IlpOverHttp => {
+            match (params.get("user"), params.get("pass"), params.get("token")) {
+                (Some(username), Some(password), None) => {
+                    auth.set_specified(
+                        "auth",
+                        Some(AuthParams::Basic(BasicAuthParams {
+                            username: username.to_string(),
+                            password: password.to_string(),
+                        })),
+                    )?;
+                }
+                (None, None, Some(token)) => {
+                    auth.set_specified(
+                        "auth",
+                        Some(AuthParams::Token(TokenAuthParams {
+                            token: token.to_string(),
+                        })),
+                    )?;
+                }
+                (None, None, None) => {}
+                (Some(_), None, None) => {
+                    return config_err(
+                        "Authentication parameter 'user' is present, but 'pass' is missing",
+                    );
+                }
+                (None, Some(_), None) => {
+                    return config_err(
+                        "Authentication parameter 'pass' is present, but 'user' is missing",
+                    );
+                }
+                (_, _, _) => {
+                    return config_err(
+                        "Inconsistent HTTP authentication parameters. \
+                        Specify either 'user' and 'pass', or just 'token'",
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(feature = "ilp-over-http")]
@@ -1767,7 +1842,9 @@ impl SenderBuilder {
 
         // tls=  tls_verify=  tls_roots=  tls_roots_password=
         if with_tls {
-            builder.tls.set_specified("tls", tls_config(&params)?)?;
+            builder
+                .tls
+                .set_specified("tls", handle_tls_config(&params)?)?;
         } else {
             builder.tls.set_specified("tls", Tls::Disabled)?;
         }
@@ -1776,77 +1853,9 @@ impl SenderBuilder {
         #[cfg(feature = "ilp-over-http")]
         handle_http_params(&mut builder.http, &params)?;
 
-        match protocol {
-            // user=  token=  token_x=  token_y=
-            SenderProtocol::IlpOverTcp => {
-                match (
-                    params.get("user"),
-                    params.get("token"),
-                    params.get("token_x"),
-                    params.get("token_y"),
-                ) {
-                    (Some(key_id), Some(priv_key), Some(pub_key_x), Some(pub_key_y)) => {
-                        builder.auth.set_specified(
-                            "auth",
-                            Some(AuthParams::Ecdsa(EcdsaAuthParams {
-                                key_id: key_id.to_string(),
-                                priv_key: priv_key.to_string(),
-                                pub_key_x: pub_key_x.to_string(),
-                                pub_key_y: pub_key_y.to_string(),
-                            })),
-                        )?;
-                    }
-                    (None, None, None, None) => {}
-                    (_, _, _, _) => {
-                        return config_err(
-                            "Incomplete ECDSA authentication parameters. Specify either all or none of: \
-                            'user', 'token', 'token_x', 'token_y'",
-                        )
-                    }
-                }
-            }
+        // user=  pass=  token=  token_x=  token_y=
+        handle_auth(&mut builder.auth, &protocol, &params)?;
 
-            // user= pass= OR token=
-            #[cfg(feature = "ilp-over-http")]
-            SenderProtocol::IlpOverHttp => {
-                match (params.get("user"), params.get("pass"), params.get("token")) {
-                    (Some(username), Some(password), None) => {
-                        builder.auth.set_specified(
-                            "auth",
-                            Some(AuthParams::Basic(BasicAuthParams {
-                                username: username.to_string(),
-                                password: password.to_string(),
-                            })),
-                        )?;
-                    }
-                    (None, None, Some(token)) => {
-                        builder.auth.set_specified(
-                            "auth",
-                            Some(AuthParams::Token(TokenAuthParams {
-                                token: token.to_string(),
-                            })),
-                        )?;
-                    }
-                    (None, None, None) => {}
-                    (Some(_), None, None) => {
-                        return config_err(
-                            "Authentication parameter 'user' is present, but 'pass' is missing",
-                        );
-                    }
-                    (None, Some(_), None) => {
-                        return config_err(
-                            "Authentication parameter 'pass' is present, but 'user' is missing",
-                        );
-                    }
-                    (_, _, _) => {
-                        return config_err(
-                            "Inconsistent HTTP authentication parameters. \
-                            Specify either 'user' and 'pass', or just 'token'",
-                        );
-                    }
-                }
-            }
-        }
         if let Some(&auto_flush) = params.get("auto_flush") {
             match auto_flush.as_str() {
                 "off" => {}
