@@ -1549,7 +1549,7 @@ fn tls_config(params: &HashMap<String, &String>) -> Result<Tls> {
             #[cfg(feature = "tls-native-certs")]
             "os-certs" => CertificateAuthority::OsRoots,
             path => CertificateAuthority::File {
-                path: PathBuf::from_str(&path).unwrap(),
+                path: PathBuf::from_str(path).unwrap(),
                 password: params.get("tls_roots_password").map(|&p| p.clone()),
             },
         },
@@ -2207,11 +2207,12 @@ impl SenderBuilder {
         Ok(self)
     }
 
-    /// Connect synchronously.
+    /// Build the sender.
     ///
-    /// Will return once the connection is fully established:
-    /// If the connection requires authentication or TLS, these will also be
-    /// completed before returning.
+    /// In case of TCP, this synchronously establishes the TCP connection, and
+    /// returns once the connection is fully established. If the connection
+    /// requires authentication or TLS, these will also be completed before
+    /// returning.
     pub fn build(&self) -> Result<Sender> {
         let mut descr = format!("Sender[host={:?},port={:?},", self.host, self.port);
 
@@ -2338,12 +2339,8 @@ impl SenderBuilder {
                     None => agent_builder,
                 };
                 let auth = match self.auth.deref().clone() {
-                    #[cfg(feature = "ilp-over-http")]
                     Some(AuthParams::Basic(auth)) => Some(auth.to_header_string()),
-
-                    #[cfg(feature = "ilp-over-http")]
                     Some(AuthParams::Token(auth)) => Some(auth.to_header_string()?),
-
                     Some(AuthParams::Ecdsa(_)) => {
                         return Err(error::fmt!(
                             AuthError,
