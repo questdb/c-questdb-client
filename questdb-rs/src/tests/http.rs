@@ -460,7 +460,10 @@ fn test_tls() -> TestResult {
     let mut sender = server
         .lsb()?
         .http()?
-        .tls(Tls::Enabled(CertificateAuthority::File(ca_path)))?
+        .tls(Tls::Enabled(CertificateAuthority::File {
+            path: ca_path,
+            password: None,
+        }))?
         .build()?;
 
     let server_thread = std::thread::spawn(move || -> io::Result<()> {

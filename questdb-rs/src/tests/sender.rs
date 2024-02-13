@@ -330,9 +330,10 @@ fn test_tls_with_file_ca() -> TestResult {
     ca_path.push("server_rootCA.pem");
 
     let server = MockServer::new()?;
-    let lsb = server
-        .lsb()?
-        .tls(Tls::Enabled(CertificateAuthority::File(ca_path)))?;
+    let lsb = server.lsb()?.tls(Tls::Enabled(CertificateAuthority::File {
+        path: ca_path,
+        password: None,
+    }))?;
     let server_jh = server.accept_tls();
     let mut sender = lsb.build()?;
     let mut server: MockServer = server_jh.join().unwrap()?;
@@ -363,7 +364,10 @@ fn test_tls_to_plain_server() -> TestResult {
     let lsb = server
         .lsb()?
         .read_timeout(Duration::from_millis(500))?
-        .tls(Tls::Enabled(CertificateAuthority::File(ca_path)))?;
+        .tls(Tls::Enabled(CertificateAuthority::File {
+            path: ca_path,
+            password: None,
+        }))?;
     let server_jh = std::thread::spawn(move || -> io::Result<MockServer> {
         server.accept()?;
         Ok(server)

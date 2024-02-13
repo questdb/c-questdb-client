@@ -195,6 +195,7 @@ use std::fmt::{Formatter, Write};
 use std::io::{self, BufRead, BufReader, ErrorKind, Write as IoWrite};
 use std::ops::Deref;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::string::ToString;
 use std::sync::Arc;
 
@@ -1382,7 +1383,10 @@ pub enum CertificateAuthority {
     WebpkiAndOsRoots,
 
     /// Use the root certificates provided by a PEM-encoded file.
-    File(PathBuf),
+    File {
+        path: PathBuf,
+        password: Option<String>,
+    },
 }
 
 /// Options for full-connection encryption via TLS.
@@ -1395,7 +1399,7 @@ pub enum Tls {
     Enabled(CertificateAuthority),
 
     /// Use TLS encryption, whilst dangerously ignoring the server's certificate.
-    /// This should only be used for deubgging purposes.
+    /// This should only be used for debugging purposes.
     /// For testing consider specifying a [`CertificateAuthority::File`] instead.
     ///
     /// *This option requires the `insecure-skip-verify` feature.*
@@ -1524,6 +1528,34 @@ fn add_os_roots(root_store: &mut RootCertStore) -> Result<()> {
     Ok(())
 }
 
+fn tls_config(params: &HashMap<String, &String>) -> Result<Tls> {
+    if let Some(&tls_verify) = params.get("tls_verify") {
+        match tls_verify.as_str() {
+            "unsafe_off" => {
+                return Ok(Tls::InsecureSkipVerify);
+            }
+            "on" => {}
+            _ => {
+                return config_err(
+                    "Config parameter 'tls_verify' must be either 'on' or 'unsafe_off'",
+                )
+            }
+        }
+    }
+    let roots = match params.get("tls_roots") {
+        Some(&value) => match value.as_str() {
+            "webpki" => CertificateAuthority::WebpkiRoots,
+            "os-certs" => CertificateAuthority::OsRoots,
+            path => CertificateAuthority::File {
+                path: PathBuf::from_str(&path).unwrap(),
+                password: params.get("tls_root_password").map(|&p| p.clone()),
+            },
+        },
+        None => CertificateAuthority::WebpkiRoots,
+    };
+    Ok(Tls::Enabled(roots))
+}
+
 fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
     if !tls.is_enabled() {
         return Ok(None);
@@ -1546,7 +1578,7 @@ fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
                 add_webpki_roots(&mut root_store);
                 add_os_roots(&mut root_store)?;
             }
-            CertificateAuthority::File(ca_file) => {
+            CertificateAuthority::File { path: ca_file, .. } => {
                 let certfile = std::fs::File::open(ca_file).map_err(|io_err| {
                     error::fmt!(
                         TlsError,
@@ -1692,15 +1724,10 @@ impl SenderBuilder {
             SenderProtocol::IlpOverHttp => builder.http()?,
         };
 
-        // tls=
-        builder.tls.set_specified(
-            "tls",
-            if with_tls {
-                Tls::Enabled(CertificateAuthority::WebpkiRoots)
-            } else {
-                Tls::Disabled
-            },
-        )?;
+        // tls=  tls_verify=  tls_roots=  tls_roots_password=
+        if with_tls {
+            builder.tls.set_specified("tls", tls_config(&params)?)?;
+        }
 
         match protocol {
             // user= token= token_x= token_y=
@@ -2580,6 +2607,14 @@ mod tests {
     }
 
     #[test]
+    fn invalid_value() {
+        assert_conf_err(
+            SenderBuilder::from_conf("http::addr=localhost\n;"),
+            "Config parse error: invalid char '\\n' in value at position 20",
+        );
+    }
+
+    #[test]
     fn specified_cant_change() {
         let builder = assert_ok(SenderBuilder::from_conf("http::addr=localhost;"));
         assert_conf_err(builder.http(), "protocol is already specified");
@@ -2701,6 +2736,76 @@ mod tests {
                 "tcp::addr=localhost;user=user123;token=token123;token_x=123;",
             ),
             expected_err_msg,
+        );
+    }
+
+    #[test]
+    fn https_tls_verify_on() {
+        let builder = assert_ok(SenderBuilder::from_conf(
+            "https::addr=localhost;tls_verify=on;",
+        ));
+        assert_specified_eq(builder.tls, Tls::Enabled(CertificateAuthority::WebpkiRoots));
+    }
+
+    #[test]
+    fn https_tls_verify_unsafe_off() {
+        let builder = assert_ok(SenderBuilder::from_conf(
+            "https::addr=localhost;tls_verify=unsafe_off;",
+        ));
+        assert_specified_eq(builder.tls, Tls::InsecureSkipVerify);
+    }
+
+    #[test]
+    fn https_tls_verify_invalid() {
+        assert_conf_err(
+            SenderBuilder::from_conf("https::addr=localhost;tls_verify=off;"),
+            "Config parameter 'tls_verify' must be either 'on' or 'unsafe_off'",
+        );
+    }
+
+    #[test]
+    fn https_tls_roots_webpki() {
+        let builder = assert_ok(SenderBuilder::from_conf(
+            "https::addr=localhost;tls_roots=webpki;",
+        ));
+        assert_specified_eq(builder.tls, Tls::Enabled(CertificateAuthority::WebpkiRoots));
+    }
+
+    #[test]
+    fn https_tls_roots_os() {
+        let builder = assert_ok(SenderBuilder::from_conf(
+            "https::addr=localhost;tls_roots=os-certs;",
+        ));
+        assert_specified_eq(builder.tls, Tls::Enabled(CertificateAuthority::OsRoots));
+    }
+
+    #[test]
+    fn https_tls_roots_file() {
+        let builder = assert_ok(SenderBuilder::from_conf(
+            "https::addr=localhost;tls_roots=/home/questuser/cacerts.pem;",
+        ));
+        let path = PathBuf::from_str("/home/questuser/cacerts.pem").unwrap();
+        assert_specified_eq(
+            builder.tls,
+            Tls::Enabled(CertificateAuthority::File {
+                path,
+                password: None,
+            }),
+        );
+    }
+
+    #[test]
+    fn https_tls_roots_file_with_password() {
+        let builder = assert_ok(SenderBuilder::from_conf(
+            "https::addr=localhost;tls_roots=/home/questuser/cacerts.pem;tls_roots_password=extremely_secure;",
+        ));
+        let path = PathBuf::from_str("/home/questuser/cacerts.pem").unwrap();
+        assert_specified_eq(
+            builder.tls,
+            Tls::Enabled(CertificateAuthority::File {
+                path,
+                password: Some("extremely_secure".to_string()),
+            }),
         );
     }
 
