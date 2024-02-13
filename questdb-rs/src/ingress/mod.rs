@@ -1799,7 +1799,29 @@ impl SenderBuilder {
                 }
             }
         }
-
+        if let Some(&auto_flush) = params.get("auto_flush") {
+            match auto_flush.as_str() {
+                "off" => {}
+                _ => {
+                    return config_err(format!(
+                        "Invalid auto_flush value '{auto_flush}'. This client does not \
+                        support auto-flush, so the only accepted value is 'off'"
+                    ));
+                }
+            }
+        }
+        if params.get("auto_flush_rows").is_some() {
+            return config_err(
+                "Invalid configuration parameter 'auto_flush_rows'. \
+                This client does not support auto-flush",
+            );
+        }
+        if params.get("auto_flush_bytes").is_some() {
+            return config_err(
+                "Invalid configuration parameter 'auto_flush_bytes'. \
+                This client does not support auto-flush",
+            );
+        }
         // TODO: Map the rest of the parameters.
         // TODO: Validate param inconsistencies.
         Ok(builder)
@@ -2806,6 +2828,22 @@ mod tests {
                 path,
                 password: Some("extremely_secure".to_string()),
             }),
+        );
+    }
+
+    #[test]
+    fn auto_flush_off() {
+        assert_ok(SenderBuilder::from_conf(
+            "https::addr=localhost;auto_flush=off;",
+        ));
+    }
+
+    #[test]
+    fn auto_flush_unsupported() {
+        assert_conf_err(
+            SenderBuilder::from_conf("https::addr=localhost;auto_flush=on;"),
+            "Invalid auto_flush value 'on'. This client does not support \
+            auto-flush, so the only accepted value is 'off'",
         );
     }
 
