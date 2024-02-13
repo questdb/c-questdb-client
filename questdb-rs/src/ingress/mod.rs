@@ -1747,6 +1747,36 @@ fn handle_http_params(
     Ok(())
 }
 
+fn report_unrecognized_params(mut params: HashMap<String, &String>) -> Result<()> {
+    let recognized_params = vec![
+        "addr",
+        "user",
+        "pass",
+        "token",
+        "token_x",
+        "token_y",
+        "auto_flush",
+        "auto_flush_rows",
+        "auto_flush_bytes",
+        "min_throughput",
+        "grace_timeout",
+        "retry_timeout",
+        "init_buf_size",
+        "max_buf_size",
+        "tls_verify",
+        "tls_roots",
+        "tls_roots_password",
+    ];
+    params.retain(|k, _| !recognized_params.contains(&k.as_str()));
+    if !params.is_empty() {
+        return config_err(format!(
+            "Configuration string contains unrecognized parameters: {:?}",
+            params.keys().collect::<Vec<_>>()
+        ));
+    }
+    Ok(())
+}
+
 /// Protocol used to communicate with the QuestDB server.
 #[derive(PartialEq, Debug, Clone, Copy)]
 pub(crate) enum SenderProtocol {
@@ -1856,6 +1886,7 @@ impl SenderBuilder {
         // user=  pass=  token=  token_x=  token_y=
         handle_auth(&mut builder.auth, &protocol, &params)?;
 
+        // auto_flush=
         if let Some(&auto_flush) = params.get("auto_flush") {
             match auto_flush.as_str() {
                 "off" => {}
@@ -1867,12 +1898,14 @@ impl SenderBuilder {
                 }
             }
         }
+        // auto_flush_rows=
         if params.get("auto_flush_rows").is_some() {
             return config_err(
                 "Invalid configuration parameter 'auto_flush_rows'. \
                 This client does not support auto-flush",
             );
         }
+        // auto_flush_bytes=
         if params.get("auto_flush_bytes").is_some() {
             return config_err(
                 "Invalid configuration parameter 'auto_flush_bytes'. \
@@ -1881,34 +1914,10 @@ impl SenderBuilder {
         }
         // TODO: Handle init_buf_size and max_buf_size.
 
-        let recognized_params = vec![
-            "addr",
-            "user",
-            "pass",
-            "token",
-            "token_x",
-            "token_y",
-            "auto_flush",
-            "auto_flush_rows",
-            "auto_flush_bytes",
-            "min_throughput",
-            "grace_timeout",
-            "retry_timeout",
-            "init_buf_size",
-            "max_buf_size",
-            "tls_verify",
-            "tls_roots",
-            "tls_roots_password",
-        ];
-        let mut params = params;
-        params.retain(|k, _| !recognized_params.contains(&k.as_str()));
-        if !params.is_empty() {
-            return config_err(format!(
-                "Configuration string contains unrecognized parameters: {:?}",
-                params.keys().collect::<Vec<_>>()
-            ));
-        }
-        // TODO: Validate param inconsistencies.
+        // TODO: report unrecognized params whenever there's a missing param. It
+        // will help the user resolve misspelled params.
+        report_unrecognized_params(params)?;
+
         Ok(builder)
     }
 
