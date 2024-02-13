@@ -1531,6 +1531,7 @@ fn add_os_roots(root_store: &mut RootCertStore) -> Result<()> {
 fn tls_config(params: &HashMap<String, &String>) -> Result<Tls> {
     if let Some(&tls_verify) = params.get("tls_verify") {
         match tls_verify.as_str() {
+            #[cfg(feature = "insecure-skip-verify")]
             "unsafe_off" => {
                 return Ok(Tls::InsecureSkipVerify);
             }
@@ -1545,6 +1546,7 @@ fn tls_config(params: &HashMap<String, &String>) -> Result<Tls> {
     let roots = match params.get("tls_roots") {
         Some(&value) => match value.as_str() {
             "webpki" => CertificateAuthority::WebpkiRoots,
+            #[cfg(feature = "tls-native-certs")]
             "os-certs" => CertificateAuthority::OsRoots,
             path => CertificateAuthority::File {
                 path: PathBuf::from_str(&path).unwrap(),
@@ -1631,6 +1633,7 @@ fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
     Ok(Some(Arc::new(config)))
 }
 
+#[cfg(feature = "ilp-over-http")]
 fn handle_http_params(
     http_config: &mut Option<HttpConfig>,
     params: &HashMap<String, &String>,
@@ -1770,6 +1773,7 @@ impl SenderBuilder {
         }
 
         // min_throughput=  grace_timeout=  retry_timeout=
+        #[cfg(feature = "ilp-over-http")]
         handle_http_params(&mut builder.http, &params)?;
 
         match protocol {
@@ -1803,6 +1807,7 @@ impl SenderBuilder {
             }
 
             // user= pass= OR token=
+            #[cfg(feature = "ilp-over-http")]
             SenderProtocol::IlpOverHttp => {
                 match (params.get("user"), params.get("pass"), params.get("token")) {
                     (Some(username), Some(password), None) => {
@@ -2116,7 +2121,10 @@ impl SenderBuilder {
     pub fn tcp(mut self) -> Result<Self> {
         self.protocol
             .set_specified("protocol", SenderProtocol::IlpOverTcp)?;
-        self.http = None;
+        #[cfg(feature = "ilp-over-http")]
+        {
+            self.http = None;
+        }
         Ok(self)
     }
 
@@ -2419,6 +2427,7 @@ fn validate_value<V: Into<String>>(value_str: V) -> Result<String> {
     Ok(value_str)
 }
 
+#[cfg(feature = "ilp-over-http")]
 fn parse<T>(str_value: &str) -> Result<T>
 where
     T: FromStr,
@@ -2649,6 +2658,7 @@ mod tests {
     use super::*;
     use crate::{error::Result, ErrorCode};
 
+    #[cfg(feature = "ilp-over-http")]
     #[test]
     fn http_simple() {
         let builder = assert_ok(SenderBuilder::from_conf("http::addr=localhost;"));
@@ -2658,6 +2668,7 @@ mod tests {
         assert_specified_eq(builder.tls, Tls::Disabled);
     }
 
+    #[cfg(feature = "ilp-over-http")]
     #[test]
     fn https_simple() {
         let builder = assert_ok(SenderBuilder::from_conf("https::addr=localhost;"));
@@ -2688,21 +2699,21 @@ mod tests {
     #[test]
     fn invalid_value() {
         assert_conf_err(
-            SenderBuilder::from_conf("http::addr=localhost\n;"),
-            "Config parse error: invalid char '\\n' in value at position 20",
+            SenderBuilder::from_conf("tcp::addr=localhost\n;"),
+            "Config parse error: invalid char '\\n' in value at position 19",
         );
     }
 
     #[test]
     fn specified_cant_change() {
-        let builder = assert_ok(SenderBuilder::from_conf("http::addr=localhost;"));
-        assert_conf_err(builder.http(), "protocol is already specified");
+        let builder = assert_ok(SenderBuilder::from_conf("tcp::addr=localhost;"));
+        assert_conf_err(builder.tcp(), "protocol is already specified");
     }
 
     #[test]
     fn missing_addr() {
         assert_conf_err(
-            SenderBuilder::from_conf("http::"),
+            SenderBuilder::from_conf("tcp::"),
             "Missing 'addr' parameter in config string",
         );
     }
@@ -2715,6 +2726,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "ilp-over-http")]
     #[test]
     fn http_basic_auth() {
         let builder = assert_ok(SenderBuilder::from_conf(
@@ -2732,6 +2744,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "ilp-over-http")]
     #[test]
     fn http_token_auth() {
         let builder = assert_ok(SenderBuilder::from_conf(
@@ -2748,6 +2761,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "ilp-over-http")]
     #[test]
     fn incomplete_basic_auth() {
         assert_conf_err(
@@ -2760,6 +2774,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "ilp-over-http")]
     #[test]
     fn inconsistent_http_auth() {
         let expected_err_msg = "Inconsistent HTTP authentication parameters. \
@@ -2819,49 +2834,51 @@ mod tests {
     }
 
     #[test]
-    fn https_tls_verify_on() {
+    fn tcps_tls_verify_on() {
         let builder = assert_ok(SenderBuilder::from_conf(
-            "https::addr=localhost;tls_verify=on;",
+            "tcps::addr=localhost;tls_verify=on;",
         ));
         assert_specified_eq(builder.tls, Tls::Enabled(CertificateAuthority::WebpkiRoots));
     }
 
+    #[cfg(feature = "insecure-skip-verify")]
     #[test]
-    fn https_tls_verify_unsafe_off() {
+    fn tcps_tls_verify_unsafe_off() {
         let builder = assert_ok(SenderBuilder::from_conf(
-            "https::addr=localhost;tls_verify=unsafe_off;",
+            "tcps::addr=localhost;tls_verify=unsafe_off;",
         ));
         assert_specified_eq(builder.tls, Tls::InsecureSkipVerify);
     }
 
     #[test]
-    fn https_tls_verify_invalid() {
+    fn tcps_tls_verify_invalid() {
         assert_conf_err(
-            SenderBuilder::from_conf("https::addr=localhost;tls_verify=off;"),
+            SenderBuilder::from_conf("tcps::addr=localhost;tls_verify=off;"),
             "Config parameter 'tls_verify' must be either 'on' or 'unsafe_off'",
         );
     }
 
     #[test]
-    fn https_tls_roots_webpki() {
+    fn tcps_tls_roots_webpki() {
         let builder = assert_ok(SenderBuilder::from_conf(
-            "https::addr=localhost;tls_roots=webpki;",
+            "tcps::addr=localhost;tls_roots=webpki;",
         ));
         assert_specified_eq(builder.tls, Tls::Enabled(CertificateAuthority::WebpkiRoots));
     }
 
+    #[cfg(feature = "tls-native-certs")]
     #[test]
-    fn https_tls_roots_os() {
+    fn tcps_tls_roots_os() {
         let builder = assert_ok(SenderBuilder::from_conf(
-            "https::addr=localhost;tls_roots=os-certs;",
+            "tcps::addr=localhost;tls_roots=os-certs;",
         ));
         assert_specified_eq(builder.tls, Tls::Enabled(CertificateAuthority::OsRoots));
     }
 
     #[test]
-    fn https_tls_roots_file() {
+    fn tcps_tls_roots_file() {
         let builder = assert_ok(SenderBuilder::from_conf(
-            "https::addr=localhost;tls_roots=/home/questuser/cacerts.pem;",
+            "tcps::addr=localhost;tls_roots=/home/questuser/cacerts.pem;",
         ));
         let path = PathBuf::from_str("/home/questuser/cacerts.pem").unwrap();
         assert_specified_eq(
@@ -2874,9 +2891,9 @@ mod tests {
     }
 
     #[test]
-    fn https_tls_roots_file_with_password() {
+    fn tcps_tls_roots_file_with_password() {
         let builder = assert_ok(SenderBuilder::from_conf(
-            "https::addr=localhost;tls_roots=/home/questuser/cacerts.pem;tls_roots_password=extremely_secure;",
+            "tcps::addr=localhost;tls_roots=/home/questuser/cacerts.pem;tls_roots_password=extremely_secure;",
         ));
         let path = PathBuf::from_str("/home/questuser/cacerts.pem").unwrap();
         assert_specified_eq(
@@ -2888,6 +2905,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "ilp-over-http")]
     #[test]
     fn http_min_throughput() {
         let builder = assert_ok(SenderBuilder::from_conf(
@@ -2901,6 +2919,7 @@ mod tests {
         assert_defaulted_eq(http_config.retry_timeout, Duration::from_millis(10000));
     }
 
+    #[cfg(feature = "ilp-over-http")]
     #[test]
     fn http_grace_timeout() {
         let builder = assert_ok(SenderBuilder::from_conf(
@@ -2914,6 +2933,7 @@ mod tests {
         assert_defaulted_eq(http_config.retry_timeout, Duration::from_millis(10000));
     }
 
+    #[cfg(feature = "ilp-over-http")]
     #[test]
     fn http_retry_timeout() {
         let builder = assert_ok(SenderBuilder::from_conf(
@@ -2930,14 +2950,14 @@ mod tests {
     #[test]
     fn auto_flush_off() {
         assert_ok(SenderBuilder::from_conf(
-            "https::addr=localhost;auto_flush=off;",
+            "tcps::addr=localhost;auto_flush=off;",
         ));
     }
 
     #[test]
     fn auto_flush_unsupported() {
         assert_conf_err(
-            SenderBuilder::from_conf("https::addr=localhost;auto_flush=on;"),
+            SenderBuilder::from_conf("tcps::addr=localhost;auto_flush=on;"),
             "Invalid auto_flush value 'on'. This client does not support \
             auto-flush, so the only accepted value is 'off'",
         );
