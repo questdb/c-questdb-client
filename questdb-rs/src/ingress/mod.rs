@@ -1879,7 +1879,35 @@ impl SenderBuilder {
                 This client does not support auto-flush",
             );
         }
-        // TODO: Map the rest of the parameters.
+        // TODO: Handle init_buf_size and max_buf_size.
+
+        let recognized_params = vec![
+            "addr",
+            "user",
+            "pass",
+            "token",
+            "token_x",
+            "token_y",
+            "auto_flush",
+            "auto_flush_rows",
+            "auto_flush_bytes",
+            "min_throughput",
+            "grace_timeout",
+            "retry_timeout",
+            "init_buf_size",
+            "max_buf_size",
+            "tls_verify",
+            "tls_roots",
+            "tls_roots_password",
+        ];
+        let mut params = params;
+        params.retain(|k, _| !recognized_params.contains(&k.as_str()));
+        if !params.is_empty() {
+            return config_err(format!(
+                "Configuration string contains unrecognized parameters: {:?}",
+                params.keys().collect::<Vec<_>>()
+            ));
+        }
         // TODO: Validate param inconsistencies.
         Ok(builder)
     }
@@ -2707,6 +2735,14 @@ mod tests {
         assert_conf_err(
             SenderBuilder::from_conf("tcp::addr=localhost\n;"),
             "Config parse error: invalid char '\\n' in value at position 19",
+        );
+    }
+
+    #[test]
+    fn unrecognized_param() {
+        assert_conf_err(
+            SenderBuilder::from_conf("tcp::addr=localhost;quest=db;"),
+            "Configuration string contains unrecognized parameters: [\"quest\"]",
         );
     }
 
