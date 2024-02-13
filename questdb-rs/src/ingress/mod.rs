@@ -1548,7 +1548,7 @@ fn tls_config(params: &HashMap<String, &String>) -> Result<Tls> {
             "os-certs" => CertificateAuthority::OsRoots,
             path => CertificateAuthority::File {
                 path: PathBuf::from_str(&path).unwrap(),
-                password: params.get("tls_root_password").map(|&p| p.clone()),
+                password: params.get("tls_roots_password").map(|&p| p.clone()),
             },
         },
         None => CertificateAuthority::WebpkiRoots,
@@ -1629,6 +1629,44 @@ fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
     }
 
     Ok(Some(Arc::new(config)))
+}
+
+fn handle_http_params(
+    http_config: &mut Option<HttpConfig>,
+    params: &HashMap<String, &String>,
+) -> Result<()> {
+    if let Some(http_config) = http_config {
+        if let Some(min_throughput) = params.get("min_throughput") {
+            http_config
+                .min_throughput
+                .set_specified("min_throughput", parse(min_throughput)?)?;
+        }
+        if let Some(grace_timeout) = params.get("grace_timeout") {
+            http_config.grace_timeout.set_specified(
+                "grace_timeout",
+                Duration::from_millis(parse(grace_timeout)?),
+            )?;
+        }
+        if let Some(retry_timeout) = params.get("retry_timeout") {
+            http_config.retry_timeout.set_specified(
+                "retry_timeout",
+                Duration::from_millis(parse(retry_timeout)?),
+            )?;
+        }
+    } else {
+        if params.get("min_throughput").is_some() {
+            return config_err(
+                "Configuration parameter 'min_throughput' only applies in HTTP mode",
+            );
+        }
+        if params.get("grace_timeout").is_some() {
+            return config_err("Configuration parameter 'grace_timeout' only applies in HTTP mode");
+        }
+        if params.get("retry_timeout").is_some() {
+            return config_err("Configuration parameter 'retry_timeout' only applies in HTTP mode");
+        }
+    }
+    Ok(())
 }
 
 /// Protocol used to communicate with the QuestDB server.
@@ -1727,10 +1765,15 @@ impl SenderBuilder {
         // tls=  tls_verify=  tls_roots=  tls_roots_password=
         if with_tls {
             builder.tls.set_specified("tls", tls_config(&params)?)?;
+        } else {
+            builder.tls.set_specified("tls", Tls::Disabled)?;
         }
 
+        // min_throughput=  grace_timeout=  retry_timeout=
+        handle_http_params(&mut builder.http, &params)?;
+
         match protocol {
-            // user= token= token_x= token_y=
+            // user=  token=  token_x=  token_y=
             SenderProtocol::IlpOverTcp => {
                 match (
                     params.get("user"),
@@ -2376,8 +2419,22 @@ fn validate_value<V: Into<String>>(value_str: V) -> Result<String> {
     Ok(value_str)
 }
 
+fn parse<T>(str_value: &str) -> Result<T>
+where
+    T: FromStr,
+    T::Err: std::fmt::Debug,
+{
+    str_value
+        .parse()
+        .map_err(|e| config_error(format!("{e:?}")))
+}
+
 fn config_err<T, M: Into<String>>(msg: M) -> Result<T> {
-    Err(Error::new(ErrorCode::ConfigError, msg))
+    Err(config_error(msg))
+}
+
+fn config_error<M: Into<String>>(msg: M) -> Error {
+    Error::new(ErrorCode::ConfigError, msg)
 }
 
 fn b64_decode(descr: &'static str, buf: &str) -> Result<Vec<u8>> {
@@ -2829,6 +2886,45 @@ mod tests {
                 password: Some("extremely_secure".to_string()),
             }),
         );
+    }
+
+    #[test]
+    fn http_min_throughput() {
+        let builder = assert_ok(SenderBuilder::from_conf(
+            "http::addr=localhost;min_throughput=100;",
+        ));
+        let Some(http_config) = builder.http else {
+            panic!("Expected Some(HttpConfig)");
+        };
+        assert_specified_eq(http_config.min_throughput, 100u64);
+        assert_defaulted_eq(http_config.grace_timeout, Duration::from_millis(5000));
+        assert_defaulted_eq(http_config.retry_timeout, Duration::from_millis(10000));
+    }
+
+    #[test]
+    fn http_grace_timeout() {
+        let builder = assert_ok(SenderBuilder::from_conf(
+            "http::addr=localhost;grace_timeout=100;",
+        ));
+        let Some(http_config) = builder.http else {
+            panic!("Expected Some(HttpConfig)");
+        };
+        assert_defaulted_eq(http_config.min_throughput, 102400u64);
+        assert_specified_eq(http_config.grace_timeout, Duration::from_millis(100));
+        assert_defaulted_eq(http_config.retry_timeout, Duration::from_millis(10000));
+    }
+
+    #[test]
+    fn http_retry_timeout() {
+        let builder = assert_ok(SenderBuilder::from_conf(
+            "http::addr=localhost;retry_timeout=100;",
+        ));
+        let Some(http_config) = builder.http else {
+            panic!("Expected Some(HttpConfig)");
+        };
+        assert_defaulted_eq(http_config.min_throughput, 102400u64);
+        assert_defaulted_eq(http_config.grace_timeout, Duration::from_millis(5000));
+        assert_specified_eq(http_config.retry_timeout, Duration::from_millis(100));
     }
 
     #[test]
