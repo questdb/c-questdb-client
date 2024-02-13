@@ -1678,7 +1678,7 @@ impl SenderBuilder {
         let Some(addr) = params.get("addr") else {
             return Err(error::fmt!(
                 ConfigError,
-                "Missing 'addr' parameter in config string."
+                "Missing 'addr' parameter in config string"
             ));
         };
         let (host, port) = match addr.split_once(':') {
@@ -1725,14 +1725,14 @@ impl SenderBuilder {
                     (None, None, None, None) => {}
                     (_, _, _, _) => {
                         return config_err(
-                            "Incomplete authentication parameters. Specify either all or none of: \
+                            "Incomplete ECDSA authentication parameters. Specify either all or none of: \
                             'user', 'token', 'token_x', 'token_y'",
                         )
                     }
                 }
             }
 
-            // user= pass= or token=
+            // user= pass= OR token=
             SenderProtocol::IlpOverHttp => {
                 match (params.get("user"), params.get("pass"), params.get("token")) {
                     (Some(username), Some(password), None) => {
@@ -1753,19 +1753,19 @@ impl SenderBuilder {
                         )?;
                     }
                     (None, None, None) => {}
-                    (None, Some(_), None) => {
-                        return config_err(
-                            "Authentication parameter 'pass' is present, but 'user' is missing",
-                        );
-                    }
                     (Some(_), None, None) => {
                         return config_err(
                             "Authentication parameter 'user' is present, but 'pass' is missing",
                         );
                     }
+                    (None, Some(_), None) => {
+                        return config_err(
+                            "Authentication parameter 'pass' is present, but 'user' is missing",
+                        );
+                    }
                     (_, _, _) => {
                         return config_err(
-                            "Inconsistent authentication parameters. \
+                            "Inconsistent HTTP authentication parameters. \
                             Specify either 'user' and 'pass', or just 'token'",
                         );
                     }
@@ -2580,10 +2580,16 @@ mod tests {
     }
 
     #[test]
+    fn specified_cant_change() {
+        let builder = assert_ok(SenderBuilder::from_conf("http::addr=localhost;"));
+        assert_conf_err(builder.http(), "protocol is already specified");
+    }
+
+    #[test]
     fn missing_addr() {
         assert_conf_err(
             SenderBuilder::from_conf("http::"),
-            "Missing 'addr' parameter in config string.",
+            "Missing 'addr' parameter in config string",
         );
     }
 
@@ -2598,13 +2604,13 @@ mod tests {
     #[test]
     fn http_basic_auth() {
         let builder = assert_ok(SenderBuilder::from_conf(
-            "http::addr=localhost;user=meme;pass=emem;",
+            "http::addr=localhost;user=user123;pass=pass321;",
         ));
         let auth = assert_specified(builder.auth).expect("builder.auth was set to None");
         match auth {
             AuthParams::Basic(BasicAuthParams { username, password }) => {
-                assert_eq!(username, "meme");
-                assert_eq!(password, "emem");
+                assert_eq!(username, "user123");
+                assert_eq!(password, "pass321");
             }
             _ => {
                 panic!("Expected AuthParams::Basic");
@@ -2615,17 +2621,87 @@ mod tests {
     #[test]
     fn http_token_auth() {
         let builder = assert_ok(SenderBuilder::from_conf(
-            "http::addr=localhost:9000;token=hemem;",
+            "http::addr=localhost:9000;token=token123;",
         ));
         let auth = assert_specified(builder.auth).expect("builder.auth was set to None");
         match auth {
             AuthParams::Token(TokenAuthParams { token }) => {
-                assert_eq!(token, "hemem");
+                assert_eq!(token, "token123");
             }
             _ => {
-                panic!("Expected AuthParams::Basic");
+                panic!("Expected AuthParams::Token");
             }
         }
+    }
+
+    #[test]
+    fn incomplete_basic_auth() {
+        assert_conf_err(
+            SenderBuilder::from_conf("http::addr=localhost;user=user123;"),
+            "Authentication parameter 'user' is present, but 'pass' is missing",
+        );
+        assert_conf_err(
+            SenderBuilder::from_conf("http::addr=localhost;pass=pass321;"),
+            "Authentication parameter 'pass' is present, but 'user' is missing",
+        );
+    }
+
+    #[test]
+    fn inconsistent_http_auth() {
+        let expected_err_msg = "Inconsistent HTTP authentication parameters. \
+            Specify either 'user' and 'pass', or just 'token'";
+        assert_conf_err(
+            SenderBuilder::from_conf("http::addr=localhost;user=user123;token=token123;"),
+            expected_err_msg,
+        );
+        assert_conf_err(
+            SenderBuilder::from_conf("http::addr=localhost;pass=pass321;token=token123;"),
+            expected_err_msg,
+        );
+    }
+
+    #[test]
+    fn tcp_ecdsa_auth() {
+        let builder = assert_ok(SenderBuilder::from_conf(
+            "tcp::addr=localhost:9000;user=user123;token=token123;token_x=xtok123;token_y=ytok123;",
+        ));
+        let auth = assert_specified(builder.auth).expect("builder.auth was set to None");
+        match auth {
+            AuthParams::Ecdsa(EcdsaAuthParams {
+                key_id,
+                priv_key,
+                pub_key_x,
+                pub_key_y,
+            }) => {
+                assert_eq!(key_id, "user123");
+                assert_eq!(priv_key, "token123");
+                assert_eq!(pub_key_x, "xtok123");
+                assert_eq!(pub_key_y, "ytok123");
+            }
+            _ => {
+                panic!("Expected AuthParams::Ecdsa");
+            }
+        }
+    }
+
+    #[test]
+    fn incomplete_tcp_ecdsa_auth() {
+        let expected_err_msg = "Incomplete ECDSA authentication parameters. \
+            Specify either all or none of: 'user', 'token', 'token_x', 'token_y'";
+        assert_conf_err(
+            SenderBuilder::from_conf("tcp::addr=localhost;user=user123;"),
+            expected_err_msg,
+        );
+        assert_conf_err(
+            SenderBuilder::from_conf("tcp::addr=localhost;user=user123;token=token123;"),
+            expected_err_msg,
+        );
+        assert_conf_err(
+            SenderBuilder::from_conf(
+                "tcp::addr=localhost;user=user123;token=token123;token_x=123;",
+            ),
+            expected_err_msg,
+        );
     }
 
     fn assert_ok(result: Result<SenderBuilder>) -> SenderBuilder {
