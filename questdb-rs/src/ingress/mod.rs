@@ -1896,6 +1896,7 @@ impl SenderBuilder {
         };
 
         // tls=  tls_verify=  tls_roots=  tls_roots_password=
+        // TODO: no support in config string for WebPkiAndOsRoots
         if with_tls {
             builder
                 .tls
@@ -1915,6 +1916,7 @@ impl SenderBuilder {
         handle_auto_flush_params(&params)?;
 
         // TODO: Handle init_buf_size and max_buf_size.
+        // TODO: read_timeout, net_interface can't be set via config string.
 
         let unrecognized_params = unrecognized_params(&params);
         if unrecognized_params.is_empty() {
