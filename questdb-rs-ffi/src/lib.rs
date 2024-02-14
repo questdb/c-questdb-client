@@ -599,7 +599,14 @@ pub unsafe extern "C" fn line_sender_opts_tls_ca(
     ca_path: line_sender_utf8,
 ) {
     let ca_path = PathBuf::from(ca_path.as_str());
-    upd_opts!(opts, tls, Tls::Enabled(CertificateAuthority::File(ca_path)));
+    upd_opts!(
+        opts,
+        tls,
+        Tls::Enabled(CertificateAuthority::File {
+            path: ca_path,
+            password: Option::None
+        })
+    );
 }
 
 /// Enable TLS whilst dangerously accepting any certificate as valid.
