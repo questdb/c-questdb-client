@@ -47,22 +47,6 @@ impl<T> ConfigSetting<T> {
         ConfigSetting::Specified(value)
     }
 
-    /// Update the default value, usually because
-    /// another setting was triggered.
-    /// Does nothing if the value was already specified.
-    /// Returns true if the value was updated.
-    pub(crate) fn set_default(&mut self, value: T) -> Result<()> {
-        if let ConfigSetting::Defaulted(_) = self {
-            *self = ConfigSetting::Defaulted(value);
-            Ok(())
-        } else {
-            Err(Error::new(
-                ErrorCode::ConfigError,
-                "set_default() called on a specified value",
-            ))
-        }
-    }
-
     /// Set the user-defined value.
     /// Note that it can't be changed once set.
     /// Returns true if the value was updated, false if already specified.
