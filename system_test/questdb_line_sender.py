@@ -313,7 +313,7 @@ def _setup_cdll():
         None,
         c_line_sender_opts_p)
     set_sig(
-        dll.line_sender_connect,
+        dll.line_sender_build,
         c_line_sender_p,
         c_line_sender_opts_p,
         c_line_sender_error_p_p)
@@ -619,7 +619,7 @@ class Sender:
         if self._impl:
             raise SenderError('Already connected')
         self._impl = _error_wrapped_call(
-            _DLL.line_sender_connect,
+            _DLL.line_sender_build,
             self._opts.impl)
 
     def __enter__(self):

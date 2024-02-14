@@ -705,7 +705,7 @@ void line_sender_opts_free(line_sender_opts* opts);
  * @note The opts object is freed.
  */
 LINESENDER_API
-line_sender *line_sender_connect(
+line_sender *line_sender_build(
     const line_sender_opts* opts,
     line_sender_error** err_out);
 

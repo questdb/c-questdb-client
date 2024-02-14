@@ -20,7 +20,7 @@ static bool example(const char* host, const char* port)
 
     // Call `line_sender_opts_new` if instead you have an integer port.
     opts = line_sender_opts_new_service(host_utf8, port_utf8);
-    sender = line_sender_connect(opts, &err);
+    sender = line_sender_build(opts, &err);
     line_sender_opts_free(opts);
     opts = NULL;
     if (!sender)

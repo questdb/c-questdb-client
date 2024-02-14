@@ -60,7 +60,7 @@ TEST_CASE("line_sender c api basics")
     CHECK(::line_sender_utf8_init(&host, 9, "localhost", &err));
     ::line_sender_opts* opts = ::line_sender_opts_new(host, server.port());
     CHECK_NE(opts, nullptr);
-    ::line_sender* sender = ::line_sender_connect(opts, &err);
+    ::line_sender* sender = ::line_sender_build(opts, &err);
     line_sender_opts_free(opts);
     CHECK_NE(sender, nullptr);
     CHECK_FALSE(::line_sender_must_close(sender));

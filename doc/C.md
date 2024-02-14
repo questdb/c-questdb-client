@@ -37,7 +37,7 @@ if (!opts) {
     /* ... handle error ... */
 }
 
-sender = line_sender_connect(opts, &err);
+sender = line_sender_build(opts, &err);
 line_sender_opts_free(opts);
 opts = NULL;
 if (!sender) {

@@ -27,7 +27,7 @@ static bool example(const char* host, const char* port)
     // Ensure that each buffer contains lines for a single table on each flush.
     line_sender_opts_transactional(opts);
 
-    sender = line_sender_connect(opts, &err);
+    sender = line_sender_build(opts, &err);
     line_sender_opts_free(opts);
     opts = NULL;
     if (!sender)

@@ -970,7 +970,7 @@ namespace questdb::ingress
 
         line_sender(const opts& opts)
             : _impl{line_sender_error::wrapped_call(
-                ::line_sender_connect, opts._impl)}
+                ::line_sender_build, opts._impl)}
         {}
 
         line_sender(const line_sender&) = delete;

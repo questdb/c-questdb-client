@@ -1008,11 +1008,18 @@ pub unsafe extern "C" fn line_sender_buffer_at_now(
 /// Batch up rows in `buffer` objects, then call `flush` to send them.
 pub struct line_sender(Sender);
 
-/// Synchronously connect to the QuestDB database.
+/// Build the line sender.
+///
+/// In case of TCP, this synchronously establishes the TCP connection, and
+/// returns once the connection is fully established. If the connection
+/// requires authentication or TLS, these will also be completed before
+/// returning.
+///
 /// The connection should be accessed by only a single thread a time.
+///
 /// @param[in] opts Options for the connection.
 #[no_mangle]
-pub unsafe extern "C" fn line_sender_connect(
+pub unsafe extern "C" fn line_sender_build(
     opts: *const line_sender_opts,
     err_out: *mut *mut line_sender_error,
 ) -> *mut line_sender {
