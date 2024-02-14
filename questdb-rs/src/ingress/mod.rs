@@ -1984,6 +1984,7 @@ impl SenderBuilder {
     /// # }
     /// ```
     pub fn net_interface<I: Into<String>>(mut self, addr: I) -> Result<Self> {
+        self.ensure_selected_protocol("net_interface", SenderProtocol::IlpOverTcp)?;
         self.net_interface
             .set_specified("net_interface", Some(validate_value(addr)?))?;
         Ok(self)
@@ -2034,6 +2035,7 @@ impl SenderBuilder {
         C: Into<String>,
         D: Into<String>,
     {
+        self.ensure_selected_protocol("auth", SenderProtocol::IlpOverTcp)?;
         self.auth.set_specified(
             "auth",
             Some(AuthParams::Ecdsa(EcdsaAuthParams {
@@ -2056,6 +2058,7 @@ impl SenderBuilder {
         A: Into<String>,
         B: Into<String>,
     {
+        self.ensure_selected_protocol("basic_auth", SenderProtocol::IlpOverHttp)?;
         self.auth.set_specified(
             "auth",
             Some(AuthParams::Basic(BasicAuthParams {
@@ -2075,6 +2078,7 @@ impl SenderBuilder {
     where
         A: Into<String>,
     {
+        self.ensure_selected_protocol("token_auth", SenderProtocol::IlpOverHttp)?;
         self.auth.set_specified(
             "auth",
             Some(AuthParams::Token(TokenAuthParams {
@@ -2464,6 +2468,23 @@ impl SenderBuilder {
             }
         }
         Ok(sender)
+    }
+
+    fn ensure_selected_protocol(
+        &self,
+        param_name: &str,
+        required_protocol: SenderProtocol,
+    ) -> Result<()> {
+        match self.protocol {
+            ConfigSetting::Specified(p) if p == required_protocol => Ok(()),
+            ConfigSetting::Defaulted(p) if p == required_protocol => config_err(format!(
+                "protocol {required_protocol:?} is selected by default, but in order to \
+                set {param_name}, you must select it explicitly."
+            )),
+            _ => config_err(format!(
+                "in order to set {param_name}, you must first select protocol {required_protocol:?}"
+            )),
+        }
     }
 }
 
@@ -2873,6 +2894,44 @@ mod tests {
         assert_conf_err(
             SenderBuilder::from_conf("http::addr=localhost;pass=pass321;token=token123;"),
             expected_err_msg,
+        );
+    }
+
+    #[test]
+    fn cant_use_basic_auth_with_tcp() {
+        let builder = assert_ok(SenderBuilder::new("localhost", 9000));
+        assert_conf_err(
+            builder.basic_auth("user123", "pass321"),
+            "in order to set basic_auth, you must first select protocol IlpOverHttp",
+        );
+    }
+
+    #[test]
+    fn cant_use_token_auth_with_tcp() {
+        let builder = assert_ok(SenderBuilder::new("localhost", 9000));
+        assert_conf_err(
+            builder.token_auth("token123"),
+            "in order to set token_auth, you must first select protocol IlpOverHttp",
+        );
+    }
+
+    #[test]
+    fn must_explicitly_select_tcp_to_set_auth() {
+        let builder = assert_ok(SenderBuilder::new("localhost", 9000));
+        assert_conf_err(
+            builder.auth("key_id123", "priv_key123", "pub_key1", "pub_key2"),
+            "protocol IlpOverTcp is selected by default, but in order to \
+            set auth, you must select it explicitly.",
+        );
+    }
+
+    #[test]
+    fn must_explicitly_select_tcp_to_set_net_interface() {
+        let builder = assert_ok(SenderBuilder::new("localhost", 9000));
+        assert_conf_err(
+            builder.net_interface("55.88.0.4"),
+            "protocol IlpOverTcp is selected by default, but in order to \
+            set net_interface, you must select it explicitly.",
         );
     }
 
