@@ -1633,7 +1633,7 @@ fn handle_tls_config(params: &HashMap<String, &String>) -> Result<Tls> {
     Ok(Tls::Enabled(roots))
 }
 
-fn handle_auth(
+fn handle_auth_params(
     auth: &mut ConfigSetting<Option<AuthParams>>,
     protocol: &SenderProtocol,
     params: &HashMap<String, &String>,
@@ -1658,9 +1658,10 @@ fn handle_auth(
                     )?;
                 }
                 (None, None, None, None) => {}
-                (_, _, _, _) => return config_err(
+                (_, _, _, _) => return missing_param_err(
                     "Incomplete ECDSA authentication parameters. Specify either all or none of: \
                     'user', 'token', 'token_x', 'token_y'",
+                    params,
                 ),
             }
         }
@@ -1687,19 +1688,22 @@ fn handle_auth(
                 }
                 (None, None, None) => {}
                 (Some(_), None, None) => {
-                    return config_err(
+                    return missing_param_err(
                         "Authentication parameter 'user' is present, but 'pass' is missing",
+                        params,
                     );
                 }
                 (None, Some(_), None) => {
-                    return config_err(
+                    return missing_param_err(
                         "Authentication parameter 'pass' is present, but 'user' is missing",
+                        params,
                     );
                 }
                 (_, _, _) => {
-                    return config_err(
+                    return missing_param_err(
                         "Inconsistent HTTP authentication parameters. \
                         Specify either 'user' and 'pass', or just 'token'",
+                        params,
                     );
                 }
             }
@@ -1747,7 +1751,34 @@ fn handle_http_params(
     Ok(())
 }
 
-fn report_unrecognized_params(mut params: HashMap<String, &String>) -> Result<()> {
+fn handle_auto_flush_params(params: &HashMap<String, &String>) -> Result<()> {
+    if let Some(&auto_flush) = params.get("auto_flush") {
+        match auto_flush.as_str() {
+            "off" => {}
+            _ => {
+                return config_err(format!(
+                    "Invalid auto_flush value '{auto_flush}'. This client does not \
+                    support auto-flush, so the only accepted value is 'off'"
+                ));
+            }
+        }
+    }
+    if params.get("auto_flush_rows").is_some() {
+        return config_err(
+            "Invalid configuration parameter 'auto_flush_rows'. \
+            This client does not support auto-flush",
+        );
+    }
+    if params.get("auto_flush_bytes").is_some() {
+        return config_err(
+            "Invalid configuration parameter 'auto_flush_bytes'. \
+            This client does not support auto-flush",
+        );
+    }
+    Ok(())
+}
+
+fn unrecognized_params(params: &HashMap<String, &String>) -> Vec<String> {
     let recognized_params = vec![
         "addr",
         "user",
@@ -1767,14 +1798,11 @@ fn report_unrecognized_params(mut params: HashMap<String, &String>) -> Result<()
         "tls_roots",
         "tls_roots_password",
     ];
-    params.retain(|k, _| !recognized_params.contains(&k.as_str()));
-    if !params.is_empty() {
-        return config_err(format!(
-            "Configuration string contains unrecognized parameters: {:?}",
-            params.keys().collect::<Vec<_>>()
-        ));
-    }
-    Ok(())
+    params
+        .keys()
+        .filter(|p| !recognized_params.contains(&p.as_str()))
+        .cloned()
+        .collect::<Vec<_>>()
 }
 
 /// Protocol used to communicate with the QuestDB server.
@@ -1854,10 +1882,7 @@ impl SenderBuilder {
 
         // addr=
         let Some(addr) = params.get("addr") else {
-            return Err(error::fmt!(
-                ConfigError,
-                "Missing 'addr' parameter in config string"
-            ));
+            return missing_param_err("Missing 'addr' parameter in config string", &params);
         };
         let (host, port) = match addr.split_once(':') {
             Some((h, p)) => (h, p),
@@ -1884,41 +1909,21 @@ impl SenderBuilder {
         handle_http_params(&mut builder.http, &params)?;
 
         // user=  pass=  token=  token_x=  token_y=
-        handle_auth(&mut builder.auth, &protocol, &params)?;
+        handle_auth_params(&mut builder.auth, &protocol, &params)?;
 
-        // auto_flush=
-        if let Some(&auto_flush) = params.get("auto_flush") {
-            match auto_flush.as_str() {
-                "off" => {}
-                _ => {
-                    return config_err(format!(
-                        "Invalid auto_flush value '{auto_flush}'. This client does not \
-                        support auto-flush, so the only accepted value is 'off'"
-                    ));
-                }
-            }
-        }
-        // auto_flush_rows=
-        if params.get("auto_flush_rows").is_some() {
-            return config_err(
-                "Invalid configuration parameter 'auto_flush_rows'. \
-                This client does not support auto-flush",
-            );
-        }
-        // auto_flush_bytes=
-        if params.get("auto_flush_bytes").is_some() {
-            return config_err(
-                "Invalid configuration parameter 'auto_flush_bytes'. \
-                This client does not support auto-flush",
-            );
-        }
+        // auto_flush=  auto_flush_rows=  auto_flush_bytes=
+        handle_auto_flush_params(&params)?;
+
         // TODO: Handle init_buf_size and max_buf_size.
 
-        // TODO: report unrecognized params whenever there's a missing param. It
-        // will help the user resolve misspelled params.
-        report_unrecognized_params(params)?;
-
-        Ok(builder)
+        let unrecognized_params = unrecognized_params(&params);
+        if unrecognized_params.is_empty() {
+            Ok(builder)
+        } else {
+            config_err(format!(
+                "Configuration string contains unrecognized parameters: {unrecognized_params:?}"
+            ))
+        }
     }
 
     /// Create a new `SenderBuilder` instance from the
@@ -2481,6 +2486,20 @@ where
         .map_err(|e| config_error(format!("{e:?}")))
 }
 
+fn missing_param_err<T, M: Into<String>>(msg: M, params: &HashMap<String, &String>) -> Result<T> {
+    let unrecognized_params = unrecognized_params(params);
+    let msg: String = msg.into();
+    let msg = if unrecognized_params.is_empty() {
+        msg
+    } else {
+        format!(
+            "{msg}. Hint: check the spelling of the parameters. \
+            These parameters weren't recognized: {unrecognized_params:?}"
+        )
+    };
+    config_err(msg)
+}
+
 fn config_err<T, M: Into<String>>(msg: M) -> Result<T> {
     Err(config_error(msg))
 }
@@ -2827,6 +2846,21 @@ mod tests {
 
     #[cfg(feature = "ilp-over-http")]
     #[test]
+    fn misspelled_basic_auth() {
+        assert_conf_err(
+            SenderBuilder::from_conf("http::addr=localhost;user=user123;password=pass321;"),
+            "Authentication parameter 'user' is present, but 'pass' is missing. \
+            Hint: check the spelling of the parameters. These parameters weren't recognized: [\"password\"]",
+        );
+        assert_conf_err(
+            SenderBuilder::from_conf("http::addr=localhost;username=user123;pass=pass321;"),
+            "Authentication parameter 'pass' is present, but 'user' is missing. \
+            Hint: check the spelling of the parameters. These parameters weren't recognized: [\"username\"]",
+        );
+    }
+
+    #[cfg(feature = "ilp-over-http")]
+    #[test]
     fn inconsistent_http_auth() {
         let expected_err_msg = "Inconsistent HTTP authentication parameters. \
             Specify either 'user' and 'pass', or just 'token'";
@@ -2881,6 +2915,16 @@ mod tests {
                 "tcp::addr=localhost;user=user123;token=token123;token_x=123;",
             ),
             expected_err_msg,
+        );
+    }
+
+    #[test]
+    fn misspelled_tcp_ecdsa_auth() {
+        assert_conf_err(
+            SenderBuilder::from_conf("tcp::addr=localhost;user=user123;tokenx=123;"),
+            "Incomplete ECDSA authentication parameters. \
+            Specify either all or none of: 'user', 'token', 'token_x', 'token_y'. \
+            Hint: check the spelling of the parameters. These parameters weren't recognized: [\"tokenx\"]"
         );
     }
 
