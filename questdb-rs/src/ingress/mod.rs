@@ -1984,7 +1984,7 @@ impl SenderBuilder {
     /// # }
     /// ```
     pub fn net_interface<I: Into<String>>(mut self, addr: I) -> Result<Self> {
-        self.ensure_selected_protocol("net_interface", SenderProtocol::IlpOverTcp)?;
+        self.ensure_specified_protocol("net_interface", SenderProtocol::IlpOverTcp)?;
         self.net_interface
             .set_specified("net_interface", Some(validate_value(addr)?))?;
         Ok(self)
@@ -2035,7 +2035,7 @@ impl SenderBuilder {
         C: Into<String>,
         D: Into<String>,
     {
-        self.ensure_selected_protocol("auth", SenderProtocol::IlpOverTcp)?;
+        self.ensure_specified_protocol("auth", SenderProtocol::IlpOverTcp)?;
         self.auth.set_specified(
             "auth",
             Some(AuthParams::Ecdsa(EcdsaAuthParams {
@@ -2058,7 +2058,7 @@ impl SenderBuilder {
         A: Into<String>,
         B: Into<String>,
     {
-        self.ensure_selected_protocol("basic_auth", SenderProtocol::IlpOverHttp)?;
+        self.ensure_specified_protocol("basic_auth", SenderProtocol::IlpOverHttp)?;
         self.auth.set_specified(
             "auth",
             Some(AuthParams::Basic(BasicAuthParams {
@@ -2078,7 +2078,7 @@ impl SenderBuilder {
     where
         A: Into<String>,
     {
-        self.ensure_selected_protocol("token_auth", SenderProtocol::IlpOverHttp)?;
+        self.ensure_specified_protocol("token_auth", SenderProtocol::IlpOverHttp)?;
         self.auth.set_specified(
             "auth",
             Some(AuthParams::Token(TokenAuthParams {
@@ -2470,17 +2470,17 @@ impl SenderBuilder {
         Ok(sender)
     }
 
-    fn ensure_selected_protocol(
-        &self,
+    fn ensure_specified_protocol(
+        &mut self,
         param_name: &str,
         required_protocol: SenderProtocol,
     ) -> Result<()> {
         match self.protocol {
             ConfigSetting::Specified(p) if p == required_protocol => Ok(()),
-            ConfigSetting::Defaulted(p) if p == required_protocol => config_err(format!(
-                "protocol {required_protocol:?} is selected by default, but in order to \
-                set {param_name}, you must select it explicitly."
-            )),
+            ConfigSetting::Defaulted(p) if p == required_protocol => {
+                self.protocol.set_specified("protocol", p)?;
+                Ok(())
+            }
             _ => config_err(format!(
                 "in order to set {param_name}, you must first select protocol {required_protocol:?}"
             )),
@@ -2747,38 +2747,44 @@ mod tests {
     #[test]
     fn http_simple() {
         let builder = assert_ok(SenderBuilder::from_conf("http::addr=localhost;"));
-        assert_specified_eq(builder.protocol, SenderProtocol::IlpOverHttp);
-        assert_specified_eq(builder.host, "localhost");
-        assert_specified_eq(builder.port, SenderProtocol::IlpOverHttp.default_port());
-        assert_specified_eq(builder.tls, Tls::Disabled);
+        assert_specified_eq(&builder.protocol, SenderProtocol::IlpOverHttp);
+        assert_specified_eq(&builder.host, "localhost");
+        assert_specified_eq(&builder.port, SenderProtocol::IlpOverHttp.default_port());
+        assert_specified_eq(&builder.tls, Tls::Disabled);
     }
 
     #[cfg(feature = "ilp-over-http")]
     #[test]
     fn https_simple() {
         let builder = assert_ok(SenderBuilder::from_conf("https::addr=localhost;"));
-        assert_specified_eq(builder.protocol, SenderProtocol::IlpOverHttp);
-        assert_specified_eq(builder.host, "localhost");
-        assert_specified_eq(builder.port, SenderProtocol::IlpOverHttp.default_port());
-        assert_specified_eq(builder.tls, Tls::Enabled(CertificateAuthority::WebpkiRoots));
+        assert_specified_eq(&builder.protocol, SenderProtocol::IlpOverHttp);
+        assert_specified_eq(&builder.host, "localhost");
+        assert_specified_eq(&builder.port, SenderProtocol::IlpOverHttp.default_port());
+        assert_specified_eq(
+            &builder.tls,
+            Tls::Enabled(CertificateAuthority::WebpkiRoots),
+        );
     }
 
     #[test]
     fn tcp_simple() {
         let builder = assert_ok(SenderBuilder::from_conf("tcp::addr=localhost;"));
-        assert_specified_eq(builder.protocol, SenderProtocol::IlpOverTcp);
-        assert_specified_eq(builder.port, SenderProtocol::IlpOverTcp.default_port());
-        assert_specified_eq(builder.host, "localhost");
-        assert_specified_eq(builder.tls, Tls::Disabled);
+        assert_specified_eq(&builder.protocol, SenderProtocol::IlpOverTcp);
+        assert_specified_eq(&builder.port, SenderProtocol::IlpOverTcp.default_port());
+        assert_specified_eq(&builder.host, "localhost");
+        assert_specified_eq(&builder.tls, Tls::Disabled);
     }
 
     #[test]
     fn tcps_simple() {
         let builder = assert_ok(SenderBuilder::from_conf("tcps::addr=localhost;"));
-        assert_specified_eq(builder.protocol, SenderProtocol::IlpOverTcp);
-        assert_specified_eq(builder.host, "localhost");
-        assert_specified_eq(builder.port, SenderProtocol::IlpOverTcp.default_port());
-        assert_specified_eq(builder.tls, Tls::Enabled(CertificateAuthority::WebpkiRoots));
+        assert_specified_eq(&builder.protocol, SenderProtocol::IlpOverTcp);
+        assert_specified_eq(&builder.host, "localhost");
+        assert_specified_eq(&builder.port, SenderProtocol::IlpOverTcp.default_port());
+        assert_specified_eq(
+            &builder.tls,
+            Tls::Enabled(CertificateAuthority::WebpkiRoots),
+        );
     }
 
     #[test]
@@ -2916,23 +2922,28 @@ mod tests {
     }
 
     #[test]
-    fn must_explicitly_select_tcp_to_set_auth() {
-        let builder = assert_ok(SenderBuilder::new("localhost", 9000));
+    fn cant_use_ecdsa_auth_with_http() {
+        let builder = assert_ok(SenderBuilder::from_conf("http::addr=localhost;"));
         assert_conf_err(
             builder.auth("key_id123", "priv_key123", "pub_key1", "pub_key2"),
-            "protocol IlpOverTcp is selected by default, but in order to \
-            set auth, you must select it explicitly.",
+            "in order to set auth, you must first select protocol IlpOverTcp",
         );
     }
 
     #[test]
-    fn must_explicitly_select_tcp_to_set_net_interface() {
-        let builder = assert_ok(SenderBuilder::new("localhost", 9000));
-        assert_conf_err(
-            builder.net_interface("55.88.0.4"),
-            "protocol IlpOverTcp is selected by default, but in order to \
-            set net_interface, you must select it explicitly.",
-        );
+    fn set_auth_specifies_tcp() {
+        let mut builder = assert_ok(SenderBuilder::new("localhost", 9000));
+        assert_defaulted_eq(&builder.protocol, SenderProtocol::IlpOverTcp);
+        builder = assert_ok(builder.auth("key_id123", "priv_key123", "pub_key1", "pub_key2"));
+        assert_specified_eq(&builder.protocol, SenderProtocol::IlpOverTcp);
+    }
+
+    #[test]
+    fn set_net_interface_specifies_tcp() {
+        let mut builder = assert_ok(SenderBuilder::new("localhost", 9000));
+        assert_defaulted_eq(&builder.protocol, SenderProtocol::IlpOverTcp);
+        builder = assert_ok(builder.net_interface("55.88.0.4"));
+        assert_specified_eq(&builder.protocol, SenderProtocol::IlpOverTcp);
     }
 
     #[test]
@@ -2994,7 +3005,10 @@ mod tests {
         let builder = assert_ok(SenderBuilder::from_conf(
             "tcps::addr=localhost;tls_verify=on;",
         ));
-        assert_specified_eq(builder.tls, Tls::Enabled(CertificateAuthority::WebpkiRoots));
+        assert_specified_eq(
+            &builder.tls,
+            Tls::Enabled(CertificateAuthority::WebpkiRoots),
+        );
     }
 
     #[cfg(feature = "insecure-skip-verify")]
@@ -3003,7 +3017,7 @@ mod tests {
         let builder = assert_ok(SenderBuilder::from_conf(
             "tcps::addr=localhost;tls_verify=unsafe_off;",
         ));
-        assert_specified_eq(builder.tls, Tls::InsecureSkipVerify);
+        assert_specified_eq(&builder.tls, Tls::InsecureSkipVerify);
     }
 
     #[test]
@@ -3019,7 +3033,10 @@ mod tests {
         let builder = assert_ok(SenderBuilder::from_conf(
             "tcps::addr=localhost;tls_roots=webpki;",
         ));
-        assert_specified_eq(builder.tls, Tls::Enabled(CertificateAuthority::WebpkiRoots));
+        assert_specified_eq(
+            &builder.tls,
+            Tls::Enabled(CertificateAuthority::WebpkiRoots),
+        );
     }
 
     #[cfg(feature = "tls-native-certs")]
@@ -3028,7 +3045,7 @@ mod tests {
         let builder = assert_ok(SenderBuilder::from_conf(
             "tcps::addr=localhost;tls_roots=os-certs;",
         ));
-        assert_specified_eq(builder.tls, Tls::Enabled(CertificateAuthority::OsRoots));
+        assert_specified_eq(&builder.tls, Tls::Enabled(CertificateAuthority::OsRoots));
     }
 
     #[test]
@@ -3038,7 +3055,7 @@ mod tests {
         ));
         let path = PathBuf::from_str("/home/questuser/cacerts.pem").unwrap();
         assert_specified_eq(
-            builder.tls,
+            &builder.tls,
             Tls::Enabled(CertificateAuthority::File {
                 path,
                 password: None,
@@ -3053,7 +3070,7 @@ mod tests {
         ));
         let path = PathBuf::from_str("/home/questuser/cacerts.pem").unwrap();
         assert_specified_eq(
-            builder.tls,
+            &builder.tls,
             Tls::Enabled(CertificateAuthority::File {
                 path,
                 password: Some("extremely_secure".to_string()),
@@ -3070,9 +3087,9 @@ mod tests {
         let Some(http_config) = builder.http else {
             panic!("Expected Some(HttpConfig)");
         };
-        assert_specified_eq(http_config.min_throughput, 100u64);
-        assert_defaulted_eq(http_config.grace_timeout, Duration::from_millis(5000));
-        assert_defaulted_eq(http_config.retry_timeout, Duration::from_millis(10000));
+        assert_specified_eq(&http_config.min_throughput, 100u64);
+        assert_defaulted_eq(&http_config.grace_timeout, Duration::from_millis(5000));
+        assert_defaulted_eq(&http_config.retry_timeout, Duration::from_millis(10000));
     }
 
     #[cfg(feature = "ilp-over-http")]
@@ -3084,9 +3101,9 @@ mod tests {
         let Some(http_config) = builder.http else {
             panic!("Expected Some(HttpConfig)");
         };
-        assert_defaulted_eq(http_config.min_throughput, 102400u64);
-        assert_specified_eq(http_config.grace_timeout, Duration::from_millis(100));
-        assert_defaulted_eq(http_config.retry_timeout, Duration::from_millis(10000));
+        assert_defaulted_eq(&http_config.min_throughput, 102400u64);
+        assert_specified_eq(&http_config.grace_timeout, Duration::from_millis(100));
+        assert_defaulted_eq(&http_config.retry_timeout, Duration::from_millis(10000));
     }
 
     #[cfg(feature = "ilp-over-http")]
@@ -3098,9 +3115,9 @@ mod tests {
         let Some(http_config) = builder.http else {
             panic!("Expected Some(HttpConfig)");
         };
-        assert_defaulted_eq(http_config.min_throughput, 102400u64);
-        assert_defaulted_eq(http_config.grace_timeout, Duration::from_millis(5000));
-        assert_specified_eq(http_config.retry_timeout, Duration::from_millis(100));
+        assert_defaulted_eq(&http_config.min_throughput, 102400u64);
+        assert_defaulted_eq(&http_config.grace_timeout, Duration::from_millis(5000));
+        assert_specified_eq(&http_config.retry_timeout, Duration::from_millis(100));
     }
 
     #[test]
@@ -3135,24 +3152,24 @@ mod tests {
     }
 
     fn assert_specified_eq<V: PartialEq + std::fmt::Debug, IntoV: Into<V>>(
-        actual: ConfigSetting<V>,
+        actual: &ConfigSetting<V>,
         expected: IntoV,
     ) {
         let expected = expected.into();
         if let ConfigSetting::Specified(actual_value) = actual {
-            assert_eq!(actual_value, expected);
+            assert_eq!(actual_value, &expected);
         } else {
             panic!("Expected Specified({:?}), but got {:?}", expected, actual);
         }
     }
 
     fn assert_defaulted_eq<V: PartialEq + std::fmt::Debug, IntoV: Into<V>>(
-        actual: ConfigSetting<V>,
+        actual: &ConfigSetting<V>,
         expected: IntoV,
     ) {
         let expected = expected.into();
         if let ConfigSetting::Defaulted(actual_value) = actual {
-            assert_eq!(actual_value, expected);
+            assert_eq!(actual_value, &expected);
         } else {
             panic!("Expected Defaulted({:?}), but got {:?}", expected, actual);
         }
