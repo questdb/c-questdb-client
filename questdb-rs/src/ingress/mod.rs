@@ -1347,7 +1347,7 @@ impl std::fmt::Debug for Sender {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(PartialEq, Debug, Clone)]
 struct EcdsaAuthParams {
     key_id: String,
     priv_key: String,
@@ -1355,7 +1355,7 @@ struct EcdsaAuthParams {
     pub_key_y: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(PartialEq, Debug, Clone)]
 enum AuthParams {
     Ecdsa(EcdsaAuthParams),
 

@@ -38,7 +38,7 @@ pub(crate) enum ConfigSetting<T> {
     Specified(T),
 }
 
-impl<T> ConfigSetting<T> {
+impl<T: PartialEq> ConfigSetting<T> {
     pub(crate) fn new_default(value: T) -> Self {
         ConfigSetting::Defaulted(value)
     }
@@ -51,14 +51,16 @@ impl<T> ConfigSetting<T> {
     /// Note that it can't be changed once set.
     /// Returns true if the value was updated, false if already specified.
     pub(crate) fn set_specified(&mut self, setting_name: &str, value: T) -> Result<()> {
-        if let ConfigSetting::Defaulted(_) = self {
-            *self = ConfigSetting::Specified(value);
-            Ok(())
-        } else {
-            Err(Error::new(
+        match self {
+            ConfigSetting::Defaulted(_) => {
+                *self = ConfigSetting::Specified(value);
+                Ok(())
+            }
+            ConfigSetting::Specified(curr_value) if *curr_value == value => Ok(()),
+            _ => Err(Error::new(
                 ErrorCode::ConfigError,
                 format!("{setting_name} is already specified"),
-            ))
+            )),
         }
     }
 }

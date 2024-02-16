@@ -62,9 +62,19 @@ fn unrecognized_param() {
 }
 
 #[test]
-fn specified_cant_change() {
+fn specified_is_idempotent() {
     let builder = assert_ok(SenderBuilder::from_conf("tcp::addr=localhost;"));
-    assert_conf_err(builder.tcp(), "protocol is already specified");
+    assert_ok(builder.tcp());
+}
+
+#[test]
+fn specified_cant_change() {
+    let mut builder = assert_ok(SenderBuilder::from_conf("tcp::addr=localhost;"));
+    builder = assert_ok(builder.net_interface("1.1.1.1"));
+    assert_conf_err(
+        builder.net_interface("1.1.1.2"),
+        "net_interface is already specified",
+    );
 }
 
 #[test]
@@ -150,7 +160,7 @@ fn misspelled_basic_auth() {
 #[test]
 fn inconsistent_http_auth() {
     let expected_err_msg = "Inconsistent HTTP authentication parameters. \
-            Specify either 'user' and 'pass', or just 'token'";
+    Specify either 'user' and 'pass', or just 'token'";
     assert_conf_err(
         SenderBuilder::from_conf("http::addr=localhost;user=user123;token=token123;"),
         expected_err_msg,
@@ -161,6 +171,7 @@ fn inconsistent_http_auth() {
     );
 }
 
+#[cfg(feature = "ilp-over-http")]
 #[test]
 fn cant_use_basic_auth_with_tcp() {
     let builder = assert_ok(SenderBuilder::new("localhost", 9000));
@@ -170,6 +181,7 @@ fn cant_use_basic_auth_with_tcp() {
     );
 }
 
+#[cfg(feature = "ilp-over-http")]
 #[test]
 fn cant_use_token_auth_with_tcp() {
     let builder = assert_ok(SenderBuilder::new("localhost", 9000));
@@ -179,6 +191,7 @@ fn cant_use_token_auth_with_tcp() {
     );
 }
 
+#[cfg(feature = "ilp-over-http")]
 #[test]
 fn cant_use_ecdsa_auth_with_http() {
     let builder = assert_ok(SenderBuilder::from_conf("http::addr=localhost;"));

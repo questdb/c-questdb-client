@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use super::conf::ConfigSetting;
 
-#[derive(Debug, Clone)]
+#[derive(PartialEq, Debug, Clone)]
 pub(super) struct BasicAuthParams {
     pub(super) username: String,
     pub(super) password: String,
@@ -22,7 +22,7 @@ impl BasicAuthParams {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(PartialEq, Debug, Clone)]
 pub(super) struct TokenAuthParams {
     pub(super) token: String,
 }
