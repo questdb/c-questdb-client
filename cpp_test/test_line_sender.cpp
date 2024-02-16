@@ -552,9 +552,14 @@ TEST_CASE("os certs")
 {
     // We're just checking these APIs don't throw.
     questdb::ingress::test::mock_server server;
-    questdb::ingress::opts opts{"localhost", server.port()};
-    opts.tls_os_roots();
-    opts.tls_webpki_and_os_roots();
+    {
+        questdb::ingress::opts opts{"localhost", server.port()};
+        opts.tls_os_roots();
+    }
+    {
+        questdb::ingress::opts opts{"localhost", server.port()};
+        opts.tls_webpki_and_os_roots();
+    }
 }
 
 TEST_CASE("Opts copy ctor, assignment and move testing.")
