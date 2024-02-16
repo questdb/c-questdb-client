@@ -27,7 +27,7 @@ use questdb::{
         TimestampNanos}};
 
 fn main() -> Result<()> {
-   let mut sender = SenderBuilder::new_tcp("localhost", 9009)?.build()?;
+   let mut sender = SenderBuilder::new("localhost", 9009)?.build()?;
    let mut buffer = Buffer::new();
    buffer
        .table("sensors")?

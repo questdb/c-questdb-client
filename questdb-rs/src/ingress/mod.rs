@@ -118,8 +118,10 @@
 //!
 //! # fn main() -> Result<()> {
 //! let mut sender = SenderBuilder::new("localhost", 9009)?
-//!     .tls(Tls::Enabled(CertificateAuthority::File(
-//!         PathBuf::from("/path/to/server_rootCA.pem"))))?
+//!     .tls(Tls::Enabled(CertificateAuthority::File {
+//!             path: PathBuf::from("/path/to/server_rootCA.pem"),
+//!             password: None
+//!         }))?
 //!     .build()?;
 //! # Ok(())
 //! # }
@@ -2131,8 +2133,10 @@ impl SenderBuilder {
     ///
     /// # fn main() -> Result<()> {
     /// let mut sender = SenderBuilder::new("localhost", 9009)?
-    ///     .tls(Tls::Enabled(CertificateAuthority::File(
-    ///         PathBuf::from("/path/to/server_rootCA.pem"))))?
+    ///     .tls(Tls::Enabled(CertificateAuthority::File {
+    ///         path: PathBuf::from("/path/to/server_rootCA.pem"),
+    ///         password: None
+    ///     }))?
     ///     .build()?;
     /// # Ok(())
     /// # }
