@@ -330,10 +330,12 @@ fn test_tls_with_file_ca() -> TestResult {
     ca_path.push("server_rootCA.pem");
 
     let server = MockServer::new()?;
-    let lsb = server.lsb_tcp()?.tls(Tls::Enabled(CertificateAuthority::File {
-        path: ca_path,
-        password: None,
-    }))?;
+    let lsb = server
+        .lsb_tcp()?
+        .tls(Tls::Enabled(CertificateAuthority::File {
+            path: ca_path,
+            password: None,
+        }))?;
     let server_jh = server.accept_tls();
     let mut sender = lsb.build()?;
     let mut server: MockServer = server_jh.join().unwrap()?;

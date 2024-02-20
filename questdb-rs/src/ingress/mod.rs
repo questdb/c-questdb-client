@@ -1826,7 +1826,6 @@ impl Display for SenderProtocol {
             SenderProtocol::IlpOverHttp => f.write_str("ILP/HTTP"),
         }
     }
-
 }
 
 impl SenderProtocol {
@@ -1978,7 +1977,11 @@ impl SenderBuilder {
         Self::from_conf(conf)
     }
 
-    fn new<H: Into<String>, P: Into<Port>>(host: H, port: P, protocol: SenderProtocol) -> Result<Self> {
+    fn new<H: Into<String>, P: Into<Port>>(
+        host: H,
+        port: P,
+        protocol: SenderProtocol,
+    ) -> Result<Self> {
         let host = validate_value(host)?;
         let port: Port = port.into();
         let port = validate_value(port.0)?;
@@ -2525,8 +2528,7 @@ impl SenderBuilder {
     ) -> Result<()> {
         if self.protocol == required_protocol {
             Ok(())
-        }
-        else {
+        } else {
             config_err(format!(
                 "The {param_name:?} setting can only be used with the {required_protocol} protocol."
             ))

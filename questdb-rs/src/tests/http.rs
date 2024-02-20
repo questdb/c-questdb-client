@@ -497,10 +497,7 @@ fn test_user_agent() -> TestResult {
     let buffer2 = buffer.clone();
 
     let mut server = MockServer::new()?;
-    let mut sender = server
-        .lsb_http()?
-        .user_agent("wallabies/1.2.99")?
-        .build()?;
+    let mut sender = server.lsb_http()?.user_agent("wallabies/1.2.99")?.build()?;
 
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
         server.accept()?;
