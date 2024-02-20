@@ -4,8 +4,8 @@ use crate::{error::Result, ErrorCode};
 #[cfg(feature = "ilp-over-http")]
 #[test]
 fn http_simple() {
-    let builder = assert_ok(SenderBuilder::from_conf("http::addr=localhost;"));
-    assert_specified_eq(&builder.protocol, SenderProtocol::IlpOverHttp);
+    let builder = SenderBuilder::from_conf("http::addr=localhost;").unwrap();
+    assert_eq!(builder.protocol, SenderProtocol::IlpOverHttp);
     assert_specified_eq(&builder.host, "localhost");
     assert_specified_eq(&builder.port, SenderProtocol::IlpOverHttp.default_port());
     assert_specified_eq(&builder.tls, Tls::Disabled);
@@ -14,8 +14,8 @@ fn http_simple() {
 #[cfg(feature = "ilp-over-http")]
 #[test]
 fn https_simple() {
-    let builder = assert_ok(SenderBuilder::from_conf("https::addr=localhost;"));
-    assert_specified_eq(&builder.protocol, SenderProtocol::IlpOverHttp);
+    let builder = SenderBuilder::from_conf("https::addr=localhost;").unwrap();
+    assert_eq!(builder.protocol, SenderProtocol::IlpOverHttp);
     assert_specified_eq(&builder.host, "localhost");
     assert_specified_eq(&builder.port, SenderProtocol::IlpOverHttp.default_port());
     assert_specified_eq(
@@ -26,8 +26,8 @@ fn https_simple() {
 
 #[test]
 fn tcp_simple() {
-    let builder = assert_ok(SenderBuilder::from_conf("tcp::addr=localhost;"));
-    assert_specified_eq(&builder.protocol, SenderProtocol::IlpOverTcp);
+    let builder = SenderBuilder::from_conf("tcp::addr=localhost;").unwrap();
+    assert_eq!(builder.protocol, SenderProtocol::IlpOverTcp);
     assert_specified_eq(&builder.port, SenderProtocol::IlpOverTcp.default_port());
     assert_specified_eq(&builder.host, "localhost");
     assert_specified_eq(&builder.tls, Tls::Disabled);
@@ -35,8 +35,8 @@ fn tcp_simple() {
 
 #[test]
 fn tcps_simple() {
-    let builder = assert_ok(SenderBuilder::from_conf("tcps::addr=localhost;"));
-    assert_specified_eq(&builder.protocol, SenderProtocol::IlpOverTcp);
+    let builder = SenderBuilder::from_conf("tcps::addr=localhost;").unwrap();
+    assert_eq!(builder.protocol, SenderProtocol::IlpOverTcp);
     assert_specified_eq(&builder.host, "localhost");
     assert_specified_eq(&builder.port, SenderProtocol::IlpOverTcp.default_port());
     assert_specified_eq(
@@ -62,15 +62,9 @@ fn unrecognized_param() {
 }
 
 #[test]
-fn specified_is_idempotent() {
-    let builder = assert_ok(SenderBuilder::from_conf("tcp::addr=localhost;"));
-    assert_ok(builder.tcp());
-}
-
-#[test]
 fn specified_cant_change() {
-    let mut builder = assert_ok(SenderBuilder::from_conf("tcp::addr=localhost;"));
-    builder = assert_ok(builder.net_interface("1.1.1.1"));
+    let mut builder = SenderBuilder::from_conf("tcp::addr=localhost;").unwrap();
+    builder = builder.net_interface("1.1.1.1").unwrap();
     assert_conf_err(
         builder.net_interface("1.1.1.2"),
         "net_interface is already specified",
@@ -96,9 +90,9 @@ fn unsupported_service() {
 #[cfg(feature = "ilp-over-http")]
 #[test]
 fn http_basic_auth() {
-    let builder = assert_ok(SenderBuilder::from_conf(
+    let builder = SenderBuilder::from_conf(
         "http::addr=localhost;user=user123;pass=pass321;",
-    ));
+    ).unwrap();
     let auth = assert_specified(builder.auth).expect("builder.auth was set to None");
     match auth {
         AuthParams::Basic(BasicAuthParams { username, password }) => {
@@ -114,9 +108,9 @@ fn http_basic_auth() {
 #[cfg(feature = "ilp-over-http")]
 #[test]
 fn http_token_auth() {
-    let builder = assert_ok(SenderBuilder::from_conf(
+    let builder = SenderBuilder::from_conf(
         "http::addr=localhost:9000;token=token123;",
-    ));
+    ).unwrap();
     let auth = assert_specified(builder.auth).expect("builder.auth was set to None");
     match auth {
         AuthParams::Token(TokenAuthParams { token }) => {
@@ -174,54 +168,53 @@ fn inconsistent_http_auth() {
 #[cfg(feature = "ilp-over-http")]
 #[test]
 fn cant_use_basic_auth_with_tcp() {
-    let builder = assert_ok(SenderBuilder::new("localhost", 9000));
+    let builder = SenderBuilder::new_tcp("localhost", 9000).unwrap();
     assert_conf_err(
         builder.basic_auth("user123", "pass321"),
-        "in order to set basic_auth, you must first select protocol IlpOverHttp",
+        "The \"basic_auth\" setting can only be used with the ILP/HTTP protocol."
     );
 }
 
 #[cfg(feature = "ilp-over-http")]
 #[test]
 fn cant_use_token_auth_with_tcp() {
-    let builder = assert_ok(SenderBuilder::new("localhost", 9000));
+    let builder = SenderBuilder::new_tcp("localhost", 9000).unwrap();
     assert_conf_err(
         builder.token_auth("token123"),
-        "in order to set token_auth, you must first select protocol IlpOverHttp",
+        "The \"token_auth\" setting can only be used with the ILP/HTTP protocol."
     );
 }
 
 #[cfg(feature = "ilp-over-http")]
 #[test]
 fn cant_use_ecdsa_auth_with_http() {
-    let builder = assert_ok(SenderBuilder::from_conf("http::addr=localhost;"));
+    let builder = SenderBuilder::from_conf("http::addr=localhost;").unwrap();
     assert_conf_err(
         builder.auth("key_id123", "priv_key123", "pub_key1", "pub_key2"),
-        "in order to set auth, you must first select protocol IlpOverTcp",
+        "The \"auth\" setting can only be used with the ILP/TCP protocol."
     );
 }
 
 #[test]
 fn set_auth_specifies_tcp() {
-    let mut builder = assert_ok(SenderBuilder::new("localhost", 9000));
-    assert_defaulted_eq(&builder.protocol, SenderProtocol::IlpOverTcp);
-    builder = assert_ok(builder.auth("key_id123", "priv_key123", "pub_key1", "pub_key2"));
-    assert_specified_eq(&builder.protocol, SenderProtocol::IlpOverTcp);
+    let mut builder = SenderBuilder::new_tcp("localhost", 9000).unwrap();
+    assert_eq!(builder.protocol, SenderProtocol::IlpOverTcp);
+    builder = builder.auth("key_id123", "priv_key123", "pub_key1", "pub_key2").unwrap();
+    assert_eq!(builder.protocol, SenderProtocol::IlpOverTcp);
 }
 
 #[test]
 fn set_net_interface_specifies_tcp() {
-    let mut builder = assert_ok(SenderBuilder::new("localhost", 9000));
-    assert_defaulted_eq(&builder.protocol, SenderProtocol::IlpOverTcp);
-    builder = assert_ok(builder.net_interface("55.88.0.4"));
-    assert_specified_eq(&builder.protocol, SenderProtocol::IlpOverTcp);
+    let builder = SenderBuilder::new_tcp("localhost", 9000).unwrap();
+    assert_eq!(builder.protocol, SenderProtocol::IlpOverTcp);
+    builder.net_interface("55.88.0.4").unwrap();
 }
 
 #[test]
 fn tcp_ecdsa_auth() {
-    let builder = assert_ok(SenderBuilder::from_conf(
+    let builder = SenderBuilder::from_conf(
         "tcp::addr=localhost:9000;user=user123;token=token123;token_x=xtok123;token_y=ytok123;",
-    ));
+    ).unwrap();
     let auth = assert_specified(builder.auth).expect("builder.auth was set to None");
     match auth {
         AuthParams::Ecdsa(EcdsaAuthParams {
@@ -271,9 +264,9 @@ fn misspelled_tcp_ecdsa_auth() {
 
 #[test]
 fn tcps_tls_verify_on() {
-    let builder = assert_ok(SenderBuilder::from_conf(
+    let builder = SenderBuilder::from_conf(
         "tcps::addr=localhost;tls_verify=on;",
-    ));
+    ).unwrap();
     assert_specified_eq(
         &builder.tls,
         Tls::Enabled(CertificateAuthority::WebpkiRoots),
@@ -283,9 +276,9 @@ fn tcps_tls_verify_on() {
 #[cfg(feature = "insecure-skip-verify")]
 #[test]
 fn tcps_tls_verify_unsafe_off() {
-    let builder = assert_ok(SenderBuilder::from_conf(
+    let builder = SenderBuilder::from_conf(
         "tcps::addr=localhost;tls_verify=unsafe_off;",
-    ));
+    ).unwrap();
     assert_specified_eq(&builder.tls, Tls::InsecureSkipVerify);
 }
 
@@ -299,9 +292,9 @@ fn tcps_tls_verify_invalid() {
 
 #[test]
 fn tcps_tls_roots_webpki() {
-    let builder = assert_ok(SenderBuilder::from_conf(
+    let builder = SenderBuilder::from_conf(
         "tcps::addr=localhost;tls_roots=webpki;",
-    ));
+    ).unwrap();
     assert_specified_eq(
         &builder.tls,
         Tls::Enabled(CertificateAuthority::WebpkiRoots),
@@ -311,17 +304,17 @@ fn tcps_tls_roots_webpki() {
 #[cfg(feature = "tls-native-certs")]
 #[test]
 fn tcps_tls_roots_os() {
-    let builder = assert_ok(SenderBuilder::from_conf(
+    let builder = SenderBuilder::from_conf(
         "tcps::addr=localhost;tls_roots=os-certs;",
-    ));
+    ).unwrap();
     assert_specified_eq(&builder.tls, Tls::Enabled(CertificateAuthority::OsRoots));
 }
 
 #[test]
 fn tcps_tls_roots_file() {
-    let builder = assert_ok(SenderBuilder::from_conf(
+    let builder = SenderBuilder::from_conf(
         "tcps::addr=localhost;tls_roots=/home/questuser/cacerts.pem;",
-    ));
+    ).unwrap();
     let path = PathBuf::from_str("/home/questuser/cacerts.pem").unwrap();
     assert_specified_eq(
         &builder.tls,
@@ -334,9 +327,9 @@ fn tcps_tls_roots_file() {
 
 #[test]
 fn tcps_tls_roots_file_with_password() {
-    let builder = assert_ok(SenderBuilder::from_conf(
+    let builder = SenderBuilder::from_conf(
         "tcps::addr=localhost;tls_roots=/home/questuser/cacerts.pem;tls_roots_password=extremely_secure;",
-    ));
+    ).unwrap();
     let path = PathBuf::from_str("/home/questuser/cacerts.pem").unwrap();
     assert_specified_eq(
         &builder.tls,
@@ -350,9 +343,9 @@ fn tcps_tls_roots_file_with_password() {
 #[cfg(feature = "ilp-over-http")]
 #[test]
 fn http_min_throughput() {
-    let builder = assert_ok(SenderBuilder::from_conf(
+    let builder = SenderBuilder::from_conf(
         "http::addr=localhost;min_throughput=100;",
-    ));
+    ).unwrap();
     let Some(http_config) = builder.http else {
         panic!("Expected Some(HttpConfig)");
     };
@@ -364,9 +357,9 @@ fn http_min_throughput() {
 #[cfg(feature = "ilp-over-http")]
 #[test]
 fn http_grace_timeout() {
-    let builder = assert_ok(SenderBuilder::from_conf(
+    let builder = SenderBuilder::from_conf(
         "http::addr=localhost;grace_timeout=100;",
-    ));
+    ).unwrap();
     let Some(http_config) = builder.http else {
         panic!("Expected Some(HttpConfig)");
     };
@@ -378,9 +371,9 @@ fn http_grace_timeout() {
 #[cfg(feature = "ilp-over-http")]
 #[test]
 fn http_retry_timeout() {
-    let builder = assert_ok(SenderBuilder::from_conf(
+    let builder = SenderBuilder::from_conf(
         "http::addr=localhost;retry_timeout=100;",
-    ));
+    ).unwrap();
     let Some(http_config) = builder.http else {
         panic!("Expected Some(HttpConfig)");
     };
@@ -391,9 +384,9 @@ fn http_retry_timeout() {
 
 #[test]
 fn auto_flush_off() {
-    assert_ok(SenderBuilder::from_conf(
+    SenderBuilder::from_conf(
         "tcps::addr=localhost;auto_flush=off;",
-    ));
+    ).unwrap();
 }
 
 #[test]
@@ -403,13 +396,6 @@ fn auto_flush_unsupported() {
         "Invalid auto_flush value 'on'. This client does not support \
             auto-flush, so the only accepted value is 'off'",
     );
-}
-
-fn assert_ok(result: Result<SenderBuilder>) -> SenderBuilder {
-    if let Err(err) = result {
-        panic!("Expected an Ok result, but got {:?}", err);
-    }
-    result.unwrap()
 }
 
 fn assert_specified<V: std::fmt::Debug>(actual: ConfigSetting<V>) -> V {

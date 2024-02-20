@@ -193,7 +193,7 @@ use core::time::Duration;
 use itoa;
 use std::collections::HashMap;
 use std::convert::{Infallible, TryFrom, TryInto};
-use std::fmt::{Formatter, Write};
+use std::fmt::{Display, Formatter, Write};
 use std::io::{self, BufRead, BufReader, ErrorKind, Write as IoWrite};
 use std::ops::Deref;
 use std::path::PathBuf;
@@ -1818,6 +1818,17 @@ pub(crate) enum SenderProtocol {
     IlpOverHttp,
 }
 
+impl Display for SenderProtocol {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
+        match self {
+            SenderProtocol::IlpOverTcp => f.write_str("ILP/TCP"),
+            #[cfg(feature = "ilp-over-http")]
+            SenderProtocol::IlpOverHttp => f.write_str("ILP/HTTP"),
+        }
+    }
+
+}
+
 impl SenderProtocol {
     fn default_port(&self) -> &str {
         match self {
@@ -1833,9 +1844,42 @@ impl SenderProtocol {
 /// ```no_run
 /// # use questdb::Result;
 /// use questdb::ingress::SenderBuilder;
+/// # fn main() -> Result<()> {
+/// let mut sender = SenderBuilder::new_http("localhost", 9009)?.build()?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// ```no_run
+/// # use questdb::Result;
+/// use questdb::ingress::SenderBuilder;
 ///
 /// # fn main() -> Result<()> {
-/// let mut sender = SenderBuilder::new("localhost", 9009)?.build()?;
+/// let mut sender = SenderBuilder::new_tcp("localhost", 9009)?.build()?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// or
+///
+/// ```no_run
+/// # use questdb::Result;
+/// use questdb::ingress::SenderBuilder;
+///
+/// # fn main() -> Result<()> {
+/// let mut sender = SenderBuilder::from_conf("https::addr=localhost:9009")?.build()?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// or
+///
+/// ```no_run
+/// # use questdb::Result;
+/// use questdb::ingress::SenderBuilder;
+///
+/// # fn main() -> Result<()> {
+/// let mut sender = SenderBuilder::from_env()?.build()?;
 /// # Ok(())
 /// # }
 /// ```
@@ -1848,13 +1892,13 @@ impl SenderProtocol {
 ///
 #[derive(Debug, Clone)]
 pub struct SenderBuilder {
+    protocol: SenderProtocol,
     read_timeout: ConfigSetting<Duration>,
     host: ConfigSetting<String>,
     port: ConfigSetting<String>,
     net_interface: ConfigSetting<Option<String>>,
     auth: ConfigSetting<Option<AuthParams>>,
     tls: ConfigSetting<Tls>,
-    protocol: ConfigSetting<SenderProtocol>,
 
     #[cfg(feature = "ilp-over-http")]
     http: Option<HttpConfig>,
@@ -1890,12 +1934,7 @@ impl SenderBuilder {
             Some((h, p)) => (h, p),
             None => (addr.as_str(), protocol.default_port()),
         };
-        let mut builder = SenderBuilder::new(host, port)?;
-        builder = match protocol {
-            SenderProtocol::IlpOverTcp => builder.tcp()?,
-            #[cfg(feature = "ilp-over-http")]
-            SenderProtocol::IlpOverHttp => builder.http()?,
-        };
+        let mut builder = SenderBuilder::new(host, port, protocol)?;
 
         // tls=  tls_verify=  tls_roots=  tls_roots_password=
         // TODO: no support in config string for WebPkiAndOsRoots
@@ -1939,19 +1978,7 @@ impl SenderBuilder {
         Self::from_conf(conf)
     }
 
-    /// Create a new `SenderBuilder` instance from the provided QuestDB
-    /// server and port. By default, it will use the TCP protocol.
-    ///
-    /// ```no_run
-    /// # use questdb::Result;
-    /// use questdb::ingress::SenderBuilder;
-    ///
-    /// # fn main() -> Result<()> {
-    /// let mut sender = SenderBuilder::new("localhost", 9009)?.build()?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn new<H: Into<String>, P: Into<Port>>(host: H, port: P) -> Result<Self> {
+    fn new<H: Into<String>, P: Into<Port>>(host: H, port: P, protocol: SenderProtocol) -> Result<Self> {
         let host = validate_value(host)?;
         let port: Port = port.into();
         let port = validate_value(port.0)?;
@@ -1962,10 +1989,47 @@ impl SenderBuilder {
             net_interface: ConfigSetting::new_default(None),
             auth: ConfigSetting::new_default(None),
             tls: ConfigSetting::new_default(Tls::Disabled),
-            protocol: ConfigSetting::new_default(SenderProtocol::IlpOverTcp),
+            protocol,
             #[cfg(feature = "ilp-over-http")]
-            http: None,
+            http: if protocol == SenderProtocol::IlpOverHttp {
+                Some(HttpConfig::default())
+            } else {
+                None
+            },
         })
+    }
+
+    /// Create a new `SenderBuilder` instance from the provided QuestDB
+    /// server and port using ILP over the TCP protocol.
+    ///
+    /// ```no_run
+    /// # use questdb::Result;
+    /// use questdb::ingress::SenderBuilder;
+    ///
+    /// # fn main() -> Result<()> {
+    /// let mut sender = SenderBuilder::new_tcp("localhost", 9009)?.build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn new_tcp<H: Into<String>, P: Into<Port>>(host: H, port: P) -> Result<Self> {
+        Self::new(host, port, SenderProtocol::IlpOverTcp)
+    }
+
+    /// Create a new `SenderBuilder` instance from the provided QuestDB
+    /// server and port using ILP over the TCP protocol.
+    ///
+    /// ```no_run
+    /// # use questdb::Result;
+    /// use questdb::ingress::SenderBuilder;
+    ///
+    /// # fn main() -> Result<()> {
+    /// let mut sender = SenderBuilder::new_tcp("localhost", 9009)?.build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "ilp-over-http")]
+    pub fn new_http<H: Into<String>, P: Into<Port>>(host: H, port: P) -> Result<Self> {
+        Self::new(host, port, SenderProtocol::IlpOverHttp)
     }
 
     /// Select local outbound interface.
@@ -2178,26 +2242,6 @@ impl SenderBuilder {
         Ok(self)
     }
 
-    /// Configure to the TCP protocol.
-    pub fn tcp(mut self) -> Result<Self> {
-        self.protocol
-            .set_specified("protocol", SenderProtocol::IlpOverTcp)?;
-        #[cfg(feature = "ilp-over-http")]
-        {
-            self.http = None;
-        }
-        Ok(self)
-    }
-
-    #[cfg(feature = "ilp-over-http")]
-    /// Configure to use the HTTP protocol.
-    pub fn http(mut self) -> Result<Self> {
-        self.protocol
-            .set_specified("protocol", SenderProtocol::IlpOverHttp)?;
-        self.http = Some(HttpConfig::default());
-        Ok(self)
-    }
-
     #[cfg(feature = "ilp-over-http")]
     /// Cumulative duration spent in retries.
     /// Default is 10 seconds.
@@ -2285,7 +2329,7 @@ impl SenderBuilder {
             Tls::InsecureSkipVerify => write!(descr, "tls=insecure_skip_verify,").unwrap(),
         }
 
-        let handler = match *self.protocol {
+        let handler = match self.protocol {
             SenderProtocol::IlpOverTcp => {
                 let addr: SockAddr =
                     gai::resolve_host_port(self.host.as_str(), self.port.as_str())?;
@@ -2479,15 +2523,13 @@ impl SenderBuilder {
         param_name: &str,
         required_protocol: SenderProtocol,
     ) -> Result<()> {
-        match self.protocol {
-            ConfigSetting::Specified(p) if p == required_protocol => Ok(()),
-            ConfigSetting::Defaulted(p) if p == required_protocol => {
-                self.protocol.set_specified("protocol", p)?;
-                Ok(())
-            }
-            _ => config_err(format!(
-                "in order to set {param_name}, you must first select protocol {required_protocol:?}"
-            )),
+        if self.protocol == required_protocol {
+            Ok(())
+        }
+        else {
+            config_err(format!(
+                "The {param_name:?} setting can only be used with the {required_protocol} protocol."
+            ))
         }
     }
 }

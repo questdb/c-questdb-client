@@ -41,7 +41,7 @@ use std::{io, time::SystemTime};
 #[test]
 fn test_basics() -> TestResult {
     let mut server = MockServer::new()?;
-    let mut sender = server.lsb()?.build()?;
+    let mut sender = server.lsb_tcp()?.build()?;
     assert!(!sender.must_close());
     server.accept()?;
 
@@ -206,7 +206,7 @@ fn test_bad_key(
 ) -> TestResult {
     let server = MockServer::new()?;
     let lsb = server
-        .lsb()?
+        .lsb_tcp()?
         .auth("testUser1", priv_key, pub_key_x, pub_key_y)?;
     let sender = lsb.build();
 
@@ -330,7 +330,7 @@ fn test_tls_with_file_ca() -> TestResult {
     ca_path.push("server_rootCA.pem");
 
     let server = MockServer::new()?;
-    let lsb = server.lsb()?.tls(Tls::Enabled(CertificateAuthority::File {
+    let lsb = server.lsb_tcp()?.tls(Tls::Enabled(CertificateAuthority::File {
         path: ca_path,
         password: None,
     }))?;
@@ -362,7 +362,7 @@ fn test_tls_to_plain_server() -> TestResult {
 
     let mut server = MockServer::new()?;
     let lsb = server
-        .lsb()?
+        .lsb_tcp()?
         .read_timeout(Duration::from_millis(500))?
         .tls(Tls::Enabled(CertificateAuthority::File {
             path: ca_path,
@@ -406,7 +406,7 @@ fn expect_eventual_disconnect(sender: &mut Sender) {
 fn test_plain_to_tls_server() -> TestResult {
     let server = MockServer::new()?;
     let lsb = server
-        .lsb()?
+        .lsb_tcp()?
         .read_timeout(Duration::from_millis(500))?
         .tls(Tls::Disabled)?;
     let server_jh = server.accept_tls();
@@ -431,7 +431,7 @@ fn test_plain_to_tls_server() -> TestResult {
 #[test]
 fn test_tls_insecure_skip_verify() -> TestResult {
     let server = MockServer::new()?;
-    let lsb = server.lsb()?.tls(Tls::InsecureSkipVerify)?;
+    let lsb = server.lsb_tcp()?.tls(Tls::InsecureSkipVerify)?;
     let server_jh = server.accept_tls();
     let mut sender = lsb.build()?;
     let mut server: MockServer = server_jh.join().unwrap()?;

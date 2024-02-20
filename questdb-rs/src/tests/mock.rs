@@ -543,7 +543,11 @@ impl MockServer {
         self.recv(0.1)
     }
 
-    pub fn lsb(&self) -> crate::error::Result<SenderBuilder> {
-        SenderBuilder::new(self.host, self.port)
+    pub fn lsb_tcp(&self) -> crate::error::Result<SenderBuilder> {
+        SenderBuilder::new_tcp(self.host, self.port)
+    }
+
+    pub fn lsb_http(&self) -> crate::error::Result<SenderBuilder> {
+        SenderBuilder::new_http(self.host, self.port)
     }
 }
