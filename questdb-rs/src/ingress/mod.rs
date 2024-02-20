@@ -43,7 +43,7 @@
 //!         TimestampNanos}};
 //!
 //! fn main() -> Result<()> {
-//!    let mut sender = SenderBuilder::new("localhost", 9009)?.build()?;
+//!    let mut sender = SenderBuilder::new_tcp("localhost", 9009)?.build()?;
 //!    let mut buffer = Buffer::new();
 //!    buffer
 //!        .table("sensors")?
@@ -89,7 +89,7 @@
 //!
 //! # fn main() -> Result<()> {
 //! // See: https://questdb.io/docs/reference/api/ilp/authenticate
-//! let mut sender = SenderBuilder::new("localhost", 9009)?
+//! let mut sender = SenderBuilder::new_tcp("localhost", 9009)?
 //!     .auth(
 //!         "testUser1",                                    // kid
 //!         "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48",  // d
@@ -117,7 +117,7 @@
 //! use questdb::ingress::{SenderBuilder, Tls, CertificateAuthority};
 //!
 //! # fn main() -> Result<()> {
-//! let mut sender = SenderBuilder::new("localhost", 9009)?
+//! let mut sender = SenderBuilder::new_tcp("localhost", 9009)?
 //!     .tls(Tls::Enabled(CertificateAuthority::File {
 //!             path: PathBuf::from("/path/to/server_rootCA.pem"),
 //!             password: None
@@ -1840,14 +1840,24 @@ impl SenderProtocol {
 
 /// Accumulate parameters for a new `Sender` instance.
 ///
-/// ```no_run
-/// # use questdb::Result;
-/// use questdb::ingress::SenderBuilder;
-/// # fn main() -> Result<()> {
-/// let mut sender = SenderBuilder::new_http("localhost", 9009)?.build()?;
-/// # Ok(())
-/// # }
-/// ```
+/// The `SenderBuilder` can be created either for ILP/TCP or ILP/HTTP (with the "ilp-over-http"
+/// feature enabled).
+///
+/// It can also be created from a config string or the `QDB_CLIENT_CONF` environment variable.
+///
+#[cfg_attr(
+    feature = "ilp-over-http",
+    doc = r##"
+```no_run
+# use questdb::Result;
+use questdb::ingress::SenderBuilder;
+# fn main() -> Result<()> {
+let mut sender = SenderBuilder::new_http("localhost", 9009)?.build()?;
+# Ok(())
+# }
+```
+"##
+)]
 ///
 /// ```no_run
 /// # use questdb::Result;
@@ -1859,8 +1869,6 @@ impl SenderProtocol {
 /// # }
 /// ```
 ///
-/// or
-///
 /// ```no_run
 /// # use questdb::Result;
 /// use questdb::ingress::SenderBuilder;
@@ -1870,8 +1878,6 @@ impl SenderProtocol {
 /// # Ok(())
 /// # }
 /// ```
-///
-/// or
 ///
 /// ```no_run
 /// # use questdb::Result;
@@ -2046,7 +2052,7 @@ impl SenderBuilder {
     /// # use questdb::Result;
     /// # use questdb::ingress::SenderBuilder;
     /// # fn main() -> Result<()> {
-    /// let mut sender = SenderBuilder::new("localhost", 9009)?
+    /// let mut sender = SenderBuilder::new_tcp("localhost", 9009)?
     ///     .net_interface("0.0.0.0")?
     ///     .build()?;
     /// # Ok(())
@@ -2077,7 +2083,7 @@ impl SenderBuilder {
     /// # use questdb::Result;
     /// # use questdb::ingress::SenderBuilder;
     /// # fn main() -> Result<()> {
-    /// let mut sender = SenderBuilder::new("localhost", 9009)?
+    /// let mut sender = SenderBuilder::new_tcp("localhost", 9009)?
     ///     .auth(
     ///         "testUser1",                                    // kid
     ///         "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48",  // d
@@ -2166,7 +2172,7 @@ impl SenderBuilder {
     /// # use questdb::ingress::SenderBuilder;
     /// # use questdb::ingress::Tls;
     /// # fn main() -> Result<()> {
-    /// let mut sender = SenderBuilder::new("localhost", 9009)?
+    /// let mut sender = SenderBuilder::new_tcp("localhost", 9009)?
     ///     .tls(Tls::Disabled)?
     ///     .build()?;
     /// # Ok(())
@@ -2182,7 +2188,7 @@ impl SenderBuilder {
     /// use questdb::ingress::CertificateAuthority;
     ///
     /// # fn main() -> Result<()> {
-    /// let mut sender = SenderBuilder::new("localhost", 9009)?
+    /// let mut sender = SenderBuilder::new_tcp("localhost", 9009)?
     ///     .tls(Tls::Enabled(CertificateAuthority::WebpkiRoots))?
     ///     .build()?;
     /// # Ok(())
@@ -2199,7 +2205,7 @@ impl SenderBuilder {
     /// use std::path::PathBuf;
     ///
     /// # fn main() -> Result<()> {
-    /// let mut sender = SenderBuilder::new("localhost", 9009)?
+    /// let mut sender = SenderBuilder::new_tcp("localhost", 9009)?
     ///     .tls(Tls::Enabled(CertificateAuthority::File {
     ///         path: PathBuf::from("/path/to/server_rootCA.pem"),
     ///         password: None
@@ -2213,7 +2219,7 @@ impl SenderBuilder {
     /// `insecure-skip-verify` feature to skip the certificate verification:
     ///
     /// ```ignore
-    /// let mut sender = SenderBuilder::new("localhost", 9009)?
+    /// let mut sender = SenderBuilder::new_tcp("localhost", 9009)?
     ///    .tls(Tls::InsecureSkipVerify)?
     ///    .build()?;
     /// ```
@@ -2234,7 +2240,7 @@ impl SenderBuilder {
     /// use std::time::Duration;
     ///
     /// # fn main() -> Result<()> {
-    /// let mut sender = SenderBuilder::new("localhost", 9009)?
+    /// let mut sender = SenderBuilder::new_tcp("localhost", 9009)?
     ///    .read_timeout(Duration::from_secs(15))?
     ///    .build()?;
     /// # Ok(())

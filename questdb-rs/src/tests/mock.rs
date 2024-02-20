@@ -547,6 +547,7 @@ impl MockServer {
         SenderBuilder::new_tcp(self.host, self.port)
     }
 
+    #[cfg(feature = "ilp-over-http")]
     pub fn lsb_http(&self) -> crate::error::Result<SenderBuilder> {
         SenderBuilder::new_http(self.host, self.port)
     }

@@ -228,6 +228,7 @@ fn tcp_ecdsa_auth() {
             assert_eq!(pub_key_x, "xtok123");
             assert_eq!(pub_key_y, "ytok123");
         }
+        #[cfg(feature = "ilp-over-http")]
         _ => {
             panic!("Expected AuthParams::Ecdsa");
         }
@@ -402,6 +403,7 @@ fn assert_specified_eq<V: PartialEq + std::fmt::Debug, IntoV: Into<V>>(
     }
 }
 
+#[cfg(feature = "ilp-over-http")]
 fn assert_defaulted_eq<V: PartialEq + std::fmt::Debug, IntoV: Into<V>>(
     actual: &ConfigSetting<V>,
     expected: IntoV,
