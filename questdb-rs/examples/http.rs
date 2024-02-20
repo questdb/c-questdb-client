@@ -7,7 +7,8 @@ use questdb::{
 fn main() -> Result<()> {
     let mut sender = SenderBuilder::new_http("localhost", 9000)?
         .tls(Tls::Enabled(CertificateAuthority::WebpkiRoots))?
-        .basic_auth("foo", "bar")?
+        .user("foo")?
+        .pass("bar")?
         .build()?;
     let mut buffer = Buffer::new();
     buffer

@@ -33,7 +33,7 @@ use crate::{Error, ErrorCode, Result};
 ///   or to a user-specified value.
 /// * A user-specified value can't be changed once set.
 #[derive(Debug, Clone)]
-pub(crate) enum ConfigSetting<T> {
+pub(crate) enum ConfigSetting<T: PartialEq> {
     Defaulted(T),
     Specified(T),
 }
@@ -65,7 +65,7 @@ impl<T: PartialEq> ConfigSetting<T> {
     }
 }
 
-impl<T> Deref for ConfigSetting<T> {
+impl<T: PartialEq> Deref for ConfigSetting<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {

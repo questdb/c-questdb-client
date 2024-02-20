@@ -300,7 +300,8 @@ fn test_http_basic_auth() -> TestResult {
     let mut server = MockServer::new()?;
     let mut sender = server
         .lsb_http()?
-        .basic_auth("Aladdin", "OpenSesame")?
+        .user("Aladdin")?
+        .pass("OpenSesame")?
         .build()?;
 
     let buffer2 = buffer.clone();
@@ -391,7 +392,7 @@ fn test_token_auth() -> TestResult {
         .at_now()?;
 
     let mut server = MockServer::new()?;
-    let mut sender = server.lsb_http()?.token_auth("0123456789")?.build()?;
+    let mut sender = server.lsb_http()?.token("0123456789")?.build()?;
 
     let buffer2 = buffer.clone();
     let server_thread = std::thread::spawn(move || -> io::Result<()> {

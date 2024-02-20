@@ -47,13 +47,9 @@ fn test_basics() -> TestResult {
 
     assert_eq!(server.recv_q()?, 0);
 
-    let ts = std::time::SystemTime::now();
-    let ts_micros_num = ts
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)?
-        .as_micros() as i64;
-    let ts_nanos_num = ts
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)?
-        .as_nanos() as i64;
+    let ts = SystemTime::now();
+    let ts_micros_num = ts.duration_since(SystemTime::UNIX_EPOCH)?.as_micros() as i64;
+    let ts_nanos_num = ts.duration_since(SystemTime::UNIX_EPOCH)?.as_nanos() as i64;
     let ts_micros = TimestampMicros::from_systemtime(ts)?;
     assert_eq!(ts_micros.as_i64(), ts_micros_num);
     let ts_nanos = TimestampNanos::from_systemtime(ts)?;
@@ -207,7 +203,10 @@ fn test_bad_key(
     let server = MockServer::new()?;
     let lsb = server
         .lsb_tcp()?
-        .auth("testUser1", priv_key, pub_key_x, pub_key_y)?;
+        .user("testUser1")?
+        .token(priv_key)?
+        .token_x(pub_key_x)?
+        .token_y(pub_key_y)?;
     let sender = lsb.build();
 
     match sender {

@@ -90,11 +90,10 @@
 //! # fn main() -> Result<()> {
 //! // See: https://questdb.io/docs/reference/api/ilp/authenticate
 //! let mut sender = SenderBuilder::new_tcp("localhost", 9009)?
-//!     .auth(
-//!         "testUser1",                                    // kid
-//!         "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48",  // d
-//!         "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU",  // x
-//!         "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac")?  // y
+//!     .user("testUser1")? // kid
+//!     .token("5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48")? // d
+//!     .token_x("fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU")? // x
+//!     .token_y("Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac")? // y
 //!     .tls(Tls::Enabled(CertificateAuthority::WebpkiRoots))?
 //!     .build()?;
 //! # Ok(())
@@ -193,7 +192,7 @@ use core::time::Duration;
 use itoa;
 use std::collections::HashMap;
 use std::convert::{Infallible, TryFrom, TryInto};
-use std::fmt::{Display, Formatter, Write};
+use std::fmt::{Debug, Display, Formatter, Write};
 use std::io::{self, BufRead, BufReader, ErrorKind, Write as IoWrite};
 use std::ops::Deref;
 use std::path::PathBuf;
@@ -1635,84 +1634,84 @@ fn handle_tls_config(params: &HashMap<String, &String>) -> Result<Tls> {
     Ok(Tls::Enabled(roots))
 }
 
-fn handle_auth_params(
-    auth: &mut ConfigSetting<Option<AuthParams>>,
-    protocol: &SenderProtocol,
-    params: &HashMap<String, &String>,
-) -> Result<()> {
-    match protocol {
-        SenderProtocol::IlpOverTcp => {
-            match (
-                params.get("user"),
-                params.get("token"),
-                params.get("token_x"),
-                params.get("token_y"),
-            ) {
-                (Some(key_id), Some(priv_key), Some(pub_key_x), Some(pub_key_y)) => {
-                    auth.set_specified(
-                        "auth",
-                        Some(AuthParams::Ecdsa(EcdsaAuthParams {
-                            key_id: key_id.to_string(),
-                            priv_key: priv_key.to_string(),
-                            pub_key_x: pub_key_x.to_string(),
-                            pub_key_y: pub_key_y.to_string(),
-                        })),
-                    )?;
-                }
-                (None, None, None, None) => {}
-                (_, _, _, _) => return missing_param_err(
-                    "Incomplete ECDSA authentication parameters. Specify either all or none of: \
-                    'user', 'token', 'token_x', 'token_y'",
-                    params,
-                ),
-            }
-        }
-
-        #[cfg(feature = "ilp-over-http")]
-        SenderProtocol::IlpOverHttp => {
-            match (params.get("user"), params.get("pass"), params.get("token")) {
-                (Some(username), Some(password), None) => {
-                    auth.set_specified(
-                        "auth",
-                        Some(AuthParams::Basic(BasicAuthParams {
-                            username: username.to_string(),
-                            password: password.to_string(),
-                        })),
-                    )?;
-                }
-                (None, None, Some(token)) => {
-                    auth.set_specified(
-                        "auth",
-                        Some(AuthParams::Token(TokenAuthParams {
-                            token: token.to_string(),
-                        })),
-                    )?;
-                }
-                (None, None, None) => {}
-                (Some(_), None, None) => {
-                    return missing_param_err(
-                        "Authentication parameter 'user' is present, but 'pass' is missing",
-                        params,
-                    );
-                }
-                (None, Some(_), None) => {
-                    return missing_param_err(
-                        "Authentication parameter 'pass' is present, but 'user' is missing",
-                        params,
-                    );
-                }
-                (_, _, _) => {
-                    return missing_param_err(
-                        "Inconsistent HTTP authentication parameters. \
-                        Specify either 'user' and 'pass', or just 'token'",
-                        params,
-                    );
-                }
-            }
-        }
-    }
-    Ok(())
-}
+// fn handle_auth_params(
+//     auth: &mut ConfigSetting<Option<AuthParams>>,
+//     protocol: &SenderProtocol,
+//     params: &HashMap<String, &String>,
+// ) -> Result<()> {
+//     match protocol {
+//         SenderProtocol::IlpOverTcp => {
+//             match (
+//                 params.get("user"),
+//                 params.get("token"),
+//                 params.get("token_x"),
+//                 params.get("token_y"),
+//             ) {
+//                 (Some(key_id), Some(priv_key), Some(pub_key_x), Some(pub_key_y)) => {
+//                     auth.set_specified(
+//                         "auth",
+//                         Some(AuthParams::Ecdsa(EcdsaAuthParams {
+//                             key_id: key_id.to_string(),
+//                             priv_key: priv_key.to_string(),
+//                             pub_key_x: pub_key_x.to_string(),
+//                             pub_key_y: pub_key_y.to_string(),
+//                         })),
+//                     )?;
+//                 }
+//                 (None, None, None, None) => {}
+//                 (_, _, _, _) => return missing_param_err(
+//                     "Incomplete ECDSA authentication parameters. Specify either all or none of: \
+//                     'user', 'token', 'token_x', 'token_y'",
+//                     params,
+//                 ),
+//             }
+//         }
+//
+//         #[cfg(feature = "ilp-over-http")]
+//         SenderProtocol::IlpOverHttp => {
+//             match (params.get("user"), params.get("pass"), params.get("token")) {
+//                 (Some(username), Some(password), None) => {
+//                     auth.set_specified(
+//                         "auth",
+//                         Some(AuthParams::Basic(BasicAuthParams {
+//                             username: username.to_string(),
+//                             password: password.to_string(),
+//                         })),
+//                     )?;
+//                 }
+//                 (None, None, Some(token)) => {
+//                     auth.set_specified(
+//                         "auth",
+//                         Some(AuthParams::Token(TokenAuthParams {
+//                             token: token.to_string(),
+//                         })),
+//                     )?;
+//                 }
+//                 (None, None, None) => {}
+//                 (Some(_), None, None) => {
+//                     return missing_param_err(
+//                         "Authentication parameter 'user' is present, but 'pass' is missing",
+//                         params,
+//                     );
+//                 }
+//                 (None, Some(_), None) => {
+//                     return missing_param_err(
+//                         "Authentication parameter 'pass' is present, but 'user' is missing",
+//                         params,
+//                     );
+//                 }
+//                 (_, _, _) => {
+//                     return missing_param_err(
+//                         "Inconsistent HTTP authentication parameters. \
+//                         Specify either 'user' and 'pass', or just 'token'",
+//                         params,
+//                     );
+//                 }
+//             }
+//         }
+//     }
+//     Ok(())
+// }
 
 #[cfg(feature = "ilp-over-http")]
 fn handle_http_params(
@@ -1778,33 +1777,6 @@ fn handle_auto_flush_params(params: &HashMap<String, &String>) -> Result<()> {
         );
     }
     Ok(())
-}
-
-fn unrecognized_params(params: &HashMap<String, &String>) -> Vec<String> {
-    let recognized_params = vec![
-        "addr",
-        "user",
-        "pass",
-        "token",
-        "token_x",
-        "token_y",
-        "auto_flush",
-        "auto_flush_rows",
-        "auto_flush_bytes",
-        "min_throughput",
-        "grace_timeout",
-        "retry_timeout",
-        "init_buf_size",
-        "max_buf_size",
-        "tls_verify",
-        "tls_roots",
-        "tls_roots_password",
-    ];
-    params
-        .keys()
-        .filter(|p| !recognized_params.contains(&p.as_str()))
-        .cloned()
-        .collect::<Vec<_>>()
 }
 
 /// Protocol used to communicate with the QuestDB server.
@@ -1902,7 +1874,11 @@ pub struct SenderBuilder {
     host: ConfigSetting<String>,
     port: ConfigSetting<String>,
     net_interface: ConfigSetting<Option<String>>,
-    auth: ConfigSetting<Option<AuthParams>>,
+    user: ConfigSetting<Option<String>>,
+    pass: ConfigSetting<Option<String>>,
+    token: ConfigSetting<Option<String>>,
+    token_x: ConfigSetting<Option<String>>,
+    token_y: ConfigSetting<Option<String>>,
     tls: ConfigSetting<Tls>,
 
     #[cfg(feature = "ilp-over-http")]
@@ -1933,7 +1909,7 @@ impl SenderBuilder {
 
         // addr=
         let Some(addr) = params.get("addr") else {
-            return missing_param_err("Missing 'addr' parameter in config string", &params);
+            return config_err("Missing \"addr\" parameter in config string");
         };
         let (host, port) = match addr.split_once(':') {
             Some((h, p)) => (h, p),
@@ -1951,12 +1927,23 @@ impl SenderBuilder {
             builder.tls.set_specified("tls", Tls::Disabled)?;
         }
 
+        let auth_params = ["user", "pass", "token", "token_x", "token_y"];
+        for &param_name in auth_params.iter() {
+            if let Some(val) = params.get(param_name) {
+                builder = match param_name {
+                    "user" => builder.user(val)?,
+                    "pass" => builder.pass(val)?,
+                    "token" => builder.token(val)?,
+                    "token_x" => builder.token_x(val)?,
+                    "token_y" => builder.token_y(val)?,
+                    _ => unreachable!(),
+                };
+            }
+        }
+
         // min_throughput=  grace_timeout=  retry_timeout=
         #[cfg(feature = "ilp-over-http")]
         handle_http_params(&mut builder.http, &params)?;
-
-        // user=  pass=  token=  token_x=  token_y=
-        handle_auth_params(&mut builder.auth, &protocol, &params)?;
 
         // auto_flush=  auto_flush_rows=  auto_flush_bytes=
         handle_auto_flush_params(&params)?;
@@ -1964,14 +1951,7 @@ impl SenderBuilder {
         // TODO: Handle init_buf_size and max_buf_size.
         // TODO: read_timeout, net_interface can't be set via config string.
 
-        let unrecognized_params = unrecognized_params(&params);
-        if unrecognized_params.is_empty() {
-            Ok(builder)
-        } else {
-            config_err(format!(
-                "Configuration string contains unrecognized parameters: {unrecognized_params:?}"
-            ))
-        }
+        Ok(builder)
     }
 
     /// Create a new `SenderBuilder` instance from the
@@ -1988,7 +1968,7 @@ impl SenderBuilder {
         port: P,
         protocol: SenderProtocol,
     ) -> Result<Self> {
-        let host = validate_value(host)?;
+        let host = validate_value(host.into())?;
         let port: Port = port.into();
         let port = validate_value(port.0)?;
         Ok(Self {
@@ -1996,7 +1976,11 @@ impl SenderBuilder {
             host: ConfigSetting::new_specified(host),
             port: ConfigSetting::new_specified(port),
             net_interface: ConfigSetting::new_default(None),
-            auth: ConfigSetting::new_default(None),
+            user: ConfigSetting::new_default(None),
+            pass: ConfigSetting::new_default(None),
+            token: ConfigSetting::new_default(None),
+            token_x: ConfigSetting::new_default(None),
+            token_y: ConfigSetting::new_default(None),
             tls: ConfigSetting::new_default(Tls::Disabled),
             protocol,
             #[cfg(feature = "ilp-over-http")]
@@ -2061,107 +2045,58 @@ impl SenderBuilder {
     pub fn net_interface<I: Into<String>>(mut self, addr: I) -> Result<Self> {
         self.ensure_specified_protocol("net_interface", SenderProtocol::IlpOverTcp)?;
         self.net_interface
-            .set_specified("net_interface", Some(validate_value(addr)?))?;
+            .set_specified("net_interface", Some(validate_value(addr.into())?))?;
         Ok(self)
     }
 
-    /// ECDSA Authentication Parameters for ILP over TCP.
-    /// For HTTP, use [`basic_auth`](SenderBuilder::basic_auth).
-    ///
-    /// If not called, authentication is disabled for ILP over TCP.
-    ///
-    /// # Arguments
-    /// * `key_id` - Key identifier, AKA "kid" in JWT. This is sometimes
-    ///   referred to as the username.
-    /// * `priv_key` - Private key, AKA "d" in JWT.
-    /// * `pub_key_x` - X coordinate of the public key, AKA "x" in JWT.
-    /// * `pub_key_y` - Y coordinate of the public key, AKA "y" in JWT.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use questdb::Result;
-    /// # use questdb::ingress::SenderBuilder;
-    /// # fn main() -> Result<()> {
-    /// let mut sender = SenderBuilder::new_tcp("localhost", 9009)?
-    ///     .auth(
-    ///         "testUser1",                                    // kid
-    ///         "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48",  // d
-    ///         "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU",  // x
-    ///         "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac")?  // y
-    ///     .build()?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    ///
-    /// Follow the QuestDB [authentication
-    /// documentation](https://questdb.io/docs/reference/api/ilp/authenticate)
-    /// for instructions on generating keys.
-    pub fn auth<A, B, C, D>(
-        mut self,
-        key_id: A,
-        priv_key: B,
-        pub_key_x: C,
-        pub_key_y: D,
-    ) -> Result<Self>
-    where
-        A: Into<String>,
-        B: Into<String>,
-        C: Into<String>,
-        D: Into<String>,
-    {
-        self.ensure_specified_protocol("auth", SenderProtocol::IlpOverTcp)?;
-        self.auth.set_specified(
-            "auth",
-            Some(AuthParams::Ecdsa(EcdsaAuthParams {
-                key_id: validate_value(key_id)?,
-                priv_key: validate_value(priv_key)?,
-                pub_key_x: validate_value(pub_key_x)?,
-                pub_key_y: validate_value(pub_key_y)?,
-            })),
-        )?;
+    pub fn user(mut self, user: &str) -> Result<Self> {
+        self.user
+            .set_specified("user", Some(validate_value(user.to_string())?))?;
         Ok(self)
     }
 
-    /// Basic Authentication Parameters for ILP over HTTP.
-    /// For TCP, use [`auth`](SenderBuilder::auth).
-    ///
-    /// For HTTP you can also use [`token_auth`](SenderBuilder::token_auth).
-    #[cfg(feature = "ilp-over-http")]
-    pub fn basic_auth<A, B>(mut self, username: A, password: B) -> Result<Self>
-    where
-        A: Into<String>,
-        B: Into<String>,
-    {
-        self.ensure_specified_protocol("basic_auth", SenderProtocol::IlpOverHttp)?;
-        self.auth.set_specified(
-            "auth",
-            Some(AuthParams::Basic(BasicAuthParams {
-                username: validate_value(username)?,
-                password: validate_value(password)?,
-            })),
-        )?;
+    pub fn pass(mut self, pass: &str) -> Result<Self> {
+        self.pass
+            .set_specified("pass", Some(validate_value(pass.to_string())?))?;
         Ok(self)
     }
 
-    /// Token (Bearer) Authentication Parameters for ILP over HTTP.
-    /// For TCP, use [`auth`](SenderBuilder::auth).
-    ///
-    /// For HTTP you can also use [`basic_auth`](SenderBuilder::basic_auth).
-    #[cfg(feature = "ilp-over-http")]
-    pub fn token_auth<A>(mut self, token: A) -> Result<Self>
-    where
-        A: Into<String>,
-    {
-        self.ensure_specified_protocol("token_auth", SenderProtocol::IlpOverHttp)?;
-        self.auth.set_specified(
-            "auth",
-            Some(AuthParams::Token(TokenAuthParams {
-                token: validate_value(token)?,
-            })),
-        )?;
+    pub fn token(mut self, token: &str) -> Result<Self> {
+        self.token
+            .set_specified("token", Some(validate_value(token.to_string())?))?;
         Ok(self)
     }
+
+    pub fn token_x(mut self, token_x: &str) -> Result<Self> {
+        self.token_x
+            .set_specified("token_x", Some(validate_value(token_x.to_string())?))?;
+        Ok(self)
+    }
+
+    pub fn token_y(mut self, token_y: &str) -> Result<Self> {
+        self.token_y
+            .set_specified("token_y", Some(validate_value(token_y.to_string())?))?;
+        Ok(self)
+    }
+
+    // /// Token (Bearer) Authentication Parameters for ILP over HTTP.
+    // /// For TCP, use [`auth`](SenderBuilder::auth).
+    // ///
+    // /// For HTTP you can also use [`basic_auth`](SenderBuilder::basic_auth).
+    // #[cfg(feature = "ilp-over-http")]
+    // pub fn token_auth<A>(mut self, token: A) -> Result<Self>
+    // where
+    //     A: Into<String>,
+    // {
+    //     self.ensure_specified_protocol("token_auth", SenderProtocol::IlpOverHttp)?;
+    //     self.auth.set_specified(
+    //         "auth",
+    //         Some(AuthParams::Token(TokenAuthParams {
+    //             token: validate_value(token)?,
+    //         })),
+    //     )?;
+    //     Ok(self)
+    // }
 
     /// Configure TLS handshake.
     ///
@@ -2321,6 +2256,173 @@ impl SenderBuilder {
         Ok(self)
     }
 
+    fn connect_tcp(&self, auth: &Option<AuthParams>) -> Result<ProtocolHandler> {
+        let addr: SockAddr = gai::resolve_host_port(self.host.as_str(), self.port.as_str())?;
+        let mut sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
+            .map_err(|io_err| map_io_to_socket_err("Could not open TCP socket: ", io_err))?;
+
+        // See: https://idea.popcount.org/2014-04-03-bind-before-connect/
+        // We set `SO_REUSEADDR` on the outbound socket to avoid issues where a client may exhaust
+        // their interface's ports. See: https://github.com/questdb/py-questdb-client/issues/21
+        sock.set_reuse_address(true)
+            .map_err(|io_err| map_io_to_socket_err("Could not set SO_REUSEADDR: ", io_err))?;
+
+        sock.set_linger(Some(Duration::from_secs(120)))
+            .map_err(|io_err| map_io_to_socket_err("Could not set socket linger: ", io_err))?;
+        sock.set_keepalive(true)
+            .map_err(|io_err| map_io_to_socket_err("Could not set SO_KEEPALIVE: ", io_err))?;
+        sock.set_nodelay(true)
+            .map_err(|io_err| map_io_to_socket_err("Could not set TCP_NODELAY: ", io_err))?;
+        if let Some(ref host) = self.net_interface.deref() {
+            let bind_addr = gai::resolve_host(host.as_str())?;
+            sock.bind(&bind_addr).map_err(|io_err| {
+                map_io_to_socket_err(
+                    &format!("Could not bind to interface address {:?}: ", host),
+                    io_err,
+                )
+            })?;
+        }
+        sock.connect(&addr).map_err(|io_err| {
+            let host_port = format!("{}:{}", self.host.deref(), *self.port);
+            let prefix = format!("Could not connect to {:?}: ", host_port);
+            map_io_to_socket_err(&prefix, io_err)
+        })?;
+
+        // We read during both TLS handshake and authentication.
+        // We set up a read timeout to prevent the client from "hanging"
+        // should we be connecting to a server configured in a different way
+        // from the client.
+        sock.set_read_timeout(Some(*self.read_timeout))
+            .map_err(|io_err| {
+                map_io_to_socket_err("Failed to set read timeout on socket: ", io_err)
+            })?;
+
+        let mut conn = match configure_tls(&self.tls)? {
+            Some(tls_config) => {
+                let server_name: ServerName = ServerName::try_from(self.host.as_str())
+                    .map_err(|inv_dns_err| error::fmt!(TlsError, "Bad host: {}", inv_dns_err))?
+                    .to_owned();
+                let mut tls_conn =
+                    ClientConnection::new(tls_config, server_name).map_err(|rustls_err| {
+                        error::fmt!(TlsError, "Could not create TLS client: {}", rustls_err)
+                    })?;
+                while tls_conn.wants_write() || tls_conn.is_handshaking() {
+                    tls_conn.complete_io(&mut sock).map_err(|io_err| {
+                        if (io_err.kind() == ErrorKind::TimedOut)
+                            || (io_err.kind() == ErrorKind::WouldBlock)
+                        {
+                            error::fmt!(
+                                TlsError,
+                                concat!(
+                                    "Failed to complete TLS handshake:",
+                                    " Timed out waiting for server ",
+                                    "response after {:?}."
+                                ),
+                                *self.read_timeout
+                            )
+                        } else {
+                            error::fmt!(TlsError, "Failed to complete TLS handshake: {}", io_err)
+                        }
+                    })?;
+                }
+                Connection::Tls(StreamOwned::new(tls_conn, sock).into())
+            }
+            None => Connection::Direct(sock),
+        };
+
+        if let Some(AuthParams::Ecdsa(auth)) = auth {
+            conn.authenticate(auth)?;
+        }
+
+        Ok(ProtocolHandler::Socket(conn))
+    }
+
+    fn build_auth(&self) -> Result<Option<AuthParams>> {
+        match (
+            self.protocol,
+            self.user.deref(),
+            self.pass.deref(),
+            self.token.deref(),
+            self.token_x.deref(),
+            self.token_y.deref(),
+        ) {
+            (_, None, None, None, None, None) => Ok(None),
+            (
+                SenderProtocol::IlpOverTcp,
+                Some(user),
+                None,
+                Some(token),
+                Some(token_x),
+                Some(token_y),
+            ) => Ok(Some(AuthParams::Ecdsa(EcdsaAuthParams {
+                key_id: user.to_string(),
+                priv_key: token.to_string(),
+                pub_key_x: token_x.to_string(),
+                pub_key_y: token_y.to_string(),
+            }))),
+            (SenderProtocol::IlpOverTcp, Some(_user), Some(_pass), None, None, None) => {
+                config_err(
+                    r##"The "basic_auth" setting can only be used with the ILP/HTTP protocol."##,
+                )
+            }
+            (SenderProtocol::IlpOverTcp, None, None, Some(_token), None, None) => {
+                config_err("Token authentication only be used with the ILP/HTTP protocol.")
+            }
+            (SenderProtocol::IlpOverTcp, _user, None, _token, _token_x, _token_y) => {
+                config_err(
+                    r##"Incomplete ECDSA authentication parameters. Specify either all or none of: "user", "token", "token_x", "token_y"."##,
+                )
+            }
+            #[cfg(feature = "ilp-over-http")]
+            (SenderProtocol::IlpOverHttp, Some(user), Some(pass), None, None, None) => {
+                Ok(Some(AuthParams::Basic(BasicAuthParams {
+                    username: user.to_string(),
+                    password: pass.to_string(),
+                })))
+            }
+            #[cfg(feature = "ilp-over-http")]
+            (SenderProtocol::IlpOverHttp, Some(_user), None, None, None, None) => {
+                config_err(
+                    r##"Basic authentication parameter "user" is present, but "pass" is missing."##,
+                )
+            }
+            #[cfg(feature = "ilp-over-http")]
+            (SenderProtocol::IlpOverHttp, None, Some(_pass), None, None, None) => {
+                config_err(
+                    r##"Basic authentication parameter "pass" is present, but "user" is missing."##,
+                )
+            }
+            #[cfg(feature = "ilp-over-http")]
+            (SenderProtocol::IlpOverHttp, None, None, Some(token), None, None) => {
+                Ok(Some(AuthParams::Token(TokenAuthParams {
+                    token: token.to_string(),
+                })))
+            }
+            #[cfg(feature = "ilp-over-http")]
+            (
+                SenderProtocol::IlpOverHttp,
+                Some(_user),
+                None,
+                Some(_token),
+                Some(_token_x),
+                Some(_token_y),
+            ) => {
+                config_err("ECDSA authentication is only available with ILP/TCP and not available with ILP/HTTP.")
+            }
+            #[cfg(feature = "ilp-over-http")]
+            (SenderProtocol::IlpOverHttp, _user, _pass, _token, None, None) => {
+                config_err(
+                    r##"Inconsistent HTTP authentication parameters. Specify either "user" and "pass", or just "token"."##,
+                )
+            }
+            _ => {
+                config_err(
+                    r##"Incomplete authentication parameters. Check "user", "pass", "token", "token_x" and "token_y" parameters are set correctly."##,
+                )
+            }
+        }
+    }
+
     /// Build the sender.
     ///
     /// In case of TCP, this synchronously establishes the TCP connection, and
@@ -2338,96 +2440,10 @@ impl SenderBuilder {
             Tls::InsecureSkipVerify => write!(descr, "tls=insecure_skip_verify,").unwrap(),
         }
 
+        let auth = self.build_auth()?;
+
         let handler = match self.protocol {
-            SenderProtocol::IlpOverTcp => {
-                let addr: SockAddr =
-                    gai::resolve_host_port(self.host.as_str(), self.port.as_str())?;
-                let mut sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
-                    .map_err(|io_err| {
-                        map_io_to_socket_err("Could not open TCP socket: ", io_err)
-                    })?;
-
-                // See: https://idea.popcount.org/2014-04-03-bind-before-connect/
-                // We set `SO_REUSEADDR` on the outbound socket to avoid issues where a client may exhaust
-                // their interface's ports. See: https://github.com/questdb/py-questdb-client/issues/21
-                sock.set_reuse_address(true).map_err(|io_err| {
-                    map_io_to_socket_err("Could not set SO_REUSEADDR: ", io_err)
-                })?;
-
-                sock.set_linger(Some(Duration::from_secs(120)))
-                    .map_err(|io_err| {
-                        map_io_to_socket_err("Could not set socket linger: ", io_err)
-                    })?;
-                sock.set_keepalive(true).map_err(|io_err| {
-                    map_io_to_socket_err("Could not set SO_KEEPALIVE: ", io_err)
-                })?;
-                sock.set_nodelay(true).map_err(|io_err| {
-                    map_io_to_socket_err("Could not set TCP_NODELAY: ", io_err)
-                })?;
-                if let Some(ref host) = self.net_interface.deref() {
-                    let bind_addr = gai::resolve_host(host.as_str())?;
-                    sock.bind(&bind_addr).map_err(|io_err| {
-                        map_io_to_socket_err(
-                            &format!("Could not bind to interface address {:?}: ", host),
-                            io_err,
-                        )
-                    })?;
-                }
-                sock.connect(&addr).map_err(|io_err| {
-                    let host_port = format!("{}:{}", self.host.deref(), *self.port);
-                    let prefix = format!("Could not connect to {:?}: ", host_port);
-                    map_io_to_socket_err(&prefix, io_err)
-                })?;
-
-                // We read during both TLS handshake and authentication.
-                // We set up a read timeout to prevent the client from "hanging"
-                // should we be connecting to a server configured in a different way
-                // from the client.
-                sock.set_read_timeout(Some(*self.read_timeout))
-                    .map_err(|io_err| {
-                        map_io_to_socket_err("Failed to set read timeout on socket: ", io_err)
-                    })?;
-
-                ProtocolHandler::Socket(match configure_tls(&self.tls)? {
-                    Some(tls_config) => {
-                        let server_name: ServerName = ServerName::try_from(self.host.as_str())
-                            .map_err(|inv_dns_err| {
-                                error::fmt!(TlsError, "Bad host: {}", inv_dns_err)
-                            })?
-                            .to_owned();
-                        let mut tls_conn = ClientConnection::new(tls_config, server_name).map_err(
-                            |rustls_err| {
-                                error::fmt!(TlsError, "Could not create TLS client: {}", rustls_err)
-                            },
-                        )?;
-                        while tls_conn.wants_write() || tls_conn.is_handshaking() {
-                            tls_conn.complete_io(&mut sock).map_err(|io_err| {
-                                if (io_err.kind() == ErrorKind::TimedOut)
-                                    || (io_err.kind() == ErrorKind::WouldBlock)
-                                {
-                                    error::fmt!(
-                                        TlsError,
-                                        concat!(
-                                            "Failed to complete TLS handshake:",
-                                            " Timed out waiting for server ",
-                                            "response after {:?}."
-                                        ),
-                                        *self.read_timeout
-                                    )
-                                } else {
-                                    error::fmt!(
-                                        TlsError,
-                                        "Failed to complete TLS handshake: {}",
-                                        io_err
-                                    )
-                                }
-                            })?;
-                        }
-                        Connection::Tls(StreamOwned::new(tls_conn, sock).into())
-                    }
-                    None => Connection::Direct(sock),
-                })
-            }
+            SenderProtocol::IlpOverTcp => self.connect_tcp(&auth)?,
             #[cfg(feature = "ilp-over-http")]
             SenderProtocol::IlpOverHttp => {
                 if self.net_interface.is_some() {
@@ -2452,9 +2468,9 @@ impl SenderBuilder {
                     Some(tls_config) => agent_builder.tls_config(tls_config),
                     None => agent_builder,
                 };
-                let auth = match self.auth.deref().clone() {
-                    Some(AuthParams::Basic(auth)) => Some(auth.to_header_string()),
-                    Some(AuthParams::Token(auth)) => Some(auth.to_header_string()?),
+                let auth = match auth {
+                    Some(AuthParams::Basic(ref auth)) => Some(auth.to_header_string()),
+                    Some(AuthParams::Token(ref auth)) => Some(auth.to_header_string()?),
                     Some(AuthParams::Ecdsa(_)) => {
                         return Err(error::fmt!(
                             AuthError,
@@ -2486,44 +2502,18 @@ impl SenderBuilder {
             }
         };
 
-        if self.auth.is_some() {
+        if auth.is_some() {
             descr.push_str("auth=on]");
         } else {
             descr.push_str("auth=off]");
         }
-        let mut sender = Sender {
+
+        let sender = Sender {
             descr,
             handler,
             connected: true,
         };
-        if let Some(auth) = self.auth.as_ref() {
-            #[allow(irrefutable_let_patterns)]
-            if let ProtocolHandler::Socket(conn) = &mut sender.handler {
-                match auth {
-                    AuthParams::Ecdsa(auth) => {
-                        conn.authenticate(auth)?;
-                    }
 
-                    #[cfg(feature = "ilp-over-http")]
-                    AuthParams::Basic(_auth) => {
-                        return Err(error::fmt!(
-                            AuthError,
-                            "Basic authentication is not supported for ILP over TCP. \
-                            Please use ECDSA authentication instead."
-                        ));
-                    }
-
-                    #[cfg(feature = "ilp-over-http")]
-                    AuthParams::Token(_auth) => {
-                        return Err(error::fmt!(
-                            AuthError,
-                            "Token authentication is not supported for ILP over TCP. \
-                            Please use ECDSA authentication instead."
-                        ));
-                    }
-                }
-            }
-        }
         Ok(sender)
     }
 
@@ -2542,14 +2532,16 @@ impl SenderBuilder {
     }
 }
 
-fn validate_value<V: Into<String>>(value_str: V) -> Result<String> {
-    let value_str: String = value_str.into();
-    for (p, c) in value_str.chars().enumerate() {
+/// When parsing from config, we exclude certain characters.
+/// Here we repeat the same validation logic for consistency.
+fn validate_value<T: AsRef<str>>(value: T) -> Result<T> {
+    let str_ref = value.as_ref();
+    for (p, c) in str_ref.chars().enumerate() {
         if matches!(c, '\u{0}'..='\u{1f}' | '\u{7f}'..='\u{9f}') {
-            return config_err(format!("Invalid character at position {p}"));
+            return config_err(format!("Invalid character {c:?} at position {p}"));
         }
     }
-    Ok(value_str)
+    Ok(value)
 }
 
 #[cfg(feature = "ilp-over-http")]
@@ -2561,20 +2553,6 @@ where
     str_value
         .parse()
         .map_err(|e| config_error(format!("{e:?}")))
-}
-
-fn missing_param_err<T, M: Into<String>>(msg: M, params: &HashMap<String, &String>) -> Result<T> {
-    let unrecognized_params = unrecognized_params(params);
-    let msg: String = msg.into();
-    let msg = if unrecognized_params.is_empty() {
-        msg
-    } else {
-        format!(
-            "{msg}. Hint: check the spelling of the parameters. \
-            These parameters weren't recognized: {unrecognized_params:?}"
-        )
-    };
-    config_err(msg)
 }
 
 fn config_err<T, M: Into<String>>(msg: M) -> Result<T> {

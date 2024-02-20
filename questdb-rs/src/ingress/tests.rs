@@ -54,14 +54,6 @@ fn invalid_value() {
 }
 
 #[test]
-fn unrecognized_param() {
-    assert_conf_err(
-        SenderBuilder::from_conf("tcp::addr=localhost;quest=db;"),
-        "Configuration string contains unrecognized parameters: [\"quest\"]",
-    );
-}
-
-#[test]
 fn specified_cant_change() {
     let mut builder = SenderBuilder::from_conf("tcp::addr=localhost;").unwrap();
     builder = builder.net_interface("1.1.1.1").unwrap();
@@ -75,7 +67,7 @@ fn specified_cant_change() {
 fn missing_addr() {
     assert_conf_err(
         SenderBuilder::from_conf("tcp::"),
-        "Missing 'addr' parameter in config string",
+        "Missing \"addr\" parameter in config string",
     );
 }
 
@@ -92,8 +84,8 @@ fn unsupported_service() {
 fn http_basic_auth() {
     let builder =
         SenderBuilder::from_conf("http::addr=localhost;user=user123;pass=pass321;").unwrap();
-    let auth = assert_specified(builder.auth).expect("builder.auth was set to None");
-    match auth {
+    let auth = builder.build_auth().unwrap();
+    match auth.unwrap() {
         AuthParams::Basic(BasicAuthParams { username, password }) => {
             assert_eq!(username, "user123");
             assert_eq!(password, "pass321");
@@ -108,8 +100,8 @@ fn http_basic_auth() {
 #[test]
 fn http_token_auth() {
     let builder = SenderBuilder::from_conf("http::addr=localhost:9000;token=token123;").unwrap();
-    let auth = assert_specified(builder.auth).expect("builder.auth was set to None");
-    match auth {
+    let auth = builder.build_auth().unwrap();
+    match auth.unwrap() {
         AuthParams::Token(TokenAuthParams { token }) => {
             assert_eq!(token, "token123");
         }
@@ -123,12 +115,16 @@ fn http_token_auth() {
 #[test]
 fn incomplete_basic_auth() {
     assert_conf_err(
-        SenderBuilder::from_conf("http::addr=localhost;user=user123;"),
-        "Authentication parameter 'user' is present, but 'pass' is missing",
+        SenderBuilder::from_conf("http::addr=localhost;user=user123;")
+            .unwrap()
+            .build(),
+        "Basic authentication parameter \"user\" is present, but \"pass\" is missing.",
     );
     assert_conf_err(
-        SenderBuilder::from_conf("http::addr=localhost;pass=pass321;"),
-        "Authentication parameter 'pass' is present, but 'user' is missing",
+        SenderBuilder::from_conf("http::addr=localhost;pass=pass321;")
+            .unwrap()
+            .build(),
+        "Basic authentication parameter \"pass\" is present, but \"user\" is missing.",
     );
 }
 
@@ -136,28 +132,25 @@ fn incomplete_basic_auth() {
 #[test]
 fn misspelled_basic_auth() {
     assert_conf_err(
-        SenderBuilder::from_conf("http::addr=localhost;user=user123;password=pass321;"),
-        "Authentication parameter 'user' is present, but 'pass' is missing. \
-            Hint: check the spelling of the parameters. These parameters weren't recognized: [\"password\"]",
+        Sender::from_conf("http::addr=localhost;user=user123;password=pass321;"),
+        r##"Basic authentication parameter "user" is present, but "pass" is missing."##,
     );
     assert_conf_err(
-        SenderBuilder::from_conf("http::addr=localhost;username=user123;pass=pass321;"),
-        "Authentication parameter 'pass' is present, but 'user' is missing. \
-            Hint: check the spelling of the parameters. These parameters weren't recognized: [\"username\"]",
+        Sender::from_conf("http::addr=localhost;username=user123;pass=pass321;"),
+        r##"Basic authentication parameter "pass" is present, but "user" is missing."##,
     );
 }
 
 #[cfg(feature = "ilp-over-http")]
 #[test]
 fn inconsistent_http_auth() {
-    let expected_err_msg = "Inconsistent HTTP authentication parameters. \
-    Specify either 'user' and 'pass', or just 'token'";
+    let expected_err_msg = r##"Inconsistent HTTP authentication parameters. Specify either "user" and "pass", or just "token"."##;
     assert_conf_err(
-        SenderBuilder::from_conf("http::addr=localhost;user=user123;token=token123;"),
+        Sender::from_conf("http::addr=localhost;user=user123;token=token123;"),
         expected_err_msg,
     );
     assert_conf_err(
-        SenderBuilder::from_conf("http::addr=localhost;pass=pass321;token=token123;"),
+        Sender::from_conf("http::addr=localhost;pass=pass321;token=token123;"),
         expected_err_msg,
     );
 }
@@ -165,9 +158,14 @@ fn inconsistent_http_auth() {
 #[cfg(feature = "ilp-over-http")]
 #[test]
 fn cant_use_basic_auth_with_tcp() {
-    let builder = SenderBuilder::new_tcp("localhost", 9000).unwrap();
+    let builder = SenderBuilder::new_tcp("localhost", 9000)
+        .unwrap()
+        .user("user123")
+        .unwrap()
+        .pass("pass321")
+        .unwrap();
     assert_conf_err(
-        builder.basic_auth("user123", "pass321"),
+        builder.build_auth(),
         "The \"basic_auth\" setting can only be used with the ILP/HTTP protocol.",
     );
 }
@@ -175,20 +173,32 @@ fn cant_use_basic_auth_with_tcp() {
 #[cfg(feature = "ilp-over-http")]
 #[test]
 fn cant_use_token_auth_with_tcp() {
-    let builder = SenderBuilder::new_tcp("localhost", 9000).unwrap();
+    let builder = SenderBuilder::new_tcp("localhost", 9000)
+        .unwrap()
+        .token("token123")
+        .unwrap();
     assert_conf_err(
-        builder.token_auth("token123"),
-        "The \"token_auth\" setting can only be used with the ILP/HTTP protocol.",
+        builder.build_auth(),
+        "Token authentication only be used with the ILP/HTTP protocol.",
     );
 }
 
 #[cfg(feature = "ilp-over-http")]
 #[test]
 fn cant_use_ecdsa_auth_with_http() {
-    let builder = SenderBuilder::from_conf("http::addr=localhost;").unwrap();
+    let builder = SenderBuilder::from_conf("http::addr=localhost;")
+        .unwrap()
+        .user("key_id123")
+        .unwrap()
+        .token("priv_key123")
+        .unwrap()
+        .token_x("pub_key1")
+        .unwrap()
+        .token_y("pub_key2")
+        .unwrap();
     assert_conf_err(
-        builder.auth("key_id123", "priv_key123", "pub_key1", "pub_key2"),
-        "The \"auth\" setting can only be used with the ILP/TCP protocol.",
+        builder.build_auth(),
+        "ECDSA authentication is only available with ILP/TCP and not available with ILP/HTTP.",
     );
 }
 
@@ -197,7 +207,13 @@ fn set_auth_specifies_tcp() {
     let mut builder = SenderBuilder::new_tcp("localhost", 9000).unwrap();
     assert_eq!(builder.protocol, SenderProtocol::IlpOverTcp);
     builder = builder
-        .auth("key_id123", "priv_key123", "pub_key1", "pub_key2")
+        .user("key_id123")
+        .unwrap()
+        .token("priv_key123")
+        .unwrap()
+        .token_x("pub_key1")
+        .unwrap()
+        .token_y("pub_key2")
         .unwrap();
     assert_eq!(builder.protocol, SenderProtocol::IlpOverTcp);
 }
@@ -215,8 +231,8 @@ fn tcp_ecdsa_auth() {
         "tcp::addr=localhost:9000;user=user123;token=token123;token_x=xtok123;token_y=ytok123;",
     )
     .unwrap();
-    let auth = assert_specified(builder.auth).expect("builder.auth was set to None");
-    match auth {
+    let auth = builder.build_auth().unwrap();
+    match auth.unwrap() {
         AuthParams::Ecdsa(EcdsaAuthParams {
             key_id,
             priv_key,
@@ -237,18 +253,23 @@ fn tcp_ecdsa_auth() {
 
 #[test]
 fn incomplete_tcp_ecdsa_auth() {
-    let expected_err_msg = "Incomplete ECDSA authentication parameters. \
-            Specify either all or none of: 'user', 'token', 'token_x', 'token_y'";
+    let expected_err_msg = r##"Incomplete ECDSA authentication parameters. Specify either all or none of: "user", "token", "token_x", "token_y"."##;
     assert_conf_err(
-        SenderBuilder::from_conf("tcp::addr=localhost;user=user123;"),
+        SenderBuilder::from_conf("tcp::addr=localhost;user=user123;")
+            .unwrap()
+            .build(),
         expected_err_msg,
     );
     assert_conf_err(
-        SenderBuilder::from_conf("tcp::addr=localhost;user=user123;token=token123;"),
+        SenderBuilder::from_conf("tcp::addr=localhost;user=user123;token=token123;")
+            .unwrap()
+            .build(),
         expected_err_msg,
     );
     assert_conf_err(
-        SenderBuilder::from_conf("tcp::addr=localhost;user=user123;token=token123;token_x=123;"),
+        SenderBuilder::from_conf("tcp::addr=localhost;user=user123;token=token123;token_x=123;")
+            .unwrap()
+            .build(),
         expected_err_msg,
     );
 }
@@ -256,10 +277,8 @@ fn incomplete_tcp_ecdsa_auth() {
 #[test]
 fn misspelled_tcp_ecdsa_auth() {
     assert_conf_err(
-        SenderBuilder::from_conf("tcp::addr=localhost;user=user123;tokenx=123;"),
-        "Incomplete ECDSA authentication parameters. \
-            Specify either all or none of: 'user', 'token', 'token_x', 'token_y'. \
-            Hint: check the spelling of the parameters. These parameters weren't recognized: [\"tokenx\"]"
+        Sender::from_conf("tcp::addr=localhost;user=user123;tokenx=123;"),
+        "Incomplete ECDSA authentication parameters. Specify either all or none of: \"user\", \"token\", \"token_x\", \"token_y\"."
     );
 }
 
@@ -383,15 +402,7 @@ fn auto_flush_unsupported() {
     );
 }
 
-fn assert_specified<V: std::fmt::Debug>(actual: ConfigSetting<V>) -> V {
-    if let ConfigSetting::Specified(actual_value) = actual {
-        actual_value
-    } else {
-        panic!("Expected Specified(_), but got {:?}", actual);
-    }
-}
-
-fn assert_specified_eq<V: PartialEq + std::fmt::Debug, IntoV: Into<V>>(
+fn assert_specified_eq<V: PartialEq + Debug, IntoV: Into<V>>(
     actual: &ConfigSetting<V>,
     expected: IntoV,
 ) {
@@ -416,7 +427,7 @@ fn assert_defaulted_eq<V: PartialEq + std::fmt::Debug, IntoV: Into<V>>(
     }
 }
 
-fn assert_conf_err<M: AsRef<str>>(result: Result<SenderBuilder>, expect_msg: M) {
+fn assert_conf_err<T, M: AsRef<str>>(result: Result<T>, expect_msg: M) {
     let Err(err) = result else {
         panic!("Got Ok, expected ConfigError: {}", expect_msg.as_ref());
     };
