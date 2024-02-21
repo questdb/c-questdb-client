@@ -364,7 +364,7 @@ fn test_tls_to_plain_server() -> TestResult {
     let mut server = MockServer::new()?;
     let lsb = server
         .lsb_tcp()?
-        .read_timeout(Duration::from_millis(500))?
+        .auth_timeout(Duration::from_millis(500))?
         .tls(Tls::Enabled(CertificateAuthority::File {
             path: ca_path,
             password: None,
@@ -408,7 +408,7 @@ fn test_plain_to_tls_server() -> TestResult {
     let server = MockServer::new()?;
     let lsb = server
         .lsb_tcp()?
-        .read_timeout(Duration::from_millis(500))?
+        .auth_timeout(Duration::from_millis(500))?
         .tls(Tls::Disabled)?;
     let server_jh = server.accept_tls();
     let maybe_sender = lsb.build();

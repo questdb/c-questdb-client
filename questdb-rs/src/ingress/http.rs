@@ -45,7 +45,6 @@ pub(super) struct HttpConfig {
     pub(super) user_agent: ConfigSetting<Option<String>>,
     pub(super) retry_timeout: ConfigSetting<Duration>,
     pub(super) grace_timeout: ConfigSetting<Duration>,
-    pub(super) transactional: ConfigSetting<bool>,
 }
 
 impl Default for HttpConfig {
@@ -55,7 +54,6 @@ impl Default for HttpConfig {
             user_agent: ConfigSetting::new_default(None),
             retry_timeout: ConfigSetting::new_default(Duration::from_secs(10)),
             grace_timeout: ConfigSetting::new_default(Duration::from_secs(5)),
-            transactional: ConfigSetting::new_default(false),
         }
     }
 }

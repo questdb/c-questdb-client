@@ -56,10 +56,10 @@ fn invalid_value() {
 #[test]
 fn specified_cant_change() {
     let mut builder = SenderBuilder::from_conf("tcp::addr=localhost;").unwrap();
-    builder = builder.net_interface("1.1.1.1").unwrap();
+    builder = builder.bind_interface("1.1.1.1").unwrap();
     assert_conf_err(
-        builder.net_interface("1.1.1.2"),
-        "net_interface is already specified",
+        builder.bind_interface("1.1.1.2"),
+        "\"bind_interface\" is already specified",
     );
 }
 
@@ -222,7 +222,7 @@ fn set_auth_specifies_tcp() {
 fn set_net_interface_specifies_tcp() {
     let builder = SenderBuilder::new_tcp("localhost", 9000).unwrap();
     assert_eq!(builder.protocol, SenderProtocol::IlpOverTcp);
-    builder.net_interface("55.88.0.4").unwrap();
+    builder.bind_interface("55.88.0.4").unwrap();
 }
 
 #[test]

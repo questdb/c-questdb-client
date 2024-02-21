@@ -678,7 +678,7 @@ fn test_transactional() -> TestResult {
     assert!(buffer2.transactional());
 
     let mut server = MockServer::new()?;
-    let mut sender = server.lsb_http()?.transactional()?.build()?;
+    let mut sender = server.lsb_http()?.build()?;
 
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
         server.accept()?;
@@ -691,7 +691,7 @@ fn test_transactional() -> TestResult {
         Ok(())
     });
 
-    let res = sender.flush_and_keep(&buffer1);
+    let res = sender.flush_and_keep_with_flags(&buffer1, true);
     assert!(res.is_err());
     let err = res.unwrap_err();
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
@@ -701,7 +701,7 @@ fn test_transactional() -> TestResult {
         Transactional flushes are only supported for buffers containing lines for a single table."
     );
 
-    let res = sender.flush_and_keep(&buffer2);
+    let res = sender.flush_and_keep_with_flags(&buffer2, true);
 
     server_thread.join().unwrap()?;
 

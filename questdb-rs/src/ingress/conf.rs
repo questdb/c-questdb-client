@@ -59,7 +59,7 @@ impl<T: PartialEq> ConfigSetting<T> {
             ConfigSetting::Specified(curr_value) if *curr_value == value => Ok(()),
             _ => Err(Error::new(
                 ErrorCode::ConfigError,
-                format!("{setting_name} is already specified"),
+                format!("{setting_name:?} is already specified"),
             )),
         }
     }

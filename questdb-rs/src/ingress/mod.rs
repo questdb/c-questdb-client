@@ -1746,10 +1746,11 @@ let mut sender = SenderBuilder::new_http("localhost", 9009)?.build()?;
 #[derive(Debug, Clone)]
 pub struct SenderBuilder {
     protocol: SenderProtocol,
-    read_timeout: ConfigSetting<Duration>,
     host: ConfigSetting<String>,
     port: ConfigSetting<String>,
     net_interface: ConfigSetting<Option<String>>,
+    max_buf_size: ConfigSetting<usize>,
+    auth_timeout: ConfigSetting<Duration>,
     user: ConfigSetting<Option<String>>,
     pass: ConfigSetting<Option<String>>,
     token: ConfigSetting<Option<String>>,
@@ -1812,25 +1813,35 @@ impl SenderBuilder {
                 "token" => builder.token(val)?,
                 "token_x" => builder.token_x(val)?,
                 "token_y" => builder.token_y(val)?,
+                "bind_interface" => builder.bind_interface(val)?,
+
+                "init_buf_size" => {
+                    return config_err("\"init_buf_size\" is not supported in config string")
+                }
+
+                "max_buf_size" => builder.max_buf_size(parse_conf_value(key, val)?)?,
+
+                "auth_timeout" => {
+                    builder.auth_timeout(Duration::from_millis(parse_conf_value(key, val)?))?
+                }
 
                 #[cfg(feature = "ilp-over-http")]
-                "min_throughput" => builder.min_throughput(parse(key, val)?)?,
+                "min_throughput" => builder.min_throughput(parse_conf_value(key, val)?)?,
 
                 #[cfg(feature = "ilp-over-http")]
                 "grace_timeout" => {
-                    builder.grace_timeout(Duration::from_millis(parse(key, val)?))?
+                    builder.grace_timeout(Duration::from_millis(parse_conf_value(key, val)?))?
                 }
 
                 #[cfg(feature = "ilp-over-http")]
                 "retry_timeout" => {
-                    builder.retry_timeout(Duration::from_millis(parse(key, val)?))?
+                    builder.retry_timeout(Duration::from_millis(parse_conf_value(key, val)?))?
                 }
                 _ => builder, // ignore other parameters
             };
         }
 
         // TODO: Handle init_buf_size and max_buf_size.
-        // TODO: read_timeout, net_interface can't be set via config string.
 
         Ok(builder)
     }
@@ -1853,17 +1864,19 @@ impl SenderBuilder {
         let port: Port = port.into();
         let port = validate_value(port.0)?;
         Ok(Self {
-            read_timeout: ConfigSetting::new_default(Duration::from_secs(15)),
+            protocol,
             host: ConfigSetting::new_specified(host),
             port: ConfigSetting::new_specified(port),
             net_interface: ConfigSetting::new_default(None),
+            max_buf_size: ConfigSetting::new_default(100 * 1024 * 1024),
+            auth_timeout: ConfigSetting::new_default(Duration::from_secs(15)),
             user: ConfigSetting::new_default(None),
             pass: ConfigSetting::new_default(None),
             token: ConfigSetting::new_default(None),
             token_x: ConfigSetting::new_default(None),
             token_y: ConfigSetting::new_default(None),
             tls: ConfigSetting::new_default(Tls::Disabled),
-            protocol,
+
             #[cfg(feature = "ilp-over-http")]
             http: if protocol == SenderProtocol::IlpOverHttp {
                 Some(HttpConfig::default())
@@ -1918,66 +1931,60 @@ impl SenderBuilder {
     /// # use questdb::ingress::SenderBuilder;
     /// # fn main() -> Result<()> {
     /// let mut sender = SenderBuilder::new_tcp("localhost", 9009)?
-    ///     .net_interface("0.0.0.0")?
+    ///     .bind_interface("0.0.0.0")?
     ///     .build()?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn net_interface<I: Into<String>>(mut self, addr: I) -> Result<Self> {
-        self.ensure_specified_protocol("net_interface", SenderProtocol::IlpOverTcp)?;
+    pub fn bind_interface<I: Into<String>>(mut self, addr: I) -> Result<Self> {
+        self.ensure_specified_protocol("bind_interface", SenderProtocol::IlpOverTcp)?;
         self.net_interface
-            .set_specified("net_interface", Some(validate_value(addr.into())?))?;
+            .set_specified("bind_interface", Some(validate_value(addr.into())?))?;
         Ok(self)
     }
 
+    /// Set the username for authentication.
+    ///
+    /// For TCP this is the `kid` part of the ECDSA key set.
+    /// The other fields [`token`](SenderBuilder::token), [`token_x`](SenderBuilder::token_x),
+    /// and [`token_y`](SenderBuilder::token_y).
+    ///
+    /// For HTTP this is part of basic authentication.
+    /// Also see [`pass`](SenderBuilder::pass).
     pub fn user(mut self, user: &str) -> Result<Self> {
         self.user
             .set_specified("user", Some(validate_value(user.to_string())?))?;
         Ok(self)
     }
 
+    /// Set the password for basic HTTP authentication.
     pub fn pass(mut self, pass: &str) -> Result<Self> {
         self.pass
             .set_specified("pass", Some(validate_value(pass.to_string())?))?;
         Ok(self)
     }
 
+    /// Token (Bearer) Authentication Parameters for ILP over HTTP,
+    /// or the ECDSA private key for ILP over TCP authentication.
     pub fn token(mut self, token: &str) -> Result<Self> {
         self.token
             .set_specified("token", Some(validate_value(token.to_string())?))?;
         Ok(self)
     }
 
+    /// The ECDSA public key X for ILP over TCP authentication.
     pub fn token_x(mut self, token_x: &str) -> Result<Self> {
         self.token_x
             .set_specified("token_x", Some(validate_value(token_x.to_string())?))?;
         Ok(self)
     }
 
+    /// The ECDSA public key Y for ILP over TCP authentication.
     pub fn token_y(mut self, token_y: &str) -> Result<Self> {
         self.token_y
             .set_specified("token_y", Some(validate_value(token_y.to_string())?))?;
         Ok(self)
     }
-
-    // /// Token (Bearer) Authentication Parameters for ILP over HTTP.
-    // /// For TCP, use [`auth`](SenderBuilder::auth).
-    // ///
-    // /// For HTTP you can also use [`basic_auth`](SenderBuilder::basic_auth).
-    // #[cfg(feature = "ilp-over-http")]
-    // pub fn token_auth<A>(mut self, token: A) -> Result<Self>
-    // where
-    //     A: Into<String>,
-    // {
-    //     self.ensure_specified_protocol("token_auth", SenderProtocol::IlpOverHttp)?;
-    //     self.auth.set_specified(
-    //         "auth",
-    //         Some(AuthParams::Token(TokenAuthParams {
-    //             token: validate_value(token)?,
-    //         })),
-    //     )?;
-    //     Ok(self)
-    // }
 
     /// Configure TLS handshake.
     ///
@@ -2057,13 +2064,24 @@ impl SenderBuilder {
     ///
     /// # fn main() -> Result<()> {
     /// let mut sender = SenderBuilder::new_tcp("localhost", 9009)?
-    ///    .read_timeout(Duration::from_secs(15))?
+    ///    .auth_timeout(Duration::from_secs(15))?
     ///    .build()?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn read_timeout(mut self, value: Duration) -> Result<Self> {
-        self.read_timeout.set_specified("read_timeout", value)?;
+    pub fn auth_timeout(mut self, value: Duration) -> Result<Self> {
+        self.auth_timeout.set_specified("auth_timeout", value)?;
+        Ok(self)
+    }
+
+    /// The maximum buffer size that the client will flush to the server.
+    /// The default is 100 MiB.
+    pub fn max_buf_size(mut self, value: usize) -> Result<Self> {
+        let min = 10 * 1024;
+        if value < min {
+            return config_err("\"max_buf_size\" must be at least {min} bytes.");
+        }
+        self.max_buf_size.set_specified("max_buf_size", value)?;
         Ok(self)
     }
 
@@ -2090,7 +2108,7 @@ impl SenderBuilder {
         if let Some(http) = &mut self.http {
             http.min_throughput.set_specified("min_throughput", value)?;
         } else {
-            return config_err("min_throughput is supported only in ILP over HTTP.");
+            return config_err("\"min_throughput\" is supported only in ILP over HTTP.");
         }
         Ok(self)
     }
@@ -2103,20 +2121,7 @@ impl SenderBuilder {
         if let Some(http) = &mut self.http {
             http.grace_timeout.set_specified("grace_timeout", value)?;
         } else {
-            return config_err("grace_timeout is supported only in ILP over HTTP.");
-        }
-        Ok(self)
-    }
-
-    #[cfg(feature = "ilp-over-http")]
-    /// Enable transactional flushes.
-    /// This is only relevant for HTTP.
-    /// This works by ensuring that the buffer contains lines for a single table.
-    pub fn transactional(mut self) -> Result<Self> {
-        if let Some(http) = &mut self.http {
-            http.transactional.set_specified("transactional", true)?;
-        } else {
-            return config_err("Transactional flushes are supported only in ILP over HTTP.");
+            return config_err("\"grace_timeout\" is supported only in ILP over HTTP.");
         }
         Ok(self)
     }
@@ -2173,7 +2178,7 @@ impl SenderBuilder {
         // We set up a read timeout to prevent the client from "hanging"
         // should we be connecting to a server configured in a different way
         // from the client.
-        sock.set_read_timeout(Some(*self.read_timeout))
+        sock.set_read_timeout(Some(*self.auth_timeout))
             .map_err(|io_err| {
                 map_io_to_socket_err("Failed to set read timeout on socket: ", io_err)
             })?;
@@ -2199,7 +2204,7 @@ impl SenderBuilder {
                                     " Timed out waiting for server ",
                                     "response after {:?}."
                                 ),
-                                *self.read_timeout
+                                *self.auth_timeout
                             )
                         } else {
                             error::fmt!(TlsError, "Failed to complete TLS handshake: {}", io_err)
@@ -2425,8 +2430,7 @@ fn validate_value<T: AsRef<str>>(value: T) -> Result<T> {
     Ok(value)
 }
 
-#[cfg(feature = "ilp-over-http")]
-fn parse<T>(param_name: &str, str_value: &str) -> Result<T>
+fn parse_conf_value<T>(param_name: &str, str_value: &str) -> Result<T>
 where
     T: FromStr,
     T::Err: std::fmt::Debug,
@@ -2554,13 +2558,8 @@ impl Sender {
         SenderBuilder::from_env()?.build()
     }
 
-    /// Send buffer to the QuestDB server, without clearing the
-    /// buffer.
-    ///
-    /// This will block until the buffer is flushed to the network socket.
-    /// This does not guarantee that the buffer will be sent to the server
-    /// or that the server has received it.
-    pub fn flush_and_keep(&mut self, buf: &Buffer) -> Result<()> {
+    #[allow(unused_variables)]
+    fn flush_impl(&mut self, buf: &Buffer, transactional: bool) -> Result<()> {
         if !self.connected {
             return Err(error::fmt!(
                 SocketError,
@@ -2581,7 +2580,7 @@ impl Sender {
             }
             #[cfg(feature = "ilp-over-http")]
             ProtocolHandler::Http(ref state) => {
-                if *state.config.transactional && !buf.transactional() {
+                if transactional && !buf.transactional() {
                     return Err(error::fmt!(
                         InvalidApiCall,
                         "Buffer contains lines for multiple tables. \
@@ -2623,13 +2622,45 @@ impl Sender {
         Ok(())
     }
 
+    /// Variant of `.flush()` that does not clear the buffer and allows for
+    /// transactional flushes.
+    ///
+    /// A transactional flush is simply a flush that ensures that all rows in
+    /// the ILP buffer refer to the same table, thus allowing the server to
+    /// treat the flush request as a single transaction.
+    ///
+    /// This is because QuestDB does not support transactions spanning multiple
+    /// tables.
+    #[cfg(feature = "ilp-over-http")]
+    pub fn flush_and_keep_with_flags(&mut self, buf: &Buffer, transactional: bool) -> Result<()> {
+        self.flush_impl(buf, transactional)
+    }
+
+    /// Variant of `.flush()` that does not clear the buffer.
+    pub fn flush_and_keep(&mut self, buf: &Buffer) -> Result<()> {
+        self.flush_impl(buf, false)
+    }
+
     /// Send buffer to the QuestDB server, clearing the buffer.
     ///
-    /// This will block until the buffer is flushed to the network socket.
-    /// This does not guarantee that the buffer will be sent to the server
-    /// or that the server has received it.
+    /// If sending over HTTP, flushing will send an HTTP request and wait
+    /// for the response. If the server responds with an error, this function
+    /// will return a descriptive error. In case of network errors,
+    /// this function will retry.
+    ///
+    /// If sending over TCP, this will block until the buffer is flushed to the
+    /// network socket. Note that this does not guarantee that the buffer will
+    /// be sent to the server or that the server has received it.
+    /// In case of errors the server will disconnect: consult the server logs.
+    ///
+    /// Prefer HTTP in most cases, but use TCP if you need to continuously
+    /// data to the server at a high rate.
+    ///
+    /// To improve HTTP performance, send larger buffers (with more rows),
+    /// and consider parallelizing writes using multiple senders from multiple
+    /// threads.
     pub fn flush(&mut self, buf: &mut Buffer) -> Result<()> {
-        self.flush_and_keep(buf)?;
+        self.flush_impl(buf, false)?;
         buf.clear();
         Ok(())
     }
@@ -2637,6 +2668,8 @@ impl Sender {
     /// The sender is no longer usable and must be dropped.
     ///
     /// This is caused if there was an earlier failure.
+    ///
+    /// This method is specific to ILP/TCP and is not relevant for ILP/HTTP.
     pub fn must_close(&self) -> bool {
         !self.connected
     }
