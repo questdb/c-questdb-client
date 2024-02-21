@@ -1754,27 +1754,21 @@ fn handle_http_params(
 
 fn handle_auto_flush_params(params: &HashMap<String, &String>) -> Result<()> {
     if let Some(&auto_flush) = params.get("auto_flush") {
-        match auto_flush.as_str() {
-            "off" => {}
-            _ => {
-                return config_err(format!(
-                    "Invalid auto_flush value '{auto_flush}'. This client does not \
-                    support auto-flush, so the only accepted value is 'off'"
-                ));
-            }
+        if auto_flush.as_str() != "off" {
+            return config_err(format!(
+                "Invalid auto_flush value '{auto_flush}'. This client does not \
+                support auto-flush, so the only accepted value is 'off'"
+            ));
         }
     }
-    if params.get("auto_flush_rows").is_some() {
-        return config_err(
-            "Invalid configuration parameter 'auto_flush_rows'. \
-            This client does not support auto-flush",
-        );
-    }
-    if params.get("auto_flush_bytes").is_some() {
-        return config_err(
-            "Invalid configuration parameter 'auto_flush_bytes'. \
-            This client does not support auto-flush",
-        );
+
+    for &param in ["auto_flush_rows", "auto_flush_bytes"].iter() {
+        if params.contains_key(param) {
+            return config_err(format!(
+                "Invalid configuration parameter {:?}. This client does not support auto-flush",
+                param
+            ));
+        }
     }
     Ok(())
 }

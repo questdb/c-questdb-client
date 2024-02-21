@@ -402,6 +402,22 @@ fn auto_flush_unsupported() {
     );
 }
 
+#[test]
+fn auto_flush_rows_unsupported() {
+    assert_conf_err(
+        SenderBuilder::from_conf("tcps::addr=localhost;auto_flush_rows=100;"),
+        "Invalid configuration parameter \"auto_flush_rows\". This client does not support auto-flush",
+    );
+}
+
+#[test]
+fn auto_flush_bytes_unsupported() {
+    assert_conf_err(
+        SenderBuilder::from_conf("tcps::addr=localhost;auto_flush_bytes=100;"),
+        "Invalid configuration parameter \"auto_flush_bytes\". This client does not support auto-flush",
+    );
+}
+
 fn assert_specified_eq<V: PartialEq + Debug, IntoV: Into<V>>(
     actual: &ConfigSetting<V>,
     expected: IntoV,
