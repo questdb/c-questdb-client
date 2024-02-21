@@ -1634,125 +1634,7 @@ fn handle_tls_config(params: &HashMap<String, &String>) -> Result<Tls> {
     Ok(Tls::Enabled(roots))
 }
 
-// fn handle_auth_params(
-//     auth: &mut ConfigSetting<Option<AuthParams>>,
-//     protocol: &SenderProtocol,
-//     params: &HashMap<String, &String>,
-// ) -> Result<()> {
-//     match protocol {
-//         SenderProtocol::IlpOverTcp => {
-//             match (
-//                 params.get("user"),
-//                 params.get("token"),
-//                 params.get("token_x"),
-//                 params.get("token_y"),
-//             ) {
-//                 (Some(key_id), Some(priv_key), Some(pub_key_x), Some(pub_key_y)) => {
-//                     auth.set_specified(
-//                         "auth",
-//                         Some(AuthParams::Ecdsa(EcdsaAuthParams {
-//                             key_id: key_id.to_string(),
-//                             priv_key: priv_key.to_string(),
-//                             pub_key_x: pub_key_x.to_string(),
-//                             pub_key_y: pub_key_y.to_string(),
-//                         })),
-//                     )?;
-//                 }
-//                 (None, None, None, None) => {}
-//                 (_, _, _, _) => return missing_param_err(
-//                     "Incomplete ECDSA authentication parameters. Specify either all or none of: \
-//                     'user', 'token', 'token_x', 'token_y'",
-//                     params,
-//                 ),
-//             }
-//         }
-//
-//         #[cfg(feature = "ilp-over-http")]
-//         SenderProtocol::IlpOverHttp => {
-//             match (params.get("user"), params.get("pass"), params.get("token")) {
-//                 (Some(username), Some(password), None) => {
-//                     auth.set_specified(
-//                         "auth",
-//                         Some(AuthParams::Basic(BasicAuthParams {
-//                             username: username.to_string(),
-//                             password: password.to_string(),
-//                         })),
-//                     )?;
-//                 }
-//                 (None, None, Some(token)) => {
-//                     auth.set_specified(
-//                         "auth",
-//                         Some(AuthParams::Token(TokenAuthParams {
-//                             token: token.to_string(),
-//                         })),
-//                     )?;
-//                 }
-//                 (None, None, None) => {}
-//                 (Some(_), None, None) => {
-//                     return missing_param_err(
-//                         "Authentication parameter 'user' is present, but 'pass' is missing",
-//                         params,
-//                     );
-//                 }
-//                 (None, Some(_), None) => {
-//                     return missing_param_err(
-//                         "Authentication parameter 'pass' is present, but 'user' is missing",
-//                         params,
-//                     );
-//                 }
-//                 (_, _, _) => {
-//                     return missing_param_err(
-//                         "Inconsistent HTTP authentication parameters. \
-//                         Specify either 'user' and 'pass', or just 'token'",
-//                         params,
-//                     );
-//                 }
-//             }
-//         }
-//     }
-//     Ok(())
-// }
-
-#[cfg(feature = "ilp-over-http")]
-fn handle_http_params(
-    http_config: &mut Option<HttpConfig>,
-    params: &HashMap<String, &String>,
-) -> Result<()> {
-    if let Some(http_config) = http_config {
-        if let Some(min_throughput) = params.get("min_throughput") {
-            http_config
-                .min_throughput
-                .set_specified("min_throughput", parse(min_throughput)?)?;
-        }
-        if let Some(grace_timeout) = params.get("grace_timeout") {
-            http_config.grace_timeout.set_specified(
-                "grace_timeout",
-                Duration::from_millis(parse(grace_timeout)?),
-            )?;
-        }
-        if let Some(retry_timeout) = params.get("retry_timeout") {
-            http_config.retry_timeout.set_specified(
-                "retry_timeout",
-                Duration::from_millis(parse(retry_timeout)?),
-            )?;
-        }
-    } else {
-        if params.get("min_throughput").is_some() {
-            return config_err(
-                "Configuration parameter 'min_throughput' only applies in HTTP mode",
-            );
-        }
-        if params.get("grace_timeout").is_some() {
-            return config_err("Configuration parameter 'grace_timeout' only applies in HTTP mode");
-        }
-        if params.get("retry_timeout").is_some() {
-            return config_err("Configuration parameter 'retry_timeout' only applies in HTTP mode");
-        }
-    }
-    Ok(())
-}
-
-fn handle_auto_flush_params(params: &HashMap<String, &String>) -> Result<()> {
+fn validate_auto_flush_params(params: &HashMap<String, &String>) -> Result<()> {
     if let Some(&auto_flush) = params.get("auto_flush") {
         if auto_flush.as_str() != "off" {
             return config_err(format!(
@@ -1921,26 +1803,31 @@ impl SenderBuilder {
             builder.tls.set_specified("tls", Tls::Disabled)?;
         }
 
-        let auth_params = ["user", "pass", "token", "token_x", "token_y"];
-        for &param_name in auth_params.iter() {
-            if let Some(val) = params.get(param_name) {
-                builder = match param_name {
-                    "user" => builder.user(val)?,
-                    "pass" => builder.pass(val)?,
-                    "token" => builder.token(val)?,
-                    "token_x" => builder.token_x(val)?,
-                    "token_y" => builder.token_y(val)?,
-                    _ => unreachable!(),
-                };
-            }
+        validate_auto_flush_params(&params)?;
+
+        for (key, val) in params.iter().map(|(k, v)| (k.as_str(), v.as_str())) {
+            builder = match key {
+                "user" => builder.user(val)?,
+                "pass" => builder.pass(val)?,
+                "token" => builder.token(val)?,
+                "token_x" => builder.token_x(val)?,
+                "token_y" => builder.token_y(val)?,
+
+                #[cfg(feature = "ilp-over-http")]
+                "min_throughput" => builder.min_throughput(parse(key, val)?)?,
+
+                #[cfg(feature = "ilp-over-http")]
+                "grace_timeout" => {
+                    builder.grace_timeout(Duration::from_millis(parse(key, val)?))?
+                }
+
+                #[cfg(feature = "ilp-over-http")]
+                "retry_timeout" => {
+                    builder.retry_timeout(Duration::from_millis(parse(key, val)?))?
+                }
+                _ => builder, // ignore other parameters
+            };
         }
-
-        // min_throughput=  grace_timeout=  retry_timeout=
-        #[cfg(feature = "ilp-over-http")]
-        handle_http_params(&mut builder.http, &params)?;
-
-        // auto_flush=  auto_flush_rows=  auto_flush_bytes=
-        handle_auto_flush_params(&params)?;
 
         // TODO: Handle init_buf_size and max_buf_size.
         // TODO: read_timeout, net_interface can't be set via config string.
@@ -2539,14 +2426,14 @@ fn validate_value<T: AsRef<str>>(value: T) -> Result<T> {
 }
 
 #[cfg(feature = "ilp-over-http")]
-fn parse<T>(str_value: &str) -> Result<T>
+fn parse<T>(param_name: &str, str_value: &str) -> Result<T>
 where
     T: FromStr,
     T::Err: std::fmt::Debug,
 {
     str_value
         .parse()
-        .map_err(|e| config_error(format!("{e:?}")))
+        .map_err(|e| config_error(format!("Could not parse {param_name:?} to number: {e:?}")))
 }
 
 fn config_err<T, M: Into<String>>(msg: M) -> Result<T> {
