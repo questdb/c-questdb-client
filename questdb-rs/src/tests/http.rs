@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-use crate::ingress::{Buffer, CertificateAuthority, SenderBuilder, TimestampNanos, Tls};
+use crate::ingress::{Buffer, SenderBuilder, TimestampNanos};
 use crate::tests::mock::{certs_dir, HttpResponse, MockServer};
 use crate::ErrorCode;
 use std::io;
@@ -457,13 +457,7 @@ fn test_tls() -> TestResult {
     let buffer2 = buffer.clone();
 
     let mut server = MockServer::new()?;
-    let mut sender = server
-        .lsb_http()?
-        .tls(Tls::Enabled(CertificateAuthority::File {
-            path: ca_path,
-            password: None,
-        }))?
-        .build()?;
+    let mut sender = server.lsb_http()?.tls_roots(ca_path)?.build()?;
 
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
         server.accept_tls_sync()?;

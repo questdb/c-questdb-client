@@ -1,6 +1,6 @@
 use chrono::{TimeZone, Utc};
 use questdb::{
-    ingress::{Buffer, CertificateAuthority, SenderBuilder, TimestampNanos, Tls},
+    ingress::{Buffer, SenderBuilder, TimestampNanos},
     Result,
 };
 
@@ -16,8 +16,7 @@ fn main() -> Result<()> {
         .token("5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48")? // d
         .token_x("fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU")? // x
         .token_y("Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac")? // y
-        .tls(Tls::Enabled(CertificateAuthority::WebpkiRoots))?
-        // Alternatively: .tls(Tls::Enabled(CertificateAuthority::OsRoots))
+        .tls_enabled(true)?
         .build()?;
     let mut buffer = Buffer::new();
     let designated_timestamp =

@@ -85,7 +85,7 @@
 //!
 //! ```no_run
 //! # use questdb::Result;
-//! use questdb::ingress::{SenderBuilder, Tls, CertificateAuthority};
+//! use questdb::ingress::SenderBuilder;
 //!
 //! # fn main() -> Result<()> {
 //! // See: https://questdb.io/docs/reference/api/ilp/authenticate
@@ -94,7 +94,7 @@
 //!     .token("5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48")? // d
 //!     .token_x("fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU")? // x
 //!     .token_y("Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac")? // y
-//!     .tls(Tls::Enabled(CertificateAuthority::WebpkiRoots))?
+//!     .tls_enabled(true)?
 //!     .build()?;
 //! # Ok(())
 //! # }
@@ -113,14 +113,11 @@
 //! ```no_run
 //! # use questdb::Result;
 //! use std::path::PathBuf;
-//! use questdb::ingress::{SenderBuilder, Tls, CertificateAuthority};
+//! use questdb::ingress::{SenderBuilder, CertificateAuthority};
 //!
 //! # fn main() -> Result<()> {
 //! let mut sender = SenderBuilder::new_tcp("localhost", 9009)?
-//!     .tls(Tls::Enabled(CertificateAuthority::File {
-//!             path: PathBuf::from("/path/to/server_rootCA.pem"),
-//!             password: None
-//!         }))?
+//!     .tls_roots("/path/to/server_rootCA.pem")?
 //!     .build()?;
 //! # Ok(())
 //! # }
@@ -186,8 +183,8 @@
 pub use self::timestamp::*;
 
 use crate::error::{self, Error, Result};
+use crate::gai;
 use crate::ingress::conf::ConfigSetting;
-use crate::{gai, ErrorCode};
 use core::time::Duration;
 use itoa;
 use std::collections::HashMap;
@@ -1338,6 +1335,7 @@ pub struct Sender {
     descr: String,
     handler: ProtocolHandler,
     connected: bool,
+    max_buf_size: usize,
 }
 
 impl std::fmt::Debug for Sender {
@@ -1368,7 +1366,7 @@ enum AuthParams {
 /// Root used to determine how to validate the server's TLS certificate.
 ///
 /// Used when configuring the [`tls`](SenderBuilder::tls) option.
-#[derive(PartialEq, Debug, Clone)]
+#[derive(PartialEq, Debug, Clone, Copy)]
 pub enum CertificateAuthority {
     /// Use the root certificates provided by the
     /// [`webpki-roots`](https://crates.io/crates/webpki-roots) crate.
@@ -1384,35 +1382,7 @@ pub enum CertificateAuthority {
     WebpkiAndOsRoots,
 
     /// Use the root certificates provided by a PEM-encoded file.
-    File {
-        path: PathBuf,
-        password: Option<String>,
-    },
-}
-
-/// Options for full-connection encryption via TLS.
-#[derive(PartialEq, Debug, Clone)]
-pub enum Tls {
-    /// No TLS encryption.
-    Disabled,
-
-    /// Use TLS encryption, verifying the server's certificate.
-    Enabled(CertificateAuthority),
-
-    /// Use TLS encryption, whilst dangerously ignoring the server's certificate.
-    /// This should only be used for debugging purposes.
-    /// For testing consider specifying a [`CertificateAuthority::File`] instead.
-    ///
-    /// *This option requires the `insecure-skip-verify` feature.*
-    #[cfg(feature = "insecure-skip-verify")]
-    InsecureSkipVerify,
-}
-
-impl Tls {
-    /// Returns true if TLS is enabled.
-    pub fn is_enabled(&self) -> bool {
-        !matches!(self, Tls::Disabled)
-    }
+    PemFile,
 }
 
 /// A `u16` port number or `String` port service name as is registered with
@@ -1529,29 +1499,51 @@ fn add_os_roots(root_store: &mut RootCertStore) -> Result<()> {
     Ok(())
 }
 
-fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
-    if !tls.is_enabled() {
+fn configure_tls(
+    tls_enabled: bool,
+    tls_verify: bool,
+    tls_ca: CertificateAuthority,
+    tls_roots: &Option<PathBuf>,
+) -> Result<Option<Arc<rustls::ClientConfig>>> {
+    if !tls_enabled {
         return Ok(None);
     }
 
     let mut root_store = RootCertStore::empty();
-
-    if let Tls::Enabled(ca) = tls {
-        match ca {
+    if tls_verify {
+        match (tls_ca, tls_roots) {
             #[cfg(feature = "tls-webpki-certs")]
-            CertificateAuthority::WebpkiRoots => {
+            (CertificateAuthority::WebpkiRoots, None) => {
                 add_webpki_roots(&mut root_store);
             }
+
+            #[cfg(feature = "tls-webpki-certs")]
+            (CertificateAuthority::WebpkiRoots, Some(_)) => {
+                return Err(error::fmt!(ConfigError, "Config parameter \"tls_roots\" must be unset when \"tls_ca\" is set to \"webpki_roots\"."));
+            }
+
             #[cfg(feature = "tls-native-certs")]
-            CertificateAuthority::OsRoots => {
+            (CertificateAuthority::OsRoots, None) => {
                 add_os_roots(&mut root_store)?;
             }
+
+            #[cfg(feature = "tls-native-certs")]
+            (CertificateAuthority::OsRoots, Some(_)) => {
+                return Err(error::fmt!(ConfigError, "Config parameter \"tls_roots\" must be unset when \"tls_ca\" is set to \"os_roots\"."));
+            }
+
             #[cfg(all(feature = "tls-webpki-certs", feature = "tls-native-certs"))]
-            CertificateAuthority::WebpkiAndOsRoots => {
+            (CertificateAuthority::WebpkiAndOsRoots, None) => {
                 add_webpki_roots(&mut root_store);
                 add_os_roots(&mut root_store)?;
             }
-            CertificateAuthority::File { path: ca_file, .. } => {
+
+            #[cfg(all(feature = "tls-webpki-certs", feature = "tls-native-certs"))]
+            (CertificateAuthority::WebpkiAndOsRoots, Some(_)) => {
+                return Err(error::fmt!(ConfigError, "Config parameter \"tls_roots\" must be unset when \"tls_ca\" is set to \"webpki_and_os_roots\"."));
+            }
+
+            (CertificateAuthority::PemFile, Some(ca_file)) => {
                 let certfile = std::fs::File::open(ca_file).map_err(|io_err| {
                     error::fmt!(
                         TlsError,
@@ -1579,12 +1571,12 @@ fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
                     })?;
                 root_store.add_parsable_certificates(der_certs);
             }
+
+            (CertificateAuthority::PemFile, None) => {
+                return Err(error::fmt!(ConfigError, "Config parameter \"tls_roots\" is required when \"tls_ca\" is set to \"pem_file\"."));
+            }
         }
     }
-    // else if let Tls::InsecureSkipVerify {
-    //    We don't need to set up any certificates.
-    //    An empty root is fine if we're going to ignore validity anyways.
-    // }
 
     let mut config = rustls::ClientConfig::builder()
         .with_root_certificates(root_store)
@@ -1595,7 +1587,7 @@ fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
     config.key_log = Arc::new(rustls::KeyLogFile::new());
 
     #[cfg(feature = "insecure-skip-verify")]
-    if let Tls::InsecureSkipVerify = tls {
+    if !tls_verify {
         config
             .dangerous()
             .set_certificate_verifier(Arc::new(danger::NoCertificateVerification {}));
@@ -1604,40 +1596,11 @@ fn configure_tls(tls: &Tls) -> Result<Option<Arc<rustls::ClientConfig>>> {
     Ok(Some(Arc::new(config)))
 }
 
-fn handle_tls_config(params: &HashMap<String, &String>) -> Result<Tls> {
-    if let Some(&tls_verify) = params.get("tls_verify") {
-        match tls_verify.as_str() {
-            #[cfg(feature = "insecure-skip-verify")]
-            "unsafe_off" => {
-                return Ok(Tls::InsecureSkipVerify);
-            }
-            "on" => {}
-            _ => {
-                return config_err(
-                    "Config parameter 'tls_verify' must be either 'on' or 'unsafe_off'",
-                )
-            }
-        }
-    }
-    let roots = match params.get("tls_roots") {
-        Some(&value) => match value.as_str() {
-            "webpki" => CertificateAuthority::WebpkiRoots,
-            #[cfg(feature = "tls-native-certs")]
-            "os-certs" => CertificateAuthority::OsRoots,
-            path => CertificateAuthority::File {
-                path: PathBuf::from_str(path).unwrap(),
-                password: params.get("tls_roots_password").map(|&p| p.clone()),
-            },
-        },
-        None => CertificateAuthority::WebpkiRoots,
-    };
-    Ok(Tls::Enabled(roots))
-}
-
 fn validate_auto_flush_params(params: &HashMap<String, &String>) -> Result<()> {
     if let Some(&auto_flush) = params.get("auto_flush") {
         if auto_flush.as_str() != "off" {
-            return config_err(format!(
+            return Err(error::fmt!(
+                ConfigError,
                 "Invalid auto_flush value '{auto_flush}'. This client does not \
                 support auto-flush, so the only accepted value is 'off'"
             ));
@@ -1646,7 +1609,8 @@ fn validate_auto_flush_params(params: &HashMap<String, &String>) -> Result<()> {
 
     for &param in ["auto_flush_rows", "auto_flush_bytes"].iter() {
         if params.contains_key(param) {
-            return config_err(format!(
+            return Err(error::fmt!(
+                ConfigError,
                 "Invalid configuration parameter {:?}. This client does not support auto-flush",
                 param
             ));
@@ -1737,12 +1701,6 @@ let mut sender = SenderBuilder::new_http("localhost", 9009)?.build()?;
 /// # }
 /// ```
 ///
-/// Additional options for:
-///   * Binding a specific [outbound network address](SenderBuilder::net_interface).
-///   * Connection security
-///     ([authentication](SenderBuilder::auth), [encryption](SenderBuilder::tls)).
-///   * Authentication [timeouts](SenderBuilder::read_timeout).
-///
 #[derive(Debug, Clone)]
 pub struct SenderBuilder {
     protocol: SenderProtocol,
@@ -1756,7 +1714,14 @@ pub struct SenderBuilder {
     token: ConfigSetting<Option<String>>,
     token_x: ConfigSetting<Option<String>>,
     token_y: ConfigSetting<Option<String>>,
-    tls: ConfigSetting<Tls>,
+    tls_enabled: ConfigSetting<bool>,
+
+    #[cfg(feature = "insecure-skip-verify")]
+    tls_verify: ConfigSetting<bool>,
+
+    tls_ca: ConfigSetting<CertificateAuthority>,
+    tls_roots: ConfigSetting<Option<PathBuf>>,
+    tls_roots_password: ConfigSetting<Option<String>>,
 
     #[cfg(feature = "ilp-over-http")]
     http: Option<HttpConfig>,
@@ -1786,7 +1751,10 @@ impl SenderBuilder {
 
         // addr=
         let Some(addr) = params.get("addr") else {
-            return config_err("Missing \"addr\" parameter in config string");
+            return Err(error::fmt!(
+                ConfigError,
+                "Missing \"addr\" parameter in config string"
+            ));
         };
         let (host, port) = match addr.split_once(':') {
             Some((h, p)) => (h, p),
@@ -1796,13 +1764,7 @@ impl SenderBuilder {
 
         // tls=  tls_verify=  tls_roots=  tls_roots_password=
         // TODO: no support in config string for WebPkiAndOsRoots
-        if with_tls {
-            builder
-                .tls
-                .set_specified("tls", handle_tls_config(&params)?)?;
-        } else {
-            builder.tls.set_specified("tls", Tls::Disabled)?;
-        }
+        builder.tls_enabled.set_specified("tls", with_tls)?;
 
         validate_auto_flush_params(&params)?;
 
@@ -1816,7 +1778,10 @@ impl SenderBuilder {
                 "bind_interface" => builder.bind_interface(val)?,
 
                 "init_buf_size" => {
-                    return config_err("\"init_buf_size\" is not supported in config string")
+                    return Err(error::fmt!(
+                        ConfigError,
+                        "\"init_buf_size\" is not supported in config string"
+                    ))
                 }
 
                 "max_buf_size" => builder.max_buf_size(parse_conf_value(key, val)?)?,
@@ -1824,6 +1789,72 @@ impl SenderBuilder {
                 "auth_timeout" => {
                     builder.auth_timeout(Duration::from_millis(parse_conf_value(key, val)?))?
                 }
+
+                "tls_verify" => {
+                    let verify = match val {
+                        "on" => true,
+                        "unsafe_off" => false,
+                        _ => {
+                            return Err(error::fmt!(
+                                ConfigError,
+                                r##"Config parameter "tls_verify" must be either "on" or "unsafe_off".'"##,
+                            ))
+                        }
+                    };
+
+                    #[cfg(not(feature = "insecure-skip-verify"))]
+                    {
+                        if !verify {
+                            return Err(error::fmt!(
+                                ConfigError,
+                                r##"The "insecure-skip-verify" feature is not enabled, so "tls_verify=unsafe_off" is not supported"##,
+                            ));
+                        }
+                        builder
+                    }
+
+                    #[cfg(feature = "insecure-skip-verify")]
+                    builder.tls_verify(verify)?
+                }
+
+                "tls_ca" => {
+                    let ca = match val {
+                        #[cfg(feature = "tls-webpki-certs")]
+                        "webpki_roots" => CertificateAuthority::WebpkiRoots,
+
+                        #[cfg(not(feature = "tls-webpki-certs"))]
+                        "webpki_roots" => return Err(error::fmt!(ConfigError, "Config parameter \"tls_ca=webpki_roots\" requires the \"tls-webpki-certs\" feature")),
+
+                        #[cfg(feature = "tls-native-certs")]
+                        "os_roots" => CertificateAuthority::OsRoots,
+
+                        #[cfg(not(feature = "tls-native-certs"))]
+                        "os_roots" => return Err(error::fmt!(ConfigError, "Config parameter \"tls_ca=os_roots\" requires the \"tls-native-certs\" feature")),
+
+                        #[cfg(all(feature = "tls-webpki-certs", feature = "tls-native-certs"))]
+                        "webpki_and_os_roots" => CertificateAuthority::WebpkiAndOsRoots,
+
+                        #[cfg(not(all(feature = "tls-webpki-certs", feature = "tls-native-certs")))]
+                        "webpki_and_os_roots" => return Err(error::fmt!(ConfigError, "Config parameter \"tls_ca=webpki_and_os_roots\" requires both the \"tls-webpki-certs\" and \"tls-native-certs\" features")),
+
+                        _ => return Err(error::fmt!(ConfigError, "Invalid value {val:?} for \"tls_ca\"")),
+                    };
+                    builder.tls_ca(ca)?
+                }
+
+                "tls_roots" => {
+                    let path = PathBuf::from_str(val).map_err(|e| {
+                        error::fmt!(
+                            ConfigError,
+                            "Invalid path {:?} for \"tls_roots\": {}",
+                            val,
+                            e
+                        )
+                    })?;
+                    builder.tls_roots(path)?
+                }
+
+                "tls_roots_password" => builder.tls_roots_password(val)?,
 
                 #[cfg(feature = "ilp-over-http")]
                 "min_throughput" => builder.min_throughput(parse_conf_value(key, val)?)?,
@@ -1837,11 +1868,13 @@ impl SenderBuilder {
                 "retry_timeout" => {
                     builder.retry_timeout(Duration::from_millis(parse_conf_value(key, val)?))?
                 }
-                _ => builder, // ignore other parameters
+                // Ignore other parameters.
+                // We don't want to fail on unknown keys as this would require releasing different
+                // library implementations in lock step as soon as a new parameter is added to any of them,
+                // even if it's not used.
+                _ => builder,
             };
         }
-
-        // TODO: Handle init_buf_size and max_buf_size.
 
         Ok(builder)
     }
@@ -1875,7 +1908,14 @@ impl SenderBuilder {
             token: ConfigSetting::new_default(None),
             token_x: ConfigSetting::new_default(None),
             token_y: ConfigSetting::new_default(None),
-            tls: ConfigSetting::new_default(Tls::Disabled),
+            tls_enabled: ConfigSetting::new_default(false),
+
+            #[cfg(feature = "insecure-skip-verify")]
+            tls_verify: ConfigSetting::new_default(true),
+
+            tls_ca: ConfigSetting::new_default(CertificateAuthority::WebpkiRoots),
+            tls_roots: ConfigSetting::new_default(None),
+            tls_roots_password: ConfigSetting::new_default(None),
 
             #[cfg(feature = "ilp-over-http")]
             http: if protocol == SenderProtocol::IlpOverHttp {
@@ -1986,73 +2026,6 @@ impl SenderBuilder {
         Ok(self)
     }
 
-    /// Configure TLS handshake.
-    ///
-    /// The default is [`Tls::Disabled`].
-    ///
-    /// ```no_run
-    /// # use questdb::Result;
-    /// # use questdb::ingress::SenderBuilder;
-    /// # use questdb::ingress::Tls;
-    /// # fn main() -> Result<()> {
-    /// let mut sender = SenderBuilder::new_tcp("localhost", 9009)?
-    ///     .tls(Tls::Disabled)?
-    ///     .build()?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    ///
-    /// To enable with commonly accepted certificates, use:
-    ///
-    /// ```no_run
-    /// # use questdb::Result;
-    /// # use questdb::ingress::SenderBuilder;
-    /// # use questdb::ingress::Tls;
-    /// use questdb::ingress::CertificateAuthority;
-    ///
-    /// # fn main() -> Result<()> {
-    /// let mut sender = SenderBuilder::new_tcp("localhost", 9009)?
-    ///     .tls(Tls::Enabled(CertificateAuthority::WebpkiRoots))?
-    ///     .build()?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    ///
-    /// To use [self-signed certificates](https://github.com/questdb/c-questdb-client/tree/main/tls_certs):
-    ///
-    /// ```no_run
-    /// # use questdb::Result;
-    /// # use questdb::ingress::SenderBuilder;
-    /// # use questdb::ingress::Tls;
-    /// use questdb::ingress::CertificateAuthority;
-    /// use std::path::PathBuf;
-    ///
-    /// # fn main() -> Result<()> {
-    /// let mut sender = SenderBuilder::new_tcp("localhost", 9009)?
-    ///     .tls(Tls::Enabled(CertificateAuthority::File {
-    ///         path: PathBuf::from("/path/to/server_rootCA.pem"),
-    ///         password: None
-    ///     }))?
-    ///     .build()?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    ///
-    /// If you're still struggling you may temporarily enable the dangerous
-    /// `insecure-skip-verify` feature to skip the certificate verification:
-    ///
-    /// ```ignore
-    /// let mut sender = SenderBuilder::new_tcp("localhost", 9009)?
-    ///    .tls(Tls::InsecureSkipVerify)?
-    ///    .build()?;
-    /// ```
-    pub fn tls(mut self, tls: Tls) -> Result<Self> {
-        // TODO: Decouple the `specified` state of "Root CA to use" from the
-        // `specified` state of "TLS enabled"
-        self.tls.set_specified("tls", tls)?;
-        Ok(self)
-    }
-
     /// Configure how long to wait for messages from the QuestDB server during
     /// the TLS handshake and authentication process.
     /// The default is 15 seconds.
@@ -2074,12 +2047,92 @@ impl SenderBuilder {
         Ok(self)
     }
 
+    /// Enable or disable TLS.
+    pub fn tls_enabled(mut self, enabled: bool) -> Result<Self> {
+        self.tls_enabled.set_specified("tls", enabled)?;
+
+        #[cfg(feature = "tls-webpki-certs")]
+        self.tls_ca.set_default(CertificateAuthority::WebpkiRoots);
+
+        #[cfg(all(not(feature = "tls-webpki-certs"), feature = "tls-native-certs"))]
+        self.tls_ca.set_default(CertificateAuthority::OsRoots);
+
+        #[cfg(not(any(feature = "tls-webpki-certs", feature = "tls-native-certs")))]
+        self.tls_ca.set_default(CertificateAuthority::PemFile);
+
+        Ok(self)
+    }
+
+    fn ensure_tls_enabled(self, other_setting: &str) -> Result<Self> {
+        if matches!(&self.tls_enabled, ConfigSetting::Specified(false)) {
+            return Err(error::fmt!(
+                ConfigError,
+                "TLS is not enabled. Can't specify {other_setting:?}."
+            ));
+        }
+        self.tls_enabled(true)
+    }
+
+    /// Set to `false` to disable TLS certificate verification.
+    /// This should only be used for debugging purposes as it reduces security.
+    ///
+    /// For testing consider specifying a path to a `.pem` file instead via
+    /// the [`tls_roots`](SenderBuilder::tls_roots) method.
+    #[cfg(feature = "insecure-skip-verify")]
+    pub fn tls_verify(self, verify: bool) -> Result<Self> {
+        let mut builder = self.ensure_tls_enabled("tls_verify")?;
+        builder.tls_verify.set_specified("tls_verify", verify)?;
+        Ok(builder)
+    }
+
+    pub fn tls_ca(self, ca: CertificateAuthority) -> Result<Self> {
+        let mut builder = self.ensure_tls_enabled("tls_ca")?;
+        builder.tls_ca.set_specified("tls_ca", ca)?;
+        Ok(builder)
+    }
+
+    /// Set the path to a custom root certificate `.pem` file.
+    /// This is used to validate the server's certificate during the TLS handshake.
+    /// The file may be password-protected, if so, also specify the password.
+    /// via the [`tls_roots_password`](SenderBuilder::tls_roots_password) method.
+    ///
+    /// See notes on how to test with [self-signed certificates](https://github.com/questdb/c-questdb-client/tree/main/tls_certs).
+    pub fn tls_roots<P: Into<PathBuf>>(self, path: P) -> Result<Self> {
+        let mut builder = self.tls_ca(CertificateAuthority::PemFile)?;
+        let path = path.into();
+        // Attempt to read the file here to catch any issues early.
+        let _file = std::fs::File::open(&path).map_err(|io_err| {
+            error::fmt!(
+                ConfigError,
+                "Could not open root certificate file from path {:?}: {}",
+                path,
+                io_err
+            )
+        })?;
+        builder.tls_roots.set_specified("tls_roots", Some(path))?;
+        Ok(builder)
+    }
+
+    /// Set the password for the root certificate `.pem` file.
+    /// This is used to decrypt the file pointed to by the
+    /// [`tls_roots`](SenderBuilder::tls_roots) method if it's password-protected.
+    pub fn tls_roots_password(self, password: &str) -> Result<Self> {
+        let mut builder = self.ensure_tls_enabled("tls_roots_password")?;
+        builder
+            .tls_roots_password
+            .set_specified("tls_roots_password", Some(password.to_string()))?;
+        Ok(builder)
+    }
+
     /// The maximum buffer size that the client will flush to the server.
     /// The default is 100 MiB.
     pub fn max_buf_size(mut self, value: usize) -> Result<Self> {
-        let min = 10 * 1024;
+        let min = 1024;
         if value < min {
-            return config_err("\"max_buf_size\" must be at least {min} bytes.");
+            return Err(error::fmt!(
+                ConfigError,
+                "max_buf_size\" must be at least {min} bytes."
+            ));
         }
         self.max_buf_size.set_specified("max_buf_size", value)?;
         Ok(self)
@@ -2092,7 +2145,10 @@ impl SenderBuilder {
         if let Some(http) = &mut self.http {
             http.retry_timeout.set_specified("retry_timeout", value)?;
         } else {
-            return config_err("retry_timeout is supported only in ILP over HTTP.");
+            return Err(error::fmt!(
+                ConfigError,
+                "retry_timeout is supported only in ILP over HTTP."
+            ));
         }
         Ok(self)
     }
@@ -2108,7 +2164,10 @@ impl SenderBuilder {
         if let Some(http) = &mut self.http {
             http.min_throughput.set_specified("min_throughput", value)?;
         } else {
-            return config_err("\"min_throughput\" is supported only in ILP over HTTP.");
+            return Err(error::fmt!(
+                ConfigError,
+                "\"min_throughput\" is supported only in ILP over HTTP."
+            ));
         }
         Ok(self)
     }
@@ -2121,7 +2180,10 @@ impl SenderBuilder {
         if let Some(http) = &mut self.http {
             http.grace_timeout.set_specified("grace_timeout", value)?;
         } else {
-            return config_err("\"grace_timeout\" is supported only in ILP over HTTP.");
+            return Err(error::fmt!(
+                ConfigError,
+                "\"grace_timeout\" is supported only in ILP over HTTP."
+            ));
         }
         Ok(self)
     }
@@ -2137,7 +2199,10 @@ impl SenderBuilder {
             http.user_agent
                 .set_specified("user_agent", Some(value.to_string()))?;
         } else {
-            return config_err("user_agent is supported only in ILP over HTTP.");
+            return Err(error::fmt!(
+                ConfigError,
+                "user_agent is supported only in ILP over HTTP."
+            ));
         }
         Ok(self)
     }
@@ -2183,7 +2248,18 @@ impl SenderBuilder {
                 map_io_to_socket_err("Failed to set read timeout on socket: ", io_err)
             })?;
 
-        let mut conn = match configure_tls(&self.tls)? {
+        #[cfg(feature = "insecure-skip-verify")]
+        let tls_verify = *self.tls_verify;
+
+        #[cfg(not(feature = "insecure-skip-verify"))]
+        let tls_verify = true;
+
+        let mut conn = match configure_tls(
+            *self.tls_enabled,
+            tls_verify,
+            *self.tls_ca,
+            self.tls_roots.deref(),
+        )? {
             Some(tls_config) => {
                 let server_name: ServerName = ServerName::try_from(self.host.as_str())
                     .map_err(|inv_dns_err| error::fmt!(TlsError, "Bad host: {}", inv_dns_err))?
@@ -2247,17 +2323,17 @@ impl SenderBuilder {
                 pub_key_y: token_y.to_string(),
             }))),
             (SenderProtocol::IlpOverTcp, Some(_user), Some(_pass), None, None, None) => {
-                config_err(
+                Err(error::fmt!(ConfigError,
                     r##"The "basic_auth" setting can only be used with the ILP/HTTP protocol."##,
-                )
+                ))
             }
             (SenderProtocol::IlpOverTcp, None, None, Some(_token), None, None) => {
-                config_err("Token authentication only be used with the ILP/HTTP protocol.")
+                Err(error::fmt!(ConfigError, "Token authentication only be used with the ILP/HTTP protocol."))
             }
             (SenderProtocol::IlpOverTcp, _user, None, _token, _token_x, _token_y) => {
-                config_err(
+                Err(error::fmt!(ConfigError,
                     r##"Incomplete ECDSA authentication parameters. Specify either all or none of: "user", "token", "token_x", "token_y"."##,
-                )
+                ))
             }
             #[cfg(feature = "ilp-over-http")]
             (SenderProtocol::IlpOverHttp, Some(user), Some(pass), None, None, None) => {
@@ -2268,15 +2344,15 @@ impl SenderBuilder {
             }
             #[cfg(feature = "ilp-over-http")]
             (SenderProtocol::IlpOverHttp, Some(_user), None, None, None, None) => {
-                config_err(
+                Err(error::fmt!(ConfigError,
                     r##"Basic authentication parameter "user" is present, but "pass" is missing."##,
-                )
+                ))
             }
             #[cfg(feature = "ilp-over-http")]
             (SenderProtocol::IlpOverHttp, None, Some(_pass), None, None, None) => {
-                config_err(
+                Err(error::fmt!(ConfigError,
                     r##"Basic authentication parameter "pass" is present, but "user" is missing."##,
-                )
+                ))
             }
             #[cfg(feature = "ilp-over-http")]
             (SenderProtocol::IlpOverHttp, None, None, Some(token), None, None) => {
@@ -2293,18 +2369,18 @@ impl SenderBuilder {
                 Some(_token_x),
                 Some(_token_y),
             ) => {
-                config_err("ECDSA authentication is only available with ILP/TCP and not available with ILP/HTTP.")
+                Err(error::fmt!(ConfigError, "ECDSA authentication is only available with ILP/TCP and not available with ILP/HTTP."))
             }
             #[cfg(feature = "ilp-over-http")]
             (SenderProtocol::IlpOverHttp, _user, _pass, _token, None, None) => {
-                config_err(
+                Err(error::fmt!(ConfigError,
                     r##"Inconsistent HTTP authentication parameters. Specify either "user" and "pass", or just "token"."##,
-                )
+                ))
             }
             _ => {
-                config_err(
+                Err(error::fmt!(ConfigError,
                     r##"Incomplete authentication parameters. Check "user", "pass", "token", "token_x" and "token_y" parameters are set correctly."##,
-                )
+                ))
             }
         }
     }
@@ -2318,12 +2394,10 @@ impl SenderBuilder {
     pub fn build(&self) -> Result<Sender> {
         let mut descr = format!("Sender[host={:?},port={:?},", self.host, self.port);
 
-        match self.tls.deref() {
-            Tls::Disabled => write!(descr, "tls=enabled,").unwrap(),
-            Tls::Enabled(_) => write!(descr, "tls=enabled,").unwrap(),
-
-            #[cfg(feature = "insecure-skip-verify")]
-            Tls::InsecureSkipVerify => write!(descr, "tls=insecure_skip_verify,").unwrap(),
+        if *self.tls_enabled {
+            write!(descr, "tls=enabled,").unwrap();
+        } else {
+            write!(descr, "tls=disabled,").unwrap();
         }
 
         let auth = self.build_auth()?;
@@ -2350,7 +2424,19 @@ impl SenderBuilder {
                 let agent_builder = ureq::AgentBuilder::new()
                     .user_agent(user_agent)
                     .no_delay(true);
-                let agent_builder = match configure_tls(&self.tls)? {
+
+                #[cfg(feature = "insecure-skip-verify")]
+                let tls_verify = *self.tls_verify;
+
+                #[cfg(not(feature = "insecure-skip-verify"))]
+                let tls_verify = true;
+
+                let agent_builder = match configure_tls(
+                    *self.tls_enabled,
+                    tls_verify,
+                    *self.tls_ca,
+                    self.tls_roots.deref(),
+                )? {
                     Some(tls_config) => agent_builder.tls_config(tls_config),
                     None => agent_builder,
                 };
@@ -2367,11 +2453,7 @@ impl SenderBuilder {
                     None => None,
                 };
                 let agent = agent_builder.build();
-                let proto = if self.tls.is_enabled() {
-                    "https"
-                } else {
-                    "http"
-                };
+                let proto = if *self.tls_enabled { "https" } else { "http" };
                 let url = format!(
                     "{}://{}:{}/write",
                     proto,
@@ -2398,6 +2480,7 @@ impl SenderBuilder {
             descr,
             handler,
             connected: true,
+            max_buf_size: *self.max_buf_size,
         };
 
         Ok(sender)
@@ -2411,7 +2494,7 @@ impl SenderBuilder {
         if self.protocol == required_protocol {
             Ok(())
         } else {
-            config_err(format!(
+            Err(error::fmt!(ConfigError,
                 "The {param_name:?} setting can only be used with the {required_protocol} protocol."
             ))
         }
@@ -2424,7 +2507,10 @@ fn validate_value<T: AsRef<str>>(value: T) -> Result<T> {
     let str_ref = value.as_ref();
     for (p, c) in str_ref.chars().enumerate() {
         if matches!(c, '\u{0}'..='\u{1f}' | '\u{7f}'..='\u{9f}') {
-            return config_err(format!("Invalid character {c:?} at position {p}"));
+            return Err(error::fmt!(
+                ConfigError,
+                "Invalid character {c:?} at position {p}"
+            ));
         }
     }
     Ok(value)
@@ -2435,17 +2521,12 @@ where
     T: FromStr,
     T::Err: std::fmt::Debug,
 {
-    str_value
-        .parse()
-        .map_err(|e| config_error(format!("Could not parse {param_name:?} to number: {e:?}")))
-}
-
-fn config_err<T, M: Into<String>>(msg: M) -> Result<T> {
-    Err(config_error(msg))
-}
-
-fn config_error<M: Into<String>>(msg: M) -> Error {
-    Error::new(ErrorCode::ConfigError, msg)
+    str_value.parse().map_err(|e| {
+        error::fmt!(
+            ConfigError,
+            "Could not parse {param_name:?} to number: {e:?}"
+        )
+    })
 }
 
 fn b64_decode(descr: &'static str, buf: &str) -> Result<Vec<u8>> {
@@ -2567,6 +2648,16 @@ impl Sender {
             ));
         }
         buf.check_op(Op::Flush)?;
+
+        if buf.len() > self.max_buf_size {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "Could not flush buffer: Buffer size of {} exceeds maximum configured allowed size of {} bytes.",
+                buf.len(),
+                self.max_buf_size
+            ));
+        }
+
         let bytes = buf.as_str().as_bytes();
         if bytes.is_empty() {
             return Ok(());

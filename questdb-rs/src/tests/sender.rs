@@ -24,8 +24,7 @@
 
 use crate::{
     ingress::{
-        Buffer, CertificateAuthority, Sender, TableName, Timestamp, TimestampMicros,
-        TimestampNanos, Tls,
+        Buffer, CertificateAuthority, Sender, TableName, Timestamp, TimestampMicros, TimestampNanos,
     },
     Error, ErrorCode,
 };
@@ -79,6 +78,33 @@ fn test_basics() -> TestResult {
     assert_eq!(buffer.as_str(), "");
     assert_eq!(server.recv_q()?, 1);
     assert_eq!(server.msgs[0].as_str(), exp);
+    Ok(())
+}
+
+#[test]
+fn test_max_buf_size() -> TestResult {
+    let max = 1024;
+    let mut server = MockServer::new()?;
+    let mut sender = server.lsb_tcp()?.max_buf_size(max)?.build()?;
+    assert!(!sender.must_close());
+    server.accept()?;
+
+    let mut buffer = Buffer::new();
+
+    while buffer.len() < max {
+        buffer
+            .table("test")?
+            .symbol("t1", "v1")?
+            .column_f64("f1", 0.5)?
+            .at_now()?;
+    }
+
+    let err = sender.flush(&mut buffer).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert_eq!(
+        err.msg(),
+        "Could not flush buffer: Buffer size of 1026 exceeds maximum configured allowed size of 1024 bytes."
+    );
     Ok(())
 }
 
@@ -329,12 +355,7 @@ fn test_tls_with_file_ca() -> TestResult {
     ca_path.push("server_rootCA.pem");
 
     let server = MockServer::new()?;
-    let lsb = server
-        .lsb_tcp()?
-        .tls(Tls::Enabled(CertificateAuthority::File {
-            path: ca_path,
-            password: None,
-        }))?;
+    let lsb = server.lsb_tcp()?.tls_roots(ca_path)?;
     let server_jh = server.accept_tls();
     let mut sender = lsb.build()?;
     let mut server: MockServer = server_jh.join().unwrap()?;
@@ -365,10 +386,8 @@ fn test_tls_to_plain_server() -> TestResult {
     let lsb = server
         .lsb_tcp()?
         .auth_timeout(Duration::from_millis(500))?
-        .tls(Tls::Enabled(CertificateAuthority::File {
-            path: ca_path,
-            password: None,
-        }))?;
+        .tls_ca(CertificateAuthority::PemFile)?
+        .tls_roots(ca_path)?;
     let server_jh = std::thread::spawn(move || -> io::Result<MockServer> {
         server.accept()?;
         Ok(server)
@@ -409,7 +428,7 @@ fn test_plain_to_tls_server() -> TestResult {
     let lsb = server
         .lsb_tcp()?
         .auth_timeout(Duration::from_millis(500))?
-        .tls(Tls::Disabled)?;
+        .tls_enabled(false)?;
     let server_jh = server.accept_tls();
     let maybe_sender = lsb.build();
     let server_err = server_jh.join().unwrap().unwrap_err();
@@ -432,7 +451,7 @@ fn test_plain_to_tls_server() -> TestResult {
 #[test]
 fn test_tls_insecure_skip_verify() -> TestResult {
     let server = MockServer::new()?;
-    let lsb = server.lsb_tcp()?.tls(Tls::InsecureSkipVerify)?;
+    let lsb = server.lsb_tcp()?.tls_verify(false)?;
     let server_jh = server.accept_tls();
     let mut sender = lsb.build()?;
     let mut server: MockServer = server_jh.join().unwrap()?;

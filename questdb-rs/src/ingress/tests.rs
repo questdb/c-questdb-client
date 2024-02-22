@@ -1,5 +1,6 @@
 use super::*;
 use crate::{error::Result, ErrorCode};
+use tempfile::TempDir;
 
 #[cfg(feature = "ilp-over-http")]
 #[test]
@@ -8,7 +9,7 @@ fn http_simple() {
     assert_eq!(builder.protocol, SenderProtocol::IlpOverHttp);
     assert_specified_eq(&builder.host, "localhost");
     assert_specified_eq(&builder.port, SenderProtocol::IlpOverHttp.default_port());
-    assert_specified_eq(&builder.tls, Tls::Disabled);
+    assert_specified_eq(&builder.tls_enabled, false);
 }
 
 #[cfg(feature = "ilp-over-http")]
@@ -18,10 +19,8 @@ fn https_simple() {
     assert_eq!(builder.protocol, SenderProtocol::IlpOverHttp);
     assert_specified_eq(&builder.host, "localhost");
     assert_specified_eq(&builder.port, SenderProtocol::IlpOverHttp.default_port());
-    assert_specified_eq(
-        &builder.tls,
-        Tls::Enabled(CertificateAuthority::WebpkiRoots),
-    );
+    assert_specified_eq(&builder.tls_enabled, true);
+    assert_defaulted_eq(&builder.tls_ca, CertificateAuthority::WebpkiRoots);
 }
 
 #[test]
@@ -30,7 +29,7 @@ fn tcp_simple() {
     assert_eq!(builder.protocol, SenderProtocol::IlpOverTcp);
     assert_specified_eq(&builder.port, SenderProtocol::IlpOverTcp.default_port());
     assert_specified_eq(&builder.host, "localhost");
-    assert_specified_eq(&builder.tls, Tls::Disabled);
+    assert_specified_eq(&builder.tls_enabled, false);
 }
 
 #[test]
@@ -39,10 +38,8 @@ fn tcps_simple() {
     assert_eq!(builder.protocol, SenderProtocol::IlpOverTcp);
     assert_specified_eq(&builder.host, "localhost");
     assert_specified_eq(&builder.port, SenderProtocol::IlpOverTcp.default_port());
-    assert_specified_eq(
-        &builder.tls,
-        Tls::Enabled(CertificateAuthority::WebpkiRoots),
-    );
+    assert_specified_eq(&builder.tls_enabled, true);
+    assert_defaulted_eq(&builder.tls_ca, CertificateAuthority::WebpkiRoots);
 }
 
 #[test]
@@ -285,70 +282,85 @@ fn misspelled_tcp_ecdsa_auth() {
 #[test]
 fn tcps_tls_verify_on() {
     let builder = SenderBuilder::from_conf("tcps::addr=localhost;tls_verify=on;").unwrap();
-    assert_specified_eq(
-        &builder.tls,
-        Tls::Enabled(CertificateAuthority::WebpkiRoots),
-    );
+    assert_specified_eq(&builder.tls_enabled, true);
+    assert_defaulted_eq(&builder.tls_ca, CertificateAuthority::WebpkiRoots);
 }
 
 #[cfg(feature = "insecure-skip-verify")]
 #[test]
 fn tcps_tls_verify_unsafe_off() {
     let builder = SenderBuilder::from_conf("tcps::addr=localhost;tls_verify=unsafe_off;").unwrap();
-    assert_specified_eq(&builder.tls, Tls::InsecureSkipVerify);
+    assert_specified_eq(&builder.tls_enabled, true);
+    assert_defaulted_eq(&builder.tls_ca, CertificateAuthority::WebpkiRoots);
+    assert_specified_eq(&builder.tls_verify, false);
 }
 
 #[test]
 fn tcps_tls_verify_invalid() {
     assert_conf_err(
         SenderBuilder::from_conf("tcps::addr=localhost;tls_verify=off;"),
-        "Config parameter 'tls_verify' must be either 'on' or 'unsafe_off'",
+        r##"Config parameter "tls_verify" must be either "on" or "unsafe_off".'"##,
     );
 }
 
 #[test]
 fn tcps_tls_roots_webpki() {
-    let builder = SenderBuilder::from_conf("tcps::addr=localhost;tls_roots=webpki;").unwrap();
-    assert_specified_eq(
-        &builder.tls,
-        Tls::Enabled(CertificateAuthority::WebpkiRoots),
-    );
+    let builder = SenderBuilder::from_conf("tcps::addr=localhost;tls_ca=webpki_roots;").unwrap();
+    assert_specified_eq(&builder.tls_enabled, true);
+    assert_specified_eq(&builder.tls_ca, CertificateAuthority::WebpkiRoots);
+    assert_defaulted_eq(&builder.tls_roots, None);
+    assert_defaulted_eq(&builder.tls_roots_password, None);
 }
 
 #[cfg(feature = "tls-native-certs")]
 #[test]
 fn tcps_tls_roots_os() {
-    let builder = SenderBuilder::from_conf("tcps::addr=localhost;tls_roots=os-certs;").unwrap();
-    assert_specified_eq(&builder.tls, Tls::Enabled(CertificateAuthority::OsRoots));
+    let builder = SenderBuilder::from_conf("tcps::addr=localhost;tls_ca=os_roots;").unwrap();
+    assert_specified_eq(&builder.tls_enabled, true);
+    assert_specified_eq(&builder.tls_ca, CertificateAuthority::OsRoots);
+    assert_defaulted_eq(&builder.tls_roots, None);
 }
 
 #[test]
 fn tcps_tls_roots_file() {
-    let builder =
-        SenderBuilder::from_conf("tcps::addr=localhost;tls_roots=/home/questuser/cacerts.pem;")
-            .unwrap();
-    let path = PathBuf::from_str("/home/questuser/cacerts.pem").unwrap();
-    assert_specified_eq(
-        &builder.tls,
-        Tls::Enabled(CertificateAuthority::File {
-            path,
-            password: None,
-        }),
-    );
+    // Write a dummy file to test the file path
+    let tmp_dir = TempDir::new().unwrap();
+    let path = tmp_dir.path().join("cacerts.pem");
+    let mut file = std::fs::File::create(&path).unwrap();
+    file.write_all(b"dummy").unwrap();
+    let builder = SenderBuilder::from_conf(format!(
+        "tcps::addr=localhost;tls_roots={};",
+        path.to_str().unwrap()
+    ))
+    .unwrap();
+    assert_specified_eq(&builder.tls_ca, CertificateAuthority::PemFile);
+    assert_specified_eq(&builder.tls_roots, path);
+    assert_defaulted_eq(&builder.tls_roots_password, None);
+}
+
+#[test]
+fn tcps_tls_roots_file_missing() {
+    assert_conf_err(
+        SenderBuilder::from_conf("tcps::addr=localhost;tls_roots=/some/invalid/path/cacerts.pem;"),
+        "Could not open root certificate file from path \"/some/invalid/path/cacerts.pem\": No such file or directory (os error 2)");
 }
 
 #[test]
 fn tcps_tls_roots_file_with_password() {
-    let builder = SenderBuilder::from_conf(
-        "tcps::addr=localhost;tls_roots=/home/questuser/cacerts.pem;tls_roots_password=extremely_secure;",
-    ).unwrap();
-    let path = PathBuf::from_str("/home/questuser/cacerts.pem").unwrap();
+    let tmp_dir = TempDir::new().unwrap();
+    let path = tmp_dir.path().join("cacerts.pem");
+    let mut file = std::fs::File::create(&path).unwrap();
+    file.write_all(b"dummy").unwrap();
+    let builder = SenderBuilder::from_conf(format!(
+        "tcps::addr=localhost;tls_roots={};tls_roots_password=extremely_secure;",
+        path.to_str().unwrap()
+    ))
+    .unwrap();
+    assert_specified_eq(&builder.tls_ca, CertificateAuthority::PemFile);
+    assert_specified_eq(&builder.tls_roots, path);
     assert_specified_eq(
-        &builder.tls,
-        Tls::Enabled(CertificateAuthority::File {
-            path,
-            password: Some("extremely_secure".to_string()),
-        }),
+        &builder.tls_roots_password,
+        Some("extremely_secure".to_string()),
     );
 }
 
@@ -430,7 +442,6 @@ fn assert_specified_eq<V: PartialEq + Debug, IntoV: Into<V>>(
     }
 }
 
-#[cfg(feature = "ilp-over-http")]
 fn assert_defaulted_eq<V: PartialEq + std::fmt::Debug, IntoV: Into<V>>(
     actual: &ConfigSetting<V>,
     expected: IntoV,

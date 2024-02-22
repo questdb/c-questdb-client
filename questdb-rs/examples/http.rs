@@ -1,15 +1,10 @@
-use questdb::ingress::{CertificateAuthority, Tls};
 use questdb::{
-    ingress::{Buffer, SenderBuilder, TimestampNanos},
+    ingress::{Buffer, Sender, TimestampNanos},
     Result,
 };
 
 fn main() -> Result<()> {
-    let mut sender = SenderBuilder::new_http("localhost", 9000)?
-        .tls(Tls::Enabled(CertificateAuthority::WebpkiRoots))?
-        .user("foo")?
-        .pass("bar")?
-        .build()?;
+    let mut sender = Sender::from_conf("https::addr=localhost:9000;user=foo;pass=bar;")?;
     let mut buffer = Buffer::new();
     buffer
         .table("sensors")?
