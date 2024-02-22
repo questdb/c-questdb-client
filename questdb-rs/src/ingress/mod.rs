@@ -78,8 +78,7 @@
 //! # Connection Security Options
 //!
 //! To establish an [authenticated](https://questdb.io/docs/reference/api/ilp/authenticate)
-//! and TLS-encrypted connection, call the SenderBuilder's
-//! [`auth`](SenderBuilder::auth) and [`tls`](SenderBuilder::tls) methods.
+//! and TLS-encrypted connection, call the SenderBuilder's authentication and tls methods.
 //!
 //! Here's an example that uses full security:
 //!
@@ -1363,9 +1362,7 @@ enum AuthParams {
     Token(TokenAuthParams),
 }
 
-/// Root used to determine how to validate the server's TLS certificate.
-///
-/// Used when configuring the [`tls`](SenderBuilder::tls) option.
+/// Certificate authority used to determine how to validate the server's TLS certificate.
 #[derive(PartialEq, Debug, Clone, Copy)]
 pub enum CertificateAuthority {
     /// Use the root certificates provided by the
@@ -1686,7 +1683,7 @@ let mut sender = SenderBuilder::new_http("localhost", 9009)?.build()?;
 /// use questdb::ingress::SenderBuilder;
 ///
 /// # fn main() -> Result<()> {
-/// let mut sender = SenderBuilder::from_conf("https::addr=localhost:9009")?.build()?;
+/// let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
 /// # Ok(())
 /// # }
 /// ```
@@ -1696,6 +1693,7 @@ let mut sender = SenderBuilder::new_http("localhost", 9009)?.build()?;
 /// use questdb::ingress::SenderBuilder;
 ///
 /// # fn main() -> Result<()> {
+/// // export QDB_CLIENT_CONF="https::addr=localhost:9000;"
 /// let mut sender = SenderBuilder::from_env()?.build()?;
 /// # Ok(())
 /// # }
