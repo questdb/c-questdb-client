@@ -1726,7 +1726,11 @@ pub struct SenderBuilder {
 }
 
 impl SenderBuilder {
-    /// Create a new `SenderBuilder` instance from configuration parameters.
+    /// Create a new `SenderBuilder` instance from configuration string.
+    /// The format of the string is: "tcp::addr=host:port;ket=value;...;"
+    /// Alongside "tcp" you can also specify "tcps", "http", and "https".
+    /// The accepted set of keys and values is the same as for the `SenderBuilder`'s API.
+    /// E.g. "tcp::addr=host:port;user=alice;password=secret;tls_ca=os_roots;"
     pub fn from_conf<T: AsRef<str>>(conf: T) -> Result<Self> {
         let conf = conf.as_ref();
         let conf = questdb_confstr::parse_conf_str(conf)
@@ -1877,7 +1881,7 @@ impl SenderBuilder {
         Ok(builder)
     }
 
-    /// Create a new `SenderBuilder` instance from the
+    /// Create a new `SenderBuilder` instance from configuration string read from the
     /// `QDB_CLIENT_CONF` environment variable.
     pub fn from_env() -> Result<Self> {
         let conf = std::env::var("QDB_CLIENT_CONF").map_err(|_| {
@@ -1961,19 +1965,7 @@ impl SenderBuilder {
     ///
     /// This may be relevant if your machine has multiple network interfaces.
     ///
-    /// If unspecified, the default is to use any available interface and is
-    /// equivalent to calling:
-    ///
-    /// ```no_run
-    /// # use questdb::Result;
-    /// # use questdb::ingress::SenderBuilder;
-    /// # fn main() -> Result<()> {
-    /// let mut sender = SenderBuilder::new_tcp("localhost", 9009)?
-    ///     .bind_interface("0.0.0.0")?
-    ///     .build()?;
-    /// # Ok(())
-    /// # }
-    /// ```
+    /// The default is `"0.0.0.0"`.
     pub fn bind_interface<I: Into<String>>(mut self, addr: I) -> Result<Self> {
         self.ensure_specified_protocol("bind_interface", SenderProtocol::IlpOverTcp)?;
         self.net_interface
@@ -1984,7 +1976,7 @@ impl SenderBuilder {
     /// Set the username for authentication.
     ///
     /// For TCP this is the `kid` part of the ECDSA key set.
-    /// The other fields [`token`](SenderBuilder::token), [`token_x`](SenderBuilder::token_x),
+    /// The other fields are [`token`](SenderBuilder::token), [`token_x`](SenderBuilder::token_x),
     /// and [`token_y`](SenderBuilder::token_y).
     ///
     /// For HTTP this is part of basic authentication.
@@ -1996,6 +1988,7 @@ impl SenderBuilder {
     }
 
     /// Set the password for basic HTTP authentication.
+    /// Also see [`user`](SenderBuilder::user).
     pub fn pass(mut self, pass: &str) -> Result<Self> {
         self.pass
             .set_specified("pass", Some(validate_value(pass.to_string())?))?;
@@ -2083,6 +2076,7 @@ impl SenderBuilder {
         Ok(builder)
     }
 
+    /// Set the certificate authority used to determine how to validate the server's TLS certificate.
     pub fn tls_ca(self, ca: CertificateAuthority) -> Result<Self> {
         let mut builder = self.ensure_tls_enabled("tls_ca")?;
         builder.tls_ca.set_specified("tls_ca", ca)?;
