@@ -654,7 +654,6 @@ pub unsafe extern "C" fn line_sender_opts_tls_verify(
     upd_opts!(opts, err_out, tls_verify, verify)
 }
 
-
 /// Set the certificate authority used to determine how to validate the server's TLS certificate.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_opts_tls_ca(
@@ -705,8 +704,6 @@ pub unsafe extern "C" fn line_sender_opts_retry_timeout(
     upd_opts!(opts, err_out, retry_timeout, retry_timeout)
 }
 
-/*
-
 /// Minimum expected throughput in bytes per second for HTTP requests.
 /// If the throughput is lower than this value, the connection will time out.
 /// The default is 100 KiB/s.
@@ -715,16 +712,21 @@ pub unsafe extern "C" fn line_sender_opts_retry_timeout(
 pub unsafe extern "C" fn line_sender_opts_min_throughput(
     opts: *mut line_sender_opts,
     bytes_per_sec: u64,
-) {
-    upd_opts!(opts, min_throughput, bytes_per_sec);
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    upd_opts!(opts, err_out, min_throughput, bytes_per_sec)
 }
 
 /// Grace request timeout before relying on the minimum throughput logic.
 /// The default is 5 seconds.
 #[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_grace_timeout(opts: *mut line_sender_opts, millis: u64) {
+pub unsafe extern "C" fn line_sender_opts_grace_timeout(
+    opts: *mut line_sender_opts,
+    millis: u64,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
     let grace_timeout = std::time::Duration::from_millis(millis);
-    upd_opts!(opts, grace_timeout, grace_timeout);
+    upd_opts!(opts, err_out, grace_timeout, grace_timeout)
 }
 
 /// Set the HTTP user agent. Internal API. Do not use.
@@ -733,73 +735,9 @@ pub unsafe extern "C" fn line_sender_opts_grace_timeout(opts: *mut line_sender_o
 pub unsafe extern "C" fn line_sender_opts_user_agent(
     opts: *mut line_sender_opts,
     user_agent: line_sender_utf8,
-) {
-    upd_opts!(opts, user_agent, user_agent.as_str());
-}
-
-/// Enable full connection encryption via TLS.
-/// The connection will accept certificates by well-known certificate
-/// authorities as per the "webpki-roots" Rust crate.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_tls(opts: *mut line_sender_opts) {
-    upd_opts!(opts, tls, Tls::Enabled(CertificateAuthority::WebpkiRoots));
-}
-
-/// Enable full connection encryption via TLS, using OS-provided certificate roots.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_tls_os_roots(opts: *mut line_sender_opts) {
-    upd_opts!(opts, tls, Tls::Enabled(CertificateAuthority::OsRoots));
-}
-
-/// Enable full connection encryption via TLS, accepting certificates signed by either
-/// the OS-provided certificate roots or well-known certificate authorities as per
-/// the "webpki-roots" Rust crate.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_tls_webpki_and_os_roots(opts: *mut line_sender_opts) {
-    upd_opts!(
-        opts,
-        tls,
-        Tls::Enabled(CertificateAuthority::WebpkiAndOsRoots)
-    );
-}
-
-/// Enable full connection encryption via TLS.
-/// The connection will accept certificates by the specified certificate
-/// authority file.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_tls_ca(
-    opts: *mut line_sender_opts,
-    ca_path: line_sender_utf8,
-) {
-    let ca_path = PathBuf::from(ca_path.as_str());
-    upd_opts!(
-        opts,
-        tls,
-        Tls::Enabled(CertificateAuthority::File {
-            path: ca_path,
-            password: Option::None
-        })
-    );
-}
-
-/// Enable TLS whilst dangerously accepting any certificate as valid.
-/// This should only be used for debugging.
-/// Consider using calling "tls_ca" instead.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_tls_insecure_skip_verify(opts: *mut line_sender_opts) {
-    upd_opts!(opts, tls, Tls::InsecureSkipVerify);
-}
-
-/// Configure how long to wait for messages from the QuestDB server during
-/// the TLS handshake and authentication process.
-/// The default is 15 seconds.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_auth_timeout(
-    opts: *mut line_sender_opts,
-    timeout_millis: u64,
-) {
-    let timeout = std::time::Duration::from_millis(timeout_millis);
-    upd_opts!(opts, auth_timeout, timeout);
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    upd_opts!(opts, err_out, user_agent, user_agent.as_str())
 }
 
 /// Duplicate the opts object.
@@ -1276,4 +1214,3 @@ pub unsafe extern "C" fn line_sender_now_nanos() -> i64 {
 pub unsafe extern "C" fn line_sender_now_micros() -> i64 {
     TimestampMicros::now().as_i64()
 }
-*/
