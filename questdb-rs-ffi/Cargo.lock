@@ -294,6 +294,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a85ae0d477308986d89496bce6227833e11490cd27b98b809e4704b105000fd8"
 
 [[package]]
+name = "questdb-confstr-ffi"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a745c819f8ef71ca240dff7119bad4db368e0b11489c6e5e07b8e5cf2c775561"
+dependencies = [
+ "questdb-confstr",
+]
+
+[[package]]
 name = "questdb-rs"
 version = "3.1.0"
 dependencies = [
@@ -325,6 +334,7 @@ version = "3.1.0"
 dependencies = [
  "cbindgen",
  "libc",
+ "questdb-confstr-ffi",
  "questdb-rs",
 ]
 

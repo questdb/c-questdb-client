@@ -1221,7 +1221,10 @@ pub unsafe extern "C" fn line_sender_flush_and_keep_with_flags(
 ) -> bool {
     let sender = unwrap_sender_mut(sender);
     let buffer = unwrap_buffer(buffer);
-    bubble_err_to_c!(err_out, sender.flush_and_keep_with_flags(buffer, transactional));
+    bubble_err_to_c!(
+        err_out,
+        sender.flush_and_keep_with_flags(buffer, transactional)
+    );
     true
 }
 
@@ -1235,4 +1238,17 @@ pub unsafe extern "C" fn line_sender_now_nanos() -> i64 {
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_now_micros() -> i64 {
     TimestampMicros::now().as_i64()
+}
+
+#[cfg(feature = "confstr-ffi")]
+use questdb_confstr_ffi::questdb_conf_str_parse_err;
+
+#[cfg(feature = "confstr-ffi")]
+/// A build system hack.
+/// Without this, the `questdb-confstr-ffi` crate dependency is not
+/// included in the final binary.
+/// This is because otherwise `cargo` will optimise out the dependency.
+pub unsafe fn _build_system_hack(err: *mut questdb_conf_str_parse_err) {
+    use questdb_confstr_ffi::questdb_conf_str_parse_err_free;
+    questdb_conf_str_parse_err_free(err);
 }
