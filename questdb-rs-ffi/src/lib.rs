@@ -682,18 +682,6 @@ pub unsafe extern "C" fn line_sender_opts_tls_roots(
     upd_opts!(opts, err_out, tls_roots, path)
 }
 
-/// Set the password for the root certificate `.pem` file.
-/// This is used to decrypt the file pointed to by the
-/// `tls_roots` method if it's password-protected.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_tls_roots_password(
-    opts: *mut line_sender_opts,
-    password: line_sender_utf8,
-    err_out: *mut *mut line_sender_error,
-) -> bool {
-    upd_opts!(opts, err_out, tls_roots_password, password.as_str())
-}
-
 /// The maximum buffer size that the client will flush to the server.
 /// The default is 100 MiB.
 #[no_mangle]

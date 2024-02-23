@@ -1545,7 +1545,7 @@ fn configure_tls(
                     error::fmt!(
                         TlsError,
                         concat!(
-                            "Could not open certificate authority ",
+                            "Could not open tls_roots certificate authority ",
                             "file from path {:?}: {}"
                         ),
                         ca_file,
@@ -1719,7 +1719,6 @@ pub struct SenderBuilder {
 
     tls_ca: ConfigSetting<CertificateAuthority>,
     tls_roots: ConfigSetting<Option<PathBuf>>,
-    tls_roots_password: ConfigSetting<Option<String>>,
 
     #[cfg(feature = "ilp-over-http")]
     http: Option<HttpConfig>,
@@ -1856,7 +1855,12 @@ impl SenderBuilder {
                     builder.tls_roots(path)?
                 }
 
-                "tls_roots_password" => builder.tls_roots_password(val)?,
+                "tls_roots_password" => {
+                    return Err(error::fmt!(
+                        ConfigError,
+                        "\"tls_roots_password\" is not supported."
+                    ))
+                }
 
                 #[cfg(feature = "ilp-over-http")]
                 "min_throughput" => builder.min_throughput(parse_conf_value(key, val)?)?,
@@ -1917,7 +1921,6 @@ impl SenderBuilder {
 
             tls_ca: ConfigSetting::new_default(CertificateAuthority::WebpkiRoots),
             tls_roots: ConfigSetting::new_default(None),
-            tls_roots_password: ConfigSetting::new_default(None),
 
             #[cfg(feature = "ilp-over-http")]
             http: if protocol == SenderProtocol::IlpOverHttp {
@@ -2102,17 +2105,6 @@ impl SenderBuilder {
             )
         })?;
         builder.tls_roots.set_specified("tls_roots", Some(path))?;
-        Ok(builder)
-    }
-
-    /// Set the password for the root certificate `.pem` file.
-    /// This is used to decrypt the file pointed to by the
-    /// [`tls_roots`](SenderBuilder::tls_roots) method if it's password-protected.
-    pub fn tls_roots_password(self, password: &str) -> Result<Self> {
-        let mut builder = self.ensure_tls_enabled("tls_roots_password")?;
-        builder
-            .tls_roots_password
-            .set_specified("tls_roots_password", Some(password.to_string()))?;
         Ok(builder)
     }
 
