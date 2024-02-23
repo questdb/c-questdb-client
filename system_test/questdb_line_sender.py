@@ -253,7 +253,7 @@ def _setup_cdll():
         c_line_sender_utf8,
         c_uint16)
     set_sig(
-        dll.line_sender_opts_new_service,
+        dll.line_sender_opts_new_tcp_service,
         c_line_sender_opts_p,
         c_line_sender_utf8,
         c_line_sender_utf8)
@@ -430,7 +430,7 @@ def _fully_qual_name(obj):
 class _Opts:
     def __init__(self, host, port):
         self.impl = _error_wrapped_call(
-            _DLL.line_sender_opts_new_service,
+            _DLL.line_sender_opts_new_tcp_service,
             _utf8(str(host)),
             _utf8(str(port)))
 

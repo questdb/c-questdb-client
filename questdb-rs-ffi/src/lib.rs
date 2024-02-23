@@ -1139,6 +1139,29 @@ pub unsafe extern "C" fn line_sender_build(
     Box::into_raw(Box::new(line_sender(sender)))
 }
 
+/// Create a new `line_sender` instance from configuration string.
+/// The format of the string is: "tcp::addr=host:port;key=value;...;"
+/// Alongside "tcp" you can also specify "tcps", "http", and "https".
+/// The accepted set of keys and values is the same as for the opt's API.
+/// E.g. "tcp::addr=host:port;user=alice;password=secret;tls_ca=os_roots;"
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_from_conf(
+    config: line_sender_utf8,
+    err_out: *mut *mut line_sender_error,
+) -> *mut line_sender {
+    let config = config.as_str();
+    let sender = bubble_err_to_c!(err_out, Sender::from_conf(config), ptr::null_mut());
+    Box::into_raw(Box::new(line_sender(sender)))
+}
+
+/// Create a new `line_sender` instance from configuration string read from the
+/// `QDB_CLIENT_CONF` environment variable.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_from_env(err_out: *mut *mut line_sender_error) -> *mut line_sender {
+    let sender = bubble_err_to_c!(err_out, Sender::from_env(), ptr::null_mut());
+    Box::into_raw(Box::new(line_sender(sender)))
+}
+
 unsafe fn unwrap_sender<'a>(sender: *const line_sender) -> &'a Sender {
     &(*sender).0
 }

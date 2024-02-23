@@ -779,14 +779,34 @@ LINESENDER_API
 void line_sender_opts_free(line_sender_opts* opts);
 
 /**
- * Synchronously connect to the QuestDB database.
- * The connection should be accessed by only a single thread a time.
+ * Create the client.
+ * The client should be accessed by only a single thread a time.
  * @param[in] opts Options for the connection.
  * @note The opts object is freed.
  */
 LINESENDER_API
 line_sender* line_sender_build(
     const line_sender_opts* opts,
+    line_sender_error** err_out);
+
+/**
+ * Create a new `line_sender` instance from configuration string.
+ * The format of the string is: "tcp::addr=host:port;key=value;...;"
+ * Alongside "tcp" you can also specify "tcps", "http", and "https".
+ * The accepted set of keys and values is the same as for the opt's API.
+ * E.g. "tcp::addr=host:port;user=alice;password=secret;tls_ca=os_roots;"
+ */
+LINESENDER_API
+line_sender* line_sender_from_conf(
+    line_sender_utf8 config,
+    line_sender_error** err_out);
+
+/**
+ * Create a new `line_sender` instance from configuration string read from the
+ * `QDB_CLIENT_CONF` environment variable.
+ */
+LINESENDER_API
+line_sender* line_sender_from_env(
     line_sender_error** err_out);
 
 /**

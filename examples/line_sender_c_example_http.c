@@ -19,7 +19,7 @@ static bool example(const char* host, const char* port)
         goto on_error;
 
     // Call `line_sender_opts_new` if instead you have an integer port.
-    opts = line_sender_opts_new_service(host_utf8, port_utf8);
+    opts = line_sender_opts_new_tcp_service(host_utf8, port_utf8);
 
     // Use ILP/HTTP instead of ILP/TCP for better error messages.
     line_sender_opts_http(opts);
