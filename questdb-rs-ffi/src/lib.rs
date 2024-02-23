@@ -139,20 +139,20 @@ impl From<ErrorCode> for line_sender_error_code {
     }
 }
 
-/// Category of error.
+/// Certificate authority used to determine how to validate the server's TLS certificate.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub enum line_sender_ca {
-    /// The server does not support ILP over HTTP.
+    /// Use the set of root certificates provided by the `webpki` crate.
     line_sender_ca_webpki_roots,
 
-    /// The server does not support ILP over HTTP.
+    /// Use the set of root certificates provided by the operating system.
     line_sender_ca_os_roots,
 
-    /// The server does not support ILP over HTTP.
+    /// Use the set of root certificates provided by both the `webpki` crate and the operating system.
     line_sender_ca_webpki_and_os_roots,
 
-    /// The server does not support ILP over HTTP.
+    /// Use a custom root certificate `.pem` file.
     line_sender_ca_pem_file,
 }
 
@@ -470,292 +470,6 @@ pub unsafe extern "C" fn line_sender_column_name_assert(
         Err(msg) => {
             panic!("{}", msg);
         }
-    }
-}
-
-/// Accumulates parameters for creating a line sender connection.
-pub struct line_sender_opts(SenderBuilder);
-
-/// Create a new `ops` instance from configuration string.
-/// The format of the string is: "tcp::addr=host:port;ket=value;...;"
-/// Alongside "tcp" you can also specify "tcps", "http", and "https".
-/// The accepted set of keys and values is the same as for the opt's API.
-/// E.g. "tcp::addr=host:port;user=alice;password=secret;tls_ca=os_roots;"
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_from_conf(
-    config: line_sender_utf8,
-    err_out: *mut *mut line_sender_error,
-) -> *mut line_sender_opts {
-    let config = config.as_str();
-    let builder = bubble_err_to_c!(err_out, SenderBuilder::from_conf(config), ptr::null_mut());
-    Box::into_raw(Box::new(line_sender_opts(builder)))
-}
-
-/// Create a new `ops` instance from configuration string read from the
-/// `QDB_CLIENT_CONF` environment variable.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_from_env(
-    err_out: *mut *mut line_sender_error,
-) -> *mut line_sender_opts {
-    let builder = bubble_err_to_c!(err_out, SenderBuilder::from_env(), ptr::null_mut());
-    Box::into_raw(Box::new(line_sender_opts(builder)))
-}
-
-/// A new set of options for a line sender connection for ILP/TCP.
-/// @param[in] host The QuestDB database host.
-/// @param[in] port The QuestDB ILP TCP port.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_new_tcp(
-    host: line_sender_utf8,
-    port: u16,
-) -> *mut line_sender_opts {
-    let builder = SenderBuilder::new_tcp(host.as_str(), port).unwrap();
-    Box::into_raw(Box::new(line_sender_opts(builder)))
-}
-
-/// Variant of line_sender_opts_new_tcp that takes a service name for port.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_new_service(
-    host: line_sender_utf8,
-    port: line_sender_utf8,
-) -> *mut line_sender_opts {
-    let builder = SenderBuilder::new_tcp(host.as_str(), port.as_str()).unwrap();
-    Box::into_raw(Box::new(line_sender_opts(builder)))
-}
-
-/// A new set of options for a line sender connection for ILP/HTTP.
-/// @param[in] host The QuestDB database host.
-/// @param[in] port The QuestDB HTTP port.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_new_http(
-    host: line_sender_utf8,
-    port: u16,
-) -> *mut line_sender_opts {
-    let builder = SenderBuilder::new_http(host.as_str(), port).unwrap();
-    Box::into_raw(Box::new(line_sender_opts(builder)))
-}
-
-/// Variant of line_sender_opts_new_http that takes a service name for port.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_new_http_service(
-    host: line_sender_utf8,
-    port: line_sender_utf8,
-) -> *mut line_sender_opts {
-    let builder = SenderBuilder::new_http(host.as_str(), port.as_str()).unwrap();
-    Box::into_raw(Box::new(line_sender_opts(builder)))
-}
-
-/// Select local outbound network "bind" interface.
-///
-/// This may be relevant if your machine has multiple network interfaces.
-///
-/// The default is `0.0.0.0``.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_bind_interface(
-    opts: *mut line_sender_opts,
-    bind_interface: line_sender_utf8,
-    err_out: *mut *mut line_sender_error,
-) -> bool {
-    upd_opts!(opts, err_out, bind_interface, bind_interface.as_str())
-}
-
-/// Set the username for authentication.
-///
-/// For TCP this is the `kid` part of the ECDSA key set.
-/// The other fields are `token` `token_x` and `token_y`.
-///
-/// For HTTP this is part of basic authentication.
-/// Also see `pass`.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_user(
-    opts: *mut line_sender_opts,
-    user: line_sender_utf8,
-    err_out: *mut *mut line_sender_error,
-) -> bool {
-    upd_opts!(opts, err_out, user, user.as_str())
-}
-
-/// Set the password for basic HTTP authentication.
-/// Also see `user`.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_pass(
-    opts: *mut line_sender_opts,
-    pass: line_sender_utf8,
-    err_out: *mut *mut line_sender_error,
-) -> bool {
-    upd_opts!(opts, err_out, pass, pass.as_str())
-}
-
-/// Token (Bearer) Authentication Parameters for ILP over HTTP,
-/// or the ECDSA private key for ILP over TCP authentication.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_token(
-    opts: *mut line_sender_opts,
-    token: line_sender_utf8,
-    err_out: *mut *mut line_sender_error,
-) -> bool {
-    upd_opts!(opts, err_out, token, token.as_str())
-}
-
-/// The ECDSA public key X for ILP over TCP authentication.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_token_x(
-    opts: *mut line_sender_opts,
-    token_x: line_sender_utf8,
-    err_out: *mut *mut line_sender_error,
-) -> bool {
-    upd_opts!(opts, err_out, token_x, token_x.as_str())
-}
-
-/// The ECDSA public key Y for ILP over TCP authentication.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_token_y(
-    opts: *mut line_sender_opts,
-    token_y: line_sender_utf8,
-    err_out: *mut *mut line_sender_error,
-) -> bool {
-    upd_opts!(opts, err_out, token_y, token_y.as_str())
-}
-
-/// Configure how long to wait for messages from the QuestDB server during
-/// the TLS handshake and authentication process.
-/// The default is 15000 milliseconds.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_auth_timeout(
-    opts: *mut line_sender_opts,
-    timeout_millis: u64,
-    err_out: *mut *mut line_sender_error,
-) -> bool {
-    let timeout = std::time::Duration::from_millis(timeout_millis);
-    upd_opts!(opts, err_out, auth_timeout, timeout)
-}
-
-/// Enable or disable TLS.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_tls_enabled(
-    opts: *mut line_sender_opts,
-    enabled: bool,
-    err_out: *mut *mut line_sender_error,
-) -> bool {
-    upd_opts!(opts, err_out, tls_enabled, enabled)
-}
-
-/// Set to `false` to disable TLS certificate verification.
-/// This should only be used for debugging purposes as it reduces security.
-///
-/// For testing consider specifying a path to a `.pem` file instead via
-/// the `tls_roots`.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_tls_verify(
-    opts: *mut line_sender_opts,
-    verify: bool,
-    err_out: *mut *mut line_sender_error,
-) -> bool {
-    upd_opts!(opts, err_out, tls_verify, verify)
-}
-
-/// Set the certificate authority used to determine how to validate the server's TLS certificate.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_tls_ca(
-    opts: *mut line_sender_opts,
-    ca: line_sender_ca,
-    err_out: *mut *mut line_sender_error,
-) -> bool {
-    let ca: CertificateAuthority = ca.into();
-    upd_opts!(opts, err_out, tls_ca, ca)
-}
-
-/// Set the path to a custom root certificate `.pem` file.
-/// This is used to validate the server's certificate during the TLS handshake.
-/// The file may be password-protected, if so, also specify the password.
-/// via the `tls_roots_password` method.
-///
-/// See notes on how to test with [self-signed certificates](https://github.com/questdb/c-questdb-client/tree/main/tls_certs).
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_tls_roots(
-    opts: *mut line_sender_opts,
-    path: line_sender_utf8,
-    err_out: *mut *mut line_sender_error,
-) -> bool {
-    let path = PathBuf::from(path.as_str());
-    upd_opts!(opts, err_out, tls_roots, path)
-}
-
-/// The maximum buffer size that the client will flush to the server.
-/// The default is 100 MiB.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_max_buf_size(
-    opts: *mut line_sender_opts,
-    max_buf_size: size_t,
-    err_out: *mut *mut line_sender_error,
-) -> bool {
-    upd_opts!(opts, err_out, max_buf_size, max_buf_size)
-}
-
-/// Cumulative duration spent in retries.
-/// Default is 10 seconds.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_retry_timeout(
-    opts: *mut line_sender_opts,
-    millis: u64,
-    err_out: *mut *mut line_sender_error,
-) -> bool {
-    let retry_timeout = std::time::Duration::from_millis(millis);
-    upd_opts!(opts, err_out, retry_timeout, retry_timeout)
-}
-
-/// Minimum expected throughput in bytes per second for HTTP requests.
-/// If the throughput is lower than this value, the connection will time out.
-/// The default is 100 KiB/s.
-/// The value is expressed as a number of bytes per second.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_min_throughput(
-    opts: *mut line_sender_opts,
-    bytes_per_sec: u64,
-    err_out: *mut *mut line_sender_error,
-) -> bool {
-    upd_opts!(opts, err_out, min_throughput, bytes_per_sec)
-}
-
-/// Grace request timeout before relying on the minimum throughput logic.
-/// The default is 5 seconds.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_grace_timeout(
-    opts: *mut line_sender_opts,
-    millis: u64,
-    err_out: *mut *mut line_sender_error,
-) -> bool {
-    let grace_timeout = std::time::Duration::from_millis(millis);
-    upd_opts!(opts, err_out, grace_timeout, grace_timeout)
-}
-
-/// Set the HTTP user agent. Internal API. Do not use.
-#[doc(hidden)]
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_user_agent(
-    opts: *mut line_sender_opts,
-    user_agent: line_sender_utf8,
-    err_out: *mut *mut line_sender_error,
-) -> bool {
-    upd_opts!(opts, err_out, user_agent, user_agent.as_str())
-}
-
-/// Duplicate the opts object.
-/// Both old and new objects will have to be freed.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_clone(
-    opts: *const line_sender_opts,
-) -> *mut line_sender_opts {
-    let builder = &(*opts).0;
-    let new_builder = builder.clone();
-    Box::into_raw(Box::new(line_sender_opts(new_builder)))
-}
-
-/// Release the opts object.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_free(opts: *mut line_sender_opts) {
-    if !opts.is_null() {
-        drop(Box::from_raw(opts));
     }
 }
 
@@ -1114,6 +828,292 @@ pub unsafe extern "C" fn line_sender_buffer_at_now(
     true
 }
 
+/// Accumulates parameters for creating a line sender connection.
+pub struct line_sender_opts(SenderBuilder);
+
+/// Create a new `ops` instance from configuration string.
+/// The format of the string is: "tcp::addr=host:port;ket=value;...;"
+/// Alongside "tcp" you can also specify "tcps", "http", and "https".
+/// The accepted set of keys and values is the same as for the opt's API.
+/// E.g. "tcp::addr=host:port;user=alice;password=secret;tls_ca=os_roots;"
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_from_conf(
+    config: line_sender_utf8,
+    err_out: *mut *mut line_sender_error,
+) -> *mut line_sender_opts {
+    let config = config.as_str();
+    let builder = bubble_err_to_c!(err_out, SenderBuilder::from_conf(config), ptr::null_mut());
+    Box::into_raw(Box::new(line_sender_opts(builder)))
+}
+
+/// Create a new `ops` instance from configuration string read from the
+/// `QDB_CLIENT_CONF` environment variable.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_from_env(
+    err_out: *mut *mut line_sender_error,
+) -> *mut line_sender_opts {
+    let builder = bubble_err_to_c!(err_out, SenderBuilder::from_env(), ptr::null_mut());
+    Box::into_raw(Box::new(line_sender_opts(builder)))
+}
+
+/// A new set of options for a line sender connection for ILP/TCP.
+/// @param[in] host The QuestDB database host.
+/// @param[in] port The QuestDB ILP TCP port.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_new_tcp(
+    host: line_sender_utf8,
+    port: u16,
+) -> *mut line_sender_opts {
+    let builder = SenderBuilder::new_tcp(host.as_str(), port).unwrap();
+    Box::into_raw(Box::new(line_sender_opts(builder)))
+}
+
+/// Variant of line_sender_opts_new_tcp that takes a service name for port.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_new_tcp_service(
+    host: line_sender_utf8,
+    port: line_sender_utf8,
+) -> *mut line_sender_opts {
+    let builder = SenderBuilder::new_tcp(host.as_str(), port.as_str()).unwrap();
+    Box::into_raw(Box::new(line_sender_opts(builder)))
+}
+
+/// A new set of options for a line sender connection for ILP/HTTP.
+/// @param[in] host The QuestDB database host.
+/// @param[in] port The QuestDB HTTP port.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_new_http(
+    host: line_sender_utf8,
+    port: u16,
+) -> *mut line_sender_opts {
+    let builder = SenderBuilder::new_http(host.as_str(), port).unwrap();
+    Box::into_raw(Box::new(line_sender_opts(builder)))
+}
+
+/// Variant of line_sender_opts_new_http that takes a service name for port.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_new_http_service(
+    host: line_sender_utf8,
+    port: line_sender_utf8,
+) -> *mut line_sender_opts {
+    let builder = SenderBuilder::new_http(host.as_str(), port.as_str()).unwrap();
+    Box::into_raw(Box::new(line_sender_opts(builder)))
+}
+
+/// Select local outbound network "bind" interface.
+///
+/// This may be relevant if your machine has multiple network interfaces.
+///
+/// The default is `0.0.0.0``.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_bind_interface(
+    opts: *mut line_sender_opts,
+    bind_interface: line_sender_utf8,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    upd_opts!(opts, err_out, bind_interface, bind_interface.as_str())
+}
+
+/// Set the username for authentication.
+///
+/// For TCP this is the `kid` part of the ECDSA key set.
+/// The other fields are `token` `token_x` and `token_y`.
+///
+/// For HTTP this is part of basic authentication.
+/// Also see `pass`.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_user(
+    opts: *mut line_sender_opts,
+    user: line_sender_utf8,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    upd_opts!(opts, err_out, user, user.as_str())
+}
+
+/// Set the password for basic HTTP authentication.
+/// Also see `user`.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_pass(
+    opts: *mut line_sender_opts,
+    pass: line_sender_utf8,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    upd_opts!(opts, err_out, pass, pass.as_str())
+}
+
+/// Token (Bearer) Authentication Parameters for ILP over HTTP,
+/// or the ECDSA private key for ILP over TCP authentication.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_token(
+    opts: *mut line_sender_opts,
+    token: line_sender_utf8,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    upd_opts!(opts, err_out, token, token.as_str())
+}
+
+/// The ECDSA public key X for ILP over TCP authentication.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_token_x(
+    opts: *mut line_sender_opts,
+    token_x: line_sender_utf8,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    upd_opts!(opts, err_out, token_x, token_x.as_str())
+}
+
+/// The ECDSA public key Y for ILP over TCP authentication.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_token_y(
+    opts: *mut line_sender_opts,
+    token_y: line_sender_utf8,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    upd_opts!(opts, err_out, token_y, token_y.as_str())
+}
+
+/// Configure how long to wait for messages from the QuestDB server during
+/// the TLS handshake and authentication process.
+/// The default is 15000 milliseconds.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_auth_timeout(
+    opts: *mut line_sender_opts,
+    timeout_millis: u64,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    let timeout = std::time::Duration::from_millis(timeout_millis);
+    upd_opts!(opts, err_out, auth_timeout, timeout)
+}
+
+/// Enable or disable TLS.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_tls_enabled(
+    opts: *mut line_sender_opts,
+    enabled: bool,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    upd_opts!(opts, err_out, tls_enabled, enabled)
+}
+
+/// Set to `false` to disable TLS certificate verification.
+/// This should only be used for debugging purposes as it reduces security.
+///
+/// For testing consider specifying a path to a `.pem` file instead via
+/// the `tls_roots` setting.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_tls_verify(
+    opts: *mut line_sender_opts,
+    verify: bool,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    upd_opts!(opts, err_out, tls_verify, verify)
+}
+
+/// Set the certificate authority used to determine how to validate the server's TLS certificate.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_tls_ca(
+    opts: *mut line_sender_opts,
+    ca: line_sender_ca,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    let ca: CertificateAuthority = ca.into();
+    upd_opts!(opts, err_out, tls_ca, ca)
+}
+
+/// Set the path to a custom root certificate `.pem` file.
+/// This is used to validate the server's certificate during the TLS handshake.
+/// The file may be password-protected, if so, also specify the password.
+/// via the `tls_roots_password` method.
+///
+/// See notes on how to test with [self-signed certificates](https://github.com/questdb/c-questdb-client/tree/main/tls_certs).
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_tls_roots(
+    opts: *mut line_sender_opts,
+    path: line_sender_utf8,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    let path = PathBuf::from(path.as_str());
+    upd_opts!(opts, err_out, tls_roots, path)
+}
+
+/// The maximum buffer size that the client will flush to the server.
+/// The default is 100 MiB.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_max_buf_size(
+    opts: *mut line_sender_opts,
+    max_buf_size: size_t,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    upd_opts!(opts, err_out, max_buf_size, max_buf_size)
+}
+
+/// Cumulative duration spent in retries.
+/// Default is 10 seconds.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_retry_timeout(
+    opts: *mut line_sender_opts,
+    millis: u64,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    let retry_timeout = std::time::Duration::from_millis(millis);
+    upd_opts!(opts, err_out, retry_timeout, retry_timeout)
+}
+
+/// Minimum expected throughput in bytes per second for HTTP requests.
+/// If the throughput is lower than this value, the connection will time out.
+/// The default is 100 KiB/s.
+/// The value is expressed as a number of bytes per second.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_min_throughput(
+    opts: *mut line_sender_opts,
+    bytes_per_sec: u64,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    upd_opts!(opts, err_out, min_throughput, bytes_per_sec)
+}
+
+/// Grace request timeout before relying on the minimum throughput logic.
+/// The default is 5 seconds.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_grace_timeout(
+    opts: *mut line_sender_opts,
+    millis: u64,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    let grace_timeout = std::time::Duration::from_millis(millis);
+    upd_opts!(opts, err_out, grace_timeout, grace_timeout)
+}
+
+/// Set the HTTP user agent. Internal API. Do not use.
+#[doc(hidden)]
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_user_agent(
+    opts: *mut line_sender_opts,
+    user_agent: line_sender_utf8,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    upd_opts!(opts, err_out, user_agent, user_agent.as_str())
+}
+
+/// Duplicate the opts object.
+/// Both old and new objects will have to be freed.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_clone(
+    opts: *const line_sender_opts,
+) -> *mut line_sender_opts {
+    let builder = &(*opts).0;
+    let new_builder = builder.clone();
+    Box::into_raw(Box::new(line_sender_opts(new_builder)))
+}
+
+/// Release the opts object.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_free(opts: *mut line_sender_opts) {
+    if !opts.is_null() {
+        drop(Box::from_raw(opts));
+    }
+}
+
 /// Insert data into QuestDB via the InfluxDB Line Protocol.
 ///
 /// Batch up rows in `buffer` objects, then call `flush` to send them.
@@ -1200,6 +1200,28 @@ pub unsafe extern "C" fn line_sender_flush_and_keep(
     let sender = unwrap_sender_mut(sender);
     let buffer = unwrap_buffer(buffer);
     bubble_err_to_c!(err_out, sender.flush_and_keep(buffer));
+    true
+}
+
+/// Variant of `.flush()` that does not clear the buffer and allows for
+/// transactional flushes.
+///
+/// A transactional flush is simply a flush that ensures that all rows in
+/// the ILP buffer refer to the same table, thus allowing the server to
+/// treat the flush request as a single transaction.
+///
+/// This is because QuestDB does not support transactions spanning multiple
+/// tables.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_flush_and_keep_with_flags(
+    sender: *mut line_sender,
+    buffer: *const line_sender_buffer,
+    transactional: bool,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    let sender = unwrap_sender_mut(sender);
+    let buffer = unwrap_buffer(buffer);
+    bubble_err_to_c!(err_out, sender.flush_and_keep_with_flags(buffer, transactional));
     true
 }
 

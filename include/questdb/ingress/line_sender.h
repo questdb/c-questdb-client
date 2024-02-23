@@ -75,7 +75,25 @@ typedef enum line_sender_error_code
 
     /** Error sent back from the server during flush. */
     line_sender_error_server_flush_error,
+
+    /** Bad configuration. */
+    line_sender_error_config_error,
 } line_sender_error_code;
+
+/* Certificate authority used to determine how to validate the server's TLS certificate. */
+typedef enum line_sender_ca {
+    /** Use the set of root certificates provided by the `webpki` crate. */
+    line_sender_ca_webpki_roots,
+
+    /** Use the set of root certificates provided by the operating system. */
+    line_sender_ca_os_roots,
+
+    /** Use the set of root certificates provided by both the `webpki` crate and the operating system. */
+    line_sender_ca_webpki_and_os_roots,
+
+    /** Use a custom root certificate `.pem` file. */
+    line_sender_ca_pem_file,
+};
 
 /** Error code categorizing the error. */
 LINESENDER_API
@@ -528,85 +546,205 @@ typedef struct line_sender line_sender;
 typedef struct line_sender_opts line_sender_opts;
 
 /**
- * A new set of options for a line sender connection.
- * @param[in] host The QuestDB database host.
- * @param[in] port The QuestDB database port.
+ * Create a new `ops` instance from configuration string.
+ * The format of the string is: "tcp::addr=host:port;key=value;...;"
+ * Alongside "tcp" you can also specify "tcps", "http", and "https".
+ * The accepted set of keys and values is the same as for the opt's API.
+ * E.g. "tcp::addr=host:port;user=alice;password=secret;tls_ca=os_roots;"
  */
 LINESENDER_API
-line_sender_opts* line_sender_opts_new(
+line_sender_opts* line_sender_opts_from_conf(
+    line_sender_utf8 config,
+    line_sender_error** err_out);
+
+/// Create a new `ops` instance from configuration string read from the
+/// `QDB_CLIENT_CONF` environment variable.
+
+/**
+ * Create a new `ops` instance from configuration string read from the
+ * `QDB_CLIENT_CONF` environment variable.
+ */
+LINESENDER_API
+line_sender_opts* line_sender_opts_from_env(
+    line_sender_error** err_out);
+
+/**
+ * A new set of options for a line sender connection for ILP/TCP.
+ * @param[in] host The QuestDB database host.
+ * @param[in] port The QuestDB ILP TCP port.
+ */
+LINESENDER_API
+line_sender_opts* line_sender_opts_new_tcp(
     line_sender_utf8 host,
     uint16_t port);
 
 /**
- * A new set of options for a line sender connection.
- * @param[in] host The QuestDB database host.
- * @param[in] port The QuestDB database port as service name.
+ * Variant of line_sender_opts_new_tcp that takes a service name for port.
  */
 LINESENDER_API
-line_sender_opts* line_sender_opts_new_service(
+line_sender_opts* line_sender_opts_new_tcp_service(
     line_sender_utf8 host,
     line_sender_utf8 port);
 
-/** Select local outbound interface. */
+/**
+ * A new set of options for a line sender connection for ILP/HTTP.
+ * @param[in] host The QuestDB database host.
+ * @param[in] port The QuestDB HTTP port.
+ */
 LINESENDER_API
-void line_sender_opts_net_interface(
-    line_sender_opts* opts,
-    line_sender_utf8 net_interface);
+line_sender_opts* line_sender_opts_new_http(
+    line_sender_utf8 host,
+    uint16_t port);
 
 /**
- * ECDSA Authentication Parameters for ILP over TCP.
- * For HTTP, use `basic_auth` instead.
+ * Variant of line_sender_opts_new_http that takes a service name for port.
+ */
+LINESENDER_API
+line_sender_opts* line_sender_opts_new_http_service(
+    line_sender_utf8 host,
+    line_sender_utf8 port);
+
+/** 
+ * Select local outbound network "bind" interface.
  *
- * @param[in] key_id Key id. AKA "kid"
- * @param[in] priv_key Private key. AKA "d".
- * @param[in] pub_key_x Public key X coordinate. AKA "x".
- * @param[in] pub_key_y Public key Y coordinate. AKA "y".
- */
-LINESENDER_API
-void line_sender_opts_auth(
-    line_sender_opts* opts,
-    line_sender_utf8 key_id,
-    line_sender_utf8 priv_key,
-    line_sender_utf8 pub_key_x,
-    line_sender_utf8 pub_key_y);
-
-/**
- * Basic Authentication Parameters for ILP over HTTP.
- * For TCP, use `auth` instead.
+ * This may be relevant if your machine has multiple network interfaces.
  *
- * @param[in] username Username.
- * @param[in] password Password.
+ * The default is `0.0.0.0``.
  */
 LINESENDER_API
-void line_sender_opts_basic_auth(
+bool line_sender_opts_bind_interface(
     line_sender_opts* opts,
-    line_sender_utf8 username,
-    line_sender_utf8 password);
-
+    line_sender_utf8 bind_interface,
+    line_sender_error** err_out);
 
 /**
- * Token (Bearer) Authentication Parameters for ILP over HTTP.
- * For TCP, use `auth` instead.
+ * Set the username for authentication.
+ * 
+ * For TCP this is the `kid` part of the ECDSA key set.
+ * The other fields are `token` `token_x` and `token_y`.
+ * 
+ * For HTTP this is part of basic authentication.
+ * Also see `pass`.
  */
 LINESENDER_API
-void line_sender_opts_token_auth(
+bool line_sender_opts_user(
     line_sender_opts* opts,
-    line_sender_utf8 token);
+    line_sender_utf8 user,
+    line_sender_error** err_out);
 
 /**
- * Enable ILP over HTTP.
+ * Set the password for basic HTTP authentication.
+ * Also see `user`.
  */
 LINESENDER_API
-void line_sender_opts_http(line_sender_opts* opts);
+bool line_sender_opts_pass(
+    line_sender_opts* opts,
+    line_sender_utf8 pass,
+    line_sender_error** err_out);
+
+/**
+ * Token (Bearer) Authentication Parameters for ILP over HTTP,
+ * or the ECDSA private key for ILP over TCP authentication.
+ */
+LINESENDER_API
+bool line_sender_opts_token(
+    line_sender_opts* opts,
+    line_sender_utf8 token,
+    line_sender_error** err_out);
+
+/**
+ * The ECDSA public key X for ILP over TCP authentication.
+ */
+LINESENDER_API
+bool line_sender_opts_token_x(
+    line_sender_opts* opts,
+    line_sender_utf8 token_x,
+    line_sender_error** err_out);
+
+/**
+ * The ECDSA public key Y for ILP over TCP authentication.
+ */
+LINESENDER_API
+bool line_sender_opts_token_y(
+    line_sender_opts* opts,
+    line_sender_utf8 token_y,
+    line_sender_error** err_out);
+
+/**
+ * Configure how long to wait for messages from the QuestDB server during
+ * the TLS handshake and authentication process.
+ * The default is 15 seconds.
+ */
+LINESENDER_API
+void line_sender_opts_auth_timeout(
+    line_sender_opts* opts,
+    uint64_t millis);
+
+/**
+ * Enable or disable TLS.
+ */
+LINESENDER_API
+bool line_sender_opts_tls_enabled(
+    line_sender_opts* opts,
+    bool enabled,
+    line_sender_error** err_out);
+
+/**
+ * Set to `false` to disable TLS certificate verification.
+ * This should only be used for debugging purposes as it reduces security.
+ * 
+ * For testing consider specifying a path to a `.pem` file instead via
+ * the `tls_roots` setting.
+ */
+LINESENDER_API
+bool line_sender_opts_tls_verify(
+    line_sender_opts* opts,
+    bool verify,
+    line_sender_error** err_out);
+
+/**
+ * Set the certificate authority used to determine how to validate the server's TLS certificate.
+ */
+LINESENDER_API
+bool line_sender_opts_tls_ca(
+    line_sender_opts* opts,
+    line_sender_ca ca,
+    line_sender_error** err_out);
+
+/**
+ * Set the path to a custom root certificate `.pem` file.
+ * This is used to validate the server's certificate during the TLS handshake.
+ * The file may be password-protected, if so, also specify the password.
+ * via the `tls_roots_password` method.
+ *
+ * See notes on how to test with self-signed certificates:
+ * https://github.com/questdb/c-questdb-client/tree/main/tls_certs.
+ */
+LINESENDER_API
+bool line_sender_opts_tls_roots(
+    line_sender_opts* opts,
+    line_sender_utf8 path,
+    line_sender_error** err_out);
+
+/**
+ * The maximum buffer size that the client will flush to the server.
+ * The default is 100 MiB.
+ */
+LINESENDER_API
+bool line_sender_opts_max_buf_size(
+    line_sender_opts* opts,
+    size_t max_buf_size,
+    line_sender_error** err_out);
 
 /**
  * Cumulative duration spent in retries.
  * Default is 10 seconds.
  */
 LINESENDER_API
-void line_sender_opts_retry_timeout(
+bool line_sender_opts_retry_timeout(
     line_sender_opts* opts,
-    uint64_t millis);
+    uint64_t millis,
+    line_sender_error** err_out);
 
 /**
  * Minimum expected throughput in bytes per second for HTTP requests.
@@ -615,76 +753,20 @@ void line_sender_opts_retry_timeout(
  * The value is expressed as a number of bytes per second.
  */
 LINESENDER_API
-void line_sender_opts_min_throughput(
+bool line_sender_opts_min_throughput(
     line_sender_opts* opts,
-    uint64_t bytes_per_sec);
+    uint64_t bytes_per_sec,
+    line_sender_error** err_out);
 
 /**
  * Grace request timeout before relying on the minimum throughput logic.
  * The default is 5 seconds.
  */
 LINESENDER_API
-void line_sender_opts_grace_timeout(
+bool line_sender_opts_grace_timeout(
     line_sender_opts* opts,
-    uint64_t millis);
-
-/**
- * Enable transactional flushes.
- * This is only relevant for HTTP.
- * This works by ensuring that the buffer contains lines for a single table.
- */
-LINESENDER_API
-void line_sender_opts_transactional(line_sender_opts* opts);
-
-/**
- * Enable full connection encryption via TLS.
- * The connection will accept certificates by well-known certificate
- * authorities as per the "webpki-roots" Rust crate.
- */
-LINESENDER_API
-void line_sender_opts_tls(line_sender_opts* opts);
-
-/**
- * Enable full connection encryption via TLS, using OS-provided certificate roots.
- */
-LINESENDER_API
-void line_sender_opts_tls_os_roots(line_sender_opts* opts);
-
-/*
- * Enable full connection encryption via TLS, accepting certificates signed by either
- * the OS-provided certificate roots or well-known certificate authorities as per
- * the "webpki-roots" Rust crate.
- */
-LINESENDER_API
-void line_sender_opts_tls_webpki_and_os_roots(line_sender_opts* opts);
-
-/**
- * Enable full connection encryption via TLS.
- * The connection will accept certificates by the specified certificate
- * authority file.
- */
-LINESENDER_API
-void line_sender_opts_tls_ca(
-    line_sender_opts* opts,
-    line_sender_utf8 ca_path);
-
-/**
- * Enable TLS whilst dangerously accepting any certificate as valid.
- * This should only be used for debugging.
- * Consider using calling "tls_ca" instead.
- */
-LINESENDER_API
-void line_sender_opts_tls_insecure_skip_verify(line_sender_opts* opts);
-
-/**
- * Configure how long to wait for messages from the QuestDB server during
- * the TLS handshake and authentication process.
- * The default is 15 seconds.
- */
-LINESENDER_API
-void line_sender_opts_read_timeout(
-    line_sender_opts* opts,
-    uint64_t timeout_millis);
+    uint64_t millis,
+    line_sender_error** err_out);
 
 /**
  * Duplicate the opts object.
@@ -705,9 +787,24 @@ void line_sender_opts_free(line_sender_opts* opts);
  * @note The opts object is freed.
  */
 LINESENDER_API
-line_sender *line_sender_build(
+line_sender* line_sender_build(
     const line_sender_opts* opts,
     line_sender_error** err_out);
+
+/**
+ * Check if an error occurred previously and the sender must be closed.
+ * @param[in] sender Line sender object.
+ * @return true if an error occurred with a sender and it must be closed.
+ */
+LINESENDER_API
+bool line_sender_must_close(const line_sender* sender);
+
+/**
+ * Close the connection. Does not flush. Non-idempotent.
+ * @param[in] sender Line sender object.
+ */
+LINESENDER_API
+void line_sender_close(line_sender* sender);
 
 /**
  * Send buffer of rows to the QuestDB server.
@@ -740,21 +837,33 @@ bool line_sender_flush_and_keep(
     const line_sender_buffer* buffer,
     line_sender_error** err_out);
 
-/**
- * Check if an error occurred previously and the sender must be closed.
- * @param[in] sender Line sender object.
- * @return true if an error occurred with a sender and it must be closed.
- */
-LINESENDER_API
-bool line_sender_must_close(const line_sender* sender);
+/// Variant of `.flush()` that does not clear the buffer and allows for
+/// transactional flushes.
+///
+/// A transactional flush is simply a flush that ensures that all rows in
+/// the ILP buffer refer to the same table, thus allowing the server to
+/// treat the flush request as a single transaction.
+///
+/// This is because QuestDB does not support transactions spanning multiple
+/// tables.
 
 /**
- * Close the connection. Does not flush. Non-idempotent.
- * @param[in] sender Line sender object.
+ * Variant of `.flush()` that does not clear the buffer and allows for
+ * transactional flushes.
+ * 
+ * A transactional flush is simply a flush that ensures that all rows in
+ * the ILP buffer refer to the same table, thus allowing the server to
+ * treat the flush request as a single transaction.
+ * 
+ * This is because QuestDB does not support transactions spanning multiple
+ * tables.
  */
 LINESENDER_API
-void line_sender_close(line_sender* sender);
-
+bool line_sender_flush_and_keep_with_flags(
+    line_sender* sender,
+    line_sender_buffer* buffer,
+    bool transactional,
+    line_sender_error** err_out);
 
 /////////// Getting the current timestamp.
 
