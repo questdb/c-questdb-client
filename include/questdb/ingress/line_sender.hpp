@@ -74,6 +74,24 @@ namespace questdb::ingress
 
         /** Error sent back from the server during flush. */
         server_flush_error,
+
+        /** Bad configuration. */
+        config_error,
+    };
+
+    /* Certificate authority used to determine how to validate the server's TLS certificate. */
+    enum class line_sender_ca {
+        /** Use the set of root certificates provided by the `webpki` crate. */
+        webpki_roots,
+
+        /** Use the set of root certificates provided by the operating system. */
+        os_roots,
+
+        /** Use the set of root certificates provided by both the `webpki` crate and the operating system. */
+        webpki_and_os_roots,
+
+        /** Use a custom root certificate `.pem` file. */
+        pem_file,
     };
 
     /**
@@ -694,29 +712,76 @@ namespace questdb::ingress
         friend class line_sender;
     };
 
+    /**
+     * Protocol to use for the line sender.
+     */
+    enum class line_sender_protocol
+    {
+        /** ILP/TCP */
+        tcp,
+
+        /** ILP/HTTP */
+        http,
+    };
+
     class opts
     {
         public:
             /**
+             * Create a new `ops` instance from configuration string.
+             * The format of the string is: "tcp::addr=host:port;key=value;...;"
+             * Alongside "tcp" you can also specify "tcps", "http", and "https".
+             * The accepted set of keys and values is the same as for the opt's API.
+             * E.g. "tcp::addr=host:port;user=alice;password=secret;tls_ca=os_roots;"
+             */
+            static inline opts from_conf(utf8_view conf)
+            {
+                return {line_sender_error::wrapped_call(
+                    ::line_sender_opts_from_conf,
+                    conf._impl)};
+            }
+
+            /**
+             * Create a new `ops` instance from configuration string read from the
+             * `QDB_CLIENT_CONF` environment variable.
+             */
+            static inline opts from_env()
+            {
+                return {line_sender_error::wrapped_call(
+                    ::line_sender_opts_from_env)};
+            }
+
+            /**
              * A new set of options for a line sender connection.
+             * @param[in] protocol The protocol to use.
              * @param[in] host The QuestDB database host.
-             * @param[in] port The QuestDB database port.
+             * @param[in] port The QuestDB tcp or http port.
              */
             opts(
+                line_sender_protocol protocol,
                 utf8_view host,
                 uint16_t port) noexcept
-                : _impl{::line_sender_opts_new(host._impl, port)}
+                : _impl{
+                    protocol == line_sender_protocol::tcp
+                        ? ::line_sender_opts_new_tcp(host._impl, port)
+                        : ::line_sender_opts_new_http(host._impl, port)
+                }
             {}
 
             /**
              * A new set of options for a line sender connection.
              * @param[in] host The QuestDB database host.
-             * @param[in] port The QuestDB database port as service name.
+             * @param[in] port The QuestDB tcp or http port as service name.
              */
             opts(
+                line_sender_protocol protocol,
                 utf8_view host,
                 utf8_view port) noexcept
-                : _impl{::line_sender_opts_new_service(host._impl, port._impl)}
+                : _impl{
+                    protocol == line_sender_protocol::tcp
+                        ? ::line_sender_opts_new_tcp_service(host._impl, port._impl)
+                        : ::line_sender_opts_new_http_service(host._impl, port._impl)
+                }
             {}
 
             opts(const opts& other) noexcept
@@ -750,76 +815,187 @@ namespace questdb::ingress
                 return *this;
             }
 
-            /** Select local outbound interface. */
-            opts& net_interface(utf8_view net_interface) noexcept
-            {
-                ::line_sender_opts_net_interface(
-                    _impl,
-                    net_interface._impl);
-                return *this;
-            }
-
-            /**
-             * ECDSA Authentication Parameters for ILP over TCP.
-             * For HTTP, use `basic_auth` instead.
+            /** 
+             * Select local outbound network "bind" interface.
              *
-             * @param[in] key_id Key id. AKA "kid"
-             * @param[in] priv_key Private key. AKA "d".
-             * @param[in] pub_key_x Public key X coordinate. AKA "x".
-             * @param[in] pub_key_y Public key Y coordinate. AKA "y".
-             */
-            opts& auth(
-                utf8_view key_id,
-                utf8_view priv_key,
-                utf8_view pub_key_x,
-                utf8_view pub_key_y) noexcept
-            {
-                ::line_sender_opts_auth(
-                    _impl,
-                    key_id._impl,
-                    priv_key._impl,
-                    pub_key_x._impl,
-                    pub_key_y._impl);
-                return *this;
-            }
-
-            /**
-             * Basic Authentication Parameters for ILP over HTTP.
-             * For TCP, use `auth` instead.
+             * This may be relevant if your machine has multiple network interfaces.
              *
-             * @param[in] username Username.
-             * @param[in] password Password.
+             * The default is `0.0.0.0``.
              */
-            opts& basic_auth(
-                utf8_view username,
-                utf8_view password) noexcept
+            opts& bind_interface(utf8_view bind_interface)
             {
-                ::line_sender_opts_basic_auth(
+                line_sender_error::wrapped_call(
+                    ::line_sender_opts_bind_interface,
                     _impl,
-                    username._impl,
-                    password._impl);
+                    bind_interface._impl);
+                return *this;
+            }
+
+            // /**
+            //  * Set the username for authentication.
+            //  * 
+            //  * For TCP this is the `kid` part of the ECDSA key set.
+            //  * The other fields are `token` `token_x` and `token_y`.
+            //  * 
+            //  * For HTTP this is part of basic authentication.
+            //  * Also see `pass`.
+            //  */
+            // LINESENDER_API
+            // bool line_sender_opts_user(
+            //     line_sender_opts* opts,
+            //     line_sender_utf8 user,
+            //     line_sender_error** err_out);
+
+            /**
+             * Set the username for basic HTTP authentication.
+             * 
+             * For TCP this is the `kid` part of the ECDSA key set.
+             * The other fields are `token` `token_x` and `token_y`.
+             * 
+             * For HTTP this is part of basic authentication.
+             * Also see `pass`.
+             */
+            opts& user(utf8_view user)
+            {
+                line_sender_error::wrapped_call(
+                    ::line_sender_opts_user,
+                    _impl,
+                    user._impl);
                 return *this;
             }
 
             /**
-             * Token (Bearer) Authentication Parameters for ILP over HTTP.
+             * Set the password for basic HTTP authentication.
+             * Also see `user`.
+             */
+            opts& pass(utf8_view pass)
+            {
+                line_sender_error::wrapped_call(
+                    ::line_sender_opts_pass,
+                    _impl,
+                    pass._impl);
+                return *this;
+            }
+
+            /**
+             * Token (Bearer) Authentication Parameters for ILP over HTTP,
+             * or the ECDSA private key for ILP over TCP authentication.
+             */
+            opts& token(utf8_view token)
+            {
+                line_sender_error::wrapped_call(
+                    ::line_sender_opts_token,
+                    _impl,
+                    token._impl);
+                return *this;
+            }
+
+            /**
+             * The ECDSA public key X for ILP over TCP authentication.
+             */
+            opts& token_x(utf8_view token_x)
+            {
+                line_sender_error::wrapped_call(
+                    ::line_sender_opts_token_x,
+                    _impl,
+                    token_x._impl);
+                return *this;
+            }
+
+            /**
+             * The ECDSA public key Y for ILP over TCP authentication.
+             */
+            opts& token_y(utf8_view token_y)
+            {
+                line_sender_error::wrapped_call(
+                    ::line_sender_opts_token_y,
+                    _impl,
+                    token_y._impl);
+                return *this;
+            }
+
+            /**
+             * Configure how long to wait for messages from the QuestDB server during
+             * the TLS handshake and authentication process.
+             * The default is 15 seconds.
+             */
+            opts& auth_timeout(uint64_t millis)
+            {
+                line_sender_error::wrapped_call(
+                    ::line_sender_opts_auth_timeout,
+                    _impl,
+                    millis);
+                return *this;
+            }
+
+            /**
+             * Enable or disable TLS.
+             */
+            opts& tls_enabled(bool enabled)
+            {
+                line_sender_error::wrapped_call(
+                    ::line_sender_opts_tls_enabled,
+                    _impl,
+                    enabled);
+                return *this;
+            }
+
+            /**
+             * Set to `false` to disable TLS certificate verification.
+             * This should only be used for debugging purposes as it reduces security.
+             * 
+             * For testing consider specifying a path to a `.pem` file instead via
+             * the `tls_roots` setting.
+             */
+            opts& tls_verify(bool verify)
+            {
+                line_sender_error::wrapped_call(
+                    ::line_sender_opts_tls_verify,
+                    _impl,
+                    verify);
+                return *this;
+            }
+
+            /**
+             * Set the certificate authority used to determine how to validate the server's TLS certificate.
+             */
+            opts& tls_ca(line_sender_ca ca)
+            {
+                line_sender_error::wrapped_call(
+                    ::line_sender_opts_tls_ca,
+                    _impl,
+                    ca);
+                return *this;
+            }
+
+            /**
+             * Set the path to a custom root certificate `.pem` file.
+             * This is used to validate the server's certificate during the TLS handshake.
+             * The file may be password-protected, if so, also specify the password
+             * via the `tls_roots_password` method.
              *
-             * @param[in] token Token.
+             * See notes on how to test with self-signed certificates:
+             * https://github.com/questdb/c-questdb-client/tree/main/tls_certs.
              */
-            opts& token_auth(utf8_view token) noexcept
+            opts& tls_roots(utf8_view path)
             {
-                ::line_sender_opts_token_auth(
-                        _impl,
-                        token._impl);
+                line_sender_error::wrapped_call(
+                    ::line_sender_opts_tls_roots,
+                    _impl,
+                    path._impl);
                 return *this;
             }
 
             /**
-             * Enable ILP over HTTP.
+             * The maximum buffer size that the client will flush to the server.
+             * The default is 100 MiB.
              */
-            opts& http() noexcept
+            opts& max_buf_size(size_t max_buf_size)
             {
-                ::line_sender_opts_http(_impl);
+                line_sender_error::wrapped_call(
+                    ::line_sender_opts_max_buf_size,
+                    _impl,
+                    max_buf_size);
                 return *this;
             }
 
@@ -827,9 +1003,12 @@ namespace questdb::ingress
              * Cumulative duration spent in retries.
              * Default is 10 seconds.
              */
-            opts& retry_timeout(uint64_t millis) noexcept
+            opts& retry_timeout(uint64_t millis)
             {
-                ::line_sender_opts_retry_timeout(_impl, millis);
+                line_sender_error::wrapped_call(
+                    ::line_sender_opts_retry_timeout,
+                    _impl,
+                    millis);
                 return *this;
             }
 
@@ -839,9 +1018,12 @@ namespace questdb::ingress
              * The default is 100 KiB/s.
              * The value is expressed as a number of bytes per second.
              */
-            opts& min_throughput(uint64_t bytes_per_sec) noexcept
+            opts& min_throughput(uint64_t bytes_per_sec)
             {
-                ::line_sender_opts_min_throughput(_impl, bytes_per_sec);
+                line_sender_error::wrapped_call(
+                    ::line_sender_opts_min_throughput,
+                    _impl,
+                    bytes_per_sec);
                 return *this;
             }
 
@@ -849,84 +1031,12 @@ namespace questdb::ingress
              * Grace request timeout before relying on the minimum throughput logic.
              * The default is 5 seconds.
              */
-            opts& grace_timeout(uint64_t millis) noexcept
+            opts& grace_timeout(uint64_t millis)
             {
-                ::line_sender_opts_grace_timeout(_impl, millis);
-                return *this;
-            }
-
-            /**
-             * Enable transactional flushes.
-             * This is only relevant for HTTP.
-             * This works by ensuring that the buffer contains lines for a single table.
-             */
-            opts& transactional() noexcept
-            {
-                ::line_sender_opts_transactional(_impl);
-                return *this;
-            }
-
-            /**
-             * Enable full connection encryption via TLS.
-             * The connection will accept certificates by well-known certificate
-             * authorities as per the "webpki-roots" Rust crate.
-             */
-            opts& tls() noexcept
-            {
-                ::line_sender_opts_tls(_impl);
-                return *this;
-            }
-
-            /*
-             * Enable full connection encryption via TLS, using OS-provided certificate roots.
-             */
-            opts& tls_os_roots() noexcept
-            {
-                ::line_sender_opts_tls_os_roots(_impl);
-                return *this;
-            }
-
-            /*
-             * Enable full connection encryption via TLS, accepting certificates signed by either
-             * the OS-provided certificate roots or well-known certificate authorities as per
-             * the "webpki-roots" Rust crate.
-             */
-            opts& tls_webpki_and_os_roots() noexcept
-            {
-                ::line_sender_opts_tls_webpki_and_os_roots(_impl);
-                return *this;
-            }
-
-            /**
-             * Enable full connection encryption via TLS.
-             * The connection will accept certificates by the specified certificate
-             * authority file.
-             */
-            opts& tls(utf8_view ca_file) noexcept
-            {
-                ::line_sender_opts_tls_ca(_impl, ca_file._impl);
-                return *this;
-            }
-
-            /**
-             * Enable TLS whilst dangerously accepting any certificate as valid.
-             * This should only be used for debugging.
-             * Consider using calling "tls_ca" instead.
-             */
-            opts& tls_insecure_skip_verify() noexcept
-            {
-                ::line_sender_opts_tls_insecure_skip_verify(_impl);
-                return *this;
-            }
-
-            /**
-             * Configure how long to wait for messages from the QuestDB server
-             * during the TLS handshake and authentication process.
-             * The default is 15 seconds.
-             */
-            opts& read_timeout(uint64_t timeout_millis) noexcept
-            {
-                ::line_sender_opts_read_timeout(_impl, timeout_millis);
+                line_sender_error::wrapped_call(
+                    ::line_sender_opts_grace_timeout,
+                    _impl,
+                    millis);
                 return *this;
             }
 
@@ -935,6 +1045,9 @@ namespace questdb::ingress
                 reset();
             }
         private:
+            opts(::line_sender_opts* impl) : _impl{impl}
+            {}
+
             void reset() noexcept
             {
                 if (_impl)
@@ -960,12 +1073,33 @@ namespace questdb::ingress
     class line_sender
     {
     public:
-        line_sender(utf8_view host, uint16_t port)
-            : line_sender{opts{host, port}}
+        /**
+         * Create a new `line_sender` instance from configuration string.
+         * The format of the string is: "tcp::addr=host:port;key=value;...;"
+         * Alongside "tcp" you can also specify "tcps", "http", and "https".
+         * The accepted set of keys and values is the same as for the opt's API.
+         * E.g. "tcp::addr=host:port;user=alice;password=secret;tls_ca=os_roots;"
+         */
+        static inline line_sender from_conf(utf8_view conf)
+        {
+            return {opts::from_conf(conf)};
+        }
+
+        /**
+         * Create a new `line_sender` instance from configuration string read from the
+         * `QDB_CLIENT_CONF` environment variable.
+         */
+        static inline line_sender from_env()
+        {
+            return {opts::from_env()};
+        }
+
+        line_sender(line_sender_protocol protocol, utf8_view host, uint16_t port)
+            : line_sender{opts{protocol, host, port}}
         {}
 
-        line_sender(utf8_view host, utf8_view port)
-            : line_sender{opts{host, port}}
+        line_sender(line_sender_protocol protocol, utf8_view host, utf8_view port)
+            : line_sender{opts{protocol, host, port}}
         {}
 
         line_sender(const opts& opts)

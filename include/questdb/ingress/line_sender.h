@@ -93,7 +93,7 @@ typedef enum line_sender_ca {
 
     /** Use a custom root certificate `.pem` file. */
     line_sender_ca_pem_file,
-};
+} line_sender_ca;
 
 /** Error code categorizing the error. */
 LINESENDER_API
@@ -557,9 +557,6 @@ line_sender_opts* line_sender_opts_from_conf(
     line_sender_utf8 config,
     line_sender_error** err_out);
 
-/// Create a new `ops` instance from configuration string read from the
-/// `QDB_CLIENT_CONF` environment variable.
-
 /**
  * Create a new `ops` instance from configuration string read from the
  * `QDB_CLIENT_CONF` environment variable.
@@ -676,9 +673,10 @@ bool line_sender_opts_token_y(
  * The default is 15 seconds.
  */
 LINESENDER_API
-void line_sender_opts_auth_timeout(
+bool line_sender_opts_auth_timeout(
     line_sender_opts* opts,
-    uint64_t millis);
+    uint64_t millis,
+    line_sender_error** err_out);
 
 /**
  * Enable or disable TLS.
