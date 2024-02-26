@@ -1951,7 +1951,7 @@ impl SenderBuilder {
     /// use questdb::ingress::SenderBuilder;
     ///
     /// # fn main() -> Result<()> {
-    /// let mut sender = SenderBuilder::new_tcp("localhost", 9009)?.build()?;
+    /// let mut sender = SenderBuilder::new_tcp("localhost", 9009).build()?;
     /// # Ok(())
     /// # }
     /// ```
