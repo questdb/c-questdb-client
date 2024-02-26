@@ -66,37 +66,37 @@ def ns_to_qdb_date(at_ts_ns):
 
 
 # Valid keys, but not registered with the QuestDB fixture.
-AUTH_UNRECOGNIZED = (
-    "testUser2",
-    "xiecEl-2zbg6aYCFbxDMVWaly9BlCTaEChvcxCH5BCk",
-    "-nSHz3evuPl-rGLIlbIZjwOJeWao0rbk53Cll6XEgak",
-    "9iYksF4L5mfmArupv0CMoyVAWjQ4gNIoupdg6N5noG8")
+AUTH_UNRECOGNIZED = dict(
+    user="testUser2",
+    token="xiecEl-2zbg6aYCFbxDMVWaly9BlCTaEChvcxCH5BCk",
+    token_x="-nSHz3evuPl-rGLIlbIZjwOJeWao0rbk53Cll6XEgak",
+    token_y="9iYksF4L5mfmArupv0CMoyVAWjQ4gNIoupdg6N5noG8")
 
 
 # Bad malformed key
-AUTH_MALFORMED1 = (
-    "testUser3",
-    "xiecEl-zzbg6aYCFbxDMVWaly9BlCTaEChvcxCH5BCk",
-    "-nSHz3evuPl-rGLIlbIZjwOJeWao0rbk53Cll6XEgak",
-    "9iYksF4L6mfmArupv0CMoyVAWjQ4gNIoupdg6N5noG8")
+AUTH_MALFORMED1 = dict(
+    user="testUser3",
+    token="xiecEl-zzbg6aYCFbxDMVWaly9BlCTaEChvcxCH5BCk",
+    token_x="-nSHz3evuPl-rGLIlbIZjwOJeWao0rbk53Cll6XEgak",
+    token_y="9iYksF4L6mfmArupv0CMoyVAWjQ4gNIoupdg6N5noG8")
 
 
 # Another malformed key where the keys invalid base 64.
-AUTH_MALFORMED2 = (
-    "testUser4",
-    "xiecEl-zzbg6aYCFbxDMVWaly9BlCTaECH5BCk",
-    "-nSHz3evuPl-rGLIlbIZjwOJeWao0rbk5XEgak",
-    "9iYksF4L6mfmArupv0CMoyVAWjQ4gNIou5noG8")
+AUTH_MALFORMED2 = dict(
+    user="testUser4",
+    token="xiecEl-zzbg6aYCFbxDMVWaly9BlCTaECH5BCk",
+    token_x="-nSHz3evuPl-rGLIlbIZjwOJeWao0rbk5XEgak",
+    token_y="9iYksF4L6mfmArupv0CMoyVAWjQ4gNIou5noG8")
 
 
 class TestSender(unittest.TestCase):
     def _mk_linesender(self, transactional=False):
+        auth = AUTH if QDB_FIXTURE.auth else {}
         return qls.Sender(
             QDB_FIXTURE.host,
             QDB_FIXTURE.http_server_port if QDB_FIXTURE.http else QDB_FIXTURE.line_tcp_port,
-            auth=AUTH if QDB_FIXTURE.auth else None,
-            http=QDB_FIXTURE.http,
-            transactional=transactional)
+            protocol=qls.Protocol.HTTP if QDB_FIXTURE.http else qls.Protocol.TCP,
+            **auth)
 
     def _expect_eventual_disconnect(self, sender):
         with self.assertRaisesRegex(
@@ -531,13 +531,13 @@ class TestSender(unittest.TestCase):
     def test_c_tls_example(self):
         self._test_example(
             'line_sender_c_example_tls_ca',
-            'c_cars_tls',
+            'c_cars_tls_ca',
             tls=True)
 
     def test_cpp_tls_example(self):
         self._test_example(
             'line_sender_cpp_example_tls_ca',
-            'cpp_cars_tls',
+            'cpp_cars_tls_ca',
             tls=True)
 
     def test_opposite_auth(self):
@@ -546,12 +546,12 @@ class TestSender(unittest.TestCase):
           * An authenticating client to a non-authenticating DB instance.
           * Or a non-authenticating client to an authenticating DB instance.
         """
-        client_auth = None if QDB_FIXTURE.auth else AUTH
+        auth = {} if QDB_FIXTURE.auth else AUTH
         sender = qls.Sender(
             QDB_FIXTURE.host,
             QDB_FIXTURE.line_tcp_port,
-            auth=client_auth)
-        if client_auth:
+            **auth)
+        if auth:
             with self.assertRaisesRegex(
                     qls.SenderError,
                     r'.*not receive auth challenge.*'):
@@ -576,7 +576,7 @@ class TestSender(unittest.TestCase):
         sender = qls.Sender(
             QDB_FIXTURE.host,
             QDB_FIXTURE.line_tcp_port,
-            auth=AUTH_UNRECOGNIZED)
+            **AUTH_UNRECOGNIZED)
 
         with sender:
             self._expect_eventual_disconnect(sender)
@@ -588,7 +588,7 @@ class TestSender(unittest.TestCase):
         sender = qls.Sender(
             QDB_FIXTURE.host,
             QDB_FIXTURE.line_tcp_port,
-            auth=AUTH_MALFORMED1)
+            **AUTH_MALFORMED1)
 
         with self.assertRaisesRegex(
                 qls.SenderError,
@@ -602,7 +602,7 @@ class TestSender(unittest.TestCase):
         sender = qls.Sender(
             QDB_FIXTURE.host,
             QDB_FIXTURE.line_tcp_port,
-            auth=AUTH_MALFORMED2)
+            **AUTH_MALFORMED2)
 
         with self.assertRaisesRegex(
                 qls.SenderError,
@@ -610,31 +610,34 @@ class TestSender(unittest.TestCase):
             sender.connect()
 
     def test_tls_insecure_skip_verify(self):
+        auth = AUTH if QDB_FIXTURE.auth else {}
         sender = qls.Sender(
             QDB_FIXTURE.host,
             TLS_PROXY_FIXTURE.listen_port,
-            auth=AUTH if QDB_FIXTURE.auth else None,
-            tls='insecure_skip_verify')
+            tls_verify=False,
+            **auth)
         self._test_single_symbol_impl(sender)
 
-    def test_tls_ca(self):
+    def test_tls_roots(self):
+        auth = auth=AUTH if QDB_FIXTURE.auth else {}
         sender = qls.Sender(
             QDB_FIXTURE.host,
             TLS_PROXY_FIXTURE.listen_port,
-            auth=AUTH if QDB_FIXTURE.auth else None,
-            tls=Project().tls_certs_dir / 'server_rootCA.pem')
+            **auth,
+            tls_roots=str(Project().tls_certs_dir / 'server_rootCA.pem'))
         self._test_single_symbol_impl(sender)
 
-    def _test_tls_special(self, tls_mode):
+    def _test_tls_ca(self, tls_ca):
         prev_ssl_cert_file = os.environ.get('SSL_CERT_FILE')
         try:
             os.environ['SSL_CERT_FILE'] = str(
                 Project().tls_certs_dir / 'server_rootCA.pem')
+            auth = auth=AUTH if QDB_FIXTURE.auth else {}
             sender = qls.Sender(
                 QDB_FIXTURE.host,
                 TLS_PROXY_FIXTURE.listen_port,
-                auth=AUTH if QDB_FIXTURE.auth else None,
-                tls=tls_mode)
+                tls_ca=tls_ca,
+                **auth)
             self._test_single_symbol_impl(sender)
         finally:
             if prev_ssl_cert_file:
@@ -642,11 +645,11 @@ class TestSender(unittest.TestCase):
             else:
                 del os.environ['SSL_CERT_FILE']
 
-    def test_tls_os_roots(self):
-        self._test_tls_special('os_roots')
+    def test_tls_ca_os_roots(self):
+        self._test_tls_ca(qls.CA_OS_ROOTS)
 
-    def test_tls_webpki_and_os_roots(self):
-        self._test_tls_special('webpki_and_os_roots')
+    def test_tls_ca_webpki_and_os_roots(self):
+        self._test_tls_ca(qls.CA_WEBPKI_AND_OS_ROOTS)
 
     def test_http_transactions(self):
         if not QDB_FIXTURE.http:
@@ -677,9 +680,11 @@ class TestSender(unittest.TestCase):
             self.skipTest('TCP-only test')
         if QDB_FIXTURE.version <= (7, 3, 7):
             self.skipTest('No ILP/HTTP support')
+        buf = qls.Buffer()
+        buf.table('t1').column('c1', 'v1').at(time.time_ns())
         with self.assertRaisesRegex(qls.SenderError, r'.*Transactional .* not supported.*'):
-            with self._mk_linesender(transactional=True) as sender:
-                pass
+            with self._mk_linesender() as sender:
+                sender.flush(buf, transactional=True)
 
 
 def parse_args():

@@ -2644,6 +2644,12 @@ impl Sender {
         }
         match self.handler {
             ProtocolHandler::Socket(ref mut conn) => {
+                if transactional {
+                    return Err(error::fmt!(
+                        InvalidApiCall,
+                        "Transactional flushes are not supported for ILP over TCP."
+                    ));
+                }
                 conn.write_all(bytes).map_err(|io_err| {
                     self.connected = false;
                     map_io_to_socket_err("Could not flush buffer: ", io_err)
