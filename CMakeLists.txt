@@ -90,18 +90,23 @@ endfunction()
 if (QUESTDB_TESTS_AND_EXAMPLES)
     compile_example(
         line_sender_c_example
+        examples/concat.c
         examples/line_sender_c_example.c)
     compile_example(
         line_sender_c_example_auth
+        examples/concat.c
         examples/line_sender_c_example_auth.c)
     compile_example(
         line_sender_c_example_tls_ca
+        examples/concat.c
         examples/line_sender_c_example_tls_ca.c)
     compile_example(
         line_sender_c_example_auth_tls
+        examples/concat.c
         examples/line_sender_c_example_auth_tls.c)
     compile_example(
         line_sender_c_example_http
+        examples/concat.c
         examples/line_sender_c_example_http.c)
     compile_example(
         line_sender_cpp_example

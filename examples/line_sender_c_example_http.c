@@ -2,36 +2,30 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <string.h>
+#include "concat.h"
 
 static bool example(const char* host, const char* port)
 {
     line_sender_error* err = NULL;
-    line_sender_opts* opts = NULL;
     line_sender* sender = NULL;
     line_sender_buffer* buffer = NULL;
-
-    line_sender_utf8 host_utf8 = { 0, NULL };
-    if (!line_sender_utf8_init(&host_utf8, strlen(host), host, &err))
+    // Use `https` to enable TLS.
+    // Use `user=...;pass=...;` or `token=...` for authentication.
+    char* conf_str = concat("http::addr=", host, ":", port, ";");
+    if (!conf_str) {
+        fprintf(stderr, "Could not concatenate connection string.\n");
+        return false;
+    }
+    line_sender_utf8 conf_str_utf8 = { 0, NULL };
+    if (!line_sender_utf8_init(&conf_str_utf8, strlen(conf_str), conf_str, &err))
         goto on_error;
 
-    line_sender_utf8 port_utf8 = { 0, NULL };
-    if (!line_sender_utf8_init(&port_utf8, strlen(port), port, &err))
-        goto on_error;
-
-    // Call `line_sender_opts_new` if instead you have an integer port.
-    opts = line_sender_opts_new_tcp_service(host_utf8, port_utf8);
-
-    // Use ILP/HTTP instead of ILP/TCP for better error messages.
-    line_sender_opts_http(opts);
-
-    // Ensure that each buffer contains lines for a single table on each flush.
-    line_sender_opts_transactional(opts);
-
-    sender = line_sender_build(opts, &err);
-    line_sender_opts_free(opts);
-    opts = NULL;
+    sender = line_sender_from_conf(conf_str_utf8, &err);
     if (!sender)
-        goto on_error;
+        goto on_error;    
+
+    free(conf_str);
+    conf_str = NULL;
 
     buffer = line_sender_buffer_new();
     line_sender_buffer_reserve(buffer, 64 * 1024);  // 64KB buffer initial size.
@@ -92,10 +86,10 @@ static bool example(const char* host, const char* port)
     return true;
 
 on_error: ;
-    line_sender_opts_free(opts);
     size_t err_len = 0;
     const char* err_msg = line_sender_error_msg(err, &err_len);
     fprintf(stderr, "Error running example: %.*s\n", (int)err_len, err_msg);
+    free(conf_str);
     line_sender_error_free(err);
     line_sender_buffer_free(buffer);
     line_sender_close(sender);
@@ -112,7 +106,7 @@ static bool displayed_help(int argc, const char* argv[])
             fprintf(stderr, "Usage:\n");
             fprintf(stderr, "line_sender_c_example: [HOST [PORT]]\n");
             fprintf(stderr, "    HOST: ILP host (defaults to \"localhost\").\n");
-            fprintf(stderr, "    PORT: ILP port (defaults to \"9009\").\n");
+            fprintf(stderr, "    PORT: HTTP port (defaults to \"9000\").\n");
             return true;
         }
     }
@@ -127,7 +121,7 @@ int main(int argc, const char* argv[])
     const char* host = "localhost";
     if (argc >= 2)
         host = argv[1];
-    const char* port = "9009";
+    const char* port = "9000";
     if (argc >= 3)
         port = argv[2];
 
