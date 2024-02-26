@@ -57,16 +57,74 @@ macro_rules! bubble_err_to_c {
     };
 }
 
+/*
+
+    // This is square-peg-round-hole code.
+    // The C API is not designed to handle Rust's ownership semantics.
+    // So we're going to do some very unsafe things here.
+    // We need to extract a `T` from a `*mut T` and then replace it with
+    // another `T` in situ.
+    let dest = &mut (*opts).0;
+    let forced_builder = ptr::read(&(*opts).0);
+    let new_builder = match forced_builder.tls_roots(path) {
+        Ok(builder) => builder,
+        Err(err) => {
+            let err_ptr = Box::into_raw(Box::new(line_sender_error(err)));
+            *err_out = err_ptr;
+
+            // We're really messing the borrow-checker here.
+            // We've moved ownership of `forced_builder` (which is actually
+            // just an alias of the real `SenderBuilder` owned by the caller
+            // via a pointer - but the Rust compiler doesn't know that)
+            // into `tls_roots`.
+            // This leaves the original caller holding a pointer to an
+            // already cleaned up object.
+            // To avoid double-freeing, we need to construct a valid "dummy"
+            // object on top of the memory that is still owned by the caller.
+            let dummy = SenderBuilder::new_tcp("localhost", 1);
+            ptr::write(dest, dummy);
+            return false;
+        }
+    };
+    ptr::write(dest, new_builder);
+    true
+
+*/
+
 /// Update the Rust builder inside the C opts object
 /// after calling a method that takes ownership of the builder.
 macro_rules! upd_opts {
+    // This is square-peg-round-hole code.
+    // The C API is not designed to handle Rust's move semantics.
+    // So we're going to do some very unsafe things here.
+    // We need to extract a `T` from a `*mut T` and then replace it with
+    // another `T` in situ.
     ($opts:expr, $err_out:expr, $func:ident $(, $($args:expr),*)?) => {
         {
-            let dest = &mut (*$opts).0;
+            let builder_ref: *mut SenderBuilder = &mut (*$opts).0;
             let forced_builder = ptr::read(&(*$opts).0);
             let new_builder_or_err = forced_builder.$func($($($args),*)?);
-            let new_builder = bubble_err_to_c!($err_out, new_builder_or_err);
-            ptr::write(dest, new_builder);
+            let new_builder = match new_builder_or_err {
+                Ok(builder) => builder,
+                Err(err) => {
+                    *$err_out = Box::into_raw(Box::new(line_sender_error(err)));
+                    // We're really messing the borrow-checker here.
+                    // We've moved ownership of `forced_builder` (which is actually
+                    // just an alias of the real `SenderBuilder` owned by the caller
+                    // via a pointer - but the Rust compiler doesn't know that)
+                    // into `tls_roots`.
+                    // This leaves the original caller holding a pointer to an
+                    // already cleaned up object.
+                    // To avoid double-freeing, we need to construct a valid "dummy"
+                    // object on top of the memory that is still owned by the caller.
+                    let dummy = SenderBuilder::new_tcp("localhost", 1);
+                    ptr::write(builder_ref, dummy);
+                    return false;
+                }
+            };
+
+            // Overwrite the original builder with the new one.
+            ptr::write(builder_ref, new_builder);
             true
         }
     };
@@ -1020,46 +1078,6 @@ pub unsafe extern "C" fn line_sender_opts_tls_ca(
     upd_opts!(opts, err_out, tls_ca, ca)
 }
 
-unsafe fn upd_opts_tls_roots(
-    opts: *mut line_sender_opts,
-    err_out: *mut *mut line_sender_error,
-    path: PathBuf,
-) -> bool {
-    eprintln!("upd_opts_tls_roots :: (A): {path:?}");
-    {
-        // This is square-peg-round-hole code.
-        // The C API is not designed to handle Rust's ownership semantics.
-        // So we're going to do some very unsafe things here.
-        // We need to extract a `T` from a `*mut T` and then replace it with
-        // another `T` in situ.
-        let dest = &mut (*opts).0;
-        let forced_builder = ptr::read(&(*opts).0);
-        let new_builder = match forced_builder.tls_roots(path) {
-            Ok(builder) => builder,
-            Err(err) => {
-                let err_ptr = Box::into_raw(Box::new(line_sender_error(err)));
-                *err_out = err_ptr;
-
-                // We're really messing the borrow-checker here.
-                // We've moved ownership of `forced_builder` (which is actually
-                // just an alias of the real `SenderBuilder` owned by the caller
-                // via a pointer - but the Rust compiler doesn't know that)
-                // into `tls_roots`.
-                // This leaves the original caller holding a pointer to an
-                // already cleaned up object.
-                // To avoid double-freeing, we need to construct a valid "dummy"
-                // object on top of the memory that is still owned by the caller.
-                let dummy = SenderBuilder::new_tcp("localhost", 1);
-                ptr::write(dest, dummy);
-                return false;
-            }
-        };
-        ptr::write(dest, new_builder);
-    }
-    eprint!("upd_opts_tls_roots :: (G)");
-    true
-}
-
 /// Set the path to a custom root certificate `.pem` file.
 /// This is used to validate the server's certificate during the TLS handshake.
 /// The file may be password-protected, if so, also specify the password.
@@ -1072,13 +1090,8 @@ pub unsafe extern "C" fn line_sender_opts_tls_roots(
     path: line_sender_utf8,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    eprintln!("line_sender_opts_tls_roots :: (A): {path:?}");
     let path = PathBuf::from(path.as_str());
-    eprintln!("line_sender_opts_tls_roots :: (B): {path:?}");
-    // let r = upd_opts!(opts, err_out, tls_roots, path);
-    let r = upd_opts_tls_roots(opts, err_out, path);
-    eprintln!("line_sender_opts_tls_roots :: (C): {r:?}");
-    r
+    upd_opts!(opts, err_out, tls_roots, path)
 }
 
 /// The maximum buffer size that the client will flush to the server.

@@ -11,28 +11,18 @@ static bool example(
 {
     try
     {
-        questdb::ingress::opts opts{host, port};
-
-        // This example uses a custom certificate authority file.
-        // You can use the default certificate authority by calling the `.tls()`
-        // overload that takes no arguments.
-        opts.tls(ca_path);
-
-        // Follow our authentication documentation to generate your own keys:
-        // https://questdb.io/docs/reference/api/ilp/authenticate
-        opts.auth(
-            "testUser1",  // key_id
-            "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48",  // priv_key
-            "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU",  // pub_key_x
-            "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac");  // pub_key_y
-
-        // Connect.
-        questdb::ingress::line_sender sender{opts};
+        auto sender = questdb::ingress::line_sender::from_conf(
+            "tcps::addr=" + std::string{host} + ":" + std::string{port} + ";"
+            "user=testUser1;"
+            "token=5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48;"
+            "token_x=fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU;"
+            "token_y=Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac;"
+            "tls_roots=" + std::string{ca_path} + ";");  // path to custom `.pem` file.
 
         // We prepare all our table names and column names in advance.
         // If we're inserting multiple rows, this allows us to avoid
         // re-validating the same strings over and over again.
-        const auto table_name = "cpp_cars_tls"_tn;
+        const auto table_name = "cpp_cars_tls_ca"_tn;
         const auto id_name = "id"_cn;
         const auto x_name = "x"_cn;
         const auto y_name = "y"_cn;
@@ -41,8 +31,6 @@ static bool example(
         const auto driver_name = "driver"_cn;
 
         questdb::ingress::line_sender_buffer buffer;
-        // 1997-07-04 04:56:55 UTC
-        questdb::ingress::timestamp_nanos designated_timestamp{867992215000000000};
         buffer
             .table(table_name)
             .symbol(id_name, "d6e5fe92-d19f-482a-a97a-c105f547f721"_utf8)
@@ -51,9 +39,7 @@ static bool example(
             .column(booked_name, true)
             .column(passengers_name, int64_t{3})
             .column(driver_name, "John Doe"_utf8)
-            .at(designated_timestamp);
-
-        // Call `.at(timestamp_nanos::now())` to use the current system time.
+            .at(questdb::ingress::timestamp_nanos::now());
 
         // To insert more records, call `buffer.table(..)...` again.
 

@@ -961,10 +961,11 @@ namespace questdb::ingress
              */
             opts& tls_ca(line_sender_ca ca)
             {
+                ::line_sender_ca ca_impl = static_cast<::line_sender_ca>(ca);
                 line_sender_error::wrapped_call(
                     ::line_sender_opts_tls_ca,
                     _impl,
-                    ca);
+                    ca_impl);
                 return *this;
             }
 
