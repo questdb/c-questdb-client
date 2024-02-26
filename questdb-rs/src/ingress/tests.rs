@@ -156,7 +156,6 @@ fn inconsistent_http_auth() {
 #[test]
 fn cant_use_basic_auth_with_tcp() {
     let builder = SenderBuilder::new_tcp("localhost", 9000)
-        .unwrap()
         .user("user123")
         .unwrap()
         .pass("pass321")
@@ -171,7 +170,6 @@ fn cant_use_basic_auth_with_tcp() {
 #[test]
 fn cant_use_token_auth_with_tcp() {
     let builder = SenderBuilder::new_tcp("localhost", 9000)
-        .unwrap()
         .token("token123")
         .unwrap();
     assert_conf_err(
@@ -201,7 +199,7 @@ fn cant_use_ecdsa_auth_with_http() {
 
 #[test]
 fn set_auth_specifies_tcp() {
-    let mut builder = SenderBuilder::new_tcp("localhost", 9000).unwrap();
+    let mut builder = SenderBuilder::new_tcp("localhost", 9000);
     assert_eq!(builder.protocol, SenderProtocol::IlpOverTcp);
     builder = builder
         .user("key_id123")
@@ -217,7 +215,7 @@ fn set_auth_specifies_tcp() {
 
 #[test]
 fn set_net_interface_specifies_tcp() {
-    let builder = SenderBuilder::new_tcp("localhost", 9000).unwrap();
+    let builder = SenderBuilder::new_tcp("localhost", 9000);
     assert_eq!(builder.protocol, SenderProtocol::IlpOverTcp);
     builder.bind_interface("55.88.0.4").unwrap();
 }
@@ -309,7 +307,6 @@ fn tcps_tls_roots_webpki() {
     assert_specified_eq(&builder.tls_enabled, true);
     assert_specified_eq(&builder.tls_ca, CertificateAuthority::WebpkiRoots);
     assert_defaulted_eq(&builder.tls_roots, None);
-    assert_defaulted_eq(&builder.tls_roots_password, None);
 }
 
 #[cfg(feature = "tls-native-certs")]
@@ -335,7 +332,6 @@ fn tcps_tls_roots_file() {
     .unwrap();
     assert_specified_eq(&builder.tls_ca, CertificateAuthority::PemFile);
     assert_specified_eq(&builder.tls_roots, path);
-    assert_defaulted_eq(&builder.tls_roots_password, None);
 }
 
 #[test]
@@ -351,17 +347,11 @@ fn tcps_tls_roots_file_with_password() {
     let path = tmp_dir.path().join("cacerts.pem");
     let mut file = std::fs::File::create(&path).unwrap();
     file.write_all(b"dummy").unwrap();
-    let builder = SenderBuilder::from_conf(format!(
+    let builder_or_err = SenderBuilder::from_conf(format!(
         "tcps::addr=localhost;tls_roots={};tls_roots_password=extremely_secure;",
         path.to_str().unwrap()
-    ))
-    .unwrap();
-    assert_specified_eq(&builder.tls_ca, CertificateAuthority::PemFile);
-    assert_specified_eq(&builder.tls_roots, path);
-    assert_specified_eq(
-        &builder.tls_roots_password,
-        Some("extremely_secure".to_string()),
-    );
+    ));
+    assert_conf_err(builder_or_err, "\"tls_roots_password\" is not supported.");
 }
 
 #[cfg(feature = "ilp-over-http")]

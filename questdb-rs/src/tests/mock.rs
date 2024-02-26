@@ -543,12 +543,12 @@ impl MockServer {
         self.recv(0.1)
     }
 
-    pub fn lsb_tcp(&self) -> crate::error::Result<SenderBuilder> {
+    pub fn lsb_tcp(&self) -> SenderBuilder {
         SenderBuilder::new_tcp(self.host, self.port)
     }
 
     #[cfg(feature = "ilp-over-http")]
-    pub fn lsb_http(&self) -> crate::error::Result<SenderBuilder> {
+    pub fn lsb_http(&self) -> SenderBuilder {
         SenderBuilder::new_http(self.host, self.port)
     }
 }

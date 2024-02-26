@@ -43,7 +43,7 @@
 //!         TimestampNanos}};
 //!
 //! fn main() -> Result<()> {
-//!    let mut sender = SenderBuilder::new_tcp("localhost", 9009)?.build()?;
+//!    let mut sender = SenderBuilder::new_tcp("localhost", 9009).build()?;
 //!    let mut buffer = Buffer::new();
 //!    buffer
 //!        .table("sensors")?
@@ -88,7 +88,7 @@
 //!
 //! # fn main() -> Result<()> {
 //! // See: https://questdb.io/docs/reference/api/ilp/authenticate
-//! let mut sender = SenderBuilder::new_tcp("localhost", 9009)?
+//! let mut sender = SenderBuilder::new_tcp("localhost", 9009)
 //!     .user("testUser1")? // kid
 //!     .token("5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48")? // d
 //!     .token_x("fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU")? // x
@@ -115,7 +115,7 @@
 //! use questdb::ingress::{SenderBuilder, CertificateAuthority};
 //!
 //! # fn main() -> Result<()> {
-//! let mut sender = SenderBuilder::new_tcp("localhost", 9009)?
+//! let mut sender = SenderBuilder::new_tcp("localhost", 9009)
 //!     .tls_roots("/path/to/server_rootCA.pem")?
 //!     .build()?;
 //! # Ok(())
@@ -1661,7 +1661,7 @@ impl SenderProtocol {
 # use questdb::Result;
 use questdb::ingress::SenderBuilder;
 # fn main() -> Result<()> {
-let mut sender = SenderBuilder::new_http("localhost", 9009)?.build()?;
+let mut sender = SenderBuilder::new_http("localhost", 9009).build()?;
 # Ok(())
 # }
 ```
@@ -1673,7 +1673,7 @@ let mut sender = SenderBuilder::new_http("localhost", 9009)?.build()?;
 /// use questdb::ingress::SenderBuilder;
 ///
 /// # fn main() -> Result<()> {
-/// let mut sender = SenderBuilder::new_tcp("localhost", 9009)?.build()?;
+/// let mut sender = SenderBuilder::new_tcp("localhost", 9009).build()?;
 /// # Ok(())
 /// # }
 /// ```
@@ -1761,7 +1761,7 @@ impl SenderBuilder {
             Some((h, p)) => (h, p),
             None => (addr.as_str(), protocol.default_port()),
         };
-        let mut builder = SenderBuilder::new(host, port, protocol)?;
+        let mut builder = SenderBuilder::new(host, port, protocol);
 
         // tls=  tls_verify=  tls_roots=  tls_roots_password=
         // TODO: no support in config string for WebPkiAndOsRoots
@@ -1894,15 +1894,11 @@ impl SenderBuilder {
         Self::from_conf(conf)
     }
 
-    fn new<H: Into<String>, P: Into<Port>>(
-        host: H,
-        port: P,
-        protocol: SenderProtocol,
-    ) -> Result<Self> {
-        let host = validate_value(host.into())?;
+    fn new<H: Into<String>, P: Into<Port>>(host: H, port: P, protocol: SenderProtocol) -> Self {
+        let host = host.into();
         let port: Port = port.into();
-        let port = validate_value(port.0)?;
-        Ok(Self {
+        let port = port.0;
+        Self {
             protocol,
             host: ConfigSetting::new_specified(host),
             port: ConfigSetting::new_specified(port),
@@ -1928,7 +1924,7 @@ impl SenderBuilder {
             } else {
                 None
             },
-        })
+        }
     }
 
     /// Create a new `SenderBuilder` instance from the provided QuestDB
@@ -1939,11 +1935,11 @@ impl SenderBuilder {
     /// use questdb::ingress::SenderBuilder;
     ///
     /// # fn main() -> Result<()> {
-    /// let mut sender = SenderBuilder::new_tcp("localhost", 9009)?.build()?;
+    /// let mut sender = SenderBuilder::new_tcp("localhost", 9009).build()?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn new_tcp<H: Into<String>, P: Into<Port>>(host: H, port: P) -> Result<Self> {
+    pub fn new_tcp<H: Into<String>, P: Into<Port>>(host: H, port: P) -> Self {
         Self::new(host, port, SenderProtocol::IlpOverTcp)
     }
 
@@ -1960,7 +1956,7 @@ impl SenderBuilder {
     /// # }
     /// ```
     #[cfg(feature = "ilp-over-http")]
-    pub fn new_http<H: Into<String>, P: Into<Port>>(host: H, port: P) -> Result<Self> {
+    pub fn new_http<H: Into<String>, P: Into<Port>>(host: H, port: P) -> Self {
         Self::new(host, port, SenderProtocol::IlpOverHttp)
     }
 
@@ -2030,7 +2026,7 @@ impl SenderBuilder {
     /// use std::time::Duration;
     ///
     /// # fn main() -> Result<()> {
-    /// let mut sender = SenderBuilder::new_tcp("localhost", 9009)?
+    /// let mut sender = SenderBuilder::new_tcp("localhost", 9009)
     ///    .auth_timeout(Duration::from_secs(15))?
     ///    .build()?;
     /// # Ok(())

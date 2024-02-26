@@ -40,7 +40,7 @@ use std::{io, time::SystemTime};
 #[test]
 fn test_basics() -> TestResult {
     let mut server = MockServer::new()?;
-    let mut sender = server.lsb_tcp()?.build()?;
+    let mut sender = server.lsb_tcp().build()?;
     assert!(!sender.must_close());
     server.accept()?;
 
@@ -85,7 +85,7 @@ fn test_basics() -> TestResult {
 fn test_max_buf_size() -> TestResult {
     let max = 1024;
     let mut server = MockServer::new()?;
-    let mut sender = server.lsb_tcp()?.max_buf_size(max)?.build()?;
+    let mut sender = server.lsb_tcp().max_buf_size(max)?.build()?;
     assert!(!sender.must_close());
     server.accept()?;
 
@@ -228,7 +228,7 @@ fn test_bad_key(
 ) -> TestResult {
     let server = MockServer::new()?;
     let lsb = server
-        .lsb_tcp()?
+        .lsb_tcp()
         .user("testUser1")?
         .token(priv_key)?
         .token_x(pub_key_x)?
@@ -355,7 +355,7 @@ fn test_tls_with_file_ca() -> TestResult {
     ca_path.push("server_rootCA.pem");
 
     let server = MockServer::new()?;
-    let lsb = server.lsb_tcp()?.tls_roots(ca_path)?;
+    let lsb = server.lsb_tcp().tls_roots(ca_path)?;
     let server_jh = server.accept_tls();
     let mut sender = lsb.build()?;
     let mut server: MockServer = server_jh.join().unwrap()?;
@@ -384,7 +384,7 @@ fn test_tls_to_plain_server() -> TestResult {
 
     let mut server = MockServer::new()?;
     let lsb = server
-        .lsb_tcp()?
+        .lsb_tcp()
         .auth_timeout(Duration::from_millis(500))?
         .tls_ca(CertificateAuthority::PemFile)?
         .tls_roots(ca_path)?;
@@ -426,7 +426,7 @@ fn expect_eventual_disconnect(sender: &mut Sender) {
 fn test_plain_to_tls_server() -> TestResult {
     let server = MockServer::new()?;
     let lsb = server
-        .lsb_tcp()?
+        .lsb_tcp()
         .auth_timeout(Duration::from_millis(500))?
         .tls_enabled(false)?;
     let server_jh = server.accept_tls();
@@ -451,7 +451,7 @@ fn test_plain_to_tls_server() -> TestResult {
 #[test]
 fn test_tls_insecure_skip_verify() -> TestResult {
     let server = MockServer::new()?;
-    let lsb = server.lsb_tcp()?.tls_verify(false)?;
+    let lsb = server.lsb_tcp().tls_verify(false)?;
     let server_jh = server.accept_tls();
     let mut sender = lsb.build()?;
     let mut server: MockServer = server_jh.join().unwrap()?;

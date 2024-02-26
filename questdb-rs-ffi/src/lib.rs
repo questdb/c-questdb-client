@@ -864,7 +864,7 @@ pub unsafe extern "C" fn line_sender_opts_new_tcp(
     host: line_sender_utf8,
     port: u16,
 ) -> *mut line_sender_opts {
-    let builder = SenderBuilder::new_tcp(host.as_str(), port).unwrap();
+    let builder = SenderBuilder::new_tcp(host.as_str(), port);
     Box::into_raw(Box::new(line_sender_opts(builder)))
 }
 
@@ -874,7 +874,7 @@ pub unsafe extern "C" fn line_sender_opts_new_tcp_service(
     host: line_sender_utf8,
     port: line_sender_utf8,
 ) -> *mut line_sender_opts {
-    let builder = SenderBuilder::new_tcp(host.as_str(), port.as_str()).unwrap();
+    let builder = SenderBuilder::new_tcp(host.as_str(), port.as_str());
     Box::into_raw(Box::new(line_sender_opts(builder)))
 }
 
@@ -886,7 +886,7 @@ pub unsafe extern "C" fn line_sender_opts_new_http(
     host: line_sender_utf8,
     port: u16,
 ) -> *mut line_sender_opts {
-    let builder = SenderBuilder::new_http(host.as_str(), port).unwrap();
+    let builder = SenderBuilder::new_http(host.as_str(), port);
     Box::into_raw(Box::new(line_sender_opts(builder)))
 }
 
@@ -896,7 +896,7 @@ pub unsafe extern "C" fn line_sender_opts_new_http_service(
     host: line_sender_utf8,
     port: line_sender_utf8,
 ) -> *mut line_sender_opts {
-    let builder = SenderBuilder::new_http(host.as_str(), port.as_str()).unwrap();
+    let builder = SenderBuilder::new_http(host.as_str(), port.as_str());
     Box::into_raw(Box::new(line_sender_opts(builder)))
 }
 
@@ -1020,6 +1020,46 @@ pub unsafe extern "C" fn line_sender_opts_tls_ca(
     upd_opts!(opts, err_out, tls_ca, ca)
 }
 
+unsafe fn upd_opts_tls_roots(
+    opts: *mut line_sender_opts,
+    err_out: *mut *mut line_sender_error,
+    path: PathBuf,
+) -> bool {
+    eprintln!("upd_opts_tls_roots :: (A): {path:?}");
+    {
+        // This is square-peg-round-hole code.
+        // The C API is not designed to handle Rust's ownership semantics.
+        // So we're going to do some very unsafe things here.
+        // We need to extract a `T` from a `*mut T` and then replace it with
+        // another `T` in situ.
+        let dest = &mut (*opts).0;
+        let forced_builder = ptr::read(&(*opts).0);
+        let new_builder = match forced_builder.tls_roots(path) {
+            Ok(builder) => builder,
+            Err(err) => {
+                let err_ptr = Box::into_raw(Box::new(line_sender_error(err)));
+                *err_out = err_ptr;
+
+                // We're really messing the borrow-checker here.
+                // We've moved ownership of `forced_builder` (which is actually
+                // just an alias of the real `SenderBuilder` owned by the caller
+                // via a pointer - but the Rust compiler doesn't know that)
+                // into `tls_roots`.
+                // This leaves the original caller holding a pointer to an
+                // already cleaned up object.
+                // To avoid double-freeing, we need to construct a valid "dummy"
+                // object on top of the memory that is still owned by the caller.
+                let dummy = SenderBuilder::new_tcp("localhost", 1);
+                ptr::write(dest, dummy);
+                return false;
+            }
+        };
+        ptr::write(dest, new_builder);
+    }
+    eprint!("upd_opts_tls_roots :: (G)");
+    true
+}
+
 /// Set the path to a custom root certificate `.pem` file.
 /// This is used to validate the server's certificate during the TLS handshake.
 /// The file may be password-protected, if so, also specify the password.
@@ -1032,8 +1072,13 @@ pub unsafe extern "C" fn line_sender_opts_tls_roots(
     path: line_sender_utf8,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
+    eprintln!("line_sender_opts_tls_roots :: (A): {path:?}");
     let path = PathBuf::from(path.as_str());
-    upd_opts!(opts, err_out, tls_roots, path)
+    eprintln!("line_sender_opts_tls_roots :: (B): {path:?}");
+    // let r = upd_opts!(opts, err_out, tls_roots, path);
+    let r = upd_opts_tls_roots(opts, err_out, path);
+    eprintln!("line_sender_opts_tls_roots :: (C): {r:?}");
+    r
 }
 
 /// The maximum buffer size that the client will flush to the server.

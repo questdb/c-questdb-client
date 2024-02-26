@@ -11,7 +11,7 @@ fn main() -> Result<()> {
         .unwrap_or("9009".to_string())
         .parse()
         .unwrap();
-    let mut sender = SenderBuilder::new_tcp(host, port)?
+    let mut sender = SenderBuilder::new_tcp(host, port)
         .user("testUser1")? // kid
         .token("5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48")? // d
         .token_x("fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU")? // x
