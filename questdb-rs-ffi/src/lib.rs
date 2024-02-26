@@ -1215,7 +1215,9 @@ pub unsafe extern "C" fn line_sender_from_conf(
 /// Create a new `line_sender` instance from configuration string read from the
 /// `QDB_CLIENT_CONF` environment variable.
 #[no_mangle]
-pub unsafe extern "C" fn line_sender_from_env(err_out: *mut *mut line_sender_error) -> *mut line_sender {
+pub unsafe extern "C" fn line_sender_from_env(
+    err_out: *mut *mut line_sender_error,
+) -> *mut line_sender {
     let sender = bubble_err_to_c!(err_out, Sender::from_env(), ptr::null_mut());
     Box::into_raw(Box::new(line_sender(sender)))
 }
