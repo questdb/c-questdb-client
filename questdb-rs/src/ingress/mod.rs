@@ -40,7 +40,7 @@
 //!         Sender,
 //!         Buffer,
 //!         TimestampNanos}};
-//! 
+//!
 //! fn main() -> Result<()> {
 //!    let mut sender = Sender::from_conf("http::addr=localhost:9000;")?;
 //!    let mut buffer = Buffer::new();
