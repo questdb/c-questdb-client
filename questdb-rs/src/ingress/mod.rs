@@ -185,15 +185,13 @@ use crate::error::{self, Error, Result};
 use crate::gai;
 use crate::ingress::conf::ConfigSetting;
 use core::time::Duration;
-use itoa;
 use std::collections::HashMap;
-use std::convert::{Infallible, TryFrom, TryInto};
+use std::convert::Infallible;
 use std::fmt::{Debug, Display, Formatter, Write};
 use std::io::{self, BufRead, BufReader, ErrorKind, Write as IoWrite};
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::string::ToString;
 use std::sync::Arc;
 
 use base64ct::{Base64, Base64UrlUnpadded, Encoding};

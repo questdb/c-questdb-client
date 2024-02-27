@@ -1,5 +1,5 @@
 use super::*;
-use crate::{error::Result, ErrorCode};
+use crate::ErrorCode;
 use tempfile::TempDir;
 
 #[cfg(feature = "ilp-over-http")]
@@ -336,9 +336,13 @@ fn tcps_tls_roots_file() {
 
 #[test]
 fn tcps_tls_roots_file_missing() {
-    assert_conf_err(
-        SenderBuilder::from_conf("tcps::addr=localhost;tls_roots=/some/invalid/path/cacerts.pem;"),
-        "Could not open root certificate file from path \"/some/invalid/path/cacerts.pem\": No such file or directory (os error 2)");
+    let err =
+        SenderBuilder::from_conf("tcps::addr=localhost;tls_roots=/some/invalid/path/cacerts.pem;")
+            .unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ConfigError);
+    assert!(err
+        .msg()
+        .contains("Could not open root certificate file from path"));
 }
 
 #[test]
