@@ -795,6 +795,8 @@ line_sender* line_sender_build(
  * Alongside "tcp" you can also specify "tcps", "http", and "https".
  * The accepted set of keys and values is the same as for the opt's API.
  * E.g. "tcp::addr=host:port;user=alice;password=secret;tls_ca=os_roots;"
+ * 
+ * For full list of options, search this header for `bool line_sender_opts_`.
  */
 LINESENDER_API
 line_sender* line_sender_from_conf(

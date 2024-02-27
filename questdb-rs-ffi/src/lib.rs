@@ -1202,6 +1202,8 @@ pub unsafe extern "C" fn line_sender_build(
 /// Alongside "tcp" you can also specify "tcps", "http", and "https".
 /// The accepted set of keys and values is the same as for the opt's API.
 /// E.g. "tcp::addr=host:port;user=alice;password=secret;tls_ca=os_roots;"
+///
+/// For full list of options, search this header for `bool line_sender_opts_`.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_from_conf(
     config: line_sender_utf8,
