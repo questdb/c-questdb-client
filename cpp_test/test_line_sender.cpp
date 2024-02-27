@@ -569,6 +569,9 @@ TEST_CASE("Bad CA path")
             "localhost",
             server.port()};
 
+        opts.auth_timeout(1000);
+
+        opts.tls_ca(questdb::ingress::line_sender_ca::pem_file);
         opts.tls_roots("/an/invalid/path/to/ca.pem");
         questdb::ingress::line_sender sender{opts};
     }
@@ -621,7 +624,12 @@ TEST_CASE("Opts copy ctor, assignment and move testing.")
             questdb::ingress::line_sender_protocol::tcp,
             "localhost",
             "9009"};
+        opts1.tls_enabled(false);
         questdb::ingress::opts opts2{std::move(opts1)};
+        CHECK_THROWS_AS_MESSAGE(
+            opts2.tls_enabled(true),
+            questdb::ingress::line_sender_error,
+            "\"tls_enabled\" is already specified");
     }
 
     {
@@ -799,13 +807,12 @@ TEST_CASE("Opts from conf") {
 }
 
 TEST_CASE("HTTP basics") {
-    std::cerr << "http_basics :: (A)" << std::endl;
     questdb::ingress::opts opts1{
         questdb::ingress::line_sender_protocol::http,
         "localhost",
         1};
     questdb::ingress::opts opts1conf = questdb::ingress::opts::from_conf(
-        "http::addr=localhost:1;grace_timeout=5000;retry_timeout=5;user=user;pass=pass;");
+        "http::addr=localhost:1;user=user;pass=pass;grace_timeout=5000;retry_timeout=5;");
     questdb::ingress::opts opts2{
         questdb::ingress::line_sender_protocol::http,
         "localhost",
@@ -813,10 +820,11 @@ TEST_CASE("HTTP basics") {
     questdb::ingress::opts opts2conf = questdb::ingress::opts::from_conf(
         "http::addr=localhost:1;token=token;min_throughput=1000;retry_timeout=0;");
     opts1
-        .grace_timeout(5000)
-        .retry_timeout(5)
         .user("user")
-        .pass("pass");
+        .pass("pass")
+        .max_buf_size(1000000)
+        .grace_timeout(5000)
+        .retry_timeout(5);
     opts2
         .token("token")
         .min_throughput(1000)
@@ -833,4 +841,8 @@ TEST_CASE("HTTP basics") {
     CHECK_THROWS_AS(sender1conf.flush(b1), questdb::ingress::line_sender_error);
     CHECK_THROWS_AS(sender2.flush(b1), questdb::ingress::line_sender_error);
     CHECK_THROWS_AS(sender2conf.flush(b1), questdb::ingress::line_sender_error);
+
+    CHECK_THROWS_AS(
+        questdb::ingress::opts::from_conf("http::addr=localhost:1;bind_interface=0.0.0.0;"),
+        questdb::ingress::line_sender_error);    
 }

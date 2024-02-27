@@ -2037,7 +2037,7 @@ impl SenderBuilder {
 
     /// Enable or disable TLS.
     pub fn tls_enabled(mut self, enabled: bool) -> Result<Self> {
-        self.tls_enabled.set_specified("tls", enabled)?;
+        self.tls_enabled.set_specified("tls_enabled", enabled)?;
 
         #[cfg(feature = "tls-webpki-certs")]
         self.tls_ca.set_default(CertificateAuthority::WebpkiRoots);
