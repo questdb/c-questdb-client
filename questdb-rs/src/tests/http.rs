@@ -419,7 +419,7 @@ fn test_token_auth() -> TestResult {
 }
 
 #[test]
-fn test_grace_timeout() -> TestResult {
+fn test_request_timeout() -> TestResult {
     let mut buffer = Buffer::new();
     buffer
         .table("test")?
@@ -430,16 +430,19 @@ fn test_grace_timeout() -> TestResult {
     // Here we use a mock (tcp) server instead and don't send a response back.
     let server = MockServer::new()?;
 
-    let grace = Duration::from_millis(50);
+    let request_timeout = Duration::from_millis(50);
     let time_start = std::time::Instant::now();
-    let mut sender = server.lsb_http().grace_timeout(grace)?.build()?;
+    let mut sender = server
+        .lsb_http()
+        .request_timeout(request_timeout)?
+        .build()?;
     let res = sender.flush_and_keep(&buffer);
     let time_elapsed = time_start.elapsed();
     assert!(res.is_err());
     let err = res.unwrap_err();
     assert_eq!(err.code(), ErrorCode::SocketError);
     assert!(err.msg().contains("timed out reading response"));
-    assert!(time_elapsed >= grace);
+    assert!(time_elapsed >= request_timeout);
     Ok(())
 }
 

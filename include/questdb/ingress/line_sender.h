@@ -751,7 +751,7 @@ bool line_sender_opts_retry_timeout(
  * The value is expressed as a number of bytes per second.
  */
 LINESENDER_API
-bool line_sender_opts_min_throughput(
+bool line_sender_opts_request_min_throughput(
     line_sender_opts* opts,
     uint64_t bytes_per_sec,
     line_sender_error** err_out);
@@ -761,7 +761,7 @@ bool line_sender_opts_min_throughput(
  * The default is 5 seconds.
  */
 LINESENDER_API
-bool line_sender_opts_grace_timeout(
+bool line_sender_opts_request_timeout(
     line_sender_opts* opts,
     uint64_t millis,
     line_sender_error** err_out);

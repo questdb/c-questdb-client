@@ -812,22 +812,22 @@ TEST_CASE("HTTP basics") {
         "localhost",
         1};
     questdb::ingress::opts opts1conf = questdb::ingress::opts::from_conf(
-        "http::addr=localhost:1;user=user;pass=pass;grace_timeout=5000;retry_timeout=5;");
+        "http::addr=localhost:1;user=user;pass=pass;request_timeout=5000;retry_timeout=5;");
     questdb::ingress::opts opts2{
         questdb::ingress::line_sender_protocol::http,
         "localhost",
         "1"};
     questdb::ingress::opts opts2conf = questdb::ingress::opts::from_conf(
-        "http::addr=localhost:1;token=token;min_throughput=1000;retry_timeout=0;");
+        "http::addr=localhost:1;token=token;request_min_throughput=1000;retry_timeout=0;");
     opts1
         .user("user")
         .pass("pass")
         .max_buf_size(1000000)
-        .grace_timeout(5000)
+        .request_timeout(5000)
         .retry_timeout(5);
     opts2
         .token("token")
-        .min_throughput(1000)
+        .request_min_throughput(1000)
         .retry_timeout(0);
     questdb::ingress::line_sender sender1{opts1};
     questdb::ingress::line_sender sender1conf{opts1conf};

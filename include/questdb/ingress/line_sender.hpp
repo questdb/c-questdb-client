@@ -1019,10 +1019,10 @@ namespace questdb::ingress
              * The default is 100 KiB/s.
              * The value is expressed as a number of bytes per second.
              */
-            opts& min_throughput(uint64_t bytes_per_sec)
+            opts& request_min_throughput(uint64_t bytes_per_sec)
             {
                 line_sender_error::wrapped_call(
-                    ::line_sender_opts_min_throughput,
+                    ::line_sender_opts_request_min_throughput,
                     _impl,
                     bytes_per_sec);
                 return *this;
@@ -1032,10 +1032,10 @@ namespace questdb::ingress
              * Grace request timeout before relying on the minimum throughput logic.
              * The default is 5 seconds.
              */
-            opts& grace_timeout(uint64_t millis)
+            opts& request_timeout(uint64_t millis)
             {
                 line_sender_error::wrapped_call(
-                    ::line_sender_opts_grace_timeout,
+                    ::line_sender_opts_request_timeout,
                     _impl,
                     millis);
                 return *this;

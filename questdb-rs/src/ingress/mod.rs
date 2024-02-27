@@ -1761,8 +1761,6 @@ impl SenderBuilder {
         };
         let mut builder = SenderBuilder::new(host, port, protocol);
 
-        // tls=  tls_verify=  tls_roots=  tls_roots_password=
-        // TODO: no support in config string for WebPkiAndOsRoots
         builder.tls_enabled.set_specified("tls", with_tls)?;
 
         validate_auto_flush_params(&params)?;
@@ -1861,11 +1859,13 @@ impl SenderBuilder {
                 }
 
                 #[cfg(feature = "ilp-over-http")]
-                "min_throughput" => builder.min_throughput(parse_conf_value(key, val)?)?,
+                "request_min_throughput" => {
+                    builder.request_min_throughput(parse_conf_value(key, val)?)?
+                }
 
                 #[cfg(feature = "ilp-over-http")]
-                "grace_timeout" => {
-                    builder.grace_timeout(Duration::from_millis(parse_conf_value(key, val)?))?
+                "request_timeout" => {
+                    builder.request_timeout(Duration::from_millis(parse_conf_value(key, val)?))?
                 }
 
                 #[cfg(feature = "ilp-over-http")]
@@ -2082,8 +2082,6 @@ impl SenderBuilder {
 
     /// Set the path to a custom root certificate `.pem` file.
     /// This is used to validate the server's certificate during the TLS handshake.
-    /// The file may be password-protected, if so, also specify the password.
-    /// via the [`tls_roots_password`](SenderBuilder::tls_roots_password) method.
     ///
     /// See notes on how to test with [self-signed certificates](https://github.com/questdb/c-questdb-client/tree/main/tls_certs).
     pub fn tls_roots<P: Into<PathBuf>>(self, path: P) -> Result<Self> {
@@ -2137,14 +2135,15 @@ impl SenderBuilder {
     /// The default is 100 KiB/s.
     /// The value is expressed as a number of bytes per second.
     /// This is used to calculate additional request timeout, on top of
-    /// the [`grace_timeout`](SenderBuilder::grace_timeout).
-    pub fn min_throughput(mut self, value: u64) -> Result<Self> {
+    /// the [`request_timeout`](SenderBuilder::request_timeout).
+    pub fn request_min_throughput(mut self, value: u64) -> Result<Self> {
         if let Some(http) = &mut self.http {
-            http.min_throughput.set_specified("min_throughput", value)?;
+            http.request_min_throughput
+                .set_specified("request_min_throughput", value)?;
         } else {
             return Err(error::fmt!(
                 ConfigError,
-                "\"min_throughput\" is supported only in ILP over HTTP."
+                "\"request_min_throughput\" is supported only in ILP over HTTP."
             ));
         }
         Ok(self)
@@ -2153,14 +2152,15 @@ impl SenderBuilder {
     #[cfg(feature = "ilp-over-http")]
     /// Grace request timeout before relying on the minimum throughput logic.
     /// The default is 5 seconds.
-    /// See [`min_throughput`](SenderBuilder::min_throughput) for more details.
-    pub fn grace_timeout(mut self, value: Duration) -> Result<Self> {
+    /// See [`request_min_throughput`](SenderBuilder::request_min_throughput) for more details.
+    pub fn request_timeout(mut self, value: Duration) -> Result<Self> {
         if let Some(http) = &mut self.http {
-            http.grace_timeout.set_specified("grace_timeout", value)?;
+            http.request_timeout
+                .set_specified("request_timeout", value)?;
         } else {
             return Err(error::fmt!(
                 ConfigError,
-                "\"grace_timeout\" is supported only in ILP over HTTP."
+                "\"request_timeout\" is supported only in ILP over HTTP."
             ));
         }
         Ok(self)
@@ -2663,8 +2663,8 @@ impl Sender {
                     ));
                 }
                 let timeout = Duration::from_secs_f64(
-                    (bytes.len() as f64) / (*state.config.min_throughput as f64),
-                ) + *state.config.grace_timeout;
+                    (bytes.len() as f64) / (*state.config.request_min_throughput as f64),
+                ) + *state.config.request_timeout;
                 let request = state
                     .agent
                     .post(&state.url)

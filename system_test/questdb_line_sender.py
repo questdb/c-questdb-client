@@ -355,13 +355,13 @@ def _setup_cdll():
         c_uint64,
         c_line_sender_error_p_p)
     set_sig(
-        dll.line_sender_opts_min_throughput,
+        dll.line_sender_opts_request_min_throughput,
         c_bool,
         c_line_sender_opts_p,
         c_uint64,
         c_line_sender_error_p_p)
     set_sig(
-        dll.line_sender_opts_grace_timeout,
+        dll.line_sender_opts_request_timeout,
         c_bool,
         c_line_sender_opts_p,
         c_uint64,

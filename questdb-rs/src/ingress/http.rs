@@ -41,19 +41,19 @@ impl TokenAuthParams {
 
 #[derive(Debug, Clone)]
 pub(super) struct HttpConfig {
-    pub(super) min_throughput: ConfigSetting<u64>,
+    pub(super) request_min_throughput: ConfigSetting<u64>,
     pub(super) user_agent: ConfigSetting<Option<String>>,
     pub(super) retry_timeout: ConfigSetting<Duration>,
-    pub(super) grace_timeout: ConfigSetting<Duration>,
+    pub(super) request_timeout: ConfigSetting<Duration>,
 }
 
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
-            min_throughput: ConfigSetting::new_default(102400), // 100 KiB/s
+            request_min_throughput: ConfigSetting::new_default(102400), // 100 KiB/s
             user_agent: ConfigSetting::new_default(None),
             retry_timeout: ConfigSetting::new_default(Duration::from_secs(10)),
-            grace_timeout: ConfigSetting::new_default(Duration::from_secs(5)),
+            request_timeout: ConfigSetting::new_default(Duration::from_secs(5)),
         }
     }
 }

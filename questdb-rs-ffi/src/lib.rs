@@ -1122,24 +1122,24 @@ pub unsafe extern "C" fn line_sender_opts_retry_timeout(
 /// The default is 100 KiB/s.
 /// The value is expressed as a number of bytes per second.
 #[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_min_throughput(
+pub unsafe extern "C" fn line_sender_opts_request_min_throughput(
     opts: *mut line_sender_opts,
     bytes_per_sec: u64,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    upd_opts!(opts, err_out, min_throughput, bytes_per_sec)
+    upd_opts!(opts, err_out, request_min_throughput, bytes_per_sec)
 }
 
 /// Grace request timeout before relying on the minimum throughput logic.
 /// The default is 5 seconds.
 #[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_grace_timeout(
+pub unsafe extern "C" fn line_sender_opts_request_timeout(
     opts: *mut line_sender_opts,
     millis: u64,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let grace_timeout = std::time::Duration::from_millis(millis);
-    upd_opts!(opts, err_out, grace_timeout, grace_timeout)
+    let request_timeout = std::time::Duration::from_millis(millis);
+    upd_opts!(opts, err_out, request_timeout, request_timeout)
 }
 
 /// Set the HTTP user agent. Internal API. Do not use.

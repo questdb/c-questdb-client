@@ -360,25 +360,26 @@ fn tcps_tls_roots_file_with_password() {
 
 #[cfg(feature = "ilp-over-http")]
 #[test]
-fn http_min_throughput() {
-    let builder = SenderBuilder::from_conf("http::addr=localhost;min_throughput=100;").unwrap();
+fn http_request_min_throughput() {
+    let builder =
+        SenderBuilder::from_conf("http::addr=localhost;request_min_throughput=100;").unwrap();
     let Some(http_config) = builder.http else {
         panic!("Expected Some(HttpConfig)");
     };
-    assert_specified_eq(&http_config.min_throughput, 100u64);
-    assert_defaulted_eq(&http_config.grace_timeout, Duration::from_millis(5000));
+    assert_specified_eq(&http_config.request_min_throughput, 100u64);
+    assert_defaulted_eq(&http_config.request_timeout, Duration::from_millis(5000));
     assert_defaulted_eq(&http_config.retry_timeout, Duration::from_millis(10000));
 }
 
 #[cfg(feature = "ilp-over-http")]
 #[test]
-fn http_grace_timeout() {
-    let builder = SenderBuilder::from_conf("http::addr=localhost;grace_timeout=100;").unwrap();
+fn http_request_timeout() {
+    let builder = SenderBuilder::from_conf("http::addr=localhost;request_timeout=100;").unwrap();
     let Some(http_config) = builder.http else {
         panic!("Expected Some(HttpConfig)");
     };
-    assert_defaulted_eq(&http_config.min_throughput, 102400u64);
-    assert_specified_eq(&http_config.grace_timeout, Duration::from_millis(100));
+    assert_defaulted_eq(&http_config.request_min_throughput, 102400u64);
+    assert_specified_eq(&http_config.request_timeout, Duration::from_millis(100));
     assert_defaulted_eq(&http_config.retry_timeout, Duration::from_millis(10000));
 }
 
@@ -389,8 +390,8 @@ fn http_retry_timeout() {
     let Some(http_config) = builder.http else {
         panic!("Expected Some(HttpConfig)");
     };
-    assert_defaulted_eq(&http_config.min_throughput, 102400u64);
-    assert_defaulted_eq(&http_config.grace_timeout, Duration::from_millis(5000));
+    assert_defaulted_eq(&http_config.request_min_throughput, 102400u64);
+    assert_defaulted_eq(&http_config.request_timeout, Duration::from_millis(5000));
     assert_specified_eq(&http_config.retry_timeout, Duration::from_millis(100));
 }
 
