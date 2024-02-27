@@ -29,21 +29,20 @@
 //! (ILP) over TCP.
 //!
 //! To get started:
-//!   * Connect to QuestDB by creating a [`Sender`] object.
+//!   * Connect to QuestDB by creating a [`Sender`] object, usually via [`Sender::from_conf`].
 //!   * Populate a [`Buffer`] with one or more rows of data.
 //!   * Send the buffer via the Sender's [`flush`](Sender::flush) method.
 //!
-//! ```no_run
+//! ```rust no_run
 //! use questdb::{
 //!     Result,
 //!     ingress::{
 //!         Sender,
 //!         Buffer,
-//!         SenderBuilder,
 //!         TimestampNanos}};
-//!
+//! 
 //! fn main() -> Result<()> {
-//!    let mut sender = SenderBuilder::new_tcp("localhost", 9009).build()?;
+//!    let mut sender = Sender::from_conf("http::addr=localhost:9000;")?;
 //!    let mut buffer = Buffer::new();
 //!    buffer
 //!        .table("sensors")?
@@ -1325,7 +1324,7 @@ impl Default for Buffer {
 
 /// Connects to a QuestDB instance and inserts data via the ILP protocol.
 ///
-/// * To construct an instance, use the [`SenderBuilder`].
+/// * To construct an instance, use [`Sender::from_conf`] or the [`SenderBuilder`].
 /// * To prepare messages, use [`Buffer`] objects.
 /// * To send messages, call the [`flush`](Sender::flush) method.
 pub struct Sender {
@@ -1724,10 +1723,24 @@ pub struct SenderBuilder {
 
 impl SenderBuilder {
     /// Create a new `SenderBuilder` instance from configuration string.
-    /// The format of the string is: "tcp::addr=host:port;ket=value;...;"
-    /// Alongside "tcp" you can also specify "tcps", "http", and "https".
+    ///
+    /// The format of the string is: `"http::addr=host:port;ket=value;...;"`.
+    ///
+    /// Alongside `"http"` you can also specify `"https"`, `"tcp"`, and `"tcps"`.
+    ///
+    /// HTTP is recommended in most cases as is provides better error feedback
+    /// allows controlling transactions. TCP can sometimes be faster in higher-latency
+    /// networks, but misses out on a number of features.
+    ///
     /// The accepted set of keys and values is the same as for the `SenderBuilder`'s API.
-    /// E.g. "tcp::addr=host:port;user=alice;password=secret;tls_ca=os_roots;"
+    ///
+    /// E.g. `"http::addr=host:port;user=alice;password=secret;tls_ca=os_roots;"`.
+    ///
+    /// If you prefer, you can also load the configuration from an environment variable.
+    /// See [`SenderBuilder::from_env`].
+    ///
+    /// Once a `SenderBuilder` is created from a string (or from the environment variable)
+    /// it can be further customized before calling [`SenderBuilder::build`].
     pub fn from_conf<T: AsRef<str>>(conf: T) -> Result<Self> {
         let conf = conf.as_ref();
         let conf = questdb_confstr::parse_conf_str(conf)
@@ -1885,6 +1898,8 @@ impl SenderBuilder {
 
     /// Create a new `SenderBuilder` instance from configuration string read from the
     /// `QDB_CLIENT_CONF` environment variable.
+    ///
+    /// The format of the string is the same as for [`SenderBuilder::from_conf`].
     pub fn from_env() -> Result<Self> {
         let conf = std::env::var("QDB_CLIENT_CONF").map_err(|_| {
             error::fmt!(ConfigError, "Environment variable QDB_CLIENT_CONF not set.")
@@ -2607,12 +2622,31 @@ impl F64Serializer {
 }
 
 impl Sender {
-    /// Create a new `Sender` from configuration parameters.
+    /// Create a new `Sender` instance from configuration string.
+    ///
+    /// The format of the string is: `"http::addr=host:port;key=value;...;"`.
+    ///
+    /// Alongside `"http"` you can also specify `"https"`, `"tcp"`, and `"tcps"`.
+    ///
+    /// HTTP is recommended in most cases as is provides better error feedback
+    /// allows controlling transactions. TCP can sometimes be faster in higher-latency
+    /// networks, but misses out on a number of features.
+    ///
+    /// The accepted set of keys and values is the same as for the opt's API.
+    ///
+    /// E.g. `"http::addr=host:port;user=alice;password=secret;tls_ca=os_roots;"`.
+    ///
+    /// For full list of keys and values, see the [`SenderBuilder`] documentation:
+    /// The builder API and the configuration string API are equivalent.
+    ///
+    /// If you prefer, you can also load the configuration from an environment variable.
+    /// See [`Sender::from_env`].
     pub fn from_conf<T: AsRef<str>>(conf: T) -> Result<Self> {
         SenderBuilder::from_conf(conf)?.build()
     }
 
     /// Create a new `Sender` from the `QDB_CLIENT_CONF` environment variable.
+    /// The format is the same as that taken by [`Sender::from_conf`].
     pub fn from_env() -> Result<Self> {
         SenderBuilder::from_env()?.build()
     }
@@ -2706,6 +2740,8 @@ impl Sender {
     ///
     /// This is because QuestDB does not support transactions spanning multiple
     /// tables.
+    ///
+    /// Note that transactional flushes are only supported for ILP over HTTP.
     #[cfg(feature = "ilp-over-http")]
     pub fn flush_and_keep_with_flags(&mut self, buf: &Buffer, transactional: bool) -> Result<()> {
         self.flush_impl(buf, transactional)

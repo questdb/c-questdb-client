@@ -10,6 +10,9 @@ keywords = ["questdb", "ilp", "client-library"]
 categories = ["database"]
 authors = ["Adam Cimarosti <adam@questdb.io>"]
 
+[package.metadata.docs.rs]
+all-features = true
+
 [lib]
 name = "questdb"
 crate-type = ["lib"]
