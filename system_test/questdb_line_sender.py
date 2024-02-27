@@ -70,10 +70,12 @@ class c_line_sender_buffer(ctypes.Structure):
     pass
 
 c_line_sender_ca = ctypes.c_int
-CA_WEBPKI_ROOTS = c_line_sender_ca(0)
-CA_OS_ROOTS = c_line_sender_ca(1)
-CA_WEBPKI_AND_OS_ROOTS = c_line_sender_ca(2)
-CA_PEM_FILE = c_line_sender_ca(3)
+
+class CertificateAuthority(Enum):
+    WEBPKI_ROOTS = (c_line_sender_ca(0), 'webpki_roots')
+    OS_ROOTS = (c_line_sender_ca(1), 'os_roots')
+    WEBPKI_AND_OS_ROOTS = (c_line_sender_ca(2), 'webpki_and_os_roots')
+    PEM_FILE = (c_line_sender_ca(3), 'pem_file')
 
 class c_line_sender_opts(ctypes.Structure):
     pass
@@ -378,6 +380,15 @@ def _setup_cdll():
         c_line_sender_opts_p,
         c_line_sender_error_p_p)
     set_sig(
+        dll.line_sender_from_conf,
+        c_line_sender_p,
+        c_line_sender_utf8,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_from_env,
+        c_line_sender_p,
+        c_line_sender_error_p_p)
+    set_sig(
         dll.line_sender_must_close,
         None,
         c_line_sender_p)
@@ -641,23 +652,62 @@ class Buffer:
         _DLL.line_sender_buffer_free(self._impl)
 
 
+class BuildMode(Enum):
+    API = 1
+    CONF = 2
+    ENV = 3
+
+
+def _map_value(key, value):
+    """
+    Return a pair of option C object and string value.
+    """
+    if isinstance(value, bool):
+        if key == 'tls_verify':
+            return (value, 'on' if value else 'unsafe_off')
+        else:
+            return (value, 'on' if value else 'off')
+    elif isinstance(value, CertificateAuthority):
+        return value.value  # a tuple of `(c_line_sender_ca, str)`
+    else:
+        return (value, f'{value}')
+
+
 class Sender:
     def __init__(
             self,
+            build_mode: BuildMode,
             host: str,
             port: Union[str, int],
             *,
             protocol: Protocol = Protocol.TCP,
             **kwargs):
         
+        self._build_mode = build_mode
         self._impl = None
-
-        opts = _Opts(host, port, protocol)
-
-        for key, value in kwargs.items():
-            getattr(opts, key)(value)
-
+        self._conf = [
+            'tcp' if protocol == Protocol.TCP else 'http',
+            '::',
+            f'addr={host}:{port};']
+        self._opts = None
         self._buffer = Buffer()
+        opts = _Opts(host, port, protocol)
+        for key, value in kwargs.items():
+            # Build the config string param pair.
+            tls_proto = False
+            if key == 'tls_enabled':
+                tls_proto = bool(value)
+            elif key.startswith('tls_'):
+                tls_proto = True
+
+            if tls_proto:
+                self._conf[0] = 'tcps' if protocol == Protocol.TCP else 'https'
+
+            c_value, conf_value = _map_value(key, value)
+            self._conf.append(f'{key}={conf_value};')
+            getattr(opts, key)(c_value)
+
+        self._conf = ''.join(self._conf)
         self._opts = opts
 
     @property
@@ -667,9 +717,20 @@ class Sender:
     def connect(self):
         if self._impl:
             raise SenderError('Already connected')
-        self._impl = _error_wrapped_call(
-            _DLL.line_sender_build,
-            self._opts.impl)
+        if self._build_mode == BuildMode.CONF:
+            self._impl = _error_wrapped_call(
+                _DLL.line_sender_from_conf,
+                _utf8(self._conf))
+        elif self._build_mode == BuildMode.ENV:
+            env_var = 'QDB_CLIENT_CONF'
+            os.environ[env_var] = self._conf
+            self._impl = _error_wrapped_call(
+                _DLL.line_sender_from_env)
+            del os.environ[env_var]
+        else:
+            self._impl = _error_wrapped_call(
+                _DLL.line_sender_build,
+                self._opts.impl)
 
     def __enter__(self):
         self.connect()

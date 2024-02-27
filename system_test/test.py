@@ -51,6 +51,7 @@ from collections import namedtuple
 
 QDB_FIXTURE: QuestDbFixture = None
 TLS_PROXY_FIXTURE: TlsProxyFixture = None
+BUILD_MODE = None
 
 
 def retry_check_table(*args, **kwargs):
@@ -93,6 +94,7 @@ class TestSender(unittest.TestCase):
     def _mk_linesender(self, transactional=False):
         auth = AUTH if QDB_FIXTURE.auth else {}
         return qls.Sender(
+            BUILD_MODE,
             QDB_FIXTURE.host,
             QDB_FIXTURE.http_server_port if QDB_FIXTURE.http else QDB_FIXTURE.line_tcp_port,
             protocol=qls.Protocol.HTTP if QDB_FIXTURE.http else qls.Protocol.TCP,
@@ -474,6 +476,8 @@ class TestSender(unittest.TestCase):
         self.assertEqual(scrubbed_dataset, exp_dataset)
 
     def _test_example(self, bin_name, table_name, tls=False):
+        if BUILD_MODE != qls.BuildMode.API:
+            self.skipTest('BuildMode.API-only test')
         if tls and not QDB_FIXTURE.auth:
             self.skipTest('No auth')
         # Call the example program.
@@ -548,6 +552,7 @@ class TestSender(unittest.TestCase):
         """
         auth = {} if QDB_FIXTURE.auth else AUTH
         sender = qls.Sender(
+            BUILD_MODE,
             QDB_FIXTURE.host,
             QDB_FIXTURE.line_tcp_port,
             **auth)
@@ -574,6 +579,7 @@ class TestSender(unittest.TestCase):
             self.skipTest('No auth')
 
         sender = qls.Sender(
+            BUILD_MODE,
             QDB_FIXTURE.host,
             QDB_FIXTURE.line_tcp_port,
             **AUTH_UNRECOGNIZED)
@@ -586,6 +592,7 @@ class TestSender(unittest.TestCase):
             self.skipTest('No auth')
 
         sender = qls.Sender(
+            BUILD_MODE,
             QDB_FIXTURE.host,
             QDB_FIXTURE.line_tcp_port,
             **AUTH_MALFORMED1)
@@ -600,6 +607,7 @@ class TestSender(unittest.TestCase):
             self.skipTest('No auth')
 
         sender = qls.Sender(
+            BUILD_MODE,
             QDB_FIXTURE.host,
             QDB_FIXTURE.line_tcp_port,
             **AUTH_MALFORMED2)
@@ -612,6 +620,7 @@ class TestSender(unittest.TestCase):
     def test_tls_insecure_skip_verify(self):
         auth = AUTH if QDB_FIXTURE.auth else {}
         sender = qls.Sender(
+            BUILD_MODE,
             QDB_FIXTURE.host,
             TLS_PROXY_FIXTURE.listen_port,
             tls_verify=False,
@@ -621,6 +630,7 @@ class TestSender(unittest.TestCase):
     def test_tls_roots(self):
         auth = auth=AUTH if QDB_FIXTURE.auth else {}
         sender = qls.Sender(
+            BUILD_MODE,
             QDB_FIXTURE.host,
             TLS_PROXY_FIXTURE.listen_port,
             **auth,
@@ -634,6 +644,7 @@ class TestSender(unittest.TestCase):
                 Project().tls_certs_dir / 'server_rootCA.pem')
             auth = auth=AUTH if QDB_FIXTURE.auth else {}
             sender = qls.Sender(
+                BUILD_MODE,
                 QDB_FIXTURE.host,
                 TLS_PROXY_FIXTURE.listen_port,
                 tls_ca=tls_ca,
@@ -646,10 +657,10 @@ class TestSender(unittest.TestCase):
                 del os.environ['SSL_CERT_FILE']
 
     def test_tls_ca_os_roots(self):
-        self._test_tls_ca(qls.CA_OS_ROOTS)
+        self._test_tls_ca(qls.CertificateAuthority.OS_ROOTS)
 
     def test_tls_ca_webpki_and_os_roots(self):
-        self._test_tls_ca(qls.CA_WEBPKI_AND_OS_ROOTS)
+        self._test_tls_ca(qls.CertificateAuthority.WEBPKI_AND_OS_ROOTS)
 
     def test_http_transactions(self):
         if not QDB_FIXTURE.http:
@@ -685,6 +696,15 @@ class TestSender(unittest.TestCase):
         with self.assertRaisesRegex(qls.SenderError, r'.*Transactional .* not supported.*'):
             with self._mk_linesender() as sender:
                 sender.flush(buf, transactional=True)
+
+    def test_bad_env_var(self):
+        if not BUILD_MODE == qls.BuildMode.API:
+            self.skipTest('BuildMode.API-only test')
+        env_var = 'QDB_CLIENT_CONF'
+        if env_var in os.environ:
+            del os.environ[env_var]
+        with self.assertRaisesRegex(qls.SenderError, r'.*Environment variable QDB_CLIENT_CONF not set.*'):
+            qls._error_wrapped_call(qls._DLL.line_sender_from_env)
 
 
 def parse_args():
@@ -724,7 +744,7 @@ def parse_args():
     return parser.parse_known_args()
 
 
-def list(args):
+def list_releases(args):
     print('List of releases:')
     for vers, _ in list_questdb_releases(args.n or 1):
         print(f'    {vers}')
@@ -782,33 +802,37 @@ def iter_versions(args):
 def run_with_fixtures(args):
     global QDB_FIXTURE
     global TLS_PROXY_FIXTURE
+    global BUILD_MODE
     last_version = None
     for questdb_dir in iter_versions(args):
         for auth in (False, True):
             for http in (False, True):
-                if http and last_version <= (7, 3, 7):
-                    print('Skipping ILP/HTTP tests for versions <= 7.3.7')
-                    continue
-                if http and auth:
-                    print('Skipping auth for ILP/HTTP tests')
-                    continue
-                QDB_FIXTURE = QuestDbFixture(questdb_dir, auth=auth, http=http)
-                TLS_PROXY_FIXTURE = None
-                try:
-                    QDB_FIXTURE.start()
-                    # Read the version _after_ a first start so it can rely
-                    # on the live one from the `select build` query.
-                    last_version = QDB_FIXTURE.version
-                    TLS_PROXY_FIXTURE = TlsProxyFixture(QDB_FIXTURE.line_tcp_port)
-                    TLS_PROXY_FIXTURE.start()
+                for build_mode in list(qls.BuildMode):
+                    print(f'Running tests [questdb_dir={questdb_dir}, auth={auth}, http={http}, build_mode={build_mode}]')
+                    if http and last_version <= (7, 3, 7):
+                        print('Skipping ILP/HTTP tests for versions <= 7.3.7')
+                        continue
+                    if http and auth:
+                        print('Skipping auth for ILP/HTTP tests')
+                        continue
+                    QDB_FIXTURE = QuestDbFixture(questdb_dir, auth=auth, http=http)
+                    TLS_PROXY_FIXTURE = None
+                    BUILD_MODE = build_mode
+                    try:
+                        QDB_FIXTURE.start()
+                        # Read the version _after_ a first start so it can rely
+                        # on the live one from the `select build` query.
+                        last_version = QDB_FIXTURE.version
+                        TLS_PROXY_FIXTURE = TlsProxyFixture(QDB_FIXTURE.line_tcp_port)
+                        TLS_PROXY_FIXTURE.start()
 
-                    test_prog = unittest.TestProgram(exit=False)
-                    if not test_prog.result.wasSuccessful():
-                        sys.exit(1)
-                finally:
-                    if TLS_PROXY_FIXTURE:
-                        TLS_PROXY_FIXTURE.stop()
-                    QDB_FIXTURE.stop()
+                        test_prog = unittest.TestProgram(exit=False)
+                        if not test_prog.result.wasSuccessful():
+                            sys.exit(1)
+                    finally:
+                        if TLS_PROXY_FIXTURE:
+                            TLS_PROXY_FIXTURE.stop()
+                        QDB_FIXTURE.stop()
 
 
 def run(args, show_help=False):
@@ -827,7 +851,7 @@ def run(args, show_help=False):
 def main():
     args, extra_args = parse_args()
     if args.command == 'list':
-        list(args)
+        list_releases(args)
     else:
         # Repackage args for unittest's own arg parser.
         sys.argv[:] = sys.argv[:1] + extra_args
