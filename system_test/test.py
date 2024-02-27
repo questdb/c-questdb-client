@@ -28,7 +28,6 @@ import sys
 sys.dont_write_bytecode = True
 import os
 
-import shutil
 import pathlib
 import math
 import datetime
@@ -88,6 +87,14 @@ AUTH_MALFORMED2 = dict(
     token="xiecEl-zzbg6aYCFbxDMVWaly9BlCTaECH5BCk",
     token_x="-nSHz3evuPl-rGLIlbIZjwOJeWao0rbk5XEgak",
     token_y="9iYksF4L6mfmArupv0CMoyVAWjQ4gNIou5noG8")
+
+
+# All the keys are valid, but the user is wrong.
+AUTH_MALFORMED3 = dict(
+    user="wrongUser",
+    token=AUTH['token'],
+    token_x=AUTH['token_x'],
+    token_y=AUTH['token_y'])
 
 
 class TestSender(unittest.TestCase):
@@ -616,6 +623,19 @@ class TestSender(unittest.TestCase):
                 qls.SenderError,
                 r'.*invalid Base64.*'):
             sender.connect()
+
+    def test_malformed_auth3(self):
+        if not QDB_FIXTURE.auth:
+            self.skipTest('No auth')
+
+        sender = qls.Sender(
+            BUILD_MODE,
+            QDB_FIXTURE.host,
+            QDB_FIXTURE.line_tcp_port,
+            **AUTH_MALFORMED3)
+
+        with sender:
+            self._expect_eventual_disconnect(sender)
 
     def test_tls_insecure_skip_verify(self):
         auth = AUTH if QDB_FIXTURE.auth else {}
