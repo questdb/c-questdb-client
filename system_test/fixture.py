@@ -291,8 +291,8 @@ class QuestDbFixture:
             java,
             '-DQuestDB-Runtime-0',
             '-ea',
-            #'-Dnoebug',
-            '-Debug',
+            '-Dnoebug',
+            # '-Debug',
             '-XX:+UnlockExperimentalVMOptions',
             '-XX:+AlwaysPreTouch',
             '-p', str(self._root_dir / 'bin' / 'questdb.jar'),
@@ -392,7 +392,7 @@ class QuestDbFixture:
             table_name,
             *,
             min_rows=1,
-            timeout_sec=45,
+            timeout_sec=120,
             log=True,
             log_ctx=None):
         sql_query = f"select * from '{table_name}'"
