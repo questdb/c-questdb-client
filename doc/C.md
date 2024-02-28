@@ -27,27 +27,22 @@
 
 ...
 
+line_sender_utf8 conf = QDB_UTF8_LITERAL(
+    "http::addr=localhost:9000;");
+
 line_sender_error* err = NULL;
-line_sender_opts* opts = NULL;
-line_sender* sender = NULL;
-
-line_sender_utf8 host = QDB_UTF8_LITERAL("localhost");
-opts = line_sender_opts_new(host, 9009, &err);
-if (!opts) {
-    /* ... handle error ... */
-}
-
-sender = line_sender_build(opts, &err);
-line_sender_opts_free(opts);
-opts = NULL;
+line_sender* sender = sender = line_sender_from_conf(&err);
 if (!sender) {
     /* ... handle error ... */
 }
 
 ```
 
-The `opts` object can additionally take parameters for the outbound interface,
-authentication, full-connection encryption via TLS and more.
+See the main [client libraries](https://questdb.io/docs/reference/clients/overview/)
+documentation for the full config string params, including authentication, tls, etc.
+
+You can also connect programmatically using `line_sender_opts_new_tcp` or
+`line_sender_opts_new_http`.
 
 ### Building Messages
 
