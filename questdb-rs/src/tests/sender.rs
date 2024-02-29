@@ -229,7 +229,7 @@ fn test_bad_key(
     let server = MockServer::new()?;
     let lsb = server
         .lsb_tcp()
-        .user("testUser1")?
+        .username("testUser1")?
         .token(priv_key)?
         .token_x(pub_key_x)?
         .token_y(pub_key_y)?;

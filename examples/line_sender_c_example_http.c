@@ -10,7 +10,7 @@ static bool example(const char* host, const char* port)
     line_sender* sender = NULL;
     line_sender_buffer* buffer = NULL;
     // Use `https` to enable TLS.
-    // Use `user=...;pass=...;` or `token=...` for authentication.
+    // Use `username=...;password=...;` or `token=...` for authentication.
     char* conf_str = concat("http::addr=", host, ":", port, ";");
     if (!conf_str) {
         fprintf(stderr, "Could not concatenate connection string.\n");

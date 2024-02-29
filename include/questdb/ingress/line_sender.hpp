@@ -732,7 +732,7 @@ namespace questdb::ingress
              * The format of the string is: "tcp::addr=host:port;key=value;...;"
              * Alongside "tcp" you can also specify "tcps", "http", and "https".
              * The accepted set of keys and values is the same as for the opt's API.
-             * E.g. "tcp::addr=host:port;user=alice;password=secret;tls_ca=os_roots;"
+             * E.g. "tcp::addr=host:port;username=alice;password=secret;tls_ca=os_roots;"
              */
             static inline opts from_conf(utf8_view conf)
             {
@@ -831,21 +831,6 @@ namespace questdb::ingress
                 return *this;
             }
 
-            // /**
-            //  * Set the username for authentication.
-            //  * 
-            //  * For TCP this is the `kid` part of the ECDSA key set.
-            //  * The other fields are `token` `token_x` and `token_y`.
-            //  * 
-            //  * For HTTP this is part of basic authentication.
-            //  * Also see `pass`.
-            //  */
-            // LINESENDER_API
-            // bool line_sender_opts_user(
-            //     line_sender_opts* opts,
-            //     line_sender_utf8 user,
-            //     line_sender_error** err_out);
-
             /**
              * Set the username for basic HTTP authentication.
              * 
@@ -853,27 +838,27 @@ namespace questdb::ingress
              * The other fields are `token` `token_x` and `token_y`.
              * 
              * For HTTP this is part of basic authentication.
-             * Also see `pass`.
+             * Also see `password`.
              */
-            opts& user(utf8_view user)
+            opts& username(utf8_view username)
             {
                 line_sender_error::wrapped_call(
-                    ::line_sender_opts_user,
+                    ::line_sender_opts_username,
                     _impl,
-                    user._impl);
+                    username._impl);
                 return *this;
             }
 
             /**
              * Set the password for basic HTTP authentication.
-             * Also see `user`.
+             * Also see `username`.
              */
-            opts& pass(utf8_view pass)
+            opts& password(utf8_view password)
             {
                 line_sender_error::wrapped_call(
-                    ::line_sender_opts_pass,
+                    ::line_sender_opts_password,
                     _impl,
-                    pass._impl);
+                    password._impl);
                 return *this;
             }
 
@@ -1079,7 +1064,7 @@ namespace questdb::ingress
          * The format of the string is: "tcp::addr=host:port;key=value;...;"
          * Alongside "tcp" you can also specify "tcps", "http", and "https".
          * The accepted set of keys and values is the same as for the opt's API.
-         * E.g. "tcp::addr=host:port;user=alice;password=secret;tls_ca=os_roots;"
+         * E.g. "tcp::addr=host:port;username=alice;password=secret;tls_ca=os_roots;"
          */
         static inline line_sender from_conf(utf8_view conf)
         {

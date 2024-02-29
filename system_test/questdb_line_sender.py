@@ -283,13 +283,13 @@ def _setup_cdll():
         c_line_sender_utf8,
         c_line_sender_error_p_p)
     set_sig(
-        dll.line_sender_opts_user,
+        dll.line_sender_opts_username,
         c_bool,
         c_line_sender_opts_p,
         c_line_sender_utf8,
         c_line_sender_error_p_p)
     set_sig(
-        dll.line_sender_opts_pass,
+        dll.line_sender_opts_password,
         c_bool,
         c_line_sender_opts_p,
         c_line_sender_utf8,

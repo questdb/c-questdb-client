@@ -890,10 +890,10 @@ pub unsafe extern "C" fn line_sender_buffer_at_now(
 pub struct line_sender_opts(SenderBuilder);
 
 /// Create a new `ops` instance from configuration string.
-/// The format of the string is: "tcp::addr=host:port;ket=value;...;"
+/// The format of the string is: "tcp::addr=host:port;key=value;...;"
 /// Alongside "tcp" you can also specify "tcps", "http", and "https".
 /// The accepted set of keys and values is the same as for the opt's API.
-/// E.g. "tcp::addr=host:port;user=alice;password=secret;tls_ca=os_roots;"
+/// E.g. "tcp::addr=host:port;username=alice;password=secret;tls_ca=os_roots;"
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_opts_from_conf(
     config: line_sender_utf8,
@@ -978,25 +978,25 @@ pub unsafe extern "C" fn line_sender_opts_bind_interface(
 /// The other fields are `token` `token_x` and `token_y`.
 ///
 /// For HTTP this is part of basic authentication.
-/// Also see `pass`.
+/// Also see `password`.
 #[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_user(
+pub unsafe extern "C" fn line_sender_opts_username(
     opts: *mut line_sender_opts,
-    user: line_sender_utf8,
+    username: line_sender_utf8,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    upd_opts!(opts, err_out, user, user.as_str())
+    upd_opts!(opts, err_out, username, username.as_str())
 }
 
 /// Set the password for basic HTTP authentication.
-/// Also see `user`.
+/// Also see `username`.
 #[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_pass(
+pub unsafe extern "C" fn line_sender_opts_password(
     opts: *mut line_sender_opts,
-    pass: line_sender_utf8,
+    password: line_sender_utf8,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    upd_opts!(opts, err_out, pass, pass.as_str())
+    upd_opts!(opts, err_out, password, password.as_str())
 }
 
 /// Token (Bearer) Authentication Parameters for ILP over HTTP,
@@ -1201,7 +1201,7 @@ pub unsafe extern "C" fn line_sender_build(
 /// The format of the string is: "tcp::addr=host:port;key=value;...;"
 /// Alongside "tcp" you can also specify "tcps", "http", and "https".
 /// The accepted set of keys and values is the same as for the opt's API.
-/// E.g. "tcp::addr=host:port;user=alice;password=secret;tls_ca=os_roots;"
+/// E.g. "tcp::addr=host:port;username=alice;password=secret;tls_ca=os_roots;"
 ///
 /// For full list of options, search this header for `bool line_sender_opts_`.
 #[no_mangle]

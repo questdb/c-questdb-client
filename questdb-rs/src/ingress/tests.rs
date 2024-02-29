@@ -80,7 +80,8 @@ fn unsupported_service() {
 #[test]
 fn http_basic_auth() {
     let builder =
-        SenderBuilder::from_conf("http::addr=localhost;user=user123;pass=pass321;").unwrap();
+        SenderBuilder::from_conf("http::addr=localhost;username=user123;password=pass321;")
+            .unwrap();
     let auth = builder.build_auth().unwrap();
     match auth.unwrap() {
         AuthParams::Basic(BasicAuthParams { username, password }) => {
@@ -112,16 +113,16 @@ fn http_token_auth() {
 #[test]
 fn incomplete_basic_auth() {
     assert_conf_err(
-        SenderBuilder::from_conf("http::addr=localhost;user=user123;")
+        SenderBuilder::from_conf("http::addr=localhost;username=user123;")
             .unwrap()
             .build(),
-        "Basic authentication parameter \"user\" is present, but \"pass\" is missing.",
+        "Basic authentication parameter \"username\" is present, but \"password\" is missing.",
     );
     assert_conf_err(
-        SenderBuilder::from_conf("http::addr=localhost;pass=pass321;")
+        SenderBuilder::from_conf("http::addr=localhost;password=pass321;")
             .unwrap()
             .build(),
-        "Basic authentication parameter \"pass\" is present, but \"user\" is missing.",
+        "Basic authentication parameter \"password\" is present, but \"username\" is missing.",
     );
 }
 
@@ -129,25 +130,25 @@ fn incomplete_basic_auth() {
 #[test]
 fn misspelled_basic_auth() {
     assert_conf_err(
-        Sender::from_conf("http::addr=localhost;user=user123;password=pass321;"),
-        r##"Basic authentication parameter "user" is present, but "pass" is missing."##,
+        Sender::from_conf("http::addr=localhost;username=user123;password=pass321;"),
+        r##"Basic authentication parameter "username" is present, but "password" is missing."##,
     );
     assert_conf_err(
-        Sender::from_conf("http::addr=localhost;username=user123;pass=pass321;"),
-        r##"Basic authentication parameter "pass" is present, but "user" is missing."##,
+        Sender::from_conf("http::addr=localhost;username=user123;password=pass321;"),
+        r##"Basic authentication parameter "password" is present, but "username" is missing."##,
     );
 }
 
 #[cfg(feature = "ilp-over-http")]
 #[test]
 fn inconsistent_http_auth() {
-    let expected_err_msg = r##"Inconsistent HTTP authentication parameters. Specify either "user" and "pass", or just "token"."##;
+    let expected_err_msg = r##"Inconsistent HTTP authentication parameters. Specify either "username" and "password", or just "token"."##;
     assert_conf_err(
-        Sender::from_conf("http::addr=localhost;user=user123;token=token123;"),
+        Sender::from_conf("http::addr=localhost;username=user123;token=token123;"),
         expected_err_msg,
     );
     assert_conf_err(
-        Sender::from_conf("http::addr=localhost;pass=pass321;token=token123;"),
+        Sender::from_conf("http::addr=localhost;password=pass321;token=token123;"),
         expected_err_msg,
     );
 }
@@ -156,9 +157,9 @@ fn inconsistent_http_auth() {
 #[test]
 fn cant_use_basic_auth_with_tcp() {
     let builder = SenderBuilder::new_tcp("localhost", 9000)
-        .user("user123")
+        .username("user123")
         .unwrap()
-        .pass("pass321")
+        .password("pass321")
         .unwrap();
     assert_conf_err(
         builder.build_auth(),
@@ -183,7 +184,7 @@ fn cant_use_token_auth_with_tcp() {
 fn cant_use_ecdsa_auth_with_http() {
     let builder = SenderBuilder::from_conf("http::addr=localhost;")
         .unwrap()
-        .user("key_id123")
+        .username("key_id123")
         .unwrap()
         .token("priv_key123")
         .unwrap()
@@ -202,7 +203,7 @@ fn set_auth_specifies_tcp() {
     let mut builder = SenderBuilder::new_tcp("localhost", 9000);
     assert_eq!(builder.protocol, SenderProtocol::IlpOverTcp);
     builder = builder
-        .user("key_id123")
+        .username("key_id123")
         .unwrap()
         .token("priv_key123")
         .unwrap()
@@ -223,7 +224,7 @@ fn set_net_interface_specifies_tcp() {
 #[test]
 fn tcp_ecdsa_auth() {
     let builder = SenderBuilder::from_conf(
-        "tcp::addr=localhost:9000;user=user123;token=token123;token_x=xtok123;token_y=ytok123;",
+        "tcp::addr=localhost:9000;username=user123;token=token123;token_x=xtok123;token_y=ytok123;",
     )
     .unwrap();
     let auth = builder.build_auth().unwrap();
@@ -248,23 +249,25 @@ fn tcp_ecdsa_auth() {
 
 #[test]
 fn incomplete_tcp_ecdsa_auth() {
-    let expected_err_msg = r##"Incomplete ECDSA authentication parameters. Specify either all or none of: "user", "token", "token_x", "token_y"."##;
+    let expected_err_msg = r##"Incomplete ECDSA authentication parameters. Specify either all or none of: "username", "token", "token_x", "token_y"."##;
     assert_conf_err(
-        SenderBuilder::from_conf("tcp::addr=localhost;user=user123;")
+        SenderBuilder::from_conf("tcp::addr=localhost;username=user123;")
             .unwrap()
             .build(),
         expected_err_msg,
     );
     assert_conf_err(
-        SenderBuilder::from_conf("tcp::addr=localhost;user=user123;token=token123;")
+        SenderBuilder::from_conf("tcp::addr=localhost;username=user123;token=token123;")
             .unwrap()
             .build(),
         expected_err_msg,
     );
     assert_conf_err(
-        SenderBuilder::from_conf("tcp::addr=localhost;user=user123;token=token123;token_x=123;")
-            .unwrap()
-            .build(),
+        SenderBuilder::from_conf(
+            "tcp::addr=localhost;username=user123;token=token123;token_x=123;",
+        )
+        .unwrap()
+        .build(),
         expected_err_msg,
     );
 }
@@ -272,8 +275,8 @@ fn incomplete_tcp_ecdsa_auth() {
 #[test]
 fn misspelled_tcp_ecdsa_auth() {
     assert_conf_err(
-        Sender::from_conf("tcp::addr=localhost;user=user123;tokenx=123;"),
-        "Incomplete ECDSA authentication parameters. Specify either all or none of: \"user\", \"token\", \"token_x\", \"token_y\"."
+        Sender::from_conf("tcp::addr=localhost;username=user123;tokenx=123;"),
+        "Incomplete ECDSA authentication parameters. Specify either all or none of: \"username\", \"token\", \"token_x\", \"token_y\"."
     );
 }
 

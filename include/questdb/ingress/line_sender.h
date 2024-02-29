@@ -550,7 +550,7 @@ typedef struct line_sender_opts line_sender_opts;
  * The format of the string is: "tcp::addr=host:port;key=value;...;"
  * Alongside "tcp" you can also specify "tcps", "http", and "https".
  * The accepted set of keys and values is the same as for the opt's API.
- * E.g. "tcp::addr=host:port;user=alice;password=secret;tls_ca=os_roots;"
+ * E.g. "tcp::addr=host:port;username=alice;password=secret;tls_ca=os_roots;"
  */
 LINESENDER_API
 line_sender_opts* line_sender_opts_from_conf(
@@ -621,22 +621,22 @@ bool line_sender_opts_bind_interface(
  * The other fields are `token` `token_x` and `token_y`.
  * 
  * For HTTP this is part of basic authentication.
- * Also see `pass`.
+ * Also see `password`.
  */
 LINESENDER_API
-bool line_sender_opts_user(
+bool line_sender_opts_username(
     line_sender_opts* opts,
-    line_sender_utf8 user,
+    line_sender_utf8 username,
     line_sender_error** err_out);
 
 /**
  * Set the password for basic HTTP authentication.
- * Also see `user`.
+ * Also see `username`.
  */
 LINESENDER_API
-bool line_sender_opts_pass(
+bool line_sender_opts_password(
     line_sender_opts* opts,
-    line_sender_utf8 pass,
+    line_sender_utf8 password,
     line_sender_error** err_out);
 
 /**
@@ -758,7 +758,7 @@ bool line_sender_opts_request_min_throughput(
 
 /**
  * Grace request timeout before relying on the minimum throughput logic.
- * The default is 5 seconds.
+ * The default is 10 seconds.
  */
 LINESENDER_API
 bool line_sender_opts_request_timeout(
@@ -794,7 +794,7 @@ line_sender* line_sender_build(
  * The format of the string is: "tcp::addr=host:port;key=value;...;"
  * Alongside "tcp" you can also specify "tcps", "http", and "https".
  * The accepted set of keys and values is the same as for the opt's API.
- * E.g. "tcp::addr=host:port;user=alice;password=secret;tls_ca=os_roots;"
+ * E.g. "tcp::addr=host:port;username=alice;password=secret;tls_ca=os_roots;"
  * 
  * For full list of keys and values, search this header for `bool line_sender_opts_`.
  */
@@ -856,16 +856,6 @@ bool line_sender_flush_and_keep(
     line_sender *sender,
     const line_sender_buffer* buffer,
     line_sender_error** err_out);
-
-/// Variant of `.flush()` that does not clear the buffer and allows for
-/// transactional flushes.
-///
-/// A transactional flush is simply a flush that ensures that all rows in
-/// the ILP buffer refer to the same table, thus allowing the server to
-/// treat the flush request as a single transaction.
-///
-/// This is because QuestDB does not support transactions spanning multiple
-/// tables.
 
 /**
  * Variant of `.flush()` that does not clear the buffer and allows for

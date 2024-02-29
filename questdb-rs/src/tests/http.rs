@@ -300,8 +300,8 @@ fn test_http_basic_auth() -> TestResult {
     let mut server = MockServer::new()?;
     let mut sender = server
         .lsb_http()
-        .user("Aladdin")?
-        .pass("OpenSesame")?
+        .username("Aladdin")?
+        .password("OpenSesame")?
         .build()?;
 
     let buffer2 = buffer.clone();

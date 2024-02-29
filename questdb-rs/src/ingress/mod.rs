@@ -88,7 +88,7 @@
 //! # fn main() -> Result<()> {
 //! // See: https://questdb.io/docs/reference/api/ilp/authenticate
 //! let mut sender = SenderBuilder::new_tcp("localhost", 9009)
-//!     .user("testUser1")? // kid
+//!     .username("testUser1")? // kid
 //!     .token("5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48")? // d
 //!     .token_x("fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU")? // x
 //!     .token_y("Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac")? // y
@@ -1704,8 +1704,8 @@ pub struct SenderBuilder {
     net_interface: ConfigSetting<Option<String>>,
     max_buf_size: ConfigSetting<usize>,
     auth_timeout: ConfigSetting<Duration>,
-    user: ConfigSetting<Option<String>>,
-    pass: ConfigSetting<Option<String>>,
+    username: ConfigSetting<Option<String>>,
+    password: ConfigSetting<Option<String>>,
     token: ConfigSetting<Option<String>>,
     token_x: ConfigSetting<Option<String>>,
     token_y: ConfigSetting<Option<String>>,
@@ -1724,7 +1724,7 @@ pub struct SenderBuilder {
 impl SenderBuilder {
     /// Create a new `SenderBuilder` instance from configuration string.
     ///
-    /// The format of the string is: `"http::addr=host:port;ket=value;...;"`.
+    /// The format of the string is: `"http::addr=host:port;key=value;...;"`.
     ///
     /// Alongside `"http"` you can also specify `"https"`, `"tcp"`, and `"tcps"`.
     ///
@@ -1734,7 +1734,7 @@ impl SenderBuilder {
     ///
     /// The accepted set of keys and values is the same as for the `SenderBuilder`'s API.
     ///
-    /// E.g. `"http::addr=host:port;user=alice;password=secret;tls_ca=os_roots;"`.
+    /// E.g. `"http::addr=host:port;username=alice;password=secret;tls_ca=os_roots;"`.
     ///
     /// If you prefer, you can also load the configuration from an environment variable.
     /// See [`SenderBuilder::from_env`].
@@ -1780,8 +1780,8 @@ impl SenderBuilder {
 
         for (key, val) in params.iter().map(|(k, v)| (k.as_str(), v.as_str())) {
             builder = match key {
-                "user" => builder.user(val)?,
-                "pass" => builder.pass(val)?,
+                "username" => builder.username(val)?,
+                "password" => builder.password(val)?,
                 "token" => builder.token(val)?,
                 "token_x" => builder.token_x(val)?,
                 "token_y" => builder.token_y(val)?,
@@ -1918,8 +1918,8 @@ impl SenderBuilder {
             net_interface: ConfigSetting::new_default(None),
             max_buf_size: ConfigSetting::new_default(100 * 1024 * 1024),
             auth_timeout: ConfigSetting::new_default(Duration::from_secs(15)),
-            user: ConfigSetting::new_default(None),
-            pass: ConfigSetting::new_default(None),
+            username: ConfigSetting::new_default(None),
+            password: ConfigSetting::new_default(None),
             token: ConfigSetting::new_default(None),
             token_x: ConfigSetting::new_default(None),
             token_y: ConfigSetting::new_default(None),
@@ -1992,18 +1992,18 @@ impl SenderBuilder {
     /// and [`token_y`](SenderBuilder::token_y).
     ///
     /// For HTTP this is part of basic authentication.
-    /// Also see [`pass`](SenderBuilder::pass).
-    pub fn user(mut self, user: &str) -> Result<Self> {
-        self.user
-            .set_specified("user", Some(validate_value(user.to_string())?))?;
+    /// Also see [`password`](SenderBuilder::password).
+    pub fn username(mut self, username: &str) -> Result<Self> {
+        self.username
+            .set_specified("username", Some(validate_value(username.to_string())?))?;
         Ok(self)
     }
 
     /// Set the password for basic HTTP authentication.
-    /// Also see [`user`](SenderBuilder::user).
-    pub fn pass(mut self, pass: &str) -> Result<Self> {
-        self.pass
-            .set_specified("pass", Some(validate_value(pass.to_string())?))?;
+    /// Also see [`username`](SenderBuilder::username).
+    pub fn password(mut self, password: &str) -> Result<Self> {
+        self.password
+            .set_specified("password", Some(validate_value(password.to_string())?))?;
         Ok(self)
     }
 
@@ -2295,8 +2295,8 @@ impl SenderBuilder {
     fn build_auth(&self) -> Result<Option<AuthParams>> {
         match (
             self.protocol,
-            self.user.deref(),
-            self.pass.deref(),
+            self.username.deref(),
+            self.password.deref(),
             self.token.deref(),
             self.token_x.deref(),
             self.token_y.deref(),
@@ -2304,18 +2304,18 @@ impl SenderBuilder {
             (_, None, None, None, None, None) => Ok(None),
             (
                 SenderProtocol::IlpOverTcp,
-                Some(user),
+                Some(username),
                 None,
                 Some(token),
                 Some(token_x),
                 Some(token_y),
             ) => Ok(Some(AuthParams::Ecdsa(EcdsaAuthParams {
-                key_id: user.to_string(),
+                key_id: username.to_string(),
                 priv_key: token.to_string(),
                 pub_key_x: token_x.to_string(),
                 pub_key_y: token_y.to_string(),
             }))),
-            (SenderProtocol::IlpOverTcp, Some(_user), Some(_pass), None, None, None) => {
+            (SenderProtocol::IlpOverTcp, Some(_username), Some(_password), None, None, None) => {
                 Err(error::fmt!(ConfigError,
                     r##"The "basic_auth" setting can only be used with the ILP/HTTP protocol."##,
                 ))
@@ -2323,28 +2323,28 @@ impl SenderBuilder {
             (SenderProtocol::IlpOverTcp, None, None, Some(_token), None, None) => {
                 Err(error::fmt!(ConfigError, "Token authentication only be used with the ILP/HTTP protocol."))
             }
-            (SenderProtocol::IlpOverTcp, _user, None, _token, _token_x, _token_y) => {
+            (SenderProtocol::IlpOverTcp, _username, None, _token, _token_x, _token_y) => {
                 Err(error::fmt!(ConfigError,
-                    r##"Incomplete ECDSA authentication parameters. Specify either all or none of: "user", "token", "token_x", "token_y"."##,
+                    r##"Incomplete ECDSA authentication parameters. Specify either all or none of: "username", "token", "token_x", "token_y"."##,
                 ))
             }
             #[cfg(feature = "ilp-over-http")]
-            (SenderProtocol::IlpOverHttp, Some(user), Some(pass), None, None, None) => {
+            (SenderProtocol::IlpOverHttp, Some(username), Some(password), None, None, None) => {
                 Ok(Some(AuthParams::Basic(BasicAuthParams {
-                    username: user.to_string(),
-                    password: pass.to_string(),
+                    username: username.to_string(),
+                    password: password.to_string(),
                 })))
             }
             #[cfg(feature = "ilp-over-http")]
-            (SenderProtocol::IlpOverHttp, Some(_user), None, None, None, None) => {
+            (SenderProtocol::IlpOverHttp, Some(_username), None, None, None, None) => {
                 Err(error::fmt!(ConfigError,
-                    r##"Basic authentication parameter "user" is present, but "pass" is missing."##,
+                    r##"Basic authentication parameter "username" is present, but "password" is missing."##,
                 ))
             }
             #[cfg(feature = "ilp-over-http")]
-            (SenderProtocol::IlpOverHttp, None, Some(_pass), None, None, None) => {
+            (SenderProtocol::IlpOverHttp, None, Some(_password), None, None, None) => {
                 Err(error::fmt!(ConfigError,
-                    r##"Basic authentication parameter "pass" is present, but "user" is missing."##,
+                    r##"Basic authentication parameter "password" is present, but "username" is missing."##,
                 ))
             }
             #[cfg(feature = "ilp-over-http")]
@@ -2356,7 +2356,7 @@ impl SenderBuilder {
             #[cfg(feature = "ilp-over-http")]
             (
                 SenderProtocol::IlpOverHttp,
-                Some(_user),
+                Some(_username),
                 None,
                 Some(_token),
                 Some(_token_x),
@@ -2365,14 +2365,14 @@ impl SenderBuilder {
                 Err(error::fmt!(ConfigError, "ECDSA authentication is only available with ILP/TCP and not available with ILP/HTTP."))
             }
             #[cfg(feature = "ilp-over-http")]
-            (SenderProtocol::IlpOverHttp, _user, _pass, _token, None, None) => {
+            (SenderProtocol::IlpOverHttp, _username, _password, _token, None, None) => {
                 Err(error::fmt!(ConfigError,
-                    r##"Inconsistent HTTP authentication parameters. Specify either "user" and "pass", or just "token"."##,
+                    r##"Inconsistent HTTP authentication parameters. Specify either "username" and "password", or just "token"."##,
                 ))
             }
             _ => {
                 Err(error::fmt!(ConfigError,
-                    r##"Incomplete authentication parameters. Check "user", "pass", "token", "token_x" and "token_y" parameters are set correctly."##,
+                    r##"Incomplete authentication parameters. Check "username", "password", "token", "token_x" and "token_y" parameters are set correctly."##,
                 ))
             }
         }
@@ -2634,7 +2634,7 @@ impl Sender {
     ///
     /// The accepted set of keys and values is the same as for the opt's API.
     ///
-    /// E.g. `"http::addr=host:port;user=alice;password=secret;tls_ca=os_roots;"`.
+    /// E.g. `"http::addr=host:port;username=alice;password=secret;tls_ca=os_roots;"`.
     ///
     /// For full list of keys and values, see the [`SenderBuilder`] documentation:
     /// The builder API and the configuration string API are equivalent.

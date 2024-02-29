@@ -12,7 +12,7 @@ fn main() -> Result<()> {
         .parse()
         .unwrap();
     let mut sender = SenderBuilder::new_tcp(host, port)
-        .user("testUser1")? // kid
+        .username("testUser1")? // kid
         .token("5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48")? // d
         .token_x("fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU")? // x
         .token_y("Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac")? // y

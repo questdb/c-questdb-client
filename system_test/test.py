@@ -67,7 +67,7 @@ def ns_to_qdb_date(at_ts_ns):
 
 # Valid keys, but not registered with the QuestDB fixture.
 AUTH_UNRECOGNIZED = dict(
-    user="testUser2",
+    username="testUser2",
     token="xiecEl-2zbg6aYCFbxDMVWaly9BlCTaEChvcxCH5BCk",
     token_x="-nSHz3evuPl-rGLIlbIZjwOJeWao0rbk53Cll6XEgak",
     token_y="9iYksF4L5mfmArupv0CMoyVAWjQ4gNIoupdg6N5noG8")
@@ -75,7 +75,7 @@ AUTH_UNRECOGNIZED = dict(
 
 # Bad malformed key
 AUTH_MALFORMED1 = dict(
-    user="testUser3",
+    username="testUser3",
     token="xiecEl-zzbg6aYCFbxDMVWaly9BlCTaEChvcxCH5BCk",
     token_x="-nSHz3evuPl-rGLIlbIZjwOJeWao0rbk53Cll6XEgak",
     token_y="9iYksF4L6mfmArupv0CMoyVAWjQ4gNIoupdg6N5noG8")
@@ -83,15 +83,15 @@ AUTH_MALFORMED1 = dict(
 
 # Another malformed key where the keys invalid base 64.
 AUTH_MALFORMED2 = dict(
-    user="testUser4",
+    username="testUser4",
     token="xiecEl-zzbg6aYCFbxDMVWaly9BlCTaECH5BCk",
     token_x="-nSHz3evuPl-rGLIlbIZjwOJeWao0rbk5XEgak",
     token_y="9iYksF4L6mfmArupv0CMoyVAWjQ4gNIou5noG8")
 
 
-# All the keys are valid, but the user is wrong.
+# All the keys are valid, but the username is wrong.
 AUTH_MALFORMED3 = dict(
-    user="wrongUser",
+    username="wrongUser",
     token=AUTH['token'],
     token_x=AUTH['token_x'],
     token_y=AUTH['token_y'])

@@ -10,7 +10,7 @@ static bool example(std::string_view host, std::string_view port)
     {
         auto sender = questdb::ingress::line_sender::from_conf(
             "tcp::addr=" + std::string{host} + ":" + std::string{port} + ";"
-            "user=testUser1;"
+            "username=testUser1;"
             "token=5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48;"
             "token_x=fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU;"
             "token_y=Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac;");
