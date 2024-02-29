@@ -2166,7 +2166,7 @@ impl SenderBuilder {
 
     #[cfg(feature = "ilp-over-http")]
     /// Grace request timeout before relying on the minimum throughput logic.
-    /// The default is 5 seconds.
+    /// The default is 10 seconds.
     /// See [`request_min_throughput`](SenderBuilder::request_min_throughput) for more details.
     pub fn request_timeout(mut self, value: Duration) -> Result<Self> {
         if let Some(http) = &mut self.http {

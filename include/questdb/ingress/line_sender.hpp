@@ -1015,7 +1015,7 @@ namespace questdb::ingress
 
             /**
              * Grace request timeout before relying on the minimum throughput logic.
-             * The default is 5 seconds.
+             * The default is 10 seconds.
              */
             opts& request_timeout(uint64_t millis)
             {
