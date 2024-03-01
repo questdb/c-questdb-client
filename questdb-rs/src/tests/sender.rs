@@ -355,7 +355,7 @@ fn test_tls_with_file_ca() -> TestResult {
     ca_path.push("server_rootCA.pem");
 
     let server = MockServer::new()?;
-    let lsb = server.lsb_tcp().tls_roots(ca_path)?;
+    let lsb = server.lsb_tcps().tls_roots(ca_path)?;
     let server_jh = server.accept_tls();
     let mut sender = lsb.build()?;
     let mut server: MockServer = server_jh.join().unwrap()?;
@@ -384,7 +384,7 @@ fn test_tls_to_plain_server() -> TestResult {
 
     let mut server = MockServer::new()?;
     let lsb = server
-        .lsb_tcp()
+        .lsb_tcps()
         .auth_timeout(Duration::from_millis(500))?
         .tls_ca(CertificateAuthority::PemFile)?
         .tls_roots(ca_path)?;
@@ -425,10 +425,7 @@ fn expect_eventual_disconnect(sender: &mut Sender) {
 #[test]
 fn test_plain_to_tls_server() -> TestResult {
     let server = MockServer::new()?;
-    let lsb = server
-        .lsb_tcp()
-        .auth_timeout(Duration::from_millis(500))?
-        .tls_enabled(false)?;
+    let lsb = server.lsb_tcp().auth_timeout(Duration::from_millis(500))?;
     let server_jh = server.accept_tls();
     let maybe_sender = lsb.build();
     let server_err = server_jh.join().unwrap().unwrap_err();
@@ -451,7 +448,7 @@ fn test_plain_to_tls_server() -> TestResult {
 #[test]
 fn test_tls_insecure_skip_verify() -> TestResult {
     let server = MockServer::new()?;
-    let lsb = server.lsb_tcp().tls_verify(false)?;
+    let lsb = server.lsb_tcps().tls_verify(false)?;
     let server_jh = server.accept_tls();
     let mut sender = lsb.build()?;
     let mut server: MockServer = server_jh.join().unwrap()?;

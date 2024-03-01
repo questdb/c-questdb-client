@@ -35,7 +35,7 @@ use std::str;
 
 use questdb::{
     ingress::{
-        Buffer, CertificateAuthority, ColumnName, Sender, SenderBuilder, TableName,
+        Buffer, CertificateAuthority, ColumnName, Protocol, Sender, SenderBuilder, TableName,
         TimestampMicros, TimestampNanos,
     },
     Error, ErrorCode,
@@ -81,7 +81,7 @@ macro_rules! bubble_err_to_c {
             // already cleaned up object.
             // To avoid double-freeing, we need to construct a valid "dummy"
             // object on top of the memory that is still owned by the caller.
-            let dummy = SenderBuilder::new_tcp("localhost", 1);
+            let dummy = SenderBuilder::new(Protocol::Tcp, "localhost", 1);
             ptr::write(dest, dummy);
             return false;
         }
@@ -117,7 +117,7 @@ macro_rules! upd_opts {
                     // already cleaned up object.
                     // To avoid double-freeing, we need to construct a valid "dummy"
                     // object on top of the memory that is still owned by the caller.
-                    let dummy = SenderBuilder::new_tcp("localhost", 1);
+                    let dummy = SenderBuilder::new(Protocol::Tcp, "localhost", 1);
                     ptr::write(builder_ref, dummy);
                     return false;
                 }
@@ -193,6 +193,45 @@ impl From<ErrorCode> for line_sender_error_code {
                 line_sender_error_code::line_sender_error_server_flush_error
             }
             ErrorCode::ConfigError => line_sender_error_code::line_sender_error_config_error,
+        }
+    }
+}
+
+/// The protocol used to connect with.
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub enum line_sender_protocol {
+    /// InfluxDB Line Protocol over TCP.
+    line_sender_protocol_tcp,
+
+    /// InfluxDB Line Protocol over TCP with TLS.
+    line_sender_protocol_tcps,
+
+    /// InfluxDB Line Protocol over HTTP.
+    line_sender_protocol_http,
+
+    /// InfluxDB Line Protocol over HTTP with TLS.
+    line_sender_protocol_https,
+}
+
+impl From<Protocol> for line_sender_protocol {
+    fn from(protocol: Protocol) -> Self {
+        match protocol {
+            Protocol::Tcp => line_sender_protocol::line_sender_protocol_tcp,
+            Protocol::Tcps => line_sender_protocol::line_sender_protocol_tcps,
+            Protocol::Http => line_sender_protocol::line_sender_protocol_http,
+            Protocol::Https => line_sender_protocol::line_sender_protocol_https,
+        }
+    }
+}
+
+impl From<line_sender_protocol> for Protocol {
+    fn from(protocol: line_sender_protocol) -> Self {
+        match protocol {
+            line_sender_protocol::line_sender_protocol_tcp => Protocol::Tcp,
+            line_sender_protocol::line_sender_protocol_tcps => Protocol::Tcps,
+            line_sender_protocol::line_sender_protocol_http => Protocol::Http,
+            line_sender_protocol::line_sender_protocol_https => Protocol::Https,
         }
     }
 }
@@ -915,46 +954,27 @@ pub unsafe extern "C" fn line_sender_opts_from_env(
 }
 
 /// A new set of options for a line sender connection for ILP/TCP.
+/// @param[in] protocol The protocol to use.
 /// @param[in] host The QuestDB database host.
 /// @param[in] port The QuestDB ILP TCP port.
 #[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_new_tcp(
+pub unsafe extern "C" fn line_sender_opts_new(
+    protocol: line_sender_protocol,
     host: line_sender_utf8,
     port: u16,
 ) -> *mut line_sender_opts {
-    let builder = SenderBuilder::new_tcp(host.as_str(), port);
+    let builder = SenderBuilder::new(protocol.into(), host.as_str(), port);
     Box::into_raw(Box::new(line_sender_opts(builder)))
 }
 
-/// Variant of line_sender_opts_new_tcp that takes a service name for port.
+/// Variant of line_sender_opts_new that takes a service name for port.
 #[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_new_tcp_service(
+pub unsafe extern "C" fn line_sender_opts_new_service(
+    protocol: line_sender_protocol,
     host: line_sender_utf8,
     port: line_sender_utf8,
 ) -> *mut line_sender_opts {
-    let builder = SenderBuilder::new_tcp(host.as_str(), port.as_str());
-    Box::into_raw(Box::new(line_sender_opts(builder)))
-}
-
-/// A new set of options for a line sender connection for ILP/HTTP.
-/// @param[in] host The QuestDB database host.
-/// @param[in] port The QuestDB HTTP port.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_new_http(
-    host: line_sender_utf8,
-    port: u16,
-) -> *mut line_sender_opts {
-    let builder = SenderBuilder::new_http(host.as_str(), port);
-    Box::into_raw(Box::new(line_sender_opts(builder)))
-}
-
-/// Variant of line_sender_opts_new_http that takes a service name for port.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_new_http_service(
-    host: line_sender_utf8,
-    port: line_sender_utf8,
-) -> *mut line_sender_opts {
-    let builder = SenderBuilder::new_http(host.as_str(), port.as_str());
+    let builder = SenderBuilder::new(protocol.into(), host.as_str(), port.as_str());
     Box::into_raw(Box::new(line_sender_opts(builder)))
 }
 
@@ -1041,16 +1061,6 @@ pub unsafe extern "C" fn line_sender_opts_auth_timeout(
 ) -> bool {
     let timeout = std::time::Duration::from_millis(timeout_millis);
     upd_opts!(opts, err_out, auth_timeout, timeout)
-}
-
-/// Enable or disable TLS.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_tls_enabled(
-    opts: *mut line_sender_opts,
-    enabled: bool,
-    err_out: *mut *mut line_sender_error,
-) -> bool {
-    upd_opts!(opts, err_out, tls_enabled, enabled)
 }
 
 /// Set to `false` to disable TLS certificate verification.

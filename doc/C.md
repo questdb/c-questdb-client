@@ -41,8 +41,7 @@ if (!sender) {
 See the main [client libraries](https://questdb.io/docs/reference/clients/overview/)
 documentation for the full config string params, including authentication, tls, etc.
 
-You can also connect programmatically using `line_sender_opts_new_tcp` or
-`line_sender_opts_new_http`.
+You can also connect programmatically using `line_sender_opts_new`.
 
 ### Building Messages
 

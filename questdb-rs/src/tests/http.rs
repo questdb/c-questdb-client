@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-use crate::ingress::{Buffer, SenderBuilder, TimestampNanos};
+use crate::ingress::{Buffer, Protocol, SenderBuilder, TimestampNanos};
 use crate::tests::mock::{certs_dir, HttpResponse, MockServer};
 use crate::ErrorCode;
 use std::io;
@@ -231,7 +231,7 @@ fn test_no_connection() -> TestResult {
         .column_f64("x", 1.0)?
         .at_now()?;
 
-    let mut sender = SenderBuilder::new_http("127.0.0.1", 1).build()?;
+    let mut sender = SenderBuilder::new(Protocol::Http, "127.0.0.1", 1).build()?;
     let res = sender.flush_and_keep(&buffer);
     assert!(res.is_err());
     let err = res.unwrap_err();
@@ -460,7 +460,7 @@ fn test_tls() -> TestResult {
     let buffer2 = buffer.clone();
 
     let mut server = MockServer::new()?;
-    let mut sender = server.lsb_http().tls_roots(ca_path)?.build()?;
+    let mut sender = server.lsb_https().tls_roots(ca_path)?.build()?;
 
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
         server.accept_tls_sync()?;

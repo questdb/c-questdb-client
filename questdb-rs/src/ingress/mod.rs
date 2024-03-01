@@ -79,27 +79,29 @@
 //! To establish an [authenticated](https://questdb.io/docs/reference/api/ilp/authenticate)
 //! and TLS-encrypted connection, call the SenderBuilder's authentication and tls methods.
 //!
-//! Here's an example that uses full security:
+//! Here's an example that uses full security with TCP:
 //!
 //! ```no_run
 //! # use questdb::Result;
-//! use questdb::ingress::SenderBuilder;
+//! use questdb::ingress::{Protocol, SenderBuilder};
 //!
 //! # fn main() -> Result<()> {
 //! // See: https://questdb.io/docs/reference/api/ilp/authenticate
-//! let mut sender = SenderBuilder::new_tcp("localhost", 9009)
+//! let mut sender = SenderBuilder::new(Protocol::Tcps, "localhost", 9009)
 //!     .username("testUser1")? // kid
 //!     .token("5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48")? // d
 //!     .token_x("fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU")? // x
 //!     .token_y("Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac")? // y
-//!     .tls_enabled(true)?
 //!     .build()?;
 //! # Ok(())
 //! # }
 //! ```
 //!
-//! Note that as of writing QuestDB does not natively support TLS encryption.
-//! To use TLS use a TLS proxy such as [HAProxy](http://www.haproxy.org/).
+//! Note that as of writing Open Source QuestDB does not natively support TLS
+//! encryption (QuestDB enterprise does).
+//!
+//! To use TLS with QuestDB open source use a TLS proxy such as
+//! [HAProxy](http://www.haproxy.org/).
 //!
 //! For testing, you can use a self-signed certificate and key.
 //!
@@ -111,10 +113,10 @@
 //! ```no_run
 //! # use questdb::Result;
 //! use std::path::PathBuf;
-//! use questdb::ingress::{SenderBuilder, CertificateAuthority};
+//! use questdb::ingress::{SenderBuilder, Protocol, CertificateAuthority};
 //!
 //! # fn main() -> Result<()> {
-//! let mut sender = SenderBuilder::new_tcp("localhost", 9009)
+//! let mut sender = SenderBuilder::new(Protocol::Tcps, "localhost", 9009)
 //!     .tls_roots("/path/to/server_rootCA.pem")?
 //!     .build()?;
 //! # Ok(())
@@ -198,7 +200,7 @@ use ring::rand::SystemRandom;
 use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
 use rustls::{ClientConnection, RootCertStore, StreamOwned};
 use rustls_pki_types::ServerName;
-use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+use socket2::{Domain, Protocol as SockProtocol, SockAddr, Socket, Type};
 
 #[derive(Debug, Copy, Clone)]
 enum Op {
@@ -1615,31 +1617,89 @@ fn validate_auto_flush_params(params: &HashMap<String, &String>) -> Result<()> {
 
 /// Protocol used to communicate with the QuestDB server.
 #[derive(PartialEq, Debug, Clone, Copy)]
-pub(crate) enum SenderProtocol {
+pub enum Protocol {
     /// ILP over TCP (streaming).
-    IlpOverTcp,
+    Tcp,
+
+    /// TCP + TLS
+    Tcps,
 
     #[cfg(feature = "ilp-over-http")]
     /// ILP over HTTP (request-response, InfluxDB-compatible).
-    IlpOverHttp,
+    Http,
+
+    #[cfg(feature = "ilp-over-http")]
+    /// HTTP + TLS
+    Https,
 }
 
-impl Display for SenderProtocol {
+impl Display for Protocol {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
-        match self {
-            SenderProtocol::IlpOverTcp => f.write_str("ILP/TCP"),
-            #[cfg(feature = "ilp-over-http")]
-            SenderProtocol::IlpOverHttp => f.write_str("ILP/HTTP"),
-        }
+        f.write_str(self.schema())
     }
 }
 
-impl SenderProtocol {
+impl Protocol {
     fn default_port(&self) -> &str {
         match self {
-            SenderProtocol::IlpOverTcp => "9009",
+            Protocol::Tcp | Protocol::Tcps => "9009",
             #[cfg(feature = "ilp-over-http")]
-            SenderProtocol::IlpOverHttp => "9000",
+            Protocol::Http | Protocol::Https => "9000",
+        }
+    }
+
+    fn tls_enabled(&self) -> bool {
+        match self {
+            Protocol::Tcp => false,
+            Protocol::Tcps => true,
+            #[cfg(feature = "ilp-over-http")]
+            Protocol::Http => false,
+            #[cfg(feature = "ilp-over-http")]
+            Protocol::Https => true,
+        }
+    }
+
+    fn is_tcpx(&self) -> bool {
+        match self {
+            Protocol::Tcp => true,
+            Protocol::Tcps => true,
+            #[cfg(feature = "ilp-over-http")]
+            Protocol::Http => false,
+            #[cfg(feature = "ilp-over-http")]
+            Protocol::Https => false,
+        }
+    }
+
+    #[cfg(feature = "ilp-over-http")]
+    fn is_httpx(&self) -> bool {
+        match self {
+            Protocol::Tcp => false,
+            Protocol::Tcps => false,
+            Protocol::Http => true,
+            Protocol::Https => true,
+        }
+    }
+
+    fn schema(&self) -> &str {
+        match self {
+            Protocol::Tcp => "tcp",
+            Protocol::Tcps => "tcps",
+            #[cfg(feature = "ilp-over-http")]
+            Protocol::Http => "http",
+            #[cfg(feature = "ilp-over-http")]
+            Protocol::Https => "https",
+        }
+    }
+
+    fn from_schema(schema: &str) -> Result<Self> {
+        match schema.to_lowercase().as_str() {
+            "tcp" => Ok(Protocol::Tcp),
+            "tcps" => Ok(Protocol::Tcps),
+            #[cfg(feature = "ilp-over-http")]
+            "http" => Ok(Protocol::Http),
+            #[cfg(feature = "ilp-over-http")]
+            "https" => Ok(Protocol::Https),
+            _ => Err(error::fmt!(ConfigError, "Unsupported protocol: {}", schema)),
         }
     }
 }
@@ -1656,9 +1716,9 @@ impl SenderProtocol {
     doc = r##"
 ```no_run
 # use questdb::Result;
-use questdb::ingress::SenderBuilder;
+use questdb::ingress::{Protocol, SenderBuilder};
 # fn main() -> Result<()> {
-let mut sender = SenderBuilder::new_http("localhost", 9009).build()?;
+let mut sender = SenderBuilder::new(Protocol::Http, "localhost", 9009).build()?;
 # Ok(())
 # }
 ```
@@ -1667,10 +1727,10 @@ let mut sender = SenderBuilder::new_http("localhost", 9009).build()?;
 ///
 /// ```no_run
 /// # use questdb::Result;
-/// use questdb::ingress::SenderBuilder;
+/// use questdb::ingress::{Protocol, SenderBuilder};
 ///
 /// # fn main() -> Result<()> {
-/// let mut sender = SenderBuilder::new_tcp("localhost", 9009).build()?;
+/// let mut sender = SenderBuilder::new(Protocol::Tcp, "localhost", 9009).build()?;
 /// # Ok(())
 /// # }
 /// ```
@@ -1698,7 +1758,7 @@ let mut sender = SenderBuilder::new_http("localhost", 9009).build()?;
 ///
 #[derive(Debug, Clone)]
 pub struct SenderBuilder {
-    protocol: SenderProtocol,
+    protocol: Protocol,
     host: ConfigSetting<String>,
     port: ConfigSetting<String>,
     net_interface: ConfigSetting<Option<String>>,
@@ -1709,7 +1769,6 @@ pub struct SenderBuilder {
     token: ConfigSetting<Option<String>>,
     token_x: ConfigSetting<Option<String>>,
     token_y: ConfigSetting<Option<String>>,
-    tls_enabled: ConfigSetting<bool>,
 
     #[cfg(feature = "insecure-skip-verify")]
     tls_verify: ConfigSetting<bool>,
@@ -1752,16 +1811,8 @@ impl SenderBuilder {
             .map(|(k, v)| (k.to_lowercase(), v))
             .collect::<HashMap<_, _>>();
 
-        // schema::
-        let protocol = match service.as_ref() {
-            "tcp" | "tcps" => SenderProtocol::IlpOverTcp,
-            #[cfg(feature = "ilp-over-http")]
-            "http" | "https" => SenderProtocol::IlpOverHttp,
-            _ => return Err(error::fmt!(ConfigError, "Unsupported service: {}", service)),
-        };
-        let with_tls = service.ends_with('s');
+        let protocol = Protocol::from_schema(service.as_str())?;
 
-        // addr=
         let Some(addr) = params.get("addr") else {
             return Err(error::fmt!(
                 ConfigError,
@@ -1772,9 +1823,7 @@ impl SenderBuilder {
             Some((h, p)) => (h, p),
             None => (addr.as_str(), protocol.default_port()),
         };
-        let mut builder = SenderBuilder::new(host, port, protocol);
-
-        builder.tls_enabled.set_specified("tls", with_tls)?;
+        let mut builder = SenderBuilder::new(protocol, host, port);
 
         validate_auto_flush_params(&params)?;
 
@@ -1907,10 +1956,33 @@ impl SenderBuilder {
         Self::from_conf(conf)
     }
 
-    fn new<H: Into<String>, P: Into<Port>>(host: H, port: P, protocol: SenderProtocol) -> Self {
+    /// Create a new `SenderBuilder` instance from the provided QuestDB
+    /// server and port using ILP over the specified protocol.
+    ///
+    /// ```no_run
+    /// # use questdb::Result;
+    /// use questdb::ingress::{Protocol, SenderBuilder};
+    ///
+    /// # fn main() -> Result<()> {
+    /// let mut sender = SenderBuilder::new(
+    ///     Protocol::Tcp, "localhost", 9009).build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn new<H: Into<String>, P: Into<Port>>(protocol: Protocol, host: H, port: P) -> Self {
         let host = host.into();
         let port: Port = port.into();
         let port = port.0;
+
+        #[cfg(feature = "tls-webpki-certs")]
+        let tls_ca = CertificateAuthority::WebpkiRoots;
+
+        #[cfg(all(not(feature = "tls-webpki-certs"), feature = "tls-native-certs"))]
+        let tls_ca = CertificateAuthority::OsRoots;
+
+        #[cfg(not(any(feature = "tls-webpki-certs", feature = "tls-native-certs")))]
+        let tls_ca = CertificateAuthority::PemFile;
+
         Self {
             protocol,
             host: ConfigSetting::new_specified(host),
@@ -1923,54 +1995,20 @@ impl SenderBuilder {
             token: ConfigSetting::new_default(None),
             token_x: ConfigSetting::new_default(None),
             token_y: ConfigSetting::new_default(None),
-            tls_enabled: ConfigSetting::new_default(false),
 
             #[cfg(feature = "insecure-skip-verify")]
             tls_verify: ConfigSetting::new_default(true),
 
-            tls_ca: ConfigSetting::new_default(CertificateAuthority::WebpkiRoots),
+            tls_ca: ConfigSetting::new_default(tls_ca),
             tls_roots: ConfigSetting::new_default(None),
 
             #[cfg(feature = "ilp-over-http")]
-            http: if protocol == SenderProtocol::IlpOverHttp {
+            http: if protocol.is_httpx() {
                 Some(HttpConfig::default())
             } else {
                 None
             },
         }
-    }
-
-    /// Create a new `SenderBuilder` instance from the provided QuestDB
-    /// server and port using ILP over the TCP protocol.
-    ///
-    /// ```no_run
-    /// # use questdb::Result;
-    /// use questdb::ingress::SenderBuilder;
-    ///
-    /// # fn main() -> Result<()> {
-    /// let mut sender = SenderBuilder::new_tcp("localhost", 9009).build()?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn new_tcp<H: Into<String>, P: Into<Port>>(host: H, port: P) -> Self {
-        Self::new(host, port, SenderProtocol::IlpOverTcp)
-    }
-
-    /// Create a new `SenderBuilder` instance from the provided QuestDB
-    /// server and port using ILP over the TCP protocol.
-    ///
-    /// ```no_run
-    /// # use questdb::Result;
-    /// use questdb::ingress::SenderBuilder;
-    ///
-    /// # fn main() -> Result<()> {
-    /// let mut sender = SenderBuilder::new_tcp("localhost", 9009).build()?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    #[cfg(feature = "ilp-over-http")]
-    pub fn new_http<H: Into<String>, P: Into<Port>>(host: H, port: P) -> Self {
-        Self::new(host, port, SenderProtocol::IlpOverHttp)
     }
 
     /// Select local outbound interface.
@@ -1979,7 +2017,7 @@ impl SenderBuilder {
     ///
     /// The default is `"0.0.0.0"`.
     pub fn bind_interface<I: Into<String>>(mut self, addr: I) -> Result<Self> {
-        self.ensure_specified_protocol("bind_interface", SenderProtocol::IlpOverTcp)?;
+        self.ensure_is_tcpx("bind_interface")?;
         self.net_interface
             .set_specified("bind_interface", Some(validate_value(addr.into())?))?;
         Ok(self)
@@ -2032,48 +2070,21 @@ impl SenderBuilder {
     /// Configure how long to wait for messages from the QuestDB server during
     /// the TLS handshake and authentication process.
     /// The default is 15 seconds.
-    ///
-    /// ```no_run
-    /// # use questdb::Result;
-    /// # use questdb::ingress::SenderBuilder;
-    /// use std::time::Duration;
-    ///
-    /// # fn main() -> Result<()> {
-    /// let mut sender = SenderBuilder::new_tcp("localhost", 9009)
-    ///    .auth_timeout(Duration::from_secs(15))?
-    ///    .build()?;
-    /// # Ok(())
-    /// # }
-    /// ```
     pub fn auth_timeout(mut self, value: Duration) -> Result<Self> {
         self.auth_timeout.set_specified("auth_timeout", value)?;
         Ok(self)
     }
 
-    /// Enable or disable TLS.
-    pub fn tls_enabled(mut self, enabled: bool) -> Result<Self> {
-        self.tls_enabled.set_specified("tls_enabled", enabled)?;
-
-        #[cfg(feature = "tls-webpki-certs")]
-        self.tls_ca.set_default(CertificateAuthority::WebpkiRoots);
-
-        #[cfg(all(not(feature = "tls-webpki-certs"), feature = "tls-native-certs"))]
-        self.tls_ca.set_default(CertificateAuthority::OsRoots);
-
-        #[cfg(not(any(feature = "tls-webpki-certs", feature = "tls-native-certs")))]
-        self.tls_ca.set_default(CertificateAuthority::PemFile);
-
-        Ok(self)
-    }
-
-    fn ensure_tls_enabled(self, other_setting: &str) -> Result<Self> {
-        if matches!(&self.tls_enabled, ConfigSetting::Specified(false)) {
+    /// Ensure that TLS is enabled for the protocol.
+    pub fn ensure_tls_enabled(&self, property: &str) -> Result<()> {
+        if !self.protocol.tls_enabled() {
             return Err(error::fmt!(
                 ConfigError,
-                "TLS is not enabled. Can't specify {other_setting:?}."
+                "Cannot set {property:?}: TLS is not supported for protocol {}",
+                self.protocol
             ));
         }
-        self.tls_enabled(true)
+        Ok(())
     }
 
     /// Set to `false` to disable TLS certificate verification.
@@ -2082,17 +2093,17 @@ impl SenderBuilder {
     /// For testing consider specifying a path to a `.pem` file instead via
     /// the [`tls_roots`](SenderBuilder::tls_roots) method.
     #[cfg(feature = "insecure-skip-verify")]
-    pub fn tls_verify(self, verify: bool) -> Result<Self> {
-        let mut builder = self.ensure_tls_enabled("tls_verify")?;
-        builder.tls_verify.set_specified("tls_verify", verify)?;
-        Ok(builder)
+    pub fn tls_verify(mut self, verify: bool) -> Result<Self> {
+        self.ensure_tls_enabled("tls_verify")?;
+        self.tls_verify.set_specified("tls_verify", verify)?;
+        Ok(self)
     }
 
     /// Set the certificate authority used to determine how to validate the server's TLS certificate.
-    pub fn tls_ca(self, ca: CertificateAuthority) -> Result<Self> {
-        let mut builder = self.ensure_tls_enabled("tls_ca")?;
-        builder.tls_ca.set_specified("tls_ca", ca)?;
-        Ok(builder)
+    pub fn tls_ca(mut self, ca: CertificateAuthority) -> Result<Self> {
+        self.ensure_tls_enabled("tls_ca")?;
+        self.tls_ca.set_specified("tls_ca", ca)?;
+        Ok(self)
     }
 
     /// Set the path to a custom root certificate `.pem` file.
@@ -2202,7 +2213,7 @@ impl SenderBuilder {
 
     fn connect_tcp(&self, auth: &Option<AuthParams>) -> Result<ProtocolHandler> {
         let addr: SockAddr = gai::resolve_host_port(self.host.as_str(), self.port.as_str())?;
-        let mut sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
+        let mut sock = Socket::new(Domain::IPV4, Type::STREAM, Some(SockProtocol::TCP))
             .map_err(|io_err| map_io_to_socket_err("Could not open TCP socket: ", io_err))?;
 
         // See: https://idea.popcount.org/2014-04-03-bind-before-connect/
@@ -2248,7 +2259,7 @@ impl SenderBuilder {
         let tls_verify = true;
 
         let mut conn = match configure_tls(
-            *self.tls_enabled,
+            self.protocol.tls_enabled(),
             tls_verify,
             *self.tls_ca,
             self.tls_roots.deref(),
@@ -2303,69 +2314,77 @@ impl SenderBuilder {
         ) {
             (_, None, None, None, None, None) => Ok(None),
             (
-                SenderProtocol::IlpOverTcp,
+                protocol,
                 Some(username),
                 None,
                 Some(token),
                 Some(token_x),
                 Some(token_y),
-            ) => Ok(Some(AuthParams::Ecdsa(EcdsaAuthParams {
+            ) if protocol.is_tcpx() => Ok(Some(AuthParams::Ecdsa(EcdsaAuthParams {
                 key_id: username.to_string(),
                 priv_key: token.to_string(),
                 pub_key_x: token_x.to_string(),
                 pub_key_y: token_y.to_string(),
             }))),
-            (SenderProtocol::IlpOverTcp, Some(_username), Some(_password), None, None, None) => {
+            (protocol, Some(_username), Some(_password), None, None, None)
+                if protocol.is_tcpx() => {
                 Err(error::fmt!(ConfigError,
                     r##"The "basic_auth" setting can only be used with the ILP/HTTP protocol."##,
                 ))
             }
-            (SenderProtocol::IlpOverTcp, None, None, Some(_token), None, None) => {
+            (protocol, None, None, Some(_token), None, None)
+                if protocol.is_tcpx() => {
                 Err(error::fmt!(ConfigError, "Token authentication only be used with the ILP/HTTP protocol."))
             }
-            (SenderProtocol::IlpOverTcp, _username, None, _token, _token_x, _token_y) => {
+            (protocol, _username, None, _token, _token_x, _token_y)
+                if protocol.is_tcpx() => {
                 Err(error::fmt!(ConfigError,
                     r##"Incomplete ECDSA authentication parameters. Specify either all or none of: "username", "token", "token_x", "token_y"."##,
                 ))
             }
             #[cfg(feature = "ilp-over-http")]
-            (SenderProtocol::IlpOverHttp, Some(username), Some(password), None, None, None) => {
+            (protocol, Some(username), Some(password), None, None, None)
+                if protocol.is_httpx() => {
                 Ok(Some(AuthParams::Basic(BasicAuthParams {
                     username: username.to_string(),
                     password: password.to_string(),
                 })))
             }
             #[cfg(feature = "ilp-over-http")]
-            (SenderProtocol::IlpOverHttp, Some(_username), None, None, None, None) => {
+            (protocol, Some(_username), None, None, None, None)
+                if protocol.is_httpx() => {
                 Err(error::fmt!(ConfigError,
                     r##"Basic authentication parameter "username" is present, but "password" is missing."##,
                 ))
             }
             #[cfg(feature = "ilp-over-http")]
-            (SenderProtocol::IlpOverHttp, None, Some(_password), None, None, None) => {
+            (protocol, None, Some(_password), None, None, None)
+                if protocol.is_httpx() => {
                 Err(error::fmt!(ConfigError,
                     r##"Basic authentication parameter "password" is present, but "username" is missing."##,
                 ))
             }
             #[cfg(feature = "ilp-over-http")]
-            (SenderProtocol::IlpOverHttp, None, None, Some(token), None, None) => {
+            (protocol, None, None, Some(token), None, None)
+                if protocol.is_httpx() => {
                 Ok(Some(AuthParams::Token(TokenAuthParams {
                     token: token.to_string(),
                 })))
             }
             #[cfg(feature = "ilp-over-http")]
             (
-                SenderProtocol::IlpOverHttp,
+                protocol,
                 Some(_username),
                 None,
                 Some(_token),
                 Some(_token_x),
                 Some(_token_y),
-            ) => {
+            ) if protocol.is_httpx() => {
                 Err(error::fmt!(ConfigError, "ECDSA authentication is only available with ILP/TCP and not available with ILP/HTTP."))
             }
             #[cfg(feature = "ilp-over-http")]
-            (SenderProtocol::IlpOverHttp, _username, _password, _token, None, None) => {
+            (protocol, _username, _password, _token, None, None)
+                if protocol.is_httpx() => {
                 Err(error::fmt!(ConfigError,
                     r##"Inconsistent HTTP authentication parameters. Specify either "username" and "password", or just "token"."##,
                 ))
@@ -2387,7 +2406,7 @@ impl SenderBuilder {
     pub fn build(&self) -> Result<Sender> {
         let mut descr = format!("Sender[host={:?},port={:?},", self.host, self.port);
 
-        if *self.tls_enabled {
+        if self.protocol.tls_enabled() {
             write!(descr, "tls=enabled,").unwrap();
         } else {
             write!(descr, "tls=disabled,").unwrap();
@@ -2396,9 +2415,9 @@ impl SenderBuilder {
         let auth = self.build_auth()?;
 
         let handler = match self.protocol {
-            SenderProtocol::IlpOverTcp => self.connect_tcp(&auth)?,
+            Protocol::Tcp | Protocol::Tcps => self.connect_tcp(&auth)?,
             #[cfg(feature = "ilp-over-http")]
-            SenderProtocol::IlpOverHttp => {
+            Protocol::Http | Protocol::Https => {
                 if self.net_interface.is_some() {
                     // See: https://github.com/algesten/ureq/issues/692
                     return Err(error::fmt!(
@@ -2425,7 +2444,7 @@ impl SenderBuilder {
                 let tls_verify = true;
 
                 let agent_builder = match configure_tls(
-                    *self.tls_enabled,
+                    self.protocol.tls_enabled(),
                     tls_verify,
                     *self.tls_ca,
                     self.tls_roots.deref(),
@@ -2446,7 +2465,7 @@ impl SenderBuilder {
                     None => None,
                 };
                 let agent = agent_builder.build();
-                let proto = if *self.tls_enabled { "https" } else { "http" };
+                let proto = self.protocol.schema();
                 let url = format!(
                     "{}://{}:{}/write",
                     proto,
@@ -2479,16 +2498,13 @@ impl SenderBuilder {
         Ok(sender)
     }
 
-    fn ensure_specified_protocol(
-        &mut self,
-        param_name: &str,
-        required_protocol: SenderProtocol,
-    ) -> Result<()> {
-        if self.protocol == required_protocol {
+    fn ensure_is_tcpx(&mut self, param_name: &str) -> Result<()> {
+        if self.protocol.is_tcpx() {
             Ok(())
         } else {
-            Err(error::fmt!(ConfigError,
-                "The {param_name:?} setting can only be used with the {required_protocol} protocol."
+            Err(error::fmt!(
+                ConfigError,
+                "The {param_name:?} setting can only be used with the TCP protocol."
             ))
         }
     }

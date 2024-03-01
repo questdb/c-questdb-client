@@ -1,17 +1,13 @@
 use chrono::{TimeZone, Utc};
 use questdb::{
-    ingress::{Buffer, SenderBuilder, TimestampNanos},
+    ingress::{Buffer, Sender, TimestampNanos},
     Result,
 };
 
 fn main() -> Result<()> {
     let host: String = std::env::args().nth(1).unwrap_or("localhost".to_string());
-    let port: u16 = std::env::args()
-        .nth(2)
-        .unwrap_or("9009".to_string())
-        .parse()
-        .unwrap();
-    let mut sender = SenderBuilder::new_tcp(host, port).build()?;
+    let port: &str = &std::env::args().nth(2).unwrap_or("9009".to_string());
+    let mut sender = Sender::from_conf(format!("tcp::addr={host}:{port};"))?;
     let mut buffer = Buffer::new();
     let designated_timestamp =
         TimestampNanos::from_datetime(Utc.with_ymd_and_hms(1997, 7, 4, 4, 56, 55).unwrap())?;

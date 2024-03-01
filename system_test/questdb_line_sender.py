@@ -69,6 +69,14 @@ class c_line_sender(ctypes.Structure):
 class c_line_sender_buffer(ctypes.Structure):
     pass
 
+c_line_sender_protocol = ctypes.c_int
+
+class Protocol(Enum):
+    TCP = (c_line_sender_protocol(0), 'tcp')
+    TCPS = (c_line_sender_protocol(1), 'tcps')
+    HTTP = (c_line_sender_protocol(2), 'http')
+    HTTPS = (c_line_sender_protocol(3), 'https')
+
 c_line_sender_ca = ctypes.c_int
 
 class CertificateAuthority(Enum):
@@ -257,23 +265,15 @@ def _setup_cdll():
         c_line_sender_buffer_p,
         c_line_sender_error_p_p)
     set_sig(
-        dll.line_sender_opts_new_tcp,
+        dll.line_sender_opts_new,
         c_line_sender_opts_p,
+        c_line_sender_protocol,
         c_line_sender_utf8,
         c_uint16)
     set_sig(
-        dll.line_sender_opts_new_tcp_service,
+        dll.line_sender_opts_new_service,
         c_line_sender_opts_p,
-        c_line_sender_utf8,
-        c_line_sender_utf8)
-    set_sig(
-        dll.line_sender_opts_new_http,
-        c_line_sender_opts_p,
-        c_line_sender_utf8,
-        c_uint16)
-    set_sig(
-        dll.line_sender_opts_new_http_service,
-        c_line_sender_opts_p,
+        c_line_sender_protocol,
         c_line_sender_utf8,
         c_line_sender_utf8)
     set_sig(
@@ -317,12 +317,6 @@ def _setup_cdll():
         c_bool,
         c_line_sender_opts_p,
         c_uint64,
-        c_line_sender_error_p_p)
-    set_sig(
-        dll.line_sender_opts_tls_enabled,
-        c_bool,
-        c_line_sender_opts_p,
-        c_bool,
         c_line_sender_error_p_p)
     set_sig(
         dll.line_sender_opts_tls_verify,
@@ -505,18 +499,11 @@ def _fully_qual_name(obj):
         return module + '.' + qn
 
 
-class Protocol(Enum):
-    TCP = 0
-    HTTP = 1
-
-
 class _Opts:
     def __init__(self, host, port, protocol=Protocol.TCP):
-        ctor_fn = _DLL.line_sender_opts_new_tcp_service \
-            if protocol == Protocol.TCP \
-            else _DLL.line_sender_opts_new_http_service
         self.impl = _error_wrapped_call(
-            ctor_fn,
+            _DLL.line_sender_opts_new_service,
+            protocol.value[0],
             _utf8(str(host)),
             _utf8(str(port)))
 
@@ -677,16 +664,15 @@ class Sender:
     def __init__(
             self,
             build_mode: BuildMode,
+            protocol,
             host: str,
             port: Union[str, int],
-            *,
-            protocol: Protocol = Protocol.TCP,
             **kwargs):
         
         self._build_mode = build_mode
         self._impl = None
         self._conf = [
-            'tcp' if protocol == Protocol.TCP else 'http',
+            protocol.value[1],
             '::',
             f'addr={host}:{port};']
         self._opts = None
@@ -694,17 +680,10 @@ class Sender:
         opts = _Opts(host, port, protocol)
         for key, value in kwargs.items():
             # Build the config string param pair.
-            tls_proto = False
-            if key == 'tls_enabled':
-                tls_proto = bool(value)
-            elif key.startswith('tls_'):
-                tls_proto = True
-
-            if tls_proto:
-                self._conf[0] = 'tcps' if protocol == Protocol.TCP else 'https'
-
             c_value, conf_value = _map_value(key, value)
             self._conf.append(f'{key}={conf_value};')
+
+            # Set the option in the C object.
             getattr(opts, key)(c_value)
 
         self._conf = ''.join(self._conf)

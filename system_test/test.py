@@ -98,13 +98,14 @@ AUTH_MALFORMED3 = dict(
 
 
 class TestSender(unittest.TestCase):
-    def _mk_linesender(self, transactional=False):
+    def _mk_linesender(self):
+        # N.B.: We never connect with TLS here.
         auth = AUTH if QDB_FIXTURE.auth else {}
         return qls.Sender(
             BUILD_MODE,
+            qls.Protocol.HTTP if QDB_FIXTURE.http else qls.Protocol.TCP,
             QDB_FIXTURE.host,
             QDB_FIXTURE.http_server_port if QDB_FIXTURE.http else QDB_FIXTURE.line_tcp_port,
-            protocol=qls.Protocol.HTTP if QDB_FIXTURE.http else qls.Protocol.TCP,
             **auth)
 
     def _expect_eventual_disconnect(self, sender):
@@ -557,9 +558,12 @@ class TestSender(unittest.TestCase):
           * An authenticating client to a non-authenticating DB instance.
           * Or a non-authenticating client to an authenticating DB instance.
         """
+        if QDB_FIXTURE.http:
+            self.skipTest('TCP-only test')
         auth = {} if QDB_FIXTURE.auth else AUTH
         sender = qls.Sender(
             BUILD_MODE,
+            qls.Protocol.TCP,
             QDB_FIXTURE.host,
             QDB_FIXTURE.line_tcp_port,
             **auth)
@@ -582,11 +586,15 @@ class TestSender(unittest.TestCase):
                 self._expect_eventual_disconnect(sender)
 
     def test_unrecognized_auth(self):
+        if QDB_FIXTURE.http:
+            self.skipTest('TCP-only test')
+
         if not QDB_FIXTURE.auth:
             self.skipTest('No auth')
 
         sender = qls.Sender(
             BUILD_MODE,
+            qls.Protocol.TCP,
             QDB_FIXTURE.host,
             QDB_FIXTURE.line_tcp_port,
             **AUTH_UNRECOGNIZED)
@@ -595,11 +603,15 @@ class TestSender(unittest.TestCase):
             self._expect_eventual_disconnect(sender)
 
     def test_malformed_auth1(self):
+        if QDB_FIXTURE.http:
+            self.skipTest('TCP-only test')
+
         if not QDB_FIXTURE.auth:
             self.skipTest('No auth')
 
         sender = qls.Sender(
             BUILD_MODE,
+            qls.Protocol.TCP,
             QDB_FIXTURE.host,
             QDB_FIXTURE.line_tcp_port,
             **AUTH_MALFORMED1)
@@ -610,11 +622,15 @@ class TestSender(unittest.TestCase):
             sender.connect()
 
     def test_malformed_auth2(self):
+        if QDB_FIXTURE.http:
+            self.skipTest('TCP-only test')
+
         if not QDB_FIXTURE.auth:
             self.skipTest('No auth')
 
         sender = qls.Sender(
             BUILD_MODE,
+            qls.Protocol.TCP,
             QDB_FIXTURE.host,
             QDB_FIXTURE.line_tcp_port,
             **AUTH_MALFORMED2)
@@ -625,11 +641,15 @@ class TestSender(unittest.TestCase):
             sender.connect()
 
     def test_malformed_auth3(self):
+        if QDB_FIXTURE.http:
+            self.skipTest('TCP-only test')
+
         if not QDB_FIXTURE.auth:
             self.skipTest('No auth')
 
         sender = qls.Sender(
             BUILD_MODE,
+            qls.Protocol.TCP,
             QDB_FIXTURE.host,
             QDB_FIXTURE.line_tcp_port,
             **AUTH_MALFORMED3)
@@ -638,9 +658,11 @@ class TestSender(unittest.TestCase):
             self._expect_eventual_disconnect(sender)
 
     def test_tls_insecure_skip_verify(self):
+        protocol = qls.Protocol.HTTPS if QDB_FIXTURE.http else qls.Protocol.TCPS
         auth = AUTH if QDB_FIXTURE.auth else {}
         sender = qls.Sender(
             BUILD_MODE,
+            protocol,
             QDB_FIXTURE.host,
             TLS_PROXY_FIXTURE.listen_port,
             tls_verify=False,
@@ -648,9 +670,11 @@ class TestSender(unittest.TestCase):
         self._test_single_symbol_impl(sender)
 
     def test_tls_roots(self):
+        protocol = qls.Protocol.HTTPS if QDB_FIXTURE.http else qls.Protocol.TCPS
         auth = auth=AUTH if QDB_FIXTURE.auth else {}
         sender = qls.Sender(
             BUILD_MODE,
+            protocol,
             QDB_FIXTURE.host,
             TLS_PROXY_FIXTURE.listen_port,
             **auth,
@@ -658,6 +682,7 @@ class TestSender(unittest.TestCase):
         self._test_single_symbol_impl(sender)
 
     def _test_tls_ca(self, tls_ca):
+        protocol = qls.Protocol.HTTPS if QDB_FIXTURE.http else qls.Protocol.TCPS
         prev_ssl_cert_file = os.environ.get('SSL_CERT_FILE')
         try:
             os.environ['SSL_CERT_FILE'] = str(
@@ -665,6 +690,7 @@ class TestSender(unittest.TestCase):
             auth = auth=AUTH if QDB_FIXTURE.auth else {}
             sender = qls.Sender(
                 BUILD_MODE,
+                protocol,
                 QDB_FIXTURE.host,
                 TLS_PROXY_FIXTURE.listen_port,
                 tls_ca=tls_ca,
@@ -688,13 +714,13 @@ class TestSender(unittest.TestCase):
         if QDB_FIXTURE.version <= (7, 3, 7):
             self.skipTest('No ILP/HTTP support')
         table_name = uuid.uuid4().hex
-        with self._mk_linesender(transactional=True) as sender:
+        with self._mk_linesender() as sender:
             sender.table(table_name).column('col1', 'v1').at(time.time_ns())
             sender.table(table_name).column('col1', 'v2').at(time.time_ns())
             sender.table(table_name).column('col1', 42.5).at(time.time_ns())
 
             try:
-                sender.flush()
+                sender.flush(transactional=True)
             except qls.SenderError as e:
                 if not QDB_FIXTURE.http:
                     raise e
@@ -843,7 +869,9 @@ def run_with_fixtures(args):
                         # Read the version _after_ a first start so it can rely
                         # on the live one from the `select build` query.
                         last_version = QDB_FIXTURE.version
-                        TLS_PROXY_FIXTURE = TlsProxyFixture(QDB_FIXTURE.line_tcp_port)
+                        port_to_proxy = QDB_FIXTURE.http_server_port \
+                            if http else QDB_FIXTURE.line_tcp_port
+                        TLS_PROXY_FIXTURE = TlsProxyFixture(port_to_proxy)
                         TLS_PROXY_FIXTURE.start()
 
                         test_prog = unittest.TestProgram(exit=False)

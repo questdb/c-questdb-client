@@ -6,39 +6,39 @@ use tempfile::TempDir;
 #[test]
 fn http_simple() {
     let builder = SenderBuilder::from_conf("http::addr=localhost;").unwrap();
-    assert_eq!(builder.protocol, SenderProtocol::IlpOverHttp);
+    assert_eq!(builder.protocol, Protocol::Http);
     assert_specified_eq(&builder.host, "localhost");
-    assert_specified_eq(&builder.port, SenderProtocol::IlpOverHttp.default_port());
-    assert_specified_eq(&builder.tls_enabled, false);
+    assert_specified_eq(&builder.port, Protocol::Http.default_port());
+    assert!(!builder.protocol.tls_enabled());
 }
 
 #[cfg(feature = "ilp-over-http")]
 #[test]
 fn https_simple() {
     let builder = SenderBuilder::from_conf("https::addr=localhost;").unwrap();
-    assert_eq!(builder.protocol, SenderProtocol::IlpOverHttp);
+    assert_eq!(builder.protocol, Protocol::Https);
     assert_specified_eq(&builder.host, "localhost");
-    assert_specified_eq(&builder.port, SenderProtocol::IlpOverHttp.default_port());
-    assert_specified_eq(&builder.tls_enabled, true);
+    assert_specified_eq(&builder.port, Protocol::Https.default_port());
+    assert!(builder.protocol.tls_enabled());
     assert_defaulted_eq(&builder.tls_ca, CertificateAuthority::WebpkiRoots);
 }
 
 #[test]
 fn tcp_simple() {
     let builder = SenderBuilder::from_conf("tcp::addr=localhost;").unwrap();
-    assert_eq!(builder.protocol, SenderProtocol::IlpOverTcp);
-    assert_specified_eq(&builder.port, SenderProtocol::IlpOverTcp.default_port());
+    assert_eq!(builder.protocol, Protocol::Tcp);
+    assert_specified_eq(&builder.port, Protocol::Tcp.default_port());
     assert_specified_eq(&builder.host, "localhost");
-    assert_specified_eq(&builder.tls_enabled, false);
+    assert!(!builder.protocol.tls_enabled());
 }
 
 #[test]
 fn tcps_simple() {
     let builder = SenderBuilder::from_conf("tcps::addr=localhost;").unwrap();
-    assert_eq!(builder.protocol, SenderProtocol::IlpOverTcp);
+    assert_eq!(builder.protocol, Protocol::Tcps);
     assert_specified_eq(&builder.host, "localhost");
-    assert_specified_eq(&builder.port, SenderProtocol::IlpOverTcp.default_port());
-    assert_specified_eq(&builder.tls_enabled, true);
+    assert_specified_eq(&builder.port, Protocol::Tcps.default_port());
+    assert!(builder.protocol.tls_enabled());
     assert_defaulted_eq(&builder.tls_ca, CertificateAuthority::WebpkiRoots);
 }
 
@@ -72,7 +72,7 @@ fn missing_addr() {
 fn unsupported_service() {
     assert_conf_err(
         SenderBuilder::from_conf("xaxa::addr=localhost;"),
-        "Unsupported service: xaxa",
+        "Unsupported protocol: xaxa",
     );
 }
 
@@ -130,11 +130,11 @@ fn incomplete_basic_auth() {
 #[test]
 fn misspelled_basic_auth() {
     assert_conf_err(
-        Sender::from_conf("http::addr=localhost;username=user123;password=pass321;"),
+        Sender::from_conf("http::addr=localhost;username=user123;pass=pass321;"),
         r##"Basic authentication parameter "username" is present, but "password" is missing."##,
     );
     assert_conf_err(
-        Sender::from_conf("http::addr=localhost;username=user123;password=pass321;"),
+        Sender::from_conf("http::addr=localhost;user=user123;password=pass321;"),
         r##"Basic authentication parameter "password" is present, but "username" is missing."##,
     );
 }
@@ -156,7 +156,7 @@ fn inconsistent_http_auth() {
 #[cfg(feature = "ilp-over-http")]
 #[test]
 fn cant_use_basic_auth_with_tcp() {
-    let builder = SenderBuilder::new_tcp("localhost", 9000)
+    let builder = SenderBuilder::new(Protocol::Tcp, "localhost", 9000)
         .username("user123")
         .unwrap()
         .password("pass321")
@@ -170,7 +170,7 @@ fn cant_use_basic_auth_with_tcp() {
 #[cfg(feature = "ilp-over-http")]
 #[test]
 fn cant_use_token_auth_with_tcp() {
-    let builder = SenderBuilder::new_tcp("localhost", 9000)
+    let builder = SenderBuilder::new(Protocol::Tcp, "localhost", 9000)
         .token("token123")
         .unwrap();
     assert_conf_err(
@@ -200,8 +200,8 @@ fn cant_use_ecdsa_auth_with_http() {
 
 #[test]
 fn set_auth_specifies_tcp() {
-    let mut builder = SenderBuilder::new_tcp("localhost", 9000);
-    assert_eq!(builder.protocol, SenderProtocol::IlpOverTcp);
+    let mut builder = SenderBuilder::new(Protocol::Tcp, "localhost", 9000);
+    assert_eq!(builder.protocol, Protocol::Tcp);
     builder = builder
         .username("key_id123")
         .unwrap()
@@ -211,13 +211,13 @@ fn set_auth_specifies_tcp() {
         .unwrap()
         .token_y("pub_key2")
         .unwrap();
-    assert_eq!(builder.protocol, SenderProtocol::IlpOverTcp);
+    assert_eq!(builder.protocol, Protocol::Tcp);
 }
 
 #[test]
 fn set_net_interface_specifies_tcp() {
-    let builder = SenderBuilder::new_tcp("localhost", 9000);
-    assert_eq!(builder.protocol, SenderProtocol::IlpOverTcp);
+    let builder = SenderBuilder::new(Protocol::Tcp, "localhost", 9000);
+    assert_eq!(builder.protocol, Protocol::Tcp);
     builder.bind_interface("55.88.0.4").unwrap();
 }
 
@@ -283,7 +283,7 @@ fn misspelled_tcp_ecdsa_auth() {
 #[test]
 fn tcps_tls_verify_on() {
     let builder = SenderBuilder::from_conf("tcps::addr=localhost;tls_verify=on;").unwrap();
-    assert_specified_eq(&builder.tls_enabled, true);
+    assert!(builder.protocol.tls_enabled());
     assert_defaulted_eq(&builder.tls_ca, CertificateAuthority::WebpkiRoots);
 }
 
@@ -291,7 +291,7 @@ fn tcps_tls_verify_on() {
 #[test]
 fn tcps_tls_verify_unsafe_off() {
     let builder = SenderBuilder::from_conf("tcps::addr=localhost;tls_verify=unsafe_off;").unwrap();
-    assert_specified_eq(&builder.tls_enabled, true);
+    assert!(builder.protocol.tls_enabled());
     assert_defaulted_eq(&builder.tls_ca, CertificateAuthority::WebpkiRoots);
     assert_specified_eq(&builder.tls_verify, false);
 }
@@ -307,7 +307,7 @@ fn tcps_tls_verify_invalid() {
 #[test]
 fn tcps_tls_roots_webpki() {
     let builder = SenderBuilder::from_conf("tcps::addr=localhost;tls_ca=webpki_roots;").unwrap();
-    assert_specified_eq(&builder.tls_enabled, true);
+    assert!(builder.protocol.tls_enabled());
     assert_specified_eq(&builder.tls_ca, CertificateAuthority::WebpkiRoots);
     assert_defaulted_eq(&builder.tls_roots, None);
 }
@@ -316,7 +316,7 @@ fn tcps_tls_roots_webpki() {
 #[test]
 fn tcps_tls_roots_os() {
     let builder = SenderBuilder::from_conf("tcps::addr=localhost;tls_ca=os_roots;").unwrap();
-    assert_specified_eq(&builder.tls_enabled, true);
+    assert!(builder.protocol.tls_enabled());
     assert_specified_eq(&builder.tls_ca, CertificateAuthority::OsRoots);
     assert_defaulted_eq(&builder.tls_roots, None);
 }
@@ -370,7 +370,7 @@ fn http_request_min_throughput() {
         panic!("Expected Some(HttpConfig)");
     };
     assert_specified_eq(&http_config.request_min_throughput, 100u64);
-    assert_defaulted_eq(&http_config.request_timeout, Duration::from_millis(5000));
+    assert_defaulted_eq(&http_config.request_timeout, Duration::from_millis(10000));
     assert_defaulted_eq(&http_config.retry_timeout, Duration::from_millis(10000));
 }
 
@@ -394,7 +394,7 @@ fn http_retry_timeout() {
         panic!("Expected Some(HttpConfig)");
     };
     assert_defaulted_eq(&http_config.request_min_throughput, 102400u64);
-    assert_defaulted_eq(&http_config.request_timeout, Duration::from_millis(5000));
+    assert_defaulted_eq(&http_config.request_timeout, Duration::from_millis(10000));
     assert_specified_eq(&http_config.retry_timeout, Duration::from_millis(100));
 }
 

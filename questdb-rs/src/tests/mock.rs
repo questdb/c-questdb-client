@@ -22,14 +22,14 @@
  *
  ******************************************************************************/
 
-use crate::ingress::SenderBuilder;
+use crate::ingress::{Protocol, SenderBuilder};
 
 use core::time::Duration;
 use mio::event::Event;
 use mio::net::TcpStream;
 use mio::{Events, Interest, Poll, Token};
 use rustls::{server::ServerConnection, ServerConfig, Stream};
-use socket2::{Domain, Protocol, Socket, Type};
+use socket2::{Domain, Protocol as SockProtocol, Socket, Type};
 use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::net::SocketAddr;
@@ -196,7 +196,7 @@ fn position(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 impl MockServer {
     pub fn new() -> io::Result<Self> {
-        let listener = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+        let listener = Socket::new(Domain::IPV4, Type::STREAM, Some(SockProtocol::TCP))?;
         let address: SocketAddr = "127.0.0.1:0".parse().unwrap();
         listener.bind(&address.into())?;
         listener.listen(128)?;
@@ -544,11 +544,20 @@ impl MockServer {
     }
 
     pub fn lsb_tcp(&self) -> SenderBuilder {
-        SenderBuilder::new_tcp(self.host, self.port)
+        SenderBuilder::new(Protocol::Tcp, self.host, self.port)
+    }
+
+    pub fn lsb_tcps(&self) -> SenderBuilder {
+        SenderBuilder::new(Protocol::Tcps, self.host, self.port)
     }
 
     #[cfg(feature = "ilp-over-http")]
     pub fn lsb_http(&self) -> SenderBuilder {
-        SenderBuilder::new_http(self.host, self.port)
+        SenderBuilder::new(Protocol::Http, self.host, self.port)
+    }
+
+    #[cfg(feature = "ilp-over-http")]
+    pub fn lsb_https(&self) -> SenderBuilder {
+        SenderBuilder::new(Protocol::Https, self.host, self.port)
     }
 }

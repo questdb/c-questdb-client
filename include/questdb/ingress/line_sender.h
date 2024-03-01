@@ -80,6 +80,22 @@ typedef enum line_sender_error_code
     line_sender_error_config_error,
 } line_sender_error_code;
 
+/** The protocol used to connect with. */
+typedef enum line_sender_protocol
+{
+    /** InfluxDB Line Protocol over TCP. */
+    line_sender_protocol_tcp,
+
+    /** InfluxDB Line Protocol over TCP with TLS. */
+    line_sender_protocol_tcps,
+
+    /** InfluxDB Line Protocol over HTTP. */
+    line_sender_protocol_http,
+
+    /** InfluxDB Line Protocol over HTTP with TLS. */
+    line_sender_protocol_https,
+} line_sender_protocol;
+
 /* Certificate authority used to determine how to validate the server's TLS certificate. */
 typedef enum line_sender_ca {
     /** Use the set of root certificates provided by the `webpki` crate. */
@@ -566,38 +582,23 @@ line_sender_opts* line_sender_opts_from_env(
     line_sender_error** err_out);
 
 /**
- * A new set of options for a line sender connection for ILP/TCP.
+ * A new set of options for a line sender connection.
+ * @param[in] protocol The protocol to use.
  * @param[in] host The QuestDB database host.
  * @param[in] port The QuestDB ILP TCP port.
  */
 LINESENDER_API
-line_sender_opts* line_sender_opts_new_tcp(
+line_sender_opts* line_sender_opts_new(
+    line_sender_protocol protocol,
     line_sender_utf8 host,
     uint16_t port);
 
 /**
- * Variant of line_sender_opts_new_tcp that takes a service name for port.
+ * Variant of line_sender_opts_new that takes a service name for port.
  */
 LINESENDER_API
-line_sender_opts* line_sender_opts_new_tcp_service(
-    line_sender_utf8 host,
-    line_sender_utf8 port);
-
-/**
- * A new set of options for a line sender connection for ILP/HTTP.
- * @param[in] host The QuestDB database host.
- * @param[in] port The QuestDB HTTP port.
- */
-LINESENDER_API
-line_sender_opts* line_sender_opts_new_http(
-    line_sender_utf8 host,
-    uint16_t port);
-
-/**
- * Variant of line_sender_opts_new_http that takes a service name for port.
- */
-LINESENDER_API
-line_sender_opts* line_sender_opts_new_http_service(
+line_sender_opts* line_sender_opts_new_service(
+    line_sender_protocol protocol,
     line_sender_utf8 host,
     line_sender_utf8 port);
 
@@ -676,15 +677,6 @@ LINESENDER_API
 bool line_sender_opts_auth_timeout(
     line_sender_opts* opts,
     uint64_t millis,
-    line_sender_error** err_out);
-
-/**
- * Enable or disable TLS.
- */
-LINESENDER_API
-bool line_sender_opts_tls_enabled(
-    line_sender_opts* opts,
-    bool enabled,
     line_sender_error** err_out);
 
 /**

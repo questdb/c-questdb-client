@@ -47,14 +47,6 @@ impl<T: PartialEq> ConfigSetting<T> {
         ConfigSetting::Specified(value)
     }
 
-    /// Set a new default value.
-    /// Does nothing if the value is already specified.
-    pub(crate) fn set_default(&mut self, value: T) {
-        if let ConfigSetting::Defaulted(curr_value) = self {
-            *curr_value = value;
-        }
-    }
-
     /// Set the user-defined value.
     /// Note that it can't be changed once set.
     /// Returns true if the value was updated, false if already specified.

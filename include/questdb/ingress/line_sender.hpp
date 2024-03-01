@@ -79,8 +79,24 @@ namespace questdb::ingress
         config_error,
     };
 
+    /** The protocol used to connect with. */
+    enum class protocol
+    {
+        /** InfluxDB Line Protocol over TCP. */
+        tcp,
+
+        /** InfluxDB Line Protocol over TCP with TLS. */
+        tcps,
+
+        /** InfluxDB Line Protocol over HTTP. */
+        http,
+
+        /** InfluxDB Line Protocol over HTTP with TLS. */
+        https,
+    };
+
     /* Certificate authority used to determine how to validate the server's TLS certificate. */
-    enum class line_sender_ca {
+    enum class ca {
         /** Use the set of root certificates provided by the `webpki` crate. */
         webpki_roots,
 
@@ -712,18 +728,6 @@ namespace questdb::ingress
         friend class line_sender;
     };
 
-    /**
-     * Protocol to use for the line sender.
-     */
-    enum class line_sender_protocol
-    {
-        /** ILP/TCP */
-        tcp,
-
-        /** ILP/HTTP */
-        http,
-    };
-
     class opts
     {
         public:
@@ -758,29 +762,31 @@ namespace questdb::ingress
              * @param[in] port The QuestDB tcp or http port.
              */
             opts(
-                line_sender_protocol protocol,
+                protocol protocol,
                 utf8_view host,
                 uint16_t port) noexcept
                 : _impl{
-                    protocol == line_sender_protocol::tcp
-                        ? ::line_sender_opts_new_tcp(host._impl, port)
-                        : ::line_sender_opts_new_http(host._impl, port)
+                    ::line_sender_opts_new(
+                        static_cast<::line_sender_protocol>(protocol),
+                        host._impl,
+                        port)
                 }
             {}
 
             /**
              * A new set of options for a line sender connection.
+             * @param[in] protocol The protocol to use.
              * @param[in] host The QuestDB database host.
              * @param[in] port The QuestDB tcp or http port as service name.
              */
             opts(
-                line_sender_protocol protocol,
+                protocol protocol,
                 utf8_view host,
                 utf8_view port) noexcept
                 : _impl{
-                    protocol == line_sender_protocol::tcp
-                        ? ::line_sender_opts_new_tcp_service(host._impl, port._impl)
-                        : ::line_sender_opts_new_http_service(host._impl, port._impl)
+                    ::line_sender_opts_new_service(
+                        static_cast<::line_sender_protocol>(protocol),
+                        host._impl, port._impl)
                 }
             {}
 
@@ -914,18 +920,6 @@ namespace questdb::ingress
             }
 
             /**
-             * Enable or disable TLS.
-             */
-            opts& tls_enabled(bool enabled)
-            {
-                line_sender_error::wrapped_call(
-                    ::line_sender_opts_tls_enabled,
-                    _impl,
-                    enabled);
-                return *this;
-            }
-
-            /**
              * Set to `false` to disable TLS certificate verification.
              * This should only be used for debugging purposes as it reduces security.
              * 
@@ -944,7 +938,7 @@ namespace questdb::ingress
             /**
              * Set the certificate authority used to determine how to validate the server's TLS certificate.
              */
-            opts& tls_ca(line_sender_ca ca)
+            opts& tls_ca(ca ca)
             {
                 ::line_sender_ca ca_impl = static_cast<::line_sender_ca>(ca);
                 line_sender_error::wrapped_call(
@@ -1080,11 +1074,11 @@ namespace questdb::ingress
             return {opts::from_env()};
         }
 
-        line_sender(line_sender_protocol protocol, utf8_view host, uint16_t port)
+        line_sender(protocol protocol, utf8_view host, uint16_t port)
             : line_sender{opts{protocol, host, port}}
         {}
 
-        line_sender(line_sender_protocol protocol, utf8_view host, utf8_view port)
+        line_sender(protocol protocol, utf8_view host, utf8_view port)
             : line_sender{opts{protocol, host, port}}
         {}
 
