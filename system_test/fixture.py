@@ -502,3 +502,7 @@ class TlsProxyFixture:
             self._proc.terminate()
             self._proc.wait()
             self._proc = None
+        if self._log_file:
+            self._log_file.close()
+            self._log_file = None
+
