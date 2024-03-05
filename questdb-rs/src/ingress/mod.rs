@@ -2200,13 +2200,7 @@ impl SenderBuilder {
     pub fn user_agent(mut self, value: &str) -> Result<Self> {
         let value = validate_value(value)?;
         if let Some(http) = &mut self.http {
-            http.user_agent
-                .set_specified("user_agent", Some(value.to_string()))?;
-        } else {
-            return Err(error::fmt!(
-                ConfigError,
-                "user_agent is supported only in ILP over HTTP."
-            ));
+            http.user_agent = value.to_string();
         }
         Ok(self)
     }
@@ -2426,13 +2420,7 @@ impl SenderBuilder {
                     ));
                 }
 
-                let user_agent = self
-                    .http
-                    .as_ref()
-                    .unwrap()
-                    .user_agent
-                    .as_deref()
-                    .unwrap_or(concat!("questdb/rust/", env!("CARGO_PKG_VERSION")));
+                let user_agent = self.http.as_ref().unwrap().user_agent.as_str();
                 let agent_builder = ureq::AgentBuilder::new()
                     .user_agent(user_agent)
                     .no_delay(true);
