@@ -758,6 +758,12 @@ bool line_sender_opts_request_timeout(
     uint64_t millis,
     line_sender_error** err_out);
 
+// Do not call: Private API for the C++ and Python bindings.
+bool line_sender_opts_user_agent(
+    line_sender_opts* opts,
+    line_sender_utf8 user_agent,
+    line_sender_error** err_out);
+
 /**
  * Duplicate the opts object.
  * Both old and new objects will have to be freed.

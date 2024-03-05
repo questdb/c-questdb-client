@@ -728,6 +728,22 @@ namespace questdb::ingress
         friend class line_sender;
     };
 
+    class _user_agent
+    {
+    private:
+        static inline ::line_sender_utf8 name()
+        {
+            // Maintained by .bumpversion.cfg
+            static const char user_agent[] = "questdb/c++/3.1.0";
+            ::line_sender_utf8 utf8 = ::line_sender_utf8_assert(
+                sizeof(user_agent) - 1,
+                user_agent);
+            return utf8;
+        }
+
+        friend class opts;
+    };
+
     class opts
     {
         public:
@@ -751,8 +767,13 @@ namespace questdb::ingress
              */
             static inline opts from_env()
             {
-                return {line_sender_error::wrapped_call(
+                opts impl{line_sender_error::wrapped_call(
                     ::line_sender_opts_from_env)};
+                line_sender_error::wrapped_call(
+                    ::line_sender_opts_user_agent,
+                    impl._impl,
+                    _user_agent::name());
+                return impl;
             }
 
             /**
@@ -771,7 +792,12 @@ namespace questdb::ingress
                         host._impl,
                         port)
                 }
-            {}
+            {
+                line_sender_error::wrapped_call(
+                    ::line_sender_opts_user_agent,
+                    _impl,
+                    _user_agent::name());
+            }
 
             /**
              * A new set of options for a line sender connection.
@@ -788,7 +814,12 @@ namespace questdb::ingress
                         static_cast<::line_sender_protocol>(protocol),
                         host._impl, port._impl)
                 }
-            {}
+            {
+                line_sender_error::wrapped_call(
+                    ::line_sender_opts_user_agent,
+                    _impl,
+                    _user_agent::name());
+            }
 
             opts(const opts& other) noexcept
                 : _impl{::line_sender_opts_clone(other._impl)}
