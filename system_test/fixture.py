@@ -65,7 +65,7 @@ def retry(
     every=0.05,
     msg='Timed out retrying',
     backoff_till=5.0,
-    lead_sleep=0.1):
+    lead_sleep=0.001):
     """
     Repeat task every `interval` until it returns a truthy value or times out.
     """
