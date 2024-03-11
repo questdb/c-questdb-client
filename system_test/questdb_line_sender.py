@@ -529,10 +529,10 @@ class TimestampMicros:
 
 
 class Buffer:
-    def __init__(self, init_capacity=65536, max_name_len=127):
+    def __init__(self, init_buf_size=65536, max_name_len=127):
         self._impl = _DLL.line_sender_buffer_with_max_name_len(
             c_size_t(max_name_len))
-        _DLL.line_sender_buffer_reserve(self._impl, c_size_t(init_capacity))
+        _DLL.line_sender_buffer_reserve(self._impl, c_size_t(init_buf_size))
 
     def __len__(self):
         return _DLL.line_sender_buffer_size(self._impl)

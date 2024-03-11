@@ -315,28 +315,28 @@ namespace questdb::ingress
     class line_sender_buffer
     {
     public:
-        explicit line_sender_buffer(size_t init_capacity = 64 * 1024) noexcept
-            : line_sender_buffer{init_capacity, 127}
+        explicit line_sender_buffer(size_t init_buf_size = 64 * 1024) noexcept
+            : line_sender_buffer{init_buf_size, 127}
         {}
 
         line_sender_buffer(
-            size_t init_capacity,
+            size_t init_buf_size,
             size_t max_name_len) noexcept
             : _impl{nullptr}
-            , _init_capacity{init_capacity}
+            , _init_buf_size{init_buf_size}
             , _max_name_len{max_name_len}
         {
         }
 
         line_sender_buffer(const line_sender_buffer& other) noexcept
             : _impl{::line_sender_buffer_clone(other._impl)}
-            , _init_capacity{other._init_capacity}
+            , _init_buf_size{other._init_buf_size}
             , _max_name_len{other._max_name_len}
         {}
 
         line_sender_buffer(line_sender_buffer&& other) noexcept
             : _impl{other._impl}
-            , _init_capacity{other._init_capacity}
+            , _init_buf_size{other._init_buf_size}
             , _max_name_len{other._max_name_len}
         {
             other._impl = nullptr;
@@ -351,7 +351,7 @@ namespace questdb::ingress
                     _impl = ::line_sender_buffer_clone(other._impl);
                 else
                     _impl = nullptr;
-                _init_capacity = other._init_capacity;
+                _init_buf_size = other._init_buf_size;
                 _max_name_len = other._max_name_len;
             }
             return *this;
@@ -363,7 +363,7 @@ namespace questdb::ingress
             {
                 ::line_sender_buffer_free(_impl);
                 _impl = other._impl;
-                _init_capacity = other._init_capacity;
+                _init_buf_size = other._init_buf_size;
                 _max_name_len = other._max_name_len;
                 other._impl = nullptr;
             }
@@ -717,12 +717,12 @@ namespace questdb::ingress
             if (!_impl)
             {
                 _impl = ::line_sender_buffer_with_max_name_len(_max_name_len);
-                ::line_sender_buffer_reserve(_impl, _init_capacity);
+                ::line_sender_buffer_reserve(_impl, _init_buf_size);
             }
         }
 
         ::line_sender_buffer* _impl;
-        size_t _init_capacity;
+        size_t _init_buf_size;
         size_t _max_name_len;
 
         friend class line_sender;

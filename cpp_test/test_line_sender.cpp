@@ -384,17 +384,17 @@ TEST_CASE("Validation of bad chars in key names.")
 
 TEST_CASE("Buffer move and copy ctor testing")
 {
-    const size_t init_capacity = 128;
+    const size_t init_buf_size = 128;
 
-    questdb::ingress::line_sender_buffer buffer1{init_capacity};
+    questdb::ingress::line_sender_buffer buffer1{init_buf_size};
     buffer1.table("buffer1");
     CHECK(buffer1.peek() == "buffer1");
 
-    questdb::ingress::line_sender_buffer buffer2{2 * init_capacity};
+    questdb::ingress::line_sender_buffer buffer2{2 * init_buf_size};
     buffer2.table("buffer2");
     CHECK(buffer2.peek() == "buffer2");
 
-    questdb::ingress::line_sender_buffer buffer3{3 * init_capacity};
+    questdb::ingress::line_sender_buffer buffer3{3 * init_buf_size};
     buffer3.table("buffer3");
     CHECK(buffer3.peek() == "buffer3");
 
