@@ -28,10 +28,8 @@ use crate::{Error, ErrorCode, Result};
 
 /// Wraps a SenderBuilder config setting with the intent of tracking
 /// whether the value was user-specified or defaulted.
-/// The API then ensures the following rules:
-/// * A defaulted value can be changed to another defaulted value,
-///   or to a user-specified value.
-/// * A user-specified value can't be changed once set.
+/// This helps the builder API ensure that a user-specified value can't
+/// be changed once set.
 #[derive(Debug, Clone)]
 pub(crate) enum ConfigSetting<T: PartialEq> {
     Defaulted(T),
@@ -49,7 +47,7 @@ impl<T: PartialEq> ConfigSetting<T> {
 
     /// Set the user-defined value.
     /// Note that it can't be changed once set.
-    /// Returns true if the value was updated, false if already specified.
+    /// If the value is already specified, returns an error.
     pub(crate) fn set_specified(&mut self, setting_name: &str, value: T) -> Result<()> {
         match self {
             ConfigSetting::Defaulted(_) => {

@@ -95,7 +95,7 @@ namespace questdb::ingress
         https,
     };
 
-    /* Certificate authority used to determine how to validate the server's TLS certificate. */
+    /* Possible sources of the root certificates used to validate the server's TLS certificate. */
     enum class ca {
         /** Use the set of root certificates provided by the `webpki` crate. */
         webpki_roots,
@@ -748,7 +748,7 @@ namespace questdb::ingress
     {
         public:
             /**
-             * Create a new `ops` instance from configuration string.
+             * Create a new `opts` instance from configuration string.
              * The format of the string is: "tcp::addr=host:port;key=value;...;"
              * Alongside "tcp" you can also specify "tcps", "http", and "https".
              * The accepted set of keys and values is the same as for the opt's API.
@@ -762,7 +762,7 @@ namespace questdb::ingress
             }
 
             /**
-             * Create a new `ops` instance from configuration string read from the
+             * Create a new `opts` instance from configuration string read from the
              * `QDB_CLIENT_CONF` environment variable.
              */
             static inline opts from_env()
@@ -852,12 +852,12 @@ namespace questdb::ingress
                 return *this;
             }
 
-            /** 
+            /**
              * Select local outbound network "bind" interface.
              *
              * This may be relevant if your machine has multiple network interfaces.
              *
-             * The default is `0.0.0.0``.
+             * The default is `0.0.0.0`.
              */
             opts& bind_interface(utf8_view bind_interface)
             {
@@ -870,10 +870,10 @@ namespace questdb::ingress
 
             /**
              * Set the username for basic HTTP authentication.
-             * 
+             *
              * For TCP this is the `kid` part of the ECDSA key set.
              * The other fields are `token` `token_x` and `token_y`.
-             * 
+             *
              * For HTTP this is part of basic authentication.
              * Also see `password`.
              */
@@ -953,7 +953,7 @@ namespace questdb::ingress
             /**
              * Set to `false` to disable TLS certificate verification.
              * This should only be used for debugging purposes as it reduces security.
-             * 
+             *
              * For testing consider specifying a path to a `.pem` file instead via
              * the `tls_roots` setting.
              */
@@ -967,7 +967,8 @@ namespace questdb::ingress
             }
 
             /**
-             * Set the certificate authority used to determine how to validate the server's TLS certificate.
+             * Specify where to find the certificate authority used to validate the
+             * server's TLS certificate.
              */
             opts& tls_ca(ca ca)
             {
@@ -982,8 +983,6 @@ namespace questdb::ingress
             /**
              * Set the path to a custom root certificate `.pem` file.
              * This is used to validate the server's certificate during the TLS handshake.
-             * The file may be password-protected, if so, also specify the password
-             * via the `tls_roots_password` method.
              *
              * See notes on how to test with self-signed certificates:
              * https://github.com/questdb/c-questdb-client/tree/main/tls_certs.
@@ -1012,7 +1011,7 @@ namespace questdb::ingress
 
             /**
              * Cumulative duration spent in retries.
-             * Default is 10 seconds.
+             * The default is 10 seconds.
              */
             opts& retry_timeout(uint64_t millis)
             {

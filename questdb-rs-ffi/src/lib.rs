@@ -78,7 +78,7 @@ macro_rules! upd_opts {
                     // We've moved ownership of `forced_builder` (which is actually
                     // just an alias of the real `SenderBuilder` owned by the caller
                     // via a pointer - but the Rust compiler doesn't know that)
-                    // into `tls_roots`.
+                    // into this function.
                     // This leaves the original caller holding a pointer to an
                     // already cleaned up object.
                     // To avoid double-freeing, we need to construct a valid "dummy"
@@ -202,7 +202,7 @@ impl From<line_sender_protocol> for Protocol {
     }
 }
 
-/// Certificate authority used to determine how to validate the server's TLS certificate.
+/// Possible sources of the root certificates used to validate the server's TLS certificate.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub enum line_sender_ca {
@@ -556,7 +556,7 @@ pub unsafe extern "C" fn line_sender_buffer_with_max_name_len(
     Box::into_raw(Box::new(line_sender_buffer(buffer)))
 }
 
-/// Release the buffer object.
+/// Release the `line_sender_buffer` object.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_buffer_free(buffer: *mut line_sender_buffer) {
     if !buffer.is_null() {
@@ -894,7 +894,7 @@ pub unsafe extern "C" fn line_sender_buffer_at_now(
 /// Accumulates parameters for creating a line sender connection.
 pub struct line_sender_opts(SenderBuilder);
 
-/// Create a new `ops` instance from configuration string.
+/// Create a new `line_sender_opts` instance from configuration string.
 /// The format of the string is: "tcp::addr=host:port;key=value;...;"
 /// Alongside "tcp" you can also specify "tcps", "http", and "https".
 /// The accepted set of keys and values is the same as for the opt's API.
@@ -909,8 +909,8 @@ pub unsafe extern "C" fn line_sender_opts_from_conf(
     Box::into_raw(Box::new(line_sender_opts(builder)))
 }
 
-/// Create a new `ops` instance from configuration string read from the
-/// `QDB_CLIENT_CONF` environment variable.
+/// Create a new `line_sender_opts` instance from configuration string read
+/// from the `QDB_CLIENT_CONF` environment variable.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_opts_from_env(
     err_out: *mut *mut line_sender_error,
@@ -954,7 +954,7 @@ pub unsafe extern "C" fn line_sender_opts_new_service(
 ///
 /// This may be relevant if your machine has multiple network interfaces.
 ///
-/// The default is `0.0.0.0``.
+/// The default is `0.0.0.0`.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_opts_bind_interface(
     opts: *mut line_sender_opts,
@@ -1049,7 +1049,8 @@ pub unsafe extern "C" fn line_sender_opts_tls_verify(
     upd_opts!(opts, err_out, tls_verify, verify)
 }
 
-/// Set the certificate authority used to determine how to validate the server's TLS certificate.
+/// Specify where to find the certificate authority used to validate
+/// the validate the server's TLS certificate.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_opts_tls_ca(
     opts: *mut line_sender_opts,
@@ -1062,8 +1063,6 @@ pub unsafe extern "C" fn line_sender_opts_tls_ca(
 
 /// Set the path to a custom root certificate `.pem` file.
 /// This is used to validate the server's certificate during the TLS handshake.
-/// The file may be password-protected, if so, also specify the password.
-/// via the `tls_roots_password` method.
 ///
 /// See notes on how to test with [self-signed certificates](https://github.com/questdb/c-questdb-client/tree/main/tls_certs).
 #[no_mangle]
@@ -1088,7 +1087,7 @@ pub unsafe extern "C" fn line_sender_opts_max_buf_size(
 }
 
 /// Cumulative duration spent in retries.
-/// Default is 10 seconds.
+/// The default is 10 seconds.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_opts_retry_timeout(
     opts: *mut line_sender_opts,
@@ -1135,7 +1134,7 @@ pub unsafe extern "C" fn line_sender_opts_user_agent(
     upd_opts!(opts, err_out, user_agent, user_agent.as_str())
 }
 
-/// Duplicate the opts object.
+/// Duplicate the `line_sender_opts` object.
 /// Both old and new objects will have to be freed.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_opts_clone(
@@ -1146,7 +1145,7 @@ pub unsafe extern "C" fn line_sender_opts_clone(
     Box::into_raw(Box::new(line_sender_opts(new_builder)))
 }
 
-/// Release the opts object.
+/// Release the `line_sender_opts` object.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_opts_free(opts: *mut line_sender_opts) {
     if !opts.is_null() {
@@ -1185,7 +1184,7 @@ pub unsafe extern "C" fn line_sender_build(
 /// The accepted set of keys and values is the same as for the opt's API.
 /// E.g. "https::addr=host:port;username=alice;password=secret;tls_ca=os_roots;"
 ///
-/// For full list of options, search this header for `bool line_sender_opts_`.
+/// For the full list of keys, search this file for `fn line_sender_opts_`.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_from_conf(
     config: line_sender_utf8,

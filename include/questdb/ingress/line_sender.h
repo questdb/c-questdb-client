@@ -96,7 +96,7 @@ typedef enum line_sender_protocol
     line_sender_protocol_https,
 } line_sender_protocol;
 
-/* Certificate authority used to determine how to validate the server's TLS certificate. */
+/* Possible sources of the root certificates used to validate the server's TLS certificate. */
 typedef enum line_sender_ca {
     /** Use the set of root certificates provided by the `webpki` crate. */
     line_sender_ca_webpki_roots,
@@ -278,7 +278,7 @@ line_sender_buffer* line_sender_buffer_new();
 LINESENDER_API
 line_sender_buffer* line_sender_buffer_with_max_name_len(size_t max_name_len);
 
-/** Release the buffer object. */
+/** Release the `line_sender_buffer` object. */
 LINESENDER_API
 void line_sender_buffer_free(line_sender_buffer* buffer);
 
@@ -562,7 +562,7 @@ typedef struct line_sender line_sender;
 typedef struct line_sender_opts line_sender_opts;
 
 /**
- * Create a new `ops` instance from configuration string.
+ * Create a new `line_sender_opts` instance from configuration string.
  * The format of the string is: "tcp::addr=host:port;key=value;...;"
  * Alongside "tcp" you can also specify "tcps", "http", and "https".
  * The accepted set of keys and values is the same as for the opt's API.
@@ -574,8 +574,8 @@ line_sender_opts* line_sender_opts_from_conf(
     line_sender_error** err_out);
 
 /**
- * Create a new `ops` instance from configuration string read from the
- * `QDB_CLIENT_CONF` environment variable.
+ * Create a new `line_sender_opts` instance from configuration string
+ * read from the `QDB_CLIENT_CONF` environment variable.
  */
 LINESENDER_API
 line_sender_opts* line_sender_opts_from_env(
@@ -602,12 +602,12 @@ line_sender_opts* line_sender_opts_new_service(
     line_sender_utf8 host,
     line_sender_utf8 port);
 
-/** 
+/**
  * Select local outbound network "bind" interface.
  *
  * This may be relevant if your machine has multiple network interfaces.
  *
- * The default is `0.0.0.0``.
+ * The default is `0.0.0.0`.
  */
 LINESENDER_API
 bool line_sender_opts_bind_interface(
@@ -617,10 +617,10 @@ bool line_sender_opts_bind_interface(
 
 /**
  * Set the username for authentication.
- * 
+ *
  * For TCP this is the `kid` part of the ECDSA key set.
  * The other fields are `token` `token_x` and `token_y`.
- * 
+ *
  * For HTTP this is part of basic authentication.
  * Also see `password`.
  */
@@ -682,7 +682,7 @@ bool line_sender_opts_auth_timeout(
 /**
  * Set to `false` to disable TLS certificate verification.
  * This should only be used for debugging purposes as it reduces security.
- * 
+ *
  * For testing consider specifying a path to a `.pem` file instead via
  * the `tls_roots` setting.
  */
@@ -693,7 +693,8 @@ bool line_sender_opts_tls_verify(
     line_sender_error** err_out);
 
 /**
- * Set the certificate authority used to determine how to validate the server's TLS certificate.
+ * Specify where to find the root certificates used to validate the
+ * server's TLS certificate.
  */
 LINESENDER_API
 bool line_sender_opts_tls_ca(
@@ -704,8 +705,6 @@ bool line_sender_opts_tls_ca(
 /**
  * Set the path to a custom root certificate `.pem` file.
  * This is used to validate the server's certificate during the TLS handshake.
- * The file may be password-protected, if so, also specify the password.
- * via the `tls_roots_password` method.
  *
  * See notes on how to test with self-signed certificates:
  * https://github.com/questdb/c-questdb-client/tree/main/tls_certs.
@@ -728,7 +727,7 @@ bool line_sender_opts_max_buf_size(
 
 /**
  * Cumulative duration spent in retries.
- * Default is 10 seconds.
+ * The default is 10 seconds.
  */
 LINESENDER_API
 bool line_sender_opts_retry_timeout(
@@ -765,14 +764,14 @@ bool line_sender_opts_user_agent(
     line_sender_error** err_out);
 
 /**
- * Duplicate the opts object.
+ * Duplicate the `line_sender_opts` object.
  * Both old and new objects will have to be freed.
  */
 LINESENDER_API
 line_sender_opts* line_sender_opts_clone(
     line_sender_opts* opts);
 
-/** Release the opts object. */
+/** Release the `line_sender_opts` object. */
 LINESENDER_API
 void line_sender_opts_free(line_sender_opts* opts);
 
@@ -793,8 +792,8 @@ line_sender* line_sender_build(
  * Alongside "tcp" you can also specify "tcps", "http", and "https".
  * The accepted set of keys and values is the same as for the opt's API.
  * E.g. "https::addr=host:port;username=alice;password=secret;tls_ca=os_roots;"
- * 
- * For full list of keys and values, search this header for `bool line_sender_opts_`.
+ *
+ * For the full list of keys, search this header for `bool line_sender_opts_`.
  */
 LINESENDER_API
 line_sender* line_sender_from_conf(
@@ -858,11 +857,11 @@ bool line_sender_flush_and_keep(
 /**
  * Variant of `.flush()` that does not clear the buffer and allows for
  * transactional flushes.
- * 
+ *
  * A transactional flush is simply a flush that ensures that all rows in
  * the ILP buffer refer to the same table, thus allowing the server to
  * treat the flush request as a single transaction.
- * 
+ *
  * This is because QuestDB does not support transactions spanning multiple
  * tables.
  */

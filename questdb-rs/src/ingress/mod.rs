@@ -97,10 +97,10 @@
 //! # }
 //! ```
 //!
-//! Note that as of writing Open Source QuestDB does not natively support TLS
-//! encryption (QuestDB enterprise does).
+//! Note that Open Source QuestDB does not natively support TLS
+//! encryption (this is a QuestDB enterprise feature).
 //!
-//! To use TLS with QuestDB open source use a TLS proxy such as
+//! To use TLS with QuestDB open source, use a TLS proxy such as
 //! [HAProxy](http://www.haproxy.org/).
 //!
 //! For testing, you can use a self-signed certificate and key.
@@ -1361,7 +1361,7 @@ enum AuthParams {
     Token(TokenAuthParams),
 }
 
-/// Certificate authority used to determine how to validate the server's TLS certificate.
+/// Possible sources of the root certificates used to validate the server's TLS certificate.
 #[derive(PartialEq, Debug, Clone, Copy)]
 pub enum CertificateAuthority {
     /// Use the root certificates provided by the
@@ -2099,7 +2099,8 @@ impl SenderBuilder {
         Ok(self)
     }
 
-    /// Set the certificate authority used to determine how to validate the server's TLS certificate.
+    /// Specify where to find the root certificate used to validate the
+    /// server's TLS certificate.
     pub fn tls_ca(mut self, ca: CertificateAuthority) -> Result<Self> {
         self.ensure_tls_enabled("tls_ca")?;
         self.tls_ca.set_specified("tls_ca", ca)?;
@@ -2142,7 +2143,7 @@ impl SenderBuilder {
 
     #[cfg(feature = "ilp-over-http")]
     /// Cumulative duration spent in retries.
-    /// Default is 10 seconds.
+    /// The default is 10 seconds.
     pub fn retry_timeout(mut self, value: Duration) -> Result<Self> {
         if let Some(http) = &mut self.http {
             http.retry_timeout.set_specified("retry_timeout", value)?;
