@@ -57,40 +57,6 @@ macro_rules! bubble_err_to_c {
     };
 }
 
-/*
-
-    // This is square-peg-round-hole code.
-    // The C API is not designed to handle Rust's ownership semantics.
-    // So we're going to do some very unsafe things here.
-    // We need to extract a `T` from a `*mut T` and then replace it with
-    // another `T` in situ.
-    let dest = &mut (*opts).0;
-    let forced_builder = ptr::read(&(*opts).0);
-    let new_builder = match forced_builder.tls_roots(path) {
-        Ok(builder) => builder,
-        Err(err) => {
-            let err_ptr = Box::into_raw(Box::new(line_sender_error(err)));
-            *err_out = err_ptr;
-
-            // We're really messing the borrow-checker here.
-            // We've moved ownership of `forced_builder` (which is actually
-            // just an alias of the real `SenderBuilder` owned by the caller
-            // via a pointer - but the Rust compiler doesn't know that)
-            // into `tls_roots`.
-            // This leaves the original caller holding a pointer to an
-            // already cleaned up object.
-            // To avoid double-freeing, we need to construct a valid "dummy"
-            // object on top of the memory that is still owned by the caller.
-            let dummy = SenderBuilder::new(Protocol::Tcp, "localhost", 1);
-            ptr::write(dest, dummy);
-            return false;
-        }
-    };
-    ptr::write(dest, new_builder);
-    true
-
-*/
-
 /// Update the Rust builder inside the C opts object
 /// after calling a method that takes ownership of the builder.
 macro_rules! upd_opts {
@@ -108,7 +74,7 @@ macro_rules! upd_opts {
                 Ok(builder) => builder,
                 Err(err) => {
                     *$err_out = Box::into_raw(Box::new(line_sender_error(err)));
-                    // We're really messing the borrow-checker here.
+                    // We're really messing with the borrow-checker here.
                     // We've moved ownership of `forced_builder` (which is actually
                     // just an alias of the real `SenderBuilder` owned by the caller
                     // via a pointer - but the Rust compiler doesn't know that)
@@ -932,7 +898,7 @@ pub struct line_sender_opts(SenderBuilder);
 /// The format of the string is: "tcp::addr=host:port;key=value;...;"
 /// Alongside "tcp" you can also specify "tcps", "http", and "https".
 /// The accepted set of keys and values is the same as for the opt's API.
-/// E.g. "tcp::addr=host:port;username=alice;password=secret;tls_ca=os_roots;"
+/// E.g. "https::addr=host:port;username=alice;password=secret;tls_ca=os_roots;"
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_opts_from_conf(
     config: line_sender_utf8,
@@ -1217,7 +1183,7 @@ pub unsafe extern "C" fn line_sender_build(
 /// The format of the string is: "tcp::addr=host:port;key=value;...;"
 /// Alongside "tcp" you can also specify "tcps", "http", and "https".
 /// The accepted set of keys and values is the same as for the opt's API.
-/// E.g. "tcp::addr=host:port;username=alice;password=secret;tls_ca=os_roots;"
+/// E.g. "https::addr=host:port;username=alice;password=secret;tls_ca=os_roots;"
 ///
 /// For full list of options, search this header for `bool line_sender_opts_`.
 #[no_mangle]

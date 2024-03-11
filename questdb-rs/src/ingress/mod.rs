@@ -1793,7 +1793,7 @@ impl SenderBuilder {
     ///
     /// The accepted set of keys and values is the same as for the `SenderBuilder`'s API.
     ///
-    /// E.g. `"http::addr=host:port;username=alice;password=secret;tls_ca=os_roots;"`.
+    /// E.g. `"https::addr=host:port;username=alice;password=secret;tls_ca=os_roots;"`.
     ///
     /// If you prefer, you can also load the configuration from an environment variable.
     /// See [`SenderBuilder::from_env`].
@@ -2638,7 +2638,7 @@ impl Sender {
     ///
     /// The accepted set of keys and values is the same as for the opt's API.
     ///
-    /// E.g. `"http::addr=host:port;username=alice;password=secret;tls_ca=os_roots;"`.
+    /// E.g. `"https::addr=host:port;username=alice;password=secret;tls_ca=os_roots;"`.
     ///
     /// For full list of keys and values, see the [`SenderBuilder`] documentation:
     /// The builder API and the configuration string API are equivalent.

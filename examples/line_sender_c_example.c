@@ -11,7 +11,7 @@ static bool example(const char* host, const char* port)
     line_sender_buffer* buffer = NULL;
     char* conf_str = concat("tcp::addr=", host, ":", port, ";");
     if (!conf_str) {
-        fprintf(stderr, "Could not concatenate connection string.\n");
+        fprintf(stderr, "Could not concatenate configuration string.\n");
         return false;
     }
     line_sender_utf8 conf_str_utf8 = { 0, NULL };

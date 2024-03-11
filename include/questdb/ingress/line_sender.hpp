@@ -752,7 +752,7 @@ namespace questdb::ingress
              * The format of the string is: "tcp::addr=host:port;key=value;...;"
              * Alongside "tcp" you can also specify "tcps", "http", and "https".
              * The accepted set of keys and values is the same as for the opt's API.
-             * E.g. "tcp::addr=host:port;username=alice;password=secret;tls_ca=os_roots;"
+             * E.g. "https::addr=host:port;username=alice;password=secret;tls_ca=os_roots;"
              */
             static inline opts from_conf(utf8_view conf)
             {
@@ -1089,7 +1089,7 @@ namespace questdb::ingress
          * The format of the string is: "tcp::addr=host:port;key=value;...;"
          * Alongside "tcp" you can also specify "tcps", "http", and "https".
          * The accepted set of keys and values is the same as for the opt's API.
-         * E.g. "tcp::addr=host:port;username=alice;password=secret;tls_ca=os_roots;"
+         * E.g. "https::addr=host:port;username=alice;password=secret;tls_ca=os_roots;"
          */
         static inline line_sender from_conf(utf8_view conf)
         {

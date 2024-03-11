@@ -13,7 +13,7 @@ static bool example(const char* host, const char* port)
     // Use `username=...;password=...;` or `token=...` for authentication.
     char* conf_str = concat("http::addr=", host, ":", port, ";");
     if (!conf_str) {
-        fprintf(stderr, "Could not concatenate connection string.\n");
+        fprintf(stderr, "Could not concatenate configuration string.\n");
         return false;
     }
     line_sender_utf8 conf_str_utf8 = { 0, NULL };

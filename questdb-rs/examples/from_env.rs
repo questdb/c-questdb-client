@@ -4,7 +4,7 @@ use questdb::{
 };
 
 fn main() -> Result<()> {
-    // Read connection string from the `QDB_CLIENT_CONF` environment variable.
+    // Read configuration string from the `QDB_CLIENT_CONF` environment variable.
     let mut sender = Sender::from_env()?;
     let mut buffer = Buffer::new();
     buffer

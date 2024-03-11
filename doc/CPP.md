@@ -28,7 +28,7 @@
 ...
 
 auto sender = questdb::ingress::line_sender::from_conf(
-    "http::addr=localhost:1;");
+    "http::addr=localhost:9000;");
 
 ```
 

@@ -11,12 +11,12 @@ static bool example(const char* host, const char* port)
     line_sender_buffer* buffer = NULL;
     char* conf_str = concat(
         "tcps::addr=", host, ":", port, ";",
-        "username=testUser1;",
+        "username=testUser1;"
         "token=5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48;"
         "token_x=fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU;"
         "token_y=Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac;");
     if (!conf_str) {
-        fprintf(stderr, "Could not concatenate connection string.\n");
+        fprintf(stderr, "Could not concatenate configuration string.\n");
         return false;
     }
     line_sender_utf8 conf_str_utf8 = { 0, NULL };
