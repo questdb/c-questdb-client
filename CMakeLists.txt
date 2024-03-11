@@ -109,6 +109,9 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
         examples/concat.c
         examples/line_sender_c_example_http.c)
     compile_example(
+        line_sender_c_example_from_conf
+        examples/line_sender_c_example_from_conf.c)
+    compile_example(
         line_sender_c_example_from_env
         examples/line_sender_c_example_from_env.c)
     compile_example(
@@ -126,6 +129,9 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
     compile_example(
         line_sender_cpp_example_http
         examples/line_sender_cpp_example_http.cpp)
+    compile_example(
+        line_sender_cpp_example_from_conf
+        examples/line_sender_cpp_example_from_conf.cpp)
     compile_example(
         line_sender_cpp_example_from_env
         examples/line_sender_cpp_example_from_env.cpp)
