@@ -2701,9 +2701,13 @@ impl Sender {
                         Transactional flushes are only supported for buffers containing lines for a single table."
                     ));
                 }
-                let timeout = Duration::from_secs_f64(
-                    (bytes.len() as f64) / (*state.config.request_min_throughput as f64),
-                ) + *state.config.request_timeout;
+                let request_min_throughput = *state.config.request_min_throughput;
+                let extra_time = if request_min_throughput > 0 {
+                    (bytes.len() as f64) / (request_min_throughput as f64)
+                } else {
+                    0.0f64
+                };
+                let timeout = *state.config.request_timeout + Duration::from_secs_f64(extra_time);
                 let request = state
                     .agent
                     .post(&state.url)
