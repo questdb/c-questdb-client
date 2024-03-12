@@ -752,6 +752,14 @@ class TestSender(unittest.TestCase):
         with self.assertRaisesRegex(qls.SenderError, r'.*Environment variable QDB_CLIENT_CONF not set.*'):
             qls._error_wrapped_call(qls._DLL.line_sender_from_env)
 
+    def test_manifest_yaml(self):
+        # Check the manifest file can be read as yaml.
+        import yaml
+        proj = Project()
+        manifest_path = proj.root_dir / 'examples.manifest.yaml'
+        with open(manifest_path, 'r') as f:
+            yaml.safe_load(f)
+
 
 def parse_args():
     parser = argparse.ArgumentParser('Run system tests.')
