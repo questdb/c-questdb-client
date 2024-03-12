@@ -6,7 +6,7 @@
 ##    \__\_\\__,_|\___||___/\__|____/|____/
 ##
 ##  Copyright (c) 2014-2019 Appsicle
-##  Copyright (c) 2019-2023 QuestDB
+##  Copyright (c) 2019-2024 QuestDB
 ##
 ##  Licensed under the Apache License, Version 2.0 (the "License");
 ##  you may not use this file except in compliance with the License.
@@ -48,11 +48,11 @@ AUTH_TXT = """testUser1 ec-p-256-sha256 fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWS
 
 
 # Valid keys as registered with the QuestDB fixture.
-AUTH = (
-    "testUser1",
-    "5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48",
-    "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU",
-    "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac")
+AUTH = dict(
+    username="testUser1",
+    token="5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48",
+    token_x="fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU",
+    token_y="Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac")
 
 
 CA_PATH = (pathlib.Path(__file__).parent.parent /
@@ -65,7 +65,7 @@ def retry(
     every=0.05,
     msg='Timed out retrying',
     backoff_till=5.0,
-    lead_sleep=0.1):
+    lead_sleep=0.001):
     """
     Repeat task every `interval` until it returns a truthy value or times out.
     """
@@ -291,8 +291,8 @@ class QuestDbFixture:
             java,
             '-DQuestDB-Runtime-0',
             '-ea',
-            #'-Dnoebug',
-            '-Debug',
+            '-Dnoebug',
+            # '-Debug',
             '-XX:+UnlockExperimentalVMOptions',
             '-XX:+AlwaysPreTouch',
             '-p', str(self._root_dir / 'bin' / 'questdb.jar'),
@@ -315,7 +315,7 @@ class QuestDbFixture:
                     raise RuntimeError('QuestDB died during startup.')
                 req = urllib.request.Request(
                     f'http://localhost:{self.http_server_port}',
-                    method='HEAD')
+                    method='GET')
                 try:
                     resp = urllib.request.urlopen(req, timeout=1)
                     if resp.status == 200:
@@ -329,7 +329,7 @@ class QuestDbFixture:
             sys.stderr.write('Waiting until HTTP service is up.\n')
             retry(
                 check_http_up,
-                timeout_sec=60,
+                timeout_sec=300,
                 msg='Timed out waiting for HTTP service to come up.')
         except:
             sys.stderr.write(f'QuestDB log at `{self._log_path}`:\n')
@@ -392,7 +392,7 @@ class QuestDbFixture:
             table_name,
             *,
             min_rows=1,
-            timeout_sec=30,
+            timeout_sec=300,
             log=True,
             log_ctx=None):
         sql_query = f"select * from '{table_name}'"
@@ -502,3 +502,7 @@ class TlsProxyFixture:
             self._proc.terminate()
             self._proc.wait()
             self._proc = None
+        if self._log_file:
+            self._log_file.close()
+            self._log_file = None
+

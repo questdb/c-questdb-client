@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2023 QuestDB
+ *  Copyright (c) 2019-2024 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,8 +24,7 @@
 
 use crate::{
     ingress::{
-        Buffer, CertificateAuthority, Sender, TableName, Timestamp, TimestampMicros,
-        TimestampNanos, Tls,
+        Buffer, CertificateAuthority, Sender, TableName, Timestamp, TimestampMicros, TimestampNanos,
     },
     Error, ErrorCode,
 };
@@ -41,19 +40,15 @@ use std::{io, time::SystemTime};
 #[test]
 fn test_basics() -> TestResult {
     let mut server = MockServer::new()?;
-    let mut sender = server.lsb().connect()?;
+    let mut sender = server.lsb_tcp().build()?;
     assert!(!sender.must_close());
     server.accept()?;
 
     assert_eq!(server.recv_q()?, 0);
 
-    let ts = std::time::SystemTime::now();
-    let ts_micros_num = ts
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)?
-        .as_micros() as i64;
-    let ts_nanos_num = ts
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)?
-        .as_nanos() as i64;
+    let ts = SystemTime::now();
+    let ts_micros_num = ts.duration_since(SystemTime::UNIX_EPOCH)?.as_micros() as i64;
+    let ts_nanos_num = ts.duration_since(SystemTime::UNIX_EPOCH)?.as_nanos() as i64;
     let ts_micros = TimestampMicros::from_systemtime(ts)?;
     assert_eq!(ts_micros.as_i64(), ts_micros_num);
     let ts_nanos = TimestampNanos::from_systemtime(ts)?;
@@ -83,6 +78,33 @@ fn test_basics() -> TestResult {
     assert_eq!(buffer.as_str(), "");
     assert_eq!(server.recv_q()?, 1);
     assert_eq!(server.msgs[0].as_str(), exp);
+    Ok(())
+}
+
+#[test]
+fn test_max_buf_size() -> TestResult {
+    let max = 1024;
+    let mut server = MockServer::new()?;
+    let mut sender = server.lsb_tcp().max_buf_size(max)?.build()?;
+    assert!(!sender.must_close());
+    server.accept()?;
+
+    let mut buffer = Buffer::new();
+
+    while buffer.len() < max {
+        buffer
+            .table("test")?
+            .symbol("t1", "v1")?
+            .column_f64("f1", 0.5)?
+            .at_now()?;
+    }
+
+    let err = sender.flush(&mut buffer).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert_eq!(
+        err.msg(),
+        "Could not flush buffer: Buffer size of 1026 exceeds maximum configured allowed size of 1024 bytes."
+    );
     Ok(())
 }
 
@@ -206,9 +228,12 @@ fn test_bad_key(
 ) -> TestResult {
     let server = MockServer::new()?;
     let lsb = server
-        .lsb()
-        .auth("testUser1", priv_key, pub_key_x, pub_key_y);
-    let sender = lsb.connect();
+        .lsb_tcp()
+        .username("testUser1")?
+        .token(priv_key)?
+        .token_x(pub_key_x)?
+        .token_y(pub_key_y)?;
+    let sender = lsb.build();
 
     match sender {
         Ok(_) => panic!("Expected an error due to bad key, but connect succeeded."),
@@ -330,11 +355,9 @@ fn test_tls_with_file_ca() -> TestResult {
     ca_path.push("server_rootCA.pem");
 
     let server = MockServer::new()?;
-    let lsb = server
-        .lsb()
-        .tls(Tls::Enabled(CertificateAuthority::File(ca_path)));
+    let lsb = server.lsb_tcps().tls_roots(ca_path)?;
     let server_jh = server.accept_tls();
-    let mut sender = lsb.connect()?;
+    let mut sender = lsb.build()?;
     let mut server: MockServer = server_jh.join().unwrap()?;
 
     let mut buffer = Buffer::new();
@@ -361,14 +384,15 @@ fn test_tls_to_plain_server() -> TestResult {
 
     let mut server = MockServer::new()?;
     let lsb = server
-        .lsb()
-        .read_timeout(Duration::from_millis(500))
-        .tls(Tls::Enabled(CertificateAuthority::File(ca_path)));
+        .lsb_tcps()
+        .auth_timeout(Duration::from_millis(500))?
+        .tls_ca(CertificateAuthority::PemFile)?
+        .tls_roots(ca_path)?;
     let server_jh = std::thread::spawn(move || -> io::Result<MockServer> {
         server.accept()?;
         Ok(server)
     });
-    let maybe_sender = lsb.connect();
+    let maybe_sender = lsb.build();
     let _server: MockServer = server_jh.join().unwrap()?;
     let err = maybe_sender.unwrap_err();
     assert_eq!(
@@ -401,12 +425,9 @@ fn expect_eventual_disconnect(sender: &mut Sender) {
 #[test]
 fn test_plain_to_tls_server() -> TestResult {
     let server = MockServer::new()?;
-    let lsb = server
-        .lsb()
-        .read_timeout(Duration::from_millis(500))
-        .tls(Tls::Disabled);
+    let lsb = server.lsb_tcp().auth_timeout(Duration::from_millis(500))?;
     let server_jh = server.accept_tls();
-    let maybe_sender = lsb.connect();
+    let maybe_sender = lsb.build();
     let server_err = server_jh.join().unwrap().unwrap_err();
 
     // The server failed to handshake, so disconnected the client.
@@ -427,9 +448,9 @@ fn test_plain_to_tls_server() -> TestResult {
 #[test]
 fn test_tls_insecure_skip_verify() -> TestResult {
     let server = MockServer::new()?;
-    let lsb = server.lsb().tls(Tls::InsecureSkipVerify);
+    let lsb = server.lsb_tcps().tls_verify(false)?;
     let server_jh = server.accept_tls();
-    let mut sender = lsb.connect()?;
+    let mut sender = lsb.build()?;
     let mut server: MockServer = server_jh.join().unwrap()?;
 
     let mut buffer = Buffer::new();

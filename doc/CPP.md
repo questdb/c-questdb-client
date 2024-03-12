@@ -27,17 +27,15 @@
 
 ...
 
-// Automatically connects on object construction.
-questdb::ingress::line_sender sender{
-    "localhost",  // QuestDB hostname
-    9009};        // QuestDB port
+auto sender = questdb::ingress::line_sender::from_conf(
+    "http::addr=localhost:9000;");
 
 ```
 
-For more advanced use cases, such as those requiring authentication or
-full-connection encryption via TLS, first, create an `opts` object then call its
-methods to populate its options and then pass the `opts` object to the
-`line_sender` constructor.
+See the main [client libraries](https://questdb.io/docs/reference/clients/overview/)
+documentation for the full config string params, including authentication, tls, etc.
+
+You can also connect programmatically using the `questdb::ingress::opts` object.
 
 ### Building Messages
 

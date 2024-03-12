@@ -45,6 +45,9 @@ pub enum ErrorCode {
 
     /// Error sent back from the server during flush.
     ServerFlushError,
+
+    /// Bad configuration.
+    ConfigError,
 }
 
 /// An error that occurred when using QuestDB client library.

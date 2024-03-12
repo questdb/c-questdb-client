@@ -10,6 +10,9 @@ keywords = ["questdb", "ilp", "client-library"]
 categories = ["database"]
 authors = ["Adam Cimarosti <adam@questdb.io>"]
 
+[package.metadata.docs.rs]
+all-features = true
+
 [lib]
 name = "questdb"
 crate-type = ["lib"]
@@ -30,6 +33,7 @@ webpki-roots = { version = "0.26.0", optional = true }
 chrono = { version = "0.4.30", optional = true }
 ureq = { version = "2.9.4", optional = true }
 serde_json = { version = "1.0.108", optional = true }
+questdb-confstr = "0.1.0"
 rand = { version = "0.8.5", optional = true }
 
 [target.'cfg(windows)'.dependencies]
@@ -44,6 +48,7 @@ indoc = "2.0.4"
 [dev-dependencies]
 mio = { version = "0.8.10", features = ["os-poll", "net"] }
 chrono = "0.4.31"
+tempfile = "3.2.0"
 
 [features]
 default = ["tls-webpki-certs"]

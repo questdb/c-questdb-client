@@ -197,9 +197,9 @@ checksum = "d897f394bad6a705d5f4104762e116a75639e470d80901eed05a860a95cb1904"
 
 [[package]]
 name = "idna"
-version = "0.3.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e14ddfc70884202db2244c223200c204c2bda1bc6e0998d11b5e024d657209e6"
+checksum = "634d9b1461af396cad843f47fdba5597a4f9e6ddd4bfb6ff5d85028c25cb12f6"
 dependencies = [
  "unicode-bidi",
  "unicode-normalization",
@@ -288,6 +288,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "questdb-confstr"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a85ae0d477308986d89496bce6227833e11490cd27b98b809e4704b105000fd8"
+
+[[package]]
+name = "questdb-confstr-ffi"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a745c819f8ef71ca240dff7119bad4db368e0b11489c6e5e07b8e5cf2c775561"
+dependencies = [
+ "questdb-confstr",
+]
+
+[[package]]
 name = "questdb-rs"
 version = "3.1.0"
 dependencies = [
@@ -296,6 +311,7 @@ dependencies = [
  "indoc",
  "itoa",
  "libc",
+ "questdb-confstr",
  "rand",
  "ring",
  "rustls",
@@ -318,6 +334,7 @@ version = "3.1.0"
 dependencies = [
  "cbindgen",
  "libc",
+ "questdb-confstr-ffi",
  "questdb-rs",
 ]
 
@@ -654,9 +671,9 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "ureq"
-version = "2.9.4"
+version = "2.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "399dd89e2af196ae4f83a47bb37a1455e664fe2fed97b3ae68a1c4a3f8216e76"
+checksum = "0b52731d03d6bb2fd18289d4028aee361d6c28d44977846793b994b13cdcc64d"
 dependencies = [
  "base64",
  "flate2",
@@ -672,9 +689,9 @@ dependencies = [
 
 [[package]]
 name = "url"
-version = "2.3.1"
+version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d68c799ae75762b8c3fe375feb6600ef5602c883c5d21eb51c09f22b83c4643"
+checksum = "31e6302e3bb753d46e83516cae55ae196fc0c309407cf11ab35cc51a4c2a4633"
 dependencies = [
  "form_urlencoded",
  "idna",

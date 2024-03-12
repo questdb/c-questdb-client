@@ -90,19 +90,30 @@ endfunction()
 if (QUESTDB_TESTS_AND_EXAMPLES)
     compile_example(
         line_sender_c_example
+        examples/concat.c
         examples/line_sender_c_example.c)
     compile_example(
         line_sender_c_example_auth
+        examples/concat.c
         examples/line_sender_c_example_auth.c)
     compile_example(
         line_sender_c_example_tls_ca
+        examples/concat.c
         examples/line_sender_c_example_tls_ca.c)
     compile_example(
         line_sender_c_example_auth_tls
+        examples/concat.c
         examples/line_sender_c_example_auth_tls.c)
     compile_example(
         line_sender_c_example_http
+        examples/concat.c
         examples/line_sender_c_example_http.c)
+    compile_example(
+        line_sender_c_example_from_conf
+        examples/line_sender_c_example_from_conf.c)
+    compile_example(
+        line_sender_c_example_from_env
+        examples/line_sender_c_example_from_env.c)
     compile_example(
         line_sender_cpp_example
         examples/line_sender_cpp_example.cpp)
@@ -118,6 +129,12 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
     compile_example(
         line_sender_cpp_example_http
         examples/line_sender_cpp_example_http.cpp)
+    compile_example(
+        line_sender_cpp_example_from_conf
+        examples/line_sender_cpp_example_from_conf.cpp)
+    compile_example(
+        line_sender_cpp_example_from_env
+        examples/line_sender_cpp_example_from_env.cpp)
 
     # Include Rust tests as part of the tests run
     add_test(

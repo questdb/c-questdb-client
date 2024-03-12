@@ -6,7 +6,9 @@ use std::fmt::Write;
 use std::thread::sleep;
 use std::time::Duration;
 
-#[derive(Debug, Clone)]
+use super::conf::ConfigSetting;
+
+#[derive(PartialEq, Debug, Clone)]
 pub(super) struct BasicAuthParams {
     pub(super) username: String,
     pub(super) password: String,
@@ -20,7 +22,7 @@ impl BasicAuthParams {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(PartialEq, Debug, Clone)]
 pub(super) struct TokenAuthParams {
     pub(super) token: String,
 }
@@ -39,11 +41,21 @@ impl TokenAuthParams {
 
 #[derive(Debug, Clone)]
 pub(super) struct HttpConfig {
-    pub(super) min_throughput: u64,
-    pub(super) user_agent: Option<String>,
-    pub(super) retry_timeout: Duration,
-    pub(super) grace_timeout: Duration,
-    pub(super) transactional: bool,
+    pub(super) request_min_throughput: ConfigSetting<u64>,
+    pub(super) user_agent: String,
+    pub(super) retry_timeout: ConfigSetting<Duration>,
+    pub(super) request_timeout: ConfigSetting<Duration>,
+}
+
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self {
+            request_min_throughput: ConfigSetting::new_default(102400), // 100 KiB/s
+            user_agent: concat!("questdb/rust/", env!("CARGO_PKG_VERSION")).to_string(),
+            retry_timeout: ConfigSetting::new_default(Duration::from_secs(10)),
+            request_timeout: ConfigSetting::new_default(Duration::from_secs(10)),
+        }
+    }
 }
 
 pub(super) struct HttpHandlerState {
@@ -55,9 +67,6 @@ pub(super) struct HttpHandlerState {
 
     /// The content of the `Authorization` HTTP header.
     pub(super) auth: Option<String>,
-
-    /// Additional grace period added to the timeout as calculated via `min_throughput`.
-    pub(super) grace_timeout: Duration,
 
     /// HTTP params configured via the `SenderBuilder`.
     pub(super) config: HttpConfig,

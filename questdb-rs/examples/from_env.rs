@@ -4,7 +4,8 @@ use questdb::{
 };
 
 fn main() -> Result<()> {
-    let mut sender = Sender::from_conf("https::addr=localhost:9000;username=foo;password=bar;")?;
+    // Read configuration string from the `QDB_CLIENT_CONF` environment variable.
+    let mut sender = Sender::from_env()?;
     let mut buffer = Buffer::new();
     buffer
         .table("sensors")?

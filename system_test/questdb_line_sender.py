@@ -6,7 +6,7 @@
 ##    \__\_\\__,_|\___||___/\__|____/|____/
 ##
 ##  Copyright (c) 2014-2019 Appsicle
-##  Copyright (c) 2019-2023 QuestDB
+##  Copyright (c) 2019-2024 QuestDB
 ##
 ##  Licensed under the Apache License, Version 2.0 (the "License");
 ##  you may not use this file except in compliance with the License.
@@ -46,6 +46,7 @@ import pathlib
 import ctypes
 import os
 from datetime import datetime
+from enum import Enum
 
 from ctypes import (
     c_bool,
@@ -67,6 +68,22 @@ class c_line_sender(ctypes.Structure):
 
 class c_line_sender_buffer(ctypes.Structure):
     pass
+
+c_line_sender_protocol = ctypes.c_int
+
+class Protocol(Enum):
+    TCP = (c_line_sender_protocol(0), 'tcp')
+    TCPS = (c_line_sender_protocol(1), 'tcps')
+    HTTP = (c_line_sender_protocol(2), 'http')
+    HTTPS = (c_line_sender_protocol(3), 'https')
+
+c_line_sender_ca = ctypes.c_int
+
+class CertificateAuthority(Enum):
+    WEBPKI_ROOTS = (c_line_sender_ca(0), 'webpki_roots')
+    OS_ROOTS = (c_line_sender_ca(1), 'os_roots')
+    WEBPKI_AND_OS_ROOTS = (c_line_sender_ca(2), 'webpki_and_os_roots')
+    PEM_FILE = (c_line_sender_ca(3), 'pem_file')
 
 class c_line_sender_opts(ctypes.Structure):
     pass
@@ -250,60 +267,99 @@ def _setup_cdll():
     set_sig(
         dll.line_sender_opts_new,
         c_line_sender_opts_p,
+        c_line_sender_protocol,
         c_line_sender_utf8,
         c_uint16)
     set_sig(
         dll.line_sender_opts_new_service,
         c_line_sender_opts_p,
+        c_line_sender_protocol,
         c_line_sender_utf8,
         c_line_sender_utf8)
     set_sig(
-        dll.line_sender_opts_net_interface,
-        None,
-        c_line_sender_opts_p,
-        c_line_sender_utf8)
-    set_sig(
-        dll.line_sender_opts_auth,
-        None,
+        dll.line_sender_opts_bind_interface,
+        c_bool,
         c_line_sender_opts_p,
         c_line_sender_utf8,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_opts_username,
+        c_bool,
+        c_line_sender_opts_p,
         c_line_sender_utf8,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_opts_password,
+        c_bool,
+        c_line_sender_opts_p,
         c_line_sender_utf8,
-        c_line_sender_utf8)
+        c_line_sender_error_p_p)
     set_sig(
-        dll.line_sender_opts_http,
-        None,
-        c_line_sender_opts_p)
+        dll.line_sender_opts_token,
+        c_bool,
+        c_line_sender_opts_p,
+        c_line_sender_utf8,
+        c_line_sender_error_p_p)
     set_sig(
-        dll.line_sender_opts_transactional,
-        None,
-        c_line_sender_opts_p)
+        dll.line_sender_opts_token_x,
+        c_bool,
+        c_line_sender_opts_p,
+        c_line_sender_utf8,
+        c_line_sender_error_p_p)
     set_sig(
-        dll.line_sender_opts_tls,
-        None,
-        c_line_sender_opts_p)
+        dll.line_sender_opts_token_y,
+        c_bool,
+        c_line_sender_opts_p,
+        c_line_sender_utf8,
+        c_line_sender_error_p_p)
     set_sig(
-        dll.line_sender_opts_tls_os_roots,
-        None,
-        c_line_sender_opts_p)
+        dll.line_sender_opts_auth_timeout,
+        c_bool,
+        c_line_sender_opts_p,
+        c_uint64,
+        c_line_sender_error_p_p)
     set_sig(
-        dll.line_sender_opts_tls_webpki_and_os_roots,
-        None,
-        c_line_sender_opts_p)
+        dll.line_sender_opts_tls_verify,
+        c_bool,
+        c_line_sender_opts_p,
+        c_bool,
+        c_line_sender_error_p_p)
     set_sig(
         dll.line_sender_opts_tls_ca,
-        None,
+        c_bool,
         c_line_sender_opts_p,
-        c_line_sender_utf8)
+        c_line_sender_ca,
+        c_line_sender_error_p_p)
     set_sig(
-        dll.line_sender_opts_tls_insecure_skip_verify,
-        None,
-        c_line_sender_opts_p)
-    set_sig(
-        dll.line_sender_opts_read_timeout,
-        None,
+        dll.line_sender_opts_tls_roots,
+        c_bool,
         c_line_sender_opts_p,
-        c_uint64)
+        c_line_sender_utf8,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_opts_max_buf_size,
+        c_bool,
+        c_line_sender_opts_p,
+        c_size_t,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_opts_retry_timeout,
+        c_bool,
+        c_line_sender_opts_p,
+        c_uint64,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_opts_request_min_throughput,
+        c_bool,
+        c_line_sender_opts_p,
+        c_uint64,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_opts_request_timeout,
+        c_bool,
+        c_line_sender_opts_p,
+        c_uint64,
+        c_line_sender_error_p_p)
     set_sig(
         dll.line_sender_opts_clone,
         c_line_sender_opts_p,
@@ -313,9 +369,18 @@ def _setup_cdll():
         None,
         c_line_sender_opts_p)
     set_sig(
-        dll.line_sender_connect,
+        dll.line_sender_build,
         c_line_sender_p,
         c_line_sender_opts_p,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_from_conf,
+        c_line_sender_p,
+        c_line_sender_utf8,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_from_env,
+        c_line_sender_p,
         c_line_sender_error_p_p)
     set_sig(
         dll.line_sender_must_close,
@@ -336,6 +401,13 @@ def _setup_cdll():
         c_bool,
         c_line_sender_p,
         c_line_sender_buffer_p,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_flush_and_keep_with_flags,
+        c_bool,
+        c_line_sender_p,
+        c_line_sender_buffer_p,
+        c_bool,
         c_line_sender_error_p_p)
     return dll
 
@@ -428,9 +500,10 @@ def _fully_qual_name(obj):
 
 
 class _Opts:
-    def __init__(self, host, port):
+    def __init__(self, host, port, protocol=Protocol.TCP):
         self.impl = _error_wrapped_call(
             _DLL.line_sender_opts_new_service,
+            protocol.value[0],
             _utf8(str(host)),
             _utf8(str(port)))
 
@@ -456,10 +529,10 @@ class TimestampMicros:
 
 
 class Buffer:
-    def __init__(self, init_capacity=65536, max_name_len=127):
+    def __init__(self, init_buf_size=65536, max_name_len=127):
         self._impl = _DLL.line_sender_buffer_with_max_name_len(
             c_size_t(max_name_len))
-        _DLL.line_sender_buffer_reserve(self._impl, c_size_t(init_capacity))
+        _DLL.line_sender_buffer_reserve(self._impl, c_size_t(init_buf_size))
 
     def __len__(self):
         return _DLL.line_sender_buffer_size(self._impl)
@@ -566,50 +639,55 @@ class Buffer:
         _DLL.line_sender_buffer_free(self._impl)
 
 
+class BuildMode(Enum):
+    API = 1
+    CONF = 2
+    ENV = 3
+
+
+def _map_value(key, value):
+    """
+    Return a pair of option C object and string value.
+    """
+    if isinstance(value, bool):
+        if key == 'tls_verify':
+            return (value, 'on' if value else 'unsafe_off')
+        else:
+            return (value, 'on' if value else 'off')
+    elif isinstance(value, CertificateAuthority):
+        return value.value  # a tuple of `(c_line_sender_ca, str)`
+    else:
+        return (value, f'{value}')
+
+
 class Sender:
     def __init__(
             self,
+            build_mode: BuildMode,
+            protocol,
             host: str,
             port: Union[str, int],
-            *,
-            interface: Optional[str] = None,
-            auth: Optional[Tuple[str, str, str, str]] = None,
-            http: bool = False,
-            transactional: bool = False,
-            tls: Union[bool, str] = False,
-            read_timeout: Optional[int] = None):
-
-        opts = _Opts(host, port)
-        if interface:
-            opts.net_interface(interface)
-
-        if auth:
-            opts.auth(*auth)
-
-        if http:
-            opts.http()
-
-        if transactional:
-            opts.transactional()
-
-        if tls:
-            if tls is True:
-                opts.tls()
-            elif tls == 'os_roots':
-                opts.tls_os_roots()
-            elif tls == 'webpki_and_os_roots':
-                opts.tls_webpki_and_os_roots()
-            elif tls == 'insecure_skip_verify':
-                opts.tls_insecure_skip_verify()
-            else:
-                opts.tls_ca(str(tls))
-
-        if read_timeout is not None:
-            opts.read_timeout(read_timeout)
-
-        self._buffer = Buffer()
-        self._opts = opts
+            **kwargs):
+        
+        self._build_mode = build_mode
         self._impl = None
+        self._conf = [
+            protocol.value[1],
+            '::',
+            f'addr={host}:{port};']
+        self._opts = None
+        self._buffer = Buffer()
+        opts = _Opts(host, port, protocol)
+        for key, value in kwargs.items():
+            # Build the config string param pair.
+            c_value, conf_value = _map_value(key, value)
+            self._conf.append(f'{key}={conf_value};')
+
+            # Set the option in the C object.
+            getattr(opts, key)(c_value)
+
+        self._conf = ''.join(self._conf)
+        self._opts = opts
 
     @property
     def buffer(self):
@@ -618,9 +696,20 @@ class Sender:
     def connect(self):
         if self._impl:
             raise SenderError('Already connected')
-        self._impl = _error_wrapped_call(
-            _DLL.line_sender_connect,
-            self._opts.impl)
+        if self._build_mode == BuildMode.CONF:
+            self._impl = _error_wrapped_call(
+                _DLL.line_sender_from_conf,
+                _utf8(self._conf))
+        elif self._build_mode == BuildMode.ENV:
+            env_var = 'QDB_CLIENT_CONF'
+            os.environ[env_var] = self._conf
+            self._impl = _error_wrapped_call(
+                _DLL.line_sender_from_env)
+            del os.environ[env_var]
+        else:
+            self._impl = _error_wrapped_call(
+                _DLL.line_sender_build,
+                self._opts.impl)
 
     def __enter__(self):
         self.connect()
@@ -650,7 +739,7 @@ class Sender:
     def at(self, timestamp: int):
         self._buffer.at(timestamp)
 
-    def flush(self, buffer: Optional[Buffer]=None, clear=True):
+    def flush(self, buffer: Optional[Buffer]=None, clear=True, transactional=None):
         if (buffer is None) and not clear:
             raise ValueError(
                 'Clear flag must be True when using internal buffer')
@@ -659,16 +748,27 @@ class Sender:
         if len(buffer) == 0:
             return
         try:
-            if clear:
+            if transactional is not None:
+                if not isinstance(transactional, bool):
+                    raise ValueError('Transactional flag must be a boolean')
                 _error_wrapped_call(
-                    _DLL.line_sender_flush,
+                    _DLL.line_sender_flush_and_keep_with_flags,
                     self._impl,
-                    buffer._impl)
+                    buffer._impl,
+                    transactional)
+                if clear:
+                    buffer.clear()
             else:
-                _error_wrapped_call(
-                    _DLL.line_sender_flush_and_keep,
-                    self._impl,
-                    buffer._impl)
+                if clear:
+                    _error_wrapped_call(
+                        _DLL.line_sender_flush,
+                        self._impl,
+                        buffer._impl)
+                else:
+                    _error_wrapped_call(
+                        _DLL.line_sender_flush_and_keep,
+                        self._impl,
+                        buffer._impl)
         except:
             # Prevent `.close()` from erroring if it was called
             # after a flush exception was raised, trapped and discarded.

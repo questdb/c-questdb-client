@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2023 QuestDB
+ *  Copyright (c) 2019-2024 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-use crate::ingress::{Buffer, CertificateAuthority, SenderBuilder, TimestampNanos, Tls};
+use crate::ingress::{Buffer, Protocol, SenderBuilder, TimestampNanos};
 use crate::tests::mock::{certs_dir, HttpResponse, MockServer};
 use crate::ErrorCode;
 use std::io;
@@ -47,7 +47,7 @@ fn test_two_lines() -> TestResult {
     let buffer2 = buffer.clone();
 
     let mut server = MockServer::new()?;
-    let mut sender = server.lsb().http().connect()?;
+    let mut sender = server.lsb_http().build()?;
 
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
         server.accept()?;
@@ -88,7 +88,7 @@ fn test_text_plain_error() -> TestResult {
     buffer.table("test")?.column_f64("sym", 2.0)?.at_now()?;
 
     let mut server = MockServer::new()?;
-    let mut sender = server.lsb().http().connect()?;
+    let mut sender = server.lsb_http().build()?;
 
     let buffer2 = buffer.clone();
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
@@ -134,7 +134,7 @@ fn test_bad_json_error() -> TestResult {
     buffer.table("test")?.column_f64("sym", 2.0)?.at_now()?;
 
     let mut server = MockServer::new()?;
-    let mut sender = server.lsb().http().connect()?;
+    let mut sender = server.lsb_http().build()?;
 
     let buffer2 = buffer.clone();
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
@@ -182,7 +182,7 @@ fn test_json_error() -> TestResult {
     buffer.table("test")?.column_f64("sym", 2.0)?.at_now()?;
 
     let mut server = MockServer::new()?;
-    let mut sender = server.lsb().http().connect()?;
+    let mut sender = server.lsb_http().build()?;
 
     let buffer2 = buffer.clone();
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
@@ -231,7 +231,7 @@ fn test_no_connection() -> TestResult {
         .column_f64("x", 1.0)?
         .at_now()?;
 
-    let mut sender = SenderBuilder::new("127.0.0.1", 1).http().connect()?;
+    let mut sender = SenderBuilder::new(Protocol::Http, "127.0.0.1", 1).build()?;
     let res = sender.flush_and_keep(&buffer);
     assert!(res.is_err());
     let err = res.unwrap_err();
@@ -252,7 +252,7 @@ fn test_old_server_without_ilp_http_support() -> TestResult {
         .at_now()?;
 
     let mut server = MockServer::new()?;
-    let mut sender = server.lsb().http().connect()?;
+    let mut sender = server.lsb_http().build()?;
 
     let buffer2 = buffer.clone();
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
@@ -299,10 +299,10 @@ fn test_http_basic_auth() -> TestResult {
 
     let mut server = MockServer::new()?;
     let mut sender = server
-        .lsb()
-        .http()
-        .basic_auth("Aladdin", "OpenSesame")
-        .connect()?;
+        .lsb_http()
+        .username("Aladdin")?
+        .password("OpenSesame")?
+        .build()?;
 
     let buffer2 = buffer.clone();
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
@@ -344,7 +344,7 @@ fn test_unauthenticated() -> TestResult {
         .at_now()?;
 
     let mut server = MockServer::new()?;
-    let mut sender = server.lsb().http().connect()?;
+    let mut sender = server.lsb_http().build()?;
 
     let buffer2 = buffer.clone();
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
@@ -392,7 +392,7 @@ fn test_token_auth() -> TestResult {
         .at_now()?;
 
     let mut server = MockServer::new()?;
-    let mut sender = server.lsb().http().token_auth("0123456789").connect()?;
+    let mut sender = server.lsb_http().token("0123456789")?.build()?;
 
     let buffer2 = buffer.clone();
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
@@ -419,7 +419,7 @@ fn test_token_auth() -> TestResult {
 }
 
 #[test]
-fn test_grace_timeout() -> TestResult {
+fn test_request_timeout() -> TestResult {
     let mut buffer = Buffer::new();
     buffer
         .table("test")?
@@ -430,16 +430,19 @@ fn test_grace_timeout() -> TestResult {
     // Here we use a mock (tcp) server instead and don't send a response back.
     let server = MockServer::new()?;
 
-    let grace = Duration::from_millis(50);
+    let request_timeout = Duration::from_millis(50);
     let time_start = std::time::Instant::now();
-    let mut sender = server.lsb().http().grace_timeout(grace).connect()?;
+    let mut sender = server
+        .lsb_http()
+        .request_timeout(request_timeout)?
+        .build()?;
     let res = sender.flush_and_keep(&buffer);
     let time_elapsed = time_start.elapsed();
     assert!(res.is_err());
     let err = res.unwrap_err();
     assert_eq!(err.code(), ErrorCode::SocketError);
     assert!(err.msg().contains("timed out reading response"));
-    assert!(time_elapsed >= grace);
+    assert!(time_elapsed >= request_timeout);
     Ok(())
 }
 
@@ -457,11 +460,7 @@ fn test_tls() -> TestResult {
     let buffer2 = buffer.clone();
 
     let mut server = MockServer::new()?;
-    let mut sender = server
-        .lsb()
-        .http()
-        .tls(Tls::Enabled(CertificateAuthority::File(ca_path)))
-        .connect()?;
+    let mut sender = server.lsb_https().tls_roots(ca_path)?.build()?;
 
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
         server.accept_tls_sync()?;
@@ -496,11 +495,7 @@ fn test_user_agent() -> TestResult {
     let buffer2 = buffer.clone();
 
     let mut server = MockServer::new()?;
-    let mut sender = server
-        .lsb()
-        .http()
-        .user_agent("wallabies/1.2.99")
-        .connect()?;
+    let mut sender = server.lsb_http().user_agent("wallabies/1.2.99")?.build()?;
 
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
         server.accept()?;
@@ -538,10 +533,9 @@ fn test_two_retries() -> TestResult {
 
     let mut server = MockServer::new()?;
     let mut sender = server
-        .lsb()
-        .http()
-        .retry_timeout(Duration::from_secs(30))
-        .connect()?;
+        .lsb_http()
+        .retry_timeout(Duration::from_secs(30))?
+        .build()?;
 
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
         server.accept()?;
@@ -602,10 +596,9 @@ fn test_one_retry() -> TestResult {
 
     let mut server = MockServer::new()?;
     let mut sender = server
-        .lsb()
-        .http()
-        .retry_timeout(Duration::from_millis(19))
-        .connect()?;
+        .lsb_http()
+        .retry_timeout(Duration::from_millis(19))?
+        .build()?;
 
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
         server.accept()?;
@@ -682,7 +675,7 @@ fn test_transactional() -> TestResult {
     assert!(buffer2.transactional());
 
     let mut server = MockServer::new()?;
-    let mut sender = server.lsb().http().transactional().connect()?;
+    let mut sender = server.lsb_http().build()?;
 
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
         server.accept()?;
@@ -695,7 +688,7 @@ fn test_transactional() -> TestResult {
         Ok(())
     });
 
-    let res = sender.flush_and_keep(&buffer1);
+    let res = sender.flush_and_keep_with_flags(&buffer1, true);
     assert!(res.is_err());
     let err = res.unwrap_err();
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
@@ -705,7 +698,7 @@ fn test_transactional() -> TestResult {
         Transactional flushes are only supported for buffers containing lines for a single table."
     );
 
-    let res = sender.flush_and_keep(&buffer2);
+    let res = sender.flush_and_keep_with_flags(&buffer2, true);
 
     server_thread.join().unwrap()?;
 

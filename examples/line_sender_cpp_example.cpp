@@ -8,8 +8,8 @@ static bool example(std::string_view host, std::string_view port)
 {
     try
     {
-        // Connect.
-        questdb::ingress::line_sender sender{host, port};
+        auto sender = questdb::ingress::line_sender::from_conf(
+            "tcp::addr=" + std::string{host} + ":" + std::string{port} + ";");
 
         // We prepare all our table names and column names in advance.
         // If we're inserting multiple rows, this allows us to avoid
@@ -23,8 +23,6 @@ static bool example(std::string_view host, std::string_view port)
         const auto driver_name = "driver"_cn;
 
         questdb::ingress::line_sender_buffer buffer;
-        // 1997-07-04 04:56:55 UTC
-        questdb::ingress::timestamp_nanos designated_timestamp{867992215000000000};
         buffer
             .table(table_name)
             .symbol(id_name, "d6e5fe92-d19f-482a-a97a-c105f547f721"_utf8)
@@ -33,9 +31,7 @@ static bool example(std::string_view host, std::string_view port)
             .column(booked_name, true)
             .column(passengers_name, int64_t{3})
             .column(driver_name, "John Doe"_utf8)
-            .at(designated_timestamp);
-
-        // Call `.at(timestamp_nanos::now())` to use the current system time.
+            .at(questdb::ingress::timestamp_nanos::now());
 
         // To insert more records, call `buffer.table(..)...` again.
 

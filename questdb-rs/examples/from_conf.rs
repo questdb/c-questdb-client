@@ -4,7 +4,7 @@ use questdb::{
 };
 
 fn main() -> Result<()> {
-    let mut sender = Sender::from_conf("https::addr=localhost:9000;username=foo;password=bar;")?;
+    let mut sender = Sender::from_conf("tcp::addr=localhost:9009;")?;
     let mut buffer = Buffer::new();
     buffer
         .table("sensors")?

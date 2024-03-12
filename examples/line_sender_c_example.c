@@ -2,29 +2,28 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <string.h>
+#include "concat.h"
 
 static bool example(const char* host, const char* port)
 {
     line_sender_error* err = NULL;
-    line_sender_opts* opts = NULL;
     line_sender* sender = NULL;
     line_sender_buffer* buffer = NULL;
-
-    line_sender_utf8 host_utf8 = { 0, NULL };
-    if (!line_sender_utf8_init(&host_utf8, strlen(host), host, &err))
+    char* conf_str = concat("tcp::addr=", host, ":", port, ";");
+    if (!conf_str) {
+        fprintf(stderr, "Could not concatenate configuration string.\n");
+        return false;
+    }
+    line_sender_utf8 conf_str_utf8 = { 0, NULL };
+    if (!line_sender_utf8_init(&conf_str_utf8, strlen(conf_str), conf_str, &err))
         goto on_error;
 
-    line_sender_utf8 port_utf8 = { 0, NULL };
-    if (!line_sender_utf8_init(&port_utf8, strlen(port), port, &err))
-        goto on_error;
-
-    // Call `line_sender_opts_new` if instead you have an integer port.
-    opts = line_sender_opts_new_service(host_utf8, port_utf8);
-    sender = line_sender_connect(opts, &err);
-    line_sender_opts_free(opts);
-    opts = NULL;
+    sender = line_sender_from_conf(conf_str_utf8, &err);
     if (!sender)
-        goto on_error;
+        goto on_error;    
+
+    free(conf_str);
+    conf_str = NULL;
 
     buffer = line_sender_buffer_new();
     line_sender_buffer_reserve(buffer, 64 * 1024);  // 64KB buffer initial size.
@@ -85,10 +84,10 @@ static bool example(const char* host, const char* port)
     return true;
 
 on_error: ;
-    line_sender_opts_free(opts);
     size_t err_len = 0;
     const char* err_msg = line_sender_error_msg(err, &err_len);
     fprintf(stderr, "Error running example: %.*s\n", (int)err_len, err_msg);
+    free(conf_str);
     line_sender_error_free(err);
     line_sender_buffer_free(buffer);
     line_sender_close(sender);

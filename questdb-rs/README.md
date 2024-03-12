@@ -1,5 +1,12 @@
 # QuestDB Client Library for Rust
 
+Official Rust client for [QuestDB](https://questdb.io/), an open-source SQL database designed to process time-series data, faster.
+
+The client library is designed for fast ingestion of data into QuestDB via the InfluxDB Line Protocol (ILP).
+
+* [QuestDB Database docs](https://questdb.io/docs/)
+* [ILP docs](https://questdb.io/docs/reference/api/ilp/overview/)
+
 ## Getting Started
 
 To start using `questdb-rs` add it to your `Cargo.toml`:
@@ -23,11 +30,10 @@ use questdb::{
     ingress::{
         Sender,
         Buffer,
-        SenderBuilder,
         TimestampNanos}};
 
 fn main() -> Result<()> {
-   let mut sender = SenderBuilder::new("localhost", 9009).connect()?;
+   let mut sender = Sender::from_conf("http::addr=localhost:9000;")?;
    let mut buffer = Buffer::new();
    buffer
        .table("sensors")?
