@@ -754,7 +754,10 @@ class TestSender(unittest.TestCase):
 
     def test_manifest_yaml(self):
         # Check the manifest file can be read as yaml.
-        import yaml
+        try:
+            import yaml
+        except ImportError:
+            self.skipTest('Python version does not support yaml')
         proj = Project()
         manifest_path = proj.root_dir / 'examples.manifest.yaml'
         with open(manifest_path, 'r') as f:
