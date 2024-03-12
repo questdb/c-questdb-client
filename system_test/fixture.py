@@ -459,6 +459,19 @@ class TlsProxyFixture:
         env = dict(os.environ)
         env['CARGO_TARGET_DIR'] = str(self._target_dir)
         self._log_file = open(self._log_path, 'wb')
+
+        # Compile before running `cargo run`.
+        # Note that errors and output are purpously suppressed.
+        # This is just to exclude the build time from the start-up time.
+        # If there are build errors, they'll be reported later in the `run`
+        # call below.
+        subprocess.call(
+            ['cargo', 'build'],
+            cwd=self._code_dir,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+
         self._proc = subprocess.Popen(
             ['cargo', 'run', str(self.qdb_ilp_port)],
             cwd=self._code_dir,
