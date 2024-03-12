@@ -103,23 +103,23 @@
     host: localhost
     port: 9009
 
- - name: ilp-from-conf
-   lang: c
-   path: examples/line_sender_c_example_from_conf.c
-   header: |-
-     [C client library docs](https://github.com/questdb/c-questdb-client/blob/main/doc/C.md)
-   conf: tcp::addr=localhost:9009;
+- name: ilp-from-conf
+  lang: c
+  path: examples/line_sender_c_example_from_conf.c
+  header: |-
+    [C client library docs](https://github.com/questdb/c-questdb-client/blob/main/doc/C.md)
+  conf: tcp::addr=localhost:9009;
 
- - name: ilp-from-conf
-   lang: cpp
-   path: examples/line_sender_cpp_example_from_conf.cpp
-   header: |-
-     [C client library docs](https://github.com/questdb/c-questdb-client/blob/main/doc/CPP.md)
-   conf: tcp::addr=localhost:9009;
+- name: ilp-from-conf
+  lang: cpp
+  path: examples/line_sender_cpp_example_from_conf.cpp
+  header: |-
+    [C client library docs](https://github.com/questdb/c-questdb-client/blob/main/doc/CPP.md)
+  conf: tcp::addr=localhost:9009;
 
-  - name: ilp-from-conf
-    lang: rust
-    path: questdb-rs/examples/from_conf.rs
-    header: |-
-      [Rust client library docs](https://docs.rs/crate/questdb-rs/latest)
-    conf: tcp::addr=localhost:9009;
+- name: ilp-from-conf
+  lang: rust
+  path: questdb-rs/examples/from_conf.rs
+  header: |-
+    [Rust client library docs](https://docs.rs/crate/questdb-rs/latest)
+  conf: tcp::addr=localhost:9009;
