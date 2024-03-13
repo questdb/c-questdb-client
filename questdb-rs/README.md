@@ -53,7 +53,7 @@ This Rust crate supports a number of optional features.
 For example, if you want to work with ILP/HTTP and work with Chrono timestamps,
 use:
 
-```
+```bash
 cargo add questdb-rs --features ilp-over-http chrono
 ```
 
