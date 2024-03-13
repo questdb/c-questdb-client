@@ -98,12 +98,22 @@ To determine the buffer size, call:
 
 ### Disconnections, Data Errors and troubleshooting
 
-A failure when flushing data gerally indicates that the network connection was
-dropped.
+#### ILP/HTTP
 
-The ILP protocol does not send errors back to the client. Instead, by design,
-it will disconnect a client if it encounters any insertion errors. This is to
-avoid errors going unnoticed.
+When using ILP/HTTP, server errors are reported back to the client from
+`flush` calls.
+
+#### ILP/TCP
+
+When using ILP/TCP errors cause disconnects and can be found
+in the QuestDB server logs.
+
+When using TCP, failure when flushing data gerally indicates that the network
+connection was dropped.
+
+The ILP over TCP protocol does not send errors back to the client.
+Instead, by design, it will disconnect a client if it encounters any insertion
+errors. This is to avoid errors going unnoticed.
 
 As an example, if a client were to insert a `STRING` value into a `BOOLEAN`
 column, the QuestDB server would disconnect the client.

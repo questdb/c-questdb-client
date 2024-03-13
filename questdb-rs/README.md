@@ -46,6 +46,31 @@ fn main() -> Result<()> {
 }
 ```
 
+## Crate features
+
+This Rust crate supports a number of optional features.
+
+For example, if you want to work with ILP/HTTP and work with Chrono timestamps,
+use:
+
+```
+cargo add questdb-rs --features ilp-over-http chrono
+```
+
+### Default-enabled features
+
+* `tls-webpki-certs`: Use the `webpki-roots` crate for TLS cert verification.
+
+### Optional features
+
+These features are opt-in as they bring in additional downstream dependencies.
+
+* `ilp-over-http`: Enables ILP/HTTP support via the `ureq` crate.
+* `tls-native-certs`: Supports validating TLS certificates against the OS's
+  certificates store.
+* `insecure-skip-verify`: Allow skipping TLS validation.
+* `chrono_timestamp`: Allows specifying timestamps as `chrono::Datetime` objects.
+
 ## C, C++ and Python APIs
 
 This crate is also exposed as a C and C++ API and in turn exposed to Python.

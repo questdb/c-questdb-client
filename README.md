@@ -4,7 +4,7 @@
 This library makes it easy to insert data into [QuestDB](https://questdb.io/).
 
 This client library implements the [InfluxDB Line Protocol](
-https://questdb.io/docs/reference/api/ilp/overview/) (ILP) over TCP.
+https://questdb.io/docs/reference/api/ilp/overview/) (ILP) over TCP or HTTP.
 
 * Implementation is in Rust, with no additional
   [run-time or link-time dependencies](doc/BUILD.md#pre-requisites-and-dependencies)
@@ -16,21 +16,21 @@ https://questdb.io/docs/reference/api/ilp/overview/) (ILP) over TCP.
 
 ## Insertion Protocols Overview
 
-Inserting data into QuestDB can be done via one of three protocols.
+Inserting data into QuestDB can be done in several ways.
+
+This library supports ILP/HTTP (default-recommended) and ILP/TCP (specific
+streaming use cases).
 
 | Protocol | Record Insertion Reporting | Data Insertion Performance |
 | -------- | -------------------------- | -------------------------- |
-| [ILP](https://questdb.io/docs/reference/api/ilp/overview/)| Errors in logs; Disconnect on error | **Best** |
+| **[ILP/HTTP](https://questdb.io/docs/reference/api/ilp/overview/)** | Transaction-level (on flush) | **Excellent** |
+| [ILP/TCP](https://questdb.io/docs/reference/api/ilp/overview/)| Errors in logs; Disconnect on error | **Best** (tolerates higher latency networks) |
 | [CSV Upload via HTTP](https://questdb.io/docs/reference/api/rest/#imp---import-data) | Configurable | Very Good |
 | [PostgreSQL](https://questdb.io/docs/reference/api/postgres/) | Transaction-level | Good |
 
-This library implements the **ILP protocol** and mitigates the lack of confirmation
-and error reporting by validating data ahead of time before any data is sent
-to the database instance.
-
-For example, the client library will report that a supplied string isn't encoded
-in UTF-8. Some issues unfortunately can't be caught by the library and require
-some [care and diligence to avoid data problems](doc/CONSIDERATIONS.md).
+Server errors are only reported back to the client for ILP/HTTP.
+See the [flush troubleshooting](doc/CONSIDERATIONS.md) docs for more details on
+how to debug ILP/TCP.
 
 For an overview and code examples, see the
 [ILP page of the developer docs](https://questdb.io/docs/develop/insert-data/#influxdb-line-protocol).
