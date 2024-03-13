@@ -105,7 +105,7 @@ When using ILP/HTTP, server errors are reported back to the client from
 
 #### ILP/TCP
 
-When using ILP/TCP errors cause disconnects and can be found
+When using ILP/TCP, errors which cause disconnects can be found
 in the QuestDB server logs.
 
 When using TCP, failure when flushing data gerally indicates that the network
