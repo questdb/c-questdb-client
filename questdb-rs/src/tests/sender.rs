@@ -469,3 +469,22 @@ fn test_tls_insecure_skip_verify() -> TestResult {
     assert_eq!(server.msgs[0].as_str(), exp);
     Ok(())
 }
+
+#[test]
+fn bad_uppercase_protocol() {
+    let res = Sender::from_conf("TCP::addr=localhost:9009;");
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert!(err.code() == ErrorCode::ConfigError);
+    assert!(err.msg() == "Unsupported protocol: TCP");
+}
+
+#[test]
+fn bad_uppercase_addr() {
+    let res = Sender::from_conf("tcp::ADDR=localhost:9009;");
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    eprint!("err: {:?}", err);
+    assert!(err.code() == ErrorCode::ConfigError);
+    assert!(err.msg() == "Missing \"addr\" parameter in config string");
+}

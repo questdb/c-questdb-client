@@ -1592,8 +1592,8 @@ fn configure_tls(
     Ok(Some(Arc::new(config)))
 }
 
-fn validate_auto_flush_params(params: &HashMap<String, &String>) -> Result<()> {
-    if let Some(&auto_flush) = params.get("auto_flush") {
+fn validate_auto_flush_params(params: &HashMap<String, String>) -> Result<()> {
+    if let Some(auto_flush) = params.get("auto_flush") {
         if auto_flush.as_str() != "off" {
             return Err(error::fmt!(
                 ConfigError,
@@ -1692,7 +1692,7 @@ impl Protocol {
     }
 
     fn from_schema(schema: &str) -> Result<Self> {
-        match schema.to_lowercase().as_str() {
+        match schema {
             "tcp" => Ok(Protocol::Tcp),
             "tcps" => Ok(Protocol::Tcps),
             #[cfg(feature = "ilp-over-http")]
@@ -1804,14 +1804,10 @@ impl SenderBuilder {
         let conf = conf.as_ref();
         let conf = questdb_confstr::parse_conf_str(conf)
             .map_err(|e| error::fmt!(ConfigError, "Config parse error: {}", e))?;
-        let service = conf.service().to_lowercase();
-        let params = conf
-            .params()
-            .iter()
-            .map(|(k, v)| (k.to_lowercase(), v))
-            .collect::<HashMap<_, _>>();
+        let service = conf.service();
+        let params = conf.params();
 
-        let protocol = Protocol::from_schema(service.as_str())?;
+        let protocol = Protocol::from_schema(service)?;
 
         let Some(addr) = params.get("addr") else {
             return Err(error::fmt!(
@@ -1825,7 +1821,7 @@ impl SenderBuilder {
         };
         let mut builder = SenderBuilder::new(protocol, host, port);
 
-        validate_auto_flush_params(&params)?;
+        validate_auto_flush_params(params)?;
 
         for (key, val) in params.iter().map(|(k, v)| (k.as_str(), v.as_str())) {
             builder = match key {
