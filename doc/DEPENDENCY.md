@@ -43,7 +43,8 @@ In all examples below, we will attempt to compile:
 
 int main()
 {
-    questdb::ingress::line_sender sender{"localhost", 9009};
+    auto sender = questdb::ingress::line_sender::from_conf(
+        "http::addr=localhost:9000;");
     return 0;
 }
 ```
