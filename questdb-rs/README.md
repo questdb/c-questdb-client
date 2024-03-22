@@ -1,15 +1,17 @@
 # QuestDB Client Library for Rust
 
-Official Rust client for [QuestDB](https://questdb.io/), an open-source SQL database designed to process time-series data, faster.
+Official Rust client for [QuestDB](https://questdb.io/), an open-source SQL
+database designed to process time-series data, faster.
 
-The client library is designed for fast ingestion of data into QuestDB via the InfluxDB Line Protocol (ILP).
+The client library is designed for fast ingestion of data into QuestDB via the
+InfluxDB Line Protocol (ILP).
 
 * [QuestDB Database docs](https://questdb.io/docs/)
 * [ILP docs](https://questdb.io/docs/reference/api/ilp/overview/)
 
 ## Getting Started
 
-To start using `questdb-rs` add it to your `Cargo.toml`:
+To start using `questdb-rs`, add it to your `Cargo.toml`:
 
 ```toml
 [dependencies]
@@ -18,9 +20,12 @@ questdb-rs = "4.0.0"
 
 ## Docs
 
-See documentation for the [`ingress`](https://docs.rs/questdb-rs/4.0.0/questdb/ingress/) module to insert data into QuestDB via the ILP protocol.
+See documentation for the
+[`ingress`](https://docs.rs/questdb-rs/4.0.0/questdb/ingress/) module to insert
+data into QuestDB via the ILP protocol.
 
-* Latest API docs: [https://docs.rs/questdb-rs/latest/](https://docs.rs/questdb-rs/latest/)
+* Latest API docs:
+  [https://docs.rs/questdb-rs/latest/](https://docs.rs/questdb-rs/latest/)
 
 ## Example
 

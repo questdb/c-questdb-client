@@ -26,12 +26,17 @@
 //!
 //! The `ingress` module implements QuestDB's variant of the
 //! [InfluxDB Line Protocol](https://questdb.io/docs/reference/api/ilp/overview/)
-//! (ILP) over TCP.
+//! (ILP) over HTTP and TCP. We recommend using HTTP, and consider TCP as a
+//! legacy protocol variant.
 //!
 //! To get started:
-//!   * Connect to QuestDB by creating a [`Sender`] object, usually via [`Sender::from_conf`].
-//!   * Populate a [`Buffer`] with one or more rows of data.
-//!   * Send the buffer via the Sender's [`flush`](Sender::flush) method.
+//!   * Make sure you have the dependency with the HTTP feature enabled:
+//!
+//! ```cargo add questdb-rs --features ilp-over-http```
+//!
+//!   * Use [`Sender::from_conf()`] to get the [`Sender`] object
+//!   * Populate a [`Buffer`] with one or more rows of data
+//!   * Send the buffer using [`sender.flush()`](Sender::flush)
 //!
 //! ```rust no_run
 //! use questdb::{
@@ -43,87 +48,147 @@
 //!
 //! fn main() -> Result<()> {
 //!    let mut sender = Sender::from_conf("http::addr=localhost:9000;")?;
-//!    let mut buffer = Buffer::new();
-//!    buffer
+//!    let mut buf = Buffer::new();
+//!    buf
 //!        .table("sensors")?
 //!        .symbol("id", "toronto1")?
 //!        .column_f64("temperature", 20.0)?
 //!        .column_i64("humidity", 50)?
 //!        .at(TimestampNanos::now())?;
-//!    sender.flush(&mut buffer)?;
+//!    sender.flush(&mut buf)?;
 //!    Ok(())
 //! }
 //! ```
 //!
-//! # Flushing
+//! # Unified APIs: configuration string and builder API
 //!
-//! The Sender's [`flush`](Sender::flush) method will clear the buffer
-//! which is then reusable for another batch of rows.
+//! In addition to the configuration string, we provide the [`SenderBuilder`] to
+//! programmatically configure the sender. The methods on this struct match
+//! one-for-one the keys in the configuration string. To get documentation on
+//! configuration string options, refer to the docs on [`SenderBuilder`] methods.
 //!
-//! Dropping the sender will close the connection to QuestDB and any unflushed
-//! messages will be lost: In other words, *do not forget to
-//! [`flush`](Sender::flush) before closing the connection!*
+//! # Authentication
 //!
-//! A common technique is to flush periodically on a timer and/or once the
-//! buffer exceeds a certain size.
-//! You can check the buffer's size by the calling Buffer's [`len`](Buffer::len)
-//! method.
+//! To establish an [authenticated](https://questdb.io/docs/reference/api/ilp/overview/#authentication)
+//! and TLS-encrypted connection, use the `https` or `tcps` protocol, and use the
+//! configuration options appropriate for the authentication method.
 //!
-//! Note that flushing will automatically clear the buffer's contents.
-//! If you'd rather preserve the contents (for example, to send the same data to
-//! multiple QuestDB instances), you can call
-//! [`flush_and_keep`](Sender::flush_and_keep) instead.
+//! Here are quick examples of configuration strings for each authentication method
+//! we support:
 //!
-//! # Connection Security Options
-//!
-//! To establish an [authenticated](https://questdb.io/docs/reference/api/ilp/authenticate)
-//! and TLS-encrypted connection, call the SenderBuilder's authentication and tls methods.
-//!
-//! Here's an example that uses full security with TCP:
+//! * HTTP Token Bearer Auth:
 //!
 //! ```no_run
-//! # use questdb::Result;
-//! use questdb::ingress::{Protocol, SenderBuilder};
-//!
-//! # fn main() -> Result<()> {
-//! // See: https://questdb.io/docs/reference/api/ilp/authenticate
-//! let mut sender = SenderBuilder::new(Protocol::Tcps, "localhost", 9009)
-//!     .username("testUser1")? // kid
-//!     .token("5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48")? // d
-//!     .token_x("fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU")? // x
-//!     .token_y("Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac")? // y
-//!     .build()?;
-//! # Ok(())
-//! # }
+//! let mut sender = Sender::from_conf(
+//!     "https::addr=localhost:9000;token=Yfym3fgMv0B9;"
+//! )?;
 //! ```
 //!
-//! Note that Open Source QuestDB does not natively support TLS
-//! encryption (this is a QuestDB enterprise feature).
+//! * HTTP Basic Auth:
 //!
+//! ```no_run
+//! let mut sender = Sender::from_conf(
+//!     "https::addr=localhost:9000;username=testUser1;password=Yfym3fgMv0B9;"
+//! )?;
+//! ```
+//!
+//! * TCP ECDSA:
+//!
+//! ```no_run
+//! let mut sender = Sender::from_conf(
+//!     "tcps::addr=localhost:9009;username=testUser1;token=5UjEA0;token_x=fLKYa9;token_y=bS1dEfy"
+//! )?;
+//! ```
+//! The four components are:
+//!
+//! * `username` aka. _kid_
+//! * `token` aka. _d_
+//! * `token_x` aka. _x_
+//! * `token_y` aka. _y_
+//!
+//! You can specify how long the client should wait for the authentication request
+//! to resolve. The configuration parameter is `auth_timeout`, and the value is in
+//! milliseconds. The default is 15 seconds.
+//!
+//! ## Encryption on the wire: TLS
+//!
+//! Note that Open Source QuestDB does not natively support TLS
+//! encryption (this is a QuestDB enterprise feature). To enable TLS on the server,
+//! refer to the [QuestDB Enterprise TLS documentation](https://questdb.io/docs/operations/tls/).
 //! To use TLS with QuestDB open source, use a TLS proxy such as
 //! [HAProxy](http://www.haproxy.org/).
 //!
-//! For testing, you can use a self-signed certificate and key.
+//! We support several certification authorities (sources of PKI root certificates).
+//! To select one, use the `tls_ca` config option. These are the supported values:
 //!
-//! See our notes on [how to generate keys that this library will
-//! accept](https://github.com/questdb/c-questdb-client/tree/main/tls_certs).
+//! * `webpki_roots`: use the roots provided in the standard Rust crate
+//! [webpki-roots](https://crates.io/crates/webpki-roots)
 //!
-//! From the API, you can then point to a custom CA file:
+//! *  `os_roots`: use the OS-provided certificate store
+//!
+//! * `webpki_and_os_roots`: combine both of the above
+//!
+//! * `pem_file`: specify the path to the PEM file with root certificates. Main purpose
+//!    is for testing with self-signed certificates.
+//!
+//! See our notes on [how to generate keys that the QuestDB client will
+//! accept](https://github.com/questdb/c-questdb-client/tree/main/tls_certs), and
+//! then point the client to the PEM file:
 //!
 //! ```no_run
-//! # use questdb::Result;
-//! use std::path::PathBuf;
-//! use questdb::ingress::{SenderBuilder, Protocol, CertificateAuthority};
-//!
-//! # fn main() -> Result<()> {
-//! let mut sender = SenderBuilder::new(Protocol::Tcps, "localhost", 9009)
-//!     .tls_roots("/path/to/server_rootCA.pem")?
-//!     .build()?;
-//! # Ok(())
-//! # }
+//! let mut sender = Sender::from_conf(
+//!     "https::addr=localhost:9000;tls_roots=/path/to/root-ca.pem"
+//! )?;
 //! ```
 //!
-//! # Avoiding revalidating names
+//! *Note:* when you provide the `tls_roots` option, you don't have to redundantly
+//! specify `tls_ca=pem_file`, this is selected automatically.
+//!
+//! The option `tls_verify=unsafe_off` allows you to disable the verification of the
+//! server's certificate. You can use it as a last resort, when you weren't able to
+//! apply the above approach with a self-signed certificate. You should never use it
+//! in production as it defeats security and allows a man-in-the middle attack.
+//!
+//! # HTTP timeouts
+//!
+//! Instead of a fixed timeout value, we use a flexible timeout that depends on the
+//! size of the HTTP request payload (how much data is in the buffer that you're
+//! flushing). You can configure it using two options:
+//!
+//! * `request_timeout` (milliseconds, default 10 seconds): how much to wait for the
+//!    response from the server, before starting to send the payload.
+//! * `request_min_throughput` (bytes per second, default 100 KiB/s): divide the
+//!   payload size by this number to determine for how long to keep sending the
+//!   payload before timing out.
+//!
+//! Finally, the client will keep retrying the request if it experiences errors. You
+//! can configure the total time budget for retrying:
+//!
+//! * `retry_timeout` (milliseconds, default 10 seconds)
+//!
+//! # Flushing
+//!
+//! [`sender.flush(&mut buf)`](Sender::flush) clears the buffer, making it ready for
+//! another batch of rows.
+//!
+//! Make sure you've flushed the buffer before dropping it. Otherwise, any messages
+//! still left in it will silently disappear.
+//!
+//! A common technique is to flush periodically on a timer and/or once the buffer
+//! exceeds a certain size. You can check the buffer's size by the calling
+//! [`buf.len()`](Buffer::len).
+//!
+//! Flushing automatically clears the buffer. If you want to preserve its contents
+//! (for example, to send the same data to multiple QuestDB instances), call
+//! [`flush_and_keep`](Sender::flush_and_keep) instead.
+//!
+//! # Buffer API sequential coupling
+//!
+//! Symbols must always be written before rows. See the [`Buffer`] documentation
+//! for details. Each row must be terminated with a call to either
+//! [`at`](Buffer::at) or [`at_now`](Buffer::at_now).
+//!
+//! # Optimization: avoid revalidating names
 //! To avoid re-validating table and column names, consider re-using them across
 //! rows.
 //!
@@ -136,27 +201,21 @@
 //!     TimestampNanos};
 //!
 //! # fn main() -> Result<()> {
-//! let mut buffer = Buffer::new();
+//! let mut buf = Buffer::new();
 //! let tide_name = TableName::new("tide")?;
 //! let water_level_name = ColumnName::new("water_level")?;
-//! buffer.table(tide_name)?.column_f64(water_level_name, 20.4)?.at(TimestampNanos::now())?;
-//! buffer.table(tide_name)?.column_f64(water_level_name, 17.2)?.at(TimestampNanos::now())?;
+//! buf.table(tide_name)?.column_f64(water_level_name, 20.4)?.at(TimestampNanos::now())?;
+//! buf.table(tide_name)?.column_f64(water_level_name, 17.2)?.at(TimestampNanos::now())?;
 //! # Ok(())
 //! # }
 //! ```
 //!
-//! # Buffer API sequential coupling
-//!
-//! Symbols must always be written before rows. See the [`Buffer`] documentation
-//! for details. Each row must be terminated with a call to either
-//! [`at`](Buffer::at) or [`at_now`](Buffer::at_now).
-//!
 //! # Considerations
 //!
-//! The [Library considerations](https://github.com/questdb/c-questdb-client/blob/main/doc/CONSIDERATIONS.md) documentation
-//! goes through:
-//!   * Threading.
-//!   * Differences between ILP vs QuestDB Data Types.
+//! The [Library considerations](https://github.com/questdb/c-questdb-client/blob/main/doc/CONSIDERATIONS.md)
+//! document covers these topics:
+//!   * Threading
+//!   * Differences between ILP and QuestDB Data Types
 //!   * Data Quality
 //!   * Client-side checks and server errors
 //!   * Flushing
@@ -166,18 +225,17 @@
 //!
 //! ## Infrequent Flushing
 //!
-//! You may not see data appear in a timely manner because you’re not calling
-//! the [`flush`](Sender::flush) method often enough.
+//! If the data doesn't appear in the database in a timely manner, you may not be
+//! calling [`flush()`](Sender::flush) often enough.
 //!
-//! ## Debugging disconnects and inspecting errors
+//! ## Debug disconnects and inspect errors
 //!
-//! The ILP protocol does not send errors back to the client.
-//! Instead, on error, the QuestDB server will disconnect and any error messages
-//! will be present in the
-//! [server logs](https://questdb.io/docs/troubleshooting/log/).
+//! If you're using the legacy ILP-over-TCP, it doesn't report any errors to the
+//! client. Instead, on error, the server terminates the connection, and logs
+//! any error messages in [server logs](https://questdb.io/docs/troubleshooting/log/).
 //!
-//! If you want to inspect or log a buffer's contents before it is sent, you
-//! can call its [`as_str`](Buffer::as_str) method.
+//! To inspect or log a buffer's contents before you send it, call
+//! [`buf.as_str()`](Buffer::as_str).
 //!
 
 pub use self::timestamp::*;
@@ -612,7 +670,7 @@ impl BufferState {
     }
 }
 
-/// A reusable buffer to prepare ILP messages.
+/// A reusable buffer to prepare a batch of ILP messages.
 ///
 /// # Example
 ///
@@ -621,10 +679,10 @@ impl BufferState {
 /// use questdb::ingress::{Buffer, TimestampMicros, TimestampNanos};
 ///
 /// # fn main() -> Result<()> {
-/// let mut buffer = Buffer::new();
+/// let mut buf = Buffer::new();
 ///
 /// // first row
-/// buffer
+/// buf
 ///     .table("table1")?
 ///     .symbol("bar", "baz")?
 ///     .column_bool("a", false)?
@@ -635,7 +693,7 @@ impl BufferState {
 ///     .at(TimestampNanos::now())?;
 ///
 /// // second row
-/// buffer
+/// buf
 ///     .table("table2")?
 ///     .symbol("foo", "bar")?
 ///     .at(TimestampNanos::now())?;
@@ -643,8 +701,7 @@ impl BufferState {
 /// # }
 /// ```
 ///
-/// The buffer can then be sent with the Sender's [`flush`](Sender::flush)
-/// method.
+/// Send the buffer to QuestDB using [`sender.flush(&mut buf)`](Sender::flush).
 ///
 /// # Sequential Coupling
 /// The Buffer API is sequentially coupled:
@@ -660,7 +717,7 @@ impl BufferState {
 ///   * A row must be terminated with either [`at`](Buffer::at) or
 ///     [`at_now`](Buffer::at_now).
 ///
-/// This diagram might help:
+/// This diagram visualizes the sequence:
 ///
 /// <img src="https://raw.githubusercontent.com/questdb/c-questdb-client/main/api_seq/seq.svg">
 ///
@@ -675,12 +732,13 @@ impl BufferState {
 /// | [`column_str`](Buffer::column_str) | [`STRING`](https://questdb.io/docs/reference/api/ilp/columnset-types#string) |
 /// | [`column_ts`](Buffer::column_ts) | [`TIMESTAMP`](https://questdb.io/docs/reference/api/ilp/columnset-types#timestamp) |
 ///
-/// QuestDB supports both `STRING` columns and `SYMBOL` column types.
+/// QuestDB supports both `STRING` and `SYMBOL` column types.
 ///
 /// To understand the difference refer to the
-/// [QuestDB documentation](https://questdb.io/docs/concept/symbol/), but in
-/// short symbols are interned strings that are most suitable for identifiers
-/// that you expect to be repeated throughout the column.
+/// [QuestDB documentation](https://questdb.io/docs/concept/symbol/). In a nutshell,
+/// symbols are interned strings that are most suitable for identifiers that you
+/// expect to be repeated throughout the column. They offer an advantage in storage
+/// space and query performance.
 ///
 /// # Inserting NULL values
 ///
@@ -688,13 +746,13 @@ impl BufferState {
 ///
 /// # Recovering from validation errors
 ///
-/// If you want to recover from potential validation errors, you can use the
-/// [`set_marker`](Buffer::set_marker) method to track a last known good state,
-/// append as many rows or parts of rows as you like and then call
-/// [`clear_marker`](Buffer::clear_marker) on success.
+/// If you want to recover from potential validation errors, call
+/// [`buf.set_marker()`](Buffer::set_marker) to track the last known good state,
+/// append as many rows or parts of rows as you like, and then call
+/// [`buf.clear_marker()`](Buffer::clear_marker) on success.
 ///
-/// If there was an error in one of the table names or other, you can use the
-/// [`rewind_to_marker`](Buffer::rewind_to_marker) method to go back to the
+/// If there was an error in one of the rows, use
+/// [`buf.rewind_to_marker()`](Buffer::rewind_to_marker) to go back to the
 /// marked last known good state.
 ///
 #[derive(Debug, Clone)]
@@ -725,9 +783,9 @@ impl Buffer {
     /// If the server does not configure it the default is `127` and you might
     /// as well call [`new`](Buffer::new).
     pub fn with_max_name_len(max_name_len: usize) -> Self {
-        let mut buffer = Self::new();
-        buffer.max_name_len = max_name_len;
-        buffer
+        let mut buf = Self::new();
+        buf.max_name_len = max_name_len;
+        buf
     }
 
     /// Pre-allocate to ensure the buffer has enough capacity for at least the
@@ -857,8 +915,8 @@ impl Buffer {
     /// # use questdb::Result;
     /// # use questdb::ingress::Buffer;
     /// # fn main() -> Result<()> {
-    /// # let mut buffer = Buffer::new();
-    /// buffer.table("table_name")?;
+    /// # let mut buf = Buffer::new();
+    /// buf.table("table_name")?;
     /// # Ok(())
     /// # }
     /// ```
@@ -871,9 +929,9 @@ impl Buffer {
     /// use questdb::ingress::TableName;
     ///
     /// # fn main() -> Result<()> {
-    /// # let mut buffer = Buffer::new();
+    /// # let mut buf = Buffer::new();
     /// let table_name = TableName::new("table_name")?;
-    /// buffer.table(table_name)?;
+    /// buf.table(table_name)?;
     /// # Ok(())
     /// # }
     /// ```
@@ -905,9 +963,9 @@ impl Buffer {
     /// # use questdb::Result;
     /// # use questdb::ingress::Buffer;
     /// # fn main() -> Result<()> {
-    /// # let mut buffer = Buffer::new();
-    /// # buffer.table("x")?;
-    /// buffer.symbol("col_name", "value")?;
+    /// # let mut buf = Buffer::new();
+    /// # buf.table("x")?;
+    /// buf.symbol("col_name", "value")?;
     /// # Ok(())
     /// # }
     /// ```
@@ -918,10 +976,10 @@ impl Buffer {
     /// # use questdb::Result;
     /// # use questdb::ingress::Buffer;
     /// # fn main() -> Result<()> {
-    /// # let mut buffer = Buffer::new();
-    /// # buffer.table("x")?;
+    /// # let mut buf = Buffer::new();
+    /// # buf.table("x")?;
     /// let value: String = "value".to_owned();
-    /// buffer.symbol("col_name", value)?;
+    /// buf.symbol("col_name", value)?;
     /// # Ok(())
     /// # }
     /// ```
@@ -934,10 +992,10 @@ impl Buffer {
     /// use questdb::ingress::ColumnName;
     ///
     /// # fn main() -> Result<()> {
-    /// # let mut buffer = Buffer::new();
-    /// # buffer.table("x")?;
+    /// # let mut buf = Buffer::new();
+    /// # buf.table("x")?;
     /// let col_name = ColumnName::new("col_name")?;
-    /// buffer.symbol(col_name, "value")?;
+    /// buf.symbol(col_name, "value")?;
     /// # Ok(())
     /// # }
     /// ```
@@ -985,9 +1043,9 @@ impl Buffer {
     /// # use questdb::Result;
     /// # use questdb::ingress::Buffer;
     /// # fn main() -> Result<()> {
-    /// # let mut buffer = Buffer::new();
-    /// # buffer.table("x")?;
-    /// buffer.column_bool("col_name", true)?;
+    /// # let mut buf = Buffer::new();
+    /// # buf.table("x")?;
+    /// buf.column_bool("col_name", true)?;
     /// # Ok(())
     /// # }
     /// ```
@@ -1000,10 +1058,10 @@ impl Buffer {
     /// use questdb::ingress::ColumnName;
     ///
     /// # fn main() -> Result<()> {
-    /// # let mut buffer = Buffer::new();
-    /// # buffer.table("x")?;
+    /// # let mut buf = Buffer::new();
+    /// # buf.table("x")?;
     /// let col_name = ColumnName::new("col_name")?;
-    /// buffer.column_bool(col_name, true)?;
+    /// buf.column_bool(col_name, true)?;
     /// # Ok(())
     /// # }
     /// ```
@@ -1023,9 +1081,9 @@ impl Buffer {
     /// # use questdb::Result;
     /// # use questdb::ingress::Buffer;
     /// # fn main() -> Result<()> {
-    /// # let mut buffer = Buffer::new();
-    /// # buffer.table("x")?;
-    /// buffer.column_i64("col_name", 42)?;
+    /// # let mut buf = Buffer::new();
+    /// # buf.table("x")?;
+    /// buf.column_i64("col_name", 42)?;
     /// # Ok(())
     /// # }
     /// ```
@@ -1038,10 +1096,10 @@ impl Buffer {
     /// use questdb::ingress::ColumnName;
     ///
     /// # fn main() -> Result<()> {
-    /// # let mut buffer = Buffer::new();
-    /// # buffer.table("x")?;
+    /// # let mut buf = Buffer::new();
+    /// # buf.table("x")?;
     /// let col_name = ColumnName::new("col_name")?;
-    /// buffer.column_i64(col_name, 42);
+    /// buf.column_i64(col_name, 42);
     /// # Ok(())
     /// # }
     /// ```
@@ -1064,9 +1122,9 @@ impl Buffer {
     /// # use questdb::Result;
     /// # use questdb::ingress::Buffer;
     /// # fn main() -> Result<()> {
-    /// # let mut buffer = Buffer::new();
-    /// # buffer.table("x")?;
-    /// buffer.column_f64("col_name", 3.14)?;
+    /// # let mut buf = Buffer::new();
+    /// # buf.table("x")?;
+    /// buf.column_f64("col_name", 3.14)?;
     /// # Ok(())
     /// # }
     /// ```
@@ -1079,10 +1137,10 @@ impl Buffer {
     /// use questdb::ingress::ColumnName;
     ///
     /// # fn main() -> Result<()> {
-    /// # let mut buffer = Buffer::new();
-    /// # buffer.table("x")?;
+    /// # let mut buf = Buffer::new();
+    /// # buf.table("x")?;
     /// let col_name = ColumnName::new("col_name")?;
-    /// buffer.column_f64(col_name, 3.14)?;
+    /// buf.column_f64(col_name, 3.14)?;
     /// # Ok(())
     /// # }
     /// ```
@@ -1103,9 +1161,9 @@ impl Buffer {
     /// # use questdb::Result;
     /// # use questdb::ingress::Buffer;
     /// # fn main() -> Result<()> {
-    /// # let mut buffer = Buffer::new();
-    /// # buffer.table("x")?;
-    /// buffer.column_str("col_name", "value")?;
+    /// # let mut buf = Buffer::new();
+    /// # buf.table("x")?;
+    /// buf.column_str("col_name", "value")?;
     /// # Ok(())
     /// # }
     /// ```
@@ -1116,10 +1174,10 @@ impl Buffer {
     /// # use questdb::Result;
     /// # use questdb::ingress::Buffer;
     /// # fn main() -> Result<()> {
-    /// # let mut buffer = Buffer::new();
-    /// # buffer.table("x")?;
+    /// # let mut buf = Buffer::new();
+    /// # buf.table("x")?;
     /// let value: String = "value".to_owned();
-    /// buffer.column_str("col_name", value)?;
+    /// buf.column_str("col_name", value)?;
     /// # Ok(())
     /// # }
     /// ```
@@ -1132,10 +1190,10 @@ impl Buffer {
     /// use questdb::ingress::ColumnName;
     ///
     /// # fn main() -> Result<()> {
-    /// # let mut buffer = Buffer::new();
-    /// # buffer.table("x")?;
+    /// # let mut buf = Buffer::new();
+    /// # buf.table("x")?;
     /// let col_name = ColumnName::new("col_name")?;
-    /// buffer.column_str(col_name, "value")?;
+    /// buf.column_str(col_name, "value")?;
     /// # Ok(())
     /// # }
     /// ```
@@ -1157,9 +1215,9 @@ impl Buffer {
     /// # use questdb::ingress::Buffer;
     /// use questdb::ingress::TimestampMicros;
     /// # fn main() -> Result<()> {
-    /// # let mut buffer = Buffer::new();
-    /// # buffer.table("x")?;
-    /// buffer.column_ts("col_name", TimestampMicros::now())?;
+    /// # let mut buf = Buffer::new();
+    /// # buf.table("x")?;
+    /// buf.column_ts("col_name", TimestampMicros::now())?;
     /// # Ok(())
     /// # }
     /// ```
@@ -1172,9 +1230,9 @@ impl Buffer {
     /// use questdb::ingress::TimestampMicros;
     ///
     /// # fn main() -> Result<()> {
-    /// # let mut buffer = Buffer::new();
-    /// # buffer.table("x")?;
-    /// buffer.column_ts("col_name", TimestampMicros::new(1659548204354448))?;
+    /// # let mut buf = Buffer::new();
+    /// # buf.table("x")?;
+    /// buf.column_ts("col_name", TimestampMicros::new(1659548204354448))?;
     /// # Ok(())
     /// # }
     /// ```
@@ -1188,10 +1246,10 @@ impl Buffer {
     /// use questdb::ingress::ColumnName;
     ///
     /// # fn main() -> Result<()> {
-    /// # let mut buffer = Buffer::new();
-    /// # buffer.table("x")?;
+    /// # let mut buf = Buffer::new();
+    /// # buf.table("x")?;
     /// let col_name = ColumnName::new("col_name")?;
-    /// buffer.column_ts(col_name, TimestampMicros::now())?;
+    /// buf.column_ts(col_name, TimestampMicros::now())?;
     /// # Ok(())
     /// # }
     /// ```
@@ -1226,9 +1284,9 @@ impl Buffer {
     /// # use questdb::ingress::Buffer;
     /// use questdb::ingress::TimestampNanos;
     /// # fn main() -> Result<()> {
-    /// # let mut buffer = Buffer::new();
-    /// # buffer.table("x")?.symbol("a", "b")?;
-    /// buffer.at(TimestampNanos::now())?;
+    /// # let mut buf = Buffer::new();
+    /// # buf.table("x")?.symbol("a", "b")?;
+    /// buf.at(TimestampNanos::now())?;
     /// # Ok(())
     /// # }
     /// ```
@@ -1241,9 +1299,9 @@ impl Buffer {
     /// use questdb::ingress::TimestampNanos;
     ///
     /// # fn main() -> Result<()> {
-    /// # let mut buffer = Buffer::new();
-    /// # buffer.table("x")?.symbol("a", "b")?;
-    /// buffer.at(TimestampNanos::new(1659548315647406592))?;
+    /// # let mut buf = Buffer::new();
+    /// # buf.table("x")?.symbol("a", "b")?;
+    /// buf.at(TimestampNanos::new(1659548315647406592))?;
     /// # Ok(())
     /// # }
     /// ```
@@ -1298,9 +1356,9 @@ impl Buffer {
     /// # use questdb::Result;
     /// # use questdb::ingress::Buffer;
     /// # fn main() -> Result<()> {
-    /// # let mut buffer = Buffer::new();
-    /// # buffer.table("x")?.symbol("a", "b")?;
-    /// buffer.at_now()?;
+    /// # let mut buf = Buffer::new();
+    /// # buf.table("x")?.symbol("a", "b")?;
+    /// buf.at_now()?;
     /// # Ok(())
     /// # }
     /// ```
@@ -1781,25 +1839,27 @@ pub struct SenderBuilder {
 }
 
 impl SenderBuilder {
-    /// Create a new `SenderBuilder` instance from configuration string.
+    /// Create a new `SenderBuilder` instance from the configuration string.
     ///
     /// The format of the string is: `"http::addr=host:port;key=value;...;"`.
     ///
-    /// Alongside `"http"` you can also specify `"https"`, `"tcp"`, and `"tcps"`.
+    /// Instead of `"http"`, you can also specify `"https"`, `"tcp"`, and `"tcps"`.
     ///
-    /// HTTP is recommended in most cases as is provides better error feedback
-    /// allows controlling transactions. TCP can sometimes be faster in higher-latency
-    /// networks, but misses out on a number of features.
+    /// We recommend HTTP for most cases because it provides more features, like
+    /// reporting errors to the client and supporting transaction control. TCP can
+    /// sometimes be faster in higher-latency networks, but misses a number of
+    /// features.
     ///
-    /// The accepted set of keys and values is the same as for the `SenderBuilder`'s API.
+    /// Keys in the config string correspond to same-named methods on `SenderBuilder`.
     ///
     /// E.g. `"https::addr=host:port;username=alice;password=secret;tls_ca=os_roots;"`.
     ///
-    /// If you prefer, you can also load the configuration from an environment variable.
-    /// See [`SenderBuilder::from_env`].
+    /// You can also load the configuration from an environment variable. See
+    /// [`SenderBuilder::from_env`].
     ///
-    /// Once a `SenderBuilder` is created from a string (or from the environment variable)
-    /// it can be further customized before calling [`SenderBuilder::build`].
+    /// Once you have a `SenderBuilder` instance, you can further customize it
+    /// before calling [`SenderBuilder::build`], but you can't change any settings
+    /// that are already set in the config string.
     pub fn from_conf<T: AsRef<str>>(conf: T) -> Result<Self> {
         let conf = conf.as_ref();
         let conf = questdb_confstr::parse_conf_str(conf)
@@ -1941,8 +2001,8 @@ impl SenderBuilder {
         Ok(builder)
     }
 
-    /// Create a new `SenderBuilder` instance from configuration string read from the
-    /// `QDB_CLIENT_CONF` environment variable.
+    /// Create a new `SenderBuilder` instance from the configuration string present
+    /// in the `QDB_CLIENT_CONF` environment variable.
     ///
     /// The format of the string is the same as for [`SenderBuilder::from_conf`].
     pub fn from_env() -> Result<Self> {
@@ -1952,7 +2012,7 @@ impl SenderBuilder {
         Self::from_conf(conf)
     }
 
-    /// Create a new `SenderBuilder` instance from the provided QuestDB
+    /// Create a new `SenderBuilder` instance with the provided QuestDB
     /// server and port using ILP over the specified protocol.
     ///
     /// ```no_run
@@ -2021,11 +2081,11 @@ impl SenderBuilder {
 
     /// Set the username for authentication.
     ///
-    /// For TCP this is the `kid` part of the ECDSA key set.
+    /// For TCP, this is the `kid` part of the ECDSA key set.
     /// The other fields are [`token`](SenderBuilder::token), [`token_x`](SenderBuilder::token_x),
     /// and [`token_y`](SenderBuilder::token_y).
     ///
-    /// For HTTP this is part of basic authentication.
+    /// For HTTP, this is a part of basic authentication.
     /// Also see [`password`](SenderBuilder::password).
     pub fn username(mut self, username: &str) -> Result<Self> {
         self.username
@@ -2627,18 +2687,18 @@ impl Sender {
     ///
     /// The format of the string is: `"http::addr=host:port;key=value;...;"`.
     ///
-    /// Alongside `"http"` you can also specify `"https"`, `"tcp"`, and `"tcps"`.
+    /// Instead of `"http"`, you can also specify `"https"`, `"tcp"`, and `"tcps"`.
     ///
-    /// HTTP is recommended in most cases as is provides better error feedback
-    /// allows controlling transactions. TCP can sometimes be faster in higher-latency
-    /// networks, but misses out on a number of features.
+    /// We recommend HTTP for most cases because it provides more features, like
+    /// reporting errors to the client and supporting transaction control. TCP can
+    /// sometimes be faster in higher-latency networks, but misses a number of
+    /// features.
     ///
-    /// The accepted set of keys and values is the same as for the opt's API.
+    /// Keys in the config string correspond to same-named methods on `SenderBuilder`.
     ///
     /// E.g. `"https::addr=host:port;username=alice;password=secret;tls_ca=os_roots;"`.
     ///
-    /// For full list of keys and values, see the [`SenderBuilder`] documentation:
-    /// The builder API and the configuration string API are equivalent.
+    /// For the full list of keys and values, see the docs on [`SenderBuilder`].
     ///
     /// If you prefer, you can also load the configuration from an environment variable.
     /// See [`Sender::from_env`].
