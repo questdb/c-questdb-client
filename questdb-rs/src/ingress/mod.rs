@@ -76,7 +76,7 @@
 //! Here are quick examples of configuration strings for each authentication method
 //! we support:
 //!
-//! * HTTP Token Bearer Auth:
+//! ### HTTP Token Bearer Authentication
 //!
 //! ```no_run
 //! # use questdb::{Result, ingress::Sender};
@@ -88,7 +88,9 @@
 //! # }
 //! ```
 //!
-//! * HTTP Basic Auth:
+//! * `token`: the authentication token
+//!
+//! ### HTTP Basic Authentication
 //!
 //! ```no_run
 //! # use questdb::{Result, ingress::Sender};
@@ -99,8 +101,10 @@
 //! # Ok(())
 //! # }
 //! ```
+//! * `username`: the username
+//! * `password`: the password
 //!
-//! * TCP ECDSA:
+//! ### TCP Elliptic Curve Digital Signature Algorithm (ECDSA)
 //!
 //! ```no_run
 //! # use questdb::{Result, ingress::Sender};
@@ -111,12 +115,12 @@
 //! # Ok(())
 //! # }
 //! ```
-//! The four components are:
+//! The four ECDSA components are:
 //!
-//! * `username` aka. _kid_
-//! * `token` aka. _d_
-//! * `token_x` aka. _x_
-//! * `token_y` aka. _y_
+//! * `username`, aka. _kid_
+//! * `token`, aka. _d_
+//! * `token_x`, aka. _x_
+//! * `token_y`, aka. _y_
 //!
 //! ### Authentication Timeout
 //!
@@ -163,10 +167,11 @@
 //! *Note:* when you provide the `tls_roots` option, you don't have to redundantly
 //! specify `tls_ca=pem_file`, this is selected automatically.
 //!
-//! The option `tls_verify=unsafe_off` allows you to disable the verification of the
-//! server's certificate. You can use it as a last resort, when you weren't able to
-//! apply the above approach with a self-signed certificate. You should never use it
-//! in production as it defeats security and allows a man-in-the middle attack.
+//! * `tls_verify=unsafe_off` tells the QuestDB client to ignore all CA roots and
+//!   accept any server certificate without checking. You can use it as a last resort,
+//!   when you weren't able to apply the above approach with a self-signed certificate.
+//!   You should **never use it in production** as it defeats security and allows a
+//!   man-in-the middle attack.
 //!
 //! ## HTTP Timeouts
 //!
