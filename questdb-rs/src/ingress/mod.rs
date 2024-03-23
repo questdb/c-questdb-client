@@ -229,9 +229,9 @@
 //!
 //! ## Optimization: avoid revalidating names
 //!
-//! The client must validate every name you provide. To avoid the redundant CPU
-//!  work of re-validating the same names on every row, create pre-validated
-//! [`ColumnName`] and [`TableName`] values:
+//! The client validates every name you provide. To avoid the redundant CPU work of
+//! re-validating the same names on every row, create pre-validated [`ColumnName`]
+//! and [`TableName`] values:
 //!
 //! ```
 //! # use questdb::Result;
@@ -260,9 +260,9 @@
 //!
 //! ## Debug disconnects and inspect errors
 //!
-//! If you're using the legacy ILP-over-TCP, it doesn't report any errors to the
-//! client. Instead, on error, the server terminates the connection, and logs
-//! any error messages in [server logs](https://questdb.io/docs/troubleshooting/log/).
+//! If you're using ILP-over-TCP, it doesn't report any errors to the client.
+//! Instead, on error, the server terminates the connection, and logs any error
+//! messages in [server logs](https://questdb.io/docs/troubleshooting/log/).
 //!
 //! To inspect or log a buffer's contents before you send it, call
 //! [`buffer.as_str()`](Buffer::as_str).
