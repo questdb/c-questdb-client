@@ -48,14 +48,14 @@
 //!
 //! fn main() -> Result<()> {
 //!    let mut sender = Sender::from_conf("http::addr=localhost:9000;")?;
-//!    let mut buf = Buffer::new();
-//!    buf
+//!    let mut buffer = Buffer::new();
+//!    buffer
 //!        .table("sensors")?
 //!        .symbol("id", "toronto1")?
 //!        .column_f64("temperature", 20.0)?
 //!        .column_i64("humidity", 50)?
 //!        .at(TimestampNanos::now())?;
-//!    sender.flush(&mut buf)?;
+//!    sender.flush(&mut buffer)?;
 //!    Ok(())
 //! }
 //! ```
@@ -168,7 +168,7 @@
 //!
 //! # Flushing
 //!
-//! [`sender.flush(&mut buf)`](Sender::flush) clears the buffer, making it ready for
+//! [`sender.flush(&mut buffer)`](Sender::flush) clears the buffer, making it ready for
 //! another batch of rows.
 //!
 //! Make sure you've flushed the buffer before dropping it. Otherwise, any messages
@@ -176,7 +176,7 @@
 //!
 //! A common technique is to flush periodically on a timer and/or once the buffer
 //! exceeds a certain size. You can check the buffer's size by the calling
-//! [`buf.len()`](Buffer::len).
+//! [`buffer.len()`](Buffer::len).
 //!
 //! Flushing automatically clears the buffer. If you want to preserve its contents
 //! (for example, to send the same data to multiple QuestDB instances), call
@@ -201,11 +201,11 @@
 //!     TimestampNanos};
 //!
 //! # fn main() -> Result<()> {
-//! let mut buf = Buffer::new();
+//! let mut buffer = Buffer::new();
 //! let tide_name = TableName::new("tide")?;
 //! let water_level_name = ColumnName::new("water_level")?;
-//! buf.table(tide_name)?.column_f64(water_level_name, 20.4)?.at(TimestampNanos::now())?;
-//! buf.table(tide_name)?.column_f64(water_level_name, 17.2)?.at(TimestampNanos::now())?;
+//! buffer.table(tide_name)?.column_f64(water_level_name, 20.4)?.at(TimestampNanos::now())?;
+//! buffer.table(tide_name)?.column_f64(water_level_name, 17.2)?.at(TimestampNanos::now())?;
 //! # Ok(())
 //! # }
 //! ```
@@ -235,7 +235,7 @@
 //! any error messages in [server logs](https://questdb.io/docs/troubleshooting/log/).
 //!
 //! To inspect or log a buffer's contents before you send it, call
-//! [`buf.as_str()`](Buffer::as_str).
+//! [`buffer.as_str()`](Buffer::as_str).
 //!
 
 pub use self::timestamp::*;
@@ -679,10 +679,10 @@ impl BufferState {
 /// use questdb::ingress::{Buffer, TimestampMicros, TimestampNanos};
 ///
 /// # fn main() -> Result<()> {
-/// let mut buf = Buffer::new();
+/// let mut buffer = Buffer::new();
 ///
 /// // first row
-/// buf
+/// buffer
 ///     .table("table1")?
 ///     .symbol("bar", "baz")?
 ///     .column_bool("a", false)?
@@ -693,7 +693,7 @@ impl BufferState {
 ///     .at(TimestampNanos::now())?;
 ///
 /// // second row
-/// buf
+/// buffer
 ///     .table("table2")?
 ///     .symbol("foo", "bar")?
 ///     .at(TimestampNanos::now())?;
@@ -701,7 +701,7 @@ impl BufferState {
 /// # }
 /// ```
 ///
-/// Send the buffer to QuestDB using [`sender.flush(&mut buf)`](Sender::flush).
+/// Send the buffer to QuestDB using [`sender.flush(&mut buffer)`](Sender::flush).
 ///
 /// # Sequential Coupling
 /// The Buffer API is sequentially coupled:
@@ -747,12 +747,12 @@ impl BufferState {
 /// # Recovering from validation errors
 ///
 /// If you want to recover from potential validation errors, call
-/// [`buf.set_marker()`](Buffer::set_marker) to track the last known good state,
+/// [`buffer.set_marker()`](Buffer::set_marker) to track the last known good state,
 /// append as many rows or parts of rows as you like, and then call
-/// [`buf.clear_marker()`](Buffer::clear_marker) on success.
+/// [`buffer.clear_marker()`](Buffer::clear_marker) on success.
 ///
 /// If there was an error in one of the rows, use
-/// [`buf.rewind_to_marker()`](Buffer::rewind_to_marker) to go back to the
+/// [`buffer.rewind_to_marker()`](Buffer::rewind_to_marker) to go back to the
 /// marked last known good state.
 ///
 #[derive(Debug, Clone)]
@@ -915,8 +915,8 @@ impl Buffer {
     /// # use questdb::Result;
     /// # use questdb::ingress::Buffer;
     /// # fn main() -> Result<()> {
-    /// # let mut buf = Buffer::new();
-    /// buf.table("table_name")?;
+    /// # let mut buffer = Buffer::new();
+    /// buffer.table("table_name")?;
     /// # Ok(())
     /// # }
     /// ```
@@ -929,9 +929,9 @@ impl Buffer {
     /// use questdb::ingress::TableName;
     ///
     /// # fn main() -> Result<()> {
-    /// # let mut buf = Buffer::new();
+    /// # let mut buffer = Buffer::new();
     /// let table_name = TableName::new("table_name")?;
-    /// buf.table(table_name)?;
+    /// buffer.table(table_name)?;
     /// # Ok(())
     /// # }
     /// ```
@@ -963,9 +963,9 @@ impl Buffer {
     /// # use questdb::Result;
     /// # use questdb::ingress::Buffer;
     /// # fn main() -> Result<()> {
-    /// # let mut buf = Buffer::new();
-    /// # buf.table("x")?;
-    /// buf.symbol("col_name", "value")?;
+    /// # let mut buffer = Buffer::new();
+    /// # buffer.table("x")?;
+    /// buffer.symbol("col_name", "value")?;
     /// # Ok(())
     /// # }
     /// ```
@@ -976,10 +976,10 @@ impl Buffer {
     /// # use questdb::Result;
     /// # use questdb::ingress::Buffer;
     /// # fn main() -> Result<()> {
-    /// # let mut buf = Buffer::new();
-    /// # buf.table("x")?;
+    /// # let mut buffer = Buffer::new();
+    /// # buffer.table("x")?;
     /// let value: String = "value".to_owned();
-    /// buf.symbol("col_name", value)?;
+    /// buffer.symbol("col_name", value)?;
     /// # Ok(())
     /// # }
     /// ```
@@ -992,10 +992,10 @@ impl Buffer {
     /// use questdb::ingress::ColumnName;
     ///
     /// # fn main() -> Result<()> {
-    /// # let mut buf = Buffer::new();
-    /// # buf.table("x")?;
+    /// # let mut buffer = Buffer::new();
+    /// # buffer.table("x")?;
     /// let col_name = ColumnName::new("col_name")?;
-    /// buf.symbol(col_name, "value")?;
+    /// buffer.symbol(col_name, "value")?;
     /// # Ok(())
     /// # }
     /// ```
@@ -1043,9 +1043,9 @@ impl Buffer {
     /// # use questdb::Result;
     /// # use questdb::ingress::Buffer;
     /// # fn main() -> Result<()> {
-    /// # let mut buf = Buffer::new();
-    /// # buf.table("x")?;
-    /// buf.column_bool("col_name", true)?;
+    /// # let mut buffer = Buffer::new();
+    /// # buffer.table("x")?;
+    /// buffer.column_bool("col_name", true)?;
     /// # Ok(())
     /// # }
     /// ```
@@ -1058,10 +1058,10 @@ impl Buffer {
     /// use questdb::ingress::ColumnName;
     ///
     /// # fn main() -> Result<()> {
-    /// # let mut buf = Buffer::new();
-    /// # buf.table("x")?;
+    /// # let mut buffer = Buffer::new();
+    /// # buffer.table("x")?;
     /// let col_name = ColumnName::new("col_name")?;
-    /// buf.column_bool(col_name, true)?;
+    /// buffer.column_bool(col_name, true)?;
     /// # Ok(())
     /// # }
     /// ```
@@ -1081,9 +1081,9 @@ impl Buffer {
     /// # use questdb::Result;
     /// # use questdb::ingress::Buffer;
     /// # fn main() -> Result<()> {
-    /// # let mut buf = Buffer::new();
-    /// # buf.table("x")?;
-    /// buf.column_i64("col_name", 42)?;
+    /// # let mut buffer = Buffer::new();
+    /// # buffer.table("x")?;
+    /// buffer.column_i64("col_name", 42)?;
     /// # Ok(())
     /// # }
     /// ```
@@ -1096,10 +1096,10 @@ impl Buffer {
     /// use questdb::ingress::ColumnName;
     ///
     /// # fn main() -> Result<()> {
-    /// # let mut buf = Buffer::new();
-    /// # buf.table("x")?;
+    /// # let mut buffer = Buffer::new();
+    /// # buffer.table("x")?;
     /// let col_name = ColumnName::new("col_name")?;
-    /// buf.column_i64(col_name, 42);
+    /// buffer.column_i64(col_name, 42);
     /// # Ok(())
     /// # }
     /// ```
@@ -1122,9 +1122,9 @@ impl Buffer {
     /// # use questdb::Result;
     /// # use questdb::ingress::Buffer;
     /// # fn main() -> Result<()> {
-    /// # let mut buf = Buffer::new();
-    /// # buf.table("x")?;
-    /// buf.column_f64("col_name", 3.14)?;
+    /// # let mut buffer = Buffer::new();
+    /// # buffer.table("x")?;
+    /// buffer.column_f64("col_name", 3.14)?;
     /// # Ok(())
     /// # }
     /// ```
@@ -1137,10 +1137,10 @@ impl Buffer {
     /// use questdb::ingress::ColumnName;
     ///
     /// # fn main() -> Result<()> {
-    /// # let mut buf = Buffer::new();
-    /// # buf.table("x")?;
+    /// # let mut buffer = Buffer::new();
+    /// # buffer.table("x")?;
     /// let col_name = ColumnName::new("col_name")?;
-    /// buf.column_f64(col_name, 3.14)?;
+    /// buffer.column_f64(col_name, 3.14)?;
     /// # Ok(())
     /// # }
     /// ```
@@ -1161,9 +1161,9 @@ impl Buffer {
     /// # use questdb::Result;
     /// # use questdb::ingress::Buffer;
     /// # fn main() -> Result<()> {
-    /// # let mut buf = Buffer::new();
-    /// # buf.table("x")?;
-    /// buf.column_str("col_name", "value")?;
+    /// # let mut buffer = Buffer::new();
+    /// # buffer.table("x")?;
+    /// buffer.column_str("col_name", "value")?;
     /// # Ok(())
     /// # }
     /// ```
@@ -1174,10 +1174,10 @@ impl Buffer {
     /// # use questdb::Result;
     /// # use questdb::ingress::Buffer;
     /// # fn main() -> Result<()> {
-    /// # let mut buf = Buffer::new();
-    /// # buf.table("x")?;
+    /// # let mut buffer = Buffer::new();
+    /// # buffer.table("x")?;
     /// let value: String = "value".to_owned();
-    /// buf.column_str("col_name", value)?;
+    /// buffer.column_str("col_name", value)?;
     /// # Ok(())
     /// # }
     /// ```
@@ -1190,10 +1190,10 @@ impl Buffer {
     /// use questdb::ingress::ColumnName;
     ///
     /// # fn main() -> Result<()> {
-    /// # let mut buf = Buffer::new();
-    /// # buf.table("x")?;
+    /// # let mut buffer = Buffer::new();
+    /// # buffer.table("x")?;
     /// let col_name = ColumnName::new("col_name")?;
-    /// buf.column_str(col_name, "value")?;
+    /// buffer.column_str(col_name, "value")?;
     /// # Ok(())
     /// # }
     /// ```
@@ -1215,9 +1215,9 @@ impl Buffer {
     /// # use questdb::ingress::Buffer;
     /// use questdb::ingress::TimestampMicros;
     /// # fn main() -> Result<()> {
-    /// # let mut buf = Buffer::new();
-    /// # buf.table("x")?;
-    /// buf.column_ts("col_name", TimestampMicros::now())?;
+    /// # let mut buffer = Buffer::new();
+    /// # buffer.table("x")?;
+    /// buffer.column_ts("col_name", TimestampMicros::now())?;
     /// # Ok(())
     /// # }
     /// ```
@@ -1230,9 +1230,9 @@ impl Buffer {
     /// use questdb::ingress::TimestampMicros;
     ///
     /// # fn main() -> Result<()> {
-    /// # let mut buf = Buffer::new();
-    /// # buf.table("x")?;
-    /// buf.column_ts("col_name", TimestampMicros::new(1659548204354448))?;
+    /// # let mut buffer = Buffer::new();
+    /// # buffer.table("x")?;
+    /// buffer.column_ts("col_name", TimestampMicros::new(1659548204354448))?;
     /// # Ok(())
     /// # }
     /// ```
@@ -1246,10 +1246,10 @@ impl Buffer {
     /// use questdb::ingress::ColumnName;
     ///
     /// # fn main() -> Result<()> {
-    /// # let mut buf = Buffer::new();
-    /// # buf.table("x")?;
+    /// # let mut buffer = Buffer::new();
+    /// # buffer.table("x")?;
     /// let col_name = ColumnName::new("col_name")?;
-    /// buf.column_ts(col_name, TimestampMicros::now())?;
+    /// buffer.column_ts(col_name, TimestampMicros::now())?;
     /// # Ok(())
     /// # }
     /// ```
@@ -1284,9 +1284,9 @@ impl Buffer {
     /// # use questdb::ingress::Buffer;
     /// use questdb::ingress::TimestampNanos;
     /// # fn main() -> Result<()> {
-    /// # let mut buf = Buffer::new();
-    /// # buf.table("x")?.symbol("a", "b")?;
-    /// buf.at(TimestampNanos::now())?;
+    /// # let mut buffer = Buffer::new();
+    /// # buffer.table("x")?.symbol("a", "b")?;
+    /// buffer.at(TimestampNanos::now())?;
     /// # Ok(())
     /// # }
     /// ```
@@ -1299,9 +1299,9 @@ impl Buffer {
     /// use questdb::ingress::TimestampNanos;
     ///
     /// # fn main() -> Result<()> {
-    /// # let mut buf = Buffer::new();
-    /// # buf.table("x")?.symbol("a", "b")?;
-    /// buf.at(TimestampNanos::new(1659548315647406592))?;
+    /// # let mut buffer = Buffer::new();
+    /// # buffer.table("x")?.symbol("a", "b")?;
+    /// buffer.at(TimestampNanos::new(1659548315647406592))?;
     /// # Ok(())
     /// # }
     /// ```
@@ -1356,9 +1356,9 @@ impl Buffer {
     /// # use questdb::Result;
     /// # use questdb::ingress::Buffer;
     /// # fn main() -> Result<()> {
-    /// # let mut buf = Buffer::new();
-    /// # buf.table("x")?.symbol("a", "b")?;
-    /// buf.at_now()?;
+    /// # let mut buffer = Buffer::new();
+    /// # buffer.table("x")?.symbol("a", "b")?;
+    /// buffer.at_now()?;
     /// # Ok(())
     /// # }
     /// ```
