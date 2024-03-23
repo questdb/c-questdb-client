@@ -22,12 +22,13 @@
  *
  ******************************************************************************/
 
-//! # Fast Ingestion of data into QuestDB
+//! # Fast Ingestion of Data into QuestDB
 //!
 //! The `ingress` module implements QuestDB's variant of the
 //! [InfluxDB Line Protocol](https://questdb.io/docs/reference/api/ilp/overview/)
-//! (ILP) over HTTP and TCP. We recommend using HTTP, and consider TCP as a
-//! legacy protocol variant.
+//! (ILP) over HTTP and TCP. We recommend using HTTP because it has a number of
+//! features that TCP lacks, such as receiving error messages from the server and
+//! fine-grained transaction control.
 //!
 //! To get started:
 //!   * Make sure you have the dependency with the HTTP feature enabled:
@@ -60,14 +61,13 @@
 //! }
 //! ```
 //!
-//! # Unified APIs: configuration string and builder API
+//! # Configuration Parameters
 //!
-//! In addition to the configuration string, we provide the [`SenderBuilder`] to
-//! programmatically configure the sender. The methods on this struct match
-//! one-for-one the keys in the configuration string. To get documentation on
-//! configuration string options, refer to the docs on [`SenderBuilder`] methods.
+//! In the examples below, we'll use configuration strings. We also provide the
+//! [`SenderBuilder`] to programmatically configure the sender. The methods on
+//! [`SenderBuilder`] match one-for-one with the keys in the configuration string.
 //!
-//! # Authentication
+//! ## Authentication
 //!
 //! To establish an [authenticated](https://questdb.io/docs/reference/api/ilp/overview/#authentication)
 //! and TLS-encrypted connection, use the `https` or `tcps` protocol, and use the
@@ -79,25 +79,37 @@
 //! * HTTP Token Bearer Auth:
 //!
 //! ```no_run
+//! # use questdb::{Result, ingress::Sender};
+//! # fn main() -> Result<()> {
 //! let mut sender = Sender::from_conf(
 //!     "https::addr=localhost:9000;token=Yfym3fgMv0B9;"
 //! )?;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! * HTTP Basic Auth:
 //!
 //! ```no_run
+//! # use questdb::{Result, ingress::Sender};
+//! # fn main() -> Result<()> {
 //! let mut sender = Sender::from_conf(
 //!     "https::addr=localhost:9000;username=testUser1;password=Yfym3fgMv0B9;"
 //! )?;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! * TCP ECDSA:
 //!
 //! ```no_run
+//! # use questdb::{Result, ingress::Sender};
+//! # fn main() -> Result<()> {
 //! let mut sender = Sender::from_conf(
 //!     "tcps::addr=localhost:9009;username=testUser1;token=5UjEA0;token_x=fLKYa9;token_y=bS1dEfy"
 //! )?;
+//! # Ok(())
+//! # }
 //! ```
 //! The four components are:
 //!
@@ -106,17 +118,20 @@
 //! * `token_x` aka. _x_
 //! * `token_y` aka. _y_
 //!
+//! ### Authentication Timeout
+//!
 //! You can specify how long the client should wait for the authentication request
-//! to resolve. The configuration parameter is `auth_timeout`, and the value is in
-//! milliseconds. The default is 15 seconds.
+//! to resolve. The configuration parameter is:
 //!
-//! ## Encryption on the wire: TLS
+//! * `auth_timeout` (milliseconds, default 15 seconds)
 //!
-//! Note that Open Source QuestDB does not natively support TLS
-//! encryption (this is a QuestDB enterprise feature). To enable TLS on the server,
-//! refer to the [QuestDB Enterprise TLS documentation](https://questdb.io/docs/operations/tls/).
-//! To use TLS with QuestDB open source, use a TLS proxy such as
-//! [HAProxy](http://www.haproxy.org/).
+//! ## Encryption on the Wire: TLS
+//!
+//! To enable TLS on the QuestDB Enterprise server, refer to the [QuestDB Enterprise
+//! TLS documentation](https://questdb.io/docs/operations/tls/).
+//!
+//! *Note*: QuestDB Open Source does not support TLS natively. To use TLS with QuestDB
+//! Open Source, use a TLS proxy such as [HAProxy](http://www.haproxy.org/).
 //!
 //! We support several certification authorities (sources of PKI root certificates).
 //! To select one, use the `tls_ca` config option. These are the supported values:
@@ -136,9 +151,13 @@
 //! then point the client to the PEM file:
 //!
 //! ```no_run
+//! # use questdb::{Result, ingress::Sender};
+//! # fn main() -> Result<()> {
 //! let mut sender = Sender::from_conf(
 //!     "https::addr=localhost:9000;tls_roots=/path/to/root-ca.pem"
 //! )?;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! *Note:* when you provide the `tls_roots` option, you don't have to redundantly
@@ -149,7 +168,7 @@
 //! apply the above approach with a self-signed certificate. You should never use it
 //! in production as it defeats security and allows a man-in-the middle attack.
 //!
-//! # HTTP timeouts
+//! ## HTTP Timeouts
 //!
 //! Instead of a fixed timeout value, we use a flexible timeout that depends on the
 //! size of the HTTP request payload (how much data is in the buffer that you're
@@ -166,10 +185,30 @@
 //!
 //! * `retry_timeout` (milliseconds, default 10 seconds)
 //!
-//! # Flushing
+//! # Usage Considerations
 //!
-//! [`sender.flush(&mut buffer)`](Sender::flush) clears the buffer, making it ready for
-//! another batch of rows.
+//! The [Library considerations](https://github.com/questdb/c-questdb-client/blob/main/doc/CONSIDERATIONS.md)
+//! document covers these topics:
+//!   * Threading
+//!   * Differences between ILP and QuestDB Data Types
+//!   * Data Quality
+//!   * Client-side checks and server errors
+//!   * Flushing
+//!   * Disconnections, data errors and troubleshooting
+//!
+//!  Here are a few more things to keep in mind.
+//!
+//! ## Sequential Coupling in the Buffer API
+//!
+//! The fluent API of [`Buffer`] has sequential coupling: there's a certain order
+//! in which you are expected to call the methods. For example, you must write the
+//! symbols before the rows, and you must terminate each row with a call to either
+//! [`at`](Buffer::at) or [`at_now`](Buffer::at_now).
+//!
+//! ## Flushing
+//!
+//! [`sender.flush(&mut buffer)`](Sender::flush) clears the buffer, making it ready
+//! for another batch of rows.
 //!
 //! Make sure you've flushed the buffer before dropping it. Otherwise, any messages
 //! still left in it will silently disappear.
@@ -182,15 +221,13 @@
 //! (for example, to send the same data to multiple QuestDB instances), call
 //! [`flush_and_keep`](Sender::flush_and_keep) instead.
 //!
-//! # Buffer API sequential coupling
+//! See the [`Buffer`] documentation for full details and a flow chart.
 //!
-//! Symbols must always be written before rows. See the [`Buffer`] documentation
-//! for details. Each row must be terminated with a call to either
-//! [`at`](Buffer::at) or [`at_now`](Buffer::at_now).
+//! ## Optimization: avoid revalidating names
 //!
-//! # Optimization: avoid revalidating names
-//! To avoid re-validating table and column names, consider re-using them across
-//! rows.
+//! The client validates every column name you provide. To avoid the redundant CPU
+//! work of re-validating the same names on every row, create [`ColumnName`]s for
+//! them:
 //!
 //! ```
 //! # use questdb::Result;
@@ -209,17 +246,6 @@
 //! # Ok(())
 //! # }
 //! ```
-//!
-//! # Considerations
-//!
-//! The [Library considerations](https://github.com/questdb/c-questdb-client/blob/main/doc/CONSIDERATIONS.md)
-//! document covers these topics:
-//!   * Threading
-//!   * Differences between ILP and QuestDB Data Types
-//!   * Data Quality
-//!   * Client-side checks and server errors
-//!   * Flushing
-//!   * Disconnections, data errors and troubleshooting
 //!
 //! # Troubleshooting Common Issues
 //!
