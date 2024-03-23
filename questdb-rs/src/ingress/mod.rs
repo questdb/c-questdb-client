@@ -207,8 +207,9 @@
 //!
 //! The fluent API of [`Buffer`] has sequential coupling: there's a certain order
 //! in which you are expected to call the methods. For example, you must write the
-//! symbols before the rows, and you must terminate each row with a call to either
-//! [`at`](Buffer::at) or [`at_now`](Buffer::at_now).
+//! symbols before the columns, and you must terminate each row by calling
+//! either [`at`](Buffer::at) or [`at_now`](Buffer::at_now). Refer to the [`Buffer`]
+//! doc for full rules and a flowchart.
 //!
 //! ## Flushing
 //!
@@ -226,13 +227,11 @@
 //! (for example, to send the same data to multiple QuestDB instances), call
 //! [`flush_and_keep`](Sender::flush_and_keep) instead.
 //!
-//! See the [`Buffer`] documentation for full details and a flow chart.
-//!
 //! ## Optimization: avoid revalidating names
 //!
-//! The client validates every column name you provide. To avoid the redundant CPU
-//! work of re-validating the same names on every row, create [`ColumnName`]s for
-//! them:
+//! The client must validate every name you provide. To avoid the redundant CPU
+//!  work of re-validating the same names on every row, create pre-validated
+//! [`ColumnName`] and [`TableName`] values:
 //!
 //! ```
 //! # use questdb::Result;
@@ -320,8 +319,8 @@ fn map_io_to_socket_err(prefix: &str, io_err: io::Error) -> Error {
 ///
 /// This type simply wraps a `&str`.
 ///
-/// You can use it to construct it explicitly to avoid re-validating the same
-/// names over and over.
+/// When you pass a `TableName` instead of a plain string to a [`Buffer`] method,
+/// it doesn't have to validate it again. This saves CPU cycles.
 #[derive(Clone, Copy)]
 pub struct TableName<'a> {
     name: &'a str,
@@ -390,12 +389,12 @@ impl<'a> TableName<'a> {
         Ok(Self { name })
     }
 
-    /// Construct an unvalidated table name.
+    /// Construct a table name without validating it.
     ///
     /// This breaks API encapsulation and is only intended for use
     /// when the the string was already previously validated.
     ///
-    /// Invalid table names will be rejected by the QuestDB server.
+    /// The QuestDB server will reject an invalid table name.
     pub fn new_unchecked(name: &'a str) -> Self {
         Self { name }
     }
@@ -405,8 +404,8 @@ impl<'a> TableName<'a> {
 ///
 /// This type simply wraps a `&str`.
 ///
-/// You can use it to construct it explicitly to avoid re-validating the same
-/// names over and over.
+/// When you pass a `ColumnName` instead of a plain string to a [`Buffer`] method,
+/// it doesn't have to validate it again. This saves CPU cycles.
 #[derive(Clone, Copy)]
 pub struct ColumnName<'a> {
     name: &'a str,
@@ -463,12 +462,12 @@ impl<'a> ColumnName<'a> {
         Ok(Self { name })
     }
 
-    /// Construct an unvalidated column name.
+    /// Construct a column name without validating it.
     ///
     /// This breaks API encapsulation and is only intended for use
     /// when the the string was already previously validated.
     ///
-    /// Invalid column names will be rejected by the QuestDB server.
+    /// The QuestDB server will reject an invalid column name.
     pub fn new_unchecked(name: &'a str) -> Self {
         Self { name }
     }
@@ -744,7 +743,7 @@ impl BufferState {
 ///       [`column_f64`](Buffer::column_f64),
 ///       [`column_str`](Buffer::column_str),
 ///       [`column_ts`](Buffer::column_ts)).
-///   * Symbols must always appear before columns.
+///   * Symbols must appear before columns.
 ///   * A row must be terminated with either [`at`](Buffer::at) or
 ///     [`at_now`](Buffer::at_now).
 ///
@@ -765,11 +764,11 @@ impl BufferState {
 ///
 /// QuestDB supports both `STRING` and `SYMBOL` column types.
 ///
-/// To understand the difference refer to the
+/// To understand the difference, refer to the
 /// [QuestDB documentation](https://questdb.io/docs/concept/symbol/). In a nutshell,
-/// symbols are interned strings that are most suitable for identifiers that you
-/// expect to be repeated throughout the column. They offer an advantage in storage
-/// space and query performance.
+/// symbols are interned strings, most suitable for identifiers that are repeated many
+/// times throughout the column. They offer an advantage in storage space and query
+/// performance.
 ///
 /// # Inserting NULL values
 ///
@@ -806,13 +805,13 @@ impl Buffer {
         }
     }
 
-    /// Construct with a custom maximum length for table and column names.
+    /// Construct an instance with a custom maximum length for table and column names.
     ///
     /// This should match the `cairo.max.file.name.length` setting of the
     /// QuestDB instance you're connecting to.
     ///
-    /// If the server does not configure it the default is `127` and you might
-    /// as well call [`new`](Buffer::new).
+    /// If the server does not configure it, the default is `127` and you can simply
+    /// call [`new`](Buffer::new).
     pub fn with_max_name_len(max_name_len: usize) -> Self {
         let mut buf = Self::new();
         buf.max_name_len = max_name_len;
@@ -827,7 +826,7 @@ impl Buffer {
         self.output.reserve(additional);
     }
 
-    /// Number of bytes accumulated in the buffer.
+    /// The number of bytes accumulated in the buffer.
     pub fn len(&self) -> usize {
         self.output.len()
     }
@@ -837,8 +836,9 @@ impl Buffer {
         self.state.row_count
     }
 
-    /// The buffer is transactional if sent over HTTP.
-    /// A buffer stops being transactional if it contains rows for multiple tables.
+    /// Tells whether the buffer is transactional. It is transactional iff it contains
+    /// data for at most one table. Additionally, you must send the buffer over HTTP to
+    /// get transactional behavior.
     pub fn transactional(&self) -> bool {
         self.state.transactional
     }
@@ -847,13 +847,12 @@ impl Buffer {
         self.output.is_empty()
     }
 
-    /// Number of bytes that can be written to the buffer before it needs to
-    /// resize.
+    /// The total number of bytes the buffer can hold before it needs to resize.
     pub fn capacity(&self) -> usize {
         self.output.capacity()
     }
 
-    /// Inspect the contents of the buffer.
+    /// A string representation of the buffer's contents. Useful for debugging.
     pub fn as_str(&self) -> &str {
         &self.output
     }
@@ -1308,7 +1307,8 @@ impl Buffer {
         Ok(self)
     }
 
-    /// Terminate the row with a specified timestamp.
+    /// Record the designated timestamp of the current row and complete it.
+    /// After calling this method, you can't add more data to the row.
     ///
     /// ```
     /// # use questdb::Result;
@@ -1372,7 +1372,8 @@ impl Buffer {
         Ok(())
     }
 
-    /// Terminate the row with a server-specified timestamp.
+    /// Declare that the current row will use a server-assigned designated timestamp,
+    /// and complete it. After calling this method, you can't add more data to the row.
     ///
     /// This is NOT equivalent to calling [`at`](Buffer::at) with the current time.
     /// There's a trade-off: Letting the server assign the timestamp can be faster
@@ -1394,10 +1395,9 @@ impl Buffer {
     /// # }
     /// ```
     ///
-    /// The QuestDB instance will set the timestamp once it receives the row.
-    /// If you're [`flushing`](Sender::flush) infrequently, the timestamp
-    /// assigned by the server may drift significantly from when the data
-    /// was recorded in the buffer.
+    /// The QuestDB server will set the timestamp once it receives the row. If you're
+    /// [`flushing`](Sender::flush) infrequently, the server-assigned timestamp may be
+    /// significantly behind the time the data was recorded in the buffer.
     pub fn at_now(&mut self) -> Result<()> {
         self.check_op(Op::At)?;
         self.output.push('\n');
@@ -1450,7 +1450,8 @@ enum AuthParams {
     Token(TokenAuthParams),
 }
 
-/// Possible sources of the root certificates used to validate the server's TLS certificate.
+/// Possible sources of the root certificates used to validate the server's TLS
+/// certificate.
 #[derive(PartialEq, Debug, Clone, Copy)]
 pub enum CertificateAuthority {
     /// Use the root certificates provided by the
@@ -1466,7 +1467,7 @@ pub enum CertificateAuthority {
     #[cfg(all(feature = "tls-webpki-certs", feature = "tls-native-certs"))]
     WebpkiAndOsRoots,
 
-    /// Use the root certificates provided by a PEM-encoded file.
+    /// Use the root certificates provided in a PEM-encoded file.
     PemFile,
 }
 
