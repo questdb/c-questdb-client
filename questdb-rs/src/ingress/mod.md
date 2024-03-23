@@ -114,36 +114,23 @@ QuestDB Open Source, use a TLS proxy such as
 [HAProxy](http://www.haproxy.org/).
 
 We support several certification authorities (sources of PKI root certificates).
-To select one, use the `tls_ca` config option. These are the supported values:
+To select one, use the `tls_ca` config option. These are the supported variants:
 
-* `webpki_roots`: use the roots provided in the standard Rust crate
+* `tls_ca=webpki_roots;` use the roots provided in the standard Rust crate
   [webpki-roots](https://crates.io/crates/webpki-roots)
 
-* `os_roots`: use the OS-provided certificate store
+* `tls_ca=os_roots;` use the OS-provided certificate store
 
-* `webpki_and_os_roots`: combine both of the above
+* `tls_ca=webpki_and_os_roots;` combine both of the above
 
-* `pem_file`: specify the path to the PEM file with root certificates. Main
-  purpose is for testing with self-signed certificates.
+* `tls_roots=/path/to/root-ca.pem;` get the root certificates from the specified
+  file. Main purpose is for testing with self-signed certificates. _Note:_ this
+  automatically sets `tls_ca=pem_file`.
 
-See our notes on [how to generate keys that the QuestDB client will
-accept](https://github.com/questdb/c-questdb-client/tree/main/tls_certs), and
-then point the client to the PEM file:
+See our notes on [how to generate a self-signed
+certificate](https://github.com/questdb/c-questdb-client/tree/main/tls_certs).
 
-```no_run
-# use questdb::{Result, ingress::Sender};
-# fn main() -> Result<()> {
-let mut sender = Sender::from_conf(
-    "https::addr=localhost:9000;tls_roots=/path/to/root-ca.pem"
-)?;
-# Ok(())
-# }
-```
-
-*Note:* when you provide the `tls_roots` option, you don't have to redundantly
-specify `tls_ca=pem_file`, this is selected automatically.
-
-* `tls_verify=unsafe_off` tells the QuestDB client to ignore all CA roots and
+* `tls_verify=unsafe_off;` tells the QuestDB client to ignore all CA roots and
   accept any server certificate without checking. You can use it as a last
   resort, when you weren't able to apply the above approach with a self-signed
   certificate. You should **never use it in production** as it defeats security
@@ -168,8 +155,8 @@ can configure the total time budget for retrying:
 
 # Usage Considerations
 
-The
-[Library considerations](https://github.com/questdb/c-questdb-client/blob/main/doc/CONSIDERATIONS.md)
+The [Library
+considerations](https://github.com/questdb/c-questdb-client/blob/main/doc/CONSIDERATIONS.md)
 document covers these topics:
 
 * Threading
