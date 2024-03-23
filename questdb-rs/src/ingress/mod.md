@@ -8,10 +8,6 @@ fine-grained transaction control.
 
 To get started:
 
-* Make sure you have the dependency with the HTTP feature enabled:
-
- ```cargo add questdb-rs --features ilp-over-http```
-
 * Use [`Sender::from_conf()`] to get the [`Sender`] object
 * Populate a [`Buffer`] with one or more rows of data
 * Send the buffer using [`sender.flush()`](Sender::flush)
