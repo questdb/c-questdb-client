@@ -352,7 +352,7 @@ LINESENDER_API
 size_t line_sender_buffer_row_count(const line_sender_buffer* buffer);
 
 /**
- * Tells whether the buffer is transactional. It is transactional iff it contains
+ * Tell whether the buffer is transactional. It is transactional iff it contains
  * data for at most one table. Additionally, you must send the buffer over HTTP to
  * get transactional behavior.
  */
@@ -374,7 +374,7 @@ const char* line_sender_buffer_peek(
     size_t* len_out);
 
 /**
- * Begin recording a new row for the given table.
+ * Start recording a new row for the given table.
  * @param[in] buffer Line buffer object.
  * @param[in] name Table name.
  */
@@ -464,7 +464,7 @@ bool line_sender_buffer_column_str(
  * Record a nanosecond timestamp value for the given column.
  * @param[in] buffer Line buffer object.
  * @param[in] name Column name.
- * @param[in] nanos The timestamp in nanoseconds since the unix epoch.
+ * @param[in] nanos The timestamp in nanoseconds since the Unix epoch.
  * @param[out] err_out Set on error.
  * @return true on success, false on error.
  */
@@ -479,7 +479,7 @@ bool line_sender_buffer_column_ts_nanos(
  * Record a microsecond timestamp value for the given column.
  * @param[in] buffer Line buffer object.
  * @param[in] name Column name.
- * @param[in] micros The timestamp in microseconds since the unix epoch.
+ * @param[in] micros The timestamp in microseconds since the Unix epoch.
  * @param[out] err_out Set on error.
  * @return true on success, false on error.
  */
@@ -494,14 +494,14 @@ bool line_sender_buffer_column_ts_micros(
  * Complete the current row with the designated timestamp in nanoseconds.
  *
  * After this call, you can start recording the next row by calling
- * `table()` again, or you can send the accumulated batch by calling
- * `line_sender_flush()` or one of its variants.
+ * `line_sender_buffer_table()` again, or you can send the accumulated batch
+ * by calling `line_sender_flush()` or one of its variants.
  *
  * If you want to pass the current system timestamp, see
  * `line_sender_now_nanos()`.
  *
  * @param[in] buffer Line buffer object.
- * @param[in] epoch_nanos Number of nanoseconds since the unix epoch.
+ * @param[in] epoch_nanos Number of nanoseconds since the Unix epoch.
  * @param[out] err_out Set on error.
  * @return true on success, false on error.
  */
@@ -515,14 +515,14 @@ bool line_sender_buffer_at_nanos(
  * Complete the current row with the designated timestamp in microseconds.
  *
  * After this call, you can start recording the next row by calling
- * `table()` again, or you can send the accumulated batch by
- * calling `flush()` or one of its variants.
+ * `line_sender_buffer_table()` again, or you can send the accumulated batch
+ * by calling `line_sender_flush()` or one of its variants.
  *
  * If you want to pass the current system timestamp, see
  * `line_sender_now_micros()`.
  *
  * @param[in] buffer Line buffer object.
- * @param[in] epoch_micros Number of microseconds since the unix epoch.
+ * @param[in] epoch_micros Number of microseconds since the Unix epoch.
  * @param[out] err_out Set on error.
  * @return true on success, false on error.
  */
@@ -566,8 +566,8 @@ bool line_sender_buffer_at_now(
 /**
  * Inserts data into QuestDB via the InfluxDB Line Protocol.
  *
- * Batch up rows in `buffer` objects, then call `flush()` or one of its variants
- * with this object to send them.
+ * Batch up rows in a `line_sender_buffer`, then call `flush()` or one of its
+ * variants with this object to send them.
  */
 typedef struct line_sender line_sender;
 
@@ -606,7 +606,8 @@ line_sender_opts* line_sender_opts_from_env(
     line_sender_error** err_out);
 
 /**
- * A new set of options for a line sender connection.
+ * Create a new `line_sender_opts` instance with the given protocol, hostname and
+ * port.
  * @param[in] protocol The protocol to use.
  * @param[in] host The QuestDB database host.
  * @param[in] port The QuestDB ILP TCP port.
@@ -618,7 +619,8 @@ line_sender_opts* line_sender_opts_new(
     uint16_t port);
 
 /**
- * Variant of `line_sender_opts_new()` that takes a service name for port.
+ * Create a new `line_sender_opts` instance with the given protocol, hostname and
+ * service name.
  */
 LINESENDER_API
 line_sender_opts* line_sender_opts_new_service(
@@ -642,7 +644,7 @@ bool line_sender_opts_bind_interface(
 /**
  * Set the username for authentication.
  *
- * For TCP this is the `kid` part of the ECDSA key set.
+ * For TCP, this is the `kid` part of the ECDSA key set.
  * The other fields are `token` `token_x` and `token_y`.
  *
  * For HTTP this is part of basic authentication.
@@ -764,7 +766,7 @@ bool line_sender_opts_retry_timeout(
  * long to keep sending the payload before timing out.
  * The value is in bytes per second, and the default is 100 KiB/s.
  * The timeout calculated from minimum throughput is adedd to the value of
- * `request_timeout`
+ * `request_timeout`.
  *
  * See also: `line_sender_opts_request_timeout()`
  */
@@ -778,6 +780,7 @@ bool line_sender_opts_request_min_throughput(
  * Additional time to wait on top of that calculated from the minimum throughput.
  * This accounts for the fixed latency of the HTTP request-response roundtrip.
  * The value is in milliseconds, and the default is 10 seconds.
+ *
  * See also: `line_sender_opts_request_min_throughput()`
  */
 LINESENDER_API
@@ -850,7 +853,7 @@ line_sender* line_sender_from_conf(
     line_sender_error** err_out);
 
 /**
- * Create a new `line_sender_opts` instance from the configuration stored in the
+ * Create a new `line_sender` instance from the configuration stored in the
  * `QDB_CLIENT_CONF` environment variable.
  *
  * In the case of TCP, this synchronously establishes the TCP connection, and
@@ -867,7 +870,7 @@ line_sender* line_sender_from_env(
 /**
  * Tell whether the sender is no longer usable and must be closed.
  * This happens when there was an earlier failure.
- * This method is specific to ILP-over-TCP and is not relevant for ILP-over-HTTP.
+ * This fuction is specific to ILP-over-TCP and is not relevant for ILP-over-HTTP.
  * @param[in] sender Line sender object.
  * @return true if an error occurred with a sender and it must be closed.
  */
@@ -920,7 +923,8 @@ bool line_sender_flush(
  *
  * All the data stays in the buffer. Clear the buffer before starting a new batch.
  *
- * To send and clear in one step, call `line_sender_flush` instead.
+ * To send and clear in one step, call `line_sender_flush` instead. Also, see the docs
+ * on that function for more important details on flushing.
  * @param[in] sender Line sender object.
  * @param[in] buffer Line buffer object.
  * @return true on success, false on error.
@@ -932,8 +936,8 @@ bool line_sender_flush_and_keep(
     line_sender_error** err_out);
 
 /**
- * Send the batch of rows in the buffer to the QuestDB server, and ensure the flush
- * is transactional.
+ * Send the batch of rows in the buffer to the QuestDB server, and, if the parameter
+ * `transactional` is true, ensure the flush will be transactional.
  *
  * A flush is transactional iff all the rows belong to the same table. This allows
  * QuestDB to treat the flush as a single database transaction, because it doesn't

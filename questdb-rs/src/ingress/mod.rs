@@ -2603,8 +2603,8 @@ impl Sender {
         Ok(())
     }
 
-    /// Send the batch of rows in the buffer to the QuestDB server, and ensure the flush
-    /// is transactional.
+    /// Send the batch of rows in the buffer to the QuestDB server, and, if the
+    /// `transactional` parameter is true, ensure the flush will be transactional.
     ///
     /// A flush is transactional iff all the rows belong to the same table. This allows
     /// QuestDB to treat the flush as a single database transaction, because it doesn't
