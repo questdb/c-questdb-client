@@ -103,17 +103,17 @@ namespace questdb::ingress
         /** Use the set of root certificates provided by the operating system. */
         os_roots,
 
-        /** Use the set of root certificates provided by both the `webpki` crate and the operating system. */
+        /** Combine the set of root certificates provided by the `webpki` crate and the operating system. */
         webpki_and_os_roots,
 
-        /** Use a custom root certificate `.pem` file. */
+        /** Use the root certificates provided in a PEM-encoded file. */
         pem_file,
     };
 
     /**
      * An error that occurred when using the line sender.
      *
-     * Call `.what()` to obtain ASCII encoded error message.
+     * Call `.what()` to obtain the ASCII-encoded error message.
      */
     class line_sender_error : public std::runtime_error
     {
@@ -392,7 +392,7 @@ namespace questdb::ingress
                 return 0;
         }
 
-        /** Number of bytes in the accumulated buffer. */
+        /** The number of bytes in the accumulated buffer. */
         size_t size() const noexcept
         {
             if (_impl)
@@ -411,8 +411,9 @@ namespace questdb::ingress
         }
 
         /**
-         * The buffer is transactional if sent over HTTP.
-         * A buffer stops being transactional if it contains rows for multiple tables.
+         * Tell whether the buffer is transactional. It is transactional iff it contains
+         * data for at most one table. Additionally, you must send the buffer over HTTP to
+         * get transactional behavior.
          */
         bool transactional() const noexcept
         {
@@ -423,8 +424,7 @@ namespace questdb::ingress
         }
 
         /**
-         * Get a view of the accumulated buffer.
-         * This is useful for debugging.
+         * Get a string representation of the contents of the buffer.
          */
         std::string_view peek() const noexcept
         {
@@ -483,7 +483,7 @@ namespace questdb::ingress
         }
 
         /**
-         * Start batching the next row of input for the named table.
+         * Start recording a new row for the given table.
          * @param name Table name.
          */
         line_sender_buffer& table(table_name_view name)
@@ -497,9 +497,8 @@ namespace questdb::ingress
         }
 
         /**
-         * Append a value for a SYMBOL column.
-         * Symbol columns must always be written before other columns for any
-         * given row.
+         * Record a symbol value for the given column.
+         * Make sure you record all the symbol columns before any other column type.
          * @param name Column name.
          * @param value Column value.
          */
@@ -520,7 +519,7 @@ namespace questdb::ingress
         line_sender_buffer& column(column_name_view name, T value) = delete;
 
         /**
-         * Append a value for a BOOLEAN column.
+         * Record a boolean value for the given column.
          * @param name Column name.
          * @param value Column value.
          */
@@ -536,7 +535,7 @@ namespace questdb::ingress
         }
 
         /**
-         * Append a value for a LONG column.
+         * Record an integer value for the given column.
          * @param name Column name.
          * @param value Column value.
          */
@@ -552,7 +551,7 @@ namespace questdb::ingress
         }
 
         /**
-         * Append a value for a DOUBLE column.
+         * Record a floating-point value for the given column.
          * @param name Column name.
          * @param value Column value.
          */
@@ -568,7 +567,7 @@ namespace questdb::ingress
         }
 
         /**
-         * Append a value for a STRING column.
+         * Record a string value for the given column.
          * @param name Column name.
          * @param value Column value.
          */
@@ -605,6 +604,7 @@ namespace questdb::ingress
             return column(name, utf8_view{value});
         }
 
+        /** Record a nanosecond timestamp value for the given column. */
         template <typename ClockT>
         line_sender_buffer& column(
             column_name_view name,
@@ -614,6 +614,8 @@ namespace questdb::ingress
             return column(name, nanos);
         }
 
+        /** Record a timestamp value for the given column, specified as a
+         * `DurationT`. */
         template <typename ClockT, typename DurationT>
         line_sender_buffer& column(
             column_name_view name,
@@ -650,13 +652,15 @@ namespace questdb::ingress
         }
 
         /**
-         * Complete the row with a timestamp specified as nanoseconds.
+         * Complete the current row with the designated timestamp in nanoseconds.
          *
-         * After this call, you can start batching the next row by calling
-         * `.table(..)` again, or you can send the accumulated batch by
-         * calling `.flush(..)`.
+         * After this call, you can start recording the next row by calling
+         * `table()` again, or you can send the accumulated batch by calling
+         * `flush()` or one of its variants.
          *
-         * @param timestamp Number of nanoseconds since 1st Jan 1970 UTC.
+         * If you want to pass the current system timestamp, call `at_now()`.
+         *
+         * @param timestamp Number of nanoseconds since the Unix epoch.
          */
         void at(timestamp_nanos timestamp)
         {
@@ -668,13 +672,13 @@ namespace questdb::ingress
         }
 
         /**
-         * Complete the row with a timestamp specified as microseconds.
+         * Complete the current row with the designated timestamp in microseconds.
          *
-         * After this call, you can start batching the next row by calling
-         * `.table(..)` again, or you can send the accumulated batch by
-         * calling `.flush(..)`.
+         * After this call, you can start recording the next row by calling
+         * `table()` again, or you can send the accumulated batch by calling
+         * `flush()` or one of its variants.
          *
-         * @param timestamp Number of microseconds since 1st Jan 1970 UTC.
+         * @param timestamp Number of microseconds since the Unix epoch.
          */
         void at(timestamp_micros timestamp)
         {
@@ -686,17 +690,24 @@ namespace questdb::ingress
         }
 
         /**
-         * Complete the row without providing a timestamp.
-         * The QuestDB instance will insert its own timestamp.
+         * Complete the current row without providing a timestamp. The QuestDB instance
+         * will insert its own timestamp.
          *
-         * This is NOT equivalent to calling `at()` with the
-         * current system time.
-         * There's a trade-off: Letting the server assign the timestamp
-         * can be faster since it a reliable way to avoid out-of-order
-         * operations in the database for maximum ingestion throughput.
-         * On the other hand, it removes the ability to deduplicate rows.
+         * Letting the server assign the timestamp can be faster since it a reliable way
+         * to avoid out-of-order operations in the database for maximum ingestion
+         * throughput. However, it removes the ability to deduplicate rows.
          *
-         * In almost all cases, you should prefer the `at()` method.
+         * This is NOT equivalent to calling `line_sender_buffer_at_nanos()` or
+         * `line_sender_buffer_at_micros()` with the current time: the QuestDB server
+         * will set the timestamp only after receiving the row. If you're flushing
+         * infrequently, the server-assigned timestamp may be significantly behind the
+         * time the data was recorded in the buffer.
+         *
+         * In almost all cases, you should prefer the `at()`/`at_now()` methods.
+         *
+         * After this call, you can start recording the next row by calling `table()`
+         * again, or you can send the accumulated batch by calling `flush()` or one of
+         * its variants.
          */
         void at_now()
         {
@@ -748,11 +759,18 @@ namespace questdb::ingress
     {
         public:
             /**
-             * Create a new `opts` instance from configuration string.
-             * The format of the string is: "tcp::addr=host:port;key=value;...;"
-             * Alongside "tcp" you can also specify "tcps", "http", and "https".
-             * The accepted set of keys and values is the same as for the opt's API.
-             * E.g. "https::addr=host:port;username=alice;password=secret;tls_ca=os_roots;"
+              * Create a new `opts` instance from the given configuration string.
+              * The format of the string is: "tcp::addr=host:port;key=value;...;"
+              * Instead of "tcp" you can also specify "tcps", "http", and "https".
+              *
+              * The accepted keys match one-for-one with the methods on `opts`.
+              * For example, this is a valid configuration string:
+              *
+              * "https::addr=host:port;username=alice;password=secret;"
+              *
+              * and there are matching methods `opts.username()` and `opts.password()`.
+              * The value for `addr=` is supplied directly to `opts()`, so there's no
+              * function with a matching name.
              */
             static inline opts from_conf(utf8_view conf)
             {
@@ -762,7 +780,7 @@ namespace questdb::ingress
             }
 
             /**
-             * Create a new `opts` instance from configuration string read from the
+             * Create a new `opts` instance from the configuration stored in the
              * `QDB_CLIENT_CONF` environment variable.
              */
             static inline opts from_env()
@@ -777,7 +795,7 @@ namespace questdb::ingress
             }
 
             /**
-             * A new set of options for a line sender connection.
+             * Create a new `opts` instance with the given protocol, hostname and port.
              * @param[in] protocol The protocol to use.
              * @param[in] host The QuestDB database host.
              * @param[in] port The QuestDB tcp or http port.
@@ -800,7 +818,7 @@ namespace questdb::ingress
             }
 
             /**
-             * A new set of options for a line sender connection.
+             * Create a new `opts` instance with the given protocol, hostname and service name.
              * @param[in] protocol The protocol to use.
              * @param[in] host The QuestDB database host.
              * @param[in] port The QuestDB tcp or http port as service name.
@@ -869,13 +887,13 @@ namespace questdb::ingress
             }
 
             /**
-             * Set the username for basic HTTP authentication.
+             * Set the username for authentication.
              *
              * For TCP this is the `kid` part of the ECDSA key set.
              * The other fields are `token` `token_x` and `token_y`.
              *
              * For HTTP this is part of basic authentication.
-             * Also see `password`.
+             * See also: `password()`.
              */
             opts& username(utf8_view username)
             {
@@ -888,7 +906,7 @@ namespace questdb::ingress
 
             /**
              * Set the password for basic HTTP authentication.
-             * Also see `username`.
+             * See also: `username()`.
              */
             opts& password(utf8_view password)
             {
@@ -954,7 +972,7 @@ namespace questdb::ingress
              * Set to `false` to disable TLS certificate verification.
              * This should only be used for debugging purposes as it reduces security.
              *
-             * For testing consider specifying a path to a `.pem` file instead via
+             * For testing, consider specifying a path to a `.pem` file instead via
              * the `tls_roots` setting.
              */
             opts& tls_verify(bool verify)
@@ -1023,10 +1041,13 @@ namespace questdb::ingress
             }
 
             /**
-             * Minimum expected throughput in bytes per second for HTTP requests.
-             * If the throughput is lower than this value, the connection will time out.
-             * The default is 100 KiB/s.
-             * The value is expressed as a number of bytes per second.
+             * The sender will divide the payload size by this number to determine for how
+             * long to keep sending the payload before timing out.
+             * The value is in bytes per second, and the default is 100 KiB/s.
+             * The timeout calculated from minimum throughput is adedd to the value of
+             * `request_timeout`.
+             *
+             * See also: `request_timeout()`
              */
             opts& request_min_throughput(uint64_t bytes_per_sec)
             {
@@ -1038,8 +1059,11 @@ namespace questdb::ingress
             }
 
             /**
-             * Grace request timeout before relying on the minimum throughput logic.
-             * The default is 10 seconds.
+             * Additional time to wait on top of that calculated from the minimum throughput.
+             * This accounts for the fixed latency of the HTTP request-response roundtrip.
+             * The value is in milliseconds, and the default is 10 seconds.
+             *
+             * See also: `request_min_throughput()`
              */
             opts& request_timeout(uint64_t millis)
             {
@@ -1073,22 +1097,37 @@ namespace questdb::ingress
     };
 
     /**
-     * Insert data into QuestDB via the InfluxDB Line Protocol.
+     * Inserts data into QuestDB via the InfluxDB Line Protocol.
      *
-     * A `line_sender` object connects on construction.
-     * If you want to connect later, wrap it up in an std::optional.
+     * Batch up rows in a `line_sender_buffer` object, then call
+     * `.flush()` or one of its variants to send.
      *
-     * Batch up rows, then call `.flush()` to send.
+     * When you use ILP-over-TCP, the `line_sender` object connects on construction.
+     * If you want to connect later, wrap it in an std::optional.
      */
     class line_sender
     {
     public:
         /**
-         * Create a new `line_sender` instance from configuration string.
+         * Create a new line sender instance from the given configuration string.
          * The format of the string is: "tcp::addr=host:port;key=value;...;"
-         * Alongside "tcp" you can also specify "tcps", "http", and "https".
-         * The accepted set of keys and values is the same as for the opt's API.
-         * E.g. "https::addr=host:port;username=alice;password=secret;tls_ca=os_roots;"
+         * Instead of "tcp" you can also specify "tcps", "http", and "https".
+         *
+         * The accepted keys match one-for-one with the methods on `opts`.
+         * For example, this is a valid configuration string:
+         *
+         * "https::addr=host:port;username=alice;password=secret;"
+         *
+         * and there are matching methods `opts.username()` and `opts.password()`. The
+         * value for `addr=` is supplied directly to `opts()`, so there's no function
+         * with a matching name.
+         *
+         * In the case of TCP, this synchronously establishes the TCP connection, and
+         * returns once the connection is fully established. If the connection
+         * requires authentication or TLS, these will also be completed before
+         * returning.
+         *
+         * The sender should be accessed by only a single thread a time.
          */
         static inline line_sender from_conf(utf8_view conf)
         {
@@ -1096,8 +1135,15 @@ namespace questdb::ingress
         }
 
         /**
-         * Create a new `line_sender` instance from configuration string read from the
+         * Create a new `line_sender` instance from the configuration stored in the
          * `QDB_CLIENT_CONF` environment variable.
+         *
+         * In the case of TCP, this synchronously establishes the TCP connection, and
+         * returns once the connection is fully established. If the connection
+         * requires authentication or TLS, these will also be completed before
+         * returning.
+         *
+         * The sender should be accessed by only a single thread a time.
          */
         static inline line_sender from_env()
         {
@@ -1139,13 +1185,27 @@ namespace questdb::ingress
         }
 
         /**
-         * Send batched-up rows to the QuestDB server.
+         * Send the given buffer of rows to the QuestDB server, clearing the buffer.
          *
-         * This method automatically clears the buffer.
-         * See `flush_and_keep` if you want to retain the buffer contents.
+         * After this function returns, the buffer is empty and ready for the next batch.
+         * If you want to preserve the buffer contents, call `flush_and_keep()`. If you
+         * want to ensure the flush is transactional, call `flush_and_keep_with_flags()`.
          *
-         * After sending a batch, you can close the connection or begin
-         * preparing a new batch by calling `.table(..)` on the buffer again.
+         * With ILP-over-HTTP, this function sends an HTTP request and waits for the
+         * response. If the server responds with an error, it returns a descriptive error.
+         * In the case of a network error, it retries until it has exhausted the retry time
+         * budget.
+         *
+         * With ILP-over-TCP, the function blocks only until the buffer is flushed to the
+         * underlying OS-level network socket, without waiting to actually send it to the
+         * server. In the case of an error, the server will quietly disconnect: consult the
+         * server logs for error messages.
+         *
+         * HTTP should be the first choice, but use TCP if you need to continuously send
+         * data to the server at a high rate.
+         *
+         * To improve the HTTP performance, send larger buffers (with more rows), and
+         * consider parallelizing writes using multiple senders from multiple threads.
          */
         void flush(line_sender_buffer& buffer)
         {
@@ -1158,10 +1218,12 @@ namespace questdb::ingress
         }
 
         /**
-         * Send batched-up rows to the QuestDB server.
+         * Send the given buffer of rows to the QuestDB server.
          *
-         * This method does not affect the buffer and its contains
-         * will be retained.
+         * All the data stays in the buffer. Clear the buffer before starting a new batch.
+         *
+         * To send and clear in one step, call `flush()` instead. Also, see the docs
+         * on that method for more important details on flushing.
          */
         void flush_and_keep(const line_sender_buffer& buffer)
         {
@@ -1186,6 +1248,8 @@ namespace questdb::ingress
 
         /**
          * Check if an error occurred previously and the sender must be closed.
+         * This happens when there was an earlier failure.
+         * This method is specific to ILP-over-TCP and is not relevant for ILP-over-HTTP.
          * @return true if an error occurred with a sender and it must be closed.
          */
         bool must_close() const noexcept
