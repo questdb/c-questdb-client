@@ -551,7 +551,7 @@ pub struct Buffer {
 
 impl Buffer {
     /// Construct a `Buffer` with a `max_name_len` of `127`, which is the same as the
-    /// QuestDB default.
+    /// QuestDB server default.
     pub fn new() -> Self {
         Self {
             output: String::new(),
@@ -695,7 +695,7 @@ impl Buffer {
         Ok(())
     }
 
-    /// Begin recording a row for a given table.
+    /// Begin recording a new row for the given table.
     ///
     /// ```
     /// # use questdb::Result;
@@ -743,7 +743,8 @@ impl Buffer {
         Ok(self)
     }
 
-    /// Record a symbol for a given column.
+    /// Record a symbol for the given column.
+    /// Make sure you record all symbol columns before any other column type.
     ///
     /// ```
     /// # use questdb::Result;
@@ -823,7 +824,7 @@ impl Buffer {
         Ok(self)
     }
 
-    /// Record a boolean value for a column.
+    /// Record a boolean value for the given column.
     ///
     /// ```
     /// # use questdb::Result;
@@ -861,7 +862,7 @@ impl Buffer {
         Ok(self)
     }
 
-    /// Record an integer value for a column.
+    /// Record an integer value for the given column.
     ///
     /// ```
     /// # use questdb::Result;
@@ -902,7 +903,7 @@ impl Buffer {
         Ok(self)
     }
 
-    /// Record a floating point value for a column.
+    /// Record a floating point value for the given column.
     ///
     /// ```
     /// # use questdb::Result;
@@ -941,7 +942,7 @@ impl Buffer {
         Ok(self)
     }
 
-    /// Record a string value for a column.
+    /// Record a string value for the given column.
     ///
     /// ```
     /// # use questdb::Result;
@@ -994,7 +995,7 @@ impl Buffer {
         Ok(self)
     }
 
-    /// Record a timestamp for a column.
+    /// Record a timestamp value for the given column.
     ///
     /// ```
     /// # use questdb::Result;
@@ -1063,8 +1064,9 @@ impl Buffer {
         Ok(self)
     }
 
-    /// Record the designated timestamp of the current row and complete it.
-    /// After calling this method, you can't add more data to the row.
+    /// Complete the current row with the designated timestamp. After this call, you can
+    /// start recording the next row by calling [Buffer::table] again, or  you can send
+    /// the accumulated batch by calling [Sender::flush] or one of its variants.
     ///
     /// ```
     /// # use questdb::Result;
@@ -1128,17 +1130,23 @@ impl Buffer {
         Ok(())
     }
 
-    /// Declare that the current row will use a server-assigned designated timestamp,
-    /// and complete it. After calling this method, you can't add more data to the row.
+    /// Complete the current row without providing a timestamp. The QuestDB instance
+    /// will insert its own timestamp.
     ///
-    /// This is NOT equivalent to calling [`at`](Buffer::at) with the current time.
-    /// There's a trade-off: Letting the server assign the timestamp can be faster
-    /// since it a reliable way to avoid out-of-order operations in the database
-    /// for maximum ingestion throughput.
+    /// Letting the server assign the timestamp can be faster since it reliably avoids
+    /// out-of-order operations in the database for maximum ingestion throughput. However,
+    /// it removes the ability to deduplicate rows.
     ///
-    /// On the other hand, it removes the ability to deduplicate rows.
+    /// This is NOT equivalent to calling [Buffer::at] with the current time: the QuestDB
+    /// server will set the timestamp only after receiving the row. If you're flushing
+    /// infrequently, the server-assigned timestamp may be significantly behind the
+    /// time the data was recorded in the buffer.
     ///
-    /// In almost all cases, you should prefer [`at`](Buffer::at) over this method.
+    /// In almost all cases, you should prefer the [Buffer::at] function.
+    ///
+    /// After this call, you can start recording the next row by calling [Buffer::table]
+    /// again, or you can send the accumulated batch by calling [Sender::flush] or one of
+    /// its variants.
     ///
     /// ```
     /// # use questdb::Result;
@@ -1150,10 +1158,6 @@ impl Buffer {
     /// # Ok(())
     /// # }
     /// ```
-    ///
-    /// The QuestDB server will set the timestamp once it receives the row. If you're
-    /// [`flushing`](Sender::flush) infrequently, the server-assigned timestamp may be
-    /// significantly behind the time the data was recorded in the buffer.
     pub fn at_now(&mut self) -> Result<()> {
         self.check_op(Op::At)?;
         self.output.push('\n');
@@ -1219,7 +1223,7 @@ pub enum CertificateAuthority {
     #[cfg(feature = "tls-native-certs")]
     OsRoots,
 
-    /// Use the root certificates provided by both the OS and the `webpki-roots` crate.
+    /// Combine the root certificates provided by the OS and the `webpki-roots` crate.
     #[cfg(all(feature = "tls-webpki-certs", feature = "tls-native-certs"))]
     WebpkiAndOsRoots,
 
@@ -1550,12 +1554,11 @@ impl Protocol {
     }
 }
 
-/// Accumulate parameters for a new `Sender` instance.
+/// Accumulates parameters for a new `Sender` instance. It can create a sender for either
+/// ILP-over-HTTP or ILP-over-TCP.
 ///
-/// The `SenderBuilder` can be created either for ILP/TCP or ILP/HTTP (with the "ilp-over-http"
-/// feature enabled).
-///
-/// It can also be created from a config string or the `QDB_CLIENT_CONF` environment variable.
+/// You can also create the builder from a config string or the `QDB_CLIENT_CONF`
+/// environment variable.
 ///
 #[cfg_attr(
     feature = "ilp-over-http",
@@ -1638,9 +1641,14 @@ impl SenderBuilder {
     /// sometimes be faster in higher-latency networks, but misses a number of
     /// features.
     ///
-    /// Keys in the config string correspond to same-named methods on `SenderBuilder`.
+    /// The accepted keys match one-for-one with the methods on `SenderBuilder`.
+    /// For example, this is a valid configuration string:
     ///
-    /// E.g. `"https::addr=host:port;username=alice;password=secret;tls_ca=os_roots;"`.
+    /// "https::addr=host:port;username=alice;password=secret;"
+    ///
+    /// and there are matching methods [SenderBuilder::username] and
+    /// [SenderBuilder::password]. The value of `addr=` is supplied directly to the
+    /// `SenderBuilder` constructor, so there's no matching method for that.
     ///
     /// You can also load the configuration from an environment variable. See
     /// [`SenderBuilder::from_env`].
@@ -1789,8 +1797,8 @@ impl SenderBuilder {
         Ok(builder)
     }
 
-    /// Create a new `SenderBuilder` instance from the configuration string present
-    /// in the `QDB_CLIENT_CONF` environment variable.
+    /// Create a new `SenderBuilder` instance from the configuration from the
+    /// configuration stored in the `QDB_CLIENT_CONF` environment variable.
     ///
     /// The format of the string is the same as for [`SenderBuilder::from_conf`].
     pub fn from_env() -> Result<Self> {
@@ -1801,7 +1809,7 @@ impl SenderBuilder {
     }
 
     /// Create a new `SenderBuilder` instance with the provided QuestDB
-    /// server and port using ILP over the specified protocol.
+    /// server and port, using ILP over the specified protocol.
     ///
     /// ```no_run
     /// # use questdb::Result;
@@ -1874,7 +1882,7 @@ impl SenderBuilder {
     /// and [`token_y`](SenderBuilder::token_y).
     ///
     /// For HTTP, this is a part of basic authentication.
-    /// Also see [`password`](SenderBuilder::password).
+    /// See also: [`password`](SenderBuilder::password).
     pub fn username(mut self, username: &str) -> Result<Self> {
         self.username
             .set_specified("username", Some(validate_value(username.to_string())?))?;
@@ -1882,7 +1890,7 @@ impl SenderBuilder {
     }
 
     /// Set the password for basic HTTP authentication.
-    /// Also see [`username`](SenderBuilder::username).
+    /// See also: [`username`](SenderBuilder::username).
     pub fn password(mut self, password: &str) -> Result<Self> {
         self.password
             .set_specified("password", Some(validate_value(password.to_string())?))?;
@@ -1934,7 +1942,7 @@ impl SenderBuilder {
     /// Set to `false` to disable TLS certificate verification.
     /// This should only be used for debugging purposes as it reduces security.
     ///
-    /// For testing consider specifying a path to a `.pem` file instead via
+    /// For testing, consider specifying a path to a `.pem` file instead via
     /// the [`tls_roots`](SenderBuilder::tls_roots) method.
     #[cfg(feature = "insecure-skip-verify")]
     pub fn tls_verify(mut self, verify: bool) -> Result<Self> {
@@ -1954,7 +1962,8 @@ impl SenderBuilder {
     /// Set the path to a custom root certificate `.pem` file.
     /// This is used to validate the server's certificate during the TLS handshake.
     ///
-    /// See notes on how to test with [self-signed certificates](https://github.com/questdb/c-questdb-client/tree/main/tls_certs).
+    /// See notes on how to test with [self-signed
+    /// certificates](https://github.com/questdb/c-questdb-client/tree/main/tls_certs).
     pub fn tls_roots<P: Into<PathBuf>>(self, path: P) -> Result<Self> {
         let mut builder = self.tls_ca(CertificateAuthority::PemFile)?;
         let path = path.into();
@@ -2001,12 +2010,12 @@ impl SenderBuilder {
     }
 
     #[cfg(feature = "ilp-over-http")]
-    /// Minimum expected throughput in bytes per second for HTTP requests.
-    /// If the throughput is lower than this value, the connection will time out.
-    /// The default is 100 KiB/s.
-    /// The value is expressed as a number of bytes per second.
-    /// This is used to calculate additional request timeout, on top of
-    /// the [`request_timeout`](SenderBuilder::request_timeout).
+    /// The sender will divide the payload size by this number to determine for how
+    /// long to keep sending the payload before timing out.
+    /// The value is in bytes per second, and the default is 100 KiB/s.
+    /// The timeout calculated from minimum throughput is adedd to the value of
+    /// [`request_timeout`](SenderBuilder::request_timeout) to get the total timeout
+    /// value.
     pub fn request_min_throughput(mut self, value: u64) -> Result<Self> {
         if let Some(http) = &mut self.http {
             http.request_min_throughput
@@ -2021,9 +2030,10 @@ impl SenderBuilder {
     }
 
     #[cfg(feature = "ilp-over-http")]
-    /// Grace request timeout before relying on the minimum throughput logic.
-    /// The default is 10 seconds.
-    /// See [`request_min_throughput`](SenderBuilder::request_min_throughput) for more details.
+    /// Additional time to wait on top of that calculated from the minimum throughput.
+    /// This accounts for the fixed latency of the HTTP request-response roundtrip.
+    /// The value is in milliseconds, and the default is 10 seconds.
+    /// See also: [`request_min_throughput`](SenderBuilder::request_min_throughput).
     pub fn request_timeout(mut self, value: Duration) -> Result<Self> {
         if let Some(http) = &mut self.http {
             http.request_timeout
@@ -2238,7 +2248,7 @@ impl SenderBuilder {
 
     /// Build the sender.
     ///
-    /// In case of TCP, this synchronously establishes the TCP connection, and
+    /// In the case of TCP, this synchronously establishes the TCP connection, and
     /// returns once the connection is fully established. If the connection
     /// requires authentication or TLS, these will also be completed before
     /// returning.
@@ -2471,7 +2481,7 @@ impl F64Serializer {
 }
 
 impl Sender {
-    /// Create a new `Sender` instance from configuration string.
+    /// Create a new `Sender` instance from the given configuration string.
     ///
     /// The format of the string is: `"http::addr=host:port;key=value;...;"`.
     ///
@@ -2484,18 +2494,27 @@ impl Sender {
     ///
     /// Keys in the config string correspond to same-named methods on `SenderBuilder`.
     ///
-    /// E.g. `"https::addr=host:port;username=alice;password=secret;tls_ca=os_roots;"`.
-    ///
     /// For the full list of keys and values, see the docs on [`SenderBuilder`].
     ///
-    /// If you prefer, you can also load the configuration from an environment variable.
+    /// You can also load the configuration from an environment variable.
     /// See [`Sender::from_env`].
+    ///
+    /// In the case of TCP, this synchronously establishes the TCP connection, and
+    /// returns once the connection is fully established. If the connection
+    /// requires authentication or TLS, these will also be completed before
+    /// returning.
     pub fn from_conf<T: AsRef<str>>(conf: T) -> Result<Self> {
         SenderBuilder::from_conf(conf)?.build()
     }
 
-    /// Create a new `Sender` from the `QDB_CLIENT_CONF` environment variable.
-    /// The format is the same as that taken by [`Sender::from_conf`].
+    /// Create a new `Sender` from the configuration stored in the `QDB_CLIENT_CONF`
+    /// environment variable. The format is the same as that accepted by
+    /// [`Sender::from_conf`].
+    ///
+    /// In the case of TCP, this synchronously establishes the TCP connection, and
+    /// returns once the connection is fully established. If the connection
+    /// requires authentication or TLS, these will also be completed before
+    /// returning.
     pub fn from_env() -> Result<Self> {
         SenderBuilder::from_env()?.build()
     }
@@ -2584,56 +2603,69 @@ impl Sender {
         Ok(())
     }
 
-    /// Variant of `.flush()` that does not clear the buffer and allows for
-    /// transactional flushes.
+    /// Send the batch of rows in the buffer to the QuestDB server, and ensure the flush
+    /// is transactional.
     ///
-    /// A transactional flush is simply a flush that ensures that all rows in
-    /// the ILP buffer refer to the same table, thus allowing the server to
-    /// treat the flush request as a single transaction.
+    /// A flush is transactional iff all the rows belong to the same table. This allows
+    /// QuestDB to treat the flush as a single database transaction, because it doesn't
+    /// support transactions spanning multiple tables. Additionally, only ILP-over-HTTP
+    /// supports transactional flushes.
     ///
-    /// This is because QuestDB does not support transactions spanning multiple
-    /// tables.
+    /// If the flush wouldn't be transactional, this function returns an error and
+    /// doesn't flush any data.
     ///
-    /// Note that transactional flushes are only supported for ILP over HTTP.
+    /// The function sends an HTTP request and waits for the response. If the server
+    /// responds with an error, it returns a descriptive error. In the case of a network
+    /// error, it retries until it has exhausted the retry time budget.
+    ///
+    /// All the data stays in the buffer. Clear the buffer before starting a new batch.
     #[cfg(feature = "ilp-over-http")]
     pub fn flush_and_keep_with_flags(&mut self, buf: &Buffer, transactional: bool) -> Result<()> {
         self.flush_impl(buf, transactional)
     }
 
-    /// Variant of `.flush()` that does not clear the buffer.
+    /// Send the given buffer of rows to the QuestDB server.
+    ///
+    /// All the data stays in the buffer. Clear the buffer before starting a new batch.
+    ///
+    /// To send and clear in one step, call [Sender::flush] instead.
     pub fn flush_and_keep(&mut self, buf: &Buffer) -> Result<()> {
         self.flush_impl(buf, false)
     }
 
-    /// Send buffer to the QuestDB server, clearing the buffer.
+    /// Send the given buffer of rows to the QuestDB server, clearing the buffer.
     ///
-    /// If sending over HTTP, flushing will send an HTTP request and wait
-    /// for the response. If the server responds with an error, this function
-    /// will return a descriptive error. In case of network errors,
-    /// this function will retry.
+    /// After this function returns, the buffer is empty and ready for the next batch.
+    /// If you want to preserve the buffer contents, call [Sender::flush_and_keep]. If
+    /// you want to ensure the flush is transactional, call
+    /// [Sender::flush_and_keep_with_flags].
     ///
-    /// If sending over TCP, this will block until the buffer is flushed to the
-    /// network socket. Note that this does not guarantee that the buffer will
-    /// be sent to the server or that the server has received it.
-    /// In case of errors the server will disconnect: consult the server logs.
+    /// With ILP-over-HTTP, this function sends an HTTP request and waits for the
+    /// response. If the server responds with an error, it returns a descriptive error.
+    /// In the case of a network error, it retries until it has exhausted the retry time
+    /// budget.
     ///
-    /// Prefer HTTP in most cases, but use TCP if you need to continuously
+    /// With ILP-over-TCP, the function blocks only until the buffer is flushed to the
+    /// underlying OS-level network socket, without waiting to actually send it to the
+    /// server. In the case of an error, the server will quietly disconnect: consult the
+    /// server logs for error messages.
+    ///
+    /// HTTP should be the first choice, but use TCP if you need to continuously send
     /// data to the server at a high rate.
     ///
-    /// To improve HTTP performance, send larger buffers (with more rows),
-    /// and consider parallelizing writes using multiple senders from multiple
-    /// threads.
+    /// To improve the HTTP performance, send larger buffers (with more rows), and
+    /// consider parallelizing writes using multiple senders from multiple threads.
     pub fn flush(&mut self, buf: &mut Buffer) -> Result<()> {
         self.flush_impl(buf, false)?;
         buf.clear();
         Ok(())
     }
 
-    /// The sender is no longer usable and must be dropped.
+    /// Tell whether the sender is no longer usable and must be dropped.
     ///
-    /// This is caused if there was an earlier failure.
+    /// This happens when there was an earlier failure.
     ///
-    /// This method is specific to ILP/TCP and is not relevant for ILP/HTTP.
+    /// This method is specific to ILP-over-TCP and is not relevant for ILP-over-HTTP.
     pub fn must_close(&self) -> bool {
         !self.connected
     }
