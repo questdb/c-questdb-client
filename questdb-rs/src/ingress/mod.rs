@@ -550,8 +550,8 @@ pub struct Buffer {
 }
 
 impl Buffer {
-    /// Construct an instance with a `max_name_len` of `127`,
-    /// which is the same as the QuestDB default.
+    /// Construct a `Buffer` with a `max_name_len` of `127`, which is the same as the
+    /// QuestDB default.
     pub fn new() -> Self {
         Self {
             output: String::new(),
@@ -561,7 +561,7 @@ impl Buffer {
         }
     }
 
-    /// Construct an instance with a custom maximum length for table and column names.
+    /// Construct a `Buffer` with a custom maximum length for table and column names.
     ///
     /// This should match the `cairo.max.file.name.length` setting of the
     /// QuestDB instance you're connecting to.

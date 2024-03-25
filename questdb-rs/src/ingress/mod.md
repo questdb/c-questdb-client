@@ -142,11 +142,11 @@ Instead of a fixed timeout value, we use a flexible timeout that depends on the
 size of the HTTP request payload (how much data is in the buffer that you're
 flushing). You can configure it using two options:
 
-* `request_timeout` (milliseconds, default 10 seconds): how much to wait for the
-  response from the server, before starting to send the payload.
 * `request_min_throughput` (bytes per second, default 100 KiB/s): divide the
   payload size by this number to determine for how long to keep sending the
   payload before timing out.
+* `request_timeout` (milliseconds, default 10 seconds): additional time
+  allowance to account for the fixed latency of the request-response roundtrip.
 
 Finally, the client will keep retrying the request if it experiences errors. You
 can configure the total time budget for retrying:
@@ -170,11 +170,11 @@ Here are a few more things to keep in mind.
 
 ## Sequential Coupling in the Buffer API
 
-The fluent API of [`Buffer`] has sequential coupling: there's a certain order
-in which you are expected to call the methods. For example, you must write the
-symbols before the columns, and you must terminate each row by calling
-either [`at`](Buffer::at) or [`at_now`](Buffer::at_now). Refer to the [`Buffer`]
-doc for full rules and a flowchart.
+The fluent API of [`Buffer`] has sequential coupling: there's a certain order in
+which you are expected to call the methods. For example, you must write the
+symbols before the columns, and you must terminate each row by calling either
+[`at`](Buffer::at) or [`at_now`](Buffer::at_now). Refer to the [`Buffer`] doc
+for the full rules and a flowchart.
 
 ## Flushing
 
