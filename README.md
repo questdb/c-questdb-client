@@ -4,7 +4,7 @@
 This library makes it easy to insert data into [QuestDB](https://questdb.io/).
 
 This client library implements the [InfluxDB Line Protocol](
-https://questdb.io/docs/reference/api/ilp/overview/) (ILP) over TCP or HTTP.
+https://questdb.io/docs/reference/api/ilp/overview/) (ILP) over HTTP and TCP.
 
 * Implementation is in Rust, with no additional
   [run-time or link-time dependencies](doc/BUILD.md#pre-requisites-and-dependencies)
@@ -24,7 +24,7 @@ streaming use cases).
 | Protocol | Record Insertion Reporting | Data Insertion Performance |
 | -------- | -------------------------- | -------------------------- |
 | **[ILP/HTTP](https://questdb.io/docs/reference/api/ilp/overview/)** | Transaction-level (on flush) | **Excellent** |
-| [ILP/TCP](https://questdb.io/docs/reference/api/ilp/overview/)| Errors in logs; Disconnect on error | **Best** (tolerates higher latency networks) |
+| [ILP/TCP](https://questdb.io/docs/reference/api/ilp/overview/)| Errors in logs; Disconnect on error | **Best** (tolerates higher-latency networks) |
 | [CSV Upload via HTTP](https://questdb.io/docs/reference/api/rest/#imp---import-data) | Configurable | Very Good |
 | [PostgreSQL](https://questdb.io/docs/reference/api/postgres/) | Transaction-level | Good |
 
@@ -33,7 +33,7 @@ See the [flush troubleshooting](doc/CONSIDERATIONS.md) docs for more details on
 how to debug ILP/TCP.
 
 For an overview and code examples, see the
-[ILP page of the developer docs](https://questdb.io/docs/develop/insert-data/#influxdb-line-protocol).
+[InfluxDB Line Protocol page of the developer docs](https://questdb.io/docs/develop/insert-data/#influxdb-line-protocol).
 
 To understand the protocol in more depth, consult the
 [protocol reference docs](https://questdb.io/docs/reference/api/ilp/overview/).
