@@ -2,9 +2,7 @@
 
 The `ingress` module implements QuestDB's variant of the
 [InfluxDB Line Protocol](https://questdb.io/docs/reference/api/ilp/overview/)
-(ILP) over HTTP and TCP. We recommend using HTTP because it has a number of
-features that TCP lacks, such as receiving error messages from the server and
-fine-grained transaction control.
+(ILP) over HTTP and TCP.
 
 To get started:
 
@@ -155,18 +153,47 @@ can configure the total time budget for retrying:
 
 # Usage Considerations
 
-The [Library
-considerations](https://github.com/questdb/c-questdb-client/blob/main/doc/CONSIDERATIONS.md)
-document covers these topics:
+## Don't forget to flush
 
-* Threading
-* Differences between ILP and QuestDB Data Types
-* Data Quality
-* Client-side checks and server errors
-* Flushing
-* Disconnections, data errors and troubleshooting
+The sender and buffer objects are entirely decoupled. This means that the sender
+won't get access to the data in the buffer until you explicitly call
+[`sender.flush(&mut buffer)`](Sender::flush) or a variant. This may lead to a
+pitfall where you drop a buffer that still has some data in it, resulting in
+permanent data loss.
 
-Here are a few more things to keep in mind.
+A common technique is to flush periodically on a timer and/or once the buffer
+exceeds a certain size. You can check the buffer's size by the calling
+[`buffer.len()`](Buffer::len).
+
+The default `flush()` method clears the buffer after sending its data. If you
+want to preserve its contents (for example, to send the same data to multiple
+QuestDB instances), call
+[`sender.flush_and_keep(&mut buffer)`](Sender::flush_and_keep) instead.
+
+## Transactional Flush
+
+When using ILP-over-HTTP, you can arrange that each `flush()` call behaves like
+its own transaction. For this to work, your buffer must contain data that targets
+only one table. This is because QuestDB doesn't support multi-table transactions.
+
+In order to ensure in advance that a flush will be transactional, call
+[`sender.flush_and_keep_with_flags(&mut buffer)`](Sender::flush_and_keep_with_flags).
+This method will refuse to flush a buffer if the flush wouldn't be
+transactional.
+
+## Which transport protocol to use, HTTP or TCP?
+
+The sender supports two transport options, HTTP and TCP. We recommend HTTP as
+the first choice, and TCP only in specific scenarios.
+
+HTTP provides feedback on errors, automatically retries failed requests,
+supports transactional flushing, and is easier to configure.
+
+TCP transport doesn't report any errors to the caller (the server just
+disconnects), has no automatic retries, and requires manual handling of
+connection failures. However, it also has lower overhead than HTTP and may be
+useful in a scenario where you have constantly high data rate and deal with a
+high-latency network connection.
 
 ## Sequential Coupling in the Buffer API
 
@@ -175,22 +202,6 @@ which you are expected to call the methods. For example, you must write the
 symbols before the columns, and you must terminate each row by calling either
 [`at`](Buffer::at) or [`at_now`](Buffer::at_now). Refer to the [`Buffer`] doc
 for the full rules and a flowchart.
-
-## Flushing
-
-[`sender.flush(&mut buffer)`](Sender::flush) clears the buffer, making it ready
-for another batch of rows.
-
-Make sure you've flushed the buffer before dropping it. Otherwise, any messages
-still left in it will silently disappear.
-
-A common technique is to flush periodically on a timer and/or once the buffer
-exceeds a certain size. You can check the buffer's size by the calling
-[`buffer.len()`](Buffer::len).
-
-Flushing automatically clears the buffer. If you want to preserve its contents
-(for example, to send the same data to multiple QuestDB instances), call
-[`flush_and_keep`](Sender::flush_and_keep) instead.
 
 ## Optimization: avoid revalidating names
 
@@ -214,6 +225,19 @@ buffer.table(tide_name)?.column_f64(water_level_name, 17.2)?.at(TimestampNanos::
 # Ok(())
 # }
 ```
+
+## Check out the CONSIDERATIONS document
+
+The [Library
+considerations](https://github.com/questdb/c-questdb-client/blob/main/doc/CONSIDERATIONS.md)
+document covers these topics:
+
+* Threading
+* Differences between the InfluxDB Line Protocol and QuestDB Data Types
+* Data Quality
+* Client-side checks and server errors
+* Flushing
+* Disconnections, data errors and troubleshooting
 
 # Troubleshooting Common Issues
 
