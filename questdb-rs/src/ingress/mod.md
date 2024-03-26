@@ -2,7 +2,7 @@
 
 The `ingress` module implements QuestDB's variant of the
 [InfluxDB Line Protocol](https://questdb.io/docs/reference/api/ilp/overview/)
-(ILP) over HTTP and TCP.
+(ILP).
 
 To get started:
 
