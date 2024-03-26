@@ -151,9 +151,38 @@ can configure the total time budget for retrying:
 
 * `retry_timeout` (milliseconds, default 10 seconds)
 
+# Error Handling
+
+The two supported transport modes, HTTP and TCP, handle errors very differently.
+In a nutshell, HTTP is much better at error handling.
+
+## TCP
+
+TCP doesn't report errors at all to the sender; instead, the server quietly
+disconnects and you'll have to inspect the server logs to get more information
+on the reason. When this has happened, the sender transitions into an error
+state, and it is permanently unusable. You must drop it and create a new sender.
+You can inspect the sender's error state by calling
+[`sender.must_close()`](Sender::must_close).
+
+## HTTP
+
+HTTP distinguishes between recoverable and non-recoverable errors. For
+recoverable ones, it enters a retry loop with exponential backoff, and reports
+the error to the caller only after it has exhausted the retry time budget
+(configuration parameter: `retry_timeout`).
+
+`sender.flush()` and variant methods communicate the error in the `Result`
+return value. The category of the error is signalled through the
+[`ErrorCode`](crate::error::ErrorCode) enum, and it's accompanied with an error
+message.
+
+After the sender has signalled an error, it remains usable. You can handle the
+error as appropriate and continue using it.
+
 # Usage Considerations
 
-## Don't forget to flush
+## Don't Forget to Flush
 
 The sender and buffer objects are entirely decoupled. This means that the sender
 won't get access to the data in the buffer until you explicitly call
@@ -172,28 +201,24 @@ QuestDB instances), call
 
 ## Transactional Flush
 
-When using ILP-over-HTTP, you can arrange that each `flush()` call behaves like
-its own transaction. For this to work, your buffer must contain data that targets
-only one table. This is because QuestDB doesn't support multi-table transactions.
+When using HTTP, you can arrange that each `flush()` call happens within its own
+transaction. For this to work, your buffer must contain data that targets only
+one table. This is because QuestDB doesn't support multi-table transactions.
 
 In order to ensure in advance that a flush will be transactional, call
-[`sender.flush_and_keep_with_flags(&mut buffer)`](Sender::flush_and_keep_with_flags).
-This method will refuse to flush a buffer if the flush wouldn't be
-transactional.
+[`sender.flush_and_keep_with_flags(&mut buffer, true)`](Sender::flush_and_keep_with_flags).
+This call will refuse to flush a buffer if the flush wouldn't be transactional.
 
-## Which transport protocol to use, HTTP or TCP?
+## When to Choose the TCP Transport?
 
-The sender supports two transport options, HTTP and TCP. We recommend HTTP as
-the first choice, and TCP only in specific scenarios.
+As discussed above, the TCP transport mode is raw and simplistic: it doesn't
+report any errors to the caller (the server just disconnects), has no automatic
+retries, requires manual handling of connection failures, and doesn't support
+transactional flushing.
 
-HTTP provides feedback on errors, automatically retries failed requests,
-supports transactional flushing, and is easier to configure.
-
-TCP transport doesn't report any errors to the caller (the server just
-disconnects), has no automatic retries, and requires manual handling of
-connection failures. However, it also has lower overhead than HTTP and may be
-useful in a scenario where you have constantly high data rate and deal with a
-high-latency network connection.
+However, TP has lower overhead than HTTP and it's worthwhile to try out as an
+alternative in a scenario where you have a constantly high data rate and/or deal
+with a high-latency network connection.
 
 ## Sequential Coupling in the Buffer API
 
@@ -203,7 +228,7 @@ symbols before the columns, and you must terminate each row by calling either
 [`at`](Buffer::at) or [`at_now`](Buffer::at_now). Refer to the [`Buffer`] doc
 for the full rules and a flowchart.
 
-## Optimization: avoid revalidating names
+## Optimization: Avoid Revalidating Names
 
 The client validates every name you provide. To avoid the redundant CPU work of
 re-validating the same names on every row, create pre-validated [`ColumnName`]
@@ -226,7 +251,7 @@ buffer.table(tide_name)?.column_f64(water_level_name, 17.2)?.at(TimestampNanos::
 # }
 ```
 
-## Check out the CONSIDERATIONS document
+## Check out the CONSIDERATIONS Document
 
 The [Library
 considerations](https://github.com/questdb/c-questdb-client/blob/main/doc/CONSIDERATIONS.md)
