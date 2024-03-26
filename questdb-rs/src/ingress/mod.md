@@ -228,7 +228,7 @@ report any errors to the caller (the server just disconnects), has no automatic
 retries, requires manual handling of connection failures, and doesn't support
 transactional flushing.
 
-However, TP has lower overhead than HTTP and it's worthwhile to try out as an
+However, TCP has a lower overhead than HTTP and it's worthwhile to try out as an
 alternative in a scenario where you have a constantly high data rate and/or deal
 with a high-latency network connection.
 
