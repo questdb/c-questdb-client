@@ -1554,8 +1554,7 @@ impl Protocol {
     }
 }
 
-/// Accumulates parameters for a new `Sender` instance. It can create a sender for either
-/// ILP-over-HTTP or ILP-over-TCP.
+/// Accumulates parameters for a new `Sender` instance.
 ///
 /// You can also create the builder from a config string or the `QDB_CLIENT_CONF`
 /// environment variable.
@@ -1897,22 +1896,22 @@ impl SenderBuilder {
         Ok(self)
     }
 
-    /// Token (Bearer) Authentication Parameters for ILP over HTTP,
-    /// or the ECDSA private key for ILP over TCP authentication.
+    /// Set the Token (Bearer) Authentication parameter for HTTP,
+    /// or the ECDSA private key for TCP authentication.
     pub fn token(mut self, token: &str) -> Result<Self> {
         self.token
             .set_specified("token", Some(validate_value(token.to_string())?))?;
         Ok(self)
     }
 
-    /// The ECDSA public key X for ILP over TCP authentication.
+    /// Set the ECDSA public key X for TCP authentication.
     pub fn token_x(mut self, token_x: &str) -> Result<Self> {
         self.token_x
             .set_specified("token_x", Some(validate_value(token_x.to_string())?))?;
         Ok(self)
     }
 
-    /// The ECDSA public key Y for ILP over TCP authentication.
+    /// Set the ECDSA public key Y for TCP authentication.
     pub fn token_y(mut self, token_y: &str) -> Result<Self> {
         self.token_y
             .set_specified("token_y", Some(validate_value(token_y.to_string())?))?;
@@ -1980,7 +1979,7 @@ impl SenderBuilder {
         Ok(builder)
     }
 
-    /// The maximum buffer size that the client will flush to the server.
+    /// The maximum buffer size in bytes that the client will flush to the server.
     /// The default is 100 MiB.
     pub fn max_buf_size(mut self, value: usize) -> Result<Self> {
         let min = 1024;
@@ -1995,8 +1994,8 @@ impl SenderBuilder {
     }
 
     #[cfg(feature = "ilp-over-http")]
-    /// Cumulative duration spent in retries.
-    /// The default is 10 seconds.
+    /// Set the cumulative duration spent in retries.
+    /// The value is in milliseconds, and the default is 10 seconds.
     pub fn retry_timeout(mut self, value: Duration) -> Result<Self> {
         if let Some(http) = &mut self.http {
             http.retry_timeout.set_specified("retry_timeout", value)?;
@@ -2010,6 +2009,7 @@ impl SenderBuilder {
     }
 
     #[cfg(feature = "ilp-over-http")]
+    /// Set the minimum acceptable throughput while sending a buffer to the server.
     /// The sender will divide the payload size by this number to determine for how
     /// long to keep sending the payload before timing out.
     /// The value is in bytes per second, and the default is 100 KiB/s.

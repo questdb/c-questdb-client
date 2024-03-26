@@ -392,7 +392,7 @@ namespace questdb::ingress
                 return 0;
         }
 
-        /** The number of bytes in the accumulated buffer. */
+        /** The number of bytes accumulated in the buffer. */
         size_t size() const noexcept
         {
             if (_impl)
@@ -918,8 +918,8 @@ namespace questdb::ingress
             }
 
             /**
-             * Token (Bearer) Authentication Parameters for ILP over HTTP,
-             * or the ECDSA private key for ILP over TCP authentication.
+             * Set the Token (Bearer) Authentication parameter for HTTP,
+             * or the ECDSA private key for TCP authentication.
              */
             opts& token(utf8_view token)
             {
@@ -931,7 +931,7 @@ namespace questdb::ingress
             }
 
             /**
-             * The ECDSA public key X for ILP over TCP authentication.
+             * Set the ECDSA public key X for TCP authentication.
              */
             opts& token_x(utf8_view token_x)
             {
@@ -943,7 +943,7 @@ namespace questdb::ingress
             }
 
             /**
-             * The ECDSA public key Y for ILP over TCP authentication.
+             * Set the ECDSA public key Y for TCP authentication.
              */
             opts& token_y(utf8_view token_y)
             {
@@ -957,7 +957,7 @@ namespace questdb::ingress
             /**
              * Configure how long to wait for messages from the QuestDB server during
              * the TLS handshake and authentication process.
-             * The default is 15 seconds.
+             * The value is in milliseconds, and the default is 15 seconds.
              */
             opts& auth_timeout(uint64_t millis)
             {
@@ -1015,7 +1015,7 @@ namespace questdb::ingress
             }
 
             /**
-             * The maximum buffer size that the client will flush to the server.
+             * The maximum buffer size in bytes that the client will flush to the server.
              * The default is 100 MiB.
              */
             opts& max_buf_size(size_t max_buf_size)
@@ -1028,8 +1028,8 @@ namespace questdb::ingress
             }
 
             /**
-             * Cumulative duration spent in retries.
-             * The default is 10 seconds.
+             * Set the cumulative duration spent in retries.
+             * The value is in milliseconds, and the default is 10 seconds.
              */
             opts& retry_timeout(uint64_t millis)
             {
@@ -1041,6 +1041,7 @@ namespace questdb::ingress
             }
 
             /**
+             * Set the minimum acceptable throughput while sending a buffer to the server.
              * The sender will divide the payload size by this number to determine for how
              * long to keep sending the payload before timing out.
              * The value is in bytes per second, and the default is 100 KiB/s.

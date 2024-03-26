@@ -343,7 +343,7 @@ void line_sender_buffer_clear_marker(
 LINESENDER_API
 void line_sender_buffer_clear(line_sender_buffer* buffer);
 
-/** The number of bytes in the accumulated buffer. */
+/** The number of bytes accumulated in the buffer. */
 LINESENDER_API
 size_t line_sender_buffer_size(const line_sender_buffer* buffer);
 
@@ -566,13 +566,13 @@ bool line_sender_buffer_at_now(
 /**
  * Inserts data into QuestDB via the InfluxDB Line Protocol.
  *
- * Batch up rows in a `line_sender_buffer`, then call `flush()` or one of its
- * variants with this object to send them.
+ * Batch up rows in a `line_sender_buffer`, then call `line_sender_flush()` or
+ * one of its variants with this object to send them.
  */
 typedef struct line_sender line_sender;
 
 /**
- * Accumulates parameters for creating a line sender connection.
+ * Accumulates parameters for a new `line_sender` object.
  */
 typedef struct line_sender_opts line_sender_opts;
 
@@ -647,8 +647,8 @@ bool line_sender_opts_bind_interface(
  * For TCP, this is the `kid` part of the ECDSA key set.
  * The other fields are `token` `token_x` and `token_y`.
  *
- * For HTTP this is part of basic authentication.
- * See also: `password()`.
+ * For HTTP, this is part of basic authentication.
+ * See also: `line_sender_opts_password()`.
  */
 LINESENDER_API
 bool line_sender_opts_username(
@@ -658,7 +658,7 @@ bool line_sender_opts_username(
 
 /**
  * Set the password for basic HTTP authentication.
- * See also: `username()`.
+ * See also: `line_sender_opts_username()`.
  */
 LINESENDER_API
 bool line_sender_opts_password(
@@ -667,8 +667,8 @@ bool line_sender_opts_password(
     line_sender_error** err_out);
 
 /**
- * Token (Bearer) Authentication Parameters for ILP over HTTP,
- * or the ECDSA private key for ILP over TCP authentication.
+ * Set the Token (Bearer) Authentication parameter for HTTP,
+ * or the ECDSA private key for TCP authentication.
  */
 LINESENDER_API
 bool line_sender_opts_token(
@@ -677,7 +677,7 @@ bool line_sender_opts_token(
     line_sender_error** err_out);
 
 /**
- * The ECDSA public key X for ILP over TCP authentication.
+ * Set the ECDSA public key X for TCP authentication.
  */
 LINESENDER_API
 bool line_sender_opts_token_x(
@@ -686,7 +686,7 @@ bool line_sender_opts_token_x(
     line_sender_error** err_out);
 
 /**
- * The ECDSA public key Y for ILP over TCP authentication.
+ * Set the ECDSA public key Y for TCP authentication.
  */
 LINESENDER_API
 bool line_sender_opts_token_y(
@@ -697,7 +697,7 @@ bool line_sender_opts_token_y(
 /**
  * Configure how long to wait for messages from the QuestDB server during
  * the TLS handshake and authentication process.
- * The default is 15 seconds.
+ * The value is in milliseconds, and the default is 15 seconds.
  */
 LINESENDER_API
 bool line_sender_opts_auth_timeout(
@@ -742,7 +742,7 @@ bool line_sender_opts_tls_roots(
     line_sender_error** err_out);
 
 /**
- * The maximum buffer size that the client will flush to the server.
+ * Set the maximum buffer size in bytes that the client will flush to the server.
  * The default is 100 MiB.
  */
 LINESENDER_API
@@ -752,8 +752,8 @@ bool line_sender_opts_max_buf_size(
     line_sender_error** err_out);
 
 /**
- * Cumulative duration spent in retries.
- * The default is 10 seconds.
+ * Set the cumulative duration spent in retries.
+ * The value is in milliseconds, and the default is 10 seconds.
  */
 LINESENDER_API
 bool line_sender_opts_retry_timeout(
@@ -762,6 +762,7 @@ bool line_sender_opts_retry_timeout(
     line_sender_error** err_out);
 
 /**
+ * Set the minimum acceptable throughput while sending a buffer to the server.
  * The sender will divide the payload size by this number to determine for how
  * long to keep sending the payload before timing out.
  * The value is in bytes per second, and the default is 100 KiB/s.
@@ -777,9 +778,9 @@ bool line_sender_opts_request_min_throughput(
     line_sender_error** err_out);
 
 /**
- * Additional time to wait on top of that calculated from the minimum throughput.
- * This accounts for the fixed latency of the HTTP request-response roundtrip.
- * The value is in milliseconds, and the default is 10 seconds.
+ * Set the additional time to wait on top of that calculated from the minimum
+ * throughput. This accounts for the fixed latency of the HTTP request-response
+ * roundtrip. The value is in milliseconds, and the default is 10 seconds.
  *
  * See also: `line_sender_opts_request_min_throughput()`
  */
@@ -870,7 +871,7 @@ line_sender* line_sender_from_env(
 /**
  * Tell whether the sender is no longer usable and must be closed.
  * This happens when there was an earlier failure.
- * This fuction is specific to ILP-over-TCP and is not relevant for ILP-over-HTTP.
+ * This fuction is specific to TCP and is not relevant for HTTP.
  * @param[in] sender Line sender object.
  * @return true if an error occurred with a sender and it must be closed.
  */
@@ -962,11 +963,11 @@ bool line_sender_flush_and_keep_with_flags(
 
 /////////// Getting the current timestamp.
 
-/** Get the current time in nanoseconds since the unix epoch (UTC). */
+/** Get the current time in nanoseconds since the Unix epoch (UTC). */
 LINESENDER_API
 int64_t line_sender_now_nanos();
 
-/** Get the current time in microseconds since the unix epoch (UTC). */
+/** Get the current time in microseconds since the Unix epoch (UTC). */
 LINESENDER_API
 int64_t line_sender_now_micros();
 
