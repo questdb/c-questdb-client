@@ -31,6 +31,64 @@ fn main() -> Result<()> {
 }
 ```
 
+# Configuration String
+
+The easiest way to configure all the available parameters on a line sender is
+the configuration string. The general structure is:
+
+```plain
+<transport>::addr=host:port;param1=val1;param2=val2;...
+```
+
+`transport` can be `http`, `https`, `tcp`, or `tcps`. See the full details on
+supported parameters in a dedicated section below.
+
+# Don't Forget to Flush
+
+The sender and buffer objects are entirely decoupled. This means that the sender
+won't get access to the data in the buffer until you explicitly call
+[`sender.flush(&mut buffer)`](Sender::flush) or a variant. This may lead to a
+pitfall where you drop a buffer that still has some data in it, resulting in
+permanent data loss.
+
+A common technique is to flush periodically on a timer and/or once the buffer
+exceeds a certain size. You can check the buffer's size by the calling
+[`buffer.len()`](Buffer::len).
+
+The default `flush()` method clears the buffer after sending its data. If you
+want to preserve its contents (for example, to send the same data to multiple
+QuestDB instances), call
+[`sender.flush_and_keep(&mut buffer)`](Sender::flush_and_keep) instead.
+
+# Error Handling
+
+The two supported transport modes, HTTP and TCP, handle errors very differently.
+In a nutshell, HTTP is much better at error handling.
+
+## TCP
+
+TCP doesn't report errors at all to the sender; instead, the server quietly
+disconnects and you'll have to inspect the server logs to get more information
+on the reason. When this has happened, the sender transitions into an error
+state, and it is permanently unusable. You must drop it and create a new sender.
+You can inspect the sender's error state by calling
+[`sender.must_close()`](Sender::must_close).
+
+## HTTP
+
+HTTP distinguishes between recoverable and non-recoverable errors. For
+recoverable ones, it enters a retry loop with exponential backoff, and reports
+the error to the caller only after it has exhausted the retry time budget
+(configuration parameter: `retry_timeout`).
+
+`sender.flush()` and variant methods communicate the error in the `Result`
+return value. The category of the error is signalled through the
+[`ErrorCode`](crate::error::ErrorCode) enum, and it's accompanied with an error
+message.
+
+After the sender has signalled an error, it remains usable. You can handle the
+error as appropriate and continue using it.
+
 # Configuration Parameters
 
 In the examples below, we'll use configuration strings. We also provide the
@@ -151,53 +209,7 @@ can configure the total time budget for retrying:
 
 * `retry_timeout` (milliseconds, default 10 seconds)
 
-# Error Handling
-
-The two supported transport modes, HTTP and TCP, handle errors very differently.
-In a nutshell, HTTP is much better at error handling.
-
-## TCP
-
-TCP doesn't report errors at all to the sender; instead, the server quietly
-disconnects and you'll have to inspect the server logs to get more information
-on the reason. When this has happened, the sender transitions into an error
-state, and it is permanently unusable. You must drop it and create a new sender.
-You can inspect the sender's error state by calling
-[`sender.must_close()`](Sender::must_close).
-
-## HTTP
-
-HTTP distinguishes between recoverable and non-recoverable errors. For
-recoverable ones, it enters a retry loop with exponential backoff, and reports
-the error to the caller only after it has exhausted the retry time budget
-(configuration parameter: `retry_timeout`).
-
-`sender.flush()` and variant methods communicate the error in the `Result`
-return value. The category of the error is signalled through the
-[`ErrorCode`](crate::error::ErrorCode) enum, and it's accompanied with an error
-message.
-
-After the sender has signalled an error, it remains usable. You can handle the
-error as appropriate and continue using it.
-
 # Usage Considerations
-
-## Don't Forget to Flush
-
-The sender and buffer objects are entirely decoupled. This means that the sender
-won't get access to the data in the buffer until you explicitly call
-[`sender.flush(&mut buffer)`](Sender::flush) or a variant. This may lead to a
-pitfall where you drop a buffer that still has some data in it, resulting in
-permanent data loss.
-
-A common technique is to flush periodically on a timer and/or once the buffer
-exceeds a certain size. You can check the buffer's size by the calling
-[`buffer.len()`](Buffer::len).
-
-The default `flush()` method clears the buffer after sending its data. If you
-want to preserve its contents (for example, to send the same data to multiple
-QuestDB instances), call
-[`sender.flush_and_keep(&mut buffer)`](Sender::flush_and_keep) instead.
 
 ## Transactional Flush
 
