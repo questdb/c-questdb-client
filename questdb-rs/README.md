@@ -1,15 +1,17 @@
 # QuestDB Client Library for Rust
 
-Official Rust client for [QuestDB](https://questdb.io/), an open-source SQL database designed to process time-series data, faster.
+Official Rust client for [QuestDB](https://questdb.io/), an open-source SQL
+database designed to process time-series data, faster.
 
-The client library is designed for fast ingestion of data into QuestDB via the InfluxDB Line Protocol (ILP).
+The client library is designed for fast ingestion of data into QuestDB via the
+InfluxDB Line Protocol (ILP).
 
 * [QuestDB Database docs](https://questdb.io/docs/)
-* [ILP docs](https://questdb.io/docs/reference/api/ilp/overview/)
+* [Docs on InfluxDB Line Protocol](https://questdb.io/docs/reference/api/ilp/overview/)
 
 ## Getting Started
 
-To start using `questdb-rs` add it to your `Cargo.toml`:
+To start using `questdb-rs`, add it to your `Cargo.toml`:
 
 ```toml
 [dependencies]
@@ -18,9 +20,12 @@ questdb-rs = "4.0.0"
 
 ## Docs
 
-See documentation for the [`ingress`](https://docs.rs/questdb-rs/4.0.0/questdb/ingress/) module to insert data into QuestDB via the ILP protocol.
+See documentation for the
+[`ingress`](https://docs.rs/questdb-rs/4.0.0/questdb/ingress/) module to insert
+data into QuestDB via the ILP protocol.
 
-* Latest API docs: [https://docs.rs/questdb-rs/latest/](https://docs.rs/questdb-rs/latest/)
+* Latest API docs:
+  [https://docs.rs/questdb-rs/latest/](https://docs.rs/questdb-rs/latest/)
 
 ## Example
 
@@ -48,28 +53,30 @@ fn main() -> Result<()> {
 
 ## Crate features
 
-This Rust crate supports a number of optional features.
+This Rust crate supports a number of optional features, in most cases linked
+to additional library dependencies.
 
-For example, if you want to work with ILP/HTTP and work with Chrono timestamps,
-use:
+For example, if you want to work with Chrono timestamps, use:
 
 ```bash
-cargo add questdb-rs --features ilp-over-http chrono
+cargo add questdb-rs --features chrono_timestamp
 ```
 
 ### Default-enabled features
 
-* `tls-webpki-certs`: Use the `webpki-roots` crate for TLS cert verification.
+* `ilp-over-http`: Enables ILP/HTTP support via the `ureq` crate.
+* `tls-webpki-certs`: Supports using the `webpki-roots` crate for TLS
+  certificate verification.
 
 ### Optional features
 
-These features are opt-in as they bring in additional downstream dependencies.
+These features are opt-in:
 
-* `ilp-over-http`: Enables ILP/HTTP support via the `ureq` crate.
+* `chrono_timestamp`: Allows specifying timestamps as `chrono::Datetime` objects.
 * `tls-native-certs`: Supports validating TLS certificates against the OS's
   certificates store.
-* `insecure-skip-verify`: Allows skipping TLS validation.
-* `chrono_timestamp`: Allows specifying timestamps as `chrono::Datetime` objects.
+* `insecure-skip-verify`: Allows skipping server certificate validation in TLS
+  (this compromises security).
 
 ## C, C++ and Python APIs
 

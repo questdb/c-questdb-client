@@ -51,7 +51,7 @@ chrono = "0.4.31"
 tempfile = "3.2.0"
 
 [features]
-default = ["tls-webpki-certs"]
+default = ["tls-webpki-certs", "ilp-over-http"]
 
 # Include support for ILP over HTTP.
 ilp-over-http = ["dep:ureq", "dep:serde_json", "dep:rand"]

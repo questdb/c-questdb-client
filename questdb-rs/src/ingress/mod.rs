@@ -22,163 +22,7 @@
  *
  ******************************************************************************/
 
-//! # Fast Ingestion of data into QuestDB
-//!
-//! The `ingress` module implements QuestDB's variant of the
-//! [InfluxDB Line Protocol](https://questdb.io/docs/reference/api/ilp/overview/)
-//! (ILP) over TCP.
-//!
-//! To get started:
-//!   * Connect to QuestDB by creating a [`Sender`] object, usually via [`Sender::from_conf`].
-//!   * Populate a [`Buffer`] with one or more rows of data.
-//!   * Send the buffer via the Sender's [`flush`](Sender::flush) method.
-//!
-//! ```rust no_run
-//! use questdb::{
-//!     Result,
-//!     ingress::{
-//!         Sender,
-//!         Buffer,
-//!         TimestampNanos}};
-//!
-//! fn main() -> Result<()> {
-//!    let mut sender = Sender::from_conf("http::addr=localhost:9000;")?;
-//!    let mut buffer = Buffer::new();
-//!    buffer
-//!        .table("sensors")?
-//!        .symbol("id", "toronto1")?
-//!        .column_f64("temperature", 20.0)?
-//!        .column_i64("humidity", 50)?
-//!        .at(TimestampNanos::now())?;
-//!    sender.flush(&mut buffer)?;
-//!    Ok(())
-//! }
-//! ```
-//!
-//! # Flushing
-//!
-//! The Sender's [`flush`](Sender::flush) method will clear the buffer
-//! which is then reusable for another batch of rows.
-//!
-//! Dropping the sender will close the connection to QuestDB and any unflushed
-//! messages will be lost: In other words, *do not forget to
-//! [`flush`](Sender::flush) before closing the connection!*
-//!
-//! A common technique is to flush periodically on a timer and/or once the
-//! buffer exceeds a certain size.
-//! You can check the buffer's size by the calling Buffer's [`len`](Buffer::len)
-//! method.
-//!
-//! Note that flushing will automatically clear the buffer's contents.
-//! If you'd rather preserve the contents (for example, to send the same data to
-//! multiple QuestDB instances), you can call
-//! [`flush_and_keep`](Sender::flush_and_keep) instead.
-//!
-//! # Connection Security Options
-//!
-//! To establish an [authenticated](https://questdb.io/docs/reference/api/ilp/authenticate)
-//! and TLS-encrypted connection, call the SenderBuilder's authentication and tls methods.
-//!
-//! Here's an example that uses full security with TCP:
-//!
-//! ```no_run
-//! # use questdb::Result;
-//! use questdb::ingress::{Protocol, SenderBuilder};
-//!
-//! # fn main() -> Result<()> {
-//! // See: https://questdb.io/docs/reference/api/ilp/authenticate
-//! let mut sender = SenderBuilder::new(Protocol::Tcps, "localhost", 9009)
-//!     .username("testUser1")? // kid
-//!     .token("5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48")? // d
-//!     .token_x("fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU")? // x
-//!     .token_y("Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac")? // y
-//!     .build()?;
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! Note that Open Source QuestDB does not natively support TLS
-//! encryption (this is a QuestDB enterprise feature).
-//!
-//! To use TLS with QuestDB open source, use a TLS proxy such as
-//! [HAProxy](http://www.haproxy.org/).
-//!
-//! For testing, you can use a self-signed certificate and key.
-//!
-//! See our notes on [how to generate keys that this library will
-//! accept](https://github.com/questdb/c-questdb-client/tree/main/tls_certs).
-//!
-//! From the API, you can then point to a custom CA file:
-//!
-//! ```no_run
-//! # use questdb::Result;
-//! use std::path::PathBuf;
-//! use questdb::ingress::{SenderBuilder, Protocol, CertificateAuthority};
-//!
-//! # fn main() -> Result<()> {
-//! let mut sender = SenderBuilder::new(Protocol::Tcps, "localhost", 9009)
-//!     .tls_roots("/path/to/server_rootCA.pem")?
-//!     .build()?;
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! # Avoiding revalidating names
-//! To avoid re-validating table and column names, consider re-using them across
-//! rows.
-//!
-//! ```
-//! # use questdb::Result;
-//! use questdb::ingress::{
-//!     TableName,
-//!     ColumnName,
-//!     Buffer,
-//!     TimestampNanos};
-//!
-//! # fn main() -> Result<()> {
-//! let mut buffer = Buffer::new();
-//! let tide_name = TableName::new("tide")?;
-//! let water_level_name = ColumnName::new("water_level")?;
-//! buffer.table(tide_name)?.column_f64(water_level_name, 20.4)?.at(TimestampNanos::now())?;
-//! buffer.table(tide_name)?.column_f64(water_level_name, 17.2)?.at(TimestampNanos::now())?;
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! # Buffer API sequential coupling
-//!
-//! Symbols must always be written before rows. See the [`Buffer`] documentation
-//! for details. Each row must be terminated with a call to either
-//! [`at`](Buffer::at) or [`at_now`](Buffer::at_now).
-//!
-//! # Considerations
-//!
-//! The [Library considerations](https://github.com/questdb/c-questdb-client/blob/main/doc/CONSIDERATIONS.md) documentation
-//! goes through:
-//!   * Threading.
-//!   * Differences between ILP vs QuestDB Data Types.
-//!   * Data Quality
-//!   * Client-side checks and server errors
-//!   * Flushing
-//!   * Disconnections, data errors and troubleshooting
-//!
-//! # Troubleshooting Common Issues
-//!
-//! ## Infrequent Flushing
-//!
-//! You may not see data appear in a timely manner because you’re not calling
-//! the [`flush`](Sender::flush) method often enough.
-//!
-//! ## Debugging disconnects and inspecting errors
-//!
-//! The ILP protocol does not send errors back to the client.
-//! Instead, on error, the QuestDB server will disconnect and any error messages
-//! will be present in the
-//! [server logs](https://questdb.io/docs/troubleshooting/log/).
-//!
-//! If you want to inspect or log a buffer's contents before it is sent, you
-//! can call its [`as_str`](Buffer::as_str) method.
-//!
+#![doc = include_str!("mod.md")]
 
 pub use self::timestamp::*;
 
@@ -231,8 +75,8 @@ fn map_io_to_socket_err(prefix: &str, io_err: io::Error) -> Error {
 ///
 /// This type simply wraps a `&str`.
 ///
-/// You can use it to construct it explicitly to avoid re-validating the same
-/// names over and over.
+/// When you pass a `TableName` instead of a plain string to a [`Buffer`] method,
+/// it doesn't have to validate it again. This saves CPU cycles.
 #[derive(Clone, Copy)]
 pub struct TableName<'a> {
     name: &'a str,
@@ -301,12 +145,12 @@ impl<'a> TableName<'a> {
         Ok(Self { name })
     }
 
-    /// Construct an unvalidated table name.
+    /// Construct a table name without validating it.
     ///
     /// This breaks API encapsulation and is only intended for use
     /// when the the string was already previously validated.
     ///
-    /// Invalid table names will be rejected by the QuestDB server.
+    /// The QuestDB server will reject an invalid table name.
     pub fn new_unchecked(name: &'a str) -> Self {
         Self { name }
     }
@@ -316,8 +160,8 @@ impl<'a> TableName<'a> {
 ///
 /// This type simply wraps a `&str`.
 ///
-/// You can use it to construct it explicitly to avoid re-validating the same
-/// names over and over.
+/// When you pass a `ColumnName` instead of a plain string to a [`Buffer`] method,
+/// it doesn't have to validate it again. This saves CPU cycles.
 #[derive(Clone, Copy)]
 pub struct ColumnName<'a> {
     name: &'a str,
@@ -374,12 +218,12 @@ impl<'a> ColumnName<'a> {
         Ok(Self { name })
     }
 
-    /// Construct an unvalidated column name.
+    /// Construct a column name without validating it.
     ///
     /// This breaks API encapsulation and is only intended for use
     /// when the the string was already previously validated.
     ///
-    /// Invalid column names will be rejected by the QuestDB server.
+    /// The QuestDB server will reject an invalid column name.
     pub fn new_unchecked(name: &'a str) -> Self {
         Self { name }
     }
@@ -612,7 +456,7 @@ impl BufferState {
     }
 }
 
-/// A reusable buffer to prepare ILP messages.
+/// A reusable buffer to prepare a batch of ILP messages.
 ///
 /// # Example
 ///
@@ -643,8 +487,7 @@ impl BufferState {
 /// # }
 /// ```
 ///
-/// The buffer can then be sent with the Sender's [`flush`](Sender::flush)
-/// method.
+/// Send the buffer to QuestDB using [`sender.flush(&mut buffer)`](Sender::flush).
 ///
 /// # Sequential Coupling
 /// The Buffer API is sequentially coupled:
@@ -656,11 +499,11 @@ impl BufferState {
 ///       [`column_f64`](Buffer::column_f64),
 ///       [`column_str`](Buffer::column_str),
 ///       [`column_ts`](Buffer::column_ts)).
-///   * Symbols must always appear before columns.
+///   * Symbols must appear before columns.
 ///   * A row must be terminated with either [`at`](Buffer::at) or
 ///     [`at_now`](Buffer::at_now).
 ///
-/// This diagram might help:
+/// This diagram visualizes the sequence:
 ///
 /// <img src="https://raw.githubusercontent.com/questdb/c-questdb-client/main/api_seq/seq.svg">
 ///
@@ -675,12 +518,13 @@ impl BufferState {
 /// | [`column_str`](Buffer::column_str) | [`STRING`](https://questdb.io/docs/reference/api/ilp/columnset-types#string) |
 /// | [`column_ts`](Buffer::column_ts) | [`TIMESTAMP`](https://questdb.io/docs/reference/api/ilp/columnset-types#timestamp) |
 ///
-/// QuestDB supports both `STRING` columns and `SYMBOL` column types.
+/// QuestDB supports both `STRING` and `SYMBOL` column types.
 ///
-/// To understand the difference refer to the
-/// [QuestDB documentation](https://questdb.io/docs/concept/symbol/), but in
-/// short symbols are interned strings that are most suitable for identifiers
-/// that you expect to be repeated throughout the column.
+/// To understand the difference, refer to the
+/// [QuestDB documentation](https://questdb.io/docs/concept/symbol/). In a nutshell,
+/// symbols are interned strings, most suitable for identifiers that are repeated many
+/// times throughout the column. They offer an advantage in storage space and query
+/// performance.
 ///
 /// # Inserting NULL values
 ///
@@ -688,13 +532,13 @@ impl BufferState {
 ///
 /// # Recovering from validation errors
 ///
-/// If you want to recover from potential validation errors, you can use the
-/// [`set_marker`](Buffer::set_marker) method to track a last known good state,
-/// append as many rows or parts of rows as you like and then call
-/// [`clear_marker`](Buffer::clear_marker) on success.
+/// If you want to recover from potential validation errors, call
+/// [`buffer.set_marker()`](Buffer::set_marker) to track the last known good state,
+/// append as many rows or parts of rows as you like, and then call
+/// [`buffer.clear_marker()`](Buffer::clear_marker) on success.
 ///
-/// If there was an error in one of the table names or other, you can use the
-/// [`rewind_to_marker`](Buffer::rewind_to_marker) method to go back to the
+/// If there was an error in one of the rows, use
+/// [`buffer.rewind_to_marker()`](Buffer::rewind_to_marker) to go back to the
 /// marked last known good state.
 ///
 #[derive(Debug, Clone)]
@@ -706,8 +550,8 @@ pub struct Buffer {
 }
 
 impl Buffer {
-    /// Construct an instance with a `max_name_len` of `127`,
-    /// which is the same as the QuestDB default.
+    /// Construct a `Buffer` with a `max_name_len` of `127`, which is the same as the
+    /// QuestDB server default.
     pub fn new() -> Self {
         Self {
             output: String::new(),
@@ -717,17 +561,17 @@ impl Buffer {
         }
     }
 
-    /// Construct with a custom maximum length for table and column names.
+    /// Construct a `Buffer` with a custom maximum length for table and column names.
     ///
     /// This should match the `cairo.max.file.name.length` setting of the
     /// QuestDB instance you're connecting to.
     ///
-    /// If the server does not configure it the default is `127` and you might
-    /// as well call [`new`](Buffer::new).
+    /// If the server does not configure it, the default is `127` and you can simply
+    /// call [`new`](Buffer::new).
     pub fn with_max_name_len(max_name_len: usize) -> Self {
-        let mut buffer = Self::new();
-        buffer.max_name_len = max_name_len;
-        buffer
+        let mut buf = Self::new();
+        buf.max_name_len = max_name_len;
+        buf
     }
 
     /// Pre-allocate to ensure the buffer has enough capacity for at least the
@@ -738,7 +582,7 @@ impl Buffer {
         self.output.reserve(additional);
     }
 
-    /// Number of bytes accumulated in the buffer.
+    /// The number of bytes accumulated in the buffer.
     pub fn len(&self) -> usize {
         self.output.len()
     }
@@ -748,8 +592,9 @@ impl Buffer {
         self.state.row_count
     }
 
-    /// The buffer is transactional if sent over HTTP.
-    /// A buffer stops being transactional if it contains rows for multiple tables.
+    /// Tells whether the buffer is transactional. It is transactional iff it contains
+    /// data for at most one table. Additionally, you must send the buffer over HTTP to
+    /// get transactional behavior.
     pub fn transactional(&self) -> bool {
         self.state.transactional
     }
@@ -758,13 +603,12 @@ impl Buffer {
         self.output.is_empty()
     }
 
-    /// Number of bytes that can be written to the buffer before it needs to
-    /// resize.
+    /// The total number of bytes the buffer can hold before it needs to resize.
     pub fn capacity(&self) -> usize {
         self.output.capacity()
     }
 
-    /// Inspect the contents of the buffer.
+    /// A string representation of the buffer's contents. Useful for debugging.
     pub fn as_str(&self) -> &str {
         &self.output
     }
@@ -851,7 +695,7 @@ impl Buffer {
         Ok(())
     }
 
-    /// Begin recording a row for a given table.
+    /// Begin recording a new row for the given table.
     ///
     /// ```
     /// # use questdb::Result;
@@ -899,7 +743,8 @@ impl Buffer {
         Ok(self)
     }
 
-    /// Record a symbol for a given column.
+    /// Record a symbol for the given column.
+    /// Make sure you record all symbol columns before any other column type.
     ///
     /// ```
     /// # use questdb::Result;
@@ -979,7 +824,7 @@ impl Buffer {
         Ok(self)
     }
 
-    /// Record a boolean value for a column.
+    /// Record a boolean value for the given column.
     ///
     /// ```
     /// # use questdb::Result;
@@ -1017,7 +862,7 @@ impl Buffer {
         Ok(self)
     }
 
-    /// Record an integer value for a column.
+    /// Record an integer value for the given column.
     ///
     /// ```
     /// # use questdb::Result;
@@ -1058,7 +903,7 @@ impl Buffer {
         Ok(self)
     }
 
-    /// Record a floating point value for a column.
+    /// Record a floating point value for the given column.
     ///
     /// ```
     /// # use questdb::Result;
@@ -1097,7 +942,7 @@ impl Buffer {
         Ok(self)
     }
 
-    /// Record a string value for a column.
+    /// Record a string value for the given column.
     ///
     /// ```
     /// # use questdb::Result;
@@ -1150,7 +995,7 @@ impl Buffer {
         Ok(self)
     }
 
-    /// Record a timestamp for a column.
+    /// Record a timestamp value for the given column.
     ///
     /// ```
     /// # use questdb::Result;
@@ -1219,7 +1064,9 @@ impl Buffer {
         Ok(self)
     }
 
-    /// Terminate the row with a specified timestamp.
+    /// Complete the current row with the designated timestamp. After this call, you can
+    /// start recording the next row by calling [Buffer::table] again, or  you can send
+    /// the accumulated batch by calling [Sender::flush] or one of its variants.
     ///
     /// ```
     /// # use questdb::Result;
@@ -1283,16 +1130,23 @@ impl Buffer {
         Ok(())
     }
 
-    /// Terminate the row with a server-specified timestamp.
+    /// Complete the current row without providing a timestamp. The QuestDB instance
+    /// will insert its own timestamp.
     ///
-    /// This is NOT equivalent to calling [`at`](Buffer::at) with the current time.
-    /// There's a trade-off: Letting the server assign the timestamp can be faster
-    /// since it a reliable way to avoid out-of-order operations in the database
-    /// for maximum ingestion throughput.
+    /// Letting the server assign the timestamp can be faster since it reliably avoids
+    /// out-of-order operations in the database for maximum ingestion throughput. However,
+    /// it removes the ability to deduplicate rows.
     ///
-    /// On the other hand, it removes the ability to deduplicate rows.
+    /// This is NOT equivalent to calling [Buffer::at] with the current time: the QuestDB
+    /// server will set the timestamp only after receiving the row. If you're flushing
+    /// infrequently, the server-assigned timestamp may be significantly behind the
+    /// time the data was recorded in the buffer.
     ///
-    /// In almost all cases, you should prefer [`at`](Buffer::at) over this method.
+    /// In almost all cases, you should prefer the [Buffer::at] function.
+    ///
+    /// After this call, you can start recording the next row by calling [Buffer::table]
+    /// again, or you can send the accumulated batch by calling [Sender::flush] or one of
+    /// its variants.
     ///
     /// ```
     /// # use questdb::Result;
@@ -1304,11 +1158,6 @@ impl Buffer {
     /// # Ok(())
     /// # }
     /// ```
-    ///
-    /// The QuestDB instance will set the timestamp once it receives the row.
-    /// If you're [`flushing`](Sender::flush) infrequently, the timestamp
-    /// assigned by the server may drift significantly from when the data
-    /// was recorded in the buffer.
     pub fn at_now(&mut self) -> Result<()> {
         self.check_op(Op::At)?;
         self.output.push('\n');
@@ -1361,7 +1210,8 @@ enum AuthParams {
     Token(TokenAuthParams),
 }
 
-/// Possible sources of the root certificates used to validate the server's TLS certificate.
+/// Possible sources of the root certificates used to validate the server's TLS
+/// certificate.
 #[derive(PartialEq, Debug, Clone, Copy)]
 pub enum CertificateAuthority {
     /// Use the root certificates provided by the
@@ -1373,11 +1223,11 @@ pub enum CertificateAuthority {
     #[cfg(feature = "tls-native-certs")]
     OsRoots,
 
-    /// Use the root certificates provided by both the OS and the `webpki-roots` crate.
+    /// Combine the root certificates provided by the OS and the `webpki-roots` crate.
     #[cfg(all(feature = "tls-webpki-certs", feature = "tls-native-certs"))]
     WebpkiAndOsRoots,
 
-    /// Use the root certificates provided by a PEM-encoded file.
+    /// Use the root certificates provided in a PEM-encoded file.
     PemFile,
 }
 
@@ -1704,12 +1554,10 @@ impl Protocol {
     }
 }
 
-/// Accumulate parameters for a new `Sender` instance.
+/// Accumulates parameters for a new `Sender` instance.
 ///
-/// The `SenderBuilder` can be created either for ILP/TCP or ILP/HTTP (with the "ilp-over-http"
-/// feature enabled).
-///
-/// It can also be created from a config string or the `QDB_CLIENT_CONF` environment variable.
+/// You can also create the builder from a config string or the `QDB_CLIENT_CONF`
+/// environment variable.
 ///
 #[cfg_attr(
     feature = "ilp-over-http",
@@ -1781,25 +1629,32 @@ pub struct SenderBuilder {
 }
 
 impl SenderBuilder {
-    /// Create a new `SenderBuilder` instance from configuration string.
+    /// Create a new `SenderBuilder` instance from the configuration string.
     ///
     /// The format of the string is: `"http::addr=host:port;key=value;...;"`.
     ///
-    /// Alongside `"http"` you can also specify `"https"`, `"tcp"`, and `"tcps"`.
+    /// Instead of `"http"`, you can also specify `"https"`, `"tcp"`, and `"tcps"`.
     ///
-    /// HTTP is recommended in most cases as is provides better error feedback
-    /// allows controlling transactions. TCP can sometimes be faster in higher-latency
-    /// networks, but misses out on a number of features.
+    /// We recommend HTTP for most cases because it provides more features, like
+    /// reporting errors to the client and supporting transaction control. TCP can
+    /// sometimes be faster in higher-latency networks, but misses a number of
+    /// features.
     ///
-    /// The accepted set of keys and values is the same as for the `SenderBuilder`'s API.
+    /// The accepted keys match one-for-one with the methods on `SenderBuilder`.
+    /// For example, this is a valid configuration string:
     ///
-    /// E.g. `"https::addr=host:port;username=alice;password=secret;tls_ca=os_roots;"`.
+    /// "https::addr=host:port;username=alice;password=secret;"
     ///
-    /// If you prefer, you can also load the configuration from an environment variable.
-    /// See [`SenderBuilder::from_env`].
+    /// and there are matching methods [SenderBuilder::username] and
+    /// [SenderBuilder::password]. The value of `addr=` is supplied directly to the
+    /// `SenderBuilder` constructor, so there's no matching method for that.
     ///
-    /// Once a `SenderBuilder` is created from a string (or from the environment variable)
-    /// it can be further customized before calling [`SenderBuilder::build`].
+    /// You can also load the configuration from an environment variable. See
+    /// [`SenderBuilder::from_env`].
+    ///
+    /// Once you have a `SenderBuilder` instance, you can further customize it
+    /// before calling [`SenderBuilder::build`], but you can't change any settings
+    /// that are already set in the config string.
     pub fn from_conf<T: AsRef<str>>(conf: T) -> Result<Self> {
         let conf = conf.as_ref();
         let conf = questdb_confstr::parse_conf_str(conf)
@@ -1941,8 +1796,8 @@ impl SenderBuilder {
         Ok(builder)
     }
 
-    /// Create a new `SenderBuilder` instance from configuration string read from the
-    /// `QDB_CLIENT_CONF` environment variable.
+    /// Create a new `SenderBuilder` instance from the configuration from the
+    /// configuration stored in the `QDB_CLIENT_CONF` environment variable.
     ///
     /// The format of the string is the same as for [`SenderBuilder::from_conf`].
     pub fn from_env() -> Result<Self> {
@@ -1952,8 +1807,8 @@ impl SenderBuilder {
         Self::from_conf(conf)
     }
 
-    /// Create a new `SenderBuilder` instance from the provided QuestDB
-    /// server and port using ILP over the specified protocol.
+    /// Create a new `SenderBuilder` instance with the provided QuestDB
+    /// server and port, using ILP over the specified protocol.
     ///
     /// ```no_run
     /// # use questdb::Result;
@@ -2021,12 +1876,12 @@ impl SenderBuilder {
 
     /// Set the username for authentication.
     ///
-    /// For TCP this is the `kid` part of the ECDSA key set.
+    /// For TCP, this is the `kid` part of the ECDSA key set.
     /// The other fields are [`token`](SenderBuilder::token), [`token_x`](SenderBuilder::token_x),
     /// and [`token_y`](SenderBuilder::token_y).
     ///
-    /// For HTTP this is part of basic authentication.
-    /// Also see [`password`](SenderBuilder::password).
+    /// For HTTP, this is a part of basic authentication.
+    /// See also: [`password`](SenderBuilder::password).
     pub fn username(mut self, username: &str) -> Result<Self> {
         self.username
             .set_specified("username", Some(validate_value(username.to_string())?))?;
@@ -2034,29 +1889,29 @@ impl SenderBuilder {
     }
 
     /// Set the password for basic HTTP authentication.
-    /// Also see [`username`](SenderBuilder::username).
+    /// See also: [`username`](SenderBuilder::username).
     pub fn password(mut self, password: &str) -> Result<Self> {
         self.password
             .set_specified("password", Some(validate_value(password.to_string())?))?;
         Ok(self)
     }
 
-    /// Token (Bearer) Authentication Parameters for ILP over HTTP,
-    /// or the ECDSA private key for ILP over TCP authentication.
+    /// Set the Token (Bearer) Authentication parameter for HTTP,
+    /// or the ECDSA private key for TCP authentication.
     pub fn token(mut self, token: &str) -> Result<Self> {
         self.token
             .set_specified("token", Some(validate_value(token.to_string())?))?;
         Ok(self)
     }
 
-    /// The ECDSA public key X for ILP over TCP authentication.
+    /// Set the ECDSA public key X for TCP authentication.
     pub fn token_x(mut self, token_x: &str) -> Result<Self> {
         self.token_x
             .set_specified("token_x", Some(validate_value(token_x.to_string())?))?;
         Ok(self)
     }
 
-    /// The ECDSA public key Y for ILP over TCP authentication.
+    /// Set the ECDSA public key Y for TCP authentication.
     pub fn token_y(mut self, token_y: &str) -> Result<Self> {
         self.token_y
             .set_specified("token_y", Some(validate_value(token_y.to_string())?))?;
@@ -2086,7 +1941,7 @@ impl SenderBuilder {
     /// Set to `false` to disable TLS certificate verification.
     /// This should only be used for debugging purposes as it reduces security.
     ///
-    /// For testing consider specifying a path to a `.pem` file instead via
+    /// For testing, consider specifying a path to a `.pem` file instead via
     /// the [`tls_roots`](SenderBuilder::tls_roots) method.
     #[cfg(feature = "insecure-skip-verify")]
     pub fn tls_verify(mut self, verify: bool) -> Result<Self> {
@@ -2106,7 +1961,8 @@ impl SenderBuilder {
     /// Set the path to a custom root certificate `.pem` file.
     /// This is used to validate the server's certificate during the TLS handshake.
     ///
-    /// See notes on how to test with [self-signed certificates](https://github.com/questdb/c-questdb-client/tree/main/tls_certs).
+    /// See notes on how to test with [self-signed
+    /// certificates](https://github.com/questdb/c-questdb-client/tree/main/tls_certs).
     pub fn tls_roots<P: Into<PathBuf>>(self, path: P) -> Result<Self> {
         let mut builder = self.tls_ca(CertificateAuthority::PemFile)?;
         let path = path.into();
@@ -2123,7 +1979,7 @@ impl SenderBuilder {
         Ok(builder)
     }
 
-    /// The maximum buffer size that the client will flush to the server.
+    /// The maximum buffer size in bytes that the client will flush to the server.
     /// The default is 100 MiB.
     pub fn max_buf_size(mut self, value: usize) -> Result<Self> {
         let min = 1024;
@@ -2138,8 +1994,8 @@ impl SenderBuilder {
     }
 
     #[cfg(feature = "ilp-over-http")]
-    /// Cumulative duration spent in retries.
-    /// The default is 10 seconds.
+    /// Set the cumulative duration spent in retries.
+    /// The value is in milliseconds, and the default is 10 seconds.
     pub fn retry_timeout(mut self, value: Duration) -> Result<Self> {
         if let Some(http) = &mut self.http {
             http.retry_timeout.set_specified("retry_timeout", value)?;
@@ -2153,12 +2009,13 @@ impl SenderBuilder {
     }
 
     #[cfg(feature = "ilp-over-http")]
-    /// Minimum expected throughput in bytes per second for HTTP requests.
-    /// If the throughput is lower than this value, the connection will time out.
-    /// The default is 100 KiB/s.
-    /// The value is expressed as a number of bytes per second.
-    /// This is used to calculate additional request timeout, on top of
-    /// the [`request_timeout`](SenderBuilder::request_timeout).
+    /// Set the minimum acceptable throughput while sending a buffer to the server.
+    /// The sender will divide the payload size by this number to determine for how
+    /// long to keep sending the payload before timing out.
+    /// The value is in bytes per second, and the default is 100 KiB/s.
+    /// The timeout calculated from minimum throughput is adedd to the value of
+    /// [`request_timeout`](SenderBuilder::request_timeout) to get the total timeout
+    /// value.
     pub fn request_min_throughput(mut self, value: u64) -> Result<Self> {
         if let Some(http) = &mut self.http {
             http.request_min_throughput
@@ -2173,9 +2030,10 @@ impl SenderBuilder {
     }
 
     #[cfg(feature = "ilp-over-http")]
-    /// Grace request timeout before relying on the minimum throughput logic.
-    /// The default is 10 seconds.
-    /// See [`request_min_throughput`](SenderBuilder::request_min_throughput) for more details.
+    /// Additional time to wait on top of that calculated from the minimum throughput.
+    /// This accounts for the fixed latency of the HTTP request-response roundtrip.
+    /// The value is in milliseconds, and the default is 10 seconds.
+    /// See also: [`request_min_throughput`](SenderBuilder::request_min_throughput).
     pub fn request_timeout(mut self, value: Duration) -> Result<Self> {
         if let Some(http) = &mut self.http {
             http.request_timeout
@@ -2390,7 +2248,7 @@ impl SenderBuilder {
 
     /// Build the sender.
     ///
-    /// In case of TCP, this synchronously establishes the TCP connection, and
+    /// In the case of TCP, this synchronously establishes the TCP connection, and
     /// returns once the connection is fully established. If the connection
     /// requires authentication or TLS, these will also be completed before
     /// returning.
@@ -2623,31 +2481,40 @@ impl F64Serializer {
 }
 
 impl Sender {
-    /// Create a new `Sender` instance from configuration string.
+    /// Create a new `Sender` instance from the given configuration string.
     ///
     /// The format of the string is: `"http::addr=host:port;key=value;...;"`.
     ///
-    /// Alongside `"http"` you can also specify `"https"`, `"tcp"`, and `"tcps"`.
+    /// Instead of `"http"`, you can also specify `"https"`, `"tcp"`, and `"tcps"`.
     ///
-    /// HTTP is recommended in most cases as is provides better error feedback
-    /// allows controlling transactions. TCP can sometimes be faster in higher-latency
-    /// networks, but misses out on a number of features.
+    /// We recommend HTTP for most cases because it provides more features, like
+    /// reporting errors to the client and supporting transaction control. TCP can
+    /// sometimes be faster in higher-latency networks, but misses a number of
+    /// features.
     ///
-    /// The accepted set of keys and values is the same as for the opt's API.
+    /// Keys in the config string correspond to same-named methods on `SenderBuilder`.
     ///
-    /// E.g. `"https::addr=host:port;username=alice;password=secret;tls_ca=os_roots;"`.
+    /// For the full list of keys and values, see the docs on [`SenderBuilder`].
     ///
-    /// For full list of keys and values, see the [`SenderBuilder`] documentation:
-    /// The builder API and the configuration string API are equivalent.
-    ///
-    /// If you prefer, you can also load the configuration from an environment variable.
+    /// You can also load the configuration from an environment variable.
     /// See [`Sender::from_env`].
+    ///
+    /// In the case of TCP, this synchronously establishes the TCP connection, and
+    /// returns once the connection is fully established. If the connection
+    /// requires authentication or TLS, these will also be completed before
+    /// returning.
     pub fn from_conf<T: AsRef<str>>(conf: T) -> Result<Self> {
         SenderBuilder::from_conf(conf)?.build()
     }
 
-    /// Create a new `Sender` from the `QDB_CLIENT_CONF` environment variable.
-    /// The format is the same as that taken by [`Sender::from_conf`].
+    /// Create a new `Sender` from the configuration stored in the `QDB_CLIENT_CONF`
+    /// environment variable. The format is the same as that accepted by
+    /// [`Sender::from_conf`].
+    ///
+    /// In the case of TCP, this synchronously establishes the TCP connection, and
+    /// returns once the connection is fully established. If the connection
+    /// requires authentication or TLS, these will also be completed before
+    /// returning.
     pub fn from_env() -> Result<Self> {
         SenderBuilder::from_env()?.build()
     }
@@ -2736,56 +2603,69 @@ impl Sender {
         Ok(())
     }
 
-    /// Variant of `.flush()` that does not clear the buffer and allows for
-    /// transactional flushes.
+    /// Send the batch of rows in the buffer to the QuestDB server, and, if the
+    /// `transactional` parameter is true, ensure the flush will be transactional.
     ///
-    /// A transactional flush is simply a flush that ensures that all rows in
-    /// the ILP buffer refer to the same table, thus allowing the server to
-    /// treat the flush request as a single transaction.
+    /// A flush is transactional iff all the rows belong to the same table. This allows
+    /// QuestDB to treat the flush as a single database transaction, because it doesn't
+    /// support transactions spanning multiple tables. Additionally, only ILP-over-HTTP
+    /// supports transactional flushes.
     ///
-    /// This is because QuestDB does not support transactions spanning multiple
-    /// tables.
+    /// If the flush wouldn't be transactional, this function returns an error and
+    /// doesn't flush any data.
     ///
-    /// Note that transactional flushes are only supported for ILP over HTTP.
+    /// The function sends an HTTP request and waits for the response. If the server
+    /// responds with an error, it returns a descriptive error. In the case of a network
+    /// error, it retries until it has exhausted the retry time budget.
+    ///
+    /// All the data stays in the buffer. Clear the buffer before starting a new batch.
     #[cfg(feature = "ilp-over-http")]
     pub fn flush_and_keep_with_flags(&mut self, buf: &Buffer, transactional: bool) -> Result<()> {
         self.flush_impl(buf, transactional)
     }
 
-    /// Variant of `.flush()` that does not clear the buffer.
+    /// Send the given buffer of rows to the QuestDB server.
+    ///
+    /// All the data stays in the buffer. Clear the buffer before starting a new batch.
+    ///
+    /// To send and clear in one step, call [Sender::flush] instead.
     pub fn flush_and_keep(&mut self, buf: &Buffer) -> Result<()> {
         self.flush_impl(buf, false)
     }
 
-    /// Send buffer to the QuestDB server, clearing the buffer.
+    /// Send the given buffer of rows to the QuestDB server, clearing the buffer.
     ///
-    /// If sending over HTTP, flushing will send an HTTP request and wait
-    /// for the response. If the server responds with an error, this function
-    /// will return a descriptive error. In case of network errors,
-    /// this function will retry.
+    /// After this function returns, the buffer is empty and ready for the next batch.
+    /// If you want to preserve the buffer contents, call [Sender::flush_and_keep]. If
+    /// you want to ensure the flush is transactional, call
+    /// [Sender::flush_and_keep_with_flags].
     ///
-    /// If sending over TCP, this will block until the buffer is flushed to the
-    /// network socket. Note that this does not guarantee that the buffer will
-    /// be sent to the server or that the server has received it.
-    /// In case of errors the server will disconnect: consult the server logs.
+    /// With ILP-over-HTTP, this function sends an HTTP request and waits for the
+    /// response. If the server responds with an error, it returns a descriptive error.
+    /// In the case of a network error, it retries until it has exhausted the retry time
+    /// budget.
     ///
-    /// Prefer HTTP in most cases, but use TCP if you need to continuously
+    /// With ILP-over-TCP, the function blocks only until the buffer is flushed to the
+    /// underlying OS-level network socket, without waiting to actually send it to the
+    /// server. In the case of an error, the server will quietly disconnect: consult the
+    /// server logs for error messages.
+    ///
+    /// HTTP should be the first choice, but use TCP if you need to continuously send
     /// data to the server at a high rate.
     ///
-    /// To improve HTTP performance, send larger buffers (with more rows),
-    /// and consider parallelizing writes using multiple senders from multiple
-    /// threads.
+    /// To improve the HTTP performance, send larger buffers (with more rows), and
+    /// consider parallelizing writes using multiple senders from multiple threads.
     pub fn flush(&mut self, buf: &mut Buffer) -> Result<()> {
         self.flush_impl(buf, false)?;
         buf.clear();
         Ok(())
     }
 
-    /// The sender is no longer usable and must be dropped.
+    /// Tell whether the sender is no longer usable and must be dropped.
     ///
-    /// This is caused if there was an earlier failure.
+    /// This happens when there was an earlier failure.
     ///
-    /// This method is specific to ILP/TCP and is not relevant for ILP/HTTP.
+    /// This method is specific to ILP-over-TCP and is not relevant for ILP-over-HTTP.
     pub fn must_close(&self) -> bool {
         !self.connected
     }
