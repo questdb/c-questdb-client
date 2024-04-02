@@ -707,3 +707,68 @@ fn test_transactional() -> TestResult {
 
     Ok(())
 }
+
+#[test]
+fn test_timeout_no_accept() -> TestResult {
+    let mut buffer = Buffer::new();
+    buffer
+        .table("test")?
+        .symbol("t1", "v1")?
+        .column_f64("f1", 0.5)?
+        .at(TimestampNanos::new(10000000))?;
+
+    let server = MockServer::new()?;
+    let mut sender = server
+        .lsb_http()
+        .request_timeout(Duration::from_millis(50))?
+        .request_min_throughput(0)?
+        .retry_timeout(Duration::from_secs(0))?
+        .build()?;
+
+    let start = std::time::Instant::now();
+    let res = sender.flush(&mut buffer);
+    let elapsed = std::time::Instant::now() - start;
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::SocketError);
+    assert!(err.msg().contains("timed out"));
+    assert!(elapsed >= Duration::from_millis(50));
+    assert!(elapsed < Duration::from_millis(100));
+    Ok(())
+}
+
+#[test]
+fn test_timeout_with_accept() -> TestResult {
+    let mut buffer = Buffer::new();
+    buffer
+        .table("test")?
+        .symbol("t1", "v1")?
+        .column_f64("f1", 0.5)?
+        .at(TimestampNanos::new(10000000))?;
+
+    let mut server = MockServer::new()?;
+    let mut sender = server
+        .lsb_http()
+        .request_timeout(Duration::from_millis(50))?
+        .request_min_throughput(0)?
+        .retry_timeout(Duration::from_secs(0))?
+        .build()?;
+
+    let server_thread = std::thread::spawn(move || -> io::Result<()> {
+        server.accept()?;
+        std::thread::sleep(Duration::from_millis(100));
+        Ok(())
+    });
+
+    let start = std::time::Instant::now();
+    let res = sender.flush(&mut buffer);
+    let elapsed = std::time::Instant::now() - start;
+    server_thread.join().unwrap()?;
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::SocketError);
+    assert!(err.msg().contains("timed out"));
+    assert!(elapsed >= Duration::from_millis(50));
+    assert!(elapsed < Duration::from_millis(100));
+    Ok(())
+}
