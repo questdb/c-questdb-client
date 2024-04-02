@@ -772,3 +772,32 @@ fn test_timeout_with_accept() -> TestResult {
     assert!(elapsed < Duration::from_millis(100));
     Ok(())
 }
+
+#[test]
+fn test_timeouts_and_retries() -> TestResult {
+    let mut buffer = Buffer::new();
+    buffer
+        .table("test")?
+        .symbol("t1", "v1")?
+        .column_f64("f1", 0.5)?
+        .at(TimestampNanos::new(10000000))?;
+
+    let server = MockServer::new()?;
+    let mut sender = server
+        .lsb_http()
+        .request_timeout(Duration::from_millis(50))?
+        .request_min_throughput(0)?
+        .retry_timeout(Duration::from_millis(100))?
+        .build()?;
+
+    let start = std::time::Instant::now();
+    let res = sender.flush(&mut buffer);
+    let elapsed = std::time::Instant::now() - start;
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::SocketError);
+    assert!(err.msg().contains("timed out"));
+    assert!(elapsed >= Duration::from_millis(150));
+    assert!(elapsed < Duration::from_millis(300));  // 250ms really, but with 50ms grace.
+    Ok(())
+}
