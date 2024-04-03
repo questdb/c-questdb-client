@@ -192,11 +192,6 @@ fn retry_http_send(
     retry_timeout: Duration,
     mut last_err: ureq::Error,
 ) -> Result<ureq::Response, ureq::Error> {
-    eprintln!(
-        "Entering request retry loop, outstanding: {:?} :: {:?}",
-        retry_timeout,
-        std::time::Instant::now()
-    );
     let mut rng = rand::thread_rng();
     let retry_end = std::time::Instant::now() + retry_timeout;
     let mut retry_interval_ms = 10;
@@ -207,14 +202,7 @@ fn retry_http_send(
         if (std::time::Instant::now() + to_sleep) > retry_end {
             return Err(last_err);
         }
-        eprintln!(
-            "Sleeping for {:?} / outstanding: {:?}",
-            to_sleep,
-            retry_end - std::time::Instant::now()
-        );
         sleep(to_sleep);
-        eprintln!("Retrying request :: {:?}", std::time::Instant::now());
-        let start = std::time::Instant::now();
         last_err = match request.clone().send_bytes(buf) {
             Ok(res) => return Ok(res),
             Err(err) => {
@@ -224,12 +212,6 @@ fn retry_http_send(
                 err
             }
         };
-        let elapsed = std::time::Instant::now() - start;
-        eprintln!(
-            "    took {:?}, outstanding: {:?}",
-            elapsed,
-            retry_end - std::time::Instant::now()
-        );
         retry_interval_ms = (retry_interval_ms * 2).min(1000);
     }
 }
@@ -240,20 +222,14 @@ pub(super) fn http_send_with_retries(
     buf: &[u8],
     retry_timeout: Duration,
 ) -> Result<ureq::Response, ureq::Error> {
-    eprintln!("Sending request :: {:?}", std::time::Instant::now());
-    let start = std::time::Instant::now();
     let last_err = match request.clone().send_bytes(buf) {
         Ok(res) => return Ok(res),
         Err(err) => err,
     };
-    let elapsed = std::time::Instant::now() - start;
-    eprintln!("    took {elapsed:?}");
 
     if retry_timeout.is_zero() || !is_retriable_error(&last_err) {
         return Err(last_err);
     }
 
-    let res = retry_http_send(request, buf, retry_timeout, last_err);
-    eprintln!("in total took {:?}", std::time::Instant::now() - start);
-    res
+    retry_http_send(request, buf, retry_timeout, last_err)
 }
