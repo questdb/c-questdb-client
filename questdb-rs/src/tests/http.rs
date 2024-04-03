@@ -798,6 +798,6 @@ fn test_timeouts_and_retries() -> TestResult {
     assert_eq!(err.code(), ErrorCode::SocketError);
     assert!(err.msg().contains("timed out"));
     assert!(elapsed >= Duration::from_millis(150));
-    assert!(elapsed < Duration::from_millis(300));  // 250ms really, but with 50ms grace.
+    assert!(elapsed < Duration::from_millis(300)); // 250ms really, but with 50ms grace.
     Ok(())
 }
