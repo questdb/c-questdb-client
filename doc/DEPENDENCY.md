@@ -91,7 +91,7 @@ FetchContent_Declare(
     GIT_REPOSITORY https://github.com/questdb/c-questdb-client.git
     GIT_TAG CHOSEN_RELEASE_TAG)   # CHANGE ME!
 
-FetchContent_MakeAvailable(c_questdb_client)
+FetchContent_MakeAvailable(c_questdb_client_proj)
 
 add_executable(
     main
