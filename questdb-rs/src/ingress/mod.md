@@ -65,6 +65,27 @@ QuestDB instances), call
 The two supported transport modes, HTTP and TCP, handle errors very differently.
 In a nutshell, HTTP is much better at error handling.
 
+# Health Check
+
+The QuestDB server has a "ping" endpoint you can access to see if it's alive,
+and confirm the version of InfluxDB Line Protocol with which you are
+interacting:
+
+```shell
+curl -I http://localhost:9000/ping
+```
+
+Example of the expected response:
+
+```shell
+HTTP/1.1 204 OK
+Server: questDB/1.0
+Date: Fri, 2 Feb 2024 17:09:38 GMT
+Transfer-Encoding: chunked
+Content-Type: text/plain; charset=utf-8
+X-Influxdb-Version: v2.7.4
+```
+
 ## TCP
 
 TCP doesn't report errors at all to the sender; instead, the server quietly
@@ -231,6 +252,21 @@ transactional flushing.
 However, TCP has a lower overhead than HTTP and it's worthwhile to try out as an
 alternative in a scenario where you have a constantly high data rate and/or deal
 with a high-latency network connection.
+
+### Timestamp Column Name
+
+InfluxDB Line Protocol (ILP) does not give a name to the designated timestamp,
+so if you let this client auto-create the table, it will have the default name.
+To use a custom name, create the table using a DDL statement:
+
+```sql
+CREATE TABLE sensors (
+    my_ts timestamp,
+    id symbol,
+    temperature double,
+    humidity double,
+) timestamp(my_ts);
+```
 
 ## Sequential Coupling in the Buffer API
 
