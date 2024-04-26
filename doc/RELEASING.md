@@ -1,4 +1,4 @@
-# How to publish a new release of the Rust ILP Client library
+# How to publish a new release
 
 ## 1. Ensure you're fully in sync with the remote repo
 
