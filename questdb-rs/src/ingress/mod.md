@@ -65,27 +65,6 @@ QuestDB instances), call
 The two supported transport modes, HTTP and TCP, handle errors very differently.
 In a nutshell, HTTP is much better at error handling.
 
-# Health Check
-
-The QuestDB server has a "ping" endpoint you can access to see if it's alive,
-and confirm the version of InfluxDB Line Protocol with which you are
-interacting:
-
-```shell
-curl -I http://localhost:9000/ping
-```
-
-Example of the expected response:
-
-```shell
-HTTP/1.1 204 OK
-Server: questDB/1.0
-Date: Fri, 2 Feb 2024 17:09:38 GMT
-Transfer-Encoding: chunked
-Content-Type: text/plain; charset=utf-8
-X-Influxdb-Version: v2.7.4
-```
-
 ## TCP
 
 TCP doesn't report errors at all to the sender; instead, the server quietly
@@ -109,6 +88,27 @@ message.
 
 After the sender has signalled an error, it remains usable. You can handle the
 error as appropriate and continue using it.
+
+# Health Check
+
+The QuestDB server has a "ping" endpoint you can access to see if it's alive,
+and confirm the version of InfluxDB Line Protocol with which you are
+interacting:
+
+```shell
+curl -I http://localhost:9000/ping
+```
+
+Example of the expected response:
+
+```shell
+HTTP/1.1 204 OK
+Server: questDB/1.0
+Date: Fri, 2 Feb 2024 17:09:38 GMT
+Transfer-Encoding: chunked
+Content-Type: text/plain; charset=utf-8
+X-Influxdb-Version: v2.7.4
+```
 
 # Configuration Parameters
 
