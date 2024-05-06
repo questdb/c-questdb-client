@@ -2275,7 +2275,8 @@ impl SenderBuilder {
                     ));
                 }
 
-                let user_agent = self.http.as_ref().unwrap().user_agent.as_str();
+                let http_config = self.http.as_ref().unwrap();
+                let user_agent = http_config.user_agent.as_str();
                 let agent_builder = ureq::AgentBuilder::new()
                     .user_agent(user_agent)
                     .no_delay(true);
@@ -2307,6 +2308,8 @@ impl SenderBuilder {
                     }
                     None => None,
                 };
+                let agent_builder =
+                    agent_builder.timeout_connect(*http_config.request_timeout.deref());
                 let agent = agent_builder.build();
                 let proto = self.protocol.schema();
                 let url = format!(
