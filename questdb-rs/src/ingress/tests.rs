@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use super::*;
 use crate::ErrorCode;
 use tempfile::TempDir;
@@ -196,6 +198,32 @@ fn cant_use_ecdsa_auth_with_http() {
         builder.build_auth(),
         "ECDSA authentication is only available with ILP/TCP and not available with ILP/HTTP.",
     );
+}
+
+#[cfg(feature = "ilp-over-http")]
+#[test]
+fn connect_timeout_uses_request_timeout() {
+    let request_timeout = Duration::from_millis(10);
+    let builder = SenderBuilder::new(Protocol::Http, "127.0.0.2", "1111")
+        .request_timeout(request_timeout)
+        .unwrap()
+        .retry_timeout(Duration::from_millis(10))
+        .unwrap()
+        .request_min_throughput(0)
+        .unwrap();
+    let mut sender = builder.build().unwrap();
+    let mut buf = Buffer::new();
+    buf.table("x")
+        .unwrap()
+        .symbol("x", "x")
+        .unwrap()
+        .at_now()
+        .unwrap();
+    let start = Instant::now();
+    sender
+        .flush(&mut buf)
+        .expect_err("Request did not time out");
+    assert!(Instant::now() - start < Duration::from_secs(10));
 }
 
 #[test]
