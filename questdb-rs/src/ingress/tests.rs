@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use super::*;
 use crate::ErrorCode;
 use tempfile::TempDir;
@@ -396,6 +398,32 @@ fn http_retry_timeout() {
     assert_defaulted_eq(&http_config.request_min_throughput, 102400u64);
     assert_defaulted_eq(&http_config.request_timeout, Duration::from_millis(10000));
     assert_specified_eq(&http_config.retry_timeout, Duration::from_millis(100));
+}
+
+#[cfg(feature = "ilp-over-http")]
+#[test]
+fn connect_timeout_uses_request_timeout() {
+    let request_timeout = Duration::from_millis(10);
+    let builder = SenderBuilder::new(Protocol::Http, "127.0.0.2", "1111")
+        .request_timeout(request_timeout)
+        .unwrap()
+        .retry_timeout(Duration::from_millis(10))
+        .unwrap()
+        .request_min_throughput(0)
+        .unwrap();
+    let mut sender = builder.build().unwrap();
+    let mut buf = Buffer::new();
+    buf.table("x")
+        .unwrap()
+        .symbol("x", "x")
+        .unwrap()
+        .at_now()
+        .unwrap();
+    let start = Instant::now();
+    sender
+        .flush(&mut buf)
+        .expect_err("Request did not time out");
+    assert!(Instant::now() - start < Duration::from_secs(10));
 }
 
 #[test]

@@ -441,7 +441,12 @@ fn test_request_timeout() -> TestResult {
     assert!(res.is_err());
     let err = res.unwrap_err();
     assert_eq!(err.code(), ErrorCode::SocketError);
-    assert!(err.msg().contains("timed out reading response"));
+    // different error message on windows
+    if cfg!(windows) {
+        assert!(err.msg().contains("os error 10060"));
+    } else {
+        assert!(err.msg().contains("timed out reading response"));
+    }
     assert!(time_elapsed >= request_timeout);
     Ok(())
 }
@@ -628,7 +633,7 @@ fn test_one_retry() -> TestResult {
                 return Err(io::Error::new(
                     ErrorKind::InvalidInput,
                     "unexpected retry response",
-                ))
+                ));
             }
             Err(err) => err,
         };
