@@ -39,7 +39,8 @@ cargo build
 ## 5. Merge the release branch to master
 
 ```bash
-git commit -m "Bump version: <current> → <new>"
+git commit -a -m "Bump version: <current> → <new>"
+git push
 ```
 
 Replace the `<current>` and `<new>` placeholders!
