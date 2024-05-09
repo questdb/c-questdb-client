@@ -745,7 +745,7 @@ namespace questdb::ingress
         static inline ::line_sender_utf8 name()
         {
             // Maintained by .bumpversion.cfg
-            static const char user_agent[] = "questdb/c++/4.0.1";
+            static const char user_agent[] = "questdb/c++/4.0.2";
             ::line_sender_utf8 utf8 = ::line_sender_utf8_assert(
                 sizeof(user_agent) - 1,
                 user_agent);
