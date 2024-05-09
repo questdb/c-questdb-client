@@ -484,7 +484,6 @@ fn bad_uppercase_addr() {
     let res = Sender::from_conf("tcp::ADDR=localhost:9009;");
     assert!(res.is_err());
     let err = res.unwrap_err();
-    eprint!("err: {:?}", err);
     assert!(err.code() == ErrorCode::ConfigError);
     assert!(err.msg() == "Missing \"addr\" parameter in config string");
 }

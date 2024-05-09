@@ -9,25 +9,16 @@ InfluxDB Line Protocol (ILP).
 * [QuestDB Database docs](https://questdb.io/docs/)
 * [Docs on InfluxDB Line Protocol](https://questdb.io/docs/reference/api/ilp/overview/)
 
-## Getting Started
+## Quick Start
 
-To start using `questdb-rs`, add it to your `Cargo.toml`:
+To start using `questdb-rs`, add it as a dependency of your project:
 
-```toml
-[dependencies]
-questdb-rs = "4.0.0"
+```bash
+cargo add questdb-rs
 ```
 
-## Docs
-
-See documentation for the
-[`ingress`](https://docs.rs/questdb-rs/4.0.0/questdb/ingress/) module to insert
-data into QuestDB via the ILP protocol.
-
-* Latest API docs:
-  [https://docs.rs/questdb-rs/latest/](https://docs.rs/questdb-rs/latest/)
-
-## Example
+Then you can try out this quick example, which connects to a QuestDB server
+running on your local machine:
 
 ```rust no_run
 use questdb::{
@@ -50,6 +41,11 @@ fn main() -> Result<()> {
    Ok(())
 }
 ```
+
+## Docs
+
+Most of the client documentation is on the
+[`ingress`](https://docs.rs/questdb-rs/4.0.1/questdb/ingress/) module page.
 
 ## Crate features
 
