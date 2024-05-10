@@ -130,6 +130,21 @@ fn incomplete_basic_auth() {
 
 #[cfg(feature = "ilp-over-http")]
 #[test]
+fn zero_timeout_forbidden() {
+    assert_conf_err(
+        SenderBuilder::from_conf("http::addr=localhost;username=user123;request_timeout=0;"),
+        "\"request_timeout\" must be greater than 0.",
+    );
+
+    assert_conf_err(
+        SenderBuilder::new(Protocol::Http, "localhost", 9000)
+            .request_timeout(Duration::from_millis(0)),
+        "\"request_timeout\" must be greater than 0.",
+    );
+}
+
+#[cfg(feature = "ilp-over-http")]
+#[test]
 fn misspelled_basic_auth() {
     assert_conf_err(
         Sender::from_conf("http::addr=localhost;username=user123;pass=pass321;"),
