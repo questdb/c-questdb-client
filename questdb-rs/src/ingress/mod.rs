@@ -2034,10 +2034,16 @@ impl SenderBuilder {
     #[cfg(feature = "ilp-over-http")]
     /// Additional time to wait on top of that calculated from the minimum throughput.
     /// This accounts for the fixed latency of the HTTP request-response roundtrip.
-    /// The value is in milliseconds, and the default is 10 seconds.
+    /// The default is 10 seconds.
     /// See also: [`request_min_throughput`](SenderBuilder::request_min_throughput).
     pub fn request_timeout(mut self, value: Duration) -> Result<Self> {
         if let Some(http) = &mut self.http {
+            if value.is_zero() {
+                return Err(error::fmt!(
+                    ConfigError,
+                    "\"request_timeout\" must be greater than 0."
+                ));
+            }
             http.request_timeout
                 .set_specified("request_timeout", value)?;
         } else {
