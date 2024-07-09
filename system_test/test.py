@@ -255,7 +255,7 @@ class TestSender(unittest.TestCase):
         with self._mk_linesender() as sender:
             (sender
                 .table(table_name)
-                .column('a', 'A')  # VARCHAR
+                .column('a', 1)    # LONG
                 .at_now())
             (sender
                 .table(table_name)
@@ -283,11 +283,11 @@ class TestSender(unittest.TestCase):
             # We only ever get the first row back.
             resp = retry_check_table(table_name, log_ctx=pending)
             exp_columns = [
-                {'name': 'a', 'type': 'VARCHAR'},
+                {'name': 'a', 'type': 'LONG'},
                 {'name': 'timestamp', 'type': 'TIMESTAMP'}]
             self.assertEqual(resp['columns'], exp_columns)
 
-            exp_dataset = [['A']]  # Comparison excludes timestamp column.
+            exp_dataset = [[1]]  # Comparison excludes timestamp column.
             scrubbed_dataset = [row[:-1] for row in resp['dataset']]
             self.assertEqual(scrubbed_dataset, exp_dataset)
 
