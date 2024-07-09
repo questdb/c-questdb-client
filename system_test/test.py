@@ -271,7 +271,7 @@ class TestSender(unittest.TestCase):
                     raise e
                 self.assertIn('Could not flush buffer', str(e))
                 self.assertIn('cast error from', str(e))
-                self.assertIn('VARCHAR', str(e))
+                self.assertIn('LONG', str(e))
                 self.assertIn('code: invalid, line: 2', str(e))
 
         if QDB_FIXTURE.http:
@@ -726,7 +726,7 @@ class TestSender(unittest.TestCase):
                     raise e
                 self.assertIn('Could not flush buffer', str(e))
                 self.assertIn('cast error from', str(e))
-                self.assertIn('STRING', str(e))
+                self.assertIn('VARCHAR', str(e))
                 self.assertIn('code: invalid, line: 3', str(e))
 
         with self.assertRaises(TimeoutError):
