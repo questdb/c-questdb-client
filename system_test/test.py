@@ -142,7 +142,7 @@ class TestSender(unittest.TestCase):
             {'name': 'name_b', 'type': 'BOOLEAN'},
             {'name': 'name_c', 'type': 'LONG'},
             {'name': 'name_d', 'type': 'DOUBLE'},
-            {'name': 'name_e', 'type': 'STRING'},
+            {'name': 'name_e', 'type': 'VARCHAR'},
             {'name': 'timestamp', 'type': 'TIMESTAMP'}]
         self.assertEqual(resp['columns'], exp_columns)
 
@@ -240,8 +240,8 @@ class TestSender(unittest.TestCase):
 
         resp = retry_check_table(table_name, log_ctx=pending)
         exp_columns = [
-            {'name': 'a', 'type': 'STRING'},
-            {'name': 'b', 'type': 'STRING'},
+            {'name': 'a', 'type': 'VARCHAR'},
+            {'name': 'b', 'type': 'VARCHAR'},
             {'name': 'timestamp', 'type': 'TIMESTAMP'}]
         self.assertEqual(resp['columns'], exp_columns)
 
@@ -255,7 +255,7 @@ class TestSender(unittest.TestCase):
         with self._mk_linesender() as sender:
             (sender
                 .table(table_name)
-                .column('a', 'A')  # STRING
+                .column('a', 'A')  # VARCHAR
                 .at_now())
             (sender
                 .table(table_name)
@@ -271,7 +271,7 @@ class TestSender(unittest.TestCase):
                     raise e
                 self.assertIn('Could not flush buffer', str(e))
                 self.assertIn('cast error from', str(e))
-                self.assertIn('STRING', str(e))
+                self.assertIn('VARCHAR', str(e))
                 self.assertIn('code: invalid, line: 2', str(e))
 
         if QDB_FIXTURE.http:
@@ -283,7 +283,7 @@ class TestSender(unittest.TestCase):
             # We only ever get the first row back.
             resp = retry_check_table(table_name, log_ctx=pending)
             exp_columns = [
-                {'name': 'a', 'type': 'STRING'},
+                {'name': 'a', 'type': 'VARCHAR'},
                 {'name': 'timestamp', 'type': 'TIMESTAMP'}]
             self.assertEqual(resp['columns'], exp_columns)
 
@@ -352,7 +352,7 @@ class TestSender(unittest.TestCase):
         exp_dataset = [['1969-12-31T23:59:59.000000Z'], ['1970-01-01T00:00:01.000000Z']]
         scrubbed_dataset = [row[:-1] for row in resp['dataset']]
         self.assertEqual(scrubbed_dataset, exp_dataset)
-        
+
 
     def test_underscores(self):
         table_name = f'_{uuid.uuid4().hex}_'
