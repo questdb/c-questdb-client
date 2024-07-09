@@ -512,7 +512,7 @@ class TestSender(unittest.TestCase):
             {'name': 'y', 'type': 'DOUBLE'},
             {'name': 'booked', 'type': 'BOOLEAN'},
             {'name': 'passengers', 'type': 'LONG'},
-            {'name': 'driver', 'type': 'STRING'},
+            {'name': 'driver', 'type': 'VARCHAR'},
             {'name': 'timestamp', 'type': 'TIMESTAMP'}]
         self.assertEqual(resp['columns'], exp_columns)
 
