@@ -86,5 +86,5 @@ cargo publish --token [your API token from crates.io]
 ## 9. Ensure the docs are online on docs.rs
 
 The release is immediately visible on crates.io, but there's a delay until it
-becomes available on [https://docs.rs/](docs.rs). Watch that site and ensure it
+becomes available on [docs.rs](https://docs.rs/questdb-rs/latest/questdb/). Watch that site and ensure it
 appears there.
