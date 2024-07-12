@@ -93,6 +93,8 @@ function(_corrosion_parse_target_triple target_triple out_arch out_vendor out_os
         "nvidia"
         "openwrt"
         "alpine"
+        "chimera"
+        "unikraft"
         "unknown"
         "uwp" # aarch64-uwp-windows-msvc
         "wrs" # e.g. aarch64-wrs-vxworks
@@ -131,7 +133,7 @@ function(_corrosion_parse_target_triple target_triple out_arch out_vendor out_os
     set("${out_env}" "${CMAKE_MATCH_6}" PARENT_SCOPE)
 endfunction()
 
-function(_corrosion_determine_libs_new target_triple out_libs)
+function(_corrosion_determine_libs_new target_triple out_libs out_flags)
     set(package_dir "${CMAKE_BINARY_DIR}/corrosion/required_libs")
     # Cleanup on reconfigure to get a cleans state (in case we change something in the future)
     file(REMOVE_RECURSE "${package_dir}")
@@ -160,11 +162,30 @@ function(_corrosion_determine_libs_new target_triple out_libs)
         if(cargo_build_error_message MATCHES "native-static-libs: ([^\r\n]+)\r?\n")
             string(REPLACE " " ";" "libs_list" "${CMAKE_MATCH_1}")
             set(stripped_lib_list "")
+            set(flag_list "")
+
+            set(was_last_framework OFF)
             foreach(lib ${libs_list})
-                # Strip leading `-l` (unix) and potential .lib suffix (windows)
-                string(REGEX REPLACE "^-l" "" "stripped_lib" "${lib}")
-                string(REGEX REPLACE "\.lib$" "" "stripped_lib" "${stripped_lib}")
-                list(APPEND stripped_lib_list "${stripped_lib}")
+                # merge -framework;lib -> "-framework lib" as CMake does de-duplication of link libraries, and -framework prefix is required
+                if (lib STREQUAL "-framework")
+                    set(was_last_framework ON)
+                    continue()
+                endif()
+                if (was_last_framework)
+                    list(APPEND stripped_lib_list "-framework ${lib}")
+                    set(was_last_framework OFF)
+                    continue()
+                endif()
+                
+                # Flags start with / for MSVC
+                if (lib MATCHES "^/" AND ${target_triple} MATCHES "msvc$")
+                    list(APPEND flag_list "${lib}")
+                else()
+                    # Strip leading `-l` (unix) and potential .lib suffix (windows)
+                    string(REGEX REPLACE "^-l" "" "stripped_lib" "${lib}")
+                    string(REGEX REPLACE "\.lib$" "" "stripped_lib" "${stripped_lib}")
+                    list(APPEND stripped_lib_list "${stripped_lib}")
+                endif()
             endforeach()
             set(libs_list "${stripped_lib_list}")
             # Special case `msvcrt` to link with the debug version in Debug mode.
@@ -176,6 +197,7 @@ function(_corrosion_determine_libs_new target_triple out_libs)
         endif()
     endif()
     set("${out_libs}" "${libs_list}" PARENT_SCOPE)
+    set("${out_flags}" "${flag_list}" PARENT_SCOPE)
 endfunction()
 
 if (NOT "${Rust_TOOLCHAIN}" STREQUAL "$CACHE{Rust_TOOLCHAIN}")
@@ -699,6 +721,19 @@ if (NOT Rust_CARGO_TARGET_CACHED)
         if (_Rust_ANDROID_TARGET)
             set(Rust_CARGO_TARGET_CACHED "${_Rust_ANDROID_TARGET}" CACHE STRING "Target triple")
         endif()
+    elseif("${CMAKE_SYSTEM_NAME}" STREQUAL "OHOS")
+        if(CMAKE_OHOS_ARCH_ABI STREQUAL arm64-v8a)
+            set(_RUST_OHOS_TARGET aarch64-unknown-linux-ohos)
+        elseif(CMAKE_OHOS_ARCH_ABI STREQUAL armeabi-v7a)
+            set(_RUST_OHOS_TARGET armv7-unknown-linux-ohos)
+        elseif(CMAKE_OHOS_ARCH_ABI STREQUAL x86_64)
+            set(_RUST_OHOS_TARGET x86_64-unknown-linux-ohos)
+        else()
+            message(WARNING "unrecognized OHOS architecture: ${OHOS_ARCH}")
+        endif()
+        if(_RUST_OHOS_TARGET)
+            set(Rust_CARGO_TARGET_CACHED "${_RUST_OHOS_TARGET}" CACHE STRING "Target triple")
+        endif()
     endif()
     # Fallback to the default host target
     if(NOT Rust_CARGO_TARGET_CACHED)
@@ -735,9 +770,12 @@ set(Rust_CARGO_HOST_ENV "${rust_host_env}" CACHE INTERNAL "Host environment")
 if(NOT DEFINED CACHE{Rust_CARGO_TARGET_LINK_NATIVE_LIBS})
     message(STATUS "Determining required link libraries for target ${Rust_CARGO_TARGET_CACHED}")
     unset(required_native_libs)
-    _corrosion_determine_libs_new("${Rust_CARGO_TARGET_CACHED}" required_native_libs)
+    _corrosion_determine_libs_new("${Rust_CARGO_TARGET_CACHED}" required_native_libs required_link_flags)
     if(DEFINED required_native_libs)
         message(STATUS "Required static libs for target ${Rust_CARGO_TARGET_CACHED}: ${required_native_libs}" )
+    endif()
+    if(DEFINED required_link_flags)
+        message(STATUS "Required link flags for target ${Rust_CARGO_TARGET_CACHED}: ${required_link_flags}" )
     endif()
     # In very recent corrosion versions it is possible to override the rust compiler version
     # per target, so to be totally correct we would need to determine the libraries for
@@ -746,17 +784,21 @@ if(NOT DEFINED CACHE{Rust_CARGO_TARGET_LINK_NATIVE_LIBS})
     # for the target and once for the host target (if cross-compiling).
     set(Rust_CARGO_TARGET_LINK_NATIVE_LIBS "${required_native_libs}" CACHE INTERNAL
             "Required native libraries when linking Rust static libraries")
+    set(Rust_CARGO_TARGET_LINK_OPTIONS "${required_link_flags}" CACHE INTERNAL
+            "Required link flags when linking Rust static libraries")
 endif()
 
 if(Rust_CROSSCOMPILING AND NOT DEFINED CACHE{Rust_CARGO_HOST_TARGET_LINK_NATIVE_LIBS})
     message(STATUS "Determining required link libraries for target ${Rust_CARGO_HOST_TARGET_CACHED}")
     unset(host_libs)
-    _corrosion_determine_libs_new("${Rust_CARGO_HOST_TARGET_CACHED}" host_libs)
+    _corrosion_determine_libs_new("${Rust_CARGO_HOST_TARGET_CACHED}" host_libs host_flags)
     if(DEFINED host_libs)
         message(STATUS "Required static libs for host target ${Rust_CARGO_HOST_TARGET_CACHED}: ${host_libs}" )
     endif()
     set(Rust_CARGO_HOST_TARGET_LINK_NATIVE_LIBS "${host_libs}" CACHE INTERNAL
         "Required native libraries when linking Rust static libraries for the host target")
+    set(Rust_CARGO_HOST_TARGET_LINK_OPTIONS "${host_flags}" CACHE INTERNAL
+        "Required linker flags when linking Rust static libraries for the host target")
 endif()
 
 # Set the input variables as non-cache variables so that the variables are available after

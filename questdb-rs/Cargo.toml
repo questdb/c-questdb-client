@@ -31,7 +31,7 @@ rustls = "0.22.0"
 rustls-native-certs = { version = "0.7.0", optional = true }
 webpki-roots = { version = "0.26.0", optional = true }
 chrono = { version = "0.4.30", optional = true }
-ureq = { version = "2.9.4", optional = true }
+ureq = { version = "=2.9", optional = true }
 serde_json = { version = "1.0.108", optional = true }
 questdb-confstr = "0.1.0"
 rand = { version = "0.8.5", optional = true }
