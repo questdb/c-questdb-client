@@ -10,7 +10,7 @@ static bool example(std::string_view host, std::string_view port)
     {
         auto sender = questdb::ingress::line_sender::from_conf(
             "tcp::addr=" + std::string{host} + ":" + std::string{port} + ";"
-            "username=testUser1;"
+            "username=admin;"
             "token=5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48;"
             "token_x=fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU;"
             "token_y=Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac;");
@@ -18,23 +18,19 @@ static bool example(std::string_view host, std::string_view port)
         // We prepare all our table names and column names in advance.
         // If we're inserting multiple rows, this allows us to avoid
         // re-validating the same strings over and over again.
-        const auto table_name = "cpp_cars_auth"_tn;
-        const auto id_name = "id"_cn;
-        const auto x_name = "x"_cn;
-        const auto y_name = "y"_cn;
-        const auto booked_name = "booked"_cn;
-        const auto passengers_name = "passengers"_cn;
-        const auto driver_name = "driver"_cn;
+        const auto table_name = "trades"_tn;
+        const auto symbol_name = "symbol"_cn;
+        const auto side_name = "side"_cn;
+        const auto price_name = "price"_cn;
+        const auto amount_name = "amount"_cn;
 
         questdb::ingress::line_sender_buffer buffer;
         buffer
             .table(table_name)
-            .symbol(id_name, "d6e5fe92-d19f-482a-a97a-c105f547f721"_utf8)
-            .column(x_name, 30.5)
-            .column(y_name, -150.25)
-            .column(booked_name, true)
-            .column(passengers_name, int64_t{3})
-            .column(driver_name, "John Doe"_utf8)
+            .symbol(symbol_name, "ETH-USD"_utf8)
+            .symbol(side_name, "sell"_utf8)
+            .column(price_name, 2615.54)
+            .column(amount_name, 0.00044)
             .at(questdb::ingress::timestamp_nanos::now());
 
         // To insert more records, call `buffer.table(..)...` again.

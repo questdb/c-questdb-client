@@ -22,7 +22,7 @@ static bool example(const char* host, const char* port)
 
     sender = line_sender_from_conf(conf_str_utf8, &err);
     if (!sender)
-        goto on_error;    
+        goto on_error;
 
     free(conf_str);
     conf_str = NULL;
@@ -30,40 +30,28 @@ static bool example(const char* host, const char* port)
     buffer = line_sender_buffer_new();
     line_sender_buffer_reserve(buffer, 64 * 1024);  // 64KB buffer initial size.
 
-    // We prepare all our table names and column names in advance.
-    // If we're inserting multiple rows, this allows us to avoid
-    // re-validating the same strings over and over again.
-    line_sender_table_name table_name = QDB_TABLE_NAME_LITERAL("c_cars_http");
-    line_sender_column_name id_name = QDB_COLUMN_NAME_LITERAL("id");
-    line_sender_column_name x_name = QDB_COLUMN_NAME_LITERAL("x");
-    line_sender_column_name y_name = QDB_COLUMN_NAME_LITERAL("y");
-    line_sender_column_name booked_name = QDB_COLUMN_NAME_LITERAL("booked");
-    line_sender_column_name passengers_name = QDB_COLUMN_NAME_LITERAL(
-        "passengers");
-    line_sender_column_name driver_name = QDB_COLUMN_NAME_LITERAL("driver");
+    line_sender_table_name table_name = QDB_TABLE_NAME_LITERAL("trades");
+    line_sender_column_name symbol_name = QDB_COLUMN_NAME_LITERAL("symbol");
+    line_sender_column_name side_name = QDB_COLUMN_NAME_LITERAL("side");
+    line_sender_column_name price_name = QDB_COLUMN_NAME_LITERAL("price");
+    line_sender_column_name amount_name = QDB_COLUMN_NAME_LITERAL("amount");
+
 
     if (!line_sender_buffer_table(buffer, table_name, &err))
         goto on_error;
 
-    line_sender_utf8 id_value = QDB_UTF8_LITERAL(
-        "d6e5fe92-d19f-482a-a97a-c105f547f721");
-    if (!line_sender_buffer_symbol(buffer, id_name, id_value, &err))
+    line_sender_utf8 symbol_value = QDB_UTF8_LITERAL("ETH-USD");
+    if (!line_sender_buffer_symbol(buffer, symbol_name, symbol_value, &err))
         goto on_error;
 
-    if (!line_sender_buffer_column_f64(buffer, x_name, 30.5, &err))
+    line_sender_utf8 side_value = QDB_UTF8_LITERAL("sell");
+    if (!line_sender_buffer_symbol(buffer, side_name, side_value, &err))
         goto on_error;
 
-    if (!line_sender_buffer_column_f64(buffer, y_name, -150.25, &err))
+    if (!line_sender_buffer_column_f64(buffer, price_name, 2615.54, &err))
         goto on_error;
 
-    if (!line_sender_buffer_column_bool(buffer, booked_name, true, &err))
-        goto on_error;
-
-    if (!line_sender_buffer_column_i64(buffer, passengers_name, 3, &err))
-        goto on_error;
-
-    line_sender_utf8 driver_value = QDB_UTF8_LITERAL("John Doe");
-    if (!line_sender_buffer_column_str(buffer, driver_name, driver_value, &err))
+    if (!line_sender_buffer_column_f64(buffer, amount_name, 0.00044, &err))
         goto on_error;
 
     // 1997-07-04 04:56:55 UTC

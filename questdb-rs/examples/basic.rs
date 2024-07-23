@@ -12,10 +12,11 @@ fn main() -> Result<()> {
     let designated_timestamp =
         TimestampNanos::from_datetime(Utc.with_ymd_and_hms(1997, 7, 4, 4, 56, 55).unwrap())?;
     buffer
-        .table("sensors")?
-        .symbol("id", "toronto1")?
-        .column_f64("temperature", 20.0)?
-        .column_i64("humidity", 50)?
+        .table("trades")?
+        .symbol("symbol", "ETH-USD")?
+        .symbol("side", "sell")?
+        .column_f64("price", 2615.54)?
+        .column_f64("amount", 0.00044)?
         .at(designated_timestamp)?;
 
     //// If you want to pass the current system timestamp, replace with:

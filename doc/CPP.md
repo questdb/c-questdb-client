@@ -58,9 +58,9 @@ re-usable, but a buffer may only be flushed via the sender after a call to
 ```cpp
 questdb::ingress::line_sender_buffer buffer;
 buffer
-    .table("cpp_cars")
-    .symbol("id", "d6e5fe92-d19f-482a-a97a-c105f547f721")
-    .column("x", 30.5)
+    .table("trades")
+    .symbol("symbol", "ETH-USD")
+    .column("price", 2615.54)
     .at(timestamp_nanos::now());
 
 // To insert more records, call `buffer.table(..)...` again.

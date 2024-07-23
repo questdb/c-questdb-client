@@ -62,21 +62,20 @@ re-usable, but a buffer may only be flushed via the sender after a call to
 `line_sender_buffer_at_*(..)` (preferred) or `line_sender_buffer_at_now()`.
 
 ```c
-line_sender_table_name table_name = QDB_TABLE_NAME_LITERAL("c_cars");
-line_sender_column_name id_name = QDB_COLUMN_NAME_LITERAL("id");
-line_sender_column_name x_name = QDB_COLUMN_NAME_LITERAL("x");
+line_sender_table_name table_name = QDB_TABLE_NAME_LITERAL("trades");
+line_sender_column_name symbol_name = QDB_COLUMN_NAME_LITERAL("symbol");
+line_sender_column_name price_name = QDB_COLUMN_NAME_LITERAL("price");
 
 line_sender_buffer* buffer = line_sender_buffer_new();
 
 if (!line_sender_buffer_table(buffer, table_name, &err))
     goto on_error;
 
-line_sender_utf8 id_value = QDB_UTF8_LITERAL(
-    "d6e5fe92-d19f-482a-a97a-c105f547f721");
-if (!line_sender_buffer_symbol(buffer, id_name, id_value, &err))
+line_sender_utf8 symbol_value = QDB_UTF8_LITERAL("ETH-USD");
+if (!line_sender_buffer_symbol(buffer, symbol_name, symbol_value, &err))
     goto on_error;
 
-if (!line_sender_buffer_column_f64(buffer, x_name, 30.5, &err))
+if (!line_sender_buffer_column_f64(buffer, price_name, 2615.54, &err))
     goto on_error;
 
 if (!line_sender_buffer_at_nanos(buffer, line_sender_now_nanos(), &err))
