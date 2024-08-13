@@ -33,7 +33,7 @@ See the [flush troubleshooting](doc/CONSIDERATIONS.md) docs for more details on
 how to debug ILP/TCP.
 
 For an overview and code examples, see the
-[InfluxDB Line Protocol page of the developer docs](https://questdb.io/docs/develop/insert-data/#influxdb-line-protocol).
+[Ingestion overview page of the developer docs](https://questdb.io/docs/ingestion-overview/).
 
 To understand the protocol in more depth, consult the
 [protocol reference docs](https://questdb.io/docs/reference/api/ilp/overview/).
