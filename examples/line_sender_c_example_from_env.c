@@ -19,7 +19,7 @@ int main(int argc, const char* argv[])
     // We prepare all our table names and column names in advance.
     // If we're inserting multiple rows, this allows us to avoid
     // re-validating the same strings over and over again.
-    line_sender_table_name table_name = QDB_TABLE_NAME_LITERAL("trades");
+    line_sender_table_name table_name = QDB_TABLE_NAME_LITERAL("c_trades_from_env");
     line_sender_column_name symbol_name = QDB_COLUMN_NAME_LITERAL("symbol");
     line_sender_column_name side_name = QDB_COLUMN_NAME_LITERAL("side");
     line_sender_column_name price_name = QDB_COLUMN_NAME_LITERAL("price");

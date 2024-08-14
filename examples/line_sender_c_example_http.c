@@ -30,7 +30,7 @@ static bool example(const char* host, const char* port)
     buffer = line_sender_buffer_new();
     line_sender_buffer_reserve(buffer, 64 * 1024);  // 64KB buffer initial size.
 
-    line_sender_table_name table_name = QDB_TABLE_NAME_LITERAL("trades");
+    line_sender_table_name table_name = QDB_TABLE_NAME_LITERAL("c_trades_http");
     line_sender_column_name symbol_name = QDB_COLUMN_NAME_LITERAL("symbol");
     line_sender_column_name side_name = QDB_COLUMN_NAME_LITERAL("side");
     line_sender_column_name price_name = QDB_COLUMN_NAME_LITERAL("price");

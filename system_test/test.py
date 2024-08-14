@@ -514,7 +514,7 @@ class TestSender(unittest.TestCase):
             {'name': 'timestamp', 'type': 'TIMESTAMP'}]
         self.assertEqual(resp['columns'], exp_columns)
 
-        exp_dataset = [['ETH-USD', 'sell', 2615.54, 0.00044], ['ETH-USD', 'sell', 2615.54, 0.00044]]  # Comparison excludes timestamp column.
+        exp_dataset = [['ETH-USD', 'sell', 2615.54, 0.00044]]  # Comparison excludes timestamp column.
         scrubbed_dataset = [row[:-1] for row in resp['dataset']]
         sys.stdout.write(f"Asserting results [{bin_name=}]")
         self.assertEqual(scrubbed_dataset, exp_dataset)
@@ -524,25 +524,25 @@ class TestSender(unittest.TestCase):
         suffix += '_http' if QDB_FIXTURE.http else ''
         self._test_example(
             f'line_sender_c_example{suffix}',
-            f'trades')
+            f'c_trades{suffix}')
 
     def test_cpp_example(self):
         suffix = '_auth' if QDB_FIXTURE.auth else ''
         suffix += '_http' if QDB_FIXTURE.http else ''
         self._test_example(
             f'line_sender_cpp_example{suffix}',
-            f'trades')
+            f'cpp_trades{suffix}')
 
     def test_c_tls_example(self):
         self._test_example(
             'line_sender_c_example_tls_ca',
-            'trades',
+            'c_trades{suffix}',
             tls=True)
 
     def test_cpp_tls_example(self):
         self._test_example(
             'line_sender_cpp_example_tls_ca',
-            'trades',
+            'cpp_trades{suffix}',
             tls=True)
 
     def test_opposite_auth(self):

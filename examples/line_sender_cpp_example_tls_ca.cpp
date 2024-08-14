@@ -22,7 +22,7 @@ static bool example(
         // We prepare all our table names and column names in advance.
         // If we're inserting multiple rows, this allows us to avoid
         // re-validating the same strings over and over again.
-        const auto table_name = "trades"_tn;
+        const auto table_name = "cpp_trades_tls_ca"_tn;
         const auto symbol_name = "symbol"_cn;
         const auto side_name = "side"_cn;
         const auto price_name = "price"_cn;
