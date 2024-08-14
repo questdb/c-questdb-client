@@ -536,13 +536,13 @@ class TestSender(unittest.TestCase):
     def test_c_tls_example(self):
         self._test_example(
             'line_sender_c_example_tls_ca',
-            'c_trades{suffix}',
+            'c_trades_tls_ca',
             tls=True)
 
     def test_cpp_tls_example(self):
         self._test_example(
             'line_sender_cpp_example_tls_ca',
-            'cpp_trades{suffix}',
+            'cpp_trades_tls_ca',
             tls=True)
 
     def test_opposite_auth(self):
