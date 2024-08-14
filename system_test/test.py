@@ -514,13 +514,7 @@ class TestSender(unittest.TestCase):
             {'name': 'timestamp', 'type': 'TIMESTAMP'}]
         self.assertEqual(resp['columns'], exp_columns)
 
-        exp_dataset = [[
-            'd6e5fe92-d19f-482a-a97a-c105f547f721',
-            30.5,
-            -150.25,
-            True,
-            3,
-            'John Doe']]  # Comparison excludes timestamp column.
+        exp_dataset = [['ETH-USD', 'sell', 2615.54, 0.00044]]  # Comparison excludes timestamp column.
         scrubbed_dataset = [row[:-1] for row in resp['dataset']]
         self.assertEqual(scrubbed_dataset, exp_dataset)
 
