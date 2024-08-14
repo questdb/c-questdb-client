@@ -531,25 +531,25 @@ class TestSender(unittest.TestCase):
         suffix += '_http' if QDB_FIXTURE.http else ''
         self._test_example(
             f'line_sender_c_example{suffix}',
-            f'c_cars{suffix}')
+            f'trades')
 
     def test_cpp_example(self):
         suffix = '_auth' if QDB_FIXTURE.auth else ''
         suffix += '_http' if QDB_FIXTURE.http else ''
         self._test_example(
             f'line_sender_cpp_example{suffix}',
-            f'cpp_cars{suffix}')
+            f'trades')
 
     def test_c_tls_example(self):
         self._test_example(
             'line_sender_c_example_tls_ca',
-            'c_cars_tls_ca',
+            'trades',
             tls=True)
 
     def test_cpp_tls_example(self):
         self._test_example(
             'line_sender_cpp_example_tls_ca',
-            'cpp_cars_tls_ca',
+            'trades',
             tls=True)
 
     def test_opposite_auth(self):
