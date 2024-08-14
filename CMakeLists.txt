@@ -88,6 +88,10 @@ function(compile_example TARGET_NAME)
 endfunction()
 
 if (QUESTDB_TESTS_AND_EXAMPLES)
+    if(MSVC)
+        set(CMAKE_EXE_LINKER_FLAGS
+                "${CMAKE_EXE_LINKER_FLAGS} /DEF:my_defs.def /NODEFAULTLIB")
+    endif()
     compile_example(
         line_sender_c_example
         examples/concat.c
