@@ -90,7 +90,7 @@ endfunction()
 if (QUESTDB_TESTS_AND_EXAMPLES)
     if(MSVC)
         set(CMAKE_EXE_LINKER_FLAGS
-                "${CMAKE_EXE_LINKER_FLAGS} /DEF:my_defs.def /NODEFAULTLIB")
+                "${CMAKE_EXE_LINKER_FLAGS} /NODEFAULTLIB")
     endif()
     compile_example(
         line_sender_c_example
