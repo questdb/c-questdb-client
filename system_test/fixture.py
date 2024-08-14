@@ -49,7 +49,7 @@ AUTH_TXT = """testUser1 ec-p-256-sha256 fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWS
 
 # Valid keys as registered with the QuestDB fixture.
 AUTH = dict(
-    username="testUser1",
+    username="admin",
     token="5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48",
     token_x="fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU",
     token_y="Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac")
