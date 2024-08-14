@@ -507,12 +507,10 @@ class TestSender(unittest.TestCase):
         # Check inserted data.
         resp = retry_check_table(table_name)
         exp_columns = [
-            {'name': 'id', 'type': 'SYMBOL'},
-            {'name': 'x', 'type': 'DOUBLE'},
-            {'name': 'y', 'type': 'DOUBLE'},
-            {'name': 'booked', 'type': 'BOOLEAN'},
-            {'name': 'passengers', 'type': 'LONG'},
-            {'name': 'driver', 'type': 'VARCHAR'},
+            {'name': 'symbol', 'type': 'SYMBOL'},
+            {'name': 'side', 'type': 'SYMBOL'},
+            {'name': 'price', 'type': 'DOUBLE'},
+            {'name': 'amount', 'type': 'DOUBLE'},
             {'name': 'timestamp', 'type': 'TIMESTAMP'}]
         self.assertEqual(resp['columns'], exp_columns)
 
