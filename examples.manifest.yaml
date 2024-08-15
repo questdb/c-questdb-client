@@ -38,7 +38,7 @@
   header: |-
     [C++ client library docs](https://github.com/questdb/c-questdb-client/blob/main/doc/CPP.md)
   auth:
-    kid: testUser1
+    kid: admin
     d: 5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48
     x: fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU
     y: Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac
@@ -67,7 +67,7 @@
   header: |-
     [C client library docs](https://github.com/questdb/c-questdb-client/blob/main/doc/C.md)
   auth:
-    kid: testUser1
+    kid: admin
     d: 5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48
     x: fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU
     y: Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac
@@ -81,7 +81,7 @@
   header: |-
     [C++ client library docs](https://github.com/questdb/c-questdb-client/blob/main/doc/CPP.md)
   auth:
-    kid: testUser1
+    kid: admin
     d: 5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48
     x: fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU
     y: Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac
@@ -95,7 +95,7 @@
   header: |-
     [Rust client library docs](https://docs.rs/crate/questdb-rs/latest)
   auth:
-    kid: testUser1
+    kid: admin
     d: 5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48
     x: fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU
     y: Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac
