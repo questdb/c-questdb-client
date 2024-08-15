@@ -68,7 +68,7 @@ function(set_compile_flags TARGET_NAME)
         # The warning is not applicable in new releases of the Windows SDK.
         target_compile_options(
             ${TARGET_NAME} PRIVATE
-            /MDd /W4 /WX $<$<COMPILE_LANGUAGE:C>:/wd5105>)
+            /W4 /WX $<$<COMPILE_LANGUAGE:C>:/wd5105>)
     else()
         target_compile_options(
             ${TARGET_NAME} PRIVATE
@@ -88,10 +88,6 @@ function(compile_example TARGET_NAME)
 endfunction()
 
 if (QUESTDB_TESTS_AND_EXAMPLES)
-    if(MSVC)
-        set(CMAKE_EXE_LINKER_FLAGS
-                "${CMAKE_EXE_LINKER_FLAGS} /NODEFAULTLIB")
-    endif()
     compile_example(
         line_sender_c_example
         examples/concat.c
