@@ -68,7 +68,7 @@ function(set_compile_flags TARGET_NAME)
         # The warning is not applicable in new releases of the Windows SDK.
         target_compile_options(
             ${TARGET_NAME} PRIVATE
-            /MTd /W4 /WX $<$<COMPILE_LANGUAGE:C>:/wd5105>)
+            /MDd /W4 /WX $<$<COMPILE_LANGUAGE:C>:/wd5105>)
     else()
         target_compile_options(
             ${TARGET_NAME} PRIVATE
