@@ -162,7 +162,7 @@ let mut sender = Sender::from_conf(
 # use questdb::{Result, ingress::Sender};
 # fn main() -> Result<()> {
 let mut sender = Sender::from_conf(
-    "tcps::addr=localhost:9009;username=testUser1;token=5UjEA0;token_x=fLKYa9;token_y=bS1dEfy"
+    "tcps::addr=localhost:9009;username=testUser1;token=5UjEA0;token_x=fLKYa9;token_y=bS1dEfy;"
 )?;
 # Ok(())
 # }
