@@ -516,7 +516,6 @@ class TestSender(unittest.TestCase):
 
         exp_dataset = [['ETH-USD', 'sell', 2615.54, 0.00044]]  # Comparison excludes timestamp column.
         scrubbed_dataset = [row[:-1] for row in resp['dataset']]
-        sys.stdout.write(f"Asserting results [{bin_name=}]")
         self.assertEqual(scrubbed_dataset, exp_dataset)
 
     def test_c_example(self):
