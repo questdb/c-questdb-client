@@ -32,10 +32,11 @@ fn main() -> Result<()> {
    let mut sender = Sender::from_conf("http::addr=localhost:9000;")?;
    let mut buffer = Buffer::new();
    buffer
-       .table("sensors")?
-       .symbol("id", "toronto1")?
-       .column_f64("temperature", 20.0)?
-       .column_i64("humidity", 50)?
+       .table("trades")?
+       .symbol("symbol", "ETH-USD")?
+       .symbol("side", "sell")?
+       .column_f64("price", 2615.54)?
+       .column_f64("amount", 0.00044)?
        .at(TimestampNanos::now())?;
    sender.flush(&mut buffer)?;
    Ok(())
@@ -45,7 +46,7 @@ fn main() -> Result<()> {
 ## Docs
 
 Most of the client documentation is on the
-[`ingress`](https://docs.rs/questdb-rs/4.0.2/questdb/ingress/) module page.
+[`ingress`](https://docs.rs/questdb-rs/4.0.3/questdb/ingress/) module page.
 
 ## Crate features
 
