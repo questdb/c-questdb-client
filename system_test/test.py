@@ -507,22 +507,14 @@ class TestSender(unittest.TestCase):
         # Check inserted data.
         resp = retry_check_table(table_name)
         exp_columns = [
-            {'name': 'id', 'type': 'SYMBOL'},
-            {'name': 'x', 'type': 'DOUBLE'},
-            {'name': 'y', 'type': 'DOUBLE'},
-            {'name': 'booked', 'type': 'BOOLEAN'},
-            {'name': 'passengers', 'type': 'LONG'},
-            {'name': 'driver', 'type': 'VARCHAR'},
+            {'name': 'symbol', 'type': 'SYMBOL'},
+            {'name': 'side', 'type': 'SYMBOL'},
+            {'name': 'price', 'type': 'DOUBLE'},
+            {'name': 'amount', 'type': 'DOUBLE'},
             {'name': 'timestamp', 'type': 'TIMESTAMP'}]
         self.assertEqual(resp['columns'], exp_columns)
 
-        exp_dataset = [[
-            'd6e5fe92-d19f-482a-a97a-c105f547f721',
-            30.5,
-            -150.25,
-            True,
-            3,
-            'John Doe']]  # Comparison excludes timestamp column.
+        exp_dataset = [['ETH-USD', 'sell', 2615.54, 0.00044]]  # Comparison excludes timestamp column.
         scrubbed_dataset = [row[:-1] for row in resp['dataset']]
         self.assertEqual(scrubbed_dataset, exp_dataset)
 
@@ -531,25 +523,25 @@ class TestSender(unittest.TestCase):
         suffix += '_http' if QDB_FIXTURE.http else ''
         self._test_example(
             f'line_sender_c_example{suffix}',
-            f'c_cars{suffix}')
+            f'c_trades{suffix}')
 
     def test_cpp_example(self):
         suffix = '_auth' if QDB_FIXTURE.auth else ''
         suffix += '_http' if QDB_FIXTURE.http else ''
         self._test_example(
             f'line_sender_cpp_example{suffix}',
-            f'cpp_cars{suffix}')
+            f'cpp_trades{suffix}')
 
     def test_c_tls_example(self):
         self._test_example(
             'line_sender_c_example_tls_ca',
-            'c_cars_tls_ca',
+            'c_trades_tls_ca',
             tls=True)
 
     def test_cpp_tls_example(self):
         self._test_example(
             'line_sender_cpp_example_tls_ca',
-            'cpp_cars_tls_ca',
+            'cpp_trades_tls_ca',
             tls=True)
 
     def test_opposite_auth(self):

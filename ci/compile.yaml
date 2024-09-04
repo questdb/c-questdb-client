@@ -8,7 +8,7 @@ steps:
     env:
       JAVA_HOME: $(JAVA_HOME_11_X64)
     displayName: "Build Makefile with CMake"
-  - script: cmake --build build
+  - script: cmake --build build --config Release
     env:
       JAVA_HOME: $(JAVA_HOME_11_X64)
     displayName: "Make"

@@ -33,7 +33,7 @@ See the [flush troubleshooting](doc/CONSIDERATIONS.md) docs for more details on
 how to debug ILP/TCP.
 
 For an overview and code examples, see the
-[InfluxDB Line Protocol page of the developer docs](https://questdb.io/docs/develop/insert-data/#influxdb-line-protocol).
+[Ingestion overview page of the developer docs](https://questdb.io/docs/ingestion-overview/). 
 
 To understand the protocol in more depth, consult the
 [protocol reference docs](https://questdb.io/docs/reference/api/ilp/overview/).
@@ -70,9 +70,9 @@ To get started, read the language-specific guides.
 ## Community
 
 If you need help, have additional questions or want to provide feedback, you
-may find us on [Slack](https://slack.questdb.io).
+may find us on our [Community Forum](https://community.questdb.io/).
 
-You can also [sign up to our mailing list](https://questdb.io/community/)
+You can also [sign up to our mailing list](https://questdb.io/contributors/)
 to get notified of new releases.
 
 ## License
