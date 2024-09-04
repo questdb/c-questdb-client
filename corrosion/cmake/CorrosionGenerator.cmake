@@ -79,7 +79,6 @@ function(_generator_add_package_targets)
         string(JSON target_name GET "${target}" "name")
         string(JSON target_kind GET "${target}" "kind")
         string(JSON target_kind_len LENGTH "${target_kind}")
-        string(JSON target_name GET "${target}" "name")
 
         math(EXPR target_kind_len-1 "${target_kind_len} - 1")
         set(kinds)
@@ -106,6 +105,13 @@ function(_generator_add_package_targets)
         endif()
 
         if("staticlib" IN_LIST kinds OR "cdylib" IN_LIST kinds)
+            # Explicitly set library names have always been forbidden from using dashes (by cargo).
+            # Starting with Rust 1.79, names inherited from the package name will have dashes replaced
+            # by underscores too. Corrosion will thus replace dashes with underscores, to make the target
+            # name consistent independent of the Rust version. `bin` target names are not affected.
+            # See https://github.com/corrosion-rs/corrosion/issues/501 for more details.
+            string(REPLACE "\-" "_" target_name "${target_name}")
+
             set(archive_byproducts "")
             set(shared_lib_byproduct "")
             set(pdb_byproduct "")
@@ -150,6 +156,7 @@ function(_generator_add_package_targets)
                 )
             endif()
             list(APPEND corrosion_targets ${target_name})
+            set_property(TARGET "${target_name}" PROPERTY INTERFACE_COR_CARGO_PACKAGE_NAME "${package_name}" )
         # Note: "bin" is mutually exclusive with "staticlib/cdylib", since `bin`s are seperate crates from libraries.
         elseif("bin" IN_LIST kinds)
             set(bin_byproduct "")
@@ -182,6 +189,7 @@ function(_generator_add_package_targets)
                 )
             endif()
             list(APPEND corrosion_targets ${target_name})
+            set_property(TARGET "${target_name}" PROPERTY INTERFACE_COR_CARGO_PACKAGE_NAME "${package_name}" )
         else()
             # ignore other kinds (like examples, tests, build scripts, ...)
         endif()

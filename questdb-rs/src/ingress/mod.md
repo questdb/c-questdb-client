@@ -21,10 +21,11 @@ fn main() -> Result<()> {
    let mut sender = Sender::from_conf("http::addr=localhost:9000;")?;
    let mut buffer = Buffer::new();
    buffer
-       .table("sensors")?
-       .symbol("id", "toronto1")?
-       .column_f64("temperature", 20.0)?
-       .column_i64("humidity", 50)?
+       .table("trades")?
+       .symbol("symbol", "ETH-USD")?
+       .symbol("side", "sell")?
+       .column_f64("price", 2615.54)?
+       .column_f64("amount", 0.00044)?
        .at(TimestampNanos::now())?;
    sender.flush(&mut buffer)?;
    Ok(())
@@ -89,6 +90,27 @@ message.
 After the sender has signalled an error, it remains usable. You can handle the
 error as appropriate and continue using it.
 
+# Health Check
+
+The QuestDB server has a "ping" endpoint you can access to see if it's alive,
+and confirm the version of InfluxDB Line Protocol with which you are
+interacting:
+
+```shell
+curl -I http://localhost:9000/ping
+```
+
+Example of the expected response:
+
+```shell
+HTTP/1.1 204 OK
+Server: questDB/1.0
+Date: Fri, 2 Feb 2024 17:09:38 GMT
+Transfer-Encoding: chunked
+Content-Type: text/plain; charset=utf-8
+X-Influxdb-Version: v2.7.4
+```
+
 # Configuration Parameters
 
 In the examples below, we'll use configuration strings. We also provide the
@@ -140,7 +162,7 @@ let mut sender = Sender::from_conf(
 # use questdb::{Result, ingress::Sender};
 # fn main() -> Result<()> {
 let mut sender = Sender::from_conf(
-    "tcps::addr=localhost:9009;username=testUser1;token=5UjEA0;token_x=fLKYa9;token_y=bS1dEfy"
+    "tcps::addr=localhost:9009;username=testUser1;token=5UjEA0;token_x=fLKYa9;token_y=bS1dEfy;"
 )?;
 # Ok(())
 # }
@@ -232,6 +254,28 @@ However, TCP has a lower overhead than HTTP and it's worthwhile to try out as an
 alternative in a scenario where you have a constantly high data rate and/or deal
 with a high-latency network connection.
 
+### Timestamp Column Name
+
+InfluxDB Line Protocol (ILP) does not give a name to the designated timestamp,
+so if you let this client auto-create the table, it will have the default `timestamp` name.
+To use a custom name, say `my_ts`, pre-create the table with the desired
+timestamp column name:
+
+To address this, issue a `CREATE TABLE` statement to create the table in advance:
+
+```questdb-sql title="Creating a timestamp named my_ts"
+CREATE TABLE IF NOT EXISTS 'trades' (
+  symbol SYMBOL capacity 256 CACHE,
+  side SYMBOL capacity 256 CACHE,
+  price DOUBLE,
+  amount DOUBLE,
+  my_ts TIMESTAMP
+) timestamp (my_ts) PARTITION BY DAY WAL;
+```
+
+You can use the `CREATE TABLE IF NOT EXISTS` construct to make sure the table is
+created, but without raising an error if the table already exists.
+
 ## Sequential Coupling in the Buffer API
 
 The fluent API of [`Buffer`] has sequential coupling: there's a certain order in
@@ -255,10 +299,10 @@ use questdb::ingress::{
     TimestampNanos};
 # fn main() -> Result<()> {
 let mut buffer = Buffer::new();
-let tide_name = TableName::new("tide")?;
-let water_level_name = ColumnName::new("water_level")?;
-buffer.table(tide_name)?.column_f64(water_level_name, 20.4)?.at(TimestampNanos::now())?;
-buffer.table(tide_name)?.column_f64(water_level_name, 17.2)?.at(TimestampNanos::now())?;
+let table_name = TableName::new("trades")?;
+let price_name = ColumnName::new("price")?;
+buffer.table(table_name)?.column_f64(price_name, 2615.54)?.at(TimestampNanos::now())?;
+buffer.table(table_name)?.column_f64(price_name, 39269.98)?.at(TimestampNanos::now())?;
 # Ok(())
 # }
 ```

@@ -142,7 +142,7 @@ class TestSender(unittest.TestCase):
             {'name': 'name_b', 'type': 'BOOLEAN'},
             {'name': 'name_c', 'type': 'LONG'},
             {'name': 'name_d', 'type': 'DOUBLE'},
-            {'name': 'name_e', 'type': 'STRING'},
+            {'name': 'name_e', 'type': 'VARCHAR'},
             {'name': 'timestamp', 'type': 'TIMESTAMP'}]
         self.assertEqual(resp['columns'], exp_columns)
 
@@ -240,8 +240,8 @@ class TestSender(unittest.TestCase):
 
         resp = retry_check_table(table_name, log_ctx=pending)
         exp_columns = [
-            {'name': 'a', 'type': 'STRING'},
-            {'name': 'b', 'type': 'STRING'},
+            {'name': 'a', 'type': 'VARCHAR'},
+            {'name': 'b', 'type': 'VARCHAR'},
             {'name': 'timestamp', 'type': 'TIMESTAMP'}]
         self.assertEqual(resp['columns'], exp_columns)
 
@@ -255,7 +255,7 @@ class TestSender(unittest.TestCase):
         with self._mk_linesender() as sender:
             (sender
                 .table(table_name)
-                .column('a', 'A')  # STRING
+                .column('a', 1)    # LONG
                 .at_now())
             (sender
                 .table(table_name)
@@ -271,7 +271,7 @@ class TestSender(unittest.TestCase):
                     raise e
                 self.assertIn('Could not flush buffer', str(e))
                 self.assertIn('cast error from', str(e))
-                self.assertIn('STRING', str(e))
+                self.assertIn('LONG', str(e))
                 self.assertIn('code: invalid, line: 2', str(e))
 
         if QDB_FIXTURE.http:
@@ -283,11 +283,11 @@ class TestSender(unittest.TestCase):
             # We only ever get the first row back.
             resp = retry_check_table(table_name, log_ctx=pending)
             exp_columns = [
-                {'name': 'a', 'type': 'STRING'},
+                {'name': 'a', 'type': 'LONG'},
                 {'name': 'timestamp', 'type': 'TIMESTAMP'}]
             self.assertEqual(resp['columns'], exp_columns)
 
-            exp_dataset = [['A']]  # Comparison excludes timestamp column.
+            exp_dataset = [[1]]  # Comparison excludes timestamp column.
             scrubbed_dataset = [row[:-1] for row in resp['dataset']]
             self.assertEqual(scrubbed_dataset, exp_dataset)
 
@@ -352,7 +352,7 @@ class TestSender(unittest.TestCase):
         exp_dataset = [['1969-12-31T23:59:59.000000Z'], ['1970-01-01T00:00:01.000000Z']]
         scrubbed_dataset = [row[:-1] for row in resp['dataset']]
         self.assertEqual(scrubbed_dataset, exp_dataset)
-        
+
 
     def test_underscores(self):
         table_name = f'_{uuid.uuid4().hex}_'
@@ -507,22 +507,14 @@ class TestSender(unittest.TestCase):
         # Check inserted data.
         resp = retry_check_table(table_name)
         exp_columns = [
-            {'name': 'id', 'type': 'SYMBOL'},
-            {'name': 'x', 'type': 'DOUBLE'},
-            {'name': 'y', 'type': 'DOUBLE'},
-            {'name': 'booked', 'type': 'BOOLEAN'},
-            {'name': 'passengers', 'type': 'LONG'},
-            {'name': 'driver', 'type': 'STRING'},
+            {'name': 'symbol', 'type': 'SYMBOL'},
+            {'name': 'side', 'type': 'SYMBOL'},
+            {'name': 'price', 'type': 'DOUBLE'},
+            {'name': 'amount', 'type': 'DOUBLE'},
             {'name': 'timestamp', 'type': 'TIMESTAMP'}]
         self.assertEqual(resp['columns'], exp_columns)
 
-        exp_dataset = [[
-            'd6e5fe92-d19f-482a-a97a-c105f547f721',
-            30.5,
-            -150.25,
-            True,
-            3,
-            'John Doe']]  # Comparison excludes timestamp column.
+        exp_dataset = [['ETH-USD', 'sell', 2615.54, 0.00044]]  # Comparison excludes timestamp column.
         scrubbed_dataset = [row[:-1] for row in resp['dataset']]
         self.assertEqual(scrubbed_dataset, exp_dataset)
 
@@ -531,25 +523,25 @@ class TestSender(unittest.TestCase):
         suffix += '_http' if QDB_FIXTURE.http else ''
         self._test_example(
             f'line_sender_c_example{suffix}',
-            f'c_cars{suffix}')
+            f'c_trades{suffix}')
 
     def test_cpp_example(self):
         suffix = '_auth' if QDB_FIXTURE.auth else ''
         suffix += '_http' if QDB_FIXTURE.http else ''
         self._test_example(
             f'line_sender_cpp_example{suffix}',
-            f'cpp_cars{suffix}')
+            f'cpp_trades{suffix}')
 
     def test_c_tls_example(self):
         self._test_example(
             'line_sender_c_example_tls_ca',
-            'c_cars_tls_ca',
+            'c_trades_tls_ca',
             tls=True)
 
     def test_cpp_tls_example(self):
         self._test_example(
             'line_sender_cpp_example_tls_ca',
-            'cpp_cars_tls_ca',
+            'cpp_trades_tls_ca',
             tls=True)
 
     def test_opposite_auth(self):
@@ -726,7 +718,7 @@ class TestSender(unittest.TestCase):
                     raise e
                 self.assertIn('Could not flush buffer', str(e))
                 self.assertIn('cast error from', str(e))
-                self.assertIn('STRING', str(e))
+                self.assertIn('VARCHAR', str(e))
                 self.assertIn('code: invalid, line: 3', str(e))
 
         with self.assertRaises(TimeoutError):

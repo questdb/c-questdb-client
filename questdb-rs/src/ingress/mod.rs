@@ -1919,7 +1919,7 @@ impl SenderBuilder {
     }
 
     /// Configure how long to wait for messages from the QuestDB server during
-    /// the TLS handshake and authentication process.
+    /// the TLS handshake and authentication process. This only applies to TCP.
     /// The default is 15 seconds.
     pub fn auth_timeout(mut self, value: Duration) -> Result<Self> {
         self.auth_timeout.set_specified("auth_timeout", value)?;
@@ -2016,6 +2016,8 @@ impl SenderBuilder {
     /// The timeout calculated from minimum throughput is adedd to the value of
     /// [`request_timeout`](SenderBuilder::request_timeout) to get the total timeout
     /// value.
+    /// A value of 0 disables this feature, so it's similar to setting "infinite"
+    /// minimum throughput. The total timeout will then be equal to `request_timeout`.
     pub fn request_min_throughput(mut self, value: u64) -> Result<Self> {
         if let Some(http) = &mut self.http {
             http.request_min_throughput
@@ -2032,10 +2034,16 @@ impl SenderBuilder {
     #[cfg(feature = "ilp-over-http")]
     /// Additional time to wait on top of that calculated from the minimum throughput.
     /// This accounts for the fixed latency of the HTTP request-response roundtrip.
-    /// The value is in milliseconds, and the default is 10 seconds.
+    /// The default is 10 seconds.
     /// See also: [`request_min_throughput`](SenderBuilder::request_min_throughput).
     pub fn request_timeout(mut self, value: Duration) -> Result<Self> {
         if let Some(http) = &mut self.http {
+            if value.is_zero() {
+                return Err(error::fmt!(
+                    ConfigError,
+                    "\"request_timeout\" must be greater than 0."
+                ));
+            }
             http.request_timeout
                 .set_specified("request_timeout", value)?;
         } else {
@@ -2275,7 +2283,8 @@ impl SenderBuilder {
                     ));
                 }
 
-                let user_agent = self.http.as_ref().unwrap().user_agent.as_str();
+                let http_config = self.http.as_ref().unwrap();
+                let user_agent = http_config.user_agent.as_str();
                 let agent_builder = ureq::AgentBuilder::new()
                     .user_agent(user_agent)
                     .no_delay(true);
@@ -2307,6 +2316,8 @@ impl SenderBuilder {
                     }
                     None => None,
                 };
+                let agent_builder =
+                    agent_builder.timeout_connect(*http_config.request_timeout.deref());
                 let agent = agent_builder.build();
                 let proto = self.protocol.schema();
                 let url = format!(

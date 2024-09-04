@@ -229,7 +229,7 @@ fn test_bad_key(
     let server = MockServer::new()?;
     let lsb = server
         .lsb_tcp()
-        .username("testUser1")?
+        .username("admin")?
         .token(priv_key)?
         .token_x(pub_key_x)?
         .token_y(pub_key_y)?;
@@ -484,7 +484,6 @@ fn bad_uppercase_addr() {
     let res = Sender::from_conf("tcp::ADDR=localhost:9009;");
     assert!(res.is_err());
     let err = res.unwrap_err();
-    eprint!("err: {:?}", err);
     assert!(err.code() == ErrorCode::ConfigError);
     assert!(err.msg() == "Missing \"addr\" parameter in config string");
 }

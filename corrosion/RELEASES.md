@@ -1,3 +1,100 @@
+# v0.5.0 (2024-05-11)
+
+### Breaking Changes
+
+- Dashes (`-`) in names of imported CMake **library** targets are now replaced with underscores (`_`).
+  See [issue #501] for details. Users on older Corrosion versions will experience the same
+  change when using Rust 1.79 or newer. `bin` targets are not affected by this change.
+
+[issue #501]: https://github.com/corrosion-rs/corrosion/issues/501
+
+# v0.4.10 (2024-05-11)
+
+### New features
+
+- `corrosion_experimental_cbindgen()` can now be called multiple times on the same Rust target,
+  as long as the output header name differs. This may be useful to generate separate C and C++
+  bindings. [#507]
+- If `corrosion_link_libraries()` is called on a Rust static library target, then
+  `target_link_libraries()` is called to propagate the dependencies to C/C++ consumers.
+  Previously a warning was emitted in this case and the arguments ignored. [#506]
+
+### Fixes
+
+- Combine `-framework` flags on macos to avoid linker deduplication errors [#455]
+- `corrosion_experimental_cbindgen()` will now correctly use the package name, instead of assuming that
+    the package and crate name are identical. ([11e27c])
+- Set the `AR_<triple>` variable for `cc-rs` (except for msvc targets) [#456]
+- Fix hostbuild when cross-compiling to windows [#477]
+- Consider vworks executable suffix [#504]
+- `corrosion_experimental_cbindgen()` now forwards the Rust target-triple (e.g. `aarch64-unknown-linux-gnu`)
+  to cbindgen via the `TARGET` environment variable. The `hostbuild` property is considered. [#507]
+- Fix linking errors with Rust >= 1.79 and `-msvc` targets.` [#511]
+
+
+[#455]: https://github.com/corrosion-rs/corrosion/pull/455
+[#456]: https://github.com/corrosion-rs/corrosion/pull/456
+[#477]: https://github.com/corrosion-rs/corrosion/pull/477
+[#504]: https://github.com/corrosion-rs/corrosion/pull/504
+[#506]: https://github.com/corrosion-rs/corrosion/pull/506
+[#507]: https://github.com/corrosion-rs/corrosion/pull/507
+[#511]: https://github.com/corrosion-rs/corrosion/pull/511
+[11e27c]: https://github.com/corrosion-rs/corrosion/pull/514/commits/11e27cde2cf32c7ed539c96eb03c2f10035de538
+
+# v0.4.9 (2024-05-01)
+
+### New Features 
+
+- Automatically detect Rust target for OpenHarmony ([#510]).
+
+### Fixes
+
+- Make find_package portable ([#509]).
+
+[#510]: https://github.com/corrosion-rs/corrosion/pull/510
+[#509]: https://github.com/corrosion-rs/corrosion/pull/509
+
+# v0.4.8 (2024-04-03)
+
+### Fixes
+
+- Fix an internal error when passing both the `PROFILE` and `CRATES` option to
+  `corrosion_import_crate()` ([#496]).
+
+[#496]: https://github.com/corrosion-rs/corrosion/pull/496
+
+# v0.4.7 (2024-01-19)
+
+### Fixes
+
+- The C/C++ compiler passed from corrosion to `cc-rs` can now be overriden by users setting
+  `CC_<target>` (e.g. `CC_x86_64-unknown-linux-gnu=/path/to/my-compiler`) environment variables ([#475]).
+
+[#475]: https://github.com/corrosion-rs/corrosion/pull/475
+
+# v0.4.6 (2024-01-17)
+
+### Fixes
+
+- Fix hostbuild executables when cross-compiling from non-windows to windows targets.
+  (Only with CMake >= 3.19).
+
+# v0.4.5 (2023-11-30)
+
+### Fixes
+
+- Fix hostbuild executables when cross-compiling on windows to non-windows targets
+  (Only with CMake >= 3.19).
+
+# v0.4.4 (2023-10-06)
+
+### Fixes
+
+- Add `chimera` ([#445]) and `unikraft` ([#446]) to the list of known vendors
+
+[#445]: https://github.com/corrosion-rs/corrosion/pull/445
+[#446]: https://github.com/corrosion-rs/corrosion/pull/446
+
 # v0.4.3 (2023-09-09)
 
 ### Fixes

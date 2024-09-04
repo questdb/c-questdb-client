@@ -9,25 +9,16 @@ InfluxDB Line Protocol (ILP).
 * [QuestDB Database docs](https://questdb.io/docs/)
 * [Docs on InfluxDB Line Protocol](https://questdb.io/docs/reference/api/ilp/overview/)
 
-## Getting Started
+## Quick Start
 
-To start using `questdb-rs`, add it to your `Cargo.toml`:
+To start using `questdb-rs`, add it as a dependency of your project:
 
-```toml
-[dependencies]
-questdb-rs = "4.0.0"
+```bash
+cargo add questdb-rs
 ```
 
-## Docs
-
-See documentation for the
-[`ingress`](https://docs.rs/questdb-rs/4.0.0/questdb/ingress/) module to insert
-data into QuestDB via the ILP protocol.
-
-* Latest API docs:
-  [https://docs.rs/questdb-rs/latest/](https://docs.rs/questdb-rs/latest/)
-
-## Example
+Then you can try out this quick example, which connects to a QuestDB server
+running on your local machine:
 
 ```rust no_run
 use questdb::{
@@ -41,15 +32,21 @@ fn main() -> Result<()> {
    let mut sender = Sender::from_conf("http::addr=localhost:9000;")?;
    let mut buffer = Buffer::new();
    buffer
-       .table("sensors")?
-       .symbol("id", "toronto1")?
-       .column_f64("temperature", 20.0)?
-       .column_i64("humidity", 50)?
+       .table("trades")?
+       .symbol("symbol", "ETH-USD")?
+       .symbol("side", "sell")?
+       .column_f64("price", 2615.54)?
+       .column_f64("amount", 0.00044)?
        .at(TimestampNanos::now())?;
    sender.flush(&mut buffer)?;
    Ok(())
 }
 ```
+
+## Docs
+
+Most of the client documentation is on the
+[`ingress`](https://docs.rs/questdb-rs/4.0.3/questdb/ingress/) module page.
 
 ## Crate features
 

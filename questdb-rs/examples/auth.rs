@@ -10,7 +10,7 @@ fn main() -> Result<()> {
     let mut sender = Sender::from_conf(format!(
         concat!(
             "tcp::addr={}:{};",
-            "username=testUser1;",
+            "username=admin;",
             "token=5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48;",
             "token_x=fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU;",
             "token_y=Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac;"
@@ -21,10 +21,11 @@ fn main() -> Result<()> {
     let designated_timestamp =
         TimestampNanos::from_datetime(Utc.with_ymd_and_hms(1997, 7, 4, 4, 56, 55).unwrap())?;
     buffer
-        .table("sensors")?
-        .symbol("id", "toronto1")?
-        .column_f64("temperature", 20.0)?
-        .column_i64("humidity", 50)?
+        .table("trades")?
+        .symbol("symbol", "ETH-USD")?
+        .symbol("side", "sell")?
+        .column_f64("price", 2615.54)?
+        .column_f64("amount", 0.00044)?
         .at(designated_timestamp)?;
 
     //// If you want to pass the current system timestamp, replace with:
