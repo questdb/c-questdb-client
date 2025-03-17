@@ -251,12 +251,11 @@ impl From<Infallible> for Error {
     }
 }
 
-fn write_escaped_impl<Q, C>(check_escape_fn: C, quoting_fn: Q, output: &mut String, s: &str)
+fn write_escaped_impl<Q, C>(check_escape_fn: C, quoting_fn: Q, output_vec: &mut Vec<u8>, s: &str)
 where
     C: Fn(u8) -> bool,
     Q: Fn(&mut Vec<u8>),
 {
-    let output_vec = unsafe { output.as_mut_vec() };
     let mut to_escape = 0usize;
     for b in s.bytes() {
         if check_escape_fn(b) {
@@ -300,11 +299,11 @@ fn must_escape_quoted(c: u8) -> bool {
     matches!(c, b'\n' | b'\r' | b'"' | b'\\')
 }
 
-fn write_escaped_unquoted(output: &mut String, s: &str) {
+fn write_escaped_unquoted(output: &mut Vec<u8>, s: &str) {
     write_escaped_impl(must_escape_unquoted, |_output| (), output, s);
 }
 
-fn write_escaped_quoted(output: &mut String, s: &str) {
+fn write_escaped_quoted(output: &mut Vec<u8>, s: &str) {
     write_escaped_impl(must_escape_quoted, |output| output.push(b'"'), output, s)
 }
 
@@ -543,7 +542,7 @@ impl BufferState {
 ///
 #[derive(Debug, Clone)]
 pub struct Buffer {
-    output: String,
+    output: Vec<u8>,
     state: BufferState,
     marker: Option<(usize, BufferState)>,
     max_name_len: usize,
@@ -554,7 +553,7 @@ impl Buffer {
     /// QuestDB server default.
     pub fn new() -> Self {
         Self {
-            output: String::new(),
+            output: Vec::new(),
             state: BufferState::new(),
             marker: None,
             max_name_len: 127,
@@ -608,9 +607,13 @@ impl Buffer {
         self.output.capacity()
     }
 
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.output
+    }
+
     /// A string representation of the buffer's contents. Useful for debugging.
     pub fn as_str(&self) -> &str {
-        &self.output
+        std::str::from_utf8(&self.output).unwrap()
     }
 
     /// Mark a rewind point.
@@ -796,9 +799,9 @@ impl Buffer {
         let name: ColumnName<'a> = name.try_into()?;
         self.validate_max_name_len(name.name)?;
         self.check_op(Op::Symbol)?;
-        self.output.push(',');
+        self.output.push(b',');
         write_escaped_unquoted(&mut self.output, name.name);
-        self.output.push('=');
+        self.output.push(b'=');
         write_escaped_unquoted(&mut self.output, value.as_ref());
         self.state.op_case = OpCase::SymbolWritten;
         Ok(self)
@@ -814,12 +817,12 @@ impl Buffer {
         self.check_op(Op::Column)?;
         self.output
             .push(if (self.state.op_case as isize & Op::Symbol as isize) > 0 {
-                ' '
+                b' '
             } else {
-                ','
+                b','
             });
         write_escaped_unquoted(&mut self.output, name.name);
-        self.output.push('=');
+        self.output.push(b'=');
         self.state.op_case = OpCase::ColumnWritten;
         Ok(self)
     }
@@ -858,7 +861,7 @@ impl Buffer {
         Error: From<N::Error>,
     {
         self.write_column_key(name)?;
-        self.output.push(if value { 't' } else { 'f' });
+        self.output.push(if value { b't' } else { b'f' });
         Ok(self)
     }
 
@@ -898,8 +901,8 @@ impl Buffer {
         self.write_column_key(name)?;
         let mut buf = itoa::Buffer::new();
         let printed = buf.format(value);
-        self.output.push_str(printed);
-        self.output.push('i');
+        self.output.extend_from_slice(printed.as_bytes());
+        self.output.push(b'i');
         Ok(self)
     }
 
@@ -938,7 +941,7 @@ impl Buffer {
     {
         self.write_column_key(name)?;
         let mut ser = F64Serializer::new(value);
-        self.output.push_str(ser.as_str());
+        self.output.extend_from_slice(ser.as_str().as_bytes());
         Ok(self)
     }
 
@@ -1059,8 +1062,8 @@ impl Buffer {
         let timestamp: TimestampMicros = timestamp.try_into()?;
         let mut buf = itoa::Buffer::new();
         let printed = buf.format(timestamp.as_i64());
-        self.output.push_str(printed);
-        self.output.push('t');
+        self.output.extend_from_slice(printed.as_bytes());
+        self.output.push(b't');
         Ok(self)
     }
 
@@ -1122,9 +1125,9 @@ impl Buffer {
         }
         let mut buf = itoa::Buffer::new();
         let printed = buf.format(epoch_nanos);
-        self.output.push(' ');
-        self.output.push_str(printed);
-        self.output.push('\n');
+        self.output.push(b' ');
+        self.output.extend_from_slice(printed.as_bytes());
+        self.output.push(b'\n');
         self.state.op_case = OpCase::MayFlushOrTable;
         self.state.row_count += 1;
         Ok(())
@@ -1160,7 +1163,7 @@ impl Buffer {
     /// ```
     pub fn at_now(&mut self) -> Result<()> {
         self.check_op(Op::At)?;
-        self.output.push('\n');
+        self.output.push(b'\n');
         self.state.op_case = OpCase::MayFlushOrTable;
         self.state.row_count += 1;
         Ok(())
