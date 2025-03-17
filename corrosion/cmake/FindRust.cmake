@@ -17,15 +17,14 @@ include(FindPackageHandleStandardArgs)
 
 list(APPEND CMAKE_MESSAGE_CONTEXT "FindRust")
 
-# Print error message and return.
+# Print error message and return. Should not be used from inside functions
 macro(_findrust_failed)
     if("${Rust_FIND_REQUIRED}")
         message(FATAL_ERROR ${ARGN})
     elseif(NOT "${Rust_FIND_QUIETLY}")
         message(WARNING ${ARGN})
     endif()
-    # Note: PARENT_SCOPE is the scope of the caller of the caller of this macro.
-    set(Rust_FOUND "" PARENT_SCOPE)
+    set(Rust_FOUND "")
     return()
 endmacro()
 
@@ -320,18 +319,18 @@ if (Rust_RESOLVE_RUSTUP_TOOLCHAINS)
     set(_DISCOVERED_TOOLCHAINS_VERSION "")
 
     foreach(_TOOLCHAIN_RAW ${_TOOLCHAINS_RAW})
-        if (_TOOLCHAIN_RAW MATCHES "([a-zA-Z0-9\\._\\-]+)[ \t\r\n]?(\\(default\\) \\(override\\)|\\(default\\)|\\(override\\))?[ \t\r\n]+(.+)")
+        if (_TOOLCHAIN_RAW MATCHES "([a-zA-Z0-9\\._\\-]+)[ \t\r\n]?(\\(active\\)|\\(active, default\\)|\\(default\\) \\(override\\)|\\(default\\)|\\(override\\))?[ \t\r\n]+(.+)")
             set(_TOOLCHAIN "${CMAKE_MATCH_1}")
             set(_TOOLCHAIN_TYPE "${CMAKE_MATCH_2}")
 
             set(_TOOLCHAIN_PATH "${CMAKE_MATCH_3}")
             set(_TOOLCHAIN_${_TOOLCHAIN}_PATH "${CMAKE_MATCH_3}")
 
-            if (_TOOLCHAIN_TYPE MATCHES ".*\\(default\\).*")
+            if (_TOOLCHAIN_TYPE MATCHES ".*\\((active, )?default\\).*")
                 set(_TOOLCHAIN_DEFAULT "${_TOOLCHAIN}")
             endif()
 
-            if (_TOOLCHAIN_TYPE MATCHES ".*\\(override\\).*")
+            if (_TOOLCHAIN_TYPE MATCHES ".*\\((active|override)\\).*")
                 set(_TOOLCHAIN_OVERRIDE "${_TOOLCHAIN}")
             endif()
 
