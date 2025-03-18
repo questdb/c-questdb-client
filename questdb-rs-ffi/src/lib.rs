@@ -687,7 +687,7 @@ pub struct line_sender_buffer_view {
 /// - `len`: Exact byte length of the data
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_buffer_peek(
-    buffer: *const line_sender_buffer
+    buffer: *const line_sender_buffer,
 ) -> line_sender_buffer_view {
     let buffer = unwrap_buffer(buffer);
     let buf: &[u8] = buffer.as_bytes();
