@@ -150,11 +150,11 @@ pub(super) fn parse_http_error(http_status_code: u16, response: ureq::Response) 
                 }
             };
 
-            return if let Some(serde_json::Value::String(ref msg)) = json.get("message") {
+            if let Some(serde_json::Value::String(ref msg)) = json.get("message") {
                 parse_json_error(&json, msg)
             } else {
                 string_err()
-            };
+            }
         }
         Err(err) => {
             error::fmt!(SocketError, "Could not flush buffer: {}", err)

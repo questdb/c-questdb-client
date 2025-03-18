@@ -314,11 +314,11 @@ class QuestDbFixture:
                 if self._proc.poll() is not None:
                     raise RuntimeError('QuestDB died during startup.')
                 req = urllib.request.Request(
-                    f'http://localhost:{self.http_server_port}',
+                    f'http://localhost:{self.http_server_port}/ping',
                     method='GET')
                 try:
                     resp = urllib.request.urlopen(req, timeout=1)
-                    if resp.status == 200:
+                    if resp.status == 204:
                         return True
                 except socket.timeout:
                     pass
