@@ -104,6 +104,10 @@ c_line_sender_utf8_p = ctypes.POINTER(c_line_sender_utf8)
 class c_line_sender_table_name(ctypes.Structure):
     _fields_ = [("len", c_size_t),
                 ("buf", c_char_p)]
+class line_sender_buffer_view(ctypes.Structure):
+    _fields_ = [("len", c_size_t),
+                ("buf", c_char_p)]
+
 c_line_sender_table_name_p = ctypes.POINTER(c_line_sender_table_name)
 class c_line_sender_column_name(ctypes.Structure):
     _fields_ = [("len", c_size_t),
@@ -185,9 +189,8 @@ def _setup_cdll():
         c_line_sender_buffer_p)
     set_sig(
         dll.line_sender_buffer_peek,
-        c_char_p,
-        c_line_sender_buffer_p,
-        c_size_t_p)
+        line_sender_buffer_view,
+        c_line_sender_buffer_p)
     set_sig(
         dll.line_sender_buffer_clear,
         None,
@@ -547,7 +550,7 @@ class Buffer:
         buf = _DLL.line_sender_buffer_peek(self._impl, ctypes.byref(size))
         if size:
             size = c_ssize_t(size.value)
-            return _PY_DLL.PyUnicode_FromStringAndSize(buf, size)
+            return _PY_DLL.PyUnicode_FromStringAndSize(buf.buf, size)
         else:
             return ''
 

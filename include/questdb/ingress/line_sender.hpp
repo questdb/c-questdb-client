@@ -430,9 +430,8 @@ namespace questdb::ingress
         {
             if (_impl)
             {
-                size_t len = 0;
-                const char* buf = ::line_sender_buffer_peek(_impl, &len);
-                return {buf, len};
+              auto buf = ::line_sender_buffer_peek(_impl);
+              return {buf.buf, buf.len};
             }
             else
             {

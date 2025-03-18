@@ -611,11 +611,6 @@ impl Buffer {
         &self.output
     }
 
-    /// A string representation of the buffer's contents. Useful for debugging.
-    pub fn as_str(&self) -> &str {
-        std::str::from_utf8(&self.output).unwrap()
-    }
-
     /// Mark a rewind point.
     /// This allows undoing accumulated changes to the buffer for one or more
     /// rows by calling [`rewind_to_marker`](Buffer::rewind_to_marker).
@@ -2552,7 +2547,7 @@ impl Sender {
             ));
         }
 
-        let bytes = buf.as_str().as_bytes();
+        let bytes = buf.as_bytes();
         if bytes.is_empty() {
             return Ok(());
         }

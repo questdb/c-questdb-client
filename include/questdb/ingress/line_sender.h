@@ -172,6 +172,14 @@ line_sender_utf8 line_sender_utf8_assert(size_t len, const char* buf);
     line_sender_utf8_assert(sizeof(literal) - 1, (literal))
 
 /**
+ * Non-owning view of sender buffer.
+ */
+typedef struct line_sender_buffer_view {
+  size_t len;
+  const char *buf;
+} line_sender_buffer_view;
+
+/**
  * Non-owning validated table, symbol or column name. UTF-8 encoded.
  * Need not be null-terminated.
  */
@@ -360,18 +368,15 @@ LINESENDER_API
 bool line_sender_buffer_transactional(const line_sender_buffer* buffer);
 
 /**
- * Get a string representation of the contents of the buffer.
+ * Get a read-only view into the buffer's bytes content..
  *
  * @param[in] buffer Line sender buffer object.
- * @param[out] len_out The length in bytes of the returned string buffer.
- * @return UTF-8 encoded buffer with the string representation of the line
- *         sender buffer's contents. The buffer is not nul-terminated, and the
- *         length is in the `len_out` parameter.
+ * @return read_only view with the byte representation of the line
+ *         sender buffer's contents.
  */
 LINESENDER_API
-const char* line_sender_buffer_peek(
-    const line_sender_buffer* buffer,
-    size_t* len_out);
+line_sender_buffer_view
+line_sender_buffer_peek(const line_sender_buffer *buffer);
 
 /**
  * Start recording a new row for the given table.
