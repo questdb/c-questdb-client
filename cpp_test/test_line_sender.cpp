@@ -388,40 +388,38 @@ TEST_CASE("Buffer move and copy ctor testing")
 
     questdb::ingress::line_sender_buffer buffer1{init_buf_size};
     buffer1.table("buffer1");
-    CHECK(buffer1.peek() == "buffer1");
+    CHECK(buffer1.peek_as_bytes() == "buffer1");
 
     questdb::ingress::line_sender_buffer buffer2{2 * init_buf_size};
     buffer2.table("buffer2");
-    CHECK(buffer2.peek() == "buffer2");
+    CHECK(buffer2.peek_as_bytes() == "buffer2");
 
     questdb::ingress::line_sender_buffer buffer3{3 * init_buf_size};
     buffer3.table("buffer3");
-    CHECK(buffer3.peek() == "buffer3");
+    CHECK(buffer3.peek_as_bytes() == "buffer3");
 
     questdb::ingress::line_sender_buffer buffer4{buffer3};
     buffer4.symbol("t1", "v1");
-    CHECK(buffer4.peek() == "buffer3,t1=v1");
-    CHECK(buffer3.peek() == "buffer3");
+    CHECK(buffer4.peek_as_bytes() == "buffer3,t1=v1");
+    CHECK(buffer3.peek_as_bytes() == "buffer3");
 
     questdb::ingress::line_sender_buffer buffer5{std::move(buffer4)};
-    CHECK(buffer5.peek() == "buffer3,t1=v1");
-    CHECK(buffer4.peek() == "");
+    CHECK(buffer5.peek_as_bytes() == "buffer3,t1=v1");
+    CHECK(buffer4.peek_as_bytes() == "");
 
     buffer4.table("buffer4");
-    CHECK(buffer4.peek() == "buffer4");
+    CHECK(buffer4.peek_as_bytes() == "buffer4");
 
     buffer1 = buffer2;
-    CHECK(buffer1.peek() == "buffer2");
-    CHECK(buffer2.peek() == "buffer2");
+    CHECK(buffer1.peek_as_bytes() == "buffer2");
+    CHECK(buffer2.peek_as_bytes() == "buffer2");
 
     buffer1 = std::move(buffer3);
-    CHECK(buffer1.peek() == "buffer3");
-    CHECK(buffer3.peek() == "");
+    CHECK(buffer1.peek_as_bytes() == "buffer3");
+    CHECK(buffer3.peek_as_bytes() == "");
     CHECK(buffer3.size() == 0);
     CHECK(buffer3.capacity() == 0);
-    CHECK(buffer3.peek() == "");
-
-
+    CHECK(buffer3.peek_as_bytes() == "");
 }
 
 TEST_CASE("Sender move testing.")
@@ -704,11 +702,11 @@ TEST_CASE("Test timestamp column.")
     std::stringstream ss;
     ss << "test ts1=12345t,ts2=" << now_micros << "t,ts3=" << now_micros << "t " << now_nanos << "\n";
     const auto exp = ss.str();
-    CHECK(buffer.peek() == exp);
+    CHECK(buffer.peek_as_bytes() == exp);
 
     sender.flush_and_keep(buffer);
 
-    CHECK(buffer.peek() == exp);
+    CHECK(buffer.peek_as_bytes() == exp);
 
     server.accept();
     sender.close();
@@ -740,11 +738,11 @@ TEST_CASE("Test Marker")
 
     buffer.set_marker();
     buffer.table("test");
-    CHECK(buffer.peek() == "test");
+    CHECK(buffer.peek_as_bytes() == "test");
     CHECK(buffer.size() == 4);
 
     buffer.rewind_to_marker();
-    CHECK(buffer.peek() == "");
+    CHECK(buffer.peek_as_bytes() == "");
     CHECK(buffer.size() == 0);
 
     // Can't rewind, no marker set: Cleared by `rewind_to_marker`.
@@ -753,10 +751,10 @@ TEST_CASE("Test Marker")
     buffer.table("a").symbol("b", "c");
     CHECK_THROWS_AS(buffer.set_marker(), questdb::ingress::line_sender_error);
     CHECK_THROWS_AS(buffer.rewind_to_marker(), questdb::ingress::line_sender_error);
-    CHECK(buffer.peek() == "a,b=c");
+    CHECK(buffer.peek_as_bytes() == "a,b=c");
 
     buffer.at_now();
-    CHECK(buffer.peek() == "a,b=c\n");
+    CHECK(buffer.peek_as_bytes() == "a,b=c\n");
 
     buffer.set_marker();
     buffer.clear_marker();
@@ -764,13 +762,13 @@ TEST_CASE("Test Marker")
     CHECK_THROWS_AS(buffer.rewind_to_marker(), questdb::ingress::line_sender_error);
     buffer.set_marker();
     buffer.table("d").symbol("e", "f");
-    CHECK(buffer.peek() == "a,b=c\nd,e=f");
+    CHECK(buffer.peek_as_bytes() == "a,b=c\nd,e=f");
 
     buffer.rewind_to_marker();
-    CHECK(buffer.peek() == "a,b=c\n");
+    CHECK(buffer.peek_as_bytes() == "a,b=c\n");
 
     buffer.clear();
-    CHECK(buffer.peek() == "");
+    CHECK(buffer.peek_as_bytes() == "");
     CHECK_THROWS_AS(buffer.rewind_to_marker(), questdb::ingress::line_sender_error);
 }
 

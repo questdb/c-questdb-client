@@ -468,7 +468,7 @@ fn test_tls_insecure_skip_verify() -> TestResult {
     assert_eq!(buffer.len(), exp.len());
     sender.flush(&mut buffer)?;
     assert_eq!(server.recv_q()?, 1);
-    assert_eq!(server.msgs[0].as_str(), exp);
+    assert_eq!(server.msgs[0].as_bytes(), exp);
     Ok(())
 }
 

@@ -334,4 +334,4 @@ Instead, on error, the server terminates the connection, and logs any error
 messages in [server logs](https://questdb.io/docs/troubleshooting/log/).
 
 To inspect or log a buffer's contents before you send it, call
-[`buffer.as_str()`](Buffer::as_str).
+[`buffer.as_bytes()`](Buffer::as_bytes).
