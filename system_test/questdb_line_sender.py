@@ -51,11 +51,11 @@ from enum import Enum
 from ctypes import (
     c_bool,
     c_size_t,
-    c_ubyte_p,
     c_char_p,
     c_int,
     c_int64,
     c_double,
+    c_uint8,
     c_uint16,
     c_uint64,
     c_void_p,
@@ -107,7 +107,7 @@ class c_line_sender_table_name(ctypes.Structure):
                 ("buf", c_char_p)]
 class line_sender_buffer_view(ctypes.Structure):
     _fields_ = [("len", c_size_t),
-                ("buf", c_ubyte_p)]
+                ("buf", ctypes.POINTER(c_uint8))]
 
 c_line_sender_table_name_p = ctypes.POINTER(c_line_sender_table_name)
 class c_line_sender_column_name(ctypes.Structure):
