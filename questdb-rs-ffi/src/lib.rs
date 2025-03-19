@@ -676,7 +676,7 @@ pub unsafe extern "C" fn line_sender_buffer_transactional(
 #[derive(Debug, Copy, Clone)]
 pub struct line_sender_buffer_view {
     len: size_t,
-    buf: *const c_char,
+    buf: *const u8,
 }
 
 /// Provides a read-only view into the buffer's bytes content.
@@ -693,7 +693,7 @@ pub unsafe extern "C" fn line_sender_buffer_peek(
     let buf: &[u8] = buffer.as_bytes();
     line_sender_buffer_view {
         len: buf.len(),
-        buf: buf.as_ptr() as *const c_char,
+        buf: buf.as_ptr(),
     }
 }
 

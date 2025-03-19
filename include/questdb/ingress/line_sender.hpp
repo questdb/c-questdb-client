@@ -427,10 +427,10 @@ namespace questdb::ingress
          * Get a bytes representation of the contents of the buffer(not
          * guarantee encoding string).
          */
-        std::string_view peek_as_bytes() const noexcept {
+        std::string_view peek() const noexcept {
           if (_impl) {
-            auto buf = ::line_sender_buffer_peek(_impl);
-            return {buf.buf, buf.len};
+            auto view = ::line_sender_buffer_peek(_impl);
+            return {reinterpret_cast<const char *>(view.buf), view.len};
           } else {
             return {};
           }

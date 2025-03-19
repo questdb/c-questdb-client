@@ -51,6 +51,7 @@ from enum import Enum
 from ctypes import (
     c_bool,
     c_size_t,
+    c_ubyte_p,
     c_char_p,
     c_int,
     c_int64,
@@ -106,7 +107,7 @@ class c_line_sender_table_name(ctypes.Structure):
                 ("buf", c_char_p)]
 class line_sender_buffer_view(ctypes.Structure):
     _fields_ = [("len", c_size_t),
-                ("buf", c_char_p)]
+                ("buf", c_ubyte_p)]
 
 c_line_sender_table_name_p = ctypes.POINTER(c_line_sender_table_name)
 class c_line_sender_column_name(ctypes.Structure):
@@ -420,8 +421,8 @@ _DLL = _setup_cdll()
 _PY_DLL = ctypes.pythonapi
 _PY_DLL.PyUnicode_FromKindAndData.restype = ctypes.py_object
 _PY_DLL.PyUnicode_FromKindAndData.argtypes = [c_int, c_void_p, c_ssize_t]
-_PY_DLL.PyUnicode_FromStringAndSize.restype = ctypes.py_object
-_PY_DLL.PyUnicode_FromStringAndSize.argtypes = [c_char_p, c_ssize_t]
+_PY_DLL.PyBytes_FromStringAndSize.restype = ctypes.py_object
+_PY_DLL.PyBytes_FromStringAndSize.argtypes = [ctypes.c_char_p, ctypes.c_ssize_t]
 
 
 class SenderError(Exception):
@@ -546,11 +547,10 @@ class Buffer:
         # https://docs.python.org/3/c-api/buffer.html
         # This way we would not need to `bytes(..)` the object to keep it alive.
         # Then we could call `PyMemoryView_FromObject`.
-        size = c_size_t(0)
-        buf = _DLL.line_sender_buffer_peek(self._impl, ctypes.byref(size))
-        if size:
-            size = c_ssize_t(size.value)
-            return _PY_DLL.PyUnicode_FromStringAndSize(buf.buf, size)
+        view = _DLL.line_sender_buffer_peek(self._impl)
+        if view.len:
+            c_buf = ctypes.cast(view.buf, c_char_p)  # uint8_t* → char*
+            return _PY_DLL.PyBytes_FromStringAndSize(c_buf, view.len)
         else:
             return ''
 

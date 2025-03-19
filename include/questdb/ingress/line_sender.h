@@ -172,11 +172,12 @@ line_sender_utf8 line_sender_utf8_assert(size_t len, const char* buf);
     line_sender_utf8_assert(sizeof(literal) - 1, (literal))
 
 /**
- * Non-owning view of sender buffer.
+ * Non-owning view of sender buffer, Modifying the buffer will invalidate the
+ * borrowed buffer
  */
 typedef struct line_sender_buffer_view {
   size_t len;
-  const char *buf;
+  const uint8_t *buf; // clang-format off
 } line_sender_buffer_view;
 
 /**
@@ -368,7 +369,7 @@ LINESENDER_API
 bool line_sender_buffer_transactional(const line_sender_buffer* buffer);
 
 /**
- * Get a read-only view into the buffer's bytes content..
+ * Get a read-only view into the buffer's bytes contents.
  *
  * @param[in] buffer Line sender buffer object.
  * @return read_only view with the byte representation of the line
