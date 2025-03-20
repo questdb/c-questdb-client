@@ -1,4 +1,5 @@
 use std::fmt::{Display, Formatter};
+use ureq::Error::StatusCode;
 
 macro_rules! fmt {
     ($code:ident, $($arg:tt)*) => {
@@ -74,6 +75,54 @@ impl Error {
     /// Get the string message of this error.
     pub fn msg(&self) -> &str {
         &self.msg
+    }
+}
+
+impl From<ureq::Error> for Error {
+    fn from(err: ureq::Error) -> Error {
+        match err {
+            StatusCode(code) => {
+                if code == 404 {
+                    fmt!(
+                        HttpNotSupported,
+                        "Could not flush buffer: HTTP endpoint does not support ILP."
+                    )
+                } else if [401, 403].contains(&code) {
+                    fmt!(
+                        AuthError,
+                        "Could not flush buffer: HTTP endpoint authentication error [code: {}]",
+                        code
+                    )
+                } else {
+                    fmt!(SocketError, "Could not flush buffer: {}", err)
+                }
+            }
+            ureq::Error::Http(e) => {
+                fmt!(
+                    SocketError,
+                    "Could not flush buffer: Inner http error: {}",
+                    e
+                )
+            }
+            ureq::Error::BadUri(s) => {
+                fmt!(SocketError, "Could not flush buffer: Bad uri  {}", s)
+            }
+            ureq::Error::Protocol(e) => {
+                fmt!(SocketError, "Could not flush buffer: Protocol error: {}", e)
+            }
+            ureq::Error::Io(e) => {
+                fmt!(SocketError, "Could not flush buffer: Io error: {}", e)
+            }
+            ureq::Error::Timeout(e) => {
+                fmt!(SocketError, "Could not flush buffer: Timeout {}", e)
+            }
+            ureq::Error::Tls(e) => {
+                fmt!(SocketError, "Could not flush buffer: Tls error: {}", e)
+            }
+            e => {
+                fmt!(SocketError, "Could not flush buffer: other error: {}", e)
+            }
+        }
     }
 }
 
