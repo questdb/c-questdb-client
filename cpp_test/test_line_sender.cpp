@@ -30,10 +30,11 @@
 #include <questdb/ingress/line_sender.h>
 #include <questdb/ingress/line_sender.hpp>
 
-#include <vector>
-#include <sstream>
 #include <chrono>
+#include <cstring>
+#include <sstream>
 #include <thread>
+#include <vector>
 
 using namespace std::string_literals;
 using namespace questdb::ingress::literals;
@@ -382,44 +383,57 @@ TEST_CASE("Validation of bad chars in key names.")
     }
 }
 
+#if __cplusplus >= 202002L
+bool operator==(const std::span<const std::byte> &lhs, const char *rhs) {
+  return lhs.size() == std::strlen(rhs) &&
+         std::memcmp(lhs.data(), rhs, lhs.size()) == 0;
+}
+
+bool operator==(const std::span<const std::byte> &lhs,
+                const std::string &rhs) noexcept {
+  return lhs.size() == rhs.size() &&
+         std::memcmp(lhs.data(), rhs.data(), lhs.size()) == 0;
+}
+#endif
+
 TEST_CASE("Buffer move and copy ctor testing")
 {
-    const size_t init_buf_size = 128;
+  const size_t init_buf_size = 128;
 
-    questdb::ingress::line_sender_buffer buffer1{init_buf_size};
-    buffer1.table("buffer1");
-    CHECK(buffer1.peek() == "buffer1");
+  questdb::ingress::line_sender_buffer buffer1{init_buf_size};
+  buffer1.table("buffer1");
+  CHECK(buffer1.peek() == "buffer1");
 
-    questdb::ingress::line_sender_buffer buffer2{2 * init_buf_size};
-    buffer2.table("buffer2");
-    CHECK(buffer2.peek() == "buffer2");
+  questdb::ingress::line_sender_buffer buffer2{2 * init_buf_size};
+  buffer2.table("buffer2");
+  CHECK(buffer2.peek() == "buffer2");
 
-    questdb::ingress::line_sender_buffer buffer3{3 * init_buf_size};
-    buffer3.table("buffer3");
-    CHECK(buffer3.peek() == "buffer3");
+  questdb::ingress::line_sender_buffer buffer3{3 * init_buf_size};
+  buffer3.table("buffer3");
+  CHECK(buffer3.peek() == "buffer3");
 
-    questdb::ingress::line_sender_buffer buffer4{buffer3};
-    buffer4.symbol("t1", "v1");
-    CHECK(buffer4.peek() == "buffer3,t1=v1");
-    CHECK(buffer3.peek() == "buffer3");
+  questdb::ingress::line_sender_buffer buffer4{buffer3};
+  buffer4.symbol("t1", "v1");
+  CHECK(buffer4.peek() == "buffer3,t1=v1");
+  CHECK(buffer3.peek() == "buffer3");
 
-    questdb::ingress::line_sender_buffer buffer5{std::move(buffer4)};
-    CHECK(buffer5.peek() == "buffer3,t1=v1");
-    CHECK(buffer4.peek() == "");
+  questdb::ingress::line_sender_buffer buffer5{std::move(buffer4)};
+  CHECK(buffer5.peek() == "buffer3,t1=v1");
+  CHECK(buffer4.peek() == "");
 
-    buffer4.table("buffer4");
-    CHECK(buffer4.peek() == "buffer4");
+  buffer4.table("buffer4");
+  CHECK(buffer4.peek() == "buffer4");
 
-    buffer1 = buffer2;
-    CHECK(buffer1.peek() == "buffer2");
-    CHECK(buffer2.peek() == "buffer2");
+  buffer1 = buffer2;
+  CHECK(buffer1.peek() == "buffer2");
+  CHECK(buffer2.peek() == "buffer2");
 
-    buffer1 = std::move(buffer3);
-    CHECK(buffer1.peek() == "buffer3");
-    CHECK(buffer3.peek() == "");
-    CHECK(buffer3.size() == 0);
-    CHECK(buffer3.capacity() == 0);
-    CHECK(buffer3.peek() == "");
+  buffer1 = std::move(buffer3);
+  CHECK(buffer1.peek() == "buffer3");
+  CHECK(buffer3.peek() == "");
+  CHECK(buffer3.size() == 0);
+  CHECK(buffer3.capacity() == 0);
+  CHECK(buffer3.peek() == "");
 }
 
 TEST_CASE("Sender move testing.")

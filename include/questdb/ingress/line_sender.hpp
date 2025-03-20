@@ -26,13 +26,17 @@
 
 #include "line_sender.h"
 
-#include <string>
-#include <string_view>
-#include <stdexcept>
-#include <cstdint>
-#include <optional>
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <optional>
+#include <stdexcept>
+#include <string>
 #include <type_traits>
+#if __cplusplus >= 202002L
+#include <span>
+#endif
 
 namespace questdb::ingress
 {
@@ -93,6 +97,23 @@ namespace questdb::ingress
 
         /** InfluxDB Line Protocol over HTTP with TLS. */
         https,
+    };
+
+    struct line_sender_buffer_bytes {
+      const std::byte *buf;
+      size_t len;
+
+      friend bool operator==(const line_sender_buffer_bytes &lhs,
+                             const char *rhs) {
+        return lhs.len == std::strlen(rhs) &&
+               std::memcmp(lhs.buf, rhs, lhs.len) == 0;
+      }
+
+      friend bool operator==(const line_sender_buffer_bytes &lhs,
+                             const std::string &rhs) {
+        return lhs.len == rhs.size() &&
+               std::memcmp(lhs.buf, rhs.data(), lhs.len) == 0;
+      }
     };
 
     /* Possible sources of the root certificates used to validate the server's TLS certificate. */
@@ -423,17 +444,22 @@ namespace questdb::ingress
                 return 0;
         }
 
+#if __cplusplus >= 202002L
+        using buffer_view_t = std::span<const std::byte>;
+#else
+        using buffer_view_t = line_sender_buffer_bytes;
+#endif
+
         /**
-         * Get a bytes representation of the contents of the buffer(not
-         * guarantee encoding string).
+         * Get a bytes representation of the contents of the buffer
+         * (not guaranteed to be an encoded string)
          */
-        std::string_view peek() const noexcept {
+        buffer_view_t peek() const noexcept {
           if (_impl) {
             auto view = ::line_sender_buffer_peek(_impl);
-            return {reinterpret_cast<const char *>(view.buf), view.len};
-          } else {
-            return {};
+            return {reinterpret_cast<const std::byte *>(view.buf), view.len};
           }
+          return {};
         }
 
         /**
