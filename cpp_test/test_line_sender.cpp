@@ -401,7 +401,7 @@ bool operator==(std::span<const std::byte> lhs, const std::string& rhs)
 }
 #else
 template <size_t N>
-bool operator==(const questdb::ingress::buffer_view& lhs_view,
+bool operator==(const questdb::ingress::buffer_view lhs_view,
                 const char (&rhs)[N])
 {
     constexpr size_t bytelen = N - 1; // Exclude null terminator
@@ -410,7 +410,7 @@ bool operator==(const questdb::ingress::buffer_view& lhs_view,
     return lhs_view == rhs_view;
 }
 
-bool operator==(const questdb::ingress::buffer_view& lhs_view,
+bool operator==(const questdb::ingress::buffer_view lhs_view,
                 const std::string& rhs)
 {
     const questdb::ingress::buffer_view rhs_view{
