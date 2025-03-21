@@ -145,7 +145,7 @@ pub(super) fn parse_json_error(json: &serde_json::Value, msg: &str) -> Error {
                 description.push_str(", ");
             }
             description.push_str("line: ");
-            description.write_str(format!("{}", line).as_str()).unwrap();
+            write!(description, "{}", line).unwrap();
         }
 
         description.push(']');
