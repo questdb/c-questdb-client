@@ -12,3 +12,11 @@ steps:
     env:
       JAVA_HOME: $(JAVA_HOME_11_X64)
     displayName: "Make"
+  - script: cmake -S . -B build_CXX20 -DCMAKE_BUILD_TYPE=Release -DQUESTDB_TESTS_AND_EXAMPLES=ON -DCMAKE_CXX_STANDARD=20
+    env:
+      JAVA_HOME: $(JAVA_HOME_11_X64)
+    displayName: "Build Makefile with CMake"
+  - script: cmake --build build_CXX20 --config Release
+    env:
+      JAVA_HOME: $(JAVA_HOME_11_X64)
+    displayName: "Make"
