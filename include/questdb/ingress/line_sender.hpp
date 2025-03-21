@@ -35,9 +35,6 @@
 #include <type_traits>
 #if __cplusplus >= 202002L
 #include <span>
-#else
-#include <cassert>
-#include <iterator>
 #endif
 
 namespace questdb::ingress
@@ -361,116 +358,13 @@ namespace questdb::ingress
         /// @return true if size() == 0.
         constexpr bool empty() const noexcept { return len == 0; }
 
-        // ------------------------------------------------------------------------
-        // Iterators
-        // ------------------------------------------------------------------------
-
-        /// @brief Gets an iterator to the beginning of the byte sequence.
-        constexpr iterator begin() const noexcept { return buf; }
-
-        /// @brief Gets an iterator past the end of the byte sequence.
-        constexpr iterator end() const noexcept { return buf + len; }
-
-        /// @brief Gets a const iterator to the beginning of the byte sequence.
-        constexpr const_iterator cbegin() const noexcept { return buf; }
-
-        /// @brief Gets a const iterator past the end of the byte sequence.
-        constexpr const_iterator cend() const noexcept { return buf + len; }
-
-        /// @brief Gets a reverse iterator to the end of the byte sequence.
-        constexpr reverse_iterator rbegin() const noexcept
-        {
-            return reverse_iterator(end());
-        }
-
-        /// @brief Gets a reverse iterator to the beginning of the byte
-        /// sequence.
-        constexpr reverse_iterator rend() const noexcept
-        {
-            return reverse_iterator(begin());
-        }
-
-        /// @brief Gets a const reverse iterator to the end of the byte
-        /// sequence.
-        constexpr const_reverse_iterator crbegin() const noexcept
-        {
-            return const_reverse_iterator(cend());
-        }
-
-        /// @brief Gets a const reverse iterator to the beginning of the byte
-        /// sequence.
-        constexpr const_reverse_iterator crend() const noexcept
-        {
-            return const_reverse_iterator(cbegin());
-        }
-
-        // ------------------------------------------------------------------------
-        // Element Access
-        // ------------------------------------------------------------------------
-
-        /// @brief Accesses the byte at specified position.
-        /// @param idx Index of the byte to access.
-        /// @throws No exceptions, but triggers assert if idx >= size().
-        constexpr reference operator[](size_t idx) const
-        {
-            assert(idx < len && "buffer_view::operator[] index out of range");
-            return buf[idx];
-        }
-
-        /// @brief Accesses the first byte.
-        /// @throws No exceptions, but triggers assert if empty().
-        constexpr reference front() const
-        {
-            assert(!empty() && "buffer_view::front() on empty buffer");
-            return buf[0];
-        }
-
-        /// @brief Accesses the last byte.
-        /// @throws No exceptions, but triggers assert if empty().
-        constexpr reference back() const
-        {
-            assert(!empty() && "buffer_view::back() on empty buffer");
-            return buf[len - 1];
-        }
-
-        // ------------------------------------------------------------------------
-        // Subview Operations
-        // ------------------------------------------------------------------------
-
-        /// @brief Creates a subview starting at offset with specified length.
-        /// @param offset Starting position in the current view.
-        /// @param count Number of bytes to include (clamped to remaining
-        /// bytes).
-        /// @throws std::out_of_range if offset > size().
-        constexpr buffer_view subview(size_t offset, size_t count) const
-        {
-            if (offset > len)
-            {
-                throw std::out_of_range(
-                    "buffer_view::subview offset out of range");
-            }
-            return {buf + offset, std::min(count, len - offset)};
-        }
-
-        /// @brief Creates a subview starting at offset until the end.
-        /// @param offset Starting position in the current view.
-        /// @return Subview from offset to size().
-        constexpr buffer_view subview(size_t offset) const
-        {
-            return subview(offset, len - offset);
-        }
-
-        // ------------------------------------------------------------------------
-        // Comparison
-        // ------------------------------------------------------------------------
-
         /// @brief Checks byte-wise equality between two buffer views.
         /// @return true if both views have identical size and byte content.
         friend bool operator==(const buffer_view& lhs,
                                const buffer_view& rhs) noexcept
         {
             return lhs.size() == rhs.size() &&
-                   std::equal(lhs.begin(), lhs.end(), rhs.begin());
+                   std::equal(lhs.buf, lhs.buf + lhs.len, rhs.buf);
         }
     };
 #endif
@@ -587,20 +481,8 @@ namespace questdb::ingress
         }
 
 #if __cplusplus >= 202002L
-        /**
-         * Get a bytes view of the contents of the buffer
-         * (not guaranteed to be an encoded string)
-         */
-        std::span<const std::byte> peek() const noexcept
-        {
-            if (_impl)
-            {
-                auto view = ::line_sender_buffer_peek(_impl);
-                return {reinterpret_cast<const std::byte*>(view.buf), view.len};
-            }
-            return {};
-        }
-#else
+        using buffer_view = std::span<const std::byte>;
+#endif
 
         /**
          * Get a bytes view of the contents of the buffer
@@ -615,7 +497,6 @@ namespace questdb::ingress
             }
             return {};
         }
-#endif
 
         /**
          * Mark a rewind point.
