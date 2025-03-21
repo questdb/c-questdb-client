@@ -384,15 +384,38 @@ TEST_CASE("Validation of bad chars in key names.")
 }
 
 #if __cplusplus >= 202002L
-bool operator==(const std::span<const std::byte> &lhs, const char *rhs) {
-  return lhs.size() == std::strlen(rhs) &&
-         std::memcmp(lhs.data(), rhs, lhs.size()) == 0;
+template <size_t N>
+bool operator==(std::span<const std::byte> lhs, const char (&rhs)[N])
+{
+    constexpr size_t bytelen = N - 1; // Exclude null terminator
+    const std::span<const std::byte> rhs_span{
+        reinterpret_cast<const std::byte*>(rhs), bytelen};
+    return lhs.size() == bytelen && std::ranges::equal(lhs, rhs_span);
 }
 
-bool operator==(const std::span<const std::byte> &lhs,
-                const std::string &rhs) noexcept {
-  return lhs.size() == rhs.size() &&
-         std::memcmp(lhs.data(), rhs.data(), lhs.size()) == 0;
+bool operator==(std::span<const std::byte> lhs, const std::string& rhs)
+{
+    const std::span<const std::byte> rhs_span{
+        reinterpret_cast<const std::byte*>(rhs.data()), rhs.size()};
+    return lhs.size() == rhs.size() && std::ranges::equal(lhs, rhs_span);
+}
+#else
+template <size_t N>
+bool operator==(const questdb::ingress::buffer_view& lhs_view,
+                const char (&rhs)[N])
+{
+    constexpr size_t bytelen = N - 1; // Exclude null terminator
+    const questdb::ingress::buffer_view rhs_view{
+        reinterpret_cast<const std::byte*>(rhs), bytelen};
+    return lhs_view == rhs_view;
+}
+
+bool operator==(const questdb::ingress::buffer_view& lhs_view,
+                const std::string& rhs)
+{
+    const questdb::ingress::buffer_view rhs_view{
+        reinterpret_cast<const std::byte*>(rhs.data()), rhs.size()};
+    return lhs_view == rhs_view;
 }
 #endif
 

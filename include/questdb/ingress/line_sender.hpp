@@ -29,13 +29,15 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
 #if __cplusplus >= 202002L
 #include <span>
+#else
+#include <cassert>
+#include <iterator>
 #endif
 
 namespace questdb::ingress
@@ -97,23 +99,6 @@ namespace questdb::ingress
 
         /** InfluxDB Line Protocol over HTTP with TLS. */
         https,
-    };
-
-    struct line_sender_buffer_bytes {
-      const std::byte *buf;
-      size_t len;
-
-      friend bool operator==(const line_sender_buffer_bytes &lhs,
-                             const char *rhs) {
-        return lhs.len == std::strlen(rhs) &&
-               std::memcmp(lhs.buf, rhs, lhs.len) == 0;
-      }
-
-      friend bool operator==(const line_sender_buffer_bytes &lhs,
-                             const std::string &rhs) {
-        return lhs.len == rhs.size() &&
-               std::memcmp(lhs.buf, rhs.data(), lhs.len) == 0;
-      }
     };
 
     /* Possible sources of the root certificates used to validate the server's TLS certificate. */
@@ -333,6 +318,163 @@ namespace questdb::ingress
         int64_t _ts;
     };
 
+#if __cplusplus < 202002L
+    class buffer_view final
+    {
+      public:
+        using iterator = const std::byte*;
+        using const_iterator = const std::byte*;
+        using reverse_iterator = std::reverse_iterator<iterator>;
+        using const_reverse_iterator = std::reverse_iterator<const_iterator>;
+        using reference = const std::byte&;
+
+      private:
+        const std::byte* buf{nullptr};
+        size_t len{0};
+
+      public:
+        // ------------------------------------------------------------------------
+        // Constructor & Core Accessors
+        // ------------------------------------------------------------------------
+
+        /// @brief Default constructor. Creates an empty buffer view.
+        buffer_view() noexcept = default;
+
+        /// @brief Constructs a buffer view from raw byte data.
+        /// @param data Pointer to the underlying byte array (may be nullptr if
+        /// length=0).
+        /// @param length Number of bytes in the array.
+        constexpr buffer_view(const std::byte* data, size_t length) noexcept
+            : buf(data), len(length)
+        {
+        }
+
+        /// @brief Gets a pointer to the underlying byte array.
+        /// @return Const pointer to the data (may be nullptr if empty()).
+        constexpr const std::byte* data() const noexcept { return buf; }
+
+        /// @brief Gets the number of bytes in the view.
+        /// @return Size in bytes.
+        constexpr size_t size() const noexcept { return len; }
+
+        /// @brief Checks if the view contains no bytes.
+        /// @return true if size() == 0.
+        constexpr bool empty() const noexcept { return len == 0; }
+
+        // ------------------------------------------------------------------------
+        // Iterators
+        // ------------------------------------------------------------------------
+
+        /// @brief Gets an iterator to the beginning of the byte sequence.
+        constexpr iterator begin() const noexcept { return buf; }
+
+        /// @brief Gets an iterator past the end of the byte sequence.
+        constexpr iterator end() const noexcept { return buf + len; }
+
+        /// @brief Gets a const iterator to the beginning of the byte sequence.
+        constexpr const_iterator cbegin() const noexcept { return buf; }
+
+        /// @brief Gets a const iterator past the end of the byte sequence.
+        constexpr const_iterator cend() const noexcept { return buf + len; }
+
+        /// @brief Gets a reverse iterator to the end of the byte sequence.
+        constexpr reverse_iterator rbegin() const noexcept
+        {
+            return reverse_iterator(end());
+        }
+
+        /// @brief Gets a reverse iterator to the beginning of the byte
+        /// sequence.
+        constexpr reverse_iterator rend() const noexcept
+        {
+            return reverse_iterator(begin());
+        }
+
+        /// @brief Gets a const reverse iterator to the end of the byte
+        /// sequence.
+        constexpr const_reverse_iterator crbegin() const noexcept
+        {
+            return const_reverse_iterator(cend());
+        }
+
+        /// @brief Gets a const reverse iterator to the beginning of the byte
+        /// sequence.
+        constexpr const_reverse_iterator crend() const noexcept
+        {
+            return const_reverse_iterator(cbegin());
+        }
+
+        // ------------------------------------------------------------------------
+        // Element Access
+        // ------------------------------------------------------------------------
+
+        /// @brief Accesses the byte at specified position.
+        /// @param idx Index of the byte to access.
+        /// @throws No exceptions, but triggers assert if idx >= size().
+        constexpr reference operator[](size_t idx) const
+        {
+            assert(idx < len && "buffer_view::operator[] index out of range");
+            return buf[idx];
+        }
+
+        /// @brief Accesses the first byte.
+        /// @throws No exceptions, but triggers assert if empty().
+        constexpr reference front() const
+        {
+            assert(!empty() && "buffer_view::front() on empty buffer");
+            return buf[0];
+        }
+
+        /// @brief Accesses the last byte.
+        /// @throws No exceptions, but triggers assert if empty().
+        constexpr reference back() const
+        {
+            assert(!empty() && "buffer_view::back() on empty buffer");
+            return buf[len - 1];
+        }
+
+        // ------------------------------------------------------------------------
+        // Subview Operations
+        // ------------------------------------------------------------------------
+
+        /// @brief Creates a subview starting at offset with specified length.
+        /// @param offset Starting position in the current view.
+        /// @param count Number of bytes to include (clamped to remaining
+        /// bytes).
+        /// @throws std::out_of_range if offset > size().
+        constexpr buffer_view subview(size_t offset, size_t count) const
+        {
+            if (offset > len)
+            {
+                throw std::out_of_range(
+                    "buffer_view::subview offset out of range");
+            }
+            return {buf + offset, std::min(count, len - offset)};
+        }
+
+        /// @brief Creates a subview starting at offset until the end.
+        /// @param offset Starting position in the current view.
+        /// @return Subview from offset to size().
+        constexpr buffer_view subview(size_t offset) const
+        {
+            return subview(offset, len - offset);
+        }
+
+        // ------------------------------------------------------------------------
+        // Comparison
+        // ------------------------------------------------------------------------
+
+        /// @brief Checks byte-wise equality between two buffer views.
+        /// @return true if both views have identical size and byte content.
+        friend bool operator==(const buffer_view& lhs,
+                               const buffer_view& rhs) noexcept
+        {
+            return lhs.size() == rhs.size() &&
+                   std::equal(lhs.begin(), lhs.end(), rhs.begin());
+        }
+    };
+#endif
+
     class line_sender_buffer
     {
     public:
@@ -445,22 +587,35 @@ namespace questdb::ingress
         }
 
 #if __cplusplus >= 202002L
-        using buffer_view_t = std::span<const std::byte>;
-#else
-        using buffer_view_t = line_sender_buffer_bytes;
-#endif
-
         /**
-         * Get a bytes representation of the contents of the buffer
+         * Get a bytes view of the contents of the buffer
          * (not guaranteed to be an encoded string)
          */
-        buffer_view_t peek() const noexcept {
-          if (_impl) {
-            auto view = ::line_sender_buffer_peek(_impl);
-            return {reinterpret_cast<const std::byte *>(view.buf), view.len};
-          }
-          return {};
+        std::span<const std::byte> peek() const noexcept
+        {
+            if (_impl)
+            {
+                auto view = ::line_sender_buffer_peek(_impl);
+                return {reinterpret_cast<const std::byte*>(view.buf), view.len};
+            }
+            return {};
         }
+#else
+
+        /**
+         * Get a bytes view of the contents of the buffer
+         * (not guaranteed to be an encoded string)
+         */
+        buffer_view peek() const noexcept
+        {
+            if (_impl)
+            {
+                auto view = ::line_sender_buffer_peek(_impl);
+                return {reinterpret_cast<const std::byte*>(view.buf), view.len};
+            }
+            return {};
+        }
+#endif
 
         /**
          * Mark a rewind point.

@@ -251,7 +251,7 @@ impl From<Infallible> for Error {
     }
 }
 
-fn write_escaped_impl<Q, C>(check_escape_fn: C, quoting_fn: Q, output_vec: &mut Vec<u8>, s: &str)
+fn write_escaped_impl<Q, C>(check_escape_fn: C, quoting_fn: Q, output: &mut Vec<u8>, s: &str)
 where
     C: Fn(u8) -> bool,
     Q: Fn(&mut Vec<u8>),
@@ -263,32 +263,32 @@ where
         }
     }
 
-    quoting_fn(output_vec);
+    quoting_fn(output);
 
     if to_escape == 0 {
         // output.push_str(s);
-        output_vec.extend_from_slice(s.as_bytes());
+        output.extend_from_slice(s.as_bytes());
     } else {
         let additional = s.len() + to_escape;
-        output_vec.reserve(additional);
-        let mut index = output_vec.len();
-        unsafe { output_vec.set_len(index + additional) };
+        output.reserve(additional);
+        let mut index = output.len();
+        unsafe { output.set_len(index + additional) };
         for b in s.bytes() {
             if check_escape_fn(b) {
                 unsafe {
-                    *output_vec.get_unchecked_mut(index) = b'\\';
+                    *output.get_unchecked_mut(index) = b'\\';
                 }
                 index += 1;
             }
 
             unsafe {
-                *output_vec.get_unchecked_mut(index) = b;
+                *output.get_unchecked_mut(index) = b;
             }
             index += 1;
         }
     }
 
-    quoting_fn(output_vec);
+    quoting_fn(output);
 }
 
 fn must_escape_unquoted(c: u8) -> bool {
