@@ -1,8 +1,9 @@
 use super::conf::ConfigSetting;
-use crate::error;
+use crate::{error, Error};
 use base64ct::Base64;
 use base64ct::Encoding;
 use rand::Rng;
+use std::fmt::{Debug, Write};
 use std::thread::sleep;
 use std::time::Duration;
 use ureq::http::Response;
@@ -112,6 +113,105 @@ pub(super) fn is_retriable_error(err: &ureq::Error) -> bool {
     }
 }
 
+pub(super) fn parse_json_error(json: &serde_json::Value, msg: &str) -> Error {
+    let mut description = msg.to_string();
+    error::fmt!(ServerFlushError, "Could not flush buffer: {}", msg);
+
+    let error_id = json.get("errorId").and_then(|v| v.as_str());
+    let code = json.get("code").and_then(|v| v.as_str());
+    let line = json.get("line").and_then(|v| v.as_i64());
+
+    let mut printed_detail = false;
+    if error_id.is_some() || code.is_some() || line.is_some() {
+        description.push_str(" [");
+
+        if let Some(error_id) = error_id {
+            description.push_str("id: ");
+            description.push_str(error_id);
+            printed_detail = true;
+        }
+
+        if let Some(code) = code {
+            if printed_detail {
+                description.push_str(", ");
+            }
+            description.push_str("code: ");
+            description.push_str(code);
+            printed_detail = true;
+        }
+
+        if let Some(line) = line {
+            if printed_detail {
+                description.push_str(", ");
+            }
+            description.push_str("line: ");
+            description.write_str(format!("{}", line).as_str()).unwrap();
+        }
+
+        description.push(']');
+    }
+
+    error::fmt!(ServerFlushError, "Could not flush buffer: {}", description)
+}
+
+pub(super) fn parse_http_error(http_status_code: u16, mut response: Response<Body>) -> Error {
+    let body_content = response.body_mut().read_to_string();
+    if http_status_code == 404 {
+        return error::fmt!(
+            HttpNotSupported,
+            "Could not flush buffer: HTTP endpoint does not support ILP."
+        );
+    } else if [401, 403].contains(&http_status_code) {
+        let description = match body_content {
+            Ok(msg) if !msg.is_empty() => format!(": {}", msg),
+            _ => "".to_string(),
+        };
+        return error::fmt!(
+            AuthError,
+            "Could not flush buffer: HTTP endpoint authentication error{} [code: {}]",
+            description,
+            http_status_code
+        );
+    }
+
+    let is_json = match response.headers().get("Content-Type") {
+        Some(header_value) => {
+            match header_value.to_str() {
+                Ok(s) => s.eq_ignore_ascii_case("application/json"),
+                Err(_) => {
+                    false
+                }
+            }
+        }
+        None => false
+    };
+    match body_content {
+        Ok(msg) => {
+            let string_err = || error::fmt!(ServerFlushError, "Could not flush buffer: {}", msg);
+
+            if !is_json {
+                return string_err();
+            }
+
+            let json: serde_json::Value = match serde_json::from_str(&msg) {
+                Ok(json) => json,
+                Err(_) => {
+                    return string_err();
+                }
+            };
+
+            if let Some(serde_json::Value::String(ref msg)) = json.get("message") {
+                parse_json_error(&json, msg)
+            } else {
+                string_err()
+            }
+        }
+        Err(err) => {
+            error::fmt!(SocketError, "Could not flush buffer: {}", err)
+        }
+    }
+}
+
 #[allow(clippy::result_large_err)] // `ureq::Error` is large enough to cause this warning.
 fn retry_http_send(
     state: &HttpHandlerState,
@@ -150,7 +250,13 @@ pub(super) fn http_send_with_retries(
     retry_timeout: Duration,
 ) -> Result<Response<Body>, ureq::Error> {
     let last_err = match state.build_request().send(buf) {
-        Ok(res) => return Ok(res),
+        Ok(res) => {
+            if res.status().is_client_error() || res.status().is_server_error() {
+                ureq::Error::StatusCode(res.status().as_u16())
+            } else {
+                return Ok(res)
+            }
+        }
         Err(err) => err,
     };
 

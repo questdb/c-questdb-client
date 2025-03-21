@@ -2322,7 +2322,8 @@ impl SenderBuilder {
                 };
                 let agent_builder =
                     agent_builder.timeout_connect(Some(*http_config.request_timeout.deref()))
-                        .timeout_global(Some(*http_config.request_timeout.deref()));
+                        .timeout_global(Some(*http_config.request_timeout.deref()))
+                        .http_status_as_error(false);
                 let agent = ureq::Agent::with_parts(
                     agent_builder.build(),
                     connector,
@@ -2711,9 +2712,16 @@ impl Sender {
                     0.0f64
                 };
                 state.agent.config().timeouts().per_call = Some(*state.config.request_timeout + Duration::from_secs_f64(extra_time));
-                let response_or_err =
-                    http_send_with_retries(state, bytes, *state.config.retry_timeout);
-                response_or_err.map_err(Error::from)?;
+                match http_send_with_retries(state, bytes, *state.config.retry_timeout) {
+                    Ok(res) => {
+                        return if res.status().is_client_error() || res.status().is_server_error() {
+                            Err(parse_http_error(res.status().as_u16(), res))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    Err(err) => Error::from(err)
+                };
             }
         }
         Ok(())
