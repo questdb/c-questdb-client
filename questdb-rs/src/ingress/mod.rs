@@ -2289,7 +2289,7 @@ impl SenderBuilder {
 
                 let http_config = self.http.as_ref().unwrap();
                 let user_agent = http_config.user_agent.as_str();
-                let connector = ().chain(TcpConnector::default());
+                let connector = TcpConnector::default();
 
                 let agent_builder = ureq::Agent::config_builder()
                     .user_agent(user_agent)
@@ -2321,7 +2321,8 @@ impl SenderBuilder {
                     None => None,
                 };
                 let agent_builder =
-                    agent_builder.timeout_connect(Some(*http_config.request_timeout.deref()));
+                    agent_builder.timeout_connect(Some(*http_config.request_timeout.deref()))
+                        .timeout_global(Some(*http_config.request_timeout.deref()));
                 let agent = ureq::Agent::with_parts(
                     agent_builder.build(),
                     connector,

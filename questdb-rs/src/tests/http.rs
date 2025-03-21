@@ -445,7 +445,7 @@ fn test_request_timeout() -> TestResult {
     if cfg!(windows) {
         assert!(err.msg().contains("os error 10060"));
     } else {
-        assert!(err.msg().contains("timed out reading response"));
+        assert!(err.msg().contains("Timeout global"));
     }
     assert!(time_elapsed >= request_timeout);
     Ok(())
