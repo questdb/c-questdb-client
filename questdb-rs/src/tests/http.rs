@@ -441,12 +441,7 @@ fn test_request_timeout() -> TestResult {
     assert!(res.is_err());
     let err = res.unwrap_err();
     assert_eq!(err.code(), ErrorCode::SocketError);
-    // different error message on windows
-    if cfg!(windows) {
-        assert!(err.msg().contains("os error 10060"));
-    } else {
-        assert!(err.msg().contains("per call"));
-    }
+    assert!(err.msg().contains("per call"));
     assert!(time_elapsed >= request_timeout);
     Ok(())
 }
