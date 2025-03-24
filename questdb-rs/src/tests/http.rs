@@ -236,9 +236,9 @@ fn test_no_connection() -> TestResult {
     assert!(res.is_err());
     let err = res.unwrap_err();
     assert_eq!(err.code(), ErrorCode::SocketError);
-    assert!(err.msg().starts_with(
-        "Could not flush buffer: http://127.0.0.1:1/write: io: Connection refused"
-    ));
+    assert!(err
+        .msg()
+        .starts_with("Could not flush buffer: http://127.0.0.1:1/write: io: Connection refused"));
     Ok(())
 }
 
@@ -445,7 +445,7 @@ fn test_request_timeout() -> TestResult {
     if cfg!(windows) {
         assert!(err.msg().contains("os error 10060"));
     } else {
-        assert!(err.msg().contains("timeout: global"));
+        assert!(err.msg().contains("per call"));
     }
     assert!(time_elapsed >= request_timeout);
     Ok(())

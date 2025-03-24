@@ -46,9 +46,7 @@ use rustls::{ClientConnection, RootCertStore, StreamOwned};
 use rustls_pki_types::ServerName;
 use socket2::{Domain, Protocol as SockProtocol, SockAddr, Socket, Type};
 use ureq::unversioned::resolver;
-use ureq::unversioned::transport::{
-    Connector, TcpConnector,
-};
+use ureq::unversioned::transport::{Connector, TcpConnector};
 
 #[derive(Debug, Copy, Clone)]
 enum Op {
@@ -2590,9 +2588,13 @@ impl Sender {
                 } else {
                     0.0f64
                 };
-                state.agent.config().timeouts().per_call =
-                    Some(*state.config.request_timeout + Duration::from_secs_f64(extra_time));
-                return match http_send_with_retries(state, bytes, *state.config.retry_timeout) {
+
+                return match http_send_with_retries(
+                    state,
+                    bytes,
+                    *state.config.request_timeout + Duration::from_secs_f64(extra_time),
+                    *state.config.retry_timeout,
+                ) {
                     Ok(res) => {
                         if res.status().is_client_error() || res.status().is_server_error() {
                             Err(parse_http_error(res.status().as_u16(), res))

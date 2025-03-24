@@ -80,12 +80,20 @@ pub(super) struct HttpHandlerState {
 }
 
 impl HttpHandlerState {
-    fn send_request(&self, buf: &[u8]) -> (bool, Result<Response<Body>, ureq::Error>) {
+    fn send_request(
+        &self,
+        buf: &[u8],
+        request_timeout: Duration,
+    ) -> (bool, Result<Response<Body>, ureq::Error>) {
         let request = self
             .agent
             .post(&self.url)
+            .config()
+            .timeout_per_call(Some(request_timeout))
+            .build()
             .query_pairs([("precision", "n")])
             .content_type("text/plain; charset=utf-8");
+
         let request = match self.auth.as_ref() {
             Some(auth) => request.header("Authorization", auth),
             None => request,
@@ -108,7 +116,9 @@ impl Debug for TlsConnector {
     }
 }
 
-use ureq::unversioned::transport::{Buffers, Connector, LazyBuffers, NextTimeout, Transport, TransportAdapter};
+use ureq::unversioned::transport::{
+    Buffers, Connector, LazyBuffers, NextTimeout, Transport, TransportAdapter,
+};
 use ureq::unversioned::*;
 
 impl<In: Transport> Connector<In> for TlsConnector {
@@ -184,11 +194,7 @@ impl Transport for TlsTransport {
         &mut self.buffers
     }
 
-    fn transmit_output(
-        &mut self,
-        amount: usize,
-        timeout: NextTimeout,
-    ) -> Result<(), ureq::Error> {
+    fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), ureq::Error> {
         self.stream.get_mut().set_timeout(timeout);
 
         let output = &self.buffers.output()[..amount];
@@ -298,9 +304,7 @@ pub(super) fn parse_json_error(json: &serde_json::Value, msg: &str) -> Error {
 
 pub(super) fn parse_http_error(http_status_code: u16, response: Response<Body>) -> Error {
     let (head, body) = response.into_parts();
-    let body_content = body.into_with_config()
-        .lossy_utf8(true)
-        .read_to_string();
+    let body_content = body.into_with_config().lossy_utf8(true).read_to_string();
     if http_status_code == 404 {
         return error::fmt!(
             HttpNotSupported,
@@ -357,6 +361,7 @@ pub(super) fn parse_http_error(http_status_code: u16, response: Response<Body>) 
 fn retry_http_send(
     state: &HttpHandlerState,
     buf: &[u8],
+    request_timeout: Duration,
     retry_timeout: Duration,
     mut last_rep: Result<Response<Body>, ureq::Error>,
 ) -> Result<Response<Body>, ureq::Error> {
@@ -377,7 +382,7 @@ fn retry_http_send(
             // see https://github.com/algesten/ureq/issues/94
             _ = last_rep.into_body().read_to_vec();
         }
-        (need_retry, last_rep) = state.send_request(buf);
+        (need_retry, last_rep) = state.send_request(buf, request_timeout);
         if !need_retry {
             return last_rep;
         }
@@ -389,12 +394,13 @@ fn retry_http_send(
 pub(super) fn http_send_with_retries(
     state: &HttpHandlerState,
     buf: &[u8],
+    request_timeout: Duration,
     retry_timeout: Duration,
 ) -> Result<Response<Body>, ureq::Error> {
-    let (need_retry, last_rep) = state.send_request(buf);
+    let (need_retry, last_rep) = state.send_request(buf, request_timeout);
     if !need_retry || retry_timeout.is_zero() {
         return last_rep;
     }
 
-    retry_http_send(state, buf, retry_timeout, last_rep)
+    retry_http_send(state, buf, request_timeout, retry_timeout, last_rep)
 }
