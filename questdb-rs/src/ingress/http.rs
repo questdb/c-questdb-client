@@ -7,8 +7,8 @@ use std::fmt::{Debug, Write};
 use std::thread::sleep;
 use std::time::Duration;
 use ureq::http::Response;
-use ureq::typestate::WithBody;
-use ureq::{Body, RequestBuilder};
+use ureq::Error::*;
+use ureq::{http, Body};
 
 #[derive(PartialEq, Debug, Clone)]
 pub(super) struct BasicAuthParams {
@@ -75,41 +75,56 @@ pub(super) struct HttpHandlerState {
 }
 
 impl HttpHandlerState {
-    fn build_request(&self) -> RequestBuilder<WithBody> {
+    fn send_request(&self, buf: &[u8]) -> (bool, Result<Response<Body>, ureq::Error>) {
         let request = self
             .agent
             .post(&self.url)
             .query_pairs([("precision", "n")])
             .content_type("text/plain; charset=utf-8");
-        match self.auth.as_ref() {
+        let request = match self.auth.as_ref() {
             Some(auth) => request.header("Authorization", auth),
             None => request,
+        };
+        let response = request.send(buf);
+        match &response {
+            Ok(res) => (need_retry(Ok(res.status())), response),
+            Err(err) => (need_retry(Err(err)), response),
         }
     }
 }
 
-pub(super) fn is_retriable_error(err: &ureq::Error) -> bool {
-    use ureq::Error::*;
-    match err {
-        Timeout(_) => true,
-        ConnectionFailed => true,
-        TooManyRedirects => true,
-
-        // Official HTTP codes
-        StatusCode(500) |  // Internal Server Error
-        StatusCode(503) |  // Service Unavailable
-        StatusCode(504) |  // Gateway Timeout
-
-        // Unofficial extensions
-        StatusCode(507) | // Insufficient Storage
-        StatusCode(509) | // Bandwidth Limit Exceeded
-        StatusCode(523) | // Origin is Unreachable
-        StatusCode(524) | // A Timeout Occurred
-        StatusCode(529) | // Site is overloaded
-        StatusCode(599) => { // Network Connect Timeout Error
-            true
+pub(super) fn need_retry(res: Result<http::status::StatusCode, &ureq::Error>) -> bool {
+    match res {
+        Ok(status) => {
+            status.is_server_error()
+                && matches!(
+                    status.as_u16(),
+                    500 | 503 | 504 | 507 | 509 | 523 | 524 | 529 | 599
+                )
         }
-        _ => false
+        Err(err) => {
+            match err {
+                Timeout(_) => true,
+                ConnectionFailed => true,
+                TooManyRedirects => true,
+
+                // Official HTTP codes
+                StatusCode(500) |  // Internal Server Error
+                StatusCode(503) |  // Service Unavailable
+                StatusCode(504) |  // Gateway Timeout
+
+                // Unofficial extensions
+                StatusCode(507) | // Insufficient Storage
+                StatusCode(509) | // Bandwidth Limit Exceeded
+                StatusCode(523) | // Origin is Unreachable
+                StatusCode(524) | // A Timeout Occurred
+                StatusCode(529) | // Site is overloaded
+                StatusCode(599) => { // Network Connect Timeout Error
+                    true
+                }
+                _ => false
+            }
+        }
     }
 }
 
@@ -154,8 +169,11 @@ pub(super) fn parse_json_error(json: &serde_json::Value, msg: &str) -> Error {
     error::fmt!(ServerFlushError, "Could not flush buffer: {}", description)
 }
 
-pub(super) fn parse_http_error(http_status_code: u16, mut response: Response<Body>) -> Error {
-    let body_content = response.body_mut().read_to_string();
+pub(super) fn parse_http_error(http_status_code: u16, response: Response<Body>) -> Error {
+    let (head, body) = response.into_parts();
+    let body_content = body.into_with_config()
+        .lossy_utf8(true)
+        .read_to_string();
     if http_status_code == 404 {
         return error::fmt!(
             HttpNotSupported,
@@ -174,16 +192,12 @@ pub(super) fn parse_http_error(http_status_code: u16, mut response: Response<Bod
         );
     }
 
-    let is_json = match response.headers().get("Content-Type") {
-        Some(header_value) => {
-            match header_value.to_str() {
-                Ok(s) => s.eq_ignore_ascii_case("application/json"),
-                Err(_) => {
-                    false
-                }
-            }
-        }
-        None => false
+    let is_json = match head.headers.get("Content-Type") {
+        Some(header_value) => match header_value.to_str() {
+            Ok(s) => s.eq_ignore_ascii_case("application/json"),
+            Err(_) => false,
+        },
+        None => false,
     };
     match body_content {
         Ok(msg) => {
@@ -217,28 +231,29 @@ fn retry_http_send(
     state: &HttpHandlerState,
     buf: &[u8],
     retry_timeout: Duration,
-    mut last_err: ureq::Error,
+    mut last_rep: Result<Response<Body>, ureq::Error>,
 ) -> Result<Response<Body>, ureq::Error> {
     let mut rng = rand::thread_rng();
     let retry_end = std::time::Instant::now() + retry_timeout;
     let mut retry_interval_ms = 10;
+    let mut need_retry;
     loop {
         let jitter_ms = rng.gen_range(-5i32..5);
         let to_sleep_ms = retry_interval_ms + jitter_ms;
         let to_sleep = Duration::from_millis(to_sleep_ms as u64);
         if (std::time::Instant::now() + to_sleep) > retry_end {
-            return Err(last_err);
+            return last_rep;
         }
         sleep(to_sleep);
-        last_err = match state.build_request().send(buf) {
-            Ok(res) => return Ok(res),
-            Err(err) => {
-                if !is_retriable_error(&err) {
-                    return Err(err);
-                }
-                err
-            }
-        };
+        if let Ok(last_rep) = last_rep {
+            // Actively consume the reader to return the connection to the connection pool.
+            // see https://github.com/algesten/ureq/issues/94
+            _ = last_rep.into_body().read_to_vec();
+        }
+        (need_retry, last_rep) = state.send_request(buf);
+        if !need_retry {
+            return last_rep;
+        }
         retry_interval_ms = (retry_interval_ms * 2).min(1000);
     }
 }
@@ -249,20 +264,10 @@ pub(super) fn http_send_with_retries(
     buf: &[u8],
     retry_timeout: Duration,
 ) -> Result<Response<Body>, ureq::Error> {
-    let last_err = match state.build_request().send(buf) {
-        Ok(res) => {
-            if res.status().is_client_error() || res.status().is_server_error() {
-                ureq::Error::StatusCode(res.status().as_u16())
-            } else {
-                return Ok(res)
-            }
-        }
-        Err(err) => err,
-    };
-
-    if retry_timeout.is_zero() || !is_retriable_error(&last_err) {
-        return Err(last_err);
+    let (need_retry, last_rep) = state.send_request(buf);
+    if !need_retry || retry_timeout.is_zero() {
+        return last_rep;
     }
 
-    retry_http_send(state, buf, retry_timeout, last_err)
+    retry_http_send(state, buf, retry_timeout, last_rep)
 }

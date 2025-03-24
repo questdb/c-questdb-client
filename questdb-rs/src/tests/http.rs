@@ -236,9 +236,9 @@ fn test_no_connection() -> TestResult {
     assert!(res.is_err());
     let err = res.unwrap_err();
     assert_eq!(err.code(), ErrorCode::SocketError);
-    assert!(err.msg().starts_with(
-        "Could not flush buffer: Io error: Connection refused"
-    ));
+    assert!(err
+        .msg()
+        .starts_with("Could not flush buffer: Io error: Connection refused"));
     Ok(())
 }
 
