@@ -12,6 +12,11 @@ use std::sync::Arc;
 use std::thread::sleep;
 use std::time::Duration;
 use ureq::http::Response;
+use ureq::unversioned::transport::{
+    Buffers, Connector, LazyBuffers, NextTimeout, Transport, TransportAdapter,
+};
+
+use ureq::unversioned::*;
 use ureq::Error::*;
 use ureq::{http, Body};
 
@@ -106,20 +111,10 @@ impl HttpHandlerState {
     }
 }
 
+#[derive(Debug)]
 pub struct TlsConnector {
     config: Option<Arc<rustls::ClientConfig>>,
 }
-
-impl Debug for TlsConnector {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TlsConnector").finish()
-    }
-}
-
-use ureq::unversioned::transport::{
-    Buffers, Connector, LazyBuffers, NextTimeout, Transport, TransportAdapter,
-};
-use ureq::unversioned::*;
 
 impl<In: Transport> Connector<In> for TlsConnector {
     type Out = transport::Either<In, TlsTransport>;
@@ -156,7 +151,6 @@ impl<In: Transport> Connector<In> for TlsConnector {
                     conn,
                     sock: TransportAdapter::new(transport.boxed()),
                 };
-
                 let buffers = LazyBuffers::new(
                     details.config.input_buffer_size(),
                     details.config.output_buffer_size(),
@@ -196,10 +190,8 @@ impl Transport for TlsTransport {
 
     fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), ureq::Error> {
         self.stream.get_mut().set_timeout(timeout);
-
         let output = &self.buffers.output()[..amount];
         self.stream.write_all(output)?;
-
         Ok(())
     }
 
@@ -209,11 +201,9 @@ impl Transport for TlsTransport {
         }
 
         self.stream.get_mut().set_timeout(timeout);
-
         let input = self.buffers.input_append_buf();
         let amount = self.stream.read(input)?;
         self.buffers.input_appended(amount);
-
         Ok(amount > 0)
     }
 
