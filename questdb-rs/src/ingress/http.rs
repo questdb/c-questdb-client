@@ -3,7 +3,12 @@ use crate::{error, Error};
 use base64ct::Base64;
 use base64ct::Encoding;
 use rand::Rng;
+use rustls::{ClientConnection, StreamOwned};
+use rustls_pki_types::ServerName;
+use std::fmt;
 use std::fmt::{Debug, Write};
+use std::io::{Read, Write as IoWrite};
+use std::sync::Arc;
 use std::thread::sleep;
 use std::time::Duration;
 use ureq::http::Response;
@@ -90,6 +95,128 @@ impl HttpHandlerState {
             Ok(res) => (need_retry(Ok(res.status())), response),
             Err(err) => (need_retry(Err(err)), response),
         }
+    }
+}
+
+pub struct TlsConnector {
+    config: Option<Arc<rustls::ClientConfig>>,
+}
+
+impl Debug for TlsConnector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TlsConnector").finish()
+    }
+}
+
+use ureq::unversioned::transport::{Buffers, Connector, LazyBuffers, NextTimeout, Transport, TransportAdapter};
+use ureq::unversioned::*;
+
+impl<In: Transport> Connector<In> for TlsConnector {
+    type Out = transport::Either<In, TlsTransport>;
+
+    fn connect(
+        &self,
+        details: &transport::ConnectionDetails,
+        chained: Option<In>,
+    ) -> std::result::Result<Option<Self::Out>, ureq::Error> {
+        let transport = match chained {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+
+        // Only add TLS if we are connecting via HTTPS, otherwise use chained transport as is.
+        if !details.needs_tls() {
+            return Ok(Some(transport::Either::A(transport)));
+        }
+
+        match self.config.as_ref() {
+            Some(config) => {
+                let name_borrowed: ServerName<'_> = details
+                    .uri
+                    .authority()
+                    .expect("uri authority for tls")
+                    .host()
+                    .try_into()
+                    .map_err(|_e| ureq::Error::Tls("tls invalid dns name error"))?;
+
+                let name = name_borrowed.to_owned();
+                let conn = ClientConnection::new(config.clone(), name)
+                    .map_err(|_e| ureq::Error::Tls("tls client connection error"))?;
+                let stream = StreamOwned {
+                    conn,
+                    sock: TransportAdapter::new(transport.boxed()),
+                };
+
+                let buffers = LazyBuffers::new(
+                    details.config.input_buffer_size(),
+                    details.config.output_buffer_size(),
+                );
+
+                let transport = TlsTransport { buffers, stream };
+                Ok(Some(transport::Either::B(transport)))
+            }
+            _ => Ok(Some(transport::Either::A(transport))),
+        }
+    }
+}
+
+impl TlsConnector {
+    pub(crate) fn new(protocol: Option<Arc<rustls::ClientConfig>>) -> Self {
+        TlsConnector { config: protocol }
+    }
+}
+
+pub struct TlsTransport {
+    buffers: LazyBuffers,
+    stream: StreamOwned<ClientConnection, TransportAdapter>,
+}
+
+impl Debug for TlsTransport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TlsTransport")
+            .field("chained", &self.stream.sock.inner())
+            .finish()
+    }
+}
+
+impl Transport for TlsTransport {
+    fn buffers(&mut self) -> &mut dyn Buffers {
+        &mut self.buffers
+    }
+
+    fn transmit_output(
+        &mut self,
+        amount: usize,
+        timeout: NextTimeout,
+    ) -> Result<(), ureq::Error> {
+        self.stream.get_mut().set_timeout(timeout);
+
+        let output = &self.buffers.output()[..amount];
+        self.stream.write_all(output)?;
+
+        Ok(())
+    }
+
+    fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
+        if self.buffers.can_use_input() {
+            return Ok(true);
+        }
+
+        self.stream.get_mut().set_timeout(timeout);
+
+        let input = self.buffers.input_append_buf();
+        let amount = self.stream.read(input)?;
+        self.buffers.input_appended(amount);
+
+        Ok(amount > 0)
+    }
+
+    fn is_open(&mut self) -> bool {
+        self.stream.get_mut().get_mut().is_open()
+    }
+
+    fn is_tls(&self) -> bool {
+        true
     }
 }
 

@@ -67,19 +67,7 @@ impl Error {
         }
     }
 
-    /// Get the error code (category) of this error.
-    pub fn code(&self) -> ErrorCode {
-        self.code
-    }
-
-    /// Get the string message of this error.
-    pub fn msg(&self) -> &str {
-        &self.msg
-    }
-}
-
-impl From<ureq::Error> for Error {
-    fn from(err: ureq::Error) -> Error {
+    pub fn new_from_ureq_error(err: ureq::Error, url: &str) -> Error {
         match err {
             StatusCode(code) => {
                 if code == 404 {
@@ -94,35 +82,23 @@ impl From<ureq::Error> for Error {
                         code
                     )
                 } else {
-                    fmt!(SocketError, "Could not flush buffer: {}", err)
+                    fmt!(SocketError, "Could not flush buffer: {}: {}", url, err)
                 }
             }
-            ureq::Error::Http(e) => {
-                fmt!(
-                    SocketError,
-                    "Could not flush buffer: Inner http error: {}",
-                    e
-                )
-            }
-            ureq::Error::BadUri(s) => {
-                fmt!(SocketError, "Could not flush buffer: Bad uri  {}", s)
-            }
-            ureq::Error::Protocol(e) => {
-                fmt!(SocketError, "Could not flush buffer: Protocol error: {}", e)
-            }
-            ureq::Error::Io(e) => {
-                fmt!(SocketError, "Could not flush buffer: Io error: {}", e)
-            }
-            ureq::Error::Timeout(e) => {
-                fmt!(SocketError, "Could not flush buffer: Timeout {}", e)
-            }
-            ureq::Error::Tls(e) => {
-                fmt!(SocketError, "Could not flush buffer: Tls error: {}", e)
-            }
             e => {
-                fmt!(SocketError, "Could not flush buffer: other error: {}", e)
+                fmt!(SocketError, "Could not flush buffer: {}: {}", url, e)
             }
         }
+    }
+
+    /// Get the error code (category) of this error.
+    pub fn code(&self) -> ErrorCode {
+        self.code
+    }
+
+    /// Get the string message of this error.
+    pub fn msg(&self) -> &str {
+        &self.msg
     }
 }
 

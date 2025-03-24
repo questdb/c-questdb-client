@@ -32,9 +32,8 @@ use crate::ingress::conf::ConfigSetting;
 use core::time::Duration;
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::fmt;
 use std::fmt::{Debug, Display, Formatter, Write};
-use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write as IoWrite};
+use std::io::{self, BufRead, BufReader, ErrorKind, Write as IoWrite};
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -46,8 +45,9 @@ use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
 use rustls::{ClientConnection, RootCertStore, StreamOwned};
 use rustls_pki_types::ServerName;
 use socket2::{Domain, Protocol as SockProtocol, SockAddr, Socket, Type};
+use ureq::unversioned::resolver;
 use ureq::unversioned::transport::{
-    Buffers, Connector, LazyBuffers, NextTimeout, TcpConnector, Transport, TransportAdapter,
+    Connector, TcpConnector,
 };
 
 #[derive(Debug, Copy, Clone)]
@@ -2322,7 +2322,6 @@ impl SenderBuilder {
                 };
                 let agent_builder = agent_builder
                     .timeout_connect(Some(*http_config.request_timeout.deref()))
-                    .timeout_global(Some(*http_config.request_timeout.deref()))
                     .http_status_as_error(false);
                 let agent = ureq::Agent::with_parts(
                     agent_builder.build(),
@@ -2371,126 +2370,6 @@ impl SenderBuilder {
                 "The {param_name:?} setting can only be used with the TCP protocol."
             ))
         }
-    }
-}
-
-pub struct TlsConnector {
-    config: Option<Arc<rustls::ClientConfig>>,
-}
-
-impl Debug for TlsConnector {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TlsConnector").finish()
-    }
-}
-
-use ureq::unversioned::*;
-impl<In: Transport> Connector<In> for TlsConnector {
-    type Out = transport::Either<In, TlsTransport>;
-
-    fn connect(
-        &self,
-        details: &transport::ConnectionDetails,
-        chained: Option<In>,
-    ) -> std::result::Result<Option<Self::Out>, ureq::Error> {
-        let transport = match chained {
-            Some(t) => t,
-            None => return Ok(None),
-        };
-
-        // Only add TLS if we are connecting via HTTPS, otherwise use chained transport as is.
-        if !details.needs_tls() {
-            return Ok(Some(transport::Either::A(transport)));
-        }
-
-        match self.config.as_ref() {
-            Some(config) => {
-                let name_borrowed: ServerName<'_> = details
-                    .uri
-                    .authority()
-                    .expect("uri authority for tls")
-                    .host()
-                    .try_into()
-                    .map_err(|_e| ureq::Error::Tls("tls invalid dns name error"))?;
-
-                let name = name_borrowed.to_owned();
-                let conn = ClientConnection::new(config.clone(), name)
-                    .map_err(|_e| ureq::Error::Tls("tls client connection error"))?;
-                let stream = StreamOwned {
-                    conn,
-                    sock: TransportAdapter::new(transport.boxed()),
-                };
-
-                let buffers = LazyBuffers::new(
-                    details.config.input_buffer_size(),
-                    details.config.output_buffer_size(),
-                );
-
-                let transport = TlsTransport { buffers, stream };
-                Ok(Some(transport::Either::B(transport)))
-            }
-            _ => Ok(Some(transport::Either::A(transport))),
-        }
-    }
-}
-
-impl TlsConnector {
-    fn new(protocol: Option<Arc<rustls::ClientConfig>>) -> Self {
-        TlsConnector { config: protocol }
-    }
-}
-
-pub struct TlsTransport {
-    buffers: LazyBuffers,
-    stream: StreamOwned<ClientConnection, TransportAdapter>,
-}
-
-impl fmt::Debug for TlsTransport {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TlsTransport")
-            .field("chained", &self.stream.sock.inner())
-            .finish()
-    }
-}
-
-impl Transport for TlsTransport {
-    fn buffers(&mut self) -> &mut dyn Buffers {
-        &mut self.buffers
-    }
-
-    fn transmit_output(
-        &mut self,
-        amount: usize,
-        timeout: NextTimeout,
-    ) -> std::result::Result<(), ureq::Error> {
-        self.stream.get_mut().set_timeout(timeout);
-
-        let output = &self.buffers.output()[..amount];
-        self.stream.write_all(output)?;
-
-        Ok(())
-    }
-
-    fn await_input(&mut self, timeout: NextTimeout) -> std::result::Result<bool, ureq::Error> {
-        if self.buffers.can_use_input() {
-            return Ok(true);
-        }
-
-        self.stream.get_mut().set_timeout(timeout);
-
-        let input = self.buffers.input_append_buf();
-        let amount = self.stream.read(input)?;
-        self.buffers.input_appended(amount);
-
-        Ok(amount > 0)
-    }
-
-    fn is_open(&mut self) -> bool {
-        self.stream.get_mut().get_mut().is_open()
-    }
-
-    fn is_tls(&self) -> bool {
-        true
     }
 }
 
@@ -2722,7 +2601,7 @@ impl Sender {
                             Ok(())
                         }
                     }
-                    Err(err) => Err(Error::from(err)),
+                    Err(err) => Err(Error::new_from_ureq_error(err, &state.url)),
                 };
             }
         }

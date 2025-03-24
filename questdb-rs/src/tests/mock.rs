@@ -490,7 +490,7 @@ impl MockServer {
 
     #[cfg(feature = "ilp-over-http")]
     pub fn recv_http_q(&mut self) -> io::Result<HttpRequest> {
-        self.recv_http(500.0)
+        self.recv_http(5.0)
     }
 
     pub fn recv(&mut self, wait_timeout_sec: f64) -> io::Result<usize> {
