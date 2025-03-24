@@ -272,7 +272,7 @@ class TestSender(unittest.TestCase):
                 self.assertIn('Could not flush buffer', str(e))
                 self.assertIn('cast error from', str(e))
                 self.assertIn('LONG', str(e))
-                self.assertIn('code: invalid, line: 2', str(e))
+                self.assertIn('error in line 2', str(e))
 
         if QDB_FIXTURE.http:
             # If HTTP, the error should cause the whole batch to be ignored.
@@ -719,7 +719,7 @@ class TestSender(unittest.TestCase):
                 self.assertIn('Could not flush buffer', str(e))
                 self.assertIn('cast error from', str(e))
                 self.assertIn('VARCHAR', str(e))
-                self.assertIn('code: invalid, line: 3', str(e))
+                self.assertIn('error in line 3', str(e))
 
         with self.assertRaises(TimeoutError):
             retry_check_table(table_name, timeout_sec=1, log=False)
