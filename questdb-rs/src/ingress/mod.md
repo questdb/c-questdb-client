@@ -102,7 +102,7 @@ curl -I http://localhost:9000/ping
 
 Example of the expected response:
 
-```shell
+```plain
 HTTP/1.1 204 OK
 Server: questDB/1.0
 Date: Fri, 2 Feb 2024 17:09:38 GMT
@@ -261,9 +261,10 @@ so if you let this client auto-create the table, it will have the default `times
 To use a custom name, say `my_ts`, pre-create the table with the desired
 timestamp column name:
 
-To address this, issue a `CREATE TABLE` statement to create the table in advance:
+To address this, issue a `CREATE TABLE` statement to create the table in advance.
+Note the `timestamp(my_ts)` clause at the end specifies the designated timestamp.
 
-```questdb-sql title="Creating a timestamp named my_ts"
+```sql
 CREATE TABLE IF NOT EXISTS 'trades' (
   symbol SYMBOL capacity 256 CACHE,
   side SYMBOL capacity 256 CACHE,

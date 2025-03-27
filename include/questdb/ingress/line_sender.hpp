@@ -319,21 +319,6 @@ namespace questdb::ingress
     class buffer_view final
     {
       public:
-        using iterator = const std::byte*;
-        using const_iterator = const std::byte*;
-        using reverse_iterator = std::reverse_iterator<iterator>;
-        using const_reverse_iterator = std::reverse_iterator<const_iterator>;
-        using reference = const std::byte&;
-
-      private:
-        const std::byte* buf{nullptr};
-        size_t len{0};
-
-      public:
-        // ------------------------------------------------------------------------
-        // Constructor & Core Accessors
-        // ------------------------------------------------------------------------
-
         /// @brief Default constructor. Creates an empty buffer view.
         buffer_view() noexcept = default;
 
@@ -342,7 +327,8 @@ namespace questdb::ingress
         /// length=0).
         /// @param length Number of bytes in the array.
         constexpr buffer_view(const std::byte* data, size_t length) noexcept
-            : buf(data), len(length)
+            : buf(data)
+            , len(length)
         {
         }
 
@@ -366,6 +352,10 @@ namespace questdb::ingress
             return lhs.size() == rhs.size() &&
                    std::equal(lhs.buf, lhs.buf + lhs.len, rhs.buf);
         }
+
+    private:
+        const std::byte* buf{nullptr};
+        size_t len{0};
     };
 #endif
 
