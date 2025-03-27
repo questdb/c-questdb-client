@@ -45,6 +45,8 @@ use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
 use rustls::{ClientConnection, RootCertStore, StreamOwned};
 use rustls_pki_types::ServerName;
 use socket2::{Domain, Protocol as SockProtocol, SockAddr, Socket, Type};
+use ureq::unversioned::resolver;
+use ureq::unversioned::transport::{Connector, TcpConnector};
 
 #[derive(Debug, Copy, Clone)]
 enum Op {
@@ -2283,7 +2285,9 @@ impl SenderBuilder {
 
                 let http_config = self.http.as_ref().unwrap();
                 let user_agent = http_config.user_agent.as_str();
-                let agent_builder = ureq::AgentBuilder::new()
+                let connector = TcpConnector::default();
+
+                let agent_builder = ureq::Agent::config_builder()
                     .user_agent(user_agent)
                     .no_delay(true);
 
@@ -2293,15 +2297,13 @@ impl SenderBuilder {
                 #[cfg(not(feature = "insecure-skip-verify"))]
                 let tls_verify = true;
 
-                let agent_builder = match configure_tls(
+                let connector = connector.chain(TlsConnector::new(configure_tls(
                     self.protocol.tls_enabled(),
                     tls_verify,
                     *self.tls_ca,
                     self.tls_roots.deref(),
-                )? {
-                    Some(tls_config) => agent_builder.tls_config(tls_config),
-                    None => agent_builder,
-                };
+                )?));
+
                 let auth = match auth {
                     Some(AuthParams::Basic(ref auth)) => Some(auth.to_header_string()),
                     Some(AuthParams::Token(ref auth)) => Some(auth.to_header_string()?),
@@ -2314,9 +2316,14 @@ impl SenderBuilder {
                     }
                     None => None,
                 };
-                let agent_builder =
-                    agent_builder.timeout_connect(*http_config.request_timeout.deref());
-                let agent = agent_builder.build();
+                let agent_builder = agent_builder
+                    .timeout_connect(Some(*http_config.request_timeout.deref()))
+                    .http_status_as_error(false);
+                let agent = ureq::Agent::with_parts(
+                    agent_builder.build(),
+                    connector,
+                    resolver::DefaultResolver::default(),
+                );
                 let proto = self.protocol.schema();
                 let url = format!(
                     "{}://{}:{}/write",
@@ -2579,34 +2586,23 @@ impl Sender {
                 } else {
                     0.0f64
                 };
-                let timeout = *state.config.request_timeout + Duration::from_secs_f64(extra_time);
-                let request = state
-                    .agent
-                    .post(&state.url)
-                    .query_pairs([("precision", "n")])
-                    .timeout(timeout)
-                    .set("Content-Type", "text/plain; charset=utf-8");
-                let request = match state.auth.as_ref() {
-                    Some(auth) => request.set("Authorization", auth),
-                    None => request,
+
+                return match http_send_with_retries(
+                    state,
+                    bytes,
+                    *state.config.request_timeout + Duration::from_secs_f64(extra_time),
+                    *state.config.retry_timeout,
+                ) {
+                    Ok(res) => {
+                        if res.status().is_client_error() || res.status().is_server_error() {
+                            Err(parse_http_error(res.status().as_u16(), res))
+                        } else {
+                            res.into_body();
+                            Ok(())
+                        }
+                    }
+                    Err(err) => Err(Error::new_from_ureq_error(err, &state.url)),
                 };
-                let response_or_err =
-                    http_send_with_retries(request, bytes, *state.config.retry_timeout);
-                match response_or_err {
-                    Ok(_response) => {
-                        // on success, there's no information in the response.
-                    }
-                    Err(ureq::Error::Status(http_status_code, response)) => {
-                        return Err(parse_http_error(http_status_code, response));
-                    }
-                    Err(ureq::Error::Transport(transport)) => {
-                        return Err(error::fmt!(
-                            SocketError,
-                            "Could not flush buffer: {}",
-                            transport
-                        ));
-                    }
-                }
             }
         }
         Ok(())

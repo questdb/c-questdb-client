@@ -1,4 +1,5 @@
 use std::fmt::{Display, Formatter};
+use ureq::Error::StatusCode;
 
 macro_rules! fmt {
     ($code:ident, $($arg:tt)*) => {
@@ -63,6 +64,30 @@ impl Error {
         Error {
             code,
             msg: msg.into(),
+        }
+    }
+
+    pub fn new_from_ureq_error(err: ureq::Error, url: &str) -> Error {
+        match err {
+            StatusCode(code) => {
+                if code == 404 {
+                    fmt!(
+                        HttpNotSupported,
+                        "Could not flush buffer: HTTP endpoint does not support ILP."
+                    )
+                } else if [401, 403].contains(&code) {
+                    fmt!(
+                        AuthError,
+                        "Could not flush buffer: HTTP endpoint authentication error [code: {}]",
+                        code
+                    )
+                } else {
+                    fmt!(SocketError, "Could not flush buffer: {}: {}", url, err)
+                }
+            }
+            e => {
+                fmt!(SocketError, "Could not flush buffer: {}: {}", url, e)
+            }
         }
     }
 
