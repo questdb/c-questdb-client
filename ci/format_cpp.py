@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 
 """
-Format all the and C++ code using `clang-format`.
+Format all the C and C++ code using `clang-format`.
+If --check is passed, check for formatting issues instead of modifying files.
 """
 
 import sys
@@ -18,4 +19,10 @@ FILES = [
 ]
 
 if __name__ == '__main__':
-    subprocess.check_call(['clang-format', '-i', '--style=file'] + FILES)
+    check_mode = '--check' in sys.argv
+    command = [
+        'clang-format',
+        '--style=file',
+        '--dry-run' if check_mode else '-i'
+        ] + FILES
+    subprocess.check_call(command)

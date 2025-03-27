@@ -62,7 +62,7 @@ stages:
             inputs:
               pathToPublish: ./build
             displayName: "Publish build directory"
-      - job: CargoFmtAndClippy
+      - job: FormatAndLinting
         displayName: "cargo fmt and clippy"
         pool:
           vmImage: 'ubuntu-latest'
@@ -70,9 +70,10 @@ stages:
         steps:
           - checkout: self
           - script: |
+              apt install clang-format
               rustup component add clippy
               rustup component add rustfmt
-            displayName: "Install clippy and rustfmt"
+            displayName: "Install clang-format, clippy and rustfmt"
           - script: |
               cd questdb-rs
               cargo fmt --all -- --check
@@ -89,6 +90,9 @@ stages:
               cd questdb-rs-ffi
               cargo clippy --all-targets --all-features -- -D warnings
             displayName: "questdb-rs-ffi: clippy"
+          - script: |
+              python3 ci/format_cpp.py --check
+            displayName: "C/C++ clang-format"
           - script: |
               cd system_test
               cd tls_proxy
