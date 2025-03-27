@@ -1,5 +1,6 @@
 target
 build
+build_CXX20
 cmake-build-debug
 cmake-build-release
 .vs

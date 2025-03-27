@@ -1,0 +1,36 @@
+---
+BasedOnStyle: Microsoft
+AlignAfterOpenBracket: AlwaysBreak
+AlignTrailingComments: 'true'
+AllowAllArgumentsOnNextLine: 'true'
+AllowAllConstructorInitializersOnNextLine: 'true'
+AllowAllParametersOfDeclarationOnNextLine: 'true'
+AllowShortBlocksOnASingleLine: 'false'
+AllowShortCaseLabelsOnASingleLine: 'false'
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLambdasOnASingleLine: Inline
+AllowShortLoopsOnASingleLine: 'false'
+AlwaysBreakAfterReturnType: None
+AlwaysBreakBeforeMultilineStrings: 'true'
+AlwaysBreakTemplateDeclarations: 'Yes'
+BinPackArguments: 'false'
+BinPackParameters: 'false'
+BreakBeforeTernaryOperators: 'true'
+BreakConstructorInitializers: BeforeComma
+BreakInheritanceList: BeforeComma
+ColumnLimit: '80'
+CompactNamespaces: 'true'
+FixNamespaceComments: 'false'
+IndentWidth: '4'
+PointerAlignment: Left
+SortIncludes: 'false'
+SortUsingDeclarations: 'true'
+SpaceAfterTemplateKeyword: 'true'
+UseTab: Never
+IndentPPDirectives: AfterHash
+AccessModifierOffset: -4
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterExternBlock: false
+...

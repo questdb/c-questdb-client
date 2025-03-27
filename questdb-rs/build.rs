@@ -98,9 +98,9 @@ pub mod json_tests {
             use crate::{Result, ingress::{Buffer}};
             use crate::tests::{TestResult};
 
-            fn matches_any_line(line: &str, expected: &[&str]) -> bool {
+            fn matches_any_line(line: &[u8], expected: &[&str]) -> bool {
                 for &exp in expected {
-                    if line == exp {
+                    if line == exp.as_bytes() {
                         return true;
                     }
                 }
@@ -171,7 +171,7 @@ pub mod json_tests {
                 if let Some(ref line) = expected.line {
                     let exp_ln = format!("{}\n", line);
                     writeln!(output, "    let exp = {:?};", exp_ln)?;
-                    writeln!(output, "    assert_eq!(buffer.as_str(), exp);")?;
+                    writeln!(output, "    assert_eq!(buffer.as_bytes(), exp.as_bytes());")?;
                 } else {
                     let any: Vec<String> = expected
                         .any_lines
@@ -187,7 +187,7 @@ pub mod json_tests {
                     writeln!(output, "        ];")?;
                     writeln!(
                         output,
-                        "    assert!(matches_any_line(buffer.as_str(), &any));"
+                        "    assert!(matches_any_line(buffer.as_bytes(), &any));"
                     )?;
                 }
             } else {

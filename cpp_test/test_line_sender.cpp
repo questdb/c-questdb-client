@@ -30,20 +30,28 @@
 #include <questdb/ingress/line_sender.h>
 #include <questdb/ingress/line_sender.hpp>
 
-#include <vector>
-#include <sstream>
 #include <chrono>
+#include <cstring>
+#include <sstream>
 #include <thread>
+#include <vector>
 
 using namespace std::string_literals;
 using namespace questdb::ingress::literals;
 
 template <typename F>
-    class on_scope_exit
+class on_scope_exit
 {
 public:
-    explicit on_scope_exit(F&& f) : _f{std::move(f)} {}
-    ~on_scope_exit() { _f(); }
+    explicit on_scope_exit(F&& f)
+        : _f{std::move(f)}
+    {
+    }
+    ~on_scope_exit()
+    {
+        _f();
+    }
+
 private:
     F _f;
 };
@@ -52,26 +60,23 @@ TEST_CASE("line_sender c api basics")
 {
     questdb::ingress::test::mock_server server;
     ::line_sender_error* err = nullptr;
-    on_scope_exit error_free_guard{[&]{
-            if (err)
-                ::line_sender_error_free(err);
-        }};
+    on_scope_exit error_free_guard{[&] {
+        if (err)
+            ::line_sender_error_free(err);
+    }};
     ::line_sender_utf8 host = {0, nullptr};
     CHECK(::line_sender_utf8_init(&host, 9, "localhost", &err));
-    ::line_sender_opts* opts = ::line_sender_opts_new(
-        ::line_sender_protocol_tcp,
-        host,
-        server.port());
+    ::line_sender_opts* opts =
+        ::line_sender_opts_new(::line_sender_protocol_tcp, host, server.port());
     CHECK_NE(opts, nullptr);
     ::line_sender* sender = ::line_sender_build(opts, &err);
     line_sender_opts_free(opts);
     CHECK_NE(sender, nullptr);
     CHECK_FALSE(::line_sender_must_close(sender));
-    on_scope_exit sender_close_guard{[&]
-        {
-            ::line_sender_close(sender);
-            sender = nullptr;
-        }};
+    on_scope_exit sender_close_guard{[&] {
+        ::line_sender_close(sender);
+        sender = nullptr;
+    }};
     server.accept();
     CHECK(server.recv() == 0);
     ::line_sender_table_name table_name{0, nullptr};
@@ -99,7 +104,8 @@ TEST_CASE("line_sender c api basics")
     CHECK(server.msgs().front() == "test,t1=v1 f1=0.5 10000000\n");
 }
 
-TEST_CASE("Opts service API tests") {
+TEST_CASE("Opts service API tests")
+{
     // We just check these compile and link.
 
     line_sender_utf8 host = QDB_UTF8_LITERAL("localhost");
@@ -109,28 +115,24 @@ TEST_CASE("Opts service API tests") {
         ::line_sender_protocol_tcp,
         ::line_sender_protocol_tcps,
         ::line_sender_protocol_http,
-        ::line_sender_protocol_https
-    };
+        ::line_sender_protocol_https};
 
-    for (size_t index = 0; index < sizeof(protocols) / sizeof(::line_sender_protocol); ++index)
+    for (size_t index = 0;
+         index < sizeof(protocols) / sizeof(::line_sender_protocol);
+         ++index)
     {
         auto proto = protocols[index];
-        ::line_sender_opts* opts1 = ::line_sender_opts_new_service(
-            proto,
-            host,
-            port);
+        ::line_sender_opts* opts1 =
+            ::line_sender_opts_new_service(proto, host, port);
         ::line_sender_opts_free(opts1);
     }
-
 }
 
 TEST_CASE("line_sender c++ connect disconnect")
 {
     questdb::ingress::test::mock_server server;
     questdb::ingress::line_sender sender{
-        questdb::ingress::protocol::tcp,
-        "localhost",
-        server.port()};
+        questdb::ingress::protocol::tcp, "localhost", server.port()};
     CHECK_FALSE(sender.must_close());
     server.accept();
     CHECK(server.recv() == 0);
@@ -148,8 +150,7 @@ TEST_CASE("line_sender c++ api basics")
     CHECK(server.recv() == 0);
 
     questdb::ingress::line_sender_buffer buffer;
-    buffer
-        .table("test")
+    buffer.table("test")
         .symbol("t1", "v1")
         .symbol("t2", "")
         .column("f1", 0.5)
@@ -166,8 +167,7 @@ TEST_CASE("test multiple lines")
 {
     questdb::ingress::test::mock_server server;
     std::string conf_str =
-        "tcp::addr=localhost:" +
-        std::to_string(server.port()) + ";";
+        "tcp::addr=localhost:" + std::to_string(server.port()) + ";";
     questdb::ingress::line_sender sender =
         questdb::ingress::line_sender::from_conf(conf_str);
     CHECK_FALSE(sender.must_close());
@@ -176,8 +176,7 @@ TEST_CASE("test multiple lines")
 
     const auto table_name = "metric1"_tn;
     questdb::ingress::line_sender_buffer buffer;
-    buffer
-        .table(table_name)
+    buffer.table(table_name)
         .symbol("t1"_cn, "val1"_utf8)
         .symbol("t2"_cn, "val2"_utf8)
         .column("f1"_cn, true)
@@ -187,8 +186,7 @@ TEST_CASE("test multiple lines")
         .column("f5"_cn, "val4"_utf8)
         .column("f6"_cn, "val5"_utf8)
         .at(questdb::ingress::timestamp_nanos{111222233333});
-    buffer
-        .table(table_name)
+    buffer.table(table_name)
         .symbol("tag3"_cn, "value 3"_utf8)
         .symbol("tag 4"_cn, "value:4"_utf8)
         .column("field5"_cn, false)
@@ -198,10 +196,12 @@ TEST_CASE("test multiple lines")
     CHECK(buffer.size() == 137);
     sender.flush(buffer);
     CHECK(server.recv() == 2);
-    CHECK(server.msgs()[0] ==
+    CHECK(
+        server.msgs()[0] ==
         ("metric1,t1=val1,t2=val2 f1=t,f2=12345i,"
          "f3=10.75,f4=\"val3\",f5=\"val4\",f6=\"val5\" 111222233333\n"));
-    CHECK(server.msgs()[1] ==
+    CHECK(
+        server.msgs()[1] ==
         "metric1,tag3=value\\ 3,tag\\ 4=value:4 field5=f\n");
 }
 
@@ -250,9 +250,7 @@ TEST_CASE("One column only - server.accept() after flush, before close")
 {
     questdb::ingress::test::mock_server server;
     questdb::ingress::line_sender sender{
-        questdb::ingress::protocol::tcp,
-        "localhost",
-        server.port()};
+        questdb::ingress::protocol::tcp, "localhost", server.port()};
 
     // Does not raise - this is unlike InfluxDB spec that disallows this.
     questdb::ingress::line_sender_buffer buffer;
@@ -272,16 +270,13 @@ TEST_CASE("Symbol after column")
 {
     questdb::ingress::test::mock_server server;
     questdb::ingress::line_sender sender{
-        questdb::ingress::protocol::tcp,
-        "localhost",
-        server.port()};
+        questdb::ingress::protocol::tcp, "localhost", server.port()};
 
     questdb::ingress::line_sender_buffer buffer;
     buffer.table("test").column("t1", "v1");
 
     CHECK_THROWS_AS(
-        buffer.symbol("t2", "v2"),
-        questdb::ingress::line_sender_error);
+        buffer.symbol("t2", "v2"), questdb::ingress::line_sender_error);
 
     CHECK(!sender.must_close());
 
@@ -337,50 +332,95 @@ TEST_CASE("Validation of bad chars in key names.")
             questdb::ingress::line_sender_error);
     }
 
-    auto test_bad_name = [](std::string bad_name)
+    auto test_bad_name = [](std::string bad_name) {
+        try
         {
-            try
+            questdb::ingress::column_name_view{bad_name};
+            std::stringstream ss;
+            ss << "Name `" << bad_name << "` (";
+            for (const char& c : bad_name)
             {
-                questdb::ingress::column_name_view{bad_name};
-                std::stringstream ss;
-                ss << "Name `" << bad_name << "` (";
-                for (const char& c : bad_name)
-                {
-                    ss << "\\x"
-                       << std::hex
-                       << std::setw(2)
-                       << std::setfill('0')
-                       << (int)c;
-                }
-                ss << ") did not raise.";
-                CHECK_MESSAGE(false, ss.str());
+                ss << "\\x" << std::hex << std::setw(2) << std::setfill('0')
+                   << (int)c;
             }
-            catch (const questdb::ingress::line_sender_error&)
-            {
-                return;
-            }
-            catch (...)
-            {
-                CHECK_MESSAGE(false, "Other exception raised.");
-            }
-        };
+            ss << ") did not raise.";
+            CHECK_MESSAGE(false, ss.str());
+        }
+        catch (const questdb::ingress::line_sender_error&)
+        {
+            return;
+        }
+        catch (...)
+        {
+            CHECK_MESSAGE(false, "Other exception raised.");
+        }
+    };
 
     std::vector<std::string> bad_chars{
-        "?"s, "."s, ","s, "'"s, "\""s, "\\"s, "/"s, "\0"s, ":"s,
-        ")"s, "("s, "+"s, "-"s, "*"s, "%"s, "~"s, "\xef\xbb\xbf"s};
+        "?"s,
+        "."s,
+        ","s,
+        "'"s,
+        "\""s,
+        "\\"s,
+        "/"s,
+        "\0"s,
+        ":"s,
+        ")"s,
+        "("s,
+        "+"s,
+        "-"s,
+        "*"s,
+        "%"s,
+        "~"s,
+        "\xef\xbb\xbf"s};
 
     for (const auto& bad_char : bad_chars)
     {
         std::vector<std::string> bad_names{
-            bad_char + "abc",
-            "ab" + bad_char + "c",
-            "abc" + bad_char};
+            bad_char + "abc", "ab" + bad_char + "c", "abc" + bad_char};
         for (const auto& bad_name : bad_names)
         {
             test_bad_name(bad_name);
         }
     }
 }
+
+#if __cplusplus >= 202002L
+template <size_t N>
+bool operator==(std::span<const std::byte> lhs, const char (&rhs)[N])
+{
+    constexpr size_t bytelen = N - 1; // Exclude null terminator
+    const std::span<const std::byte> rhs_span{
+        reinterpret_cast<const std::byte*>(rhs), bytelen};
+    return lhs.size() == bytelen && std::ranges::equal(lhs, rhs_span);
+}
+
+bool operator==(std::span<const std::byte> lhs, const std::string& rhs)
+{
+    const std::span<const std::byte> rhs_span{
+        reinterpret_cast<const std::byte*>(rhs.data()), rhs.size()};
+    return lhs.size() == rhs.size() && std::ranges::equal(lhs, rhs_span);
+}
+#else
+template <size_t N>
+bool operator==(
+    const questdb::ingress::buffer_view lhs_view, const char (&rhs)[N])
+{
+    constexpr size_t bytelen = N - 1; // Exclude null terminator
+    const questdb::ingress::buffer_view rhs_view{
+        reinterpret_cast<const std::byte*>(rhs), bytelen};
+    return lhs_view == rhs_view;
+}
+
+bool operator==(
+    const questdb::ingress::buffer_view lhs_view, const std::string& rhs)
+{
+    const questdb::ingress::buffer_view rhs_view{
+        reinterpret_cast<const std::byte*>(rhs.data()), rhs.size()};
+    return lhs_view == rhs_view;
+}
+#endif
 
 TEST_CASE("Buffer move and copy ctor testing")
 {
@@ -420,8 +460,6 @@ TEST_CASE("Buffer move and copy ctor testing")
     CHECK(buffer3.size() == 0);
     CHECK(buffer3.capacity() == 0);
     CHECK(buffer3.peek() == "");
-
-
 }
 
 TEST_CASE("Sender move testing.")
@@ -433,9 +471,7 @@ TEST_CASE("Sender move testing.")
     const questdb::ingress::utf8_view& host_ref = host;
 
     questdb::ingress::line_sender sender1{
-        questdb::ingress::protocol::tcp,
-        host_ref,
-        server1.port()};
+        questdb::ingress::protocol::tcp, host_ref, server1.port()};
 
     questdb::ingress::line_sender_buffer buffer;
     buffer.table("test").column("t1", "v1").at_now();
@@ -451,8 +487,7 @@ TEST_CASE("Sender move testing.")
     };
 
     CHECK_THROWS_AS(
-        fail_to_flush_eventually(),
-        questdb::ingress::line_sender_error);
+        fail_to_flush_eventually(), questdb::ingress::line_sender_error);
     CHECK(sender1.must_close());
 
     questdb::ingress::line_sender sender2{std::move(sender1)};
@@ -461,9 +496,7 @@ TEST_CASE("Sender move testing.")
     CHECK(sender2.must_close());
 
     questdb::ingress::line_sender sender3{
-        questdb::ingress::protocol::tcp,
-        "localhost",
-        server2.port()};
+        questdb::ingress::protocol::tcp, "localhost", server2.port()};
     CHECK_FALSE(sender3.must_close());
 
     sender3 = std::move(sender2);
@@ -475,9 +508,7 @@ TEST_CASE("Bad hostname")
     try
     {
         questdb::ingress::line_sender sender{
-            questdb::ingress::protocol::tcp,
-            "dummy_hostname",
-            "9009"};
+            questdb::ingress::protocol::tcp, "dummy_hostname", "9009"};
         CHECK_MESSAGE(false, "Expected exception");
     }
     catch (const questdb::ingress::line_sender_error& se)
@@ -498,9 +529,7 @@ TEST_CASE("Bad interface")
     try
     {
         questdb::ingress::opts opts{
-            questdb::ingress::protocol::tcp,
-            "localhost",
-            "9009"};
+            questdb::ingress::protocol::tcp, "localhost", "9009"};
         opts.bind_interface("dummy_hostname");
         questdb::ingress::line_sender sender{opts};
         CHECK_MESSAGE(false, "Expected exception");
@@ -509,8 +538,7 @@ TEST_CASE("Bad interface")
     {
         std::string msg{se.what()};
         CHECK_MESSAGE(
-            msg.rfind("Could not resolve \"dummy_hostname\": ", 0) == 0,
-            msg);
+            msg.rfind("Could not resolve \"dummy_hostname\": ", 0) == 0, msg);
     }
     catch (...)
     {
@@ -520,27 +548,24 @@ TEST_CASE("Bad interface")
 
 TEST_CASE("Bad port")
 {
-    const auto test_bad_port = [](std::string bad_port)
+    const auto test_bad_port = [](std::string bad_port) {
+        try
         {
-            try
-            {
-                questdb::ingress::line_sender sender{
-                    questdb::ingress::protocol::tcp,
-                    "localhost",
-                    bad_port};
-                CHECK_MESSAGE(false, "Expected exception");
-            }
-            catch (const questdb::ingress::line_sender_error& se)
-            {
-                std::string msg{se.what()};
-                std::string exp_msg{"\"localhost:" + bad_port + "\": "};
-                CHECK_MESSAGE(msg.find(exp_msg) != std::string::npos, msg);
-            }
-            catch (...)
-            {
-                CHECK_MESSAGE(false, "Other exception raised.");
-            }
-        };
+            questdb::ingress::line_sender sender{
+                questdb::ingress::protocol::tcp, "localhost", bad_port};
+            CHECK_MESSAGE(false, "Expected exception");
+        }
+        catch (const questdb::ingress::line_sender_error& se)
+        {
+            std::string msg{se.what()};
+            std::string exp_msg{"\"localhost:" + bad_port + "\": "};
+            CHECK_MESSAGE(msg.find(exp_msg) != std::string::npos, msg);
+        }
+        catch (...)
+        {
+            CHECK_MESSAGE(false, "Other exception raised.");
+        }
+    };
 
     test_bad_port("wombat");
     test_bad_port("0");
@@ -556,17 +581,13 @@ TEST_CASE("Bad connect")
         // Port 1 is generally the tcpmux service which one would
         // very much expect to never be running.
         questdb::ingress::line_sender sender{
-            questdb::ingress::protocol::tcp,
-            "localhost",
-            1};
+            questdb::ingress::protocol::tcp, "localhost", 1};
         CHECK_MESSAGE(false, "Expected exception");
     }
     catch (const questdb::ingress::line_sender_error& se)
     {
         std::string msg{se.what()};
-        CHECK_MESSAGE(
-            msg.rfind("Could not connect", 0) == 0,
-            msg);
+        CHECK_MESSAGE(msg.rfind("Could not connect", 0) == 0, msg);
     }
     catch (...)
     {
@@ -580,9 +601,7 @@ TEST_CASE("Bad CA path")
     {
         questdb::ingress::test::mock_server server;
         questdb::ingress::opts opts{
-            questdb::ingress::protocol::tcps,
-            "localhost",
-            server.port()};
+            questdb::ingress::protocol::tcps, "localhost", server.port()};
 
         opts.auth_timeout(1000);
 
@@ -590,7 +609,7 @@ TEST_CASE("Bad CA path")
         opts.tls_roots("/an/invalid/path/to/ca.pem");
         questdb::ingress::line_sender sender{opts};
     }
-    catch(const questdb::ingress::line_sender_error& se)
+    catch (const questdb::ingress::line_sender_error& se)
     {
         std::string msg{se.what()};
         CHECK_MESSAGE(
@@ -609,25 +628,19 @@ TEST_CASE("os certs")
     questdb::ingress::test::mock_server server;
     {
         questdb::ingress::opts opts{
-            questdb::ingress::protocol::tcps,
-            "localhost",
-            server.port()};
+            questdb::ingress::protocol::tcps, "localhost", server.port()};
         opts.tls_ca(questdb::ingress::ca::webpki_roots);
     }
 
     {
         questdb::ingress::opts opts{
-            questdb::ingress::protocol::https,
-            "localhost",
-            server.port()};
+            questdb::ingress::protocol::https, "localhost", server.port()};
         opts.tls_ca(questdb::ingress::ca::os_roots);
     }
 
     {
         questdb::ingress::opts opts{
-            questdb::ingress::protocol::https,
-            "localhost",
-            server.port()};
+            questdb::ingress::protocol::https, "localhost", server.port()};
         opts.tls_ca(questdb::ingress::ca::webpki_and_os_roots);
     }
 }
@@ -636,40 +649,29 @@ TEST_CASE("Opts copy ctor, assignment and move testing.")
 {
     {
         questdb::ingress::opts opts1{
-            questdb::ingress::protocol::tcp,
-            "localhost",
-            "9009"};
+            questdb::ingress::protocol::tcp, "localhost", "9009"};
         questdb::ingress::opts opts2{std::move(opts1)};
     }
 
     {
         questdb::ingress::opts opts1{
-            questdb::ingress::protocol::tcps,
-            "localhost",
-            "9009"};
+            questdb::ingress::protocol::tcps, "localhost", "9009"};
         questdb::ingress::opts opts2{opts1};
     }
 
     {
-        questdb::ingress::opts opts1{questdb::ingress::protocol::tcp,
-            "localhost",
-            "9009"};
+        questdb::ingress::opts opts1{
+            questdb::ingress::protocol::tcp, "localhost", "9009"};
         questdb::ingress::opts opts2{
-            questdb::ingress::protocol::tcp,
-            "altavista.digital.com",
-            "9009"};
+            questdb::ingress::protocol::tcp, "altavista.digital.com", "9009"};
         opts1 = std::move(opts2);
     }
 
     {
         questdb::ingress::opts opts1{
-            questdb::ingress::protocol::https,
-            "localhost",
-            "9009"};
+            questdb::ingress::protocol::https, "localhost", "9009"};
         questdb::ingress::opts opts2{
-            questdb::ingress::protocol::https,
-            "altavista.digital.com",
-            "9009"};
+            questdb::ingress::protocol::https, "altavista.digital.com", "9009"};
         opts1 = opts2;
     }
 }
@@ -678,31 +680,30 @@ TEST_CASE("Test timestamp column.")
 {
     questdb::ingress::test::mock_server server;
     questdb::ingress::line_sender sender{
-        questdb::ingress::protocol::tcp,
-        "localhost",
-        server.port()};
+        questdb::ingress::protocol::tcp, "localhost", server.port()};
 
     const auto now = std::chrono::system_clock::now();
     const auto now_micros =
         std::chrono::duration_cast<std::chrono::microseconds>(
-            now.time_since_epoch()).count();
-    const auto now_nanos =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            now.time_since_epoch()).count();
+            now.time_since_epoch())
+            .count();
+    const auto now_nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               now.time_since_epoch())
+                               .count();
 
     const auto now_nanos_ts = questdb::ingress::timestamp_nanos{now_nanos};
     const auto now_micros_ts = questdb::ingress::timestamp_micros{now_micros};
 
     questdb::ingress::line_sender_buffer buffer;
-    buffer
-        .table("test")
+    buffer.table("test")
         .column("ts1", questdb::ingress::timestamp_micros{12345})
         .column("ts2", now_micros_ts)
         .column("ts3", now_nanos_ts)
         .at(now_nanos_ts);
 
     std::stringstream ss;
-    ss << "test ts1=12345t,ts2=" << now_micros << "t,ts3=" << now_micros << "t " << now_nanos << "\n";
+    ss << "test ts1=12345t,ts2=" << now_micros << "t,ts3=" << now_micros << "t "
+       << now_nanos << "\n";
     const auto exp = ss.str();
     CHECK(buffer.peek() == exp);
 
@@ -717,10 +718,14 @@ TEST_CASE("Test timestamp column.")
     CHECK(server.msgs()[0] == exp);
 }
 
-TEST_CASE("test timestamp_micros and timestamp_nanos::now()") {
-    // Explicit in tests, just to be sure we haven't messed up the return types :-)
-    questdb::ingress::timestamp_micros micros_now{questdb::ingress::timestamp_micros::now()};
-    questdb::ingress::timestamp_nanos nanos_now{questdb::ingress::timestamp_nanos::now()};
+TEST_CASE("test timestamp_micros and timestamp_nanos::now()")
+{
+    // Explicit in tests, just to be sure we haven't messed up the return types
+    // :-)
+    questdb::ingress::timestamp_micros micros_now{
+        questdb::ingress::timestamp_micros::now()};
+    questdb::ingress::timestamp_nanos nanos_now{
+        questdb::ingress::timestamp_nanos::now()};
 
     // Check both are not zero.
     CHECK(micros_now.as_micros() != 0);
@@ -729,7 +734,9 @@ TEST_CASE("test timestamp_micros and timestamp_nanos::now()") {
     // Check both are within half second of each other.
     const int64_t micros_of_nanos = nanos_now.as_nanos() / 1000;
     const int64_t half_second_micros = 500000;
-    CHECK(std::abs(micros_of_nanos - micros_now.as_micros()) < half_second_micros);
+    CHECK(
+        std::abs(micros_of_nanos - micros_now.as_micros()) <
+        half_second_micros);
 }
 
 TEST_CASE("Test Marker")
@@ -748,11 +755,13 @@ TEST_CASE("Test Marker")
     CHECK(buffer.size() == 0);
 
     // Can't rewind, no marker set: Cleared by `rewind_to_marker`.
-    CHECK_THROWS_AS(buffer.rewind_to_marker(), questdb::ingress::line_sender_error);
+    CHECK_THROWS_AS(
+        buffer.rewind_to_marker(), questdb::ingress::line_sender_error);
 
     buffer.table("a").symbol("b", "c");
     CHECK_THROWS_AS(buffer.set_marker(), questdb::ingress::line_sender_error);
-    CHECK_THROWS_AS(buffer.rewind_to_marker(), questdb::ingress::line_sender_error);
+    CHECK_THROWS_AS(
+        buffer.rewind_to_marker(), questdb::ingress::line_sender_error);
     CHECK(buffer.peek() == "a,b=c");
 
     buffer.at_now();
@@ -761,7 +770,8 @@ TEST_CASE("Test Marker")
     buffer.set_marker();
     buffer.clear_marker();
     buffer.clear_marker();
-    CHECK_THROWS_AS(buffer.rewind_to_marker(), questdb::ingress::line_sender_error);
+    CHECK_THROWS_AS(
+        buffer.rewind_to_marker(), questdb::ingress::line_sender_error);
     buffer.set_marker();
     buffer.table("d").symbol("e", "f");
     CHECK(buffer.peek() == "a,b=c\nd,e=f");
@@ -771,10 +781,12 @@ TEST_CASE("Test Marker")
 
     buffer.clear();
     CHECK(buffer.peek() == "");
-    CHECK_THROWS_AS(buffer.rewind_to_marker(), questdb::ingress::line_sender_error);
+    CHECK_THROWS_AS(
+        buffer.rewind_to_marker(), questdb::ingress::line_sender_error);
 }
 
-TEST_CASE("Moved View") {
+TEST_CASE("Moved View")
+{
     auto v1 = "abc"_tn;
     CHECK(v1.size() == 3);
     questdb::ingress::table_name_view v2{std::move(v1)};
@@ -783,7 +795,8 @@ TEST_CASE("Moved View") {
     CHECK(v1.data() == v2.data());
 }
 
-TEST_CASE("Empty Buffer") {
+TEST_CASE("Empty Buffer")
+{
     questdb::ingress::line_sender_buffer b1;
     CHECK(b1.size() == 0);
     questdb::ingress::line_sender_buffer b2{std::move(b1)};
@@ -801,7 +814,8 @@ TEST_CASE("Empty Buffer") {
     CHECK(b5.size() == 9);
 
     questdb::ingress::test::mock_server server;
-    questdb::ingress::line_sender sender{questdb::ingress::protocol::tcp, "localhost", server.port()};
+    questdb::ingress::line_sender sender{
+        questdb::ingress::protocol::tcp, "localhost", server.port()};
     CHECK_THROWS_WITH_AS(
         sender.flush(b1),
         "State error: Bad call to `flush`, should have called `table` instead.",
@@ -812,36 +826,36 @@ TEST_CASE("Empty Buffer") {
         questdb::ingress::line_sender_error);
 }
 
-TEST_CASE("Opts from conf") {
-    questdb::ingress::opts opts1 = questdb::ingress::opts::from_conf("tcp::addr=localhost:9009;");
-    questdb::ingress::opts opts2 = questdb::ingress::opts::from_conf("tcps::addr=localhost:9009;");
-    questdb::ingress::opts opts3 = questdb::ingress::opts::from_conf("https::addr=localhost:9009;");
-    questdb::ingress::opts opts4 = questdb::ingress::opts::from_conf("https::addr=localhost:9009;");
+TEST_CASE("Opts from conf")
+{
+    questdb::ingress::opts opts1 =
+        questdb::ingress::opts::from_conf("tcp::addr=localhost:9009;");
+    questdb::ingress::opts opts2 =
+        questdb::ingress::opts::from_conf("tcps::addr=localhost:9009;");
+    questdb::ingress::opts opts3 =
+        questdb::ingress::opts::from_conf("https::addr=localhost:9009;");
+    questdb::ingress::opts opts4 =
+        questdb::ingress::opts::from_conf("https::addr=localhost:9009;");
 }
 
-TEST_CASE("HTTP basics") {
+TEST_CASE("HTTP basics")
+{
     questdb::ingress::opts opts1{
-        questdb::ingress::protocol::http,
-        "localhost",
-        1};
+        questdb::ingress::protocol::http, "localhost", 1};
     questdb::ingress::opts opts1conf = questdb::ingress::opts::from_conf(
-        "http::addr=localhost:1;username=user;password=pass;request_timeout=5000;retry_timeout=5;");
+        "http::addr=localhost:1;username=user;password=pass;request_timeout="
+        "5000;retry_timeout=5;");
     questdb::ingress::opts opts2{
-        questdb::ingress::protocol::https,
-        "localhost",
-        "1"};
+        questdb::ingress::protocol::https, "localhost", "1"};
     questdb::ingress::opts opts2conf = questdb::ingress::opts::from_conf(
-        "http::addr=localhost:1;token=token;request_min_throughput=1000;retry_timeout=0;");
-    opts1
-        .username("user")
+        "http::addr=localhost:1;token=token;request_min_throughput=1000;retry_"
+        "timeout=0;");
+    opts1.username("user")
         .password("pass")
         .max_buf_size(1000000)
         .request_timeout(5000)
         .retry_timeout(5);
-    opts2
-        .token("token")
-        .request_min_throughput(1000)
-        .retry_timeout(0);
+    opts2.token("token").request_min_throughput(1000).retry_timeout(0);
     questdb::ingress::line_sender sender1{opts1};
     questdb::ingress::line_sender sender1conf{opts1conf};
     questdb::ingress::line_sender sender2{opts2};
@@ -856,6 +870,7 @@ TEST_CASE("HTTP basics") {
     CHECK_THROWS_AS(sender2conf.flush(b1), questdb::ingress::line_sender_error);
 
     CHECK_THROWS_AS(
-        questdb::ingress::opts::from_conf("http::addr=localhost:1;bind_interface=0.0.0.0;"),
-        questdb::ingress::line_sender_error);    
+        questdb::ingress::opts::from_conf(
+            "http::addr=localhost:1;bind_interface=0.0.0.0;"),
+        questdb::ingress::line_sender_error);
 }
