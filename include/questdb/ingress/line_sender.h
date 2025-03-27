@@ -176,10 +176,8 @@ line_sender_utf8 line_sender_utf8_assert(size_t len, const char* buf);
  * borrowed buffer
  */
 typedef struct line_sender_buffer_view {
-  size_t len;
-  // clang-format off
-  const uint8_t* buf;
-  // clang-format on
+    size_t len;
+    const uint8_t* buf;
 } line_sender_buffer_view;
 
 /**
