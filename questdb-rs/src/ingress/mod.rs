@@ -1325,14 +1325,27 @@ fn add_webpki_roots(root_store: &mut RootCertStore) {
 }
 
 #[cfg(feature = "tls-native-certs")]
-fn add_os_roots(root_store: &mut RootCertStore) -> Result<()> {
-    let os_certs = rustls_native_certs::load_native_certs().map_err(|io_err| {
-        error::fmt!(
+fn unpack_os_native_certs(
+    res: rustls_native_certs::CertificateResult,
+) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+    if !res.errors.is_empty() {
+        return Err(error::fmt!(
             TlsError,
             "Could not load OS native TLS certificates: {}",
-            io_err
-        )
-    })?;
+            res.errors
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    Ok(res.certs)
+}
+
+#[cfg(feature = "tls-native-certs")]
+fn add_os_roots(root_store: &mut RootCertStore) -> Result<()> {
+    let os_certs = unpack_os_native_certs(rustls_native_certs::load_native_certs())?;
 
     let (valid_count, invalid_count) = root_store.add_parsable_certificates(os_certs);
     if valid_count == 0 && invalid_count > 0 {

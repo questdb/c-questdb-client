@@ -355,12 +355,12 @@ fn retry_http_send(
     retry_timeout: Duration,
     mut last_rep: Result<Response<Body>, ureq::Error>,
 ) -> Result<Response<Body>, ureq::Error> {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let retry_end = std::time::Instant::now() + retry_timeout;
     let mut retry_interval_ms = 10;
     let mut need_retry;
     loop {
-        let jitter_ms = rng.gen_range(-5i32..5);
+        let jitter_ms = rng.random_range(-5i32..5);
         let to_sleep_ms = retry_interval_ms + jitter_ms;
         let to_sleep = Duration::from_millis(to_sleep_ms as u64);
         if (std::time::Instant::now() + to_sleep) > retry_end {
