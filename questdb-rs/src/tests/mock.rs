@@ -104,10 +104,6 @@ impl HttpRequest {
     pub fn body(&self) -> &[u8] {
         &self.body
     }
-
-    pub fn body_str(&self) -> Result<&str, std::str::Utf8Error> {
-        std::str::from_utf8(self.body())
-    }
 }
 
 #[cfg(feature = "ilp-over-http")]

@@ -59,7 +59,7 @@ fn test_two_lines() -> TestResult {
             req.header("user-agent"),
             Some(concat!("questdb/rust/", env!("CARGO_PKG_VERSION")))
         );
-        assert_eq!(req.body_str().unwrap(), buffer2.as_str());
+        assert_eq!(req.body(), buffer2.as_bytes());
 
         server.send_http_response_q(HttpResponse::empty())?;
 
@@ -97,7 +97,7 @@ fn test_text_plain_error() -> TestResult {
         let req = server.recv_http_q()?;
         assert_eq!(req.method(), "POST");
         assert_eq!(req.path(), "/write?precision=n");
-        assert_eq!(req.body_str().unwrap(), buffer2.as_str());
+        assert_eq!(req.body(), buffer2.as_bytes());
 
         server.send_http_response_q(
             HttpResponse::empty()
@@ -143,7 +143,7 @@ fn test_bad_json_error() -> TestResult {
         let req = server.recv_http_q()?;
         assert_eq!(req.method(), "POST");
         assert_eq!(req.path(), "/write?precision=n");
-        assert_eq!(req.body_str().unwrap(), buffer2.as_str());
+        assert_eq!(req.body(), buffer2.as_bytes());
 
         server.send_http_response_q(
             HttpResponse::empty()
@@ -191,7 +191,7 @@ fn test_json_error() -> TestResult {
         let req = server.recv_http_q()?;
         assert_eq!(req.method(), "POST");
         assert_eq!(req.path(), "/write?precision=n");
-        assert_eq!(req.body_str().unwrap(), buffer2.as_str());
+        assert_eq!(req.body(), buffer2.as_bytes());
 
         server.send_http_response_q(
             HttpResponse::empty()
@@ -261,7 +261,7 @@ fn test_old_server_without_ilp_http_support() -> TestResult {
         let req = server.recv_http_q()?;
         assert_eq!(req.method(), "POST");
         assert_eq!(req.path(), "/write?precision=n");
-        assert_eq!(req.body_str().unwrap(), buffer2.as_str());
+        assert_eq!(req.body(), buffer2.as_bytes());
 
         server.send_http_response_q(
             HttpResponse::empty()
@@ -316,7 +316,7 @@ fn test_http_basic_auth() -> TestResult {
             req.header("authorization"),
             Some("Basic QWxhZGRpbjpPcGVuU2VzYW1l")
         );
-        assert_eq!(req.body_str().unwrap(), buffer2.as_str());
+        assert_eq!(req.body(), buffer2.as_bytes());
 
         server.send_http_response_q(HttpResponse::empty())?;
 
@@ -353,7 +353,7 @@ fn test_unauthenticated() -> TestResult {
         let req = server.recv_http_q()?;
         assert_eq!(req.method(), "POST");
         assert_eq!(req.path(), "/write?precision=n");
-        assert_eq!(req.body_str().unwrap(), buffer2.as_str());
+        assert_eq!(req.body(), buffer2.as_bytes());
 
         server.send_http_response_q(
             HttpResponse::empty()
@@ -402,7 +402,7 @@ fn test_token_auth() -> TestResult {
         assert_eq!(req.method(), "POST");
         assert_eq!(req.path(), "/write?precision=n");
         assert_eq!(req.header("authorization"), Some("Bearer 0123456789"));
-        assert_eq!(req.body_str().unwrap(), buffer2.as_str());
+        assert_eq!(req.body(), buffer2.as_bytes());
 
         server.send_http_response_q(HttpResponse::empty())?;
 
@@ -467,7 +467,7 @@ fn test_tls() -> TestResult {
         let req = server.recv_http_q()?;
         assert_eq!(req.method(), "POST");
         assert_eq!(req.path(), "/write?precision=n");
-        assert_eq!(req.body_str().unwrap(), buffer2.as_str());
+        assert_eq!(req.body(), buffer2.as_bytes());
 
         server.send_http_response_q(HttpResponse::empty())?;
 
@@ -502,7 +502,7 @@ fn test_user_agent() -> TestResult {
 
         let req = server.recv_http_q()?;
         assert_eq!(req.header("user-agent"), Some("wallabies/1.2.99"));
-        assert_eq!(req.body_str().unwrap(), buffer2.as_str());
+        assert_eq!(req.body(), buffer2.as_bytes());
 
         server.send_http_response_q(HttpResponse::empty())?;
 
@@ -541,7 +541,7 @@ fn test_two_retries() -> TestResult {
         server.accept()?;
 
         let req = server.recv_http_q()?;
-        assert_eq!(req.body_str().unwrap(), buffer2.as_str());
+        assert_eq!(req.body(), buffer2.as_bytes());
 
         server.send_http_response_q(
             HttpResponse::empty()
@@ -552,7 +552,7 @@ fn test_two_retries() -> TestResult {
         let start_time = std::time::Instant::now();
 
         let req = server.recv_http_q()?;
-        assert_eq!(req.body_str().unwrap(), buffer2.as_str());
+        assert_eq!(req.body(), buffer2.as_bytes());
         let elapsed = std::time::Instant::now().duration_since(start_time);
         assert!(elapsed > Duration::from_millis(5));
 
@@ -565,7 +565,7 @@ fn test_two_retries() -> TestResult {
         let start_time = std::time::Instant::now();
 
         let req = server.recv_http_q()?;
-        assert_eq!(req.body_str().unwrap(), buffer2.as_str());
+        assert_eq!(req.body(), buffer2.as_bytes());
         let elapsed = std::time::Instant::now().duration_since(start_time);
         assert!(elapsed > Duration::from_millis(15));
 
@@ -604,7 +604,7 @@ fn test_one_retry() -> TestResult {
         server.accept()?;
 
         let req = server.recv_http_q()?;
-        assert_eq!(req.body_str().unwrap(), buffer2.as_str());
+        assert_eq!(req.body(), buffer2.as_bytes());
 
         server.send_http_response_q(
             HttpResponse::empty()
@@ -613,7 +613,7 @@ fn test_one_retry() -> TestResult {
         )?;
 
         let req = server.recv_http_q()?;
-        assert_eq!(req.body_str().unwrap(), buffer2.as_str());
+        assert_eq!(req.body(), buffer2.as_bytes());
 
         server.send_http_response_q(
             HttpResponse::empty()
@@ -681,7 +681,7 @@ fn test_transactional() -> TestResult {
         server.accept()?;
 
         let req = server.recv_http_q()?;
-        assert_eq!(req.body_str().unwrap(), buffer3.as_str());
+        assert_eq!(req.body(), buffer3.as_bytes());
 
         server.send_http_response_q(HttpResponse::empty())?;
 

@@ -71,13 +71,14 @@ fn test_basics() -> TestResult {
         ts_nanos_num / 1000i64,
         ts_nanos_num
     );
-    assert_eq!(buffer.as_str(), exp);
+    let exp_byte = exp.as_bytes();
+    assert_eq!(buffer.as_bytes(), exp_byte);
     assert_eq!(buffer.len(), exp.len());
     sender.flush(&mut buffer)?;
     assert_eq!(buffer.len(), 0);
-    assert_eq!(buffer.as_str(), "");
+    assert_eq!(buffer.as_bytes(), b"");
     assert_eq!(server.recv_q()?, 1);
-    assert_eq!(server.msgs[0].as_str(), exp);
+    assert_eq!(server.msgs[0].as_bytes(), exp_byte);
     Ok(())
 }
 
@@ -286,8 +287,9 @@ fn test_timestamp_overloads() -> TestResult {
     let exp = concat!(
         "tbl_name a=12345t,b=-100000000t,c=12345t,d=-12345t,e=-1t,f=-10t 1000\n",
         "tbl_name a=1000000t 5000000000\n"
-    );
-    assert_eq!(buffer.as_str(), exp);
+    )
+    .as_bytes();
+    assert_eq!(buffer.as_bytes(), exp);
 
     Ok(())
 }
@@ -304,8 +306,8 @@ fn test_chrono_timestamp() -> TestResult {
     let mut buffer = Buffer::new();
     buffer.table(tbl_name)?.column_ts("a", ts)?.at(ts)?;
 
-    let exp = "tbl_name a=1000000t 1000000000\n";
-    assert_eq!(buffer.as_str(), exp);
+    let exp = b"tbl_name a=1000000t 1000000000\n";
+    assert_eq!(buffer.as_bytes(), exp);
 
     Ok(())
 }
@@ -368,12 +370,12 @@ fn test_tls_with_file_ca() -> TestResult {
         .at(TimestampNanos::new(10000000))?;
 
     assert_eq!(server.recv_q()?, 0);
-    let exp = "test,t1=v1 f1=0.5 10000000\n";
-    assert_eq!(buffer.as_str(), exp);
+    let exp = b"test,t1=v1 f1=0.5 10000000\n";
+    assert_eq!(buffer.as_bytes(), exp);
     assert_eq!(buffer.len(), exp.len());
     sender.flush(&mut buffer)?;
     assert_eq!(server.recv_q()?, 1);
-    assert_eq!(server.msgs[0].as_str(), exp);
+    assert_eq!(server.msgs[0].as_bytes(), exp);
     Ok(())
 }
 
@@ -461,12 +463,12 @@ fn test_tls_insecure_skip_verify() -> TestResult {
         .at(TimestampNanos::new(10000000))?;
 
     assert_eq!(server.recv_q()?, 0);
-    let exp = "test,t1=v1 f1=0.5 10000000\n";
-    assert_eq!(buffer.as_str(), exp);
+    let exp = b"test,t1=v1 f1=0.5 10000000\n";
+    assert_eq!(buffer.as_bytes(), exp);
     assert_eq!(buffer.len(), exp.len());
     sender.flush(&mut buffer)?;
     assert_eq!(server.recv_q()?, 1);
-    assert_eq!(server.msgs[0].as_str(), exp);
+    assert_eq!(server.msgs[0].as_bytes(), exp);
     Ok(())
 }
 
