@@ -2798,6 +2798,6 @@ mod http;
 #[cfg(feature = "ilp-over-http")]
 use http::*;
 
-mod ndarr;
+pub(crate) mod ndarr;
 #[cfg(test)]
 mod tests;

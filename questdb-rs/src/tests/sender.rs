@@ -35,6 +35,8 @@ use crate::tests::{
 };
 
 use core::time::Duration;
+#[cfg(feature = "ndarray")]
+use ndarray::arr1;
 use std::{io, time::SystemTime};
 
 #[test]
@@ -349,6 +351,11 @@ fn test_f64_column_name_too_long() -> TestResult {
 #[test]
 fn test_str_column_name_too_long() -> TestResult {
     column_name_too_long_test_impl!(column_str, "value")
+}
+
+#[cfg(feature = "ndarray")]
+fn test_arr_column_name_too_long() -> TestResult {
+    column_name_too_long_test_impl!(column_arr, &arr1(&[1.0, 2.0, 3.0]).view())
 }
 
 #[test]

@@ -32,7 +32,7 @@ pub trait ArrayElement: Copy + 'static {
 }
 
 #[repr(u8)]
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum ElemDataType {
     /// Uninitialized/placeholder type
     Undefined = 0,
@@ -103,7 +103,7 @@ where
     }
 
     fn dim(&self, index: usize) -> Option<usize> {
-        let len = self.len();
+        let len = self.ndim();
         if index < len {
             Some(self.len_of(Axis(index)))
         } else {
