@@ -324,8 +324,9 @@ class QuestDbFixture:
                 except socket.timeout:
                     print("socket timeout")
                     pass
-                except urllib.error.URLError:
+                except urllib.error.URLError as e:
                     print("url error")
+                    print(e)
                     pass
                 return False
 
