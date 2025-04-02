@@ -1072,7 +1072,7 @@ impl Buffer {
         self.output.push(ARRAY_BINARY_FORMAT_TYPE);
         // ndarr dims
         self.output.push(view.ndim() as u8);
-        // ndarr shapes
+        // ndarr datatype
         self.output.push(D::elem_type().into());
 
         let mut reserve_size = size_of::<D>();
@@ -1081,6 +1081,7 @@ impl Buffer {
                 error::fmt!(ArrayViewError, "Can not get correct dimensions for dim {}", i)
             })?;
 
+            // ndarr shapes
             self.output
                 .extend_from_slice((d as i32).to_le_bytes().as_slice());
             reserve_size = reserve_size
@@ -1096,6 +1097,8 @@ impl Buffer {
             .try_reserve(reserve_size)
             .map_err(|_| error::fmt!(BufferOutOfMemory, "Buffer out of memory"))?;
         unsafe { self.output.set_len(reserve_size) }
+        
+        // ndarr data
         view.write_row_major_buf(&mut self.output[index..]);
         Ok(self)
     }
