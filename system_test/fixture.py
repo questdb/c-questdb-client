@@ -323,7 +323,7 @@ class QuestDbFixture:
                         return True
                 except socket.timeout:
                     pass
-                except urllib.error.URLError as e:
+                except urllib.error.URLError:
                     pass
                 return False
 
