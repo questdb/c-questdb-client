@@ -24,6 +24,11 @@
 
 #![doc = include_str!("mod.md")]
 
+#[cfg(not(any(feature = "tls-webpki-certs", feature = "tls-native-certs")))]
+compile_error!(
+    "At least one of `tls-webpki-certs` or `tls-native-certs` features must be enabled."
+);
+
 pub use self::timestamp::*;
 
 use crate::error::{self, Error, Result};
@@ -39,14 +44,12 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use aws_lc_rs::rand::SystemRandom;
+use aws_lc_rs::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
 use base64ct::{Base64, Base64UrlUnpadded, Encoding};
-use ring::rand::SystemRandom;
-use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
 use rustls::{ClientConnection, RootCertStore, StreamOwned};
 use rustls_pki_types::ServerName;
 use socket2::{Domain, Protocol as SockProtocol, SockAddr, Socket, Type};
-use ureq::unversioned::resolver;
-use ureq::unversioned::transport::{Connector, TcpConnector};
 
 #[derive(Debug, Copy, Clone)]
 enum Op {
@@ -1310,7 +1313,7 @@ mod danger {
         }
 
         fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-            rustls::crypto::ring::default_provider()
+            rustls::crypto::aws_lc_rs::default_provider()
                 .signature_verification_algorithms
                 .supported_schemes()
         }
@@ -2288,6 +2291,8 @@ impl SenderBuilder {
             Protocol::Tcp | Protocol::Tcps => self.connect_tcp(&auth)?,
             #[cfg(feature = "ilp-over-http")]
             Protocol::Http | Protocol::Https => {
+                use ureq::unversioned::transport::Connector;
+                use ureq::unversioned::transport::TcpConnector;
                 if self.net_interface.is_some() {
                     // See: https://github.com/algesten/ureq/issues/692
                     return Err(error::fmt!(
@@ -2335,7 +2340,7 @@ impl SenderBuilder {
                 let agent = ureq::Agent::with_parts(
                     agent_builder.build(),
                     connector,
-                    resolver::DefaultResolver::default(),
+                    ureq::unversioned::resolver::DefaultResolver::default(),
                 );
                 let proto = self.protocol.schema();
                 let url = format!(
@@ -2455,12 +2460,10 @@ fn parse_public_key(pub_key_x: &str, pub_key_y: &str) -> Result<Vec<u8>> {
 fn parse_key_pair(auth: &EcdsaAuthParams) -> Result<EcdsaKeyPair> {
     let private_key = b64_decode("private authentication key", auth.priv_key.as_str())?;
     let public_key = parse_public_key(auth.pub_key_x.as_str(), auth.pub_key_y.as_str())?;
-    let system_random = SystemRandom::new();
     EcdsaKeyPair::from_private_key_and_public_key(
         &ECDSA_P256_SHA256_FIXED_SIGNING,
         &private_key[..],
         &public_key[..],
-        &system_random,
     )
     .map_err(|key_rejected| {
         error::fmt!(
@@ -2614,7 +2617,7 @@ impl Sender {
                             Ok(())
                         }
                     }
-                    Err(err) => Err(Error::new_from_ureq_error(err, &state.url)),
+                    Err(err) => Err(Error::from_ureq_error(err, &state.url)),
                 };
             }
         }

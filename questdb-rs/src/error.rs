@@ -1,5 +1,4 @@
 use std::fmt::{Display, Formatter};
-use ureq::Error::StatusCode;
 
 macro_rules! fmt {
     ($code:ident, $($arg:tt)*) => {
@@ -67,9 +66,10 @@ impl Error {
         }
     }
 
-    pub fn new_from_ureq_error(err: ureq::Error, url: &str) -> Error {
+    #[cfg(feature = "ilp-over-http")]
+    pub(crate) fn from_ureq_error(err: ureq::Error, url: &str) -> Error {
         match err {
-            StatusCode(code) => {
+            ureq::Error::StatusCode(code) => {
                 if code == 404 {
                     fmt!(
                         HttpNotSupported,
