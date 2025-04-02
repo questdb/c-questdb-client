@@ -318,12 +318,14 @@ class QuestDbFixture:
                     method='GET')
                 try:
                     resp = urllib.request.urlopen(req, timeout=1)
-                    print(resp)
+                    print(resp.status)
                     if resp.status == 200:
                         return True
                 except socket.timeout:
+                    print("socket timeout")
                     pass
                 except urllib.error.URLError:
+                    print("url error")
                     pass
                 return False
 
