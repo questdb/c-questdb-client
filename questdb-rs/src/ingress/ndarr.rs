@@ -1,109 +1,133 @@
-use std::mem::ManuallyDrop;
-use std::ptr::NonNull;
-use std::slice;
+pub(crate) const MAX_DIMS: usize = 32;
 
-pub struct Shape(Vec<usize>);
-
-impl From<Vec<usize>> for Shape {
-    fn from(vec: Vec<usize>) -> Self {
-        Self(vec)
-    }
-}
-
-#[derive(Debug)]
-#[repr(C)]
-pub struct OwnedRepr<T>
-{
-    ptr: NonNull<T>,
-    len: usize,
-    capacity: usize,
-}
-
-impl<A> OwnedRepr<A> {
-    pub fn from(v: Vec<A>) -> Self
-    {
-        let mut v = ManuallyDrop::new(v);
-        let len = v.len();
-        let capacity = v.capacity();
-        unsafe {
-            let ptr = NonNull::new_unchecked(v.as_mut_ptr());
-            Self { ptr, len, capacity }
-        }
-    }
-
-    pub(crate) fn into_vec(self) -> Vec<A>
-    {
-        ManuallyDrop::new(self).take_as_vec()
-    }
-
-    pub(crate) fn as_slice(&self) -> &[A]
-    {
-        unsafe { slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
-    }
-
-    pub(crate) fn len(&self) -> usize
-    {
-        self.len
-    }
-
-    pub(crate) fn as_ptr(&self) -> *const A
-    {
-        self.ptr.as_ptr()
-    }
-
-    pub(crate) fn as_nonnull_mut(&mut self) -> NonNull<A>
-    {
-        self.ptr
-    }
-
-    fn take_as_vec(&mut self) -> Vec<A>
-    {
-        let capacity = self.capacity;
-        let len = self.len;
-        self.len = 0;
-        self.capacity = 0;
-        unsafe { Vec::from_raw_parts(self.ptr.as_ptr(), len, capacity) }
-    }
-}
-
-pub struct Array<T>
+pub trait NdArrayView<T>
 where
     T: ArrayElement,
 {
-    shape: Shape,
-    data: OwnedRepr<T>,
+    /// Returns the number of dimensions (rank) of the array.
+    fn ndim(&self) -> usize;
+
+    /// Returns the size of the specified dimension.
+    fn dim(&self, index: usize) -> Option<usize>;
+
+    /// Writes array data to buffer in row-major order.
+    ///
+    /// # Important Notes
+    /// - Buffer must be pre-allocated with exact required size
+    /// - No alignment assumptions should be made about buffer start
+    /// - Handles both contiguous and non-contiguous memory layouts
+    fn write_row_major_buf(&self, buff: &mut [u8]);
 }
 
-impl<T: ArrayElement> Array<T> {
+/// Marker trait for valid array element types.
+///
+/// Implemented for primitive types that can be stored in arrays.
+/// Combines type information with data type classification.
+pub trait ArrayElement: Copy + 'static {
+    /// Returns the corresponding data type classification.
+    ///
+    /// This enables runtime type identification while maintaining
+    /// compile-time type safety.
+    fn elem_type() -> ElemDataType;
+}
+
+#[repr(u8)]
+#[derive(Debug)]
+pub enum ElemDataType {
+    /// Uninitialized/placeholder type
+    Undefined = 0,
+    /// Boolean values (true/false)
+    Boolean,
+    /// 8-bit signed integer
+    Byte,
+    /// 16-bit signed integer
+    Short,
+    /// UTF-16 character
+    Char,
+    /// 32-bit signed integer
+    Int,
+    /// 64-bit signed integer
+    Long,
+    /// Date type (days since epoch)
+    Date,
+    /// Microsecond-precision timestamp
+    Timestamp,
+    /// 32-bit floating point
+    Float,
+    /// 64-bit floating point
+    Double,
+    /// UTF-8 string data
+    String,
+    /// Interned string symbol
+    Symbol,
+    /// 256-bit integer value
+    Long256,
+    /// Geospatial byte coordinates
+    GeoByte,
+    /// Geospatial short coordinates
+    GeoShort,
+    /// Geospatial integer coordinates
+    GeoInt,
+    /// Geospatial long coordinates
+    GeoLong,
+    /// Binary large object
+    Binary,
+    /// UUID values
+    Uuid,
+}
+
+impl From<ElemDataType> for u8 {
+    fn from(val: ElemDataType) -> Self {
+        val as u8
+    }
+}
+
+impl ArrayElement for f64 {
+    /// Identifies f64 as Double type in QuestDB's type system.
+    fn elem_type() -> ElemDataType {
+        ElemDataType::Double
+    }
+}
+
+#[cfg(feature = "ndarray")]
+use ndarray::{ArrayView, Axis, Dimension};
+
+#[cfg(feature = "ndarray")]
+impl<T, D> NdArrayView<T> for ArrayView<'_, T, D>
+where
+    T: ArrayElement,
+    D: Dimension,
+{
     fn ndim(&self) -> usize {
-        self.shape.0.len()
+        self.ndim()
     }
 
     fn dim(&self, index: usize) -> Option<usize> {
-        if index < self.shape.0.len() {
-            Some(self.shape.0[index])
+        let len = self.len();
+        if index < len {
+            Some(self.len_of(Axis(index)))
         } else {
             None
         }
     }
 
-    fn from(v: Vec<T>) -> Self
-    {
-        Self::from_shape_vec_unchecked(vec![v.len()], v)
-    }
+    fn write_row_major_buf(&self, buf: &mut [u8]) {
+        let elem_size = size_of::<T>();
 
-    pub fn from_shape_vec_unchecked<Sh>(shape: Sh, v: Vec<T>) -> Self
-    where
-        Sh: Into<Shape>,
-    {
-        Array {
-            shape: shape.into(),
-            data: OwnedRepr::from(v),
+        if let Some(slice) = self.as_slice() {
+            let byte_len = size_of_val(slice);
+            let bytes =
+                unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, byte_len) };
+            buf[..byte_len].copy_from_slice(bytes);
+            return;
+        }
+
+        let mut bytes_written = 0;
+        for &element in self.iter() {
+            let element_bytes =
+                unsafe { std::slice::from_raw_parts(&element as *const T as *const _, elem_size) };
+            buf[bytes_written..bytes_written + elem_size].copy_from_slice(element_bytes);
+            bytes_written += elem_size;
         }
     }
 }
-
-pub trait ArrayElement: Copy + 'static {}
-impl ArrayElement for f64 {}
-
-

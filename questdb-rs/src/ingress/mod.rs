@@ -39,6 +39,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use crate::ingress::ndarr::{ArrayElement, NdArrayView, MAX_DIMS};
 use base64ct::{Base64, Base64UrlUnpadded, Encoding};
 use ring::rand::SystemRandom;
 use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
@@ -990,6 +991,112 @@ impl Buffer {
     {
         self.write_column_key(name)?;
         write_escaped_quoted(&mut self.output, value.as_ref());
+        Ok(self)
+    }
+
+    /// Record a multidimensional array value for the given column.
+    ///
+    /// Supports arrays with up to [`MAX_DIMS`] dimensions. The array elements must
+    /// implement [`ArrayElement`] trait which provides type-to-[`ElemDataType`] mapping.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage with direct dimension specification:
+    ///
+    /// ```
+    /// # #[cfg(feature = "ndarray")]
+    /// # {
+    /// # use questdb::Result;
+    /// # use questdb::ingress::Buffer;
+    /// # use ndarray::array;
+    /// # fn main() -> Result<()> {
+    /// # let mut buffer = Buffer::new();
+    /// # buffer.table("x")?;
+    /// // Record a 2D array of f64 values
+    /// let array_2d = array![[1.1, 2.2], [3.3, 4.4]];
+    /// buffer.column_arr("array_col", &array_2d.view())?;
+    /// # Ok(())
+    /// # }
+    /// # }
+    ///
+    /// ```
+    ///
+    /// Using [`ColumnName`] for validated column names:
+    ///
+    /// ```
+    /// # #[cfg(feature = "ndarray")]
+    /// # {
+    /// # use questdb::Result;
+    /// # use questdb::ingress::{Buffer, ColumnName};
+    /// # use ndarray::Array3;
+    /// # fn main() -> Result<()> {
+    /// # let mut buffer = Buffer::new();
+    /// # buffer.table("x1")?;
+    /// // Record a 3D array of f64 values
+    /// let array_3d = Array3::from_elem((2, 3, 4), 42f64);
+    /// let col_name = ColumnName::new("col1")?;
+    /// buffer.column_arr(col_name, &array_3d.view())?;
+    /// # Ok(())
+    /// # }
+    /// # }
+    /// ```
+    /// # Errors
+    ///
+    /// Returns [`Error`] if:
+    /// - Array dimensions exceed [`MAX_DIMS`]
+    /// - Failed to get dimension sizes
+    /// - Memory allocation fails for array data
+    /// - Column name validation fails
+    pub fn column_arr<'a, N, T, D>(&mut self, name: N, view: &T) -> Result<&mut Self>
+    where
+        N: TryInto<ColumnName<'a>>,
+        T: NdArrayView<D>,
+        D: ArrayElement,
+        Error: From<N::Error>,
+    {
+        self.write_column_key(name)?;
+
+        // check dimension less equal than max dims
+        if MAX_DIMS < view.ndim() {
+            return Err(error::fmt!(
+                ArrayHasTooManyDims,
+                "Array dimension mismatch: expected at most {} dimensions, but got {}",
+                MAX_DIMS,
+                view.ndim()
+            ));
+        }
+
+        // binary format flag '='
+        self.output.push(b'=');
+        // binary format entity type
+        self.output.push(ARRAY_BINARY_FORMAT_TYPE);
+        // ndarr dims
+        self.output.push(view.ndim() as u8);
+        // ndarr shapes
+        self.output.push(D::elem_type().into());
+
+        let mut reserve_size = size_of::<D>();
+        for i in 0..view.ndim() {
+            let d = view.dim(i).ok_or_else(|| {
+                error::fmt!(ArrayViewError, "Can not get correct dimensions for dim {}", i)
+            })?;
+
+            self.output
+                .extend_from_slice((d as i32).to_le_bytes().as_slice());
+            reserve_size = reserve_size
+                .checked_mul(d)
+                .ok_or(error::fmt!(ArrayViewError, "Array total elem size overflow"))?
+        }
+
+        let index = self.output.len();
+        let reserve_size = reserve_size
+            .checked_add(index)
+            .ok_or(error::fmt!(ArrayViewError, "Array total elem size overflow"))?;
+        self.output
+            .try_reserve(reserve_size)
+            .map_err(|_| error::fmt!(BufferOutOfMemory, "Buffer out of memory"))?;
+        unsafe { self.output.set_len(reserve_size) }
+        view.write_row_major_buf(&mut self.output[index..]);
         Ok(self)
     }
 
@@ -2680,6 +2787,8 @@ impl Sender {
     }
 }
 
+const ARRAY_BINARY_FORMAT_TYPE: u8 = 14;
+
 mod conf;
 mod timestamp;
 
@@ -2689,6 +2798,6 @@ mod http;
 #[cfg(feature = "ilp-over-http")]
 use http::*;
 
+mod ndarr;
 #[cfg(test)]
 mod tests;
-mod ndarr;

@@ -48,6 +48,15 @@ pub enum ErrorCode {
 
     /// Bad configuration.
     ConfigError,
+
+    /// Array has too many dims
+    ArrayHasTooManyDims,
+
+    /// Array error
+    ArrayViewError,
+
+    /// Buffer outOfMemory
+    BufferOutOfMemory,
 }
 
 /// An error that occurred when using QuestDB client library.
