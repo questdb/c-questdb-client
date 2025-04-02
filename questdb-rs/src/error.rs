@@ -49,13 +49,13 @@ pub enum ErrorCode {
     /// Bad configuration.
     ConfigError,
 
-    /// Array has too many dims
+    /// Array has too many dims. Currently, only arrays with a maximum [`crate::ingress::ndarr::MAX_DIMS`] dimensions are supported.
     ArrayHasTooManyDims,
 
-    /// Array error
+    /// Array view internal error.
     ArrayViewError,
 
-    /// Buffer outOfMemory
+    /// Buffer outOfMemory.
     BufferOutOfMemory,
 }
 
