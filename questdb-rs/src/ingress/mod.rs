@@ -498,6 +498,7 @@ impl BufferState {
 ///       [`column_i64`](Buffer::column_i64),
 ///       [`column_f64`](Buffer::column_f64),
 ///       [`column_str`](Buffer::column_str),
+///       [`column_arr`](Buffer::column_arr),
 ///       [`column_ts`](Buffer::column_ts)).
 ///   * Symbols must appear before columns.
 ///   * A row must be terminated with either [`at`](Buffer::at) or
@@ -516,6 +517,7 @@ impl BufferState {
 /// | [`column_i64`](Buffer::column_i64) | [`INTEGER`](https://questdb.io/docs/reference/api/ilp/columnset-types#integer) |
 /// | [`column_f64`](Buffer::column_f64) | [`FLOAT`](https://questdb.io/docs/reference/api/ilp/columnset-types#float) |
 /// | [`column_str`](Buffer::column_str) | [`STRING`](https://questdb.io/docs/reference/api/ilp/columnset-types#string) |
+/// | [`column_arr`](Buffer::column_arr) | [`ARRAY`](https://questdb.io/docs/reference/api/ilp/columnset-types#array) |
 /// | [`column_ts`](Buffer::column_ts) | [`TIMESTAMP`](https://questdb.io/docs/reference/api/ilp/columnset-types#timestamp) |
 ///
 /// QuestDB supports both `STRING` and `SYMBOL` column types.
@@ -1070,10 +1072,10 @@ impl Buffer {
         self.output.push(b'=');
         // binary format entity type
         self.output.push(ARRAY_BINARY_FORMAT_TYPE);
-        // ndarr dims
-        self.output.push(view.ndim() as u8);
         // ndarr datatype
         self.output.push(D::elem_type().into());
+        // ndarr dims
+        self.output.push(view.ndim() as u8);
 
         let mut reserve_size = size_of::<D>();
         for i in 0..view.ndim() {
