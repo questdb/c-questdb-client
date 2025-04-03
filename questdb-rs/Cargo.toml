@@ -75,7 +75,7 @@ chrono_timestamp = ["chrono"]
 
 [[example]]
 name = "basic"
-required-features = ["chrono_timestamp"]
+required-features = ["chrono_timestamp", "ndarray"]
 
 [[example]]
 name = "auth"
@@ -87,4 +87,4 @@ required-features = ["chrono_timestamp"]
 
 [[example]]
 name = "http"
-required-features = ["ilp-over-http"]
+required-features = ["ilp-over-http", "ndarray"]

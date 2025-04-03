@@ -23,6 +23,7 @@
  ******************************************************************************/
 
 use crate::{
+    ingress,
     ingress::{
         Buffer, CertificateAuthority, Sender, TableName, Timestamp, TimestampMicros, TimestampNanos,
     },
@@ -34,9 +35,12 @@ use crate::tests::{
     TestResult,
 };
 
+#[cfg(feature = "ndarray")]
+use crate::ingress::ndarr::{ElemDataType, NdArrayView};
 use core::time::Duration;
 #[cfg(feature = "ndarray")]
-use ndarray::arr1;
+use ndarray::{arr1, arr2, ArrayD};
+
 use std::{io, time::SystemTime};
 
 #[test]
@@ -79,8 +83,79 @@ fn test_basics() -> TestResult {
     sender.flush(&mut buffer)?;
     assert_eq!(buffer.len(), 0);
     assert_eq!(buffer.as_bytes(), b"");
-    assert_eq!(server.recv_q()?, 1);
-    assert_eq!(server.msgs[0].as_bytes(), exp_byte);
+    assert_eq!(server.recv_q()?, exp_byte.len());
+    assert_eq!(server.msgs, exp_byte);
+    Ok(())
+}
+
+#[cfg(feature = "ndarray")]
+#[test]
+fn test_array_basic() -> TestResult {
+    let mut server = MockServer::new()?;
+    let mut sender = server.lsb_tcp().build()?;
+    server.accept()?;
+
+    let ts = SystemTime::now();
+    let ts_nanos_num = ts.duration_since(SystemTime::UNIX_EPOCH)?.as_nanos() as i64;
+    let ts_nanos = TimestampNanos::from_systemtime(ts)?;
+    let array_2d = arr2(&[[1.1, 2.2], [3.3, 4.4]]);
+    let array_3d = ArrayD::<f64>::ones(vec![2, 3, 4]);
+
+    let mut buffer = Buffer::new();
+    buffer
+        .table("my_table")?
+        .symbol("device", "A001")?
+        .column_f64("f1", 25.5)?
+        .column_arr("arr2d", &array_2d.view())?
+        .column_arr("arr3d", &array_3d.view())?
+        .at(ts_nanos)?;
+
+    assert_eq!(server.recv_q()?, 0);
+
+    let array_header2d = &[
+        &[b'='][..],
+        &[ingress::ARRAY_BINARY_FORMAT_TYPE],
+        &[ElemDataType::Double as u8],
+        &[2u8],
+        &2i32.to_le_bytes(),
+        &2i32.to_le_bytes(),
+    ]
+    .concat();
+    let mut array_data2d = vec![0u8; 4 * size_of::<f64>()];
+    array_2d.view().write_row_major_buf(&mut array_data2d);
+
+    let array_header3d = &[
+        &[b'='][..],
+        &[ingress::ARRAY_BINARY_FORMAT_TYPE],
+        &[ElemDataType::Double as u8],
+        &[3u8],
+        &2i32.to_le_bytes(),
+        &3i32.to_le_bytes(),
+        &4i32.to_le_bytes(),
+    ]
+    .concat();
+    let mut array_data3d = vec![0u8; 24 * size_of::<f64>()];
+    array_3d.view().write_row_major_buf(&mut array_data3d);
+
+    let exp = &[
+        "my_table,device=A001 f1=25.5".as_bytes(),
+        ",arr2d=".as_bytes(),
+        array_header2d,
+        array_data2d.as_slice(),
+        ",arr3d=".as_bytes(),
+        array_header3d,
+        array_data3d.as_slice(),
+        format!(" {}\n", ts_nanos_num).as_bytes(),
+    ]
+    .concat();
+
+    assert_eq!(buffer.as_bytes(), exp);
+    assert_eq!(buffer.len(), exp.len());
+    sender.flush(&mut buffer)?;
+    assert_eq!(buffer.len(), 0);
+    assert_eq!(buffer.as_bytes(), b"");
+    assert_eq!(server.recv_q()?, exp.len());
+    assert_eq!(server.msgs.as_slice(), exp);
     Ok(())
 }
 
@@ -354,6 +429,7 @@ fn test_str_column_name_too_long() -> TestResult {
 }
 
 #[cfg(feature = "ndarray")]
+#[test]
 fn test_arr_column_name_too_long() -> TestResult {
     column_name_too_long_test_impl!(column_arr, &arr1(&[1.0, 2.0, 3.0]).view())
 }
@@ -381,8 +457,8 @@ fn test_tls_with_file_ca() -> TestResult {
     assert_eq!(buffer.as_bytes(), exp);
     assert_eq!(buffer.len(), exp.len());
     sender.flush(&mut buffer)?;
-    assert_eq!(server.recv_q()?, 1);
-    assert_eq!(server.msgs[0].as_bytes(), exp);
+    assert_eq!(server.recv_q()?, exp.len());
+    assert_eq!(server.msgs.as_slice(), exp);
     Ok(())
 }
 
@@ -474,8 +550,8 @@ fn test_tls_insecure_skip_verify() -> TestResult {
     assert_eq!(buffer.as_bytes(), exp);
     assert_eq!(buffer.len(), exp.len());
     sender.flush(&mut buffer)?;
-    assert_eq!(server.recv_q()?, 1);
-    assert_eq!(server.msgs[0].as_bytes(), exp);
+    assert_eq!(server.recv_q()?, exp.len());
+    assert_eq!(server.msgs.as_slice(), exp);
     Ok(())
 }
 

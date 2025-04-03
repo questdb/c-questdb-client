@@ -50,7 +50,7 @@ pub struct MockServer {
     tls_conn: Option<ServerConnection>,
     pub host: &'static str,
     pub port: u16,
-    pub msgs: Vec<String>,
+    pub msgs: Vec<u8>,
 }
 
 pub fn certs_dir() -> std::path::PathBuf {
@@ -519,20 +519,8 @@ impl MockServer {
             }
         }
 
-        let mut received_count = 0usize;
-        let mut head = 0usize;
-        for index in 1..accum.len() {
-            let last = accum[index];
-            let prev = accum[index - 1];
-            if (last == b'\n') && (prev != b'\\') {
-                let tail = index + 1;
-                let msg = std::str::from_utf8(&accum[head..tail]).unwrap();
-                self.msgs.push(msg.to_owned());
-                head = tail;
-                received_count += 1;
-            }
-        }
-        Ok(received_count)
+        self.msgs = accum;
+        Ok(self.msgs.len())
     }
 
     pub fn recv_q(&mut self) -> io::Result<usize> {

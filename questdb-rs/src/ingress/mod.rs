@@ -1080,26 +1080,32 @@ impl Buffer {
         let mut reserve_size = size_of::<D>();
         for i in 0..view.ndim() {
             let d = view.dim(i).ok_or_else(|| {
-                error::fmt!(ArrayViewError, "Can not get correct dimensions for dim {}", i)
+                error::fmt!(
+                    ArrayViewError,
+                    "Can not get correct dimensions for dim {}",
+                    i
+                )
             })?;
 
             // ndarr shapes
             self.output
                 .extend_from_slice((d as i32).to_le_bytes().as_slice());
-            reserve_size = reserve_size
-                .checked_mul(d)
-                .ok_or(error::fmt!(ArrayViewError, "Array total elem size overflow"))?
+            reserve_size = reserve_size.checked_mul(d).ok_or(error::fmt!(
+                ArrayViewError,
+                "Array total elem size overflow"
+            ))?
         }
 
         let index = self.output.len();
-        let reserve_size = reserve_size
-            .checked_add(index)
-            .ok_or(error::fmt!(ArrayViewError, "Array total elem size overflow"))?;
+        let reserve_size = reserve_size.checked_add(index).ok_or(error::fmt!(
+            ArrayViewError,
+            "Array total elem size overflow"
+        ))?;
         self.output
             .try_reserve(reserve_size)
             .map_err(|_| error::fmt!(BufferOutOfMemory, "Buffer out of memory"))?;
         unsafe { self.output.set_len(reserve_size) }
-        
+
         // ndarr data
         view.write_row_major_buf(&mut self.output[index..]);
         Ok(self)
@@ -2792,7 +2798,7 @@ impl Sender {
     }
 }
 
-const ARRAY_BINARY_FORMAT_TYPE: u8 = 14;
+pub(crate) const ARRAY_BINARY_FORMAT_TYPE: u8 = 14;
 
 mod conf;
 mod timestamp;
