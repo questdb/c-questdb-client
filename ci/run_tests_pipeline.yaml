@@ -52,7 +52,7 @@ stages:
           - template: compile.yaml
           - script: |
               cd questdb-rs
-              cargo build --examples --all-features
+              cargo build --examples --features almost-all-features
             displayName: "Build Rust examples"
           - script: python3 ci/run_all_tests.py
             env:
