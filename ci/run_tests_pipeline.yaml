@@ -80,7 +80,7 @@ stages:
             displayName: "questdb-rs: fmt"
           - script: |
               cd questdb-rs
-              cargo clippy --all-targets --all-features -- -D warnings
+              cargo clippy --all-targets --features almost-all-features -- -D warnings
             displayName: "questdb-rs: clippy"
           - script: |
               cd questdb-rs-ffi

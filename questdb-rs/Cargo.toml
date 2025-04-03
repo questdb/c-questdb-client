@@ -80,6 +80,19 @@ json_tests = []
 # Enable methods to create timestamp objects from chrono::DateTime objects.
 chrono_timestamp = ["chrono"]
 
+# The `aws-lc-crypto` and `ring-crypto` features are mutually exclusive,
+# thus compiling with `--all-features` will not work.
+# Instead compile with `--features almost-all-features`.
+# This is useful for quickly running `cargo test` or `cargo clippy`.
+almost-all-features = [
+    "tls-webpki-certs",
+    "ilp-over-http",
+    "aws-lc-crypto",
+    "insecure-skip-verify",
+    "json_tests",
+    "chrono_timestamp"
+]
+
 [[example]]
 name = "basic"
 required-features = ["chrono_timestamp"]

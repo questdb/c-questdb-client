@@ -49,7 +49,7 @@ def main():
             '--', '--nocapture', cwd='questdb-rs')
     run_cmd('cargo', 'test', '--no-default-features', '--features=ring-crypto,tls-native-certs,ilp-over-http',
             '--', '--nocapture', cwd='questdb-rs')
-    run_cmd('cargo', 'test', '--features=insecure-skip-verify,json_tests,chrono_timestamp',
+    run_cmd('cargo', 'test', '--features=almost-all-features',
             '--', '--nocapture', cwd='questdb-rs')
     run_cmd(str(test_line_sender_path))
     run_cmd(str(test_line_sender_path_CXX20))
