@@ -29,6 +29,9 @@ mod http;
 mod mock;
 mod sender;
 
+#[cfg(feature = "ndarray")]
+mod ndarr;
+
 #[cfg(feature = "json_tests")]
 mod json_tests {
     include!(concat!(env!("OUT_DIR"), "/json_tests.rs"));

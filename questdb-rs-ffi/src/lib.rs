@@ -24,7 +24,7 @@
 
 #![allow(non_camel_case_types, clippy::missing_safety_doc)]
 
-use libc::{c_char, size_t};
+use libc::{c_char, c_uint, size_t};
 use std::ascii;
 use std::boxed::Box;
 use std::convert::{From, Into};
@@ -35,8 +35,8 @@ use std::str;
 
 use questdb::{
     ingress::{
-        Buffer, CertificateAuthority, ColumnName, Protocol, Sender, SenderBuilder, TableName,
-        TimestampMicros, TimestampNanos,
+        ArrayElement, Buffer, CertificateAuthority, ColumnName, NdArrayView, Protocol, Sender,
+        SenderBuilder, TableName, TimestampMicros, TimestampNanos,
     },
     Error, ErrorCode,
 };
@@ -135,6 +135,15 @@ pub enum line_sender_error_code {
 
     /// Bad configuration.
     line_sender_error_config_error,
+
+    /// Currently, only arrays with a maximum 32 dimensions are supported.
+    line_sender_error_array_large_dim,
+
+    /// ArrayView internal error, such as failure to get the size of a valid dimension.
+    line_sender_error_array_view_internal_error,
+
+    /// Buffer Out Of Memory
+    line_sender_error_buffer_out_of_memory,
 }
 
 impl From<ErrorCode> for line_sender_error_code {
@@ -159,6 +168,15 @@ impl From<ErrorCode> for line_sender_error_code {
                 line_sender_error_code::line_sender_error_server_flush_error
             }
             ErrorCode::ConfigError => line_sender_error_code::line_sender_error_config_error,
+            ErrorCode::ArrayHasTooManyDims => {
+                line_sender_error_code::line_sender_error_array_large_dim
+            }
+            ErrorCode::ArrayViewError => {
+                line_sender_error_code::line_sender_error_array_view_internal_error
+            }
+            ErrorCode::BufferOutOfMemory => {
+                line_sender_error_code::line_sender_error_buffer_out_of_memory
+            }
         }
     }
 }
@@ -288,6 +306,52 @@ pub struct line_sender_utf8 {
 impl line_sender_utf8 {
     fn as_str(&self) -> &str {
         unsafe { str::from_utf8_unchecked(slice::from_raw_parts(self.buf as *const u8, self.len)) }
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+struct line_sender_array {
+    dims: size_t,
+    shapes: *const u32,
+    buf_len: size_t,
+    buf: *const u8,
+}
+
+impl<T> NdArrayView<T> for line_sender_array
+where
+    T: ArrayElement,
+{
+    fn ndim(&self) -> usize {
+        self.dims
+    }
+
+    fn dim(&self, index: usize) -> Option<usize> {
+        if index >= self.dims {
+            return None;
+        }
+
+        unsafe {
+            if self.shapes.is_null() {
+                return None;
+            }
+
+            let dim_size = *self.shapes.add(index);
+            Some(dim_size as usize)
+        }
+    }
+
+    fn write_row_major_buf(&self, buff: &mut [u8]) {
+        let elem_size = size_of::<T>();
+        let total_elements: usize = (0..self.dims)
+            .filter_map(|i| <line_sender_array as NdArrayView<T>>::dim(self, i))
+            .product();
+        assert_eq!(
+            self.buf_len,
+            total_elements * elem_size,
+            "Buffer length mismatch"
+        );
+        let bytes = unsafe { slice::from_raw_parts(self.buf, self.buf_len) };
+        buff[..self.buf_len].copy_from_slice(bytes);
     }
 }
 
@@ -801,6 +865,43 @@ pub unsafe extern "C" fn line_sender_buffer_column_str(
     let name = name.as_name();
     let value = value.as_str();
     bubble_err_to_c!(err_out, buffer.column_str(name, value));
+    true
+}
+
+/// Record a float multidimensional array value for the given column.
+/// @param[in] buffer Line buffer object.
+/// @param[in] name Column name.
+/// @param[in] rank Array dims.
+/// @param[in] shape Array shapes.
+/// @param[in] data_buffer Array data memory ptr.
+/// @param[in] data_buffer_len Array data memory length.
+/// @param[out] err_out Set on error.
+/// # Safety
+/// - All pointer parameters must be valid and non-null
+/// - shape must point to an array of `rank` integers
+/// - data_buffer must point to a buffer of size `data_buffer_len` bytes
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_buffer_column_f64_arr(
+    buffer: *mut line_sender_buffer,
+    name: line_sender_column_name,
+    rank: size_t,
+    shape: *const c_uint,    // C array of dimension sizes
+    data_buffer: *const u8,  // Raw array data
+    data_buffer_len: size_t, // Total bytes length
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    let buffer = unwrap_buffer_mut(buffer);
+    let name = name.as_name();
+    let view = line_sender_array {
+        dims: rank,
+        shapes: shape,
+        buf_len: data_buffer_len,
+        buf: data_buffer,
+    };
+    bubble_err_to_c!(
+        err_out,
+        buffer.column_arr::<ColumnName<'_>, line_sender_array, f64>(name, &view)
+    );
     true
 }
 
