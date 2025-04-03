@@ -2800,8 +2800,8 @@ impl Sender {
 pub(crate) const ARRAY_BINARY_FORMAT_TYPE: u8 = 14;
 
 mod conf;
-mod timestamp;
 pub(crate) mod ndarr;
+mod timestamp;
 
 #[cfg(feature = "ilp-over-http")]
 mod http;
