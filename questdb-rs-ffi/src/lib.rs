@@ -168,9 +168,15 @@ impl From<ErrorCode> for line_sender_error_code {
                 line_sender_error_code::line_sender_error_server_flush_error
             }
             ErrorCode::ConfigError => line_sender_error_code::line_sender_error_config_error,
-            ErrorCode::ArrayHasTooManyDims => line_sender_error_code::line_sender_error_array_large_dim,
-            ErrorCode::ArrayViewError => line_sender_error_code::line_sender_error_array_view_internal_error,
-            ErrorCode::BufferOutOfMemory => line_sender_error_code::line_sender_error_buffer_out_of_memory,
+            ErrorCode::ArrayHasTooManyDims => {
+                line_sender_error_code::line_sender_error_array_large_dim
+            }
+            ErrorCode::ArrayViewError => {
+                line_sender_error_code::line_sender_error_array_view_internal_error
+            }
+            ErrorCode::BufferOutOfMemory => {
+                line_sender_error_code::line_sender_error_buffer_out_of_memory
+            }
         }
     }
 }
