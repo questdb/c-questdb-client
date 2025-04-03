@@ -25,9 +25,10 @@ base64ct = { version = "1.7", features = ["alloc"] }
 rustls-pemfile = "2.0.0"
 ryu = "1.0"
 itoa = "1.0"
-aws-lc-rs = "1.13"
+aws-lc-rs = { version = "1.13", optional = true }
+ring = { version = "0.17.14", optional = true }
 rustls-pki-types = "1.0.1"
-rustls = { version = "0.23.25" }
+rustls = { version = "0.23.25", default-features = false, features = ["logging", "std", "tls12"] }
 rustls-native-certs = { version = "0.8.1", optional = true }
 webpki-roots = { version = "0.26.8", default-features = false, optional = true }
 chrono = { version = "0.4.40", optional = true }
@@ -53,7 +54,7 @@ tempfile = "3"
 webpki-roots = "0.26.8"
 
 [features]
-default = ["tls-webpki-certs", "ilp-over-http"]
+default = ["tls-webpki-certs", "ilp-over-http", "aws-lc-crypto"]
 
 # Include support for ILP over HTTP.
 ilp-over-http = ["dep:ureq", "dep:serde_json", "dep:rand"]
@@ -63,6 +64,12 @@ tls-native-certs = ["dep:rustls-native-certs"]
 
 # Allow use of the `webpki-roots` crate to validate TLS certificates.
 tls-webpki-certs = ["dep:webpki-roots"]
+
+# Use `aws-lc-rs` as the cryto library.
+aws-lc-crypto = ["dep:aws-lc-rs", "rustls/aws-lc-rs"]
+
+# Use `ring` as the crypto library.
+ring-crypto = ["dep:ring", "rustls/ring"]
 
 # Allow skipping verification of insecure certificates.
 insecure-skip-verify = []

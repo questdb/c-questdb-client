@@ -113,7 +113,7 @@ impl HttpHandlerState {
 
 #[derive(Debug)]
 pub struct TlsConnector {
-    config: Option<Arc<rustls::ClientConfig>>,
+    tls_config: Option<Arc<rustls::ClientConfig>>,
 }
 
 impl<In: Transport> Connector<In> for TlsConnector {
@@ -134,7 +134,7 @@ impl<In: Transport> Connector<In> for TlsConnector {
             return Ok(Some(transport::Either::A(transport)));
         }
 
-        match self.config.as_ref() {
+        match self.tls_config.as_ref() {
             Some(config) => {
                 let name_borrowed: ServerName<'_> = details
                     .uri
@@ -165,8 +165,8 @@ impl<In: Transport> Connector<In> for TlsConnector {
 }
 
 impl TlsConnector {
-    pub(crate) fn new(protocol: Option<Arc<rustls::ClientConfig>>) -> Self {
-        TlsConnector { config: protocol }
+    pub fn new(tls_config: Option<Arc<rustls::ClientConfig>>) -> Self {
+        TlsConnector { tls_config }
     }
 }
 

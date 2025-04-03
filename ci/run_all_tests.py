@@ -45,11 +45,11 @@ def main():
 
     run_cmd('cargo', 'test',
             '--', '--nocapture', cwd='questdb-rs')
-    run_cmd('cargo', 'test', '--no-default-features', '--features=tls-native-certs',
+    run_cmd('cargo', 'test', '--no-default-features', '--features=aws-lc-crypto,tls-native-certs',
             '--', '--nocapture', cwd='questdb-rs')
-    run_cmd('cargo', 'test', '--no-default-features', '--features=tls-native-certs,ilp-over-http',
+    run_cmd('cargo', 'test', '--no-default-features', '--features=ring-crypto,tls-native-certs,ilp-over-http',
             '--', '--nocapture', cwd='questdb-rs')
-    run_cmd('cargo', 'test', '--all-features',
+    run_cmd('cargo', 'test', '--features=insecure-skip-verify,json_tests,chrono_timestamp',
             '--', '--nocapture', cwd='questdb-rs')
     run_cmd(str(test_line_sender_path))
     run_cmd(str(test_line_sender_path_CXX20))

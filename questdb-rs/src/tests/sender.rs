@@ -173,11 +173,17 @@ fn test_auth_bad_base64_private_key() -> TestResult {
 
 #[test]
 fn test_auth_private_key_too_long() -> TestResult {
+    #[cfg(feature = "aws-lc-crypto")]    
+    let expected = "Misconfigured ILP authentication keys: InvalidEncoding. Hint: Check the keys for a possible typo.";
+
+    #[cfg(feature = "ring-crypto")]
+    let expected = "Misconfigured ILP authentication keys: InvalidComponent. Hint: Check the keys for a possible typo.";
+
     test_bad_key(
         "ZkxLWUVhb0ViOWxybjNua3dMREEtTV94bnVGT2RTdDl5MFo3X3ZXU0hMVWZMS1lFYW9FYjlscm4zbmt3TERBLU1feG51Rk9kU3Q5eTBaN192V1NITFU",
         "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU", // x
         "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac", // y
-        "Misconfigured ILP authentication keys: InvalidEncoding. Hint: Check the keys for a possible typo."
+        expected
     )
 }
 

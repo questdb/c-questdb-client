@@ -24,17 +24,16 @@
 
 #![doc = include_str!("mod.md")]
 
-#[cfg(not(any(feature = "tls-webpki-certs", feature = "tls-native-certs")))]
-compile_error!(
-    "At least one of `tls-webpki-certs` or `tls-native-certs` features must be enabled."
-);
-
 pub use self::timestamp::*;
 
 use crate::error::{self, Error, Result};
 use crate::gai;
 use crate::ingress::conf::ConfigSetting;
+use base64ct::{Base64, Base64UrlUnpadded, Encoding};
 use core::time::Duration;
+use rustls::{ClientConnection, RootCertStore, StreamOwned};
+use rustls_pki_types::ServerName;
+use socket2::{Domain, Protocol as SockProtocol, SockAddr, Socket, Type};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fmt::{Debug, Display, Formatter, Write};
@@ -44,12 +43,17 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use aws_lc_rs::rand::SystemRandom;
-use aws_lc_rs::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
-use base64ct::{Base64, Base64UrlUnpadded, Encoding};
-use rustls::{ClientConnection, RootCertStore, StreamOwned};
-use rustls_pki_types::ServerName;
-use socket2::{Domain, Protocol as SockProtocol, SockAddr, Socket, Type};
+#[cfg(feature = "aws-lc-crypto")]
+use aws_lc_rs::{
+    rand::SystemRandom,
+    signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING},
+};
+
+#[cfg(feature = "ring-crypto")]
+use ring::{
+    rand::SystemRandom,
+    signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING},
+};
 
 #[derive(Debug, Copy, Clone)]
 enum Op {
@@ -1312,6 +1316,14 @@ mod danger {
             Ok(HandshakeSignatureValid::assertion())
         }
 
+        #[cfg(feature = "aws-lc-crypto")]
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            rustls::crypto::aws_lc_rs::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+
+        #[cfg(feature = "ring-crypto")]
         fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
             rustls::crypto::aws_lc_rs::default_provider()
                 .signature_verification_algorithms
@@ -2460,12 +2472,26 @@ fn parse_public_key(pub_key_x: &str, pub_key_y: &str) -> Result<Vec<u8>> {
 fn parse_key_pair(auth: &EcdsaAuthParams) -> Result<EcdsaKeyPair> {
     let private_key = b64_decode("private authentication key", auth.priv_key.as_str())?;
     let public_key = parse_public_key(auth.pub_key_x.as_str(), auth.pub_key_y.as_str())?;
-    EcdsaKeyPair::from_private_key_and_public_key(
+
+    #[cfg(feature = "aws-lc-crypto")]
+    let res = EcdsaKeyPair::from_private_key_and_public_key(
         &ECDSA_P256_SHA256_FIXED_SIGNING,
         &private_key[..],
         &public_key[..],
-    )
-    .map_err(|key_rejected| {
+    );
+
+    #[cfg(feature = "ring-crypto")]
+    let res = {
+        let system_random = SystemRandom::new();
+        EcdsaKeyPair::from_private_key_and_public_key(
+            &ECDSA_P256_SHA256_FIXED_SIGNING,
+            &private_key[..],
+            &public_key[..],
+            &system_random,
+        )
+    };
+
+    res.map_err(|key_rejected| {
         error::fmt!(
             AuthError,
             "Misconfigured ILP authentication keys: {}. Hint: Check the keys for a possible typo.",
