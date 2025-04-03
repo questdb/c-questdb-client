@@ -482,7 +482,7 @@ bool line_sender_buffer_column_f64_arr(
     line_sender_buffer* buffer,
     line_sender_column_name name,
     size_t rank,
-    const int32_t* shapes,
+    const uint32_t* shapes,
     const uint8_t* data_buffer,
     size_t data_buffer_len,
     line_sender_error** err_out);

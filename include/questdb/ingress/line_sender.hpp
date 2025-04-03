@@ -26,6 +26,7 @@
 
 #include "line_sender.h"
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -621,6 +622,39 @@ public:
         may_init();
         line_sender_error::wrapped_call(
             ::line_sender_buffer_column_f64, _impl, name._impl, value);
+        return *this;
+    }
+
+    /**
+     * Record a multidimensional double-precision array for the given column.
+     *
+     * @param name    Column name.
+     * @param shape   Array dimensions (e.g., [2,3] for a 2x3 matrix).
+     * @param data    Array data in row-major order. Size must match product of
+     * dimensions.
+     *
+     * @note Data is stored contiguously in row-major (C-style) order.
+     *       Example: shape [2,3] expects 6 elements ordered as:
+     *       [a11, a12, a13, a21, a22, a23]
+     */
+    template <typename T, size_t N>
+    line_sender_buffer& column(
+        column_name_view name,
+        const std::vector<uint32_t>& shape,
+        const std::array<T, N>& data)
+    {
+        static_assert(
+            std::is_same_v<T, double>,
+            "Only double types are supported for arrays");
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_f64_arr,
+            _impl,
+            name._impl,
+            shape.size(),
+            shape.data(),
+            reinterpret_cast<const uint8_t*>(data.data()),
+            sizeof(double) * N);
         return *this;
     }
 

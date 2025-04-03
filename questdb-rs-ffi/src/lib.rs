@@ -24,7 +24,7 @@
 
 #![allow(non_camel_case_types, clippy::missing_safety_doc)]
 
-use libc::{c_char, c_int, size_t};
+use libc::{c_char, c_uint, size_t};
 use std::ascii;
 use std::boxed::Box;
 use std::convert::{From, Into};
@@ -312,7 +312,7 @@ impl line_sender_utf8 {
 #[derive(Debug, Copy, Clone)]
 struct line_sender_array {
     dims: size_t,
-    shapes: *const i32,
+    shapes: *const u32,
     buf_len: size_t,
     buf: *const u8,
 }
@@ -336,11 +336,7 @@ where
             }
 
             let dim_size = *self.shapes.add(index);
-            if dim_size < 0 {
-                None
-            } else {
-                Some(dim_size as usize)
-            }
+            Some(dim_size as usize)
         }
     }
 
@@ -889,7 +885,7 @@ pub unsafe extern "C" fn line_sender_buffer_column_f64_arr(
     buffer: *mut line_sender_buffer,
     name: line_sender_column_name,
     rank: size_t,
-    shape: *const c_int,     // C array of dimension sizes
+    shape: *const c_uint,     // C array of dimension sizes
     data_buffer: *const u8,  // Raw array data
     data_buffer_len: size_t, // Total bytes length
     err_out: *mut *mut line_sender_error,
