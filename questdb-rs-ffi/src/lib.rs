@@ -885,7 +885,7 @@ pub unsafe extern "C" fn line_sender_buffer_column_f64_arr(
     buffer: *mut line_sender_buffer,
     name: line_sender_column_name,
     rank: size_t,
-    shape: *const c_uint,     // C array of dimension sizes
+    shape: *const c_uint,    // C array of dimension sizes
     data_buffer: *const u8,  // Raw array data
     data_buffer_len: size_t, // Total bytes length
     err_out: *mut *mut line_sender_error,
