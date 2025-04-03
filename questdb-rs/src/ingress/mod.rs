@@ -24,8 +24,8 @@
 
 #![doc = include_str!("mod.md")]
 
+pub use self::ndarr::*;
 pub use self::timestamp::*;
-
 use crate::error::{self, Error, Result};
 use crate::gai;
 use crate::ingress::conf::ConfigSetting;
@@ -39,7 +39,6 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use crate::ingress::ndarr::{ArrayElement, NdArrayView, MAX_DIMS};
 use base64ct::{Base64, Base64UrlUnpadded, Encoding};
 use ring::rand::SystemRandom;
 use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
@@ -2802,6 +2801,7 @@ pub(crate) const ARRAY_BINARY_FORMAT_TYPE: u8 = 14;
 
 mod conf;
 mod timestamp;
+pub(crate) mod ndarr;
 
 #[cfg(feature = "ilp-over-http")]
 mod http;
@@ -2809,6 +2809,5 @@ mod http;
 #[cfg(feature = "ilp-over-http")]
 use http::*;
 
-pub(crate) mod ndarr;
 #[cfg(test)]
 mod tests;
