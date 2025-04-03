@@ -216,38 +216,27 @@ impl Transport for TlsTransport {
     }
 }
 
-pub(super) fn need_retry(res: Result<http::status::StatusCode, &ureq::Error>) -> bool {
+fn need_retry(res: Result<http::status::StatusCode, &ureq::Error>) -> bool {
     match res {
         Ok(status) => {
             status.is_server_error()
                 && matches!(
                     status.as_u16(),
-                    500 | 503 | 504 | 507 | 509 | 523 | 524 | 529 | 599
+                    // Official HTTP codes
+                    500 | // Internal Server Error
+                    503 | // Service Unavailable
+                    504 | // Gateway Timeout
+
+                    // Unofficial extensions
+                    507 | // Insufficient Storage
+                    509 | // Bandwidth Limit Exceeded
+                    523 | // Origin is Unreachable
+                    524 | // A Timeout Occurred
+                    529 | // Site is overloaded
+                    599 // Network Connect Timeout Error
                 )
         }
-        Err(err) => {
-            match err {
-                Timeout(_) => true,
-                ConnectionFailed => true,
-                TooManyRedirects => true,
-
-                // Official HTTP codes
-                StatusCode(500) |  // Internal Server Error
-                StatusCode(503) |  // Service Unavailable
-                StatusCode(504) |  // Gateway Timeout
-
-                // Unofficial extensions
-                StatusCode(507) | // Insufficient Storage
-                StatusCode(509) | // Bandwidth Limit Exceeded
-                StatusCode(523) | // Origin is Unreachable
-                StatusCode(524) | // A Timeout Occurred
-                StatusCode(529) | // Site is overloaded
-                StatusCode(599) => { // Network Connect Timeout Error
-                    true
-                }
-                _ => false
-            }
-        }
+        Err(err) => matches!(err, Timeout(_) | ConnectionFailed | TooManyRedirects),
     }
 }
 
