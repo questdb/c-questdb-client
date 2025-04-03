@@ -240,7 +240,7 @@ fn need_retry(res: Result<http::status::StatusCode, &ureq::Error>) -> bool {
     }
 }
 
-pub(super) fn parse_json_error(json: &serde_json::Value, msg: &str) -> Error {
+fn parse_json_error(json: &serde_json::Value, msg: &str) -> Error {
     let mut description = msg.to_string();
     error::fmt!(ServerFlushError, "Could not flush buffer: {}", msg);
 
