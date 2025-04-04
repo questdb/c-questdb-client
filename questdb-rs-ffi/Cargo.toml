@@ -12,7 +12,7 @@ crate-type = ["cdylib", "staticlib"]
 questdb-rs = { path = "../questdb-rs", features = [
     "insecure-skip-verify", "tls-native-certs", "ilp-over-http"] }
 libc = "0.2"
-questdb-confstr-ffi = { version = "0.1.0", optional = true }
+questdb-confstr-ffi = { version = "0.1.1", optional = true }
 
 [build-dependencies]
 cbindgen = { version = "0.28.0", optional = true, default-features = false }
