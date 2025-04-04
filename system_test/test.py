@@ -8,7 +8,7 @@
 ##    \__\_\\__,_|\___||___/\__|____/|____/
 ##
 ##  Copyright (c) 2014-2019 Appsicle
-##  Copyright (c) 2019-2024 QuestDB
+##  Copyright (c) 2019-2025 QuestDB
 ##
 ##  Licensed under the Apache License, Version 2.0 (the "License");
 ##  you may not use this file except in compliance with the License.
@@ -272,7 +272,7 @@ class TestSender(unittest.TestCase):
                 self.assertIn('Could not flush buffer', str(e))
                 self.assertIn('cast error from', str(e))
                 self.assertIn('LONG', str(e))
-                self.assertIn('code: invalid, line: 2', str(e))
+                self.assertIn('error in line 2', str(e))
 
         if QDB_FIXTURE.http:
             # If HTTP, the error should cause the whole batch to be ignored.
@@ -610,7 +610,7 @@ class TestSender(unittest.TestCase):
 
         with self.assertRaisesRegex(
                 qls.SenderError,
-                r'Misconfigured ILP authentication keys: InconsistentComponents. Hint: Check the keys for a possible typo.'):
+                r'Misconfigured ILP authentication keys: .*. Hint: Check the keys for a possible typo.'):
             sender.connect()
 
     def test_malformed_auth2(self):
@@ -719,7 +719,7 @@ class TestSender(unittest.TestCase):
                 self.assertIn('Could not flush buffer', str(e))
                 self.assertIn('cast error from', str(e))
                 self.assertIn('VARCHAR', str(e))
-                self.assertIn('code: invalid, line: 3', str(e))
+                self.assertIn('error in line 3', str(e))
 
         with self.assertRaises(TimeoutError):
             retry_check_table(table_name, timeout_sec=1, log=False)

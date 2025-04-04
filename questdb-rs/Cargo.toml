@@ -21,20 +21,24 @@ crate-type = ["lib"]
 libc = "0.2"
 socket2 = "0.5.5"
 dns-lookup = "2.0.4"
-base64ct = { version = "1.6.0", features = ["alloc"] }
+base64ct = { version = "1.7", features = ["alloc"] }
 rustls-pemfile = "2.0.0"
-ryu = "1.0.15"
-itoa = "1.0.9"
-ring = "0.17.5"
+ryu = "1.0"
+itoa = "1.0"
+aws-lc-rs = { version = "1.13", optional = true }
+ring = { version = "0.17.14", optional = true }
 rustls-pki-types = "1.0.1"
-rustls = "0.22.0"
-rustls-native-certs = { version = "0.7.0", optional = true }
-webpki-roots = { version = "0.26.0", optional = true }
-chrono = { version = "0.4.30", optional = true }
-ureq = { version = "=2.9", optional = true }
-serde_json = { version = "1.0.108", optional = true }
-questdb-confstr = "0.1.0"
-rand = { version = "0.8.5", optional = true }
+rustls = { version = "0.23.25", default-features = false, features = ["logging", "std", "tls12"] }
+rustls-native-certs = { version = "0.8.1", optional = true }
+webpki-roots = { version = "0.26.8", default-features = false, optional = true }
+chrono = { version = "0.4.40", optional = true }
+
+# We need to limit the `ureq` version to 3.0.x since we use
+# the `ureq::unversioned` module which does not respect semantic versioning.
+ureq = { version = "3.0.10, <3.1.0", default-features = false, features = ["rustls-no-provider"], optional = true }
+serde_json = { version = "1", optional = true }
+questdb-confstr = "0.1.1"
+rand = { version = "0.9.0", optional = true }
 no-panic = { version = "0.1", optional = true }
 
 [target.'cfg(windows)'.dependencies]
@@ -44,15 +48,16 @@ winapi = { version = "0.3.9", features = ["ws2def"] }
 serde_json = { version = "1.0.108" }
 serde = { version = "1.0.193", features = ["derive"] }
 slugify = "0.1.0"
-indoc = "2.0.4"
+indoc = "2"
 
 [dev-dependencies]
-mio = { version = "0.8.10", features = ["os-poll", "net"] }
+mio = { version = "1", features = ["os-poll", "net"] }
 chrono = "0.4.31"
-tempfile = "3.2.0"
+tempfile = "3"
+webpki-roots = "0.26.8"
 
 [features]
-default = ["tls-webpki-certs", "ilp-over-http"]
+default = ["tls-webpki-certs", "ilp-over-http", "aws-lc-crypto"]
 
 # Include support for ILP over HTTP.
 ilp-over-http = ["dep:ureq", "dep:serde_json", "dep:rand"]
@@ -63,6 +68,12 @@ tls-native-certs = ["dep:rustls-native-certs"]
 # Allow use of the `webpki-roots` crate to validate TLS certificates.
 tls-webpki-certs = ["dep:webpki-roots"]
 
+# Use `aws-lc-rs` as the cryto library.
+aws-lc-crypto = ["dep:aws-lc-rs", "rustls/aws-lc-rs"]
+
+# Use `ring` as the crypto library.
+ring-crypto = ["dep:ring", "rustls/ring"]
+
 # Allow skipping verification of insecure certificates.
 insecure-skip-verify = []
 
@@ -71,6 +82,19 @@ json_tests = []
 
 # Enable methods to create timestamp objects from chrono::DateTime objects.
 chrono_timestamp = ["chrono"]
+
+# The `aws-lc-crypto` and `ring-crypto` features are mutually exclusive,
+# thus compiling with `--all-features` will not work.
+# Instead compile with `--features almost-all-features`.
+# This is useful for quickly running `cargo test` or `cargo clippy`.
+almost-all-features = [
+    "tls-webpki-certs",
+    "ilp-over-http",
+    "aws-lc-crypto",
+    "insecure-skip-verify",
+    "json_tests",
+    "chrono_timestamp"
+]
 
 [[example]]
 name = "basic"
