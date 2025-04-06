@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2025 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -236,9 +236,9 @@ fn test_no_connection() -> TestResult {
     assert!(res.is_err());
     let err = res.unwrap_err();
     assert_eq!(err.code(), ErrorCode::SocketError);
-    assert!(err.msg().starts_with(
-        "Could not flush buffer: http://127.0.0.1:1/write?precision=n: Connection Failed"
-    ));
+    assert!(err
+        .msg()
+        .starts_with("Could not flush buffer: http://127.0.0.1:1/write: io: Connection refused"));
     Ok(())
 }
 
@@ -441,12 +441,7 @@ fn test_request_timeout() -> TestResult {
     assert!(res.is_err());
     let err = res.unwrap_err();
     assert_eq!(err.code(), ErrorCode::SocketError);
-    // different error message on windows
-    if cfg!(windows) {
-        assert!(err.msg().contains("os error 10060"));
-    } else {
-        assert!(err.msg().contains("timed out reading response"));
-    }
+    assert!(err.msg().contains("per call"));
     assert!(time_elapsed >= request_timeout);
     Ok(())
 }

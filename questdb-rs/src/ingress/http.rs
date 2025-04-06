@@ -1,12 +1,24 @@
+use super::conf::ConfigSetting;
 use crate::{error, Error};
 use base64ct::Base64;
 use base64ct::Encoding;
 use rand::Rng;
-use std::fmt::Write;
+use rustls::{ClientConnection, StreamOwned};
+use rustls_pki_types::ServerName;
+use std::fmt;
+use std::fmt::{Debug, Write};
+use std::io::{Read, Write as IoWrite};
+use std::sync::Arc;
 use std::thread::sleep;
 use std::time::Duration;
+use ureq::http::Response;
+use ureq::unversioned::transport::{
+    Buffers, Connector, LazyBuffers, NextTimeout, Transport, TransportAdapter,
+};
 
-use super::conf::ConfigSetting;
+use ureq::unversioned::*;
+use ureq::Error::*;
+use ureq::{http, Body};
 
 #[derive(PartialEq, Debug, Clone)]
 pub(super) struct BasicAuthParams {
@@ -72,7 +84,163 @@ pub(super) struct HttpHandlerState {
     pub(super) config: HttpConfig,
 }
 
-pub(super) fn parse_json_error(json: &serde_json::Value, msg: &str) -> Error {
+impl HttpHandlerState {
+    fn send_request(
+        &self,
+        buf: &[u8],
+        request_timeout: Duration,
+    ) -> (bool, Result<Response<Body>, ureq::Error>) {
+        let request = self
+            .agent
+            .post(&self.url)
+            .config()
+            .timeout_per_call(Some(request_timeout))
+            .build()
+            .query_pairs([("precision", "n")])
+            .content_type("text/plain; charset=utf-8");
+
+        let request = match self.auth.as_ref() {
+            Some(auth) => request.header("Authorization", auth),
+            None => request,
+        };
+        let response = request.send(buf);
+        match &response {
+            Ok(res) => (need_retry(Ok(res.status())), response),
+            Err(err) => (need_retry(Err(err)), response),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct TlsConnector {
+    tls_config: Option<Arc<rustls::ClientConfig>>,
+}
+
+impl<In: Transport> Connector<In> for TlsConnector {
+    type Out = transport::Either<In, TlsTransport>;
+
+    fn connect(
+        &self,
+        details: &transport::ConnectionDetails,
+        chained: Option<In>,
+    ) -> std::result::Result<Option<Self::Out>, ureq::Error> {
+        let transport = match chained {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+
+        // Only add TLS if we are connecting via HTTPS, otherwise use chained transport as is.
+        if !details.needs_tls() {
+            return Ok(Some(transport::Either::A(transport)));
+        }
+
+        match self.tls_config.as_ref() {
+            Some(config) => {
+                let name_borrowed: ServerName<'_> = details
+                    .uri
+                    .authority()
+                    .expect("uri authority for tls")
+                    .host()
+                    .try_into()
+                    .map_err(|_e| ureq::Error::Tls("tls invalid dns name error"))?;
+
+                let name = name_borrowed.to_owned();
+                let conn = ClientConnection::new(config.clone(), name)
+                    .map_err(|_e| ureq::Error::Tls("tls client connection error"))?;
+                let stream = StreamOwned {
+                    conn,
+                    sock: TransportAdapter::new(transport.boxed()),
+                };
+                let buffers = LazyBuffers::new(
+                    details.config.input_buffer_size(),
+                    details.config.output_buffer_size(),
+                );
+
+                let transport = TlsTransport { buffers, stream };
+                Ok(Some(transport::Either::B(transport)))
+            }
+            _ => Ok(Some(transport::Either::A(transport))),
+        }
+    }
+}
+
+impl TlsConnector {
+    pub fn new(tls_config: Option<Arc<rustls::ClientConfig>>) -> Self {
+        TlsConnector { tls_config }
+    }
+}
+
+pub struct TlsTransport {
+    buffers: LazyBuffers,
+    stream: StreamOwned<ClientConnection, TransportAdapter>,
+}
+
+impl Debug for TlsTransport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TlsTransport")
+            .field("chained", &self.stream.sock.inner())
+            .finish()
+    }
+}
+
+impl Transport for TlsTransport {
+    fn buffers(&mut self) -> &mut dyn Buffers {
+        &mut self.buffers
+    }
+
+    fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), ureq::Error> {
+        self.stream.get_mut().set_timeout(timeout);
+        let output = &self.buffers.output()[..amount];
+        self.stream.write_all(output)?;
+        Ok(())
+    }
+
+    fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
+        if self.buffers.can_use_input() {
+            return Ok(true);
+        }
+
+        self.stream.get_mut().set_timeout(timeout);
+        let input = self.buffers.input_append_buf();
+        let amount = self.stream.read(input)?;
+        self.buffers.input_appended(amount);
+        Ok(amount > 0)
+    }
+
+    fn is_open(&mut self) -> bool {
+        self.stream.get_mut().get_mut().is_open()
+    }
+
+    fn is_tls(&self) -> bool {
+        true
+    }
+}
+
+fn need_retry(res: Result<http::status::StatusCode, &ureq::Error>) -> bool {
+    match res {
+        Ok(status) => {
+            status.is_server_error()
+                && matches!(
+                    status.as_u16(),
+                    // Official HTTP codes
+                    500 | // Internal Server Error
+                    503 | // Service Unavailable
+                    504 | // Gateway Timeout
+
+                    // Unofficial extensions
+                    507 | // Insufficient Storage
+                    509 | // Bandwidth Limit Exceeded
+                    523 | // Origin is Unreachable
+                    524 | // A Timeout Occurred
+                    529 | // Site is overloaded
+                    599 // Network Connect Timeout Error
+                )
+        }
+        Err(err) => matches!(err, Timeout(_) | ConnectionFailed | TooManyRedirects),
+    }
+}
+
+fn parse_json_error(json: &serde_json::Value, msg: &str) -> Error {
     let mut description = msg.to_string();
     error::fmt!(ServerFlushError, "Could not flush buffer: {}", msg);
 
@@ -113,14 +281,16 @@ pub(super) fn parse_json_error(json: &serde_json::Value, msg: &str) -> Error {
     error::fmt!(ServerFlushError, "Could not flush buffer: {}", description)
 }
 
-pub(super) fn parse_http_error(http_status_code: u16, response: ureq::Response) -> Error {
+pub(super) fn parse_http_error(http_status_code: u16, response: Response<Body>) -> Error {
+    let (head, body) = response.into_parts();
+    let body_content = body.into_with_config().lossy_utf8(true).read_to_string();
     if http_status_code == 404 {
         return error::fmt!(
             HttpNotSupported,
             "Could not flush buffer: HTTP endpoint does not support ILP."
         );
     } else if [401, 403].contains(&http_status_code) {
-        let description = match response.into_string() {
+        let description = match body_content {
             Ok(msg) if !msg.is_empty() => format!(": {}", msg),
             _ => "".to_string(),
         };
@@ -132,10 +302,14 @@ pub(super) fn parse_http_error(http_status_code: u16, response: ureq::Response) 
         );
     }
 
-    let is_json = response
-        .content_type()
-        .eq_ignore_ascii_case("application/json");
-    match response.into_string() {
+    let is_json = match head.headers.get("Content-Type") {
+        Some(header_value) => match header_value.to_str() {
+            Ok(s) => s.eq_ignore_ascii_case("application/json"),
+            Err(_) => false,
+        },
+        None => false,
+    };
+    match body_content {
         Ok(msg) => {
             let string_err = || error::fmt!(ServerFlushError, "Could not flush buffer: {}", msg);
 
@@ -162,74 +336,50 @@ pub(super) fn parse_http_error(http_status_code: u16, response: ureq::Response) 
     }
 }
 
-pub(super) fn is_retriable_error(err: &ureq::Error) -> bool {
-    use ureq::Error::*;
-    match err {
-        Transport(_) => true,
-
-        // Official HTTP codes
-        Status(500, _) |  // Internal Server Error
-        Status(503, _) |  // Service Unavailable
-        Status(504, _) |  // Gateway Timeout
-
-        // Unofficial extensions
-        Status(507, _) | // Insufficient Storage
-        Status(509, _) | // Bandwidth Limit Exceeded
-        Status(523, _) | // Origin is Unreachable
-        Status(524, _) | // A Timeout Occurred
-        Status(529, _) | // Site is overloaded
-        Status(599, _) => { // Network Connect Timeout Error
-            true
-        }
-        _ => false
-    }
-}
-
 #[allow(clippy::result_large_err)] // `ureq::Error` is large enough to cause this warning.
 fn retry_http_send(
-    request: ureq::Request,
+    state: &HttpHandlerState,
     buf: &[u8],
+    request_timeout: Duration,
     retry_timeout: Duration,
-    mut last_err: ureq::Error,
-) -> Result<ureq::Response, ureq::Error> {
-    let mut rng = rand::thread_rng();
+    mut last_rep: Result<Response<Body>, ureq::Error>,
+) -> Result<Response<Body>, ureq::Error> {
+    let mut rng = rand::rng();
     let retry_end = std::time::Instant::now() + retry_timeout;
     let mut retry_interval_ms = 10;
+    let mut need_retry;
     loop {
-        let jitter_ms = rng.gen_range(-5i32..5);
+        let jitter_ms = rng.random_range(-5i32..5);
         let to_sleep_ms = retry_interval_ms + jitter_ms;
         let to_sleep = Duration::from_millis(to_sleep_ms as u64);
         if (std::time::Instant::now() + to_sleep) > retry_end {
-            return Err(last_err);
+            return last_rep;
         }
         sleep(to_sleep);
-        last_err = match request.clone().send_bytes(buf) {
-            Ok(res) => return Ok(res),
-            Err(err) => {
-                if !is_retriable_error(&err) {
-                    return Err(err);
-                }
-                err
-            }
-        };
+        if let Ok(last_rep) = last_rep {
+            // Actively consume the reader to return the connection to the connection pool.
+            // see https://github.com/algesten/ureq/issues/94
+            _ = last_rep.into_body().read_to_vec();
+        }
+        (need_retry, last_rep) = state.send_request(buf, request_timeout);
+        if !need_retry {
+            return last_rep;
+        }
         retry_interval_ms = (retry_interval_ms * 2).min(1000);
     }
 }
 
 #[allow(clippy::result_large_err)] // `ureq::Error` is large enough to cause this warning.
 pub(super) fn http_send_with_retries(
-    request: ureq::Request,
+    state: &HttpHandlerState,
     buf: &[u8],
+    request_timeout: Duration,
     retry_timeout: Duration,
-) -> Result<ureq::Response, ureq::Error> {
-    let last_err = match request.clone().send_bytes(buf) {
-        Ok(res) => return Ok(res),
-        Err(err) => err,
-    };
-
-    if retry_timeout.is_zero() || !is_retriable_error(&last_err) {
-        return Err(last_err);
+) -> Result<Response<Body>, ureq::Error> {
+    let (need_retry, last_rep) = state.send_request(buf, request_timeout);
+    if !need_retry || retry_timeout.is_zero() {
+        return last_rep;
     }
 
-    retry_http_send(request, buf, retry_timeout, last_err)
+    retry_http_send(state, buf, request_timeout, retry_timeout, last_rep)
 }

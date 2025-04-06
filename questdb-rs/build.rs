@@ -202,6 +202,17 @@ pub mod json_tests {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(not(any(feature = "tls-webpki-certs", feature = "tls-native-certs")))]
+    compile_error!(
+        "At least one of `tls-webpki-certs` or `tls-native-certs` features must be enabled."
+    );
+
+    #[cfg(not(any(feature = "aws-lc-crypto", feature = "ring-crypto")))]
+    compile_error!("You must enable exactly one of the `aws-lc-crypto` or `ring-crypto` features, but none are enabled.");
+
+    #[cfg(all(feature = "aws-lc-crypto", feature = "ring-crypto"))]
+    compile_error!("You must enable exactly one of the `aws-lc-crypto` or `ring-crypto` features, but both are enabled.");
+
     #[cfg(feature = "json_tests")]
     {
         println!("cargo:rerun-if-changed=build.rs");

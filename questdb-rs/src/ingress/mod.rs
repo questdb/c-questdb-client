@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2025 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -29,7 +29,11 @@ pub use self::timestamp::*;
 use crate::error::{self, Error, Result};
 use crate::gai;
 use crate::ingress::conf::ConfigSetting;
+use base64ct::{Base64, Base64UrlUnpadded, Encoding};
 use core::time::Duration;
+use rustls::{ClientConnection, RootCertStore, StreamOwned};
+use rustls_pki_types::ServerName;
+use socket2::{Domain, Protocol as SockProtocol, SockAddr, Socket, Type};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fmt::{Debug, Display, Formatter, Write};
@@ -39,12 +43,17 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use base64ct::{Base64, Base64UrlUnpadded, Encoding};
-use ring::rand::SystemRandom;
-use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
-use rustls::{ClientConnection, RootCertStore, StreamOwned};
-use rustls_pki_types::ServerName;
-use socket2::{Domain, Protocol as SockProtocol, SockAddr, Socket, Type};
+#[cfg(feature = "aws-lc-crypto")]
+use aws_lc_rs::{
+    rand::SystemRandom,
+    signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING},
+};
+
+#[cfg(feature = "ring-crypto")]
+use ring::{
+    rand::SystemRandom,
+    signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING},
+};
 
 #[derive(Debug, Copy, Clone)]
 enum Op {
@@ -1424,8 +1433,16 @@ mod danger {
             Ok(HandshakeSignatureValid::assertion())
         }
 
+        #[cfg(feature = "aws-lc-crypto")]
         fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-            rustls::crypto::ring::default_provider()
+            rustls::crypto::aws_lc_rs::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+
+        #[cfg(feature = "ring-crypto")]
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            rustls::crypto::aws_lc_rs::default_provider()
                 .signature_verification_algorithms
                 .supported_schemes()
         }
@@ -1440,14 +1457,27 @@ fn add_webpki_roots(root_store: &mut RootCertStore) {
 }
 
 #[cfg(feature = "tls-native-certs")]
-fn add_os_roots(root_store: &mut RootCertStore) -> Result<()> {
-    let os_certs = rustls_native_certs::load_native_certs().map_err(|io_err| {
-        error::fmt!(
+fn unpack_os_native_certs(
+    res: rustls_native_certs::CertificateResult,
+) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+    if !res.errors.is_empty() {
+        return Err(error::fmt!(
             TlsError,
             "Could not load OS native TLS certificates: {}",
-            io_err
-        )
-    })?;
+            res.errors
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    Ok(res.certs)
+}
+
+#[cfg(feature = "tls-native-certs")]
+fn add_os_roots(root_store: &mut RootCertStore) -> Result<()> {
+    let os_certs = unpack_os_native_certs(rustls_native_certs::load_native_certs())?;
 
     let (valid_count, invalid_count) = root_store.add_parsable_certificates(os_certs);
     if valid_count == 0 && invalid_count > 0 {
@@ -2390,6 +2420,8 @@ impl SenderBuilder {
             Protocol::Tcp | Protocol::Tcps => self.connect_tcp(&auth)?,
             #[cfg(feature = "ilp-over-http")]
             Protocol::Http | Protocol::Https => {
+                use ureq::unversioned::transport::Connector;
+                use ureq::unversioned::transport::TcpConnector;
                 if self.net_interface.is_some() {
                     // See: https://github.com/algesten/ureq/issues/692
                     return Err(error::fmt!(
@@ -2400,7 +2432,9 @@ impl SenderBuilder {
 
                 let http_config = self.http.as_ref().unwrap();
                 let user_agent = http_config.user_agent.as_str();
-                let agent_builder = ureq::AgentBuilder::new()
+                let connector = TcpConnector::default();
+
+                let agent_builder = ureq::Agent::config_builder()
                     .user_agent(user_agent)
                     .no_delay(true);
 
@@ -2410,15 +2444,13 @@ impl SenderBuilder {
                 #[cfg(not(feature = "insecure-skip-verify"))]
                 let tls_verify = true;
 
-                let agent_builder = match configure_tls(
+                let connector = connector.chain(TlsConnector::new(configure_tls(
                     self.protocol.tls_enabled(),
                     tls_verify,
                     *self.tls_ca,
                     self.tls_roots.deref(),
-                )? {
-                    Some(tls_config) => agent_builder.tls_config(tls_config),
-                    None => agent_builder,
-                };
+                )?));
+
                 let auth = match auth {
                     Some(AuthParams::Basic(ref auth)) => Some(auth.to_header_string()),
                     Some(AuthParams::Token(ref auth)) => Some(auth.to_header_string()?),
@@ -2431,9 +2463,14 @@ impl SenderBuilder {
                     }
                     None => None,
                 };
-                let agent_builder =
-                    agent_builder.timeout_connect(*http_config.request_timeout.deref());
-                let agent = agent_builder.build();
+                let agent_builder = agent_builder
+                    .timeout_connect(Some(*http_config.request_timeout.deref()))
+                    .http_status_as_error(false);
+                let agent = ureq::Agent::with_parts(
+                    agent_builder.build(),
+                    connector,
+                    ureq::unversioned::resolver::DefaultResolver::default(),
+                );
                 let proto = self.protocol.schema();
                 let url = format!(
                     "{}://{}:{}/write",
@@ -2552,14 +2589,26 @@ fn parse_public_key(pub_key_x: &str, pub_key_y: &str) -> Result<Vec<u8>> {
 fn parse_key_pair(auth: &EcdsaAuthParams) -> Result<EcdsaKeyPair> {
     let private_key = b64_decode("private authentication key", auth.priv_key.as_str())?;
     let public_key = parse_public_key(auth.pub_key_x.as_str(), auth.pub_key_y.as_str())?;
-    let system_random = SystemRandom::new();
-    EcdsaKeyPair::from_private_key_and_public_key(
+
+    #[cfg(feature = "aws-lc-crypto")]
+    let res = EcdsaKeyPair::from_private_key_and_public_key(
         &ECDSA_P256_SHA256_FIXED_SIGNING,
         &private_key[..],
         &public_key[..],
-        &system_random,
-    )
-    .map_err(|key_rejected| {
+    );
+
+    #[cfg(feature = "ring-crypto")]
+    let res = {
+        let system_random = SystemRandom::new();
+        EcdsaKeyPair::from_private_key_and_public_key(
+            &ECDSA_P256_SHA256_FIXED_SIGNING,
+            &private_key[..],
+            &public_key[..],
+            &system_random,
+        )
+    };
+
+    res.map_err(|key_rejected| {
         error::fmt!(
             AuthError,
             "Misconfigured ILP authentication keys: {}. Hint: Check the keys for a possible typo.",
@@ -2696,34 +2745,23 @@ impl Sender {
                 } else {
                     0.0f64
                 };
-                let timeout = *state.config.request_timeout + Duration::from_secs_f64(extra_time);
-                let request = state
-                    .agent
-                    .post(&state.url)
-                    .query_pairs([("precision", "n")])
-                    .timeout(timeout)
-                    .set("Content-Type", "text/plain; charset=utf-8");
-                let request = match state.auth.as_ref() {
-                    Some(auth) => request.set("Authorization", auth),
-                    None => request,
+
+                return match http_send_with_retries(
+                    state,
+                    bytes,
+                    *state.config.request_timeout + Duration::from_secs_f64(extra_time),
+                    *state.config.retry_timeout,
+                ) {
+                    Ok(res) => {
+                        if res.status().is_client_error() || res.status().is_server_error() {
+                            Err(parse_http_error(res.status().as_u16(), res))
+                        } else {
+                            res.into_body();
+                            Ok(())
+                        }
+                    }
+                    Err(err) => Err(Error::from_ureq_error(err, &state.url)),
                 };
-                let response_or_err =
-                    http_send_with_retries(request, bytes, *state.config.retry_timeout);
-                match response_or_err {
-                    Ok(_response) => {
-                        // on success, there's no information in the response.
-                    }
-                    Err(ureq::Error::Status(http_status_code, response)) => {
-                        return Err(parse_http_error(http_status_code, response));
-                    }
-                    Err(ureq::Error::Transport(transport)) => {
-                        return Err(error::fmt!(
-                            SocketError,
-                            "Could not flush buffer: {}",
-                            transport
-                        ));
-                    }
-                }
             }
         }
         Ok(())

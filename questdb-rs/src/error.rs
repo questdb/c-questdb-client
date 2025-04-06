@@ -75,6 +75,31 @@ impl Error {
         }
     }
 
+    #[cfg(feature = "ilp-over-http")]
+    pub(crate) fn from_ureq_error(err: ureq::Error, url: &str) -> Error {
+        match err {
+            ureq::Error::StatusCode(code) => {
+                if code == 404 {
+                    fmt!(
+                        HttpNotSupported,
+                        "Could not flush buffer: HTTP endpoint does not support ILP."
+                    )
+                } else if [401, 403].contains(&code) {
+                    fmt!(
+                        AuthError,
+                        "Could not flush buffer: HTTP endpoint authentication error [code: {}]",
+                        code
+                    )
+                } else {
+                    fmt!(SocketError, "Could not flush buffer: {}: {}", url, err)
+                }
+            }
+            e => {
+                fmt!(SocketError, "Could not flush buffer: {}: {}", url, e)
+            }
+        }
+    }
+
     /// Get the error code (category) of this error.
     pub fn code(&self) -> ErrorCode {
         self.code
