@@ -62,7 +62,7 @@ impl<T: ArrayElement> NdArrayView<T> for Array2D<T> {
             let bytes = unsafe {
                 std::slice::from_raw_parts(
                     chunk.as_ptr() as *const u8,
-                    chunk.len() * std::mem::size_of::<T>(),
+                    size_of_val(chunk)
                 )
             };
             writer.write_all(bytes)?;
