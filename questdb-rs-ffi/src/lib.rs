@@ -142,8 +142,8 @@ pub enum line_sender_error_code {
     /// ArrayView internal error, such as failure to get the size of a valid dimension.
     line_sender_error_array_view_internal_error,
 
-    /// Buffer Out Of Memory
-    line_sender_error_buffer_out_of_memory,
+    /// Write arrayView to sender buffer error.
+    line_sender_error_array_view_write_to_buffer_error
 }
 
 impl From<ErrorCode> for line_sender_error_code {
@@ -174,8 +174,8 @@ impl From<ErrorCode> for line_sender_error_code {
             ErrorCode::ArrayViewError => {
                 line_sender_error_code::line_sender_error_array_view_internal_error
             }
-            ErrorCode::BufferOutOfMemory => {
-                line_sender_error_code::line_sender_error_buffer_out_of_memory
+            ErrorCode::ArrayWriteToBufferError => {
+                line_sender_error_code::line_sender_error_array_view_write_to_buffer_error
             }
         }
     }
@@ -340,18 +340,10 @@ where
         }
     }
 
-    fn write_row_major_buf(&self, buff: &mut [u8]) {
-        let elem_size = size_of::<T>();
-        let total_elements: usize = (0..self.dims)
-            .filter_map(|i| <line_sender_array as NdArrayView<T>>::dim(self, i))
-            .product();
-        assert_eq!(
-            self.buf_len,
-            total_elements * elem_size,
-            "Buffer length mismatch"
-        );
+    fn write_row_major<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
         let bytes = unsafe { slice::from_raw_parts(self.buf, self.buf_len) };
-        buff[..self.buf_len].copy_from_slice(bytes);
+        writer.write_all(bytes)?;
+        Ok(())
     }
 }
 

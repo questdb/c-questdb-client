@@ -24,7 +24,7 @@
 
 #![doc = include_str!("mod.md")]
 
-pub use self::ndarr::*;
+pub use self::ndarr::{ArrayElement, ElemDataType, NdArrayView};
 pub use self::timestamp::*;
 use crate::error::{self, Error, Result};
 use crate::gai;
@@ -37,9 +37,10 @@ use socket2::{Domain, Protocol as SockProtocol, SockAddr, Socket, Type};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fmt::{Debug, Display, Formatter, Write};
-use std::io::{self, BufRead, BufReader, ErrorKind, Write as IoWrite};
+use std::io::{self, BufRead, BufReader, Cursor, ErrorKind, Write as IoWrite};
 use std::ops::Deref;
 use std::path::PathBuf;
+use std::slice::from_raw_parts_mut;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -54,6 +55,9 @@ use ring::{
     rand::SystemRandom,
     signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING},
 };
+
+/// Defines the maximum allowed dimensions for array data in binary serialization protocols.
+pub const MAX_DIMS: usize = 32;
 
 #[derive(Debug, Copy, Clone)]
 enum Op {
@@ -1055,7 +1059,6 @@ impl Buffer {
     /// Returns [`Error`] if:
     /// - Array dimensions exceed [`MAX_DIMS`]
     /// - Failed to get dimension sizes
-    /// - Memory allocation fails for array data
     /// - Column name validation fails
     pub fn column_arr<'a, N, T, D>(&mut self, name: N, view: &T) -> Result<&mut Self>
     where
@@ -1104,18 +1107,30 @@ impl Buffer {
             ))?
         }
 
+        self.output.reserve(reserve_size);
         let index = self.output.len();
-        let reserve_size = reserve_size.checked_add(index).ok_or(error::fmt!(
-            ArrayViewError,
-            "Array total elem size overflow"
-        ))?;
-        self.output
-            .try_reserve(reserve_size)
-            .map_err(|_| error::fmt!(BufferOutOfMemory, "Buffer out of memory"))?;
-        unsafe { self.output.set_len(reserve_size) }
-
+        let writeable =
+            unsafe { from_raw_parts_mut(self.output.as_mut_ptr().add(index), reserve_size) };
+        let mut cursor = Cursor::new(writeable);
         // ndarr data
-        view.write_row_major_buf(&mut self.output[index..]);
+        if let Err(e) = view.write_row_major(&mut cursor) {
+            return Err(error::fmt!(
+                ArrayWriteToBufferError,
+                "Can not write row major to writer: {}",
+                e
+            ));
+        }
+
+        if cursor.position() != (reserve_size as u64) {
+            return Err(error::fmt!(
+                ArrayWriteToBufferError,
+                "Array write buffer length mismatch (actual: {}, expected: {})",
+                cursor.position(),
+                reserve_size
+            ));
+        }
+
+        unsafe { self.output.set_len(reserve_size + index) }
         Ok(self)
     }
 

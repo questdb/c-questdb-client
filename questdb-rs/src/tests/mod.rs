@@ -29,7 +29,6 @@ mod http;
 mod mock;
 mod sender;
 
-#[cfg(feature = "ndarray")]
 mod ndarr;
 
 #[cfg(feature = "json_tests")]
