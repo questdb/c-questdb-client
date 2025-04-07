@@ -549,10 +549,9 @@ impl MockServer {
                     let dims = accum[index] as usize;
                     index += 1;
                     for _ in 0..dims {
-                        elems_size = elems_size
-                            * i32::from_le_bytes(
-                                accum[index..index + size_of::<i32>()].try_into().unwrap(),
-                            ) as usize;
+                        elems_size *= i32::from_le_bytes(
+                            accum[index..index + size_of::<i32>()].try_into().unwrap(),
+                        ) as usize;
                         index += size_of::<i32>();
                     }
                     index += elems_size;

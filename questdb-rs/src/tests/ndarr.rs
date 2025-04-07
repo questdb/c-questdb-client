@@ -1,8 +1,6 @@
 #[cfg(feature = "ndarray")]
 use crate::ingress::MAX_DIMS;
-use crate::ingress::{
-    ArrayElement, Buffer, ElemDataType, NdArrayView, ARRAY_BINARY_FORMAT_TYPE
-};
+use crate::ingress::{ArrayElement, Buffer, ElemDataType, NdArrayView, ARRAY_BINARY_FORMAT_TYPE};
 use crate::tests::TestResult;
 use crate::ErrorCode;
 

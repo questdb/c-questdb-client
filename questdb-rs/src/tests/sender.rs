@@ -22,9 +22,12 @@
  *
  ******************************************************************************/
 
-use crate::{ingress::{
-    Buffer, CertificateAuthority, Sender, TableName, Timestamp, TimestampMicros, TimestampNanos,
-}, Error, ErrorCode};
+use crate::{
+    ingress::{
+        Buffer, CertificateAuthority, Sender, TableName, Timestamp, TimestampMicros, TimestampNanos,
+    },
+    Error, ErrorCode,
+};
 
 use crate::tests::{
     mock::{certs_dir, MockServer},
@@ -32,7 +35,10 @@ use crate::tests::{
 };
 
 #[cfg(feature = "ndarray")]
-use crate::{ingress, ingress::{ElemDataType, NdArrayView}};
+use crate::{
+    ingress,
+    ingress::{ElemDataType, NdArrayView},
+};
 use core::time::Duration;
 #[cfg(feature = "ndarray")]
 use ndarray::{arr1, arr2, ArrayD};
