@@ -95,6 +95,33 @@ TEST_CASE("line_sender c api basics")
     CHECK(::line_sender_buffer_table(buffer, table_name, &err));
     CHECK(::line_sender_buffer_symbol(buffer, t1_name, v1_utf8, &err));
     CHECK(::line_sender_buffer_column_f64(buffer, f1_name, 0.5, &err));
+
+    line_sender_column_name arr_name = QDB_COLUMN_NAME_LITERAL("order_book");
+    // 3D array of doubles
+    size_t rank = 3;
+    uint32_t shapes[] = {2, 3, 2};
+    double arr_data[] = {
+        48123.5,
+        2.4,
+        48124.0,
+        1.8,
+        48124.5,
+        0.9,
+        48122.5,
+        3.1,
+        48122.0,
+        2.7,
+        48121.5,
+        4.3};
+    CHECK(
+        ::line_sender_buffer_column_f64_arr(
+            buffer,
+            arr_name,
+            rank,
+            shapes,
+            reinterpret_cast<uint8_t*>(arr_data),
+            sizeof(arr_data),
+            &err));
     CHECK(::line_sender_buffer_at_nanos(buffer, 10000000, &err));
     CHECK(server.recv() == 0);
     CHECK(::line_sender_buffer_size(buffer) == 27);

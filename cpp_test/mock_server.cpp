@@ -24,6 +24,7 @@
 
 #include "mock_server.hpp"
 
+#include <cstddef>
 #include <string.h>
 
 #if defined(PLATFORM_UNIX)
@@ -195,9 +196,9 @@ size_t mock_server::recv(double wait_timeout_sec)
     if (!wait_for_data(wait_timeout_sec))
         return 0;
 
-    char chunk[1024];
+    std::byte chunk[1024];
     size_t chunk_len{sizeof(chunk)};
-    std::vector<char> accum;
+    std::vector<std::byte> accum;
     for (;;)
     {
         wait_for_data();
