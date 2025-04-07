@@ -44,6 +44,17 @@ impl From<ElemDataType> for u8 {
     }
 }
 
+impl TryFrom<u8> for ElemDataType {
+    type Error = String;
+
+    fn try_from(value: u8) -> Result<Self, String> {
+        match value {
+            0x0A => Ok(ElemDataType::Double),
+            _ => Err(format!("Unknown element type: {}", value)),
+        }
+    }
+}
+
 impl ArrayElement for f64 {
     /// Identifies f64 as Double type in QuestDB's type system.
     fn elem_type() -> ElemDataType {

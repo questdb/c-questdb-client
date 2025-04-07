@@ -59,7 +59,7 @@ tempfile = "3"
 webpki-roots = "0.26.8"
 
 [features]
-default = ["tls-webpki-certs", "ilp-over-http", "aws-lc-crypto", "ndarray"]
+default = ["tls-webpki-certs", "ilp-over-http", "aws-lc-crypto"]
 
 # Include support for ILP over HTTP.
 ilp-over-http = ["dep:ureq", "dep:serde_json", "dep:rand"]

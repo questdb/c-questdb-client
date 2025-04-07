@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-use crate::ingress::{Protocol, SenderBuilder};
+use crate::ingress::{ElemDataType, Protocol, SenderBuilder};
 
 use core::time::Duration;
 use mio::event::Event;
@@ -36,6 +36,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::ingress;
 #[cfg(feature = "ilp-over-http")]
 use std::io::Write;
 
@@ -50,7 +51,7 @@ pub struct MockServer {
     tls_conn: Option<ServerConnection>,
     pub host: &'static str,
     pub port: u16,
-    pub msgs: Vec<u8>,
+    pub msgs: Vec<Vec<u8>>,
 }
 
 pub fn certs_dir() -> std::path::PathBuf {
@@ -519,8 +520,55 @@ impl MockServer {
             }
         }
 
-        self.msgs = accum;
-        Ok(self.msgs.len())
+        let mut received_count = 0usize;
+        let mut head = 0usize;
+        let binary_length = 0usize;
+        let mut index = 1;
+
+        while index < accum.len() {
+            let last = accum[index];
+            let prev = accum[index - 1];
+            if last == b'=' && prev == b'=' {
+                index += 1;
+                // calc binary length
+                let binary_type = accum[index];
+                if binary_type == ingress::DOUBLE_BINARY_FORMAT_TYPE {
+                    index += size_of::<f64>();
+                } else if binary_type == ingress::ARRAY_BINARY_FORMAT_TYPE {
+                    index += 1;
+                    let element_type = match ElemDataType::try_from(accum[index]) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            return Err(io::Error::new(io::ErrorKind::Other, e));
+                        }
+                    };
+                    let mut elems_size = match element_type {
+                        ElemDataType::Double => size_of::<f64>(),
+                    };
+                    index += 1;
+                    let dims = accum[index] as usize;
+                    index += 1;
+                    for _ in 0..dims {
+                        elems_size = elems_size
+                            * i32::from_le_bytes(
+                                accum[index..index + size_of::<i32>()].try_into().unwrap(),
+                            ) as usize;
+                        index += size_of::<i32>();
+                    }
+                    index += elems_size;
+                }
+            } else if (last == b'\n') && (prev != b'\\' && binary_length == 0) {
+                let tail = index + 1;
+                let msg = &accum[head..tail];
+                self.msgs.push(msg.to_vec());
+                head = tail;
+                received_count += 1;
+                index = tail;
+            } else {
+                index += 1;
+            }
+        }
+        Ok(received_count)
     }
 
     pub fn recv_q(&mut self) -> io::Result<usize> {

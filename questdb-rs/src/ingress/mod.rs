@@ -2851,6 +2851,8 @@ impl Sender {
 }
 
 pub(crate) const ARRAY_BINARY_FORMAT_TYPE: u8 = 14;
+#[allow(dead_code)]
+pub(crate) const DOUBLE_BINARY_FORMAT_TYPE: u8 = 16;
 
 mod conf;
 pub(crate) mod ndarr;

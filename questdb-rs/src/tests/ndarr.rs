@@ -1,5 +1,7 @@
+#[cfg(feature = "ndarray")]
+use crate::ingress::MAX_DIMS;
 use crate::ingress::{
-    ArrayElement, Buffer, ElemDataType, NdArrayView, ARRAY_BINARY_FORMAT_TYPE, MAX_DIMS,
+    ArrayElement, Buffer, ElemDataType, NdArrayView, ARRAY_BINARY_FORMAT_TYPE
 };
 use crate::tests::TestResult;
 use crate::ErrorCode;
@@ -60,10 +62,7 @@ impl<T: ArrayElement> NdArrayView<T> for Array2D<T> {
 
         for chunk in self.data.chunks(self.cols) {
             let bytes = unsafe {
-                std::slice::from_raw_parts(
-                    chunk.as_ptr() as *const u8,
-                    size_of_val(chunk)
-                )
+                std::slice::from_raw_parts(chunk.as_ptr() as *const u8, size_of_val(chunk))
             };
             writer.write_all(bytes)?;
         }
@@ -162,7 +161,7 @@ fn test_invalid_dimension() -> TestResult {
             None
         }
         fn write_row_major<W: std::io::Write>(&self, _: &mut W) -> std::io::Result<()> {
-            todo!()
+            Ok(())
         }
     }
 

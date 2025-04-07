@@ -22,13 +22,9 @@
  *
  ******************************************************************************/
 
-use crate::{
-    ingress,
-    ingress::{
-        Buffer, CertificateAuthority, Sender, TableName, Timestamp, TimestampMicros, TimestampNanos,
-    },
-    Error, ErrorCode,
-};
+use crate::{ingress::{
+    Buffer, CertificateAuthority, Sender, TableName, Timestamp, TimestampMicros, TimestampNanos,
+}, Error, ErrorCode};
 
 use crate::tests::{
     mock::{certs_dir, MockServer},
@@ -36,7 +32,7 @@ use crate::tests::{
 };
 
 #[cfg(feature = "ndarray")]
-use crate::ingress::ndarr::{ElemDataType, NdArrayView};
+use crate::{ingress, ingress::{ElemDataType, NdArrayView}};
 use core::time::Duration;
 #[cfg(feature = "ndarray")]
 use ndarray::{arr1, arr2, ArrayD};
@@ -83,8 +79,8 @@ fn test_basics() -> TestResult {
     sender.flush(&mut buffer)?;
     assert_eq!(buffer.len(), 0);
     assert_eq!(buffer.as_bytes(), b"");
-    assert_eq!(server.recv_q()?, exp_byte.len());
-    assert_eq!(server.msgs, exp_byte);
+    assert_eq!(server.recv_q()?, 1);
+    assert_eq!(server.msgs[0], exp_byte);
     Ok(())
 }
 
@@ -158,8 +154,8 @@ fn test_array_basic() -> TestResult {
     sender.flush(&mut buffer)?;
     assert_eq!(buffer.len(), 0);
     assert_eq!(buffer.as_bytes(), b"");
-    assert_eq!(server.recv_q()?, exp.len());
-    assert_eq!(server.msgs.as_slice(), exp);
+    assert_eq!(server.recv_q()?, 1);
+    assert_eq!(server.msgs[0].as_slice(), exp);
     Ok(())
 }
 
@@ -467,8 +463,8 @@ fn test_tls_with_file_ca() -> TestResult {
     assert_eq!(buffer.as_bytes(), exp);
     assert_eq!(buffer.len(), exp.len());
     sender.flush(&mut buffer)?;
-    assert_eq!(server.recv_q()?, exp.len());
-    assert_eq!(server.msgs.as_slice(), exp);
+    assert_eq!(server.recv_q()?, 1);
+    assert_eq!(server.msgs[0].as_slice(), exp);
     Ok(())
 }
 
@@ -560,8 +556,8 @@ fn test_tls_insecure_skip_verify() -> TestResult {
     assert_eq!(buffer.as_bytes(), exp);
     assert_eq!(buffer.len(), exp.len());
     sender.flush(&mut buffer)?;
-    assert_eq!(server.recv_q()?, exp.len());
-    assert_eq!(server.msgs.as_slice(), exp);
+    assert_eq!(server.recv_q()?, 1);
+    assert_eq!(server.msgs[0].as_slice(), exp);
     Ok(())
 }
 
