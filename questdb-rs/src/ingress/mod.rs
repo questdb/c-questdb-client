@@ -24,7 +24,7 @@
 
 #![doc = include_str!("mod.md")]
 
-pub use self::ndarr::{ArrayElement, ElemDataType, NdArrayView};
+pub use self::ndarr::{ArrayElement, ArrayViewWithStrides, ElemDataType, NdArrayView};
 pub use self::timestamp::*;
 use crate::error::{self, Error, Result};
 use crate::gai;
@@ -1112,6 +1112,7 @@ impl Buffer {
         let writeable =
             unsafe { from_raw_parts_mut(self.output.as_mut_ptr().add(index), reserve_size) };
         let mut cursor = Cursor::new(writeable);
+
         // ndarr data
         if let Err(e) = view.write_row_major(&mut cursor) {
             return Err(error::fmt!(

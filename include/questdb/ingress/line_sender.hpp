@@ -641,7 +641,8 @@ public:
     template <typename T, size_t N>
     line_sender_buffer& column(
         column_name_view name,
-        const std::vector<uint32_t>& shape,
+        const std::vector<size_t>& shapes,
+        const std::vector<int64_t>& strides,
         const std::array<T, N>& data)
     {
         static_assert(
@@ -652,8 +653,8 @@ public:
             ::line_sender_buffer_column_f64_arr,
             _impl,
             name._impl,
-            shape.size(),
-            shape.data(),
+            shapes.data(),
+            strides.data(),
             reinterpret_cast<const uint8_t*>(data.data()),
             sizeof(double) * N);
         return *this;

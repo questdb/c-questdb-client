@@ -24,7 +24,7 @@
 
 #![allow(non_camel_case_types, clippy::missing_safety_doc)]
 
-use libc::{c_char, c_uint, size_t};
+use libc::{c_char, size_t};
 use std::ascii;
 use std::boxed::Box;
 use std::convert::{From, Into};
@@ -33,13 +33,10 @@ use std::ptr;
 use std::slice;
 use std::str;
 
-use questdb::{
-    ingress::{
-        ArrayElement, Buffer, CertificateAuthority, ColumnName, NdArrayView, Protocol, Sender,
-        SenderBuilder, TableName, TimestampMicros, TimestampNanos,
-    },
-    Error, ErrorCode,
-};
+use questdb::{ingress, ingress::{
+    Buffer, CertificateAuthority, ColumnName, Protocol, Sender,
+    SenderBuilder, TableName, TimestampMicros, TimestampNanos,
+}, Error, ErrorCode};
 
 macro_rules! bubble_err_to_c {
     ($err_out:expr, $expression:expr) => {
@@ -306,44 +303,6 @@ pub struct line_sender_utf8 {
 impl line_sender_utf8 {
     fn as_str(&self) -> &str {
         unsafe { str::from_utf8_unchecked(slice::from_raw_parts(self.buf as *const u8, self.len)) }
-    }
-}
-
-#[derive(Debug, Copy, Clone)]
-struct line_sender_array {
-    dims: size_t,
-    shapes: *const u32,
-    buf_len: size_t,
-    buf: *const u8,
-}
-
-impl<T> NdArrayView<T> for line_sender_array
-where
-    T: ArrayElement,
-{
-    fn ndim(&self) -> usize {
-        self.dims
-    }
-
-    fn dim(&self, index: usize) -> Option<usize> {
-        if index >= self.dims {
-            return None;
-        }
-
-        unsafe {
-            if self.shapes.is_null() {
-                return None;
-            }
-
-            let dim_size = *self.shapes.add(index);
-            Some(dim_size as usize)
-        }
-    }
-
-    fn write_row_major<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        let bytes = unsafe { slice::from_raw_parts(self.buf, self.buf_len) };
-        writer.write_all(bytes)?;
-        Ok(())
     }
 }
 
@@ -877,22 +836,24 @@ pub unsafe extern "C" fn line_sender_buffer_column_f64_arr(
     buffer: *mut line_sender_buffer,
     name: line_sender_column_name,
     rank: size_t,
-    shape: *const c_uint,    // C array of dimension sizes
+    shapes: *const size_t,    // C array of shapes
+    strides: *const i64,    // C array of strides
     data_buffer: *const u8,  // Raw array data
     data_buffer_len: size_t, // Total bytes length
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     let buffer = unwrap_buffer_mut(buffer);
     let name = name.as_name();
-    let view = line_sender_array {
-        dims: rank,
-        shapes: shape,
-        buf_len: data_buffer_len,
-        buf: data_buffer,
-    };
+    let view = ingress::ArrayViewWithStrides::<f64>::new(
+        rank,
+        shapes,
+        strides as *const isize,
+        data_buffer,
+        data_buffer_len,
+    );
     bubble_err_to_c!(
         err_out,
-        buffer.column_arr::<ColumnName<'_>, line_sender_array, f64>(name, &view)
+        buffer.column_arr::<ColumnName<'_>, ingress::ArrayViewWithStrides<'_, f64>, f64>(name, &view)
     );
     true
 }
