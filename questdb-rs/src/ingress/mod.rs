@@ -24,7 +24,7 @@
 
 #![doc = include_str!("mod.md")]
 
-pub use self::ndarr::{ArrayElement, ArrayViewWithStrides, ElemDataType, NdArrayView};
+pub use self::ndarr::{ArrayElement, ElemDataType, NdArrayView, StridedArrayView};
 pub use self::timestamp::*;
 use crate::error::{self, Error, Result};
 use crate::gai;
@@ -1079,6 +1079,7 @@ impl Buffer {
             ));
         }
 
+        let reserve_size = view.check_data_buf()?;
         // binary format flag '='
         self.output.push(b'=');
         // binary format entity type
@@ -1088,7 +1089,6 @@ impl Buffer {
         // ndarr dims
         self.output.push(view.ndim() as u8);
 
-        let mut reserve_size = size_of::<D>();
         for i in 0..view.ndim() {
             let d = view.dim(i).ok_or_else(|| {
                 error::fmt!(
@@ -1097,14 +1097,9 @@ impl Buffer {
                     i
                 )
             })?;
-
             // ndarr shapes
             self.output
                 .extend_from_slice((d as i32).to_le_bytes().as_slice());
-            reserve_size = reserve_size.checked_mul(d).ok_or(error::fmt!(
-                ArrayViewError,
-                "Array total elem size overflow"
-            ))?
         }
 
         self.output.reserve(reserve_size);
@@ -1114,7 +1109,7 @@ impl Buffer {
         let mut cursor = Cursor::new(writeable);
 
         // ndarr data
-        if let Err(e) = view.write_row_major(&mut cursor) {
+        if let Err(e) = ndarr::write_array_data(view, &mut cursor) {
             return Err(error::fmt!(
                 ArrayWriteToBufferError,
                 "Can not write row major to writer: {}",

@@ -1,71 +1,22 @@
 #[cfg(feature = "ndarray")]
 use crate::ingress::MAX_DIMS;
-use crate::ingress::{ArrayElement, Buffer, ElemDataType, NdArrayView, ARRAY_BINARY_FORMAT_TYPE};
+use crate::ingress::{
+    ArrayElement, Buffer, ElemDataType, NdArrayView, StridedArrayView, ARRAY_BINARY_FORMAT_TYPE,
+};
 use crate::tests::TestResult;
 use crate::ErrorCode;
 
+use crate::ingress::ndarr::write_array_data;
 #[cfg(feature = "ndarray")]
 use ndarray::{arr1, arr2, arr3, s, ArrayD};
 #[cfg(feature = "ndarray")]
 use std::iter;
-use std::marker::PhantomData;
+use std::ptr;
 
 #[test]
 fn test_f64_element_type() {
     assert_eq!(<f64 as ArrayElement>::elem_type(), ElemDataType::Double);
     assert_eq!(u8::from(ElemDataType::Double), 10);
-}
-
-struct Array2D<T> {
-    data: Vec<T>,
-    rows: usize,
-    cols: usize,
-    contiguous: bool,
-}
-
-impl<T: ArrayElement> Array2D<T> {
-    fn new(data: Vec<T>, rows: usize, cols: usize, contiguous: bool) -> Self {
-        Self {
-            data,
-            rows,
-            cols,
-            contiguous,
-        }
-    }
-}
-
-impl<T: ArrayElement> NdArrayView<T> for Array2D<T> {
-    fn ndim(&self) -> usize {
-        2
-    }
-
-    fn dim(&self, index: usize) -> Option<usize> {
-        match index {
-            0 => Some(self.rows),
-            1 => Some(self.cols),
-            _ => None,
-        }
-    }
-
-    fn write_row_major<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        if self.contiguous {
-            let bytes = unsafe {
-                std::slice::from_raw_parts(
-                    self.data.as_ptr() as *const u8,
-                    self.data.len() * std::mem::size_of::<T>(),
-                )
-            };
-            return writer.write_all(bytes);
-        }
-
-        for chunk in self.data.chunks(self.cols) {
-            let bytes = unsafe {
-                std::slice::from_raw_parts(chunk.as_ptr() as *const u8, size_of_val(chunk))
-            };
-            writer.write_all(bytes)?;
-        }
-        Ok(())
-    }
 }
 
 fn to_bytes<T: Copy>(data: &[T]) -> Vec<u8> {
@@ -79,55 +30,115 @@ fn to_bytes<T: Copy>(data: &[T]) -> Vec<u8> {
 }
 
 #[test]
-fn test_basic_array_view() {
+fn test_strided_array_view() -> TestResult {
     // contiguous layout
-    let test_data = vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0];
-    let array = Array2D::new(test_data.clone(), 2, 3, true);
+    let test_data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let shapes = [2, 3];
+    let strides = [
+        (shapes[1] * size_of::<f64>()) as isize,
+        size_of::<f64>() as isize,
+    ];
+    let array = unsafe {
+        StridedArrayView::<f64>::new(
+            shapes.len(),
+            shapes.as_ptr(),
+            strides.as_ptr(),
+            test_data.as_ptr() as *const u8,
+            test_data.len() * size_of::<f64>(),
+        )
+    };
+
     assert_eq!(array.ndim(), 2);
     assert_eq!(array.dim(0), Some(2));
     assert_eq!(array.dim(1), Some(3));
     assert_eq!(array.dim(2), None);
+    assert!(array.as_slice().is_some());
     let mut buf = vec![];
-    array.write_row_major(&mut buf).unwrap();
+    write_array_data(&array, &mut buf).unwrap();
     let expected = to_bytes(&test_data);
     assert_eq!(buf, expected);
+    Ok(())
+}
 
-    // non-contiguous layout
-    let test_data = vec![vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 6.0]]
-        .into_iter()
-        .flatten()
-        .collect();
-    let array_non_contig = Array2D::new(test_data, 3, 2, false);
-    let mut buf_non_contig = vec![];
-    array_non_contig
-        .write_row_major(&mut buf_non_contig)
-        .unwrap();
-    let expected_non_contig = to_bytes(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-    assert_eq!(buf_non_contig, expected_non_contig);
+#[test]
+fn test_strided_non_contiguous() -> TestResult {
+    let elem_size = size_of::<f64>();
+    let col_major_data = vec![1.0, 3.0, 5.0, 2.0, 4.0, 6.0];
+    let shapes = [3, 2];
+    let strides = [elem_size as isize, (shapes[0] * elem_size) as isize];
+
+    let array_view: StridedArrayView<'_, f64> = unsafe {
+        StridedArrayView::new(
+            shapes.len(),
+            shapes.as_ptr(),
+            strides.as_ptr(),
+            col_major_data.as_ptr() as *const u8,
+            col_major_data.len() * elem_size,
+        )
+    };
+
+    assert_eq!(array_view.ndim(), 2);
+    assert_eq!(array_view.dim(0), Some(3));
+    assert_eq!(array_view.dim(1), Some(2));
+    assert_eq!(array_view.dim(2), None);
+    assert!(array_view.as_slice().is_none());
+    let mut buffer = Vec::new();
+    write_array_data(&array_view, &mut buffer)?;
+
+    let expected_data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let expected_bytes = unsafe {
+        std::slice::from_raw_parts(
+            expected_data.as_ptr() as *const u8,
+            expected_data.len() * elem_size,
+        )
+    };
+    assert_eq!(buffer, expected_bytes);
+    Ok(())
 }
 
 #[test]
 fn test_basic_edge_cases() {
     // empty array
-    let empty_array = Array2D::<f64>::new(vec![], 0, 0, false);
-    assert_eq!(empty_array.ndim(), 2);
-    assert_eq!(empty_array.dim(0), Some(0));
-    assert_eq!(empty_array.dim(1), Some(0));
+    let elem_size = std::mem::size_of::<f64>();
+    let empty_view: StridedArrayView<'_, f64> =
+        unsafe { StridedArrayView::new(2, [0, 0].as_ptr(), [0, 0].as_ptr(), ptr::null(), 0) };
+    assert_eq!(empty_view.ndim(), 2);
+    assert_eq!(empty_view.dim(0), Some(0));
+    assert_eq!(empty_view.dim(1), Some(0));
 
     // single element array
-    let single = Array2D::new(vec![42.0], 1, 1, true);
+    let single_data = vec![42.0];
+    let single_view: StridedArrayView<'_, f64> = unsafe {
+        StridedArrayView::new(
+            2,
+            [1, 1].as_ptr(), // 1x1 矩阵
+            [elem_size as isize, elem_size as isize].as_ptr(),
+            single_data.as_ptr() as *const u8,
+            elem_size,
+        )
+    };
     let mut buf = vec![];
-    single.write_row_major(&mut buf).unwrap();
-    assert_eq!(buf, 42.0f64.to_ne_bytes().to_vec());
+    write_array_data(&single_view, &mut buf).unwrap();
+    assert_eq!(buf, 42.0f64.to_ne_bytes());
 }
 
 #[test]
 fn test_buffer_basic_write() -> TestResult {
-    let test_data = vec![1.1f64, 2.2, 3.3, 4.4];
+    let elem_size = std::mem::size_of::<f64>();
+
+    let test_data = vec![1.1, 2.2, 3.3, 4.4];
+    let array_view: StridedArrayView<'_, f64> = unsafe {
+        StridedArrayView::new(
+            2,
+            [2, 2].as_ptr(),
+            [2 * elem_size as isize, elem_size as isize].as_ptr(),
+            test_data.as_ptr() as *const u8,
+            test_data.len() * elem_size,
+        )
+    };
     let mut buffer = Buffer::new();
     buffer.table("my_test")?;
-    let array_2d = Array2D::<f64>::new(test_data, 2, 2, true);
-    buffer.column_arr("temperature", &array_2d)?;
+    buffer.column_arr("temperature", &array_view)?;
     let data = buffer.as_bytes();
     assert_eq!(&data[0..7], b"my_test");
     assert_eq!(&data[8..19], b"temperature");
@@ -143,51 +154,35 @@ fn test_buffer_basic_write() -> TestResult {
     );
     assert_eq!(
         &data[24..32],
-        [2i32.to_le_bytes().as_slice(), 2i32.to_le_bytes().as_slice()].concat()
+        [2i32.to_le_bytes(), 2i32.to_le_bytes()].concat()
+    );
+    assert_eq!(
+        &data[32..64],
+        &[
+            1.1f64.to_ne_bytes(),
+            2.2f64.to_le_bytes(),
+            3.3f64.to_le_bytes(),
+            4.4f64.to_le_bytes(),
+        ].concat()
     );
     Ok(())
 }
 
 #[test]
-fn test_invalid_dimension() -> TestResult {
-    struct InvalidDimArray;
-    impl NdArrayView<f64> for InvalidDimArray {
-        fn ndim(&self) -> usize {
-            2
-        }
-        fn dim(&self, _: usize) -> Option<usize> {
-            None
-        }
-        fn write_row_major<W: std::io::Write>(&self, _: &mut W) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    let mut buffer = Buffer::new();
-    buffer.table("my_test")?;
-    let result = buffer.column_arr("arr1", &InvalidDimArray);
-    assert!(result.is_err());
-    let err = result.unwrap_err();
-    assert_eq!(err.code(), ErrorCode::ArrayViewError);
-    assert!(err
-        .msg()
-        .contains("Can not get correct dimensions for dim 0"));
-    Ok(())
-}
-
-#[test]
 fn test_size_overflow() -> TestResult {
-    let mut buffer = Buffer::new();
-    buffer.table("my_test")?;
-    let data = vec![1.0f64];
-    let arr = Array2D::<f64> {
-        data,
-        rows: usize::MAX,
-        cols: usize::MAX,
-        contiguous: false,
+    let overflow_view = unsafe {
+        StridedArrayView::<f64>::new(
+            2,
+            [usize::MAX, usize::MAX].as_ptr(),
+            [8, 8].as_ptr(),
+            ptr::null(),
+            0,
+        )
     };
 
-    let result = buffer.column_arr("arr1", &arr);
+    let mut buffer = Buffer::new();
+    buffer.table("my_test")?;
+    let result = buffer.column_arr("arr1", &overflow_view);
     let err = result.unwrap_err();
     assert_eq!(err.code(), ErrorCode::ArrayViewError);
     assert!(err.msg().contains("Array total elem size overflow"));
@@ -195,72 +190,43 @@ fn test_size_overflow() -> TestResult {
 }
 
 #[test]
-fn test_write_failure() -> TestResult {
-    struct FaultyArray<T>(PhantomData<T>);
-    impl<T: ArrayElement> NdArrayView<T> for FaultyArray<T> {
-        fn ndim(&self) -> usize {
-            2
-        }
-        fn dim(&self, _: usize) -> Option<usize> {
-            Some(1)
-        }
-        fn write_row_major<W: std::io::Write>(&self, _: &mut W) -> std::io::Result<()> {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "mock write error",
-            ))
-        }
-    }
-    let mut buffer = Buffer::new();
-    buffer.table("my_test")?;
-    let result = buffer.column_arr("arr1", &FaultyArray(PhantomData::<f64>));
-    let err = result.unwrap_err();
-    assert_eq!(err.code(), ErrorCode::ArrayWriteToBufferError);
-    assert!(err
-        .msg()
-        .contains("Can not write row major to writer: mock write error"));
-    Ok(())
-}
-
-#[test]
 fn test_array_length_mismatch() -> TestResult {
-    // actual data length is larger than shapes
-    let test_data = vec![1.1f64, 2.2, 3.3, 4.4];
-    let mut buffer = Buffer::new();
-    buffer.table("my_test")?;
-    let array_2d = Array2D::<f64>::new(test_data, 1, 2, true);
-    let result = buffer.column_arr("arr1", &array_2d);
-    let err = result.unwrap_err();
-    assert_eq!(err.code(), ErrorCode::ArrayWriteToBufferError);
-    assert!(err
-        .msg()
-        .contains("Can not write row major to writer: failed to write whole buffer"));
-    buffer.clear();
+    let elem_size = std::mem::size_of::<f64>();
+    let under_data = vec![1.1];
+    let under_view: StridedArrayView<'_, f64> = unsafe {
+        StridedArrayView::new(
+            2,
+            [1, 2].as_ptr(),
+            [elem_size as isize, elem_size as isize].as_ptr(),
+            under_data.as_ptr() as *const u8,
+            under_data.len() * elem_size,
+        )
+    };
 
-    // actual data length is less than shapes
-    let test_data = vec![1.1f64];
     let mut buffer = Buffer::new();
     buffer.table("my_test")?;
-    let array_2d = Array2D::<f64>::new(test_data, 1, 2, true);
-    let result = buffer.column_arr("arr1", &array_2d);
+    let result = buffer.column_arr("arr1", &under_view);
     let err = result.unwrap_err();
     assert_eq!(err.code(), ErrorCode::ArrayWriteToBufferError);
-    assert!(err
-        .msg()
-        .contains("Array write buffer length mismatch (actual: 8, expected: 16)"));
-    buffer.clear();
+    assert!(err.msg().contains("Array buffer length mismatch (actual: 8, expected: 16)"));
 
-    // non-contiguous layout
-    let test_data = vec![1.1f64];
-    let mut buffer = Buffer::new();
+    let over_data = vec![1.1, 2.2, 3.3];
+    let over_view: StridedArrayView<'_, f64> = unsafe {
+        StridedArrayView::new(
+            2,
+            [1, 2].as_ptr(),
+            [elem_size as isize, elem_size as isize].as_ptr(),
+            over_data.as_ptr() as *const u8,
+            over_data.len() * elem_size,
+        )
+    };
+
+    buffer.clear();
     buffer.table("my_test")?;
-    let array_2d = Array2D::<f64>::new(test_data, 1, 2, false);
-    let result = buffer.column_arr("arr1", &array_2d);
+    let result = buffer.column_arr("arr1", &over_view);
     let err = result.unwrap_err();
     assert_eq!(err.code(), ErrorCode::ArrayWriteToBufferError);
-    assert!(err
-        .msg()
-        .contains("Array write buffer length mismatch (actual: 8, expected: 16)"));
+    assert!(err.msg().contains("Array buffer length mismatch (actual: 24, expected: 16)"));
     Ok(())
 }
 
@@ -270,7 +236,7 @@ fn test_1d_contiguous_ndarray_buffer() -> TestResult {
     let array = arr1(&[1.0, 2.0, 3.0, 4.0]);
     let view = array.view();
     let mut buf = vec![0u8; 4 * size_of::<f64>()];
-    view.write_row_major(&mut &mut buf[0..])?;
+    write_array_data(&view, &mut &mut buf[0..])?;
     let expected: Vec<u8> = array
         .iter()
         .flat_map(|&x| x.to_ne_bytes().to_vec())
@@ -286,7 +252,7 @@ fn test_2d_non_contiguous_ndarray_buffer() -> TestResult {
     let transposed = array.view().reversed_axes();
     assert!(!transposed.is_standard_layout());
     let mut buf = vec![0u8; 4 * size_of::<f64>()];
-    transposed.write_row_major(&mut &mut buf[0..])?;
+    write_array_data(&transposed, &mut &mut buf[0..])?;
     let expected = [1.0f64, 3.0, 2.0, 4.0]
         .iter()
         .flat_map(|&x| x.to_ne_bytes())
@@ -307,7 +273,7 @@ fn test_strided_ndarray_layout() -> TestResult {
     let strided_view = array.slice(s![1..;2, 1..;2]);
     assert_eq!(strided_view.dim(), (2, 2));
     let mut buf = vec![0u8; 4 * size_of::<f64>()];
-    strided_view.write_row_major(&mut &mut buf[0..])?;
+    write_array_data(&strided_view, &mut &mut buf[0..])?;
 
     // expect：6.0, 8.0, 14.0, 16.0
     let expected = [6.0f64, 8.0, 14.0, 16.0]

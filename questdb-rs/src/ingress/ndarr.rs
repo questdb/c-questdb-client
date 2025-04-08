@@ -2,19 +2,70 @@ pub trait NdArrayView<T>
 where
     T: ArrayElement,
 {
+    type Iter<'a>: Iterator<Item=&'a T>
+    where
+        Self: 'a,
+        T: 'a;
+
     /// Returns the number of dimensions (rank) of the array.
     fn ndim(&self) -> usize;
 
     /// Returns the size of the specified dimension.
     fn dim(&self, index: usize) -> Option<usize>;
 
-    /// Writes array data to writer in row-major order.
+    /// Return the array’s data as a slice, if it is c-major-layout.
+    /// Return `None` otherwise.
+    fn as_slice(&self) -> Option<&[T]>;
+
+    /// Return an iterator of references to the elements of the array.
+    /// Iterator element type is `&T`.
+    fn iter(&self) -> Self::Iter<'_>;
+
+    /// Validates the data buffer size of array is consistency of shapes.
     ///
-    /// # Important Notes
-    /// - Writer must be pre-allocated with exact required size
-    /// - No alignment assumptions should be made about writer start
-    /// - Handles both contiguous and non-contiguous memory layouts
-    fn write_row_major<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()>;
+    /// # Returns
+    /// - `Ok(usize)`: Expected buffer size in bytes if valid
+    /// - `Err(Error)`: Currently never returned, but reserved for future validation logic
+    fn check_data_buf(&self) -> Result<usize, Error>;
+}
+
+pub(crate) fn write_array_data<W: std::io::Write, A: NdArrayView<T>, T>(
+    array: &A,
+    writer: &mut W,
+) -> std::io::Result<()>
+where
+    T: ArrayElement,
+{
+    // First optimization path: write contiguous memory directly
+    if let Some(contiguous) = array.as_slice() {
+        let bytes = unsafe {
+            slice::from_raw_parts(contiguous.as_ptr() as *const u8, size_of_val(contiguous))
+        };
+        return writer.write_all(bytes);
+    }
+
+    // Fallback path: non-contiguous memory handling
+    let elem_size = size_of::<T>();
+    let mut io_slices = Vec::new();
+    for element in array.iter() {
+        let bytes = unsafe { slice::from_raw_parts(element as *const T as *const _, elem_size) };
+        io_slices.push(std::io::IoSlice::new(bytes));
+    }
+
+    let mut io_slices: &mut [IoSlice<'_>] = io_slices.as_mut_slice();
+    IoSlice::advance_slices(&mut io_slices, 0);
+
+    while !io_slices.is_empty() {
+        let written = writer.write_vectored(io_slices)?;
+        if written == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "Failed to write all bytes",
+            ));
+        }
+        IoSlice::advance_slices(&mut io_slices, written);
+    }
+    Ok(())
 }
 
 /// Marker trait for valid array element types.
@@ -62,8 +113,9 @@ impl ArrayElement for f64 {
     }
 }
 
+/// A view into a multi-dimensional array with custom memory strides.
 #[derive(Debug)]
-pub struct ArrayViewWithStrides<'a, T> {
+pub struct StridedArrayView<'a, T> {
     dims: usize,
     shapes: &'a [usize],
     strides: &'a [isize],
@@ -72,10 +124,16 @@ pub struct ArrayViewWithStrides<'a, T> {
     _marker: std::marker::PhantomData<T>,
 }
 
-impl<T> NdArrayView<T> for ArrayViewWithStrides<'_, T>
+impl<T> NdArrayView<T> for StridedArrayView<'_, T>
 where
     T: ArrayElement,
 {
+    type Iter<'b>
+    = RowMajorIter<'b, T>
+    where
+        Self: 'b,
+        T: 'b;
+
     fn ndim(&self) -> usize {
         self.dims
     }
@@ -88,74 +146,15 @@ where
         Some(self.shapes[index])
     }
 
-    fn write_row_major<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+    fn as_slice(&self) -> Option<&[T]> {
         if self.is_c_major() {
-            let bytes = unsafe { slice::from_raw_parts(self.buf, self.buf_len) };
-            writer.write_all(bytes)?;
-            Ok(())
+            Some(unsafe { slice::from_raw_parts(self.buf as *const T, self.buf_len / size_of::<T>()) })
         } else {
-            let mut io_slices = Vec::new();
-            for element in self.iter() {
-                io_slices.push(std::io::IoSlice::new(element));
-            }
-
-            let mut io_slices: &mut [std::io::IoSlice<'_>] = io_slices.as_mut_slice();
-            while !io_slices.is_empty() {
-                let written = writer.write_vectored(io_slices)?;
-                if written == 0 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::WriteZero,
-                        "Failed to write all bytes",
-                    ));
-                }
-                io_slices = &mut io_slices[written..];
-            }
-            Ok(())
-        }
-    }
-}
-
-impl<T> ArrayViewWithStrides<'_, T>
-where
-    T: ArrayElement,
-{
-    /// # Safety
-    ///
-    /// todo
-    pub unsafe fn new(
-        dims: usize,
-        shapes: *const usize,
-        strides: *const isize,
-        data: *const u8,
-        data_len: usize,
-    ) -> Self {
-        let shapes = slice::from_raw_parts(shapes, dims);
-        let strides = slice::from_raw_parts(strides, dims);
-        Self {
-            dims,
-            shapes,
-            strides,
-            buf_len: data_len,
-            buf: data,
-            _marker: std::marker::PhantomData::<T>,
+            None
         }
     }
 
-    fn is_c_major(&self) -> bool {
-        let mut expected_stride = size_of::<T>() as isize;
-        self.strides
-            .iter()
-            .rev()
-            .skip(1)
-            .zip(self.shapes.iter().rev())
-            .all(|(&actual, &dim)| {
-                let expected = expected_stride;
-                expected_stride *= dim as isize;
-                actual.abs() == expected.abs()
-            })
-    }
-
-    fn iter(&self) -> CMajorIterWithStrides<T> {
+    fn iter(&self) -> Self::Iter<'_> {
         let mut dim_products = Vec::with_capacity(self.dims);
         let mut product = 1;
         for &dim in self.shapes.iter().rev() {
@@ -177,7 +176,7 @@ where
                     ptr
                 }
             });
-        CMajorIterWithStrides {
+        RowMajorIter {
             base_ptr,
             array: self,
             dim_products,
@@ -185,17 +184,107 @@ where
             total_elements: self.shapes.iter().product(),
         }
     }
+
+    fn check_data_buf(&self) -> Result<usize, Error> {
+        let mut size = size_of::<T>();
+        for i in 0..self.dims {
+            let d = self.shapes[i];
+            size = size.checked_mul(d).ok_or(error::fmt!(
+                ArrayViewError,
+                "Array total elem size overflow"
+            ))?
+        }
+        if size != self.buf_len {
+            return Err(error::fmt!(
+                ArrayWriteToBufferError,
+                "Array buffer length mismatch (actual: {}, expected: {})",
+                self.buf_len,
+                size
+            ));
+        }
+        Ok(size)
+    }
 }
 
-struct CMajorIterWithStrides<'a, T> {
+impl<T> StridedArrayView<'_, T>
+where
+    T: ArrayElement,
+{
+    /// Creates a new strided array view from raw components (unsafe constructor).
+    ///
+    /// # Safety
+    /// Caller must ensure all the following conditions:
+    /// - `shapes` points to a valid array of at least `dims` elements
+    /// - `strides` points to a valid array of at least `dims` elements
+    /// - `data` points to a valid memory block of at least `data_len` bytes
+    /// - Memory layout must satisfy:
+    ///   1. `data_len ≥ (shape[0]-1)*abs(strides[0]) + ... + (shape[n-1]-1)*abs(strides[n-1]) + size_of::<T>()`
+    ///   2. All calculated offsets stay within `[0, data_len - size_of::<T>()]`
+    /// - Lifetime `'a` must outlive the view's usage
+    /// - Strides are measured in bytes (not elements)
+    pub unsafe fn new(
+        dims: usize,
+        shapes: *const usize,
+        strides: *const isize,
+        data: *const u8,
+        data_len: usize,
+    ) -> Self {
+        let shapes = slice::from_raw_parts(shapes, dims);
+        let strides = slice::from_raw_parts(strides, dims);
+        Self {
+            dims,
+            shapes,
+            strides,
+            buf_len: data_len,
+            buf: data,
+            _marker: std::marker::PhantomData::<T>,
+        }
+    }
+
+    /// Verifies if the array follows C-style row-major memory layout.
+    fn is_c_major(&self) -> bool {
+        if self.buf.is_null() || self.buf_len == 0 {
+            return false;
+        }
+
+        if self.dims == 1 {
+            return self.strides[0] == 1 || self.shapes[0] <= 1;
+        }
+
+        for &d in self.shapes {
+            if d == 0 {
+                return true;
+            }
+        }
+
+        let mut contig_stride = size_of::<T>();
+        for (dim, stride) in self.shapes.iter()
+            .rev()
+            .zip(self.strides.iter().rev())
+        {
+            if *dim != 1 {
+                let s = *stride;
+                if s.abs() != contig_stride as isize {
+                    return false;
+                }
+                contig_stride *= *dim;
+            }
+        }
+
+        true
+    }
+}
+
+/// Iterator for traversing a strided array in row-major (C-style) order.
+pub struct RowMajorIter<'a, T> {
     base_ptr: *const u8,
-    array: &'a ArrayViewWithStrides<'a, T>,
+    array: &'a StridedArrayView<'a, T>,
     dim_products: Vec<usize>,
     current_linear: usize,
     total_elements: usize,
 }
 
-impl<T> CMajorIterWithStrides<'_, T> {
+impl<T> RowMajorIter<'_, T> {
     fn is_ptr_valid(&self, ptr: *const u8) -> bool {
         let start = self.array.buf;
         let end = unsafe { start.add(self.array.buf_len) };
@@ -203,29 +292,35 @@ impl<T> CMajorIterWithStrides<'_, T> {
     }
 }
 
-impl<'a, T> Iterator for CMajorIterWithStrides<'a, T>
+impl<'a, T> Iterator for RowMajorIter<'a, T>
 where
     T: ArrayElement,
 {
-    type Item = &'a [u8];
+    type Item = &'a T;
     fn next(&mut self) -> Option<Self::Item> {
         if self.current_linear >= self.total_elements {
             return None;
         }
-        let mut index = self.current_linear;
+        let mut remaining_index = self.current_linear;
         let mut offset = 0isize;
 
-        for (dim, &prod) in self.dim_products.iter().enumerate() {
-            let coord = index / prod;
-            offset += self.array.strides[dim] * coord as isize;
-            index %= prod;
+        for (dim, &dim_factor) in self.dim_products.iter().enumerate() {
+            let coord = remaining_index / dim_factor;
+            remaining_index %= dim_factor;
+            let stride = self.array.strides[dim];
+            let actual_coord = if stride >= 0 {
+                coord
+            } else {
+                self.array.shapes[dim] - 1 - coord
+            };
+            offset += (actual_coord as isize) * stride;
         }
 
         self.current_linear += 1;
         unsafe {
             let ptr = self.base_ptr.offset(offset);
             if self.is_ptr_valid(ptr) {
-                Some(slice::from_raw_parts(ptr, size_of::<T>()))
+                Some(&*(ptr as *const T))
             } else {
                 None
             }
@@ -233,8 +328,10 @@ where
     }
 }
 
+use crate::{error, Error};
 #[cfg(feature = "ndarray")]
 use ndarray::{ArrayView, Axis, Dimension};
+use std::io::IoSlice;
 use std::slice;
 
 #[cfg(feature = "ndarray")]
@@ -243,6 +340,12 @@ where
     T: ArrayElement,
     D: Dimension,
 {
+    type Iter<'a>
+    = ndarray::iter::Iter<'a, T, D>
+    where
+        Self: 'a,
+        T: 'a;
+
     fn ndim(&self) -> usize {
         self.ndim()
     }
@@ -256,36 +359,15 @@ where
         }
     }
 
-    fn write_row_major<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        if let Some(contiguous) = self.as_slice() {
-            let bytes = unsafe {
-                std::slice::from_raw_parts(
-                    contiguous.as_ptr() as *const u8,
-                    size_of_val(contiguous),
-                )
-            };
-            return writer.write_all(bytes);
-        }
+    fn iter(&self) -> Self::Iter<'_> {
+        self.iter()
+    }
 
-        let elem_size = size_of::<T>();
-        let mut io_slices = Vec::new();
-        for element in self.iter() {
-            let bytes =
-                unsafe { std::slice::from_raw_parts(element as *const T as *const _, elem_size) };
-            io_slices.push(std::io::IoSlice::new(bytes));
-        }
+    fn as_slice(&self) -> Option<&[T]> {
+        self.as_slice()
+    }
 
-        let mut io_slices: &mut [std::io::IoSlice<'_>] = io_slices.as_mut_slice();
-        while !io_slices.is_empty() {
-            let written = writer.write_vectored(io_slices)?;
-            if written == 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    "Failed to write all bytes",
-                ));
-            }
-            io_slices = &mut io_slices[written..];
-        }
-        Ok(())
+    fn check_data_buf(&self) -> Result<usize, Error> {
+        Ok(self.len() * size_of::<T>())
     }
 }

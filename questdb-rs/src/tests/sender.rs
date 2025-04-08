@@ -37,12 +37,13 @@ use crate::tests::{
 #[cfg(feature = "ndarray")]
 use crate::{
     ingress,
-    ingress::{ElemDataType, NdArrayView},
+    ingress::ElemDataType,
 };
 use core::time::Duration;
 #[cfg(feature = "ndarray")]
 use ndarray::{arr1, arr2, ArrayD};
 
+use crate::ingress::ndarr;
 use std::{io, time::SystemTime};
 
 #[test]
@@ -124,9 +125,7 @@ fn test_array_basic() -> TestResult {
     ]
     .concat();
     let mut array_data2d = vec![0u8; 4 * size_of::<f64>()];
-    array_2d
-        .view()
-        .write_row_major(&mut &mut array_data2d[0..])?;
+    ndarr::write_array_data(&array_2d.view(), &mut &mut array_data2d[0..])?;
 
     let array_header3d = &[
         &[b'='][..],
@@ -139,9 +138,7 @@ fn test_array_basic() -> TestResult {
     ]
     .concat();
     let mut array_data3d = vec![0u8; 24 * size_of::<f64>()];
-    array_3d
-        .view()
-        .write_row_major(&mut &mut array_data3d[0..])?;
+    ndarr::write_array_data(&array_3d.view(), &mut &mut array_data3d[0..])?;
 
     let exp = &[
         "my_table,device=A001 f1=25.5".as_bytes(),

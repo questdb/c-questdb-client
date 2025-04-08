@@ -844,7 +844,7 @@ pub unsafe extern "C" fn line_sender_buffer_column_f64_arr(
 ) -> bool {
     let buffer = unwrap_buffer_mut(buffer);
     let name = name.as_name();
-    let view = ingress::ArrayViewWithStrides::<f64>::new(
+    let view = ingress::StridedArrayView::<f64>::new(
         rank,
         shapes,
         strides as *const isize,
@@ -853,7 +853,7 @@ pub unsafe extern "C" fn line_sender_buffer_column_f64_arr(
     );
     bubble_err_to_c!(
         err_out,
-        buffer.column_arr::<ColumnName<'_>, ingress::ArrayViewWithStrides<'_, f64>, f64>(name, &view)
+        buffer.column_arr::<ColumnName<'_>, ingress::StridedArrayView<'_, f64>, f64>(name, &view)
     );
     true
 }
