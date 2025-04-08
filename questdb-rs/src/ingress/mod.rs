@@ -1130,6 +1130,56 @@ impl Buffer {
         Ok(self)
     }
 
+    #[cfg(feature = "benchmark")]
+    pub fn column_arr_use_raw_buffer<'a, N, T, D>(&mut self, name: N, view: &T) -> Result<&mut Self>
+    where
+        N: TryInto<ColumnName<'a>>,
+        T: NdArrayView<D>,
+        D: ArrayElement,
+        Error: From<N::Error>,
+    {
+        self.write_column_key(name)?;
+
+        // check dimension less equal than max dims
+        if MAX_DIMS < view.ndim() {
+            return Err(error::fmt!(
+                ArrayHasTooManyDims,
+                "Array dimension mismatch: expected at most {} dimensions, but got {}",
+                MAX_DIMS,
+                view.ndim()
+            ));
+        }
+
+        let reserve_size = view.check_data_buf()?;
+        // binary format flag '='
+        self.output.push(b'=');
+        // binary format entity type
+        self.output.push(ARRAY_BINARY_FORMAT_TYPE);
+        // ndarr datatype
+        self.output.push(D::elem_type().into());
+        // ndarr dims
+        self.output.push(view.ndim() as u8);
+
+        for i in 0..view.ndim() {
+            let d = view.dim(i).ok_or_else(|| {
+                error::fmt!(
+                    ArrayViewError,
+                    "Can not get correct dimensions for dim {}",
+                    i
+                )
+            })?;
+            // ndarr shapes
+            self.output
+                .extend_from_slice((d as i32).to_le_bytes().as_slice());
+        }
+
+        self.output.reserve(reserve_size);
+        let index = self.output.len();
+        unsafe { self.output.set_len(reserve_size + index) }
+        ndarr::write_array_data_use_raw_buffer(&mut self.output[index..], view);
+        Ok(self)
+    }
+
     /// Record a timestamp value for the given column.
     ///
     /// ```

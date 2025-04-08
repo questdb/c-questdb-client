@@ -33,10 +33,14 @@ use std::ptr;
 use std::slice;
 use std::str;
 
-use questdb::{ingress, ingress::{
-    Buffer, CertificateAuthority, ColumnName, Protocol, Sender,
-    SenderBuilder, TableName, TimestampMicros, TimestampNanos,
-}, Error, ErrorCode};
+use questdb::{
+    ingress,
+    ingress::{
+        Buffer, CertificateAuthority, ColumnName, Protocol, Sender, SenderBuilder, TableName,
+        TimestampMicros, TimestampNanos,
+    },
+    Error, ErrorCode,
+};
 
 macro_rules! bubble_err_to_c {
     ($err_out:expr, $expression:expr) => {
@@ -140,7 +144,7 @@ pub enum line_sender_error_code {
     line_sender_error_array_view_internal_error,
 
     /// Write arrayView to sender buffer error.
-    line_sender_error_array_view_write_to_buffer_error
+    line_sender_error_array_view_write_to_buffer_error,
 }
 
 impl From<ErrorCode> for line_sender_error_code {
@@ -836,8 +840,8 @@ pub unsafe extern "C" fn line_sender_buffer_column_f64_arr(
     buffer: *mut line_sender_buffer,
     name: line_sender_column_name,
     rank: size_t,
-    shapes: *const size_t,    // C array of shapes
-    strides: *const i64,    // C array of strides
+    shapes: *const size_t,   // C array of shapes
+    strides: *const i64,     // C array of strides
     data_buffer: *const u8,  // Raw array data
     data_buffer_len: size_t, // Total bytes length
     err_out: *mut *mut line_sender_error,

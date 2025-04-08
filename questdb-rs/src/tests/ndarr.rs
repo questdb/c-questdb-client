@@ -163,7 +163,8 @@ fn test_buffer_basic_write() -> TestResult {
             2.2f64.to_le_bytes(),
             3.3f64.to_le_bytes(),
             4.4f64.to_le_bytes(),
-        ].concat()
+        ]
+        .concat()
     );
     Ok(())
 }
@@ -208,7 +209,9 @@ fn test_array_length_mismatch() -> TestResult {
     let result = buffer.column_arr("arr1", &under_view);
     let err = result.unwrap_err();
     assert_eq!(err.code(), ErrorCode::ArrayWriteToBufferError);
-    assert!(err.msg().contains("Array buffer length mismatch (actual: 8, expected: 16)"));
+    assert!(err
+        .msg()
+        .contains("Array buffer length mismatch (actual: 8, expected: 16)"));
 
     let over_data = vec![1.1, 2.2, 3.3];
     let over_view: StridedArrayView<'_, f64> = unsafe {
@@ -226,7 +229,9 @@ fn test_array_length_mismatch() -> TestResult {
     let result = buffer.column_arr("arr1", &over_view);
     let err = result.unwrap_err();
     assert_eq!(err.code(), ErrorCode::ArrayWriteToBufferError);
-    assert!(err.msg().contains("Array buffer length mismatch (actual: 24, expected: 16)"));
+    assert!(err
+        .msg()
+        .contains("Array buffer length mismatch (actual: 24, expected: 16)"));
     Ok(())
 }
 

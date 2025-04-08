@@ -2,7 +2,7 @@ pub trait NdArrayView<T>
 where
     T: ArrayElement,
 {
-    type Iter<'a>: Iterator<Item=&'a T>
+    type Iter<'a>: Iterator<Item = &'a T>
     where
         Self: 'a,
         T: 'a;
@@ -29,7 +29,7 @@ where
     fn check_data_buf(&self) -> Result<usize, Error>;
 }
 
-pub(crate) fn write_array_data<W: std::io::Write, A: NdArrayView<T>, T>(
+pub fn write_array_data<W: std::io::Write, A: NdArrayView<T>, T>(
     array: &A,
     writer: &mut W,
 ) -> std::io::Result<()>
@@ -66,6 +66,30 @@ where
         IoSlice::advance_slices(&mut io_slices, written);
     }
     Ok(())
+}
+
+#[cfg(feature = "benchmark")]
+pub(crate) fn write_array_data_use_raw_buffer<A: NdArrayView<T>, T>(buf: &mut [u8], array: &A)
+where
+    T: ArrayElement,
+{
+    // First optimization path: write contiguous memory directly
+    if let Some(contiguous) = array.as_slice() {
+        let byte_len = size_of_val(contiguous);
+        let bytes =
+            unsafe { std::slice::from_raw_parts(contiguous.as_ptr() as *const u8, byte_len) };
+        buf[..byte_len].copy_from_slice(bytes);
+    }
+
+    // Fallback path: non-contiguous memory handling
+    let mut bytes_written = 0;
+    let elem_size = size_of::<T>();
+    for &element in array.iter() {
+        let element_bytes =
+            unsafe { std::slice::from_raw_parts(&element as *const T as *const _, elem_size) };
+        buf[bytes_written..bytes_written + elem_size].copy_from_slice(element_bytes);
+        bytes_written += elem_size;
+    }
 }
 
 /// Marker trait for valid array element types.
@@ -129,7 +153,7 @@ where
     T: ArrayElement,
 {
     type Iter<'b>
-    = RowMajorIter<'b, T>
+        = RowMajorIter<'b, T>
     where
         Self: 'b,
         T: 'b;
@@ -148,7 +172,9 @@ where
 
     fn as_slice(&self) -> Option<&[T]> {
         if self.is_c_major() {
-            Some(unsafe { slice::from_raw_parts(self.buf as *const T, self.buf_len / size_of::<T>()) })
+            Some(unsafe {
+                slice::from_raw_parts(self.buf as *const T, self.buf_len / size_of::<T>())
+            })
         } else {
             None
         }
@@ -258,10 +284,7 @@ where
         }
 
         let mut contig_stride = size_of::<T>();
-        for (dim, stride) in self.shapes.iter()
-            .rev()
-            .zip(self.strides.iter().rev())
-        {
+        for (dim, stride) in self.shapes.iter().rev().zip(self.strides.iter().rev()) {
             if *dim != 1 {
                 let s = *stride;
                 if s.abs() != contig_stride as isize {
@@ -341,7 +364,7 @@ where
     D: Dimension,
 {
     type Iter<'a>
-    = ndarray::iter::Iter<'a, T, D>
+        = ndarray::iter::Iter<'a, T, D>
     where
         Self: 'a,
         T: 'a;
