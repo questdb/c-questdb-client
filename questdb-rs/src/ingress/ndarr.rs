@@ -21,7 +21,7 @@ where
     /// Iterator element type is `&T`.
     fn iter(&self) -> Self::Iter<'_>;
 
-    /// Validates the data buffer size of array is consistency of shapes.
+    /// Validates the data buffer size of array is consistency with array [`Shapes`].
     ///
     /// # Returns
     /// - `Ok(usize)`: Expected buffer size in bytes if valid
