@@ -470,10 +470,8 @@ bool line_sender_buffer_column_str(
  * @param[in] rank Number of dimensions of the array.
  * @param[in] shapes Array of dimension sizes (length = `rank`).
  *                   Each element must be a positive integer.
- * @param[in] data_buffer Raw bytes of the array data in little-endian format.
- *                        Size must be `sizeof(double) * (shapes[0] * ... *
- *                        shapes[rank-1])`.
- * @param[in] data_buffer_len Byte length of the data buffer.
+ * @param[in] data_buffer First array element data.
+ * @param[in] data_buffer_len Bytes length of the array data.
  * @param[out] err_out Set to an error object on failure (if non-NULL).
  * @return true on success, false on error.
  */
@@ -482,8 +480,8 @@ bool line_sender_buffer_column_f64_arr(
     line_sender_buffer* buffer,
     line_sender_column_name name,
     size_t rank,
-    const size_t* shapes,
-    const int64_t* strides,
+    const uint32_t* shapes,
+    const int32_t* strides,
     const uint8_t* data_buffer,
     size_t data_buffer_len,
     line_sender_error** err_out);

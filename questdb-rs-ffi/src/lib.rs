@@ -828,7 +828,8 @@ pub unsafe extern "C" fn line_sender_buffer_column_str(
 /// @param[in] name Column name.
 /// @param[in] rank Array dims.
 /// @param[in] shape Array shapes.
-/// @param[in] data_buffer Array data memory ptr.
+/// @param[in] strides Array strides.
+/// @param[in] data_buffer Array **first element** data memory ptr.
 /// @param[in] data_buffer_len Array data memory length.
 /// @param[out] err_out Set on error.
 /// # Safety
@@ -840,18 +841,18 @@ pub unsafe extern "C" fn line_sender_buffer_column_f64_arr(
     buffer: *mut line_sender_buffer,
     name: line_sender_column_name,
     rank: size_t,
-    shapes: *const size_t,   // C array of shapes
-    strides: *const i64,     // C array of strides
-    data_buffer: *const u8,  // Raw array data
-    data_buffer_len: size_t, // Total bytes length
+    shape: *const u32,
+    strides: *const i32,
+    data_buffer: *const u8,
+    data_buffer_len: size_t,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     let buffer = unwrap_buffer_mut(buffer);
     let name = name.as_name();
     let view = ingress::StridedArrayView::<f64>::new(
         rank,
-        shapes,
-        strides as *const isize,
+        shape,
+        strides,
         data_buffer,
         data_buffer_len,
     );

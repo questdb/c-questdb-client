@@ -35,12 +35,12 @@ use crate::tests::{
 };
 
 #[cfg(feature = "ndarray")]
+use crate::ingress::ndarr::write_array_data;
+#[cfg(feature = "ndarray")]
 use crate::{ingress, ingress::ElemDataType};
 use core::time::Duration;
 #[cfg(feature = "ndarray")]
 use ndarray::{arr1, arr2, ArrayD};
-
-use crate::ingress::ndarr::write_array_data;
 use std::{io, time::SystemTime};
 
 #[test]

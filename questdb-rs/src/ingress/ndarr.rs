@@ -143,8 +143,8 @@ impl ArrayElement for f64 {
 #[derive(Debug)]
 pub struct StridedArrayView<'a, T> {
     dims: usize,
-    shapes: &'a [usize],
-    strides: &'a [isize],
+    shape: &'a [u32],
+    strides: &'a [i32],
     buf_len: usize,
     buf: *const u8,
     _marker: std::marker::PhantomData<T>,
@@ -169,7 +169,7 @@ where
             return None;
         }
 
-        Some(self.shapes[index])
+        Some(self.shape[index] as usize)
     }
 
     fn as_slice(&self) -> Option<&[T]> {
@@ -185,7 +185,7 @@ where
     fn iter(&self) -> Self::Iter<'_> {
         let mut dim_products = Vec::with_capacity(self.dims);
         let mut product = 1;
-        for &dim in self.shapes.iter().rev() {
+        for &dim in self.shape.iter().rev() {
             dim_products.push(product);
             product *= dim;
         }
@@ -198,8 +198,8 @@ where
             .enumerate()
             .fold(self.buf, |ptr, (dim, &stride)| {
                 if stride < 0 {
-                    let dim_size = self.shapes[dim] as isize;
-                    unsafe { ptr.offset(stride * (dim_size - 1)) }
+                    let dim_size = self.shape[dim] as isize;
+                    unsafe { ptr.offset(stride as isize * (dim_size - 1)) }
                 } else {
                     ptr
                 }
@@ -209,15 +209,15 @@ where
             array: self,
             dim_products,
             current_linear: 0,
-            total_elements: self.shapes.iter().product(),
+            total_elements: self.shape.iter().product(),
         }
     }
 
     fn check_data_buf(&self) -> Result<usize, Error> {
         let mut size = size_of::<T>();
         for i in 0..self.dims {
-            let d = self.shapes[i];
-            size = size.checked_mul(d).ok_or(error::fmt!(
+            let d = self.shape[i];
+            size = size.checked_mul(d as usize).ok_or(error::fmt!(
                 ArrayViewError,
                 "Array total elem size overflow"
             ))?
@@ -252,16 +252,16 @@ where
     /// - Strides are measured in bytes (not elements)
     pub unsafe fn new(
         dims: usize,
-        shapes: *const usize,
-        strides: *const isize,
+        shape: *const u32,
+        strides: *const i32,
         data: *const u8,
         data_len: usize,
     ) -> Self {
-        let shapes = slice::from_raw_parts(shapes, dims);
+        let shapes = slice::from_raw_parts(shape, dims);
         let strides = slice::from_raw_parts(strides, dims);
         Self {
             dims,
-            shapes,
+            shape: shapes,
             strides,
             buf_len: data_len,
             buf: data,
@@ -275,17 +275,17 @@ where
             return false;
         }
 
-        let elem_size = size_of::<T>() as isize;
+        let elem_size = size_of::<T>() as i32;
         if self.dims == 1 {
-            return self.strides[0] == elem_size || self.shapes[0] == 1;
+            return self.strides[0] == elem_size || self.shape[0] == 1;
         }
 
         let mut expected_stride = elem_size;
-        for (dim, &stride) in self.shapes.iter().zip(self.strides).rev() {
+        for (dim, &stride) in self.shape.iter().zip(self.strides).rev() {
             if *dim > 1 && stride != expected_stride {
                 return false;
             }
-            expected_stride *= *dim as isize;
+            expected_stride *= *dim as i32;
         }
         true
     }
@@ -295,9 +295,9 @@ where
 pub struct RowMajorIter<'a, T> {
     base_ptr: *const u8,
     array: &'a StridedArrayView<'a, T>,
-    dim_products: Vec<usize>,
-    current_linear: usize,
-    total_elements: usize,
+    dim_products: Vec<u32>,
+    current_linear: u32,
+    total_elements: u32,
 }
 
 impl<'a, T> Iterator for RowMajorIter<'a, T>
@@ -310,7 +310,7 @@ where
             return None;
         }
         let mut remaining_index = self.current_linear;
-        let mut offset = 0isize;
+        let mut offset = 0;
 
         for (dim, &dim_factor) in self.dim_products.iter().enumerate() {
             let coord = remaining_index / dim_factor;
@@ -319,14 +319,14 @@ where
             let actual_coord = if stride >= 0 {
                 coord
             } else {
-                self.array.shapes[dim] - 1 - coord
+                self.array.shape[dim] - 1 - coord
             };
-            offset += (actual_coord as isize) * stride.abs();
+            offset += actual_coord * stride.unsigned_abs();
         }
 
         self.current_linear += 1;
         unsafe {
-            let ptr = self.base_ptr.offset(offset);
+            let ptr = self.base_ptr.offset(offset as isize);
             Some(&*(ptr as *const T))
         }
     }

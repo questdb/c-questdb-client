@@ -631,18 +631,15 @@ public:
      *
      * @param name    Column name.
      * @param shape   Array dimensions (e.g., [2,3] for a 2x3 matrix).
-     * @param data    Array data in row-major order. Size must match product of
+     * @param data    Array first element data. Size must match product of
      * dimensions.
-     *
-     * @note Data is stored contiguously in row-major (C-style) order.
-     *       Example: shape [2,3] expects 6 elements ordered as:
-     *       [a11, a12, a13, a21, a22, a23]
      */
     template <typename T, size_t N>
     line_sender_buffer& column(
         column_name_view name,
-        const std::vector<size_t>& shapes,
-        const std::vector<int64_t>& strides,
+        const size_t rank,
+        const std::vector<uint32_t>& shapes,
+        const std::vector<int32_t>& strides,
         const std::array<T, N>& data)
     {
         static_assert(
@@ -653,6 +650,7 @@ public:
             ::line_sender_buffer_column_f64_arr,
             _impl,
             name._impl,
+            rank,
             shapes.data(),
             strides.data(),
             reinterpret_cast<const uint8_t*>(data.data()),
