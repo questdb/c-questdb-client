@@ -77,11 +77,7 @@ where
     if let Some(contiguous) = array.as_slice() {
         let byte_len = size_of_val(contiguous);
         unsafe {
-            ptr::copy_nonoverlapping(
-                contiguous.as_ptr() as *const u8,
-                buf.as_mut_ptr(),
-                byte_len,
-            )
+            std::ptr::copy_nonoverlapping(contiguous.as_ptr() as *const u8, buf.as_mut_ptr(), byte_len)
         }
     }
 
@@ -89,7 +85,7 @@ where
     let elem_size = size_of::<T>();
     for (i, &element) in array.iter().enumerate() {
         unsafe {
-            ptr::copy_nonoverlapping(
+            std::ptr::copy_nonoverlapping(
                 &element as *const T as *const u8,
                 buf.as_mut_ptr().add(i * elem_size),
                 elem_size,
@@ -279,9 +275,6 @@ where
             return false;
         }
 
-        if self.shapes.iter().any(|&d| d == 0) {
-            return true;
-        }
         let elem_size = size_of::<T>() as isize;
         if self.dims == 1 {
             return self.strides[0] == elem_size || self.shapes[0] == 1;
@@ -343,7 +336,7 @@ use crate::{error, Error};
 #[cfg(feature = "ndarray")]
 use ndarray::{ArrayView, Axis, Dimension};
 use std::io::IoSlice;
-use std::{ptr, slice};
+use std::slice;
 
 #[cfg(feature = "ndarray")]
 impl<T, D> NdArrayView<T> for ArrayView<'_, T, D>
