@@ -24,8 +24,8 @@
 
 #pragma once
 
+#include <cassert>
 #include <vector>
-#include <string>
 #include <cstdint>
 #include <optional>
 #include <stdexcept>
