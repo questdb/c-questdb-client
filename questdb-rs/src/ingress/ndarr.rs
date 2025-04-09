@@ -273,27 +273,21 @@ where
             return false;
         }
 
+        if self.shapes.iter().any(|&d| d == 0) {
+            return true;
+        }
+        let elem_size = size_of::<T>() as isize;
         if self.dims == 1 {
-            return self.strides[0] == 1 || self.shapes[0] <= 1;
+            return self.strides[0] == elem_size || self.shapes[0] == 1;
         }
 
-        for &d in self.shapes {
-            if d == 0 {
-                return true;
+        let mut expected_stride = elem_size;
+        for (dim, &stride) in self.shapes.iter().zip(self.strides).rev() {
+            if *dim > 1 && stride != expected_stride {
+                return false;
             }
+            expected_stride *= *dim as isize;
         }
-
-        let mut contig_stride = size_of::<T>();
-        for (dim, stride) in self.shapes.iter().rev().zip(self.strides.iter().rev()) {
-            if *dim != 1 {
-                let s = *stride;
-                if s.abs() != contig_stride as isize {
-                    return false;
-                }
-                contig_stride *= *dim;
-            }
-        }
-
         true
     }
 }
@@ -305,14 +299,6 @@ pub struct RowMajorIter<'a, T> {
     dim_products: Vec<usize>,
     current_linear: usize,
     total_elements: usize,
-}
-
-impl<T> RowMajorIter<'_, T> {
-    fn is_ptr_valid(&self, ptr: *const u8) -> bool {
-        let start = self.array.buf;
-        let end = unsafe { start.add(self.array.buf_len) };
-        ptr >= start && ptr < end
-    }
 }
 
 impl<'a, T> Iterator for RowMajorIter<'a, T>
@@ -336,17 +322,13 @@ where
             } else {
                 self.array.shapes[dim] - 1 - coord
             };
-            offset += (actual_coord as isize) * stride;
+            offset += (actual_coord as isize) * stride.abs();
         }
 
         self.current_linear += 1;
         unsafe {
             let ptr = self.base_ptr.offset(offset);
-            if self.is_ptr_valid(ptr) {
-                Some(&*(ptr as *const T))
-            } else {
-                None
-            }
+            Some(&*(ptr as *const T))
         }
     }
 }

@@ -97,6 +97,35 @@ fn test_strided_non_contiguous() -> TestResult {
 }
 
 #[test]
+fn test_negative_strides() -> TestResult {
+    let elem_size = size_of::<f64>();
+    let data = vec![1f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+    let view = unsafe {
+        StridedArrayView::<f64>::new(
+            2,
+            &[3usize, 3usize] as *const usize,
+            &[-24isize, 8] as *const isize,
+            (data.as_ptr() as *const u8).add(48),
+            data.len() * elem_size,
+        )
+    };
+    let collected: Vec<_> = view.iter().copied().collect();
+    assert!(view.as_slice().is_none());
+    let expected_data = vec![7.0, 8.0, 9.0, 4.0, 5.0, 6.0, 1.0, 2.0, 3.0];
+    assert_eq!(collected, expected_data);
+    let mut buffer = Vec::new();
+    write_array_data(&view, &mut buffer)?;
+    let expected_bytes = unsafe {
+        std::slice::from_raw_parts(
+            expected_data.as_ptr() as *const u8,
+            expected_data.len() * elem_size,
+        )
+    };
+    assert_eq!(buffer, expected_bytes);
+    Ok(())
+}
+
+#[test]
 fn test_basic_edge_cases() {
     // empty array
     let elem_size = std::mem::size_of::<f64>();
