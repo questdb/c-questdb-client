@@ -76,19 +76,25 @@ where
     // First optimization path: write contiguous memory directly
     if let Some(contiguous) = array.as_slice() {
         let byte_len = size_of_val(contiguous);
-        let bytes =
-            unsafe { std::slice::from_raw_parts(contiguous.as_ptr() as *const u8, byte_len) };
-        buf[..byte_len].copy_from_slice(bytes);
+        unsafe {
+            ptr::copy_nonoverlapping(
+                contiguous.as_ptr() as *const u8,
+                buf.as_mut_ptr(),
+                byte_len,
+            )
+        }
     }
 
     // Fallback path: non-contiguous memory handling
-    let mut bytes_written = 0;
     let elem_size = size_of::<T>();
-    for &element in array.iter() {
-        let element_bytes =
-            unsafe { std::slice::from_raw_parts(&element as *const T as *const _, elem_size) };
-        buf[bytes_written..bytes_written + elem_size].copy_from_slice(element_bytes);
-        bytes_written += elem_size;
+    for (i, &element) in array.iter().enumerate() {
+        unsafe {
+            ptr::copy_nonoverlapping(
+                &element as *const T as *const u8,
+                buf.as_mut_ptr().add(i * elem_size),
+                elem_size,
+            )
+        }
     }
 }
 
@@ -337,7 +343,7 @@ use crate::{error, Error};
 #[cfg(feature = "ndarray")]
 use ndarray::{ArrayView, Axis, Dimension};
 use std::io::IoSlice;
-use std::slice;
+use std::{ptr, slice};
 
 #[cfg(feature = "ndarray")]
 impl<T, D> NdArrayView<T> for ArrayView<'_, T, D>
