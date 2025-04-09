@@ -48,6 +48,7 @@ int main(int argc, const char* argv[])
     // 3D array of doubles
     size_t rank = 3;
     uint32_t shapes[] = {2, 3, 2};
+    int32_t strides[] = {48, 16, 8};
     double arr_data[] = {
         48123.5,
         2.4,
@@ -66,6 +67,7 @@ int main(int argc, const char* argv[])
             arr_name,
             rank,
             shapes,
+            strides,
             (const uint8_t*)arr_data,
             sizeof(arr_data),
             &err))
