@@ -77,7 +77,11 @@ where
     if let Some(contiguous) = array.as_slice() {
         let byte_len = size_of_val(contiguous);
         unsafe {
-            std::ptr::copy_nonoverlapping(contiguous.as_ptr() as *const u8, buf.as_mut_ptr(), byte_len)
+            std::ptr::copy_nonoverlapping(
+                contiguous.as_ptr() as *const u8,
+                buf.as_mut_ptr(),
+                byte_len,
+            )
         }
     }
 
