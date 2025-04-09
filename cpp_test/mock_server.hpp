@@ -29,9 +29,12 @@
 #include <cstdint>
 #include <optional>
 #include <stdexcept>
-
 #include "build_env.h"
-#include "questdb/ingress/line_sender.hpp"
+#if __cplusplus < 202002L
+#    include "questdb/ingress/line_sender.hpp"
+#else
+#    include <span>
+#endif
 
 #if defined(PLATFORM_UNIX)
 typedef int socketfd_t;
@@ -61,10 +64,14 @@ public:
 
     size_t recv(double wait_timeout_sec = 0.1);
 
-    const buffer_view msgs(size_t index) const
+#if __cplusplus >= 202002L
+    using buffer_view = std::span<const std::byte>;
+#endif
+
+    buffer_view msgs(size_t index) const
     {
         assert(index < _msgs.size());
-        return buffer_view{_msgs[index].data(), _msgs[index].size()};
+        return {_msgs[index].data(), _msgs[index].size()};
     }
 
     void close();
