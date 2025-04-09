@@ -533,7 +533,7 @@ impl MockServer {
                 // calc binary length
                 let binary_type = accum[index];
                 if binary_type == ingress::DOUBLE_BINARY_FORMAT_TYPE {
-                    index += size_of::<f64>();
+                    index += size_of::<f64>() + 1;
                 } else if binary_type == ingress::ARRAY_BINARY_FORMAT_TYPE {
                     index += 1;
                     let element_type = match ElemDataType::try_from(accum[index]) {

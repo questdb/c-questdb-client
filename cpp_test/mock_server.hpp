@@ -31,6 +31,7 @@
 #include <stdexcept>
 
 #include "build_env.h"
+#include "questdb/ingress/line_sender.hpp"
 
 #if defined(PLATFORM_UNIX)
 typedef int socketfd_t;
@@ -60,9 +61,10 @@ public:
 
     size_t recv(double wait_timeout_sec = 0.1);
 
-    const std::vector<std::string>& msgs() const
+    const buffer_view msgs(size_t index) const
     {
-        return _msgs;
+        assert(index < _msgs.size());
+        return buffer_view{_msgs[index].data(), _msgs[index].size()};
     }
 
     void close();
@@ -75,7 +77,7 @@ private:
     socketfd_t _listen_fd;
     socketfd_t _conn_fd;
     uint16_t _port;
-    std::vector<std::string> _msgs;
+    std::vector<std::vector<std::byte>> _msgs;
 };
 
 } // namespace questdb::ingress::test
