@@ -63,7 +63,7 @@ fn test_strided_array_view() -> TestResult {
 #[test]
 fn test_strided_non_contiguous() -> TestResult {
     let elem_size = size_of::<f64>() as i32;
-    let col_major_data = vec![1.0, 3.0, 5.0, 2.0, 4.0, 6.0];
+    let col_major_data = [1.0, 3.0, 5.0, 2.0, 4.0, 6.0];
     let shapes = [3u32, 2];
     let strides = [elem_size, shapes[0] as i32 * elem_size];
 
@@ -85,7 +85,7 @@ fn test_strided_non_contiguous() -> TestResult {
     let mut buffer = Vec::new();
     write_array_data(&array_view, &mut buffer)?;
 
-    let expected_data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let expected_data = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
     let expected_bytes = unsafe {
         std::slice::from_raw_parts(
             expected_data.as_ptr() as *const u8,
@@ -99,7 +99,7 @@ fn test_strided_non_contiguous() -> TestResult {
 #[test]
 fn test_negative_strides() -> TestResult {
     let elem_size = size_of::<f64>();
-    let data = vec![1f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+    let data = [1f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
     let view = unsafe {
         StridedArrayView::<f64>::new(
             2,
@@ -136,7 +136,7 @@ fn test_basic_edge_cases() {
     assert_eq!(empty_view.dim(1), Some(0));
 
     // single element array
-    let single_data = vec![42.0];
+    let single_data = [42.0];
     let single_view: StridedArrayView<'_, f64> = unsafe {
         StridedArrayView::new(
             2,
@@ -155,7 +155,7 @@ fn test_basic_edge_cases() {
 fn test_buffer_basic_write() -> TestResult {
     let elem_size = std::mem::size_of::<f64>() as i32;
 
-    let test_data = vec![1.1, 2.2, 3.3, 4.4];
+    let test_data = [1.1, 2.2, 3.3, 4.4];
     let array_view: StridedArrayView<'_, f64> = unsafe {
         StridedArrayView::new(
             2,
@@ -221,8 +221,8 @@ fn test_size_overflow() -> TestResult {
 
 #[test]
 fn test_array_length_mismatch() -> TestResult {
-    let elem_size = std::mem::size_of::<f64>() as i32;
-    let under_data = vec![1.1];
+    let elem_size = size_of::<f64>() as i32;
+    let under_data = [1.1];
     let under_view: StridedArrayView<'_, f64> = unsafe {
         StridedArrayView::new(
             2,
@@ -242,7 +242,7 @@ fn test_array_length_mismatch() -> TestResult {
         .msg()
         .contains("Array buffer length mismatch (actual: 8, expected: 16)"));
 
-    let over_data = vec![1.1, 2.2, 3.3];
+    let over_data = [1.1, 2.2, 3.3];
     let over_view: StridedArrayView<'_, f64> = unsafe {
         StridedArrayView::new(
             2,

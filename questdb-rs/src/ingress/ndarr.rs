@@ -21,7 +21,7 @@ where
     /// Iterator element type is `&T`.
     fn iter(&self) -> Self::Iter<'_>;
 
-    /// Validates the data buffer size of array is consistency with array [`Shapes`].
+    /// Validates the data buffer size of array is consistency with array shapes.
     ///
     /// # Returns
     /// - `Ok(usize)`: Expected buffer size in bytes if valid
@@ -111,7 +111,7 @@ pub trait ArrayElement: Copy + 'static {
 }
 
 /// Defines binary format identifiers for array element types compatible with
-/// QuestDB's [`ColumnType`]: https://github.com/questdb/questdb/blob/e1853db56ae586d923ca77de01a487cad44093b9/core/src/main/java/io/questdb/cairo/ColumnType.java#L67-L89.
+/// QuestDB's ColumnType: <https://github.com/questdb/questdb/blob/e1853db56ae586d923ca77de01a487cad44093b9/core/src/main/java/io/questdb/cairo/ColumnType.java#L67-L89>.
 #[repr(u8)]
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum ElemDataType {
