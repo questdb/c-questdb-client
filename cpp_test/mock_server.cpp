@@ -208,8 +208,11 @@ size_t mock_server::recv(double wait_timeout_sec)
     for (;;)
     {
         wait_for_data();
-        sock_ssize_t count =
-            ::recv(_conn_fd, &chunk[0], static_cast<sock_len_t>(chunk_len), 0);
+        sock_ssize_t count = ::recv(
+            _conn_fd,
+            reinterpret_cast<char*>(&chunk[0]),
+            static_cast<sock_len_t>(chunk_len),
+            0);
         if (count == -1)
             throw std::runtime_error{"Bad `recv()`."};
         const size_t u_count = static_cast<size_t>(count);
