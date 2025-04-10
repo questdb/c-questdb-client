@@ -375,14 +375,14 @@ fn test_buffer_ndarray_write() -> TestResult {
 fn test_buffer_write_ndarray_max_dimensions() -> TestResult {
     let mut buffer = Buffer::new();
     buffer.table("nd_test")?;
-    let shape: Vec<usize> = iter::repeat(1).take(MAX_DIMS).collect();
+    let shape: Vec<usize> = iter::repeat_n(1, MAX_DIMS).collect();
     let array = ArrayD::<f64>::zeros(shape.clone());
     buffer.column_arr("max_dim", &array.view())?;
     let data = buffer.as_bytes();
     assert_eq!(data[19], MAX_DIMS as u8);
 
     // 33 dims error
-    let shape_invalid: Vec<_> = iter::repeat(1).take(MAX_DIMS + 1).collect();
+    let shape_invalid: Vec<_> = iter::repeat_n(1, MAX_DIMS + 1).collect();
     let array_invalid = ArrayD::<f64>::zeros(shape_invalid);
     let result = buffer.column_arr("invalid", &array_invalid.view());
     assert!(result.is_err());
