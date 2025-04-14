@@ -93,7 +93,7 @@ bool operator==(
 #endif
 
 template <size_t N>
-void push_double_arr_to_buffer(
+std::string& push_double_arr_to_buffer(
     std::string& buffer,
     std::array<double, N> data,
     size_t rank,
@@ -108,6 +108,14 @@ void push_double_arr_to_buffer(
     buffer.append(
         reinterpret_cast<const char*>(data.data()),
         data.size() * sizeof(double));
+    return buffer;
+}
+
+std::string& push_double_to_buffer(std::string& buffer, double data)
+{
+    buffer.push_back(16);
+    buffer.append(reinterpret_cast<const char*>(&data), sizeof(double));
+    return buffer;
 }
 
 TEST_CASE("line_sender c api basics")
@@ -180,13 +188,14 @@ TEST_CASE("line_sender c api basics")
             &err));
     CHECK(::line_sender_buffer_at_nanos(buffer, 10000000, &err));
     CHECK(server.recv() == 0);
-    CHECK(::line_sender_buffer_size(buffer) == 143);
+    CHECK(::line_sender_buffer_size(buffer) == 150);
     CHECK(::line_sender_flush(sender, buffer, &err));
     ::line_sender_buffer_free(buffer);
     CHECK(server.recv() == 1);
-    std::string expect{"test,t1=v1 f1=0.5,a1=="};
-    push_double_arr_to_buffer(expect, arr_data, 3, shapes);
-    expect.append(" 10000000\n");
+    std::string expect{"test,t1=v1 f1=="};
+    push_double_to_buffer(expect, 0.5).append(",a1==");
+    push_double_arr_to_buffer(expect, arr_data, 3, shapes)
+        .append(" 10000000\n");
     CHECK(server.msgs(0) == expect);
 }
 
@@ -243,10 +252,12 @@ TEST_CASE("line_sender c++ api basics")
         .at(questdb::ingress::timestamp_nanos{10000000});
 
     CHECK(server.recv() == 0);
-    CHECK(buffer.size() == 31);
+    CHECK(buffer.size() == 38);
     sender.flush(buffer);
     CHECK(server.recv() == 1);
-    CHECK(server.msgs(0) == "test,t1=v1,t2= f1=0.5 10000000\n");
+    std::string expect{"test,t1=v1,t2= f1=="};
+    push_double_to_buffer(expect, 0.5).append(" 10000000\n");
+    CHECK(server.msgs(0) == expect);
 }
 
 TEST_CASE("test multiple lines")
@@ -279,13 +290,13 @@ TEST_CASE("test multiple lines")
         .at_now();
 
     CHECK(server.recv() == 0);
-    CHECK(buffer.size() == 137);
+    CHECK(buffer.size() == 142);
     sender.flush(buffer);
     CHECK(server.recv() == 2);
-    CHECK(
-        server.msgs(0) ==
-        ("metric1,t1=val1,t2=val2 f1=t,f2=12345i,"
-         "f3=10.75,f4=\"val3\",f5=\"val4\",f6=\"val5\" 111222233333\n"));
+    std::string expect{"metric1,t1=val1,t2=val2 f1=t,f2=12345i,f3=="};
+    push_double_to_buffer(expect, 10.75)
+        .append(",f4=\"val3\",f5=\"val4\",f6=\"val5\" 111222233333\n");
+    CHECK(server.msgs(0) == expect);
     CHECK(
         server.msgs(1) == "metric1,tag3=value\\ 3,tag\\ 4=value:4 field5=f\n");
 }
@@ -683,13 +694,19 @@ TEST_CASE("os certs")
 
     {
         questdb::ingress::opts opts{
-            questdb::ingress::protocol::https, "localhost", server.port()};
+            questdb::ingress::protocol::https,
+            "localhost",
+            server.port(),
+            true};
         opts.tls_ca(questdb::ingress::ca::os_roots);
     }
 
     {
         questdb::ingress::opts opts{
-            questdb::ingress::protocol::https, "localhost", server.port()};
+            questdb::ingress::protocol::https,
+            "localhost",
+            server.port(),
+            true};
         opts.tls_ca(questdb::ingress::ca::webpki_and_os_roots);
     }
 }
@@ -718,9 +735,12 @@ TEST_CASE("Opts copy ctor, assignment and move testing.")
 
     {
         questdb::ingress::opts opts1{
-            questdb::ingress::protocol::https, "localhost", "9009"};
+            questdb::ingress::protocol::https, "localhost", "9009", true};
         questdb::ingress::opts opts2{
-            questdb::ingress::protocol::https, "altavista.digital.com", "9009"};
+            questdb::ingress::protocol::https,
+            "altavista.digital.com",
+            "9009",
+            true};
         opts1 = opts2;
     }
 }
@@ -890,15 +910,15 @@ TEST_CASE("Opts from conf")
 TEST_CASE("HTTP basics")
 {
     questdb::ingress::opts opts1{
-        questdb::ingress::protocol::http, "localhost", 1};
+        questdb::ingress::protocol::http, "localhost", 1, true};
     questdb::ingress::opts opts1conf = questdb::ingress::opts::from_conf(
         "http::addr=localhost:1;username=user;password=pass;request_timeout="
-        "5000;retry_timeout=5;");
+        "5000;retry_timeout=5;disable_line_protocol_validation=on;");
     questdb::ingress::opts opts2{
-        questdb::ingress::protocol::https, "localhost", "1"};
+        questdb::ingress::protocol::https, "localhost", "1", true};
     questdb::ingress::opts opts2conf = questdb::ingress::opts::from_conf(
         "http::addr=localhost:1;token=token;request_min_throughput=1000;retry_"
-        "timeout=0;");
+        "timeout=0;disable_line_protocol_validation=on;");
     opts1.username("user")
         .password("pass")
         .max_buf_size(1000000)

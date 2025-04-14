@@ -55,8 +55,11 @@ pub enum ErrorCode {
     /// Array view internal error.
     ArrayViewError,
 
-    /// Array write to buffer error
+    /// Array write to buffer error.
     ArrayWriteToBufferError,
+
+    /// Validate line protocol version error.
+    LineProtocolVersionError,
 }
 
 /// An error that occurred when using QuestDB client library.

@@ -40,6 +40,8 @@
 
 from ast import arg
 import sys
+import numpy
+
 sys.dont_write_bytecode = True
 
 import pathlib
@@ -53,10 +55,12 @@ from ctypes import (
     c_size_t,
     c_char_p,
     c_int,
+    c_int32,
     c_int64,
     c_double,
     c_uint8,
     c_uint16,
+    c_uint32,
     c_uint64,
     c_void_p,
     c_ssize_t)
@@ -98,6 +102,10 @@ c_line_sender_buffer_p = ctypes.POINTER(c_line_sender_buffer)
 c_line_sender_opts_p = ctypes.POINTER(c_line_sender_opts)
 c_line_sender_error_p = ctypes.POINTER(c_line_sender_error)
 c_line_sender_error_p_p = ctypes.POINTER(c_line_sender_error_p)
+c_int32_p = ctypes.POINTER(c_int32)
+c_uint8_p = ctypes.POINTER(c_uint8)
+c_uint32_p = ctypes.POINTER(c_uint32)
+
 class c_line_sender_utf8(ctypes.Structure):
     _fields_ = [("len", c_size_t),
                 ("buf", c_char_p)]
@@ -107,7 +115,7 @@ class c_line_sender_table_name(ctypes.Structure):
                 ("buf", c_char_p)]
 class line_sender_buffer_view(ctypes.Structure):
     _fields_ = [("len", c_size_t),
-                ("buf", ctypes.POINTER(c_uint8))]
+                ("buf", c_uint8_p)]
 
 c_line_sender_table_name_p = ctypes.POINTER(c_line_sender_table_name)
 class c_line_sender_column_name(ctypes.Structure):
@@ -236,6 +244,17 @@ def _setup_cdll():
         c_line_sender_buffer_p,
         c_line_sender_column_name,
         c_line_sender_utf8,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_f64_arr,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        c_size_t,
+        c_uint32_p,
+        c_int32_p,
+        c_uint8_p,
+        c_size_t,
         c_line_sender_error_p_p)
     set_sig(
         dll.line_sender_buffer_column_ts_nanos,
@@ -627,6 +646,34 @@ class Buffer:
                 '`bool`, `int`, `float` or `str`.')
         return self
 
+    def column_f64_arr(self, name: str,
+                       rank: int,
+                       shapes: tuple[int, ...],
+                       strides: tuple[int, ...],
+                       data: c_void_p,
+                       length: int):
+        def _convert_tuple(tpl: tuple[int, ...], c_type: type, name: str) -> ctypes.POINTER:
+            arr_type = c_type * len(tpl)
+            try:
+                return arr_type(*[c_type(v) for v in tpl])
+            except OverflowError as e:
+                raise ValueError(
+                    f"{name} value exceeds {c_type.__name__} range"
+                ) from e
+
+        c_shapes = _convert_tuple(shapes, c_uint32, "shapes")
+        c_strides = _convert_tuple(strides, c_int32, "strides")
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_column_f64_arr,
+            self._impl,
+            _column_name(name),
+            c_size_t(rank),
+            c_shapes,
+            c_strides,
+            ctypes.cast(data, c_uint8_p),
+            c_size_t(length)
+        )
+    
     def at_now(self):
         _error_wrapped_call(
             _DLL.line_sender_buffer_at_now,
@@ -734,6 +781,12 @@ class Sender:
             self, name: str,
             value: Union[bool, int, float, str, TimestampMicros, datetime]):
         self._buffer.column(name, value)
+        return self
+
+    def column_f64_arr(
+        self, name: str,
+        array: numpy.ndarray):
+        self._buffer.column_f64_arr(name, array.ndim, array.shape, array.strides, array.ctypes.data, array.nbytes)
         return self
 
     def at_now(self):

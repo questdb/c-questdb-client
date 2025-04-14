@@ -19,6 +19,23 @@ int main(int argc, const char* argv[])
         const auto side_name = "side"_cn;
         const auto price_name = "price"_cn;
         const auto amount_name = "amount"_cn;
+        const auto order_book_name = "order_book"_cn;
+        size_t rank = 3;
+        std::vector<uint32_t> shape{2, 3, 2};
+        std::vector<int32_t> strides{48, 16, 8};
+        std::array<double, 12> arr_data = {
+            48123.5,
+            2.4,
+            48124.0,
+            1.8,
+            48124.5,
+            0.9,
+            48122.5,
+            3.1,
+            48122.0,
+            2.7,
+            48121.5,
+            4.3};
 
         questdb::ingress::line_sender_buffer buffer;
         buffer
@@ -27,6 +44,7 @@ int main(int argc, const char* argv[])
             .symbol(side_name, "sell"_utf8)
             .column(price_name, 2615.54)
             .column(amount_name, 0.00044)
+            .column(order_book_name, 3, shape, strides, arr_data)
             .at(questdb::ingress::timestamp_nanos::now());
 
         // To insert more records, call `buffer.table(..)...` again.

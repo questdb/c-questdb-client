@@ -25,14 +25,15 @@
 ################################################################################
 
 import sys
+
 sys.dont_write_bytecode = True
 import os
-
 import pathlib
 import math
 import datetime
 import argparse
 import unittest
+import numpy as np
 import time
 import questdb_line_sender as qls
 import uuid
@@ -46,7 +47,6 @@ from fixture import (
     AUTH)
 import subprocess
 from collections import namedtuple
-
 
 QDB_FIXTURE: QuestDbFixture = None
 TLS_PROXY_FIXTURE: TlsProxyFixture = None
@@ -72,7 +72,6 @@ AUTH_UNRECOGNIZED = dict(
     token_x="-nSHz3evuPl-rGLIlbIZjwOJeWao0rbk53Cll6XEgak",
     token_y="9iYksF4L5mfmArupv0CMoyVAWjQ4gNIoupdg6N5noG8")
 
-
 # Bad malformed key
 AUTH_MALFORMED1 = dict(
     username="testUser3",
@@ -80,14 +79,12 @@ AUTH_MALFORMED1 = dict(
     token_x="-nSHz3evuPl-rGLIlbIZjwOJeWao0rbk53Cll6XEgak",
     token_y="9iYksF4L6mfmArupv0CMoyVAWjQ4gNIoupdg6N5noG8")
 
-
 # Another malformed key where the keys invalid base 64.
 AUTH_MALFORMED2 = dict(
     username="testUser4",
     token="xiecEl-zzbg6aYCFbxDMVWaly9BlCTaECH5BCk",
     token_x="-nSHz3evuPl-rGLIlbIZjwOJeWao0rbk5XEgak",
     token_y="9iYksF4L6mfmArupv0CMoyVAWjQ4gNIou5noG8")
-
 
 # All the keys are valid, but the username is wrong.
 AUTH_MALFORMED3 = dict(
@@ -115,9 +112,9 @@ class TestSender(unittest.TestCase):
             for _ in range(1000):
                 time.sleep(0.1)
                 (sender
-                    .table(table_name)
-                    .symbol('s1', 'v1')
-                    .at_now())
+                 .table(table_name)
+                 .symbol('s1', 'v1')
+                 .at_now())
                 sender.flush()
 
     def test_insert_three_rows(self):
@@ -126,13 +123,13 @@ class TestSender(unittest.TestCase):
         with self._mk_linesender() as sender:
             for _ in range(3):
                 (sender
-                    .table(table_name)
-                    .symbol('name_a', 'val_a')
-                    .column('name_b', True)
-                    .column('name_c', 42)
-                    .column('name_d', 2.5)
-                    .column('name_e', 'val_b')
-                    .at_now())
+                 .table(table_name)
+                 .symbol('name_a', 'val_a')
+                 .column('name_b', True)
+                 .column('name_c', 42)
+                 .column('name_d', 2.5)
+                 .column('name_e', 'val_b')
+                 .at_now())
             pending = sender.buffer.peek()
             sender.flush()
 
@@ -161,12 +158,12 @@ class TestSender(unittest.TestCase):
         pending = None
         with self._mk_linesender() as sender:
             (sender
-                .table(table_name)
-                .symbol('a', 'A')
-                .symbol('a', 'B')
-                .column('b', False)
-                .column('b', 'C')
-                .at_now())
+             .table(table_name)
+             .symbol('a', 'A')
+             .symbol('a', 'B')
+             .column('b', False)
+             .column('b', 'C')
+             .at_now())
             pending = sender.buffer.peek()
 
         resp = retry_check_table(table_name, log_ctx=pending)
@@ -188,10 +185,10 @@ class TestSender(unittest.TestCase):
         pending = None
         with self._mk_linesender() as sender:
             (sender
-                .table(table_name)
-                .symbol('a', 'A')
-                .column('a', 'B')
-                .at_now())
+             .table(table_name)
+             .symbol('a', 'A')
+             .column('a', 'B')
+             .at_now())
             pending = sender.buffer.peek()
 
         resp = retry_check_table(table_name, log_ctx=pending)
@@ -209,9 +206,9 @@ class TestSender(unittest.TestCase):
         pending = None
         with sender:
             (sender
-                .table(table_name)
-                .symbol('a', 'A')
-                .at_now())
+             .table(table_name)
+             .symbol('a', 'A')
+             .at_now())
             pending = sender.buffer.peek()
 
         resp = retry_check_table(table_name, log_ctx=pending)
@@ -232,10 +229,10 @@ class TestSender(unittest.TestCase):
         pending = None
         with self._mk_linesender() as sender:
             (sender
-                .table(table_name)
-                .column('a', 'A')
-                .column('b', 'B')
-                .at_now())
+             .table(table_name)
+             .column('a', 'A')
+             .column('b', 'B')
+             .at_now())
             pending = sender.buffer.peek()
 
         resp = retry_check_table(table_name, log_ctx=pending)
@@ -254,13 +251,13 @@ class TestSender(unittest.TestCase):
         pending = None
         with self._mk_linesender() as sender:
             (sender
-                .table(table_name)
-                .column('a', 1)    # LONG
-                .at_now())
+             .table(table_name)
+             .column('a', 1)  # LONG
+             .at_now())
             (sender
-                .table(table_name)
-                .symbol('a', 'B')  # SYMBOL
-                .at_now())
+             .table(table_name)
+             .symbol('a', 'B')  # SYMBOL
+             .at_now())
 
             pending = sender.buffer.peek()
 
@@ -304,9 +301,9 @@ class TestSender(unittest.TestCase):
         pending = None
         with self._mk_linesender() as sender:
             (sender
-                .table(table_name)
-                .symbol('a', 'A')
-                .at(at_ts_ns))
+             .table(table_name)
+             .symbol('a', 'A')
+             .at(at_ts_ns))
             pending = sender.buffer.peek()
         resp = retry_check_table(table_name, log_ctx=pending)
         exp_dataset = [['A', ns_to_qdb_date(at_ts_ns)]]
@@ -322,9 +319,9 @@ class TestSender(unittest.TestCase):
             with self._mk_linesender() as sender:
                 with self.assertRaisesRegex(qls.SenderError, r'.*Timestamp .* is negative.*'):
                     (sender
-                        .table(table_name)
-                        .symbol('a', 'A')
-                        .at(at_ts_ns))
+                     .table(table_name)
+                     .symbol('a', 'A')
+                     .at(at_ts_ns))
 
     def test_timestamp_col(self):
         if QDB_FIXTURE.version <= (6, 0, 7, 1):
@@ -334,13 +331,13 @@ class TestSender(unittest.TestCase):
         pending = None
         with self._mk_linesender() as sender:
             (sender
-                .table(table_name)
-                .column('a', qls.TimestampMicros(-1000000))
-                .at_now())
+             .table(table_name)
+             .column('a', qls.TimestampMicros(-1000000))
+             .at_now())
             (sender
-                .table(table_name)
-                .column('a', qls.TimestampMicros(1000000))
-                .at_now())
+             .table(table_name)
+             .column('a', qls.TimestampMicros(1000000))
+             .at_now())
             pending = sender.buffer.peek()
 
         resp = retry_check_table(table_name, log_ctx=pending)
@@ -353,16 +350,15 @@ class TestSender(unittest.TestCase):
         scrubbed_dataset = [row[:-1] for row in resp['dataset']]
         self.assertEqual(scrubbed_dataset, exp_dataset)
 
-
     def test_underscores(self):
         table_name = f'_{uuid.uuid4().hex}_'
         pending = None
         with self._mk_linesender() as sender:
             (sender
-                .table(table_name)
-                .symbol('_a_b_c_', 'A')
-                .column('_d_e_f_', True)
-                .at_now())
+             .table(table_name)
+             .symbol('_a_b_c_', 'A')
+             .column('_d_e_f_', True)
+             .at_now())
             pending = sender.buffer.peek()
 
         resp = retry_check_table(table_name, log_ctx=pending)
@@ -422,16 +418,16 @@ class TestSender(unittest.TestCase):
             1.23456789012,
             1000000000000000000000000.0,
             -1000000000000000000000000.0,
-            float("nan"),   # Converted to `None`.
-            float("inf"),   # Converted to `None`.
+            float("nan"),  # Converted to `None`.
+            float("inf"),  # Converted to `None`.
             float("-inf")]  # Converted to `None`.
 
-            # These values below do not round-trip properly: QuestDB limitation.
-            # 1.2345678901234567,
-            # 2.2250738585072014e-308,
-            # -2.2250738585072014e-308,
-            # 1.7976931348623157e+308,
-            # -1.7976931348623157e+308]
+        # These values below do not round-trip properly: QuestDB limitation.
+        # 1.2345678901234567,
+        # 2.2250738585072014e-308,
+        # -2.2250738585072014e-308,
+        # 1.7976931348623157e+308,
+        # -1.7976931348623157e+308]
         table_name = uuid.uuid4().hex
         pending = None
         with self._mk_linesender() as sender:
@@ -469,9 +465,9 @@ class TestSender(unittest.TestCase):
         ts = qls.TimestampMicros(3600000000)  # One hour past epoch.
         with self._mk_linesender() as sender:
             (sender
-                .table(table_name)
-                .column('ts1', ts)
-                .at_now())
+             .table(table_name)
+             .column('ts1', ts)
+             .at_now())
             pending = sender.buffer.peek()
 
         resp = retry_check_table(table_name, log_ctx=pending)
@@ -482,6 +478,38 @@ class TestSender(unittest.TestCase):
         exp_dataset = [['1970-01-01T01:00:00.000000Z']]
         scrubbed_dataset = [row[:-1] for row in resp['dataset']]
         self.assertEqual(scrubbed_dataset, exp_dataset)
+
+    def test_f64_arr_column(self):
+        table_name = uuid.uuid4().hex
+        array1 = np.array(
+            [
+                [[1.1, 2.2], [3.3, 4.4]],
+                [[5.5, 6.6], [7.7, 8.8]]
+            ],
+            dtype=np.float64
+        )
+        array2 = array1.T
+        array3 = array1[::-1, ::-1]
+
+        with self._mk_linesender() as sender:
+            (sender
+             .table(table_name)
+             .column_f64_arr('f64_arr1', array1)
+             .column_f64_arr('f64_arr2', array2)
+             .column_f64_arr('f64_arr3', array3)
+             .at_now())
+
+        resp = retry_check_table(table_name)
+        exp_columns = [{'dim': 3, 'elemType': 'DOUBLE', 'name': 'f64_arr1', 'type': 'ARRAY'},
+                       {'dim': 3, 'elemType': 'DOUBLE', 'name': 'f64_arr2', 'type': 'ARRAY'},
+                       {'dim': 3, 'elemType': 'DOUBLE', 'name': 'f64_arr3', 'type': 'ARRAY'},
+                       {'name': 'timestamp', 'type': 'TIMESTAMP'}]
+        self.assertEqual(resp['columns'], exp_columns)
+        expected_data = [[[[[1.1, 2.2], [3.3, 4.4]], [[5.5, 6.6], [7.7, 8.8]]],
+                          [[[1.1, 5.5], [3.3, 7.7]], [[2.2, 6.6], [4.4, 8.8]]],
+                          [[[7.7, 8.8], [5.5, 6.6]], [[3.3, 4.4], [1.1, 2.2]]]]]
+        scrubbed_data = [row[:-1] for row in resp['dataset']]
+        self.assertEqual(scrubbed_data, expected_data)
 
     def _test_example(self, bin_name, table_name, tls=False):
         if BUILD_MODE != qls.BuildMode.API:
@@ -511,10 +539,17 @@ class TestSender(unittest.TestCase):
             {'name': 'side', 'type': 'SYMBOL'},
             {'name': 'price', 'type': 'DOUBLE'},
             {'name': 'amount', 'type': 'DOUBLE'},
+            {'dim': 3, 'elemType': 'DOUBLE', 'name': 'order_book', 'type': 'ARRAY'},
             {'name': 'timestamp', 'type': 'TIMESTAMP'}]
         self.assertEqual(resp['columns'], exp_columns)
 
-        exp_dataset = [['ETH-USD', 'sell', 2615.54, 0.00044]]  # Comparison excludes timestamp column.
+        exp_dataset = [['ETH-USD',
+                        'sell',
+                        2615.54,
+                        0.00044,
+                        [[[48123.5, 2.4], [48124.0, 1.8], [48124.5, 0.9]],
+                         [[48122.5, 3.1], [48122.0, 2.7], [48121.5, 4.3]]]]]
+        # Comparison excludes timestamp column.
         scrubbed_dataset = [row[:-1] for row in resp['dataset']]
         self.assertEqual(scrubbed_dataset, exp_dataset)
 
@@ -570,9 +605,9 @@ class TestSender(unittest.TestCase):
 
                 # The sending the first line will not fail.
                 (sender
-                    .table(table_name)
-                    .symbol('s1', 'v1')
-                    .at_now())
+                 .table(table_name)
+                 .symbol('s1', 'v1')
+                 .at_now())
                 sender.flush()
 
                 self._expect_eventual_disconnect(sender)
@@ -663,7 +698,7 @@ class TestSender(unittest.TestCase):
 
     def test_tls_roots(self):
         protocol = qls.Protocol.HTTPS if QDB_FIXTURE.http else qls.Protocol.TCPS
-        auth = auth=AUTH if QDB_FIXTURE.auth else {}
+        auth = auth = AUTH if QDB_FIXTURE.auth else {}
         sender = qls.Sender(
             BUILD_MODE,
             protocol,
@@ -679,7 +714,7 @@ class TestSender(unittest.TestCase):
         try:
             os.environ['SSL_CERT_FILE'] = str(
                 Project().tls_certs_dir / 'server_rootCA.pem')
-            auth = auth=AUTH if QDB_FIXTURE.auth else {}
+            auth = auth = AUTH if QDB_FIXTURE.auth else {}
             sender = qls.Sender(
                 BUILD_MODE,
                 protocol,
@@ -803,14 +838,15 @@ def run_with_existing(args):
     global QDB_FIXTURE
     MockFixture = namedtuple(
         'MockFixture',
-        ('host', 'line_tcp_port', 'http_server_port', 'version', 'http'))
+        ('host', 'line_tcp_port', 'http_server_port', 'version', 'http', "auth"))
     host, line_tcp_port, http_server_port = args.existing.split(':')
     QDB_FIXTURE = MockFixture(
         host,
         int(line_tcp_port),
         int(http_server_port),
         (999, 999, 999),
-        True)
+        True,
+        False)
     unittest.main()
 
 
@@ -831,11 +867,11 @@ def iter_versions(args):
     if versions_args:
         versions = {
             version: (
-                'https://github.com/questdb/questdb/releases/download/' +
-                version +
-                '/questdb-' +
-                version +
-                '-no-jre-bin.tar.gz')
+                    'https://github.com/questdb/questdb/releases/download/' +
+                    version +
+                    '/questdb-' +
+                    version +
+                    '-no-jre-bin.tar.gz')
             for version in versions_args}
     else:
         last_n = getattr(args, 'last_n', None) or 1
@@ -857,7 +893,8 @@ def run_with_fixtures(args):
         for auth in (False, True):
             for http in (False, True):
                 for build_mode in list(qls.BuildMode):
-                    print(f'Running tests [questdb_dir={questdb_dir}, auth={auth}, http={http}, build_mode={build_mode}]')
+                    print(
+                        f'Running tests [questdb_dir={questdb_dir}, auth={auth}, http={http}, build_mode={build_mode}]')
                     if http and last_version <= (7, 3, 7):
                         print('Skipping ILP/HTTP tests for versions <= 7.3.7')
                         continue

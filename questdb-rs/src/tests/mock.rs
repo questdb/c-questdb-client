@@ -52,6 +52,8 @@ pub struct MockServer {
     pub host: &'static str,
     pub port: u16,
     pub msgs: Vec<Vec<u8>>,
+    #[cfg(feature = "ilp-over-http")]
+    settings_response: serde_json::Value,
 }
 
 pub fn certs_dir() -> std::path::PathBuf {
@@ -207,6 +209,8 @@ impl MockServer {
             host: "localhost",
             port,
             msgs: Vec::new(),
+            #[cfg(feature = "ilp-over-http")]
+            settings_response: serde_json::Value::Null,
         })
     }
 
@@ -301,6 +305,19 @@ impl MockServer {
         } else {
             client.read(buf)
         }
+    }
+
+    #[cfg(feature = "ilp-over-http")]
+    pub fn configure_settings_response(
+        mut self,
+        default_version: u16,
+        supported_versions: &[u16],
+    ) -> Self {
+        self.settings_response = serde_json::json!({
+            "line.proto.default.version": default_version,
+            "line.proto.support.versions": supported_versions
+        });
+        self
     }
 
     #[cfg(feature = "ilp-over-http")]
@@ -456,6 +473,15 @@ impl MockServer {
     }
 
     #[cfg(feature = "ilp-over-http")]
+    pub fn send_settings_response(&mut self) -> io::Result<()> {
+        let response = HttpResponse::empty()
+            .with_status(200, "OK")
+            .with_body_json(&self.settings_response);
+        self.send_http_response(response, Some(2.0))?;
+        Ok(())
+    }
+
+    #[cfg(feature = "ilp-over-http")]
     pub fn send_http_response_q(&mut self, response: HttpResponse) -> io::Result<()> {
         self.send_http_response(response, Some(5.0))
     }
@@ -466,6 +492,14 @@ impl MockServer {
         let deadline = Instant::now() + Duration::from_secs_f64(wait_timeout_sec);
         let (pos, method, path) = self.recv_http_method(&mut accum, deadline)?;
         let (pos, headers) = self.recv_http_headers(pos, &mut accum, deadline)?;
+        if &method == "GET" {
+            return Ok(HttpRequest {
+                method,
+                path,
+                headers,
+                body: vec![],
+            });
+        }
         let content_length = headers
             .get("content-length")
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Missing Content-Length"))?

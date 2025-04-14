@@ -145,6 +145,9 @@ pub enum line_sender_error_code {
 
     /// Write arrayView to sender buffer error.
     line_sender_error_array_view_write_to_buffer_error,
+
+    /// Line sender protocol version error.
+    line_sender_error_line_protocol_version_error,
 }
 
 impl From<ErrorCode> for line_sender_error_code {
@@ -177,6 +180,9 @@ impl From<ErrorCode> for line_sender_error_code {
             }
             ErrorCode::ArrayWriteToBufferError => {
                 line_sender_error_code::line_sender_error_array_view_write_to_buffer_error
+            }
+            ErrorCode::LineProtocolVersionError => {
+                line_sender_error_code::line_sender_error_line_protocol_version_error
             }
         }
     }
@@ -217,6 +223,37 @@ impl From<line_sender_protocol> for Protocol {
             line_sender_protocol::line_sender_protocol_tcps => Protocol::Tcps,
             line_sender_protocol::line_sender_protocol_http => Protocol::Http,
             line_sender_protocol::line_sender_protocol_https => Protocol::Https,
+        }
+    }
+}
+
+/// The version of Line Protocol used for [`Buffer`].
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub enum LineProtocolVersion {
+    /// Version 1 of Line Protocol.
+    /// Uses text format serialization for f64.
+    V1,
+
+    /// Version 2 of InfluxDB Line Protocol.
+    /// Uses binary format serialization for f64, and support array data type.
+    V2,
+}
+
+impl From<LineProtocolVersion> for ingress::LineProtocolVersion {
+    fn from(version: LineProtocolVersion) -> Self {
+        match version {
+            LineProtocolVersion::V1 => ingress::LineProtocolVersion::V1,
+            LineProtocolVersion::V2 => ingress::LineProtocolVersion::V2,
+        }
+    }
+}
+
+impl From<ingress::LineProtocolVersion> for LineProtocolVersion {
+    fn from(version: ingress::LineProtocolVersion) -> Self {
+        match version {
+            ingress::LineProtocolVersion::V1 => LineProtocolVersion::V1,
+            ingress::LineProtocolVersion::V2 => LineProtocolVersion::V2,
         }
     }
 }
@@ -578,6 +615,17 @@ pub unsafe extern "C" fn line_sender_buffer_with_max_name_len(
 ) -> *mut line_sender_buffer {
     let buffer = Buffer::with_max_name_len(max_name_len);
     Box::into_raw(Box::new(line_sender_buffer(buffer)))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_buffer_set_line_protocol_version(
+    buffer: *mut line_sender_buffer,
+    version: LineProtocolVersion,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    let buffer = unwrap_buffer_mut(buffer);
+    bubble_err_to_c!(err_out, buffer.set_line_proto_version(version.into()));
+    true
 }
 
 /// Release the `line_sender_buffer` object.
@@ -1120,6 +1168,15 @@ pub unsafe extern "C" fn line_sender_opts_token_y(
     upd_opts!(opts, err_out, token_y, token_y.as_str())
 }
 
+/// Disable the line protocol validation.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_disable_line_protocol_validation(
+    opts: *mut line_sender_opts,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    upd_opts!(opts, err_out, disable_line_protocol_validation)
+}
+
 /// Configure how long to wait for messages from the QuestDB server during
 /// the TLS handshake and authentication process.
 /// The value is in milliseconds, and the default is 15 seconds.
@@ -1347,6 +1404,22 @@ unsafe fn unwrap_sender<'a>(sender: *const line_sender) -> &'a Sender {
 
 unsafe fn unwrap_sender_mut<'a>(sender: *mut line_sender) -> &'a mut Sender {
     &mut (*sender).0
+}
+
+/// Returns the client's recommended default line protocol version.
+/// Will be used to [`line_sender_buffer_set_line_protocol_version`]
+///
+/// The version selection follows these rules:
+/// 1. **TCP/TCPS Protocol**: Always returns [`LineProtocolVersion::V2`]
+/// 2. **HTTP/HTTPS Protocol**:
+///    - If line protocol auto-detection is disabled [`line_sender_opts_disable_line_protocol_validation`], returns [`LineProtocolVersion::V2`]
+///    - If line protocol auto-detection is enabled:
+///      - Uses the server's default version if supported by the client
+///      - Otherwise uses the highest mutually supported version from the intersection
+///        of client and server compatible versions
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_default_line_protocol_version(sender: *mut line_sender) -> LineProtocolVersion {
+    unwrap_sender(sender).default_line_protocol_version().into()
 }
 
 /// Tell whether the sender is no longer usable and must be closed.

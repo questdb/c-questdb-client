@@ -59,6 +59,22 @@ use ring::{
 /// Defines the maximum allowed dimensions for array data in binary serialization protocols.
 pub const MAX_DIMS: usize = 32;
 
+/// Line Protocol Version supported by current client.
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub enum LineProtocolVersion {
+    V1 = 1,
+    V2 = 2,
+}
+
+impl std::fmt::Display for LineProtocolVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LineProtocolVersion::V1 => write!(f, "v1"),
+            LineProtocolVersion::V2 => write!(f, "v2"),
+        }
+    }
+}
+
 #[derive(Debug, Copy, Clone)]
 enum Op {
     Table = 1,
@@ -468,6 +484,8 @@ impl BufferState {
     }
 }
 
+pub trait Buffer1 {}
+
 /// A reusable buffer to prepare a batch of ILP messages.
 ///
 /// # Example
@@ -561,6 +579,8 @@ pub struct Buffer {
     state: BufferState,
     marker: Option<(usize, BufferState)>,
     max_name_len: usize,
+    f64serializer: fn(&mut Vec<u8>, f64),
+    version: LineProtocolVersion,
 }
 
 impl Buffer {
@@ -572,6 +592,8 @@ impl Buffer {
             state: BufferState::new(),
             marker: None,
             max_name_len: 127,
+            f64serializer: f64_binary_series,
+            version: LineProtocolVersion::V2,
         }
     }
 
@@ -586,6 +608,36 @@ impl Buffer {
         let mut buf = Self::new();
         buf.max_name_len = max_name_len;
         buf
+    }
+
+    pub fn with_line_proto_version(mut self, version: LineProtocolVersion) -> Result<Self> {
+        if self.state.op_case != OpCase::Init {
+            return Err(error::fmt!(
+                LineProtocolVersionError,
+                "Line protocol version must be set before adding any data."
+            ));
+        }
+        self.f64serializer = match version {
+            LineProtocolVersion::V1 => f64_text_series,
+            LineProtocolVersion::V2 => f64_binary_series,
+        };
+        self.version = version;
+        Ok(self)
+    }
+
+    pub fn set_line_proto_version(&mut self, version: LineProtocolVersion) -> Result<&mut Self> {
+        if self.state.op_case != OpCase::Init {
+            return Err(error::fmt!(
+                LineProtocolVersionError,
+                "Line protocol version must be set before adding any data."
+            ));
+        }
+        self.f64serializer = match version {
+            LineProtocolVersion::V1 => f64_text_series,
+            LineProtocolVersion::V2 => f64_binary_series,
+        };
+        self.version = version;
+        Ok(self)
     }
 
     /// Pre-allocate to ensure the buffer has enough capacity for at least the
@@ -950,8 +1002,7 @@ impl Buffer {
         Error: From<N::Error>,
     {
         self.write_column_key(name)?;
-        let mut ser = F64Serializer::new(value);
-        self.output.extend_from_slice(ser.as_str().as_bytes());
+        (self.f64serializer)(&mut self.output, value);
         Ok(self)
     }
 
@@ -1109,24 +1160,27 @@ impl Buffer {
         let mut cursor = Cursor::new(writeable);
 
         // ndarr data
-        if let Err(e) = ndarr::write_array_data(view, &mut cursor) {
-            return Err(error::fmt!(
-                ArrayWriteToBufferError,
-                "Can not write row major to writer: {}",
-                e
-            ));
+        if view.as_slice().is_some() {
+            if let Err(e) = ndarr::write_array_data(view, &mut cursor) {
+                return Err(error::fmt!(
+                    ArrayWriteToBufferError,
+                    "Can not write row major to writer: {}",
+                    e
+                ));
+            }
+            if cursor.position() != (reserve_size as u64) {
+                return Err(error::fmt!(
+                    ArrayWriteToBufferError,
+                    "Array write buffer length mismatch (actual: {}, expected: {})",
+                    cursor.position(),
+                    reserve_size
+                ));
+            }
+            unsafe { self.output.set_len(reserve_size + index) }
+        } else {
+            unsafe { self.output.set_len(reserve_size + index) }
+            ndarr::write_array_data_use_raw_buffer(&mut self.output[index..], view);
         }
-
-        if cursor.position() != (reserve_size as u64) {
-            return Err(error::fmt!(
-                ArrayWriteToBufferError,
-                "Array write buffer length mismatch (actual: {}, expected: {})",
-                cursor.position(),
-                reserve_size
-            ));
-        }
-
-        unsafe { self.output.set_len(reserve_size + index) }
         Ok(self)
     }
 
@@ -1368,6 +1422,9 @@ pub struct Sender {
     handler: ProtocolHandler,
     connected: bool,
     max_buf_size: usize,
+    default_line_protocol_version: LineProtocolVersion,
+    #[cfg(feature = "ilp-over-http")]
+    supported_line_protocol_versions: Option<Vec<LineProtocolVersion>>,
 }
 
 impl std::fmt::Debug for Sender {
@@ -1991,6 +2048,19 @@ impl SenderBuilder {
                 "retry_timeout" => {
                     builder.retry_timeout(Duration::from_millis(parse_conf_value(key, val)?))?
                 }
+
+                #[cfg(feature = "ilp-over-http")]
+                "disable_line_protocol_validation" => {
+                    if val == "on" {
+                        builder.disable_line_protocol_validation()?
+                    } else if val != "off" {
+                        return Err(error::fmt!(
+                            ConfigError, "invalid \"disable_line_protocol_validation\" [value={val}, allowed-values=[on, off]]]\"]"));
+                    } else {
+                        builder
+                    }
+                }
+
                 // Ignore other parameters.
                 // We don't want to fail on unknown keys as this would require releasing different
                 // library implementations in lock step as soon as a new parameter is added to any of them,
@@ -2257,6 +2327,22 @@ impl SenderBuilder {
                 ConfigError,
                 "\"request_timeout\" is supported only in ILP over HTTP."
             ));
+        }
+        Ok(self)
+    }
+
+    #[cfg(feature = "ilp-over-http")]
+    /// Disables automatic line protocol version validation for ILP-over-HTTP.
+    ///
+    /// - When set to `"off"`: Skips the initial server version handshake and disables protocol validation.
+    /// - When set to `"on"`: Keeps default validation behavior (recommended).
+    ///
+    /// Please ensure client's default version ([`LINE_PROTOCOL_VERSION_V2`]) or
+    /// explicitly set protocol version exactly matches server expectation.
+    pub fn disable_line_protocol_validation(mut self) -> Result<Self> {
+        if let Some(http) = &mut self.http {
+            http.disable_line_proto_validation
+                .set_specified("disable_line_protocol_validation", true)?;
         }
         Ok(self)
     }
@@ -2543,9 +2629,35 @@ impl SenderBuilder {
                     agent,
                     url,
                     auth,
-
                     config: self.http.as_ref().unwrap().clone(),
                 })
+            }
+        };
+
+        let mut default_line_protocol_version = LineProtocolVersion::V2;
+        #[cfg(feature = "ilp-over-http")]
+        let mut supported_line_protocol_versions: Option<Vec<_>> = None;
+
+        #[cfg(feature = "ilp-over-http")]
+        match self.protocol {
+            Protocol::Tcp | Protocol::Tcps => {}
+            Protocol::Http | Protocol::Https => {
+                let http_config = self.http.as_ref().unwrap();
+                if !*http_config.disable_line_proto_validation.deref() {
+                    if let ProtocolHandler::Http(http_state) = &handler {
+                        let settings_url = &format!(
+                            "http://{}:{}/settings",
+                            self.host.deref(),
+                            self.port.deref()
+                        );
+                        (
+                            supported_line_protocol_versions,
+                            default_line_protocol_version,
+                        ) = get_line_protocol_version(http_state, settings_url)?;
+                    } else {
+                        default_line_protocol_version = LineProtocolVersion::V1;
+                    }
+                }
             }
         };
 
@@ -2554,12 +2666,14 @@ impl SenderBuilder {
         } else {
             descr.push_str("auth=off]");
         }
-
         let sender = Sender {
             descr,
             handler,
             connected: true,
             max_buf_size: *self.max_buf_size,
+            default_line_protocol_version,
+            #[cfg(feature = "ilp-over-http")]
+            supported_line_protocol_versions,
         };
 
         Ok(sender)
@@ -2678,6 +2792,17 @@ fn parse_key_pair(auth: &EcdsaAuthParams) -> Result<EcdsaKeyPair> {
     })
 }
 
+fn f64_text_series(vec: &mut Vec<u8>, value: f64) {
+    let mut ser = F64Serializer::new(value);
+    vec.extend_from_slice(ser.as_str().as_bytes())
+}
+
+fn f64_binary_series(vec: &mut Vec<u8>, value: f64) {
+    vec.push(b'=');
+    vec.push(DOUBLE_BINARY_FORMAT_TYPE);
+    vec.extend_from_slice(&value.to_le_bytes())
+}
+
 pub(crate) struct F64Serializer {
     buf: ryu::Buffer,
     n: f64,
@@ -2773,6 +2898,9 @@ impl Sender {
                 self.max_buf_size
             ));
         }
+
+        #[cfg(feature = "ilp-over-http")]
+        self.check_line_protocol_version(buf.version)?;
 
         let bytes = buf.as_bytes();
         if bytes.is_empty() {
@@ -2894,10 +3022,59 @@ impl Sender {
     pub fn must_close(&self) -> bool {
         !self.connected
     }
+
+    /// Returns the client's recommended default line protocol version.
+    /// Will be used to [`Buffer::with_line_proto_version`]
+    ///
+    /// The version selection follows these rules:
+    /// 1. **TCP/TCPS Protocol**: Always returns [`LineProtocolVersion::V2`]
+    /// 2. **HTTP/HTTPS Protocol**:
+    ///    - If line protocol auto-detection is disabled [`SenderBuilder::disable_line_protocol_validation`], returns [`LineProtocolVersion::V2`]
+    ///    - If line protocol auto-detection is enabled:
+    ///      - Uses the server's default version if supported by the client
+    ///      - Otherwise uses the highest mutually supported version from the intersection
+    ///        of client and server compatible versions
+    pub fn default_line_protocol_version(&self) -> LineProtocolVersion {
+        self.default_line_protocol_version
+    }
+
+    #[cfg(feature = "ilp-over-http")]
+    #[inline(always)]
+    fn check_line_protocol_version(&self, version: LineProtocolVersion) -> Result<()> {
+        match &self.handler {
+            ProtocolHandler::Socket(_) => Ok(()),
+            #[cfg(feature = "ilp-over-http")]
+            ProtocolHandler::Http(http) => {
+                if *http.config.disable_line_proto_validation.deref() {
+                    Ok(())
+                } else {
+                    match self.supported_line_protocol_versions {
+                        Some(ref supported_line_protocols) => {
+                            if supported_line_protocols.contains(&version) {
+                                Ok(())
+                            } else {
+                                Err(error::fmt!(
+                                    LineProtocolVersionError,
+                                    "Line protocol version {} is not supported by current QuestDB Server",  version))
+                            }
+                        }
+                        None => {
+                            if version == LineProtocolVersion::V1 {
+                                Ok(())
+                            } else {
+                                Err(error::fmt!(
+                                LineProtocolVersionError,
+                                    "Line protocol version {} is not supported by current QuestDB Server",  version))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 pub(crate) const ARRAY_BINARY_FORMAT_TYPE: u8 = 14;
-#[allow(dead_code)]
 pub(crate) const DOUBLE_BINARY_FORMAT_TYPE: u8 = 16;
 
 mod conf;

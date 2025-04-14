@@ -1,6 +1,6 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use ndarray::{Array, Array2};
-use questdb::ingress::{Buffer, ColumnName};
+use questdb::ingress::{Buffer, ColumnName, StridedArrayView};
 
 /// run with
 /// ```shell
@@ -65,5 +65,52 @@ fn bench_write_array_data(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_write_array_data);
+// bench NdArrayView and StridedArrayView write performance.
+fn bench_array_view(c: &mut Criterion) {
+    let mut group = c.benchmark_group("write_array_view");
+    let col_name = ColumnName::new("col1").unwrap();
+    let array: Array2<f64> = Array::ones((1000, 1000));
+    let transposed_view = array.t();
+
+    // Case 1
+    group.bench_function("ndarray_view", |b| {
+        let mut buffer = Buffer::new();
+        buffer.table("x1").unwrap();
+        b.iter(|| {
+            buffer
+                .column_arr(col_name, black_box(&transposed_view))
+                .unwrap();
+        });
+        buffer.clear();
+    });
+
+    let shape: Vec<u32> = transposed_view.shape().iter().map(|&d| d as u32).collect();
+    let elem_size = size_of::<f64>() as i32;
+    let strides: Vec<i32> = transposed_view
+        .strides()
+        .iter()
+        .map(|&s| s as i32 * elem_size) // 转换为字节步长
+        .collect();
+    let view2: StridedArrayView<'_, f64> = unsafe {
+        StridedArrayView::new(
+            transposed_view.ndim(),
+            shape.as_ptr(),
+            strides.as_ptr(),
+            transposed_view.as_ptr() as *const u8,
+            transposed_view.len() * elem_size as usize,
+        )
+    };
+
+    // Case 2
+    group.bench_function("strides_view", |b| {
+        let mut buffer = Buffer::new();
+        buffer.table("x1").unwrap();
+        b.iter(|| {
+            buffer.column_arr(col_name, black_box(&view2)).unwrap();
+        });
+        buffer.clear();
+    });
+}
+
+criterion_group!(benches, bench_write_array_data, bench_array_view);
 criterion_main!(benches);

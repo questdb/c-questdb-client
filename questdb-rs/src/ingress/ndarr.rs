@@ -25,7 +25,7 @@ where
     ///
     /// # Returns
     /// - `Ok(usize)`: Expected buffer size in bytes if valid
-    /// - `Err(Error)`: Currently never returned, but reserved for future validation logic
+    /// - `Err(Error)`: Otherwise
     fn check_data_buf(&self) -> Result<usize, Error>;
 }
 
@@ -68,7 +68,6 @@ where
     Ok(())
 }
 
-#[cfg(feature = "benchmark")]
 pub(crate) fn write_array_data_use_raw_buffer<A: NdArrayView<T>, T>(buf: &mut [u8], array: &A)
 where
     T: ArrayElement,

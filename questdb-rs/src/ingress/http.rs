@@ -1,4 +1,5 @@
 use super::conf::ConfigSetting;
+use crate::error::fmt;
 use crate::{error, Error};
 use base64ct::Base64;
 use base64ct::Encoding;
@@ -16,6 +17,7 @@ use ureq::unversioned::transport::{
     Buffers, Connector, LazyBuffers, NextTimeout, Transport, TransportAdapter,
 };
 
+use crate::ingress::LineProtocolVersion;
 use ureq::unversioned::*;
 use ureq::Error::*;
 use ureq::{http, Body};
@@ -57,6 +59,7 @@ pub(super) struct HttpConfig {
     pub(super) user_agent: String,
     pub(super) retry_timeout: ConfigSetting<Duration>,
     pub(super) request_timeout: ConfigSetting<Duration>,
+    pub(super) disable_line_proto_validation: ConfigSetting<bool>,
 }
 
 impl Default for HttpConfig {
@@ -66,6 +69,7 @@ impl Default for HttpConfig {
             user_agent: concat!("questdb/rust/", env!("CARGO_PKG_VERSION")).to_string(),
             retry_timeout: ConfigSetting::new_default(Duration::from_secs(10)),
             request_timeout: ConfigSetting::new_default(Duration::from_secs(10)),
+            disable_line_proto_validation: ConfigSetting::new_default(false),
         }
     }
 }
@@ -104,6 +108,24 @@ impl HttpHandlerState {
             None => request,
         };
         let response = request.send(buf);
+        match &response {
+            Ok(res) => (need_retry(Ok(res.status())), response),
+            Err(err) => (need_retry(Err(err)), response),
+        }
+    }
+
+    pub(crate) fn get_request(
+        &self,
+        url: &str,
+        request_timeout: Duration,
+    ) -> (bool, Result<Response<Body>, ureq::Error>) {
+        let request = self
+            .agent
+            .get(url)
+            .config()
+            .timeout_per_call(Some(request_timeout))
+            .build();
+        let response = request.call();
         match &response {
             Ok(res) => (need_retry(Ok(res.status())), response),
             Err(err) => (need_retry(Err(err)), response),
@@ -382,4 +404,176 @@ pub(super) fn http_send_with_retries(
     }
 
     retry_http_send(state, buf, request_timeout, retry_timeout, last_rep)
+}
+
+pub(super) fn get_line_protocol_version(
+    state: &HttpHandlerState,
+    settings_url: &str,
+) -> Result<(Option<Vec<LineProtocolVersion>>, LineProtocolVersion), Error> {
+    let mut support_versions: Option<Vec<_>> = None;
+    let mut default_version = LineProtocolVersion::V1;
+
+    let response = match http_get_with_retries(
+        state,
+        settings_url,
+        *state.config.request_timeout,
+        Duration::from_secs(1),
+    ) {
+        Ok(res) => {
+            if res.status().is_client_error() || res.status().is_server_error() {
+                if res.status().as_u16() == 404 {
+                    return Ok((support_versions, default_version));
+                }
+                return Err(fmt!(
+                    LineProtocolVersionError,
+                    "Failed to detect server's line protocol version, settings url: {}, status code: {}.",
+                    settings_url,
+                    res.status()
+                ));
+            } else {
+                res
+            }
+        }
+        Err(err) => {
+            let e = match err {
+                ureq::Error::StatusCode(code) => {
+                    if code == 404 {
+                        return Ok((support_versions, default_version));
+                    } else {
+                        fmt!(
+                            LineProtocolVersionError,
+                            "Failed to detect server's line protocol version, settings url: {}, err: {}.",
+                            settings_url,
+                            err
+                        )
+                    }
+                }
+                e => {
+                    fmt!(
+                        LineProtocolVersionError,
+                        "Failed to detect server's line protocol version, settings url: {}, err: {}.",
+                        settings_url,
+                        e
+                    )
+                }
+            };
+            return Err(e);
+        }
+    };
+
+    let (_, body) = response.into_parts();
+    let body_content = body.into_with_config().lossy_utf8(true).read_to_string();
+
+    if let Ok(msg) = body_content {
+        let json: serde_json::Value = serde_json::from_str(&msg).map_err(|_| {
+            error::fmt!(
+                LineProtocolVersionError,
+                "Malformed server response, settings url: {}, err: response is not valid JSON.",
+                settings_url,
+            )
+        })?;
+
+        if let Some(serde_json::Value::Array(ref values)) = json.get("line.proto.support.versions")
+        {
+            let mut versions = Vec::new();
+            for value in values.iter() {
+                if let Some(v) = value.as_u64() {
+                    match v {
+                        1 => versions.push(LineProtocolVersion::V1),
+                        2 => versions.push(LineProtocolVersion::V2),
+                        _ => {}
+                    }
+                }
+            }
+            support_versions = Some(versions);
+        }
+
+        if let Some(serde_json::Value::Number(ref v)) = json.get("line.proto.default.version") {
+            default_version = match v.as_u64() {
+                Some(vu64) => match vu64 {
+                    1 => LineProtocolVersion::V1,
+                    2 => LineProtocolVersion::V2,
+                    _ => {
+                        if let Some(ref versions) = support_versions {
+                            if versions.contains(&LineProtocolVersion::V2) {
+                                LineProtocolVersion::V2
+                            } else if versions.contains(&LineProtocolVersion::V1) {
+                                LineProtocolVersion::V1
+                            } else {
+                                return Err(error::fmt!(
+                                    LineProtocolVersionError,
+                                    "Server does not support current client."
+                                ));
+                            }
+                        } else {
+                            return Err(error::fmt!(
+                                LineProtocolVersionError,
+                                "Unexpected response version content."
+                            ));
+                        }
+                    }
+                },
+                None => {
+                    return Err(error::fmt!(
+                        LineProtocolVersionError,
+                        "Not a valid int for line.proto.default.version in response."
+                    ))
+                }
+            };
+        }
+    } else {
+        return Err(error::fmt!(
+            LineProtocolVersionError,
+            "Malformed server response, settings url: {}, err: failed to read response body as UTF-8", settings_url
+        ));
+    }
+    Ok((support_versions, default_version))
+}
+
+#[allow(clippy::result_large_err)] // `ureq::Error` is large enough to cause this warning.
+fn retry_http_get(
+    state: &HttpHandlerState,
+    url: &str,
+    request_timeout: Duration,
+    retry_timeout: Duration,
+    mut last_rep: Result<Response<Body>, ureq::Error>,
+) -> Result<Response<Body>, ureq::Error> {
+    let mut rng = rand::rng();
+    let retry_end = std::time::Instant::now() + retry_timeout;
+    let mut retry_interval_ms = 10;
+    let mut need_retry;
+    loop {
+        let jitter_ms = rng.random_range(-5i32..5);
+        let to_sleep_ms = retry_interval_ms + jitter_ms;
+        let to_sleep = Duration::from_millis(to_sleep_ms as u64);
+        if (std::time::Instant::now() + to_sleep) > retry_end {
+            return last_rep;
+        }
+        sleep(to_sleep);
+        if let Ok(last_rep) = last_rep {
+            // Actively consume the reader to return the connection to the connection pool.
+            // see https://github.com/algesten/ureq/issues/94
+            _ = last_rep.into_body().read_to_vec();
+        }
+        (need_retry, last_rep) = state.get_request(url, request_timeout);
+        if !need_retry {
+            return last_rep;
+        }
+        retry_interval_ms = (retry_interval_ms * 2).min(1000);
+    }
+}
+
+#[allow(clippy::result_large_err)] // `ureq::Error` is large enough to cause this warning.
+fn http_get_with_retries(
+    state: &HttpHandlerState,
+    url: &str,
+    request_timeout: Duration,
+    retry_timeout: Duration,
+) -> Result<Response<Body>, ureq::Error> {
+    let (need_retry, last_rep) = state.get_request(url, request_timeout);
+    if !need_retry || retry_timeout.is_zero() {
+        return last_rep;
+    }
+
+    retry_http_get(state, url, request_timeout, retry_timeout, last_rep)
 }

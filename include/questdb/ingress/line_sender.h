@@ -95,6 +95,18 @@ typedef enum line_sender_protocol
     line_sender_protocol_https,
 } line_sender_protocol;
 
+/** The line protocol version used to write data to buffer. */
+typedef enum line_protocol_version
+{
+    /** Version 1 of InfluxDB Line Protocol.
+    Uses text format serialization for f64. */
+    line_protocol_version_1,
+
+    /** Version 2 of InfluxDB Line Protocol.
+    Uses binary format serialization for f64, and support array data type.*/
+    line_protocol_version_2,
+} line_protocol_version;
+
 /** Possible sources of the root certificates used to validate the server's
  * TLS certificate. */
 typedef enum line_sender_ca
@@ -295,6 +307,23 @@ line_sender_buffer* line_sender_buffer_new();
  */
 LINESENDER_API
 line_sender_buffer* line_sender_buffer_with_max_name_len(size_t max_name_len);
+
+/**
+ * Sets the Line Protocol version for line_sender_buffer.
+ *
+ * The buffer defaults is line_protocol_version_2 which uses
+ * binary format f64 serialization and support array data type. Call this to
+ * switch to version 1 (text format f64) when connecting to servers that don't
+ * support line_protocol_version_2(under 8.3.2).
+ *
+ * Must be called before adding any data to the buffer. Protocol version cannot
+ * be changed after the buffer contains data.
+ */
+LINESENDER_API
+line_sender_buffer* line_sender_buffer_set_line_protocol_version(
+    line_sender_buffer* buffer,
+    line_protocol_version version,
+    line_sender_error** err_out);
 
 /** Release the `line_sender_buffer` object. */
 LINESENDER_API
@@ -719,6 +748,13 @@ bool line_sender_opts_token_y(
     line_sender_error** err_out);
 
 /**
+ * Set the ECDSA public key Y for TCP authentication.
+ */
+LINESENDER_API
+bool line_sender_opts_disable_line_protocol_validation(
+    line_sender_opts* opts, line_sender_error** err_out);
+
+/**
  * Configure how long to wait for messages from the QuestDB server during
  * the TLS handshake and authentication process.
  * The value is in milliseconds, and the default is 15 seconds.
@@ -876,6 +912,25 @@ line_sender* line_sender_from_conf(
  */
 LINESENDER_API
 line_sender* line_sender_from_env(line_sender_error** err_out);
+
+/**
+ * Returns the client's recommended default line protocol version.
+ * Will be used to [`line_sender_buffer_set_line_protocol_version`]
+ *
+ * The version selection follows these rules:
+ * 1. TCP/TCPS Protocol: Always returns [`LineProtocolVersion::V2`]
+ * 2. HTTP/HTTPS Protocol:
+ *   - If line protocol auto-detection is disabled
+ *    [`line_sender_opts_disable_line_protocol_validation`], returns
+ *    [`LineProtocolVersion::V2`]
+ *   - If line protocol auto-detection is enabled:
+ *     - Uses the server's default version if supported by the client
+ *     - Otherwise uses the highest mutually supported version from the
+ *       intersection of client and server compatible versions.
+ */
+LINESENDER_API
+line_protocol_version line_sender_default_line_protocol_version(
+    line_sender* sender);
 
 /**
  * Tell whether the sender is no longer usable and must be closed.

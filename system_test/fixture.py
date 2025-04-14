@@ -414,7 +414,8 @@ class QuestDbFixture:
         except TimeoutError as toe:
             if log:
                 if log_ctx:
-                    log_ctx = f'\n{textwrap.indent(log_ctx, "    ")}\n'
+                    log_ctx_str = log_ctx.decode('utf-8', errors='replace')
+                    log_ctx = f'\n{textwrap.indent(log_ctx_str, "    ")}\n'
                 sys.stderr.write(
                     f'Timed out after {timeout_sec} seconds ' +
                     f'waiting for query {sql_query!r}. ' +
