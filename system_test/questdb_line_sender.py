@@ -90,6 +90,12 @@ class CertificateAuthority(Enum):
     WEBPKI_AND_OS_ROOTS = (c_line_sender_ca(2), 'webpki_and_os_roots')
     PEM_FILE = (c_line_sender_ca(3), 'pem_file')
 
+c_line_protocol_version = ctypes.c_int
+
+class ProtocolVersion(Enum):
+    TCP = (c_line_protocol_version(0), 'v1')
+    TCPS = (c_line_protocol_version(1), 'v2')
+
 class c_line_sender_opts(ctypes.Structure):
     pass
 
@@ -184,6 +190,10 @@ def _setup_cdll():
         dll.line_sender_buffer_with_max_name_len,
         c_line_sender_buffer_p,
         c_size_t)
+    set_sig(
+        dll.line_sender_buffer_set_line_protocol_version,
+        c_line_protocol_version,
+        c_line_sender_error_p_p)
     set_sig(
         dll.line_sender_buffer_free,
         None,
@@ -336,6 +346,11 @@ def _setup_cdll():
         c_line_sender_utf8,
         c_line_sender_error_p_p)
     set_sig(
+        dll.line_sender_opts_disable_line_protocol_validation,
+        c_bool,
+        c_line_sender_opts_p,
+        c_line_sender_error_p_p)
+    set_sig(
         dll.line_sender_opts_auth_timeout,
         c_bool,
         c_line_sender_opts_p,
@@ -405,6 +420,10 @@ def _setup_cdll():
         dll.line_sender_from_env,
         c_line_sender_p,
         c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_default_line_protocol_version,
+        c_line_protocol_version,
+        c_line_sender_p)
     set_sig(
         dll.line_sender_must_close,
         None,

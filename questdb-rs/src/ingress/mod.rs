@@ -2646,7 +2646,8 @@ impl SenderBuilder {
                 if !*http_config.disable_line_proto_validation.deref() {
                     if let ProtocolHandler::Http(http_state) = &handler {
                         let settings_url = &format!(
-                            "http://{}:{}/settings",
+                            "{}://{}:{}/settings",
+                            self.protocol.schema(),
                             self.host.deref(),
                             self.port.deref()
                         );
