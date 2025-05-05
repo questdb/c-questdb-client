@@ -1418,7 +1418,9 @@ unsafe fn unwrap_sender_mut<'a>(sender: *mut line_sender) -> &'a mut Sender {
 ///      - Otherwise uses the highest mutually supported version from the intersection
 ///        of client and server compatible versions
 #[no_mangle]
-pub unsafe extern "C" fn line_sender_default_line_protocol_version(sender: *mut line_sender) -> LineProtocolVersion {
+pub unsafe extern "C" fn line_sender_default_line_protocol_version(
+    sender: *mut line_sender,
+) -> LineProtocolVersion {
     unwrap_sender(sender).default_line_protocol_version().into()
 }
 
