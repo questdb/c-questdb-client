@@ -412,6 +412,11 @@ public:
     {
     }
 
+    line_sender_buffer(line_protocol_version version) noexcept
+        : line_sender_buffer{64 * 1024, 127, version}
+    {
+    }
+
     line_sender_buffer(const line_sender_buffer& other) noexcept
         : _impl{::line_sender_buffer_clone(other._impl)}
         , _init_buf_size{other._init_buf_size}
@@ -1359,6 +1364,16 @@ public:
             line_sender_error::wrapped_call(
                 ::line_sender_flush_and_keep, _impl, buffer2._impl);
         }
+    }
+
+    /**
+     * Returns the client's recommended default line protocol version.
+     */
+    line_protocol_version default_line_protocol_version()
+    {
+        ensure_impl();
+        return line_sender_error::wrapped_call(
+            ::line_sender_default_line_protocol_version, _impl);
     }
 
     /**

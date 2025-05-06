@@ -37,7 +37,8 @@ static bool example(std::string_view host, std::string_view port)
             48121.5,
             4.3};
 
-        questdb::ingress::line_sender_buffer buffer;
+        questdb::ingress::line_sender_buffer buffer{
+            sender.default_line_protocol_version()};
         buffer
             .table(table_name)
             .symbol(symbol_name, "ETH-USD"_utf8)
