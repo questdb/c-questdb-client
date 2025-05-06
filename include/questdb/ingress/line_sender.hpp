@@ -1372,8 +1372,7 @@ public:
     line_protocol_version default_line_protocol_version()
     {
         ensure_impl();
-        return line_sender_error::wrapped_call(
-            ::line_sender_default_line_protocol_version, _impl);
+        return line_sender_default_line_protocol_version(_impl);
     }
 
     /**
