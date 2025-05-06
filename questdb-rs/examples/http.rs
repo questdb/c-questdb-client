@@ -6,7 +6,8 @@ use questdb::{
 
 fn main() -> Result<()> {
     let mut sender = Sender::from_conf("https::addr=localhost:9000;username=foo;password=bar;")?;
-    let mut buffer = Buffer::new();
+    let mut buffer =
+        Buffer::new().with_line_proto_version(sender.default_line_protocol_version())?;
     buffer
         .table("trades")?
         .symbol("symbol", "ETH-USD")?

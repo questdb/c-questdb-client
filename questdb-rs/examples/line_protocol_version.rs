@@ -18,7 +18,8 @@ fn main() -> Result<()> {
     sender.flush(&mut buffer)?;
 
     let mut sender2 = Sender::from_conf("https::addr=localhost:9000;username=foo;password=bar;")?;
-    let mut buffer2 = Buffer::new().with_line_proto_version(LineProtocolVersion::V1)?;
+    let mut buffer2 =
+        Buffer::new().with_line_proto_version(sender2.default_line_protocol_version())?;
     buffer2
         .table("trades_ilp_v2")?
         .symbol("symbol", "ETH-USD")?

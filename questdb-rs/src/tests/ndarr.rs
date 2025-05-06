@@ -264,6 +264,734 @@ fn test_array_length_mismatch() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn test_build_in_1d_array_normal() -> TestResult {
+    let arr = [1.0f64, 2.0, 3.0, 4.0];
+    assert_eq!(arr.ndim(), 1);
+    assert_eq!(arr.dim(0), Some(4));
+    assert_eq!(arr.dim(1), None);
+    assert_eq!(NdArrayView::as_slice(&arr), Some(&[1.0, 2.0, 3.0, 4.0][..]));
+    let collected: Vec<_> = NdArrayView::iter(&arr).copied().collect();
+    assert_eq!(collected, vec![1.0, 2.0, 3.0, 4.0]);
+    assert_eq!(arr.check_data_buf(), Ok(32));
+
+    let mut buffer = Buffer::new();
+    buffer.table("my_test")?;
+    buffer.column_arr("temperature", &arr)?;
+    let data = buffer.as_bytes();
+    assert_eq!(&data[0..7], b"my_test");
+    assert_eq!(&data[8..19], b"temperature");
+    assert_eq!(
+        &data[19..24],
+        &[
+            b'=',
+            b'=',
+            ARRAY_BINARY_FORMAT_TYPE,
+            ElemDataType::Double.into(),
+            1u8
+        ]
+    );
+    assert_eq!(&data[24..28], [4i32.to_le_bytes()].concat());
+    assert_eq!(
+        &data[28..60],
+        &[
+            1.0f64.to_ne_bytes(),
+            2.0f64.to_le_bytes(),
+            3.0f64.to_le_bytes(),
+            4.0f64.to_le_bytes(),
+        ]
+        .concat()
+    );
+    Ok(())
+}
+
+#[test]
+fn test_build_in_1d_array_empty() -> TestResult {
+    let arr: [f64; 0] = [];
+    assert_eq!(arr.ndim(), 1);
+    assert_eq!(arr.dim(0), Some(0));
+    assert_eq!(NdArrayView::as_slice(&arr), Some(&[][..]));
+    assert_eq!(arr.check_data_buf(), Ok(0));
+
+    let mut buffer = Buffer::new();
+    buffer.table("my_test")?;
+    buffer.column_arr("temperature", &arr)?;
+    let data = buffer.as_bytes();
+    assert_eq!(&data[0..7], b"my_test");
+    assert_eq!(&data[8..19], b"temperature");
+    assert_eq!(
+        &data[19..24],
+        &[
+            b'=',
+            b'=',
+            ARRAY_BINARY_FORMAT_TYPE,
+            ElemDataType::Double.into(),
+            1u8
+        ]
+    );
+    assert_eq!(&data[24..28], [0i32.to_le_bytes()].concat());
+    Ok(())
+}
+
+#[test]
+fn test_build_in_1d_vec_normal() -> TestResult {
+    let vec = vec![5.0f64, 6.0, 7.0];
+    assert_eq!(vec.ndim(), 1);
+    assert_eq!(vec.dim(0), Some(3));
+    assert_eq!(NdArrayView::as_slice(&vec), Some(&[5.0, 6.0, 7.0][..]));
+    let collected: Vec<_> = NdArrayView::iter(&vec).copied().collect();
+    assert_eq!(collected, vec![5.0, 6.0, 7.0]);
+    assert_eq!(vec.check_data_buf(), Ok(24));
+
+    let mut buffer = Buffer::new();
+    buffer.table("my_test")?;
+    buffer.column_arr("temperature", &vec)?;
+    let data = buffer.as_bytes();
+    assert_eq!(&data[0..7], b"my_test");
+    assert_eq!(&data[8..19], b"temperature");
+    assert_eq!(
+        &data[19..24],
+        &[
+            b'=',
+            b'=',
+            ARRAY_BINARY_FORMAT_TYPE,
+            ElemDataType::Double.into(),
+            1u8
+        ]
+    );
+    assert_eq!(&data[24..28], [3i32.to_le_bytes()].concat());
+    assert_eq!(
+        &data[28..52],
+        &[
+            5.0f64.to_le_bytes(),
+            6.0f64.to_le_bytes(),
+            7.0f64.to_le_bytes(),
+        ]
+        .concat()
+    );
+    Ok(())
+}
+
+#[test]
+fn test_build_in_1d_vec_empty() -> TestResult {
+    let vec: Vec<f64> = Vec::new();
+    assert_eq!(vec.ndim(), 1);
+    assert_eq!(vec.dim(0), Some(0));
+    assert_eq!(NdArrayView::as_slice(&vec), Some(&[][..]));
+    assert_eq!(vec.check_data_buf(), Ok(0));
+
+    let mut buffer = Buffer::new();
+    buffer.table("my_test")?;
+    buffer.column_arr("temperature", &vec)?;
+    let data = buffer.as_bytes();
+    assert_eq!(&data[0..7], b"my_test");
+    assert_eq!(&data[8..19], b"temperature");
+    assert_eq!(
+        &data[19..24],
+        &[
+            b'=',
+            b'=',
+            ARRAY_BINARY_FORMAT_TYPE,
+            ElemDataType::Double.into(),
+            1u8
+        ]
+    );
+    assert_eq!(&data[24..28], [0i32.to_le_bytes()].concat());
+    Ok(())
+}
+
+#[test]
+fn test_build_in_1d_slice_normal() -> TestResult {
+    let data = [10.0f64, 20.0, 30.0, 40.0];
+    let slice = &data[1..3];
+    assert_eq!(slice.ndim(), 1);
+    assert_eq!(slice.dim(0), Some(2));
+    assert_eq!(NdArrayView::as_slice(&slice), Some(&[20.0, 30.0][..]));
+    assert_eq!(slice.check_data_buf(), Ok(16));
+
+    let mut buffer = Buffer::new();
+    buffer.table("my_test")?;
+    buffer.column_arr("temperature", &slice)?;
+    let data = buffer.as_bytes();
+    assert_eq!(&data[0..7], b"my_test");
+    assert_eq!(&data[8..19], b"temperature");
+    assert_eq!(
+        &data[19..24],
+        &[
+            b'=',
+            b'=',
+            ARRAY_BINARY_FORMAT_TYPE,
+            ElemDataType::Double.into(),
+            1u8
+        ]
+    );
+    assert_eq!(&data[24..28], [2i32.to_le_bytes()].concat());
+    assert_eq!(
+        &data[28..44],
+        &[20.0f64.to_le_bytes(), 30.0f64.to_le_bytes(),].concat()
+    );
+    Ok(())
+}
+
+#[test]
+fn test_build_in_1d_slice_empty() -> TestResult {
+    let data = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let slice = &data[2..2];
+    assert_eq!(slice.ndim(), 1);
+    assert_eq!(slice.dim(0), Some(0));
+    assert_eq!(NdArrayView::as_slice(&slice), Some(&[][..]));
+    assert_eq!(slice.check_data_buf(), Ok(0));
+
+    let mut buffer = Buffer::new();
+    buffer.table("my_test")?;
+    buffer.column_arr("temperature", &slice)?;
+    let data = buffer.as_bytes();
+    assert_eq!(&data[0..7], b"my_test");
+    assert_eq!(&data[8..19], b"temperature");
+    assert_eq!(
+        &data[19..24],
+        &[
+            b'=',
+            b'=',
+            ARRAY_BINARY_FORMAT_TYPE,
+            ElemDataType::Double.into(),
+            1u8
+        ]
+    );
+    assert_eq!(&data[24..28], [0i32.to_le_bytes()].concat());
+    Ok(())
+}
+
+#[test]
+fn test_build_in_2d_array_normal() -> TestResult {
+    let arr = [[1.0f64, 2.0], [3.0, 4.0], [5.0, 6.0]];
+    assert_eq!(arr.ndim(), 2);
+    assert_eq!(arr.dim(0), Some(3));
+    assert_eq!(arr.dim(1), Some(2));
+    assert_eq!(
+        NdArrayView::as_slice(&arr),
+        Some(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0][..])
+    );
+    let collected: Vec<_> = NdArrayView::iter(&arr).copied().collect();
+    assert_eq!(collected, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    assert_eq!(arr.check_data_buf(), Ok(48));
+
+    let mut buffer = Buffer::new();
+    buffer.table("my_test")?;
+    buffer.column_arr("2darray", &arr)?;
+    let data = buffer.as_bytes();
+    assert_eq!(&data[0..7], b"my_test");
+    assert_eq!(&data[8..15], b"2darray");
+    assert_eq!(
+        &data[15..20],
+        &[
+            b'=',
+            b'=',
+            ARRAY_BINARY_FORMAT_TYPE,
+            ElemDataType::Double.into(),
+            2u8
+        ]
+    );
+    assert_eq!(
+        &data[20..28],
+        [3i32.to_le_bytes(), 2i32.to_le_bytes()].concat()
+    );
+    assert_eq!(
+        &data[28..76],
+        &[
+            1.0f64.to_le_bytes(),
+            2.0f64.to_le_bytes(),
+            3.0f64.to_le_bytes(),
+            4.0f64.to_le_bytes(),
+            5.0f64.to_le_bytes(),
+            6.0f64.to_le_bytes(),
+        ]
+        .concat()
+    );
+    Ok(())
+}
+
+#[test]
+fn test_build_in_2d_array_empty() -> TestResult {
+    let arr: [[f64; 0]; 0] = [];
+    assert_eq!(arr.ndim(), 2);
+    assert_eq!(arr.dim(0), Some(0));
+    assert_eq!(arr.dim(1), Some(0));
+    assert_eq!(NdArrayView::as_slice(&arr), Some(&[][..]));
+    assert_eq!(arr.check_data_buf(), Ok(0));
+
+    let mut buffer = Buffer::new();
+    buffer.table("my_test")?;
+    buffer.column_arr("2darray", &arr)?;
+    let data = buffer.as_bytes();
+    assert_eq!(&data[0..7], b"my_test");
+    assert_eq!(&data[8..15], b"2darray");
+    assert_eq!(
+        &data[15..20],
+        &[
+            b'=',
+            b'=',
+            ARRAY_BINARY_FORMAT_TYPE,
+            ElemDataType::Double.into(),
+            2u8
+        ]
+    );
+    assert_eq!(
+        &data[20..28],
+        [0i32.to_le_bytes(), 0i32.to_le_bytes()].concat()
+    );
+    Ok(())
+}
+
+#[test]
+fn test_build_in_2d_vec_normal() -> TestResult {
+    let vec = vec![vec![1.0f64, 2.0], vec![3.0, 4.0], vec![5.0, 6.0]];
+    assert_eq!(vec.ndim(), 2);
+    assert_eq!(vec.dim(0), Some(3));
+    assert_eq!(vec.dim(1), Some(2));
+    assert!(NdArrayView::as_slice(&vec).is_none());
+    let collected: Vec<_> = NdArrayView::iter(&vec).copied().collect();
+    assert_eq!(collected, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    assert_eq!(vec.check_data_buf(), Ok(48));
+
+    let mut buffer = Buffer::new();
+    buffer.table("my_test")?;
+    buffer.column_arr("2darray", &vec)?;
+    let data = buffer.as_bytes();
+    assert_eq!(&data[0..7], b"my_test");
+    assert_eq!(&data[8..15], b"2darray");
+    assert_eq!(
+        &data[15..20],
+        &[
+            b'=',
+            b'=',
+            ARRAY_BINARY_FORMAT_TYPE,
+            ElemDataType::Double.into(),
+            2u8
+        ]
+    );
+    assert_eq!(
+        &data[20..28],
+        [3i32.to_le_bytes(), 2i32.to_le_bytes()].concat()
+    );
+    assert_eq!(
+        &data[28..76],
+        &[
+            1.0f64.to_le_bytes(),
+            2.0f64.to_le_bytes(),
+            3.0f64.to_le_bytes(),
+            4.0f64.to_le_bytes(),
+            5.0f64.to_le_bytes(),
+            6.0f64.to_le_bytes(),
+        ]
+        .concat()
+    );
+    Ok(())
+}
+
+#[test]
+fn test_build_in_2d_vec_irregular_shape() -> TestResult {
+    let irregular_vec = vec![vec![1.0, 2.0], vec![3.0], vec![4.0, 5.0]];
+    let mut buffer = Buffer::new();
+    buffer.table("my_test")?;
+    let result = buffer.column_arr("arr", &irregular_vec);
+    let err = result.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ArrayViewError);
+    assert!(err.msg().contains("Irregular array shape"));
+    Ok(())
+}
+
+#[test]
+fn test_build_in_2d_vec_empty() -> TestResult {
+    let vec: Vec<Vec<f64>> = vec![vec![], vec![], vec![]];
+    assert_eq!(vec.ndim(), 2);
+    assert_eq!(vec.dim(0), Some(3));
+    assert_eq!(vec.dim(1), Some(0));
+    assert_eq!(vec.check_data_buf(), Ok(0));
+
+    let mut buffer = Buffer::new();
+    buffer.table("my_test")?;
+    buffer.column_arr("2darray", &vec)?;
+    let data = buffer.as_bytes();
+    assert_eq!(&data[0..7], b"my_test");
+    assert_eq!(&data[8..15], b"2darray");
+    assert_eq!(
+        &data[15..20],
+        &[
+            b'=',
+            b'=',
+            ARRAY_BINARY_FORMAT_TYPE,
+            ElemDataType::Double.into(),
+            2u8
+        ]
+    );
+    assert_eq!(
+        &data[20..28],
+        [3i32.to_le_bytes(), 0i32.to_le_bytes()].concat()
+    );
+    Ok(())
+}
+
+#[test]
+fn test_build_in_2d_slice_normal() -> TestResult {
+    let data = [[1.0f64, 2.0], [3.0, 4.0], [5.0, 6.0]];
+    let slice = &data[..2];
+    assert_eq!(slice.ndim(), 2);
+    assert_eq!(slice.dim(0), Some(2));
+    assert_eq!(slice.dim(1), Some(2));
+    assert_eq!(
+        NdArrayView::as_slice(&slice),
+        Some(&[1.0, 2.0, 3.0, 4.0][..])
+    );
+    assert_eq!(slice.check_data_buf(), Ok(32));
+
+    let mut buffer = Buffer::new();
+    buffer.table("my_test")?;
+    buffer.column_arr("2darray", &slice)?;
+    let data = buffer.as_bytes();
+    assert_eq!(&data[0..7], b"my_test");
+    assert_eq!(&data[8..15], b"2darray");
+    assert_eq!(
+        &data[15..20],
+        &[
+            b'=',
+            b'=',
+            ARRAY_BINARY_FORMAT_TYPE,
+            ElemDataType::Double.into(),
+            2u8
+        ]
+    );
+    assert_eq!(
+        &data[20..28],
+        [2i32.to_le_bytes(), 2i32.to_le_bytes()].concat()
+    );
+    assert_eq!(
+        &data[28..60],
+        &[
+            1.0f64.to_le_bytes(),
+            2.0f64.to_le_bytes(),
+            3.0f64.to_le_bytes(),
+            4.0f64.to_le_bytes(),
+        ]
+        .concat()
+    );
+    Ok(())
+}
+
+#[test]
+fn test_build_in_2d_slice_empty() -> TestResult {
+    let data = [[1.0f64, 2.0], [3.0, 4.0], [5.0, 6.0]];
+    let slice = &data[2..2];
+    assert_eq!(slice.ndim(), 2);
+    assert_eq!(slice.dim(0), Some(0));
+    assert_eq!(slice.dim(1), Some(2));
+    assert_eq!(NdArrayView::as_slice(&slice), Some(&[][..]));
+    assert_eq!(slice.check_data_buf(), Ok(0));
+
+    let mut buffer = Buffer::new();
+    buffer.table("my_test")?;
+    buffer.column_arr("2darray", &slice)?;
+    let data = buffer.as_bytes();
+    assert_eq!(&data[0..7], b"my_test");
+    assert_eq!(&data[8..15], b"2darray");
+    assert_eq!(
+        &data[15..20],
+        &[
+            b'=',
+            b'=',
+            ARRAY_BINARY_FORMAT_TYPE,
+            ElemDataType::Double.into(),
+            2u8
+        ]
+    );
+    assert_eq!(
+        &data[20..28],
+        [0i32.to_le_bytes(), 2i32.to_le_bytes()].concat()
+    );
+    Ok(())
+}
+
+#[test]
+fn test_build_in_3d_array_normal() -> TestResult {
+    let arr = [[[1.0f64, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]];
+    assert_eq!(arr.ndim(), 3);
+    assert_eq!(arr.dim(0), Some(2));
+    assert_eq!(arr.dim(1), Some(2));
+    assert_eq!(arr.dim(2), Some(2));
+    assert_eq!(
+        NdArrayView::as_slice(&arr),
+        Some(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0][..])
+    );
+    let collected: Vec<_> = NdArrayView::iter(&arr).copied().collect();
+    assert_eq!(collected, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+    assert_eq!(arr.check_data_buf(), Ok(64));
+
+    let mut buffer = Buffer::new();
+    buffer.table("my_test")?;
+    buffer.column_arr("3darray", &arr)?;
+    let data = buffer.as_bytes();
+    assert_eq!(&data[0..7], b"my_test");
+    assert_eq!(&data[8..15], b"3darray");
+    assert_eq!(
+        &data[15..20],
+        &[
+            b'=',
+            b'=',
+            ARRAY_BINARY_FORMAT_TYPE,
+            ElemDataType::Double.into(),
+            3u8
+        ]
+    );
+    assert_eq!(
+        &data[20..32],
+        [2i32.to_le_bytes(), 2i32.to_le_bytes(), 2i32.to_le_bytes()].concat()
+    );
+    assert_eq!(
+        &data[32..96],
+        &[
+            1.0f64.to_le_bytes(),
+            2.0f64.to_le_bytes(),
+            3.0f64.to_le_bytes(),
+            4.0f64.to_le_bytes(),
+            5.0f64.to_le_bytes(),
+            6.0f64.to_le_bytes(),
+            7.0f64.to_le_bytes(),
+            8.0f64.to_le_bytes()
+        ]
+        .concat()
+    );
+    Ok(())
+}
+
+#[test]
+fn test_build_in_3d_array_empty() -> TestResult {
+    let arr: [[[f64; 2]; 0]; 0] = [];
+    assert_eq!(arr.ndim(), 3);
+    assert_eq!(arr.dim(0), Some(0));
+    assert_eq!(arr.dim(1), Some(0));
+    assert_eq!(arr.dim(2), Some(2));
+    assert_eq!(NdArrayView::as_slice(&arr), Some(&[][..]));
+    assert_eq!(arr.check_data_buf(), Ok(0));
+
+    let mut buffer = Buffer::new();
+    buffer.table("my_test")?;
+    buffer.column_arr("3darray", &arr)?;
+    let data = buffer.as_bytes();
+    assert_eq!(&data[0..7], b"my_test");
+    assert_eq!(&data[8..15], b"3darray");
+    assert_eq!(
+        &data[15..20],
+        &[
+            b'=',
+            b'=',
+            ARRAY_BINARY_FORMAT_TYPE,
+            ElemDataType::Double.into(),
+            3u8
+        ]
+    );
+    assert_eq!(
+        &data[20..32],
+        [0i32.to_le_bytes(), 0i32.to_le_bytes(), 2i32.to_le_bytes()].concat()
+    );
+    Ok(())
+}
+
+#[test]
+fn test_build_in_3d_vec_normal() -> TestResult {
+    let vec = vec![
+        vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]],
+        vec![vec![7.0, 8.0, 9.0], vec![10.0, 11.0, 12.0]],
+    ];
+    assert_eq!(vec.ndim(), 3);
+    assert_eq!(vec.dim(0), Some(2));
+    assert_eq!(vec.dim(1), Some(2));
+    assert_eq!(vec.dim(2), Some(3));
+    assert!(NdArrayView::as_slice(&vec).is_none());
+    let collected: Vec<_> = NdArrayView::iter(&vec).copied().collect();
+    assert_eq!(
+        collected,
+        vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
+    );
+    assert_eq!(vec.check_data_buf(), Ok(96));
+
+    let mut buffer = Buffer::new();
+    buffer.table("my_test")?;
+    buffer.column_arr("3darray", &vec)?;
+    let data = buffer.as_bytes();
+    assert_eq!(&data[0..7], b"my_test");
+    assert_eq!(&data[8..15], b"3darray");
+    assert_eq!(
+        &data[15..20],
+        &[
+            b'=',
+            b'=',
+            ARRAY_BINARY_FORMAT_TYPE,
+            ElemDataType::Double.into(),
+            3u8
+        ]
+    );
+    assert_eq!(
+        &data[20..32],
+        [2i32.to_le_bytes(), 2i32.to_le_bytes(), 3i32.to_le_bytes()].concat()
+    );
+    assert_eq!(
+        &data[32..128],
+        &[
+            1.0f64.to_le_bytes(),
+            2.0f64.to_le_bytes(),
+            3.0f64.to_le_bytes(),
+            4.0f64.to_le_bytes(),
+            5.0f64.to_le_bytes(),
+            6.0f64.to_le_bytes(),
+            7.0f64.to_le_bytes(),
+            8.0f64.to_le_bytes(),
+            9.0f64.to_le_bytes(),
+            10.0f64.to_le_bytes(),
+            11.0f64.to_le_bytes(),
+            12.0f64.to_le_bytes(),
+        ]
+        .concat()
+    );
+    Ok(())
+}
+
+#[test]
+fn test_build_in_3d_vec_empty() -> TestResult {
+    let vec: Vec<Vec<Vec<f64>>> = vec![vec![vec![], vec![]], vec![vec![], vec![]]];
+    assert_eq!(vec.ndim(), 3);
+    assert_eq!(vec.dim(0), Some(2));
+    assert_eq!(vec.dim(1), Some(2));
+    assert_eq!(vec.dim(2), Some(0));
+    assert!(NdArrayView::as_slice(&vec).is_none());
+    assert_eq!(vec.check_data_buf(), Ok(0));
+
+    let mut buffer = Buffer::new();
+    buffer.table("my_test")?;
+    buffer.column_arr("3darray", &vec)?;
+    let data = buffer.as_bytes();
+    assert_eq!(&data[0..7], b"my_test");
+    assert_eq!(&data[8..15], b"3darray");
+    assert_eq!(
+        &data[15..20],
+        &[
+            b'=',
+            b'=',
+            ARRAY_BINARY_FORMAT_TYPE,
+            ElemDataType::Double.into(),
+            3u8
+        ]
+    );
+    assert_eq!(
+        &data[20..32],
+        [2i32.to_le_bytes(), 2i32.to_le_bytes(), 0i32.to_le_bytes()].concat()
+    );
+    Ok(())
+}
+
+#[test]
+fn test_build_in_3d_vec_irregular_shape() -> TestResult {
+    let irregular1 = vec![vec![vec![1.0, 2.0], vec![3.0, 4.0]], vec![vec![5.0, 6.0]]];
+
+    let irregular2 = vec![
+        vec![vec![1.0, 2.0], vec![3.0, 4.0, 5.0]],
+        vec![vec![6.0, 7.0], vec![8.0, 9.0]],
+    ];
+
+    let mut buffer = Buffer::new();
+    buffer.table("my_test")?;
+    let result = buffer.column_arr("arr", &irregular1);
+    let err = result.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ArrayViewError);
+    assert!(err.msg().contains("Irregular array shape"));
+
+    let result = buffer.column_arr("arr", &irregular2);
+    let err = result.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ArrayViewError);
+    assert!(err.msg().contains("Irregular array shape"));
+    Ok(())
+}
+
+#[test]
+fn test_3d_slice_normal() -> TestResult {
+    let data = [[[1f64, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]];
+    let slice = &data[..1];
+    assert_eq!(slice.ndim(), 3);
+    assert_eq!(slice.dim(0), Some(1));
+    assert_eq!(slice.dim(1), Some(2));
+    assert_eq!(slice.dim(2), Some(2));
+    assert_eq!(
+        NdArrayView::as_slice(&slice),
+        Some(&[1.0, 2.0, 3.0, 4.0][..])
+    );
+    assert_eq!(slice.check_data_buf(), Ok(32));
+
+    let mut buffer = Buffer::new();
+    buffer.table("my_test")?;
+    buffer.column_arr("3darray", &slice)?;
+    let data = buffer.as_bytes();
+    assert_eq!(&data[0..7], b"my_test");
+    assert_eq!(&data[8..15], b"3darray");
+    assert_eq!(
+        &data[15..20],
+        &[
+            b'=',
+            b'=',
+            ARRAY_BINARY_FORMAT_TYPE,
+            ElemDataType::Double.into(),
+            3u8
+        ]
+    );
+    assert_eq!(
+        &data[20..32],
+        [1i32.to_le_bytes(), 2i32.to_le_bytes(), 2i32.to_le_bytes()].concat()
+    );
+    assert_eq!(
+        &data[32..64],
+        &[
+            1.0f64.to_le_bytes(),
+            2.0f64.to_le_bytes(),
+            3.0f64.to_le_bytes(),
+            4.0f64.to_le_bytes(),
+        ]
+        .concat()
+    );
+    Ok(())
+}
+
+#[test]
+fn test_3d_slice_empty() -> TestResult {
+    let data = [[[1f64, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]];
+    let slice = &data[1..1];
+    assert_eq!(slice.ndim(), 3);
+    assert_eq!(slice.dim(0), Some(0));
+    assert_eq!(slice.dim(1), Some(2));
+    assert_eq!(slice.dim(2), Some(2));
+    assert_eq!(NdArrayView::as_slice(&slice), Some(&[][..]));
+    assert_eq!(slice.check_data_buf(), Ok(0));
+
+    let mut buffer = Buffer::new();
+    buffer.table("my_test")?;
+    buffer.column_arr("3darray", &slice)?;
+    let data = buffer.as_bytes();
+    assert_eq!(&data[0..7], b"my_test");
+    assert_eq!(&data[8..15], b"3darray");
+    assert_eq!(
+        &data[15..20],
+        &[
+            b'=',
+            b'=',
+            ARRAY_BINARY_FORMAT_TYPE,
+            ElemDataType::Double.into(),
+            3u8
+        ]
+    );
+    assert_eq!(
+        &data[20..32],
+        [0i32.to_le_bytes(), 2i32.to_le_bytes(), 2i32.to_le_bytes()].concat()
+    );
+    Ok(())
+}
+
 #[cfg(feature = "ndarray")]
 #[test]
 fn test_1d_contiguous_ndarray_buffer() -> TestResult {
