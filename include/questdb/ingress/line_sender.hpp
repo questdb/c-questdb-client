@@ -1367,7 +1367,7 @@ public:
     }
 
     /**
-     * Returns the client's recommended default line protocol version.
+     * Returns the QuestDB server's recommended default line protocol version.
      */
     line_protocol_version default_line_protocol_version()
     {

@@ -914,7 +914,7 @@ LINESENDER_API
 line_sender* line_sender_from_env(line_sender_error** err_out);
 
 /**
- * Returns the client's recommended default line protocol version.
+ * Returns the QuestDB server's recommended default line protocol version.
  * Will be used to [`line_sender_buffer_set_line_protocol_version`]
  *
  * The version selection follows these rules:

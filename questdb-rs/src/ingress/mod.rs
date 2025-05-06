@@ -3030,7 +3030,7 @@ impl Sender {
         !self.connected
     }
 
-    /// Returns the client's recommended default line protocol version.
+    /// Returns the QuestDB server's recommended default line protocol version.
     /// Will be used to [`Buffer::with_line_proto_version`]
     ///
     /// The version selection follows these rules:
