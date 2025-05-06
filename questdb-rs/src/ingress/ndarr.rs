@@ -335,6 +335,313 @@ where
     }
 }
 
+/// impl NdArrayView for one dimension vector
+impl<T: ArrayElement> NdArrayView<T> for Vec<T> {
+    type Iter<'a>
+        = std::slice::Iter<'a, T>
+    where
+        T: 'a;
+
+    fn ndim(&self) -> usize {
+        1
+    }
+
+    fn dim(&self, idx: usize) -> Option<usize> {
+        (idx == 0).then_some(self.len())
+    }
+
+    fn as_slice(&self) -> Option<&[T]> {
+        Some(self.as_slice())
+    }
+
+    fn iter(&self) -> Self::Iter<'_> {
+        self.as_slice().iter()
+    }
+
+    fn check_data_buf(&self) -> Result<usize, Error> {
+        Ok(self.len() * std::mem::size_of::<T>())
+    }
+}
+
+/// impl NdArrayView for one dimension array
+impl<T: ArrayElement, const N: usize> NdArrayView<T> for [T; N] {
+    type Iter<'a>
+        = std::slice::Iter<'a, T>
+    where
+        T: 'a;
+
+    fn ndim(&self) -> usize {
+        1
+    }
+
+    fn dim(&self, idx: usize) -> Option<usize> {
+        (idx == 0).then_some(N)
+    }
+
+    fn as_slice(&self) -> Option<&[T]> {
+        Some(self)
+    }
+
+    fn iter(&self) -> Self::Iter<'_> {
+        self.as_slice().iter()
+    }
+
+    fn check_data_buf(&self) -> Result<usize, Error> {
+        Ok(N * std::mem::size_of::<T>())
+    }
+}
+
+/// impl NdArrayView for one dimension slice
+impl<T: ArrayElement> NdArrayView<T> for &[T] {
+    type Iter<'a>
+        = std::slice::Iter<'a, T>
+    where
+        Self: 'a,
+        T: 'a;
+
+    fn ndim(&self) -> usize {
+        1
+    }
+
+    fn dim(&self, idx: usize) -> Option<usize> {
+        (idx == 0).then_some(self.len())
+    }
+
+    fn as_slice(&self) -> Option<&[T]> {
+        Some(self)
+    }
+
+    fn iter(&self) -> Self::Iter<'_> {
+        <[T]>::iter(self)
+    }
+
+    fn check_data_buf(&self) -> Result<usize, Error> {
+        Ok(std::mem::size_of_val(*self))
+    }
+}
+
+/// impl NdArrayView for two dimensions vector
+impl<T: ArrayElement> NdArrayView<T> for Vec<Vec<T>> {
+    type Iter<'a>
+        = std::iter::Flatten<std::slice::Iter<'a, Vec<T>>>
+    where
+        T: 'a;
+
+    fn ndim(&self) -> usize {
+        2
+    }
+
+    fn dim(&self, idx: usize) -> Option<usize> {
+        match idx {
+            0 => Some(self.len()),
+            1 => self.first().map(|v| v.len()),
+            _ => None,
+        }
+    }
+
+    fn as_slice(&self) -> Option<&[T]> {
+        None
+    }
+
+    fn iter(&self) -> Self::Iter<'_> {
+        self.as_slice().iter().flatten()
+    }
+
+    fn check_data_buf(&self) -> Result<usize, Error> {
+        let row_len = self.first().map_or(0, |v| v.len());
+        if self.as_slice().iter().any(|v| v.len() != row_len) {
+            return Err(error::fmt!(ArrayViewError, "Irregular array shape"));
+        }
+        Ok(self.len() * row_len * std::mem::size_of::<T>())
+    }
+}
+
+/// impl NdArrayView for two dimensions array
+impl<T: ArrayElement, const M: usize, const N: usize> NdArrayView<T> for [[T; M]; N] {
+    type Iter<'a>
+        = std::iter::Flatten<std::slice::Iter<'a, [T; M]>>
+    where
+        T: 'a;
+
+    fn ndim(&self) -> usize {
+        2
+    }
+
+    fn dim(&self, idx: usize) -> Option<usize> {
+        match idx {
+            0 => Some(N),
+            1 => Some(M),
+            _ => None,
+        }
+    }
+
+    fn as_slice(&self) -> Option<&[T]> {
+        Some(unsafe { std::slice::from_raw_parts(self.as_ptr() as *const T, N * M) })
+    }
+
+    fn iter(&self) -> Self::Iter<'_> {
+        self.as_slice().iter().flatten()
+    }
+
+    fn check_data_buf(&self) -> Result<usize, Error> {
+        Ok(N * M * std::mem::size_of::<T>())
+    }
+}
+
+/// impl NdArrayView for two dimensions slices
+impl<T: ArrayElement, const M: usize> NdArrayView<T> for &[[T; M]] {
+    type Iter<'a>
+        = std::iter::Flatten<std::slice::Iter<'a, [T; M]>>
+    where
+        Self: 'a,
+        T: 'a;
+
+    fn ndim(&self) -> usize {
+        2
+    }
+
+    fn dim(&self, idx: usize) -> Option<usize> {
+        match idx {
+            0 => Some(self.len()),
+            1 => Some(M),
+            _ => None,
+        }
+    }
+
+    fn as_slice(&self) -> Option<&[T]> {
+        Some(unsafe { std::slice::from_raw_parts(self.as_ptr() as *const T, self.len() * M) })
+    }
+
+    fn iter(&self) -> Self::Iter<'_> {
+        <[[T; M]]>::iter(self).flatten()
+    }
+
+    fn check_data_buf(&self) -> Result<usize, Error> {
+        Ok(self.len() * M * std::mem::size_of::<T>())
+    }
+}
+
+/// impl NdArrayView for three dimensions vector
+impl<T: ArrayElement> NdArrayView<T> for Vec<Vec<Vec<T>>> {
+    type Iter<'a>
+        = std::iter::Flatten<std::iter::Flatten<std::slice::Iter<'a, Vec<Vec<T>>>>>
+    where
+        T: 'a;
+
+    fn ndim(&self) -> usize {
+        3
+    }
+
+    fn dim(&self, idx: usize) -> Option<usize> {
+        match idx {
+            0 => Some(self.len()),
+            1 => self.first().map(|v| v.len()),
+            2 => self.first().and_then(|v2| v2.first()).map(|v3| v3.len()),
+            _ => None,
+        }
+    }
+
+    fn as_slice(&self) -> Option<&[T]> {
+        None
+    }
+
+    fn iter(&self) -> Self::Iter<'_> {
+        self.as_slice().iter().flatten().flatten()
+    }
+
+    fn check_data_buf(&self) -> Result<usize, Error> {
+        let dim1 = self.first().map_or(0, |v| v.len());
+
+        if self.as_slice().iter().any(|v2| v2.len() != dim1) {
+            return Err(error::fmt!(ArrayViewError, "Irregular array shape"));
+        }
+
+        let dim2 = self
+            .first()
+            .and_then(|v2| v2.first())
+            .map_or(0, |v3| v3.len());
+
+        if self
+            .as_slice()
+            .iter()
+            .flat_map(|v2| v2.as_slice().iter())
+            .any(|v3| v3.len() != dim2)
+        {
+            return Err(error::fmt!(ArrayViewError, "Irregular array shape"));
+        }
+
+        Ok(self.len() * dim1 * dim2 * std::mem::size_of::<T>())
+    }
+}
+
+/// impl NdArrayView for three dimensions array
+impl<T: ArrayElement, const M: usize, const N: usize, const L: usize> NdArrayView<T>
+    for [[[T; M]; N]; L]
+{
+    type Iter<'a>
+        = std::iter::Flatten<std::iter::Flatten<std::slice::Iter<'a, [[T; M]; N]>>>
+    where
+        T: 'a;
+
+    fn ndim(&self) -> usize {
+        3
+    }
+
+    fn dim(&self, idx: usize) -> Option<usize> {
+        match idx {
+            0 => Some(L),
+            1 => Some(N),
+            2 => Some(M),
+            _ => None,
+        }
+    }
+
+    fn as_slice(&self) -> Option<&[T]> {
+        Some(unsafe { std::slice::from_raw_parts(self.as_ptr() as *const T, L * N * M) })
+    }
+
+    fn iter(&self) -> Self::Iter<'_> {
+        self.as_slice().iter().flatten().flatten()
+    }
+
+    fn check_data_buf(&self) -> Result<usize, Error> {
+        Ok(L * N * M * std::mem::size_of::<T>())
+    }
+}
+
+impl<T: ArrayElement, const M: usize, const N: usize> NdArrayView<T> for &[[[T; M]; N]] {
+    type Iter<'a>
+        = std::iter::Flatten<std::iter::Flatten<std::slice::Iter<'a, [[T; M]; N]>>>
+    where
+        Self: 'a,
+        T: 'a;
+
+    fn ndim(&self) -> usize {
+        3
+    }
+
+    fn dim(&self, idx: usize) -> Option<usize> {
+        match idx {
+            0 => Some(self.len()),
+            1 => Some(N),
+            2 => Some(M),
+            _ => None,
+        }
+    }
+
+    fn as_slice(&self) -> Option<&[T]> {
+        Some(unsafe { std::slice::from_raw_parts(self.as_ptr() as *const T, self.len() * N * M) })
+    }
+
+    fn iter(&self) -> Self::Iter<'_> {
+        <[[[T; M]; N]]>::iter(self).flatten().flatten()
+    }
+
+    fn check_data_buf(&self) -> Result<usize, Error> {
+        Ok(self.len() * N * M * std::mem::size_of::<T>())
+    }
+}
+
 use crate::{error, Error};
 #[cfg(feature = "ndarray")]
 use ndarray::{ArrayView, Axis, Dimension};
