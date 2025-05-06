@@ -32,6 +32,7 @@ rustls = { version = "0.23.25", default-features = false, features = ["logging",
 rustls-native-certs = { version = "0.8.1", optional = true }
 webpki-roots = { version = "0.26.8", default-features = false, optional = true }
 chrono = { version = "0.4.40", optional = true }
+hex	= "0.4.3"
 
 # We need to limit the `ureq` version to 3.0.x since we use
 # the `ureq::unversioned` module which does not respect semantic versioning.
