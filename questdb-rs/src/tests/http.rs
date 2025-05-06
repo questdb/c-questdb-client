@@ -830,3 +830,145 @@ fn test_transactional(
 
     Ok(())
 }
+
+#[test]
+fn test_sender_line_protocol_version() -> TestResult {
+    let mut server = MockServer::new()?.configure_settings_response(2, &[1, 2]);
+    let sender_builder = server.lsb_http();
+    let server_thread = std::thread::spawn(move || -> io::Result<()> {
+        server.accept()?;
+        let req = server.recv_http_q()?;
+        assert_eq!(req.method(), "GET");
+        assert_eq!(req.path(), "/settings");
+        assert_eq!(
+            req.header("user-agent"),
+            Some(concat!("questdb/rust/", env!("CARGO_PKG_VERSION")))
+        );
+        server.send_settings_response()?;
+        Ok(())
+    });
+    let sender = sender_builder.build()?;
+    assert_eq!(
+        sender.default_line_protocol_version(),
+        LineProtocolVersion::V2
+    );
+    assert_eq!(
+        sender.support_line_protocol_versions().unwrap(),
+        vec![LineProtocolVersion::V1, LineProtocolVersion::V2]
+    );
+    server_thread.join().unwrap()?;
+    Ok(())
+}
+
+#[test]
+fn test_sender_line_protocol_version_old_server1() -> TestResult {
+    let mut server = MockServer::new()?.configure_settings_response(0, &[1, 2]);
+    let sender_builder = server.lsb_http();
+    let server_thread = std::thread::spawn(move || -> io::Result<()> {
+        server.accept()?;
+        let req = server.recv_http_q()?;
+        assert_eq!(req.method(), "GET");
+        assert_eq!(req.path(), "/settings");
+        assert_eq!(
+            req.header("user-agent"),
+            Some(concat!("questdb/rust/", env!("CARGO_PKG_VERSION")))
+        );
+        server.send_settings_response()?;
+        Ok(())
+    });
+    let sender = sender_builder.build()?;
+    assert_eq!(
+        sender.default_line_protocol_version(),
+        LineProtocolVersion::V1
+    );
+    assert!(sender.support_line_protocol_versions().is_none());
+    server_thread.join().unwrap()?;
+    Ok(())
+}
+
+#[test]
+fn test_sender_line_protocol_version_old_server2() -> TestResult {
+    let mut server = MockServer::new()?.configure_settings_response(0, &[1, 2]);
+    let sender_builder = server.lsb_http();
+    let server_thread = std::thread::spawn(move || -> io::Result<()> {
+        server.accept()?;
+        server.send_http_response_q(
+            HttpResponse::empty()
+                .with_status(404, "Not Found")
+                .with_header("content-type", "text/plain")
+                .with_body_str("Not Found"),
+        )?;
+        Ok(())
+    });
+    let sender = sender_builder.build()?;
+    assert_eq!(
+        sender.default_line_protocol_version(),
+        LineProtocolVersion::V1
+    );
+    assert!(sender.support_line_protocol_versions().is_none());
+    server_thread.join().unwrap()?;
+    Ok(())
+}
+
+#[test]
+fn test_sender_line_protocol_version_unsupported_client() -> TestResult {
+    let mut server = MockServer::new()?.configure_settings_response(3, &[3, 4]);
+    let sender_builder = server.lsb_http();
+    let server_thread = std::thread::spawn(move || -> io::Result<()> {
+        server.accept()?;
+        server.send_settings_response()?;
+        Ok(())
+    });
+    let res1 = sender_builder.build();
+    assert!(res1.is_err());
+    let e1 = res1.err().unwrap();
+    assert_eq!(e1.code(), ErrorCode::LineProtocolVersionError);
+    assert!(e1.msg().contains("Server does not support current client."));
+    server_thread.join().unwrap()?;
+    Ok(())
+}
+
+#[test]
+fn test_sender_disable_line_protocol_version_validation() -> TestResult {
+    let mut server = MockServer::new()?.configure_settings_response(2, &[1, 2]);
+    let mut sender = server
+        .lsb_http()
+        .disable_line_protocol_validation()?
+        .build()?;
+    let mut buffer =
+        Buffer::new().with_line_proto_version(sender.default_line_protocol_version())?;
+    buffer
+        .table("test")?
+        .symbol("sym", "bol")?
+        .column_f64("x", 1.0)?
+        .at_now()?;
+    let buffer2 = buffer.clone();
+
+    let server_thread = std::thread::spawn(move || -> io::Result<()> {
+        server.accept()?;
+        let req = server.recv_http_q()?;
+        assert_eq!(req.body(), buffer2.as_bytes());
+        server.send_http_response_q(HttpResponse::empty())?;
+        Ok(())
+    });
+
+    sender.flush(&mut buffer)?;
+    server_thread.join().unwrap()?;
+    Ok(())
+}
+
+#[test]
+fn test_sender_line_protocol_version1_not_support_array() -> TestResult {
+    let mut buffer = Buffer::new().with_line_proto_version(LineProtocolVersion::V1)?;
+    let res = buffer
+        .table("test")?
+        .symbol("sym", "bol")?
+        .column_arr("x", &[1.0f64, 2.0]);
+    assert!(res.is_err());
+    let e1 = res.as_ref().err().unwrap();
+    assert_eq!(e1.code(), ErrorCode::LineProtocolVersionError);
+    assert!(e1
+        .msg()
+        .contains("line protocol version v1 does not support array datatype"));
+    Ok(())
+}

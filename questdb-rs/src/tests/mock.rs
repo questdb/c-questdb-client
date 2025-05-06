@@ -313,10 +313,14 @@ impl MockServer {
         default_version: u16,
         supported_versions: &[u16],
     ) -> Self {
-        self.settings_response = serde_json::json!({
-            "line.proto.default.version": default_version,
-            "line.proto.support.versions": supported_versions
-        });
+        if default_version == 0 {
+            self.settings_response = serde_json::json!({"version": "8.1.2"});
+        } else {
+            self.settings_response = serde_json::json!({
+                "line.proto.default.version": default_version,
+                "line.proto.support.versions": supported_versions
+            });
+        }
         self
     }
 

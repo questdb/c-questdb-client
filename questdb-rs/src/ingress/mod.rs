@@ -1118,6 +1118,12 @@ impl Buffer {
         D: ArrayElement,
         Error: From<N::Error>,
     {
+        if self.version == LineProtocolVersion::V1 {
+            return Err(error::fmt!(
+                LineProtocolVersionError,
+                "line protocol version v1 does not support array datatype",
+            ));
+        }
         self.write_column_key(name)?;
 
         // check dimension less equal than max dims
@@ -3037,6 +3043,12 @@ impl Sender {
     ///        of client and server compatible versions
     pub fn default_line_protocol_version(&self) -> LineProtocolVersion {
         self.default_line_protocol_version
+    }
+
+    #[cfg(feature = "ilp-over-http")]
+    #[cfg(test)]
+    pub(crate) fn support_line_protocol_versions(&self) -> Option<Vec<LineProtocolVersion>> {
+        self.supported_line_protocol_versions.clone()
     }
 
     #[cfg(feature = "ilp-over-http")]
