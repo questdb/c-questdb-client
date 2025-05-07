@@ -2355,7 +2355,8 @@ impl SenderBuilder {
     pub fn disable_line_protocol_validation(mut self) -> Result<Self> {
         if let Some(http) = &mut self.http {
             // ignore "already specified" error
-            let _ = http.disable_line_proto_validation
+            let _ = http
+                .disable_line_proto_validation
                 .set_specified("disable_line_protocol_validation", true);
         }
         Ok(self)
