@@ -502,7 +502,7 @@ pub(super) fn get_line_protocol_version(
                             } else {
                                 return Err(error::fmt!(
                                     LineProtocolVersionError,
-                                    "Server does not support current client."
+                                    "Server does not support current client"
                                 ));
                             }
                         } else {

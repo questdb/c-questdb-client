@@ -923,7 +923,7 @@ fn test_sender_line_protocol_version_unsupported_client() -> TestResult {
     assert!(res1.is_err());
     let e1 = res1.err().unwrap();
     assert_eq!(e1.code(), ErrorCode::LineProtocolVersionError);
-    assert!(e1.msg().contains("Server does not support current client."));
+    assert!(e1.msg().contains("Server does not support current client"));
     server_thread.join().unwrap()?;
     Ok(())
 }

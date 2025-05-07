@@ -725,6 +725,48 @@ class TestSender(unittest.TestCase):
             'cpp_trades_tls_ca',
             tls=True)
 
+    def test_cpp_array_example(self):
+        self._test_array_example(
+            'line_sender_cpp_example_array',
+            'cpp_market_orders')
+
+    def test_c_array_example(self):
+        self._test_array_example(
+            'line_sender_c_example_array',
+            'market_orders')
+
+    def _test_array_example(self, bin_name, table_name):
+        if QDB_FIXTURE.version < (8, 3, 1):
+            self.skipTest('array unsupported')
+        if QDB_FIXTURE.http:
+            self.skipTest('TCP-only test')
+        if BUILD_MODE != qls.BuildMode.API:
+            self.skipTest('BuildMode.API-only test')
+        if QDB_FIXTURE.auth:
+            self.skipTest('auth')
+
+        proj = Project()
+        ext = '.exe' if sys.platform == 'win32' else ''
+        try:
+            bin_path = next(proj.build_dir.glob(f'**/{bin_name}{ext}'))
+        except StopIteration:
+            raise RuntimeError(f'Could not find {bin_name}{ext} in {proj.build_dir}')
+        port = QDB_FIXTURE.line_tcp_port
+        args = [str(bin_path)]
+        args.extend(['localhost', str(port)])
+        subprocess.check_call(args, cwd=bin_path.parent)
+        resp = retry_check_table(table_name)
+        exp_columns = [
+            {'name': 'symbol', 'type': 'SYMBOL'},
+            {'dim': 3, 'elemType': 'DOUBLE', 'name': 'order_book', 'type': 'ARRAY'},
+            {'name': 'timestamp', 'type': 'TIMESTAMP'}]
+        self.assertEqual(resp['columns'], exp_columns)
+        exp_dataset = [['BTC-USD',
+                        [[[48123.5, 2.4], [48124.0, 1.8], [48124.5, 0.9]],
+                         [[48122.5, 3.1], [48122.0, 2.7], [48121.5, 4.3]]]]]
+        scrubbed_dataset = [row[:-1] for row in resp['dataset']]
+        self.assertEqual(scrubbed_dataset, exp_dataset)
+
     def test_opposite_auth(self):
         """
         We simulate incorrectly connecting either:
