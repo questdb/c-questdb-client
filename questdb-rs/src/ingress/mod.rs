@@ -689,6 +689,15 @@ impl Buffer {
         }
     }
 
+    /// Checks if this buffer is ready to be flushed to a sender via one of the
+    /// [`Sender::flush`] functions. An [`Ok`] value indicates that the buffer
+    /// is ready to be flushed via a [`Sender`] while an [`Err`] will contain a
+    /// message indicating why this [`Buffer`] cannot be flushed at the moment.
+    #[inline(always)]
+    pub fn check_can_flush(&self) -> Result<()> {
+        self.check_op(Op::Flush)
+    }
+
     #[inline(always)]
     fn validate_max_name_len(&self, name: &str) -> Result<()> {
         if name.len() > self.max_name_len {
@@ -1170,31 +1179,6 @@ impl Buffer {
         self.output.push(b'\n');
         self.state.op_case = OpCase::MayFlushOrTable;
         self.state.row_count += 1;
-        Ok(())
-    }
-
-    /// Checks if this buffer is ready to be flushed to a sender via one of the
-    /// [`Sender::flush`] functions. An [`Ok`] value indicates that the buffer
-    /// is ready to be written to using the given [`Protocol`] and transaction
-    /// level, while an [`Err`] will contain a message indicating why this
-    /// [`Buffer`] cannot be flushed at the moment.
-    pub fn check_can_flush(&self, transactional: bool, proto: Protocol) -> Result<()> {
-        self.check_op(Op::Flush)?;
-        if transactional {
-            if proto.is_tcpx() {
-                return Err(error::fmt!(
-                    InvalidApiCall,
-                    "Transactional flushes are not supported for ILP over TCP."
-                ));
-            }
-            if !self.transactional() {
-                return Err(error::fmt!(
-                        InvalidApiCall,
-                        "Buffer contains lines for multiple tables. \
-                        Transactional flushes are only supported for buffers containing lines for a single table."
-                    ));
-            };
-        }
         Ok(())
     }
 }
@@ -2610,6 +2594,7 @@ impl Sender {
                 "Could not flush buffer: not connected to database."
             ));
         }
+        buf.check_can_flush()?;
 
         if buf.len() > self.max_buf_size {
             return Err(error::fmt!(
@@ -2626,7 +2611,12 @@ impl Sender {
         }
         match self.handler {
             ProtocolHandler::Socket(ref mut conn) => {
-                buf.check_can_flush(transactional, Protocol::Tcp)?;
+                if transactional {
+                    return Err(error::fmt!(
+                        InvalidApiCall,
+                        "Transactional flushes are not supported for ILP over TCP."
+                    ));
+                }
                 conn.write_all(bytes).map_err(|io_err| {
                     self.connected = false;
                     map_io_to_socket_err("Could not flush buffer: ", io_err)
@@ -2634,7 +2624,13 @@ impl Sender {
             }
             #[cfg(feature = "ilp-over-http")]
             ProtocolHandler::Http(ref state) => {
-                buf.check_can_flush(transactional, Protocol::Http)?;
+                if transactional && !buf.transactional() {
+                    return Err(error::fmt!(
+                        InvalidApiCall,
+                        "Buffer contains lines for multiple tables. \
+                        Transactional flushes are only supported for buffers containing lines for a single table."
+                    ));
+                }
                 let request_min_throughput = *state.config.request_min_throughput;
                 let extra_time = if request_min_throughput > 0 {
                     (bytes.len() as f64) / (request_min_throughput as f64)
