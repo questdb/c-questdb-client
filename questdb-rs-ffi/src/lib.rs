@@ -233,11 +233,11 @@ impl From<line_sender_protocol> for Protocol {
 pub enum LineProtocolVersion {
     /// Version 1 of Line Protocol.
     /// Uses text format serialization for f64.
-    V1,
+    V1 = 1,
 
     /// Version 2 of InfluxDB Line Protocol.
     /// Uses binary format serialization for f64, and support array data type.
-    V2,
+    V2 = 2,
 }
 
 impl From<LineProtocolVersion> for ingress::LineProtocolVersion {

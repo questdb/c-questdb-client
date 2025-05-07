@@ -23,12 +23,12 @@
 ################################################################################
 
 import sys
+
 sys.dont_write_bytecode = True
 
 import os
 import re
 import pathlib
-import textwrap
 import json
 import tarfile
 import shutil
@@ -42,10 +42,8 @@ import urllib.parse
 import urllib.error
 from pprint import pformat
 
-
 AUTH_TXT = """admin ec-p-256-sha256 fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac
 # [key/user id] [key type] {keyX keyY}"""
-
 
 # Valid keys as registered with the QuestDB fixture.
 AUTH = dict(
@@ -54,18 +52,17 @@ AUTH = dict(
     token_x="fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU",
     token_y="Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac")
 
-
 CA_PATH = (pathlib.Path(__file__).parent.parent /
-    'tls_certs' / 'server_rootCA.pem')
+           'tls_certs' / 'server_rootCA.pem')
 
 
 def retry(
-    predicate_task,
-    timeout_sec=30,
-    every=0.05,
-    msg='Timed out retrying',
-    backoff_till=5.0,
-    lead_sleep=0.001):
+        predicate_task,
+        timeout_sec=30,
+        every=0.05,
+        msg='Timed out retrying',
+        backoff_till=5.0,
+        lead_sleep=0.001):
     """
     Repeat task every `interval` until it returns a truthy value or times out.
     """
@@ -121,8 +118,8 @@ class Project:
 
 def list_questdb_releases(max_results=1):
     url = (
-        'https://api.github.com/repos/questdb/questdb/releases?' +
-        urllib.parse.urlencode({'per_page': max_results}))
+            'https://api.github.com/repos/questdb/questdb/releases?' +
+            urllib.parse.urlencode({'per_page': max_results}))
     req = urllib.request.Request(
         url,
         headers={
@@ -351,8 +348,8 @@ class QuestDbFixture:
 
     def http_sql_query(self, sql_query):
         url = (
-            f'http://{self.host}:{self.http_server_port}/exec?' +
-            urllib.parse.urlencode({'query': sql_query}))
+                f'http://{self.host}:{self.http_server_port}/exec?' +
+                urllib.parse.urlencode({'query': sql_query}))
         buf = None
         try:
             resp = urllib.request.urlopen(url, timeout=5)
@@ -370,7 +367,7 @@ class QuestDbFixture:
         if 'error' in data:
             raise QueryError(data['error'])
         return data
-    
+
     def query_version(self):
         try:
             res = self.http_sql_query('select build')
@@ -397,6 +394,7 @@ class QuestDbFixture:
             log_ctx=None):
         sql_query = f"select * from '{table_name}'"
         http_response_log = []
+
         def check_table():
             try:
                 resp = self.http_sql_query(sql_query)
@@ -494,7 +492,7 @@ class TlsProxyFixture:
         self.listen_port = retry(
             check_started,
             timeout_sec=180,  # Longer to include time to compile.
-            msg='Timed out waiting for `tls_proxy` to start.',)
+            msg='Timed out waiting for `tls_proxy` to start.', )
 
         def connect_to_listening_port():
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -519,4 +517,3 @@ class TlsProxyFixture:
         if self._log_file:
             self._log_file.close()
             self._log_file = None
-

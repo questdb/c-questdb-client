@@ -2347,8 +2347,9 @@ impl SenderBuilder {
     /// explicitly set protocol version exactly matches server expectation.
     pub fn disable_line_protocol_validation(mut self) -> Result<Self> {
         if let Some(http) = &mut self.http {
-            http.disable_line_proto_validation
-                .set_specified("disable_line_protocol_validation", true)?;
+            // ignore "already specified" error
+            let _ = http.disable_line_proto_validation
+                .set_specified("disable_line_protocol_validation", true);
         }
         Ok(self)
     }

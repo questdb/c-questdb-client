@@ -176,16 +176,15 @@ TEST_CASE("line_sender c api basics")
         2.7,
         48121.5,
         4.3};
-    CHECK(
-        ::line_sender_buffer_column_f64_arr(
-            buffer,
-            arr_name,
-            rank,
-            shapes,
-            strides,
-            reinterpret_cast<uint8_t*>(arr_data.data()),
-            sizeof(arr_data),
-            &err));
+    CHECK(::line_sender_buffer_column_f64_arr(
+        buffer,
+        arr_name,
+        rank,
+        shapes,
+        strides,
+        reinterpret_cast<uint8_t*>(arr_data.data()),
+        sizeof(arr_data),
+        &err));
     CHECK(::line_sender_buffer_at_nanos(buffer, 10000000, &err));
     CHECK(server.recv() == 0);
     CHECK(::line_sender_buffer_size(buffer) == 150);
@@ -942,4 +941,30 @@ TEST_CASE("HTTP basics")
         questdb::ingress::opts::from_conf(
             "http::addr=localhost:1;bind_interface=0.0.0.0;"),
         questdb::ingress::line_sender_error);
+}
+
+TEST_CASE("line sender protocol version v1")
+{
+    questdb::ingress::test::mock_server server;
+    questdb::ingress::line_sender sender{
+        questdb::ingress::protocol::tcp,
+        std::string("localhost"),
+        std::to_string(server.port())};
+    CHECK_FALSE(sender.must_close());
+    server.accept();
+    CHECK(server.recv() == 0);
+
+    questdb::ingress::line_sender_buffer buffer{line_protocol_version_1};
+    buffer.table("test")
+        .symbol("t1", "v1")
+        .symbol("t2", "")
+        .column("f1", 0.5)
+        .at(questdb::ingress::timestamp_nanos{10000000});
+
+    CHECK(server.recv() == 0);
+    CHECK(buffer.size() == 31);
+    sender.flush(buffer);
+    CHECK(server.recv() == 1);
+    std::string expect{"test,t1=v1,t2= f1=0.5 10000000\n"};
+    CHECK(server.msgs(0) == expect);
 }

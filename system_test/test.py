@@ -95,9 +95,11 @@ AUTH_MALFORMED3 = dict(
 
 
 class TestSender(unittest.TestCase):
-    def _mk_linesender(self):
+    def _mk_linesender(self, disable_line_protocol_validation=False):
         # N.B.: We never connect with TLS here.
         auth = AUTH if QDB_FIXTURE.auth else {}
+        if disable_line_protocol_validation:
+            auth["disable_line_protocol_validation"] = "on"
         return qls.Sender(
             BUILD_MODE,
             qls.Protocol.HTTP if QDB_FIXTURE.http else qls.Protocol.TCP,
@@ -510,6 +512,68 @@ class TestSender(unittest.TestCase):
                           [[[7.7, 8.8], [5.5, 6.6]], [[3.3, 4.4], [1.1, 2.2]]]]]
         scrubbed_data = [row[:-1] for row in resp['dataset']]
         self.assertEqual(scrubbed_data, expected_data)
+
+    def test_line_protocol_version_v1(self):
+        if QDB_FIXTURE.version <= (6, 1, 2):
+            self.skipTest('Float issues support')
+        numbers = [
+            0.0,
+            -0.0,
+            1.0,
+            -1.0]  # Converted to `None`.
+
+        table_name = uuid.uuid4().hex
+        pending = None
+        with self._mk_linesender() as sender:
+            sender.buffer.set_line_protocol_version(qls.LineProtocolVersion.V1)
+            for num in numbers:
+                sender.table(table_name)
+                sender.column('n', num)
+                sender.at_now()
+            pending = sender.buffer.peek()
+
+        resp = retry_check_table(
+            table_name,
+            min_rows=len(numbers),
+            log_ctx=pending)
+        exp_columns = [
+            {'name': 'n', 'type': 'DOUBLE'},
+            {'name': 'timestamp', 'type': 'TIMESTAMP'}]
+        self.assertEqual(resp['columns'], exp_columns)
+
+        def massage(num):
+            if math.isnan(num) or math.isinf(num):
+                return None
+            elif num == -0.0:
+                return 0.0
+            else:
+                return num
+
+        # Comparison excludes timestamp column.
+        exp_dataset = [[massage(num)] for num in numbers]
+        scrubbed_dataset = [row[:-1] for row in resp['dataset']]
+        self.assertEqual(scrubbed_dataset, exp_dataset)
+
+    def test_line_protocol_version_v1_array_unsupported(self):
+        if QDB_FIXTURE.version <= (8, 3, 1):
+            self.skipTest('array unsupported')
+
+        array1 = np.array(
+            [
+                [[1.1, 2.2], [3.3, 4.4]],
+                [[5.5, 6.6], [7.7, 8.8]]
+            ],
+            dtype=np.float64
+        )
+        table_name = uuid.uuid4().hex
+        try:
+            with self._mk_linesender(True) as sender:
+                sender.buffer.set_line_protocol_version(qls.LineProtocolVersion.V1)
+                sender.table(table_name)
+                sender.column_f64_arr('f64_arr1', array1)
+                sender.at_now()
+        except qls.SenderError as e:
+            self.assertIn('line protocol version v1 does not support array datatype', str(e))
 
     def _test_example(self, bin_name, table_name, tls=False):
         if BUILD_MODE != qls.BuildMode.API:

@@ -320,7 +320,7 @@ line_sender_buffer* line_sender_buffer_with_max_name_len(size_t max_name_len);
  * be changed after the buffer contains data.
  */
 LINESENDER_API
-line_sender_buffer* line_sender_buffer_set_line_protocol_version(
+bool line_sender_buffer_set_line_protocol_version(
     line_sender_buffer* buffer,
     line_protocol_version version,
     line_sender_error** err_out);
