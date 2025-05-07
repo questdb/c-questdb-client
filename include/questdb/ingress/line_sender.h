@@ -100,11 +100,11 @@ typedef enum line_protocol_version
 {
     /** Version 1 of InfluxDB Line Protocol.
     Uses text format serialization for f64. */
-    line_protocol_version_1,
+    line_protocol_version_1 = 1,
 
     /** Version 2 of InfluxDB Line Protocol.
     Uses binary format serialization for f64, and support array data type.*/
-    line_protocol_version_2,
+    line_protocol_version_2 = 2,
 } line_protocol_version;
 
 /** Possible sources of the root certificates used to validate the server's

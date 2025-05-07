@@ -1124,6 +1124,13 @@ impl Buffer {
                 "line protocol version v1 does not support array datatype",
             ));
         }
+        if view.ndim() == 0 {
+            return Err(error::fmt!(
+                ArrayViewError,
+                "Zero-dimensional arrays are not supported",
+            ));
+        }
+
         self.write_column_key(name)?;
 
         // check dimension less equal than max dims

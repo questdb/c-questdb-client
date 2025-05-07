@@ -854,6 +854,8 @@ class Sender:
     def column_f64_arr(
             self, name: str,
             array: numpy.ndarray):
+        if array.dtype != numpy.float64:
+            raise ValueError('expect float64 array')
         self._buffer.column_f64_arr(name, array.ndim, array.shape, array.strides, array.ctypes.data, array.nbytes)
         return self
 

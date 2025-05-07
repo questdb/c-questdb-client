@@ -482,6 +482,9 @@ class TestSender(unittest.TestCase):
         self.assertEqual(scrubbed_dataset, exp_dataset)
 
     def test_f64_arr_column(self):
+        if QDB_FIXTURE.version < (8, 3, 1):
+            self.skipTest('array issues support')
+
         table_name = uuid.uuid4().hex
         array1 = np.array(
             [
@@ -512,6 +515,88 @@ class TestSender(unittest.TestCase):
                           [[[7.7, 8.8], [5.5, 6.6]], [[3.3, 4.4], [1.1, 2.2]]]]]
         scrubbed_data = [row[:-1] for row in resp['dataset']]
         self.assertEqual(scrubbed_data, expected_data)
+
+    def test_f64_arr_empty(self):
+        if QDB_FIXTURE.version < (8, 3, 1):
+            self.skipTest('array issues support')
+
+        table_name = uuid.uuid4().hex
+        empty_array = np.array([], dtype=np.float64).reshape(0, 0, 0)
+        with self._mk_linesender() as sender:
+            (sender.table(table_name)
+             .column_f64_arr('empty', empty_array)
+             .at_now())
+
+        resp = retry_check_table(table_name)
+        exp_columns = [{'dim': 3, 'elemType': 'DOUBLE', 'name': 'empty', 'type': 'ARRAY'},
+                       {'name': 'timestamp', 'type': 'TIMESTAMP'}]
+        self.assertEqual(exp_columns, resp['columns'])
+        self.assertEqual(resp['dataset'][0][0], [])
+
+    def test_f64_arr_non_contiguous(self):
+        if QDB_FIXTURE.version < (8, 3, 1):
+            self.skipTest('array issues support')
+
+        table_name = uuid.uuid4().hex
+        array = np.array([[1.1, 2.2], [3.3, 4.4]], dtype=np.float64)[:, ::2]
+        with self._mk_linesender() as sender:
+            (sender.table(table_name)
+             .column_f64_arr('non_contiguous', array)
+             .at_now())
+
+        resp = retry_check_table(table_name)
+        exp_columns = [{'dim': 2, 'elemType': 'DOUBLE', 'name': 'non_contiguous', 'type': 'ARRAY'},
+                       {'name': 'timestamp', 'type': 'TIMESTAMP'}]
+        self.assertEqual(exp_columns, resp['columns'])
+        self.assertEqual(resp['dataset'][0][0], [[1.1], [3.3]])
+
+    def test_f64_arr_zero_dimensional(self):
+        if QDB_FIXTURE.version < (8, 3, 1):
+            self.skipTest('array issues support')
+
+        table_name = uuid.uuid4().hex
+        array = np.array(42.0, dtype=np.float64)
+        try:
+            with self._mk_linesender() as sender:
+                (sender.table(table_name)
+                 .column_f64_arr('scalar', array)
+                 .at_now())
+        except qls.SenderError as e:
+            self.assertIn('Zero-dimensional arrays are not supported', str(e))
+
+    def test_f64_arr_wrong_datatype(self):
+        if QDB_FIXTURE.version < (8, 3, 1):
+            self.skipTest('array issues support')
+
+        table_name = uuid.uuid4().hex
+        array = np.array([1, 2], dtype=np.int32)
+        try:
+            with self._mk_linesender() as sender:
+                (sender.table(table_name)
+                 .column_f64_arr('wrong', array)
+                 .at_now())
+        except ValueError as e:
+            self.assertIn('expect float64 array', str(e))
+
+    def test_f64_arr_mix_dims(self):
+        if QDB_FIXTURE.version < (8, 3, 1):
+            self.skipTest('array issues support')
+
+        array_2d = np.array([[1.1, 2.2], [3.3, 4.4]], dtype=np.float64)
+        array_1d = np.array([1.1], dtype=np.float64)
+        table_name = uuid.uuid4().hex
+        try:
+            with self._mk_linesender() as sender:
+                (sender.table(table_name)
+                 .column_f64_arr('array', array_2d)
+                 .at_now()
+                 )
+                (sender.table(table_name)
+                 .column_f64_arr('array', array_1d)
+                 .at_now()
+                 )
+        except qls.SenderError as e:
+            self.assertIn('cast error from protocol type: DOUBLE[] to column type: DOUBLE[][]', str(e))
 
     def test_line_protocol_version_v1(self):
         if QDB_FIXTURE.version <= (6, 1, 2):
