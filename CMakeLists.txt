@@ -99,6 +99,10 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
         examples/concat.c
         examples/line_sender_c_example.c)
     compile_example(
+        line_sender_c_example_array
+        examples/concat.c
+        examples/line_sender_c_example_array.c)
+    compile_example(
         line_sender_c_example_auth
         examples/concat.c
         examples/line_sender_c_example_auth.c)
@@ -123,6 +127,9 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
     compile_example(
         line_sender_cpp_example
         examples/line_sender_cpp_example.cpp)
+    compile_example(
+        line_sender_cpp_example_array
+        examples/line_sender_cpp_example_array.cpp)
     compile_example(
         line_sender_cpp_example_auth
         examples/line_sender_cpp_example_auth.cpp)

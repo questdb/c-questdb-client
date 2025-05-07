@@ -44,35 +44,6 @@ int main(int argc, const char* argv[])
     if (!line_sender_buffer_column_f64(buffer, amount_name, 0.00044, &err))
         goto on_error;
 
-    line_sender_column_name arr_name = QDB_COLUMN_NAME_LITERAL("order_book");
-    // 3D array of doubles
-    size_t rank = 3;
-    uint32_t shapes[] = {2, 3, 2};
-    int32_t strides[] = {48, 16, 8};
-    double arr_data[] = {
-        48123.5,
-        2.4,
-        48124.0,
-        1.8,
-        48124.5,
-        0.9,
-        48122.5,
-        3.1,
-        48122.0,
-        2.7,
-        48121.5,
-        4.3};
-    if (!line_sender_buffer_column_f64_arr(
-            buffer,
-            arr_name,
-            rank,
-            shapes,
-            strides,
-            (const uint8_t*)arr_data,
-            sizeof(arr_data),
-            &err))
-        goto on_error;
-
     // 1997-07-04 04:56:55 UTC
     int64_t designated_timestamp = 867992215000000000;
     if (!line_sender_buffer_at_nanos(buffer, designated_timestamp, &err))
