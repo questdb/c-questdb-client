@@ -640,7 +640,7 @@ class TestSender(unittest.TestCase):
         self.assertEqual(scrubbed_dataset, exp_dataset)
 
     def test_line_protocol_version_v1_array_unsupported(self):
-        if QDB_FIXTURE.version <= (8, 3, 1):
+        if QDB_FIXTURE.version < (8, 3, 1):
             self.skipTest('array unsupported')
 
         array1 = np.array(
@@ -688,16 +688,13 @@ class TestSender(unittest.TestCase):
             {'name': 'side', 'type': 'SYMBOL'},
             {'name': 'price', 'type': 'DOUBLE'},
             {'name': 'amount', 'type': 'DOUBLE'},
-            {'dim': 3, 'elemType': 'DOUBLE', 'name': 'order_book', 'type': 'ARRAY'},
             {'name': 'timestamp', 'type': 'TIMESTAMP'}]
         self.assertEqual(resp['columns'], exp_columns)
 
         exp_dataset = [['ETH-USD',
                         'sell',
                         2615.54,
-                        0.00044,
-                        [[[48123.5, 2.4], [48124.0, 1.8], [48124.5, 0.9]],
-                         [[48122.5, 3.1], [48122.0, 2.7], [48121.5, 4.3]]]]]
+                        0.00044]]
         # Comparison excludes timestamp column.
         scrubbed_dataset = [row[:-1] for row in resp['dataset']]
         self.assertEqual(scrubbed_dataset, exp_dataset)
