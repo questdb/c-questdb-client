@@ -24,13 +24,14 @@
 
 #![doc = include_str!("mod.md")]
 
-pub use self::ndarr::{ArrayElement, ElemDataType, NdArrayView, StrideArrayView};
+pub use self::ndarr::{ArrayElement, NdArrayView, StrideArrayView};
 pub use self::timestamp::*;
 use crate::error::{self, Error, Result};
 use crate::gai;
 use crate::ingress::conf::ConfigSetting;
 use base64ct::{Base64, Base64UrlUnpadded, Encoding};
 use core::time::Duration;
+use ndarr::ArrayElementSealed;
 use rustls::{ClientConnection, RootCertStore, StreamOwned};
 use rustls_pki_types::ServerName;
 use socket2::{Domain, Protocol as SockProtocol, SockAddr, Socket, Type};
@@ -1111,11 +1112,12 @@ impl Buffer {
     /// - Array dimensions exceed [`MAX_DIMS`]
     /// - Failed to get dimension sizes
     /// - Column name validation fails
+    #[allow(private_bounds)]
     pub fn column_arr<'a, N, T, D>(&mut self, name: N, view: &T) -> Result<&mut Self>
     where
         N: TryInto<ColumnName<'a>>,
         T: NdArrayView<D>,
-        D: ArrayElement,
+        D: ArrayElement + ArrayElementSealed,
         Error: From<N::Error>,
     {
         if self.version == LineProtocolVersion::V1 {
@@ -1144,18 +1146,14 @@ impl Buffer {
         }
 
         let reserve_size = view.check_data_buf()?;
-        i32::try_from(reserve_size).map_err(
-            |_| error::fmt!(
-                ArrayViewError,
-                "Array total elem size overflow"
-            )
-        )?;
+        i32::try_from(reserve_size)
+            .map_err(|_| error::fmt!(ArrayViewError, "Array total elem size overflow"))?;
         // binary format flag '='
         self.output.push(b'=');
         // binary format entity type
         self.output.push(ARRAY_BINARY_FORMAT_TYPE);
         // ndarr datatype
-        self.output.push(D::elem_type().into());
+        self.output.push(D::type_tag());
         // ndarr dims
         self.output.push(view.ndim() as u8);
 

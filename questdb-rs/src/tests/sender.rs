@@ -30,14 +30,14 @@ use crate::{
 };
 
 #[cfg(feature = "ndarray")]
+use crate::ingress;
+#[cfg(feature = "ndarray")]
 use crate::ingress::ndarr::write_array_data;
 use crate::ingress::LineProtocolVersion;
 use crate::tests::{
     mock::{certs_dir, MockServer},
     TestResult,
 };
-#[cfg(feature = "ndarray")]
-use crate::{ingress, ingress::ElemDataType};
 use core::time::Duration;
 #[cfg(feature = "ndarray")]
 use ndarray::{arr1, arr2, ArrayD};
@@ -99,6 +99,8 @@ fn test_basics(
 #[cfg(feature = "ndarray")]
 #[test]
 fn test_array_basic() -> TestResult {
+    use crate::tests::ndarr::ArrayColumnTypeTag;
+
     let mut server = MockServer::new()?;
     let mut sender = server.lsb_tcp().build()?;
     server.accept()?;
@@ -124,7 +126,7 @@ fn test_array_basic() -> TestResult {
     let array_header2d = &[
         &[b'='][..],
         &[ingress::ARRAY_BINARY_FORMAT_TYPE],
-        &[ElemDataType::Double as u8],
+        &[ArrayColumnTypeTag::Double.into()],
         &[2u8],
         &2i32.to_le_bytes(),
         &2i32.to_le_bytes(),
@@ -136,7 +138,7 @@ fn test_array_basic() -> TestResult {
     let array_header3d = &[
         &[b'='][..],
         &[ingress::ARRAY_BINARY_FORMAT_TYPE],
-        &[ElemDataType::Double as u8],
+        &[ArrayColumnTypeTag::Double.into()],
         &[3u8],
         &2i32.to_le_bytes(),
         &3i32.to_le_bytes(),

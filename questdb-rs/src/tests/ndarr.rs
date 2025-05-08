@@ -1,8 +1,6 @@
 #[cfg(feature = "ndarray")]
 use crate::ingress::MAX_DIMS;
-use crate::ingress::{
-    ArrayElement, Buffer, ElemDataType, NdArrayView, StrideArrayView, ARRAY_BINARY_FORMAT_TYPE,
-};
+use crate::ingress::{Buffer, NdArrayView, StrideArrayView, ARRAY_BINARY_FORMAT_TYPE};
 use crate::tests::TestResult;
 use crate::ErrorCode;
 
@@ -13,10 +11,36 @@ use ndarray::{arr1, arr2, arr3, s, ArrayD};
 use std::iter;
 use std::ptr;
 
-#[test]
-fn test_f64_element_type() {
-    assert_eq!(<f64 as ArrayElement>::elem_type(), ElemDataType::Double);
-    assert_eq!(u8::from(ElemDataType::Double), 10);
+/// QuestDB column type tags that are supported as array element types.
+#[derive(Clone, Copy)]
+#[repr(u8)]
+pub enum ArrayColumnTypeTag {
+    Double = 10,
+}
+
+impl ArrayColumnTypeTag {
+    pub fn size(&self) -> usize {
+        match self {
+            ArrayColumnTypeTag::Double => std::mem::size_of::<f64>(),
+        }
+    }
+}
+
+impl From<ArrayColumnTypeTag> for u8 {
+    fn from(tag: ArrayColumnTypeTag) -> Self {
+        tag as u8
+    }
+}
+
+impl TryFrom<u8> for ArrayColumnTypeTag {
+    type Error = String;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            10 => Ok(ArrayColumnTypeTag::Double),
+            _ => Err(format!("Unsupported column type tag {} for arrays", value)),
+        }
+    }
 }
 
 fn to_bytes<T: Copy>(data: &[T]) -> Vec<u8> {
@@ -177,7 +201,7 @@ fn test_buffer_basic_write() -> TestResult {
             b'=',
             b'=',
             ARRAY_BINARY_FORMAT_TYPE,
-            ElemDataType::Double.into(),
+            ArrayColumnTypeTag::Double.into(),
             2u8
         ]
     );
@@ -287,7 +311,7 @@ fn test_build_in_1d_array_normal() -> TestResult {
             b'=',
             b'=',
             ARRAY_BINARY_FORMAT_TYPE,
-            ElemDataType::Double.into(),
+            ArrayColumnTypeTag::Double.into(),
             1u8
         ]
     );
@@ -325,7 +349,7 @@ fn test_build_in_1d_array_empty() -> TestResult {
             b'=',
             b'=',
             ARRAY_BINARY_FORMAT_TYPE,
-            ElemDataType::Double.into(),
+            ArrayColumnTypeTag::Double.into(),
             1u8
         ]
     );
@@ -355,7 +379,7 @@ fn test_build_in_1d_vec_normal() -> TestResult {
             b'=',
             b'=',
             ARRAY_BINARY_FORMAT_TYPE,
-            ElemDataType::Double.into(),
+            ArrayColumnTypeTag::Double.into(),
             1u8
         ]
     );
@@ -392,7 +416,7 @@ fn test_build_in_1d_vec_empty() -> TestResult {
             b'=',
             b'=',
             ARRAY_BINARY_FORMAT_TYPE,
-            ElemDataType::Double.into(),
+            ArrayColumnTypeTag::Double.into(),
             1u8
         ]
     );
@@ -421,7 +445,7 @@ fn test_build_in_1d_slice_normal() -> TestResult {
             b'=',
             b'=',
             ARRAY_BINARY_FORMAT_TYPE,
-            ElemDataType::Double.into(),
+            ArrayColumnTypeTag::Double.into(),
             1u8
         ]
     );
@@ -454,7 +478,7 @@ fn test_build_in_1d_slice_empty() -> TestResult {
             b'=',
             b'=',
             ARRAY_BINARY_FORMAT_TYPE,
-            ElemDataType::Double.into(),
+            ArrayColumnTypeTag::Double.into(),
             1u8
         ]
     );
@@ -488,7 +512,7 @@ fn test_build_in_2d_array_normal() -> TestResult {
             b'=',
             b'=',
             ARRAY_BINARY_FORMAT_TYPE,
-            ElemDataType::Double.into(),
+            ArrayColumnTypeTag::Double.into(),
             2u8
         ]
     );
@@ -532,7 +556,7 @@ fn test_build_in_2d_array_empty() -> TestResult {
             b'=',
             b'=',
             ARRAY_BINARY_FORMAT_TYPE,
-            ElemDataType::Double.into(),
+            ArrayColumnTypeTag::Double.into(),
             2u8
         ]
     );
@@ -566,7 +590,7 @@ fn test_build_in_2d_vec_normal() -> TestResult {
             b'=',
             b'=',
             ARRAY_BINARY_FORMAT_TYPE,
-            ElemDataType::Double.into(),
+            ArrayColumnTypeTag::Double.into(),
             2u8
         ]
     );
@@ -621,7 +645,7 @@ fn test_build_in_2d_vec_empty() -> TestResult {
             b'=',
             b'=',
             ARRAY_BINARY_FORMAT_TYPE,
-            ElemDataType::Double.into(),
+            ArrayColumnTypeTag::Double.into(),
             2u8
         ]
     );
@@ -657,7 +681,7 @@ fn test_build_in_2d_slice_normal() -> TestResult {
             b'=',
             b'=',
             ARRAY_BINARY_FORMAT_TYPE,
-            ElemDataType::Double.into(),
+            ArrayColumnTypeTag::Double.into(),
             2u8
         ]
     );
@@ -700,7 +724,7 @@ fn test_build_in_2d_slice_empty() -> TestResult {
             b'=',
             b'=',
             ARRAY_BINARY_FORMAT_TYPE,
-            ElemDataType::Double.into(),
+            ArrayColumnTypeTag::Double.into(),
             2u8
         ]
     );
@@ -738,7 +762,7 @@ fn test_build_in_3d_array_normal() -> TestResult {
             b'=',
             b'=',
             ARRAY_BINARY_FORMAT_TYPE,
-            ElemDataType::Double.into(),
+            ArrayColumnTypeTag::Double.into(),
             3u8
         ]
     );
@@ -785,7 +809,7 @@ fn test_build_in_3d_array_empty() -> TestResult {
             b'=',
             b'=',
             ARRAY_BINARY_FORMAT_TYPE,
-            ElemDataType::Double.into(),
+            ArrayColumnTypeTag::Double.into(),
             3u8
         ]
     );
@@ -826,7 +850,7 @@ fn test_build_in_3d_vec_normal() -> TestResult {
             b'=',
             b'=',
             ARRAY_BINARY_FORMAT_TYPE,
-            ElemDataType::Double.into(),
+            ArrayColumnTypeTag::Double.into(),
             3u8
         ]
     );
@@ -877,7 +901,7 @@ fn test_build_in_3d_vec_empty() -> TestResult {
             b'=',
             b'=',
             ARRAY_BINARY_FORMAT_TYPE,
-            ElemDataType::Double.into(),
+            ArrayColumnTypeTag::Double.into(),
             3u8
         ]
     );
@@ -937,7 +961,7 @@ fn test_3d_slice_normal() -> TestResult {
             b'=',
             b'=',
             ARRAY_BINARY_FORMAT_TYPE,
-            ElemDataType::Double.into(),
+            ArrayColumnTypeTag::Double.into(),
             3u8
         ]
     );
@@ -981,7 +1005,7 @@ fn test_3d_slice_empty() -> TestResult {
             b'=',
             b'=',
             ARRAY_BINARY_FORMAT_TYPE,
-            ElemDataType::Double.into(),
+            ArrayColumnTypeTag::Double.into(),
             3u8
         ]
     );
@@ -1087,7 +1111,7 @@ fn test_buffer_ndarray_write() -> TestResult {
             b'=',
             b'=',
             ARRAY_BINARY_FORMAT_TYPE,
-            ElemDataType::Double.into(),
+            ArrayColumnTypeTag::Double.into(),
             2u8
         ]
     );

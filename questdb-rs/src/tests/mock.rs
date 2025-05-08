@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-use crate::ingress::{ElemDataType, Protocol, SenderBuilder};
+use crate::ingress::{Protocol, SenderBuilder};
 
 use core::time::Duration;
 use mio::event::Event;
@@ -39,6 +39,8 @@ use std::time::Instant;
 use crate::ingress;
 #[cfg(feature = "ilp-over-http")]
 use std::io::Write;
+
+use super::ndarr::ArrayColumnTypeTag;
 
 const CLIENT: Token = Token(0);
 
@@ -574,15 +576,13 @@ impl MockServer {
                     index += size_of::<f64>() + 1;
                 } else if binary_type == ingress::ARRAY_BINARY_FORMAT_TYPE {
                     index += 1;
-                    let element_type = match ElemDataType::try_from(accum[index]) {
+                    let element_type = match ArrayColumnTypeTag::try_from(accum[index]) {
                         Ok(t) => t,
                         Err(e) => {
                             return Err(io::Error::new(io::ErrorKind::Other, e));
                         }
                     };
-                    let mut elems_size = match element_type {
-                        ElemDataType::Double => size_of::<f64>(),
-                    };
+                    let mut elems_size = element_type.size();
                     index += 1;
                     let dims = accum[index] as usize;
                     index += 1;

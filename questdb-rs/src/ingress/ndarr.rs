@@ -101,44 +101,19 @@ where
 ///
 /// Implemented for primitive types that can be stored in arrays.
 /// Combines type information with data type classification.
-pub trait ArrayElement: Copy + 'static {
-    /// Returns the corresponding data type classification.
-    ///
-    /// This enables runtime type identification while maintaining
-    /// compile-time type safety.
-    fn elem_type() -> ElemDataType;
+pub trait ArrayElement: Copy + 'static {}
+
+pub(crate) trait ArrayElementSealed {
+    /// Returns the binary format identifier for array element types compatible
+    /// with QuestDB's io.questdb.cairo.ColumnType numeric type constants.
+    fn type_tag() -> u8;
 }
 
-/// Defines binary format identifiers for array element types compatible with
-/// QuestDB's ColumnType: <https://github.com/questdb/questdb/blob/e1853db56ae586d923ca77de01a487cad44093b9/core/src/main/java/io/questdb/cairo/ColumnType.java#L67-L89>.
-#[repr(u8)]
-#[derive(Debug, PartialEq, Clone, Copy)]
-pub enum ElemDataType {
-    /// 64-bit floating point
-    Double = 0x0A,
-}
+impl ArrayElement for f64 {}
 
-impl From<ElemDataType> for u8 {
-    fn from(val: ElemDataType) -> Self {
-        val as u8
-    }
-}
-
-impl TryFrom<u8> for ElemDataType {
-    type Error = String;
-
-    fn try_from(value: u8) -> Result<Self, String> {
-        match value {
-            0x0A => Ok(ElemDataType::Double),
-            _ => Err(format!("Unknown element type: {}", value)),
-        }
-    }
-}
-
-impl ArrayElement for f64 {
-    /// Identifies f64 as Double type in QuestDB's type system.
-    fn elem_type() -> ElemDataType {
-        ElemDataType::Double
+impl ArrayElementSealed for f64 {
+    fn type_tag() -> u8 {
+        10 // Double
     }
 }
 
@@ -683,5 +658,15 @@ where
 
     fn check_data_buf(&self) -> Result<usize, Error> {
         Ok(self.len() * size_of::<T>())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_f64_element_type() {
+        assert_eq!(<f64 as ArrayElementSealed>::type_tag(), 10);
     }
 }
