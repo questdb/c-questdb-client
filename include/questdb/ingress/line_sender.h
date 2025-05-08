@@ -944,7 +944,7 @@ line_sender* line_sender_from_env(line_sender_error** err_out);
  */
 LINESENDER_API
 line_protocol_version line_sender_default_line_protocol_version(
-    line_sender* sender);
+    const line_sender* sender);
 
 /**
  * Tell whether the sender is no longer usable and must be closed.
