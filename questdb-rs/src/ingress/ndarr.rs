@@ -144,16 +144,16 @@ impl ArrayElement for f64 {
 
 /// A view into a multi-dimensional array with custom memory strides.
 #[derive(Debug)]
-pub struct StridedArrayView<'a, T> {
+pub struct StrideArrayView<'a, T> {
     dims: usize,
-    shape: &'a [u32],
-    strides: &'a [i32],
+    shape: &'a [usize],
+    strides: &'a [isize],
     buf_len: usize,
     buf: *const u8,
     _marker: std::marker::PhantomData<T>,
 }
 
-impl<T> NdArrayView<T> for StridedArrayView<'_, T>
+impl<T> NdArrayView<T> for StrideArrayView<'_, T>
 where
     T: ArrayElement,
 {
@@ -172,7 +172,7 @@ where
             return None;
         }
 
-        Some(self.shape[index] as usize)
+        Some(self.shape[index])
     }
 
     fn as_slice(&self) -> Option<&[T]> {
@@ -202,7 +202,7 @@ where
             .fold(self.buf, |ptr, (dim, &stride)| {
                 if stride < 0 {
                     let dim_size = self.shape[dim] as isize;
-                    unsafe { ptr.offset(stride as isize * (dim_size - 1)) }
+                    unsafe { ptr.offset(stride * (dim_size - 1)) }
                 } else {
                     ptr
                 }
@@ -220,7 +220,7 @@ where
         let mut size = size_of::<T>();
         for i in 0..self.dims {
             let d = self.shape[i];
-            size = size.checked_mul(d as usize).ok_or(error::fmt!(
+            size = size.checked_mul(d).ok_or(error::fmt!(
                 ArrayViewError,
                 "Array total elem size overflow"
             ))?
@@ -237,7 +237,7 @@ where
     }
 }
 
-impl<T> StridedArrayView<'_, T>
+impl<T> StrideArrayView<'_, T>
 where
     T: ArrayElement,
 {
@@ -255,8 +255,8 @@ where
     /// - Strides are measured in bytes (not elements)
     pub unsafe fn new(
         dims: usize,
-        shape: *const u32,
-        strides: *const i32,
+        shape: *const usize,
+        strides: *const isize,
         data: *const u8,
         data_len: usize,
     ) -> Self {
@@ -278,7 +278,7 @@ where
             return false;
         }
 
-        let elem_size = size_of::<T>() as i32;
+        let elem_size = size_of::<T>() as isize;
         if self.dims == 1 {
             return self.strides[0] == elem_size || self.shape[0] == 1;
         }
@@ -288,7 +288,7 @@ where
             if *dim > 1 && stride != expected_stride {
                 return false;
             }
-            expected_stride *= *dim as i32;
+            expected_stride *= *dim as isize;
         }
         true
     }
@@ -297,10 +297,10 @@ where
 /// Iterator for traversing a strided array in row-major (C-style) order.
 pub struct RowMajorIter<'a, T> {
     base_ptr: *const u8,
-    array: &'a StridedArrayView<'a, T>,
-    dim_products: Vec<u32>,
-    current_linear: u32,
-    total_elements: u32,
+    array: &'a StrideArrayView<'a, T>,
+    dim_products: Vec<usize>,
+    current_linear: usize,
+    total_elements: usize,
 }
 
 impl<'a, T> Iterator for RowMajorIter<'a, T>
@@ -329,7 +329,7 @@ where
 
         self.current_linear += 1;
         unsafe {
-            let ptr = self.base_ptr.offset(offset as isize);
+            let ptr = self.base_ptr.add(offset);
             Some(&*(ptr as *const T))
         }
     }

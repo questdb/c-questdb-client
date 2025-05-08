@@ -1,6 +1,6 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use ndarray::{Array, Array2};
-use questdb::ingress::{Buffer, ColumnName, StridedArrayView};
+use questdb::ingress::{Buffer, ColumnName, StrideArrayView};
 
 /// run with
 /// ```shell
@@ -84,17 +84,16 @@ fn bench_array_view(c: &mut Criterion) {
         buffer.clear();
     });
 
-    let shape: Vec<u32> = transposed_view.shape().iter().map(|&d| d as u32).collect();
-    let elem_size = size_of::<f64>() as i32;
-    let strides: Vec<i32> = transposed_view
+    let elem_size = size_of::<f64>() as isize;
+    let strides: Vec<isize> = transposed_view
         .strides()
         .iter()
-        .map(|&s| s as i32 * elem_size) // 转换为字节步长
+        .map(|&s| s * elem_size) // 转换为字节步长
         .collect();
-    let view2: StridedArrayView<'_, f64> = unsafe {
-        StridedArrayView::new(
+    let view2: StrideArrayView<'_, f64> = unsafe {
+        StrideArrayView::new(
             transposed_view.ndim(),
-            shape.as_ptr(),
+            transposed_view.shape().as_ptr(),
             strides.as_ptr(),
             transposed_view.as_ptr() as *const u8,
             transposed_view.len() * elem_size as usize,

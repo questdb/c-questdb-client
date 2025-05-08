@@ -97,7 +97,7 @@ std::string& push_double_arr_to_buffer(
     std::string& buffer,
     std::array<double, N> data,
     size_t rank,
-    uint32_t* shapes)
+    uintptr_t* shapes)
 {
     buffer.push_back(14);
     buffer.push_back(10);
@@ -161,8 +161,8 @@ TEST_CASE("line_sender c api basics")
     line_sender_column_name arr_name = QDB_COLUMN_NAME_LITERAL("a1");
     // 3D array of doubles
     size_t rank = 3;
-    uint32_t shapes[] = {2, 3, 2};
-    int32_t strides[] = {48, 16, 8};
+    uintptr_t shapes[] = {2, 3, 2};
+    intptr_t strides[] = {48, 16, 8};
     std::array<double, 12> arr_data = {
         48123.5,
         2.4,

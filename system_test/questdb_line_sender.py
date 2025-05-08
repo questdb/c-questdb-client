@@ -54,12 +54,10 @@ from ctypes import (
     c_size_t,
     c_char_p,
     c_int,
-    c_int32,
     c_int64,
     c_double,
     c_uint8,
     c_uint16,
-    c_uint32,
     c_uint64,
     c_void_p,
     c_ssize_t)
@@ -119,14 +117,13 @@ class c_line_sender_error(ctypes.Structure):
 
 
 c_size_t_p = ctypes.POINTER(c_size_t)
+c_ssize_t_p = ctypes.POINTER(c_ssize_t)
 c_line_sender_p = ctypes.POINTER(c_line_sender)
 c_line_sender_buffer_p = ctypes.POINTER(c_line_sender_buffer)
 c_line_sender_opts_p = ctypes.POINTER(c_line_sender_opts)
 c_line_sender_error_p = ctypes.POINTER(c_line_sender_error)
 c_line_sender_error_p_p = ctypes.POINTER(c_line_sender_error_p)
-c_int32_p = ctypes.POINTER(c_int32)
 c_uint8_p = ctypes.POINTER(c_uint8)
-c_uint32_p = ctypes.POINTER(c_uint32)
 
 
 class c_line_sender_utf8(ctypes.Structure):
@@ -291,8 +288,8 @@ def _setup_cdll():
         c_line_sender_buffer_p,
         c_line_sender_column_name,
         c_size_t,
-        c_uint32_p,
-        c_int32_p,
+        c_size_t_p,
+        c_ssize_t_p,
         c_uint8_p,
         c_size_t,
         c_line_sender_error_p_p)
@@ -724,8 +721,8 @@ class Buffer:
                     f"{name} value exceeds {c_type.__name__} range"
                 ) from e
 
-        c_shapes = _convert_tuple(shapes, c_uint32, "shapes")
-        c_strides = _convert_tuple(strides, c_int32, "strides")
+        c_shapes = _convert_tuple(shapes, c_size_t, "shapes")
+        c_strides = _convert_tuple(strides, c_ssize_t, "strides")
         _error_wrapped_call(
             _DLL.line_sender_buffer_column_f64_arr,
             self._impl,

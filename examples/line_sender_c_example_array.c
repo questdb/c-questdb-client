@@ -43,8 +43,8 @@ static bool example(const char* host, const char* port)
         goto on_error;
 
     size_t array_rank = 3;
-    uint32_t array_shapes[] = {2, 3, 2};
-    int32_t array_strides[] = {48, 16, 8};
+    uintptr_t array_shapes[] = {2, 3, 2};
+    intptr_t array_strides[] = {48, 16, 8};
 
     double array_data[] = {
         48123.5,

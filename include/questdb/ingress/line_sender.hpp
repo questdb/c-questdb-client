@@ -678,8 +678,8 @@ public:
     line_sender_buffer& column(
         column_name_view name,
         const size_t rank,
-        const std::vector<uint32_t>& shapes,
-        const std::vector<int32_t>& strides,
+        const std::vector<uintptr_t>& shapes,
+        const std::vector<intptr_t>& strides,
         const std::array<T, N>& data)
     {
         static_assert(

@@ -1,7 +1,7 @@
 #[cfg(feature = "ndarray")]
 use crate::ingress::MAX_DIMS;
 use crate::ingress::{
-    ArrayElement, Buffer, ElemDataType, NdArrayView, StridedArrayView, ARRAY_BINARY_FORMAT_TYPE,
+    ArrayElement, Buffer, ElemDataType, NdArrayView, StrideArrayView, ARRAY_BINARY_FORMAT_TYPE,
 };
 use crate::tests::TestResult;
 use crate::ErrorCode;
@@ -30,16 +30,16 @@ fn to_bytes<T: Copy>(data: &[T]) -> Vec<u8> {
 }
 
 #[test]
-fn test_strided_array_view() -> TestResult {
+fn test_stride_array_view() -> TestResult {
     // contiguous layout
     let test_data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
-    let shapes = [2u32, 3];
+    let shapes = [2usize, 3];
     let strides = [
-        (shapes[1] * size_of::<f64>() as u32) as i32,
-        size_of::<f64>() as i32,
+        (shapes[1] * size_of::<f64>()) as isize,
+        size_of::<f64>() as isize,
     ];
     let array = unsafe {
-        StridedArrayView::<f64>::new(
+        StrideArrayView::<f64>::new(
             shapes.len(),
             shapes.as_ptr(),
             strides.as_ptr(),
@@ -62,13 +62,13 @@ fn test_strided_array_view() -> TestResult {
 
 #[test]
 fn test_strided_non_contiguous() -> TestResult {
-    let elem_size = size_of::<f64>() as i32;
+    let elem_size = size_of::<f64>() as isize;
     let col_major_data = [1.0, 3.0, 5.0, 2.0, 4.0, 6.0];
-    let shapes = [3u32, 2];
-    let strides = [elem_size, shapes[0] as i32 * elem_size];
+    let shapes = [3usize, 2];
+    let strides = [elem_size, shapes[0] as isize * elem_size];
 
-    let array_view: StridedArrayView<'_, f64> = unsafe {
-        StridedArrayView::new(
+    let array_view: StrideArrayView<'_, f64> = unsafe {
+        StrideArrayView::new(
             shapes.len(),
             shapes.as_ptr(),
             strides.as_ptr(),
@@ -101,10 +101,10 @@ fn test_negative_strides() -> TestResult {
     let elem_size = size_of::<f64>();
     let data = [1f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
     let view = unsafe {
-        StridedArrayView::<f64>::new(
+        StrideArrayView::<f64>::new(
             2,
-            &[3u32, 3] as *const u32,
-            &[-24i32, 8] as *const i32,
+            &[3usize, 3] as *const usize,
+            &[-24isize, 8] as *const isize,
             (data.as_ptr() as *const u8).add(48),
             data.len() * elem_size,
         )
@@ -128,17 +128,17 @@ fn test_negative_strides() -> TestResult {
 #[test]
 fn test_basic_edge_cases() {
     // empty array
-    let elem_size = std::mem::size_of::<f64>() as i32;
-    let empty_view: StridedArrayView<'_, f64> =
-        unsafe { StridedArrayView::new(2, [0, 0].as_ptr(), [0, 0].as_ptr(), ptr::null(), 0) };
+    let elem_size = std::mem::size_of::<f64>() as isize;
+    let empty_view: StrideArrayView<'_, f64> =
+        unsafe { StrideArrayView::new(2, [0, 0].as_ptr(), [0, 0].as_ptr(), ptr::null(), 0) };
     assert_eq!(empty_view.ndim(), 2);
     assert_eq!(empty_view.dim(0), Some(0));
     assert_eq!(empty_view.dim(1), Some(0));
 
     // single element array
     let single_data = [42.0];
-    let single_view: StridedArrayView<'_, f64> = unsafe {
-        StridedArrayView::new(
+    let single_view: StrideArrayView<'_, f64> = unsafe {
+        StrideArrayView::new(
             2,
             [1, 1].as_ptr(),
             [elem_size, elem_size].as_ptr(),
@@ -153,11 +153,11 @@ fn test_basic_edge_cases() {
 
 #[test]
 fn test_buffer_basic_write() -> TestResult {
-    let elem_size = std::mem::size_of::<f64>() as i32;
+    let elem_size = std::mem::size_of::<f64>() as isize;
 
     let test_data = [1.1, 2.2, 3.3, 4.4];
-    let array_view: StridedArrayView<'_, f64> = unsafe {
-        StridedArrayView::new(
+    let array_view: StrideArrayView<'_, f64> = unsafe {
+        StrideArrayView::new(
             2,
             [2, 2].as_ptr(),
             [2 * elem_size, elem_size].as_ptr(),
@@ -201,9 +201,9 @@ fn test_buffer_basic_write() -> TestResult {
 #[test]
 fn test_size_overflow() -> TestResult {
     let overflow_view = unsafe {
-        StridedArrayView::<f64>::new(
+        StrideArrayView::<f64>::new(
             2,
-            [u32::MAX, u32::MAX].as_ptr(),
+            [u32::MAX as usize, u32::MAX as usize].as_ptr(),
             [8, 8].as_ptr(),
             ptr::null(),
             0,
@@ -221,10 +221,10 @@ fn test_size_overflow() -> TestResult {
 
 #[test]
 fn test_array_length_mismatch() -> TestResult {
-    let elem_size = size_of::<f64>() as i32;
+    let elem_size = size_of::<f64>() as isize;
     let under_data = [1.1];
-    let under_view: StridedArrayView<'_, f64> = unsafe {
-        StridedArrayView::new(
+    let under_view: StrideArrayView<'_, f64> = unsafe {
+        StrideArrayView::new(
             2,
             [1, 2].as_ptr(),
             [elem_size, elem_size].as_ptr(),
@@ -243,8 +243,8 @@ fn test_array_length_mismatch() -> TestResult {
         .contains("Array buffer length mismatch (actual: 8, expected: 16)"));
 
     let over_data = [1.1, 2.2, 3.3];
-    let over_view: StridedArrayView<'_, f64> = unsafe {
-        StridedArrayView::new(
+    let over_view: StrideArrayView<'_, f64> = unsafe {
+        StrideArrayView::new(
             2,
             [1, 2].as_ptr(),
             [elem_size, elem_size].as_ptr(),
