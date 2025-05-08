@@ -1144,12 +1144,8 @@ impl Buffer {
         }
 
         let reserve_size = view.check_data_buf()?;
-        i32::try_from(reserve_size).map_err(
-            |_| error::fmt!(
-                ArrayViewError,
-                "Array total elem size overflow"
-            )
-        )?;
+        i32::try_from(reserve_size)
+            .map_err(|_| error::fmt!(ArrayViewError, "Array total elem size overflow"))?;
         // binary format flag '='
         self.output.push(b'=');
         // binary format entity type

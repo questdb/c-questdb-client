@@ -24,6 +24,7 @@
 
 #include "mock_server.hpp"
 
+#include <string.h>
 #include <string>
 
 #if defined(PLATFORM_UNIX)
