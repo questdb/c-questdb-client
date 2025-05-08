@@ -77,6 +77,19 @@ typedef enum line_sender_error_code
 
     /** Bad configuration. */
     line_sender_error_config_error,
+
+    /** Currently, only arrays with a maximum 32 dimensions are supported. */
+    line_sender_error_array_large_dim,
+
+    /** ArrayView internal error, such as failure to get the size of a valid
+     * dimension. */
+    line_sender_error_array_view_internal_error,
+
+    /**  Write arrayView to sender buffer error. */
+    line_sender_error_array_view_write_to_buffer_error,
+
+    /**  Line sender protocol version error. */
+    line_sender_error_line_protocol_version_error,
 } line_sender_error_code;
 
 /** The protocol used to connect with. */
@@ -499,6 +512,7 @@ bool line_sender_buffer_column_str(
  * @param[in] rank Number of dimensions of the array.
  * @param[in] shapes Array of dimension sizes (length = `rank`).
  *                   Each element must be a positive integer.
+ * @param[in] strides Array strides.
  * @param[in] data_buffer First array element data.
  * @param[in] data_buffer_len Bytes length of the array data.
  * @param[out] err_out Set to an error object on failure (if non-NULL).
