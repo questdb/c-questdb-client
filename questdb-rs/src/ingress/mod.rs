@@ -748,6 +748,15 @@ impl Buffer {
         }
     }
 
+    /// Checks if this buffer is ready to be flushed to a sender via one of the
+    /// [`Sender::flush`] functions. An [`Ok`] value indicates that the buffer
+    /// is ready to be flushed via a [`Sender`] while an [`Err`] will contain a
+    /// message indicating why this [`Buffer`] cannot be flushed at the moment.
+    #[inline(always)]
+    pub fn check_can_flush(&self) -> Result<()> {
+        self.check_op(Op::Flush)
+    }
+
     #[inline(always)]
     fn validate_max_name_len(&self, name: &str) -> Result<()> {
         if name.len() > self.max_name_len {
@@ -2945,7 +2954,7 @@ impl Sender {
                 "Could not flush buffer: not connected to database."
             ));
         }
-        buf.check_op(Op::Flush)?;
+        buf.check_can_flush()?;
 
         if buf.len() > self.max_buf_size {
             return Err(error::fmt!(
