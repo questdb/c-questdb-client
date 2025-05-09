@@ -24,22 +24,24 @@
 
 #![doc = include_str!("mod.md")]
 
+pub use self::ndarr::{ArrayElement, NdArrayView, StrideArrayView};
 pub use self::timestamp::*;
-
 use crate::error::{self, Error, Result};
 use crate::gai;
 use crate::ingress::conf::ConfigSetting;
 use base64ct::{Base64, Base64UrlUnpadded, Encoding};
 use core::time::Duration;
+use ndarr::ArrayElementSealed;
 use rustls::{ClientConnection, RootCertStore, StreamOwned};
 use rustls_pki_types::ServerName;
 use socket2::{Domain, Protocol as SockProtocol, SockAddr, Socket, Type};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fmt::{Debug, Display, Formatter, Write};
-use std::io::{self, BufRead, BufReader, ErrorKind, Write as IoWrite};
+use std::io::{self, BufRead, BufReader, Cursor, ErrorKind, Write as IoWrite};
 use std::ops::Deref;
 use std::path::PathBuf;
+use std::slice::from_raw_parts_mut;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -54,6 +56,25 @@ use ring::{
     rand::SystemRandom,
     signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING},
 };
+
+/// Defines the maximum allowed dimensions for array data in binary serialization protocols.
+pub const MAX_DIMS: usize = 32;
+
+/// Line Protocol Version supported by current client.
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub enum LineProtocolVersion {
+    V1 = 1,
+    V2 = 2,
+}
+
+impl std::fmt::Display for LineProtocolVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LineProtocolVersion::V1 => write!(f, "v1"),
+            LineProtocolVersion::V2 => write!(f, "v2"),
+        }
+    }
+}
 
 #[derive(Debug, Copy, Clone)]
 enum Op {
@@ -464,6 +485,8 @@ impl BufferState {
     }
 }
 
+pub trait Buffer1 {}
+
 /// A reusable buffer to prepare a batch of ILP messages.
 ///
 /// # Example
@@ -506,6 +529,7 @@ impl BufferState {
 ///     [`column_i64`](Buffer::column_i64),
 ///     [`column_f64`](Buffer::column_f64),
 ///     [`column_str`](Buffer::column_str),
+///     [`column_arr`](Buffer::column_arr),
 ///     [`column_ts`](Buffer::column_ts)).
 ///   * Symbols must appear before columns.
 ///   * A row must be terminated with either [`at`](Buffer::at) or
@@ -524,6 +548,7 @@ impl BufferState {
 /// | [`column_i64`](Buffer::column_i64) | [`INTEGER`](https://questdb.io/docs/reference/api/ilp/columnset-types#integer) |
 /// | [`column_f64`](Buffer::column_f64) | [`FLOAT`](https://questdb.io/docs/reference/api/ilp/columnset-types#float) |
 /// | [`column_str`](Buffer::column_str) | [`STRING`](https://questdb.io/docs/reference/api/ilp/columnset-types#string) |
+/// | [`column_arr`](Buffer::column_arr) | [`ARRAY`](https://questdb.io/docs/reference/api/ilp/columnset-types#array) |
 /// | [`column_ts`](Buffer::column_ts) | [`TIMESTAMP`](https://questdb.io/docs/reference/api/ilp/columnset-types#timestamp) |
 ///
 /// QuestDB supports both `STRING` and `SYMBOL` column types.
@@ -555,6 +580,8 @@ pub struct Buffer {
     state: BufferState,
     marker: Option<(usize, BufferState)>,
     max_name_len: usize,
+    f64serializer: fn(&mut Vec<u8>, f64),
+    version: LineProtocolVersion,
 }
 
 impl Buffer {
@@ -566,6 +593,8 @@ impl Buffer {
             state: BufferState::new(),
             marker: None,
             max_name_len: 127,
+            f64serializer: f64_binary_series,
+            version: LineProtocolVersion::V2,
         }
     }
 
@@ -580,6 +609,36 @@ impl Buffer {
         let mut buf = Self::new();
         buf.max_name_len = max_name_len;
         buf
+    }
+
+    pub fn with_line_proto_version(mut self, version: LineProtocolVersion) -> Result<Self> {
+        if self.state.op_case != OpCase::Init {
+            return Err(error::fmt!(
+                LineProtocolVersionError,
+                "Line protocol version must be set before adding any data."
+            ));
+        }
+        self.f64serializer = match version {
+            LineProtocolVersion::V1 => f64_text_series,
+            LineProtocolVersion::V2 => f64_binary_series,
+        };
+        self.version = version;
+        Ok(self)
+    }
+
+    pub fn set_line_proto_version(&mut self, version: LineProtocolVersion) -> Result<&mut Self> {
+        if self.state.op_case != OpCase::Init {
+            return Err(error::fmt!(
+                LineProtocolVersionError,
+                "Line protocol version must be set before adding any data."
+            ));
+        }
+        self.f64serializer = match version {
+            LineProtocolVersion::V1 => f64_text_series,
+            LineProtocolVersion::V2 => f64_binary_series,
+        };
+        self.version = version;
+        Ok(self)
     }
 
     /// Pre-allocate to ensure the buffer has enough capacity for at least the
@@ -953,8 +1012,7 @@ impl Buffer {
         Error: From<N::Error>,
     {
         self.write_column_key(name)?;
-        let mut ser = F64Serializer::new(value);
-        self.output.extend_from_slice(ser.as_str().as_bytes());
+        (self.f64serializer)(&mut self.output, value);
         Ok(self)
     }
 
@@ -1011,6 +1069,234 @@ impl Buffer {
         Ok(self)
     }
 
+    /// Record a multidimensional array value for the given column.
+    ///
+    /// Supports arrays with up to [`MAX_DIMS`] dimensions. The array elements must
+    /// implement [`ArrayElement`] trait which provides type-to-[`ElemDataType`] mapping.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage with direct dimension specification:
+    ///
+    /// ```
+    /// # #[cfg(feature = "ndarray")]
+    /// # {
+    /// # use questdb::Result;
+    /// # use questdb::ingress::Buffer;
+    /// # use ndarray::array;
+    /// # fn main() -> Result<()> {
+    /// # let mut buffer = Buffer::new();
+    /// # buffer.table("x")?;
+    /// // Record a 2D array of f64 values
+    /// let array_2d = array![[1.1, 2.2], [3.3, 4.4]];
+    /// buffer.column_arr("array_col", &array_2d.view())?;
+    /// # Ok(())
+    /// # }
+    /// # }
+    ///
+    /// ```
+    ///
+    /// Using [`ColumnName`] for validated column names:
+    ///
+    /// ```
+    /// # #[cfg(feature = "ndarray")]
+    /// # {
+    /// # use questdb::Result;
+    /// # use questdb::ingress::{Buffer, ColumnName};
+    /// # use ndarray::Array3;
+    /// # fn main() -> Result<()> {
+    /// # let mut buffer = Buffer::new();
+    /// # buffer.table("x1")?;
+    /// // Record a 3D array of f64 values
+    /// let array_3d = Array3::from_elem((2, 3, 4), 42f64);
+    /// let col_name = ColumnName::new("col1")?;
+    /// buffer.column_arr(col_name, &array_3d.view())?;
+    /// # Ok(())
+    /// # }
+    /// # }
+    /// ```
+    /// # Errors
+    ///
+    /// Returns [`Error`] if:
+    /// - Array dimensions exceed [`MAX_DIMS`]
+    /// - Failed to get dimension sizes
+    /// - Column name validation fails
+    #[allow(private_bounds)]
+    pub fn column_arr<'a, N, T, D>(&mut self, name: N, view: &T) -> Result<&mut Self>
+    where
+        N: TryInto<ColumnName<'a>>,
+        T: NdArrayView<D>,
+        D: ArrayElement + ArrayElementSealed,
+        Error: From<N::Error>,
+    {
+        if self.version == LineProtocolVersion::V1 {
+            return Err(error::fmt!(
+                LineProtocolVersionError,
+                "line protocol version v1 does not support array datatype",
+            ));
+        }
+        let ndim = view.ndim();
+        if ndim == 0 {
+            return Err(error::fmt!(
+                ArrayViewError,
+                "Zero-dimensional arrays are not supported",
+            ));
+        }
+
+        self.write_column_key(name)?;
+
+        // check dimension less equal than max dims
+        if MAX_DIMS < ndim {
+            return Err(error::fmt!(
+                ArrayHasTooManyDims,
+                "Array dimension mismatch: expected at most {} dimensions, but got {}",
+                MAX_DIMS,
+                ndim
+            ));
+        }
+
+        // TODO: Remove `check_data_buf` this from the trait.
+        //       It's private impl details that can be coded generically
+        let array_buf_size = view.check_data_buf()?;
+        if array_buf_size > i32::MAX as usize {
+            // TODO: We should probably agree on a significantly
+            //       _smaller_ limit here, since there's no way
+            //       we've ever tested anything that big.
+            //       My gut feeling is that the maximum array buffer should be
+            //       in the order of 100MB or so.
+            return Err(error::fmt!(
+                ArrayViewError,
+                "Array buffer size too big: {}",
+                array_buf_size
+            ));
+        }
+
+        // binary format flag '='
+        self.output.push(b'=');
+        // binary format entity type
+        self.output.push(ARRAY_BINARY_FORMAT_TYPE);
+        // ndarr datatype
+        self.output.push(D::type_tag());
+        // ndarr dims
+        self.output.push(ndim as u8);
+
+        let dim_header_size = size_of::<u32>() * ndim;
+        self.output.reserve(dim_header_size + array_buf_size);
+
+        for i in 0..ndim {
+            let dim = view.dim(i).ok_or_else(|| {
+                error::fmt!(
+                    ArrayViewError,
+                    "Cannot get correct dimensions for dim {}",
+                    i
+                )
+            })?;
+
+            // TODO: check that the dimension is not past
+            // the maximum size that the java impl will accept.
+            // I seem to remember that it's 2^28-1 or something like that.
+            // Must check Java impl.
+
+            // ndarr shapes
+            self.output
+                .extend_from_slice((dim as u32).to_le_bytes().as_slice());
+        }
+
+        let index = self.output.len();
+        let writeable =
+            unsafe { from_raw_parts_mut(self.output.as_mut_ptr().add(index), array_buf_size) };
+        let mut cursor = Cursor::new(writeable);
+
+        // TODO: The next section needs a bit of a rewrite.
+        //       It also needs clear comments that explain the design decisions.
+        //
+        //       I'd be expecting two code paths here:
+        //          1. The array is row-major contiguous
+        //          2. The data needs to be written out via the strides.
+        //
+        //       The code here seems to do something a bit different and
+        //       is worth explaining.
+        //       I see two code paths that I honestly don't understand,
+        //       the `ndarr::write_array_data` and the `ndarr::write_array_data_use_raw_buffer`
+        //       functions both seem to handle both cases (why?) and then seem
+        //       to construct a vectored IoSlice buffer (why??) before writing
+        //       the strided data out.
+
+        // ndarr data
+        if view.as_slice().is_some() {
+            if let Err(e) = ndarr::write_array_data(view, &mut cursor) {
+                return Err(error::fmt!(
+                    ArrayWriteToBufferError,
+                    "Can not write row major to writer: {}",
+                    e
+                ));
+            }
+            if cursor.position() != (array_buf_size as u64) {
+                return Err(error::fmt!(
+                    ArrayWriteToBufferError,
+                    "Array write buffer length mismatch (actual: {}, expected: {})",
+                    cursor.position(),
+                    array_buf_size
+                ));
+            }
+            unsafe { self.output.set_len(array_buf_size + index) }
+        } else {
+            unsafe { self.output.set_len(array_buf_size + index) }
+            ndarr::write_array_data_use_raw_buffer(&mut self.output[index..], view);
+        }
+        Ok(self)
+    }
+
+    #[cfg(feature = "benchmark")]
+    pub fn column_arr_use_raw_buffer<'a, N, T, D>(&mut self, name: N, view: &T) -> Result<&mut Self>
+    where
+        N: TryInto<ColumnName<'a>>,
+        T: NdArrayView<D>,
+        D: ArrayElement,
+        Error: From<N::Error>,
+    {
+        self.write_column_key(name)?;
+
+        // check dimension less equal than max dims
+        if MAX_DIMS < view.ndim() {
+            return Err(error::fmt!(
+                ArrayHasTooManyDims,
+                "Array dimension mismatch: expected at most {} dimensions, but got {}",
+                MAX_DIMS,
+                view.ndim()
+            ));
+        }
+
+        let reserve_size = view.check_data_buf()?;
+        // binary format flag '='
+        self.output.push(b'=');
+        // binary format entity type
+        self.output.push(ARRAY_BINARY_FORMAT_TYPE);
+        // ndarr datatype
+        self.output.push(D::elem_type().into());
+        // ndarr dims
+        self.output.push(view.ndim() as u8);
+
+        for i in 0..view.ndim() {
+            let d = view.dim(i).ok_or_else(|| {
+                error::fmt!(
+                    ArrayViewError,
+                    "Can not get correct dimensions for dim {}",
+                    i
+                )
+            })?;
+            // ndarr shapes
+            self.output
+                .extend_from_slice((d as i32).to_le_bytes().as_slice());
+        }
+
+        self.output.reserve(reserve_size);
+        let index = self.output.len();
+        unsafe { self.output.set_len(reserve_size + index) }
+        ndarr::write_array_data_use_raw_buffer(&mut self.output[index..], view);
+        Ok(self)
+    }
+
     /// Record a timestamp value for the given column.
     ///
     /// ```
@@ -1060,7 +1346,7 @@ impl Buffer {
     /// or you can also pass in a `TimestampNanos`.
     ///
     /// Note that both `TimestampMicros` and `TimestampNanos` can be constructed
-    /// easily from either `chrono::DateTime` and `std::time::SystemTime`.
+    /// easily from either `std::time::SystemTime` or `chrono::DateTime`.
     ///
     /// This last option requires the `chrono_timestamp` feature.
     pub fn column_ts<'a, N, T>(&mut self, name: N, value: T) -> Result<&mut Self>
@@ -1114,7 +1400,7 @@ impl Buffer {
     /// You can also pass in a `TimestampMicros`.
     ///
     /// Note that both `TimestampMicros` and `TimestampNanos` can be constructed
-    /// easily from either `chrono::DateTime` and `std::time::SystemTime`.
+    /// easily from either `std::time::SystemTime` or `chrono::DateTime`.
     ///
     pub fn at<T>(&mut self, timestamp: T) -> Result<()>
     where
@@ -1199,6 +1485,9 @@ pub struct Sender {
     handler: ProtocolHandler,
     connected: bool,
     max_buf_size: usize,
+    default_line_protocol_version: LineProtocolVersion,
+    #[cfg(feature = "ilp-over-http")]
+    supported_line_protocol_versions: Option<Vec<LineProtocolVersion>>,
 }
 
 impl std::fmt::Debug for Sender {
@@ -1822,6 +2111,19 @@ impl SenderBuilder {
                 "retry_timeout" => {
                     builder.retry_timeout(Duration::from_millis(parse_conf_value(key, val)?))?
                 }
+
+                #[cfg(feature = "ilp-over-http")]
+                "disable_line_protocol_validation" => {
+                    if val == "on" {
+                        builder.disable_line_protocol_validation()?
+                    } else if val != "off" {
+                        return Err(error::fmt!(
+                            ConfigError, "invalid \"disable_line_protocol_validation\" [value={val}, allowed-values=[on, off]]]\"]"));
+                    } else {
+                        builder
+                    }
+                }
+
                 // Ignore other parameters.
                 // We don't want to fail on unknown keys as this would require releasing different
                 // library implementations in lock step as soon as a new parameter is added to any of them,
@@ -2088,6 +2390,24 @@ impl SenderBuilder {
                 ConfigError,
                 "\"request_timeout\" is supported only in ILP over HTTP."
             ));
+        }
+        Ok(self)
+    }
+
+    #[cfg(feature = "ilp-over-http")]
+    /// Disables automatic line protocol version validation for ILP-over-HTTP.
+    ///
+    /// - When set to `"off"`: Skips the initial server version handshake and disables protocol validation.
+    /// - When set to `"on"`: Keeps default validation behavior (recommended).
+    ///
+    /// Please ensure client's default version ([`LINE_PROTOCOL_VERSION_V2`]) or
+    /// explicitly set protocol version exactly matches server expectation.
+    pub fn disable_line_protocol_validation(mut self) -> Result<Self> {
+        if let Some(http) = &mut self.http {
+            // ignore "already specified" error
+            let _ = http
+                .disable_line_proto_validation
+                .set_specified("disable_line_protocol_validation", true);
         }
         Ok(self)
     }
@@ -2374,9 +2694,36 @@ impl SenderBuilder {
                     agent,
                     url,
                     auth,
-
                     config: self.http.as_ref().unwrap().clone(),
                 })
+            }
+        };
+
+        let mut default_line_protocol_version = LineProtocolVersion::V2;
+        #[cfg(feature = "ilp-over-http")]
+        let mut supported_line_protocol_versions: Option<Vec<_>> = None;
+
+        #[cfg(feature = "ilp-over-http")]
+        match self.protocol {
+            Protocol::Tcp | Protocol::Tcps => {}
+            Protocol::Http | Protocol::Https => {
+                let http_config = self.http.as_ref().unwrap();
+                if !*http_config.disable_line_proto_validation.deref() {
+                    if let ProtocolHandler::Http(http_state) = &handler {
+                        let settings_url = &format!(
+                            "{}://{}:{}/settings",
+                            self.protocol.schema(),
+                            self.host.deref(),
+                            self.port.deref()
+                        );
+                        (
+                            supported_line_protocol_versions,
+                            default_line_protocol_version,
+                        ) = get_line_protocol_version(http_state, settings_url)?;
+                    } else {
+                        default_line_protocol_version = LineProtocolVersion::V1;
+                    }
+                }
             }
         };
 
@@ -2385,12 +2732,14 @@ impl SenderBuilder {
         } else {
             descr.push_str("auth=off]");
         }
-
         let sender = Sender {
             descr,
             handler,
             connected: true,
             max_buf_size: *self.max_buf_size,
+            default_line_protocol_version,
+            #[cfg(feature = "ilp-over-http")]
+            supported_line_protocol_versions,
         };
 
         Ok(sender)
@@ -2509,6 +2858,17 @@ fn parse_key_pair(auth: &EcdsaAuthParams) -> Result<EcdsaKeyPair> {
     })
 }
 
+fn f64_text_series(vec: &mut Vec<u8>, value: f64) {
+    let mut ser = F64Serializer::new(value);
+    vec.extend_from_slice(ser.as_str().as_bytes())
+}
+
+fn f64_binary_series(vec: &mut Vec<u8>, value: f64) {
+    vec.push(b'=');
+    vec.push(DOUBLE_BINARY_FORMAT_TYPE);
+    vec.extend_from_slice(&value.to_le_bytes())
+}
+
 pub(crate) struct F64Serializer {
     buf: ryu::Buffer,
     n: f64,
@@ -2604,6 +2964,9 @@ impl Sender {
                 self.max_buf_size
             ));
         }
+
+        #[cfg(feature = "ilp-over-http")]
+        self.check_line_protocol_version(buf.version)?;
 
         let bytes = buf.as_bytes();
         if bytes.is_empty() {
@@ -2725,9 +3088,69 @@ impl Sender {
     pub fn must_close(&self) -> bool {
         !self.connected
     }
+
+    /// Returns the QuestDB server's recommended default line protocol version.
+    /// Will be used to [`Buffer::with_line_proto_version`]
+    ///
+    /// The version selection follows these rules:
+    /// 1. **TCP/TCPS Protocol**: Always returns [`LineProtocolVersion::V2`]
+    /// 2. **HTTP/HTTPS Protocol**:
+    ///    - If line protocol auto-detection is disabled [`SenderBuilder::disable_line_protocol_validation`], returns [`LineProtocolVersion::V2`]
+    ///    - If line protocol auto-detection is enabled:
+    ///      - Uses the server's default version if supported by the client
+    ///      - Otherwise uses the highest mutually supported version from the intersection
+    ///        of client and server compatible versions
+    pub fn default_line_protocol_version(&self) -> LineProtocolVersion {
+        self.default_line_protocol_version
+    }
+
+    #[cfg(feature = "ilp-over-http")]
+    #[cfg(test)]
+    pub(crate) fn support_line_protocol_versions(&self) -> Option<Vec<LineProtocolVersion>> {
+        self.supported_line_protocol_versions.clone()
+    }
+
+    #[cfg(feature = "ilp-over-http")]
+    #[inline(always)]
+    fn check_line_protocol_version(&self, version: LineProtocolVersion) -> Result<()> {
+        match &self.handler {
+            ProtocolHandler::Socket(_) => Ok(()),
+            #[cfg(feature = "ilp-over-http")]
+            ProtocolHandler::Http(http) => {
+                if *http.config.disable_line_proto_validation.deref() {
+                    Ok(())
+                } else {
+                    match self.supported_line_protocol_versions {
+                        Some(ref supported_line_protocols) => {
+                            if supported_line_protocols.contains(&version) {
+                                Ok(())
+                            } else {
+                                Err(error::fmt!(
+                                    LineProtocolVersionError,
+                                    "Line protocol version {} is not supported by current QuestDB Server",  version))
+                            }
+                        }
+                        None => {
+                            if version == LineProtocolVersion::V1 {
+                                Ok(())
+                            } else {
+                                Err(error::fmt!(
+                                LineProtocolVersionError,
+                                    "Line protocol version {} is not supported by current QuestDB Server",  version))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
+pub(crate) const ARRAY_BINARY_FORMAT_TYPE: u8 = 14;
+pub(crate) const DOUBLE_BINARY_FORMAT_TYPE: u8 = 16;
+
 mod conf;
+pub(crate) mod ndarr;
 mod timestamp;
 
 #[cfg(feature = "ilp-over-http")]

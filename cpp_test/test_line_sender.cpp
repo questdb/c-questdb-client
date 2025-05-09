@@ -56,6 +56,68 @@ private:
     F _f;
 };
 
+#if __cplusplus >= 202002L
+template <size_t N>
+bool operator==(std::span<const std::byte> lhs, const char (&rhs)[N])
+{
+    constexpr size_t bytelen = N - 1; // Exclude null terminator
+    const std::span<const std::byte> rhs_span{
+        reinterpret_cast<const std::byte*>(rhs), bytelen};
+    return lhs.size() == bytelen && std::ranges::equal(lhs, rhs_span);
+}
+
+bool operator==(std::span<const std::byte> lhs, const std::string& rhs)
+{
+    const std::span<const std::byte> rhs_span{
+        reinterpret_cast<const std::byte*>(rhs.data()), rhs.size()};
+    return lhs.size() == rhs.size() && std::ranges::equal(lhs, rhs_span);
+}
+#else
+template <size_t N>
+bool operator==(
+    const questdb::ingress::buffer_view lhs_view, const char (&rhs)[N])
+{
+    constexpr size_t bytelen = N - 1; // Exclude null terminator
+    const questdb::ingress::buffer_view rhs_view{
+        reinterpret_cast<const std::byte*>(rhs), bytelen};
+    return lhs_view == rhs_view;
+}
+
+bool operator==(
+    const questdb::ingress::buffer_view lhs_view, const std::string& rhs)
+{
+    const questdb::ingress::buffer_view rhs_view{
+        reinterpret_cast<const std::byte*>(rhs.data()), rhs.size()};
+    return lhs_view == rhs_view;
+}
+#endif
+
+template <size_t N>
+std::string& push_double_arr_to_buffer(
+    std::string& buffer,
+    std::array<double, N> data,
+    size_t rank,
+    uintptr_t* shapes)
+{
+    buffer.push_back(14);
+    buffer.push_back(10);
+    buffer.push_back(static_cast<char>(rank));
+    for (size_t i = 0; i < rank; ++i)
+        buffer.append(
+            reinterpret_cast<const char*>(&shapes[i]), sizeof(uint32_t));
+    buffer.append(
+        reinterpret_cast<const char*>(data.data()),
+        data.size() * sizeof(double));
+    return buffer;
+}
+
+std::string& push_double_to_buffer(std::string& buffer, double data)
+{
+    buffer.push_back(16);
+    buffer.append(reinterpret_cast<const char*>(&data), sizeof(double));
+    return buffer;
+}
+
 TEST_CASE("line_sender c api basics")
 {
     questdb::ingress::test::mock_server server;
@@ -95,13 +157,45 @@ TEST_CASE("line_sender c api basics")
     CHECK(::line_sender_buffer_table(buffer, table_name, &err));
     CHECK(::line_sender_buffer_symbol(buffer, t1_name, v1_utf8, &err));
     CHECK(::line_sender_buffer_column_f64(buffer, f1_name, 0.5, &err));
+
+    line_sender_column_name arr_name = QDB_COLUMN_NAME_LITERAL("a1");
+    // 3D array of doubles
+    size_t rank = 3;
+    uintptr_t shapes[] = {2, 3, 2};
+    intptr_t strides[] = {48, 16, 8};
+    std::array<double, 12> arr_data = {
+        48123.5,
+        2.4,
+        48124.0,
+        1.8,
+        48124.5,
+        0.9,
+        48122.5,
+        3.1,
+        48122.0,
+        2.7,
+        48121.5,
+        4.3};
+    CHECK(::line_sender_buffer_column_f64_arr(
+        buffer,
+        arr_name,
+        rank,
+        shapes,
+        strides,
+        reinterpret_cast<uint8_t*>(arr_data.data()),
+        sizeof(arr_data),
+        &err));
     CHECK(::line_sender_buffer_at_nanos(buffer, 10000000, &err));
     CHECK(server.recv() == 0);
-    CHECK(::line_sender_buffer_size(buffer) == 27);
+    CHECK(::line_sender_buffer_size(buffer) == 150);
     CHECK(::line_sender_flush(sender, buffer, &err));
     ::line_sender_buffer_free(buffer);
     CHECK(server.recv() == 1);
-    CHECK(server.msgs().front() == "test,t1=v1 f1=0.5 10000000\n");
+    std::string expect{"test,t1=v1 f1=="};
+    push_double_to_buffer(expect, 0.5).append(",a1==");
+    push_double_arr_to_buffer(expect, arr_data, 3, shapes)
+        .append(" 10000000\n");
+    CHECK(server.msgs(0) == expect);
 }
 
 TEST_CASE("Opts service API tests")
@@ -157,10 +251,12 @@ TEST_CASE("line_sender c++ api basics")
         .at(questdb::ingress::timestamp_nanos{10000000});
 
     CHECK(server.recv() == 0);
-    CHECK(buffer.size() == 31);
+    CHECK(buffer.size() == 38);
     sender.flush(buffer);
     CHECK(server.recv() == 1);
-    CHECK(server.msgs().front() == "test,t1=v1,t2= f1=0.5 10000000\n");
+    std::string expect{"test,t1=v1,t2= f1=="};
+    push_double_to_buffer(expect, 0.5).append(" 10000000\n");
+    CHECK(server.msgs(0) == expect);
 }
 
 TEST_CASE("test multiple lines")
@@ -193,16 +289,15 @@ TEST_CASE("test multiple lines")
         .at_now();
 
     CHECK(server.recv() == 0);
-    CHECK(buffer.size() == 137);
+    CHECK(buffer.size() == 142);
     sender.flush(buffer);
     CHECK(server.recv() == 2);
+    std::string expect{"metric1,t1=val1,t2=val2 f1=t,f2=12345i,f3=="};
+    push_double_to_buffer(expect, 10.75)
+        .append(",f4=\"val3\",f5=\"val4\",f6=\"val5\" 111222233333\n");
+    CHECK(server.msgs(0) == expect);
     CHECK(
-        server.msgs()[0] ==
-        ("metric1,t1=val1,t2=val2 f1=t,f2=12345i,"
-         "f3=10.75,f4=\"val3\",f5=\"val4\",f6=\"val5\" 111222233333\n"));
-    CHECK(
-        server.msgs()[1] ==
-        "metric1,tag3=value\\ 3,tag\\ 4=value:4 field5=f\n");
+        server.msgs(1) == "metric1,tag3=value\\ 3,tag\\ 4=value:4 field5=f\n");
 }
 
 TEST_CASE("State machine testing -- flush without data.")
@@ -243,7 +338,7 @@ TEST_CASE("One symbol only - flush before server accept")
     // but the server hasn't actually accepted the client connection yet.
     server.accept();
     CHECK(server.recv() == 1);
-    CHECK(server.msgs()[0] == "test,t1=v1\n");
+    CHECK(server.msgs(0) == "test,t1=v1\n");
 }
 
 TEST_CASE("One column only - server.accept() after flush, before close")
@@ -263,7 +358,7 @@ TEST_CASE("One column only - server.accept() after flush, before close")
     sender.close();
 
     CHECK(server.recv() == 1);
-    CHECK(server.msgs()[0] == "test t1=\"v1\"\n");
+    CHECK(server.msgs(0) == "test t1=\"v1\"\n");
 }
 
 TEST_CASE("Symbol after column")
@@ -385,42 +480,6 @@ TEST_CASE("Validation of bad chars in key names.")
         }
     }
 }
-
-#if __cplusplus >= 202002L
-template <size_t N>
-bool operator==(std::span<const std::byte> lhs, const char (&rhs)[N])
-{
-    constexpr size_t bytelen = N - 1; // Exclude null terminator
-    const std::span<const std::byte> rhs_span{
-        reinterpret_cast<const std::byte*>(rhs), bytelen};
-    return lhs.size() == bytelen && std::ranges::equal(lhs, rhs_span);
-}
-
-bool operator==(std::span<const std::byte> lhs, const std::string& rhs)
-{
-    const std::span<const std::byte> rhs_span{
-        reinterpret_cast<const std::byte*>(rhs.data()), rhs.size()};
-    return lhs.size() == rhs.size() && std::ranges::equal(lhs, rhs_span);
-}
-#else
-template <size_t N>
-bool operator==(
-    const questdb::ingress::buffer_view lhs_view, const char (&rhs)[N])
-{
-    constexpr size_t bytelen = N - 1; // Exclude null terminator
-    const questdb::ingress::buffer_view rhs_view{
-        reinterpret_cast<const std::byte*>(rhs), bytelen};
-    return lhs_view == rhs_view;
-}
-
-bool operator==(
-    const questdb::ingress::buffer_view lhs_view, const std::string& rhs)
-{
-    const questdb::ingress::buffer_view rhs_view{
-        reinterpret_cast<const std::byte*>(rhs.data()), rhs.size()};
-    return lhs_view == rhs_view;
-}
-#endif
 
 TEST_CASE("Buffer move and copy ctor testing")
 {
@@ -634,13 +693,19 @@ TEST_CASE("os certs")
 
     {
         questdb::ingress::opts opts{
-            questdb::ingress::protocol::https, "localhost", server.port()};
+            questdb::ingress::protocol::https,
+            "localhost",
+            server.port(),
+            true};
         opts.tls_ca(questdb::ingress::ca::os_roots);
     }
 
     {
         questdb::ingress::opts opts{
-            questdb::ingress::protocol::https, "localhost", server.port()};
+            questdb::ingress::protocol::https,
+            "localhost",
+            server.port(),
+            true};
         opts.tls_ca(questdb::ingress::ca::webpki_and_os_roots);
     }
 }
@@ -669,9 +734,12 @@ TEST_CASE("Opts copy ctor, assignment and move testing.")
 
     {
         questdb::ingress::opts opts1{
-            questdb::ingress::protocol::https, "localhost", "9009"};
+            questdb::ingress::protocol::https, "localhost", "9009", true};
         questdb::ingress::opts opts2{
-            questdb::ingress::protocol::https, "altavista.digital.com", "9009"};
+            questdb::ingress::protocol::https,
+            "altavista.digital.com",
+            "9009",
+            true};
         opts1 = opts2;
     }
 }
@@ -715,7 +783,7 @@ TEST_CASE("Test timestamp column.")
     sender.close();
 
     CHECK(server.recv() == 1);
-    CHECK(server.msgs()[0] == exp);
+    CHECK(server.msgs(0) == exp);
 }
 
 TEST_CASE("test timestamp_micros and timestamp_nanos::now()")
@@ -841,15 +909,15 @@ TEST_CASE("Opts from conf")
 TEST_CASE("HTTP basics")
 {
     questdb::ingress::opts opts1{
-        questdb::ingress::protocol::http, "localhost", 1};
+        questdb::ingress::protocol::http, "localhost", 1, true};
     questdb::ingress::opts opts1conf = questdb::ingress::opts::from_conf(
         "http::addr=localhost:1;username=user;password=pass;request_timeout="
-        "5000;retry_timeout=5;");
+        "5000;retry_timeout=5;disable_line_protocol_validation=on;");
     questdb::ingress::opts opts2{
-        questdb::ingress::protocol::https, "localhost", "1"};
+        questdb::ingress::protocol::https, "localhost", "1", true};
     questdb::ingress::opts opts2conf = questdb::ingress::opts::from_conf(
         "http::addr=localhost:1;token=token;request_min_throughput=1000;retry_"
-        "timeout=0;");
+        "timeout=0;disable_line_protocol_validation=on;");
     opts1.username("user")
         .password("pass")
         .max_buf_size(1000000)
@@ -873,4 +941,30 @@ TEST_CASE("HTTP basics")
         questdb::ingress::opts::from_conf(
             "http::addr=localhost:1;bind_interface=0.0.0.0;"),
         questdb::ingress::line_sender_error);
+}
+
+TEST_CASE("line sender protocol version v1")
+{
+    questdb::ingress::test::mock_server server;
+    questdb::ingress::line_sender sender{
+        questdb::ingress::protocol::tcp,
+        std::string("localhost"),
+        std::to_string(server.port())};
+    CHECK_FALSE(sender.must_close());
+    server.accept();
+    CHECK(server.recv() == 0);
+
+    questdb::ingress::line_sender_buffer buffer{line_protocol_version_1};
+    buffer.table("test")
+        .symbol("t1", "v1")
+        .symbol("t2", "")
+        .column("f1", 0.5)
+        .at(questdb::ingress::timestamp_nanos{10000000});
+
+    CHECK(server.recv() == 0);
+    CHECK(buffer.size() == 31);
+    sender.flush(buffer);
+    CHECK(server.recv() == 1);
+    std::string expect{"test,t1=v1,t2= f1=0.5 10000000\n"};
+    CHECK(server.msgs(0) == expect);
 }

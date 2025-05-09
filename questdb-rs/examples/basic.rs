@@ -1,4 +1,5 @@
 use chrono::{TimeZone, Utc};
+use ndarray::arr1;
 use questdb::{
     ingress::{Buffer, Sender, TimestampNanos},
     Result,
@@ -17,6 +18,7 @@ fn main() -> Result<()> {
         .symbol("side", "sell")?
         .column_f64("price", 2615.54)?
         .column_f64("amount", 0.00044)?
+        .column_arr("location", &arr1(&[100.0, 100.1, 100.2]).view())?
         .at(designated_timestamp)?;
 
     //// If you want to pass the current system timestamp, replace with:

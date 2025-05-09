@@ -48,6 +48,18 @@ pub enum ErrorCode {
 
     /// Bad configuration.
     ConfigError,
+
+    /// Array has too many dims. Currently, only arrays with a maximum [`crate::ingress::MAX_DIMS`] dimensions are supported.
+    ArrayHasTooManyDims,
+
+    /// Array view internal error.
+    ArrayViewError,
+
+    /// Array write to buffer error.
+    ArrayWriteToBufferError,
+
+    /// Validate line protocol version error.
+    LineProtocolVersionError,
 }
 
 /// An error that occurred when using QuestDB client library.

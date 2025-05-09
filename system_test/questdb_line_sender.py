@@ -37,9 +37,10 @@
 
 """
 
-
-from ast import arg
 import sys
+
+import numpy
+
 sys.dont_write_bytecode = True
 
 import pathlib
@@ -61,16 +62,19 @@ from ctypes import (
     c_void_p,
     c_ssize_t)
 
-from typing import Optional, Tuple, Union
+from typing import Optional, Union
 
 
 class c_line_sender(ctypes.Structure):
     pass
 
+
 class c_line_sender_buffer(ctypes.Structure):
     pass
 
+
 c_line_sender_protocol = ctypes.c_int
+
 
 class Protocol(Enum):
     TCP = (c_line_sender_protocol(0), 'tcp')
@@ -78,7 +82,9 @@ class Protocol(Enum):
     HTTP = (c_line_sender_protocol(2), 'http')
     HTTPS = (c_line_sender_protocol(3), 'https')
 
+
 c_line_sender_ca = ctypes.c_int
+
 
 class CertificateAuthority(Enum):
     WEBPKI_ROOTS = (c_line_sender_ca(0), 'webpki_roots')
@@ -86,33 +92,66 @@ class CertificateAuthority(Enum):
     WEBPKI_AND_OS_ROOTS = (c_line_sender_ca(2), 'webpki_and_os_roots')
     PEM_FILE = (c_line_sender_ca(3), 'pem_file')
 
+
+c_line_protocol_version = ctypes.c_int
+
+
+class LineProtocolVersion(Enum):
+    V1 = (c_line_protocol_version(1), 'v1')
+    V2 = (c_line_protocol_version(2), 'v2')
+
+    @classmethod
+    def from_int(cls, value: c_line_protocol_version):
+        for member in cls:
+            if member.value[0].value == value:
+                return member
+        raise ValueError(f"invalid protocol version: {value}")
+
+
 class c_line_sender_opts(ctypes.Structure):
     pass
+
 
 class c_line_sender_error(ctypes.Structure):
     pass
 
+
 c_size_t_p = ctypes.POINTER(c_size_t)
+c_ssize_t_p = ctypes.POINTER(c_ssize_t)
 c_line_sender_p = ctypes.POINTER(c_line_sender)
 c_line_sender_buffer_p = ctypes.POINTER(c_line_sender_buffer)
 c_line_sender_opts_p = ctypes.POINTER(c_line_sender_opts)
 c_line_sender_error_p = ctypes.POINTER(c_line_sender_error)
 c_line_sender_error_p_p = ctypes.POINTER(c_line_sender_error_p)
+c_uint8_p = ctypes.POINTER(c_uint8)
+
+
 class c_line_sender_utf8(ctypes.Structure):
     _fields_ = [("len", c_size_t),
                 ("buf", c_char_p)]
+
+
 c_line_sender_utf8_p = ctypes.POINTER(c_line_sender_utf8)
+
+
 class c_line_sender_table_name(ctypes.Structure):
     _fields_ = [("len", c_size_t),
                 ("buf", c_char_p)]
+
+
 class line_sender_buffer_view(ctypes.Structure):
     _fields_ = [("len", c_size_t),
-                ("buf", ctypes.POINTER(c_uint8))]
+                ("buf", c_uint8_p)]
+
 
 c_line_sender_table_name_p = ctypes.POINTER(c_line_sender_table_name)
+
+
 class c_line_sender_column_name(ctypes.Structure):
     _fields_ = [("len", c_size_t),
                 ("buf", c_char_p)]
+
+
 c_line_sender_column_name_p = ctypes.POINTER(c_line_sender_column_name)
 
 
@@ -129,7 +168,7 @@ def _setup_cdll():
         'darwin': 'dylib',
         'win32': 'dll'}[sys.platform]
     dll_path = next(
-       build_dir.glob(f'**/*questdb_client*.{dll_ext}'))
+        build_dir.glob(f'**/*questdb_client*.{dll_ext}'))
 
     dll = ctypes.CDLL(str(dll_path))
 
@@ -176,6 +215,12 @@ def _setup_cdll():
         dll.line_sender_buffer_with_max_name_len,
         c_line_sender_buffer_p,
         c_size_t)
+    set_sig(
+        dll.line_sender_buffer_set_line_protocol_version,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_protocol_version,
+        c_line_sender_error_p_p)
     set_sig(
         dll.line_sender_buffer_free,
         None,
@@ -236,6 +281,17 @@ def _setup_cdll():
         c_line_sender_buffer_p,
         c_line_sender_column_name,
         c_line_sender_utf8,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_f64_arr,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        c_size_t,
+        c_size_t_p,
+        c_ssize_t_p,
+        c_uint8_p,
+        c_size_t,
         c_line_sender_error_p_p)
     set_sig(
         dll.line_sender_buffer_column_ts_nanos,
@@ -317,6 +373,11 @@ def _setup_cdll():
         c_line_sender_utf8,
         c_line_sender_error_p_p)
     set_sig(
+        dll.line_sender_opts_disable_line_protocol_validation,
+        c_bool,
+        c_line_sender_opts_p,
+        c_line_sender_error_p_p)
+    set_sig(
         dll.line_sender_opts_auth_timeout,
         c_bool,
         c_line_sender_opts_p,
@@ -386,6 +447,10 @@ def _setup_cdll():
         dll.line_sender_from_env,
         c_line_sender_p,
         c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_default_line_protocol_version,
+        c_line_protocol_version,
+        c_line_sender_p)
     set_sig(
         dll.line_sender_must_close,
         None,
@@ -513,7 +578,10 @@ class _Opts:
 
     def __getattr__(self, name: str):
         fn = getattr(_DLL, 'line_sender_opts_' + name)
+
         def wrapper(*args):
+            if name == 'disable_line_protocol_validation':
+                return _error_wrapped_call(fn, self.impl)
             mapped_args = [
                 (_utf8(arg) if isinstance(arg, str) else arg)
                 for arg in args]
@@ -521,6 +589,7 @@ class _Opts:
                 return _error_wrapped_call(fn, self.impl, *mapped_args)
             else:
                 return fn(self.impl, *mapped_args)
+
         return wrapper
 
     def __del__(self):
@@ -533,16 +602,20 @@ class TimestampMicros:
 
 
 class Buffer:
-    def __init__(self, init_buf_size=65536, max_name_len=127):
+    def __init__(self, init_buf_size=65536, max_name_len=127, line_protocol_version=LineProtocolVersion.V2):
         self._impl = _DLL.line_sender_buffer_with_max_name_len(
             c_size_t(max_name_len))
         _DLL.line_sender_buffer_reserve(self._impl, c_size_t(init_buf_size))
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_set_line_protocol_version,
+            self._impl,
+            line_protocol_version.value[0])
 
     def __len__(self):
         return _DLL.line_sender_buffer_size(self._impl)
 
     def peek(self) -> str:
-        # This is a hacky way of doing it because it copies the whole buffer.
+        #  This is a hacky way of doing it because it copies the whole buffer.
         # Instead the `buffer` should be made to support the buffer protocol:
         # https://docs.python.org/3/c-api/buffer.html
         # This way we would not need to `bytes(..)` the object to keep it alive.
@@ -553,6 +626,12 @@ class Buffer:
             return _PY_DLL.PyBytes_FromStringAndSize(c_buf, view.len)
         else:
             return ''
+
+    def set_line_protocol_version(self, version: LineProtocolVersion):
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_set_line_protocol_version,
+            self._impl,
+            version.value[0])
 
     def reserve(self, additional):
         _DLL.line_sender_buffer_reserve(self._impl, c_size_t(additional))
@@ -627,6 +706,34 @@ class Buffer:
                 '`bool`, `int`, `float` or `str`.')
         return self
 
+    def column_f64_arr(self, name: str,
+                       rank: int,
+                       shapes: tuple[int, ...],
+                       strides: tuple[int, ...],
+                       data: c_void_p,
+                       length: int):
+        def _convert_tuple(tpl: tuple[int, ...], c_type: type, name: str) -> ctypes.POINTER:
+            arr_type = c_type * len(tpl)
+            try:
+                return arr_type(*[c_type(v) for v in tpl])
+            except OverflowError as e:
+                raise ValueError(
+                    f"{name} value exceeds {c_type.__name__} range"
+                ) from e
+
+        c_shapes = _convert_tuple(shapes, c_size_t, "shapes")
+        c_strides = _convert_tuple(strides, c_ssize_t, "strides")
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_column_f64_arr,
+            self._impl,
+            _column_name(name),
+            c_size_t(rank),
+            c_shapes,
+            c_strides,
+            ctypes.cast(data, c_uint8_p),
+            c_size_t(length)
+        )
+
     def at_now(self):
         _error_wrapped_call(
             _DLL.line_sender_buffer_at_now,
@@ -671,7 +778,7 @@ class Sender:
             host: str,
             port: Union[str, int],
             **kwargs):
-        
+
         self._build_mode = build_mode
         self._impl = None
         self._conf = [
@@ -679,7 +786,6 @@ class Sender:
             '::',
             f'addr={host}:{port};']
         self._opts = None
-        self._buffer = Buffer()
         opts = _Opts(host, port, protocol)
         for key, value in kwargs.items():
             # Build the config string param pair.
@@ -716,11 +822,17 @@ class Sender:
 
     def __enter__(self):
         self.connect()
+        self._buffer = Buffer(
+            line_protocol_version=LineProtocolVersion.from_int(self.line_sender_default_line_protocol_version()))
         return self
 
     def _check_connected(self):
         if not self._impl:
             raise SenderError('Not connected.')
+
+    def line_sender_default_line_protocol_version(self):
+        self._check_connected()
+        return _DLL.line_sender_default_line_protocol_version(self._impl)
 
     def table(self, table: str):
         self._buffer.table(table)
@@ -736,13 +848,21 @@ class Sender:
         self._buffer.column(name, value)
         return self
 
+    def column_f64_arr(
+            self, name: str,
+            array: numpy.ndarray):
+        if array.dtype != numpy.float64:
+            raise ValueError('expect float64 array')
+        self._buffer.column_f64_arr(name, array.ndim, array.shape, array.strides, array.ctypes.data, array.nbytes)
+        return self
+
     def at_now(self):
         self._buffer.at_now()
 
     def at(self, timestamp: int):
         self._buffer.at(timestamp)
 
-    def flush(self, buffer: Optional[Buffer]=None, clear=True, transactional=None):
+    def flush(self, buffer: Optional[Buffer] = None, clear=True, transactional=None):
         if (buffer is None) and not clear:
             raise ValueError(
                 'Clear flag must be True when using internal buffer')

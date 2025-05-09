@@ -77,6 +77,19 @@ typedef enum line_sender_error_code
 
     /** Bad configuration. */
     line_sender_error_config_error,
+
+    /** Currently, only arrays with a maximum 32 dimensions are supported. */
+    line_sender_error_array_large_dim,
+
+    /** ArrayView internal error, such as failure to get the size of a valid
+     * dimension. */
+    line_sender_error_array_view_internal_error,
+
+    /**  Write arrayView to sender buffer error. */
+    line_sender_error_array_view_write_to_buffer_error,
+
+    /**  Line sender protocol version error. */
+    line_sender_error_line_protocol_version_error,
 } line_sender_error_code;
 
 /** The protocol used to connect with. */
@@ -94,6 +107,18 @@ typedef enum line_sender_protocol
     /** InfluxDB Line Protocol over HTTP with TLS. */
     line_sender_protocol_https,
 } line_sender_protocol;
+
+/** The line protocol version used to write data to buffer. */
+typedef enum line_protocol_version
+{
+    /** Version 1 of InfluxDB Line Protocol.
+    Uses text format serialization for f64. */
+    line_protocol_version_1 = 1,
+
+    /** Version 2 of InfluxDB Line Protocol.
+    Uses binary format serialization for f64, and support array data type.*/
+    line_protocol_version_2 = 2,
+} line_protocol_version;
 
 /** Possible sources of the root certificates used to validate the server's
  * TLS certificate. */
@@ -296,6 +321,23 @@ line_sender_buffer* line_sender_buffer_new();
 LINESENDER_API
 line_sender_buffer* line_sender_buffer_with_max_name_len(size_t max_name_len);
 
+/**
+ * Sets the Line Protocol version for line_sender_buffer.
+ *
+ * The buffer defaults is line_protocol_version_2 which uses
+ * binary format f64 serialization and support array data type. Call this to
+ * switch to version 1 (text format f64) when connecting to servers that don't
+ * support line_protocol_version_2(under 8.3.2).
+ *
+ * Must be called before adding any data to the buffer. Protocol version cannot
+ * be changed after the buffer contains data.
+ */
+LINESENDER_API
+bool line_sender_buffer_set_line_protocol_version(
+    line_sender_buffer* buffer,
+    line_protocol_version version,
+    line_sender_error** err_out);
+
 /** Release the `line_sender_buffer` object. */
 LINESENDER_API
 void line_sender_buffer_free(line_sender_buffer* buffer);
@@ -459,6 +501,32 @@ bool line_sender_buffer_column_str(
     line_sender_buffer* buffer,
     line_sender_column_name name,
     line_sender_utf8 value,
+    line_sender_error** err_out);
+
+/**
+ * Record a multidimensional array of double for the given column.
+ * The array data must be stored in row-major order (C-style contiguous layout).
+ *
+ * @param[in] buffer Line buffer object.
+ * @param[in] name Column name.
+ * @param[in] rank Number of dimensions of the array.
+ * @param[in] shapes Array of dimension sizes (length = `rank`).
+ *                   Each element must be a positive integer.
+ * @param[in] strides Array strides.
+ * @param[in] data_buffer First array element data.
+ * @param[in] data_buffer_len Bytes length of the array data.
+ * @param[out] err_out Set to an error object on failure (if non-NULL).
+ * @return true on success, false on error.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_f64_arr(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    size_t rank,
+    const uintptr_t* shape,
+    const intptr_t* strides,
+    const uint8_t* data_buffer,
+    size_t data_buffer_len,
     line_sender_error** err_out);
 
 /**
@@ -694,6 +762,13 @@ bool line_sender_opts_token_y(
     line_sender_error** err_out);
 
 /**
+ * Set the ECDSA public key Y for TCP authentication.
+ */
+LINESENDER_API
+bool line_sender_opts_disable_line_protocol_validation(
+    line_sender_opts* opts, line_sender_error** err_out);
+
+/**
  * Configure how long to wait for messages from the QuestDB server during
  * the TLS handshake and authentication process.
  * The value is in milliseconds, and the default is 15 seconds.
@@ -851,6 +926,25 @@ line_sender* line_sender_from_conf(
  */
 LINESENDER_API
 line_sender* line_sender_from_env(line_sender_error** err_out);
+
+/**
+ * Returns the QuestDB server's recommended default line protocol version.
+ * Will be used to [`line_sender_buffer_set_line_protocol_version`]
+ *
+ * The version selection follows these rules:
+ * 1. TCP/TCPS Protocol: Always returns [`LineProtocolVersion::V2`]
+ * 2. HTTP/HTTPS Protocol:
+ *   - If line protocol auto-detection is disabled
+ *    [`line_sender_opts_disable_line_protocol_validation`], returns
+ *    [`LineProtocolVersion::V2`]
+ *   - If line protocol auto-detection is enabled:
+ *     - Uses the server's default version if supported by the client
+ *     - Otherwise uses the highest mutually supported version from the
+ *       intersection of client and server compatible versions.
+ */
+LINESENDER_API
+line_protocol_version line_sender_default_line_protocol_version(
+    const line_sender* sender);
 
 /**
  * Tell whether the sender is no longer usable and must be closed.
