@@ -2572,6 +2572,7 @@ impl SenderBuilder {
     /// requires authentication or TLS, these will also be completed before
     /// returning.
     pub fn build(&self) -> Result<Sender> {
+        println!("[DEBUG] Entering SenderBuilder block");
         println!("SenderBuilder ....... {:?}", self);
         let mut descr = format!("Sender[host={:?},port={:?},", self.host, self.port);
 
