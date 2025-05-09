@@ -1126,7 +1126,8 @@ impl Buffer {
                 "line protocol version v1 does not support array datatype",
             ));
         }
-        if view.ndim() == 0 {
+        let ndim = view.ndim();
+        if ndim == 0 {
             return Err(error::fmt!(
                 ArrayViewError,
                 "Zero-dimensional arrays are not supported",
@@ -1136,18 +1137,31 @@ impl Buffer {
         self.write_column_key(name)?;
 
         // check dimension less equal than max dims
-        if MAX_DIMS < view.ndim() {
+        if MAX_DIMS < ndim {
             return Err(error::fmt!(
                 ArrayHasTooManyDims,
                 "Array dimension mismatch: expected at most {} dimensions, but got {}",
                 MAX_DIMS,
-                view.ndim()
+                ndim
             ));
         }
 
-        let reserve_size = view.check_data_buf()?;
-        i32::try_from(reserve_size)
-            .map_err(|_| error::fmt!(ArrayViewError, "Array total elem size overflow"))?;
+        // TODO: Remove `check_data_buf` this from the trait.
+        //       It's private impl details that can be coded generically
+        let array_buf_size = view.check_data_buf()?;
+        if array_buf_size > i32::MAX as usize {
+            // TODO: We should probably agree on a significantly
+            //       _smaller_ limit here, since there's no way
+            //       we've ever tested anything that big.
+            //       My gut feeling is that the maximum array buffer should be
+            //       in the order of 100MB or so.
+            return Err(error::fmt!(
+                ArrayViewError,
+                "Array buffer size too big: {}",
+                array_buf_size
+            ));
+        }
+
         // binary format flag '='
         self.output.push(b'=');
         // binary format entity type
@@ -1155,26 +1169,49 @@ impl Buffer {
         // ndarr datatype
         self.output.push(D::type_tag());
         // ndarr dims
-        self.output.push(view.ndim() as u8);
+        self.output.push(ndim as u8);
 
-        for i in 0..view.ndim() {
-            let d = view.dim(i).ok_or_else(|| {
+        let dim_header_size = size_of::<u32>() * ndim;
+        self.output.reserve(dim_header_size + array_buf_size);
+
+        for i in 0..ndim {
+            let dim = view.dim(i).ok_or_else(|| {
                 error::fmt!(
                     ArrayViewError,
-                    "Can not get correct dimensions for dim {}",
+                    "Cannot get correct dimensions for dim {}",
                     i
                 )
             })?;
+
+            // TODO: check that the dimension is not past
+            // the maximum size that the java impl will accept.
+            // I seem to remember that it's 2^28-1 or something like that.
+            // Must check Java impl.
+
             // ndarr shapes
             self.output
-                .extend_from_slice((d as i32).to_le_bytes().as_slice());
+                .extend_from_slice((dim as u32).to_le_bytes().as_slice());
         }
 
-        self.output.reserve(reserve_size);
         let index = self.output.len();
         let writeable =
-            unsafe { from_raw_parts_mut(self.output.as_mut_ptr().add(index), reserve_size) };
+            unsafe { from_raw_parts_mut(self.output.as_mut_ptr().add(index), array_buf_size) };
         let mut cursor = Cursor::new(writeable);
+
+        // TODO: The next section needs a bit of a rewrite.
+        //       It also needs clear comments that explain the design decisions.
+        //
+        //       I'd be expecting two code paths here:
+        //          1. The array is row-major contiguous
+        //          2. The data needs to be written out via the strides.
+        //
+        //       The code here seems to do something a bit different and
+        //       is worth explaining.
+        //       I see two code paths that I honestly don't understand,
+        //       the `ndarr::write_array_data` and the `ndarr::write_array_data_use_raw_buffer`
+        //       functions both seem to handle both cases (why?) and then seem
+        //       to construct a vectored IoSlice buffer (why??) before writing
+        //       the strided data out.
 
         // ndarr data
         if view.as_slice().is_some() {
@@ -1185,17 +1222,17 @@ impl Buffer {
                     e
                 ));
             }
-            if cursor.position() != (reserve_size as u64) {
+            if cursor.position() != (array_buf_size as u64) {
                 return Err(error::fmt!(
                     ArrayWriteToBufferError,
                     "Array write buffer length mismatch (actual: {}, expected: {})",
                     cursor.position(),
-                    reserve_size
+                    array_buf_size
                 ));
             }
-            unsafe { self.output.set_len(reserve_size + index) }
+            unsafe { self.output.set_len(array_buf_size + index) }
         } else {
-            unsafe { self.output.set_len(reserve_size + index) }
+            unsafe { self.output.set_len(array_buf_size + index) }
             ndarr::write_array_data_use_raw_buffer(&mut self.output[index..], view);
         }
         Ok(self)
@@ -1300,7 +1337,7 @@ impl Buffer {
     /// or you can also pass in a `TimestampNanos`.
     ///
     /// Note that both `TimestampMicros` and `TimestampNanos` can be constructed
-    /// easily from either `chrono::DateTime` and `std::time::SystemTime`.
+    /// easily from either `std::time::SystemTime` or `chrono::DateTime`.
     ///
     /// This last option requires the `chrono_timestamp` feature.
     pub fn column_ts<'a, N, T>(&mut self, name: N, value: T) -> Result<&mut Self>
@@ -1354,7 +1391,7 @@ impl Buffer {
     /// You can also pass in a `TimestampMicros`.
     ///
     /// Note that both `TimestampMicros` and `TimestampNanos` can be constructed
-    /// easily from either `chrono::DateTime` and `std::time::SystemTime`.
+    /// easily from either `std::time::SystemTime` or `chrono::DateTime`.
     ///
     pub fn at<T>(&mut self, timestamp: T) -> Result<()>
     where

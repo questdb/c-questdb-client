@@ -123,6 +123,8 @@ pub struct StrideArrayView<'a, T> {
     dims: usize,
     shape: &'a [usize],
     strides: &'a [isize],
+
+    // TODO: Why a pointer and len? Shouldn't it be a `&'a [u8]` slice?
     buf_len: usize,
     buf: *const u8,
     _marker: std::marker::PhantomData<T>,

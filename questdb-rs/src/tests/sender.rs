@@ -29,25 +29,27 @@ use crate::{
     Error, ErrorCode,
 };
 
-#[cfg(feature = "ndarray")]
 use crate::ingress;
 #[cfg(feature = "ndarray")]
 use crate::ingress::ndarr::write_array_data;
 use crate::ingress::LineProtocolVersion;
 use crate::tests::{
     mock::{certs_dir, MockServer},
+    ndarr::ArrayColumnTypeTag,
     TestResult,
 };
 use core::time::Duration;
 #[cfg(feature = "ndarray")]
 use ndarray::{arr1, arr2, ArrayD};
 use rstest::rstest;
-use std::{io, time::SystemTime};
+use std::io;
 
 #[rstest]
 fn test_basics(
     #[values(LineProtocolVersion::V1, LineProtocolVersion::V2)] version: LineProtocolVersion,
 ) -> TestResult {
+    use std::time::SystemTime;
+
     let mut server = MockServer::new()?;
     let mut sender = server.lsb_tcp().build()?;
     assert!(!sender.must_close());
@@ -96,18 +98,59 @@ fn test_basics(
     Ok(())
 }
 
-#[cfg(feature = "ndarray")]
 #[test]
-fn test_array_basic() -> TestResult {
-    use crate::tests::ndarr::ArrayColumnTypeTag;
-
+fn test_array_f64_basic() -> TestResult {
     let mut server = MockServer::new()?;
     let mut sender = server.lsb_tcp().build()?;
     server.accept()?;
 
-    let ts = SystemTime::now();
-    let ts_nanos_num = ts.duration_since(SystemTime::UNIX_EPOCH)?.as_nanos() as i64;
-    let ts_nanos = TimestampNanos::from_systemtime(ts)?;
+    let ts = TimestampNanos::now();
+
+    let mut buffer =
+        Buffer::new().with_line_proto_version(sender.default_line_protocol_version())?;
+    buffer
+        .table("my_table")?
+        .symbol("device", "A001")?
+        .column_f64("f1", 25.5)?
+        .column_arr("arr1d", &[1.0, 2.0, 3.0])?
+        .at(ts)?;
+
+    assert_eq!(server.recv_q()?, 0);
+
+    let exp = &[
+        b"my_table,device=A001 ",
+        f64_to_bytes("f1", 25.5, LineProtocolVersion::V2).as_slice(),
+        b",arr1d=",
+        b"=", // binary field
+        &[ingress::ARRAY_BINARY_FORMAT_TYPE],
+        &[ArrayColumnTypeTag::Double.into()],
+        &[1u8],              // 1D array
+        &3u32.to_le_bytes(), // 3 elements
+        &1.0f64.to_le_bytes(),
+        &2.0f64.to_le_bytes(),
+        &3.0f64.to_le_bytes(),
+        format!(" {}\n", ts.as_i64()).as_bytes(),
+    ]
+    .concat();
+
+    assert_eq!(buffer.as_bytes(), exp);
+    assert_eq!(buffer.len(), exp.len());
+    sender.flush(&mut buffer)?;
+    assert_eq!(buffer.len(), 0);
+    assert_eq!(buffer.as_bytes(), b"");
+    assert_eq!(server.recv_q()?, 1);
+    assert_eq!(server.msgs[0].as_slice(), exp);
+    Ok(())
+}
+
+#[cfg(feature = "ndarray")]
+#[test]
+fn test_array_f64_from_ndarray() -> TestResult {
+    let mut server = MockServer::new()?;
+    let mut sender = server.lsb_tcp().build()?;
+    server.accept()?;
+
+    let ts = TimestampNanos::now();
     let array_2d = arr2(&[[1.1, 2.2], [3.3, 4.4]]);
     let array_3d = ArrayD::<f64>::ones(vec![2, 3, 4]);
 
@@ -119,12 +162,12 @@ fn test_array_basic() -> TestResult {
         .column_f64("f1", 25.5)?
         .column_arr("arr2d", &array_2d.view())?
         .column_arr("arr3d", &array_3d.view())?
-        .at(ts_nanos)?;
+        .at(ts)?;
 
     assert_eq!(server.recv_q()?, 0);
 
     let array_header2d = &[
-        &[b'='][..],
+        &[b'='],
         &[ingress::ARRAY_BINARY_FORMAT_TYPE],
         &[ArrayColumnTypeTag::Double.into()],
         &[2u8],
@@ -362,6 +405,8 @@ fn test_bad_key(
 
 #[test]
 fn test_timestamp_overloads() -> TestResult {
+    use std::time::SystemTime;
+
     let tbl_name = TableName::new("tbl_name")?;
 
     let mut buffer = Buffer::new();
