@@ -269,7 +269,7 @@ where
     }
 }
 
-/// Iterator for traversing a strided array in row-major (C-style) order.
+/// Iterator for traversing a stride array in row-major (C-style) order.
 pub struct RowMajorIter<'a, T> {
     base_ptr: *const u8,
     array: &'a StrideArrayView<'a, T>,
