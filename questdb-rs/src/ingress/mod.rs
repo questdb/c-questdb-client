@@ -2677,7 +2677,7 @@ impl SenderBuilder {
                         (
                             supported_line_protocol_versions,
                             default_line_protocol_version,
-                        ) = get_line_protocol_version(http_state, settings_url)?;
+                        ) = get_line_protocol_version(http_state, settings_url, self)?;
                     } else {
                         default_line_protocol_version = LineProtocolVersion::V1;
                     }

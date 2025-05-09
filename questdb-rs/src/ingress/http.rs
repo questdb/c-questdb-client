@@ -17,7 +17,7 @@ use ureq::unversioned::transport::{
     Buffers, Connector, LazyBuffers, NextTimeout, Transport, TransportAdapter,
 };
 
-use crate::ingress::LineProtocolVersion;
+use crate::ingress::{LineProtocolVersion, SenderBuilder};
 use ureq::unversioned::*;
 use ureq::Error::*;
 use ureq::{http, Body};
@@ -409,6 +409,7 @@ pub(super) fn http_send_with_retries(
 pub(super) fn get_line_protocol_version(
     state: &HttpHandlerState,
     settings_url: &str,
+    build: &SenderBuilder,
 ) -> Result<(Option<Vec<LineProtocolVersion>>, LineProtocolVersion), Error> {
     let mut support_versions: Option<Vec<_>> = None;
     let mut default_version = LineProtocolVersion::V1;
@@ -442,18 +443,20 @@ pub(super) fn get_line_protocol_version(
                     } else {
                         fmt!(
                             LineProtocolVersionError,
-                            "Failed to detect server's line protocol version, settings url: {}, err: {}.",
+                            "Failed to detect server's line protocol version, settings url: {}, err: {}. builder {}",
                             settings_url,
-                            err
+                            err,
+                            build
                         )
                     }
                 }
                 e => {
                     fmt!(
                         LineProtocolVersionError,
-                        "Failed to detect server's line protocol version, settings url: {}, err: {}.",
+                        "Failed to detect server's line protocol version, settings url: {}, err: {}. builder {}",
                         settings_url,
-                        e
+                        e,
+                        build
                     )
                 }
             };
