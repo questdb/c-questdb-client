@@ -443,7 +443,7 @@ pub(super) fn get_line_protocol_version(
                     } else {
                         fmt!(
                             LineProtocolVersionError,
-                            "Failed to detect server's line protocol version, settings url: {}, err: {}. builder {:?}",
+                            "Failed to detectxcccc server's line protocol version, settings url: {}, err: {}. builder {:?}",
                             settings_url,
                             err,
                             build
@@ -453,7 +453,7 @@ pub(super) fn get_line_protocol_version(
                 e => {
                     fmt!(
                         LineProtocolVersionError,
-                        "Failed to detect server's line protocol version, settings url: {}, err: {}. builder {:?}",
+                        "Failed to detect server's lineccxcccc protocol version, settings url: {}, err: {}. builder {:?}",
                         settings_url,
                         e,
                         build
