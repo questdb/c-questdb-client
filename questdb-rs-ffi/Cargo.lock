@@ -467,6 +467,7 @@ dependencies = [
  "indoc",
  "itoa",
  "libc",
+ "log",
  "questdb-confstr",
  "rand",
  "rustls",
