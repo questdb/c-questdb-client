@@ -2573,7 +2573,9 @@ impl SenderBuilder {
     /// returning.
     pub fn build(&self) -> Result<Sender> {
         println!("[DEBUG] Entering SenderBuilder block");
+
         println!("SenderBuilder ....... {:?}", self);
+        log::debug!("Sending GET request to: {:?}", self);
         let mut descr = format!("Sender[host={:?},port={:?},", self.host, self.port);
 
         if self.protocol.tls_enabled() {
