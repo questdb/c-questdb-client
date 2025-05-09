@@ -69,10 +69,10 @@ stages:
             env:
               JAVA_HOME: $(JAVA_HOME_11_X64)
             displayName: "Tests"
-          - task: PublishBuildArtifacts@1
-            inputs:
-              pathToPublish: ./build
-            displayName: "Publish build directory"
+          # - task: PublishBuildArtifacts@1
+          #   inputs:
+          #     pathToPublish: ./build
+          #   displayName: "Publish build directory"
       - job: FormatAndLinting
         displayName: "cargo fmt and clippy"
         pool:
