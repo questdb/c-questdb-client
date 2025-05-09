@@ -125,10 +125,18 @@ impl HttpHandlerState {
             .config()
             .timeout_per_call(Some(request_timeout))
             .build();
+        eprintln!("get_request (1) {:?}", request_timeout);
         let response = request.call();
+        eprintln!("get_request (2) {:?}", request_timeout);
         match &response {
-            Ok(res) => (need_retry(Ok(res.status())), response),
-            Err(err) => (need_retry(Err(err)), response),
+            Ok(res) => {
+                eprintln!("get_request (3) {:?}", request_timeout);
+                (need_retry(Ok(res.status())), response)
+            }
+            Err(err) => {
+                eprintln!("get_request (4) {:?}", request_timeout);
+                (need_retry(Err(err)), response)
+            }
         }
     }
 }
