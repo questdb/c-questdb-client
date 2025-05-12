@@ -167,7 +167,7 @@ fn test_array_f64_from_ndarray() -> TestResult {
     assert_eq!(server.recv_q()?, 0);
 
     let array_header2d = &[
-        &[b'='],
+        &[b'='][..],
         &[ingress::ARRAY_BINARY_FORMAT_TYPE],
         &[ArrayColumnTypeTag::Double.into()],
         &[2u8],
@@ -200,7 +200,7 @@ fn test_array_f64_from_ndarray() -> TestResult {
         ",arr3d=".as_bytes(),
         array_header3d,
         array_data3d.as_slice(),
-        format!(" {}\n", ts_nanos_num).as_bytes(),
+        format!(" {}\n", ts.as_i64()).as_bytes(),
     ]
     .concat();
 
