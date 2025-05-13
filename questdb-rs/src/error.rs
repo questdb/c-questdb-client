@@ -49,7 +49,7 @@ pub enum ErrorCode {
     /// Bad configuration.
     ConfigError,
 
-    /// Array has too many dims. Currently, only arrays with a maximum [`crate::ingress::MAX_DIMS`] dimensions are supported.
+    /// Array has too many dims. Currently, only arrays with a maximum [`crate::ingress::MAX_ARRAY_DIMS`] dimensions are supported.
     ArrayHasTooManyDims,
 
     /// Array view internal error.

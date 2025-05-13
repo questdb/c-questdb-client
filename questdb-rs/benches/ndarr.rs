@@ -98,6 +98,7 @@ fn bench_array_view(c: &mut Criterion) {
             transposed_view.as_ptr() as *const u8,
             transposed_view.len() * elem_size as usize,
         )
+        .unwrap()
     };
 
     // Case 2

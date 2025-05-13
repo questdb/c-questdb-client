@@ -1,8 +1,8 @@
 #[cfg(feature = "ndarray")]
-use crate::ingress::MAX_DIMS;
+use crate::ingress::MAX_ARRAY_DIMS;
 use crate::ingress::{Buffer, NdArrayView, StrideArrayView, ARRAY_BINARY_FORMAT_TYPE};
 use crate::tests::TestResult;
-use crate::ErrorCode;
+use crate::{Error, ErrorCode};
 
 use crate::ingress::ndarr::write_array_data;
 #[cfg(feature = "ndarray")]
@@ -70,12 +70,12 @@ fn test_stride_array_view() -> TestResult {
             test_data.as_ptr() as *const u8,
             test_data.len() * size_of::<f64>(),
         )
-    };
+    }?;
 
     assert_eq!(array.ndim(), 2);
-    assert_eq!(array.dim(0), Some(2));
-    assert_eq!(array.dim(1), Some(3));
-    assert_eq!(array.dim(2), None);
+    assert_eq!(array.dim(0), Ok(2));
+    assert_eq!(array.dim(1), Ok(3));
+    assert!(array.dim(2).is_err());
     assert!(array.as_slice().is_some());
     let mut buf = vec![];
     write_array_data(&array, &mut buf).unwrap();
@@ -99,12 +99,12 @@ fn test_strided_non_contiguous() -> TestResult {
             col_major_data.as_ptr() as *const u8,
             col_major_data.len() * elem_size as usize,
         )
-    };
+    }?;
 
     assert_eq!(array_view.ndim(), 2);
-    assert_eq!(array_view.dim(0), Some(3));
-    assert_eq!(array_view.dim(1), Some(2));
-    assert_eq!(array_view.dim(2), None);
+    assert_eq!(array_view.dim(0), Ok(3));
+    assert_eq!(array_view.dim(1), Ok(2));
+    assert!(array_view.dim(2).is_err());
     assert!(array_view.as_slice().is_none());
     let mut buffer = Vec::new();
     write_array_data(&array_view, &mut buffer)?;
@@ -132,7 +132,7 @@ fn test_negative_strides() -> TestResult {
             (data.as_ptr() as *const u8).add(48),
             data.len() * elem_size,
         )
-    };
+    }?;
     let collected: Vec<_> = view.iter().copied().collect();
     assert!(view.as_slice().is_none());
     let expected_data = vec![7.0, 8.0, 9.0, 4.0, 5.0, 6.0, 1.0, 2.0, 3.0];
@@ -150,14 +150,14 @@ fn test_negative_strides() -> TestResult {
 }
 
 #[test]
-fn test_basic_edge_cases() {
+fn test_basic_edge_cases() -> TestResult {
     // empty array
     let elem_size = std::mem::size_of::<f64>() as isize;
     let empty_view: StrideArrayView<'_, f64> =
-        unsafe { StrideArrayView::new(2, [0, 0].as_ptr(), [0, 0].as_ptr(), ptr::null(), 0) };
+        unsafe { StrideArrayView::new(2, [0, 0].as_ptr(), [0, 0].as_ptr(), ptr::null(), 0)? };
     assert_eq!(empty_view.ndim(), 2);
-    assert_eq!(empty_view.dim(0), Some(0));
-    assert_eq!(empty_view.dim(1), Some(0));
+    assert_eq!(empty_view.dim(0), Ok(0));
+    assert_eq!(empty_view.dim(1), Ok(0));
 
     // single element array
     let single_data = [42.0];
@@ -169,10 +169,11 @@ fn test_basic_edge_cases() {
             single_data.as_ptr() as *const u8,
             elem_size as usize,
         )
-    };
+    }?;
     let mut buf = vec![];
     write_array_data(&single_view, &mut buf).unwrap();
     assert_eq!(buf, 42.0f64.to_ne_bytes());
+    Ok(())
 }
 
 #[test]
@@ -188,7 +189,7 @@ fn test_buffer_basic_write() -> TestResult {
             test_data.as_ptr() as *const u8,
             test_data.len() * elem_size as usize,
         )
-    };
+    }?;
     let mut buffer = Buffer::new();
     buffer.table("my_test")?;
     buffer.column_arr("temperature", &array_view)?;
@@ -223,8 +224,8 @@ fn test_buffer_basic_write() -> TestResult {
 }
 
 #[test]
-fn test_size_overflow() -> TestResult {
-    let overflow_view = unsafe {
+fn test_stride_array_size_overflow() -> TestResult {
+    let result = unsafe {
         StrideArrayView::<f64>::new(
             2,
             [u32::MAX as usize, u32::MAX as usize].as_ptr(),
@@ -233,10 +234,6 @@ fn test_size_overflow() -> TestResult {
             0,
         )
     };
-
-    let mut buffer = Buffer::new();
-    buffer.table("my_test")?;
-    let result = buffer.column_arr("arr1", &overflow_view);
     let err = result.unwrap_err();
     assert_eq!(err.code(), ErrorCode::ArrayViewError);
     assert!(err.msg().contains("Array total elem size overflow"));
@@ -244,10 +241,10 @@ fn test_size_overflow() -> TestResult {
 }
 
 #[test]
-fn test_array_length_mismatch() -> TestResult {
+fn test_stride_view_length_mismatch() -> TestResult {
     let elem_size = size_of::<f64>() as isize;
     let under_data = [1.1];
-    let under_view: StrideArrayView<'_, f64> = unsafe {
+    let result: Result<StrideArrayView<'_, f64>, Error> = unsafe {
         StrideArrayView::new(
             2,
             [1, 2].as_ptr(),
@@ -256,18 +253,14 @@ fn test_array_length_mismatch() -> TestResult {
             under_data.len() * elem_size as usize,
         )
     };
-
-    let mut buffer = Buffer::new();
-    buffer.table("my_test")?;
-    let result = buffer.column_arr("arr1", &under_view);
     let err = result.unwrap_err();
-    assert_eq!(err.code(), ErrorCode::ArrayWriteToBufferError);
+    assert_eq!(err.code(), ErrorCode::ArrayViewError);
     assert!(err
         .msg()
         .contains("Array buffer length mismatch (actual: 8, expected: 16)"));
 
     let over_data = [1.1, 2.2, 3.3];
-    let over_view: StrideArrayView<'_, f64> = unsafe {
+    let result: Result<StrideArrayView<'_, f64>, Error> = unsafe {
         StrideArrayView::new(
             2,
             [1, 2].as_ptr(),
@@ -277,11 +270,8 @@ fn test_array_length_mismatch() -> TestResult {
         )
     };
 
-    buffer.clear();
-    buffer.table("my_test")?;
-    let result = buffer.column_arr("arr1", &over_view);
     let err = result.unwrap_err();
-    assert_eq!(err.code(), ErrorCode::ArrayWriteToBufferError);
+    assert_eq!(err.code(), ErrorCode::ArrayViewError);
     assert!(err
         .msg()
         .contains("Array buffer length mismatch (actual: 24, expected: 16)"));
@@ -292,12 +282,11 @@ fn test_array_length_mismatch() -> TestResult {
 fn test_build_in_1d_array_normal() -> TestResult {
     let arr = [1.0f64, 2.0, 3.0, 4.0];
     assert_eq!(arr.ndim(), 1);
-    assert_eq!(arr.dim(0), Some(4));
-    assert_eq!(arr.dim(1), None);
+    assert_eq!(arr.dim(0), Ok(4));
+    assert!(arr.dim(1).is_err());
     assert_eq!(NdArrayView::as_slice(&arr), Some(&[1.0, 2.0, 3.0, 4.0][..]));
     let collected: Vec<_> = NdArrayView::iter(&arr).copied().collect();
     assert_eq!(collected, vec![1.0, 2.0, 3.0, 4.0]);
-    assert_eq!(arr.check_data_buf(), Ok(32));
 
     let mut buffer = Buffer::new();
     buffer.table("my_test")?;
@@ -333,9 +322,8 @@ fn test_build_in_1d_array_normal() -> TestResult {
 fn test_build_in_1d_array_empty() -> TestResult {
     let arr: [f64; 0] = [];
     assert_eq!(arr.ndim(), 1);
-    assert_eq!(arr.dim(0), Some(0));
+    assert_eq!(arr.dim(0), Ok(0));
     assert_eq!(NdArrayView::as_slice(&arr), Some(&[][..]));
-    assert_eq!(arr.check_data_buf(), Ok(0));
 
     let mut buffer = Buffer::new();
     buffer.table("my_test")?;
@@ -361,11 +349,10 @@ fn test_build_in_1d_array_empty() -> TestResult {
 fn test_build_in_1d_vec_normal() -> TestResult {
     let vec = vec![5.0f64, 6.0, 7.0];
     assert_eq!(vec.ndim(), 1);
-    assert_eq!(vec.dim(0), Some(3));
+    assert_eq!(vec.dim(0), Ok(3));
     assert_eq!(NdArrayView::as_slice(&vec), Some(&[5.0, 6.0, 7.0][..]));
     let collected: Vec<_> = NdArrayView::iter(&vec).copied().collect();
     assert_eq!(collected, vec![5.0, 6.0, 7.0]);
-    assert_eq!(vec.check_data_buf(), Ok(24));
 
     let mut buffer = Buffer::new();
     buffer.table("my_test")?;
@@ -400,9 +387,8 @@ fn test_build_in_1d_vec_normal() -> TestResult {
 fn test_build_in_1d_vec_empty() -> TestResult {
     let vec: Vec<f64> = Vec::new();
     assert_eq!(vec.ndim(), 1);
-    assert_eq!(vec.dim(0), Some(0));
+    assert_eq!(vec.dim(0), Ok(0));
     assert_eq!(NdArrayView::as_slice(&vec), Some(&[][..]));
-    assert_eq!(vec.check_data_buf(), Ok(0));
 
     let mut buffer = Buffer::new();
     buffer.table("my_test")?;
@@ -429,9 +415,8 @@ fn test_build_in_1d_slice_normal() -> TestResult {
     let data = [10.0f64, 20.0, 30.0, 40.0];
     let slice = &data[1..3];
     assert_eq!(slice.ndim(), 1);
-    assert_eq!(slice.dim(0), Some(2));
+    assert_eq!(slice.dim(0), Ok(2));
     assert_eq!(NdArrayView::as_slice(&slice), Some(&[20.0, 30.0][..]));
-    assert_eq!(slice.check_data_buf(), Ok(16));
 
     let mut buffer = Buffer::new();
     buffer.table("my_test")?;
@@ -462,9 +447,8 @@ fn test_build_in_1d_slice_empty() -> TestResult {
     let data = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
     let slice = &data[2..2];
     assert_eq!(slice.ndim(), 1);
-    assert_eq!(slice.dim(0), Some(0));
+    assert_eq!(slice.dim(0), Ok(0));
     assert_eq!(NdArrayView::as_slice(&slice), Some(&[][..]));
-    assert_eq!(slice.check_data_buf(), Ok(0));
 
     let mut buffer = Buffer::new();
     buffer.table("my_test")?;
@@ -490,15 +474,14 @@ fn test_build_in_1d_slice_empty() -> TestResult {
 fn test_build_in_2d_array_normal() -> TestResult {
     let arr = [[1.0f64, 2.0], [3.0, 4.0], [5.0, 6.0]];
     assert_eq!(arr.ndim(), 2);
-    assert_eq!(arr.dim(0), Some(3));
-    assert_eq!(arr.dim(1), Some(2));
+    assert_eq!(arr.dim(0), Ok(3));
+    assert_eq!(arr.dim(1), Ok(2));
     assert_eq!(
         NdArrayView::as_slice(&arr),
         Some(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0][..])
     );
     let collected: Vec<_> = NdArrayView::iter(&arr).copied().collect();
     assert_eq!(collected, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-    assert_eq!(arr.check_data_buf(), Ok(48));
 
     let mut buffer = Buffer::new();
     buffer.table("my_test")?;
@@ -539,10 +522,9 @@ fn test_build_in_2d_array_normal() -> TestResult {
 fn test_build_in_2d_array_empty() -> TestResult {
     let arr: [[f64; 0]; 0] = [];
     assert_eq!(arr.ndim(), 2);
-    assert_eq!(arr.dim(0), Some(0));
-    assert_eq!(arr.dim(1), Some(0));
+    assert_eq!(arr.dim(0), Ok(0));
+    assert_eq!(arr.dim(1), Ok(0));
     assert_eq!(NdArrayView::as_slice(&arr), Some(&[][..]));
-    assert_eq!(arr.check_data_buf(), Ok(0));
 
     let mut buffer = Buffer::new();
     buffer.table("my_test")?;
@@ -571,12 +553,11 @@ fn test_build_in_2d_array_empty() -> TestResult {
 fn test_build_in_2d_vec_normal() -> TestResult {
     let vec = vec![vec![1.0f64, 2.0], vec![3.0, 4.0], vec![5.0, 6.0]];
     assert_eq!(vec.ndim(), 2);
-    assert_eq!(vec.dim(0), Some(3));
-    assert_eq!(vec.dim(1), Some(2));
+    assert_eq!(vec.dim(0), Ok(3));
+    assert_eq!(vec.dim(1), Ok(2));
     assert!(NdArrayView::as_slice(&vec).is_none());
     let collected: Vec<_> = NdArrayView::iter(&vec).copied().collect();
     assert_eq!(collected, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-    assert_eq!(vec.check_data_buf(), Ok(48));
 
     let mut buffer = Buffer::new();
     buffer.table("my_test")?;
@@ -629,9 +610,8 @@ fn test_build_in_2d_vec_irregular_shape() -> TestResult {
 fn test_build_in_2d_vec_empty() -> TestResult {
     let vec: Vec<Vec<f64>> = vec![vec![], vec![], vec![]];
     assert_eq!(vec.ndim(), 2);
-    assert_eq!(vec.dim(0), Some(3));
-    assert_eq!(vec.dim(1), Some(0));
-    assert_eq!(vec.check_data_buf(), Ok(0));
+    assert_eq!(vec.dim(0), Ok(3));
+    assert_eq!(vec.dim(1), Ok(0));
 
     let mut buffer = Buffer::new();
     buffer.table("my_test")?;
@@ -661,13 +641,12 @@ fn test_build_in_2d_slice_normal() -> TestResult {
     let data = [[1.0f64, 2.0], [3.0, 4.0], [5.0, 6.0]];
     let slice = &data[..2];
     assert_eq!(slice.ndim(), 2);
-    assert_eq!(slice.dim(0), Some(2));
-    assert_eq!(slice.dim(1), Some(2));
+    assert_eq!(slice.dim(0), Ok(2));
+    assert_eq!(slice.dim(1), Ok(2));
     assert_eq!(
         NdArrayView::as_slice(&slice),
         Some(&[1.0, 2.0, 3.0, 4.0][..])
     );
-    assert_eq!(slice.check_data_buf(), Ok(32));
 
     let mut buffer = Buffer::new();
     buffer.table("my_test")?;
@@ -707,10 +686,9 @@ fn test_build_in_2d_slice_empty() -> TestResult {
     let data = [[1.0f64, 2.0], [3.0, 4.0], [5.0, 6.0]];
     let slice = &data[2..2];
     assert_eq!(slice.ndim(), 2);
-    assert_eq!(slice.dim(0), Some(0));
-    assert_eq!(slice.dim(1), Some(2));
+    assert_eq!(slice.dim(0), Ok(0));
+    assert_eq!(slice.dim(1), Ok(2));
     assert_eq!(NdArrayView::as_slice(&slice), Some(&[][..]));
-    assert_eq!(slice.check_data_buf(), Ok(0));
 
     let mut buffer = Buffer::new();
     buffer.table("my_test")?;
@@ -739,16 +717,15 @@ fn test_build_in_2d_slice_empty() -> TestResult {
 fn test_build_in_3d_array_normal() -> TestResult {
     let arr = [[[1.0f64, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]];
     assert_eq!(arr.ndim(), 3);
-    assert_eq!(arr.dim(0), Some(2));
-    assert_eq!(arr.dim(1), Some(2));
-    assert_eq!(arr.dim(2), Some(2));
+    assert_eq!(arr.dim(0), Ok(2));
+    assert_eq!(arr.dim(1), Ok(2));
+    assert_eq!(arr.dim(2), Ok(2));
     assert_eq!(
         NdArrayView::as_slice(&arr),
         Some(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0][..])
     );
     let collected: Vec<_> = NdArrayView::iter(&arr).copied().collect();
     assert_eq!(collected, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
-    assert_eq!(arr.check_data_buf(), Ok(64));
 
     let mut buffer = Buffer::new();
     buffer.table("my_test")?;
@@ -791,11 +768,10 @@ fn test_build_in_3d_array_normal() -> TestResult {
 fn test_build_in_3d_array_empty() -> TestResult {
     let arr: [[[f64; 2]; 0]; 0] = [];
     assert_eq!(arr.ndim(), 3);
-    assert_eq!(arr.dim(0), Some(0));
-    assert_eq!(arr.dim(1), Some(0));
-    assert_eq!(arr.dim(2), Some(2));
+    assert_eq!(arr.dim(0), Ok(0));
+    assert_eq!(arr.dim(1), Ok(0));
+    assert_eq!(arr.dim(2), Ok(2));
     assert_eq!(NdArrayView::as_slice(&arr), Some(&[][..]));
-    assert_eq!(arr.check_data_buf(), Ok(0));
 
     let mut buffer = Buffer::new();
     buffer.table("my_test")?;
@@ -827,16 +803,15 @@ fn test_build_in_3d_vec_normal() -> TestResult {
         vec![vec![7.0, 8.0, 9.0], vec![10.0, 11.0, 12.0]],
     ];
     assert_eq!(vec.ndim(), 3);
-    assert_eq!(vec.dim(0), Some(2));
-    assert_eq!(vec.dim(1), Some(2));
-    assert_eq!(vec.dim(2), Some(3));
+    assert_eq!(vec.dim(0), Ok(2));
+    assert_eq!(vec.dim(1), Ok(2));
+    assert_eq!(vec.dim(2), Ok(3));
     assert!(NdArrayView::as_slice(&vec).is_none());
     let collected: Vec<_> = NdArrayView::iter(&vec).copied().collect();
     assert_eq!(
         collected,
         vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
     );
-    assert_eq!(vec.check_data_buf(), Ok(96));
 
     let mut buffer = Buffer::new();
     buffer.table("my_test")?;
@@ -883,11 +858,10 @@ fn test_build_in_3d_vec_normal() -> TestResult {
 fn test_build_in_3d_vec_empty() -> TestResult {
     let vec: Vec<Vec<Vec<f64>>> = vec![vec![vec![], vec![]], vec![vec![], vec![]]];
     assert_eq!(vec.ndim(), 3);
-    assert_eq!(vec.dim(0), Some(2));
-    assert_eq!(vec.dim(1), Some(2));
-    assert_eq!(vec.dim(2), Some(0));
+    assert_eq!(vec.dim(0), Ok(2));
+    assert_eq!(vec.dim(1), Ok(2));
+    assert_eq!(vec.dim(2), Ok(0));
     assert!(NdArrayView::as_slice(&vec).is_none());
-    assert_eq!(vec.check_data_buf(), Ok(0));
 
     let mut buffer = Buffer::new();
     buffer.table("my_test")?;
@@ -940,14 +914,13 @@ fn test_3d_slice_normal() -> TestResult {
     let data = [[[1f64, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]];
     let slice = &data[..1];
     assert_eq!(slice.ndim(), 3);
-    assert_eq!(slice.dim(0), Some(1));
-    assert_eq!(slice.dim(1), Some(2));
-    assert_eq!(slice.dim(2), Some(2));
+    assert_eq!(slice.dim(0), Ok(1));
+    assert_eq!(slice.dim(1), Ok(2));
+    assert_eq!(slice.dim(2), Ok(2));
     assert_eq!(
         NdArrayView::as_slice(&slice),
         Some(&[1.0, 2.0, 3.0, 4.0][..])
     );
-    assert_eq!(slice.check_data_buf(), Ok(32));
 
     let mut buffer = Buffer::new();
     buffer.table("my_test")?;
@@ -987,11 +960,10 @@ fn test_3d_slice_empty() -> TestResult {
     let data = [[[1f64, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]];
     let slice = &data[1..1];
     assert_eq!(slice.ndim(), 3);
-    assert_eq!(slice.dim(0), Some(0));
-    assert_eq!(slice.dim(1), Some(2));
-    assert_eq!(slice.dim(2), Some(2));
+    assert_eq!(slice.dim(0), Ok(0));
+    assert_eq!(slice.dim(1), Ok(2));
+    assert_eq!(slice.dim(2), Ok(2));
     assert_eq!(NdArrayView::as_slice(&slice), Some(&[][..]));
-    assert_eq!(slice.check_data_buf(), Ok(0));
 
     let mut buffer = Buffer::new();
     buffer.table("my_test")?;
@@ -1078,8 +1050,8 @@ fn test_1d_dimension_ndarray_info() {
     let view = array.view();
 
     assert_eq!(NdArrayView::ndim(&view), 1);
-    assert_eq!(NdArrayView::dim(&view, 0), Some(3));
-    assert_eq!(NdArrayView::dim(&view, 1), None);
+    assert_eq!(NdArrayView::dim(&view, 0), Ok(3));
+    assert!(NdArrayView::dim(&view, 1).is_err());
 }
 
 #[cfg(feature = "ndarray")]
@@ -1089,9 +1061,9 @@ fn test_complex_ndarray_dimensions() {
     let view = array.view();
 
     assert_eq!(NdArrayView::ndim(&view), 3);
-    assert_eq!(NdArrayView::dim(&view, 0), Some(2));
-    assert_eq!(NdArrayView::dim(&view, 1), Some(2));
-    assert_eq!(NdArrayView::dim(&view, 2), Some(1));
+    assert_eq!(NdArrayView::dim(&view, 0), Ok(2));
+    assert_eq!(NdArrayView::dim(&view, 1), Ok(2));
+    assert_eq!(NdArrayView::dim(&view, 2), Ok(1));
 }
 
 #[cfg(feature = "ndarray")]
@@ -1127,14 +1099,14 @@ fn test_buffer_ndarray_write() -> TestResult {
 fn test_buffer_write_ndarray_max_dimensions() -> TestResult {
     let mut buffer = Buffer::new();
     buffer.table("nd_test")?;
-    let shape: Vec<usize> = iter::repeat_n(1, MAX_DIMS).collect();
+    let shape: Vec<usize> = iter::repeat_n(1, MAX_ARRAY_DIMS).collect();
     let array = ArrayD::<f64>::zeros(shape.clone());
     buffer.column_arr("max_dim", &array.view())?;
     let data = buffer.as_bytes();
-    assert_eq!(data[19], MAX_DIMS as u8);
+    assert_eq!(data[19], MAX_ARRAY_DIMS as u8);
 
     // 33 dims error
-    let shape_invalid: Vec<_> = iter::repeat_n(1, MAX_DIMS + 1).collect();
+    let shape_invalid: Vec<_> = iter::repeat_n(1, MAX_ARRAY_DIMS + 1).collect();
     let array_invalid = ArrayD::<f64>::zeros(shape_invalid);
     let result = buffer.column_arr("invalid", &array_invalid.view());
     assert!(result.is_err());

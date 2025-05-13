@@ -11,7 +11,7 @@ where
     fn ndim(&self) -> usize;
 
     /// Returns the size of the specified dimension.
-    fn dim(&self, index: usize) -> Option<usize>;
+    fn dim(&self, index: usize) -> Result<usize, Error>;
 
     /// Return the array’s data as a slice, if it is c-major-layout.
     /// Return `None` otherwise.
@@ -20,16 +20,17 @@ where
     /// Return an iterator of references to the elements of the array.
     /// Iterator element type is `&T`.
     fn iter(&self) -> Self::Iter<'_>;
-
-    /// Validates the data buffer size of array is consistency with array shapes.
-    ///
-    /// # Returns
-    /// - `Ok(usize)`: Expected buffer size in bytes if valid
-    /// - `Err(Error)`: Otherwise
-    fn check_data_buf(&self) -> Result<usize, Error>;
 }
 
-pub fn write_array_data<W: std::io::Write, A: NdArrayView<T>, T>(
+// TODO: We should probably agree on a significantly
+//       _smaller_ limit here, since there's no way
+//       we've ever tested anything that big.
+//       My gut feeling is that the maximum array buffer should be
+//       in the order of 100MB or so.
+const MAX_ARRAY_BUFFER_SIZE: usize = i32::MAX as usize;
+pub(crate) const MAX_ARRAY_DIM_LEN: usize = 0x0FFF_FFFF; // 1 << 28 - 1
+
+pub(crate) fn write_array_data<W: std::io::Write, A: NdArrayView<T>, T>(
     array: &A,
     writer: &mut W,
 ) -> std::io::Result<()>
@@ -97,6 +98,25 @@ where
     }
 }
 
+pub(crate) fn get_and_check_array_bytes_size<A: NdArrayView<T>, T>(
+    array: &A,
+) -> Result<usize, Error>
+where
+    T: ArrayElement,
+{
+    (0..array.ndim())
+        .try_fold(std::mem::size_of::<T>(), |acc, i| Ok(acc * array.dim(i)?))
+        .and_then(|p| match p <= MAX_ARRAY_BUFFER_SIZE {
+            true => Ok(p),
+            false => Err(error::fmt!(
+                ArrayViewError,
+                "Array buffer size too big: {}, maximum: {}",
+                p,
+                MAX_ARRAY_BUFFER_SIZE
+            )),
+        })
+}
+
 /// Marker trait for valid array element types.
 ///
 /// Implemented for primitive types that can be stored in arrays.
@@ -123,10 +143,7 @@ pub struct StrideArrayView<'a, T> {
     dims: usize,
     shape: &'a [usize],
     strides: &'a [isize],
-
-    // TODO: Why a pointer and len? Shouldn't it be a `&'a [u8]` slice?
-    buf_len: usize,
-    buf: *const u8,
+    data: Option<&'a [u8]>,
     _marker: std::marker::PhantomData<T>,
 }
 
@@ -144,21 +161,26 @@ where
         self.dims
     }
 
-    fn dim(&self, index: usize) -> Option<usize> {
+    fn dim(&self, index: usize) -> Result<usize, Error> {
         if index >= self.dims {
-            return None;
+            return Err(error::fmt!(
+                ArrayViewError,
+                "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
+                index,
+                self.dims
+            ));
         }
-
-        Some(self.shape[index])
+        Ok(self.shape[index])
     }
 
     fn as_slice(&self) -> Option<&[T]> {
-        if self.is_c_major() {
-            Some(unsafe {
-                slice::from_raw_parts(self.buf as *const T, self.buf_len / size_of::<T>())
-            })
-        } else {
-            None
+        unsafe {
+            self.is_c_major().then_some(self.data.and_then(|data| {
+                Some(slice::from_raw_parts(
+                    data.as_ptr() as *const T,
+                    data.len() / size_of::<T>(),
+                ))
+            })?)
         }
     }
 
@@ -172,18 +194,23 @@ where
         dim_products.reverse();
 
         // consider minus strides
-        let base_ptr = self
-            .strides
-            .iter()
-            .enumerate()
-            .fold(self.buf, |ptr, (dim, &stride)| {
-                if stride < 0 {
-                    let dim_size = self.shape[dim] as isize;
-                    unsafe { ptr.offset(stride * (dim_size - 1)) }
-                } else {
-                    ptr
-                }
-            });
+        let base_ptr = match self.data {
+            None => std::ptr::null(),
+            Some(data) => {
+                self.strides
+                    .iter()
+                    .enumerate()
+                    .fold(data.as_ptr(), |ptr, (dim, &stride)| {
+                        if stride < 0 {
+                            let dim_size = self.shape[dim] as isize;
+                            unsafe { ptr.offset(stride * (dim_size - 1)) }
+                        } else {
+                            ptr
+                        }
+                    })
+            }
+        };
+
         RowMajorIter {
             base_ptr,
             array: self,
@@ -191,26 +218,6 @@ where
             current_linear: 0,
             total_elements: self.shape.iter().product(),
         }
-    }
-
-    fn check_data_buf(&self) -> Result<usize, Error> {
-        let mut size = size_of::<T>();
-        for i in 0..self.dims {
-            let d = self.shape[i];
-            size = size.checked_mul(d).ok_or(error::fmt!(
-                ArrayViewError,
-                "Array total elem size overflow"
-            ))?
-        }
-        if size != self.buf_len {
-            return Err(error::fmt!(
-                ArrayWriteToBufferError,
-                "Array buffer length mismatch (actual: {}, expected: {})",
-                self.buf_len,
-                size
-            ));
-        }
-        Ok(size)
     }
 }
 
@@ -236,38 +243,60 @@ where
         strides: *const isize,
         data: *const u8,
         data_len: usize,
-    ) -> Self {
+    ) -> Result<Self, Error> {
         let shapes = slice::from_raw_parts(shape, dims);
+        let size = shapes
+            .iter()
+            .try_fold(std::mem::size_of::<T>(), |acc, &dim| {
+                acc.checked_mul(dim)
+                    .ok_or_else(|| error::fmt!(ArrayViewError, "Array total elem size overflow"))
+            })?;
+        if size != data_len {
+            return Err(error::fmt!(
+                ArrayViewError,
+                "Array buffer length mismatch (actual: {}, expected: {})",
+                data_len,
+                size
+            ));
+        }
         let strides = slice::from_raw_parts(strides, dims);
-        Self {
+        let mut slice = None;
+        if data_len != 0 {
+            slice = Some(slice::from_raw_parts(data, data_len));
+        }
+        Ok(Self {
             dims,
             shape: shapes,
             strides,
-            buf_len: data_len,
-            buf: data,
+            data: slice,
             _marker: std::marker::PhantomData::<T>,
-        }
+        })
     }
 
     /// Verifies if the array follows C-style row-major memory layout.
     fn is_c_major(&self) -> bool {
-        if self.buf.is_null() || self.buf_len == 0 {
-            return false;
-        }
+        match self.data {
+            None => false,
+            Some(data) => {
+                if data.is_empty() {
+                    return false;
+                }
 
-        let elem_size = size_of::<T>() as isize;
-        if self.dims == 1 {
-            return self.strides[0] == elem_size || self.shape[0] == 1;
-        }
+                let elem_size = size_of::<T>() as isize;
+                if self.dims == 1 {
+                    return self.strides[0] == elem_size || self.shape[0] == 1;
+                }
 
-        let mut expected_stride = elem_size;
-        for (dim, &stride) in self.shape.iter().zip(self.strides).rev() {
-            if *dim > 1 && stride != expected_stride {
-                return false;
+                let mut expected_stride = elem_size;
+                for (dim, &stride) in self.shape.iter().zip(self.strides).rev() {
+                    if *dim > 1 && stride != expected_stride {
+                        return false;
+                    }
+                    expected_stride *= *dim as isize;
+                }
+                true
             }
-            expected_stride *= *dim as isize;
         }
-        true
     }
 }
 
@@ -323,8 +352,17 @@ impl<T: ArrayElement> NdArrayView<T> for Vec<T> {
         1
     }
 
-    fn dim(&self, idx: usize) -> Option<usize> {
-        (idx == 0).then_some(self.len())
+    fn dim(&self, idx: usize) -> Result<usize, Error> {
+        if idx == 0 {
+            Ok(self.len())
+        } else {
+            Err(error::fmt!(
+                    ArrayViewError,
+                    "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
+                    idx,
+                    1
+                ))
+        }
     }
 
     fn as_slice(&self) -> Option<&[T]> {
@@ -333,10 +371,6 @@ impl<T: ArrayElement> NdArrayView<T> for Vec<T> {
 
     fn iter(&self) -> Self::Iter<'_> {
         self.as_slice().iter()
-    }
-
-    fn check_data_buf(&self) -> Result<usize, Error> {
-        Ok(self.len() * std::mem::size_of::<T>())
     }
 }
 
@@ -351,8 +385,17 @@ impl<T: ArrayElement, const N: usize> NdArrayView<T> for [T; N] {
         1
     }
 
-    fn dim(&self, idx: usize) -> Option<usize> {
-        (idx == 0).then_some(N)
+    fn dim(&self, idx: usize) -> Result<usize, Error> {
+        if idx == 0 {
+            Ok(N)
+        } else {
+            Err(error::fmt!(
+                    ArrayViewError,
+                    "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
+                    idx,
+                    1
+                ))
+        }
     }
 
     fn as_slice(&self) -> Option<&[T]> {
@@ -361,10 +404,6 @@ impl<T: ArrayElement, const N: usize> NdArrayView<T> for [T; N] {
 
     fn iter(&self) -> Self::Iter<'_> {
         self.as_slice().iter()
-    }
-
-    fn check_data_buf(&self) -> Result<usize, Error> {
-        Ok(N * std::mem::size_of::<T>())
     }
 }
 
@@ -380,8 +419,17 @@ impl<T: ArrayElement> NdArrayView<T> for &[T] {
         1
     }
 
-    fn dim(&self, idx: usize) -> Option<usize> {
-        (idx == 0).then_some(self.len())
+    fn dim(&self, idx: usize) -> Result<usize, Error> {
+        if idx == 0 {
+            Ok(self.len())
+        } else {
+            Err(error::fmt!(
+                    ArrayViewError,
+                    "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
+                    idx,
+                    1
+                ))
+        }
     }
 
     fn as_slice(&self) -> Option<&[T]> {
@@ -390,10 +438,6 @@ impl<T: ArrayElement> NdArrayView<T> for &[T] {
 
     fn iter(&self) -> Self::Iter<'_> {
         <[T]>::iter(self)
-    }
-
-    fn check_data_buf(&self) -> Result<usize, Error> {
-        Ok(std::mem::size_of_val(*self))
     }
 }
 
@@ -408,11 +452,22 @@ impl<T: ArrayElement> NdArrayView<T> for Vec<Vec<T>> {
         2
     }
 
-    fn dim(&self, idx: usize) -> Option<usize> {
+    fn dim(&self, idx: usize) -> Result<usize, Error> {
         match idx {
-            0 => Some(self.len()),
-            1 => self.first().map(|v| v.len()),
-            _ => None,
+            0 => Ok(self.len()),
+            1 => {
+                let dim1 = self.first().map_or(0, |v| v.len());
+                if self.as_slice().iter().any(|v2| v2.len() != dim1) {
+                    return Err(error::fmt!(ArrayViewError, "Irregular array shape"));
+                }
+                Ok(dim1)
+            }
+            _ => Err(error::fmt!(
+                    ArrayViewError,
+                    "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
+                    idx,
+                    2
+                )),
         }
     }
 
@@ -422,14 +477,6 @@ impl<T: ArrayElement> NdArrayView<T> for Vec<Vec<T>> {
 
     fn iter(&self) -> Self::Iter<'_> {
         self.as_slice().iter().flatten()
-    }
-
-    fn check_data_buf(&self) -> Result<usize, Error> {
-        let row_len = self.first().map_or(0, |v| v.len());
-        if self.as_slice().iter().any(|v| v.len() != row_len) {
-            return Err(error::fmt!(ArrayViewError, "Irregular array shape"));
-        }
-        Ok(self.len() * row_len * std::mem::size_of::<T>())
     }
 }
 
@@ -444,11 +491,16 @@ impl<T: ArrayElement, const M: usize, const N: usize> NdArrayView<T> for [[T; M]
         2
     }
 
-    fn dim(&self, idx: usize) -> Option<usize> {
+    fn dim(&self, idx: usize) -> Result<usize, Error> {
         match idx {
-            0 => Some(N),
-            1 => Some(M),
-            _ => None,
+            0 => Ok(N),
+            1 => Ok(M),
+            _ => Err(error::fmt!(
+                    ArrayViewError,
+                    "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
+                    idx,
+                    2
+                )),
         }
     }
 
@@ -458,10 +510,6 @@ impl<T: ArrayElement, const M: usize, const N: usize> NdArrayView<T> for [[T; M]
 
     fn iter(&self) -> Self::Iter<'_> {
         self.as_slice().iter().flatten()
-    }
-
-    fn check_data_buf(&self) -> Result<usize, Error> {
-        Ok(N * M * std::mem::size_of::<T>())
     }
 }
 
@@ -477,11 +525,16 @@ impl<T: ArrayElement, const M: usize> NdArrayView<T> for &[[T; M]] {
         2
     }
 
-    fn dim(&self, idx: usize) -> Option<usize> {
+    fn dim(&self, idx: usize) -> Result<usize, Error> {
         match idx {
-            0 => Some(self.len()),
-            1 => Some(M),
-            _ => None,
+            0 => Ok(self.len()),
+            1 => Ok(M),
+            _ => Err(error::fmt!(
+                    ArrayViewError,
+                    "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
+                    idx,
+                    2
+                )),
         }
     }
 
@@ -491,10 +544,6 @@ impl<T: ArrayElement, const M: usize> NdArrayView<T> for &[[T; M]] {
 
     fn iter(&self) -> Self::Iter<'_> {
         <[[T; M]]>::iter(self).flatten()
-    }
-
-    fn check_data_buf(&self) -> Result<usize, Error> {
-        Ok(self.len() * M * std::mem::size_of::<T>())
     }
 }
 
@@ -509,12 +558,38 @@ impl<T: ArrayElement> NdArrayView<T> for Vec<Vec<Vec<T>>> {
         3
     }
 
-    fn dim(&self, idx: usize) -> Option<usize> {
+    fn dim(&self, idx: usize) -> Result<usize, Error> {
         match idx {
-            0 => Some(self.len()),
-            1 => self.first().map(|v| v.len()),
-            2 => self.first().and_then(|v2| v2.first()).map(|v3| v3.len()),
-            _ => None,
+            0 => Ok(self.len()),
+            1 => {
+                let dim1 = self.first().map_or(0, |v| v.len());
+                if self.as_slice().iter().any(|v2| v2.len() != dim1) {
+                    return Err(error::fmt!(ArrayViewError, "Irregular array shape"));
+                }
+                Ok(dim1)
+            }
+            2 => {
+                let dim2 = self
+                    .first()
+                    .and_then(|v2| v2.first())
+                    .map_or(0, |v3| v3.len());
+
+                if self
+                    .as_slice()
+                    .iter()
+                    .flat_map(|v2| v2.as_slice().iter())
+                    .any(|v3| v3.len() != dim2)
+                {
+                    return Err(error::fmt!(ArrayViewError, "Irregular array shape"));
+                }
+                Ok(dim2)
+            }
+            _ => Err(error::fmt!(
+                    ArrayViewError,
+                    "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
+                    idx,
+                    3
+                )),
         }
     }
 
@@ -524,30 +599,6 @@ impl<T: ArrayElement> NdArrayView<T> for Vec<Vec<Vec<T>>> {
 
     fn iter(&self) -> Self::Iter<'_> {
         self.as_slice().iter().flatten().flatten()
-    }
-
-    fn check_data_buf(&self) -> Result<usize, Error> {
-        let dim1 = self.first().map_or(0, |v| v.len());
-
-        if self.as_slice().iter().any(|v2| v2.len() != dim1) {
-            return Err(error::fmt!(ArrayViewError, "Irregular array shape"));
-        }
-
-        let dim2 = self
-            .first()
-            .and_then(|v2| v2.first())
-            .map_or(0, |v3| v3.len());
-
-        if self
-            .as_slice()
-            .iter()
-            .flat_map(|v2| v2.as_slice().iter())
-            .any(|v3| v3.len() != dim2)
-        {
-            return Err(error::fmt!(ArrayViewError, "Irregular array shape"));
-        }
-
-        Ok(self.len() * dim1 * dim2 * std::mem::size_of::<T>())
     }
 }
 
@@ -564,12 +615,17 @@ impl<T: ArrayElement, const M: usize, const N: usize, const L: usize> NdArrayVie
         3
     }
 
-    fn dim(&self, idx: usize) -> Option<usize> {
+    fn dim(&self, idx: usize) -> Result<usize, Error> {
         match idx {
-            0 => Some(L),
-            1 => Some(N),
-            2 => Some(M),
-            _ => None,
+            0 => Ok(L),
+            1 => Ok(N),
+            2 => Ok(M),
+            _ => Err(error::fmt!(
+                    ArrayViewError,
+                    "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
+                    idx,
+                    3
+                )),
         }
     }
 
@@ -579,10 +635,6 @@ impl<T: ArrayElement, const M: usize, const N: usize, const L: usize> NdArrayVie
 
     fn iter(&self) -> Self::Iter<'_> {
         self.as_slice().iter().flatten().flatten()
-    }
-
-    fn check_data_buf(&self) -> Result<usize, Error> {
-        Ok(L * N * M * std::mem::size_of::<T>())
     }
 }
 
@@ -597,12 +649,17 @@ impl<T: ArrayElement, const M: usize, const N: usize> NdArrayView<T> for &[[[T; 
         3
     }
 
-    fn dim(&self, idx: usize) -> Option<usize> {
+    fn dim(&self, idx: usize) -> Result<usize, Error> {
         match idx {
-            0 => Some(self.len()),
-            1 => Some(N),
-            2 => Some(M),
-            _ => None,
+            0 => Ok(self.len()),
+            1 => Ok(N),
+            2 => Ok(M),
+            _ => Err(error::fmt!(
+                    ArrayViewError,
+                    "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
+                    idx,
+                    3
+                )),
         }
     }
 
@@ -612,10 +669,6 @@ impl<T: ArrayElement, const M: usize, const N: usize> NdArrayView<T> for &[[[T; 
 
     fn iter(&self) -> Self::Iter<'_> {
         <[[[T; M]; N]]>::iter(self).flatten().flatten()
-    }
-
-    fn check_data_buf(&self) -> Result<usize, Error> {
-        Ok(self.len() * N * M * std::mem::size_of::<T>())
     }
 }
 
@@ -641,12 +694,17 @@ where
         self.ndim()
     }
 
-    fn dim(&self, index: usize) -> Option<usize> {
+    fn dim(&self, index: usize) -> Result<usize, Error> {
         let len = self.ndim();
         if index < len {
-            Some(self.len_of(Axis(index)))
+            Ok(self.len_of(Axis(index)))
         } else {
-            None
+            Err(error::fmt!(
+                    ArrayViewError,
+                    "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
+                    index,
+                    3
+                ))
         }
     }
 
@@ -656,10 +714,6 @@ where
 
     fn as_slice(&self) -> Option<&[T]> {
         self.as_slice()
-    }
-
-    fn check_data_buf(&self) -> Result<usize, Error> {
-        Ok(self.len() * size_of::<T>())
     }
 }
 

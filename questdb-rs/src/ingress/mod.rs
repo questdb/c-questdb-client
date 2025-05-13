@@ -58,7 +58,7 @@ use ring::{
 };
 
 /// Defines the maximum allowed dimensions for array data in binary serialization protocols.
-pub const MAX_DIMS: usize = 32;
+pub const MAX_ARRAY_DIMS: usize = 32;
 
 /// Line Protocol Version supported by current client.
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -1071,7 +1071,7 @@ impl Buffer {
 
     /// Record a multidimensional array value for the given column.
     ///
-    /// Supports arrays with up to [`MAX_DIMS`] dimensions. The array elements must
+    /// Supports arrays with up to [`MAX_ARRAY_DIMS`] dimensions. The array elements must
     /// implement [`ArrayElement`] trait which provides type-to-[`ElemDataType`] mapping.
     ///
     /// # Examples
@@ -1118,7 +1118,7 @@ impl Buffer {
     /// # Errors
     ///
     /// Returns [`Error`] if:
-    /// - Array dimensions exceed [`MAX_DIMS`]
+    /// - Array dimensions exceed [`MAX_ARRAY_DIMS`]
     /// - Failed to get dimension sizes
     /// - Column name validation fails
     #[allow(private_bounds)]
@@ -1143,34 +1143,18 @@ impl Buffer {
             ));
         }
 
-        self.write_column_key(name)?;
-
         // check dimension less equal than max dims
-        if MAX_DIMS < ndim {
+        if MAX_ARRAY_DIMS < ndim {
             return Err(error::fmt!(
                 ArrayHasTooManyDims,
                 "Array dimension mismatch: expected at most {} dimensions, but got {}",
-                MAX_DIMS,
+                MAX_ARRAY_DIMS,
                 ndim
             ));
         }
 
-        // TODO: Remove `check_data_buf` this from the trait.
-        //       It's private impl details that can be coded generically
-        let array_buf_size = view.check_data_buf()?;
-        if array_buf_size > i32::MAX as usize {
-            // TODO: We should probably agree on a significantly
-            //       _smaller_ limit here, since there's no way
-            //       we've ever tested anything that big.
-            //       My gut feeling is that the maximum array buffer should be
-            //       in the order of 100MB or so.
-            return Err(error::fmt!(
-                ArrayViewError,
-                "Array buffer size too big: {}",
-                array_buf_size
-            ));
-        }
-
+        let array_buf_size = get_and_check_array_bytes_size(view)?;
+        self.write_column_key(name)?;
         // binary format flag '='
         self.output.push(b'=');
         // binary format entity type
@@ -1184,19 +1168,16 @@ impl Buffer {
         self.output.reserve(dim_header_size + array_buf_size);
 
         for i in 0..ndim {
-            let dim = view.dim(i).ok_or_else(|| {
-                error::fmt!(
+            let dim = view.dim(i)?;
+            if dim > MAX_ARRAY_DIM_LEN {
+                return Err(error::fmt!(
                     ArrayViewError,
-                    "Cannot get correct dimensions for dim {}",
-                    i
-                )
-            })?;
-
-            // TODO: check that the dimension is not past
-            // the maximum size that the java impl will accept.
-            // I seem to remember that it's 2^28-1 or something like that.
-            // Must check Java impl.
-
+                    "dimension length out of range: dim {}, dim length {}, max length {}",
+                    i,
+                    dim,
+                    MAX_ARRAY_DIM_LEN
+                ));
+            }
             // ndarr shapes
             self.output
                 .extend_from_slice((dim as u32).to_le_bytes().as_slice());
@@ -1258,16 +1239,16 @@ impl Buffer {
         self.write_column_key(name)?;
 
         // check dimension less equal than max dims
-        if MAX_DIMS < view.ndim() {
+        if MAX_ARRAY_DIMS < view.ndim() {
             return Err(error::fmt!(
                 ArrayHasTooManyDims,
                 "Array dimension mismatch: expected at most {} dimensions, but got {}",
-                MAX_DIMS,
+                MAX_ARRAY_DIMS,
                 view.ndim()
             ));
         }
 
-        let reserve_size = view.check_data_buf()?;
+        let reserve_size = get_and_check_array_bytes_size(view)?;
         // binary format flag '='
         self.output.push(b'=');
         // binary format entity type
@@ -3156,6 +3137,7 @@ mod timestamp;
 #[cfg(feature = "ilp-over-http")]
 mod http;
 
+use crate::ingress::ndarr::{get_and_check_array_bytes_size, MAX_ARRAY_DIM_LEN};
 #[cfg(feature = "ilp-over-http")]
 use http::*;
 
