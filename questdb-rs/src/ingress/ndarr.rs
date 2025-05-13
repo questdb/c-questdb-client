@@ -30,45 +30,71 @@ where
 const MAX_ARRAY_BUFFER_SIZE: usize = i32::MAX as usize;
 pub(crate) const MAX_ARRAY_DIM_LEN: usize = 0x0FFF_FFFF; // 1 << 28 - 1
 
-pub(crate) fn write_array_data<W: std::io::Write, A: NdArrayView<T>, T>(
+pub(crate) fn write_array_data<A: NdArrayView<T>, T>(
     array: &A,
-    writer: &mut W,
-) -> std::io::Result<()>
+    buf: &mut [u8],
+    expect_size: usize,
+) -> Result<(), Error>
 where
     T: ArrayElement,
 {
     // First optimization path: write contiguous memory directly
+    // When working with contiguous layout. Benchmark shows `copy_from_slice` has better performance than
+    // `std::ptr::copy_nonoverlapping` on both arm(Macos) and x86(Linux) platform.
+    // This may because `copy_from_slice` benefits more from compiler.
     if let Some(contiguous) = array.as_slice() {
         let bytes = unsafe {
             slice::from_raw_parts(contiguous.as_ptr() as *const u8, size_of_val(contiguous))
         };
-        return writer.write_all(bytes);
+
+        if bytes.len() != expect_size {
+            return Err(error::fmt!(
+                ArrayWriteToBufferError,
+                "Array write buffer length mismatch (actual: {}, expected: {})",
+                expect_size,
+                bytes.len()
+            ));
+        }
+
+        if buf.len() < bytes.len() {
+            return Err(error::fmt!(
+                ArrayWriteToBufferError,
+                "Buffer capacity {} < required {}",
+                buf.len(),
+                bytes.len()
+            ));
+        }
+
+        buf[..bytes.len()].copy_from_slice(bytes);
+        return Ok(());
     }
 
     // Fallback path: non-contiguous memory handling
+    // For non-contiguous memory layouts, direct raw pointer operations are preferred.
     let elem_size = size_of::<T>();
-    let mut io_slices = Vec::new();
-    for element in array.iter() {
-        let bytes = unsafe { slice::from_raw_parts(element as *const T as *const _, elem_size) };
-        io_slices.push(std::io::IoSlice::new(bytes));
-    }
-
-    let mut io_slices: &mut [IoSlice<'_>] = io_slices.as_mut_slice();
-    IoSlice::advance_slices(&mut io_slices, 0);
-
-    while !io_slices.is_empty() {
-        let written = writer.write_vectored(io_slices)?;
-        if written == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WriteZero,
-                "Failed to write all bytes",
-            ));
+    let mut total_len = 0;
+    for (i, &element) in array.iter().enumerate() {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                &element as *const T as *const u8,
+                buf.as_mut_ptr().add(i * elem_size),
+                elem_size,
+            )
         }
-        IoSlice::advance_slices(&mut io_slices, written);
+        total_len += elem_size;
+    }
+    if total_len != expect_size {
+        return Err(error::fmt!(
+            ArrayWriteToBufferError,
+            "Array write buffer length mismatch (actual: {}, expected: {})",
+            total_len,
+            expect_size
+        ));
     }
     Ok(())
 }
 
+#[cfg(feature = "benchmark")]
 pub(crate) fn write_array_data_use_raw_buffer<A: NdArrayView<T>, T>(buf: &mut [u8], array: &A)
 where
     T: ArrayElement,
@@ -138,6 +164,10 @@ impl ArrayElementSealed for f64 {
 }
 
 /// A view into a multi-dimensional array with custom memory strides.
+// TODO: We are currently evaluating whether to use StrideArrayView or ndarray's view.
+//       Current benchmarks show that StrideArrayView's iter implementation underperforms(2x)
+//       compared to ndarray's view. If we proceed with StrideArrayView, we need to
+//       optimize the iter traversal pattern
 #[derive(Debug)]
 pub struct StrideArrayView<'a, T> {
     dims: usize,
@@ -175,10 +205,9 @@ where
 
     fn as_slice(&self) -> Option<&[T]> {
         unsafe {
-            self.is_c_major().then_some(self.data.map(|data| slice::from_raw_parts(
-                    data.as_ptr() as *const T,
-                    data.len() / size_of::<T>(),
-            ))?)
+            self.is_c_major().then_some(self.data.map(|data| {
+                slice::from_raw_parts(data.as_ptr() as *const T, data.len() / size_of::<T>())
+            })?)
         }
     }
 
@@ -673,7 +702,6 @@ impl<T: ArrayElement, const M: usize, const N: usize> NdArrayView<T> for &[[[T; 
 use crate::{error, Error};
 #[cfg(feature = "ndarray")]
 use ndarray::{ArrayView, Axis, Dimension};
-use std::io::IoSlice;
 use std::slice;
 
 #[cfg(feature = "ndarray")]

@@ -77,8 +77,8 @@ fn test_stride_array_view() -> TestResult {
     assert_eq!(array.dim(1), Ok(3));
     assert!(array.dim(2).is_err());
     assert!(array.as_slice().is_some());
-    let mut buf = vec![];
-    write_array_data(&array, &mut buf).unwrap();
+    let mut buf = vec![0u8; 48];
+    write_array_data(&array, &mut buf, 48).unwrap();
     let expected = to_bytes(&test_data);
     assert_eq!(buf, expected);
     Ok(())
@@ -106,8 +106,8 @@ fn test_strided_non_contiguous() -> TestResult {
     assert_eq!(array_view.dim(1), Ok(2));
     assert!(array_view.dim(2).is_err());
     assert!(array_view.as_slice().is_none());
-    let mut buffer = Vec::new();
-    write_array_data(&array_view, &mut buffer)?;
+    let mut buffer = vec![0u8; 48];
+    write_array_data(&array_view, &mut buffer, 48)?;
 
     let expected_data = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
     let expected_bytes = unsafe {
@@ -137,8 +137,8 @@ fn test_negative_strides() -> TestResult {
     assert!(view.as_slice().is_none());
     let expected_data = vec![7.0, 8.0, 9.0, 4.0, 5.0, 6.0, 1.0, 2.0, 3.0];
     assert_eq!(collected, expected_data);
-    let mut buffer = Vec::new();
-    write_array_data(&view, &mut buffer)?;
+    let mut buffer = vec![0u8; 72];
+    write_array_data(&view, &mut buffer, 72)?;
     let expected_bytes = unsafe {
         std::slice::from_raw_parts(
             expected_data.as_ptr() as *const u8,
@@ -163,15 +163,15 @@ fn test_basic_edge_cases() -> TestResult {
     let single_data = [42.0];
     let single_view: StrideArrayView<'_, f64> = unsafe {
         StrideArrayView::new(
-            2,
-            [1, 1].as_ptr(),
-            [elem_size, elem_size].as_ptr(),
+            1,
+            [1].as_ptr(),
+            [elem_size].as_ptr(),
             single_data.as_ptr() as *const u8,
             elem_size as usize,
         )
     }?;
-    let mut buf = vec![];
-    write_array_data(&single_view, &mut buf).unwrap();
+    let mut buf = vec![0u8; 8];
+    write_array_data(&single_view, &mut buf, 8).unwrap();
     assert_eq!(buf, 42.0f64.to_ne_bytes());
     Ok(())
 }
@@ -994,7 +994,7 @@ fn test_1d_contiguous_ndarray_buffer() -> TestResult {
     let array = arr1(&[1.0, 2.0, 3.0, 4.0]);
     let view = array.view();
     let mut buf = vec![0u8; 4 * size_of::<f64>()];
-    write_array_data(&view, &mut &mut buf[0..])?;
+    write_array_data(&view, &mut buf[0..], 32)?;
     let expected: Vec<u8> = array
         .iter()
         .flat_map(|&x| x.to_ne_bytes().to_vec())
@@ -1010,7 +1010,7 @@ fn test_2d_non_contiguous_ndarray_buffer() -> TestResult {
     let transposed = array.view().reversed_axes();
     assert!(!transposed.is_standard_layout());
     let mut buf = vec![0u8; 4 * size_of::<f64>()];
-    write_array_data(&transposed, &mut &mut buf[0..])?;
+    write_array_data(&transposed, &mut buf[0..], 32)?;
     let expected = [1.0f64, 3.0, 2.0, 4.0]
         .iter()
         .flat_map(|&x| x.to_ne_bytes())
@@ -1031,7 +1031,7 @@ fn test_strided_ndarray_layout() -> TestResult {
     let strided_view = array.slice(s![1..;2, 1..;2]);
     assert_eq!(strided_view.dim(), (2, 2));
     let mut buf = vec![0u8; 4 * size_of::<f64>()];
-    write_array_data(&strided_view, &mut &mut buf[0..])?;
+    write_array_data(&strided_view, &mut buf[0..], 32)?;
 
     // expect：6.0, 8.0, 14.0, 16.0
     let expected = [6.0f64, 8.0, 14.0, 16.0]

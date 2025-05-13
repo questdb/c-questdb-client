@@ -38,7 +38,7 @@ use socket2::{Domain, Protocol as SockProtocol, SockAddr, Socket, Type};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fmt::{Debug, Display, Formatter, Write};
-use std::io::{self, BufRead, BufReader, Cursor, ErrorKind, Write as IoWrite};
+use std::io::{self, BufRead, BufReader, ErrorKind, Write as IoWrite};
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::slice::from_raw_parts_mut;
@@ -1186,48 +1186,14 @@ impl Buffer {
         let index = self.output.len();
         let writeable =
             unsafe { from_raw_parts_mut(self.output.as_mut_ptr().add(index), array_buf_size) };
-        let mut cursor = Cursor::new(writeable);
-
-        // TODO: The next section needs a bit of a rewrite.
-        //       It also needs clear comments that explain the design decisions.
-        //
-        //       I'd be expecting two code paths here:
-        //          1. The array is row-major contiguous
-        //          2. The data needs to be written out via the strides.
-        //
-        //       The code here seems to do something a bit different and
-        //       is worth explaining.
-        //       I see two code paths that I honestly don't understand,
-        //       the `ndarr::write_array_data` and the `ndarr::write_array_data_use_raw_buffer`
-        //       functions both seem to handle both cases (why?) and then seem
-        //       to construct a vectored IoSlice buffer (why??) before writing
-        //       the strided data out.
 
         // ndarr data
-        if view.as_slice().is_some() {
-            if let Err(e) = ndarr::write_array_data(view, &mut cursor) {
-                return Err(error::fmt!(
-                    ArrayWriteToBufferError,
-                    "Can not write row major to writer: {}",
-                    e
-                ));
-            }
-            if cursor.position() != (array_buf_size as u64) {
-                return Err(error::fmt!(
-                    ArrayWriteToBufferError,
-                    "Array write buffer length mismatch (actual: {}, expected: {})",
-                    cursor.position(),
-                    array_buf_size
-                ));
-            }
-            unsafe { self.output.set_len(array_buf_size + index) }
-        } else {
-            unsafe { self.output.set_len(array_buf_size + index) }
-            ndarr::write_array_data_use_raw_buffer(&mut self.output[index..], view);
-        }
+        ndarr::write_array_data(view, writeable, array_buf_size)?;
+        unsafe { self.output.set_len(array_buf_size + index) }
         Ok(self)
     }
 
+    #[allow(private_bounds)]
     #[cfg(feature = "benchmark")]
     pub fn column_arr_use_raw_buffer<'a, N, T, D>(&mut self, name: N, view: &T) -> Result<&mut Self>
     where

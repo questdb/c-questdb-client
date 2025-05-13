@@ -176,7 +176,7 @@ fn test_array_f64_from_ndarray() -> TestResult {
     ]
     .concat();
     let mut array_data2d = vec![0u8; 4 * size_of::<f64>()];
-    write_array_data(&array_2d.view(), &mut &mut array_data2d[0..])?;
+    write_array_data(&array_2d.view(), &mut &mut array_data2d[0..], 32)?;
 
     let array_header3d = &[
         &[b'='][..],
@@ -189,7 +189,11 @@ fn test_array_f64_from_ndarray() -> TestResult {
     ]
     .concat();
     let mut array_data3d = vec![0u8; 24 * size_of::<f64>()];
-    write_array_data(&array_3d.view(), &mut &mut array_data3d[0..])?;
+    write_array_data(
+        &array_3d.view(),
+        &mut &mut array_data3d[0..],
+        24 * size_of::<f64>(),
+    )?;
 
     let exp = &[
         "my_table,device=A001 ".as_bytes(),
