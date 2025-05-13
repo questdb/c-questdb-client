@@ -175,12 +175,10 @@ where
 
     fn as_slice(&self) -> Option<&[T]> {
         unsafe {
-            self.is_c_major().then_some(self.data.and_then(|data| {
-                Some(slice::from_raw_parts(
+            self.is_c_major().then_some(self.data.map(|data| slice::from_raw_parts(
                     data.as_ptr() as *const T,
                     data.len() / size_of::<T>(),
-                ))
-            })?)
+            ))?)
         }
     }
 

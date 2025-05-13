@@ -1233,7 +1233,7 @@ impl Buffer {
     where
         N: TryInto<ColumnName<'a>>,
         T: NdArrayView<D>,
-        D: ArrayElement,
+        D: ArrayElement + ArrayElementSealed,
         Error: From<N::Error>,
     {
         self.write_column_key(name)?;
@@ -1254,18 +1254,12 @@ impl Buffer {
         // binary format entity type
         self.output.push(ARRAY_BINARY_FORMAT_TYPE);
         // ndarr datatype
-        self.output.push(D::elem_type().into());
+        self.output.push(D::type_tag());
         // ndarr dims
         self.output.push(view.ndim() as u8);
 
         for i in 0..view.ndim() {
-            let d = view.dim(i).ok_or_else(|| {
-                error::fmt!(
-                    ArrayViewError,
-                    "Can not get correct dimensions for dim {}",
-                    i
-                )
-            })?;
+            let d = view.dim(i)?;
             // ndarr shapes
             self.output
                 .extend_from_slice((d as i32).to_le_bytes().as_slice());
