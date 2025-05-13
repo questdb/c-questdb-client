@@ -897,8 +897,20 @@ pub unsafe extern "C" fn line_sender_buffer_column_f64_arr(
 ) -> bool {
     let buffer = unwrap_buffer_mut(buffer);
     let name = name.as_name();
-    let view =
-        ingress::StrideArrayView::<f64>::new(rank, shape, strides, data_buffer, data_buffer_len);
+    let view = match ingress::StrideArrayView::<f64>::new(
+        rank,
+        shape,
+        strides,
+        data_buffer,
+        data_buffer_len,
+    ) {
+        Ok(value) => value,
+        Err(err) => {
+            let err_ptr = Box::into_raw(Box::new(line_sender_error(err)));
+            *err_out = err_ptr;
+            return false;
+        }
+    };
     bubble_err_to_c!(
         err_out,
         buffer.column_arr::<ColumnName<'_>, ingress::StrideArrayView<'_, f64>, f64>(name, &view)
