@@ -1334,7 +1334,7 @@ mod danger {
 
         #[cfg(feature = "ring-crypto")]
         fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-            rustls::crypto::aws_lc_rs::default_provider()
+            rustls::crypto::ring::default_provider()
                 .signature_verification_algorithms
                 .supported_schemes()
         }
