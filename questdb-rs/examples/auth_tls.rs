@@ -1,6 +1,6 @@
 use chrono::{TimeZone, Utc};
 use questdb::{
-    ingress::{Buffer, Sender, TimestampNanos},
+    ingress::{Sender, TimestampNanos},
     Result,
 };
 
@@ -17,7 +17,7 @@ fn main() -> Result<()> {
         ),
         host, port
     ))?;
-    let mut buffer = Buffer::new();
+    let mut buffer = sender.new_buffer();
     let designated_timestamp =
         TimestampNanos::from_datetime(Utc.with_ymd_and_hms(1997, 7, 4, 4, 56, 55).unwrap())?;
     buffer

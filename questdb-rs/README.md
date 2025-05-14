@@ -30,7 +30,7 @@ use questdb::{
 
 fn main() -> Result<()> {
    let mut sender = Sender::from_conf("http::addr=localhost:9000;")?;
-   let mut buffer = Buffer::new();
+  let mut buffer = sender.new_buffer();
    buffer
        .table("trades")?
        .symbol("symbol", "ETH-USD")?

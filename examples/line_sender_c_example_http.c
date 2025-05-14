@@ -29,8 +29,8 @@ static bool example(const char* host, const char* port)
 
     buffer = line_sender_buffer_new();
     line_sender_buffer_reserve(buffer, 64 * 1024);  // 64KB buffer initial size.
-    if (!line_sender_buffer_set_line_protocol_version(
-        buffer, line_sender_default_line_protocol_version(sender), &err))
+    if (!line_sender_buffer_set_protocol_version(
+        buffer, line_sender_default_protocol_version(sender), &err))
         goto on_error;
 
     line_sender_table_name table_name = QDB_TABLE_NAME_LITERAL("c_trades_http");

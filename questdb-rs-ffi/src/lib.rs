@@ -147,7 +147,7 @@ pub enum line_sender_error_code {
     line_sender_error_array_view_write_to_buffer_error,
 
     /// Line sender protocol version error.
-    line_sender_error_line_protocol_version_error,
+    line_sender_error_protocol_version_error,
 }
 
 impl From<ErrorCode> for line_sender_error_code {
@@ -181,8 +181,8 @@ impl From<ErrorCode> for line_sender_error_code {
             ErrorCode::ArrayWriteToBufferError => {
                 line_sender_error_code::line_sender_error_array_view_write_to_buffer_error
             }
-            ErrorCode::LineProtocolVersionError => {
-                line_sender_error_code::line_sender_error_line_protocol_version_error
+            ErrorCode::ProtocolVersionError => {
+                line_sender_error_code::line_sender_error_protocol_version_error
             }
         }
     }
@@ -230,7 +230,7 @@ impl From<line_sender_protocol> for Protocol {
 /// The version of Line Protocol used for [`Buffer`].
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
-pub enum LineProtocolVersion {
+pub enum ProtocolVersion {
     /// Version 1 of Line Protocol.
     /// Uses text format serialization for f64.
     V1 = 1,
@@ -240,20 +240,20 @@ pub enum LineProtocolVersion {
     V2 = 2,
 }
 
-impl From<LineProtocolVersion> for ingress::LineProtocolVersion {
-    fn from(version: LineProtocolVersion) -> Self {
+impl From<ProtocolVersion> for ingress::ProtocolVersion {
+    fn from(version: ProtocolVersion) -> Self {
         match version {
-            LineProtocolVersion::V1 => ingress::LineProtocolVersion::V1,
-            LineProtocolVersion::V2 => ingress::LineProtocolVersion::V2,
+            ProtocolVersion::V1 => ingress::ProtocolVersion::V1,
+            ProtocolVersion::V2 => ingress::ProtocolVersion::V2,
         }
     }
 }
 
-impl From<ingress::LineProtocolVersion> for LineProtocolVersion {
-    fn from(version: ingress::LineProtocolVersion) -> Self {
+impl From<ingress::ProtocolVersion> for ProtocolVersion {
+    fn from(version: ingress::ProtocolVersion) -> Self {
         match version {
-            ingress::LineProtocolVersion::V1 => LineProtocolVersion::V1,
-            ingress::LineProtocolVersion::V2 => LineProtocolVersion::V2,
+            ingress::ProtocolVersion::V1 => ProtocolVersion::V1,
+            ingress::ProtocolVersion::V2 => ProtocolVersion::V2,
         }
     }
 }
@@ -599,8 +599,10 @@ pub struct line_sender_buffer(Buffer);
 /// Construct a `line_sender_buffer` with a `max_name_len` of `127`, which is the
 /// same as the QuestDB server default.
 #[no_mangle]
-pub unsafe extern "C" fn line_sender_buffer_new() -> *mut line_sender_buffer {
-    let buffer = Buffer::new();
+pub unsafe extern "C" fn line_sender_buffer_new(
+    version: ProtocolVersion,
+) -> *mut line_sender_buffer {
+    let buffer = Buffer::new(version.into());
     Box::into_raw(Box::new(line_sender_buffer(buffer)))
 }
 
@@ -612,20 +614,10 @@ pub unsafe extern "C" fn line_sender_buffer_new() -> *mut line_sender_buffer {
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_buffer_with_max_name_len(
     max_name_len: size_t,
+    version: ProtocolVersion,
 ) -> *mut line_sender_buffer {
-    let buffer = Buffer::with_max_name_len(max_name_len);
+    let buffer = Buffer::with_max_name_len(max_name_len, version.into());
     Box::into_raw(Box::new(line_sender_buffer(buffer)))
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_buffer_set_line_protocol_version(
-    buffer: *mut line_sender_buffer,
-    version: LineProtocolVersion,
-    err_out: *mut *mut line_sender_error,
-) -> bool {
-    let buffer = unwrap_buffer_mut(buffer);
-    bubble_err_to_c!(err_out, buffer.set_line_proto_version(version.into()));
-    true
 }
 
 /// Release the `line_sender_buffer` object.
@@ -1182,11 +1174,21 @@ pub unsafe extern "C" fn line_sender_opts_token_y(
 
 /// Disable the line protocol validation.
 #[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_disable_line_protocol_validation(
+pub unsafe extern "C" fn line_sender_opts_disable_protocol_validation(
     opts: *mut line_sender_opts,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    upd_opts!(opts, err_out, disable_line_protocol_validation)
+    upd_opts!(opts, err_out, disable_protocol_validation)
+}
+
+/// set the line protocol version.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_protocol_version(
+    opts: *mut line_sender_opts,
+    version: ProtocolVersion,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    upd_opts!(opts, err_out, protocol_version, version.into())
 }
 
 /// Configure how long to wait for messages from the QuestDB server during
@@ -1419,21 +1421,46 @@ unsafe fn unwrap_sender_mut<'a>(sender: *mut line_sender) -> &'a mut Sender {
 }
 
 /// Returns the client's recommended default line protocol version.
-/// Will be used to [`line_sender_buffer_set_line_protocol_version`]
 ///
 /// The version selection follows these rules:
-/// 1. **TCP/TCPS Protocol**: Always returns [`LineProtocolVersion::V2`]
+/// 1. **TCP/TCPS Protocol**: Always returns [`ProtocolVersion::V2`]
 /// 2. **HTTP/HTTPS Protocol**:
-///    - If line protocol auto-detection is disabled [`line_sender_opts_disable_line_protocol_validation`], returns [`LineProtocolVersion::V2`]
+///    - If line protocol auto-detection is disabled [`line_sender_opts_disable_protocol_validation`], returns [`ProtocolVersion::V2`]
 ///    - If line protocol auto-detection is enabled:
 ///      - Uses the server's default version if supported by the client
 ///      - Otherwise uses the highest mutually supported version from the intersection
 ///        of client and server compatible versions
 #[no_mangle]
-pub unsafe extern "C" fn line_sender_default_line_protocol_version(
+pub unsafe extern "C" fn line_sender_default_protocol_version(
     sender: *const line_sender,
-) -> LineProtocolVersion {
-    unwrap_sender(sender).default_line_protocol_version().into()
+) -> ProtocolVersion {
+    unwrap_sender(sender).default_protocol_version().into()
+}
+
+/// Construct a `line_sender_buffer` with a `max_name_len` of `127` and sender's default protocol version
+/// which is the same as the QuestDB server default.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_new_buffer(
+    sender: *const line_sender,
+) -> *mut line_sender_buffer {
+    let sender = unwrap_sender(sender);
+    let buffer = sender.new_buffer();
+    Box::into_raw(Box::new(line_sender_buffer(buffer)))
+}
+
+/// Construct a `line_sender_buffer` with sender's default protocol version and a custom maximum
+/// length for table and column names. This should match the `cairo.max.file.name.length` setting of
+/// the QuestDB  server you're connecting to.
+/// If the server does not configure it, the default is `127`, and you can
+/// call `line_sender_new_buffer()` instead.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_new_buffer_with_max_name_len(
+    sender: *const line_sender,
+    max_name_len: size_t,
+) -> *mut line_sender_buffer {
+    let sender = unwrap_sender(sender);
+    let buffer = sender.new_buffer_with_max_name_len(max_name_len);
+    Box::into_raw(Box::new(line_sender_buffer(buffer)))
 }
 
 /// Tell whether the sender is no longer usable and must be closed.

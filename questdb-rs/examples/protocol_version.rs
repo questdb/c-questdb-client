@@ -1,13 +1,14 @@
 use ndarray::arr1;
-use questdb::ingress::LineProtocolVersion;
 use questdb::{
-    ingress::{Buffer, Sender, TimestampNanos},
+    ingress::{Sender, TimestampNanos},
     Result,
 };
 
 fn main() -> Result<()> {
-    let mut sender = Sender::from_conf("https::addr=localhost:9000;username=foo;password=bar;")?;
-    let mut buffer = Buffer::new().with_line_proto_version(LineProtocolVersion::V1)?;
+    let mut sender = Sender::from_conf(
+        "https::addr=localhost:9000;username=foo;password=bar;protocol_version=1;",
+    )?;
+    let mut buffer = sender.new_buffer();
     buffer
         .table("trades_ilp_v1")?
         .symbol("symbol", "ETH-USD")?
@@ -17,9 +18,10 @@ fn main() -> Result<()> {
         .at(TimestampNanos::now())?;
     sender.flush(&mut buffer)?;
 
-    let mut sender2 = Sender::from_conf("https::addr=localhost:9000;username=foo;password=bar;")?;
-    let mut buffer2 =
-        Buffer::new().with_line_proto_version(sender2.default_line_protocol_version())?;
+    let mut sender2 = Sender::from_conf(
+        "https::addr=localhost:9000;username=foo;password=bar;protocol_version=1;",
+    )?;
+    let mut buffer2 = sender.new_buffer();
     buffer2
         .table("trades_ilp_v2")?
         .symbol("symbol", "ETH-USD")?

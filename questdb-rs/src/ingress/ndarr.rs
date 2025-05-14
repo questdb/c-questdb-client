@@ -94,53 +94,25 @@ where
     Ok(())
 }
 
-#[cfg(feature = "benchmark")]
-pub(crate) fn write_array_data_use_raw_buffer<A: NdArrayView<T>, T>(buf: &mut [u8], array: &A)
-where
-    T: ArrayElement,
-{
-    // First optimization path: write contiguous memory directly
-    if let Some(contiguous) = array.as_slice() {
-        let byte_len = size_of_val(contiguous);
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                contiguous.as_ptr() as *const u8,
-                buf.as_mut_ptr(),
-                byte_len,
-            )
-        }
-    }
-
-    // Fallback path: non-contiguous memory handling
-    let elem_size = size_of::<T>();
-    for (i, &element) in array.iter().enumerate() {
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                &element as *const T as *const u8,
-                buf.as_mut_ptr().add(i * elem_size),
-                elem_size,
-            )
-        }
-    }
-}
-
 pub(crate) fn get_and_check_array_bytes_size<A: NdArrayView<T>, T>(
     array: &A,
 ) -> Result<usize, Error>
 where
     T: ArrayElement,
 {
-    (0..array.ndim())
-        .try_fold(std::mem::size_of::<T>(), |acc, i| Ok(acc * array.dim(i)?))
-        .and_then(|p| match p <= MAX_ARRAY_BUFFER_SIZE {
-            true => Ok(p),
-            false => Err(error::fmt!(
+    let mut size = std::mem::size_of::<T>();
+    for dim_index in 0..array.ndim() {
+        size *= array.dim(dim_index)?;
+        if size > MAX_ARRAY_BUFFER_SIZE {
+            return Err(error::fmt!(
                 ArrayViewError,
                 "Array buffer size too big: {}, maximum: {}",
-                p,
+                size,
                 MAX_ARRAY_BUFFER_SIZE
-            )),
-        })
+            ));
+        }
+    }
+    Ok(size)
 }
 
 /// Marker trait for valid array element types.

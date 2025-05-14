@@ -1,6 +1,8 @@
 #[cfg(feature = "ndarray")]
 use crate::ingress::MAX_ARRAY_DIMS;
-use crate::ingress::{Buffer, NdArrayView, StrideArrayView, ARRAY_BINARY_FORMAT_TYPE};
+use crate::ingress::{
+    Buffer, NdArrayView, ProtocolVersion, StrideArrayView, ARRAY_BINARY_FORMAT_TYPE,
+};
 use crate::tests::TestResult;
 use crate::{Error, ErrorCode};
 
@@ -190,7 +192,7 @@ fn test_buffer_basic_write() -> TestResult {
             test_data.len() * elem_size as usize,
         )
     }?;
-    let mut buffer = Buffer::new();
+    let mut buffer = Buffer::new(ProtocolVersion::V2);
     buffer.table("my_test")?;
     buffer.column_arr("temperature", &array_view)?;
     let data = buffer.as_bytes();
@@ -288,7 +290,7 @@ fn test_build_in_1d_array_normal() -> TestResult {
     let collected: Vec<_> = NdArrayView::iter(&arr).copied().collect();
     assert_eq!(collected, vec![1.0, 2.0, 3.0, 4.0]);
 
-    let mut buffer = Buffer::new();
+    let mut buffer = Buffer::new(ProtocolVersion::V2);
     buffer.table("my_test")?;
     buffer.column_arr("temperature", &arr)?;
     let data = buffer.as_bytes();
@@ -325,7 +327,7 @@ fn test_build_in_1d_array_empty() -> TestResult {
     assert_eq!(arr.dim(0), Ok(0));
     assert_eq!(NdArrayView::as_slice(&arr), Some(&[][..]));
 
-    let mut buffer = Buffer::new();
+    let mut buffer = Buffer::new(ProtocolVersion::V2);
     buffer.table("my_test")?;
     buffer.column_arr("temperature", &arr)?;
     let data = buffer.as_bytes();
@@ -354,7 +356,7 @@ fn test_build_in_1d_vec_normal() -> TestResult {
     let collected: Vec<_> = NdArrayView::iter(&vec).copied().collect();
     assert_eq!(collected, vec![5.0, 6.0, 7.0]);
 
-    let mut buffer = Buffer::new();
+    let mut buffer = Buffer::new(ProtocolVersion::V2);
     buffer.table("my_test")?;
     buffer.column_arr("temperature", &vec)?;
     let data = buffer.as_bytes();
@@ -390,7 +392,7 @@ fn test_build_in_1d_vec_empty() -> TestResult {
     assert_eq!(vec.dim(0), Ok(0));
     assert_eq!(NdArrayView::as_slice(&vec), Some(&[][..]));
 
-    let mut buffer = Buffer::new();
+    let mut buffer = Buffer::new(ProtocolVersion::V2);
     buffer.table("my_test")?;
     buffer.column_arr("temperature", &vec)?;
     let data = buffer.as_bytes();
@@ -418,7 +420,7 @@ fn test_build_in_1d_slice_normal() -> TestResult {
     assert_eq!(slice.dim(0), Ok(2));
     assert_eq!(NdArrayView::as_slice(&slice), Some(&[20.0, 30.0][..]));
 
-    let mut buffer = Buffer::new();
+    let mut buffer = Buffer::new(ProtocolVersion::V2);
     buffer.table("my_test")?;
     buffer.column_arr("temperature", &slice)?;
     let data = buffer.as_bytes();
@@ -450,7 +452,7 @@ fn test_build_in_1d_slice_empty() -> TestResult {
     assert_eq!(slice.dim(0), Ok(0));
     assert_eq!(NdArrayView::as_slice(&slice), Some(&[][..]));
 
-    let mut buffer = Buffer::new();
+    let mut buffer = Buffer::new(ProtocolVersion::V2);
     buffer.table("my_test")?;
     buffer.column_arr("temperature", &slice)?;
     let data = buffer.as_bytes();
@@ -483,7 +485,7 @@ fn test_build_in_2d_array_normal() -> TestResult {
     let collected: Vec<_> = NdArrayView::iter(&arr).copied().collect();
     assert_eq!(collected, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
 
-    let mut buffer = Buffer::new();
+    let mut buffer = Buffer::new(ProtocolVersion::V2);
     buffer.table("my_test")?;
     buffer.column_arr("2darray", &arr)?;
     let data = buffer.as_bytes();
@@ -526,7 +528,7 @@ fn test_build_in_2d_array_empty() -> TestResult {
     assert_eq!(arr.dim(1), Ok(0));
     assert_eq!(NdArrayView::as_slice(&arr), Some(&[][..]));
 
-    let mut buffer = Buffer::new();
+    let mut buffer = Buffer::new(ProtocolVersion::V2);
     buffer.table("my_test")?;
     buffer.column_arr("2darray", &arr)?;
     let data = buffer.as_bytes();
@@ -559,7 +561,7 @@ fn test_build_in_2d_vec_normal() -> TestResult {
     let collected: Vec<_> = NdArrayView::iter(&vec).copied().collect();
     assert_eq!(collected, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
 
-    let mut buffer = Buffer::new();
+    let mut buffer = Buffer::new(ProtocolVersion::V2);
     buffer.table("my_test")?;
     buffer.column_arr("2darray", &vec)?;
     let data = buffer.as_bytes();
@@ -597,7 +599,7 @@ fn test_build_in_2d_vec_normal() -> TestResult {
 #[test]
 fn test_build_in_2d_vec_irregular_shape() -> TestResult {
     let irregular_vec = vec![vec![1.0, 2.0], vec![3.0], vec![4.0, 5.0]];
-    let mut buffer = Buffer::new();
+    let mut buffer = Buffer::new(ProtocolVersion::V2);
     buffer.table("my_test")?;
     let result = buffer.column_arr("arr", &irregular_vec);
     let err = result.unwrap_err();
@@ -613,7 +615,7 @@ fn test_build_in_2d_vec_empty() -> TestResult {
     assert_eq!(vec.dim(0), Ok(3));
     assert_eq!(vec.dim(1), Ok(0));
 
-    let mut buffer = Buffer::new();
+    let mut buffer = Buffer::new(ProtocolVersion::V2);
     buffer.table("my_test")?;
     buffer.column_arr("2darray", &vec)?;
     let data = buffer.as_bytes();
@@ -648,7 +650,7 @@ fn test_build_in_2d_slice_normal() -> TestResult {
         Some(&[1.0, 2.0, 3.0, 4.0][..])
     );
 
-    let mut buffer = Buffer::new();
+    let mut buffer = Buffer::new(ProtocolVersion::V2);
     buffer.table("my_test")?;
     buffer.column_arr("2darray", &slice)?;
     let data = buffer.as_bytes();
@@ -690,7 +692,7 @@ fn test_build_in_2d_slice_empty() -> TestResult {
     assert_eq!(slice.dim(1), Ok(2));
     assert_eq!(NdArrayView::as_slice(&slice), Some(&[][..]));
 
-    let mut buffer = Buffer::new();
+    let mut buffer = Buffer::new(ProtocolVersion::V2);
     buffer.table("my_test")?;
     buffer.column_arr("2darray", &slice)?;
     let data = buffer.as_bytes();
@@ -727,7 +729,7 @@ fn test_build_in_3d_array_normal() -> TestResult {
     let collected: Vec<_> = NdArrayView::iter(&arr).copied().collect();
     assert_eq!(collected, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
 
-    let mut buffer = Buffer::new();
+    let mut buffer = Buffer::new(ProtocolVersion::V2);
     buffer.table("my_test")?;
     buffer.column_arr("3darray", &arr)?;
     let data = buffer.as_bytes();
@@ -773,7 +775,7 @@ fn test_build_in_3d_array_empty() -> TestResult {
     assert_eq!(arr.dim(2), Ok(2));
     assert_eq!(NdArrayView::as_slice(&arr), Some(&[][..]));
 
-    let mut buffer = Buffer::new();
+    let mut buffer = Buffer::new(ProtocolVersion::V2);
     buffer.table("my_test")?;
     buffer.column_arr("3darray", &arr)?;
     let data = buffer.as_bytes();
@@ -813,7 +815,7 @@ fn test_build_in_3d_vec_normal() -> TestResult {
         vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
     );
 
-    let mut buffer = Buffer::new();
+    let mut buffer = Buffer::new(ProtocolVersion::V2);
     buffer.table("my_test")?;
     buffer.column_arr("3darray", &vec)?;
     let data = buffer.as_bytes();
@@ -863,7 +865,7 @@ fn test_build_in_3d_vec_empty() -> TestResult {
     assert_eq!(vec.dim(2), Ok(0));
     assert!(NdArrayView::as_slice(&vec).is_none());
 
-    let mut buffer = Buffer::new();
+    let mut buffer = Buffer::new(ProtocolVersion::V2);
     buffer.table("my_test")?;
     buffer.column_arr("3darray", &vec)?;
     let data = buffer.as_bytes();
@@ -895,7 +897,7 @@ fn test_build_in_3d_vec_irregular_shape() -> TestResult {
         vec![vec![6.0, 7.0], vec![8.0, 9.0]],
     ];
 
-    let mut buffer = Buffer::new();
+    let mut buffer = Buffer::new(ProtocolVersion::V2);
     buffer.table("my_test")?;
     let result = buffer.column_arr("arr", &irregular1);
     let err = result.unwrap_err();
@@ -922,7 +924,7 @@ fn test_3d_slice_normal() -> TestResult {
         Some(&[1.0, 2.0, 3.0, 4.0][..])
     );
 
-    let mut buffer = Buffer::new();
+    let mut buffer = Buffer::new(ProtocolVersion::V2);
     buffer.table("my_test")?;
     buffer.column_arr("3darray", &slice)?;
     let data = buffer.as_bytes();
@@ -965,7 +967,7 @@ fn test_3d_slice_empty() -> TestResult {
     assert_eq!(slice.dim(2), Ok(2));
     assert_eq!(NdArrayView::as_slice(&slice), Some(&[][..]));
 
-    let mut buffer = Buffer::new();
+    let mut buffer = Buffer::new(ProtocolVersion::V2);
     buffer.table("my_test")?;
     buffer.column_arr("3darray", &slice)?;
     let data = buffer.as_bytes();
@@ -1069,7 +1071,7 @@ fn test_complex_ndarray_dimensions() {
 #[cfg(feature = "ndarray")]
 #[test]
 fn test_buffer_ndarray_write() -> TestResult {
-    let mut buffer = Buffer::new();
+    let mut buffer = Buffer::new(ProtocolVersion::V2);
     buffer.table("my_test")?;
     let array_2d = arr2(&[[1.1, 2.2], [3.3, 4.4]]);
     buffer.column_arr("temperature", &array_2d.view())?;
@@ -1097,7 +1099,7 @@ fn test_buffer_ndarray_write() -> TestResult {
 #[cfg(feature = "ndarray")]
 #[test]
 fn test_buffer_write_ndarray_max_dimensions() -> TestResult {
-    let mut buffer = Buffer::new();
+    let mut buffer = Buffer::new(ProtocolVersion::V2);
     buffer.table("nd_test")?;
     let shape: Vec<usize> = iter::repeat_n(1, MAX_ARRAY_DIMS).collect();
     let array = ArrayD::<f64>::zeros(shape.clone());

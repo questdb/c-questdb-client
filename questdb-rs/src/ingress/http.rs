@@ -17,7 +17,7 @@ use ureq::unversioned::transport::{
     Buffers, Connector, LazyBuffers, NextTimeout, Transport, TransportAdapter,
 };
 
-use crate::ingress::LineProtocolVersion;
+use crate::ingress::ProtocolVersion;
 use ureq::unversioned::*;
 use ureq::Error::*;
 use ureq::{http, Body};
@@ -59,7 +59,7 @@ pub(super) struct HttpConfig {
     pub(super) user_agent: String,
     pub(super) retry_timeout: ConfigSetting<Duration>,
     pub(super) request_timeout: ConfigSetting<Duration>,
-    pub(super) disable_line_proto_validation: ConfigSetting<bool>,
+    pub(super) disable_protocol_validation: ConfigSetting<bool>,
 }
 
 impl Default for HttpConfig {
@@ -69,7 +69,7 @@ impl Default for HttpConfig {
             user_agent: concat!("questdb/rust/", env!("CARGO_PKG_VERSION")).to_string(),
             retry_timeout: ConfigSetting::new_default(Duration::from_secs(10)),
             request_timeout: ConfigSetting::new_default(Duration::from_secs(10)),
-            disable_line_proto_validation: ConfigSetting::new_default(false),
+            disable_protocol_validation: ConfigSetting::new_default(false),
         }
     }
 }
@@ -406,12 +406,25 @@ pub(super) fn http_send_with_retries(
     retry_http_send(state, buf, request_timeout, retry_timeout, last_rep)
 }
 
-pub(super) fn get_line_protocol_version(
+/// Determines the server's default and all-supported protocol versions.
+///
+/// Returns a tuple containing:
+/// - `Option<Vec<ProtocolVersion>>`: List of all protocol versions supported by the server.
+///   - `Some(versions)`: When server explicitly provides supported versions (modern servers).
+///   - `None`: When server doesn't provide version info (legacy servers or 404 response).
+/// - `ProtocolVersion`: The server-recommended default protocol version
+///    (Here we introduce a new field, rather than use the implicit max value of supported versions).
+///
+/// When protocol version is auto-detection mode (no explicit set by use user),
+/// client will use the server's `default_version` as protocol version.
+/// When user explicitly specifies a `protocol_version`, client will
+/// validate against `support_versions`, Returns error if specified version not in supported list.
+pub(super) fn get_protocol_version(
     state: &HttpHandlerState,
     settings_url: &str,
-) -> Result<(Option<Vec<LineProtocolVersion>>, LineProtocolVersion), Error> {
+) -> Result<(Option<Vec<ProtocolVersion>>, ProtocolVersion), Error> {
     let mut support_versions: Option<Vec<_>> = None;
-    let mut default_version = LineProtocolVersion::V1;
+    let mut default_version = ProtocolVersion::V1;
 
     let response = match http_get_with_retries(
         state,
@@ -425,7 +438,7 @@ pub(super) fn get_line_protocol_version(
                     return Ok((support_versions, default_version));
                 }
                 return Err(fmt!(
-                    LineProtocolVersionError,
+                    ProtocolVersionError,
                     "Failed to detect server's line protocol version, settings url: {}, status code: {}.",
                     settings_url,
                     res.status()
@@ -441,7 +454,7 @@ pub(super) fn get_line_protocol_version(
                         return Ok((support_versions, default_version));
                     } else {
                         fmt!(
-                            LineProtocolVersionError,
+                            ProtocolVersionError,
                             "Failed to detect server's line protocol version, settings url: {}, err: {}.",
                             settings_url,
                             err
@@ -450,7 +463,7 @@ pub(super) fn get_line_protocol_version(
                 }
                 e => {
                     fmt!(
-                        LineProtocolVersionError,
+                        ProtocolVersionError,
                         "Failed to detect server's line protocol version, settings url: {}, err: {}.",
                         settings_url,
                         e
@@ -467,7 +480,7 @@ pub(super) fn get_line_protocol_version(
     if let Ok(msg) = body_content {
         let json: serde_json::Value = serde_json::from_str(&msg).map_err(|_| {
             error::fmt!(
-                LineProtocolVersionError,
+                ProtocolVersionError,
                 "Malformed server response, settings url: {}, err: response is not valid JSON.",
                 settings_url,
             )
@@ -479,8 +492,8 @@ pub(super) fn get_line_protocol_version(
             for value in values.iter() {
                 if let Some(v) = value.as_u64() {
                     match v {
-                        1 => versions.push(LineProtocolVersion::V1),
-                        2 => versions.push(LineProtocolVersion::V2),
+                        1 => versions.push(ProtocolVersion::V1),
+                        2 => versions.push(ProtocolVersion::V2),
                         _ => {}
                     }
                 }
@@ -491,23 +504,23 @@ pub(super) fn get_line_protocol_version(
         if let Some(serde_json::Value::Number(ref v)) = json.get("line.proto.default.version") {
             default_version = match v.as_u64() {
                 Some(vu64) => match vu64 {
-                    1 => LineProtocolVersion::V1,
-                    2 => LineProtocolVersion::V2,
+                    1 => ProtocolVersion::V1,
+                    2 => ProtocolVersion::V2,
                     _ => {
                         if let Some(ref versions) = support_versions {
-                            if versions.contains(&LineProtocolVersion::V2) {
-                                LineProtocolVersion::V2
-                            } else if versions.contains(&LineProtocolVersion::V1) {
-                                LineProtocolVersion::V1
+                            if versions.contains(&ProtocolVersion::V2) {
+                                ProtocolVersion::V2
+                            } else if versions.contains(&ProtocolVersion::V1) {
+                                ProtocolVersion::V1
                             } else {
                                 return Err(error::fmt!(
-                                    LineProtocolVersionError,
+                                    ProtocolVersionError,
                                     "Server does not support current client"
                                 ));
                             }
                         } else {
                             return Err(error::fmt!(
-                                LineProtocolVersionError,
+                                ProtocolVersionError,
                                 "Unexpected response version content."
                             ));
                         }
@@ -515,7 +528,7 @@ pub(super) fn get_line_protocol_version(
                 },
                 None => {
                     return Err(error::fmt!(
-                        LineProtocolVersionError,
+                        ProtocolVersionError,
                         "Not a valid int for line.proto.default.version in response."
                     ))
                 }
@@ -523,7 +536,7 @@ pub(super) fn get_line_protocol_version(
         }
     } else {
         return Err(error::fmt!(
-            LineProtocolVersionError,
+            ProtocolVersionError,
             "Malformed server response, settings url: {}, err: failed to read response body as UTF-8", settings_url
         ));
     }

@@ -447,14 +447,14 @@ fn connect_timeout_uses_request_timeout() {
     let builder = SenderBuilder::new(Protocol::Http, "127.0.0.2", "1111")
         .request_timeout(request_timeout)
         .unwrap()
-        .disable_line_protocol_validation()
+        .disable_protocol_validation()
         .unwrap()
         .retry_timeout(Duration::from_millis(10))
         .unwrap()
         .request_min_throughput(0)
         .unwrap();
     let mut sender = builder.build().unwrap();
-    let mut buf = Buffer::new();
+    let mut buf = sender.new_buffer();
     buf.table("x")
         .unwrap()
         .symbol("x", "x")

@@ -58,8 +58,8 @@ pub enum ErrorCode {
     /// Array write to buffer error.
     ArrayWriteToBufferError,
 
-    /// Validate line protocol version error.
-    LineProtocolVersionError,
+    /// Validate protocol version error.
+    ProtocolVersionError,
 }
 
 /// An error that occurred when using QuestDB client library.

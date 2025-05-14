@@ -912,12 +912,12 @@ TEST_CASE("HTTP basics")
         questdb::ingress::protocol::http, "localhost", 1, true};
     questdb::ingress::opts opts1conf = questdb::ingress::opts::from_conf(
         "http::addr=localhost:1;username=user;password=pass;request_timeout="
-        "5000;retry_timeout=5;disable_line_protocol_validation=on;");
+        "5000;retry_timeout=5;disable_protocol_validation=on;");
     questdb::ingress::opts opts2{
         questdb::ingress::protocol::https, "localhost", "1", true};
     questdb::ingress::opts opts2conf = questdb::ingress::opts::from_conf(
         "http::addr=localhost:1;token=token;request_min_throughput=1000;retry_"
-        "timeout=0;disable_line_protocol_validation=on;");
+        "timeout=0;disable_protocol_validation=on;");
     opts1.username("user")
         .password("pass")
         .max_buf_size(1000000)
@@ -954,7 +954,7 @@ TEST_CASE("line sender protocol version v1")
     server.accept();
     CHECK(server.recv() == 0);
 
-    questdb::ingress::line_sender_buffer buffer{line_protocol_version_1};
+    questdb::ingress::line_sender_buffer buffer{protocol_version_1};
     buffer.table("test")
         .symbol("t1", "v1")
         .symbol("t2", "")

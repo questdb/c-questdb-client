@@ -56,7 +56,6 @@ mio = { version = "1", features = ["os-poll", "net"] }
 chrono = "0.4.31"
 tempfile = "3"
 webpki-roots = "0.26.8"
-criterion = "0.5"
 rstest = "0.25.0"
 
 [features]
@@ -86,8 +85,6 @@ json_tests = []
 # Enable methods to create timestamp objects from chrono::DateTime objects.
 chrono_timestamp = ["chrono"]
 
-benchmark = []
-
 # The `aws-lc-crypto` and `ring-crypto` features are mutually exclusive,
 # thus compiling with `--all-features` will not work.
 # Instead compile with `--features almost-all-features`.
@@ -101,11 +98,6 @@ almost-all-features = [
     "chrono_timestamp",
     "ndarray"
 ]
-
-[[bench]]
-name = "ndarr"
-harness = false
-required-features = ["benchmark", "ndarray"]
 
 [[example]]
 name = "basic"
@@ -124,5 +116,5 @@ name = "http"
 required-features = ["ilp-over-http", "ndarray"]
 
 [[example]]
-name = "line_protocol_version"
+name = "protocol_version"
 required-features = ["ilp-over-http", "ndarray"]

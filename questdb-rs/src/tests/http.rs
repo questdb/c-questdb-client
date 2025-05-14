@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-use crate::ingress::{Buffer, LineProtocolVersion, Protocol, SenderBuilder, TimestampNanos};
+use crate::ingress::{Buffer, Protocol, ProtocolVersion, SenderBuilder, TimestampNanos};
 use crate::tests::mock::{certs_dir, HttpResponse, MockServer};
 use crate::tests::TestResult;
 use crate::ErrorCode;
@@ -33,9 +33,9 @@ use std::time::Duration;
 
 #[rstest]
 fn test_two_lines(
-    #[values(LineProtocolVersion::V1, LineProtocolVersion::V2)] version: LineProtocolVersion,
+    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
 ) -> TestResult {
-    let mut buffer = Buffer::new().with_line_proto_version(version)?;
+    let mut buffer = Buffer::new(version);
     buffer
         .table("test")?
         .symbol("sym", "bol")?
@@ -90,9 +90,9 @@ fn test_two_lines(
 
 #[rstest]
 fn test_text_plain_error(
-    #[values(LineProtocolVersion::V1, LineProtocolVersion::V2)] version: LineProtocolVersion,
+    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
 ) -> TestResult {
-    let mut buffer = Buffer::new().with_line_proto_version(version)?;
+    let mut buffer = Buffer::new(version);
     buffer
         .table("test")?
         .symbol("sym", "bol")?
@@ -147,9 +147,9 @@ fn test_text_plain_error(
 
 #[rstest]
 fn test_bad_json_error(
-    #[values(LineProtocolVersion::V1, LineProtocolVersion::V2)] version: LineProtocolVersion,
+    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
 ) -> TestResult {
-    let mut buffer = Buffer::new().with_line_proto_version(version)?;
+    let mut buffer = Buffer::new(version);
     buffer
         .table("test")?
         .symbol("sym", "bol")?
@@ -206,9 +206,9 @@ fn test_bad_json_error(
 
 #[rstest]
 fn test_json_error(
-    #[values(LineProtocolVersion::V1, LineProtocolVersion::V2)] version: LineProtocolVersion,
+    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
 ) -> TestResult {
-    let mut buffer = Buffer::new().with_line_proto_version(version)?;
+    let mut buffer = Buffer::new(version);
     buffer
         .table("test")?
         .symbol("sym", "bol")?
@@ -267,9 +267,9 @@ fn test_json_error(
 
 #[rstest]
 fn test_no_connection(
-    #[values(LineProtocolVersion::V1, LineProtocolVersion::V2)] version: LineProtocolVersion,
+    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
 ) -> TestResult {
-    let mut buffer = Buffer::new().with_line_proto_version(version)?;
+    let mut buffer = Buffer::new(version);
     buffer
         .table("test")?
         .symbol("sym", "bol")?
@@ -277,7 +277,7 @@ fn test_no_connection(
         .at_now()?;
 
     let mut sender = SenderBuilder::new(Protocol::Http, "127.0.0.1", 1)
-        .disable_line_protocol_validation()?
+        .disable_protocol_validation()?
         .build()?;
     let res = sender.flush_and_keep(&buffer);
     assert!(res.is_err());
@@ -291,9 +291,9 @@ fn test_no_connection(
 
 #[rstest]
 fn test_old_server_without_ilp_http_support(
-    #[values(LineProtocolVersion::V1, LineProtocolVersion::V2)] version: LineProtocolVersion,
+    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
 ) -> TestResult {
-    let mut buffer = Buffer::new().with_line_proto_version(version)?;
+    let mut buffer = Buffer::new(version);
     buffer
         .table("test")?
         .symbol("sym", "bol")?
@@ -347,9 +347,9 @@ fn test_old_server_without_ilp_http_support(
 
 #[rstest]
 fn test_http_basic_auth(
-    #[values(LineProtocolVersion::V1, LineProtocolVersion::V2)] version: LineProtocolVersion,
+    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
 ) -> TestResult {
-    let mut buffer = Buffer::new().with_line_proto_version(version)?;
+    let mut buffer = Buffer::new(version);
     buffer
         .table("test")?
         .symbol("sym", "bol")?
@@ -402,9 +402,9 @@ fn test_http_basic_auth(
 
 #[rstest]
 fn test_unauthenticated(
-    #[values(LineProtocolVersion::V1, LineProtocolVersion::V2)] version: LineProtocolVersion,
+    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
 ) -> TestResult {
-    let mut buffer = Buffer::new().with_line_proto_version(version)?;
+    let mut buffer = Buffer::new(version);
     buffer
         .table("test")?
         .symbol("sym", "bol")?
@@ -460,9 +460,9 @@ fn test_unauthenticated(
 
 #[rstest]
 fn test_token_auth(
-    #[values(LineProtocolVersion::V1, LineProtocolVersion::V2)] version: LineProtocolVersion,
+    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
 ) -> TestResult {
-    let mut buffer = Buffer::new().with_line_proto_version(version)?;
+    let mut buffer = Buffer::new(version);
     buffer
         .table("test")?
         .symbol("sym", "bol")?
@@ -506,9 +506,9 @@ fn test_token_auth(
 
 #[rstest]
 fn test_request_timeout(
-    #[values(LineProtocolVersion::V1, LineProtocolVersion::V2)] version: LineProtocolVersion,
+    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
 ) -> TestResult {
-    let mut buffer = Buffer::new().with_line_proto_version(version)?;
+    let mut buffer = Buffer::new(version);
     buffer
         .table("test")?
         .symbol("sym", "bol")?
@@ -522,7 +522,7 @@ fn test_request_timeout(
     let time_start = std::time::Instant::now();
     let mut sender = server
         .lsb_http()
-        .disable_line_protocol_validation()?
+        .disable_protocol_validation()?
         .request_timeout(request_timeout)?
         .build()?;
     let res = sender.flush_and_keep(&buffer);
@@ -537,12 +537,12 @@ fn test_request_timeout(
 
 #[rstest]
 fn test_tls(
-    #[values(LineProtocolVersion::V1, LineProtocolVersion::V2)] version: LineProtocolVersion,
+    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
 ) -> TestResult {
     let mut ca_path = certs_dir();
     ca_path.push("server_rootCA.pem");
 
-    let mut buffer = Buffer::new().with_line_proto_version(version)?;
+    let mut buffer = Buffer::new(version);
     buffer
         .table("test")?
         .symbol("t1", "v1")?
@@ -554,7 +554,7 @@ fn test_tls(
     let mut sender = server
         .lsb_https()
         .tls_roots(ca_path)?
-        .disable_line_protocol_validation()?
+        .disable_protocol_validation()?
         .build()?;
 
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
@@ -581,9 +581,9 @@ fn test_tls(
 
 #[rstest]
 fn test_user_agent(
-    #[values(LineProtocolVersion::V1, LineProtocolVersion::V2)] version: LineProtocolVersion,
+    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
 ) -> TestResult {
-    let mut buffer = Buffer::new().with_line_proto_version(version)?;
+    let mut buffer = Buffer::new(version);
     buffer
         .table("test")?
         .symbol("t1", "v1")?
@@ -622,11 +622,11 @@ fn test_user_agent(
 
 #[rstest]
 fn test_two_retries(
-    #[values(LineProtocolVersion::V1, LineProtocolVersion::V2)] version: LineProtocolVersion,
+    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
 ) -> TestResult {
     // Note: This also tests that the _same_ connection is being reused, i.e. tests keepalive.
 
-    let mut buffer = Buffer::new().with_line_proto_version(version)?;
+    let mut buffer = Buffer::new(version);
     buffer
         .table("test")?
         .symbol("t1", "v1")?
@@ -694,9 +694,9 @@ fn test_two_retries(
 
 #[rstest]
 fn test_one_retry(
-    #[values(LineProtocolVersion::V1, LineProtocolVersion::V2)] version: LineProtocolVersion,
+    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
 ) -> TestResult {
-    let mut buffer = Buffer::new().with_line_proto_version(version)?;
+    let mut buffer = Buffer::new(version);
     buffer
         .table("test")?
         .symbol("t1", "v1")?
@@ -708,7 +708,7 @@ fn test_one_retry(
     let mut sender = server
         .lsb_http()
         .retry_timeout(Duration::from_millis(19))?
-        .disable_line_protocol_validation()
+        .disable_protocol_validation()
         .unwrap()
         .build()?;
 
@@ -761,10 +761,10 @@ fn test_one_retry(
 
 #[rstest]
 fn test_transactional(
-    #[values(LineProtocolVersion::V1, LineProtocolVersion::V2)] version: LineProtocolVersion,
+    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
 ) -> TestResult {
     // A buffer with a two tables.
-    let mut buffer1 = Buffer::new().with_line_proto_version(version)?;
+    let mut buffer1 = Buffer::new(version);
     buffer1
         .table("tab1")?
         .symbol("t1", "v1")?
@@ -778,7 +778,7 @@ fn test_transactional(
     assert!(!buffer1.transactional());
 
     // A buffer with a single table.
-    let mut buffer2 = Buffer::new().with_line_proto_version(version)?;
+    let mut buffer2 = Buffer::new(version);
     buffer2
         .table("test")?
         .symbol("t1", "v1")?
@@ -832,7 +832,7 @@ fn test_transactional(
 }
 
 #[test]
-fn test_sender_line_protocol_version() -> TestResult {
+fn test_sender_protocol_version() -> TestResult {
     let mut server = MockServer::new()?.configure_settings_response(2, &[1, 2]);
     let sender_builder = server.lsb_http();
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
@@ -848,20 +848,17 @@ fn test_sender_line_protocol_version() -> TestResult {
         Ok(())
     });
     let sender = sender_builder.build()?;
+    assert_eq!(sender.default_protocol_version(), ProtocolVersion::V2);
     assert_eq!(
-        sender.default_line_protocol_version(),
-        LineProtocolVersion::V2
-    );
-    assert_eq!(
-        sender.support_line_protocol_versions().unwrap(),
-        vec![LineProtocolVersion::V1, LineProtocolVersion::V2]
+        sender.support_protocol_versions().unwrap(),
+        vec![ProtocolVersion::V1, ProtocolVersion::V2]
     );
     server_thread.join().unwrap()?;
     Ok(())
 }
 
 #[test]
-fn test_sender_line_protocol_version_old_server1() -> TestResult {
+fn test_sender_protocol_version_old_server1() -> TestResult {
     let mut server = MockServer::new()?.configure_settings_response(0, &[1, 2]);
     let sender_builder = server.lsb_http();
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
@@ -877,17 +874,14 @@ fn test_sender_line_protocol_version_old_server1() -> TestResult {
         Ok(())
     });
     let sender = sender_builder.build()?;
-    assert_eq!(
-        sender.default_line_protocol_version(),
-        LineProtocolVersion::V1
-    );
-    assert!(sender.support_line_protocol_versions().is_none());
+    assert_eq!(sender.default_protocol_version(), ProtocolVersion::V1);
+    assert!(sender.support_protocol_versions().is_none());
     server_thread.join().unwrap()?;
     Ok(())
 }
 
 #[test]
-fn test_sender_line_protocol_version_old_server2() -> TestResult {
+fn test_sender_protocol_version_old_server2() -> TestResult {
     let mut server = MockServer::new()?.configure_settings_response(0, &[1, 2]);
     let sender_builder = server.lsb_http();
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
@@ -901,17 +895,14 @@ fn test_sender_line_protocol_version_old_server2() -> TestResult {
         Ok(())
     });
     let sender = sender_builder.build()?;
-    assert_eq!(
-        sender.default_line_protocol_version(),
-        LineProtocolVersion::V1
-    );
-    assert!(sender.support_line_protocol_versions().is_none());
+    assert_eq!(sender.default_protocol_version(), ProtocolVersion::V1);
+    assert!(sender.support_protocol_versions().is_none());
     server_thread.join().unwrap()?;
     Ok(())
 }
 
 #[test]
-fn test_sender_line_protocol_version_unsupported_client() -> TestResult {
+fn test_sender_protocol_version_unsupported_client() -> TestResult {
     let mut server = MockServer::new()?.configure_settings_response(3, &[3, 4]);
     let sender_builder = server.lsb_http();
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
@@ -922,21 +913,17 @@ fn test_sender_line_protocol_version_unsupported_client() -> TestResult {
     let res1 = sender_builder.build();
     assert!(res1.is_err());
     let e1 = res1.err().unwrap();
-    assert_eq!(e1.code(), ErrorCode::LineProtocolVersionError);
+    assert_eq!(e1.code(), ErrorCode::ProtocolVersionError);
     assert!(e1.msg().contains("Server does not support current client"));
     server_thread.join().unwrap()?;
     Ok(())
 }
 
 #[test]
-fn test_sender_disable_line_protocol_version_validation() -> TestResult {
+fn test_sender_disable_protocol_version_validation() -> TestResult {
     let mut server = MockServer::new()?.configure_settings_response(2, &[1, 2]);
-    let mut sender = server
-        .lsb_http()
-        .disable_line_protocol_validation()?
-        .build()?;
-    let mut buffer =
-        Buffer::new().with_line_proto_version(sender.default_line_protocol_version())?;
+    let mut sender = server.lsb_http().disable_protocol_validation()?.build()?;
+    let mut buffer = sender.new_buffer();
     buffer
         .table("test")?
         .symbol("sym", "bol")?
@@ -958,15 +945,15 @@ fn test_sender_disable_line_protocol_version_validation() -> TestResult {
 }
 
 #[test]
-fn test_sender_line_protocol_version1_not_support_array() -> TestResult {
-    let mut buffer = Buffer::new().with_line_proto_version(LineProtocolVersion::V1)?;
+fn test_sender_protocol_version1_not_support_array() -> TestResult {
+    let mut buffer = Buffer::new(ProtocolVersion::V1);
     let res = buffer
         .table("test")?
         .symbol("sym", "bol")?
         .column_arr("x", &[1.0f64, 2.0]);
     assert!(res.is_err());
     let e1 = res.as_ref().err().unwrap();
-    assert_eq!(e1.code(), ErrorCode::LineProtocolVersionError);
+    assert_eq!(e1.code(), ErrorCode::ProtocolVersionError);
     assert!(e1
         .msg()
         .contains("line protocol version v1 does not support array datatype"));

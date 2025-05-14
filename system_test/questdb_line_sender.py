@@ -93,15 +93,15 @@ class CertificateAuthority(Enum):
     PEM_FILE = (c_line_sender_ca(3), 'pem_file')
 
 
-c_line_protocol_version = ctypes.c_int
+c_protocol_version = ctypes.c_int
 
 
-class LineProtocolVersion(Enum):
-    V1 = (c_line_protocol_version(1), 'v1')
-    V2 = (c_line_protocol_version(2), 'v2')
+class ProtocolVersion(Enum):
+    V1 = (c_protocol_version(1), 'v1')
+    V2 = (c_protocol_version(2), 'v2')
 
     @classmethod
-    def from_int(cls, value: c_line_protocol_version):
+    def from_int(cls, value: c_protocol_version):
         for member in cls:
             if member.value[0].value == value:
                 return member
@@ -216,10 +216,10 @@ def _setup_cdll():
         c_line_sender_buffer_p,
         c_size_t)
     set_sig(
-        dll.line_sender_buffer_set_line_protocol_version,
+        dll.line_sender_buffer_set_protocol_version,
         c_bool,
         c_line_sender_buffer_p,
-        c_line_protocol_version,
+        c_protocol_version,
         c_line_sender_error_p_p)
     set_sig(
         dll.line_sender_buffer_free,
@@ -373,7 +373,7 @@ def _setup_cdll():
         c_line_sender_utf8,
         c_line_sender_error_p_p)
     set_sig(
-        dll.line_sender_opts_disable_line_protocol_validation,
+        dll.line_sender_opts_disable_protocol_validation,
         c_bool,
         c_line_sender_opts_p,
         c_line_sender_error_p_p)
@@ -448,8 +448,8 @@ def _setup_cdll():
         c_line_sender_p,
         c_line_sender_error_p_p)
     set_sig(
-        dll.line_sender_default_line_protocol_version,
-        c_line_protocol_version,
+        dll.line_sender_default_protocol_version,
+        c_protocol_version,
         c_line_sender_p)
     set_sig(
         dll.line_sender_must_close,
@@ -580,7 +580,7 @@ class _Opts:
         fn = getattr(_DLL, 'line_sender_opts_' + name)
 
         def wrapper(*args):
-            if name == 'disable_line_protocol_validation':
+            if name == 'disable_protocol_validation':
                 return _error_wrapped_call(fn, self.impl)
             mapped_args = [
                 (_utf8(arg) if isinstance(arg, str) else arg)
@@ -602,14 +602,14 @@ class TimestampMicros:
 
 
 class Buffer:
-    def __init__(self, init_buf_size=65536, max_name_len=127, line_protocol_version=LineProtocolVersion.V2):
+    def __init__(self, init_buf_size=65536, max_name_len=127, protocol_version=ProtocolVersion.V2):
         self._impl = _DLL.line_sender_buffer_with_max_name_len(
             c_size_t(max_name_len))
         _DLL.line_sender_buffer_reserve(self._impl, c_size_t(init_buf_size))
         _error_wrapped_call(
-            _DLL.line_sender_buffer_set_line_protocol_version,
+            _DLL.line_sender_buffer_set_protocol_version,
             self._impl,
-            line_protocol_version.value[0])
+            protocol_version.value[0])
 
     def __len__(self):
         return _DLL.line_sender_buffer_size(self._impl)
@@ -627,9 +627,9 @@ class Buffer:
         else:
             return ''
 
-    def set_line_protocol_version(self, version: LineProtocolVersion):
+    def set_protocol_version(self, version: ProtocolVersion):
         _error_wrapped_call(
-            _DLL.line_sender_buffer_set_line_protocol_version,
+            _DLL.line_sender_buffer_set_protocol_version,
             self._impl,
             version.value[0])
 
@@ -823,16 +823,16 @@ class Sender:
     def __enter__(self):
         self.connect()
         self._buffer = Buffer(
-            line_protocol_version=LineProtocolVersion.from_int(self.line_sender_default_line_protocol_version()))
+            protocol_version=ProtocolVersion.from_int(self.line_sender_default_protocol_version()))
         return self
 
     def _check_connected(self):
         if not self._impl:
             raise SenderError('Not connected.')
 
-    def line_sender_default_line_protocol_version(self):
+    def line_sender_default_protocol_version(self):
         self._check_connected()
-        return _DLL.line_sender_default_line_protocol_version(self._impl)
+        return _DLL.line_sender_default_protocol_version(self._impl)
 
     def table(self, table: str):
         self._buffer.table(table)

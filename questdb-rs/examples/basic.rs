@@ -1,7 +1,7 @@
 use chrono::{TimeZone, Utc};
 use ndarray::arr1;
 use questdb::{
-    ingress::{Buffer, Sender, TimestampNanos},
+    ingress::{Sender, TimestampNanos},
     Result,
 };
 
@@ -9,7 +9,7 @@ fn main() -> Result<()> {
     let host: String = std::env::args().nth(1).unwrap_or("localhost".to_string());
     let port: &str = &std::env::args().nth(2).unwrap_or("9009".to_string());
     let mut sender = Sender::from_conf(format!("tcp::addr={host}:{port};"))?;
-    let mut buffer = Buffer::new();
+    let mut buffer = sender.new_buffer();
     let designated_timestamp =
         TimestampNanos::from_datetime(Utc.with_ymd_and_hms(1997, 7, 4, 4, 56, 55).unwrap())?;
     buffer

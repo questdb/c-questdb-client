@@ -95,11 +95,11 @@ AUTH_MALFORMED3 = dict(
 
 
 class TestSender(unittest.TestCase):
-    def _mk_linesender(self, disable_line_protocol_validation=False):
+    def _mk_linesender(self, disable_protocol_validation=False):
         # N.B.: We never connect with TLS here.
         auth = AUTH if QDB_FIXTURE.auth else {}
-        if disable_line_protocol_validation:
-            auth["disable_line_protocol_validation"] = "on"
+        if disable_protocol_validation:
+            auth["disable_protocol_validation"] = "on"
         return qls.Sender(
             BUILD_MODE,
             qls.Protocol.HTTP if QDB_FIXTURE.http else qls.Protocol.TCP,
@@ -598,7 +598,7 @@ class TestSender(unittest.TestCase):
         except qls.SenderError as e:
             self.assertIn('cast error from protocol type: DOUBLE[] to column type: DOUBLE[][]', str(e))
 
-    def test_line_protocol_version_v1(self):
+    def test_protocol_version_v1(self):
         if QDB_FIXTURE.version <= (6, 1, 2):
             self.skipTest('Float issues support')
         numbers = [
@@ -610,7 +610,7 @@ class TestSender(unittest.TestCase):
         table_name = uuid.uuid4().hex
         pending = None
         with self._mk_linesender() as sender:
-            sender.buffer.set_line_protocol_version(qls.LineProtocolVersion.V1)
+            sender.buffer.set_protocol_version(qls.ProtocolVersion.V1)
             for num in numbers:
                 sender.table(table_name)
                 sender.column('n', num)
@@ -639,7 +639,7 @@ class TestSender(unittest.TestCase):
         scrubbed_dataset = [row[:-1] for row in resp['dataset']]
         self.assertEqual(scrubbed_dataset, exp_dataset)
 
-    def test_line_protocol_version_v1_array_unsupported(self):
+    def test_protocol_version_v1_array_unsupported(self):
         if QDB_FIXTURE.version < (8, 3, 1):
             self.skipTest('array unsupported')
 
@@ -653,7 +653,7 @@ class TestSender(unittest.TestCase):
         table_name = uuid.uuid4().hex
         try:
             with self._mk_linesender(True) as sender:
-                sender.buffer.set_line_protocol_version(qls.LineProtocolVersion.V1)
+                sender.buffer.set_protocol_version(qls.ProtocolVersion.V1)
                 sender.table(table_name)
                 sender.column_f64_arr('f64_arr1', array1)
                 sender.at_now()

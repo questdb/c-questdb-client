@@ -19,7 +19,7 @@ use questdb::{
         TimestampNanos}};
 fn main() -> Result<()> {
    let mut sender = Sender::from_conf("http::addr=localhost:9000;")?;
-   let mut buffer = Buffer::new();
+  let mut buffer = sender.new_buffer();
    buffer
        .table("trades")?
        .symbol("symbol", "ETH-USD")?
@@ -297,9 +297,11 @@ use questdb::ingress::{
     TableName,
     ColumnName,
     Buffer,
+    SenderBuilder,
     TimestampNanos};
 # fn main() -> Result<()> {
-let mut buffer = Buffer::new();
+let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+let mut buffer = sender.new_buffer();
 let table_name = TableName::new("trades")?;
 let price_name = ColumnName::new("price")?;
 buffer.table(table_name)?.column_f64(price_name, 2615.54)?.at(TimestampNanos::now())?;

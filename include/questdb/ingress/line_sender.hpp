@@ -404,15 +404,15 @@ public:
     line_sender_buffer(
         size_t init_buf_size,
         size_t max_name_len,
-        line_protocol_version version) noexcept
+        protocol_version version) noexcept
         : _impl{nullptr}
         , _init_buf_size{init_buf_size}
         , _max_name_len{max_name_len}
-        , _line_protocol_version{version}
+        , _protocol_version{version}
     {
     }
 
-    line_sender_buffer(line_protocol_version version) noexcept
+    line_sender_buffer(protocol_version version) noexcept
         : line_sender_buffer{64 * 1024, 127, version}
     {
     }
@@ -421,7 +421,7 @@ public:
         : _impl{::line_sender_buffer_clone(other._impl)}
         , _init_buf_size{other._init_buf_size}
         , _max_name_len{other._max_name_len}
-        , _line_protocol_version{other._line_protocol_version}
+        , _protocol_version{other._protocol_version}
     {
     }
 
@@ -429,7 +429,7 @@ public:
         : _impl{other._impl}
         , _init_buf_size{other._init_buf_size}
         , _max_name_len{other._max_name_len}
-        , _line_protocol_version{other._line_protocol_version}
+        , _protocol_version{other._protocol_version}
     {
         other._impl = nullptr;
     }
@@ -445,7 +445,7 @@ public:
                 _impl = nullptr;
             _init_buf_size = other._init_buf_size;
             _max_name_len = other._max_name_len;
-            _line_protocol_version = other._line_protocol_version;
+            _protocol_version = other._protocol_version;
         }
         return *this;
     }
@@ -458,29 +458,9 @@ public:
             _impl = other._impl;
             _init_buf_size = other._init_buf_size;
             _max_name_len = other._max_name_len;
-            _line_protocol_version = other._line_protocol_version;
+            _protocol_version = other._protocol_version;
             other._impl = nullptr;
         }
-        return *this;
-    }
-
-    /**
-     * Sets the Line Protocol version for line_sender_buffer.
-     *
-     * The buffer defaults is line_protocol_version_2 which uses
-     * binary format f64 serialization and support array data type. Call this to
-     * switch to version 1 (text format f64) when connecting to servers that
-     * don't support line_protocol_version_2(under 8.3.2).
-     *
-     * Must be called before adding any data to the buffer. Protocol version
-     * cannot be changed after the buffer contains data.
-     */
-    line_sender_buffer& set_line_protocol_version(line_protocol_version v)
-    {
-        may_init();
-        line_sender_error::wrapped_call(
-            ::line_sender_buffer_set_line_protocol_version, _impl, v);
-        _line_protocol_version = v;
         return *this;
     }
 
@@ -844,16 +824,16 @@ private:
             _impl = ::line_sender_buffer_with_max_name_len(_max_name_len);
             ::line_sender_buffer_reserve(_impl, _init_buf_size);
             line_sender_error::wrapped_call(
-                line_sender_buffer_set_line_protocol_version,
+                line_sender_buffer_set_protocol_version,
                 _impl,
-                _line_protocol_version);
+                _protocol_version);
         }
     }
 
     ::line_sender_buffer* _impl;
     size_t _init_buf_size;
     size_t _max_name_len;
-    line_protocol_version _line_protocol_version{::line_protocol_version_2};
+    protocol_version _protocol_version{::protocol_version_2};
 
     friend class line_sender;
 };
@@ -913,23 +893,23 @@ public:
      * @param[in] protocol The protocol to use.
      * @param[in] host The QuestDB database host.
      * @param[in] port The QuestDB tcp or http port.
-     * @param[in] disable_line_protocol_validation disable line protocol version
+     * @param[in] disable_protocol_validation disable line protocol version
      * validation.
      */
     opts(
         protocol protocol,
         utf8_view host,
         uint16_t port,
-        bool disable_line_protocol_validation = false) noexcept
+        bool disable_protocol_validation = false) noexcept
         : _impl{::line_sender_opts_new(
               static_cast<::line_sender_protocol>(protocol), host._impl, port)}
     {
         line_sender_error::wrapped_call(
             ::line_sender_opts_user_agent, _impl, _user_agent::name());
-        if (disable_line_protocol_validation)
+        if (disable_protocol_validation)
         {
             line_sender_error::wrapped_call(
-                ::line_sender_opts_disable_line_protocol_validation, _impl);
+                ::line_sender_opts_disable_protocol_validation, _impl);
         }
     }
 
@@ -939,13 +919,13 @@ public:
      * @param[in] protocol The protocol to use.
      * @param[in] host The QuestDB database host.
      * @param[in] port The QuestDB tcp or http port as service name.
-     * @param[in] disable_line_protocol_validation disable line protocol version
+     * @param[in] disable_protocol_validation disable line protocol version
      */
     opts(
         protocol protocol,
         utf8_view host,
         utf8_view port,
-        bool disable_line_protocol_validation = false) noexcept
+        bool disable_protocol_validation = false) noexcept
         : _impl{::line_sender_opts_new_service(
               static_cast<::line_sender_protocol>(protocol),
               host._impl,
@@ -953,10 +933,10 @@ public:
     {
         line_sender_error::wrapped_call(
             ::line_sender_opts_user_agent, _impl, _user_agent::name());
-        if (disable_line_protocol_validation)
+        if (disable_protocol_validation)
         {
             line_sender_error::wrapped_call(
-                ::line_sender_opts_disable_line_protocol_validation, _impl);
+                ::line_sender_opts_disable_protocol_validation, _impl);
         }
     }
 
@@ -1067,10 +1047,10 @@ public:
     /**
      * Disable the validation of the line protocol version.
      */
-    opts& disable_line_protocol_validation()
+    opts& disable_protocol_validation()
     {
         line_sender_error::wrapped_call(
-            ::line_sender_opts_disable_line_protocol_validation, _impl);
+            ::line_sender_opts_disable_protocol_validation, _impl);
         return *this;
     }
 
@@ -1264,9 +1244,8 @@ public:
         protocol protocol,
         utf8_view host,
         uint16_t port,
-        bool disable_line_protocol_validation = false)
-        : line_sender{
-              opts{protocol, host, port, disable_line_protocol_validation}}
+        bool disable_protocol_validation = false)
+        : line_sender{opts{protocol, host, port, disable_protocol_validation}}
     {
     }
 
@@ -1274,9 +1253,8 @@ public:
         protocol protocol,
         utf8_view host,
         utf8_view port,
-        bool disable_line_protocol_validation = false)
-        : line_sender{
-              opts{protocol, host, port, disable_line_protocol_validation}}
+        bool disable_protocol_validation = false)
+        : line_sender{opts{protocol, host, port, disable_protocol_validation}}
     {
     }
 
@@ -1369,10 +1347,10 @@ public:
     /**
      * Returns the QuestDB server's recommended default line protocol version.
      */
-    line_protocol_version default_line_protocol_version()
+    protocol_version default_protocol_version()
     {
         ensure_impl();
-        return line_sender_default_line_protocol_version(_impl);
+        return line_sender_default_protocol_version(_impl);
     }
 
     /**

@@ -21,7 +21,7 @@ static bool example(std::string_view host, std::string_view port)
         const auto amount_name = "amount"_cn;
 
         questdb::ingress::line_sender_buffer buffer{
-            sender.default_line_protocol_version()};
+            sender.default_protocol_version()};
         buffer.table(table_name)
             .symbol(symbol_name, "ETH-USD"_utf8)
             .symbol(side_name, "sell"_utf8)

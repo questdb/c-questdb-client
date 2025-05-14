@@ -62,16 +62,16 @@ pub const MAX_ARRAY_DIMS: usize = 32;
 
 /// Line Protocol Version supported by current client.
 #[derive(Debug, Copy, Clone, PartialEq)]
-pub enum LineProtocolVersion {
+pub enum ProtocolVersion {
     V1 = 1,
     V2 = 2,
 }
 
-impl std::fmt::Display for LineProtocolVersion {
+impl std::fmt::Display for ProtocolVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LineProtocolVersion::V1 => write!(f, "v1"),
-            LineProtocolVersion::V2 => write!(f, "v2"),
+            ProtocolVersion::V1 => write!(f, "v1"),
+            ProtocolVersion::V2 => write!(f, "v2"),
         }
     }
 }
@@ -485,18 +485,19 @@ impl BufferState {
     }
 }
 
-pub trait Buffer1 {}
-
 /// A reusable buffer to prepare a batch of ILP messages.
 ///
 /// # Example
 ///
-/// ```
+/// ```no_run
 /// # use questdb::Result;
-/// use questdb::ingress::{Buffer, TimestampMicros, TimestampNanos};
+/// # use questdb::ingress::SenderBuilder;
 ///
 /// # fn main() -> Result<()> {
-/// let mut buffer = Buffer::new();
+/// # let mut sender = SenderBuilder::from_conf("http::addr=localhost:9000;")?.build()?;
+/// # use questdb::Result;
+/// use questdb::ingress::{Buffer, TimestampMicros, TimestampNanos};
+/// let mut buffer = sender.new_buffer();
 ///
 /// // first row
 /// buffer
@@ -580,65 +581,41 @@ pub struct Buffer {
     state: BufferState,
     marker: Option<(usize, BufferState)>,
     max_name_len: usize,
-    f64serializer: fn(&mut Vec<u8>, f64),
-    version: LineProtocolVersion,
+    version: ProtocolVersion,
 }
 
 impl Buffer {
-    /// Construct a `Buffer` with a `max_name_len` of `127`, which is the same as the
-    /// QuestDB server default.
-    pub fn new() -> Self {
+    /// Creates a new [`Buffer`] with default parameters.
+    ///
+    /// - Uses the specified protocol version
+    /// - Sets maximum name length to **127 characters** (QuestDB server default)
+    ///
+    /// This is equivalent to [`Sender::new_buffer`] when using the sender's
+    /// protocol version. For custom name lengths, use
+    /// [`Sender::new_buffer_with_max_name_len`].
+    pub fn new(protocol_version: ProtocolVersion) -> Self {
         Self {
             output: Vec::new(),
             state: BufferState::new(),
             marker: None,
             max_name_len: 127,
-            f64serializer: f64_binary_series,
-            version: LineProtocolVersion::V2,
+            version: protocol_version,
         }
     }
 
-    /// Construct a `Buffer` with a custom maximum length for table and column names.
+    /// Creates a new [`Buffer`] with a custom maximum name length.
     ///
-    /// This should match the `cairo.max.file.name.length` setting of the
-    /// QuestDB instance you're connecting to.
+    /// - `max_name_len`: Maximum allowed length for table/column names, must match
+    ///   your QuestDB server's `cairo.max.file.name.length` configuration
+    /// - `protocol_version`: Protocol version to use
     ///
-    /// If the server does not configure it, the default is `127` and you can simply
-    /// call [`new`](Buffer::new).
-    pub fn with_max_name_len(max_name_len: usize) -> Self {
-        let mut buf = Self::new();
+    /// This is equivalent to [`Sender::new_buffer_with_max_name_len`] when using
+    /// the sender's protocol version. For the default name length (127),
+    /// use [`new`](Self::new) or [`Sender::new_buffer`].
+    pub fn with_max_name_len(max_name_len: usize, protocol_version: ProtocolVersion) -> Self {
+        let mut buf = Self::new(protocol_version);
         buf.max_name_len = max_name_len;
         buf
-    }
-
-    pub fn with_line_proto_version(mut self, version: LineProtocolVersion) -> Result<Self> {
-        if self.state.op_case != OpCase::Init {
-            return Err(error::fmt!(
-                LineProtocolVersionError,
-                "Line protocol version must be set before adding any data."
-            ));
-        }
-        self.f64serializer = match version {
-            LineProtocolVersion::V1 => f64_text_series,
-            LineProtocolVersion::V2 => f64_binary_series,
-        };
-        self.version = version;
-        Ok(self)
-    }
-
-    pub fn set_line_proto_version(&mut self, version: LineProtocolVersion) -> Result<&mut Self> {
-        if self.state.op_case != OpCase::Init {
-            return Err(error::fmt!(
-                LineProtocolVersionError,
-                "Line protocol version must be set before adding any data."
-            ));
-        }
-        self.f64serializer = match version {
-            LineProtocolVersion::V1 => f64_text_series,
-            LineProtocolVersion::V2 => f64_binary_series,
-        };
-        self.version = version;
-        Ok(self)
     }
 
     /// Pre-allocate to ensure the buffer has enough capacity for at least the
@@ -772,11 +749,12 @@ impl Buffer {
 
     /// Begin recording a new row for the given table.
     ///
-    /// ```
+    /// ```no_run
     /// # use questdb::Result;
-    /// # use questdb::ingress::Buffer;
+    /// # use questdb::ingress::{Buffer, SenderBuilder};
     /// # fn main() -> Result<()> {
-    /// # let mut buffer = Buffer::new();
+    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+    /// # let mut buffer = sender.new_buffer();
     /// buffer.table("table_name")?;
     /// # Ok(())
     /// # }
@@ -784,13 +762,14 @@ impl Buffer {
     ///
     /// or
     ///
-    /// ```
+    /// ```no_run
     /// # use questdb::Result;
-    /// # use questdb::ingress::Buffer;
+    /// # use questdb::ingress::{Buffer, SenderBuilder};
     /// use questdb::ingress::TableName;
     ///
     /// # fn main() -> Result<()> {
-    /// # let mut buffer = Buffer::new();
+    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+    /// # let mut buffer = sender.new_buffer();
     /// let table_name = TableName::new("table_name")?;
     /// buffer.table(table_name)?;
     /// # Ok(())
@@ -821,11 +800,12 @@ impl Buffer {
     /// Record a symbol for the given column.
     /// Make sure you record all symbol columns before any other column type.
     ///
-    /// ```
+    /// ```no_run
     /// # use questdb::Result;
-    /// # use questdb::ingress::Buffer;
+    /// # use questdb::ingress::{Buffer, SenderBuilder};
     /// # fn main() -> Result<()> {
-    /// # let mut buffer = Buffer::new();
+    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+    /// # let mut buffer = sender.new_buffer();
     /// # buffer.table("x")?;
     /// buffer.symbol("col_name", "value")?;
     /// # Ok(())
@@ -834,11 +814,12 @@ impl Buffer {
     ///
     /// or
     ///
-    /// ```
+    /// ```no_run
     /// # use questdb::Result;
-    /// # use questdb::ingress::Buffer;
+    /// # use questdb::ingress::{Buffer, SenderBuilder};
     /// # fn main() -> Result<()> {
-    /// # let mut buffer = Buffer::new();
+    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+    /// # let mut buffer = sender.new_buffer();
     /// # buffer.table("x")?;
     /// let value: String = "value".to_owned();
     /// buffer.symbol("col_name", value)?;
@@ -848,13 +829,14 @@ impl Buffer {
     ///
     /// or
     ///
-    /// ```
+    /// ```no_run
     /// # use questdb::Result;
-    /// # use questdb::ingress::Buffer;
+    /// # use questdb::ingress::{Buffer, SenderBuilder};
     /// use questdb::ingress::ColumnName;
     ///
     /// # fn main() -> Result<()> {
-    /// # let mut buffer = Buffer::new();
+    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+    /// # let mut buffer = sender.new_buffer();
     /// # buffer.table("x")?;
     /// let col_name = ColumnName::new("col_name")?;
     /// buffer.symbol(col_name, "value")?;
@@ -901,11 +883,12 @@ impl Buffer {
 
     /// Record a boolean value for the given column.
     ///
-    /// ```
+    /// ```no_run
     /// # use questdb::Result;
-    /// # use questdb::ingress::Buffer;
+    /// # use questdb::ingress::{Buffer, SenderBuilder};
     /// # fn main() -> Result<()> {
-    /// # let mut buffer = Buffer::new();
+    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+    /// # let mut buffer = sender.new_buffer();
     /// # buffer.table("x")?;
     /// buffer.column_bool("col_name", true)?;
     /// # Ok(())
@@ -914,13 +897,14 @@ impl Buffer {
     ///
     /// or
     ///
-    /// ```
+    /// ```no_run
     /// # use questdb::Result;
-    /// # use questdb::ingress::Buffer;
+    /// # use questdb::ingress::{Buffer, SenderBuilder};
     /// use questdb::ingress::ColumnName;
     ///
     /// # fn main() -> Result<()> {
-    /// # let mut buffer = Buffer::new();
+    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+    /// # let mut buffer = sender.new_buffer();
     /// # buffer.table("x")?;
     /// let col_name = ColumnName::new("col_name")?;
     /// buffer.column_bool(col_name, true)?;
@@ -939,11 +923,12 @@ impl Buffer {
 
     /// Record an integer value for the given column.
     ///
-    /// ```
+    /// ```no_run
     /// # use questdb::Result;
-    /// # use questdb::ingress::Buffer;
+    /// # use questdb::ingress::{Buffer, SenderBuilder};
     /// # fn main() -> Result<()> {
-    /// # let mut buffer = Buffer::new();
+    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+    /// # let mut buffer = sender.new_buffer();
     /// # buffer.table("x")?;
     /// buffer.column_i64("col_name", 42)?;
     /// # Ok(())
@@ -952,13 +937,14 @@ impl Buffer {
     ///
     /// or
     ///
-    /// ```
+    /// ```no_run
     /// # use questdb::Result;
-    /// # use questdb::ingress::Buffer;
+    /// # use questdb::ingress::{Buffer, SenderBuilder};
     /// use questdb::ingress::ColumnName;
     ///
     /// # fn main() -> Result<()> {
-    /// # let mut buffer = Buffer::new();
+    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+    /// # let mut buffer = sender.new_buffer();
     /// # buffer.table("x")?;
     /// let col_name = ColumnName::new("col_name")?;
     /// buffer.column_i64(col_name, 42);
@@ -980,11 +966,12 @@ impl Buffer {
 
     /// Record a floating point value for the given column.
     ///
-    /// ```
+    /// ```no_run
     /// # use questdb::Result;
-    /// # use questdb::ingress::Buffer;
+    /// # use questdb::ingress::{Buffer, SenderBuilder};
     /// # fn main() -> Result<()> {
-    /// # let mut buffer = Buffer::new();
+    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+    /// # let mut buffer = sender.new_buffer();
     /// # buffer.table("x")?;
     /// buffer.column_f64("col_name", 3.14)?;
     /// # Ok(())
@@ -993,13 +980,14 @@ impl Buffer {
     ///
     /// or
     ///
-    /// ```
+    /// ```no_run
     /// # use questdb::Result;
-    /// # use questdb::ingress::Buffer;
+    /// # use questdb::ingress::{Buffer, SenderBuilder};
     /// use questdb::ingress::ColumnName;
     ///
     /// # fn main() -> Result<()> {
-    /// # let mut buffer = Buffer::new();
+    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+    /// # let mut buffer = sender.new_buffer();
     /// # buffer.table("x")?;
     /// let col_name = ColumnName::new("col_name")?;
     /// buffer.column_f64(col_name, 3.14)?;
@@ -1012,17 +1000,25 @@ impl Buffer {
         Error: From<N::Error>,
     {
         self.write_column_key(name)?;
-        (self.f64serializer)(&mut self.output, value);
+        if !matches!(self.version, ProtocolVersion::V1) {
+            self.output.push(b'=');
+            self.output.push(DOUBLE_BINARY_FORMAT_TYPE);
+            self.output.extend_from_slice(&value.to_le_bytes())
+        } else {
+            let mut ser = F64Serializer::new(value);
+            self.output.extend_from_slice(ser.as_str().as_bytes())
+        }
         Ok(self)
     }
 
     /// Record a string value for the given column.
     ///
-    /// ```
+    /// ```no_run
     /// # use questdb::Result;
-    /// # use questdb::ingress::Buffer;
+    /// # use questdb::ingress::{Buffer, SenderBuilder};
     /// # fn main() -> Result<()> {
-    /// # let mut buffer = Buffer::new();
+    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+    /// # let mut buffer = sender.new_buffer();
     /// # buffer.table("x")?;
     /// buffer.column_str("col_name", "value")?;
     /// # Ok(())
@@ -1031,11 +1027,12 @@ impl Buffer {
     ///
     /// or
     ///
-    /// ```
+    /// ```no_run
     /// # use questdb::Result;
-    /// # use questdb::ingress::Buffer;
+    /// # use questdb::ingress::{Buffer, SenderBuilder};
     /// # fn main() -> Result<()> {
-    /// # let mut buffer = Buffer::new();
+    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+    /// # let mut buffer = sender.new_buffer();
     /// # buffer.table("x")?;
     /// let value: String = "value".to_owned();
     /// buffer.column_str("col_name", value)?;
@@ -1045,13 +1042,14 @@ impl Buffer {
     ///
     /// or
     ///
-    /// ```
+    /// ```no_run
     /// # use questdb::Result;
-    /// # use questdb::ingress::Buffer;
+    /// # use questdb::ingress::{Buffer, SenderBuilder};
     /// use questdb::ingress::ColumnName;
     ///
     /// # fn main() -> Result<()> {
-    /// # let mut buffer = Buffer::new();
+    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+    /// # let mut buffer = sender.new_buffer();
     /// # buffer.table("x")?;
     /// let col_name = ColumnName::new("col_name")?;
     /// buffer.column_str(col_name, "value")?;
@@ -1072,55 +1070,49 @@ impl Buffer {
     /// Record a multidimensional array value for the given column.
     ///
     /// Supports arrays with up to [`MAX_ARRAY_DIMS`] dimensions. The array elements must
-    /// implement [`ArrayElement`] trait which provides type-to-[`ElemDataType`] mapping.
+    /// be of type `f64`, which is currently the only supported data type.
     ///
     /// # Examples
     ///
-    /// Basic usage with direct dimension specification:
+    /// Recording a 2D array using slices:
     ///
-    /// ```
-    /// # #[cfg(feature = "ndarray")]
-    /// # {
+    /// ```no_run
     /// # use questdb::Result;
-    /// # use questdb::ingress::Buffer;
-    /// # use ndarray::array;
+    /// # use questdb::ingress::{Buffer, SenderBuilder};
     /// # fn main() -> Result<()> {
-    /// # let mut buffer = Buffer::new();
+    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+    /// # let mut buffer = sender.new_buffer();
     /// # buffer.table("x")?;
-    /// // Record a 2D array of f64 values
-    /// let array_2d = array![[1.1, 2.2], [3.3, 4.4]];
-    /// buffer.column_arr("array_col", &array_2d.view())?;
+    /// let array_2d = vec![vec![1.1, 2.2], vec![3.3, 4.4]];
+    /// buffer.column_arr("array_col", &array_2d)?;
     /// # Ok(())
     /// # }
-    /// # }
-    ///
     /// ```
     ///
-    /// Using [`ColumnName`] for validated column names:
+    /// Recording a 3D array using vectors:
     ///
-    /// ```
-    /// # #[cfg(feature = "ndarray")]
-    /// # {
+    /// ```no_run
     /// # use questdb::Result;
-    /// # use questdb::ingress::{Buffer, ColumnName};
-    /// # use ndarray::Array3;
+    /// # use questdb::ingress::{Buffer, ColumnName, SenderBuilder};
     /// # fn main() -> Result<()> {
-    /// # let mut buffer = Buffer::new();
+    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+    /// # let mut buffer = sender.new_buffer();
     /// # buffer.table("x1")?;
-    /// // Record a 3D array of f64 values
-    /// let array_3d = Array3::from_elem((2, 3, 4), 42f64);
+    /// let array_3d = vec![vec![vec![42.0; 4]; 3]; 2];
     /// let col_name = ColumnName::new("col1")?;
-    /// buffer.column_arr(col_name, &array_3d.view())?;
+    /// buffer.column_arr(col_name, &array_3d)?;
     /// # Ok(())
     /// # }
-    /// # }
     /// ```
+    ///
     /// # Errors
     ///
     /// Returns [`Error`] if:
     /// - Array dimensions exceed [`MAX_ARRAY_DIMS`]
     /// - Failed to get dimension sizes
     /// - Column name validation fails
+    /// - Protocol version v1 is used (arrays require v2+)
+    /// - Array contains unsupported element types (non-f64)
     #[allow(private_bounds)]
     pub fn column_arr<'a, N, T, D>(&mut self, name: N, view: &T) -> Result<&mut Self>
     where
@@ -1129,9 +1121,9 @@ impl Buffer {
         D: ArrayElement + ArrayElementSealed,
         Error: From<N::Error>,
     {
-        if self.version == LineProtocolVersion::V1 {
+        if self.version == ProtocolVersion::V1 {
             return Err(error::fmt!(
-                LineProtocolVersionError,
+                ProtocolVersionError,
                 "line protocol version v1 does not support array datatype",
             ));
         }
@@ -1193,59 +1185,15 @@ impl Buffer {
         Ok(self)
     }
 
-    #[allow(private_bounds)]
-    #[cfg(feature = "benchmark")]
-    pub fn column_arr_use_raw_buffer<'a, N, T, D>(&mut self, name: N, view: &T) -> Result<&mut Self>
-    where
-        N: TryInto<ColumnName<'a>>,
-        T: NdArrayView<D>,
-        D: ArrayElement + ArrayElementSealed,
-        Error: From<N::Error>,
-    {
-        self.write_column_key(name)?;
-
-        // check dimension less equal than max dims
-        if MAX_ARRAY_DIMS < view.ndim() {
-            return Err(error::fmt!(
-                ArrayHasTooManyDims,
-                "Array dimension mismatch: expected at most {} dimensions, but got {}",
-                MAX_ARRAY_DIMS,
-                view.ndim()
-            ));
-        }
-
-        let reserve_size = get_and_check_array_bytes_size(view)?;
-        // binary format flag '='
-        self.output.push(b'=');
-        // binary format entity type
-        self.output.push(ARRAY_BINARY_FORMAT_TYPE);
-        // ndarr datatype
-        self.output.push(D::type_tag());
-        // ndarr dims
-        self.output.push(view.ndim() as u8);
-
-        for i in 0..view.ndim() {
-            let d = view.dim(i)?;
-            // ndarr shapes
-            self.output
-                .extend_from_slice((d as i32).to_le_bytes().as_slice());
-        }
-
-        self.output.reserve(reserve_size);
-        let index = self.output.len();
-        unsafe { self.output.set_len(reserve_size + index) }
-        ndarr::write_array_data_use_raw_buffer(&mut self.output[index..], view);
-        Ok(self)
-    }
-
     /// Record a timestamp value for the given column.
     ///
-    /// ```
+    /// ```no_run
     /// # use questdb::Result;
-    /// # use questdb::ingress::Buffer;
+    /// # use questdb::ingress::{Buffer, SenderBuilder};
     /// use questdb::ingress::TimestampMicros;
     /// # fn main() -> Result<()> {
-    /// # let mut buffer = Buffer::new();
+    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+    /// # let mut buffer = sender.new_buffer();
     /// # buffer.table("x")?;
     /// buffer.column_ts("col_name", TimestampMicros::now())?;
     /// # Ok(())
@@ -1254,13 +1202,14 @@ impl Buffer {
     ///
     /// or
     ///
-    /// ```
+    /// ```no_run
     /// # use questdb::Result;
-    /// # use questdb::ingress::Buffer;
+    /// # use questdb::ingress::{Buffer, SenderBuilder};
     /// use questdb::ingress::TimestampMicros;
     ///
     /// # fn main() -> Result<()> {
-    /// # let mut buffer = Buffer::new();
+    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+    /// # let mut buffer = sender.new_buffer();
     /// # buffer.table("x")?;
     /// buffer.column_ts("col_name", TimestampMicros::new(1659548204354448))?;
     /// # Ok(())
@@ -1269,14 +1218,15 @@ impl Buffer {
     ///
     /// or
     ///
-    /// ```
+    /// ```no_run
     /// # use questdb::Result;
-    /// # use questdb::ingress::Buffer;
+    /// # use questdb::ingress::{Buffer, SenderBuilder};
     /// use questdb::ingress::TimestampMicros;
     /// use questdb::ingress::ColumnName;
     ///
     /// # fn main() -> Result<()> {
-    /// # let mut buffer = Buffer::new();
+    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+    /// # let mut buffer = sender.new_buffer();
     /// # buffer.table("x")?;
     /// let col_name = ColumnName::new("col_name")?;
     /// buffer.column_ts(col_name, TimestampMicros::now())?;
@@ -1311,12 +1261,13 @@ impl Buffer {
     /// start recording the next row by calling [Buffer::table] again, or  you can send
     /// the accumulated batch by calling [Sender::flush] or one of its variants.
     ///
-    /// ```
+    /// ```no_run
     /// # use questdb::Result;
-    /// # use questdb::ingress::Buffer;
+    /// # use questdb::ingress::{Buffer, SenderBuilder};
     /// use questdb::ingress::TimestampNanos;
     /// # fn main() -> Result<()> {
-    /// # let mut buffer = Buffer::new();
+    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+    /// # let mut buffer = sender.new_buffer();
     /// # buffer.table("x")?.symbol("a", "b")?;
     /// buffer.at(TimestampNanos::now())?;
     /// # Ok(())
@@ -1325,13 +1276,14 @@ impl Buffer {
     ///
     /// or
     ///
-    /// ```
+    /// ```no_run
     /// # use questdb::Result;
-    /// # use questdb::ingress::Buffer;
+    /// # use questdb::ingress::{Buffer, SenderBuilder};
     /// use questdb::ingress::TimestampNanos;
     ///
     /// # fn main() -> Result<()> {
-    /// # let mut buffer = Buffer::new();
+    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+    /// # let mut buffer = sender.new_buffer();
     /// # buffer.table("x")?.symbol("a", "b")?;
     /// buffer.at(TimestampNanos::new(1659548315647406592))?;
     /// # Ok(())
@@ -1391,11 +1343,12 @@ impl Buffer {
     /// again, or you can send the accumulated batch by calling [Sender::flush] or one of
     /// its variants.
     ///
-    /// ```
+    /// ```no_run
     /// # use questdb::Result;
-    /// # use questdb::ingress::Buffer;
+    /// # use questdb::ingress::{Buffer, SenderBuilder};
     /// # fn main() -> Result<()> {
-    /// # let mut buffer = Buffer::new();
+    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+    /// # let mut buffer = sender.new_buffer();
     /// # buffer.table("x")?.symbol("a", "b")?;
     /// buffer.at_now()?;
     /// # Ok(())
@@ -1410,12 +1363,6 @@ impl Buffer {
     }
 }
 
-impl Default for Buffer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Connects to a QuestDB instance and inserts data via the ILP protocol.
 ///
 /// * To construct an instance, use [`Sender::from_conf`] or the [`SenderBuilder`].
@@ -1426,9 +1373,14 @@ pub struct Sender {
     handler: ProtocolHandler,
     connected: bool,
     max_buf_size: usize,
-    default_line_protocol_version: LineProtocolVersion,
+    default_protocol_version: ProtocolVersion,
     #[cfg(feature = "ilp-over-http")]
-    supported_line_protocol_versions: Option<Vec<LineProtocolVersion>>,
+    /// List of protocol versions supported by the server.
+    /// This is an `Option<Vec<ProtocolVersion>>` because:
+    /// - `Some(versions)`: The server explicitly returned supported protocol versions
+    ///   during handshake (with `/settings` endpoint).
+    /// - `None`: The server didn't provide protocol version information (legacy servers).
+    supported_protocol_versions: Option<Vec<ProtocolVersion>>,
 }
 
 impl std::fmt::Debug for Sender {
@@ -1884,6 +1836,7 @@ pub struct SenderBuilder {
     token: ConfigSetting<Option<String>>,
     token_x: ConfigSetting<Option<String>>,
     token_y: ConfigSetting<Option<String>>,
+    protocol_version: ConfigSetting<Option<ProtocolVersion>>,
 
     #[cfg(feature = "insecure-skip-verify")]
     tls_verify: ConfigSetting<bool>,
@@ -1953,6 +1906,17 @@ impl SenderBuilder {
                 "token_x" => builder.token_x(val)?,
                 "token_y" => builder.token_y(val)?,
                 "bind_interface" => builder.bind_interface(val)?,
+                "protocol_version" => match val {
+                    "1" => builder.protocol_version(ProtocolVersion::V1)?,
+                    "2" => builder.protocol_version(ProtocolVersion::V2)?,
+                    "auto" => builder,
+                    invalid => {
+                        return Err(error::fmt!(
+                            ConfigError,
+                            "invalid \"protocol_version\" [value={invalid}, allowed-values=[auto, 1, 2]]]\"]"
+                        ))
+                    }
+                },
 
                 "init_buf_size" => {
                     return Err(error::fmt!(
@@ -2054,12 +2018,12 @@ impl SenderBuilder {
                 }
 
                 #[cfg(feature = "ilp-over-http")]
-                "disable_line_protocol_validation" => {
+                "disable_protocol_validation" => {
                     if val == "on" {
-                        builder.disable_line_protocol_validation()?
+                        builder.disable_protocol_validation()?
                     } else if val != "off" {
                         return Err(error::fmt!(
-                            ConfigError, "invalid \"disable_line_protocol_validation\" [value={val}, allowed-values=[on, off]]]\"]"));
+                            ConfigError, "invalid \"disable_protocol_validation\" [value={val}, allowed-values=[on, off]]]\"]"));
                     } else {
                         builder
                     }
@@ -2126,6 +2090,7 @@ impl SenderBuilder {
             token: ConfigSetting::new_default(None),
             token_x: ConfigSetting::new_default(None),
             token_y: ConfigSetting::new_default(None),
+            protocol_version: ConfigSetting::new_default(None),
 
             #[cfg(feature = "insecure-skip-verify")]
             tls_verify: ConfigSetting::new_default(true),
@@ -2195,6 +2160,13 @@ impl SenderBuilder {
     pub fn token_y(mut self, token_y: &str) -> Result<Self> {
         self.token_y
             .set_specified("token_y", Some(validate_value(token_y.to_string())?))?;
+        Ok(self)
+    }
+
+    /// Set the line protocol version.
+    pub fn protocol_version(mut self, protocol_version: ProtocolVersion) -> Result<Self> {
+        self.protocol_version
+            .set_specified("protocol_version", Some(protocol_version))?;
         Ok(self)
     }
 
@@ -2341,14 +2313,14 @@ impl SenderBuilder {
     /// - When set to `"off"`: Skips the initial server version handshake and disables protocol validation.
     /// - When set to `"on"`: Keeps default validation behavior (recommended).
     ///
-    /// Please ensure client's default version ([`LINE_PROTOCOL_VERSION_V2`]) or
+    /// Please ensure client's default version ([`ProtocolVersion::V1`]) or
     /// explicitly set protocol version exactly matches server expectation.
-    pub fn disable_line_protocol_validation(mut self) -> Result<Self> {
+    pub fn disable_protocol_validation(mut self) -> Result<Self> {
         if let Some(http) = &mut self.http {
             // ignore "already specified" error
             let _ = http
-                .disable_line_proto_validation
-                .set_specified("disable_line_protocol_validation", true);
+                .disable_protocol_validation
+                .set_specified("disable_protocol_validation", true);
         }
         Ok(self)
     }
@@ -2640,16 +2612,20 @@ impl SenderBuilder {
             }
         };
 
-        let mut default_line_protocol_version = LineProtocolVersion::V2;
+        let mut default_protocol_version = match self.protocol_version.deref() {
+            None => ProtocolVersion::V1,
+            Some(v) => *v,
+        };
+
         #[cfg(feature = "ilp-over-http")]
-        let mut supported_line_protocol_versions: Option<Vec<_>> = None;
+        let mut supported_protocol_versions: Option<Vec<_>> = None;
 
         #[cfg(feature = "ilp-over-http")]
         match self.protocol {
             Protocol::Tcp | Protocol::Tcps => {}
             Protocol::Http | Protocol::Https => {
                 let http_config = self.http.as_ref().unwrap();
-                if !*http_config.disable_line_proto_validation.deref() {
+                if !*http_config.disable_protocol_validation.deref() {
                     if let ProtocolHandler::Http(http_state) = &handler {
                         let settings_url = &format!(
                             "{}://{}:{}/settings",
@@ -2657,12 +2633,10 @@ impl SenderBuilder {
                             self.host.deref(),
                             self.port.deref()
                         );
-                        (
-                            supported_line_protocol_versions,
-                            default_line_protocol_version,
-                        ) = get_line_protocol_version(http_state, settings_url)?;
+                        (supported_protocol_versions, default_protocol_version) =
+                            get_protocol_version(http_state, settings_url)?;
                     } else {
-                        default_line_protocol_version = LineProtocolVersion::V1;
+                        default_protocol_version = ProtocolVersion::V1;
                     }
                 }
             }
@@ -2678,9 +2652,9 @@ impl SenderBuilder {
             handler,
             connected: true,
             max_buf_size: *self.max_buf_size,
-            default_line_protocol_version,
+            default_protocol_version,
             #[cfg(feature = "ilp-over-http")]
-            supported_line_protocol_versions,
+            supported_protocol_versions,
         };
 
         Ok(sender)
@@ -2799,17 +2773,6 @@ fn parse_key_pair(auth: &EcdsaAuthParams) -> Result<EcdsaKeyPair> {
     })
 }
 
-fn f64_text_series(vec: &mut Vec<u8>, value: f64) {
-    let mut ser = F64Serializer::new(value);
-    vec.extend_from_slice(ser.as_str().as_bytes())
-}
-
-fn f64_binary_series(vec: &mut Vec<u8>, value: f64) {
-    vec.push(b'=');
-    vec.push(DOUBLE_BINARY_FORMAT_TYPE);
-    vec.extend_from_slice(&value.to_le_bytes())
-}
-
 pub(crate) struct F64Serializer {
     buf: ryu::Buffer,
     n: f64,
@@ -2887,6 +2850,28 @@ impl Sender {
         SenderBuilder::from_env()?.build()
     }
 
+    /// Creates a new [`Buffer`] with default parameters.
+    ///
+    /// This initializes a buffer using the sender's protocol version and
+    /// the QuestDB server's default maximum name length of 127 characters.
+    /// For custom name lengths, use [`new_buffer_with_max_name_len`](Self::new_buffer_with_max_name_len)
+    ///
+    /// The default `max_name_len` matches the QuestDB server's `cairo.max.file.name.length` setting.
+    pub fn new_buffer(&self) -> Buffer {
+        Buffer::new(self.default_protocol_version)
+    }
+
+    /// Creates a new [`Buffer`] with a custom maximum name length.
+    ///
+    /// This initializes a buffer using the sender's protocol version and
+    /// a specified maximum length for table/column names. The value should match
+    /// your QuestDB server's `cairo.max.file.name.length` configuration.
+    ///
+    /// For the default name length (127), use [`new_buffer`](Self::new_buffer)
+    pub fn new_buffer_with_max_name_len(&self, max_name_len: usize) -> Buffer {
+        Buffer::with_max_name_len(max_name_len, self.default_protocol_version)
+    }
+
     #[allow(unused_variables)]
     fn flush_impl(&mut self, buf: &Buffer, transactional: bool) -> Result<()> {
         if !self.connected {
@@ -2907,7 +2892,7 @@ impl Sender {
         }
 
         #[cfg(feature = "ilp-over-http")]
-        self.check_line_protocol_version(buf.version)?;
+        self.check_protocol_version(buf.version)?;
 
         let bytes = buf.as_bytes();
         if bytes.is_empty() {
@@ -3031,52 +3016,51 @@ impl Sender {
     }
 
     /// Returns the QuestDB server's recommended default line protocol version.
-    /// Will be used to [`Buffer::with_line_proto_version`]
     ///
     /// The version selection follows these rules:
-    /// 1. **TCP/TCPS Protocol**: Always returns [`LineProtocolVersion::V2`]
+    /// 1. **TCP/TCPS Protocol**: Always returns [`ProtocolVersion::V2`]
     /// 2. **HTTP/HTTPS Protocol**:
-    ///    - If line protocol auto-detection is disabled [`SenderBuilder::disable_line_protocol_validation`], returns [`LineProtocolVersion::V2`]
+    ///    - If line protocol auto-detection is disabled [`SenderBuilder::disable_protocol_validation`], returns [`ProtocolVersion::V2`]
     ///    - If line protocol auto-detection is enabled:
     ///      - Uses the server's default version if supported by the client
     ///      - Otherwise uses the highest mutually supported version from the intersection
     ///        of client and server compatible versions
-    pub fn default_line_protocol_version(&self) -> LineProtocolVersion {
-        self.default_line_protocol_version
+    pub fn default_protocol_version(&self) -> ProtocolVersion {
+        self.default_protocol_version
     }
 
     #[cfg(feature = "ilp-over-http")]
     #[cfg(test)]
-    pub(crate) fn support_line_protocol_versions(&self) -> Option<Vec<LineProtocolVersion>> {
-        self.supported_line_protocol_versions.clone()
+    pub(crate) fn support_protocol_versions(&self) -> Option<Vec<ProtocolVersion>> {
+        self.supported_protocol_versions.clone()
     }
 
     #[cfg(feature = "ilp-over-http")]
     #[inline(always)]
-    fn check_line_protocol_version(&self, version: LineProtocolVersion) -> Result<()> {
+    fn check_protocol_version(&self, version: ProtocolVersion) -> Result<()> {
         match &self.handler {
             ProtocolHandler::Socket(_) => Ok(()),
             #[cfg(feature = "ilp-over-http")]
             ProtocolHandler::Http(http) => {
-                if *http.config.disable_line_proto_validation.deref() {
+                if *http.config.disable_protocol_validation.deref() {
                     Ok(())
                 } else {
-                    match self.supported_line_protocol_versions {
+                    match self.supported_protocol_versions {
                         Some(ref supported_line_protocols) => {
                             if supported_line_protocols.contains(&version) {
                                 Ok(())
                             } else {
                                 Err(error::fmt!(
-                                    LineProtocolVersionError,
+                                    ProtocolVersionError,
                                     "Line protocol version {} is not supported by current QuestDB Server",  version))
                             }
                         }
                         None => {
-                            if version == LineProtocolVersion::V1 {
+                            if version == ProtocolVersion::V1 {
                                 Ok(())
                             } else {
                                 Err(error::fmt!(
-                                LineProtocolVersionError,
+                                ProtocolVersionError,
                                     "Line protocol version {} is not supported by current QuestDB Server",  version))
                             }
                         }
