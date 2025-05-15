@@ -38,9 +38,8 @@ pub(crate) fn write_array_data<A: NdArrayView<T>, T>(
 where
     T: ArrayElement,
 {
-    // First optimization path: write contiguous memory directly
-    // When working with contiguous layout. Benchmark shows `copy_from_slice` has better performance than
-    // `std::ptr::copy_nonoverlapping` on both arm(Macos) and x86(Linux) platform.
+    // When working with contiguous layout, benchmark shows `copy_from_slice` has better performance than
+    // `std::ptr::copy_nonoverlapping` on both Arm(Macos) and x86(Linux) platform.
     // This may because `copy_from_slice` benefits more from compiler.
     if let Some(contiguous) = array.as_slice() {
         let bytes = unsafe {
@@ -69,7 +68,6 @@ where
         return Ok(());
     }
 
-    // Fallback path: non-contiguous memory handling
     // For non-contiguous memory layouts, direct raw pointer operations are preferred.
     let elem_size = size_of::<T>();
     let mut total_len = 0;
@@ -94,7 +92,7 @@ where
     Ok(())
 }
 
-pub(crate) fn get_and_check_array_bytes_size<A: NdArrayView<T>, T>(
+pub(crate) fn check_and_get_array_bytes_size<A: NdArrayView<T>, T>(
     array: &A,
 ) -> Result<usize, Error>
 where
@@ -135,10 +133,10 @@ impl ArrayElementSealed for f64 {
     }
 }
 
-/// A view into a multi-dimensional array with custom memory strides.
+/// A view into a multidimensional array with custom memory strides.
 // TODO: We are currently evaluating whether to use StrideArrayView or ndarray's view.
 //       Current benchmarks show that StrideArrayView's iter implementation underperforms(2x)
-//       compared to ndarray's view. If we proceed with StrideArrayView, we need to
+//       compared to ndarray's. If we proceed with StrideArrayView, we need to
 //       optimize the iter traversal pattern
 #[derive(Debug)]
 pub struct StrideArrayView<'a, T> {
