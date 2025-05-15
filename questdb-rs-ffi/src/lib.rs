@@ -1439,7 +1439,7 @@ pub unsafe extern "C" fn line_sender_buffer_new_for_sender(
 /// If the server does not configure it, the default is `127`, and you can
 /// call `line_sender_buffer_new_for_sender()` instead.
 #[no_mangle]
-pub unsafe extern "C" fn line_sender_buffer_new_with_max_name_len_for_sender(
+pub unsafe extern "C" fn line_sender_buffer_with_max_name_len_for_sender(
     sender: *const line_sender,
     max_name_len: size_t,
 ) -> *mut line_sender_buffer {

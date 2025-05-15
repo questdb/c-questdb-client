@@ -936,7 +936,7 @@ line_sender_buffer* line_sender_buffer_new_for_sender(
  * connecting to. If the server does not configure it, the default is `127`,
  * and you can call `line_sender_buffer_new_for_sender()` instead.
  */
-line_sender_buffer* line_sender_buffer_new_with_max_name_len_for_sender(
+line_sender_buffer* line_sender_buffer_with_max_name_len_for_sender(
     const line_sender* sender, size_t max_name_len);
 
 /**

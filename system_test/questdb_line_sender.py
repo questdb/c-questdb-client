@@ -214,7 +214,8 @@ def _setup_cdll():
     set_sig(
         dll.line_sender_buffer_with_max_name_len,
         c_line_sender_buffer_p,
-        c_size_t)
+        c_size_t,
+        c_protocol_version)
     set_sig(
         dll.line_sender_buffer_free,
         None,
@@ -367,9 +368,10 @@ def _setup_cdll():
         c_line_sender_utf8,
         c_line_sender_error_p_p)
     set_sig(
-        dll.line_sender_opts_disable_protocol_validation,
+        dll.line_sender_opts_protocol_version,
         c_bool,
         c_line_sender_opts_p,
+        c_protocol_version,
         c_line_sender_error_p_p)
     set_sig(
         dll.line_sender_opts_auth_timeout,
@@ -445,6 +447,11 @@ def _setup_cdll():
         dll.line_sender_default_protocol_version,
         c_protocol_version,
         c_line_sender_p)
+    set_sig(
+        dll.line_sender_buffer_with_max_name_len_for_sender,
+        c_line_sender_buffer_p,
+        c_line_sender_p,
+        c_size_t)
     set_sig(
         dll.line_sender_must_close,
         None,
@@ -574,8 +581,6 @@ class _Opts:
         fn = getattr(_DLL, 'line_sender_opts_' + name)
 
         def wrapper(*args):
-            if name == 'disable_protocol_validation':
-                return _error_wrapped_call(fn, self.impl)
             mapped_args = [
                 (_utf8(arg) if isinstance(arg, str) else arg)
                 for arg in args]
@@ -596,14 +601,10 @@ class TimestampMicros:
 
 
 class Buffer:
-    def __init__(self, init_buf_size=65536, max_name_len=127, protocol_version=ProtocolVersion.V2):
+    def __init__(self, protocol_version: ProtocolVersion, init_buf_size=65536, max_name_len=127, ):
         self._impl = _DLL.line_sender_buffer_with_max_name_len(
-            c_size_t(max_name_len))
+            c_size_t(max_name_len), protocol_version.value[0])
         _DLL.line_sender_buffer_reserve(self._impl, c_size_t(init_buf_size))
-        _error_wrapped_call(
-            _DLL.line_sender_buffer_set_protocol_version,
-            self._impl,
-            protocol_version.value[0])
 
     def __len__(self):
         return _DLL.line_sender_buffer_size(self._impl)
@@ -620,12 +621,6 @@ class Buffer:
             return _PY_DLL.PyBytes_FromStringAndSize(c_buf, view.len)
         else:
             return ''
-
-    def set_protocol_version(self, version: ProtocolVersion):
-        _error_wrapped_call(
-            _DLL.line_sender_buffer_set_protocol_version,
-            self._impl,
-            version.value[0])
 
     def reserve(self, additional):
         _DLL.line_sender_buffer_reserve(self._impl, c_size_t(additional))

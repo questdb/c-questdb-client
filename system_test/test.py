@@ -95,11 +95,11 @@ AUTH_MALFORMED3 = dict(
 
 
 class TestSender(unittest.TestCase):
-    def _mk_linesender(self, disable_protocol_validation=False):
+    def _mk_linesender(self):
         # N.B.: We never connect with TLS here.
         auth = AUTH if QDB_FIXTURE.auth else {}
-        if disable_protocol_validation:
-            auth["disable_protocol_validation"] = "on"
+        if not QDB_FIXTURE.http and not QDB_FIXTURE.version < (8, 3, 1):
+            auth["protocol_version"] = "2"
         return qls.Sender(
             BUILD_MODE,
             qls.Protocol.HTTP if QDB_FIXTURE.http else qls.Protocol.TCP,
@@ -952,7 +952,10 @@ class TestSender(unittest.TestCase):
             self.skipTest('TCP-only test')
         if QDB_FIXTURE.version <= (7, 3, 7):
             self.skipTest('No ILP/HTTP support')
-        buf = qls.Buffer()
+        version = qls.ProtocolVersion.V2
+        if QDB_FIXTURE.version <= (8, 3, 1):
+            version = qls.ProtocolVersion.V1
+        buf = qls.Buffer(version)
         buf.table('t1').column('c1', 'v1').at(time.time_ns())
         with self.assertRaisesRegex(qls.SenderError, r'.*Transactional .* not supported.*'):
             with self._mk_linesender() as sender:
