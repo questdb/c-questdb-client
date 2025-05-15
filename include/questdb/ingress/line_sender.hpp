@@ -87,16 +87,16 @@ enum class line_sender_error_code
 /** The protocol used to connect with. */
 enum class protocol
 {
-    /** InfluxDB Line Protocol over TCP. */
+    /** Ingestion Line Protocol over TCP. */
     tcp,
 
-    /** InfluxDB Line Protocol over TCP with TLS. */
+    /** Ingestion Line Protocol over TCP with TLS. */
     tcps,
 
-    /** InfluxDB Line Protocol over HTTP. */
+    /** Ingestion Line Protocol over HTTP. */
     http,
 
-    /** InfluxDB Line Protocol over HTTP with TLS. */
+    /** Ingestion Line Protocol over HTTP with TLS. */
     https,
 };
 
@@ -1192,7 +1192,7 @@ private:
 };
 
 /**
- * Inserts data into QuestDB via the InfluxDB Line Protocol.
+ * Inserts data into QuestDB via the Ingestion Line Protocol.
  *
  * Batch up rows in a `line_sender_buffer` object, then call
  * `.flush()` or one of its variants to send.

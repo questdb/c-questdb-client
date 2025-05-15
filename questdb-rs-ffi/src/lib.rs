@@ -192,16 +192,16 @@ impl From<ErrorCode> for line_sender_error_code {
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub enum line_sender_protocol {
-    /// InfluxDB Line Protocol over TCP.
+    /// Ingestion Line Protocol over TCP.
     line_sender_protocol_tcp,
 
-    /// InfluxDB Line Protocol over TCP with TLS.
+    /// Ingestion Line Protocol over TCP with TLS.
     line_sender_protocol_tcps,
 
-    /// InfluxDB Line Protocol over HTTP.
+    /// Ingestion Line Protocol over HTTP.
     line_sender_protocol_http,
 
-    /// InfluxDB Line Protocol over HTTP with TLS.
+    /// Ingestion Line Protocol over HTTP with TLS.
     line_sender_protocol_https,
 }
 
@@ -235,7 +235,7 @@ pub enum ProtocolVersion {
     /// Uses text format serialization for f64.
     V1 = 1,
 
-    /// Version 2 of InfluxDB Line Protocol.
+    /// Version 2 of Ingestion Line Protocol.
     /// Uses binary format serialization for f64, and support array data type.
     V2 = 2,
 }
@@ -1321,7 +1321,7 @@ pub unsafe extern "C" fn line_sender_opts_free(opts: *mut line_sender_opts) {
     }
 }
 
-/// Inserts data into QuestDB via the InfluxDB Line Protocol.
+/// Inserts data into QuestDB via the Ingestion Line Protocol.
 ///
 /// Batch up rows in a `line_sender_buffer`, then call `line_sender_flush()` or
 /// one of its variants with this object to send them.

@@ -4,10 +4,14 @@ Official Rust client for [QuestDB](https://questdb.io/), an open-source SQL
 database designed to process time-series data, faster.
 
 The client library is designed for fast ingestion of data into QuestDB via the
-InfluxDB Line Protocol (ILP).
+Ingestion Line Protocol (ILP) over either HTTP (recommended) or TCP.
 
 * [QuestDB Database docs](https://questdb.io/docs/)
-* [Docs on InfluxDB Line Protocol](https://questdb.io/docs/reference/api/ilp/overview/)
+* [Docs on Ingestion Line Protocol](https://questdb.io/docs/reference/api/ilp/overview/)
+
+When connecting to QuestDB over HTTP, the library will auto-detect the server's
+latest supported version and use it. Version 1 is compatible with
+the [InfluxDB Line Protocol](https://docs.influxdata.com/influxdb/v2/reference/syntax/line-protocol/).
 
 ## Quick Start
 

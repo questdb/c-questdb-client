@@ -350,7 +350,7 @@ TEST_CASE("One column only - server.accept() after flush, before close")
     questdb::ingress::line_sender sender{
         questdb::ingress::protocol::tcp, "localhost", server.port()};
 
-    // Does not raise - this is unlike InfluxDB spec that disallows this.
+    // Does not raise - this is unlike the InfluxDB spec that disallows this.
     questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
     buffer.table("test").column("t1", "v1").at_now();
     CHECK(!sender.must_close());

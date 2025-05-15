@@ -1693,7 +1693,8 @@ pub enum Protocol {
     Tcps,
 
     #[cfg(feature = "ilp-over-http")]
-    /// ILP over HTTP (request-response, InfluxDB-compatible).
+    /// ILP over HTTP (request-response)
+    /// Version 1 is compatible with the InfluxDB Line Protocol.
     Http,
 
     #[cfg(feature = "ilp-over-http")]

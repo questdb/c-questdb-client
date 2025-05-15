@@ -95,28 +95,33 @@ typedef enum line_sender_error_code
 /** The protocol used to connect with. */
 typedef enum line_sender_protocol
 {
-    /** InfluxDB Line Protocol over TCP. */
+    /** Ingestion Line Protocol over TCP. */
     line_sender_protocol_tcp,
 
-    /** InfluxDB Line Protocol over TCP with TLS. */
+    /** Ingestion Line Protocol over TCP with TLS. */
     line_sender_protocol_tcps,
 
-    /** InfluxDB Line Protocol over HTTP. */
+    /** Ingestion Line Protocol over HTTP. */
     line_sender_protocol_http,
 
-    /** InfluxDB Line Protocol over HTTP with TLS. */
+    /** Ingestion Line Protocol over HTTP with TLS. */
     line_sender_protocol_https,
 } line_sender_protocol;
 
 /** The line protocol version used to write data to buffer. */
 typedef enum protocol_version
 {
-    /** Version 1 of InfluxDB Line Protocol.
-    Uses text format serialization for f64. */
+    /**
+     * Version 1 of Ingestion Line Protocol.
+     * This version is compatible with InfluxDB line protocol.
+     */
     protocol_version_1 = 1,
 
-    /** Version 2 of InfluxDB Line Protocol.
-    Uses binary format serialization for f64, and support array data type.*/
+    /**
+     * Version 2 of Ingestion Line Protocol.
+     * Uses a binary format serialization for f64, and supports
+     * the array data type.
+     */
     protocol_version_2 = 2,
 } protocol_version;
 
@@ -618,7 +623,7 @@ bool line_sender_buffer_at_now(
 /////////// Connecting, sending and disconnecting.
 
 /**
- * Inserts data into QuestDB via the InfluxDB Line Protocol.
+ * Inserts data into QuestDB via the Ingestion Line Protocol.
  *
  * Batch up rows in a `line_sender_buffer`, then call `line_sender_flush()`
  * or one of its variants with this object to send them.
