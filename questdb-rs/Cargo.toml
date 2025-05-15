@@ -59,7 +59,7 @@ webpki-roots = "0.26.8"
 rstest = "0.25.0"
 
 [features]
-default = ["tls-webpki-certs", "ilp-over-http", "aws-lc-crypto"]
+default = ["tls-webpki-certs", "ilp-over-http", "ring-crypto"]
 
 # Include support for ILP over HTTP.
 ilp-over-http = ["dep:ureq", "dep:serde_json", "dep:rand"]
@@ -92,7 +92,7 @@ chrono_timestamp = ["chrono"]
 almost-all-features = [
     "tls-webpki-certs",
     "ilp-over-http",
-    "aws-lc-crypto",
+    "ring-crypto",
     "insecure-skip-verify",
     "json_tests",
     "chrono_timestamp",
