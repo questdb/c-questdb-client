@@ -746,13 +746,6 @@ bool line_sender_opts_token_y(
     line_sender_error** err_out);
 
 /**
- * Disable the line protocol validation.
- */
-LINESENDER_API
-bool line_sender_opts_disable_protocol_validation(
-    line_sender_opts* opts, line_sender_error** err_out);
-
-/**
  * set the line protocol version.
  */
 LINESENDER_API
@@ -920,21 +913,10 @@ line_sender* line_sender_from_conf(
 LINESENDER_API
 line_sender* line_sender_from_env(line_sender_error** err_out);
 
-/**
- * Returns the QuestDB server's recommended default line protocol version.
- * Will be used to [`line_sender_buffer_set_protocol_version`]
- *
- * The version selection follows these rules:
- * 1. TCP/TCPS Protocol: Always returns [`ProtocolVersion::V2`]
- * 2. HTTP/HTTPS Protocol:
- *   - If line protocol auto-detection is disabled
- *    [`line_sender_opts_disable_protocol_validation`], returns
- *    [`ProtocolVersion::V2`]
- *   - If line protocol auto-detection is enabled:
- *     - Uses the server's default version if supported by the client
- *     - Otherwise uses the highest mutually supported version from the
- *       intersection of client and server compatible versions.
- */
+/// Returns sender's default protocol version.
+/// 1. User-set value via [`line_sender_opts_protocol_version`]
+/// 2. V1 for TCP/TCPS (legacy protocol)
+/// 3. Auto-detected version for HTTP/HTTPS
 LINESENDER_API
 protocol_version line_sender_default_protocol_version(
     const line_sender* sender);

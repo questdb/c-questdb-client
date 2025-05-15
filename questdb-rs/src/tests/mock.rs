@@ -310,16 +310,11 @@ impl MockServer {
     }
 
     #[cfg(feature = "ilp-over-http")]
-    pub fn configure_settings_response(
-        mut self,
-        default_version: u16,
-        supported_versions: &[u16],
-    ) -> Self {
-        if default_version == 0 {
+    pub fn configure_settings_response(mut self, supported_versions: &[u16]) -> Self {
+        if supported_versions.is_empty() {
             self.settings_response = serde_json::json!({"version": "8.1.2"});
         } else {
             self.settings_response = serde_json::json!({
-                "line.proto.default.version": default_version,
                 "line.proto.support.versions": supported_versions
             });
         }

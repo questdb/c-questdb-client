@@ -1172,15 +1172,6 @@ pub unsafe extern "C" fn line_sender_opts_token_y(
     upd_opts!(opts, err_out, token_y, token_y.as_str())
 }
 
-/// Disable the line protocol validation.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_opts_disable_protocol_validation(
-    opts: *mut line_sender_opts,
-    err_out: *mut *mut line_sender_error,
-) -> bool {
-    upd_opts!(opts, err_out, disable_protocol_validation)
-}
-
 /// set the line protocol version.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_opts_protocol_version(
@@ -1420,16 +1411,10 @@ unsafe fn unwrap_sender_mut<'a>(sender: *mut line_sender) -> &'a mut Sender {
     &mut (*sender).0
 }
 
-/// Returns the client's recommended default line protocol version.
-///
-/// The version selection follows these rules:
-/// 1. **TCP/TCPS Protocol**: Always returns [`ProtocolVersion::V2`]
-/// 2. **HTTP/HTTPS Protocol**:
-///    - If line protocol auto-detection is disabled [`line_sender_opts_disable_protocol_validation`], returns [`ProtocolVersion::V2`]
-///    - If line protocol auto-detection is enabled:
-///      - Uses the server's default version if supported by the client
-///      - Otherwise uses the highest mutually supported version from the intersection
-///        of client and server compatible versions
+/// Returns sender's default protocol version.
+/// 1. User-set value via [`line_sender_opts_protocol_version`]
+/// 2. V1 for TCP/TCPS (legacy protocol)
+/// 3. Auto-detected version for HTTP/HTTPS
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_default_protocol_version(
     sender: *const line_sender,

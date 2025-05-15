@@ -591,8 +591,8 @@ impl Buffer {
     /// - Sets maximum name length to **127 characters** (QuestDB server default)
     ///
     /// This is equivalent to [`Sender::new_buffer`] when using the sender's
-    /// protocol version. For custom name lengths, use
-    /// [`Sender::new_buffer_with_max_name_len`].
+    /// protocol version. For custom name lengths, use [`with_max_name_len`](Self::with_max_name_len)
+    /// or [`Sender::new_buffer_with_max_name_len`].
     pub fn new(protocol_version: ProtocolVersion) -> Self {
         Self {
             output: Vec::new(),
@@ -1376,10 +1376,9 @@ pub struct Sender {
     default_protocol_version: ProtocolVersion,
     #[cfg(feature = "ilp-over-http")]
     /// List of protocol versions supported by the server.
-    /// This is an `Option<Vec<ProtocolVersion>>` because:
-    /// - `Some(versions)`: The server explicitly returned supported protocol versions
-    ///   during handshake (with `/settings` endpoint).
-    /// - `None`: The server didn't provide protocol version information (legacy servers).
+    /// It will be `None` when user explicitly sets `protocol_version` (no first http round trip).
+    /// Note that when connecting to older servers (responding with 404 or missing version data),
+    /// it will be init as [`ProtocolVersion::V1`] instead of leaving `None`
     supported_protocol_versions: Option<Vec<ProtocolVersion>>,
 }
 
@@ -2017,18 +2016,6 @@ impl SenderBuilder {
                     builder.retry_timeout(Duration::from_millis(parse_conf_value(key, val)?))?
                 }
 
-                #[cfg(feature = "ilp-over-http")]
-                "disable_protocol_validation" => {
-                    if val == "on" {
-                        builder.disable_protocol_validation()?
-                    } else if val != "off" {
-                        return Err(error::fmt!(
-                            ConfigError, "invalid \"disable_protocol_validation\" [value={val}, allowed-values=[on, off]]]\"]"));
-                    } else {
-                        builder
-                    }
-                }
-
                 // Ignore other parameters.
                 // We don't want to fail on unknown keys as this would require releasing different
                 // library implementations in lock step as soon as a new parameter is added to any of them,
@@ -2303,24 +2290,6 @@ impl SenderBuilder {
                 ConfigError,
                 "\"request_timeout\" is supported only in ILP over HTTP."
             ));
-        }
-        Ok(self)
-    }
-
-    #[cfg(feature = "ilp-over-http")]
-    /// Disables automatic line protocol version validation for ILP-over-HTTP.
-    ///
-    /// - When set to `"off"`: Skips the initial server version handshake and disables protocol validation.
-    /// - When set to `"on"`: Keeps default validation behavior (recommended).
-    ///
-    /// Please ensure client's default version ([`ProtocolVersion::V1`]) or
-    /// explicitly set protocol version exactly matches server expectation.
-    pub fn disable_protocol_validation(mut self) -> Result<Self> {
-        if let Some(http) = &mut self.http {
-            // ignore "already specified" error
-            let _ = http
-                .disable_protocol_validation
-                .set_specified("disable_protocol_validation", true);
         }
         Ok(self)
     }
@@ -2612,20 +2581,20 @@ impl SenderBuilder {
             }
         };
 
-        let mut default_protocol_version = match self.protocol_version.deref() {
-            None => ProtocolVersion::V1,
-            Some(v) => *v,
-        };
-
+        let default_protocol_version;
         #[cfg(feature = "ilp-over-http")]
         let mut supported_protocol_versions: Option<Vec<_>> = None;
 
-        #[cfg(feature = "ilp-over-http")]
-        match self.protocol {
-            Protocol::Tcp | Protocol::Tcps => {}
-            Protocol::Http | Protocol::Https => {
-                let http_config = self.http.as_ref().unwrap();
-                if !*http_config.disable_protocol_validation.deref() {
+        match self.protocol_version.deref() {
+            Some(v) => {
+                default_protocol_version = *v;
+            }
+            None => match self.protocol {
+                Protocol::Tcp | Protocol::Tcps => {
+                    default_protocol_version = ProtocolVersion::V1;
+                }
+                #[cfg(feature = "ilp-over-http")]
+                Protocol::Http | Protocol::Https => {
                     if let ProtocolHandler::Http(http_state) = &handler {
                         let settings_url = &format!(
                             "{}://{}:{}/settings",
@@ -2633,14 +2602,24 @@ impl SenderBuilder {
                             self.host.deref(),
                             self.port.deref()
                         );
-                        (supported_protocol_versions, default_protocol_version) =
-                            get_protocol_version(http_state, settings_url)?;
+                        let versions = get_supported_protocol_versions(http_state, settings_url)?;
+                        if versions.contains(&ProtocolVersion::V2) {
+                            default_protocol_version = ProtocolVersion::V2;
+                        } else if versions.contains(&ProtocolVersion::V1) {
+                            default_protocol_version = ProtocolVersion::V1;
+                        } else {
+                            return Err(error::fmt!(
+                                ProtocolVersionError,
+                                "Server does not support current client"
+                            ));
+                        }
+                        supported_protocol_versions = Some(versions);
                     } else {
                         default_protocol_version = ProtocolVersion::V1;
                     }
                 }
-            }
-        };
+            },
+        }
 
         if auth.is_some() {
             descr.push_str("auth=on]");
@@ -2855,8 +2834,6 @@ impl Sender {
     /// This initializes a buffer using the sender's protocol version and
     /// the QuestDB server's default maximum name length of 127 characters.
     /// For custom name lengths, use [`new_buffer_with_max_name_len`](Self::new_buffer_with_max_name_len)
-    ///
-    /// The default `max_name_len` matches the QuestDB server's `cairo.max.file.name.length` setting.
     pub fn new_buffer(&self) -> Buffer {
         Buffer::new(self.default_protocol_version)
     }
@@ -3015,16 +2992,10 @@ impl Sender {
         !self.connected
     }
 
-    /// Returns the QuestDB server's recommended default line protocol version.
-    ///
-    /// The version selection follows these rules:
-    /// 1. **TCP/TCPS Protocol**: Always returns [`ProtocolVersion::V2`]
-    /// 2. **HTTP/HTTPS Protocol**:
-    ///    - If line protocol auto-detection is disabled [`SenderBuilder::disable_protocol_validation`], returns [`ProtocolVersion::V2`]
-    ///    - If line protocol auto-detection is enabled:
-    ///      - Uses the server's default version if supported by the client
-    ///      - Otherwise uses the highest mutually supported version from the intersection
-    ///        of client and server compatible versions
+    /// Returns sender's default protocol version.
+    /// 1. User-set value via [`SenderBuilder::protocol_version`]
+    /// 2. V1 for TCP/TCPS (legacy protocol)
+    /// 3. Auto-detected version for HTTP/HTTPS
     pub fn default_protocol_version(&self) -> ProtocolVersion {
         self.default_protocol_version
     }
@@ -3041,30 +3012,18 @@ impl Sender {
         match &self.handler {
             ProtocolHandler::Socket(_) => Ok(()),
             #[cfg(feature = "ilp-over-http")]
-            ProtocolHandler::Http(http) => {
-                if *http.config.disable_protocol_validation.deref() {
-                    Ok(())
-                } else {
-                    match self.supported_protocol_versions {
-                        Some(ref supported_line_protocols) => {
-                            if supported_line_protocols.contains(&version) {
-                                Ok(())
-                            } else {
-                                Err(error::fmt!(
+            ProtocolHandler::Http(_) => {
+                match self.supported_protocol_versions {
+                    Some(ref supported_line_protocols) => {
+                        if supported_line_protocols.contains(&version) {
+                            Ok(())
+                        } else {
+                            Err(error::fmt!(
                                     ProtocolVersionError,
                                     "Line protocol version {} is not supported by current QuestDB Server",  version))
-                            }
-                        }
-                        None => {
-                            if version == ProtocolVersion::V1 {
-                                Ok(())
-                            } else {
-                                Err(error::fmt!(
-                                ProtocolVersionError,
-                                    "Line protocol version {} is not supported by current QuestDB Server",  version))
-                            }
                         }
                     }
+                    None => Ok(()),
                 }
             }
         }

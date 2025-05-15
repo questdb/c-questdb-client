@@ -131,6 +131,7 @@ TEST_CASE("line_sender c api basics")
     ::line_sender_opts* opts =
         ::line_sender_opts_new(::line_sender_protocol_tcp, host, server.port());
     CHECK_NE(opts, nullptr);
+    line_sender_opts_protocol_version(opts, protocol_version_2, &err);
     ::line_sender* sender = ::line_sender_build(opts, &err);
     line_sender_opts_free(opts);
     CHECK_NE(sender, nullptr);
@@ -238,7 +239,8 @@ TEST_CASE("line_sender c++ api basics")
     questdb::ingress::line_sender sender{
         questdb::ingress::protocol::tcp,
         std::string("localhost"),
-        std::to_string(server.port())};
+        std::to_string(server.port()),
+        protocol_version_2};
     CHECK_FALSE(sender.must_close());
     server.accept();
     CHECK(server.recv() == 0);
@@ -263,7 +265,8 @@ TEST_CASE("test multiple lines")
 {
     questdb::ingress::test::mock_server server;
     std::string conf_str =
-        "tcp::addr=localhost:" + std::to_string(server.port()) + ";";
+        "tcp::addr=localhost:" + std::to_string(server.port()) +
+        ";protocol_version=2;";
     questdb::ingress::line_sender sender =
         questdb::ingress::line_sender::from_conf(conf_str);
     CHECK_FALSE(sender.must_close());
@@ -696,19 +699,13 @@ TEST_CASE("os certs")
 
     {
         questdb::ingress::opts opts{
-            questdb::ingress::protocol::https,
-            "localhost",
-            server.port(),
-            true};
+            questdb::ingress::protocol::https, "localhost", server.port()};
         opts.tls_ca(questdb::ingress::ca::os_roots);
     }
 
     {
         questdb::ingress::opts opts{
-            questdb::ingress::protocol::https,
-            "localhost",
-            server.port(),
-            true};
+            questdb::ingress::protocol::https, "localhost", server.port()};
         opts.tls_ca(questdb::ingress::ca::webpki_and_os_roots);
     }
 }
@@ -737,12 +734,9 @@ TEST_CASE("Opts copy ctor, assignment and move testing.")
 
     {
         questdb::ingress::opts opts1{
-            questdb::ingress::protocol::https, "localhost", "9009", true};
+            questdb::ingress::protocol::https, "localhost", "9009"};
         questdb::ingress::opts opts2{
-            questdb::ingress::protocol::https,
-            "altavista.digital.com",
-            "9009",
-            true};
+            questdb::ingress::protocol::https, "altavista.digital.com", "9009"};
         opts1 = opts2;
     }
 }
@@ -912,16 +906,18 @@ TEST_CASE("Opts from conf")
 TEST_CASE("HTTP basics")
 {
     questdb::ingress::opts opts1{
-        questdb::ingress::protocol::http, "localhost", 1, true};
+        questdb::ingress::protocol::http, "localhost", 1, protocol_version_2};
     questdb::ingress::opts opts1conf = questdb::ingress::opts::from_conf(
         "http::addr=localhost:1;username=user;password=pass;request_timeout="
-        "5000;retry_timeout=5;disable_protocol_validation=on;protocol_version="
-        "2;");
+        "5000;retry_timeout=5;protocol_version=2;");
     questdb::ingress::opts opts2{
-        questdb::ingress::protocol::https, "localhost", "1", true};
+        questdb::ingress::protocol::https,
+        "localhost",
+        "1",
+        protocol_version_2};
     questdb::ingress::opts opts2conf = questdb::ingress::opts::from_conf(
         "http::addr=localhost:1;token=token;request_min_throughput=1000;retry_"
-        "timeout=0;disable_protocol_validation=on;");
+        "timeout=0;protocol_version=2;");
     opts1.username("user")
         .password("pass")
         .max_buf_size(1000000)

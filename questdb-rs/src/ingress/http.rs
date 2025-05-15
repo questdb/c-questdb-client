@@ -59,7 +59,6 @@ pub(super) struct HttpConfig {
     pub(super) user_agent: String,
     pub(super) retry_timeout: ConfigSetting<Duration>,
     pub(super) request_timeout: ConfigSetting<Duration>,
-    pub(super) disable_protocol_validation: ConfigSetting<bool>,
 }
 
 impl Default for HttpConfig {
@@ -69,7 +68,6 @@ impl Default for HttpConfig {
             user_agent: concat!("questdb/rust/", env!("CARGO_PKG_VERSION")).to_string(),
             retry_timeout: ConfigSetting::new_default(Duration::from_secs(10)),
             request_timeout: ConfigSetting::new_default(Duration::from_secs(10)),
-            disable_protocol_validation: ConfigSetting::new_default(false),
         }
     }
 }
@@ -406,25 +404,14 @@ pub(super) fn http_send_with_retries(
     retry_http_send(state, buf, request_timeout, retry_timeout, last_rep)
 }
 
-/// Determines the server's default and all-supported protocol versions.
-///
-/// Returns a tuple containing:
-/// - `Option<Vec<ProtocolVersion>>`: List of all protocol versions supported by the server.
-///   - `Some(versions)`: When server explicitly provides supported versions (modern servers).
-///   - `None`: When server doesn't provide version info (legacy servers or 404 response).
-/// - `ProtocolVersion`: The server-recommended default protocol version
-///    (Here we introduce a new field, rather than use the implicit max value of supported versions).
-///
-/// When protocol version is auto-detection mode (no explicit set by use user),
-/// client will use the server's `default_version` as protocol version.
-/// When user explicitly specifies a `protocol_version`, client will
-/// validate against `support_versions`, Returns error if specified version not in supported list.
-pub(super) fn get_protocol_version(
+/// Return and the server's all supported protocol versions.
+/// - For modern servers: Returns explicit version list from `line.proto.support.versions` JSON field(/settings endpoint)
+/// - For legacy servers (404 response or missing version field): Automatically falls back to [`ProtocolVersion::V1`]
+pub(super) fn get_supported_protocol_versions(
     state: &HttpHandlerState,
     settings_url: &str,
-) -> Result<(Option<Vec<ProtocolVersion>>, ProtocolVersion), Error> {
-    let mut support_versions: Option<Vec<_>> = None;
-    let mut default_version = ProtocolVersion::V1;
+) -> Result<Vec<ProtocolVersion>, Error> {
+    let mut support_versions: Vec<ProtocolVersion> = vec![];
 
     let response = match http_get_with_retries(
         state,
@@ -435,7 +422,8 @@ pub(super) fn get_protocol_version(
         Ok(res) => {
             if res.status().is_client_error() || res.status().is_server_error() {
                 if res.status().as_u16() == 404 {
-                    return Ok((support_versions, default_version));
+                    support_versions.push(ProtocolVersion::V1);
+                    return Ok(support_versions);
                 }
                 return Err(fmt!(
                     ProtocolVersionError,
@@ -451,7 +439,8 @@ pub(super) fn get_protocol_version(
             let e = match err {
                 ureq::Error::StatusCode(code) => {
                     if code == 404 {
-                        return Ok((support_versions, default_version));
+                        support_versions.push(ProtocolVersion::V1);
+                        return Ok(support_versions);
                     } else {
                         fmt!(
                             ProtocolVersionError,
@@ -488,51 +477,17 @@ pub(super) fn get_protocol_version(
 
         if let Some(serde_json::Value::Array(ref values)) = json.get("line.proto.support.versions")
         {
-            let mut versions = Vec::new();
             for value in values.iter() {
                 if let Some(v) = value.as_u64() {
                     match v {
-                        1 => versions.push(ProtocolVersion::V1),
-                        2 => versions.push(ProtocolVersion::V2),
+                        1 => support_versions.push(ProtocolVersion::V1),
+                        2 => support_versions.push(ProtocolVersion::V2),
                         _ => {}
                     }
                 }
             }
-            support_versions = Some(versions);
-        }
-
-        if let Some(serde_json::Value::Number(ref v)) = json.get("line.proto.default.version") {
-            default_version = match v.as_u64() {
-                Some(vu64) => match vu64 {
-                    1 => ProtocolVersion::V1,
-                    2 => ProtocolVersion::V2,
-                    _ => {
-                        if let Some(ref versions) = support_versions {
-                            if versions.contains(&ProtocolVersion::V2) {
-                                ProtocolVersion::V2
-                            } else if versions.contains(&ProtocolVersion::V1) {
-                                ProtocolVersion::V1
-                            } else {
-                                return Err(error::fmt!(
-                                    ProtocolVersionError,
-                                    "Server does not support current client"
-                                ));
-                            }
-                        } else {
-                            return Err(error::fmt!(
-                                ProtocolVersionError,
-                                "Unexpected response version content."
-                            ));
-                        }
-                    }
-                },
-                None => {
-                    return Err(error::fmt!(
-                        ProtocolVersionError,
-                        "Not a valid int for line.proto.default.version in response."
-                    ))
-                }
-            };
+        } else {
+            support_versions.push(ProtocolVersion::V1);
         }
     } else {
         return Err(error::fmt!(
@@ -540,7 +495,7 @@ pub(super) fn get_protocol_version(
             "Malformed server response, settings url: {}, err: failed to read response body as UTF-8", settings_url
         ));
     }
-    Ok((support_versions, default_version))
+    Ok(support_versions)
 }
 
 #[allow(clippy::result_large_err)] // `ureq::Error` is large enough to cause this warning.

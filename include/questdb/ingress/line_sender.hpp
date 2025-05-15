@@ -882,24 +882,14 @@ public:
      * @param[in] protocol The protocol to use.
      * @param[in] host The QuestDB database host.
      * @param[in] port The QuestDB tcp or http port.
-     * @param[in] disable_protocol_validation disable line protocol version
      * validation.
      */
-    opts(
-        protocol protocol,
-        utf8_view host,
-        uint16_t port,
-        bool disable_protocol_validation = false) noexcept
+    opts(protocol protocol, utf8_view host, uint16_t port) noexcept
         : _impl{::line_sender_opts_new(
               static_cast<::line_sender_protocol>(protocol), host._impl, port)}
     {
         line_sender_error::wrapped_call(
             ::line_sender_opts_user_agent, _impl, _user_agent::name());
-        if (disable_protocol_validation)
-        {
-            line_sender_error::wrapped_call(
-                ::line_sender_opts_disable_protocol_validation, _impl);
-        }
     }
 
     /**
@@ -907,15 +897,14 @@ public:
      * @param[in] protocol The protocol to use.
      * @param[in] host The QuestDB database host.
      * @param[in] port The QuestDB tcp or http port.
-     * @param[in] disable_protocol_validation disable line protocol version
+     * @param[in] version The protocol version to use.
      * validation.
      */
     opts(
         protocol protocol,
         utf8_view host,
         uint16_t port,
-        protocol_version version,
-        bool disable_protocol_validation = false) noexcept
+        protocol_version version) noexcept
         : _impl{::line_sender_opts_new(
               static_cast<::line_sender_protocol>(protocol), host._impl, port)}
     {
@@ -923,11 +912,6 @@ public:
             ::line_sender_opts_user_agent, _impl, _user_agent::name());
         line_sender_error::wrapped_call(
             ::line_sender_opts_protocol_version, _impl, version);
-        if (disable_protocol_validation)
-        {
-            line_sender_error::wrapped_call(
-                ::line_sender_opts_disable_protocol_validation, _impl);
-        }
     }
 
     /**
@@ -936,13 +920,8 @@ public:
      * @param[in] protocol The protocol to use.
      * @param[in] host The QuestDB database host.
      * @param[in] port The QuestDB tcp or http port as service name.
-     * @param[in] disable_protocol_validation disable line protocol version
      */
-    opts(
-        protocol protocol,
-        utf8_view host,
-        utf8_view port,
-        bool disable_protocol_validation = false) noexcept
+    opts(protocol protocol, utf8_view host, utf8_view port) noexcept
         : _impl{::line_sender_opts_new_service(
               static_cast<::line_sender_protocol>(protocol),
               host._impl,
@@ -950,11 +929,6 @@ public:
     {
         line_sender_error::wrapped_call(
             ::line_sender_opts_user_agent, _impl, _user_agent::name());
-        if (disable_protocol_validation)
-        {
-            line_sender_error::wrapped_call(
-                ::line_sender_opts_disable_protocol_validation, _impl);
-        }
     }
 
     /**
@@ -963,14 +937,13 @@ public:
      * @param[in] protocol The protocol to use.
      * @param[in] host The QuestDB database host.
      * @param[in] port The QuestDB tcp or http port as service name.
-     * @param[in] disable_protocol_validation disable line protocol version
+     * @param[in] version The protocol version to use.
      */
     opts(
         protocol protocol,
         utf8_view host,
         utf8_view port,
-        protocol_version version,
-        bool disable_protocol_validation = false) noexcept
+        protocol_version version) noexcept
         : _impl{::line_sender_opts_new_service(
               static_cast<::line_sender_protocol>(protocol),
               host._impl,
@@ -980,11 +953,6 @@ public:
             ::line_sender_opts_user_agent, _impl, _user_agent::name());
         line_sender_error::wrapped_call(
             ::line_sender_opts_protocol_version, _impl, version);
-        if (disable_protocol_validation)
-        {
-            line_sender_error::wrapped_call(
-                ::line_sender_opts_disable_protocol_validation, _impl);
-        }
     }
 
     opts(const opts& other) noexcept
@@ -1088,16 +1056,6 @@ public:
     {
         line_sender_error::wrapped_call(
             ::line_sender_opts_token_y, _impl, token_y._impl);
-        return *this;
-    }
-
-    /**
-     * Disable the validation of the line protocol version.
-     */
-    opts& disable_protocol_validation()
-    {
-        line_sender_error::wrapped_call(
-            ::line_sender_opts_disable_protocol_validation, _impl);
         return *this;
     }
 
@@ -1287,21 +1245,13 @@ public:
         return {opts::from_env()};
     }
 
-    line_sender(
-        protocol protocol,
-        utf8_view host,
-        uint16_t port,
-        bool disable_protocol_validation = false)
-        : line_sender{opts{protocol, host, port, disable_protocol_validation}}
+    line_sender(protocol protocol, utf8_view host, uint16_t port)
+        : line_sender{opts{protocol, host, port}}
     {
     }
 
-    line_sender(
-        protocol protocol,
-        utf8_view host,
-        utf8_view port,
-        bool disable_protocol_validation = false)
-        : line_sender{opts{protocol, host, port, disable_protocol_validation}}
+    line_sender(protocol protocol, utf8_view host, utf8_view port)
+        : line_sender{opts{protocol, host, port}}
     {
     }
 
@@ -1309,10 +1259,8 @@ public:
         protocol protocol,
         utf8_view host,
         uint16_t port,
-        protocol_version version,
-        bool disable_protocol_validation = false)
-        : line_sender{
-              opts{protocol, host, port, version, disable_protocol_validation}}
+        protocol_version version)
+        : line_sender{opts{protocol, host, port, version}}
     {
     }
 
@@ -1320,10 +1268,8 @@ public:
         protocol protocol,
         utf8_view host,
         utf8_view port,
-        protocol_version version,
-        bool disable_protocol_validation = false)
-        : line_sender{
-              opts{protocol, host, port, version, disable_protocol_validation}}
+        protocol_version version)
+        : line_sender{opts{protocol, host, port, version}}
     {
     }
 

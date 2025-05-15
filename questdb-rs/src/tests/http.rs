@@ -48,7 +48,7 @@ fn test_two_lines(
         .at_now()?;
     let buffer2 = buffer.clone();
 
-    let mut server = MockServer::new()?.configure_settings_response(2, &[1, 2]);
+    let mut server = MockServer::new()?.configure_settings_response(&[1, 2]);
     let sender_builder = server.lsb_http();
 
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
@@ -100,7 +100,7 @@ fn test_text_plain_error(
         .at_now()?;
     buffer.table("test")?.column_f64("sym", 2.0)?.at_now()?;
 
-    let mut server = MockServer::new()?.configure_settings_response(2, &[1, 2]);
+    let mut server = MockServer::new()?.configure_settings_response(&[1, 2]);
     let sender_builder = server.lsb_http();
 
     let buffer2 = buffer.clone();
@@ -157,7 +157,7 @@ fn test_bad_json_error(
         .at_now()?;
     buffer.table("test")?.column_f64("sym", 2.0)?.at_now()?;
 
-    let mut server = MockServer::new()?.configure_settings_response(2, &[1, 2]);
+    let mut server = MockServer::new()?.configure_settings_response(&[1, 2]);
     let sender_builder = server.lsb_http();
 
     let buffer2 = buffer.clone();
@@ -216,7 +216,7 @@ fn test_json_error(
         .at_now()?;
     buffer.table("test")?.column_f64("sym", 2.0)?.at_now()?;
 
-    let mut server = MockServer::new()?.configure_settings_response(2, &[1, 2]);
+    let mut server = MockServer::new()?.configure_settings_response(&[1, 2]);
     let sender_builder = server.lsb_http();
 
     let buffer2 = buffer.clone();
@@ -277,7 +277,7 @@ fn test_no_connection(
         .at_now()?;
 
     let mut sender = SenderBuilder::new(Protocol::Http, "127.0.0.1", 1)
-        .disable_protocol_validation()?
+        .protocol_version(ProtocolVersion::V2)?
         .build()?;
     let res = sender.flush_and_keep(&buffer);
     assert!(res.is_err());
@@ -300,7 +300,7 @@ fn test_old_server_without_ilp_http_support(
         .column_f64("x", 1.0)?
         .at_now()?;
 
-    let mut server = MockServer::new()?.configure_settings_response(2, &[1, 2]);
+    let mut server = MockServer::new()?.configure_settings_response(&[1, 2]);
     let sender_builder = server.lsb_http();
 
     let buffer2 = buffer.clone();
@@ -356,7 +356,7 @@ fn test_http_basic_auth(
         .column_f64("x", 1.0)?
         .at_now()?;
 
-    let mut server = MockServer::new()?.configure_settings_response(2, &[1, 2]);
+    let mut server = MockServer::new()?.configure_settings_response(&[1, 2]);
     let sender_builder = server
         .lsb_http()
         .username("Aladdin")?
@@ -411,7 +411,7 @@ fn test_unauthenticated(
         .column_f64("x", 1.0)?
         .at_now()?;
 
-    let mut server = MockServer::new()?.configure_settings_response(2, &[1, 2]);
+    let mut server = MockServer::new()?.configure_settings_response(&[1, 2]);
     let sender_builder = server.lsb_http();
 
     let buffer2 = buffer.clone();
@@ -469,7 +469,7 @@ fn test_token_auth(
         .column_f64("x", 1.0)?
         .at_now()?;
 
-    let mut server = MockServer::new()?.configure_settings_response(2, &[1, 2]);
+    let mut server = MockServer::new()?.configure_settings_response(&[1, 2]);
     let sender_builder = server.lsb_http().token("0123456789")?;
 
     let buffer2 = buffer.clone();
@@ -516,13 +516,13 @@ fn test_request_timeout(
         .at_now()?;
 
     // Here we use a mock (tcp) server instead and don't send a response back.
-    let server = MockServer::new()?.configure_settings_response(2, &[1, 2]);
+    let server = MockServer::new()?.configure_settings_response(&[1, 2]);
 
     let request_timeout = Duration::from_millis(50);
     let time_start = std::time::Instant::now();
     let mut sender = server
         .lsb_http()
-        .disable_protocol_validation()?
+        .protocol_version(ProtocolVersion::V2)?
         .request_timeout(request_timeout)?
         .build()?;
     let res = sender.flush_and_keep(&buffer);
@@ -550,11 +550,11 @@ fn test_tls(
         .at(TimestampNanos::new(10000000))?;
     let buffer2 = buffer.clone();
 
-    let mut server = MockServer::new()?.configure_settings_response(2, &[1, 2]);
+    let mut server = MockServer::new()?.configure_settings_response(&[1, 2]);
     let mut sender = server
         .lsb_https()
         .tls_roots(ca_path)?
-        .disable_protocol_validation()?
+        .protocol_version(ProtocolVersion::V2)?
         .build()?;
 
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
@@ -591,7 +591,7 @@ fn test_user_agent(
         .at(TimestampNanos::new(10000000))?;
     let buffer2 = buffer.clone();
 
-    let mut server = MockServer::new()?.configure_settings_response(2, &[1, 2]);
+    let mut server = MockServer::new()?.configure_settings_response(&[1, 2]);
     let sender_builder = server.lsb_http().user_agent("wallabies/1.2.99")?;
 
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
@@ -634,7 +634,7 @@ fn test_two_retries(
         .at(TimestampNanos::new(10000000))?;
     let buffer2 = buffer.clone();
 
-    let mut server = MockServer::new()?.configure_settings_response(2, &[1, 2]);
+    let mut server = MockServer::new()?.configure_settings_response(&[1, 2]);
     let sender_builder = server.lsb_http().retry_timeout(Duration::from_secs(30))?;
 
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
@@ -704,11 +704,11 @@ fn test_one_retry(
         .at(TimestampNanos::new(10000000))?;
     let buffer2 = buffer.clone();
 
-    let mut server = MockServer::new()?.configure_settings_response(2, &[1, 2]);
+    let mut server = MockServer::new()?.configure_settings_response(&[1, 2]);
     let mut sender = server
         .lsb_http()
         .retry_timeout(Duration::from_millis(19))?
-        .disable_protocol_validation()
+        .protocol_version(ProtocolVersion::V2)
         .unwrap()
         .build()?;
 
@@ -787,7 +787,7 @@ fn test_transactional(
     let buffer3 = buffer2.clone();
     assert!(buffer2.transactional());
 
-    let mut server = MockServer::new()?.configure_settings_response(2, &[1, 2]);
+    let mut server = MockServer::new()?.configure_settings_response(&[1, 2]);
     let sender_builder = server.lsb_http();
 
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
@@ -833,7 +833,7 @@ fn test_transactional(
 
 #[test]
 fn test_sender_protocol_version() -> TestResult {
-    let mut server = MockServer::new()?.configure_settings_response(2, &[1, 2]);
+    let mut server = MockServer::new()?.configure_settings_response(&[1, 2]);
     let sender_builder = server.lsb_http();
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
         server.accept()?;
@@ -859,7 +859,7 @@ fn test_sender_protocol_version() -> TestResult {
 
 #[test]
 fn test_sender_protocol_version_old_server1() -> TestResult {
-    let mut server = MockServer::new()?.configure_settings_response(0, &[1, 2]);
+    let mut server = MockServer::new()?.configure_settings_response(&[]);
     let sender_builder = server.lsb_http();
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
         server.accept()?;
@@ -875,14 +875,14 @@ fn test_sender_protocol_version_old_server1() -> TestResult {
     });
     let sender = sender_builder.build()?;
     assert_eq!(sender.default_protocol_version(), ProtocolVersion::V1);
-    assert!(sender.support_protocol_versions().is_none());
+    assert_eq!(sender.support_protocol_versions(), Some(vec![ProtocolVersion::V1]));
     server_thread.join().unwrap()?;
     Ok(())
 }
 
 #[test]
 fn test_sender_protocol_version_old_server2() -> TestResult {
-    let mut server = MockServer::new()?.configure_settings_response(0, &[1, 2]);
+    let mut server = MockServer::new()?.configure_settings_response(&[]);
     let sender_builder = server.lsb_http();
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
         server.accept()?;
@@ -896,14 +896,14 @@ fn test_sender_protocol_version_old_server2() -> TestResult {
     });
     let sender = sender_builder.build()?;
     assert_eq!(sender.default_protocol_version(), ProtocolVersion::V1);
-    assert!(sender.support_protocol_versions().is_none());
+    assert_eq!(sender.support_protocol_versions(), Some(vec![ProtocolVersion::V1]));
     server_thread.join().unwrap()?;
     Ok(())
 }
 
 #[test]
 fn test_sender_protocol_version_unsupported_client() -> TestResult {
-    let mut server = MockServer::new()?.configure_settings_response(3, &[3, 4]);
+    let mut server = MockServer::new()?.configure_settings_response(&[3, 4]);
     let sender_builder = server.lsb_http();
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
         server.accept()?;
@@ -920,9 +920,12 @@ fn test_sender_protocol_version_unsupported_client() -> TestResult {
 }
 
 #[test]
-fn test_sender_disable_protocol_version_validation() -> TestResult {
-    let mut server = MockServer::new()?.configure_settings_response(2, &[1, 2]);
-    let mut sender = server.lsb_http().disable_protocol_validation()?.build()?;
+fn test_sender_explicit_set_protocol_version_v2() -> TestResult {
+    let mut server = MockServer::new()?.configure_settings_response(&[]);
+    let mut sender = server
+        .lsb_http()
+        .protocol_version(ProtocolVersion::V2)?
+        .build()?;
     let mut buffer = sender.new_buffer();
     buffer
         .table("test")?

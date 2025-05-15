@@ -11,7 +11,7 @@ static bool example(
     {
         auto sender = questdb::ingress::line_sender::from_conf(
             "tcps::addr=" + std::string{host} + ":" + std::string{port} +
-            ";"
+            ";protocol_version=2;"
             "username=admin;"
             "token=5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48;"
             "token_x=fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU;"
