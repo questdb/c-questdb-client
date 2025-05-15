@@ -99,7 +99,7 @@ class TestSender(unittest.TestCase):
         # N.B.: We never connect with TLS here.
         auth = AUTH if QDB_FIXTURE.auth else {}
         if not QDB_FIXTURE.http and not QDB_FIXTURE.version < (8, 3, 1):
-            auth["protocol_version"] = "2"
+            auth["protocol_version"] = qls.ProtocolVersion.V2.value[0]
         return qls.Sender(
             BUILD_MODE,
             qls.Protocol.HTTP if QDB_FIXTURE.http else qls.Protocol.TCP,
