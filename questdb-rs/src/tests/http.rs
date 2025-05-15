@@ -389,7 +389,11 @@ fn test_token_auth(
     #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
 ) -> TestResult {
     let mut server = MockServer::new()?;
-    let mut sender = server.lsb_http().protocol_version(version)?.token("0123456789")?.build()?;
+    let mut sender = server
+        .lsb_http()
+        .protocol_version(version)?
+        .token("0123456789")?
+        .build()?;
     let mut buffer = sender.new_buffer();
     buffer
         .table("test")?
@@ -497,7 +501,11 @@ fn test_user_agent(
     #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
 ) -> TestResult {
     let mut server = MockServer::new()?;
-    let mut sender = server.lsb_http().user_agent("wallabies/1.2.99")?.protocol_version(version)?.build()?;
+    let mut sender = server
+        .lsb_http()
+        .user_agent("wallabies/1.2.99")?
+        .protocol_version(version)?
+        .build()?;
     let mut buffer = sender.new_buffer();
     buffer
         .table("test")?
@@ -532,7 +540,11 @@ fn test_two_retries(
 ) -> TestResult {
     // Note: This also tests that the _same_ connection is being reused, i.e. tests keepalive.
     let mut server = MockServer::new()?;
-    let mut sender = server.lsb_http().protocol_version(version)?.retry_timeout(Duration::from_secs(30))?.build()?;
+    let mut sender = server
+        .lsb_http()
+        .protocol_version(version)?
+        .retry_timeout(Duration::from_secs(30))?
+        .build()?;
     let mut buffer = sender.new_buffer();
     buffer
         .table("test")?
@@ -711,9 +723,13 @@ fn test_transactional(
     Ok(())
 }
 
-fn _test_sender_auto_detect_protocol_version(supported_versions: Option<Vec<u16>>, expect_version: ProtocolVersion) -> TestResult {
+fn _test_sender_auto_detect_protocol_version(
+    supported_versions: Option<Vec<u16>>,
+    expect_version: ProtocolVersion,
+) -> TestResult {
     let supported_versions1 = supported_versions.clone();
-    let mut server = MockServer::new()?.configure_settings_response(supported_versions.as_deref().unwrap_or(&[]));
+    let mut server = MockServer::new()?
+        .configure_settings_response(supported_versions.as_deref().unwrap_or(&[]));
     let sender_builder = server.lsb_http();
 
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
@@ -728,13 +744,14 @@ fn _test_sender_auto_detect_protocol_version(supported_versions: Option<Vec<u16>
                     .with_header("content-type", "text/plain")
                     .with_body_str("Not Found"),
             )?,
-            Some(_) => server.send_settings_response()?
+            Some(_) => server.send_settings_response()?,
         }
         let exp = &[
             b"test,t1=v1 ",
             crate::tests::sender::f64_to_bytes("f1", 0.5, expect_version).as_slice(),
-            b" 10000000\n"
-        ].concat();
+            b" 10000000\n",
+        ]
+        .concat();
         let req = server.recv_http_q()?;
         assert_eq!(req.body(), exp);
         server.send_http_response_q(HttpResponse::empty())?;
@@ -798,7 +815,6 @@ fn test_sender_protocol_version_only_v1() -> TestResult {
 fn test_sender_protocol_version_only_v2() -> TestResult {
     _test_sender_auto_detect_protocol_version(Some(vec![2]), ProtocolVersion::V2)
 }
-
 
 #[test]
 fn test_sender_protocol_version_unsupported_client() -> TestResult {

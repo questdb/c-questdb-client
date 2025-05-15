@@ -176,8 +176,8 @@ def build_latest_questdb(branch='master'):
     if not questdb_path.exists():
         _run('git', 'clone', 'https://github.com/questdb/questdb.git')
     _run('git', 'fetch', 'origin', branch, cwd=questdb_path)
-    _run('git', 'switch', branch=questdb_path)
-    _run('git', 'pull', 'origin', branch=questdb_path)
+    _run('git', 'switch', branch, cwd=questdb_path)
+    _run('git', 'pull', 'origin', branch, cwd=questdb_path)
     _run('git', 'submodule', 'update', '--init', '--recursive', cwd=questdb_path)
     _run('mvn', 'clean', 'package', '-DskipTests', '-Pbuild-web-console', cwd=questdb_path)
 
@@ -190,6 +190,7 @@ def test_vs_latest_questdb():
     _run(
         sys.executable,
         PROJ_ROOT / 'system_test' / 'test.py',
+        'run',
         '--repo', PROJ_ROOT / 'questdb',
         '-v')
 
