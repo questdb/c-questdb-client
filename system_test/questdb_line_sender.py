@@ -216,12 +216,6 @@ def _setup_cdll():
         c_line_sender_buffer_p,
         c_size_t)
     set_sig(
-        dll.line_sender_buffer_set_protocol_version,
-        c_bool,
-        c_line_sender_buffer_p,
-        c_protocol_version,
-        c_line_sender_error_p_p)
-    set_sig(
         dll.line_sender_buffer_free,
         None,
         c_line_sender_buffer_p)

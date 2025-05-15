@@ -875,7 +875,10 @@ fn test_sender_protocol_version_old_server1() -> TestResult {
     });
     let sender = sender_builder.build()?;
     assert_eq!(sender.default_protocol_version(), ProtocolVersion::V1);
-    assert_eq!(sender.support_protocol_versions(), Some(vec![ProtocolVersion::V1]));
+    assert_eq!(
+        sender.support_protocol_versions(),
+        Some(vec![ProtocolVersion::V1])
+    );
     server_thread.join().unwrap()?;
     Ok(())
 }
@@ -896,7 +899,10 @@ fn test_sender_protocol_version_old_server2() -> TestResult {
     });
     let sender = sender_builder.build()?;
     assert_eq!(sender.default_protocol_version(), ProtocolVersion::V1);
-    assert_eq!(sender.support_protocol_versions(), Some(vec![ProtocolVersion::V1]));
+    assert_eq!(
+        sender.support_protocol_versions(),
+        Some(vec![ProtocolVersion::V1])
+    );
     server_thread.join().unwrap()?;
     Ok(())
 }

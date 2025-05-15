@@ -153,7 +153,7 @@ TEST_CASE("line_sender c api basics")
     CHECK(::line_sender_utf8_init(&v1_utf8, 2, "v1", &err));
     ::line_sender_column_name f1_name{0, nullptr};
     CHECK(::line_sender_column_name_init(&f1_name, 2, "f1", &err));
-    ::line_sender_buffer* buffer = line_sender_new_buffer(sender);
+    ::line_sender_buffer* buffer = line_sender_buffer_new_for_sender(sender);
     CHECK(buffer != nullptr);
     CHECK(::line_sender_buffer_table(buffer, table_name, &err));
     CHECK(::line_sender_buffer_symbol(buffer, t1_name, v1_utf8, &err));

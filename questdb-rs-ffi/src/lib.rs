@@ -1425,7 +1425,7 @@ pub unsafe extern "C" fn line_sender_default_protocol_version(
 /// Construct a `line_sender_buffer` with a `max_name_len` of `127` and sender's default protocol version
 /// which is the same as the QuestDB server default.
 #[no_mangle]
-pub unsafe extern "C" fn line_sender_new_buffer(
+pub unsafe extern "C" fn line_sender_buffer_new_for_sender(
     sender: *const line_sender,
 ) -> *mut line_sender_buffer {
     let sender = unwrap_sender(sender);
@@ -1437,9 +1437,9 @@ pub unsafe extern "C" fn line_sender_new_buffer(
 /// length for table and column names. This should match the `cairo.max.file.name.length` setting of
 /// the QuestDB  server you're connecting to.
 /// If the server does not configure it, the default is `127`, and you can
-/// call `line_sender_new_buffer()` instead.
+/// call `line_sender_buffer_new_for_sender()` instead.
 #[no_mangle]
-pub unsafe extern "C" fn line_sender_new_buffer_with_max_name_len(
+pub unsafe extern "C" fn line_sender_buffer_new_with_max_name_len_for_sender(
     sender: *const line_sender,
     max_name_len: size_t,
 ) -> *mut line_sender_buffer {

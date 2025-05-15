@@ -926,16 +926,17 @@ protocol_version line_sender_default_protocol_version(
  * default protocol version
  * which is the same as the QuestDB server default.
  */
-line_sender_buffer* line_sender_new_buffer(const line_sender* sender);
+line_sender_buffer* line_sender_buffer_new_for_sender(
+    const line_sender* sender);
 
 /**
  * Construct a `line_sender_buffer` with sender's default protocol version and
  * a custom maximum length for table and column names. This should match the
  * `cairo.max.file.name.length` setting of the QuestDB  server you're
  * connecting to. If the server does not configure it, the default is `127`,
- * and you can call `line_sender_new_buffer()` instead.
+ * and you can call `line_sender_buffer_new_for_sender()` instead.
  */
-line_sender_buffer* line_sender_new_buffer_with_max_name_len(
+line_sender_buffer* line_sender_buffer_new_with_max_name_len_for_sender(
     const line_sender* sender, size_t max_name_len);
 
 /**
