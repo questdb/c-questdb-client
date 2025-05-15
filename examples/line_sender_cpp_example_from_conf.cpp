@@ -20,7 +20,7 @@ int main(int argc, const char* argv[])
         const auto price_name = "price"_cn;
         const auto amount_name = "amount"_cn;
 
-        questdb::ingress::line_sender_buffer buffer;
+        questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
         buffer.table(table_name)
             .symbol(symbol_name, "ETH-USD"_utf8)
             .symbol(side_name, "sell"_utf8)

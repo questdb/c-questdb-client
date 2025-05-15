@@ -152,7 +152,7 @@ TEST_CASE("line_sender c api basics")
     CHECK(::line_sender_utf8_init(&v1_utf8, 2, "v1", &err));
     ::line_sender_column_name f1_name{0, nullptr};
     CHECK(::line_sender_column_name_init(&f1_name, 2, "f1", &err));
-    ::line_sender_buffer* buffer = line_sender_buffer_new();
+    ::line_sender_buffer* buffer = line_sender_new_buffer(sender);
     CHECK(buffer != nullptr);
     CHECK(::line_sender_buffer_table(buffer, table_name, &err));
     CHECK(::line_sender_buffer_symbol(buffer, t1_name, v1_utf8, &err));
@@ -243,7 +243,7 @@ TEST_CASE("line_sender c++ api basics")
     server.accept();
     CHECK(server.recv() == 0);
 
-    questdb::ingress::line_sender_buffer buffer;
+    questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
     buffer.table("test")
         .symbol("t1", "v1")
         .symbol("t2", "")
@@ -271,7 +271,7 @@ TEST_CASE("test multiple lines")
     CHECK(server.recv() == 0);
 
     const auto table_name = "metric1"_tn;
-    questdb::ingress::line_sender_buffer buffer;
+    questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
     buffer.table(table_name)
         .symbol("t1"_cn, "val1"_utf8)
         .symbol("t2"_cn, "val2"_utf8)
@@ -308,7 +308,7 @@ TEST_CASE("State machine testing -- flush without data.")
         std::string_view{"localhost"},
         std::to_string(server.port())};
 
-    questdb::ingress::line_sender_buffer buffer;
+    questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
     CHECK(buffer.size() == 0);
     CHECK_THROWS_WITH_AS(
         sender.flush(buffer),
@@ -327,7 +327,7 @@ TEST_CASE("One symbol only - flush before server accept")
         server.port()};
 
     // Does not raise - this is unlike InfluxDB spec that disallows this.
-    questdb::ingress::line_sender_buffer buffer;
+    questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
     buffer.table("test").symbol("t1", std::string{"v1"}).at_now();
     CHECK(!sender.must_close());
     CHECK(buffer.size() == 11);
@@ -348,7 +348,7 @@ TEST_CASE("One column only - server.accept() after flush, before close")
         questdb::ingress::protocol::tcp, "localhost", server.port()};
 
     // Does not raise - this is unlike InfluxDB spec that disallows this.
-    questdb::ingress::line_sender_buffer buffer;
+    questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
     buffer.table("test").column("t1", "v1").at_now();
     CHECK(!sender.must_close());
     CHECK(buffer.size() == 13);
@@ -367,7 +367,7 @@ TEST_CASE("Symbol after column")
     questdb::ingress::line_sender sender{
         questdb::ingress::protocol::tcp, "localhost", server.port()};
 
-    questdb::ingress::line_sender_buffer buffer;
+    questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
     buffer.table("test").column("t1", "v1");
 
     CHECK_THROWS_AS(
@@ -485,15 +485,18 @@ TEST_CASE("Buffer move and copy ctor testing")
 {
     const size_t init_buf_size = 128;
 
-    questdb::ingress::line_sender_buffer buffer1{init_buf_size};
+    questdb::ingress::line_sender_buffer buffer1{
+        protocol_version_1, init_buf_size};
     buffer1.table("buffer1");
     CHECK(buffer1.peek() == "buffer1");
 
-    questdb::ingress::line_sender_buffer buffer2{2 * init_buf_size};
+    questdb::ingress::line_sender_buffer buffer2{
+        protocol_version_1, 2 * init_buf_size};
     buffer2.table("buffer2");
     CHECK(buffer2.peek() == "buffer2");
 
-    questdb::ingress::line_sender_buffer buffer3{3 * init_buf_size};
+    questdb::ingress::line_sender_buffer buffer3{
+        protocol_version_1, 3 * init_buf_size};
     buffer3.table("buffer3");
     CHECK(buffer3.peek() == "buffer3");
 
@@ -532,7 +535,7 @@ TEST_CASE("Sender move testing.")
     questdb::ingress::line_sender sender1{
         questdb::ingress::protocol::tcp, host_ref, server1.port()};
 
-    questdb::ingress::line_sender_buffer buffer;
+    questdb::ingress::line_sender_buffer buffer = sender1.new_buffer();
     buffer.table("test").column("t1", "v1").at_now();
 
     server1.close();
@@ -762,7 +765,7 @@ TEST_CASE("Test timestamp column.")
     const auto now_nanos_ts = questdb::ingress::timestamp_nanos{now_nanos};
     const auto now_micros_ts = questdb::ingress::timestamp_micros{now_micros};
 
-    questdb::ingress::line_sender_buffer buffer;
+    questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
     buffer.table("test")
         .column("ts1", questdb::ingress::timestamp_micros{12345})
         .column("ts2", now_micros_ts)
@@ -809,7 +812,7 @@ TEST_CASE("test timestamp_micros and timestamp_nanos::now()")
 
 TEST_CASE("Test Marker")
 {
-    questdb::ingress::line_sender_buffer buffer;
+    questdb::ingress::line_sender_buffer buffer{protocol_version_1};
     buffer.clear_marker();
     buffer.clear_marker();
 
@@ -865,18 +868,18 @@ TEST_CASE("Moved View")
 
 TEST_CASE("Empty Buffer")
 {
-    questdb::ingress::line_sender_buffer b1;
+    questdb::ingress::line_sender_buffer b1{protocol_version_2};
     CHECK(b1.size() == 0);
     questdb::ingress::line_sender_buffer b2{std::move(b1)};
     CHECK(b1.size() == 0);
     CHECK(b2.size() == 0);
-    questdb::ingress::line_sender_buffer b3;
+    questdb::ingress::line_sender_buffer b3{protocol_version_2};
     b3 = std::move(b2);
     CHECK(b2.size() == 0);
     CHECK(b3.size() == 0);
-    questdb::ingress::line_sender_buffer b4;
+    questdb::ingress::line_sender_buffer b4{protocol_version_2};
     b4.table("test").symbol("a", "b").at_now();
-    questdb::ingress::line_sender_buffer b5;
+    questdb::ingress::line_sender_buffer b5{protocol_version_2};
     b5 = std::move(b4);
     CHECK(b4.size() == 0);
     CHECK(b5.size() == 9);
@@ -912,7 +915,8 @@ TEST_CASE("HTTP basics")
         questdb::ingress::protocol::http, "localhost", 1, true};
     questdb::ingress::opts opts1conf = questdb::ingress::opts::from_conf(
         "http::addr=localhost:1;username=user;password=pass;request_timeout="
-        "5000;retry_timeout=5;disable_protocol_validation=on;");
+        "5000;retry_timeout=5;disable_protocol_validation=on;protocol_version="
+        "2;");
     questdb::ingress::opts opts2{
         questdb::ingress::protocol::https, "localhost", "1", true};
     questdb::ingress::opts opts2conf = questdb::ingress::opts::from_conf(
@@ -929,7 +933,7 @@ TEST_CASE("HTTP basics")
     questdb::ingress::line_sender sender2{opts2};
     questdb::ingress::line_sender sender2conf{opts2conf};
 
-    questdb::ingress::line_sender_buffer b1;
+    questdb::ingress::line_sender_buffer b1 = sender1.new_buffer();
     b1.table("test").symbol("a", "b").at_now();
 
     CHECK_THROWS_AS(sender1.flush(b1), questdb::ingress::line_sender_error);
@@ -954,7 +958,33 @@ TEST_CASE("line sender protocol version v1")
     server.accept();
     CHECK(server.recv() == 0);
 
-    questdb::ingress::line_sender_buffer buffer{protocol_version_1};
+    questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
+    buffer.table("test")
+        .symbol("t1", "v1")
+        .symbol("t2", "")
+        .column("f1", 0.5)
+        .at(questdb::ingress::timestamp_nanos{10000000});
+
+    CHECK(server.recv() == 0);
+    CHECK(buffer.size() == 31);
+    sender.flush(buffer);
+    CHECK(server.recv() == 1);
+    std::string expect{"test,t1=v1,t2= f1=0.5 10000000\n"};
+    CHECK(server.msgs(0) == expect);
+}
+
+TEST_CASE("line sender protocol version v2")
+{
+    questdb::ingress::test::mock_server server;
+    questdb::ingress::line_sender sender{
+        questdb::ingress::protocol::tcp,
+        std::string("localhost"),
+        std::to_string(server.port())};
+    CHECK_FALSE(sender.must_close());
+    server.accept();
+    CHECK(server.recv() == 0);
+
+    questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
     buffer.table("test")
         .symbol("t1", "v1")
         .symbol("t2", "")

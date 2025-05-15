@@ -389,47 +389,39 @@ private:
 class line_sender_buffer
 {
 public:
-    explicit line_sender_buffer(size_t init_buf_size = 64 * 1024) noexcept
-        : line_sender_buffer{init_buf_size, 127}
-    {
-    }
-
-    line_sender_buffer(size_t init_buf_size, size_t max_name_len) noexcept
-        : _impl{nullptr}
-        , _init_buf_size{init_buf_size}
-        , _max_name_len{max_name_len}
+    explicit line_sender_buffer(
+        protocol_version protocol_version,
+        size_t init_buf_size = 64 * 1024) noexcept
+        : line_sender_buffer{protocol_version, init_buf_size, 127}
     {
     }
 
     line_sender_buffer(
+        protocol_version version,
         size_t init_buf_size,
-        size_t max_name_len,
-        protocol_version version) noexcept
+        size_t max_name_len) noexcept
         : _impl{nullptr}
+        , _protocol_version(version)
         , _init_buf_size{init_buf_size}
         , _max_name_len{max_name_len}
-        , _protocol_version{version}
-    {
-    }
-
-    line_sender_buffer(protocol_version version) noexcept
-        : line_sender_buffer{64 * 1024, 127, version}
     {
     }
 
     line_sender_buffer(const line_sender_buffer& other) noexcept
         : _impl{::line_sender_buffer_clone(other._impl)}
+        , _protocol_version{other._protocol_version}
         , _init_buf_size{other._init_buf_size}
         , _max_name_len{other._max_name_len}
-        , _protocol_version{other._protocol_version}
+
     {
     }
 
     line_sender_buffer(line_sender_buffer&& other) noexcept
         : _impl{other._impl}
+        , _protocol_version{other._protocol_version}
         , _init_buf_size{other._init_buf_size}
         , _max_name_len{other._max_name_len}
-        , _protocol_version{other._protocol_version}
+
     {
         other._impl = nullptr;
     }
@@ -821,19 +813,16 @@ private:
     {
         if (!_impl)
         {
-            _impl = ::line_sender_buffer_with_max_name_len(_max_name_len);
+            _impl = ::line_sender_buffer_with_max_name_len(
+                _max_name_len, _protocol_version);
             ::line_sender_buffer_reserve(_impl, _init_buf_size);
-            line_sender_error::wrapped_call(
-                line_sender_buffer_set_protocol_version,
-                _impl,
-                _protocol_version);
         }
     }
 
     ::line_sender_buffer* _impl;
+    protocol_version _protocol_version;
     size_t _init_buf_size;
     size_t _max_name_len;
-    protocol_version _protocol_version{::protocol_version_2};
 
     friend class line_sender;
 };
@@ -914,6 +903,34 @@ public:
     }
 
     /**
+     * Create a new `opts` instance with the given protocol, hostname and port.
+     * @param[in] protocol The protocol to use.
+     * @param[in] host The QuestDB database host.
+     * @param[in] port The QuestDB tcp or http port.
+     * @param[in] disable_protocol_validation disable line protocol version
+     * validation.
+     */
+    opts(
+        protocol protocol,
+        utf8_view host,
+        uint16_t port,
+        protocol_version version,
+        bool disable_protocol_validation = false) noexcept
+        : _impl{::line_sender_opts_new(
+              static_cast<::line_sender_protocol>(protocol), host._impl, port)}
+    {
+        line_sender_error::wrapped_call(
+            ::line_sender_opts_user_agent, _impl, _user_agent::name());
+        line_sender_error::wrapped_call(
+            ::line_sender_opts_protocol_version, _impl, version);
+        if (disable_protocol_validation)
+        {
+            line_sender_error::wrapped_call(
+                ::line_sender_opts_disable_protocol_validation, _impl);
+        }
+    }
+
+    /**
      * Create a new `opts` instance with the given protocol, hostname and
      * service name.
      * @param[in] protocol The protocol to use.
@@ -933,6 +950,36 @@ public:
     {
         line_sender_error::wrapped_call(
             ::line_sender_opts_user_agent, _impl, _user_agent::name());
+        if (disable_protocol_validation)
+        {
+            line_sender_error::wrapped_call(
+                ::line_sender_opts_disable_protocol_validation, _impl);
+        }
+    }
+
+    /**
+     * Create a new `opts` instance with the given protocol, hostname and
+     * service name.
+     * @param[in] protocol The protocol to use.
+     * @param[in] host The QuestDB database host.
+     * @param[in] port The QuestDB tcp or http port as service name.
+     * @param[in] disable_protocol_validation disable line protocol version
+     */
+    opts(
+        protocol protocol,
+        utf8_view host,
+        utf8_view port,
+        protocol_version version,
+        bool disable_protocol_validation = false) noexcept
+        : _impl{::line_sender_opts_new_service(
+              static_cast<::line_sender_protocol>(protocol),
+              host._impl,
+              port._impl)}
+    {
+        line_sender_error::wrapped_call(
+            ::line_sender_opts_user_agent, _impl, _user_agent::name());
+        line_sender_error::wrapped_call(
+            ::line_sender_opts_protocol_version, _impl, version);
         if (disable_protocol_validation)
         {
             line_sender_error::wrapped_call(
@@ -1258,6 +1305,28 @@ public:
     {
     }
 
+    line_sender(
+        protocol protocol,
+        utf8_view host,
+        uint16_t port,
+        protocol_version version,
+        bool disable_protocol_validation = false)
+        : line_sender{
+              opts{protocol, host, port, version, disable_protocol_validation}}
+    {
+    }
+
+    line_sender(
+        protocol protocol,
+        utf8_view host,
+        utf8_view port,
+        protocol_version version,
+        bool disable_protocol_validation = false)
+        : line_sender{
+              opts{protocol, host, port, version, disable_protocol_validation}}
+    {
+    }
+
     line_sender(const opts& opts)
         : _impl{
               line_sender_error::wrapped_call(::line_sender_build, opts._impl)}
@@ -1283,6 +1352,13 @@ public:
             other._impl = nullptr;
         }
         return *this;
+    }
+
+    line_sender_buffer new_buffer(
+        size_t init_buf_size = 64 * 1024, size_t max_name_len = 127) noexcept
+    {
+        return line_sender_buffer{
+            default_protocol_version(), init_buf_size, max_name_len};
     }
 
     /**
@@ -1337,7 +1413,7 @@ public:
         }
         else
         {
-            line_sender_buffer buffer2{0};
+            line_sender_buffer buffer2{default_protocol_version(), 0};
             buffer2.may_init();
             line_sender_error::wrapped_call(
                 ::line_sender_flush_and_keep, _impl, buffer2._impl);

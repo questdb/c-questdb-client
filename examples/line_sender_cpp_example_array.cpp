@@ -10,14 +10,15 @@ static bool array_example(std::string_view host, std::string_view port)
     try
     {
         auto sender = questdb::ingress::line_sender::from_conf(
-            "tcp::addr=" + std::string{host} + ":" + std::string{port} + ";");
+            "tcp::addr=" + std::string{host} + ":" + std::string{port} +
+            ";protocol_version=2;");
 
         const auto table_name = "cpp_market_orders"_tn;
         const auto symbol_col = "symbol"_cn;
         const auto book_col = "order_book"_cn;
         size_t rank = 3;
-        std::vector<uintptr_t> shape{2, 3, 2};
-        std::vector<intptr_t> strides{48, 16, 8};
+        std::vector<uint32_t> shape{2, 3, 2};
+        std::vector<int32_t> strides{48, 16, 8};
         std::array<double, 12> arr_data = {
             48123.5,
             2.4,
@@ -32,7 +33,7 @@ static bool array_example(std::string_view host, std::string_view port)
             48121.5,
             4.3};
 
-        questdb::ingress::line_sender_buffer buffer;
+        questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
         buffer.table(table_name)
             .symbol(symbol_col, "BTC-USD"_utf8)
             .column(book_col, 3, shape, strides, arr_data)

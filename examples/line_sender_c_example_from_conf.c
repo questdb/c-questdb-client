@@ -14,7 +14,7 @@ int main(int argc, const char* argv[])
     if (!sender)
         goto on_error;
 
-    buffer = line_sender_buffer_new();
+    buffer = line_sender_new_buffer(sender);
     line_sender_buffer_reserve(buffer, 64 * 1024);  // 64KB buffer initial size.
 
     // We prepare all our table names and column names in advance.

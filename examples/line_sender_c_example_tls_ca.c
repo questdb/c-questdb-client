@@ -31,7 +31,7 @@ static bool example(const char* ca_path, const char* host, const char* port)
     free(conf_str);
     conf_str = NULL;
 
-    buffer = line_sender_buffer_new();
+    buffer = line_sender_new_buffer(sender);
     line_sender_buffer_reserve(buffer, 64 * 1024);  // 64KB buffer initial size.
 
     // We prepare all our table names and column names in advance.
