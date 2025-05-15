@@ -424,6 +424,26 @@ class QuestDbFixture:
                     f'\nQuestDB log:\n')
                 self.print_log()
             raise toe
+        
+    def show_tables(self):
+        """Return a list of tables in the database."""
+        sql_query = "show tables"
+        try:
+            resp = self.http_sql_query(sql_query)
+            return [row[0] for row in resp['dataset']]
+        except QueryError as qe:
+            raise qe
+        
+    def drop_table(self, table_name):
+        self.http_sql_query(f"drop table '{table_name}'")
+
+    def drop_all_tables(self):
+        """Drop all tables in the database."""
+        all_tables = self.show_tables()
+        # if all_tables:
+        #     print(f'Dropping {len(all_tables)} tables: {all_tables!r}')
+        for table_name in all_tables:
+            self.drop_table(table_name)
 
     def __enter__(self):
         self.start()

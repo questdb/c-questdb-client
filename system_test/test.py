@@ -1137,6 +1137,7 @@ def run_with_fixtures(args):
             TLS_PROXY_FIXTURE = TlsProxyFixture(port_to_proxy)
             TLS_PROXY_FIXTURE.start()
 
+            QDB_FIXTURE.drop_all_tables()
             test_prog = unittest.TestProgram(exit=False)
             if not test_prog.result.wasSuccessful():
                 sys.exit(1)
