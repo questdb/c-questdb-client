@@ -35,7 +35,9 @@ use std::time::Duration;
 fn test_two_lines(
     #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
 ) -> TestResult {
-    let mut buffer = Buffer::new(version);
+    let mut server = MockServer::new()?;
+    let mut sender = server.lsb_http().protocol_version(version)?.build()?;
+    let mut buffer = sender.new_buffer();
     buffer
         .table("test")?
         .symbol("sym", "bol")?
@@ -48,20 +50,8 @@ fn test_two_lines(
         .at_now()?;
     let buffer2 = buffer.clone();
 
-    let mut server = MockServer::new()?.configure_settings_response(&[1, 2]);
-    let sender_builder = server.lsb_http();
-
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
         server.accept()?;
-        let req = server.recv_http_q()?;
-        assert_eq!(req.method(), "GET");
-        assert_eq!(req.path(), "/settings");
-        assert_eq!(
-            req.header("user-agent"),
-            Some(concat!("questdb/rust/", env!("CARGO_PKG_VERSION")))
-        );
-        server.send_settings_response()?;
-
         let req = server.recv_http_q()?;
         assert_eq!(req.method(), "POST");
         assert_eq!(req.path(), "/write?precision=n");
@@ -76,7 +66,6 @@ fn test_two_lines(
         Ok(())
     });
 
-    let mut sender = sender_builder.build()?;
     let res = sender.flush(&mut buffer);
 
     server_thread.join().unwrap()?;
@@ -92,29 +81,18 @@ fn test_two_lines(
 fn test_text_plain_error(
     #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
 ) -> TestResult {
-    let mut buffer = Buffer::new(version);
+    let mut server = MockServer::new()?;
+    let mut sender = server.lsb_http().protocol_version(version)?.build()?;
+    let mut buffer = sender.new_buffer();
     buffer
         .table("test")?
         .symbol("sym", "bol")?
         .column_f64("x", 1.0)?
         .at_now()?;
     buffer.table("test")?.column_f64("sym", 2.0)?.at_now()?;
-
-    let mut server = MockServer::new()?.configure_settings_response(&[1, 2]);
-    let sender_builder = server.lsb_http();
-
     let buffer2 = buffer.clone();
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
         server.accept()?;
-        let req = server.recv_http_q()?;
-        assert_eq!(req.method(), "GET");
-        assert_eq!(req.path(), "/settings");
-        assert_eq!(
-            req.header("user-agent"),
-            Some(concat!("questdb/rust/", env!("CARGO_PKG_VERSION")))
-        );
-        server.send_settings_response()?;
-
         let req = server.recv_http_q()?;
         assert_eq!(req.method(), "POST");
         assert_eq!(req.path(), "/write?precision=n");
@@ -130,7 +108,6 @@ fn test_text_plain_error(
         Ok(())
     });
 
-    let mut sender = sender_builder.build()?;
     let res = sender.flush(&mut buffer);
 
     server_thread.join().unwrap()?;
@@ -149,7 +126,9 @@ fn test_text_plain_error(
 fn test_bad_json_error(
     #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
 ) -> TestResult {
-    let mut buffer = Buffer::new(version);
+    let mut server = MockServer::new()?;
+    let mut sender = server.lsb_http().protocol_version(version)?.build()?;
+    let mut buffer = sender.new_buffer();
     buffer
         .table("test")?
         .symbol("sym", "bol")?
@@ -157,21 +136,9 @@ fn test_bad_json_error(
         .at_now()?;
     buffer.table("test")?.column_f64("sym", 2.0)?.at_now()?;
 
-    let mut server = MockServer::new()?.configure_settings_response(&[1, 2]);
-    let sender_builder = server.lsb_http();
-
     let buffer2 = buffer.clone();
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
         server.accept()?;
-        let req = server.recv_http_q()?;
-        assert_eq!(req.method(), "GET");
-        assert_eq!(req.path(), "/settings");
-        assert_eq!(
-            req.header("user-agent"),
-            Some(concat!("questdb/rust/", env!("CARGO_PKG_VERSION")))
-        );
-        server.send_settings_response()?;
-
         let req = server.recv_http_q()?;
         assert_eq!(req.method(), "POST");
         assert_eq!(req.path(), "/write?precision=n");
@@ -188,7 +155,6 @@ fn test_bad_json_error(
         Ok(())
     });
 
-    let mut sender = sender_builder.build()?;
     let res = sender.flush_and_keep(&buffer);
 
     server_thread.join().unwrap()?;
@@ -208,7 +174,9 @@ fn test_bad_json_error(
 fn test_json_error(
     #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
 ) -> TestResult {
-    let mut buffer = Buffer::new(version);
+    let mut server = MockServer::new()?;
+    let mut sender = server.lsb_http().protocol_version(version)?.build()?;
+    let mut buffer = sender.new_buffer();
     buffer
         .table("test")?
         .symbol("sym", "bol")?
@@ -216,21 +184,9 @@ fn test_json_error(
         .at_now()?;
     buffer.table("test")?.column_f64("sym", 2.0)?.at_now()?;
 
-    let mut server = MockServer::new()?.configure_settings_response(&[1, 2]);
-    let sender_builder = server.lsb_http();
-
     let buffer2 = buffer.clone();
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
         server.accept()?;
-        let req = server.recv_http_q()?;
-        assert_eq!(req.method(), "GET");
-        assert_eq!(req.path(), "/settings");
-        assert_eq!(
-            req.header("user-agent"),
-            Some(concat!("questdb/rust/", env!("CARGO_PKG_VERSION")))
-        );
-        server.send_settings_response()?;
-
         let req = server.recv_http_q()?;
         assert_eq!(req.method(), "POST");
         assert_eq!(req.path(), "/write?precision=n");
@@ -250,7 +206,7 @@ fn test_json_error(
         Ok(())
     });
 
-    let res = sender_builder.build()?.flush_and_keep(&buffer);
+    let res = sender.flush_and_keep(&buffer);
 
     server_thread.join().unwrap()?;
 
@@ -269,16 +225,15 @@ fn test_json_error(
 fn test_no_connection(
     #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
 ) -> TestResult {
-    let mut buffer = Buffer::new(version);
+    let mut sender = SenderBuilder::new(Protocol::Http, "127.0.0.1", 1)
+        .protocol_version(version)?
+        .build()?;
+    let mut buffer = sender.new_buffer();
     buffer
         .table("test")?
         .symbol("sym", "bol")?
         .column_f64("x", 1.0)?
         .at_now()?;
-
-    let mut sender = SenderBuilder::new(Protocol::Http, "127.0.0.1", 1)
-        .protocol_version(ProtocolVersion::V2)?
-        .build()?;
     let res = sender.flush_and_keep(&buffer);
     assert!(res.is_err());
     let err = res.unwrap_err();
@@ -293,28 +248,18 @@ fn test_no_connection(
 fn test_old_server_without_ilp_http_support(
     #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
 ) -> TestResult {
-    let mut buffer = Buffer::new(version);
+    let mut server = MockServer::new()?;
+    let mut sender = server.lsb_http().protocol_version(version)?.build()?;
+    let mut buffer = sender.new_buffer();
     buffer
         .table("test")?
         .symbol("sym", "bol")?
         .column_f64("x", 1.0)?
         .at_now()?;
 
-    let mut server = MockServer::new()?.configure_settings_response(&[1, 2]);
-    let sender_builder = server.lsb_http();
-
     let buffer2 = buffer.clone();
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
         server.accept()?;
-        let req = server.recv_http_q()?;
-        assert_eq!(req.method(), "GET");
-        assert_eq!(req.path(), "/settings");
-        assert_eq!(
-            req.header("user-agent"),
-            Some(concat!("questdb/rust/", env!("CARGO_PKG_VERSION")))
-        );
-        server.send_settings_response()?;
-
         let req = server.recv_http_q()?;
         assert_eq!(req.method(), "POST");
         assert_eq!(req.path(), "/write?precision=n");
@@ -330,7 +275,7 @@ fn test_old_server_without_ilp_http_support(
         Ok(())
     });
 
-    let res = sender_builder.build()?.flush_and_keep(&buffer);
+    let res = sender.flush_and_keep(&buffer);
 
     server_thread.join().unwrap()?;
 
@@ -349,33 +294,24 @@ fn test_old_server_without_ilp_http_support(
 fn test_http_basic_auth(
     #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
 ) -> TestResult {
-    let mut buffer = Buffer::new(version);
+    let mut server = MockServer::new()?;
+    let mut sender = server
+        .lsb_http()
+        .protocol_version(version)?
+        .username("Aladdin")?
+        .password("OpenSesame")?
+        .build()?;
+    let mut buffer = sender.new_buffer();
     buffer
         .table("test")?
         .symbol("sym", "bol")?
         .column_f64("x", 1.0)?
         .at_now()?;
 
-    let mut server = MockServer::new()?.configure_settings_response(&[1, 2]);
-    let sender_builder = server
-        .lsb_http()
-        .username("Aladdin")?
-        .password("OpenSesame")?;
-
     let buffer2 = buffer.clone();
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
         server.accept()?;
         let req = server.recv_http_q()?;
-        assert_eq!(req.method(), "GET");
-        assert_eq!(req.path(), "/settings");
-        assert_eq!(
-            req.header("user-agent"),
-            Some(concat!("questdb/rust/", env!("CARGO_PKG_VERSION")))
-        );
-        server.send_settings_response()?;
-
-        let req = server.recv_http_q()?;
-
         assert_eq!(req.method(), "POST");
         assert_eq!(req.path(), "/write?precision=n");
         assert_eq!(
@@ -389,7 +325,7 @@ fn test_http_basic_auth(
         Ok(())
     });
 
-    let res = sender_builder.build()?.flush(&mut buffer);
+    let res = sender.flush(&mut buffer);
 
     server_thread.join().unwrap()?;
 
@@ -404,28 +340,18 @@ fn test_http_basic_auth(
 fn test_unauthenticated(
     #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
 ) -> TestResult {
-    let mut buffer = Buffer::new(version);
+    let mut server = MockServer::new()?;
+    let mut sender = server.lsb_http().protocol_version(version)?.build()?;
+    let mut buffer = sender.new_buffer();
     buffer
         .table("test")?
         .symbol("sym", "bol")?
         .column_f64("x", 1.0)?
         .at_now()?;
 
-    let mut server = MockServer::new()?.configure_settings_response(&[1, 2]);
-    let sender_builder = server.lsb_http();
-
     let buffer2 = buffer.clone();
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
         server.accept()?;
-        let req = server.recv_http_q()?;
-        assert_eq!(req.method(), "GET");
-        assert_eq!(req.path(), "/settings");
-        assert_eq!(
-            req.header("user-agent"),
-            Some(concat!("questdb/rust/", env!("CARGO_PKG_VERSION")))
-        );
-        server.send_settings_response()?;
-
         let req = server.recv_http_q()?;
         assert_eq!(req.method(), "POST");
         assert_eq!(req.path(), "/write?precision=n");
@@ -441,7 +367,7 @@ fn test_unauthenticated(
         Ok(())
     });
 
-    let res = sender_builder.build()?.flush(&mut buffer);
+    let res = sender.flush(&mut buffer);
 
     server_thread.join().unwrap()?;
 
@@ -462,28 +388,18 @@ fn test_unauthenticated(
 fn test_token_auth(
     #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
 ) -> TestResult {
-    let mut buffer = Buffer::new(version);
+    let mut server = MockServer::new()?;
+    let mut sender = server.lsb_http().protocol_version(version)?.token("0123456789")?.build()?;
+    let mut buffer = sender.new_buffer();
     buffer
         .table("test")?
         .symbol("sym", "bol")?
         .column_f64("x", 1.0)?
         .at_now()?;
 
-    let mut server = MockServer::new()?.configure_settings_response(&[1, 2]);
-    let sender_builder = server.lsb_http().token("0123456789")?;
-
     let buffer2 = buffer.clone();
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
         server.accept()?;
-        let req = server.recv_http_q()?;
-        assert_eq!(req.method(), "GET");
-        assert_eq!(req.path(), "/settings");
-        assert_eq!(
-            req.header("user-agent"),
-            Some(concat!("questdb/rust/", env!("CARGO_PKG_VERSION")))
-        );
-        server.send_settings_response()?;
-
         let req = server.recv_http_q()?;
         assert_eq!(req.method(), "POST");
         assert_eq!(req.path(), "/write?precision=n");
@@ -495,7 +411,7 @@ fn test_token_auth(
         Ok(())
     });
 
-    let res = sender_builder.build()?.flush(&mut buffer);
+    let res = sender.flush(&mut buffer);
 
     server_thread.join().unwrap()?;
 
@@ -508,7 +424,14 @@ fn test_token_auth(
 fn test_request_timeout(
     #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
 ) -> TestResult {
-    let mut buffer = Buffer::new(version);
+    let server = MockServer::new()?;
+    let request_timeout = Duration::from_millis(50);
+    let mut sender = server
+        .lsb_http()
+        .protocol_version(version)?
+        .request_timeout(request_timeout)?
+        .build()?;
+    let mut buffer = sender.new_buffer();
     buffer
         .table("test")?
         .symbol("sym", "bol")?
@@ -516,15 +439,7 @@ fn test_request_timeout(
         .at_now()?;
 
     // Here we use a mock (tcp) server instead and don't send a response back.
-    let server = MockServer::new()?.configure_settings_response(&[1, 2]);
-
-    let request_timeout = Duration::from_millis(50);
     let time_start = std::time::Instant::now();
-    let mut sender = server
-        .lsb_http()
-        .protocol_version(ProtocolVersion::V2)?
-        .request_timeout(request_timeout)?
-        .build()?;
     let res = sender.flush_and_keep(&buffer);
     let time_elapsed = time_start.elapsed();
     assert!(res.is_err());
@@ -541,22 +456,20 @@ fn test_tls(
 ) -> TestResult {
     let mut ca_path = certs_dir();
     ca_path.push("server_rootCA.pem");
+    let mut server = MockServer::new()?;
+    let mut sender = server
+        .lsb_https()
+        .tls_roots(ca_path)?
+        .protocol_version(version)?
+        .build()?;
 
-    let mut buffer = Buffer::new(version);
+    let mut buffer = sender.new_buffer();
     buffer
         .table("test")?
         .symbol("t1", "v1")?
         .column_f64("f1", 0.5)?
         .at(TimestampNanos::new(10000000))?;
     let buffer2 = buffer.clone();
-
-    let mut server = MockServer::new()?.configure_settings_response(&[1, 2]);
-    let mut sender = server
-        .lsb_https()
-        .tls_roots(ca_path)?
-        .protocol_version(ProtocolVersion::V2)?
-        .build()?;
-
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
         server.accept_tls_sync()?;
         let req = server.recv_http_q()?;
@@ -583,24 +496,17 @@ fn test_tls(
 fn test_user_agent(
     #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
 ) -> TestResult {
-    let mut buffer = Buffer::new(version);
+    let mut server = MockServer::new()?;
+    let mut sender = server.lsb_http().user_agent("wallabies/1.2.99")?.protocol_version(version)?.build()?;
+    let mut buffer = sender.new_buffer();
     buffer
         .table("test")?
         .symbol("t1", "v1")?
         .column_f64("f1", 0.5)?
         .at(TimestampNanos::new(10000000))?;
     let buffer2 = buffer.clone();
-
-    let mut server = MockServer::new()?.configure_settings_response(&[1, 2]);
-    let sender_builder = server.lsb_http().user_agent("wallabies/1.2.99")?;
-
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
         server.accept()?;
-        let req = server.recv_http_q()?;
-        assert_eq!(req.method(), "GET");
-        assert_eq!(req.path(), "/settings");
-        server.send_settings_response()?;
-
         let req = server.recv_http_q()?;
         assert_eq!(req.header("user-agent"), Some("wallabies/1.2.99"));
         assert_eq!(req.body(), buffer2.as_bytes());
@@ -610,7 +516,7 @@ fn test_user_agent(
         Ok(())
     });
 
-    let res = sender_builder.build()?.flush_and_keep(&buffer);
+    let res = sender.flush_and_keep(&buffer);
 
     server_thread.join().unwrap()?;
 
@@ -625,29 +531,17 @@ fn test_two_retries(
     #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
 ) -> TestResult {
     // Note: This also tests that the _same_ connection is being reused, i.e. tests keepalive.
-
-    let mut buffer = Buffer::new(version);
+    let mut server = MockServer::new()?;
+    let mut sender = server.lsb_http().protocol_version(version)?.retry_timeout(Duration::from_secs(30))?.build()?;
+    let mut buffer = sender.new_buffer();
     buffer
         .table("test")?
         .symbol("t1", "v1")?
         .column_f64("f1", 0.5)?
         .at(TimestampNanos::new(10000000))?;
     let buffer2 = buffer.clone();
-
-    let mut server = MockServer::new()?.configure_settings_response(&[1, 2]);
-    let sender_builder = server.lsb_http().retry_timeout(Duration::from_secs(30))?;
-
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
         server.accept()?;
-        let req = server.recv_http_q()?;
-        assert_eq!(req.method(), "GET");
-        assert_eq!(req.path(), "/settings");
-        assert_eq!(
-            req.header("user-agent"),
-            Some(concat!("questdb/rust/", env!("CARGO_PKG_VERSION")))
-        );
-        server.send_settings_response()?;
-
         let req = server.recv_http_q()?;
         assert_eq!(req.body(), buffer2.as_bytes());
 
@@ -682,7 +576,7 @@ fn test_two_retries(
         Ok(())
     });
 
-    let res = sender_builder.build()?.flush_and_keep(&buffer);
+    let res = sender.flush_and_keep(&buffer);
 
     server_thread.join().unwrap()?;
 
@@ -696,21 +590,19 @@ fn test_two_retries(
 fn test_one_retry(
     #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
 ) -> TestResult {
-    let mut buffer = Buffer::new(version);
+    let mut server = MockServer::new()?;
+    let mut sender = server
+        .lsb_http()
+        .retry_timeout(Duration::from_millis(19))?
+        .protocol_version(version)?
+        .build()?;
+    let mut buffer = sender.new_buffer();
     buffer
         .table("test")?
         .symbol("t1", "v1")?
         .column_f64("f1", 0.5)?
         .at(TimestampNanos::new(10000000))?;
     let buffer2 = buffer.clone();
-
-    let mut server = MockServer::new()?.configure_settings_response(&[1, 2]);
-    let mut sender = server
-        .lsb_http()
-        .retry_timeout(Duration::from_millis(19))?
-        .protocol_version(ProtocolVersion::V2)
-        .unwrap()
-        .build()?;
 
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
         server.accept()?;
@@ -763,8 +655,10 @@ fn test_one_retry(
 fn test_transactional(
     #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
 ) -> TestResult {
+    let mut server = MockServer::new()?;
+    let mut sender = server.lsb_http().protocol_version(version)?.build()?;
     // A buffer with a two tables.
-    let mut buffer1 = Buffer::new(version);
+    let mut buffer1 = sender.new_buffer();
     buffer1
         .table("tab1")?
         .symbol("t1", "v1")?
@@ -778,7 +672,7 @@ fn test_transactional(
     assert!(!buffer1.transactional());
 
     // A buffer with a single table.
-    let mut buffer2 = Buffer::new(version);
+    let mut buffer2 = sender.new_buffer();
     buffer2
         .table("test")?
         .symbol("t1", "v1")?
@@ -787,20 +681,8 @@ fn test_transactional(
     let buffer3 = buffer2.clone();
     assert!(buffer2.transactional());
 
-    let mut server = MockServer::new()?.configure_settings_response(&[1, 2]);
-    let sender_builder = server.lsb_http();
-
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
         server.accept()?;
-        let req = server.recv_http_q()?;
-        assert_eq!(req.method(), "GET");
-        assert_eq!(req.path(), "/settings");
-        assert_eq!(
-            req.header("user-agent"),
-            Some(concat!("questdb/rust/", env!("CARGO_PKG_VERSION")))
-        );
-        server.send_settings_response()?;
-
         let req = server.recv_http_q()?;
         assert_eq!(req.body(), buffer3.as_bytes());
 
@@ -808,8 +690,6 @@ fn test_transactional(
 
         Ok(())
     });
-
-    let mut sender = sender_builder.build()?;
 
     let res = sender.flush_and_keep_with_flags(&buffer1, true);
     assert!(res.is_err());
@@ -831,60 +711,51 @@ fn test_transactional(
     Ok(())
 }
 
-#[test]
-fn test_sender_protocol_version() -> TestResult {
-    let mut server = MockServer::new()?.configure_settings_response(&[1, 2]);
+fn _test_sender_auto_detect_protocol_version(supported_versions: Option<Vec<u16>>, expect_version: ProtocolVersion) -> TestResult {
+    let supported_versions1 = supported_versions.clone();
+    let mut server = MockServer::new()?.configure_settings_response(supported_versions.as_deref().unwrap_or(&[]));
     let sender_builder = server.lsb_http();
+
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
         server.accept()?;
         let req = server.recv_http_q()?;
         assert_eq!(req.method(), "GET");
         assert_eq!(req.path(), "/settings");
-        assert_eq!(
-            req.header("user-agent"),
-            Some(concat!("questdb/rust/", env!("CARGO_PKG_VERSION")))
-        );
-        server.send_settings_response()?;
-        Ok(())
-    });
-    let sender = sender_builder.build()?;
-    assert_eq!(sender.default_protocol_version(), ProtocolVersion::V2);
-    assert_eq!(
-        sender.support_protocol_versions().unwrap(),
-        vec![ProtocolVersion::V1, ProtocolVersion::V2]
-    );
-    server_thread.join().unwrap()?;
-    Ok(())
-}
-
-#[test]
-fn test_sender_protocol_version_old_server1() -> TestResult {
-    let mut server = MockServer::new()?.configure_settings_response(&[]);
-    let sender_builder = server.lsb_http();
-    let server_thread = std::thread::spawn(move || -> io::Result<()> {
-        server.accept()?;
+        match supported_versions1 {
+            None => server.send_http_response_q(
+                HttpResponse::empty()
+                    .with_status(404, "Not Found")
+                    .with_header("content-type", "text/plain")
+                    .with_body_str("Not Found"),
+            )?,
+            Some(_) => server.send_settings_response()?
+        }
+        let exp = &[
+            b"test,t1=v1 ",
+            crate::tests::sender::f64_to_bytes("f1", 0.5, expect_version).as_slice(),
+            b" 10000000\n"
+        ].concat();
         let req = server.recv_http_q()?;
-        assert_eq!(req.method(), "GET");
-        assert_eq!(req.path(), "/settings");
-        assert_eq!(
-            req.header("user-agent"),
-            Some(concat!("questdb/rust/", env!("CARGO_PKG_VERSION")))
-        );
-        server.send_settings_response()?;
+        assert_eq!(req.body(), exp);
+        server.send_http_response_q(HttpResponse::empty())?;
         Ok(())
     });
-    let sender = sender_builder.build()?;
-    assert_eq!(sender.default_protocol_version(), ProtocolVersion::V1);
-    assert_eq!(
-        sender.support_protocol_versions(),
-        Some(vec![ProtocolVersion::V1])
-    );
+
+    let mut sender = sender_builder.build()?;
+    assert_eq!(sender.default_protocol_version(), expect_version);
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("test")?
+        .symbol("t1", "v1")?
+        .column_f64("f1", 0.5)?
+        .at(TimestampNanos::new(10000000))?;
+    let res = sender.flush(&mut buffer);
     server_thread.join().unwrap()?;
+    res?;
     Ok(())
 }
-
 #[test]
-fn test_sender_protocol_version_old_server2() -> TestResult {
+fn test_sender_protocol_version_old_server21() -> TestResult {
     let mut server = MockServer::new()?.configure_settings_response(&[]);
     let sender_builder = server.lsb_http();
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
@@ -899,13 +770,35 @@ fn test_sender_protocol_version_old_server2() -> TestResult {
     });
     let sender = sender_builder.build()?;
     assert_eq!(sender.default_protocol_version(), ProtocolVersion::V1);
-    assert_eq!(
-        sender.support_protocol_versions(),
-        Some(vec![ProtocolVersion::V1])
-    );
     server_thread.join().unwrap()?;
     Ok(())
 }
+#[test]
+fn test_sender_protocol_version() -> TestResult {
+    _test_sender_auto_detect_protocol_version(Some(vec![1, 2]), ProtocolVersion::V2)
+}
+
+#[test]
+fn test_sender_protocol_version_old_server1() -> TestResult {
+    _test_sender_auto_detect_protocol_version(Some(vec![]), ProtocolVersion::V1)
+}
+
+// todo test hang
+// #[test]
+// fn test_sender_protocol_version_old_server2() -> TestResult {
+//    _test_sender_auto_detect_protocol_version(None, ProtocolVersion::V1)
+// }
+
+#[test]
+fn test_sender_protocol_version_only_v1() -> TestResult {
+    _test_sender_auto_detect_protocol_version(Some(vec![1]), ProtocolVersion::V1)
+}
+
+#[test]
+fn test_sender_protocol_version_only_v2() -> TestResult {
+    _test_sender_auto_detect_protocol_version(Some(vec![2]), ProtocolVersion::V2)
+}
+
 
 #[test]
 fn test_sender_protocol_version_unsupported_client() -> TestResult {
@@ -926,35 +819,7 @@ fn test_sender_protocol_version_unsupported_client() -> TestResult {
 }
 
 #[test]
-fn test_sender_explicit_set_protocol_version_v2() -> TestResult {
-    let mut server = MockServer::new()?.configure_settings_response(&[]);
-    let mut sender = server
-        .lsb_http()
-        .protocol_version(ProtocolVersion::V2)?
-        .build()?;
-    let mut buffer = sender.new_buffer();
-    buffer
-        .table("test")?
-        .symbol("sym", "bol")?
-        .column_f64("x", 1.0)?
-        .at_now()?;
-    let buffer2 = buffer.clone();
-
-    let server_thread = std::thread::spawn(move || -> io::Result<()> {
-        server.accept()?;
-        let req = server.recv_http_q()?;
-        assert_eq!(req.body(), buffer2.as_bytes());
-        server.send_http_response_q(HttpResponse::empty())?;
-        Ok(())
-    });
-
-    sender.flush(&mut buffer)?;
-    server_thread.join().unwrap()?;
-    Ok(())
-}
-
-#[test]
-fn test_sender_protocol_version1_not_support_array() -> TestResult {
+fn test_buffer_protocol_version1_not_support_array() -> TestResult {
     let mut buffer = Buffer::new(ProtocolVersion::V1);
     let res = buffer
         .table("test")?

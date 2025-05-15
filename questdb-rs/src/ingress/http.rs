@@ -405,7 +405,7 @@ pub(super) fn http_send_with_retries(
 }
 
 /// Return and the server's all supported protocol versions.
-/// - For modern servers: Returns explicit version list from `line.proto.support.versions` JSON field(/settings endpoint)
+/// - For modern servers: Returns explicit version list from QuestDB's server's `/settings` endpoint response
 /// - For legacy servers (404 response or missing version field): Automatically falls back to [`ProtocolVersion::V1`]
 pub(super) fn get_supported_protocol_versions(
     state: &HttpHandlerState,
@@ -421,7 +421,9 @@ pub(super) fn get_supported_protocol_versions(
     ) {
         Ok(res) => {
             if res.status().is_client_error() || res.status().is_server_error() {
-                if res.status().as_u16() == 404 {
+                let status = res.status();
+                let _ = res.into_body();
+                if status.as_u16() == 404 {
                     support_versions.push(ProtocolVersion::V1);
                     return Ok(support_versions);
                 }
@@ -429,7 +431,7 @@ pub(super) fn get_supported_protocol_versions(
                     ProtocolVersionError,
                     "Failed to detect server's line protocol version, settings url: {}, status code: {}.",
                     settings_url,
-                    res.status()
+                    status
                 ));
             } else {
                 res

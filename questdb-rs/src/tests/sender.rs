@@ -146,7 +146,7 @@ fn test_array_f64_basic() -> TestResult {
 
 #[cfg(feature = "ndarray")]
 #[test]
-fn test_array_f64_from_ndarray() -> TestResult {
+fn test_array_f64_for_ndarray() -> TestResult {
     let mut server = MockServer::new()?;
     let mut sender = server
         .lsb_tcp()
@@ -677,7 +677,7 @@ fn bad_uppercase_addr() {
     assert!(err.msg() == "Missing \"addr\" parameter in config string");
 }
 
-fn f64_to_bytes(name: &str, value: f64, version: ProtocolVersion) -> Vec<u8> {
+pub(crate) fn f64_to_bytes(name: &str, value: f64, version: ProtocolVersion) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend_from_slice(name.as_bytes());
     buf.push(b'=');

@@ -1112,7 +1112,6 @@ impl Buffer {
     /// - Failed to get dimension sizes
     /// - Column name validation fails
     /// - Protocol version v1 is used (arrays require v2+)
-    /// - Array contains unsupported element types (non-f64)
     #[allow(private_bounds)]
     pub fn column_arr<'a, N, T, D>(&mut self, name: N, view: &T) -> Result<&mut Self>
     where
@@ -1145,7 +1144,7 @@ impl Buffer {
             ));
         }
 
-        let array_buf_size = get_and_check_array_bytes_size(view)?;
+        let array_buf_size = check_and_get_array_bytes_size(view)?;
         self.write_column_key(name)?;
         // binary format flag '='
         self.output.push(b'=');
@@ -3002,17 +3001,10 @@ impl Sender {
     }
 
     #[cfg(feature = "ilp-over-http")]
-    #[cfg(test)]
-    pub(crate) fn support_protocol_versions(&self) -> Option<Vec<ProtocolVersion>> {
-        self.supported_protocol_versions.clone()
-    }
-
-    #[cfg(feature = "ilp-over-http")]
     #[inline(always)]
     fn check_protocol_version(&self, version: ProtocolVersion) -> Result<()> {
         match &self.handler {
             ProtocolHandler::Socket(_) => Ok(()),
-            #[cfg(feature = "ilp-over-http")]
             ProtocolHandler::Http(_) => {
                 match self.supported_protocol_versions {
                     Some(ref supported_line_protocols) => {
@@ -3024,6 +3016,7 @@ impl Sender {
                                     "Line protocol version {} is not supported by current QuestDB Server",  version))
                         }
                     }
+                    // `None` implies user set protocol_version explicitly
                     None => Ok(()),
                 }
             }
@@ -3041,7 +3034,7 @@ mod timestamp;
 #[cfg(feature = "ilp-over-http")]
 mod http;
 
-use crate::ingress::ndarr::{get_and_check_array_bytes_size, MAX_ARRAY_DIM_LEN};
+use crate::ingress::ndarr::{check_and_get_array_bytes_size, MAX_ARRAY_DIM_LEN};
 #[cfg(feature = "ilp-over-http")]
 use http::*;
 
