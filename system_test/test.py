@@ -33,6 +33,7 @@ import math
 import datetime
 import argparse
 import unittest
+import itertools
 import numpy as np
 import time
 import questdb_line_sender as qls
@@ -51,6 +52,9 @@ from collections import namedtuple
 QDB_FIXTURE: QuestDbFixture = None
 TLS_PROXY_FIXTURE: TlsProxyFixture = None
 BUILD_MODE = None
+
+# The first QuestDB version that supports array types.
+FIRST_ARRAYS_RELEASE = (8, 3, 1)
 
 
 def retry_check_table(*args, **kwargs):
@@ -97,15 +101,29 @@ AUTH_MALFORMED3 = dict(
 class TestSender(unittest.TestCase):
     def _mk_linesender(self):
         # N.B.: We never connect with TLS here.
-        auth = AUTH if QDB_FIXTURE.auth else {}
-        if not QDB_FIXTURE.http and not QDB_FIXTURE.version < (8, 3, 1):
-            auth["protocol_version"] = qls.ProtocolVersion.V2.value[0]
+        kwargs = AUTH if QDB_FIXTURE.auth else {}
+        if QDB_FIXTURE.protocol_version:
+            kwargs["protocol_version"] = QDB_FIXTURE.protocol_version
         return qls.Sender(
             BUILD_MODE,
             qls.Protocol.HTTP if QDB_FIXTURE.http else qls.Protocol.TCP,
             QDB_FIXTURE.host,
             QDB_FIXTURE.http_server_port if QDB_FIXTURE.http else QDB_FIXTURE.line_tcp_port,
-            **auth)
+            **kwargs)
+    
+    @property
+    def expected_protocol_version(self) -> qls.ProtocolVersion:
+        """The protocol version that we expect to be handling."""
+        if QDB_FIXTURE.protocol_version is None:
+            if not QDB_FIXTURE.http:
+                return qls.ProtocolVersion.V1
+            
+            if QDB_FIXTURE.version >= FIRST_ARRAYS_RELEASE:
+                return qls.ProtocolVersion.V2
+            
+            return qls.ProtocolVersion.V1
+            
+        return QDB_FIXTURE.protocol_version
 
     def _expect_eventual_disconnect(self, sender):
         with self.assertRaisesRegex(
@@ -482,8 +500,8 @@ class TestSender(unittest.TestCase):
         self.assertEqual(scrubbed_dataset, exp_dataset)
 
     def test_f64_arr_column(self):
-        if QDB_FIXTURE.version < (8, 3, 1):
-            self.skipTest('array issues support')
+        if self.expected_protocol_version < qls.ProtocolVersion.V2:
+            self.skipTest('communicating over old protocol which does not support arrays')
 
         table_name = uuid.uuid4().hex
         array1 = np.array(
@@ -517,8 +535,8 @@ class TestSender(unittest.TestCase):
         self.assertEqual(scrubbed_data, expected_data)
 
     def test_f64_arr_empty(self):
-        if QDB_FIXTURE.version < (8, 3, 1):
-            self.skipTest('array issues support')
+        if self.expected_protocol_version < qls.ProtocolVersion.V2:
+            self.skipTest('communicating over old protocol which does not support arrays')
 
         table_name = uuid.uuid4().hex
         empty_array = np.array([], dtype=np.float64).reshape(0, 0, 0)
@@ -534,8 +552,8 @@ class TestSender(unittest.TestCase):
         self.assertEqual(resp['dataset'][0][0], [])
 
     def test_f64_arr_non_contiguous(self):
-        if QDB_FIXTURE.version < (8, 3, 1):
-            self.skipTest('array issues support')
+        if self.expected_protocol_version < qls.ProtocolVersion.V2:
+            self.skipTest('communicating over old protocol which does not support arrays')
 
         table_name = uuid.uuid4().hex
         array = np.array([[1.1, 2.2], [3.3, 4.4]], dtype=np.float64)[:, ::2]
@@ -551,8 +569,8 @@ class TestSender(unittest.TestCase):
         self.assertEqual(resp['dataset'][0][0], [[1.1], [3.3]])
 
     def test_f64_arr_zero_dimensional(self):
-        if QDB_FIXTURE.version < (8, 3, 1):
-            self.skipTest('array issues support')
+        if self.expected_protocol_version < qls.ProtocolVersion.V2:
+            self.skipTest('communicating over old protocol which does not support arrays')
 
         table_name = uuid.uuid4().hex
         array = np.array(42.0, dtype=np.float64)
@@ -565,8 +583,8 @@ class TestSender(unittest.TestCase):
             self.assertIn('Zero-dimensional arrays are not supported', str(e))
 
     def test_f64_arr_wrong_datatype(self):
-        if QDB_FIXTURE.version < (8, 3, 1):
-            self.skipTest('array issues support')
+        if self.expected_protocol_version < qls.ProtocolVersion.V2:
+            self.skipTest('communicating over old protocol which does not support arrays')
 
         table_name = uuid.uuid4().hex
         array = np.array([1, 2], dtype=np.int32)
@@ -579,8 +597,8 @@ class TestSender(unittest.TestCase):
             self.assertIn('expect float64 array', str(e))
 
     def test_f64_arr_mix_dims(self):
-        if QDB_FIXTURE.version < (8, 3, 1):
-            self.skipTest('array issues support')
+        if self.expected_protocol_version < qls.ProtocolVersion.V2:
+            self.skipTest('communicating over old protocol which does not support arrays')
 
         array_2d = np.array([[1.1, 2.2], [3.3, 4.4]], dtype=np.float64)
         array_1d = np.array([1.1], dtype=np.float64)
@@ -599,6 +617,8 @@ class TestSender(unittest.TestCase):
             self.assertIn('cast error from protocol type: DOUBLE[] to column type: DOUBLE[][]', str(e))
 
     def test_protocol_version_v1(self):
+        if self.expected_protocol_version >= qls.ProtocolVersion.V2:
+            self.skipTest('we are only validating the older protocol here')
         if QDB_FIXTURE.version <= (6, 1, 2):
             self.skipTest('Float issues support')
         numbers = [
@@ -610,7 +630,6 @@ class TestSender(unittest.TestCase):
         table_name = uuid.uuid4().hex
         pending = None
         with self._mk_linesender() as sender:
-            sender.buffer.set_protocol_version(qls.ProtocolVersion.V1)
             for num in numbers:
                 sender.table(table_name)
                 sender.column('n', num)
@@ -640,8 +659,8 @@ class TestSender(unittest.TestCase):
         self.assertEqual(scrubbed_dataset, exp_dataset)
 
     def test_protocol_version_v1_array_unsupported(self):
-        if QDB_FIXTURE.version < (8, 3, 1):
-            self.skipTest('array unsupported')
+        if self.expected_protocol_version >= qls.ProtocolVersion.V2:
+            self.skipTest('communicating over a newer protocl that DOES support arrays')
 
         array1 = np.array(
             [
@@ -652,8 +671,7 @@ class TestSender(unittest.TestCase):
         )
         table_name = uuid.uuid4().hex
         try:
-            with self._mk_linesender(True) as sender:
-                sender.buffer.set_protocol_version(qls.ProtocolVersion.V1)
+            with self._mk_linesender() as sender:
                 sender.table(table_name)
                 sender.column_f64_arr('f64_arr1', array1)
                 sender.at_now()
@@ -736,8 +754,8 @@ class TestSender(unittest.TestCase):
             'market_orders')
 
     def _test_array_example(self, bin_name, table_name):
-        if QDB_FIXTURE.version < (8, 3, 1):
-            self.skipTest('array unsupported')
+        if self.expected_protocol_version < qls.ProtocolVersion.V2:
+            self.skipTest('communicating over old protocol which does not support arrays')
         if QDB_FIXTURE.http:
             self.skipTest('TCP-only test')
         if BUILD_MODE != qls.BuildMode.API:
@@ -1029,7 +1047,14 @@ def run_with_existing(args):
     global QDB_FIXTURE
     MockFixture = namedtuple(
         'MockFixture',
-        ('host', 'line_tcp_port', 'http_server_port', 'version', 'http', "auth"))
+        (
+            'host',
+            'line_tcp_port',
+            'http_server_port',
+            'version',
+            'http',
+            'auth',
+            'protocol_version'))
     host, line_tcp_port, http_server_port = args.existing.split(':')
     QDB_FIXTURE = MockFixture(
         host,
@@ -1080,38 +1105,45 @@ def run_with_fixtures(args):
     global TLS_PROXY_FIXTURE
     global BUILD_MODE
     last_version = None
-    for questdb_dir in iter_versions(args):
-        for auth in (False, True):
-            for http in (False, True):
-                for build_mode in list(qls.BuildMode):
-                    print(
-                        f'Running tests [questdb_dir={questdb_dir}, auth={auth}, http={http}, build_mode={build_mode}]')
-                    if http and last_version <= (7, 3, 7):
-                        print('Skipping ILP/HTTP tests for versions <= 7.3.7')
-                        continue
-                    if http and auth:
-                        print('Skipping auth for ILP/HTTP tests')
-                        continue
-                    QDB_FIXTURE = QuestDbFixture(questdb_dir, auth=auth, http=http)
-                    TLS_PROXY_FIXTURE = None
-                    BUILD_MODE = build_mode
-                    try:
-                        QDB_FIXTURE.start()
-                        # Read the version _after_ a first start so it can rely
-                        # on the live one from the `select build` query.
-                        last_version = QDB_FIXTURE.version
-                        port_to_proxy = QDB_FIXTURE.http_server_port \
-                            if http else QDB_FIXTURE.line_tcp_port
-                        TLS_PROXY_FIXTURE = TlsProxyFixture(port_to_proxy)
-                        TLS_PROXY_FIXTURE.start()
 
-                        test_prog = unittest.TestProgram(exit=False)
-                        if not test_prog.result.wasSuccessful():
-                            sys.exit(1)
-                    finally:
-                        if TLS_PROXY_FIXTURE:
-                            TLS_PROXY_FIXTURE.stop()
-                        QDB_FIXTURE.stop()
+    for questdb_dir, auth, http, protocol_version, build_mode in itertools.product(
+            iter_versions(args),
+            (False, True),  # auth
+            (False, True),  # http
+            [None] + list(qls.ProtocolVersion),  # None is for `auto`
+            list(qls.BuildMode)):
+        print(
+            f'Running tests [questdb_dir={questdb_dir}, auth={auth}, http={http}, build_mode={build_mode}, protocol_version={protocol_version}]')
+        if http and last_version <= (7, 3, 7):
+            print('Skipping ILP/HTTP tests for versions <= 7.3.7')
+            continue
+        if http and auth:
+            print('Skipping auth for ILP/HTTP tests')
+            continue
+        QDB_FIXTURE = QuestDbFixture(
+            questdb_dir,
+            auth=auth,
+            http=http,
+            protocol_version=protocol_version)
+        TLS_PROXY_FIXTURE = None
+        BUILD_MODE = build_mode
+        try:
+            QDB_FIXTURE.start()
+            # Read the version _after_ a first start so it can rely
+            # on the live one from the `select build` query.
+            last_version = QDB_FIXTURE.version
+            port_to_proxy = QDB_FIXTURE.http_server_port \
+                if http else QDB_FIXTURE.line_tcp_port
+            TLS_PROXY_FIXTURE = TlsProxyFixture(port_to_proxy)
+            TLS_PROXY_FIXTURE.start()
+
+            test_prog = unittest.TestProgram(exit=False)
+            if not test_prog.result.wasSuccessful():
+                sys.exit(1)
+        finally:
+            if TLS_PROXY_FIXTURE:
+                TLS_PROXY_FIXTURE.stop()
+            QDB_FIXTURE.stop()
 
 
 def run(args, show_help=False):

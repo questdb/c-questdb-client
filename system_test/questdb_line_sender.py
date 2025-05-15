@@ -47,6 +47,7 @@ import pathlib
 import ctypes
 import os
 from datetime import datetime
+from functools import total_ordering
 from enum import Enum
 
 from ctypes import (
@@ -96,9 +97,10 @@ class CertificateAuthority(Enum):
 c_protocol_version = ctypes.c_int
 
 
+@total_ordering
 class ProtocolVersion(Enum):
-    V1 = (c_protocol_version(1), 'v1')
-    V2 = (c_protocol_version(2), 'v2')
+    V1 = (c_protocol_version(1), '1')
+    V2 = (c_protocol_version(2), '2')
 
     @classmethod
     def from_int(cls, value: c_protocol_version):
@@ -106,6 +108,16 @@ class ProtocolVersion(Enum):
             if member.value[0].value == value:
                 return member
         raise ValueError(f"invalid protocol version: {value}")
+
+    def __lt__(self, other):
+        if not isinstance(other, ProtocolVersion):
+            return NotImplemented
+        return self.value[0].value < other.value[0].value
+
+    def __eq__(self, other):
+        if not isinstance(other, ProtocolVersion):
+            return NotImplemented
+        return self.value[0].value == other.value[0].value
 
 
 class c_line_sender_opts(ctypes.Structure):
@@ -753,8 +765,8 @@ def _map_value(key, value):
             return (value, 'on' if value else 'unsafe_off')
         else:
             return (value, 'on' if value else 'off')
-    elif isinstance(value, CertificateAuthority):
-        return value.value  # a tuple of `(c_line_sender_ca, str)`
+    elif isinstance(value, (CertificateAuthority, ProtocolVersion)):
+        return value.value  # a tuple of `(c enum value, str)`
     else:
         return (value, f'{value}')
 
@@ -795,9 +807,13 @@ class Sender:
         if self._impl:
             raise SenderError('Already connected')
         if self._build_mode == BuildMode.CONF:
-            self._impl = _error_wrapped_call(
-                _DLL.line_sender_from_conf,
-                _utf8(self._conf))
+            try:
+                self._impl = _error_wrapped_call(
+                    _DLL.line_sender_from_conf,
+                    _utf8(self._conf))
+            except SenderError as e:
+                raise SenderError(
+                    f'Failed to connect to QuestDB with conf `{self._conf}`: {e}') from e
         elif self._build_mode == BuildMode.ENV:
             env_var = 'QDB_CLIENT_CONF'
             os.environ[env_var] = self._conf

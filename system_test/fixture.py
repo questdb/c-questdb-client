@@ -230,7 +230,7 @@ class QueryError(Exception):
 
 
 class QuestDbFixture:
-    def __init__(self, root_dir: pathlib.Path, auth=False, wrap_tls=False, http=False):
+    def __init__(self, root_dir: pathlib.Path, auth=False, wrap_tls=False, http=False, protocol_version=None):
         self._root_dir = root_dir
         self.version = _parse_version(self._root_dir.name)
         self._data_dir = self._root_dir / 'data'
@@ -255,6 +255,7 @@ class QuestDbFixture:
             with open(auth_txt_path, 'w', encoding='utf-8') as auth_file:
                 auth_file.write(AUTH_TXT)
         self.http = http
+        self.protocol_version = protocol_version
 
     def print_log(self):
         with open(self._log_path, 'r', encoding='utf-8') as log_file:
