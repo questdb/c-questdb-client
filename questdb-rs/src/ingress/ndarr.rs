@@ -262,12 +262,16 @@ where
             ));
         }
         let shape = slice::from_raw_parts(shape, dims);
-        let size = shape
-            .iter()
-            .try_fold(std::mem::size_of::<T>(), |acc, &dim| {
-                acc.checked_mul(dim)
-                    .ok_or_else(|| error::fmt!(ArrayViewError, "Array buffer size too big"))
-            })?;
+        let size = 0usize;
+        if !shape.is_empty() {
+            size = shape
+                .iter()
+                .try_fold(std::mem::size_of::<T>(), |acc, &dim| {
+                    acc.checked_mul(dim)
+                        .ok_or_else(|| error::fmt!(ArrayViewError, "Array buffer size too big"))
+                })?;
+        }
+
         if size != data_len {
             return Err(error::fmt!(
                 ArrayViewError,
