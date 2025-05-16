@@ -24,7 +24,7 @@
 
 use crate::ingress::{Buffer, Protocol, ProtocolVersion, SenderBuilder, TimestampNanos};
 use crate::tests::mock::{certs_dir, HttpResponse, MockServer};
-use crate::tests::TestResult;
+use crate::tests::{assert_err_contains, TestResult};
 use crate::ErrorCode;
 use rstest::rstest;
 use std::io;
@@ -446,10 +446,7 @@ fn test_request_timeout(
     let time_start = std::time::Instant::now();
     let res = sender.flush_and_keep(&buffer);
     let time_elapsed = time_start.elapsed();
-    assert!(res.is_err());
-    let err = res.unwrap_err();
-    assert_eq!(err.code(), ErrorCode::SocketError);
-    assert!(err.msg().contains("per call"));
+    assert_err_contains(res, ErrorCode::SocketError, "per call");
     assert!(time_elapsed >= request_timeout);
     Ok(())
 }
@@ -710,7 +707,7 @@ fn test_transactional(
     assert_eq!(
         err.msg(),
         "Buffer contains lines for multiple tables. \
-        Transactional flushes are only supported for buffers containing lines for a single table."
+        Transactional flushes are only supported for buffers containing lines for a single table.",
     );
 
     let res = sender.flush_and_keep_with_flags(&buffer2, true);
@@ -806,11 +803,11 @@ fn test_sender_auto_protocol_version_unsupported_client() -> TestResult {
         server.send_settings_response()?;
         Ok(())
     });
-    let res1 = sender_builder.build();
-    assert!(res1.is_err());
-    let e1 = res1.err().unwrap();
-    assert_eq!(e1.code(), ErrorCode::ProtocolVersionError);
-    assert!(e1.msg().contains("Server does not support current client"));
+    assert_err_contains(
+        sender_builder.build(),
+        ErrorCode::ProtocolVersionError,
+        "Server does not support current client",
+    );
     server_thread.join().unwrap()?;
     Ok(())
 }
@@ -822,11 +819,10 @@ fn test_buffer_protocol_version1_not_support_array() -> TestResult {
         .table("test")?
         .symbol("sym", "bol")?
         .column_arr("x", &[1.0f64, 2.0]);
-    assert!(res.is_err());
-    let e1 = res.as_ref().err().unwrap();
-    assert_eq!(e1.code(), ErrorCode::ProtocolVersionError);
-    assert!(e1
-        .msg()
-        .contains("line protocol version v1 does not support array datatype"));
+    assert_err_contains(
+        res,
+        ErrorCode::ProtocolVersionError,
+        "line protocol version v1 does not support array datatype",
+    );
     Ok(())
 }
