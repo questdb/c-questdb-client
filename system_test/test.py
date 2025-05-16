@@ -1134,20 +1134,21 @@ def run_with_fixtures(args):
     global BUILD_MODE
     last_version = None
 
+    latest_protocol = sorted(list(qls.ProtocolVersion))[-1]
     for questdb_dir, auth, http, protocol_version, build_mode in itertools.product(
             iter_versions(args),
             (False, True),  # auth
             (False, True),  # http
             [None] + list(qls.ProtocolVersion),  # None is for `auto`
             list(qls.BuildMode)):
-        print(
-            f'Running tests [questdb_dir={questdb_dir}, auth={auth}, http={http}, build_mode={build_mode}, protocol_version={protocol_version}]')
-        if http and last_version <= (7, 3, 7):
-            print('Skipping ILP/HTTP tests for versions <= 7.3.7')
+        if (build_mode in (qls.BuildMode.API, qls.BuildMode.ENV)) and (protocol_version != latest_protocol):
             continue
         if http and auth:
-            print('Skipping auth for ILP/HTTP tests')
             continue
+        if auth and (protocol_version != latest_protocol):
+            continue
+        print(
+            f'Running tests [auth={auth}, http={http}, build_mode={build_mode}, protocol_version={protocol_version}]')
         QDB_FIXTURE = QuestDbFixture(
             questdb_dir,
             auth=auth,
