@@ -798,17 +798,20 @@ fn test_sender_auto_protocol_version_only_v2() -> TestResult {
 fn test_sender_auto_protocol_version_unsupported_client() -> TestResult {
     let mut server = MockServer::new()?.configure_settings_response(&[3, 4]);
     let sender_builder = server.lsb_http();
-    let server_thread = std::thread::spawn(move || -> io::Result<()> {
+    let server_thread = std::thread::spawn(move || -> io::Result<MockServer> {
         server.accept()?;
         server.send_settings_response()?;
-        Ok(())
+        Ok(server)
     });
     assert_err_contains(
         sender_builder.build(),
         ErrorCode::ProtocolVersionError,
         "Server does not support current client",
     );
-    server_thread.join().unwrap()?;
+    let server = server_thread.join().unwrap()?;
+
+    // We keep the server around til the end of the test to ensure that the response is fully received.
+    drop(server);
     Ok(())
 }
 

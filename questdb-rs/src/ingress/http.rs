@@ -19,7 +19,6 @@ use ureq::unversioned::transport::{
 
 use crate::ingress::ProtocolVersion;
 use ureq::unversioned::*;
-use ureq::Error::*;
 use ureq::{http, Body};
 
 #[derive(PartialEq, Debug, Clone)]
@@ -256,7 +255,10 @@ fn need_retry(res: Result<http::status::StatusCode, &ureq::Error>) -> bool {
                     599 // Network Connect Timeout Error
                 )
         }
-        Err(err) => matches!(err, Timeout(_) | ConnectionFailed | TooManyRedirects),
+        Err(err) => matches!(
+            err,
+            ureq::Error::Timeout(_) | ureq::Error::ConnectionFailed | ureq::Error::TooManyRedirects
+        ),
     }
 }
 
@@ -429,7 +431,7 @@ pub(super) fn get_supported_protocol_versions(
                 }
                 return Err(fmt!(
                     ProtocolVersionError,
-                    "Failed to detect server's line protocol version, settings url: {}, status code: {}.",
+                    "Could not detect server's line protocol version, settings url: {}, status code: {}.",
                     settings_url,
                     status
                 ));
@@ -446,7 +448,7 @@ pub(super) fn get_supported_protocol_versions(
                     } else {
                         fmt!(
                             ProtocolVersionError,
-                            "Failed to detect server's line protocol version, settings url: {}, err: {}.",
+                            "Could not detect server's line protocol version, settings url: {}, err: {}.",
                             settings_url,
                             err
                         )
@@ -455,7 +457,7 @@ pub(super) fn get_supported_protocol_versions(
                 e => {
                     fmt!(
                         ProtocolVersionError,
-                        "Failed to detect server's line protocol version, settings url: {}, err: {}.",
+                        "Could not detect server's line protocol version, settings url: {}, err: {}.",
                         settings_url,
                         e
                     )
