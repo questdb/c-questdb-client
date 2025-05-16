@@ -306,6 +306,7 @@ impl From<line_sender_ca> for CertificateAuthority {
 pub unsafe extern "C" fn line_sender_error_get_code(
     error: *const line_sender_error,
 ) -> line_sender_error_code {
+    eprintln!("line_sender_error_get_code: {:?}", (*error).0);
     (*error).0.code().into()
 }
 
@@ -903,11 +904,15 @@ pub unsafe extern "C" fn line_sender_buffer_column_f64_arr(
             return false;
         }
     };
-    bubble_err_to_c!(
-        err_out,
-        buffer.column_arr::<ColumnName<'_>, ingress::StrideArrayView<'_, f64>, f64>(name, &view)
-    );
-    true
+    match buffer.column_arr::<ColumnName<'_>, ingress::StrideArrayView<'_, f64>, f64>(name, &view) {
+        Ok(_) => true,
+        Err(err) => {
+            eprintln!("column_arrcolumn_arrcolumn_arrcolumn_arrcolumn_arr{:?}", err);
+            let err_ptr = Box::into_raw(Box::new(line_sender_error(err)));
+            *err_out = err_ptr;
+            false
+        }
+    }
 }
 
 /// Record a nanosecond timestamp value for the given column.
