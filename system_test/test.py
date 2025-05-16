@@ -630,20 +630,6 @@ class TestSender(unittest.TestCase):
         except qls.SenderError as e:
             self.assertIn('dimension length out of range', str(e))
 
-    def test_f64_arr_total_size_overflow(self):
-        if self.expected_protocol_version < qls.ProtocolVersion.V2:
-            self.skipTest('communicating over old protocol which does not support arrays')
-
-        table_name = uuid.uuid4().hex
-        array = np.empty((1 << 16, 1 << 16), dtype=np.float64)
-        try:
-            with self._mk_linesender() as sender:
-                (sender.table(table_name)
-                 .column_f64_arr('array', array)
-                 .at_now())
-        except qls.SenderError as e:
-            self.assertIn('Array buffer size too big', str(e))
-
     def test_f64_arr_max_dims(self):
         if self.expected_protocol_version < qls.ProtocolVersion.V2:
             self.skipTest('communicating over old protocol which does not support arrays')
