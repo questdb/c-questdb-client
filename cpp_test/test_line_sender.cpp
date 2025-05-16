@@ -97,14 +97,14 @@ std::string& push_double_arr_to_buffer(
     std::string& buffer,
     std::array<double, N> data,
     size_t rank,
-    uintptr_t* shapes)
+    uintptr_t* shape)
 {
     buffer.push_back(14);
     buffer.push_back(10);
     buffer.push_back(static_cast<char>(rank));
     for (size_t i = 0; i < rank; ++i)
         buffer.append(
-            reinterpret_cast<const char*>(&shapes[i]), sizeof(uint32_t));
+            reinterpret_cast<const char*>(&shape[i]), sizeof(uint32_t));
     buffer.append(
         reinterpret_cast<const char*>(data.data()),
         data.size() * sizeof(double));
@@ -162,7 +162,7 @@ TEST_CASE("line_sender c api basics")
     line_sender_column_name arr_name = QDB_COLUMN_NAME_LITERAL("a1");
     // 3D array of doubles
     size_t rank = 3;
-    uintptr_t shapes[] = {2, 3, 2};
+    uintptr_t shape[] = {2, 3, 2};
     intptr_t strides[] = {48, 16, 8};
     std::array<double, 12> arr_data = {
         48123.5,
@@ -177,15 +177,16 @@ TEST_CASE("line_sender c api basics")
         2.7,
         48121.5,
         4.3};
-    CHECK(::line_sender_buffer_column_f64_arr(
-        buffer,
-        arr_name,
-        rank,
-        shapes,
-        strides,
-        reinterpret_cast<uint8_t*>(arr_data.data()),
-        sizeof(arr_data),
-        &err));
+    CHECK(
+        ::line_sender_buffer_column_f64_arr(
+            buffer,
+            arr_name,
+            rank,
+            shape,
+            strides,
+            reinterpret_cast<uint8_t*>(arr_data.data()),
+            sizeof(arr_data),
+            &err));
     CHECK(::line_sender_buffer_at_nanos(buffer, 10000000, &err));
     CHECK(server.recv() == 0);
     CHECK(::line_sender_buffer_size(buffer) == 150);
@@ -194,8 +195,7 @@ TEST_CASE("line_sender c api basics")
     CHECK(server.recv() == 1);
     std::string expect{"test,t1=v1 f1=="};
     push_double_to_buffer(expect, 0.5).append(",a1==");
-    push_double_arr_to_buffer(expect, arr_data, 3, shapes)
-        .append(" 10000000\n");
+    push_double_arr_to_buffer(expect, arr_data, 3, shape).append(" 10000000\n");
     CHECK(server.msgs(0) == expect);
 }
 
@@ -246,18 +246,38 @@ TEST_CASE("line_sender c++ api basics")
     CHECK(server.recv() == 0);
 
     questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
+    // 3D array of doubles
+    size_t rank = 3;
+    std::vector<uintptr_t> shape{2, 3, 2};
+    std::vector<intptr_t> strides{48, 16, 8};
+    std::array<double, 12> arr_data = {
+        48123.5,
+        2.4,
+        48124.0,
+        1.8,
+        48124.5,
+        0.9,
+        48122.5,
+        3.1,
+        48122.0,
+        2.7,
+        48121.5,
+        4.3};
     buffer.table("test")
         .symbol("t1", "v1")
         .symbol("t2", "")
         .column("f1", 0.5)
+        .column("a1", rank, shape, strides, arr_data)
         .at(questdb::ingress::timestamp_nanos{10000000});
 
     CHECK(server.recv() == 0);
-    CHECK(buffer.size() == 38);
+    CHECK(buffer.size() == 154);
     sender.flush(buffer);
     CHECK(server.recv() == 1);
     std::string expect{"test,t1=v1,t2= f1=="};
-    push_double_to_buffer(expect, 0.5).append(" 10000000\n");
+    push_double_to_buffer(expect, 0.5).append(",a1==");
+    push_double_arr_to_buffer(expect, arr_data, 3, shape.data())
+        .append(" 10000000\n");
     CHECK(server.msgs(0) == expect);
 }
 
@@ -943,7 +963,7 @@ TEST_CASE("HTTP basics")
         questdb::ingress::line_sender_error);
 }
 
-TEST_CASE("line sender protocol version v1")
+TEST_CASE("line sender protocol version default v1 for tcp")
 {
     questdb::ingress::test::mock_server server;
     questdb::ingress::line_sender sender{
@@ -961,6 +981,7 @@ TEST_CASE("line sender protocol version v1")
         .column("f1", 0.5)
         .at(questdb::ingress::timestamp_nanos{10000000});
 
+    CHECK(sender.default_protocol_version() == protocol_version_1);
     CHECK(server.recv() == 0);
     CHECK(buffer.size() == 31);
     sender.flush(buffer);
@@ -975,7 +996,8 @@ TEST_CASE("line sender protocol version v2")
     questdb::ingress::line_sender sender{
         questdb::ingress::protocol::tcp,
         std::string("localhost"),
-        std::to_string(server.port())};
+        std::to_string(server.port()),
+        protocol_version_2};
     CHECK_FALSE(sender.must_close());
     server.accept();
     CHECK(server.recv() == 0);
@@ -988,9 +1010,33 @@ TEST_CASE("line sender protocol version v2")
         .at(questdb::ingress::timestamp_nanos{10000000});
 
     CHECK(server.recv() == 0);
-    CHECK(buffer.size() == 31);
+    CHECK(buffer.size() == 38);
     sender.flush(buffer);
     CHECK(server.recv() == 1);
-    std::string expect{"test,t1=v1,t2= f1=0.5 10000000\n"};
+    std::string expect{"test,t1=v1,t2= f1=="};
+    push_double_to_buffer(expect, 0.5).append(" 10000000\n");
     CHECK(server.msgs(0) == expect);
+}
+
+TEST_CASE("Http auto detect line protocol version failed")
+{
+    try
+    {
+        questdb::ingress::opts opts{
+            questdb::ingress::protocol::http, "localhost", 1};
+        questdb::ingress::line_sender sender1{opts};
+        CHECK_MESSAGE(false, "Expected exception");
+    }
+    catch (const questdb::ingress::line_sender_error& se)
+    {
+        std::string msg{se.what()};
+        CHECK_MESSAGE(
+            msg.rfind("Failed to detect server's line protocol version", 0) ==
+                0,
+            msg);
+    }
+    catch (...)
+    {
+        CHECK_MESSAGE(false, "Other exception raised.");
+    }
 }

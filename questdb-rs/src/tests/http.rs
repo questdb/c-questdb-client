@@ -771,25 +771,6 @@ fn _test_sender_auto_detect_protocol_version(
     res?;
     Ok(())
 }
-#[test]
-fn test_sender_protocol_version_old_server21() -> TestResult {
-    let mut server = MockServer::new()?.configure_settings_response(&[]);
-    let sender_builder = server.lsb_http();
-    let server_thread = std::thread::spawn(move || -> io::Result<()> {
-        server.accept()?;
-        server.send_http_response_q(
-            HttpResponse::empty()
-                .with_status(404, "Not Found")
-                .with_header("content-type", "text/plain")
-                .with_body_str("Not Found"),
-        )?;
-        Ok(())
-    });
-    let sender = sender_builder.build()?;
-    assert_eq!(sender.default_protocol_version(), ProtocolVersion::V1);
-    server_thread.join().unwrap()?;
-    Ok(())
-}
 
 #[test]
 fn test_sender_auto_protocol_version_basic() -> TestResult {

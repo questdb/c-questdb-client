@@ -867,7 +867,7 @@ pub unsafe extern "C" fn line_sender_buffer_column_str(
 /// @param[in] buffer Line buffer object.
 /// @param[in] name Column name.
 /// @param[in] rank Array dims.
-/// @param[in] shape Array shapes.
+/// @param[in] shape Array shape.
 /// @param[in] strides Array strides.
 /// @param[in] data_buffer Array **first element** data memory ptr.
 /// @param[in] data_buffer_len Array data memory length.

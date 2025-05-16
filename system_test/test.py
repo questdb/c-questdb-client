@@ -110,19 +110,19 @@ class TestSender(unittest.TestCase):
             QDB_FIXTURE.host,
             QDB_FIXTURE.http_server_port if QDB_FIXTURE.http else QDB_FIXTURE.line_tcp_port,
             **kwargs)
-    
+
     @property
     def expected_protocol_version(self) -> qls.ProtocolVersion:
         """The protocol version that we expect to be handling."""
         if QDB_FIXTURE.protocol_version is None:
             if not QDB_FIXTURE.http:
                 return qls.ProtocolVersion.V1
-            
+
             if QDB_FIXTURE.version >= FIRST_ARRAYS_RELEASE:
                 return qls.ProtocolVersion.V2
-            
+
             return qls.ProtocolVersion.V1
-            
+
         return QDB_FIXTURE.protocol_version
 
     def _expect_eventual_disconnect(self, sender):
@@ -616,6 +616,49 @@ class TestSender(unittest.TestCase):
         except qls.SenderError as e:
             self.assertIn('cast error from protocol type: DOUBLE[] to column type: DOUBLE[][]', str(e))
 
+    def test_f64_arr_dims_length_overflow(self):
+        if self.expected_protocol_version < qls.ProtocolVersion.V2:
+            self.skipTest('communicating over old protocol which does not support arrays')
+
+        table_name = uuid.uuid4().hex
+        array = np.empty((1 << 29, 0), dtype=np.float64)
+        try:
+            with self._mk_linesender() as sender:
+                (sender.table(table_name)
+                 .column_f64_arr('array', array)
+                 .at_now())
+        except qls.SenderError as e:
+            self.assertIn('dimension length out of range', str(e))
+
+    def test_f64_arr_total_size_overflow(self):
+        if self.expected_protocol_version < qls.ProtocolVersion.V2:
+            self.skipTest('communicating over old protocol which does not support arrays')
+
+        table_name = uuid.uuid4().hex
+        array = np.empty((1 << 16, 1 << 16), dtype=np.float64)
+        try:
+            with self._mk_linesender() as sender:
+                (sender.table(table_name)
+                 .column_f64_arr('array', array)
+                 .at_now())
+        except qls.SenderError as e:
+            self.assertIn('Array buffer size too big', str(e))
+
+    def test_f64_arr_max_dims(self):
+        if self.expected_protocol_version < qls.ProtocolVersion.V2:
+            self.skipTest('communicating over old protocol which does not support arrays')
+
+        table_name = uuid.uuid4().hex
+        dims = (1,) * 33
+        array = np.empty(dims, dtype=np.float64)
+        try:
+            with self._mk_linesender() as sender:
+                (sender.table(table_name)
+                 .column_f64_arr('array', array)
+                 .at_now())
+        except qls.SenderError as e:
+            self.assertIn('Array dimension mismatch: expected at most 32 dimensions, but got 33', str(e))
+
     def test_protocol_version_v1(self):
         if self.expected_protocol_version >= qls.ProtocolVersion.V2:
             self.skipTest('we are only validating the older protocol here')
@@ -625,7 +668,7 @@ class TestSender(unittest.TestCase):
             0.0,
             -0.0,
             1.0,
-            -1.0]  # Converted to `None`.
+            -1.0]
 
         table_name = uuid.uuid4().hex
         pending = None
@@ -970,10 +1013,7 @@ class TestSender(unittest.TestCase):
             self.skipTest('TCP-only test')
         if QDB_FIXTURE.version <= (7, 3, 7):
             self.skipTest('No ILP/HTTP support')
-        version = qls.ProtocolVersion.V2
-        if QDB_FIXTURE.version <= (8, 3, 1):
-            version = qls.ProtocolVersion.V1
-        buf = qls.Buffer(version)
+        buf = qls.Buffer(self.expected_protocol_version)
         buf.table('t1').column('c1', 'v1').at(time.time_ns())
         with self.assertRaisesRegex(qls.SenderError, r'.*Transactional .* not supported.*'):
             with self._mk_linesender() as sender:

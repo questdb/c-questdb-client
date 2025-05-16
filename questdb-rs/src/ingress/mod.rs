@@ -1159,19 +1159,9 @@ impl Buffer {
         self.output.reserve(dim_header_size + array_buf_size);
 
         for i in 0..ndim {
-            let dim = view.dim(i)?;
-            if dim > MAX_ARRAY_DIM_LEN {
-                return Err(error::fmt!(
-                    ArrayViewError,
-                    "dimension length out of range: dim {}, dim length {}, max length {}",
-                    i,
-                    dim,
-                    MAX_ARRAY_DIM_LEN
-                ));
-            }
-            // ndarr shapes
+            // ndarr shape
             self.output
-                .extend_from_slice((dim as u32).to_le_bytes().as_slice());
+                .extend_from_slice((view.dim(i)? as u32).to_le_bytes().as_slice());
         }
 
         let index = self.output.len();
@@ -3034,7 +3024,7 @@ mod timestamp;
 #[cfg(feature = "ilp-over-http")]
 mod http;
 
-use crate::ingress::ndarr::{check_and_get_array_bytes_size, MAX_ARRAY_DIM_LEN};
+use crate::ingress::ndarr::check_and_get_array_bytes_size;
 #[cfg(feature = "ilp-over-http")]
 use http::*;
 

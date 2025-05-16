@@ -650,7 +650,7 @@ public:
     line_sender_buffer& column(
         column_name_view name,
         const size_t rank,
-        const std::vector<uintptr_t>& shapes,
+        const std::vector<uintptr_t>& shape,
         const std::vector<intptr_t>& strides,
         const std::array<T, N>& data)
     {
@@ -663,7 +663,7 @@ public:
             _impl,
             name._impl,
             rank,
-            shapes.data(),
+            shape.data(),
             strides.data(),
             reinterpret_cast<const uint8_t*>(data.data()),
             sizeof(double) * N);

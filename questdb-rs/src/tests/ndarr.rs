@@ -59,15 +59,15 @@ fn to_bytes<T: Copy>(data: &[T]) -> Vec<u8> {
 fn test_stride_array_view() -> TestResult {
     // contiguous layout
     let test_data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
-    let shapes = [2usize, 3];
+    let shape = [2usize, 3];
     let strides = [
-        (shapes[1] * size_of::<f64>()) as isize,
+        (shape[1] * size_of::<f64>()) as isize,
         size_of::<f64>() as isize,
     ];
     let array = unsafe {
         StrideArrayView::<f64>::new(
-            shapes.len(),
-            shapes.as_ptr(),
+            shape.len(),
+            shape.as_ptr(),
             strides.as_ptr(),
             test_data.as_ptr() as *const u8,
             test_data.len() * size_of::<f64>(),
@@ -90,13 +90,13 @@ fn test_stride_array_view() -> TestResult {
 fn test_strided_non_contiguous() -> TestResult {
     let elem_size = size_of::<f64>() as isize;
     let col_major_data = [1.0, 3.0, 5.0, 2.0, 4.0, 6.0];
-    let shapes = [3usize, 2];
-    let strides = [elem_size, shapes[0] as isize * elem_size];
+    let shape = [3usize, 2];
+    let strides = [elem_size, shape[0] as isize * elem_size];
 
     let array_view: StrideArrayView<'_, f64> = unsafe {
         StrideArrayView::new(
-            shapes.len(),
-            shapes.as_ptr(),
+            shape.len(),
+            shape.as_ptr(),
             strides.as_ptr(),
             col_major_data.as_ptr() as *const u8,
             col_major_data.len() * elem_size as usize,
@@ -238,7 +238,7 @@ fn test_stride_array_size_overflow() -> TestResult {
     };
     let err = result.unwrap_err();
     assert_eq!(err.code(), ErrorCode::ArrayViewError);
-    assert!(err.msg().contains("Array total elem size overflow"));
+    assert!(err.msg().contains("Array buffer size too big"));
     Ok(())
 }
 

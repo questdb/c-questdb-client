@@ -709,7 +709,7 @@ class Buffer:
 
     def column_f64_arr(self, name: str,
                        rank: int,
-                       shapes: tuple[int, ...],
+                       shape: tuple[int, ...],
                        strides: tuple[int, ...],
                        data: c_void_p,
                        length: int):
@@ -722,14 +722,14 @@ class Buffer:
                     f"{name} value exceeds {c_type.__name__} range"
                 ) from e
 
-        c_shapes = _convert_tuple(shapes, c_size_t, "shapes")
+        c_shape = _convert_tuple(shape, c_size_t, "shape")
         c_strides = _convert_tuple(strides, c_ssize_t, "strides")
         _error_wrapped_call(
             _DLL.line_sender_buffer_column_f64_arr,
             self._impl,
             _column_name(name),
             c_size_t(rank),
-            c_shapes,
+            c_shape,
             c_strides,
             ctypes.cast(data, c_uint8_p),
             c_size_t(length)

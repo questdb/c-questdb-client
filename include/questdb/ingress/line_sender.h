@@ -499,7 +499,7 @@ bool line_sender_buffer_column_str(
  * @param[in] buffer Line buffer object.
  * @param[in] name Column name.
  * @param[in] rank Number of dimensions of the array.
- * @param[in] shapes Array of dimension sizes (length = `rank`).
+ * @param[in] shape Array of dimension sizes (length = `rank`).
  *                   Each element must be a positive integer.
  * @param[in] strides Array strides.
  * @param[in] data_buffer First array element data.

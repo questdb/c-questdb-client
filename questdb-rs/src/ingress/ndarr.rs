@@ -100,15 +100,27 @@ where
 {
     let mut size = std::mem::size_of::<T>();
     for dim_index in 0..array.ndim() {
-        size *= array.dim(dim_index)?;
-        if size > MAX_ARRAY_BUFFER_SIZE {
+        let dim = array.dim(dim_index)?;
+        if dim > MAX_ARRAY_DIM_LEN {
             return Err(error::fmt!(
                 ArrayViewError,
-                "Array buffer size too big: {}, maximum: {}",
-                size,
-                MAX_ARRAY_BUFFER_SIZE
+                "dimension length out of range: dim {}, dim length {}, max length {}",
+                dim_index,
+                dim,
+                MAX_ARRAY_DIM_LEN
             ));
         }
+        // following dimension's length may be zero, so check the size in out of loop
+        size *= dim;
+    }
+
+    if size > MAX_ARRAY_BUFFER_SIZE {
+        return Err(error::fmt!(
+            ArrayViewError,
+            "Array buffer size too big: {}, maximum: {}",
+            size,
+            MAX_ARRAY_BUFFER_SIZE
+        ));
     }
     Ok(size)
 }
@@ -226,7 +238,7 @@ where
     ///
     /// # Safety
     /// Caller must ensure all the following conditions:
-    /// - `shapes` points to a valid array of at least `dims` elements
+    /// - `shape` points to a valid array of at least `dims` elements
     /// - `strides` points to a valid array of at least `dims` elements
     /// - `data` points to a valid memory block of at least `data_len` bytes
     /// - Memory layout must satisfy:
@@ -241,12 +253,20 @@ where
         data: *const u8,
         data_len: usize,
     ) -> Result<Self, Error> {
-        let shapes = slice::from_raw_parts(shape, dims);
-        let size = shapes
+        if data_len > MAX_ARRAY_BUFFER_SIZE {
+            return Err(error::fmt!(
+                ArrayViewError,
+                "Array buffer size too big: {}, maximum: {}",
+                data_len,
+                MAX_ARRAY_BUFFER_SIZE
+            ));
+        }
+        let shape = slice::from_raw_parts(shape, dims);
+        let size = shape
             .iter()
             .try_fold(std::mem::size_of::<T>(), |acc, &dim| {
                 acc.checked_mul(dim)
-                    .ok_or_else(|| error::fmt!(ArrayViewError, "Array total elem size overflow"))
+                    .ok_or_else(|| error::fmt!(ArrayViewError, "Array buffer size too big"))
             })?;
         if size != data_len {
             return Err(error::fmt!(
@@ -263,7 +283,7 @@ where
         }
         Ok(Self {
             dims,
-            shape: shapes,
+            shape,
             strides,
             data: slice,
             _marker: std::marker::PhantomData::<T>,
