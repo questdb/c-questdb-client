@@ -938,6 +938,8 @@ class TestSender(unittest.TestCase):
     def test_tls_insecure_skip_verify(self):
         if BUILD_MODE != qls.BuildMode.API:
             self.skipTest('BuildMode.API-only test')
+        if QDB_FIXTURE.protocol_version != sorted(list(qls.ProtocolVersion))[-1]:
+            self.skipTest('Skipping tls test for non-latest protocol version')
         protocol = qls.Protocol.HTTPS if QDB_FIXTURE.http else qls.Protocol.TCPS
         auth = AUTH if QDB_FIXTURE.auth else {}
         sender = qls.Sender(
@@ -952,6 +954,8 @@ class TestSender(unittest.TestCase):
     def test_tls_roots(self):
         if BUILD_MODE != qls.BuildMode.API:
             self.skipTest('BuildMode.API-only test')
+        if QDB_FIXTURE.protocol_version != sorted(list(qls.ProtocolVersion))[-1]:
+            self.skipTest('Skipping tls test for non-latest protocol version')
         protocol = qls.Protocol.HTTPS if QDB_FIXTURE.http else qls.Protocol.TCPS
         auth = auth = AUTH if QDB_FIXTURE.auth else {}
         sender = qls.Sender(
@@ -966,6 +970,8 @@ class TestSender(unittest.TestCase):
     def _test_tls_ca(self, tls_ca):
         if BUILD_MODE != qls.BuildMode.API:
             self.skipTest('BuildMode.API-only test')
+        if QDB_FIXTURE.protocol_version != sorted(list(qls.ProtocolVersion))[-1]:
+            self.skipTest('Skipping tls test for non-latest protocol version')
         protocol = qls.Protocol.HTTPS if QDB_FIXTURE.http else qls.Protocol.TCPS
         prev_ssl_cert_file = os.environ.get('SSL_CERT_FILE')
         try:
