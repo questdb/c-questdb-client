@@ -262,7 +262,7 @@ where
             ));
         }
         let shape = slice::from_raw_parts(shape, dims);
-        let size = 0usize;
+        let mut size = 0usize;
         if !shape.is_empty() {
             size = shape
                 .iter()
