@@ -888,6 +888,7 @@ pub unsafe extern "C" fn line_sender_buffer_column_f64_arr(
     data_buffer_len: size_t,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
+    eprintln!("enter line_sender_buffer_column_f64_arr");
     let buffer = unwrap_buffer_mut(buffer);
     let name = name.as_name();
     let view = match ingress::StrideArrayView::<f64>::new(
@@ -899,13 +900,17 @@ pub unsafe extern "C" fn line_sender_buffer_column_f64_arr(
     ) {
         Ok(value) => value,
         Err(err) => {
+            eprintln!("err_ptrerr_ptrerr_ptrerr_ptrerr_ptrerr_ptr{:?}", err);
             let err_ptr = Box::into_raw(Box::new(line_sender_error(err)));
             *err_out = err_ptr;
             return false;
         }
     };
     match buffer.column_arr::<ColumnName<'_>, ingress::StrideArrayView<'_, f64>, f64>(name, &view) {
-        Ok(_) => true,
+        Ok(_) => {
+            eprintln!("column_arrcolumn_arrcolumn_arrcolumn_arrcolumn_arrxxxxxxxxxxx");
+            true
+        },
         Err(err) => {
             eprintln!("column_arrcolumn_arrcolumn_arrcolumn_arrcolumn_arr{:?}", err);
             let err_ptr = Box::into_raw(Box::new(line_sender_error(err)));
