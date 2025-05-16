@@ -253,6 +253,12 @@ where
         data: *const u8,
         data_len: usize,
     ) -> Result<Self, Error> {
+        if dims == 0 {
+            return Err(error::fmt!(
+                ArrayViewError,
+                "Zero-dimensional arrays are not supported",
+            ));
+        }
         if data_len > MAX_ARRAY_BUFFER_SIZE {
             return Err(error::fmt!(
                 ArrayViewError,
@@ -262,12 +268,11 @@ where
             ));
         }
         let shape = slice::from_raw_parts(shape, dims);
-        let size = shape
-            .iter()
-            .try_fold(std::mem::size_of::<T>(), |acc, &dim| {
-                acc.checked_mul(dim)
-                    .ok_or_else(|| error::fmt!(ArrayViewError, "Array buffer size too big"))
-            })?;
+        let mut size = std::mem::size_of::<T>();
+        for &dim in shape {
+            size *= dim
+        }
+
         if size != data_len {
             return Err(error::fmt!(
                 ArrayViewError,
