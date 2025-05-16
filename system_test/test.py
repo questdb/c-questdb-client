@@ -824,6 +824,8 @@ class TestSender(unittest.TestCase):
         """
         if QDB_FIXTURE.http:
             self.skipTest('TCP-only test')
+        if BUILD_MODE != qls.BuildMode.API:
+            self.skipTest('BuildMode.API-only test')
         auth = {} if QDB_FIXTURE.auth else AUTH
         sender = qls.Sender(
             BUILD_MODE,
@@ -856,6 +858,9 @@ class TestSender(unittest.TestCase):
         if not QDB_FIXTURE.auth:
             self.skipTest('No auth')
 
+        if BUILD_MODE != qls.BuildMode.API:
+            self.skipTest('BuildMode.API-only test')
+
         sender = qls.Sender(
             BUILD_MODE,
             qls.Protocol.TCP,
@@ -872,6 +877,9 @@ class TestSender(unittest.TestCase):
 
         if not QDB_FIXTURE.auth:
             self.skipTest('No auth')
+
+        if BUILD_MODE != qls.BuildMode.API:
+            self.skipTest('BuildMode.API-only test')
 
         sender = qls.Sender(
             BUILD_MODE,
@@ -892,6 +900,9 @@ class TestSender(unittest.TestCase):
         if not QDB_FIXTURE.auth:
             self.skipTest('No auth')
 
+        if BUILD_MODE != qls.BuildMode.API:
+            self.skipTest('BuildMode.API-only test')
+
         sender = qls.Sender(
             BUILD_MODE,
             qls.Protocol.TCP,
@@ -911,6 +922,9 @@ class TestSender(unittest.TestCase):
         if not QDB_FIXTURE.auth:
             self.skipTest('No auth')
 
+        if BUILD_MODE != qls.BuildMode.API:
+            self.skipTest('BuildMode.API-only test')
+
         sender = qls.Sender(
             BUILD_MODE,
             qls.Protocol.TCP,
@@ -922,6 +936,8 @@ class TestSender(unittest.TestCase):
             self._expect_eventual_disconnect(sender)
 
     def test_tls_insecure_skip_verify(self):
+        if BUILD_MODE != qls.BuildMode.API:
+            self.skipTest('BuildMode.API-only test')
         protocol = qls.Protocol.HTTPS if QDB_FIXTURE.http else qls.Protocol.TCPS
         auth = AUTH if QDB_FIXTURE.auth else {}
         sender = qls.Sender(
@@ -934,6 +950,8 @@ class TestSender(unittest.TestCase):
         self._test_single_symbol_impl(sender)
 
     def test_tls_roots(self):
+        if BUILD_MODE != qls.BuildMode.API:
+            self.skipTest('BuildMode.API-only test')
         protocol = qls.Protocol.HTTPS if QDB_FIXTURE.http else qls.Protocol.TCPS
         auth = auth = AUTH if QDB_FIXTURE.auth else {}
         sender = qls.Sender(
@@ -946,6 +964,8 @@ class TestSender(unittest.TestCase):
         self._test_single_symbol_impl(sender)
 
     def _test_tls_ca(self, tls_ca):
+        if BUILD_MODE != qls.BuildMode.API:
+            self.skipTest('BuildMode.API-only test')
         protocol = qls.Protocol.HTTPS if QDB_FIXTURE.http else qls.Protocol.TCPS
         prev_ssl_cert_file = os.environ.get('SSL_CERT_FILE')
         try:
@@ -1036,6 +1056,10 @@ def parse_args():
         '--unittest-help',
         action='store_true',
         help='Show unittest --help')
+    run_p.add_argument(
+        '--profile',
+        action='store_true',
+        help='Run with cProfile')
     version_g = run_p.add_mutually_exclusive_group()
     version_g.add_argument(
         '--last-n',
@@ -1194,6 +1218,12 @@ def main():
     if args.command == 'list':
         list_releases(args)
     else:
+        profile = args.profile
+        if profile:
+            sys.argv.remove("--profile")
+            import cProfile
+            cProfile.run('main()', filename='profile.out')
+            return
         # Repackage args for unittest's own arg parser.
         sys.argv[:] = sys.argv[:1] + extra_args
         show_help = getattr(args, 'unittest_help', False)
