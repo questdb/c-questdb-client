@@ -295,7 +295,7 @@ class TestSender(unittest.TestCase):
             # If HTTP, the error should cause the whole batch to be ignored.
             # We assert that the table is empty.
             with self.assertRaises(TimeoutError):
-                retry_check_table(table_name, timeout_sec=1, log=False)
+                retry_check_table(table_name, timeout_sec=0.25, log=False)
         else:
             # We only ever get the first row back.
             resp = retry_check_table(table_name, log_ctx=pending)
@@ -310,7 +310,7 @@ class TestSender(unittest.TestCase):
 
             # The second one is dropped and will not appear in results.
             with self.assertRaises(TimeoutError):
-                retry_check_table(table_name, min_rows=2, timeout_sec=1, log=False)
+                retry_check_table(table_name, min_rows=2, timeout_sec=0.25, log=False)
 
     def test_at(self):
         if QDB_FIXTURE.version <= (6, 0, 7, 1):
@@ -1014,7 +1014,7 @@ class TestSender(unittest.TestCase):
                 self.assertIn('error in line 3', str(e))
 
         with self.assertRaises(TimeoutError):
-            retry_check_table(table_name, timeout_sec=1, log=False)
+            retry_check_table(table_name, timeout_sec=0.25, log=False)
 
     def test_tcp_transactions(self):
         if QDB_FIXTURE.http:
@@ -1156,47 +1156,46 @@ def run_with_fixtures(args):
     global QDB_FIXTURE
     global TLS_PROXY_FIXTURE
     global BUILD_MODE
-    last_version = None
 
     latest_protocol = sorted(list(qls.ProtocolVersion))[-1]
-    for questdb_dir, auth, http, protocol_version, build_mode in itertools.product(
-            iter_versions(args),
-            (False, True),  # auth
-            (False, True),  # http
-            [None] + list(qls.ProtocolVersion),  # None is for `auto`
-            list(qls.BuildMode)):
-        if (build_mode in (qls.BuildMode.API, qls.BuildMode.ENV)) and (protocol_version != latest_protocol):
-            continue
-        if http and auth:
-            continue
-        if auth and (protocol_version != latest_protocol):
-            continue
-        print(
-            f'Running tests [auth={auth}, http={http}, build_mode={build_mode}, protocol_version={protocol_version}]')
+    for questdb_dir, auth in itertools.product(iter_versions(args), (False, True)):
         QDB_FIXTURE = QuestDbFixture(
             questdb_dir,
-            auth=auth,
-            http=http,
-            protocol_version=protocol_version)
+            auth=auth)
         TLS_PROXY_FIXTURE = None
-        BUILD_MODE = build_mode
         try:
+            print(f'>>>> STARTING {questdb_dir} [auth={auth}] <<<<')
             QDB_FIXTURE.start()
-            # Read the version _after_ a first start so it can rely
-            # on the live one from the `select build` query.
-            last_version = QDB_FIXTURE.version
-            port_to_proxy = QDB_FIXTURE.http_server_port \
-                if http else QDB_FIXTURE.line_tcp_port
-            TLS_PROXY_FIXTURE = TlsProxyFixture(port_to_proxy)
-            TLS_PROXY_FIXTURE.start()
-
-            QDB_FIXTURE.drop_all_tables()
-            test_prog = unittest.TestProgram(exit=False)
-            if not test_prog.result.wasSuccessful():
-                sys.exit(1)
+            for http, protocol_version, build_mode in itertools.product(
+                    (False, True),  # http
+                    [None] + list(qls.ProtocolVersion),  # None is for `auto`
+                    list(qls.BuildMode)):
+                if (build_mode in (qls.BuildMode.API, qls.BuildMode.ENV)) and (protocol_version != latest_protocol):
+                    continue
+                if http and auth:
+                    continue
+                if auth and (protocol_version != latest_protocol):
+                    continue
+                print(
+                    f'Running tests [auth={auth}, http={http}, build_mode={build_mode}, protocol_version={protocol_version}]')
+                # Read the version _after_ a first start so it can rely
+                # on the live one from the `select build` query.
+                BUILD_MODE = build_mode
+                QDB_FIXTURE.http = http
+                QDB_FIXTURE.protocol_version = protocol_version
+                port_to_proxy = QDB_FIXTURE.http_server_port \
+                    if http else QDB_FIXTURE.line_tcp_port
+                TLS_PROXY_FIXTURE = TlsProxyFixture(port_to_proxy)
+                TLS_PROXY_FIXTURE.start()
+                try:
+                    QDB_FIXTURE.drop_all_tables()
+                    test_prog = unittest.TestProgram(exit=False)
+                    if not test_prog.result.wasSuccessful():
+                        sys.exit(1)
+                finally:
+                    if TLS_PROXY_FIXTURE:
+                        TLS_PROXY_FIXTURE.stop()    
         finally:
-            if TLS_PROXY_FIXTURE:
-                TLS_PROXY_FIXTURE.stop()
             QDB_FIXTURE.stop()
 
 
