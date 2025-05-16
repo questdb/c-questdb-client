@@ -127,7 +127,7 @@ TEST_CASE("line_sender c api basics")
             ::line_sender_error_free(err);
     }};
     ::line_sender_utf8 host = {0, nullptr};
-    CHECK(::line_sender_utf8_init(&host, 9, "localhost", &err));
+    CHECK(::line_sender_utf8_init(&host, 9, "127.0.0.1", &err));
     ::line_sender_opts* opts =
         ::line_sender_opts_new(::line_sender_protocol_tcp, host, server.port());
     CHECK_NE(opts, nullptr);
@@ -227,7 +227,7 @@ TEST_CASE("line_sender c++ connect disconnect")
 {
     questdb::ingress::test::mock_server server;
     questdb::ingress::line_sender sender{
-        questdb::ingress::protocol::tcp, "localhost", server.port()};
+        questdb::ingress::protocol::tcp, "127.0.0.1", server.port()};
     CHECK_FALSE(sender.must_close());
     server.accept();
     CHECK(server.recv() == 0);
@@ -238,7 +238,7 @@ TEST_CASE("line_sender c++ api basics")
     questdb::ingress::test::mock_server server;
     questdb::ingress::line_sender sender{
         questdb::ingress::protocol::tcp,
-        std::string("localhost"),
+        std::string("127.0.0.1"),
         std::to_string(server.port()),
         protocol_version_2};
     CHECK_FALSE(sender.must_close());
@@ -285,7 +285,7 @@ TEST_CASE("test multiple lines")
 {
     questdb::ingress::test::mock_server server;
     std::string conf_str =
-        "tcp::addr=localhost:" + std::to_string(server.port()) +
+        "tcp::addr=127.0.0.1:" + std::to_string(server.port()) +
         ";protocol_version=2;";
     questdb::ingress::line_sender sender =
         questdb::ingress::line_sender::from_conf(conf_str);
@@ -328,7 +328,7 @@ TEST_CASE("State machine testing -- flush without data.")
     questdb::ingress::test::mock_server server;
     questdb::ingress::line_sender sender{
         questdb::ingress::protocol::tcp,
-        std::string_view{"localhost"},
+        std::string_view{"127.0.0.1"},
         std::to_string(server.port())};
 
     questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
@@ -346,7 +346,7 @@ TEST_CASE("One symbol only - flush before server accept")
     questdb::ingress::test::mock_server server;
     questdb::ingress::line_sender sender{
         questdb::ingress::protocol::tcp,
-        std::string{"localhost"},
+        std::string{"127.0.0.1"},
         server.port()};
 
     // Does not raise - this is unlike InfluxDB spec that disallows this.
@@ -368,7 +368,7 @@ TEST_CASE("One column only - server.accept() after flush, before close")
 {
     questdb::ingress::test::mock_server server;
     questdb::ingress::line_sender sender{
-        questdb::ingress::protocol::tcp, "localhost", server.port()};
+        questdb::ingress::protocol::tcp, "127.0.0.1", server.port()};
 
     // Does not raise - this is unlike the InfluxDB spec that disallows this.
     questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
@@ -388,7 +388,7 @@ TEST_CASE("Symbol after column")
 {
     questdb::ingress::test::mock_server server;
     questdb::ingress::line_sender sender{
-        questdb::ingress::protocol::tcp, "localhost", server.port()};
+        questdb::ingress::protocol::tcp, "127.0.0.1", server.port()};
 
     questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
     buffer.table("test").column("t1", "v1");
@@ -552,7 +552,7 @@ TEST_CASE("Sender move testing.")
     questdb::ingress::test::mock_server server1;
     questdb::ingress::test::mock_server server2;
 
-    questdb::ingress::utf8_view host{"localhost"};
+    questdb::ingress::utf8_view host{"127.0.0.1"};
     const questdb::ingress::utf8_view& host_ref = host;
 
     questdb::ingress::line_sender sender1{
@@ -581,7 +581,7 @@ TEST_CASE("Sender move testing.")
     CHECK(sender2.must_close());
 
     questdb::ingress::line_sender sender3{
-        questdb::ingress::protocol::tcp, "localhost", server2.port()};
+        questdb::ingress::protocol::tcp, "127.0.0.1", server2.port()};
     CHECK_FALSE(sender3.must_close());
 
     sender3 = std::move(sender2);
@@ -614,7 +614,7 @@ TEST_CASE("Bad interface")
     try
     {
         questdb::ingress::opts opts{
-            questdb::ingress::protocol::tcp, "localhost", "9009"};
+            questdb::ingress::protocol::tcp, "127.0.0.1", "9009"};
         opts.bind_interface("dummy_hostname");
         questdb::ingress::line_sender sender{opts};
         CHECK_MESSAGE(false, "Expected exception");
@@ -637,13 +637,13 @@ TEST_CASE("Bad port")
         try
         {
             questdb::ingress::line_sender sender{
-                questdb::ingress::protocol::tcp, "localhost", bad_port};
+                questdb::ingress::protocol::tcp, "127.0.0.1", bad_port};
             CHECK_MESSAGE(false, "Expected exception");
         }
         catch (const questdb::ingress::line_sender_error& se)
         {
             std::string msg{se.what()};
-            std::string exp_msg{"\"localhost:" + bad_port + "\": "};
+            std::string exp_msg{"\"127.0.0.1:" + bad_port + "\": "};
             CHECK_MESSAGE(msg.find(exp_msg) != std::string::npos, msg);
         }
         catch (...)
@@ -666,7 +666,7 @@ TEST_CASE("Bad connect")
         // Port 1 is generally the tcpmux service which one would
         // very much expect to never be running.
         questdb::ingress::line_sender sender{
-            questdb::ingress::protocol::tcp, "localhost", 1};
+            questdb::ingress::protocol::tcp, "127.0.0.1", 1};
         CHECK_MESSAGE(false, "Expected exception");
     }
     catch (const questdb::ingress::line_sender_error& se)
@@ -734,7 +734,7 @@ TEST_CASE("Opts copy ctor, assignment and move testing.")
 {
     {
         questdb::ingress::opts opts1{
-            questdb::ingress::protocol::tcp, "localhost", "9009"};
+            questdb::ingress::protocol::tcp, "127.0.0.1", "9009"};
         questdb::ingress::opts opts2{std::move(opts1)};
     }
 
@@ -746,7 +746,7 @@ TEST_CASE("Opts copy ctor, assignment and move testing.")
 
     {
         questdb::ingress::opts opts1{
-            questdb::ingress::protocol::tcp, "localhost", "9009"};
+            questdb::ingress::protocol::tcp, "127.0.0.1", "9009"};
         questdb::ingress::opts opts2{
             questdb::ingress::protocol::tcp, "altavista.digital.com", "9009"};
         opts1 = std::move(opts2);
@@ -765,7 +765,7 @@ TEST_CASE("Test timestamp column.")
 {
     questdb::ingress::test::mock_server server;
     questdb::ingress::line_sender sender{
-        questdb::ingress::protocol::tcp, "localhost", server.port()};
+        questdb::ingress::protocol::tcp, "127.0.0.1", server.port()};
 
     const auto now = std::chrono::system_clock::now();
     const auto now_micros =
@@ -900,7 +900,7 @@ TEST_CASE("Empty Buffer")
 
     questdb::ingress::test::mock_server server;
     questdb::ingress::line_sender sender{
-        questdb::ingress::protocol::tcp, "localhost", server.port()};
+        questdb::ingress::protocol::tcp, "127.0.0.1", server.port()};
     CHECK_THROWS_WITH_AS(
         sender.flush(b1),
         "State error: Bad call to `flush`, should have called `table` instead.",
@@ -914,11 +914,11 @@ TEST_CASE("Empty Buffer")
 TEST_CASE("Opts from conf")
 {
     questdb::ingress::opts opts1 =
-        questdb::ingress::opts::from_conf("tcp::addr=localhost:9009;");
+        questdb::ingress::opts::from_conf("tcp::addr=127.0.0.1:9009;");
     questdb::ingress::opts opts2 =
         questdb::ingress::opts::from_conf("tcps::addr=localhost:9009;");
     questdb::ingress::opts opts3 =
-        questdb::ingress::opts::from_conf("https::addr=localhost:9009;");
+        questdb::ingress::opts::from_conf("https::addr=127.0.0.1:9009;");
     questdb::ingress::opts opts4 =
         questdb::ingress::opts::from_conf("https::addr=localhost:9009;");
 }
@@ -926,9 +926,9 @@ TEST_CASE("Opts from conf")
 TEST_CASE("HTTP basics")
 {
     questdb::ingress::opts opts1{
-        questdb::ingress::protocol::http, "localhost", 1, protocol_version_2};
+        questdb::ingress::protocol::http, "127.0.0.1", 1, protocol_version_2};
     questdb::ingress::opts opts1conf = questdb::ingress::opts::from_conf(
-        "http::addr=localhost:1;username=user;password=pass;request_timeout="
+        "http::addr=127.0.0.1:1;username=user;password=pass;request_timeout="
         "5000;retry_timeout=5;protocol_version=2;");
     questdb::ingress::opts opts2{
         questdb::ingress::protocol::https,
@@ -936,7 +936,7 @@ TEST_CASE("HTTP basics")
         "1",
         protocol_version_2};
     questdb::ingress::opts opts2conf = questdb::ingress::opts::from_conf(
-        "http::addr=localhost:1;token=token;request_min_throughput=1000;retry_"
+        "http::addr=127.0.0.1:1;token=token;request_min_throughput=1000;retry_"
         "timeout=0;protocol_version=2;");
     opts1.username("user")
         .password("pass")
@@ -959,7 +959,7 @@ TEST_CASE("HTTP basics")
 
     CHECK_THROWS_AS(
         questdb::ingress::opts::from_conf(
-            "http::addr=localhost:1;bind_interface=0.0.0.0;"),
+            "http::addr=127.0.0.1:1;bind_interface=0.0.0.0;"),
         questdb::ingress::line_sender_error);
 }
 
@@ -968,7 +968,7 @@ TEST_CASE("line sender protocol version default v1 for tcp")
     questdb::ingress::test::mock_server server;
     questdb::ingress::line_sender sender{
         questdb::ingress::protocol::tcp,
-        std::string("localhost"),
+        std::string("127.0.0.1"),
         std::to_string(server.port())};
     CHECK_FALSE(sender.must_close());
     server.accept();
@@ -995,7 +995,7 @@ TEST_CASE("line sender protocol version v2")
     questdb::ingress::test::mock_server server;
     questdb::ingress::line_sender sender{
         questdb::ingress::protocol::tcp,
-        std::string("localhost"),
+        std::string("127.0.0.1"),
         std::to_string(server.port()),
         protocol_version_2};
     CHECK_FALSE(sender.must_close());
@@ -1023,7 +1023,7 @@ TEST_CASE("Http auto detect line protocol version failed")
     try
     {
         questdb::ingress::opts opts{
-            questdb::ingress::protocol::http, "localhost", 1};
+            questdb::ingress::protocol::http, "127.0.0.1", 1};
         questdb::ingress::line_sender sender1{opts};
         CHECK_MESSAGE(false, "Expected exception");
     }

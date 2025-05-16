@@ -725,7 +725,9 @@ class TestSender(unittest.TestCase):
             ca_path = proj.tls_certs_dir / 'server_rootCA.pem'
             args.append(str(ca_path))
             port = TLS_PROXY_FIXTURE.listen_port
-        args.extend(['localhost', str(port)])
+            args.extend(['localhost', str(port)])
+        else:
+            args.extend(['127.0.0.1', str(port)])
         subprocess.check_call(args, cwd=bin_path.parent)
 
         # Check inserted data.
@@ -800,7 +802,7 @@ class TestSender(unittest.TestCase):
             raise RuntimeError(f'Could not find {bin_name}{ext} in {proj.build_dir}')
         port = QDB_FIXTURE.line_tcp_port
         args = [str(bin_path)]
-        args.extend(['localhost', str(port)])
+        args.extend(['127.0.0.1', str(port)])
         subprocess.check_call(args, cwd=bin_path.parent)
         resp = retry_check_table(table_name)
         exp_columns = [

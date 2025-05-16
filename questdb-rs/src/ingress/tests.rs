@@ -5,9 +5,9 @@ use tempfile::TempDir;
 #[cfg(feature = "ilp-over-http")]
 #[test]
 fn http_simple() {
-    let builder = SenderBuilder::from_conf("http::addr=localhost;").unwrap();
+    let builder = SenderBuilder::from_conf("http::addr=127.0.0.1;").unwrap();
     assert_eq!(builder.protocol, Protocol::Http);
-    assert_specified_eq(&builder.host, "localhost");
+    assert_specified_eq(&builder.host, "127.0.0.1");
     assert_specified_eq(&builder.port, Protocol::Http.default_port());
     assert!(!builder.protocol.tls_enabled());
 }
@@ -30,10 +30,10 @@ fn https_simple() {
 
 #[test]
 fn tcp_simple() {
-    let builder = SenderBuilder::from_conf("tcp::addr=localhost;").unwrap();
+    let builder = SenderBuilder::from_conf("tcp::addr=127.0.0.1;").unwrap();
     assert_eq!(builder.protocol, Protocol::Tcp);
     assert_specified_eq(&builder.port, Protocol::Tcp.default_port());
-    assert_specified_eq(&builder.host, "localhost");
+    assert_specified_eq(&builder.host, "127.0.0.1");
     assert!(!builder.protocol.tls_enabled());
 }
 

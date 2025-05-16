@@ -780,6 +780,10 @@ class Sender:
             port: Union[str, int],
             **kwargs):
 
+        if protocol in (Protocol.TCPS, Protocol.HTTPS):
+            if host == '127.0.0.1':
+                host = 'localhost'  # for TLS connections we need a hostname
+
         self._build_mode = build_mode
         self._impl = None
         self._conf = [

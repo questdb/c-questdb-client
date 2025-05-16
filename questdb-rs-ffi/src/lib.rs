@@ -84,7 +84,7 @@ macro_rules! upd_opts {
                     // already cleaned up object.
                     // To avoid double-freeing, we need to construct a valid "dummy"
                     // object on top of the memory that is still owned by the caller.
-                    let dummy = SenderBuilder::new(Protocol::Tcp, "localhost", 1);
+                    let dummy = SenderBuilder::new(Protocol::Tcp, "127.0.0.1", 1);
                     ptr::write(builder_ref, dummy);
                     return false;
                 }
