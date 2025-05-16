@@ -1031,7 +1031,7 @@ TEST_CASE("Http auto detect line protocol version failed")
     {
         std::string msg{se.what()};
         CHECK_MESSAGE(
-            msg.rfind("Failed to detect server's line protocol version", 0) ==
+            msg.rfind("Could not detect server's line protocol version", 0) ==
                 0,
             msg);
     }
