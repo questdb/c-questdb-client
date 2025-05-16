@@ -422,7 +422,7 @@ pub(super) fn get_supported_protocol_versions(
         Ok(res) => {
             if res.status().is_client_error() || res.status().is_server_error() {
                 let status = res.status();
-                let _ = res.into_body();
+                _ = res.into_body().read_to_vec();
                 if status.as_u16() == 404 {
                     support_versions.push(ProtocolVersion::V1);
                     return Ok(support_versions);

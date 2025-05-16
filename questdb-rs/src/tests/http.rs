@@ -790,34 +790,34 @@ fn test_sender_protocol_version_old_server21() -> TestResult {
     server_thread.join().unwrap()?;
     Ok(())
 }
+
 #[test]
-fn test_sender_protocol_version() -> TestResult {
+fn test_sender_auto_protocol_version_basic() -> TestResult {
     _test_sender_auto_detect_protocol_version(Some(vec![1, 2]), ProtocolVersion::V2)
 }
 
 #[test]
-fn test_sender_protocol_version_old_server1() -> TestResult {
+fn test_sender_auto_protocol_version_old_server1() -> TestResult {
     _test_sender_auto_detect_protocol_version(Some(vec![]), ProtocolVersion::V1)
 }
 
-// todo test hang
-// #[test]
-// fn test_sender_protocol_version_old_server2() -> TestResult {
-//    _test_sender_auto_detect_protocol_version(None, ProtocolVersion::V1)
-// }
+#[test]
+fn test_sender_auto_protocol_version_old_server2() -> TestResult {
+    _test_sender_auto_detect_protocol_version(None, ProtocolVersion::V1)
+}
 
 #[test]
-fn test_sender_protocol_version_only_v1() -> TestResult {
+fn test_sender_auto_protocol_version_only_v1() -> TestResult {
     _test_sender_auto_detect_protocol_version(Some(vec![1]), ProtocolVersion::V1)
 }
 
 #[test]
-fn test_sender_protocol_version_only_v2() -> TestResult {
+fn test_sender_auto_protocol_version_only_v2() -> TestResult {
     _test_sender_auto_detect_protocol_version(Some(vec![2]), ProtocolVersion::V2)
 }
 
 #[test]
-fn test_sender_protocol_version_unsupported_client() -> TestResult {
+fn test_sender_auto_protocol_version_unsupported_client() -> TestResult {
     let mut server = MockServer::new()?.configure_settings_response(&[3, 4]);
     let sender_builder = server.lsb_http();
     let server_thread = std::thread::spawn(move || -> io::Result<()> {
