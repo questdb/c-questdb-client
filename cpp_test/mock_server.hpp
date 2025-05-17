@@ -24,13 +24,17 @@
 
 #pragma once
 
+#include <cassert>
 #include <vector>
-#include <string>
 #include <cstdint>
 #include <optional>
 #include <stdexcept>
-
 #include "build_env.h"
+#if __cplusplus < 202002L
+#    include "questdb/ingress/line_sender.hpp"
+#else
+#    include <span>
+#endif
 
 #if defined(PLATFORM_UNIX)
 typedef int socketfd_t;
@@ -60,9 +64,14 @@ public:
 
     size_t recv(double wait_timeout_sec = 0.1);
 
-    const std::vector<std::string>& msgs() const
+#if __cplusplus >= 202002L
+    using buffer_view = std::span<const std::byte>;
+#endif
+
+    buffer_view msgs(size_t index) const
     {
-        return _msgs;
+        assert(index < _msgs.size());
+        return {_msgs[index].data(), _msgs[index].size()};
     }
 
     void close();
@@ -75,7 +84,7 @@ private:
     socketfd_t _listen_fd;
     socketfd_t _conn_fd;
     uint16_t _port;
-    std::vector<std::string> _msgs;
+    std::vector<std::vector<std::byte>> _msgs;
 };
 
 } // namespace questdb::ingress::test

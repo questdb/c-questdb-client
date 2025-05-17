@@ -19,9 +19,8 @@ int main(int argc, const char* argv[])
         const auto price_name = "price"_cn;
         const auto amount_name = "amount"_cn;
 
-        questdb::ingress::line_sender_buffer buffer;
-        buffer
-            .table(table_name)
+        questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
+        buffer.table(table_name)
             .symbol(symbol_name, "ETH-USD"_utf8)
             .symbol(side_name, "sell"_utf8)
             .column(price_name, 2615.54)
@@ -39,10 +38,7 @@ int main(int argc, const char* argv[])
     }
     catch (const questdb::ingress::line_sender_error& err)
     {
-        std::cerr
-            << "Error running example: "
-            << err.what()
-            << std::endl;
+        std::cerr << "Error running example: " << err.what() << std::endl;
 
         return 1;
     }
