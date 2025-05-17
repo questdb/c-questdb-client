@@ -50,7 +50,7 @@ fn test_two_lines(
         .at_now()?;
     let buffer2 = buffer.clone();
 
-    let server_thread = std::thread::spawn(move || -> io::Result<()> {
+    let server_thread = std::thread::spawn(move || -> io::Result<MockServer> {
         server.accept()?;
         let req = server.recv_http_q()?;
         assert_eq!(req.method(), "POST");
@@ -63,12 +63,12 @@ fn test_two_lines(
 
         server.send_http_response_q(HttpResponse::empty())?;
 
-        Ok(())
+        Ok(server)
     });
 
     let res = sender.flush(&mut buffer);
 
-    server_thread.join().unwrap()?;
+    _ = server_thread.join().unwrap()?;
 
     res?;
 
@@ -91,7 +91,7 @@ fn test_text_plain_error(
         .at_now()?;
     buffer.table("test")?.column_f64("sym", 2.0)?.at_now()?;
     let buffer2 = buffer.clone();
-    let server_thread = std::thread::spawn(move || -> io::Result<()> {
+    let server_thread = std::thread::spawn(move || -> io::Result<MockServer> {
         server.accept()?;
         let req = server.recv_http_q()?;
         assert_eq!(req.method(), "POST");
@@ -105,19 +105,17 @@ fn test_text_plain_error(
                 .with_body_str("bad wombat"),
         )?;
 
-        Ok(())
+        Ok(server)
     });
 
-    let res = sender.flush(&mut buffer);
-
-    server_thread.join().unwrap()?;
-
-    assert!(res.is_err());
-    let err = res.unwrap_err();
-    assert_eq!(err.code(), ErrorCode::ServerFlushError);
-    assert_eq!(err.msg(), "Could not flush buffer: bad wombat");
+    assert_err_contains(
+        sender.flush(&mut buffer),
+        ErrorCode::ServerFlushError,
+        "Could not flush buffer: bad wombat",
+    );
 
     assert!(!buffer.is_empty());
+    _ = server_thread.join().unwrap()?;
 
     Ok(())
 }
@@ -137,7 +135,7 @@ fn test_bad_json_error(
     buffer.table("test")?.column_f64("sym", 2.0)?.at_now()?;
 
     let buffer2 = buffer.clone();
-    let server_thread = std::thread::spawn(move || -> io::Result<()> {
+    let server_thread = std::thread::spawn(move || -> io::Result<MockServer> {
         server.accept()?;
         let req = server.recv_http_q()?;
         assert_eq!(req.method(), "POST");
@@ -152,12 +150,12 @@ fn test_bad_json_error(
                 })),
         )?;
 
-        Ok(())
+        Ok(server)
     });
 
     let res = sender.flush_and_keep(&buffer);
 
-    server_thread.join().unwrap()?;
+    _ = server_thread.join().unwrap()?;
 
     assert!(res.is_err());
     let err = res.unwrap_err();
@@ -185,7 +183,7 @@ fn test_json_error(
     buffer.table("test")?.column_f64("sym", 2.0)?.at_now()?;
 
     let buffer2 = buffer.clone();
-    let server_thread = std::thread::spawn(move || -> io::Result<()> {
+    let server_thread = std::thread::spawn(move || -> io::Result<MockServer> {
         server.accept()?;
         let req = server.recv_http_q()?;
         assert_eq!(req.method(), "POST");
@@ -203,21 +201,16 @@ fn test_json_error(
                 })),
         )?;
 
-        Ok(())
+        Ok(server)
     });
 
-    let res = sender.flush_and_keep(&buffer);
-
-    server_thread.join().unwrap()?;
-
-    assert!(res.is_err());
-    let err = res.unwrap_err();
-    assert_eq!(err.code(), ErrorCode::ServerFlushError);
-    assert_eq!(
-        err.msg(),
-        "Could not flush buffer: failed to parse line protocol: invalid field format [id: ABC-2, code: invalid, line: 2]"
+    assert_err_contains(
+        sender.flush_and_keep(&buffer),
+        ErrorCode::ServerFlushError,
+        "Could not flush buffer: failed to parse line protocol: invalid field format [id: ABC-2, code: invalid, line: 2]",
     );
 
+    _ = server_thread.join().unwrap()?;
     Ok(())
 }
 
@@ -258,7 +251,7 @@ fn test_old_server_without_ilp_http_support(
         .at_now()?;
 
     let buffer2 = buffer.clone();
-    let server_thread = std::thread::spawn(move || -> io::Result<()> {
+    let server_thread = std::thread::spawn(move || -> io::Result<MockServer> {
         server.accept()?;
         let req = server.recv_http_q()?;
         assert_eq!(req.method(), "POST");
@@ -272,21 +265,16 @@ fn test_old_server_without_ilp_http_support(
                 .with_body_str("Not Found"),
         )?;
 
-        Ok(())
+        Ok(server)
     });
 
-    let res = sender.flush_and_keep(&buffer);
-
-    server_thread.join().unwrap()?;
-
-    assert!(res.is_err());
-    let err = res.unwrap_err();
-    assert_eq!(err.code(), ErrorCode::HttpNotSupported);
-    assert_eq!(
-        err.msg(),
-        "Could not flush buffer: HTTP endpoint does not support ILP."
+    assert_err_contains(
+        sender.flush_and_keep(&buffer),
+        ErrorCode::HttpNotSupported,
+        "Could not flush buffer: HTTP endpoint does not support ILP.",
     );
 
+    _ = server_thread.join().unwrap()?;
     Ok(())
 }
 
@@ -309,7 +297,7 @@ fn test_http_basic_auth(
         .at_now()?;
 
     let buffer2 = buffer.clone();
-    let server_thread = std::thread::spawn(move || -> io::Result<()> {
+    let server_thread = std::thread::spawn(move || -> io::Result<MockServer> {
         server.accept()?;
         let req = server.recv_http_q()?;
         assert_eq!(req.method(), "POST");
@@ -322,12 +310,12 @@ fn test_http_basic_auth(
 
         server.send_http_response_q(HttpResponse::empty())?;
 
-        Ok(())
+        Ok(server)
     });
 
     let res = sender.flush(&mut buffer);
 
-    server_thread.join().unwrap()?;
+    _ = server_thread.join().unwrap()?;
 
     res?;
 
@@ -350,7 +338,7 @@ fn test_unauthenticated(
         .at_now()?;
 
     let buffer2 = buffer.clone();
-    let server_thread = std::thread::spawn(move || -> io::Result<()> {
+    let server_thread = std::thread::spawn(move || -> io::Result<MockServer> {
         server.accept()?;
         let req = server.recv_http_q()?;
         assert_eq!(req.method(), "POST");
@@ -364,23 +352,17 @@ fn test_unauthenticated(
                 .with_header("WWW-Authenticate", "Basic realm=\"Our Site\""),
         )?;
 
-        Ok(())
+        Ok(server)
     });
 
-    let res = sender.flush(&mut buffer);
-
-    server_thread.join().unwrap()?;
-
-    assert!(res.is_err());
-    let err = res.unwrap_err();
-    assert_eq!(err.code(), ErrorCode::AuthError);
-    assert_eq!(
-        err.msg(),
-        "Could not flush buffer: HTTP endpoint authentication error: Unauthorized [code: 401]"
+    assert_err_contains(
+        sender.flush(&mut buffer),
+        ErrorCode::AuthError,
+        "Could not flush buffer: HTTP endpoint authentication error: Unauthorized [code: 401]",
     );
-
     assert!(!buffer.is_empty());
 
+    _ = server_thread.join().unwrap()?;
     Ok(())
 }
 
@@ -402,7 +384,7 @@ fn test_token_auth(
         .at_now()?;
 
     let buffer2 = buffer.clone();
-    let server_thread = std::thread::spawn(move || -> io::Result<()> {
+    let server_thread = std::thread::spawn(move || -> io::Result<MockServer> {
         server.accept()?;
         let req = server.recv_http_q()?;
         assert_eq!(req.method(), "POST");
@@ -412,12 +394,12 @@ fn test_token_auth(
 
         server.send_http_response_q(HttpResponse::empty())?;
 
-        Ok(())
+        Ok(server)
     });
 
     let res = sender.flush(&mut buffer);
 
-    server_thread.join().unwrap()?;
+    _ = server_thread.join().unwrap()?;
 
     res?;
 
@@ -471,7 +453,7 @@ fn test_tls(
         .column_f64("f1", 0.5)?
         .at(TimestampNanos::new(10000000))?;
     let buffer2 = buffer.clone();
-    let server_thread = std::thread::spawn(move || -> io::Result<()> {
+    let server_thread = std::thread::spawn(move || -> io::Result<MockServer> {
         server.accept_tls_sync()?;
         let req = server.recv_http_q()?;
         assert_eq!(req.method(), "POST");
@@ -480,12 +462,12 @@ fn test_tls(
 
         server.send_http_response_q(HttpResponse::empty())?;
 
-        Ok(())
+        Ok(server)
     });
 
     let res = sender.flush_and_keep(&buffer);
 
-    server_thread.join().unwrap()?;
+    _ = server_thread.join().unwrap()?;
 
     // Unpacking the error here allows server errors to bubble first.
     res?;
@@ -510,7 +492,7 @@ fn test_user_agent(
         .column_f64("f1", 0.5)?
         .at(TimestampNanos::new(10000000))?;
     let buffer2 = buffer.clone();
-    let server_thread = std::thread::spawn(move || -> io::Result<()> {
+    let server_thread = std::thread::spawn(move || -> io::Result<MockServer> {
         server.accept()?;
         let req = server.recv_http_q()?;
         assert_eq!(req.header("user-agent"), Some("wallabies/1.2.99"));
@@ -518,12 +500,12 @@ fn test_user_agent(
 
         server.send_http_response_q(HttpResponse::empty())?;
 
-        Ok(())
+        Ok(server)
     });
 
     let res = sender.flush_and_keep(&buffer);
 
-    server_thread.join().unwrap()?;
+    _ = server_thread.join().unwrap()?;
 
     // Unpacking the error here allows server errors to bubble first.
     res?;
@@ -549,7 +531,7 @@ fn test_two_retries(
         .column_f64("f1", 0.5)?
         .at(TimestampNanos::new(10000000))?;
     let buffer2 = buffer.clone();
-    let server_thread = std::thread::spawn(move || -> io::Result<()> {
+    let server_thread = std::thread::spawn(move || -> io::Result<MockServer> {
         server.accept()?;
         let req = server.recv_http_q()?;
         assert_eq!(req.body(), buffer2.as_bytes());
@@ -582,12 +564,12 @@ fn test_two_retries(
 
         server.send_http_response_q(HttpResponse::empty())?;
 
-        Ok(())
+        Ok(server)
     });
 
     let res = sender.flush_and_keep(&buffer);
 
-    server_thread.join().unwrap()?;
+    _ = server_thread.join().unwrap()?;
 
     // Unpacking the error here allows server errors to bubble first.
     res?;
@@ -613,7 +595,7 @@ fn test_one_retry(
         .at(TimestampNanos::new(10000000))?;
     let buffer2 = buffer.clone();
 
-    let server_thread = std::thread::spawn(move || -> io::Result<()> {
+    let server_thread = std::thread::spawn(move || -> io::Result<MockServer> {
         server.accept()?;
         let req = server.recv_http_q()?;
         assert_eq!(req.body(), buffer2.as_bytes());
@@ -646,17 +628,16 @@ fn test_one_retry(
         };
         assert_eq!(err.kind(), ErrorKind::TimedOut);
 
-        Ok(())
+        Ok(server)
     });
 
-    let res = sender.flush_and_keep(&buffer);
+    assert_err_contains(
+        sender.flush_and_keep(&buffer),
+        ErrorCode::ServerFlushError,
+        "Could not flush buffer: error 2",
+    );
 
-    server_thread.join().unwrap()?;
-
-    let err = res.unwrap_err();
-    assert_eq!(err.code(), ErrorCode::ServerFlushError);
-    assert_eq!(err.msg(), "Could not flush buffer: error 2");
-
+    _ = server_thread.join().unwrap()?;
     Ok(())
 }
 
@@ -690,29 +671,26 @@ fn test_transactional(
     let buffer3 = buffer2.clone();
     assert!(buffer2.transactional());
 
-    let server_thread = std::thread::spawn(move || -> io::Result<()> {
+    let server_thread = std::thread::spawn(move || -> io::Result<MockServer> {
         server.accept()?;
         let req = server.recv_http_q()?;
         assert_eq!(req.body(), buffer3.as_bytes());
 
         server.send_http_response_q(HttpResponse::empty())?;
 
-        Ok(())
+        Ok(server)
     });
 
-    let res = sender.flush_and_keep_with_flags(&buffer1, true);
-    assert!(res.is_err());
-    let err = res.unwrap_err();
-    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
-    assert_eq!(
-        err.msg(),
+    assert_err_contains(
+        sender.flush_and_keep_with_flags(&buffer1, true),
+        ErrorCode::InvalidApiCall,
         "Buffer contains lines for multiple tables. \
         Transactional flushes are only supported for buffers containing lines for a single table.",
     );
 
     let res = sender.flush_and_keep_with_flags(&buffer2, true);
 
-    server_thread.join().unwrap()?;
+    _ = server_thread.join().unwrap()?;
 
     // Unpacking the error here allows server errors to bubble first.
     res?;
@@ -729,7 +707,7 @@ fn _test_sender_auto_detect_protocol_version(
         .configure_settings_response(supported_versions.as_deref().unwrap_or(&[]));
     let sender_builder = server.lsb_http();
 
-    let server_thread = std::thread::spawn(move || -> io::Result<()> {
+    let server_thread = std::thread::spawn(move || -> io::Result<MockServer> {
         server.accept()?;
         let req = server.recv_http_q()?;
         assert_eq!(req.method(), "GET");
@@ -752,7 +730,7 @@ fn _test_sender_auto_detect_protocol_version(
         let req = server.recv_http_q()?;
         assert_eq!(req.body(), exp);
         server.send_http_response_q(HttpResponse::empty())?;
-        Ok(())
+        Ok(server)
     });
 
     let mut sender = sender_builder.build()?;
@@ -764,8 +742,8 @@ fn _test_sender_auto_detect_protocol_version(
         .column_f64("f1", 0.5)?
         .at(TimestampNanos::new(10000000))?;
     let res = sender.flush(&mut buffer);
-    server_thread.join().unwrap()?;
     res?;
+    _ = server_thread.join().unwrap()?;
     Ok(())
 }
 
@@ -808,10 +786,9 @@ fn test_sender_auto_protocol_version_unsupported_client() -> TestResult {
         ErrorCode::ProtocolVersionError,
         "Server does not support current client",
     );
-    let server = server_thread.join().unwrap()?;
 
     // We keep the server around til the end of the test to ensure that the response is fully received.
-    drop(server);
+    _ = server_thread.join().unwrap()?;
     Ok(())
 }
 
@@ -825,7 +802,7 @@ fn test_buffer_protocol_version1_not_support_array() -> TestResult {
     assert_err_contains(
         res,
         ErrorCode::ProtocolVersionError,
-        "line protocol version v1 does not support array datatype",
+        "Protocol version v1 does not support array datatype",
     );
     Ok(())
 }

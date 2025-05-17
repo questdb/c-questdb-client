@@ -1123,7 +1123,7 @@ impl Buffer {
         if self.version == ProtocolVersion::V1 {
             return Err(error::fmt!(
                 ProtocolVersionError,
-                "line protocol version v1 does not support array datatype",
+                "Protocol version v1 does not support array datatype",
             ));
         }
         let ndim = view.ndim();
