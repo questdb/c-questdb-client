@@ -705,7 +705,7 @@ class TestSender(unittest.TestCase):
                 sender.column_f64_arr('f64_arr1', array1)
                 sender.at_now()
         except qls.SenderError as e:
-            self.assertIn('line protocol version v1 does not support array datatype', str(e))
+            self.assertIn('Protocol version v1 does not support array datatype', str(e))
 
     def _test_example(self, bin_name, table_name, tls=False):
         if BUILD_MODE != qls.BuildMode.API:
