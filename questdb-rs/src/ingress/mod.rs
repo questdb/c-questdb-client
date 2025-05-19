@@ -1363,12 +1363,6 @@ pub struct Sender {
     connected: bool,
     max_buf_size: usize,
     default_protocol_version: ProtocolVersion,
-    #[cfg(feature = "ilp-over-http")]
-    /// List of protocol versions supported by the server.
-    /// It will be `None` when user explicitly sets `protocol_version` (no first http round trip).
-    /// Note that when connecting to older servers (responding with 404 or missing version data),
-    /// it will be init as [`ProtocolVersion::V1`] instead of leaving `None`
-    supported_protocol_versions: Option<Vec<ProtocolVersion>>,
 }
 
 impl std::fmt::Debug for Sender {
@@ -2571,18 +2565,10 @@ impl SenderBuilder {
             }
         };
 
-        let default_protocol_version;
-        #[cfg(feature = "ilp-over-http")]
-        let mut supported_protocol_versions: Option<Vec<_>> = None;
-
-        match self.protocol_version.deref() {
-            Some(v) => {
-                default_protocol_version = *v;
-            }
+        let default_protocol_version = match self.protocol_version.deref() {
+            Some(v) => *v,
             None => match self.protocol {
-                Protocol::Tcp | Protocol::Tcps => {
-                    default_protocol_version = ProtocolVersion::V1;
-                }
+                Protocol::Tcp | Protocol::Tcps => ProtocolVersion::V1,
                 #[cfg(feature = "ilp-over-http")]
                 Protocol::Http | Protocol::Https => {
                     if let ProtocolHandler::Http(http_state) = &handler {
@@ -2594,22 +2580,21 @@ impl SenderBuilder {
                         );
                         let versions = get_supported_protocol_versions(http_state, settings_url)?;
                         if versions.contains(&ProtocolVersion::V2) {
-                            default_protocol_version = ProtocolVersion::V2;
+                            ProtocolVersion::V2
                         } else if versions.contains(&ProtocolVersion::V1) {
-                            default_protocol_version = ProtocolVersion::V1;
+                            ProtocolVersion::V1
                         } else {
                             return Err(error::fmt!(
                                 ProtocolVersionError,
                                 "Server does not support current client"
                             ));
                         }
-                        supported_protocol_versions = Some(versions);
                     } else {
-                        default_protocol_version = ProtocolVersion::V1;
+                        unreachable!("HTTP handler should be used for HTTP protocol");
                     }
                 }
             },
-        }
+        };
 
         if auth.is_some() {
             descr.push_str("auth=on]");
@@ -2622,8 +2607,6 @@ impl SenderBuilder {
             connected: true,
             max_buf_size: *self.max_buf_size,
             default_protocol_version,
-            #[cfg(feature = "ilp-over-http")]
-            supported_protocol_versions,
         };
 
         Ok(sender)
@@ -2858,7 +2841,6 @@ impl Sender {
             ));
         }
 
-        #[cfg(feature = "ilp-over-http")]
         self.check_protocol_version(buf.version)?;
 
         let bytes = buf.as_bytes();
@@ -2990,27 +2972,18 @@ impl Sender {
         self.default_protocol_version
     }
 
-    #[cfg(feature = "ilp-over-http")]
     #[inline(always)]
     fn check_protocol_version(&self, version: ProtocolVersion) -> Result<()> {
-        match &self.handler {
-            ProtocolHandler::Socket(_) => Ok(()),
-            ProtocolHandler::Http(_) => {
-                match self.supported_protocol_versions {
-                    Some(ref supported_line_protocols) => {
-                        if supported_line_protocols.contains(&version) {
-                            Ok(())
-                        } else {
-                            Err(error::fmt!(
-                                    ProtocolVersionError,
-                                    "Line protocol version {} is not supported by current QuestDB Server",  version))
-                        }
-                    }
-                    // `None` implies user set protocol_version explicitly
-                    None => Ok(()),
-                }
-            }
+        if self.default_protocol_version != version {
+            return Err(error::fmt!(
+                ProtocolVersionError,
+                "Attempting to send with protocol version {} \
+                but the sender is configured to use protocol version {}",
+                version,
+                self.default_protocol_version
+            ));
         }
+        Ok(())
     }
 }
 

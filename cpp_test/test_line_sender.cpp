@@ -177,16 +177,15 @@ TEST_CASE("line_sender c api basics")
         2.7,
         48121.5,
         4.3};
-    CHECK(
-        ::line_sender_buffer_column_f64_arr(
-            buffer,
-            arr_name,
-            rank,
-            shape,
-            strides,
-            reinterpret_cast<uint8_t*>(arr_data.data()),
-            sizeof(arr_data),
-            &err));
+    CHECK(::line_sender_buffer_column_f64_arr(
+        buffer,
+        arr_name,
+        rank,
+        shape,
+        strides,
+        reinterpret_cast<uint8_t*>(arr_data.data()),
+        sizeof(arr_data),
+        &err));
     CHECK(::line_sender_buffer_at_nanos(buffer, 10000000, &err));
     CHECK(server.recv() == 0);
     CHECK(::line_sender_buffer_size(buffer) == 150);

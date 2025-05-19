@@ -26,6 +26,7 @@ use crate::{
     ingress::{
         Buffer, CertificateAuthority, Sender, TableName, Timestamp, TimestampMicros, TimestampNanos,
     },
+    tests::assert_err_contains,
     Error, ErrorCode,
 };
 
@@ -606,7 +607,7 @@ fn test_plain_to_tls_server() -> TestResult {
     let server = MockServer::new()?;
     let lsb = server.lsb_tcp().auth_timeout(Duration::from_millis(500))?;
     let server_jh = server.accept_tls();
-    let maybe_sender = lsb.build();
+    let maybe_sender = lsb.protocol_version(ProtocolVersion::V2)?.build();
     let server_err = server_jh.join().unwrap().unwrap_err();
 
     // The server failed to handshake, so disconnected the client.
@@ -675,6 +676,24 @@ fn bad_uppercase_addr() {
     let err = res.unwrap_err();
     assert!(err.code() == ErrorCode::ConfigError);
     assert!(err.msg() == "Missing \"addr\" parameter in config string");
+}
+
+#[test]
+fn tcp_mismatched_buffer_and_sender_version() -> TestResult {
+    let server = MockServer::new()?;
+    let mut sender = server
+        .lsb_tcp()
+        .protocol_version(ProtocolVersion::V2)?
+        .build()?;
+    let mut buffer = Buffer::new(ProtocolVersion::V1);
+    buffer.table("test")?.symbol("t1", "v1")?.at_now()?;
+    assert_err_contains(
+        sender.flush(&mut buffer),
+        ErrorCode::ProtocolVersionError,
+        "Attempting to send with protocol version v1 \
+        but the sender is configured to use protocol version v2",
+    );
+    Ok(())
 }
 
 pub(crate) fn f64_to_bytes(name: &str, value: f64, version: ProtocolVersion) -> Vec<u8> {
