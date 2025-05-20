@@ -1253,7 +1253,7 @@ public:
         return *this;
     }
 
-    protocol_version protocol_version() const noexcept
+    questdb::ingress::protocol_version protocol_version() const noexcept
     {
         ensure_impl();
         return static_cast<enum protocol_version>(
