@@ -332,6 +332,11 @@ def _setup_cdll():
         c_line_sender_buffer_p,
         c_line_sender_error_p_p)
     set_sig(
+        dll.line_sender_buffer_check_can_flush,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_error_p_p)
+    set_sig(
         dll.line_sender_opts_new,
         c_line_sender_opts_p,
         c_line_sender_protocol,
@@ -482,6 +487,14 @@ def _setup_cdll():
         c_line_sender_buffer_p,
         c_bool,
         c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_get_protocol_version,
+        c_protocol_version,
+        c_line_sender_p)
+    set_sig(
+        dll.line_sender_get_max_name_len,
+        c_size_t,
+        c_line_sender_p)
     return dll
 
 
@@ -824,16 +837,24 @@ class Sender:
     def __enter__(self):
         self.connect()
         self._buffer = Buffer(
-            protocol_version=ProtocolVersion.from_int(self.line_sender_default_protocol_version()))
+            protocol_version=self.protocol_version,
+            max_name_len=self.max_name_len)
         return self
 
     def _check_connected(self):
         if not self._impl:
             raise SenderError('Not connected.')
 
-    def line_sender_default_protocol_version(self):
+    @property
+    def protocol_version(self):
         self._check_connected()
-        return _DLL.line_sender_default_protocol_version(self._impl)
+        return ProtocolVersion.from_int(
+            _DLL.line_sender_get_protocol_version(self._impl))
+    
+    @property
+    def max_name_len(self):
+        self._check_connected()
+        return _DLL.line_sender_get_max_name_len(self._impl)
 
     def table(self, table: str):
         self._buffer.table(table)
