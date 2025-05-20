@@ -24,7 +24,7 @@
 
 #![doc = include_str!("mod.md")]
 
-pub use self::ndarr::{ArrayElement, NdArrayView, StrideArrayView};
+pub use self::ndarr::{ArrayElement, NdArrayView};
 pub use self::timestamp::*;
 use crate::error::{self, Error, Result};
 use crate::gai;
@@ -59,8 +59,16 @@ use ring::{
 
 pub(crate) const MAX_NAME_LEN_DEFAULT: usize = 127;
 
-/// Defines the maximum allowed dimensions for array data in binary serialization protocols.
-pub(crate) const MAX_ARRAY_DIMS: usize = 32;
+/// The maximum allowed dimensions for arrays.
+pub const MAX_ARRAY_DIMS: usize = 32;
+
+// TODO: We should probably agree on a significantly
+//       _smaller_ limit here, since there's no way
+//       we've ever tested anything that big.
+//       My gut feeling is that the maximum array buffer should be
+//       in the order of 100MB or so.
+const MAX_ARRAY_BUFFER_SIZE: usize = i32::MAX as usize;
+pub(crate) const MAX_ARRAY_DIM_LEN: usize = 0x0FFF_FFFF; // 1 << 28 - 1
 
 /// The version of Ingestion Line Protocol used to communicate with the server.
 #[derive(Debug, Copy, Clone, PartialEq)]

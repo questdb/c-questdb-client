@@ -14,16 +14,9 @@ questdb-rs = { path = "../questdb-rs", features = [
 libc = "0.2"
 questdb-confstr-ffi = { version = "0.1.1", optional = true }
 
-[build-dependencies]
-cbindgen = { version = "0.28.0", optional = true, default-features = false }
-
 [features]
 # Expose the config parsing C API.
 # This used by `py-questdb-client` to parse the config file.
 # It is exposed here to avoid having multiple copies of the `questdb-confstr`
 # crate in the final binary.
 confstr-ffi = ["dep:questdb-confstr-ffi"]
-
-# Auto-generate the header. This is for dev-debugging-diffing only.
-# A hand-crafted header is easier on the eyes.
-gen_h = ["cbindgen"]
