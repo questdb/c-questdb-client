@@ -50,7 +50,7 @@ fn main() -> Result<()> {
 ## Docs
 
 Most of the client documentation is on the
-[`ingress`](https://docs.rs/questdb-rs/4.0.4/questdb/ingress/) module page.
+[`ingress`](https://docs.rs/questdb-rs/5.0.0-rc1/questdb/ingress/) module page.
 
 ## Crate features
 

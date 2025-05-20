@@ -57,13 +57,21 @@ use ring::{
     signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING},
 };
 
-/// Defines the maximum allowed dimensions for array data in binary serialization protocols.
-pub const MAX_ARRAY_DIMS: usize = 32;
+pub(crate) const MAX_NAME_LEN_DEFAULT: usize = 127;
 
-/// Line Protocol Version supported by current client.
+/// Defines the maximum allowed dimensions for array data in binary serialization protocols.
+pub(crate) const MAX_ARRAY_DIMS: usize = 32;
+
+/// The version of Ingestion Line Protocol used to communicate with the server.
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum ProtocolVersion {
+    /// Version 1 of Line Protocol.
+    /// Full-text protocol.
+    /// When used over HTTP, it is compatible with the InfluxDB line protocol.
     V1 = 1,
+
+    /// Version 2 of Ingestion Line Protocol.
+    /// Uses binary format serialization for f64, and supports the array data type.
     V2 = 2,
 }
 
@@ -594,13 +602,7 @@ impl Buffer {
     /// protocol version. For custom name lengths, use [`with_max_name_len`](Self::with_max_name_len)
     /// or [`Sender::new_buffer_with_max_name_len`].
     pub fn new(protocol_version: ProtocolVersion) -> Self {
-        Self {
-            output: Vec::new(),
-            state: BufferState::new(),
-            marker: None,
-            max_name_len: 127,
-            version: protocol_version,
-        }
+        Self::with_max_name_len(protocol_version, MAX_NAME_LEN_DEFAULT)
     }
 
     /// Creates a new [`Buffer`] with a custom maximum name length.
@@ -612,10 +614,14 @@ impl Buffer {
     /// This is equivalent to [`Sender::new_buffer_with_max_name_len`] when using
     /// the sender's protocol version. For the default name length (127),
     /// use [`new`](Self::new) or [`Sender::new_buffer`].
-    pub fn with_max_name_len(max_name_len: usize, protocol_version: ProtocolVersion) -> Self {
-        let mut buf = Self::new(protocol_version);
-        buf.max_name_len = max_name_len;
-        buf
+    pub fn with_max_name_len(protocol_version: ProtocolVersion, max_name_len: usize) -> Self {
+        Self {
+            output: Vec::new(),
+            state: BufferState::new(),
+            marker: None,
+            max_name_len,
+            version: protocol_version,
+        }
     }
 
     /// Pre-allocate to ensure the buffer has enough capacity for at least the
@@ -1362,7 +1368,8 @@ pub struct Sender {
     handler: ProtocolHandler,
     connected: bool,
     max_buf_size: usize,
-    default_protocol_version: ProtocolVersion,
+    protocol_version: ProtocolVersion,
+    max_name_len: usize,
 }
 
 impl std::fmt::Debug for Sender {
@@ -1813,6 +1820,7 @@ pub struct SenderBuilder {
     port: ConfigSetting<String>,
     net_interface: ConfigSetting<Option<String>>,
     max_buf_size: ConfigSetting<usize>,
+    max_name_len: ConfigSetting<usize>,
     auth_timeout: ConfigSetting<Duration>,
     username: ConfigSetting<Option<String>>,
     password: ConfigSetting<Option<String>>,
@@ -1900,6 +1908,9 @@ impl SenderBuilder {
                         ))
                     }
                 },
+                "max_name_len" => {
+                    builder.max_name_len(parse_conf_value(key, val)?)?
+                }
 
                 "init_buf_size" => {
                     return Err(error::fmt!(
@@ -2055,6 +2066,7 @@ impl SenderBuilder {
             port: ConfigSetting::new_specified(port),
             net_interface: ConfigSetting::new_default(None),
             max_buf_size: ConfigSetting::new_default(100 * 1024 * 1024),
+            max_name_len: ConfigSetting::new_default(MAX_NAME_LEN_DEFAULT),
             auth_timeout: ConfigSetting::new_default(Duration::from_secs(15)),
             username: ConfigSetting::new_default(None),
             password: ConfigSetting::new_default(None),
@@ -2216,6 +2228,22 @@ impl SenderBuilder {
         Ok(self)
     }
 
+    /// The maximum length of a table or column name in bytes.
+    /// Matches the `cairo.max.file.name.length` setting in the server.
+    /// The default is 127 bytes.
+    /// If running over HTTP and protocol version 2 is auto-negotiated, this
+    /// value is picked up from the server.
+    pub fn max_name_len(mut self, value: usize) -> Result<Self> {
+        if value < 16 {
+            return Err(error::fmt!(
+                ConfigError,
+                "max_name_len must be at least 16 bytes."
+            ));
+        }
+        self.max_name_len.set_specified("max_name_len", value)?;
+        Ok(self)
+    }
+
     #[cfg(feature = "ilp-over-http")]
     /// Set the cumulative duration spent in retries.
     /// The value is in milliseconds, and the default is 10 seconds.
@@ -2308,7 +2336,7 @@ impl SenderBuilder {
             .map_err(|io_err| map_io_to_socket_err("Could not set SO_KEEPALIVE: ", io_err))?;
         sock.set_nodelay(true)
             .map_err(|io_err| map_io_to_socket_err("Could not set TCP_NODELAY: ", io_err))?;
-        if let Some(ref host) = self.net_interface.deref() {
+        if let Some(host) = self.net_interface.deref() {
             let bind_addr = gai::resolve_host(host.as_str())?;
             sock.bind(&bind_addr).map_err(|io_err| {
                 map_io_to_socket_err(
@@ -2565,7 +2593,9 @@ impl SenderBuilder {
             }
         };
 
-        let default_protocol_version = match self.protocol_version.deref() {
+        let mut max_name_len = *self.max_name_len;
+
+        let protocol_version = match self.protocol_version.deref() {
             Some(v) => *v,
             None => match self.protocol {
                 Protocol::Tcp | Protocol::Tcps => ProtocolVersion::V1,
@@ -2578,10 +2608,12 @@ impl SenderBuilder {
                             self.host.deref(),
                             self.port.deref()
                         );
-                        let versions = get_supported_protocol_versions(http_state, settings_url)?;
-                        if versions.contains(&ProtocolVersion::V2) {
+                        let (protocol_versions, server_max_name_len) =
+                            read_server_settings(http_state, settings_url)?;
+                        max_name_len = server_max_name_len;
+                        if protocol_versions.contains(&ProtocolVersion::V2) {
                             ProtocolVersion::V2
-                        } else if versions.contains(&ProtocolVersion::V1) {
+                        } else if protocol_versions.contains(&ProtocolVersion::V1) {
                             ProtocolVersion::V1
                         } else {
                             return Err(error::fmt!(
@@ -2601,12 +2633,14 @@ impl SenderBuilder {
         } else {
             descr.push_str("auth=off]");
         }
+
         let sender = Sender {
             descr,
             handler,
             connected: true,
             max_buf_size: *self.max_buf_size,
-            default_protocol_version,
+            protocol_version,
+            max_name_len,
         };
 
         Ok(sender)
@@ -2808,18 +2842,7 @@ impl Sender {
     /// the QuestDB server's default maximum name length of 127 characters.
     /// For custom name lengths, use [`new_buffer_with_max_name_len`](Self::new_buffer_with_max_name_len)
     pub fn new_buffer(&self) -> Buffer {
-        Buffer::new(self.default_protocol_version)
-    }
-
-    /// Creates a new [`Buffer`] with a custom maximum name length.
-    ///
-    /// This initializes a buffer using the sender's protocol version and
-    /// a specified maximum length for table/column names. The value should match
-    /// your QuestDB server's `cairo.max.file.name.length` configuration.
-    ///
-    /// For the default name length (127), use [`new_buffer`](Self::new_buffer)
-    pub fn new_buffer_with_max_name_len(&self, max_name_len: usize) -> Buffer {
-        Buffer::with_max_name_len(max_name_len, self.default_protocol_version)
+        Buffer::with_max_name_len(self.protocol_version, self.max_name_len)
     }
 
     #[allow(unused_variables)]
@@ -2964,23 +2987,33 @@ impl Sender {
         !self.connected
     }
 
-    /// Returns sender's default protocol version.
-    /// 1. User-set value via [`SenderBuilder::protocol_version`]
-    /// 2. V1 for TCP/TCPS (legacy protocol)
-    /// 3. Auto-detected version for HTTP/HTTPS
-    pub fn default_protocol_version(&self) -> ProtocolVersion {
-        self.default_protocol_version
+    /// Return the sender's protocol version.
+    /// This is either the protocol version that was set explicitly,
+    /// or the one that was auto-detected during the connection process.
+    /// If connecting via TCP and not overridden, the value is V1.
+    pub fn protocol_version(&self) -> ProtocolVersion {
+        self.protocol_version
+    }
+
+    /// Return the sender's maxinum name length of any column or table name.
+    /// This is either set explicitly when constructing the sender,
+    /// or the default value of 127.
+    /// When unset and using protocol version 2 over HTTP, the value is read
+    /// from the server from the `cairo.max.file.name.length` setting in
+    /// `server.conf` which defaults to 127.
+    pub fn max_name_len(&self) -> usize {
+        self.max_name_len
     }
 
     #[inline(always)]
     fn check_protocol_version(&self, version: ProtocolVersion) -> Result<()> {
-        if self.default_protocol_version != version {
+        if self.protocol_version != version {
             return Err(error::fmt!(
                 ProtocolVersionError,
                 "Attempting to send with protocol version {} \
                 but the sender is configured to use protocol version {}",
                 version,
-                self.default_protocol_version
+                self.protocol_version
             ));
         }
         Ok(())

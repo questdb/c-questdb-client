@@ -266,7 +266,7 @@ fn test_max_buf_size(
 
 #[test]
 fn test_table_name_too_long() -> TestResult {
-    let mut buffer = Buffer::with_max_name_len(4, ProtocolVersion::V2);
+    let mut buffer = Buffer::with_max_name_len(ProtocolVersion::V2, 4);
     let name = "a name too long";
     let err = buffer.table(name).unwrap_err();
     assert_eq!(err.code(), ErrorCode::InvalidName);
@@ -477,7 +477,7 @@ fn test_chrono_timestamp() -> TestResult {
 
 macro_rules! column_name_too_long_test_impl {
     ($column_fn:ident, $value:expr) => {{
-        let mut buffer = Buffer::with_max_name_len(4, ProtocolVersion::V2);
+        let mut buffer = Buffer::with_max_name_len(ProtocolVersion::V2, 4);
         let name = "a name too long";
         let err = buffer.table("tbl")?.$column_fn(name, $value).unwrap_err();
         assert_eq!(err.code(), ErrorCode::InvalidName);

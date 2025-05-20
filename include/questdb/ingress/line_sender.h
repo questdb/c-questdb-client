@@ -109,21 +109,21 @@ typedef enum line_sender_protocol
 } line_sender_protocol;
 
 /** The line protocol version used to write data to buffer. */
-typedef enum protocol_version
+typedef enum line_sender_protocol_version
 {
     /**
      * Version 1 of Ingestion Line Protocol.
      * This version is compatible with InfluxDB line protocol.
      */
-    protocol_version_1 = 1,
+    line_sender_protocol_version_1 = 1,
 
     /**
      * Version 2 of Ingestion Line Protocol.
      * Uses a binary format serialization for f64, and supports
      * the array data type.
      */
-    protocol_version_2 = 2,
-} protocol_version;
+    line_sender_protocol_version_2 = 2,
+} line_sender_protocol_version;
 
 /** Possible sources of the root certificates used to validate the server's
  * TLS certificate. */
@@ -314,7 +314,8 @@ typedef struct line_sender_buffer line_sender_buffer;
  * the same as the QuestDB server default.
  */
 LINESENDER_API
-line_sender_buffer* line_sender_buffer_new(protocol_version version);
+line_sender_buffer* line_sender_buffer_new(
+    line_sender_protocol_version version);
 
 /**
  * Construct a `line_sender_buffer` with a custom maximum length for table
@@ -325,7 +326,7 @@ line_sender_buffer* line_sender_buffer_new(protocol_version version);
  */
 LINESENDER_API
 line_sender_buffer* line_sender_buffer_with_max_name_len(
-    size_t max_name_len, protocol_version version);
+    line_sender_protocol_version version, size_t max_name_len);
 
 /** Release the `line_sender_buffer` object. */
 LINESENDER_API
@@ -756,7 +757,7 @@ bool line_sender_opts_token_y(
 LINESENDER_API
 bool line_sender_opts_protocol_version(
     line_sender_opts* opts,
-    protocol_version version,
+    line_sender_protocol_version version,
     line_sender_error** err_out);
 
 /**
@@ -918,31 +919,32 @@ line_sender* line_sender_from_conf(
 LINESENDER_API
 line_sender* line_sender_from_env(line_sender_error** err_out);
 
-/// Returns sender's default protocol version.
-/// 1. User-set value via [`line_sender_opts_protocol_version`]
-/// 2. V1 for TCP/TCPS (legacy protocol)
-/// 3. Auto-detected version for HTTP/HTTPS
+/**
+ * Return the sender's protocol version.
+ * This is either the protocol version that was set explicitly,
+ * or the one that was auto-detected during the connection process.
+ * If connecting via TCP and not overridden, the value is V1.
+ */
 LINESENDER_API
-protocol_version line_sender_default_protocol_version(
+line_sender_protocol_version line_sender_get_protocol_version(
     const line_sender* sender);
 
 /**
- * Construct a `line_sender_buffer` with a `max_name_len` of `127` and sender's
- * default protocol version
- * which is the same as the QuestDB server default.
+ * Returns the configured max_name_len, or the default value of 127.
+ */
+LINESENDER_API
+size_t line_sender_get_max_name_len(const line_sender* sender);
+
+/**
+ * Construct a `line_sender_buffer` with the sender's
+ * configured protocol version and other parameters.
+ * This is equivalent to calling:
+ *   line_sender_buffer_new(
+ *       line_sender_get_protocol_version(sender),
+ *       line_sender_get_max_name_len(sender))
  */
 line_sender_buffer* line_sender_buffer_new_for_sender(
     const line_sender* sender);
-
-/**
- * Construct a `line_sender_buffer` with sender's default protocol version and
- * a custom maximum length for table and column names. This should match the
- * `cairo.max.file.name.length` setting of the QuestDB  server you're
- * connecting to. If the server does not configure it, the default is `127`,
- * and you can call `line_sender_buffer_new_for_sender()` instead.
- */
-line_sender_buffer* line_sender_buffer_with_max_name_len_for_sender(
-    const line_sender* sender, size_t max_name_len);
 
 /**
  * Tell whether the sender is no longer usable and must be closed.

@@ -1,4 +1,5 @@
 use super::conf::ConfigSetting;
+use super::MAX_NAME_LEN_DEFAULT;
 use crate::error::fmt;
 use crate::{error, Error};
 use base64ct::Base64;
@@ -406,14 +407,18 @@ pub(super) fn http_send_with_retries(
     retry_http_send(state, buf, request_timeout, retry_timeout, last_rep)
 }
 
-/// Return and the server's all supported protocol versions.
-/// - For modern servers: Returns explicit version list from QuestDB's server's `/settings` endpoint response
-/// - For legacy servers (404 response or missing version field): Automatically falls back to [`ProtocolVersion::V1`]
-pub(super) fn get_supported_protocol_versions(
+/// Read the server settings from the `/settings` endpoint.
+/// This function returns:
+///   - A list of supported protocol versions: Default is V1.
+///   - The server's max name length: Default is 127.
+///
+/// If the server does not support the `/settings` endpoint (404), it returns
+/// default values.
+pub(super) fn read_server_settings(
     state: &HttpHandlerState,
     settings_url: &str,
-) -> Result<Vec<ProtocolVersion>, Error> {
-    let mut support_versions: Vec<ProtocolVersion> = vec![];
+) -> Result<(Vec<ProtocolVersion>, usize), Error> {
+    let default_protocol_version = ProtocolVersion::V1;
 
     let response = match http_get_with_retries(
         state,
@@ -426,8 +431,7 @@ pub(super) fn get_supported_protocol_versions(
                 let status = res.status();
                 _ = res.into_body().read_to_vec();
                 if status.as_u16() == 404 {
-                    support_versions.push(ProtocolVersion::V1);
-                    return Ok(support_versions);
+                    return Ok((vec![default_protocol_version], MAX_NAME_LEN_DEFAULT));
                 }
                 return Err(fmt!(
                     ProtocolVersionError,
@@ -443,8 +447,7 @@ pub(super) fn get_supported_protocol_versions(
             let e = match err {
                 ureq::Error::StatusCode(code) => {
                     if code == 404 {
-                        support_versions.push(ProtocolVersion::V1);
-                        return Ok(support_versions);
+                        return Ok((vec![default_protocol_version], MAX_NAME_LEN_DEFAULT));
                     } else {
                         fmt!(
                             ProtocolVersionError,
@@ -468,7 +471,7 @@ pub(super) fn get_supported_protocol_versions(
     };
 
     let (_, body) = response.into_parts();
-    let body_content = body.into_with_config().lossy_utf8(true).read_to_string();
+    let body_content = body.into_with_config().read_to_string();
 
     if let Ok(msg) = body_content {
         let json: serde_json::Value = serde_json::from_str(&msg).map_err(|_| {
@@ -479,6 +482,7 @@ pub(super) fn get_supported_protocol_versions(
             )
         })?;
 
+        let mut support_versions: Vec<ProtocolVersion> = vec![];
         if let Some(serde_json::Value::Array(ref values)) = json.get("line.proto.support.versions")
         {
             for value in values.iter() {
@@ -491,15 +495,20 @@ pub(super) fn get_supported_protocol_versions(
                 }
             }
         } else {
-            support_versions.push(ProtocolVersion::V1);
+            support_versions.push(default_protocol_version);
         }
+
+        let max_name_length = json
+            .get("cairo.max.file.name.length")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(MAX_NAME_LEN_DEFAULT as u64) as usize;
+        Ok((support_versions, max_name_length))
     } else {
-        return Err(error::fmt!(
+        Err(error::fmt!(
             ProtocolVersionError,
             "Malformed server response, settings url: {}, err: failed to read response body as UTF-8", settings_url
-        ));
+        ))
     }
-    Ok(support_versions)
 }
 
 #[allow(clippy::result_large_err)] // `ureq::Error` is large enough to cause this warning.

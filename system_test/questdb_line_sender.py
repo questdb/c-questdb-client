@@ -226,8 +226,8 @@ def _setup_cdll():
     set_sig(
         dll.line_sender_buffer_with_max_name_len,
         c_line_sender_buffer_p,
-        c_size_t,
-        c_protocol_version)
+        c_protocol_version,
+        c_size_t)
     set_sig(
         dll.line_sender_buffer_free,
         None,
@@ -456,15 +456,6 @@ def _setup_cdll():
         c_line_sender_p,
         c_line_sender_error_p_p)
     set_sig(
-        dll.line_sender_default_protocol_version,
-        c_protocol_version,
-        c_line_sender_p)
-    set_sig(
-        dll.line_sender_buffer_with_max_name_len_for_sender,
-        c_line_sender_buffer_p,
-        c_line_sender_p,
-        c_size_t)
-    set_sig(
         dll.line_sender_must_close,
         None,
         c_line_sender_p)
@@ -615,7 +606,8 @@ class TimestampMicros:
 class Buffer:
     def __init__(self, protocol_version: ProtocolVersion, init_buf_size=65536, max_name_len=127, ):
         self._impl = _DLL.line_sender_buffer_with_max_name_len(
-            c_size_t(max_name_len), protocol_version.value[0])
+            protocol_version.value[0],
+            c_size_t(max_name_len))
         _DLL.line_sender_buffer_reserve(self._impl, c_size_t(init_buf_size))
 
     def __len__(self):

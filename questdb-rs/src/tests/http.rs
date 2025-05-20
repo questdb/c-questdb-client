@@ -734,7 +734,7 @@ fn _test_sender_auto_detect_protocol_version(
     });
 
     let mut sender = sender_builder.build()?;
-    assert_eq!(sender.default_protocol_version(), expect_version);
+    assert_eq!(sender.protocol_version(), expect_version);
     let mut buffer = sender.new_buffer();
     buffer
         .table("test")?

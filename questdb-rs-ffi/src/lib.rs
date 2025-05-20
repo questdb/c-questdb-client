@@ -227,16 +227,17 @@ impl From<line_sender_protocol> for Protocol {
     }
 }
 
-/// The version of Line Protocol used for [`Buffer`].
+/// The version of Ingestion Line Protocol used to communicate with the server.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub enum ProtocolVersion {
     /// Version 1 of Line Protocol.
-    /// Uses text format serialization for f64.
+    /// Full-text protocol.
+    /// When used over HTTP, it is compatible with the InfluxDB line protocol.
     V1 = 1,
 
     /// Version 2 of Ingestion Line Protocol.
-    /// Uses binary format serialization for f64, and support array data type.
+    /// Uses binary format serialization for f64, and supports the array data type.
     V2 = 2,
 }
 
@@ -613,10 +614,10 @@ pub unsafe extern "C" fn line_sender_buffer_new(
 /// call `line_sender_buffer_new()` instead.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_buffer_with_max_name_len(
-    max_name_len: size_t,
     version: ProtocolVersion,
+    max_name_len: size_t,
 ) -> *mut line_sender_buffer {
-    let buffer = Buffer::with_max_name_len(max_name_len, version.into());
+    let buffer = Buffer::with_max_name_len(version.into(), max_name_len);
     Box::into_raw(Box::new(line_sender_buffer(buffer)))
 }
 
@@ -1411,15 +1412,20 @@ unsafe fn unwrap_sender_mut<'a>(sender: *mut line_sender) -> &'a mut Sender {
     &mut (*sender).0
 }
 
-/// Returns sender's default protocol version.
-/// 1. User-set value via [`line_sender_opts_protocol_version`]
-/// 2. V1 for TCP/TCPS (legacy protocol)
-/// 3. Auto-detected version for HTTP/HTTPS
+/// Return the sender's protocol version.
+/// This is either the protocol version that was set explicitly,
+/// or the one that was auto-detected during the connection process.
+/// If connecting via TCP and not overridden, the value is V1.
 #[no_mangle]
-pub unsafe extern "C" fn line_sender_default_protocol_version(
+pub unsafe extern "C" fn line_sender_get_protocol_version(
     sender: *const line_sender,
 ) -> ProtocolVersion {
-    unwrap_sender(sender).default_protocol_version().into()
+    unwrap_sender(sender).protocol_version().into()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_get_max_name_len(sender: *const line_sender) -> size_t {
+    unwrap_sender(sender).max_name_len()
 }
 
 /// Construct a `line_sender_buffer` with a `max_name_len` of `127` and sender's default protocol version
@@ -1430,21 +1436,6 @@ pub unsafe extern "C" fn line_sender_buffer_new_for_sender(
 ) -> *mut line_sender_buffer {
     let sender = unwrap_sender(sender);
     let buffer = sender.new_buffer();
-    Box::into_raw(Box::new(line_sender_buffer(buffer)))
-}
-
-/// Construct a `line_sender_buffer` with sender's default protocol version and a custom maximum
-/// length for table and column names. This should match the `cairo.max.file.name.length` setting of
-/// the QuestDB  server you're connecting to.
-/// If the server does not configure it, the default is `127`, and you can
-/// call `line_sender_buffer_new_for_sender()` instead.
-#[no_mangle]
-pub unsafe extern "C" fn line_sender_buffer_with_max_name_len_for_sender(
-    sender: *const line_sender,
-    max_name_len: size_t,
-) -> *mut line_sender_buffer {
-    let sender = unwrap_sender(sender);
-    let buffer = sender.new_buffer_with_max_name_len(max_name_len);
     Box::into_raw(Box::new(line_sender_buffer(buffer)))
 }
 

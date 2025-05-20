@@ -266,7 +266,7 @@ dependencies = [
 
 [[package]]
 name = "questdb-rs"
-version = "4.0.4"
+version = "5.0.0-rc1"
 dependencies = [
  "base64ct",
  "dns-lookup",
@@ -292,7 +292,7 @@ dependencies = [
 
 [[package]]
 name = "questdb-rs-ffi"
-version = "4.0.4"
+version = "5.0.0-rc1"
 dependencies = [
  "cbindgen",
  "libc",

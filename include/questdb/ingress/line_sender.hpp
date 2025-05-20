@@ -100,6 +100,15 @@ enum class protocol
     https,
 };
 
+enum class protocol_version
+{
+    /** Ingestion Line Protocol v1. */
+    v1 = 1,
+
+    /** Ingestion Line Protocol v2. */
+    v2 = 2,
+};
+
 /* Possible sources of the root certificates used to validate the server's TLS
  * certificate. */
 enum class ca
@@ -390,18 +399,11 @@ class line_sender_buffer
 {
 public:
     explicit line_sender_buffer(
-        protocol_version protocol_version,
-        size_t init_buf_size = 64 * 1024) noexcept
-        : line_sender_buffer{protocol_version, init_buf_size, 127}
-    {
-    }
-
-    line_sender_buffer(
         protocol_version version,
-        size_t init_buf_size,
-        size_t max_name_len) noexcept
+        size_t init_buf_size = 64 * 1024,
+        size_t max_name_len = 127) noexcept
         : _impl{nullptr}
-        , _protocol_version(version)
+        , _protocol_version{version}
         , _init_buf_size{init_buf_size}
         , _max_name_len{max_name_len}
     {
@@ -814,7 +816,9 @@ private:
         if (!_impl)
         {
             _impl = ::line_sender_buffer_with_max_name_len(
-                _max_name_len, _protocol_version);
+                static_cast<::line_sender_protocol_version>(
+                    static_cast<int>(_protocol_version)),
+                _max_name_len);
             ::line_sender_buffer_reserve(_impl, _init_buf_size);
         }
     }
@@ -833,7 +837,7 @@ private:
     static inline ::line_sender_utf8 name()
     {
         // Maintained by .bumpversion.cfg
-        static const char user_agent[] = "questdb/c++/4.0.4";
+        static const char user_agent[] = "questdb/c++/5.0.0-rc1";
         ::line_sender_utf8 utf8 =
             ::line_sender_utf8_assert(sizeof(user_agent) - 1, user_agent);
         return utf8;
@@ -893,28 +897,6 @@ public:
     }
 
     /**
-     * Create a new `opts` instance with the given protocol, hostname and port.
-     * @param[in] protocol The protocol to use.
-     * @param[in] host The QuestDB database host.
-     * @param[in] port The QuestDB tcp or http port.
-     * @param[in] version The protocol version to use.
-     * validation.
-     */
-    opts(
-        protocol protocol,
-        utf8_view host,
-        uint16_t port,
-        protocol_version version) noexcept
-        : _impl{::line_sender_opts_new(
-              static_cast<::line_sender_protocol>(protocol), host._impl, port)}
-    {
-        line_sender_error::wrapped_call(
-            ::line_sender_opts_user_agent, _impl, _user_agent::name());
-        line_sender_error::wrapped_call(
-            ::line_sender_opts_protocol_version, _impl, version);
-    }
-
-    /**
      * Create a new `opts` instance with the given protocol, hostname and
      * service name.
      * @param[in] protocol The protocol to use.
@@ -929,30 +911,6 @@ public:
     {
         line_sender_error::wrapped_call(
             ::line_sender_opts_user_agent, _impl, _user_agent::name());
-    }
-
-    /**
-     * Create a new `opts` instance with the given protocol, hostname and
-     * service name.
-     * @param[in] protocol The protocol to use.
-     * @param[in] host The QuestDB database host.
-     * @param[in] port The QuestDB tcp or http port as service name.
-     * @param[in] version The protocol version to use.
-     */
-    opts(
-        protocol protocol,
-        utf8_view host,
-        utf8_view port,
-        protocol_version version) noexcept
-        : _impl{::line_sender_opts_new_service(
-              static_cast<::line_sender_protocol>(protocol),
-              host._impl,
-              port._impl)}
-    {
-        line_sender_error::wrapped_call(
-            ::line_sender_opts_user_agent, _impl, _user_agent::name());
-        line_sender_error::wrapped_call(
-            ::line_sender_opts_protocol_version, _impl, version);
     }
 
     opts(const opts& other) noexcept
@@ -1166,6 +1124,16 @@ public:
         return *this;
     }
 
+    opts& protocol_version(protocol_version version) noexcept
+    {
+        const auto c_protocol_version =
+            static_cast<::line_sender_protocol_version>(
+                static_cast<int>(version));
+        line_sender_error::wrapped_call(
+            ::line_sender_opts_protocol_version, _impl, c_protocol_version);
+        return *this;
+    }
+
     ~opts() noexcept
     {
         reset();
@@ -1255,24 +1223,6 @@ public:
     {
     }
 
-    line_sender(
-        protocol protocol,
-        utf8_view host,
-        uint16_t port,
-        protocol_version version)
-        : line_sender{opts{protocol, host, port, version}}
-    {
-    }
-
-    line_sender(
-        protocol protocol,
-        utf8_view host,
-        utf8_view port,
-        protocol_version version)
-        : line_sender{opts{protocol, host, port, version}}
-    {
-    }
-
     line_sender(const opts& opts)
         : _impl{
               line_sender_error::wrapped_call(::line_sender_build, opts._impl)}
@@ -1300,11 +1250,20 @@ public:
         return *this;
     }
 
-    line_sender_buffer new_buffer(
-        size_t init_buf_size = 64 * 1024, size_t max_name_len = 127) noexcept
+    protocol_version protocol_version() const noexcept
     {
+        ensure_impl();
+        return static_cast<enum protocol_version>(
+            static_cast<int>(::line_sender_get_protocol_version(_impl)));
+    }
+
+    line_sender_buffer new_buffer(size_t init_buf_size = 64 * 1024) noexcept
+    {
+        ensure_impl();
         return line_sender_buffer{
-            default_protocol_version(), init_buf_size, max_name_len};
+            this->protocol_version(),
+            init_buf_size,
+            ::line_sender_get_max_name_len(_impl)};
     }
 
     /**
@@ -1359,20 +1318,11 @@ public:
         }
         else
         {
-            line_sender_buffer buffer2{default_protocol_version(), 0};
+            line_sender_buffer buffer2{this->protocol_version(), 0};
             buffer2.may_init();
             line_sender_error::wrapped_call(
                 ::line_sender_flush_and_keep, _impl, buffer2._impl);
         }
-    }
-
-    /**
-     * Returns the QuestDB server's recommended default line protocol version.
-     */
-    protocol_version default_protocol_version()
-    {
-        ensure_impl();
-        return line_sender_default_protocol_version(_impl);
     }
 
     /**
@@ -1405,7 +1355,7 @@ public:
     }
 
 private:
-    void ensure_impl()
+    void ensure_impl() const
     {
         if (!_impl)
             throw line_sender_error{

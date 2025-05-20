@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.15.0)
-project(c-questdb-client VERSION 4.0.4)
+project(c-questdb-client VERSION 5.0.0)
+set(PROJECT_PRE_RELEASE "rc1")
 
 set(CPACK_PROJECT_NAME ${PROJECT_NAME})
 set(CPACK_PROJECT_VERSION ${PROJECT_VERSION})
