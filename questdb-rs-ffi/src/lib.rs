@@ -1031,6 +1031,21 @@ pub unsafe extern "C" fn line_sender_buffer_at_now(
     true
 }
 
+/**
+ * Check whether the buffer is ready to be flushed.
+ * If this returns false, the buffer is incomplete and cannot be sent,
+ * and an error message is set to indicate the problem.
+ */
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_buffer_check_can_flush(
+    buffer: *const line_sender_buffer,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    let buffer = unwrap_buffer(buffer);
+    bubble_err_to_c!(err_out, buffer.check_can_flush());
+    true
+}
+
 /// Accumulates parameters for a new `line_sender` object.
 pub struct line_sender_opts(SenderBuilder);
 

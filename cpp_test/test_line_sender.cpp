@@ -226,8 +226,8 @@ TEST_CASE("Opts service API tests")
 TEST_CASE("line_sender c++ connect disconnect")
 {
     questdb::ingress::test::mock_server server;
-    questdb::ingress::line_sender sender{
-        questdb::ingress::protocol::tcp, "127.0.0.1", server.port()};
+    questdb::ingress::line_sender sender{questdb::ingress::opts{
+        questdb::ingress::protocol::tcp, "127.0.0.1", server.port()}};
     CHECK_FALSE(sender.must_close());
     server.accept();
     CHECK(server.recv() == 0);
@@ -327,10 +327,10 @@ TEST_CASE("test multiple lines")
 TEST_CASE("State machine testing -- flush without data.")
 {
     questdb::ingress::test::mock_server server;
-    questdb::ingress::line_sender sender{
+    questdb::ingress::line_sender sender{questdb::ingress::opts{
         questdb::ingress::protocol::tcp,
         std::string_view{"127.0.0.1"},
-        std::to_string(server.port())};
+        std::to_string(server.port())}};
 
     questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
     CHECK(buffer.size() == 0);
@@ -345,10 +345,10 @@ TEST_CASE("State machine testing -- flush without data.")
 TEST_CASE("One symbol only - flush before server accept")
 {
     questdb::ingress::test::mock_server server;
-    questdb::ingress::line_sender sender{
+    questdb::ingress::line_sender sender{questdb::ingress::opts{
         questdb::ingress::protocol::tcp,
         std::string{"127.0.0.1"},
-        server.port()};
+        server.port()}};
 
     // Does not raise - this is unlike InfluxDB spec that disallows this.
     questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
@@ -368,8 +368,8 @@ TEST_CASE("One symbol only - flush before server accept")
 TEST_CASE("One column only - server.accept() after flush, before close")
 {
     questdb::ingress::test::mock_server server;
-    questdb::ingress::line_sender sender{
-        questdb::ingress::protocol::tcp, "127.0.0.1", server.port()};
+    questdb::ingress::line_sender sender{questdb::ingress::opts{
+        questdb::ingress::protocol::tcp, "127.0.0.1", server.port()}};
 
     // Does not raise - this is unlike the InfluxDB spec that disallows this.
     questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
@@ -388,8 +388,8 @@ TEST_CASE("One column only - server.accept() after flush, before close")
 TEST_CASE("Symbol after column")
 {
     questdb::ingress::test::mock_server server;
-    questdb::ingress::line_sender sender{
-        questdb::ingress::protocol::tcp, "127.0.0.1", server.port()};
+    questdb::ingress::line_sender sender{questdb::ingress::opts{
+        questdb::ingress::protocol::tcp, "127.0.0.1", server.port()}};
 
     questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
     buffer.table("test").column("t1", "v1");
@@ -556,8 +556,8 @@ TEST_CASE("Sender move testing.")
     questdb::ingress::utf8_view host{"127.0.0.1"};
     const questdb::ingress::utf8_view& host_ref = host;
 
-    questdb::ingress::line_sender sender1{
-        questdb::ingress::protocol::tcp, host_ref, server1.port()};
+    questdb::ingress::line_sender sender1{questdb::ingress::opts{
+        questdb::ingress::protocol::tcp, host_ref, server1.port()}};
 
     questdb::ingress::line_sender_buffer buffer = sender1.new_buffer();
     buffer.table("test").column("t1", "v1").at_now();
@@ -581,8 +581,8 @@ TEST_CASE("Sender move testing.")
     CHECK_FALSE(sender1.must_close());
     CHECK(sender2.must_close());
 
-    questdb::ingress::line_sender sender3{
-        questdb::ingress::protocol::tcp, "127.0.0.1", server2.port()};
+    questdb::ingress::line_sender sender3{questdb::ingress::opts{
+        questdb::ingress::protocol::tcp, "127.0.0.1", server2.port()}};
     CHECK_FALSE(sender3.must_close());
 
     sender3 = std::move(sender2);
@@ -593,8 +593,8 @@ TEST_CASE("Bad hostname")
 {
     try
     {
-        questdb::ingress::line_sender sender{
-            questdb::ingress::protocol::tcp, "dummy_hostname", "9009"};
+        questdb::ingress::line_sender sender{questdb::ingress::opts{
+            questdb::ingress::protocol::tcp, "dummy_hostname", "9009"}};
         CHECK_MESSAGE(false, "Expected exception");
     }
     catch (const questdb::ingress::line_sender_error& se)
@@ -637,8 +637,8 @@ TEST_CASE("Bad port")
     const auto test_bad_port = [](std::string bad_port) {
         try
         {
-            questdb::ingress::line_sender sender{
-                questdb::ingress::protocol::tcp, "127.0.0.1", bad_port};
+            questdb::ingress::line_sender sender{questdb::ingress::opts{
+                questdb::ingress::protocol::tcp, "127.0.0.1", bad_port}};
             CHECK_MESSAGE(false, "Expected exception");
         }
         catch (const questdb::ingress::line_sender_error& se)
@@ -666,8 +666,8 @@ TEST_CASE("Bad connect")
     {
         // Port 1 is generally the tcpmux service which one would
         // very much expect to never be running.
-        questdb::ingress::line_sender sender{
-            questdb::ingress::protocol::tcp, "127.0.0.1", 1};
+        questdb::ingress::line_sender sender{questdb::ingress::opts{
+            questdb::ingress::protocol::tcp, "127.0.0.1", 1}};
         CHECK_MESSAGE(false, "Expected exception");
     }
     catch (const questdb::ingress::line_sender_error& se)
@@ -765,8 +765,8 @@ TEST_CASE("Opts copy ctor, assignment and move testing.")
 TEST_CASE("Test timestamp column.")
 {
     questdb::ingress::test::mock_server server;
-    questdb::ingress::line_sender sender{
-        questdb::ingress::protocol::tcp, "127.0.0.1", server.port()};
+    questdb::ingress::line_sender sender{questdb::ingress::opts{
+        questdb::ingress::protocol::tcp, "127.0.0.1", server.port()}};
 
     const auto now = std::chrono::system_clock::now();
     const auto now_micros =
@@ -905,8 +905,8 @@ TEST_CASE("Empty Buffer")
     CHECK(b5.size() == 9);
 
     questdb::ingress::test::mock_server server;
-    questdb::ingress::line_sender sender{
-        questdb::ingress::protocol::tcp, "127.0.0.1", server.port()};
+    questdb::ingress::line_sender sender{questdb::ingress::opts{
+        questdb::ingress::protocol::tcp, "127.0.0.1", server.port()}};
     CHECK_THROWS_WITH_AS(
         sender.flush(b1),
         "State error: Bad call to `flush`, should have called `table` instead.",
@@ -973,10 +973,10 @@ TEST_CASE("HTTP basics")
 TEST_CASE("line sender protocol version default v1 for tcp")
 {
     questdb::ingress::test::mock_server server;
-    questdb::ingress::line_sender sender{
+    questdb::ingress::line_sender sender{questdb::ingress::opts{
         questdb::ingress::protocol::tcp,
         std::string("127.0.0.1"),
-        std::to_string(server.port())};
+        std::to_string(server.port())}};
     CHECK_FALSE(sender.must_close());
     server.accept();
     CHECK(server.recv() == 0);

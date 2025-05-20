@@ -804,6 +804,19 @@ public:
         line_sender_error::wrapped_call(::line_sender_buffer_at_now, _impl);
     }
 
+    void check_can_flush() const
+    {
+        if (!_impl)
+        {
+            throw line_sender_error{
+                line_sender_error_code::invalid_api_call,
+                "State error: Bad call to `flush`, should have called `table` "
+                "instead."};
+        }
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_check_can_flush, _impl);
+    }
+
     ~line_sender_buffer() noexcept
     {
         if (_impl)
@@ -1211,16 +1224,6 @@ public:
     static inline line_sender from_env()
     {
         return {opts::from_env()};
-    }
-
-    line_sender(protocol protocol, utf8_view host, uint16_t port)
-        : line_sender{opts{protocol, host, port}}
-    {
-    }
-
-    line_sender(protocol protocol, utf8_view host, utf8_view port)
-        : line_sender{opts{protocol, host, port}}
-    {
     }
 
     line_sender(const opts& opts)

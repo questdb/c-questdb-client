@@ -312,6 +312,10 @@ typedef struct line_sender_buffer line_sender_buffer;
 /**
  * Construct a `line_sender_buffer` with a `max_name_len` of `127`, which is
  * the same as the QuestDB server default.
+ * You should prefer to use `line_sender_for_sender()` instead, which
+ * automatically creates a buffer of the same protocol version as the sender.
+ * This is useful as it can rely on the sender's ability to auto-detect the
+ * protocol version when communicating over HTTP.
  */
 LINESENDER_API
 line_sender_buffer* line_sender_buffer_new(
@@ -620,6 +624,15 @@ bool line_sender_buffer_at_micros(
 LINESENDER_API
 bool line_sender_buffer_at_now(
     line_sender_buffer* buffer, line_sender_error** err_out);
+
+/**
+ * Check whether the buffer is ready to be flushed.
+ * If this returns false, the buffer is incomplete and cannot be sent,
+ * and an error message is set to indicate the problem.
+ */
+LINESENDER_API
+bool line_sender_buffer_check_can_flush(
+    const line_sender_buffer* buffer, line_sender_error** err_out);
 
 /////////// Connecting, sending and disconnecting.
 
