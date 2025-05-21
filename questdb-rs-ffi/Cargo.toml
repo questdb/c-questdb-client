@@ -9,10 +9,19 @@ name = "questdb_client"
 crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
-questdb-rs = { path = "../questdb-rs", features = [
-    "insecure-skip-verify", "tls-native-certs", "ilp-over-http"] }
 libc = "0.2"
 questdb-confstr-ffi = { version = "0.1.1", optional = true }
+
+[dependencies.questdb-rs]
+path = "../questdb-rs"
+default-features = false
+features = [
+    "ring-crypto",
+    "insecure-skip-verify",
+    "tls-webpki-certs",
+    "tls-native-certs",
+    "ilp-over-http"
+]
 
 [features]
 # Expose the config parsing C API.
