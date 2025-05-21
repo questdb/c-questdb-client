@@ -1261,6 +1261,17 @@ pub unsafe extern "C" fn line_sender_opts_max_buf_size(
     upd_opts!(opts, err_out, max_buf_size, max_buf_size)
 }
 
+/// Ser the maximum length of a table or column name in bytes.
+/// The default is 127 bytes.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_max_name_len(
+    opts: *mut line_sender_opts,
+    max_name_len: size_t,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    upd_opts!(opts, err_out, max_name_len, max_name_len)
+}
+
 /// Set the cumulative duration spent in retries.
 /// The value is in milliseconds, and the default is 10 seconds.
 #[no_mangle]

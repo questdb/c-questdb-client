@@ -1095,6 +1095,17 @@ public:
     }
 
     /**
+     * The maximum length of a table or column name in bytes.
+     * The default is 127 bytes.
+     */
+    opts& max_name_len(size_t max_name_len)
+    {
+        line_sender_error::wrapped_call(
+            ::line_sender_opts_max_name_len, _impl, max_name_len);
+        return *this;
+    }
+
+    /**
      * Set the cumulative duration spent in retries.
      * The value is in milliseconds, and the default is 10 seconds.
      */

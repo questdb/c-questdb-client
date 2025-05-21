@@ -822,6 +822,14 @@ bool line_sender_opts_max_buf_size(
     line_sender_opts* opts, size_t max_buf_size, line_sender_error** err_out);
 
 /**
+ * Set the maximum length of a table or column name in bytes.
+ * The default is 127 bytes.
+ */
+LINESENDER_API
+bool line_sender_opts_max_name_len(
+    line_sender_opts* opts, size_t max_name_len, line_sender_error** err_out);
+
+/**
  * Set the cumulative duration spent in retries.
  * The value is in milliseconds, and the default is 10 seconds.
  */
