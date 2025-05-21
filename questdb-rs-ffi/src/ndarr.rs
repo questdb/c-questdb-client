@@ -29,6 +29,14 @@ use questdb::Error;
 use std::mem::size_of;
 use std::slice;
 
+macro_rules! fmt_error {
+    ($code:ident, $($arg:tt)*) => {
+        questdb::Error::new(
+            questdb::ErrorCode::$code,
+            format!($($arg)*))
+    }
+}
+
 /// A view into a multidimensional array with custom memory strides.
 // TODO: We are currently evaluating whether to use StrideArrayView or ndarray's view.
 //       Current benchmarks show that StrideArrayView's iter implementation underperforms(2x)
@@ -62,7 +70,7 @@ where
 
     fn dim(&self, index: usize) -> Result<usize, Error> {
         if index >= self.dims {
-            return Err(error::fmt!(
+            return Err(fmt_error!(
                 ArrayViewError,
                 "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
                 index,
@@ -141,13 +149,13 @@ where
         data_len: usize,
     ) -> Result<Self, Error> {
         if dims == 0 {
-            return Err(error::fmt!(
+            return Err(fmt_error!(
                 ArrayViewError,
                 "Zero-dimensional arrays are not supported",
             ));
         }
         if data_len > MAX_ARRAY_BUFFER_SIZE {
-            return Err(error::fmt!(
+            return Err(fmt_error!(
                 ArrayViewError,
                 "Array buffer size too big: {}, maximum: {}",
                 data_len,
@@ -159,11 +167,11 @@ where
             .iter()
             .try_fold(std::mem::size_of::<T>(), |acc, &dim| {
                 acc.checked_mul(dim)
-                    .ok_or_else(|| error::fmt!(ArrayViewError, "Array buffer size too big"))
+                    .ok_or_else(|| fmt_error!(ArrayViewError, "Array buffer size too big"))
             })?;
 
         if size != data_len {
-            return Err(error::fmt!(
+            return Err(fmt_error!(
                 ArrayViewError,
                 "Array buffer length mismatch (actual: {}, expected: {})",
                 data_len,
@@ -256,8 +264,9 @@ where
 mod tests {
     use super::*;
     use questdb::ingress::*;
+    use questdb::{Error, ErrorCode};
     use std::ptr;
-    type TestResult = Result<(), Box<dyn std::error::Error>>;
+    type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
     fn to_bytes<T: Copy>(data: &[T]) -> Vec<u8> {
         data.iter()
@@ -268,6 +277,69 @@ mod tests {
                 bytes.to_vec()
             })
             .collect()
+    }
+
+    // Duplicated from `questdb::ingress::ndarr::write_array_data` to avoid leaking it to the public API.
+    pub(crate) fn write_array_data<A: NdArrayView<T>, T>(
+        array: &A,
+        buf: &mut [u8],
+        expect_size: usize,
+    ) -> Result<(), Error>
+    where
+        T: ArrayElement,
+    {
+        // When working with contiguous layout, benchmark shows `copy_from_slice` has better performance than
+        // `std::ptr::copy_nonoverlapping` on both Arm(Macos) and x86(Linux) platform.
+        // This may because `copy_from_slice` benefits more from compiler.
+        if let Some(contiguous) = array.as_slice() {
+            let bytes = unsafe {
+                slice::from_raw_parts(contiguous.as_ptr() as *const u8, size_of_val(contiguous))
+            };
+
+            if bytes.len() != expect_size {
+                return Err(fmt_error!(
+                    ArrayWriteToBufferError,
+                    "Array write buffer length mismatch (actual: {}, expected: {})",
+                    expect_size,
+                    bytes.len()
+                ));
+            }
+
+            if buf.len() < bytes.len() {
+                return Err(fmt_error!(
+                    ArrayWriteToBufferError,
+                    "Buffer capacity {} < required {}",
+                    buf.len(),
+                    bytes.len()
+                ));
+            }
+
+            buf[..bytes.len()].copy_from_slice(bytes);
+            return Ok(());
+        }
+
+        // For non-contiguous memory layouts, direct raw pointer operations are preferred.
+        let elem_size = size_of::<T>();
+        let mut total_len = 0;
+        for (i, &element) in array.iter().enumerate() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    &element as *const T as *const u8,
+                    buf.as_mut_ptr().add(i * elem_size),
+                    elem_size,
+                )
+            }
+            total_len += elem_size;
+        }
+        if total_len != expect_size {
+            return Err(fmt_error!(
+                ArrayWriteToBufferError,
+                "Array write buffer length mismatch (actual: {}, expected: {})",
+                total_len,
+                expect_size
+            ));
+        }
+        Ok(())
     }
 
     #[test]
@@ -293,10 +365,8 @@ mod tests {
         assert_eq!(
             &data[19..24],
             &[
-                b'=',
-                b'=',
-                ARRAY_BINARY_FORMAT_TYPE,
-                ArrayColumnTypeTag::Double.into(),
+                b'=', b'=', 14u8, // ARRAY_BINARY_FORMAT_TYPE
+                10u8, // ArrayColumnTypeTag::Double.into()
                 2u8
             ]
         );
@@ -394,6 +464,7 @@ mod tests {
         assert_eq!(array_view.dim(1), Ok(2));
         assert!(array_view.dim(2).is_err());
         assert!(array_view.as_slice().is_none());
+
         let mut buffer = vec![0u8; 48];
         write_array_data(&array_view, &mut buffer, 48)?;
 

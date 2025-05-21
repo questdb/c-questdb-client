@@ -51,6 +51,7 @@ def main():
             '--', '--nocapture', cwd='questdb-rs')
     run_cmd('cargo', 'test', '--features=almost-all-features',
             '--', '--nocapture', cwd='questdb-rs')
+    run_cmd('cargo', 'test', cwd='questdb-rs-ffi')
     run_cmd(str(test_line_sender_path))
     run_cmd(str(test_line_sender_path_CXX20))
     #run_cmd('python3', str(system_test_path), 'run', '--versions', qdb_v, '-v')

@@ -67,8 +67,8 @@ pub const MAX_ARRAY_DIMS: usize = 32;
 //       we've ever tested anything that big.
 //       My gut feeling is that the maximum array buffer should be
 //       in the order of 100MB or so.
-const MAX_ARRAY_BUFFER_SIZE: usize = i32::MAX as usize;
-pub(crate) const MAX_ARRAY_DIM_LEN: usize = 0x0FFF_FFFF; // 1 << 28 - 1
+pub const MAX_ARRAY_BUFFER_SIZE: usize = i32::MAX as usize;
+pub const MAX_ARRAY_DIM_LEN: usize = 0x0FFF_FFFF; // 1 << 28 - 1
 
 /// The version of Ingestion Line Protocol used to communicate with the server.
 #[derive(Debug, Copy, Clone, PartialEq)]

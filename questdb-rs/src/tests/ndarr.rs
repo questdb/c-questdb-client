@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-#[cfg(feature = "ndarray")]
+use crate::ingress::ndarr::write_array_data;
 use crate::ingress::MAX_ARRAY_DIMS;
 use crate::ingress::{Buffer, NdArrayView, ProtocolVersion, ARRAY_BINARY_FORMAT_TYPE};
 use crate::tests::TestResult;
