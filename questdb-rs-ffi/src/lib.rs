@@ -305,9 +305,6 @@ impl From<line_sender_ca> for CertificateAuthority {
     }
 }
 
-#[no_mangle]
-pub static MAX_ARRAY_DIMS: usize = ingress::MAX_ARRAY_DIMS;
-
 /** Error code categorizing the error. */
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_error_get_code(
