@@ -29,7 +29,7 @@ static bool example(const char* host, const char* port)
     conf_str = NULL;
 
     buffer = line_sender_buffer_new_for_sender(sender);
-    line_sender_buffer_reserve(buffer, 64 * 1024); // 64KB 初始缓冲
+    line_sender_buffer_reserve(buffer, 64 * 1024);
 
     line_sender_table_name table_name = QDB_TABLE_NAME_LITERAL("market_orders");
     line_sender_column_name symbol_col = QDB_COLUMN_NAME_LITERAL("symbol");
