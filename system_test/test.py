@@ -776,13 +776,19 @@ class TestSender(unittest.TestCase):
 
     def test_cpp_array_example(self):
         self._test_array_example(
-            'line_sender_cpp_example_array',
-            'cpp_market_orders')
+            'line_sender_cpp_example_array_byte_strides',
+            'cpp_market_orders_byte_strides', )
+        self._test_array_example(
+            'line_sender_cpp_example_array_elem_strides',
+            'cpp_market_orders_elem_strides', )
 
     def test_c_array_example(self):
         self._test_array_example(
-            'line_sender_c_example_array',
-            'market_orders')
+            'line_sender_c_example_array_byte_strides',
+            'market_orders_byte_strides', )
+        self._test_array_example(
+            'line_sender_c_example_array_elem_strides',
+            'market_orders_elem_strides', )
 
     def _test_array_example(self, bin_name, table_name):
         if self.expected_protocol_version < qls.ProtocolVersion.V2:
@@ -1200,7 +1206,7 @@ def run_with_fixtures(args):
                         sys.exit(1)
                 finally:
                     if TLS_PROXY_FIXTURE:
-                        TLS_PROXY_FIXTURE.stop()    
+                        TLS_PROXY_FIXTURE.stop()
         finally:
             QDB_FIXTURE.stop()
 
