@@ -314,9 +314,16 @@ impl MockServer {
         if supported_versions.is_empty() {
             self.settings_response = serde_json::json!({"version": "8.1.2"});
         } else {
-            self.settings_response = serde_json::json!({
-                "line.proto.support.versions": supported_versions
-            });
+            self.settings_response = serde_json::json!(
+                {"config":{"release.type":"OSS","release.version":"[DEVELOPMENT]",
+                    "line.proto.support.versions":supported_versions,
+                    "ilp.proto.transports":["tcp", "http"],
+                    "posthog.enabled":false,
+                    "posthog.api.key":null,
+                    "cairo.max.file.name.length":127},
+                    "preferences.version":0,
+                    "preferences":{}}
+            );
         }
         self
     }

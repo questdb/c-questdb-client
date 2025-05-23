@@ -507,7 +507,7 @@ pub(super) fn read_server_settings(
         })?;
 
         let mut support_versions: Vec<ProtocolVersion> = vec![];
-        if let Some(serde_json::Value::Array(ref values)) = json.get("line.proto.support.versions")
+        if let Some(serde_json::Value::Array(ref values)) = json.get("config").and_then(|v| v.get("line.proto.support.versions"))
         {
             for value in values.iter() {
                 if let Some(v) = value.as_u64() {
@@ -523,7 +523,8 @@ pub(super) fn read_server_settings(
         }
 
         let max_name_length = json
-            .get("cairo.max.file.name.length")
+            .get("config")
+            .and_then(|v| v.get("cairo.max.file.name.length"))
             .and_then(|v| v.as_u64())
             .unwrap_or(MAX_NAME_LEN_DEFAULT as u64) as usize;
         Ok((support_versions, max_name_length))
