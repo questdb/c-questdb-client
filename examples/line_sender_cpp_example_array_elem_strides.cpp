@@ -18,7 +18,7 @@ static bool array_example(std::string_view host, std::string_view port)
         const auto book_col = "order_book"_cn;
         size_t rank = 3;
         std::vector<uintptr_t> shape{2, 3, 2};
-        std::vector<intptr_t> strides{6, 2, 8};
+        std::vector<intptr_t> strides{6, 2, 1};
         std::array<double, 12> arr_data = {
             48123.5,
             2.4,
