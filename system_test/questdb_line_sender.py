@@ -290,7 +290,7 @@ def _setup_cdll():
         c_line_sender_utf8,
         c_line_sender_error_p_p)
     set_sig(
-        dll.line_sender_buffer_column_f64_arr,
+        dll.line_sender_buffer_column_f64_arr_byte_strides,
         c_bool,
         c_line_sender_buffer_p,
         c_line_sender_column_name,
@@ -730,7 +730,7 @@ class Buffer:
         c_shape = _convert_tuple(shape, c_size_t, "shape")
         c_strides = _convert_tuple(strides, c_ssize_t, "strides")
         _error_wrapped_call(
-            _DLL.line_sender_buffer_column_f64_arr,
+            _DLL.line_sender_buffer_column_f64_arr_byte_strides,
             self._impl,
             _column_name(name),
             c_size_t(rank),
@@ -850,7 +850,7 @@ class Sender:
         self._check_connected()
         return ProtocolVersion.from_int(
             _DLL.line_sender_get_protocol_version(self._impl))
-    
+
     @property
     def max_name_len(self):
         self._check_connected()
