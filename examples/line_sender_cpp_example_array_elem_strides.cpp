@@ -13,12 +13,12 @@ static bool array_example(std::string_view host, std::string_view port)
             "tcp::addr=" + std::string{host} + ":" + std::string{port} +
             ";protocol_version=2;");
 
-        const auto table_name = "cpp_market_orders"_tn;
+        const auto table_name = "cpp_market_orders_elem_strides"_tn;
         const auto symbol_col = "symbol"_cn;
         const auto book_col = "order_book"_cn;
         size_t rank = 3;
         std::vector<uintptr_t> shape{2, 3, 2};
-        std::vector<intptr_t> strides{48, 16, 8};
+        std::vector<intptr_t> strides{6, 2, 8};
         std::array<double, 12> arr_data = {
             48123.5,
             2.4,
@@ -36,7 +36,7 @@ static bool array_example(std::string_view host, std::string_view port)
         questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
         buffer.table(table_name)
             .symbol(symbol_col, "BTC-USD"_utf8)
-            .column(book_col, 3, shape, strides, arr_data)
+            .column<false>(book_col, 3, shape, strides, arr_data)
             .at(questdb::ingress::timestamp_nanos::now());
         sender.flush(buffer);
         return true;

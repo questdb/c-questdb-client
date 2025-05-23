@@ -178,23 +178,38 @@ TEST_CASE("line_sender c api basics")
         2.7,
         48121.5,
         4.3};
-    CHECK(::line_sender_buffer_column_f64_arr(
-        buffer,
-        arr_name,
-        rank,
-        shape,
-        strides,
-        reinterpret_cast<uint8_t*>(arr_data.data()),
-        sizeof(arr_data),
-        &err));
+    CHECK(
+        ::line_sender_buffer_column_f64_arr_byte_strides(
+            buffer,
+            arr_name,
+            rank,
+            shape,
+            strides,
+            reinterpret_cast<uint8_t*>(arr_data.data()),
+            sizeof(arr_data),
+            &err));
+
+    line_sender_column_name arr_name2 = QDB_COLUMN_NAME_LITERAL("a2");
+    intptr_t elem_strides[] = {6, 2, 1};
+    CHECK(
+        ::line_sender_buffer_column_f64_arr_elem_strides(
+            buffer,
+            arr_name2,
+            rank,
+            shape,
+            elem_strides,
+            reinterpret_cast<uint8_t*>(arr_data.data()),
+            sizeof(arr_data),
+            &err));
     CHECK(::line_sender_buffer_at_nanos(buffer, 10000000, &err));
     CHECK(server.recv() == 0);
-    CHECK(::line_sender_buffer_size(buffer) == 150);
+    CHECK(::line_sender_buffer_size(buffer) == 266);
     CHECK(::line_sender_flush(sender, buffer, &err));
     ::line_sender_buffer_free(buffer);
     CHECK(server.recv() == 1);
     std::string expect{"test,t1=v1 f1=="};
     push_double_to_buffer(expect, 0.5).append(",a1==");
+    push_double_arr_to_buffer(expect, arr_data, 3, shape).append(",a2==");
     push_double_arr_to_buffer(expect, arr_data, 3, shape).append(" 10000000\n");
     CHECK(server.msgs(0) == expect);
 }
@@ -264,19 +279,23 @@ TEST_CASE("line_sender c++ api basics")
         2.7,
         48121.5,
         4.3};
+    std::vector<intptr_t> elem_strides{6, 2, 1};
     buffer.table("test")
         .symbol("t1", "v1")
         .symbol("t2", "")
         .column("f1", 0.5)
-        .column("a1", rank, shape, strides, arr_data)
+        .column<true>("a1", rank, shape, strides, arr_data)
+        .column<false>("a2", rank, shape, elem_strides, arr_data)
         .at(questdb::ingress::timestamp_nanos{10000000});
 
     CHECK(server.recv() == 0);
-    CHECK(buffer.size() == 154);
+    CHECK(buffer.size() == 270);
     sender.flush(buffer);
     CHECK(server.recv() == 1);
     std::string expect{"test,t1=v1,t2= f1=="};
     push_double_to_buffer(expect, 0.5).append(",a1==");
+    push_double_arr_to_buffer(expect, arr_data, 3, shape.data())
+        .append(",a2==");
     push_double_arr_to_buffer(expect, arr_data, 3, shape.data())
         .append(" 10000000\n");
     CHECK(server.msgs(0) == expect);

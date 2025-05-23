@@ -499,7 +499,9 @@ bool line_sender_buffer_column_str(
 
 /**
  * Record a multidimensional array of double for the given column.
- * The array data must be stored in row-major order (C-style contiguous layout).
+ *
+ * This API uses BYTE-LEVEL STRIDES where the stride values represent the
+ * number of bytes between consecutive elements along each dimension.
  *
  * @param[in] buffer Line buffer object.
  * @param[in] name Column name.
@@ -513,7 +515,35 @@ bool line_sender_buffer_column_str(
  * @return true on success, false on error.
  */
 LINESENDER_API
-bool line_sender_buffer_column_f64_arr(
+bool line_sender_buffer_column_f64_arr_byte_strides(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    size_t rank,
+    const uintptr_t* shape,
+    const intptr_t* strides,
+    const uint8_t* data_buffer,
+    size_t data_buffer_len,
+    line_sender_error** err_out);
+
+/**
+ * Record a multidimensional array of double for the given column.
+ *
+ * This function uses ELEMENT-LEVEL STRIDES where the stride values represent
+ * the number of elements between consecutive elements along each dimension.
+ *
+ * @param[in] buffer Line buffer object.
+ * @param[in] name Column name.
+ * @param[in] rank Number of dimensions of the array.
+ * @param[in] shape Array of dimension sizes (length = `rank`).
+ *                   Each element must be a positive integer.
+ * @param[in] strides Array strides.
+ * @param[in] data_buffer First array element data.
+ * @param[in] data_buffer_len Bytes length of the array data.
+ * @param[out] err_out Set to an error object on failure (if non-NULL).
+ * @return true on success, false on error.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_f64_arr_elem_strides(
     line_sender_buffer* buffer,
     line_sender_column_name name,
     size_t rank,

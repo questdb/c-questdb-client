@@ -643,12 +643,18 @@ public:
     /**
      * Record a multidimensional double-precision array for the given column.
      *
+     * @tparam B    Strides mode selector:
+     *              - `true` for byte-level strides
+     *              - `false` for element-level strides
+     * @tparam T    Element type (current only `double` is supported).
+     * @tparam N    Number of elements in the flat data array
+     *
      * @param name    Column name.
      * @param shape   Array dimensions (e.g., [2,3] for a 2x3 matrix).
      * @param data    Array first element data. Size must match product of
      * dimensions.
      */
-    template <typename T, size_t N>
+    template <bool B, typename T, size_t N>
     line_sender_buffer& column(
         column_name_view name,
         const size_t rank,
@@ -661,7 +667,8 @@ public:
             "Only double types are supported for arrays");
         may_init();
         line_sender_error::wrapped_call(
-            ::line_sender_buffer_column_f64_arr,
+            B ? ::line_sender_buffer_column_f64_arr_byte_strides
+              : ::line_sender_buffer_column_f64_arr_elem_strides,
             _impl,
             name._impl,
             rank,

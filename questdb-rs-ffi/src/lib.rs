@@ -867,12 +867,15 @@ pub unsafe extern "C" fn line_sender_buffer_column_str(
     true
 }
 
-/// Record a float multidimensional array value for the given column.
+/// Records a float64 multidimensional array with **byte-level strides specification**.
+///
+/// The `strides` represent byte offsets between elements along each dimension.
+///
 /// @param[in] buffer Line buffer object.
 /// @param[in] name Column name.
 /// @param[in] rank Array dims.
 /// @param[in] shape Array shape.
-/// @param[in] strides Array strides.
+/// @param[in] strides Array strides, represent byte offsets between elements along each dimension.
 /// @param[in] data_buffer Array **first element** data memory ptr.
 /// @param[in] data_buffer_len Array data memory length.
 /// @param[out] err_out Set on error.
@@ -881,7 +884,7 @@ pub unsafe extern "C" fn line_sender_buffer_column_str(
 /// - shape must point to an array of `rank` integers
 /// - data_buffer must point to a buffer of size `data_buffer_len` bytes
 #[no_mangle]
-pub unsafe extern "C" fn line_sender_buffer_column_f64_arr(
+pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_byte_strides(
     buffer: *mut line_sender_buffer,
     name: line_sender_column_name,
     rank: size_t,
@@ -893,8 +896,59 @@ pub unsafe extern "C" fn line_sender_buffer_column_f64_arr(
 ) -> bool {
     let buffer = unwrap_buffer_mut(buffer);
     let name = name.as_name();
-    let view = match StrideArrayView::<f64>::new(rank, shape, strides, data_buffer, data_buffer_len)
-    {
+    let view =
+        match StrideArrayView::<f64, 1>::new(rank, shape, strides, data_buffer, data_buffer_len) {
+            Ok(value) => value,
+            Err(err) => {
+                let err_ptr = Box::into_raw(Box::new(line_sender_error(err)));
+                *err_out = err_ptr;
+                return false;
+            }
+        };
+    bubble_err_to_c!(
+        err_out,
+        buffer.column_arr::<ColumnName<'_>, StrideArrayView<'_, f64, 1>, f64>(name, &view)
+    );
+    true
+}
+
+/// Records a float64 multidimensional array with **element count stride specification**.
+///
+/// The `strides` represent element counts between elements along each dimension.
+///
+/// converted to byte strides using f64 size
+/// @param[in] buffer Line buffer object.
+/// @param[in] name Column name.
+/// @param[in] rank Array dims.
+/// @param[in] shape Array shape.
+/// @param[in] strides Array strides, represent element counts between elements along each dimension.
+/// @param[in] data_buffer Array **first element** data memory ptr.
+/// @param[in] data_buffer_len Array data memory length.
+/// @param[out] err_out Set on error.
+/// # Safety
+/// - All pointer parameters must be valid and non-null
+/// - shape must point to an array of `rank` integers
+/// - data_buffer must point to a buffer of size `data_buffer_len` bytes
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_elem_strides(
+    buffer: *mut line_sender_buffer,
+    name: line_sender_column_name,
+    rank: size_t,
+    shape: *const usize,
+    strides: *const isize,
+    data_buffer: *const u8,
+    data_buffer_len: size_t,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    let buffer = unwrap_buffer_mut(buffer);
+    let name = name.as_name();
+    let view = match StrideArrayView::<f64, { std::mem::size_of::<f64>() as isize }>::new(
+        rank,
+        shape,
+        strides,
+        data_buffer,
+        data_buffer_len,
+    ) {
         Ok(value) => value,
         Err(err) => {
             let err_ptr = Box::into_raw(Box::new(line_sender_error(err)));
@@ -903,9 +957,9 @@ pub unsafe extern "C" fn line_sender_buffer_column_f64_arr(
         }
     };
     bubble_err_to_c!(
-        err_out,
-        buffer.column_arr::<ColumnName<'_>, StrideArrayView<'_, f64>, f64>(name, &view)
-    );
+            err_out,
+            buffer.column_arr::<ColumnName<'_>, StrideArrayView<'_, f64,  { std::mem::size_of::<f64>() as isize }>, f64>(name, &view)
+        );
     true
 }
 
