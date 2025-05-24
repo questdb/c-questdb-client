@@ -1,4 +1,30 @@
+/*******************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2025 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
 use super::conf::ConfigSetting;
+use super::MAX_NAME_LEN_DEFAULT;
+use crate::error::fmt;
 use crate::{error, Error};
 use base64ct::Base64;
 use base64ct::Encoding;
@@ -16,8 +42,8 @@ use ureq::unversioned::transport::{
     Buffers, Connector, LazyBuffers, NextTimeout, Transport, TransportAdapter,
 };
 
+use crate::ingress::ProtocolVersion;
 use ureq::unversioned::*;
-use ureq::Error::*;
 use ureq::{http, Body};
 
 #[derive(PartialEq, Debug, Clone)]
@@ -104,6 +130,24 @@ impl HttpHandlerState {
             None => request,
         };
         let response = request.send(buf);
+        match &response {
+            Ok(res) => (need_retry(Ok(res.status())), response),
+            Err(err) => (need_retry(Err(err)), response),
+        }
+    }
+
+    pub(crate) fn get_request(
+        &self,
+        url: &str,
+        request_timeout: Duration,
+    ) -> (bool, Result<Response<Body>, ureq::Error>) {
+        let request = self
+            .agent
+            .get(url)
+            .config()
+            .timeout_per_call(Some(request_timeout))
+            .build();
+        let response = request.call();
         match &response {
             Ok(res) => (need_retry(Ok(res.status())), response),
             Err(err) => (need_retry(Err(err)), response),
@@ -236,7 +280,10 @@ fn need_retry(res: Result<http::status::StatusCode, &ureq::Error>) -> bool {
                     599 // Network Connect Timeout Error
                 )
         }
-        Err(err) => matches!(err, Timeout(_) | ConnectionFailed | TooManyRedirects),
+        Err(err) => matches!(
+            err,
+            ureq::Error::Timeout(_) | ureq::Error::ConnectionFailed | ureq::Error::TooManyRedirects
+        ),
     }
 }
 
@@ -382,4 +429,159 @@ pub(super) fn http_send_with_retries(
     }
 
     retry_http_send(state, buf, request_timeout, retry_timeout, last_rep)
+}
+
+/// Read the server settings from the `/settings` endpoint.
+/// This function returns:
+///   - A list of supported protocol versions: Default is V1.
+///   - The server's max name length: Default is 127.
+///
+/// If the server does not support the `/settings` endpoint (404), it returns
+/// default values.
+pub(super) fn read_server_settings(
+    state: &HttpHandlerState,
+    settings_url: &str,
+) -> Result<(Vec<ProtocolVersion>, usize), Error> {
+    let default_protocol_version = ProtocolVersion::V1;
+
+    let response = match http_get_with_retries(
+        state,
+        settings_url,
+        *state.config.request_timeout,
+        Duration::from_secs(1),
+    ) {
+        Ok(res) => {
+            if res.status().is_client_error() || res.status().is_server_error() {
+                let status = res.status();
+                _ = res.into_body().read_to_vec();
+                if status.as_u16() == 404 {
+                    return Ok((vec![default_protocol_version], MAX_NAME_LEN_DEFAULT));
+                }
+                return Err(fmt!(
+                    ProtocolVersionError,
+                    "Could not detect server's line protocol version, settings url: {}, status code: {}.",
+                    settings_url,
+                    status
+                ));
+            } else {
+                res
+            }
+        }
+        Err(err) => {
+            let e = match err {
+                ureq::Error::StatusCode(code) => {
+                    if code == 404 {
+                        return Ok((vec![default_protocol_version], MAX_NAME_LEN_DEFAULT));
+                    } else {
+                        fmt!(
+                            ProtocolVersionError,
+                            "Could not detect server's line protocol version, settings url: {}, err: {}.",
+                            settings_url,
+                            err
+                        )
+                    }
+                }
+                e => {
+                    fmt!(
+                        ProtocolVersionError,
+                        "Could not detect server's line protocol version, settings url: {}, err: {}.",
+                        settings_url,
+                        e
+                    )
+                }
+            };
+            return Err(e);
+        }
+    };
+
+    let (_, body) = response.into_parts();
+    let body_content = body.into_with_config().read_to_string();
+
+    if let Ok(msg) = body_content {
+        let json: serde_json::Value = serde_json::from_str(&msg).map_err(|_| {
+            error::fmt!(
+                ProtocolVersionError,
+                "Malformed server response, settings url: {}, err: response is not valid JSON.",
+                settings_url,
+            )
+        })?;
+
+        let mut support_versions: Vec<ProtocolVersion> = vec![];
+        if let Some(serde_json::Value::Array(ref values)) = json
+            .get("config")
+            .and_then(|v| v.get("line.proto.support.versions"))
+        {
+            for value in values.iter() {
+                if let Some(v) = value.as_u64() {
+                    match v {
+                        1 => support_versions.push(ProtocolVersion::V1),
+                        2 => support_versions.push(ProtocolVersion::V2),
+                        _ => {}
+                    }
+                }
+            }
+        } else {
+            support_versions.push(default_protocol_version);
+        }
+
+        let max_name_length = json
+            .get("config")
+            .and_then(|v| v.get("cairo.max.file.name.length"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(MAX_NAME_LEN_DEFAULT as u64) as usize;
+        Ok((support_versions, max_name_length))
+    } else {
+        Err(error::fmt!(
+            ProtocolVersionError,
+            "Malformed server response, settings url: {}, err: failed to read response body as UTF-8", settings_url
+        ))
+    }
+}
+
+#[allow(clippy::result_large_err)] // `ureq::Error` is large enough to cause this warning.
+fn retry_http_get(
+    state: &HttpHandlerState,
+    url: &str,
+    request_timeout: Duration,
+    retry_timeout: Duration,
+    mut last_rep: Result<Response<Body>, ureq::Error>,
+) -> Result<Response<Body>, ureq::Error> {
+    let mut rng = rand::rng();
+    let retry_end = std::time::Instant::now() + retry_timeout;
+    let mut retry_interval_ms = 10;
+    let mut need_retry;
+    loop {
+        let jitter_ms = rng.random_range(-5i32..5);
+        let to_sleep_ms = retry_interval_ms + jitter_ms;
+        let to_sleep = Duration::from_millis(to_sleep_ms as u64);
+        if (std::time::Instant::now() + to_sleep) > retry_end {
+            return last_rep;
+        }
+        sleep(to_sleep);
+        if let Ok(last_rep) = last_rep {
+            // Actively consume the reader to return the connection to the connection pool.
+            // see https://github.com/algesten/ureq/issues/94
+            _ = last_rep.into_body().read_to_vec();
+        }
+        (need_retry, last_rep) = state.get_request(url, request_timeout);
+        if !need_retry {
+            return last_rep;
+        }
+        retry_interval_ms = (retry_interval_ms * 2).min(1000);
+    }
+}
+
+#[allow(clippy::result_large_err)] // `ureq::Error` is large enough to cause this warning.
+fn http_get_with_retries(
+    state: &HttpHandlerState,
+    url: &str,
+    request_timeout: Duration,
+    retry_timeout: Duration,
+) -> Result<Response<Body>, ureq::Error> {
+    let (need_retry, last_rep) = state.get_request(url, request_timeout);
+    if !need_retry || retry_timeout.is_zero() {
+        return last_rep;
+    }
+
+    retry_http_get(state, url, request_timeout, retry_timeout, last_rep)
 }

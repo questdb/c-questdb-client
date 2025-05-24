@@ -23,12 +23,12 @@
 ################################################################################
 
 import sys
+
 sys.dont_write_bytecode = True
 
 import os
 import re
 import pathlib
-import textwrap
 import json
 import tarfile
 import shutil
@@ -42,10 +42,8 @@ import urllib.parse
 import urllib.error
 from pprint import pformat
 
-
 AUTH_TXT = """admin ec-p-256-sha256 fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac
 # [key/user id] [key type] {keyX keyY}"""
-
 
 # Valid keys as registered with the QuestDB fixture.
 AUTH = dict(
@@ -54,18 +52,17 @@ AUTH = dict(
     token_x="fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU",
     token_y="Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac")
 
-
 CA_PATH = (pathlib.Path(__file__).parent.parent /
-    'tls_certs' / 'server_rootCA.pem')
+           'tls_certs' / 'server_rootCA.pem')
 
 
 def retry(
-    predicate_task,
-    timeout_sec=30,
-    every=0.05,
-    msg='Timed out retrying',
-    backoff_till=5.0,
-    lead_sleep=0.001):
+        predicate_task,
+        timeout_sec=30,
+        every=0.05,
+        msg='Timed out retrying',
+        backoff_till=5.0,
+        lead_sleep=0.001):
     """
     Repeat task every `interval` until it returns a truthy value or times out.
     """
@@ -121,8 +118,8 @@ class Project:
 
 def list_questdb_releases(max_results=1):
     url = (
-        'https://api.github.com/repos/questdb/questdb/releases?' +
-        urllib.parse.urlencode({'per_page': max_results}))
+            'https://api.github.com/repos/questdb/questdb/releases?' +
+            urllib.parse.urlencode({'per_page': max_results}))
     req = urllib.request.Request(
         url,
         headers={
@@ -233,7 +230,7 @@ class QueryError(Exception):
 
 
 class QuestDbFixture:
-    def __init__(self, root_dir: pathlib.Path, auth=False, wrap_tls=False, http=False):
+    def __init__(self, root_dir: pathlib.Path, auth=False, wrap_tls=False, http=False, protocol_version=None):
         self._root_dir = root_dir
         self.version = _parse_version(self._root_dir.name)
         self._data_dir = self._root_dir / 'data'
@@ -243,7 +240,7 @@ class QuestDbFixture:
         self._conf_path = self._conf_dir / 'server.conf'
         self._log = None
         self._proc = None
-        self.host = 'localhost'
+        self.host = '127.0.0.1'
         self.http_server_port = None
         self.line_tcp_port = None
         self.pg_port = None
@@ -258,6 +255,7 @@ class QuestDbFixture:
             with open(auth_txt_path, 'w', encoding='utf-8') as auth_file:
                 auth_file.write(AUTH_TXT)
         self.http = http
+        self.protocol_version = protocol_version
 
     def print_log(self):
         with open(self._log_path, 'r', encoding='utf-8') as log_file:
@@ -314,7 +312,7 @@ class QuestDbFixture:
                 if self._proc.poll() is not None:
                     raise RuntimeError('QuestDB died during startup.')
                 req = urllib.request.Request(
-                    f'http://localhost:{self.http_server_port}/ping',
+                    f'http://127.0.0.1:{self.http_server_port}/ping',
                     method='GET')
                 try:
                     resp = urllib.request.urlopen(req, timeout=1)
@@ -351,8 +349,8 @@ class QuestDbFixture:
 
     def http_sql_query(self, sql_query):
         url = (
-            f'http://{self.host}:{self.http_server_port}/exec?' +
-            urllib.parse.urlencode({'query': sql_query}))
+                f'http://{self.host}:{self.http_server_port}/exec?' +
+                urllib.parse.urlencode({'query': sql_query}))
         buf = None
         try:
             resp = urllib.request.urlopen(url, timeout=5)
@@ -370,7 +368,7 @@ class QuestDbFixture:
         if 'error' in data:
             raise QueryError(data['error'])
         return data
-    
+
     def query_version(self):
         try:
             res = self.http_sql_query('select build')
@@ -397,6 +395,7 @@ class QuestDbFixture:
             log_ctx=None):
         sql_query = f"select * from '{table_name}'"
         http_response_log = []
+
         def check_table():
             try:
                 resp = self.http_sql_query(sql_query)
@@ -414,7 +413,8 @@ class QuestDbFixture:
         except TimeoutError as toe:
             if log:
                 if log_ctx:
-                    log_ctx = f'\n{textwrap.indent(log_ctx, "    ")}\n'
+                    log_ctx_str = log_ctx.decode('utf-8', errors='replace')
+                    log_ctx = f'\n{textwrap.indent(log_ctx_str, "    ")}\n'
                 sys.stderr.write(
                     f'Timed out after {timeout_sec} seconds ' +
                     f'waiting for query {sql_query!r}. ' +
@@ -424,6 +424,26 @@ class QuestDbFixture:
                     f'\nQuestDB log:\n')
                 self.print_log()
             raise toe
+        
+    def show_tables(self):
+        """Return a list of tables in the database."""
+        sql_query = "show tables"
+        try:
+            resp = self.http_sql_query(sql_query)
+            return [row[0] for row in resp['dataset']]
+        except QueryError as qe:
+            raise qe
+        
+    def drop_table(self, table_name):
+        self.http_sql_query(f"drop table '{table_name}'")
+
+    def drop_all_tables(self):
+        """Drop all tables in the database."""
+        all_tables = self.show_tables()
+        # if all_tables:
+        #     print(f'Dropping {len(all_tables)} tables: {all_tables!r}')
+        for table_name in all_tables:
+            self.drop_table(table_name)
 
     def __enter__(self):
         self.start()
@@ -493,7 +513,7 @@ class TlsProxyFixture:
         self.listen_port = retry(
             check_started,
             timeout_sec=180,  # Longer to include time to compile.
-            msg='Timed out waiting for `tls_proxy` to start.',)
+            msg='Timed out waiting for `tls_proxy` to start.', )
 
         def connect_to_listening_port():
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -518,4 +538,3 @@ class TlsProxyFixture:
         if self._log_file:
             self._log_file.close()
             self._log_file = None
-

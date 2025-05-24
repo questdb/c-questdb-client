@@ -1,11 +1,11 @@
 use questdb::{
-    ingress::{Buffer, Sender, TimestampNanos},
+    ingress::{Sender, TimestampNanos},
     Result,
 };
 
 fn main() -> Result<()> {
     let mut sender = Sender::from_conf("tcp::addr=localhost:9009;")?;
-    let mut buffer = Buffer::new();
+    let mut buffer = sender.new_buffer();
     buffer
         .table("trades")?
         .symbol("symbol", "ETH-USD")?

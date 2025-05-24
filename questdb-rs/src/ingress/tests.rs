@@ -1,3 +1,27 @@
+/*******************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2025 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
 use super::*;
 use crate::ErrorCode;
 use tempfile::TempDir;
@@ -5,9 +29,9 @@ use tempfile::TempDir;
 #[cfg(feature = "ilp-over-http")]
 #[test]
 fn http_simple() {
-    let builder = SenderBuilder::from_conf("http::addr=localhost;").unwrap();
+    let builder = SenderBuilder::from_conf("http::addr=127.0.0.1;").unwrap();
     assert_eq!(builder.protocol, Protocol::Http);
-    assert_specified_eq(&builder.host, "localhost");
+    assert_specified_eq(&builder.host, "127.0.0.1");
     assert_specified_eq(&builder.port, Protocol::Http.default_port());
     assert!(!builder.protocol.tls_enabled());
 }
@@ -30,10 +54,10 @@ fn https_simple() {
 
 #[test]
 fn tcp_simple() {
-    let builder = SenderBuilder::from_conf("tcp::addr=localhost;").unwrap();
+    let builder = SenderBuilder::from_conf("tcp::addr=127.0.0.1;").unwrap();
     assert_eq!(builder.protocol, Protocol::Tcp);
     assert_specified_eq(&builder.port, Protocol::Tcp.default_port());
-    assert_specified_eq(&builder.host, "localhost");
+    assert_specified_eq(&builder.host, "127.0.0.1");
     assert!(!builder.protocol.tls_enabled());
 }
 
@@ -447,12 +471,14 @@ fn connect_timeout_uses_request_timeout() {
     let builder = SenderBuilder::new(Protocol::Http, "127.0.0.2", "1111")
         .request_timeout(request_timeout)
         .unwrap()
+        .protocol_version(ProtocolVersion::V2)
+        .unwrap()
         .retry_timeout(Duration::from_millis(10))
         .unwrap()
         .request_min_throughput(0)
         .unwrap();
     let mut sender = builder.build().unwrap();
-    let mut buf = Buffer::new();
+    let mut buf = sender.new_buffer();
     buf.table("x")
         .unwrap()
         .symbol("x", "x")
