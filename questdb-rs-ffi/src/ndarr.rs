@@ -717,7 +717,7 @@ mod tests {
     }
 
     #[test]
-    fn test_stride_array_view_strides_with_elem_size() -> TestResult {
+    fn test_stride_array_view_strides_with_elem_strides() -> TestResult {
         // contiguous layout
         let test_data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         let shape = [2usize, 3];

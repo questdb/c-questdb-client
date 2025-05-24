@@ -507,7 +507,9 @@ pub(super) fn read_server_settings(
         })?;
 
         let mut support_versions: Vec<ProtocolVersion> = vec![];
-        if let Some(serde_json::Value::Array(ref values)) = json.get("config").and_then(|v| v.get("line.proto.support.versions"))
+        if let Some(serde_json::Value::Array(ref values)) = json
+            .get("config")
+            .and_then(|v| v.get("line.proto.support.versions"))
         {
             for value in values.iter() {
                 if let Some(v) = value.as_u64() {
