@@ -9,9 +9,20 @@ Ingestion Line Protocol (ILP) over either HTTP (recommended) or TCP.
 * [QuestDB Database docs](https://questdb.io/docs/)
 * [Docs on Ingestion Line Protocol](https://questdb.io/docs/reference/api/ilp/overview/)
 
-When connecting to QuestDB over HTTP, the library will auto-detect the server's
-latest supported version and use it. Version 1 is compatible with
-the [InfluxDB Line Protocol](https://docs.influxdata.com/influxdb/v2/reference/syntax/line-protocol/).
+## Protocol Versions
+
+The library supports the following ILP protocol versions.
+
+These protocol versions are supported over both HTTP and TCP.
+
+If you use HTTP, the library will automatically detect the server's
+latest supported protocol version and use it. If you use TCP, you can specify the
+`protocol_version=N` parameter when constructing the `Sender` object.
+
+| Version | Description                                             | Server Comatibility   |
+| ------- | ------------------------------------------------------- | --------------------- |
+| **1**   | Over HTTP it's compatible InfluxDB Line Protocol (ILP)  | All QuestDB versions  |
+| **2**   | 64-bit floats sent as binary, adds n-dimentional arrays | 8.4.0+ (2023-10-30)   |
 
 ## Quick Start
 
@@ -78,6 +89,9 @@ These features are opt-in:
   certificates store.
 * `insecure-skip-verify`: Allows skipping server certificate validation in TLS
   (this compromises security).
+* `ndarray`: Enables integration with the `ndarray` crate for working with
+  n-dimensional arrays. Without this feature, you can still send slices,
+  or integrate custom array types via the `NdArrayView` trait.
 
 ## C, C++ and Python APIs
 

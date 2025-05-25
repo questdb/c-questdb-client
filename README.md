@@ -42,6 +42,21 @@ For an overview and code examples, see the
 To understand the protocol in more depth, consult the
 [protocol reference docs](https://questdb.io/docs/reference/api/ilp/overview/).
 
+## Protocol Versions
+
+The library supports the following ILP protocol versions.
+
+These protocol versions are supported over both HTTP and TCP.
+
+If you use HTTP, the library will automatically detect the server's
+latest supported protocol version and use it. If you use TCP, you can specify the
+`protocol_version=N` parameter when constructing the `Sender` object.
+
+| Version | Description                                             | Server Comatibility   |
+| ------- | ------------------------------------------------------- | --------------------- |
+| **1**   | Over HTTP it's compatible InfluxDB Line Protocol (ILP)  | All QuestDB versions  |
+| **2**   | 64-bit floats sent as binary, adds n-dimentional arrays | 8.4.0+ (2023-10-30)   |
+
 ## Getting Started
 
 To get started, read the language-specific guides.
