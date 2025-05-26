@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2025 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -27,27 +27,27 @@
 #include <string.h>
 
 #if defined(PLATFORM_UNIX)
-#include <fcntl.h>
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#    include <fcntl.h>
+#    include <arpa/inet.h>
+#    include <netdb.h>
+#    include <netinet/in.h>
+#    include <netinet/tcp.h>
+#    include <sys/types.h>
+#    include <sys/socket.h>
+#    include <unistd.h>
 #elif defined(PLATFORM_WINDOWS)
-#include <winsock2.h>
-#include <ws2tcpip.h>
+#    include <winsock2.h>
+#    include <ws2tcpip.h>
 #endif
 
 #if defined(PLATFORM_UNIX)
-#define CLOSESOCKET ::close
+#    define CLOSESOCKET ::close
 typedef const void* setsockopt_arg_t;
-#ifndef INVALID_SOCKET
-#define INVALID_SOCKET -1
-#endif
+#    ifndef INVALID_SOCKET
+#        define INVALID_SOCKET -1
+#    endif
 #elif defined(PLATFORM_WINDOWS)
-#define CLOSESOCKET ::closesocket
+#    define CLOSESOCKET ::closesocket
 typedef const char* setsockopt_arg_t;
 typedef long suseconds_t;
 #endif
@@ -108,8 +108,8 @@ mock_server::mock_server()
             _listen_fd,
             SOL_SOCKET,
             SO_REUSEADDR,
-            static_cast<setsockopt_arg_t>(static_cast<const void*>(
-                &reuse_addr)),
+            static_cast<setsockopt_arg_t>(
+                static_cast<const void*>(&reuse_addr)),
             sizeof(reuse_addr)) != 0)
     {
 #if defined(PLATFORM_UNIX)
@@ -126,10 +126,8 @@ mock_server::mock_server()
     listen_addr.sin_family = AF_INET;
     listen_addr.sin_addr.s_addr = INADDR_ANY;
     listen_addr.sin_port = htons(0);
-    if (bind(
-            _listen_fd,
-            (const sockaddr *)&listen_addr,
-            sizeof(listen_addr)) == -1)
+    if (bind(_listen_fd, (const sockaddr*)&listen_addr, sizeof(listen_addr)) ==
+        -1)
         throw std::runtime_error{"Bad `bind()`."};
 
     if (listen(_listen_fd, 1) == -1)
@@ -139,9 +137,7 @@ mock_server::mock_server()
     memset(&resolved_addr, 0, sizeof(resolved_addr));
     socklen_t resolved_addr_len = sizeof(resolved_addr);
     if (getsockname(
-            _listen_fd,
-            (sockaddr *)&resolved_addr,
-            &resolved_addr_len) == -1)
+            _listen_fd, (sockaddr*)&resolved_addr, &resolved_addr_len) == -1)
         throw std::runtime_error{"Bad `getsockname()`."};
     _port = ntohs(resolved_addr.sin_port);
 }
@@ -150,10 +146,7 @@ void mock_server::accept()
 {
     sockaddr_in remote_addr;
     socklen_t remote_addr_len = sizeof(remote_addr);
-    _conn_fd = ::accept(
-        _listen_fd,
-        (sockaddr *)&remote_addr,
-        &remote_addr_len);
+    _conn_fd = ::accept(_listen_fd, (sockaddr*)&remote_addr, &remote_addr_len);
     if (_conn_fd == INVALID_SOCKET)
         throw std::runtime_error{"Bad `accept()`."};
 #if defined(PLATFORM_UNIX)
@@ -169,7 +162,7 @@ bool mock_server::wait_for_data(std::optional<double> wait_timeout_sec)
     fd_set read_set;
     FD_ZERO(&read_set);
     FD_SET(_conn_fd, &read_set);
-    timeval* timeout_ptr = nullptr;  // nullptr blocks indefinitely.
+    timeval* timeout_ptr = nullptr; // nullptr blocks indefinitely.
     timeval timeout;
     if (wait_timeout_sec)
     {
@@ -178,9 +171,8 @@ bool mock_server::wait_for_data(std::optional<double> wait_timeout_sec)
 #elif defined(PLATFORM_WINDOWS)
         const long secs = static_cast<long>(*wait_timeout_sec);
 #endif
-        const suseconds_t usec =
-            static_cast<suseconds_t>(
-                1000000.0 * (*wait_timeout_sec - static_cast<double>(secs)));
+        const suseconds_t usec = static_cast<suseconds_t>(
+            1000000.0 * (*wait_timeout_sec - static_cast<double>(secs)));
         timeout = timeval{secs, usec};
         timeout_ptr = &timeout;
     }
@@ -209,11 +201,8 @@ size_t mock_server::recv(double wait_timeout_sec)
     for (;;)
     {
         wait_for_data();
-        sock_ssize_t count = ::recv(
-            _conn_fd,
-            &chunk[0],
-            static_cast<sock_len_t>(chunk_len),
-            0);
+        sock_ssize_t count =
+            ::recv(_conn_fd, &chunk[0], static_cast<sock_len_t>(chunk_len), 0);
         if (count == -1)
             throw std::runtime_error{"Bad `recv()`."};
         const size_t u_count = static_cast<size_t>(count);
@@ -266,4 +255,4 @@ mock_server::~mock_server()
 #endif
 }
 
-}
+} // namespace questdb::ingress::test

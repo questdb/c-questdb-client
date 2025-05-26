@@ -1,5 +1,3 @@
-use std::time::Instant;
-
 use super::*;
 use crate::ErrorCode;
 use tempfile::TempDir;
@@ -22,7 +20,12 @@ fn https_simple() {
     assert_specified_eq(&builder.host, "localhost");
     assert_specified_eq(&builder.port, Protocol::Https.default_port());
     assert!(builder.protocol.tls_enabled());
+
+    #[cfg(feature = "tls-webpki-certs")]
     assert_defaulted_eq(&builder.tls_ca, CertificateAuthority::WebpkiRoots);
+
+    #[cfg(not(feature = "tls-webpki-certs"))]
+    assert_defaulted_eq(&builder.tls_ca, CertificateAuthority::OsRoots);
 }
 
 #[test]
@@ -41,7 +44,12 @@ fn tcps_simple() {
     assert_specified_eq(&builder.host, "localhost");
     assert_specified_eq(&builder.port, Protocol::Tcps.default_port());
     assert!(builder.protocol.tls_enabled());
+
+    #[cfg(feature = "tls-webpki-certs")]
     assert_defaulted_eq(&builder.tls_ca, CertificateAuthority::WebpkiRoots);
+
+    #[cfg(not(feature = "tls-webpki-certs"))]
+    assert_defaulted_eq(&builder.tls_ca, CertificateAuthority::OsRoots);
 }
 
 #[test]
@@ -301,7 +309,12 @@ fn misspelled_tcp_ecdsa_auth() {
 fn tcps_tls_verify_on() {
     let builder = SenderBuilder::from_conf("tcps::addr=localhost;tls_verify=on;").unwrap();
     assert!(builder.protocol.tls_enabled());
+
+    #[cfg(feature = "tls-webpki-certs")]
     assert_defaulted_eq(&builder.tls_ca, CertificateAuthority::WebpkiRoots);
+
+    #[cfg(not(feature = "tls-webpki-certs"))]
+    assert_defaulted_eq(&builder.tls_ca, CertificateAuthority::OsRoots);
 }
 
 #[cfg(feature = "insecure-skip-verify")]
@@ -323,10 +336,21 @@ fn tcps_tls_verify_invalid() {
 
 #[test]
 fn tcps_tls_roots_webpki() {
-    let builder = SenderBuilder::from_conf("tcps::addr=localhost;tls_ca=webpki_roots;").unwrap();
-    assert!(builder.protocol.tls_enabled());
-    assert_specified_eq(&builder.tls_ca, CertificateAuthority::WebpkiRoots);
-    assert_defaulted_eq(&builder.tls_roots, None);
+    let builder = SenderBuilder::from_conf("tcps::addr=localhost;tls_ca=webpki_roots;");
+
+    #[cfg(feature = "tls-webpki-certs")]
+    {
+        let builder = builder.unwrap();
+        assert!(builder.protocol.tls_enabled());
+        assert_specified_eq(&builder.tls_ca, CertificateAuthority::WebpkiRoots);
+        assert_defaulted_eq(&builder.tls_roots, None);
+    }
+
+    #[cfg(not(feature = "tls-webpki-certs"))]
+    assert_eq!(
+        "Config parameter \"tls_ca=webpki_roots\" requires the \"tls-webpki-certs\" feature",
+        builder.unwrap_err().msg()
+    );
 }
 
 #[cfg(feature = "tls-native-certs")]
@@ -418,6 +442,7 @@ fn http_retry_timeout() {
 #[cfg(feature = "ilp-over-http")]
 #[test]
 fn connect_timeout_uses_request_timeout() {
+    use std::time::Instant;
     let request_timeout = Duration::from_millis(10);
     let builder = SenderBuilder::new(Protocol::Http, "127.0.0.2", "1111")
         .request_timeout(request_timeout)

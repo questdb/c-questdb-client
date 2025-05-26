@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2025 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -35,7 +35,7 @@
 #if defined(PLATFORM_UNIX)
 typedef int socketfd_t;
 #elif defined(PLATFORM_WINDOWS)
-#include <winsock2.h>
+#    include <winsock2.h>
 typedef SOCKET socketfd_t;
 #endif
 
@@ -45,17 +45,20 @@ namespace questdb::ingress::test
 /**
  * Bug-ridden mock server to handle line requests.
  * YMMV, but should be just good enough for testing.
-*/
+ */
 class mock_server
 {
 public:
     mock_server();
 
-    uint16_t port() const { return _port; }
+    uint16_t port() const
+    {
+        return _port;
+    }
 
     void accept();
 
-    size_t recv(double wait_timeout_sec=0.1);
+    size_t recv(double wait_timeout_sec = 0.1);
 
     const std::vector<std::string>& msgs() const
     {
@@ -75,4 +78,4 @@ private:
     std::vector<std::string> _msgs;
 };
 
-}
+} // namespace questdb::ingress::test

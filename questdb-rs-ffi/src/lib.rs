@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2025 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -672,20 +672,29 @@ pub unsafe extern "C" fn line_sender_buffer_transactional(
     buffer.transactional()
 }
 
-/// Get a string representation of the contents of the buffer.
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct line_sender_buffer_view {
+    len: size_t,
+    buf: *const u8,
+}
+
+/// Provides a read-only view into the buffer's bytes content.
 ///
 /// @param[in] buffer Line buffer object.
-/// @param[out] len_out The length in bytes of the accumulated buffer.
-/// @return UTF-8 encoded buffer. The buffer is not nul-terminated.
+/// @return A [`line_sender_buffer_view`] struct containing:
+/// - `buf`: Immutable pointer to the byte stream
+/// - `len`: Exact byte length of the data
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_buffer_peek(
     buffer: *const line_sender_buffer,
-    len_out: *mut size_t,
-) -> *const c_char {
+) -> line_sender_buffer_view {
     let buffer = unwrap_buffer(buffer);
-    let buf: &[u8] = buffer.as_str().as_bytes();
-    *len_out = buf.len();
-    buf.as_ptr() as *const c_char
+    let buf: &[u8] = buffer.as_bytes();
+    line_sender_buffer_view {
+        len: buf.len(),
+        buf: buf.as_ptr(),
+    }
 }
 
 /// Start recording a new row for the given table.

@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2025 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -29,7 +29,11 @@ pub use self::timestamp::*;
 use crate::error::{self, Error, Result};
 use crate::gai;
 use crate::ingress::conf::ConfigSetting;
+use base64ct::{Base64, Base64UrlUnpadded, Encoding};
 use core::time::Duration;
+use rustls::{ClientConnection, RootCertStore, StreamOwned};
+use rustls_pki_types::ServerName;
+use socket2::{Domain, Protocol as SockProtocol, SockAddr, Socket, Type};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fmt::{Debug, Display, Formatter, Write};
@@ -39,12 +43,17 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use base64ct::{Base64, Base64UrlUnpadded, Encoding};
-use ring::rand::SystemRandom;
-use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
-use rustls::{ClientConnection, RootCertStore, StreamOwned};
-use rustls_pki_types::ServerName;
-use socket2::{Domain, Protocol as SockProtocol, SockAddr, Socket, Type};
+#[cfg(feature = "aws-lc-crypto")]
+use aws_lc_rs::{
+    rand::SystemRandom,
+    signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING},
+};
+
+#[cfg(feature = "ring-crypto")]
+use ring::{
+    rand::SystemRandom,
+    signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING},
+};
 
 #[derive(Debug, Copy, Clone)]
 enum Op {
@@ -251,12 +260,11 @@ impl From<Infallible> for Error {
     }
 }
 
-fn write_escaped_impl<Q, C>(check_escape_fn: C, quoting_fn: Q, output: &mut String, s: &str)
+fn write_escaped_impl<Q, C>(check_escape_fn: C, quoting_fn: Q, output: &mut Vec<u8>, s: &str)
 where
     C: Fn(u8) -> bool,
     Q: Fn(&mut Vec<u8>),
 {
-    let output_vec = unsafe { output.as_mut_vec() };
     let mut to_escape = 0usize;
     for b in s.bytes() {
         if check_escape_fn(b) {
@@ -264,32 +272,32 @@ where
         }
     }
 
-    quoting_fn(output_vec);
+    quoting_fn(output);
 
     if to_escape == 0 {
         // output.push_str(s);
-        output_vec.extend_from_slice(s.as_bytes());
+        output.extend_from_slice(s.as_bytes());
     } else {
         let additional = s.len() + to_escape;
-        output_vec.reserve(additional);
-        let mut index = output_vec.len();
-        unsafe { output_vec.set_len(index + additional) };
+        output.reserve(additional);
+        let mut index = output.len();
+        unsafe { output.set_len(index + additional) };
         for b in s.bytes() {
             if check_escape_fn(b) {
                 unsafe {
-                    *output_vec.get_unchecked_mut(index) = b'\\';
+                    *output.get_unchecked_mut(index) = b'\\';
                 }
                 index += 1;
             }
 
             unsafe {
-                *output_vec.get_unchecked_mut(index) = b;
+                *output.get_unchecked_mut(index) = b;
             }
             index += 1;
         }
     }
 
-    quoting_fn(output_vec);
+    quoting_fn(output);
 }
 
 fn must_escape_unquoted(c: u8) -> bool {
@@ -300,11 +308,11 @@ fn must_escape_quoted(c: u8) -> bool {
     matches!(c, b'\n' | b'\r' | b'"' | b'\\')
 }
 
-fn write_escaped_unquoted(output: &mut String, s: &str) {
+fn write_escaped_unquoted(output: &mut Vec<u8>, s: &str) {
     write_escaped_impl(must_escape_unquoted, |_output| (), output, s);
 }
 
-fn write_escaped_quoted(output: &mut String, s: &str) {
+fn write_escaped_quoted(output: &mut Vec<u8>, s: &str) {
     write_escaped_impl(must_escape_quoted, |output| output.push(b'"'), output, s)
 }
 
@@ -494,11 +502,11 @@ impl BufferState {
 ///   * A row always starts with [`table`](Buffer::table).
 ///   * A row must contain at least one [`symbol`](Buffer::symbol) or
 ///     column (
-///       [`column_bool`](Buffer::column_bool),
-///       [`column_i64`](Buffer::column_i64),
-///       [`column_f64`](Buffer::column_f64),
-///       [`column_str`](Buffer::column_str),
-///       [`column_ts`](Buffer::column_ts)).
+///     [`column_bool`](Buffer::column_bool),
+///     [`column_i64`](Buffer::column_i64),
+///     [`column_f64`](Buffer::column_f64),
+///     [`column_str`](Buffer::column_str),
+///     [`column_ts`](Buffer::column_ts)).
 ///   * Symbols must appear before columns.
 ///   * A row must be terminated with either [`at`](Buffer::at) or
 ///     [`at_now`](Buffer::at_now).
@@ -543,7 +551,7 @@ impl BufferState {
 ///
 #[derive(Debug, Clone)]
 pub struct Buffer {
-    output: String,
+    output: Vec<u8>,
     state: BufferState,
     marker: Option<(usize, BufferState)>,
     max_name_len: usize,
@@ -554,7 +562,7 @@ impl Buffer {
     /// QuestDB server default.
     pub fn new() -> Self {
         Self {
-            output: String::new(),
+            output: Vec::new(),
             state: BufferState::new(),
             marker: None,
             max_name_len: 127,
@@ -608,8 +616,7 @@ impl Buffer {
         self.output.capacity()
     }
 
-    /// A string representation of the buffer's contents. Useful for debugging.
-    pub fn as_str(&self) -> &str {
+    pub fn as_bytes(&self) -> &[u8] {
         &self.output
     }
 
@@ -680,6 +687,15 @@ impl Buffer {
                 self.state.op_case.next_op_descr()
             ))
         }
+    }
+
+    /// Checks if this buffer is ready to be flushed to a sender via one of the
+    /// [`Sender::flush`] functions. An [`Ok`] value indicates that the buffer
+    /// is ready to be flushed via a [`Sender`] while an [`Err`] will contain a
+    /// message indicating why this [`Buffer`] cannot be flushed at the moment.
+    #[inline(always)]
+    pub fn check_can_flush(&self) -> Result<()> {
+        self.check_op(Op::Flush)
     }
 
     #[inline(always)]
@@ -796,9 +812,9 @@ impl Buffer {
         let name: ColumnName<'a> = name.try_into()?;
         self.validate_max_name_len(name.name)?;
         self.check_op(Op::Symbol)?;
-        self.output.push(',');
+        self.output.push(b',');
         write_escaped_unquoted(&mut self.output, name.name);
-        self.output.push('=');
+        self.output.push(b'=');
         write_escaped_unquoted(&mut self.output, value.as_ref());
         self.state.op_case = OpCase::SymbolWritten;
         Ok(self)
@@ -814,12 +830,12 @@ impl Buffer {
         self.check_op(Op::Column)?;
         self.output
             .push(if (self.state.op_case as isize & Op::Symbol as isize) > 0 {
-                ' '
+                b' '
             } else {
-                ','
+                b','
             });
         write_escaped_unquoted(&mut self.output, name.name);
-        self.output.push('=');
+        self.output.push(b'=');
         self.state.op_case = OpCase::ColumnWritten;
         Ok(self)
     }
@@ -858,7 +874,7 @@ impl Buffer {
         Error: From<N::Error>,
     {
         self.write_column_key(name)?;
-        self.output.push(if value { 't' } else { 'f' });
+        self.output.push(if value { b't' } else { b'f' });
         Ok(self)
     }
 
@@ -898,8 +914,8 @@ impl Buffer {
         self.write_column_key(name)?;
         let mut buf = itoa::Buffer::new();
         let printed = buf.format(value);
-        self.output.push_str(printed);
-        self.output.push('i');
+        self.output.extend_from_slice(printed.as_bytes());
+        self.output.push(b'i');
         Ok(self)
     }
 
@@ -938,7 +954,7 @@ impl Buffer {
     {
         self.write_column_key(name)?;
         let mut ser = F64Serializer::new(value);
-        self.output.push_str(ser.as_str());
+        self.output.extend_from_slice(ser.as_str().as_bytes());
         Ok(self)
     }
 
@@ -1059,8 +1075,8 @@ impl Buffer {
         let timestamp: TimestampMicros = timestamp.try_into()?;
         let mut buf = itoa::Buffer::new();
         let printed = buf.format(timestamp.as_i64());
-        self.output.push_str(printed);
-        self.output.push('t');
+        self.output.extend_from_slice(printed.as_bytes());
+        self.output.push(b't');
         Ok(self)
     }
 
@@ -1122,9 +1138,9 @@ impl Buffer {
         }
         let mut buf = itoa::Buffer::new();
         let printed = buf.format(epoch_nanos);
-        self.output.push(' ');
-        self.output.push_str(printed);
-        self.output.push('\n');
+        self.output.push(b' ');
+        self.output.extend_from_slice(printed.as_bytes());
+        self.output.push(b'\n');
         self.state.op_case = OpCase::MayFlushOrTable;
         self.state.row_count += 1;
         Ok(())
@@ -1160,7 +1176,7 @@ impl Buffer {
     /// ```
     pub fn at_now(&mut self) -> Result<()> {
         self.check_op(Op::At)?;
-        self.output.push('\n');
+        self.output.push(b'\n');
         self.state.op_case = OpCase::MayFlushOrTable;
         self.state.row_count += 1;
         Ok(())
@@ -1309,6 +1325,14 @@ mod danger {
             Ok(HandshakeSignatureValid::assertion())
         }
 
+        #[cfg(feature = "aws-lc-crypto")]
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            rustls::crypto::aws_lc_rs::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+
+        #[cfg(feature = "ring-crypto")]
         fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
             rustls::crypto::ring::default_provider()
                 .signature_verification_algorithms
@@ -1325,14 +1349,27 @@ fn add_webpki_roots(root_store: &mut RootCertStore) {
 }
 
 #[cfg(feature = "tls-native-certs")]
-fn add_os_roots(root_store: &mut RootCertStore) -> Result<()> {
-    let os_certs = rustls_native_certs::load_native_certs().map_err(|io_err| {
-        error::fmt!(
+fn unpack_os_native_certs(
+    res: rustls_native_certs::CertificateResult,
+) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+    if !res.errors.is_empty() {
+        return Err(error::fmt!(
             TlsError,
             "Could not load OS native TLS certificates: {}",
-            io_err
-        )
-    })?;
+            res.errors
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    Ok(res.certs)
+}
+
+#[cfg(feature = "tls-native-certs")]
+fn add_os_roots(root_store: &mut RootCertStore) -> Result<()> {
+    let os_certs = unpack_os_native_certs(rustls_native_certs::load_native_certs())?;
 
     let (valid_count, invalid_count) = root_store.add_parsable_certificates(os_certs);
     if valid_count == 0 && invalid_count > 0 {
@@ -2275,6 +2312,8 @@ impl SenderBuilder {
             Protocol::Tcp | Protocol::Tcps => self.connect_tcp(&auth)?,
             #[cfg(feature = "ilp-over-http")]
             Protocol::Http | Protocol::Https => {
+                use ureq::unversioned::transport::Connector;
+                use ureq::unversioned::transport::TcpConnector;
                 if self.net_interface.is_some() {
                     // See: https://github.com/algesten/ureq/issues/692
                     return Err(error::fmt!(
@@ -2285,7 +2324,9 @@ impl SenderBuilder {
 
                 let http_config = self.http.as_ref().unwrap();
                 let user_agent = http_config.user_agent.as_str();
-                let agent_builder = ureq::AgentBuilder::new()
+                let connector = TcpConnector::default();
+
+                let agent_builder = ureq::Agent::config_builder()
                     .user_agent(user_agent)
                     .no_delay(true);
 
@@ -2295,15 +2336,13 @@ impl SenderBuilder {
                 #[cfg(not(feature = "insecure-skip-verify"))]
                 let tls_verify = true;
 
-                let agent_builder = match configure_tls(
+                let connector = connector.chain(TlsConnector::new(configure_tls(
                     self.protocol.tls_enabled(),
                     tls_verify,
                     *self.tls_ca,
                     self.tls_roots.deref(),
-                )? {
-                    Some(tls_config) => agent_builder.tls_config(tls_config),
-                    None => agent_builder,
-                };
+                )?));
+
                 let auth = match auth {
                     Some(AuthParams::Basic(ref auth)) => Some(auth.to_header_string()),
                     Some(AuthParams::Token(ref auth)) => Some(auth.to_header_string()?),
@@ -2316,9 +2355,14 @@ impl SenderBuilder {
                     }
                     None => None,
                 };
-                let agent_builder =
-                    agent_builder.timeout_connect(*http_config.request_timeout.deref());
-                let agent = agent_builder.build();
+                let agent_builder = agent_builder
+                    .timeout_connect(Some(*http_config.request_timeout.deref()))
+                    .http_status_as_error(false);
+                let agent = ureq::Agent::with_parts(
+                    agent_builder.build(),
+                    connector,
+                    ureq::unversioned::resolver::DefaultResolver::default(),
+                );
                 let proto = self.protocol.schema();
                 let url = format!(
                     "{}://{}:{}/write",
@@ -2437,14 +2481,26 @@ fn parse_public_key(pub_key_x: &str, pub_key_y: &str) -> Result<Vec<u8>> {
 fn parse_key_pair(auth: &EcdsaAuthParams) -> Result<EcdsaKeyPair> {
     let private_key = b64_decode("private authentication key", auth.priv_key.as_str())?;
     let public_key = parse_public_key(auth.pub_key_x.as_str(), auth.pub_key_y.as_str())?;
-    let system_random = SystemRandom::new();
-    EcdsaKeyPair::from_private_key_and_public_key(
+
+    #[cfg(feature = "aws-lc-crypto")]
+    let res = EcdsaKeyPair::from_private_key_and_public_key(
         &ECDSA_P256_SHA256_FIXED_SIGNING,
         &private_key[..],
         &public_key[..],
-        &system_random,
-    )
-    .map_err(|key_rejected| {
+    );
+
+    #[cfg(feature = "ring-crypto")]
+    let res = {
+        let system_random = SystemRandom::new();
+        EcdsaKeyPair::from_private_key_and_public_key(
+            &ECDSA_P256_SHA256_FIXED_SIGNING,
+            &private_key[..],
+            &public_key[..],
+            &system_random,
+        )
+    };
+
+    res.map_err(|key_rejected| {
         error::fmt!(
             AuthError,
             "Misconfigured ILP authentication keys: {}. Hint: Check the keys for a possible typo.",
@@ -2538,7 +2594,7 @@ impl Sender {
                 "Could not flush buffer: not connected to database."
             ));
         }
-        buf.check_op(Op::Flush)?;
+        buf.check_can_flush()?;
 
         if buf.len() > self.max_buf_size {
             return Err(error::fmt!(
@@ -2549,7 +2605,7 @@ impl Sender {
             ));
         }
 
-        let bytes = buf.as_str().as_bytes();
+        let bytes = buf.as_bytes();
         if bytes.is_empty() {
             return Ok(());
         }
@@ -2581,34 +2637,23 @@ impl Sender {
                 } else {
                     0.0f64
                 };
-                let timeout = *state.config.request_timeout + Duration::from_secs_f64(extra_time);
-                let request = state
-                    .agent
-                    .post(&state.url)
-                    .query_pairs([("precision", "n")])
-                    .timeout(timeout)
-                    .set("Content-Type", "text/plain; charset=utf-8");
-                let request = match state.auth.as_ref() {
-                    Some(auth) => request.set("Authorization", auth),
-                    None => request,
+
+                return match http_send_with_retries(
+                    state,
+                    bytes,
+                    *state.config.request_timeout + Duration::from_secs_f64(extra_time),
+                    *state.config.retry_timeout,
+                ) {
+                    Ok(res) => {
+                        if res.status().is_client_error() || res.status().is_server_error() {
+                            Err(parse_http_error(res.status().as_u16(), res))
+                        } else {
+                            res.into_body();
+                            Ok(())
+                        }
+                    }
+                    Err(err) => Err(Error::from_ureq_error(err, &state.url)),
                 };
-                let response_or_err =
-                    http_send_with_retries(request, bytes, *state.config.retry_timeout);
-                match response_or_err {
-                    Ok(_response) => {
-                        // on success, there's no information in the response.
-                    }
-                    Err(ureq::Error::Status(http_status_code, response)) => {
-                        return Err(parse_http_error(http_status_code, response));
-                    }
-                    Err(ureq::Error::Transport(transport)) => {
-                        return Err(error::fmt!(
-                            SocketError,
-                            "Could not flush buffer: {}",
-                            transport
-                        ));
-                    }
-                }
             }
         }
         Ok(())

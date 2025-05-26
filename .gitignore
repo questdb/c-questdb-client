@@ -1,10 +1,12 @@
 target
 build
+build_CXX20
 cmake-build-debug
 cmake-build-release
 .vs
 .vscode
 .idea
+.cache
 questdb-rs/Cargo.lock
 include/questdb/ingress/line_sender.gen.h
 cython/questdb/ingress/line_sender.pxd
