@@ -1247,6 +1247,42 @@ public:
     }
 
     /**
+     * Send the batch of rows in the buffer to the QuestDB server, and, if the parameter
+     * `transactional` is true, ensure the flush will be transactional.
+     * See docs on the ::line_sender_flush_and_keep_with_flags() function for more details.
+    */
+    bool flush_and_keep_with_flags(const line_sender_buffer& buffer, bool transactional)
+    {
+        try
+        {
+            if (buffer._impl)
+            {
+                ensure_impl();
+                line_sender_error::wrapped_call(
+                    ::line_sender_flush_and_keep_with_flags,
+                    _impl,
+                    buffer._impl,
+                    transactional);
+            }
+            else
+            {
+                line_sender_buffer buffer2{0};
+                buffer2.may_init();
+                line_sender_error::wrapped_call(
+                    ::line_sender_flush_and_keep_with_flags,
+                    _impl,
+                    buffer2._impl,
+                    transactional);
+            }
+        }
+        catch (...)
+        {
+            return false;
+        }
+        return true;
+    }
+
+    /**
      * Check if an error occurred previously and the sender must be closed.
      * This happens when there was an earlier failure.
      * This method is specific to ILP-over-TCP and is not relevant for
