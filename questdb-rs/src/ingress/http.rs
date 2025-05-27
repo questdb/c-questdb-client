@@ -123,6 +123,7 @@ impl HttpHandlerState {
             .post(&self.url)
             .config()
             .timeout_per_call(Some(request_timeout))
+            .timeout_await_100(Some(Duration::from_secs(100)))
             .build()
             .query_pairs([("precision", "n")])
             .content_type("text/plain; charset=utf-8");
