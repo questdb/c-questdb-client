@@ -116,6 +116,7 @@ impl HttpHandlerState {
         buf: &[u8],
         request_timeout: Duration,
     ) -> (bool, Result<Response<Body>, ureq::Error>) {
+        eprintln!("Sending request to {:?}", self.agent);
         std::env::set_var("RUST_LOG", "debug");
         let request = self
             .agent
