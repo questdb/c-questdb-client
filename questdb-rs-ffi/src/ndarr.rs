@@ -743,4 +743,27 @@ mod tests {
         assert_eq!(buf, expected);
         Ok(())
     }
+
+    #[test]
+    fn test_stride_minus_non_contiguous_strides_array() -> TestResult {
+        let test_data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
+        let shape = [2usize, 2];
+        let strides = [-8, -2];
+        let array = unsafe {
+            StrideArrayView::<f64, { std::mem::size_of::<f64>() as isize }>::new(
+                shape.len(),
+                shape.as_ptr(),
+                strides.as_ptr(),
+                test_data.as_ptr().add(11) as *const u8,
+                4 * size_of::<f64>(),
+            )
+        }?;
+
+        let test_data1 = vec![12.0f64, 10.0, 4.0, 2.0];
+        let mut buf = vec![0u8; 32];
+        write_array_data(&array, &mut buf, 32).unwrap();
+        let expected = to_bytes(&test_data1);
+        assert_eq!(buf, expected);
+        Ok(())
+    }
 }
