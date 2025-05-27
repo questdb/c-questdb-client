@@ -2579,7 +2579,9 @@ impl SenderBuilder {
                 };
                 let agent_builder = agent_builder
                     .timeout_connect(Some(*http_config.request_timeout.deref()))
-                    .http_status_as_error(false);
+                    .http_status_as_error(false)
+                    .timeout_await_100(Some(Duration::from_secs(5)))
+                    .max_idle_connections_per_host(10);
                 let agent = ureq::Agent::with_parts(
                     agent_builder.build(),
                     connector,
