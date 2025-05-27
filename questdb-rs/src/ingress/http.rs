@@ -116,8 +116,6 @@ impl HttpHandlerState {
         buf: &[u8],
         request_timeout: Duration,
     ) -> (bool, Result<Response<Body>, ureq::Error>) {
-        eprintln!("Sending request to {:?}", self.agent);
-        std::env::set_var("RUST_LOG", "debug");
         let request = self
             .agent
             .post(&self.url)
@@ -127,7 +125,7 @@ impl HttpHandlerState {
             .build()
             .query_pairs([("precision", "n")])
             .content_type("text/plain; charset=utf-8");
-
+        eprintln!("Sending request to {:?}", request);
         let request = match self.auth.as_ref() {
             Some(auth) => request.header("Authorization", auth),
             None => request,
