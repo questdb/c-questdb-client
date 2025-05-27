@@ -2854,6 +2854,7 @@ impl Sender {
 
     #[allow(unused_variables)]
     fn flush_impl(&mut self, buf: &Buffer, transactional: bool) -> Result<()> {
+        eprint!("sender::flush_impl: {:?}", self);
         if !self.connected {
             return Err(error::fmt!(
                 SocketError,
