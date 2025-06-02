@@ -746,7 +746,7 @@ mod tests {
 
     #[test]
     fn test_stride_minus_non_contiguous_strides_array() -> TestResult {
-        let test_data = vec![
+        let test_data = [
             1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
         ];
         let shape = [2usize, 2];
