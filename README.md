@@ -3,12 +3,12 @@
 
 This library makes it easy to insert data into [QuestDB](https://questdb.io/).
 
-This client library implements the QuestDB [Ingestion Line Protocol](
+This client library implements the QuestDB's variant of the [InfluxDB Line Protocol](
 https://questdb.io/docs/reference/api/ilp/overview/) (ILP) over HTTP and TCP.
 
 When connecting to QuestDB over HTTP, the library will auto-detect the server's
 latest supported version and use it. Version 1 is compatible with
-the [InfluxDB Line Protocol](https://docs.influxdata.com/influxdb/v2/reference/syntax/line-protocol/).
+the [InfluxDB Database](https://docs.influxdata.com/influxdb/v2/reference/syntax/line-protocol/).
 
 * Implementation is in Rust, with no additional
   [run-time or link-time dependencies](doc/BUILD.md#pre-requisites-and-dependencies)

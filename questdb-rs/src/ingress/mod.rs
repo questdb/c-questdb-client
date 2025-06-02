@@ -70,16 +70,17 @@ pub const MAX_ARRAY_DIMS: usize = 32;
 pub const MAX_ARRAY_BUFFER_SIZE: usize = i32::MAX as usize;
 pub const MAX_ARRAY_DIM_LEN: usize = 0x0FFF_FFFF; // 1 << 28 - 1
 
-/// The version of Ingestion Line Protocol used to communicate with the server.
+/// The version of InfluxDB Line Protocol used to communicate with the server.
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub enum ProtocolVersion {
     /// Version 1 of Line Protocol.
     /// Full-text protocol.
-    /// When used over HTTP, it is compatible with the InfluxDB line protocol.
+    /// When used over HTTP, this version is compatible with the InfluxDB database.
     V1 = 1,
 
-    /// Version 2 of Ingestion Line Protocol.
+    /// Version 2 of InfluxDB Line Protocol.
     /// Uses binary format serialization for f64, and supports the array data type.
+    /// This version is specific to QuestDB and is not compatible with InfluxDB.
     V2 = 2,
 }
 

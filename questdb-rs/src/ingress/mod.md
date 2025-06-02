@@ -1,7 +1,7 @@
 # Fast Ingestion of Data into QuestDB
 
-The `ingress` module implements QuestDB's
-[Ingestion Line Protocol](https://questdb.io/docs/reference/api/ilp/overview/)
+The `ingress` module implements QuestDB's variant of the
+[InfluxDB Line Protocol](https://questdb.io/docs/reference/api/ilp/overview/)
 (ILP).
 
 To get started:
@@ -256,7 +256,7 @@ with a high-latency network connection.
 
 ### Timestamp Column Name
 
-The Ingestion Line Protocol (ILP) does not give a name to the designated timestamp,
+The InfluxDB Line Protocol (ILP) does not give a name to the designated timestamp,
 so if you let this client auto-create the table, it will have the default `timestamp` name.
 To use a custom name, say `my_ts`, pre-create the table with the desired
 timestamp column name:
@@ -317,7 +317,7 @@ considerations](https://github.com/questdb/c-questdb-client/blob/main/doc/CONSID
 document covers these topics:
 
 * Threading
-* Differences between the Ingestion Line Protocol and QuestDB Data Types
+* Differences between the InfluxDB Line Protocol and QuestDB Data Types
 * Data Quality
 * Client-side checks and server errors
 * Flushing
