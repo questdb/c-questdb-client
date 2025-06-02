@@ -581,7 +581,7 @@ impl MockServer {
                     let element_type = match ArrayColumnTypeTag::try_from(accum[index]) {
                         Ok(t) => t,
                         Err(e) => {
-                            return Err(io::Error::new(io::ErrorKind::Other, e));
+                            return Err(io::Error::other(e));
                         }
                     };
                     let mut elems_size = element_type.size();
