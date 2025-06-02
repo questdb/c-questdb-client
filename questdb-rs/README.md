@@ -4,10 +4,25 @@ Official Rust client for [QuestDB](https://questdb.io/), an open-source SQL
 database designed to process time-series data, faster.
 
 The client library is designed for fast ingestion of data into QuestDB via the
-InfluxDB Line Protocol (ILP).
+InfluxDB Line Protocol (ILP) over either HTTP (recommended) or TCP.
 
 * [QuestDB Database docs](https://questdb.io/docs/)
 * [Docs on InfluxDB Line Protocol](https://questdb.io/docs/reference/api/ilp/overview/)
+
+## Protocol Versions
+
+The library supports the following ILP protocol versions.
+
+These protocol versions are supported over both HTTP and TCP.
+
+If you use HTTP, the library will automatically detect the server's
+latest supported protocol version and use it. If you use TCP, you can specify the
+`protocol_version=N` parameter when constructing the `Sender` object.
+
+| Version | Description                                             | Server Comatibility   |
+| ------- | ------------------------------------------------------- | --------------------- |
+| **1**   | Over HTTP it's compatible InfluxDB Line Protocol (ILP)  | All QuestDB versions  |
+| **2**   | 64-bit floats sent as binary, adds n-dimentional arrays | 8.4.0+ (2023-10-30)   |
 
 ## Quick Start
 
@@ -30,7 +45,7 @@ use questdb::{
 
 fn main() -> Result<()> {
    let mut sender = Sender::from_conf("http::addr=localhost:9000;")?;
-   let mut buffer = Buffer::new();
+  let mut buffer = sender.new_buffer();
    buffer
        .table("trades")?
        .symbol("symbol", "ETH-USD")?
@@ -46,7 +61,7 @@ fn main() -> Result<()> {
 ## Docs
 
 Most of the client documentation is on the
-[`ingress`](https://docs.rs/questdb-rs/4.0.4/questdb/ingress/) module page.
+[`ingress`](https://docs.rs/questdb-rs/5.0.0-rc1/questdb/ingress/) module page.
 
 ## Crate features
 
@@ -74,6 +89,9 @@ These features are opt-in:
   certificates store.
 * `insecure-skip-verify`: Allows skipping server certificate validation in TLS
   (this compromises security).
+* `ndarray`: Enables integration with the `ndarray` crate for working with
+  n-dimensional arrays. Without this feature, you can still send slices,
+  or integrate custom array types via the `NdArrayView` trait.
 
 ## C, C++ and Python APIs
 

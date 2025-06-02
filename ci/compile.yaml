@@ -4,6 +4,10 @@ steps:
       rustup default $(toolchain)
     condition: ne(variables['toolchain'], '')
     displayName: "Update and set Rust toolchain"
+  - script: |
+      python -m pip install --upgrade pip
+      pip install numpy
+    displayName: 'Install Python Dependencies'
   - script: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DQUESTDB_TESTS_AND_EXAMPLES=ON
     env:
       JAVA_HOME: $(JAVA_HOME_11_X64)

@@ -34,12 +34,16 @@ use std::slice;
 use std::str;
 
 use questdb::{
+    ingress,
     ingress::{
         Buffer, CertificateAuthority, ColumnName, Protocol, Sender, SenderBuilder, TableName,
         TimestampMicros, TimestampNanos,
     },
     Error, ErrorCode,
 };
+
+mod ndarr;
+use ndarr::StrideArrayView;
 
 macro_rules! bubble_err_to_c {
     ($err_out:expr, $expression:expr) => {
@@ -83,7 +87,7 @@ macro_rules! upd_opts {
                     // already cleaned up object.
                     // To avoid double-freeing, we need to construct a valid "dummy"
                     // object on top of the memory that is still owned by the caller.
-                    let dummy = SenderBuilder::new(Protocol::Tcp, "localhost", 1);
+                    let dummy = SenderBuilder::new(Protocol::Tcp, "127.0.0.1", 1);
                     ptr::write(builder_ref, dummy);
                     return false;
                 }
@@ -135,6 +139,18 @@ pub enum line_sender_error_code {
 
     /// Bad configuration.
     line_sender_error_config_error,
+
+    /// Currently, only arrays with a maximum 32 dimensions are supported.
+    line_sender_error_array_large_dim,
+
+    /// ArrayView internal error, such as failure to get the size of a valid dimension.
+    line_sender_error_array_view_internal_error,
+
+    /// Write arrayView to sender buffer error.
+    line_sender_error_array_view_write_to_buffer_error,
+
+    /// Line sender protocol version error.
+    line_sender_error_protocol_version_error,
 }
 
 impl From<ErrorCode> for line_sender_error_code {
@@ -159,6 +175,18 @@ impl From<ErrorCode> for line_sender_error_code {
                 line_sender_error_code::line_sender_error_server_flush_error
             }
             ErrorCode::ConfigError => line_sender_error_code::line_sender_error_config_error,
+            ErrorCode::ArrayHasTooManyDims => {
+                line_sender_error_code::line_sender_error_array_large_dim
+            }
+            ErrorCode::ArrayViewError => {
+                line_sender_error_code::line_sender_error_array_view_internal_error
+            }
+            ErrorCode::ArrayWriteToBufferError => {
+                line_sender_error_code::line_sender_error_array_view_write_to_buffer_error
+            }
+            ErrorCode::ProtocolVersionError => {
+                line_sender_error_code::line_sender_error_protocol_version_error
+            }
         }
     }
 }
@@ -198,6 +226,39 @@ impl From<line_sender_protocol> for Protocol {
             line_sender_protocol::line_sender_protocol_tcps => Protocol::Tcps,
             line_sender_protocol::line_sender_protocol_http => Protocol::Http,
             line_sender_protocol::line_sender_protocol_https => Protocol::Https,
+        }
+    }
+}
+
+/// The version of InfluxDB Line Protocol used to communicate with the server.
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub enum ProtocolVersion {
+    /// Version 1 of InfluxDB Line Protocol.
+    /// Full-text protocol.
+    /// When used over HTTP, it is compatible with the InfluxDB line protocol.
+    V1 = 1,
+
+    /// Version 2 of InfluxDB Line Protocol.
+    /// Uses binary format serialization for f64, and supports the array data type.
+    /// This version is specific to QuestDB and is not compatible with InfluxDB.
+    V2 = 2,
+}
+
+impl From<ProtocolVersion> for ingress::ProtocolVersion {
+    fn from(version: ProtocolVersion) -> Self {
+        match version {
+            ProtocolVersion::V1 => ingress::ProtocolVersion::V1,
+            ProtocolVersion::V2 => ingress::ProtocolVersion::V2,
+        }
+    }
+}
+
+impl From<ingress::ProtocolVersion> for ProtocolVersion {
+    fn from(version: ingress::ProtocolVersion) -> Self {
+        match version {
+            ingress::ProtocolVersion::V1 => ProtocolVersion::V1,
+            ingress::ProtocolVersion::V2 => ProtocolVersion::V2,
         }
     }
 }
@@ -543,8 +604,10 @@ pub struct line_sender_buffer(Buffer);
 /// Construct a `line_sender_buffer` with a `max_name_len` of `127`, which is the
 /// same as the QuestDB server default.
 #[no_mangle]
-pub unsafe extern "C" fn line_sender_buffer_new() -> *mut line_sender_buffer {
-    let buffer = Buffer::new();
+pub unsafe extern "C" fn line_sender_buffer_new(
+    version: ProtocolVersion,
+) -> *mut line_sender_buffer {
+    let buffer = Buffer::new(version.into());
     Box::into_raw(Box::new(line_sender_buffer(buffer)))
 }
 
@@ -555,9 +618,10 @@ pub unsafe extern "C" fn line_sender_buffer_new() -> *mut line_sender_buffer {
 /// call `line_sender_buffer_new()` instead.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_buffer_with_max_name_len(
+    version: ProtocolVersion,
     max_name_len: size_t,
 ) -> *mut line_sender_buffer {
-    let buffer = Buffer::with_max_name_len(max_name_len);
+    let buffer = Buffer::with_max_name_len(version.into(), max_name_len);
     Box::into_raw(Box::new(line_sender_buffer(buffer)))
 }
 
@@ -804,6 +868,102 @@ pub unsafe extern "C" fn line_sender_buffer_column_str(
     true
 }
 
+/// Records a float64 multidimensional array with **byte-level strides specification**.
+///
+/// The `strides` represent byte offsets between elements along each dimension.
+///
+/// @param[in] buffer Line buffer object.
+/// @param[in] name Column name.
+/// @param[in] rank Array dims.
+/// @param[in] shape Array shape.
+/// @param[in] strides Array strides, represent byte offsets between elements along each dimension.
+/// @param[in] data_buffer Array **first element** data memory ptr.
+/// @param[in] data_buffer_len Array data memory length.
+/// @param[out] err_out Set on error.
+/// # Safety
+/// - All pointer parameters must be valid and non-null
+/// - shape must point to an array of `rank` integers
+/// - data_buffer must point to a buffer of size `data_buffer_len` bytes
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_byte_strides(
+    buffer: *mut line_sender_buffer,
+    name: line_sender_column_name,
+    rank: size_t,
+    shape: *const usize,
+    strides: *const isize,
+    data_buffer: *const u8,
+    data_buffer_len: size_t,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    let buffer = unwrap_buffer_mut(buffer);
+    let name = name.as_name();
+    let view =
+        match StrideArrayView::<f64, 1>::new(rank, shape, strides, data_buffer, data_buffer_len) {
+            Ok(value) => value,
+            Err(err) => {
+                let err_ptr = Box::into_raw(Box::new(line_sender_error(err)));
+                *err_out = err_ptr;
+                return false;
+            }
+        };
+    bubble_err_to_c!(
+        err_out,
+        buffer.column_arr::<ColumnName<'_>, StrideArrayView<'_, f64, 1>, f64>(name, &view)
+    );
+    true
+}
+
+/// Records a float64 multidimensional array with **element count stride specification**.
+///
+/// The `strides` represent element counts between elements along each dimension.
+///
+/// converted to byte strides using f64 size
+/// @param[in] buffer Line buffer object.
+/// @param[in] name Column name.
+/// @param[in] rank Array dims.
+/// @param[in] shape Array shape.
+/// @param[in] strides Array strides, represent element counts between elements along each dimension.
+/// @param[in] data_buffer Array **first element** data memory ptr.
+/// @param[in] data_buffer_len Array data memory length.
+/// @param[out] err_out Set on error.
+/// # Safety
+/// - All pointer parameters must be valid and non-null
+/// - shape must point to an array of `rank` integers
+/// - data_buffer must point to a buffer of size `data_buffer_len` bytes
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_elem_strides(
+    buffer: *mut line_sender_buffer,
+    name: line_sender_column_name,
+    rank: size_t,
+    shape: *const usize,
+    strides: *const isize,
+    data_buffer: *const u8,
+    data_buffer_len: size_t,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    let buffer = unwrap_buffer_mut(buffer);
+    let name = name.as_name();
+    let view = match StrideArrayView::<f64, { std::mem::size_of::<f64>() as isize }>::new(
+        rank,
+        shape,
+        strides,
+        data_buffer,
+        data_buffer_len,
+    ) {
+        Ok(value) => value,
+        Err(err) => {
+            let err_ptr = Box::into_raw(Box::new(line_sender_error(err)));
+            *err_out = err_ptr;
+            return false;
+        }
+    };
+    bubble_err_to_c!(
+            err_out,
+            buffer.column_arr::<ColumnName<'_>, StrideArrayView<'_, f64,  { std::mem::size_of::<f64>() as isize }>, f64>(name, &view)
+        );
+    true
+}
+
 /// Record a nanosecond timestamp value for the given column.
 /// @param[in] buffer Line buffer object.
 /// @param[in] name Column name.
@@ -921,6 +1081,21 @@ pub unsafe extern "C" fn line_sender_buffer_at_now(
 ) -> bool {
     let buffer = unwrap_buffer_mut(buffer);
     bubble_err_to_c!(err_out, buffer.at_now());
+    true
+}
+
+/**
+ * Check whether the buffer is ready to be flushed.
+ * If this returns false, the buffer is incomplete and cannot be sent,
+ * and an error message is set to indicate the problem.
+ */
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_buffer_check_can_flush(
+    buffer: *const line_sender_buffer,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    let buffer = unwrap_buffer(buffer);
+    bubble_err_to_c!(err_out, buffer.check_can_flush());
     true
 }
 
@@ -1066,6 +1241,16 @@ pub unsafe extern "C" fn line_sender_opts_token_y(
     upd_opts!(opts, err_out, token_y, token_y.as_str())
 }
 
+/// set the line protocol version.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_protocol_version(
+    opts: *mut line_sender_opts,
+    version: ProtocolVersion,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    upd_opts!(opts, err_out, protocol_version, version.into())
+}
+
 /// Configure how long to wait for messages from the QuestDB server during
 /// the TLS handshake and authentication process.
 /// The value is in milliseconds, and the default is 15 seconds.
@@ -1129,6 +1314,17 @@ pub unsafe extern "C" fn line_sender_opts_max_buf_size(
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     upd_opts!(opts, err_out, max_buf_size, max_buf_size)
+}
+
+/// Ser the maximum length of a table or column name in bytes.
+/// The default is 127 bytes.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_opts_max_name_len(
+    opts: *mut line_sender_opts,
+    max_name_len: size_t,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    upd_opts!(opts, err_out, max_name_len, max_name_len)
 }
 
 /// Set the cumulative duration spent in retries.
@@ -1293,6 +1489,33 @@ unsafe fn unwrap_sender<'a>(sender: *const line_sender) -> &'a Sender {
 
 unsafe fn unwrap_sender_mut<'a>(sender: *mut line_sender) -> &'a mut Sender {
     &mut (*sender).0
+}
+
+/// Return the sender's protocol version.
+/// This is either the protocol version that was set explicitly,
+/// or the one that was auto-detected during the connection process.
+/// If connecting via TCP and not overridden, the value is V1.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_get_protocol_version(
+    sender: *const line_sender,
+) -> ProtocolVersion {
+    unwrap_sender(sender).protocol_version().into()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_get_max_name_len(sender: *const line_sender) -> size_t {
+    unwrap_sender(sender).max_name_len()
+}
+
+/// Construct a `line_sender_buffer` with a `max_name_len` of `127` and sender's default protocol version
+/// which is the same as the QuestDB server default.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_buffer_new_for_sender(
+    sender: *const line_sender,
+) -> *mut line_sender_buffer {
+    let sender = unwrap_sender(sender);
+    let buffer = sender.new_buffer();
+    Box::into_raw(Box::new(line_sender_buffer(buffer)))
 }
 
 /// Tell whether the sender is no longer usable and must be closed.

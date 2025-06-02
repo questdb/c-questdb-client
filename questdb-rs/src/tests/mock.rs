@@ -36,8 +36,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::ingress;
 #[cfg(feature = "ilp-over-http")]
 use std::io::Write;
+
+use super::ndarr::ArrayColumnTypeTag;
 
 const CLIENT: Token = Token(0);
 
@@ -50,7 +53,9 @@ pub struct MockServer {
     tls_conn: Option<ServerConnection>,
     pub host: &'static str,
     pub port: u16,
-    pub msgs: Vec<String>,
+    pub msgs: Vec<Vec<u8>>,
+    #[cfg(feature = "ilp-over-http")]
+    settings_response: serde_json::Value,
 }
 
 pub fn certs_dir() -> std::path::PathBuf {
@@ -206,6 +211,8 @@ impl MockServer {
             host: "localhost",
             port,
             msgs: Vec::new(),
+            #[cfg(feature = "ilp-over-http")]
+            settings_response: serde_json::Value::Null,
         })
     }
 
@@ -300,6 +307,25 @@ impl MockServer {
         } else {
             client.read(buf)
         }
+    }
+
+    #[cfg(feature = "ilp-over-http")]
+    pub fn configure_settings_response(mut self, supported_versions: &[u16]) -> Self {
+        if supported_versions.is_empty() {
+            self.settings_response = serde_json::json!({"version": "8.1.2"});
+        } else {
+            self.settings_response = serde_json::json!(
+                {"config":{"release.type":"OSS","release.version":"[DEVELOPMENT]",
+                    "line.proto.support.versions":supported_versions,
+                    "ilp.proto.transports":["tcp", "http"],
+                    "posthog.enabled":false,
+                    "posthog.api.key":null,
+                    "cairo.max.file.name.length":127},
+                    "preferences.version":0,
+                    "preferences":{}}
+            );
+        }
+        self
     }
 
     #[cfg(feature = "ilp-over-http")]
@@ -455,6 +481,15 @@ impl MockServer {
     }
 
     #[cfg(feature = "ilp-over-http")]
+    pub fn send_settings_response(&mut self) -> io::Result<()> {
+        let response = HttpResponse::empty()
+            .with_status(200, "OK")
+            .with_body_json(&self.settings_response);
+        self.send_http_response(response, Some(2.0))?;
+        Ok(())
+    }
+
+    #[cfg(feature = "ilp-over-http")]
     pub fn send_http_response_q(&mut self, response: HttpResponse) -> io::Result<()> {
         self.send_http_response(response, Some(5.0))
     }
@@ -465,6 +500,14 @@ impl MockServer {
         let deadline = Instant::now() + Duration::from_secs_f64(wait_timeout_sec);
         let (pos, method, path) = self.recv_http_method(&mut accum, deadline)?;
         let (pos, headers) = self.recv_http_headers(pos, &mut accum, deadline)?;
+        if &method == "GET" {
+            return Ok(HttpRequest {
+                method,
+                path,
+                headers,
+                body: vec![],
+            });
+        }
         let content_length = headers
             .get("content-length")
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Missing Content-Length"))?
@@ -521,15 +564,47 @@ impl MockServer {
 
         let mut received_count = 0usize;
         let mut head = 0usize;
-        for index in 1..accum.len() {
+        let binary_length = 0usize;
+        let mut index = 1;
+
+        while index < accum.len() {
             let last = accum[index];
             let prev = accum[index - 1];
-            if (last == b'\n') && (prev != b'\\') {
+            if last == b'=' && prev == b'=' {
+                index += 1;
+                // calc binary length
+                let binary_type = accum[index];
+                if binary_type == ingress::DOUBLE_BINARY_FORMAT_TYPE {
+                    index += size_of::<f64>() + 1;
+                } else if binary_type == ingress::ARRAY_BINARY_FORMAT_TYPE {
+                    index += 1;
+                    let element_type = match ArrayColumnTypeTag::try_from(accum[index]) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            return Err(io::Error::other(e));
+                        }
+                    };
+                    let mut elems_size = element_type.size();
+                    index += 1;
+                    let dims = accum[index] as usize;
+                    index += 1;
+                    for _ in 0..dims {
+                        elems_size *= i32::from_le_bytes(
+                            accum[index..index + size_of::<i32>()].try_into().unwrap(),
+                        ) as usize;
+                        index += size_of::<i32>();
+                    }
+                    index += elems_size;
+                }
+            } else if (last == b'\n') && (prev != b'\\' && binary_length == 0) {
                 let tail = index + 1;
-                let msg = std::str::from_utf8(&accum[head..tail]).unwrap();
-                self.msgs.push(msg.to_owned());
+                let msg = &accum[head..tail];
+                self.msgs.push(msg.to_vec());
                 head = tail;
                 received_count += 1;
+                index = tail;
+            } else {
+                index += 1;
             }
         }
         Ok(received_count)

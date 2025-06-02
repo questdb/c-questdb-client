@@ -3,8 +3,12 @@
 
 This library makes it easy to insert data into [QuestDB](https://questdb.io/).
 
-This client library implements the [InfluxDB Line Protocol](
+This client library implements the QuestDB's variant of the [InfluxDB Line Protocol](
 https://questdb.io/docs/reference/api/ilp/overview/) (ILP) over HTTP and TCP.
+
+When connecting to QuestDB over HTTP, the library will auto-detect the server's
+latest supported version and use it. Version 1 is compatible with
+the [InfluxDB Database](https://docs.influxdata.com/influxdb/v2/reference/syntax/line-protocol/).
 
 * Implementation is in Rust, with no additional
   [run-time or link-time dependencies](doc/BUILD.md#pre-requisites-and-dependencies)
@@ -37,6 +41,21 @@ For an overview and code examples, see the
 
 To understand the protocol in more depth, consult the
 [protocol reference docs](https://questdb.io/docs/reference/api/ilp/overview/).
+
+## Protocol Versions
+
+The library supports the following ILP protocol versions.
+
+These protocol versions are supported over both HTTP and TCP.
+
+If you use HTTP, the library will automatically detect the server's
+latest supported protocol version and use it. If you use TCP, you can specify the
+`protocol_version=N` parameter when constructing the `Sender` object.
+
+| Version | Description                                             | Server Comatibility   |
+| ------- | ------------------------------------------------------- | --------------------- |
+| **1**   | Over HTTP it's compatible InfluxDB Line Protocol (ILP)  | All QuestDB versions  |
+| **2**   | 64-bit floats sent as binary, adds n-dimentional arrays | 8.4.0+ (2023-10-30)   |
 
 ## Getting Started
 

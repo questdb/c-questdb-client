@@ -26,21 +26,33 @@ use crate::{
     ingress::{
         Buffer, CertificateAuthority, Sender, TableName, Timestamp, TimestampMicros, TimestampNanos,
     },
+    tests::assert_err_contains,
     Error, ErrorCode,
 };
 
+use crate::ingress;
+#[cfg(feature = "ndarray")]
+use crate::ingress::ndarr::write_array_data;
+use crate::ingress::ProtocolVersion;
 use crate::tests::{
     mock::{certs_dir, MockServer},
+    ndarr::ArrayColumnTypeTag,
     TestResult,
 };
-
 use core::time::Duration;
-use std::{io, time::SystemTime};
+#[cfg(feature = "ndarray")]
+use ndarray::{arr2, ArrayD};
+use rstest::rstest;
+use std::io;
 
-#[test]
-fn test_basics() -> TestResult {
+#[rstest]
+fn test_basics(
+    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
+) -> TestResult {
+    use std::time::SystemTime;
+
     let mut server = MockServer::new()?;
-    let mut sender = server.lsb_tcp().build()?;
+    let mut sender = server.lsb_tcp().protocol_version(version)?.build()?;
     assert!(!sender.must_close());
     server.accept()?;
 
@@ -54,7 +66,7 @@ fn test_basics() -> TestResult {
     let ts_nanos = TimestampNanos::from_systemtime(ts)?;
     assert_eq!(ts_nanos.as_i64(), ts_nanos_num);
 
-    let mut buffer = Buffer::new();
+    let mut buffer = sender.new_buffer();
     buffer
         .table("test")?
         .symbol("t1", "v1")?
@@ -65,32 +77,165 @@ fn test_basics() -> TestResult {
         .at(ts_nanos)?;
 
     assert_eq!(server.recv_q()?, 0);
-    let exp = format!(
-        "test,t1=v1 f1=0.5,ts1=12345t,ts2={}t,ts3={}t {}\n",
-        ts_micros_num,
-        ts_nanos_num / 1000i64,
-        ts_nanos_num
-    );
-    let exp_byte = exp.as_bytes();
-    assert_eq!(buffer.as_bytes(), exp_byte);
+    let exp = &[
+        "test,t1=v1 ".as_bytes(),
+        f64_to_bytes("f1", 0.5, version).as_slice(),
+        format!(
+            ",ts1=12345t,ts2={}t,ts3={}t {}\n",
+            ts_micros_num,
+            ts_nanos_num / 1000i64,
+            ts_nanos_num
+        )
+        .as_bytes(),
+    ]
+    .concat();
+    assert_eq!(buffer.as_bytes(), exp);
     assert_eq!(buffer.len(), exp.len());
     sender.flush(&mut buffer)?;
     assert_eq!(buffer.len(), 0);
     assert_eq!(buffer.as_bytes(), b"");
     assert_eq!(server.recv_q()?, 1);
-    assert_eq!(server.msgs[0].as_bytes(), exp_byte);
+    assert_eq!(server.msgs[0], *exp);
     Ok(())
 }
 
 #[test]
-fn test_max_buf_size() -> TestResult {
-    let max = 1024;
+fn test_array_f64_basic() -> TestResult {
     let mut server = MockServer::new()?;
-    let mut sender = server.lsb_tcp().max_buf_size(max)?.build()?;
-    assert!(!sender.must_close());
+    let mut sender = server
+        .lsb_tcp()
+        .protocol_version(ProtocolVersion::V2)?
+        .build()?;
     server.accept()?;
 
-    let mut buffer = Buffer::new();
+    let ts = TimestampNanos::now();
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("my_table")?
+        .symbol("device", "A001")?
+        .column_f64("f1", 25.5)?
+        .column_arr("arr1d", &[1.0, 2.0, 3.0])?
+        .at(ts)?;
+
+    assert_eq!(server.recv_q()?, 0);
+
+    let exp = &[
+        b"my_table,device=A001 ",
+        f64_to_bytes("f1", 25.5, ProtocolVersion::V2).as_slice(),
+        b",arr1d=",
+        b"=", // binary field
+        &[ingress::ARRAY_BINARY_FORMAT_TYPE],
+        &[ArrayColumnTypeTag::Double.into()],
+        &[1u8],              // 1D array
+        &3u32.to_le_bytes(), // 3 elements
+        &1.0f64.to_le_bytes(),
+        &2.0f64.to_le_bytes(),
+        &3.0f64.to_le_bytes(),
+        format!(" {}\n", ts.as_i64()).as_bytes(),
+    ]
+    .concat();
+
+    assert_eq!(buffer.as_bytes(), exp);
+    assert_eq!(buffer.len(), exp.len());
+    sender.flush(&mut buffer)?;
+    assert_eq!(buffer.len(), 0);
+    assert_eq!(buffer.as_bytes(), b"");
+    assert_eq!(server.recv_q()?, 1);
+    assert_eq!(server.msgs[0].as_slice(), exp);
+    Ok(())
+}
+
+#[cfg(feature = "ndarray")]
+#[test]
+fn test_array_f64_for_ndarray() -> TestResult {
+    let mut server = MockServer::new()?;
+    let mut sender = server
+        .lsb_tcp()
+        .protocol_version(ProtocolVersion::V2)?
+        .build()?;
+    server.accept()?;
+
+    let ts = TimestampNanos::now();
+    let array_2d = arr2(&[[1.1, 2.2], [3.3, 4.4]]);
+    let array_3d = ArrayD::<f64>::ones(vec![2, 3, 4]);
+
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("my_table")?
+        .symbol("device", "A001")?
+        .column_f64("f1", 25.5)?
+        .column_arr("arr2d", &array_2d.view())?
+        .column_arr("arr3d", &array_3d.view())?
+        .at(ts)?;
+
+    assert_eq!(server.recv_q()?, 0);
+
+    let array_header2d = &[
+        &[b'='][..],
+        &[ingress::ARRAY_BINARY_FORMAT_TYPE],
+        &[ArrayColumnTypeTag::Double.into()],
+        &[2u8],
+        &2i32.to_le_bytes(),
+        &2i32.to_le_bytes(),
+    ]
+    .concat();
+    let mut array_data2d = vec![0u8; 4 * size_of::<f64>()];
+    write_array_data(&array_2d.view(), &mut array_data2d[0..], 32)?;
+
+    let array_header3d = &[
+        &[b'='][..],
+        &[ingress::ARRAY_BINARY_FORMAT_TYPE],
+        &[ArrayColumnTypeTag::Double.into()],
+        &[3u8],
+        &2i32.to_le_bytes(),
+        &3i32.to_le_bytes(),
+        &4i32.to_le_bytes(),
+    ]
+    .concat();
+    let mut array_data3d = vec![0u8; 24 * size_of::<f64>()];
+    write_array_data(
+        &array_3d.view(),
+        &mut array_data3d[0..],
+        24 * size_of::<f64>(),
+    )?;
+
+    let exp = &[
+        "my_table,device=A001 ".as_bytes(),
+        f64_to_bytes("f1", 25.5, ProtocolVersion::V2).as_slice(),
+        ",arr2d=".as_bytes(),
+        array_header2d,
+        array_data2d.as_slice(),
+        ",arr3d=".as_bytes(),
+        array_header3d,
+        array_data3d.as_slice(),
+        format!(" {}\n", ts.as_i64()).as_bytes(),
+    ]
+    .concat();
+
+    assert_eq!(buffer.as_bytes(), exp);
+    assert_eq!(buffer.len(), exp.len());
+    sender.flush(&mut buffer)?;
+    assert_eq!(buffer.len(), 0);
+    assert_eq!(buffer.as_bytes(), b"");
+    assert_eq!(server.recv_q()?, 1);
+    assert_eq!(server.msgs[0].as_slice(), exp);
+    Ok(())
+}
+
+#[rstest]
+fn test_max_buf_size(
+    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
+) -> TestResult {
+    let max = 1024;
+    let mut server = MockServer::new()?;
+    let mut sender = server
+        .lsb_tcp()
+        .protocol_version(version)?
+        .max_buf_size(max)?
+        .build()?;
+    assert!(!sender.must_close());
+    server.accept()?;
+    let mut buffer = sender.new_buffer();
 
     while buffer.len() < max {
         buffer
@@ -102,16 +247,26 @@ fn test_max_buf_size() -> TestResult {
 
     let err = sender.flush(&mut buffer).unwrap_err();
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
-    assert_eq!(
-        err.msg(),
-        "Could not flush buffer: Buffer size of 1026 exceeds maximum configured allowed size of 1024 bytes."
-    );
+    match version {
+        ProtocolVersion::V1 => {
+            assert_eq!(
+                err.msg(),
+                "Could not flush buffer: Buffer size of 1026 exceeds maximum configured allowed size of 1024 bytes."
+            );
+        }
+        ProtocolVersion::V2 => {
+            assert_eq!(
+                err.msg(),
+                "Could not flush buffer: Buffer size of 1025 exceeds maximum configured allowed size of 1024 bytes."
+            );
+        }
+    }
     Ok(())
 }
 
 #[test]
 fn test_table_name_too_long() -> TestResult {
-    let mut buffer = Buffer::with_max_name_len(4);
+    let mut buffer = Buffer::with_max_name_len(ProtocolVersion::V2, 4);
     let name = "a name too long";
     let err = buffer.table(name).unwrap_err();
     assert_eq!(err.code(), ErrorCode::InvalidName);
@@ -124,7 +279,7 @@ fn test_table_name_too_long() -> TestResult {
 
 #[test]
 fn test_row_count() -> TestResult {
-    let mut buffer = Buffer::new();
+    let mut buffer = Buffer::new(ProtocolVersion::V2);
     assert_eq!(buffer.row_count(), 0);
 
     buffer.table("x")?.symbol("y", "z1")?.at_now()?;
@@ -262,9 +417,11 @@ fn test_bad_key(
 
 #[test]
 fn test_timestamp_overloads() -> TestResult {
+    use std::time::SystemTime;
+
     let tbl_name = TableName::new("tbl_name")?;
 
-    let mut buffer = Buffer::new();
+    let mut buffer = Buffer::new(ProtocolVersion::V2);
     buffer
         .table(tbl_name)?
         .column_ts("a", TimestampMicros::new(12345))?
@@ -309,7 +466,7 @@ fn test_chrono_timestamp() -> TestResult {
     let ts: DateTime<Utc> = Utc.with_ymd_and_hms(1970, 1, 1, 0, 0, 1).unwrap();
     let ts = TimestampNanos::from_datetime(ts)?;
 
-    let mut buffer = Buffer::new();
+    let mut buffer = Buffer::new(ProtocolVersion::V2);
     buffer.table(tbl_name)?.column_ts("a", ts)?.at(ts)?;
 
     let exp = b"tbl_name a=1000000t 1000000000\n";
@@ -320,7 +477,7 @@ fn test_chrono_timestamp() -> TestResult {
 
 macro_rules! column_name_too_long_test_impl {
     ($column_fn:ident, $value:expr) => {{
-        let mut buffer = Buffer::with_max_name_len(4);
+        let mut buffer = Buffer::with_max_name_len(ProtocolVersion::V2, 4);
         let name = "a name too long";
         let err = buffer.table("tbl")?.$column_fn(name, $value).unwrap_err();
         assert_eq!(err.code(), ErrorCode::InvalidName);
@@ -358,17 +515,27 @@ fn test_str_column_name_too_long() -> TestResult {
 }
 
 #[test]
-fn test_tls_with_file_ca() -> TestResult {
+fn test_arr_column_name_too_long() -> TestResult {
+    column_name_too_long_test_impl!(column_arr, &[1.0, 2.0, 3.0])
+}
+
+#[rstest]
+fn test_tls_with_file_ca(
+    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
+) -> TestResult {
     let mut ca_path = certs_dir();
     ca_path.push("server_rootCA.pem");
 
     let server = MockServer::new()?;
-    let lsb = server.lsb_tcps().tls_roots(ca_path)?;
+    let lsb = server
+        .lsb_tcps()
+        .protocol_version(version)?
+        .tls_roots(ca_path)?;
     let server_jh = server.accept_tls();
     let mut sender = lsb.build()?;
     let mut server: MockServer = server_jh.join().unwrap()?;
 
-    let mut buffer = Buffer::new();
+    let mut buffer = sender.new_buffer();
     buffer
         .table("test")?
         .symbol("t1", "v1")?
@@ -376,12 +543,17 @@ fn test_tls_with_file_ca() -> TestResult {
         .at(TimestampNanos::new(10000000))?;
 
     assert_eq!(server.recv_q()?, 0);
-    let exp = b"test,t1=v1 f1=0.5 10000000\n";
+    let exp = &[
+        "test,t1=v1 ".as_bytes(),
+        f64_to_bytes("f1", 0.5, version).as_slice(),
+        " 10000000\n".as_bytes(),
+    ]
+    .concat();
     assert_eq!(buffer.as_bytes(), exp);
     assert_eq!(buffer.len(), exp.len());
     sender.flush(&mut buffer)?;
     assert_eq!(server.recv_q()?, 1);
-    assert_eq!(server.msgs[0].as_bytes(), exp);
+    assert_eq!(server.msgs[0].as_slice(), exp);
     Ok(())
 }
 
@@ -419,7 +591,7 @@ fn expect_eventual_disconnect(sender: &mut Sender) {
     let mut retry = || {
         for _ in 0..1000 {
             std::thread::sleep(Duration::from_millis(100));
-            let mut buffer = Buffer::new();
+            let mut buffer = Buffer::new(ProtocolVersion::V2);
             buffer.table("test_table")?.symbol("s1", "v1")?.at_now()?;
             sender.flush(&mut buffer)?;
         }
@@ -435,7 +607,7 @@ fn test_plain_to_tls_server() -> TestResult {
     let server = MockServer::new()?;
     let lsb = server.lsb_tcp().auth_timeout(Duration::from_millis(500))?;
     let server_jh = server.accept_tls();
-    let maybe_sender = lsb.build();
+    let maybe_sender = lsb.protocol_version(ProtocolVersion::V2)?.build();
     let server_err = server_jh.join().unwrap().unwrap_err();
 
     // The server failed to handshake, so disconnected the client.
@@ -453,15 +625,20 @@ fn test_plain_to_tls_server() -> TestResult {
 }
 
 #[cfg(feature = "insecure-skip-verify")]
-#[test]
-fn test_tls_insecure_skip_verify() -> TestResult {
+#[rstest]
+fn test_tls_insecure_skip_verify(
+    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
+) -> TestResult {
     let server = MockServer::new()?;
-    let lsb = server.lsb_tcps().tls_verify(false)?;
+    let lsb = server
+        .lsb_tcps()
+        .protocol_version(version)?
+        .tls_verify(false)?;
     let server_jh = server.accept_tls();
     let mut sender = lsb.build()?;
     let mut server: MockServer = server_jh.join().unwrap()?;
 
-    let mut buffer = Buffer::new();
+    let mut buffer = sender.new_buffer();
     buffer
         .table("test")?
         .symbol("t1", "v1")?
@@ -469,12 +646,17 @@ fn test_tls_insecure_skip_verify() -> TestResult {
         .at(TimestampNanos::new(10000000))?;
 
     assert_eq!(server.recv_q()?, 0);
-    let exp = b"test,t1=v1 f1=0.5 10000000\n";
+    let exp = &[
+        "test,t1=v1 ".as_bytes(),
+        f64_to_bytes("f1", 0.5, version).as_slice(),
+        " 10000000\n".as_bytes(),
+    ]
+    .concat();
     assert_eq!(buffer.as_bytes(), exp);
     assert_eq!(buffer.len(), exp.len());
     sender.flush(&mut buffer)?;
     assert_eq!(server.recv_q()?, 1);
-    assert_eq!(server.msgs[0].as_bytes(), exp);
+    assert_eq!(server.msgs[0].as_slice(), exp);
     Ok(())
 }
 
@@ -494,4 +676,41 @@ fn bad_uppercase_addr() {
     let err = res.unwrap_err();
     assert!(err.code() == ErrorCode::ConfigError);
     assert!(err.msg() == "Missing \"addr\" parameter in config string");
+}
+
+#[test]
+fn tcp_mismatched_buffer_and_sender_version() -> TestResult {
+    let server = MockServer::new()?;
+    let mut sender = server
+        .lsb_tcp()
+        .protocol_version(ProtocolVersion::V2)?
+        .build()?;
+    let mut buffer = Buffer::new(ProtocolVersion::V1);
+    buffer.table("test")?.symbol("t1", "v1")?.at_now()?;
+    assert_err_contains(
+        sender.flush(&mut buffer),
+        ErrorCode::ProtocolVersionError,
+        "Attempting to send with protocol version v1 \
+        but the sender is configured to use protocol version v2",
+    );
+    Ok(())
+}
+
+pub(crate) fn f64_to_bytes(name: &str, value: f64, version: ProtocolVersion) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(name.as_bytes());
+    buf.push(b'=');
+
+    match version {
+        ProtocolVersion::V1 => {
+            let mut ser = crate::ingress::F64Serializer::new(value);
+            buf.extend_from_slice(ser.as_str().as_bytes());
+        }
+        ProtocolVersion::V2 => {
+            buf.push(b'=');
+            buf.push(crate::ingress::DOUBLE_BINARY_FORMAT_TYPE);
+            buf.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    buf
 }

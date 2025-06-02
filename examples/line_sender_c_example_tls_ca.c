@@ -11,6 +11,7 @@ static bool example(const char* ca_path, const char* host, const char* port)
     line_sender_buffer* buffer = NULL;
     char* conf_str = concat(
         "tcps::addr=", host, ":", port, ";",
+        "protocol_version=2;"
         "tls_roots=", ca_path, ";",
         "username=admin;"
         "token=5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48;"
@@ -31,7 +32,7 @@ static bool example(const char* ca_path, const char* host, const char* port)
     free(conf_str);
     conf_str = NULL;
 
-    buffer = line_sender_buffer_new();
+    buffer = line_sender_buffer_new_for_sender(sender);
     line_sender_buffer_reserve(buffer, 64 * 1024);  // 64KB buffer initial size.
 
     // We prepare all our table names and column names in advance.

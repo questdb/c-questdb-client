@@ -25,6 +25,7 @@
 #include "mock_server.hpp"
 
 #include <string.h>
+#include <string>
 
 #if defined(PLATFORM_UNIX)
 #    include <fcntl.h>
@@ -190,43 +191,81 @@ bool mock_server::wait_for_data(std::optional<double> wait_timeout_sec)
     return !!count;
 }
 
+int32_t bytes_to_int32_le(const std::byte* bytes)
+{
+    return static_cast<int32_t>(
+        (bytes[0] << 0) | (bytes[1] << 8) | (bytes[2] << 16) |
+        (bytes[3] << 24));
+}
+
 size_t mock_server::recv(double wait_timeout_sec)
 {
     if (!wait_for_data(wait_timeout_sec))
         return 0;
 
-    char chunk[1024];
+    std::byte chunk[1024];
     size_t chunk_len{sizeof(chunk)};
-    std::vector<char> accum;
+    std::vector<std::byte> accum;
     for (;;)
     {
         wait_for_data();
-        sock_ssize_t count =
-            ::recv(_conn_fd, &chunk[0], static_cast<sock_len_t>(chunk_len), 0);
+        sock_ssize_t count = ::recv(
+            _conn_fd,
+            reinterpret_cast<char*>(&chunk[0]),
+            static_cast<sock_len_t>(chunk_len),
+            0);
         if (count == -1)
             throw std::runtime_error{"Bad `recv()`."};
         const size_t u_count = static_cast<size_t>(count);
         accum.insert(accum.end(), chunk, chunk + u_count);
         if (accum.size() < 2)
             continue;
-        if ((accum[accum.size() - 1] == '\n') &&
-            (accum[accum.size() - 2] != '\\'))
+        if ((accum[accum.size() - 1] == std::byte('\n')) &&
+            (accum[accum.size() - 2] != std::byte('\\')))
             break;
     }
 
     size_t received_count{0};
-    const char* head{&accum[0]};
-    for (size_t index = 1; index < accum.size(); ++index)
+    const std::byte* head{&accum[0]};
+    size_t index{1};
+    while (index < accum.size())
     {
-        const char& last = accum[index];
-        const char& prev = accum[index - 1];
-        if ((last == '\n') && (prev != '\\'))
+        const std::byte& last = accum[index];
+        const std::byte& prev = accum[index - 1];
+        if (last == std::byte('=') && prev == std::byte('='))
         {
-            const char* tail{&last + 1};
-            _msgs.emplace_back(head, tail - head);
+            index++;
+            std::byte& binary_type = accum[index];
+            if (binary_type == std::byte(16)) // DOUBLE_BINARY_FORMAT_TYPE
+                index += sizeof(double) + 1;
+            else if (binary_type == std::byte(14)) // ARRAY_BINARY_FORMAT_TYPE
+            {
+                index++;
+                const std::byte& array_elem_type = accum[index];
+                if (array_elem_type == std::byte(10))
+                {
+                    index++;
+                    const size_t dims = size_t(accum[index]);
+                    index++;
+                    size_t data_size{sizeof(double)};
+                    for (size_t i = 0; i < dims; i++)
+                    {
+                        data_size *= bytes_to_int32_le(&accum[index]);
+                        index += sizeof(int32_t);
+                    }
+                    index += data_size;
+                }
+            }
+            continue;
+        }
+        else if ((last == std::byte('\n')) && (prev != std::byte('\\')))
+        {
+            const std::byte* tail{&last + 1};
+            _msgs.emplace_back(head, tail);
             head = tail;
             ++received_count;
         }
+        index++;
     }
     return received_count;
 }

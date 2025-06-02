@@ -1,12 +1,12 @@
 use questdb::{
-    ingress::{Buffer, Sender, TimestampNanos},
+    ingress::{Sender, TimestampNanos},
     Result,
 };
 
 fn main() -> Result<()> {
     // Read configuration string from the `QDB_CLIENT_CONF` environment variable.
     let mut sender = Sender::from_env()?;
-    let mut buffer = Buffer::new();
+    let mut buffer = sender.new_buffer();
     buffer
         .table("trades")?
         .symbol("symbol", "ETH-USD")?

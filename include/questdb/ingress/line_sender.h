@@ -77,6 +77,19 @@ typedef enum line_sender_error_code
 
     /** Bad configuration. */
     line_sender_error_config_error,
+
+    /** Currently, only arrays with a maximum 32 dimensions are supported. */
+    line_sender_error_array_large_dim,
+
+    /** ArrayView internal error, such as failure to get the size of a valid
+     * dimension. */
+    line_sender_error_array_view_internal_error,
+
+    /**  Write arrayView to sender buffer error. */
+    line_sender_error_array_view_write_to_buffer_error,
+
+    /**  Line sender protocol version error. */
+    line_sender_error_protocol_version_error,
 } line_sender_error_code;
 
 /** The protocol used to connect with. */
@@ -94,6 +107,24 @@ typedef enum line_sender_protocol
     /** InfluxDB Line Protocol over HTTP with TLS. */
     line_sender_protocol_https,
 } line_sender_protocol;
+
+/** The line protocol version used to write data to buffer. */
+typedef enum line_sender_protocol_version
+{
+    /**
+     * Version 1 of InfluxDB Line Protocol.
+     * This version is compatible with the InfluxDB database.
+     */
+    line_sender_protocol_version_1 = 1,
+
+    /**
+     * Version 2 of InfluxDB Line Protocol.
+     * Uses a binary format serialization for f64, and supports
+     * the array data type.
+     * This version is specific to QuestDB and not compatible with InfluxDB.
+     */
+    line_sender_protocol_version_2 = 2,
+} line_sender_protocol_version;
 
 /** Possible sources of the root certificates used to validate the server's
  * TLS certificate. */
@@ -282,9 +313,14 @@ typedef struct line_sender_buffer line_sender_buffer;
 /**
  * Construct a `line_sender_buffer` with a `max_name_len` of `127`, which is
  * the same as the QuestDB server default.
+ * You should prefer to use `line_sender_for_sender()` instead, which
+ * automatically creates a buffer of the same protocol version as the sender.
+ * This is useful as it can rely on the sender's ability to auto-detect the
+ * protocol version when communicating over HTTP.
  */
 LINESENDER_API
-line_sender_buffer* line_sender_buffer_new();
+line_sender_buffer* line_sender_buffer_new(
+    line_sender_protocol_version version);
 
 /**
  * Construct a `line_sender_buffer` with a custom maximum length for table
@@ -294,7 +330,8 @@ line_sender_buffer* line_sender_buffer_new();
  * `line_sender_buffer_new()` instead.
  */
 LINESENDER_API
-line_sender_buffer* line_sender_buffer_with_max_name_len(size_t max_name_len);
+line_sender_buffer* line_sender_buffer_with_max_name_len(
+    line_sender_protocol_version version, size_t max_name_len);
 
 /** Release the `line_sender_buffer` object. */
 LINESENDER_API
@@ -462,6 +499,62 @@ bool line_sender_buffer_column_str(
     line_sender_error** err_out);
 
 /**
+ * Record a multidimensional array of double for the given column.
+ *
+ * This API uses BYTE-LEVEL STRIDES where the stride values represent the
+ * number of bytes between consecutive elements along each dimension.
+ *
+ * @param[in] buffer Line buffer object.
+ * @param[in] name Column name.
+ * @param[in] rank Number of dimensions of the array.
+ * @param[in] shape Array of dimension sizes (length = `rank`).
+ *                   Each element must be a positive integer.
+ * @param[in] strides Array strides.
+ * @param[in] data_buffer First array element data.
+ * @param[in] data_buffer_len Bytes length of the array data.
+ * @param[out] err_out Set to an error object on failure (if non-NULL).
+ * @return true on success, false on error.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_f64_arr_byte_strides(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    size_t rank,
+    const uintptr_t* shape,
+    const intptr_t* strides,
+    const uint8_t* data_buffer,
+    size_t data_buffer_len,
+    line_sender_error** err_out);
+
+/**
+ * Record a multidimensional array of double for the given column.
+ *
+ * This function uses ELEMENT-LEVEL STRIDES where the stride values represent
+ * the number of elements between consecutive elements along each dimension.
+ *
+ * @param[in] buffer Line buffer object.
+ * @param[in] name Column name.
+ * @param[in] rank Number of dimensions of the array.
+ * @param[in] shape Array of dimension sizes (length = `rank`).
+ *                   Each element must be a positive integer.
+ * @param[in] strides Array strides.
+ * @param[in] data_buffer First array element data.
+ * @param[in] data_buffer_len Bytes length of the array data.
+ * @param[out] err_out Set to an error object on failure (if non-NULL).
+ * @return true on success, false on error.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_f64_arr_elem_strides(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    size_t rank,
+    const uintptr_t* shape,
+    const intptr_t* strides,
+    const uint8_t* data_buffer,
+    size_t data_buffer_len,
+    line_sender_error** err_out);
+
+/**
  * Record a nanosecond timestamp value for the given column.
  * @param[in] buffer Line buffer object.
  * @param[in] name Column name.
@@ -562,6 +655,15 @@ bool line_sender_buffer_at_micros(
 LINESENDER_API
 bool line_sender_buffer_at_now(
     line_sender_buffer* buffer, line_sender_error** err_out);
+
+/**
+ * Check whether the buffer is ready to be flushed.
+ * If this returns false, the buffer is incomplete and cannot be sent,
+ * and an error message is set to indicate the problem.
+ */
+LINESENDER_API
+bool line_sender_buffer_check_can_flush(
+    const line_sender_buffer* buffer, line_sender_error** err_out);
 
 /////////// Connecting, sending and disconnecting.
 
@@ -694,6 +796,15 @@ bool line_sender_opts_token_y(
     line_sender_error** err_out);
 
 /**
+ * set the line protocol version.
+ */
+LINESENDER_API
+bool line_sender_opts_protocol_version(
+    line_sender_opts* opts,
+    line_sender_protocol_version version,
+    line_sender_error** err_out);
+
+/**
  * Configure how long to wait for messages from the QuestDB server during
  * the TLS handshake and authentication process.
  * The value is in milliseconds, and the default is 15 seconds.
@@ -740,6 +851,14 @@ bool line_sender_opts_tls_roots(
 LINESENDER_API
 bool line_sender_opts_max_buf_size(
     line_sender_opts* opts, size_t max_buf_size, line_sender_error** err_out);
+
+/**
+ * Set the maximum length of a table or column name in bytes.
+ * The default is 127 bytes.
+ */
+LINESENDER_API
+bool line_sender_opts_max_name_len(
+    line_sender_opts* opts, size_t max_name_len, line_sender_error** err_out);
 
 /**
  * Set the cumulative duration spent in retries.
@@ -851,6 +970,33 @@ line_sender* line_sender_from_conf(
  */
 LINESENDER_API
 line_sender* line_sender_from_env(line_sender_error** err_out);
+
+/**
+ * Return the sender's protocol version.
+ * This is either the protocol version that was set explicitly,
+ * or the one that was auto-detected during the connection process.
+ * If connecting via TCP and not overridden, the value is V1.
+ */
+LINESENDER_API
+line_sender_protocol_version line_sender_get_protocol_version(
+    const line_sender* sender);
+
+/**
+ * Returns the configured max_name_len, or the default value of 127.
+ */
+LINESENDER_API
+size_t line_sender_get_max_name_len(const line_sender* sender);
+
+/**
+ * Construct a `line_sender_buffer` with the sender's
+ * configured protocol version and other parameters.
+ * This is equivalent to calling:
+ *   line_sender_buffer_new(
+ *       line_sender_get_protocol_version(sender),
+ *       line_sender_get_max_name_len(sender))
+ */
+line_sender_buffer* line_sender_buffer_new_for_sender(
+    const line_sender* sender);
 
 /**
  * Tell whether the sender is no longer usable and must be closed.

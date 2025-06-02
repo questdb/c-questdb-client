@@ -9,7 +9,7 @@ static bool example(const char* host, const char* port)
     line_sender_error* err = NULL;
     line_sender* sender = NULL;
     line_sender_buffer* buffer = NULL;
-    char* conf_str = concat("tcp::addr=", host, ":", port, ";");
+    char* conf_str = concat("tcp::addr=", host, ":", port, ";protocol_version=2;");
     if (!conf_str) {
         fprintf(stderr, "Could not concatenate configuration string.\n");
         return false;
@@ -25,7 +25,7 @@ static bool example(const char* host, const char* port)
     free(conf_str);
     conf_str = NULL;
 
-    buffer = line_sender_buffer_new();
+    buffer = line_sender_buffer_new_for_sender(sender);
     line_sender_buffer_reserve(buffer, 64 * 1024);  // 64KB buffer initial size.
 
     // We prepare all our table names and column names in advance.

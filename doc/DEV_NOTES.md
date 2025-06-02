@@ -38,14 +38,8 @@ either of the two Rust projects:
 * [questdb-rs](../questdb-rs/) - Core library
 * [questdb-rs-ffi](../questdb-rs-ffi/) - C bindings layer.
 
-If you are editing the C functions in the `questdb-rs-ffi` project and what to
-see the resulting generated header file, call `cargo build --features gen_h`.
-
 Note that to reduce compile time we don't use cbindgen in the header we ship,
 which also contains additional formatting and comments.
-
-Similarly, we also support generating Cython bindings via the `gen_cython`
-feature.
 
 This generated files should be not be checked in:
 * `include/questdb/ingress/line_sender.gen.h`

@@ -20,9 +20,8 @@ static bool example(std::string_view host, std::string_view port)
         const auto price_name = "price"_cn;
         const auto amount_name = "amount"_cn;
 
-        questdb::ingress::line_sender_buffer buffer;
-        buffer
-            .table(table_name)
+        questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
+        buffer.table(table_name)
             .symbol(symbol_name, "ETH-USD"_utf8)
             .symbol(side_name, "sell"_utf8)
             .column(price_name, 2615.54)
@@ -40,10 +39,7 @@ static bool example(std::string_view host, std::string_view port)
     }
     catch (const questdb::ingress::line_sender_error& err)
     {
-        std::cerr
-            << "Error running example: "
-            << err.what()
-            << std::endl;
+        std::cerr << "Error running example: " << err.what() << std::endl;
 
         return false;
     }
@@ -56,12 +52,11 @@ static bool displayed_help(int argc, const char* argv[])
         const std::string_view arg{argv[index]};
         if ((arg == "-h"sv) || (arg == "--help"sv))
         {
-            std::cerr
-                <<  "Usage:\n"
-                <<  "line_sender_c_example: [HOST [PORT]]\n"
-                << "    HOST: ILP host (defaults to \"localhost\").\n"
-                << "    PORT: ILP port (defaults to \"9009\")."
-                << std::endl;
+            std::cerr << "Usage:\n"
+                      << "line_sender_c_example: [HOST [PORT]]\n"
+                      << "    HOST: ILP host (defaults to \"localhost\").\n"
+                      << "    PORT: ILP port (defaults to \"9009\")."
+                      << std::endl;
             return true;
         }
     }
