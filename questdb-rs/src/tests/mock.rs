@@ -310,7 +310,11 @@ impl MockServer {
     }
 
     #[cfg(feature = "ilp-over-http")]
-    pub fn configure_settings_response(mut self, supported_versions: &[u16]) -> Self {
+    pub fn configure_settings_response(
+        mut self,
+        supported_versions: &[u16],
+        max_name_len: usize,
+    ) -> Self {
         if supported_versions.is_empty() {
             self.settings_response = serde_json::json!({"version": "8.1.2"});
         } else {
@@ -320,7 +324,7 @@ impl MockServer {
                     "ilp.proto.transports":["tcp", "http"],
                     "posthog.enabled":false,
                     "posthog.api.key":null,
-                    "cairo.max.file.name.length":127},
+                    "cairo.max.file.name.length": max_name_len},
                     "preferences.version":0,
                     "preferences":{}}
             );

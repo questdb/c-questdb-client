@@ -57,7 +57,7 @@ use ring::{
     signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING},
 };
 
-pub(crate) const MAX_NAME_LEN_DEFAULT: usize = 127;
+const MAX_NAME_LEN_DEFAULT: usize = 127;
 
 /// The maximum allowed dimensions for arrays.
 pub const MAX_ARRAY_DIMS: usize = 32;
@@ -2618,7 +2618,7 @@ impl SenderBuilder {
                             self.port.deref()
                         );
                         let (protocol_versions, server_max_name_len) =
-                            read_server_settings(http_state, settings_url)?;
+                            read_server_settings(http_state, settings_url, max_name_len)?;
                         max_name_len = server_max_name_len;
                         if protocol_versions.contains(&ProtocolVersion::V2) {
                             ProtocolVersion::V2
