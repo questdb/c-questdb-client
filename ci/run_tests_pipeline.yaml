@@ -126,7 +126,7 @@ stages:
             submodules: false
           - template: compile.yaml
           - script: |
-              git clone -b nd_arr --depth 1 https://github.com/questdb/questdb.git
+              git clone -b master --depth 1 https://github.com/questdb/questdb.git
             displayName: git clone questdb
           - task: Maven@3
             displayName: "Compile QuestDB"
