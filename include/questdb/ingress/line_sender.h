@@ -78,15 +78,8 @@ typedef enum line_sender_error_code
     /** Bad configuration. */
     line_sender_error_config_error,
 
-    /** Currently, only arrays with a maximum 32 dimensions are supported. */
-    line_sender_error_array_large_dim,
-
-    /** ArrayView internal error, such as failure to get the size of a valid
-     * dimension. */
-    line_sender_error_array_view_internal_error,
-
-    /**  Write arrayView to sender buffer error. */
-    line_sender_error_array_view_write_to_buffer_error,
+    /** There was an error serializing an array. */
+    line_sender_error_array_error,
 
     /**  Line sender protocol version error. */
     line_sender_error_protocol_version_error,

@@ -140,14 +140,8 @@ pub enum line_sender_error_code {
     /// Bad configuration.
     line_sender_error_config_error,
 
-    /// Currently, only arrays with a maximum 32 dimensions are supported.
-    line_sender_error_array_large_dim,
-
-    /// ArrayView internal error, such as failure to get the size of a valid dimension.
-    line_sender_error_array_view_internal_error,
-
-    /// Write arrayView to sender buffer error.
-    line_sender_error_array_view_write_to_buffer_error,
+    /// There was an error serializing an array.
+    line_sender_error_array_error,
 
     /// Line sender protocol version error.
     line_sender_error_protocol_version_error,
@@ -175,15 +169,7 @@ impl From<ErrorCode> for line_sender_error_code {
                 line_sender_error_code::line_sender_error_server_flush_error
             }
             ErrorCode::ConfigError => line_sender_error_code::line_sender_error_config_error,
-            ErrorCode::ArrayHasTooManyDims => {
-                line_sender_error_code::line_sender_error_array_large_dim
-            }
-            ErrorCode::ArrayViewError => {
-                line_sender_error_code::line_sender_error_array_view_internal_error
-            }
-            ErrorCode::ArrayWriteToBufferError => {
-                line_sender_error_code::line_sender_error_array_view_write_to_buffer_error
-            }
+            ErrorCode::ArrayError => line_sender_error_code::line_sender_error_array_error,
             ErrorCode::ProtocolVersionError => {
                 line_sender_error_code::line_sender_error_protocol_version_error
             }

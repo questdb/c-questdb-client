@@ -71,7 +71,7 @@ where
     fn dim(&self, index: usize) -> Result<usize, Error> {
         if index >= self.dims {
             return Err(fmt_error!(
-                ArrayViewError,
+                ArrayError,
                 "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
                 index,
                 self.dims
@@ -151,13 +151,13 @@ where
     ) -> Result<Self, Error> {
         if dims == 0 {
             return Err(fmt_error!(
-                ArrayViewError,
+                ArrayError,
                 "Zero-dimensional arrays are not supported",
             ));
         }
         if data_len > MAX_ARRAY_BUFFER_SIZE {
             return Err(fmt_error!(
-                ArrayViewError,
+                ArrayError,
                 "Array buffer size too big: {}, maximum: {}",
                 data_len,
                 MAX_ARRAY_BUFFER_SIZE
@@ -168,12 +168,12 @@ where
             .iter()
             .try_fold(std::mem::size_of::<T>(), |acc, &dim| {
                 acc.checked_mul(dim)
-                    .ok_or_else(|| fmt_error!(ArrayViewError, "Array buffer size too big"))
+                    .ok_or_else(|| fmt_error!(ArrayError, "Array buffer size too big"))
             })?;
 
         if size != data_len {
             return Err(fmt_error!(
-                ArrayViewError,
+                ArrayError,
                 "Array buffer length mismatch (actual: {}, expected: {})",
                 data_len,
                 size
@@ -299,7 +299,7 @@ mod tests {
 
             if bytes.len() != expect_size {
                 return Err(fmt_error!(
-                    ArrayWriteToBufferError,
+                    ArrayError,
                     "Array write buffer length mismatch (actual: {}, expected: {})",
                     expect_size,
                     bytes.len()
@@ -308,7 +308,7 @@ mod tests {
 
             if buf.len() < bytes.len() {
                 return Err(fmt_error!(
-                    ArrayWriteToBufferError,
+                    ArrayError,
                     "Buffer capacity {} < required {}",
                     buf.len(),
                     bytes.len()
@@ -334,7 +334,7 @@ mod tests {
         }
         if total_len != expect_size {
             return Err(fmt_error!(
-                ArrayWriteToBufferError,
+                ArrayError,
                 "Array write buffer length mismatch (actual: {}, expected: {})",
                 total_len,
                 expect_size
@@ -445,7 +445,7 @@ mod tests {
             )
         };
         let err = result.unwrap_err();
-        assert_eq!(err.code(), ErrorCode::ArrayViewError);
+        assert_eq!(err.code(), ErrorCode::ArrayError);
         assert!(err.msg().contains("Array buffer size too big"));
         Ok(())
     }
@@ -464,7 +464,7 @@ mod tests {
             )
         };
         let err = result.unwrap_err();
-        assert_eq!(err.code(), ErrorCode::ArrayViewError);
+        assert_eq!(err.code(), ErrorCode::ArrayError);
         assert!(err
             .msg()
             .contains("Array buffer length mismatch (actual: 8, expected: 16)"));
@@ -481,7 +481,7 @@ mod tests {
         };
 
         let err = result.unwrap_err();
-        assert_eq!(err.code(), ErrorCode::ArrayViewError);
+        assert_eq!(err.code(), ErrorCode::ArrayError);
         assert!(err
             .msg()
             .contains("Array buffer length mismatch (actual: 24, expected: 16)"));
@@ -502,7 +502,7 @@ mod tests {
             )
         };
         let err = result.unwrap_err();
-        assert_eq!(err.code(), ErrorCode::ArrayViewError);
+        assert_eq!(err.code(), ErrorCode::ArrayError);
         assert!(err
             .msg()
             .contains("Array buffer length mismatch (actual: 8, expected: 16)"));
@@ -519,7 +519,7 @@ mod tests {
         };
 
         let err = result.unwrap_err();
-        assert_eq!(err.code(), ErrorCode::ArrayViewError);
+        assert_eq!(err.code(), ErrorCode::ArrayError);
         assert!(err
             .msg()
             .contains("Array buffer length mismatch (actual: 24, expected: 16)"));

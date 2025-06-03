@@ -1144,7 +1144,7 @@ impl Buffer {
         let ndim = view.ndim();
         if ndim == 0 {
             return Err(error::fmt!(
-                ArrayViewError,
+                ArrayError,
                 "Zero-dimensional arrays are not supported",
             ));
         }
@@ -1152,7 +1152,7 @@ impl Buffer {
         // check dimension less equal than max dims
         if MAX_ARRAY_DIMS < ndim {
             return Err(error::fmt!(
-                ArrayHasTooManyDims,
+                ArrayError,
                 "Array dimension mismatch: expected at most {} dimensions, but got {}",
                 MAX_ARRAY_DIMS,
                 ndim
