@@ -48,9 +48,12 @@ The library supports the following ILP protocol versions.
 
 These protocol versions are supported over both HTTP and TCP.
 
-If you use HTTP, the library will automatically detect the server's
-latest supported protocol version and use it. If you use TCP, you can specify the
-`protocol_version=N` parameter when constructing the `Sender` object.
+* If you use HTTP and `protocol_version=auto` or unset, the library will
+  automatically detect the server's
+  latest supported protocol version and use it (recommended).
+* If you use TCP, you can specify the
+  `protocol_version=N` parameter when constructing the `Sender` object
+  (TCP defaults to `protocol_version=1`).
 
 | Version | Description                                             | Server Comatibility   |
 | ------- | ------------------------------------------------------- | --------------------- |
