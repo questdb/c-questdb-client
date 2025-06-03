@@ -499,18 +499,19 @@ bool line_sender_buffer_column_str(
     line_sender_error** err_out);
 
 /**
- * Record a multidimensional array of double for the given column.
+ * Record a multidimensional array of `double` values for the given column.
  *
- * This API uses BYTE-LEVEL STRIDES where the stride values represent the
- * number of bytes between consecutive elements along each dimension.
+ * The values in the `strides` parameter represent the number of bytes
+ * between consecutive elements along each dimension.
  *
  * @param[in] buffer Line buffer object.
  * @param[in] name Column name.
  * @param[in] rank Number of dimensions of the array.
  * @param[in] shape Array of dimension sizes (length = `rank`).
- *                   Each element must be a positive integer.
- * @param[in] strides Array strides.
- * @param[in] data_buffer First array element data.
+ *                  Each element must be a positive integer.
+ * @param[in] strides Array strides, in the unit of bytes.
+ * @param[in] data_buffer Array elements laid out in row-major order. Their number
+ *                        must match the product of dimension sizes.
  * @param[in] data_buffer_len Bytes length of the array data.
  * @param[out] err_out Set to an error object on failure (if non-NULL).
  * @return true on success, false on error.
@@ -527,10 +528,10 @@ bool line_sender_buffer_column_f64_arr_byte_strides(
     line_sender_error** err_out);
 
 /**
- * Record a multidimensional array of double for the given column.
+ * Record a multidimensional array of `double` values for the given column.
  *
- * This function uses ELEMENT-LEVEL STRIDES where the stride values represent
- * the number of elements between consecutive elements along each dimension.
+ * The values in the `strides` parameter represent the number of elements
+ * between consecutive elements along each dimension.
  *
  * @param[in] buffer Line buffer object.
  * @param[in] name Column name.
