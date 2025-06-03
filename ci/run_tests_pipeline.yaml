@@ -56,7 +56,7 @@ stages:
             displayName: "Build Rust examples"
           ############################# temp for test begin #####################
           - script: |
-              git clone -b nd_arr --depth 1 https://github.com/questdb/questdb.git ./questdb_nd_arr
+              git clone -b master --depth 1 https://github.com/questdb/questdb.git ./questdb_nd_arr
             displayName: git clone questdb
           - task: Maven@3
             displayName: "Compile QuestDB"
