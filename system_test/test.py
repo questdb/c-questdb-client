@@ -785,6 +785,9 @@ class TestSender(unittest.TestCase):
         self._test_array_example(
             'line_sender_cpp_example_array_elem_strides',
             'cpp_market_orders_elem_strides', )
+        self._test_array_example(
+            'line_sender_cpp_example_array_c_major',
+            'cpp_market_orders_c_major', )
 
     def test_c_array_example(self):
         self._test_array_example(
@@ -793,6 +796,9 @@ class TestSender(unittest.TestCase):
         self._test_array_example(
             'line_sender_c_example_array_elem_strides',
             'market_orders_elem_strides', )
+        self._test_array_example(
+            'line_sender_c_example_array_c_major',
+            'market_orders_c_major', )
 
     def _test_array_example(self, bin_name, table_name):
         if self.expected_protocol_version < qls.ProtocolVersion.V2:

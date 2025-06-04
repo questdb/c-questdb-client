@@ -109,6 +109,18 @@ enum class protocol_version
     v2 = 2,
 };
 
+enum class array_strides_mode
+{
+    /** Strides are inferred from C-style row-major memory layout. */
+    c_major,
+
+    /** Strides are provided in bytes */
+    bytes,
+
+    /** Strides are provided in elements */
+    elems,
+};
+
 /* Possible sources of the root certificates used to validate the server's TLS
  * certificate. */
 enum class ca
@@ -641,11 +653,9 @@ public:
     }
 
     /**
-     * Record a multidimensional double-precision array for the given column.
+     * Records a multidimensional array of double-precision values.
      *
-     * @tparam B    Strides mode selector:
-     *              - `true` for byte-level strides
-     *              - `false` for element-level strides
+     * @tparam Layout    Memory layout specification (array_strides_mode)
      * @tparam T    Element type (current only `double` is supported).
      * @tparam N    Number of elements in the flat data array
      *
@@ -654,7 +664,7 @@ public:
      * @param data    Array first element data. Size must match product of
      * dimensions.
      */
-    template <bool B, typename T, size_t N>
+    template <array_strides_mode Layout, typename T, size_t N>
     line_sender_buffer& column(
         column_name_view name,
         const size_t rank,
@@ -666,16 +676,46 @@ public:
             std::is_same_v<T, double>,
             "Only double types are supported for arrays");
         may_init();
-        line_sender_error::wrapped_call(
-            B ? ::line_sender_buffer_column_f64_arr_byte_strides
-              : ::line_sender_buffer_column_f64_arr_elem_strides,
-            _impl,
-            name._impl,
-            rank,
-            shape.data(),
-            strides.data(),
-            reinterpret_cast<const uint8_t*>(data.data()),
-            sizeof(double) * N);
+        switch (Layout)
+        {
+        case array_strides_mode::c_major:
+            if (!strides.empty())
+            {
+                throw line_sender_error{
+                    line_sender_error_code::config_error,
+                    "C_Major layout requires empty strides vector"};
+            }
+            line_sender_error::wrapped_call(
+                ::line_sender_buffer_column_f64_arr_c_major,
+                _impl,
+                name._impl,
+                rank,
+                shape.data(),
+                reinterpret_cast<const uint8_t*>(data.data()),
+                sizeof(double) * N);
+            break;
+        case array_strides_mode::bytes:
+            line_sender_error::wrapped_call(
+                ::line_sender_buffer_column_f64_arr_byte_strides,
+                _impl,
+                name._impl,
+                rank,
+                shape.data(),
+                strides.data(),
+                reinterpret_cast<const uint8_t*>(data.data()),
+                sizeof(double) * N);
+            break;
+        case array_strides_mode::elems:
+            line_sender_error::wrapped_call(
+                ::line_sender_buffer_column_f64_arr_elem_strides,
+                _impl,
+                name._impl,
+                rank,
+                shape.data(),
+                strides.data(),
+                reinterpret_cast<const uint8_t*>(data.data()),
+                sizeof(double) * N);
+        }
         return *this;
     }
 

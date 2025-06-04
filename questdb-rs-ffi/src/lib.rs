@@ -854,6 +854,46 @@ pub unsafe extern "C" fn line_sender_buffer_column_str(
     true
 }
 
+/// Records a float64 multidimensional array with **C-MAJOR memory layout**.
+///
+/// @param[in] buffer Line buffer object.
+/// @param[in] name Column name.
+/// @param[in] rank Array dims.
+/// @param[in] shape Array shape.
+/// @param[in] data_buffer Array **first element** data memory ptr.
+/// @param[in] data_buffer_len Array data memory length.
+/// @param[out] err_out Set on error.
+/// # Safety
+/// - All pointer parameters must be valid and non-null
+/// - shape must point to an array of `rank` integers
+/// - data_buffer must point to a buffer of size `data_buffer_len` bytes
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_c_major(
+    buffer: *mut line_sender_buffer,
+    name: line_sender_column_name,
+    rank: size_t,
+    shape: *const usize,
+    data_buffer: *const u8,
+    data_buffer_len: size_t,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    let buffer = unwrap_buffer_mut(buffer);
+    let name = name.as_name();
+    let view = match CMajorArrayView::<f64>::new(rank, shape, data_buffer, data_buffer_len) {
+        Ok(value) => value,
+        Err(err) => {
+            let err_ptr = Box::into_raw(Box::new(line_sender_error(err)));
+            *err_out = err_ptr;
+            return false;
+        }
+    };
+    bubble_err_to_c!(
+        err_out,
+        buffer.column_arr::<ColumnName<'_>, CMajorArrayView<'_, f64>, f64>(name, &view)
+    );
+    true
+}
+
 /// Records a float64 multidimensional array with **byte-level strides specification**.
 ///
 /// The `strides` represent byte offsets between elements along each dimension.
@@ -1626,6 +1666,7 @@ pub unsafe extern "C" fn line_sender_now_micros() -> i64 {
     TimestampMicros::now().as_i64()
 }
 
+use crate::ndarr::CMajorArrayView;
 #[cfg(feature = "confstr-ffi")]
 use questdb_confstr_ffi::questdb_conf_str_parse_err;
 

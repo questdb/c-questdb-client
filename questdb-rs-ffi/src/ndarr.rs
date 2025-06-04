@@ -149,36 +149,7 @@ where
         data: *const u8,
         data_len: usize,
     ) -> Result<Self, Error> {
-        if dims == 0 {
-            return Err(fmt_error!(
-                ArrayError,
-                "Zero-dimensional arrays are not supported",
-            ));
-        }
-        if data_len > MAX_ARRAY_BUFFER_SIZE {
-            return Err(fmt_error!(
-                ArrayError,
-                "Array buffer size too big: {}, maximum: {}",
-                data_len,
-                MAX_ARRAY_BUFFER_SIZE
-            ));
-        }
-        let shape = slice::from_raw_parts(shape, dims);
-        let size = shape
-            .iter()
-            .try_fold(std::mem::size_of::<T>(), |acc, &dim| {
-                acc.checked_mul(dim)
-                    .ok_or_else(|| fmt_error!(ArrayError, "Array buffer size too big"))
-            })?;
-
-        if size != data_len {
-            return Err(fmt_error!(
-                ArrayError,
-                "Array buffer length mismatch (actual: {}, expected: {})",
-                data_len,
-                size
-            ));
-        }
+        let shape = check_array_shape::<T>(dims, shape, data_len)?;
         let strides = slice::from_raw_parts(strides, dims);
         let mut slice = None;
         if data_len != 0 {
@@ -259,6 +230,157 @@ where
             Some(&*(ptr as *const T))
         }
     }
+}
+
+#[derive(Debug)]
+pub struct CMajorArrayView<'a, T> {
+    dims: usize,
+    shape: &'a [usize],
+    data: Option<&'a [u8]>,
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<T> NdArrayView<T> for CMajorArrayView<'_, T>
+where
+    T: ArrayElement,
+{
+    type Iter<'b>
+        = CMajorArrayViewIterator<'b, T>
+    where
+        Self: 'b,
+        T: 'b;
+
+    fn ndim(&self) -> usize {
+        self.dims
+    }
+
+    fn dim(&self, index: usize) -> Result<usize, Error> {
+        if index >= self.dims {
+            return Err(fmt_error!(
+                ArrayError,
+                "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
+                index,
+                self.dims
+            ));
+        }
+        Ok(self.shape[index])
+    }
+
+    fn as_slice(&self) -> Option<&[T]> {
+        self.data.map(|d| unsafe {
+            slice::from_raw_parts(d.as_ptr() as *const T, d.len() / size_of::<T>())
+        })
+    }
+
+    fn iter(&self) -> Self::Iter<'_> {
+        let elem_size = self.shape.iter().product();
+        let count = 0;
+        let data_ptr = match self.data {
+            Some(data) => data.as_ptr() as *const T,
+            None => std::ptr::null_mut(),
+        };
+        CMajorArrayViewIterator {
+            elem_size,
+            count,
+            data_ptr,
+            _marker: Default::default(),
+        }
+    }
+}
+
+pub struct CMajorArrayViewIterator<'a, T> {
+    elem_size: usize,
+    count: usize,
+    data_ptr: *const T,
+    _marker: std::marker::PhantomData<&'a T>,
+}
+
+impl<'a, T> Iterator for CMajorArrayViewIterator<'a, T>
+where
+    T: ArrayElement,
+{
+    type Item = &'a T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.data_ptr.is_null() || self.count >= self.elem_size {
+            None
+        } else {
+            unsafe {
+                let ptr = self.data_ptr.add(self.count);
+                self.count += 1;
+                Some(&*(ptr))
+            }
+        }
+    }
+}
+
+impl<T> CMajorArrayView<'_, T>
+where
+    T: ArrayElement,
+{
+    /// Creates a new C-Major memory layout array view from raw components (unsafe constructor).
+    ///
+    /// # Safety
+    /// Caller must ensure all the following conditions:
+    /// - `shape` points to a valid array of at least `dims` elements
+    /// - `data` points to a valid memory block of at least `data_len` bytes
+    pub unsafe fn new(
+        dims: usize,
+        shape: *const usize,
+        data: *const u8,
+        data_len: usize,
+    ) -> Result<Self, Error> {
+        let shape = check_array_shape::<T>(dims, shape, data_len)?;
+        let mut slice = None;
+        if data_len != 0 {
+            slice = Some(slice::from_raw_parts(data, data_len));
+        }
+        Ok(Self {
+            dims,
+            shape,
+            data: slice,
+            _marker: std::marker::PhantomData::<T>,
+        })
+    }
+}
+
+fn check_array_shape<T>(
+    dims: usize,
+    shape: *const usize,
+    data_len: usize,
+) -> Result<&'static [usize], Error> {
+    if dims == 0 {
+        return Err(fmt_error!(
+            ArrayError,
+            "Zero-dimensional arrays are not supported",
+        ));
+    }
+    if data_len > MAX_ARRAY_BUFFER_SIZE {
+        return Err(fmt_error!(
+            ArrayError,
+            "Array buffer size too big: {}, maximum: {}",
+            data_len,
+            MAX_ARRAY_BUFFER_SIZE
+        ));
+    }
+    let shape = unsafe { slice::from_raw_parts(shape, dims) };
+
+    let size = shape
+        .iter()
+        .try_fold(std::mem::size_of::<T>(), |acc, &dim| {
+            acc.checked_mul(dim)
+                .ok_or_else(|| fmt_error!(ArrayError, "Array buffer size too big"))
+        })?;
+
+    if size != data_len {
+        return Err(fmt_error!(
+            ArrayError,
+            "Array buffer length mismatch (actual: {}, expected: {})",
+            data_len,
+            size
+        ));
+    }
+    Ok(shape)
 }
 
 #[cfg(test)]
@@ -766,6 +888,80 @@ mod tests {
         write_array_data(&array, &mut buf, 32).unwrap();
         let expected = to_bytes(&test_data1);
         assert_eq!(buf, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn test_c_major_array_basic() -> TestResult {
+        let test_data = [1.1, 2.2, 3.3, 4.4];
+        let array_view: CMajorArrayView<'_, f64> = unsafe {
+            CMajorArrayView::new(
+                2,
+                [2, 2].as_ptr(),
+                test_data.as_ptr() as *const u8,
+                test_data.len() * 8usize,
+            )
+        }?;
+        let mut buffer = Buffer::new(ProtocolVersion::V2);
+        buffer.table("my_test")?;
+        buffer.column_arr("temperature", &array_view)?;
+        let data = buffer.as_bytes();
+        assert_eq!(&data[0..7], b"my_test");
+        assert_eq!(&data[8..19], b"temperature");
+        assert_eq!(
+            &data[19..24],
+            &[
+                b'=', b'=', 14u8, // ARRAY_BINARY_FORMAT_TYPE
+                10u8, // ArrayColumnTypeTag::Double.into()
+                2u8
+            ]
+        );
+        assert_eq!(
+            &data[24..32],
+            [2i32.to_le_bytes(), 2i32.to_le_bytes()].concat()
+        );
+        assert_eq!(
+            &data[32..64],
+            &[
+                1.1f64.to_ne_bytes(),
+                2.2f64.to_le_bytes(),
+                3.3f64.to_le_bytes(),
+                4.4f64.to_le_bytes(),
+            ]
+            .concat()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_c_major_empty_array() -> TestResult {
+        let test_data = [];
+        let array_view: CMajorArrayView<'_, f64> = unsafe {
+            CMajorArrayView::new(
+                2,
+                [2, 0].as_ptr(),
+                test_data.as_ptr(),
+                test_data.len() * 8usize,
+            )
+        }?;
+        let mut buffer = Buffer::new(ProtocolVersion::V2);
+        buffer.table("my_test")?;
+        buffer.column_arr("temperature", &array_view)?;
+        let data = buffer.as_bytes();
+        assert_eq!(&data[0..7], b"my_test");
+        assert_eq!(&data[8..19], b"temperature");
+        assert_eq!(
+            &data[19..24],
+            &[
+                b'=', b'=', 14u8, // ARRAY_BINARY_FORMAT_TYPE
+                10u8, // ArrayColumnTypeTag::Double.into()
+                2u8
+            ]
+        );
+        assert_eq!(
+            &data[24..32],
+            [2i32.to_le_bytes(), 0i32.to_le_bytes()].concat()
+        );
         Ok(())
     }
 }

@@ -492,6 +492,30 @@ bool line_sender_buffer_column_str(
     line_sender_error** err_out);
 
 /**
+ * Records a multidimensional array of 64-bit floating-point values in C-major
+ * order.
+ *
+ * @param[in] buffer Line buffer object.
+ * @param[in] name Column name.
+ * @param[in] rank Number of dimensions of the array.
+ * @param[in] shape Array of dimension sizes (length = `rank`).
+ *                   Each element must be a positive integer.
+ * @param[in] data_buffer First array element data.
+ * @param[in] data_buffer_len Bytes length of the array data.
+ * @param[out] err_out Set to an error object on failure (if non-NULL).
+ * @return true on success, false on error.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_f64_arr_c_major(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    size_t rank,
+    const uintptr_t* shape,
+    const uint8_t* data_buffer,
+    size_t data_buffer_len,
+    line_sender_error** err_out);
+
+/**
  * Record a multidimensional array of double for the given column.
  *
  * This API uses BYTE-LEVEL STRIDES where the stride values represent the

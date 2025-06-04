@@ -199,15 +199,26 @@ TEST_CASE("line_sender c api basics")
         reinterpret_cast<uint8_t*>(arr_data.data()),
         sizeof(arr_data),
         &err));
+    line_sender_column_name arr_name3 = QDB_COLUMN_NAME_LITERAL("a3");
+    CHECK(
+        ::line_sender_buffer_column_f64_arr_c_major(
+            buffer,
+            arr_name3,
+            rank,
+            shape,
+            reinterpret_cast<uint8_t*>(arr_data.data()),
+            sizeof(arr_data),
+            &err));
     CHECK(::line_sender_buffer_at_nanos(buffer, 10000000, &err));
     CHECK(server.recv() == 0);
-    CHECK(::line_sender_buffer_size(buffer) == 266);
+    CHECK(::line_sender_buffer_size(buffer) == 382);
     CHECK(::line_sender_flush(sender, buffer, &err));
     ::line_sender_buffer_free(buffer);
     CHECK(server.recv() == 1);
     std::string expect{"test,t1=v1 f1=="};
     push_double_to_buffer(expect, 0.5).append(",a1==");
     push_double_arr_to_buffer(expect, arr_data, 3, shape).append(",a2==");
+    push_double_arr_to_buffer(expect, arr_data, 3, shape).append(",a3==");
     push_double_arr_to_buffer(expect, arr_data, 3, shape).append(" 10000000\n");
     CHECK(server.msgs(0) == expect);
 }
@@ -282,18 +293,24 @@ TEST_CASE("line_sender c++ api basics")
         .symbol("t1", "v1")
         .symbol("t2", "")
         .column("f1", 0.5)
-        .column<true>("a1", rank, shape, strides, arr_data)
-        .column<false>("a2", rank, shape, elem_strides, arr_data)
+        .column<questdb::ingress::array_strides_mode::bytes>(
+            "a1", rank, shape, strides, arr_data)
+        .column<questdb::ingress::array_strides_mode::elems>(
+            "a2", rank, shape, elem_strides, arr_data)
+        .column<questdb::ingress::array_strides_mode::c_major>(
+            "a3", rank, shape, {}, arr_data)
         .at(questdb::ingress::timestamp_nanos{10000000});
 
     CHECK(server.recv() == 0);
-    CHECK(buffer.size() == 270);
+    CHECK(buffer.size() == 386);
     sender.flush(buffer);
     CHECK(server.recv() == 1);
     std::string expect{"test,t1=v1,t2= f1=="};
     push_double_to_buffer(expect, 0.5).append(",a1==");
     push_double_arr_to_buffer(expect, arr_data, 3, shape.data())
         .append(",a2==");
+    push_double_arr_to_buffer(expect, arr_data, 3, shape.data())
+        .append(",a3==");
     push_double_arr_to_buffer(expect, arr_data, 3, shape.data())
         .append(" 10000000\n");
     CHECK(server.msgs(0) == expect);

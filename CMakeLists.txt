@@ -108,6 +108,10 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
         examples/concat.c
         examples/line_sender_c_example_array_elem_strides.c)
     compile_example(
+        line_sender_c_example_array_c_major
+        examples/concat.c
+        examples/line_sender_c_example_array_c_major.c)
+    compile_example(
         line_sender_c_example_auth
         examples/concat.c
         examples/line_sender_c_example_auth.c)
@@ -141,6 +145,9 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
     compile_example(
         line_sender_cpp_example_auth
         examples/line_sender_cpp_example_auth.cpp)
+    compile_example(
+        line_sender_cpp_example_array_c_major
+        examples/line_sender_cpp_example_array_c_major.cpp)
     compile_example(
         line_sender_cpp_example_tls_ca
         examples/line_sender_cpp_example_tls_ca.cpp)
