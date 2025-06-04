@@ -38,13 +38,6 @@ macro_rules! fmt_error {
 }
 
 /// A view into a multidimensional array with custom memory strides.
-// TODO: We are currently evaluating whether to use StrideArrayView or ndarray's view.
-//       Current benchmarks show that StrideArrayView's iter implementation underperforms(2x)
-//       compared to ndarray's.
-//       We should optimise this implementation to be competitive.
-//       Unfortunately, the `ndarray` crate does not support negative strides
-//       which we need to support in this FFI crate for efficient iteration of
-//       numpy arrays coming from Python without copying the data.
 #[derive(Debug)]
 pub struct StrideArrayView<'a, T, const N: isize> {
     dims: usize,
@@ -89,39 +82,24 @@ where
     }
 
     fn iter(&self) -> Self::Iter<'_> {
-        let mut dim_products = Vec::with_capacity(self.dims);
-        let mut product = 1;
-        for &dim in self.shape.iter().rev() {
-            dim_products.push(product);
-            product *= dim;
-        }
-        dim_products.reverse();
-
         // consider minus strides
         let base_ptr = match self.data {
             None => std::ptr::null(),
-            Some(data) => {
-                self.strides
-                    .iter()
-                    .enumerate()
-                    .fold(data.as_ptr(), |ptr, (dim, &stride)| {
-                        let stride_bytes_size = stride * N;
-                        if stride_bytes_size < 0 {
-                            let dim_size = self.shape[dim] as isize;
-                            unsafe { ptr.offset(stride_bytes_size * (dim_size - 1)) }
-                        } else {
-                            ptr
-                        }
-                    })
-            }
+            Some(data) => data.as_ptr(),
         };
+        let mut cache_strides = Vec::with_capacity(self.dims);
+        for (&shape, &stride) in self.shape.iter().zip(self.strides) {
+            cache_strides.push((shape as isize - 1) * stride * N);
+        }
 
         RowMajorIter {
             base_ptr,
             array: self,
-            dim_products,
+            index: vec![0; self.dims],
             current_linear: 0,
             total_elements: self.shape.iter().product(),
+            next_offset: 0,
+            cache_strides,
         }
     }
 }
@@ -195,9 +173,11 @@ where
 pub struct RowMajorIter<'a, T, const N: isize> {
     base_ptr: *const u8,
     array: &'a StrideArrayView<'a, T, N>,
-    dim_products: Vec<usize>,
+    index: Vec<usize>,
     current_linear: usize,
     total_elements: usize,
+    next_offset: isize,
+    cache_strides: Vec<isize>,
 }
 
 impl<'a, T, const N: isize> Iterator for RowMajorIter<'a, T, N>
@@ -205,30 +185,37 @@ where
     T: ArrayElement,
 {
     type Item = &'a T;
+
     fn next(&mut self) -> Option<Self::Item> {
         if self.current_linear >= self.total_elements {
             return None;
         }
-        let mut remaining_index = self.current_linear;
-        let mut offset = 0;
 
-        for (dim, &dim_factor) in self.dim_products.iter().enumerate() {
-            let coord = remaining_index / dim_factor;
-            remaining_index %= dim_factor;
-            let stride = self.array.strides[dim] * N;
-            let actual_coord = if stride >= 0 {
-                coord
-            } else {
-                self.array.shape[dim] - 1 - coord
-            };
-            offset += actual_coord * stride.unsigned_abs();
+        let mut dim = self.array.dims - 1;
+        let offset = self.next_offset;
+
+        unsafe {
+            loop {
+                let index = self.index.get_unchecked_mut(dim);
+                let shape = *self.array.shape.get_unchecked(dim);
+                let stride = *self.array.strides.get_unchecked(dim) * N;
+                if *index != shape - 1 {
+                    *index += 1;
+                    self.next_offset += stride;
+                    break;
+                } else {
+                    self.next_offset -= self.cache_strides.get_unchecked(dim);
+                    *index = 0;
+                }
+                if dim == 0 {
+                    break;
+                }
+                dim -= 1;
+            }
         }
 
         self.current_linear += 1;
-        unsafe {
-            let ptr = self.base_ptr.add(offset);
-            Some(&*(ptr as *const T))
-        }
+        unsafe { Some(&*(self.base_ptr.offset(offset) as *const T)) }
     }
 }
 
