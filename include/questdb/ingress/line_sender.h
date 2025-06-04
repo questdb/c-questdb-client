@@ -538,8 +538,9 @@ bool line_sender_buffer_column_f64_arr_byte_strides(
  * @param[in] rank Number of dimensions of the array.
  * @param[in] shape Array of dimension sizes (length = `rank`).
  *                   Each element must be a positive integer.
- * @param[in] strides Array strides.
- * @param[in] data_buffer First array element data.
+ * @param[in] strides Array strides, in the unit of elements.
+ * @param[in] data_buffer Array elements laid out in row-major order. Their number
+ *                        must match the product of dimension sizes.
  * @param[in] data_buffer_len Bytes length of the array data.
  * @param[out] err_out Set to an error object on failure (if non-NULL).
  * @return true on success, false on error.
