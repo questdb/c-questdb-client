@@ -43,7 +43,7 @@ use questdb::{
 };
 
 mod ndarr;
-pub use ndarr::StrideArrayView;
+use ndarr::StrideArrayView;
 
 macro_rules! bubble_err_to_c {
     ($err_out:expr, $expression:expr) => {
