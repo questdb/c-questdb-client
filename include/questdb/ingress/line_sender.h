@@ -78,7 +78,7 @@ typedef enum line_sender_error_code
     /** Bad configuration. */
     line_sender_error_config_error,
 
-    /** Currently, only arrays with a maximum 32 dimensions are supported. */
+    /** QuestDB supports arrays of up to 32 dimensions. */
     line_sender_error_array_large_dim,
 
     /** ArrayView internal error, such as failure to get the size of a valid
