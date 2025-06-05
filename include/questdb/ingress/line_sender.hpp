@@ -641,18 +641,19 @@ public:
     }
 
     /**
-     * Record a multidimensional double-precision array for the given column.
+     * Record a multidimensional array for the given column.
      *
-     * @tparam B    Strides mode selector:
-     *              - `true` for byte-level strides
-     *              - `false` for element-level strides
-     * @tparam T    Element type (current only `double` is supported).
+     * @tparam B    Selects the unit used for the strides:
+     *              - `true`: the unit is bytes
+     *              - `false` the unit is elements
+     * @tparam T    Element type (currently only `double` is supported).
      * @tparam N    Number of elements in the flat data array
      *
      * @param name    Column name.
      * @param shape   Array dimensions (e.g., [2,3] for a 2x3 matrix).
-     * @param data    Array first element data. Size must match product of
-     * dimensions.
+     * @param strides Strides for each dimension, in the unit specified by `B`.
+     * @param data    Array elements laid out in row-major order. Their number must
+     *                match the product of dimension sizes.
      */
     template <bool B, typename T, size_t N>
     line_sender_buffer& column(

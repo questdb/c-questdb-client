@@ -56,13 +56,13 @@ stages:
             displayName: "Build Rust examples"
           ############################# temp for test begin #####################
           - script: |
-              git clone -b nd_arr --depth 1 https://github.com/questdb/questdb.git ./questdb_nd_arr
+              git clone --depth 1 https://github.com/questdb/questdb.git ./questdb
             displayName: git clone questdb
           - task: Maven@3
             displayName: "Compile QuestDB"
             inputs:
-              mavenPOMFile: 'questdb_nd_arr/pom.xml'
-              jdkVersionOption: '1.11'
+              mavenPOMFile: "questdb/pom.xml"
+              jdkVersionOption: "1.11"
               options: "-DskipTests -Pbuild-web-console"
           ############################# temp for test end ##################### 
           - script: python3 ci/run_all_tests.py
@@ -126,7 +126,7 @@ stages:
             submodules: false
           - template: compile.yaml
           - script: |
-              git clone -b nd_arr --depth 1 https://github.com/questdb/questdb.git
+              git clone --depth 1 https://github.com/questdb/questdb.git
             displayName: git clone questdb
           - task: Maven@3
             displayName: "Compile QuestDB"
