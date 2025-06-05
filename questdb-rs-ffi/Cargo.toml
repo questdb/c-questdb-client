@@ -6,10 +6,11 @@ publish = false
 
 [lib]
 name = "questdb_client"
-crate-type = ["cdylib", "staticlib"]
+crate-type = ["cdylib", "staticlib", "lib"]
 
 [dependencies]
 libc = "0.2"
+ndarray = { version = "0.16", optional = true }
 questdb-confstr-ffi = { version = "0.1.1", optional = true }
 
 [dependencies.questdb-rs]
@@ -20,8 +21,12 @@ features = [
     "insecure-skip-verify",
     "tls-webpki-certs",
     "tls-native-certs",
-    "ilp-over-http"
+    "ilp-over-http",
+    "ndarray"
 ]
+
+[dev-dependencies]
+criterion = "0.5"
 
 [features]
 # Expose the config parsing C API.
@@ -29,3 +34,8 @@ features = [
 # It is exposed here to avoid having multiple copies of the `questdb-confstr`
 # crate in the final binary.
 confstr-ffi = ["dep:questdb-confstr-ffi"]
+
+[[bench]]
+name = "ndarr"
+harness = false
+required-features = ["ndarray"]
