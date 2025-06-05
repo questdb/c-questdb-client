@@ -413,6 +413,7 @@ line_sender_buffer_view line_sender_buffer_peek(
 
 /**
  * Start recording a new row for the given table.
+ *
  * @param[in] buffer Line buffer object.
  * @param[in] name Table name.
  */
@@ -425,6 +426,7 @@ bool line_sender_buffer_table(
 /**
  * Record a symbol value for the given column.
  * Make sure you record all the symbol columns before any other column type.
+ *
  * @param[in] buffer Line buffer object.
  * @param[in] name Column name.
  * @param[in] value Column value.
@@ -440,6 +442,7 @@ bool line_sender_buffer_symbol(
 
 /**
  * Record a boolean value for the given column.
+ *
  * @param[in] buffer Line buffer object.
  * @param[in] name Column name.
  * @param[in] value Column value.
@@ -455,6 +458,7 @@ bool line_sender_buffer_column_bool(
 
 /**
  * Record an integer value for the given column.
+ *
  * @param[in] buffer Line buffer object.
  * @param[in] name Column name.
  * @param[in] value Column value.
@@ -470,6 +474,7 @@ bool line_sender_buffer_column_i64(
 
 /**
  * Record a floating-point value for the given column.
+ *
  * @param[in] buffer Line buffer object.
  * @param[in] name Column name.
  * @param[in] value Column value.
@@ -485,6 +490,7 @@ bool line_sender_buffer_column_f64(
 
 /**
  * Record a string value for the given column.
+ *
  * @param[in] buffer Line buffer object.
  * @param[in] name Column name.
  * @param[in] value Column value.
@@ -558,6 +564,7 @@ bool line_sender_buffer_column_f64_arr_elem_strides(
 
 /**
  * Record a nanosecond timestamp value for the given column.
+ *
  * @param[in] buffer Line buffer object.
  * @param[in] name Column name.
  * @param[in] nanos The timestamp in nanoseconds since the Unix epoch.
@@ -573,6 +580,7 @@ bool line_sender_buffer_column_ts_nanos(
 
 /**
  * Record a microsecond timestamp value for the given column.
+ *
  * @param[in] buffer Line buffer object.
  * @param[in] name Column name.
  * @param[in] micros The timestamp in microseconds since the Unix epoch.
@@ -713,6 +721,7 @@ line_sender_opts* line_sender_opts_from_env(line_sender_error** err_out);
 /**
  * Create a new `line_sender_opts` instance with the given protocol,
  * hostname and port.
+ *
  * @param[in] protocol The protocol to use.
  * @param[in] host The QuestDB database host.
  * @param[in] port The QuestDB ILP TCP port.
@@ -1060,6 +1069,7 @@ bool line_sender_flush(
  *
  * To send and clear in one step, call `line_sender_flush` instead. Also,
  * see the docs on that function for more important details on flushing.
+ *
  * @param[in] sender Line sender object.
  * @param[in] buffer Line buffer object.
  * @return true on success, false on error.
