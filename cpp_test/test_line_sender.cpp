@@ -827,15 +827,35 @@ TEST_CASE("Test timestamp column.")
     const auto exp = ss.str();
     CHECK(buffer.peek() == exp);
 
-    sender.flush_and_keep(buffer);
+    try
+    {
+        sender.flush_and_keep_with_flags(buffer, true);
+        CHECK_MESSAGE(false, "Expected exception");
+    }
+    catch (const questdb::ingress::line_sender_error& se)
+    {
+        std::string msg{se.what()};
+        CHECK_MESSAGE(
+            msg.rfind(
+                "Transactional flushes are not supported for ILP over TCP",
+                0) == 0,
+            msg);
+    }
+    catch (...)
+    {
+        CHECK_MESSAGE(false, "Other exception raised.");
+    }
 
+    sender.flush_and_keep(buffer);
+    sender.flush_and_keep_with_flags(buffer, false);
     CHECK(buffer.peek() == exp);
 
     server.accept();
     sender.close();
 
-    CHECK(server.recv() == 1);
+    CHECK(server.recv() == 2);
     CHECK(server.msgs(0) == exp);
+    CHECK(server.msgs(1) == exp);
 }
 
 TEST_CASE("test timestamp_micros and timestamp_nanos::now()")

@@ -1387,11 +1387,57 @@ public:
     }
 
     /**
+     * Send the batch of rows in the buffer to the QuestDB server, and, if the
+     * parameter `transactional` is true, ensure the flush will be
+     * transactional.
+     *
+     * A flush is transactional iff all the rows belong to the same table. This
+     * allows QuestDB to treat the flush as a single database transaction,
+     * because it doesn't support transactions spanning multiple tables.
+     * Additionally, only ILP-over-HTTP supports transactional flushes.
+     *
+     * If the flush wouldn't be transactional, this function returns an error
+     * and doesn't flush any data.
+     *
+     * The function sends an HTTP request and waits for the response. If the
+     * server responds with an error, it returns a descriptive error. In the
+     * case of a network error, it retries until it has exhausted the retry time
+     * budget.
+     *
+     * All the data stays in the buffer. Clear the buffer before starting a new
+     * batch.
+     */
+    void flush_and_keep_with_flags(
+        const line_sender_buffer& buffer, bool transactional)
+    {
+        if (buffer._impl)
+        {
+            ensure_impl();
+            line_sender_error::wrapped_call(
+                ::line_sender_flush_and_keep_with_flags,
+                _impl,
+                buffer._impl,
+                transactional);
+        }
+        else
+        {
+            line_sender_buffer buffer2{this->protocol_version(), 0};
+            buffer2.may_init();
+            line_sender_error::wrapped_call(
+                ::line_sender_flush_and_keep_with_flags,
+                _impl,
+                buffer2._impl,
+                transactional);
+        }
+    }
+
+    /**
      * Check if an error occurred previously and the sender must be closed.
      * This happens when there was an earlier failure.
      * This method is specific to ILP-over-TCP and is not relevant for
      * ILP-over-HTTP.
-     * @return true if an error occurred with a sender and it must be closed.
+     * @return true if an error occurred with a sender and it must be
+     * closed.
      */
     bool must_close() const noexcept
     {
