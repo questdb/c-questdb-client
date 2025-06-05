@@ -22,6 +22,7 @@
  *
  ******************************************************************************/
 
+use crate::fmt_error;
 use questdb::ingress::ArrayElement;
 use questdb::ingress::NdArrayView;
 use questdb::ingress::MAX_ARRAY_BUFFER_SIZE;
@@ -29,45 +30,36 @@ use questdb::Error;
 use std::mem::size_of;
 use std::slice;
 
-macro_rules! fmt_error {
-    ($code:ident, $($arg:tt)*) => {
-        questdb::Error::new(
-            questdb::ErrorCode::$code,
-            format!($($arg)*))
-    }
-}
-
 /// A view into a multidimensional array with custom memory strides.
 #[derive(Debug)]
-pub struct StrideArrayView<'a, T, const N: isize> {
-    dims: usize,
+pub struct StrideArrayView<'a, T, const N: isize, const D: usize> {
     shape: &'a [usize],
     strides: &'a [isize],
     data: Option<&'a [u8]>,
     _marker: std::marker::PhantomData<T>,
 }
 
-impl<T, const N: isize> NdArrayView<T> for StrideArrayView<'_, T, N>
+impl<T, const N: isize, const D: usize> NdArrayView<T> for StrideArrayView<'_, T, N, D>
 where
     T: ArrayElement,
 {
     type Iter<'b>
-        = RowMajorIter<'b, T, N>
+        = RowMajorIter<'b, T, N, D>
     where
         Self: 'b,
         T: 'b;
 
     fn ndim(&self) -> usize {
-        self.dims
+        D
     }
 
     fn dim(&self, index: usize) -> Result<usize, Error> {
-        if index >= self.dims {
+        if index >= D {
             return Err(fmt_error!(
                 ArrayError,
                 "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
                 index,
-                self.dims
+                D
             ));
         }
         Ok(self.shape[index])
@@ -87,24 +79,17 @@ where
             None => std::ptr::null(),
             Some(data) => data.as_ptr(),
         };
-        let mut cache_strides = Vec::with_capacity(self.dims);
-        for (&shape, &stride) in self.shape.iter().zip(self.strides) {
-            cache_strides.push((shape as isize - 1) * stride * N);
-        }
-
         RowMajorIter {
             base_ptr,
             array: self,
-            index: vec![0; self.dims],
+            index: vec![0; D],
             current_linear: 0,
             total_elements: self.shape.iter().product(),
-            next_offset: 0,
-            cache_strides,
         }
     }
 }
 
-impl<T, const N: isize> StrideArrayView<'_, T, N>
+impl<T, const N: isize, const D: usize> StrideArrayView<'_, T, N, D>
 where
     T: ArrayElement,
 {
@@ -121,20 +106,18 @@ where
     /// - Lifetime `'a` must outlive the view's usage
     /// - Strides are measured in bytes (not elements)
     pub unsafe fn new(
-        dims: usize,
         shape: *const usize,
         strides: *const isize,
         data: *const u8,
         data_len: usize,
     ) -> Result<Self, Error> {
-        let shape = check_array_shape::<T>(dims, shape, data_len)?;
-        let strides = slice::from_raw_parts(strides, dims);
+        let shape = check_array_shape::<T>(D, shape, data_len)?;
+        let strides = slice::from_raw_parts(strides, D);
         let mut slice = None;
         if data_len != 0 {
             slice = Some(slice::from_raw_parts(data, data_len));
         }
         Ok(Self {
-            dims,
             shape,
             strides,
             data: slice,
@@ -152,7 +135,7 @@ where
                 }
 
                 let elem_size = size_of::<T>() as isize;
-                if self.dims == 1 {
+                if D == 1 {
                     return self.strides[0] * N == elem_size || self.shape[0] == 1;
                 }
 
@@ -170,17 +153,15 @@ where
 }
 
 /// Iterator for traversing a stride array in row-major (C-style) order.
-pub struct RowMajorIter<'a, T, const N: isize> {
+pub struct RowMajorIter<'a, T, const N: isize, const D: usize> {
     base_ptr: *const u8,
-    array: &'a StrideArrayView<'a, T, N>,
+    array: &'a StrideArrayView<'a, T, N, D>,
     index: Vec<usize>,
     current_linear: usize,
     total_elements: usize,
-    next_offset: isize,
-    cache_strides: Vec<isize>,
 }
 
-impl<'a, T, const N: isize> Iterator for RowMajorIter<'a, T, N>
+impl<'a, T, const N: isize, const D: usize> Iterator for RowMajorIter<'a, T, N, D>
 where
     T: ArrayElement,
 {
@@ -190,27 +171,57 @@ where
         if self.current_linear >= self.total_elements {
             return None;
         }
+        let offset = unsafe {
+            match D {
+                1 => {
+                    let stride = *self.array.strides.get_unchecked(0) * N;
+                    stride * self.current_linear as isize
+                }
+                2 => {
+                    let stride1 = self.array.strides.get_unchecked(0) * N;
+                    let stride2 = self.array.strides.get_unchecked(1) * N;
+                    let index1 = *self.index.get_unchecked(0);
+                    let index2 = *self.index.get_unchecked(1);
+                    if index2 != self.array.shape.get_unchecked(1) - 1 {
+                        self.index[1] = index2 + 1;
+                    } else {
+                        self.index[1] = 0;
+                        self.index[0] = index1 + 1;
+                    }
+                    index1 as isize * stride1 + index2 as isize * stride2
+                }
+                3 => {
+                    let stride1 = self.array.strides.get_unchecked(0) * N;
+                    let stride2 = self.array.strides.get_unchecked(1) * N;
+                    let stride3 = self.array.strides.get_unchecked(2) * N;
+                    let index1 = *self.index.get_unchecked(0);
+                    let index2 = *self.index.get_unchecked(1);
+                    let index3 = *self.index.get_unchecked(2);
 
-        let mut dim = self.array.dims - 1;
-        let offset = self.next_offset;
+                    index1 as isize * stride1
+                        + index2 as isize * stride2
+                        + index3 as isize * stride3
+                }
+                other => {
+                    let mut offset = 0;
+                    for dim in 0..other {
+                        offset += *self.array.strides.get_unchecked(dim)
+                            * N
+                            * *self.index.get_unchecked(dim) as isize
+                    }
+                    offset
+                }
+            }
+        };
 
-        unsafe {
-            loop {
-                let index = self.index.get_unchecked_mut(dim);
-                let shape = *self.array.shape.get_unchecked(dim);
-                let stride = *self.array.strides.get_unchecked(dim) * N;
-                if *index != shape - 1 {
-                    *index += 1;
-                    self.next_offset += stride;
-                    break;
+        if D > 2 {
+            for (&dim, ix) in self.array.shape.iter().zip(self.index.iter_mut()).rev() {
+                *ix += 1;
+                if *ix == dim {
+                    *ix = 0;
                 } else {
-                    self.next_offset -= self.cache_strides.get_unchecked(dim);
-                    *index = 0;
-                }
-                if dim == 0 {
                     break;
                 }
-                dim -= 1;
             }
         }
 
@@ -457,9 +468,8 @@ mod tests {
         let elem_size = std::mem::size_of::<f64>() as isize;
 
         let test_data = [1.1, 2.2, 3.3, 4.4];
-        let array_view: StrideArrayView<'_, f64, 1> = unsafe {
+        let array_view: StrideArrayView<'_, f64, 1, 2> = unsafe {
             StrideArrayView::new(
-                2,
                 [2, 2].as_ptr(),
                 [2 * elem_size, elem_size].as_ptr(),
                 test_data.as_ptr() as *const u8,
@@ -502,9 +512,8 @@ mod tests {
         let elem_size = std::mem::size_of::<f64>() as isize;
 
         let test_data = [1.1, 2.2, 3.3, 4.4];
-        let array_view: StrideArrayView<'_, f64, 8> = unsafe {
+        let array_view: StrideArrayView<'_, f64, 8, 2> = unsafe {
             StrideArrayView::new(
-                2,
                 [2, 2].as_ptr(),
                 [2, 1].as_ptr(),
                 test_data.as_ptr() as *const u8,
@@ -545,8 +554,7 @@ mod tests {
     #[test]
     fn test_stride_array_size_overflow() -> TestResult {
         let result = unsafe {
-            StrideArrayView::<f64, 1>::new(
-                2,
+            StrideArrayView::<f64, 1, 2>::new(
                 [u32::MAX as usize, u32::MAX as usize].as_ptr(),
                 [8, 8].as_ptr(),
                 ptr::null(),
@@ -563,9 +571,8 @@ mod tests {
     fn test_stride_view_length_mismatch() -> TestResult {
         let elem_size = size_of::<f64>() as isize;
         let under_data = [1.1];
-        let result: Result<StrideArrayView<'_, f64, 1>, Error> = unsafe {
+        let result: Result<StrideArrayView<'_, f64, 1, 2>, Error> = unsafe {
             StrideArrayView::new(
-                2,
                 [1, 2].as_ptr(),
                 [elem_size, elem_size].as_ptr(),
                 under_data.as_ptr() as *const u8,
@@ -579,9 +586,8 @@ mod tests {
             .contains("Array buffer length mismatch (actual: 8, expected: 16)"));
 
         let over_data = [1.1, 2.2, 3.3];
-        let result: Result<StrideArrayView<'_, f64, 1>, Error> = unsafe {
+        let result: Result<StrideArrayView<'_, f64, 1, 2>, Error> = unsafe {
             StrideArrayView::new(
-                2,
                 [1, 2].as_ptr(),
                 [elem_size, elem_size].as_ptr(),
                 over_data.as_ptr() as *const u8,
@@ -601,9 +607,8 @@ mod tests {
     fn test_stride_view_length_mismatch_with_elem_strides() -> TestResult {
         let elem_size = size_of::<f64>() as isize;
         let under_data = [1.1];
-        let result: Result<StrideArrayView<'_, f64, 8>, Error> = unsafe {
+        let result: Result<StrideArrayView<'_, f64, 8, 2>, Error> = unsafe {
             StrideArrayView::new(
-                2,
                 [1, 2].as_ptr(),
                 [1, 1].as_ptr(),
                 under_data.as_ptr() as *const u8,
@@ -617,9 +622,8 @@ mod tests {
             .contains("Array buffer length mismatch (actual: 8, expected: 16)"));
 
         let over_data = [1.1, 2.2, 3.3];
-        let result: Result<StrideArrayView<'_, f64, 1>, Error> = unsafe {
+        let result: Result<StrideArrayView<'_, f64, 1, 2>, Error> = unsafe {
             StrideArrayView::new(
-                2,
                 [1, 2].as_ptr(),
                 [elem_size, elem_size].as_ptr(),
                 over_data.as_ptr() as *const u8,
@@ -642,9 +646,8 @@ mod tests {
         let shape = [3usize, 2];
         let strides = [elem_size, shape[0] as isize * elem_size];
 
-        let array_view: StrideArrayView<'_, f64, 1> = unsafe {
+        let array_view: StrideArrayView<'_, f64, 1, 2> = unsafe {
             StrideArrayView::new(
-                shape.len(),
                 shape.as_ptr(),
                 strides.as_ptr(),
                 col_major_data.as_ptr() as *const u8,
@@ -679,9 +682,8 @@ mod tests {
         let shape = [3usize, 2];
         let strides = [1, shape[0] as isize];
 
-        let array_view: StrideArrayView<'_, f64, 8> = unsafe {
+        let array_view: StrideArrayView<'_, f64, 8, 2> = unsafe {
             StrideArrayView::new(
-                shape.len(),
                 shape.as_ptr(),
                 strides.as_ptr(),
                 col_major_data.as_ptr() as *const u8,
@@ -714,8 +716,7 @@ mod tests {
         let elem_size = size_of::<f64>();
         let data = [1f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
         let view = unsafe {
-            StrideArrayView::<f64, 1>::new(
-                2,
+            StrideArrayView::<f64, 1, 2>::new(
                 &[3usize, 3] as *const usize,
                 &[-24isize, 8] as *const isize,
                 (data.as_ptr() as *const u8).add(48),
@@ -743,8 +744,7 @@ mod tests {
         let elem_size = size_of::<f64>();
         let data = [1f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
         let view = unsafe {
-            StrideArrayView::<f64, 8>::new(
-                2,
+            StrideArrayView::<f64, 8, 2>::new(
                 &[3usize, 3] as *const usize,
                 &[-3isize, 1] as *const isize,
                 (data.as_ptr() as *const u8).add(48),
@@ -771,17 +771,16 @@ mod tests {
     fn test_basic_edge_cases() -> TestResult {
         // empty array
         let elem_size = std::mem::size_of::<f64>() as isize;
-        let empty_view: StrideArrayView<'_, f64, 1> =
-            unsafe { StrideArrayView::new(2, [0, 0].as_ptr(), [0, 0].as_ptr(), ptr::null(), 0)? };
+        let empty_view: StrideArrayView<'_, f64, 1, 2> =
+            unsafe { StrideArrayView::new([0, 0].as_ptr(), [0, 0].as_ptr(), ptr::null(), 0)? };
         assert_eq!(empty_view.ndim(), 2);
         assert_eq!(empty_view.dim(0), Ok(0));
         assert_eq!(empty_view.dim(1), Ok(0));
 
         // single element array
         let single_data = [42.0];
-        let single_view: StrideArrayView<'_, f64, 1> = unsafe {
+        let single_view: StrideArrayView<'_, f64, 1, 1> = unsafe {
             StrideArrayView::new(
-                1,
                 [1].as_ptr(),
                 [elem_size].as_ptr(),
                 single_data.as_ptr() as *const u8,
@@ -804,8 +803,7 @@ mod tests {
             size_of::<f64>() as isize,
         ];
         let array = unsafe {
-            StrideArrayView::<f64, 1>::new(
-                shape.len(),
+            StrideArrayView::<f64, 1, 2>::new(
                 shape.as_ptr(),
                 strides.as_ptr(),
                 test_data.as_ptr() as *const u8,
@@ -832,8 +830,7 @@ mod tests {
         let shape = [2usize, 3];
         let strides = [shape[1] as isize, 1];
         let array = unsafe {
-            StrideArrayView::<f64, { std::mem::size_of::<f64>() as isize }>::new(
-                shape.len(),
+            StrideArrayView::<f64, { std::mem::size_of::<f64>() as isize }, 2>::new(
                 shape.as_ptr(),
                 strides.as_ptr(),
                 test_data.as_ptr() as *const u8,
@@ -861,8 +858,7 @@ mod tests {
         let shape = [2usize, 2];
         let strides = [-8, -2];
         let array = unsafe {
-            StrideArrayView::<f64, { std::mem::size_of::<f64>() as isize }>::new(
-                shape.len(),
+            StrideArrayView::<f64, { std::mem::size_of::<f64>() as isize }, 2>::new(
                 shape.as_ptr(),
                 strides.as_ptr(),
                 test_data.as_ptr().add(11) as *const u8,

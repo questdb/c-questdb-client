@@ -61,6 +61,90 @@ macro_rules! bubble_err_to_c {
     };
 }
 
+#[macro_export]
+macro_rules! fmt_error {
+    ($code:ident, $($arg:tt)*) => {
+        questdb::Error::new(
+            questdb::ErrorCode::$code,
+            format!($($arg)*))
+    }
+}
+
+macro_rules! new_stride_array {
+    (
+        $rank:expr,
+        $m:literal,
+        $n:literal,
+        $shape:expr,
+        $strides:expr,
+        $data_buffer:expr,
+        $data_buffer_len:expr,
+        $err_out:expr,
+        $buffer:expr,
+        $name:expr
+    ) => {{
+        let view = match StrideArrayView::<f64, $m, $n>::new(
+            $shape,
+            $strides,
+            $data_buffer,
+            $data_buffer_len,
+        ) {
+            Ok(value) => value,
+            Err(err) => {
+                let err_ptr = Box::into_raw(Box::new(line_sender_error(err)));
+                *$err_out = err_ptr;
+                return false;
+            }
+        };
+        bubble_err_to_c!(
+            $err_out,
+            $buffer
+                .column_arr::<ColumnName<'_>, StrideArrayView<'_, f64, $m, $n>, f64>($name, &view)
+        );
+    }};
+}
+
+macro_rules! generate_array_dims_branches {
+    ($rank:expr, $m:literal, $shape:expr, $strides:expr, $data_buffer:expr, $data_buffer_len:expr, $err_out:expr, $buffer:expr, $name:expr => $($n:literal),*) => {
+        match $rank {
+            0 => {
+                let err = fmt_error!(
+                    ArrayError,
+                    "Zero-dimensional arrays are not supported",
+                );
+                let err_ptr = Box::into_raw(Box::new(line_sender_error(err)));
+                *$err_out = err_ptr;
+                return false;
+            }
+            $(
+                $n => new_stride_array!(
+                    $rank,
+                    $m,
+                    $n,
+                    $shape,
+                    $strides,
+                    $data_buffer,
+                    $data_buffer_len,
+                    $err_out,
+                    $buffer,
+                    $name
+                ),
+            )*
+            other => {
+                let err = fmt_error!(
+                    ArrayError,
+                    "Array dimension mismatch: expected at most {} dimensions, but got {}",
+                    32,
+                    other
+                );
+                let err_ptr = Box::into_raw(Box::new(line_sender_error(err)));
+                *$err_out = err_ptr;
+                return false;
+            }
+        }
+    };
+}
+
 /// Update the Rust builder inside the C opts object
 /// after calling a method that takes ownership of the builder.
 macro_rules! upd_opts {
@@ -923,18 +1007,17 @@ pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_byte_strides(
 ) -> bool {
     let buffer = unwrap_buffer_mut(buffer);
     let name = name.as_name();
-    let view =
-        match StrideArrayView::<f64, 1>::new(rank, shape, strides, data_buffer, data_buffer_len) {
-            Ok(value) => value,
-            Err(err) => {
-                let err_ptr = Box::into_raw(Box::new(line_sender_error(err)));
-                *err_out = err_ptr;
-                return false;
-            }
-        };
-    bubble_err_to_c!(
+    generate_array_dims_branches!(
+        rank,
+        1,
+        shape,
+        strides,
+        data_buffer,
+        data_buffer_len,
         err_out,
-        buffer.column_arr::<ColumnName<'_>, StrideArrayView<'_, f64, 1>, f64>(name, &view)
+        buffer,
+        name
+        => 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32
     );
     true
 }
@@ -969,24 +1052,18 @@ pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_elem_strides(
 ) -> bool {
     let buffer = unwrap_buffer_mut(buffer);
     let name = name.as_name();
-    let view = match StrideArrayView::<f64, { std::mem::size_of::<f64>() as isize }>::new(
+    generate_array_dims_branches!(
         rank,
+        8,
         shape,
         strides,
         data_buffer,
         data_buffer_len,
-    ) {
-        Ok(value) => value,
-        Err(err) => {
-            let err_ptr = Box::into_raw(Box::new(line_sender_error(err)));
-            *err_out = err_ptr;
-            return false;
-        }
-    };
-    bubble_err_to_c!(
-            err_out,
-            buffer.column_arr::<ColumnName<'_>, StrideArrayView<'_, f64,  { std::mem::size_of::<f64>() as isize }>, f64>(name, &view)
-        );
+        err_out,
+        buffer,
+        name
+        => 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32
+    );
     true
 }
 
