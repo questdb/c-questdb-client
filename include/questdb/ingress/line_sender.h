@@ -515,7 +515,7 @@ bool line_sender_buffer_column_str(
  * @param[in] rank Number of dimensions of the array.
  * @param[in] shape Array of dimension sizes (length = `rank`).
  *                  Each element must be a positive integer.
- * @param[in] strides Array strides, in the unit of bytes.
+ * @param[in] strides Array strides, in the unit of bytes. Strides can be negative.
  * @param[in] data_buffer Array data, laid out according to the provided shape and strides.
  * @param[in] data_buffer_len Length of the array data block in bytes.
  * @param[out] err_out Set to an error object on failure (if non-NULL).
@@ -543,7 +543,7 @@ bool line_sender_buffer_column_f64_arr_byte_strides(
  * @param[in] rank Number of dimensions of the array.
  * @param[in] shape Array of dimension sizes (length = `rank`).
  *                   Each element must be a positive integer.
- * @param[in] strides Array strides, in the unit of elements.
+ * @param[in] strides Array strides, in the unit of elements. Strides can be negative.
  * @param[in] data_buffer Array data, laid out according to the provided shape and strides.
  * @param[in] data_buffer_len Length of the array data block in bytes.
  * @param[out] err_out Set to an error object on failure (if non-NULL).
