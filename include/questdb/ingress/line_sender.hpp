@@ -108,7 +108,7 @@ enum class protocol_version
     /**
      * InfluxDB Line Protocol v2.
      * QuestDB server version 8.4.0 or later is required for
-     * `v2` supported.
+     * `v2` support.
      */
     v2 = 2,
 };
@@ -1324,7 +1324,7 @@ public:
      * `protocol_version::v2` in order to ingest arrays.
      *
      * QuestDB server version 8.4.0 or later is required for
-     * `protocol_version::v2`.
+     * `protocol_version::v2` support.
      */
     opts& protocol_version(protocol_version version) noexcept
     {

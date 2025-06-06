@@ -116,7 +116,7 @@ typedef enum line_sender_protocol_version
      * the array data type.
      * This version is specific to QuestDB and not compatible with InfluxDB.
      * QuestDB server version 8.4.0 or later is required for
-     * `line_sender_protocol_version_2` supported.
+     * `line_sender_protocol_version_2` support.
      */
     line_sender_protocol_version_2 = 2,
 } line_sender_protocol_version;
@@ -829,7 +829,7 @@ bool line_sender_opts_token_y(
  * `line_sender_protocol_version_2` in order to ingest arrays.
  *
  * QuestDB server version 8.4.0 or later is required for
- * `line_sender_protocol_version_2`.
+ * `line_sender_protocol_version_2` support.
  */
 LINESENDER_API
 bool line_sender_opts_protocol_version(

@@ -312,7 +312,7 @@ pub enum ProtocolVersion {
     /// Version 2 of InfluxDB Line Protocol.
     /// Uses binary format serialization for f64, and supports the array data type.
     /// This version is specific to QuestDB and is not compatible with InfluxDB.
-    /// QuestDB server version 8.4.0 or later is required for V2 supported.
+    /// QuestDB server version 8.4.0 or later is required for `V2` supported.
     V2 = 2,
 }
 
@@ -1355,7 +1355,7 @@ pub unsafe extern "C" fn line_sender_opts_token_y(
 ///   default. You must explicitly set [`ProtocolVersion::V2`] in order to ingest
 ///   arrays.
 ///
-/// QuestDB server version 8.4.0 or later is required for [`ProtocolVersion::V2`]
+/// QuestDB server version 8.4.0 or later is required for [`ProtocolVersion::V2`] support
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_opts_protocol_version(
     opts: *mut line_sender_opts,

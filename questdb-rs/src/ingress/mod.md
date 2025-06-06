@@ -256,7 +256,7 @@ with a high-latency network connection.
 
 ## Array Datatype
 
-The [`Sender::column_arr`](Sender::column_arr) method supports efficient ingestion of N-dimensional
+The [`Buffer::column_arr`](Buffer::column_arr) method supports efficient ingestion of N-dimensional
 arrays using several convenient types:
 
 - native Rust arrays and slices (up to 3-dimensional)
