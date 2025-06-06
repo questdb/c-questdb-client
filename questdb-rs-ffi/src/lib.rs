@@ -1344,7 +1344,12 @@ pub unsafe extern "C" fn line_sender_opts_token_y(
     upd_opts!(opts, err_out, token_y, token_y.as_str())
 }
 
-/// set the line protocol version.
+/// Sets the ingestion protocol version.
+/// - HTTP transport automatically negotiates the protocol version by default(unset, **Strong Recommended**).
+///   You can explicitly configure the protocol version to avoid the slight latency cost at connection time.
+/// - TCP transport does not negotiate the protocol version and uses [`ProtocolVersion::V1`] by
+///   default. You must explicitly set [`ProtocolVersion::V2`] in order to ingest
+///   arrays.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_opts_protocol_version(
     opts: *mut line_sender_opts,
@@ -1594,10 +1599,11 @@ unsafe fn unwrap_sender_mut<'a>(sender: *mut line_sender) -> &'a mut Sender {
     &mut (*sender).0
 }
 
-/// Return the sender's protocol version.
-/// This is either the protocol version that was set explicitly,
-/// or the one that was auto-detected during the connection process.
-/// If connecting via TCP and not overridden, the value is V1.
+/// Returns the sender's protocol version
+///
+/// - Explicitly set version, or
+/// - Auto-detected during HTTP transport, or
+/// - [`ProtocolVersion::V1`] for TCP transport.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_get_protocol_version(
     sender: *const line_sender,
@@ -1610,8 +1616,7 @@ pub unsafe extern "C" fn line_sender_get_max_name_len(sender: *const line_sender
     unwrap_sender(sender).max_name_len()
 }
 
-/// Construct a `line_sender_buffer` with a `max_name_len` of `127` and sender's default protocol version
-/// which is the same as the QuestDB server default.
+/// Construct a [`line_sender_buffer`] using the sender's protocol settings.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_buffer_new_for_sender(
     sender: *const line_sender,

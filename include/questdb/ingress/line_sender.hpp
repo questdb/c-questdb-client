@@ -1195,6 +1195,17 @@ public:
         return *this;
     }
 
+    /**
+     * Sets the ingestion protocol version.
+     *
+     * HTTP transport automatically negotiates the protocol version by
+     * default(unset, strong recommended). You can explicitlyconfigure the
+     * protocol version to avoid the slight latency cost at connection time.
+     *
+     * TCP transport does not negotiate the protocol version and uses
+     * `protocol_version::v1` by default. You must explicitly set
+     * `protocol_version::v2` in order to ingest arrays.
+     */
     opts& protocol_version(protocol_version version) noexcept
     {
         const auto c_protocol_version =
@@ -1311,6 +1322,9 @@ public:
         return *this;
     }
 
+    /**
+     * Get the current protocol version used by the sender.
+     */
     questdb::ingress::protocol_version protocol_version() const noexcept
     {
         ensure_impl();
