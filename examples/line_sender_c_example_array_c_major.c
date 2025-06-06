@@ -34,7 +34,7 @@ static bool example(const char* host, const char* port)
     buffer = line_sender_buffer_new_for_sender(sender);
     line_sender_buffer_reserve(buffer, 64 * 1024);
 
-    line_sender_table_name table_name = QDB_TABLE_NAME_LITERAL("market_orders_byte_strides");
+    line_sender_table_name table_name = QDB_TABLE_NAME_LITERAL("market_orders_c_major");
     line_sender_column_name symbol_col = QDB_COLUMN_NAME_LITERAL("symbol");
     line_sender_column_name book_col = QDB_COLUMN_NAME_LITERAL("order_book");
 
@@ -47,8 +47,6 @@ static bool example(const char* host, const char* port)
 
     size_t array_rank = 3;
     uintptr_t array_shape[] = {2, 3, 2};
-    intptr_t array_strides[] = {48, 16, 8};
-
     double array_data[] = {
         48123.5,
         2.4,
@@ -63,12 +61,11 @@ static bool example(const char* host, const char* port)
         48121.5,
         4.3};
 
-    if (!line_sender_buffer_column_f64_arr_byte_strides(
+    if (!line_sender_buffer_column_f64_arr_c_major(
             buffer,
             book_col,
             array_rank,
             array_shape,
-            array_strides,
             (const uint8_t*)array_data,
             sizeof(array_data),
             &err))

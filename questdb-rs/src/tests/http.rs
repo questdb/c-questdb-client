@@ -701,10 +701,12 @@ fn test_transactional(
 fn _test_sender_auto_detect_protocol_version(
     supported_versions: Option<Vec<u16>>,
     expect_version: ProtocolVersion,
+    max_name_len: usize,
+    expect_max_name_len: usize,
 ) -> TestResult {
     let supported_versions1 = supported_versions.clone();
     let mut server = MockServer::new()?
-        .configure_settings_response(supported_versions.as_deref().unwrap_or(&[]));
+        .configure_settings_response(supported_versions.as_deref().unwrap_or(&[]), max_name_len);
     let sender_builder = server.lsb_http();
 
     let server_thread = std::thread::spawn(move || -> io::Result<MockServer> {
@@ -735,6 +737,7 @@ fn _test_sender_auto_detect_protocol_version(
 
     let mut sender = sender_builder.build()?;
     assert_eq!(sender.protocol_version(), expect_version);
+    assert_eq!(sender.max_name_len(), expect_max_name_len);
     let mut buffer = sender.new_buffer();
     buffer
         .table("test")?
@@ -749,32 +752,32 @@ fn _test_sender_auto_detect_protocol_version(
 
 #[test]
 fn test_sender_auto_protocol_version_basic() -> TestResult {
-    _test_sender_auto_detect_protocol_version(Some(vec![1, 2]), ProtocolVersion::V2)
+    _test_sender_auto_detect_protocol_version(Some(vec![1, 2]), ProtocolVersion::V2, 130, 130)
 }
 
 #[test]
 fn test_sender_auto_protocol_version_old_server1() -> TestResult {
-    _test_sender_auto_detect_protocol_version(Some(vec![]), ProtocolVersion::V1)
+    _test_sender_auto_detect_protocol_version(Some(vec![]), ProtocolVersion::V1, 0, 127)
 }
 
 #[test]
 fn test_sender_auto_protocol_version_old_server2() -> TestResult {
-    _test_sender_auto_detect_protocol_version(None, ProtocolVersion::V1)
+    _test_sender_auto_detect_protocol_version(None, ProtocolVersion::V1, 0, 127)
 }
 
 #[test]
 fn test_sender_auto_protocol_version_only_v1() -> TestResult {
-    _test_sender_auto_detect_protocol_version(Some(vec![1]), ProtocolVersion::V1)
+    _test_sender_auto_detect_protocol_version(Some(vec![1]), ProtocolVersion::V1, 127, 127)
 }
 
 #[test]
 fn test_sender_auto_protocol_version_only_v2() -> TestResult {
-    _test_sender_auto_detect_protocol_version(Some(vec![2]), ProtocolVersion::V2)
+    _test_sender_auto_detect_protocol_version(Some(vec![2]), ProtocolVersion::V2, 127, 127)
 }
 
 #[test]
 fn test_sender_auto_protocol_version_unsupported_client() -> TestResult {
-    let mut server = MockServer::new()?.configure_settings_response(&[3, 4]);
+    let mut server = MockServer::new()?.configure_settings_response(&[3, 4], 127);
     let sender_builder = server.lsb_http();
     let server_thread = std::thread::spawn(move || -> io::Result<MockServer> {
         server.accept()?;
@@ -787,6 +790,76 @@ fn test_sender_auto_protocol_version_unsupported_client() -> TestResult {
         "Server does not support current client",
     );
 
+    // We keep the server around til the end of the test to ensure that the response is fully received.
+    _ = server_thread.join().unwrap()?;
+    Ok(())
+}
+
+#[test]
+fn test_sender_short_max_name_len() -> TestResult {
+    _test_sender_max_name_len(4, 4, 0)
+}
+
+#[test]
+fn test_sender_specify_max_name_len_with_response() -> TestResult {
+    _test_sender_max_name_len(4, 4, 127)
+}
+
+#[test]
+fn test_sender_long_max_name_len() -> TestResult {
+    _test_sender_max_name_len(130, 130, 0)
+}
+
+#[test]
+fn test_sender_specify_max_name_len_without_response() -> TestResult {
+    _test_sender_max_name_len(0, 16, 16)
+}
+
+#[test]
+fn test_sender_default_max_name_len() -> TestResult {
+    _test_sender_max_name_len(0, 127, 0)
+}
+
+fn _test_sender_max_name_len(
+    response_max_name_len: usize,
+    expect_max_name_len: usize,
+    sender_specify_max_name_len: usize,
+) -> TestResult {
+    let mut server = MockServer::new()?;
+    if response_max_name_len != 0 {
+        server = server.configure_settings_response(&[1, 2], response_max_name_len);
+    }
+
+    let mut sender_builder = server.lsb_http();
+    if sender_specify_max_name_len != 0 {
+        sender_builder = sender_builder.max_name_len(sender_specify_max_name_len)?;
+    }
+    let server_thread = std::thread::spawn(move || -> io::Result<MockServer> {
+        server.accept()?;
+        match response_max_name_len {
+            0 => server.send_http_response_q(
+                HttpResponse::empty()
+                    .with_status(404, "Not Found")
+                    .with_header("content-type", "text/plain")
+                    .with_body_str("Not Found"),
+            )?,
+            _ => server.send_settings_response()?,
+        }
+        Ok(server)
+    });
+    let sender = sender_builder.build()?;
+    assert_eq!(sender.max_name_len(), expect_max_name_len);
+    let mut buffer = sender.new_buffer();
+    let name = "a name too long";
+    if expect_max_name_len < name.len() {
+        assert_err_contains(
+            buffer.table(name),
+            ErrorCode::InvalidName,
+            r#"Bad name: "a name too long": Too long (max 4 characters)"#,
+        );
+    } else {
+        assert!(buffer.table(name).is_ok());
+    }
     // We keep the server around til the end of the test to ensure that the response is fully received.
     _ = server_thread.join().unwrap()?;
     Ok(())

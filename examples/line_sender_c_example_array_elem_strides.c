@@ -4,6 +4,9 @@
 #include <string.h>
 #include "concat.h"
 
+/*
+ * QuestDB server version 8.4.0 or later is required for array support.
+ */
 static bool example(const char* host, const char* port)
 {
     line_sender_error* err = NULL;

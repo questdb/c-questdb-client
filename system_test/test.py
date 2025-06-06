@@ -54,7 +54,7 @@ TLS_PROXY_FIXTURE: TlsProxyFixture = None
 BUILD_MODE = None
 
 # The first QuestDB version that supports array types.
-FIRST_ARRAYS_RELEASE = (8, 3, 1)
+FIRST_ARRAYS_RELEASE = (8, 3, 3)
 
 
 def retry_check_table(*args, **kwargs):
@@ -136,6 +136,10 @@ class TestSender(unittest.TestCase):
                  .symbol('s1', 'v1')
                  .at_now())
                 sender.flush()
+
+    def test_default_max_name_len(self):
+        with self._mk_linesender() as sender:
+            self.assertEqual(sender.max_name_len, 127)
 
     def test_insert_three_rows(self):
         table_name = uuid.uuid4().hex
@@ -781,6 +785,9 @@ class TestSender(unittest.TestCase):
         self._test_array_example(
             'line_sender_cpp_example_array_elem_strides',
             'cpp_market_orders_elem_strides', )
+        self._test_array_example(
+            'line_sender_cpp_example_array_c_major',
+            'cpp_market_orders_c_major', )
 
     def test_c_array_example(self):
         self._test_array_example(
@@ -789,6 +796,9 @@ class TestSender(unittest.TestCase):
         self._test_array_example(
             'line_sender_c_example_array_elem_strides',
             'market_orders_elem_strides', )
+        self._test_array_example(
+            'line_sender_c_example_array_c_major',
+            'market_orders_c_major', )
 
     def _test_array_example(self, bin_name, table_name):
         if self.expected_protocol_version < qls.ProtocolVersion.V2:

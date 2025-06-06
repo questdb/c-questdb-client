@@ -105,8 +105,21 @@ enum class protocol_version
     /** InfluxDB Line Protocol v1. */
     v1 = 1,
 
-    /** InfluxDB Line Protocol v2. */
+    /**
+     * InfluxDB Line Protocol v2.
+     * QuestDB server version 8.4.0 or later is required for
+     * `v2` support.
+     */
     v2 = 2,
+};
+
+enum class array_strides_size_mode
+{
+    /** Strides are provided in bytes */
+    bytes,
+
+    /** Strides are provided in elements */
+    elems,
 };
 
 /* Possible sources of the root certificates used to validate the server's TLS
@@ -641,25 +654,76 @@ public:
     }
 
     /**
-     * Record a multidimensional double-precision array for the given column.
+     * Records a multidimensional array of double-precision values.
      *
-     * @tparam B    Strides mode selector:
-     *              - `true` for byte-level strides
-     *              - `false` for element-level strides
+     * QuestDB server version 8.4.0 or later is required for array support.
+     *
+     * @tparam L    Array stride size mode (bytes or elements).
      * @tparam T    Element type (current only `double` is supported).
      * @tparam N    Number of elements in the flat data array
      *
      * @param name    Column name.
      * @param shape   Array dimensions (e.g., [2,3] for a 2x3 matrix).
-     * @param data    Array first element data. Size must match product of
-     * dimensions.
+     * @param data    Array data.
      */
-    template <bool B, typename T, size_t N>
+    template <array_strides_size_mode L, typename T, size_t N>
     line_sender_buffer& column(
         column_name_view name,
         const size_t rank,
-        const std::vector<uintptr_t>& shape,
-        const std::vector<intptr_t>& strides,
+        const uintptr_t* shape,
+        const intptr_t* strides,
+        const std::array<T, N>& data)
+    {
+        static_assert(
+            std::is_same_v<T, double>,
+            "Only double types are supported for arrays");
+        may_init();
+        switch (L)
+        {
+        case array_strides_size_mode::bytes:
+            line_sender_error::wrapped_call(
+                ::line_sender_buffer_column_f64_arr_byte_strides,
+                _impl,
+                name._impl,
+                rank,
+                shape,
+                strides,
+                reinterpret_cast<const uint8_t*>(data.data()),
+                sizeof(double) * N);
+            break;
+        case array_strides_size_mode::elems:
+            line_sender_error::wrapped_call(
+                ::line_sender_buffer_column_f64_arr_elem_strides,
+                _impl,
+                name._impl,
+                rank,
+                shape,
+                strides,
+                reinterpret_cast<const uint8_t*>(data.data()),
+                sizeof(double) * N);
+        }
+        return *this;
+    }
+
+    /**
+     * Records a multidimensional array of double-precision values with c_major
+     * layout.
+     *
+     * QuestDB server version 8.4.0 or later is required for array support.
+     *
+     * @tparam T    Element type (current only `double` is supported).
+     * @tparam N    Number of elements in the flat data array
+     *
+     * @param name    Column name.
+     * @param rank    Number of dimensions of the array.
+     * @param shape   Array dimensions (e.g., [2,3] for a 2x3 matrix).
+     * @param data    Array data.
+     */
+    template <typename T, size_t N>
+    line_sender_buffer& column(
+        column_name_view name,
+        const size_t rank,
+        const size_t* shape,
         const std::array<T, N>& data)
     {
         static_assert(
@@ -667,17 +731,172 @@ public:
             "Only double types are supported for arrays");
         may_init();
         line_sender_error::wrapped_call(
-            B ? ::line_sender_buffer_column_f64_arr_byte_strides
-              : ::line_sender_buffer_column_f64_arr_elem_strides,
+            ::line_sender_buffer_column_f64_arr_c_major,
             _impl,
             name._impl,
             rank,
-            shape.data(),
-            strides.data(),
+            shape,
             reinterpret_cast<const uint8_t*>(data.data()),
             sizeof(double) * N);
         return *this;
     }
+
+    /**
+     * Records a multidimensional array of double-precision values with
+     * configurable stride mode.
+     *
+     * QuestDB server version 8.4.0 or later is required for array support.
+     *
+     * @tparam L    Array stride size mode (bytes or elements).
+     * @tparam T    Element type (current only `double` is supported).
+     *
+     * @param name    Column name.
+     * @param rank     Number of dimensions of the array.
+     * @param shape    Array dimensions. Example: [2,3] for 2x3 matrix.
+     * @param strides  Array strides. Step between consecutive elements in each
+     * dimension.
+     * @param data     Raw pointer to the start of the array data.
+     * @param elem_count Total element of the array.
+     */
+    template <array_strides_size_mode L, typename T>
+    line_sender_buffer& column(
+        column_name_view name,
+        const size_t rank,
+        const uintptr_t* shape,
+        const intptr_t* strides,
+        const T* data,
+        size_t elem_count)
+    {
+        static_assert(
+            std::is_same_v<T, double>,
+            "Only double types are supported for arrays");
+        may_init();
+        switch (L)
+        {
+        case array_strides_size_mode::bytes:
+            line_sender_error::wrapped_call(
+                ::line_sender_buffer_column_f64_arr_byte_strides,
+                _impl,
+                name._impl,
+                rank,
+                shape,
+                strides,
+                reinterpret_cast<const uint8_t*>(data),
+                elem_count * sizeof(T));
+            break;
+        case array_strides_size_mode::elems:
+            line_sender_error::wrapped_call(
+                ::line_sender_buffer_column_f64_arr_elem_strides,
+                _impl,
+                name._impl,
+                rank,
+                shape,
+                strides,
+                reinterpret_cast<const uint8_t*>(data),
+                elem_count * sizeof(T));
+        }
+        return *this;
+    }
+
+    /**
+     * Records a multidimensional array of double-precision values in C-major
+     * (row-major) layout layout.
+     *
+     * QuestDB server version 8.4.0 or later is required for array support.
+     *
+     * @tparam T    Element type (current only `double` is supported).
+     *
+     * @param name     Column name.
+     * @param rank     Number of dimensions in the array.
+     * @param shape    Array dimensions. Example: [2,3] for 2x3 matrix.
+     * @param data     Raw pointer to the first element of the flat data
+     * array.
+     * @param elem_count Total element of the array.
+     */
+    template <typename T>
+    line_sender_buffer& column(
+        column_name_view name,
+        const size_t rank,
+        const size_t* shape,
+        const T* data,
+        size_t elem_count)
+    {
+        static_assert(
+            std::is_same_v<T, double>,
+            "Only double types are supported for arrays");
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_f64_arr_c_major,
+            _impl,
+            name._impl,
+            rank,
+            shape,
+            reinterpret_cast<const uint8_t*>(data),
+            elem_count * sizeof(T));
+        return *this;
+    }
+
+    /**
+     * Records a 1-dimensional vector of double-precision values as array.
+     *
+     * QuestDB server version 8.4.0 or later is required for array support.
+     *
+     * @tparam T    Element type (current only `double` is supported).
+     *
+     * @param name     Column name.
+     * @param data     Vector.
+     */
+    template <typename T>
+    line_sender_buffer& column(
+        column_name_view name, const std::vector<T>& data)
+    {
+        static_assert(
+            std::is_same_v<T, double>,
+            "Only double types are supported for arrays");
+        may_init();
+        uintptr_t array_shape[] = {data.size()};
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_f64_arr_c_major,
+            _impl,
+            name._impl,
+            1,
+            array_shape,
+            reinterpret_cast<const uint8_t*>(data.data()),
+            data.size() * sizeof(T));
+        return *this;
+    }
+
+#if __cplusplus >= 202002L
+    /**
+     * Records a 1-dimensional span of double-precision values as array.
+     *
+     * QuestDB server version 8.4.0 or later is required for array support.
+     *
+     * @tparam T    Element type (current only `double` is supported).
+     *
+     * @param name     Column name.
+     * @param data     Vector.
+     */
+    template <typename T>
+    line_sender_buffer& column(
+        column_name_view name, const std::span<const T> data)
+    {
+        static_assert(
+            std::is_same_v<T, double>,
+            "Only double types are supported for arrays");
+        may_init();
+        uintptr_t array_shape[] = {data.size()};
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_f64_arr_c_major,
+            _impl,
+            name._impl,
+            1,
+            array_shape,
+            reinterpret_cast<const uint8_t*>(data.data()),
+            data.size() * sizeof(T));
+        return *this;
+    }
+#endif
 
     /**
      * Record a string value for the given column.
@@ -1155,6 +1374,20 @@ public:
         return *this;
     }
 
+    /**
+     * Sets the ingestion protocol version.
+     *
+     * HTTP transport automatically negotiates the protocol version by
+     * default(unset, strong recommended). You can explicitlyconfigure the
+     * protocol version to avoid the slight latency cost at connection time.
+     *
+     * TCP transport does not negotiate the protocol version and uses
+     * `protocol_version::v1` by default. You must explicitly set
+     * `protocol_version::v2` in order to ingest arrays.
+     *
+     * QuestDB server version 8.4.0 or later is required for
+     * `protocol_version::v2` support.
+     */
     opts& protocol_version(protocol_version version) noexcept
     {
         const auto c_protocol_version =
@@ -1271,6 +1504,9 @@ public:
         return *this;
     }
 
+    /**
+     * Get the current protocol version used by the sender.
+     */
     questdb::ingress::protocol_version protocol_version() const noexcept
     {
         ensure_impl();
@@ -1347,11 +1583,57 @@ public:
     }
 
     /**
+     * Send the batch of rows in the buffer to the QuestDB server, and, if the
+     * parameter `transactional` is true, ensure the flush will be
+     * transactional.
+     *
+     * A flush is transactional iff all the rows belong to the same table. This
+     * allows QuestDB to treat the flush as a single database transaction,
+     * because it doesn't support transactions spanning multiple tables.
+     * Additionally, only ILP-over-HTTP supports transactional flushes.
+     *
+     * If the flush wouldn't be transactional, this function returns an error
+     * and doesn't flush any data.
+     *
+     * The function sends an HTTP request and waits for the response. If the
+     * server responds with an error, it returns a descriptive error. In the
+     * case of a network error, it retries until it has exhausted the retry time
+     * budget.
+     *
+     * All the data stays in the buffer. Clear the buffer before starting a new
+     * batch.
+     */
+    void flush_and_keep_with_flags(
+        const line_sender_buffer& buffer, bool transactional)
+    {
+        if (buffer._impl)
+        {
+            ensure_impl();
+            line_sender_error::wrapped_call(
+                ::line_sender_flush_and_keep_with_flags,
+                _impl,
+                buffer._impl,
+                transactional);
+        }
+        else
+        {
+            line_sender_buffer buffer2{this->protocol_version(), 0};
+            buffer2.may_init();
+            line_sender_error::wrapped_call(
+                ::line_sender_flush_and_keep_with_flags,
+                _impl,
+                buffer2._impl,
+                transactional);
+        }
+    }
+
+    /**
      * Check if an error occurred previously and the sender must be closed.
      * This happens when there was an earlier failure.
      * This method is specific to ILP-over-TCP and is not relevant for
      * ILP-over-HTTP.
-     * @return true if an error occurred with a sender and it must be closed.
+     * @return true if an error occurred with a sender and it must be
+     * closed.
      */
     bool must_close() const noexcept
     {
