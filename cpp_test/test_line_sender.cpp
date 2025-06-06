@@ -273,8 +273,8 @@ TEST_CASE("line_sender c++ api basics")
     questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
     // 3D array of doubles
     size_t rank = 3;
-    std::vector<uintptr_t> shape{2, 3, 2};
-    std::vector<intptr_t> strides{48, 16, 8};
+    size_t shape[] = {2, 3, 2};
+    ssize_t strides[] = {48, 16, 8};
     std::array<double, 12> arr_data = {
         48123.5,
         2.4,
@@ -288,31 +288,35 @@ TEST_CASE("line_sender c++ api basics")
         2.7,
         48121.5,
         4.3};
-    std::vector<intptr_t> elem_strides{6, 2, 1};
+    ssize_t elem_strides[] = {6, 2, 1};
     buffer.table("test")
         .symbol("t1", "v1")
         .symbol("t2", "")
         .column("f1", 0.5)
-        .column<questdb::ingress::array_strides_mode::bytes>(
+        .column<questdb::ingress::array_strides_size_mode::bytes>(
             "a1", rank, shape, strides, arr_data)
-        .column<questdb::ingress::array_strides_mode::elems>(
+        .column<questdb::ingress::array_strides_size_mode::elems>(
             "a2", rank, shape, elem_strides, arr_data)
-        .column<questdb::ingress::array_strides_mode::c_major>(
-            "a3", rank, shape, {}, arr_data)
+        .column("a3", rank, shape, arr_data)
+        .column<questdb::ingress::array_strides_size_mode::bytes>(
+            "a4", rank, shape, strides, arr_data.data(), arr_data.size())
+        .column<questdb::ingress::array_strides_size_mode::elems>(
+            "a5", rank, shape, elem_strides, arr_data.data(), arr_data.size())
+        .column("a6", rank, shape, arr_data.data(), arr_data.size())
         .at(questdb::ingress::timestamp_nanos{10000000});
 
     CHECK(server.recv() == 0);
-    CHECK(buffer.size() == 386);
+    CHECK(buffer.size() == 734);
     sender.flush(buffer);
     CHECK(server.recv() == 1);
     std::string expect{"test,t1=v1,t2= f1=="};
     push_double_to_buffer(expect, 0.5).append(",a1==");
-    push_double_arr_to_buffer(expect, arr_data, 3, shape.data())
-        .append(",a2==");
-    push_double_arr_to_buffer(expect, arr_data, 3, shape.data())
-        .append(",a3==");
-    push_double_arr_to_buffer(expect, arr_data, 3, shape.data())
-        .append(" 10000000\n");
+    push_double_arr_to_buffer(expect, arr_data, 3, shape).append(",a2==");
+    push_double_arr_to_buffer(expect, arr_data, 3, shape).append(",a3==");
+    push_double_arr_to_buffer(expect, arr_data, 3, shape).append(",a4==");
+    push_double_arr_to_buffer(expect, arr_data, 3, shape).append(",a5==");
+    push_double_arr_to_buffer(expect, arr_data, 3, shape).append(",a6==");
+    push_double_arr_to_buffer(expect, arr_data, 3, shape).append(" 10000000\n");
     CHECK(server.msgs(0) == expect);
 }
 

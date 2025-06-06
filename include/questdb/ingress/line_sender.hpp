@@ -109,11 +109,8 @@ enum class protocol_version
     v2 = 2,
 };
 
-enum class array_strides_mode
+enum class array_strides_size_mode
 {
-    /** Strides are inferred from C-style row-major memory layout. */
-    c_major,
-
     /** Strides are provided in bytes */
     bytes,
 
@@ -655,67 +652,175 @@ public:
     /**
      * Records a multidimensional array of double-precision values.
      *
-     * @tparam Layout    Memory layout specification (array_strides_mode)
+     * @tparam L    Array stride size mode (bytes or elements).
      * @tparam T    Element type (current only `double` is supported).
      * @tparam N    Number of elements in the flat data array
      *
      * @param name    Column name.
      * @param shape   Array dimensions (e.g., [2,3] for a 2x3 matrix).
-     * @param data    Array first element data. Size must match product of
-     * dimensions.
+     * @param data    Array data.
      */
-    template <array_strides_mode Layout, typename T, size_t N>
+    template <array_strides_size_mode L, typename T, size_t N>
     line_sender_buffer& column(
         column_name_view name,
         const size_t rank,
-        const std::vector<uintptr_t>& shape,
-        const std::vector<intptr_t>& strides,
+        const size_t* shape,
+        const ssize_t* strides,
         const std::array<T, N>& data)
     {
         static_assert(
             std::is_same_v<T, double>,
             "Only double types are supported for arrays");
         may_init();
-        switch (Layout)
+        switch (L)
         {
-        case array_strides_mode::c_major:
-            if (!strides.empty())
-            {
-                throw line_sender_error{
-                    line_sender_error_code::config_error,
-                    "C_Major layout requires empty strides vector"};
-            }
-            line_sender_error::wrapped_call(
-                ::line_sender_buffer_column_f64_arr_c_major,
-                _impl,
-                name._impl,
-                rank,
-                shape.data(),
-                reinterpret_cast<const uint8_t*>(data.data()),
-                sizeof(double) * N);
-            break;
-        case array_strides_mode::bytes:
+        case array_strides_size_mode::bytes:
             line_sender_error::wrapped_call(
                 ::line_sender_buffer_column_f64_arr_byte_strides,
                 _impl,
                 name._impl,
                 rank,
-                shape.data(),
-                strides.data(),
+                shape,
+                strides,
                 reinterpret_cast<const uint8_t*>(data.data()),
                 sizeof(double) * N);
             break;
-        case array_strides_mode::elems:
+        case array_strides_size_mode::elems:
             line_sender_error::wrapped_call(
                 ::line_sender_buffer_column_f64_arr_elem_strides,
                 _impl,
                 name._impl,
                 rank,
-                shape.data(),
-                strides.data(),
+                shape,
+                strides,
                 reinterpret_cast<const uint8_t*>(data.data()),
                 sizeof(double) * N);
         }
+        return *this;
+    }
+
+    /**
+     * Records a multidimensional array of double-precision values with c_major
+     * layout.
+     *
+     * @tparam T    Element type (current only `double` is supported).
+     * @tparam N    Number of elements in the flat data array
+     *
+     * @param name    Column name.
+     * @param rank    Number of dimensions of the array.
+     * @param shape   Array dimensions (e.g., [2,3] for a 2x3 matrix).
+     * @param data    Array data.
+     */
+    template <typename T, size_t N>
+    line_sender_buffer& column(
+        column_name_view name,
+        const size_t rank,
+        const size_t* shape,
+        const std::array<T, N>& data)
+    {
+        static_assert(
+            std::is_same_v<T, double>,
+            "Only double types are supported for arrays");
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_f64_arr_c_major,
+            _impl,
+            name._impl,
+            rank,
+            shape,
+            reinterpret_cast<const uint8_t*>(data.data()),
+            sizeof(double) * N);
+        return *this;
+    }
+
+    /**
+     * Records a multidimensional array of double-precision values with
+     * configurable stride mode.
+     *
+     * @tparam L    Array stride size mode (bytes or elements).
+     * @tparam T    Element type (current only `double` is supported).
+     *
+     * @param name    Column name.
+     * @param rank     Number of dimensions of the array.
+     * @param shape    Array dimensions. Example: [2,3] for 2x3 matrix.
+     * @param strides  Array strides. Step between consecutive elements in each
+     * dimension.
+     * @param data     Raw pointer to the start of the array data.
+     * @param elem_count Total element of the array.
+     */
+    template <array_strides_size_mode L, typename T>
+    line_sender_buffer& column(
+        column_name_view name,
+        const size_t rank,
+        const size_t* shape,
+        const ssize_t* strides,
+        const T* data,
+        size_t elem_count)
+    {
+        static_assert(
+            std::is_same_v<T, double>,
+            "Only double types are supported for arrays");
+        may_init();
+        switch (L)
+        {
+        case array_strides_size_mode::bytes:
+            line_sender_error::wrapped_call(
+                ::line_sender_buffer_column_f64_arr_byte_strides,
+                _impl,
+                name._impl,
+                rank,
+                shape,
+                strides,
+                reinterpret_cast<const uint8_t*>(data),
+                elem_count * sizeof(T));
+            break;
+        case array_strides_size_mode::elems:
+            line_sender_error::wrapped_call(
+                ::line_sender_buffer_column_f64_arr_elem_strides,
+                _impl,
+                name._impl,
+                rank,
+                shape,
+                strides,
+                reinterpret_cast<const uint8_t*>(data),
+                elem_count * sizeof(T));
+        }
+        return *this;
+    }
+
+    /**
+     * Records a multidimensional array of double-precision values in C-major
+     * (row-major) layout layout.
+     *
+     * @tparam T    Element type (current only `double` is supported).
+     *
+     * @param name     Column name.
+     * @param rank     Number of dimensions in the array.
+     * @param shape    Array dimensions. Example: [2,3] for 2x3 matrix.
+     * @param data     Raw pointer to the first element of the flat data
+     * array.
+     * @param elem_count Total element of the array.
+     */
+    template <typename T>
+    line_sender_buffer& column(
+        column_name_view name,
+        const size_t rank,
+        const size_t* shape,
+        const T* data,
+        size_t elem_count)
+    {
+        static_assert(
+            std::is_same_v<T, double>,
+            "Only double types are supported for arrays");
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_f64_arr_c_major,
+            _impl,
+            name._impl,
+            rank,
+            shape,
+            reinterpret_cast<const uint8_t*>(data),
+            elem_count * sizeof(T));
         return *this;
     }
 
