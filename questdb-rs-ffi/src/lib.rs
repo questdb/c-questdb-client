@@ -312,6 +312,7 @@ pub enum ProtocolVersion {
     /// Version 2 of InfluxDB Line Protocol.
     /// Uses binary format serialization for f64, and supports the array data type.
     /// This version is specific to QuestDB and is not compatible with InfluxDB.
+    /// QuestDB server version 8.4.0 or later is required for V2 supported.
     V2 = 2,
 }
 
@@ -951,6 +952,7 @@ pub unsafe extern "C" fn line_sender_buffer_column_str(
 /// - All pointer parameters must be valid and non-null
 /// - shape must point to an array of `rank` integers
 /// - data_buffer must point to a buffer of size `data_buffer_len` bytes
+/// - QuestDB server version 8.4.0 or later is required for array support.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_c_major(
     buffer: *mut line_sender_buffer,
@@ -994,6 +996,7 @@ pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_c_major(
 /// - All pointer parameters must be valid and non-null
 /// - shape must point to an array of `rank` integers
 /// - data_buffer must point to a buffer of size `data_buffer_len` bytes
+/// - QuestDB server version 8.4.0 or later is required for array support.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_byte_strides(
     buffer: *mut line_sender_buffer,
@@ -1039,6 +1042,7 @@ pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_byte_strides(
 /// - All pointer parameters must be valid and non-null
 /// - shape must point to an array of `rank` integers
 /// - data_buffer must point to a buffer of size `data_buffer_len` bytes
+/// - QuestDB server version 8.4.0 or later is required for array support.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_elem_strides(
     buffer: *mut line_sender_buffer,
@@ -1350,6 +1354,8 @@ pub unsafe extern "C" fn line_sender_opts_token_y(
 /// - TCP transport does not negotiate the protocol version and uses [`ProtocolVersion::V1`] by
 ///   default. You must explicitly set [`ProtocolVersion::V2`] in order to ingest
 ///   arrays.
+///
+/// QuestDB server version 8.4.0 or later is required for [`ProtocolVersion::V2`]
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_opts_protocol_version(
     opts: *mut line_sender_opts,

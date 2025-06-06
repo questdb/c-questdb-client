@@ -115,6 +115,8 @@ typedef enum line_sender_protocol_version
      * Uses a binary format serialization for f64, and supports
      * the array data type.
      * This version is specific to QuestDB and not compatible with InfluxDB.
+     * QuestDB server version 8.4.0 or later is required for
+     * `line_sender_protocol_version_2` supported.
      */
     line_sender_protocol_version_2 = 2,
 } line_sender_protocol_version;
@@ -492,6 +494,8 @@ bool line_sender_buffer_column_str(
  * Records a multidimensional array of 64-bit floating-point values in C-major
  * order.
  *
+ * QuestDB server version 8.4.0 or later is required for array support.
+ *
  * @param[in] buffer Line buffer object.
  * @param[in] name Column name.
  * @param[in] rank Number of dimensions of the array.
@@ -517,6 +521,8 @@ bool line_sender_buffer_column_f64_arr_c_major(
  *
  * This API uses BYTE-LEVEL STRIDES where the stride values represent the
  * number of bytes between consecutive elements along each dimension.
+ *
+ * QuestDB server version 8.4.0 or later is required for array support.
  *
  * @param[in] buffer Line buffer object.
  * @param[in] name Column name.
@@ -545,6 +551,8 @@ bool line_sender_buffer_column_f64_arr_byte_strides(
  *
  * This function uses ELEMENT-LEVEL STRIDES where the stride values represent
  * the number of elements between consecutive elements along each dimension.
+ *
+ * QuestDB server version 8.4.0 or later is required for array support.
  *
  * @param[in] buffer Line buffer object.
  * @param[in] name Column name.
@@ -819,6 +827,9 @@ bool line_sender_opts_token_y(
  * TCP transport does not negotiate the protocol version and uses
  * `line_sender_protocol_version_1` by default. You must explicitly set
  * `line_sender_protocol_version_2` in order to ingest arrays.
+ *
+ * QuestDB server version 8.4.0 or later is required for
+ * `line_sender_protocol_version_2`.
  */
 LINESENDER_API
 bool line_sender_opts_protocol_version(

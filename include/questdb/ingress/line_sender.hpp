@@ -105,7 +105,11 @@ enum class protocol_version
     /** InfluxDB Line Protocol v1. */
     v1 = 1,
 
-    /** InfluxDB Line Protocol v2. */
+    /**
+     * InfluxDB Line Protocol v2.
+     * QuestDB server version 8.4.0 or later is required for
+     * `v2` supported.
+     */
     v2 = 2,
 };
 
@@ -652,6 +656,8 @@ public:
     /**
      * Records a multidimensional array of double-precision values.
      *
+     * QuestDB server version 8.4.0 or later is required for array support.
+     *
      * @tparam L    Array stride size mode (bytes or elements).
      * @tparam T    Element type (current only `double` is supported).
      * @tparam N    Number of elements in the flat data array
@@ -703,6 +709,8 @@ public:
      * Records a multidimensional array of double-precision values with c_major
      * layout.
      *
+     * QuestDB server version 8.4.0 or later is required for array support.
+     *
      * @tparam T    Element type (current only `double` is supported).
      * @tparam N    Number of elements in the flat data array
      *
@@ -736,6 +744,8 @@ public:
     /**
      * Records a multidimensional array of double-precision values with
      * configurable stride mode.
+     *
+     * QuestDB server version 8.4.0 or later is required for array support.
      *
      * @tparam L    Array stride size mode (bytes or elements).
      * @tparam T    Element type (current only `double` is supported).
@@ -791,6 +801,8 @@ public:
     /**
      * Records a multidimensional array of double-precision values in C-major
      * (row-major) layout layout.
+     *
+     * QuestDB server version 8.4.0 or later is required for array support.
      *
      * @tparam T    Element type (current only `double` is supported).
      *
@@ -1310,6 +1322,9 @@ public:
      * TCP transport does not negotiate the protocol version and uses
      * `protocol_version::v1` by default. You must explicitly set
      * `protocol_version::v2` in order to ingest arrays.
+     *
+     * QuestDB server version 8.4.0 or later is required for
+     * `protocol_version::v2`.
      */
     opts& protocol_version(protocol_version version) noexcept
     {

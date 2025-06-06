@@ -27,6 +27,8 @@ These protocol versions are supported over both HTTP and TCP.
 | **1**   | Over HTTP it's compatible InfluxDB Line Protocol (ILP)  | All QuestDB versions  |
 | **2**   | 64-bit floats sent as binary, adds n-dimentional arrays | 8.4.0+ (2023-10-30)   |
 
+**Note**: QuestDB server version 8.4.0 or later is required for `protocol_version=2`.
+
 ## Quick Start
 
 To start using `questdb-rs`, add it as a dependency of your project:
