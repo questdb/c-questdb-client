@@ -837,6 +837,68 @@ public:
     }
 
     /**
+     * Records a 1-dimensional vector of double-precision values as array.
+     *
+     * QuestDB server version 8.4.0 or later is required for array support.
+     *
+     * @tparam T    Element type (current only `double` is supported).
+     *
+     * @param name     Column name.
+     * @param data     Vector.
+     */
+    template <typename T>
+    line_sender_buffer& column(
+        column_name_view name, const std::vector<T>& data)
+    {
+        static_assert(
+            std::is_same_v<T, double>,
+            "Only double types are supported for arrays");
+        may_init();
+        uintptr_t array_shape[] = {data.size()};
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_f64_arr_c_major,
+            _impl,
+            name._impl,
+            1,
+            array_shape,
+            reinterpret_cast<const uint8_t*>(data.data()),
+            data.size() * sizeof(T));
+        return *this;
+    }
+
+#if __cplusplus >= 202002L
+    /**
+     * Records a 1-dimensional span of double-precision values as array.
+     *
+     * QuestDB server version 8.4.0 or later is required for array support.
+     *
+     * @tparam T    Element type (current only `double` is supported).
+     *
+     * @param name     Column name.
+     * @param data     Vector.
+     */
+    template <typename T>
+    line_sender_buffer& column(
+        column_name_view name, const std::span<const T> data)
+    {
+        static_assert(
+            std::is_same_v<T, double>,
+            "Only double types are supported for arrays");
+        may_init();
+        uintptr_t array_shape[] = {data.size()};
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_f64_arr_c_major,
+            _impl,
+            name._impl,
+            1,
+            array_shape,
+            reinterpret_cast<const uint8_t*>(data.data()),
+            data.size() * sizeof(T));
+        return *this;
+    }
+#endif
+
+    /**
      * Record a string value for the given column.
      * @param name Column name.
      * @param value Column value.

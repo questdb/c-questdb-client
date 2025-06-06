@@ -111,6 +111,24 @@ std::string& push_double_arr_to_buffer(
     return buffer;
 }
 
+std::string& push_double_arr_to_buffer(
+    std::string& buffer,
+    std::vector<double>& data,
+    size_t rank,
+    uintptr_t* shape)
+{
+    buffer.push_back(14);
+    buffer.push_back(10);
+    buffer.push_back(static_cast<char>(rank));
+    for (size_t i = 0; i < rank; ++i)
+        buffer.append(
+            reinterpret_cast<const char*>(&shape[i]), sizeof(uint32_t));
+    buffer.append(
+        reinterpret_cast<const char*>(data.data()),
+        data.size() * sizeof(double));
+    return buffer;
+}
+
 std::string& push_double_to_buffer(std::string& buffer, double data)
 {
     buffer.push_back(16);
@@ -319,6 +337,99 @@ TEST_CASE("line_sender c++ api basics")
     push_double_arr_to_buffer(expect, arr_data, 3, shape).append(" 10000000\n");
     CHECK(server.msgs(0) == expect);
 }
+
+TEST_CASE("line_sender array vector API")
+{
+    questdb::ingress::test::mock_server server;
+    questdb::ingress::opts opts{
+        questdb::ingress::protocol::tcp,
+        std::string("127.0.0.1"),
+        std::to_string(server.port())};
+    opts.protocol_version(questdb::ingress::protocol_version::v2);
+    questdb::ingress::line_sender sender{opts};
+    CHECK_FALSE(sender.must_close());
+    server.accept();
+    CHECK(server.recv() == 0);
+    questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
+    std::vector<double> arr_data = {
+        48123.5,
+        2.4,
+        48124.0,
+        1.8,
+        48124.5,
+        0.9,
+        48122.5,
+        3.1,
+        48122.0,
+        2.7,
+        48121.5,
+        4.3};
+    buffer.table("test")
+        .symbol("t1", "v1")
+        .symbol("t2", "")
+        .column("a1", arr_data)
+        .at(questdb::ingress::timestamp_nanos{10000000});
+
+    uintptr_t test_shape[] = {12};
+    CHECK(server.recv() == 0);
+    CHECK(buffer.size() == 132);
+    sender.flush(buffer);
+    CHECK(server.recv() == 1);
+    std::string expect{"test,t1=v1,t2= a1=="};
+    push_double_arr_to_buffer(expect, arr_data, 1, test_shape)
+        .append(" 10000000\n");
+    CHECK(server.msgs(0) == expect);
+}
+
+#if __cplusplus >= 202002L
+TEST_CASE("line_sender array span API")
+{
+    questdb::ingress::test::mock_server server;
+    questdb::ingress::opts opts{
+        questdb::ingress::protocol::tcp,
+        std::string("127.0.0.1"),
+        std::to_string(server.port())};
+    opts.protocol_version(questdb::ingress::protocol_version::v2);
+    questdb::ingress::line_sender sender{opts};
+    CHECK_FALSE(sender.must_close());
+    server.accept();
+    CHECK(server.recv() == 0);
+
+    questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
+
+    std::vector<double> arr_data = {
+        48123.5,
+        2.4,
+        48124.0,
+        1.8,
+        48124.5,
+        0.9,
+        48122.5,
+        3.1,
+        48122.0,
+        2.7,
+        48121.5,
+        4.3};
+    std::span<const double> data_span = arr_data;
+    buffer.table("test")
+        .symbol("t1", "v1")
+        .symbol("t2", "")
+        .column("a1", data_span.subspan(1, 8))
+        .at(questdb::ingress::timestamp_nanos{10000000});
+    std::vector<double> expect_arr_data = {
+        2.4, 48124.0, 1.8, 48124.5, 0.9, 48122.5, 3.1, 48122.0};
+
+    uintptr_t test_shape[] = {8};
+    CHECK(server.recv() == 0);
+    CHECK(buffer.size() == 100);
+    sender.flush(buffer);
+    CHECK(server.recv() == 1);
+    std::string expect{"test,t1=v1,t2= a1=="};
+    push_double_arr_to_buffer(expect, expect_arr_data, 1, test_shape)
+        .append(" 10000000\n");
+    CHECK(server.msgs(0) == expect);
+}
+#endif
 
 TEST_CASE("test multiple lines")
 {
