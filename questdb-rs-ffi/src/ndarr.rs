@@ -947,4 +947,284 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn test_stride_non_contiguous_3d() -> TestResult {
+        let elem_size = size_of::<f64>() as isize;
+        let col_major_data = [
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ];
+        let shape = [2, 3, 2];
+        let strides = [
+            elem_size,
+            shape[0] as isize * elem_size,
+            shape[0] as isize * shape[1] as isize * elem_size,
+        ];
+        let array_view: StrideArrayView<'_, f64, 1, 3> = unsafe {
+            StrideArrayView::new(
+                shape.as_ptr(),
+                strides.as_ptr(),
+                col_major_data.as_ptr() as *const u8,
+                col_major_data.len() * elem_size as usize,
+            )
+        }?;
+        assert_eq!(array_view.ndim(), 3);
+        assert_eq!(array_view.dim(0), Ok(2));
+        assert_eq!(array_view.dim(1), Ok(3));
+        assert_eq!(array_view.dim(2), Ok(2));
+        assert!(array_view.dim(3).is_err());
+        assert!(array_view.as_slice().is_none());
+
+        let mut buffer = Buffer::new(ProtocolVersion::V2);
+        buffer.table("my_test")?;
+        buffer.column_arr("temperature", &array_view)?;
+        let data = buffer.as_bytes();
+        assert_eq!(&data[0..7], b"my_test");
+        assert_eq!(&data[8..19], b"temperature");
+        assert_eq!(
+            &data[19..24],
+            &[
+                b'=', b'=', 14u8, // ARRAY_BINARY_FORMAT_TYPE
+                10u8, // ArrayColumnTypeTag::Double.into()
+                3u8
+            ]
+        );
+        assert_eq!(
+            &data[24..36],
+            [2i32.to_le_bytes(), 3i32.to_le_bytes(), 2i32.to_le_bytes()].concat()
+        );
+        assert_eq!(
+            &data[36..132],
+            &[
+                1.0f64.to_ne_bytes(),
+                7.0f64.to_le_bytes(),
+                3.0f64.to_le_bytes(),
+                9.0f64.to_le_bytes(),
+                5.0f64.to_ne_bytes(),
+                11.0f64.to_le_bytes(),
+                2.0f64.to_le_bytes(),
+                8.0f64.to_le_bytes(),
+                4.0f64.to_ne_bytes(),
+                10.0f64.to_le_bytes(),
+                6.0f64.to_le_bytes(),
+                12.0f64.to_le_bytes(),
+            ]
+            .concat()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_stride_non_contiguous_elem_stride_3d() -> TestResult {
+        let elem_size = size_of::<f64>() as isize;
+        let col_major_data = [
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ];
+        let shape = [2, 3, 2];
+        let strides = [1, shape[0] as isize, shape[0] as isize * shape[1] as isize];
+        let array_view: StrideArrayView<'_, f64, 8, 3> = unsafe {
+            StrideArrayView::new(
+                shape.as_ptr(),
+                strides.as_ptr(),
+                col_major_data.as_ptr() as *const u8,
+                col_major_data.len() * elem_size as usize,
+            )
+        }?;
+        assert_eq!(array_view.ndim(), 3);
+        assert_eq!(array_view.dim(0), Ok(2));
+        assert_eq!(array_view.dim(1), Ok(3));
+        assert_eq!(array_view.dim(2), Ok(2));
+        assert!(array_view.dim(3).is_err());
+        assert!(array_view.as_slice().is_none());
+
+        let mut buffer = Buffer::new(ProtocolVersion::V2);
+        buffer.table("my_test")?;
+        buffer.column_arr("temperature", &array_view)?;
+        let data = buffer.as_bytes();
+        assert_eq!(&data[0..7], b"my_test");
+        assert_eq!(&data[8..19], b"temperature");
+        assert_eq!(
+            &data[19..24],
+            &[
+                b'=', b'=', 14u8, // ARRAY_BINARY_FORMAT_TYPE
+                10u8, // ArrayColumnTypeTag::Double.into()
+                3u8
+            ]
+        );
+        assert_eq!(
+            &data[24..36],
+            [2i32.to_le_bytes(), 3i32.to_le_bytes(), 2i32.to_le_bytes()].concat()
+        );
+        assert_eq!(
+            &data[36..132],
+            &[
+                1.0f64.to_ne_bytes(),
+                7.0f64.to_le_bytes(),
+                3.0f64.to_le_bytes(),
+                9.0f64.to_le_bytes(),
+                5.0f64.to_ne_bytes(),
+                11.0f64.to_le_bytes(),
+                2.0f64.to_le_bytes(),
+                8.0f64.to_le_bytes(),
+                4.0f64.to_ne_bytes(),
+                10.0f64.to_le_bytes(),
+                6.0f64.to_le_bytes(),
+                12.0f64.to_le_bytes(),
+            ]
+            .concat()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_stride_non_contiguous_4d() -> TestResult {
+        let elem_size = size_of::<f64>() as isize;
+        let col_major_data = [
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ];
+        let shape = [2, 2, 1, 3];
+        let strides = [
+            elem_size,
+            shape[0] as isize * elem_size,
+            shape[0] as isize * shape[1] as isize * elem_size,
+            shape[0] as isize * shape[1] as isize * shape[2] as isize * elem_size,
+        ];
+
+        let array_view: StrideArrayView<'_, f64, 1, 4> = unsafe {
+            StrideArrayView::new(
+                shape.as_ptr(),
+                strides.as_ptr(),
+                col_major_data.as_ptr() as *const u8,
+                col_major_data.len() * elem_size as usize,
+            )
+        }?;
+
+        assert_eq!(array_view.ndim(), 4);
+        assert_eq!(array_view.dim(0), Ok(2));
+        assert_eq!(array_view.dim(1), Ok(2));
+        assert_eq!(array_view.dim(2), Ok(1));
+        assert_eq!(array_view.dim(3), Ok(3));
+        assert!(array_view.dim(4).is_err());
+        assert!(array_view.as_slice().is_none());
+
+        let mut buffer = Buffer::new(ProtocolVersion::V2);
+        buffer.table("my_test")?;
+        buffer.column_arr("temperature", &array_view)?;
+        let data = buffer.as_bytes();
+        assert_eq!(&data[0..7], b"my_test");
+        assert_eq!(&data[8..19], b"temperature");
+        assert_eq!(
+            &data[19..24],
+            &[
+                b'=', b'=', 14u8, // ARRAY_BINARY_FORMAT_TYPE
+                10u8, // ArrayColumnTypeTag::Double.into()
+                4u8
+            ]
+        );
+        assert_eq!(
+            &data[24..40],
+            [
+                2i32.to_le_bytes(),
+                2i32.to_le_bytes(),
+                1i32.to_le_bytes(),
+                3i32.to_le_bytes()
+            ]
+            .concat()
+        );
+        assert_eq!(
+            &data[40..136],
+            &[
+                1.0f64.to_ne_bytes(),
+                5.0f64.to_le_bytes(),
+                9.0f64.to_le_bytes(),
+                3.0f64.to_le_bytes(),
+                7.0f64.to_ne_bytes(),
+                11.0f64.to_le_bytes(),
+                2.0f64.to_le_bytes(),
+                6.0f64.to_le_bytes(),
+                10.0f64.to_ne_bytes(),
+                4.0f64.to_le_bytes(),
+                8.0f64.to_le_bytes(),
+                12.0f64.to_le_bytes(),
+            ]
+            .concat()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_stride_non_contiguous_elem_stride_4d() -> TestResult {
+        let elem_size = size_of::<f64>() as isize;
+        let col_major_data = [
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ];
+        let shape = [2, 2, 1, 3];
+        let strides = [
+            1,
+            shape[0] as isize,
+            shape[0] as isize * shape[1] as isize,
+            shape[0] as isize * shape[1] as isize * shape[2] as isize,
+        ];
+
+        let array_view: StrideArrayView<'_, f64, 8, 4> = unsafe {
+            StrideArrayView::new(
+                shape.as_ptr(),
+                strides.as_ptr(),
+                col_major_data.as_ptr() as *const u8,
+                col_major_data.len() * elem_size as usize,
+            )
+        }?;
+
+        assert_eq!(array_view.ndim(), 4);
+        assert_eq!(array_view.dim(0), Ok(2));
+        assert_eq!(array_view.dim(1), Ok(2));
+        assert_eq!(array_view.dim(2), Ok(1));
+        assert_eq!(array_view.dim(3), Ok(3));
+        assert!(array_view.dim(4).is_err());
+        assert!(array_view.as_slice().is_none());
+
+        let mut buffer = Buffer::new(ProtocolVersion::V2);
+        buffer.table("my_test")?;
+        buffer.column_arr("temperature", &array_view)?;
+        let data = buffer.as_bytes();
+        assert_eq!(&data[0..7], b"my_test");
+        assert_eq!(&data[8..19], b"temperature");
+        assert_eq!(
+            &data[19..24],
+            &[
+                b'=', b'=', 14u8, // ARRAY_BINARY_FORMAT_TYPE
+                10u8, // ArrayColumnTypeTag::Double.into()
+                4u8
+            ]
+        );
+        assert_eq!(
+            &data[24..40],
+            [
+                2i32.to_le_bytes(),
+                2i32.to_le_bytes(),
+                1i32.to_le_bytes(),
+                3i32.to_le_bytes()
+            ]
+            .concat()
+        );
+        assert_eq!(
+            &data[40..136],
+            &[
+                1.0f64.to_ne_bytes(),
+                5.0f64.to_le_bytes(),
+                9.0f64.to_le_bytes(),
+                3.0f64.to_le_bytes(),
+                7.0f64.to_ne_bytes(),
+                11.0f64.to_le_bytes(),
+                2.0f64.to_le_bytes(),
+                6.0f64.to_le_bytes(),
+                10.0f64.to_ne_bytes(),
+                4.0f64.to_le_bytes(),
+                8.0f64.to_le_bytes(),
+                12.0f64.to_le_bytes(),
+            ]
+            .concat()
+        );
+        Ok(())
+    }
 }
