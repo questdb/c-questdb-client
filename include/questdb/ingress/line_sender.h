@@ -304,23 +304,20 @@ line_sender_column_name line_sender_column_name_assert(
 typedef struct line_sender_buffer line_sender_buffer;
 
 /**
- * Construct a `line_sender_buffer` with a `max_name_len` of `127`, which is
- * the same as the QuestDB server default.
- * You should prefer to use `line_sender_for_sender()` instead, which
- * automatically creates a buffer of the same protocol version as the sender.
- * This is useful as it can rely on the sender's ability to auto-detect the
- * protocol version when communicating over HTTP.
+ * Construct a `line_sender_buffer` with explicitly set `protocol_version` and
+ * fixed 127-byte name length limit.
+ * Prefer `line_sender_buffer_new_for_sender` which uses the sender's
+ * configured protocol settings.
  */
 LINESENDER_API
 line_sender_buffer* line_sender_buffer_new(
     line_sender_protocol_version version);
 
 /**
- * Construct a `line_sender_buffer` with a custom maximum length for table
- * and column names. This should match the `cairo.max.file.name.length`
- * setting of the QuestDB  server you're connecting to. If the server does
- * not configure it, the default is `127`, and you can call
- * `line_sender_buffer_new()` instead.
+ * Construct a `line_sender_buffer` with explicitly set `protocol_version` and
+ * a max name length limit.
+ * Prefer `line_sender_buffer_new_for_sender` which uses the sender's
+ * configured protocol and max name length limit settings.
  */
 LINESENDER_API
 line_sender_buffer* line_sender_buffer_with_max_name_len(
@@ -813,7 +810,15 @@ bool line_sender_opts_token_y(
     line_sender_error** err_out);
 
 /**
- * set the line protocol version.
+ * Sets the ingestion protocol version.
+ *
+ * HTTP transport automatically negotiates the protocol version by
+ * default(unset strong recommended). You can explicitlyconfigure the
+ * protocol version to avoid the slight latency cost at connection time.
+ *
+ * TCP transport does not negotiate the protocol version and uses
+ * `line_sender_protocol_version_1` by default. You must explicitly set
+ * `line_sender_protocol_version_2` in order to ingest arrays.
  */
 LINESENDER_API
 bool line_sender_opts_protocol_version(
@@ -991,8 +996,9 @@ line_sender* line_sender_from_env(line_sender_error** err_out);
 /**
  * Return the sender's protocol version.
  * This is either the protocol version that was set explicitly,
- * or the one that was auto-detected during the connection process.
- * If connecting via TCP and not overridden, the value is V1.
+ * or the one that was auto-detected during the connection process(Only for
+ * HTTP). If connecting via TCP and not overridden, the value is
+ * `line_sender_protocol_version_1`.
  */
 LINESENDER_API
 line_sender_protocol_version line_sender_get_protocol_version(
@@ -1006,7 +1012,7 @@ size_t line_sender_get_max_name_len(const line_sender* sender);
 
 /**
  * Construct a `line_sender_buffer` with the sender's
- * configured protocol version and other parameters.
+ * configured `protocol_version` and `max_name_len` settings.
  * This is equivalent to calling:
  *   line_sender_buffer_new(
  *       line_sender_get_protocol_version(sender),

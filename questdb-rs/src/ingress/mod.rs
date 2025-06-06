@@ -2158,7 +2158,7 @@ impl SenderBuilder {
     }
 
     /// Sets the ingestion protocol version.
-    /// - HTTP transport automatically negotiates the protocol version by default(unset, **Strong Recommended**). 
+    /// - HTTP transport automatically negotiates the protocol version by default(unset, **Strong Recommended**).
     ///   You can explicitly configure the protocol version to avoid the slight latency cost at connection time.
     /// - TCP transport does not negotiate the protocol version and uses [`ProtocolVersion::V1`] by
     ///   default. You must explicitly set [`ProtocolVersion::V2`] in order to ingest
