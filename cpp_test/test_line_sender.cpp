@@ -273,8 +273,8 @@ TEST_CASE("line_sender c++ api basics")
     questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
     // 3D array of doubles
     size_t rank = 3;
-    size_t shape[] = {2, 3, 2};
-    ssize_t strides[] = {48, 16, 8};
+    uintptr_t shape[] = {2, 3, 2};
+    intptr_t strides[] = {48, 16, 8};
     std::array<double, 12> arr_data = {
         48123.5,
         2.4,
@@ -288,7 +288,7 @@ TEST_CASE("line_sender c++ api basics")
         2.7,
         48121.5,
         4.3};
-    ssize_t elem_strides[] = {6, 2, 1};
+    intptr_t elem_strides[] = {6, 2, 1};
     buffer.table("test")
         .symbol("t1", "v1")
         .symbol("t2", "")

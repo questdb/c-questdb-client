@@ -670,8 +670,8 @@ public:
     line_sender_buffer& column(
         column_name_view name,
         const size_t rank,
-        const size_t* shape,
-        const ssize_t* strides,
+        const uintptr_t* shape,
+        const intptr_t* strides,
         const std::array<T, N>& data)
     {
         static_assert(
@@ -762,8 +762,8 @@ public:
     line_sender_buffer& column(
         column_name_view name,
         const size_t rank,
-        const size_t* shape,
-        const ssize_t* strides,
+        const uintptr_t* shape,
+        const intptr_t* strides,
         const T* data,
         size_t elem_count)
     {
