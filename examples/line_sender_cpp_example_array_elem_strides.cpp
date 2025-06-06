@@ -36,8 +36,8 @@ static bool array_example(std::string_view host, std::string_view port)
         questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
         buffer.table(table_name)
             .symbol(symbol_col, "BTC-USD"_utf8)
-            .column<questdb::ingress::array_strides_mode::elems>(
-                book_col, 3, shape, strides, arr_data)
+            .column<questdb::ingress::array_strides_size_mode::elems>(
+                book_col, 3, shape.data(), strides.data(), arr_data)
             .at(questdb::ingress::timestamp_nanos::now());
         sender.flush(buffer);
         return true;
