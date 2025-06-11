@@ -167,6 +167,7 @@ where
 {
     type Item = &'a T;
 
+    #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         if self.current_linear >= self.total_elements {
             return None;
