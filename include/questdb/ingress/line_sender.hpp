@@ -654,7 +654,7 @@ public:
     }
 
     /**
-     * Records a multidimensional array of double-precision values.
+     * Record a multidimensional array of `double` values.
      *
      * QuestDB server version 8.4.0 or later is required for array support.
      *
@@ -664,6 +664,7 @@ public:
      *
      * @param name    Column name.
      * @param shape   Array dimensions (e.g., [2,3] for a 2x3 matrix).
+     * @param strides Strides for each dimension, in the unit specified by `B`.
      * @param data    Array data.
      */
     template <array_strides_size_mode L, typename T, size_t N>

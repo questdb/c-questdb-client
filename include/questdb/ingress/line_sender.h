@@ -405,6 +405,7 @@ line_sender_buffer_view line_sender_buffer_peek(
 
 /**
  * Start recording a new row for the given table.
+ *
  * @param[in] buffer Line buffer object.
  * @param[in] name Table name.
  */
@@ -417,6 +418,7 @@ bool line_sender_buffer_table(
 /**
  * Record a symbol value for the given column.
  * Make sure you record all the symbol columns before any other column type.
+ *
  * @param[in] buffer Line buffer object.
  * @param[in] name Column name.
  * @param[in] value Column value.
@@ -432,6 +434,7 @@ bool line_sender_buffer_symbol(
 
 /**
  * Record a boolean value for the given column.
+ *
  * @param[in] buffer Line buffer object.
  * @param[in] name Column name.
  * @param[in] value Column value.
@@ -447,6 +450,7 @@ bool line_sender_buffer_column_bool(
 
 /**
  * Record an integer value for the given column.
+ *
  * @param[in] buffer Line buffer object.
  * @param[in] name Column name.
  * @param[in] value Column value.
@@ -462,6 +466,7 @@ bool line_sender_buffer_column_i64(
 
 /**
  * Record a floating-point value for the given column.
+ *
  * @param[in] buffer Line buffer object.
  * @param[in] name Column name.
  * @param[in] value Column value.
@@ -477,6 +482,7 @@ bool line_sender_buffer_column_f64(
 
 /**
  * Record a string value for the given column.
+ *
  * @param[in] buffer Line buffer object.
  * @param[in] name Column name.
  * @param[in] value Column value.
@@ -491,8 +497,7 @@ bool line_sender_buffer_column_str(
     line_sender_error** err_out);
 
 /**
- * Records a multidimensional array of 64-bit floating-point values in C-major
- * order.
+ * Record a multidimensional array of `double` values in C-major order.
  *
  * QuestDB server version 8.4.0 or later is required for array support.
  *
@@ -517,10 +522,10 @@ bool line_sender_buffer_column_f64_arr_c_major(
     line_sender_error** err_out);
 
 /**
- * Record a multidimensional array of double for the given column.
+ * Record a multidimensional array of `double` values for the given column.
  *
- * This API uses BYTE-LEVEL STRIDES where the stride values represent the
- * number of bytes between consecutive elements along each dimension.
+ * The values in the `strides` parameter represent the number of bytes
+ * between consecutive elements along each dimension.
  *
  * QuestDB server version 8.4.0 or later is required for array support.
  *
@@ -528,10 +533,10 @@ bool line_sender_buffer_column_f64_arr_c_major(
  * @param[in] name Column name.
  * @param[in] rank Number of dimensions of the array.
  * @param[in] shape Array of dimension sizes (length = `rank`).
- *                   Each element must be a positive integer.
- * @param[in] strides Array strides.
- * @param[in] data_buffer First array element data.
- * @param[in] data_buffer_len Bytes length of the array data.
+ *                  Each element must be a positive integer.
+ * @param[in] strides Array strides, in the unit of bytes. Strides can be negative.
+ * @param[in] data_buffer Array data, laid out according to the provided shape and strides.
+ * @param[in] data_buffer_len Length of the array data block in bytes.
  * @param[out] err_out Set to an error object on failure (if non-NULL).
  * @return true on success, false on error.
  */
@@ -547,10 +552,10 @@ bool line_sender_buffer_column_f64_arr_byte_strides(
     line_sender_error** err_out);
 
 /**
- * Record a multidimensional array of double for the given column.
+ * Record a multidimensional array of `double` values for the given column.
  *
- * This function uses ELEMENT-LEVEL STRIDES where the stride values represent
- * the number of elements between consecutive elements along each dimension.
+ * The values in the `strides` parameter represent the number of elements
+ * between consecutive elements along each dimension.
  *
  * QuestDB server version 8.4.0 or later is required for array support.
  *
@@ -559,9 +564,9 @@ bool line_sender_buffer_column_f64_arr_byte_strides(
  * @param[in] rank Number of dimensions of the array.
  * @param[in] shape Array of dimension sizes (length = `rank`).
  *                   Each element must be a positive integer.
- * @param[in] strides Array strides.
- * @param[in] data_buffer First array element data.
- * @param[in] data_buffer_len Bytes length of the array data.
+ * @param[in] strides Array strides, in the unit of elements. Strides can be negative.
+ * @param[in] data_buffer Array data, laid out according to the provided shape and strides.
+ * @param[in] data_buffer_len Length of the array data block in bytes.
  * @param[out] err_out Set to an error object on failure (if non-NULL).
  * @return true on success, false on error.
  */
@@ -578,6 +583,7 @@ bool line_sender_buffer_column_f64_arr_elem_strides(
 
 /**
  * Record a nanosecond timestamp value for the given column.
+ *
  * @param[in] buffer Line buffer object.
  * @param[in] name Column name.
  * @param[in] nanos The timestamp in nanoseconds since the Unix epoch.
@@ -593,6 +599,7 @@ bool line_sender_buffer_column_ts_nanos(
 
 /**
  * Record a microsecond timestamp value for the given column.
+ *
  * @param[in] buffer Line buffer object.
  * @param[in] name Column name.
  * @param[in] micros The timestamp in microseconds since the Unix epoch.
@@ -733,6 +740,7 @@ line_sender_opts* line_sender_opts_from_env(line_sender_error** err_out);
 /**
  * Create a new `line_sender_opts` instance with the given protocol,
  * hostname and port.
+ *
  * @param[in] protocol The protocol to use.
  * @param[in] host The QuestDB database host.
  * @param[in] port The QuestDB ILP TCP port.
@@ -1092,6 +1100,7 @@ bool line_sender_flush(
  *
  * To send and clear in one step, call `line_sender_flush` instead. Also,
  * see the docs on that function for more important details on flushing.
+ *
  * @param[in] sender Line sender object.
  * @param[in] buffer Line buffer object.
  * @return true on success, false on error.
