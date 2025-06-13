@@ -38,7 +38,7 @@ def main():
         build_dir.glob(f'**/test_line_sender{exe_suffix}')))
     build_cxx20_dir = pathlib.Path('build_CXX20')
     test_line_sender_path_CXX20 = next(iter(
-        build_cxx20_dir.glob(f'**/test_line_sender{exe_suffix}'))) 
+        build_cxx20_dir.glob(f'**/test_line_sender{exe_suffix}')))
 
     system_test_path = pathlib.Path('system_test') / 'test.py'
     #qdb_v = '8.2.3'  # The version of QuestDB we'll test against.
@@ -55,7 +55,7 @@ def main():
     run_cmd(str(test_line_sender_path))
     run_cmd(str(test_line_sender_path_CXX20))
     #run_cmd('python3', str(system_test_path), 'run', '--versions', qdb_v, '-v')
-    run_cmd('python3', str(system_test_path), 'run', '--repo', './questdb_nd_arr', '-v')
+    run_cmd('python3', str(system_test_path), 'run', '--repo', './questdb', '-v')
 
 
 if __name__ == '__main__':
