@@ -477,7 +477,9 @@ impl OpCase {
     }
 }
 
-#[derive(Debug, Clone)]
+// IMPORTANT: This struct MUST remain `Copy` to ensure that
+// there are no heap allocations when performing marker operations.
+#[derive(Debug, Clone, Copy)]
 struct BufferState {
     op_case: OpCase,
     row_count: usize,
@@ -493,13 +495,6 @@ impl BufferState {
             first_table_len: None,
             transactional: true,
         }
-    }
-
-    fn clear(&mut self) {
-        self.op_case = OpCase::Init;
-        self.row_count = 0;
-        self.first_table_len = None;
-        self.transactional = true;
     }
 }
 
@@ -689,7 +684,7 @@ impl Buffer {
                 )
             ));
         }
-        self.marker = Some((self.output.len(), self.state.clone()));
+        self.marker = Some((self.output.len(), self.state));
         Ok(())
     }
 
@@ -722,7 +717,7 @@ impl Buffer {
     /// [`capacity`](Buffer::capacity).
     pub fn clear(&mut self) {
         self.output.clear();
-        self.state.clear();
+        self.state = BufferState::new();
         self.marker = None;
     }
 
