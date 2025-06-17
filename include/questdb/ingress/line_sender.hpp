@@ -652,8 +652,8 @@ public:
      * @param name    Column name.
      * @param shape   Array dimensions (e.g., [2,3] for a 2x3 matrix).
      * @param strides Strides for each dimension, in the unit specified by `B`.
-     * @param data    Array elements laid out in row-major order. Their number must
-     *                match the product of dimension sizes.
+     * @param data    Array elements laid out in row-major order. Their number
+     * must match the product of dimension sizes.
      */
     template <bool B, typename T, size_t N>
     line_sender_buffer& column(

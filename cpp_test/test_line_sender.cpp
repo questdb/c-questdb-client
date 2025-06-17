@@ -178,29 +178,27 @@ TEST_CASE("line_sender c api basics")
         2.7,
         48121.5,
         4.3};
-    CHECK(
-        ::line_sender_buffer_column_f64_arr_byte_strides(
-            buffer,
-            arr_name,
-            rank,
-            shape,
-            strides,
-            reinterpret_cast<uint8_t*>(arr_data.data()),
-            sizeof(arr_data),
-            &err));
+    CHECK(::line_sender_buffer_column_f64_arr_byte_strides(
+        buffer,
+        arr_name,
+        rank,
+        shape,
+        strides,
+        reinterpret_cast<uint8_t*>(arr_data.data()),
+        sizeof(arr_data),
+        &err));
 
     line_sender_column_name arr_name2 = QDB_COLUMN_NAME_LITERAL("a2");
     intptr_t elem_strides[] = {6, 2, 1};
-    CHECK(
-        ::line_sender_buffer_column_f64_arr_elem_strides(
-            buffer,
-            arr_name2,
-            rank,
-            shape,
-            elem_strides,
-            reinterpret_cast<uint8_t*>(arr_data.data()),
-            sizeof(arr_data),
-            &err));
+    CHECK(::line_sender_buffer_column_f64_arr_elem_strides(
+        buffer,
+        arr_name2,
+        rank,
+        shape,
+        elem_strides,
+        reinterpret_cast<uint8_t*>(arr_data.data()),
+        sizeof(arr_data),
+        &err));
     CHECK(::line_sender_buffer_at_nanos(buffer, 10000000, &err));
     CHECK(server.recv() == 0);
     CHECK(::line_sender_buffer_size(buffer) == 266);

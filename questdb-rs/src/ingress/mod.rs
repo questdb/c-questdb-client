@@ -39,6 +39,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fmt::{Debug, Display, Formatter, Write};
 use std::io::{self, BufRead, BufReader, ErrorKind, Write as IoWrite};
+use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::slice::from_raw_parts_mut;
@@ -476,11 +477,13 @@ impl OpCase {
     }
 }
 
-#[derive(Debug, Clone)]
+// IMPORTANT: This struct MUST remain `Copy` to ensure that
+// there are no heap allocations when performing marker operations.
+#[derive(Debug, Clone, Copy)]
 struct BufferState {
     op_case: OpCase,
     row_count: usize,
-    first_table: Option<String>,
+    first_table_len: Option<NonZeroUsize>,
     transactional: bool,
 }
 
@@ -489,16 +492,9 @@ impl BufferState {
         Self {
             op_case: OpCase::Init,
             row_count: 0,
-            first_table: None,
+            first_table_len: None,
             transactional: true,
         }
-    }
-
-    fn clear(&mut self) {
-        self.op_case = OpCase::Init;
-        self.row_count = 0;
-        self.first_table = None;
-        self.transactional = true;
     }
 }
 
@@ -688,7 +684,7 @@ impl Buffer {
                 )
             ));
         }
-        self.marker = Some((self.output.len(), self.state.clone()));
+        self.marker = Some((self.output.len(), self.state));
         Ok(())
     }
 
@@ -721,7 +717,7 @@ impl Buffer {
     /// [`capacity`](Buffer::capacity).
     pub fn clear(&mut self) {
         self.output.clear();
-        self.state.clear();
+        self.state = BufferState::new();
         self.marker = None;
     }
 
@@ -798,16 +794,31 @@ impl Buffer {
         let name: TableName<'a> = name.try_into()?;
         self.validate_max_name_len(name.name)?;
         self.check_op(Op::Table)?;
+        let table_begin = self.output.len();
         write_escaped_unquoted(&mut self.output, name.name);
+        let table_end = self.output.len();
         self.state.op_case = OpCase::TableWritten;
 
         // A buffer stops being transactional if it targets multiple tables.
-        if let Some(first_table) = &self.state.first_table {
-            if first_table != name.name {
+        if let Some(first_table_len) = &self.state.first_table_len {
+            let first_table = &self.output[0..(first_table_len.get())];
+            let this_table = &self.output[table_begin..table_end];
+            if first_table != this_table {
                 self.state.transactional = false;
             }
         } else {
-            self.state.first_table = Some(name.name.to_owned());
+            debug_assert!(table_begin == 0);
+
+            // This is a bit confusing, so worth explaining:
+            // `NonZeroUsize::new(table_end)` will return `None` if `table_end` is 0,
+            // but we know that `table_end` is never 0 here, we just need an option type
+            // anyway, so we don't bother unwrapping it to then wrap it again.
+            let first_table_len = NonZeroUsize::new(table_end);
+
+            // Instead we just assert that it's `Some`.
+            debug_assert!(first_table_len.is_some());
+
+            self.state.first_table_len = first_table_len;
         }
         Ok(self)
     }
