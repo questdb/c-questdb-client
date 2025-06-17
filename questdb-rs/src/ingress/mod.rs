@@ -490,11 +490,11 @@ impl BufferState {
 ///   * A row always starts with [`table`](Buffer::table).
 ///   * A row must contain at least one [`symbol`](Buffer::symbol) or
 ///     column (
-///       [`column_bool`](Buffer::column_bool),
-///       [`column_i64`](Buffer::column_i64),
-///       [`column_f64`](Buffer::column_f64),
-///       [`column_str`](Buffer::column_str),
-///       [`column_ts`](Buffer::column_ts)).
+///     [`column_bool`](Buffer::column_bool),
+///     [`column_i64`](Buffer::column_i64),
+///     [`column_f64`](Buffer::column_f64),
+///     [`column_str`](Buffer::column_str),
+///     [`column_ts`](Buffer::column_ts)).
 ///   * Symbols must appear before columns.
 ///   * A row must be terminated with either [`at`](Buffer::at) or
 ///     [`at_now`](Buffer::at_now).
