@@ -218,15 +218,14 @@ TEST_CASE("line_sender c api basics")
         sizeof(arr_data),
         &err));
     line_sender_column_name arr_name3 = QDB_COLUMN_NAME_LITERAL("a3");
-    CHECK(
-        ::line_sender_buffer_column_f64_arr_c_major(
-            buffer,
-            arr_name3,
-            rank,
-            shape,
-            reinterpret_cast<uint8_t*>(arr_data.data()),
-            sizeof(arr_data),
-            &err));
+    CHECK(::line_sender_buffer_column_f64_arr_c_major(
+        buffer,
+        arr_name3,
+        rank,
+        shape,
+        reinterpret_cast<uint8_t*>(arr_data.data()),
+        sizeof(arr_data),
+        &err));
     CHECK(::line_sender_buffer_at_nanos(buffer, 10000000, &err));
     CHECK(server.recv() == 0);
     CHECK(::line_sender_buffer_size(buffer) == 382);
@@ -307,20 +306,30 @@ TEST_CASE("line_sender c++ api basics")
         48121.5,
         4.3};
     intptr_t elem_strides[] = {6, 2, 1};
+    questdb::ingress::nd_array_strided_view<
+        double,
+        questdb::ingress::array_strides_size_mode::bytes>
+        a1{rank, shape, strides, arr_data.data(), arr_data.size()};
+    questdb::ingress::nd_array_strided_view<
+        double,
+        questdb::ingress::array_strides_size_mode::elems>
+        a2{rank, shape, elem_strides, arr_data.data(), arr_data.size()};
+    questdb::ingress::nd_array_row_major_view<double> a3{
+        rank, shape, arr_data.data(), arr_data.size()};
+    questdb::ingress::nd_array_strided_view<
+        double,
+        questdb::ingress::array_strides_size_mode::bytes>
+        a4{rank, shape, strides, arr_data.data(), arr_data.size()};
     buffer.table("test")
         .symbol("t1", "v1")
         .symbol("t2", "")
         .column("f1", 0.5)
-        .column<questdb::ingress::array_strides_size_mode::bytes>(
-            "a1", rank, shape, strides, arr_data)
-        .column<questdb::ingress::array_strides_size_mode::elems>(
-            "a2", rank, shape, elem_strides, arr_data)
-        .column("a3", rank, shape, arr_data)
-        .column<questdb::ingress::array_strides_size_mode::bytes>(
-            "a4", rank, shape, strides, arr_data.data(), arr_data.size())
-        .column<questdb::ingress::array_strides_size_mode::elems>(
-            "a5", rank, shape, elem_strides, arr_data.data(), arr_data.size())
-        .column("a6", rank, shape, arr_data.data(), arr_data.size())
+        .column("a1", a1)
+        .column("a2", a2)
+        .column("a3", a3)
+        .column("a4", a4)
+        .column("a5", a2)
+        .column("a6", a3)
         .at(questdb::ingress::timestamp_nanos{10000000});
 
     CHECK(server.recv() == 0);

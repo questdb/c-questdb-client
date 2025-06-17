@@ -408,6 +408,100 @@ private:
 };
 #endif
 
+template <typename T, array_strides_size_mode M>
+class nd_array_strided_view
+{
+public:
+    using element_type = T;
+    static constexpr array_strides_size_mode stride_size_mode = M;
+
+    nd_array_strided_view(
+        size_t rank,
+        const uintptr_t* shape,
+        const intptr_t* strides,
+        const T* data,
+        size_t data_size)
+        : _rank{rank}
+        , _shape{shape}
+        , _strides{strides}
+        , _data{data}
+        , _data_size{data_size}
+    {
+    }
+
+    size_t rank() const
+    {
+        return _rank;
+    }
+
+    const uintptr_t* shape() const
+    {
+        return _shape;
+    }
+
+    const intptr_t* strides() const
+    {
+        return _strides;
+    }
+
+    const T* data() const
+    {
+        return _data;
+    }
+
+    size_t data_size() const
+    {
+        return _data_size;
+    }
+
+private:
+    size_t _rank;
+    const uintptr_t* _shape;
+    const intptr_t* _strides;
+    const T* _data;
+    size_t _data_size;
+};
+
+template <typename T>
+class nd_array_row_major_view
+{
+public:
+    using element_type = T;
+
+    nd_array_row_major_view(
+        size_t rank, const uintptr_t* shape, const T* data, size_t data_size)
+        : _rank{rank}
+        , _shape{shape}
+        , _data{data}
+        , _data_size{data_size}
+    {
+    }
+
+    size_t rank() const
+    {
+        return _rank;
+    }
+    const uintptr_t* shape() const
+    {
+        return _shape;
+    }
+    const T* data() const
+    {
+        return _data;
+    }
+
+    size_t data_size() const
+    {
+        return _data_size;
+    }
+
+private:
+    size_t _rank;
+    const uintptr_t* _shape;
+    const T* _data;
+    size_t _data_size;
+};
+
 class line_sender_buffer
 {
 public:
@@ -658,50 +752,44 @@ public:
      *
      * QuestDB server version 8.4.0 or later is required for array support.
      *
-     * @tparam L    Array stride size mode (bytes or elements).
      * @tparam T    Element type (current only `double` is supported).
-     * @tparam N    Number of elements in the flat data array
+     * @tparam M    Array stride size mode (bytes or elements).
      *
      * @param name    Column name.
-     * @param shape   Array dimensions (e.g., [2,3] for a 2x3 matrix).
-     * @param strides Strides for each dimension, in the unit specified by `B`.
-     * @param data    Array data.
+     * @param data    Multi-dimensional array.
      */
-    template <array_strides_size_mode L, typename T, size_t N>
+    template <typename T, array_strides_size_mode M>
     line_sender_buffer& column(
-        column_name_view name,
-        const size_t rank,
-        const uintptr_t* shape,
-        const intptr_t* strides,
-        const std::array<T, N>& data)
+        column_name_view name, const nd_array_strided_view<T, M>& array)
     {
         static_assert(
             std::is_same_v<T, double>,
             "Only double types are supported for arrays");
         may_init();
-        switch (L)
+        switch (M)
         {
         case array_strides_size_mode::bytes:
             line_sender_error::wrapped_call(
                 ::line_sender_buffer_column_f64_arr_byte_strides,
                 _impl,
                 name._impl,
-                rank,
-                shape,
-                strides,
-                reinterpret_cast<const uint8_t*>(data.data()),
-                sizeof(double) * N);
+                array.rank(),
+                array.shape(),
+                array.strides(),
+                reinterpret_cast<const uint8_t*>(array.data()),
+                sizeof(T) * array.data_size());
             break;
         case array_strides_size_mode::elems:
             line_sender_error::wrapped_call(
                 ::line_sender_buffer_column_f64_arr_elem_strides,
                 _impl,
                 name._impl,
-                rank,
-                shape,
-                strides,
-                reinterpret_cast<const uint8_t*>(data.data()),
-                sizeof(double) * N);
+                array.rank(),
+                array.shape(),
+                array.strides(),
+                reinterpret_cast<const uint8_t*>(array.data()),
+                sizeof(T) * array.data_size());
+            break;
         }
         return *this;
     }
@@ -720,107 +808,9 @@ public:
      * @param shape   Array dimensions (e.g., [2,3] for a 2x3 matrix).
      * @param data    Array data.
      */
-    template <typename T, size_t N>
-    line_sender_buffer& column(
-        column_name_view name,
-        const size_t rank,
-        const size_t* shape,
-        const std::array<T, N>& data)
-    {
-        static_assert(
-            std::is_same_v<T, double>,
-            "Only double types are supported for arrays");
-        may_init();
-        line_sender_error::wrapped_call(
-            ::line_sender_buffer_column_f64_arr_c_major,
-            _impl,
-            name._impl,
-            rank,
-            shape,
-            reinterpret_cast<const uint8_t*>(data.data()),
-            sizeof(double) * N);
-        return *this;
-    }
-
-    /**
-     * Records a multidimensional array of double-precision values with
-     * configurable stride mode.
-     *
-     * QuestDB server version 8.4.0 or later is required for array support.
-     *
-     * @tparam L    Array stride size mode (bytes or elements).
-     * @tparam T    Element type (current only `double` is supported).
-     *
-     * @param name    Column name.
-     * @param rank     Number of dimensions of the array.
-     * @param shape    Array dimensions. Example: [2,3] for 2x3 matrix.
-     * @param strides  Array strides. Step between consecutive elements in each
-     * dimension.
-     * @param data     Raw pointer to the start of the array data.
-     * @param elem_count Total element of the array.
-     */
-    template <array_strides_size_mode L, typename T>
-    line_sender_buffer& column(
-        column_name_view name,
-        const size_t rank,
-        const uintptr_t* shape,
-        const intptr_t* strides,
-        const T* data,
-        size_t elem_count)
-    {
-        static_assert(
-            std::is_same_v<T, double>,
-            "Only double types are supported for arrays");
-        may_init();
-        switch (L)
-        {
-        case array_strides_size_mode::bytes:
-            line_sender_error::wrapped_call(
-                ::line_sender_buffer_column_f64_arr_byte_strides,
-                _impl,
-                name._impl,
-                rank,
-                shape,
-                strides,
-                reinterpret_cast<const uint8_t*>(data),
-                elem_count * sizeof(T));
-            break;
-        case array_strides_size_mode::elems:
-            line_sender_error::wrapped_call(
-                ::line_sender_buffer_column_f64_arr_elem_strides,
-                _impl,
-                name._impl,
-                rank,
-                shape,
-                strides,
-                reinterpret_cast<const uint8_t*>(data),
-                elem_count * sizeof(T));
-        }
-        return *this;
-    }
-
-    /**
-     * Records a multidimensional array of double-precision values in C-major
-     * (row-major) layout layout.
-     *
-     * QuestDB server version 8.4.0 or later is required for array support.
-     *
-     * @tparam T    Element type (current only `double` is supported).
-     *
-     * @param name     Column name.
-     * @param rank     Number of dimensions in the array.
-     * @param shape    Array dimensions. Example: [2,3] for 2x3 matrix.
-     * @param data     Raw pointer to the first element of the flat data
-     * array.
-     * @param elem_count Total element of the array.
-     */
     template <typename T>
     line_sender_buffer& column(
-        column_name_view name,
-        const size_t rank,
-        const size_t* shape,
-        const T* data,
-        size_t elem_count)
+        column_name_view name, const nd_array_row_major_view<T>& array)
     {
         static_assert(
             std::is_same_v<T, double>,
@@ -830,10 +820,10 @@ public:
             ::line_sender_buffer_column_f64_arr_c_major,
             _impl,
             name._impl,
-            rank,
-            shape,
-            reinterpret_cast<const uint8_t*>(data),
-            elem_count * sizeof(T));
+            array.rank(),
+            array.shape(),
+            reinterpret_cast<const uint8_t*>(array.data()),
+            sizeof(double) * array.data_size());
         return *this;
     }
 
@@ -1668,5 +1658,24 @@ private:
 
     ::line_sender* _impl;
 };
+
+// template <typename ArrayT>
+// line_sender_buffer& column(column_name_view name, const ArrayT& array)
+// {
+//     const auto array_view = questdb::ingress::array::to_view(array);
+//     return column(name, array_view);
+// }
+
+// namespace array
+// {
+// template <typename T, size_t N>
+// questdb::ingress::nd_array_row_major_view<T> to_view(
+//     const std::array<T, N>& array) noexcept
+// {
+//     return questdb::ingress::nd_array_row_major_view<T>{array.data(), 1,
+//     {N}};
+// }
+
+// }
 
 } // namespace questdb::ingress
