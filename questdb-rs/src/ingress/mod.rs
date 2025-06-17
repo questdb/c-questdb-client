@@ -810,7 +810,7 @@ impl Buffer {
             debug_assert!(table_begin == 0);
 
             // This is a bit confusing, so worth explaining:
-            // `NonZeroU16::new(table_end as u16)` will return `None` if `table_end` is 0,
+            // `NonZeroUsize::new(table_end)` will return `None` if `table_end` is 0,
             // but we know that `table_end` is never 0 here, we just need an option type
             // anyway, so we don't bother unwrapping it to then wrap it again.
             let first_table_len = NonZeroUsize::new(table_end);
