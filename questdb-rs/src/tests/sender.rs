@@ -153,7 +153,7 @@ fn test_row_count() -> TestResult {
 
 #[test]
 fn test_transactional() -> TestResult {
-    let mut buffer = Buffer::new(ProtocolVersion::V2);
+    let mut buffer = Buffer::new();
 
     // transactional since there are no recorded tables yet
     assert_eq!(buffer.row_count(), 0);
