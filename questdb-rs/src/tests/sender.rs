@@ -152,6 +152,78 @@ fn test_row_count() -> TestResult {
 }
 
 #[test]
+fn test_transactional() -> TestResult {
+    let mut buffer = Buffer::new(ProtocolVersion::V2);
+
+    // transactional since there are no recorded tables yet
+    assert_eq!(buffer.row_count(), 0);
+    assert!(buffer.transactional());
+
+    buffer.set_marker()?;
+    buffer.table("table 1.test")?.symbol("a", "b")?.at_now()?;
+    assert_eq!(buffer.row_count(), 1); // tables={'table 1.test'}
+
+    // still transactional since there is only one single table.
+    assert!(buffer.transactional());
+
+    buffer.table("table 2.test")?.symbol("c", "d")?.at_now()?;
+
+    // not transactional since we have both tables "x" and "y".
+    assert_eq!(buffer.row_count(), 2); // tables={'table 1.test', 'table 2.test'}
+    assert!(!buffer.transactional());
+
+    buffer.rewind_to_marker()?;
+    // no tables, so we're transactional again
+    assert_eq!(buffer.row_count(), 0); // tables=[]
+    assert!(buffer.transactional());
+    assert!(buffer.is_empty());
+
+    // We add another new and different table, so we are still transactional.
+    buffer.table("test=table=3")?.symbol("e", "f")?.at_now()?;
+    assert_eq!(buffer.row_count(), 1); // tables={'test=table=3'}
+    assert!(buffer.transactional());
+
+    // Same table again, so we are still transactional.
+    buffer.table("test=table=3")?.symbol("g", "h")?.at_now()?;
+    assert_eq!(buffer.row_count(), 2); // tables={'test=table=3'}
+    assert!(buffer.transactional());
+
+    buffer.set_marker()?;
+    // We add a new different table: Name differs in length.
+    buffer.table("test=table=3 ")?.symbol("i", "j")?.at_now()?;
+    assert_eq!(buffer.row_count(), 3); // tables={'test=table=3', 'test=table=3 '}
+    assert!(!buffer.transactional());
+
+    buffer.rewind_to_marker()?;
+    assert_eq!(buffer.row_count(), 2); // tables={'test=table=3'}
+    assert!(buffer.transactional());
+
+    buffer.set_marker()?;
+    // We add a new different table: Name differs in content, but not in length.
+    buffer.table("test=table=4")?.symbol("k", "l")?.at_now()?;
+    assert_eq!(buffer.row_count(), 3); // tables={'test=table=3', 'test=table=4'}
+    assert!(!buffer.transactional());
+
+    buffer.rewind_to_marker()?;
+    assert_eq!(buffer.row_count(), 2); // tables={'test=table=3'}
+    assert!(buffer.transactional());
+
+    buffer.clear();
+    assert_eq!(buffer.row_count(), 0); // tables=[]
+    assert!(buffer.transactional());
+    assert!(buffer.is_empty());
+
+    // We add three rows of the same new table, so we are still transactional.
+    buffer.table("test=table=5")?.symbol("m", "n")?.at_now()?;
+    buffer.table("test=table=5")?.symbol("o", "p")?.at_now()?;
+    buffer.table("test=table=5")?.symbol("q", "r")?.at_now()?;
+    assert_eq!(buffer.row_count(), 3); // tables={'test=table=5'}
+    assert!(buffer.transactional());
+
+    Ok(())
+}
+
+#[test]
 fn test_auth_inconsistent_keys() -> TestResult {
     test_bad_key("fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU", // d
                  "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU", // x
