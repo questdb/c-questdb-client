@@ -506,8 +506,8 @@ bool line_sender_buffer_column_str(
  * @param[in] rank Number of dimensions of the array.
  * @param[in] shape Array of dimension sizes (length = `rank`).
  *                   Each element must be a positive integer.
- * @param[in] data_buffer First array element data.
- * @param[in] data_buffer_len Bytes length of the array data.
+ * @param[in] data First array element data.
+ * @param[in] data_len Element length of the array.
  * @param[out] err_out Set to an error object on failure (if non-NULL).
  * @return true on success, false on error.
  */
@@ -517,8 +517,8 @@ bool line_sender_buffer_column_f64_arr_c_major(
     line_sender_column_name name,
     size_t rank,
     const uintptr_t* shape,
-    const uint8_t* data_buffer,
-    size_t data_buffer_len,
+    const double* data,
+    size_t data_len,
     line_sender_error** err_out);
 
 /**
@@ -536,9 +536,9 @@ bool line_sender_buffer_column_f64_arr_c_major(
  *                  Each element must be a positive integer.
  * @param[in] strides Array strides, in the unit of bytes. Strides can be
  * negative.
- * @param[in] data_buffer Array data, laid out according to the provided shape
+ * @param[in] data Array data, laid out according to the provided shape
  * and strides.
- * @param[in] data_buffer_len Length of the array data block in bytes.
+ * @param[in] data_len Element length of the array.
  * @param[out] err_out Set to an error object on failure (if non-NULL).
  * @return true on success, false on error.
  */
@@ -549,8 +549,8 @@ bool line_sender_buffer_column_f64_arr_byte_strides(
     size_t rank,
     const uintptr_t* shape,
     const intptr_t* strides,
-    const uint8_t* data_buffer,
-    size_t data_buffer_len,
+    const double* data,
+    size_t data_len,
     line_sender_error** err_out);
 
 /**
@@ -568,9 +568,9 @@ bool line_sender_buffer_column_f64_arr_byte_strides(
  *                   Each element must be a positive integer.
  * @param[in] strides Array strides, in the unit of elements. Strides can be
  * negative.
- * @param[in] data_buffer Array data, laid out according to the provided shape
+ * @param[in] data Array data, laid out according to the provided shape
  * and strides.
- * @param[in] data_buffer_len Length of the array data block in bytes.
+ * @param[in] data_len Element length of the array.
  * @param[out] err_out Set to an error object on failure (if non-NULL).
  * @return true on success, false on error.
  */
@@ -581,8 +581,8 @@ bool line_sender_buffer_column_f64_arr_elem_strides(
     size_t rank,
     const uintptr_t* shape,
     const intptr_t* strides,
-    const uint8_t* data_buffer,
-    size_t data_buffer_len,
+    const double* data,
+    size_t data_len,
     line_sender_error** err_out);
 
 /**

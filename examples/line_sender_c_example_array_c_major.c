@@ -66,8 +66,8 @@ static bool example(const char* host, const char* port)
             book_col,
             array_rank,
             array_shape,
-            (const uint8_t*)array_data,
-            sizeof(array_data),
+            array_data,
+            sizeof(array_data) / sizeof(array_data[0]),
             &err))
         goto on_error;
 

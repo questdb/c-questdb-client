@@ -776,8 +776,8 @@ public:
                 array.rank(),
                 array.shape(),
                 array.strides(),
-                reinterpret_cast<const uint8_t*>(array.data()),
-                sizeof(T) * array.data_size());
+                array.data(),
+                array.data_size());
             break;
         case array_strides_size_mode::elems:
             line_sender_error::wrapped_call(
@@ -787,8 +787,8 @@ public:
                 array.rank(),
                 array.shape(),
                 array.strides(),
-                reinterpret_cast<const uint8_t*>(array.data()),
-                sizeof(T) * array.data_size());
+                array.data(),
+                array.data_size());
             break;
         }
         return *this;
@@ -822,8 +822,8 @@ public:
             name._impl,
             array.rank(),
             array.shape(),
-            reinterpret_cast<const uint8_t*>(array.data()),
-            sizeof(double) * array.data_size());
+            array.data(),
+            array.data_size());
         return *this;
     }
 
@@ -852,8 +852,38 @@ public:
             name._impl,
             1,
             array_shape,
-            reinterpret_cast<const uint8_t*>(data.data()),
-            data.size() * sizeof(T));
+            data.data(),
+            data.size());
+        return *this;
+    }
+
+    /**
+     * Records a 1-dimensional std::array of double-precision values as array.
+     *
+     * QuestDB server version 8.4.0 or later is required for array support.
+     *
+     * @tparam T    Element type (current only `double` is supported).
+     *
+     * @param name     Column name.
+     * @param data     array.
+     */
+    template <typename T, size_t N>
+    line_sender_buffer& column(
+        column_name_view name, const std::array<T, N>& data)
+    {
+        static_assert(
+            std::is_same_v<T, double>,
+            "Only double types are supported for arrays");
+        may_init();
+        uintptr_t shape[] = {N};
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_f64_arr_c_major,
+            _impl,
+            name._impl,
+            1,
+            shape,
+            data.data(),
+            N);
         return *this;
     }
 
@@ -883,8 +913,8 @@ public:
             name._impl,
             1,
             array_shape,
-            reinterpret_cast<const uint8_t*>(data.data()),
-            data.size() * sizeof(T));
+            data.data(),
+            data.size());
         return *this;
     }
 #endif

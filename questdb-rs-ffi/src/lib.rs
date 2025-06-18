@@ -77,18 +77,13 @@ macro_rules! new_stride_array {
         $n:literal,
         $shape:expr,
         $strides:expr,
-        $data_buffer:expr,
-        $data_buffer_len:expr,
+        $data:expr,
+        $data_len:expr,
         $err_out:expr,
         $buffer:expr,
         $name:expr
     ) => {{
-        let view = match StrideArrayView::<f64, $m, $n>::new(
-            $shape,
-            $strides,
-            $data_buffer,
-            $data_buffer_len,
-        ) {
+        let view = match StrideArrayView::<f64, $m, $n>::new($shape, $strides, $data, $data_len) {
             Ok(value) => value,
             Err(err) => {
                 let err_ptr = Box::into_raw(Box::new(line_sender_error(err)));
@@ -105,7 +100,7 @@ macro_rules! new_stride_array {
 }
 
 macro_rules! generate_array_dims_branches {
-    ($rank:expr, $m:literal, $shape:expr, $strides:expr, $data_buffer:expr, $data_buffer_len:expr, $err_out:expr, $buffer:expr, $name:expr => $($n:literal),*) => {
+    ($rank:expr, $m:literal, $shape:expr, $strides:expr, $data:expr, $data_len:expr, $err_out:expr, $buffer:expr, $name:expr => $($n:literal),*) => {
         match $rank {
             0 => {
                 let err = fmt_error!(
@@ -123,8 +118,8 @@ macro_rules! generate_array_dims_branches {
                     $n,
                     $shape,
                     $strides,
-                    $data_buffer,
-                    $data_buffer_len,
+                    $data,
+                    $data_len,
                     $err_out,
                     $buffer,
                     $name
@@ -945,13 +940,13 @@ pub unsafe extern "C" fn line_sender_buffer_column_str(
 /// @param[in] name Column name.
 /// @param[in] rank Array dims.
 /// @param[in] shape Array shape.
-/// @param[in] data_buffer Array **first element** data memory ptr.
-/// @param[in] data_buffer_len Array data memory length.
+/// @param[in] data Array **first element** data memory ptr.
+/// @param[in] data_len Array data length.
 /// @param[out] err_out Set on error.
 /// # Safety
 /// - All pointer parameters must be valid and non-null
 /// - shape must point to an array of `rank` integers
-/// - data_buffer must point to a buffer of size `data_buffer_len` bytes
+/// - data must point to a buffer of size `data_len` f64 elements.
 /// - QuestDB server version 8.4.0 or later is required for array support.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_c_major(
@@ -959,13 +954,13 @@ pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_c_major(
     name: line_sender_column_name,
     rank: size_t,
     shape: *const usize,
-    data_buffer: *const u8,
-    data_buffer_len: size_t,
+    data: *const f64,
+    data_len: size_t,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     let buffer = unwrap_buffer_mut(buffer);
     let name = name.as_name();
-    let view = match CMajorArrayView::<f64>::new(rank, shape, data_buffer, data_buffer_len) {
+    let view = match CMajorArrayView::<f64>::new(rank, shape, data, data_len) {
         Ok(value) => value,
         Err(err) => {
             let err_ptr = Box::into_raw(Box::new(line_sender_error(err)));
@@ -989,13 +984,13 @@ pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_c_major(
 /// @param[in] rank Array dims.
 /// @param[in] shape Array shape.
 /// @param[in] strides Array strides, represent byte offsets between elements along each dimension.
-/// @param[in] data_buffer Array **first element** data memory ptr.
-/// @param[in] data_buffer_len Array data memory length.
+/// @param[in] data Array **first element** data memory ptr.
+/// @param[in] data_len Array data element length.
 /// @param[out] err_out Set on error.
 /// # Safety
 /// - All pointer parameters must be valid and non-null
 /// - shape must point to an array of `rank` integers
-/// - data_buffer must point to a buffer of size `data_buffer_len` bytes
+/// - data must point to a buffer of size `data_len` f64 elements.
 /// - QuestDB server version 8.4.0 or later is required for array support.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_byte_strides(
@@ -1004,8 +999,8 @@ pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_byte_strides(
     rank: size_t,
     shape: *const usize,
     strides: *const isize,
-    data_buffer: *const u8,
-    data_buffer_len: size_t,
+    data: *const f64,
+    data_len: size_t,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     let buffer = unwrap_buffer_mut(buffer);
@@ -1015,8 +1010,8 @@ pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_byte_strides(
         1,
         shape,
         strides,
-        data_buffer,
-        data_buffer_len,
+        data,
+        data_len,
         err_out,
         buffer,
         name
@@ -1035,13 +1030,13 @@ pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_byte_strides(
 /// @param[in] rank Array dims.
 /// @param[in] shape Array shape.
 /// @param[in] strides Array strides, represent element counts between elements along each dimension.
-/// @param[in] data_buffer Array **first element** data memory ptr.
-/// @param[in] data_buffer_len Array data memory length.
+/// @param[in] data Array **first element** data memory ptr.
+/// @param[in] data_len Array data element length.
 /// @param[out] err_out Set on error.
 /// # Safety
 /// - All pointer parameters must be valid and non-null
 /// - shape must point to an array of `rank` integers
-/// - data_buffer must point to a buffer of size `data_buffer_len` bytes
+/// - data must point to a buffer of size `data_len` f64 elements.
 /// - QuestDB server version 8.4.0 or later is required for array support.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_elem_strides(
@@ -1050,8 +1045,8 @@ pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_elem_strides(
     rank: size_t,
     shape: *const usize,
     strides: *const isize,
-    data_buffer: *const u8,
-    data_buffer_len: size_t,
+    data: *const f64,
+    data_len: size_t,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     let buffer = unwrap_buffer_mut(buffer);
@@ -1061,8 +1056,8 @@ pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_elem_strides(
         8,
         shape,
         strides,
-        data_buffer,
-        data_buffer_len,
+        data,
+        data_len,
         err_out,
         buffer,
         name

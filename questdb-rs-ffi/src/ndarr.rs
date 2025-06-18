@@ -35,7 +35,7 @@ use std::slice;
 pub struct StrideArrayView<'a, T, const N: isize, const D: usize> {
     shape: &'a [usize],
     strides: &'a [isize],
-    data: Option<&'a [u8]>,
+    data: Option<&'a [T]>,
     _marker: std::marker::PhantomData<T>,
 }
 
@@ -67,9 +67,10 @@ where
 
     fn as_slice(&self) -> Option<&[T]> {
         unsafe {
-            self.is_c_major().then_some(self.data.map(|data| {
-                slice::from_raw_parts(data.as_ptr() as *const T, data.len() / size_of::<T>())
-            })?)
+            self.is_c_major().then_some(
+                self.data
+                    .map(|data| slice::from_raw_parts(data.as_ptr(), data.len()))?,
+            )
         }
     }
 
@@ -77,7 +78,7 @@ where
         // consider minus strides
         let base_ptr = match self.data {
             None => std::ptr::null(),
-            Some(data) => data.as_ptr(),
+            Some(data) => data.as_ptr() as *const u8,
         };
         RowMajorIter {
             base_ptr,
@@ -101,21 +102,21 @@ where
     /// - `strides` points to a valid array of at least `dims` elements
     /// - `data` points to a valid memory block of at least `data_len` bytes
     /// - Memory layout must satisfy:
-    ///   1. `data_len ≥ (shape[0]-1)*abs(strides[0]) + ... + (shape[n-1]-1)*abs(strides[n-1]) + size_of::<T>()`
-    ///   2. All calculated offsets stay within `[0, data_len - size_of::<T>()]`
+    ///   1. `len == (shape[0]-1)*abs(strides[0]) + ... + (shape[n-1]-1)*abs(strides[n-1])`
+    ///   2. All calculated offsets stay within `[0, data_len * size_of::<T>()  - size_of::<T>()]`
     /// - Lifetime `'a` must outlive the view's usage
     /// - Strides are measured in bytes (not elements)
     pub unsafe fn new(
         shape: *const usize,
         strides: *const isize,
-        data: *const u8,
-        data_len: usize,
+        data: *const T,
+        len: usize,
     ) -> Result<Self, Error> {
-        let shape = check_array_shape::<T>(D, shape, data_len)?;
+        let shape = check_array_shape::<T>(D, shape, len)?;
         let strides = slice::from_raw_parts(strides, D);
         let mut slice = None;
-        if data_len != 0 {
-            slice = Some(slice::from_raw_parts(data, data_len));
+        if len != 0 {
+            slice = Some(slice::from_raw_parts(data, len));
         }
         Ok(Self {
             shape,
@@ -235,7 +236,7 @@ where
 pub struct CMajorArrayView<'a, T> {
     dims: usize,
     shape: &'a [usize],
-    data: Option<&'a [u8]>,
+    data: Option<&'a [T]>,
     _marker: std::marker::PhantomData<T>,
 }
 
@@ -266,16 +267,15 @@ where
     }
 
     fn as_slice(&self) -> Option<&[T]> {
-        self.data.map(|d| unsafe {
-            slice::from_raw_parts(d.as_ptr() as *const T, d.len() / size_of::<T>())
-        })
+        self.data
+            .map(|d| unsafe { slice::from_raw_parts(d.as_ptr(), d.len()) })
     }
 
     fn iter(&self) -> Self::Iter<'_> {
         let elem_size = self.shape.iter().product();
         let count = 0;
         let data_ptr = match self.data {
-            Some(data) => data.as_ptr() as *const T,
+            Some(data) => data.as_ptr(),
             None => std::ptr::null_mut(),
         };
         CMajorArrayViewIterator {
@@ -322,11 +322,11 @@ where
     /// # Safety
     /// Caller must ensure all the following conditions:
     /// - `shape` points to a valid array of at least `dims` elements
-    /// - `data` points to a valid memory block of at least `data_len` bytes
+    /// - `data` points to a valid memory block of at least `data_len` elements
     pub unsafe fn new(
         dims: usize,
         shape: *const usize,
-        data: *const u8,
+        data: *const T,
         data_len: usize,
     ) -> Result<Self, Error> {
         let shape = check_array_shape::<T>(dims, shape, data_len)?;
@@ -369,12 +369,13 @@ fn check_array_shape<T>(
         .try_fold(std::mem::size_of::<T>(), |acc, &dim| {
             acc.checked_mul(dim)
                 .ok_or_else(|| fmt_error!(ArrayError, "Array buffer size too big"))
-        })?;
+        })?
+        / std::mem::size_of::<T>();
 
     if size != data_len {
         return Err(fmt_error!(
             ArrayError,
-            "Array buffer length mismatch (actual: {}, expected: {})",
+            "Array element length mismatch (actual: {}, expected: {})",
             data_len,
             size
         ));
@@ -473,8 +474,8 @@ mod tests {
             StrideArrayView::new(
                 [2, 2].as_ptr(),
                 [2 * elem_size, elem_size].as_ptr(),
-                test_data.as_ptr() as *const u8,
-                test_data.len() * elem_size as usize,
+                test_data.as_ptr(),
+                test_data.len(),
             )
         }?;
         let mut buffer = Buffer::new(ProtocolVersion::V2);
@@ -510,15 +511,13 @@ mod tests {
 
     #[test]
     fn test_buffer_basic_write_with_elem_strides() -> TestResult {
-        let elem_size = std::mem::size_of::<f64>() as isize;
-
         let test_data = [1.1, 2.2, 3.3, 4.4];
         let array_view: StrideArrayView<'_, f64, 8, 2> = unsafe {
             StrideArrayView::new(
                 [2, 2].as_ptr(),
                 [2, 1].as_ptr(),
-                test_data.as_ptr() as *const u8,
-                test_data.len() * elem_size as usize,
+                test_data.as_ptr(),
+                test_data.len(),
             )
         }?;
         let mut buffer = Buffer::new(ProtocolVersion::V2);
@@ -576,23 +575,23 @@ mod tests {
             StrideArrayView::new(
                 [1, 2].as_ptr(),
                 [elem_size, elem_size].as_ptr(),
-                under_data.as_ptr() as *const u8,
-                under_data.len() * elem_size as usize,
+                under_data.as_ptr(),
+                under_data.len(),
             )
         };
         let err = result.unwrap_err();
         assert_eq!(err.code(), ErrorCode::ArrayError);
         assert!(err
             .msg()
-            .contains("Array buffer length mismatch (actual: 8, expected: 16)"));
+            .contains("Array element length mismatch (actual: 1, expected: 2)"));
 
         let over_data = [1.1, 2.2, 3.3];
         let result: Result<StrideArrayView<'_, f64, 1, 2>, Error> = unsafe {
             StrideArrayView::new(
                 [1, 2].as_ptr(),
                 [elem_size, elem_size].as_ptr(),
-                over_data.as_ptr() as *const u8,
-                over_data.len() * elem_size as usize,
+                over_data.as_ptr(),
+                over_data.len(),
             )
         };
 
@@ -600,7 +599,7 @@ mod tests {
         assert_eq!(err.code(), ErrorCode::ArrayError);
         assert!(err
             .msg()
-            .contains("Array buffer length mismatch (actual: 24, expected: 16)"));
+            .contains("Array element length mismatch (actual: 3, expected: 2)"));
         Ok(())
     }
 
@@ -612,23 +611,23 @@ mod tests {
             StrideArrayView::new(
                 [1, 2].as_ptr(),
                 [1, 1].as_ptr(),
-                under_data.as_ptr() as *const u8,
-                under_data.len() * elem_size as usize,
+                under_data.as_ptr(),
+                under_data.len(),
             )
         };
         let err = result.unwrap_err();
         assert_eq!(err.code(), ErrorCode::ArrayError);
         assert!(err
             .msg()
-            .contains("Array buffer length mismatch (actual: 8, expected: 16)"));
+            .contains("Array element length mismatch (actual: 1, expected: 2)"));
 
         let over_data = [1.1, 2.2, 3.3];
         let result: Result<StrideArrayView<'_, f64, 1, 2>, Error> = unsafe {
             StrideArrayView::new(
                 [1, 2].as_ptr(),
                 [elem_size, elem_size].as_ptr(),
-                over_data.as_ptr() as *const u8,
-                over_data.len() * elem_size as usize,
+                over_data.as_ptr(),
+                over_data.len(),
             )
         };
 
@@ -636,7 +635,7 @@ mod tests {
         assert_eq!(err.code(), ErrorCode::ArrayError);
         assert!(err
             .msg()
-            .contains("Array buffer length mismatch (actual: 24, expected: 16)"));
+            .contains("Array element length mismatch (actual: 3, expected: 2)"));
         Ok(())
     }
 
@@ -651,8 +650,8 @@ mod tests {
             StrideArrayView::new(
                 shape.as_ptr(),
                 strides.as_ptr(),
-                col_major_data.as_ptr() as *const u8,
-                col_major_data.len() * elem_size as usize,
+                col_major_data.as_ptr(),
+                col_major_data.len(),
             )
         }?;
 
@@ -687,8 +686,8 @@ mod tests {
             StrideArrayView::new(
                 shape.as_ptr(),
                 strides.as_ptr(),
-                col_major_data.as_ptr() as *const u8,
-                col_major_data.len() * elem_size as usize,
+                col_major_data.as_ptr(),
+                col_major_data.len(),
             )
         }?;
 
@@ -720,8 +719,8 @@ mod tests {
             StrideArrayView::<f64, 1, 2>::new(
                 &[3usize, 3] as *const usize,
                 &[-24isize, 8] as *const isize,
-                (data.as_ptr() as *const u8).add(48),
-                data.len() * elem_size,
+                data.as_ptr().add(6),
+                data.len(),
             )
         }?;
         let collected: Vec<_> = view.iter().copied().collect();
@@ -748,8 +747,8 @@ mod tests {
             StrideArrayView::<f64, 8, 2>::new(
                 &[3usize, 3] as *const usize,
                 &[-3isize, 1] as *const isize,
-                (data.as_ptr() as *const u8).add(48),
-                data.len() * elem_size,
+                data.as_ptr().add(6),
+                data.len(),
             )
         }?;
         let collected: Vec<_> = view.iter().copied().collect();
@@ -781,12 +780,7 @@ mod tests {
         // single element array
         let single_data = [42.0];
         let single_view: StrideArrayView<'_, f64, 1, 1> = unsafe {
-            StrideArrayView::new(
-                [1].as_ptr(),
-                [elem_size].as_ptr(),
-                single_data.as_ptr() as *const u8,
-                elem_size as usize,
-            )
+            StrideArrayView::new([1].as_ptr(), [elem_size].as_ptr(), single_data.as_ptr(), 1)
         }?;
         let mut buf = vec![0u8; 8];
         write_array_data(&single_view, &mut buf, 8).unwrap();
@@ -807,8 +801,8 @@ mod tests {
             StrideArrayView::<f64, 1, 2>::new(
                 shape.as_ptr(),
                 strides.as_ptr(),
-                test_data.as_ptr() as *const u8,
-                test_data.len() * size_of::<f64>(),
+                test_data.as_ptr(),
+                test_data.len(),
             )
         }?;
 
@@ -834,8 +828,8 @@ mod tests {
             StrideArrayView::<f64, { std::mem::size_of::<f64>() as isize }, 2>::new(
                 shape.as_ptr(),
                 strides.as_ptr(),
-                test_data.as_ptr() as *const u8,
-                test_data.len() * size_of::<f64>(),
+                test_data.as_ptr(),
+                test_data.len(),
             )
         }?;
 
@@ -862,8 +856,8 @@ mod tests {
             StrideArrayView::<f64, { std::mem::size_of::<f64>() as isize }, 2>::new(
                 shape.as_ptr(),
                 strides.as_ptr(),
-                test_data.as_ptr().add(11) as *const u8,
-                4 * size_of::<f64>(),
+                test_data.as_ptr().add(11),
+                4,
             )
         }?;
 
@@ -879,12 +873,7 @@ mod tests {
     fn test_c_major_array_basic() -> TestResult {
         let test_data = [1.1, 2.2, 3.3, 4.4];
         let array_view: CMajorArrayView<'_, f64> = unsafe {
-            CMajorArrayView::new(
-                2,
-                [2, 2].as_ptr(),
-                test_data.as_ptr() as *const u8,
-                test_data.len() * 8usize,
-            )
+            CMajorArrayView::new(2, [2, 2].as_ptr(), test_data.as_ptr(), test_data.len())
         }?;
         let mut buffer = Buffer::new(ProtocolVersion::V2);
         buffer.table("my_test")?;
@@ -965,8 +954,8 @@ mod tests {
             StrideArrayView::new(
                 shape.as_ptr(),
                 strides.as_ptr(),
-                col_major_data.as_ptr() as *const u8,
-                col_major_data.len() * elem_size as usize,
+                col_major_data.as_ptr(),
+                col_major_data.len(),
             )
         }?;
         assert_eq!(array_view.ndim(), 3);
@@ -1017,7 +1006,6 @@ mod tests {
 
     #[test]
     fn test_stride_non_contiguous_elem_stride_3d() -> TestResult {
-        let elem_size = size_of::<f64>() as isize;
         let col_major_data = [
             1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
         ];
@@ -1027,8 +1015,8 @@ mod tests {
             StrideArrayView::new(
                 shape.as_ptr(),
                 strides.as_ptr(),
-                col_major_data.as_ptr() as *const u8,
-                col_major_data.len() * elem_size as usize,
+                col_major_data.as_ptr(),
+                col_major_data.len(),
             )
         }?;
         assert_eq!(array_view.ndim(), 3);
@@ -1095,8 +1083,8 @@ mod tests {
             StrideArrayView::new(
                 shape.as_ptr(),
                 strides.as_ptr(),
-                col_major_data.as_ptr() as *const u8,
-                col_major_data.len() * elem_size as usize,
+                col_major_data.as_ptr(),
+                col_major_data.len(),
             )
         }?;
 
@@ -1155,7 +1143,6 @@ mod tests {
 
     #[test]
     fn test_stride_non_contiguous_elem_stride_4d() -> TestResult {
-        let elem_size = size_of::<f64>() as isize;
         let col_major_data = [
             1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
         ];
@@ -1171,8 +1158,8 @@ mod tests {
             StrideArrayView::new(
                 shape.as_ptr(),
                 strides.as_ptr(),
-                col_major_data.as_ptr() as *const u8,
-                col_major_data.len() * elem_size as usize,
+                col_major_data.as_ptr(),
+                col_major_data.len(),
             )
         }?;
 

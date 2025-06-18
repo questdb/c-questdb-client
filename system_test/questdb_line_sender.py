@@ -136,6 +136,7 @@ c_line_sender_opts_p = ctypes.POINTER(c_line_sender_opts)
 c_line_sender_error_p = ctypes.POINTER(c_line_sender_error)
 c_line_sender_error_p_p = ctypes.POINTER(c_line_sender_error_p)
 c_uint8_p = ctypes.POINTER(c_uint8)
+c_double_p = ctypes.POINTER(c_double)
 
 
 class c_line_sender_utf8(ctypes.Structure):
@@ -297,7 +298,7 @@ def _setup_cdll():
         c_size_t,
         c_size_t_p,
         c_ssize_t_p,
-        c_uint8_p,
+        c_double_p,
         c_size_t,
         c_line_sender_error_p_p)
     set_sig(
@@ -307,7 +308,7 @@ def _setup_cdll():
         c_line_sender_column_name,
         c_size_t,
         c_size_t_p,
-        c_uint8_p,
+        c_double_p,
         c_size_t,
         c_line_sender_error_p_p)
     set_sig(
@@ -746,7 +747,7 @@ class Buffer:
             c_size_t(rank),
             c_shape,
             c_strides,
-            ctypes.cast(data, c_uint8_p),
+            ctypes.cast(data, c_double_p),
             c_size_t(length)
         )
 
@@ -771,7 +772,7 @@ class Buffer:
             _column_name(name),
             c_size_t(rank),
             c_shape,
-            ctypes.cast(data, c_uint8_p),
+            ctypes.cast(data, c_double_p),
             c_size_t(length)
         )
 
@@ -911,9 +912,9 @@ class Sender:
         if array.dtype != numpy.float64:
             raise ValueError('expect float64 array')
         if array.flags.c_contiguous:
-            self._buffer.column_f64_arr_c_major(name, array.ndim, array.shape, array.ctypes.data, array.nbytes)
+            self._buffer.column_f64_arr_c_major(name, array.ndim, array.shape, array.ctypes.data, array.size)
         else:
-            self._buffer.column_f64_arr(name, array.ndim, array.shape, array.strides, array.ctypes.data, array.nbytes)
+            self._buffer.column_f64_arr(name, array.ndim, array.shape, array.strides, array.ctypes.data, array.size)
         return self
 
     def at_now(self):
