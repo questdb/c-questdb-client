@@ -521,7 +521,9 @@ struct row_major_1d_holder
     const T* data;
     size_t size;
 
-    row_major_1d_holder(const T* d, size_t s) : data(d), size(s)
+    row_major_1d_holder(const T* d, size_t s)
+        : data(d)
+        , size(s)
     {
         shape[0] = static_cast<uintptr_t>(s);
     }
@@ -532,46 +534,25 @@ struct row_major_1d_holder
     }
 };
 
-// template <typename T>
-// inline row_major_view<typename std::remove_cv<T>::type>
-// to_array_view_state_impl(const std::vector<T>& vec)
-// {
-//     uintptr_t shape[1] = {static_cast<uintptr_t>(vec.size())};
-//     return {1, shape, vec.data(), vec.size()};
-// }
-
-// #if __cplusplus >= 202002L
-// template <typename T>
-// inline row_major_view<typename std::remove_cv<T>::type>
-// to_array_view_state_impl(const std::span<T>& span)
-// {
-//     uintptr_t shape[1] = {static_cast<uintptr_t>(span.size())};
-//     return {1, shape, span.data(), span.size()};
-// }
-// #endif
-
-// template <typename T, size_t N>
-// inline row_major_view<typename std::remove_cv<T>::type>
-// to_array_view_state_impl(const std::array<T, N>& arr)
-// {
-//     uintptr_t shape[1] = {static_cast<uintptr_t>(N)};
-//     return {1, shape, arr.data(), N};
-// }
-
 template <typename T>
-inline auto to_array_view_state_impl(const std::vector<T>& vec) {
-    return row_major_1d_holder<typename std::remove_cv<T>::type>(vec.data(), vec.size());
+inline auto to_array_view_state_impl(const std::vector<T>& vec)
+{
+    return row_major_1d_holder<typename std::remove_cv<T>::type>(
+        vec.data(), vec.size());
 }
 
 #if __cplusplus >= 202002L
 template <typename T>
-inline auto to_array_view_state_impl(const std::span<T>& span) {
-    return row_major_1d_holder<typename std::remove_cv<T>::type>(span.data(), span.size());
+inline auto to_array_view_state_impl(const std::span<T>& span)
+{
+    return row_major_1d_holder<typename std::remove_cv<T>::type>(
+        span.data(), span.size());
 }
 #endif
 
 template <typename T, size_t N>
-inline auto to_array_view_state_impl(const std::array<T, N>& arr) {
+inline auto to_array_view_state_impl(const std::array<T, N>& arr)
+{
     return row_major_1d_holder<typename std::remove_cv<T>::type>(arr.data(), N);
 }
 
@@ -588,9 +569,11 @@ inline auto to_array_view_state_impl(const std::array<T, N>& arr) {
 /// the stack, an object with a `.view()` method which returns a `const&` to one
 /// of the two view types. Returning an object may be useful if you need to
 /// "materialize" shape or strides information into contiguous memory.
-struct to_array_view_state_fn {
+struct to_array_view_state_fn
+{
     template <typename T>
-    auto operator()(const T& array) const {
+    auto operator()(const T& array) const
+    {
         // Implement your own `to_array_view_state_impl` as needed.
         return to_array_view_state_impl(array);
     }
@@ -821,9 +804,6 @@ public:
             ,
             int> = 0>
     line_sender_buffer& column(column_name_view name, T value) = delete;
-
-    // template <typename T>
-    // line_sender_buffer& column(column_name_view name, T value) = delete;
 
     /**
      * Record a boolean value for the given column.
