@@ -113,15 +113,6 @@ enum class protocol_version
     v2 = 2,
 };
 
-enum class array_strides_size_mode
-{
-    /** Strides are provided in bytes */
-    bytes,
-
-    /** Strides are provided in elements */
-    elems,
-};
-
 /* Possible sources of the root certificates used to validate the server's TLS
  * certificate. */
 enum class ca
@@ -408,14 +399,25 @@ private:
 };
 #endif
 
-template <typename T, array_strides_size_mode M>
-class nd_array_strided_view
+namespace array
+{
+enum class strides_mode
+{
+    /** Strides are provided in bytes */
+    bytes,
+
+    /** Strides are provided in elements */
+    elements,
+};
+
+template <typename T, strides_mode M>
+class strided_view
 {
 public:
     using element_type = T;
-    static constexpr array_strides_size_mode stride_size_mode = M;
+    static constexpr strides_mode stride_size_mode = M;
 
-    nd_array_strided_view(
+    strided_view(
         size_t rank,
         const uintptr_t* shape,
         const intptr_t* strides,
@@ -454,6 +456,11 @@ public:
         return _data_size;
     }
 
+    const strided_view<T, M>& view() const
+    {
+        return *this;
+    }
+
 private:
     size_t _rank;
     const uintptr_t* _shape;
@@ -463,12 +470,12 @@ private:
 };
 
 template <typename T>
-class nd_array_row_major_view
+class row_major_view
 {
 public:
     using element_type = T;
 
-    nd_array_row_major_view(
+    row_major_view(
         size_t rank, const uintptr_t* shape, const T* data, size_t data_size)
         : _rank{rank}
         , _shape{shape}
@@ -495,12 +502,103 @@ public:
         return _data_size;
     }
 
+    const row_major_view<T>& view() const
+    {
+        return *this;
+    }
+
 private:
     size_t _rank;
     const uintptr_t* _shape;
     const T* _data;
     size_t _data_size;
 };
+
+template <typename T>
+struct row_major_1d_holder
+{
+    uintptr_t shape[1];
+    const T* data;
+    size_t size;
+
+    row_major_1d_holder(const T* d, size_t s) : data(d), size(s)
+    {
+        shape[0] = static_cast<uintptr_t>(s);
+    }
+
+    array::row_major_view<T> view() const
+    {
+        return {1, shape, data, size};
+    }
+};
+
+// template <typename T>
+// inline row_major_view<typename std::remove_cv<T>::type>
+// to_array_view_state_impl(const std::vector<T>& vec)
+// {
+//     uintptr_t shape[1] = {static_cast<uintptr_t>(vec.size())};
+//     return {1, shape, vec.data(), vec.size()};
+// }
+
+// #if __cplusplus >= 202002L
+// template <typename T>
+// inline row_major_view<typename std::remove_cv<T>::type>
+// to_array_view_state_impl(const std::span<T>& span)
+// {
+//     uintptr_t shape[1] = {static_cast<uintptr_t>(span.size())};
+//     return {1, shape, span.data(), span.size()};
+// }
+// #endif
+
+// template <typename T, size_t N>
+// inline row_major_view<typename std::remove_cv<T>::type>
+// to_array_view_state_impl(const std::array<T, N>& arr)
+// {
+//     uintptr_t shape[1] = {static_cast<uintptr_t>(N)};
+//     return {1, shape, arr.data(), N};
+// }
+
+template <typename T>
+inline auto to_array_view_state_impl(const std::vector<T>& vec) {
+    return row_major_1d_holder<typename std::remove_cv<T>::type>(vec.data(), vec.size());
+}
+
+#if __cplusplus >= 202002L
+template <typename T>
+inline auto to_array_view_state_impl(const std::span<T>& span) {
+    return row_major_1d_holder<typename std::remove_cv<T>::type>(span.data(), span.size());
+}
+#endif
+
+template <typename T, size_t N>
+inline auto to_array_view_state_impl(const std::array<T, N>& arr) {
+    return row_major_1d_holder<typename std::remove_cv<T>::type>(arr.data(), N);
+}
+
+/// Customization point to enable serialization of additonal types as arrays.
+///
+/// Forwards to a namespace or ADL (König) lookup function.
+/// The customized `to_array_view_state_impl` for your custom type can be placed
+/// in either:
+///  * The namespace of the type in question.
+///  * In the `questdb::ingress::array` namespace.
+///
+/// The function can either return a view object directly (either
+/// `row_major_view` or `strided_view`), or, if you need to place some fields on
+/// the stack, an object with a `.view()` method which returns a `const&` to one
+/// of the two view types. Returning an object may be useful if you need to
+/// "materialize" shape or strides information into contiguous memory.
+struct to_array_view_state_fn {
+    template <typename T>
+    auto operator()(const T& array) const {
+        // Implement your own `to_array_view_state_impl` as needed.
+        return to_array_view_state_impl(array);
+    }
+};
+
+inline constexpr to_array_view_state_fn to_array_view_state{};
+
+} // namespace array
 
 class line_sender_buffer
 {
@@ -704,9 +802,28 @@ public:
     }
 
     // Require specific overloads of `column` to avoid
-    // involuntary usage of the `bool` overload.
-    template <typename T>
+    // involuntary usage of the `bool` overload or similar.
+    template <
+        typename T,
+        typename std::enable_if_t<
+            // Integral types that are NOT bool or int64_t
+            (std::is_integral_v<std::decay_t<T>> &&
+             !std::is_same_v<std::decay_t<T>, bool> &&
+             !std::is_same_v<std::decay_t<T>, int64_t>) ||
+
+                // Floating-point types that are NOT double
+                (std::is_floating_point_v<std::decay_t<T>> &&
+                 !std::is_same_v<std::decay_t<T>, double>) ||
+
+                // Pointer types (which can implicitly convert to bool)
+                std::is_pointer_v<std::decay_t<T>>
+
+            ,
+            int> = 0>
     line_sender_buffer& column(column_name_view name, T value) = delete;
+
+    // template <typename T>
+    // line_sender_buffer& column(column_name_view name, T value) = delete;
 
     /**
      * Record a boolean value for the given column.
@@ -758,9 +875,9 @@ public:
      * @param name    Column name.
      * @param data    Multi-dimensional array.
      */
-    template <typename T, array_strides_size_mode M>
+    template <typename T, array::strides_mode M>
     line_sender_buffer& column(
-        column_name_view name, const nd_array_strided_view<T, M>& array)
+        column_name_view name, const array::strided_view<T, M>& array)
     {
         static_assert(
             std::is_same_v<T, double>,
@@ -768,7 +885,7 @@ public:
         may_init();
         switch (M)
         {
-        case array_strides_size_mode::bytes:
+        case array::strides_mode::bytes:
             line_sender_error::wrapped_call(
                 ::line_sender_buffer_column_f64_arr_byte_strides,
                 _impl,
@@ -779,7 +896,7 @@ public:
                 array.data(),
                 array.data_size());
             break;
-        case array_strides_size_mode::elems:
+        case array::strides_mode::elements:
             line_sender_error::wrapped_call(
                 ::line_sender_buffer_column_f64_arr_elem_strides,
                 _impl,
@@ -810,7 +927,7 @@ public:
      */
     template <typename T>
     line_sender_buffer& column(
-        column_name_view name, const nd_array_row_major_view<T>& array)
+        column_name_view name, const array::row_major_view<T>& array)
     {
         static_assert(
             std::is_same_v<T, double>,
@@ -827,97 +944,14 @@ public:
         return *this;
     }
 
-    /**
-     * Records a 1-dimensional vector of double-precision values as array.
-     *
-     * QuestDB server version 8.4.0 or later is required for array support.
-     *
-     * @tparam T    Element type (current only `double` is supported).
-     *
-     * @param name     Column name.
-     * @param data     Vector.
-     */
-    template <typename T>
-    line_sender_buffer& column(
-        column_name_view name, const std::vector<T>& data)
+    template <typename ToArrayViewT>
+    line_sender_buffer& column(column_name_view name, ToArrayViewT array)
     {
-        static_assert(
-            std::is_same_v<T, double>,
-            "Only double types are supported for arrays");
         may_init();
-        uintptr_t array_shape[] = {data.size()};
-        line_sender_error::wrapped_call(
-            ::line_sender_buffer_column_f64_arr_c_major,
-            _impl,
-            name._impl,
-            1,
-            array_shape,
-            data.data(),
-            data.size());
-        return *this;
+        const auto array_view_state =
+            questdb::ingress::array::to_array_view_state(array);
+        return column(name, array_view_state.view());
     }
-
-    /**
-     * Records a 1-dimensional std::array of double-precision values as array.
-     *
-     * QuestDB server version 8.4.0 or later is required for array support.
-     *
-     * @tparam T    Element type (current only `double` is supported).
-     *
-     * @param name     Column name.
-     * @param data     array.
-     */
-    template <typename T, size_t N>
-    line_sender_buffer& column(
-        column_name_view name, const std::array<T, N>& data)
-    {
-        static_assert(
-            std::is_same_v<T, double>,
-            "Only double types are supported for arrays");
-        may_init();
-        uintptr_t shape[] = {N};
-        line_sender_error::wrapped_call(
-            ::line_sender_buffer_column_f64_arr_c_major,
-            _impl,
-            name._impl,
-            1,
-            shape,
-            data.data(),
-            N);
-        return *this;
-    }
-
-#if __cplusplus >= 202002L
-    /**
-     * Records a 1-dimensional span of double-precision values as array.
-     *
-     * QuestDB server version 8.4.0 or later is required for array support.
-     *
-     * @tparam T    Element type (current only `double` is supported).
-     *
-     * @param name     Column name.
-     * @param data     Vector.
-     */
-    template <typename T>
-    line_sender_buffer& column(
-        column_name_view name, const std::span<const T> data)
-    {
-        static_assert(
-            std::is_same_v<T, double>,
-            "Only double types are supported for arrays");
-        may_init();
-        uintptr_t array_shape[] = {data.size()};
-        line_sender_error::wrapped_call(
-            ::line_sender_buffer_column_f64_arr_c_major,
-            _impl,
-            name._impl,
-            1,
-            array_shape,
-            data.data(),
-            data.size());
-        return *this;
-    }
-#endif
 
     /**
      * Record a string value for the given column.
@@ -1688,24 +1722,5 @@ private:
 
     ::line_sender* _impl;
 };
-
-// template <typename ArrayT>
-// line_sender_buffer& column(column_name_view name, const ArrayT& array)
-// {
-//     const auto array_view = questdb::ingress::array::to_view(array);
-//     return column(name, array_view);
-// }
-
-// namespace array
-// {
-// template <typename T, size_t N>
-// questdb::ingress::nd_array_row_major_view<T> to_view(
-//     const std::array<T, N>& array) noexcept
-// {
-//     return questdb::ingress::nd_array_row_major_view<T>{array.data(), 1,
-//     {N}};
-// }
-
-// }
 
 } // namespace questdb::ingress

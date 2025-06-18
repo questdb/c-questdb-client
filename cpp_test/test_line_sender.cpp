@@ -309,20 +309,17 @@ TEST_CASE("line_sender c++ api basics")
         48121.5,
         4.3};
     intptr_t elem_strides[] = {6, 2, 1};
-    questdb::ingress::nd_array_strided_view<
-        double,
-        questdb::ingress::array_strides_size_mode::bytes>
-        a1{rank, shape, strides, arr_data.data(), arr_data.size()};
-    questdb::ingress::nd_array_strided_view<
-        double,
-        questdb::ingress::array_strides_size_mode::elems>
-        a2{rank, shape, elem_strides, arr_data.data(), arr_data.size()};
-    questdb::ingress::nd_array_row_major_view<double> a3{
+    questdb::ingress::array::
+        strided_view<double, questdb::ingress::array::strides_mode::bytes>
+            a1{rank, shape, strides, arr_data.data(), arr_data.size()};
+    questdb::ingress::array::
+        strided_view<double, questdb::ingress::array::strides_mode::elements>
+            a2{rank, shape, elem_strides, arr_data.data(), arr_data.size()};
+    questdb::ingress::array::row_major_view<double> a3{
         rank, shape, arr_data.data(), arr_data.size()};
-    questdb::ingress::nd_array_strided_view<
-        double,
-        questdb::ingress::array_strides_size_mode::bytes>
-        a4{rank, shape, strides, arr_data.data(), arr_data.size()};
+    questdb::ingress::array::
+        strided_view<double, questdb::ingress::array::strides_mode::bytes>
+            a4{rank, shape, strides, arr_data.data(), arr_data.size()};
     buffer.table("test")
         .symbol("t1", "v1")
         .symbol("t2", "")

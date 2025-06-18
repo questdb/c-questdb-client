@@ -36,9 +36,9 @@ static bool array_example(std::string_view host, std::string_view port)
             48121.5,
             4.3};
 
-        questdb::ingress::nd_array_strided_view<
+        questdb::ingress::array::strided_view<
             double,
-            questdb::ingress::array_strides_size_mode::bytes>
+            questdb::ingress::array::strides_mode::bytes>
         book_data{rank, shape.data(), strides.data(), arr_data.data(), arr_data.size()};
 
         questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
