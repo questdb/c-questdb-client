@@ -9,10 +9,26 @@
 
 ## Complete Examples
 
-* [Basic example in C++](../examples/line_sender_cpp_example.cpp).
-* [With authentication](../examples/line_sender_cpp_example_auth.cpp).
-* [With authentication and TLS](../examples/line_sender_cpp_example_auth_tls.cpp).
-* [Custom certificate authority file](../examples/line_sender_c_example_tls_ca.c).
+**Basic Usage**
+- [Basic example in C++](../examples/line_sender_cpp_example.cpp)
+
+**Authentication & Security**
+- [With authentication](../examples/line_sender_cpp_example_auth.cpp)
+- [With authentication and TLS](../examples/line_sender_cpp_example_auth_tls.cpp)
+- [Custom certificate authority file](../examples/line_sender_cpp_example_tls_ca.cpp)
+
+**Configuration**
+- [Load configuration from file](../examples/line_sender_cpp_example_from_conf.cpp)
+- [Load configuration from environment](../examples/line_sender_cpp_example_from_env.cpp)
+
+**HTTP**
+- [Example using HTTP](../examples/line_sender_cpp_example_http.cpp)
+
+**Array Handling**
+- [Array with byte strides](../examples/line_sender_cpp_example_array_byte_strides.cpp)
+- [Array with element strides](../examples/line_sender_cpp_example_array_elem_strides.cpp)
+- [Array in C-major order](../examples/line_sender_cpp_example_array_c_major.cpp)
+- [Custom array type integration](../examples/line_sender_cpp_example_array_custom.cpp)
 
 ## API Overview
 
