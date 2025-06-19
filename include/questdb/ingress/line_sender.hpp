@@ -350,42 +350,57 @@ private:
 class buffer_view final
 {
 public:
-    /// @brief Default constructor. Creates an empty buffer view.
+    /**
+     * Default constructor. Creates an empty buffer view.
+     */
     buffer_view() noexcept = default;
 
-    /// @brief Constructs a buffer view from raw byte data.
-    /// @param data Pointer to the underlying byte array (may be nullptr if
-    /// length=0).
-    /// @param length Number of bytes in the array.
+    /**
+     * Construct a buffer view from raw byte data.
+     * @param data Pointer to the underlying byte array (may be nullptr if
+     * length=0).
+     * @param length Number of bytes in the array.
+     */
     constexpr buffer_view(const std::byte* data, size_t length) noexcept
         : buf(data)
         , len(length)
     {
     }
 
-    /// @brief Gets a pointer to the underlying byte array.
-    /// @return Const pointer to the data (may be nullptr if empty()).
+    /**
+     * Obtain a pointer to the underlying byte array.
+     *
+     * @return Const pointer to the data (may be nullptr if empty()).
+     */
     constexpr const std::byte* data() const noexcept
     {
         return buf;
     }
 
-    /// @brief Gets the number of bytes in the view.
-    /// @return Size in bytes.
+    /**
+     * Obtain the number of bytes in the view.
+     *
+     * @return Size of the view in bytes.
+     */
     constexpr size_t size() const noexcept
     {
         return len;
     }
 
-    /// @brief Checks if the view contains no bytes.
-    /// @return true if size() == 0.
+    /**
+     * Check if the buffer view is empty.
+     * @return true if the view has no bytes (size() == 0).
+     */
     constexpr bool empty() const noexcept
     {
         return len == 0;
     }
 
-    /// @brief Checks byte-wise equality between two buffer views.
-    /// @return true if both views have identical size and byte content.
+    /**
+     * Check byte-wise if two buffer views are equal.
+     * @return true if both views have the same size and
+     *         the same byte content.
+     */
     friend bool operator==(
         const buffer_view& lhs, const buffer_view& rhs) noexcept
     {
@@ -410,6 +425,19 @@ enum class strides_mode
     elements,
 };
 
+/**
+ * A view over a multi-dimensional array with custom strides.
+ *
+ * The strides can be expressed as bytes offsets or as element counts.
+ * The `rank` is the number of dimensions in the array, and the `shape`
+ * describes the size of each dimension.
+ *
+ * If the data is stored in a row-major order, it may be more convenient and
+ * efficient to use the `row_major_view` instead of `strided_view`.
+ *
+ * The `data` pointer must point to a contiguous block of memory that contains
+ * the array data.
+ */
 template <typename T, strides_mode M>
 class strided_view
 {
@@ -469,6 +497,21 @@ private:
     size_t _data_size;
 };
 
+/**
+ * A view over a multi-dimensional array in row-major order.
+ *
+ * The `rank` is the number of dimensions in the array, and the `shape`
+ * describes the size of each dimension.
+ *
+ * The `data` pointer must point to a contiguous block of memory that contains
+ * the array data.
+ *
+ * If the source array is not stored in a row-major order, you may express
+ * the strides explicitly using the `strided_view` class.
+ *
+ * This class provides a simpler and more efficient interface for row-major
+ * arrays.
+ */
 template <typename T>
 class row_major_view
 {
@@ -556,19 +599,21 @@ inline auto to_array_view_state_impl(const std::array<T, N>& arr)
     return row_major_1d_holder<typename std::remove_cv<T>::type>(arr.data(), N);
 }
 
-/// Customization point to enable serialization of additonal types as arrays.
+/**
+ * Customization point to enable serialization of additonal types as arrays.
+ *
+ * Forwards to a namespace or ADL (König) lookup function.
+ * The customized `to_array_view_state_impl` for your custom type can be placed
+ * in either:
+ *  * The namespace of the type in question.
+ *  * In the `questdb::ingress::array` namespace.
 ///
-/// Forwards to a namespace or ADL (König) lookup function.
-/// The customized `to_array_view_state_impl` for your custom type can be placed
-/// in either:
-///  * The namespace of the type in question.
-///  * In the `questdb::ingress::array` namespace.
-///
-/// The function can either return a view object directly (either
-/// `row_major_view` or `strided_view`), or, if you need to place some fields on
-/// the stack, an object with a `.view()` method which returns a `const&` to one
-/// of the two view types. Returning an object may be useful if you need to
-/// "materialize" shape or strides information into contiguous memory.
+ * The function can either return a view object directly (either
+ * `row_major_view` or `strided_view`), or, if you need to place some fields on
+ * the stack, an object with a `.view()` method which returns a `const&` to one
+ * "materialize" shape or strides information into contiguous memory.
+ * of the two view types. Returning an object may be useful if you need to
+ */
 struct to_array_view_state_fn
 {
     template <typename T>
@@ -901,9 +946,7 @@ public:
      * @tparam N    Number of elements in the flat data array
      *
      * @param name    Column name.
-     * @param rank    Number of dimensions of the array.
-     * @param shape   Array dimensions (e.g., [2,3] for a 2x3 matrix).
-     * @param data    Array data.
+     * @param array   Multi-dimensional array.
      */
     template <typename T>
     line_sender_buffer& column(
@@ -924,6 +967,27 @@ public:
         return *this;
     }
 
+    /**
+     * Record a multidimensional array of double-precision values.
+     *
+     * QuestDB server version 8.4.0 or later is required for array support.
+     *
+     * Use this method to record arrays of common or custom types such as
+     * `std::vector`, `std::span`, `std::array`, or custom types that can be
+     * converted to an array view.
+     *
+     * This overload uses a customization point to support additional types:
+     * If you need to support your additional types you may implement a
+     * `to_array_view_state_impl` function in the object's namespace (via ADL)
+     * or in the `questdb::ingress::array` namespace.
+     * Ensure that any additional customization points are included before
+     * `line_sender.hpp`.
+     *
+     * @tparam ToArrayViewT  Type convertible to a custom object instance which
+     *                       can be converted to an array view.
+     * @param name           Column name.
+     * @param array          Multi-dimensional array.
+     */
     template <typename ToArrayViewT>
     line_sender_buffer& column(column_name_view name, ToArrayViewT array)
     {
