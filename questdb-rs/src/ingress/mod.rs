@@ -621,7 +621,7 @@ impl Buffer {
     /// This is equivalent to [`Sender::new_buffer`] when using the [`Sender::protocol_version`]
     /// and [`Sender::max_name_len`].
     ///
-    /// For the default max name length limit (32), use [`Self::new`].
+    /// For the default max name length limit (127), use [`Self::new`].
     pub fn with_max_name_len(protocol_version: ProtocolVersion, max_name_len: usize) -> Self {
         Self {
             output: Vec::new(),
