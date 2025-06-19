@@ -143,6 +143,9 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
         line_sender_cpp_example_array_elem_strides
         examples/line_sender_cpp_example_array_elem_strides.cpp)
     compile_example(
+        line_sender_cpp_example_array_custom
+        examples/line_sender_cpp_example_array_custom.cpp)
+    compile_example(
         line_sender_cpp_example_auth
         examples/line_sender_cpp_example_auth.cpp)
     compile_example(
