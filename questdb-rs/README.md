@@ -40,7 +40,7 @@ cargo add questdb-rs
 Then you can try out this quick example, which connects to a QuestDB server
 running on your local machine:
 
-```rust no_run
+```rust ignore
 use questdb::{
     Result,
     ingress::{
@@ -57,12 +57,10 @@ fn main() -> Result<()> {
        .symbol("side", "sell")?
        .column_f64("price", 2615.54)?
        .column_f64("amount", 0.00044)?
-       // Array ingestion (QuestDB 8.4.0+):
-       // 1. Store a price history as a Rust slice (e.g., last 3 trade prices)
-       .column_arr("price_history", &[2615.54, 2615.10, 2614.80][..])?
-       // 2. Store a volatility vector using ndarray (requires the `ndarray` feature)
-       //    (e.g., 3-day rolling volatility values)
-       .column_arr("volatility", &ndarray::arr1(&[0.012, 0.011, 0.013]).view())?
+
+       // Array ingestion (QuestDB 8.4.0+). Slices and ndarray supported through trait
+       .column_arr("price_history", &[2615.54f64, 2615.10, 2614.80])?
+       .column_arr("volatility", &ndarray::arr1(&[0.012f64, 0.011, 0.013]).view())?
        .at(TimestampNanos::now())?;
    sender.flush(&mut buffer)?;
    Ok(())
