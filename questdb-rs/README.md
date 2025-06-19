@@ -72,21 +72,21 @@ fn main() -> Result<()> {
 ## Docs
 
 Most of the client documentation is on the
-[`ingress`](https://docs.rs/questdb-rs/4.9.0/questdb/ingress/) module page.
+[`ingress`](https://docs.rs/questdb-rs/5.0.0/questdb/ingress/) module page.
 
 ## Examples
 
-A selection of usage examples is available in the [examples directory](https://github.com/questdb/c-questdb-client/tree/4.9.0/questdb-rs/examples):
+A selection of usage examples is available in the [examples directory](https://github.com/questdb/c-questdb-client/tree/5.0.0/questdb-rs/examples):
 
 | Example | Description |
 |---------|-------------|
-| [`basic.rs`](https://github.com/questdb/c-questdb-client/blob/4.9.0/questdb-rs/examples/basic.rs) | Minimal TCP ingestion example; shows basic row and array ingestion. |
-| [`auth.rs`](https://github.com/questdb/c-questdb-client/blob/4.9.0/questdb-rs/examples/auth.rs) | Adds authentication (user/password, token) to basic ingestion. |
-| [`auth_tls.rs`](https://github.com/questdb/c-questdb-client/blob/4.9.0/questdb-rs/examples/auth_tls.rs) | Like `auth.rs`, but uses TLS for encrypted TCP connections. |
-| [`from_conf.rs`](https://github.com/questdb/c-questdb-client/blob/4.9.0/questdb-rs/examples/from_conf.rs) | Configures client via connection string instead of builder pattern. |
-| [`from_env.rs`](https://github.com/questdb/c-questdb-client/blob/4.9.0/questdb-rs/examples/from_env.rs) | Reads config from `QDB_CLIENT_CONF` environment variable. |
-| [`http.rs`](https://github.com/questdb/c-questdb-client/blob/4.9.0/questdb-rs/examples/http.rs) | Uses HTTP transport and demonstrates array ingestion with `ndarray`. |
-| [`protocol_version.rs`](https://github.com/questdb/c-questdb-client/blob/4.9.0/questdb-rs/examples/protocol_version.rs) | Shows protocol version selection and feature differences (e.g. arrays). |
+| [`basic.rs`](https://github.com/questdb/c-questdb-client/blob/5.0.0/questdb-rs/examples/basic.rs) | Minimal TCP ingestion example; shows basic row and array ingestion. |
+| [`auth.rs`](https://github.com/questdb/c-questdb-client/blob/5.0.0/questdb-rs/examples/auth.rs) | Adds authentication (user/password, token) to basic ingestion. |
+| [`auth_tls.rs`](https://github.com/questdb/c-questdb-client/blob/5.0.0/questdb-rs/examples/auth_tls.rs) | Like `auth.rs`, but uses TLS for encrypted TCP connections. |
+| [`from_conf.rs`](https://github.com/questdb/c-questdb-client/blob/5.0.0/questdb-rs/examples/from_conf.rs) | Configures client via connection string instead of builder pattern. |
+| [`from_env.rs`](https://github.com/questdb/c-questdb-client/blob/5.0.0/questdb-rs/examples/from_env.rs) | Reads config from `QDB_CLIENT_CONF` environment variable. |
+| [`http.rs`](https://github.com/questdb/c-questdb-client/blob/5.0.0/questdb-rs/examples/http.rs) | Uses HTTP transport and demonstrates array ingestion with `ndarray`. |
+| [`protocol_version.rs`](https://github.com/questdb/c-questdb-client/blob/5.0.0/questdb-rs/examples/protocol_version.rs) | Shows protocol version selection and feature differences (e.g. arrays). |
 
 ## Crate features
 
