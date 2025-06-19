@@ -44,24 +44,3 @@ which also contains additional formatting and comments.
 This generated files should be not be checked in:
 * `include/questdb/ingress/line_sender.gen.h`
 * `cython/questdb/ingress/line_sender.pxd`
-
-## Updating version in the codebase before releasing
-
-* Ensure you have `python3` and `bump2version` installed (`python3 -m pip install bump2version`).
-
-```console
-bump2version --config-file .bumpversion.cfg patch
-```
-
-Last argument argument:
-  * `patch` would bump from (for example) `0.1.0` to `0.1.1`.
-  * `minor` would bump from `0.1.0` to `0.2.0`.
-  * `major` would bump from `0.1.0` to `1.0.0`.
-
-* For more command line options, see: https://pypi.org/project/bump2version/
-
-If you're editing the config file, a good set of arguments to debug issues is:
-
-```
-bump2version --dry-run --allow-dirty --verbose --config-file .bumpversion.cfg patch
-```
