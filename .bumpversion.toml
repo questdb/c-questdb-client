@@ -29,6 +29,11 @@ search = "https://github.com/questdb/c-questdb-client/tree/{current_version}/"
 replace = "https://github.com/questdb/c-questdb-client/tree/{new_version}/"
 
 [[tool.bumpversion.files]]
+filename = "questdb-rs/README.md"
+search = "https://github.com/questdb/c-questdb-client/blob/{current_version}/questdb-rs/"
+replace = "https://github.com/questdb/c-questdb-client/blob/{new_version}/questdb-rs/"
+
+[[tool.bumpversion.files]]
 filename = "questdb-rs-ffi/Cargo.toml"
 search = "version = \"{current_version}\""
 replace = "version = \"{new_version}\""
