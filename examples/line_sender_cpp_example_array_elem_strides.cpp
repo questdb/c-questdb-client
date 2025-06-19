@@ -38,7 +38,12 @@ static bool array_example(std::string_view host, std::string_view port)
         questdb::ingress::array::strided_view<
             double,
             questdb::ingress::array::strides_mode::elements>
-            book_data{3, shape.data(), strides.data(), arr_data.data(), arr_data.size()};
+            book_data{
+                3,
+                shape.data(),
+                strides.data(),
+                arr_data.data(),
+                arr_data.size()};
 
         questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
         buffer.table(table_name)

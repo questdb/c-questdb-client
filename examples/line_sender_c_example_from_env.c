@@ -14,17 +14,17 @@ int main(int argc, const char* argv[])
         goto on_error;
 
     buffer = line_sender_buffer_new_for_sender(sender);
-    line_sender_buffer_reserve(buffer, 64 * 1024);  // 64KB buffer initial size.
+    line_sender_buffer_reserve(buffer, 64 * 1024); // 64KB buffer initial size.
 
     // We prepare all our table names and column names in advance.
     // If we're inserting multiple rows, this allows us to avoid
     // re-validating the same strings over and over again.
-    line_sender_table_name table_name = QDB_TABLE_NAME_LITERAL("c_trades_from_env");
+    line_sender_table_name table_name =
+        QDB_TABLE_NAME_LITERAL("c_trades_from_env");
     line_sender_column_name symbol_name = QDB_COLUMN_NAME_LITERAL("symbol");
     line_sender_column_name side_name = QDB_COLUMN_NAME_LITERAL("side");
     line_sender_column_name price_name = QDB_COLUMN_NAME_LITERAL("price");
     line_sender_column_name amount_name = QDB_COLUMN_NAME_LITERAL("amount");
-
 
     if (!line_sender_buffer_table(buffer, table_name, &err))
         goto on_error;
@@ -62,7 +62,7 @@ int main(int argc, const char* argv[])
 
     return 0;
 
-on_error: ;
+on_error:;
     size_t err_len = 0;
     const char* err_msg = line_sender_error_msg(err, &err_len);
     fprintf(stderr, "Error running example: %.*s\n", (int)err_len, err_msg);
