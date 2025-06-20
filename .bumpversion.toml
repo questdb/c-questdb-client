@@ -1,5 +1,5 @@
 [tool.bumpversion]
-current_version = "4.9.0"
+current_version = "5.0.0"
 commit = false
 tag = false
 
@@ -42,3 +42,8 @@ replace = "version = \"{new_version}\""
 filename = "include/questdb/ingress/line_sender.hpp"
 search = "questdb/c++/{current_version}"
 replace = "questdb/c++/{new_version}"
+
+[[tool.bumpversion.files]]
+filename = ".bumpversion.toml"
+search = "current_version = \"{current_version}\""
+replace = "current_version = \"{new_version}\""
