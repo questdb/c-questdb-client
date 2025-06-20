@@ -9,10 +9,25 @@
 
 ## Complete Examples
 
-* [Basic example in C](../examples/line_sender_c_example.c).
-* [With authentication](../examples/line_sender_c_example_auth.c).
-* [With authentication and TLS](../examples/line_sender_c_example_auth_tls.c).
-* [Custom certificate authority file](../examples/line_sender_c_example_tls_ca.c).
+**Basic Usage**
+- [Basic example in C](../examples/line_sender_c_example.c)
+
+**Authentication & Security**
+- [With authentication](../examples/line_sender_c_example_auth.c)
+- [With authentication and TLS](../examples/line_sender_c_example_auth_tls.c)
+- [Custom certificate authority file](../examples/line_sender_c_example_tls_ca.c)
+
+**Configuration**
+- [Load configuration from file](../examples/line_sender_c_example_from_conf.c)
+- [Load configuration from environment](../examples/line_sender_c_example_from_env.c)
+
+**HTTP**
+- [Example using HTTP](../examples/line_sender_c_example_http.c)
+
+**Array Handling**
+- [Array with byte strides](../examples/line_sender_c_example_array_byte_strides.c)
+- [Array with element strides](../examples/line_sender_c_example_array_elem_strides.c)
+- [Array in C-major order](../examples/line_sender_c_example_array_c_major.c)
 
 ## API Overview
 

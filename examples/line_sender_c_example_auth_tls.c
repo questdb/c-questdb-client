@@ -10,18 +10,24 @@ static bool example(const char* host, const char* port)
     line_sender* sender = NULL;
     line_sender_buffer* buffer = NULL;
     char* conf_str = concat(
-        "tcps::addr=", host, ":", port, ";"
+        "tcps::addr=",
+        host,
+        ":",
+        port,
+        ";"
         "protocol_version=2;"
         "username=admin;"
         "token=5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48;"
         "token_x=fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU;"
         "token_y=Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac;");
-    if (!conf_str) {
+    if (!conf_str)
+    {
         fprintf(stderr, "Could not concatenate configuration string.\n");
         return false;
     }
-    line_sender_utf8 conf_str_utf8 = { 0, NULL };
-    if (!line_sender_utf8_init(&conf_str_utf8, strlen(conf_str), conf_str, &err))
+    line_sender_utf8 conf_str_utf8 = {0, NULL};
+    if (!line_sender_utf8_init(
+            &conf_str_utf8, strlen(conf_str), conf_str, &err))
         goto on_error;
 
     sender = line_sender_from_conf(conf_str_utf8, &err);
@@ -32,17 +38,17 @@ static bool example(const char* host, const char* port)
     conf_str = NULL;
 
     buffer = line_sender_buffer_new_for_sender(sender);
-    line_sender_buffer_reserve(buffer, 64 * 1024);  // 64KB buffer initial size.
+    line_sender_buffer_reserve(buffer, 64 * 1024); // 64KB buffer initial size.
 
     // We prepare all our table names and column names in advance.
     // If we're inserting multiple rows, this allows us to avoid
     // re-validating the same strings over and over again.
-    line_sender_table_name table_name = QDB_TABLE_NAME_LITERAL("c_trades_auth_tls");
+    line_sender_table_name table_name =
+        QDB_TABLE_NAME_LITERAL("c_trades_auth_tls");
     line_sender_column_name symbol_name = QDB_COLUMN_NAME_LITERAL("symbol");
     line_sender_column_name side_name = QDB_COLUMN_NAME_LITERAL("side");
     line_sender_column_name price_name = QDB_COLUMN_NAME_LITERAL("price");
     line_sender_column_name amount_name = QDB_COLUMN_NAME_LITERAL("amount");
-
 
     if (!line_sender_buffer_table(buffer, table_name, &err))
         goto on_error;
@@ -80,7 +86,7 @@ static bool example(const char* host, const char* port)
 
     return true;
 
-on_error: ;
+on_error:;
     size_t err_len = 0;
     const char* err_msg = line_sender_error_msg(err, &err_len);
     fprintf(stderr, "Error running example: %.*s\n", (int)err_len, err_msg);
@@ -100,7 +106,8 @@ static bool displayed_help(int argc, const char* argv[])
         {
             fprintf(stderr, "Usage:\n");
             fprintf(stderr, "line_sender_c_example_auth_tls: [HOST [PORT]]\n");
-            fprintf(stderr, "    HOST: ILP host (defaults to \"localhost\").\n");
+            fprintf(
+                stderr, "    HOST: ILP host (defaults to \"localhost\").\n");
             fprintf(stderr, "    PORT: ILP port (defaults to \"9009\").\n");
             return true;
         }

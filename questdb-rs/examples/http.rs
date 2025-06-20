@@ -13,6 +13,7 @@ fn main() -> Result<()> {
         .symbol("side", "sell")?
         .column_f64("price", 2615.54)?
         .column_f64("amount", 0.00044)?
+        // QuestDB server version 8.4.0 or later is required for array support.
         .column_arr("location", &arr1(&[100.0, 100.1, 100.2]).view())?
         .at(TimestampNanos::now())?;
     sender.flush(&mut buffer)?;
