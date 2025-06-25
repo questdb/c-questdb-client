@@ -39,9 +39,9 @@ def main():
 
     run_cmd('cargo', 'test',
             '--', '--nocapture', cwd='questdb-rs')
-    run_cmd('cargo', 'test', '--no-default-features', '--features=aws-lc-crypto,tls-native-certs',
+    run_cmd('cargo', 'test', '--no-default-features', '--features=aws-lc-crypto,tls-native-certs,sync-sender-tcp',
             '--', '--nocapture', cwd='questdb-rs')
-    run_cmd('cargo', 'test', '--no-default-features', '--features=ring-crypto,tls-native-certs,sync-sender-http',
+    run_cmd('cargo', 'test', '--no-default-features', '--features=ring-crypto,tls-native-certs,sync-sender',
             '--', '--nocapture', cwd='questdb-rs')
     run_cmd('cargo', 'test', '--features=almost-all-features',
             '--', '--nocapture', cwd='questdb-rs')
