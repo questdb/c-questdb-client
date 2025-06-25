@@ -419,7 +419,9 @@ impl Connection {
     }
 }
 
+#[cfg(any(feature = "sync-sender-tcp", feature = "sync-sender-http"))]
 enum ProtocolHandler {
+    #[cfg(feature = "sync-sender-tcp")]
     Socket(Connection),
 
     #[cfg(feature = "sync-sender-http")]
@@ -1407,12 +1409,13 @@ struct EcdsaAuthParams {
 
 #[derive(PartialEq, Debug, Clone)]
 enum AuthParams {
+    #[cfg(feature = "_sender-tcp")]
     Ecdsa(EcdsaAuthParams),
 
-    #[cfg(feature = "sync-sender-http")]
+    #[cfg(feature = "_sender-http")]
     Basic(BasicAuthParams),
 
-    #[cfg(feature = "sync-sender-http")]
+    #[cfg(feature = "_sender-http")]
     Token(TokenAuthParams),
 }
 
@@ -1695,18 +1698,20 @@ fn validate_auto_flush_params(params: &HashMap<String, String>) -> Result<()> {
 /// Protocol used to communicate with the QuestDB server.
 #[derive(PartialEq, Debug, Clone, Copy)]
 pub enum Protocol {
+    #[cfg(feature = "_sender-tcp")]
     /// ILP over TCP (streaming).
     Tcp,
 
+    #[cfg(feature = "_sender-tcp")]
     /// TCP + TLS
     Tcps,
 
-    #[cfg(feature = "sync-sender-http")]
+    #[cfg(feature = "_sender-http")]
     /// ILP over HTTP (request-response)
     /// Version 1 is compatible with the InfluxDB Line Protocol.
     Http,
 
-    #[cfg(feature = "sync-sender-http")]
+    #[cfg(feature = "_sender-http")]
     /// HTTP + TLS
     Https,
 }
@@ -1720,62 +1725,66 @@ impl Display for Protocol {
 impl Protocol {
     fn default_port(&self) -> &str {
         match self {
+            #[cfg(feature = "_sender-tcp")]
             Protocol::Tcp | Protocol::Tcps => "9009",
-            #[cfg(feature = "sync-sender-http")]
+            #[cfg(feature = "_sender-http")]
             Protocol::Http | Protocol::Https => "9000",
         }
     }
 
     fn tls_enabled(&self) -> bool {
         match self {
+            #[cfg(feature = "_sender-tcp")]
             Protocol::Tcp => false,
+            #[cfg(feature = "_sender-tcp")]
             Protocol::Tcps => true,
-            #[cfg(feature = "sync-sender-http")]
+            #[cfg(feature = "_sender-http")]
             Protocol::Http => false,
-            #[cfg(feature = "sync-sender-http")]
+            #[cfg(feature = "_sender-http")]
             Protocol::Https => true,
         }
     }
 
+    #[cfg(feature = "_sender-tcp")]
     fn is_tcpx(&self) -> bool {
         match self {
-            Protocol::Tcp => true,
-            Protocol::Tcps => true,
-            #[cfg(feature = "sync-sender-http")]
-            Protocol::Http => false,
-            #[cfg(feature = "sync-sender-http")]
-            Protocol::Https => false,
+            Protocol::Tcp | Protocol::Tcps => true,
+            #[cfg(feature = "_sender-http")]
+            Protocol::Http | Protocol::Https => false,
         }
     }
 
-    #[cfg(feature = "sync-sender-http")]
+    #[cfg(feature = "_sender-http")]
     fn is_httpx(&self) -> bool {
         match self {
-            Protocol::Tcp => false,
-            Protocol::Tcps => false,
-            Protocol::Http => true,
-            Protocol::Https => true,
+            #[cfg(feature = "_sender-tcp")]
+            Protocol::Tcp | Protocol::Tcps => false,
+            Protocol::Http | Protocol::Https => true,
         }
     }
 
     fn schema(&self) -> &str {
         match self {
+            #[cfg(feature = "_sender-tcp")]
             Protocol::Tcp => "tcp",
+            #[cfg(feature = "_sender-tcp")]
             Protocol::Tcps => "tcps",
-            #[cfg(feature = "sync-sender-http")]
+            #[cfg(feature = "_sender-http")]
             Protocol::Http => "http",
-            #[cfg(feature = "sync-sender-http")]
+            #[cfg(feature = "_sender-http")]
             Protocol::Https => "https",
         }
     }
 
     fn from_schema(schema: &str) -> Result<Self> {
         match schema {
+            #[cfg(feature = "_sender-tcp")]
             "tcp" => Ok(Protocol::Tcp),
+            #[cfg(feature = "_sender-tcp")]
             "tcps" => Ok(Protocol::Tcps),
-            #[cfg(feature = "sync-sender-http")]
+            #[cfg(feature = "_sender-http")]
             "http" => Ok(Protocol::Http),
-            #[cfg(feature = "sync-sender-http")]
+            #[cfg(feature = "_sender-http")]
             "https" => Ok(Protocol::Https),
             _ => Err(error::fmt!(ConfigError, "Unsupported protocol: {}", schema)),
         }
@@ -1844,8 +1853,13 @@ pub struct SenderBuilder {
     username: ConfigSetting<Option<String>>,
     password: ConfigSetting<Option<String>>,
     token: ConfigSetting<Option<String>>,
+
+    #[cfg(feature = "_sender-tcp")]
     token_x: ConfigSetting<Option<String>>,
+
+    #[cfg(feature = "_sender-tcp")]
     token_y: ConfigSetting<Option<String>>,
+
     protocol_version: ConfigSetting<Option<ProtocolVersion>>,
 
     #[cfg(feature = "insecure-skip-verify")]
@@ -1853,8 +1867,8 @@ pub struct SenderBuilder {
 
     tls_ca: ConfigSetting<CertificateAuthority>,
     tls_roots: ConfigSetting<Option<PathBuf>>,
-
-    #[cfg(feature = "sync-sender-http")]
+    
+    #[cfg(feature = "_sender-http")]
     http: Option<HttpConfig>,
 }
 
