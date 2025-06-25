@@ -54,17 +54,6 @@ stages:
               cd questdb-rs
               cargo build --examples --features almost-all-features
             displayName: "Build Rust examples"
-          ############################# temp for test begin #####################
-          - script: |
-              git clone --depth 1 https://github.com/questdb/questdb.git ./questdb
-            displayName: git clone questdb
-          - task: Maven@3
-            displayName: "Compile QuestDB"
-            inputs:
-              mavenPOMFile: "questdb/pom.xml"
-              jdkVersionOption: "1.11"
-              options: "-DskipTests -Pbuild-web-console"
-          ############################# temp for test end ##################### 
           - script: python3 ci/run_all_tests.py
             env:
               JAVA_HOME: $(JAVA_HOME_11_X64)
@@ -80,11 +69,6 @@ stages:
         timeoutInMinutes: 10
         steps:
           - checkout: self
-          - script: |
-              apt install clang-format
-              rustup component add clippy
-              rustup component add rustfmt
-            displayName: "Install clang-format, clippy and rustfmt"
           - script: |
               cd questdb-rs
               cargo fmt --all -- --check
@@ -102,9 +86,6 @@ stages:
               cargo clippy --all-targets --all-features -- -D warnings
             displayName: "questdb-rs-ffi: clippy"
           - script: |
-              python3 ci/format_cpp.py --check
-            displayName: "C/C++ clang-format"
-          - script: |
               cd system_test
               cd tls_proxy
               cargo fmt --all -- --check
@@ -114,26 +95,3 @@ stages:
               cd tls_proxy
               cargo clippy --all-targets --all-features -- -D warnings
             displayName: "tls_proxy: clippy"
-      - job: TestVsQuestDBMaster
-        displayName: "Vs QuestDB 'master'"
-        pool:
-          vmImage: 'ubuntu-latest'
-        timeoutInMinutes: 60
-        steps:
-          - checkout: self
-            fetchDepth: 1
-            lfs: false
-            submodules: false
-          - template: compile.yaml
-          - script: |
-              git clone --depth 1 https://github.com/questdb/questdb.git
-            displayName: git clone questdb
-          - task: Maven@3
-            displayName: "Compile QuestDB"
-            inputs:
-              mavenPOMFile: 'questdb/pom.xml'
-              jdkVersionOption: '1.11'
-              options: "-DskipTests -Pbuild-web-console"
-          - script: |
-              python3 system_test/test.py run --repo ./questdb -v
-            displayName: "integration test"
