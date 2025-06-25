@@ -30,7 +30,7 @@ ring = { version = "0.17.14", optional = true }
 rustls-pki-types = "1.0.1"
 rustls = { version = "0.23.25", default-features = false, features = ["logging", "std", "tls12"] }
 rustls-native-certs = { version = "0.8.1", optional = true }
-webpki-roots = { version = "0.26.8", default-features = false, optional = true }
+webpki-roots = { version = "1.0.1", default-features = false, optional = true }
 chrono = { version = "0.4.40", optional = true }
 
 # We need to limit the `ureq` version to 3.0.x since we use
