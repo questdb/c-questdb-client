@@ -274,7 +274,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     compile_error!(
         "At least one of `tls-webpki-certs` or `tls-native-certs` features must be enabled."
     );
-    
+
     #[cfg(not(any(feature = "_sender-tcp", feature = "_sender-http")))]
     compile_error!(
         "At least one of `sync-sender-tcp`, `sync-sender-http`, `async-sender-tcp` or `async-sender-http` features must be enabled"
