@@ -36,6 +36,10 @@ chrono = { version = "0.4.40", optional = true }
 # We need to limit the `ureq` version to 3.0.x since we use
 # the `ureq::unversioned` module which does not respect semantic versioning.
 ureq = { version = "3.0.10, <3.1.0", default-features = false, features = ["rustls-no-provider"], optional = true }
+
+tokio = { version = "1.45.1", default-features = false, optional = true }
+hyper = { version = "1.6.0", default-features = false, optional = true }
+
 serde_json = { version = "1", optional = true }
 questdb-confstr = "0.1.1"
 rand = { version = "0.9.0", optional = true }
@@ -54,14 +58,32 @@ indoc = "2"
 mio = { version = "1", features = ["os-poll", "net"] }
 chrono = "0.4.31"
 tempfile = "3"
-webpki-roots = "0.26.8"
+webpki-roots = "1.0.1"
 rstest = "0.25.0"
 
 [features]
-default = ["tls-webpki-certs", "ilp-over-http", "ring-crypto"]
+default = ["sync-sender", "tls-webpki-certs", "ring-crypto"]
 
-# Include support for ILP over HTTP.
-ilp-over-http = ["dep:ureq", "dep:serde_json", "dep:rand"]
+# Sync ILP/TCP + ILP/HTTP Sender
+sync-sender = ["sync-sender-tcp", "sync-sender-http"]
+
+# Sync ILP/TCP
+sync-sender-tcp = ["_sender-tcp"]
+
+# Sync ILP/HTTP
+sync-sender-http = ["_sender-http", "dep:ureq", "dep:serde_json", "dep:rand"]
+
+# Async ILP/TCP + ILP/HTTP Sender
+async-sender = ["async-sender-tcp", "async-sender-http"]
+
+# Async ILP/TCP Sender
+async-sender-tcp = ["_sender-tcp", "dep:tokio"]
+
+# Async ILP/HTTP Sender
+async-sender-http = ["_sender-http", "dep:tokio", "dep:hyper"]
+
+# Compatiblity alias.
+ilp-over-http = ["sync-sender-tcp"]
 
 # Allow use OS-provided root TLS certificates
 tls-native-certs = ["dep:rustls-native-certs"]
@@ -84,13 +106,18 @@ json_tests = []
 # Enable methods to create timestamp objects from chrono::DateTime objects.
 chrono_timestamp = ["chrono"]
 
+# Hidden derived features, used in code to enable-disable code sections. Don't use directly.
+_sender-tcp = []
+_sender-http = []
+
 # The `aws-lc-crypto` and `ring-crypto` features are mutually exclusive,
 # thus compiling with `--all-features` will not work.
 # Instead compile with `--features almost-all-features`.
 # This is useful for quickly running `cargo test` or `cargo clippy`.
 almost-all-features = [
+    "sync-sender",
+    "async-sender",
     "tls-webpki-certs",
-    "ilp-over-http",
     "ring-crypto",
     "insecure-skip-verify",
     "json_tests",
@@ -112,8 +139,8 @@ required-features = ["chrono_timestamp"]
 
 [[example]]
 name = "http"
-required-features = ["ilp-over-http", "ndarray"]
+required-features = ["sync-sender-http", "ndarray"]
 
 [[example]]
 name = "protocol_version"
-required-features = ["ilp-over-http", "ndarray"]
+required-features = ["sync-sender-http", "ndarray"]

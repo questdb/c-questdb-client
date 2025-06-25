@@ -80,8 +80,8 @@ pub enum ProtocolVersion {
     V2 = 2,
 }
 
-impl std::fmt::Display for ProtocolVersion {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for ProtocolVersion {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             ProtocolVersion::V1 => write!(f, "v1"),
             ProtocolVersion::V2 => write!(f, "v2"),
@@ -191,7 +191,7 @@ impl<'a> TableName<'a> {
     /// Construct a table name without validating it.
     ///
     /// This breaks API encapsulation and is only intended for use
-    /// when the the string was already previously validated.
+    /// when the string was already previously validated.
     ///
     /// The QuestDB server will reject an invalid table name.
     pub fn new_unchecked(name: &'a str) -> Self {
@@ -422,7 +422,7 @@ impl Connection {
 enum ProtocolHandler {
     Socket(Connection),
 
-    #[cfg(feature = "ilp-over-http")]
+    #[cfg(feature = "sync-sender-http")]
     Http(HttpHandlerState),
 }
 
@@ -1409,10 +1409,10 @@ struct EcdsaAuthParams {
 enum AuthParams {
     Ecdsa(EcdsaAuthParams),
 
-    #[cfg(feature = "ilp-over-http")]
+    #[cfg(feature = "sync-sender-http")]
     Basic(BasicAuthParams),
 
-    #[cfg(feature = "ilp-over-http")]
+    #[cfg(feature = "sync-sender-http")]
     Token(TokenAuthParams),
 }
 
@@ -1701,12 +1701,12 @@ pub enum Protocol {
     /// TCP + TLS
     Tcps,
 
-    #[cfg(feature = "ilp-over-http")]
+    #[cfg(feature = "sync-sender-http")]
     /// ILP over HTTP (request-response)
     /// Version 1 is compatible with the InfluxDB Line Protocol.
     Http,
 
-    #[cfg(feature = "ilp-over-http")]
+    #[cfg(feature = "sync-sender-http")]
     /// HTTP + TLS
     Https,
 }
@@ -1721,7 +1721,7 @@ impl Protocol {
     fn default_port(&self) -> &str {
         match self {
             Protocol::Tcp | Protocol::Tcps => "9009",
-            #[cfg(feature = "ilp-over-http")]
+            #[cfg(feature = "sync-sender-http")]
             Protocol::Http | Protocol::Https => "9000",
         }
     }
@@ -1730,9 +1730,9 @@ impl Protocol {
         match self {
             Protocol::Tcp => false,
             Protocol::Tcps => true,
-            #[cfg(feature = "ilp-over-http")]
+            #[cfg(feature = "sync-sender-http")]
             Protocol::Http => false,
-            #[cfg(feature = "ilp-over-http")]
+            #[cfg(feature = "sync-sender-http")]
             Protocol::Https => true,
         }
     }
@@ -1741,14 +1741,14 @@ impl Protocol {
         match self {
             Protocol::Tcp => true,
             Protocol::Tcps => true,
-            #[cfg(feature = "ilp-over-http")]
+            #[cfg(feature = "sync-sender-http")]
             Protocol::Http => false,
-            #[cfg(feature = "ilp-over-http")]
+            #[cfg(feature = "sync-sender-http")]
             Protocol::Https => false,
         }
     }
 
-    #[cfg(feature = "ilp-over-http")]
+    #[cfg(feature = "sync-sender-http")]
     fn is_httpx(&self) -> bool {
         match self {
             Protocol::Tcp => false,
@@ -1762,9 +1762,9 @@ impl Protocol {
         match self {
             Protocol::Tcp => "tcp",
             Protocol::Tcps => "tcps",
-            #[cfg(feature = "ilp-over-http")]
+            #[cfg(feature = "sync-sender-http")]
             Protocol::Http => "http",
-            #[cfg(feature = "ilp-over-http")]
+            #[cfg(feature = "sync-sender-http")]
             Protocol::Https => "https",
         }
     }
@@ -1773,9 +1773,9 @@ impl Protocol {
         match schema {
             "tcp" => Ok(Protocol::Tcp),
             "tcps" => Ok(Protocol::Tcps),
-            #[cfg(feature = "ilp-over-http")]
+            #[cfg(feature = "sync-sender-http")]
             "http" => Ok(Protocol::Http),
-            #[cfg(feature = "ilp-over-http")]
+            #[cfg(feature = "sync-sender-http")]
             "https" => Ok(Protocol::Https),
             _ => Err(error::fmt!(ConfigError, "Unsupported protocol: {}", schema)),
         }
@@ -1788,7 +1788,7 @@ impl Protocol {
 /// environment variable.
 ///
 #[cfg_attr(
-    feature = "ilp-over-http",
+    feature = "sync-sender-http",
     doc = r##"
 ```no_run
 # use questdb::Result;
@@ -1854,7 +1854,7 @@ pub struct SenderBuilder {
     tls_ca: ConfigSetting<CertificateAuthority>,
     tls_roots: ConfigSetting<Option<PathBuf>>,
 
-    #[cfg(feature = "ilp-over-http")]
+    #[cfg(feature = "sync-sender-http")]
     http: Option<HttpConfig>,
 }
 
@@ -2015,17 +2015,17 @@ impl SenderBuilder {
                     ))
                 }
 
-                #[cfg(feature = "ilp-over-http")]
+                #[cfg(feature = "sync-sender-http")]
                 "request_min_throughput" => {
                     builder.request_min_throughput(parse_conf_value(key, val)?)?
                 }
 
-                #[cfg(feature = "ilp-over-http")]
+                #[cfg(feature = "sync-sender-http")]
                 "request_timeout" => {
                     builder.request_timeout(Duration::from_millis(parse_conf_value(key, val)?))?
                 }
 
-                #[cfg(feature = "ilp-over-http")]
+                #[cfg(feature = "sync-sender-http")]
                 "retry_timeout" => {
                     builder.retry_timeout(Duration::from_millis(parse_conf_value(key, val)?))?
                 }
@@ -2100,7 +2100,7 @@ impl SenderBuilder {
             tls_ca: ConfigSetting::new_default(tls_ca),
             tls_roots: ConfigSetting::new_default(None),
 
-            #[cfg(feature = "ilp-over-http")]
+            #[cfg(feature = "sync-sender-http")]
             http: if protocol.is_httpx() {
                 Some(HttpConfig::default())
             } else {
@@ -2270,7 +2270,7 @@ impl SenderBuilder {
         Ok(self)
     }
 
-    #[cfg(feature = "ilp-over-http")]
+    #[cfg(feature = "sync-sender-http")]
     /// Set the cumulative duration spent in retries.
     /// The value is in milliseconds, and the default is 10 seconds.
     pub fn retry_timeout(mut self, value: Duration) -> Result<Self> {
@@ -2285,7 +2285,7 @@ impl SenderBuilder {
         Ok(self)
     }
 
-    #[cfg(feature = "ilp-over-http")]
+    #[cfg(feature = "sync-sender-http")]
     /// Set the minimum acceptable throughput while sending a buffer to the server.
     /// The sender will divide the payload size by this number to determine for how
     /// long to keep sending the payload before timing out.
@@ -2308,7 +2308,7 @@ impl SenderBuilder {
         Ok(self)
     }
 
-    #[cfg(feature = "ilp-over-http")]
+    #[cfg(feature = "sync-sender-http")]
     /// Additional time to wait on top of that calculated from the minimum throughput.
     /// This accounts for the fixed latency of the HTTP request-response roundtrip.
     /// The default is 10 seconds.
@@ -2332,7 +2332,7 @@ impl SenderBuilder {
         Ok(self)
     }
 
-    #[cfg(feature = "ilp-over-http")]
+    #[cfg(feature = "sync-sender-http")]
     /// Internal API, do not use.
     /// This is exposed exclusively for the Python client.
     /// We (QuestDB) use this to help us debug which client is being used if we encounter issues.
@@ -2476,7 +2476,7 @@ impl SenderBuilder {
                     r##"Incomplete ECDSA authentication parameters. Specify either all or none of: "username", "token", "token_x", "token_y"."##,
                 ))
             }
-            #[cfg(feature = "ilp-over-http")]
+            #[cfg(feature = "sync-sender-http")]
             (protocol, Some(username), Some(password), None, None, None)
             if protocol.is_httpx() => {
                 Ok(Some(AuthParams::Basic(BasicAuthParams {
@@ -2484,28 +2484,28 @@ impl SenderBuilder {
                     password: password.to_string(),
                 })))
             }
-            #[cfg(feature = "ilp-over-http")]
+            #[cfg(feature = "sync-sender-http")]
             (protocol, Some(_username), None, None, None, None)
             if protocol.is_httpx() => {
                 Err(error::fmt!(ConfigError,
                     r##"Basic authentication parameter "username" is present, but "password" is missing."##,
                 ))
             }
-            #[cfg(feature = "ilp-over-http")]
+            #[cfg(feature = "sync-sender-http")]
             (protocol, None, Some(_password), None, None, None)
             if protocol.is_httpx() => {
                 Err(error::fmt!(ConfigError,
                     r##"Basic authentication parameter "password" is present, but "username" is missing."##,
                 ))
             }
-            #[cfg(feature = "ilp-over-http")]
+            #[cfg(feature = "sync-sender-http")]
             (protocol, None, None, Some(token), None, None)
             if protocol.is_httpx() => {
                 Ok(Some(AuthParams::Token(TokenAuthParams {
                     token: token.to_string(),
                 })))
             }
-            #[cfg(feature = "ilp-over-http")]
+            #[cfg(feature = "sync-sender-http")]
             (
                 protocol,
                 Some(_username),
@@ -2516,7 +2516,7 @@ impl SenderBuilder {
             ) if protocol.is_httpx() => {
                 Err(error::fmt!(ConfigError, "ECDSA authentication is only available with ILP/TCP and not available with ILP/HTTP."))
             }
-            #[cfg(feature = "ilp-over-http")]
+            #[cfg(feature = "sync-sender-http")]
             (protocol, _username, _password, _token, None, None)
             if protocol.is_httpx() => {
                 Err(error::fmt!(ConfigError,
@@ -2550,7 +2550,7 @@ impl SenderBuilder {
 
         let handler = match self.protocol {
             Protocol::Tcp | Protocol::Tcps => self.connect_tcp(&auth)?,
-            #[cfg(feature = "ilp-over-http")]
+            #[cfg(feature = "sync-sender-http")]
             Protocol::Http | Protocol::Https => {
                 use ureq::unversioned::transport::Connector;
                 use ureq::unversioned::transport::TcpConnector;
@@ -2619,13 +2619,14 @@ impl SenderBuilder {
             }
         };
 
+        #[allow(unused_mut)]
         let mut max_name_len = *self.max_name_len;
 
         let protocol_version = match self.protocol_version.deref() {
             Some(v) => *v,
             None => match self.protocol {
                 Protocol::Tcp | Protocol::Tcps => ProtocolVersion::V1,
-                #[cfg(feature = "ilp-over-http")]
+                #[cfg(feature = "sync-sender-http")]
                 Protocol::Http | Protocol::Https => {
                     if let ProtocolHandler::Http(http_state) = &handler {
                         let settings_url = &format!(
@@ -2904,7 +2905,7 @@ impl Sender {
                     map_io_to_socket_err("Could not flush buffer: ", io_err)
                 })?;
             }
-            #[cfg(feature = "ilp-over-http")]
+            #[cfg(feature = "sync-sender-http")]
             ProtocolHandler::Http(ref state) => {
                 if transactional && !buf.transactional() {
                     return Err(error::fmt!(
@@ -2957,7 +2958,7 @@ impl Sender {
     /// error, it retries until it has exhausted the retry time budget.
     ///
     /// All the data stays in the buffer. Clear the buffer before starting a new batch.
-    #[cfg(feature = "ilp-over-http")]
+    #[cfg(feature = "sync-sender-http")]
     pub fn flush_and_keep_with_flags(&mut self, buf: &Buffer, transactional: bool) -> Result<()> {
         self.flush_impl(buf, transactional)
     }
@@ -3048,11 +3049,11 @@ mod conf;
 pub(crate) mod ndarr;
 mod timestamp;
 
-#[cfg(feature = "ilp-over-http")]
+#[cfg(feature = "sync-sender-http")]
 mod http;
 
 use crate::ingress::ndarr::check_and_get_array_bytes_size;
-#[cfg(feature = "ilp-over-http")]
+#[cfg(feature = "sync-sender-http")]
 use http::*;
 
 #[cfg(test)]
