@@ -366,6 +366,15 @@ enum AsyncConnection {
     Tls(Box<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>),
 }
 
+#[cfg(feature = "_async-sender")]
+enum AsyncProtocolHandler {
+    #[cfg(feature = "async-sender-tcp")]
+    AsyncTcp(AsyncConnection),
+
+    #[cfg(feature = "async-sender-http")]
+    AsyncHttp(),
+}
+
 #[cfg(feature = "sync-sender-tcp")]
 impl SyncConnection {
     fn send_key_id(&mut self, key_id: &str) -> Result<()> {
@@ -431,18 +440,13 @@ impl SyncConnection {
     }
 }
 
-enum ProtocolHandler {
+#[cfg(feature = "_sync-sender")]
+enum SyncProtocolHandler {
     #[cfg(feature = "sync-sender-tcp")]
     SyncTcp(SyncConnection),
 
     #[cfg(feature = "sync-sender-http")]
     SyncHttp(SyncHttpHandlerState),
-
-    #[cfg(feature = "async-sender-tcp")]
-    AsyncTcp(AsyncConnection),
-
-    #[cfg(feature = "async-sender-http")]
-    AsyncHttp(),
 }
 
 #[cfg(feature = "sync-sender-tcp")]
@@ -1406,7 +1410,7 @@ impl Buffer {
 /// * To send messages, call the [`flush`](Sender::flush) method.
 pub struct Sender {
     descr: String,
-    handler: ProtocolHandler,
+    handler: SyncProtocolHandler,
     connected: bool,
     max_buf_size: usize,
     protocol_version: ProtocolVersion,
@@ -2381,7 +2385,7 @@ impl SenderBuilder {
     }
 
     #[cfg(feature = "sync-sender-tcp")]
-    fn connect_tcp(&self, auth: &Option<AuthParams>) -> Result<ProtocolHandler> {
+    fn connect_tcp(&self, auth: &Option<AuthParams>) -> Result<SyncProtocolHandler> {
         let addr: SockAddr = gai::resolve_host_port(self.host.as_str(), self.port.as_str())?;
         let mut sock = Socket::new(Domain::IPV4, Type::STREAM, Some(SockProtocol::TCP))
             .map_err(|io_err| map_io_to_socket_err("Could not open TCP socket: ", io_err))?;
@@ -2470,7 +2474,7 @@ impl SenderBuilder {
             conn.authenticate(auth)?;
         }
 
-        Ok(ProtocolHandler::SyncTcp(conn))
+        Ok(SyncProtocolHandler::SyncTcp(conn))
     }
 
     fn build_auth(&self) -> Result<Option<AuthParams>> {
@@ -2648,7 +2652,7 @@ impl SenderBuilder {
                     self.host.deref(),
                     self.port.deref()
                 );
-                ProtocolHandler::SyncHttp(SyncHttpHandlerState {
+                SyncProtocolHandler::SyncHttp(SyncHttpHandlerState {
                     agent,
                     url,
                     auth,
@@ -2666,7 +2670,7 @@ impl SenderBuilder {
                 Protocol::Tcp | Protocol::Tcps => ProtocolVersion::V1,
                 #[cfg(feature = "sync-sender-http")]
                 Protocol::Http | Protocol::Https => {
-                    if let ProtocolHandler::SyncHttp(http_state) = &handler {
+                    if let SyncProtocolHandler::SyncHttp(http_state) = &handler {
                         let settings_url = &format!(
                             "{}://{}:{}/settings",
                             self.protocol.schema(),
@@ -2932,7 +2936,8 @@ impl Sender {
             return Ok(());
         }
         match self.handler {
-            ProtocolHandler::SyncTcp(ref mut conn) => {
+            #[cfg(feature = "sync-sender-tcp")]
+            SyncProtocolHandler::SyncTcp(ref mut conn) => {
                 if transactional {
                     return Err(error::fmt!(
                         InvalidApiCall,
@@ -2945,7 +2950,7 @@ impl Sender {
                 })?;
             }
             #[cfg(feature = "sync-sender-http")]
-            ProtocolHandler::SyncHttp(ref state) => {
+            SyncProtocolHandler::SyncHttp(ref state) => {
                 if transactional && !buf.transactional() {
                     return Err(error::fmt!(
                         InvalidApiCall,
