@@ -111,6 +111,24 @@ std::string& push_double_arr_to_buffer(
     return buffer;
 }
 
+std::string& push_double_arr_to_buffer(
+    std::string& buffer,
+    std::vector<double>& data,
+    size_t rank,
+    uintptr_t* shape)
+{
+    buffer.push_back(14);
+    buffer.push_back(10);
+    buffer.push_back(static_cast<char>(rank));
+    for (size_t i = 0; i < rank; ++i)
+        buffer.append(
+            reinterpret_cast<const char*>(&shape[i]), sizeof(uint32_t));
+    buffer.append(
+        reinterpret_cast<const char*>(data.data()),
+        data.size() * sizeof(double));
+    return buffer;
+}
+
 std::string& push_double_to_buffer(std::string& buffer, double data)
 {
     buffer.push_back(16);
@@ -184,8 +202,8 @@ TEST_CASE("line_sender c api basics")
         rank,
         shape,
         strides,
-        reinterpret_cast<uint8_t*>(arr_data.data()),
-        sizeof(arr_data),
+        arr_data.data(),
+        arr_data.size(),
         &err));
 
     line_sender_column_name arr_name2 = QDB_COLUMN_NAME_LITERAL("a2");
@@ -196,18 +214,28 @@ TEST_CASE("line_sender c api basics")
         rank,
         shape,
         elem_strides,
-        reinterpret_cast<uint8_t*>(arr_data.data()),
-        sizeof(arr_data),
+        arr_data.data(),
+        arr_data.size(),
+        &err));
+    line_sender_column_name arr_name3 = QDB_COLUMN_NAME_LITERAL("a3");
+    CHECK(::line_sender_buffer_column_f64_arr_c_major(
+        buffer,
+        arr_name3,
+        rank,
+        shape,
+        arr_data.data(),
+        arr_data.size(),
         &err));
     CHECK(::line_sender_buffer_at_nanos(buffer, 10000000, &err));
     CHECK(server.recv() == 0);
-    CHECK(::line_sender_buffer_size(buffer) == 266);
+    CHECK(::line_sender_buffer_size(buffer) == 382);
     CHECK(::line_sender_flush(sender, buffer, &err));
     ::line_sender_buffer_free(buffer);
     CHECK(server.recv() == 1);
     std::string expect{"test,t1=v1 f1=="};
     push_double_to_buffer(expect, 0.5).append(",a1==");
     push_double_arr_to_buffer(expect, arr_data, 3, shape).append(",a2==");
+    push_double_arr_to_buffer(expect, arr_data, 3, shape).append(",a3==");
     push_double_arr_to_buffer(expect, arr_data, 3, shape).append(" 10000000\n");
     CHECK(server.msgs(0) == expect);
 }
@@ -262,8 +290,8 @@ TEST_CASE("line_sender c++ api basics")
     questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
     // 3D array of doubles
     size_t rank = 3;
-    std::vector<uintptr_t> shape{2, 3, 2};
-    std::vector<intptr_t> strides{48, 16, 8};
+    uintptr_t shape[] = {2, 3, 2};
+    intptr_t strides[] = {48, 16, 8};
     std::array<double, 12> arr_data = {
         48123.5,
         2.4,
@@ -277,27 +305,137 @@ TEST_CASE("line_sender c++ api basics")
         2.7,
         48121.5,
         4.3};
-    std::vector<intptr_t> elem_strides{6, 2, 1};
+    intptr_t elem_strides[] = {6, 2, 1};
+    questdb::ingress::array::
+        strided_view<double, questdb::ingress::array::strides_mode::bytes>
+            a1{rank, shape, strides, arr_data.data(), arr_data.size()};
+    questdb::ingress::array::
+        strided_view<double, questdb::ingress::array::strides_mode::elements>
+            a2{rank, shape, elem_strides, arr_data.data(), arr_data.size()};
+    questdb::ingress::array::row_major_view<double> a3{
+        rank, shape, arr_data.data(), arr_data.size()};
+    questdb::ingress::array::
+        strided_view<double, questdb::ingress::array::strides_mode::bytes>
+            a4{rank, shape, strides, arr_data.data(), arr_data.size()};
     buffer.table("test")
         .symbol("t1", "v1")
         .symbol("t2", "")
         .column("f1", 0.5)
-        .column<true>("a1", rank, shape, strides, arr_data)
-        .column<false>("a2", rank, shape, elem_strides, arr_data)
+        .column("a1", a1)
+        .column("a2", a2)
+        .column("a3", a3)
+        .column("a4", a4)
+        .column("a5", arr_data)
         .at(questdb::ingress::timestamp_nanos{10000000});
 
     CHECK(server.recv() == 0);
-    CHECK(buffer.size() == 270);
+    CHECK(buffer.size() == 610);
     sender.flush(buffer);
     CHECK(server.recv() == 1);
     std::string expect{"test,t1=v1,t2= f1=="};
+    uintptr_t shapes_1dim[] = {12};
     push_double_to_buffer(expect, 0.5).append(",a1==");
-    push_double_arr_to_buffer(expect, arr_data, 3, shape.data())
-        .append(",a2==");
-    push_double_arr_to_buffer(expect, arr_data, 3, shape.data())
+    push_double_arr_to_buffer(expect, arr_data, 3, shape).append(",a2==");
+    push_double_arr_to_buffer(expect, arr_data, 3, shape).append(",a3==");
+    push_double_arr_to_buffer(expect, arr_data, 3, shape).append(",a4==");
+    push_double_arr_to_buffer(expect, arr_data, 3, shape).append(",a5==");
+    push_double_arr_to_buffer(expect, arr_data, 1, shapes_1dim)
         .append(" 10000000\n");
     CHECK(server.msgs(0) == expect);
 }
+
+TEST_CASE("line_sender array vector API")
+{
+    questdb::ingress::test::mock_server server;
+    questdb::ingress::opts opts{
+        questdb::ingress::protocol::tcp,
+        std::string("127.0.0.1"),
+        std::to_string(server.port())};
+    opts.protocol_version(questdb::ingress::protocol_version::v2);
+    questdb::ingress::line_sender sender{opts};
+    CHECK_FALSE(sender.must_close());
+    server.accept();
+    CHECK(server.recv() == 0);
+    questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
+    std::vector<double> arr_data = {
+        48123.5,
+        2.4,
+        48124.0,
+        1.8,
+        48124.5,
+        0.9,
+        48122.5,
+        3.1,
+        48122.0,
+        2.7,
+        48121.5,
+        4.3};
+    buffer.table("test")
+        .symbol("t1", "v1")
+        .symbol("t2", "")
+        .column("a1", arr_data)
+        .at(questdb::ingress::timestamp_nanos{10000000});
+
+    uintptr_t test_shape[] = {12};
+    CHECK(server.recv() == 0);
+    CHECK(buffer.size() == 132);
+    sender.flush(buffer);
+    CHECK(server.recv() == 1);
+    std::string expect{"test,t1=v1,t2= a1=="};
+    push_double_arr_to_buffer(expect, arr_data, 1, test_shape)
+        .append(" 10000000\n");
+    CHECK(server.msgs(0) == expect);
+}
+
+#if __cplusplus >= 202002L
+TEST_CASE("line_sender array span API")
+{
+    questdb::ingress::test::mock_server server;
+    questdb::ingress::opts opts{
+        questdb::ingress::protocol::tcp,
+        std::string("127.0.0.1"),
+        std::to_string(server.port())};
+    opts.protocol_version(questdb::ingress::protocol_version::v2);
+    questdb::ingress::line_sender sender{opts};
+    CHECK_FALSE(sender.must_close());
+    server.accept();
+    CHECK(server.recv() == 0);
+
+    questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
+
+    std::vector<double> arr_data = {
+        48123.5,
+        2.4,
+        48124.0,
+        1.8,
+        48124.5,
+        0.9,
+        48122.5,
+        3.1,
+        48122.0,
+        2.7,
+        48121.5,
+        4.3};
+    std::span<const double> data_span = arr_data;
+    buffer.table("test")
+        .symbol("t1", "v1")
+        .symbol("t2", "")
+        .column("a1", data_span.subspan(1, 8))
+        .at(questdb::ingress::timestamp_nanos{10000000});
+    std::vector<double> expect_arr_data = {
+        2.4, 48124.0, 1.8, 48124.5, 0.9, 48122.5, 3.1, 48122.0};
+
+    uintptr_t test_shape[] = {8};
+    CHECK(server.recv() == 0);
+    CHECK(buffer.size() == 100);
+    sender.flush(buffer);
+    CHECK(server.recv() == 1);
+    std::string expect{"test,t1=v1,t2= a1=="};
+    push_double_arr_to_buffer(expect, expect_arr_data, 1, test_shape)
+        .append(" 10000000\n");
+    CHECK(server.msgs(0) == expect);
+}
+#endif
 
 TEST_CASE("test multiple lines")
 {
@@ -810,15 +948,35 @@ TEST_CASE("Test timestamp column.")
     const auto exp = ss.str();
     CHECK(buffer.peek() == exp);
 
-    sender.flush_and_keep(buffer);
+    try
+    {
+        sender.flush_and_keep_with_flags(buffer, true);
+        CHECK_MESSAGE(false, "Expected exception");
+    }
+    catch (const questdb::ingress::line_sender_error& se)
+    {
+        std::string msg{se.what()};
+        CHECK_MESSAGE(
+            msg.rfind(
+                "Transactional flushes are not supported for ILP over TCP",
+                0) == 0,
+            msg);
+    }
+    catch (...)
+    {
+        CHECK_MESSAGE(false, "Other exception raised.");
+    }
 
+    sender.flush_and_keep(buffer);
+    sender.flush_and_keep_with_flags(buffer, false);
     CHECK(buffer.peek() == exp);
 
     server.accept();
     sender.close();
 
-    CHECK(server.recv() == 1);
+    CHECK(server.recv() == 2);
     CHECK(server.msgs(0) == exp);
+    CHECK(server.msgs(1) == exp);
 }
 
 TEST_CASE("test timestamp_micros and timestamp_nanos::now()")

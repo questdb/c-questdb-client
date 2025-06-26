@@ -58,17 +58,11 @@ use ring::{
     signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING},
 };
 
-pub(crate) const MAX_NAME_LEN_DEFAULT: usize = 127;
+const MAX_NAME_LEN_DEFAULT: usize = 127;
 
 /// The maximum allowed dimensions for arrays.
 pub const MAX_ARRAY_DIMS: usize = 32;
-
-// TODO: We should probably agree on a significantly
-//       _smaller_ limit here, since there's no way
-//       we've ever tested anything that big.
-//       My gut feeling is that the maximum array buffer should be
-//       in the order of 100MB or so.
-pub const MAX_ARRAY_BUFFER_SIZE: usize = i32::MAX as usize;
+pub const MAX_ARRAY_BUFFER_SIZE: usize = 512 * 1024 * 1024; // 512MiB
 pub const MAX_ARRAY_DIM_LEN: usize = 0x0FFF_FFFF; // 1 << 28 - 1
 
 /// The version of InfluxDB Line Protocol used to communicate with the server.
@@ -76,12 +70,13 @@ pub const MAX_ARRAY_DIM_LEN: usize = 0x0FFF_FFFF; // 1 << 28 - 1
 pub enum ProtocolVersion {
     /// Version 1 of Line Protocol.
     /// Full-text protocol.
-    /// When used over HTTP, this version is compatible with the InfluxDB database.
+    /// This version is compatible with the InfluxDB database.
     V1 = 1,
 
     /// Version 2 of InfluxDB Line Protocol.
     /// Uses binary format serialization for f64, and supports the array data type.
     /// This version is specific to QuestDB and is not compatible with InfluxDB.
+    /// QuestDB server version 8.4.0 or later is required for `V2` supported.
     V2 = 2,
 }
 
@@ -603,22 +598,24 @@ impl Buffer {
     /// - Uses the specified protocol version
     /// - Sets maximum name length to **127 characters** (QuestDB server default)
     ///
-    /// This is equivalent to [`Sender::new_buffer`] when using the sender's
-    /// protocol version. For custom name lengths, use [`with_max_name_len`](Self::with_max_name_len)
-    /// or [`Sender::new_buffer_with_max_name_len`].
+    /// This is equivalent to [`Sender::new_buffer`] when using the [`Sender::protocol_version`]
+    /// and [`Sender::max_name_len`] is 127.
+    ///
+    /// For custom name lengths, use [`Self::with_max_name_len`]
     pub fn new(protocol_version: ProtocolVersion) -> Self {
         Self::with_max_name_len(protocol_version, MAX_NAME_LEN_DEFAULT)
     }
 
     /// Creates a new [`Buffer`] with a custom maximum name length.
     ///
-    /// - `max_name_len`: Maximum allowed length for table/column names, must match
+    /// - `max_name_len`: Maximum allowed length for table/column names, match
     ///   your QuestDB server's `cairo.max.file.name.length` configuration
     /// - `protocol_version`: Protocol version to use
     ///
-    /// This is equivalent to [`Sender::new_buffer_with_max_name_len`] when using
-    /// the sender's protocol version. For the default name length (127),
-    /// use [`new`](Self::new) or [`Sender::new_buffer`].
+    /// This is equivalent to [`Sender::new_buffer`] when using the [`Sender::protocol_version`]
+    /// and [`Sender::max_name_len`].
+    ///
+    /// For the default max name length limit (127), use [`Self::new`].
     pub fn with_max_name_len(protocol_version: ProtocolVersion, max_name_len: usize) -> Self {
         Self {
             output: Vec::new(),
@@ -1098,6 +1095,8 @@ impl Buffer {
     /// Supports arrays with up to [`MAX_ARRAY_DIMS`] dimensions. The array elements must
     /// be of type `f64`, which is currently the only supported data type.
     ///
+    /// **Note**: QuestDB server version 8.4.0 or later is required for array support.
+    ///
     /// # Examples
     ///
     /// Recording a 2D array using slices:
@@ -1155,7 +1154,7 @@ impl Buffer {
         let ndim = view.ndim();
         if ndim == 0 {
             return Err(error::fmt!(
-                ArrayViewError,
+                ArrayError,
                 "Zero-dimensional arrays are not supported",
             ));
         }
@@ -1163,7 +1162,7 @@ impl Buffer {
         // check dimension less equal than max dims
         if MAX_ARRAY_DIMS < ndim {
             return Err(error::fmt!(
-                ArrayHasTooManyDims,
+                ArrayError,
                 "Array dimension mismatch: expected at most {} dimensions, but got {}",
                 MAX_ARRAY_DIMS,
                 ndim
@@ -2166,7 +2165,14 @@ impl SenderBuilder {
         Ok(self)
     }
 
-    /// Set the line protocol version.
+    /// Sets the ingestion protocol version.
+    /// - HTTP transport automatically negotiates the protocol version by default(unset, **Strong Recommended**).
+    ///   You can explicitly configure the protocol version to avoid the slight latency cost at connection time.
+    /// - TCP transport does not negotiate the protocol version and uses [`ProtocolVersion::V1`] by
+    ///   default. You must explicitly set [`ProtocolVersion::V2`] in order to ingest
+    ///   arrays.
+    ///
+    /// **Note**: QuestDB server version 8.4.0 or later is required for [`ProtocolVersion::V2`] support.
     pub fn protocol_version(mut self, protocol_version: ProtocolVersion) -> Result<Self> {
         self.protocol_version
             .set_specified("protocol_version", Some(protocol_version))?;
@@ -2455,24 +2461,24 @@ impl SenderBuilder {
                 pub_key_y: token_y.to_string(),
             }))),
             (protocol, Some(_username), Some(_password), None, None, None)
-                if protocol.is_tcpx() => {
+            if protocol.is_tcpx() => {
                 Err(error::fmt!(ConfigError,
                     r##"The "basic_auth" setting can only be used with the ILP/HTTP protocol."##,
                 ))
             }
             (protocol, None, None, Some(_token), None, None)
-                if protocol.is_tcpx() => {
+            if protocol.is_tcpx() => {
                 Err(error::fmt!(ConfigError, "Token authentication only be used with the ILP/HTTP protocol."))
             }
             (protocol, _username, None, _token, _token_x, _token_y)
-                if protocol.is_tcpx() => {
+            if protocol.is_tcpx() => {
                 Err(error::fmt!(ConfigError,
                     r##"Incomplete ECDSA authentication parameters. Specify either all or none of: "username", "token", "token_x", "token_y"."##,
                 ))
             }
             #[cfg(feature = "ilp-over-http")]
             (protocol, Some(username), Some(password), None, None, None)
-                if protocol.is_httpx() => {
+            if protocol.is_httpx() => {
                 Ok(Some(AuthParams::Basic(BasicAuthParams {
                     username: username.to_string(),
                     password: password.to_string(),
@@ -2480,21 +2486,21 @@ impl SenderBuilder {
             }
             #[cfg(feature = "ilp-over-http")]
             (protocol, Some(_username), None, None, None, None)
-                if protocol.is_httpx() => {
+            if protocol.is_httpx() => {
                 Err(error::fmt!(ConfigError,
                     r##"Basic authentication parameter "username" is present, but "password" is missing."##,
                 ))
             }
             #[cfg(feature = "ilp-over-http")]
             (protocol, None, Some(_password), None, None, None)
-                if protocol.is_httpx() => {
+            if protocol.is_httpx() => {
                 Err(error::fmt!(ConfigError,
                     r##"Basic authentication parameter "password" is present, but "username" is missing."##,
                 ))
             }
             #[cfg(feature = "ilp-over-http")]
             (protocol, None, None, Some(token), None, None)
-                if protocol.is_httpx() => {
+            if protocol.is_httpx() => {
                 Ok(Some(AuthParams::Token(TokenAuthParams {
                     token: token.to_string(),
                 })))
@@ -2512,7 +2518,7 @@ impl SenderBuilder {
             }
             #[cfg(feature = "ilp-over-http")]
             (protocol, _username, _password, _token, None, None)
-                if protocol.is_httpx() => {
+            if protocol.is_httpx() => {
                 Err(error::fmt!(ConfigError,
                     r##"Inconsistent HTTP authentication parameters. Specify either "username" and "password", or just "token"."##,
                 ))
@@ -2629,7 +2635,7 @@ impl SenderBuilder {
                             self.port.deref()
                         );
                         let (protocol_versions, server_max_name_len) =
-                            read_server_settings(http_state, settings_url)?;
+                            read_server_settings(http_state, settings_url, max_name_len)?;
                         max_name_len = server_max_name_len;
                         if protocol_versions.contains(&ProtocolVersion::V2) {
                             ProtocolVersion::V2
@@ -2855,11 +2861,7 @@ impl Sender {
         SenderBuilder::from_env()?.build()
     }
 
-    /// Creates a new [`Buffer`] with default parameters.
-    ///
-    /// This initializes a buffer using the sender's protocol version and
-    /// the QuestDB server's default maximum name length of 127 characters.
-    /// For custom name lengths, use [`new_buffer_with_max_name_len`](Self::new_buffer_with_max_name_len)
+    /// Creates a new [`Buffer`] using the sender's protocol settings
     pub fn new_buffer(&self) -> Buffer {
         Buffer::with_max_name_len(self.protocol_version, self.max_name_len)
     }
@@ -3006,10 +3008,10 @@ impl Sender {
         !self.connected
     }
 
-    /// Return the sender's protocol version.
-    /// This is either the protocol version that was set explicitly,
-    /// or the one that was auto-detected during the connection process.
-    /// If connecting via TCP and not overridden, the value is V1.
+    /// Returns the sender's protocol version
+    ///
+    /// - Explicitly set version, or
+    /// - Auto-detected for HTTP transport, or [`ProtocolVersion::V1`] for TCP transport.
     pub fn protocol_version(&self) -> ProtocolVersion {
         self.protocol_version
     }

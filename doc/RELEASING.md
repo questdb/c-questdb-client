@@ -16,17 +16,17 @@ git switch -c vX.Y.Z
 
 ## 3. Update all the occurrences of the version in the repo
 
-```bash
-bump2version --config-file .bumpversion.cfg <increment>
+## Updating version in the codebase before releasing
+
+* Ensure you have `uv` and `bump-my-version` installed:
+  * `curl -LsSf https://astral.sh/uv/install.sh | sh` : see https://docs.astral.sh/uv/getting-started/installation/
+  * `uv tool install bump-my-version`: see https://github.com/callowayproject/bump-my-version.
+
+```console
+bump-my-version replace --new-version NEW_VERSION
 ```
 
-The `increment` parameter can be:
-
-- `patch`
-- `minor`
-- `major`
-
-Use the one appropriate to the version increment you're releasing.
+If you're unsure, append `--dry-run` to preview changes.
 
 ## 4. Refresh `Cargo.lock`
 

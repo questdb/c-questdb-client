@@ -64,7 +64,7 @@ where
 
         if bytes.len() != expect_size {
             return Err(error::fmt!(
-                ArrayWriteToBufferError,
+                ArrayError,
                 "Array write buffer length mismatch (actual: {}, expected: {})",
                 expect_size,
                 bytes.len()
@@ -73,7 +73,7 @@ where
 
         if buf.len() < bytes.len() {
             return Err(error::fmt!(
-                ArrayWriteToBufferError,
+                ArrayError,
                 "Buffer capacity {} < required {}",
                 buf.len(),
                 bytes.len()
@@ -99,7 +99,7 @@ where
     }
     if total_len != expect_size {
         return Err(error::fmt!(
-            ArrayWriteToBufferError,
+            ArrayError,
             "Array write buffer length mismatch (actual: {}, expected: {})",
             total_len,
             expect_size
@@ -119,7 +119,7 @@ where
         let dim = array.dim(dim_index)?;
         if dim > MAX_ARRAY_DIM_LEN {
             return Err(error::fmt!(
-                ArrayViewError,
+                ArrayError,
                 "dimension length out of range: dim {}, dim length {}, max length {}",
                 dim_index,
                 dim,
@@ -132,7 +132,7 @@ where
 
     if size > MAX_ARRAY_BUFFER_SIZE {
         return Err(error::fmt!(
-            ArrayViewError,
+            ArrayError,
             "Array buffer size too big: {}, maximum: {}",
             size,
             MAX_ARRAY_BUFFER_SIZE
@@ -177,7 +177,7 @@ impl<T: ArrayElement> NdArrayView<T> for Vec<T> {
             Ok(self.len())
         } else {
             Err(error::fmt!(
-                    ArrayViewError,
+                    ArrayError,
                     "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
                     idx,
                     1
@@ -210,7 +210,7 @@ impl<T: ArrayElement, const N: usize> NdArrayView<T> for [T; N] {
             Ok(N)
         } else {
             Err(error::fmt!(
-                    ArrayViewError,
+                    ArrayError,
                     "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
                     idx,
                     1
@@ -244,7 +244,7 @@ impl<T: ArrayElement> NdArrayView<T> for &[T] {
             Ok(self.len())
         } else {
             Err(error::fmt!(
-                    ArrayViewError,
+                    ArrayError,
                     "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
                     idx,
                     1
@@ -278,12 +278,12 @@ impl<T: ArrayElement> NdArrayView<T> for Vec<Vec<T>> {
             1 => {
                 let dim1 = self.first().map_or(0, |v| v.len());
                 if self.as_slice().iter().any(|v2| v2.len() != dim1) {
-                    return Err(error::fmt!(ArrayViewError, "Irregular array shape"));
+                    return Err(error::fmt!(ArrayError, "Irregular array shape"));
                 }
                 Ok(dim1)
             }
             _ => Err(error::fmt!(
-                    ArrayViewError,
+                    ArrayError,
                     "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
                     idx,
                     2
@@ -316,7 +316,7 @@ impl<T: ArrayElement, const M: usize, const N: usize> NdArrayView<T> for [[T; M]
             0 => Ok(N),
             1 => Ok(M),
             _ => Err(error::fmt!(
-                    ArrayViewError,
+                    ArrayError,
                     "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
                     idx,
                     2
@@ -350,7 +350,7 @@ impl<T: ArrayElement, const M: usize> NdArrayView<T> for &[[T; M]] {
             0 => Ok(self.len()),
             1 => Ok(M),
             _ => Err(error::fmt!(
-                    ArrayViewError,
+                    ArrayError,
                     "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
                     idx,
                     2
@@ -384,7 +384,7 @@ impl<T: ArrayElement> NdArrayView<T> for Vec<Vec<Vec<T>>> {
             1 => {
                 let dim1 = self.first().map_or(0, |v| v.len());
                 if self.as_slice().iter().any(|v2| v2.len() != dim1) {
-                    return Err(error::fmt!(ArrayViewError, "Irregular array shape"));
+                    return Err(error::fmt!(ArrayError, "Irregular array shape"));
                 }
                 Ok(dim1)
             }
@@ -400,12 +400,12 @@ impl<T: ArrayElement> NdArrayView<T> for Vec<Vec<Vec<T>>> {
                     .flat_map(|v2| v2.as_slice().iter())
                     .any(|v3| v3.len() != dim2)
                 {
-                    return Err(error::fmt!(ArrayViewError, "Irregular array shape"));
+                    return Err(error::fmt!(ArrayError, "Irregular array shape"));
                 }
                 Ok(dim2)
             }
             _ => Err(error::fmt!(
-                    ArrayViewError,
+                    ArrayError,
                     "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
                     idx,
                     3
@@ -441,7 +441,7 @@ impl<T: ArrayElement, const M: usize, const N: usize, const L: usize> NdArrayVie
             1 => Ok(N),
             2 => Ok(M),
             _ => Err(error::fmt!(
-                    ArrayViewError,
+                    ArrayError,
                     "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
                     idx,
                     3
@@ -475,7 +475,7 @@ impl<T: ArrayElement, const M: usize, const N: usize> NdArrayView<T> for &[[[T; 
             1 => Ok(N),
             2 => Ok(M),
             _ => Err(error::fmt!(
-                    ArrayViewError,
+                    ArrayError,
                     "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
                     idx,
                     3
@@ -521,7 +521,7 @@ where
             Ok(self.len_of(Axis(index)))
         } else {
             Err(error::fmt!(
-                    ArrayViewError,
+                    ArrayError,
                     "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
                     index,
                     3

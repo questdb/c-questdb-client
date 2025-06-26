@@ -23,7 +23,6 @@
  ******************************************************************************/
 
 use super::conf::ConfigSetting;
-use super::MAX_NAME_LEN_DEFAULT;
 use crate::error::fmt;
 use crate::{error, Error};
 use base64ct::Base64;
@@ -441,6 +440,7 @@ pub(super) fn http_send_with_retries(
 pub(super) fn read_server_settings(
     state: &HttpHandlerState,
     settings_url: &str,
+    default_max_name_len: usize,
 ) -> Result<(Vec<ProtocolVersion>, usize), Error> {
     let default_protocol_version = ProtocolVersion::V1;
 
@@ -455,7 +455,7 @@ pub(super) fn read_server_settings(
                 let status = res.status();
                 _ = res.into_body().read_to_vec();
                 if status.as_u16() == 404 {
-                    return Ok((vec![default_protocol_version], MAX_NAME_LEN_DEFAULT));
+                    return Ok((vec![default_protocol_version], default_max_name_len));
                 }
                 return Err(fmt!(
                     ProtocolVersionError,
@@ -471,7 +471,7 @@ pub(super) fn read_server_settings(
             let e = match err {
                 ureq::Error::StatusCode(code) => {
                     if code == 404 {
-                        return Ok((vec![default_protocol_version], MAX_NAME_LEN_DEFAULT));
+                        return Ok((vec![default_protocol_version], default_max_name_len));
                     } else {
                         fmt!(
                             ProtocolVersionError,
@@ -528,7 +528,7 @@ pub(super) fn read_server_settings(
             .get("config")
             .and_then(|v| v.get("cairo.max.file.name.length"))
             .and_then(|v| v.as_u64())
-            .unwrap_or(MAX_NAME_LEN_DEFAULT as u64) as usize;
+            .unwrap_or(default_max_name_len as u64) as usize;
         Ok((support_versions, max_name_length))
     } else {
         Err(error::fmt!(

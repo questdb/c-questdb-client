@@ -22,6 +22,7 @@
  *
  ******************************************************************************/
 
+use crate::fmt_error;
 use questdb::ingress::ArrayElement;
 use questdb::ingress::NdArrayView;
 use questdb::ingress::MAX_ARRAY_BUFFER_SIZE;
@@ -29,52 +30,36 @@ use questdb::Error;
 use std::mem::size_of;
 use std::slice;
 
-macro_rules! fmt_error {
-    ($code:ident, $($arg:tt)*) => {
-        questdb::Error::new(
-            questdb::ErrorCode::$code,
-            format!($($arg)*))
-    }
-}
-
 /// A view into a multidimensional array with custom memory strides.
-// TODO: We are currently evaluating whether to use StrideArrayView or ndarray's view.
-//       Current benchmarks show that StrideArrayView's iter implementation underperforms(2x)
-//       compared to ndarray's.
-//       We should optimise this implementation to be competitive.
-//       Unfortunately, the `ndarray` crate does not support negative strides
-//       which we need to support in this FFI crate for efficient iteration of
-//       numpy arrays coming from Python without copying the data.
 #[derive(Debug)]
-pub struct StrideArrayView<'a, T, const N: isize> {
-    dims: usize,
+pub struct StrideArrayView<'a, T, const N: isize, const D: usize> {
     shape: &'a [usize],
     strides: &'a [isize],
-    data: Option<&'a [u8]>,
+    data: Option<&'a [T]>,
     _marker: std::marker::PhantomData<T>,
 }
 
-impl<T, const N: isize> NdArrayView<T> for StrideArrayView<'_, T, N>
+impl<T, const N: isize, const D: usize> NdArrayView<T> for StrideArrayView<'_, T, N, D>
 where
     T: ArrayElement,
 {
     type Iter<'b>
-        = RowMajorIter<'b, T, N>
+        = RowMajorIter<'b, T, N, D>
     where
         Self: 'b,
         T: 'b;
 
     fn ndim(&self) -> usize {
-        self.dims
+        D
     }
 
     fn dim(&self, index: usize) -> Result<usize, Error> {
-        if index >= self.dims {
+        if index >= D {
             return Err(fmt_error!(
-                ArrayViewError,
+                ArrayError,
                 "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
                 index,
-                self.dims
+                D
             ));
         }
         Ok(self.shape[index])
@@ -82,51 +67,30 @@ where
 
     fn as_slice(&self) -> Option<&[T]> {
         unsafe {
-            self.is_c_major().then_some(self.data.map(|data| {
-                slice::from_raw_parts(data.as_ptr() as *const T, data.len() / size_of::<T>())
-            })?)
+            self.is_c_major().then_some(
+                self.data
+                    .map(|data| slice::from_raw_parts(data.as_ptr(), data.len()))?,
+            )
         }
     }
 
     fn iter(&self) -> Self::Iter<'_> {
-        let mut dim_products = Vec::with_capacity(self.dims);
-        let mut product = 1;
-        for &dim in self.shape.iter().rev() {
-            dim_products.push(product);
-            product *= dim;
-        }
-        dim_products.reverse();
-
         // consider minus strides
         let base_ptr = match self.data {
             None => std::ptr::null(),
-            Some(data) => {
-                self.strides
-                    .iter()
-                    .enumerate()
-                    .fold(data.as_ptr(), |ptr, (dim, &stride)| {
-                        let stride_bytes_size = stride * N;
-                        if stride_bytes_size < 0 {
-                            let dim_size = self.shape[dim] as isize;
-                            unsafe { ptr.offset(stride_bytes_size * (dim_size - 1)) }
-                        } else {
-                            ptr
-                        }
-                    })
-            }
+            Some(data) => data.as_ptr() as *const u8,
         };
-
         RowMajorIter {
             base_ptr,
             array: self,
-            dim_products,
+            index: vec![0; D],
             current_linear: 0,
             total_elements: self.shape.iter().product(),
         }
     }
 }
 
-impl<T, const N: isize> StrideArrayView<'_, T, N>
+impl<T, const N: isize, const D: usize> StrideArrayView<'_, T, N, D>
 where
     T: ArrayElement,
 {
@@ -138,54 +102,23 @@ where
     /// - `strides` points to a valid array of at least `dims` elements
     /// - `data` points to a valid memory block of at least `data_len` bytes
     /// - Memory layout must satisfy:
-    ///   1. `data_len ≥ (shape[0]-1)*abs(strides[0]) + ... + (shape[n-1]-1)*abs(strides[n-1]) + size_of::<T>()`
-    ///   2. All calculated offsets stay within `[0, data_len - size_of::<T>()]`
+    ///   1. `len == (shape[0]-1)*abs(strides[0]) + ... + (shape[n-1]-1)*abs(strides[n-1])`
+    ///   2. All calculated offsets stay within `[0, data_len * size_of::<T>()  - size_of::<T>()]`
     /// - Lifetime `'a` must outlive the view's usage
     /// - Strides are measured in bytes (not elements)
     pub unsafe fn new(
-        dims: usize,
         shape: *const usize,
         strides: *const isize,
-        data: *const u8,
-        data_len: usize,
+        data: *const T,
+        len: usize,
     ) -> Result<Self, Error> {
-        if dims == 0 {
-            return Err(fmt_error!(
-                ArrayViewError,
-                "Zero-dimensional arrays are not supported",
-            ));
-        }
-        if data_len > MAX_ARRAY_BUFFER_SIZE {
-            return Err(fmt_error!(
-                ArrayViewError,
-                "Array buffer size too big: {}, maximum: {}",
-                data_len,
-                MAX_ARRAY_BUFFER_SIZE
-            ));
-        }
-        let shape = slice::from_raw_parts(shape, dims);
-        let size = shape
-            .iter()
-            .try_fold(std::mem::size_of::<T>(), |acc, &dim| {
-                acc.checked_mul(dim)
-                    .ok_or_else(|| fmt_error!(ArrayViewError, "Array buffer size too big"))
-            })?;
-
-        if size != data_len {
-            return Err(fmt_error!(
-                ArrayViewError,
-                "Array buffer length mismatch (actual: {}, expected: {})",
-                data_len,
-                size
-            ));
-        }
-        let strides = slice::from_raw_parts(strides, dims);
+        let shape = check_array_shape::<T>(D, shape, len)?;
+        let strides = slice::from_raw_parts(strides, D);
         let mut slice = None;
-        if data_len != 0 {
-            slice = Some(slice::from_raw_parts(data, data_len));
+        if len != 0 {
+            slice = Some(slice::from_raw_parts(data, len));
         }
         Ok(Self {
-            dims,
             shape,
             strides,
             data: slice,
@@ -203,7 +136,7 @@ where
                 }
 
                 let elem_size = size_of::<T>() as isize;
-                if self.dims == 1 {
+                if D == 1 {
                     return self.strides[0] * N == elem_size || self.shape[0] == 1;
                 }
 
@@ -221,44 +154,233 @@ where
 }
 
 /// Iterator for traversing a stride array in row-major (C-style) order.
-pub struct RowMajorIter<'a, T, const N: isize> {
+pub struct RowMajorIter<'a, T, const N: isize, const D: usize> {
     base_ptr: *const u8,
-    array: &'a StrideArrayView<'a, T, N>,
-    dim_products: Vec<usize>,
+    array: &'a StrideArrayView<'a, T, N, D>,
+    index: Vec<usize>,
     current_linear: usize,
     total_elements: usize,
 }
 
-impl<'a, T, const N: isize> Iterator for RowMajorIter<'a, T, N>
+impl<'a, T, const N: isize, const D: usize> Iterator for RowMajorIter<'a, T, N, D>
 where
     T: ArrayElement,
 {
     type Item = &'a T;
+
+    #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         if self.current_linear >= self.total_elements {
             return None;
         }
-        let mut remaining_index = self.current_linear;
-        let mut offset = 0;
+        let offset = unsafe {
+            match D {
+                1 => {
+                    let stride = *self.array.strides.get_unchecked(0) * N;
+                    stride * self.current_linear as isize
+                }
+                2 => {
+                    let stride1 = self.array.strides.get_unchecked(0) * N;
+                    let stride2 = self.array.strides.get_unchecked(1) * N;
+                    let index1 = *self.index.get_unchecked(0);
+                    let index2 = *self.index.get_unchecked(1);
+                    if index2 != self.array.shape.get_unchecked(1) - 1 {
+                        self.index[1] = index2 + 1;
+                    } else {
+                        self.index[1] = 0;
+                        self.index[0] = index1 + 1;
+                    }
+                    index1 as isize * stride1 + index2 as isize * stride2
+                }
+                3 => {
+                    let stride1 = self.array.strides.get_unchecked(0) * N;
+                    let stride2 = self.array.strides.get_unchecked(1) * N;
+                    let stride3 = self.array.strides.get_unchecked(2) * N;
+                    let index1 = *self.index.get_unchecked(0);
+                    let index2 = *self.index.get_unchecked(1);
+                    let index3 = *self.index.get_unchecked(2);
 
-        for (dim, &dim_factor) in self.dim_products.iter().enumerate() {
-            let coord = remaining_index / dim_factor;
-            remaining_index %= dim_factor;
-            let stride = self.array.strides[dim] * N;
-            let actual_coord = if stride >= 0 {
-                coord
-            } else {
-                self.array.shape[dim] - 1 - coord
-            };
-            offset += actual_coord * stride.unsigned_abs();
+                    index1 as isize * stride1
+                        + index2 as isize * stride2
+                        + index3 as isize * stride3
+                }
+                other => {
+                    let mut offset = 0;
+                    for dim in 0..other {
+                        offset += *self.array.strides.get_unchecked(dim)
+                            * N
+                            * *self.index.get_unchecked(dim) as isize
+                    }
+                    offset
+                }
+            }
+        };
+
+        if D > 2 {
+            for (&dim, ix) in self.array.shape.iter().zip(self.index.iter_mut()).rev() {
+                *ix += 1;
+                if *ix == dim {
+                    *ix = 0;
+                } else {
+                    break;
+                }
+            }
         }
 
         self.current_linear += 1;
-        unsafe {
-            let ptr = self.base_ptr.add(offset);
-            Some(&*(ptr as *const T))
+        unsafe { Some(&*(self.base_ptr.offset(offset) as *const T)) }
+    }
+}
+
+#[derive(Debug)]
+pub struct CMajorArrayView<'a, T> {
+    dims: usize,
+    shape: &'a [usize],
+    data: Option<&'a [T]>,
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<T> NdArrayView<T> for CMajorArrayView<'_, T>
+where
+    T: ArrayElement,
+{
+    type Iter<'b>
+        = CMajorArrayViewIterator<'b, T>
+    where
+        Self: 'b,
+        T: 'b;
+
+    fn ndim(&self) -> usize {
+        self.dims
+    }
+
+    fn dim(&self, index: usize) -> Result<usize, Error> {
+        if index >= self.dims {
+            return Err(fmt_error!(
+                ArrayError,
+                "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
+                index,
+                self.dims
+            ));
+        }
+        Ok(self.shape[index])
+    }
+
+    fn as_slice(&self) -> Option<&[T]> {
+        self.data
+            .map(|d| unsafe { slice::from_raw_parts(d.as_ptr(), d.len()) })
+    }
+
+    fn iter(&self) -> Self::Iter<'_> {
+        let elem_size = self.shape.iter().product();
+        let count = 0;
+        let data_ptr = match self.data {
+            Some(data) => data.as_ptr(),
+            None => std::ptr::null_mut(),
+        };
+        CMajorArrayViewIterator {
+            elem_size,
+            count,
+            data_ptr,
+            _marker: Default::default(),
         }
     }
+}
+
+pub struct CMajorArrayViewIterator<'a, T> {
+    elem_size: usize,
+    count: usize,
+    data_ptr: *const T,
+    _marker: std::marker::PhantomData<&'a T>,
+}
+
+impl<'a, T> Iterator for CMajorArrayViewIterator<'a, T>
+where
+    T: ArrayElement,
+{
+    type Item = &'a T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.data_ptr.is_null() || self.count >= self.elem_size {
+            None
+        } else {
+            unsafe {
+                let ptr = self.data_ptr.add(self.count);
+                self.count += 1;
+                Some(&*(ptr))
+            }
+        }
+    }
+}
+
+impl<T> CMajorArrayView<'_, T>
+where
+    T: ArrayElement,
+{
+    /// Creates a new C-Major memory layout array view from raw components (unsafe constructor).
+    ///
+    /// # Safety
+    /// Caller must ensure all the following conditions:
+    /// - `shape` points to a valid array of at least `dims` elements
+    /// - `data` points to a valid memory block of at least `data_len` elements
+    pub unsafe fn new(
+        dims: usize,
+        shape: *const usize,
+        data: *const T,
+        data_len: usize,
+    ) -> Result<Self, Error> {
+        let shape = check_array_shape::<T>(dims, shape, data_len)?;
+        let mut slice = None;
+        if data_len != 0 {
+            slice = Some(slice::from_raw_parts(data, data_len));
+        }
+        Ok(Self {
+            dims,
+            shape,
+            data: slice,
+            _marker: std::marker::PhantomData::<T>,
+        })
+    }
+}
+
+fn check_array_shape<T>(
+    dims: usize,
+    shape: *const usize,
+    data_len: usize,
+) -> Result<&'static [usize], Error> {
+    if dims == 0 {
+        return Err(fmt_error!(
+            ArrayError,
+            "Zero-dimensional arrays are not supported",
+        ));
+    }
+    if data_len > MAX_ARRAY_BUFFER_SIZE {
+        return Err(fmt_error!(
+            ArrayError,
+            "Array buffer size too big: {}, maximum: {}",
+            data_len,
+            MAX_ARRAY_BUFFER_SIZE
+        ));
+    }
+    let shape = unsafe { slice::from_raw_parts(shape, dims) };
+
+    let size = shape
+        .iter()
+        .try_fold(std::mem::size_of::<T>(), |acc, &dim| {
+            acc.checked_mul(dim)
+                .ok_or_else(|| fmt_error!(ArrayError, "Array buffer size too big"))
+        })?
+        / std::mem::size_of::<T>();
+
+    if size != data_len {
+        return Err(fmt_error!(
+            ArrayError,
+            "Array element length mismatch (actual: {}, expected: {})",
+            data_len,
+            size
+        ));
+    }
+    Ok(shape)
 }
 
 #[cfg(test)]
@@ -299,7 +421,7 @@ mod tests {
 
             if bytes.len() != expect_size {
                 return Err(fmt_error!(
-                    ArrayWriteToBufferError,
+                    ArrayError,
                     "Array write buffer length mismatch (actual: {}, expected: {})",
                     expect_size,
                     bytes.len()
@@ -308,7 +430,7 @@ mod tests {
 
             if buf.len() < bytes.len() {
                 return Err(fmt_error!(
-                    ArrayWriteToBufferError,
+                    ArrayError,
                     "Buffer capacity {} < required {}",
                     buf.len(),
                     bytes.len()
@@ -334,7 +456,7 @@ mod tests {
         }
         if total_len != expect_size {
             return Err(fmt_error!(
-                ArrayWriteToBufferError,
+                ArrayError,
                 "Array write buffer length mismatch (actual: {}, expected: {})",
                 total_len,
                 expect_size
@@ -348,13 +470,12 @@ mod tests {
         let elem_size = std::mem::size_of::<f64>() as isize;
 
         let test_data = [1.1, 2.2, 3.3, 4.4];
-        let array_view: StrideArrayView<'_, f64, 1> = unsafe {
+        let array_view: StrideArrayView<'_, f64, 1, 2> = unsafe {
             StrideArrayView::new(
-                2,
                 [2, 2].as_ptr(),
                 [2 * elem_size, elem_size].as_ptr(),
-                test_data.as_ptr() as *const u8,
-                test_data.len() * elem_size as usize,
+                test_data.as_ptr(),
+                test_data.len(),
             )
         }?;
         let mut buffer = Buffer::new(ProtocolVersion::V2);
@@ -390,16 +511,13 @@ mod tests {
 
     #[test]
     fn test_buffer_basic_write_with_elem_strides() -> TestResult {
-        let elem_size = std::mem::size_of::<f64>() as isize;
-
         let test_data = [1.1, 2.2, 3.3, 4.4];
-        let array_view: StrideArrayView<'_, f64, 8> = unsafe {
+        let array_view: StrideArrayView<'_, f64, 8, 2> = unsafe {
             StrideArrayView::new(
-                2,
                 [2, 2].as_ptr(),
                 [2, 1].as_ptr(),
-                test_data.as_ptr() as *const u8,
-                test_data.len() * elem_size as usize,
+                test_data.as_ptr(),
+                test_data.len(),
             )
         }?;
         let mut buffer = Buffer::new(ProtocolVersion::V2);
@@ -436,8 +554,7 @@ mod tests {
     #[test]
     fn test_stride_array_size_overflow() -> TestResult {
         let result = unsafe {
-            StrideArrayView::<f64, 1>::new(
-                2,
+            StrideArrayView::<f64, 1, 2>::new(
                 [u32::MAX as usize, u32::MAX as usize].as_ptr(),
                 [8, 8].as_ptr(),
                 ptr::null(),
@@ -445,7 +562,7 @@ mod tests {
             )
         };
         let err = result.unwrap_err();
-        assert_eq!(err.code(), ErrorCode::ArrayViewError);
+        assert_eq!(err.code(), ErrorCode::ArrayError);
         assert!(err.msg().contains("Array buffer size too big"));
         Ok(())
     }
@@ -454,37 +571,35 @@ mod tests {
     fn test_stride_view_length_mismatch() -> TestResult {
         let elem_size = size_of::<f64>() as isize;
         let under_data = [1.1];
-        let result: Result<StrideArrayView<'_, f64, 1>, Error> = unsafe {
+        let result: Result<StrideArrayView<'_, f64, 1, 2>, Error> = unsafe {
             StrideArrayView::new(
-                2,
                 [1, 2].as_ptr(),
                 [elem_size, elem_size].as_ptr(),
-                under_data.as_ptr() as *const u8,
-                under_data.len() * elem_size as usize,
+                under_data.as_ptr(),
+                under_data.len(),
             )
         };
         let err = result.unwrap_err();
-        assert_eq!(err.code(), ErrorCode::ArrayViewError);
+        assert_eq!(err.code(), ErrorCode::ArrayError);
         assert!(err
             .msg()
-            .contains("Array buffer length mismatch (actual: 8, expected: 16)"));
+            .contains("Array element length mismatch (actual: 1, expected: 2)"));
 
         let over_data = [1.1, 2.2, 3.3];
-        let result: Result<StrideArrayView<'_, f64, 1>, Error> = unsafe {
+        let result: Result<StrideArrayView<'_, f64, 1, 2>, Error> = unsafe {
             StrideArrayView::new(
-                2,
                 [1, 2].as_ptr(),
                 [elem_size, elem_size].as_ptr(),
-                over_data.as_ptr() as *const u8,
-                over_data.len() * elem_size as usize,
+                over_data.as_ptr(),
+                over_data.len(),
             )
         };
 
         let err = result.unwrap_err();
-        assert_eq!(err.code(), ErrorCode::ArrayViewError);
+        assert_eq!(err.code(), ErrorCode::ArrayError);
         assert!(err
             .msg()
-            .contains("Array buffer length mismatch (actual: 24, expected: 16)"));
+            .contains("Array element length mismatch (actual: 3, expected: 2)"));
         Ok(())
     }
 
@@ -492,37 +607,35 @@ mod tests {
     fn test_stride_view_length_mismatch_with_elem_strides() -> TestResult {
         let elem_size = size_of::<f64>() as isize;
         let under_data = [1.1];
-        let result: Result<StrideArrayView<'_, f64, 8>, Error> = unsafe {
+        let result: Result<StrideArrayView<'_, f64, 8, 2>, Error> = unsafe {
             StrideArrayView::new(
-                2,
                 [1, 2].as_ptr(),
                 [1, 1].as_ptr(),
-                under_data.as_ptr() as *const u8,
-                under_data.len() * elem_size as usize,
+                under_data.as_ptr(),
+                under_data.len(),
             )
         };
         let err = result.unwrap_err();
-        assert_eq!(err.code(), ErrorCode::ArrayViewError);
+        assert_eq!(err.code(), ErrorCode::ArrayError);
         assert!(err
             .msg()
-            .contains("Array buffer length mismatch (actual: 8, expected: 16)"));
+            .contains("Array element length mismatch (actual: 1, expected: 2)"));
 
         let over_data = [1.1, 2.2, 3.3];
-        let result: Result<StrideArrayView<'_, f64, 1>, Error> = unsafe {
+        let result: Result<StrideArrayView<'_, f64, 1, 2>, Error> = unsafe {
             StrideArrayView::new(
-                2,
                 [1, 2].as_ptr(),
                 [elem_size, elem_size].as_ptr(),
-                over_data.as_ptr() as *const u8,
-                over_data.len() * elem_size as usize,
+                over_data.as_ptr(),
+                over_data.len(),
             )
         };
 
         let err = result.unwrap_err();
-        assert_eq!(err.code(), ErrorCode::ArrayViewError);
+        assert_eq!(err.code(), ErrorCode::ArrayError);
         assert!(err
             .msg()
-            .contains("Array buffer length mismatch (actual: 24, expected: 16)"));
+            .contains("Array element length mismatch (actual: 3, expected: 2)"));
         Ok(())
     }
 
@@ -533,13 +646,12 @@ mod tests {
         let shape = [3usize, 2];
         let strides = [elem_size, shape[0] as isize * elem_size];
 
-        let array_view: StrideArrayView<'_, f64, 1> = unsafe {
+        let array_view: StrideArrayView<'_, f64, 1, 2> = unsafe {
             StrideArrayView::new(
-                shape.len(),
                 shape.as_ptr(),
                 strides.as_ptr(),
-                col_major_data.as_ptr() as *const u8,
-                col_major_data.len() * elem_size as usize,
+                col_major_data.as_ptr(),
+                col_major_data.len(),
             )
         }?;
 
@@ -570,13 +682,12 @@ mod tests {
         let shape = [3usize, 2];
         let strides = [1, shape[0] as isize];
 
-        let array_view: StrideArrayView<'_, f64, 8> = unsafe {
+        let array_view: StrideArrayView<'_, f64, 8, 2> = unsafe {
             StrideArrayView::new(
-                shape.len(),
                 shape.as_ptr(),
                 strides.as_ptr(),
-                col_major_data.as_ptr() as *const u8,
-                col_major_data.len() * elem_size as usize,
+                col_major_data.as_ptr(),
+                col_major_data.len(),
             )
         }?;
 
@@ -605,12 +716,11 @@ mod tests {
         let elem_size = size_of::<f64>();
         let data = [1f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
         let view = unsafe {
-            StrideArrayView::<f64, 1>::new(
-                2,
+            StrideArrayView::<f64, 1, 2>::new(
                 &[3usize, 3] as *const usize,
                 &[-24isize, 8] as *const isize,
-                (data.as_ptr() as *const u8).add(48),
-                data.len() * elem_size,
+                data.as_ptr().add(6),
+                data.len(),
             )
         }?;
         let collected: Vec<_> = view.iter().copied().collect();
@@ -634,12 +744,11 @@ mod tests {
         let elem_size = size_of::<f64>();
         let data = [1f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
         let view = unsafe {
-            StrideArrayView::<f64, 8>::new(
-                2,
+            StrideArrayView::<f64, 8, 2>::new(
                 &[3usize, 3] as *const usize,
                 &[-3isize, 1] as *const isize,
-                (data.as_ptr() as *const u8).add(48),
-                data.len() * elem_size,
+                data.as_ptr().add(6),
+                data.len(),
             )
         }?;
         let collected: Vec<_> = view.iter().copied().collect();
@@ -662,22 +771,16 @@ mod tests {
     fn test_basic_edge_cases() -> TestResult {
         // empty array
         let elem_size = std::mem::size_of::<f64>() as isize;
-        let empty_view: StrideArrayView<'_, f64, 1> =
-            unsafe { StrideArrayView::new(2, [0, 0].as_ptr(), [0, 0].as_ptr(), ptr::null(), 0)? };
+        let empty_view: StrideArrayView<'_, f64, 1, 2> =
+            unsafe { StrideArrayView::new([0, 0].as_ptr(), [0, 0].as_ptr(), ptr::null(), 0)? };
         assert_eq!(empty_view.ndim(), 2);
         assert_eq!(empty_view.dim(0), Ok(0));
         assert_eq!(empty_view.dim(1), Ok(0));
 
         // single element array
         let single_data = [42.0];
-        let single_view: StrideArrayView<'_, f64, 1> = unsafe {
-            StrideArrayView::new(
-                1,
-                [1].as_ptr(),
-                [elem_size].as_ptr(),
-                single_data.as_ptr() as *const u8,
-                elem_size as usize,
-            )
+        let single_view: StrideArrayView<'_, f64, 1, 1> = unsafe {
+            StrideArrayView::new([1].as_ptr(), [elem_size].as_ptr(), single_data.as_ptr(), 1)
         }?;
         let mut buf = vec![0u8; 8];
         write_array_data(&single_view, &mut buf, 8).unwrap();
@@ -695,12 +798,11 @@ mod tests {
             size_of::<f64>() as isize,
         ];
         let array = unsafe {
-            StrideArrayView::<f64, 1>::new(
-                shape.len(),
+            StrideArrayView::<f64, 1, 2>::new(
                 shape.as_ptr(),
                 strides.as_ptr(),
-                test_data.as_ptr() as *const u8,
-                test_data.len() * size_of::<f64>(),
+                test_data.as_ptr(),
+                test_data.len(),
             )
         }?;
 
@@ -723,12 +825,11 @@ mod tests {
         let shape = [2usize, 3];
         let strides = [shape[1] as isize, 1];
         let array = unsafe {
-            StrideArrayView::<f64, { std::mem::size_of::<f64>() as isize }>::new(
-                shape.len(),
+            StrideArrayView::<f64, { std::mem::size_of::<f64>() as isize }, 2>::new(
                 shape.as_ptr(),
                 strides.as_ptr(),
-                test_data.as_ptr() as *const u8,
-                test_data.len() * size_of::<f64>(),
+                test_data.as_ptr(),
+                test_data.len(),
             )
         }?;
 
@@ -752,12 +853,11 @@ mod tests {
         let shape = [2usize, 2];
         let strides = [-8, -2];
         let array = unsafe {
-            StrideArrayView::<f64, { std::mem::size_of::<f64>() as isize }>::new(
-                shape.len(),
+            StrideArrayView::<f64, { std::mem::size_of::<f64>() as isize }, 2>::new(
                 shape.as_ptr(),
                 strides.as_ptr(),
-                test_data.as_ptr().add(11) as *const u8,
-                4 * size_of::<f64>(),
+                test_data.as_ptr().add(11),
+                4,
             )
         }?;
 
@@ -766,6 +866,353 @@ mod tests {
         write_array_data(&array, &mut buf, 32).unwrap();
         let expected = to_bytes(&test_data1);
         assert_eq!(buf, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn test_c_major_array_basic() -> TestResult {
+        let test_data = [1.1, 2.2, 3.3, 4.4];
+        let array_view: CMajorArrayView<'_, f64> = unsafe {
+            CMajorArrayView::new(2, [2, 2].as_ptr(), test_data.as_ptr(), test_data.len())
+        }?;
+        let mut buffer = Buffer::new(ProtocolVersion::V2);
+        buffer.table("my_test")?;
+        buffer.column_arr("temperature", &array_view)?;
+        let data = buffer.as_bytes();
+        assert_eq!(&data[0..7], b"my_test");
+        assert_eq!(&data[8..19], b"temperature");
+        assert_eq!(
+            &data[19..24],
+            &[
+                b'=', b'=', 14u8, // ARRAY_BINARY_FORMAT_TYPE
+                10u8, // ArrayColumnTypeTag::Double.into()
+                2u8
+            ]
+        );
+        assert_eq!(
+            &data[24..32],
+            [2i32.to_le_bytes(), 2i32.to_le_bytes()].concat()
+        );
+        assert_eq!(
+            &data[32..64],
+            &[
+                1.1f64.to_ne_bytes(),
+                2.2f64.to_le_bytes(),
+                3.3f64.to_le_bytes(),
+                4.4f64.to_le_bytes(),
+            ]
+            .concat()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_c_major_empty_array() -> TestResult {
+        let test_data = [];
+        let array_view: CMajorArrayView<'_, f64> = unsafe {
+            CMajorArrayView::new(
+                2,
+                [2, 0].as_ptr(),
+                test_data.as_ptr(),
+                test_data.len() * 8usize,
+            )
+        }?;
+        let mut buffer = Buffer::new(ProtocolVersion::V2);
+        buffer.table("my_test")?;
+        buffer.column_arr("temperature", &array_view)?;
+        let data = buffer.as_bytes();
+        assert_eq!(&data[0..7], b"my_test");
+        assert_eq!(&data[8..19], b"temperature");
+        assert_eq!(
+            &data[19..24],
+            &[
+                b'=', b'=', 14u8, // ARRAY_BINARY_FORMAT_TYPE
+                10u8, // ArrayColumnTypeTag::Double.into()
+                2u8
+            ]
+        );
+        assert_eq!(
+            &data[24..32],
+            [2i32.to_le_bytes(), 0i32.to_le_bytes()].concat()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_stride_non_contiguous_3d() -> TestResult {
+        let elem_size = size_of::<f64>() as isize;
+        let col_major_data = [
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ];
+        let shape = [2, 3, 2];
+        let strides = [
+            elem_size,
+            shape[0] as isize * elem_size,
+            shape[0] as isize * shape[1] as isize * elem_size,
+        ];
+        let array_view: StrideArrayView<'_, f64, 1, 3> = unsafe {
+            StrideArrayView::new(
+                shape.as_ptr(),
+                strides.as_ptr(),
+                col_major_data.as_ptr(),
+                col_major_data.len(),
+            )
+        }?;
+        assert_eq!(array_view.ndim(), 3);
+        assert_eq!(array_view.dim(0), Ok(2));
+        assert_eq!(array_view.dim(1), Ok(3));
+        assert_eq!(array_view.dim(2), Ok(2));
+        assert!(array_view.dim(3).is_err());
+        assert!(array_view.as_slice().is_none());
+
+        let mut buffer = Buffer::new(ProtocolVersion::V2);
+        buffer.table("my_test")?;
+        buffer.column_arr("temperature", &array_view)?;
+        let data = buffer.as_bytes();
+        assert_eq!(&data[0..7], b"my_test");
+        assert_eq!(&data[8..19], b"temperature");
+        assert_eq!(
+            &data[19..24],
+            &[
+                b'=', b'=', 14u8, // ARRAY_BINARY_FORMAT_TYPE
+                10u8, // ArrayColumnTypeTag::Double.into()
+                3u8
+            ]
+        );
+        assert_eq!(
+            &data[24..36],
+            [2i32.to_le_bytes(), 3i32.to_le_bytes(), 2i32.to_le_bytes()].concat()
+        );
+        assert_eq!(
+            &data[36..132],
+            &[
+                1.0f64.to_ne_bytes(),
+                7.0f64.to_le_bytes(),
+                3.0f64.to_le_bytes(),
+                9.0f64.to_le_bytes(),
+                5.0f64.to_ne_bytes(),
+                11.0f64.to_le_bytes(),
+                2.0f64.to_le_bytes(),
+                8.0f64.to_le_bytes(),
+                4.0f64.to_ne_bytes(),
+                10.0f64.to_le_bytes(),
+                6.0f64.to_le_bytes(),
+                12.0f64.to_le_bytes(),
+            ]
+            .concat()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_stride_non_contiguous_elem_stride_3d() -> TestResult {
+        let col_major_data = [
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ];
+        let shape = [2, 3, 2];
+        let strides = [1, shape[0] as isize, shape[0] as isize * shape[1] as isize];
+        let array_view: StrideArrayView<'_, f64, 8, 3> = unsafe {
+            StrideArrayView::new(
+                shape.as_ptr(),
+                strides.as_ptr(),
+                col_major_data.as_ptr(),
+                col_major_data.len(),
+            )
+        }?;
+        assert_eq!(array_view.ndim(), 3);
+        assert_eq!(array_view.dim(0), Ok(2));
+        assert_eq!(array_view.dim(1), Ok(3));
+        assert_eq!(array_view.dim(2), Ok(2));
+        assert!(array_view.dim(3).is_err());
+        assert!(array_view.as_slice().is_none());
+
+        let mut buffer = Buffer::new(ProtocolVersion::V2);
+        buffer.table("my_test")?;
+        buffer.column_arr("temperature", &array_view)?;
+        let data = buffer.as_bytes();
+        assert_eq!(&data[0..7], b"my_test");
+        assert_eq!(&data[8..19], b"temperature");
+        assert_eq!(
+            &data[19..24],
+            &[
+                b'=', b'=', 14u8, // ARRAY_BINARY_FORMAT_TYPE
+                10u8, // ArrayColumnTypeTag::Double.into()
+                3u8
+            ]
+        );
+        assert_eq!(
+            &data[24..36],
+            [2i32.to_le_bytes(), 3i32.to_le_bytes(), 2i32.to_le_bytes()].concat()
+        );
+        assert_eq!(
+            &data[36..132],
+            &[
+                1.0f64.to_ne_bytes(),
+                7.0f64.to_le_bytes(),
+                3.0f64.to_le_bytes(),
+                9.0f64.to_le_bytes(),
+                5.0f64.to_ne_bytes(),
+                11.0f64.to_le_bytes(),
+                2.0f64.to_le_bytes(),
+                8.0f64.to_le_bytes(),
+                4.0f64.to_ne_bytes(),
+                10.0f64.to_le_bytes(),
+                6.0f64.to_le_bytes(),
+                12.0f64.to_le_bytes(),
+            ]
+            .concat()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_stride_non_contiguous_4d() -> TestResult {
+        let elem_size = size_of::<f64>() as isize;
+        let col_major_data = [
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ];
+        let shape = [2, 2, 1, 3];
+        let strides = [
+            elem_size,
+            shape[0] as isize * elem_size,
+            shape[0] as isize * shape[1] as isize * elem_size,
+            shape[0] as isize * shape[1] as isize * shape[2] as isize * elem_size,
+        ];
+
+        let array_view: StrideArrayView<'_, f64, 1, 4> = unsafe {
+            StrideArrayView::new(
+                shape.as_ptr(),
+                strides.as_ptr(),
+                col_major_data.as_ptr(),
+                col_major_data.len(),
+            )
+        }?;
+
+        assert_eq!(array_view.ndim(), 4);
+        assert_eq!(array_view.dim(0), Ok(2));
+        assert_eq!(array_view.dim(1), Ok(2));
+        assert_eq!(array_view.dim(2), Ok(1));
+        assert_eq!(array_view.dim(3), Ok(3));
+        assert!(array_view.dim(4).is_err());
+        assert!(array_view.as_slice().is_none());
+
+        let mut buffer = Buffer::new(ProtocolVersion::V2);
+        buffer.table("my_test")?;
+        buffer.column_arr("temperature", &array_view)?;
+        let data = buffer.as_bytes();
+        assert_eq!(&data[0..7], b"my_test");
+        assert_eq!(&data[8..19], b"temperature");
+        assert_eq!(
+            &data[19..24],
+            &[
+                b'=', b'=', 14u8, // ARRAY_BINARY_FORMAT_TYPE
+                10u8, // ArrayColumnTypeTag::Double.into()
+                4u8
+            ]
+        );
+        assert_eq!(
+            &data[24..40],
+            [
+                2i32.to_le_bytes(),
+                2i32.to_le_bytes(),
+                1i32.to_le_bytes(),
+                3i32.to_le_bytes()
+            ]
+            .concat()
+        );
+        assert_eq!(
+            &data[40..136],
+            &[
+                1.0f64.to_ne_bytes(),
+                5.0f64.to_le_bytes(),
+                9.0f64.to_le_bytes(),
+                3.0f64.to_le_bytes(),
+                7.0f64.to_ne_bytes(),
+                11.0f64.to_le_bytes(),
+                2.0f64.to_le_bytes(),
+                6.0f64.to_le_bytes(),
+                10.0f64.to_ne_bytes(),
+                4.0f64.to_le_bytes(),
+                8.0f64.to_le_bytes(),
+                12.0f64.to_le_bytes(),
+            ]
+            .concat()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_stride_non_contiguous_elem_stride_4d() -> TestResult {
+        let col_major_data = [
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ];
+        let shape = [2, 2, 1, 3];
+        let strides = [
+            1,
+            shape[0] as isize,
+            shape[0] as isize * shape[1] as isize,
+            shape[0] as isize * shape[1] as isize * shape[2] as isize,
+        ];
+
+        let array_view: StrideArrayView<'_, f64, 8, 4> = unsafe {
+            StrideArrayView::new(
+                shape.as_ptr(),
+                strides.as_ptr(),
+                col_major_data.as_ptr(),
+                col_major_data.len(),
+            )
+        }?;
+
+        assert_eq!(array_view.ndim(), 4);
+        assert_eq!(array_view.dim(0), Ok(2));
+        assert_eq!(array_view.dim(1), Ok(2));
+        assert_eq!(array_view.dim(2), Ok(1));
+        assert_eq!(array_view.dim(3), Ok(3));
+        assert!(array_view.dim(4).is_err());
+        assert!(array_view.as_slice().is_none());
+
+        let mut buffer = Buffer::new(ProtocolVersion::V2);
+        buffer.table("my_test")?;
+        buffer.column_arr("temperature", &array_view)?;
+        let data = buffer.as_bytes();
+        assert_eq!(&data[0..7], b"my_test");
+        assert_eq!(&data[8..19], b"temperature");
+        assert_eq!(
+            &data[19..24],
+            &[
+                b'=', b'=', 14u8, // ARRAY_BINARY_FORMAT_TYPE
+                10u8, // ArrayColumnTypeTag::Double.into()
+                4u8
+            ]
+        );
+        assert_eq!(
+            &data[24..40],
+            [
+                2i32.to_le_bytes(),
+                2i32.to_le_bytes(),
+                1i32.to_le_bytes(),
+                3i32.to_le_bytes()
+            ]
+            .concat()
+        );
+        assert_eq!(
+            &data[40..136],
+            &[
+                1.0f64.to_ne_bytes(),
+                5.0f64.to_le_bytes(),
+                9.0f64.to_le_bytes(),
+                3.0f64.to_le_bytes(),
+                7.0f64.to_ne_bytes(),
+                11.0f64.to_le_bytes(),
+                2.0f64.to_le_bytes(),
+                6.0f64.to_le_bytes(),
+                10.0f64.to_ne_bytes(),
+                4.0f64.to_le_bytes(),
+                8.0f64.to_le_bytes(),
+                12.0f64.to_le_bytes(),
+            ]
+            .concat()
+        );
         Ok(())
     }
 }
