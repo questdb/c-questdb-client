@@ -65,58 +65,59 @@ rstest = "0.25.0"
 [features]
 default = ["sync-sender", "tls-webpki-certs", "ring-crypto"]
 
-# Sync ILP/TCP + ILP/HTTP Sender
+## Sync ILP/TCP + ILP/HTTP Sender
 sync-sender = ["sync-sender-tcp", "sync-sender-http"]
 
-# Sync ILP/TCP
+## Sync ILP/TCP
 sync-sender-tcp = ["_sync-sender", "_sender-tcp"]
 
-# Sync ILP/HTTP
+## Sync ILP/HTTP
 sync-sender-http = ["_sync-sender", "_sender-http", "dep:ureq", "dep:serde_json", "dep:rand"]
 
-# Async ILP/TCP + ILP/HTTP Sender
+## Async ILP/TCP + ILP/HTTP Sender
 async-sender = ["_async-sender", "async-sender-tcp", "async-sender-http"]
 
-# Async ILP/TCP Sender
+## Async ILP/TCP Sender
 async-sender-tcp = ["_async-sender", "_sender-tcp", "dep:tokio", "dep:tokio-rustls"]
 
-# Async ILP/HTTP Sender
+## Async ILP/HTTP Sender
 async-sender-http = ["_sender-http", "dep:tokio", "dep:hyper"]
 
-# Compatiblity alias.
+## Compatiblity alias.
 ilp-over-http = ["sync-sender-tcp"]
 
-# Allow use OS-provided root TLS certificates
+## Allow use OS-provided root TLS certificates
 tls-native-certs = ["dep:rustls-native-certs"]
 
-# Allow use of the `webpki-roots` crate to validate TLS certificates.
+## Allow use of the `webpki-roots` crate to validate TLS certificates.
 tls-webpki-certs = ["dep:webpki-roots"]
 
-# Use `aws-lc-rs` as the cryto library.
+## Use `aws-lc-rs` as the cryto library.
 aws-lc-crypto = ["dep:aws-lc-rs", "rustls/aws-lc-rs"]
 
-# Use `ring` as the crypto library.
+## Use `ring` as the crypto library.
 ring-crypto = ["dep:ring", "rustls/ring"]
 
-# Allow skipping verification of insecure certificates.
+## Allow skipping verification of insecure certificates.
 insecure-skip-verify = []
 
-# Enable code-generation in `build.rs` for additional tests.
+## Enable code-generation in `build.rs` for additional tests.
 json_tests = []
 
-# Enable methods to create timestamp objects from chrono::DateTime objects.
+## Enable methods to create timestamp objects from chrono::DateTime objects.
 chrono_timestamp = ["chrono"]
 
 # Hidden derived features, used in code to enable-disable code sections. Don't use directly.
-_sender-tcp = []
-_sender-http = []
-_sync-sender = []
-_async-sender = []
+_sender-tcp = [] # equiv of any(sync-sender-tcp, async-sender-tcp)
+_sender-http = [] # equiv of any(sync-sender-http, async-sender-http)
+_sync-sender = [] # equiv of any(sync-sender-tcp, sync-sender-http)
+_async-sender = [] # equiv of any(async-sender-tcp, async-sender-http)
 
-# The `aws-lc-crypto` and `ring-crypto` features are mutually exclusive,
-# thus compiling with `--all-features` will not work.
-# Instead compile with `--features almost-all-features`.
-# This is useful for quickly running `cargo test` or `cargo clippy`.
+## Enable all cross-compatible features.
+## The `aws-lc-crypto` and `ring-crypto` features are mutually exclusive,
+## thus compiling with `--all-features` will not work.
+## Instead use `--features almost-all-features`.
+## This is useful for quickly running `cargo test` or `cargo clippy`.
 almost-all-features = [
     "sync-sender",
     "async-sender",
