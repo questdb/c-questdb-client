@@ -37,7 +37,8 @@ chrono = { version = "0.4.40", optional = true }
 # the `ureq::unversioned` module which does not respect semantic versioning.
 ureq = { version = "3.0.10, <3.1.0", default-features = false, features = ["rustls-no-provider"], optional = true }
 
-tokio = { version = "1.45.1", default-features = false, optional = true }
+tokio = { version = "1.45.1", default-features = false, features = ["net"], optional = true }
+tokio-rustls = { version = "0.26.2", default-features = false, optional = true }
 hyper = { version = "1.6.0", default-features = false, optional = true }
 
 serde_json = { version = "1", optional = true }
@@ -68,16 +69,16 @@ default = ["sync-sender", "tls-webpki-certs", "ring-crypto"]
 sync-sender = ["sync-sender-tcp", "sync-sender-http"]
 
 # Sync ILP/TCP
-sync-sender-tcp = ["_sender-tcp"]
+sync-sender-tcp = ["_sync-sender", "_sender-tcp"]
 
 # Sync ILP/HTTP
-sync-sender-http = ["_sender-http", "dep:ureq", "dep:serde_json", "dep:rand"]
+sync-sender-http = ["_sync-sender", "_sender-http", "dep:ureq", "dep:serde_json", "dep:rand"]
 
 # Async ILP/TCP + ILP/HTTP Sender
-async-sender = ["async-sender-tcp", "async-sender-http"]
+async-sender = ["_async-sender", "async-sender-tcp", "async-sender-http"]
 
 # Async ILP/TCP Sender
-async-sender-tcp = ["_sender-tcp", "dep:tokio"]
+async-sender-tcp = ["_async-sender", "_sender-tcp", "dep:tokio", "dep:tokio-rustls"]
 
 # Async ILP/HTTP Sender
 async-sender-http = ["_sender-http", "dep:tokio", "dep:hyper"]
@@ -109,6 +110,8 @@ chrono_timestamp = ["chrono"]
 # Hidden derived features, used in code to enable-disable code sections. Don't use directly.
 _sender-tcp = []
 _sender-http = []
+_sync-sender = []
+_async-sender = []
 
 # The `aws-lc-crypto` and `ring-crypto` features are mutually exclusive,
 # thus compiling with `--all-features` will not work.

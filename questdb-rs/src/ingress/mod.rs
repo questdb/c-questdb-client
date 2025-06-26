@@ -38,7 +38,11 @@ use socket2::{Domain, Protocol as SockProtocol, SockAddr, Socket, Type};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fmt::{Debug, Display, Formatter, Write};
-use std::io::{self, BufRead, BufReader, ErrorKind, Write as IoWrite};
+use std::io::{self, BufReader, ErrorKind, Write as IoWrite};
+
+#[cfg(feature = "sync-sender-tcp")]
+use std::io::BufRead;
+
 use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::path::PathBuf;
@@ -350,12 +354,20 @@ fn write_escaped_quoted(output: &mut Vec<u8>, s: &str) {
     write_escaped_impl(must_escape_quoted, |output| output.push(b'"'), output, s)
 }
 
-enum Connection {
+#[cfg(feature = "sync-sender-tcp")]
+enum SyncConnection {
     Direct(Socket),
     Tls(Box<StreamOwned<ClientConnection, Socket>>),
 }
 
-impl Connection {
+#[cfg(feature = "async-sender-tcp")]
+enum AsyncConnection {
+    Direct(tokio::net::TcpStream),
+    Tls(Box<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>),
+}
+
+#[cfg(feature = "sync-sender-tcp")]
+impl SyncConnection {
     fn send_key_id(&mut self, key_id: &str) -> Result<()> {
         writeln!(self, "{}", key_id)
             .map_err(|io_err| map_io_to_socket_err("Failed to send key_id: ", io_err))?;
@@ -419,16 +431,22 @@ impl Connection {
     }
 }
 
-#[cfg(any(feature = "sync-sender-tcp", feature = "sync-sender-http"))]
 enum ProtocolHandler {
     #[cfg(feature = "sync-sender-tcp")]
-    Socket(Connection),
+    SyncTcp(SyncConnection),
 
     #[cfg(feature = "sync-sender-http")]
-    Http(HttpHandlerState),
+    SyncHttp(SyncHttpHandlerState),
+
+    #[cfg(feature = "async-sender-tcp")]
+    AsyncTcp(AsyncConnection),
+
+    #[cfg(feature = "async-sender-http")]
+    AsyncHttp()
 }
 
-impl io::Read for Connection {
+#[cfg(feature = "sync-sender-tcp")]
+impl io::Read for SyncConnection {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             Self::Direct(sock) => sock.read(buf),
@@ -437,7 +455,8 @@ impl io::Read for Connection {
     }
 }
 
-impl io::Write for Connection {
+#[cfg(feature = "sync-sender-tcp")]
+impl IoWrite for SyncConnection {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
             Self::Direct(sock) => sock.write(buf),
@@ -1379,6 +1398,7 @@ impl Buffer {
     }
 }
 
+#[cfg(feature = "_sync-sender")]
 /// Connects to a QuestDB instance and inserts data via the ILP protocol.
 ///
 /// * To construct an instance, use [`Sender::from_conf`] or the [`SenderBuilder`].
@@ -1393,7 +1413,8 @@ pub struct Sender {
     max_name_len: usize,
 }
 
-impl std::fmt::Debug for Sender {
+#[cfg(feature = "_sync-sender")]
+impl Debug for Sender {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
         f.write_str(self.descr.as_str())
     }
@@ -1867,7 +1888,7 @@ pub struct SenderBuilder {
 
     tls_ca: ConfigSetting<CertificateAuthority>,
     tls_roots: ConfigSetting<Option<PathBuf>>,
-    
+
     #[cfg(feature = "_sender-http")]
     http: Option<HttpConfig>,
 }
@@ -2359,6 +2380,7 @@ impl SenderBuilder {
         Ok(self)
     }
 
+    #[cfg(feature = "sync-sender-tcp")]
     fn connect_tcp(&self, auth: &Option<AuthParams>) -> Result<ProtocolHandler> {
         let addr: SockAddr = gai::resolve_host_port(self.host.as_str(), self.port.as_str())?;
         let mut sock = Socket::new(Domain::IPV4, Type::STREAM, Some(SockProtocol::TCP))
@@ -2439,16 +2461,16 @@ impl SenderBuilder {
                         }
                     })?;
                 }
-                Connection::Tls(StreamOwned::new(tls_conn, sock).into())
+                SyncConnection::Tls(StreamOwned::new(tls_conn, sock).into())
             }
-            None => Connection::Direct(sock),
+            None => SyncConnection::Direct(sock),
         };
 
         if let Some(AuthParams::Ecdsa(auth)) = auth {
             conn.authenticate(auth)?;
         }
 
-        Ok(ProtocolHandler::Socket(conn))
+        Ok(ProtocolHandler::SyncTcp(conn))
     }
 
     fn build_auth(&self) -> Result<Option<AuthParams>> {
@@ -2545,6 +2567,7 @@ impl SenderBuilder {
         }
     }
 
+    #[cfg(feature = "_sync-sender")]
     /// Build the sender.
     ///
     /// In the case of TCP, this synchronously establishes the TCP connection, and
@@ -2563,6 +2586,7 @@ impl SenderBuilder {
         let auth = self.build_auth()?;
 
         let handler = match self.protocol {
+            #[cfg(feature = "sync-sender-tcp")]
             Protocol::Tcp | Protocol::Tcps => self.connect_tcp(&auth)?,
             #[cfg(feature = "sync-sender-http")]
             Protocol::Http | Protocol::Https => {
@@ -2624,7 +2648,7 @@ impl SenderBuilder {
                     self.host.deref(),
                     self.port.deref()
                 );
-                ProtocolHandler::Http(HttpHandlerState {
+                ProtocolHandler::SyncHttp(SyncHttpHandlerState {
                     agent,
                     url,
                     auth,
@@ -2642,7 +2666,7 @@ impl SenderBuilder {
                 Protocol::Tcp | Protocol::Tcps => ProtocolVersion::V1,
                 #[cfg(feature = "sync-sender-http")]
                 Protocol::Http | Protocol::Https => {
-                    if let ProtocolHandler::Http(http_state) = &handler {
+                    if let ProtocolHandler::SyncHttp(http_state) = &handler {
                         let settings_url = &format!(
                             "{}://{}:{}/settings",
                             self.protocol.schema(),
@@ -2837,6 +2861,7 @@ impl F64Serializer {
     }
 }
 
+#[cfg(feature = "_sync-sender")]
 impl Sender {
     /// Create a new `Sender` instance from the given configuration string.
     ///
@@ -2907,7 +2932,7 @@ impl Sender {
             return Ok(());
         }
         match self.handler {
-            ProtocolHandler::Socket(ref mut conn) => {
+            ProtocolHandler::SyncTcp(ref mut conn) => {
                 if transactional {
                     return Err(error::fmt!(
                         InvalidApiCall,
@@ -2920,7 +2945,7 @@ impl Sender {
                 })?;
             }
             #[cfg(feature = "sync-sender-http")]
-            ProtocolHandler::Http(ref state) => {
+            ProtocolHandler::SyncHttp(ref state) => {
                 if transactional && !buf.transactional() {
                     return Err(error::fmt!(
                         InvalidApiCall,

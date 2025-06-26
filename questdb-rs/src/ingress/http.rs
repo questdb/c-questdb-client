@@ -95,7 +95,8 @@ impl Default for HttpConfig {
     }
 }
 
-pub(super) struct HttpHandlerState {
+#[cfg(feature = "sync-sender-http")]
+pub(super) struct SyncHttpHandlerState {
     /// Maintains a pool of open HTTP connections to the endpoint.
     pub(super) agent: ureq::Agent,
 
@@ -109,7 +110,8 @@ pub(super) struct HttpHandlerState {
     pub(super) config: HttpConfig,
 }
 
-impl HttpHandlerState {
+#[cfg(feature = "sync-sender-http")]
+impl SyncHttpHandlerState {
     fn send_request(
         &self,
         buf: &[u8],
@@ -384,7 +386,7 @@ pub(super) fn parse_http_error(http_status_code: u16, response: Response<Body>) 
 
 #[allow(clippy::result_large_err)] // `ureq::Error` is large enough to cause this warning.
 fn retry_http_send(
-    state: &HttpHandlerState,
+    state: &SyncHttpHandlerState,
     buf: &[u8],
     request_timeout: Duration,
     retry_timeout: Duration,
@@ -417,7 +419,7 @@ fn retry_http_send(
 
 #[allow(clippy::result_large_err)] // `ureq::Error` is large enough to cause this warning.
 pub(super) fn http_send_with_retries(
-    state: &HttpHandlerState,
+    state: &SyncHttpHandlerState,
     buf: &[u8],
     request_timeout: Duration,
     retry_timeout: Duration,
@@ -438,7 +440,7 @@ pub(super) fn http_send_with_retries(
 /// If the server does not support the `/settings` endpoint (404), it returns
 /// default values.
 pub(super) fn read_server_settings(
-    state: &HttpHandlerState,
+    state: &SyncHttpHandlerState,
     settings_url: &str,
     default_max_name_len: usize,
 ) -> Result<(Vec<ProtocolVersion>, usize), Error> {
@@ -540,7 +542,7 @@ pub(super) fn read_server_settings(
 
 #[allow(clippy::result_large_err)] // `ureq::Error` is large enough to cause this warning.
 fn retry_http_get(
-    state: &HttpHandlerState,
+    state: &SyncHttpHandlerState,
     url: &str,
     request_timeout: Duration,
     retry_timeout: Duration,
@@ -573,7 +575,7 @@ fn retry_http_get(
 
 #[allow(clippy::result_large_err)] // `ureq::Error` is large enough to cause this warning.
 fn http_get_with_retries(
-    state: &HttpHandlerState,
+    state: &SyncHttpHandlerState,
     url: &str,
     request_timeout: Duration,
     retry_timeout: Duration,
