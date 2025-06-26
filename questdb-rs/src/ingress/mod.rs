@@ -442,7 +442,7 @@ enum ProtocolHandler {
     AsyncTcp(AsyncConnection),
 
     #[cfg(feature = "async-sender-http")]
-    AsyncHttp()
+    AsyncHttp(),
 }
 
 #[cfg(feature = "sync-sender-tcp")]
