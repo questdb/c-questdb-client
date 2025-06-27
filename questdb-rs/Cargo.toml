@@ -19,7 +19,7 @@ crate-type = ["lib"]
 
 [dependencies]
 libc = "0.2"
-socket2 = "0.5.5"
+socket2 = { version = "0.5.5", optional = true }
 dns-lookup = "2.0.4"
 base64ct = { version = "1.7", features = ["alloc"] }
 rustls-pemfile = "2.0.0"
@@ -69,7 +69,7 @@ default = ["sync-sender", "tls-webpki-certs", "ring-crypto"]
 sync-sender = ["sync-sender-tcp", "sync-sender-http"]
 
 ## Sync ILP/TCP
-sync-sender-tcp = ["_sync-sender", "_sender-tcp"]
+sync-sender-tcp = ["_sync-sender", "_sender-tcp", "dep:socket2"]
 
 ## Sync ILP/HTTP
 sync-sender-http = ["_sync-sender", "_sender-http", "dep:ureq", "dep:serde_json", "dep:rand"]
@@ -122,6 +122,7 @@ almost-all-features = [
     "sync-sender",
     "async-sender",
     "tls-webpki-certs",
+    "tls-native-certs",
     "ring-crypto",
     "insecure-skip-verify",
     "json_tests",

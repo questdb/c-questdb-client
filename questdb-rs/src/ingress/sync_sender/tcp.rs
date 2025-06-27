@@ -148,6 +148,7 @@ pub(crate) fn connect_tcp(
     net_interface: Option<&str>,
     auth_timeout: Duration,
     tls_enabled: bool,
+    tls_verify: bool,
     tls_ca: CertificateAuthority,
     tls_roots: Option<&Path>,
     auth: &Option<conf::AuthParams>,
@@ -189,12 +190,6 @@ pub(crate) fn connect_tcp(
     // from the client.
     sock.set_read_timeout(Some(auth_timeout))
         .map_err(|io_err| map_io_to_socket_err("Failed to set read timeout on socket: ", io_err))?;
-
-    #[cfg(feature = "insecure-skip-verify")]
-    let tls_verify = *self.tls_verify;
-
-    #[cfg(not(feature = "insecure-skip-verify"))]
-    let tls_verify = true;
 
     let mut conn = match configure_tls(tls_enabled, tls_verify, tls_ca, tls_roots)? {
         Some(tls_config) => {
