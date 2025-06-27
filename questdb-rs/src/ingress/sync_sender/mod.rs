@@ -3,25 +3,16 @@ use crate::ingress::{Buffer, ProtocolVersion, SenderBuilder};
 use std::fmt::{Debug, Formatter};
 
 #[cfg(feature = "sync-sender-tcp")]
-use rustls::{ClientConnection, StreamOwned};
+mod tcp;
 
 #[cfg(feature = "sync-sender-tcp")]
-use crate::ingress::{map_io_to_socket_err, parse_key_pair};
+pub(crate) use tcp::*;
 
 #[cfg(feature = "sync-sender-tcp")]
-use std::io::{self, BufReader, Write as IoWrite};
+use std::io::Write;
 
 #[cfg(feature = "sync-sender-tcp")]
-use socket2::Socket;
-
-#[cfg(feature = "sync-sender-tcp")]
-use std::io::BufRead;
-
-#[cfg(all(feature = "sync-sender-tcp", feature = "aws-lc-crypto"))]
-use aws_lc_rs::rand::SystemRandom;
-
-#[cfg(all(feature = "sync-sender-tcp", feature = "ring-crypto"))]
-use ring::rand::SystemRandom;
+use crate::ingress::map_io_to_socket_err;
 
 #[cfg(feature = "sync-sender-http")]
 mod http;
@@ -29,115 +20,12 @@ mod http;
 #[cfg(feature = "sync-sender-http")]
 pub(crate) use http::*;
 
-#[cfg(feature = "sync-sender-tcp")]
-pub(crate) enum SyncConnection {
-    Direct(Socket),
-    Tls(Box<StreamOwned<ClientConnection, Socket>>),
-}
-
-#[cfg(feature = "sync-sender-tcp")]
-impl SyncConnection {
-    fn send_key_id(&mut self, key_id: &str) -> Result<()> {
-        writeln!(self, "{}", key_id)
-            .map_err(|io_err| map_io_to_socket_err("Failed to send key_id: ", io_err))?;
-        Ok(())
-    }
-
-    fn read_challenge(&mut self) -> Result<Vec<u8>> {
-        let mut buf = Vec::new();
-        let mut reader = BufReader::new(self);
-        reader.read_until(b'\n', &mut buf).map_err(|io_err| {
-            map_io_to_socket_err(
-                "Failed to read authentication challenge (timed out?): ",
-                io_err,
-            )
-        })?;
-        if buf.last().copied().unwrap_or(b'\0') != b'\n' {
-            return Err(if buf.is_empty() {
-                error::fmt!(
-                    AuthError,
-                    concat!(
-                        "Did not receive auth challenge. ",
-                        "Is the database configured to require ",
-                        "authentication?"
-                    )
-                )
-            } else {
-                error::fmt!(AuthError, "Received incomplete auth challenge: {:?}", buf)
-            });
-        }
-        buf.pop(); // b'\n'
-        Ok(buf)
-    }
-
-    pub(crate) fn authenticate(
-        &mut self,
-        auth: &crate::ingress::conf::EcdsaAuthParams,
-    ) -> Result<()> {
-        use base64ct::{Base64, Encoding};
-
-        if auth.key_id.contains('\n') {
-            return Err(error::fmt!(
-                AuthError,
-                "Bad key id {:?}: Should not contain new-line char.",
-                auth.key_id
-            ));
-        }
-        let key_pair = parse_key_pair(auth)?;
-        self.send_key_id(auth.key_id.as_str())?;
-        let challenge = self.read_challenge()?;
-        let rng = SystemRandom::new();
-        let signature = key_pair
-            .sign(&rng, &challenge[..])
-            .map_err(|unspecified_err| {
-                error::fmt!(AuthError, "Failed to sign challenge: {}", unspecified_err)
-            })?;
-        let mut encoded_sig = Base64::encode_string(signature.as_ref());
-        encoded_sig.push('\n');
-        let buf = encoded_sig.as_bytes();
-        if let Err(io_err) = self.write_all(buf) {
-            return Err(map_io_to_socket_err(
-                "Could not send signed challenge: ",
-                io_err,
-            ));
-        }
-        Ok(())
-    }
-}
-
 pub(crate) enum SyncProtocolHandler {
     #[cfg(feature = "sync-sender-tcp")]
     SyncTcp(SyncConnection),
 
     #[cfg(feature = "sync-sender-http")]
     SyncHttp(SyncHttpHandlerState),
-}
-
-#[cfg(feature = "sync-sender-tcp")]
-impl io::Read for SyncConnection {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self {
-            Self::Direct(sock) => sock.read(buf),
-            Self::Tls(stream) => stream.read(buf),
-        }
-    }
-}
-
-#[cfg(feature = "sync-sender-tcp")]
-impl IoWrite for SyncConnection {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self {
-            Self::Direct(sock) => sock.write(buf),
-            Self::Tls(stream) => stream.write(buf),
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        match self {
-            Self::Direct(sock) => sock.flush(),
-            Self::Tls(stream) => stream.flush(),
-        }
-    }
 }
 
 /// Connects to a QuestDB instance and inserts data via the ILP protocol.
@@ -200,7 +88,7 @@ impl Sender {
     /// returns once the connection is fully established. If the connection
     /// requires authentication or TLS, these will also be completed before
     /// returning.
-    pub fn from_conf<T: AsRef<str>>(conf: T) -> crate::Result<Self> {
+    pub fn from_conf<T: AsRef<str>>(conf: T) -> Result<Self> {
         SenderBuilder::from_conf(conf)?.build()
     }
 
@@ -212,7 +100,7 @@ impl Sender {
     /// returns once the connection is fully established. If the connection
     /// requires authentication or TLS, these will also be completed before
     /// returning.
-    pub fn from_env() -> crate::Result<Self> {
+    pub fn from_env() -> Result<Self> {
         SenderBuilder::from_env()?.build()
     }
 
@@ -318,7 +206,7 @@ impl Sender {
         &mut self,
         buf: &Buffer,
         transactional: bool,
-    ) -> crate::Result<()> {
+    ) -> Result<()> {
         self.flush_impl(buf, transactional)
     }
 
@@ -327,7 +215,7 @@ impl Sender {
     /// All the data stays in the buffer. Clear the buffer before starting a new batch.
     ///
     /// To send and clear in one step, call [Sender::flush] instead.
-    pub fn flush_and_keep(&mut self, buf: &Buffer) -> crate::Result<()> {
+    pub fn flush_and_keep(&mut self, buf: &Buffer) -> Result<()> {
         self.flush_impl(buf, false)
     }
 
@@ -387,7 +275,7 @@ impl Sender {
     }
 
     #[inline(always)]
-    fn check_protocol_version(&self, version: ProtocolVersion) -> crate::Result<()> {
+    fn check_protocol_version(&self, version: ProtocolVersion) -> Result<()> {
         if self.protocol_version != version {
             return Err(error::fmt!(
                 ProtocolVersionError,
