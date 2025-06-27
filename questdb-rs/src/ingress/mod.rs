@@ -34,20 +34,17 @@ use rustls::RootCertStore;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fmt::{Debug, Display, Formatter, Write};
-use std::io::BufReader;
 
 #[cfg(feature = "sync-sender-tcp")]
-use std::io::{self, ErrorKind};
-
-#[cfg(feature = "sync-sender-tcp")]
-use socket2::{Domain, Protocol as SockProtocol, SockAddr, Socket, Type};
+use std::io;
 
 use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::slice::from_raw_parts_mut;
 use std::str::FromStr;
-use std::sync::Arc;
+
+mod tls;
 
 #[cfg(all(feature = "_sender-tcp", feature = "aws-lc-crypto"))]
 use aws_lc_rs::{
@@ -1467,103 +1464,6 @@ fn add_os_roots(root_store: &mut RootCertStore) -> Result<()> {
     Ok(())
 }
 
-fn configure_tls(
-    tls_enabled: bool,
-    tls_verify: bool,
-    tls_ca: CertificateAuthority,
-    tls_roots: &Option<PathBuf>,
-) -> Result<Option<Arc<rustls::ClientConfig>>> {
-    if !tls_enabled {
-        return Ok(None);
-    }
-
-    let mut root_store = RootCertStore::empty();
-    if tls_verify {
-        match (tls_ca, tls_roots) {
-            #[cfg(feature = "tls-webpki-certs")]
-            (CertificateAuthority::WebpkiRoots, None) => {
-                add_webpki_roots(&mut root_store);
-            }
-
-            #[cfg(feature = "tls-webpki-certs")]
-            (CertificateAuthority::WebpkiRoots, Some(_)) => {
-                return Err(error::fmt!(ConfigError, "Config parameter \"tls_roots\" must be unset when \"tls_ca\" is set to \"webpki_roots\"."));
-            }
-
-            #[cfg(feature = "tls-native-certs")]
-            (CertificateAuthority::OsRoots, None) => {
-                add_os_roots(&mut root_store)?;
-            }
-
-            #[cfg(feature = "tls-native-certs")]
-            (CertificateAuthority::OsRoots, Some(_)) => {
-                return Err(error::fmt!(ConfigError, "Config parameter \"tls_roots\" must be unset when \"tls_ca\" is set to \"os_roots\"."));
-            }
-
-            #[cfg(all(feature = "tls-webpki-certs", feature = "tls-native-certs"))]
-            (CertificateAuthority::WebpkiAndOsRoots, None) => {
-                add_webpki_roots(&mut root_store);
-                add_os_roots(&mut root_store)?;
-            }
-
-            #[cfg(all(feature = "tls-webpki-certs", feature = "tls-native-certs"))]
-            (CertificateAuthority::WebpkiAndOsRoots, Some(_)) => {
-                return Err(error::fmt!(ConfigError, "Config parameter \"tls_roots\" must be unset when \"tls_ca\" is set to \"webpki_and_os_roots\"."));
-            }
-
-            (CertificateAuthority::PemFile, Some(ca_file)) => {
-                let certfile = std::fs::File::open(ca_file).map_err(|io_err| {
-                    error::fmt!(
-                        TlsError,
-                        concat!(
-                            "Could not open tls_roots certificate authority ",
-                            "file from path {:?}: {}"
-                        ),
-                        ca_file,
-                        io_err
-                    )
-                })?;
-                let mut reader = BufReader::new(certfile);
-                let der_certs = rustls_pemfile::certs(&mut reader)
-                    .collect::<std::result::Result<Vec<_>, _>>()
-                    .map_err(|io_err| {
-                        error::fmt!(
-                            TlsError,
-                            concat!(
-                                "Could not read certificate authority ",
-                                "file from path {:?}: {}"
-                            ),
-                            ca_file,
-                            io_err
-                        )
-                    })?;
-                root_store.add_parsable_certificates(der_certs);
-            }
-
-            (CertificateAuthority::PemFile, None) => {
-                return Err(error::fmt!(ConfigError, "Config parameter \"tls_roots\" is required when \"tls_ca\" is set to \"pem_file\"."));
-            }
-        }
-    }
-
-    let mut config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-
-    // TLS log file for debugging.
-    // Set the SSLKEYLOGFILE env variable to a writable location.
-    config.key_log = Arc::new(rustls::KeyLogFile::new());
-
-    #[cfg(feature = "insecure-skip-verify")]
-    if !tls_verify {
-        config
-            .dangerous()
-            .set_certificate_verifier(Arc::new(danger::NoCertificateVerification {}));
-    }
-
-    Ok(Some(Arc::new(config)))
-}
-
 fn validate_auto_flush_params(params: &HashMap<String, String>) -> Result<()> {
     if let Some(auto_flush) = params.get("auto_flush") {
         if auto_flush.as_str() != "off" {
@@ -2298,103 +2198,6 @@ impl SenderBuilder {
         Ok(self)
     }
 
-    #[cfg(feature = "sync-sender-tcp")]
-    fn connect_tcp(&self, auth: &Option<conf::AuthParams>) -> Result<SyncProtocolHandler> {
-        use crate::gai;
-        use rustls::{ClientConnection, StreamOwned};
-        use rustls_pki_types::ServerName;
-
-        let addr: SockAddr = gai::resolve_host_port(self.host.as_str(), self.port.as_str())?;
-        let mut sock = Socket::new(Domain::IPV4, Type::STREAM, Some(SockProtocol::TCP))
-            .map_err(|io_err| map_io_to_socket_err("Could not open TCP socket: ", io_err))?;
-
-        // See: https://idea.popcount.org/2014-04-03-bind-before-connect/
-        // We set `SO_REUSEADDR` on the outbound socket to avoid issues where a client may exhaust
-        // their interface's ports. See: https://github.com/questdb/py-questdb-client/issues/21
-        sock.set_reuse_address(true)
-            .map_err(|io_err| map_io_to_socket_err("Could not set SO_REUSEADDR: ", io_err))?;
-
-        sock.set_linger(Some(Duration::from_secs(120)))
-            .map_err(|io_err| map_io_to_socket_err("Could not set socket linger: ", io_err))?;
-        sock.set_keepalive(true)
-            .map_err(|io_err| map_io_to_socket_err("Could not set SO_KEEPALIVE: ", io_err))?;
-        sock.set_nodelay(true)
-            .map_err(|io_err| map_io_to_socket_err("Could not set TCP_NODELAY: ", io_err))?;
-        if let Some(host) = self.net_interface.deref() {
-            let bind_addr = gai::resolve_host(host.as_str())?;
-            sock.bind(&bind_addr).map_err(|io_err| {
-                map_io_to_socket_err(
-                    &format!("Could not bind to interface address {:?}: ", host),
-                    io_err,
-                )
-            })?;
-        }
-        sock.connect(&addr).map_err(|io_err| {
-            let host_port = format!("{}:{}", self.host.deref(), *self.port);
-            let prefix = format!("Could not connect to {:?}: ", host_port);
-            map_io_to_socket_err(&prefix, io_err)
-        })?;
-
-        // We read during both TLS handshake and authentication.
-        // We set up a read timeout to prevent the client from "hanging"
-        // should we be connecting to a server configured in a different way
-        // from the client.
-        sock.set_read_timeout(Some(*self.auth_timeout))
-            .map_err(|io_err| {
-                map_io_to_socket_err("Failed to set read timeout on socket: ", io_err)
-            })?;
-
-        #[cfg(feature = "insecure-skip-verify")]
-        let tls_verify = *self.tls_verify;
-
-        #[cfg(not(feature = "insecure-skip-verify"))]
-        let tls_verify = true;
-
-        let mut conn = match configure_tls(
-            self.protocol.tls_enabled(),
-            tls_verify,
-            *self.tls_ca,
-            self.tls_roots.deref(),
-        )? {
-            Some(tls_config) => {
-                let server_name: ServerName = ServerName::try_from(self.host.as_str())
-                    .map_err(|inv_dns_err| error::fmt!(TlsError, "Bad host: {}", inv_dns_err))?
-                    .to_owned();
-                let mut tls_conn =
-                    ClientConnection::new(tls_config, server_name).map_err(|rustls_err| {
-                        error::fmt!(TlsError, "Could not create TLS client: {}", rustls_err)
-                    })?;
-                while tls_conn.wants_write() || tls_conn.is_handshaking() {
-                    tls_conn.complete_io(&mut sock).map_err(|io_err| {
-                        if (io_err.kind() == ErrorKind::TimedOut)
-                            || (io_err.kind() == ErrorKind::WouldBlock)
-                        {
-                            error::fmt!(
-                                TlsError,
-                                concat!(
-                                    "Failed to complete TLS handshake:",
-                                    " Timed out waiting for server ",
-                                    "response after {:?}."
-                                ),
-                                *self.auth_timeout
-                            )
-                        } else {
-                            error::fmt!(TlsError, "Failed to complete TLS handshake: {}", io_err)
-                        }
-                    })?;
-                }
-                SyncConnection::Tls(StreamOwned::new(tls_conn, sock).into())
-            }
-            None => SyncConnection::Direct(sock),
-        };
-
-        if let Some(conf::AuthParams::Ecdsa(auth)) = auth {
-            conn.authenticate(auth)?;
-        }
-
-        Ok(SyncProtocolHandler::SyncTcp(conn))
-    }
-
     fn build_auth(&self) -> Result<Option<conf::AuthParams>> {
         match (
             self.protocol,
@@ -2527,7 +2330,16 @@ impl SenderBuilder {
 
         let handler = match self.protocol {
             #[cfg(feature = "sync-sender-tcp")]
-            Protocol::Tcp | Protocol::Tcps => self.connect_tcp(&auth)?,
+            Protocol::Tcp | Protocol::Tcps => connect_tcp(
+                self.host.as_str(),
+                self.port.as_str(),
+                self.net_interface.deref().as_deref(),
+                *self.auth_timeout,
+                self.protocol.tls_enabled(),
+                *self.tls_ca,
+                self.tls_roots.as_deref(),
+                &auth,
+            )?,
             #[cfg(feature = "sync-sender-http")]
             Protocol::Http | Protocol::Https => {
                 use ureq::unversioned::transport::Connector;
@@ -2554,11 +2366,11 @@ impl SenderBuilder {
                 #[cfg(not(feature = "insecure-skip-verify"))]
                 let tls_verify = true;
 
-                let connector = connector.chain(TlsConnector::new(configure_tls(
+                let connector = connector.chain(TlsConnector::new(tls::configure_tls(
                     self.protocol.tls_enabled(),
                     tls_verify,
                     *self.tls_ca,
-                    self.tls_roots.deref(),
+                    self.tls_roots.deref().as_deref(),
                 )?));
 
                 let auth = match auth {
