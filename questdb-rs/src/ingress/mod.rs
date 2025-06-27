@@ -27,21 +27,20 @@
 pub use self::ndarr::{ArrayElement, NdArrayView};
 pub use self::timestamp::*;
 use crate::error::{self, Error, Result};
-use crate::gai;
 use crate::ingress::conf::ConfigSetting;
-use base64ct::{Base64, Base64UrlUnpadded, Encoding};
 use core::time::Duration;
 use ndarr::ArrayElementSealed;
-use rustls::{ClientConnection, RootCertStore, StreamOwned};
-use rustls_pki_types::ServerName;
-use socket2::{Domain, Protocol as SockProtocol, SockAddr, Socket, Type};
+use rustls::RootCertStore;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fmt::{Debug, Display, Formatter, Write};
-use std::io::{self, BufReader, ErrorKind, Write as IoWrite};
+use std::io::BufReader;
 
 #[cfg(feature = "sync-sender-tcp")]
-use std::io::BufRead;
+use std::io::{self, ErrorKind};
+
+#[cfg(feature = "sync-sender-tcp")]
+use socket2::{Domain, Protocol as SockProtocol, SockAddr, Socket, Type};
 
 use std::num::NonZeroUsize;
 use std::ops::Deref;
@@ -50,17 +49,30 @@ use std::slice::from_raw_parts_mut;
 use std::str::FromStr;
 use std::sync::Arc;
 
-#[cfg(feature = "aws-lc-crypto")]
+#[cfg(all(feature = "_sender-tcp", feature = "aws-lc-crypto"))]
 use aws_lc_rs::{
     rand::SystemRandom,
     signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING},
 };
 
-#[cfg(feature = "ring-crypto")]
+#[cfg(all(feature = "_sender-tcp", feature = "ring-crypto"))]
 use ring::{
     rand::SystemRandom,
     signature::{EcdsaKeyPair, ECDSA_P256_SHA256_FIXED_SIGNING},
 };
+
+mod conf;
+
+pub(crate) mod ndarr;
+use crate::ingress::ndarr::check_and_get_array_bytes_size;
+
+mod timestamp;
+
+#[cfg(feature = "_sync-sender")]
+mod sync_sender;
+
+#[cfg(feature = "_sync-sender")]
+pub use sync_sender::*;
 
 const MAX_NAME_LEN_DEFAULT: usize = 127;
 
@@ -68,6 +80,9 @@ const MAX_NAME_LEN_DEFAULT: usize = 127;
 pub const MAX_ARRAY_DIMS: usize = 32;
 pub const MAX_ARRAY_BUFFER_SIZE: usize = 512 * 1024 * 1024; // 512MiB
 pub const MAX_ARRAY_DIM_LEN: usize = 0x0FFF_FFFF; // 1 << 28 - 1
+
+pub(crate) const ARRAY_BINARY_FORMAT_TYPE: u8 = 14;
+pub(crate) const DOUBLE_BINARY_FORMAT_TYPE: u8 = 16;
 
 /// The version of InfluxDB Line Protocol used to communicate with the server.
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -114,6 +129,7 @@ impl Op {
     }
 }
 
+#[cfg(feature = "_sender-tcp")]
 fn map_io_to_socket_err(prefix: &str, io_err: io::Error) -> Error {
     error::fmt!(SocketError, "{}{}", prefix, io_err)
 }
@@ -354,127 +370,20 @@ fn write_escaped_quoted(output: &mut Vec<u8>, s: &str) {
     write_escaped_impl(must_escape_quoted, |output| output.push(b'"'), output, s)
 }
 
-#[cfg(feature = "sync-sender-tcp")]
-enum SyncConnection {
-    Direct(Socket),
-    Tls(Box<StreamOwned<ClientConnection, Socket>>),
-}
-
-#[cfg(feature = "async-sender-tcp")]
-enum AsyncConnection {
-    Direct(tokio::net::TcpStream),
-    Tls(Box<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>),
-}
-
-#[cfg(feature = "_async-sender")]
-enum AsyncProtocolHandler {
-    #[cfg(feature = "async-sender-tcp")]
-    AsyncTcp(AsyncConnection),
-
-    #[cfg(feature = "async-sender-http")]
-    AsyncHttp(),
-}
-
-#[cfg(feature = "sync-sender-tcp")]
-impl SyncConnection {
-    fn send_key_id(&mut self, key_id: &str) -> Result<()> {
-        writeln!(self, "{}", key_id)
-            .map_err(|io_err| map_io_to_socket_err("Failed to send key_id: ", io_err))?;
-        Ok(())
-    }
-
-    fn read_challenge(&mut self) -> Result<Vec<u8>> {
-        let mut buf = Vec::new();
-        let mut reader = BufReader::new(self);
-        reader.read_until(b'\n', &mut buf).map_err(|io_err| {
-            map_io_to_socket_err(
-                "Failed to read authentication challenge (timed out?): ",
-                io_err,
-            )
-        })?;
-        if buf.last().copied().unwrap_or(b'\0') != b'\n' {
-            return Err(if buf.is_empty() {
-                error::fmt!(
-                    AuthError,
-                    concat!(
-                        "Did not receive auth challenge. ",
-                        "Is the database configured to require ",
-                        "authentication?"
-                    )
-                )
-            } else {
-                error::fmt!(AuthError, "Received incomplete auth challenge: {:?}", buf)
-            });
-        }
-        buf.pop(); // b'\n'
-        Ok(buf)
-    }
-
-    fn authenticate(&mut self, auth: &EcdsaAuthParams) -> Result<()> {
-        if auth.key_id.contains('\n') {
-            return Err(error::fmt!(
-                AuthError,
-                "Bad key id {:?}: Should not contain new-line char.",
-                auth.key_id
-            ));
-        }
-        let key_pair = parse_key_pair(auth)?;
-        self.send_key_id(auth.key_id.as_str())?;
-        let challenge = self.read_challenge()?;
-        let rng = SystemRandom::new();
-        let signature = key_pair
-            .sign(&rng, &challenge[..])
-            .map_err(|unspecified_err| {
-                error::fmt!(AuthError, "Failed to sign challenge: {}", unspecified_err)
-            })?;
-        let mut encoded_sig = Base64::encode_string(signature.as_ref());
-        encoded_sig.push('\n');
-        let buf = encoded_sig.as_bytes();
-        if let Err(io_err) = self.write_all(buf) {
-            return Err(map_io_to_socket_err(
-                "Could not send signed challenge: ",
-                io_err,
-            ));
-        }
-        Ok(())
-    }
-}
-
-#[cfg(feature = "_sync-sender")]
-enum SyncProtocolHandler {
-    #[cfg(feature = "sync-sender-tcp")]
-    SyncTcp(SyncConnection),
-
-    #[cfg(feature = "sync-sender-http")]
-    SyncHttp(SyncHttpHandlerState),
-}
-
-#[cfg(feature = "sync-sender-tcp")]
-impl io::Read for SyncConnection {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self {
-            Self::Direct(sock) => sock.read(buf),
-            Self::Tls(stream) => stream.read(buf),
-        }
-    }
-}
-
-#[cfg(feature = "sync-sender-tcp")]
-impl IoWrite for SyncConnection {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self {
-            Self::Direct(sock) => sock.write(buf),
-            Self::Tls(stream) => stream.write(buf),
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        match self {
-            Self::Direct(sock) => sock.flush(),
-            Self::Tls(stream) => stream.flush(),
-        }
-    }
-}
+// #[cfg(feature = "async-sender-tcp")]
+// enum AsyncConnection {
+//     Direct(tokio::net::TcpStream),
+//     Tls(Box<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>),
+// }
+//
+// #[cfg(feature = "_async-sender")]
+// enum AsyncProtocolHandler {
+//     #[cfg(feature = "async-sender-tcp")]
+//     AsyncTcp(AsyncConnection),
+//
+//     #[cfg(feature = "async-sender-http")]
+//     AsyncHttp(),
+// }
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 enum OpCase {
@@ -1402,48 +1311,6 @@ impl Buffer {
     }
 }
 
-#[cfg(feature = "_sync-sender")]
-/// Connects to a QuestDB instance and inserts data via the ILP protocol.
-///
-/// * To construct an instance, use [`Sender::from_conf`] or the [`SenderBuilder`].
-/// * To prepare messages, use [`Buffer`] objects.
-/// * To send messages, call the [`flush`](Sender::flush) method.
-pub struct Sender {
-    descr: String,
-    handler: SyncProtocolHandler,
-    connected: bool,
-    max_buf_size: usize,
-    protocol_version: ProtocolVersion,
-    max_name_len: usize,
-}
-
-#[cfg(feature = "_sync-sender")]
-impl Debug for Sender {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
-        f.write_str(self.descr.as_str())
-    }
-}
-
-#[derive(PartialEq, Debug, Clone)]
-struct EcdsaAuthParams {
-    key_id: String,
-    priv_key: String,
-    pub_key_x: String,
-    pub_key_y: String,
-}
-
-#[derive(PartialEq, Debug, Clone)]
-enum AuthParams {
-    #[cfg(feature = "_sender-tcp")]
-    Ecdsa(EcdsaAuthParams),
-
-    #[cfg(feature = "_sender-http")]
-    Basic(BasicAuthParams),
-
-    #[cfg(feature = "_sender-http")]
-    Token(TokenAuthParams),
-}
-
 /// Possible sources of the root certificates used to validate the server's TLS
 /// certificate.
 #[derive(PartialEq, Debug, Clone, Copy)]
@@ -1894,7 +1761,7 @@ pub struct SenderBuilder {
     tls_roots: ConfigSetting<Option<PathBuf>>,
 
     #[cfg(feature = "_sender-http")]
-    http: Option<HttpConfig>,
+    http: Option<conf::HttpConfig>,
 }
 
 impl SenderBuilder {
@@ -2129,8 +1996,13 @@ impl SenderBuilder {
             username: ConfigSetting::new_default(None),
             password: ConfigSetting::new_default(None),
             token: ConfigSetting::new_default(None),
+
+            #[cfg(feature = "_sender-tcp")]
             token_x: ConfigSetting::new_default(None),
+
+            #[cfg(feature = "_sender-tcp")]
             token_y: ConfigSetting::new_default(None),
+
             protocol_version: ConfigSetting::new_default(None),
 
             #[cfg(feature = "insecure-skip-verify")]
@@ -2141,7 +2013,7 @@ impl SenderBuilder {
 
             #[cfg(feature = "sync-sender-http")]
             http: if protocol.is_httpx() {
-                Some(HttpConfig::default())
+                Some(conf::HttpConfig::default())
             } else {
                 None
             },
@@ -2153,11 +2025,25 @@ impl SenderBuilder {
     /// This may be relevant if your machine has multiple network interfaces.
     ///
     /// The default is `"0.0.0.0"`.
-    pub fn bind_interface<I: Into<String>>(mut self, addr: I) -> Result<Self> {
-        self.ensure_is_tcpx("bind_interface")?;
-        self.net_interface
-            .set_specified("bind_interface", Some(validate_value(addr.into())?))?;
-        Ok(self)
+    pub fn bind_interface<I: Into<String>>(self, addr: I) -> Result<Self> {
+        #[cfg(feature = "_sender-tcp")]
+        {
+            let mut builder = self;
+            builder.ensure_is_tcpx("bind_interface")?;
+            builder
+                .net_interface
+                .set_specified("bind_interface", Some(validate_value(addr.into())?))?;
+            Ok(builder)
+        }
+
+        #[cfg(not(feature = "_sender-tcp"))]
+        {
+            let _ = addr;
+            Err(error::fmt!(
+                ConfigError,
+                "The \"bind_interface\" setting can only be used with the TCP protocol."
+            ))
+        }
     }
 
     /// Set the username for authentication.
@@ -2191,17 +2077,45 @@ impl SenderBuilder {
     }
 
     /// Set the ECDSA public key X for TCP authentication.
-    pub fn token_x(mut self, token_x: &str) -> Result<Self> {
-        self.token_x
-            .set_specified("token_x", Some(validate_value(token_x.to_string())?))?;
-        Ok(self)
+    pub fn token_x(self, token_x: &str) -> Result<Self> {
+        #[cfg(feature = "_sender-tcp")]
+        {
+            let mut builder = self;
+            builder
+                .token_x
+                .set_specified("token_x", Some(validate_value(token_x.to_string())?))?;
+            Ok(builder)
+        }
+
+        #[cfg(not(feature = "_sender-tcp"))]
+        {
+            let _ = token_x;
+            Err(error::fmt!(
+                ConfigError,
+                "The \"token_x\" setting can only be used with the TCP protocol."
+            ))
+        }
     }
 
     /// Set the ECDSA public key Y for TCP authentication.
-    pub fn token_y(mut self, token_y: &str) -> Result<Self> {
-        self.token_y
-            .set_specified("token_y", Some(validate_value(token_y.to_string())?))?;
-        Ok(self)
+    pub fn token_y(self, token_y: &str) -> Result<Self> {
+        #[cfg(feature = "_sender-tcp")]
+        {
+            let mut builder = self;
+            builder
+                .token_y
+                .set_specified("token_y", Some(validate_value(token_y.to_string())?))?;
+            Ok(builder)
+        }
+
+        #[cfg(not(feature = "_sender-tcp"))]
+        {
+            let _ = token_y;
+            Err(error::fmt!(
+                ConfigError,
+                "The \"token_y\" setting can only be used with the TCP protocol."
+            ))
+        }
     }
 
     /// Sets the ingestion protocol version.
@@ -2385,7 +2299,11 @@ impl SenderBuilder {
     }
 
     #[cfg(feature = "sync-sender-tcp")]
-    fn connect_tcp(&self, auth: &Option<AuthParams>) -> Result<SyncProtocolHandler> {
+    fn connect_tcp(&self, auth: &Option<conf::AuthParams>) -> Result<SyncProtocolHandler> {
+        use crate::gai;
+        use rustls::{ClientConnection, StreamOwned};
+        use rustls_pki_types::ServerName;
+
         let addr: SockAddr = gai::resolve_host_port(self.host.as_str(), self.port.as_str())?;
         let mut sock = Socket::new(Domain::IPV4, Type::STREAM, Some(SockProtocol::TCP))
             .map_err(|io_err| map_io_to_socket_err("Could not open TCP socket: ", io_err))?;
@@ -2470,23 +2388,35 @@ impl SenderBuilder {
             None => SyncConnection::Direct(sock),
         };
 
-        if let Some(AuthParams::Ecdsa(auth)) = auth {
+        if let Some(conf::AuthParams::Ecdsa(auth)) = auth {
             conn.authenticate(auth)?;
         }
 
         Ok(SyncProtocolHandler::SyncTcp(conn))
     }
 
-    fn build_auth(&self) -> Result<Option<AuthParams>> {
+    fn build_auth(&self) -> Result<Option<conf::AuthParams>> {
         match (
             self.protocol,
             self.username.deref(),
             self.password.deref(),
             self.token.deref(),
+
+            #[cfg(feature = "_sender-tcp")]
             self.token_x.deref(),
+
+            #[cfg(not(feature = "_sender-tcp"))]
+            None::<String>,
+
+            #[cfg(feature = "_sender-tcp")]
             self.token_y.deref(),
+
+            #[cfg(not(feature = "_sender-tcp"))]
+            None::<String>,
         ) {
             (_, None, None, None, None, None) => Ok(None),
+
+            #[cfg(feature = "_sender-tcp")]
             (
                 protocol,
                 Some(username),
@@ -2494,44 +2424,50 @@ impl SenderBuilder {
                 Some(token),
                 Some(token_x),
                 Some(token_y),
-            ) if protocol.is_tcpx() => Ok(Some(AuthParams::Ecdsa(EcdsaAuthParams {
+            ) if protocol.is_tcpx() => Ok(Some(conf::AuthParams::Ecdsa(conf::EcdsaAuthParams {
                 key_id: username.to_string(),
                 priv_key: token.to_string(),
                 pub_key_x: token_x.to_string(),
                 pub_key_y: token_y.to_string(),
             }))),
+
+            #[cfg(feature = "_sender-tcp")]
             (protocol, Some(_username), Some(_password), None, None, None)
             if protocol.is_tcpx() => {
                 Err(error::fmt!(ConfigError,
                     r##"The "basic_auth" setting can only be used with the ILP/HTTP protocol."##,
                 ))
             }
+
+            #[cfg(feature = "_sender-tcp")]
             (protocol, None, None, Some(_token), None, None)
             if protocol.is_tcpx() => {
                 Err(error::fmt!(ConfigError, "Token authentication only be used with the ILP/HTTP protocol."))
             }
+
+            #[cfg(feature = "_sender-tcp")]
             (protocol, _username, None, _token, _token_x, _token_y)
             if protocol.is_tcpx() => {
                 Err(error::fmt!(ConfigError,
                     r##"Incomplete ECDSA authentication parameters. Specify either all or none of: "username", "token", "token_x", "token_y"."##,
                 ))
             }
-            #[cfg(feature = "sync-sender-http")]
+            #[cfg(feature = "_sender-http")]
             (protocol, Some(username), Some(password), None, None, None)
             if protocol.is_httpx() => {
-                Ok(Some(AuthParams::Basic(BasicAuthParams {
+                Ok(Some(conf::AuthParams::Basic(conf::BasicAuthParams {
                     username: username.to_string(),
                     password: password.to_string(),
                 })))
             }
-            #[cfg(feature = "sync-sender-http")]
+            #[cfg(feature = "_sender-http")]
             (protocol, Some(_username), None, None, None, None)
             if protocol.is_httpx() => {
                 Err(error::fmt!(ConfigError,
                     r##"Basic authentication parameter "username" is present, but "password" is missing."##,
                 ))
             }
-            #[cfg(feature = "sync-sender-http")]
+            #[cfg(feature = "_sender-http")]
             (protocol, None, Some(_password), None, None, None)
             if protocol.is_httpx() => {
                 Err(error::fmt!(ConfigError,
@@ -2541,7 +2477,7 @@ impl SenderBuilder {
             #[cfg(feature = "sync-sender-http")]
             (protocol, None, None, Some(token), None, None)
             if protocol.is_httpx() => {
-                Ok(Some(AuthParams::Token(TokenAuthParams {
+                Ok(Some(conf::AuthParams::Token(conf::TokenAuthParams {
                     token: token.to_string(),
                 })))
             }
@@ -2556,7 +2492,7 @@ impl SenderBuilder {
             ) if protocol.is_httpx() => {
                 Err(error::fmt!(ConfigError, "ECDSA authentication is only available with ILP/TCP and not available with ILP/HTTP."))
             }
-            #[cfg(feature = "sync-sender-http")]
+            #[cfg(feature = "_sender-http")]
             (protocol, _username, _password, _token, None, None)
             if protocol.is_httpx() => {
                 Err(error::fmt!(ConfigError,
@@ -2626,9 +2562,11 @@ impl SenderBuilder {
                 )?));
 
                 let auth = match auth {
-                    Some(AuthParams::Basic(ref auth)) => Some(auth.to_header_string()),
-                    Some(AuthParams::Token(ref auth)) => Some(auth.to_header_string()?),
-                    Some(AuthParams::Ecdsa(_)) => {
+                    Some(conf::AuthParams::Basic(ref auth)) => Some(auth.to_header_string()),
+                    Some(conf::AuthParams::Token(ref auth)) => Some(auth.to_header_string()?),
+
+                    #[cfg(feature = "sync-sender-tcp")]
+                    Some(conf::AuthParams::Ecdsa(_)) => {
                         return Err(error::fmt!(
                             AuthError,
                             "ECDSA authentication is not supported for ILP over HTTP. \
@@ -2667,9 +2605,11 @@ impl SenderBuilder {
         let protocol_version = match self.protocol_version.deref() {
             Some(v) => *v,
             None => match self.protocol {
+                #[cfg(feature = "sync-sender-tcp")]
                 Protocol::Tcp | Protocol::Tcps => ProtocolVersion::V1,
                 #[cfg(feature = "sync-sender-http")]
                 Protocol::Http | Protocol::Https => {
+                    #[allow(irrefutable_let_patterns)]
                     if let SyncProtocolHandler::SyncHttp(http_state) = &handler {
                         let settings_url = &format!(
                             "{}://{}:{}/settings",
@@ -2703,18 +2643,18 @@ impl SenderBuilder {
             descr.push_str("auth=off]");
         }
 
-        let sender = Sender {
+        let sender = Sender::new(
             descr,
             handler,
-            connected: true,
-            max_buf_size: *self.max_buf_size,
+            *self.max_buf_size,
             protocol_version,
             max_name_len,
-        };
+        );
 
         Ok(sender)
     }
 
+    #[cfg(feature = "_sender-tcp")]
     fn ensure_is_tcpx(&mut self, param_name: &str) -> Result<()> {
         if self.protocol.is_tcpx() {
             Ok(())
@@ -2755,7 +2695,9 @@ where
     })
 }
 
+#[cfg(feature = "_sender-tcp")]
 fn b64_decode(descr: &'static str, buf: &str) -> Result<Vec<u8>> {
+    use base64ct::{Base64UrlUnpadded, Encoding};
     Base64UrlUnpadded::decode_vec(buf).map_err(|b64_err| {
         error::fmt!(
             AuthError,
@@ -2767,6 +2709,7 @@ fn b64_decode(descr: &'static str, buf: &str) -> Result<Vec<u8>> {
     })
 }
 
+#[cfg(feature = "_sender-tcp")]
 fn parse_public_key(pub_key_x: &str, pub_key_y: &str) -> Result<Vec<u8>> {
     let mut pub_key_x = b64_decode("public key x", pub_key_x)?;
     let mut pub_key_y = b64_decode("public key y", pub_key_y)?;
@@ -2797,7 +2740,8 @@ fn parse_public_key(pub_key_x: &str, pub_key_y: &str) -> Result<Vec<u8>> {
     Ok(encoded)
 }
 
-fn parse_key_pair(auth: &EcdsaAuthParams) -> Result<EcdsaKeyPair> {
+#[cfg(feature = "_sender-tcp")]
+fn parse_key_pair(auth: &conf::EcdsaAuthParams) -> Result<EcdsaKeyPair> {
     let private_key = b64_decode("private authentication key", auth.priv_key.as_str())?;
     let public_key = parse_public_key(auth.pub_key_x.as_str(), auth.pub_key_y.as_str())?;
 
@@ -2864,241 +2808,6 @@ impl F64Serializer {
         }
     }
 }
-
-#[cfg(feature = "_sync-sender")]
-impl Sender {
-    /// Create a new `Sender` instance from the given configuration string.
-    ///
-    /// The format of the string is: `"http::addr=host:port;key=value;...;"`.
-    ///
-    /// Instead of `"http"`, you can also specify `"https"`, `"tcp"`, and `"tcps"`.
-    ///
-    /// We recommend HTTP for most cases because it provides more features, like
-    /// reporting errors to the client and supporting transaction control. TCP can
-    /// sometimes be faster in higher-latency networks, but misses a number of
-    /// features.
-    ///
-    /// Keys in the config string correspond to same-named methods on `SenderBuilder`.
-    ///
-    /// For the full list of keys and values, see the docs on [`SenderBuilder`].
-    ///
-    /// You can also load the configuration from an environment variable.
-    /// See [`Sender::from_env`].
-    ///
-    /// In the case of TCP, this synchronously establishes the TCP connection, and
-    /// returns once the connection is fully established. If the connection
-    /// requires authentication or TLS, these will also be completed before
-    /// returning.
-    pub fn from_conf<T: AsRef<str>>(conf: T) -> Result<Self> {
-        SenderBuilder::from_conf(conf)?.build()
-    }
-
-    /// Create a new `Sender` from the configuration stored in the `QDB_CLIENT_CONF`
-    /// environment variable. The format is the same as that accepted by
-    /// [`Sender::from_conf`].
-    ///
-    /// In the case of TCP, this synchronously establishes the TCP connection, and
-    /// returns once the connection is fully established. If the connection
-    /// requires authentication or TLS, these will also be completed before
-    /// returning.
-    pub fn from_env() -> Result<Self> {
-        SenderBuilder::from_env()?.build()
-    }
-
-    /// Creates a new [`Buffer`] using the sender's protocol settings
-    pub fn new_buffer(&self) -> Buffer {
-        Buffer::with_max_name_len(self.protocol_version, self.max_name_len)
-    }
-
-    #[allow(unused_variables)]
-    fn flush_impl(&mut self, buf: &Buffer, transactional: bool) -> Result<()> {
-        if !self.connected {
-            return Err(error::fmt!(
-                SocketError,
-                "Could not flush buffer: not connected to database."
-            ));
-        }
-        buf.check_can_flush()?;
-
-        if buf.len() > self.max_buf_size {
-            return Err(error::fmt!(
-                InvalidApiCall,
-                "Could not flush buffer: Buffer size of {} exceeds maximum configured allowed size of {} bytes.",
-                buf.len(),
-                self.max_buf_size
-            ));
-        }
-
-        self.check_protocol_version(buf.version)?;
-
-        let bytes = buf.as_bytes();
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        match self.handler {
-            #[cfg(feature = "sync-sender-tcp")]
-            SyncProtocolHandler::SyncTcp(ref mut conn) => {
-                if transactional {
-                    return Err(error::fmt!(
-                        InvalidApiCall,
-                        "Transactional flushes are not supported for ILP over TCP."
-                    ));
-                }
-                conn.write_all(bytes).map_err(|io_err| {
-                    self.connected = false;
-                    map_io_to_socket_err("Could not flush buffer: ", io_err)
-                })?;
-            }
-            #[cfg(feature = "sync-sender-http")]
-            SyncProtocolHandler::SyncHttp(ref state) => {
-                if transactional && !buf.transactional() {
-                    return Err(error::fmt!(
-                        InvalidApiCall,
-                        "Buffer contains lines for multiple tables. \
-                        Transactional flushes are only supported for buffers containing lines for a single table."
-                    ));
-                }
-                let request_min_throughput = *state.config.request_min_throughput;
-                let extra_time = if request_min_throughput > 0 {
-                    (bytes.len() as f64) / (request_min_throughput as f64)
-                } else {
-                    0.0f64
-                };
-
-                return match http_send_with_retries(
-                    state,
-                    bytes,
-                    *state.config.request_timeout + Duration::from_secs_f64(extra_time),
-                    *state.config.retry_timeout,
-                ) {
-                    Ok(res) => {
-                        if res.status().is_client_error() || res.status().is_server_error() {
-                            Err(parse_http_error(res.status().as_u16(), res))
-                        } else {
-                            res.into_body();
-                            Ok(())
-                        }
-                    }
-                    Err(err) => Err(Error::from_ureq_error(err, &state.url)),
-                };
-            }
-        }
-        Ok(())
-    }
-
-    /// Send the batch of rows in the buffer to the QuestDB server, and, if the
-    /// `transactional` parameter is true, ensure the flush will be transactional.
-    ///
-    /// A flush is transactional iff all the rows belong to the same table. This allows
-    /// QuestDB to treat the flush as a single database transaction, because it doesn't
-    /// support transactions spanning multiple tables. Additionally, only ILP-over-HTTP
-    /// supports transactional flushes.
-    ///
-    /// If the flush wouldn't be transactional, this function returns an error and
-    /// doesn't flush any data.
-    ///
-    /// The function sends an HTTP request and waits for the response. If the server
-    /// responds with an error, it returns a descriptive error. In the case of a network
-    /// error, it retries until it has exhausted the retry time budget.
-    ///
-    /// All the data stays in the buffer. Clear the buffer before starting a new batch.
-    #[cfg(feature = "sync-sender-http")]
-    pub fn flush_and_keep_with_flags(&mut self, buf: &Buffer, transactional: bool) -> Result<()> {
-        self.flush_impl(buf, transactional)
-    }
-
-    /// Send the given buffer of rows to the QuestDB server.
-    ///
-    /// All the data stays in the buffer. Clear the buffer before starting a new batch.
-    ///
-    /// To send and clear in one step, call [Sender::flush] instead.
-    pub fn flush_and_keep(&mut self, buf: &Buffer) -> Result<()> {
-        self.flush_impl(buf, false)
-    }
-
-    /// Send the given buffer of rows to the QuestDB server, clearing the buffer.
-    ///
-    /// After this function returns, the buffer is empty and ready for the next batch.
-    /// If you want to preserve the buffer contents, call [Sender::flush_and_keep]. If
-    /// you want to ensure the flush is transactional, call
-    /// [Sender::flush_and_keep_with_flags].
-    ///
-    /// With ILP-over-HTTP, this function sends an HTTP request and waits for the
-    /// response. If the server responds with an error, it returns a descriptive error.
-    /// In the case of a network error, it retries until it has exhausted the retry time
-    /// budget.
-    ///
-    /// With ILP-over-TCP, the function blocks only until the buffer is flushed to the
-    /// underlying OS-level network socket, without waiting to actually send it to the
-    /// server. In the case of an error, the server will quietly disconnect: consult the
-    /// server logs for error messages.
-    ///
-    /// HTTP should be the first choice, but use TCP if you need to continuously send
-    /// data to the server at a high rate.
-    ///
-    /// To improve the HTTP performance, send larger buffers (with more rows), and
-    /// consider parallelizing writes using multiple senders from multiple threads.
-    pub fn flush(&mut self, buf: &mut Buffer) -> Result<()> {
-        self.flush_impl(buf, false)?;
-        buf.clear();
-        Ok(())
-    }
-
-    /// Tell whether the sender is no longer usable and must be dropped.
-    ///
-    /// This happens when there was an earlier failure.
-    ///
-    /// This method is specific to ILP-over-TCP and is not relevant for ILP-over-HTTP.
-    pub fn must_close(&self) -> bool {
-        !self.connected
-    }
-
-    /// Returns the sender's protocol version
-    ///
-    /// - Explicitly set version, or
-    /// - Auto-detected for HTTP transport, or [`ProtocolVersion::V1`] for TCP transport.
-    pub fn protocol_version(&self) -> ProtocolVersion {
-        self.protocol_version
-    }
-
-    /// Return the sender's maxinum name length of any column or table name.
-    /// This is either set explicitly when constructing the sender,
-    /// or the default value of 127.
-    /// When unset and using protocol version 2 over HTTP, the value is read
-    /// from the server from the `cairo.max.file.name.length` setting in
-    /// `server.conf` which defaults to 127.
-    pub fn max_name_len(&self) -> usize {
-        self.max_name_len
-    }
-
-    #[inline(always)]
-    fn check_protocol_version(&self, version: ProtocolVersion) -> Result<()> {
-        if self.protocol_version != version {
-            return Err(error::fmt!(
-                ProtocolVersionError,
-                "Attempting to send with protocol version {} \
-                but the sender is configured to use protocol version {}",
-                version,
-                self.protocol_version
-            ));
-        }
-        Ok(())
-    }
-}
-
-pub(crate) const ARRAY_BINARY_FORMAT_TYPE: u8 = 14;
-pub(crate) const DOUBLE_BINARY_FORMAT_TYPE: u8 = 16;
-
-mod conf;
-pub(crate) mod ndarr;
-mod timestamp;
-
-#[cfg(feature = "sync-sender-http")]
-mod http;
-
-use crate::ingress::ndarr::check_and_get_array_bytes_size;
-#[cfg(feature = "sync-sender-http")]
-use http::*;
 
 #[cfg(test)]
 mod tests;

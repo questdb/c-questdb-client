@@ -118,7 +118,7 @@ fn http_basic_auth() {
             .unwrap();
     let auth = builder.build_auth().unwrap();
     match auth.unwrap() {
-        AuthParams::Basic(BasicAuthParams { username, password }) => {
+        conf::AuthParams::Basic(conf::BasicAuthParams { username, password }) => {
             assert_eq!(username, "user123");
             assert_eq!(password, "pass321");
         }
@@ -134,7 +134,7 @@ fn http_token_auth() {
     let builder = SenderBuilder::from_conf("http::addr=localhost:9000;token=token123;").unwrap();
     let auth = builder.build_auth().unwrap();
     match auth.unwrap() {
-        AuthParams::Token(TokenAuthParams { token }) => {
+        conf::AuthParams::Token(conf::TokenAuthParams { token }) => {
             assert_eq!(token, "token123");
         }
         _ => {
@@ -278,7 +278,7 @@ fn tcp_ecdsa_auth() {
     .unwrap();
     let auth = builder.build_auth().unwrap();
     match auth.unwrap() {
-        AuthParams::Ecdsa(EcdsaAuthParams {
+        conf::AuthParams::Ecdsa(conf::EcdsaAuthParams {
             key_id,
             priv_key,
             pub_key_x,
@@ -388,6 +388,8 @@ fn tcps_tls_roots_os() {
 
 #[test]
 fn tcps_tls_roots_file() {
+    use std::io::Write;
+
     // Write a dummy file to test the file path
     let tmp_dir = TempDir::new().unwrap();
     let path = tmp_dir.path().join("cacerts.pem");
@@ -415,6 +417,8 @@ fn tcps_tls_roots_file_missing() {
 
 #[test]
 fn tcps_tls_roots_file_with_password() {
+    use std::io::Write;
+
     let tmp_dir = TempDir::new().unwrap();
     let path = tmp_dir.path().join("cacerts.pem");
     let mut file = std::fs::File::create(&path).unwrap();

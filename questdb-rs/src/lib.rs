@@ -24,7 +24,10 @@
 #![doc = include_str!("../README.md")]
 
 mod error;
+
+#[cfg(feature = "sync-sender-tcp")]
 mod gai;
+
 pub mod ingress;
 
 pub use error::*;
