@@ -24,7 +24,7 @@
 
 mod f64_serializer;
 
-#[cfg(feature = "ilp-over-http")]
+#[cfg(feature = "sync-sender-http")]
 mod http;
 
 mod mock;

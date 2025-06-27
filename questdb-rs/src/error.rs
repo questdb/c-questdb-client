@@ -96,7 +96,7 @@ impl Error {
         }
     }
 
-    #[cfg(feature = "ilp-over-http")]
+    #[cfg(feature = "sync-sender-http")]
     pub(crate) fn from_ureq_error(err: ureq::Error, url: &str) -> Error {
         match err {
             ureq::Error::StatusCode(code) => {

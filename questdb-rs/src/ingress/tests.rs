@@ -26,7 +26,7 @@ use super::*;
 use crate::ErrorCode;
 use tempfile::TempDir;
 
-#[cfg(feature = "ilp-over-http")]
+#[cfg(feature = "sync-sender-http")]
 #[test]
 fn http_simple() {
     let builder = SenderBuilder::from_conf("http::addr=127.0.0.1;").unwrap();
@@ -36,7 +36,7 @@ fn http_simple() {
     assert!(!builder.protocol.tls_enabled());
 }
 
-#[cfg(feature = "ilp-over-http")]
+#[cfg(feature = "sync-sender-http")]
 #[test]
 fn https_simple() {
     let builder = SenderBuilder::from_conf("https::addr=localhost;").unwrap();
@@ -110,7 +110,7 @@ fn unsupported_service() {
     );
 }
 
-#[cfg(feature = "ilp-over-http")]
+#[cfg(feature = "sync-sender-http")]
 #[test]
 fn http_basic_auth() {
     let builder =
@@ -118,7 +118,7 @@ fn http_basic_auth() {
             .unwrap();
     let auth = builder.build_auth().unwrap();
     match auth.unwrap() {
-        AuthParams::Basic(BasicAuthParams { username, password }) => {
+        conf::AuthParams::Basic(conf::BasicAuthParams { username, password }) => {
             assert_eq!(username, "user123");
             assert_eq!(password, "pass321");
         }
@@ -128,13 +128,13 @@ fn http_basic_auth() {
     }
 }
 
-#[cfg(feature = "ilp-over-http")]
+#[cfg(feature = "sync-sender-http")]
 #[test]
 fn http_token_auth() {
     let builder = SenderBuilder::from_conf("http::addr=localhost:9000;token=token123;").unwrap();
     let auth = builder.build_auth().unwrap();
     match auth.unwrap() {
-        AuthParams::Token(TokenAuthParams { token }) => {
+        conf::AuthParams::Token(conf::TokenAuthParams { token }) => {
             assert_eq!(token, "token123");
         }
         _ => {
@@ -143,7 +143,7 @@ fn http_token_auth() {
     }
 }
 
-#[cfg(feature = "ilp-over-http")]
+#[cfg(feature = "sync-sender-http")]
 #[test]
 fn incomplete_basic_auth() {
     assert_conf_err(
@@ -160,7 +160,7 @@ fn incomplete_basic_auth() {
     );
 }
 
-#[cfg(feature = "ilp-over-http")]
+#[cfg(feature = "sync-sender-http")]
 #[test]
 fn zero_timeout_forbidden() {
     assert_conf_err(
@@ -175,7 +175,7 @@ fn zero_timeout_forbidden() {
     );
 }
 
-#[cfg(feature = "ilp-over-http")]
+#[cfg(feature = "sync-sender-http")]
 #[test]
 fn misspelled_basic_auth() {
     assert_conf_err(
@@ -188,7 +188,7 @@ fn misspelled_basic_auth() {
     );
 }
 
-#[cfg(feature = "ilp-over-http")]
+#[cfg(feature = "sync-sender-http")]
 #[test]
 fn inconsistent_http_auth() {
     let expected_err_msg = r##"Inconsistent HTTP authentication parameters. Specify either "username" and "password", or just "token"."##;
@@ -202,7 +202,7 @@ fn inconsistent_http_auth() {
     );
 }
 
-#[cfg(feature = "ilp-over-http")]
+#[cfg(feature = "sync-sender-http")]
 #[test]
 fn cant_use_basic_auth_with_tcp() {
     let builder = SenderBuilder::new(Protocol::Tcp, "localhost", 9000)
@@ -216,7 +216,7 @@ fn cant_use_basic_auth_with_tcp() {
     );
 }
 
-#[cfg(feature = "ilp-over-http")]
+#[cfg(feature = "sync-sender-http")]
 #[test]
 fn cant_use_token_auth_with_tcp() {
     let builder = SenderBuilder::new(Protocol::Tcp, "localhost", 9000)
@@ -228,7 +228,7 @@ fn cant_use_token_auth_with_tcp() {
     );
 }
 
-#[cfg(feature = "ilp-over-http")]
+#[cfg(feature = "sync-sender-http")]
 #[test]
 fn cant_use_ecdsa_auth_with_http() {
     let builder = SenderBuilder::from_conf("http::addr=localhost;")
@@ -278,7 +278,7 @@ fn tcp_ecdsa_auth() {
     .unwrap();
     let auth = builder.build_auth().unwrap();
     match auth.unwrap() {
-        AuthParams::Ecdsa(EcdsaAuthParams {
+        conf::AuthParams::Ecdsa(conf::EcdsaAuthParams {
             key_id,
             priv_key,
             pub_key_x,
@@ -289,7 +289,7 @@ fn tcp_ecdsa_auth() {
             assert_eq!(pub_key_x, "xtok123");
             assert_eq!(pub_key_y, "ytok123");
         }
-        #[cfg(feature = "ilp-over-http")]
+        #[cfg(feature = "sync-sender-http")]
         _ => {
             panic!("Expected AuthParams::Ecdsa");
         }
@@ -388,6 +388,8 @@ fn tcps_tls_roots_os() {
 
 #[test]
 fn tcps_tls_roots_file() {
+    use std::io::Write;
+
     // Write a dummy file to test the file path
     let tmp_dir = TempDir::new().unwrap();
     let path = tmp_dir.path().join("cacerts.pem");
@@ -415,6 +417,8 @@ fn tcps_tls_roots_file_missing() {
 
 #[test]
 fn tcps_tls_roots_file_with_password() {
+    use std::io::Write;
+
     let tmp_dir = TempDir::new().unwrap();
     let path = tmp_dir.path().join("cacerts.pem");
     let mut file = std::fs::File::create(&path).unwrap();
@@ -426,7 +430,7 @@ fn tcps_tls_roots_file_with_password() {
     assert_conf_err(builder_or_err, "\"tls_roots_password\" is not supported.");
 }
 
-#[cfg(feature = "ilp-over-http")]
+#[cfg(feature = "sync-sender-http")]
 #[test]
 fn http_request_min_throughput() {
     let builder =
@@ -439,7 +443,7 @@ fn http_request_min_throughput() {
     assert_defaulted_eq(&http_config.retry_timeout, Duration::from_millis(10000));
 }
 
-#[cfg(feature = "ilp-over-http")]
+#[cfg(feature = "sync-sender-http")]
 #[test]
 fn http_request_timeout() {
     let builder = SenderBuilder::from_conf("http::addr=localhost;request_timeout=100;").unwrap();
@@ -451,7 +455,7 @@ fn http_request_timeout() {
     assert_defaulted_eq(&http_config.retry_timeout, Duration::from_millis(10000));
 }
 
-#[cfg(feature = "ilp-over-http")]
+#[cfg(feature = "sync-sender-http")]
 #[test]
 fn http_retry_timeout() {
     let builder = SenderBuilder::from_conf("http::addr=localhost;retry_timeout=100;").unwrap();
@@ -463,7 +467,7 @@ fn http_retry_timeout() {
     assert_specified_eq(&http_config.retry_timeout, Duration::from_millis(100));
 }
 
-#[cfg(feature = "ilp-over-http")]
+#[cfg(feature = "sync-sender-http")]
 #[test]
 fn connect_timeout_uses_request_timeout() {
     use std::time::Instant;
