@@ -152,7 +152,7 @@ impl Sender {
             ));
         }
 
-        self.check_protocol_version(buf.version)?;
+        self.check_protocol_version(buf.protocol_version())?;
 
         let bytes = buf.as_bytes();
         if bytes.is_empty() {

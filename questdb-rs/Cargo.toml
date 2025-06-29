@@ -40,6 +40,10 @@ ureq = { version = "3.0.10, <3.1.0", default-features = false, features = ["rust
 tokio = { version = "1.45.1", default-features = false, features = ["net"], optional = true }
 tokio-rustls = { version = "0.26.2", default-features = false, optional = true }
 hyper = { version = "1.6.0", default-features = false, optional = true }
+http-body-util = { version = "0.1.3", optional = true }
+hyper-util = { version = "0.1.14", optional = true }
+lasso = { version = "0.7.3", features = ["multi-threaded"], optional = true }
+crossbeam-queue = { version = "0.3.12", optional = true }
 
 serde_json = { version = "1", optional = true }
 questdb-confstr = "0.1.1"
@@ -74,14 +78,17 @@ sync-sender-tcp = ["_sync-sender", "_sender-tcp", "dep:socket2"]
 ## Sync ILP/HTTP
 sync-sender-http = ["_sync-sender", "_sender-http", "dep:ureq", "dep:serde_json", "dep:rand"]
 
-## Async ILP/TCP + ILP/HTTP Sender
-async-sender = ["_async-sender", "async-sender-tcp", "async-sender-http"]
-
-## Async ILP/TCP Sender
-async-sender-tcp = ["_async-sender", "_sender-tcp", "dep:tokio", "dep:tokio-rustls"]
-
 ## Async ILP/HTTP Sender
-async-sender-http = ["_sender-http", "dep:tokio", "dep:hyper"]
+async-sender-http = [
+    "_async-sender",
+    "_sender-http",
+    "dep:tokio",
+    "dep:tokio-rustls",
+    "dep:hyper",
+    "dep:http-body-util",
+    "dep:hyper-util",
+    "dep:lasso",
+    "dep:crossbeam-queue"]
 
 ## Compatiblity alias.
 ilp-over-http = ["sync-sender-tcp"]
@@ -120,7 +127,7 @@ _async-sender = [] # equiv of any(async-sender-tcp, async-sender-http)
 ## This is useful for quickly running `cargo test` or `cargo clippy`.
 almost-all-features = [
     "sync-sender",
-    "async-sender",
+    "async-sender-http",
     "tls-webpki-certs",
     "tls-native-certs",
     "ring-crypto",
