@@ -22,8 +22,32 @@
  *
  ******************************************************************************/
 
-// use http_body_util::Empty;
-// use hyper::Request;
-// use hyper::body::Bytes;
-// use hyper_util::rt::TokioIo;
-// use tokio::net::TcpStream;
+use crate::error::{fmt, Result};
+use crate::ingress::conf::AuthParams;
+use crate::ingress::tls::TlsSettings;
+use crate::ingress::CertificateAuthority;
+use reqwest::{Certificate, Client};
+
+pub(super) struct HttpClient {
+    host: String,
+    port: String,
+    tls: TlsSettings,
+
+    client: Client,
+}
+
+impl HttpClient {
+    pub fn new(
+        host: &str,
+        port: &str,
+        tls: Option<TlsSettings>,
+        auth_params: Option<AuthParams>,
+    ) -> Result<Self> {
+        let builder = Client::builder();
+        let client = match builder.build() {
+            Ok(client) => client,
+            Err(e) => return Err(fmt!(ConfigError, "Could not create http client: {}", e)),
+        };
+        Ok(Self { client })
+    }
+}

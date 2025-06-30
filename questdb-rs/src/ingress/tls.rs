@@ -101,19 +101,22 @@ fn add_os_roots(root_store: &mut RootCertStore) -> crate::Result<()> {
     Ok(())
 }
 
+pub(crate) struct TlsSettings<'a> {
+    pub verify_hostname: bool,
+    pub ca: CertificateAuthority,
+    pub roots: Option<&'a Path>,
+}
+
 pub(crate) fn configure_tls(
-    tls_enabled: bool,
-    tls_verify: bool,
-    tls_ca: CertificateAuthority,
-    tls_roots: Option<&Path>,
+    tls: Option<TlsSettings>,
 ) -> crate::Result<Option<Arc<rustls::ClientConfig>>> {
-    if !tls_enabled {
+    let Some(tls) = tls else {
         return Ok(None);
-    }
+    };
 
     let mut root_store = RootCertStore::empty();
-    if tls_verify {
-        match (tls_ca, tls_roots) {
+    if tls.verify_hostname {
+        match (tls.ca, tls.roots) {
             #[cfg(feature = "tls-webpki-certs")]
             (CertificateAuthority::WebpkiRoots, None) => {
                 add_webpki_roots(&mut root_store);
@@ -189,7 +192,7 @@ pub(crate) fn configure_tls(
     config.key_log = Arc::new(rustls::KeyLogFile::new());
 
     #[cfg(feature = "insecure-skip-verify")]
-    if !tls_verify {
+    if !tls.verify_hostname {
         config
             .dangerous()
             .set_certificate_verifier(Arc::new(danger::NoCertificateVerification {}));

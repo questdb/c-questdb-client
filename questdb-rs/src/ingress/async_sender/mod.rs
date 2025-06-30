@@ -24,12 +24,13 @@
 use crate::error::Result;
 use crate::ingress::ndarr::ArrayElementSealed;
 use crate::ingress::{
-    ArrayElement, Buffer, ColumnName, NdArrayView, ProtocolVersion, TableName, Timestamp,
+    ArrayElement, Buffer, ColumnName, NdArrayView, ProtocolVersion, SenderBuilder, TableName,
+    Timestamp,
 };
 use crate::Error;
 use crossbeam_queue::ArrayQueue;
 use lasso::{Spur, ThreadedRodeo};
-use std::fmt::{Debug, Display};
+use std::fmt::{Debug, Display, Formatter};
 use std::sync::Arc;
 
 mod http;
@@ -243,26 +244,38 @@ impl Drop for Transaction {
         let empty_buffer = Buffer::new(self.buffer.protocol_version());
         let detached_buffer = std::mem::replace(&mut self.buffer, empty_buffer);
         let cap = detached_buffer.capacity();
-        if (cap > 0) && (cap <= self.sender.max_buffer_capacity_keep) {
+        if (cap > 0) && (cap <= self.sender.settings.max_buffer_capacity_keep) {
             // If the buffers queue is full, drop the buffer.
             let _ = self.sender.buffer_pool.push(detached_buffer);
         }
     }
 }
 
-pub struct AsyncSender {
-    names: ThreadedRodeo,
-    buffer_pool: ArrayQueue<Buffer>,
+pub(crate) struct AsyncSenderSettings {
     max_concurrent_connections: usize,
     max_buffer_capacity_keep: usize,
-    protocol_version: ProtocolVersion,
     max_name_len: usize,
+    protocol_version: ProtocolVersion,
+}
+
+pub struct AsyncSender {
+    descr: String,
+    settings: AsyncSenderSettings,
+    names: ThreadedRodeo,
+    buffer_pool: ArrayQueue<Buffer>,
+    client: u64,
 }
 
 impl AsyncSender {
-    pub(crate) async fn new() -> Result<Arc<Self>> {
-        todo!()
+    pub async fn from_conf<T: AsRef<str>>(conf: T) -> Result<Arc<Self>> {
+        SenderBuilder::from_conf(conf)?.build_async().await
     }
+
+    pub async fn from_env() -> Result<Arc<Self>> {
+        SenderBuilder::from_env()?.build_async().await
+    }
+
+    pub(crate) async fn new(descr: String, host: &str, port: &str) -> Result<Arc<Self>> {}
 
     pub fn new_transaction<'a, N>(self: &Arc<Self>, name: N) -> Result<Transaction>
     where
@@ -271,10 +284,9 @@ impl AsyncSender {
     {
         let name = name.try_into()?;
         let name_key = self.names.get_or_intern(name.as_ref());
-        let buffer = self
-            .buffer_pool
-            .pop()
-            .unwrap_or_else(|| Buffer::with_max_name_len(self.protocol_version, self.max_name_len));
+        let buffer = self.buffer_pool.pop().unwrap_or_else(|| {
+            Buffer::with_max_name_len(self.settings.protocol_version, self.settings.max_name_len)
+        });
         Ok(Transaction {
             sender: self.clone(),
             name_key,
@@ -284,5 +296,11 @@ impl AsyncSender {
 
     async fn flush_buffer(&self, _buffer: Buffer) -> (Buffer, Result<()>) {
         todo!()
+    }
+}
+
+impl Debug for AsyncSender {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        todo!() // use .descr
     }
 }

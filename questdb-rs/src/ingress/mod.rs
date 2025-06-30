@@ -26,7 +26,7 @@
 
 pub use self::ndarr::{ArrayElement, NdArrayView};
 pub use self::timestamp::*;
-use crate::error::{self, Error, Result};
+use crate::error::{self, fmt, Result};
 use crate::ingress::conf::ConfigSetting;
 use core::time::Duration;
 use std::collections::HashMap;
@@ -106,8 +106,8 @@ impl Display for ProtocolVersion {
 }
 
 #[cfg(feature = "_sender-tcp")]
-fn map_io_to_socket_err(prefix: &str, io_err: std::io::Error) -> Error {
-    error::fmt!(SocketError, "{}{}", prefix, io_err)
+fn map_io_to_socket_err(prefix: &str, io_err: std::io::Error) -> error::Error {
+    fmt!(SocketError, "{}{}", prefix, io_err)
 }
 
 /// Possible sources of the root certificates used to validate the server's TLS
@@ -1016,6 +1016,28 @@ impl SenderBuilder {
         }
     }
 
+    #[cfg(feature = "_async-sender")]
+    async fn build_async(self) -> Result<std::sync::Arc<AsyncSender>> {
+        if !self.protocol.is_httpx() {
+            return Err(fmt!(
+                ConfigError,
+                "Only the HTTP and HTTPS protocols are supported by the AsyncSender."
+            ));
+        }
+
+        let mut descr = format!("Sender[host={:?},port={:?},", self.host, self.port);
+
+        if self.protocol.tls_enabled() {
+            write!(descr, "tls=enabled,").unwrap();
+        } else {
+            write!(descr, "tls=disabled,").unwrap();
+        }
+
+        let auth = self.build_auth()?;
+
+        AsyncSender::new(descr, self.host.deref(), self.port.deref()).await
+    }
+
     #[cfg(feature = "_sync-sender")]
     /// Build the sender.
     ///
@@ -1081,12 +1103,17 @@ impl SenderBuilder {
                 #[cfg(not(feature = "insecure-skip-verify"))]
                 let tls_verify = true;
 
-                let connector = connector.chain(TlsConnector::new(tls::configure_tls(
-                    self.protocol.tls_enabled(),
-                    tls_verify,
-                    *self.tls_ca,
-                    self.tls_roots.deref().as_deref(),
-                )?));
+                let tls_settings = if self.protocol.tls_enabled() {
+                    Some(tls::TlsSettings {
+                        verify_hostname: tls_verify,
+                        ca: *self.tls_ca,
+                        roots: self.tls_roots.deref().as_deref(),
+                    })
+                } else {
+                    None
+                };
+                let connector =
+                    connector.chain(TlsConnector::new(tls::configure_tls(tls_settings)?));
 
                 let auth = match auth {
                     Some(conf::AuthParams::Basic(ref auth)) => Some(auth.to_header_string()),
