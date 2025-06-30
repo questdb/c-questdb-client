@@ -24,27 +24,36 @@
 
 use crate::{
     ingress::{
-        Buffer, CertificateAuthority, Sender, TableName, Timestamp, TimestampMicros, TimestampNanos,
+        Buffer, F64Serializer, Sender, TableName, Timestamp, TimestampMicros, TimestampNanos,
+        DOUBLE_BINARY_FORMAT_TYPE,
     },
-    tests::assert_err_contains,
-    Error, ErrorCode,
+    ErrorCode,
 };
 
-use crate::ingress;
+use crate::ingress::ProtocolVersion;
+use crate::tests::TestResult;
+use core::time::Duration;
+
 #[cfg(feature = "ndarray")]
 use crate::ingress::ndarr::write_array_data;
-use crate::ingress::ProtocolVersion;
-use crate::tests::{
-    mock::{certs_dir, MockServer},
-    ndarr::ArrayColumnTypeTag,
-    TestResult,
-};
-use core::time::Duration;
+
 #[cfg(feature = "ndarray")]
 use ndarray::{arr2, ArrayD};
-use rstest::rstest;
-use std::io;
 
+#[cfg(feature = "sync-sender-tcp")]
+use crate::tests::{
+    assert_err_contains,
+    mock::{certs_dir, MockServer},
+    ndarr::ArrayColumnTypeTag,
+};
+
+#[cfg(feature = "sync-sender-tcp")]
+use rstest::rstest;
+
+#[cfg(feature = "sync-sender-tcp")]
+use crate::ingress::{CertificateAuthority, ARRAY_BINARY_FORMAT_TYPE};
+
+#[cfg(feature = "sync-sender-tcp")]
 #[rstest]
 fn test_basics(
     #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
@@ -99,6 +108,7 @@ fn test_basics(
     Ok(())
 }
 
+#[cfg(feature = "sync-sender-tcp")]
 #[test]
 fn test_array_f64_basic() -> TestResult {
     let mut server = MockServer::new()?;
@@ -124,7 +134,7 @@ fn test_array_f64_basic() -> TestResult {
         f64_to_bytes("f1", 25.5, ProtocolVersion::V2).as_slice(),
         b",arr1d=",
         b"=", // binary field
-        &[ingress::ARRAY_BINARY_FORMAT_TYPE],
+        &[ARRAY_BINARY_FORMAT_TYPE],
         &[ArrayColumnTypeTag::Double.into()],
         &[1u8],              // 1D array
         &3u32.to_le_bytes(), // 3 elements
@@ -145,6 +155,7 @@ fn test_array_f64_basic() -> TestResult {
     Ok(())
 }
 
+#[cfg(feature = "sync-sender-tcp")]
 #[cfg(feature = "ndarray")]
 #[test]
 fn test_array_f64_for_ndarray() -> TestResult {
@@ -172,7 +183,7 @@ fn test_array_f64_for_ndarray() -> TestResult {
 
     let array_header2d = &[
         &[b'='][..],
-        &[ingress::ARRAY_BINARY_FORMAT_TYPE],
+        &[ARRAY_BINARY_FORMAT_TYPE],
         &[ArrayColumnTypeTag::Double.into()],
         &[2u8],
         &2i32.to_le_bytes(),
@@ -184,7 +195,7 @@ fn test_array_f64_for_ndarray() -> TestResult {
 
     let array_header3d = &[
         &[b'='][..],
-        &[ingress::ARRAY_BINARY_FORMAT_TYPE],
+        &[ARRAY_BINARY_FORMAT_TYPE],
         &[ArrayColumnTypeTag::Double.into()],
         &[3u8],
         &2i32.to_le_bytes(),
@@ -222,6 +233,7 @@ fn test_array_f64_for_ndarray() -> TestResult {
     Ok(())
 }
 
+#[cfg(feature = "sync-sender-tcp")]
 #[rstest]
 fn test_max_buf_size(
     #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
@@ -379,6 +391,7 @@ fn test_transactional() -> TestResult {
     Ok(())
 }
 
+#[cfg(feature = "sync-sender-tcp")]
 #[test]
 fn test_auth_inconsistent_keys() -> TestResult {
     test_bad_key("fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU", // d
@@ -388,6 +401,7 @@ fn test_auth_inconsistent_keys() -> TestResult {
     )
 }
 
+#[cfg(feature = "sync-sender-tcp")]
 #[test]
 fn test_auth_bad_base64_private_key() -> TestResult {
     test_bad_key(
@@ -398,6 +412,7 @@ fn test_auth_bad_base64_private_key() -> TestResult {
     )
 }
 
+#[cfg(feature = "sync-sender-tcp")]
 #[test]
 fn test_auth_private_key_too_long() -> TestResult {
     #[cfg(feature = "aws-lc-crypto")]    
@@ -414,6 +429,7 @@ fn test_auth_private_key_too_long() -> TestResult {
     )
 }
 
+#[cfg(feature = "sync-sender-tcp")]
 #[test]
 fn test_auth_public_key_x_too_long() -> TestResult {
     test_bad_key(
@@ -424,6 +440,7 @@ fn test_auth_public_key_x_too_long() -> TestResult {
     )
 }
 
+#[cfg(feature = "sync-sender-tcp")]
 #[test]
 fn test_auth_public_key_y_too_long() -> TestResult {
     test_bad_key(
@@ -434,6 +451,7 @@ fn test_auth_public_key_y_too_long() -> TestResult {
     )
 }
 
+#[cfg(feature = "sync-sender-tcp")]
 #[test]
 fn test_auth_bad_base64_public_key_x() -> TestResult {
     test_bad_key(
@@ -444,6 +462,7 @@ fn test_auth_bad_base64_public_key_x() -> TestResult {
     )
 }
 
+#[cfg(feature = "sync-sender-tcp")]
 #[test]
 fn test_auth_bad_base64_public_key_y() -> TestResult {
     test_bad_key(
@@ -454,6 +473,7 @@ fn test_auth_bad_base64_public_key_y() -> TestResult {
     )
 }
 
+#[cfg(feature = "sync-sender-tcp")]
 fn test_bad_key(
     priv_key: &str,
     pub_key_x: &str,
@@ -591,6 +611,7 @@ fn test_arr_column_name_too_long() -> TestResult {
     column_name_too_long_test_impl!(column_arr, &[1.0, 2.0, 3.0])
 }
 
+#[cfg(feature = "sync-sender-tcp")]
 #[rstest]
 fn test_tls_with_file_ca(
     #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
@@ -629,6 +650,7 @@ fn test_tls_with_file_ca(
     Ok(())
 }
 
+#[cfg(feature = "sync-sender-tcp")]
 #[test]
 fn test_tls_to_plain_server() -> TestResult {
     let mut ca_path = certs_dir();
@@ -640,7 +662,7 @@ fn test_tls_to_plain_server() -> TestResult {
         .auth_timeout(Duration::from_millis(500))?
         .tls_ca(CertificateAuthority::PemFile)?
         .tls_roots(ca_path)?;
-    let server_jh = std::thread::spawn(move || -> io::Result<MockServer> {
+    let server_jh = std::thread::spawn(move || -> std::io::Result<MockServer> {
         server.accept()?;
         Ok(server)
     });
@@ -649,7 +671,7 @@ fn test_tls_to_plain_server() -> TestResult {
     let err = maybe_sender.unwrap_err();
     assert_eq!(
         err,
-        Error::new(
+        crate::error::Error::new(
             ErrorCode::TlsError,
             "Failed to complete TLS handshake: \
          Timed out waiting for server response after 500ms."
@@ -659,6 +681,7 @@ fn test_tls_to_plain_server() -> TestResult {
     Ok(())
 }
 
+#[cfg(feature = "sync-sender-tcp")]
 fn expect_eventual_disconnect(sender: &mut Sender) {
     let mut retry = || {
         for _ in 0..1000 {
@@ -670,10 +693,11 @@ fn expect_eventual_disconnect(sender: &mut Sender) {
         Ok(())
     };
 
-    let err: Error = retry().unwrap_err();
+    let err: crate::error::Error = retry().unwrap_err();
     assert_eq!(err.code(), ErrorCode::SocketError);
 }
 
+#[cfg(feature = "sync-sender-tcp")]
 #[test]
 fn test_plain_to_tls_server() -> TestResult {
     let server = MockServer::new()?;
@@ -684,8 +708,8 @@ fn test_plain_to_tls_server() -> TestResult {
 
     // The server failed to handshake, so disconnected the client.
     assert!(
-        (server_err.kind() == io::ErrorKind::TimedOut)
-            || (server_err.kind() == io::ErrorKind::WouldBlock)
+        (server_err.kind() == std::io::ErrorKind::TimedOut)
+            || (server_err.kind() == std::io::ErrorKind::WouldBlock)
     );
 
     // The client nevertheless connected successfully.
@@ -741,6 +765,7 @@ fn bad_uppercase_protocol() {
     assert!(err.msg() == "Unsupported protocol: TCP");
 }
 
+#[cfg(feature = "sync-sender-tcp")]
 #[test]
 fn bad_uppercase_addr() {
     let res = Sender::from_conf("tcp::ADDR=localhost:9009;");
@@ -750,6 +775,7 @@ fn bad_uppercase_addr() {
     assert!(err.msg() == "Missing \"addr\" parameter in config string");
 }
 
+#[cfg(feature = "sync-sender-tcp")]
 #[test]
 fn tcp_mismatched_buffer_and_sender_version() -> TestResult {
     let server = MockServer::new()?;
@@ -775,12 +801,12 @@ pub(crate) fn f64_to_bytes(name: &str, value: f64, version: ProtocolVersion) -> 
 
     match version {
         ProtocolVersion::V1 => {
-            let mut ser = crate::ingress::F64Serializer::new(value);
+            let mut ser = F64Serializer::new(value);
             buf.extend_from_slice(ser.as_str().as_bytes());
         }
         ProtocolVersion::V2 => {
             buf.push(b'=');
-            buf.push(crate::ingress::DOUBLE_BINARY_FORMAT_TYPE);
+            buf.push(DOUBLE_BINARY_FORMAT_TYPE);
             buf.extend_from_slice(&value.to_le_bytes());
         }
     }

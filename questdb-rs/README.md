@@ -91,18 +91,19 @@ A selection of usage examples is available in the [examples directory](https://g
 The crate provides several optional features to enable additional functionality. You can enable features using Cargo's `--features` flag or in your `Cargo.toml`.
 
 ### Default features
-
-- **ilp-over-http**: Enables ILP/HTTP support via the `ureq` crate for sending data over HTTP.
-- **tls-webpki-certs**: Uses the `webpki-roots` crate to validate TLS certificates.
+- **sync-sender**: Enables both `sync-sender-tcp` and `sync-sender-http`.
+- **sync-sender-tcp**: Enables ILP/TCP (legacy). Depends on the `socket2` crate.
+- **sync-sender-http**: Enables ILP/HTTP support. Depends on the `ureq` crate.
+- **tls-webpki-certs**: Uses a snapshot of the [Common CA Database](https://www.ccadb.org/) as root TLS certificates. Depends on the `webpki-roots` crate.
 - **ring-crypto**: Uses the `ring` crate as the cryptography backend for TLS (default crypto backend).
 
 ### Optional features
 
-- **chrono_timestamp**: Allows specifying timestamps as `chrono::DateTime` objects. Requires the `chrono` crate.
-- **tls-native-certs**: Uses OS-provided root TLS certificates for secure connections (via `rustls-native-certs`).
+- **chrono_timestamp**: Allows specifying timestamps as `chrono::DateTime` objects. Depends on the `chrono` crate.
+- **tls-native-certs**: Uses OS-provided root TLS certificates for secure connections. Depends on the `rustls-native-certs` crate.
 - **insecure-skip-verify**: Allows skipping verification of insecure certificates (not recommended for production).
 - **ndarray**: Enables integration with the `ndarray` crate for working with n-dimensional arrays. Without this feature, you can still send slices or implement custom array types via the `NdArrayView` trait.
-- **aws-lc-crypto**: Uses `aws-lc-rs` as the cryptography backend for TLS. Mutually exclusive with `ring-crypto`.
+- **aws-lc-crypto**: Uses `aws-lc-rs` as the cryptography backend for TLS. Mutually exclusive with the `ring-crypto` feature.
 
 - **almost-all-features**: Convenience feature for development and testing. Enables most features except mutually exclusive crypto backends.
 

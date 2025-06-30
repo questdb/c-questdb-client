@@ -51,6 +51,7 @@ slugify = "0.1.0"
 indoc = "2"
 
 [dev-dependencies]
+socket2 = "0.5.5"
 mio = { version = "1", features = ["os-poll", "net"] }
 chrono = "0.4.31"
 tempfile = "3"
@@ -68,9 +69,6 @@ sync-sender-tcp = ["_sync-sender", "_sender-tcp", "dep:socket2"]
 
 ## Sync ILP/HTTP
 sync-sender-http = ["_sync-sender", "_sender-http", "dep:ureq", "dep:serde_json", "dep:rand"]
-
-## Compatiblity alias for `sync-sender-tcp` for versions < 5.0.0
-ilp-over-http = ["sync-sender-tcp"]
 
 ## Allow use OS-provided root TLS certificates
 tls-native-certs = ["dep:rustls-native-certs"]

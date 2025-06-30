@@ -36,11 +36,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::ingress;
+#[cfg(feature = "sync-sender-tcp")]
+use crate::tests::ndarr::ArrayColumnTypeTag;
+
 #[cfg(feature = "sync-sender-http")]
 use std::io::Write;
-
-use super::ndarr::ArrayColumnTypeTag;
 
 const CLIENT: Token = Token(0);
 
@@ -53,7 +53,10 @@ pub struct MockServer {
     tls_conn: Option<ServerConnection>,
     pub host: &'static str,
     pub port: u16,
+
+    #[cfg(feature = "sync-sender-tcp")]
     pub msgs: Vec<Vec<u8>>,
+
     #[cfg(feature = "sync-sender-http")]
     settings_response: serde_json::Value,
 }
@@ -210,7 +213,10 @@ impl MockServer {
             tls_conn: None,
             host: "localhost",
             port,
+
+            #[cfg(feature = "sync-sender-tcp")]
             msgs: Vec::new(),
+
             #[cfg(feature = "sync-sender-http")]
             settings_response: serde_json::Value::Null,
         })
@@ -258,6 +264,7 @@ impl MockServer {
         Ok(())
     }
 
+    #[cfg(feature = "sync-sender-tcp")]
     pub fn accept_tls(mut self) -> std::thread::JoinHandle<io::Result<Self>> {
         std::thread::spawn(|| {
             self.accept_tls_sync()?;
@@ -535,6 +542,7 @@ impl MockServer {
         self.recv_http(5.0)
     }
 
+    #[cfg(feature = "sync-sender-tcp")]
     pub fn recv(&mut self, wait_timeout_sec: f64) -> io::Result<usize> {
         let deadline = Instant::now() + Duration::from_secs_f64(wait_timeout_sec);
 
@@ -577,9 +585,9 @@ impl MockServer {
                 index += 1;
                 // calc binary length
                 let binary_type = accum[index];
-                if binary_type == ingress::DOUBLE_BINARY_FORMAT_TYPE {
+                if binary_type == crate::ingress::DOUBLE_BINARY_FORMAT_TYPE {
                     index += size_of::<f64>() + 1;
-                } else if binary_type == ingress::ARRAY_BINARY_FORMAT_TYPE {
+                } else if binary_type == crate::ingress::ARRAY_BINARY_FORMAT_TYPE {
                     index += 1;
                     let element_type = match ArrayColumnTypeTag::try_from(accum[index]) {
                         Ok(t) => t,
@@ -613,14 +621,17 @@ impl MockServer {
         Ok(received_count)
     }
 
+    #[cfg(feature = "sync-sender-tcp")]
     pub fn recv_q(&mut self) -> io::Result<usize> {
         self.recv(0.1)
     }
 
+    #[cfg(feature = "sync-sender-tcp")]
     pub fn lsb_tcp(&self) -> SenderBuilder {
         SenderBuilder::new(Protocol::Tcp, self.host, self.port)
     }
 
+    #[cfg(feature = "sync-sender-tcp")]
     pub fn lsb_tcps(&self) -> SenderBuilder {
         SenderBuilder::new(Protocol::Tcps, self.host, self.port)
     }
