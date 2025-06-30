@@ -978,7 +978,7 @@ impl Buffer {
     /// Supports arrays with up to [`MAX_ARRAY_DIMS`] dimensions. The array elements must
     /// be of type `f64`, which is currently the only supported data type.
     ///
-    /// **Note**: QuestDB server version 8.4.0 or later is required for array support.
+    /// **Note**: QuestDB server version 9.0.0 or later is required for array support.
     ///
     /// # Examples
     ///
