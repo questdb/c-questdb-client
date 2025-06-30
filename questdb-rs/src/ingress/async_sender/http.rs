@@ -25,14 +25,13 @@
 use crate::error::{fmt, Result};
 use crate::ingress::conf::AuthParams;
 use crate::ingress::tls::TlsSettings;
-use crate::ingress::CertificateAuthority;
 use reqwest::{Certificate, Client};
 
 pub(super) struct HttpClient {
     host: String,
     port: String,
-    tls: TlsSettings,
-
+    tls: Option<TlsSettings>,
+    auth_params: Option<AuthParams>,
     client: Client,
 }
 
@@ -48,6 +47,12 @@ impl HttpClient {
             Ok(client) => client,
             Err(e) => return Err(fmt!(ConfigError, "Could not create http client: {}", e)),
         };
-        Ok(Self { client })
+        Ok(Self {
+            host: host.to_string(),
+            port: port.to_string(),
+            tls,
+            auth_params,
+            client,
+        })
     }
 }

@@ -22,7 +22,9 @@
  *
  ******************************************************************************/
 use crate::error::Result;
+use crate::ingress::conf::AuthParams;
 use crate::ingress::ndarr::ArrayElementSealed;
+use crate::ingress::tls::TlsSettings;
 use crate::ingress::{
     ArrayElement, Buffer, ColumnName, NdArrayView, ProtocolVersion, SenderBuilder, TableName,
     Timestamp,
@@ -275,7 +277,15 @@ impl AsyncSender {
         SenderBuilder::from_env()?.build_async().await
     }
 
-    pub(crate) async fn new(descr: String, host: &str, port: &str) -> Result<Arc<Self>> {}
+    pub(crate) async fn new(
+        descr: String,
+        host: &str,
+        port: &str,
+        tls_settings: Option<TlsSettings>,
+        auth: Option<AuthParams>,
+    ) -> Result<Arc<Self>> {
+        todo!()
+    }
 
     pub fn new_transaction<'a, N>(self: &Arc<Self>, name: N) -> Result<Transaction>
     where

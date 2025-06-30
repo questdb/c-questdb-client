@@ -24,16 +24,13 @@
 
 use crate::error;
 use crate::gai;
-use crate::ingress::tls::configure_tls;
-use crate::ingress::{
-    conf, map_io_to_socket_err, parse_key_pair, CertificateAuthority, SyncProtocolHandler,
-};
+use crate::ingress::tls::{configure_tls, TlsSettings};
+use crate::ingress::{conf, map_io_to_socket_err, parse_key_pair, SyncProtocolHandler};
 use rustls::{ClientConnection, StreamOwned};
 use rustls_pki_types::ServerName;
 use socket2::{Domain, Protocol as SockProtocol, SockAddr, Socket, Type};
 use std::io::{self, BufReader, Write as IoWrite};
 use std::io::{BufRead, ErrorKind};
-use std::path::Path;
 use std::time::Duration;
 
 #[cfg(feature = "aws-lc-crypto")]
@@ -49,7 +46,7 @@ pub(crate) enum SyncConnection {
 
 impl SyncConnection {
     fn send_key_id(&mut self, key_id: &str) -> crate::Result<()> {
-        writeln!(self, "{}", key_id)
+        writeln!(self, "{key_id}")
             .map_err(|io_err| map_io_to_socket_err("Failed to send key_id: ", io_err))?;
         Ok(())
     }
@@ -141,16 +138,12 @@ impl IoWrite for SyncConnection {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn connect_tcp(
     host: &str,
     port: &str,
     net_interface: Option<&str>,
     auth_timeout: Duration,
-    tls_enabled: bool,
-    tls_verify: bool,
-    tls_ca: CertificateAuthority,
-    tls_roots: Option<&Path>,
+    tls_settings: Option<TlsSettings>,
     auth: &Option<conf::AuthParams>,
 ) -> crate::Result<SyncProtocolHandler> {
     let addr: SockAddr = gai::resolve_host_port(host, port)?;
@@ -173,14 +166,14 @@ pub(crate) fn connect_tcp(
         let bind_addr = gai::resolve_host(host)?;
         sock.bind(&bind_addr).map_err(|io_err| {
             map_io_to_socket_err(
-                &format!("Could not bind to interface address {:?}: ", host),
+                &format!("Could not bind to interface address {host:?}: "),
                 io_err,
             )
         })?;
     }
     sock.connect(&addr).map_err(|io_err| {
-        let host_port = format!("{}:{}", host, port);
-        let prefix = format!("Could not connect to {:?}: ", host_port);
+        let host_port = format!("{host}:{port}");
+        let prefix = format!("Could not connect to {host_port:?}: ");
         map_io_to_socket_err(&prefix, io_err)
     })?;
 
@@ -191,8 +184,9 @@ pub(crate) fn connect_tcp(
     sock.set_read_timeout(Some(auth_timeout))
         .map_err(|io_err| map_io_to_socket_err("Failed to set read timeout on socket: ", io_err))?;
 
-    let mut conn = match configure_tls(tls_enabled, tls_verify, tls_ca, tls_roots)? {
-        Some(tls_config) => {
+    let mut conn = match tls_settings {
+        Some(tls_settings) => {
+            let tls_config = configure_tls(tls_settings)?;
             let server_name: ServerName = ServerName::try_from(host)
                 .map_err(|inv_dns_err| error::fmt!(TlsError, "Bad host: {}", inv_dns_err))?
                 .to_owned();

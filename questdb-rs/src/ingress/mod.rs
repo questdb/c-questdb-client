@@ -461,7 +461,7 @@ impl SenderBuilder {
                         "on" => true,
                         "unsafe_off" => false,
                         _ => {
-                            return Err(error::fmt!(
+                            return Err(fmt!(
                                 ConfigError,
                                 r##"Config parameter "tls_verify" must be either "on" or "unsafe_off".'"##,
                             ))
@@ -471,7 +471,7 @@ impl SenderBuilder {
                     #[cfg(not(feature = "insecure-skip-verify"))]
                     {
                         if !verify {
-                            return Err(error::fmt!(
+                            return Err(fmt!(
                                 ConfigError,
                                 r##"The "insecure-skip-verify" feature is not enabled, so "tls_verify=unsafe_off" is not supported"##,
                             ));
@@ -1033,9 +1033,27 @@ impl SenderBuilder {
             write!(descr, "tls=disabled,").unwrap();
         }
 
+        #[cfg(feature = "insecure-skip-verify")]
+        let tls_verify = *self.tls_verify;
+
+        let tls_settings = tls::TlsSettings::build(
+            self.protocol.tls_enabled(),
+            #[cfg(feature = "insecure-skip-verify")]
+            tls_verify,
+            *self.tls_ca,
+            self.tls_roots.deref().as_deref(),
+        )?;
+
         let auth = self.build_auth()?;
 
-        AsyncSender::new(descr, self.host.deref(), self.port.deref()).await
+        AsyncSender::new(
+            descr,
+            self.host.deref(),
+            self.port.deref(),
+            tls_settings,
+            auth,
+        )
+        .await
     }
 
     #[cfg(feature = "_sync-sender")]
@@ -1054,29 +1072,29 @@ impl SenderBuilder {
             write!(descr, "tls=disabled,").unwrap();
         }
 
+        #[cfg(feature = "insecure-skip-verify")]
+        let tls_verify = *self.tls_verify;
+
+        let tls_settings = tls::TlsSettings::build(
+            self.protocol.tls_enabled(),
+            #[cfg(feature = "insecure-skip-verify")]
+            tls_verify,
+            *self.tls_ca,
+            self.tls_roots.deref().as_deref(),
+        )?;
+
         let auth = self.build_auth()?;
 
         let handler = match self.protocol {
             #[cfg(feature = "sync-sender-tcp")]
-            Protocol::Tcp | Protocol::Tcps => {
-                #[cfg(feature = "insecure-skip-verify")]
-                let tls_verify = *self.tls_verify;
-
-                #[cfg(not(feature = "insecure-skip-verify"))]
-                let tls_verify = true;
-
-                connect_tcp(
-                    self.host.as_str(),
-                    self.port.as_str(),
-                    self.net_interface.deref().as_deref(),
-                    *self.auth_timeout,
-                    self.protocol.tls_enabled(),
-                    tls_verify,
-                    *self.tls_ca,
-                    self.tls_roots.as_deref(),
-                    &auth,
-                )?
-            }
+            Protocol::Tcp | Protocol::Tcps => connect_tcp(
+                self.host.as_str(),
+                self.port.as_str(),
+                self.net_interface.deref().as_deref(),
+                *self.auth_timeout,
+                tls_settings,
+                &auth,
+            )?,
             #[cfg(feature = "sync-sender-http")]
             Protocol::Http | Protocol::Https => {
                 use ureq::unversioned::transport::Connector;
@@ -1097,23 +1115,12 @@ impl SenderBuilder {
                     .user_agent(user_agent)
                     .no_delay(true);
 
-                #[cfg(feature = "insecure-skip-verify")]
-                let tls_verify = *self.tls_verify;
-
-                #[cfg(not(feature = "insecure-skip-verify"))]
-                let tls_verify = true;
-
-                let tls_settings = if self.protocol.tls_enabled() {
-                    Some(tls::TlsSettings {
-                        verify_hostname: tls_verify,
-                        ca: *self.tls_ca,
-                        roots: self.tls_roots.deref().as_deref(),
-                    })
-                } else {
-                    None
+                let tls_config = match tls_settings {
+                    Some(tls_settings) => Some(tls::configure_tls(tls_settings)?),
+                    None => None,
                 };
-                let connector =
-                    connector.chain(TlsConnector::new(tls::configure_tls(tls_settings)?));
+
+                let connector = connector.chain(TlsConnector::new(tls_config));
 
                 let auth = match auth {
                     Some(conf::AuthParams::Basic(ref auth)) => Some(auth.to_header_string()),
@@ -1121,7 +1128,7 @@ impl SenderBuilder {
 
                     #[cfg(feature = "sync-sender-tcp")]
                     Some(conf::AuthParams::Ecdsa(_)) => {
-                        return Err(error::fmt!(
+                        return Err(fmt!(
                             AuthError,
                             "ECDSA authentication is not supported for ILP over HTTP. \
                             Please use basic or token authentication instead."
@@ -1179,7 +1186,7 @@ impl SenderBuilder {
                         } else if protocol_versions.contains(&ProtocolVersion::V1) {
                             ProtocolVersion::V1
                         } else {
-                            return Err(error::fmt!(
+                            return Err(fmt!(
                                 ProtocolVersionError,
                                 "Server does not support current client"
                             ));
@@ -1213,7 +1220,7 @@ impl SenderBuilder {
         if self.protocol.is_tcpx() {
             Ok(())
         } else {
-            Err(error::fmt!(
+            Err(fmt!(
                 ConfigError,
                 "The {param_name:?} setting can only be used with the TCP protocol."
             ))
@@ -1242,7 +1249,7 @@ where
     T::Err: std::fmt::Debug,
 {
     str_value.parse().map_err(|e| {
-        error::fmt!(
+        fmt!(
             ConfigError,
             "Could not parse {param_name:?} to number: {e:?}"
         )
@@ -1253,7 +1260,7 @@ where
 fn b64_decode(descr: &'static str, buf: &str) -> Result<Vec<u8>> {
     use base64ct::{Base64UrlUnpadded, Encoding};
     Base64UrlUnpadded::decode_vec(buf).map_err(|b64_err| {
-        error::fmt!(
+        fmt!(
             AuthError,
             "Misconfigured ILP authentication keys. Could not decode {}: {}. \
             Hint: Check the keys for a possible typo.",
@@ -1273,7 +1280,7 @@ fn parse_public_key(pub_key_x: &str, pub_key_y: &str) -> Result<Vec<u8>> {
     encoded.push(4u8); // 0x04 magic byte that identifies this as uncompressed.
     let pub_key_x_ken = pub_key_x.len();
     if pub_key_x_ken > 32 {
-        return Err(error::fmt!(
+        return Err(fmt!(
             AuthError,
             "Misconfigured ILP authentication keys. Public key x is too long. \
             Hint: Check the keys for a possible typo."
@@ -1281,7 +1288,7 @@ fn parse_public_key(pub_key_x: &str, pub_key_y: &str) -> Result<Vec<u8>> {
     }
     let pub_key_y_len = pub_key_y.len();
     if pub_key_y_len > 32 {
-        return Err(error::fmt!(
+        return Err(fmt!(
             AuthError,
             "Misconfigured ILP authentication keys. Public key y is too long. \
             Hint: Check the keys for a possible typo."
@@ -1318,7 +1325,7 @@ fn parse_key_pair(auth: &conf::EcdsaAuthParams) -> Result<EcdsaKeyPair> {
     };
 
     res.map_err(|key_rejected| {
-        error::fmt!(
+        fmt!(
             AuthError,
             "Misconfigured ILP authentication keys: {}. Hint: Check the keys for a possible typo.",
             key_rejected

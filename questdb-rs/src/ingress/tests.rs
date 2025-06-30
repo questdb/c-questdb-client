@@ -534,7 +534,7 @@ fn assert_specified_eq<V: PartialEq + Debug, IntoV: Into<V>>(
     if let ConfigSetting::Specified(actual_value) = actual {
         assert_eq!(actual_value, &expected);
     } else {
-        panic!("Expected Specified({:?}), but got {:?}", expected, actual);
+        panic!("Expected Specified({expected:?}), but got {actual:?}");
     }
 }
 
@@ -546,7 +546,7 @@ fn assert_defaulted_eq<V: PartialEq + std::fmt::Debug, IntoV: Into<V>>(
     if let ConfigSetting::Defaulted(actual_value) = actual {
         assert_eq!(actual_value, &expected);
     } else {
-        panic!("Expected Defaulted({:?}), but got {:?}", expected, actual);
+        panic!("Expected Defaulted({expected:?}), but got {actual:?}");
     }
 }
 

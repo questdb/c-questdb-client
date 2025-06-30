@@ -1,6 +1,8 @@
-use crate::error;
+use crate::error::{fmt, Result};
 use crate::ingress::CertificateAuthority;
 use rustls::RootCertStore;
+use rustls_pki_types::CertificateDer;
+use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
@@ -72,7 +74,7 @@ fn unpack_os_native_certs(
     res: rustls_native_certs::CertificateResult,
 ) -> crate::Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
     if !res.errors.is_empty() {
-        return Err(error::fmt!(
+        return Err(fmt!(
             TlsError,
             "Could not load OS native TLS certificates: {}",
             res.errors
@@ -92,7 +94,7 @@ fn add_os_roots(root_store: &mut RootCertStore) -> crate::Result<()> {
 
     let (valid_count, invalid_count) = root_store.add_parsable_certificates(os_certs);
     if valid_count == 0 && invalid_count > 0 {
-        return Err(error::fmt!(
+        return Err(fmt!(
             TlsError,
             "No valid certificates found in native root store ({} found but were invalid)",
             invalid_count
@@ -101,62 +103,78 @@ fn add_os_roots(root_store: &mut RootCertStore) -> crate::Result<()> {
     Ok(())
 }
 
-pub(crate) struct TlsSettings<'a> {
-    pub verify_hostname: bool,
-    pub ca: CertificateAuthority,
-    pub roots: Option<&'a Path>,
+pub(crate) enum TlsSettings {
+    #[cfg(feature = "insecure-skip-verify")]
+    SkipVerify,
+
+    #[cfg(feature = "tls-webpki-certs")]
+    WebpkiRoots,
+
+    #[cfg(feature = "tls-native-certs")]
+    OsRoots,
+
+    #[cfg(all(feature = "tls-webpki-certs", feature = "tls-native-certs"))]
+    WebpkiAndOsRoots,
+
+    PemFile(Vec<CertificateDer<'static>>),
 }
 
-pub(crate) fn configure_tls(
-    tls: Option<TlsSettings>,
-) -> crate::Result<Option<Arc<rustls::ClientConfig>>> {
-    let Some(tls) = tls else {
-        return Ok(None);
-    };
+impl TlsSettings {
+    pub fn build(
+        enabled: bool,
 
-    let mut root_store = RootCertStore::empty();
-    if tls.verify_hostname {
-        match (tls.ca, tls.roots) {
+        #[cfg(feature = "insecure-skip-verify")] verify_hostname: bool,
+
+        ca: CertificateAuthority,
+        roots: Option<&Path>,
+    ) -> Result<Option<Self>> {
+        if !enabled {
+            return Ok(None);
+        }
+
+        #[cfg(feature = "insecure-skip-verify")]
+        if !verify_hostname {
+            return Ok(Some(TlsSettings::SkipVerify));
+        }
+
+        Ok(Some(match (ca, roots) {
             #[cfg(feature = "tls-webpki-certs")]
-            (CertificateAuthority::WebpkiRoots, None) => {
-                add_webpki_roots(&mut root_store);
-            }
+            (CertificateAuthority::WebpkiRoots, None) => TlsSettings::WebpkiRoots,
 
             #[cfg(feature = "tls-webpki-certs")]
             (CertificateAuthority::WebpkiRoots, Some(_)) => {
-                return Err(error::fmt!(ConfigError, "Config parameter \"tls_roots\" must be unset when \"tls_ca\" is set to \"webpki_roots\"."));
+                return Err(fmt!(ConfigError, "Config parameter \"tls_roots\" must be unset when \"tls_ca\" is set to \"webpki_roots\"."));
             }
 
             #[cfg(feature = "tls-native-certs")]
-            (CertificateAuthority::OsRoots, None) => {
-                add_os_roots(&mut root_store)?;
-            }
+            (CertificateAuthority::OsRoots, None) => TlsSettings::OsRoots,
 
             #[cfg(feature = "tls-native-certs")]
             (CertificateAuthority::OsRoots, Some(_)) => {
-                return Err(error::fmt!(ConfigError, "Config parameter \"tls_roots\" must be unset when \"tls_ca\" is set to \"os_roots\"."));
+                return Err(fmt!(ConfigError, "Config parameter \"tls_roots\" must be unset when \"tls_ca\" is set to \"os_roots\"."));
             }
 
             #[cfg(all(feature = "tls-webpki-certs", feature = "tls-native-certs"))]
-            (CertificateAuthority::WebpkiAndOsRoots, None) => {
-                add_webpki_roots(&mut root_store);
-                add_os_roots(&mut root_store)?;
-            }
+            (CertificateAuthority::WebpkiAndOsRoots, None) => TlsSettings::WebpkiAndOsRoots,
 
             #[cfg(all(feature = "tls-webpki-certs", feature = "tls-native-certs"))]
             (CertificateAuthority::WebpkiAndOsRoots, Some(_)) => {
-                return Err(error::fmt!(ConfigError, "Config parameter \"tls_roots\" must be unset when \"tls_ca\" is set to \"webpki_and_os_roots\"."));
+                return Err(fmt!(ConfigError, "Config parameter \"tls_roots\" must be unset when \"tls_ca\" is set to \"webpki_and_os_roots\"."));
             }
 
-            (CertificateAuthority::PemFile, Some(ca_file)) => {
-                let certfile = std::fs::File::open(ca_file).map_err(|io_err| {
-                    error::fmt!(
+            (CertificateAuthority::PemFile, None) => {
+                return Err(fmt!(ConfigError, "Config parameter \"tls_roots\" is required when \"tls_ca\" is set to \"pem_file\"."));
+            }
+
+            (CertificateAuthority::PemFile, Some(pem_file)) => {
+                let certfile = File::open(pem_file).map_err(|io_err| {
+                    fmt!(
                         TlsError,
                         concat!(
                             "Could not open tls_roots certificate authority ",
                             "file from path {:?}: {}"
                         ),
-                        ca_file,
+                        pem_file,
                         io_err
                     )
                 })?;
@@ -164,22 +182,48 @@ pub(crate) fn configure_tls(
                 let der_certs = rustls_pemfile::certs(&mut reader)
                     .collect::<std::result::Result<Vec<_>, _>>()
                     .map_err(|io_err| {
-                        error::fmt!(
+                        fmt!(
                             TlsError,
                             concat!(
                                 "Could not read certificate authority ",
                                 "file from path {:?}: {}"
                             ),
-                            ca_file,
+                            pem_file,
                             io_err
                         )
                     })?;
-                root_store.add_parsable_certificates(der_certs);
+                TlsSettings::PemFile(der_certs)
             }
+        }))
+    }
+}
 
-            (CertificateAuthority::PemFile, None) => {
-                return Err(error::fmt!(ConfigError, "Config parameter \"tls_roots\" is required when \"tls_ca\" is set to \"pem_file\"."));
-            }
+pub(crate) fn configure_tls(tls: TlsSettings) -> Result<Arc<rustls::ClientConfig>> {
+    let mut root_store = RootCertStore::empty();
+
+    #[cfg(feature = "insecure-skip-verify")]
+    let mut verify_hostname = true;
+
+    match tls {
+        #[cfg(feature = "tls-webpki-certs")]
+        TlsSettings::WebpkiRoots => add_webpki_roots(&mut root_store),
+
+        #[cfg(feature = "tls-native-certs")]
+        TlsSettings::OsRoots => add_os_roots(&mut root_store)?,
+
+        #[cfg(all(feature = "tls-webpki-certs", feature = "tls-native-certs"))]
+        TlsSettings::WebpkiAndOsRoots => {
+            add_webpki_roots(&mut root_store);
+            add_os_roots(&mut root_store)?;
+        }
+
+        TlsSettings::PemFile(der_certs) => {
+            root_store.add_parsable_certificates(der_certs);
+        }
+
+        #[cfg(feature = "insecure-skip-verify")]
+        TlsSettings::SkipVerify => {
+            verify_hostname = false;
         }
     }
 
@@ -192,11 +236,11 @@ pub(crate) fn configure_tls(
     config.key_log = Arc::new(rustls::KeyLogFile::new());
 
     #[cfg(feature = "insecure-skip-verify")]
-    if !tls.verify_hostname {
+    if !verify_hostname {
         config
             .dangerous()
             .set_certificate_verifier(Arc::new(danger::NoCertificateVerification {}));
     }
 
-    Ok(Some(Arc::new(config)))
+    Ok(Arc::new(config))
 }

@@ -133,9 +133,7 @@ pub mod json_tests {
                         return true;
                     }
                 }
-                eprintln!(
-                    "Could not match:\n    {:?}\nTo any of: {:#?}",
-                    line, expected);
+                eprintln!("Could not match:\n    {line:?}\nTo any of: {expected:#?}");
                 false
             }
             "#}
@@ -162,8 +160,8 @@ pub mod json_tests {
             if expected.is_none() {
                 writeln!(output, "    || -> Result<()> {{")?;
             }
-            writeln!(output, "{}    buffer", indent)?;
-            writeln!(output, "{}        .table({:?})?", indent, spec.table)?;
+            writeln!(output, "{indent}    buffer")?;
+            writeln!(output, "{indent}        .table({:?})?", spec.table)?;
             for symbol in spec.symbols.iter() {
                 writeln!(
                     output,
@@ -195,14 +193,13 @@ pub mod json_tests {
                     )?,
                 }
             }
-            writeln!(output, "{}        .at_now()?;", indent)?;
+            writeln!(output, "{indent}        .at_now()?;")?;
             if let Some(expected) = expected {
                 if let Some(ref base64) = expected.binary_base64 {
                     writeln!(output, "    if version != ProtocolVersion::V1 {{")?;
                     writeln!(
                         output,
-                        "        let exp = Base64::decode_vec(\"{}\").unwrap();",
-                        base64
+                        "        let exp = Base64::decode_vec(\"{base64}\").unwrap();"
                     )?;
                     writeln!(
                         output,
@@ -210,24 +207,24 @@ pub mod json_tests {
                     )?;
                     writeln!(output, "    }} else {{")?;
                     if let Some(ref line) = expected.line {
-                        let exp_ln = format!("{}\n", line);
-                        writeln!(output, "        let exp = {:?};", exp_ln)?;
+                        let exp_ln = format!("{line}\n");
+                        writeln!(output, "        let exp = {exp_ln:?};")?;
                         writeln!(
                             output,
                             "        assert_eq!(buffer.as_bytes(), exp.as_bytes());"
                         )?;
                     } else {
-                        // 处理 V1 版本的 any_lines
+                        // Checking V1 any_lines
                         let any: Vec<String> = expected
                             .any_lines
                             .as_ref()
                             .unwrap()
                             .iter()
-                            .map(|line| format!("{}\n", line))
+                            .map(|line| format!("{line}\n"))
                             .collect();
                         writeln!(output, "        let any = [")?;
                         for line in any.iter() {
-                            writeln!(output, "            {:?},", line)?;
+                            writeln!(output, "            {line:?},")?;
                         }
                         writeln!(output, "        ];")?;
                         writeln!(
@@ -237,8 +234,8 @@ pub mod json_tests {
                     }
                     writeln!(output, "    }}")?;
                 } else if let Some(ref line) = expected.line {
-                    let exp_ln = format!("{}\n", line);
-                    writeln!(output, "    let exp = {:?};", exp_ln)?;
+                    let exp_ln = format!("{line}\n");
+                    writeln!(output, "    let exp = {exp_ln:?};")?;
                     writeln!(output, "    assert_eq!(buffer.as_bytes(), exp.as_bytes());")?;
                 } else {
                     let any: Vec<String> = expected
@@ -246,11 +243,11 @@ pub mod json_tests {
                         .as_ref()
                         .unwrap()
                         .iter()
-                        .map(|line| format!("{}\n", line))
+                        .map(|line| format!("{line}\n"))
                         .collect();
                     writeln!(output, "    let any = [")?;
                     for line in any.iter() {
-                        writeln!(output, "            {:?},", line)?;
+                        writeln!(output, "            {line:?},")?;
                     }
                     writeln!(output, "        ];")?;
                     writeln!(

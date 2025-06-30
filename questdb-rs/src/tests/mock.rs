@@ -173,7 +173,7 @@ impl HttpResponse {
     pub fn as_string(&self) -> String {
         let mut s = format!("HTTP/1.1 {} {}\r\n", self.status_code, self.status_text);
         for (key, value) in &self.headers {
-            s.push_str(&format!("{}: {}\r\n", key, value));
+            s.push_str(&format!("{key}: {value}\r\n"));
         }
         s.push_str("\r\n");
         s.push_str(std::str::from_utf8(&self.body).unwrap());
@@ -395,8 +395,7 @@ impl MockServer {
                         return Err(io::Error::new(
                             io::ErrorKind::TimedOut,
                             format!(
-                                "{} timed out while waiting for data. Received so far: {}",
-                                stage, so_far
+                                "{stage} timed out while waiting for data. Received so far: {so_far}"
                             ),
                         ));
                     }
