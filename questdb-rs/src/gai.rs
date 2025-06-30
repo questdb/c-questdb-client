@@ -75,7 +75,7 @@ pub(super) fn resolve_host_port(host: &str, port: &str) -> super::Result<SockAdd
         address: AF_INET,
         ..AddrInfoHints::default()
     };
-    let host_port = format!("{}:{}", host, port);
+    let host_port = format!("{host}:{port}");
     map_getaddrinfo_result(
         &host_port,
         dns_lookup::getaddrinfo(Some(host), Some(port), Some(hints)),

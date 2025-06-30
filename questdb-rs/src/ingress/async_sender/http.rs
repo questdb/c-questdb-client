@@ -21,16 +21,38 @@
  *  limitations under the License.
  *
  ******************************************************************************/
-#![doc = include_str!("../README.md")]
 
-mod error;
+use crate::error::{fmt, Result};
+use crate::ingress::conf::AuthParams;
+use crate::ingress::tls::TlsSettings;
+use reqwest::{Certificate, Client};
 
-#[cfg(feature = "sync-sender-tcp")]
-mod gai;
+pub(super) struct HttpClient {
+    host: String,
+    port: String,
+    tls: Option<TlsSettings>,
+    auth_params: Option<AuthParams>,
+    client: Client,
+}
 
-pub mod ingress;
-
-pub use error::*;
-
-#[cfg(test)]
-mod tests;
+impl HttpClient {
+    pub fn new(
+        host: &str,
+        port: &str,
+        tls: Option<TlsSettings>,
+        auth_params: Option<AuthParams>,
+    ) -> Result<Self> {
+        let builder = Client::builder();
+        let client = match builder.build() {
+            Ok(client) => client,
+            Err(e) => return Err(fmt!(ConfigError, "Could not create http client: {}", e)),
+        };
+        Ok(Self {
+            host: host.to_string(),
+            port: port.to_string(),
+            tls,
+            auth_params,
+            client,
+        })
+    }
+}

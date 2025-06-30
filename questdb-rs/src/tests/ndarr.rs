@@ -62,7 +62,7 @@ impl TryFrom<u8> for ArrayColumnTypeTag {
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             10 => Ok(ArrayColumnTypeTag::Double),
-            _ => Err(format!("Unsupported column type tag {} for arrays", value)),
+            _ => Err(format!("Unsupported column type tag {value} for arrays")),
         }
     }
 }

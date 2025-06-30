@@ -92,7 +92,7 @@ The crate provides several optional features to enable additional functionality.
 
 ### Default features
 
-- **ilp-over-http**: Enables ILP/HTTP support via the `ureq` crate for sending data over HTTP.
+- **sync-sender**: Enables sync Sender APIs for ILP/TCP and ILP/HTTP. HTTP is enabled via the [`ureq`](https://github.com/algesten/ureq) crate.
 - **tls-webpki-certs**: Uses the `webpki-roots` crate to validate TLS certificates.
 - **ring-crypto**: Uses the `ring` crate as the cryptography backend for TLS (default crypto backend).
 
