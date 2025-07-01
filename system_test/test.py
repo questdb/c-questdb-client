@@ -1186,7 +1186,7 @@ def run_with_fixtures(args):
             auth=auth)
         TLS_PROXY_FIXTURE = None
         try:
-            print(f'>>>> STARTING {questdb_dir} [auth={auth}] <<<<')
+            sys.stderr.write(f'>>>> STARTING {questdb_dir} [auth={auth}] <<<<\n')
             QDB_FIXTURE.start()
             for http, protocol_version, build_mode in itertools.product(
                     (False, True),  # http
@@ -1198,8 +1198,8 @@ def run_with_fixtures(args):
                     continue
                 if auth and (protocol_version != latest_protocol):
                     continue
-                print(
-                    f'Running tests [auth={auth}, http={http}, build_mode={build_mode}, protocol_version={protocol_version}]')
+                sys.stderr.write(
+                    f'>>>> Running tests [auth={auth}, http={http}, build_mode={build_mode}, protocol_version={protocol_version}]\n')
                 # Read the version _after_ a first start so it can rely
                 # on the live one from the `select build` query.
                 BUILD_MODE = build_mode
