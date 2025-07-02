@@ -307,7 +307,7 @@ pub enum ProtocolVersion {
     /// Version 2 of InfluxDB Line Protocol.
     /// Uses binary format serialization for f64, and supports the array data type.
     /// This version is specific to QuestDB and is not compatible with InfluxDB.
-    /// QuestDB server version 8.4.0 or later is required for `V2` supported.
+    /// QuestDB server version 9.0.0 or later is required for `V2` supported.
     V2 = 2,
 }
 
@@ -947,7 +947,7 @@ pub unsafe extern "C" fn line_sender_buffer_column_str(
 /// - All pointer parameters must be valid and non-null
 /// - shape must point to an array of `rank` integers
 /// - data must point to a buffer of size `data_len` f64 elements.
-/// - QuestDB server version 8.4.0 or later is required for array support.
+/// - QuestDB server version 9.0.0 or later is required for array support.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_c_major(
     buffer: *mut line_sender_buffer,
@@ -991,7 +991,7 @@ pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_c_major(
 /// - All pointer parameters must be valid and non-null
 /// - shape must point to an array of `rank` integers
 /// - data must point to a buffer of size `data_len` f64 elements.
-/// - QuestDB server version 8.4.0 or later is required for array support.
+/// - QuestDB server version 9.0.0 or later is required for array support.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_byte_strides(
     buffer: *mut line_sender_buffer,
@@ -1037,7 +1037,7 @@ pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_byte_strides(
 /// - All pointer parameters must be valid and non-null
 /// - shape must point to an array of `rank` integers
 /// - data must point to a buffer of size `data_len` f64 elements.
-/// - QuestDB server version 8.4.0 or later is required for array support.
+/// - QuestDB server version 9.0.0 or later is required for array support.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_elem_strides(
     buffer: *mut line_sender_buffer,
@@ -1350,7 +1350,7 @@ pub unsafe extern "C" fn line_sender_opts_token_y(
 ///   default. You must explicitly set [`ProtocolVersion::V2`] in order to ingest
 ///   arrays.
 ///
-/// QuestDB server version 8.4.0 or later is required for [`ProtocolVersion::V2`] support
+/// QuestDB server version 9.0.0 or later is required for [`ProtocolVersion::V2`] support
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_opts_protocol_version(
     opts: *mut line_sender_opts,

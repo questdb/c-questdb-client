@@ -76,7 +76,7 @@ pub enum ProtocolVersion {
     /// Version 2 of InfluxDB Line Protocol.
     /// Uses binary format serialization for f64, and supports the array data type.
     /// This version is specific to QuestDB and is not compatible with InfluxDB.
-    /// QuestDB server version 8.4.0 or later is required for `V2` supported.
+    /// QuestDB server version 9.0.0 or later is required for `V2` supported.
     V2 = 2,
 }
 
@@ -1095,7 +1095,7 @@ impl Buffer {
     /// Supports arrays with up to [`MAX_ARRAY_DIMS`] dimensions. The array elements must
     /// be of type `f64`, which is currently the only supported data type.
     ///
-    /// **Note**: QuestDB server version 8.4.0 or later is required for array support.
+    /// **Note**: QuestDB server version 9.0.0 or later is required for array support.
     ///
     /// # Examples
     ///
@@ -2172,7 +2172,7 @@ impl SenderBuilder {
     ///   default. You must explicitly set [`ProtocolVersion::V2`] in order to ingest
     ///   arrays.
     ///
-    /// **Note**: QuestDB server version 8.4.0 or later is required for [`ProtocolVersion::V2`] support.
+    /// **Note**: QuestDB server version 9.0.0 or later is required for [`ProtocolVersion::V2`] support.
     pub fn protocol_version(mut self, protocol_version: ProtocolVersion) -> Result<Self> {
         self.protocol_version
             .set_specified("protocol_version", Some(protocol_version))?;

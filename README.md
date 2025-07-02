@@ -58,7 +58,7 @@ These protocol versions are supported over both HTTP and TCP.
 | Version | Description                                             | Server Compatibility   |
 | ------- | ------------------------------------------------------- | --------------------- |
 | **1**   | Over HTTP it's compatible InfluxDB Line Protocol (ILP)  | All QuestDB versions  |
-| **2**   | 64-bit floats sent as binary, adds n-dimentional arrays | 8.4.0+ (2023-10-30)   |
+| **2**   | 64-bit floats sent as binary, adds n-dimentional arrays | 9.0.0+ (2023-10-30)   |
 
 ## Getting Started
 

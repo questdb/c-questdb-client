@@ -18,7 +18,7 @@ fn main() -> Result<()> {
         .at(TimestampNanos::now())?;
     sender.flush(&mut buffer)?;
 
-    // QuestDB server version 8.4.0 or later is required for `protocol_version=2` support.
+    // QuestDB server version 9.0.0 or later is required for `protocol_version=2` support.
     let mut sender2 = Sender::from_conf(
         "https::addr=localhost:9000;username=foo;password=bar;protocol_version=2;",
     )?;

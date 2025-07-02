@@ -115,7 +115,7 @@ typedef enum line_sender_protocol_version
      * Uses a binary format serialization for f64, and supports
      * the array data type.
      * This version is specific to QuestDB and not compatible with InfluxDB.
-     * QuestDB server version 8.4.0 or later is required for
+     * QuestDB server version 9.0.0 or later is required for
      * `line_sender_protocol_version_2` support.
      */
     line_sender_protocol_version_2 = 2,
@@ -499,7 +499,7 @@ bool line_sender_buffer_column_str(
 /**
  * Record a multidimensional array of `double` values in C-major order.
  *
- * QuestDB server version 8.4.0 or later is required for array support.
+ * QuestDB server version 9.0.0 or later is required for array support.
  *
  * @param[in] buffer Line buffer object.
  * @param[in] name Column name.
@@ -527,7 +527,7 @@ bool line_sender_buffer_column_f64_arr_c_major(
  * The values in the `strides` parameter represent the number of bytes
  * between consecutive elements along each dimension.
  *
- * QuestDB server version 8.4.0 or later is required for array support.
+ * QuestDB server version 9.0.0 or later is required for array support.
  *
  * @param[in] buffer Line buffer object.
  * @param[in] name Column name.
@@ -559,7 +559,7 @@ bool line_sender_buffer_column_f64_arr_byte_strides(
  * The values in the `strides` parameter represent the number of elements
  * between consecutive elements along each dimension.
  *
- * QuestDB server version 8.4.0 or later is required for array support.
+ * QuestDB server version 9.0.0 or later is required for array support.
  *
  * @param[in] buffer Line buffer object.
  * @param[in] name Column name.
@@ -840,7 +840,7 @@ bool line_sender_opts_token_y(
  * `line_sender_protocol_version_1` by default. You must explicitly set
  * `line_sender_protocol_version_2` in order to ingest arrays.
  *
- * QuestDB server version 8.4.0 or later is required for
+ * QuestDB server version 9.0.0 or later is required for
  * `line_sender_protocol_version_2` support.
  */
 LINESENDER_API

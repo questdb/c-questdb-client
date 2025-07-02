@@ -5,7 +5,7 @@
 #include "concat.h"
 
 /*
- * QuestDB server version 8.4.0 or later is required for array support.
+ * QuestDB server version 9.0.0 or later is required for array support.
  */
 static bool example(const char* host, const char* port)
 {

@@ -25,9 +25,9 @@ These protocol versions are supported over both HTTP and TCP.
 | Version | Description                                             | Server Compatibility   |
 | ------- | ------------------------------------------------------- | --------------------- |
 | **1**   | Over HTTP it's compatible InfluxDB Line Protocol (ILP)  | All QuestDB versions  |
-| **2**   | 64-bit floats sent as binary, adds n-dimentional arrays | 8.4.0+ (2023-10-30)   |
+| **2**   | 64-bit floats sent as binary, adds n-dimentional arrays | 9.0.0+ (2023-10-30)   |
 
-**Note**: QuestDB server version 8.4.0 or later is required for `protocol_version=2` support.
+**Note**: QuestDB server version 9.0.0 or later is required for `protocol_version=2` support.
 
 ## Quick Start
 
@@ -58,7 +58,7 @@ fn main() -> Result<()> {
        .column_f64("price", 2615.54)?
        .column_f64("amount", 0.00044)?
 
-       // Array ingestion (QuestDB 8.4.0+). Slices and ndarray supported through trait
+       // Array ingestion (QuestDB 9.0.0+). Slices and ndarray supported through trait
        .column_arr("price_history", &[2615.54f64, 2615.10, 2614.80])?
        .column_arr("volatility", &ndarray::arr1(&[0.012f64, 0.011, 0.013]).view())?
        .at(TimestampNanos::now())?;

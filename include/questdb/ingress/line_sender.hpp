@@ -107,7 +107,7 @@ enum class protocol_version
 
     /**
      * InfluxDB Line Protocol v2.
-     * QuestDB server version 8.4.0 or later is required for
+     * QuestDB server version 9.0.0 or later is required for
      * `v2` support.
      */
     v2 = 2,
@@ -892,7 +892,7 @@ public:
     /**
      * Record a multidimensional array of `double` values.
      *
-     * QuestDB server version 8.4.0 or later is required for array support.
+     * QuestDB server version 9.0.0 or later is required for array support.
      *
      * @tparam T    Element type (current only `double` is supported).
      * @tparam M    Array stride size mode (bytes or elements).
@@ -940,7 +940,7 @@ public:
      * Records a multidimensional array of double-precision values with c_major
      * layout.
      *
-     * QuestDB server version 8.4.0 or later is required for array support.
+     * QuestDB server version 9.0.0 or later is required for array support.
      *
      * @tparam T    Element type (current only `double` is supported).
      * @tparam N    Number of elements in the flat data array
@@ -970,7 +970,7 @@ public:
     /**
      * Record a multidimensional array of double-precision values.
      *
-     * QuestDB server version 8.4.0 or later is required for array support.
+     * QuestDB server version 9.0.0 or later is required for array support.
      *
      * Use this method to record arrays of common or custom types such as
      * `std::vector`, `std::span`, `std::array`, or custom types that can be
@@ -1484,7 +1484,7 @@ public:
      * `protocol_version::v1` by default. You must explicitly set
      * `protocol_version::v2` in order to ingest arrays.
      *
-     * QuestDB server version 8.4.0 or later is required for
+     * QuestDB server version 9.0.0 or later is required for
      * `protocol_version::v2` support.
      */
     opts& protocol_version(protocol_version version) noexcept

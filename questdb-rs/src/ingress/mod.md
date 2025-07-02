@@ -265,10 +265,10 @@ arrays using several convenient types:
 
 You must use protocol version 2 to ingest arrays. HTTP transport will
 automatically enable it as long as you're connecting to an up-to-date QuestDB
-server (version 8.4.0 or later), but with TCP you must explicitly specify it in
+server (version 9.0.0 or later), but with TCP you must explicitly specify it in
 the configuration string: `protocol_version=2;`.
 
-**Note**: QuestDB server version 8.4.0 or later is required for array support.
+**Note**: QuestDB server version 9.0.0 or later is required for array support.
 
 ## Timestamp Column Name
 

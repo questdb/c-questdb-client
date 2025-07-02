@@ -6,7 +6,7 @@ using namespace std::literals::string_view_literals;
 using namespace questdb::ingress::literals;
 
 /*
- * QuestDB server version 8.4.0 or later is required for array support.
+ * QuestDB server version 9.0.0 or later is required for array support.
  */
 static bool array_example(std::string_view host, std::string_view port)
 {
