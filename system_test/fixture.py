@@ -229,7 +229,122 @@ class QueryError(Exception):
     pass
 
 
-class QuestDbFixture:
+class QuestDbFixtureBase:
+    def print_log(self):
+        """Print the QuestDB log to stderr."""
+        sys.stderr.write('questdb log output skipped.\n')
+
+    def http_sql_query(self, sql_query):
+        url = (
+                f'http://{self.host}:{self.http_server_port}/exec?' +
+                urllib.parse.urlencode({'query': sql_query}))
+        buf = None
+        try:
+            resp = urllib.request.urlopen(url, timeout=5)
+            buf = resp.read()
+        except urllib.error.HTTPError as http_error:
+            buf = http_error.read()
+        try:
+            data = json.loads(buf)
+        except json.JSONDecodeError as jde:
+            # Include buffer in error message for easier debugging.
+            raise json.JSONDecodeError(
+                f'Could not parse response: {buf!r}: {jde.msg}',
+                jde.doc,
+                jde.pos)
+        if 'error' in data:
+            raise QueryError(data['error'])
+        return data
+
+    def query_version(self):
+        try:
+            res = self.http_sql_query('select build')
+        except QueryError as qe:
+            # For old versions that don't support `build` yet, parse from path.
+            return self.version
+
+        vers = res['dataset'][0][0]
+        print(vers)
+
+        # This returns a string like:
+        # 'Build Information: QuestDB 7.3.2, JDK 11.0.8, Commit Hash 19059deec7b0fd19c53182b297a5d59774a51892'
+        # We want the '7.3.2' part.
+        vers = re.compile(r'.*QuestDB ([0-9.]+).*').search(vers).group(1)
+        return _parse_version(vers)
+
+    def retry_check_table(
+            self,
+            table_name,
+            *,
+            min_rows=1,
+            timeout_sec=300,
+            log=True,
+            log_ctx=None):
+        sql_query = f"select * from '{table_name}'"
+        http_response_log = []
+
+        def check_table():
+            try:
+                resp = self.http_sql_query(sql_query)
+                http_response_log.append((time.time(), resp))
+                if not resp.get('dataset'):
+                    return False
+                elif len(resp['dataset']) < min_rows:
+                    return False
+                return resp
+            except QueryError:
+                return None
+
+        try:
+            return retry(check_table, timeout_sec=timeout_sec)
+        except TimeoutError as toe:
+            if log:
+                if log_ctx:
+                    log_ctx_str = log_ctx.decode('utf-8', errors='replace')
+                    log_ctx = f'\n{textwrap.indent(log_ctx_str, "    ")}\n'
+                sys.stderr.write(
+                    f'Timed out after {timeout_sec} seconds ' +
+                    f'waiting for query {sql_query!r}. ' +
+                    f'Context: {log_ctx}' +
+                    f'Client response log:\n' +
+                    pformat(http_response_log) +
+                    f'\nQuestDB log:\n')
+                self.print_log()
+            raise toe
+        
+    def show_tables(self):
+        """Return a list of tables in the database."""
+        sql_query = "show tables"
+        try:
+            resp = self.http_sql_query(sql_query)
+            return [row[0] for row in resp['dataset']]
+        except QueryError as qe:
+            raise qe
+        
+    def drop_table(self, table_name):
+        self.http_sql_query(f"drop table '{table_name}'")
+
+    def drop_all_tables(self):
+        """Drop all tables in the database."""
+        all_tables = self.show_tables()
+        # if all_tables:
+        #     print(f'Dropping {len(all_tables)} tables: {all_tables!r}')
+        for table_name in all_tables:
+            self.drop_table(table_name)
+
+
+class QuestDbExternalFixture(QuestDbFixtureBase):
+    def __init__(self, host, line_tcp_port, http_server_port, version, http, auth, protocol_version):
+        self.host = host
+        self.line_tcp_port = line_tcp_port
+        self.http_server_port = http_server_port
+        self.version = version
+        self.http = http
+        self.auth = auth
+        self.protocol_version = protocol_version
+
+
+class QuestDbFixture(QuestDbFixtureBase):
     def __init__(self, root_dir: pathlib.Path, auth=False, wrap_tls=False, http=False, protocol_version=None):
         self._root_dir = root_dir
         self.version = _parse_version(self._root_dir.name)
@@ -346,104 +461,6 @@ class QuestDbFixture:
             self._tls_proxy = TlsProxyFixture(self.line_tcp_port)
             self._tls_proxy.start()
             self.tls_line_tcp_port = self._tls_proxy.listen_port
-
-    def http_sql_query(self, sql_query):
-        url = (
-                f'http://{self.host}:{self.http_server_port}/exec?' +
-                urllib.parse.urlencode({'query': sql_query}))
-        buf = None
-        try:
-            resp = urllib.request.urlopen(url, timeout=5)
-            buf = resp.read()
-        except urllib.error.HTTPError as http_error:
-            buf = http_error.read()
-        try:
-            data = json.loads(buf)
-        except json.JSONDecodeError as jde:
-            # Include buffer in error message for easier debugging.
-            raise json.JSONDecodeError(
-                f'Could not parse response: {buf!r}: {jde.msg}',
-                jde.doc,
-                jde.pos)
-        if 'error' in data:
-            raise QueryError(data['error'])
-        return data
-
-    def query_version(self):
-        try:
-            res = self.http_sql_query('select build')
-        except QueryError as qe:
-            # For old versions that don't support `build` yet, parse from path.
-            return self.version
-
-        vers = res['dataset'][0][0]
-        print(vers)
-
-        # This returns a string like:
-        # 'Build Information: QuestDB 7.3.2, JDK 11.0.8, Commit Hash 19059deec7b0fd19c53182b297a5d59774a51892'
-        # We want the '7.3.2' part.
-        vers = re.compile(r'.*QuestDB ([0-9.]+).*').search(vers).group(1)
-        return _parse_version(vers)
-
-    def retry_check_table(
-            self,
-            table_name,
-            *,
-            min_rows=1,
-            timeout_sec=300,
-            log=True,
-            log_ctx=None):
-        sql_query = f"select * from '{table_name}'"
-        http_response_log = []
-
-        def check_table():
-            try:
-                resp = self.http_sql_query(sql_query)
-                http_response_log.append((time.time(), resp))
-                if not resp.get('dataset'):
-                    return False
-                elif len(resp['dataset']) < min_rows:
-                    return False
-                return resp
-            except QueryError:
-                return None
-
-        try:
-            return retry(check_table, timeout_sec=timeout_sec)
-        except TimeoutError as toe:
-            if log:
-                if log_ctx:
-                    log_ctx_str = log_ctx.decode('utf-8', errors='replace')
-                    log_ctx = f'\n{textwrap.indent(log_ctx_str, "    ")}\n'
-                sys.stderr.write(
-                    f'Timed out after {timeout_sec} seconds ' +
-                    f'waiting for query {sql_query!r}. ' +
-                    f'Context: {log_ctx}' +
-                    f'Client response log:\n' +
-                    pformat(http_response_log) +
-                    f'\nQuestDB log:\n')
-                self.print_log()
-            raise toe
-        
-    def show_tables(self):
-        """Return a list of tables in the database."""
-        sql_query = "show tables"
-        try:
-            resp = self.http_sql_query(sql_query)
-            return [row[0] for row in resp['dataset']]
-        except QueryError as qe:
-            raise qe
-        
-    def drop_table(self, table_name):
-        self.http_sql_query(f"drop table '{table_name}'")
-
-    def drop_all_tables(self):
-        """Drop all tables in the database."""
-        all_tables = self.show_tables()
-        # if all_tables:
-        #     print(f'Dropping {len(all_tables)} tables: {all_tables!r}')
-        for table_name in all_tables:
-            self.drop_table(table_name)
 
     def __enter__(self):
         self.start()

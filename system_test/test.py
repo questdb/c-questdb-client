@@ -40,6 +40,8 @@ import questdb_line_sender as qls
 import uuid
 from fixture import (
     Project,
+    QuestDbFixtureBase,
+    QuestDbExternalFixture,
     QuestDbFixture,
     TlsProxyFixture,
     install_questdb,
@@ -49,7 +51,7 @@ from fixture import (
 import subprocess
 from collections import namedtuple
 
-QDB_FIXTURE: QuestDbFixture = None
+QDB_FIXTURE: QuestDbFixtureBase = None
 TLS_PROXY_FIXTURE: TlsProxyFixture = None
 BUILD_MODE = None
 
@@ -1119,24 +1121,16 @@ def list_releases(args):
 
 def run_with_existing(args):
     global QDB_FIXTURE
-    MockFixture = namedtuple(
-        'MockFixture',
-        (
-            'host',
-            'line_tcp_port',
-            'http_server_port',
-            'version',
-            'http',
-            'auth',
-            'protocol_version'))
     host, line_tcp_port, http_server_port = args.existing.split(':')
-    QDB_FIXTURE = MockFixture(
+    QDB_FIXTURE = QuestDbExternalFixture(
         host,
         int(line_tcp_port),
         int(http_server_port),
         (999, 999, 999),
         True,
-        False)
+        False,
+        qls.ProtocolVersion.V2
+    )
     unittest.main()
 
 
