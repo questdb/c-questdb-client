@@ -357,7 +357,7 @@ enum Connection {
 
 impl Connection {
     fn send_key_id(&mut self, key_id: &str) -> Result<()> {
-        writeln!(self, "{}", key_id)
+        writeln!(self, "{key_id}")
             .map_err(|io_err| map_io_to_socket_err("Failed to send key_id: ", io_err))?;
         Ok(())
     }
@@ -2366,14 +2366,14 @@ impl SenderBuilder {
             let bind_addr = gai::resolve_host(host.as_str())?;
             sock.bind(&bind_addr).map_err(|io_err| {
                 map_io_to_socket_err(
-                    &format!("Could not bind to interface address {:?}: ", host),
+                    &format!("Could not bind to interface address {host:?}: "),
                     io_err,
                 )
             })?;
         }
         sock.connect(&addr).map_err(|io_err| {
             let host_port = format!("{}:{}", self.host.deref(), *self.port);
-            let prefix = format!("Could not connect to {:?}: ", host_port);
+            let prefix = format!("Could not connect to {host_port:?}: ");
             map_io_to_socket_err(&prefix, io_err)
         })?;
 

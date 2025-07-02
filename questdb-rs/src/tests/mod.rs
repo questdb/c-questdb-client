@@ -46,10 +46,9 @@ pub fn assert_err_contains<T: std::fmt::Debug>(
     expected_msg_contained: &str,
 ) {
     match result {
-        Ok(_) => panic!(
-            "Expected error containing '{}', but got Ok({:?})",
-            expected_msg_contained, result
-        ),
+        Ok(_) => {
+            panic!("Expected error containing '{expected_msg_contained}', but got Ok({result:?})")
+        }
         Err(e) => {
             assert_eq!(
                 e.code(),

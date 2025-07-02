@@ -318,7 +318,7 @@ fn parse_json_error(json: &serde_json::Value, msg: &str) -> Error {
                 description.push_str(", ");
             }
             description.push_str("line: ");
-            write!(description, "{}", line).unwrap();
+            write!(description, "{line}").unwrap();
         }
 
         description.push(']');
@@ -337,7 +337,7 @@ pub(super) fn parse_http_error(http_status_code: u16, response: Response<Body>) 
         );
     } else if [401, 403].contains(&http_status_code) {
         let description = match body_content {
-            Ok(msg) if !msg.is_empty() => format!(": {}", msg),
+            Ok(msg) if !msg.is_empty() => format!(": {msg}"),
             _ => "".to_string(),
         };
         return error::fmt!(
