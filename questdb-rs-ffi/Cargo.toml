@@ -20,7 +20,7 @@ features = [
     "insecure-skip-verify",
     "tls-webpki-certs",
     "tls-native-certs",
-    "ilp-over-http"
+    "sync-sender"
 ]
 
 [features]

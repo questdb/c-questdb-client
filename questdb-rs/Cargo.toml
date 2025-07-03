@@ -19,7 +19,7 @@ crate-type = ["lib"]
 
 [dependencies]
 libc = "0.2"
-socket2 = "0.5.5"
+socket2 = { version = "0.5.5", optional = true }
 dns-lookup = "2.0.4"
 base64ct = { version = "1.7", features = ["alloc"] }
 rustls-pemfile = "2.0.0"
@@ -30,7 +30,7 @@ ring = { version = "0.17.14", optional = true }
 rustls-pki-types = "1.0.1"
 rustls = { version = "0.23.25", default-features = false, features = ["logging", "std", "tls12"] }
 rustls-native-certs = { version = "0.8.1", optional = true }
-webpki-roots = { version = "0.26.8", default-features = false, optional = true }
+webpki-roots = { version = "1.0.1", default-features = false, optional = true }
 chrono = { version = "0.4.40", optional = true }
 
 # We need to limit the `ureq` version to 3.0.x since we use
@@ -54,43 +54,59 @@ indoc = "2"
 mio = { version = "1", features = ["os-poll", "net"] }
 chrono = "0.4.31"
 tempfile = "3"
-webpki-roots = "0.26.8"
+webpki-roots = "1.0.1"
 rstest = "0.25.0"
 
 [features]
-default = ["tls-webpki-certs", "ilp-over-http", "ring-crypto"]
+default = ["sync-sender", "tls-webpki-certs", "ring-crypto"]
 
-# Include support for ILP over HTTP.
-ilp-over-http = ["dep:ureq", "dep:serde_json", "dep:rand"]
+## Sync ILP/TCP + ILP/HTTP Sender
+sync-sender = ["sync-sender-tcp", "sync-sender-http"]
 
-# Allow use OS-provided root TLS certificates
+## Sync ILP/TCP
+sync-sender-tcp = ["_sync-sender", "_sender-tcp", "dep:socket2"]
+
+## Sync ILP/HTTP
+sync-sender-http = ["_sync-sender", "_sender-http", "dep:ureq", "dep:serde_json", "dep:rand"]
+
+## Compatiblity alias for `sync-sender-tcp` for versions < 5.0.0
+ilp-over-http = ["sync-sender-tcp"]
+
+## Allow use OS-provided root TLS certificates
 tls-native-certs = ["dep:rustls-native-certs"]
 
-# Allow use of the `webpki-roots` crate to validate TLS certificates.
+## Allow use of the `webpki-roots` crate to validate TLS certificates.
 tls-webpki-certs = ["dep:webpki-roots"]
 
-# Use `aws-lc-rs` as the cryto library.
+## Use `aws-lc-rs` as the cryto library.
 aws-lc-crypto = ["dep:aws-lc-rs", "rustls/aws-lc-rs"]
 
-# Use `ring` as the crypto library.
+## Use `ring` as the crypto library.
 ring-crypto = ["dep:ring", "rustls/ring"]
 
-# Allow skipping verification of insecure certificates.
+## Allow skipping verification of insecure certificates.
 insecure-skip-verify = []
 
-# Enable code-generation in `build.rs` for additional tests.
+## Enable code-generation in `build.rs` for additional tests.
 json_tests = []
 
-# Enable methods to create timestamp objects from chrono::DateTime objects.
+## Enable methods to create timestamp objects from chrono::DateTime objects.
 chrono_timestamp = ["chrono"]
 
-# The `aws-lc-crypto` and `ring-crypto` features are mutually exclusive,
-# thus compiling with `--all-features` will not work.
-# Instead compile with `--features almost-all-features`.
-# This is useful for quickly running `cargo test` or `cargo clippy`.
+# Hidden derived features, used in code to enable-disable code sections. Don't use directly.
+_sender-tcp = []
+_sender-http = []
+_sync-sender = []
+
+## Enable all cross-compatible features.
+## The `aws-lc-crypto` and `ring-crypto` features are mutually exclusive,
+## thus compiling with `--all-features` will not work.
+## Instead use `--features almost-all-features`.
+## This is useful for quickly running `cargo test` or `cargo clippy`.
 almost-all-features = [
+    "sync-sender",
     "tls-webpki-certs",
-    "ilp-over-http",
+    "tls-native-certs",
     "ring-crypto",
     "insecure-skip-verify",
     "json_tests",
@@ -112,8 +128,8 @@ required-features = ["chrono_timestamp"]
 
 [[example]]
 name = "http"
-required-features = ["ilp-over-http", "ndarray"]
+required-features = ["sync-sender-http", "ndarray"]
 
 [[example]]
 name = "protocol_version"
-required-features = ["ilp-over-http", "ndarray"]
+required-features = ["sync-sender-http", "ndarray"]

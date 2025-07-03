@@ -21,7 +21,7 @@
  *  limitations under the License.
  *
  ******************************************************************************/
-
+use std::convert::Infallible;
 use std::fmt::{Display, Formatter};
 
 macro_rules! fmt {
@@ -96,7 +96,7 @@ impl Error {
         }
     }
 
-    #[cfg(feature = "ilp-over-http")]
+    #[cfg(feature = "sync-sender-http")]
     pub(crate) fn from_ureq_error(err: ureq::Error, url: &str) -> Error {
         match err {
             ureq::Error::StatusCode(code) => {
@@ -139,6 +139,12 @@ impl Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+impl From<Infallible> for Error {
+    fn from(_: Infallible) -> Self {
+        unreachable!()
+    }
+}
 
 /// A specialized `Result` type for the crate's [`Error`] type.
 pub type Result<T> = std::result::Result<T, Error>;

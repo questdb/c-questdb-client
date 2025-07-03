@@ -133,9 +133,7 @@ pub mod json_tests {
                         return true;
                     }
                 }
-                eprintln!(
-                    "Could not match:\n    {:?}\nTo any of: {:#?}",
-                    line, expected);
+                eprintln!("Could not match:\n    {line:?}\nTo any of: {expected:#?}");
                 false
             }
             "#}
@@ -163,7 +161,7 @@ pub mod json_tests {
                 writeln!(output, "    || -> Result<()> {{")?;
             }
             writeln!(output, "{indent}    buffer")?;
-            writeln!(output, "{}        .table({:?})?", indent, spec.table)?;
+            writeln!(output, "{indent}        .table({:?})?", spec.table)?;
             for symbol in spec.symbols.iter() {
                 writeln!(
                     output,
@@ -216,7 +214,7 @@ pub mod json_tests {
                             "        assert_eq!(buffer.as_bytes(), exp.as_bytes());"
                         )?;
                     } else {
-                        // 处理 V1 版本的 any_lines
+                        // Checking V1 any_lines
                         let any: Vec<String> = expected
                             .any_lines
                             .as_ref()
@@ -272,6 +270,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(any(feature = "tls-webpki-certs", feature = "tls-native-certs")))]
     compile_error!(
         "At least one of `tls-webpki-certs` or `tls-native-certs` features must be enabled."
+    );
+
+    #[cfg(not(any(feature = "_sender-tcp", feature = "_sender-http")))]
+    compile_error!(
+        "At least one of `sync-sender-tcp` or `sync-sender-http` features must be enabled"
     );
 
     #[cfg(not(any(feature = "aws-lc-crypto", feature = "ring-crypto")))]
