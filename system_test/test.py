@@ -139,6 +139,14 @@ class TestSender(unittest.TestCase):
                  .at_now())
                 sender.flush()
 
+    def setUp(self):
+        test_name = self.id()
+        QDB_FIXTURE.http_sql_query(f'select * from long_sequence(1) -- >>>>>>>>> BEGIN PYTHON UNIT TEST: {test_name}')
+
+    def tearDown(self):
+        test_name = self.id()
+        QDB_FIXTURE.http_sql_query(f'select * from long_sequence(1) -- <<<<<<<<< END PYTHON UNIT TEST: {test_name}')
+
     def test_default_max_name_len(self):
         with self._mk_linesender() as sender:
             self.assertEqual(sender.max_name_len, 127)
