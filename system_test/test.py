@@ -243,15 +243,19 @@ class TestSender(unittest.TestCase):
              .table(table_name)
              .symbol('a', 'A')
              .at_now())
+            (sender
+             .table(table_name)
+             .symbol('a', 'B')
+             .at_now())
             pending = sender.buffer.peek()
 
-        resp = retry_check_table(table_name, log_ctx=pending)
+        resp = retry_check_table(table_name, log_ctx=pending, min_rows=2)
         exp_columns = [
             {'name': 'a', 'type': 'SYMBOL'},
             {'name': 'timestamp', 'type': 'TIMESTAMP'}]
         self.assertEqual(resp['columns'], exp_columns)
 
-        exp_dataset = [['A']]  # Comparison excludes timestamp column.
+        exp_dataset = [['A'], ['B']]  # Comparison excludes timestamp column.
         scrubbed_dataset = [row[:-1] for row in resp['dataset']]
         self.assertEqual(scrubbed_dataset, exp_dataset)
 
