@@ -90,6 +90,7 @@ fn unpack_os_native_certs(
 
 #[cfg(feature = "tls-native-certs")]
 fn add_os_roots(root_store: &mut RootCertStore) -> crate::Result<()> {
+    eprintln!("add_os_roots :: (1)");
     let os_certs = unpack_os_native_certs(rustls_native_certs::load_native_certs())?;
 
     let (valid_count, invalid_count) = root_store.add_parsable_certificates(os_certs);
@@ -100,9 +101,11 @@ fn add_os_roots(root_store: &mut RootCertStore) -> crate::Result<()> {
             invalid_count
         ));
     }
+    eprintln!("add_os_roots :: (2) valid_count: {valid_count}, invalid_count: {invalid_count}");
     Ok(())
 }
 
+#[derive(Debug)]
 pub(crate) enum TlsSettings {
     #[cfg(feature = "insecure-skip-verify")]
     SkipVerify,
@@ -128,6 +131,7 @@ impl TlsSettings {
         ca: CertificateAuthority,
         roots: Option<&Path>,
     ) -> Result<Option<Self>> {
+        eprintln!("TlsSettings::build :: (1) enabled: {enabled}, ca: {ca:?}, roots: {roots:?}");
         if !enabled {
             return Ok(None);
         }

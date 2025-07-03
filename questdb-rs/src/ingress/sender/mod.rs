@@ -135,7 +135,9 @@ impl Sender {
 
     #[allow(unused_variables)]
     fn flush_impl(&mut self, buf: &Buffer, transactional: bool) -> Result<()> {
+        eprintln!("Sender::flush :: (1) buf: {buf:?}");
         if !self.connected {
+            eprintln!("Sender::flush :: (2)");
             return Err(error::fmt!(
                 SocketError,
                 "Could not flush buffer: not connected to database."
@@ -144,6 +146,7 @@ impl Sender {
         buf.check_can_flush()?;
 
         if buf.len() > self.max_buf_size {
+            eprintln!("Sender::flush :: (3)");
             return Err(error::fmt!(
                 InvalidApiCall,
                 "Could not flush buffer: Buffer size of {} exceeds maximum configured allowed size of {} bytes.",
@@ -162,12 +165,15 @@ impl Sender {
             #[cfg(feature = "sync-sender-tcp")]
             SyncProtocolHandler::SyncTcp(ref mut conn) => {
                 if transactional {
+                    eprintln!("Sender::flush :: (4)");
                     return Err(error::fmt!(
                         InvalidApiCall,
                         "Transactional flushes are not supported for ILP over TCP."
                     ));
                 }
+                eprintln!("Sender::flush :: (4)");
                 conn.write_all(bytes).map_err(|io_err| {
+                    eprintln!("Sender::flush :: (5)");
                     self.connected = false;
                     map_io_to_socket_err("Could not flush buffer: ", io_err)
                 })?;
