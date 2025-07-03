@@ -75,7 +75,7 @@ async fn handle_conn(
     let inbound_conn = acceptor.accept(inbound_conn).await?;
     eprintln!("Completed TLS handshake with client connection.");
     let outbound_conn = TcpStream::connect(dest_addr).await?;
-    eprintln!("Established outbound connection to {}.", dest_addr);
+    eprintln!("Established outbound connection to {dest_addr}.");
 
     let (mut in_read, mut in_write) = tio::split(inbound_conn);
     let (mut out_read, mut out_write) = outbound_conn.into_split();
@@ -95,7 +95,7 @@ async fn loop_server(
     dest_port: u16,
     listen_port_sender: tokio::sync::oneshot::Sender<u16>,
 ) -> anyhow::Result<()> {
-    let dest_addr = format!("localhost:{}", dest_port);
+    let dest_addr = format!("localhost:{dest_port}");
     eprintln!("Destination address is {}.", &dest_addr);
 
     let config = tls_config();
@@ -103,12 +103,12 @@ async fn loop_server(
 
     let listener = TcpListener::bind("0.0.0.0:0").await?;
     let listen_port = listener.local_addr()?.port();
-    eprintln!("TLS Proxy is listening on localhost:{}.", listen_port);
+    eprintln!("TLS Proxy is listening on localhost:{listen_port}.");
     listen_port_sender.send(listen_port).unwrap();
 
     loop {
         if let Err(err) = handle_conn(&listener, &acceptor, &dest_addr).await {
-            eprintln!("Error handling connection: {}", err);
+            eprintln!("Error handling connection: {err}");
         }
     }
 }
