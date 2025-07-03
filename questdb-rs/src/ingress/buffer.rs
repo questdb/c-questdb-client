@@ -1260,6 +1260,7 @@ impl Buffer {
         Ok(())
     }
 }
+
 struct DebugBytes<'a>(pub &'a [u8]);
 
 impl<'a> Debug for DebugBytes<'a> {

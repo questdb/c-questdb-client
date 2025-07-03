@@ -26,6 +26,7 @@
 // and: https://github.com/tokio-rs/tls/blob/master/tokio-rustls/examples/server/src/main.rs
 
 use std::fs::File;
+use std::io;
 use std::io::BufReader;
 use std::sync::Arc;
 
@@ -35,6 +36,7 @@ use tokio::net::TcpStream;
 use tokio::select;
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 
 fn certs_dir() -> std::path::PathBuf {
     let mut certs_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -68,24 +70,26 @@ async fn handle_conn(
     acceptor: &TlsAcceptor,
     dest_addr: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("Waiting for a connection.");
+    eprintln!("[TLS PROXY] Waiting for a connection.");
     let (inbound_conn, _) = listener.accept().await?;
-    eprintln!("Accepted a client connection.");
+    inbound_conn.set_nodelay(true)?;
+    eprintln!("[TLS PROXY] Accepted a client connection.");
     let acceptor = acceptor.clone();
     let inbound_conn = acceptor.accept(inbound_conn).await?;
-    eprintln!("Completed TLS handshake with client connection.");
+    eprintln!("[TLS PROXY] Completed TLS handshake with client connection.");
     let outbound_conn = TcpStream::connect(dest_addr).await?;
-    eprintln!("Established outbound connection to {dest_addr}.");
+    outbound_conn.set_nodelay(true)?;
+    eprintln!("[TLS PROXY] Established outbound connection to {dest_addr}.");
 
     let (mut in_read, mut in_write) = tio::split(inbound_conn);
     let (mut out_read, mut out_write) = outbound_conn.into_split();
 
-    let in_to_out = tokio::spawn(async move { tio::copy(&mut in_read, &mut out_write).await });
-    let out_to_in = tokio::spawn(async move { tio::copy(&mut out_read, &mut in_write).await });
+    let in_to_out = tokio::spawn(async move { copy_with_logging("in->out", &mut in_read, &mut out_write).await });
+    let out_to_in = tokio::spawn(async move { copy_with_logging("out->in", &mut out_read, &mut in_write).await });
 
     select! {
-        _ = in_to_out => eprintln!("in_to_out shut down."),
-        _ = out_to_in => eprintln!("out_to_in shut down."),
+        _ = in_to_out => eprintln!("[TLS PROXY] in_to_out shut down."),
+        _ = out_to_in => eprintln!("[TLS PROXY] out_to_in shut down."),
     }
 
     Ok(())
@@ -96,19 +100,19 @@ async fn loop_server(
     listen_port_sender: tokio::sync::oneshot::Sender<u16>,
 ) -> anyhow::Result<()> {
     let dest_addr = format!("localhost:{dest_port}");
-    eprintln!("Destination address is {}.", &dest_addr);
+    eprintln!("[TLS PROXY] Destination address is {}.", &dest_addr);
 
     let config = tls_config();
     let acceptor = TlsAcceptor::from(config);
 
     let listener = TcpListener::bind("0.0.0.0:0").await?;
     let listen_port = listener.local_addr()?.port();
-    eprintln!("TLS Proxy is listening on localhost:{listen_port}.");
+    eprintln!("[TLS PROXY] TLS Proxy is listening on localhost:{listen_port}.");
     listen_port_sender.send(listen_port).unwrap();
 
     loop {
         if let Err(err) = handle_conn(&listener, &acceptor, &dest_addr).await {
-            eprintln!("Error handling connection: {err}");
+            eprintln!("[TLS PROXY] Error handling connection: {err}");
         }
     }
 }
@@ -178,4 +182,64 @@ impl Drop for TlsProxy {
             self.loop_handle.take().unwrap().abort();
         });
     }
+}
+
+struct DebugBytes<'a>(pub &'a [u8]);
+
+impl<'a> std::fmt::Debug for DebugBytes<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "b\"")?;
+
+        for &byte in self.0 {
+            match byte {
+                // Printable ASCII characters (except backslash and quote)
+                0x20..=0x21 | 0x23..=0x5B | 0x5D..=0x7E => {
+                    write!(f, "{}", byte as char)?;
+                }
+                // Common escape sequences
+                b'\n' => write!(f, "\\n")?,
+                b'\r' => write!(f, "\\r")?,
+                b'\t' => write!(f, "\\t")?,
+                b'\\' => write!(f, "\\\\")?,
+                b'"' => write!(f, "\\\"")?,
+                b'\0' => write!(f, "\\0")?,
+                // Non-printable bytes as hex escapes
+                _ => write!(f, "\\x{byte:02x}")?,
+            }
+        }
+
+        write!(f, "\"")
+    }
+}
+
+pub async fn copy_with_logging<R, W>(descr: &str, reader: &mut R, writer: &mut W) -> io::Result<u64>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buf = [0u8; 8192]; // 8KB buffer
+    let mut total_copied = 0u64;
+
+    loop {
+        let n = reader.read(&mut buf).await?;
+        
+        // If we read 0 bytes, we've reached EOF
+        if n == 0 {
+            break;
+        }
+
+        // Write all the data we just read
+        writer.write_all(&buf[..n]).await?;
+        writer.flush().await?;
+
+        eprintln!("[TLS PROXY:{}] Sent {} bytes: {:?}", descr, n, &DebugBytes(&buf[..n]));
+
+        total_copied += n as u64;
+    }
+
+    // Make sure everything is flushed
+    writer.flush().await?;
+
+    eprintln!("[TLS PROXY:{}] Send complete: {} total bytes", descr, total_copied);
+    Ok(total_copied)
 }

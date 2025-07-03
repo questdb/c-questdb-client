@@ -40,6 +40,8 @@ import textwrap
 import urllib.request
 import urllib.parse
 import urllib.error
+import concurrent.futures
+import threading
 from pprint import pformat
 
 AUTH_TXT = """admin ec-p-256-sha256 fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac
@@ -277,7 +279,7 @@ class QuestDbFixtureBase:
             table_name,
             *,
             min_rows=1,
-            timeout_sec=300,
+            timeout_sec=30,
             log=True,
             log_ctx=None):
         sql_query = f"select * from '{table_name}'"
@@ -487,18 +489,41 @@ class TlsProxyFixture:
         proj = Project()
         self._code_dir = proj.root_dir / 'system_test' / 'tls_proxy'
         self._target_dir = proj.build_dir / 'tls_proxy'
-        self._log_path = self._target_dir / 'log.txt'
-        self._log_file = None
         self._proc = None
+        self._port_future = None
+
+    def _capture_output(self, pipe, port_future):
+        """Capture output from subprocess and forward to stderr while watching for port"""
+        try:
+            for line in iter(pipe.readline, b''):
+                line_str = line.decode('utf-8', errors='replace')
+                # Write to stderr
+                sys.stderr.write(line_str)
+                sys.stderr.flush()
+                
+                # Check for port if we haven't found it yet
+                if not port_future.done():
+                    listening_msg = '[TLS PROXY] TLS Proxy is listening on localhost:'
+                    if line_str.startswith(listening_msg) and line_str.endswith('.\n'):
+                        port_str = line_str[len(listening_msg):-2]
+                        try:
+                            port = int(port_str)
+                            port_future.set_result(port)
+                        except ValueError:
+                            pass  # Invalid port, keep looking
+        except Exception as e:
+            if not port_future.done():
+                port_future.set_exception(e)
+        finally:
+            pipe.close()
 
     def start(self):
         self._target_dir.mkdir(exist_ok=True)
         env = dict(os.environ)
         env['CARGO_TARGET_DIR'] = str(self._target_dir)
-        self._log_file = open(self._log_path, 'wb')
 
         # Compile before running `cargo run`.
-        # Note that errors and output are purpously suppressed.
+        # Note that errors and output are purposely suppressed.
         # This is just to exclude the build time from the start-up time.
         # If there are build errors, they'll be reported later in the `run`
         # call below.
@@ -513,24 +538,24 @@ class TlsProxyFixture:
             ['cargo', 'run', str(self.qdb_ilp_port)],
             cwd=self._code_dir,
             env=env,
-            stdout=self._log_file,
+            stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT)
 
-        def check_started():
-            with open(self._log_path, 'r', encoding='utf-8') as log_reader:
-                lines = log_reader.readlines()
-                for line in lines:
-                    listening_msg = 'TLS Proxy is listening on localhost:'
-                    if line.startswith(listening_msg) and line.endswith('.\n'):
-                        port_str = line[len(listening_msg):-2]
-                        port = int(port_str)
-                        return port
-            return None
+        # Create future for port detection
+        self._port_future = concurrent.futures.Future()
 
-        self.listen_port = retry(
-            check_started,
-            timeout_sec=180,  # Longer to include time to compile.
-            msg='Timed out waiting for `tls_proxy` to start.', )
+        # Start thread to capture and forward output
+        self._output_thread = threading.Thread(
+            target=self._capture_output,
+            args=(self._proc.stdout, self._port_future))
+        self._output_thread.daemon = True
+        self._output_thread.start()
+
+        # Wait for port detection with timeout
+        try:
+            self.listen_port = self._port_future.result(timeout=180)
+        except concurrent.futures.TimeoutError as toe:
+            raise RuntimeError('Timed out waiting for `tls_proxy` to start.') from toe
 
         def connect_to_listening_port():
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -549,9 +574,8 @@ class TlsProxyFixture:
 
     def stop(self):
         if self._proc:
+            if self._output_thread.is_alive():
+                self._output_thread.join(timeout=5)
             self._proc.terminate()
             self._proc.wait()
             self._proc = None
-        if self._log_file:
-            self._log_file.close()
-            self._log_file = None
