@@ -138,6 +138,24 @@ impl IoWrite for SyncConnection {
     }
 }
 
+// This is important to make sure that any Windows socket is properly closed
+// without dropping in-flight writes.
+// We also set SO_LINGER to 120, but that is not enough apparently.
+impl Drop for SyncProtocolHandler {
+    fn drop(&mut self) {
+        if let SyncProtocolHandler::SyncTcp(conn) = self {
+            match conn {
+                SyncConnection::Direct(sock) => {
+                    let _ = sock.shutdown(std::net::Shutdown::Write);
+                }
+                SyncConnection::Tls(stream) => {
+                    let _ = stream.get_ref().shutdown(std::net::Shutdown::Write);
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn connect_tcp(
     host: &str,
     port: &str,
@@ -146,8 +164,6 @@ pub(crate) fn connect_tcp(
     tls_settings: Option<TlsSettings>,
     auth: &Option<conf::AuthParams>,
 ) -> crate::Result<SyncProtocolHandler> {
-    eprintln!("connect_tcp :: (1) host: {host}, port: {port}, net_interface: {net_interface:?}, auth_timeout: {auth_timeout:?}, tls_settings: {tls_settings:?}, auth: {auth:?}");
-
     let addr: SockAddr = gai::resolve_host_port(host, port)?;
     let mut sock = Socket::new(Domain::IPV4, Type::STREAM, Some(SockProtocol::TCP))
         .map_err(|io_err| map_io_to_socket_err("Could not open TCP socket: ", io_err))?;
@@ -173,14 +189,12 @@ pub(crate) fn connect_tcp(
             )
         })?;
     }
-    eprintln!("connect_tcp :: (2)");
+
     sock.connect(&addr).map_err(|io_err| {
-        eprintln!("connect_tcp :: (3) io_err: {io_err:?}");
         let host_port = format!("{host}:{port}");
         let prefix = format!("Could not connect to {host_port:?}: ");
         map_io_to_socket_err(&prefix, io_err)
     })?;
-    eprintln!("connect_tcp :: (4) connected");
 
     // We read during both TLS handshake and authentication.
     // We set up a read timeout to prevent the client from "hanging"
@@ -191,25 +205,19 @@ pub(crate) fn connect_tcp(
 
     let mut conn = match tls_settings {
         Some(tls_settings) => {
-            eprintln!("connect_tcp :: (5) TLS settings provided, configuring TLS connection");
             let tls_config = configure_tls(tls_settings)?;
             let server_name: ServerName = ServerName::try_from(host)
                 .map_err(|inv_dns_err| error::fmt!(TlsError, "Bad host: {}", inv_dns_err))?
                 .to_owned();
             let mut tls_conn =
                 ClientConnection::new(tls_config, server_name).map_err(|rustls_err| {
-                    eprintln!(
-                        "connect_tcp :: (6) Could not create TLS client connection: {rustls_err:?}"
-                    );
                     error::fmt!(TlsError, "Could not create TLS client: {}", rustls_err)
                 })?;
             while tls_conn.wants_write() || tls_conn.is_handshaking() {
-                eprintln!("connect_tcp :: (7) Completing TLS handshake");
                 tls_conn.complete_io(&mut sock).map_err(|io_err| {
                     if (io_err.kind() == ErrorKind::TimedOut)
                         || (io_err.kind() == ErrorKind::WouldBlock)
                     {
-                        eprintln!("connect_tcp :: (8) TLS handshake timeout: {io_err:?}");
                         error::fmt!(
                             TlsError,
                             concat!(
@@ -220,22 +228,18 @@ pub(crate) fn connect_tcp(
                             auth_timeout
                         )
                     } else {
-                        eprintln!("connect_tcp :: (9) TLS handshake failed: {io_err:?}");
                         error::fmt!(TlsError, "Failed to complete TLS handshake: {}", io_err)
                     }
                 })?;
             }
-            eprintln!("connect_tcp :: (10) TLS handshake completed successfully");
             SyncConnection::Tls(StreamOwned::new(tls_conn, sock).into())
         }
         None => SyncConnection::Direct(sock),
     };
 
     if let Some(conf::AuthParams::Ecdsa(auth)) = auth {
-        eprintln!("connect_tcp :: (11) Authenticating with ECDSA");
         conn.authenticate(auth)?;
     }
 
-    eprintln!("connect_tcp :: (12) connection established successfully");
     Ok(SyncProtocolHandler::SyncTcp(conn))
 }

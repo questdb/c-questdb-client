@@ -1285,5 +1285,33 @@ fn parse_key_pair(auth: &conf::EcdsaAuthParams) -> Result<EcdsaKeyPair> {
     })
 }
 
+struct DebugBytes<'a>(pub &'a [u8]);
+
+impl<'a> Debug for DebugBytes<'a> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "b\"")?;
+
+        for &byte in self.0 {
+            match byte {
+                // Printable ASCII characters (except backslash and quote)
+                0x20..=0x21 | 0x23..=0x5B | 0x5D..=0x7E => {
+                    write!(f, "{}", byte as char)?;
+                }
+                // Common escape sequences
+                b'\n' => write!(f, "\\n")?,
+                b'\r' => write!(f, "\\r")?,
+                b'\t' => write!(f, "\\t")?,
+                b'\\' => write!(f, "\\\\")?,
+                b'"' => write!(f, "\\\"")?,
+                b'\0' => write!(f, "\\0")?,
+                // Non-printable bytes as hex escapes
+                _ => write!(f, "\\x{byte:02x}")?,
+            }
+        }
+
+        write!(f, "\"")
+    }
+}
+
 #[cfg(test)]
 mod tests;

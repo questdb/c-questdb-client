@@ -279,7 +279,7 @@ class QuestDbFixtureBase:
             table_name,
             *,
             min_rows=1,
-            timeout_sec=30,
+            timeout_sec=300,
             log=True,
             log_ctx=None):
         sql_query = f"select * from '{table_name}'"

@@ -35,7 +35,7 @@ struct Options {
     port: u16,
 }
 
-#[tokio::main]
+#[tokio::main(worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
     let options: Options = argh::from_env();
     let server = tls_proxy::TlsProxy::new(options.port)?;

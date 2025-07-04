@@ -23,8 +23,9 @@
  ******************************************************************************/
 use crate::ingress::ndarr::{check_and_get_array_bytes_size, ArrayElementSealed};
 use crate::ingress::{
-    ndarr, ArrayElement, NdArrayView, ProtocolVersion, Timestamp, TimestampMicros, TimestampNanos,
-    ARRAY_BINARY_FORMAT_TYPE, DOUBLE_BINARY_FORMAT_TYPE, MAX_ARRAY_DIMS, MAX_NAME_LEN_DEFAULT,
+    ndarr, ArrayElement, DebugBytes, NdArrayView, ProtocolVersion, Timestamp, TimestampMicros,
+    TimestampNanos, ARRAY_BINARY_FORMAT_TYPE, DOUBLE_BINARY_FORMAT_TYPE, MAX_ARRAY_DIMS,
+    MAX_NAME_LEN_DEFAULT,
 };
 use crate::{error, Error};
 use std::fmt::{Debug, Formatter};
@@ -1258,34 +1259,6 @@ impl Buffer {
         self.state.op_case = OpCase::MayFlushOrTable;
         self.state.row_count += 1;
         Ok(())
-    }
-}
-
-struct DebugBytes<'a>(pub &'a [u8]);
-
-impl<'a> Debug for DebugBytes<'a> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "b\"")?;
-
-        for &byte in self.0 {
-            match byte {
-                // Printable ASCII characters (except backslash and quote)
-                0x20..=0x21 | 0x23..=0x5B | 0x5D..=0x7E => {
-                    write!(f, "{}", byte as char)?;
-                }
-                // Common escape sequences
-                b'\n' => write!(f, "\\n")?,
-                b'\r' => write!(f, "\\r")?,
-                b'\t' => write!(f, "\\t")?,
-                b'\\' => write!(f, "\\\\")?,
-                b'"' => write!(f, "\\\"")?,
-                b'\0' => write!(f, "\\0")?,
-                // Non-printable bytes as hex escapes
-                _ => write!(f, "\\x{byte:02x}")?,
-            }
-        }
-
-        write!(f, "\"")
     }
 }
 
