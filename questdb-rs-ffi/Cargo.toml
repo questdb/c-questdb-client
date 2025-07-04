@@ -1,6 +1,6 @@
 [package]
 name = "questdb-rs-ffi"
-version = "5.0.0-rc1"
+version = "5.0.0"
 edition = "2021"
 publish = false
 
@@ -20,7 +20,7 @@ features = [
     "insecure-skip-verify",
     "tls-webpki-certs",
     "tls-native-certs",
-    "ilp-over-http"
+    "sync-sender"
 ]
 
 [features]

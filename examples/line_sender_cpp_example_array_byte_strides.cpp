@@ -5,6 +5,9 @@
 using namespace std::literals::string_view_literals;
 using namespace questdb::ingress::literals;
 
+/*
+ * QuestDB server version 9.0.0 or later is required for array support.
+ */
 static bool array_example(std::string_view host, std::string_view port)
 {
     try
@@ -33,10 +36,19 @@ static bool array_example(std::string_view host, std::string_view port)
             48121.5,
             4.3};
 
+        questdb::ingress::array::
+            strided_view<double, questdb::ingress::array::strides_mode::bytes>
+                book_data{
+                    rank,
+                    shape.data(),
+                    strides.data(),
+                    arr_data.data(),
+                    arr_data.size()};
+
         questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
         buffer.table(table_name)
             .symbol(symbol_col, "BTC-USD"_utf8)
-            .column<true>(book_col, 3, shape, strides, arr_data)
+            .column(book_col, book_data)
             .at(questdb::ingress::timestamp_nanos::now());
         sender.flush(buffer);
         return true;

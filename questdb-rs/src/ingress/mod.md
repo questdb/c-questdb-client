@@ -254,7 +254,23 @@ However, TCP has a lower overhead than HTTP and it's worthwhile to try out as an
 alternative in a scenario where you have a constantly high data rate and/or deal
 with a high-latency network connection.
 
-### Timestamp Column Name
+## Array Datatype
+
+The [`Buffer::column_arr`](Buffer::column_arr) method supports efficient ingestion of N-dimensional
+arrays using several convenient types:
+
+- native Rust arrays and slices (up to 3-dimensional)
+- native Rust vectors (up to 3-dimensional)
+- arrays from the [`ndarray`](https://docs.rs/ndarray) crate
+
+You must use protocol version 2 to ingest arrays. HTTP transport will
+automatically enable it as long as you're connecting to an up-to-date QuestDB
+server (version 9.0.0 or later), but with TCP you must explicitly specify it in
+the configuration string: `protocol_version=2;`.
+
+**Note**: QuestDB server version 9.0.0 or later is required for array support.
+
+## Timestamp Column Name
 
 The InfluxDB Line Protocol (ILP) does not give a name to the designated timestamp,
 so if you let this client auto-create the table, it will have the default `timestamp` name.

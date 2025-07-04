@@ -78,15 +78,8 @@ typedef enum line_sender_error_code
     /** Bad configuration. */
     line_sender_error_config_error,
 
-    /** QuestDB supports arrays of up to 32 dimensions. */
-    line_sender_error_array_large_dim,
-
-    /** ArrayView internal error, such as failure to get the size of a valid
-     * dimension. */
-    line_sender_error_array_view_internal_error,
-
-    /**  Write arrayView to sender buffer error. */
-    line_sender_error_array_view_write_to_buffer_error,
+    /** There was an error serializing an array. */
+    line_sender_error_array_error,
 
     /**  Line sender protocol version error. */
     line_sender_error_protocol_version_error,
@@ -122,6 +115,8 @@ typedef enum line_sender_protocol_version
      * Uses a binary format serialization for f64, and supports
      * the array data type.
      * This version is specific to QuestDB and not compatible with InfluxDB.
+     * QuestDB server version 9.0.0 or later is required for
+     * `line_sender_protocol_version_2` support.
      */
     line_sender_protocol_version_2 = 2,
 } line_sender_protocol_version;
@@ -311,23 +306,20 @@ line_sender_column_name line_sender_column_name_assert(
 typedef struct line_sender_buffer line_sender_buffer;
 
 /**
- * Construct a `line_sender_buffer` with a `max_name_len` of `127`, which is
- * the same as the QuestDB server default.
- * You should prefer to use `line_sender_for_sender()` instead, which
- * automatically creates a buffer of the same protocol version as the sender.
- * This is useful as it can rely on the sender's ability to auto-detect the
- * protocol version when communicating over HTTP.
+ * Construct a `line_sender_buffer` with explicitly set `protocol_version` and
+ * fixed 127-byte name length limit.
+ * Prefer `line_sender_buffer_new_for_sender` which uses the sender's
+ * configured protocol settings.
  */
 LINESENDER_API
 line_sender_buffer* line_sender_buffer_new(
     line_sender_protocol_version version);
 
 /**
- * Construct a `line_sender_buffer` with a custom maximum length for table
- * and column names. This should match the `cairo.max.file.name.length`
- * setting of the QuestDB  server you're connecting to. If the server does
- * not configure it, the default is `127`, and you can call
- * `line_sender_buffer_new()` instead.
+ * Construct a `line_sender_buffer` with explicitly set `protocol_version` and
+ * a max name length limit.
+ * Prefer `line_sender_buffer_new_for_sender` which uses the sender's
+ * configured protocol and max name length limit settings.
  */
 LINESENDER_API
 line_sender_buffer* line_sender_buffer_with_max_name_len(
@@ -505,10 +497,37 @@ bool line_sender_buffer_column_str(
     line_sender_error** err_out);
 
 /**
+ * Record a multidimensional array of `double` values in C-major order.
+ *
+ * QuestDB server version 9.0.0 or later is required for array support.
+ *
+ * @param[in] buffer Line buffer object.
+ * @param[in] name Column name.
+ * @param[in] rank Number of dimensions of the array.
+ * @param[in] shape Array of dimension sizes (length = `rank`).
+ *                   Each element must be a positive integer.
+ * @param[in] data First array element data.
+ * @param[in] data_len Element length of the array.
+ * @param[out] err_out Set to an error object on failure (if non-NULL).
+ * @return true on success, false on error.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_f64_arr_c_major(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    size_t rank,
+    const uintptr_t* shape,
+    const double* data,
+    size_t data_len,
+    line_sender_error** err_out);
+
+/**
  * Record a multidimensional array of `double` values for the given column.
  *
  * The values in the `strides` parameter represent the number of bytes
  * between consecutive elements along each dimension.
+ *
+ * QuestDB server version 9.0.0 or later is required for array support.
  *
  * @param[in] buffer Line buffer object.
  * @param[in] name Column name.
@@ -517,9 +536,9 @@ bool line_sender_buffer_column_str(
  *                  Each element must be a positive integer.
  * @param[in] strides Array strides, in the unit of bytes. Strides can be
  * negative.
- * @param[in] data_buffer Array data, laid out according to the provided shape
+ * @param[in] data Array data, laid out according to the provided shape
  * and strides.
- * @param[in] data_buffer_len Length of the array data block in bytes.
+ * @param[in] data_len Element length of the array.
  * @param[out] err_out Set to an error object on failure (if non-NULL).
  * @return true on success, false on error.
  */
@@ -530,8 +549,8 @@ bool line_sender_buffer_column_f64_arr_byte_strides(
     size_t rank,
     const uintptr_t* shape,
     const intptr_t* strides,
-    const uint8_t* data_buffer,
-    size_t data_buffer_len,
+    const double* data,
+    size_t data_len,
     line_sender_error** err_out);
 
 /**
@@ -540,6 +559,8 @@ bool line_sender_buffer_column_f64_arr_byte_strides(
  * The values in the `strides` parameter represent the number of elements
  * between consecutive elements along each dimension.
  *
+ * QuestDB server version 9.0.0 or later is required for array support.
+ *
  * @param[in] buffer Line buffer object.
  * @param[in] name Column name.
  * @param[in] rank Number of dimensions of the array.
@@ -547,9 +568,9 @@ bool line_sender_buffer_column_f64_arr_byte_strides(
  *                   Each element must be a positive integer.
  * @param[in] strides Array strides, in the unit of elements. Strides can be
  * negative.
- * @param[in] data_buffer Array data, laid out according to the provided shape
+ * @param[in] data Array data, laid out according to the provided shape
  * and strides.
- * @param[in] data_buffer_len Length of the array data block in bytes.
+ * @param[in] data_len Element length of the array.
  * @param[out] err_out Set to an error object on failure (if non-NULL).
  * @return true on success, false on error.
  */
@@ -560,8 +581,8 @@ bool line_sender_buffer_column_f64_arr_elem_strides(
     size_t rank,
     const uintptr_t* shape,
     const intptr_t* strides,
-    const uint8_t* data_buffer,
-    size_t data_buffer_len,
+    const double* data,
+    size_t data_len,
     line_sender_error** err_out);
 
 /**
@@ -809,7 +830,18 @@ bool line_sender_opts_token_y(
     line_sender_error** err_out);
 
 /**
- * set the line protocol version.
+ * Sets the ingestion protocol version.
+ *
+ * HTTP transport automatically negotiates the protocol version by
+ * default(unset strong recommended). You can explicitlyconfigure the
+ * protocol version to avoid the slight latency cost at connection time.
+ *
+ * TCP transport does not negotiate the protocol version and uses
+ * `line_sender_protocol_version_1` by default. You must explicitly set
+ * `line_sender_protocol_version_2` in order to ingest arrays.
+ *
+ * QuestDB server version 9.0.0 or later is required for
+ * `line_sender_protocol_version_2` support.
  */
 LINESENDER_API
 bool line_sender_opts_protocol_version(
@@ -987,8 +1019,9 @@ line_sender* line_sender_from_env(line_sender_error** err_out);
 /**
  * Return the sender's protocol version.
  * This is either the protocol version that was set explicitly,
- * or the one that was auto-detected during the connection process.
- * If connecting via TCP and not overridden, the value is V1.
+ * or the one that was auto-detected during the connection process(Only for
+ * HTTP). If connecting via TCP and not overridden, the value is
+ * `line_sender_protocol_version_1`.
  */
 LINESENDER_API
 line_sender_protocol_version line_sender_get_protocol_version(
@@ -1002,7 +1035,7 @@ size_t line_sender_get_max_name_len(const line_sender* sender);
 
 /**
  * Construct a `line_sender_buffer` with the sender's
- * configured protocol version and other parameters.
+ * configured `protocol_version` and `max_name_len` settings.
  * This is equivalent to calling:
  *   line_sender_buffer_new(
  *       line_sender_get_protocol_version(sender),

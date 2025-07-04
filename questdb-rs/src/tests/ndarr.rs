@@ -62,7 +62,7 @@ impl TryFrom<u8> for ArrayColumnTypeTag {
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             10 => Ok(ArrayColumnTypeTag::Double),
-            _ => Err(format!("Unsupported column type tag {} for arrays", value)),
+            _ => Err(format!("Unsupported column type tag {value} for arrays")),
         }
     }
 }
@@ -390,7 +390,7 @@ fn test_build_in_2d_vec_irregular_shape() -> TestResult {
     buffer.table("my_test")?;
     let result = buffer.column_arr("arr", &irregular_vec);
     let err = result.unwrap_err();
-    assert_eq!(err.code(), ErrorCode::ArrayViewError);
+    assert_eq!(err.code(), ErrorCode::ArrayError);
     assert!(err.msg().contains("Irregular array shape"));
     Ok(())
 }
@@ -688,12 +688,12 @@ fn test_build_in_3d_vec_irregular_shape() -> TestResult {
     buffer.table("my_test")?;
     let result = buffer.column_arr("arr", &irregular1);
     let err = result.unwrap_err();
-    assert_eq!(err.code(), ErrorCode::ArrayViewError);
+    assert_eq!(err.code(), ErrorCode::ArrayError);
     assert!(err.msg().contains("Irregular array shape"));
 
     let result = buffer.column_arr("arr", &irregular2);
     let err = result.unwrap_err();
-    assert_eq!(err.code(), ErrorCode::ArrayViewError);
+    assert_eq!(err.code(), ErrorCode::ArrayError);
     assert!(err.msg().contains("Irregular array shape"));
     Ok(())
 }
@@ -900,6 +900,6 @@ fn test_buffer_write_ndarray_max_dimensions() -> TestResult {
     let result = buffer.column_arr("invalid", &array_invalid.view());
     assert!(result.is_err());
     let err = result.unwrap_err();
-    assert_eq!(err.code(), ErrorCode::ArrayHasTooManyDims);
+    assert_eq!(err.code(), ErrorCode::ArrayError);
     Ok(())
 }

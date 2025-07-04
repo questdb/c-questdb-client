@@ -36,11 +36,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::ingress;
-#[cfg(feature = "ilp-over-http")]
-use std::io::Write;
+#[cfg(feature = "sync-sender-tcp")]
+use crate::tests::ndarr::ArrayColumnTypeTag;
 
-use super::ndarr::ArrayColumnTypeTag;
+#[cfg(feature = "sync-sender-http")]
+use std::io::Write;
 
 const CLIENT: Token = Token(0);
 
@@ -53,8 +53,11 @@ pub struct MockServer {
     tls_conn: Option<ServerConnection>,
     pub host: &'static str,
     pub port: u16,
+
+    #[cfg(feature = "sync-sender-tcp")]
     pub msgs: Vec<Vec<u8>>,
-    #[cfg(feature = "ilp-over-http")]
+
+    #[cfg(feature = "sync-sender-http")]
     settings_response: serde_json::Value,
 }
 
@@ -84,7 +87,7 @@ fn tls_config() -> Arc<ServerConfig> {
     Arc::new(config)
 }
 
-#[cfg(feature = "ilp-over-http")]
+#[cfg(feature = "sync-sender-http")]
 pub struct HttpRequest {
     method: String,
     path: String,
@@ -92,7 +95,7 @@ pub struct HttpRequest {
     body: Vec<u8>,
 }
 
-#[cfg(feature = "ilp-over-http")]
+#[cfg(feature = "sync-sender-http")]
 impl HttpRequest {
     pub fn method(&self) -> &str {
         &self.method
@@ -111,7 +114,7 @@ impl HttpRequest {
     }
 }
 
-#[cfg(feature = "ilp-over-http")]
+#[cfg(feature = "sync-sender-http")]
 pub struct HttpResponse {
     status_code: u16,
     status_text: String,
@@ -119,7 +122,7 @@ pub struct HttpResponse {
     body: Vec<u8>,
 }
 
-#[cfg(feature = "ilp-over-http")]
+#[cfg(feature = "sync-sender-http")]
 impl HttpResponse {
     pub fn empty() -> Self {
         HttpResponse {
@@ -173,7 +176,7 @@ impl HttpResponse {
     pub fn as_string(&self) -> String {
         let mut s = format!("HTTP/1.1 {} {}\r\n", self.status_code, self.status_text);
         for (key, value) in &self.headers {
-            s.push_str(&format!("{}: {}\r\n", key, value));
+            s.push_str(&format!("{key}: {value}\r\n"));
         }
         s.push_str("\r\n");
         s.push_str(std::str::from_utf8(&self.body).unwrap());
@@ -181,14 +184,14 @@ impl HttpResponse {
     }
 }
 
-#[cfg(feature = "ilp-over-http")]
+#[cfg(feature = "sync-sender-http")]
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
         .any(|window| window == needle)
 }
 
-#[cfg(feature = "ilp-over-http")]
+#[cfg(feature = "sync-sender-http")]
 fn position(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
@@ -210,8 +213,11 @@ impl MockServer {
             tls_conn: None,
             host: "localhost",
             port,
+
+            #[cfg(feature = "sync-sender-tcp")]
             msgs: Vec::new(),
-            #[cfg(feature = "ilp-over-http")]
+
+            #[cfg(feature = "sync-sender-http")]
             settings_response: serde_json::Value::Null,
         })
     }
@@ -258,6 +264,7 @@ impl MockServer {
         Ok(())
     }
 
+    #[cfg(feature = "sync-sender-tcp")]
     pub fn accept_tls(mut self) -> std::thread::JoinHandle<io::Result<Self>> {
         std::thread::spawn(|| {
             self.accept_tls_sync()?;
@@ -294,7 +301,7 @@ impl MockServer {
         self.wait_for(timeout, |event| event.is_readable())
     }
 
-    #[cfg(feature = "ilp-over-http")]
+    #[cfg(feature = "sync-sender-http")]
     pub fn wait_for_send(&mut self, duration: Option<Duration>) -> io::Result<bool> {
         self.wait_for(duration, |event| event.is_writable())
     }
@@ -309,8 +316,12 @@ impl MockServer {
         }
     }
 
-    #[cfg(feature = "ilp-over-http")]
-    pub fn configure_settings_response(mut self, supported_versions: &[u16]) -> Self {
+    #[cfg(feature = "sync-sender-http")]
+    pub fn configure_settings_response(
+        mut self,
+        supported_versions: &[u16],
+        max_name_len: usize,
+    ) -> Self {
         if supported_versions.is_empty() {
             self.settings_response = serde_json::json!({"version": "8.1.2"});
         } else {
@@ -320,7 +331,7 @@ impl MockServer {
                     "ilp.proto.transports":["tcp", "http"],
                     "posthog.enabled":false,
                     "posthog.api.key":null,
-                    "cairo.max.file.name.length":127},
+                    "cairo.max.file.name.length": max_name_len},
                     "preferences.version":0,
                     "preferences":{}}
             );
@@ -328,7 +339,7 @@ impl MockServer {
         self
     }
 
-    #[cfg(feature = "ilp-over-http")]
+    #[cfg(feature = "sync-sender-http")]
     fn do_write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let client = self.client.as_mut().unwrap();
         if let Some(tls_conn) = self.tls_conn.as_mut() {
@@ -339,7 +350,7 @@ impl MockServer {
         }
     }
 
-    #[cfg(feature = "ilp-over-http")]
+    #[cfg(feature = "sync-sender-http")]
     fn do_write_all(&mut self, buf: &[u8], timeout_sec: Option<f64>) -> io::Result<()> {
         let deadline = timeout_sec.map(|sec| Instant::now() + Duration::from_secs_f64(sec));
         let mut pos = 0usize;
@@ -374,7 +385,7 @@ impl MockServer {
         Ok(())
     }
 
-    #[cfg(feature = "ilp-over-http")]
+    #[cfg(feature = "sync-sender-http")]
     fn read_more(&mut self, accum: &mut Vec<u8>, deadline: Instant, stage: &str) -> io::Result<()> {
         let mut chunk = [0u8; 1024];
         let count = match self.do_read(&mut chunk[..]) {
@@ -391,8 +402,7 @@ impl MockServer {
                         return Err(io::Error::new(
                             io::ErrorKind::TimedOut,
                             format!(
-                                "{} timed out while waiting for data. Received so far: {}",
-                                stage, so_far
+                                "{stage} timed out while waiting for data. Received so far: {so_far}"
                             ),
                         ));
                     }
@@ -412,7 +422,7 @@ impl MockServer {
         Ok(())
     }
 
-    #[cfg(feature = "ilp-over-http")]
+    #[cfg(feature = "sync-sender-http")]
     fn recv_http_method(
         &mut self,
         accum: &mut Vec<u8>,
@@ -441,7 +451,7 @@ impl MockServer {
         Ok((body_start, method, path))
     }
 
-    #[cfg(feature = "ilp-over-http")]
+    #[cfg(feature = "sync-sender-http")]
     fn recv_http_headers(
         &mut self,
         pos: usize,
@@ -470,7 +480,7 @@ impl MockServer {
         Ok((body_start, headers))
     }
 
-    #[cfg(feature = "ilp-over-http")]
+    #[cfg(feature = "sync-sender-http")]
     pub fn send_http_response(
         &mut self,
         response: HttpResponse,
@@ -480,7 +490,7 @@ impl MockServer {
         Ok(())
     }
 
-    #[cfg(feature = "ilp-over-http")]
+    #[cfg(feature = "sync-sender-http")]
     pub fn send_settings_response(&mut self) -> io::Result<()> {
         let response = HttpResponse::empty()
             .with_status(200, "OK")
@@ -489,12 +499,12 @@ impl MockServer {
         Ok(())
     }
 
-    #[cfg(feature = "ilp-over-http")]
+    #[cfg(feature = "sync-sender-http")]
     pub fn send_http_response_q(&mut self, response: HttpResponse) -> io::Result<()> {
         self.send_http_response(response, Some(5.0))
     }
 
-    #[cfg(feature = "ilp-over-http")]
+    #[cfg(feature = "sync-sender-http")]
     pub fn recv_http(&mut self, wait_timeout_sec: f64) -> io::Result<HttpRequest> {
         let mut accum = Vec::<u8>::new();
         let deadline = Instant::now() + Duration::from_secs_f64(wait_timeout_sec);
@@ -527,11 +537,12 @@ impl MockServer {
         })
     }
 
-    #[cfg(feature = "ilp-over-http")]
+    #[cfg(feature = "sync-sender-http")]
     pub fn recv_http_q(&mut self) -> io::Result<HttpRequest> {
         self.recv_http(5.0)
     }
 
+    #[cfg(feature = "sync-sender-tcp")]
     pub fn recv(&mut self, wait_timeout_sec: f64) -> io::Result<usize> {
         let deadline = Instant::now() + Duration::from_secs_f64(wait_timeout_sec);
 
@@ -574,9 +585,9 @@ impl MockServer {
                 index += 1;
                 // calc binary length
                 let binary_type = accum[index];
-                if binary_type == ingress::DOUBLE_BINARY_FORMAT_TYPE {
+                if binary_type == crate::ingress::DOUBLE_BINARY_FORMAT_TYPE {
                     index += size_of::<f64>() + 1;
-                } else if binary_type == ingress::ARRAY_BINARY_FORMAT_TYPE {
+                } else if binary_type == crate::ingress::ARRAY_BINARY_FORMAT_TYPE {
                     index += 1;
                     let element_type = match ArrayColumnTypeTag::try_from(accum[index]) {
                         Ok(t) => t,
@@ -610,24 +621,27 @@ impl MockServer {
         Ok(received_count)
     }
 
+    #[cfg(feature = "sync-sender-tcp")]
     pub fn recv_q(&mut self) -> io::Result<usize> {
         self.recv(0.1)
     }
 
+    #[cfg(feature = "sync-sender-tcp")]
     pub fn lsb_tcp(&self) -> SenderBuilder {
         SenderBuilder::new(Protocol::Tcp, self.host, self.port)
     }
 
+    #[cfg(feature = "sync-sender-tcp")]
     pub fn lsb_tcps(&self) -> SenderBuilder {
         SenderBuilder::new(Protocol::Tcps, self.host, self.port)
     }
 
-    #[cfg(feature = "ilp-over-http")]
+    #[cfg(feature = "sync-sender-http")]
     pub fn lsb_http(&self) -> SenderBuilder {
         SenderBuilder::new(Protocol::Http, self.host, self.port)
     }
 
-    #[cfg(feature = "ilp-over-http")]
+    #[cfg(feature = "sync-sender-http")]
     pub fn lsb_https(&self) -> SenderBuilder {
         SenderBuilder::new(Protocol::Https, self.host, self.port)
     }

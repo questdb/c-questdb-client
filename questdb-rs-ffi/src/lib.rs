@@ -61,6 +61,85 @@ macro_rules! bubble_err_to_c {
     };
 }
 
+#[macro_export]
+macro_rules! fmt_error {
+    ($code:ident, $($arg:tt)*) => {
+        questdb::Error::new(
+            questdb::ErrorCode::$code,
+            format!($($arg)*))
+    }
+}
+
+macro_rules! new_stride_array {
+    (
+        $rank:expr,
+        $m:literal,
+        $n:literal,
+        $shape:expr,
+        $strides:expr,
+        $data:expr,
+        $data_len:expr,
+        $err_out:expr,
+        $buffer:expr,
+        $name:expr
+    ) => {{
+        let view = match StrideArrayView::<f64, $m, $n>::new($shape, $strides, $data, $data_len) {
+            Ok(value) => value,
+            Err(err) => {
+                let err_ptr = Box::into_raw(Box::new(line_sender_error(err)));
+                *$err_out = err_ptr;
+                return false;
+            }
+        };
+        bubble_err_to_c!(
+            $err_out,
+            $buffer
+                .column_arr::<ColumnName<'_>, StrideArrayView<'_, f64, $m, $n>, f64>($name, &view)
+        );
+    }};
+}
+
+macro_rules! generate_array_dims_branches {
+    ($rank:expr, $m:literal, $shape:expr, $strides:expr, $data:expr, $data_len:expr, $err_out:expr, $buffer:expr, $name:expr => $($n:literal),*) => {
+        match $rank {
+            0 => {
+                let err = fmt_error!(
+                    ArrayError,
+                    "Zero-dimensional arrays are not supported",
+                );
+                let err_ptr = Box::into_raw(Box::new(line_sender_error(err)));
+                *$err_out = err_ptr;
+                return false;
+            }
+            $(
+                $n => new_stride_array!(
+                    $rank,
+                    $m,
+                    $n,
+                    $shape,
+                    $strides,
+                    $data,
+                    $data_len,
+                    $err_out,
+                    $buffer,
+                    $name
+                ),
+            )*
+            other => {
+                let err = fmt_error!(
+                    ArrayError,
+                    "Array dimension mismatch: expected at most {} dimensions, but got {}",
+                    32,
+                    other
+                );
+                let err_ptr = Box::into_raw(Box::new(line_sender_error(err)));
+                *$err_out = err_ptr;
+                return false;
+            }
+        }
+    };
+}
+
 /// Update the Rust builder inside the C opts object
 /// after calling a method that takes ownership of the builder.
 macro_rules! upd_opts {
@@ -140,14 +219,8 @@ pub enum line_sender_error_code {
     /// Bad configuration.
     line_sender_error_config_error,
 
-    /// Currently, only arrays with a maximum 32 dimensions are supported.
-    line_sender_error_array_large_dim,
-
-    /// ArrayView internal error, such as failure to get the size of a valid dimension.
-    line_sender_error_array_view_internal_error,
-
-    /// Write arrayView to sender buffer error.
-    line_sender_error_array_view_write_to_buffer_error,
+    /// There was an error serializing an array.
+    line_sender_error_array_error,
 
     /// Line sender protocol version error.
     line_sender_error_protocol_version_error,
@@ -175,15 +248,7 @@ impl From<ErrorCode> for line_sender_error_code {
                 line_sender_error_code::line_sender_error_server_flush_error
             }
             ErrorCode::ConfigError => line_sender_error_code::line_sender_error_config_error,
-            ErrorCode::ArrayHasTooManyDims => {
-                line_sender_error_code::line_sender_error_array_large_dim
-            }
-            ErrorCode::ArrayViewError => {
-                line_sender_error_code::line_sender_error_array_view_internal_error
-            }
-            ErrorCode::ArrayWriteToBufferError => {
-                line_sender_error_code::line_sender_error_array_view_write_to_buffer_error
-            }
+            ErrorCode::ArrayError => line_sender_error_code::line_sender_error_array_error,
             ErrorCode::ProtocolVersionError => {
                 line_sender_error_code::line_sender_error_protocol_version_error
             }
@@ -242,6 +307,7 @@ pub enum ProtocolVersion {
     /// Version 2 of InfluxDB Line Protocol.
     /// Uses binary format serialization for f64, and supports the array data type.
     /// This version is specific to QuestDB and is not compatible with InfluxDB.
+    /// QuestDB server version 9.0.0 or later is required for `V2` supported.
     V2 = 2,
 }
 
@@ -868,6 +934,47 @@ pub unsafe extern "C" fn line_sender_buffer_column_str(
     true
 }
 
+/// Records a float64 multidimensional array with **C-MAJOR memory layout**.
+///
+/// @param[in] buffer Line buffer object.
+/// @param[in] name Column name.
+/// @param[in] rank Array dims.
+/// @param[in] shape Array shape.
+/// @param[in] data Array **first element** data memory ptr.
+/// @param[in] data_len Array data length.
+/// @param[out] err_out Set on error.
+/// # Safety
+/// - All pointer parameters must be valid and non-null
+/// - shape must point to an array of `rank` integers
+/// - data must point to a buffer of size `data_len` f64 elements.
+/// - QuestDB server version 9.0.0 or later is required for array support.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_c_major(
+    buffer: *mut line_sender_buffer,
+    name: line_sender_column_name,
+    rank: size_t,
+    shape: *const usize,
+    data: *const f64,
+    data_len: size_t,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    let buffer = unwrap_buffer_mut(buffer);
+    let name = name.as_name();
+    let view = match CMajorArrayView::<f64>::new(rank, shape, data, data_len) {
+        Ok(value) => value,
+        Err(err) => {
+            let err_ptr = Box::into_raw(Box::new(line_sender_error(err)));
+            *err_out = err_ptr;
+            return false;
+        }
+    };
+    bubble_err_to_c!(
+        err_out,
+        buffer.column_arr::<ColumnName<'_>, CMajorArrayView<'_, f64>, f64>(name, &view)
+    );
+    true
+}
+
 /// Records a float64 multidimensional array with **byte-level strides specification**.
 ///
 /// The `strides` represent byte offsets between elements along each dimension.
@@ -877,13 +984,14 @@ pub unsafe extern "C" fn line_sender_buffer_column_str(
 /// @param[in] rank Array dims.
 /// @param[in] shape Array shape.
 /// @param[in] strides Array strides, represent byte offsets between elements along each dimension.
-/// @param[in] data_buffer Array **first element** data memory ptr.
-/// @param[in] data_buffer_len Array data memory length.
+/// @param[in] data Array **first element** data memory ptr.
+/// @param[in] data_len Array data element length.
 /// @param[out] err_out Set on error.
 /// # Safety
 /// - All pointer parameters must be valid and non-null
 /// - shape must point to an array of `rank` integers
-/// - data_buffer must point to a buffer of size `data_buffer_len` bytes
+/// - data must point to a buffer of size `data_len` f64 elements.
+/// - QuestDB server version 9.0.0 or later is required for array support.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_byte_strides(
     buffer: *mut line_sender_buffer,
@@ -891,24 +999,23 @@ pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_byte_strides(
     rank: size_t,
     shape: *const usize,
     strides: *const isize,
-    data_buffer: *const u8,
-    data_buffer_len: size_t,
+    data: *const f64,
+    data_len: size_t,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     let buffer = unwrap_buffer_mut(buffer);
     let name = name.as_name();
-    let view =
-        match StrideArrayView::<f64, 1>::new(rank, shape, strides, data_buffer, data_buffer_len) {
-            Ok(value) => value,
-            Err(err) => {
-                let err_ptr = Box::into_raw(Box::new(line_sender_error(err)));
-                *err_out = err_ptr;
-                return false;
-            }
-        };
-    bubble_err_to_c!(
+    generate_array_dims_branches!(
+        rank,
+        1,
+        shape,
+        strides,
+        data,
+        data_len,
         err_out,
-        buffer.column_arr::<ColumnName<'_>, StrideArrayView<'_, f64, 1>, f64>(name, &view)
+        buffer,
+        name
+        => 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32
     );
     true
 }
@@ -923,13 +1030,14 @@ pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_byte_strides(
 /// @param[in] rank Array dims.
 /// @param[in] shape Array shape.
 /// @param[in] strides Array strides, represent element counts between elements along each dimension.
-/// @param[in] data_buffer Array **first element** data memory ptr.
-/// @param[in] data_buffer_len Array data memory length.
+/// @param[in] data Array **first element** data memory ptr.
+/// @param[in] data_len Array data element length.
 /// @param[out] err_out Set on error.
 /// # Safety
 /// - All pointer parameters must be valid and non-null
 /// - shape must point to an array of `rank` integers
-/// - data_buffer must point to a buffer of size `data_buffer_len` bytes
+/// - data must point to a buffer of size `data_len` f64 elements.
+/// - QuestDB server version 9.0.0 or later is required for array support.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_elem_strides(
     buffer: *mut line_sender_buffer,
@@ -937,30 +1045,24 @@ pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_elem_strides(
     rank: size_t,
     shape: *const usize,
     strides: *const isize,
-    data_buffer: *const u8,
-    data_buffer_len: size_t,
+    data: *const f64,
+    data_len: size_t,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     let buffer = unwrap_buffer_mut(buffer);
     let name = name.as_name();
-    let view = match StrideArrayView::<f64, { std::mem::size_of::<f64>() as isize }>::new(
+    generate_array_dims_branches!(
         rank,
+        8,
         shape,
         strides,
-        data_buffer,
-        data_buffer_len,
-    ) {
-        Ok(value) => value,
-        Err(err) => {
-            let err_ptr = Box::into_raw(Box::new(line_sender_error(err)));
-            *err_out = err_ptr;
-            return false;
-        }
-    };
-    bubble_err_to_c!(
-            err_out,
-            buffer.column_arr::<ColumnName<'_>, StrideArrayView<'_, f64,  { std::mem::size_of::<f64>() as isize }>, f64>(name, &view)
-        );
+        data,
+        data_len,
+        err_out,
+        buffer,
+        name
+        => 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32
+    );
     true
 }
 
@@ -1241,7 +1343,14 @@ pub unsafe extern "C" fn line_sender_opts_token_y(
     upd_opts!(opts, err_out, token_y, token_y.as_str())
 }
 
-/// set the line protocol version.
+/// Sets the ingestion protocol version.
+/// - HTTP transport automatically negotiates the protocol version by default(unset, **Strong Recommended**).
+///   You can explicitly configure the protocol version to avoid the slight latency cost at connection time.
+/// - TCP transport does not negotiate the protocol version and uses [`ProtocolVersion::V1`] by
+///   default. You must explicitly set [`ProtocolVersion::V2`] in order to ingest
+///   arrays.
+///
+/// QuestDB server version 9.0.0 or later is required for [`ProtocolVersion::V2`] support
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_opts_protocol_version(
     opts: *mut line_sender_opts,
@@ -1491,10 +1600,11 @@ unsafe fn unwrap_sender_mut<'a>(sender: *mut line_sender) -> &'a mut Sender {
     &mut (*sender).0
 }
 
-/// Return the sender's protocol version.
-/// This is either the protocol version that was set explicitly,
-/// or the one that was auto-detected during the connection process.
-/// If connecting via TCP and not overridden, the value is V1.
+/// Returns the sender's protocol version
+///
+/// - Explicitly set version, or
+/// - Auto-detected during HTTP transport, or
+/// - [`ProtocolVersion::V1`] for TCP transport.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_get_protocol_version(
     sender: *const line_sender,
@@ -1507,8 +1617,7 @@ pub unsafe extern "C" fn line_sender_get_max_name_len(sender: *const line_sender
     unwrap_sender(sender).max_name_len()
 }
 
-/// Construct a `line_sender_buffer` with a `max_name_len` of `127` and sender's default protocol version
-/// which is the same as the QuestDB server default.
+/// Construct a [`line_sender_buffer`] using the sender's protocol settings.
 #[no_mangle]
 pub unsafe extern "C" fn line_sender_buffer_new_for_sender(
     sender: *const line_sender,
@@ -1640,6 +1749,7 @@ pub unsafe extern "C" fn line_sender_now_micros() -> i64 {
     TimestampMicros::now().as_i64()
 }
 
+use crate::ndarr::CMajorArrayView;
 #[cfg(feature = "confstr-ffi")]
 use questdb_confstr_ffi::questdb_conf_str_parse_err;
 

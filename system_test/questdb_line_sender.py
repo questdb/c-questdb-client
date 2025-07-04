@@ -136,6 +136,7 @@ c_line_sender_opts_p = ctypes.POINTER(c_line_sender_opts)
 c_line_sender_error_p = ctypes.POINTER(c_line_sender_error)
 c_line_sender_error_p_p = ctypes.POINTER(c_line_sender_error_p)
 c_uint8_p = ctypes.POINTER(c_uint8)
+c_double_p = ctypes.POINTER(c_double)
 
 
 class c_line_sender_utf8(ctypes.Structure):
@@ -297,7 +298,17 @@ def _setup_cdll():
         c_size_t,
         c_size_t_p,
         c_ssize_t_p,
-        c_uint8_p,
+        c_double_p,
+        c_size_t,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_f64_arr_c_major,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        c_size_t,
+        c_size_t_p,
+        c_double_p,
         c_size_t,
         c_line_sender_error_p_p)
     set_sig(
@@ -736,7 +747,32 @@ class Buffer:
             c_size_t(rank),
             c_shape,
             c_strides,
-            ctypes.cast(data, c_uint8_p),
+            ctypes.cast(data, c_double_p),
+            c_size_t(length)
+        )
+
+    def column_f64_arr_c_major(self, name: str,
+                               rank: int,
+                               shape: tuple[int, ...],
+                               data: c_void_p,
+                               length: int):
+        def _convert_tuple(tpl: tuple[int, ...], c_type: type, name: str) -> ctypes.POINTER:
+            arr_type = c_type * len(tpl)
+            try:
+                return arr_type(*[c_type(v) for v in tpl])
+            except OverflowError as e:
+                raise ValueError(
+                    f"{name} value exceeds {c_type.__name__} range"
+                ) from e
+
+        c_shape = _convert_tuple(shape, c_size_t, "shape")
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_column_f64_arr_c_major,
+            self._impl,
+            _column_name(name),
+            c_size_t(rank),
+            c_shape,
+            ctypes.cast(data, c_double_p),
             c_size_t(length)
         )
 
@@ -875,7 +911,10 @@ class Sender:
             array: numpy.ndarray):
         if array.dtype != numpy.float64:
             raise ValueError('expect float64 array')
-        self._buffer.column_f64_arr(name, array.ndim, array.shape, array.strides, array.ctypes.data, array.nbytes)
+        if array.flags.c_contiguous:
+            self._buffer.column_f64_arr_c_major(name, array.ndim, array.shape, array.ctypes.data, array.size)
+        else:
+            self._buffer.column_f64_arr(name, array.ndim, array.shape, array.strides, array.ctypes.data, array.size)
         return self
 
     def at_now(self):

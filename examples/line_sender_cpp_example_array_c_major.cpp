@@ -16,12 +16,11 @@ static bool array_example(std::string_view host, std::string_view port)
             "tcp::addr=" + std::string{host} + ":" + std::string{port} +
             ";protocol_version=2;");
 
-        const auto table_name = "cpp_market_orders_elem_strides"_tn;
+        const auto table_name = "cpp_market_orders_c_major"_tn;
         const auto symbol_col = "symbol"_cn;
         const auto book_col = "order_book"_cn;
         size_t rank = 3;
         std::vector<uintptr_t> shape{2, 3, 2};
-        std::vector<intptr_t> strides{6, 2, 1};
         std::array<double, 12> arr_data = {
             48123.5,
             2.4,
@@ -35,15 +34,9 @@ static bool array_example(std::string_view host, std::string_view port)
             2.7,
             48121.5,
             4.3};
-        questdb::ingress::array::strided_view<
-            double,
-            questdb::ingress::array::strides_mode::elements>
-            book_data{
-                3,
-                shape.data(),
-                strides.data(),
-                arr_data.data(),
-                arr_data.size()};
+
+        questdb::ingress::array::row_major_view<double> book_data{
+            rank, shape.data(), arr_data.data(), arr_data.size()};
 
         questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
         buffer.table(table_name)

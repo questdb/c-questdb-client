@@ -4,12 +4,16 @@
 #include <string.h>
 #include "concat.h"
 
+/*
+ * QuestDB server version 9.0.0 or later is required for array support.
+ */
 static bool example(const char* host, const char* port)
 {
     line_sender_error* err = NULL;
     line_sender* sender = NULL;
     line_sender_buffer* buffer = NULL;
-    char* conf_str = concat("tcp::addr=", host, ":", port, ";protocol_version=2;");
+    char* conf_str =
+        concat("tcp::addr=", host, ":", port, ";protocol_version=2;");
     if (!conf_str)
     {
         fprintf(stderr, "Could not concatenate configuration string.\n");
@@ -31,7 +35,8 @@ static bool example(const char* host, const char* port)
     buffer = line_sender_buffer_new_for_sender(sender);
     line_sender_buffer_reserve(buffer, 64 * 1024);
 
-    line_sender_table_name table_name = QDB_TABLE_NAME_LITERAL("market_orders_elem_strides");
+    line_sender_table_name table_name =
+        QDB_TABLE_NAME_LITERAL("market_orders_elem_strides");
     line_sender_column_name symbol_col = QDB_COLUMN_NAME_LITERAL("symbol");
     line_sender_column_name book_col = QDB_COLUMN_NAME_LITERAL("order_book");
 
@@ -66,8 +71,8 @@ static bool example(const char* host, const char* port)
             array_rank,
             array_shape,
             array_strides,
-            (const uint8_t*)array_data,
-            sizeof(array_data),
+            array_data,
+            sizeof(array_data) / sizeof(array_data[0]),
             &err))
         goto on_error;
 

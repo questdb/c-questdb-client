@@ -105,7 +105,11 @@ enum class protocol_version
     /** InfluxDB Line Protocol v1. */
     v1 = 1,
 
-    /** InfluxDB Line Protocol v2. */
+    /**
+     * InfluxDB Line Protocol v2.
+     * QuestDB server version 9.0.0 or later is required for
+     * `v2` support.
+     */
     v2 = 2,
 };
 
@@ -346,42 +350,57 @@ private:
 class buffer_view final
 {
 public:
-    /// @brief Default constructor. Creates an empty buffer view.
+    /**
+     * Default constructor. Creates an empty buffer view.
+     */
     buffer_view() noexcept = default;
 
-    /// @brief Constructs a buffer view from raw byte data.
-    /// @param data Pointer to the underlying byte array (may be nullptr if
-    /// length=0).
-    /// @param length Number of bytes in the array.
+    /**
+     * Construct a buffer view from raw byte data.
+     * @param data Pointer to the underlying byte array (may be nullptr if
+     * length=0).
+     * @param length Number of bytes in the array.
+     */
     constexpr buffer_view(const std::byte* data, size_t length) noexcept
         : buf(data)
         , len(length)
     {
     }
 
-    /// @brief Gets a pointer to the underlying byte array.
-    /// @return Const pointer to the data (may be nullptr if empty()).
+    /**
+     * Obtain a pointer to the underlying byte array.
+     *
+     * @return Const pointer to the data (may be nullptr if empty()).
+     */
     constexpr const std::byte* data() const noexcept
     {
         return buf;
     }
 
-    /// @brief Gets the number of bytes in the view.
-    /// @return Size in bytes.
+    /**
+     * Obtain the number of bytes in the view.
+     *
+     * @return Size of the view in bytes.
+     */
     constexpr size_t size() const noexcept
     {
         return len;
     }
 
-    /// @brief Checks if the view contains no bytes.
-    /// @return true if size() == 0.
+    /**
+     * Check if the buffer view is empty.
+     * @return true if the view has no bytes (size() == 0).
+     */
     constexpr bool empty() const noexcept
     {
         return len == 0;
     }
 
-    /// @brief Checks byte-wise equality between two buffer views.
-    /// @return true if both views have identical size and byte content.
+    /**
+     * Check byte-wise if two buffer views are equal.
+     * @return true if both views have the same size and
+     *         the same byte content.
+     */
     friend bool operator==(
         const buffer_view& lhs, const buffer_view& rhs) noexcept
     {
@@ -394,6 +413,220 @@ private:
     size_t len{0};
 };
 #endif
+
+namespace array
+{
+enum class strides_mode
+{
+    /** Strides are provided in bytes */
+    bytes,
+
+    /** Strides are provided in elements */
+    elements,
+};
+
+/**
+ * A view over a multi-dimensional array with custom strides.
+ *
+ * The strides can be expressed as bytes offsets or as element counts.
+ * The `rank` is the number of dimensions in the array, and the `shape`
+ * describes the size of each dimension.
+ *
+ * If the data is stored in a row-major order, it may be more convenient and
+ * efficient to use the `row_major_view` instead of `strided_view`.
+ *
+ * The `data` pointer must point to a contiguous block of memory that contains
+ * the array data.
+ */
+template <typename T, strides_mode M>
+class strided_view
+{
+public:
+    using element_type = T;
+    static constexpr strides_mode stride_size_mode = M;
+
+    strided_view(
+        size_t rank,
+        const uintptr_t* shape,
+        const intptr_t* strides,
+        const T* data,
+        size_t data_size)
+        : _rank{rank}
+        , _shape{shape}
+        , _strides{strides}
+        , _data{data}
+        , _data_size{data_size}
+    {
+    }
+
+    size_t rank() const
+    {
+        return _rank;
+    }
+
+    const uintptr_t* shape() const
+    {
+        return _shape;
+    }
+
+    const intptr_t* strides() const
+    {
+        return _strides;
+    }
+
+    const T* data() const
+    {
+        return _data;
+    }
+
+    size_t data_size() const
+    {
+        return _data_size;
+    }
+
+    const strided_view<T, M>& view() const
+    {
+        return *this;
+    }
+
+private:
+    size_t _rank;
+    const uintptr_t* _shape;
+    const intptr_t* _strides;
+    const T* _data;
+    size_t _data_size;
+};
+
+/**
+ * A view over a multi-dimensional array in row-major order.
+ *
+ * The `rank` is the number of dimensions in the array, and the `shape`
+ * describes the size of each dimension.
+ *
+ * The `data` pointer must point to a contiguous block of memory that contains
+ * the array data.
+ *
+ * If the source array is not stored in a row-major order, you may express
+ * the strides explicitly using the `strided_view` class.
+ *
+ * This class provides a simpler and more efficient interface for row-major
+ * arrays.
+ */
+template <typename T>
+class row_major_view
+{
+public:
+    using element_type = T;
+
+    row_major_view(
+        size_t rank, const uintptr_t* shape, const T* data, size_t data_size)
+        : _rank{rank}
+        , _shape{shape}
+        , _data{data}
+        , _data_size{data_size}
+    {
+    }
+
+    size_t rank() const
+    {
+        return _rank;
+    }
+    const uintptr_t* shape() const
+    {
+        return _shape;
+    }
+    const T* data() const
+    {
+        return _data;
+    }
+
+    size_t data_size() const
+    {
+        return _data_size;
+    }
+
+    const row_major_view<T>& view() const
+    {
+        return *this;
+    }
+
+private:
+    size_t _rank;
+    const uintptr_t* _shape;
+    const T* _data;
+    size_t _data_size;
+};
+
+template <typename T>
+struct row_major_1d_holder
+{
+    uintptr_t shape[1];
+    const T* data;
+    size_t size;
+
+    row_major_1d_holder(const T* d, size_t s)
+        : data(d)
+        , size(s)
+    {
+        shape[0] = static_cast<uintptr_t>(s);
+    }
+
+    array::row_major_view<T> view() const
+    {
+        return {1, shape, data, size};
+    }
+};
+
+template <typename T>
+inline auto to_array_view_state_impl(const std::vector<T>& vec)
+{
+    return row_major_1d_holder<typename std::remove_cv<T>::type>(
+        vec.data(), vec.size());
+}
+
+#if __cplusplus >= 202002L
+template <typename T>
+inline auto to_array_view_state_impl(const std::span<T>& span)
+{
+    return row_major_1d_holder<typename std::remove_cv<T>::type>(
+        span.data(), span.size());
+}
+#endif
+
+template <typename T, size_t N>
+inline auto to_array_view_state_impl(const std::array<T, N>& arr)
+{
+    return row_major_1d_holder<typename std::remove_cv<T>::type>(arr.data(), N);
+}
+
+/**
+ * Customization point to enable serialization of additonal types as arrays.
+ *
+ * Forwards to a namespace or ADL (König) lookup function.
+ * The customized `to_array_view_state_impl` for your custom type can be placed
+ * in either:
+ *  * The namespace of the type in question.
+ *  * In the `questdb::ingress::array` namespace.
+///
+ * The function can either return a view object directly (either
+ * `row_major_view` or `strided_view`), or, if you need to place some fields on
+ * the stack, an object with a `.view()` method which returns a `const&` to one
+ * "materialize" shape or strides information into contiguous memory.
+ * of the two view types. Returning an object may be useful if you need to
+ */
+struct to_array_view_state_fn
+{
+    template <typename T>
+    auto operator()(const T& array) const
+    {
+        // Implement your own `to_array_view_state_impl` as needed.
+        return to_array_view_state_impl(array);
+    }
+};
+
+inline constexpr to_array_view_state_fn to_array_view_state{};
+
+} // namespace array
 
 class line_sender_buffer
 {
@@ -597,8 +830,24 @@ public:
     }
 
     // Require specific overloads of `column` to avoid
-    // involuntary usage of the `bool` overload.
-    template <typename T>
+    // involuntary usage of the `bool` overload or similar.
+    template <
+        typename T,
+        typename std::enable_if_t<
+            // Integral types that are NOT bool or int64_t
+            (std::is_integral_v<std::decay_t<T>> &&
+             !std::is_same_v<std::decay_t<T>, bool> &&
+             !std::is_same_v<std::decay_t<T>, int64_t>) ||
+
+                // Floating-point types that are NOT double
+                (std::is_floating_point_v<std::decay_t<T>> &&
+                 !std::is_same_v<std::decay_t<T>, double>) ||
+
+                // Pointer types (which can implicitly convert to bool)
+                std::is_pointer_v<std::decay_t<T>>
+
+            ,
+            int> = 0>
     line_sender_buffer& column(column_name_view name, T value) = delete;
 
     /**
@@ -641,43 +890,111 @@ public:
     }
 
     /**
-     * Record a multidimensional array for the given column.
+     * Record a multidimensional array of `double` values.
      *
-     * @tparam B    Selects the unit used for the strides:
-     *              - `true`: the unit is bytes
-     *              - `false` the unit is elements
-     * @tparam T    Element type (currently only `double` is supported).
+     * QuestDB server version 9.0.0 or later is required for array support.
+     *
+     * @tparam T    Element type (current only `double` is supported).
+     * @tparam M    Array stride size mode (bytes or elements).
+     *
+     * @param name    Column name.
+     * @param data    Multi-dimensional array.
+     */
+    template <typename T, array::strides_mode M>
+    line_sender_buffer& column(
+        column_name_view name, const array::strided_view<T, M>& array)
+    {
+        static_assert(
+            std::is_same_v<T, double>,
+            "Only double types are supported for arrays");
+        may_init();
+        switch (M)
+        {
+        case array::strides_mode::bytes:
+            line_sender_error::wrapped_call(
+                ::line_sender_buffer_column_f64_arr_byte_strides,
+                _impl,
+                name._impl,
+                array.rank(),
+                array.shape(),
+                array.strides(),
+                array.data(),
+                array.data_size());
+            break;
+        case array::strides_mode::elements:
+            line_sender_error::wrapped_call(
+                ::line_sender_buffer_column_f64_arr_elem_strides,
+                _impl,
+                name._impl,
+                array.rank(),
+                array.shape(),
+                array.strides(),
+                array.data(),
+                array.data_size());
+            break;
+        }
+        return *this;
+    }
+
+    /**
+     * Records a multidimensional array of double-precision values with c_major
+     * layout.
+     *
+     * QuestDB server version 9.0.0 or later is required for array support.
+     *
+     * @tparam T    Element type (current only `double` is supported).
      * @tparam N    Number of elements in the flat data array
      *
      * @param name    Column name.
-     * @param shape   Array dimensions (e.g., [2,3] for a 2x3 matrix).
-     * @param strides Strides for each dimension, in the unit specified by `B`.
-     * @param data    Array elements laid out in row-major order. Their number
-     * must match the product of dimension sizes.
+     * @param array   Multi-dimensional array.
      */
-    template <bool B, typename T, size_t N>
+    template <typename T>
     line_sender_buffer& column(
-        column_name_view name,
-        const size_t rank,
-        const std::vector<uintptr_t>& shape,
-        const std::vector<intptr_t>& strides,
-        const std::array<T, N>& data)
+        column_name_view name, const array::row_major_view<T>& array)
     {
         static_assert(
             std::is_same_v<T, double>,
             "Only double types are supported for arrays");
         may_init();
         line_sender_error::wrapped_call(
-            B ? ::line_sender_buffer_column_f64_arr_byte_strides
-              : ::line_sender_buffer_column_f64_arr_elem_strides,
+            ::line_sender_buffer_column_f64_arr_c_major,
             _impl,
             name._impl,
-            rank,
-            shape.data(),
-            strides.data(),
-            reinterpret_cast<const uint8_t*>(data.data()),
-            sizeof(double) * N);
+            array.rank(),
+            array.shape(),
+            array.data(),
+            array.data_size());
         return *this;
+    }
+
+    /**
+     * Record a multidimensional array of double-precision values.
+     *
+     * QuestDB server version 9.0.0 or later is required for array support.
+     *
+     * Use this method to record arrays of common or custom types such as
+     * `std::vector`, `std::span`, `std::array`, or custom types that can be
+     * converted to an array view.
+     *
+     * This overload uses a customization point to support additional types:
+     * If you need to support your additional types you may implement a
+     * `to_array_view_state_impl` function in the object's namespace (via ADL)
+     * or in the `questdb::ingress::array` namespace.
+     * Ensure that any additional customization points are included before
+     * `line_sender.hpp`.
+     *
+     * @tparam ToArrayViewT  Type convertible to a custom object instance which
+     *                       can be converted to an array view.
+     * @param name           Column name.
+     * @param array          Multi-dimensional array.
+     */
+    template <typename ToArrayViewT>
+    line_sender_buffer& column(column_name_view name, ToArrayViewT array)
+    {
+        may_init();
+        const auto array_view_state =
+            questdb::ingress::array::to_array_view_state(array);
+        return column(name, array_view_state.view());
     }
 
     /**
@@ -858,7 +1175,7 @@ private:
     static inline ::line_sender_utf8 name()
     {
         // Maintained by .bumpversion.cfg
-        static const char user_agent[] = "questdb/c++/5.0.0-rc1";
+        static const char user_agent[] = "questdb/c++/5.0.0";
         ::line_sender_utf8 utf8 =
             ::line_sender_utf8_assert(sizeof(user_agent) - 1, user_agent);
         return utf8;
@@ -1156,6 +1473,20 @@ public:
         return *this;
     }
 
+    /**
+     * Sets the ingestion protocol version.
+     *
+     * HTTP transport automatically negotiates the protocol version by
+     * default(unset, strong recommended). You can explicitlyconfigure the
+     * protocol version to avoid the slight latency cost at connection time.
+     *
+     * TCP transport does not negotiate the protocol version and uses
+     * `protocol_version::v1` by default. You must explicitly set
+     * `protocol_version::v2` in order to ingest arrays.
+     *
+     * QuestDB server version 9.0.0 or later is required for
+     * `protocol_version::v2` support.
+     */
     opts& protocol_version(protocol_version version) noexcept
     {
         const auto c_protocol_version =
@@ -1272,6 +1603,9 @@ public:
         return *this;
     }
 
+    /**
+     * Get the current protocol version used by the sender.
+     */
     questdb::ingress::protocol_version protocol_version() const noexcept
     {
         ensure_impl();
@@ -1348,11 +1682,57 @@ public:
     }
 
     /**
+     * Send the batch of rows in the buffer to the QuestDB server, and, if the
+     * parameter `transactional` is true, ensure the flush will be
+     * transactional.
+     *
+     * A flush is transactional iff all the rows belong to the same table. This
+     * allows QuestDB to treat the flush as a single database transaction,
+     * because it doesn't support transactions spanning multiple tables.
+     * Additionally, only ILP-over-HTTP supports transactional flushes.
+     *
+     * If the flush wouldn't be transactional, this function returns an error
+     * and doesn't flush any data.
+     *
+     * The function sends an HTTP request and waits for the response. If the
+     * server responds with an error, it returns a descriptive error. In the
+     * case of a network error, it retries until it has exhausted the retry time
+     * budget.
+     *
+     * All the data stays in the buffer. Clear the buffer before starting a new
+     * batch.
+     */
+    void flush_and_keep_with_flags(
+        const line_sender_buffer& buffer, bool transactional)
+    {
+        if (buffer._impl)
+        {
+            ensure_impl();
+            line_sender_error::wrapped_call(
+                ::line_sender_flush_and_keep_with_flags,
+                _impl,
+                buffer._impl,
+                transactional);
+        }
+        else
+        {
+            line_sender_buffer buffer2{this->protocol_version(), 0};
+            buffer2.may_init();
+            line_sender_error::wrapped_call(
+                ::line_sender_flush_and_keep_with_flags,
+                _impl,
+                buffer2._impl,
+                transactional);
+        }
+    }
+
+    /**
      * Check if an error occurred previously and the sender must be closed.
      * This happens when there was an earlier failure.
      * This method is specific to ILP-over-TCP and is not relevant for
      * ILP-over-HTTP.
-     * @return true if an error occurred with a sender and it must be closed.
+     * @return true if an error occurred with a sender and it must be
+     * closed.
      */
     bool must_close() const noexcept
     {
