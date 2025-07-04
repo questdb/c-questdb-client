@@ -40,6 +40,8 @@ import questdb_line_sender as qls
 import uuid
 from fixture import (
     Project,
+    QuestDbFixtureBase,
+    QuestDbExternalFixture,
     QuestDbFixture,
     TlsProxyFixture,
     install_questdb,
@@ -49,7 +51,7 @@ from fixture import (
 import subprocess
 from collections import namedtuple
 
-QDB_FIXTURE: QuestDbFixture = None
+QDB_FIXTURE: QuestDbFixtureBase = None
 TLS_PROXY_FIXTURE: TlsProxyFixture = None
 BUILD_MODE = None
 
@@ -136,6 +138,14 @@ class TestSender(unittest.TestCase):
                  .symbol('s1', 'v1')
                  .at_now())
                 sender.flush()
+
+    def setUp(self):
+        test_name = self.id()
+        QDB_FIXTURE.http_sql_query(f'select * from long_sequence(1) -- >>>>>>>>> BEGIN PYTHON UNIT TEST: {test_name}')
+
+    def tearDown(self):
+        test_name = self.id()
+        QDB_FIXTURE.http_sql_query(f'select * from long_sequence(1) -- <<<<<<<<< END PYTHON UNIT TEST: {test_name}')
 
     def test_default_max_name_len(self):
         with self._mk_linesender() as sender:
@@ -233,15 +243,19 @@ class TestSender(unittest.TestCase):
              .table(table_name)
              .symbol('a', 'A')
              .at_now())
+            (sender
+             .table(table_name)
+             .symbol('a', 'B')
+             .at_now())
             pending = sender.buffer.peek()
 
-        resp = retry_check_table(table_name, log_ctx=pending)
+        resp = retry_check_table(table_name, log_ctx=pending, min_rows=2)
         exp_columns = [
             {'name': 'a', 'type': 'SYMBOL'},
             {'name': 'timestamp', 'type': 'TIMESTAMP'}]
         self.assertEqual(resp['columns'], exp_columns)
 
-        exp_dataset = [['A']]  # Comparison excludes timestamp column.
+        exp_dataset = [['A'], ['B']]  # Comparison excludes timestamp column.
         scrubbed_dataset = [row[:-1] for row in resp['dataset']]
         self.assertEqual(scrubbed_dataset, exp_dataset)
 
@@ -1119,24 +1133,16 @@ def list_releases(args):
 
 def run_with_existing(args):
     global QDB_FIXTURE
-    MockFixture = namedtuple(
-        'MockFixture',
-        (
-            'host',
-            'line_tcp_port',
-            'http_server_port',
-            'version',
-            'http',
-            'auth',
-            'protocol_version'))
     host, line_tcp_port, http_server_port = args.existing.split(':')
-    QDB_FIXTURE = MockFixture(
+    QDB_FIXTURE = QuestDbExternalFixture(
         host,
         int(line_tcp_port),
         int(http_server_port),
         (999, 999, 999),
         True,
-        False)
+        False,
+        qls.ProtocolVersion.V2
+    )
     unittest.main()
 
 
@@ -1186,7 +1192,7 @@ def run_with_fixtures(args):
             auth=auth)
         TLS_PROXY_FIXTURE = None
         try:
-            print(f'>>>> STARTING {questdb_dir} [auth={auth}] <<<<')
+            sys.stderr.write(f'>>>> STARTING {questdb_dir} [auth={auth}] <<<<\n')
             QDB_FIXTURE.start()
             for http, protocol_version, build_mode in itertools.product(
                     (False, True),  # http
@@ -1198,8 +1204,8 @@ def run_with_fixtures(args):
                     continue
                 if auth and (protocol_version != latest_protocol):
                     continue
-                print(
-                    f'Running tests [auth={auth}, http={http}, build_mode={build_mode}, protocol_version={protocol_version}]')
+                sys.stderr.write(
+                    f'>>>> Running tests [auth={auth}, http={http}, build_mode={build_mode}, protocol_version={protocol_version}]\n')
                 # Read the version _after_ a first start so it can rely
                 # on the live one from the `select build` query.
                 BUILD_MODE = build_mode

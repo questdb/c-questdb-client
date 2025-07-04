@@ -20,15 +20,17 @@ sys.dont_write_bytecode = True
 import pathlib
 import platform
 import subprocess
+import shlex
 
 
 def run_cmd(*args, cwd=None):
-    sys.stderr.write(f'About to run: {args!r}:\n')
+    args_str =  shlex.join(args)
+    sys.stderr.write(f'About to run: {args_str}:\n')
     try:
         subprocess.check_call(args, cwd=cwd)
-        sys.stderr.write(f'Success running: {args!r}.\n')
+        sys.stderr.write(f'Success running: {args_str}.\n')
     except subprocess.CalledProcessError as cpe:
-        sys.stderr.write(f'Command {args!r} failed with return code {cpe.returncode}.\n')
+        sys.stderr.write(f'Command `{args_str}` failed with return code {cpe.returncode}.\n')
         sys.exit(cpe.returncode)
 
 def main():
@@ -45,9 +47,18 @@ def main():
 
     run_cmd('cargo', 'test',
             '--', '--nocapture', cwd='questdb-rs')
-    run_cmd('cargo', 'test', '--no-default-features', '--features=aws-lc-crypto,tls-native-certs',
+    run_cmd('cargo', 'test',
+            '--no-default-features',
+            '--features=aws-lc-crypto,tls-native-certs,sync-sender',
             '--', '--nocapture', cwd='questdb-rs')
-    run_cmd('cargo', 'test', '--no-default-features', '--features=ring-crypto,tls-native-certs,ilp-over-http',
+    run_cmd('cargo', 'test', '--no-default-features',
+            '--features=ring-crypto,tls-native-certs,sync-sender',
+            '--', '--nocapture', cwd='questdb-rs')
+    run_cmd('cargo', 'test', '--no-default-features',
+            '--features=ring-crypto,tls-webpki-certs,sync-sender-tcp',
+            '--', '--nocapture', cwd='questdb-rs')
+    run_cmd('cargo', 'test', '--no-default-features',
+            '--features=ring-crypto,tls-webpki-certs,sync-sender-http',
             '--', '--nocapture', cwd='questdb-rs')
     run_cmd('cargo', 'test', '--features=almost-all-features',
             '--', '--nocapture', cwd='questdb-rs')

@@ -68,14 +68,13 @@ async fn handle_conn(
     acceptor: &TlsAcceptor,
     dest_addr: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("Waiting for a connection.");
     let (inbound_conn, _) = listener.accept().await?;
-    eprintln!("Accepted a client connection.");
+    inbound_conn.set_nodelay(true)?;
+    let outbound_conn = TcpStream::connect(dest_addr);
     let acceptor = acceptor.clone();
     let inbound_conn = acceptor.accept(inbound_conn).await?;
-    eprintln!("Completed TLS handshake with client connection.");
-    let outbound_conn = TcpStream::connect(dest_addr).await?;
-    eprintln!("Established outbound connection to {}.", dest_addr);
+    let outbound_conn = outbound_conn.await?;
+    outbound_conn.set_nodelay(true)?;
 
     let (mut in_read, mut in_write) = tio::split(inbound_conn);
     let (mut out_read, mut out_write) = outbound_conn.into_split();
@@ -84,8 +83,8 @@ async fn handle_conn(
     let out_to_in = tokio::spawn(async move { tio::copy(&mut out_read, &mut in_write).await });
 
     select! {
-        _ = in_to_out => eprintln!("in_to_out shut down."),
-        _ = out_to_in => eprintln!("out_to_in shut down."),
+        _ = in_to_out => eprintln!("[TLS PROXY] in_to_out shut down."),
+        _ = out_to_in => eprintln!("[TLS PROXY] out_to_in shut down."),
     }
 
     Ok(())
@@ -95,20 +94,20 @@ async fn loop_server(
     dest_port: u16,
     listen_port_sender: tokio::sync::oneshot::Sender<u16>,
 ) -> anyhow::Result<()> {
-    let dest_addr = format!("localhost:{}", dest_port);
-    eprintln!("Destination address is {}.", &dest_addr);
+    let dest_addr = format!("localhost:{dest_port}");
+    eprintln!("[TLS PROXY] Destination address is {}.", &dest_addr);
 
     let config = tls_config();
     let acceptor = TlsAcceptor::from(config);
 
     let listener = TcpListener::bind("0.0.0.0:0").await?;
     let listen_port = listener.local_addr()?.port();
-    eprintln!("TLS Proxy is listening on localhost:{}.", listen_port);
+    eprintln!("[TLS PROXY] TLS Proxy is listening on localhost:{listen_port}.");
     listen_port_sender.send(listen_port).unwrap();
 
     loop {
         if let Err(err) = handle_conn(&listener, &acceptor, &dest_addr).await {
-            eprintln!("Error handling connection: {}", err);
+            eprintln!("[TLS PROXY] Error handling connection: {err}");
         }
     }
 }

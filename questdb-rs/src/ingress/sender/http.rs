@@ -22,11 +22,8 @@
  *
  ******************************************************************************/
 
-use super::conf::ConfigSetting;
 use crate::error::fmt;
 use crate::{error, Error};
-use base64ct::Base64;
-use base64ct::Encoding;
 use rand::Rng;
 use rustls::{ClientConnection, StreamOwned};
 use rustls_pki_types::ServerName;
@@ -41,75 +38,28 @@ use ureq::unversioned::transport::{
     Buffers, Connector, LazyBuffers, NextTimeout, Transport, TransportAdapter,
 };
 
+use crate::ingress::conf::HttpConfig;
 use crate::ingress::ProtocolVersion;
 use ureq::unversioned::*;
 use ureq::{http, Body};
 
-#[derive(PartialEq, Debug, Clone)]
-pub(super) struct BasicAuthParams {
-    pub(super) username: String,
-    pub(super) password: String,
-}
-
-impl BasicAuthParams {
-    pub(super) fn to_header_string(&self) -> String {
-        let pair = format!("{}:{}", self.username, self.password);
-        let encoded = Base64::encode_string(pair.as_bytes());
-        format!("Basic {encoded}")
-    }
-}
-
-#[derive(PartialEq, Debug, Clone)]
-pub(super) struct TokenAuthParams {
-    pub(super) token: String,
-}
-
-impl TokenAuthParams {
-    pub(super) fn to_header_string(&self) -> crate::Result<String> {
-        if self.token.contains('\n') {
-            return Err(error::fmt!(
-                AuthError,
-                "Bad auth token: Should not contain new-line char."
-            ));
-        }
-        Ok(format!("Bearer {}", self.token))
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct HttpConfig {
-    pub(super) request_min_throughput: ConfigSetting<u64>,
-    pub(super) user_agent: String,
-    pub(super) retry_timeout: ConfigSetting<Duration>,
-    pub(super) request_timeout: ConfigSetting<Duration>,
-}
-
-impl Default for HttpConfig {
-    fn default() -> Self {
-        Self {
-            request_min_throughput: ConfigSetting::new_default(102400), // 100 KiB/s
-            user_agent: concat!("questdb/rust/", env!("CARGO_PKG_VERSION")).to_string(),
-            retry_timeout: ConfigSetting::new_default(Duration::from_secs(10)),
-            request_timeout: ConfigSetting::new_default(Duration::from_secs(10)),
-        }
-    }
-}
-
-pub(super) struct HttpHandlerState {
+#[cfg(feature = "sync-sender-http")]
+pub(crate) struct SyncHttpHandlerState {
     /// Maintains a pool of open HTTP connections to the endpoint.
-    pub(super) agent: ureq::Agent,
+    pub(crate) agent: ureq::Agent,
 
     /// The URL of the HTTP endpoint.
-    pub(super) url: String,
+    pub(crate) url: String,
 
     /// The content of the `Authorization` HTTP header.
-    pub(super) auth: Option<String>,
+    pub(crate) auth: Option<String>,
 
     /// HTTP params configured via the `SenderBuilder`.
-    pub(super) config: HttpConfig,
+    pub(crate) config: HttpConfig,
 }
 
-impl HttpHandlerState {
+#[cfg(feature = "sync-sender-http")]
+impl SyncHttpHandlerState {
     fn send_request(
         &self,
         buf: &[u8],
@@ -155,7 +105,7 @@ impl HttpHandlerState {
 }
 
 #[derive(Debug)]
-pub struct TlsConnector {
+pub(crate) struct TlsConnector {
     tls_config: Option<Arc<rustls::ClientConfig>>,
 }
 
@@ -166,7 +116,7 @@ impl<In: Transport> Connector<In> for TlsConnector {
         &self,
         details: &transport::ConnectionDetails,
         chained: Option<In>,
-    ) -> std::result::Result<Option<Self::Out>, ureq::Error> {
+    ) -> Result<Option<Self::Out>, ureq::Error> {
         let transport = match chained {
             Some(t) => t,
             None => return Ok(None),
@@ -384,7 +334,7 @@ pub(super) fn parse_http_error(http_status_code: u16, response: Response<Body>) 
 
 #[allow(clippy::result_large_err)] // `ureq::Error` is large enough to cause this warning.
 fn retry_http_send(
-    state: &HttpHandlerState,
+    state: &SyncHttpHandlerState,
     buf: &[u8],
     request_timeout: Duration,
     retry_timeout: Duration,
@@ -417,7 +367,7 @@ fn retry_http_send(
 
 #[allow(clippy::result_large_err)] // `ureq::Error` is large enough to cause this warning.
 pub(super) fn http_send_with_retries(
-    state: &HttpHandlerState,
+    state: &SyncHttpHandlerState,
     buf: &[u8],
     request_timeout: Duration,
     retry_timeout: Duration,
@@ -437,8 +387,8 @@ pub(super) fn http_send_with_retries(
 ///
 /// If the server does not support the `/settings` endpoint (404), it returns
 /// default values.
-pub(super) fn read_server_settings(
-    state: &HttpHandlerState,
+pub(crate) fn read_server_settings(
+    state: &SyncHttpHandlerState,
     settings_url: &str,
     default_max_name_len: usize,
 ) -> Result<(Vec<ProtocolVersion>, usize), Error> {
@@ -540,7 +490,7 @@ pub(super) fn read_server_settings(
 
 #[allow(clippy::result_large_err)] // `ureq::Error` is large enough to cause this warning.
 fn retry_http_get(
-    state: &HttpHandlerState,
+    state: &SyncHttpHandlerState,
     url: &str,
     request_timeout: Duration,
     retry_timeout: Duration,
@@ -573,7 +523,7 @@ fn retry_http_get(
 
 #[allow(clippy::result_large_err)] // `ureq::Error` is large enough to cause this warning.
 fn http_get_with_retries(
-    state: &HttpHandlerState,
+    state: &SyncHttpHandlerState,
     url: &str,
     request_timeout: Duration,
     retry_timeout: Duration,

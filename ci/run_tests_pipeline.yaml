@@ -62,7 +62,7 @@ stages:
             displayName: "Compile QuestDB"
             inputs:
               mavenPOMFile: "questdb/pom.xml"
-              jdkVersionOption: "1.11"
+              jdkVersionOption: "1.17"
               options: "-DskipTests -Pbuild-web-console"
           ############################# temp for test end ##################### 
           - script: python3 ci/run_all_tests.py
@@ -132,7 +132,7 @@ stages:
             displayName: "Compile QuestDB"
             inputs:
               mavenPOMFile: 'questdb/pom.xml'
-              jdkVersionOption: '1.11'
+              jdkVersionOption: '1.17'
               options: "-DskipTests -Pbuild-web-console"
           - script: |
               python3 system_test/test.py run --repo ./questdb -v
