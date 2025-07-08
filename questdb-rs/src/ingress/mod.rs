@@ -59,8 +59,17 @@ mod timestamp;
 mod buffer;
 pub use buffer::*;
 
-mod sender;
-pub use sender::*;
+#[cfg(feature = "_sync-sender")]
+mod sync_sender;
+
+#[cfg(feature = "_sync-sender")]
+pub use sync_sender::*;
+
+#[cfg(feature = "_async-sender")]
+mod async_sender;
+
+#[cfg(feature = "_async-sender")]
+pub use async_sender::*;
 
 const MAX_NAME_LEN_DEFAULT: usize = 127;
 
@@ -1006,6 +1015,46 @@ impl SenderBuilder {
                 ))
             }
         }
+    }
+
+    #[cfg(feature = "_async-sender")]
+    async fn build_async(self) -> Result<std::sync::Arc<AsyncSender>> {
+        if !self.protocol.is_httpx() {
+            return Err(fmt!(
+                ConfigError,
+                "Only the HTTP and HTTPS protocols are supported by the AsyncSender."
+            ));
+        }
+
+        let mut descr = format!("Sender[host={:?},port={:?},", self.host, self.port);
+
+        if self.protocol.tls_enabled() {
+            write!(descr, "tls=enabled,").unwrap();
+        } else {
+            write!(descr, "tls=disabled,").unwrap();
+        }
+
+        #[cfg(feature = "insecure-skip-verify")]
+        let tls_verify = *self.tls_verify;
+
+        let tls_settings = tls::TlsSettings::build(
+            self.protocol.tls_enabled(),
+            #[cfg(feature = "insecure-skip-verify")]
+            tls_verify,
+            *self.tls_ca,
+            self.tls_roots.deref().as_deref(),
+        )?;
+
+        let auth = self.build_auth()?;
+
+        AsyncSender::new(
+            descr,
+            self.host.deref(),
+            self.port.deref(),
+            tls_settings,
+            auth,
+        )
+        .await
     }
 
     #[cfg(feature = "_sync-sender")]
