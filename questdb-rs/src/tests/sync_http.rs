@@ -725,7 +725,7 @@ fn _test_sender_auto_detect_protocol_version(
         }
         let exp = &[
             b"test,t1=v1 ",
-            crate::tests::sender::f64_to_bytes("f1", 0.5, expect_version).as_slice(),
+            crate::tests::sync_sender::f64_to_bytes("f1", 0.5, expect_version).as_slice(),
             b" 10000000\n",
         ]
         .concat();

@@ -25,10 +25,15 @@
 mod f64_serializer;
 
 #[cfg(feature = "sync-sender-http")]
-mod http;
+mod sync_http;
+
+#[cfg(feature = "async-sender-http")]
+mod async_http;
 
 mod mock;
-mod sender;
+
+#[cfg(feature = "_sync-sender")]
+mod sync_sender;
 
 mod ndarr;
 

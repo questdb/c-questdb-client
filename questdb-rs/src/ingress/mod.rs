@@ -618,7 +618,7 @@ impl SenderBuilder {
             tls_ca: ConfigSetting::new_default(tls_ca),
             tls_roots: ConfigSetting::new_default(None),
 
-            #[cfg(feature = "sync-sender-http")]
+            #[cfg(feature = "_sender-http")]
             http: if protocol.is_httpx() {
                 Some(conf::HttpConfig::default())
             } else {
@@ -1018,7 +1018,7 @@ impl SenderBuilder {
     }
 
     #[cfg(feature = "_async-sender")]
-    async fn build_async(self) -> Result<std::sync::Arc<AsyncSender>> {
+    pub async fn build_async(self) -> Result<std::sync::Arc<AsyncSender>> {
         if !self.protocol.is_httpx() {
             return Err(fmt!(
                 ConfigError,
@@ -1046,6 +1046,7 @@ impl SenderBuilder {
         )?;
 
         let auth = self.build_auth()?;
+        let auth = conf::auth_params_to_header_string(&auth)?;
 
         AsyncSender::new(
             descr,
@@ -1053,6 +1054,10 @@ impl SenderBuilder {
             self.port.deref(),
             tls_settings,
             auth,
+            *self.max_name_len.deref(),
+            *self.protocol_version.deref(),
+            None, // TODO,
+            None, // TODO
         )
         .await
     }
@@ -1123,20 +1128,8 @@ impl SenderBuilder {
 
                 let connector = connector.chain(TlsConnector::new(tls_config));
 
-                let auth = match auth {
-                    Some(conf::AuthParams::Basic(ref auth)) => Some(auth.to_header_string()),
-                    Some(conf::AuthParams::Token(ref auth)) => Some(auth.to_header_string()?),
+                let auth = conf::auth_params_to_header_string(&auth)?;
 
-                    #[cfg(feature = "sync-sender-tcp")]
-                    Some(conf::AuthParams::Ecdsa(_)) => {
-                        return Err(fmt!(
-                            AuthError,
-                            "ECDSA authentication is not supported for ILP over HTTP. \
-                            Please use basic or token authentication instead."
-                        ));
-                    }
-                    None => None,
-                };
                 let agent_builder = agent_builder
                     .timeout_connect(Some(*http_config.request_timeout.deref()))
                     .http_status_as_error(false);

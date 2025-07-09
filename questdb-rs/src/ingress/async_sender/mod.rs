@@ -22,6 +22,7 @@
  *
  ******************************************************************************/
 use crate::error::Result;
+use crate::ingress::async_sender::http::{build_url, HttpClient};
 use crate::ingress::conf::AuthParams;
 use crate::ingress::ndarr::ArrayElementSealed;
 use crate::ingress::tls::TlsSettings;
@@ -32,7 +33,7 @@ use crate::ingress::{
 use crate::Error;
 use crossbeam_queue::ArrayQueue;
 use lasso::{Spur, ThreadedRodeo};
-use std::fmt::{Debug, Display, Formatter};
+use std::fmt::{Debug, Display};
 use std::sync::Arc;
 
 mod http;
@@ -254,7 +255,7 @@ impl Drop for Transaction {
 }
 
 pub(crate) struct AsyncSenderSettings {
-    max_concurrent_connections: usize,
+    max_concurrent_connections: u16,
     max_buffer_capacity_keep: usize,
     max_name_len: usize,
     protocol_version: ProtocolVersion,
@@ -265,7 +266,7 @@ pub struct AsyncSender {
     settings: AsyncSenderSettings,
     names: ThreadedRodeo,
     buffer_pool: ArrayQueue<Buffer>,
-    client: u64,
+    client: HttpClient,
 }
 
 impl AsyncSender {
@@ -281,10 +282,29 @@ impl AsyncSender {
         descr: String,
         host: &str,
         port: &str,
-        tls_settings: Option<TlsSettings>,
-        auth: Option<AuthParams>,
+        tls: Option<TlsSettings>,
+        auth: Option<String>,
+        max_name_len: usize,
+        protocol_version: Option<ProtocolVersion>,
+        max_concurrent_connections: Option<u16>,
+        max_buffer_capacity_keep: Option<usize>,
     ) -> Result<Arc<Self>> {
-        todo!()
+        let settings = AsyncSenderSettings {
+            max_concurrent_connections: max_concurrent_connections.unwrap_or(16),
+            max_buffer_capacity_keep: max_buffer_capacity_keep.unwrap_or(8 * 1024 * 1024),
+            max_name_len, // TODO: sniff and overwrite.
+            protocol_version: protocol_version.unwrap_or(ProtocolVersion::V2), // TODO: sniff!
+        };
+        let settings_url = build_url(tls.is_some(), host, port, "settings")?;
+        let client = HttpClient::new(tls, auth)?;
+        let buffer_pool = ArrayQueue::new((settings.max_concurrent_connections as usize) * 3 / 2);
+        Ok(Arc::new(Self {
+            descr,
+            settings,
+            names: ThreadedRodeo::new(),
+            buffer_pool,
+            client,
+        }))
     }
 
     pub fn new_transaction<'a, N>(self: &Arc<Self>, name: N) -> Result<Transaction>
@@ -306,11 +326,5 @@ impl AsyncSender {
 
     async fn flush_buffer(&self, _buffer: Buffer) -> (Buffer, Result<()>) {
         todo!()
-    }
-}
-
-impl Debug for AsyncSender {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        todo!() // use .descr
     }
 }

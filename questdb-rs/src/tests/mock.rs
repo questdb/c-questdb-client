@@ -636,12 +636,12 @@ impl MockServer {
         SenderBuilder::new(Protocol::Tcps, self.host, self.port)
     }
 
-    #[cfg(feature = "sync-sender-http")]
+    #[cfg(feature = "_sender-http")]
     pub fn lsb_http(&self) -> SenderBuilder {
         SenderBuilder::new(Protocol::Http, self.host, self.port)
     }
 
-    #[cfg(feature = "sync-sender-http")]
+    #[cfg(feature = "_sender-http")]
     pub fn lsb_https(&self) -> SenderBuilder {
         SenderBuilder::new(Protocol::Https, self.host, self.port)
     }

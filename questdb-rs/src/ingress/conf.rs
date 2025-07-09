@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-use crate::{Error, ErrorCode, Result};
+use crate::error::{fmt, Error, ErrorCode, Result};
 use std::ops::Deref;
 
 /// Wraps a SenderBuilder config setting with the intent of tracking
@@ -149,4 +149,65 @@ pub(crate) enum AuthParams {
 
     #[cfg(feature = "_sender-http")]
     Token(TokenAuthParams),
+}
+
+#[cfg(feature = "_sender-http")]
+pub fn auth_params_to_header_string(auth: &Option<AuthParams>) -> Result<Option<String>> {
+    Ok(match auth {
+        Some(AuthParams::Basic(ref auth)) => Some(auth.to_header_string()),
+        Some(AuthParams::Token(ref auth)) => Some(auth.to_header_string()?),
+
+        #[cfg(feature = "sync-sender-tcp")]
+        Some(AuthParams::Ecdsa(_)) => {
+            return Err(fmt!(
+                AuthError,
+                "ECDSA authentication is not supported for ILP over HTTP. \
+                Please use basic or token authentication instead."
+            ));
+        }
+        None => None,
+    })
+}
+
+#[cfg(feature = "_sender-http")]
+pub(crate) fn parse_server_settings(
+    response: &str,
+    settings_url: &str,
+    default_protocol_version: crate::ingress::ProtocolVersion,
+    default_max_name_len: usize,
+) -> crate::error::Result<(Vec<crate::ingress::ProtocolVersion>, usize)> {
+    use crate::ingress::ProtocolVersion;
+
+    let json: serde_json::Value = serde_json::from_str(response).map_err(|_| {
+        crate::error::fmt!(
+            ProtocolVersionError,
+            "Malformed server response, settings url: {}, err: response is not valid JSON.",
+            settings_url,
+        )
+    })?;
+
+    let mut support_versions: Vec<ProtocolVersion> = vec![];
+    if let Some(serde_json::Value::Array(ref values)) = json
+        .get("config")
+        .and_then(|v| v.get("line.proto.support.versions"))
+    {
+        for value in values.iter() {
+            if let Some(v) = value.as_u64() {
+                match v {
+                    1 => support_versions.push(ProtocolVersion::V1),
+                    2 => support_versions.push(ProtocolVersion::V2),
+                    _ => {}
+                }
+            }
+        }
+    } else {
+        support_versions.push(default_protocol_version);
+    }
+
+    let max_name_length = json
+        .get("config")
+        .and_then(|v| v.get("cairo.max.file.name.length"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(default_max_name_len as u64) as usize;
+    Ok((support_versions, max_name_length))
 }

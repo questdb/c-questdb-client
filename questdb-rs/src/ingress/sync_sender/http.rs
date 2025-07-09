@@ -38,7 +38,7 @@ use ureq::unversioned::transport::{
     Buffers, Connector, LazyBuffers, NextTimeout, Transport, TransportAdapter,
 };
 
-use crate::ingress::conf::HttpConfig;
+use crate::ingress::conf::{parse_server_settings, HttpConfig};
 use crate::ingress::ProtocolVersion;
 use ureq::unversioned::*;
 use ureq::{http, Body};
@@ -391,7 +391,7 @@ pub(crate) fn read_server_settings(
     state: &SyncHttpHandlerState,
     settings_url: &str,
     default_max_name_len: usize,
-) -> Result<(Vec<ProtocolVersion>, usize), Error> {
+) -> crate::error::Result<(Vec<ProtocolVersion>, usize)> {
     let default_protocol_version = ProtocolVersion::V1;
 
     let response = match http_get_with_retries(
@@ -447,45 +447,19 @@ pub(crate) fn read_server_settings(
     let (_, body) = response.into_parts();
     let body_content = body.into_with_config().read_to_string();
 
-    if let Ok(msg) = body_content {
-        let json: serde_json::Value = serde_json::from_str(&msg).map_err(|_| {
-            error::fmt!(
-                ProtocolVersionError,
-                "Malformed server response, settings url: {}, err: response is not valid JSON.",
-                settings_url,
-            )
-        })?;
-
-        let mut support_versions: Vec<ProtocolVersion> = vec![];
-        if let Some(serde_json::Value::Array(ref values)) = json
-            .get("config")
-            .and_then(|v| v.get("line.proto.support.versions"))
-        {
-            for value in values.iter() {
-                if let Some(v) = value.as_u64() {
-                    match v {
-                        1 => support_versions.push(ProtocolVersion::V1),
-                        2 => support_versions.push(ProtocolVersion::V2),
-                        _ => {}
-                    }
-                }
-            }
-        } else {
-            support_versions.push(default_protocol_version);
-        }
-
-        let max_name_length = json
-            .get("config")
-            .and_then(|v| v.get("cairo.max.file.name.length"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(default_max_name_len as u64) as usize;
-        Ok((support_versions, max_name_length))
-    } else {
-        Err(error::fmt!(
+    let Ok(response) = body_content else {
+        return Err(error::fmt!(
             ProtocolVersionError,
             "Malformed server response, settings url: {}, err: failed to read response body as UTF-8", settings_url
-        ))
-    }
+        ));
+    };
+
+    parse_server_settings(
+        &response,
+        settings_url,
+        default_protocol_version,
+        default_max_name_len,
+    )
 }
 
 #[allow(clippy::result_large_err)] // `ureq::Error` is large enough to cause this warning.
