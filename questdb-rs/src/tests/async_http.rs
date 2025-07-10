@@ -21,25 +21,129 @@
  *  limitations under the License.
  *
  ******************************************************************************/
-
+use crate::ingress::ProtocolVersion;
+use crate::tests::mock::HttpResponse;
 use crate::{
     ingress::{SenderBuilder, TimestampNanos},
     tests::{mock::MockServer, TestResult},
 };
+use std::io;
 
-#[tokio::test]
-async fn test_two_lines() -> TestResult {
-    let mut server = MockServer::new()?;
-    let mut sender = server
-        .lsb_http()
-        .protocol_version(crate::ingress::ProtocolVersion::V2)?
-        .build_async()
-        .await?;
-    let mut txn = sender.new_transaction("table1")?;
+async fn _test_sender_auto_detect_protocol_version(
+    supported_versions: Option<Vec<u16>>,
+    expect_version: ProtocolVersion,
+    max_name_len: usize,
+    expect_max_name_len: usize,
+) -> TestResult {
+    let supported_versions1 = supported_versions.clone();
+    let mut server = MockServer::new()?
+        .configure_settings_response(supported_versions.as_deref().unwrap_or(&[]), max_name_len);
+    let sender_builder = server.lsb_http();
+
+    let server_thread = std::thread::spawn(move || -> io::Result<MockServer> {
+        server.accept()?;
+        let req = server.recv_http_q()?;
+        assert_eq!(req.method(), "GET");
+        assert_eq!(req.path(), "/settings");
+        match supported_versions1 {
+            None => server.send_http_response_q(
+                HttpResponse::empty()
+                    .with_status(404, "Not Found")
+                    .with_header("content-type", "text/plain")
+                    .with_body_str("Not Found"),
+            )?,
+            Some(_) => server.send_settings_response()?,
+        }
+        let exp = &[
+            b"test,t1=v1 ",
+            crate::tests::f64_to_bytes("f1", 0.5, expect_version).as_slice(),
+            b" 10000000\n",
+        ]
+        .concat();
+        let req = server.recv_http_q()?;
+        assert_eq!(req.body(), exp);
+        server.send_http_response_q(HttpResponse::empty())?;
+        Ok(server)
+    });
+
+    let mut sender = sender_builder.build_async().await?;
+    // assert_eq!(sender.protocol_version(), expect_version);
+    // assert_eq!(sender.max_name_len(), expect_max_name_len);
+    let mut txn = sender.new_transaction("test")?;
     txn.row()?
-        .symbol("a", "B")?
-        .column_f64("b", 10.25)?
-        .at(TimestampNanos::now())?;
+        .symbol("t1", "v1")?
+        .column_f64("f1", 0.5)?
+        .at(TimestampNanos::new(10000000))?;
     txn.commit().await?;
+    _ = server_thread.join().unwrap()?;
     Ok(())
 }
+
+#[tokio::test]
+async fn test_sender_auto_protocol_version_basic() -> TestResult {
+    _test_sender_auto_detect_protocol_version(Some(vec![1, 2]), ProtocolVersion::V2, 130, 130).await
+}
+
+#[tokio::test]
+async fn test_sender_auto_protocol_version_old_server1() -> TestResult {
+    _test_sender_auto_detect_protocol_version(Some(vec![]), ProtocolVersion::V1, 0, 127).await
+}
+
+#[tokio::test]
+async fn test_sender_auto_protocol_version_old_server2() -> TestResult {
+    _test_sender_auto_detect_protocol_version(None, ProtocolVersion::V1, 0, 127).await
+}
+
+#[tokio::test]
+async fn test_sender_auto_protocol_version_only_v1() -> TestResult {
+    _test_sender_auto_detect_protocol_version(Some(vec![1]), ProtocolVersion::V1, 127, 127).await
+}
+
+#[tokio::test]
+async fn test_sender_auto_protocol_version_only_v2() -> TestResult {
+    _test_sender_auto_detect_protocol_version(Some(vec![2]), ProtocolVersion::V2, 127, 127).await
+}
+
+// #[tokio::test]
+// async fn test_two_lines() -> TestResult {
+//     let mut server = MockServer::new()?;
+//     let sender_builder = server.lsb_http();
+//
+//     let server_thread = std::thread::spawn(move || -> io::Result<MockServer> {
+//         server.accept()?;
+//         let req = server.recv_http_q()?;
+//         assert_eq!(req.method(), "GET");
+//         assert_eq!(req.path(), "/settings");
+//         // match supported_versions1 {
+//         //     None => server.send_http_response_q(
+//         //         HttpResponse::empty()
+//         //             .with_status(404, "Not Found")
+//         //             .with_header("content-type", "text/plain")
+//         //             .with_body_str("Not Found"),
+//         //     )?,
+//         //     Some(_) => server.send_settings_response()?,
+//         // }
+//         server.send_settings_response()?;
+//         // let exp = &[
+//         //     b"test,t1=v1 ",
+//         //     crate::tests::sync_sender::f64_to_bytes("f1", 0.5, expect_version).as_slice(),
+//         //     b" 10000000\n",
+//         // ]
+//         //     .concat();
+//         // let req = server.recv_http_q()?;
+//         // assert_eq!(req.body(), exp);
+//         // server.send_http_response_q(HttpResponse::empty())?;
+//         Ok(server)
+//     });
+//
+//     let mut sender = sender_builder
+//         .build_async()
+//         .await?;
+//     let mut txn = sender.new_transaction("table1")?;
+//     txn.row()?
+//         .symbol("a", "B")?
+//         .column_f64("b", 10.25)?
+//         .at(TimestampNanos::now())?;
+//     txn.commit().await?;
+//     Ok(())
+// }

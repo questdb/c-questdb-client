@@ -22,8 +22,8 @@
  *
  ******************************************************************************/
 use crate::error::Result;
-use crate::ingress::async_sender::http::{build_url, HttpClient};
-use crate::ingress::conf::AuthParams;
+use crate::ingress::async_sender::http::{build_url, read_server_settings, HttpClient};
+use crate::ingress::conf::{AuthParams, HttpConfig};
 use crate::ingress::ndarr::ArrayElementSealed;
 use crate::ingress::tls::TlsSettings;
 use crate::ingress::{
@@ -34,6 +34,7 @@ use crate::Error;
 use crossbeam_queue::ArrayQueue;
 use lasso::{Spur, ThreadedRodeo};
 use std::fmt::{Debug, Display};
+use std::ops::Deref;
 use std::sync::Arc;
 
 mod http;
@@ -286,6 +287,7 @@ impl AsyncSender {
         auth: Option<String>,
         max_name_len: usize,
         protocol_version: Option<ProtocolVersion>,
+        http_config: &HttpConfig,
         max_concurrent_connections: Option<u16>,
         max_buffer_capacity_keep: Option<usize>,
     ) -> Result<Arc<Self>> {
@@ -295,8 +297,17 @@ impl AsyncSender {
             max_name_len, // TODO: sniff and overwrite.
             protocol_version: protocol_version.unwrap_or(ProtocolVersion::V2), // TODO: sniff!
         };
+
         let settings_url = build_url(tls.is_some(), host, port, "settings")?;
         let client = HttpClient::new(tls, auth)?;
+        let server_settings = read_server_settings(
+            &client,
+            &settings_url,
+            max_name_len,
+            *http_config.request_timeout.deref(),
+        )
+        .await?;
+
         let buffer_pool = ArrayQueue::new((settings.max_concurrent_connections as usize) * 3 / 2);
         Ok(Arc::new(Self {
             descr,

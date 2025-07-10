@@ -39,7 +39,7 @@ use std::time::Instant;
 #[cfg(feature = "sync-sender-tcp")]
 use crate::tests::ndarr::ArrayColumnTypeTag;
 
-#[cfg(feature = "sync-sender-http")]
+#[cfg(feature = "_sender-http")]
 use std::io::Write;
 
 const CLIENT: Token = Token(0);
@@ -57,7 +57,7 @@ pub struct MockServer {
     #[cfg(feature = "sync-sender-tcp")]
     pub msgs: Vec<Vec<u8>>,
 
-    #[cfg(feature = "sync-sender-http")]
+    #[cfg(feature = "_sender-http")]
     settings_response: serde_json::Value,
 }
 
@@ -87,7 +87,7 @@ fn tls_config() -> Arc<ServerConfig> {
     Arc::new(config)
 }
 
-#[cfg(feature = "sync-sender-http")]
+#[cfg(feature = "_sender-http")]
 pub struct HttpRequest {
     method: String,
     path: String,
@@ -95,7 +95,7 @@ pub struct HttpRequest {
     body: Vec<u8>,
 }
 
-#[cfg(feature = "sync-sender-http")]
+#[cfg(feature = "_sender-http")]
 impl HttpRequest {
     pub fn method(&self) -> &str {
         &self.method
@@ -114,7 +114,7 @@ impl HttpRequest {
     }
 }
 
-#[cfg(feature = "sync-sender-http")]
+#[cfg(feature = "_sender-http")]
 pub struct HttpResponse {
     status_code: u16,
     status_text: String,
@@ -122,7 +122,7 @@ pub struct HttpResponse {
     body: Vec<u8>,
 }
 
-#[cfg(feature = "sync-sender-http")]
+#[cfg(feature = "_sender-http")]
 impl HttpResponse {
     pub fn empty() -> Self {
         HttpResponse {
@@ -184,14 +184,14 @@ impl HttpResponse {
     }
 }
 
-#[cfg(feature = "sync-sender-http")]
+#[cfg(feature = "_sender-http")]
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
         .any(|window| window == needle)
 }
 
-#[cfg(feature = "sync-sender-http")]
+#[cfg(feature = "_sender-http")]
 fn position(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
@@ -217,7 +217,7 @@ impl MockServer {
             #[cfg(feature = "sync-sender-tcp")]
             msgs: Vec::new(),
 
-            #[cfg(feature = "sync-sender-http")]
+            #[cfg(feature = "_sender-http")]
             settings_response: serde_json::Value::Null,
         })
     }
@@ -301,7 +301,7 @@ impl MockServer {
         self.wait_for(timeout, |event| event.is_readable())
     }
 
-    #[cfg(feature = "sync-sender-http")]
+    #[cfg(feature = "_sender-http")]
     pub fn wait_for_send(&mut self, duration: Option<Duration>) -> io::Result<bool> {
         self.wait_for(duration, |event| event.is_writable())
     }
@@ -316,7 +316,7 @@ impl MockServer {
         }
     }
 
-    #[cfg(feature = "sync-sender-http")]
+    #[cfg(feature = "_sender-http")]
     pub fn configure_settings_response(
         mut self,
         supported_versions: &[u16],
@@ -339,7 +339,7 @@ impl MockServer {
         self
     }
 
-    #[cfg(feature = "sync-sender-http")]
+    #[cfg(feature = "_sender-http")]
     fn do_write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let client = self.client.as_mut().unwrap();
         if let Some(tls_conn) = self.tls_conn.as_mut() {
@@ -350,7 +350,7 @@ impl MockServer {
         }
     }
 
-    #[cfg(feature = "sync-sender-http")]
+    #[cfg(feature = "_sender-http")]
     fn do_write_all(&mut self, buf: &[u8], timeout_sec: Option<f64>) -> io::Result<()> {
         let deadline = timeout_sec.map(|sec| Instant::now() + Duration::from_secs_f64(sec));
         let mut pos = 0usize;
@@ -385,7 +385,7 @@ impl MockServer {
         Ok(())
     }
 
-    #[cfg(feature = "sync-sender-http")]
+    #[cfg(feature = "_sender-http")]
     fn read_more(&mut self, accum: &mut Vec<u8>, deadline: Instant, stage: &str) -> io::Result<()> {
         let mut chunk = [0u8; 1024];
         let count = match self.do_read(&mut chunk[..]) {
@@ -422,7 +422,7 @@ impl MockServer {
         Ok(())
     }
 
-    #[cfg(feature = "sync-sender-http")]
+    #[cfg(feature = "_sender-http")]
     fn recv_http_method(
         &mut self,
         accum: &mut Vec<u8>,
@@ -451,7 +451,7 @@ impl MockServer {
         Ok((body_start, method, path))
     }
 
-    #[cfg(feature = "sync-sender-http")]
+    #[cfg(feature = "_sender-http")]
     fn recv_http_headers(
         &mut self,
         pos: usize,
@@ -480,7 +480,7 @@ impl MockServer {
         Ok((body_start, headers))
     }
 
-    #[cfg(feature = "sync-sender-http")]
+    #[cfg(feature = "_sender-http")]
     pub fn send_http_response(
         &mut self,
         response: HttpResponse,
@@ -490,7 +490,7 @@ impl MockServer {
         Ok(())
     }
 
-    #[cfg(feature = "sync-sender-http")]
+    #[cfg(feature = "_sender-http")]
     pub fn send_settings_response(&mut self) -> io::Result<()> {
         let response = HttpResponse::empty()
             .with_status(200, "OK")
@@ -499,12 +499,12 @@ impl MockServer {
         Ok(())
     }
 
-    #[cfg(feature = "sync-sender-http")]
+    #[cfg(feature = "_sender-http")]
     pub fn send_http_response_q(&mut self, response: HttpResponse) -> io::Result<()> {
         self.send_http_response(response, Some(5.0))
     }
 
-    #[cfg(feature = "sync-sender-http")]
+    #[cfg(feature = "_sender-http")]
     pub fn recv_http(&mut self, wait_timeout_sec: f64) -> io::Result<HttpRequest> {
         let mut accum = Vec::<u8>::new();
         let deadline = Instant::now() + Duration::from_secs_f64(wait_timeout_sec);
@@ -537,7 +537,7 @@ impl MockServer {
         })
     }
 
-    #[cfg(feature = "sync-sender-http")]
+    #[cfg(feature = "_sender-http")]
     pub fn recv_http_q(&mut self) -> io::Result<HttpRequest> {
         self.recv_http(5.0)
     }

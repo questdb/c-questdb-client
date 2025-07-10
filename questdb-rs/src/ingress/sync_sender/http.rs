@@ -23,6 +23,7 @@
  ******************************************************************************/
 
 use crate::error::fmt;
+use crate::ingress::http_common::is_retriable_status_code;
 use crate::{error, Error};
 use rand::Rng;
 use rustls::{ClientConnection, StreamOwned};
@@ -38,7 +39,7 @@ use ureq::unversioned::transport::{
     Buffers, Connector, LazyBuffers, NextTimeout, Transport, TransportAdapter,
 };
 
-use crate::ingress::conf::{parse_server_settings, HttpConfig};
+use crate::ingress::conf::{parse_server_settings, HttpConfig, SETTINGS_RETRY_TIMEOUT};
 use crate::ingress::ProtocolVersion;
 use ureq::unversioned::*;
 use ureq::{http, Body};
@@ -211,24 +212,7 @@ impl Transport for TlsTransport {
 
 fn need_retry(res: Result<http::status::StatusCode, &ureq::Error>) -> bool {
     match res {
-        Ok(status) => {
-            status.is_server_error()
-                && matches!(
-                    status.as_u16(),
-                    // Official HTTP codes
-                    500 | // Internal Server Error
-                    503 | // Service Unavailable
-                    504 | // Gateway Timeout
-
-                    // Unofficial extensions
-                    507 | // Insufficient Storage
-                    509 | // Bandwidth Limit Exceeded
-                    523 | // Origin is Unreachable
-                    524 | // A Timeout Occurred
-                    529 | // Site is overloaded
-                    599 // Network Connect Timeout Error
-                )
-        }
+        Ok(status) => is_retriable_status_code(status),
         Err(err) => matches!(
             err,
             ureq::Error::Timeout(_) | ureq::Error::ConnectionFailed | ureq::Error::TooManyRedirects
@@ -338,7 +322,7 @@ fn retry_http_send(
     buf: &[u8],
     request_timeout: Duration,
     retry_timeout: Duration,
-    mut last_rep: Result<Response<Body>, ureq::Error>,
+    mut last_response: Result<Response<Body>, ureq::Error>,
 ) -> Result<Response<Body>, ureq::Error> {
     let mut rng = rand::rng();
     let retry_end = std::time::Instant::now() + retry_timeout;
@@ -349,17 +333,17 @@ fn retry_http_send(
         let to_sleep_ms = retry_interval_ms + jitter_ms;
         let to_sleep = Duration::from_millis(to_sleep_ms as u64);
         if (std::time::Instant::now() + to_sleep) > retry_end {
-            return last_rep;
+            return last_response;
         }
         sleep(to_sleep);
-        if let Ok(last_rep) = last_rep {
+        if let Ok(last_response) = last_response {
             // Actively consume the reader to return the connection to the connection pool.
             // see https://github.com/algesten/ureq/issues/94
-            _ = last_rep.into_body().read_to_vec();
+            _ = last_response.into_body().read_to_vec();
         }
-        (need_retry, last_rep) = state.send_request(buf, request_timeout);
+        (need_retry, last_response) = state.send_request(buf, request_timeout);
         if !need_retry {
-            return last_rep;
+            return last_response;
         }
         retry_interval_ms = (retry_interval_ms * 2).min(1000);
     }
@@ -372,12 +356,12 @@ pub(super) fn http_send_with_retries(
     request_timeout: Duration,
     retry_timeout: Duration,
 ) -> Result<Response<Body>, ureq::Error> {
-    let (need_retry, last_rep) = state.send_request(buf, request_timeout);
+    let (need_retry, last_response) = state.send_request(buf, request_timeout);
     if !need_retry || retry_timeout.is_zero() {
-        return last_rep;
+        return last_response;
     }
 
-    retry_http_send(state, buf, request_timeout, retry_timeout, last_rep)
+    retry_http_send(state, buf, request_timeout, retry_timeout, last_response)
 }
 
 /// Read the server settings from the `/settings` endpoint.
@@ -398,7 +382,7 @@ pub(crate) fn read_server_settings(
         state,
         settings_url,
         *state.config.request_timeout,
-        Duration::from_secs(1),
+        SETTINGS_RETRY_TIMEOUT,
     ) {
         Ok(res) => {
             if res.status().is_client_error() || res.status().is_server_error() {
@@ -468,7 +452,7 @@ fn retry_http_get(
     url: &str,
     request_timeout: Duration,
     retry_timeout: Duration,
-    mut last_rep: Result<Response<Body>, ureq::Error>,
+    mut last_response: Result<Response<Body>, ureq::Error>,
 ) -> Result<Response<Body>, ureq::Error> {
     let mut rng = rand::rng();
     let retry_end = std::time::Instant::now() + retry_timeout;
@@ -479,17 +463,17 @@ fn retry_http_get(
         let to_sleep_ms = retry_interval_ms + jitter_ms;
         let to_sleep = Duration::from_millis(to_sleep_ms as u64);
         if (std::time::Instant::now() + to_sleep) > retry_end {
-            return last_rep;
+            return last_response;
         }
         sleep(to_sleep);
-        if let Ok(last_rep) = last_rep {
+        if let Ok(last_response) = last_response {
             // Actively consume the reader to return the connection to the connection pool.
             // see https://github.com/algesten/ureq/issues/94
-            _ = last_rep.into_body().read_to_vec();
+            _ = last_response.into_body().read_to_vec();
         }
-        (need_retry, last_rep) = state.get_request(url, request_timeout);
+        (need_retry, last_response) = state.get_request(url, request_timeout);
         if !need_retry {
-            return last_rep;
+            return last_response;
         }
         retry_interval_ms = (retry_interval_ms * 2).min(1000);
     }
@@ -502,10 +486,10 @@ fn http_get_with_retries(
     request_timeout: Duration,
     retry_timeout: Duration,
 ) -> Result<Response<Body>, ureq::Error> {
-    let (need_retry, last_rep) = state.get_request(url, request_timeout);
+    let (need_retry, last_response) = state.get_request(url, request_timeout);
     if !need_retry || retry_timeout.is_zero() {
-        return last_rep;
+        return last_response;
     }
 
-    retry_http_get(state, url, request_timeout, retry_timeout, last_rep)
+    retry_http_get(state, url, request_timeout, retry_timeout, last_response)
 }

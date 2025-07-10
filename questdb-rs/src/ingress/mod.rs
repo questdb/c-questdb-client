@@ -59,6 +59,9 @@ mod timestamp;
 mod buffer;
 pub use buffer::*;
 
+#[cfg(feature = "_sender-http")]
+mod http_common;
+
 #[cfg(feature = "_sync-sender")]
 mod sync_sender;
 
@@ -1048,6 +1051,8 @@ impl SenderBuilder {
         let auth = self.build_auth()?;
         let auth = conf::auth_params_to_header_string(&auth)?;
 
+        let http_config = self.http.as_ref().unwrap();
+
         AsyncSender::new(
             descr,
             self.host.deref(),
@@ -1056,6 +1061,7 @@ impl SenderBuilder {
             auth,
             *self.max_name_len.deref(),
             *self.protocol_version.deref(),
+            http_config,
             None, // TODO,
             None, // TODO
         )

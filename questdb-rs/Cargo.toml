@@ -33,6 +33,8 @@ rustls-native-certs = { version = "0.8.1", optional = true }
 webpki-roots = { version = "1.0.1", default-features = false, optional = true }
 chrono = { version = "0.4.40", optional = true }
 
+http = { version = "1.3.1", optional = true }
+
 # We need to limit the `ureq` version to 3.0.x since we use
 # the `ureq::unversioned` module which does not respect semantic versioning.
 ureq = { version = "3.0.10, <3.1.0", default-features = false, features = ["_tls"], optional = true }
@@ -71,7 +73,7 @@ rstest = "0.25.0"
 tokio = { version = "1.45.1", features = ["macros", "rt-multi-thread"]}
 
 [features]
-default = ["sync-sender", "tls-webpki-certs", "ring-crypto"]
+default = ["sync-sender", "async-sender-http", "tls-webpki-certs", "ring-crypto"]
 
 ## Sync ILP/TCP + ILP/HTTP Sender
 sync-sender = ["sync-sender-tcp", "sync-sender-http"]
@@ -83,8 +85,7 @@ sync-sender-tcp = ["_sync-sender", "_sender-tcp", "dep:socket2"]
 sync-sender-http = [
     "_sync-sender",
     "_sender-http",
-    "dep:ureq",
-    "dep:rand"]
+    "dep:ureq"]
 
 ## Async ILP/HTTP Sender
 async-sender-http = [
@@ -123,7 +124,7 @@ chrono_timestamp = ["chrono"]
 
 # Hidden derived features, used in code to enable-disable code sections. Don't use directly.
 _sender-tcp = [] # enabled for sync-sender-tcp
-_sender-http = ["dep:serde_json"] # enabled for any(sync-sender-http, async-sender-http)
+_sender-http = ["dep:http", "dep:serde_json", "dep:rand"] # enabled for any(sync-sender-http, async-sender-http)
 _sync-sender = [] # enabled for any(sync-sender-tcp, sync-sender-http)
 _async-sender = [] # enabled for async-sender-http)
 

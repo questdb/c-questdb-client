@@ -25,6 +25,9 @@
 use crate::error::{fmt, Error, ErrorCode, Result};
 use std::ops::Deref;
 
+#[cfg(feature = "_sender-http")]
+pub(crate) const SETTINGS_RETRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Wraps a SenderBuilder config setting with the intent of tracking
 /// whether the value was user-specified or defaulted.
 /// This helps the builder API ensure that a user-specified value can't
