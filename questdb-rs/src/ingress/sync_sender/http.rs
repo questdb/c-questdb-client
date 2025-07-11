@@ -23,7 +23,7 @@
  ******************************************************************************/
 
 use crate::error::fmt;
-use crate::ingress::http_common::is_retriable_status_code;
+use crate::ingress::http_common::{is_retriable_status_code, process_settings_response};
 use crate::{error, Error};
 use rand::Rng;
 use rustls::{ClientConnection, StreamOwned};
@@ -39,7 +39,7 @@ use ureq::unversioned::transport::{
     Buffers, Connector, LazyBuffers, NextTimeout, Transport, TransportAdapter,
 };
 
-use crate::ingress::conf::{parse_server_settings, HttpConfig, SETTINGS_RETRY_TIMEOUT};
+use crate::ingress::conf::{HttpConfig, SETTINGS_RETRY_TIMEOUT};
 use crate::ingress::ProtocolVersion;
 use ureq::unversioned::*;
 use ureq::{http, Body};
@@ -378,72 +378,47 @@ pub(crate) fn read_server_settings(
 ) -> crate::error::Result<(Vec<ProtocolVersion>, usize)> {
     let default_protocol_version = ProtocolVersion::V1;
 
-    let response = match http_get_with_retries(
+    let response = http_get_with_retries(
         state,
         settings_url,
         *state.config.request_timeout,
         SETTINGS_RETRY_TIMEOUT,
-    ) {
-        Ok(res) => {
-            if res.status().is_client_error() || res.status().is_server_error() {
-                let status = res.status();
-                _ = res.into_body().read_to_vec();
-                if status.as_u16() == 404 {
-                    return Ok((vec![default_protocol_version], default_max_name_len));
-                }
-                return Err(fmt!(
+    );
+
+    // Fully read the response.
+    let response = match response {
+        Ok(response) => {
+            let status = response.status();
+            match response.into_body().read_to_vec() {
+                Ok(body) => Ok((status, body)),
+                Err(_) if status.as_u16() == 404 =>
+                    Ok((status, Vec::new())),
+                Err(err) => Err(fmt!(
                     ProtocolVersionError,
-                    "Could not detect server's line protocol version, settings url: {}, status code: {}.",
+                    "Could not detect server's line protocol version, settings url: {}, status code: {}, err: {}.",
                     settings_url,
-                    status
-                ));
-            } else {
-                res
+                    status,
+                    err
+                ))
             }
+        },
+        Err(ureq::Error::StatusCode(code)) => {
+            Ok((http::StatusCode::from_u16(code).unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR), Vec::new()))
         }
-        Err(err) => {
-            let e = match err {
-                ureq::Error::StatusCode(code) => {
-                    if code == 404 {
-                        return Ok((vec![default_protocol_version], default_max_name_len));
-                    } else {
-                        fmt!(
-                            ProtocolVersionError,
-                            "Could not detect server's line protocol version, settings url: {}, err: {}.",
-                            settings_url,
-                            err
-                        )
-                    }
-                }
-                e => {
-                    fmt!(
-                        ProtocolVersionError,
-                        "Could not detect server's line protocol version, settings url: {}, err: {}.",
-                        settings_url,
-                        e
-                    )
-                }
-            };
-            return Err(e);
-        }
+        Err(err) => 
+            Err(fmt!(
+                ProtocolVersionError,
+                "Could not detect server's line protocol version, settings url: {}, err: {}.",
+                settings_url,
+                err
+            ))
     };
 
-    let (_, body) = response.into_parts();
-    let body_content = body.into_with_config().read_to_string();
-
-    let Ok(response) = body_content else {
-        return Err(error::fmt!(
-            ProtocolVersionError,
-            "Malformed server response, settings url: {}, err: failed to read response body as UTF-8", settings_url
-        ));
-    };
-
-    parse_server_settings(
-        &response,
+    process_settings_response(
+        response,
         settings_url,
         default_protocol_version,
-        default_max_name_len,
-    )
+        default_max_name_len)
 }
 
 #[allow(clippy::result_large_err)] // `ureq::Error` is large enough to cause this warning.

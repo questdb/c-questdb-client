@@ -22,9 +22,6 @@
  *
  ******************************************************************************/
 
-#[cfg(feature = "_sender-http")]
-use http::StatusCode;
-
 use crate::error::{fmt, Error, ErrorCode, Result};
 use std::ops::Deref;
 
