@@ -46,6 +46,28 @@ pub(crate) fn is_retriable_status_code(status: http::status::StatusCode) -> bool
         )
 }
 
+pub(crate) fn check_status_code(
+    status: StatusCode,
+    url: &str,
+) -> Result<()> {
+    let code = status.as_u16();
+    match status.as_u16() {
+        404 => Err(fmt!(
+            HttpNotSupported,
+            "Could not flush buffer: HTTP endpoint does not support ILP."
+        )),
+        401 | 403 => Err(fmt!(
+            AuthError,
+            "Could not flush buffer: HTTP endpoint authentication error [code: {code}]",
+        )),
+        _ if status.is_client_error() || status.is_server_error() => Err(fmt!(
+            SocketError,
+            "Could not flush buffer: {}: {}", url, status.as_str()
+        )),
+        _ => Ok(())
+    }
+}
+
 fn parse_server_settings(
     response: &str,
     settings_url: &str,
@@ -92,9 +114,8 @@ pub(crate) fn process_settings_response<P: AsRef<[u8]>>(
     default_protocol_version: ProtocolVersion,
     default_max_name_len: usize,
 ) -> Result<(Vec<ProtocolVersion>, usize)> {
-    let response = match response {
-        Ok(response) => {
-            let status = response.0;
+    let body = match &response {
+        Ok((status, body)) => {
             if status.is_client_error() || status.is_server_error() {
                 if status.as_u16() == 404 {
                     return Ok((vec![default_protocol_version], default_max_name_len));        
@@ -104,7 +125,7 @@ pub(crate) fn process_settings_response<P: AsRef<[u8]>>(
                     "Could not detect server's line protocol version, settings url: {settings_url}, status code: {status}."
                 ));
             }
-            response
+            body.as_ref()
         },
         Err(e) => return Err(
             fmt!(
@@ -114,7 +135,6 @@ pub(crate) fn process_settings_response<P: AsRef<[u8]>>(
         )
     };
 
-    let body = response.1.as_ref();
     let body_str = std::str::from_utf8(body)
         .map_err(|utf8_error| fmt!(
             ProtocolVersionError,

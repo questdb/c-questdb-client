@@ -25,6 +25,8 @@
 use crate::error::fmt;
 use crate::ingress::http_common::{is_retriable_status_code, process_settings_response};
 use crate::{error, Error};
+#[cfg(feature = "sync-sender-http")]
+use http::StatusCode;
 use rand::Rng;
 use rustls::{ClientConnection, StreamOwned};
 use rustls_pki_types::ServerName;
@@ -65,7 +67,7 @@ impl SyncHttpHandlerState {
         &self,
         buf: &[u8],
         request_timeout: Duration,
-    ) -> (bool, Result<Response<Body>, ureq::Error>) {
+    ) -> (bool, crate::error::Result<(StatusCode, Vec<u8>)>) {
         let request = self
             .agent
             .post(&self.url)
@@ -79,11 +81,27 @@ impl SyncHttpHandlerState {
             Some(auth) => request.header("Authorization", auth),
             None => request,
         };
+
         let response = request.send(buf);
-        match &response {
-            Ok(res) => (need_retry(Ok(res.status())), response),
-            Err(err) => (need_retry(Err(err)), response),
-        }
+        let response = match response {
+            Ok(response_body) => Ok((response_body.status(), response_body.into_body().read_to_vec())),
+            Err(ureq::Error::StatusCode(code)) => {
+                let status = http::StatusCode::from_u16(code).unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
+                let need_retry = is_retriable_status_code(status);
+                (need_retry, Ok((status, Vec::new())))
+            },
+            Err(err) => {
+                let need_retry = matches!(
+                    err,
+                    ureq::Error::Timeout(_) | ureq::Error::ConnectionFailed | ureq::Error::TooManyRedirects
+                );
+                (need_retry, Err(fmt!(
+                    ServerFlushError,
+                    "Could not flush, url: {}, err: {err}",
+                    &self.url
+                )))
+            }
+        };
     }
 
     pub(crate) fn get_request(
@@ -395,7 +413,7 @@ pub(crate) fn read_server_settings(
                     Ok((status, Vec::new())),
                 Err(err) => Err(fmt!(
                     ProtocolVersionError,
-                    "Could not detect server's line protocol version, settings url: {}, status code: {}, err: {}.",
+                    "Could not detect server's line protocol version, settings url: {}, status code: {}, err: {}",
                     settings_url,
                     status,
                     err
@@ -408,7 +426,7 @@ pub(crate) fn read_server_settings(
         Err(err) => 
             Err(fmt!(
                 ProtocolVersionError,
-                "Could not detect server's line protocol version, settings url: {}, err: {}.",
+                "Could not detect server's line protocol version, settings url: {}, err: {}",
                 settings_url,
                 err
             ))
