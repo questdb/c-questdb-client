@@ -25,8 +25,8 @@
 use std::time::Duration;
 
 use crate::error::{fmt, Error, Result};
-use crate::ingress::conf::{parse_server_settings, SETTINGS_RETRY_TIMEOUT};
-use crate::ingress::http_common::is_retriable_status_code;
+use crate::ingress::conf::SETTINGS_RETRY_TIMEOUT;
+use crate::ingress::http_common::{is_retriable_status_code, process_settings_response};
 use crate::ingress::tls::TlsSettings;
 use crate::ingress::ProtocolVersion;
 use bytes::Bytes;
@@ -151,76 +151,16 @@ pub(super) async fn read_server_settings(
 ) -> Result<(Vec<ProtocolVersion>, usize)> {
     let default_protocol_version = ProtocolVersion::V1;
 
-    let (status, response) = client
+    let response = client
         .get_with_retries(settings_url, request_timeout, SETTINGS_RETRY_TIMEOUT)
-        .await?;
+        .await;
 
-    todo!();
-
-    // let response = match http_get_with_retries(
-    //     client,
-    //     settings_url,
-    //     request_timeout,
-    //     SETTINGS_RETRY_TIMEOUT,
-    // ).await {
-    //     Ok(res) => {
-    //         if res.status().is_client_error() || res.status().is_server_error() {
-    //             let status = res.status();
-    //             _ = res.into_body().read_to_vec();
-    //             if status.as_u16() == 404 {
-    //                 return Ok((vec![default_protocol_version], default_max_name_len));
-    //             }
-    //             return Err(fmt!(
-    //                 ProtocolVersionError,
-    //                 "Could not detect server's line protocol version, settings url: {}, status code: {}.",
-    //                 settings_url,
-    //                 status
-    //             ));
-    //         } else {
-    //             res
-    //         }
-    //     }
-    //     Err(err) => {
-    //         let e = match err {
-    //             ureq::Error::StatusCode(code) => {
-    //                 if code == 404 {
-    //                     return Ok((vec![default_protocol_version], default_max_name_len));
-    //                 } else {
-    //                     fmt!(
-    //                         ProtocolVersionError,
-    //                         "Could not detect server's line protocol version, settings url: {}, err: {}.",
-    //                         settings_url,
-    //                         err
-    //                     )
-    //                 }
-    //             }
-    //             e => {
-    //                 fmt!(
-    //                     ProtocolVersionError,
-    //                     "Could not detect server's line protocol version, settings url: {}, err: {}.",
-    //                     settings_url,
-    //                     e
-    //                 )
-    //             }
-    //         };
-    //         return Err(e);
-    //     }
-    // };
-
-    // let (_, body) = response.into_parts();
-    // let body_content = body.into_with_config().read_to_string();
-
-    // let Ok(response) = body_content else {
-    //     return error::fmt!(
-    //         ProtocolVersionError,
-    //         "Malformed server response, settings url: {}, err: response is not valid JSON.",
-    //         settings_url,
-    //     );
-    // };
-
-    // parse_server_settings(
-    //     response,
-    //     settings_url.as_str(),
-    //     default_protocol_version,
-    //     default_max_name_len)
+    process_settings_response(
+        response,
+        settings_url.as_str(),
+        default_protocol_version,
+        default_max_name_len,
+        |(status, _body)| *status,
+        |(_status, body)| &body[..]
+    )
 }

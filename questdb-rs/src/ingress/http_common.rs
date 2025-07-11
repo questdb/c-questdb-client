@@ -22,7 +22,14 @@
  *
  ******************************************************************************/
 
-#[cfg(feature = "_sender-http")]
+use std::fmt::Display;
+
+use http::StatusCode;
+
+use crate::error::Result;
+use crate::ingress::DebugBytes;
+use crate::{fmt, ingress::ProtocolVersion};
+
 pub(crate) fn is_retriable_status_code(status: http::status::StatusCode) -> bool {
     status.is_server_error()
         && matches!(
@@ -40,4 +47,89 @@ pub(crate) fn is_retriable_status_code(status: http::status::StatusCode) -> bool
             529 | // Site is overloaded
             599 // Network Connect Timeout Error
         )
+}
+
+fn parse_server_settings(
+    response: &str,
+    settings_url: &str,
+    default_protocol_version: crate::ingress::ProtocolVersion,
+    default_max_name_len: usize,
+) -> Result<(Vec<crate::ingress::ProtocolVersion>, usize)> {
+    let json: serde_json::Value = serde_json::from_str(response).map_err(|_| {
+        crate::error::fmt!(
+            ProtocolVersionError,
+            "Malformed server response, settings url: {}, err: response is not valid JSON.",
+            settings_url,
+        )
+    })?;
+
+    let mut support_versions: Vec<ProtocolVersion> = vec![];
+    if let Some(serde_json::Value::Array(ref values)) = json
+        .get("config")
+        .and_then(|v| v.get("line.proto.support.versions"))
+    {
+        for value in values.iter() {
+            if let Some(v) = value.as_u64() {
+                match v {
+                    1 => support_versions.push(ProtocolVersion::V1),
+                    2 => support_versions.push(ProtocolVersion::V2),
+                    _ => {}
+                }
+            }
+        }
+    } else {
+        support_versions.push(default_protocol_version);
+    }
+
+    let max_name_length = json
+        .get("config")
+        .and_then(|v| v.get("cairo.max.file.name.length"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(default_max_name_len as u64) as usize;
+    Ok((support_versions, max_name_length))
+}
+
+pub(crate) fn process_settings_response<P, E: Display>(
+    response: std::result::Result<P, E>,
+    settings_url: &str,
+    default_protocol_version: ProtocolVersion,
+    default_max_name_len: usize,
+    get_status: impl Fn(&P) -> StatusCode,
+    get_body: impl Fn(&P) -> &[u8],
+) -> Result<(Vec<ProtocolVersion>, usize)> {
+    let response = match response {
+        Ok(response) => {
+            let status = get_status(&response);
+            if status.is_client_error() || status.is_server_error() {
+                if status.as_u16() == 404 {
+                    return Ok((vec![default_protocol_version], default_max_name_len));        
+                }
+                return Err(fmt!(
+                    ProtocolVersionError,
+                    "Could not detect server's line protocol version, settings url: {settings_url}, status code: {status}."
+                ));
+            }
+            response
+        },
+        Err(e) => return Err(
+            fmt!(
+                ProtocolVersionError,
+                "Could not read the server's protocol version from the server: {e}",
+            )
+        )
+    };
+
+    let body = get_body(&response);
+    let body_str = std::str::from_utf8(body)
+        .map_err(|utf8_error| fmt!(
+            ProtocolVersionError,
+            "Could not read the server's response as a string: {:?}: {utf8_error}",
+            DebugBytes(body)
+        ))?;
+
+    parse_server_settings(
+        body_str,
+        settings_url,
+        default_protocol_version,
+        default_max_name_len)
 }
