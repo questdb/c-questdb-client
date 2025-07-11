@@ -25,7 +25,6 @@
 use crate::error::fmt;
 use crate::ingress::http_common::{is_retriable_status_code, process_settings_response};
 use crate::{error, Error};
-#[cfg(feature = "sync-sender-http")]
 use http::StatusCode;
 use rand::Rng;
 use rustls::{ClientConnection, StreamOwned};
@@ -46,7 +45,6 @@ use crate::ingress::ProtocolVersion;
 use ureq::unversioned::*;
 use ureq::{http, Body};
 
-#[cfg(feature = "sync-sender-http")]
 pub(crate) struct SyncHttpHandlerState {
     /// Maintains a pool of open HTTP connections to the endpoint.
     pub(crate) agent: ureq::Agent,
@@ -61,7 +59,6 @@ pub(crate) struct SyncHttpHandlerState {
     pub(crate) config: HttpConfig,
 }
 
-#[cfg(feature = "sync-sender-http")]
 impl SyncHttpHandlerState {
     fn send_request(
         &self,
@@ -83,8 +80,19 @@ impl SyncHttpHandlerState {
         };
 
         let response = request.send(buf);
-        let response = match response {
-            Ok(response_body) => Ok((response_body.status(), response_body.into_body().read_to_vec())),
+        match response {
+            Ok(response_body) => {
+                let status = response_body.status();
+                let need_retry = is_retriable_status_code(status);
+                match response_body.into_body().read_to_vec() {
+                    Ok(body) => (need_retry, Ok((status, body))),
+                    Err(err) => (need_retry, Err(fmt!(
+                        ServerFlushError,
+                        "Could not read flush response, url: {}, err: {err}",
+                        &self.url
+                    )))
+                }
+            },
             Err(ureq::Error::StatusCode(code)) => {
                 let status = http::StatusCode::from_u16(code).unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
                 let need_retry = is_retriable_status_code(status);
@@ -101,7 +109,7 @@ impl SyncHttpHandlerState {
                     &self.url
                 )))
             }
-        };
+        }
     }
 
     pub(crate) fn get_request(
