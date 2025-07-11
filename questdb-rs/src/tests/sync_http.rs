@@ -24,7 +24,7 @@
 
 use crate::ingress::{Buffer, Protocol, ProtocolVersion, SenderBuilder, TimestampNanos};
 use crate::tests::mock::{certs_dir, HttpResponse, MockServer};
-use crate::tests::{assert_err_contains, TestResult};
+use crate::tests::{assert_err_contains, TestResult, f64_to_bytes};
 use crate::ErrorCode;
 use rstest::rstest;
 use std::io;
@@ -725,7 +725,7 @@ fn _test_sender_auto_detect_protocol_version(
         }
         let exp = &[
             b"test,t1=v1 ",
-            crate::tests::sync_sender::f64_to_bytes("f1", 0.5, expect_version).as_slice(),
+            f64_to_bytes("f1", 0.5, expect_version).as_slice(),
             b" 10000000\n",
         ]
         .concat();

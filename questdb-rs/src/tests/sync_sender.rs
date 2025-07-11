@@ -45,6 +45,7 @@ use crate::tests::{
     assert_err_contains,
     mock::{certs_dir, MockServer},
     ndarr::ArrayColumnTypeTag,
+    f64_to_bytes
 };
 
 #[cfg(feature = "sync-sender-tcp")]
