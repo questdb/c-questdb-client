@@ -55,10 +55,10 @@ These protocol versions are supported over both HTTP and TCP.
   `protocol_version=N` parameter when constructing the `Sender` object
   (TCP defaults to `protocol_version=1`).
 
-| Version | Description                                             | Server Compatibility   |
-| ------- | ------------------------------------------------------- | --------------------- |
-| **1**   | Over HTTP it's compatible InfluxDB Line Protocol (ILP)  | All QuestDB versions  |
-| **2**   | 64-bit floats sent as binary, adds n-dimentional arrays | 9.0.0+ (2023-10-30)   |
+| Version | Description                                                  | Server Compatibility  |
+| ------- | ------------------------------------------------------------ | --------------------- |
+| **1**   | Over HTTP it's compatible with InfluxDB Line Protocol (ILP)  | All QuestDB versions  |
+| **2**   | 64-bit floats sent as binary, adds n-dimensional arrays      | 9.0.0+ (2025-07-11)   |
 
 ## Getting Started
 
