@@ -45,6 +45,7 @@ use crate::tests::{
     assert_err_contains,
     mock::{certs_dir, MockServer},
     ndarr::ArrayColumnTypeTag,
+    f64_to_bytes
 };
 
 #[cfg(feature = "sync-sender-tcp")]
@@ -792,23 +793,4 @@ fn tcp_mismatched_buffer_and_sender_version() -> TestResult {
         but the sender is configured to use protocol version v2",
     );
     Ok(())
-}
-
-pub(crate) fn f64_to_bytes(name: &str, value: f64, version: ProtocolVersion) -> Vec<u8> {
-    let mut buf = Vec::new();
-    buf.extend_from_slice(name.as_bytes());
-    buf.push(b'=');
-
-    match version {
-        ProtocolVersion::V1 => {
-            let mut ser = F64Serializer::new(value);
-            buf.extend_from_slice(ser.as_str().as_bytes());
-        }
-        ProtocolVersion::V2 => {
-            buf.push(b'=');
-            buf.push(DOUBLE_BINARY_FORMAT_TYPE);
-            buf.extend_from_slice(&value.to_le_bytes());
-        }
-    }
-    buf
 }

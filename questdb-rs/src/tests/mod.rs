@@ -22,13 +22,20 @@
  *
  ******************************************************************************/
 
+use crate::ingress::{F64Serializer, ProtocolVersion, DOUBLE_BINARY_FORMAT_TYPE};
+
 mod f64_serializer;
 
 #[cfg(feature = "sync-sender-http")]
-mod http;
+mod sync_http;
+
+#[cfg(feature = "async-sender-http")]
+mod async_http;
 
 mod mock;
-mod sender;
+
+#[cfg(feature = "_sync-sender")]
+mod sync_sender;
 
 mod ndarr;
 
@@ -65,4 +72,23 @@ pub fn assert_err_contains<T: std::fmt::Debug>(
             );
         }
     }
+}
+
+pub(crate) fn f64_to_bytes(name: &str, value: f64, version: ProtocolVersion) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(name.as_bytes());
+    buf.push(b'=');
+
+    match version {
+        ProtocolVersion::V1 => {
+            let mut ser = F64Serializer::new(value);
+            buf.extend_from_slice(ser.as_str().as_bytes());
+        }
+        ProtocolVersion::V2 => {
+            buf.push(b'=');
+            buf.push(DOUBLE_BINARY_FORMAT_TYPE);
+            buf.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    buf
 }

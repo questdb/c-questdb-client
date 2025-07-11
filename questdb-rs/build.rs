@@ -274,11 +274,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(not(any(feature = "_sender-tcp", feature = "_sender-http")))]
     compile_error!(
-        "At least one of `sync-sender-tcp` or `sync-sender-http` features must be enabled"
+        "At least one of `sync-sender-tcp`, `sync-sender-http`, or `async-sender-http` features must be enabled"
     );
 
     #[cfg(not(any(feature = "aws-lc-crypto", feature = "ring-crypto")))]
-    compile_error!("You must enable exactly one of the `aws-lc-crypto` or `ring-crypto` features, but none are enabled.");
+    compile_error!("You must enable exactly one of the `aws-lc-crypto` or `ring-crypto` features, but neither are enabled.");
 
     #[cfg(all(feature = "aws-lc-crypto", feature = "ring-crypto"))]
     compile_error!("You must enable exactly one of the `aws-lc-crypto` or `ring-crypto` features, but both are enabled.");

@@ -22,8 +22,11 @@
  *
  ******************************************************************************/
 
-use crate::{Error, ErrorCode, Result};
+use crate::error::{fmt, Error, ErrorCode, Result};
 use std::ops::Deref;
+
+#[cfg(feature = "_sender-http")]
+pub(crate) const SETTINGS_RETRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Wraps a SenderBuilder config setting with the intent of tracking
 /// whether the value was user-specified or defaulted.
@@ -149,4 +152,22 @@ pub(crate) enum AuthParams {
 
     #[cfg(feature = "_sender-http")]
     Token(TokenAuthParams),
+}
+
+#[cfg(feature = "_sender-http")]
+pub fn auth_params_to_header_string(auth: &Option<AuthParams>) -> Result<Option<String>> {
+    Ok(match auth {
+        Some(AuthParams::Basic(ref auth)) => Some(auth.to_header_string()),
+        Some(AuthParams::Token(ref auth)) => Some(auth.to_header_string()?),
+
+        #[cfg(feature = "sync-sender-tcp")]
+        Some(AuthParams::Ecdsa(_)) => {
+            return Err(fmt!(
+                AuthError,
+                "ECDSA authentication is not supported for ILP over HTTP. \
+                Please use basic or token authentication instead."
+            ));
+        }
+        None => None,
+    })
 }
