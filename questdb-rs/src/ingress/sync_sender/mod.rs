@@ -199,7 +199,7 @@ impl Sender {
                     *state.config.request_timeout + std::time::Duration::from_secs_f64(extra_time),
                     *state.config.retry_timeout,
                 )?;
-                
+
                 if status.is_client_error() || status.is_server_error() {
                     return Err(parse_http_error(status, headers, response));
                 }

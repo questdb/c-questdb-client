@@ -42,10 +42,9 @@ use ndarray::{arr2, ArrayD};
 
 #[cfg(feature = "sync-sender-tcp")]
 use crate::tests::{
-    assert_err_contains,
+    assert_err_contains, f64_to_bytes,
     mock::{certs_dir, MockServer},
     ndarr::ArrayColumnTypeTag,
-    f64_to_bytes
 };
 
 #[cfg(feature = "sync-sender-tcp")]

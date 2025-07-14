@@ -22,10 +22,10 @@
  *
  ******************************************************************************/
 
-use http::StatusCode;
 use crate::error::Result;
 use crate::ingress::DebugBytes;
 use crate::{fmt, ingress::ProtocolVersion};
+use http::StatusCode;
 
 pub(crate) fn is_retriable_status_code(status: http::status::StatusCode) -> bool {
     status.is_server_error()
@@ -46,10 +46,7 @@ pub(crate) fn is_retriable_status_code(status: http::status::StatusCode) -> bool
         )
 }
 
-pub(crate) fn check_status_code(
-    status: StatusCode,
-    url: &str,
-) -> Result<()> {
+pub(crate) fn check_status_code(status: StatusCode, url: &str) -> Result<()> {
     let code = status.as_u16();
     match status.as_u16() {
         404 => Err(fmt!(
@@ -62,9 +59,11 @@ pub(crate) fn check_status_code(
         )),
         _ if status.is_client_error() || status.is_server_error() => Err(fmt!(
             SocketError,
-            "Could not flush buffer: {}: {}", url, status.as_str()
+            "Could not flush buffer: {}: {}",
+            url,
+            status.as_str()
         )),
-        _ => Ok(())
+        _ => Ok(()),
     }
 }
 
@@ -118,7 +117,7 @@ pub(crate) fn process_settings_response<P: AsRef<[u8]>>(
         Ok((status, body)) => {
             if status.is_client_error() || status.is_server_error() {
                 if status.as_u16() == 404 {
-                    return Ok((vec![default_protocol_version], default_max_name_len));        
+                    return Ok((vec![default_protocol_version], default_max_name_len));
                 }
                 return Err(fmt!(
                     ProtocolVersionError,
@@ -126,25 +125,27 @@ pub(crate) fn process_settings_response<P: AsRef<[u8]>>(
                 ));
             }
             body.as_ref()
-        },
-        Err(e) => return Err(
-            fmt!(
+        }
+        Err(e) => {
+            return Err(fmt!(
                 ProtocolVersionError,
                 "Could not read the server's protocol version from the server: {e}",
-            )
-        )
+            ))
+        }
     };
 
-    let body_str = std::str::from_utf8(body)
-        .map_err(|utf8_error| fmt!(
+    let body_str = std::str::from_utf8(body).map_err(|utf8_error| {
+        fmt!(
             ProtocolVersionError,
             "Could not read the server's /settings response as a string: {:?}: {utf8_error}",
             DebugBytes(body)
-        ))?;
+        )
+    })?;
 
     parse_server_settings(
         body_str,
         settings_url,
         default_protocol_version,
-        default_max_name_len)
+        default_max_name_len,
+    )
 }

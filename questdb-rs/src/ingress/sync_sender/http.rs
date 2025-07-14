@@ -88,28 +88,37 @@ impl SyncHttpHandlerState {
                 let need_retry = is_retriable_status_code(status);
                 match body.read_to_vec() {
                     Ok(body) => (need_retry, Ok((status, headers, body))),
-                    Err(err) => (need_retry, Err(fmt!(
-                        ServerFlushError,
-                        "Could not read flush response, url: {}, err: {err}",
-                        &self.url
-                    )))
+                    Err(err) => (
+                        need_retry,
+                        Err(fmt!(
+                            ServerFlushError,
+                            "Could not read flush response, url: {}, err: {err}",
+                            &self.url
+                        )),
+                    ),
                 }
-            },
+            }
             Err(ureq::Error::StatusCode(code)) => {
-                let status = http::StatusCode::from_u16(code).unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
+                let status = http::StatusCode::from_u16(code)
+                    .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
                 let need_retry = is_retriable_status_code(status);
                 (need_retry, Ok((status, HeaderMap::new(), Vec::new())))
-            },
+            }
             Err(err) => {
                 let need_retry = matches!(
                     err,
-                    ureq::Error::Timeout(_) | ureq::Error::ConnectionFailed | ureq::Error::TooManyRedirects
+                    ureq::Error::Timeout(_)
+                        | ureq::Error::ConnectionFailed
+                        | ureq::Error::TooManyRedirects
                 );
-                (need_retry, Err(fmt!(
-                    ServerFlushError,
-                    "Could not flush, url: {}, err: {err}",
-                    &self.url
-                )))
+                (
+                    need_retry,
+                    Err(fmt!(
+                        ServerFlushError,
+                        "Could not flush, url: {}, err: {err}",
+                        &self.url
+                    )),
+                )
             }
         }
     }
@@ -289,7 +298,11 @@ fn parse_json_error(json: &serde_json::Value, msg: &str) -> Error {
     error::fmt!(ServerFlushError, "Could not flush buffer: {}", description)
 }
 
-pub(super) fn parse_http_error<P: AsRef<[u8]>>(status: StatusCode, headers: HeaderMap, body: P) -> Error {
+pub(super) fn parse_http_error<P: AsRef<[u8]>>(
+    status: StatusCode,
+    headers: HeaderMap,
+    body: P,
+) -> Error {
     let body = body.as_ref();
     let msg = match std::str::from_utf8(body) {
         Ok(body_str) => body_str,
@@ -322,7 +335,7 @@ pub(super) fn parse_http_error<P: AsRef<[u8]>>(status: StatusCode, headers: Head
                 "Could not flush buffer: HTTP endpoint authentication error: {msg} [code: {code}]"
             );
         }
-        _ => ()
+        _ => (),
     }
 
     let is_json = match headers.get("Content-Type") {
@@ -432,24 +445,25 @@ pub(crate) fn read_server_settings(
                     err
                 ))
             }
-        },
-        Err(ureq::Error::StatusCode(code)) => {
-            Ok((http::StatusCode::from_u16(code).unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR), Vec::new()))
         }
-        Err(err) => 
-            Err(fmt!(
-                ProtocolVersionError,
-                "Could not detect server's line protocol version, settings url: {}, err: {}",
-                settings_url,
-                err
-            ))
+        Err(ureq::Error::StatusCode(code)) => Ok((
+            http::StatusCode::from_u16(code).unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR),
+            Vec::new(),
+        )),
+        Err(err) => Err(fmt!(
+            ProtocolVersionError,
+            "Could not detect server's line protocol version, settings url: {}, err: {}",
+            settings_url,
+            err
+        )),
     };
 
     process_settings_response(
         response,
         settings_url,
         default_protocol_version,
-        default_max_name_len)
+        default_max_name_len,
+    )
 }
 
 #[allow(clippy::result_large_err)] // `ureq::Error` is large enough to cause this warning.

@@ -159,6 +159,6 @@ pub(super) async fn read_server_settings(
         response,
         settings_url.as_str(),
         default_protocol_version,
-        default_max_name_len
+        default_max_name_len,
     )
 }
