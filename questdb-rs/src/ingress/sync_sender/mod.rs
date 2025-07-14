@@ -193,22 +193,18 @@ impl Sender {
                     0.0f64
                 };
 
-                match http_send_with_retries(
+                let (status, headers, response) = http_send_with_retries(
                     state,
                     bytes,
                     *state.config.request_timeout + std::time::Duration::from_secs_f64(extra_time),
                     *state.config.retry_timeout,
-                ) {
-                    Ok(res) => {
-                        if res.status().is_client_error() || res.status().is_server_error() {
-                            Err(parse_http_error(res.status().as_u16(), res))
-                        } else {
-                            res.into_body();
-                            Ok(())
-                        }
-                    }
-                    Err(err) => Err(crate::error::Error::from_ureq_error(err, &state.url)),
+                )?;
+                
+                if status.is_client_error() || status.is_server_error() {
+                    return Err(parse_http_error(status, headers, response));
                 }
+
+                Ok(())
             }
         }
     }

@@ -25,7 +25,7 @@
 use crate::error::fmt;
 use crate::ingress::http_common::{is_retriable_status_code, process_settings_response};
 use crate::{error, Error};
-use http::StatusCode;
+use http::{HeaderMap, StatusCode};
 use rand::Rng;
 use rustls::{ClientConnection, StreamOwned};
 use rustls_pki_types::ServerName;
@@ -41,7 +41,7 @@ use ureq::unversioned::transport::{
 };
 
 use crate::ingress::conf::{HttpConfig, SETTINGS_RETRY_TIMEOUT};
-use crate::ingress::ProtocolVersion;
+use crate::ingress::{DebugBytes, ProtocolVersion};
 use ureq::unversioned::*;
 use ureq::{http, Body};
 
@@ -64,7 +64,7 @@ impl SyncHttpHandlerState {
         &self,
         buf: &[u8],
         request_timeout: Duration,
-    ) -> (bool, crate::error::Result<(StatusCode, Vec<u8>)>) {
+    ) -> (bool, crate::error::Result<(StatusCode, HeaderMap, Vec<u8>)>) {
         let request = self
             .agent
             .post(&self.url)
@@ -83,9 +83,11 @@ impl SyncHttpHandlerState {
         match response {
             Ok(response_body) => {
                 let status = response_body.status();
+                let (parts, mut body) = response_body.into_parts();
+                let headers = parts.headers;
                 let need_retry = is_retriable_status_code(status);
-                match response_body.into_body().read_to_vec() {
-                    Ok(body) => (need_retry, Ok((status, body))),
+                match body.read_to_vec() {
+                    Ok(body) => (need_retry, Ok((status, headers, body))),
                     Err(err) => (need_retry, Err(fmt!(
                         ServerFlushError,
                         "Could not read flush response, url: {}, err: {err}",
@@ -96,7 +98,7 @@ impl SyncHttpHandlerState {
             Err(ureq::Error::StatusCode(code)) => {
                 let status = http::StatusCode::from_u16(code).unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
                 let need_retry = is_retriable_status_code(status);
-                (need_retry, Ok((status, Vec::new())))
+                (need_retry, Ok((status, HeaderMap::new(), Vec::new())))
             },
             Err(err) => {
                 let need_retry = matches!(
@@ -287,69 +289,77 @@ fn parse_json_error(json: &serde_json::Value, msg: &str) -> Error {
     error::fmt!(ServerFlushError, "Could not flush buffer: {}", description)
 }
 
-pub(super) fn parse_http_error(http_status_code: u16, response: Response<Body>) -> Error {
-    let (head, body) = response.into_parts();
-    let body_content = body.into_with_config().lossy_utf8(true).read_to_string();
-    if http_status_code == 404 {
-        return error::fmt!(
-            HttpNotSupported,
-            "Could not flush buffer: HTTP endpoint does not support ILP."
-        );
-    } else if [401, 403].contains(&http_status_code) {
-        let description = match body_content {
-            Ok(msg) if !msg.is_empty() => format!(": {msg}"),
-            _ => "".to_string(),
-        };
-        return error::fmt!(
-            AuthError,
-            "Could not flush buffer: HTTP endpoint authentication error{} [code: {}]",
-            description,
-            http_status_code
-        );
+pub(super) fn parse_http_error<P: AsRef<[u8]>>(status: StatusCode, headers: HeaderMap, body: P) -> Error {
+    let body = body.as_ref();
+    let msg = match std::str::from_utf8(body) {
+        Ok(body_str) => body_str,
+        Err(utf8_error) => {
+            return fmt!(
+                ServerFlushError,
+                "Could not read the server's flush response as a string: {:?}: {utf8_error}",
+                DebugBytes(body)
+            );
+        }
+    };
+
+    let code = status.as_u16();
+    match (status.as_u16(), msg) {
+        (404, _) => {
+            return error::fmt!(
+                HttpNotSupported,
+                "Could not flush buffer: HTTP endpoint does not support ILP."
+            );
+        }
+        (401, "") | (403, "") => {
+            return error::fmt!(
+                AuthError,
+                "Could not flush buffer: HTTP endpoint authentication error [code: {code}]"
+            );
+        }
+        (401, msg) | (403, msg) => {
+            return error::fmt!(
+                AuthError,
+                "Could not flush buffer: HTTP endpoint authentication error: {msg} [code: {code}]"
+            );
+        }
+        _ => ()
     }
 
-    let is_json = match head.headers.get("Content-Type") {
+    let is_json = match headers.get("Content-Type") {
         Some(header_value) => match header_value.to_str() {
             Ok(s) => s.eq_ignore_ascii_case("application/json"),
             Err(_) => false,
         },
         None => false,
     };
-    match body_content {
-        Ok(msg) => {
-            let string_err = || error::fmt!(ServerFlushError, "Could not flush buffer: {}", msg);
 
-            if !is_json {
-                return string_err();
-            }
+    let string_err = || error::fmt!(ServerFlushError, "Could not flush buffer: {}", msg);
 
-            let json: serde_json::Value = match serde_json::from_str(&msg) {
-                Ok(json) => json,
-                Err(_) => {
-                    return string_err();
-                }
-            };
+    if !is_json {
+        return string_err();
+    }
 
-            if let Some(serde_json::Value::String(ref msg)) = json.get("message") {
-                parse_json_error(&json, msg)
-            } else {
-                string_err()
-            }
+    let json: serde_json::Value = match serde_json::from_str(&msg) {
+        Ok(json) => json,
+        Err(_) => {
+            return string_err();
         }
-        Err(err) => {
-            error::fmt!(SocketError, "Could not flush buffer: {}", err)
-        }
+    };
+
+    if let Some(serde_json::Value::String(ref msg)) = json.get("message") {
+        parse_json_error(&json, msg)
+    } else {
+        string_err()
     }
 }
 
-#[allow(clippy::result_large_err)] // `ureq::Error` is large enough to cause this warning.
 fn retry_http_send(
     state: &SyncHttpHandlerState,
     buf: &[u8],
     request_timeout: Duration,
     retry_timeout: Duration,
-    mut last_response: Result<Response<Body>, ureq::Error>,
-) -> Result<Response<Body>, ureq::Error> {
+    mut last_response: crate::error::Result<(StatusCode, HeaderMap, Vec<u8>)>,
+) -> crate::error::Result<(StatusCode, HeaderMap, Vec<u8>)> {
     let mut rng = rand::rng();
     let retry_end = std::time::Instant::now() + retry_timeout;
     let mut retry_interval_ms = 10;
@@ -362,11 +372,6 @@ fn retry_http_send(
             return last_response;
         }
         sleep(to_sleep);
-        if let Ok(last_response) = last_response {
-            // Actively consume the reader to return the connection to the connection pool.
-            // see https://github.com/algesten/ureq/issues/94
-            _ = last_response.into_body().read_to_vec();
-        }
         (need_retry, last_response) = state.send_request(buf, request_timeout);
         if !need_retry {
             return last_response;
@@ -381,7 +386,7 @@ pub(super) fn http_send_with_retries(
     buf: &[u8],
     request_timeout: Duration,
     retry_timeout: Duration,
-) -> Result<Response<Body>, ureq::Error> {
+) -> crate::error::Result<(StatusCode, HeaderMap, Vec<u8>)> {
     let (need_retry, last_response) = state.send_request(buf, request_timeout);
     if !need_retry || retry_timeout.is_zero() {
         return last_response;

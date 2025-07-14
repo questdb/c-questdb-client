@@ -26,14 +26,21 @@ use crate::ingress::{Buffer, Protocol, ProtocolVersion, SenderBuilder, Timestamp
 use crate::tests::mock::{certs_dir, HttpResponse, MockServer};
 use crate::tests::{assert_err_contains, TestResult, f64_to_bytes};
 use crate::ErrorCode;
-use rstest::rstest;
 use std::io;
 use std::io::ErrorKind;
 use std::time::Duration;
 
-#[rstest]
-fn test_two_lines(
-    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
+#[test]
+fn test_two_lines_v1() -> TestResult {
+    _test_two_lines(ProtocolVersion::V1)
+}
+
+#[test]
+fn test_two_lines_v2() -> TestResult {
+    _test_two_lines(ProtocolVersion::V2)
+}
+
+fn _test_two_lines(version: ProtocolVersion,
 ) -> TestResult {
     let mut server = MockServer::new()?;
     let mut sender = server.lsb_http().protocol_version(version)?.build()?;
@@ -77,9 +84,18 @@ fn test_two_lines(
     Ok(())
 }
 
-#[rstest]
-fn test_text_plain_error(
-    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
+#[test]
+fn test_text_plain_error_v1() -> TestResult {
+    _test_text_plain_error(ProtocolVersion::V1)
+}
+
+#[test]
+fn test_text_plain_error_v2() -> TestResult {
+    _test_text_plain_error(ProtocolVersion::V2)
+}
+
+fn _test_text_plain_error(
+    version: ProtocolVersion,
 ) -> TestResult {
     let mut server = MockServer::new()?;
     let mut sender = server.lsb_http().protocol_version(version)?.build()?;
@@ -120,9 +136,18 @@ fn test_text_plain_error(
     Ok(())
 }
 
-#[rstest]
-fn test_bad_json_error(
-    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
+#[test]
+fn test_bad_json_error_v1() -> TestResult {
+    _test_bad_json_error(ProtocolVersion::V1)
+}
+
+#[test]
+fn test_bad_json_error_v2() -> TestResult {
+    _test_bad_json_error(ProtocolVersion::V2)
+}
+
+fn _test_bad_json_error(
+    version: ProtocolVersion,
 ) -> TestResult {
     let mut server = MockServer::new()?;
     let mut sender = server.lsb_http().protocol_version(version)?.build()?;
@@ -168,9 +193,18 @@ fn test_bad_json_error(
     Ok(())
 }
 
-#[rstest]
-fn test_json_error(
-    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
+#[test]
+fn test_json_error_v1() -> TestResult {
+    _test_json_error(ProtocolVersion::V1)
+}
+
+#[test]
+fn test_json_error_v2() -> TestResult {
+    _test_json_error(ProtocolVersion::V2)
+}
+
+fn _test_json_error(
+    version: ProtocolVersion,
 ) -> TestResult {
     let mut server = MockServer::new()?;
     let mut sender = server.lsb_http().protocol_version(version)?.build()?;
@@ -214,9 +248,18 @@ fn test_json_error(
     Ok(())
 }
 
-#[rstest]
-fn test_no_connection(
-    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
+#[test]
+fn test_no_connection_v1() -> TestResult {
+    _test_no_connection(ProtocolVersion::V1)
+}
+
+#[test]
+fn test_no_connection_v2() -> TestResult {
+    _test_no_connection(ProtocolVersion::V2)
+}
+
+fn _test_no_connection(
+    version: ProtocolVersion,
 ) -> TestResult {
     let mut sender = SenderBuilder::new(Protocol::Http, "127.0.0.1", 1)
         .protocol_version(version)?
@@ -237,9 +280,18 @@ fn test_no_connection(
     Ok(())
 }
 
-#[rstest]
-fn test_old_server_without_ilp_http_support(
-    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
+#[test]
+fn test_old_server_without_ilp_http_support_v1() -> TestResult {
+    _test_old_server_without_ilp_http_support(ProtocolVersion::V1)
+}
+
+#[test]
+fn test_old_server_without_ilp_http_support_v2() -> TestResult {
+    _test_old_server_without_ilp_http_support(ProtocolVersion::V2)
+}
+
+fn _test_old_server_without_ilp_http_support(
+    version: ProtocolVersion,
 ) -> TestResult {
     let mut server = MockServer::new()?;
     let mut sender = server.lsb_http().protocol_version(version)?.build()?;
@@ -278,9 +330,18 @@ fn test_old_server_without_ilp_http_support(
     Ok(())
 }
 
-#[rstest]
-fn test_http_basic_auth(
-    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
+#[test]
+fn test_http_basic_auth_v1() -> TestResult {
+    _test_http_basic_auth(ProtocolVersion::V1)
+}
+
+#[test]
+fn test_http_basic_auth_v2() -> TestResult {
+    _test_http_basic_auth(ProtocolVersion::V2)
+}
+
+fn _test_http_basic_auth(
+    version: ProtocolVersion,
 ) -> TestResult {
     let mut server = MockServer::new()?;
     let mut sender = server
@@ -324,9 +385,18 @@ fn test_http_basic_auth(
     Ok(())
 }
 
-#[rstest]
-fn test_unauthenticated(
-    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
+#[test]
+fn test_unauthenticated_v1() -> TestResult {
+    _test_unauthenticated(ProtocolVersion::V1)
+}
+
+#[test]
+fn test_unauthenticated_v2() -> TestResult {
+    _test_unauthenticated(ProtocolVersion::V2)
+}
+
+fn _test_unauthenticated(
+    version: ProtocolVersion,
 ) -> TestResult {
     let mut server = MockServer::new()?;
     let mut sender = server.lsb_http().protocol_version(version)?.build()?;
@@ -366,9 +436,18 @@ fn test_unauthenticated(
     Ok(())
 }
 
-#[rstest]
-fn test_token_auth(
-    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
+#[test]
+fn test_token_auth_v1() -> TestResult {
+    _test_token_auth(ProtocolVersion::V1)
+}
+
+#[test]
+fn test_token_auth_v2() -> TestResult {
+    _test_token_auth(ProtocolVersion::V2)
+}
+
+fn _test_token_auth(
+    version: ProtocolVersion,
 ) -> TestResult {
     let mut server = MockServer::new()?;
     let mut sender = server
@@ -406,9 +485,18 @@ fn test_token_auth(
     Ok(())
 }
 
-#[rstest]
-fn test_request_timeout(
-    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
+#[test]
+fn test_request_timeout_v1() -> TestResult {
+    _test_request_timeout(ProtocolVersion::V1)
+}
+
+#[test]
+fn test_request_timeout_v2() -> TestResult {
+    _test_request_timeout(ProtocolVersion::V2)
+}
+
+fn _test_request_timeout(
+    version: ProtocolVersion,
 ) -> TestResult {
     let server = MockServer::new()?;
     let request_timeout = Duration::from_millis(50);
@@ -433,9 +521,18 @@ fn test_request_timeout(
     Ok(())
 }
 
-#[rstest]
-fn test_tls(
-    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
+#[test]
+fn test_tls_v1() -> TestResult {
+    _test_tls(ProtocolVersion::V1)
+}
+
+#[test]
+fn test_tls_v2() -> TestResult {
+    _test_tls(ProtocolVersion::V2)
+}
+
+fn _test_tls(
+    version: ProtocolVersion,
 ) -> TestResult {
     let mut ca_path = certs_dir();
     ca_path.push("server_rootCA.pem");
@@ -475,9 +572,18 @@ fn test_tls(
     Ok(())
 }
 
-#[rstest]
-fn test_user_agent(
-    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
+#[test]
+fn test_user_agent_v1() -> TestResult {
+    _test_user_agent(ProtocolVersion::V1)
+}
+
+#[test]
+fn test_user_agent_v2() -> TestResult {
+    _test_user_agent(ProtocolVersion::V2)
+}
+
+fn _test_user_agent(
+    version: ProtocolVersion,
 ) -> TestResult {
     let mut server = MockServer::new()?;
     let mut sender = server
@@ -513,9 +619,18 @@ fn test_user_agent(
     Ok(())
 }
 
-#[rstest]
-fn test_two_retries(
-    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
+#[test]
+fn test_two_retries_v1() -> TestResult {
+    _test_two_retries(ProtocolVersion::V1)
+}
+
+#[test]
+fn test_two_retries_v2() -> TestResult {
+    _test_two_retries(ProtocolVersion::V2)
+}
+
+fn _test_two_retries(
+    version: ProtocolVersion,
 ) -> TestResult {
     // Note: This also tests that the _same_ connection is being reused, i.e. tests keepalive.
     let mut server = MockServer::new()?;
@@ -577,10 +692,17 @@ fn test_two_retries(
     Ok(())
 }
 
-#[rstest]
-fn test_one_retry(
-    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
-) -> TestResult {
+#[test]
+fn test_one_retry_v1() -> TestResult {
+    _test_one_retry(ProtocolVersion::V1)
+}
+
+#[test]
+fn test_one_retry_v2() -> TestResult {
+    _test_one_retry(ProtocolVersion::V2)
+}
+
+fn _test_one_retry(version: ProtocolVersion) -> TestResult {
     let mut server = MockServer::new()?;
     let mut sender = server
         .lsb_http()
@@ -641,10 +763,17 @@ fn test_one_retry(
     Ok(())
 }
 
-#[rstest]
-fn test_transactional(
-    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
-) -> TestResult {
+#[test]
+fn test_transactional_v1() -> TestResult {
+    _test_transactional(ProtocolVersion::V1)
+}
+
+#[test]
+fn test_transactional_v2() -> TestResult {
+    _test_transactional(ProtocolVersion::V2)
+}
+
+fn _test_transactional(version: ProtocolVersion) -> TestResult {
     let mut server = MockServer::new()?;
     let mut sender = server.lsb_http().protocol_version(version)?.build()?;
     // A buffer with a two tables.

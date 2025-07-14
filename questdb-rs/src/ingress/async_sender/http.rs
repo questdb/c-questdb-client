@@ -105,7 +105,7 @@ impl HttpClient {
             if (Instant::now() + to_sleep) > retry_end {
                 return last_response;
             }
-            sleep(to_sleep);
+            sleep(to_sleep).await;
             (need_retry, last_response) = self.get(url, request_timeout).await;
             if !need_retry {
                 return last_response;

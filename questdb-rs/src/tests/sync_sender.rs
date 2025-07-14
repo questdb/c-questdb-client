@@ -49,16 +49,22 @@ use crate::tests::{
 };
 
 #[cfg(feature = "sync-sender-tcp")]
-use rstest::rstest;
-
-#[cfg(feature = "sync-sender-tcp")]
 use crate::ingress::{CertificateAuthority, ARRAY_BINARY_FORMAT_TYPE};
 
 #[cfg(feature = "sync-sender-tcp")]
-#[rstest]
-fn test_basics(
-    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
-) -> TestResult {
+#[test]
+fn test_basics_v1() -> TestResult {
+    _test_basics(ProtocolVersion::V1)
+}
+
+#[cfg(feature = "sync-sender-tcp")]
+#[test]
+fn test_basics_v2() -> TestResult {
+    _test_basics(ProtocolVersion::V2)
+}
+
+#[cfg(feature = "sync-sender-tcp")]
+fn _test_basics(version: ProtocolVersion) -> TestResult {
     use std::time::SystemTime;
 
     let mut server = MockServer::new()?;
@@ -235,10 +241,19 @@ fn test_array_f64_for_ndarray() -> TestResult {
 }
 
 #[cfg(feature = "sync-sender-tcp")]
-#[rstest]
-fn test_max_buf_size(
-    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
-) -> TestResult {
+#[test]
+fn test_max_buf_size_v1() -> TestResult {
+    _test_max_buf_size(ProtocolVersion::V1)
+}
+
+#[cfg(feature = "sync-sender-tcp")]
+#[test]
+fn test_max_buf_size_v2() -> TestResult {
+    _test_max_buf_size(ProtocolVersion::V2)
+}
+
+#[cfg(feature = "sync-sender-tcp")]
+fn _test_max_buf_size(version: ProtocolVersion) -> TestResult {
     let max = 1024;
     let mut server = MockServer::new()?;
     let mut sender = server
@@ -613,10 +628,17 @@ fn test_arr_column_name_too_long() -> TestResult {
 }
 
 #[cfg(feature = "sync-sender-tcp")]
-#[rstest]
-fn test_tls_with_file_ca(
-    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
-) -> TestResult {
+fn test_tls_with_file_ca_v1() -> TestResult {
+    _test_tls_with_file_ca(ProtocolVersion::V1)
+}
+
+#[cfg(feature = "sync-sender-tcp")]
+fn test_tls_with_file_ca_v2() -> TestResult {
+    _test_tls_with_file_ca(ProtocolVersion::V2)
+}
+
+#[cfg(feature = "sync-sender-tcp")]
+fn _test_tls_with_file_ca(version: ProtocolVersion) -> TestResult {
     let mut ca_path = certs_dir();
     ca_path.push("server_rootCA.pem");
 

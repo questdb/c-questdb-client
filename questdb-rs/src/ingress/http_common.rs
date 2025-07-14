@@ -138,7 +138,7 @@ pub(crate) fn process_settings_response<P: AsRef<[u8]>>(
     let body_str = std::str::from_utf8(body)
         .map_err(|utf8_error| fmt!(
             ProtocolVersionError,
-            "Could not read the server's response as a string: {:?}: {utf8_error}",
+            "Could not read the server's /settings response as a string: {:?}: {utf8_error}",
             DebugBytes(body)
         ))?;
 
