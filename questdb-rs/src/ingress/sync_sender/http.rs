@@ -64,7 +64,7 @@ impl SyncHttpHandlerState {
         &self,
         buf: &[u8],
         request_timeout: Duration,
-    ) -> (bool, crate::error::Result<(StatusCode, HeaderMap, Vec<u8>)>) {
+    ) -> (bool, error::Result<(StatusCode, HeaderMap, Vec<u8>)>) {
         let request = self
             .agent
             .post(&self.url)
@@ -91,16 +91,16 @@ impl SyncHttpHandlerState {
                     Err(err) => (
                         need_retry,
                         Err(fmt!(
-                            ServerFlushError,
-                            "Could not read flush response, url: {}, err: {err}",
+                            SocketError,
+                            "Could not flush buffer: {}: {err}",
                             &self.url
                         )),
                     ),
                 }
             }
             Err(ureq::Error::StatusCode(code)) => {
-                let status = http::StatusCode::from_u16(code)
-                    .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
+                let status = StatusCode::from_u16(code)
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 let need_retry = is_retriable_status_code(status);
                 (need_retry, Ok((status, HeaderMap::new(), Vec::new())))
             }
@@ -114,8 +114,8 @@ impl SyncHttpHandlerState {
                 (
                     need_retry,
                     Err(fmt!(
-                        ServerFlushError,
-                        "Could not flush, url: {}, err: {err}",
+                        SocketError,
+                        "Could not flush buffer: {}: {err}",
                         &self.url
                     )),
                 )
@@ -399,7 +399,7 @@ pub(super) fn http_send_with_retries(
     buf: &[u8],
     request_timeout: Duration,
     retry_timeout: Duration,
-) -> crate::error::Result<(StatusCode, HeaderMap, Vec<u8>)> {
+) -> error::Result<(StatusCode, HeaderMap, Vec<u8>)> {
     let (need_retry, last_response) = state.send_request(buf, request_timeout);
     if !need_retry || retry_timeout.is_zero() {
         return last_response;

@@ -801,7 +801,6 @@ fn _test_transactional(version: ProtocolVersion) -> TestResult {
 
     Ok(())
 }
-
 fn _test_sender_auto_detect_protocol_version(
     supported_versions: Option<Vec<u16>>,
     expect_version: ProtocolVersion,
