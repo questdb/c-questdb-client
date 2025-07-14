@@ -73,6 +73,7 @@ mod async_sender;
 
 #[cfg(feature = "_async-sender")]
 pub use async_sender::*;
+use crate::ingress::http_common::pick_protocol_version;
 
 const MAX_NAME_LEN_DEFAULT: usize = 127;
 
@@ -1181,16 +1182,7 @@ impl SenderBuilder {
                         let (protocol_versions, server_max_name_len) =
                             read_server_settings(http_state, settings_url, max_name_len)?;
                         max_name_len = server_max_name_len;
-                        if protocol_versions.contains(&ProtocolVersion::V2) {
-                            ProtocolVersion::V2
-                        } else if protocol_versions.contains(&ProtocolVersion::V1) {
-                            ProtocolVersion::V1
-                        } else {
-                            return Err(fmt!(
-                                ProtocolVersionError,
-                                "Server does not support current client"
-                            ));
-                        }
+                        pick_protocol_version(&protocol_versions[..])?
                     } else {
                         unreachable!("HTTP handler should be used for HTTP protocol");
                     }

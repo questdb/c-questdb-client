@@ -24,8 +24,9 @@
 
 use crate::error::Result;
 use crate::ingress::DebugBytes;
-use crate::{fmt, ingress::ProtocolVersion};
-use http::StatusCode;
+use crate::{fmt, ingress::ProtocolVersion, Error};
+use std::fmt::Write;
+use http::{HeaderMap, StatusCode};
 
 pub(crate) fn is_retriable_status_code(status: http::status::StatusCode) -> bool {
     status.is_server_error()
@@ -107,6 +108,13 @@ fn parse_server_settings(
     Ok((support_versions, max_name_length))
 }
 
+pub(crate) fn pick_protocol_version(server_versions: &[ProtocolVersion]) -> Result<ProtocolVersion> {
+    [ProtocolVersion::V2, ProtocolVersion::V1]
+        .into_iter()
+        .find(|v| server_versions.contains(v))
+        .ok_or_else(|| fmt!(ProtocolVersionError, "Server does not support current client"))
+}
+
 pub(crate) fn process_settings_response<P: AsRef<[u8]>>(
     response: Result<(StatusCode, P)>,
     settings_url: &str,
@@ -148,4 +156,113 @@ pub(crate) fn process_settings_response<P: AsRef<[u8]>>(
         default_protocol_version,
         default_max_name_len,
     )
+}
+
+fn parse_json_error(json: &serde_json::Value, msg: &str) -> Error {
+    let mut description = msg.to_string();
+    fmt!(ServerFlushError, "Could not flush buffer: {}", msg);
+
+    let error_id = json.get("errorId").and_then(|v| v.as_str());
+    let code = json.get("code").and_then(|v| v.as_str());
+    let line = json.get("line").and_then(|v| v.as_i64());
+
+    let mut printed_detail = false;
+    if error_id.is_some() || code.is_some() || line.is_some() {
+        description.push_str(" [");
+
+        if let Some(error_id) = error_id {
+            description.push_str("id: ");
+            description.push_str(error_id);
+            printed_detail = true;
+        }
+
+        if let Some(code) = code {
+            if printed_detail {
+                description.push_str(", ");
+            }
+            description.push_str("code: ");
+            description.push_str(code);
+            printed_detail = true;
+        }
+
+        if let Some(line) = line {
+            if printed_detail {
+                description.push_str(", ");
+            }
+            description.push_str("line: ");
+            write!(description, "{line}").unwrap();
+        }
+
+        description.push(']');
+    }
+
+    fmt!(ServerFlushError, "Could not flush buffer: {}", description)
+}
+
+pub(crate) fn parse_http_error<P: AsRef<[u8]>>(
+    status: StatusCode,
+    headers: HeaderMap,
+    body: P,
+) -> Error {
+    let body = body.as_ref();
+    let msg = match std::str::from_utf8(body) {
+        Ok(body_str) => body_str,
+        Err(utf8_error) => {
+            return fmt!(
+                ServerFlushError,
+                "Could not read the server's flush response as a string: {:?}: {utf8_error}",
+                DebugBytes(body)
+            );
+        }
+    };
+
+    let code = status.as_u16();
+    match (status.as_u16(), msg) {
+        (404, _) => {
+            return fmt!(
+                HttpNotSupported,
+                "Could not flush buffer: HTTP endpoint does not support ILP."
+            );
+        }
+        (401, "") | (403, "") => {
+            return fmt!(
+                AuthError,
+                "Could not flush buffer: HTTP endpoint authentication error [code: {code}]"
+            );
+        }
+        (401, msg) | (403, msg) => {
+            return fmt!(
+                AuthError,
+                "Could not flush buffer: HTTP endpoint authentication error: {msg} [code: {code}]"
+            );
+        }
+        _ => (),
+    }
+
+    let is_json = match headers.get("Content-Type") {
+        Some(header_value) => match header_value.to_str() {
+            Ok(s) => s.eq_ignore_ascii_case("application/json"),
+            Err(_) => false,
+        },
+        None => false,
+    };
+
+    let string_err = || fmt!(ServerFlushError, "Could not flush buffer: {}", msg);
+
+    if !is_json {
+        return string_err();
+    }
+
+    let json: serde_json::Value = match serde_json::from_str(&msg) {
+        Ok(json) => json,
+        Err(_) => {
+            return string_err();
+        }
+    };
+
+    if let Some(serde_json::Value::String(ref msg)) = json.get("message") {
+        parse_json_error(&json, msg)
+    } else {
+        string_err()
+    }
 }

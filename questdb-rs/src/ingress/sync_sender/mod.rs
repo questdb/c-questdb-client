@@ -43,6 +43,7 @@ mod http;
 
 #[cfg(feature = "sync-sender-http")]
 pub(crate) use http::*;
+use crate::ingress::http_common::parse_http_error;
 
 pub(crate) enum SyncProtocolHandler {
     #[cfg(feature = "sync-sender-tcp")]
@@ -60,6 +61,8 @@ pub(crate) enum SyncProtocolHandler {
 pub struct Sender {
     descr: String,
     handler: SyncProtocolHandler,
+
+    #[cfg(feature = "sync-sender-tcp")]
     connected: bool,
     max_buf_size: usize,
     protocol_version: ProtocolVersion,
@@ -83,7 +86,10 @@ impl Sender {
         Self {
             descr,
             handler,
+
+            #[cfg(feature = "sync-sender-tcp")]
             connected: true,
+
             max_buf_size,
             protocol_version,
             max_name_len,
@@ -135,6 +141,8 @@ impl Sender {
 
     #[allow(unused_variables)]
     fn flush_impl(&mut self, buf: &Buffer, transactional: bool) -> Result<()> {
+
+        #[cfg(feature = "sync-sender-tcp")]
         if !self.connected {
             return Err(error::fmt!(
                 SocketError,

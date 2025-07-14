@@ -125,7 +125,6 @@ pub mod json_tests {
             use crate::tests::{TestResult};
             use base64ct::Base64;
             use base64ct::Encoding;
-            use rstest::rstest;
 
             fn matches_any_line(line: &[u8], expected: &[&str]) -> bool {
                 for &exp in expected {
@@ -144,12 +143,42 @@ pub mod json_tests {
             // for line in serde_json::to_string_pretty(&spec).unwrap().split("\n") {
             //     writeln!(output, "/// {}", line)?;
             // }
-            writeln!(output, "#[rstest]")?;
+            let test_name_slug = slugify!(&spec.test_name, separator = "_");
+            writeln!(output, "#[test]")?;
             writeln!(
                 output,
-                "fn test_{:03}_{}(\n    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,\n) -> TestResult {{",
+                "fn test_{:03}_{}_v1() -> TestResult {{",
                 index,
-                slugify!(&spec.test_name, separator = "_")
+                test_name_slug
+            )?;
+            writeln!(
+                output,
+                "    _test_{:03}_{}(ProtocolVersion::V1)\n",
+                index,
+                test_name_slug
+            )?;
+            writeln!(output, "}}");
+
+            writeln!(output, "#[test]")?;
+            writeln!(
+                output,
+                "fn test_{:03}_{}_v2() -> TestResult {{",
+                index,
+                test_name_slug
+            )?;
+            writeln!(
+                output,
+                "    _test_{:03}_{}(ProtocolVersion::V2)\n",
+                index,
+                test_name_slug
+            )?;
+            writeln!(output, "}}");
+
+            writeln!(
+                output,
+                "fn _test_{:03}_{}(version: ProtocolVersion) -> TestResult {{",
+                index,
+                test_name_slug
             )?;
             writeln!(output, "    let mut buffer = Buffer::new(version);")?;
 

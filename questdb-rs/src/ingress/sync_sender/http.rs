@@ -247,122 +247,13 @@ impl Transport for TlsTransport {
     }
 }
 
-fn need_retry(res: Result<http::status::StatusCode, &ureq::Error>) -> bool {
+fn need_retry(res: Result<StatusCode, &ureq::Error>) -> bool {
     match res {
         Ok(status) => is_retriable_status_code(status),
         Err(err) => matches!(
             err,
             ureq::Error::Timeout(_) | ureq::Error::ConnectionFailed | ureq::Error::TooManyRedirects
         ),
-    }
-}
-
-fn parse_json_error(json: &serde_json::Value, msg: &str) -> Error {
-    let mut description = msg.to_string();
-    error::fmt!(ServerFlushError, "Could not flush buffer: {}", msg);
-
-    let error_id = json.get("errorId").and_then(|v| v.as_str());
-    let code = json.get("code").and_then(|v| v.as_str());
-    let line = json.get("line").and_then(|v| v.as_i64());
-
-    let mut printed_detail = false;
-    if error_id.is_some() || code.is_some() || line.is_some() {
-        description.push_str(" [");
-
-        if let Some(error_id) = error_id {
-            description.push_str("id: ");
-            description.push_str(error_id);
-            printed_detail = true;
-        }
-
-        if let Some(code) = code {
-            if printed_detail {
-                description.push_str(", ");
-            }
-            description.push_str("code: ");
-            description.push_str(code);
-            printed_detail = true;
-        }
-
-        if let Some(line) = line {
-            if printed_detail {
-                description.push_str(", ");
-            }
-            description.push_str("line: ");
-            write!(description, "{line}").unwrap();
-        }
-
-        description.push(']');
-    }
-
-    error::fmt!(ServerFlushError, "Could not flush buffer: {}", description)
-}
-
-pub(super) fn parse_http_error<P: AsRef<[u8]>>(
-    status: StatusCode,
-    headers: HeaderMap,
-    body: P,
-) -> Error {
-    let body = body.as_ref();
-    let msg = match std::str::from_utf8(body) {
-        Ok(body_str) => body_str,
-        Err(utf8_error) => {
-            return fmt!(
-                ServerFlushError,
-                "Could not read the server's flush response as a string: {:?}: {utf8_error}",
-                DebugBytes(body)
-            );
-        }
-    };
-
-    let code = status.as_u16();
-    match (status.as_u16(), msg) {
-        (404, _) => {
-            return error::fmt!(
-                HttpNotSupported,
-                "Could not flush buffer: HTTP endpoint does not support ILP."
-            );
-        }
-        (401, "") | (403, "") => {
-            return error::fmt!(
-                AuthError,
-                "Could not flush buffer: HTTP endpoint authentication error [code: {code}]"
-            );
-        }
-        (401, msg) | (403, msg) => {
-            return error::fmt!(
-                AuthError,
-                "Could not flush buffer: HTTP endpoint authentication error: {msg} [code: {code}]"
-            );
-        }
-        _ => (),
-    }
-
-    let is_json = match headers.get("Content-Type") {
-        Some(header_value) => match header_value.to_str() {
-            Ok(s) => s.eq_ignore_ascii_case("application/json"),
-            Err(_) => false,
-        },
-        None => false,
-    };
-
-    let string_err = || error::fmt!(ServerFlushError, "Could not flush buffer: {}", msg);
-
-    if !is_json {
-        return string_err();
-    }
-
-    let json: serde_json::Value = match serde_json::from_str(&msg) {
-        Ok(json) => json,
-        Err(_) => {
-            return string_err();
-        }
-    };
-
-    if let Some(serde_json::Value::String(ref msg)) = json.get("message") {
-        parse_json_error(&json, msg)
-    } else {
-        string_err()
     }
 }
 
@@ -419,7 +310,7 @@ pub(crate) fn read_server_settings(
     state: &SyncHttpHandlerState,
     settings_url: &str,
     default_max_name_len: usize,
-) -> crate::error::Result<(Vec<ProtocolVersion>, usize)> {
+) -> error::Result<(Vec<ProtocolVersion>, usize)> {
     let default_protocol_version = ProtocolVersion::V1;
 
     let response = http_get_with_retries(
@@ -447,7 +338,7 @@ pub(crate) fn read_server_settings(
             }
         }
         Err(ureq::Error::StatusCode(code)) => Ok((
-            http::StatusCode::from_u16(code).unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR),
+            StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
             Vec::new(),
         )),
         Err(err) => Err(fmt!(

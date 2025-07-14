@@ -742,11 +742,22 @@ fn test_plain_to_tls_server() -> TestResult {
     Ok(())
 }
 
+#[test]
 #[cfg(feature = "insecure-skip-verify")]
-#[rstest]
-fn test_tls_insecure_skip_verify(
-    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
+fn test_tls_insecure_skip_verify_v1(
 ) -> TestResult {
+    _test_tls_insecure_skip_verify(ProtocolVersion::V1)
+}
+
+#[test]
+#[cfg(feature = "insecure-skip-verify")]
+fn test_tls_insecure_skip_verify_v2(
+) -> TestResult {
+    _test_tls_insecure_skip_verify(ProtocolVersion::V2)
+}
+
+#[cfg(feature = "insecure-skip-verify")]
+fn _test_tls_insecure_skip_verify(version: ProtocolVersion) -> TestResult {
     let server = MockServer::new()?;
     let lsb = server
         .lsb_tcps()

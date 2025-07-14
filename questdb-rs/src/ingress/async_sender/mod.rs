@@ -36,6 +36,7 @@ use lasso::{Spur, ThreadedRodeo};
 use std::fmt::{Debug, Display};
 use std::ops::Deref;
 use std::sync::Arc;
+use crate::ingress::http_common::pick_protocol_version;
 
 mod http;
 
@@ -291,7 +292,7 @@ impl AsyncSender {
         max_concurrent_connections: Option<u16>,
         max_buffer_capacity_keep: Option<usize>,
     ) -> Result<Arc<Self>> {
-        let settings = AsyncSenderSettings {
+        let mut settings = AsyncSenderSettings {
             max_concurrent_connections: max_concurrent_connections.unwrap_or(16),
             max_buffer_capacity_keep: max_buffer_capacity_keep.unwrap_or(8 * 1024 * 1024),
             max_name_len, // TODO: sniff and overwrite.
@@ -300,13 +301,16 @@ impl AsyncSender {
 
         let settings_url = build_url(tls.is_some(), host, port, "settings")?;
         let client = HttpClient::new(tls, auth)?;
-        let server_settings = read_server_settings(
+        let (protocol_versions, max_name_len) = read_server_settings(
             &client,
             &settings_url,
             max_name_len,
             *http_config.request_timeout.deref(),
         )
         .await?;
+
+        settings.protocol_version = pick_protocol_version(&protocol_versions[..])?;
+        settings.max_name_len = max_name_len;
 
         let buffer_pool = ArrayQueue::new((settings.max_concurrent_connections as usize) * 3 / 2);
         Ok(Arc::new(Self {
@@ -335,7 +339,7 @@ impl AsyncSender {
         })
     }
 
-    async fn flush_buffer(&self, _buffer: Buffer) -> (Buffer, Result<()>) {
+    async fn flush_buffer(&self, buffer: Buffer) -> (Buffer, Result<()>) {
         todo!()
     }
 }
