@@ -24,17 +24,16 @@
 use std::future::Future;
 use std::time::Duration;
 
-use crate::error::{fmt, Error, Result};
+use crate::error::{fmt, Result};
 use crate::ingress::conf::SETTINGS_RETRY_TIMEOUT;
 use crate::ingress::http_common::{
     is_retriable_status_code, process_settings_response, ParsedResponseHeaders,
 };
 use crate::ingress::tls::TlsSettings;
-use crate::ingress::{Buffer, ProtocolVersion};
+use crate::ingress::ProtocolVersion;
 use bytes::Bytes;
 use rand::Rng;
 use reqwest::{Body, Certificate, Client, RequestBuilder, StatusCode, Url};
-use tokio::io::AsyncRead;
 use tokio::time::{sleep, Instant};
 
 pub(super) struct HttpClient {

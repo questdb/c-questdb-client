@@ -1051,7 +1051,7 @@ impl SenderBuilder {
         let auth = self.build_auth()?;
         let auth = conf::auth_params_to_header_string(&auth)?;
 
-        let http_config = self.http.as_ref().unwrap();
+        let http_config = self.http.unwrap();
 
         AsyncSender::new(
             descr,
@@ -1063,8 +1063,6 @@ impl SenderBuilder {
             *self.max_buf_size.deref(),
             *self.protocol_version.deref(),
             http_config,
-            None, // TODO,
-            None, // TODO
         )
         .await
     }

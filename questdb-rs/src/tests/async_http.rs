@@ -69,12 +69,12 @@ async fn _test_sender_auto_detect_protocol_version(
     let mut sender = sender_builder.build_async().await?;
     // assert_eq!(sender.protocol_version(), expect_version);
     // assert_eq!(sender.max_name_len(), expect_max_name_len);
-    let mut txn = sender.new_transaction("test")?;
-    txn.row()?
+    let mut buf = sender.new_buffer();
+    buf.table("test")?
         .symbol("t1", "v1")?
         .column_f64("f1", 0.5)?
         .at(TimestampNanos::new(10000000))?;
-    txn.commit().await?;
+    sender.flush(buf, true).await?;
     _ = server_thread.join().unwrap()?;
     Ok(())
 }
