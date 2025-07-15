@@ -33,8 +33,12 @@ use crate::ingress::tls::TlsSettings;
 use crate::ingress::ProtocolVersion;
 use bytes::Bytes;
 use rand::Rng;
-use reqwest::{Body, Certificate, Client, RequestBuilder, StatusCode, Url};
+use reqwest::{Client, RequestBuilder, StatusCode, Url};
 use tokio::time::{sleep, Instant};
+
+// TODO:
+//  * Implement Auth.
+//  * Implement TLS.
 
 pub(super) struct HttpClient {
     tls: Option<TlsSettings>,

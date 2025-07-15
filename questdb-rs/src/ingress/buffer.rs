@@ -520,6 +520,10 @@ pub struct FrozenBuffer {
     inner: BufferInner<Bytes>,
 }
 
+// TODO:
+// * Document APIs.
+// * Implement FrozenBuffer -> Buffer "try" logic.
+// * Document example with buffer pool.
 impl FrozenBuffer {
     pub fn transactional(&self) -> bool {
         self.inner.state.transactional

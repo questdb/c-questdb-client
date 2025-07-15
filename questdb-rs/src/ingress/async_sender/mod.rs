@@ -31,7 +31,6 @@ use crate::ingress::{
     check_protocol_version, Buffer, FrozenBuffer, NdArrayView, ProtocolVersion, SenderBuilder,
 };
 use reqwest::Url;
-use std::fmt::Display;
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -113,6 +112,8 @@ impl AsyncSender {
     }
 
     async fn flush_impl(&self, buf: impl Into<FrozenBuffer>, transactional: bool) -> Result<()> {
+        // TODO: refactor more of the impl into the `http_common` module.
+
         let buf = buf.into();
         buf.check_can_flush()?;
 
