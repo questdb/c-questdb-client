@@ -23,7 +23,9 @@
  ******************************************************************************/
 
 use crate::error::fmt;
-use crate::ingress::http_common::{is_retriable_status_code, process_settings_response};
+use crate::ingress::http_common::{
+    is_retriable_status_code, process_settings_response, ParsedResponseHeaders,
+};
 use crate::{error, Error};
 use http::{HeaderMap, StatusCode};
 use rand::Rng;
@@ -64,7 +66,10 @@ impl SyncHttpHandlerState {
         &self,
         buf: &[u8],
         request_timeout: Duration,
-    ) -> (bool, error::Result<(StatusCode, HeaderMap, Vec<u8>)>) {
+    ) -> (
+        bool,
+        error::Result<(StatusCode, ParsedResponseHeaders, Vec<u8>)>,
+    ) {
         let request = self
             .agent
             .post(&self.url)
@@ -85,9 +90,10 @@ impl SyncHttpHandlerState {
                 let status = response_body.status();
                 let (parts, mut body) = response_body.into_parts();
                 let headers = parts.headers;
+                let header_data = ParsedResponseHeaders::parse(&headers);
                 let need_retry = is_retriable_status_code(status);
                 match body.read_to_vec() {
-                    Ok(body) => (need_retry, Ok((status, headers, body))),
+                    Ok(body) => (need_retry, Ok((status, header_data, body))),
                     Err(err) => (
                         need_retry,
                         Err(fmt!(
@@ -99,10 +105,13 @@ impl SyncHttpHandlerState {
                 }
             }
             Err(ureq::Error::StatusCode(code)) => {
-                let status = StatusCode::from_u16(code)
-                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                let status =
+                    StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 let need_retry = is_retriable_status_code(status);
-                (need_retry, Ok((status, HeaderMap::new(), Vec::new())))
+                (
+                    need_retry,
+                    Ok((status, ParsedResponseHeaders::default(), Vec::new())),
+                )
             }
             Err(err) => {
                 let need_retry = matches!(
@@ -262,8 +271,8 @@ fn retry_http_send(
     buf: &[u8],
     request_timeout: Duration,
     retry_timeout: Duration,
-    mut last_response: crate::error::Result<(StatusCode, HeaderMap, Vec<u8>)>,
-) -> crate::error::Result<(StatusCode, HeaderMap, Vec<u8>)> {
+    mut last_response: error::Result<(StatusCode, ParsedResponseHeaders, Vec<u8>)>,
+) -> error::Result<(StatusCode, ParsedResponseHeaders, Vec<u8>)> {
     let mut rng = rand::rng();
     let retry_end = std::time::Instant::now() + retry_timeout;
     let mut retry_interval_ms = 10;
@@ -290,7 +299,7 @@ pub(super) fn http_send_with_retries(
     buf: &[u8],
     request_timeout: Duration,
     retry_timeout: Duration,
-) -> error::Result<(StatusCode, HeaderMap, Vec<u8>)> {
+) -> error::Result<(StatusCode, ParsedResponseHeaders, Vec<u8>)> {
     let (need_retry, last_response) = state.send_request(buf, request_timeout);
     if !need_retry || retry_timeout.is_zero() {
         return last_response;
@@ -324,10 +333,11 @@ pub(crate) fn read_server_settings(
     let response = match response {
         Ok(response) => {
             let status = response.status();
+            let header_data = ParsedResponseHeaders::parse(response.headers());
             match response.into_body().read_to_vec() {
-                Ok(body) => Ok((status, body)),
+                Ok(body) => Ok((status, header_data, body)),
                 Err(_) if status.as_u16() == 404 =>
-                    Ok((status, Vec::new())),
+                    Ok((status, header_data, Vec::new())),
                 Err(err) => Err(fmt!(
                     ProtocolVersionError,
                     "Could not detect server's line protocol version, settings url: {}, status code: {}, err: {}",
@@ -339,6 +349,7 @@ pub(crate) fn read_server_settings(
         }
         Err(ureq::Error::StatusCode(code)) => Ok((
             StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            ParsedResponseHeaders::default(),
             Vec::new(),
         )),
         Err(err) => Err(fmt!(

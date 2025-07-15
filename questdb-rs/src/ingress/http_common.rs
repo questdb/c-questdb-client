@@ -25,10 +25,10 @@
 use crate::error::Result;
 use crate::ingress::DebugBytes;
 use crate::{fmt, ingress::ProtocolVersion, Error};
-use std::fmt::Write;
 use http::{HeaderMap, StatusCode};
+use std::fmt::Write;
 
-pub(crate) fn is_retriable_status_code(status: http::status::StatusCode) -> bool {
+pub(crate) fn is_retriable_status_code(status: StatusCode) -> bool {
     status.is_server_error()
         && matches!(
             status.as_u16(),
@@ -108,21 +108,28 @@ fn parse_server_settings(
     Ok((support_versions, max_name_length))
 }
 
-pub(crate) fn pick_protocol_version(server_versions: &[ProtocolVersion]) -> Result<ProtocolVersion> {
+pub(crate) fn pick_protocol_version(
+    server_versions: &[ProtocolVersion],
+) -> Result<ProtocolVersion> {
     [ProtocolVersion::V2, ProtocolVersion::V1]
         .into_iter()
         .find(|v| server_versions.contains(v))
-        .ok_or_else(|| fmt!(ProtocolVersionError, "Server does not support current client"))
+        .ok_or_else(|| {
+            fmt!(
+                ProtocolVersionError,
+                "Server does not support current client"
+            )
+        })
 }
 
 pub(crate) fn process_settings_response<P: AsRef<[u8]>>(
-    response: Result<(StatusCode, P)>,
+    response: Result<(StatusCode, ParsedResponseHeaders, P)>,
     settings_url: &str,
     default_protocol_version: ProtocolVersion,
     default_max_name_len: usize,
 ) -> Result<(Vec<ProtocolVersion>, usize)> {
     let body = match &response {
-        Ok((status, body)) => {
+        Ok((status, _header_data, body)) => {
             if status.is_client_error() || status.is_server_error() {
                 if status.as_u16() == 404 {
                     return Ok((vec![default_protocol_version], default_max_name_len));
@@ -199,9 +206,27 @@ fn parse_json_error(json: &serde_json::Value, msg: &str) -> Error {
     fmt!(ServerFlushError, "Could not flush buffer: {}", description)
 }
 
+/// Pre-parsed header data fields.
+/// Preparsing avoids copying/allocating a heavier `http::header::map::HeaderMap` object.
+#[derive(Debug, Default)]
+pub(crate) struct ParsedResponseHeaders {
+    /// "Content-Type" was "application/json"
+    json_content_type: bool,
+}
+
+impl ParsedResponseHeaders {
+    pub fn parse(headers: &HeaderMap) -> Self {
+        let json_content_type = headers
+            .get("Content-Type")
+            .and_then(|ct| ct.to_str().ok())
+            .is_some_and(|ct| ct.eq_ignore_ascii_case("application/json"));
+        Self { json_content_type }
+    }
+}
+
 pub(crate) fn parse_http_error<P: AsRef<[u8]>>(
     status: StatusCode,
-    headers: HeaderMap,
+    header: ParsedResponseHeaders,
     body: P,
 ) -> Error {
     let body = body.as_ref();
@@ -239,17 +264,9 @@ pub(crate) fn parse_http_error<P: AsRef<[u8]>>(
         _ => (),
     }
 
-    let is_json = match headers.get("Content-Type") {
-        Some(header_value) => match header_value.to_str() {
-            Ok(s) => s.eq_ignore_ascii_case("application/json"),
-            Err(_) => false,
-        },
-        None => false,
-    };
-
     let string_err = || fmt!(ServerFlushError, "Could not flush buffer: {}", msg);
 
-    if !is_json {
+    if !header.json_content_type {
         return string_err();
     }
 

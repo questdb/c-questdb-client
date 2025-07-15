@@ -744,15 +744,13 @@ fn test_plain_to_tls_server() -> TestResult {
 
 #[test]
 #[cfg(feature = "insecure-skip-verify")]
-fn test_tls_insecure_skip_verify_v1(
-) -> TestResult {
+fn test_tls_insecure_skip_verify_v1() -> TestResult {
     _test_tls_insecure_skip_verify(ProtocolVersion::V1)
 }
 
 #[test]
 #[cfg(feature = "insecure-skip-verify")]
-fn test_tls_insecure_skip_verify_v2(
-) -> TestResult {
+fn test_tls_insecure_skip_verify_v2() -> TestResult {
     _test_tls_insecure_skip_verify(ProtocolVersion::V2)
 }
 

@@ -23,7 +23,7 @@
  ******************************************************************************/
 
 use crate::error::{self, Result};
-use crate::ingress::{Buffer, ProtocolVersion, SenderBuilder};
+use crate::ingress::{check_protocol_version, Buffer, ProtocolVersion, SenderBuilder};
 use std::fmt::{Debug, Formatter};
 
 #[cfg(feature = "sync-sender-tcp")]
@@ -41,9 +41,9 @@ use crate::ingress::map_io_to_socket_err;
 #[cfg(feature = "sync-sender-http")]
 mod http;
 
+use crate::ingress::http_common::parse_http_error;
 #[cfg(feature = "sync-sender-http")]
 pub(crate) use http::*;
-use crate::ingress::http_common::parse_http_error;
 
 pub(crate) enum SyncProtocolHandler {
     #[cfg(feature = "sync-sender-tcp")]
@@ -141,7 +141,6 @@ impl Sender {
 
     #[allow(unused_variables)]
     fn flush_impl(&mut self, buf: &Buffer, transactional: bool) -> Result<()> {
-
         #[cfg(feature = "sync-sender-tcp")]
         if !self.connected {
             return Err(error::fmt!(
@@ -160,7 +159,7 @@ impl Sender {
             ));
         }
 
-        self.check_protocol_version(buf.protocol_version())?;
+        check_protocol_version(self.protocol_version, buf.protocol_version())?;
 
         let bytes = buf.as_bytes();
         if bytes.is_empty() {
@@ -201,7 +200,7 @@ impl Sender {
                     0.0f64
                 };
 
-                let (status, headers, response) = http_send_with_retries(
+                let (status, header_data, response) = http_send_with_retries(
                     state,
                     bytes,
                     *state.config.request_timeout + std::time::Duration::from_secs_f64(extra_time),
@@ -209,7 +208,7 @@ impl Sender {
                 )?;
 
                 if status.is_client_error() || status.is_server_error() {
-                    return Err(parse_http_error(status, headers, response));
+                    return Err(parse_http_error(status, header_data, response));
                 }
 
                 Ok(())
@@ -300,19 +299,5 @@ impl Sender {
     /// `server.conf` which defaults to 127.
     pub fn max_name_len(&self) -> usize {
         self.max_name_len
-    }
-
-    #[inline(always)]
-    fn check_protocol_version(&self, version: ProtocolVersion) -> Result<()> {
-        if self.protocol_version != version {
-            return Err(error::fmt!(
-                ProtocolVersionError,
-                "Attempting to send with protocol version {} \
-                but the sender is configured to use protocol version {}",
-                version,
-                self.protocol_version
-            ));
-        }
-        Ok(())
     }
 }

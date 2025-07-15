@@ -24,19 +24,19 @@
 use crate::error::Result;
 use crate::ingress::async_sender::http::{build_url, read_server_settings, HttpClient};
 use crate::ingress::conf::{AuthParams, HttpConfig};
+use crate::ingress::http_common::pick_protocol_version;
 use crate::ingress::ndarr::ArrayElementSealed;
 use crate::ingress::tls::TlsSettings;
 use crate::ingress::{
-    ArrayElement, Buffer, ColumnName, NdArrayView, ProtocolVersion, SenderBuilder, TableName,
-    Timestamp,
+    check_protocol_version, ArrayElement, Buffer, ColumnName, NdArrayView, ProtocolVersion,
+    SenderBuilder, TableName, Timestamp,
 };
-use crate::Error;
+use crate::{error, Error};
 use crossbeam_queue::ArrayQueue;
 use lasso::{Spur, ThreadedRodeo};
 use std::fmt::{Debug, Display};
 use std::ops::Deref;
 use std::sync::Arc;
-use crate::ingress::http_common::pick_protocol_version;
 
 mod http;
 
@@ -223,7 +223,7 @@ impl Transaction {
     pub async fn commit(mut self) -> std::result::Result<(), TransactionFlushError> {
         let empty_buffer = Buffer::new(self.buffer.protocol_version()); // no-alloc!
         let detached_buffer = std::mem::replace(&mut self.buffer, empty_buffer);
-        let (returned_buffer, result) = self.sender.flush_buffer(detached_buffer).await;
+        let (returned_buffer, result) = self.sender.flush_buffer(detached_buffer, true).await;
         let _empty_buffer = std::mem::replace(&mut self.buffer, returned_buffer);
         if let Err(error) = result {
             Err(TransactionFlushError {
@@ -260,6 +260,7 @@ pub(crate) struct AsyncSenderSettings {
     max_concurrent_connections: u16,
     max_buffer_capacity_keep: usize,
     max_name_len: usize,
+    max_buf_size: usize,
     protocol_version: ProtocolVersion,
 }
 
@@ -287,6 +288,7 @@ impl AsyncSender {
         tls: Option<TlsSettings>,
         auth: Option<String>,
         max_name_len: usize,
+        max_buf_size: usize,
         protocol_version: Option<ProtocolVersion>,
         http_config: &HttpConfig,
         max_concurrent_connections: Option<u16>,
@@ -295,12 +297,13 @@ impl AsyncSender {
         let mut settings = AsyncSenderSettings {
             max_concurrent_connections: max_concurrent_connections.unwrap_or(16),
             max_buffer_capacity_keep: max_buffer_capacity_keep.unwrap_or(8 * 1024 * 1024),
-            max_name_len, // TODO: sniff and overwrite.
+            max_name_len, // sniffed and overwritten, unless endpoint is old and does not support /settings
+            max_buf_size,
             protocol_version: protocol_version.unwrap_or(ProtocolVersion::V2), // TODO: sniff!
         };
 
         let settings_url = build_url(tls.is_some(), host, port, "settings")?;
-        let client = HttpClient::new(tls, auth)?;
+        let client = HttpClient::new(tls, auth, &http_config.user_agent)?;
         let (protocol_versions, max_name_len) = read_server_settings(
             &client,
             &settings_url,
@@ -339,7 +342,36 @@ impl AsyncSender {
         })
     }
 
-    async fn flush_buffer(&self, buffer: Buffer) -> (Buffer, Result<()>) {
+    async fn flush_buffer(&self, buf: Buffer, transactional: bool) -> (Buffer, Result<()>) {
+        if let Err(err) = buf.check_can_flush() {
+            return (buf, Err(err));
+        }
+
+        if buf.len() > self.settings.max_buf_size {
+            let buf_len = buf.len();
+            return (buf, Err(error::fmt!(
+                InvalidApiCall,
+                "Could not flush buffer: Buffer size of {} exceeds maximum configured allowed size of {} bytes.",
+                buf_len,
+                self.settings.max_buf_size
+            )));
+        }
+
+        if let Err(err) =
+            check_protocol_version(self.settings.protocol_version, buf.protocol_version())
+        {
+            return (buf, Err(err));
+        }
+
+        if buf.is_empty() {
+            return (buf, Ok(()));
+        }
+
         todo!()
+
+        // let core =
+
+        // let buffer = buffer
+        // self.client.post_with_retries(body)
     }
 }

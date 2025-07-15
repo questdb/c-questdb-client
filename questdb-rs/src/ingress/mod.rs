@@ -73,7 +73,6 @@ mod async_sender;
 
 #[cfg(feature = "_async-sender")]
 pub use async_sender::*;
-use crate::ingress::http_common::pick_protocol_version;
 
 const MAX_NAME_LEN_DEFAULT: usize = 127;
 
@@ -1061,6 +1060,7 @@ impl SenderBuilder {
             tls_settings,
             auth,
             *self.max_name_len.deref(),
+            *self.max_buf_size.deref(),
             *self.protocol_version.deref(),
             http_config,
             None, // TODO,
@@ -1182,7 +1182,7 @@ impl SenderBuilder {
                         let (protocol_versions, server_max_name_len) =
                             read_server_settings(http_state, settings_url, max_name_len)?;
                         max_name_len = server_max_name_len;
-                        pick_protocol_version(&protocol_versions[..])?
+                        http_common::pick_protocol_version(&protocol_versions[..])?
                     } else {
                         unreachable!("HTTP handler should be used for HTTP protocol");
                     }
@@ -1323,6 +1323,23 @@ fn parse_key_pair(auth: &conf::EcdsaAuthParams) -> Result<EcdsaKeyPair> {
             key_rejected
         )
     })
+}
+
+#[inline(always)]
+fn check_protocol_version(
+    sender_version: ProtocolVersion,
+    buffer_version: ProtocolVersion,
+) -> Result<()> {
+    if sender_version != buffer_version {
+        return Err(fmt!(
+            ProtocolVersionError,
+            "Attempting to send with protocol version {} \
+                but the sender is configured to use protocol version {}",
+            buffer_version,
+            sender_version
+        ));
+    }
+    Ok(())
 }
 
 struct DebugBytes<'a>(pub &'a [u8]);

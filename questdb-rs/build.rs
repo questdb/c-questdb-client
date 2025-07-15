@@ -148,14 +148,12 @@ pub mod json_tests {
             writeln!(
                 output,
                 "fn test_{:03}_{}_v1() -> TestResult {{",
-                index,
-                test_name_slug
+                index, test_name_slug
             )?;
             writeln!(
                 output,
                 "    _test_{:03}_{}(ProtocolVersion::V1)\n",
-                index,
-                test_name_slug
+                index, test_name_slug
             )?;
             writeln!(output, "}}");
 
@@ -163,22 +161,19 @@ pub mod json_tests {
             writeln!(
                 output,
                 "fn test_{:03}_{}_v2() -> TestResult {{",
-                index,
-                test_name_slug
+                index, test_name_slug
             )?;
             writeln!(
                 output,
                 "    _test_{:03}_{}(ProtocolVersion::V2)\n",
-                index,
-                test_name_slug
+                index, test_name_slug
             )?;
             writeln!(output, "}}");
 
             writeln!(
                 output,
                 "fn _test_{:03}_{}(version: ProtocolVersion) -> TestResult {{",
-                index,
-                test_name_slug
+                index, test_name_slug
             )?;
             writeln!(output, "    let mut buffer = Buffer::new(version);")?;
 
