@@ -25,7 +25,7 @@ use crate::error;
 use crate::error::Result;
 use crate::ingress::async_sender::http::{build_url, read_server_settings, HttpClient};
 use crate::ingress::conf::{AuthParams, HttpConfig};
-use crate::ingress::http_common::pick_protocol_version;
+use crate::ingress::http_common::{parse_http_error, pick_protocol_version};
 use crate::ingress::tls::TlsSettings;
 use crate::ingress::{
     check_protocol_version, Buffer, FrozenBuffer, NdArrayView, ProtocolVersion, SenderBuilder,
@@ -104,9 +104,18 @@ impl AsyncSender {
         Buffer::with_max_name_len(self.settings.protocol_version, self.settings.max_name_len)
     }
 
-    pub async fn flush(&self, buf: impl Into<FrozenBuffer>, transactional: bool) -> Result<()> {
+    pub async fn flush(&self, buf: impl Into<FrozenBuffer>) -> Result<()> {
+        self.flush_impl(buf, false).await
+    }
+
+    pub async fn flush_transactional(&self, buf: impl Into<FrozenBuffer>) -> Result<()> {
+        self.flush_impl(buf, true).await
+    }
+
+    async fn flush_impl(&self, buf: impl Into<FrozenBuffer>, transactional: bool) -> Result<()> {
         let buf = buf.into();
         buf.check_can_flush()?;
+
         if transactional && !buf.transactional() {
             return Err(error::fmt!(
                         InvalidApiCall,
@@ -134,23 +143,24 @@ impl AsyncSender {
         // Which we can freeze as something that we can send.
         let body = buf.bytes();
 
-        // let response = match self.client.post_with_retries(
-        //     &self.write_url,
-        //     body.clone(),
-        //     *self.settings.http_config.request_timeout.deref(),
-        //     *self.settings.http_config.retry_timeout.deref()
-        // ).await {
-        //     Ok(response) => response,
-        //     Err(err) => {
-        //         buffer_core.restore_output(body);
-        //         _ = buf.swap_core(buffer_core);
-        //         return (buf, Err(err));
-        //     }
-        // };
+        let request_min_throughput = *self.settings.http_config.request_min_throughput;
+        let extra_time = if request_min_throughput > 0 {
+            (buf.len() as f64) / (request_min_throughput as f64)
+        } else {
+            0.0f64
+        };
 
-        todo!()
+        let (status, header_data, response) = self.client.post_with_retries(
+            &self.write_url,
+            body,
+            *self.settings.http_config.request_timeout + std::time::Duration::from_secs_f64(extra_time),
+            *self.settings.http_config.retry_timeout.deref()
+        ).await?;
 
-        // let buffer = buffer
-        // self.client.post_with_retries(body)
+        if status.is_client_error() || status.is_server_error() {
+            return Err(parse_http_error(status, header_data, response));
+        }
+
+        Ok(())
     }
 }

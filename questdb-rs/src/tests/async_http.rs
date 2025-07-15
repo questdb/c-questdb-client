@@ -74,7 +74,7 @@ async fn _test_sender_auto_detect_protocol_version(
         .symbol("t1", "v1")?
         .column_f64("f1", 0.5)?
         .at(TimestampNanos::new(10000000))?;
-    sender.flush(buf, true).await?;
+    sender.flush(buf).await?;
     _ = server_thread.join().unwrap()?;
     Ok(())
 }
