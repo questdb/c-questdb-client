@@ -103,7 +103,6 @@ fn add_os_roots(root_store: &mut RootCertStore) -> crate::Result<()> {
     Ok(())
 }
 
-#[derive(Debug)]
 pub(crate) enum TlsSettings {
     #[cfg(feature = "insecure-skip-verify")]
     SkipVerify,

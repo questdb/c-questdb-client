@@ -28,14 +28,16 @@ use crate::ingress::{
     MAX_NAME_LEN_DEFAULT,
 };
 use crate::{error, Error};
+use bytes::{BufMut, Bytes, BytesMut};
 use std::fmt::{Debug, Formatter};
+use std::mem;
 use std::num::NonZeroUsize;
 use std::slice::from_raw_parts_mut;
 
-fn write_escaped_impl<Q, C>(check_escape_fn: C, quoting_fn: Q, output: &mut Vec<u8>, s: &str)
+fn write_escaped_impl<Q, C>(check_escape_fn: C, quoting_fn: Q, output: &mut BytesMut, s: &str)
 where
     C: Fn(u8) -> bool,
-    Q: Fn(&mut Vec<u8>),
+    Q: Fn(&mut BytesMut),
 {
     let mut to_escape = 0usize;
     for b in s.bytes() {
@@ -80,12 +82,12 @@ fn must_escape_quoted(c: u8) -> bool {
     matches!(c, b'\n' | b'\r' | b'"' | b'\\')
 }
 
-fn write_escaped_unquoted(output: &mut Vec<u8>, s: &str) {
+fn write_escaped_unquoted(output: &mut BytesMut, s: &str) {
     write_escaped_impl(must_escape_unquoted, |_output| (), output, s);
 }
 
-fn write_escaped_quoted(output: &mut Vec<u8>, s: &str) {
-    write_escaped_impl(must_escape_quoted, |output| output.push(b'"'), output, s)
+fn write_escaped_quoted(output: &mut BytesMut, s: &str) {
+    write_escaped_impl(must_escape_quoted, |output| output.put_u8(b'"'), output, s)
 }
 
 pub(crate) struct F64Serializer {
@@ -170,7 +172,7 @@ impl OpCase {
 // IMPORTANT: This struct MUST remain `Copy` to ensure that
 // there are no heap allocations when performing marker operations.
 #[derive(Debug, Clone, Copy)]
-struct BufferState {
+pub(crate) struct BufferState {
     op_case: OpCase,
     row_count: usize,
     first_table_len: Option<NonZeroUsize>,
@@ -374,6 +376,42 @@ impl<'a> AsRef<str> for ColumnName<'a> {
     }
 }
 
+#[derive(Clone)]
+struct BufferInner<T>
+where
+    T: Clone,
+{
+    output: T,
+    state: BufferState,
+    marker: Option<(usize, BufferState)>,
+    max_name_len: usize,
+    protocol_version: ProtocolVersion,
+}
+
+impl<T> BufferInner<T>
+where
+    T: Clone,
+{
+    /// Check if the next API operation is allowed as per the OP case state machine.
+    #[inline(always)]
+    fn check_op(&self, op: Op) -> crate::Result<()> {
+        if (self.state.op_case as isize & op as isize) > 0 {
+            Ok(())
+        } else {
+            Err(error::fmt!(
+                InvalidApiCall,
+                "State error: Bad call to `{}`, {}.",
+                op.descr(),
+                self.state.op_case.next_op_descr()
+            ))
+        }
+    }
+
+    pub(crate) fn check_can_flush(&self) -> crate::Result<()> {
+        self.check_op(Op::Flush)
+    }
+}
+
 /// A reusable buffer to prepare a batch of ILP messages.
 ///
 /// # Example
@@ -466,11 +504,71 @@ impl<'a> AsRef<str> for ColumnName<'a> {
 ///
 #[derive(Clone)]
 pub struct Buffer {
-    output: Vec<u8>,
-    state: BufferState,
-    marker: Option<(usize, BufferState)>,
-    max_name_len: usize,
-    protocol_version: ProtocolVersion,
+    inner: BufferInner<BytesMut>,
+}
+
+/// A buffer that can be sent asynchronously.
+///
+/// ```norun
+/// let frozen: FrozenBuffer = buffer.into();
+/// ```
+///
+/// A frozen buffer is cheap to clone.
+/// This makes it possible to send the same data rows to multiple databases in parallel.
+#[derive(Clone)]
+pub struct FrozenBuffer {
+    inner: BufferInner<Bytes>,
+}
+
+// TODO:
+// * Document APIs.
+// * Implement FrozenBuffer -> Buffer "try" logic.
+// * Document example with buffer pool.
+impl FrozenBuffer {
+    pub fn transactional(&self) -> bool {
+        self.inner.state.transactional
+    }
+
+    pub fn check_can_flush(&self) -> crate::Result<()> {
+        self.inner.check_can_flush()
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.output.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.output.is_empty()
+    }
+
+    pub fn bytes(&self) -> Bytes {
+        self.inner.output.clone()
+    }
+
+    pub fn protocol_version(&self) -> ProtocolVersion {
+        self.inner.protocol_version
+    }
+}
+
+impl From<Buffer> for FrozenBuffer {
+    fn from(buf: Buffer) -> Self {
+        let BufferInner {
+            output,
+            state,
+            marker,
+            max_name_len,
+            protocol_version,
+        } = buf.inner;
+        let output = output.freeze();
+        let inner = BufferInner {
+            output,
+            state,
+            marker,
+            max_name_len,
+            protocol_version,
+        };
+        Self { inner }
+    }
 }
 
 impl Buffer {
@@ -499,16 +597,18 @@ impl Buffer {
     /// For the default max name length limit (127), use [`Self::new`].
     pub fn with_max_name_len(protocol_version: ProtocolVersion, max_name_len: usize) -> Self {
         Self {
-            output: Vec::new(),
-            state: BufferState::new(),
-            marker: None,
-            max_name_len,
-            protocol_version,
+            inner: BufferInner {
+                output: BytesMut::new(),
+                state: BufferState::new(),
+                marker: None,
+                max_name_len,
+                protocol_version,
+            },
         }
     }
 
     pub fn protocol_version(&self) -> ProtocolVersion {
-        self.protocol_version
+        self.inner.protocol_version
     }
 
     /// Pre-allocate to ensure the buffer has enough capacity for at least the
@@ -516,37 +616,37 @@ impl Buffer {
     /// This does not allocate if such additional capacity is already satisfied.
     /// See: `capacity`.
     pub fn reserve(&mut self, additional: usize) {
-        self.output.reserve(additional);
+        self.inner.output.reserve(additional);
     }
 
     /// The number of bytes accumulated in the buffer.
     pub fn len(&self) -> usize {
-        self.output.len()
+        self.inner.output.len()
     }
 
     /// The number of rows accumulated in the buffer.
     pub fn row_count(&self) -> usize {
-        self.state.row_count
+        self.inner.state.row_count
     }
 
     /// Tells whether the buffer is transactional. It is transactional iff it contains
     /// data for at most one table. Additionally, you must send the buffer over HTTP to
     /// get transactional behavior.
     pub fn transactional(&self) -> bool {
-        self.state.transactional
+        self.inner.state.transactional
     }
 
     pub fn is_empty(&self) -> bool {
-        self.output.is_empty()
+        self.inner.output.is_empty()
     }
 
     /// The total number of bytes the buffer can hold before it needs to resize.
     pub fn capacity(&self) -> usize {
-        self.output.capacity()
+        self.inner.output.capacity()
     }
 
     pub fn as_bytes(&self) -> &[u8] {
-        &self.output
+        &self.inner.output
     }
 
     /// Mark a rewind point.
@@ -556,7 +656,7 @@ impl Buffer {
     /// Once the marker is no longer needed, call
     /// [`clear_marker`](Buffer::clear_marker).
     pub fn set_marker(&mut self) -> crate::Result<()> {
-        if (self.state.op_case as isize & Op::Table as isize) == 0 {
+        if (self.inner.state.op_case as isize & Op::Table as isize) == 0 {
             return Err(error::fmt!(
                 InvalidApiCall,
                 concat!(
@@ -566,7 +666,7 @@ impl Buffer {
                 )
             ));
         }
-        self.marker = Some((self.output.len(), self.state));
+        self.inner.marker = Some((self.inner.output.len(), self.inner.state));
         Ok(())
     }
 
@@ -575,9 +675,9 @@ impl Buffer {
     ///
     /// As a side effect, this also clears the marker.
     pub fn rewind_to_marker(&mut self) -> crate::Result<()> {
-        if let Some((position, state)) = self.marker.take() {
-            self.output.truncate(position);
-            self.state = state;
+        if let Some((position, state)) = self.inner.marker.take() {
+            self.inner.output.truncate(position);
+            self.inner.state = state;
             Ok(())
         } else {
             Err(error::fmt!(
@@ -592,30 +692,21 @@ impl Buffer {
     ///
     /// Idempotent.
     pub fn clear_marker(&mut self) {
-        self.marker = None;
+        self.inner.marker = None;
     }
 
     /// Reset the buffer and clear contents whilst retaining
     /// [`capacity`](Buffer::capacity).
     pub fn clear(&mut self) {
-        self.output.clear();
-        self.state = BufferState::new();
-        self.marker = None;
+        self.inner.output.clear();
+        self.inner.state = BufferState::new();
+        self.inner.marker = None;
     }
 
     /// Check if the next API operation is allowed as per the OP case state machine.
     #[inline(always)]
     fn check_op(&self, op: Op) -> crate::Result<()> {
-        if (self.state.op_case as isize & op as isize) > 0 {
-            Ok(())
-        } else {
-            Err(error::fmt!(
-                InvalidApiCall,
-                "State error: Bad call to `{}`, {}.",
-                op.descr(),
-                self.state.op_case.next_op_descr()
-            ))
-        }
+        self.inner.check_op(op)
     }
 
     /// Checks if this buffer is ready to be flushed to a sender via one of the
@@ -624,17 +715,17 @@ impl Buffer {
     /// message indicating why this [`Buffer`] cannot be flushed at the moment.
     #[inline(always)]
     pub fn check_can_flush(&self) -> crate::Result<()> {
-        self.check_op(Op::Flush)
+        self.inner.check_can_flush()
     }
 
     #[inline(always)]
     fn validate_max_name_len(&self, name: &str) -> crate::Result<()> {
-        if name.len() > self.max_name_len {
+        if name.len() > self.inner.max_name_len {
             return Err(error::fmt!(
                 InvalidName,
                 "Bad name: {:?}: Too long (max {} characters)",
                 name,
-                self.max_name_len
+                self.inner.max_name_len
             ));
         }
         Ok(())
@@ -676,17 +767,17 @@ impl Buffer {
         let name: TableName<'a> = name.try_into()?;
         self.validate_max_name_len(name.name)?;
         self.check_op(Op::Table)?;
-        let table_begin = self.output.len();
-        write_escaped_unquoted(&mut self.output, name.name);
-        let table_end = self.output.len();
-        self.state.op_case = OpCase::TableWritten;
+        let table_begin = self.inner.output.len();
+        write_escaped_unquoted(&mut self.inner.output, name.name);
+        let table_end = self.inner.output.len();
+        self.inner.state.op_case = OpCase::TableWritten;
 
         // A buffer stops being transactional if it targets multiple tables.
-        if let Some(first_table_len) = &self.state.first_table_len {
-            let first_table = &self.output[0..first_table_len.get()];
-            let this_table = &self.output[table_begin..table_end];
+        if let Some(first_table_len) = &self.inner.state.first_table_len {
+            let first_table = &self.inner.output[0..first_table_len.get()];
+            let this_table = &self.inner.output[table_begin..table_end];
             if first_table != this_table {
-                self.state.transactional = false;
+                self.inner.state.transactional = false;
             }
         } else {
             debug_assert!(table_begin == 0);
@@ -700,7 +791,7 @@ impl Buffer {
             // Instead we just assert that it's `Some`.
             debug_assert!(first_table_len.is_some());
 
-            self.state.first_table_len = first_table_len;
+            self.inner.state.first_table_len = first_table_len;
         }
         Ok(self)
     }
@@ -761,11 +852,11 @@ impl Buffer {
         let name: ColumnName<'a> = name.try_into()?;
         self.validate_max_name_len(name.name)?;
         self.check_op(Op::Symbol)?;
-        self.output.push(b',');
-        write_escaped_unquoted(&mut self.output, name.name);
-        self.output.push(b'=');
-        write_escaped_unquoted(&mut self.output, value.as_ref());
-        self.state.op_case = OpCase::SymbolWritten;
+        self.inner.output.put_u8(b',');
+        write_escaped_unquoted(&mut self.inner.output, name.name);
+        self.inner.output.put_u8(b'=');
+        write_escaped_unquoted(&mut self.inner.output, value.as_ref());
+        self.inner.state.op_case = OpCase::SymbolWritten;
         Ok(self)
     }
 
@@ -777,15 +868,16 @@ impl Buffer {
         let name: ColumnName<'a> = name.try_into()?;
         self.validate_max_name_len(name.name)?;
         self.check_op(Op::Column)?;
-        self.output
-            .push(if (self.state.op_case as isize & Op::Symbol as isize) > 0 {
+        self.inner.output.put_u8(
+            if (self.inner.state.op_case as isize & Op::Symbol as isize) > 0 {
                 b' '
             } else {
                 b','
-            });
-        write_escaped_unquoted(&mut self.output, name.name);
-        self.output.push(b'=');
-        self.state.op_case = OpCase::ColumnWritten;
+            },
+        );
+        write_escaped_unquoted(&mut self.inner.output, name.name);
+        self.inner.output.put_u8(b'=');
+        self.inner.state.op_case = OpCase::ColumnWritten;
         Ok(self)
     }
 
@@ -825,7 +917,7 @@ impl Buffer {
         Error: From<N::Error>,
     {
         self.write_column_key(name)?;
-        self.output.push(if value { b't' } else { b'f' });
+        self.inner.output.put_u8(if value { b't' } else { b'f' });
         Ok(self)
     }
 
@@ -867,8 +959,8 @@ impl Buffer {
         self.write_column_key(name)?;
         let mut buf = itoa::Buffer::new();
         let printed = buf.format(value);
-        self.output.extend_from_slice(printed.as_bytes());
-        self.output.push(b'i');
+        self.inner.output.extend_from_slice(printed.as_bytes());
+        self.inner.output.put_u8(b'i');
         Ok(self)
     }
 
@@ -908,13 +1000,13 @@ impl Buffer {
         Error: From<N::Error>,
     {
         self.write_column_key(name)?;
-        if !matches!(self.protocol_version, ProtocolVersion::V1) {
-            self.output.push(b'=');
-            self.output.push(DOUBLE_BINARY_FORMAT_TYPE);
-            self.output.extend_from_slice(&value.to_le_bytes())
+        if !matches!(self.inner.protocol_version, ProtocolVersion::V1) {
+            self.inner.output.put_u8(b'=');
+            self.inner.output.put_u8(DOUBLE_BINARY_FORMAT_TYPE);
+            self.inner.output.extend_from_slice(&value.to_le_bytes())
         } else {
             let mut ser = F64Serializer::new(value);
-            self.output.extend_from_slice(ser.as_str().as_bytes())
+            self.inner.output.extend_from_slice(ser.as_str().as_bytes())
         }
         Ok(self)
     }
@@ -971,7 +1063,7 @@ impl Buffer {
         Error: From<N::Error>,
     {
         self.write_column_key(name)?;
-        write_escaped_quoted(&mut self.output, value.as_ref());
+        write_escaped_quoted(&mut self.inner.output, value.as_ref());
         Ok(self)
     }
 
@@ -1030,7 +1122,7 @@ impl Buffer {
         D: ArrayElement + ArrayElementSealed,
         Error: From<N::Error>,
     {
-        if self.protocol_version == ProtocolVersion::V1 {
+        if self.inner.protocol_version == ProtocolVersion::V1 {
             return Err(error::fmt!(
                 ProtocolVersionError,
                 "Protocol version v1 does not support array datatype",
@@ -1057,30 +1149,32 @@ impl Buffer {
         let array_buf_size = check_and_get_array_bytes_size(view)?;
         self.write_column_key(name)?;
         // binary format flag '='
-        self.output.push(b'=');
+        self.inner.output.put_u8(b'=');
         // binary format entity type
-        self.output.push(ARRAY_BINARY_FORMAT_TYPE);
+        self.inner.output.put_u8(ARRAY_BINARY_FORMAT_TYPE);
         // ndarr datatype
-        self.output.push(D::type_tag());
+        self.inner.output.put_u8(D::type_tag());
         // ndarr dims
-        self.output.push(ndim as u8);
+        self.inner.output.put_u8(ndim as u8);
 
         let dim_header_size = size_of::<u32>() * ndim;
-        self.output.reserve(dim_header_size + array_buf_size);
+        self.inner.output.reserve(dim_header_size + array_buf_size);
 
         for i in 0..ndim {
             // ndarr shape
-            self.output
+            self.inner
+                .output
                 .extend_from_slice((view.dim(i)? as u32).to_le_bytes().as_slice());
         }
 
-        let index = self.output.len();
-        let writeable =
-            unsafe { from_raw_parts_mut(self.output.as_mut_ptr().add(index), array_buf_size) };
+        let index = self.inner.output.len();
+        let writeable = unsafe {
+            from_raw_parts_mut(self.inner.output.as_mut_ptr().add(index), array_buf_size)
+        };
 
         // ndarr data
         ndarr::write_array_data(view, writeable, array_buf_size)?;
-        unsafe { self.output.set_len(array_buf_size + index) }
+        unsafe { self.inner.output.set_len(array_buf_size + index) }
         Ok(self)
     }
 
@@ -1151,8 +1245,8 @@ impl Buffer {
         let timestamp: TimestampMicros = timestamp.try_into()?;
         let mut buf = itoa::Buffer::new();
         let printed = buf.format(timestamp.as_i64());
-        self.output.extend_from_slice(printed.as_bytes());
-        self.output.push(b't');
+        self.inner.output.extend_from_slice(printed.as_bytes());
+        self.inner.output.put_u8(b't');
         Ok(self)
     }
 
@@ -1216,11 +1310,11 @@ impl Buffer {
         }
         let mut buf = itoa::Buffer::new();
         let printed = buf.format(epoch_nanos);
-        self.output.push(b' ');
-        self.output.extend_from_slice(printed.as_bytes());
-        self.output.push(b'\n');
-        self.state.op_case = OpCase::MayFlushOrTable;
-        self.state.row_count += 1;
+        self.inner.output.put_u8(b' ');
+        self.inner.output.extend_from_slice(printed.as_bytes());
+        self.inner.output.put_u8(b'\n');
+        self.inner.state.op_case = OpCase::MayFlushOrTable;
+        self.inner.state.row_count += 1;
         Ok(())
     }
 
@@ -1255,9 +1349,9 @@ impl Buffer {
     /// ```
     pub fn at_now(&mut self) -> crate::Result<()> {
         self.check_op(Op::At)?;
-        self.output.push(b'\n');
-        self.state.op_case = OpCase::MayFlushOrTable;
-        self.state.row_count += 1;
+        self.inner.output.put_u8(b'\n');
+        self.inner.state.op_case = OpCase::MayFlushOrTable;
+        self.inner.state.row_count += 1;
         Ok(())
     }
 }
@@ -1265,11 +1359,11 @@ impl Buffer {
 impl Debug for Buffer {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Buffer")
-            .field("output", &DebugBytes(&self.output))
-            .field("state", &self.state)
-            .field("marker", &self.marker)
-            .field("max_name_len", &self.max_name_len)
-            .field("protocol_version", &self.protocol_version)
+            .field("output", &DebugBytes(&self.inner.output))
+            .field("state", &self.inner.state)
+            .field("marker", &self.inner.marker)
+            .field("max_name_len", &self.inner.max_name_len)
+            .field("protocol_version", &self.inner.protocol_version)
             .finish()
     }
 }

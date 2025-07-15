@@ -42,22 +42,28 @@ use ndarray::{arr2, ArrayD};
 
 #[cfg(feature = "sync-sender-tcp")]
 use crate::tests::{
-    assert_err_contains,
+    assert_err_contains, f64_to_bytes,
     mock::{certs_dir, MockServer},
     ndarr::ArrayColumnTypeTag,
 };
 
 #[cfg(feature = "sync-sender-tcp")]
-use rstest::rstest;
-
-#[cfg(feature = "sync-sender-tcp")]
 use crate::ingress::{CertificateAuthority, ARRAY_BINARY_FORMAT_TYPE};
 
 #[cfg(feature = "sync-sender-tcp")]
-#[rstest]
-fn test_basics(
-    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
-) -> TestResult {
+#[test]
+fn test_basics_v1() -> TestResult {
+    _test_basics(ProtocolVersion::V1)
+}
+
+#[cfg(feature = "sync-sender-tcp")]
+#[test]
+fn test_basics_v2() -> TestResult {
+    _test_basics(ProtocolVersion::V2)
+}
+
+#[cfg(feature = "sync-sender-tcp")]
+fn _test_basics(version: ProtocolVersion) -> TestResult {
     use std::time::SystemTime;
 
     let mut server = MockServer::new()?;
@@ -234,10 +240,19 @@ fn test_array_f64_for_ndarray() -> TestResult {
 }
 
 #[cfg(feature = "sync-sender-tcp")]
-#[rstest]
-fn test_max_buf_size(
-    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
-) -> TestResult {
+#[test]
+fn test_max_buf_size_v1() -> TestResult {
+    _test_max_buf_size(ProtocolVersion::V1)
+}
+
+#[cfg(feature = "sync-sender-tcp")]
+#[test]
+fn test_max_buf_size_v2() -> TestResult {
+    _test_max_buf_size(ProtocolVersion::V2)
+}
+
+#[cfg(feature = "sync-sender-tcp")]
+fn _test_max_buf_size(version: ProtocolVersion) -> TestResult {
     let max = 1024;
     let mut server = MockServer::new()?;
     let mut sender = server
@@ -612,10 +627,17 @@ fn test_arr_column_name_too_long() -> TestResult {
 }
 
 #[cfg(feature = "sync-sender-tcp")]
-#[rstest]
-fn test_tls_with_file_ca(
-    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
-) -> TestResult {
+fn test_tls_with_file_ca_v1() -> TestResult {
+    _test_tls_with_file_ca(ProtocolVersion::V1)
+}
+
+#[cfg(feature = "sync-sender-tcp")]
+fn test_tls_with_file_ca_v2() -> TestResult {
+    _test_tls_with_file_ca(ProtocolVersion::V2)
+}
+
+#[cfg(feature = "sync-sender-tcp")]
+fn _test_tls_with_file_ca(version: ProtocolVersion) -> TestResult {
     let mut ca_path = certs_dir();
     ca_path.push("server_rootCA.pem");
 
@@ -720,11 +742,20 @@ fn test_plain_to_tls_server() -> TestResult {
     Ok(())
 }
 
+#[test]
 #[cfg(feature = "insecure-skip-verify")]
-#[rstest]
-fn test_tls_insecure_skip_verify(
-    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
-) -> TestResult {
+fn test_tls_insecure_skip_verify_v1() -> TestResult {
+    _test_tls_insecure_skip_verify(ProtocolVersion::V1)
+}
+
+#[test]
+#[cfg(feature = "insecure-skip-verify")]
+fn test_tls_insecure_skip_verify_v2() -> TestResult {
+    _test_tls_insecure_skip_verify(ProtocolVersion::V2)
+}
+
+#[cfg(feature = "insecure-skip-verify")]
+fn _test_tls_insecure_skip_verify(version: ProtocolVersion) -> TestResult {
     let server = MockServer::new()?;
     let lsb = server
         .lsb_tcps()
@@ -792,23 +823,4 @@ fn tcp_mismatched_buffer_and_sender_version() -> TestResult {
         but the sender is configured to use protocol version v2",
     );
     Ok(())
-}
-
-pub(crate) fn f64_to_bytes(name: &str, value: f64, version: ProtocolVersion) -> Vec<u8> {
-    let mut buf = Vec::new();
-    buf.extend_from_slice(name.as_bytes());
-    buf.push(b'=');
-
-    match version {
-        ProtocolVersion::V1 => {
-            let mut ser = F64Serializer::new(value);
-            buf.extend_from_slice(ser.as_str().as_bytes());
-        }
-        ProtocolVersion::V2 => {
-            buf.push(b'=');
-            buf.push(DOUBLE_BINARY_FORMAT_TYPE);
-            buf.extend_from_slice(&value.to_le_bytes());
-        }
-    }
-    buf
 }

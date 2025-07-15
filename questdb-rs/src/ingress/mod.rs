@@ -59,8 +59,20 @@ mod timestamp;
 mod buffer;
 pub use buffer::*;
 
-mod sender;
-pub use sender::*;
+#[cfg(feature = "_sender-http")]
+mod http_common;
+
+#[cfg(feature = "_sync-sender")]
+mod sync_sender;
+
+#[cfg(feature = "_sync-sender")]
+pub use sync_sender::*;
+
+#[cfg(feature = "_async-sender")]
+mod async_sender;
+
+#[cfg(feature = "_async-sender")]
+pub use async_sender::*;
 
 const MAX_NAME_LEN_DEFAULT: usize = 127;
 
@@ -609,7 +621,7 @@ impl SenderBuilder {
             tls_ca: ConfigSetting::new_default(tls_ca),
             tls_roots: ConfigSetting::new_default(None),
 
-            #[cfg(feature = "sync-sender-http")]
+            #[cfg(feature = "_sender-http")]
             http: if protocol.is_httpx() {
                 Some(conf::HttpConfig::default())
             } else {
@@ -1008,6 +1020,53 @@ impl SenderBuilder {
         }
     }
 
+    #[cfg(feature = "_async-sender")]
+    pub async fn build_async(self) -> Result<std::sync::Arc<AsyncSender>> {
+        if !self.protocol.is_httpx() {
+            return Err(fmt!(
+                ConfigError,
+                "Only the HTTP and HTTPS protocols are supported by the AsyncSender."
+            ));
+        }
+
+        let mut descr = format!("Sender[host={:?},port={:?},", self.host, self.port);
+
+        if self.protocol.tls_enabled() {
+            write!(descr, "tls=enabled,").unwrap();
+        } else {
+            write!(descr, "tls=disabled,").unwrap();
+        }
+
+        #[cfg(feature = "insecure-skip-verify")]
+        let tls_verify = *self.tls_verify;
+
+        let tls_settings = tls::TlsSettings::build(
+            self.protocol.tls_enabled(),
+            #[cfg(feature = "insecure-skip-verify")]
+            tls_verify,
+            *self.tls_ca,
+            self.tls_roots.deref().as_deref(),
+        )?;
+
+        let auth = self.build_auth()?;
+        let auth = conf::auth_params_to_header_string(&auth)?;
+
+        let http_config = self.http.unwrap();
+
+        AsyncSender::new(
+            descr,
+            self.host.deref(),
+            self.port.deref(),
+            tls_settings,
+            auth,
+            *self.max_name_len.deref(),
+            *self.max_buf_size.deref(),
+            *self.protocol_version.deref(),
+            http_config,
+        )
+        .await
+    }
+
     #[cfg(feature = "_sync-sender")]
     /// Build the sender.
     ///
@@ -1074,20 +1133,8 @@ impl SenderBuilder {
 
                 let connector = connector.chain(TlsConnector::new(tls_config));
 
-                let auth = match auth {
-                    Some(conf::AuthParams::Basic(ref auth)) => Some(auth.to_header_string()),
-                    Some(conf::AuthParams::Token(ref auth)) => Some(auth.to_header_string()?),
+                let auth = conf::auth_params_to_header_string(&auth)?;
 
-                    #[cfg(feature = "sync-sender-tcp")]
-                    Some(conf::AuthParams::Ecdsa(_)) => {
-                        return Err(fmt!(
-                            AuthError,
-                            "ECDSA authentication is not supported for ILP over HTTP. \
-                            Please use basic or token authentication instead."
-                        ));
-                    }
-                    None => None,
-                };
                 let agent_builder = agent_builder
                     .timeout_connect(Some(*http_config.request_timeout.deref()))
                     .http_status_as_error(false);
@@ -1133,16 +1180,7 @@ impl SenderBuilder {
                         let (protocol_versions, server_max_name_len) =
                             read_server_settings(http_state, settings_url, max_name_len)?;
                         max_name_len = server_max_name_len;
-                        if protocol_versions.contains(&ProtocolVersion::V2) {
-                            ProtocolVersion::V2
-                        } else if protocol_versions.contains(&ProtocolVersion::V1) {
-                            ProtocolVersion::V1
-                        } else {
-                            return Err(fmt!(
-                                ProtocolVersionError,
-                                "Server does not support current client"
-                            ));
-                        }
+                        http_common::pick_protocol_version(&protocol_versions[..])?
                     } else {
                         unreachable!("HTTP handler should be used for HTTP protocol");
                     }
@@ -1283,6 +1321,23 @@ fn parse_key_pair(auth: &conf::EcdsaAuthParams) -> Result<EcdsaKeyPair> {
             key_rejected
         )
     })
+}
+
+#[inline(always)]
+fn check_protocol_version(
+    sender_version: ProtocolVersion,
+    buffer_version: ProtocolVersion,
+) -> Result<()> {
+    if sender_version != buffer_version {
+        return Err(fmt!(
+            ProtocolVersionError,
+            "Attempting to send with protocol version {} \
+                but the sender is configured to use protocol version {}",
+            buffer_version,
+            sender_version
+        ));
+    }
+    Ok(())
 }
 
 struct DebugBytes<'a>(pub &'a [u8]);
