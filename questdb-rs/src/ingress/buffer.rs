@@ -31,11 +31,12 @@ use crate::{error, Error};
 use std::fmt::{Debug, Formatter};
 use std::num::NonZeroUsize;
 use std::slice::from_raw_parts_mut;
+use bytes::{BufMut, BytesMut};
 
-fn write_escaped_impl<Q, C>(check_escape_fn: C, quoting_fn: Q, output: &mut Vec<u8>, s: &str)
+fn write_escaped_impl<Q, C>(check_escape_fn: C, quoting_fn: Q, output: &mut BytesMut, s: &str)
 where
     C: Fn(u8) -> bool,
-    Q: Fn(&mut Vec<u8>),
+    Q: Fn(&mut BytesMut),
 {
     let mut to_escape = 0usize;
     for b in s.bytes() {
@@ -80,12 +81,12 @@ fn must_escape_quoted(c: u8) -> bool {
     matches!(c, b'\n' | b'\r' | b'"' | b'\\')
 }
 
-fn write_escaped_unquoted(output: &mut Vec<u8>, s: &str) {
+fn write_escaped_unquoted(output: &mut BytesMut, s: &str) {
     write_escaped_impl(must_escape_unquoted, |_output| (), output, s);
 }
 
-fn write_escaped_quoted(output: &mut Vec<u8>, s: &str) {
-    write_escaped_impl(must_escape_quoted, |output| output.push(b'"'), output, s)
+fn write_escaped_quoted(output: &mut BytesMut, s: &str) {
+    write_escaped_impl(must_escape_quoted, |output| output.put_u8(b'"'), output, s)
 }
 
 pub(crate) struct F64Serializer {
@@ -466,7 +467,7 @@ impl<'a> AsRef<str> for ColumnName<'a> {
 ///
 #[derive(Clone)]
 pub struct Buffer {
-    output: Vec<u8>,
+    output: BytesMut,
     state: BufferState,
     marker: Option<(usize, BufferState)>,
     max_name_len: usize,
@@ -499,7 +500,7 @@ impl Buffer {
     /// For the default max name length limit (127), use [`Self::new`].
     pub fn with_max_name_len(protocol_version: ProtocolVersion, max_name_len: usize) -> Self {
         Self {
-            output: Vec::new(),
+            output: BytesMut::new(),
             state: BufferState::new(),
             marker: None,
             max_name_len,
@@ -761,9 +762,9 @@ impl Buffer {
         let name: ColumnName<'a> = name.try_into()?;
         self.validate_max_name_len(name.name)?;
         self.check_op(Op::Symbol)?;
-        self.output.push(b',');
+        self.output.put_u8(b',');
         write_escaped_unquoted(&mut self.output, name.name);
-        self.output.push(b'=');
+        self.output.put_u8(b'=');
         write_escaped_unquoted(&mut self.output, value.as_ref());
         self.state.op_case = OpCase::SymbolWritten;
         Ok(self)
@@ -778,13 +779,13 @@ impl Buffer {
         self.validate_max_name_len(name.name)?;
         self.check_op(Op::Column)?;
         self.output
-            .push(if (self.state.op_case as isize & Op::Symbol as isize) > 0 {
+            .put_u8(if (self.state.op_case as isize & Op::Symbol as isize) > 0 {
                 b' '
             } else {
                 b','
             });
         write_escaped_unquoted(&mut self.output, name.name);
-        self.output.push(b'=');
+        self.output.put_u8(b'=');
         self.state.op_case = OpCase::ColumnWritten;
         Ok(self)
     }
@@ -825,7 +826,7 @@ impl Buffer {
         Error: From<N::Error>,
     {
         self.write_column_key(name)?;
-        self.output.push(if value { b't' } else { b'f' });
+        self.output.put_u8(if value { b't' } else { b'f' });
         Ok(self)
     }
 
@@ -868,7 +869,7 @@ impl Buffer {
         let mut buf = itoa::Buffer::new();
         let printed = buf.format(value);
         self.output.extend_from_slice(printed.as_bytes());
-        self.output.push(b'i');
+        self.output.put_u8(b'i');
         Ok(self)
     }
 
@@ -909,8 +910,8 @@ impl Buffer {
     {
         self.write_column_key(name)?;
         if !matches!(self.protocol_version, ProtocolVersion::V1) {
-            self.output.push(b'=');
-            self.output.push(DOUBLE_BINARY_FORMAT_TYPE);
+            self.output.put_u8(b'=');
+            self.output.put_u8(DOUBLE_BINARY_FORMAT_TYPE);
             self.output.extend_from_slice(&value.to_le_bytes())
         } else {
             let mut ser = F64Serializer::new(value);
@@ -1057,13 +1058,13 @@ impl Buffer {
         let array_buf_size = check_and_get_array_bytes_size(view)?;
         self.write_column_key(name)?;
         // binary format flag '='
-        self.output.push(b'=');
+        self.output.put_u8(b'=');
         // binary format entity type
-        self.output.push(ARRAY_BINARY_FORMAT_TYPE);
+        self.output.put_u8(ARRAY_BINARY_FORMAT_TYPE);
         // ndarr datatype
-        self.output.push(D::type_tag());
+        self.output.put_u8(D::type_tag());
         // ndarr dims
-        self.output.push(ndim as u8);
+        self.output.put_u8(ndim as u8);
 
         let dim_header_size = size_of::<u32>() * ndim;
         self.output.reserve(dim_header_size + array_buf_size);
@@ -1152,7 +1153,7 @@ impl Buffer {
         let mut buf = itoa::Buffer::new();
         let printed = buf.format(timestamp.as_i64());
         self.output.extend_from_slice(printed.as_bytes());
-        self.output.push(b't');
+        self.output.put_u8(b't');
         Ok(self)
     }
 
@@ -1216,9 +1217,9 @@ impl Buffer {
         }
         let mut buf = itoa::Buffer::new();
         let printed = buf.format(epoch_nanos);
-        self.output.push(b' ');
+        self.output.put_u8(b' ');
         self.output.extend_from_slice(printed.as_bytes());
-        self.output.push(b'\n');
+        self.output.put_u8(b'\n');
         self.state.op_case = OpCase::MayFlushOrTable;
         self.state.row_count += 1;
         Ok(())
@@ -1255,7 +1256,7 @@ impl Buffer {
     /// ```
     pub fn at_now(&mut self) -> crate::Result<()> {
         self.check_op(Op::At)?;
-        self.output.push(b'\n');
+        self.output.put_u8(b'\n');
         self.state.op_case = OpCase::MayFlushOrTable;
         self.state.row_count += 1;
         Ok(())
