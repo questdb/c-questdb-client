@@ -23,9 +23,8 @@
  ******************************************************************************/
 use crate::ingress::ndarr::{check_and_get_array_bytes_size, ArrayElementSealed};
 use crate::ingress::{
-    ndarr, ArrayElement, DebugBytes, NdArrayView, ProtocolVersion, Timestamp, TimestampMicros,
-    TimestampNanos, ARRAY_BINARY_FORMAT_TYPE, DOUBLE_BINARY_FORMAT_TYPE, MAX_ARRAY_DIMS,
-    MAX_NAME_LEN_DEFAULT,
+    ndarr, ArrayElement, DebugBytes, NdArrayView, ProtocolVersion, Timestamp, TimestampNanos,
+    ARRAY_BINARY_FORMAT_TYPE, DOUBLE_BINARY_FORMAT_TYPE, MAX_ARRAY_DIMS, MAX_NAME_LEN_DEFAULT,
 };
 use crate::{error, Error};
 use std::fmt::{Debug, Formatter};
@@ -281,7 +280,7 @@ impl<'a> TryFrom<&'a str> for TableName<'a> {
     }
 }
 
-impl<'a> AsRef<str> for TableName<'a> {
+impl AsRef<str> for TableName<'_> {
     fn as_ref(&self) -> &str {
         self.name
     }
@@ -368,7 +367,7 @@ impl<'a> TryFrom<&'a str> for ColumnName<'a> {
     }
 }
 
-impl<'a> AsRef<str> for ColumnName<'a> {
+impl AsRef<str> for ColumnName<'_> {
     fn as_ref(&self) -> &str {
         self.name
     }
@@ -1148,11 +1147,11 @@ impl Buffer {
     {
         self.write_column_key(name)?;
         let timestamp: Timestamp = value.try_into()?;
-        let timestamp: TimestampMicros = timestamp.try_into()?;
+        let timestamp: TimestampNanos = timestamp.try_into()?;
         let mut buf = itoa::Buffer::new();
         let printed = buf.format(timestamp.as_i64());
         self.output.extend_from_slice(printed.as_bytes());
-        self.output.push(b't');
+        self.output.push(b'n');
         Ok(self)
     }
 
