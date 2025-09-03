@@ -89,8 +89,11 @@ fn test_basics(
     let exp = &[
         "test,t1=v1 ".as_bytes(),
         f64_to_bytes("f1", 0.5, version).as_slice(),
-        format!(",ts1=12345000n,ts2={}n,ts3={ts_nanos_num}n {ts_nanos_num}\n", ts_micros_num * 1000)
-            .as_bytes(),
+        format!(
+            ",ts1=12345000n,ts2={}n,ts3={ts_nanos_num}n {ts_nanos_num}\n",
+            ts_micros_num * 1000
+        )
+        .as_bytes(),
     ]
     .concat();
     assert_eq!(buffer.as_bytes(), exp);
