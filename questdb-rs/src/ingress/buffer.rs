@@ -1147,11 +1147,19 @@ impl Buffer {
     {
         self.write_column_key(name)?;
         let timestamp: Timestamp = value.try_into()?;
-        let timestamp: TimestampNanos = timestamp.try_into()?;
         let mut buf = itoa::Buffer::new();
-        let printed = buf.format(timestamp.as_i64());
-        self.output.extend_from_slice(printed.as_bytes());
-        self.output.push(b'n');
+        match timestamp {
+            Timestamp::Micros(ts) => {
+                let printed = buf.format(ts.as_i64());
+                self.output.extend_from_slice(printed.as_bytes());
+                self.output.push(b't');
+            }
+            Timestamp::Nanos(ts) => {
+                let printed = buf.format(ts.as_i64());
+                self.output.extend_from_slice(printed.as_bytes());
+                self.output.push(b'n');
+            }
+        }
         Ok(self)
     }
 

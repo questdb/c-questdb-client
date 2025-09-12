@@ -90,8 +90,8 @@ fn test_basics(
         "test,t1=v1 ".as_bytes(),
         f64_to_bytes("f1", 0.5, version).as_slice(),
         format!(
-            ",ts1=12345000n,ts2={}n,ts3={ts_nanos_num}n {ts_nanos_num}\n",
-            ts_micros_num * 1000
+            ",ts1=12345t,ts2={}t,ts3={ts_nanos_num}n {ts_nanos_num}\n",
+            ts_micros_num
         )
         .as_bytes(),
     ]
@@ -538,8 +538,8 @@ fn test_timestamp_overloads() -> TestResult {
         )?)?;
 
     let exp = concat!(
-        "tbl_name a=12345000n,b=-100000000000n,c=12345678n,d=-12345678n,e=-1000n,f=-10000n 1000\n",
-        "tbl_name a=1000000000n 5000000000\n"
+        "tbl_name a=12345t,b=-100000000t,c=12345678n,d=-12345678n,e=-1t,f=-10000n 1000\n",
+        "tbl_name a=1000000t 5000000000\n"
     )
     .as_bytes();
     assert_eq!(buffer.as_bytes(), exp);
