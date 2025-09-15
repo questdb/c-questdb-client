@@ -1,3 +1,27 @@
+/*******************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2025 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+use std::convert::Infallible;
 use std::fmt::{Display, Formatter};
 
 macro_rules! fmt {
@@ -48,6 +72,12 @@ pub enum ErrorCode {
 
     /// Bad configuration.
     ConfigError,
+
+    /// There was an error serializing an array.
+    ArrayError,
+
+    /// Validate protocol version error.
+    ProtocolVersionError,
 }
 
 /// An error that occurred when using QuestDB client library.
@@ -66,7 +96,7 @@ impl Error {
         }
     }
 
-    #[cfg(feature = "ilp-over-http")]
+    #[cfg(feature = "sync-sender-http")]
     pub(crate) fn from_ureq_error(err: ureq::Error, url: &str) -> Error {
         match err {
             ureq::Error::StatusCode(code) => {
@@ -109,6 +139,12 @@ impl Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+impl From<Infallible> for Error {
+    fn from(_: Infallible) -> Self {
+        unreachable!()
+    }
+}
 
 /// A specialized `Result` type for the crate's [`Error`] type.
 pub type Result<T> = std::result::Result<T, Error>;

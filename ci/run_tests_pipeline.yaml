@@ -54,14 +54,25 @@ stages:
               cd questdb-rs
               cargo build --examples --features almost-all-features
             displayName: "Build Rust examples"
+          ############################# temp for test begin #####################
+          - script: |
+              git clone --depth 1 https://github.com/questdb/questdb.git ./questdb
+            displayName: git clone questdb
+          - task: Maven@3
+            displayName: "Compile QuestDB"
+            inputs:
+              mavenPOMFile: "questdb/pom.xml"
+              jdkVersionOption: "1.17"
+              options: "-DskipTests -Pbuild-web-console"
+          ############################# temp for test end ##################### 
           - script: python3 ci/run_all_tests.py
             env:
               JAVA_HOME: $(JAVA_HOME_11_X64)
             displayName: "Tests"
-          - task: PublishBuildArtifacts@1
-            inputs:
-              pathToPublish: ./build
-            displayName: "Publish build directory"
+          # - task: PublishBuildArtifacts@1
+          #   inputs:
+          #     pathToPublish: ./build
+          #   displayName: "Publish build directory"
       - job: FormatAndLinting
         displayName: "cargo fmt and clippy"
         pool:
@@ -121,7 +132,7 @@ stages:
             displayName: "Compile QuestDB"
             inputs:
               mavenPOMFile: 'questdb/pom.xml'
-              jdkVersionOption: '1.11'
+              jdkVersionOption: '1.17'
               options: "-DskipTests -Pbuild-web-console"
           - script: |
               python3 system_test/test.py run --repo ./questdb -v

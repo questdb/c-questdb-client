@@ -19,7 +19,7 @@ use questdb::{
         TimestampNanos}};
 fn main() -> Result<()> {
    let mut sender = Sender::from_conf("http::addr=localhost:9000;")?;
-   let mut buffer = Buffer::new();
+  let mut buffer = sender.new_buffer();
    buffer
        .table("trades")?
        .symbol("symbol", "ETH-USD")?
@@ -93,8 +93,8 @@ error as appropriate and continue using it.
 # Health Check
 
 The QuestDB server has a "ping" endpoint you can access to see if it's alive,
-and confirm the version of InfluxDB Line Protocol with which you are
-interacting:
+and confirm the version of the InfluxDB that it is compatible with at a protocol
+level.
 
 ```shell
 curl -I http://localhost:9000/ping
@@ -254,9 +254,25 @@ However, TCP has a lower overhead than HTTP and it's worthwhile to try out as an
 alternative in a scenario where you have a constantly high data rate and/or deal
 with a high-latency network connection.
 
-### Timestamp Column Name
+## Array Datatype
 
-InfluxDB Line Protocol (ILP) does not give a name to the designated timestamp,
+The [`Buffer::column_arr`](Buffer::column_arr) method supports efficient ingestion of N-dimensional
+arrays using several convenient types:
+
+- native Rust arrays and slices (up to 3-dimensional)
+- native Rust vectors (up to 3-dimensional)
+- arrays from the [`ndarray`](https://docs.rs/ndarray) crate
+
+You must use protocol version 2 to ingest arrays. HTTP transport will
+automatically enable it as long as you're connecting to an up-to-date QuestDB
+server (version 9.0.0 or later), but with TCP you must explicitly specify it in
+the configuration string: `protocol_version=2;`.
+
+**Note**: QuestDB server version 9.0.0 or later is required for array support.
+
+## Timestamp Column Name
+
+The InfluxDB Line Protocol (ILP) does not give a name to the designated timestamp,
 so if you let this client auto-create the table, it will have the default `timestamp` name.
 To use a custom name, say `my_ts`, pre-create the table with the desired
 timestamp column name:
@@ -297,9 +313,11 @@ use questdb::ingress::{
     TableName,
     ColumnName,
     Buffer,
+    SenderBuilder,
     TimestampNanos};
 # fn main() -> Result<()> {
-let mut buffer = Buffer::new();
+let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+let mut buffer = sender.new_buffer();
 let table_name = TableName::new("trades")?;
 let price_name = ColumnName::new("price")?;
 buffer.table(table_name)?.column_f64(price_name, 2615.54)?.at(TimestampNanos::now())?;

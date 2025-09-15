@@ -32,6 +32,7 @@
         ],
         "result": {
             "status": "SUCCESS",
+            "binaryBase64": "dGVzdF90YWJsZSxzeW1fY29sPXN5bV92YWwgc3RyX2NvbD0iZm9vIGJhciBiYXoiLGxvbmdfY29sPTQyaSxkb3VibGVfY29sPT0QAAAAAABARUAsYm9vbF9jb2w9dAo=",
             "line": "test_table,sym_col=sym_val str_col=\"foo bar baz\",long_col=42i,double_col=42.5,bool_col=t"
         }
     },
@@ -73,6 +74,7 @@
         ],
         "result": {
             "status": "SUCCESS",
+            "binaryBase64": "ZG91YmxlcyBkMD09EAAAAAAAAAAALGRtMD09EAAAAAAAAACALGQxPT0QAAAAAAAA8D8sZEUxMDA9PRB9w5QlrUmyVCxkMDAwMDAwMT09EI3ttaD3xrA+LGROMDAwMDAwMT09EI3ttaD3xrC+Cg==",
             "anyLines": [
                 "doubles d0=0,dm0=-0,d1=1,dE100=1E+100,d0000001=1E-06,dN0000001=-1E-06",
                 "doubles d0=0.0,dm0=-0.0,d1=1.0,dE100=1e100,d0000001=1e-6,dN0000001=-1e-6"
