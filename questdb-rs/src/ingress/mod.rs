@@ -1287,7 +1287,7 @@ fn parse_key_pair(auth: &conf::EcdsaAuthParams) -> Result<EcdsaKeyPair> {
 
 struct DebugBytes<'a>(pub &'a [u8]);
 
-impl<'a> Debug for DebugBytes<'a> {
+impl Debug for DebugBytes<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "b\"")?;
 

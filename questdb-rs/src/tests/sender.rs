@@ -90,10 +90,8 @@ fn test_basics(
         "test,t1=v1 ".as_bytes(),
         f64_to_bytes("f1", 0.5, version).as_slice(),
         format!(
-            ",ts1=12345t,ts2={}t,ts3={}t {}\n",
-            ts_micros_num,
-            ts_nanos_num / 1000i64,
-            ts_nanos_num
+            ",ts1=12345t,ts2={}t,ts3={ts_nanos_num}n {ts_nanos_num}\n",
+            ts_micros_num
         )
         .as_bytes(),
     ]
@@ -540,7 +538,7 @@ fn test_timestamp_overloads() -> TestResult {
         )?)?;
 
     let exp = concat!(
-        "tbl_name a=12345t,b=-100000000t,c=12345t,d=-12345t,e=-1t,f=-10t 1000\n",
+        "tbl_name a=12345t,b=-100000000t,c=12345678n,d=-12345678n,e=-1t,f=-10000n 1000\n",
         "tbl_name a=1000000t 5000000000\n"
     )
     .as_bytes();
@@ -561,7 +559,7 @@ fn test_chrono_timestamp() -> TestResult {
     let mut buffer = Buffer::new(ProtocolVersion::V2);
     buffer.table(tbl_name)?.column_ts("a", ts)?.at(ts)?;
 
-    let exp = b"tbl_name a=1000000t 1000000000\n";
+    let exp = b"tbl_name a=1000000000n 1000000000\n";
     assert_eq!(buffer.as_bytes(), exp);
 
     Ok(())

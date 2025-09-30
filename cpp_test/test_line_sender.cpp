@@ -943,7 +943,7 @@ TEST_CASE("Test timestamp column.")
         .at(now_nanos_ts);
 
     std::stringstream ss;
-    ss << "test ts1=12345t,ts2=" << now_micros << "t,ts3=" << now_micros << "t "
+    ss << "test ts1=12345t,ts2=" << now_micros << "t,ts3=" << now_nanos << "n "
        << now_nanos << "\n";
     const auto exp = ss.str();
     CHECK(buffer.peek() == exp);
