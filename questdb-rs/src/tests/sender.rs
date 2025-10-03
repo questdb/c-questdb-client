@@ -538,7 +538,7 @@ fn test_timestamp_overloads() -> TestResult {
         )?)?;
 
     let exp = concat!(
-        "tbl_name a=12345t,b=-100000000t,c=12345678n,d=-12345678n,e=-1t,f=-10000n 1000\n",
+        "tbl_name a=12345t,b=-100000000t,c=12345678n,d=-12345678n,e=-1t,f=-10000n 1t\n",
         "tbl_name a=1000000t 5000000000\n"
     )
     .as_bytes();

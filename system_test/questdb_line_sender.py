@@ -787,6 +787,12 @@ class Buffer:
             self._impl,
             timestamp)
 
+    def at_micros(self, timestamp: int):
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_at_micros,
+            self._impl,
+            timestamp)
+
     def __del__(self):
         _DLL.line_sender_buffer_free(self._impl)
 
@@ -922,6 +928,9 @@ class Sender:
 
     def at(self, timestamp: int):
         self._buffer.at(timestamp)
+
+    def at_micros(self, timestamp: int):
+        self._buffer.at_micros(timestamp)
 
     def flush(self, buffer: Optional[Buffer] = None, clear=True, transactional=None):
         if (buffer is None) and not clear:

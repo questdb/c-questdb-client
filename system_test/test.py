@@ -355,11 +355,29 @@ class TestSender(unittest.TestCase):
         at_ts_ns = -10000000
         with self.assertRaisesRegex(qls.SenderError, r'Bad call to'):
             with self._mk_linesender() as sender:
-                with self.assertRaisesRegex(qls.SenderError, r'.*Timestamp .* is negative.*'):
+                with self.assertRaisesRegex(qls.SenderError, r'.*Nanosecond timestamp .* is negative.*'):
                     (sender
                      .table(table_name)
                      .symbol('a', 'A')
                      .at(at_ts_ns))
+                    
+    def test_micros_at(self):
+        if QDB_FIXTURE.version <= (6, 0, 7, 1):
+            self.skipTest('No support for user-provided timestamps.')
+            return
+        table_name = uuid.uuid4().hex
+        at_ts_ns = 1647357688714369403
+        at_ts_us = at_ts_ns // 1000
+        pending = None
+        with self._mk_linesender() as sender:
+            (sender
+             .table(table_name)
+             .symbol('a', 'A')
+             .at_micros(at_ts_us))
+            pending = sender.buffer.peek()
+        resp = retry_check_table(table_name, log_ctx=pending)
+        exp_dataset = [['A', ns_to_qdb_date(at_ts_ns)]]
+        self.assertEqual(resp['dataset'], exp_dataset)
 
     def test_timestamp_col(self):
         if QDB_FIXTURE.version <= (6, 0, 7, 1):

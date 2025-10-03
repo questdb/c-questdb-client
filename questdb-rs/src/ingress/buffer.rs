@@ -23,7 +23,7 @@
  ******************************************************************************/
 use crate::ingress::ndarr::{check_and_get_array_bytes_size, ArrayElementSealed};
 use crate::ingress::{
-    ndarr, ArrayElement, DebugBytes, NdArrayView, ProtocolVersion, Timestamp, TimestampNanos,
+    ndarr, ArrayElement, DebugBytes, NdArrayView, ProtocolVersion, Timestamp,
     ARRAY_BINARY_FORMAT_TYPE, DOUBLE_BINARY_FORMAT_TYPE, MAX_ARRAY_DIMS, MAX_NAME_LEN_DEFAULT,
 };
 use crate::{error, Error};
@@ -1209,23 +1209,36 @@ impl Buffer {
         self.check_op(Op::At)?;
         let timestamp: Timestamp = timestamp.try_into()?;
 
-        // https://github.com/rust-lang/rust/issues/115880
-        let timestamp: crate::Result<TimestampNanos> = timestamp.try_into();
-        let timestamp: TimestampNanos = timestamp?;
+        let (number, suffix) = match timestamp {
+            Timestamp::Micros(micros) => {
+                let epoch_micros = micros.as_i64();
+                if epoch_micros < 0 {
+                    return Err(error::fmt!(
+                        InvalidTimestamp,
+                        "Microsecond timestamp {} is negative. It must be >= 0.",
+                        epoch_micros
+                    ));
+                }
+                (epoch_micros, "t\n")
+            }
+            Timestamp::Nanos(nanos) => {
+                let epoch_nanos = nanos.as_i64();
+                if epoch_nanos < 0 {
+                    return Err(error::fmt!(
+                        InvalidTimestamp,
+                        "Nanosecond timestamp {} is negative. It must be >= 0.",
+                        epoch_nanos
+                    ));
+                }
+                (epoch_nanos, "\n")
+            }
+        };
 
-        let epoch_nanos = timestamp.as_i64();
-        if epoch_nanos < 0 {
-            return Err(error::fmt!(
-                InvalidTimestamp,
-                "Timestamp {} is negative. It must be >= 0.",
-                epoch_nanos
-            ));
-        }
         let mut buf = itoa::Buffer::new();
-        let printed = buf.format(epoch_nanos);
+        let printed = buf.format(number);
         self.output.push(b' ');
         self.output.extend_from_slice(printed.as_bytes());
-        self.output.push(b'\n');
+        self.output.extend_from_slice(suffix.as_bytes());
         self.state.op_case = OpCase::MayFlushOrTable;
         self.state.row_count += 1;
         Ok(())
