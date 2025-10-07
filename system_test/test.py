@@ -355,7 +355,7 @@ class TestSender(unittest.TestCase):
         at_ts_ns = -10000000
         with self.assertRaisesRegex(qls.SenderError, r'Bad call to'):
             with self._mk_linesender() as sender:
-                with self.assertRaisesRegex(qls.SenderError, r'.*Nanosecond timestamp .* is negative.*'):
+                with self.assertRaisesRegex(qls.SenderError, r'.*Timestamp .* is negative.*'):
                     (sender
                      .table(table_name)
                      .symbol('a', 'A')
