@@ -110,11 +110,14 @@ class TestSender(unittest.TestCase):
         at_ts_us = at_ts_ns // 1000
         trimmed_ns = at_ts_ns % 1000
         at_ts_sec = at_ts_us / 1000000.0
-        at_td = datetime.datetime.fromtimestamp(at_ts_sec, datetime.UTC)
+
+        # Commented out for now. Uncomment when CI catches up to a newer Python version.
+        # at_td = datetime.datetime.fromtimestamp(at_ts_sec, datetime.UTC).replace(tzinfo=None)
+        at_td = datetime.datetime.utcfromtimestamp(at_ts_sec)
         extra_precision = ''
         if exp_nanos:
             extra_precision = f'{trimmed_ns:03}'
-        return at_td.replace(tzinfo=None).isoformat() + extra_precision + 'Z'
+        return at_td.isoformat() + extra_precision + 'Z'
     
     @property
     def client_driven_nanos_supported(self) -> bool:
