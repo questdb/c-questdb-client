@@ -86,12 +86,19 @@ fn test_basics(
         .at(ts_nanos)?;
 
     assert_eq!(server.recv_q()?, 0);
+    let (ts3_num, ts3_suffix, dts_suffix) = if version == ProtocolVersion::V1 {
+        (ts_nanos_num / 1000, "t", "")
+    } else {
+        (ts_nanos_num, "n", "n")
+    };
     let exp = &[
         "test,t1=v1 ".as_bytes(),
         f64_to_bytes("f1", 0.5, version).as_slice(),
         format!(
-            ",ts1=12345t,ts2={}t,ts3={ts_nanos_num}n {ts_nanos_num}\n",
-            ts_micros_num
+            ",ts1=12345t,\
+            ts2={ts_micros_num}t,\
+            ts3={ts3_num}{ts3_suffix} \
+            {ts_nanos_num}{dts_suffix}\n"
         )
         .as_bytes(),
     ]
@@ -139,7 +146,7 @@ fn test_array_f64_basic() -> TestResult {
         &1.0f64.to_le_bytes(),
         &2.0f64.to_le_bytes(),
         &3.0f64.to_le_bytes(),
-        format!(" {}\n", ts.as_i64()).as_bytes(),
+        format!(" {}n\n", ts.as_i64()).as_bytes(),
     ]
     .concat();
 
@@ -217,7 +224,7 @@ fn test_array_f64_for_ndarray() -> TestResult {
         ",arr3d=".as_bytes(),
         array_header3d,
         array_data3d.as_slice(),
-        format!(" {}\n", ts.as_i64()).as_bytes(),
+        format!(" {}n\n", ts.as_i64()).as_bytes(),
     ]
     .concat();
 
@@ -506,7 +513,49 @@ fn test_bad_key(
 }
 
 #[test]
-fn test_timestamp_overloads() -> TestResult {
+fn test_timestamp_overloads_v1() -> TestResult {
+    use std::time::SystemTime;
+
+    let tbl_name = TableName::new("tbl_name")?;
+
+    let mut buffer = Buffer::new(ProtocolVersion::V1);
+    buffer
+        .table(tbl_name)?
+        .column_ts("a", TimestampMicros::new(12345))?
+        .column_ts("b", TimestampMicros::new(-100000000))?
+        .column_ts("c", TimestampNanos::new(12345678))?
+        .column_ts("d", TimestampNanos::new(-12345678))?
+        .column_ts("e", Timestamp::Micros(TimestampMicros::new(-1)))?
+        .column_ts("f", Timestamp::Nanos(TimestampNanos::new(-10000)))?
+        .at(TimestampMicros::new(1))?;
+    buffer
+        .table(tbl_name)?
+        .column_ts(
+            "a",
+            TimestampMicros::from_systemtime(
+                SystemTime::UNIX_EPOCH
+                    .checked_add(Duration::from_secs(1))
+                    .unwrap(),
+            )?,
+        )?
+        .at(TimestampNanos::from_systemtime(
+            SystemTime::UNIX_EPOCH
+                .checked_add(Duration::from_secs(5))
+                .unwrap(),
+        )?)?;
+
+    let exp = concat!(
+        "tbl_name a=12345t,b=-100000000t,c=12345t,d=-12345t,e=-1t,f=-10t 1000\n",
+        "tbl_name a=1000000t 5000000000\n"
+    )
+    .as_bytes();
+    assert_eq!(buffer.as_bytes(), exp);
+
+    Ok(())
+}
+
+#[test]
+fn test_timestamp_overloads_v2() -> TestResult {
     use std::time::SystemTime;
 
     let tbl_name = TableName::new("tbl_name")?;
@@ -538,8 +587,8 @@ fn test_timestamp_overloads() -> TestResult {
         )?)?;
 
     let exp = concat!(
-        "tbl_name a=12345t,b=-100000000t,c=12345678n,d=-12345678n,e=-1t,f=-10000n 1000\n",
-        "tbl_name a=1000000t 5000000000\n"
+        "tbl_name a=12345t,b=-100000000t,c=12345678n,d=-12345678n,e=-1t,f=-10000n 1t\n",
+        "tbl_name a=1000000t 5000000000n\n"
     )
     .as_bytes();
     assert_eq!(buffer.as_bytes(), exp);
@@ -559,7 +608,7 @@ fn test_chrono_timestamp() -> TestResult {
     let mut buffer = Buffer::new(ProtocolVersion::V2);
     buffer.table(tbl_name)?.column_ts("a", ts)?.at(ts)?;
 
-    let exp = b"tbl_name a=1000000000n 1000000000\n";
+    let exp = b"tbl_name a=1000000000n 1000000000n\n";
     assert_eq!(buffer.as_bytes(), exp);
 
     Ok(())
@@ -633,11 +682,17 @@ fn test_tls_with_file_ca(
         .column_f64("f1", 0.5)?
         .at(TimestampNanos::new(10000000))?;
 
+    let designated_ts = if version == ProtocolVersion::V1 {
+        " 10000000\n"
+    } else {
+        " 10000000n\n"
+    };
+
     assert_eq!(server.recv_q()?, 0);
     let exp = &[
         "test,t1=v1 ".as_bytes(),
         f64_to_bytes("f1", 0.5, version).as_slice(),
-        " 10000000\n".as_bytes(),
+        designated_ts.as_bytes(),
     ]
     .concat();
     assert_eq!(buffer.as_bytes(), exp);
@@ -740,10 +795,15 @@ fn test_tls_insecure_skip_verify(
         .at(TimestampNanos::new(10000000))?;
 
     assert_eq!(server.recv_q()?, 0);
+    let designated_ts = if version == ProtocolVersion::V1 {
+        " 10000000\n"
+    } else {
+        " 10000000n\n"
+    };
     let exp = &[
         "test,t1=v1 ".as_bytes(),
         f64_to_bytes("f1", 0.5, version).as_slice(),
-        " 10000000\n".as_bytes(),
+        designated_ts.as_bytes(),
     ]
     .concat();
     assert_eq!(buffer.as_bytes(), exp);

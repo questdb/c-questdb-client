@@ -723,10 +723,16 @@ fn _test_sender_auto_detect_protocol_version(
             )?,
             Some(_) => server.send_settings_response()?,
         }
+
+        let designated_ts = if expect_version == ProtocolVersion::V1 {
+            " 10000000\n"
+        } else {
+            " 10000000n\n"
+        };
         let exp = &[
             b"test,t1=v1 ",
             crate::tests::sender::f64_to_bytes("f1", 0.5, expect_version).as_slice(),
-            b" 10000000\n",
+            designated_ts.as_bytes(),
         ]
         .concat();
         let req = server.recv_http_q()?;

@@ -43,7 +43,7 @@ def main():
         build_cxx20_dir.glob(f'**/test_line_sender{exe_suffix}')))
 
     system_test_path = pathlib.Path('system_test') / 'test.py'
-    qdb_v = '9.0.3'  # The version of QuestDB we'll test against.
+    qdb_v = '9.1.0'  # The version of QuestDB we'll test against.
 
     run_cmd('cargo', 'test',
             '--', '--nocapture', cwd='questdb-rs')
