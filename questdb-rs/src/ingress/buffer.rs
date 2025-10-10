@@ -72,7 +72,7 @@ where
     quoting_fn(output);
 }
 
-pub fn must_escape_unquoted(c: u8) -> bool {
+pub(crate) fn must_escape_unquoted(c: u8) -> bool {
     matches!(c, b' ' | b',' | b'=' | b'\n' | b'\r' | b'\\')
 }
 
