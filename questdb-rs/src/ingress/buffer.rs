@@ -1020,7 +1020,7 @@ impl Buffer {
     /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
     /// # let mut buffer = sender.new_buffer();
     /// # buffer.table("x")?;
-    /// let value = Decimal::from_str("123.45")?;
+    /// let value = Decimal::from_str("123.45").unwrap();
     /// buffer.column_decimal("col_name", &value)?;
     /// # Ok(())
     /// # }
@@ -1041,7 +1041,7 @@ impl Buffer {
     /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
     /// # let mut buffer = sender.new_buffer();
     /// # buffer.table("x")?;
-    /// let value = BigDecimal::from_str("0.123456789012345678901234567890")?;
+    /// let value = BigDecimal::from_str("0.123456789012345678901234567890").unwrap();
     /// buffer.column_decimal("col_name", &value)?;
     /// # Ok(())
     /// # }
