@@ -167,7 +167,7 @@ impl DecimalSerializer for &rust_decimal::Decimal {
         // We skip the upper 3 bytes (which are sign-extended) and write the lower 13 bytes
         let mantissa = self.mantissa();
         out.push(13);
-        out.extend_from_slice(&mantissa.to_be_bytes()[3..]); // Skip upper 4 bytes, write lower 12
+        out.extend_from_slice(&mantissa.to_be_bytes()[3..]);
 
         Ok(())
     }
