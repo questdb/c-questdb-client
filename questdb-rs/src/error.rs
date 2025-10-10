@@ -78,6 +78,9 @@ pub enum ErrorCode {
 
     /// Validate protocol version error.
     ProtocolVersionError,
+
+    /// The supplied decimal is invalid.
+    InvalidDecimal,
 }
 
 /// An error that occurred when using QuestDB client library.

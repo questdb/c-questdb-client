@@ -224,6 +224,9 @@ pub enum line_sender_error_code {
 
     /// Line sender protocol version error.
     line_sender_error_protocol_version_error,
+
+    /// The supplied decimal is invalid.
+    line_sender_error_invalid_decimal,
 }
 
 impl From<ErrorCode> for line_sender_error_code {
@@ -251,6 +254,9 @@ impl From<ErrorCode> for line_sender_error_code {
             ErrorCode::ArrayError => line_sender_error_code::line_sender_error_array_error,
             ErrorCode::ProtocolVersionError => {
                 line_sender_error_code::line_sender_error_protocol_version_error
+            }
+            ErrorCode::InvalidDecimal => {
+                line_sender_error_code::line_sender_error_invalid_decimal
             }
         }
     }

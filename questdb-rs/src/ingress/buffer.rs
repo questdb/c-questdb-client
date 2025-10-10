@@ -21,6 +21,7 @@
  *  limitations under the License.
  *
  ******************************************************************************/
+use crate::ingress::decimal::DecimalSerializer;
 use crate::ingress::ndarr::{check_and_get_array_bytes_size, ArrayElementSealed};
 use crate::ingress::{
     ndarr, ArrayElement, DebugBytes, NdArrayView, ProtocolVersion, Timestamp, TimestampNanos,
@@ -71,7 +72,7 @@ where
     quoting_fn(output);
 }
 
-fn must_escape_unquoted(c: u8) -> bool {
+pub fn must_escape_unquoted(c: u8) -> bool {
     matches!(c, b' ' | b',' | b'=' | b'\n' | b'\r' | b'\\')
 }
 
@@ -971,6 +972,22 @@ impl Buffer {
     {
         self.write_column_key(name)?;
         write_escaped_quoted(&mut self.output, value.as_ref());
+        Ok(self)
+    }
+
+    /// Record a decimal value for the given column.
+    /// ```
+    pub fn column_decimal<'a, N, S>(&mut self, name: N, value: S) -> crate::Result<&mut Self>
+    where
+        N: TryInto<ColumnName<'a>>,
+        S: DecimalSerializer,
+        Error: From<N::Error>,
+    {
+        self.write_column_key(name)?;
+        value.serialize(
+            &mut self.output,
+            self.protocol_version == ProtocolVersion::V2,
+        )?;
         Ok(self)
     }
 

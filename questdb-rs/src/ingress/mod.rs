@@ -62,6 +62,9 @@ pub use buffer::*;
 mod sender;
 pub use sender::*;
 
+mod decimal;
+pub use decimal::DecimalSerializer;
+
 const MAX_NAME_LEN_DEFAULT: usize = 127;
 
 /// The maximum allowed dimensions for arrays.
@@ -71,6 +74,7 @@ pub const MAX_ARRAY_DIM_LEN: usize = 0x0FFF_FFFF; // 1 << 28 - 1
 
 pub(crate) const ARRAY_BINARY_FORMAT_TYPE: u8 = 14;
 pub(crate) const DOUBLE_BINARY_FORMAT_TYPE: u8 = 16;
+pub(crate) const DECIMAL_BINARY_FORMAT_TYPE: u8 = 23;
 
 /// The version of InfluxDB Line Protocol used to communicate with the server.
 #[derive(Debug, Copy, Clone, PartialEq)]

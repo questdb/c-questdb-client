@@ -30,6 +30,7 @@ mod http;
 mod mock;
 mod sender;
 
+mod decimal;
 mod ndarr;
 
 #[cfg(feature = "json_tests")]
