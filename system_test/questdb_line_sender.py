@@ -734,7 +734,7 @@ class Buffer:
             fqn = _fully_qual_name(value)
             raise ValueError(
                 f'Bad field value of type {fqn}: Expected one of '
-                '`bool`, `int`, `float` or `str`.')
+                '`bool`, `int`, `float`, `str`, `Decimal`, `TimestampMicros`, or `datetime`.')
         return self
 
     def column_f64_arr(self, name: str,
@@ -916,7 +916,7 @@ class Sender:
 
     def column(
             self, name: str,
-            value: Union[bool, int, float, str, TimestampMicros, datetime]):
+            value: Union[bool, int, float, str, Decimal, TimestampMicros, datetime]):
         self._buffer.column(name, value)
         return self
 
