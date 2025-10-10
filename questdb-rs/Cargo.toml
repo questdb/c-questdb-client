@@ -28,18 +28,26 @@ itoa = "1.0"
 aws-lc-rs = { version = "1.13", optional = true }
 ring = { version = "0.17.14", optional = true }
 rustls-pki-types = "1.0.1"
-rustls = { version = "0.23.25", default-features = false, features = ["logging", "std", "tls12"] }
+rustls = { version = "0.23.25", default-features = false, features = [
+    "logging",
+    "std",
+    "tls12",
+] }
 rustls-native-certs = { version = "0.8.1", optional = true }
 webpki-roots = { version = "1.0.1", default-features = false, optional = true }
 chrono = { version = "0.4.40", optional = true }
 
 # We need to limit the `ureq` version to 3.0.x since we use
 # the `ureq::unversioned` module which does not respect semantic versioning.
-ureq = { version = "3.0.10, <3.1.0", default-features = false, features = ["_tls"], optional = true }
+ureq = { version = "3.0.10, <3.1.0", default-features = false, features = [
+    "_tls",
+], optional = true }
 serde_json = { version = "1", optional = true }
 questdb-confstr = "0.1.1"
 rand = { version = "0.9.0", optional = true }
 ndarray = { version = "0.16", optional = true }
+rust_decimal = { version = "1.38.0", optional = true }
+bigdecimal = { version = "0.4.8", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3.9", features = ["ws2def"] }
@@ -68,7 +76,13 @@ sync-sender = ["sync-sender-tcp", "sync-sender-http"]
 sync-sender-tcp = ["_sync-sender", "_sender-tcp", "dep:socket2"]
 
 ## Sync ILP/HTTP
-sync-sender-http = ["_sync-sender", "_sender-http", "dep:ureq", "dep:serde_json", "dep:rand"]
+sync-sender-http = [
+    "_sync-sender",
+    "_sender-http",
+    "dep:ureq",
+    "dep:serde_json",
+    "dep:rand",
+]
 
 ## Allow use OS-provided root TLS certificates
 tls-native-certs = ["dep:rustls-native-certs"]
@@ -91,6 +105,12 @@ json_tests = []
 ## Enable methods to create timestamp objects from chrono::DateTime objects.
 chrono_timestamp = ["chrono"]
 
+## Enable serialization of rust_decimal::Decimal in ILP
+rust_decimal = ["dep:rust_decimal"]
+
+## Enable serialization of bigdecimal::BigDecimal in ILP
+bigdecimal = ["dep:bigdecimal"]
+
 # Hidden derived features, used in code to enable-disable code sections. Don't use directly.
 _sender-tcp = []
 _sender-http = []
@@ -109,7 +129,9 @@ almost-all-features = [
     "insecure-skip-verify",
     "json_tests",
     "chrono_timestamp",
-    "ndarray"
+    "ndarray",
+    "rust_decimal",
+    "bigdecimal",
 ]
 
 [[example]]
@@ -126,8 +148,8 @@ required-features = ["chrono_timestamp"]
 
 [[example]]
 name = "http"
-required-features = ["sync-sender-http", "ndarray"]
+required-features = ["sync-sender-http", "ndarray", "rust_decimal"]
 
 [[example]]
 name = "protocol_version"
-required-features = ["sync-sender-http", "ndarray"]
+required-features = ["sync-sender-http", "ndarray", "bigdecimal"]

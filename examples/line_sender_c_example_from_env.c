@@ -37,7 +37,9 @@ int main(int argc, const char* argv[])
     if (!line_sender_buffer_symbol(buffer, side_name, side_value, &err))
         goto on_error;
 
-    if (!line_sender_buffer_column_f64(buffer, price_name, 2615.54, &err))
+    line_sender_utf8 price_value = QDB_UTF8_LITERAL("2615.54");
+    if (!line_sender_buffer_column_decimal_str(
+            buffer, price_name, price_value, &err))
         goto on_error;
 
     if (!line_sender_buffer_column_f64(buffer, amount_name, 0.00044, &err))

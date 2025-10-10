@@ -82,6 +82,15 @@ enum class line_sender_error_code
 
     /** Bad configuration. */
     config_error,
+
+    /** There was an error serializing an array. */
+    array_error,
+
+    /**  Line sender protocol version error. */
+    protocol_version_error,
+
+    /** The supplied decimal is invalid. */
+    invalid_decimal,
 };
 
 /** The protocol used to connect with. */
@@ -1024,6 +1033,41 @@ public:
     line_sender_buffer& column(column_name_view name, const std::string& value)
     {
         return column(name, utf8_view{value});
+    }
+
+    /**
+     * Record a decimal string value for the given column.
+     * @param name Column name.
+     * @param value Column value.
+     */
+    line_sender_buffer& column_decimal(column_name_view name, utf8_view value)
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_decimal_str,
+            _impl,
+            name._impl,
+            value._impl);
+        return *this;
+    }
+
+    template <size_t N>
+    line_sender_buffer& column_decimal(
+        column_name_view name, const char (&value)[N])
+    {
+        return column_decimal(name, utf8_view{value});
+    }
+
+    line_sender_buffer& column_decimal(
+        column_name_view name, std::string_view value)
+    {
+        return column_decimal(name, utf8_view{value});
+    }
+
+    line_sender_buffer& column_decimal(
+        column_name_view name, const std::string& value)
+    {
+        return column_decimal(name, utf8_view{value});
     }
 
     /** Record a nanosecond timestamp value for the given column. */

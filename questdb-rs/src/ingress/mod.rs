@@ -62,6 +62,9 @@ pub use buffer::*;
 mod sender;
 pub use sender::*;
 
+mod decimal;
+pub use decimal::DecimalSerializer;
+
 const MAX_NAME_LEN_DEFAULT: usize = 127;
 
 /// The maximum allowed dimensions for arrays.
@@ -71,6 +74,8 @@ pub const MAX_ARRAY_DIM_LEN: usize = 0x0FFF_FFFF; // 1 << 28 - 1
 
 pub(crate) const ARRAY_BINARY_FORMAT_TYPE: u8 = 14;
 pub(crate) const DOUBLE_BINARY_FORMAT_TYPE: u8 = 16;
+#[allow(dead_code)]
+pub(crate) const DECIMAL_BINARY_FORMAT_TYPE: u8 = 23;
 
 /// The version of InfluxDB Line Protocol used to communicate with the server.
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -85,6 +90,23 @@ pub enum ProtocolVersion {
     /// This version is specific to QuestDB and is not compatible with InfluxDB.
     /// QuestDB server version 9.0.0 or later is required for `V2` supported.
     V2 = 2,
+}
+
+impl ProtocolVersion {
+    /// Returns `true` if this protocol version supports binary-encoded column values.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use questdb::ingress::ProtocolVersion;
+    ///
+    /// assert_eq!(ProtocolVersion::V1.supports_binary_encoding(), false);
+    /// assert_eq!(ProtocolVersion::V2.supports_binary_encoding(), true);
+    /// ```
+    #[inline]
+    pub fn supports_binary_encoding(self) -> bool {
+        self != ProtocolVersion::V1
+    }
 }
 
 impl Display for ProtocolVersion {

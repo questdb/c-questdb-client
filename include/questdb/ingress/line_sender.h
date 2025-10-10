@@ -83,6 +83,9 @@ typedef enum line_sender_error_code
 
     /**  Line sender protocol version error. */
     line_sender_error_protocol_version_error,
+
+    /** The supplied decimal is invalid. */
+    line_sender_error_invalid_decimal,
 } line_sender_error_code;
 
 /** The protocol used to connect with. */
@@ -491,6 +494,22 @@ bool line_sender_buffer_column_f64(
  */
 LINESENDER_API
 bool line_sender_buffer_column_str(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    line_sender_utf8 value,
+    line_sender_error** err_out);
+
+/**
+ * Record a decimal string value for the given column.
+ *
+ * @param[in] buffer Line buffer object.
+ * @param[in] name Column name.
+ * @param[in] value Column value.
+ * @param[out] err_out Set on error.
+ * @return true on success, false on error.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_decimal_str(
     line_sender_buffer* buffer,
     line_sender_column_name name,
     line_sender_utf8 value,

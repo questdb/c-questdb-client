@@ -21,6 +21,7 @@
  *  limitations under the License.
  *
  ******************************************************************************/
+use crate::ingress::decimal::DecimalSerializer;
 use crate::ingress::ndarr::{check_and_get_array_bytes_size, ArrayElementSealed};
 use crate::ingress::{
     ndarr, ArrayElement, DebugBytes, NdArrayView, ProtocolVersion, Timestamp, TimestampNanos,
@@ -71,7 +72,7 @@ where
     quoting_fn(output);
 }
 
-fn must_escape_unquoted(c: u8) -> bool {
+pub(crate) fn must_escape_unquoted(c: u8) -> bool {
     matches!(c, b' ' | b',' | b'=' | b'\n' | b'\r' | b'\\')
 }
 
@@ -971,6 +972,92 @@ impl Buffer {
     {
         self.write_column_key(name)?;
         write_escaped_quoted(&mut self.output, value.as_ref());
+        Ok(self)
+    }
+
+    /// Record a decimal value for the given column.
+    ///
+    /// ```no_run
+    /// # use questdb::Result;
+    /// # use questdb::ingress::{Buffer, SenderBuilder};
+    /// # fn main() -> Result<()> {
+    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+    /// # let mut buffer = sender.new_buffer();
+    /// # buffer.table("x")?;
+    /// buffer.column_decimal("col_name", "123.45")?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// or
+    ///
+    /// ```no_run
+    /// # use questdb::Result;
+    /// # use questdb::ingress::{Buffer, SenderBuilder};
+    /// use questdb::ingress::ColumnName;
+    ///
+    /// # fn main() -> Result<()> {
+    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+    /// # let mut buffer = sender.new_buffer();
+    /// # buffer.table("x")?;
+    /// let col_name = ColumnName::new("col_name")?;
+    /// buffer.column_decimal(col_name, "123.45")?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// With `rust_decimal` feature enabled:
+    ///
+    /// ```no_run
+    /// # #[cfg(feature = "rust_decimal")]
+    /// # {
+    /// # use questdb::Result;
+    /// # use questdb::ingress::{Buffer, SenderBuilder};
+    /// use rust_decimal::Decimal;
+    /// use std::str::FromStr;
+    ///
+    /// # fn main() -> Result<()> {
+    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+    /// # let mut buffer = sender.new_buffer();
+    /// # buffer.table("x")?;
+    /// let value = Decimal::from_str("123.45").unwrap();
+    /// buffer.column_decimal("col_name", &value)?;
+    /// # Ok(())
+    /// # }
+    /// # }
+    /// ```
+    ///
+    /// With `bigdecimal` feature enabled:
+    ///
+    /// ```no_run
+    /// # #[cfg(feature = "bigdecimal")]
+    /// # {
+    /// # use questdb::Result;
+    /// # use questdb::ingress::{Buffer, SenderBuilder};
+    /// use bigdecimal::BigDecimal;
+    /// use std::str::FromStr;
+    ///
+    /// # fn main() -> Result<()> {
+    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+    /// # let mut buffer = sender.new_buffer();
+    /// # buffer.table("x")?;
+    /// let value = BigDecimal::from_str("0.123456789012345678901234567890").unwrap();
+    /// buffer.column_decimal("col_name", &value)?;
+    /// # Ok(())
+    /// # }
+    /// # }
+    /// ```
+    pub fn column_decimal<'a, N, S>(&mut self, name: N, value: S) -> crate::Result<&mut Self>
+    where
+        N: TryInto<ColumnName<'a>>,
+        S: DecimalSerializer,
+        Error: From<N::Error>,
+    {
+        self.write_column_key(name)?;
+        value.serialize(
+            &mut self.output,
+            self.protocol_version.supports_binary_encoding(),
+        )?;
         Ok(self)
     }
 
