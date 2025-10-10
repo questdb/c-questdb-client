@@ -125,6 +125,7 @@ impl DecimalSerializer for &str {
     }
 }
 
+#[cfg(any(feature = "rust_decimal", feature = "bigdecimal"))]
 use crate::ingress::DECIMAL_BINARY_FORMAT_TYPE;
 
 /// Helper to format decimal values directly to a byte buffer without heap allocation.
@@ -160,11 +161,6 @@ impl DecimalSerializer for &rust_decimal::Decimal {
         // rust_decimal::Decimal guarantees:
         // - MAX_SCALE is 28, which is within QuestDB's limit of 76
         // - Mantissa is always 96 bits (12 bytes), never exceeds this size
-        debug_assert!(rust_decimal::Decimal::MAX_SCALE <= 76);
-        debug_assert!(
-            rust_decimal::Decimal::MAX.mantissa() & 0x7FFF_FFFF_0000_0000_0000_0000_0000_0000i128
-                == 0
-        );
 
         out.push(self.scale() as u8);
 

@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-use crate::ingress::{Buffer, DecimalSerializer, ProtocolVersion, DECIMAL_BINARY_FORMAT_TYPE};
+use crate::ingress::{Buffer, DecimalSerializer, ProtocolVersion};
 use crate::tests::TestResult;
 use crate::ErrorCode;
 
@@ -140,6 +140,8 @@ fn test_str_rejects_backslash() -> TestResult {
 #[cfg(any(feature = "rust_decimal", feature = "bigdecimal"))]
 fn parse_binary_decimal(bytes: &[u8]) -> (u8, i128) {
     // Validate format markers
+
+    use crate::ingress::DECIMAL_BINARY_FORMAT_TYPE;
     assert_eq!(bytes[0], b'=', "Missing binary format marker");
     assert_eq!(
         bytes[1], DECIMAL_BINARY_FORMAT_TYPE,
