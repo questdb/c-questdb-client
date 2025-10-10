@@ -1056,7 +1056,7 @@ impl Buffer {
         self.write_column_key(name)?;
         value.serialize(
             &mut self.output,
-            self.protocol_version == ProtocolVersion::V2,
+            self.protocol_version.supports_binary_encoding(),
         )?;
         Ok(self)
     }

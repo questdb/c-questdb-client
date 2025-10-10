@@ -91,6 +91,23 @@ pub enum ProtocolVersion {
     V2 = 2,
 }
 
+impl ProtocolVersion {
+    /// Returns `true` if this protocol version supports binary-encoded column values.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use questdb::ingress::ProtocolVersion;
+    ///
+    /// assert_eq!(ProtocolVersion::V1.supports_binary_encoding(), false);
+    /// assert_eq!(ProtocolVersion::V2.supports_binary_encoding(), true);
+    /// ```
+    #[inline]
+    pub fn supports_binary_encoding(self) -> bool {
+        self != ProtocolVersion::V1
+    }
+}
+
 impl Display for ProtocolVersion {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
