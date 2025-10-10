@@ -82,6 +82,15 @@ enum class line_sender_error_code
 
     /** Bad configuration. */
     config_error,
+
+    /** There was an error serializing an array. */
+    array_error,
+
+    /**  Line sender protocol version error. */
+    protocol_version_error,
+
+    /** The supplied decimal is invalid. */
+    invalid_decimal,
 };
 
 /** The protocol used to connect with. */

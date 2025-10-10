@@ -83,6 +83,9 @@ typedef enum line_sender_error_code
 
     /**  Line sender protocol version error. */
     line_sender_error_protocol_version_error,
+
+    /** The supplied decimal is invalid. */
+    line_sender_error_invalid_decimal,
 } line_sender_error_code;
 
 /** The protocol used to connect with. */
