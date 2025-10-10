@@ -76,7 +76,7 @@ questdb::ingress::line_sender_buffer buffer;
 buffer
     .table("trades")
     .symbol("symbol", "ETH-USD")
-    .column("price", 2615.54)
+    .column_decimal("price", "2615.54"_utf8)
     .at(timestamp_nanos::now());
 
 // To insert more records, call `buffer.table(..)...` again.

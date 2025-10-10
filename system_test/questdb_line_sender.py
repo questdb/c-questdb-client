@@ -49,6 +49,7 @@ import os
 from datetime import datetime
 from functools import total_ordering
 from enum import Enum
+from decimal import Decimal
 
 from ctypes import (
     c_bool,
@@ -285,6 +286,13 @@ def _setup_cdll():
         c_line_sender_error_p_p)
     set_sig(
         dll.line_sender_buffer_column_str,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        c_line_sender_utf8,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_decimal_str,
         c_bool,
         c_line_sender_buffer_p,
         c_line_sender_column_name,
@@ -703,6 +711,12 @@ class Buffer:
                 self._impl,
                 _column_name(name),
                 _utf8(value))
+        elif isinstance(value, Decimal):
+            _error_wrapped_call(
+                _DLL.line_sender_buffer_column_decimal_str,
+                self._impl,
+                _column_name(name),
+                _utf8(str(value)))
         elif isinstance(value, TimestampMicros):
             _error_wrapped_call(
                 _DLL.line_sender_buffer_column_ts_micros,

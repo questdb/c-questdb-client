@@ -1026,6 +1026,41 @@ public:
         return column(name, utf8_view{value});
     }
 
+    /**
+     * Record a decimal string value for the given column.
+     * @param name Column name.
+     * @param value Column value.
+     */
+    line_sender_buffer& column_decimal(column_name_view name, utf8_view value)
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_decimal_str,
+            _impl,
+            name._impl,
+            value._impl);
+        return *this;
+    }
+
+    template <size_t N>
+    line_sender_buffer& column_decimal(
+        column_name_view name, const char (&value)[N])
+    {
+        return column_decimal(name, utf8_view{value});
+    }
+
+    line_sender_buffer& column_decimal(
+        column_name_view name, std::string_view value)
+    {
+        return column_decimal(name, utf8_view{value});
+    }
+
+    line_sender_buffer& column_decimal(
+        column_name_view name, const std::string& value)
+    {
+        return column_decimal(name, utf8_view{value});
+    }
+
     /** Record a nanosecond timestamp value for the given column. */
     template <typename ClockT>
     line_sender_buffer& column(

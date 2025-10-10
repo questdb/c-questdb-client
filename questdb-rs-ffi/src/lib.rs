@@ -255,9 +255,7 @@ impl From<ErrorCode> for line_sender_error_code {
             ErrorCode::ProtocolVersionError => {
                 line_sender_error_code::line_sender_error_protocol_version_error
             }
-            ErrorCode::InvalidDecimal => {
-                line_sender_error_code::line_sender_error_invalid_decimal
-            }
+            ErrorCode::InvalidDecimal => line_sender_error_code::line_sender_error_invalid_decimal,
         }
     }
 }
@@ -937,6 +935,26 @@ pub unsafe extern "C" fn line_sender_buffer_column_str(
     let name = name.as_name();
     let value = value.as_str();
     bubble_err_to_c!(err_out, buffer.column_str(name, value));
+    true
+}
+
+/// Record a decimal string value for the given column.
+/// @param[in] buffer Line buffer object.
+/// @param[in] name Column name.
+/// @param[in] value Column value.
+/// @param[out] err_out Set on error.
+/// @return true on success, false on error.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_buffer_column_decimal_str(
+    buffer: *mut line_sender_buffer,
+    name: line_sender_column_name,
+    value: line_sender_utf8,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    let buffer = unwrap_buffer_mut(buffer);
+    let name = name.as_name();
+    let value = value.as_str();
+    bubble_err_to_c!(err_out, buffer.column_decimal(name, value));
     true
 }
 

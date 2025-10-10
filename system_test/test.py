@@ -49,7 +49,7 @@ from fixture import (
     list_questdb_releases,
     AUTH)
 import subprocess
-from collections import namedtuple
+from decimal import Decimal
 
 QDB_FIXTURE: QuestDbFixtureBase = None
 TLS_PROXY_FIXTURE: TlsProxyFixture = None
@@ -517,6 +517,37 @@ class TestSender(unittest.TestCase):
         scrubbed_dataset = [row[:-1] for row in resp['dataset']]
         self.assertEqual(scrubbed_dataset, exp_dataset)
 
+    def test_decimal_column(self):
+        table_name = uuid.uuid4().hex
+        pending = None
+        decimals = [
+            Decimal("12.99"),
+            Decimal("-12.34"),
+            Decimal("0.001"),
+            Decimal("10000000.0"),
+            Decimal("NaN"),
+            Decimal("Infinity"),
+            Decimal("0"),
+            Decimal("-0"),
+            Decimal("1e3")
+        ]
+        with self._mk_linesender() as sender:
+            for dec in decimals:
+                sender.table(table_name)
+                sender.column('dec', dec)
+                sender.at_now()
+            pending = sender.buffer.peek()
+
+        resp = retry_check_table(table_name, min_rows=len(decimals), log_ctx=pending)
+        exp_columns = [
+            {'name': 'dec', 'type': 'DECIMAL(18,3)'},
+            {'name': 'timestamp', 'type': 'TIMESTAMP'}]
+        self.assertEqual(resp['columns'], exp_columns)
+        # By default, the decimal created as a scale of 3
+        exp_dataset = [['12.990'], ['-12.340'], ['0.001'], ['10000000.000'], [None], [None], ['0.000'], ['0.000'], ['1000.000']]
+        scrubbed_dataset = [row[:-1] for row in resp['dataset']]
+        self.assertEqual(scrubbed_dataset, exp_dataset)
+
     def test_f64_arr_column(self):
         if self.expected_protocol_version < qls.ProtocolVersion.V2:
             self.skipTest('communicating over old protocol which does not support arrays')
@@ -753,14 +784,14 @@ class TestSender(unittest.TestCase):
         exp_columns = [
             {'name': 'symbol', 'type': 'SYMBOL'},
             {'name': 'side', 'type': 'SYMBOL'},
-            {'name': 'price', 'type': 'DOUBLE'},
+            {'name': 'price', 'type': 'DECIMAL(18,3)'},
             {'name': 'amount', 'type': 'DOUBLE'},
             {'name': 'timestamp', 'type': 'TIMESTAMP'}]
         self.assertEqual(resp['columns'], exp_columns)
 
         exp_dataset = [['ETH-USD',
                         'sell',
-                        2615.54,
+                        '2615.540',
                         0.00044]]
         # Comparison excludes timestamp column.
         scrubbed_dataset = [row[:-1] for row in resp['dataset']]
