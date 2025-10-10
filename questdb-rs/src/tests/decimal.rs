@@ -506,7 +506,7 @@ mod bigdecimal_tests {
 
     #[test]
     fn test_bigdecimal_binary_negative_scale() -> TestResult {
-        // Test with scale a negative scale
+        // Test with a negative scale
         let dec = BigDecimal::from_str("1.23e12")?;
         let result = serialize_decimal(&dec, true)?;
 
