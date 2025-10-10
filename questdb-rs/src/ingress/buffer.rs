@@ -976,6 +976,76 @@ impl Buffer {
     }
 
     /// Record a decimal value for the given column.
+    ///
+    /// ```no_run
+    /// # use questdb::Result;
+    /// # use questdb::ingress::{Buffer, SenderBuilder};
+    /// # fn main() -> Result<()> {
+    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+    /// # let mut buffer = sender.new_buffer();
+    /// # buffer.table("x")?;
+    /// buffer.column_decimal("col_name", "123.45")?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// or
+    ///
+    /// ```no_run
+    /// # use questdb::Result;
+    /// # use questdb::ingress::{Buffer, SenderBuilder};
+    /// use questdb::ingress::ColumnName;
+    ///
+    /// # fn main() -> Result<()> {
+    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+    /// # let mut buffer = sender.new_buffer();
+    /// # buffer.table("x")?;
+    /// let col_name = ColumnName::new("col_name")?;
+    /// buffer.column_decimal(col_name, "123.45")?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// With `rust_decimal` feature enabled:
+    ///
+    /// ```no_run
+    /// # #[cfg(feature = "rust_decimal")]
+    /// # {
+    /// # use questdb::Result;
+    /// # use questdb::ingress::{Buffer, SenderBuilder};
+    /// use rust_decimal::Decimal;
+    /// use std::str::FromStr;
+    ///
+    /// # fn main() -> Result<()> {
+    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+    /// # let mut buffer = sender.new_buffer();
+    /// # buffer.table("x")?;
+    /// let value = Decimal::from_str("123.45")?;
+    /// buffer.column_decimal("col_name", &value)?;
+    /// # Ok(())
+    /// # }
+    /// # }
+    /// ```
+    ///
+    /// With `bigdecimal` feature enabled:
+    ///
+    /// ```no_run
+    /// # #[cfg(feature = "bigdecimal")]
+    /// # {
+    /// # use questdb::Result;
+    /// # use questdb::ingress::{Buffer, SenderBuilder};
+    /// use bigdecimal::BigDecimal;
+    /// use std::str::FromStr;
+    ///
+    /// # fn main() -> Result<()> {
+    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+    /// # let mut buffer = sender.new_buffer();
+    /// # buffer.table("x")?;
+    /// let value = BigDecimal::from_str("0.123456789012345678901234567890")?;
+    /// buffer.column_decimal("col_name", &value)?;
+    /// # Ok(())
+    /// # }
+    /// # }
     /// ```
     pub fn column_decimal<'a, N, S>(&mut self, name: N, value: S) -> crate::Result<&mut Self>
     where

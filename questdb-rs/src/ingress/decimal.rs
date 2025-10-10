@@ -47,9 +47,17 @@ use crate::{error, ingress::must_escape_unquoted, Result};
 /// 4. Length: 1 byte - number of bytes in the unscaled value
 /// 5. Unscaled value: variable-length byte array in two's complement format, big-endian
 ///
-/// Example: For decimal `123.45` with scale 2 and unscaled value 12345:
-/// ```text
-/// = [DECIMAL_BINARY_FORMAT_TYPE] [2] [2] [0x30] [0x39]
+/// Example: For decimal `123.45` with scale 2:
+/// ```
+/// Unscaled value: 12345
+/// Binary representation:
+///   = [23] [2] [2] [0x30] [0x39]
+///   │  │    │   │  └───────────┘
+///   │  │    │   │        └─ Mantissa bytes (12345 in big-endian)
+///   │  │    │   └─ Length: 2 bytes
+///   │  │    └─ Scale: 2
+///   │  └─ Type: DECIMAL_BINARY_FORMAT_TYPE (23)
+///   └─ Binary marker: '='
 /// ```
 ///
 /// # Binary Format Notes
