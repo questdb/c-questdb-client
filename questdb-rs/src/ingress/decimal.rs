@@ -48,7 +48,7 @@ use crate::{error, ingress::must_escape_unquoted, Result};
 /// 5. Unscaled value: variable-length byte array in two's complement format, big-endian
 ///
 /// Example: For decimal `123.45` with scale 2:
-/// ```
+/// ```text
 /// Unscaled value: 12345
 /// Binary representation:
 ///   = [23] [2] [2] [0x30] [0x39]
