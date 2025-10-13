@@ -63,12 +63,19 @@ pub mod json_tests {
     }
 
     #[derive(Debug, Serialize, Deserialize)]
+    struct DecimalColumn {
+        name: String,
+        value: String,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
     #[serde(tag = "type", rename_all = "UPPERCASE")]
     enum Column {
         String(StringColumn),
         Long(LongColumn),
         Double(DoubleColumn),
         Boolean(BooleanColumn),
+        Decimal(DecimalColumn),
     }
 
     #[derive(Debug, Serialize, Deserialize)]
@@ -126,6 +133,8 @@ pub mod json_tests {
             use base64ct::Base64;
             use base64ct::Encoding;
             use rstest::rstest;
+            use bigdecimal::BigDecimal;
+            use std::str::FromStr;
 
             fn matches_any_line(line: &[u8], expected: &[&str]) -> bool {
                 for &exp in expected {
@@ -133,6 +142,7 @@ pub mod json_tests {
                         return true;
                     }
                 }
+                let line = String::from_utf8_lossy(line);
                 eprintln!("Could not match:\n    {line:?}\nTo any of: {expected:#?}");
                 false
             }
@@ -189,6 +199,11 @@ pub mod json_tests {
                     Column::Boolean(column) => writeln!(
                         output,
                         "{}        .column_bool({:?}, {:?})?",
+                        indent, column.name, column.value
+                    )?,
+                    Column::Decimal(column) => writeln!(
+                        output,
+                        "{}        .column_decimal({:?}, &BigDecimal::from_str({:?}).unwrap())?",
                         indent, column.name, column.value
                     )?,
                 }

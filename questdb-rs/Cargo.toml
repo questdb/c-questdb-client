@@ -100,7 +100,7 @@ ring-crypto = ["dep:ring", "rustls/ring"]
 insecure-skip-verify = []
 
 ## Enable code-generation in `build.rs` for additional tests.
-json_tests = []
+json_tests = ["bigdecimal"]
 
 ## Enable methods to create timestamp objects from chrono::DateTime objects.
 chrono_timestamp = ["chrono"]
