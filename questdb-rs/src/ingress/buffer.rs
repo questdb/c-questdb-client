@@ -23,8 +23,9 @@
  ******************************************************************************/
 use crate::ingress::ndarr::{check_and_get_array_bytes_size, ArrayElementSealed};
 use crate::ingress::{
-    ndarr, ArrayElement, DebugBytes, NdArrayView, ProtocolVersion, Timestamp, TimestampNanos,
-    ARRAY_BINARY_FORMAT_TYPE, DOUBLE_BINARY_FORMAT_TYPE, MAX_ARRAY_DIMS, MAX_NAME_LEN_DEFAULT,
+    ndarr, ArrayElement, DebugBytes, NdArrayView, ProtocolVersion, Timestamp, TimestampMicros,
+    TimestampNanos, ARRAY_BINARY_FORMAT_TYPE, DOUBLE_BINARY_FORMAT_TYPE, MAX_ARRAY_DIMS,
+    MAX_NAME_LEN_DEFAULT,
 };
 use crate::{error, Error};
 use std::fmt::{Debug, Formatter};
@@ -1147,19 +1148,19 @@ impl Buffer {
     {
         self.write_column_key(name)?;
         let timestamp: Timestamp = value.try_into()?;
+        let (number, suffix) = match (self.protocol_version, timestamp) {
+            (ProtocolVersion::V1, _) => {
+                let timestamp: TimestampMicros = timestamp.try_into()?;
+                (timestamp.as_i64(), b't')
+            }
+            (_, Timestamp::Micros(ts)) => (ts.as_i64(), b't'),
+            (_, Timestamp::Nanos(ts)) => (ts.as_i64(), b'n'),
+        };
+
         let mut buf = itoa::Buffer::new();
-        match timestamp {
-            Timestamp::Micros(ts) => {
-                let printed = buf.format(ts.as_i64());
-                self.output.extend_from_slice(printed.as_bytes());
-                self.output.push(b't');
-            }
-            Timestamp::Nanos(ts) => {
-                let printed = buf.format(ts.as_i64());
-                self.output.extend_from_slice(printed.as_bytes());
-                self.output.push(b'n');
-            }
-        }
+        let printed = buf.format(number);
+        self.output.extend_from_slice(printed.as_bytes());
+        self.output.push(suffix);
         Ok(self)
     }
 
@@ -1209,23 +1210,28 @@ impl Buffer {
         self.check_op(Op::At)?;
         let timestamp: Timestamp = timestamp.try_into()?;
 
-        // https://github.com/rust-lang/rust/issues/115880
-        let timestamp: crate::Result<TimestampNanos> = timestamp.try_into();
-        let timestamp: TimestampNanos = timestamp?;
+        let (number, termination) = match (self.protocol_version, timestamp) {
+            (ProtocolVersion::V1, _) => {
+                let timestamp: crate::Result<TimestampNanos> = timestamp.try_into();
+                (timestamp?.as_i64(), "\n")
+            }
+            (_, Timestamp::Micros(micros)) => (micros.as_i64(), "t\n"),
+            (_, Timestamp::Nanos(nanos)) => (nanos.as_i64(), "n\n"),
+        };
 
-        let epoch_nanos = timestamp.as_i64();
-        if epoch_nanos < 0 {
+        if number < 0 {
             return Err(error::fmt!(
                 InvalidTimestamp,
                 "Timestamp {} is negative. It must be >= 0.",
-                epoch_nanos
+                number
             ));
         }
+
         let mut buf = itoa::Buffer::new();
-        let printed = buf.format(epoch_nanos);
+        let printed = buf.format(number);
         self.output.push(b' ');
         self.output.extend_from_slice(printed.as_bytes());
-        self.output.push(b'\n');
+        self.output.extend_from_slice(termination.as_bytes());
         self.state.op_case = OpCase::MayFlushOrTable;
         self.state.row_count += 1;
         Ok(())

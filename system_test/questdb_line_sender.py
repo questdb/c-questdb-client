@@ -627,6 +627,11 @@ class TimestampMicros:
         self.value = micros
 
 
+class TimestampNanos:
+    def __init__(self, nanos: int):
+        self.value = nanos
+
+
 class Buffer:
     def __init__(self, protocol_version: ProtocolVersion, init_buf_size=65536, max_name_len=127, ):
         self._impl = _DLL.line_sender_buffer_with_max_name_len(
@@ -637,12 +642,8 @@ class Buffer:
     def __len__(self):
         return _DLL.line_sender_buffer_size(self._impl)
 
-    def peek(self) -> str:
-        #  This is a hacky way of doing it because it copies the whole buffer.
-        # Instead the `buffer` should be made to support the buffer protocol:
-        # https://docs.python.org/3/c-api/buffer.html
-        # This way we would not need to `bytes(..)` the object to keep it alive.
-        # Then we could call `PyMemoryView_FromObject`.
+    def peek(self) -> bytes:
+        # Copy buffer
         view = _DLL.line_sender_buffer_peek(self._impl)
         if view.len:
             c_buf = ctypes.cast(view.buf, c_char_p)  # uint8_t* → char*
@@ -706,6 +707,12 @@ class Buffer:
         elif isinstance(value, TimestampMicros):
             _error_wrapped_call(
                 _DLL.line_sender_buffer_column_ts_micros,
+                self._impl,
+                _column_name(name),
+                value.value)
+        elif isinstance(value, TimestampNanos):
+            _error_wrapped_call(
+                _DLL.line_sender_buffer_column_ts_nanos,
                 self._impl,
                 _column_name(name),
                 value.value)
@@ -784,6 +791,12 @@ class Buffer:
     def at(self, timestamp: int):
         _error_wrapped_call(
             _DLL.line_sender_buffer_at_nanos,
+            self._impl,
+            timestamp)
+
+    def at_micros(self, timestamp: int):
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_at_micros,
             self._impl,
             timestamp)
 
@@ -902,7 +915,7 @@ class Sender:
 
     def column(
             self, name: str,
-            value: Union[bool, int, float, str, TimestampMicros, datetime]):
+            value: Union[bool, int, float, str, TimestampMicros, TimestampNanos, datetime]):
         self._buffer.column(name, value)
         return self
 
@@ -922,6 +935,9 @@ class Sender:
 
     def at(self, timestamp: int):
         self._buffer.at(timestamp)
+
+    def at_micros(self, timestamp: int):
+        self._buffer.at_micros(timestamp)
 
     def flush(self, buffer: Optional[Buffer] = None, clear=True, transactional=None):
         if (buffer is None) and not clear:
