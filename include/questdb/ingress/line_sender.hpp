@@ -585,57 +585,57 @@ struct row_major_1d_holder
         return {1, shape, data, size};
     }
 };
+} // namespace array
 
 template <typename T>
-inline auto to_array_view_state_impl(const std::vector<T>& vec)
+inline auto to_view_state_impl(const std::vector<T>& vec)
 {
-    return row_major_1d_holder<typename std::remove_cv<T>::type>(
+    return array::row_major_1d_holder<typename std::remove_cv<T>::type>(
         vec.data(), vec.size());
 }
 
 #if __cplusplus >= 202002L
 template <typename T>
-inline auto to_array_view_state_impl(const std::span<T>& span)
+inline auto to_view_state_impl(const std::span<T>& span)
 {
-    return row_major_1d_holder<typename std::remove_cv<T>::type>(
+    return array::row_major_1d_holder<typename std::remove_cv<T>::type>(
         span.data(), span.size());
 }
 #endif
 
 template <typename T, size_t N>
-inline auto to_array_view_state_impl(const std::array<T, N>& arr)
+inline auto to_view_state_impl(const std::array<T, N>& arr)
 {
-    return row_major_1d_holder<typename std::remove_cv<T>::type>(arr.data(), N);
+    return array::row_major_1d_holder<typename std::remove_cv<T>::type>(
+        arr.data(), N);
 }
 
 /**
- * Customization point to enable serialization of additional types as arrays.
+ * Customization point to enable serialization of additional types.
  *
  * Forwards to a namespace or ADL (König) lookup function.
- * The customized `to_array_view_state_impl` for your custom type can be placed
+ * The customized `to_view_state_impl` for your custom type can be placed
  * in either:
  *  * The namespace of the type in question.
- *  * In the `questdb::ingress::array` namespace.
+ *  * In the `questdb::ingress` namespace.
 ///
  * The function can either return a view object directly (either
- * `row_major_view` or `strided_view`), or, if you need to place some fields on
- * the stack, an object with a `.view()` method which returns a `const&` to one
- * "materialize" shape or strides information into contiguous memory.
- * of the two view types. Returning an object may be useful if you need to
+ * `array::row_major_view`, `array::strided_view` or `decimal::binary_view`),
+ * or, if you need to place some fields on the stack, an object with a `.view()`
+ * method which returns a `const&` to one "materialize" shape or strides
+ * information into contiguous memory.
  */
-struct to_array_view_state_fn
+struct to_view_state_fn
 {
     template <typename T>
     auto operator()(const T& array) const
     {
-        // Implement your own `to_array_view_state_impl` as needed.
-        return to_array_view_state_impl(array);
+        // Implement your own `to_view_state_impl` as needed.
+        return to_view_state_impl(array);
     }
 };
 
-inline constexpr to_array_view_state_fn to_array_view_state{};
-
-} // namespace array
+inline constexpr to_view_state_fn to_view_state{};
 
 /**
  * Types and utilities for working with arbitrary-precision decimal numbers.
@@ -1221,23 +1221,22 @@ public:
      *
      * This overload uses a customization point to support additional types:
      * If you need to support your additional types you may implement a
-     * `to_array_view_state_impl` function in the object's namespace (via ADL)
+     * `to_view_state_impl` function in the object's namespace (via ADL)
      * or in the `questdb::ingress::array` namespace.
      * Ensure that any additional customization points are included before
      * `line_sender.hpp`.
      *
-     * @tparam ToArrayViewT  Type convertible to a custom object instance which
+     * @tparam ToViewT  Type convertible to a custom object instance which
      *                       can be converted to an array view.
      * @param name           Column name.
      * @param array          Multi-dimensional array.
      */
-    template <typename ToArrayViewT>
-    line_sender_buffer& column(column_name_view name, ToArrayViewT array)
+    template <typename ToViewT>
+    line_sender_buffer& column(column_name_view name, ToViewT array)
     {
         may_init();
-        const auto array_view_state =
-            questdb::ingress::array::to_array_view_state(array);
-        return column(name, array_view_state.view());
+        const auto view_state = questdb::ingress::to_view_state(array);
+        return column(name, view_state.view());
     }
 
     /**
@@ -1323,41 +1322,6 @@ public:
             decimal.data(),
             decimal.data_size());
         return *this;
-    }
-
-    /**
-     * Record a decimal value using a custom type via a customization point.
-     *
-     * This overload allows you to serialize custom decimal types by
-     * implementing a `to_decimal_view_state_impl` function for your type.
-     *
-     * QuestDB server version 9.2.0 or later is required for decimal support.
-     *
-     * # Customization
-     *
-     * To support your custom decimal type, implement
-     * `to_decimal_view_state_impl` in either:
-     * - The namespace of your type (ADL/Koenig lookup)
-     * - The `questdb::ingress::decimal` namespace
-     *
-     * The function should return either:
-     * - A `decimal::binary_view` directly, or
-     * - An object with a `.view()` method returning `const
-     * decimal::binary_view&`
-     *
-     * Include your customization point before including `line_sender.hpp`.
-     *
-     * @tparam ToDecimalViewT Type convertible to decimal::binary_view.
-     * @param name            Column name.
-     * @param decimal         Custom decimal value.
-     */
-    template <typename ToDecimalViewT>
-    line_sender_buffer& column(column_name_view name, ToDecimalViewT decimal)
-    {
-        may_init();
-        const auto decimal_view_state =
-            questdb::ingress::decimal::to_decimal_view_state(decimal);
-        return column(name, decimal_view_state.view());
     }
 
     /** Record a nanosecond timestamp value for the given column. */

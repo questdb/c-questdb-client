@@ -96,7 +96,7 @@ private:
 // Customization point for QuestDB array API (discovered via König lookup)
 // If you need to support a 3rd party type, put this function in the namespace
 // of the type in question or in the `questdb::ingress::array` namespace
-inline auto to_array_view_state_impl(const Matrix& m)
+inline auto to_view_state_impl(const Matrix& m)
 {
     return ViewHolder{
         {static_cast<uintptr_t>(m.rows()), static_cast<uintptr_t>(m.cols())},
