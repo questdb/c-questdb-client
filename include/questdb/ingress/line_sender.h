@@ -516,6 +516,26 @@ bool line_sender_buffer_column_decimal_str(
     line_sender_error** err_out);
 
 /**
+ * Record a decimal value for the given column.
+ *
+ * @param[in] buffer Line buffer object.
+ * @param[in] name Column name.
+ * @param[in] scale Number of digits after the decimal point
+ * @param[in] data Unscaled value in two's complement format, big-endian
+ * @param[in] data_len Length of the unscaled value array
+ * @param[out] err_out Set on error.
+ * @return true on success, false on error.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_decimal(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    const unsigned int scale,
+    const uint8_t* data,
+    size_t data_len,
+    line_sender_error** err_out);
+
+/**
  * Record a multidimensional array of `double` values in C-major order.
  *
  * QuestDB server version 9.0.0 or later is required for array support.

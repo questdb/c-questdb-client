@@ -5,6 +5,45 @@ using namespace std::literals::string_view_literals;
 using namespace questdb::ingress::literals;
 using namespace questdb::ingress::decimal;
 
+namespace custom_decimal
+{
+class Decimal32
+{
+public:
+    Decimal32(uint32_t scale, int32_t unscaled_value)
+        : _scale(scale)
+        , _unscaled_value(unscaled_value)
+    {
+    }
+
+    int32_t unscaled_value() const
+    {
+        return _unscaled_value;
+    }
+
+    uint32_t scale() const
+    {
+        return _scale;
+    }
+
+    questdb::ingress::decimal::binary_view view() const
+    {
+        std::array<uint8_t, sizeof(uint32_t)> data = {
+            // Big-Endiang bytes
+            static_cast<uint8_t>(_unscaled_value >> 24),
+            static_cast<uint8_t>(_unscaled_value >> 16),
+            static_cast<uint8_t>(_unscaled_value >> 8),
+            static_cast<uint8_t>(_unscaled_value >> 0),
+        };
+        return {_scale, data};
+    }
+
+private:
+    uint32_t _scale;
+    int32_t _unscaled_value;
+};
+}
+
 static bool example(std::string_view host, std::string_view port)
 {
     try
@@ -22,11 +61,14 @@ static bool example(std::string_view host, std::string_view port)
         const auto price_name = "price"_cn;
         const auto amount_name = "amount"_cn;
 
+        // 123 with a scale of 1 gives a decimal of 12.3
+        const auto price_value = custom_decimal::Decimal32(1, 123);
+
         questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
         buffer.table(table_name)
             .symbol(symbol_name, "ETH-USD"_utf8)
             .symbol(side_name, "sell"_utf8)
-            .column(price_name, "2615.54"_decimal)
+            .column(price_name, price_value.view())
             .column(amount_name, 0.00044)
             .at(questdb::ingress::timestamp_nanos::now());
 

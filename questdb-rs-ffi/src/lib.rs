@@ -44,6 +44,7 @@ use questdb::{
 
 mod ndarr;
 use ndarr::StrideArrayView;
+mod decimal;
 
 macro_rules! bubble_err_to_c {
     ($err_out:expr, $expression:expr) => {
@@ -939,6 +940,7 @@ pub unsafe extern "C" fn line_sender_buffer_column_str(
 }
 
 /// Record a decimal string value for the given column.
+///
 /// @param[in] buffer Line buffer object.
 /// @param[in] name Column name.
 /// @param[in] value Column value.
@@ -955,6 +957,31 @@ pub unsafe extern "C" fn line_sender_buffer_column_decimal_str(
     let name = name.as_name();
     let value = value.as_str();
     bubble_err_to_c!(err_out, buffer.column_decimal(name, value));
+    true
+}
+
+/// Record a decimal value for the given column.
+///
+/// @param[in] buffer Line buffer object.
+/// @param[in] name Column name.
+/// @param[in] scale Number of digits after the decimal point
+/// @param[in] data Unscaled value in two's complement format, big-endian
+/// @param[in] data_len Length of the unscaled value array
+/// @param[out] err_out Set on error.
+/// @return true on success, false on error.
+#[no_mangle]
+pub unsafe extern "C" fn line_sender_buffer_column_decimal(
+    buffer: *mut line_sender_buffer,
+    name: line_sender_column_name,
+    scale: u32,
+    data: *const u8,
+    data_len: size_t,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    let buffer = unwrap_buffer_mut(buffer);
+    let name = name.as_name();
+    let decimal = Decimal::new(scale, slice::from_raw_parts(data, data_len));
+    bubble_err_to_c!(err_out, buffer.column_decimal(name, decimal));
     true
 }
 
@@ -1773,6 +1800,7 @@ pub unsafe extern "C" fn line_sender_now_micros() -> i64 {
     TimestampMicros::now().as_i64()
 }
 
+use crate::decimal::Decimal;
 use crate::ndarr::CMajorArrayView;
 #[cfg(feature = "confstr-ffi")]
 use questdb_confstr_ffi::questdb_conf_str_parse_err;

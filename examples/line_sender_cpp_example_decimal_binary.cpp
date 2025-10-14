@@ -21,12 +21,15 @@ static bool example(std::string_view host, std::string_view port)
         const auto side_name = "side"_cn;
         const auto price_name = "price"_cn;
         const auto amount_name = "amount"_cn;
+        const uint8_t price_unscaled_value[] = {123};
+        // 123 with a scale of 1 gives a decimal of 12.3
+        const auto price_value = binary_view(1, price_unscaled_value);
 
         questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
         buffer.table(table_name)
             .symbol(symbol_name, "ETH-USD"_utf8)
             .symbol(side_name, "sell"_utf8)
-            .column(price_name, "2615.54"_decimal)
+            .column(price_name, price_value)
             .column(amount_name, 0.00044)
             .at(questdb::ingress::timestamp_nanos::now());
 

@@ -3,6 +3,7 @@
 
 using namespace std::literals::string_view_literals;
 using namespace questdb::ingress::literals;
+using namespace questdb::ingress::decimal;
 
 int main(int argc, const char* argv[])
 {
@@ -24,7 +25,7 @@ int main(int argc, const char* argv[])
         buffer.table(table_name)
             .symbol(symbol_name, "ETH-USD"_utf8)
             .symbol(side_name, "sell"_utf8)
-            .column_decimal(price_name, "2615.54"_utf8)
+            .column(price_name, "2615.54"_decimal)
             .column(amount_name, 0.00044)
             .at(questdb::ingress::timestamp_nanos::now());
 

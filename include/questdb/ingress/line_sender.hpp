@@ -609,7 +609,7 @@ inline auto to_array_view_state_impl(const std::array<T, N>& arr)
 }
 
 /**
- * Customization point to enable serialization of additonal types as arrays.
+ * Customization point to enable serialization of additional types as arrays.
  *
  * Forwards to a namespace or ADL (König) lookup function.
  * The customized `to_array_view_state_impl` for your custom type can be placed
@@ -636,6 +636,212 @@ struct to_array_view_state_fn
 inline constexpr to_array_view_state_fn to_array_view_state{};
 
 } // namespace array
+
+/**
+ * Types and utilities for working with arbitrary-precision decimal numbers.
+ *
+ * Decimals are represented as an unscaled integer value (mantissa) and a scale.
+ * For example, the decimal "123.45" with scale 2 is represented as:
+ * - Unscaled value: 12345
+ * - Scale: 2 (meaning divide by 10^2 = 100)
+ *
+ * QuestDB supports decimal values with:
+ * - Maximum scale: 76 (QuestDB server limitation)
+ * - Maximum mantissa size: 127 bytes in binary format
+ *
+ * QuestDB server version 9.2.0 or later is required for decimal support.
+ */
+namespace decimal
+{
+
+/**
+ * A validated UTF-8 string view for text-based decimal representation.
+ *
+ * This is a wrapper around utf8_view that allows the compiler to distinguish
+ * between regular strings and decimal strings.
+ *
+ * Use this to send decimal values as strings (e.g., "123.456").
+ * The string will be parsed by the QuestDB server as a decimal column type.
+ */
+class text_view
+{
+public:
+    text_view(const char* buf, size_t len)
+        : _view{buf, len}
+    {
+    }
+
+    template <size_t N>
+    text_view(const char (&buf)[N])
+        : _view{buf}
+    {
+    }
+
+    text_view(std::string_view s_view)
+        : _view{s_view}
+    {
+    }
+
+    text_view(const std::string& s)
+        : _view{s}
+    {
+    }
+
+    const utf8_view& view() const noexcept
+    {
+        return _view;
+    }
+
+private:
+    utf8_view _view;
+
+    friend class line_sender_buffer;
+};
+
+/**
+ * Literal suffix to construct `text_view` objects from string literals.
+ *
+ * @code {.cpp}
+ * using namespace questdb::ingress::decimal;
+ * buffer.column("price"_cn, "123.456"_decimal);
+ * @endcode
+ */
+inline text_view operator"" _decimal(const char* buf, size_t len)
+{
+    return text_view{buf, len};
+}
+
+/**
+ * A view over a decimal number in binary format.
+ *
+ * The decimal is represented as:
+ * - A scale (number of decimal places)
+ * - An unscaled value (mantissa) encoded as bytes in two's complement
+ * big-endian format
+ *
+ * # Example
+ *
+ * To represent the decimal "123.45":
+ * - Scale: 2
+ * - Unscaled value: 12345 = 0x3039 in big-endian format
+ *
+ * ```c++
+ * // Represent 123.45 with scale 2 (unscaled value is 12345)
+ * uint8_t mantissa[] = {0x30, 0x39};  // 12345 in two's complement big-endian
+ * auto decimal = questdb::ingress::decimal::binary_view(2, mantissa,
+ * sizeof(mantissa)); buffer.column("price"_cn, decimal);
+ * ```
+ *
+ * # Constraints
+ *
+ * - Maximum scale: 76 (QuestDB server limitation)
+ * - Maximum mantissa size: 127 bytes (protocol limitation)
+ */
+class binary_view
+{
+public:
+    /**
+     * Construct a binary decimal view from raw bytes.
+     *
+     * @param scale Number of decimal places (must be ≤ 76)
+     * @param data Pointer to unscaled value in two's complement big-endian
+     * format
+     * @param data_size Number of bytes in the mantissa (must be ≤ 127)
+     */
+    binary_view(uint32_t scale, const uint8_t* data, size_t data_size)
+        : _scale{scale}
+        , _data{data}
+        , _data_size{data_size}
+    {
+    }
+
+    /**
+     * Construct a binary decimal view from a fixed-size array.
+     *
+     * @param scale Number of decimal places (must be ≤ 76)
+     * @param data Fixed-size array containing the unscaled value
+     */
+    template <std::size_t N>
+    binary_view(uint32_t scale, const uint8_t (&data)[N])
+        : _scale{scale}
+        , _data{data}
+        , _data_size{N}
+    {
+    }
+
+    /**
+     * Construct a binary decimal view from a std::array.
+     *
+     * @param scale Number of decimal places (must be ≤ 76)
+     * @param data std::array containing the unscaled value
+     */
+    template <std::size_t N>
+    binary_view(uint32_t scale, const std::array<uint8_t, N>& data)
+        : _scale{scale}
+        , _data{data.data()}
+        , _data_size{N}
+    {
+    }
+
+    /**
+     * Construct a binary decimal view from a std::vector.
+     *
+     * @param scale Number of decimal places (must be ≤ 76)
+     * @param vec Vector containing the unscaled value
+     */
+    binary_view(uint32_t scale, const std::vector<uint8_t>& vec)
+        : _scale{scale}
+        , _data{vec.data()}
+        , _data_size{vec.size()}
+    {
+    }
+
+#if __cplusplus >= 202002L
+    /**
+     * Construct a binary decimal view from a std::span (C++20).
+     *
+     * @param scale Number of decimal places (must be ≤ 76)
+     * @param span Span containing the unscaled value
+     */
+    binary_view(uint32_t scale, const std::span<uint8_t>& span)
+        : _scale{scale}
+        , _data{span.data()}
+        , _data_size{span.size()}
+    {
+    }
+#endif
+
+    /** Get the scale (number of decimal places). */
+    uint32_t scale() const
+    {
+        return _scale;
+    }
+
+    /** Get a pointer to the unscaled value bytes. */
+    const uint8_t* data() const
+    {
+        return _data;
+    }
+
+    /** Get the size of the unscaled value in bytes. */
+    size_t data_size() const
+    {
+        return _data_size;
+    }
+
+    /** Get a const reference to this view (for customization point
+     * compatibility). */
+    const binary_view& view() const
+    {
+        return *this;
+    }
+
+private:
+    uint32_t _scale;
+    const uint8_t* _data;
+    size_t _data_size;
+};
+} // namespace decimal
 
 class line_sender_buffer
 {
@@ -1036,38 +1242,59 @@ public:
     }
 
     /**
-     * Record a decimal string value for the given column.
-     * @param name Column name.
-     * @param value Column value.
+     * Record an arbitrary-precision decimal value from a text representation.
+     *
+     * This sends the decimal as a string (e.g., "123.456") to be parsed by
+     * the QuestDB server.
+     *
+     * For better performance and precision control, consider using the binary
+     * format via `decimal::binary_view` instead.
+     *
+     * QuestDB server version 9.2.0 or later is required for decimal support.
+     *
+     * @param name  Column name.
+     * @param value Decimal value as a validated UTF-8 string.
      */
-    line_sender_buffer& column_decimal(column_name_view name, utf8_view value)
+    line_sender_buffer& column(column_name_view name, decimal::text_view value)
     {
         may_init();
         line_sender_error::wrapped_call(
             ::line_sender_buffer_column_decimal_str,
             _impl,
             name._impl,
-            value._impl);
+            value.view()._impl);
         return *this;
     }
 
-    template <size_t N>
-    line_sender_buffer& column_decimal(
-        column_name_view name, const char (&value)[N])
+    /**
+     * Record an arbitrary-precision decimal value in binary format.
+     *
+     * The decimal is represented as an unscaled integer (mantissa) and a scale.
+     * This provides precise control over the decimal representation and is more
+     * efficient than text-based serialization.
+     *
+     * QuestDB server version 9.2.0 or later is required for decimal support.
+     *
+     * # Constraints
+     *
+     * - Maximum scale: 76 (QuestDB server limitation)
+     * - Maximum mantissa size: 127 bytes (protocol limitation)
+     *
+     * @param name    Column name.
+     * @param decimal Binary decimal view with scale and mantissa bytes.
+     */
+    line_sender_buffer& column(
+        column_name_view name, const decimal::binary_view& decimal)
     {
-        return column_decimal(name, utf8_view{value});
-    }
-
-    line_sender_buffer& column_decimal(
-        column_name_view name, std::string_view value)
-    {
-        return column_decimal(name, utf8_view{value});
-    }
-
-    line_sender_buffer& column_decimal(
-        column_name_view name, const std::string& value)
-    {
-        return column_decimal(name, utf8_view{value});
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_column_decimal,
+            _impl,
+            name._impl,
+            decimal.scale(),
+            decimal.data(),
+            decimal.data_size());
+        return *this;
     }
 
     /** Record a nanosecond timestamp value for the given column. */
