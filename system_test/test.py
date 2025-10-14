@@ -121,7 +121,6 @@ class TestSender(unittest.TestCase):
             if not QDB_FIXTURE.http:
                 return qls.ProtocolVersion.V1
 
-            print('Here got =========================')
             if QDB_FIXTURE.version >= FIRST_ARRAYS_RELEASE:
                 return qls.ProtocolVersion.V2
 
