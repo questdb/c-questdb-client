@@ -5,6 +5,16 @@ using namespace std::literals::string_view_literals;
 using namespace questdb::ingress::literals;
 using namespace questdb::ingress::decimal;
 
+struct ViewHolder
+{
+    std::array<uint8_t, sizeof(uint32_t)> data;
+    uint32_t scale;
+    questdb::ingress::decimal::binary_view view() const
+    {
+        return {scale, data};
+    }
+};
+
 namespace custom_decimal
 {
 class Decimal32
@@ -26,22 +36,27 @@ public:
         return _scale;
     }
 
-    questdb::ingress::decimal::binary_view view() const
-    {
-        std::array<uint8_t, sizeof(uint32_t)> data = {
-            // Big-Endian bytes
-            static_cast<uint8_t>(_unscaled_value >> 24),
-            static_cast<uint8_t>(_unscaled_value >> 16),
-            static_cast<uint8_t>(_unscaled_value >> 8),
-            static_cast<uint8_t>(_unscaled_value >> 0),
-        };
-        return {_scale, data};
-    }
-
 private:
     uint32_t _scale;
     int32_t _unscaled_value;
 };
+
+// Customization point for QuestDB decimal API (discovered via König lookup)
+// If you need to support a 3rd party type, put this function in the namespace
+// of the type in question or in the `questdb::ingress::decimal` namespace
+inline auto to_decimal_view_state_impl(const Decimal32& d)
+{
+    int32_t unscaled_value = d.unscaled_value();
+    return ViewHolder{
+        {
+            // Big-Endiang bytes
+            static_cast<uint8_t>(unscaled_value >> 24),
+            static_cast<uint8_t>(unscaled_value >> 16),
+            static_cast<uint8_t>(unscaled_value >> 8),
+            static_cast<uint8_t>(unscaled_value >> 0),
+        },
+        d.scale()};
+}
 }
 
 static bool example(std::string_view host, std::string_view port)
@@ -68,7 +83,7 @@ static bool example(std::string_view host, std::string_view port)
         buffer.table(table_name)
             .symbol(symbol_name, "ETH-USD"_utf8)
             .symbol(side_name, "sell"_utf8)
-            .column(price_name, price_value.view())
+            .column(price_name, price_value)
             .column(amount_name, 0.00044)
             .at(questdb::ingress::timestamp_nanos::now());
 

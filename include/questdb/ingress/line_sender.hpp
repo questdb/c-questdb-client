@@ -841,6 +841,34 @@ private:
     const uint8_t* _data;
     size_t _data_size;
 };
+/**
+ * Customization point to enable serialization of additional types as decimals.
+ *
+ * This allows you to support custom decimal types by implementing a conversion
+ * function. The customized `to_decimal_view_state_impl` for your type can be
+ * placed in either:
+ * - The namespace of the type in question (ADL/Koenig lookup)
+ * - The `questdb::ingress::decimal` namespace
+ *
+ * The function can either:
+ * - Return a `binary_view` object directly, or
+ * - Return an object with a `.view()` method that returns `const binary_view&`
+ *   (useful if you need to store temporary data like shape/strides on the
+stack)
+ */
+struct to_decimal_view_state_fn
+{
+    template <typename T>
+    auto operator()(const T& decimal) const
+    {
+        // Implement your own `to_decimal_view_state_impl` as needed.
+        // ADL lookup for user-defined to_decimal_view_state_impl
+        return to_decimal_view_state_impl(decimal);
+    }
+};
+
+inline constexpr to_decimal_view_state_fn to_decimal_view_state{};
+
 } // namespace decimal
 
 class line_sender_buffer
@@ -1295,6 +1323,41 @@ public:
             decimal.data(),
             decimal.data_size());
         return *this;
+    }
+
+    /**
+     * Record a decimal value using a custom type via a customization point.
+     *
+     * This overload allows you to serialize custom decimal types by
+     * implementing a `to_decimal_view_state_impl` function for your type.
+     *
+     * QuestDB server version 9.2.0 or later is required for decimal support.
+     *
+     * # Customization
+     *
+     * To support your custom decimal type, implement
+     * `to_decimal_view_state_impl` in either:
+     * - The namespace of your type (ADL/Koenig lookup)
+     * - The `questdb::ingress::decimal` namespace
+     *
+     * The function should return either:
+     * - A `decimal::binary_view` directly, or
+     * - An object with a `.view()` method returning `const
+     * decimal::binary_view&`
+     *
+     * Include your customization point before including `line_sender.hpp`.
+     *
+     * @tparam ToDecimalViewT Type convertible to decimal::binary_view.
+     * @param name            Column name.
+     * @param decimal         Custom decimal value.
+     */
+    template <typename ToDecimalViewT>
+    line_sender_buffer& column(column_name_view name, ToDecimalViewT decimal)
+    {
+        may_init();
+        const auto decimal_view_state =
+            questdb::ingress::decimal::to_decimal_view_state(decimal);
+        return column(name, decimal_view_state.view());
     }
 
     /** Record a nanosecond timestamp value for the given column. */
