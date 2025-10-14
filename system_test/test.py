@@ -57,6 +57,7 @@ BUILD_MODE = None
 
 # The first QuestDB version that supports array types.
 FIRST_ARRAYS_RELEASE = (8, 3, 3)
+DECIMAL_RELEASE = (9, 2, 0)
 
 
 def retry_check_table(*args, **kwargs):
@@ -120,8 +121,12 @@ class TestSender(unittest.TestCase):
             if not QDB_FIXTURE.http:
                 return qls.ProtocolVersion.V1
 
+            print('Here got =========================')
             if QDB_FIXTURE.version >= FIRST_ARRAYS_RELEASE:
                 return qls.ProtocolVersion.V2
+
+            if QDB_FIXTURE.version >= DECIMAL_RELEASE:
+                return qls.ProtocolVersion.V3
 
             return qls.ProtocolVersion.V1
 
@@ -518,6 +523,9 @@ class TestSender(unittest.TestCase):
         self.assertEqual(scrubbed_dataset, exp_dataset)
 
     def test_decimal_column(self):
+        if self.expected_protocol_version < qls.ProtocolVersion.V3:
+            self.skipTest('communicating over old protocol which does not support decimals')
+
         table_name = uuid.uuid4().hex
         pending = None
         decimals = [
@@ -1172,7 +1180,7 @@ def run_with_existing(args):
         (999, 999, 999),
         True,
         False,
-        qls.ProtocolVersion.V2
+        qls.ProtocolVersion.V3
     )
     unittest.main()
 

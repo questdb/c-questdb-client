@@ -777,7 +777,7 @@ fn test_sender_auto_protocol_version_only_v2() -> TestResult {
 
 #[test]
 fn test_sender_auto_protocol_version_unsupported_client() -> TestResult {
-    let mut server = MockServer::new()?.configure_settings_response(&[3, 4], 127);
+    let mut server = MockServer::new()?.configure_settings_response(&[4, 5], 127);
     let sender_builder = server.lsb_http();
     let server_thread = std::thread::spawn(move || -> io::Result<MockServer> {
         server.accept()?;

@@ -102,6 +102,7 @@ c_protocol_version = ctypes.c_int
 class ProtocolVersion(Enum):
     V1 = (c_protocol_version(1), '1')
     V2 = (c_protocol_version(2), '2')
+    V3 = (c_protocol_version(3), '3')
 
     @classmethod
     def from_int(cls, value: c_protocol_version):
@@ -292,7 +293,7 @@ def _setup_cdll():
         c_line_sender_utf8,
         c_line_sender_error_p_p)
     set_sig(
-        dll.line_sender_buffer_column_decimal_str,
+        dll.line_sender_buffer_column_dec_str,
         c_bool,
         c_line_sender_buffer_p,
         c_line_sender_column_name,
@@ -713,7 +714,7 @@ class Buffer:
                 _utf8(value))
         elif isinstance(value, Decimal):
             _error_wrapped_call(
-                _DLL.line_sender_buffer_column_decimal_str,
+                _DLL.line_sender_buffer_column_dec_str,
                 self._impl,
                 _column_name(name),
                 _utf8(str(value)))

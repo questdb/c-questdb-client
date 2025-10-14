@@ -234,7 +234,8 @@ fn test_array_f64_for_ndarray() -> TestResult {
 #[cfg(feature = "sync-sender-tcp")]
 #[rstest]
 fn test_max_buf_size(
-    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
+    #[values(ProtocolVersion::V1, ProtocolVersion::V2, ProtocolVersion::V3)]
+    version: ProtocolVersion,
 ) -> TestResult {
     let max = 1024;
     let mut server = MockServer::new()?;
@@ -264,7 +265,7 @@ fn test_max_buf_size(
                 "Could not flush buffer: Buffer size of 1026 exceeds maximum configured allowed size of 1024 bytes."
             );
         }
-        ProtocolVersion::V2 => {
+        ProtocolVersion::V2 | ProtocolVersion::V3 => {
             assert_eq!(
                 err.msg(),
                 "Could not flush buffer: Buffer size of 1025 exceeds maximum configured allowed size of 1024 bytes."
@@ -612,7 +613,8 @@ fn test_arr_column_name_too_long() -> TestResult {
 #[cfg(feature = "sync-sender-tcp")]
 #[rstest]
 fn test_tls_with_file_ca(
-    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
+    #[values(ProtocolVersion::V1, ProtocolVersion::V2, ProtocolVersion::V3)]
+    version: ProtocolVersion,
 ) -> TestResult {
     let mut ca_path = certs_dir();
     ca_path.push("server_rootCA.pem");
@@ -721,7 +723,8 @@ fn test_plain_to_tls_server() -> TestResult {
 #[cfg(feature = "insecure-skip-verify")]
 #[rstest]
 fn test_tls_insecure_skip_verify(
-    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
+    #[values(ProtocolVersion::V1, ProtocolVersion::V2, ProtocolVersion::V3)]
+    version: ProtocolVersion,
 ) -> TestResult {
     let server = MockServer::new()?;
     let lsb = server
@@ -802,7 +805,7 @@ pub(crate) fn f64_to_bytes(name: &str, value: f64, version: ProtocolVersion) -> 
             let mut ser = F64Serializer::new(value);
             buf.extend_from_slice(ser.as_str().as_bytes());
         }
-        ProtocolVersion::V2 => {
+        ProtocolVersion::V2 | ProtocolVersion::V3 => {
             buf.push(b'=');
             buf.push(DOUBLE_BINARY_FORMAT_TYPE);
             buf.extend_from_slice(&value.to_le_bytes());

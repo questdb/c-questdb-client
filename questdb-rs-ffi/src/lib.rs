@@ -314,6 +314,12 @@ pub enum ProtocolVersion {
     /// This version is specific to QuestDB and is not compatible with InfluxDB.
     /// QuestDB server version 9.0.0 or later is required for `V2` supported.
     V2 = 2,
+
+    /// Version 3 of InfluxDB Line Protocol.
+    /// Supports the decimal data type in text and binary formats.
+    /// This version is specific to QuestDB and is not compatible with InfluxDB.
+    /// QuestDB server version 9.2.0 or later is required for `V3` supported.
+    V3 = 3,
 }
 
 impl From<ProtocolVersion> for ingress::ProtocolVersion {
@@ -321,6 +327,7 @@ impl From<ProtocolVersion> for ingress::ProtocolVersion {
         match version {
             ProtocolVersion::V1 => ingress::ProtocolVersion::V1,
             ProtocolVersion::V2 => ingress::ProtocolVersion::V2,
+            ProtocolVersion::V3 => ingress::ProtocolVersion::V3,
         }
     }
 }
@@ -330,6 +337,7 @@ impl From<ingress::ProtocolVersion> for ProtocolVersion {
         match version {
             ingress::ProtocolVersion::V1 => ProtocolVersion::V1,
             ingress::ProtocolVersion::V2 => ProtocolVersion::V2,
+            ingress::ProtocolVersion::V3 => ProtocolVersion::V3,
         }
     }
 }
@@ -947,7 +955,7 @@ pub unsafe extern "C" fn line_sender_buffer_column_str(
 /// @param[out] err_out Set on error.
 /// @return true on success, false on error.
 #[no_mangle]
-pub unsafe extern "C" fn line_sender_buffer_column_decimal_str(
+pub unsafe extern "C" fn line_sender_buffer_column_dec_str(
     buffer: *mut line_sender_buffer,
     name: line_sender_column_name,
     value: line_sender_utf8,
@@ -956,7 +964,7 @@ pub unsafe extern "C" fn line_sender_buffer_column_decimal_str(
     let buffer = unwrap_buffer_mut(buffer);
     let name = name.as_name();
     let value = value.as_str();
-    bubble_err_to_c!(err_out, buffer.column_decimal(name, value));
+    bubble_err_to_c!(err_out, buffer.column_dec(name, value));
     true
 }
 
@@ -970,7 +978,7 @@ pub unsafe extern "C" fn line_sender_buffer_column_decimal_str(
 /// @param[out] err_out Set on error.
 /// @return true on success, false on error.
 #[no_mangle]
-pub unsafe extern "C" fn line_sender_buffer_column_decimal(
+pub unsafe extern "C" fn line_sender_buffer_column_dec(
     buffer: *mut line_sender_buffer,
     name: line_sender_column_name,
     scale: u32,
@@ -981,7 +989,7 @@ pub unsafe extern "C" fn line_sender_buffer_column_decimal(
     let buffer = unwrap_buffer_mut(buffer);
     let name = name.as_name();
     let decimal = Decimal::new(scale, slice::from_raw_parts(data, data_len));
-    bubble_err_to_c!(err_out, buffer.column_decimal(name, decimal));
+    bubble_err_to_c!(err_out, buffer.column_dec(name, decimal));
     true
 }
 

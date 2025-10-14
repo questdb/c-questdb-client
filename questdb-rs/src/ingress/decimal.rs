@@ -71,9 +71,7 @@ pub trait DecimalSerializer {
     /// # Parameters
     ///
     /// * `out` - The output buffer to write the serialized decimal to
-    /// * `support_binary` - If `true`, binary format may be used (Protocol V2).
-    ///   If `false`, text format must be used (Protocol V1).
-    fn serialize(self, out: &mut Vec<u8>, support_binary: bool) -> Result<()>;
+    fn serialize(self, out: &mut Vec<u8>) -> Result<()>;
 }
 
 /// Implementation for string slices containing decimal representations.
@@ -101,7 +99,7 @@ pub trait DecimalSerializer {
 /// Returns [`Error`] with [`ErrorCode::InvalidDecimal`](crate::error::ErrorCode::InvalidDecimal)
 /// if the string contains ILP reserved characters.
 impl DecimalSerializer for &str {
-    fn serialize(self, out: &mut Vec<u8>, _support_binary: bool) -> Result<()> {
+    fn serialize(self, out: &mut Vec<u8>) -> Result<()> {
         // Pre-allocate space for the string content plus the 'd' suffix
         out.reserve(self.len() + 1);
 
@@ -128,32 +126,9 @@ impl DecimalSerializer for &str {
 #[cfg(any(feature = "rust_decimal", feature = "bigdecimal"))]
 use crate::ingress::DECIMAL_BINARY_FORMAT_TYPE;
 
-/// Helper to format decimal values directly to a byte buffer without heap allocation.
-#[cfg(any(feature = "rust_decimal", feature = "bigdecimal"))]
-struct DecimalWriter<'a> {
-    buf: &'a mut Vec<u8>,
-}
-
-#[cfg(any(feature = "rust_decimal", feature = "bigdecimal"))]
-impl<'a> std::fmt::Write for DecimalWriter<'a> {
-    fn write_str(&mut self, s: &str) -> std::fmt::Result {
-        self.buf.extend_from_slice(s.as_bytes());
-        Ok(())
-    }
-}
-
 #[cfg(feature = "rust_decimal")]
 impl DecimalSerializer for &rust_decimal::Decimal {
-    fn serialize(self, out: &mut Vec<u8>, support_binary: bool) -> Result<()> {
-        if !support_binary {
-            // Text format
-            use std::fmt::Write;
-            write!(DecimalWriter { buf: out }, "{}", self)
-                .map_err(|_| error::fmt!(InvalidDecimal, "Failed to format decimal value"))?;
-            out.push(b'd');
-            return Ok(());
-        }
-
+    fn serialize(self, out: &mut Vec<u8>) -> Result<()> {
         // Binary format: '=' marker + type + scale + length + mantissa bytes
         out.push(b'=');
         out.push(DECIMAL_BINARY_FORMAT_TYPE);
@@ -175,16 +150,7 @@ impl DecimalSerializer for &rust_decimal::Decimal {
 
 #[cfg(feature = "bigdecimal")]
 impl DecimalSerializer for &bigdecimal::BigDecimal {
-    fn serialize(self, out: &mut Vec<u8>, support_binary: bool) -> Result<()> {
-        if !support_binary {
-            // Text format
-            use std::fmt::Write;
-            write!(DecimalWriter { buf: out }, "{}", self)
-                .map_err(|_| error::fmt!(InvalidDecimal, "Failed to format decimal value"))?;
-            out.push(b'd');
-            return Ok(());
-        }
-
+    fn serialize(self, out: &mut Vec<u8>) -> Result<()> {
         // Binary format: '=' marker + type + scale + length + mantissa bytes
         out.push(b'=');
         out.push(DECIMAL_BINARY_FORMAT_TYPE);

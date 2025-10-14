@@ -1259,7 +1259,7 @@ public:
     {
         may_init();
         line_sender_error::wrapped_call(
-            ::line_sender_buffer_column_decimal_str,
+            ::line_sender_buffer_column_dec_str,
             _impl,
             name._impl,
             value.view()._impl);
@@ -1288,7 +1288,7 @@ public:
     {
         may_init();
         line_sender_error::wrapped_call(
-            ::line_sender_buffer_column_decimal,
+            ::line_sender_buffer_column_dec,
             _impl,
             name._impl,
             decimal.scale(),

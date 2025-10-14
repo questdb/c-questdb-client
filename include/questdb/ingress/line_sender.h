@@ -122,6 +122,15 @@ typedef enum line_sender_protocol_version
      * `line_sender_protocol_version_2` support.
      */
     line_sender_protocol_version_2 = 2,
+
+    /**
+     * Version 3 of InfluxDB Line Protocol.
+     * Supports the decimal data type in text and binary formats.
+     * This version is specific to QuestDB and not compatible with InfluxDB.
+     * QuestDB server version 9.2.0 or later is required for
+     * `line_sender_protocol_version_3` support.
+     */
+    line_sender_protocol_version_3 = 3,
 } line_sender_protocol_version;
 
 /** Possible sources of the root certificates used to validate the server's
@@ -509,7 +518,7 @@ bool line_sender_buffer_column_str(
  * @return true on success, false on error.
  */
 LINESENDER_API
-bool line_sender_buffer_column_decimal_str(
+bool line_sender_buffer_column_dec_str(
     line_sender_buffer* buffer,
     line_sender_column_name name,
     line_sender_utf8 value,
@@ -527,7 +536,7 @@ bool line_sender_buffer_column_decimal_str(
  * @return true on success, false on error.
  */
 LINESENDER_API
-bool line_sender_buffer_column_decimal(
+bool line_sender_buffer_column_dec(
     line_sender_buffer* buffer,
     line_sender_column_name name,
     const unsigned int scale,
@@ -881,6 +890,9 @@ bool line_sender_opts_token_y(
  *
  * QuestDB server version 9.0.0 or later is required for
  * `line_sender_protocol_version_2` support.
+ *
+ * QuestDB server version 9.2.0 or later is required for
+ * `line_sender_protocol_version_3` support.
  */
 LINESENDER_API
 bool line_sender_opts_protocol_version(

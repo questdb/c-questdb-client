@@ -62,7 +62,7 @@ static bool example(const char* host, const char* port)
         goto on_error;
 
     line_sender_utf8 price_value = QDB_UTF8_LITERAL("2615.54");
-    if (!line_sender_buffer_column_decimal_str(
+    if (!line_sender_buffer_column_dec_str(
             buffer, price_name, price_value, &err))
         goto on_error;
 

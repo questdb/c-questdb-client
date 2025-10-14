@@ -90,22 +90,29 @@ pub enum ProtocolVersion {
     /// This version is specific to QuestDB and is not compatible with InfluxDB.
     /// QuestDB server version 9.0.0 or later is required for `V2` supported.
     V2 = 2,
+
+    /// Version 3 of InfluxDB Line Protocol.
+    /// Supports the decimal data type in text and binary formats.
+    /// This version is specific to QuestDB and is not compatible with InfluxDB.
+    /// QuestDB server version 9.2.0 or later is required for `V3` supported.
+    V3 = 3,
 }
 
 impl ProtocolVersion {
-    /// Returns `true` if this protocol version supports binary-encoded column values.
+    /// Returns `true` if this protocol version supports the given protocol version.
     ///
     /// # Examples
     ///
     /// ```
     /// use questdb::ingress::ProtocolVersion;
     ///
-    /// assert_eq!(ProtocolVersion::V1.supports_binary_encoding(), false);
-    /// assert_eq!(ProtocolVersion::V2.supports_binary_encoding(), true);
+    /// assert_eq!(ProtocolVersion::V1.supports(ProtocolVersion::V2), false);
+    /// assert_eq!(ProtocolVersion::V2.supports(ProtocolVersion::V1), true);
     /// ```
     #[inline]
-    pub fn supports_binary_encoding(self) -> bool {
-        self != ProtocolVersion::V1
+    pub fn supports(self, version: ProtocolVersion) -> bool {
+        // Protocol versions are backward compatible
+        self as u32 >= version as u32
     }
 }
 
@@ -114,6 +121,7 @@ impl Display for ProtocolVersion {
         match self {
             ProtocolVersion::V1 => write!(f, "v1"),
             ProtocolVersion::V2 => write!(f, "v2"),
+            ProtocolVersion::V3 => write!(f, "v3"),
         }
     }
 }

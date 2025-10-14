@@ -1638,6 +1638,7 @@
     },
     {
         "testName": "decimal",
+        "minimumProtocolVersion": 3,
         "table": "decimals",
         "symbols": [],
         "columns": [

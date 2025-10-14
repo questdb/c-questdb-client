@@ -18,7 +18,7 @@ fn main() -> Result<()> {
         .table("trades_ilp_v1")?
         .symbol("symbol", "ETH-USD")?
         .symbol("side", "sell")?
-        .column_decimal("price", &price)?
+        .column_dec("price", &price)?
         .column_f64("amount", 0.00044)?
         .at(TimestampNanos::now())?;
     sender.flush(&mut buffer)?;
@@ -32,7 +32,7 @@ fn main() -> Result<()> {
         .table("trades_ilp_v2")?
         .symbol("symbol", "ETH-USD")?
         .symbol("side", "sell")?
-        .column_decimal("price", &price)?
+        .column_dec("price", &price)?
         .column_f64("amount", 0.00044)?
         .column_arr("location", &arr1(&[100.0, 100.1, 100.2]).view())?
         .at(TimestampNanos::now())?;

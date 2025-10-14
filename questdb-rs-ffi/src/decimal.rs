@@ -100,18 +100,9 @@ impl<'a> DecimalSerializer for Decimal<'a> {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - Binary encoding is not supported by the protocol version
     /// - Scale exceeds 76 (QuestDB server maximum)
     /// - Value size exceeds 127 bytes (protocol limitation)
-    fn serialize(self, out: &mut Vec<u8>, support_binary: bool) -> Result<()> {
-        // Binary encoding is required for decimal types (only available in protocol v2+)
-        if !support_binary {
-            return Err(fmt_error!(
-                ProtocolVersionError,
-                "Protocol version does not support binary encoding"
-            ));
-        }
-
+    fn serialize(self, out: &mut Vec<u8>) -> Result<()> {
         // Validate scale constraint (QuestDB server limitation)
         // The server's decimal implementation supports a maximum scale of 76
         if self.scale > 76 {

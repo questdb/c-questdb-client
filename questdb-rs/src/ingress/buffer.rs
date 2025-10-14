@@ -984,7 +984,7 @@ impl Buffer {
     /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
     /// # let mut buffer = sender.new_buffer();
     /// # buffer.table("x")?;
-    /// buffer.column_decimal("col_name", "123.45")?;
+    /// buffer.column_dec("col_name", "123.45")?;
     /// # Ok(())
     /// # }
     /// ```
@@ -1001,7 +1001,7 @@ impl Buffer {
     /// # let mut buffer = sender.new_buffer();
     /// # buffer.table("x")?;
     /// let col_name = ColumnName::new("col_name")?;
-    /// buffer.column_decimal(col_name, "123.45")?;
+    /// buffer.column_dec(col_name, "123.45")?;
     /// # Ok(())
     /// # }
     /// ```
@@ -1021,7 +1021,7 @@ impl Buffer {
     /// # let mut buffer = sender.new_buffer();
     /// # buffer.table("x")?;
     /// let value = Decimal::from_str("123.45").unwrap();
-    /// buffer.column_decimal("col_name", &value)?;
+    /// buffer.column_dec("col_name", &value)?;
     /// # Ok(())
     /// # }
     /// # }
@@ -1042,22 +1042,27 @@ impl Buffer {
     /// # let mut buffer = sender.new_buffer();
     /// # buffer.table("x")?;
     /// let value = BigDecimal::from_str("0.123456789012345678901234567890").unwrap();
-    /// buffer.column_decimal("col_name", &value)?;
+    /// buffer.column_dec("col_name", &value)?;
     /// # Ok(())
     /// # }
     /// # }
     /// ```
-    pub fn column_decimal<'a, N, S>(&mut self, name: N, value: S) -> crate::Result<&mut Self>
+    pub fn column_dec<'a, N, S>(&mut self, name: N, value: S) -> crate::Result<&mut Self>
     where
         N: TryInto<ColumnName<'a>>,
         S: DecimalSerializer,
         Error: From<N::Error>,
     {
+        if !self.protocol_version.supports(ProtocolVersion::V3) {
+            return Err(error::fmt!(
+                ProtocolVersionError,
+                "Protocol version {} does not support the decimal datatype",
+                self.protocol_version
+            ));
+        }
+
         self.write_column_key(name)?;
-        value.serialize(
-            &mut self.output,
-            self.protocol_version.supports_binary_encoding(),
-        )?;
+        value.serialize(&mut self.output)?;
         Ok(self)
     }
 
@@ -1116,10 +1121,11 @@ impl Buffer {
         D: ArrayElement + ArrayElementSealed,
         Error: From<N::Error>,
     {
-        if self.protocol_version == ProtocolVersion::V1 {
+        if !self.protocol_version.supports(ProtocolVersion::V2) {
             return Err(error::fmt!(
                 ProtocolVersionError,
-                "Protocol version v1 does not support array datatype",
+                "Protocol version {} does not support array datatype",
+                self.protocol_version
             ));
         }
         let ndim = view.ndim();

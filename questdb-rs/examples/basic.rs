@@ -16,7 +16,7 @@ fn main() -> Result<()> {
         .table("trades")?
         .symbol("symbol", "ETH-USD")?
         .symbol("side", "sell")?
-        .column_decimal("price", "2615.54")?
+        .column_dec("price", "2615.54")?
         .column_f64("amount", 0.00044)?
         // QuestDB server version 9.0.0 or later is required for array support.
         .column_arr("location", &arr1(&[100.0, 100.1, 100.2]).view())?
