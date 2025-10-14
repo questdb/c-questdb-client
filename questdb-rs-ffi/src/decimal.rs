@@ -88,9 +88,9 @@ impl<'a> DecimalSerializer for Decimal<'a> {
     /// The serialization produces the following byte sequence:
     /// 1. `'='` (0x3D) - Binary encoding marker
     /// 2. Type ID (23) - Identifies this as a decimal type
-    /// 3. Length byte - Number of bytes in the value (max 127)
-    /// 4. Value bytes - The unscaled integer in big-endian format
-    /// 5. Scale byte - Number of decimal places (implicitly written after value)
+    /// 3. Scale byte - Number of decimal places
+    /// 4. Length byte - Number of bytes in the value (max 127)
+    /// 5. Value bytes - The unscaled integer in big-endian format
     ///
     /// # Arguments
     ///

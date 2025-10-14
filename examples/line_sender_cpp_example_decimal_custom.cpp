@@ -29,7 +29,7 @@ public:
     questdb::ingress::decimal::binary_view view() const
     {
         std::array<uint8_t, sizeof(uint32_t)> data = {
-            // Big-Endiang bytes
+            // Big-Endian bytes
             static_cast<uint8_t>(_unscaled_value >> 24),
             static_cast<uint8_t>(_unscaled_value >> 16),
             static_cast<uint8_t>(_unscaled_value >> 8),
