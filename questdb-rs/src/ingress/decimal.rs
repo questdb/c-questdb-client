@@ -61,7 +61,6 @@ use crate::{error, ingress::must_escape_unquoted, Result};
 /// ```
 ///
 /// # Binary Format Notes
-/// - Binary format is only supported when `support_binary` is `true` (Protocol V2)
 /// - The unscaled value must be encoded in two's complement big-endian format
 /// - Maximum scale is 76
 /// - Length byte indicates how many bytes follow for the unscaled value
