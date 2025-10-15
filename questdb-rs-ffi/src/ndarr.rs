@@ -112,18 +112,20 @@ where
         data: *const T,
         len: usize,
     ) -> Result<Self, Error> {
-        let shape = check_array_shape::<T>(D, shape, len)?;
-        let strides = slice::from_raw_parts(strides, D);
-        let mut slice = None;
-        if len != 0 {
-            slice = Some(slice::from_raw_parts(data, len));
+        unsafe {
+            let shape = check_array_shape::<T>(D, shape, len)?;
+            let strides = slice::from_raw_parts(strides, D);
+            let mut slice = None;
+            if len != 0 {
+                slice = Some(slice::from_raw_parts(data, len));
+            }
+            Ok(Self {
+                shape,
+                strides,
+                data: slice,
+                _marker: std::marker::PhantomData::<T>,
+            })
         }
-        Ok(Self {
-            shape,
-            strides,
-            data: slice,
-            _marker: std::marker::PhantomData::<T>,
-        })
     }
 
     /// Verifies if the array follows C-style row-major memory layout.
@@ -329,17 +331,19 @@ where
         data: *const T,
         data_len: usize,
     ) -> Result<Self, Error> {
-        let shape = check_array_shape::<T>(dims, shape, data_len)?;
-        let mut slice = None;
-        if data_len != 0 {
-            slice = Some(slice::from_raw_parts(data, data_len));
+        unsafe {
+            let shape = check_array_shape::<T>(dims, shape, data_len)?;
+            let mut slice = None;
+            if data_len != 0 {
+                slice = Some(slice::from_raw_parts(data, data_len));
+            }
+            Ok(Self {
+                dims,
+                shape,
+                data: slice,
+                _marker: std::marker::PhantomData::<T>,
+            })
         }
-        Ok(Self {
-            dims,
-            shape,
-            data: slice,
-            _marker: std::marker::PhantomData::<T>,
-        })
     }
 }
 
