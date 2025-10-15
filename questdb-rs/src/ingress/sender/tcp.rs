@@ -24,8 +24,8 @@
 
 use crate::error;
 use crate::gai;
-use crate::ingress::tls::{configure_tls, TlsSettings};
-use crate::ingress::{conf, map_io_to_socket_err, parse_key_pair, SyncProtocolHandler};
+use crate::ingress::tls::{TlsSettings, configure_tls};
+use crate::ingress::{SyncProtocolHandler, conf, map_io_to_socket_err, parse_key_pair};
 use rustls::{ClientConnection, StreamOwned};
 use rustls_pki_types::ServerName;
 use socket2::{Domain, Protocol as SockProtocol, SockAddr, Socket, Type};

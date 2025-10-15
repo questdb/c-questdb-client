@@ -28,7 +28,7 @@ use core::time::Duration;
 use mio::event::Event;
 use mio::net::TcpStream;
 use mio::{Events, Interest, Poll, Token};
-use rustls::{server::ServerConnection, ServerConfig, Stream};
+use rustls::{ServerConfig, Stream, server::ServerConnection};
 use socket2::{Domain, Protocol as SockProtocol, Socket, Type};
 use std::fs::File;
 use std::io::{self, BufReader, Read};

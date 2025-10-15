@@ -22,16 +22,16 @@
  *
  ******************************************************************************/
 
-use crate::ingress::{Buffer, NdArrayView, ProtocolVersion, ARRAY_BINARY_FORMAT_TYPE};
-use crate::tests::TestResult;
 use crate::ErrorCode;
+use crate::ingress::{ARRAY_BINARY_FORMAT_TYPE, Buffer, NdArrayView, ProtocolVersion};
+use crate::tests::TestResult;
 
-#[cfg(feature = "ndarray")]
-use crate::ingress::ndarr::write_array_data;
 #[cfg(feature = "ndarray")]
 use crate::ingress::MAX_ARRAY_DIMS;
 #[cfg(feature = "ndarray")]
-use ndarray::{arr1, arr2, arr3, s, ArrayD};
+use crate::ingress::ndarr::write_array_data;
+#[cfg(feature = "ndarray")]
+use ndarray::{ArrayD, arr1, arr2, arr3, s};
 #[cfg(feature = "ndarray")]
 use std::iter;
 
@@ -599,7 +599,9 @@ fn test_build_in_3d_vec_normal() -> TestResult {
     let collected: Vec<_> = NdArrayView::iter(&vec).copied().collect();
     assert_eq!(
         collected,
-        vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
+        vec![
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0
+        ]
     );
 
     let mut buffer = Buffer::new(ProtocolVersion::V2);
