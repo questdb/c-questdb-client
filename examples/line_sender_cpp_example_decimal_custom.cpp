@@ -44,12 +44,12 @@ private:
 // Customization point for QuestDB decimal API (discovered via König lookup)
 // If you need to support a 3rd party type, put this function in the namespace
 // of the type in question or in the `questdb::ingress::decimal` namespace
-inline auto to_view_state_impl(const Decimal32& d)
+inline auto to_decimal_view_state_impl(const Decimal32& d)
 {
     int32_t unscaled_value = d.unscaled_value();
     return ViewHolder{
         {
-            // Big-Endiang bytes
+            // Big-Endian bytes
             static_cast<uint8_t>(unscaled_value >> 24),
             static_cast<uint8_t>(unscaled_value >> 16),
             static_cast<uint8_t>(unscaled_value >> 8),
