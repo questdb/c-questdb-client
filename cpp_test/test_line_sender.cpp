@@ -284,7 +284,7 @@ TEST_CASE("line_sender c++ api basics")
         questdb::ingress::protocol::tcp,
         std::string("127.0.0.1"),
         std::to_string(server.port())};
-    opts.protocol_version(questdb::ingress::protocol_version::v2);
+    opts.protocol_version(questdb::ingress::protocol_version::v3);
     questdb::ingress::line_sender sender{opts};
     CHECK_FALSE(sender.must_close());
     server.accept();
@@ -354,7 +354,7 @@ TEST_CASE("line_sender array vector API")
         questdb::ingress::protocol::tcp,
         std::string("127.0.0.1"),
         std::to_string(server.port())};
-    opts.protocol_version(questdb::ingress::protocol_version::v2);
+    opts.protocol_version(questdb::ingress::protocol_version::v3);
     questdb::ingress::line_sender sender{opts};
     CHECK_FALSE(sender.must_close());
     server.accept();
@@ -398,7 +398,7 @@ TEST_CASE("line_sender array span API")
         questdb::ingress::protocol::tcp,
         std::string("127.0.0.1"),
         std::to_string(server.port())};
-    opts.protocol_version(questdb::ingress::protocol_version::v2);
+    opts.protocol_version(questdb::ingress::protocol_version::v3);
     questdb::ingress::line_sender sender{opts};
     CHECK_FALSE(sender.must_close());
     server.accept();
@@ -1063,21 +1063,21 @@ TEST_CASE("Moved View")
 TEST_CASE("Empty Buffer")
 {
     questdb::ingress::line_sender_buffer b1{
-        questdb::ingress::protocol_version::v2};
+        questdb::ingress::protocol_version::v3};
     CHECK(b1.size() == 0);
     questdb::ingress::line_sender_buffer b2{std::move(b1)};
     CHECK(b1.size() == 0);
     CHECK(b2.size() == 0);
     questdb::ingress::line_sender_buffer b3{
-        questdb::ingress::protocol_version::v2};
+        questdb::ingress::protocol_version::v3};
     b3 = std::move(b2);
     CHECK(b2.size() == 0);
     CHECK(b3.size() == 0);
     questdb::ingress::line_sender_buffer b4{
-        questdb::ingress::protocol_version::v2};
+        questdb::ingress::protocol_version::v3};
     b4.table("test").symbol("a", "b").at_now();
     questdb::ingress::line_sender_buffer b5{
-        questdb::ingress::protocol_version::v2};
+        questdb::ingress::protocol_version::v3};
     b5 = std::move(b4);
     CHECK(b4.size() == 0);
     CHECK(b5.size() == 9);
@@ -1119,13 +1119,13 @@ TEST_CASE("HTTP basics")
     questdb::ingress::opts opts2conf = questdb::ingress::opts::from_conf(
         "http::addr=127.0.0.1:1;token=token;request_min_throughput=1000;retry_"
         "timeout=0;protocol_version=3;");
-    opts1.protocol_version(questdb::ingress::protocol_version::v2)
+    opts1.protocol_version(questdb::ingress::protocol_version::v3)
         .username("user")
         .password("pass")
         .max_buf_size(1000000)
         .request_timeout(5000)
         .retry_timeout(5);
-    opts2.protocol_version(questdb::ingress::protocol_version::v2)
+    opts2.protocol_version(questdb::ingress::protocol_version::v3)
         .token("token")
         .request_min_throughput(1000)
         .retry_timeout(0);
@@ -1182,7 +1182,7 @@ TEST_CASE("line sender protocol version v2")
         questdb::ingress::protocol::tcp,
         std::string("127.0.0.1"),
         std::to_string(server.port())};
-    opts.protocol_version(questdb::ingress::protocol_version::v2);
+    opts.protocol_version(questdb::ingress::protocol_version::v3);
     questdb::ingress::line_sender sender{opts};
     CHECK_FALSE(sender.must_close());
     server.accept();

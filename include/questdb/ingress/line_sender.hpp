@@ -122,6 +122,13 @@ enum class protocol_version
      * `v2` support.
      */
     v2 = 2,
+
+    /**
+     * InfluxDB Line Protocol v3.
+     * QuestDB server version 9.2.0 or later is required for
+     * `v3` support.
+     */
+    v3 = 3,
 };
 
 /* Possible sources of the root certificates used to validate the server's TLS
