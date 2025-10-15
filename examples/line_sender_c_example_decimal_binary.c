@@ -51,7 +51,6 @@ static bool example(const char* host, const char* port)
     if (!line_sender_buffer_symbol(buffer, side_name, side_value, &err))
         goto on_error;
 
-    line_sender_utf8 price_value = QDB_UTF8_LITERAL("2615.54");
     // 123 with a scale of 1 gives a decimal of 12.3
     const uint8_t price_unscaled_value[] = {123};
     if (!line_sender_buffer_column_dec(
