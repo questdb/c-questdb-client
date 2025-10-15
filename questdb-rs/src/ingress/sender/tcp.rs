@@ -178,7 +178,7 @@ pub(crate) fn connect_tcp(
         .map_err(|io_err| map_io_to_socket_err("Could not set socket linger: ", io_err))?;
     sock.set_keepalive(true)
         .map_err(|io_err| map_io_to_socket_err("Could not set SO_KEEPALIVE: ", io_err))?;
-    sock.set_nodelay(true)
+    sock.set_tcp_nodelay(true)
         .map_err(|io_err| map_io_to_socket_err("Could not set TCP_NODELAY: ", io_err))?;
     if let Some(host) = net_interface {
         let bind_addr = gai::resolve_host(host)?;
