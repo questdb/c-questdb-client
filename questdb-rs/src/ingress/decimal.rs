@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-use crate::{error, ingress::must_escape_unquoted, Result};
+use crate::{error, Result};
 
 /// Trait for types that can be serialized as decimal values in the InfluxDB Line Protocol (ILP).
 ///
@@ -79,12 +79,13 @@ pub trait DecimalSerializer {
 /// as it cannot parse the string to extract scale and unscaled value needed for binary encoding.
 ///
 /// # Format
-/// The string is validated and written as-is, followed by the 'd' suffix.
+/// The string is validated and written as-is, followed by the 'd' suffix. Thousand separators
+/// (commas) are not allowed and the decimal point must be a dot (`.`).
 ///
 /// # Validation
 /// The implementation performs **partial validation only**:
-/// - Rejects ILP reserved characters (space, comma, equals, newline, carriage return, backslash)
-/// - Does NOT validate the actual decimal syntax (e.g., "not-a-number" would pass)
+/// - Rejects non-numerical characters (not -/+, 0-9, e/E, .)
+/// - Does NOT validate the actual decimal syntax (e.g., "e2e" would pass)
 ///
 /// This is intentional: full parsing would add overhead. The QuestDB server performs complete
 /// validation and will reject malformed decimals.
@@ -96,23 +97,24 @@ pub trait DecimalSerializer {
 ///
 /// # Errors
 /// Returns [`Error`] with [`ErrorCode::InvalidDecimal`](crate::error::ErrorCode::InvalidDecimal)
-/// if the string contains ILP reserved characters.
+/// if the string contains non-numerical characters.
 impl DecimalSerializer for &str {
     fn serialize(self, out: &mut Vec<u8>) -> Result<()> {
         // Pre-allocate space for the string content plus the 'd' suffix
         out.reserve(self.len() + 1);
 
-        // Validate and copy each byte, rejecting ILP reserved characters
-        // that would break the protocol (space, comma, equals, newline, etc.)
+        // Validate and copy each byte, rejecting non-numeric characters
         for b in self.bytes() {
-            if must_escape_unquoted(b) {
-                return Err(error::fmt!(
-                    InvalidDecimal,
-                    "Unexpected character {:?} in decimal str",
-                    b
-                ));
+            match b {
+                b'0'..=b'9' | b'.' | b'-' | b'+' | b'e' | b'E' => out.push(b),
+                _ => {
+                    return Err(error::fmt!(
+                        InvalidDecimal,
+                        "Invalid character {:?} in decimal str",
+                        b as char
+                    ));
+                }
             }
-            out.push(b);
         }
 
         // Append the 'd' suffix to mark this as a decimal value

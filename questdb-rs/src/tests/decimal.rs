@@ -23,7 +23,7 @@
  ******************************************************************************/
 
 use crate::ingress::{Buffer, DecimalSerializer, ProtocolVersion};
-use crate::tests::TestResult;
+use crate::tests::{assert_err_contains, TestResult};
 use crate::ErrorCode;
 use rstest::rstest;
 
@@ -83,46 +83,35 @@ fn test_str_with_leading_zero() -> TestResult {
 #[test]
 fn test_str_rejects_space() -> TestResult {
     let result = serialize_decimal("12 3.45");
-    assert!(result.is_err());
-    let err = result.unwrap_err();
-    assert_eq!(err.code(), ErrorCode::InvalidDecimal);
-    assert!(err.msg().contains("Unexpected character"));
+    assert_err_contains(result, ErrorCode::InvalidDecimal, "Invalid character");
     Ok(())
 }
 
 #[test]
 fn test_str_rejects_comma() -> TestResult {
     let result = serialize_decimal("1,234.56");
-    assert!(result.is_err());
-    let err = result.unwrap_err();
-    assert_eq!(err.code(), ErrorCode::InvalidDecimal);
+    assert_err_contains(result, ErrorCode::InvalidDecimal, "Invalid character");
     Ok(())
 }
 
 #[test]
 fn test_str_rejects_equals() -> TestResult {
     let result = serialize_decimal("123=45");
-    assert!(result.is_err());
-    let err = result.unwrap_err();
-    assert_eq!(err.code(), ErrorCode::InvalidDecimal);
+    assert_err_contains(result, ErrorCode::InvalidDecimal, "Invalid character");
     Ok(())
 }
 
 #[test]
 fn test_str_rejects_newline() -> TestResult {
     let result = serialize_decimal("123\n45");
-    assert!(result.is_err());
-    let err = result.unwrap_err();
-    assert_eq!(err.code(), ErrorCode::InvalidDecimal);
+    assert_err_contains(result, ErrorCode::InvalidDecimal, "Invalid character");
     Ok(())
 }
 
 #[test]
 fn test_str_rejects_backslash() -> TestResult {
     let result = serialize_decimal("123\\45");
-    assert!(result.is_err());
-    let err = result.unwrap_err();
-    assert_eq!(err.code(), ErrorCode::InvalidDecimal);
+    assert_err_contains(result, ErrorCode::InvalidDecimal, "Invalid character");
     Ok(())
 }
 
@@ -438,11 +427,7 @@ mod bigdecimal_tests {
             "0.00000000000000000000000000000000000000000000000000000000000000000000000000001",
         )?;
         let result = serialize_decimal(&dec);
-
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert_eq!(err.code(), ErrorCode::InvalidDecimal);
-        assert!(err.msg().contains("scale greater than 76"));
+        assert_err_contains(result, ErrorCode::InvalidDecimal, "scale greater than 76");
         Ok(())
     }
 
@@ -468,11 +453,11 @@ mod bigdecimal_tests {
         // QuestDB cannot accept arrays that are larger than what an i8 can fit
         let dec = BigDecimal::from_str("1e1000")?;
         let result = serialize_decimal(&dec);
-
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert_eq!(err.code(), ErrorCode::InvalidDecimal);
-        assert!(err.msg().contains("does not support values greater"));
+        assert_err_contains(
+            result,
+            ErrorCode::InvalidDecimal,
+            "does not support values greater",
+        );
         Ok(())
     }
 }
@@ -506,10 +491,11 @@ fn test_buffer_column_decimal_str_unsupported(
         .table("test")?
         .symbol("sym", "val")?
         .column_dec("dec", "123.45");
-    assert!(result.is_err());
-    let err = result.unwrap_err();
-    assert_eq!(err.code(), ErrorCode::ProtocolVersionError);
-    assert!(err.msg().contains("does not support the decimal datatype"));
+    assert_err_contains(
+        result,
+        ErrorCode::ProtocolVersionError,
+        "does not support the decimal datatype",
+    );
     Ok(())
 }
 
