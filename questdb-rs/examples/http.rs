@@ -9,7 +9,7 @@ use rust_decimal::Decimal;
 
 fn main() -> Result<()> {
     let mut sender = Sender::from_conf(
-        "https::addr=localhost:9000;username=foo;password=bar;protocol_version=2;",
+        "https::addr=localhost:9000;username=foo;password=bar;protocol_version=3;",
     )?;
     let mut buffer = sender.new_buffer();
     let price = Decimal::from_str("2615.54").unwrap();

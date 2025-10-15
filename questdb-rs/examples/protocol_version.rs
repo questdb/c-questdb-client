@@ -25,7 +25,7 @@ fn main() -> Result<()> {
 
     // QuestDB server version 9.0.0 or later is required for `protocol_version=2` support.
     let mut sender2 = Sender::from_conf(
-        "http::addr=localhost:9000;username=foo;password=bar;protocol_version=2;",
+        "http::addr=localhost:9000;username=foo;password=bar;protocol_version=3;",
     )?;
     let mut buffer2 = sender2.new_buffer();
     buffer2
