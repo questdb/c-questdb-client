@@ -259,7 +259,7 @@ struct has_array_view_state : std::false_type
 template <typename T>
 struct has_array_view_state<
     T,
-    std::void_t<decltype(to_array_view_state_impl(std::declval<T>()))>>
+    std::void_t<decltype(to_array_view_state_impl(std::declval<const T&>()))>>
     : std::true_type
 {
 };
