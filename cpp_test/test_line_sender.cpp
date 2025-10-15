@@ -231,7 +231,7 @@ TEST_CASE("line_sender c api basics")
             &err));
     CHECK(::line_sender_buffer_at_nanos(buffer, 10000000, &err));
     CHECK(server.recv() == 0);
-    CHECK(::line_sender_buffer_size(buffer) == 382);
+    CHECK(::line_sender_buffer_size(buffer) == 383);
     CHECK(::line_sender_flush(sender, buffer, &err));
     ::line_sender_buffer_free(buffer);
     CHECK(server.recv() == 1);
@@ -239,7 +239,8 @@ TEST_CASE("line_sender c api basics")
     push_double_to_buffer(expect, 0.5).append(",a1==");
     push_double_arr_to_buffer(expect, arr_data, 3, shape).append(",a2==");
     push_double_arr_to_buffer(expect, arr_data, 3, shape).append(",a3==");
-    push_double_arr_to_buffer(expect, arr_data, 3, shape).append(" 10000000\n");
+    push_double_arr_to_buffer(expect, arr_data, 3, shape)
+        .append(" 10000000n\n");
     CHECK(server.msgs(0) == expect);
 }
 
@@ -332,7 +333,7 @@ TEST_CASE("line_sender c++ api basics")
         .at(questdb::ingress::timestamp_nanos{10000000});
 
     CHECK(server.recv() == 0);
-    CHECK(buffer.size() == 610);
+    CHECK(buffer.size() == 611);
     sender.flush(buffer);
     CHECK(server.recv() == 1);
     std::string expect{"test,t1=v1,t2= f1=="};
@@ -343,7 +344,7 @@ TEST_CASE("line_sender c++ api basics")
     push_double_arr_to_buffer(expect, arr_data, 3, shape).append(",a4==");
     push_double_arr_to_buffer(expect, arr_data, 3, shape).append(",a5==");
     push_double_arr_to_buffer(expect, arr_data, 1, shapes_1dim)
-        .append(" 10000000\n");
+        .append(" 10000000n\n");
     CHECK(server.msgs(0) == expect);
 }
 
@@ -381,12 +382,12 @@ TEST_CASE("line_sender array vector API")
 
     uintptr_t test_shape[] = {12};
     CHECK(server.recv() == 0);
-    CHECK(buffer.size() == 132);
+    CHECK(buffer.size() == 133);
     sender.flush(buffer);
     CHECK(server.recv() == 1);
     std::string expect{"test,t1=v1,t2= a1=="};
     push_double_arr_to_buffer(expect, arr_data, 1, test_shape)
-        .append(" 10000000\n");
+        .append(" 10000000n\n");
     CHECK(server.msgs(0) == expect);
 }
 
@@ -430,12 +431,12 @@ TEST_CASE("line_sender array span API")
 
     uintptr_t test_shape[] = {8};
     CHECK(server.recv() == 0);
-    CHECK(buffer.size() == 100);
+    CHECK(buffer.size() == 101);
     sender.flush(buffer);
     CHECK(server.recv() == 1);
     std::string expect{"test,t1=v1,t2= a1=="};
     push_double_arr_to_buffer(expect, expect_arr_data, 1, test_shape)
-        .append(" 10000000\n");
+        .append(" 10000000n\n");
     CHECK(server.msgs(0) == expect);
 }
 #endif
@@ -471,12 +472,12 @@ TEST_CASE("test multiple lines")
         .at_now();
 
     CHECK(server.recv() == 0);
-    CHECK(buffer.size() == 142);
+    CHECK(buffer.size() == 143);
     sender.flush(buffer);
     CHECK(server.recv() == 2);
     std::string expect{"metric1,t1=val1,t2=val2 f1=t,f2=12345i,f3=="};
     push_double_to_buffer(expect, 10.75)
-        .append(",f4=\"val3\",f5=\"val4\",f6=\"val5\" 111222233333\n");
+        .append(",f4=\"val3\",f5=\"val4\",f6=\"val5\" 111222233333n\n");
     CHECK(server.msgs(0) == expect);
     CHECK(
         server.msgs(1) == "metric1,tag3=value\\ 3,tag\\ 4=value:4 field5=f\n");
@@ -920,7 +921,7 @@ TEST_CASE("Opts copy ctor, assignment and move testing.")
     }
 }
 
-TEST_CASE("Test timestamp column.")
+TEST_CASE("Test timestamp column V1.")
 {
     questdb::ingress::test::mock_server server;
     questdb::ingress::line_sender sender{questdb::ingress::opts{
@@ -946,8 +947,8 @@ TEST_CASE("Test timestamp column.")
         .at(now_nanos_ts);
 
     std::stringstream ss;
-    ss << "test ts1=12345t,ts2=" << now_micros << "t,ts3=" << now_nanos << "n "
-       << now_nanos << "\n";
+    ss << "test ts1=12345t,ts2=" << now_micros << "t,ts3=" << (now_nanos / 1000)
+       << "t " << now_nanos << "\n";
     const auto exp = ss.str();
     CHECK(buffer.peek() == exp);
 
@@ -1196,11 +1197,11 @@ TEST_CASE("line sender protocol version v2")
         .at(questdb::ingress::timestamp_nanos{10000000});
 
     CHECK(server.recv() == 0);
-    CHECK(buffer.size() == 38);
+    CHECK(buffer.size() == 39);
     sender.flush(buffer);
     CHECK(server.recv() == 1);
     std::string expect{"test,t1=v1,t2= f1=="};
-    push_double_to_buffer(expect, 0.5).append(" 10000000\n");
+    push_double_to_buffer(expect, 0.5).append(" 10000000n\n");
     CHECK(server.msgs(0) == expect);
 }
 

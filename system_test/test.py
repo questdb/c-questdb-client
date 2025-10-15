@@ -64,14 +64,6 @@ def retry_check_table(*args, **kwargs):
     return QDB_FIXTURE.retry_check_table(*args, **kwargs)
 
 
-def ns_to_qdb_date(at_ts_ns):
-    # We first need to match QuestDB's internal microsecond resolution.
-    at_ts_us = int(at_ts_ns / 1000.0)
-    at_ts_sec = at_ts_us / 1000000.0
-    at_td = datetime.datetime.utcfromtimestamp(at_ts_sec)
-    return at_td.isoformat() + 'Z'
-
-
 # Valid keys, but not registered with the QuestDB fixture.
 AUTH_UNRECOGNIZED = dict(
     username="testUser2",
@@ -113,6 +105,33 @@ class TestSender(unittest.TestCase):
             QDB_FIXTURE.host,
             QDB_FIXTURE.http_server_port if QDB_FIXTURE.http else QDB_FIXTURE.line_tcp_port,
             **kwargs)
+    
+    def _ns_to_qdb_date(self, at_ts_ns, exp_nanos: bool):
+        # We first need to match QuestDB's internal microsecond resolution.
+        at_ts_us = at_ts_ns // 1000
+        trimmed_ns = at_ts_ns % 1000
+        at_ts_sec = at_ts_us / 1000000.0
+
+        # Commented out for now. Uncomment when CI catches up to a newer Python version.
+        # at_td = datetime.datetime.fromtimestamp(at_ts_sec, datetime.UTC).replace(tzinfo=None)
+        at_td = datetime.datetime.utcfromtimestamp(at_ts_sec)
+        extra_precision = ''
+        if exp_nanos:
+            extra_precision = f'{trimmed_ns:03}'
+        return at_td.isoformat() + extra_precision + 'Z'
+    
+    @property
+    def client_driven_nanos_supported(self) -> bool:
+        """True if the QuestDB server supports nanos and also respects the client's precision for the designated timestamp."""
+        if QDB_FIXTURE.version <= (9, 1, 0):
+            return False
+
+        if QDB_FIXTURE.http:
+            return QDB_FIXTURE.protocol_version != qls.ProtocolVersion.V1
+        elif QDB_FIXTURE.protocol_version is None:
+            return False # TCP defaults to ProtocolVersion.V1
+        else:
+            return QDB_FIXTURE.protocol_version >= qls.ProtocolVersion.V2
 
     @property
     def expected_protocol_version(self) -> qls.ProtocolVersion:
@@ -345,10 +364,14 @@ class TestSender(unittest.TestCase):
             (sender
              .table(table_name)
              .symbol('a', 'A')
+             .column('b', qls.TimestampNanos(at_ts_ns))
              .at(at_ts_ns))
             pending = sender.buffer.peek()
         resp = retry_check_table(table_name, log_ctx=pending)
-        exp_dataset = [['A', ns_to_qdb_date(at_ts_ns)]]
+        exp_dataset = [[
+            'A',
+            self._ns_to_qdb_date(at_ts_ns, exp_nanos=self.client_driven_nanos_supported),
+            self._ns_to_qdb_date(at_ts_ns, exp_nanos=self.client_driven_nanos_supported)]]
         self.assertEqual(resp['dataset'], exp_dataset)
 
     def test_neg_at(self):
@@ -364,6 +387,28 @@ class TestSender(unittest.TestCase):
                      .table(table_name)
                      .symbol('a', 'A')
                      .at(at_ts_ns))
+                    
+    def test_micros_at(self):
+        if QDB_FIXTURE.version <= (6, 0, 7, 1):
+            self.skipTest('No support for user-provided timestamps.')
+            return
+        table_name = uuid.uuid4().hex
+        at_ts_ns = 1647357688714369403
+        at_ts_us = at_ts_ns // 1000
+        pending = None
+        with self._mk_linesender() as sender:
+            (sender
+             .table(table_name)
+             .symbol('a', 'A')
+             .column('b', qls.TimestampMicros(at_ts_us))
+             .at_micros(at_ts_us))
+            pending = sender.buffer.peek()
+        resp = retry_check_table(table_name, log_ctx=pending)
+        exp_dataset = [[
+            'A',
+            self._ns_to_qdb_date(at_ts_ns, exp_nanos=False),
+            self._ns_to_qdb_date(at_ts_ns, exp_nanos=False)]]
+        self.assertEqual(resp['dataset'], exp_dataset)
 
     def test_timestamp_col(self):
         if QDB_FIXTURE.version <= (6, 0, 7, 1):
@@ -788,12 +833,13 @@ class TestSender(unittest.TestCase):
 
         # Check inserted data.
         resp = retry_check_table(table_name)
+        exp_ts_type = 'TIMESTAMP_NS' if self.client_driven_nanos_supported else 'TIMESTAMP'
         exp_columns = [
             {'name': 'symbol', 'type': 'SYMBOL'},
             {'name': 'side', 'type': 'SYMBOL'},
             {'name': 'price', 'type': 'DECIMAL(18,3)'},
             {'name': 'amount', 'type': 'DOUBLE'},
-            {'name': 'timestamp', 'type': 'TIMESTAMP'}]
+            {'name': 'timestamp', 'type': exp_ts_type}]
         self.assertEqual(resp['columns'], exp_columns)
 
         exp_dataset = [['ETH-USD',
@@ -873,10 +919,11 @@ class TestSender(unittest.TestCase):
         args.extend(['127.0.0.1', str(port)])
         subprocess.check_call(args, cwd=bin_path.parent)
         resp = retry_check_table(table_name)
+        exp_ts_type = 'TIMESTAMP_NS' if self.client_driven_nanos_supported else 'TIMESTAMP'
         exp_columns = [
             {'name': 'symbol', 'type': 'SYMBOL'},
             {'dim': 3, 'elemType': 'DOUBLE', 'name': 'order_book', 'type': 'ARRAY'},
-            {'name': 'timestamp', 'type': 'TIMESTAMP'}]
+            {'name': 'timestamp', 'type': exp_ts_type}]
         self.assertEqual(resp['columns'], exp_columns)
         exp_dataset = [['BTC-USD',
                         [[[48123.5, 2.4], [48124.0, 1.8], [48124.5, 0.9]],
