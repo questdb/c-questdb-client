@@ -7,7 +7,7 @@ use questdb::{
 
 fn main() -> Result<()> {
     let host: String = std::env::args().nth(1).unwrap_or("localhost".to_string());
-    let port: &str = &std::env::args().nth(2).unwrap_or("9009".to_string());
+    let port: String = std::env::args().nth(2).unwrap_or("9009".to_string());
     let mut sender = Sender::from_conf(format!("tcp::addr={host}:{port};protocol_version=3;"))?;
     let mut buffer = sender.new_buffer();
     let designated_timestamp =
