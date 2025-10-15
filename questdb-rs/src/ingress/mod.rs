@@ -98,6 +98,13 @@ pub enum ProtocolVersion {
     V3 = 3,
 }
 
+/// List of supported protocol versions, in order of preference (highest to lowest).
+const SUPPORTED_PROTOCOL_VERSIONS: [ProtocolVersion; 3] = [
+    ProtocolVersion::V3,
+    ProtocolVersion::V2,
+    ProtocolVersion::V1,
+];
+
 impl ProtocolVersion {
     /// Returns `true` if this protocol version supports the given protocol version.
     ///
@@ -447,11 +454,12 @@ impl SenderBuilder {
                 "protocol_version" => match val {
                     "1" => builder.protocol_version(ProtocolVersion::V1)?,
                     "2" => builder.protocol_version(ProtocolVersion::V2)?,
+                    "3" => builder.protocol_version(ProtocolVersion::V3)?,
                     "auto" => builder,
                     invalid => {
                         return Err(error::fmt!(
                             ConfigError,
-                            "invalid \"protocol_version\" [value={invalid}, allowed-values=[auto, 1, 2]]]\"]"
+                            "invalid \"protocol_version\" [value={invalid}, allowed-values=[auto, 1, 2, 3]]"
                         ))
                     }
                 },
@@ -1163,22 +1171,27 @@ impl SenderBuilder {
                         let (protocol_versions, server_max_name_len) =
                             read_server_settings(http_state, settings_url, max_name_len)?;
                         max_name_len = server_max_name_len;
-                        if protocol_versions.contains(&ProtocolVersion::V2) {
-                            ProtocolVersion::V2
-                        } else if protocol_versions.contains(&ProtocolVersion::V1) {
-                            ProtocolVersion::V1
-                        } else {
-                            return Err(fmt!(
-                                ProtocolVersionError,
-                                "Server does not support current client"
-                            ));
-                        }
+                        SUPPORTED_PROTOCOL_VERSIONS
+                            .iter()
+                            .find(|version| protocol_versions.contains(version))
+                            .copied()
+                            .ok_or_else(|| {
+                                fmt!(
+                                    ProtocolVersionError,
+                                    "Server does not support any of the client protocol versions: {:?}",
+                                    SUPPORTED_PROTOCOL_VERSIONS
+                                )
+                            })?
                     } else {
                         unreachable!("HTTP handler should be used for HTTP protocol");
                     }
                 }
             },
         };
+        eprintln!(
+            "Using protocol version {:?} with max_name_len={}",
+            protocol_version, max_name_len
+        );
 
         if auth.is_some() {
             descr.push_str("auth=on]");
