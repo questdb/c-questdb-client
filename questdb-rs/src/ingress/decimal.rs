@@ -84,7 +84,7 @@ pub trait DecimalSerializer {
 ///
 /// # Validation
 /// The implementation performs **partial validation only**:
-/// - Rejects non-numerical characters (not -/+, 0-9, e/E, .)
+/// - Rejects non-numerical characters (not -/+, 0-9, a-z/A-Z, .)
 /// - Does NOT validate the actual decimal syntax (e.g., "e2e" would pass)
 ///
 /// This is intentional: full parsing would add overhead. The QuestDB server performs complete
@@ -106,7 +106,7 @@ impl DecimalSerializer for &str {
         // Validate and copy each byte, rejecting non-numeric characters
         for b in self.bytes() {
             match b {
-                b'0'..=b'9' | b'.' | b'-' | b'+' | b'e' | b'E' => out.push(b),
+                b'0'..=b'9' | b'.' | b'-' | b'+' | b'a'..=b'z' | b'A'..=b'Z' => out.push(b),
                 _ => {
                     return Err(error::fmt!(
                         InvalidDecimal,
