@@ -157,7 +157,7 @@ impl DecimalSerializer for &bigdecimal::BigDecimal {
         out.push(DECIMAL_BINARY_FORMAT_TYPE);
 
         let (unscaled, mut scale) = self.as_bigint_and_scale();
-        if scale > 76 {
+        if scale < -76 || scale > 76 {
             return Err(error::fmt!(
                 InvalidDecimal,
                 "QuestDB ILP does not support scale greater than 76, got {}",
