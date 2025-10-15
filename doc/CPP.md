@@ -30,6 +30,10 @@
 - [Array in C-major order](../examples/line_sender_cpp_example_array_c_major.cpp)
 - [Custom array type integration](../examples/line_sender_cpp_example_array_custom.cpp)
 
+**Decimal**
+- [Decimal in binary format](../examples/line_sender_cpp_example_decimal_binary.cpp)
+- [Custom decimal type integration](../examples/line_sender_cpp_example_decimal_custom.cpp)
+
 ## API Overview
 
 ### Header

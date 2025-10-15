@@ -29,6 +29,9 @@
 - [Array with element strides](../examples/line_sender_c_example_array_elem_strides.c)
 - [Array in C-major order](../examples/line_sender_c_example_array_c_major.c)
 
+**Decimal**
+- [Decimal in binary format](../examples/line_sender_c_example_decimal_binary.c)
+
 ## API Overview
 
 ### Header
