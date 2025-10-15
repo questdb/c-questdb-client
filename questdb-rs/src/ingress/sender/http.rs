@@ -320,7 +320,7 @@ pub(super) fn parse_http_error(http_status_code: u16, response: Response<Body>) 
                 }
             };
 
-            if let Some(serde_json::Value::String(ref msg)) = json.get("message") {
+            if let Some(serde_json::Value::String(msg)) = json.get("message") {
                 parse_json_error(&json, msg)
             } else {
                 string_err()
@@ -457,7 +457,7 @@ pub(crate) fn read_server_settings(
         })?;
 
         let mut support_versions: Vec<ProtocolVersion> = vec![];
-        if let Some(serde_json::Value::Array(ref values)) = json
+        if let Some(serde_json::Value::Array(values)) = json
             .get("config")
             .and_then(|v| v.get("line.proto.support.versions"))
         {
