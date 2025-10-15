@@ -23,10 +23,10 @@
  ******************************************************************************/
 
 use crate::fmt_error;
-use questdb::ingress::ArrayElement;
-use questdb::ingress::NdArrayView;
-use questdb::ingress::MAX_ARRAY_BUFFER_SIZE;
 use questdb::Error;
+use questdb::ingress::ArrayElement;
+use questdb::ingress::MAX_ARRAY_BUFFER_SIZE;
+use questdb::ingress::NdArrayView;
 use std::mem::size_of;
 use std::slice;
 
@@ -585,9 +585,10 @@ mod tests {
         };
         let err = result.unwrap_err();
         assert_eq!(err.code(), ErrorCode::ArrayError);
-        assert!(err
-            .msg()
-            .contains("Array element length mismatch (actual: 1, expected: 2)"));
+        assert!(
+            err.msg()
+                .contains("Array element length mismatch (actual: 1, expected: 2)")
+        );
 
         let over_data = [1.1, 2.2, 3.3];
         let result: Result<StrideArrayView<'_, f64, 1, 2>, Error> = unsafe {
@@ -601,9 +602,10 @@ mod tests {
 
         let err = result.unwrap_err();
         assert_eq!(err.code(), ErrorCode::ArrayError);
-        assert!(err
-            .msg()
-            .contains("Array element length mismatch (actual: 3, expected: 2)"));
+        assert!(
+            err.msg()
+                .contains("Array element length mismatch (actual: 3, expected: 2)")
+        );
         Ok(())
     }
 
@@ -621,9 +623,10 @@ mod tests {
         };
         let err = result.unwrap_err();
         assert_eq!(err.code(), ErrorCode::ArrayError);
-        assert!(err
-            .msg()
-            .contains("Array element length mismatch (actual: 1, expected: 2)"));
+        assert!(
+            err.msg()
+                .contains("Array element length mismatch (actual: 1, expected: 2)")
+        );
 
         let over_data = [1.1, 2.2, 3.3];
         let result: Result<StrideArrayView<'_, f64, 1, 2>, Error> = unsafe {
@@ -637,9 +640,10 @@ mod tests {
 
         let err = result.unwrap_err();
         assert_eq!(err.code(), ErrorCode::ArrayError);
-        assert!(err
-            .msg()
-            .contains("Array element length mismatch (actual: 3, expected: 2)"));
+        assert!(
+            err.msg()
+                .contains("Array element length mismatch (actual: 3, expected: 2)")
+        );
         Ok(())
     }
 

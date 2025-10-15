@@ -34,12 +34,11 @@ use std::slice;
 use std::str;
 
 use questdb::{
-    ingress,
+    Error, ErrorCode, ingress,
     ingress::{
         Buffer, CertificateAuthority, ColumnName, Protocol, Sender, SenderBuilder, TableName,
         TimestampMicros, TimestampNanos,
     },
-    Error, ErrorCode,
 };
 
 mod ndarr;
@@ -377,9 +376,7 @@ impl From<line_sender_ca> for CertificateAuthority {
 pub unsafe extern "C" fn line_sender_error_get_code(
     error: *const line_sender_error,
 ) -> line_sender_error_code {
-    unsafe {
-        (*error).0.code().into()
-    }
+    unsafe { (*error).0.code().into() }
 }
 
 /// UTF-8 encoded error message. Never returns NULL.
@@ -454,7 +451,9 @@ fn describe_buf(buf: &[u8]) -> String {
 unsafe fn set_err_out(err_out: *mut *mut line_sender_error, code: ErrorCode, msg: String) {
     let err = line_sender_error(Error::new(code, msg));
     let err_ptr = Box::into_raw(Box::new(err));
-    unsafe { *err_out = err_ptr; }
+    unsafe {
+        *err_out = err_ptr;
+    }
 }
 
 fn unwrap_utf8_or_str(buf: &[u8]) -> Result<&str, String> {
@@ -724,15 +723,11 @@ pub unsafe extern "C" fn line_sender_buffer_free(buffer: *mut line_sender_buffer
 }
 
 unsafe fn unwrap_buffer<'a>(buffer: *const line_sender_buffer) -> &'a Buffer {
-    unsafe {
-        &(*buffer).0
-    }
+    unsafe { &(*buffer).0 }
 }
 
 unsafe fn unwrap_buffer_mut<'a>(buffer: *mut line_sender_buffer) -> &'a mut Buffer {
-    unsafe {
-        &mut (*buffer).0
-    }
+    unsafe { &mut (*buffer).0 }
 }
 
 /// Create a new copy of the buffer.
@@ -764,9 +759,7 @@ pub unsafe extern "C" fn line_sender_buffer_reserve(
 /// Get the current capacity of the buffer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_capacity(buffer: *const line_sender_buffer) -> size_t {
-    unsafe {
-        unwrap_buffer(buffer).capacity()
-    }
+    unsafe { unwrap_buffer(buffer).capacity() }
 }
 
 /// Mark a rewind point.
@@ -1366,9 +1359,7 @@ pub unsafe extern "C" fn line_sender_opts_bind_interface(
     bind_interface: line_sender_utf8,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    unsafe {
-        upd_opts!(opts, err_out, bind_interface, bind_interface.as_str())
-    }
+    unsafe { upd_opts!(opts, err_out, bind_interface, bind_interface.as_str()) }
 }
 
 /// Set the username for authentication.
@@ -1384,9 +1375,7 @@ pub unsafe extern "C" fn line_sender_opts_username(
     username: line_sender_utf8,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    unsafe {
-        upd_opts!(opts, err_out, username, username.as_str())
-    }
+    unsafe { upd_opts!(opts, err_out, username, username.as_str()) }
 }
 
 /// Set the password for basic HTTP authentication.
@@ -1397,9 +1386,7 @@ pub unsafe extern "C" fn line_sender_opts_password(
     password: line_sender_utf8,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    unsafe {
-        upd_opts!(opts, err_out, password, password.as_str())
-    }
+    unsafe { upd_opts!(opts, err_out, password, password.as_str()) }
 }
 
 /// Set the Token (Bearer) Authentication parameter for HTTP,
@@ -1410,9 +1397,7 @@ pub unsafe extern "C" fn line_sender_opts_token(
     token: line_sender_utf8,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    unsafe {
-        upd_opts!(opts, err_out, token, token.as_str())
-    }
+    unsafe { upd_opts!(opts, err_out, token, token.as_str()) }
 }
 
 /// Set the ECDSA public key X for TCP authentication.
@@ -1422,9 +1407,7 @@ pub unsafe extern "C" fn line_sender_opts_token_x(
     token_x: line_sender_utf8,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    unsafe {
-        upd_opts!(opts, err_out, token_x, token_x.as_str())
-    }
+    unsafe { upd_opts!(opts, err_out, token_x, token_x.as_str()) }
 }
 
 /// Set the ECDSA public key Y for TCP authentication.
@@ -1434,9 +1417,7 @@ pub unsafe extern "C" fn line_sender_opts_token_y(
     token_y: line_sender_utf8,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    unsafe {
-        upd_opts!(opts, err_out, token_y, token_y.as_str())
-    }
+    unsafe { upd_opts!(opts, err_out, token_y, token_y.as_str()) }
 }
 
 /// Sets the ingestion protocol version.
@@ -1453,9 +1434,7 @@ pub unsafe extern "C" fn line_sender_opts_protocol_version(
     version: ProtocolVersion,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    unsafe {
-        upd_opts!(opts, err_out, protocol_version, version.into())
-    }
+    unsafe { upd_opts!(opts, err_out, protocol_version, version.into()) }
 }
 
 /// Configure how long to wait for messages from the QuestDB server during
@@ -1484,9 +1463,7 @@ pub unsafe extern "C" fn line_sender_opts_tls_verify(
     verify: bool,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    unsafe {
-        upd_opts!(opts, err_out, tls_verify, verify)
-    }
+    unsafe { upd_opts!(opts, err_out, tls_verify, verify) }
 }
 
 /// Specify where to find the certificate authority used to validate
@@ -1528,9 +1505,7 @@ pub unsafe extern "C" fn line_sender_opts_max_buf_size(
     max_buf_size: size_t,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    unsafe {
-        upd_opts!(opts, err_out, max_buf_size, max_buf_size)
-    }
+    unsafe { upd_opts!(opts, err_out, max_buf_size, max_buf_size) }
 }
 
 /// Ser the maximum length of a table or column name in bytes.
@@ -1541,9 +1516,7 @@ pub unsafe extern "C" fn line_sender_opts_max_name_len(
     max_name_len: size_t,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    unsafe {
-        upd_opts!(opts, err_out, max_name_len, max_name_len)
-    }
+    unsafe { upd_opts!(opts, err_out, max_name_len, max_name_len) }
 }
 
 /// Set the cumulative duration spent in retries.
@@ -1574,9 +1547,7 @@ pub unsafe extern "C" fn line_sender_opts_request_min_throughput(
     bytes_per_sec: u64,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    unsafe {
-        upd_opts!(opts, err_out, request_min_throughput, bytes_per_sec)
-    }
+    unsafe { upd_opts!(opts, err_out, request_min_throughput, bytes_per_sec) }
 }
 
 /// Set the additional time to wait on top of that calculated from the minimum
@@ -1604,9 +1575,7 @@ pub unsafe extern "C" fn line_sender_opts_user_agent(
     user_agent: line_sender_utf8,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    unsafe {
-        upd_opts!(opts, err_out, user_agent, user_agent.as_str())
-    }
+    unsafe { upd_opts!(opts, err_out, user_agent, user_agent.as_str()) }
 }
 
 /// Duplicate the `line_sender_opts` object.
@@ -1721,15 +1690,11 @@ pub unsafe extern "C" fn line_sender_from_env(
 }
 
 unsafe fn unwrap_sender<'a>(sender: *const line_sender) -> &'a Sender {
-    unsafe {
-        &(*sender).0
-    }
+    unsafe { &(*sender).0 }
 }
 
 unsafe fn unwrap_sender_mut<'a>(sender: *mut line_sender) -> &'a mut Sender {
-    unsafe {
-        &mut (*sender).0
-    }
+    unsafe { &mut (*sender).0 }
 }
 
 /// Returns the sender's protocol version
@@ -1741,16 +1706,12 @@ unsafe fn unwrap_sender_mut<'a>(sender: *mut line_sender) -> &'a mut Sender {
 pub unsafe extern "C" fn line_sender_get_protocol_version(
     sender: *const line_sender,
 ) -> ProtocolVersion {
-    unsafe {
-        unwrap_sender(sender).protocol_version().into()
-    }
+    unsafe { unwrap_sender(sender).protocol_version().into() }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_get_max_name_len(sender: *const line_sender) -> size_t {
-    unsafe {
-        unwrap_sender(sender).max_name_len()
-    }
+    unsafe { unwrap_sender(sender).max_name_len() }
 }
 
 /// Construct a [`line_sender_buffer`] using the sender's protocol settings.
@@ -1772,9 +1733,7 @@ pub unsafe extern "C" fn line_sender_buffer_new_for_sender(
 /// @return true if an error occurred with a sender and it must be closed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_must_close(sender: *const line_sender) -> bool {
-    unsafe {
-        unwrap_sender(sender).must_close()
-    }
+    unsafe { unwrap_sender(sender).must_close() }
 }
 
 /// Close the connection. Does not flush. Non-idempotent.
