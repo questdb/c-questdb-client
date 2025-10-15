@@ -143,6 +143,7 @@ impl IoWrite for SyncConnection {
 // We also set SO_LINGER to 120, but that is not enough apparently.
 impl Drop for SyncProtocolHandler {
     fn drop(&mut self) {
+        #[allow(irrefutable_let_patterns)]  // HTTP feature might be disabled.
         if let SyncProtocolHandler::SyncTcp(conn) = self {
             match conn {
                 SyncConnection::Direct(sock) => {
