@@ -15,7 +15,7 @@ static bool example(const char* ca_path, const char* host, const char* port)
         ":",
         port,
         ";",
-        "protocol_version=2;"
+        "protocol_version=3;"
         "tls_roots=",
         ca_path,
         ";",

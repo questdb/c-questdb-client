@@ -10,7 +10,7 @@ int main(int argc, const char* argv[])
     try
     {
         auto sender = questdb::ingress::line_sender::from_conf(
-            "tcp::addr=localhost:9009;protocol_version=2;");
+            "tcp::addr=localhost:9009;protocol_version=3;");
 
         // We prepare all our table names and column names in advance.
         // If we're inserting multiple rows, this allows us to avoid

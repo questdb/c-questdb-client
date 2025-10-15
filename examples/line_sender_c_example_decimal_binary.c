@@ -9,17 +9,8 @@ static bool example(const char* host, const char* port)
     line_sender_error* err = NULL;
     line_sender* sender = NULL;
     line_sender_buffer* buffer = NULL;
-    char* conf_str = concat(
-        "tcp::addr=",
-        host,
-        ":",
-        port,
-        ";"
-        "protocol_version=3;"
-        "username=admin;"
-        "token=5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48;"
-        "token_x=fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU;"
-        "token_y=Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac;");
+    char* conf_str =
+        concat("tcp::addr=", host, ":", port, ";protocol_version=3;");
     if (!conf_str)
     {
         fprintf(stderr, "Could not concatenate configuration string.\n");
@@ -43,7 +34,7 @@ static bool example(const char* host, const char* port)
     // We prepare all our table names and column names in advance.
     // If we're inserting multiple rows, this allows us to avoid
     // re-validating the same strings over and over again.
-    line_sender_table_name table_name = QDB_TABLE_NAME_LITERAL("c_trades_auth");
+    line_sender_table_name table_name = QDB_TABLE_NAME_LITERAL("c_trades");
     line_sender_column_name symbol_name = QDB_COLUMN_NAME_LITERAL("symbol");
     line_sender_column_name side_name = QDB_COLUMN_NAME_LITERAL("side");
     line_sender_column_name price_name = QDB_COLUMN_NAME_LITERAL("price");
@@ -61,8 +52,10 @@ static bool example(const char* host, const char* port)
         goto on_error;
 
     line_sender_utf8 price_value = QDB_UTF8_LITERAL("2615.54");
-    if (!line_sender_buffer_column_dec_str(
-            buffer, price_name, price_value, &err))
+    // 123 with a scale of 1 gives a decimal of 12.3
+    const uint8_t price_unscaled_value[] = {123};
+    if (!line_sender_buffer_column_dec(
+            buffer, price_name, 1, price_unscaled_value, 1, &err))
         goto on_error;
 
     if (!line_sender_buffer_column_f64(buffer, amount_name, 0.00044, &err))
@@ -106,7 +99,7 @@ static bool displayed_help(int argc, const char* argv[])
         if ((strncmp(arg, "-h", 2) == 0) || (strncmp(arg, "--help", 6) == 0))
         {
             fprintf(stderr, "Usage:\n");
-            fprintf(stderr, "line_sender_c_example_auth: [HOST [PORT]]\n");
+            fprintf(stderr, "line_sender_c_example: [HOST [PORT]]\n");
             fprintf(
                 stderr, "    HOST: ILP host (defaults to \"localhost\").\n");
             fprintf(stderr, "    PORT: ILP port (defaults to \"9009\").\n");

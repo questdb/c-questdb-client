@@ -11,7 +11,7 @@ static bool example(std::string_view host, std::string_view port)
     {
         auto sender = questdb::ingress::line_sender::from_conf(
             "tcp::addr=" + std::string{host} + ":" + std::string{port} +
-            ";protocol_version=2;");
+            ";protocol_version=3;");
 
         // We prepare all our table names and column names in advance.
         // If we're inserting multiple rows, this allows us to avoid

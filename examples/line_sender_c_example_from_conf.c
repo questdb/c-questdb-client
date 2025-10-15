@@ -9,7 +9,7 @@ int main(int argc, const char* argv[])
     line_sender_buffer* buffer = NULL;
 
     line_sender_utf8 conf =
-        QDB_UTF8_LITERAL("tcp::addr=localhost:9009;protocol_version=2;");
+        QDB_UTF8_LITERAL("tcp::addr=localhost:9009;protocol_version=3;");
     line_sender* sender = line_sender_from_conf(conf, &err);
     if (!sender)
         goto on_error;
