@@ -61,6 +61,7 @@ int main(int argc, const char* argv[])
     if (!line_sender_flush(sender, buffer, &err))
         goto on_error;
 
+    line_sender_buffer_free(buffer);
     line_sender_close(sender);
 
     return 0;

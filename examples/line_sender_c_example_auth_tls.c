@@ -84,6 +84,7 @@ static bool example(const char* host, const char* port)
     if (!line_sender_flush(sender, buffer, &err))
         goto on_error;
 
+    line_sender_buffer_free(buffer);
     line_sender_close(sender);
 
     return true;
