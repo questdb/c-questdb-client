@@ -1,9 +1,9 @@
-use crate::error::{fmt, Result};
+use crate::error::{Result, fmt};
 use crate::ingress::CertificateAuthority;
 use rustls::RootCertStore;
 use rustls_pki_types::CertificateDer;
+use rustls_pki_types::pem::PemObject;
 use std::fs::File;
-use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -144,7 +144,10 @@ impl TlsSettings {
 
             #[cfg(feature = "tls-webpki-certs")]
             (CertificateAuthority::WebpkiRoots, Some(_)) => {
-                return Err(fmt!(ConfigError, "Config parameter \"tls_roots\" must be unset when \"tls_ca\" is set to \"webpki_roots\"."));
+                return Err(fmt!(
+                    ConfigError,
+                    "Config parameter \"tls_roots\" must be unset when \"tls_ca\" is set to \"webpki_roots\"."
+                ));
             }
 
             #[cfg(feature = "tls-native-certs")]
@@ -152,7 +155,10 @@ impl TlsSettings {
 
             #[cfg(feature = "tls-native-certs")]
             (CertificateAuthority::OsRoots, Some(_)) => {
-                return Err(fmt!(ConfigError, "Config parameter \"tls_roots\" must be unset when \"tls_ca\" is set to \"os_roots\"."));
+                return Err(fmt!(
+                    ConfigError,
+                    "Config parameter \"tls_roots\" must be unset when \"tls_ca\" is set to \"os_roots\"."
+                ));
             }
 
             #[cfg(all(feature = "tls-webpki-certs", feature = "tls-native-certs"))]
@@ -160,11 +166,17 @@ impl TlsSettings {
 
             #[cfg(all(feature = "tls-webpki-certs", feature = "tls-native-certs"))]
             (CertificateAuthority::WebpkiAndOsRoots, Some(_)) => {
-                return Err(fmt!(ConfigError, "Config parameter \"tls_roots\" must be unset when \"tls_ca\" is set to \"webpki_and_os_roots\"."));
+                return Err(fmt!(
+                    ConfigError,
+                    "Config parameter \"tls_roots\" must be unset when \"tls_ca\" is set to \"webpki_and_os_roots\"."
+                ));
             }
 
             (CertificateAuthority::PemFile, None) => {
-                return Err(fmt!(ConfigError, "Config parameter \"tls_roots\" is required when \"tls_ca\" is set to \"pem_file\"."));
+                return Err(fmt!(
+                    ConfigError,
+                    "Config parameter \"tls_roots\" is required when \"tls_ca\" is set to \"pem_file\"."
+                ));
             }
 
             (CertificateAuthority::PemFile, Some(pem_file)) => {
@@ -179,8 +191,8 @@ impl TlsSettings {
                         io_err
                     )
                 })?;
-                let mut reader = BufReader::new(certfile);
-                let der_certs = rustls_pemfile::certs(&mut reader)
+
+                let der_certs = CertificateDer::pem_reader_iter(certfile)
                     .collect::<std::result::Result<Vec<_>, _>>()
                     .map_err(|io_err| {
                         fmt!(

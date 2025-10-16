@@ -34,12 +34,11 @@ use std::slice;
 use std::str;
 
 use questdb::{
-    ingress,
+    Error, ErrorCode, ingress,
     ingress::{
         Buffer, CertificateAuthority, ColumnName, Protocol, Sender, SenderBuilder, TableName,
         TimestampMicros, TimestampNanos,
     },
-    Error, ErrorCode,
 };
 
 mod ndarr;
@@ -373,31 +372,35 @@ impl From<line_sender_ca> for CertificateAuthority {
 }
 
 /** Error code categorizing the error. */
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_error_get_code(
     error: *const line_sender_error,
 ) -> line_sender_error_code {
-    (*error).0.code().into()
+    unsafe { (*error).0.code().into() }
 }
 
 /// UTF-8 encoded error message. Never returns NULL.
 /// The `len_out` argument is set to the number of bytes in the string.
 /// The string is NOT null-terminated.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_error_msg(
     error: *const line_sender_error,
     len_out: *mut size_t,
 ) -> *const c_char {
-    let msg: &str = (*error).0.msg();
-    *len_out = msg.len();
-    msg.as_ptr() as *mut c_char
+    unsafe {
+        let msg: &str = (*error).0.msg();
+        *len_out = msg.len();
+        msg.as_ptr() as *const c_char
+    }
 }
 
 /// Clean up the error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_error_free(error: *mut line_sender_error) {
-    if !error.is_null() {
-        drop(Box::from_raw(error));
+    unsafe {
+        if !error.is_null() {
+            drop(Box::from_raw(error));
+        }
     }
 }
 
@@ -448,10 +451,12 @@ fn describe_buf(buf: &[u8]) -> String {
 unsafe fn set_err_out(err_out: *mut *mut line_sender_error, code: ErrorCode, msg: String) {
     let err = line_sender_error(Error::new(code, msg));
     let err_ptr = Box::into_raw(Box::new(err));
-    *err_out = err_ptr;
+    unsafe {
+        *err_out = err_ptr;
+    }
 }
 
-unsafe fn unwrap_utf8_or_str(buf: &[u8]) -> Result<&str, String> {
+fn unwrap_utf8_or_str(buf: &[u8]) -> Result<&str, String> {
     match str::from_utf8(buf) {
         Ok(str_ref) => Ok(str_ref),
         Err(u8err) => {
@@ -486,7 +491,7 @@ unsafe fn unwrap_utf8(buf: &[u8], err_out: *mut *mut line_sender_error) -> Optio
     match unwrap_utf8_or_str(buf) {
         Ok(str_ref) => Some(str_ref),
         Err(msg) => {
-            set_err_out(err_out, ErrorCode::InvalidUtf8, msg);
+            unsafe { set_err_out(err_out, ErrorCode::InvalidUtf8, msg) };
             None
         }
     }
@@ -499,36 +504,40 @@ unsafe fn unwrap_utf8(buf: &[u8], err_out: *mut *mut line_sender_error) -> Optio
 /// @param[in] buf UTF-8 encoded buffer. Need not be null-terminated.
 /// @param[out] err_out Set on error.
 /// @return true on success, false on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_utf8_init(
     string: *mut line_sender_utf8,
     len: size_t,
     buf: *const c_char,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let slice = slice::from_raw_parts(buf as *const u8, len);
-    if let Some(str_ref) = unwrap_utf8(slice, err_out) {
-        (*string).len = str_ref.len();
-        (*string).buf = str_ref.as_ptr() as *const c_char;
-        true
-    } else {
-        false
+    unsafe {
+        let slice = slice::from_raw_parts(buf as *const u8, len);
+        if let Some(str_ref) = unwrap_utf8(slice, err_out) {
+            (*string).len = str_ref.len();
+            (*string).buf = str_ref.as_ptr() as *const c_char;
+            true
+        } else {
+            false
+        }
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_utf8_assert(
     len: size_t,
     buf: *const c_char,
 ) -> line_sender_utf8 {
-    let slice = slice::from_raw_parts(buf as *const u8, len);
-    match unwrap_utf8_or_str(slice) {
-        Ok(str_ref) => line_sender_utf8 {
-            len: str_ref.len(),
-            buf: str_ref.as_ptr() as *const c_char,
-        },
-        Err(msg) => {
-            panic!("{}", msg);
+    unsafe {
+        let slice = slice::from_raw_parts(buf as *const u8, len);
+        match unwrap_utf8_or_str(slice) {
+            Ok(str_ref) => line_sender_utf8 {
+                len: str_ref.len(),
+                buf: str_ref.as_ptr() as *const c_char,
+            },
+            Err(msg) => {
+                panic!("{}", msg);
+            }
         }
     }
 }
@@ -546,9 +555,11 @@ pub struct line_sender_table_name {
 
 impl line_sender_table_name {
     unsafe fn as_name<'a>(&self) -> TableName<'a> {
-        let str_name =
-            str::from_utf8_unchecked(slice::from_raw_parts(self.buf as *const u8, self.len));
-        TableName::new_unchecked(str_name)
+        unsafe {
+            let str_name =
+                str::from_utf8_unchecked(slice::from_raw_parts(self.buf as *const u8, self.len));
+            TableName::new_unchecked(str_name)
+        }
     }
 }
 
@@ -565,9 +576,11 @@ pub struct line_sender_column_name {
 
 impl line_sender_column_name {
     unsafe fn as_name<'a>(&self) -> ColumnName<'a> {
-        let str_name =
-            str::from_utf8_unchecked(slice::from_raw_parts(self.buf as *const u8, self.len));
-        ColumnName::new_unchecked(str_name)
+        unsafe {
+            let str_name =
+                str::from_utf8_unchecked(slice::from_raw_parts(self.buf as *const u8, self.len));
+            ColumnName::new_unchecked(str_name)
+        }
     }
 }
 
@@ -579,40 +592,44 @@ impl line_sender_column_name {
 /// @param[in] buf UTF-8 encoded buffer. Need not be null-terminated.
 /// @param[out] err_out Set on error.
 /// @return true on success, false on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_table_name_init(
     name: *mut line_sender_table_name,
     len: size_t,
     buf: *const c_char,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let mut u8str = line_sender_utf8 {
-        len: 0usize,
-        buf: ptr::null_mut(),
-    };
-    if !line_sender_utf8_init(&mut u8str, len, buf, err_out) {
-        return false;
+    unsafe {
+        let mut u8str = line_sender_utf8 {
+            len: 0usize,
+            buf: ptr::null_mut(),
+        };
+        if !line_sender_utf8_init(&mut u8str, len, buf, err_out) {
+            return false;
+        }
+
+        let str_name = str::from_utf8_unchecked(slice::from_raw_parts(buf as *const u8, len));
+
+        bubble_err_to_c!(err_out, TableName::new(str_name));
+
+        (*name).len = len;
+        (*name).buf = buf;
+        true
     }
-
-    let str_name = str::from_utf8_unchecked(slice::from_raw_parts(buf as *const u8, len));
-
-    bubble_err_to_c!(err_out, TableName::new(str_name));
-
-    (*name).len = len;
-    (*name).buf = buf;
-    true
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_table_name_assert(
     len: size_t,
     buf: *const c_char,
 ) -> line_sender_table_name {
-    let u8str = line_sender_utf8_assert(len, buf);
-    match TableName::new(u8str.as_str()) {
-        Ok(_) => line_sender_table_name { len, buf },
-        Err(msg) => {
-            panic!("{}", msg);
+    unsafe {
+        let u8str = line_sender_utf8_assert(len, buf);
+        match TableName::new(u8str.as_str()) {
+            Ok(_) => line_sender_table_name { len, buf },
+            Err(msg) => {
+                panic!("{}", msg);
+            }
         }
     }
 }
@@ -625,40 +642,44 @@ pub unsafe extern "C" fn line_sender_table_name_assert(
 /// @param[in] buf UTF-8 encoded buffer. Need not be null-terminated.
 /// @param[out] err_out Set on error.
 /// @return true on success, false on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_column_name_init(
     name: *mut line_sender_column_name,
     len: size_t,
     buf: *const c_char,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let mut u8str = line_sender_utf8 {
-        len: 0usize,
-        buf: ptr::null_mut(),
-    };
-    if !line_sender_utf8_init(&mut u8str, len, buf, err_out) {
-        return false;
+    unsafe {
+        let mut u8str = line_sender_utf8 {
+            len: 0usize,
+            buf: ptr::null_mut(),
+        };
+        if !line_sender_utf8_init(&mut u8str, len, buf, err_out) {
+            return false;
+        }
+
+        let str_name = str::from_utf8_unchecked(slice::from_raw_parts(buf as *const u8, len));
+
+        bubble_err_to_c!(err_out, ColumnName::new(str_name));
+
+        (*name).len = len;
+        (*name).buf = buf;
+        true
     }
-
-    let str_name = str::from_utf8_unchecked(slice::from_raw_parts(buf as *const u8, len));
-
-    bubble_err_to_c!(err_out, ColumnName::new(str_name));
-
-    (*name).len = len;
-    (*name).buf = buf;
-    true
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_column_name_assert(
     len: size_t,
     buf: *const c_char,
-) -> line_sender_table_name {
-    let u8str = line_sender_utf8_assert(len, buf);
-    match ColumnName::new(u8str.as_str()) {
-        Ok(_) => line_sender_table_name { len, buf },
-        Err(msg) => {
-            panic!("{}", msg);
+) -> line_sender_column_name {
+    unsafe {
+        let u8str = line_sender_utf8_assert(len, buf);
+        match ColumnName::new(u8str.as_str()) {
+            Ok(_) => line_sender_column_name { len, buf },
+            Err(msg) => {
+                panic!("{}", msg);
+            }
         }
     }
 }
@@ -669,7 +690,7 @@ pub struct line_sender_buffer(Buffer);
 
 /// Construct a `line_sender_buffer` with a `max_name_len` of `127`, which is the
 /// same as the QuestDB server default.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_new(
     version: ProtocolVersion,
 ) -> *mut line_sender_buffer {
@@ -682,7 +703,7 @@ pub unsafe extern "C" fn line_sender_buffer_new(
 /// the QuestDB  server you're connecting to.
 /// If the server does not configure it, the default is `127`, and you can
 /// call `line_sender_buffer_new()` instead.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_with_max_name_len(
     version: ProtocolVersion,
     max_name_len: size_t,
@@ -692,47 +713,53 @@ pub unsafe extern "C" fn line_sender_buffer_with_max_name_len(
 }
 
 /// Release the `line_sender_buffer` object.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_free(buffer: *mut line_sender_buffer) {
-    if !buffer.is_null() {
-        drop(Box::from_raw(buffer));
+    unsafe {
+        if !buffer.is_null() {
+            drop(Box::from_raw(buffer));
+        }
     }
 }
 
 unsafe fn unwrap_buffer<'a>(buffer: *const line_sender_buffer) -> &'a Buffer {
-    &(*buffer).0
+    unsafe { &(*buffer).0 }
 }
 
 unsafe fn unwrap_buffer_mut<'a>(buffer: *mut line_sender_buffer) -> &'a mut Buffer {
-    &mut (*buffer).0
+    unsafe { &mut (*buffer).0 }
 }
 
 /// Create a new copy of the buffer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_clone(
     buffer: *const line_sender_buffer,
 ) -> *mut line_sender_buffer {
-    let new_buffer = unwrap_buffer(buffer).clone();
-    Box::into_raw(Box::new(line_sender_buffer(new_buffer)))
+    unsafe {
+        let new_buffer = unwrap_buffer(buffer).clone();
+        Box::into_raw(Box::new(line_sender_buffer(new_buffer)))
+    }
 }
 
 /// Pre-allocate to ensure the buffer has enough capacity for at least the
 /// specified additional byte count. This may be rounded up.
 /// This does not allocate if such additional capacity is already satisfied.
 /// See: `capacity`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_reserve(
     buffer: *mut line_sender_buffer,
     additional: size_t,
 ) {
-    let buffer = unwrap_buffer_mut(buffer);
-    buffer.reserve(additional);
+    unsafe {
+        let buffer = unwrap_buffer_mut(buffer);
+        buffer.reserve(additional);
+    }
 }
 
 /// Get the current capacity of the buffer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_capacity(buffer: *const line_sender_buffer) -> size_t {
-    unwrap_buffer(buffer).capacity()
+    unsafe { unwrap_buffer(buffer).capacity() }
 }
 
 /// Mark a rewind point.
@@ -740,66 +767,80 @@ pub unsafe extern "C" fn line_sender_buffer_capacity(buffer: *const line_sender_
 /// rows by calling `rewind_to_marker`.
 /// Any previous marker will be discarded.
 /// Once the marker is no longer needed, call `clear_marker`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_set_marker(
     buffer: *mut line_sender_buffer,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let buffer = unwrap_buffer_mut(buffer);
-    bubble_err_to_c!(err_out, buffer.set_marker());
-    true
+    unsafe {
+        let buffer = unwrap_buffer_mut(buffer);
+        bubble_err_to_c!(err_out, buffer.set_marker());
+        true
+    }
 }
 
 /// Undo all changes since the last `set_marker` call.
 /// As a side-effect, this also clears the marker.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_rewind_to_marker(
     buffer: *mut line_sender_buffer,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let buffer = unwrap_buffer_mut(buffer);
-    bubble_err_to_c!(err_out, buffer.rewind_to_marker());
-    true
+    unsafe {
+        let buffer = unwrap_buffer_mut(buffer);
+        bubble_err_to_c!(err_out, buffer.rewind_to_marker());
+        true
+    }
 }
 
 /// Discard the marker.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_clear_marker(buffer: *mut line_sender_buffer) {
-    let buffer = unwrap_buffer_mut(buffer);
-    buffer.clear_marker();
+    unsafe {
+        let buffer = unwrap_buffer_mut(buffer);
+        buffer.clear_marker();
+    }
 }
 
 /// Remove all accumulated data and prepare the buffer for new lines.
 /// This does not affect the buffer's capacity.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_clear(buffer: *mut line_sender_buffer) {
-    let buffer = unwrap_buffer_mut(buffer);
-    buffer.clear();
+    unsafe {
+        let buffer = unwrap_buffer_mut(buffer);
+        buffer.clear();
+    }
 }
 
 /// The number of bytes accumulated in the buffer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_size(buffer: *const line_sender_buffer) -> size_t {
-    let buffer = unwrap_buffer(buffer);
-    buffer.len()
+    unsafe {
+        let buffer = unwrap_buffer(buffer);
+        buffer.len()
+    }
 }
 
 /// The number of rows accumulated in the buffer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_row_count(buffer: *const line_sender_buffer) -> size_t {
-    let buffer = unwrap_buffer(buffer);
-    buffer.row_count()
+    unsafe {
+        let buffer = unwrap_buffer(buffer);
+        buffer.row_count()
+    }
 }
 
 /// Tell whether the buffer is transactional. It is transactional iff it contains
 /// data for at most one table. Additionally, you must send the buffer over HTTP to
 /// get transactional behavior.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_transactional(
     buffer: *const line_sender_buffer,
 ) -> bool {
-    let buffer = unwrap_buffer(buffer);
-    buffer.transactional()
+    unsafe {
+        let buffer = unwrap_buffer(buffer);
+        buffer.transactional()
+    }
 }
 
 #[repr(C)]
@@ -815,30 +856,34 @@ pub struct line_sender_buffer_view {
 /// @return A [`line_sender_buffer_view`] struct containing:
 /// - `buf`: Immutable pointer to the byte stream
 /// - `len`: Exact byte length of the data
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_peek(
     buffer: *const line_sender_buffer,
 ) -> line_sender_buffer_view {
-    let buffer = unwrap_buffer(buffer);
-    let buf: &[u8] = buffer.as_bytes();
-    line_sender_buffer_view {
-        len: buf.len(),
-        buf: buf.as_ptr(),
+    unsafe {
+        let buffer = unwrap_buffer(buffer);
+        let buf: &[u8] = buffer.as_bytes();
+        line_sender_buffer_view {
+            len: buf.len(),
+            buf: buf.as_ptr(),
+        }
     }
 }
 
 /// Start recording a new row for the given table.
 /// @param[in] buffer Line buffer object.
 /// @param[in] name Table name.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_table(
     buffer: *mut line_sender_buffer,
     name: line_sender_table_name,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let buffer = unwrap_buffer_mut(buffer);
-    bubble_err_to_c!(err_out, buffer.table(name.as_name()));
-    true
+    unsafe {
+        let buffer = unwrap_buffer_mut(buffer);
+        bubble_err_to_c!(err_out, buffer.table(name.as_name()));
+        true
+    }
 }
 
 /// Record a symbol value for the given column.
@@ -848,16 +893,18 @@ pub unsafe extern "C" fn line_sender_buffer_table(
 /// @param[in] value Column value.
 /// @param[out] err_out Set on error.
 /// @return true on success, false on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_symbol(
     buffer: *mut line_sender_buffer,
     name: line_sender_column_name,
     value: line_sender_utf8,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let buffer = unwrap_buffer_mut(buffer);
-    bubble_err_to_c!(err_out, buffer.symbol(name.as_name(), value.as_str()));
-    true
+    unsafe {
+        let buffer = unwrap_buffer_mut(buffer);
+        bubble_err_to_c!(err_out, buffer.symbol(name.as_name(), value.as_str()));
+        true
+    }
 }
 
 /// Record a boolean value for the given column.
@@ -866,16 +913,18 @@ pub unsafe extern "C" fn line_sender_buffer_symbol(
 /// @param[in] value Column value.
 /// @param[out] err_out Set on error.
 /// @return true on success, false on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_column_bool(
     buffer: *mut line_sender_buffer,
     name: line_sender_column_name,
     value: bool,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let buffer = unwrap_buffer_mut(buffer);
-    bubble_err_to_c!(err_out, buffer.column_bool(name.as_name(), value));
-    true
+    unsafe {
+        let buffer = unwrap_buffer_mut(buffer);
+        bubble_err_to_c!(err_out, buffer.column_bool(name.as_name(), value));
+        true
+    }
 }
 
 /// Record an integer value for the given column.
@@ -884,16 +933,18 @@ pub unsafe extern "C" fn line_sender_buffer_column_bool(
 /// @param[in] value Column value.
 /// @param[out] err_out Set on error.
 /// @return true on success, false on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_column_i64(
     buffer: *mut line_sender_buffer,
     name: line_sender_column_name,
     value: i64,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let buffer = unwrap_buffer_mut(buffer);
-    bubble_err_to_c!(err_out, buffer.column_i64(name.as_name(), value));
-    true
+    unsafe {
+        let buffer = unwrap_buffer_mut(buffer);
+        bubble_err_to_c!(err_out, buffer.column_i64(name.as_name(), value));
+        true
+    }
 }
 
 /// Record a floating-point value for the given column.
@@ -902,16 +953,18 @@ pub unsafe extern "C" fn line_sender_buffer_column_i64(
 /// @param[in] value Column value.
 /// @param[out] err_out Set on error.
 /// @return true on success, false on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_column_f64(
     buffer: *mut line_sender_buffer,
     name: line_sender_column_name,
     value: f64,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let buffer = unwrap_buffer_mut(buffer);
-    bubble_err_to_c!(err_out, buffer.column_f64(name.as_name(), value));
-    true
+    unsafe {
+        let buffer = unwrap_buffer_mut(buffer);
+        bubble_err_to_c!(err_out, buffer.column_f64(name.as_name(), value));
+        true
+    }
 }
 
 /// Record a string value for the given column.
@@ -920,18 +973,20 @@ pub unsafe extern "C" fn line_sender_buffer_column_f64(
 /// @param[in] value Column value.
 /// @param[out] err_out Set on error.
 /// @return true on success, false on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_column_str(
     buffer: *mut line_sender_buffer,
     name: line_sender_column_name,
     value: line_sender_utf8,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let buffer = unwrap_buffer_mut(buffer);
-    let name = name.as_name();
-    let value = value.as_str();
-    bubble_err_to_c!(err_out, buffer.column_str(name, value));
-    true
+    unsafe {
+        let buffer = unwrap_buffer_mut(buffer);
+        let name = name.as_name();
+        let value = value.as_str();
+        bubble_err_to_c!(err_out, buffer.column_str(name, value));
+        true
+    }
 }
 
 /// Records a float64 multidimensional array with **C-MAJOR memory layout**.
@@ -948,7 +1003,7 @@ pub unsafe extern "C" fn line_sender_buffer_column_str(
 /// - shape must point to an array of `rank` integers
 /// - data must point to a buffer of size `data_len` f64 elements.
 /// - QuestDB server version 9.0.0 or later is required for array support.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_c_major(
     buffer: *mut line_sender_buffer,
     name: line_sender_column_name,
@@ -958,21 +1013,23 @@ pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_c_major(
     data_len: size_t,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let buffer = unwrap_buffer_mut(buffer);
-    let name = name.as_name();
-    let view = match CMajorArrayView::<f64>::new(rank, shape, data, data_len) {
-        Ok(value) => value,
-        Err(err) => {
-            let err_ptr = Box::into_raw(Box::new(line_sender_error(err)));
-            *err_out = err_ptr;
-            return false;
-        }
-    };
-    bubble_err_to_c!(
-        err_out,
-        buffer.column_arr::<ColumnName<'_>, CMajorArrayView<'_, f64>, f64>(name, &view)
-    );
-    true
+    unsafe {
+        let buffer = unwrap_buffer_mut(buffer);
+        let name = name.as_name();
+        let view = match CMajorArrayView::<f64>::new(rank, shape, data, data_len) {
+            Ok(value) => value,
+            Err(err) => {
+                let err_ptr = Box::into_raw(Box::new(line_sender_error(err)));
+                *err_out = err_ptr;
+                return false;
+            }
+        };
+        bubble_err_to_c!(
+            err_out,
+            buffer.column_arr::<ColumnName<'_>, CMajorArrayView<'_, f64>, f64>(name, &view)
+        );
+        true
+    }
 }
 
 /// Records a float64 multidimensional array with **byte-level strides specification**.
@@ -992,7 +1049,7 @@ pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_c_major(
 /// - shape must point to an array of `rank` integers
 /// - data must point to a buffer of size `data_len` f64 elements.
 /// - QuestDB server version 9.0.0 or later is required for array support.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_byte_strides(
     buffer: *mut line_sender_buffer,
     name: line_sender_column_name,
@@ -1003,21 +1060,23 @@ pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_byte_strides(
     data_len: size_t,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let buffer = unwrap_buffer_mut(buffer);
-    let name = name.as_name();
-    generate_array_dims_branches!(
-        rank,
-        1,
-        shape,
-        strides,
-        data,
-        data_len,
-        err_out,
-        buffer,
-        name
-        => 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32
-    );
-    true
+    unsafe {
+        let buffer = unwrap_buffer_mut(buffer);
+        let name = name.as_name();
+        generate_array_dims_branches!(
+            rank,
+            1,
+            shape,
+            strides,
+            data,
+            data_len,
+            err_out,
+            buffer,
+            name
+            => 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32
+        );
+        true
+    }
 }
 
 /// Records a float64 multidimensional array with **element count stride specification**.
@@ -1038,7 +1097,7 @@ pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_byte_strides(
 /// - shape must point to an array of `rank` integers
 /// - data must point to a buffer of size `data_len` f64 elements.
 /// - QuestDB server version 9.0.0 or later is required for array support.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_elem_strides(
     buffer: *mut line_sender_buffer,
     name: line_sender_column_name,
@@ -1049,21 +1108,23 @@ pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_elem_strides(
     data_len: size_t,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let buffer = unwrap_buffer_mut(buffer);
-    let name = name.as_name();
-    generate_array_dims_branches!(
-        rank,
-        8,
-        shape,
-        strides,
-        data,
-        data_len,
-        err_out,
-        buffer,
-        name
-        => 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32
-    );
-    true
+    unsafe {
+        let buffer = unwrap_buffer_mut(buffer);
+        let name = name.as_name();
+        generate_array_dims_branches!(
+            rank,
+            8,
+            shape,
+            strides,
+            data,
+            data_len,
+            err_out,
+            buffer,
+            name
+            => 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32
+        );
+        true
+    }
 }
 
 /// Record a nanosecond timestamp value for the given column.
@@ -1072,17 +1133,19 @@ pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_elem_strides(
 /// @param[in] nanos The timestamp in nanoseconds before or since the unix epoch.
 /// @param[out] err_out Set on error.
 /// @return true on success, false on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_column_ts_nanos(
     buffer: *mut line_sender_buffer,
     name: line_sender_column_name,
     nanos: i64,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let buffer = unwrap_buffer_mut(buffer);
-    let timestamp = TimestampNanos::new(nanos);
-    bubble_err_to_c!(err_out, buffer.column_ts(name.as_name(), timestamp));
-    true
+    unsafe {
+        let buffer = unwrap_buffer_mut(buffer);
+        let timestamp = TimestampNanos::new(nanos);
+        bubble_err_to_c!(err_out, buffer.column_ts(name.as_name(), timestamp));
+        true
+    }
 }
 
 /// Record a microsecond timestamp value for the given column.
@@ -1091,17 +1154,19 @@ pub unsafe extern "C" fn line_sender_buffer_column_ts_nanos(
 /// @param[in] micros The timestamp in microseconds before or since the unix epoch.
 /// @param[out] err_out Set on error.
 /// @return true on success, false on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_column_ts_micros(
     buffer: *mut line_sender_buffer,
     name: line_sender_column_name,
     micros: i64,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let buffer = unwrap_buffer_mut(buffer);
-    let timestamp = TimestampMicros::new(micros);
-    bubble_err_to_c!(err_out, buffer.column_ts(name.as_name(), timestamp));
-    true
+    unsafe {
+        let buffer = unwrap_buffer_mut(buffer);
+        let timestamp = TimestampMicros::new(micros);
+        bubble_err_to_c!(err_out, buffer.column_ts(name.as_name(), timestamp));
+        true
+    }
 }
 
 /// Complete the current row with the designated timestamp in nanoseconds.
@@ -1117,16 +1182,18 @@ pub unsafe extern "C" fn line_sender_buffer_column_ts_micros(
 /// @param[in] epoch_nanos Number of nanoseconds since 1st Jan 1970 UTC.
 /// @param[out] err_out Set on error.
 /// @return true on success, false on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_at_nanos(
     buffer: *mut line_sender_buffer,
     epoch_nanos: i64,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let buffer = unwrap_buffer_mut(buffer);
-    let timestamp = TimestampNanos::new(epoch_nanos);
-    bubble_err_to_c!(err_out, buffer.at(timestamp));
-    true
+    unsafe {
+        let buffer = unwrap_buffer_mut(buffer);
+        let timestamp = TimestampNanos::new(epoch_nanos);
+        bubble_err_to_c!(err_out, buffer.at(timestamp));
+        true
+    }
 }
 
 /// Complete the current row with the designated timestamp in microseconds.
@@ -1142,16 +1209,18 @@ pub unsafe extern "C" fn line_sender_buffer_at_nanos(
 /// @param[in] epoch_micros Number of microseconds since 1st Jan 1970 UTC.
 /// @param[out] err_out Set on error.
 /// @return true on success, false on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_at_micros(
     buffer: *mut line_sender_buffer,
     epoch_micros: i64,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let buffer = unwrap_buffer_mut(buffer);
-    let timestamp = TimestampMicros::new(epoch_micros);
-    bubble_err_to_c!(err_out, buffer.at(timestamp));
-    true
+    unsafe {
+        let buffer = unwrap_buffer_mut(buffer);
+        let timestamp = TimestampMicros::new(epoch_micros);
+        bubble_err_to_c!(err_out, buffer.at(timestamp));
+        true
+    }
 }
 
 /// Complete the current row without providing a timestamp. The QuestDB instance
@@ -1176,14 +1245,16 @@ pub unsafe extern "C" fn line_sender_buffer_at_micros(
 /// @param[in] buffer Line buffer object.
 /// @param[out] err_out Set on error.
 /// @return true on success, false on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_at_now(
     buffer: *mut line_sender_buffer,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let buffer = unwrap_buffer_mut(buffer);
-    bubble_err_to_c!(err_out, buffer.at_now());
-    true
+    unsafe {
+        let buffer = unwrap_buffer_mut(buffer);
+        bubble_err_to_c!(err_out, buffer.at_now());
+        true
+    }
 }
 
 /**
@@ -1191,14 +1262,16 @@ pub unsafe extern "C" fn line_sender_buffer_at_now(
  * If this returns false, the buffer is incomplete and cannot be sent,
  * and an error message is set to indicate the problem.
  */
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_check_can_flush(
     buffer: *const line_sender_buffer,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let buffer = unwrap_buffer(buffer);
-    bubble_err_to_c!(err_out, buffer.check_can_flush());
-    true
+    unsafe {
+        let buffer = unwrap_buffer(buffer);
+        bubble_err_to_c!(err_out, buffer.check_can_flush());
+        true
+    }
 }
 
 /// Accumulates parameters for a new `line_sender` object.
@@ -1218,24 +1291,28 @@ pub struct line_sender_opts(SenderBuilder);
 /// `line_sender_opts_new`, so there's no function with a matching name.
 ///
 /// For the full list of keys, search this module for `fn line_sender_opts_`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_opts_from_conf(
     config: line_sender_utf8,
     err_out: *mut *mut line_sender_error,
 ) -> *mut line_sender_opts {
-    let config = config.as_str();
-    let builder = bubble_err_to_c!(err_out, SenderBuilder::from_conf(config), ptr::null_mut());
-    Box::into_raw(Box::new(line_sender_opts(builder)))
+    unsafe {
+        let config = config.as_str();
+        let builder = bubble_err_to_c!(err_out, SenderBuilder::from_conf(config), ptr::null_mut());
+        Box::into_raw(Box::new(line_sender_opts(builder)))
+    }
 }
 
 /// Create a new `line_sender_opts` instance from the configuration stored in the
 /// `QDB_CLIENT_CONF` environment variable.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_opts_from_env(
     err_out: *mut *mut line_sender_error,
 ) -> *mut line_sender_opts {
-    let builder = bubble_err_to_c!(err_out, SenderBuilder::from_env(), ptr::null_mut());
-    Box::into_raw(Box::new(line_sender_opts(builder)))
+    unsafe {
+        let builder = bubble_err_to_c!(err_out, SenderBuilder::from_env(), ptr::null_mut());
+        Box::into_raw(Box::new(line_sender_opts(builder)))
+    }
 }
 
 /// Create a new `line_sender_opts` instance with the given protocol, hostname and
@@ -1243,7 +1320,7 @@ pub unsafe extern "C" fn line_sender_opts_from_env(
 /// @param[in] protocol The protocol to use.
 /// @param[in] host The QuestDB database host.
 /// @param[in] port The QuestDB ILP TCP port.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_opts_new(
     protocol: line_sender_protocol,
     host: line_sender_utf8,
@@ -1258,7 +1335,7 @@ pub unsafe extern "C" fn line_sender_opts_new(
 
 /// Create a new `line_sender_opts` instance with the given protocol, hostname and
 /// service name.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_opts_new_service(
     protocol: line_sender_protocol,
     host: line_sender_utf8,
@@ -1276,13 +1353,13 @@ pub unsafe extern "C" fn line_sender_opts_new_service(
 /// This may be relevant if your machine has multiple network interfaces.
 ///
 /// The default is `0.0.0.0`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_opts_bind_interface(
     opts: *mut line_sender_opts,
     bind_interface: line_sender_utf8,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    upd_opts!(opts, err_out, bind_interface, bind_interface.as_str())
+    unsafe { upd_opts!(opts, err_out, bind_interface, bind_interface.as_str()) }
 }
 
 /// Set the username for authentication.
@@ -1292,55 +1369,55 @@ pub unsafe extern "C" fn line_sender_opts_bind_interface(
 ///
 /// For HTTP, this is part of basic authentication.
 /// See also: `line_sender_opts_password()`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_opts_username(
     opts: *mut line_sender_opts,
     username: line_sender_utf8,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    upd_opts!(opts, err_out, username, username.as_str())
+    unsafe { upd_opts!(opts, err_out, username, username.as_str()) }
 }
 
 /// Set the password for basic HTTP authentication.
 /// See also: `line_sender_opts_username()`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_opts_password(
     opts: *mut line_sender_opts,
     password: line_sender_utf8,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    upd_opts!(opts, err_out, password, password.as_str())
+    unsafe { upd_opts!(opts, err_out, password, password.as_str()) }
 }
 
 /// Set the Token (Bearer) Authentication parameter for HTTP,
 /// or the ECDSA private key for TCP authentication.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_opts_token(
     opts: *mut line_sender_opts,
     token: line_sender_utf8,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    upd_opts!(opts, err_out, token, token.as_str())
+    unsafe { upd_opts!(opts, err_out, token, token.as_str()) }
 }
 
 /// Set the ECDSA public key X for TCP authentication.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_opts_token_x(
     opts: *mut line_sender_opts,
     token_x: line_sender_utf8,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    upd_opts!(opts, err_out, token_x, token_x.as_str())
+    unsafe { upd_opts!(opts, err_out, token_x, token_x.as_str()) }
 }
 
 /// Set the ECDSA public key Y for TCP authentication.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_opts_token_y(
     opts: *mut line_sender_opts,
     token_y: line_sender_utf8,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    upd_opts!(opts, err_out, token_y, token_y.as_str())
+    unsafe { upd_opts!(opts, err_out, token_y, token_y.as_str()) }
 }
 
 /// Sets the ingestion protocol version.
@@ -1351,26 +1428,28 @@ pub unsafe extern "C" fn line_sender_opts_token_y(
 ///   arrays.
 ///
 /// QuestDB server version 9.0.0 or later is required for [`ProtocolVersion::V2`] support
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_opts_protocol_version(
     opts: *mut line_sender_opts,
     version: ProtocolVersion,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    upd_opts!(opts, err_out, protocol_version, version.into())
+    unsafe { upd_opts!(opts, err_out, protocol_version, version.into()) }
 }
 
 /// Configure how long to wait for messages from the QuestDB server during
 /// the TLS handshake and authentication process.
 /// The value is in milliseconds, and the default is 15 seconds.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_opts_auth_timeout(
     opts: *mut line_sender_opts,
     timeout_millis: u64,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let timeout = std::time::Duration::from_millis(timeout_millis);
-    upd_opts!(opts, err_out, auth_timeout, timeout)
+    unsafe {
+        let timeout = std::time::Duration::from_millis(timeout_millis);
+        upd_opts!(opts, err_out, auth_timeout, timeout)
+    }
 }
 
 /// Set to `false` to disable TLS certificate verification.
@@ -1378,25 +1457,27 @@ pub unsafe extern "C" fn line_sender_opts_auth_timeout(
 ///
 /// For testing consider specifying a path to a `.pem` file instead via
 /// the `tls_roots` setting.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_opts_tls_verify(
     opts: *mut line_sender_opts,
     verify: bool,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    upd_opts!(opts, err_out, tls_verify, verify)
+    unsafe { upd_opts!(opts, err_out, tls_verify, verify) }
 }
 
 /// Specify where to find the certificate authority used to validate
 /// the validate the server's TLS certificate.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_opts_tls_ca(
     opts: *mut line_sender_opts,
     ca: line_sender_ca,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let ca: CertificateAuthority = ca.into();
-    upd_opts!(opts, err_out, tls_ca, ca)
+    unsafe {
+        let ca: CertificateAuthority = ca.into();
+        upd_opts!(opts, err_out, tls_ca, ca)
+    }
 }
 
 /// Set the path to a custom root certificate `.pem` file.
@@ -1404,48 +1485,52 @@ pub unsafe extern "C" fn line_sender_opts_tls_ca(
 ///
 /// See notes on how to test with [self-signed
 /// certificates](https://github.com/questdb/c-questdb-client/tree/main/tls_certs).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_opts_tls_roots(
     opts: *mut line_sender_opts,
     path: line_sender_utf8,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let path = PathBuf::from(path.as_str());
-    upd_opts!(opts, err_out, tls_roots, path)
+    unsafe {
+        let path = PathBuf::from(path.as_str());
+        upd_opts!(opts, err_out, tls_roots, path)
+    }
 }
 
 /// Set the maximum buffer size in bytes that the client will flush to the server.
 /// The default is 100 MiB.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_opts_max_buf_size(
     opts: *mut line_sender_opts,
     max_buf_size: size_t,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    upd_opts!(opts, err_out, max_buf_size, max_buf_size)
+    unsafe { upd_opts!(opts, err_out, max_buf_size, max_buf_size) }
 }
 
 /// Ser the maximum length of a table or column name in bytes.
 /// The default is 127 bytes.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_opts_max_name_len(
     opts: *mut line_sender_opts,
     max_name_len: size_t,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    upd_opts!(opts, err_out, max_name_len, max_name_len)
+    unsafe { upd_opts!(opts, err_out, max_name_len, max_name_len) }
 }
 
 /// Set the cumulative duration spent in retries.
 /// The value is in milliseconds, and the default is 10 seconds.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_opts_retry_timeout(
     opts: *mut line_sender_opts,
     millis: u64,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let retry_timeout = std::time::Duration::from_millis(millis);
-    upd_opts!(opts, err_out, retry_timeout, retry_timeout)
+    unsafe {
+        let retry_timeout = std::time::Duration::from_millis(millis);
+        upd_opts!(opts, err_out, retry_timeout, retry_timeout)
+    }
 }
 
 /// Set the minimum acceptable throughput while sending a buffer to the server.
@@ -1456,13 +1541,13 @@ pub unsafe extern "C" fn line_sender_opts_retry_timeout(
 /// `request_timeout`.
 ///
 /// See also: `line_sender_opts_request_timeout()`
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_opts_request_min_throughput(
     opts: *mut line_sender_opts,
     bytes_per_sec: u64,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    upd_opts!(opts, err_out, request_min_throughput, bytes_per_sec)
+    unsafe { upd_opts!(opts, err_out, request_min_throughput, bytes_per_sec) }
 }
 
 /// Set the additional time to wait on top of that calculated from the minimum
@@ -1470,43 +1555,49 @@ pub unsafe extern "C" fn line_sender_opts_request_min_throughput(
 /// roundtrip. The value is in milliseconds, and the default is 10 seconds.
 ///
 /// See also: `line_sender_opts_request_min_throughput()`
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_opts_request_timeout(
     opts: *mut line_sender_opts,
     millis: u64,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let request_timeout = std::time::Duration::from_millis(millis);
-    upd_opts!(opts, err_out, request_timeout, request_timeout)
+    unsafe {
+        let request_timeout = std::time::Duration::from_millis(millis);
+        upd_opts!(opts, err_out, request_timeout, request_timeout)
+    }
 }
 
 /// Set the HTTP user agent. Internal API. Do not use.
 #[doc(hidden)]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_opts_user_agent(
     opts: *mut line_sender_opts,
     user_agent: line_sender_utf8,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    upd_opts!(opts, err_out, user_agent, user_agent.as_str())
+    unsafe { upd_opts!(opts, err_out, user_agent, user_agent.as_str()) }
 }
 
 /// Duplicate the `line_sender_opts` object.
 /// Both old and new objects will have to be freed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_opts_clone(
     opts: *const line_sender_opts,
 ) -> *mut line_sender_opts {
-    let builder = &(*opts).0;
-    let new_builder = builder.clone();
-    Box::into_raw(Box::new(line_sender_opts(new_builder)))
+    unsafe {
+        let builder = &(*opts).0;
+        let new_builder = builder.clone();
+        Box::into_raw(Box::new(line_sender_opts(new_builder)))
+    }
 }
 
 /// Release the `line_sender_opts` object.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_opts_free(opts: *mut line_sender_opts) {
-    if !opts.is_null() {
-        drop(Box::from_raw(opts));
+    unsafe {
+        if !opts.is_null() {
+            drop(Box::from_raw(opts));
+        }
     }
 }
 
@@ -1526,14 +1617,16 @@ pub struct line_sender(Sender);
 /// The sender should be accessed by only a single thread a time.
 ///
 /// @param[in] opts Options for the connection.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_build(
     opts: *const line_sender_opts,
     err_out: *mut *mut line_sender_error,
 ) -> *mut line_sender {
-    let builder = &(*opts).0;
-    let sender = bubble_err_to_c!(err_out, builder.build(), ptr::null_mut());
-    Box::into_raw(Box::new(line_sender(sender)))
+    unsafe {
+        let builder = &(*opts).0;
+        let sender = bubble_err_to_c!(err_out, builder.build(), ptr::null_mut());
+        Box::into_raw(Box::new(line_sender(sender)))
+    }
 }
 
 /// Create a new line sender instance from the given configuration string.
@@ -1557,18 +1650,20 @@ pub unsafe extern "C" fn line_sender_build(
 /// returning.
 ///
 /// The sender should be accessed by only a single thread a time.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_from_conf(
     config: line_sender_utf8,
     err_out: *mut *mut line_sender_error,
 ) -> *mut line_sender {
-    let config = config.as_str();
-    let builder = bubble_err_to_c!(err_out, SenderBuilder::from_conf(config), ptr::null_mut());
-    let builder = builder
-        .user_agent(concat!("questdb/c/", env!("CARGO_PKG_VERSION")))
-        .expect("user_agent set");
-    let sender = bubble_err_to_c!(err_out, builder.build(), ptr::null_mut());
-    Box::into_raw(Box::new(line_sender(sender)))
+    unsafe {
+        let config = config.as_str();
+        let builder = bubble_err_to_c!(err_out, SenderBuilder::from_conf(config), ptr::null_mut());
+        let builder = builder
+            .user_agent(concat!("questdb/c/", env!("CARGO_PKG_VERSION")))
+            .expect("user_agent set");
+        let sender = bubble_err_to_c!(err_out, builder.build(), ptr::null_mut());
+        Box::into_raw(Box::new(line_sender(sender)))
+    }
 }
 
 /// Create a new `line_sender` instance from the configuration stored in the
@@ -1580,24 +1675,26 @@ pub unsafe extern "C" fn line_sender_from_conf(
 /// returning.
 ///
 /// The sender should be accessed by only a single thread a time.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_from_env(
     err_out: *mut *mut line_sender_error,
 ) -> *mut line_sender {
-    let builder = bubble_err_to_c!(err_out, SenderBuilder::from_env(), ptr::null_mut());
-    let builder = builder
-        .user_agent(concat!("questdb/c/", env!("CARGO_PKG_VERSION")))
-        .expect("user_agent set");
-    let sender = bubble_err_to_c!(err_out, builder.build(), ptr::null_mut());
-    Box::into_raw(Box::new(line_sender(sender)))
+    unsafe {
+        let builder = bubble_err_to_c!(err_out, SenderBuilder::from_env(), ptr::null_mut());
+        let builder = builder
+            .user_agent(concat!("questdb/c/", env!("CARGO_PKG_VERSION")))
+            .expect("user_agent set");
+        let sender = bubble_err_to_c!(err_out, builder.build(), ptr::null_mut());
+        Box::into_raw(Box::new(line_sender(sender)))
+    }
 }
 
 unsafe fn unwrap_sender<'a>(sender: *const line_sender) -> &'a Sender {
-    &(*sender).0
+    unsafe { &(*sender).0 }
 }
 
 unsafe fn unwrap_sender_mut<'a>(sender: *mut line_sender) -> &'a mut Sender {
-    &mut (*sender).0
+    unsafe { &mut (*sender).0 }
 }
 
 /// Returns the sender's protocol version
@@ -1605,26 +1702,28 @@ unsafe fn unwrap_sender_mut<'a>(sender: *mut line_sender) -> &'a mut Sender {
 /// - Explicitly set version, or
 /// - Auto-detected during HTTP transport, or
 /// - [`ProtocolVersion::V1`] for TCP transport.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_get_protocol_version(
     sender: *const line_sender,
 ) -> ProtocolVersion {
-    unwrap_sender(sender).protocol_version().into()
+    unsafe { unwrap_sender(sender).protocol_version().into() }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_get_max_name_len(sender: *const line_sender) -> size_t {
-    unwrap_sender(sender).max_name_len()
+    unsafe { unwrap_sender(sender).max_name_len() }
 }
 
 /// Construct a [`line_sender_buffer`] using the sender's protocol settings.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_new_for_sender(
     sender: *const line_sender,
 ) -> *mut line_sender_buffer {
-    let sender = unwrap_sender(sender);
-    let buffer = sender.new_buffer();
-    Box::into_raw(Box::new(line_sender_buffer(buffer)))
+    unsafe {
+        let sender = unwrap_sender(sender);
+        let buffer = sender.new_buffer();
+        Box::into_raw(Box::new(line_sender_buffer(buffer)))
+    }
 }
 
 /// Tell whether the sender is no longer usable and must be closed.
@@ -1632,17 +1731,19 @@ pub unsafe extern "C" fn line_sender_buffer_new_for_sender(
 /// This fuction is specific to TCP and is not relevant for HTTP.
 /// @param[in] sender Line sender object.
 /// @return true if an error occurred with a sender and it must be closed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_must_close(sender: *const line_sender) -> bool {
-    unwrap_sender(sender).must_close()
+    unsafe { unwrap_sender(sender).must_close() }
 }
 
 /// Close the connection. Does not flush. Non-idempotent.
 /// @param[in] sender Line sender object.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_close(sender: *mut line_sender) {
-    if !sender.is_null() {
-        drop(Box::from_raw(sender));
+    unsafe {
+        if !sender.is_null() {
+            drop(Box::from_raw(sender));
+        }
     }
 }
 
@@ -1672,16 +1773,18 @@ pub unsafe extern "C" fn line_sender_close(sender: *mut line_sender) {
 /// @param[in] sender Line sender object.
 /// @param[in] buffer Line buffer object.
 /// @return true on success, false on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_flush(
     sender: *mut line_sender,
     buffer: *mut line_sender_buffer,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let sender = unwrap_sender_mut(sender);
-    let buffer = unwrap_buffer_mut(buffer);
-    bubble_err_to_c!(err_out, sender.flush(buffer));
-    true
+    unsafe {
+        let sender = unwrap_sender_mut(sender);
+        let buffer = unwrap_buffer_mut(buffer);
+        bubble_err_to_c!(err_out, sender.flush(buffer));
+        true
+    }
 }
 
 /// Send the given buffer of rows to the QuestDB server.
@@ -1693,16 +1796,18 @@ pub unsafe extern "C" fn line_sender_flush(
 /// @param[in] sender Line sender object.
 /// @param[in] buffer Line buffer object.
 /// @return true on success, false on error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_flush_and_keep(
     sender: *mut line_sender,
     buffer: *const line_sender_buffer,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let sender = unwrap_sender_mut(sender);
-    let buffer = unwrap_buffer(buffer);
-    bubble_err_to_c!(err_out, sender.flush_and_keep(buffer));
-    true
+    unsafe {
+        let sender = unwrap_sender_mut(sender);
+        let buffer = unwrap_buffer(buffer);
+        bubble_err_to_c!(err_out, sender.flush_and_keep(buffer));
+        true
+    }
 }
 
 /// Send the batch of rows in the buffer to the QuestDB server, and, if the parameter
@@ -1721,30 +1826,32 @@ pub unsafe extern "C" fn line_sender_flush_and_keep(
 /// error, it retries until it has exhausted the retry time budget.
 ///
 /// All the data stays in the buffer. Clear the buffer before starting a new batch.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_flush_and_keep_with_flags(
     sender: *mut line_sender,
     buffer: *const line_sender_buffer,
     transactional: bool,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    let sender = unwrap_sender_mut(sender);
-    let buffer = unwrap_buffer(buffer);
-    bubble_err_to_c!(
-        err_out,
-        sender.flush_and_keep_with_flags(buffer, transactional)
-    );
-    true
+    unsafe {
+        let sender = unwrap_sender_mut(sender);
+        let buffer = unwrap_buffer(buffer);
+        bubble_err_to_c!(
+            err_out,
+            sender.flush_and_keep_with_flags(buffer, transactional)
+        );
+        true
+    }
 }
 
 /// Get the current time in nanoseconds since the Unix epoch (UTC).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_now_nanos() -> i64 {
     TimestampNanos::now().as_i64()
 }
 
 /// Get the current time in microseconds since the Unix epoch (UTC).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_now_micros() -> i64 {
     TimestampMicros::now().as_i64()
 }
@@ -1759,6 +1866,8 @@ use questdb_confstr_ffi::questdb_conf_str_parse_err;
 /// included in the final binary.
 /// This is because otherwise `cargo` will optimise out the dependency.
 pub unsafe fn _build_system_hack(err: *mut questdb_conf_str_parse_err) {
-    use questdb_confstr_ffi::questdb_conf_str_parse_err_free;
-    questdb_conf_str_parse_err_free(err);
+    unsafe {
+        use questdb_confstr_ffi::questdb_conf_str_parse_err_free;
+        questdb_conf_str_parse_err_free(err);
+    }
 }

@@ -1,7 +1,7 @@
 use ndarray::arr1;
 use questdb::{
-    ingress::{Sender, TimestampNanos},
     Result,
+    ingress::{Sender, TimestampNanos},
 };
 
 fn main() -> Result<()> {

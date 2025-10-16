@@ -21,13 +21,13 @@
  *  limitations under the License.
  *
  ******************************************************************************/
-use crate::ingress::ndarr::{check_and_get_array_bytes_size, ArrayElementSealed};
+use crate::ingress::ndarr::{ArrayElementSealed, check_and_get_array_bytes_size};
 use crate::ingress::{
-    ndarr, ArrayElement, DebugBytes, NdArrayView, ProtocolVersion, Timestamp, TimestampMicros,
-    TimestampNanos, ARRAY_BINARY_FORMAT_TYPE, DOUBLE_BINARY_FORMAT_TYPE, MAX_ARRAY_DIMS,
-    MAX_NAME_LEN_DEFAULT,
+    ARRAY_BINARY_FORMAT_TYPE, ArrayElement, DOUBLE_BINARY_FORMAT_TYPE, DebugBytes, MAX_ARRAY_DIMS,
+    MAX_NAME_LEN_DEFAULT, NdArrayView, ProtocolVersion, Timestamp, TimestampMicros, TimestampNanos,
+    ndarr,
 };
-use crate::{error, Error};
+use crate::{Error, error};
 use std::fmt::{Debug, Formatter};
 use std::num::NonZeroUsize;
 use std::slice::from_raw_parts_mut;

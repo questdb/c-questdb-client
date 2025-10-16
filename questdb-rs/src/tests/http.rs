@@ -22,10 +22,10 @@
  *
  ******************************************************************************/
 
-use crate::ingress::{Buffer, Protocol, ProtocolVersion, SenderBuilder, TimestampNanos};
-use crate::tests::mock::{certs_dir, HttpResponse, MockServer};
-use crate::tests::{assert_err_contains, TestResult};
 use crate::ErrorCode;
+use crate::ingress::{Buffer, Protocol, ProtocolVersion, SenderBuilder, TimestampNanos};
+use crate::tests::mock::{HttpResponse, MockServer, certs_dir};
+use crate::tests::{TestResult, assert_err_contains};
 use rstest::rstest;
 use std::io;
 use std::io::ErrorKind;
@@ -231,9 +231,11 @@ fn test_no_connection(
     assert!(res.is_err());
     let err = res.unwrap_err();
     assert_eq!(err.code(), ErrorCode::SocketError);
-    assert!(err
-        .msg()
-        .starts_with("Could not flush buffer: http://127.0.0.1:1/write: io: Connection refused"));
+    assert!(
+        err.msg().starts_with(
+            "Could not flush buffer: http://127.0.0.1:1/write: io: Connection refused"
+        )
+    );
     Ok(())
 }
 

@@ -23,11 +23,11 @@
  ******************************************************************************/
 
 use crate::{
-    ingress::{
-        Buffer, F64Serializer, Sender, TableName, Timestamp, TimestampMicros, TimestampNanos,
-        DOUBLE_BINARY_FORMAT_TYPE,
-    },
     ErrorCode,
+    ingress::{
+        Buffer, DOUBLE_BINARY_FORMAT_TYPE, F64Serializer, Sender, TableName, Timestamp,
+        TimestampMicros, TimestampNanos,
+    },
 };
 
 use crate::ingress::ProtocolVersion;
@@ -38,12 +38,12 @@ use core::time::Duration;
 use crate::ingress::ndarr::write_array_data;
 
 #[cfg(feature = "ndarray")]
-use ndarray::{arr2, ArrayD};
+use ndarray::{ArrayD, arr2};
 
 #[cfg(feature = "sync-sender-tcp")]
 use crate::tests::{
     assert_err_contains,
-    mock::{certs_dir, MockServer},
+    mock::{MockServer, certs_dir},
     ndarr::ArrayColumnTypeTag,
 };
 
@@ -51,7 +51,7 @@ use crate::tests::{
 use rstest::rstest;
 
 #[cfg(feature = "sync-sender-tcp")]
-use crate::ingress::{CertificateAuthority, ARRAY_BINARY_FORMAT_TYPE};
+use crate::ingress::{ARRAY_BINARY_FORMAT_TYPE, CertificateAuthority};
 
 #[cfg(feature = "sync-sender-tcp")]
 #[rstest]
@@ -399,10 +399,11 @@ fn test_transactional() -> TestResult {
 #[cfg(feature = "sync-sender-tcp")]
 #[test]
 fn test_auth_inconsistent_keys() -> TestResult {
-    test_bad_key("fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU", // d
-                 "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU", // x
-                 "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac",
-                 "Misconfigured ILP authentication keys: InconsistentComponents. Hint: Check the keys for a possible typo."
+    test_bad_key(
+        "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU", // d
+        "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU", // x
+        "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac",
+        "Misconfigured ILP authentication keys: InconsistentComponents. Hint: Check the keys for a possible typo.",
     )
 }
 
@@ -413,14 +414,14 @@ fn test_auth_bad_base64_private_key() -> TestResult {
         "bad key",                                     // d
         "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU", // x
         "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac", // y
-        "Misconfigured ILP authentication keys. Could not decode private authentication key: invalid Base64 encoding. Hint: Check the keys for a possible typo."
+        "Misconfigured ILP authentication keys. Could not decode private authentication key: invalid Base64 encoding. Hint: Check the keys for a possible typo.",
     )
 }
 
 #[cfg(feature = "sync-sender-tcp")]
 #[test]
 fn test_auth_private_key_too_long() -> TestResult {
-    #[cfg(feature = "aws-lc-crypto")]    
+    #[cfg(feature = "aws-lc-crypto")]
     let expected = "Misconfigured ILP authentication keys: InvalidEncoding. Hint: Check the keys for a possible typo.";
 
     #[cfg(feature = "ring-crypto")]
@@ -430,7 +431,7 @@ fn test_auth_private_key_too_long() -> TestResult {
         "ZkxLWUVhb0ViOWxybjNua3dMREEtTV94bnVGT2RTdDl5MFo3X3ZXU0hMVWZMS1lFYW9FYjlscm4zbmt3TERBLU1feG51Rk9kU3Q5eTBaN192V1NITFU",
         "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU", // x
         "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac", // y
-        expected
+        expected,
     )
 }
 
@@ -441,7 +442,7 @@ fn test_auth_public_key_x_too_long() -> TestResult {
         "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU",
         "ZkxLWUVhb0ViOWxybjNua3dMREEtTV94bnVGT2RTdDl5MFo3X3ZXU0hMVWZMS1lFYW9FYjlscm4zbmt3TERBLU1feG51Rk9kU3Q5eTBaN192V1NITFU", // x
         "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac", // y
-        "Misconfigured ILP authentication keys. Public key x is too long. Hint: Check the keys for a possible typo."
+        "Misconfigured ILP authentication keys. Public key x is too long. Hint: Check the keys for a possible typo.",
     )
 }
 
@@ -452,7 +453,7 @@ fn test_auth_public_key_y_too_long() -> TestResult {
         "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU",
         "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac", // x
         "ZkxLWUVhb0ViOWxybjNua3dMREEtTV94bnVGT2RTdDl5MFo3X3ZXU0hMVWZMS1lFYW9FYjlscm4zbmt3TERBLU1feG51Rk9kU3Q5eTBaN192V1NITFU", // y
-        "Misconfigured ILP authentication keys. Public key y is too long. Hint: Check the keys for a possible typo."
+        "Misconfigured ILP authentication keys. Public key y is too long. Hint: Check the keys for a possible typo.",
     )
 }
 
@@ -461,9 +462,9 @@ fn test_auth_public_key_y_too_long() -> TestResult {
 fn test_auth_bad_base64_public_key_x() -> TestResult {
     test_bad_key(
         "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU", // d
-        "bad base64 encoding",                       // x
+        "bad base64 encoding",                         // x
         "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac", // y
-        "Misconfigured ILP authentication keys. Could not decode public key x: invalid Base64 encoding. Hint: Check the keys for a possible typo."
+        "Misconfigured ILP authentication keys. Could not decode public key x: invalid Base64 encoding. Hint: Check the keys for a possible typo.",
     )
 }
 
@@ -473,8 +474,8 @@ fn test_auth_bad_base64_public_key_y() -> TestResult {
     test_bad_key(
         "fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU", // d
         "Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac", // x
-        "bad base64 encoding", // y
-        "Misconfigured ILP authentication keys. Could not decode public key y: invalid Base64 encoding. Hint: Check the keys for a possible typo."
+        "bad base64 encoding",                         // y
+        "Misconfigured ILP authentication keys. Could not decode public key y: invalid Base64 encoding. Hint: Check the keys for a possible typo.",
     )
 }
 

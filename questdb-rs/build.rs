@@ -278,10 +278,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     #[cfg(not(any(feature = "aws-lc-crypto", feature = "ring-crypto")))]
-    compile_error!("You must enable exactly one of the `aws-lc-crypto` or `ring-crypto` features, but none are enabled.");
+    compile_error!(
+        "You must enable exactly one of the `aws-lc-crypto` or `ring-crypto` features, but none are enabled."
+    );
 
     #[cfg(all(feature = "aws-lc-crypto", feature = "ring-crypto"))]
-    compile_error!("You must enable exactly one of the `aws-lc-crypto` or `ring-crypto` features, but both are enabled.");
+    compile_error!(
+        "You must enable exactly one of the `aws-lc-crypto` or `ring-crypto` features, but both are enabled."
+    );
 
     #[cfg(feature = "json_tests")]
     {

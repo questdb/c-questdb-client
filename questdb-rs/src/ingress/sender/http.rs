@@ -23,7 +23,7 @@
  ******************************************************************************/
 
 use crate::error::fmt;
-use crate::{error, Error};
+use crate::{Error, error};
 use rand::Rng;
 use rustls::{ClientConnection, StreamOwned};
 use rustls_pki_types::ServerName;
@@ -38,10 +38,10 @@ use ureq::unversioned::transport::{
     Buffers, Connector, LazyBuffers, NextTimeout, Transport, TransportAdapter,
 };
 
-use crate::ingress::conf::HttpConfig;
 use crate::ingress::ProtocolVersion;
+use crate::ingress::conf::HttpConfig;
 use ureq::unversioned::*;
-use ureq::{http, Body};
+use ureq::{Body, http};
 
 #[cfg(feature = "sync-sender-http")]
 pub(crate) struct SyncHttpHandlerState {
@@ -320,7 +320,7 @@ pub(super) fn parse_http_error(http_status_code: u16, response: Response<Body>) 
                 }
             };
 
-            if let Some(serde_json::Value::String(ref msg)) = json.get("message") {
+            if let Some(serde_json::Value::String(msg)) = json.get("message") {
                 parse_json_error(&json, msg)
             } else {
                 string_err()
@@ -457,7 +457,7 @@ pub(crate) fn read_server_settings(
         })?;
 
         let mut support_versions: Vec<ProtocolVersion> = vec![];
-        if let Some(serde_json::Value::Array(ref values)) = json
+        if let Some(serde_json::Value::Array(values)) = json
             .get("config")
             .and_then(|v| v.get("line.proto.support.versions"))
         {
@@ -483,7 +483,8 @@ pub(crate) fn read_server_settings(
     } else {
         Err(error::fmt!(
             ProtocolVersionError,
-            "Malformed server response, settings url: {}, err: failed to read response body as UTF-8", settings_url
+            "Malformed server response, settings url: {}, err: failed to read response body as UTF-8",
+            settings_url
         ))
     }
 }

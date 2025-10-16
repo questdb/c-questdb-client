@@ -361,7 +361,7 @@ fn incomplete_tcp_ecdsa_auth() {
 fn misspelled_tcp_ecdsa_auth() {
     assert_conf_err(
         Sender::from_conf("tcp::addr=localhost;username=user123;tokenx=123;"),
-        "Incomplete ECDSA authentication parameters. Specify either all or none of: \"username\", \"token\", \"token_x\", \"token_y\"."
+        "Incomplete ECDSA authentication parameters. Specify either all or none of: \"username\", \"token\", \"token_x\", \"token_y\".",
     );
 }
 
@@ -453,9 +453,10 @@ fn tcps_tls_roots_file_missing() {
         SenderBuilder::from_conf("tcps::addr=localhost;tls_roots=/some/invalid/path/cacerts.pem;")
             .unwrap_err();
     assert_eq!(err.code(), ErrorCode::ConfigError);
-    assert!(err
-        .msg()
-        .contains("Could not open root certificate file from path"));
+    assert!(
+        err.msg()
+            .contains("Could not open root certificate file from path")
+    );
 }
 
 #[cfg(feature = "sync-sender-tcp")]
