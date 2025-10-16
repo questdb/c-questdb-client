@@ -3,7 +3,6 @@
 
 using namespace std::literals::string_view_literals;
 using namespace questdb::ingress::literals;
-using namespace questdb::ingress::decimal;
 
 static bool example(std::string_view host, std::string_view port)
 {
@@ -23,7 +22,8 @@ static bool example(std::string_view host, std::string_view port)
         const auto amount_name = "amount"_cn;
         const uint8_t price_unscaled_value[] = {123};
         // 123 with a scale of 1 gives a decimal of 12.3
-        const auto price_value = binary_view(1, price_unscaled_value);
+        const auto price_value =
+            questdb::ingress::decimal::binary_view(1, price_unscaled_value);
 
         questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
         buffer.table(table_name)
