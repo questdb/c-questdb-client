@@ -2,8 +2,8 @@ use crate::error::{Result, fmt};
 use crate::ingress::CertificateAuthority;
 use rustls::RootCertStore;
 use rustls_pki_types::CertificateDer;
+use rustls_pki_types::pem::PemObject;
 use std::fs::File;
-use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -191,8 +191,8 @@ impl TlsSettings {
                         io_err
                     )
                 })?;
-                let mut reader = BufReader::new(certfile);
-                let der_certs = rustls_pemfile::certs(&mut reader)
+
+                let der_certs = CertificateDer::pem_reader_iter(certfile)
                     .collect::<std::result::Result<Vec<_>, _>>()
                     .map_err(|io_err| {
                         fmt!(

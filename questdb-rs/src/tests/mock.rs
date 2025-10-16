@@ -29,9 +29,11 @@ use mio::event::Event;
 use mio::net::TcpStream;
 use mio::{Events, Interest, Poll, Token};
 use rustls::{ServerConfig, Stream, server::ServerConnection};
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use socket2::{Domain, Protocol as SockProtocol, Socket, Type};
 use std::fs::File;
-use std::io::{self, BufReader, Read};
+use std::io::{self, Read};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -70,16 +72,14 @@ pub fn certs_dir() -> std::path::PathBuf {
 
 fn tls_config() -> Arc<ServerConfig> {
     let certs_dir = certs_dir();
-    let mut cert_file =
-        File::open(certs_dir.join("server.crt")).expect("cannot open certificate file");
-    let mut private_key_file =
+    let cert_file = File::open(certs_dir.join("server.crt")).expect("cannot open certificate file");
+    let private_key_file =
         File::open(certs_dir.join("server.key")).expect("cannot open private key file");
-    let certs = rustls_pemfile::certs(&mut BufReader::new(&mut cert_file))
+    let certs = CertificateDer::pem_reader_iter(cert_file)
         .collect::<Result<Vec<_>, _>>()
         .expect("cannot read certificate file");
-    let private_key = rustls_pemfile::private_key(&mut BufReader::new(&mut private_key_file))
-        .expect("cannot read private key file")
-        .expect("no private key found");
+    let private_key =
+        PrivateKeyDer::from_pem_reader(private_key_file).expect("cannot get private key from file");
     let config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, private_key)

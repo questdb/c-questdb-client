@@ -22,12 +22,11 @@ libc = "0.2"
 socket2 = { version = "0.6.1", optional = true }
 dns-lookup = "3.0.0"
 base64ct = { version = "1.7", features = ["alloc"] }
-rustls-pemfile = "2.0.0"
 ryu = { version = "1.0" }
 itoa = "1.0"
 aws-lc-rs = { version = "1.13", optional = true }
 ring = { version = "0.17.14", optional = true }
-rustls-pki-types = "1.0.1"
+rustls-pki-types = "1.12.0"
 rustls = { version = "0.23.25", default-features = false, features = ["logging", "std", "tls12"] }
 rustls-native-certs = { version = "0.8.2", optional = true }
 webpki-roots = { version = "1.0.3", default-features = false, optional = true }
