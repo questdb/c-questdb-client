@@ -390,7 +390,7 @@ pub unsafe extern "C" fn line_sender_error_msg(
     unsafe {
         let msg: &str = (*error).0.msg();
         *len_out = msg.len();
-        msg.as_ptr() as *mut c_char
+        msg.as_ptr() as *const c_char
     }
 }
 
@@ -672,11 +672,11 @@ pub unsafe extern "C" fn line_sender_column_name_init(
 pub unsafe extern "C" fn line_sender_column_name_assert(
     len: size_t,
     buf: *const c_char,
-) -> line_sender_table_name {
+) -> line_sender_column_name {
     unsafe {
         let u8str = line_sender_utf8_assert(len, buf);
         match ColumnName::new(u8str.as_str()) {
-            Ok(_) => line_sender_table_name { len, buf },
+            Ok(_) => line_sender_column_name { len, buf },
             Err(msg) => {
                 panic!("{}", msg);
             }
