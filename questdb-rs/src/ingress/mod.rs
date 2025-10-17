@@ -78,7 +78,7 @@ pub(crate) const DOUBLE_BINARY_FORMAT_TYPE: u8 = 16;
 pub const DECIMAL_BINARY_FORMAT_TYPE: u8 = 23;
 
 /// The version of InfluxDB Line Protocol used to communicate with the server.
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd)]
 pub enum ProtocolVersion {
     /// Version 1 of Line Protocol.
     /// Full-text protocol.
