@@ -311,13 +311,13 @@ pub enum ProtocolVersion {
     /// Version 2 of InfluxDB Line Protocol.
     /// Uses binary format serialization for f64, and supports the array data type.
     /// This version is specific to QuestDB and is not compatible with InfluxDB.
-    /// QuestDB server version 9.0.0 or later is required for `V2` supported.
+    /// QuestDB server version 9.0.0 or later is required for `V2` support.
     V2 = 2,
 
     /// Version 3 of InfluxDB Line Protocol.
     /// Supports the decimal data type in text and binary formats.
     /// This version is specific to QuestDB and is not compatible with InfluxDB.
-    /// QuestDB server version 9.2.0 or later is required for `V3` supported.
+    /// QuestDB server version 9.2.0 or later is required for `V3` support.
     V3 = 3,
 }
 
