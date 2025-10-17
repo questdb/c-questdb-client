@@ -263,7 +263,7 @@ arrays using several convenient types:
 - native Rust vectors (up to 3-dimensional)
 - arrays from the [`ndarray`](https://docs.rs/ndarray) crate
 
-You must use protocol version 2 to ingest arrays. HTTP transport will
+You must use protocol version 2 to ingest arrays. The HTTP transport will
 automatically enable it as long as you're connecting to an up-to-date QuestDB
 server (version 9.0.0 or later), but with TCP you must explicitly specify it in
 the configuration string: `protocol_version=2;`.
@@ -334,7 +334,7 @@ The [`Buffer::column_dec`](Buffer::column_dec) method supports efficient ingesti
 - decimals from the [`rust_decimal`](https://docs.rs/rust_decimal) crate
 - decimals from the [`bigdecimal`](https://docs.rs/bigdecimal) crate
 
-You must use protocol version 3 to ingest decimals. HTTP transport will
+You must use protocol version 3 to ingest decimals. The HTTP transport will
 automatically enable it as long as you're connecting to an up-to-date QuestDB
 server (version 9.2.0 or later), but with TCP you must explicitly specify it in
 the configuration string: `protocol_version=3;`.
