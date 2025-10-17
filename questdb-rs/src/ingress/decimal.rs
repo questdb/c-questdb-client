@@ -160,7 +160,7 @@ impl DecimalSerializer for &bigdecimal::BigDecimal {
         if scale < -76 || scale > 76 {
             return Err(error::fmt!(
                 InvalidDecimal,
-                "QuestDB ILP does not support scale greater than 76, got {}",
+                "QuestDB ILP does not support decimal scale greater than 76, got {}",
                 scale
             ));
         }
@@ -180,7 +180,7 @@ impl DecimalSerializer for &bigdecimal::BigDecimal {
         if bytes.len() > i8::MAX as usize {
             return Err(error::fmt!(
                 InvalidDecimal,
-                "QuestDB ILP does not support values greater than {} bytes, got {}",
+                "QuestDB ILP does not support decimal longer than {} bytes, got {}",
                 i8::MAX,
                 bytes.len()
             ));
