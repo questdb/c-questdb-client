@@ -1054,7 +1054,7 @@ impl Buffer {
         S: DecimalSerializer,
         Error: From<N::Error>,
     {
-        if !self.protocol_version.supports(ProtocolVersion::V3) {
+        if self.protocol_version < ProtocolVersion::V3 {
             return Err(error::fmt!(
                 ProtocolVersionError,
                 "Protocol version {} does not support the decimal datatype",
@@ -1122,7 +1122,7 @@ impl Buffer {
         D: ArrayElement + ArrayElementSealed,
         Error: From<N::Error>,
     {
-        if !self.protocol_version.supports(ProtocolVersion::V2) {
+        if self.protocol_version < ProtocolVersion::V2 {
             return Err(error::fmt!(
                 ProtocolVersionError,
                 "Protocol version {} does not support array datatype",
