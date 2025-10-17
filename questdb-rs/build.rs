@@ -167,7 +167,7 @@ pub mod json_tests {
             fn test_{:03}_{}(
                 #[values(ProtocolVersion::V1, ProtocolVersion::V2, ProtocolVersion::V3)] version: ProtocolVersion
             ) -> TestResult {{
-                if version < {} {{
+                if (version as u8) < {} {{
                     return Ok(());
                 }}
                 let mut buffer = Buffer::new(version);
