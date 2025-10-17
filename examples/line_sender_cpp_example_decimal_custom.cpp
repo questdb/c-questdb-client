@@ -112,7 +112,7 @@ static bool displayed_help(int argc, const char* argv[])
         if ((arg == "-h"sv) || (arg == "--help"sv))
         {
             std::cerr << "Usage:\n"
-                      << "line_sender_c_example_decimal_custom: [HOST [PORT]]\n"
+                      << "  " << argv[0] << ": [HOST [PORT]]\n"
                       << "    HOST: ILP host (defaults to \"localhost\").\n"
                       << "    PORT: ILP port (defaults to \"9009\")."
                       << std::endl;
