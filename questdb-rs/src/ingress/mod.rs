@@ -1183,10 +1183,6 @@ impl SenderBuilder {
                 }
             },
         };
-        eprintln!(
-            "Using protocol version {:?} with max_name_len={}",
-            protocol_version, max_name_len
-        );
 
         if auth.is_some() {
             descr.push_str("auth=on]");
