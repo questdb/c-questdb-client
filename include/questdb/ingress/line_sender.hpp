@@ -682,6 +682,8 @@ inline constexpr bool has_decimal_view_state_v =
     has_decimal_view_state<T>::value;
 } // namespace decimal
 
+using decimal::decimal_view;
+
 class line_sender_buffer
 {
 public:
