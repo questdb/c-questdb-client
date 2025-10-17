@@ -29,6 +29,9 @@
 - [Array with element strides](../examples/line_sender_c_example_array_elem_strides.c)
 - [Array in C-major order](../examples/line_sender_c_example_array_c_major.c)
 
+**Decimal**
+- [Decimal in binary format](../examples/line_sender_c_example_decimal_binary.c)
+
 ## API Overview
 
 ### Header
@@ -90,7 +93,9 @@ line_sender_utf8 symbol_value = QDB_UTF8_LITERAL("ETH-USD");
 if (!line_sender_buffer_symbol(buffer, symbol_name, symbol_value, &err))
     goto on_error;
 
-if (!line_sender_buffer_column_f64(buffer, price_name, 2615.54, &err))
+line_sender_utf8 price_value = QDB_UTF8_LITERAL("2615.54");
+if (!line_sender_buffer_column_dec_str(
+        buffer, price_name, price_value, &err))
     goto on_error;
 
 if (!line_sender_buffer_at_nanos(buffer, line_sender_now_nanos(), &err))
@@ -101,6 +106,7 @@ if (!line_sender_buffer_at_nanos(buffer, line_sender_now_nanos(), &err))
 if (!line_sender_flush(sender, buffer, &err))
     goto on_error;
 
+line_sender_buffer_free(buffer);
 line_sender_close(sender);
 ```
 

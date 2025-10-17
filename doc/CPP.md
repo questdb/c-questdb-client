@@ -30,6 +30,10 @@
 - [Array in C-major order](../examples/line_sender_cpp_example_array_c_major.cpp)
 - [Custom array type integration](../examples/line_sender_cpp_example_array_custom.cpp)
 
+**Decimal**
+- [Decimal in binary format](../examples/line_sender_cpp_example_decimal_binary.cpp)
+- [Custom decimal type integration](../examples/line_sender_cpp_example_decimal_custom.cpp)
+
 ## API Overview
 
 ### Header
@@ -76,7 +80,7 @@ questdb::ingress::line_sender_buffer buffer;
 buffer
     .table("trades")
     .symbol("symbol", "ETH-USD")
-    .column("price", 2615.54)
+    .column("price", "2615.54"_decimal)
     .at(timestamp_nanos::now());
 
 // To insert more records, call `buffer.table(..)...` again.

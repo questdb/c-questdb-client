@@ -14,7 +14,7 @@ static bool array_example(std::string_view host, std::string_view port)
     {
         auto sender = questdb::ingress::line_sender::from_conf(
             "tcp::addr=" + std::string{host} + ":" + std::string{port} +
-            ";protocol_version=2;");
+            ";protocol_version=3;");
 
         const auto table_name = "cpp_market_orders_c_major"_tn;
         const auto symbol_col = "symbol"_cn;

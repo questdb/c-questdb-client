@@ -1635,5 +1635,48 @@
         "result": {
             "status": "ERROR"
         }
+    },
+    {
+        "testName": "decimal",
+        "minimumProtocolVersion": 3,
+        "table": "decimals",
+        "symbols": [],
+        "columns": [
+            {
+                "type": "DECIMAL",
+                "name": "zero",
+                "value": "0.0"
+            },
+            {
+                "type": "DECIMAL",
+                "name": "neg_zero",
+                "value": "-0.0"
+            },
+            {
+                "type": "DECIMAL",
+                "name": "one",
+                "value": "1.0"
+            },
+            {
+                "type": "DECIMAL",
+                "name": "large",
+                "value": "99999999999999.999"
+            },
+            {
+                "type": "DECIMAL",
+                "name": "small",
+                "value": "0.001"
+            },
+            {
+                "type": "DECIMAL",
+                "name": "neg_small",
+                "value": "-0.001"
+            }
+        ],
+        "result": {
+            "status": "SUCCESS",
+            "line": "decimals zero=0d,neg_zero=0d,one=1.0d,large=99999999999999.999d,small=0.001d,neg_small=-0.001d",
+            "binaryBase64": "ZGVjaW1hbHMgemVybz09FwEBACxuZWdfemVybz09FwEBACxvbmU9PRcBAQosbGFyZ2U9PRcDCAFjRXhdif//LHNtYWxsPT0XAwEBLG5lZ19zbWFsbD09FwMB/wo="
+        }
     }
 ]

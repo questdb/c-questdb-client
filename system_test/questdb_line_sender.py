@@ -49,6 +49,7 @@ import os
 from datetime import datetime
 from functools import total_ordering
 from enum import Enum
+from decimal import Decimal
 
 from ctypes import (
     c_bool,
@@ -101,6 +102,7 @@ c_protocol_version = ctypes.c_int
 class ProtocolVersion(Enum):
     V1 = (c_protocol_version(1), '1')
     V2 = (c_protocol_version(2), '2')
+    V3 = (c_protocol_version(3), '3')
 
     @classmethod
     def from_int(cls, value: c_protocol_version):
@@ -285,6 +287,13 @@ def _setup_cdll():
         c_line_sender_error_p_p)
     set_sig(
         dll.line_sender_buffer_column_str,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        c_line_sender_utf8,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_dec_str,
         c_bool,
         c_line_sender_buffer_p,
         c_line_sender_column_name,
@@ -704,6 +713,12 @@ class Buffer:
                 self._impl,
                 _column_name(name),
                 _utf8(value))
+        elif isinstance(value, Decimal):
+            _error_wrapped_call(
+                _DLL.line_sender_buffer_column_dec_str,
+                self._impl,
+                _column_name(name),
+                _utf8(str(value)))
         elif isinstance(value, TimestampMicros):
             _error_wrapped_call(
                 _DLL.line_sender_buffer_column_ts_micros,
@@ -727,7 +742,7 @@ class Buffer:
             fqn = _fully_qual_name(value)
             raise ValueError(
                 f'Bad field value of type {fqn}: Expected one of '
-                '`bool`, `int`, `float` or `str`.')
+                '`bool`, `int`, `float`, `str`, `Decimal`, `TimestampMicros`, or `datetime`.')
         return self
 
     def column_f64_arr(self, name: str,
@@ -915,7 +930,7 @@ class Sender:
 
     def column(
             self, name: str,
-            value: Union[bool, int, float, str, TimestampMicros, TimestampNanos, datetime]):
+            value: Union[bool, int, float, str, Decimal, TimestampMicros, TimestampNanos, datetime]):
         self._buffer.column(name, value)
         return self
 

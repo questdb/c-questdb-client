@@ -196,36 +196,39 @@ TEST_CASE("line_sender c api basics")
         2.7,
         48121.5,
         4.3};
-    CHECK(::line_sender_buffer_column_f64_arr_byte_strides(
-        buffer,
-        arr_name,
-        rank,
-        shape,
-        strides,
-        arr_data.data(),
-        arr_data.size(),
-        &err));
+    CHECK(
+        ::line_sender_buffer_column_f64_arr_byte_strides(
+            buffer,
+            arr_name,
+            rank,
+            shape,
+            strides,
+            arr_data.data(),
+            arr_data.size(),
+            &err));
 
     line_sender_column_name arr_name2 = QDB_COLUMN_NAME_LITERAL("a2");
     intptr_t elem_strides[] = {6, 2, 1};
-    CHECK(::line_sender_buffer_column_f64_arr_elem_strides(
-        buffer,
-        arr_name2,
-        rank,
-        shape,
-        elem_strides,
-        arr_data.data(),
-        arr_data.size(),
-        &err));
+    CHECK(
+        ::line_sender_buffer_column_f64_arr_elem_strides(
+            buffer,
+            arr_name2,
+            rank,
+            shape,
+            elem_strides,
+            arr_data.data(),
+            arr_data.size(),
+            &err));
     line_sender_column_name arr_name3 = QDB_COLUMN_NAME_LITERAL("a3");
-    CHECK(::line_sender_buffer_column_f64_arr_c_major(
-        buffer,
-        arr_name3,
-        rank,
-        shape,
-        arr_data.data(),
-        arr_data.size(),
-        &err));
+    CHECK(
+        ::line_sender_buffer_column_f64_arr_c_major(
+            buffer,
+            arr_name3,
+            rank,
+            shape,
+            arr_data.data(),
+            arr_data.size(),
+            &err));
     CHECK(::line_sender_buffer_at_nanos(buffer, 10000000, &err));
     CHECK(server.recv() == 0);
     CHECK(::line_sender_buffer_size(buffer) == 383);
@@ -282,7 +285,7 @@ TEST_CASE("line_sender c++ api basics")
         questdb::ingress::protocol::tcp,
         std::string("127.0.0.1"),
         std::to_string(server.port())};
-    opts.protocol_version(questdb::ingress::protocol_version::v2);
+    opts.protocol_version(questdb::ingress::protocol_version::v3);
     questdb::ingress::line_sender sender{opts};
     CHECK_FALSE(sender.must_close());
     server.accept();
@@ -352,7 +355,7 @@ TEST_CASE("line_sender array vector API")
         questdb::ingress::protocol::tcp,
         std::string("127.0.0.1"),
         std::to_string(server.port())};
-    opts.protocol_version(questdb::ingress::protocol_version::v2);
+    opts.protocol_version(questdb::ingress::protocol_version::v3);
     questdb::ingress::line_sender sender{opts};
     CHECK_FALSE(sender.must_close());
     server.accept();
@@ -396,7 +399,7 @@ TEST_CASE("line_sender array span API")
         questdb::ingress::protocol::tcp,
         std::string("127.0.0.1"),
         std::to_string(server.port())};
-    opts.protocol_version(questdb::ingress::protocol_version::v2);
+    opts.protocol_version(questdb::ingress::protocol_version::v3);
     questdb::ingress::line_sender sender{opts};
     CHECK_FALSE(sender.must_close());
     server.accept();
@@ -443,7 +446,7 @@ TEST_CASE("test multiple lines")
     questdb::ingress::test::mock_server server;
     std::string conf_str =
         "tcp::addr=127.0.0.1:" + std::to_string(server.port()) +
-        ";protocol_version=2;";
+        ";protocol_version=3;";
     questdb::ingress::line_sender sender =
         questdb::ingress::line_sender::from_conf(conf_str);
     CHECK_FALSE(sender.must_close());
@@ -1061,21 +1064,21 @@ TEST_CASE("Moved View")
 TEST_CASE("Empty Buffer")
 {
     questdb::ingress::line_sender_buffer b1{
-        questdb::ingress::protocol_version::v2};
+        questdb::ingress::protocol_version::v3};
     CHECK(b1.size() == 0);
     questdb::ingress::line_sender_buffer b2{std::move(b1)};
     CHECK(b1.size() == 0);
     CHECK(b2.size() == 0);
     questdb::ingress::line_sender_buffer b3{
-        questdb::ingress::protocol_version::v2};
+        questdb::ingress::protocol_version::v3};
     b3 = std::move(b2);
     CHECK(b2.size() == 0);
     CHECK(b3.size() == 0);
     questdb::ingress::line_sender_buffer b4{
-        questdb::ingress::protocol_version::v2};
+        questdb::ingress::protocol_version::v3};
     b4.table("test").symbol("a", "b").at_now();
     questdb::ingress::line_sender_buffer b5{
-        questdb::ingress::protocol_version::v2};
+        questdb::ingress::protocol_version::v3};
     b5 = std::move(b4);
     CHECK(b4.size() == 0);
     CHECK(b5.size() == 9);
@@ -1111,19 +1114,19 @@ TEST_CASE("HTTP basics")
         questdb::ingress::protocol::http, "127.0.0.1", 1};
     questdb::ingress::opts opts1conf = questdb::ingress::opts::from_conf(
         "http::addr=127.0.0.1:1;username=user;password=pass;request_timeout="
-        "5000;retry_timeout=5;protocol_version=2;");
+        "5000;retry_timeout=5;protocol_version=3;");
     questdb::ingress::opts opts2{
         questdb::ingress::protocol::https, "localhost", "1"};
     questdb::ingress::opts opts2conf = questdb::ingress::opts::from_conf(
         "http::addr=127.0.0.1:1;token=token;request_min_throughput=1000;retry_"
-        "timeout=0;protocol_version=2;");
-    opts1.protocol_version(questdb::ingress::protocol_version::v2)
+        "timeout=0;protocol_version=3;");
+    opts1.protocol_version(questdb::ingress::protocol_version::v3)
         .username("user")
         .password("pass")
         .max_buf_size(1000000)
         .request_timeout(5000)
         .retry_timeout(5);
-    opts2.protocol_version(questdb::ingress::protocol_version::v2)
+    opts2.protocol_version(questdb::ingress::protocol_version::v3)
         .token("token")
         .request_min_throughput(1000)
         .retry_timeout(0);
@@ -1180,7 +1183,7 @@ TEST_CASE("line sender protocol version v2")
         questdb::ingress::protocol::tcp,
         std::string("127.0.0.1"),
         std::to_string(server.port())};
-    opts.protocol_version(questdb::ingress::protocol_version::v2);
+    opts.protocol_version(questdb::ingress::protocol_version::v3);
     questdb::ingress::line_sender sender{opts};
     CHECK_FALSE(sender.must_close());
     server.accept();

@@ -21,6 +21,8 @@
  *  limitations under the License.
  *
  ******************************************************************************/
+
+use crate::ingress::decimal::DecimalSerializer;
 use crate::ingress::ndarr::{ArrayElementSealed, check_and_get_array_bytes_size};
 use crate::ingress::{
     ARRAY_BINARY_FORMAT_TYPE, ArrayElement, DOUBLE_BINARY_FORMAT_TYPE, DebugBytes, MAX_ARRAY_DIMS,
@@ -975,6 +977,97 @@ impl Buffer {
         Ok(self)
     }
 
+    /// Record a decimal value for the given column.
+    ///
+    /// ```no_run
+    /// # use questdb::Result;
+    /// # use questdb::ingress::{Buffer, SenderBuilder};
+    /// # fn main() -> Result<()> {
+    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+    /// # let mut buffer = sender.new_buffer();
+    /// # buffer.table("x")?;
+    /// buffer.column_dec("col_name", "123.45")?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// or
+    ///
+    /// ```no_run
+    /// # use questdb::Result;
+    /// # use questdb::ingress::{Buffer, SenderBuilder};
+    /// use questdb::ingress::ColumnName;
+    ///
+    /// # fn main() -> Result<()> {
+    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+    /// # let mut buffer = sender.new_buffer();
+    /// # buffer.table("x")?;
+    /// let col_name = ColumnName::new("col_name")?;
+    /// buffer.column_dec(col_name, "123.45")?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// With `rust_decimal` feature enabled:
+    ///
+    /// ```no_run
+    /// # #[cfg(feature = "rust_decimal")]
+    /// # {
+    /// # use questdb::Result;
+    /// # use questdb::ingress::{Buffer, SenderBuilder};
+    /// use rust_decimal::Decimal;
+    /// use std::str::FromStr;
+    ///
+    /// # fn main() -> Result<()> {
+    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+    /// # let mut buffer = sender.new_buffer();
+    /// # buffer.table("x")?;
+    /// let value = Decimal::from_str("123.45").unwrap();
+    /// buffer.column_dec("col_name", &value)?;
+    /// # Ok(())
+    /// # }
+    /// # }
+    /// ```
+    ///
+    /// With `bigdecimal` feature enabled:
+    ///
+    /// ```no_run
+    /// # #[cfg(feature = "bigdecimal")]
+    /// # {
+    /// # use questdb::Result;
+    /// # use questdb::ingress::{Buffer, SenderBuilder};
+    /// use bigdecimal::BigDecimal;
+    /// use std::str::FromStr;
+    ///
+    /// # fn main() -> Result<()> {
+    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+    /// # let mut buffer = sender.new_buffer();
+    /// # buffer.table("x")?;
+    /// let value = BigDecimal::from_str("0.123456789012345678901234567890").unwrap();
+    /// buffer.column_dec("col_name", &value)?;
+    /// # Ok(())
+    /// # }
+    /// # }
+    /// ```
+    pub fn column_dec<'a, N, S>(&mut self, name: N, value: S) -> crate::Result<&mut Self>
+    where
+        N: TryInto<ColumnName<'a>>,
+        S: DecimalSerializer,
+        Error: From<N::Error>,
+    {
+        if self.protocol_version < ProtocolVersion::V3 {
+            return Err(error::fmt!(
+                ProtocolVersionError,
+                "Protocol version {} does not support the decimal datatype",
+                self.protocol_version
+            ));
+        }
+
+        self.write_column_key(name)?;
+        value.serialize(&mut self.output)?;
+        Ok(self)
+    }
+
     /// Record a multidimensional array value for the given column.
     ///
     /// Supports arrays with up to [`MAX_ARRAY_DIMS`] dimensions. The array elements must
@@ -1030,10 +1123,11 @@ impl Buffer {
         D: ArrayElement + ArrayElementSealed,
         Error: From<N::Error>,
     {
-        if self.protocol_version == ProtocolVersion::V1 {
+        if self.protocol_version < ProtocolVersion::V2 {
             return Err(error::fmt!(
                 ProtocolVersionError,
-                "Protocol version v1 does not support array datatype",
+                "Protocol version {} does not support array datatype",
+                self.protocol_version
             ));
         }
         let ndim = view.ndim();

@@ -63,12 +63,19 @@ pub mod json_tests {
     }
 
     #[derive(Debug, Serialize, Deserialize)]
+    struct DecimalColumn {
+        name: String,
+        value: String,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
     #[serde(tag = "type", rename_all = "UPPERCASE")]
     enum Column {
         String(StringColumn),
         Long(LongColumn),
         Double(DoubleColumn),
         Boolean(BooleanColumn),
+        Decimal(DecimalColumn),
     }
 
     #[derive(Debug, Serialize, Deserialize)]
@@ -88,10 +95,19 @@ pub mod json_tests {
         Error,
     }
 
+    fn default_minimum_protocol_version() -> u32 {
+        1
+    }
+
     #[derive(Debug, Serialize, Deserialize)]
     struct TestSpec {
         #[serde(rename = "testName")]
         test_name: String,
+        #[serde(
+            rename = "minimumProtocolVersion",
+            default = "default_minimum_protocol_version"
+        )]
+        minimum_protocol_version: u32,
         table: String,
         symbols: Vec<Symbol>,
         columns: Vec<Column>,
@@ -126,6 +142,8 @@ pub mod json_tests {
             use base64ct::Base64;
             use base64ct::Encoding;
             use rstest::rstest;
+            use bigdecimal::BigDecimal;
+            use std::str::FromStr;
 
             fn matches_any_line(line: &[u8], expected: &[&str]) -> bool {
                 for &exp in expected {
@@ -133,6 +151,7 @@ pub mod json_tests {
                         return true;
                     }
                 }
+                let line = String::from_utf8_lossy(line);
                 eprintln!("Could not match:\n    {line:?}\nTo any of: {expected:#?}");
                 false
             }
@@ -140,18 +159,24 @@ pub mod json_tests {
         )?;
 
         for (index, spec) in specs.iter().enumerate() {
-            writeln!(output, "/// {}", spec.test_name)?;
-            // for line in serde_json::to_string_pretty(&spec).unwrap().split("\n") {
-            //     writeln!(output, "/// {}", line)?;
-            // }
-            writeln!(output, "#[rstest]")?;
-            writeln!(
+            write!(
                 output,
-                "fn test_{:03}_{}(\n    #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,\n) -> TestResult {{",
+                indoc! {r#"
+            /// {}
+            #[rstest]
+            fn test_{:03}_{}(
+                #[values(ProtocolVersion::V1, ProtocolVersion::V2, ProtocolVersion::V3)] version: ProtocolVersion
+            ) -> TestResult {{
+                if (version as u8) < {} {{
+                    return Ok(());
+                }}
+                let mut buffer = Buffer::new(version);
+            "#},
+                spec.test_name,
                 index,
-                slugify!(&spec.test_name, separator = "_")
+                slugify!(&spec.test_name, separator = "_"),
+                spec.minimum_protocol_version
             )?;
-            writeln!(output, "    let mut buffer = Buffer::new(version);")?;
 
             let (expected, indent) = match &spec.result {
                 Outcome::Success(line) => (Some(line), ""),
@@ -189,6 +214,11 @@ pub mod json_tests {
                     Column::Boolean(column) => writeln!(
                         output,
                         "{}        .column_bool({:?}, {:?})?",
+                        indent, column.name, column.value
+                    )?,
+                    Column::Decimal(column) => writeln!(
+                        output,
+                        "{}        .column_dec({:?}, &BigDecimal::from_str({:?}).unwrap())?",
                         indent, column.name, column.value
                     )?,
                 }

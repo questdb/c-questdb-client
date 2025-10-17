@@ -39,6 +39,8 @@ serde_json = { version = "1", optional = true }
 questdb-confstr = "0.1.1"
 rand = { version = "0.9.0", optional = true }
 ndarray = { version = "0.16", optional = true }
+rust_decimal = { version = "1.38.0", optional = true }
+bigdecimal = { version = "0.4.8", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3.9", features = ["ws2def"] }
@@ -67,7 +69,13 @@ sync-sender = ["sync-sender-tcp", "sync-sender-http"]
 sync-sender-tcp = ["_sync-sender", "_sender-tcp", "dep:socket2"]
 
 ## Sync ILP/HTTP
-sync-sender-http = ["_sync-sender", "_sender-http", "dep:ureq", "dep:serde_json", "dep:rand"]
+sync-sender-http = [
+    "_sync-sender",
+    "_sender-http",
+    "dep:ureq",
+    "dep:serde_json",
+    "dep:rand",
+]
 
 ## Allow use OS-provided root TLS certificates
 tls-native-certs = ["dep:rustls-native-certs"]
@@ -85,10 +93,16 @@ ring-crypto = ["dep:ring", "rustls/ring"]
 insecure-skip-verify = []
 
 ## Enable code-generation in `build.rs` for additional tests.
-json_tests = []
+json_tests = ["bigdecimal"]
 
 ## Enable methods to create timestamp objects from chrono::DateTime objects.
 chrono_timestamp = ["chrono"]
+
+## Enable serialization of rust_decimal::Decimal in ILP
+rust_decimal = ["dep:rust_decimal"]
+
+## Enable serialization of bigdecimal::BigDecimal in ILP
+bigdecimal = ["dep:bigdecimal"]
 
 # Hidden derived features, used in code to enable-disable code sections. Don't use directly.
 _sender-tcp = []
@@ -108,7 +122,9 @@ almost-all-features = [
     "insecure-skip-verify",
     "json_tests",
     "chrono_timestamp",
-    "ndarray"
+    "ndarray",
+    "rust_decimal",
+    "bigdecimal",
 ]
 
 [[example]]
@@ -125,8 +141,8 @@ required-features = ["chrono_timestamp"]
 
 [[example]]
 name = "http"
-required-features = ["sync-sender-http", "ndarray"]
+required-features = ["sync-sender-http", "ndarray", "rust_decimal"]
 
 [[example]]
 name = "protocol_version"
-required-features = ["sync-sender-http", "ndarray"]
+required-features = ["sync-sender-http", "ndarray", "bigdecimal"]

@@ -466,6 +466,7 @@ pub(crate) fn read_server_settings(
                     match v {
                         1 => support_versions.push(ProtocolVersion::V1),
                         2 => support_versions.push(ProtocolVersion::V2),
+                        3 => support_versions.push(ProtocolVersion::V3),
                         _ => {}
                     }
                 }

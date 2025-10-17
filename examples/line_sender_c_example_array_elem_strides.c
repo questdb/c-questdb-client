@@ -13,7 +13,7 @@ static bool example(const char* host, const char* port)
     line_sender* sender = NULL;
     line_sender_buffer* buffer = NULL;
     char* conf_str =
-        concat("tcp::addr=", host, ":", port, ";protocol_version=2;");
+        concat("tcp::addr=", host, ":", port, ";protocol_version=3;");
     if (!conf_str)
     {
         fprintf(stderr, "Could not concatenate configuration string.\n");
@@ -82,6 +82,7 @@ static bool example(const char* host, const char* port)
     if (!line_sender_flush(sender, buffer, &err))
         goto on_error;
 
+    line_sender_buffer_free(buffer);
     line_sender_close(sender);
     return true;
 
