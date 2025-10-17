@@ -95,7 +95,6 @@ impl<'a> DecimalSerializer for Decimal<'a> {
     /// # Arguments
     ///
     /// * `out` - The output buffer to write the serialized decimal to
-    /// * `support_binary` - Whether the protocol version supports binary encoding
     ///
     /// # Errors
     ///

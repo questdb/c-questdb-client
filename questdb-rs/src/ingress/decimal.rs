@@ -75,8 +75,7 @@ pub trait DecimalSerializer {
 
 /// Implementation for string slices containing decimal representations.
 ///
-/// This implementation always uses the text format, regardless of the `support_binary` parameter,
-/// as it cannot parse the string to extract scale and unscaled value needed for binary encoding.
+/// This implementation uses the text format.
 ///
 /// # Format
 /// The string is validated and written as-is, followed by the 'd' suffix. Thousand separators
