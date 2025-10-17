@@ -45,7 +45,7 @@ use crate::fmt_error;
 ///
 /// The binary serialization format is:
 /// ```text
-/// '=' marker (1 byte) + type ID (1 byte) + length (1 byte) + value bytes + scale (1 byte)
+/// '=' marker (1 byte) + type ID (1 byte) + scale (1 byte) + length (1 byte) + value bytes
 /// ```
 ///
 /// # Constraints
