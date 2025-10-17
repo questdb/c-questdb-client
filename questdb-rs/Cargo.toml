@@ -1,10 +1,10 @@
 [package]
 name = "questdb-rs"
 version = "5.1.0"
-edition = "2021"
+edition = "2024"
 license = "Apache-2.0"
 description = "QuestDB Client Library for Rust"
-homepage = "https://questdb.io/"
+homepage = "https://questdb.com/"
 repository = "https://github.com/questdb/c-questdb-client"
 keywords = ["questdb", "ilp", "client-library"]
 categories = ["database"]
@@ -19,29 +19,22 @@ crate-type = ["lib"]
 
 [dependencies]
 libc = "0.2"
-socket2 = { version = "0.5.5", optional = true }
-dns-lookup = "2.0.4"
+socket2 = { version = "0.6.1", optional = true }
+dns-lookup = "3.0.0"
 base64ct = { version = "1.7", features = ["alloc"] }
-rustls-pemfile = "2.0.0"
 ryu = { version = "1.0" }
 itoa = "1.0"
 aws-lc-rs = { version = "1.13", optional = true }
 ring = { version = "0.17.14", optional = true }
-rustls-pki-types = "1.0.1"
-rustls = { version = "0.23.25", default-features = false, features = [
-    "logging",
-    "std",
-    "tls12",
-] }
-rustls-native-certs = { version = "0.8.1", optional = true }
-webpki-roots = { version = "1.0.1", default-features = false, optional = true }
+rustls-pki-types = "1.12.0"
+rustls = { version = "0.23.25", default-features = false, features = ["logging", "std", "tls12"] }
+rustls-native-certs = { version = "0.8.2", optional = true }
+webpki-roots = { version = "1.0.3", default-features = false, optional = true }
 chrono = { version = "0.4.40", optional = true }
 
 # We need to limit the `ureq` version to 3.0.x since we use
 # the `ureq::unversioned` module which does not respect semantic versioning.
-ureq = { version = "3.0.10, <3.1.0", default-features = false, features = [
-    "_tls",
-], optional = true }
+ureq = { version = "3.1.2, <3.2.0", default-features = false, optional = true }
 serde_json = { version = "1", optional = true }
 questdb-confstr = "0.1.1"
 rand = { version = "0.9.0", optional = true }
@@ -59,12 +52,12 @@ slugify = "0.1.0"
 indoc = "2"
 
 [dev-dependencies]
-socket2 = "0.5.5"
+socket2 = "0.6.1"
 mio = { version = "1", features = ["os-poll", "net"] }
 chrono = "0.4.31"
 tempfile = "3"
 webpki-roots = "1.0.1"
-rstest = "0.25.0"
+rstest = "0.26.1"
 
 [features]
 default = ["sync-sender", "tls-webpki-certs", "ring-crypto"]

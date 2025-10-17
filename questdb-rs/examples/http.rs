@@ -2,8 +2,8 @@ use std::str::FromStr;
 
 use ndarray::arr1;
 use questdb::{
-    ingress::{Sender, TimestampNanos},
     Result,
+    ingress::{Sender, TimestampNanos},
 };
 use rust_decimal::Decimal;
 

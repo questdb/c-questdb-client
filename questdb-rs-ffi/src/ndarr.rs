@@ -23,10 +23,10 @@
  ******************************************************************************/
 
 use crate::fmt_error;
-use questdb::ingress::ArrayElement;
-use questdb::ingress::NdArrayView;
-use questdb::ingress::MAX_ARRAY_BUFFER_SIZE;
 use questdb::Error;
+use questdb::ingress::ArrayElement;
+use questdb::ingress::MAX_ARRAY_BUFFER_SIZE;
+use questdb::ingress::NdArrayView;
 use std::mem::size_of;
 use std::slice;
 
@@ -112,18 +112,20 @@ where
         data: *const T,
         len: usize,
     ) -> Result<Self, Error> {
-        let shape = check_array_shape::<T>(D, shape, len)?;
-        let strides = slice::from_raw_parts(strides, D);
-        let mut slice = None;
-        if len != 0 {
-            slice = Some(slice::from_raw_parts(data, len));
+        unsafe {
+            let shape = check_array_shape::<T>(D, shape, len)?;
+            let strides = slice::from_raw_parts(strides, D);
+            let mut slice = None;
+            if len != 0 {
+                slice = Some(slice::from_raw_parts(data, len));
+            }
+            Ok(Self {
+                shape,
+                strides,
+                data: slice,
+                _marker: std::marker::PhantomData::<T>,
+            })
         }
-        Ok(Self {
-            shape,
-            strides,
-            data: slice,
-            _marker: std::marker::PhantomData::<T>,
-        })
     }
 
     /// Verifies if the array follows C-style row-major memory layout.
@@ -329,17 +331,19 @@ where
         data: *const T,
         data_len: usize,
     ) -> Result<Self, Error> {
-        let shape = check_array_shape::<T>(dims, shape, data_len)?;
-        let mut slice = None;
-        if data_len != 0 {
-            slice = Some(slice::from_raw_parts(data, data_len));
+        unsafe {
+            let shape = check_array_shape::<T>(dims, shape, data_len)?;
+            let mut slice = None;
+            if data_len != 0 {
+                slice = Some(slice::from_raw_parts(data, data_len));
+            }
+            Ok(Self {
+                dims,
+                shape,
+                data: slice,
+                _marker: std::marker::PhantomData::<T>,
+            })
         }
-        Ok(Self {
-            dims,
-            shape,
-            data: slice,
-            _marker: std::marker::PhantomData::<T>,
-        })
     }
 }
 
@@ -581,9 +585,10 @@ mod tests {
         };
         let err = result.unwrap_err();
         assert_eq!(err.code(), ErrorCode::ArrayError);
-        assert!(err
-            .msg()
-            .contains("Array element length mismatch (actual: 1, expected: 2)"));
+        assert!(
+            err.msg()
+                .contains("Array element length mismatch (actual: 1, expected: 2)")
+        );
 
         let over_data = [1.1, 2.2, 3.3];
         let result: Result<StrideArrayView<'_, f64, 1, 2>, Error> = unsafe {
@@ -597,9 +602,10 @@ mod tests {
 
         let err = result.unwrap_err();
         assert_eq!(err.code(), ErrorCode::ArrayError);
-        assert!(err
-            .msg()
-            .contains("Array element length mismatch (actual: 3, expected: 2)"));
+        assert!(
+            err.msg()
+                .contains("Array element length mismatch (actual: 3, expected: 2)")
+        );
         Ok(())
     }
 
@@ -617,9 +623,10 @@ mod tests {
         };
         let err = result.unwrap_err();
         assert_eq!(err.code(), ErrorCode::ArrayError);
-        assert!(err
-            .msg()
-            .contains("Array element length mismatch (actual: 1, expected: 2)"));
+        assert!(
+            err.msg()
+                .contains("Array element length mismatch (actual: 1, expected: 2)")
+        );
 
         let over_data = [1.1, 2.2, 3.3];
         let result: Result<StrideArrayView<'_, f64, 1, 2>, Error> = unsafe {
@@ -633,9 +640,10 @@ mod tests {
 
         let err = result.unwrap_err();
         assert_eq!(err.code(), ErrorCode::ArrayError);
-        assert!(err
-            .msg()
-            .contains("Array element length mismatch (actual: 3, expected: 2)"));
+        assert!(
+            err.msg()
+                .contains("Array element length mismatch (actual: 3, expected: 2)")
+        );
         Ok(())
     }
 

@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-use crate::{error, Result};
+use crate::{Result, error};
 
 /// Trait for types that can be serialized as decimal values in the InfluxDB Line Protocol (ILP).
 ///

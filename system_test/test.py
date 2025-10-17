@@ -122,16 +122,18 @@ class TestSender(unittest.TestCase):
     
     @property
     def client_driven_nanos_supported(self) -> bool:
-        """True if the QuestDB server supports nanos and also respects the client's precision for the designated timestamp."""
-        if QDB_FIXTURE.version <= (9, 1, 0):
-            return False
+        return False
+        ### Re-enable once https://github.com/questdb/questdb/pull/6220 is merged.
+        # """True if the QuestDB server supports nanos and also respects the client's precision for the designated timestamp."""
+        # if QDB_FIXTURE.version <= (9, 1, 0):
+        #     return False
 
-        if QDB_FIXTURE.http:
-            return QDB_FIXTURE.protocol_version != qls.ProtocolVersion.V1
-        elif QDB_FIXTURE.protocol_version is None:
-            return False # TCP defaults to ProtocolVersion.V1
-        else:
-            return QDB_FIXTURE.protocol_version >= qls.ProtocolVersion.V2
+        # if QDB_FIXTURE.http:
+        #     return QDB_FIXTURE.protocol_version != qls.ProtocolVersion.V1
+        # elif QDB_FIXTURE.protocol_version is None:
+        #     return False # TCP defaults to ProtocolVersion.V1
+        # else:
+        #     return QDB_FIXTURE.protocol_version >= qls.ProtocolVersion.V2
 
     @property
     def expected_protocol_version(self) -> qls.ProtocolVersion:

@@ -177,11 +177,11 @@ impl<T: ArrayElement> NdArrayView<T> for Vec<T> {
             Ok(self.len())
         } else {
             Err(error::fmt!(
-                    ArrayError,
-                    "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
-                    idx,
-                    1
-                ))
+                ArrayError,
+                "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
+                idx,
+                1
+            ))
         }
     }
 
@@ -210,11 +210,11 @@ impl<T: ArrayElement, const N: usize> NdArrayView<T> for [T; N] {
             Ok(N)
         } else {
             Err(error::fmt!(
-                    ArrayError,
-                    "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
-                    idx,
-                    1
-                ))
+                ArrayError,
+                "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
+                idx,
+                1
+            ))
         }
     }
 
@@ -244,11 +244,11 @@ impl<T: ArrayElement> NdArrayView<T> for &[T] {
             Ok(self.len())
         } else {
             Err(error::fmt!(
-                    ArrayError,
-                    "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
-                    idx,
-                    1
-                ))
+                ArrayError,
+                "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
+                idx,
+                1
+            ))
         }
     }
 
@@ -283,11 +283,11 @@ impl<T: ArrayElement> NdArrayView<T> for Vec<Vec<T>> {
                 Ok(dim1)
             }
             _ => Err(error::fmt!(
-                    ArrayError,
-                    "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
-                    idx,
-                    2
-                )),
+                ArrayError,
+                "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
+                idx,
+                2
+            )),
         }
     }
 
@@ -316,11 +316,11 @@ impl<T: ArrayElement, const M: usize, const N: usize> NdArrayView<T> for [[T; M]
             0 => Ok(N),
             1 => Ok(M),
             _ => Err(error::fmt!(
-                    ArrayError,
-                    "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
-                    idx,
-                    2
-                )),
+                ArrayError,
+                "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
+                idx,
+                2
+            )),
         }
     }
 
@@ -350,11 +350,11 @@ impl<T: ArrayElement, const M: usize> NdArrayView<T> for &[[T; M]] {
             0 => Ok(self.len()),
             1 => Ok(M),
             _ => Err(error::fmt!(
-                    ArrayError,
-                    "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
-                    idx,
-                    2
-                )),
+                ArrayError,
+                "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
+                idx,
+                2
+            )),
         }
     }
 
@@ -405,11 +405,11 @@ impl<T: ArrayElement> NdArrayView<T> for Vec<Vec<Vec<T>>> {
                 Ok(dim2)
             }
             _ => Err(error::fmt!(
-                    ArrayError,
-                    "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
-                    idx,
-                    3
-                )),
+                ArrayError,
+                "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
+                idx,
+                3
+            )),
         }
     }
 
@@ -441,11 +441,11 @@ impl<T: ArrayElement, const M: usize, const N: usize, const L: usize> NdArrayVie
             1 => Ok(N),
             2 => Ok(M),
             _ => Err(error::fmt!(
-                    ArrayError,
-                    "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
-                    idx,
-                    3
-                )),
+                ArrayError,
+                "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
+                idx,
+                3
+            )),
         }
     }
 
@@ -475,11 +475,11 @@ impl<T: ArrayElement, const M: usize, const N: usize> NdArrayView<T> for &[[[T; 
             1 => Ok(N),
             2 => Ok(M),
             _ => Err(error::fmt!(
-                    ArrayError,
-                    "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
-                    idx,
-                    3
-                )),
+                ArrayError,
+                "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
+                idx,
+                3
+            )),
         }
     }
 
@@ -492,7 +492,7 @@ impl<T: ArrayElement, const M: usize, const N: usize> NdArrayView<T> for &[[[T; 
     }
 }
 
-use crate::{error, Error};
+use crate::{Error, error};
 #[cfg(feature = "ndarray")]
 use ndarray::{ArrayView, Axis, Dimension};
 use std::slice;
@@ -521,11 +521,11 @@ where
             Ok(self.len_of(Axis(index)))
         } else {
             Err(error::fmt!(
-                    ArrayError,
-                    "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
-                    index,
-                    3
-                ))
+                ArrayError,
+                "Dimension index out of bounds. Requested axis {}, but array only has {} dimension(s)",
+                index,
+                3
+            ))
         }
     }
 

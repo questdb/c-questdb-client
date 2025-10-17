@@ -22,9 +22,9 @@
  *
  ******************************************************************************/
 
-use crate::ingress::{Buffer, DecimalSerializer, ProtocolVersion};
-use crate::tests::{assert_err_contains, TestResult};
 use crate::ErrorCode;
+use crate::ingress::{Buffer, DecimalSerializer, ProtocolVersion};
+use crate::tests::{TestResult, assert_err_contains};
 use rstest::rstest;
 
 // Helper function to serialize a decimal value and return the bytes
@@ -456,7 +456,7 @@ mod bigdecimal_tests {
         assert_err_contains(
             result,
             ErrorCode::InvalidDecimal,
-            "does not support values greater",
+            "does not support decimal scale greater than 76",
         );
         Ok(())
     }

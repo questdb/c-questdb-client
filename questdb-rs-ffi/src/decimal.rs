@@ -29,8 +29,8 @@
 //! encoded in a binary format for transmission over the InfluxDB Line Protocol (ILP).
 
 use questdb::{
-    ingress::{DecimalSerializer, DECIMAL_BINARY_FORMAT_TYPE},
     Result,
+    ingress::{DECIMAL_BINARY_FORMAT_TYPE, DecimalSerializer},
 };
 
 use crate::fmt_error;

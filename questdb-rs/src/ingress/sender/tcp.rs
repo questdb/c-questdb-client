@@ -24,8 +24,8 @@
 
 use crate::error;
 use crate::gai;
-use crate::ingress::tls::{configure_tls, TlsSettings};
-use crate::ingress::{conf, map_io_to_socket_err, parse_key_pair, SyncProtocolHandler};
+use crate::ingress::tls::{TlsSettings, configure_tls};
+use crate::ingress::{SyncProtocolHandler, conf, map_io_to_socket_err, parse_key_pair};
 use rustls::{ClientConnection, StreamOwned};
 use rustls_pki_types::ServerName;
 use socket2::{Domain, Protocol as SockProtocol, SockAddr, Socket, Type};
@@ -143,6 +143,7 @@ impl IoWrite for SyncConnection {
 // We also set SO_LINGER to 120, but that is not enough apparently.
 impl Drop for SyncProtocolHandler {
     fn drop(&mut self) {
+        #[allow(irrefutable_let_patterns)] // HTTP feature might be disabled.
         if let SyncProtocolHandler::SyncTcp(conn) = self {
             match conn {
                 SyncConnection::Direct(sock) => {
@@ -178,7 +179,7 @@ pub(crate) fn connect_tcp(
         .map_err(|io_err| map_io_to_socket_err("Could not set socket linger: ", io_err))?;
     sock.set_keepalive(true)
         .map_err(|io_err| map_io_to_socket_err("Could not set SO_KEEPALIVE: ", io_err))?;
-    sock.set_nodelay(true)
+    sock.set_tcp_nodelay(true)
         .map_err(|io_err| map_io_to_socket_err("Could not set TCP_NODELAY: ", io_err))?;
     if let Some(host) = net_interface {
         let bind_addr = gai::resolve_host(host)?;
