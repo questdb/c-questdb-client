@@ -793,7 +793,7 @@ fn test_sender_auto_protocol_version_unsupported_client() -> TestResult {
     assert_err_contains(
         sender_builder.build(),
         ErrorCode::ProtocolVersionError,
-        "Server does not support current client",
+        "Server does not support any of the client protocol versions",
     );
 
     // We keep the server around til the end of the test to ensure that the response is fully received.
