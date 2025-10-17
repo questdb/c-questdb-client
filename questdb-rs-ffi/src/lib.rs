@@ -1044,9 +1044,14 @@ pub unsafe extern "C" fn line_sender_buffer_column_dec(
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     unsafe {
+        let data = if data.is_null() {
+            &[]
+        } else {
+            slice::from_raw_parts(data, data_len)
+        };
         let buffer = unwrap_buffer_mut(buffer);
         let name = name.as_name();
-        let decimal = Decimal::new(scale, slice::from_raw_parts(data, data_len));
+        let decimal = Decimal::new(scale, data);
         bubble_err_to_c!(err_out, buffer.column_dec(name, decimal));
     }
     true
