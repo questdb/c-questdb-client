@@ -105,24 +105,6 @@ const SUPPORTED_PROTOCOL_VERSIONS: [ProtocolVersion; 3] = [
     ProtocolVersion::V1,
 ];
 
-impl ProtocolVersion {
-    /// Returns `true` if this protocol version supports the given protocol version.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use questdb::ingress::ProtocolVersion;
-    ///
-    /// assert_eq!(ProtocolVersion::V1.supports(ProtocolVersion::V2), false);
-    /// assert_eq!(ProtocolVersion::V2.supports(ProtocolVersion::V1), true);
-    /// ```
-    #[inline]
-    pub fn supports(self, version: ProtocolVersion) -> bool {
-        // Protocol versions are backward compatible
-        self as u32 >= version as u32
-    }
-}
-
 impl Display for ProtocolVersion {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
