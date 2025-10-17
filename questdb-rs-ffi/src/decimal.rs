@@ -107,7 +107,7 @@ impl<'a> DecimalSerializer for Decimal<'a> {
         if self.scale > 76 {
             return Err(fmt_error!(
                 InvalidDecimal,
-                "QuestDB ILP does not support scale greater than 76, got {}",
+                "QuestDB ILP does not support decimal scale greater than 76, got {}",
                 self.scale
             ));
         }
@@ -121,7 +121,7 @@ impl<'a> DecimalSerializer for Decimal<'a> {
         if self.value.len() > i8::MAX as usize {
             return Err(fmt_error!(
                 InvalidDecimal,
-                "QuestDB ILP does not support values greater than {} bytes, got {}",
+                "QuestDB ILP does not support decimal longer than {} bytes, got {}",
                 i8::MAX,
                 self.value.len()
             ));
