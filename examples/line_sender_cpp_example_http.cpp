@@ -53,11 +53,12 @@ static bool displayed_help(int argc, const char* argv[])
         const std::string_view arg{argv[index]};
         if ((arg == "-h"sv) || (arg == "--help"sv))
         {
-            std::cerr << "Usage:\n"
-                      << "line_sender_c_example: [HOST [PORT]]\n"
-                      << "    HOST: ILP host (defaults to \"localhost\").\n"
-                      << "    PORT: ILP port (defaults to \"9009\")."
-                      << std::endl;
+            std::cerr
+                << "Usage:\n"
+                << "  " << argv[0] << ": [HOST [PORT]]\n"
+                << "    HOST: ILP/HTTP host (defaults to \"localhost\").\n"
+                << "    PORT: ILP/HTTP port (defaults to \"9000\")."
+                << std::endl;
             return true;
         }
     }
@@ -72,7 +73,7 @@ int main(int argc, const char* argv[])
     auto host = "localhost"sv;
     if (argc >= 2)
         host = std::string_view{argv[1]};
-    auto port = "9009"sv;
+    auto port = "9000"sv;
     if (argc >= 3)
         port = std::string_view{argv[2]};
 

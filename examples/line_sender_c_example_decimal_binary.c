@@ -9,8 +9,7 @@ static bool example(const char* host, const char* port)
     line_sender_error* err = NULL;
     line_sender* sender = NULL;
     line_sender_buffer* buffer = NULL;
-    char* conf_str =
-        concat("tcp::addr=", host, ":", port, ";protocol_version=3;");
+    char* conf_str = concat("http::addr=", host, ":", port, ";");
     if (!conf_str)
     {
         fprintf(stderr, "Could not concatenate configuration string.\n");
@@ -34,7 +33,8 @@ static bool example(const char* host, const char* port)
     // We prepare all our table names and column names in advance.
     // If we're inserting multiple rows, this allows us to avoid
     // re-validating the same strings over and over again.
-    line_sender_table_name table_name = QDB_TABLE_NAME_LITERAL("c_trades");
+    line_sender_table_name table_name =
+        QDB_TABLE_NAME_LITERAL("c_trades_decimal");
     line_sender_column_name symbol_name = QDB_COLUMN_NAME_LITERAL("symbol");
     line_sender_column_name side_name = QDB_COLUMN_NAME_LITERAL("side");
     line_sender_column_name price_name = QDB_COLUMN_NAME_LITERAL("price");
@@ -103,8 +103,10 @@ static bool displayed_help(int argc, const char* argv[])
                 stderr,
                 "line_sender_c_example_decimal_binary: [HOST [PORT]]\n");
             fprintf(
-                stderr, "    HOST: ILP host (defaults to \"localhost\").\n");
-            fprintf(stderr, "    PORT: ILP port (defaults to \"9009\").\n");
+                stderr,
+                "    HOST: ILP/HTTP host (defaults to \"localhost\").\n");
+            fprintf(
+                stderr, "    PORT: ILP/HTTP port (defaults to \"9000\").\n");
             return true;
         }
     }
@@ -119,7 +121,7 @@ int main(int argc, const char* argv[])
     const char* host = "localhost";
     if (argc >= 2)
         host = argv[1];
-    const char* port = "9009";
+    const char* port = "9000";
     if (argc >= 3)
         port = argv[2];
 

@@ -64,13 +64,12 @@ static bool example(std::string_view host, std::string_view port)
     try
     {
         auto sender = questdb::ingress::line_sender::from_conf(
-            "tcp::addr=" + std::string{host} + ":" + std::string{port} +
-            ";protocol_version=3;");
+            "http::addr=" + std::string{host} + ":" + std::string{port} + ";");
 
         // We prepare all our table names and column names in advance.
         // If we're inserting multiple rows, this allows us to avoid
         // re-validating the same strings over and over again.
-        const auto table_name = "cpp_trades"_tn;
+        const auto table_name = "cpp_trades_decimal"_tn;
         const auto symbol_name = "symbol"_cn;
         const auto side_name = "side"_cn;
         const auto price_name = "price"_cn;
@@ -114,7 +113,7 @@ static bool displayed_help(int argc, const char* argv[])
             std::cerr << "Usage:\n"
                       << "  " << argv[0] << ": [HOST [PORT]]\n"
                       << "    HOST: ILP host (defaults to \"localhost\").\n"
-                      << "    PORT: ILP port (defaults to \"9009\")."
+                      << "    PORT: ILP port (defaults to \"9000\")."
                       << std::endl;
             return true;
         }
@@ -130,7 +129,7 @@ int main(int argc, const char* argv[])
     auto host = "localhost"sv;
     if (argc >= 2)
         host = std::string_view{argv[1]};
-    auto port = "9009"sv;
+    auto port = "9000"sv;
     if (argc >= 3)
         port = std::string_view{argv[2]};
 
