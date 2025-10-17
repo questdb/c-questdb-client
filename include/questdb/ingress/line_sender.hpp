@@ -458,26 +458,26 @@ namespace decimal
  * Use this to send decimal values as strings (e.g., "123.456").
  * The string will be parsed by the QuestDB server as a decimal column type.
  */
-class text_view
+class decimal_str_view
 {
 public:
-    text_view(const char* buf, size_t len)
+    decimal_str_view(const char* buf, size_t len)
         : _view{buf, len}
     {
     }
 
     template <size_t N>
-    text_view(const char (&buf)[N])
+    decimal_str_view(const char (&buf)[N])
         : _view{buf}
     {
     }
 
-    text_view(std::string_view s_view)
+    decimal_str_view(std::string_view s_view)
         : _view{s_view}
     {
     }
 
-    text_view(const std::string& s)
+    decimal_str_view(const std::string& s)
         : _view{s}
     {
     }
@@ -494,16 +494,16 @@ private:
 };
 
 /**
- * Literal suffix to construct `text_view` objects from string literals.
+ * Literal suffix to construct `decimal_str_view` objects from string literals.
  *
  * @code {.cpp}
  * using namespace questdb::ingress::decimal;
  * buffer.column("price"_cn, "123.456"_decimal);
  * @endcode
  */
-inline text_view operator"" _decimal(const char* buf, size_t len)
+inline decimal_str_view operator"" _decimal(const char* buf, size_t len)
 {
-    return text_view{buf, len};
+    return decimal_str_view{buf, len};
 }
 
 /**
@@ -523,7 +523,7 @@ inline text_view operator"" _decimal(const char* buf, size_t len)
  * ```c++
  * // Represent 123.45 with scale 2 (unscaled value is 12345)
  * uint8_t mantissa[] = {0x30, 0x39};  // 12345 in two's complement big-endian
- * auto decimal = questdb::ingress::decimal::binary_view(2, mantissa,
+ * auto decimal = questdb::ingress::decimal::decimal_view(2, mantissa,
  * sizeof(mantissa)); buffer.column("price"_cn, decimal);
  * ```
  *
@@ -532,7 +532,7 @@ inline text_view operator"" _decimal(const char* buf, size_t len)
  * - Maximum scale: 76 (QuestDB server limitation)
  * - Maximum mantissa size: 127 bytes (protocol limitation)
  */
-class binary_view
+class decimal_view
 {
 public:
     /**
@@ -543,7 +543,7 @@ public:
      * format
      * @param data_size Number of bytes in the mantissa (must be ≤ 127)
      */
-    binary_view(uint32_t scale, const uint8_t* data, size_t data_size)
+    decimal_view(uint32_t scale, const uint8_t* data, size_t data_size)
         : _scale{scale}
         , _data{data}
         , _data_size{data_size}
@@ -557,7 +557,7 @@ public:
      * @param data Fixed-size array containing the unscaled value
      */
     template <std::size_t N>
-    binary_view(uint32_t scale, const uint8_t (&data)[N])
+    decimal_view(uint32_t scale, const uint8_t (&data)[N])
         : _scale{scale}
         , _data{data}
         , _data_size{N}
@@ -571,7 +571,7 @@ public:
      * @param data std::array containing the unscaled value
      */
     template <std::size_t N>
-    binary_view(uint32_t scale, const std::array<uint8_t, N>& data)
+    decimal_view(uint32_t scale, const std::array<uint8_t, N>& data)
         : _scale{scale}
         , _data{data.data()}
         , _data_size{N}
@@ -584,7 +584,7 @@ public:
      * @param scale Number of decimal places (must be ≤ 76)
      * @param vec Vector containing the unscaled value
      */
-    binary_view(uint32_t scale, const std::vector<uint8_t>& vec)
+    decimal_view(uint32_t scale, const std::vector<uint8_t>& vec)
         : _scale{scale}
         , _data{vec.data()}
         , _data_size{vec.size()}
@@ -598,7 +598,7 @@ public:
      * @param scale Number of decimal places (must be ≤ 76)
      * @param span Span containing the unscaled value
      */
-    binary_view(uint32_t scale, const std::span<uint8_t>& span)
+    decimal_view(uint32_t scale, const std::span<uint8_t>& span)
         : _scale{scale}
         , _data{span.data()}
         , _data_size{span.size()}
@@ -626,7 +626,7 @@ public:
 
     /** Get a const reference to this view (for customization point
      * compatibility). */
-    const binary_view& view() const
+    const decimal_view& view() const
     {
         return *this;
     }
@@ -646,8 +646,8 @@ private:
  * - The `questdb::ingress::decimal` namespace
  *
  * The function can either:
- * - Return a `binary_view` object directly, or
- * - Return an object with a `.view()` method that returns `const binary_view&`
+ * - Return a `decimal_view` object directly, or
+ * - Return an object with a `.view()` method that returns `const decimal_view&`
  *   (useful if you need to store temporary data like shape/strides on the
 stack)
  */
@@ -1091,14 +1091,15 @@ public:
      * the QuestDB server.
      *
      * For better performance and precision control, consider using the binary
-     * format via `decimal::binary_view` instead.
+     * format via `decimal::decimal_view` instead.
      *
      * QuestDB server version 9.2.0 or later is required for decimal support.
      *
      * @param name  Column name.
      * @param value Decimal value as a validated UTF-8 string.
      */
-    line_sender_buffer& column(column_name_view name, decimal::text_view value)
+    line_sender_buffer& column(
+        column_name_view name, decimal::decimal_str_view value)
     {
         may_init();
         line_sender_error::wrapped_call(
@@ -1127,7 +1128,7 @@ public:
      * @param decimal Binary decimal view with scale and mantissa bytes.
      */
     line_sender_buffer& column(
-        column_name_view name, const decimal::binary_view& decimal)
+        column_name_view name, const decimal::decimal_view& decimal)
     {
         may_init();
         line_sender_error::wrapped_call(
@@ -1156,13 +1157,13 @@ public:
      * - The `questdb::ingress::decimal` namespace
      *
      * The function should return either:
-     * - A `decimal::binary_view` directly, or
+     * - A `decimal::decimal_view` directly, or
      * - An object with a `.view()` method returning `const
-     * decimal::binary_view&`
+     * decimal::decimal_view&`
      *
      * Include your customization point before including `line_sender.hpp`.
      *
-     * @tparam ToDecimalViewT Type convertible to decimal::binary_view.
+     * @tparam ToDecimalViewT Type convertible to decimal::decimal_view.
      * @param name            Column name.
      * @param decimal         Custom decimal value.
      */

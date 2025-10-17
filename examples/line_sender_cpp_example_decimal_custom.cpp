@@ -9,7 +9,7 @@ struct ViewHolder
 {
     std::array<uint8_t, sizeof(uint32_t)> data;
     uint32_t scale;
-    questdb::ingress::decimal::binary_view view() const
+    questdb::ingress::decimal::decimal_view view() const
     {
         return {scale, data};
     }
