@@ -34,11 +34,6 @@ use std::borrow::Cow;
 ///
 /// Example: `"123.45d"` or `"1.5e-3d"`
 ///
-/// Implementers must:
-/// - Write the decimal's text representation to the output buffer
-/// - Append the `'d'` suffix
-/// - Ensure no ILP reserved characters are present (space, comma, equals, newline, carriage return, backslash)
-///
 /// ### Binary Format
 /// A more compact binary encoding consisting of:
 ///
@@ -72,6 +67,14 @@ pub enum DecimalView<'a> {
 }
 
 impl<'a> DecimalView<'a> {
+    /// Creates a [`DecimalView::Scaled`] from a mantissa buffer and scale.
+    ///
+    /// Validates that:
+    /// - `scale` does not exceed the QuestDB maximum of 76 decimal places.
+    /// - The mantissa fits into at most 127 bytes (ILP binary limit).
+    ///
+    /// Returns an [`error::ErrorCode::InvalidDecimal`](crate::error::ErrorCode::InvalidDecimal)
+    /// error if either constraint is violated.
     pub fn try_new_scaled<T>(scale: u32, value: T) -> Result<Self>
     where
         T: Into<Cow<'a, [u8]>>,
@@ -98,23 +101,50 @@ impl<'a> DecimalView<'a> {
         })
     }
 
+    /// Creates a [`DecimalView::String`] from a textual decimal representation.
+    ///
+    /// Thousand separators (commas) are not allowed and the decimal point must be a dot (`.`).
+    ///
+    /// Performs lightweight validation and rejects values containing ILP-reserved characters.
+    /// Accepts plain decimals, optional `+/-` prefixes, `NaN`, `Inf[inity]`, and scientific
+    /// notation (`e`/`E`).
+    ///
+    /// Returns [`error::ErrorCode::InvalidDecimal`](crate::error::ErrorCode::InvalidDecimal)
+    /// if disallowed characters are encountered.
     pub fn try_new_string(value: &'a str) -> Result<Self> {
-        // Basic validation: ensure no ILP reserved characters are present
-        for b in value.bytes() {
+        // Basic validation: ensure only numerical characters are present (accepts NaN, Inf[inity], and e-notation)
+        for b in value.chars() {
             match b {
-                b' ' | b',' | b'=' | b'\n' | b'\r' | b'\\' => {
+                '0'..='9'
+                | '.'
+                | '-'
+                | '+'
+                | 'e'
+                | 'E'
+                | 'N'
+                | 'a'
+                | 'I'
+                | 'n'
+                | 'f'
+                | 'i'
+                | 't'
+                | 'y' => {}
+                _ => {
                     return Err(error::fmt!(
                         InvalidDecimal,
                         "Decimal string contains ILP reserved character {:?}",
                         b as char
                     ));
                 }
-                _ => {}
             }
         }
         Ok(DecimalView::String { value })
     }
 
+    /// Serializes the decimal view into the provided output buffer using the ILP encoding.
+    ///
+    /// Delegates to [`serialize_string`] for textual representations and [`serialize_scaled`] for
+    /// the compact binary format.
     pub(crate) fn serialize(&self, out: &mut Vec<u8>) {
         match self {
             DecimalView::String { value } => Self::serialize_string(value, out),
@@ -124,6 +154,7 @@ impl<'a> DecimalView<'a> {
         }
     }
 
+    /// Serializes a textual decimal by copying the string and appending the `d` suffix.
     fn serialize_string(value: &str, out: &mut Vec<u8>) {
         // Pre-allocate space for the string content plus the 'd' suffix
         out.reserve(value.len() + 1);
@@ -134,6 +165,8 @@ impl<'a> DecimalView<'a> {
         out.push(b'd');
     }
 
+    /// Serializes a scaled decimal into the binary ILP format, writing the marker, type tag,
+    /// scale, mantissa length, and mantissa bytes.
     fn serialize_scaled(scale: u8, value: &[u8], out: &mut Vec<u8>) {
         // Write binary format: '=' marker + type + scale + length + mantissa bytes
         out.push(b'=');
@@ -154,7 +187,7 @@ impl<'a> DecimalView<'a> {
 ///
 /// # Validation
 /// The implementation performs **partial validation only**:
-/// - Rejects non-numerical characters (not -/+, 0-9, a-z/A-Z, .)
+/// - Rejects non-numerical characters (not -/+, 0-9, ., Inf, NaN, e/E)
 /// - Does NOT validate the actual decimal syntax (e.g., "e2e" would pass)
 ///
 /// This is intentional: full parsing would add overhead. The QuestDB server performs complete

@@ -62,6 +62,30 @@ fn test_str_zero() -> TestResult {
 }
 
 #[test]
+fn test_str_nan() -> TestResult {
+    let decimal = DecimalView::try_new_string("NaN")?;
+    let result = serialize_decimal(decimal);
+    assert_eq!(result, b"NaNd");
+    Ok(())
+}
+
+#[test]
+fn test_str_inf() -> TestResult {
+    let decimal = DecimalView::try_new_string("Infinity")?;
+    let result = serialize_decimal(decimal);
+    assert_eq!(result, b"Infinityd");
+    Ok(())
+}
+
+#[test]
+fn test_str_negative_infinity() -> TestResult {
+    let decimal = DecimalView::try_new_string("-Infinity")?;
+    let result = serialize_decimal(decimal);
+    assert_eq!(result, b"-Infinityd");
+    Ok(())
+}
+
+#[test]
 fn test_str_scientific_notation() -> TestResult {
     let decimal = DecimalView::try_new_string("1.5e-3")?;
     let result = serialize_decimal(decimal);
