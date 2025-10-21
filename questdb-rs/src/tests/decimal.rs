@@ -23,15 +23,14 @@
  ******************************************************************************/
 
 use crate::ErrorCode;
-use crate::ingress::{Buffer, DecimalSerializer, ProtocolVersion};
+use crate::ingress::{Buffer, DecimalView, ProtocolVersion};
 use crate::tests::{TestResult, assert_err_contains};
 use rstest::rstest;
 
-// Helper function to serialize a decimal value and return the bytes
-fn serialize_decimal<D: DecimalSerializer>(value: D) -> crate::Result<Vec<u8>> {
+fn serialize_decimal(decimal: DecimalView) -> Vec<u8> {
     let mut out = Vec::new();
-    value.serialize(&mut out)?;
-    Ok(out)
+    decimal.serialize(&mut out);
+    out
 }
 
 // ============================================================================
@@ -40,78 +39,84 @@ fn serialize_decimal<D: DecimalSerializer>(value: D) -> crate::Result<Vec<u8>> {
 
 #[test]
 fn test_str_positive_decimal() -> TestResult {
-    let result = serialize_decimal("123.45")?;
+    let decimal = DecimalView::try_new_string("123.45")?;
+    let result = serialize_decimal(decimal);
     assert_eq!(result, b"123.45d");
     Ok(())
 }
 
 #[test]
 fn test_str_negative_decimal() -> TestResult {
-    let result = serialize_decimal("-123.45")?;
+    let decimal = DecimalView::try_new_string("-123.45")?;
+    let result = serialize_decimal(decimal);
     assert_eq!(result, b"-123.45d");
     Ok(())
 }
 
 #[test]
 fn test_str_zero() -> TestResult {
-    let result = serialize_decimal("0")?;
+    let decimal = DecimalView::try_new_string("0")?;
+    let result = serialize_decimal(decimal);
     assert_eq!(result, b"0d");
     Ok(())
 }
 
 #[test]
 fn test_str_scientific_notation() -> TestResult {
-    let result = serialize_decimal("1.5e-3")?;
+    let decimal = DecimalView::try_new_string("1.5e-3")?;
+    let result = serialize_decimal(decimal);
     assert_eq!(result, b"1.5e-3d");
     Ok(())
 }
 
 #[test]
 fn test_str_large_decimal() -> TestResult {
-    let result = serialize_decimal("999999999999999999.123456789")?;
+    let decimal = DecimalView::try_new_string("999999999999999999.123456789")?;
+    let result = serialize_decimal(decimal);
     assert_eq!(result, b"999999999999999999.123456789d");
     Ok(())
 }
 
 #[test]
 fn test_str_with_leading_zero() -> TestResult {
-    let result = serialize_decimal("0.001")?;
+    let decimal = DecimalView::try_new_string("0.001")?;
+    let result = serialize_decimal(decimal);
     assert_eq!(result, b"0.001d");
     Ok(())
 }
 
 #[test]
 fn test_str_rejects_space() -> TestResult {
-    let result = serialize_decimal("12 3.45");
-    assert_err_contains(result, ErrorCode::InvalidDecimal, "Invalid character");
+    let result = DecimalView::try_new_string("12 3.45");
+    assert_err_contains(result, ErrorCode::InvalidDecimal, "reserved character");
     Ok(())
 }
 
 #[test]
 fn test_str_rejects_comma() -> TestResult {
-    let result = serialize_decimal("1,234.56");
-    assert_err_contains(result, ErrorCode::InvalidDecimal, "Invalid character");
+    let result = DecimalView::try_new_string("1,234.56");
+    assert_err_contains(result, ErrorCode::InvalidDecimal, "reserved character");
     Ok(())
 }
 
 #[test]
 fn test_str_rejects_equals() -> TestResult {
-    let result = serialize_decimal("123=45");
-    assert_err_contains(result, ErrorCode::InvalidDecimal, "Invalid character");
+    let result = DecimalView::try_new_string("123=45");
+    assert_err_contains(result, ErrorCode::InvalidDecimal, "reserved character");
     Ok(())
 }
 
 #[test]
 fn test_str_rejects_newline() -> TestResult {
-    let result = serialize_decimal("123\n45");
-    assert_err_contains(result, ErrorCode::InvalidDecimal, "Invalid character");
+    let result = DecimalView::try_new_string("123\n45");
+    assert_err_contains(result, ErrorCode::InvalidDecimal, "reserved character");
     Ok(())
 }
 
 #[test]
 fn test_str_rejects_backslash() -> TestResult {
-    let result = serialize_decimal("123\\45");
-    assert_err_contains(result, ErrorCode::InvalidDecimal, "Invalid character");
+    let result = DecimalView::try_new_string("123\\45");
+    assert_err_contains(result, ErrorCode::InvalidDecimal, "reserved character");
     Ok(())
 }
 
@@ -168,13 +173,16 @@ fn parse_binary_decimal(bytes: &[u8]) -> (u8, i128) {
 #[cfg(feature = "rust_decimal")]
 mod rust_decimal_tests {
     use super::*;
+    use crate::ingress::DecimalView;
     use rust_decimal::Decimal;
+    use std::convert::TryInto;
     use std::str::FromStr;
 
     #[test]
     fn test_decimal_binary_format_zero() -> TestResult {
         let dec = Decimal::ZERO;
-        let result = serialize_decimal(&dec)?;
+        let ilp_dec: DecimalView = (&dec).try_into()?;
+        let result = serialize_decimal(ilp_dec);
 
         let (scale, unscaled) = parse_binary_decimal(&result);
         assert_eq!(scale, 0, "Zero should have scale 0");
@@ -185,7 +193,8 @@ mod rust_decimal_tests {
     #[test]
     fn test_decimal_binary_format_positive() -> TestResult {
         let dec = Decimal::from_str("123.45")?;
-        let result = serialize_decimal(&dec)?;
+        let ilp_dec: DecimalView = (&dec).try_into()?;
+        let result = serialize_decimal(ilp_dec);
 
         let (scale, unscaled) = parse_binary_decimal(&result);
         assert_eq!(scale, 2, "123.45 should have scale 2");
@@ -196,7 +205,8 @@ mod rust_decimal_tests {
     #[test]
     fn test_decimal_binary_format_negative() -> TestResult {
         let dec = Decimal::from_str("-123.45")?;
-        let result = serialize_decimal(&dec)?;
+        let ilp_dec: DecimalView = (&dec).try_into()?;
+        let result = serialize_decimal(ilp_dec);
 
         let (scale, unscaled) = parse_binary_decimal(&result);
         assert_eq!(scale, 2, "-123.45 should have scale 2");
@@ -210,7 +220,8 @@ mod rust_decimal_tests {
     #[test]
     fn test_decimal_binary_format_one() -> TestResult {
         let dec = Decimal::ONE;
-        let result = serialize_decimal(&dec)?;
+        let ilp_dec: DecimalView = (&dec).try_into()?;
+        let result = serialize_decimal(ilp_dec);
 
         let (scale, unscaled) = parse_binary_decimal(&result);
         assert_eq!(scale, 0, "One should have scale 0");
@@ -222,7 +233,8 @@ mod rust_decimal_tests {
     fn test_decimal_binary_format_max_scale() -> TestResult {
         // Create a decimal with maximum scale (28 for rust_decimal)
         let dec = Decimal::from_str("0.0000000000000000000000000001")?;
-        let result = serialize_decimal(&dec)?;
+        let ilp_dec: DecimalView = (&dec).try_into()?;
+        let result = serialize_decimal(ilp_dec);
 
         let (scale, unscaled) = parse_binary_decimal(&result);
         assert_eq!(scale, 28, "Should have maximum scale of 28");
@@ -233,7 +245,8 @@ mod rust_decimal_tests {
     #[test]
     fn test_decimal_binary_format_large_value() -> TestResult {
         let dec = Decimal::MAX;
-        let result = serialize_decimal(&dec)?;
+        let ilp_dec: DecimalView = (&dec).try_into()?;
+        let result = serialize_decimal(ilp_dec);
 
         let (scale, unscaled) = parse_binary_decimal(&result);
         assert_eq!(scale, 0, "Large integer should have scale 0");
@@ -247,7 +260,8 @@ mod rust_decimal_tests {
     #[test]
     fn test_decimal_binary_format_large_value2() -> TestResult {
         let dec = Decimal::MIN;
-        let result = serialize_decimal(&dec)?;
+        let ilp_dec: DecimalView = (&dec).try_into()?;
+        let result = serialize_decimal(ilp_dec);
 
         let (scale, unscaled) = parse_binary_decimal(&result);
         assert_eq!(scale, 0, "Large integer should have scale 0");
@@ -261,7 +275,8 @@ mod rust_decimal_tests {
     #[test]
     fn test_decimal_binary_format_small_negative() -> TestResult {
         let dec = Decimal::from_str("-0.01")?;
-        let result = serialize_decimal(&dec)?;
+        let ilp_dec: DecimalView = (&dec).try_into()?;
+        let result = serialize_decimal(ilp_dec);
 
         let (scale, unscaled) = parse_binary_decimal(&result);
         assert_eq!(scale, 2, "-0.01 should have scale 2");
@@ -272,7 +287,8 @@ mod rust_decimal_tests {
     #[test]
     fn test_decimal_binary_format_trailing_zeros() -> TestResult {
         let dec = Decimal::from_str("1.00")?;
-        let result = serialize_decimal(&dec)?;
+        let ilp_dec: DecimalView = (&dec).try_into()?;
+        let result = serialize_decimal(ilp_dec);
 
         let (scale, unscaled) = parse_binary_decimal(&result);
         // rust_decimal normalizes trailing zeros
@@ -289,13 +305,16 @@ mod rust_decimal_tests {
 #[cfg(feature = "bigdecimal")]
 mod bigdecimal_tests {
     use super::*;
+    use crate::ingress::DecimalView;
     use bigdecimal::BigDecimal;
+    use std::convert::TryInto;
     use std::str::FromStr;
 
     #[test]
     fn test_bigdecimal_binary_format_zero() -> TestResult {
         let dec = BigDecimal::from_str("0")?;
-        let result = serialize_decimal(&dec)?;
+        let ilp_dec: DecimalView = (&dec).try_into()?;
+        let result = serialize_decimal(ilp_dec);
 
         let (scale, unscaled) = parse_binary_decimal(&result);
         assert_eq!(scale, 0, "Zero should have scale 0");
@@ -306,7 +325,8 @@ mod bigdecimal_tests {
     #[test]
     fn test_bigdecimal_binary_format_positive() -> TestResult {
         let dec = BigDecimal::from_str("123.45")?;
-        let result = serialize_decimal(&dec)?;
+        let ilp_dec: DecimalView = (&dec).try_into()?;
+        let result = serialize_decimal(ilp_dec);
 
         let (scale, unscaled) = parse_binary_decimal(&result);
         assert_eq!(scale, 2, "123.45 should have scale 2");
@@ -317,7 +337,8 @@ mod bigdecimal_tests {
     #[test]
     fn test_bigdecimal_binary_format_negative() -> TestResult {
         let dec = BigDecimal::from_str("-123.45")?;
-        let result = serialize_decimal(&dec)?;
+        let ilp_dec: DecimalView = (&dec).try_into()?;
+        let result = serialize_decimal(ilp_dec);
 
         let (scale, unscaled) = parse_binary_decimal(&result);
         assert_eq!(scale, 2, "-123.45 should have scale 2");
@@ -331,7 +352,8 @@ mod bigdecimal_tests {
     #[test]
     fn test_bigdecimal_binary_format_one() -> TestResult {
         let dec = BigDecimal::from_str("1")?;
-        let result = serialize_decimal(&dec)?;
+        let ilp_dec: DecimalView = (&dec).try_into()?;
+        let result = serialize_decimal(ilp_dec);
 
         let (scale, unscaled) = parse_binary_decimal(&result);
         assert_eq!(scale, 0, "One should have scale 0");
@@ -343,7 +365,8 @@ mod bigdecimal_tests {
     fn test_bigdecimal_binary_format_high_precision() -> TestResult {
         // BigDecimal can handle arbitrary precision, test a value with many decimal places
         let dec = BigDecimal::from_str("0.123456789012345678901234567890")?;
-        let result = serialize_decimal(&dec)?;
+        let ilp_dec: DecimalView = (&dec).try_into()?;
+        let result = serialize_decimal(ilp_dec);
 
         let (scale, unscaled) = parse_binary_decimal(&result);
         assert_eq!(scale, 30, "Should preserve high precision scale");
@@ -358,7 +381,8 @@ mod bigdecimal_tests {
     fn test_bigdecimal_binary_format_large_value() -> TestResult {
         // Test a very large value that BigDecimal can represent
         let dec = BigDecimal::from_str("79228162514264337593543950335")?;
-        let result = serialize_decimal(&dec)?;
+        let ilp_dec: DecimalView = (&dec).try_into()?;
+        let result = serialize_decimal(ilp_dec);
 
         let (scale, unscaled) = parse_binary_decimal(&result);
         assert_eq!(scale, 0, "Large integer should have scale 0");
@@ -372,7 +396,8 @@ mod bigdecimal_tests {
     #[test]
     fn test_bigdecimal_binary_format_large_negative() -> TestResult {
         let dec = BigDecimal::from_str("-79228162514264337593543950335")?;
-        let result = serialize_decimal(&dec)?;
+        let ilp_dec: DecimalView = (&dec).try_into()?;
+        let result = serialize_decimal(ilp_dec);
 
         let (scale, unscaled) = parse_binary_decimal(&result);
         assert_eq!(scale, 0, "Large negative integer should have scale 0");
@@ -386,7 +411,8 @@ mod bigdecimal_tests {
     #[test]
     fn test_bigdecimal_binary_format_small_negative() -> TestResult {
         let dec = BigDecimal::from_str("-0.01")?;
-        let result = serialize_decimal(&dec)?;
+        let ilp_dec: DecimalView = (&dec).try_into()?;
+        let result = serialize_decimal(ilp_dec);
 
         let (scale, unscaled) = parse_binary_decimal(&result);
         assert_eq!(scale, 2, "-0.01 should have scale 2");
@@ -397,7 +423,8 @@ mod bigdecimal_tests {
     #[test]
     fn test_bigdecimal_binary_format_trailing_zeros() -> TestResult {
         let dec = BigDecimal::from_str("1.00")?;
-        let result = serialize_decimal(&dec)?;
+        let ilp_dec: DecimalView = (&dec).try_into()?;
+        let result = serialize_decimal(ilp_dec);
 
         let (scale, unscaled) = parse_binary_decimal(&result);
         // BigDecimal may normalize trailing zeros differently than rust_decimal
@@ -412,7 +439,8 @@ mod bigdecimal_tests {
         let dec = BigDecimal::from_str(
             "0.0000000000000000000000000000000000000000000000000000000000000000000000000001",
         )?;
-        let result = serialize_decimal(&dec)?;
+        let ilp_dec: DecimalView = (&dec).try_into()?;
+        let result = serialize_decimal(ilp_dec);
 
         let (scale, unscaled) = parse_binary_decimal(&result);
         assert_eq!(scale, 76, "Should have maximum scale of 76");
@@ -426,7 +454,7 @@ mod bigdecimal_tests {
         let dec = BigDecimal::from_str(
             "0.00000000000000000000000000000000000000000000000000000000000000000000000000001",
         )?;
-        let result = serialize_decimal(&dec);
+        let result: crate::Result<DecimalView> = (&dec).try_into();
         assert_err_contains(result, ErrorCode::InvalidDecimal, "scale greater than 76");
         Ok(())
     }
@@ -435,7 +463,8 @@ mod bigdecimal_tests {
     fn test_bigdecimal_binary_negative_scale() -> TestResult {
         // Test with a negative scale
         let dec = BigDecimal::from_str("1.23e12")?;
-        let result = serialize_decimal(&dec)?;
+        let ilp_dec: DecimalView = (&dec).try_into()?;
+        let result = serialize_decimal(ilp_dec);
 
         let (scale, unscaled) = parse_binary_decimal(&result);
         // QuestDB does not support negative scale, instead the value should be
@@ -452,12 +481,8 @@ mod bigdecimal_tests {
     fn test_bigdecimal_binary_value_too_large() -> TestResult {
         // QuestDB cannot accept arrays that are larger than what an i8 can fit
         let dec = BigDecimal::from_str("1e1000")?;
-        let result = serialize_decimal(&dec);
-        assert_err_contains(
-            result,
-            ErrorCode::InvalidDecimal,
-            "does not support decimal scale greater than 76",
-        );
+        let result: crate::Result<DecimalView> = (&dec).try_into();
+        assert_err_contains(result, ErrorCode::InvalidDecimal, "decimal longer than");
         Ok(())
     }
 }

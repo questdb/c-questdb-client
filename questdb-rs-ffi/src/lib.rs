@@ -25,6 +25,7 @@
 #![allow(non_camel_case_types, clippy::missing_safety_doc)]
 
 use libc::{c_char, size_t};
+use questdb::ingress::DecimalView;
 use std::ascii;
 use std::boxed::Box;
 use std::convert::{From, Into};
@@ -43,7 +44,6 @@ use questdb::{
 
 mod ndarr;
 use ndarr::StrideArrayView;
-mod decimal;
 
 macro_rules! bubble_err_to_c {
     ($err_out:expr, $expression:expr) => {
@@ -1051,7 +1051,7 @@ pub unsafe extern "C" fn line_sender_buffer_column_dec(
         };
         let buffer = unwrap_buffer_mut(buffer);
         let name = name.as_name();
-        let decimal = Decimal::new(scale, data);
+        let decimal = bubble_err_to_c!(err_out, DecimalView::try_new_scaled(scale, data));
         bubble_err_to_c!(err_out, buffer.column_dec(name, decimal));
     }
     true
@@ -1924,7 +1924,6 @@ pub unsafe extern "C" fn line_sender_now_micros() -> i64 {
     TimestampMicros::now().as_i64()
 }
 
-use crate::decimal::Decimal;
 use crate::ndarr::CMajorArrayView;
 #[cfg(feature = "confstr-ffi")]
 use questdb_confstr_ffi::questdb_conf_str_parse_err;

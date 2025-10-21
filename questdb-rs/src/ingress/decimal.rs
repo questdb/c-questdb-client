@@ -23,12 +23,13 @@
  ******************************************************************************/
 
 use crate::{Result, error};
+use std::borrow::Cow;
 
-/// Trait for types that can be serialized as decimal values in the InfluxDB Line Protocol (ILP).
+/// A decimal value backed by either a string representation or a scaled mantissa.
 ///
 /// Decimal values can be serialized in two formats:
 ///
-/// # Text Format
+/// ### Text Format
 /// The decimal is written as a string representation followed by a `'d'` suffix.
 ///
 /// Example: `"123.45d"` or `"1.5e-3d"`
@@ -38,7 +39,7 @@ use crate::{Result, error};
 /// - Append the `'d'` suffix
 /// - Ensure no ILP reserved characters are present (space, comma, equals, newline, carriage return, backslash)
 ///
-/// # Binary Format
+/// ### Binary Format
 /// A more compact binary encoding consisting of:
 ///
 /// 1. Binary format marker: `'='` (0x3D)
@@ -60,17 +61,87 @@ use crate::{Result, error};
 ///   └─ Binary marker: '='
 /// ```
 ///
-/// # Binary Format Notes
+/// #### Binary Format Notes
 /// - The unscaled value must be encoded in two's complement big-endian format
 /// - Maximum scale is 76
 /// - Length byte indicates how many bytes follow for the unscaled value
-pub trait DecimalSerializer {
-    /// Serialize this value as a decimal in ILP format.
-    ///
-    /// # Parameters
-    ///
-    /// * `out` - The output buffer to write the serialized decimal to
-    fn serialize(self, out: &mut Vec<u8>) -> Result<()>;
+#[derive(Debug)]
+pub enum DecimalView<'a> {
+    String { value: &'a str },
+    Scaled { scale: u8, value: Cow<'a, [u8]> },
+}
+
+impl<'a> DecimalView<'a> {
+    pub fn try_new_scaled<T>(scale: u32, value: T) -> Result<Self>
+    where
+        T: Into<Cow<'a, [u8]>>,
+    {
+        if scale > 76 {
+            return Err(error::fmt!(
+                InvalidDecimal,
+                "QuestDB ILP does not support decimal scale greater than 76, got {}",
+                scale
+            ));
+        }
+        let value: Cow<'a, [u8]> = value.into();
+        if value.len() > i8::MAX as usize {
+            return Err(error::fmt!(
+                InvalidDecimal,
+                "QuestDB ILP does not support decimal longer than {} bytes, got {}",
+                i8::MAX,
+                value.len()
+            ));
+        }
+        Ok(DecimalView::Scaled {
+            scale: scale as u8,
+            value,
+        })
+    }
+
+    pub fn try_new_string(value: &'a str) -> Result<Self> {
+        // Basic validation: ensure no ILP reserved characters are present
+        for b in value.bytes() {
+            match b {
+                b' ' | b',' | b'=' | b'\n' | b'\r' | b'\\' => {
+                    return Err(error::fmt!(
+                        InvalidDecimal,
+                        "Decimal string contains ILP reserved character {:?}",
+                        b as char
+                    ));
+                }
+                _ => {}
+            }
+        }
+        Ok(DecimalView::String { value })
+    }
+
+    pub(crate) fn serialize(&self, out: &mut Vec<u8>) {
+        match self {
+            DecimalView::String { value } => Self::serialize_string(value, out),
+            DecimalView::Scaled { scale, value } => {
+                Self::serialize_scaled(*scale, value.as_ref(), out)
+            }
+        }
+    }
+
+    fn serialize_string(value: &str, out: &mut Vec<u8>) {
+        // Pre-allocate space for the string content plus the 'd' suffix
+        out.reserve(value.len() + 1);
+
+        out.extend_from_slice(value.as_bytes());
+
+        // Append the 'd' suffix to mark this as a decimal value
+        out.push(b'd');
+    }
+
+    fn serialize_scaled(scale: u8, value: &[u8], out: &mut Vec<u8>) {
+        // Write binary format: '=' marker + type + scale + length + mantissa bytes
+        out.push(b'=');
+        out.push(crate::ingress::DECIMAL_BINARY_FORMAT_TYPE);
+        out.push(scale);
+        out.push(value.len() as u8);
+        out.extend_from_slice(value);
+    }
 }
 
 /// Implementation for string slices containing decimal representations.
@@ -97,72 +168,31 @@ pub trait DecimalSerializer {
 /// # Errors
 /// Returns [`Error`] with [`ErrorCode::InvalidDecimal`](crate::error::ErrorCode::InvalidDecimal)
 /// if the string contains non-numerical characters.
-impl DecimalSerializer for &str {
-    fn serialize(self, out: &mut Vec<u8>) -> Result<()> {
-        // Pre-allocate space for the string content plus the 'd' suffix
-        out.reserve(self.len() + 1);
+impl<'a> TryInto<DecimalView<'a>> for &'a str {
+    type Error = crate::Error;
 
-        // Validate and copy each byte, rejecting non-numeric characters
-        for b in self.bytes() {
-            match b {
-                b'0'..=b'9' | b'.' | b'-' | b'+' | b'a'..=b'z' | b'A'..=b'Z' => out.push(b),
-                _ => {
-                    return Err(error::fmt!(
-                        InvalidDecimal,
-                        "Invalid character {:?} in decimal str",
-                        b as char
-                    ));
-                }
-            }
-        }
-
-        // Append the 'd' suffix to mark this as a decimal value
-        out.push(b'd');
-
-        Ok(())
+    fn try_into(self) -> Result<DecimalView<'a>> {
+        DecimalView::try_new_string(self)
     }
 }
 
-#[cfg(any(feature = "rust_decimal", feature = "bigdecimal"))]
-use crate::ingress::DECIMAL_BINARY_FORMAT_TYPE;
-
 #[cfg(feature = "rust_decimal")]
-impl DecimalSerializer for &rust_decimal::Decimal {
-    fn serialize(self, out: &mut Vec<u8>) -> Result<()> {
-        // Binary format: '=' marker + type + scale + length + mantissa bytes
-        out.push(b'=');
-        out.push(DECIMAL_BINARY_FORMAT_TYPE);
+impl<'a> TryInto<DecimalView<'a>> for &'a rust_decimal::Decimal {
+    type Error = crate::Error;
 
-        // rust_decimal::Decimal guarantees:
-        // - MAX_SCALE is 28, which is within QuestDB's limit of 76
-        // - Mantissa is always 96 bits (12 bytes), never exceeds this size
-
-        out.push(self.scale() as u8);
-
-        // We skip the upper 3 bytes (which are sign-extended) and write the lower 13 bytes
-        let mantissa = self.mantissa();
-        out.push(13);
-        out.extend_from_slice(&mantissa.to_be_bytes()[3..]);
-
-        Ok(())
+    fn try_into(self) -> Result<DecimalView<'a>> {
+        let raw = self.mantissa().to_be_bytes();
+        let bytes = trim_leading_sign_bytes(&raw);
+        DecimalView::try_new_scaled(self.scale() as u32, bytes)
     }
 }
 
 #[cfg(feature = "bigdecimal")]
-impl DecimalSerializer for &bigdecimal::BigDecimal {
-    fn serialize(self, out: &mut Vec<u8>) -> Result<()> {
-        // Binary format: '=' marker + type + scale + length + mantissa bytes
-        out.push(b'=');
-        out.push(DECIMAL_BINARY_FORMAT_TYPE);
+impl<'a> TryInto<DecimalView<'a>> for &'a bigdecimal::BigDecimal {
+    type Error = crate::Error;
 
+    fn try_into(self) -> Result<DecimalView<'a>> {
         let (unscaled, mut scale) = self.as_bigint_and_scale();
-        if scale < -76 || scale > 76 {
-            return Err(error::fmt!(
-                InvalidDecimal,
-                "QuestDB ILP does not support decimal scale greater than 76, got {}",
-                scale
-            ));
-        }
 
         // QuestDB binary ILP doesn't support negative scale, we need to upscale the
         // unscaled value to be compliant
@@ -176,21 +206,37 @@ impl DecimalSerializer for &bigdecimal::BigDecimal {
             unscaled.to_signed_bytes_be()
         };
 
-        if bytes.len() > i8::MAX as usize {
-            return Err(error::fmt!(
-                InvalidDecimal,
-                "QuestDB ILP does not support decimal longer than {} bytes, got {}",
-                i8::MAX,
-                bytes.len()
-            ));
-        }
+        let bytes = trim_leading_sign_bytes(&bytes);
 
-        out.push(scale as u8);
-
-        // Write length byte and mantissa bytes
-        out.push(bytes.len() as u8);
-        out.extend_from_slice(&bytes);
-
-        Ok(())
+        DecimalView::try_new_scaled(scale as u32, bytes)
     }
+}
+
+#[cfg(any(feature = "rust_decimal", feature = "bigdecimal"))]
+fn trim_leading_sign_bytes(bytes: &[u8]) -> Vec<u8> {
+    if bytes.is_empty() {
+        return vec![0];
+    }
+
+    let negative = bytes[0] & 0x80 != 0;
+    let mut keep_from = 0usize;
+
+    while keep_from < bytes.len() - 1 {
+        let current = bytes[keep_from];
+        let next = bytes[keep_from + 1];
+
+        let should_trim = if negative {
+            current == 0xFF && (next & 0x80) == 0x80
+        } else {
+            current == 0x00 && (next & 0x80) == 0x00
+        };
+
+        if should_trim {
+            keep_from += 1;
+        } else {
+            break;
+        }
+    }
+
+    bytes[keep_from..].to_vec()
 }

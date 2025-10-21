@@ -63,7 +63,7 @@ mod sender;
 pub use sender::*;
 
 mod decimal;
-pub use decimal::DecimalSerializer;
+pub use decimal::DecimalView;
 
 const MAX_NAME_LEN_DEFAULT: usize = 127;
 

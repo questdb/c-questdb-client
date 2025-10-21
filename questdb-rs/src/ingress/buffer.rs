@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-use crate::ingress::decimal::DecimalSerializer;
+use crate::ingress::decimal::DecimalView;
 use crate::ingress::ndarr::{ArrayElementSealed, check_and_get_array_bytes_size};
 use crate::ingress::{
     ARRAY_BINARY_FORMAT_TYPE, ArrayElement, DOUBLE_BINARY_FORMAT_TYPE, DebugBytes, MAX_ARRAY_DIMS,
@@ -1052,8 +1052,9 @@ impl Buffer {
     pub fn column_dec<'a, N, S>(&mut self, name: N, value: S) -> crate::Result<&mut Self>
     where
         N: TryInto<ColumnName<'a>>,
-        S: DecimalSerializer,
+        S: TryInto<DecimalView<'a>>,
         Error: From<N::Error>,
+        Error: From<S::Error>,
     {
         if self.protocol_version < ProtocolVersion::V3 {
             return Err(error::fmt!(
@@ -1063,8 +1064,9 @@ impl Buffer {
             ));
         }
 
+        let value: DecimalView = value.try_into()?;
         self.write_column_key(name)?;
-        value.serialize(&mut self.output)?;
+        value.serialize(&mut self.output);
         Ok(self)
     }
 
