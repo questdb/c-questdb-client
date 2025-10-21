@@ -133,7 +133,7 @@ impl<'a> DecimalView<'a> {
                     return Err(error::fmt!(
                         InvalidDecimal,
                         "Decimal string contains ILP reserved character {:?}",
-                        b as char
+                        b
                     ));
                 }
             }
