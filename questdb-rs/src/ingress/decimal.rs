@@ -216,7 +216,7 @@ impl<'a> TryInto<DecimalView<'a>> for &'a rust_decimal::Decimal {
     fn try_into(self) -> Result<DecimalView<'a>> {
         let raw = self.mantissa().to_be_bytes();
         let bytes = trim_leading_sign_bytes(&raw);
-        DecimalView::try_new_scaled(self.scale() as u32, bytes)
+        DecimalView::try_new_scaled(self.scale(), bytes)
     }
 }
 
