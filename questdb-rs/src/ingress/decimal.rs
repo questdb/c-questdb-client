@@ -106,7 +106,7 @@ impl<'a> DecimalView<'a> {
     /// Thousand separators (commas) are not allowed and the decimal point must be a dot (`.`).
     ///
     /// Performs lightweight validation and rejects values containing ILP-reserved characters.
-    /// Accepts plain decimals, optional `+/-` prefixes, `NaN`, `Inf[inity]`, and scientific
+    /// Accepts plain decimals, optional `+/-` prefixes, `NaN`, `Infinity`, and scientific
     /// notation (`e`/`E`).
     ///
     /// Returns [`error::ErrorCode::InvalidDecimal`](crate::error::ErrorCode::InvalidDecimal)
@@ -187,7 +187,7 @@ impl<'a> DecimalView<'a> {
 ///
 /// # Validation
 /// The implementation performs **partial validation only**:
-/// - Rejects non-numerical characters (not -/+, 0-9, ., Inf, NaN, e/E)
+/// - Rejects non-numerical characters (not -/+, 0-9, ., Infinity, NaN, e/E)
 /// - Does NOT validate the actual decimal syntax (e.g., "e2e" would pass)
 ///
 /// This is intentional: full parsing would add overhead. The QuestDB server performs complete
