@@ -122,18 +122,16 @@ class TestSender(unittest.TestCase):
     
     @property
     def client_driven_nanos_supported(self) -> bool:
-        return False
-        ### Re-enable once https://github.com/questdb/questdb/pull/6220 is merged.
         # """True if the QuestDB server supports nanos and also respects the client's precision for the designated timestamp."""
-        # if QDB_FIXTURE.version <= (9, 1, 0):
-        #     return False
+        if QDB_FIXTURE.version <= (9, 1, 0):
+            return False
 
-        # if QDB_FIXTURE.http:
-        #     return QDB_FIXTURE.protocol_version != qls.ProtocolVersion.V1
-        # elif QDB_FIXTURE.protocol_version is None:
-        #     return False # TCP defaults to ProtocolVersion.V1
-        # else:
-        #     return QDB_FIXTURE.protocol_version >= qls.ProtocolVersion.V2
+        if QDB_FIXTURE.http:
+            return QDB_FIXTURE.protocol_version != qls.ProtocolVersion.V1
+        elif QDB_FIXTURE.protocol_version is None:
+            return False # TCP defaults to ProtocolVersion.V1
+        else:
+            return QDB_FIXTURE.protocol_version >= qls.ProtocolVersion.V2
 
     @property
     def expected_protocol_version(self) -> qls.ProtocolVersion:
@@ -569,6 +567,8 @@ class TestSender(unittest.TestCase):
         self.assertEqual(scrubbed_dataset, exp_dataset)
 
     def test_decimal_column(self):
+        if QDB_FIXTURE.version < DECIMAL_RELEASE:
+            self.skipTest('No decimal support in this version of QuestDB.')
         if self.expected_protocol_version < qls.ProtocolVersion.V3:
             self.skipTest('communicating over old protocol which does not support decimals')
 
@@ -853,6 +853,9 @@ class TestSender(unittest.TestCase):
         self.assertEqual(scrubbed_dataset, exp_dataset)
 
     def test_c_example(self):
+        if QDB_FIXTURE.version < DECIMAL_RELEASE:
+            self.skipTest('No decimal support in this version of QuestDB.')
+
         suffix = '_auth' if QDB_FIXTURE.auth else ''
         suffix += '_http' if QDB_FIXTURE.http else ''
         self._test_example(
@@ -860,6 +863,9 @@ class TestSender(unittest.TestCase):
             f'c_trades{suffix}')
 
     def test_cpp_example(self):
+        if QDB_FIXTURE.version < DECIMAL_RELEASE:
+            self.skipTest('No decimal support in this version of QuestDB.')
+
         suffix = '_auth' if QDB_FIXTURE.auth else ''
         suffix += '_http' if QDB_FIXTURE.http else ''
         self._test_example(
@@ -867,12 +873,18 @@ class TestSender(unittest.TestCase):
             f'cpp_trades{suffix}')
 
     def test_c_tls_example(self):
+        if QDB_FIXTURE.version < DECIMAL_RELEASE:
+            self.skipTest('No decimal support in this version of QuestDB.')
+
         self._test_example(
             'line_sender_c_example_tls_ca',
             'c_trades_tls_ca',
             tls=True)
 
     def test_cpp_tls_example(self):
+        if QDB_FIXTURE.version < DECIMAL_RELEASE:
+            self.skipTest('No decimal support in this version of QuestDB.')
+
         self._test_example(
             'line_sender_cpp_example_tls_ca',
             'cpp_trades_tls_ca',
@@ -1176,6 +1188,11 @@ def parse_args():
     sub_p = parser.add_subparsers(dest='command')
     run_p = sub_p.add_parser('run', help='Run tests')
     run_p.add_argument(
+        '--force-max-version',
+        action='store_true',
+        help='Force the client to assume the max version (999,999,999)'
+    )
+    run_p.add_argument(
         '--unittest-help',
         action='store_true',
         help='Show unittest --help')
@@ -1281,6 +1298,8 @@ def run_with_fixtures(args):
         try:
             sys.stderr.write(f'>>>> STARTING {questdb_dir} [auth={auth}] <<<<\n')
             QDB_FIXTURE.start()
+            if getattr(args, 'force_max_version', False):
+                QDB_FIXTURE.version = (999, 999, 999)
             for http, protocol_version, build_mode in itertools.product(
                     (False, True),  # http
                     [None] + list(qls.ProtocolVersion),  # None is for `auto`
