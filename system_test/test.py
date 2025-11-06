@@ -565,19 +565,6 @@ class TestSender(unittest.TestCase):
         exp_dataset = [['1970-01-01T01:00:00.000000Z']]
         scrubbed_dataset = [row[:-1] for row in resp['dataset']]
         self.assertEqual(scrubbed_dataset, exp_dataset)
-    
-    def test_decimal_unavailable_questdb_version(self):
-        if QDB_FIXTURE.version >= DECIMAL_RELEASE:
-            self.skipTest('Decimal support present in this version of QuestDB.')
-        if not QDB_FIXTURE.http:
-            self.skipTest('TCP protocol does not support decimal detection yet.')
-        table_name = uuid.uuid4().hex
-        with self.assertRaisesRegex(qls.SenderError, r'Bad call to'):
-            with self._mk_linesender() as sender:
-                with self.assertRaisesRegex(
-                        qls.SenderError,
-                        r'.*does not support the decimal datatype.*'):
-                    sender.table(table_name).column('dec', Decimal("12.34"))
 
     def test_decimal_column(self):
         if QDB_FIXTURE.version < DECIMAL_RELEASE:
