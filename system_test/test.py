@@ -608,7 +608,7 @@ class TestSender(unittest.TestCase):
         self.assertEqual(scrubbed_dataset, exp_dataset)
     
     def test_decimal_not_available(self):
-        if QDB_FIXTURE.version >= DECIMAL_RELEASE:
+        if QDB_FIXTURE.version >= DECIMAL_RELEASE or QDB_FIXTURE.version >= (9, 1, 1): # remove the second condition when 9.2.0 is released
             self.skipTest('Decimal support is available in this version of QuestDB.')
         if self.expected_protocol_version >= qls.ProtocolVersion.V3:
             self.skipTest('communicating over new protocol which supports decimals')
