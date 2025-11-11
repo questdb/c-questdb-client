@@ -606,6 +606,20 @@ class TestSender(unittest.TestCase):
         exp_dataset = [['12.990'], ['-12.340'], ['0.001'], ['10000000.000'], [None], [None], ['0.000'], ['0.000'], ['1000.000']]
         scrubbed_dataset = [row[:-1] for row in resp['dataset']]
         self.assertEqual(scrubbed_dataset, exp_dataset)
+    
+    def test_decimal_not_available(self):
+        if QDB_FIXTURE.version >= DECIMAL_RELEASE:
+            self.skipTest('Decimal support is available in this version of QuestDB.')
+        if self.expected_protocol_version >= qls.ProtocolVersion.V3:
+            self.skipTest('communicating over new protocol which supports decimals')
+        table_name = uuid.uuid4().hex
+        with self.assertRaisesRegex(qls.SenderError, r'Bad call to'):
+            with self._mk_linesender() as sender:
+                with self.assertRaisesRegex(qls.SenderError, r'.*does not support the decimal datatype*'):
+                    (sender
+                    .table(table_name)
+                    .column('dec', Decimal("12.34"))
+                    .at_now())
 
     def test_f64_arr_column(self):
         if self.expected_protocol_version < qls.ProtocolVersion.V2:
