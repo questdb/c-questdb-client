@@ -5,8 +5,13 @@ steps:
     condition: ne(variables['toolchain'], '')
     displayName: "Update and set Rust toolchain"
   - script: |
-      python3 -m pip install --upgrade pip
-      python3 -m pip install numpy
+      brew install numpy
+    condition: eq(variables['imageName'], 'macos-latest')
+    displayName: "Install numpy via brew on macOS"
+  - script: |
+      python -m pip install --upgrade pip
+      pip install numpy
+    condition: ne(variables['imageName'], 'macos-latest')
     displayName: "Install Python Dependencies"
   - script: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DQUESTDB_TESTS_AND_EXAMPLES=ON
     env:
