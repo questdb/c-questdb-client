@@ -56,7 +56,7 @@ stages:
             displayName: "Build Rust examples"
           ############################# temp for test begin #####################
           - script: |
-              git clone --depth 1 --branch rd_decimal_integration https://github.com/questdb/questdb.git ./questdb
+              git clone --depth 1 https://github.com/questdb/questdb.git ./questdb
             displayName: git clone questdb
           - task: Maven@3
             displayName: "Compile QuestDB"
