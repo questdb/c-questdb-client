@@ -66,7 +66,7 @@ def main():
     run_cmd(str(test_line_sender_path))
     run_cmd(str(test_line_sender_path_CXX20))
     run_cmd('python3', str(system_test_path), 'run', '--versions', qdb_v, '-v')
-    run_cmd('python3', str(system_test_path), 'run', '--repo', './questdb', '-v', '--force-max-version')
+    run_cmd('python3', str(system_test_path), 'run', '--repo', './questdb', '-v')
 
 
 if __name__ == '__main__':
