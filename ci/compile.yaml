@@ -6,7 +6,7 @@ steps:
     displayName: "Update and set Rust toolchain"
   - script: |
       python3 -m pip install --upgrade pip
-      pip3 install numpy
+      python3 -m pip install numpy
     displayName: "Install Python Dependencies"
   - script: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DQUESTDB_TESTS_AND_EXAMPLES=ON
     env:
