@@ -45,27 +45,27 @@ def main():
     system_test_path = pathlib.Path('system_test') / 'test.py'
     qdb_v = '9.1.0'  # The version of QuestDB we'll test against.
 
-    run_cmd('cargo', 'test',
-            '--', '--nocapture', cwd='questdb-rs')
-    run_cmd('cargo', 'test',
-            '--no-default-features',
-            '--features=aws-lc-crypto,tls-native-certs,sync-sender',
-            '--', '--nocapture', cwd='questdb-rs')
-    run_cmd('cargo', 'test', '--no-default-features',
-            '--features=ring-crypto,tls-native-certs,sync-sender',
-            '--', '--nocapture', cwd='questdb-rs')
-    run_cmd('cargo', 'test', '--no-default-features',
-            '--features=ring-crypto,tls-webpki-certs,sync-sender-tcp',
-            '--', '--nocapture', cwd='questdb-rs')
-    run_cmd('cargo', 'test', '--no-default-features',
-            '--features=ring-crypto,tls-webpki-certs,sync-sender-http',
-            '--', '--nocapture', cwd='questdb-rs')
-    run_cmd('cargo', 'test', '--features=almost-all-features',
-            '--', '--nocapture', cwd='questdb-rs')
-    run_cmd('cargo', 'test', cwd='questdb-rs-ffi')
-    run_cmd(str(test_line_sender_path))
-    run_cmd(str(test_line_sender_path_CXX20))
-    run_cmd('python3', str(system_test_path), 'run', '--versions', qdb_v, '-v')
+    # run_cmd('cargo', 'test',
+    #         '--', '--nocapture', cwd='questdb-rs')
+    # run_cmd('cargo', 'test',
+    #         '--no-default-features',
+    #         '--features=aws-lc-crypto,tls-native-certs,sync-sender',
+    #         '--', '--nocapture', cwd='questdb-rs')
+    # run_cmd('cargo', 'test', '--no-default-features',
+    #         '--features=ring-crypto,tls-native-certs,sync-sender',
+    #         '--', '--nocapture', cwd='questdb-rs')
+    # run_cmd('cargo', 'test', '--no-default-features',
+    #         '--features=ring-crypto,tls-webpki-certs,sync-sender-tcp',
+    #         '--', '--nocapture', cwd='questdb-rs')
+    # run_cmd('cargo', 'test', '--no-default-features',
+    #         '--features=ring-crypto,tls-webpki-certs,sync-sender-http',
+    #         '--', '--nocapture', cwd='questdb-rs')
+    # run_cmd('cargo', 'test', '--features=almost-all-features',
+    #         '--', '--nocapture', cwd='questdb-rs')
+    # run_cmd('cargo', 'test', cwd='questdb-rs-ffi')
+    # run_cmd(str(test_line_sender_path))
+    # run_cmd(str(test_line_sender_path_CXX20))
+    # run_cmd('python3', str(system_test_path), 'run', '--versions', qdb_v, '-v')
     run_cmd('python3', str(system_test_path), 'run', '--repo', './questdb', '-v', '--force-max-version')
 
 

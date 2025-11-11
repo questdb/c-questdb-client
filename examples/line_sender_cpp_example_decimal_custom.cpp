@@ -75,6 +75,7 @@ static bool example(std::string_view host, std::string_view port)
         const auto price_name = "price"_cn;
         const auto amount_name = "amount"_cn;
 
+        // The table must be created beforehand with the appropriate DECIMAL(N,M) type for the column.
         // 123 with a scale of 1 gives a decimal of 12.3
         const auto price_value = custom_decimal::Decimal32(1, 123);
 

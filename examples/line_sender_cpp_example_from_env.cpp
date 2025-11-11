@@ -24,6 +24,7 @@ int main(int argc, const char* argv[])
         buffer.table(table_name)
             .symbol(symbol_name, "ETH-USD"_utf8)
             .symbol(side_name, "sell"_utf8)
+        // The table must be created beforehand with the appropriate DECIMAL(N,M) type for the column.
             .column(price_name, "2615.54"_decimal)
             .column(amount_name, 0.00044)
             .at(questdb::ingress::timestamp_nanos::now());

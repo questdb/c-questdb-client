@@ -63,6 +63,9 @@ DECIMAL_RELEASE = (9, 2, 0)
 def retry_check_table(*args, **kwargs):
     return QDB_FIXTURE.retry_check_table(*args, **kwargs)
 
+def sql_query(query: str):
+    return QDB_FIXTURE.http_sql_query(query)
+
 
 # Valid keys, but not registered with the QuestDB fixture.
 AUTH_UNRECOGNIZED = dict(
@@ -573,6 +576,8 @@ class TestSender(unittest.TestCase):
             self.skipTest('communicating over old protocol which does not support decimals')
 
         table_name = uuid.uuid4().hex
+        sql_query(f'CREATE TABLE "{table_name}" (dec DECIMAL(18,3), timestamp TIMESTAMP) TIMESTAMP(timestamp) PARTITION BY DAY;')
+
         pending = None
         decimals = [
             Decimal("12.99"),
@@ -815,6 +820,11 @@ class TestSender(unittest.TestCase):
             self.skipTest('BuildMode.API-only test')
         if tls and not QDB_FIXTURE.auth:
             self.skipTest('No auth')
+        
+        exp_ts_type = 'TIMESTAMP_NS' if self.client_driven_nanos_supported else 'TIMESTAMP'
+        # Decimal columns must be created manually beforehand.
+        sql_query(f'''CREATE TABLE "{table_name}" (price DECIMAL(18,3), timestamp {exp_ts_type}) TIMESTAMP(timestamp) PARTITION BY DAY;''')
+
         # Call the example program.
         proj = Project()
         ext = '.exe' if sys.platform == 'win32' else ''
@@ -835,21 +845,21 @@ class TestSender(unittest.TestCase):
 
         # Check inserted data.
         resp = retry_check_table(table_name)
-        exp_ts_type = 'TIMESTAMP_NS' if self.client_driven_nanos_supported else 'TIMESTAMP'
         exp_columns = [
+            {'name': 'price', 'type': 'DECIMAL(18,3)'},
+            {'name': 'timestamp', 'type': exp_ts_type},
             {'name': 'symbol', 'type': 'SYMBOL'},
             {'name': 'side', 'type': 'SYMBOL'},
-            {'name': 'price', 'type': 'DECIMAL(18,3)'},
-            {'name': 'amount', 'type': 'DOUBLE'},
-            {'name': 'timestamp', 'type': exp_ts_type}]
+            {'name': 'amount', 'type': 'DOUBLE'}
+        ]
         self.assertEqual(resp['columns'], exp_columns)
 
-        exp_dataset = [['ETH-USD',
+        exp_dataset = [['2615.540',
+                        'ETH-USD',
                         'sell',
-                        '2615.540',
                         0.00044]]
         # Comparison excludes timestamp column.
-        scrubbed_dataset = [row[:-1] for row in resp['dataset']]
+        scrubbed_dataset = [row[:1] + row[2:] for row in resp['dataset']]
         self.assertEqual(scrubbed_dataset, exp_dataset)
 
     def test_c_example(self):

@@ -51,6 +51,7 @@ static bool example(const char* host, const char* port)
     if (!line_sender_buffer_symbol(buffer, side_name, side_value, &err))
         goto on_error;
 
+    // The table must be created beforehand with the appropriate DECIMAL(N,M) type for the column.
     // 123 with a scale of 1 gives a decimal of 12.3
     const uint8_t price_unscaled_value[] = {123};
     if (!line_sender_buffer_column_dec(
