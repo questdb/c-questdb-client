@@ -87,7 +87,7 @@ impl<'a> DecimalView<'a> {
             ));
         }
         let value: Cow<'a, [u8]> = value.into();
-        if value.len() > 32 as usize {
+        if value.len() > 32_usize {
             return Err(error::fmt!(
                 InvalidDecimal,
                 "QuestDB ILP does not support decimal longer than 32 bytes, got {}",
