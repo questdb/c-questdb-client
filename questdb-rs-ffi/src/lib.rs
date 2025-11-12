@@ -1064,6 +1064,9 @@ pub unsafe extern "C" fn line_sender_buffer_column_dec_str(
 
 /// Record a decimal value for the given column.
 ///
+/// There is no equivalent of NaN or Infinity when specifying decimals in binary format.
+/// Those special values have no meaning for decimals and should be encoded as nulls instead.
+///
 /// @param[in] buffer Line buffer object.
 /// @param[in] name Column name.
 /// @param[in] scale Number of digits after the decimal point
