@@ -30,13 +30,16 @@
 - [Array in C-major order](../examples/line_sender_c_example_array_c_major.c)
 
 **Decimal**
-
-:::caution
-When using decimal values, you must create the column with the appropriate type in
-QuestDB beforehand.
-:::
-
 - [Decimal in binary format](../examples/line_sender_c_example_decimal_binary.c)
+
+## Table and column auto-creation
+
+When you send data to a table that does not yet exist, QuestDB creates the table automatically and infers column types from the first row.
+The same applies to brand-new columns added to an existing table: most column types are created on the fly based on the values you send.
+Decimal columns are the main exception.
+
+Because the client cannot infer the desired scale and precision, QuestDB refuses to auto-create decimal columns.
+Define those columns ahead of time with an explicit `create table` (or `alter table add column`) statement before you start sending decimal values.
 
 ## API Overview
 
