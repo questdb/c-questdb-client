@@ -471,7 +471,7 @@ public:
      * # Constraints
      *
      * - Maximum scale: 76 (QuestDB server limitation)
-     * - Maximum mantissa size: 127 bytes (protocol limitation)
+     * - Maximum mantissa size: 32 bytes (protocol limitation)
      *
      * @param name    Column name.
      * @param decimal Binary decimal view with scale and mantissa bytes.

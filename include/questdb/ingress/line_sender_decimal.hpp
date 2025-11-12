@@ -36,7 +36,7 @@
  *
  * QuestDB supports decimal values with:
  * - Maximum scale: 76 (QuestDB server limitation)
- * - Maximum mantissa size: 127 bytes in binary format
+ * - Maximum mantissa size: 32 bytes in binary format
  *
  * QuestDB server version 9.2.0 or later is required for decimal support.
  */
@@ -130,7 +130,7 @@ inline decimal_str_view operator"" _decimal(const char* buf, size_t len)
  * # Constraints
  *
  * - Maximum scale: 76 (QuestDB server limitation)
- * - Maximum mantissa size: 127 bytes (protocol limitation)
+ * - Maximum mantissa size: 32 bytes
  */
 class decimal_view
 {
@@ -141,7 +141,7 @@ public:
      * @param scale Number of decimal places (must be ≤ 76)
      * @param data Pointer to unscaled value in two's complement big-endian
      * format
-     * @param data_size Number of bytes in the mantissa (must be ≤ 127)
+     * @param data_size Number of bytes in the mantissa (must be ≤ 32)
      */
     decimal_view(uint32_t scale, const uint8_t* data, size_t data_size)
         : _scale{scale}

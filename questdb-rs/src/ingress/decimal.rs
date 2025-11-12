@@ -71,7 +71,7 @@ impl<'a> DecimalView<'a> {
     ///
     /// Validates that:
     /// - `scale` does not exceed the QuestDB maximum of 76 decimal places.
-    /// - The mantissa fits into at most 127 bytes (ILP binary limit).
+    /// - The mantissa fits into at most 32 bytes (ILP binary limit).
     ///
     /// Returns an [`error::ErrorCode::InvalidDecimal`](crate::error::ErrorCode::InvalidDecimal)
     /// error if either constraint is violated.
@@ -87,11 +87,10 @@ impl<'a> DecimalView<'a> {
             ));
         }
         let value: Cow<'a, [u8]> = value.into();
-        if value.len() > i8::MAX as usize {
+        if value.len() > 32 as usize {
             return Err(error::fmt!(
                 InvalidDecimal,
-                "QuestDB ILP does not support decimal longer than {} bytes, got {}",
-                i8::MAX,
+                "QuestDB ILP does not support decimal longer than 32 bytes, got {}",
                 value.len()
             ));
         }
