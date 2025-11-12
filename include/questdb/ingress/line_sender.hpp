@@ -436,7 +436,8 @@ public:
      *
      * When specifying a decimal as a string, use a '.' to separate the whole
      * from the fractional parts. For example, "12.20".
-     * Infinity is encoded as "+Infinity" or "-Infinity", while NaN as "NaN".
+     * Infinity is encoded as "+Infinity" or "-Infinity", while NaN as "NaN". 
+     * Note that Infinity and NaN values decay to nulls when stored in the database.
      *
      * For better performance and precision control, consider using the binary
      * format via `decimal::decimal_view` instead.
