@@ -1013,14 +1013,47 @@ pub unsafe extern "C" fn line_sender_buffer_column_str(
 pub unsafe extern "C" fn line_sender_buffer_column_dec_str(
     buffer: *mut line_sender_buffer,
     name: line_sender_column_name,
-    value: line_sender_utf8,
+    value: *mut c_char,
+    value_len: size_t,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     let buffer = unsafe { unwrap_buffer_mut(buffer) };
     let name = name.as_name();
-    let value = value.as_str();
+    let value = unsafe { slice::from_raw_parts(value as *const u8, value_len) };
+    // Basic validation: ensure only numerical characters are present (accepts NaN, Inf[inity], and e-notation)
+    for b in value.iter() {
+        match b {
+            b'0'..=b'9'
+            | b'.'
+            | b'-'
+            | b'+'
+            | b'e'
+            | b'E'
+            | b'N'
+            | b'a'
+            | b'I'
+            | b'n'
+            | b'f'
+            | b'i'
+            | b't'
+            | b'y' => {}
+            _ => {
+                unsafe {
+                    *err_out = Box::into_raw(Box::new(line_sender_error(questdb::Error::new(
+                        questdb::ErrorCode::InvalidDecimal,
+                        format!("Decimal string contains invalid character {:?}", b),
+                    ))));
+                }
+                return false;
+            }
+        }
+    }
+    let value = unsafe { str::from_utf8_unchecked(value) };
     unsafe {
-        bubble_err_to_c!(err_out, buffer.column_dec(name, value));
+        bubble_err_to_c!(
+            err_out,
+            buffer.column_dec(name, DecimalView::String { value })
+        );
     }
     true
 }

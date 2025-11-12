@@ -453,7 +453,8 @@ public:
             ::line_sender_buffer_column_dec_str,
             _impl,
             name._impl,
-            value.view()._impl);
+            value.data(),
+            value.size());
         return *this;
     }
 

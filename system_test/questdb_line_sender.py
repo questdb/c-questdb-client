@@ -297,7 +297,8 @@ def _setup_cdll():
         c_bool,
         c_line_sender_buffer_p,
         c_line_sender_column_name,
-        c_line_sender_utf8,
+        c_char_p,
+        c_size_t,
         c_line_sender_error_p_p)
     set_sig(
         dll.line_sender_buffer_column_f64_arr_byte_strides,
@@ -686,6 +687,15 @@ class Buffer:
             _utf8(value))
         return self
 
+    def column_dec_str(self, name: str, value: str):
+        c_utf8 = value.encode('utf-8')
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_column_dec_str,
+            self._impl,
+            _column_name(name),
+            c_utf8,
+            len(c_utf8))
+
     def column(
             self, name: str,
             value: Union[bool, int, float, str, TimestampMicros, datetime]):
@@ -714,11 +724,7 @@ class Buffer:
                 _column_name(name),
                 _utf8(value))
         elif isinstance(value, Decimal):
-            _error_wrapped_call(
-                _DLL.line_sender_buffer_column_dec_str,
-                self._impl,
-                _column_name(name),
-                _utf8(str(value)))
+            self.column_dec_str(name, str(value))
         elif isinstance(value, TimestampMicros):
             _error_wrapped_call(
                 _DLL.line_sender_buffer_column_ts_micros,
@@ -932,6 +938,12 @@ class Sender:
             self, name: str,
             value: Union[bool, int, float, str, Decimal, TimestampMicros, TimestampNanos, datetime]):
         self._buffer.column(name, value)
+        return self
+    
+    def column_dec_str(
+            self, name: str,
+            value: str):
+        self._buffer.column_dec_str(name, value)
         return self
 
     def column_f64_arr(

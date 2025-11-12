@@ -521,7 +521,8 @@ LINESENDER_API
 bool line_sender_buffer_column_dec_str(
     line_sender_buffer* buffer,
     line_sender_column_name name,
-    line_sender_utf8 value,
+    const char *value,
+    size_t value_len,
     line_sender_error** err_out);
 
 /**

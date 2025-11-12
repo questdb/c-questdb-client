@@ -65,9 +65,8 @@ static bool example(const char* ca_path, const char* host, const char* port)
         goto on_error;
 
     // The table must be created beforehand with the appropriate DECIMAL(N,M) type for the column.
-    line_sender_utf8 price_value = QDB_UTF8_LITERAL("2615.54");
     if (!line_sender_buffer_column_dec_str(
-            buffer, price_name, price_value, &err))
+            buffer, price_name, "2615.54", strlen("2615.54"), &err))
         goto on_error;
 
     if (!line_sender_buffer_column_f64(buffer, amount_name, 0.00044, &err))

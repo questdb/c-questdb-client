@@ -44,7 +44,7 @@ namespace questdb::ingress::decimal
 {
 
 /**
- * A validated UTF-8 string view for text-based decimal representation.
+ * A unvalidated UTF-8 string view for text-based decimal representation.
  *
  * This is a wrapper around utf8_view that allows the compiler to distinguish
  * between regular strings and decimal strings.
@@ -56,33 +56,39 @@ class decimal_str_view
 {
 public:
     decimal_str_view(const char* buf, size_t len)
-        : _view{buf, len}
+        : buf{buf}, len{len}
     {
     }
 
     template <size_t N>
     decimal_str_view(const char (&buf)[N])
-        : _view{buf}
+        : decimal_str_view{buf, N}
     {
     }
 
     decimal_str_view(std::string_view s_view)
-        : _view{s_view}
+        : decimal_str_view{s_view.data(), s_view.size()}
     {
     }
 
     decimal_str_view(const std::string& s)
-        : _view{s}
+        : decimal_str_view{s.data(), s.size()}
     {
     }
 
-    const utf8_view& view() const noexcept
+    const char* data() const noexcept
     {
-        return _view;
+        return buf;
+    }
+
+    size_t size() const noexcept
+    {
+        return len;
     }
 
 private:
-    utf8_view _view;
+    const char* buf;
+    size_t len;
 
     friend class line_sender_buffer;
 };

@@ -93,9 +93,8 @@ line_sender_utf8 symbol_value = QDB_UTF8_LITERAL("ETH-USD");
 if (!line_sender_buffer_symbol(buffer, symbol_name, symbol_value, &err))
     goto on_error;
 
-line_sender_utf8 price_value = QDB_UTF8_LITERAL("2615.54");
 if (!line_sender_buffer_column_dec_str(
-        buffer, price_name, price_value, &err))
+        buffer, price_name, "2615.54", strlen("2615.54"), &err))
     goto on_error;
 
 if (!line_sender_buffer_at_nanos(buffer, line_sender_now_nanos(), &err))

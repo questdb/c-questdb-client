@@ -607,6 +607,21 @@ class TestSender(unittest.TestCase):
         scrubbed_dataset = [row[:-1] for row in resp['dataset']]
         self.assertEqual(scrubbed_dataset, exp_dataset)
     
+    def test_decimal_invalid_characters(self):
+        if QDB_FIXTURE.version < DECIMAL_RELEASE:
+            self.skipTest('No decimal support in this version of QuestDB.')
+        if self.expected_protocol_version < qls.ProtocolVersion.V3:
+            self.skipTest('communicating over old protocol which does not support decimals')
+
+        table_name = uuid.uuid4().hex
+        with self.assertRaisesRegex(qls.SenderError, r'Bad call to'):
+            with self._mk_linesender() as sender:
+                with self.assertRaisesRegex(qls.SenderError, r'.*Decimal string contains invalid character*'):
+                    (sender
+                    .table(table_name)
+                    .column_dec_str('dec', "12.34abc")
+                    .at_now())
+    
     def test_decimal_not_available(self):
         if QDB_FIXTURE.version >= DECIMAL_RELEASE or QDB_FIXTURE.version >= (9, 1, 1): # remove the second condition when 9.2.0 is released
             self.skipTest('Decimal support is available in this version of QuestDB.')
