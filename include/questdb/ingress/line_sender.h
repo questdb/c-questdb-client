@@ -511,6 +511,10 @@ bool line_sender_buffer_column_str(
 /**
  * Record a decimal string value for the given column.
  *
+ * When specifying a decimal as a string, use a '.' to separate the whole from the
+ * fractional parts. For example, "12.20".
+ * Infinity is encoded as "+Infinity" or "-Infinity", while NaN as "NaN".
+ *
  * @param[in] buffer Line buffer object.
  * @param[in] name Column name.
  * @param[in] value Column value.

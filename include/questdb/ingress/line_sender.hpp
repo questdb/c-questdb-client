@@ -434,8 +434,9 @@ public:
     /**
      * Record an arbitrary-precision decimal value from a text representation.
      *
-     * This sends the decimal as a string (e.g., "123.456") to be parsed by
-     * the QuestDB server.
+     * When specifying a decimal as a string, use a '.' to separate the whole
+     * from the fractional parts. For example, "12.20".
+     * Infinity is encoded as "+Infinity" or "-Infinity", while NaN as "NaN".
      *
      * For better performance and precision control, consider using the binary
      * format via `decimal::decimal_view` instead.

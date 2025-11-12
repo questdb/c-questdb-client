@@ -1227,11 +1227,6 @@ def parse_args():
     sub_p = parser.add_subparsers(dest='command')
     run_p = sub_p.add_parser('run', help='Run tests')
     run_p.add_argument(
-        '--force-max-version',
-        action='store_true',
-        help='Force the client to assume the max version (999,999,999)'
-    )
-    run_p.add_argument(
         '--unittest-help',
         action='store_true',
         help='Show unittest --help')
@@ -1337,8 +1332,6 @@ def run_with_fixtures(args):
         try:
             sys.stderr.write(f'>>>> STARTING {questdb_dir} [auth={auth}] <<<<\n')
             QDB_FIXTURE.start()
-            if getattr(args, 'force_max_version', False):
-                QDB_FIXTURE.version = (999, 999, 999)
             for http, protocol_version, build_mode in itertools.product(
                     (False, True),  # http
                     [None] + list(qls.ProtocolVersion),  # None is for `auto`
