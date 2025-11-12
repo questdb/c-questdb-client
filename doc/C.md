@@ -30,6 +30,12 @@
 - [Array in C-major order](../examples/line_sender_c_example_array_c_major.c)
 
 **Decimal**
+
+:::caution
+When using decimal values, you must create the column with the appropriate type in
+QuestDB beforehand.
+:::
+
 - [Decimal in binary format](../examples/line_sender_c_example_decimal_binary.c)
 
 ## API Overview

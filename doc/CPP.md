@@ -31,6 +31,12 @@
 - [Custom array type integration](../examples/line_sender_cpp_example_array_custom.cpp)
 
 **Decimal**
+
+:::caution
+When using decimal values, you must create the column with the appropriate type in
+QuestDB beforehand.
+:::
+
 - [Decimal in binary format](../examples/line_sender_cpp_example_decimal_binary.cpp)
 - [Custom decimal type integration](../examples/line_sender_cpp_example_decimal_custom.cpp)
 
