@@ -274,7 +274,7 @@ the configuration string: `protocol_version=2;`.
 
 The [`Buffer::column_dec`](Buffer::column_dec) method supports efficient ingestion of decimals using several convenient types:
 
-- floating point representation with `&str`
+- floating-point representation with `&str`
 - decimals from the [`bigdecimal`](https://docs.rs/bigdecimal) crate
 - decimals from the [`rust_decimal`](https://docs.rs/rust_decimal) crate
 
