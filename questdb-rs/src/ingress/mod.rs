@@ -62,6 +62,9 @@ pub use buffer::*;
 mod sender;
 pub use sender::*;
 
+mod decimal;
+pub use decimal::DecimalView;
+
 const MAX_NAME_LEN_DEFAULT: usize = 127;
 
 /// The maximum allowed dimensions for arrays.
@@ -71,9 +74,11 @@ pub const MAX_ARRAY_DIM_LEN: usize = 0x0FFF_FFFF; // 1 << 28 - 1
 
 pub(crate) const ARRAY_BINARY_FORMAT_TYPE: u8 = 14;
 pub(crate) const DOUBLE_BINARY_FORMAT_TYPE: u8 = 16;
+#[allow(dead_code)]
+pub const DECIMAL_BINARY_FORMAT_TYPE: u8 = 23;
 
 /// The version of InfluxDB Line Protocol used to communicate with the server.
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq, PartialOrd)]
 pub enum ProtocolVersion {
     /// Version 1 of Line Protocol.
     /// Full-text protocol.
@@ -83,15 +88,29 @@ pub enum ProtocolVersion {
     /// Version 2 of InfluxDB Line Protocol.
     /// Uses binary format serialization for f64, and supports the array data type.
     /// This version is specific to QuestDB and is not compatible with InfluxDB.
-    /// QuestDB server version 9.0.0 or later is required for `V2` supported.
+    /// QuestDB server version 9.0.0 or later is required for `V2` support.
     V2 = 2,
+
+    /// Version 3 of InfluxDB Line Protocol.
+    /// Supports the decimal data type in text and binary formats.
+    /// This version is specific to QuestDB and is not compatible with InfluxDB.
+    /// QuestDB server version 9.2.0 or later is required for `V3` support.
+    V3 = 3,
 }
+
+/// List of supported protocol versions, in order of preference (highest to lowest).
+const SUPPORTED_PROTOCOL_VERSIONS: [ProtocolVersion; 3] = [
+    ProtocolVersion::V3,
+    ProtocolVersion::V2,
+    ProtocolVersion::V1,
+];
 
 impl Display for ProtocolVersion {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             ProtocolVersion::V1 => write!(f, "v1"),
             ProtocolVersion::V2 => write!(f, "v2"),
+            ProtocolVersion::V3 => write!(f, "v3"),
         }
     }
 }
@@ -417,11 +436,12 @@ impl SenderBuilder {
                 "protocol_version" => match val {
                     "1" => builder.protocol_version(ProtocolVersion::V1)?,
                     "2" => builder.protocol_version(ProtocolVersion::V2)?,
+                    "3" => builder.protocol_version(ProtocolVersion::V3)?,
                     "auto" => builder,
                     invalid => {
                         return Err(error::fmt!(
                             ConfigError,
-                            "invalid \"protocol_version\" [value={invalid}, allowed-values=[auto, 1, 2]]]\"]"
+                            "invalid \"protocol_version\" [value={invalid}, allowed-values=[auto, 1, 2, 3]]"
                         ));
                     }
                 },
@@ -1146,16 +1166,17 @@ impl SenderBuilder {
                         let (protocol_versions, server_max_name_len) =
                             read_server_settings(http_state, settings_url, max_name_len)?;
                         max_name_len = server_max_name_len;
-                        if protocol_versions.contains(&ProtocolVersion::V2) {
-                            ProtocolVersion::V2
-                        } else if protocol_versions.contains(&ProtocolVersion::V1) {
-                            ProtocolVersion::V1
-                        } else {
-                            return Err(fmt!(
-                                ProtocolVersionError,
-                                "Server does not support current client"
-                            ));
-                        }
+                        SUPPORTED_PROTOCOL_VERSIONS
+                            .iter()
+                            .find(|version| protocol_versions.contains(version))
+                            .copied()
+                            .ok_or_else(|| {
+                                fmt!(
+                                    ProtocolVersionError,
+                                    "Server does not support any of the client protocol versions: {:?}",
+                                    SUPPORTED_PROTOCOL_VERSIONS
+                                )
+                            })?
                     } else {
                         unreachable!("HTTP handler should be used for HTTP protocol");
                     }

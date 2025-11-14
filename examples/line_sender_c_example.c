@@ -10,7 +10,7 @@ static bool example(const char* host, const char* port)
     line_sender* sender = NULL;
     line_sender_buffer* buffer = NULL;
     char* conf_str =
-        concat("tcp::addr=", host, ":", port, ";protocol_version=2;");
+        concat("tcp::addr=", host, ":", port, ";protocol_version=3;");
     if (!conf_str)
     {
         fprintf(stderr, "Could not concatenate configuration string.\n");
@@ -51,7 +51,9 @@ static bool example(const char* host, const char* port)
     if (!line_sender_buffer_symbol(buffer, side_name, side_value, &err))
         goto on_error;
 
-    if (!line_sender_buffer_column_f64(buffer, price_name, 2615.54, &err))
+    // The table must be created beforehand with the appropriate DECIMAL(N,M) type for the column.
+    if (!line_sender_buffer_column_dec_str(
+            buffer, price_name, "2615.54", strlen("2615.54"), &err))
         goto on_error;
 
     if (!line_sender_buffer_column_f64(buffer, amount_name, 0.00044, &err))
@@ -72,6 +74,7 @@ static bool example(const char* host, const char* port)
     if (!line_sender_flush(sender, buffer, &err))
         goto on_error;
 
+    line_sender_buffer_free(buffer);
     line_sender_close(sender);
 
     return true;

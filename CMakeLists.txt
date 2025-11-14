@@ -133,6 +133,10 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
         line_sender_c_example_from_env
         examples/line_sender_c_example_from_env.c)
     compile_example(
+        line_sender_c_example_decimal_binary
+        examples/concat.c
+        examples/line_sender_c_example_decimal_binary.c)
+    compile_example(
         line_sender_cpp_example
         examples/line_sender_cpp_example.cpp)
     compile_example(
@@ -165,6 +169,12 @@ if (QUESTDB_TESTS_AND_EXAMPLES)
     compile_example(
         line_sender_cpp_example_from_env
         examples/line_sender_cpp_example_from_env.cpp)
+    compile_example(
+        line_sender_cpp_example_decimal_custom
+        examples/line_sender_cpp_example_decimal_custom.cpp)
+    compile_example(
+        line_sender_cpp_example_decimal_binary
+        examples/line_sender_cpp_example_decimal_binary.cpp)
 
     # Include Rust tests as part of the tests run
     add_test(

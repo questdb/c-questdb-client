@@ -49,7 +49,7 @@ from fixture import (
     list_questdb_releases,
     AUTH)
 import subprocess
-from collections import namedtuple
+from decimal import Decimal
 
 QDB_FIXTURE: QuestDbFixtureBase = None
 TLS_PROXY_FIXTURE: TlsProxyFixture = None
@@ -57,10 +57,14 @@ BUILD_MODE = None
 
 # The first QuestDB version that supports array types.
 FIRST_ARRAYS_RELEASE = (8, 3, 3)
+DECIMAL_RELEASE = (9, 2, 0)
 
 
 def retry_check_table(*args, **kwargs):
     return QDB_FIXTURE.retry_check_table(*args, **kwargs)
+
+def sql_query(query: str):
+    return QDB_FIXTURE.http_sql_query(query)
 
 
 # Valid keys, but not registered with the QuestDB fixture.
@@ -121,18 +125,16 @@ class TestSender(unittest.TestCase):
     
     @property
     def client_driven_nanos_supported(self) -> bool:
-        return False
-        ### Re-enable once https://github.com/questdb/questdb/pull/6220 is merged.
         # """True if the QuestDB server supports nanos and also respects the client's precision for the designated timestamp."""
-        # if QDB_FIXTURE.version <= (9, 1, 0):
-        #     return False
+        if QDB_FIXTURE.version <= (9, 1, 0):
+            return False
 
-        # if QDB_FIXTURE.http:
-        #     return QDB_FIXTURE.protocol_version != qls.ProtocolVersion.V1
-        # elif QDB_FIXTURE.protocol_version is None:
-        #     return False # TCP defaults to ProtocolVersion.V1
-        # else:
-        #     return QDB_FIXTURE.protocol_version >= qls.ProtocolVersion.V2
+        if QDB_FIXTURE.http:
+            return QDB_FIXTURE.protocol_version != qls.ProtocolVersion.V1
+        elif QDB_FIXTURE.protocol_version is None:
+            return False # TCP defaults to ProtocolVersion.V1
+        else:
+            return QDB_FIXTURE.protocol_version >= qls.ProtocolVersion.V2
 
     @property
     def expected_protocol_version(self) -> qls.ProtocolVersion:
@@ -143,6 +145,9 @@ class TestSender(unittest.TestCase):
 
             if QDB_FIXTURE.version >= FIRST_ARRAYS_RELEASE:
                 return qls.ProtocolVersion.V2
+
+            if QDB_FIXTURE.version >= DECIMAL_RELEASE:
+                return qls.ProtocolVersion.V3
 
             return qls.ProtocolVersion.V1
 
@@ -564,6 +569,73 @@ class TestSender(unittest.TestCase):
         scrubbed_dataset = [row[:-1] for row in resp['dataset']]
         self.assertEqual(scrubbed_dataset, exp_dataset)
 
+    def test_decimal_column(self):
+        if QDB_FIXTURE.version < DECIMAL_RELEASE:
+            self.skipTest('No decimal support in this version of QuestDB.')
+        if self.expected_protocol_version < qls.ProtocolVersion.V3:
+            self.skipTest('communicating over old protocol which does not support decimals')
+
+        table_name = uuid.uuid4().hex
+        sql_query(f'CREATE TABLE "{table_name}" (dec DECIMAL(18,3), timestamp TIMESTAMP) TIMESTAMP(timestamp) PARTITION BY DAY;')
+
+        pending = None
+        decimals = [
+            Decimal("12.99"),
+            Decimal("-12.34"),
+            Decimal("0.001"),
+            Decimal("10000000.0"),
+            Decimal("NaN"),
+            Decimal("Infinity"),
+            Decimal("0"),
+            Decimal("-0"),
+            Decimal("1e3")
+        ]
+        with self._mk_linesender() as sender:
+            for dec in decimals:
+                sender.table(table_name)
+                sender.column('dec', dec)
+                sender.at_now()
+            pending = sender.buffer.peek()
+
+        resp = retry_check_table(table_name, min_rows=len(decimals), log_ctx=pending)
+        exp_columns = [
+            {'name': 'dec', 'type': 'DECIMAL(18,3)'},
+            {'name': 'timestamp', 'type': 'TIMESTAMP'}]
+        self.assertEqual(resp['columns'], exp_columns)
+        # By default, the decimal created as a scale of 3
+        exp_dataset = [['12.990'], ['-12.340'], ['0.001'], ['10000000.000'], [None], [None], ['0.000'], ['0.000'], ['1000.000']]
+        scrubbed_dataset = [row[:-1] for row in resp['dataset']]
+        self.assertEqual(scrubbed_dataset, exp_dataset)
+    
+    def test_decimal_invalid_characters(self):
+        if QDB_FIXTURE.version < DECIMAL_RELEASE:
+            self.skipTest('No decimal support in this version of QuestDB.')
+        if self.expected_protocol_version < qls.ProtocolVersion.V3:
+            self.skipTest('communicating over old protocol which does not support decimals')
+
+        table_name = uuid.uuid4().hex
+        with self.assertRaisesRegex(qls.SenderError, r'Bad call to'):
+            with self._mk_linesender() as sender:
+                with self.assertRaisesRegex(qls.SenderError, r'.*Decimal string contains invalid character*'):
+                    (sender
+                    .table(table_name)
+                    .column_dec_str('dec', "12.34abc")
+                    .at_now())
+    
+    def test_decimal_not_available(self):
+        if QDB_FIXTURE.version >= DECIMAL_RELEASE or QDB_FIXTURE.version >= (9, 1, 1): # remove the second condition when 9.2.0 is released
+            self.skipTest('Decimal support is available in this version of QuestDB.')
+        if self.expected_protocol_version >= qls.ProtocolVersion.V3:
+            self.skipTest('communicating over new protocol which supports decimals')
+        table_name = uuid.uuid4().hex
+        with self.assertRaisesRegex(qls.SenderError, r'Bad call to'):
+            with self._mk_linesender() as sender:
+                with self.assertRaisesRegex(qls.SenderError, r'.*does not support the decimal datatype*'):
+                    (sender
+                    .table(table_name)
+                    .column('dec', Decimal("12.34"))
+                    .at_now())
+
     def test_f64_arr_column(self):
         if self.expected_protocol_version < qls.ProtocolVersion.V2:
             self.skipTest('communicating over old protocol which does not support arrays')
@@ -777,6 +849,11 @@ class TestSender(unittest.TestCase):
             self.skipTest('BuildMode.API-only test')
         if tls and not QDB_FIXTURE.auth:
             self.skipTest('No auth')
+        
+        exp_ts_type = 'TIMESTAMP_NS' if self.client_driven_nanos_supported else 'TIMESTAMP'
+        # Decimal columns must be created manually beforehand.
+        sql_query(f'''CREATE TABLE "{table_name}" (price DECIMAL(18,3), timestamp {exp_ts_type}) TIMESTAMP(timestamp) PARTITION BY DAY;''')
+
         # Call the example program.
         proj = Project()
         ext = '.exe' if sys.platform == 'win32' else ''
@@ -797,24 +874,27 @@ class TestSender(unittest.TestCase):
 
         # Check inserted data.
         resp = retry_check_table(table_name)
-        exp_ts_type = 'TIMESTAMP_NS' if self.client_driven_nanos_supported else 'TIMESTAMP'
         exp_columns = [
+            {'name': 'price', 'type': 'DECIMAL(18,3)'},
+            {'name': 'timestamp', 'type': exp_ts_type},
             {'name': 'symbol', 'type': 'SYMBOL'},
             {'name': 'side', 'type': 'SYMBOL'},
-            {'name': 'price', 'type': 'DOUBLE'},
-            {'name': 'amount', 'type': 'DOUBLE'},
-            {'name': 'timestamp', 'type': exp_ts_type}]
+            {'name': 'amount', 'type': 'DOUBLE'}
+        ]
         self.assertEqual(resp['columns'], exp_columns)
 
-        exp_dataset = [['ETH-USD',
+        exp_dataset = [['2615.540',
+                        'ETH-USD',
                         'sell',
-                        2615.54,
                         0.00044]]
         # Comparison excludes timestamp column.
-        scrubbed_dataset = [row[:-1] for row in resp['dataset']]
+        scrubbed_dataset = [row[:1] + row[2:] for row in resp['dataset']]
         self.assertEqual(scrubbed_dataset, exp_dataset)
 
     def test_c_example(self):
+        if QDB_FIXTURE.version < DECIMAL_RELEASE:
+            self.skipTest('No decimal support in this version of QuestDB.')
+
         suffix = '_auth' if QDB_FIXTURE.auth else ''
         suffix += '_http' if QDB_FIXTURE.http else ''
         self._test_example(
@@ -822,6 +902,9 @@ class TestSender(unittest.TestCase):
             f'c_trades{suffix}')
 
     def test_cpp_example(self):
+        if QDB_FIXTURE.version < DECIMAL_RELEASE:
+            self.skipTest('No decimal support in this version of QuestDB.')
+
         suffix = '_auth' if QDB_FIXTURE.auth else ''
         suffix += '_http' if QDB_FIXTURE.http else ''
         self._test_example(
@@ -829,12 +912,18 @@ class TestSender(unittest.TestCase):
             f'cpp_trades{suffix}')
 
     def test_c_tls_example(self):
+        if QDB_FIXTURE.version < DECIMAL_RELEASE:
+            self.skipTest('No decimal support in this version of QuestDB.')
+
         self._test_example(
             'line_sender_c_example_tls_ca',
             'c_trades_tls_ca',
             tls=True)
 
     def test_cpp_tls_example(self):
+        if QDB_FIXTURE.version < DECIMAL_RELEASE:
+            self.skipTest('No decimal support in this version of QuestDB.')
+
         self._test_example(
             'line_sender_cpp_example_tls_ca',
             'cpp_trades_tls_ca',
@@ -1190,7 +1279,7 @@ def run_with_existing(args):
         (999, 999, 999),
         True,
         False,
-        qls.ProtocolVersion.V2
+        qls.ProtocolVersion.V3
     )
     unittest.main()
 

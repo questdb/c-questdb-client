@@ -3,6 +3,7 @@
 
 using namespace std::literals::string_view_literals;
 using namespace questdb::ingress::literals;
+using namespace questdb::ingress::decimal;
 
 static bool example(std::string_view host, std::string_view port)
 {
@@ -24,7 +25,8 @@ static bool example(std::string_view host, std::string_view port)
         buffer.table(table_name)
             .symbol(symbol_name, "ETH-USD"_utf8)
             .symbol(side_name, "sell"_utf8)
-            .column(price_name, 2615.54)
+        // The table must be created beforehand with the appropriate DECIMAL(N,M) type for the column.
+            .column(price_name, "2615.54"_decimal)
             .column(amount_name, 0.00044)
             .at(questdb::ingress::timestamp_nanos::now());
 
@@ -52,11 +54,12 @@ static bool displayed_help(int argc, const char* argv[])
         const std::string_view arg{argv[index]};
         if ((arg == "-h"sv) || (arg == "--help"sv))
         {
-            std::cerr << "Usage:\n"
-                      << "line_sender_c_example: [HOST [PORT]]\n"
-                      << "    HOST: ILP host (defaults to \"localhost\").\n"
-                      << "    PORT: ILP port (defaults to \"9009\")."
-                      << std::endl;
+            std::cerr
+                << "Usage:\n"
+                << "  " << argv[0] << ": [HOST [PORT]]\n"
+                << "    HOST: ILP/HTTP host (defaults to \"localhost\").\n"
+                << "    PORT: ILP/HTTP port (defaults to \"9000\")."
+                << std::endl;
             return true;
         }
     }
@@ -71,7 +74,7 @@ int main(int argc, const char* argv[])
     auto host = "localhost"sv;
     if (argc >= 2)
         host = std::string_view{argv[1]};
-    auto port = "9009"sv;
+    auto port = "9000"sv;
     if (argc >= 3)
         port = std::string_view{argv[2]};
 

@@ -25,6 +25,7 @@
 #![allow(non_camel_case_types, clippy::missing_safety_doc)]
 
 use libc::{c_char, size_t};
+use questdb::ingress::DecimalView;
 use std::ascii;
 use std::boxed::Box;
 use std::convert::{From, Into};
@@ -223,6 +224,9 @@ pub enum line_sender_error_code {
 
     /// Line sender protocol version error.
     line_sender_error_protocol_version_error,
+
+    /// The supplied decimal is invalid.
+    line_sender_error_invalid_decimal,
 }
 
 impl From<ErrorCode> for line_sender_error_code {
@@ -251,6 +255,7 @@ impl From<ErrorCode> for line_sender_error_code {
             ErrorCode::ProtocolVersionError => {
                 line_sender_error_code::line_sender_error_protocol_version_error
             }
+            ErrorCode::InvalidDecimal => line_sender_error_code::line_sender_error_invalid_decimal,
         }
     }
 }
@@ -306,8 +311,14 @@ pub enum ProtocolVersion {
     /// Version 2 of InfluxDB Line Protocol.
     /// Uses binary format serialization for f64, and supports the array data type.
     /// This version is specific to QuestDB and is not compatible with InfluxDB.
-    /// QuestDB server version 9.0.0 or later is required for `V2` supported.
+    /// QuestDB server version 9.0.0 or later is required for `V2` support.
     V2 = 2,
+
+    /// Version 3 of InfluxDB Line Protocol.
+    /// Supports the decimal data type in text and binary formats.
+    /// This version is specific to QuestDB and is not compatible with InfluxDB.
+    /// QuestDB server version 9.2.0 or later is required for `V3` support.
+    V3 = 3,
 }
 
 impl From<ProtocolVersion> for ingress::ProtocolVersion {
@@ -315,6 +326,7 @@ impl From<ProtocolVersion> for ingress::ProtocolVersion {
         match version {
             ProtocolVersion::V1 => ingress::ProtocolVersion::V1,
             ProtocolVersion::V2 => ingress::ProtocolVersion::V2,
+            ProtocolVersion::V3 => ingress::ProtocolVersion::V3,
         }
     }
 }
@@ -324,6 +336,7 @@ impl From<ingress::ProtocolVersion> for ProtocolVersion {
         match version {
             ingress::ProtocolVersion::V1 => ProtocolVersion::V1,
             ingress::ProtocolVersion::V2 => ProtocolVersion::V2,
+            ingress::ProtocolVersion::V3 => ProtocolVersion::V3,
         }
     }
 }
@@ -575,7 +588,7 @@ pub struct line_sender_column_name {
 }
 
 impl line_sender_column_name {
-    unsafe fn as_name<'a>(&self) -> ColumnName<'a> {
+    fn as_name<'a>(&self) -> ColumnName<'a> {
         unsafe {
             let str_name =
                 str::from_utf8_unchecked(slice::from_raw_parts(self.buf as *const u8, self.len));
@@ -987,6 +1000,102 @@ pub unsafe extern "C" fn line_sender_buffer_column_str(
         bubble_err_to_c!(err_out, buffer.column_str(name, value));
         true
     }
+}
+
+/// Record a decimal string value for the given column.
+///
+/// When specifying a decimal as a string, use a '.' to separate the whole from the
+/// fractional parts. For example, "12.20".
+/// Infinity is encoded as "+Infinity" or "-Infinity", while NaN as "NaN".
+/// Note that Infinity and NaN values decay to nulls when stored in the database.
+///
+/// @param[in] buffer Line buffer object.
+/// @param[in] name Column name.
+/// @param[in] value Column value.
+/// @param[out] err_out Set on error.
+/// @return true on success, false on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_buffer_column_dec_str(
+    buffer: *mut line_sender_buffer,
+    name: line_sender_column_name,
+    value: *mut c_char,
+    value_len: size_t,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    let buffer = unsafe { unwrap_buffer_mut(buffer) };
+    let name = name.as_name();
+    let value = unsafe { slice::from_raw_parts(value as *const u8, value_len) };
+    // Basic validation: ensure only numerical characters are present (accepts NaN, Inf[inity], and e-notation)
+    for b in value.iter() {
+        match b {
+            b'0'..=b'9'
+            | b'.'
+            | b'-'
+            | b'+'
+            | b'e'
+            | b'E'
+            | b'N'
+            | b'a'
+            | b'I'
+            | b'n'
+            | b'f'
+            | b'i'
+            | b't'
+            | b'y' => {}
+            _ => {
+                unsafe {
+                    *err_out = Box::into_raw(Box::new(line_sender_error(questdb::Error::new(
+                        questdb::ErrorCode::InvalidDecimal,
+                        format!("Decimal string contains invalid character {:?}", b),
+                    ))));
+                }
+                return false;
+            }
+        }
+    }
+    let value = unsafe { str::from_utf8_unchecked(value) };
+    unsafe {
+        bubble_err_to_c!(
+            err_out,
+            buffer.column_dec(name, DecimalView::String { value })
+        );
+    }
+    true
+}
+
+/// Record a decimal value for the given column.
+///
+/// There is no equivalent of NaN or Infinity when specifying decimals in binary format.
+/// Those special values have no meaning for decimals and should be encoded as nulls instead.
+///
+/// @param[in] buffer Line buffer object.
+/// @param[in] name Column name.
+/// @param[in] scale Number of digits after the decimal point
+/// @param[in] data Unscaled value in two's complement format, big-endian
+/// @param[in] data_len Length of the unscaled value array
+/// @param[out] err_out Set on error.
+/// @return true on success, false on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_buffer_column_dec(
+    buffer: *mut line_sender_buffer,
+    name: line_sender_column_name,
+    scale: u32,
+    data: *const u8,
+    data_len: size_t,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe {
+        let data = if data.is_null() {
+            &[]
+        } else {
+            slice::from_raw_parts(data, data_len)
+        };
+        let buffer = unwrap_buffer_mut(buffer);
+        let name = name.as_name();
+        let decimal = bubble_err_to_c!(err_out, DecimalView::try_new_scaled(scale, data));
+        bubble_err_to_c!(err_out, buffer.column_dec(name, decimal));
+    }
+    true
 }
 
 /// Records a float64 multidimensional array with **C-MAJOR memory layout**.

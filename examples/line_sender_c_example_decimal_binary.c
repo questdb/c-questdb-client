@@ -2,17 +2,30 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <string.h>
+#include "concat.h"
 
-int main(int argc, const char* argv[])
+static bool example(const char* host, const char* port)
 {
     line_sender_error* err = NULL;
+    line_sender* sender = NULL;
     line_sender_buffer* buffer = NULL;
+    char* conf_str = concat("http::addr=", host, ":", port, ";");
+    if (!conf_str)
+    {
+        fprintf(stderr, "Could not concatenate configuration string.\n");
+        return false;
+    }
+    line_sender_utf8 conf_str_utf8 = {0, NULL};
+    if (!line_sender_utf8_init(
+            &conf_str_utf8, strlen(conf_str), conf_str, &err))
+        goto on_error;
 
-    line_sender_utf8 conf =
-        QDB_UTF8_LITERAL("tcp::addr=localhost:9009;protocol_version=3;");
-    line_sender* sender = line_sender_from_conf(conf, &err);
+    sender = line_sender_from_conf(conf_str_utf8, &err);
     if (!sender)
         goto on_error;
+
+    free(conf_str);
+    conf_str = NULL;
 
     buffer = line_sender_buffer_new_for_sender(sender);
     line_sender_buffer_reserve(buffer, 64 * 1024); // 64KB buffer initial size.
@@ -21,7 +34,7 @@ int main(int argc, const char* argv[])
     // If we're inserting multiple rows, this allows us to avoid
     // re-validating the same strings over and over again.
     line_sender_table_name table_name =
-        QDB_TABLE_NAME_LITERAL("c_trades_from_conf");
+        QDB_TABLE_NAME_LITERAL("c_trades_decimal");
     line_sender_column_name symbol_name = QDB_COLUMN_NAME_LITERAL("symbol");
     line_sender_column_name side_name = QDB_COLUMN_NAME_LITERAL("side");
     line_sender_column_name price_name = QDB_COLUMN_NAME_LITERAL("price");
@@ -39,8 +52,10 @@ int main(int argc, const char* argv[])
         goto on_error;
 
     // The table must be created beforehand with the appropriate DECIMAL(N,M) type for the column.
-    if (!line_sender_buffer_column_dec_str(
-            buffer, price_name, "2615.54", strlen("2615.54"), &err))
+    // 123 with a scale of 1 gives a decimal of 12.3
+    const uint8_t price_unscaled_value[] = {123};
+    if (!line_sender_buffer_column_dec(
+            buffer, price_name, 1, price_unscaled_value, 1, &err))
         goto on_error;
 
     if (!line_sender_buffer_column_f64(buffer, amount_name, 0.00044, &err))
@@ -64,14 +79,52 @@ int main(int argc, const char* argv[])
     line_sender_buffer_free(buffer);
     line_sender_close(sender);
 
-    return 0;
+    return true;
 
 on_error:;
     size_t err_len = 0;
     const char* err_msg = line_sender_error_msg(err, &err_len);
     fprintf(stderr, "Error running example: %.*s\n", (int)err_len, err_msg);
+    free(conf_str);
     line_sender_error_free(err);
     line_sender_buffer_free(buffer);
     line_sender_close(sender);
-    return 1;
+    return false;
+}
+
+static bool displayed_help(int argc, const char* argv[])
+{
+    for (int index = 1; index < argc; ++index)
+    {
+        const char* arg = argv[index];
+        if ((strncmp(arg, "-h", 2) == 0) || (strncmp(arg, "--help", 6) == 0))
+        {
+            fprintf(stderr, "Usage:\n");
+            fprintf(
+                stderr,
+                "line_sender_c_example_decimal_binary: [HOST [PORT]]\n");
+            fprintf(
+                stderr,
+                "    HOST: ILP/HTTP host (defaults to \"localhost\").\n");
+            fprintf(
+                stderr, "    PORT: ILP/HTTP port (defaults to \"9000\").\n");
+            return true;
+        }
+    }
+    return false;
+}
+
+int main(int argc, const char* argv[])
+{
+    if (displayed_help(argc, argv))
+        return 0;
+
+    const char* host = "localhost";
+    if (argc >= 2)
+        host = argv[1];
+    const char* port = "9000";
+    if (argc >= 3)
+        port = argv[2];
+
+    return !example(host, port);
 }

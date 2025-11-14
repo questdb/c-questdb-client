@@ -37,7 +37,9 @@ int main(int argc, const char* argv[])
     if (!line_sender_buffer_symbol(buffer, side_name, side_value, &err))
         goto on_error;
 
-    if (!line_sender_buffer_column_f64(buffer, price_name, 2615.54, &err))
+    // The table must be created beforehand with the appropriate DECIMAL(N,M) type for the column.
+    if (!line_sender_buffer_column_dec_str(
+            buffer, price_name, "2615.54", strlen("2615.54"), &err))
         goto on_error;
 
     if (!line_sender_buffer_column_f64(buffer, amount_name, 0.00044, &err))
@@ -58,6 +60,7 @@ int main(int argc, const char* argv[])
     if (!line_sender_flush(sender, buffer, &err))
         goto on_error;
 
+    line_sender_buffer_free(buffer);
     line_sender_close(sender);
 
     return 0;

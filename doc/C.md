@@ -29,6 +29,18 @@
 - [Array with element strides](../examples/line_sender_c_example_array_elem_strides.c)
 - [Array in C-major order](../examples/line_sender_c_example_array_c_major.c)
 
+**Decimal**
+- [Decimal in binary format](../examples/line_sender_c_example_decimal_binary.c)
+
+## Table and column auto-creation
+
+When you send data to a table that does not yet exist, QuestDB creates the table automatically and infers column types from the first row.
+The same applies to brand-new columns added to an existing table: most column types are created on the fly based on the values you send.
+Decimal columns are the main exception.
+
+Because the client cannot infer the desired scale and precision, QuestDB refuses to auto-create decimal columns.
+Define those columns ahead of time with an explicit `create table` (or `alter table add column`) statement before you start sending decimal values.
+
 ## API Overview
 
 ### Header
@@ -90,7 +102,8 @@ line_sender_utf8 symbol_value = QDB_UTF8_LITERAL("ETH-USD");
 if (!line_sender_buffer_symbol(buffer, symbol_name, symbol_value, &err))
     goto on_error;
 
-if (!line_sender_buffer_column_f64(buffer, price_name, 2615.54, &err))
+if (!line_sender_buffer_column_dec_str(
+        buffer, price_name, "2615.54", strlen("2615.54"), &err))
     goto on_error;
 
 if (!line_sender_buffer_at_nanos(buffer, line_sender_now_nanos(), &err))
@@ -101,6 +114,7 @@ if (!line_sender_buffer_at_nanos(buffer, line_sender_now_nanos(), &err))
 if (!line_sender_flush(sender, buffer, &err))
     goto on_error;
 
+line_sender_buffer_free(buffer);
 line_sender_close(sender);
 ```
 

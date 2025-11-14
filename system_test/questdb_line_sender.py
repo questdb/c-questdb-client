@@ -49,6 +49,7 @@ import os
 from datetime import datetime
 from functools import total_ordering
 from enum import Enum
+from decimal import Decimal
 
 from ctypes import (
     c_bool,
@@ -101,6 +102,7 @@ c_protocol_version = ctypes.c_int
 class ProtocolVersion(Enum):
     V1 = (c_protocol_version(1), '1')
     V2 = (c_protocol_version(2), '2')
+    V3 = (c_protocol_version(3), '3')
 
     @classmethod
     def from_int(cls, value: c_protocol_version):
@@ -289,6 +291,14 @@ def _setup_cdll():
         c_line_sender_buffer_p,
         c_line_sender_column_name,
         c_line_sender_utf8,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_column_dec_str,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_column_name,
+        c_char_p,
+        c_size_t,
         c_line_sender_error_p_p)
     set_sig(
         dll.line_sender_buffer_column_f64_arr_byte_strides,
@@ -677,6 +687,15 @@ class Buffer:
             _utf8(value))
         return self
 
+    def column_dec_str(self, name: str, value: str):
+        c_utf8 = value.encode('utf-8')
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_column_dec_str,
+            self._impl,
+            _column_name(name),
+            c_utf8,
+            len(c_utf8))
+
     def column(
             self, name: str,
             value: Union[bool, int, float, str, TimestampMicros, datetime]):
@@ -704,6 +723,8 @@ class Buffer:
                 self._impl,
                 _column_name(name),
                 _utf8(value))
+        elif isinstance(value, Decimal):
+            self.column_dec_str(name, str(value))
         elif isinstance(value, TimestampMicros):
             _error_wrapped_call(
                 _DLL.line_sender_buffer_column_ts_micros,
@@ -727,7 +748,7 @@ class Buffer:
             fqn = _fully_qual_name(value)
             raise ValueError(
                 f'Bad field value of type {fqn}: Expected one of '
-                '`bool`, `int`, `float` or `str`.')
+                '`bool`, `int`, `float`, `str`, `Decimal`, `TimestampMicros`, or `datetime`.')
         return self
 
     def column_f64_arr(self, name: str,
@@ -915,8 +936,14 @@ class Sender:
 
     def column(
             self, name: str,
-            value: Union[bool, int, float, str, TimestampMicros, TimestampNanos, datetime]):
+            value: Union[bool, int, float, str, Decimal, TimestampMicros, TimestampNanos, datetime]):
         self._buffer.column(name, value)
+        return self
+    
+    def column_dec_str(
+            self, name: str,
+            value: str):
+        self._buffer.column_dec_str(name, value)
         return self
 
     def column_f64_arr(

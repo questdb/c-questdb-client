@@ -3,35 +3,33 @@
 
 using namespace std::literals::string_view_literals;
 using namespace questdb::ingress::literals;
-using namespace questdb::ingress::decimal;
 
 static bool example(std::string_view host, std::string_view port)
 {
     try
     {
         auto sender = questdb::ingress::line_sender::from_conf(
-            "tcp::addr=" + std::string{host} + ":" + std::string{port} +
-            ";protocol_version=3;"
-            "username=admin;"
-            "token=5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48;"
-            "token_x=fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU;"
-            "token_y=Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac;");
+            "http::addr=" + std::string{host} + ":" + std::string{port} + ";");
 
         // We prepare all our table names and column names in advance.
         // If we're inserting multiple rows, this allows us to avoid
         // re-validating the same strings over and over again.
-        const auto table_name = "cpp_trades_auth"_tn;
+        const auto table_name = "cpp_trades_decimal"_tn;
         const auto symbol_name = "symbol"_cn;
         const auto side_name = "side"_cn;
         const auto price_name = "price"_cn;
         const auto amount_name = "amount"_cn;
+        const uint8_t price_unscaled_value[] = {123};
+        // The table must be created beforehand with the appropriate DECIMAL(N,M) type for the column.
+        // 123 with a scale of 1 gives a decimal of 12.3
+        const auto price_value =
+            questdb::ingress::decimal::decimal_view(1, price_unscaled_value);
 
         questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
         buffer.table(table_name)
             .symbol(symbol_name, "ETH-USD"_utf8)
             .symbol(side_name, "sell"_utf8)
-        // The table must be created beforehand with the appropriate DECIMAL(N,M) type for the column.
-            .column(price_name, "2615.54"_decimal)
+            .column(price_name, price_value)
             .column(amount_name, 0.00044)
             .at(questdb::ingress::timestamp_nanos::now());
 
@@ -59,11 +57,12 @@ static bool displayed_help(int argc, const char* argv[])
         const std::string_view arg{argv[index]};
         if ((arg == "-h"sv) || (arg == "--help"sv))
         {
-            std::cerr << "Usage:\n"
-                      << "line_sender_c_example: [HOST [PORT]]\n"
-                      << "    HOST: ILP host (defaults to \"localhost\").\n"
-                      << "    PORT: ILP port (defaults to \"9009\")."
-                      << std::endl;
+            std::cerr
+                << "Usage:\n"
+                << "  " << argv[0] << ": [HOST [PORT]]\n"
+                << "    HOST: ILP/HTTP host (defaults to \"localhost\").\n"
+                << "    PORT: ILP/HTTP port (defaults to \"9000\")."
+                << std::endl;
             return true;
         }
     }
@@ -78,7 +77,7 @@ int main(int argc, const char* argv[])
     auto host = "localhost"sv;
     if (argc >= 2)
         host = std::string_view{argv[1]};
-    auto port = "9009"sv;
+    auto port = "9000"sv;
     if (argc >= 3)
         port = std::string_view{argv[2]};
 

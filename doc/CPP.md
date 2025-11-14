@@ -30,6 +30,19 @@
 - [Array in C-major order](../examples/line_sender_cpp_example_array_c_major.cpp)
 - [Custom array type integration](../examples/line_sender_cpp_example_array_custom.cpp)
 
+**Decimal**
+- [Decimal in binary format](../examples/line_sender_cpp_example_decimal_binary.cpp)
+- [Custom decimal type integration](../examples/line_sender_cpp_example_decimal_custom.cpp)
+
+## Table and column auto-creation
+
+When you send data to a table that does not yet exist, QuestDB creates the table automatically and infers column types from the first row.
+The same applies to brand-new columns added to an existing table: most column types are created on the fly based on the values you send.
+Decimal columns are the main exception.
+
+Because the client cannot infer the desired scale and precision, QuestDB refuses to auto-create decimal columns.
+Define those columns ahead of time with an explicit `create table` (or `alter table add column`) statement before you start sending decimal values.
+
 ## API Overview
 
 ### Header
@@ -76,7 +89,7 @@ questdb::ingress::line_sender_buffer buffer;
 buffer
     .table("trades")
     .symbol("symbol", "ETH-USD")
-    .column("price", 2615.54)
+    .column("price", "2615.54"_decimal)
     .at(timestamp_nanos::now());
 
 // To insert more records, call `buffer.table(..)...` again.

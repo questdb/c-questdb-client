@@ -64,7 +64,7 @@ stages:
               mavenPOMFile: "questdb/pom.xml"
               jdkVersionOption: "1.17"
               options: "-DskipTests -Pbuild-web-console"
-          ############################# temp for test end ##################### 
+          ############################# temp for test end #####################
           - script: python3 ci/run_all_tests.py
             env:
               JAVA_HOME: $(JAVA_HOME_11_X64)
@@ -76,7 +76,7 @@ stages:
       - job: FormatAndLinting
         displayName: "cargo fmt and clippy"
         pool:
-          vmImage: 'ubuntu-latest'
+          vmImage: "ubuntu-latest"
         timeoutInMinutes: 10
         steps:
           - checkout: self
@@ -117,7 +117,7 @@ stages:
       - job: TestVsQuestDBMaster
         displayName: "Vs QuestDB 'master'"
         pool:
-          vmImage: 'ubuntu-latest'
+          vmImage: "ubuntu-latest"
         timeoutInMinutes: 60
         steps:
           - checkout: self
@@ -131,8 +131,8 @@ stages:
           - task: Maven@3
             displayName: "Compile QuestDB"
             inputs:
-              mavenPOMFile: 'questdb/pom.xml'
-              jdkVersionOption: '1.17'
+              mavenPOMFile: "questdb/pom.xml"
+              jdkVersionOption: "1.17"
               options: "-DskipTests -Pbuild-web-console"
           - script: |
               python3 system_test/test.py run --repo ./questdb -v

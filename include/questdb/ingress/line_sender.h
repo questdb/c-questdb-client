@@ -83,6 +83,9 @@ typedef enum line_sender_error_code
 
     /**  Line sender protocol version error. */
     line_sender_error_protocol_version_error,
+
+    /** The supplied decimal is invalid. */
+    line_sender_error_invalid_decimal,
 } line_sender_error_code;
 
 /** The protocol used to connect with. */
@@ -119,6 +122,15 @@ typedef enum line_sender_protocol_version
      * `line_sender_protocol_version_2` support.
      */
     line_sender_protocol_version_2 = 2,
+
+    /**
+     * Version 3 of InfluxDB Line Protocol.
+     * Supports the decimal data type in text and binary formats.
+     * This version is specific to QuestDB and not compatible with InfluxDB.
+     * QuestDB server version 9.2.0 or later is required for
+     * `line_sender_protocol_version_3` support.
+     */
+    line_sender_protocol_version_3 = 3,
 } line_sender_protocol_version;
 
 /** Possible sources of the root certificates used to validate the server's
@@ -497,6 +509,48 @@ bool line_sender_buffer_column_str(
     line_sender_error** err_out);
 
 /**
+ * Record a decimal string value for the given column.
+ *
+ * When specifying a decimal as a string, use a '.' to separate the whole from the
+ * fractional parts. For example, "12.20".
+ * Infinity is encoded as "+Infinity" or "-Infinity", while NaN as "NaN".
+ * Note that Infinity and NaN values decay to nulls when stored in the database.
+ *
+ * @param[in] buffer Line buffer object.
+ * @param[in] name Column name.
+ * @param[in] value Column value.
+ * @param[out] err_out Set on error.
+ * @return true on success, false on error.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_dec_str(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    const char *value,
+    size_t value_len,
+    line_sender_error** err_out);
+
+/**
+ * Record a decimal value for the given column.
+ *
+ * @param[in] buffer Line buffer object.
+ * @param[in] name Column name.
+ * @param[in] scale Number of digits after the decimal point
+ * @param[in] data Unscaled value in two's complement format, big-endian
+ * @param[in] data_len Length of the unscaled value array
+ * @param[out] err_out Set on error.
+ * @return true on success, false on error.
+ */
+LINESENDER_API
+bool line_sender_buffer_column_dec(
+    line_sender_buffer* buffer,
+    line_sender_column_name name,
+    const unsigned int scale,
+    const uint8_t* data,
+    size_t data_len,
+    line_sender_error** err_out);
+
+/**
  * Record a multidimensional array of `double` values in C-major order.
  *
  * QuestDB server version 9.0.0 or later is required for array support.
@@ -842,6 +896,9 @@ bool line_sender_opts_token_y(
  *
  * QuestDB server version 9.0.0 or later is required for
  * `line_sender_protocol_version_2` support.
+ *
+ * QuestDB server version 9.2.0 or later is required for
+ * `line_sender_protocol_version_3` support.
  */
 LINESENDER_API
 bool line_sender_opts_protocol_version(

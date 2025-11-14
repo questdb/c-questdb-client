@@ -3,6 +3,7 @@
 
 using namespace std::literals::string_view_literals;
 using namespace questdb::ingress::literals;
+using namespace questdb::ingress::decimal;
 
 static bool example(std::string_view host, std::string_view port)
 {
@@ -10,7 +11,7 @@ static bool example(std::string_view host, std::string_view port)
     {
         auto sender = questdb::ingress::line_sender::from_conf(
             "tcp::addr=" + std::string{host} + ":" + std::string{port} +
-            ";protocol_version=2;");
+            ";protocol_version=3;");
 
         // We prepare all our table names and column names in advance.
         // If we're inserting multiple rows, this allows us to avoid
@@ -25,7 +26,8 @@ static bool example(std::string_view host, std::string_view port)
         buffer.table(table_name)
             .symbol(symbol_name, "ETH-USD"_utf8)
             .symbol(side_name, "sell"_utf8)
-            .column(price_name, 2615.54)
+        // The table must be created beforehand with the appropriate DECIMAL(N,M) type for the column.
+            .column(price_name, "2615.54"_decimal)
             .column(amount_name, 0.00044)
             .at(questdb::ingress::timestamp_nanos::now());
 
