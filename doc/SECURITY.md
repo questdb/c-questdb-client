@@ -35,7 +35,7 @@ A few important technical details on TLS:
     are managed centrally.
 
 For API usage:
-* Rust: `SenderBuilder`'s [`auth`](https://docs.rs/questdb-rs/6.0.0/questdb/ingress/struct.SenderBuilder.html#method.auth)
-  and [`tls`](https://docs.rs/questdb-rs/6.0.0/questdb/ingress/struct.SenderBuilder.html#method.tls) methods.
+* Rust: `SenderBuilder`'s [`auth`](https://docs.rs/questdb-rs/6.1.0/questdb/ingress/struct.SenderBuilder.html#method.auth)
+  and [`tls`](https://docs.rs/questdb-rs/6.1.0/questdb/ingress/struct.SenderBuilder.html#method.tls) methods.
 * C: [examples/line_sender_c_example_auth.c](../examples/line_sender_c_example_auth.c)
 * C++: [examples/line_sender_cpp_example_auth.cpp](../examples/line_sender_cpp_example_auth.cpp)
