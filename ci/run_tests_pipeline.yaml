@@ -67,7 +67,7 @@ stages:
           ############################# temp for test end #####################
           - script: python3 ci/run_all_tests.py
             env:
-              JAVA_HOME: $(JAVA_HOME_11_X64)
+              JAVA_HOME: $(JAVA_HOME_17_X64)
             displayName: "Tests"
           # - task: PublishBuildArtifacts@1
           #   inputs:
