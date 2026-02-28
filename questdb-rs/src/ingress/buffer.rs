@@ -771,6 +771,45 @@ impl Buffer {
         Ok(self)
     }
 
+    /// Record a symbol for the given column if the value is `Some`.
+    /// If the value is `None`, this is a no-op and the column is skipped.
+    ///
+    /// This is a convenience wrapper around [`Self::symbol`]. Make sure you
+    /// record all symbol columns before any other column type.
+    ///
+    /// **Tip:** If you have an `Option<String>`, use `.as_deref()` to pass it
+    /// without consuming the original string.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use questdb::Result;
+    /// # use questdb::ingress::{Buffer, SenderBuilder};
+    /// # fn main() -> Result<()> {
+    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+    /// # let mut buffer = sender.new_buffer();
+    /// # buffer.table("x")?;
+    /// let val: Option<&str> = Some("value");
+    /// buffer.symbol_opt("col_name", val)?;
+    ///
+    /// let no_val: Option<&str> = None;
+    /// buffer.symbol_opt("skipped_col", no_val)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn symbol_opt<'a, N, S>(&mut self, name: N, value: Option<S>) -> crate::Result<&mut Self>
+    where
+        N: TryInto<ColumnName<'a>>,
+        S: AsRef<str>,
+        Error: From<N::Error>,
+    {
+        if let Some(v) = value {
+            self.symbol(name, v)
+        } else {
+            Ok(self)
+        }
+    }
+
     fn write_column_key<'a, N>(&mut self, name: N) -> crate::Result<&mut Self>
     where
         N: TryInto<ColumnName<'a>>,
@@ -831,6 +870,44 @@ impl Buffer {
         Ok(self)
     }
 
+    /// Record a boolean value for the given column if the value is `Some`.
+    /// If the value is `None`, this is a no-op and the column is skipped.
+    ///
+    /// This is a convenience wrapper around [`Self::column_bool`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use questdb::Result;
+    /// # use questdb::ingress::{Buffer, SenderBuilder};
+    /// # fn main() -> Result<()> {
+    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+    /// # let mut buffer = sender.new_buffer();
+    /// # buffer.table("x")?;
+    /// let val: Option<bool> = Some(true);
+    /// buffer.column_bool_opt("col_name", val)?;
+    ///
+    /// let no_val: Option<bool> = None;
+    /// buffer.column_bool_opt("skipped_col", no_val)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn column_bool_opt<'a, N>(
+        &mut self,
+        name: N,
+        value: Option<bool>,
+    ) -> crate::Result<&mut Self>
+    where
+        N: TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        if let Some(v) = value {
+            self.column_bool(name, v)
+        } else {
+            Ok(self)
+        }
+    }
+
     /// Record an integer value for the given column.
     ///
     /// ```no_run
@@ -872,6 +949,40 @@ impl Buffer {
         self.output.extend_from_slice(printed.as_bytes());
         self.output.push(b'i');
         Ok(self)
+    }
+
+    /// Record an integer value for the given column if the value is `Some`.
+    /// If the value is `None`, this is a no-op and the column is skipped.
+    ///
+    /// This is a convenience wrapper around [`Self::column_i64`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use questdb::Result;
+    /// # use questdb::ingress::{Buffer, SenderBuilder};
+    /// # fn main() -> Result<()> {
+    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+    /// # let mut buffer = sender.new_buffer();
+    /// # buffer.table("x")?;
+    /// let val: Option<i64> = Some(42);
+    /// buffer.column_i64_opt("col_name", val)?;
+    ///
+    /// let no_val: Option<i64> = None;
+    /// buffer.column_i64_opt("skipped_col", no_val)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn column_i64_opt<'a, N>(&mut self, name: N, value: Option<i64>) -> crate::Result<&mut Self>
+    where
+        N: TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        if let Some(v) = value {
+            self.column_i64(name, v)
+        } else {
+            Ok(self)
+        }
     }
 
     /// Record a floating point value for the given column.
@@ -919,6 +1030,40 @@ impl Buffer {
             self.output.extend_from_slice(ser.as_str().as_bytes())
         }
         Ok(self)
+    }
+
+    /// Record a floating point value for the given column if the value is `Some`.
+    /// If the value is `None`, this is a no-op and the column is skipped.
+    ///
+    /// This is a convenience wrapper around [`Self::column_f64`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use questdb::Result;
+    /// # use questdb::ingress::{Buffer, SenderBuilder};
+    /// # fn main() -> Result<()> {
+    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+    /// # let mut buffer = sender.new_buffer();
+    /// # buffer.table("x")?;
+    /// let val: Option<f64> = Some(3.14);
+    /// buffer.column_f64_opt("col_name", val)?;
+    ///
+    /// let no_val: Option<f64> = None;
+    /// buffer.column_f64_opt("skipped_col", no_val)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn column_f64_opt<'a, N>(&mut self, name: N, value: Option<f64>) -> crate::Result<&mut Self>
+    where
+        N: TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        if let Some(v) = value {
+            self.column_f64(name, v)
+        } else {
+            Ok(self)
+        }
     }
 
     /// Record a string value for the given column.
@@ -975,6 +1120,48 @@ impl Buffer {
         self.write_column_key(name)?;
         write_escaped_quoted(&mut self.output, value.as_ref());
         Ok(self)
+    }
+
+    /// Record a string value for the given column if the value is `Some`.
+    /// If the value is `None`, this is a no-op and the column is skipped.
+    ///
+    /// This is a convenience wrapper around [`Self::column_str`].
+    ///
+    /// **Tip:** If you have an `Option<String>`, use `.as_deref()` to pass it
+    /// without consuming the original string.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use questdb::Result;
+    /// # use questdb::ingress::{Buffer, SenderBuilder};
+    /// # fn main() -> Result<()> {
+    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+    /// # let mut buffer = sender.new_buffer();
+    /// # buffer.table("x")?;
+    /// let val: Option<&str> = Some("value");
+    /// buffer.column_str_opt("col_name", val)?;
+    ///
+    /// let no_val: Option<&str> = None;
+    /// buffer.column_str_opt("skipped_col", no_val)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn column_str_opt<'a, N, S>(
+        &mut self,
+        name: N,
+        value: Option<S>,
+    ) -> crate::Result<&mut Self>
+    where
+        N: TryInto<ColumnName<'a>>,
+        S: AsRef<str>,
+        Error: From<N::Error>,
+    {
+        if let Some(v) = value {
+            self.column_str(name, v)
+        } else {
+            Ok(self)
+        }
     }
 
     /// Record a decimal value for the given column.
@@ -1072,6 +1259,58 @@ impl Buffer {
         self.write_column_key(name)?;
         value.serialize(&mut self.output);
         Ok(self)
+    }
+
+    /// Record a decimal value for the given column if the value is `Some`.
+    /// If the value is `None`, this is a no-op and the column is skipped.
+    ///
+    /// This is a convenience wrapper around [`Self::column_dec`]. It has the
+    /// exact same requirements and error conditions as the underlying method
+    /// (e.g., it requires Protocol Version 3 or higher).
+    ///
+    /// **Tip:** If you have an `Option<Decimal>`, use `.as_ref()` to pass it
+    /// without consuming the original string.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] if the provided value is `Some` and violates any of the
+    /// constraints detailed in [`Self::column_dec`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use questdb::Result;
+    /// # use questdb::ingress::{Buffer, SenderBuilder};
+    /// use bigdecimal::BigDecimal;
+    /// use std::str::FromStr;
+    /// # fn main() -> Result<()> {
+    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+    /// # let mut buffer = sender.new_buffer();
+    /// # buffer.table("x")?;
+    /// let val: Option<BigDecimal> = Some(BigDecimal::from_str("0.123456789012345678901234567890").unwrap());
+    /// buffer.column_dec_opt("col_name", val)?;
+    ///
+    /// let no_val: Option<BigDecimal> = None;
+    /// buffer.column_dec_opt("skipped_col", no_val)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn column_dec_opt<'a, N, S>(
+        &mut self,
+        name: N,
+        value: Option<S>,
+    ) -> crate::Result<&mut Self>
+    where
+        N: TryInto<ColumnName<'a>>,
+        S: TryInto<DecimalView<'a>>,
+        Error: From<N::Error>,
+        Error: From<S::Error>,
+    {
+        if let Some(v) = value {
+            self.column_dec(name, v)
+        } else {
+            Ok(self)
+        }
     }
 
     /// Record a multidimensional array value for the given column.
@@ -1184,6 +1423,59 @@ impl Buffer {
         Ok(self)
     }
 
+    /// Record a multidimensional array value for the given column if the value is `Some`.
+    /// If the value is `None`, this is a no-op and the column is skipped.
+    ///
+    /// This is a convenience wrapper around [`Self::column_arr`]. When the value is `Some`,
+    /// it has the exact same requirements and error conditions as the underlying method.
+    /// Specifically, it requires QuestDB server version 9.0.0+ and supports up to
+    /// [`MAX_ARRAY_DIMS`] dimensions of `f64` elements.
+    ///
+    /// **Tip:** If you have an `Option<Vec<Vec<f64>>>`, use `.as_ref()` to pass it
+    /// without consuming the original vector.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] if the provided value is `Some` and violates any of the
+    /// constraints detailed in [`Self::column_arr`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use questdb::Result;
+    /// # use questdb::ingress::{Buffer, SenderBuilder};
+    /// # fn main() -> Result<()> {
+    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+    /// # let mut buffer = sender.new_buffer();
+    /// # buffer.table("x")?;
+    /// let array_2d = vec![vec![1.1, 2.2], vec![3.3, 4.4]];
+    /// let val = Some(&array_2d);
+    /// buffer.column_arr_opt("array_col", val)?;
+    ///
+    /// let no_val: Option<&Vec<Vec<f64>>> = None;
+    /// buffer.column_arr_opt("skipped_col", no_val)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[allow(private_bounds)]
+    pub fn column_arr_opt<'a, N, T, D>(
+        &mut self,
+        name: N,
+        value: Option<&T>,
+    ) -> crate::Result<&mut Self>
+    where
+        N: TryInto<ColumnName<'a>>,
+        T: NdArrayView<D>,
+        D: ArrayElement + ArrayElementSealed,
+        Error: From<N::Error>,
+    {
+        if let Some(v) = value {
+            self.column_arr(name, v)
+        } else {
+            Ok(self)
+        }
+    }
+
     /// Record a timestamp value for the given column.
     ///
     /// ```no_run
@@ -1262,6 +1554,43 @@ impl Buffer {
         self.output.extend_from_slice(printed.as_bytes());
         self.output.push(suffix);
         Ok(self)
+    }
+
+    /// Record a timestamp value for the given column if the value is `Some`.
+    /// If the value is `None`, this is a no-op and the column is skipped.
+    ///
+    /// This is a convenience wrapper around [`Self::column_ts`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use questdb::Result;
+    /// # use questdb::ingress::{Buffer, SenderBuilder};
+    /// use questdb::ingress::TimestampMicros;
+    /// # fn main() -> Result<()> {
+    /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+    /// # let mut buffer = sender.new_buffer();
+    /// # buffer.table("x")?;
+    /// let val = Some(TimestampMicros::now());
+    /// buffer.column_ts_opt("col_name", val)?;
+    ///
+    /// let no_val: Option<TimestampMicros> = None;
+    /// buffer.column_ts_opt("skipped_col", no_val)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn column_ts_opt<'a, N, T>(&mut self, name: N, value: Option<T>) -> crate::Result<&mut Self>
+    where
+        N: TryInto<ColumnName<'a>>,
+        T: TryInto<Timestamp>,
+        Error: From<N::Error>,
+        Error: From<T::Error>,
+    {
+        if let Some(v) = value {
+            self.column_ts(name, v)
+        } else {
+            Ok(self)
+        }
     }
 
     /// Complete the current row with the designated timestamp. After this call, you can
