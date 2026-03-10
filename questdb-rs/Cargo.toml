@@ -62,8 +62,8 @@ rstest = "0.26.1"
 [features]
 default = ["sync-sender", "tls-webpki-certs", "ring-crypto"]
 
-## Sync ILP/TCP + ILP/HTTP Sender
-sync-sender = ["sync-sender-tcp", "sync-sender-http"]
+## Sync senders: ILP/TCP + ILP/HTTP + QWP/UDP
+sync-sender = ["sync-sender-tcp", "sync-sender-http", "sync-sender-qwp-udp"]
 
 ## Sync ILP/TCP
 sync-sender-tcp = ["_sync-sender", "_sender-tcp", "dep:socket2"]
