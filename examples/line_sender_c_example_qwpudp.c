@@ -82,7 +82,7 @@ static bool displayed_help(int argc, const char* argv[])
     for (int index = 1; index < argc; ++index)
     {
         const char* arg = argv[index];
-        if ((strncmp(arg, "-h", 2) == 0) || (strncmp(arg, "--help", 6) == 0))
+        if ((strcmp(arg, "-h") == 0) || (strcmp(arg, "--help") == 0))
         {
             fprintf(stderr, "Usage:\n");
             fprintf(
