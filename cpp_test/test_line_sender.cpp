@@ -53,6 +53,7 @@ using namespace questdb::ingress::literals;
 typedef const void* qdb_test_setsockopt_arg_t;
 typedef size_t qdb_test_sock_len_t;
 typedef ssize_t qdb_test_sock_ssize_t;
+typedef socklen_t qdb_test_addr_len_t;
 #    ifndef INVALID_SOCKET
 #        define INVALID_SOCKET -1
 #    endif
@@ -61,6 +62,7 @@ typedef ssize_t qdb_test_sock_ssize_t;
 typedef const char* qdb_test_setsockopt_arg_t;
 typedef int qdb_test_sock_len_t;
 typedef int qdb_test_sock_ssize_t;
+typedef int qdb_test_addr_len_t;
 
 static void qdb_test_init_winsock()
 {
@@ -109,7 +111,7 @@ public:
                 sizeof(listen_addr)) == 0);
 
         sockaddr_in resolved_addr{};
-        socklen_t resolved_addr_len = sizeof(resolved_addr);
+        qdb_test_addr_len_t resolved_addr_len = sizeof(resolved_addr);
         REQUIRE(
             ::getsockname(
                 _socket,
@@ -153,7 +155,7 @@ public:
 
         std::vector<std::byte> buffer(65536);
         sockaddr_in remote_addr{};
-        socklen_t remote_addr_len = sizeof(remote_addr);
+        qdb_test_addr_len_t remote_addr_len = sizeof(remote_addr);
         const auto count = ::recvfrom(
             _socket,
             reinterpret_cast<char*>(buffer.data()),
