@@ -590,6 +590,9 @@ fn qwp_udp_rejects_mixed_designated_timestamp_precisions_within_table_batch() ->
         .column_i64("qty", 2)?
         .at(TimestampNanos::new(789_000))?;
 
+    let size_hint = buffer.len();
+    assert!(size_hint > 0);
+
     assert_err_contains(
         sender.flush_and_keep(&buffer),
         ErrorCode::InvalidApiCall,
@@ -615,6 +618,9 @@ fn qwp_udp_rejects_mixed_timestamp_column_precisions_within_table_batch() -> Tes
         .symbol("sym", "BTC-USD")?
         .column_ts("event_ts", TimestampNanos::new(789_000))?
         .at_now()?;
+
+    let size_hint = buffer.len();
+    assert!(size_hint > 0);
 
     assert_err_contains(
         sender.flush_and_keep(&buffer),

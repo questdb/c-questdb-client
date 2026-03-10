@@ -22,12 +22,10 @@
  *
  ******************************************************************************/
 
-use crate::Error;
-#[cfg(test)]
-use crate::ErrorCode;
 use crate::error;
 use crate::ingress::decimal::DecimalView;
 use crate::ingress::{ArrayElement, NdArrayView, Timestamp};
+use crate::{Error, ErrorCode};
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -108,6 +106,53 @@ impl BufferState {
     }
 }
 
+#[derive(Clone, Debug)]
+struct QwpSizeHint {
+    committed_len: usize,
+    active_group: Option<RowGroupEstimator>,
+}
+
+impl QwpSizeHint {
+    fn new() -> Self {
+        Self {
+            committed_len: 0,
+            active_group: None,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.committed_len
+    }
+
+    fn add_committed_row(&mut self, row: &CommittedRow) -> crate::Result<()> {
+        let specs = row_value_specs(row);
+        if let Some(group) = self.active_group.as_mut() {
+            if group.table_name == row.table_name {
+                let previous_len = group.current_len();
+                let new_len = match group.estimate_len_with_specs(&specs) {
+                    Ok(new_len) => new_len,
+                    Err(err) if is_batched_type_change_error(&err) => {
+                        self.committed_len += standalone_row_group_len(row);
+                        self.active_group = None;
+                        return Ok(());
+                    }
+                    Err(err) => return Err(err),
+                };
+                group.add_row_with_specs(&specs, new_len)?;
+                self.committed_len = self.committed_len - previous_len + new_len;
+                return Ok(());
+            }
+        }
+
+        let mut group = RowGroupEstimator::new(&row.table_name);
+        let new_len = group.estimate_len_with_specs(&specs)?;
+        group.add_row_with_specs(&specs, new_len)?;
+        self.committed_len += new_len;
+        self.active_group = Some(group);
+        Ok(())
+    }
+}
+
 impl Debug for BufferState {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BufferState")
@@ -120,11 +165,19 @@ impl Debug for BufferState {
 }
 
 #[derive(Clone, Debug)]
+struct QwpMarker {
+    row_count: usize,
+    state: BufferState,
+    size_hint: QwpSizeHint,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct QwpBuffer {
     rows: Vec<CommittedRow>,
     pending_row: Option<PendingRow>,
     state: BufferState,
-    marker: Option<(usize, BufferState)>,
+    size_hint: QwpSizeHint,
+    marker: Option<QwpMarker>,
     max_name_len: usize,
 }
 
@@ -206,6 +259,7 @@ impl QwpBuffer {
             rows: Vec::new(),
             pending_row: None,
             state: BufferState::new(),
+            size_hint: QwpSizeHint::new(),
             marker: None,
             max_name_len,
         }
@@ -214,12 +268,7 @@ impl QwpBuffer {
     pub(crate) fn reserve(&mut self, _additional: usize) {}
 
     pub(crate) fn len(&self) -> usize {
-        let committed = self
-            .rows
-            .iter()
-            .map(CommittedRow::encoded_len)
-            .sum::<usize>();
-        committed + self.pending_size_hint()
+        self.size_hint.len() + self.pending_size_hint()
     }
 
     pub(crate) fn row_count(&self) -> usize {
@@ -253,15 +302,20 @@ impl QwpBuffer {
                 )
             ));
         }
-        self.marker = Some((self.rows.len(), self.state.clone()));
+        self.marker = Some(QwpMarker {
+            row_count: self.rows.len(),
+            state: self.state.clone(),
+            size_hint: self.size_hint.clone(),
+        });
         Ok(())
     }
 
     pub(crate) fn rewind_to_marker(&mut self) -> crate::Result<()> {
-        if let Some((row_count, state)) = self.marker.take() {
-            self.rows.truncate(row_count);
+        if let Some(marker) = self.marker.take() {
+            self.rows.truncate(marker.row_count);
             self.pending_row = None;
-            self.state = state;
+            self.state = marker.state;
+            self.size_hint = marker.size_hint;
             Ok(())
         } else {
             Err(error::fmt!(
@@ -279,6 +333,7 @@ impl QwpBuffer {
         self.rows.clear();
         self.pending_row = None;
         self.state = BufferState::new();
+        self.size_hint = QwpSizeHint::new();
         self.marker = None;
     }
 
@@ -519,11 +574,13 @@ impl QwpBuffer {
             return Err(error::fmt!(InvalidApiCall, "no columns were provided"));
         }
 
-        self.rows.push(CommittedRow {
+        let committed_row = CommittedRow {
             table_name: pending_row.table_name,
             entries: pending_row.entries,
             designated_ts,
-        });
+        };
+        self.size_hint.add_committed_row(&committed_row)?;
+        self.rows.push(committed_row);
         self.state.row_count += 1;
         self.state.op_case = OpCase::MayFlushOrTable;
         Ok(())
@@ -568,37 +625,31 @@ impl QwpBuffer {
     }
 }
 
-impl CommittedRow {
-    fn encoded_len(&self) -> usize {
-        estimated_row_group_len(std::slice::from_ref(self)).unwrap_or(0)
-    }
-}
-
-#[derive(Debug)]
-struct RowGroupEstimator<'a> {
-    table_name: &'a str,
+#[derive(Clone, Debug)]
+struct RowGroupEstimator {
+    table_name: String,
     row_count: usize,
     current_len: usize,
-    columns: Vec<EstimatedColumn<'a>>,
-    indexes: HashMap<&'a str, usize>,
+    columns: Vec<EstimatedColumn>,
+    indexes: HashMap<String, usize>,
 }
 
-#[derive(Debug)]
-struct EstimatedColumn<'a> {
-    name: &'a str,
+#[derive(Clone, Debug)]
+struct EstimatedColumn {
+    name: String,
     kind: ColumnKind,
     base_nullable: bool,
     non_null_count: usize,
     string_data_len: usize,
     symbol_dict_bytes: usize,
     symbol_row_index_bytes: usize,
-    symbol_indexes: HashMap<&'a str, usize>,
+    symbol_indexes: HashMap<String, usize>,
 }
 
-impl<'a> RowGroupEstimator<'a> {
-    fn new(table_name: &'a str) -> Self {
+impl RowGroupEstimator {
+    fn new(table_name: &str) -> Self {
         Self {
-            table_name,
+            table_name: table_name.to_owned(),
             row_count: 0,
             current_len: base_datagram_len(table_name, 0, 0),
             columns: Vec::new(),
@@ -614,10 +665,10 @@ impl<'a> RowGroupEstimator<'a> {
         self.current_len
     }
 
-    fn estimate_len_with_specs(&self, specs: &[RowValueSpec<'a>]) -> crate::Result<usize> {
+    fn estimate_len_with_specs(&self, specs: &[RowValueSpec<'_>]) -> crate::Result<usize> {
         let new_row_count = self.row_count + 1;
-        let mut existing = Vec::<(usize, RowValueSpec<'a>)>::new();
-        let mut created = Vec::<RowValueSpec<'a>>::new();
+        let mut existing = Vec::<(usize, RowValueSpec<'_>)>::new();
+        let mut created = Vec::<RowValueSpec<'_>>::new();
 
         for spec in specs {
             if let Some(&idx) = self.indexes.get(spec.name) {
@@ -636,7 +687,7 @@ impl<'a> RowGroupEstimator<'a> {
         }
 
         let mut total = base_datagram_len(
-            self.table_name,
+            &self.table_name,
             new_row_count,
             self.columns.len() + created.len(),
         );
@@ -664,7 +715,7 @@ impl<'a> RowGroupEstimator<'a> {
 
     fn add_row_with_specs(
         &mut self,
-        specs: &[RowValueSpec<'a>],
+        specs: &[RowValueSpec<'_>],
         new_len: usize,
     ) -> crate::Result<()> {
         for spec in specs {
@@ -682,7 +733,7 @@ impl<'a> RowGroupEstimator<'a> {
                 let idx = self.columns.len();
                 self.columns
                     .push(EstimatedColumn::new(spec.name, spec.kind, spec.value)?);
-                self.indexes.insert(spec.name, idx);
+                self.indexes.insert(spec.name.to_owned(), idx);
             }
         }
 
@@ -692,10 +743,10 @@ impl<'a> RowGroupEstimator<'a> {
     }
 }
 
-impl<'a> EstimatedColumn<'a> {
-    fn new(name: &'a str, kind: ColumnKind, value: ColumnValueRef<'a>) -> crate::Result<Self> {
+impl EstimatedColumn {
+    fn new(name: &str, kind: ColumnKind, value: ColumnValueRef<'_>) -> crate::Result<Self> {
         let mut column = Self {
-            name,
+            name: name.to_owned(),
             kind,
             base_nullable: matches!(
                 kind,
@@ -715,7 +766,7 @@ impl<'a> EstimatedColumn<'a> {
     }
 
     fn schema_len(&self) -> usize {
-        qwp_string_len(self.name) + 1
+        qwp_string_len(&self.name) + 1
     }
 
     fn payload_len(&self, row_count: usize) -> usize {
@@ -745,7 +796,7 @@ impl<'a> EstimatedColumn<'a> {
     fn payload_len_after_adding(
         &self,
         row_count_after: usize,
-        value: ColumnValueRef<'a>,
+        value: ColumnValueRef<'_>,
     ) -> crate::Result<usize> {
         let non_null_count = self.non_null_count + 1;
         let nullable = self.is_nullable_with_count(row_count_after, non_null_count);
@@ -857,7 +908,7 @@ impl<'a> EstimatedColumn<'a> {
         Ok(bitmap + payload)
     }
 
-    fn add_value(&mut self, value: ColumnValueRef<'a>) -> crate::Result<()> {
+    fn add_value(&mut self, value: ColumnValueRef<'_>) -> crate::Result<()> {
         match self.kind {
             ColumnKind::Bool => match value {
                 ColumnValueRef::Bool(_) => {
@@ -916,7 +967,7 @@ impl<'a> EstimatedColumn<'a> {
                         idx
                     } else {
                         let idx = self.symbol_indexes.len();
-                        self.symbol_indexes.insert(symbol, idx);
+                        self.symbol_indexes.insert(symbol.to_owned(), idx);
                         self.symbol_dict_bytes += qwp_string_len(symbol);
                         idx
                     };
@@ -992,6 +1043,15 @@ fn row_value_specs(row: &CommittedRow) -> Vec<RowValueSpec<'_>> {
         });
     }
     specs
+}
+
+fn standalone_row_group_len(row: &CommittedRow) -> usize {
+    estimated_row_group_len(std::slice::from_ref(row)).unwrap_or(0)
+}
+
+fn is_batched_type_change_error(err: &Error) -> bool {
+    err.code() == ErrorCode::InvalidApiCall
+        && err.msg().contains("changes type within a batched table")
 }
 
 fn estimated_row_group_len(rows: &[CommittedRow]) -> crate::Result<usize> {
@@ -1663,5 +1723,259 @@ mod tests {
             let actual = encode_row_group(rows).unwrap().len();
             assert_eq!(estimated, actual, "prefix {}", prefix_len);
         }
+    }
+
+    #[test]
+    fn qwp_len_matches_unsplit_datagram_encoding_for_committed_groups() {
+        let mut buf = QwpBuffer::new(127);
+
+        buf.table("trades")
+            .unwrap()
+            .symbol("sym", "ETH-USD")
+            .unwrap()
+            .column_i64("qty", 4)
+            .unwrap()
+            .at_now()
+            .unwrap();
+
+        buf.table("trades")
+            .unwrap()
+            .symbol("sym", "BTC-USD")
+            .unwrap()
+            .column_str("venue", "binance")
+            .unwrap()
+            .at_now()
+            .unwrap();
+
+        buf.table("quotes")
+            .unwrap()
+            .symbol("sym", "ETH-USD")
+            .unwrap()
+            .column_f64("px", 42.5)
+            .unwrap()
+            .at_now()
+            .unwrap();
+
+        buf.table("trades")
+            .unwrap()
+            .symbol("sym", "SOL-USD")
+            .unwrap()
+            .column_i64("qty", 9)
+            .unwrap()
+            .at_now()
+            .unwrap();
+
+        let actual: usize = buf
+            .encode_datagrams(usize::MAX)
+            .unwrap()
+            .iter()
+            .map(Vec::len)
+            .sum();
+        assert_eq!(buf.len(), actual);
+    }
+
+    #[test]
+    fn qwp_len_rewinds_with_marker_state() {
+        let mut buf = QwpBuffer::new(127);
+
+        buf.table("trades")
+            .unwrap()
+            .symbol("sym", "ETH-USD")
+            .unwrap()
+            .column_i64("qty", 1)
+            .unwrap()
+            .at_now()
+            .unwrap();
+
+        buf.table("trades")
+            .unwrap()
+            .symbol("sym", "BTC-USD")
+            .unwrap()
+            .column_i64("qty", 2)
+            .unwrap()
+            .at_now()
+            .unwrap();
+
+        let before = buf.len();
+        buf.set_marker().unwrap();
+
+        buf.table("trades")
+            .unwrap()
+            .symbol("sym", "SOL-USD")
+            .unwrap()
+            .column_i64("qty", 3)
+            .unwrap()
+            .at_now()
+            .unwrap();
+
+        buf.table("quotes")
+            .unwrap()
+            .symbol("sym", "ETH-USD")
+            .unwrap()
+            .column_f64("px", 42.5)
+            .unwrap()
+            .at_now()
+            .unwrap();
+
+        assert!(buf.len() > before);
+        buf.rewind_to_marker().unwrap();
+        assert_eq!(buf.len(), before);
+
+        let actual: usize = buf
+            .encode_datagrams(usize::MAX)
+            .unwrap()
+            .iter()
+            .map(Vec::len)
+            .sum();
+        assert_eq!(buf.len(), actual);
+    }
+
+    #[test]
+    fn qwp_len_resets_after_clear() {
+        let mut buf = QwpBuffer::new(127);
+
+        buf.table("trades")
+            .unwrap()
+            .symbol("sym", "ETH-USD")
+            .unwrap()
+            .column_i64("qty", 1)
+            .unwrap()
+            .at_now()
+            .unwrap();
+
+        assert!(buf.len() > 0);
+        assert_eq!(buf.row_count(), 1);
+
+        buf.clear();
+
+        assert_eq!(buf.len(), 0);
+        assert_eq!(buf.row_count(), 0);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn qwp_len_clone_tracks_cached_state_independently() {
+        let mut original = QwpBuffer::new(127);
+
+        original
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "ETH-USD")
+            .unwrap()
+            .column_i64("qty", 1)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        original
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "BTC-USD")
+            .unwrap()
+            .column_i64("qty", 2)
+            .unwrap()
+            .at_now()
+            .unwrap();
+
+        let mut cloned = original.clone();
+        assert_eq!(original.len(), cloned.len());
+
+        let original_actual: usize = original
+            .encode_datagrams(usize::MAX)
+            .unwrap()
+            .iter()
+            .map(Vec::len)
+            .sum();
+        let cloned_actual: usize = cloned
+            .encode_datagrams(usize::MAX)
+            .unwrap()
+            .iter()
+            .map(Vec::len)
+            .sum();
+        assert_eq!(original.len(), original_actual);
+        assert_eq!(cloned.len(), cloned_actual);
+
+        cloned
+            .table("quotes")
+            .unwrap()
+            .symbol("sym", "ETH-USD")
+            .unwrap()
+            .column_f64("px", 42.5)
+            .unwrap()
+            .at_now()
+            .unwrap();
+
+        assert_ne!(original.len(), cloned.len());
+
+        let original_after: usize = original
+            .encode_datagrams(usize::MAX)
+            .unwrap()
+            .iter()
+            .map(Vec::len)
+            .sum();
+        let cloned_after: usize = cloned
+            .encode_datagrams(usize::MAX)
+            .unwrap()
+            .iter()
+            .map(Vec::len)
+            .sum();
+        assert_eq!(original.len(), original_after);
+        assert_eq!(cloned.len(), cloned_after);
+    }
+
+    #[test]
+    fn qwp_len_treats_non_contiguous_same_table_rows_as_distinct_groups() {
+        let mut buf = QwpBuffer::new(127);
+
+        buf.table("trades")
+            .unwrap()
+            .symbol("sym", "ETH-USD")
+            .unwrap()
+            .column_i64("qty", 1)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        buf.table("quotes")
+            .unwrap()
+            .symbol("sym", "ETH-USD")
+            .unwrap()
+            .column_f64("px", 42.5)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        buf.table("trades")
+            .unwrap()
+            .symbol("sym", "BTC-USD")
+            .unwrap()
+            .column_i64("qty", 2)
+            .unwrap()
+            .at_now()
+            .unwrap();
+
+        let before = buf.len();
+        let actual_before: usize = buf
+            .encode_datagrams(usize::MAX)
+            .unwrap()
+            .iter()
+            .map(Vec::len)
+            .sum();
+        assert_eq!(before, actual_before);
+
+        buf.table("trades")
+            .unwrap()
+            .symbol("sym", "SOL-USD")
+            .unwrap()
+            .column_i64("qty", 3)
+            .unwrap()
+            .at_now()
+            .unwrap();
+
+        assert!(buf.len() > before);
+        let actual_after: usize = buf
+            .encode_datagrams(usize::MAX)
+            .unwrap()
+            .iter()
+            .map(Vec::len)
+            .sum();
+        assert_eq!(buf.len(), actual_after);
     }
 }

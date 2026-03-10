@@ -49,10 +49,6 @@ impl QwpUdpMock {
         SenderBuilder::new(Protocol::QwpUdp, self.host, self.port)
     }
 
-    pub fn address(&self) -> String {
-        format!("{}:{}", self.host, self.port)
-    }
-
     pub fn recv_datagram(&self) -> io::Result<Vec<u8>> {
         let mut buf = vec![0u8; 65_536];
         let (len, _) = self.socket.recv_from(&mut buf)?;
