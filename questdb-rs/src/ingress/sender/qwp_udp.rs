@@ -23,9 +23,9 @@
  ******************************************************************************/
 
 use crate::error;
+use crate::ingress::SyncProtocolHandler;
 use crate::ingress::buffer::QwpBuffer;
 use crate::ingress::conf::QwpUdpConfig;
-use crate::ingress::SyncProtocolHandler;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs, UdpSocket};
 
 pub(crate) struct SyncQwpUdpHandlerState {

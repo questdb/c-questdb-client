@@ -31,10 +31,10 @@ use crate::Error;
 use crate::ingress::ndarr::ArrayElementSealed;
 use crate::ingress::{ArrayElement, DecimalView, NdArrayView, ProtocolVersion, Timestamp};
 
-pub use self::ilp::{ColumnName, TableName};
 pub(crate) use self::ilp::Buffer as IlpBuffer;
 #[allow(unused_imports)]
 pub(crate) use self::ilp::F64Serializer;
+pub use self::ilp::{ColumnName, TableName};
 
 #[cfg(feature = "_sender-qwp-udp")]
 pub(crate) use self::qwp::QwpBuffer;
@@ -67,10 +67,7 @@ impl Buffer {
     /// Creates a new ILP buffer with a custom maximum name length.
     pub fn with_max_name_len(protocol_version: ProtocolVersion, max_name_len: usize) -> Self {
         Self {
-            inner: BufferInner::Ilp(IlpBuffer::with_max_name_len(
-                protocol_version,
-                max_name_len,
-            )),
+            inner: BufferInner::Ilp(IlpBuffer::with_max_name_len(protocol_version, max_name_len)),
         }
     }
 

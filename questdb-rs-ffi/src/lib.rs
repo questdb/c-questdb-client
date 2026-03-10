@@ -1881,7 +1881,9 @@ unsafe fn unwrap_sender_mut<'a>(sender: *mut line_sender) -> &'a mut Sender {
 
 /// Return the sender's configured transport protocol.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_sender_get_protocol(sender: *const line_sender) -> line_sender_protocol {
+pub unsafe extern "C" fn line_sender_get_protocol(
+    sender: *const line_sender,
+) -> line_sender_protocol {
     unsafe { unwrap_sender(sender).protocol().into() }
 }
 

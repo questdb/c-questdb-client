@@ -22,12 +22,12 @@
  *
  ******************************************************************************/
 
-use crate::error;
-use crate::ingress::decimal::DecimalView;
-use crate::ingress::{ArrayElement, NdArrayView, Timestamp};
 use crate::Error;
 #[cfg(test)]
 use crate::ErrorCode;
+use crate::error;
+use crate::ingress::decimal::DecimalView;
+use crate::ingress::{ArrayElement, NdArrayView, Timestamp};
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -380,11 +380,7 @@ impl QwpBuffer {
         Ok(self)
     }
 
-    pub(crate) fn column_bool<'a, N>(
-        &mut self,
-        name: N,
-        value: bool,
-    ) -> crate::Result<&mut Self>
+    pub(crate) fn column_bool<'a, N>(&mut self, name: N, value: bool) -> crate::Result<&mut Self>
     where
         N: TryInto<ColumnName<'a>>,
         Error: From<N::Error>,
@@ -435,11 +431,7 @@ impl QwpBuffer {
         Ok(self)
     }
 
-    pub(crate) fn column_str<'a, N, S>(
-        &mut self,
-        name: N,
-        value: S,
-    ) -> crate::Result<&mut Self>
+    pub(crate) fn column_str<'a, N, S>(&mut self, name: N, value: S) -> crate::Result<&mut Self>
     where
         N: TryInto<ColumnName<'a>>,
         S: AsRef<str>,
@@ -457,11 +449,7 @@ impl QwpBuffer {
         Ok(self)
     }
 
-    pub(crate) fn column_dec<'a, N, S>(
-        &mut self,
-        _name: N,
-        _value: S,
-    ) -> crate::Result<&mut Self>
+    pub(crate) fn column_dec<'a, N, S>(&mut self, _name: N, _value: S) -> crate::Result<&mut Self>
     where
         N: TryInto<ColumnName<'a>>,
         S: TryInto<DecimalView<'a>>,
@@ -486,11 +474,7 @@ impl QwpBuffer {
         Err(unsupported_qwp_call("column_arr"))
     }
 
-    pub(crate) fn column_ts<'a, N, T>(
-        &mut self,
-        name: N,
-        value: T,
-    ) -> crate::Result<&mut Self>
+    pub(crate) fn column_ts<'a, N, T>(&mut self, name: N, value: T) -> crate::Result<&mut Self>
     where
         N: TryInto<ColumnName<'a>>,
         T: TryInto<Timestamp>,
@@ -532,10 +516,7 @@ impl QwpBuffer {
         };
 
         if pending_row.entries.is_empty() {
-            return Err(error::fmt!(
-                InvalidApiCall,
-                "no columns were provided"
-            ));
+            return Err(error::fmt!(InvalidApiCall, "no columns were provided"));
         }
 
         self.rows.push(CommittedRow {
@@ -576,7 +557,11 @@ impl QwpBuffer {
             while end < self.rows.len() && self.rows[end].table_name == *table_name {
                 end += 1;
             }
-            encode_row_group_with_splitting(&self.rows[start..end], max_datagram_size, &mut datagrams)?;
+            encode_row_group_with_splitting(
+                &self.rows[start..end],
+                max_datagram_size,
+                &mut datagrams,
+            )?;
             start = end;
         }
         Ok(datagrams)
@@ -650,11 +635,18 @@ impl<'a> RowGroupEstimator<'a> {
             }
         }
 
-        let mut total = base_datagram_len(self.table_name, new_row_count, self.columns.len() + created.len());
+        let mut total = base_datagram_len(
+            self.table_name,
+            new_row_count,
+            self.columns.len() + created.len(),
+        );
 
         for (idx, column) in self.columns.iter().enumerate() {
             total += column.schema_len();
-            if let Some((_, spec)) = existing.iter().find(|(existing_idx, _)| *existing_idx == idx) {
+            if let Some((_, spec)) = existing
+                .iter()
+                .find(|(existing_idx, _)| *existing_idx == idx)
+            {
                 total += column.payload_len_after_adding(new_row_count, spec.value)?;
             } else {
                 total += column.payload_len(new_row_count);
@@ -670,7 +662,11 @@ impl<'a> RowGroupEstimator<'a> {
         Ok(total)
     }
 
-    fn add_row_with_specs(&mut self, specs: &[RowValueSpec<'a>], new_len: usize) -> crate::Result<()> {
+    fn add_row_with_specs(
+        &mut self,
+        specs: &[RowValueSpec<'a>],
+        new_len: usize,
+    ) -> crate::Result<()> {
         for spec in specs {
             if let Some(&idx) = self.indexes.get(spec.name) {
                 let column = &mut self.columns[idx];
@@ -684,7 +680,8 @@ impl<'a> RowGroupEstimator<'a> {
                 column.add_value(spec.value)?;
             } else {
                 let idx = self.columns.len();
-                self.columns.push(EstimatedColumn::new(spec.name, spec.kind, spec.value)?);
+                self.columns
+                    .push(EstimatedColumn::new(spec.name, spec.kind, spec.value)?);
                 self.indexes.insert(spec.name, idx);
             }
         }
@@ -752,7 +749,11 @@ impl<'a> EstimatedColumn<'a> {
     ) -> crate::Result<usize> {
         let non_null_count = self.non_null_count + 1;
         let nullable = self.is_nullable_with_count(row_count_after, non_null_count);
-        let bitmap = if nullable { bitmap_bytes(row_count_after) } else { 0 };
+        let bitmap = if nullable {
+            bitmap_bytes(row_count_after)
+        } else {
+            0
+        };
 
         let payload = match self.kind {
             ColumnKind::Bool => {
@@ -970,7 +971,8 @@ fn bitmap_bytes(value_count: usize) -> usize {
 }
 
 fn row_value_specs(row: &CommittedRow) -> Vec<RowValueSpec<'_>> {
-    let mut specs = Vec::with_capacity(row.entries.len() + usize::from(row.designated_ts.is_some()));
+    let mut specs =
+        Vec::with_capacity(row.entries.len() + usize::from(row.designated_ts.is_some()));
     for entry in &row.entries {
         specs.push(RowValueSpec {
             name: &entry.name,
@@ -994,7 +996,10 @@ fn row_value_specs(row: &CommittedRow) -> Vec<RowValueSpec<'_>> {
 
 fn estimated_row_group_len(rows: &[CommittedRow]) -> crate::Result<usize> {
     let Some(first_row) = rows.first() else {
-        return Err(error::fmt!(InvalidApiCall, "cannot estimate empty QWP row group"));
+        return Err(error::fmt!(
+            InvalidApiCall,
+            "cannot estimate empty QWP row group"
+        ));
     };
 
     let mut estimator = RowGroupEstimator::new(&first_row.table_name);
@@ -1070,7 +1075,10 @@ fn encode_row_group_with_splitting(
 
 fn encode_row_group(rows: &[CommittedRow]) -> crate::Result<Vec<u8>> {
     let Some(first_row) = rows.first() else {
-        return Err(error::fmt!(InvalidApiCall, "cannot encode empty QWP row group"));
+        return Err(error::fmt!(
+            InvalidApiCall,
+            "cannot encode empty QWP row group"
+        ));
     };
 
     let columns = build_batch_columns(rows)?;
@@ -1151,6 +1159,7 @@ fn build_batch_columns<'a>(rows: &'a [CommittedRow]) -> crate::Result<Vec<BatchC
     Ok(columns)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn add_batch_value<'a>(
     columns: &mut Vec<BatchColumn<'a>>,
     indexes: &mut HashMap<String, usize>,
@@ -1261,7 +1270,9 @@ impl<'a> BatchColumn<'a> {
             ColumnKind::I64 => self.encode_i64_payload(out),
             ColumnKind::F64 => self.encode_f64_payload(out),
             ColumnKind::String => self.encode_string_payload(out),
-            ColumnKind::TimestampMicros | ColumnKind::TimestampNanos => self.encode_timestamp_payload(out),
+            ColumnKind::TimestampMicros | ColumnKind::TimestampNanos => {
+                self.encode_timestamp_payload(out)
+            }
         }
     }
 
@@ -1410,10 +1421,9 @@ impl<'a> BatchColumn<'a> {
                 }
             };
             data.extend_from_slice(text.as_bytes());
-            let offset: i32 = data
-                .len()
-                .try_into()
-                .map_err(|_| error::fmt!(InvalidApiCall, "QWP string payload exceeds i32 length"))?;
+            let offset: i32 = data.len().try_into().map_err(|_| {
+                error::fmt!(InvalidApiCall, "QWP string payload exceeds i32 length")
+            })?;
             offsets.push(offset);
         }
         for offset in offsets {
@@ -1548,7 +1558,11 @@ mod tests {
 
         let datagram = buf.encode_datagrams(1400).unwrap().pop().unwrap();
         assert!(!datagram.windows(2).any(|w| w == [0, QWP_TYPE_TIMESTAMP]));
-        assert!(!datagram.windows(2).any(|w| w == [0, QWP_TYPE_TIMESTAMP_NANOS]));
+        assert!(
+            !datagram
+                .windows(2)
+                .any(|w| w == [0, QWP_TYPE_TIMESTAMP_NANOS])
+        );
     }
 
     #[test]
@@ -1561,7 +1575,10 @@ mod tests {
         buf.table("trades").unwrap();
         let err = buf.at(TimestampMicros::new(1)).unwrap_err();
         assert_eq!(err.code(), ErrorCode::InvalidApiCall);
-        assert!(err.msg().contains("should have called `symbol` or `column` instead"));
+        assert!(
+            err.msg()
+                .contains("should have called `symbol` or `column` instead")
+        );
     }
 
     #[test]

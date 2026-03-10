@@ -1335,20 +1335,16 @@ impl SenderBuilder {
             return Ok(());
         }
 
-        if self.username.is_some()
-            || self.password.is_some()
-            || self.token.is_some()
-            || {
-                #[cfg(feature = "_sender-tcp")]
-                {
-                    self.token_x.is_some() || self.token_y.is_some()
-                }
-                #[cfg(not(feature = "_sender-tcp"))]
-                {
-                    false
-                }
+        if self.username.is_some() || self.password.is_some() || self.token.is_some() || {
+            #[cfg(feature = "_sender-tcp")]
+            {
+                self.token_x.is_some() || self.token_y.is_some()
             }
-        {
+            #[cfg(not(feature = "_sender-tcp"))]
+            {
+                false
+            }
+        } {
             return Err(error::fmt!(
                 ConfigError,
                 "Authentication settings are not supported for QWP/UDP."

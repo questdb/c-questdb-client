@@ -50,6 +50,7 @@ mod http;
 #[cfg(feature = "sync-sender-http")]
 pub(crate) use http::*;
 
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum SyncProtocolHandler {
     #[cfg(feature = "sync-sender-qwp-udp")]
     SyncQwpUdp(SyncQwpUdpHandlerState),

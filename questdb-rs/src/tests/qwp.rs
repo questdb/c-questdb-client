@@ -115,14 +115,12 @@ fn qwp_udp_flushes_supported_rows_to_mock_receiver() -> TestResult {
     );
     assert_eq!(
         second.table.rows,
-        vec![
-            vec![
-                DecodedValue::Symbol("BTC-USD".to_owned()),
-                DecodedValue::Bool(false),
-                DecodedValue::String("feed-a".to_owned()),
-                DecodedValue::I64(7),
-            ],
-        ]
+        vec![vec![
+            DecodedValue::Symbol("BTC-USD".to_owned()),
+            DecodedValue::Bool(false),
+            DecodedValue::String("feed-a".to_owned()),
+            DecodedValue::I64(7),
+        ],]
     );
 
     Ok(())
@@ -186,8 +184,14 @@ fn qwp_udp_splits_batched_rows_when_datagram_size_is_too_small() -> TestResult {
         .collect::<Vec<_>>();
     assert_eq!(decoded[0].table.row_count, 1);
     assert_eq!(decoded[1].table.row_count, 1);
-    assert_eq!(decoded[0].table.rows[0][0], DecodedValue::Symbol("ETH-USD".to_owned()));
-    assert_eq!(decoded[1].table.rows[0][0], DecodedValue::Symbol("BTC-USD".to_owned()));
+    assert_eq!(
+        decoded[0].table.rows[0][0],
+        DecodedValue::Symbol("ETH-USD".to_owned())
+    );
+    assert_eq!(
+        decoded[1].table.rows[0][0],
+        DecodedValue::Symbol("BTC-USD".to_owned())
+    );
 
     Ok(())
 }
@@ -494,22 +498,34 @@ fn qwp_udp_encodes_sparse_long_and_double_columns_as_non_nullable_sentinels() ->
             .collect::<Vec<_>>(),
         vec![("sym", true), ("qty", false), ("px", false)]
     );
-    assert_eq!(decoded.table.rows[0][0], DecodedValue::Symbol("r1".to_owned()));
+    assert_eq!(
+        decoded.table.rows[0][0],
+        DecodedValue::Symbol("r1".to_owned())
+    );
     assert_eq!(decoded.table.rows[0][1], DecodedValue::I64(i64::MIN));
     match &decoded.table.rows[0][2] {
         DecodedValue::F64(value) => assert!(value.is_nan()),
         other => panic!("expected NaN sentinel for sparse double column, got {other:?}"),
     }
-    assert_eq!(decoded.table.rows[1][0], DecodedValue::Symbol("r2".to_owned()));
+    assert_eq!(
+        decoded.table.rows[1][0],
+        DecodedValue::Symbol("r2".to_owned())
+    );
     assert_eq!(decoded.table.rows[1][1], DecodedValue::I64(2));
     match &decoded.table.rows[1][2] {
         DecodedValue::F64(value) => assert!(value.is_nan()),
         other => panic!("expected NaN sentinel for sparse double column, got {other:?}"),
     }
-    assert_eq!(decoded.table.rows[2][0], DecodedValue::Symbol("r3".to_owned()));
+    assert_eq!(
+        decoded.table.rows[2][0],
+        DecodedValue::Symbol("r3".to_owned())
+    );
     assert_eq!(decoded.table.rows[2][1], DecodedValue::I64(i64::MIN));
     assert_eq!(decoded.table.rows[2][2], DecodedValue::F64(33.5));
-    assert_eq!(decoded.table.rows[3][0], DecodedValue::Symbol("r4".to_owned()));
+    assert_eq!(
+        decoded.table.rows[3][0],
+        DecodedValue::Symbol("r4".to_owned())
+    );
     assert_eq!(decoded.table.rows[3][1], DecodedValue::I64(4));
     assert_eq!(decoded.table.rows[3][2], DecodedValue::F64(44.5));
 
@@ -528,10 +544,7 @@ fn qwp_udp_encodes_sparse_timestamp_columns_as_nullable_nulls() -> TestResult {
         .symbol("sym", "r2")?
         .column_ts("event_ts", TimestampMicros::new(123_456))?
         .at_now()?;
-    buffer
-        .table("trades")?
-        .symbol("sym", "r3")?
-        .at_now()?;
+    buffer.table("trades")?.symbol("sym", "r3")?.at_now()?;
 
     sender.flush(&mut buffer)?;
     let decoded = decode_datagram(&mock.recv_datagram()?).expect("datagram should decode");
@@ -548,18 +561,12 @@ fn qwp_udp_encodes_sparse_timestamp_columns_as_nullable_nulls() -> TestResult {
     assert_eq!(
         decoded.table.rows,
         vec![
-            vec![
-                DecodedValue::Symbol("r1".to_owned()),
-                DecodedValue::Null,
-            ],
+            vec![DecodedValue::Symbol("r1".to_owned()), DecodedValue::Null,],
             vec![
                 DecodedValue::Symbol("r2".to_owned()),
                 DecodedValue::TimestampMicros(123_456),
             ],
-            vec![
-                DecodedValue::Symbol("r3".to_owned()),
-                DecodedValue::Null,
-            ],
+            vec![DecodedValue::Symbol("r3".to_owned()), DecodedValue::Null,],
         ]
     );
 

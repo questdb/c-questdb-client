@@ -259,7 +259,11 @@ pub(crate) fn decode_datagram(bytes: &[u8]) -> Result<DecodedDatagram, String> {
                     let idx = indexes[next_index];
                     next_index += 1;
                     let symbol = dict.get(idx).ok_or_else(|| {
-                        format!("symbol index {} out of bounds for dictionary size {}", idx, dict.len())
+                        format!(
+                            "symbol index {} out of bounds for dictionary size {}",
+                            idx,
+                            dict.len()
+                        )
                     })?;
                     values.push(DecodedValue::Symbol(symbol.clone()));
                 }
@@ -320,10 +324,12 @@ pub(crate) fn decode_datagram(bytes: &[u8]) -> Result<DecodedDatagram, String> {
                         values.push(DecodedValue::Null);
                         continue;
                     }
-                    let start = usize::try_from(offsets[next_offset])
-                        .map_err(|_| format!("invalid string start offset {}", offsets[next_offset]))?;
-                    let end = usize::try_from(offsets[next_offset + 1])
-                        .map_err(|_| format!("invalid string end offset {}", offsets[next_offset + 1]))?;
+                    let start = usize::try_from(offsets[next_offset]).map_err(|_| {
+                        format!("invalid string start offset {}", offsets[next_offset])
+                    })?;
+                    let end = usize::try_from(offsets[next_offset + 1]).map_err(|_| {
+                        format!("invalid string end offset {}", offsets[next_offset + 1])
+                    })?;
                     let value = std::str::from_utf8(&data[start..end])
                         .map_err(|err| format!("invalid utf-8 in string value: {err}"))?;
                     values.push(DecodedValue::String(value.to_owned()));
