@@ -143,27 +143,12 @@ impl Sender {
 
     /// Creates a new [`Buffer`] using the sender's protocol settings
     pub fn new_buffer(&self) -> Buffer {
-        #[cfg(all(
-            feature = "sync-sender-qwp-udp",
-            not(any(feature = "sync-sender-tcp", feature = "sync-sender-http"))
-        ))]
-        {
-            let _ = &self.handler;
-            Buffer::qwp_with_max_name_len(self.max_name_len)
+        #[cfg(feature = "sync-sender-qwp-udp")]
+        if matches!(&self.handler, SyncProtocolHandler::SyncQwpUdp(_)) {
+            return Buffer::qwp_with_max_name_len(self.max_name_len);
         }
 
-        #[cfg(not(all(
-            feature = "sync-sender-qwp-udp",
-            not(any(feature = "sync-sender-tcp", feature = "sync-sender-http"))
-        )))]
-        {
-            #[cfg(feature = "sync-sender-qwp-udp")]
-            if matches!(&self.handler, SyncProtocolHandler::SyncQwpUdp(_)) {
-                return Buffer::qwp_with_max_name_len(self.max_name_len);
-            }
-
-            Buffer::with_max_name_len(self.protocol_version, self.max_name_len)
-        }
+        Buffer::with_max_name_len(self.protocol_version, self.max_name_len)
     }
 
     #[allow(unused_variables)]
