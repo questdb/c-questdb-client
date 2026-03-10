@@ -369,3 +369,7 @@ messages in [server logs](https://questdb.io/docs/troubleshooting/log/).
 
 To inspect or log a buffer's contents before you send it, call
 [`buffer.as_bytes()`](Buffer::as_bytes).
+
+This byte-level inspection is only meaningful for ILP buffers. QWP buffers are
+encoded into UDP datagrams during [`flush()`](Sender::flush), so
+[`buffer.as_bytes()`](Buffer::as_bytes) is not useful there.

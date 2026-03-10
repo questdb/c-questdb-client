@@ -24,11 +24,11 @@
 
 use crate::{
     ErrorCode,
-    ingress::{
-        Buffer, DOUBLE_BINARY_FORMAT_TYPE, F64Serializer, Sender, TableName, Timestamp,
-        TimestampMicros, TimestampNanos,
-    },
+    ingress::{Buffer, Sender, TableName, Timestamp, TimestampMicros, TimestampNanos},
 };
+
+#[cfg(feature = "sync-sender-tcp")]
+use crate::ingress::{DOUBLE_BINARY_FORMAT_TYPE, F64Serializer};
 
 use crate::ingress::ProtocolVersion;
 use crate::tests::TestResult;
@@ -856,6 +856,7 @@ fn tcp_mismatched_buffer_and_sender_version() -> TestResult {
     Ok(())
 }
 
+#[cfg(feature = "sync-sender-tcp")]
 pub(crate) fn f64_to_bytes(name: &str, value: f64, version: ProtocolVersion) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend_from_slice(name.as_bytes());

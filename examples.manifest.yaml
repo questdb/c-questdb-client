@@ -17,6 +17,43 @@
   header: |-
     [Rust client library docs](https://docs.rs/questdb-rs/latest/questdb/)
 
+# QWP/UDP examples
+- name: qwpudp
+  lang: c
+  path: examples/line_sender_c_example_qwpudp.c
+  header: |-
+    [C client library docs](https://github.com/questdb/c-questdb-client/blob/main/doc/C.md)
+  addr:
+    host: localhost
+    port: 9007
+
+- name: qwpudp
+  lang: cpp
+  path: examples/line_sender_cpp_example_qwpudp.cpp
+  header: |-
+    [C++ client library docs](https://github.com/questdb/c-questdb-client/blob/main/doc/CPP.md)
+  addr:
+    host: localhost
+    port: 9007
+
+- name: qwpudp-batch
+  lang: c
+  path: examples/line_sender_c_example_qwpudp_batch.c
+  header: |-
+    [C client library docs](https://github.com/questdb/c-questdb-client/blob/main/doc/C.md)
+  addr:
+    host: localhost
+    port: 9007
+
+- name: qwpudp-batch
+  lang: cpp
+  path: examples/line_sender_cpp_example_qwpudp_batch.cpp
+  header: |-
+    [C++ client library docs](https://github.com/questdb/c-questdb-client/blob/main/doc/CPP.md)
+  addr:
+    host: localhost
+    port: 9007
+
 # ILP Auth Examples
 - name: ilp-auth
   lang: c

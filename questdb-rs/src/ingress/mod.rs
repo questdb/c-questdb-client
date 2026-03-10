@@ -99,6 +99,7 @@ pub enum ProtocolVersion {
 }
 
 /// List of supported protocol versions, in order of preference (highest to lowest).
+#[cfg(feature = "_sender-http")]
 const SUPPORTED_PROTOCOL_VERSIONS: [ProtocolVersion; 3] = [
     ProtocolVersion::V3,
     ProtocolVersion::V2,
@@ -222,6 +223,10 @@ pub enum Protocol {
     #[cfg(feature = "_sender-http")]
     /// HTTP + TLS
     Https,
+
+    #[cfg(feature = "_sender-qwp-udp")]
+    /// Quest Wire Protocol over UDP datagrams.
+    QwpUdp,
 }
 
 impl Display for Protocol {
@@ -237,6 +242,8 @@ impl Protocol {
             Protocol::Tcp | Protocol::Tcps => "9009",
             #[cfg(feature = "_sender-http")]
             Protocol::Http | Protocol::Https => "9000",
+            #[cfg(feature = "_sender-qwp-udp")]
+            Protocol::QwpUdp => "9007",
         }
     }
 
@@ -250,6 +257,8 @@ impl Protocol {
             Protocol::Http => false,
             #[cfg(feature = "_sender-http")]
             Protocol::Https => true,
+            #[cfg(feature = "_sender-qwp-udp")]
+            Protocol::QwpUdp => false,
         }
     }
 
@@ -259,6 +268,8 @@ impl Protocol {
             Protocol::Tcp | Protocol::Tcps => true,
             #[cfg(feature = "_sender-http")]
             Protocol::Http | Protocol::Https => false,
+            #[cfg(feature = "_sender-qwp-udp")]
+            Protocol::QwpUdp => false,
         }
     }
 
@@ -268,7 +279,14 @@ impl Protocol {
             #[cfg(feature = "_sender-tcp")]
             Protocol::Tcp | Protocol::Tcps => false,
             Protocol::Http | Protocol::Https => true,
+            #[cfg(feature = "_sender-qwp-udp")]
+            Protocol::QwpUdp => false,
         }
+    }
+
+    #[cfg(feature = "_sender-qwp-udp")]
+    fn is_qwp_udp(&self) -> bool {
+        matches!(self, Protocol::QwpUdp)
     }
 
     fn schema(&self) -> &str {
@@ -281,6 +299,8 @@ impl Protocol {
             Protocol::Http => "http",
             #[cfg(feature = "_sender-http")]
             Protocol::Https => "https",
+            #[cfg(feature = "_sender-qwp-udp")]
+            Protocol::QwpUdp => "qwpudp",
         }
     }
 
@@ -294,6 +314,8 @@ impl Protocol {
             "http" => Ok(Protocol::Http),
             #[cfg(feature = "_sender-http")]
             "https" => Ok(Protocol::Https),
+            #[cfg(feature = "_sender-qwp-udp")]
+            "qwpudp" => Ok(Protocol::QwpUdp),
             _ => Err(error::fmt!(ConfigError, "Unsupported protocol: {}", schema)),
         }
     }
@@ -373,6 +395,9 @@ pub struct SenderBuilder {
 
     #[cfg(feature = "_sender-http")]
     http: Option<conf::HttpConfig>,
+
+    #[cfg(feature = "_sender-qwp-udp")]
+    qwp_udp: Option<conf::QwpUdpConfig>,
 }
 
 impl SenderBuilder {
@@ -433,6 +458,10 @@ impl SenderBuilder {
                 "token_x" => builder.token_x(val)?,
                 "token_y" => builder.token_y(val)?,
                 "bind_interface" => builder.bind_interface(val)?,
+                #[cfg(feature = "_sender-qwp-udp")]
+                "max_datagram_size" => builder.max_datagram_size(parse_conf_value(key, val)?)?,
+                #[cfg(feature = "_sender-qwp-udp")]
+                "multicast_ttl" => builder.multicast_ttl(parse_conf_value(key, val)?)?,
                 "protocol_version" => match val {
                     "1" => builder.protocol_version(ProtocolVersion::V1)?,
                     "2" => builder.protocol_version(ProtocolVersion::V2)?,
@@ -488,51 +517,54 @@ impl SenderBuilder {
                 }
 
                 "tls_ca" => {
-                    let ca = match val {
-                        #[cfg(feature = "tls-webpki-certs")]
-                        "webpki_roots" => CertificateAuthority::WebpkiRoots,
+                    #[allow(unreachable_code, unused_variables)]
+                    {
+                        let ca = match val {
+                            #[cfg(feature = "tls-webpki-certs")]
+                            "webpki_roots" => CertificateAuthority::WebpkiRoots,
 
-                        #[cfg(not(feature = "tls-webpki-certs"))]
-                        "webpki_roots" => {
-                            return Err(error::fmt!(
-                                ConfigError,
-                                "Config parameter \"tls_ca=webpki_roots\" requires the \"tls-webpki-certs\" feature"
-                            ));
-                        }
+                            #[cfg(not(feature = "tls-webpki-certs"))]
+                            "webpki_roots" => {
+                                return Err(error::fmt!(
+                                    ConfigError,
+                                    "Config parameter \"tls_ca=webpki_roots\" requires the \"tls-webpki-certs\" feature"
+                                ));
+                            }
 
-                        #[cfg(feature = "tls-native-certs")]
-                        "os_roots" => CertificateAuthority::OsRoots,
+                            #[cfg(feature = "tls-native-certs")]
+                            "os_roots" => CertificateAuthority::OsRoots,
 
-                        #[cfg(not(feature = "tls-native-certs"))]
-                        "os_roots" => {
-                            return Err(error::fmt!(
-                                ConfigError,
-                                "Config parameter \"tls_ca=os_roots\" requires the \"tls-native-certs\" feature"
-                            ));
-                        }
+                            #[cfg(not(feature = "tls-native-certs"))]
+                            "os_roots" => {
+                                return Err(error::fmt!(
+                                    ConfigError,
+                                    "Config parameter \"tls_ca=os_roots\" requires the \"tls-native-certs\" feature"
+                                ));
+                            }
 
-                        #[cfg(all(feature = "tls-webpki-certs", feature = "tls-native-certs"))]
-                        "webpki_and_os_roots" => CertificateAuthority::WebpkiAndOsRoots,
+                            #[cfg(all(feature = "tls-webpki-certs", feature = "tls-native-certs"))]
+                            "webpki_and_os_roots" => CertificateAuthority::WebpkiAndOsRoots,
 
-                        #[cfg(not(all(
-                            feature = "tls-webpki-certs",
-                            feature = "tls-native-certs"
-                        )))]
-                        "webpki_and_os_roots" => {
-                            return Err(error::fmt!(
-                                ConfigError,
-                                "Config parameter \"tls_ca=webpki_and_os_roots\" requires both the \"tls-webpki-certs\" and \"tls-native-certs\" features"
-                            ));
-                        }
+                            #[cfg(not(all(
+                                feature = "tls-webpki-certs",
+                                feature = "tls-native-certs"
+                            )))]
+                            "webpki_and_os_roots" => {
+                                return Err(error::fmt!(
+                                    ConfigError,
+                                    "Config parameter \"tls_ca=webpki_and_os_roots\" requires both the \"tls-webpki-certs\" and \"tls-native-certs\" features"
+                                ));
+                            }
 
-                        _ => {
-                            return Err(error::fmt!(
-                                ConfigError,
-                                "Invalid value {val:?} for \"tls_ca\""
-                            ));
-                        }
-                    };
-                    builder.tls_ca(ca)?
+                            _ => {
+                                return Err(error::fmt!(
+                                    ConfigError,
+                                    "Invalid value {val:?} for \"tls_ca\""
+                                ));
+                            }
+                        };
+                        builder.tls_ca(ca)?
+                    }
                 }
 
                 "tls_roots" => {
@@ -656,6 +688,13 @@ impl SenderBuilder {
             } else {
                 None
             },
+
+            #[cfg(feature = "_sender-qwp-udp")]
+            qwp_udp: if protocol.is_qwp_udp() {
+                Some(conf::QwpUdpConfig::default())
+            } else {
+                None
+            },
         }
     }
 
@@ -665,17 +704,17 @@ impl SenderBuilder {
     ///
     /// The default is `"0.0.0.0"`.
     pub fn bind_interface<I: Into<String>>(self, addr: I) -> Result<Self> {
-        #[cfg(feature = "_sender-tcp")]
+        #[cfg(any(feature = "_sender-tcp", feature = "_sender-qwp-udp"))]
         {
             let mut builder = self;
-            builder.ensure_is_tcpx("bind_interface")?;
+            builder.ensure_supports_bind_interface("bind_interface")?;
             builder
                 .net_interface
                 .set_specified("bind_interface", Some(validate_value(addr.into())?))?;
             Ok(builder)
         }
 
-        #[cfg(not(feature = "_sender-tcp"))]
+        #[cfg(not(any(feature = "_sender-tcp", feature = "_sender-qwp-udp")))]
         {
             let _ = addr;
             Err(error::fmt!(
@@ -766,8 +805,57 @@ impl SenderBuilder {
     ///
     /// **Note**: QuestDB server version 9.0.0 or later is required for [`ProtocolVersion::V2`] support.
     pub fn protocol_version(mut self, protocol_version: ProtocolVersion) -> Result<Self> {
+        #[cfg(feature = "_sender-qwp-udp")]
+        if self.protocol.is_qwp_udp() {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"protocol_version\" setting is not supported for QWP/UDP."
+            ));
+        }
         self.protocol_version
             .set_specified("protocol_version", Some(protocol_version))?;
+        Ok(self)
+    }
+
+    #[cfg(feature = "_sender-qwp-udp")]
+    /// Set the maximum datagram size in bytes for QWP/UDP transport.
+    pub fn max_datagram_size(mut self, value: usize) -> Result<Self> {
+        if value == 0 {
+            return Err(error::fmt!(
+                ConfigError,
+                "\"max_datagram_size\" must be greater than 0."
+            ));
+        }
+        let Some(qwp_udp) = &mut self.qwp_udp else {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"max_datagram_size\" setting is only supported for QWP/UDP."
+            ));
+        };
+        qwp_udp
+            .max_datagram_size
+            .set_specified("max_datagram_size", value)?;
+        Ok(self)
+    }
+
+    #[cfg(feature = "_sender-qwp-udp")]
+    /// Set the multicast TTL for QWP/UDP transport.
+    pub fn multicast_ttl(mut self, value: u32) -> Result<Self> {
+        if value > 255 {
+            return Err(error::fmt!(
+                ConfigError,
+                "\"multicast_ttl\" must be between 0 and 255."
+            ));
+        }
+        let Some(qwp_udp) = &mut self.qwp_udp else {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"multicast_ttl\" setting is only supported for QWP/UDP."
+            ));
+        };
+        qwp_udp
+            .multicast_ttl
+            .set_specified("multicast_ttl", value)?;
         Ok(self)
     }
 
@@ -832,8 +920,11 @@ impl SenderBuilder {
         Ok(builder)
     }
 
-    /// The maximum buffer size in bytes that the client will flush to the server.
+    /// The maximum buffered size that the client will flush to the server.
     /// The default is 100 MiB.
+    ///
+    /// For ILP this applies to the exact pending byte length.
+    /// For QWP/UDP this applies to the buffer size hint exposed by [`Buffer::len`].
     pub fn max_buf_size(mut self, value: usize) -> Result<Self> {
         let min = 1024;
         if value < min {
@@ -1060,6 +1151,7 @@ impl SenderBuilder {
         #[cfg(feature = "insecure-skip-verify")]
         let tls_verify = *self.tls_verify;
 
+        #[allow(unused_variables)]
         let tls_settings = tls::TlsSettings::build(
             self.protocol.tls_enabled(),
             #[cfg(feature = "insecure-skip-verify")]
@@ -1067,6 +1159,9 @@ impl SenderBuilder {
             *self.tls_ca,
             self.tls_roots.deref().as_deref(),
         )?;
+
+        #[cfg(feature = "_sender-qwp-udp")]
+        self.validate_qwp_udp_settings()?;
 
         let auth = self.build_auth()?;
 
@@ -1143,6 +1238,13 @@ impl SenderBuilder {
                     config: self.http.as_ref().unwrap().clone(),
                 })
             }
+            #[cfg(feature = "sync-sender-qwp-udp")]
+            Protocol::QwpUdp => connect_qwp_udp(
+                self.host.as_str(),
+                self.port.as_str(),
+                self.net_interface.deref().as_deref(),
+                self.qwp_udp.as_ref().expect("qwp config missing"),
+            )?,
         };
 
         #[allow(unused_mut)]
@@ -1181,6 +1283,8 @@ impl SenderBuilder {
                         unreachable!("HTTP handler should be used for HTTP protocol");
                     }
                 }
+                #[cfg(feature = "sync-sender-qwp-udp")]
+                Protocol::QwpUdp => ProtocolVersion::V1,
             },
         };
 
@@ -1194,6 +1298,7 @@ impl SenderBuilder {
             descr,
             handler,
             *self.max_buf_size,
+            self.protocol,
             protocol_version,
             max_name_len,
         );
@@ -1201,16 +1306,70 @@ impl SenderBuilder {
         Ok(sender)
     }
 
-    #[cfg(feature = "_sender-tcp")]
-    fn ensure_is_tcpx(&mut self, param_name: &str) -> Result<()> {
+    #[cfg(any(feature = "_sender-tcp", feature = "_sender-qwp-udp"))]
+    fn ensure_supports_bind_interface(&self, param_name: &str) -> Result<()> {
+        #[cfg(feature = "_sender-tcp")]
         if self.protocol.is_tcpx() {
-            Ok(())
-        } else {
-            Err(fmt!(
-                ConfigError,
-                "The {param_name:?} setting can only be used with the TCP protocol."
-            ))
+            return Ok(());
         }
+
+        #[cfg(feature = "_sender-qwp-udp")]
+        if self.protocol.is_qwp_udp() {
+            return Ok(());
+        }
+
+        #[cfg(feature = "_sender-qwp-udp")]
+        let supported = "TCP or QWP/UDP";
+        #[cfg(not(feature = "_sender-qwp-udp"))]
+        let supported = "TCP";
+
+        Err(fmt!(
+            ConfigError,
+            "The {param_name:?} setting can only be used with the {supported} protocol."
+        ))
+    }
+
+    #[cfg(feature = "_sender-qwp-udp")]
+    fn validate_qwp_udp_settings(&self) -> Result<()> {
+        if !self.protocol.is_qwp_udp() {
+            return Ok(());
+        }
+
+        if self.username.is_some()
+            || self.password.is_some()
+            || self.token.is_some()
+            || {
+                #[cfg(feature = "_sender-tcp")]
+                {
+                    self.token_x.is_some() || self.token_y.is_some()
+                }
+                #[cfg(not(feature = "_sender-tcp"))]
+                {
+                    false
+                }
+            }
+        {
+            return Err(error::fmt!(
+                ConfigError,
+                "Authentication settings are not supported for QWP/UDP."
+            ));
+        }
+
+        if self.protocol_version.is_some() {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"protocol_version\" setting is not supported for QWP/UDP."
+            ));
+        }
+
+        if matches!(self.auth_timeout, ConfigSetting::Specified(_)) {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"auth_timeout\" setting is not supported for QWP/UDP."
+            ));
+        }
+
+        Ok(())
     }
 }
 

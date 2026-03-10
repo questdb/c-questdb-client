@@ -27,7 +27,17 @@ mod f64_serializer;
 #[cfg(feature = "sync-sender-http")]
 mod http;
 
+#[cfg(any(feature = "sync-sender-tcp", feature = "sync-sender-http"))]
 mod mock;
+
+#[cfg(feature = "sync-sender-qwp-udp")]
+mod qwp;
+
+#[cfg(feature = "sync-sender-qwp-udp")]
+mod qwp_decode;
+
+#[cfg(feature = "sync-sender-qwp-udp")]
+mod qwp_mock;
 mod sender;
 
 mod decimal;

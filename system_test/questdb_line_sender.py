@@ -60,6 +60,7 @@ from ctypes import (
     c_double,
     c_uint8,
     c_uint16,
+    c_uint32,
     c_uint64,
     c_void_p,
     c_ssize_t)
@@ -83,6 +84,14 @@ class Protocol(Enum):
     TCPS = (c_line_sender_protocol(1), 'tcps')
     HTTP = (c_line_sender_protocol(2), 'http')
     HTTPS = (c_line_sender_protocol(3), 'https')
+    QWPUDP = (c_line_sender_protocol(4), 'qwpudp')
+
+    @classmethod
+    def from_int(cls, value: c_line_sender_protocol):
+        for member in cls:
+            if member.value[0].value == value:
+                return member
+        raise ValueError(f"invalid protocol: {value}")
 
 
 c_line_sender_ca = ctypes.c_int
@@ -232,6 +241,10 @@ def _setup_cdll():
         c_protocol_version,
         c_size_t)
     set_sig(
+        dll.line_sender_buffer_new_for_sender,
+        c_line_sender_buffer_p,
+        c_line_sender_p)
+    set_sig(
         dll.line_sender_buffer_free,
         None,
         c_line_sender_buffer_p)
@@ -249,6 +262,20 @@ def _setup_cdll():
         c_line_sender_buffer_p)
     set_sig(
         dll.line_sender_buffer_clear,
+        None,
+        c_line_sender_buffer_p)
+    set_sig(
+        dll.line_sender_buffer_set_marker,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_rewind_to_marker,
+        c_bool,
+        c_line_sender_buffer_p,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_buffer_clear_marker,
         None,
         c_line_sender_buffer_p)
     set_sig(
@@ -374,6 +401,18 @@ def _setup_cdll():
         c_bool,
         c_line_sender_opts_p,
         c_line_sender_utf8,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_opts_max_datagram_size,
+        c_bool,
+        c_line_sender_opts_p,
+        c_size_t,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_opts_multicast_ttl,
+        c_bool,
+        c_line_sender_opts_p,
+        c_uint32,
         c_line_sender_error_p_p)
     set_sig(
         dll.line_sender_opts_username,
@@ -508,6 +547,10 @@ def _setup_cdll():
         c_line_sender_buffer_p,
         c_bool,
         c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_get_protocol,
+        c_line_sender_protocol,
+        c_line_sender_p)
     set_sig(
         dll.line_sender_get_protocol_version,
         c_protocol_version,
@@ -649,6 +692,13 @@ class Buffer:
             c_size_t(max_name_len))
         _DLL.line_sender_buffer_reserve(self._impl, c_size_t(init_buf_size))
 
+    @classmethod
+    def from_sender(cls, sender_impl, init_buf_size=65536):
+        self = cls.__new__(cls)
+        self._impl = _DLL.line_sender_buffer_new_for_sender(sender_impl)
+        _DLL.line_sender_buffer_reserve(self._impl, c_size_t(init_buf_size))
+        return self
+
     def __len__(self):
         return _DLL.line_sender_buffer_size(self._impl)
 
@@ -670,6 +720,22 @@ class Buffer:
 
     def clear(self):
         _DLL.line_sender_buffer_clear(self._impl)
+
+    def set_marker(self):
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_set_marker,
+            self._impl)
+        return self
+
+    def rewind_to_marker(self):
+        _error_wrapped_call(
+            _DLL.line_sender_buffer_rewind_to_marker,
+            self._impl)
+        return self
+
+    def clear_marker(self):
+        _DLL.line_sender_buffer_clear_marker(self._impl)
+        return self
 
     def table(self, table: str):
         table_name = _table_name(table)
@@ -906,14 +972,17 @@ class Sender:
 
     def __enter__(self):
         self.connect()
-        self._buffer = Buffer(
-            protocol_version=self.protocol_version,
-            max_name_len=self.max_name_len)
+        self._buffer = Buffer.from_sender(self._impl)
         return self
 
     def _check_connected(self):
         if not self._impl:
             raise SenderError('Not connected.')
+
+    @property
+    def protocol(self):
+        self._check_connected()
+        return Protocol.from_int(_DLL.line_sender_get_protocol(self._impl))
 
     @property
     def protocol_version(self):

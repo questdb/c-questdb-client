@@ -36,8 +36,146 @@
 #include <thread>
 #include <vector>
 
+#if defined(PLATFORM_UNIX)
+#    include <arpa/inet.h>
+#    include <sys/socket.h>
+#    include <unistd.h>
+#elif defined(PLATFORM_WINDOWS)
+#    include <winsock2.h>
+#    include <ws2tcpip.h>
+#endif
+
 using namespace std::string_literals;
 using namespace questdb::ingress::literals;
+
+#if defined(PLATFORM_UNIX)
+#    define QDB_TEST_CLOSESOCKET ::close
+typedef const void* qdb_test_setsockopt_arg_t;
+typedef size_t qdb_test_sock_len_t;
+typedef ssize_t qdb_test_sock_ssize_t;
+#    ifndef INVALID_SOCKET
+#        define INVALID_SOCKET -1
+#    endif
+#elif defined(PLATFORM_WINDOWS)
+#    define QDB_TEST_CLOSESOCKET ::closesocket
+typedef const char* qdb_test_setsockopt_arg_t;
+typedef int qdb_test_sock_len_t;
+typedef int qdb_test_sock_ssize_t;
+
+static void qdb_test_init_winsock()
+{
+    WORD vers_req = MAKEWORD(2, 2);
+    WSADATA wsa_data;
+    REQUIRE(WSAStartup(vers_req, &wsa_data) == 0);
+}
+
+static void qdb_test_release_winsock()
+{
+    REQUIRE(WSACleanup() == 0);
+}
+#endif
+
+class udp_capture
+{
+public:
+    udp_capture()
+        : _socket{INVALID_SOCKET}
+        , _port{0}
+    {
+#if defined(PLATFORM_WINDOWS)
+        qdb_test_init_winsock();
+#endif
+        _socket = ::socket(AF_INET, SOCK_DGRAM, 0);
+        REQUIRE(_socket != INVALID_SOCKET);
+
+        const int reuse_addr = 1;
+        REQUIRE(
+            ::setsockopt(
+                _socket,
+                SOL_SOCKET,
+                SO_REUSEADDR,
+                static_cast<qdb_test_setsockopt_arg_t>(
+                    static_cast<const void*>(&reuse_addr)),
+                sizeof(reuse_addr)) == 0);
+
+        sockaddr_in listen_addr{};
+        listen_addr.sin_family = AF_INET;
+        listen_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        listen_addr.sin_port = htons(0);
+        REQUIRE(
+            ::bind(
+                _socket,
+                reinterpret_cast<const sockaddr*>(&listen_addr),
+                sizeof(listen_addr)) == 0);
+
+        sockaddr_in resolved_addr{};
+        socklen_t resolved_addr_len = sizeof(resolved_addr);
+        REQUIRE(
+            ::getsockname(
+                _socket,
+                reinterpret_cast<sockaddr*>(&resolved_addr),
+                &resolved_addr_len) == 0);
+        _port = ntohs(resolved_addr.sin_port);
+    }
+
+    udp_capture(const udp_capture&) = delete;
+    udp_capture& operator=(const udp_capture&) = delete;
+
+    ~udp_capture()
+    {
+        if (_socket != INVALID_SOCKET)
+            QDB_TEST_CLOSESOCKET(_socket);
+#if defined(PLATFORM_WINDOWS)
+        qdb_test_release_winsock();
+#endif
+    }
+
+    uint16_t port() const
+    {
+        return _port;
+    }
+
+    std::vector<std::byte> recv_datagram(double wait_timeout_sec = 0.5) const
+    {
+        fd_set read_set;
+        FD_ZERO(&read_set);
+        FD_SET(_socket, &read_set);
+
+        const auto secs = static_cast<long>(wait_timeout_sec);
+        const auto micros = static_cast<long>(
+            1000000.0 * (wait_timeout_sec - static_cast<double>(secs)));
+        timeval timeout{secs, micros};
+        const int nfds = static_cast<int>(_socket) + 1;
+        const int ready =
+            ::select(nfds, &read_set, nullptr, nullptr, &timeout);
+        REQUIRE(ready >= 0);
+        REQUIRE(ready == 1);
+
+        std::vector<std::byte> buffer(65536);
+        sockaddr_in remote_addr{};
+        socklen_t remote_addr_len = sizeof(remote_addr);
+        const auto count = ::recvfrom(
+            _socket,
+            reinterpret_cast<char*>(buffer.data()),
+            static_cast<qdb_test_sock_len_t>(buffer.size()),
+            0,
+            reinterpret_cast<sockaddr*>(&remote_addr),
+            &remote_addr_len);
+        REQUIRE(count >= 0);
+        buffer.resize(static_cast<size_t>(count));
+        return buffer;
+    }
+
+private:
+    socketfd_t _socket;
+    uint16_t _port;
+};
+
+bool datagram_starts_with_qwp1(const std::vector<std::byte>& datagram)
+{
+    return datagram.size() >= 4 &&
+        std::memcmp(datagram.data(), "QWP1", 4) == 0;
+}
 
 template <typename F>
 class on_scope_exit
@@ -1203,6 +1341,146 @@ TEST_CASE("line sender protocol version v2")
     std::string expect{"test,t1=v1,t2= f1=="};
     push_double_to_buffer(expect, 0.5).append(" 10000000n\n");
     CHECK(server.msgs(0) == expect);
+}
+
+TEST_CASE("line_sender c api qwpudp basics")
+{
+    udp_capture receiver;
+    ::line_sender_error* err = nullptr;
+    on_scope_exit error_free_guard{[&] {
+        if (err)
+            ::line_sender_error_free(err);
+    }};
+
+    const auto host = QDB_UTF8_LITERAL("127.0.0.1");
+    ::line_sender_opts* opts =
+        ::line_sender_opts_new(::line_sender_protocol_qwpudp, host, receiver.port());
+    REQUIRE(opts != nullptr);
+    on_scope_exit opts_free_guard{[&] { ::line_sender_opts_free(opts); }};
+
+    CHECK(::line_sender_opts_max_datagram_size(opts, 256, &err));
+
+    ::line_sender* sender = ::line_sender_build(opts, &err);
+    REQUIRE(sender != nullptr);
+    on_scope_exit sender_close_guard{[&] { ::line_sender_close(sender); }};
+
+    ::line_sender_buffer* buffer = ::line_sender_buffer_new_for_sender(sender);
+    REQUIRE(buffer != nullptr);
+    on_scope_exit buffer_free_guard{[&] { ::line_sender_buffer_free(buffer); }};
+
+    const auto table = QDB_TABLE_NAME_LITERAL("trades");
+    const auto sym = QDB_COLUMN_NAME_LITERAL("sym");
+    const auto qty = QDB_COLUMN_NAME_LITERAL("qty");
+    const auto active = QDB_COLUMN_NAME_LITERAL("active");
+    const auto venue = QDB_COLUMN_NAME_LITERAL("venue");
+    const auto sym_value = QDB_UTF8_LITERAL("ETH-USD");
+    const auto venue_value = QDB_UTF8_LITERAL("binance");
+
+    CHECK(::line_sender_buffer_table(buffer, table, &err));
+    CHECK(::line_sender_buffer_symbol(buffer, sym, sym_value, &err));
+    CHECK(::line_sender_buffer_column_i64(buffer, qty, 4, &err));
+    CHECK(::line_sender_buffer_column_bool(buffer, active, true, &err));
+    CHECK(::line_sender_buffer_column_str(buffer, venue, venue_value, &err));
+    CHECK(::line_sender_buffer_at_now(buffer, &err));
+    CHECK(::line_sender_flush(sender, buffer, &err));
+    CHECK(::line_sender_buffer_row_count(buffer) == 0);
+
+    const auto datagram = receiver.recv_datagram();
+    CHECK(datagram.size() >= 12);
+    CHECK(datagram_starts_with_qwp1(datagram));
+    CHECK(std::to_integer<uint8_t>(datagram[4]) == 1);
+    CHECK(std::to_integer<uint8_t>(datagram[6]) == 1);
+    CHECK(std::to_integer<uint8_t>(datagram[7]) == 0);
+}
+
+TEST_CASE("line_sender c api standalone qwpudp buffer")
+{
+    udp_capture receiver;
+    ::line_sender_error* err = nullptr;
+    on_scope_exit error_free_guard{[&] {
+        if (err)
+            ::line_sender_error_free(err);
+    }};
+
+    const auto host = QDB_UTF8_LITERAL("127.0.0.1");
+    ::line_sender_opts* opts =
+        ::line_sender_opts_new(::line_sender_protocol_qwpudp, host, receiver.port());
+    REQUIRE(opts != nullptr);
+    on_scope_exit opts_free_guard{[&] { ::line_sender_opts_free(opts); }};
+
+    ::line_sender* sender = ::line_sender_build(opts, &err);
+    REQUIRE(sender != nullptr);
+    on_scope_exit sender_close_guard{[&] { ::line_sender_close(sender); }};
+
+    ::line_sender_buffer* buffer = ::line_sender_buffer_new_qwp();
+    REQUIRE(buffer != nullptr);
+    on_scope_exit buffer_free_guard{[&] { ::line_sender_buffer_free(buffer); }};
+
+    const auto table = QDB_TABLE_NAME_LITERAL("quotes");
+    const auto sym = QDB_COLUMN_NAME_LITERAL("sym");
+    const auto qty = QDB_COLUMN_NAME_LITERAL("qty");
+    const auto sym_value = QDB_UTF8_LITERAL("BTC-USD");
+
+    CHECK(::line_sender_buffer_table(buffer, table, &err));
+    CHECK(::line_sender_buffer_symbol(buffer, sym, sym_value, &err));
+    CHECK(::line_sender_buffer_column_i64(buffer, qty, 7, &err));
+    CHECK(::line_sender_buffer_at_now(buffer, &err));
+    CHECK(::line_sender_flush(sender, buffer, &err));
+
+    const auto datagram = receiver.recv_datagram();
+    CHECK(datagram.size() >= 12);
+    CHECK(datagram_starts_with_qwp1(datagram));
+}
+
+TEST_CASE("line_sender c++ qwpudp flush_and_keep resends datagram")
+{
+    udp_capture receiver;
+    questdb::ingress::opts opts{
+        questdb::ingress::protocol::qwpudp,
+        std::string("127.0.0.1"),
+        std::to_string(receiver.port())};
+    opts.max_datagram_size(256);
+    questdb::ingress::line_sender sender{opts};
+
+    questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
+    buffer.table("trades")
+        .symbol("sym", "ETH-USD")
+        .column("qty", int64_t{4})
+        .column("active", true)
+        .at_now();
+
+    CHECK(buffer.row_count() == 1);
+    sender.flush_and_keep(buffer);
+    CHECK(buffer.row_count() == 1);
+    const auto first = receiver.recv_datagram();
+    CHECK(datagram_starts_with_qwp1(first));
+
+    sender.flush(buffer);
+    CHECK(buffer.row_count() == 0);
+    const auto second = receiver.recv_datagram();
+    CHECK(second == first);
+}
+
+TEST_CASE("line_sender c++ standalone qwpudp buffer")
+{
+    udp_capture receiver;
+    questdb::ingress::opts opts{
+        questdb::ingress::protocol::qwpudp,
+        std::string("127.0.0.1"),
+        std::to_string(receiver.port())};
+    questdb::ingress::line_sender sender{opts};
+
+    questdb::ingress::line_sender_buffer buffer =
+        questdb::ingress::line_sender_buffer::qwp_udp();
+    buffer.table("quotes")
+        .symbol("sym", "SOL-USD")
+        .column("qty", int64_t{9})
+        .at_now();
+
+    sender.flush(buffer);
+    CHECK(buffer.row_count() == 0);
+    const auto datagram = receiver.recv_datagram();
+    CHECK(datagram_starts_with_qwp1(datagram));
 }
 
 TEST_CASE("Http auto detect line protocol version failed")

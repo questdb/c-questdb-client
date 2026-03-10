@@ -32,6 +32,13 @@ namespace questdb::ingress
 class line_sender_buffer
 {
 public:
+    /**
+     * Construct an ILP buffer with the given ILP protocol version.
+     *
+     * This constructor is ILP-only. It does not create QWP/UDP buffers.
+     * For protocol-neutral construction, especially when using QWP/UDP, prefer
+     * `line_sender::new_buffer()`.
+     */
     explicit line_sender_buffer(
         protocol_version version,
         size_t init_buf_size = 64 * 1024,
@@ -41,6 +48,27 @@ public:
         , _init_buf_size{init_buf_size}
         , _max_name_len{max_name_len}
     {
+    }
+
+    /**
+     * Construct a standalone QWP/UDP buffer.
+     *
+     * This is the QWP counterpart to the ILP-only constructor above.
+     * For protocol-neutral construction tied to a sender instance, prefer
+     * `line_sender::new_buffer()`.
+     */
+    static line_sender_buffer qwp_udp(
+        size_t init_buf_size = 64 * 1024,
+        size_t max_name_len = 127) noexcept
+    {
+        auto* raw_buffer =
+            ::line_sender_buffer_new_qwp_with_max_name_len(max_name_len);
+        ::line_sender_buffer_reserve(raw_buffer, init_buf_size);
+        return line_sender_buffer{
+            raw_buffer,
+            protocol_version::v1,
+            init_buf_size,
+            max_name_len};
     }
 
     line_sender_buffer(const line_sender_buffer& other) noexcept
@@ -97,6 +125,9 @@ public:
      * the specified additional byte count. This may be rounded up.
      * This does not allocate if such additional capacity is already
      * satisfied.
+     *
+     * For ILP buffers this is expressed in bytes. For QWP buffers this is
+     * only a best-effort hint and may be ignored.
      * See: `capacity`.
      */
     void reserve(size_t additional)
@@ -105,7 +136,13 @@ public:
         ::line_sender_buffer_reserve(_impl, additional);
     }
 
-    /** Get the current capacity of the buffer. */
+    /**
+     * Get the current buffer capacity.
+     *
+     * For ILP buffers this is byte capacity. For QWP buffers this is an
+     * implementation-defined capacity hint and should not be interpreted as
+     * byte capacity.
+     */
     size_t capacity() const noexcept
     {
         if (_impl)
@@ -114,7 +151,13 @@ public:
             return 0;
     }
 
-    /** The number of bytes accumulated in the buffer. */
+    /**
+     * The current encoded size of the buffered data.
+     *
+     * For ILP buffers this is the exact pending byte length. For QWP buffers
+     * this is a buffered size hint, not the exact size of any eventual UDP
+     * datagram.
+     */
     size_t size() const noexcept
     {
         if (_impl)
@@ -151,7 +194,11 @@ public:
 
     /**
      * Get a bytes view of the contents of the buffer
-     * (not guaranteed to be an encoded string)
+     * (not guaranteed to be an encoded string).
+     *
+     * This is only meaningful for ILP buffers. For QWP buffers the returned
+     * view is currently empty because rows are encoded into UDP datagrams only
+     * during `flush()`.
      */
     buffer_view peek() const noexcept
     {
@@ -653,6 +700,18 @@ public:
     }
 
 private:
+    line_sender_buffer(
+        ::line_sender_buffer* impl,
+        protocol_version version,
+        size_t init_buf_size,
+        size_t max_name_len) noexcept
+        : _impl{impl}
+        , _protocol_version{version}
+        , _init_buf_size{init_buf_size}
+        , _max_name_len{max_name_len}
+    {
+    }
+
     inline void may_init()
     {
         if (!_impl)
@@ -727,7 +786,7 @@ public:
      * Create a new `opts` instance with the given protocol, hostname and port.
      * @param[in] protocol The protocol to use.
      * @param[in] host The QuestDB database host.
-     * @param[in] port The QuestDB tcp or http port.
+     * @param[in] port The QuestDB port for the selected protocol.
      * validation.
      */
     opts(protocol protocol, utf8_view host, uint16_t port) noexcept
@@ -743,7 +802,7 @@ public:
      * service name.
      * @param[in] protocol The protocol to use.
      * @param[in] host The QuestDB database host.
-     * @param[in] port The QuestDB tcp or http port as service name.
+     * @param[in] port The QuestDB port as service name for the selected protocol.
      */
     opts(protocol protocol, utf8_view host, utf8_view port) noexcept
         : _impl{::line_sender_opts_new_service(
@@ -798,6 +857,30 @@ public:
     {
         line_sender_error::wrapped_call(
             ::line_sender_opts_bind_interface, _impl, bind_interface._impl);
+        return *this;
+    }
+
+    /**
+     * Set the maximum QWP/UDP datagram size in bytes.
+     *
+     * This setting is only supported for `protocol::qwpudp`.
+     */
+    opts& max_datagram_size(size_t max_datagram_size)
+    {
+        line_sender_error::wrapped_call(
+            ::line_sender_opts_max_datagram_size, _impl, max_datagram_size);
+        return *this;
+    }
+
+    /**
+     * Set the multicast TTL used for QWP/UDP sends.
+     *
+     * This setting is only supported for `protocol::qwpudp`.
+     */
+    opts& multicast_ttl(uint32_t multicast_ttl)
+    {
+        line_sender_error::wrapped_call(
+            ::line_sender_opts_multicast_ttl, _impl, multicast_ttl);
         return *this;
     }
 
@@ -913,8 +996,12 @@ public:
     }
 
     /**
-     * The maximum buffer size in bytes that the client will flush to the
-     * server. The default is 100 MiB.
+     * The maximum buffered size that the client will flush to the server.
+     * The default is 100 MiB.
+     *
+     * For ILP this applies to the exact pending byte length.
+     * For QWP/UDP this applies to the buffer size hint returned by
+     * `line_sender_buffer::size()`.
      */
     opts& max_buf_size(size_t max_buf_size)
     {
@@ -1108,7 +1195,21 @@ public:
     }
 
     /**
+     * Get the configured transport protocol used by the sender.
+     */
+    questdb::ingress::protocol protocol() const noexcept
+    {
+        ensure_impl();
+        return static_cast<enum protocol>(
+            static_cast<int>(::line_sender_get_protocol(_impl)));
+    }
+
+    /**
      * Get the current protocol version used by the sender.
+     *
+     * This is meaningful for ILP senders. For protocol-neutral inspection, use
+     * `protocol()`. Do not use this value to construct QWP/UDP buffers; use
+     * `new_buffer()` instead.
      */
     questdb::ingress::protocol_version protocol_version() const noexcept
     {
@@ -1117,13 +1218,25 @@ public:
             static_cast<int>(::line_sender_get_protocol_version(_impl)));
     }
 
+    /**
+     * Construct a new line buffer with the sender's configured settings.
+     *
+     * This is the preferred protocol-neutral constructor. It may produce a
+     * different buffer implementation than `line_sender_buffer{protocol_version()}`
+     * when the sender uses QWP-over-UDP.
+     */
     line_sender_buffer new_buffer(size_t init_buf_size = 64 * 1024) noexcept
     {
         ensure_impl();
+        auto version = this->protocol_version();
+        auto max_name_len = ::line_sender_get_max_name_len(_impl);
+        auto* raw_buffer = ::line_sender_buffer_new_for_sender(_impl);
+        ::line_sender_buffer_reserve(raw_buffer, init_buf_size);
         return line_sender_buffer{
-            this->protocol_version(),
+            raw_buffer,
+            version,
             init_buf_size,
-            ::line_sender_get_max_name_len(_impl)};
+            max_name_len};
     }
 
     /**
@@ -1143,6 +1256,10 @@ public:
      * to the underlying OS-level network socket, without waiting to actually
      * send it to the server. In the case of an error, the server will quietly
      * disconnect: consult the server logs for error messages.
+     *
+     * With QWP-over-UDP, the function sends one or more UDP datagrams and
+     * returns local socket errors only. A successful return does not
+     * guarantee delivery.
      *
      * HTTP should be the first choice, but use TCP if you need to continuously
      * send data to the server at a high rate.
@@ -1178,8 +1295,7 @@ public:
         }
         else
         {
-            line_sender_buffer buffer2{this->protocol_version(), 0};
-            buffer2.may_init();
+            line_sender_buffer buffer2 = this->new_buffer(0);
             line_sender_error::wrapped_call(
                 ::line_sender_flush_and_keep, _impl, buffer2._impl);
         }
@@ -1220,8 +1336,7 @@ public:
         }
         else
         {
-            line_sender_buffer buffer2{this->protocol_version(), 0};
-            buffer2.may_init();
+            line_sender_buffer buffer2 = this->new_buffer(0);
             line_sender_error::wrapped_call(
                 ::line_sender_flush_and_keep_with_flags,
                 _impl,
@@ -1234,7 +1349,7 @@ public:
      * Check if an error occurred previously and the sender must be closed.
      * This happens when there was an earlier failure.
      * This method is specific to ILP-over-TCP and is not relevant for
-     * ILP-over-HTTP.
+     * ILP-over-HTTP or QWP-over-UDP.
      * @return true if an error occurred with a sender and it must be
      * closed.
      */

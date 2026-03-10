@@ -106,6 +106,9 @@ enum class protocol
 
     /** InfluxDB Line Protocol over HTTP with TLS. */
     https,
+
+    /** QuestWire Protocol over UDP. */
+    qwpudp,
 };
 
 enum class protocol_version

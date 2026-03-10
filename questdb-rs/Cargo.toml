@@ -77,6 +77,9 @@ sync-sender-http = [
     "dep:rand",
 ]
 
+## Sync QWP/UDP
+sync-sender-qwp-udp = ["_sync-sender", "_sender-qwp-udp", "dep:socket2"]
+
 ## Allow use OS-provided root TLS certificates
 tls-native-certs = ["dep:rustls-native-certs"]
 
@@ -107,6 +110,7 @@ bigdecimal = ["dep:bigdecimal"]
 # Hidden derived features, used in code to enable-disable code sections. Don't use directly.
 _sender-tcp = []
 _sender-http = []
+_sender-qwp-udp = []
 _sync-sender = []
 
 ## Enable all cross-compatible features.

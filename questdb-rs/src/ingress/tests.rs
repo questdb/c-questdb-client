@@ -80,6 +80,44 @@ fn tcps_simple() {
     assert_defaulted_eq(&builder.tls_ca, CertificateAuthority::OsRoots);
 }
 
+#[cfg(feature = "sync-sender-qwp-udp")]
+#[test]
+fn qwpudp_simple() {
+    let builder = SenderBuilder::from_conf("qwpudp::addr=127.0.0.1;").unwrap();
+    assert_eq!(builder.protocol, Protocol::QwpUdp);
+    assert_specified_eq(&builder.host, "127.0.0.1");
+    assert_specified_eq(&builder.port, Protocol::QwpUdp.default_port());
+    assert!(!builder.protocol.tls_enabled());
+    let qwp_udp = builder.qwp_udp.as_ref().unwrap();
+    assert_defaulted_eq(&qwp_udp.max_datagram_size, 1400usize);
+    assert_defaulted_eq(&qwp_udp.multicast_ttl, 0u32);
+}
+
+#[cfg(feature = "sync-sender-qwp-udp")]
+#[test]
+fn qwpudp_custom_config() {
+    let builder = SenderBuilder::from_conf(
+        "qwpudp::addr=239.1.2.3:19002;bind_interface=192.168.1.10;max_datagram_size=1200;multicast_ttl=7;",
+    )
+    .unwrap();
+    assert_eq!(builder.protocol, Protocol::QwpUdp);
+    assert_specified_eq(&builder.host, "239.1.2.3");
+    assert_specified_eq(&builder.port, "19002");
+    assert_specified_eq(&builder.net_interface, Some("192.168.1.10".to_string()));
+    let qwp_udp = builder.qwp_udp.as_ref().unwrap();
+    assert_specified_eq(&qwp_udp.max_datagram_size, 1200usize);
+    assert_specified_eq(&qwp_udp.multicast_ttl, 7u32);
+}
+
+#[cfg(feature = "sync-sender-qwp-udp")]
+#[test]
+fn qwpudp_sender_reports_transport_protocol() {
+    let sender = SenderBuilder::new(Protocol::QwpUdp, "127.0.0.1", 9007)
+        .build()
+        .unwrap();
+    assert_eq!(sender.protocol(), Protocol::QwpUdp);
+}
+
 #[cfg(feature = "sync-sender-tcp")]
 #[test]
 fn invalid_value() {
@@ -109,7 +147,11 @@ fn missing_addr() {
     );
 }
 
-#[cfg(any(feature = "sync-sender-tcp", feature = "sync-sender-http"))]
+#[cfg(any(
+    feature = "sync-sender-tcp",
+    feature = "sync-sender-http",
+    feature = "sync-sender-qwp-udp"
+))]
 #[test]
 fn unsupported_service() {
     assert_conf_err(
@@ -275,6 +317,67 @@ fn cant_use_ecdsa_auth_with_http_ex_tcp_support() {
     assert_conf_err(
         mk_builder().token_y("pub_key2"),
         "cannot specify \"token_y\": ECDSA authentication is only available with ILP/TCP and not available with ILP/HTTP.",
+    );
+}
+
+#[cfg(feature = "sync-sender-qwp-udp")]
+#[test]
+fn qwpudp_protocol_version_unsupported() {
+    assert_conf_err(
+        SenderBuilder::from_conf("qwpudp::addr=localhost;protocol_version=2;"),
+        "The \"protocol_version\" setting is not supported for QWP/UDP.",
+    );
+}
+
+#[cfg(feature = "sync-sender-qwp-udp")]
+#[test]
+fn qwpudp_max_datagram_size_requires_qwp_udp() {
+    assert_conf_err(
+        SenderBuilder::new(Protocol::QwpUdp, "localhost", 9007).max_datagram_size(0),
+        "\"max_datagram_size\" must be greater than 0.",
+    );
+
+    #[cfg(feature = "sync-sender-http")]
+    assert_conf_err(
+        SenderBuilder::new(Protocol::Http, "localhost", 9000).max_datagram_size(1400),
+        "The \"max_datagram_size\" setting is only supported for QWP/UDP.",
+    );
+}
+
+#[cfg(feature = "sync-sender-qwp-udp")]
+#[test]
+fn qwpudp_multicast_ttl_requires_qwp_udp() {
+    assert_conf_err(
+        SenderBuilder::new(Protocol::QwpUdp, "localhost", 9007).multicast_ttl(256),
+        "\"multicast_ttl\" must be between 0 and 255.",
+    );
+
+    #[cfg(feature = "sync-sender-http")]
+    assert_conf_err(
+        SenderBuilder::new(Protocol::Http, "localhost", 9000).multicast_ttl(1),
+        "The \"multicast_ttl\" setting is only supported for QWP/UDP.",
+    );
+}
+
+#[cfg(feature = "sync-sender-qwp-udp")]
+#[test]
+fn qwpudp_auth_is_rejected() {
+    assert_conf_err(
+        SenderBuilder::from_conf("qwpudp::addr=localhost;username=user123;")
+            .unwrap()
+            .build(),
+        "Authentication settings are not supported for QWP/UDP.",
+    );
+}
+
+#[cfg(feature = "sync-sender-qwp-udp")]
+#[test]
+fn qwpudp_auth_timeout_is_rejected() {
+    assert_conf_err(
+        SenderBuilder::from_conf("qwpudp::addr=localhost;auth_timeout=100;")
+            .unwrap()
+            .build(),
+        "The \"auth_timeout\" setting is not supported for QWP/UDP.",
     );
 }
 
