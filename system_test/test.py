@@ -1248,6 +1248,8 @@ class TestQwpUdpSender(unittest.TestCase):
             datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
 
     def _require_qwp_udp_system_test(self):
+        # TODO: Remove this repo-only gate once QWP/UDP receiver support is
+        # available in released QuestDB builds.
         if not getattr(QDB_FIXTURE, 'qwp_udp', False):
             self.skipTest('QWP/UDP system test requires repo-backed QWP receiver support')
         if QDB_FIXTURE.http:
