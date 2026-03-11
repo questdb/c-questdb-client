@@ -872,7 +872,12 @@ bool line_sender_opts_bind_interface(
 /**
  * Set the maximum QWP/UDP datagram size in bytes.
  *
+ * `max_datagram_size` must be a positive, non-zero value.
+ * Passing 0 is treated as an error.
+ *
  * This setting is only supported for `line_sender_protocol_qwpudp`.
+ * Returns `false` and sets `err_out` on constraint violation or
+ * protocol mismatch.
  */
 LINESENDER_API
 bool line_sender_opts_max_datagram_size(
@@ -883,7 +888,12 @@ bool line_sender_opts_max_datagram_size(
 /**
  * Set the multicast TTL used for QWP/UDP sends.
  *
+ * `multicast_ttl` must be in the 0–255 range (inclusive).
+ * Values greater than 255 are treated as an error.
+ *
  * This setting is only supported for `line_sender_protocol_qwpudp`.
+ * Returns `false` and sets `err_out` on constraint violation or
+ * protocol mismatch.
  */
 LINESENDER_API
 bool line_sender_opts_multicast_ttl(
