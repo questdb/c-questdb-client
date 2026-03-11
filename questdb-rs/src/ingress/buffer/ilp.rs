@@ -212,15 +212,15 @@ impl<'a> TableName<'a> {
         }
 
         let mut prev = '\0';
-        for (index, c) in name.chars().enumerate() {
+        for (byte_idx, c) in name.char_indices() {
             match c {
                 '.' => {
-                    if index == 0 || index == name.len() - 1 || prev == '.' {
+                    if byte_idx == 0 || byte_idx + c.len_utf8() == name.len() || prev == '.' {
                         return Err(error::fmt!(
                             InvalidName,
                             concat!("Bad string {:?}: ", "Found invalid dot `.` at position {}."),
                             name,
-                            index
+                            byte_idx
                         ));
                     }
                 }
@@ -238,7 +238,7 @@ impl<'a> TableName<'a> {
                         ),
                         name,
                         c,
-                        index
+                        byte_idx
                     ));
                 }
                 '\u{feff}' => {
@@ -253,7 +253,7 @@ impl<'a> TableName<'a> {
                             "byte position {}."
                         ),
                         name,
-                        index
+                        byte_idx
                     ));
                 }
                 _ => (),
@@ -310,7 +310,7 @@ impl<'a> ColumnName<'a> {
             ));
         }
 
-        for (index, c) in name.chars().enumerate() {
+        for (byte_idx, c) in name.char_indices() {
             match c {
                 '?' | '.' | ',' | '\'' | '\"' | '\\' | '/' | ':' | ')' | '(' | '+' | '-' | '*'
                 | '%' | '~' | '\r' | '\n' | '\0' | '\u{0001}' | '\u{0002}' | '\u{0003}'
@@ -326,7 +326,7 @@ impl<'a> ColumnName<'a> {
                         ),
                         name,
                         c,
-                        index
+                        byte_idx
                     ));
                 }
                 '\u{FEFF}' => {
@@ -341,7 +341,7 @@ impl<'a> ColumnName<'a> {
                             "byte position {}."
                         ),
                         name,
-                        index
+                        byte_idx
                     ));
                 }
                 _ => (),
@@ -1384,5 +1384,50 @@ impl Debug for Buffer {
             .field("max_name_len", &self.max_name_len)
             .field("protocol_version", &self.protocol_version)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ColumnName, TableName};
+    use crate::ErrorCode;
+
+    #[test]
+    fn name_validation_table_name_uses_byte_offset_for_invalid_char() {
+        let err = match TableName::new("é?") {
+            Ok(_) => panic!("expected invalid table name"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code(), ErrorCode::InvalidName);
+        assert_eq!(
+            err.msg(),
+            r#"Bad string "é?": Table names can't contain a '?' character, which was found at byte position 2."#
+        );
+    }
+
+    #[test]
+    fn name_validation_table_name_rejects_trailing_dot_at_byte_offset() {
+        let err = match TableName::new("é.") {
+            Ok(_) => panic!("expected invalid table name"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code(), ErrorCode::InvalidName);
+        assert_eq!(
+            err.msg(),
+            r#"Bad string "é.": Found invalid dot `.` at position 2."#
+        );
+    }
+
+    #[test]
+    fn name_validation_column_name_uses_byte_offset_for_invalid_char() {
+        let err = match ColumnName::new("é?") {
+            Ok(_) => panic!("expected invalid column name"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code(), ErrorCode::InvalidName);
+        assert_eq!(
+            err.msg(),
+            r#"Bad string "é?": Column names can't contain a '?' character, which was found at byte position 2."#
+        );
     }
 }
