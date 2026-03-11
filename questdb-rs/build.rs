@@ -297,22 +297,36 @@ pub mod json_tests {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    #[cfg(not(any(feature = "tls-webpki-certs", feature = "tls-native-certs")))]
+    #[cfg(all(
+        any(feature = "_sender-tcp", feature = "_sender-http"),
+        not(any(feature = "tls-webpki-certs", feature = "tls-native-certs"))
+    ))]
     compile_error!(
         "At least one of `tls-webpki-certs` or `tls-native-certs` features must be enabled."
     );
 
-    #[cfg(not(any(feature = "_sender-tcp", feature = "_sender-http")))]
+    #[cfg(not(any(
+        feature = "_sender-tcp",
+        feature = "_sender-http",
+        feature = "_sender-qwp-udp"
+    )))]
     compile_error!(
-        "At least one of `sync-sender-tcp` or `sync-sender-http` features must be enabled"
+        "At least one of `sync-sender-tcp`, `sync-sender-http` or `sync-sender-qwp-udp` features must be enabled"
     );
 
-    #[cfg(not(any(feature = "aws-lc-crypto", feature = "ring-crypto")))]
+    #[cfg(all(
+        any(feature = "_sender-tcp", feature = "_sender-http"),
+        not(any(feature = "aws-lc-crypto", feature = "ring-crypto"))
+    ))]
     compile_error!(
         "You must enable exactly one of the `aws-lc-crypto` or `ring-crypto` features, but none are enabled."
     );
 
-    #[cfg(all(feature = "aws-lc-crypto", feature = "ring-crypto"))]
+    #[cfg(all(
+        any(feature = "_sender-tcp", feature = "_sender-http"),
+        feature = "aws-lc-crypto",
+        feature = "ring-crypto"
+    ))]
     compile_error!(
         "You must enable exactly one of the `aws-lc-crypto` or `ring-crypto` features, but both are enabled."
     );

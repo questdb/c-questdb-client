@@ -94,6 +94,9 @@ To determine the buffer size, call:
 * C++: `buffer.size()`
 * Rust: `buffer.len()`
 
+For ILP buffers this is the exact pending byte length. For QWP buffers this is
+a buffered size hint rather than the exact size of any eventual UDP datagram.
+
 *Closing the connection will not auto-flush.*
 
 ### Disconnections, Data Errors and troubleshooting
@@ -125,3 +128,7 @@ You can inspect the contents of a constructed buffer at any time calling:
 * C: `line_sender_buffer_peek`
 * C++: `buffer.peek()`
 * Rust: `buffer.as_str()`
+
+This byte-level inspection is only meaningful for ILP buffers. QWP buffers are
+encoded into UDP datagrams during `flush`, so `peek`/`as_str` are not useful
+there.
