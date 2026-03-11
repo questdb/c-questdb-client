@@ -1316,6 +1316,21 @@ TEST_CASE("line sender protocol version default v1 for tcp")
     CHECK(server.msgs(0) == expect);
 }
 
+TEST_CASE("line sender protocol throws after close")
+{
+    questdb::ingress::test::mock_server server;
+    questdb::ingress::line_sender sender{questdb::ingress::opts{
+        questdb::ingress::protocol::tcp,
+        std::string("127.0.0.1"),
+        std::to_string(server.port())}};
+    CHECK(sender.protocol() == questdb::ingress::protocol::tcp);
+
+    sender.close();
+
+    CHECK_THROWS_WITH_AS(
+        sender.protocol(), "Sender closed.", questdb::ingress::line_sender_error);
+}
+
 TEST_CASE("line sender protocol version v2")
 {
     questdb::ingress::test::mock_server server;

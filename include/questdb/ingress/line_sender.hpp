@@ -1197,7 +1197,7 @@ public:
     /**
      * Get the configured transport protocol used by the sender.
      */
-    questdb::ingress::protocol protocol() const noexcept
+    questdb::ingress::protocol protocol() const
     {
         ensure_impl();
         return static_cast<enum protocol>(
