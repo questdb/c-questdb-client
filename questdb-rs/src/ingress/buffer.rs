@@ -44,7 +44,7 @@ enum BufferInner {
     Ilp(IlpBuffer),
 
     #[cfg(feature = "_sender-qwp-udp")]
-    Qwp(QwpBuffer),
+    Qwp(Box<QwpBuffer>),
 }
 
 /// A reusable row buffer.
@@ -81,7 +81,7 @@ impl Buffer {
     /// Creates a new QWP/UDP buffer with a custom maximum name length.
     pub fn qwp_with_max_name_len(max_name_len: usize) -> Self {
         Self {
-            inner: BufferInner::Qwp(QwpBuffer::new(max_name_len)),
+            inner: BufferInner::Qwp(Box::new(QwpBuffer::new(max_name_len))),
         }
     }
 
@@ -97,7 +97,7 @@ impl Buffer {
     pub(crate) fn as_qwp(&self) -> Option<&QwpBuffer> {
         match &self.inner {
             BufferInner::Ilp(_) => None,
-            BufferInner::Qwp(inner) => Some(inner),
+            BufferInner::Qwp(inner) => Some(inner.as_ref()),
         }
     }
 

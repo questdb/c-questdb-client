@@ -126,22 +126,22 @@ impl QwpSizeHint {
 
     fn add_committed_row(&mut self, row: &CommittedRow) -> crate::Result<()> {
         let specs = row_value_specs(row);
-        if let Some(group) = self.active_group.as_mut() {
-            if group.table_name == row.table_name {
-                let previous_len = group.current_len();
-                let new_len = match group.estimate_len_with_specs(&specs) {
-                    Ok(new_len) => new_len,
-                    Err(err) if is_batched_type_change_error(&err) => {
-                        self.committed_len += standalone_row_group_len(row);
-                        self.active_group = None;
-                        return Ok(());
-                    }
-                    Err(err) => return Err(err),
-                };
-                group.add_row_with_specs(&specs, new_len)?;
-                self.committed_len = self.committed_len - previous_len + new_len;
-                return Ok(());
-            }
+        if let Some(group) = self.active_group.as_mut()
+            && group.table_name == row.table_name
+        {
+            let previous_len = group.current_len();
+            let new_len = match group.estimate_len_with_specs(&specs) {
+                Ok(new_len) => new_len,
+                Err(err) if is_batched_type_change_error(&err) => {
+                    self.committed_len += standalone_row_group_len(row);
+                    self.active_group = None;
+                    return Ok(());
+                }
+                Err(err) => return Err(err),
+            };
+            group.add_row_with_specs(&specs, new_len)?;
+            self.committed_len = self.committed_len - previous_len + new_len;
+            return Ok(());
         }
 
         let mut group = RowGroupEstimator::new(&row.table_name);
@@ -1843,7 +1843,7 @@ mod tests {
             .at_now()
             .unwrap();
 
-        assert!(buf.len() > 0);
+        assert!(!buf.is_empty());
         assert_eq!(buf.row_count(), 1);
 
         buf.clear();
