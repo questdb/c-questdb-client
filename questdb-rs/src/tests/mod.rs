@@ -33,6 +33,8 @@ mod sender;
 mod decimal;
 mod ndarr;
 
+mod buffer_opt;
+
 #[cfg(feature = "json_tests")]
 mod json_tests {
     include!(concat!(env!("OUT_DIR"), "/json_tests.rs"));
