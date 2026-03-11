@@ -32,7 +32,6 @@ use crate::ingress::{
 use crate::{Error, error};
 use std::fmt::{Debug, Formatter};
 use std::num::NonZeroUsize;
-use std::slice::from_raw_parts_mut;
 
 fn write_escaped_impl<Q, C>(check_escape_fn: C, quoting_fn: Q, output: &mut Vec<u8>, s: &str)
 where
@@ -1175,12 +1174,14 @@ impl Buffer {
         }
 
         let index = self.output.len();
-        let writeable =
-            unsafe { from_raw_parts_mut(self.output.as_mut_ptr().add(index), array_buf_size) };
+        self.output.resize(index + array_buf_size, 0);
+        let writeable = &mut self.output[index..index + array_buf_size];
 
         // ndarr data
-        ndarr::write_array_data(view, writeable, array_buf_size)?;
-        unsafe { self.output.set_len(array_buf_size + index) }
+        if let Err(err) = ndarr::write_array_data(view, writeable, array_buf_size) {
+            self.output.truncate(index);
+            return Err(err);
+        }
         Ok(self)
     }
 
