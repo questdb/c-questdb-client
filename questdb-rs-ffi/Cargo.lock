@@ -190,15 +190,11 @@ dependencies = [
 
 [[package]]
 name = "questdb-confstr"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7aceffde1cbf8e67f34cdfd70d2436396176d6ff648fa719e0231fb9856ef3e9"
+version = "0.2.0"
 
 [[package]]
 name = "questdb-confstr-ffi"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "123e9600ed7e3ca168902c5729ae621e7bde1f5fb5e3a80bd5ceee8410751448"
+version = "0.2.0"
 dependencies = [
  "questdb-confstr",
 ]

@@ -178,7 +178,7 @@ impl Sender {
                 Ok(())
             }
             #[cfg(feature = "sync-sender-http")]
-            SyncProtocolHandler::SyncHttp(ref state) => {
+            SyncProtocolHandler::SyncHttp(ref mut state) => {
                 if transactional && !buf.transactional() {
                     return Err(error::fmt!(
                         InvalidApiCall,
@@ -192,22 +192,29 @@ impl Sender {
                 } else {
                     0.0f64
                 };
+                let request_timeout =
+                    *state.config.request_timeout + std::time::Duration::from_secs_f64(extra_time);
+                let retry_timeout = *state.config.retry_timeout;
 
                 match http_send_with_retries(
                     state,
                     bytes,
-                    *state.config.request_timeout + std::time::Duration::from_secs_f64(extra_time),
-                    *state.config.retry_timeout,
+                    request_timeout,
+                    retry_timeout,
                 ) {
                     Ok(res) => {
                         if res.status().is_client_error() || res.status().is_server_error() {
                             Err(parse_http_error(res.status().as_u16(), res))
                         } else {
-                            res.into_body();
+                            // Actively consume the body to return the connection to the pool.
+                            _ = res.into_body().read_to_vec();
                             Ok(())
                         }
                     }
-                    Err(err) => Err(crate::error::Error::from_ureq_error(err, &state.url)),
+                    Err(err) => {
+                        let url = &state.current_endpoint().url;
+                        Err(crate::error::Error::from_ureq_error(err, url))
+                    }
                 }
             }
         }

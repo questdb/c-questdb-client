@@ -43,13 +43,27 @@ use crate::ingress::conf::HttpConfig;
 use ureq::unversioned::*;
 use ureq::{Body, http};
 
+/// A single HTTP endpoint with its own connection pool.
+/// Each address gets a separate agent to avoid TLS TargetHost conflicts.
 #[cfg(feature = "sync-sender-http")]
-pub(crate) struct SyncHttpHandlerState {
-    /// Maintains a pool of open HTTP connections to the endpoint.
+pub(crate) struct HttpEndpoint {
+    /// Maintains a pool of open HTTP connections to this endpoint.
     pub(crate) agent: ureq::Agent,
 
-    /// The URL of the HTTP endpoint.
+    /// The URL of the HTTP write endpoint (e.g. "http://host:port/write").
     pub(crate) url: String,
+
+    /// The URL of the HTTP settings endpoint (e.g. "http://host:port/settings").
+    pub(crate) settings_url: String,
+}
+
+#[cfg(feature = "sync-sender-http")]
+pub(crate) struct SyncHttpHandlerState {
+    /// Per-address endpoints for multi-url failover support.
+    pub(crate) endpoints: Vec<HttpEndpoint>,
+
+    /// Index of the current endpoint in round-robin rotation.
+    pub(crate) current_index: usize,
 
     /// The content of the `Authorization` HTTP header.
     pub(crate) auth: Option<String>,
@@ -60,14 +74,28 @@ pub(crate) struct SyncHttpHandlerState {
 
 #[cfg(feature = "sync-sender-http")]
 impl SyncHttpHandlerState {
+    /// Get the current endpoint.
+    pub(crate) fn current_endpoint(&self) -> &HttpEndpoint {
+        &self.endpoints[self.current_index]
+    }
+
+    /// Rotate to the next endpoint in round-robin fashion.
+    /// Only rotates if there are multiple endpoints.
+    pub(crate) fn rotate(&mut self) {
+        if self.endpoints.len() > 1 {
+            self.current_index = (self.current_index + 1) % self.endpoints.len();
+        }
+    }
+
     fn send_request(
         &self,
         buf: &[u8],
         request_timeout: Duration,
     ) -> (bool, Result<Response<Body>, ureq::Error>) {
-        let request = self
+        let ep = self.current_endpoint();
+        let request = ep
             .agent
-            .post(&self.url)
+            .post(&ep.url)
             .config()
             .timeout_per_call(Some(request_timeout))
             .build()
@@ -90,7 +118,8 @@ impl SyncHttpHandlerState {
         url: &str,
         request_timeout: Duration,
     ) -> (bool, Result<Response<Body>, ureq::Error>) {
-        let request = self
+        let ep = self.current_endpoint();
+        let request = ep
             .agent
             .get(url)
             .config()
@@ -212,22 +241,22 @@ impl Transport for TlsTransport {
 fn need_retry(res: Result<http::status::StatusCode, &ureq::Error>) -> bool {
     match res {
         Ok(status) => {
-            status.is_server_error()
-                && matches!(
-                    status.as_u16(),
-                    // Official HTTP codes
-                    500 | // Internal Server Error
-                    503 | // Service Unavailable
-                    504 | // Gateway Timeout
+            matches!(
+                status.as_u16(),
+                // Official HTTP codes
+                421 | // Misdirected Request (load balancer routing error)
+                500 | // Internal Server Error
+                503 | // Service Unavailable
+                504 | // Gateway Timeout
 
-                    // Unofficial extensions
-                    507 | // Insufficient Storage
-                    509 | // Bandwidth Limit Exceeded
-                    523 | // Origin is Unreachable
-                    524 | // A Timeout Occurred
-                    529 | // Site is overloaded
-                    599 // Network Connect Timeout Error
-                )
+                // Unofficial extensions
+                507 | // Insufficient Storage
+                509 | // Bandwidth Limit Exceeded
+                523 | // Origin is Unreachable
+                524 | // A Timeout Occurred
+                529 | // Site is overloaded
+                599 // Network Connect Timeout Error
+            )
         }
         Err(err) => matches!(
             err,
@@ -238,7 +267,6 @@ fn need_retry(res: Result<http::status::StatusCode, &ureq::Error>) -> bool {
 
 fn parse_json_error(json: &serde_json::Value, msg: &str) -> Error {
     let mut description = msg.to_string();
-    error::fmt!(ServerFlushError, "Could not flush buffer: {}", msg);
 
     let error_id = json.get("errorId").and_then(|v| v.as_str());
     let code = json.get("code").and_then(|v| v.as_str());
@@ -334,7 +362,7 @@ pub(super) fn parse_http_error(http_status_code: u16, response: Response<Body>) 
 
 #[allow(clippy::result_large_err)] // `ureq::Error` is large enough to cause this warning.
 fn retry_http_send(
-    state: &SyncHttpHandlerState,
+    state: &mut SyncHttpHandlerState,
     buf: &[u8],
     request_timeout: Duration,
     retry_timeout: Duration,
@@ -345,8 +373,11 @@ fn retry_http_send(
     let mut retry_interval_ms = 10;
     let mut need_retry;
     loop {
+        // Rotate to the next address on retriable failure.
+        state.rotate();
+
         let jitter_ms = rng.random_range(-5i32..5);
-        let to_sleep_ms = retry_interval_ms + jitter_ms;
+        let to_sleep_ms = (retry_interval_ms + jitter_ms).max(0);
         let to_sleep = Duration::from_millis(to_sleep_ms as u64);
         if (std::time::Instant::now() + to_sleep) > retry_end {
             return last_rep;
@@ -367,7 +398,7 @@ fn retry_http_send(
 
 #[allow(clippy::result_large_err)] // `ureq::Error` is large enough to cause this warning.
 pub(super) fn http_send_with_retries(
-    state: &SyncHttpHandlerState,
+    state: &mut SyncHttpHandlerState,
     buf: &[u8],
     request_timeout: Duration,
     retry_timeout: Duration,
@@ -388,15 +419,13 @@ pub(super) fn http_send_with_retries(
 /// If the server does not support the `/settings` endpoint (404), it returns
 /// default values.
 pub(crate) fn read_server_settings(
-    state: &SyncHttpHandlerState,
-    settings_url: &str,
+    state: &mut SyncHttpHandlerState,
     default_max_name_len: usize,
 ) -> Result<(Vec<ProtocolVersion>, usize), Error> {
     let default_protocol_version = ProtocolVersion::V1;
 
     let response = match http_get_with_retries(
         state,
-        settings_url,
         *state.config.request_timeout,
         Duration::from_secs(1),
     ) {
@@ -404,6 +433,7 @@ pub(crate) fn read_server_settings(
             if res.status().is_client_error() || res.status().is_server_error() {
                 let status = res.status();
                 _ = res.into_body().read_to_vec();
+                let settings_url = &state.current_endpoint().settings_url;
                 if status.as_u16() == 404 {
                     return Ok((vec![default_protocol_version], default_max_name_len));
                 }
@@ -418,6 +448,7 @@ pub(crate) fn read_server_settings(
             }
         }
         Err(err) => {
+            let settings_url = &state.current_endpoint().settings_url;
             let e = match err {
                 ureq::Error::StatusCode(code) => {
                     if code == 404 {
@@ -444,6 +475,7 @@ pub(crate) fn read_server_settings(
         }
     };
 
+    let settings_url = state.current_endpoint().settings_url.clone();
     let (_, body) = response.into_parts();
     let body_content = body.into_with_config().read_to_string();
 
@@ -492,8 +524,7 @@ pub(crate) fn read_server_settings(
 
 #[allow(clippy::result_large_err)] // `ureq::Error` is large enough to cause this warning.
 fn retry_http_get(
-    state: &SyncHttpHandlerState,
-    url: &str,
+    state: &mut SyncHttpHandlerState,
     request_timeout: Duration,
     retry_timeout: Duration,
     mut last_rep: Result<Response<Body>, ureq::Error>,
@@ -503,8 +534,11 @@ fn retry_http_get(
     let mut retry_interval_ms = 10;
     let mut need_retry;
     loop {
+        // Rotate to the next address on retriable failure.
+        state.rotate();
+
         let jitter_ms = rng.random_range(-5i32..5);
-        let to_sleep_ms = retry_interval_ms + jitter_ms;
+        let to_sleep_ms = (retry_interval_ms + jitter_ms).max(0);
         let to_sleep = Duration::from_millis(to_sleep_ms as u64);
         if (std::time::Instant::now() + to_sleep) > retry_end {
             return last_rep;
@@ -515,7 +549,8 @@ fn retry_http_get(
             // see https://github.com/algesten/ureq/issues/94
             _ = last_rep.into_body().read_to_vec();
         }
-        (need_retry, last_rep) = state.get_request(url, request_timeout);
+        let ep = state.current_endpoint();
+        (need_retry, last_rep) = state.get_request(&ep.settings_url.clone(), request_timeout);
         if !need_retry {
             return last_rep;
         }
@@ -525,15 +560,113 @@ fn retry_http_get(
 
 #[allow(clippy::result_large_err)] // `ureq::Error` is large enough to cause this warning.
 fn http_get_with_retries(
-    state: &SyncHttpHandlerState,
-    url: &str,
+    state: &mut SyncHttpHandlerState,
     request_timeout: Duration,
     retry_timeout: Duration,
 ) -> Result<Response<Body>, ureq::Error> {
-    let (need_retry, last_rep) = state.get_request(url, request_timeout);
+    let ep = state.current_endpoint();
+    let url = ep.settings_url.clone();
+    let (need_retry, last_rep) = state.get_request(&url, request_timeout);
     if !need_retry || retry_timeout.is_zero() {
         return last_rep;
     }
 
-    retry_http_get(state, url, request_timeout, retry_timeout, last_rep)
+    retry_http_get(state, request_timeout, retry_timeout, last_rep)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ingress::conf;
+
+    fn make_dummy_agent() -> ureq::Agent {
+        ureq::Agent::new_with_defaults()
+    }
+
+    fn make_endpoint(host: &str, port: u16) -> HttpEndpoint {
+        HttpEndpoint {
+            agent: make_dummy_agent(),
+            url: format!("http://{host}:{port}/write"),
+            settings_url: format!("http://{host}:{port}/settings"),
+        }
+    }
+
+    fn make_state(hosts: &[(&str, u16)]) -> SyncHttpHandlerState {
+        let endpoints: Vec<HttpEndpoint> = hosts
+            .iter()
+            .map(|(h, p)| make_endpoint(h, *p))
+            .collect();
+        SyncHttpHandlerState {
+            endpoints,
+            current_index: 0,
+            auth: None,
+            config: conf::HttpConfig::default(),
+        }
+    }
+
+    #[test]
+    fn rotation_single_endpoint_no_op() {
+        let mut state = make_state(&[("host1", 9000)]);
+        assert_eq!(state.current_index, 0);
+        assert_eq!(state.current_endpoint().url, "http://host1:9000/write");
+        state.rotate();
+        assert_eq!(state.current_index, 0);
+        assert_eq!(state.current_endpoint().url, "http://host1:9000/write");
+    }
+
+    #[test]
+    fn rotation_round_robin_three() {
+        let mut state = make_state(&[("host1", 9000), ("host2", 9001), ("host3", 9002)]);
+
+        assert_eq!(state.current_endpoint().url, "http://host1:9000/write");
+        state.rotate();
+        assert_eq!(state.current_endpoint().url, "http://host2:9001/write");
+        state.rotate();
+        assert_eq!(state.current_endpoint().url, "http://host3:9002/write");
+        state.rotate();
+        assert_eq!(state.current_endpoint().url, "http://host1:9000/write");
+        state.rotate();
+        assert_eq!(state.current_endpoint().url, "http://host2:9001/write");
+    }
+
+    #[test]
+    fn rotation_two_endpoints_alternates() {
+        let mut state = make_state(&[("a", 1), ("b", 2)]);
+
+        for _ in 0..10 {
+            assert_eq!(state.current_index, 0);
+            state.rotate();
+            assert_eq!(state.current_index, 1);
+            state.rotate();
+        }
+    }
+
+    #[test]
+    fn rotation_wraps_at_boundary() {
+        let mut state = make_state(&[("a", 1), ("b", 2), ("c", 3), ("d", 4), ("e", 5)]);
+        for i in 0..25 {
+            assert_eq!(state.current_index, i % 5);
+            state.rotate();
+        }
+    }
+
+    #[test]
+    fn current_endpoint_returns_correct_endpoint() {
+        let state = make_state(&[("first", 1000), ("second", 2000), ("third", 3000)]);
+        assert_eq!(state.current_endpoint().url, "http://first:1000/write");
+        assert_eq!(
+            state.current_endpoint().settings_url,
+            "http://first:1000/settings"
+        );
+    }
+
+    #[test]
+    fn rotation_after_manual_index_set() {
+        let mut state = make_state(&[("a", 1), ("b", 2), ("c", 3)]);
+        state.current_index = 2;
+        state.rotate();
+        assert_eq!(state.current_index, 0); // wraps from 2 -> 0
+        state.rotate();
+        assert_eq!(state.current_index, 1);
+    }
 }
