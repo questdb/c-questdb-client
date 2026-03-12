@@ -113,15 +113,14 @@ impl SyncHttpHandlerState {
         }
     }
 
-    pub(crate) fn get_request(
+    pub(crate) fn get_settings(
         &self,
-        url: &str,
         request_timeout: Duration,
     ) -> (bool, Result<Response<Body>, ureq::Error>) {
         let ep = self.current_endpoint();
         let request = ep
             .agent
-            .get(url)
+            .get(&ep.settings_url)
             .config()
             .timeout_per_call(Some(request_timeout))
             .build();
@@ -246,6 +245,7 @@ fn need_retry(res: Result<http::status::StatusCode, &ureq::Error>) -> bool {
                 // Official HTTP codes
                 421 | // Misdirected Request (load balancer routing error)
                 500 | // Internal Server Error
+                502 | // Bad Gateway (common from reverse proxies/load balancers)
                 503 | // Service Unavailable
                 504 | // Gateway Timeout
 
@@ -258,10 +258,16 @@ fn need_retry(res: Result<http::status::StatusCode, &ureq::Error>) -> bool {
                 599 // Network Connect Timeout Error
             )
         }
-        Err(err) => matches!(
-            err,
-            ureq::Error::Timeout(_) | ureq::Error::ConnectionFailed | ureq::Error::TooManyRedirects
-        ),
+        Err(err) => match err {
+            ureq::Error::Timeout(_) | ureq::Error::ConnectionFailed | ureq::Error::TooManyRedirects | ureq::Error::HostNotFound => true,
+            ureq::Error::Io(io_err) => matches!(
+                io_err.kind(),
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+            ),
+            _ => false,
+        },
     }
 }
 
@@ -373,9 +379,6 @@ fn retry_http_send(
     let mut retry_interval_ms = 10;
     let mut need_retry;
     loop {
-        // Rotate to the next address on retriable failure.
-        state.rotate();
-
         let jitter_ms = rng.random_range(-5i32..5);
         let to_sleep_ms = (retry_interval_ms + jitter_ms).max(0);
         let to_sleep = Duration::from_millis(to_sleep_ms as u64);
@@ -388,6 +391,8 @@ fn retry_http_send(
             // see https://github.com/algesten/ureq/issues/94
             _ = last_rep.into_body().read_to_vec();
         }
+        // Rotate to the next address on retriable failure.
+        state.rotate();
         (need_retry, last_rep) = state.send_request(buf, request_timeout);
         if !need_retry {
             return last_rep;
@@ -534,9 +539,6 @@ fn retry_http_get(
     let mut retry_interval_ms = 10;
     let mut need_retry;
     loop {
-        // Rotate to the next address on retriable failure.
-        state.rotate();
-
         let jitter_ms = rng.random_range(-5i32..5);
         let to_sleep_ms = (retry_interval_ms + jitter_ms).max(0);
         let to_sleep = Duration::from_millis(to_sleep_ms as u64);
@@ -549,8 +551,9 @@ fn retry_http_get(
             // see https://github.com/algesten/ureq/issues/94
             _ = last_rep.into_body().read_to_vec();
         }
-        let ep = state.current_endpoint();
-        (need_retry, last_rep) = state.get_request(&ep.settings_url.clone(), request_timeout);
+        // Rotate to the next address on retriable failure.
+        state.rotate();
+        (need_retry, last_rep) = state.get_settings(request_timeout);
         if !need_retry {
             return last_rep;
         }
@@ -564,9 +567,7 @@ fn http_get_with_retries(
     request_timeout: Duration,
     retry_timeout: Duration,
 ) -> Result<Response<Body>, ureq::Error> {
-    let ep = state.current_endpoint();
-    let url = ep.settings_url.clone();
-    let (need_retry, last_rep) = state.get_request(&url, request_timeout);
+    let (need_retry, last_rep) = state.get_settings(request_timeout);
     if !need_retry || retry_timeout.is_zero() {
         return last_rep;
     }

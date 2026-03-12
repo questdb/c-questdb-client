@@ -1071,7 +1071,10 @@ fn test_multi_url_all_servers_unavailable() -> TestResult {
     assert_eq!(err.code(), ErrorCode::ServerFlushError);
     // Validate the error message contains useful information.
     let msg = format!("{}", err);
-    assert!(msg.contains("server"), "Error should contain server response: {}", msg);
+    assert!(
+        msg.contains("server1 down") || msg.contains("server2 down"),
+        "Error should contain one of the server error bodies: {}", msg
+    );
 
     _ = s1_thread.join().unwrap();
     _ = s2_thread.join().unwrap();
@@ -1494,7 +1497,9 @@ fn test_multi_url_failover_on_request_timeout() -> TestResult {
 fn test_multi_url_retriable_status_codes() -> TestResult {
     // Test that all retriable status codes trigger failover.
     let retriable_codes: Vec<(u16, &str)> = vec![
+        (421, "Misdirected Request"),
         (500, "Internal Server Error"),
+        (502, "Bad Gateway"),
         (503, "Service Unavailable"),
         (504, "Gateway Timeout"),
         (507, "Insufficient Storage"),
@@ -1689,6 +1694,7 @@ fn test_multi_url_failover_on_421() -> TestResult {
         .table("test")?
         .column_f64("x", 1.0)?
         .at_now()?;
+    let buf_copy = buffer.clone();
 
     // Server1 returns 421 Misdirected Request — should trigger failover.
     let s1_thread = std::thread::spawn(move || -> io::Result<MockServer> {
@@ -1702,7 +1708,8 @@ fn test_multi_url_failover_on_421() -> TestResult {
 
     let s2_thread = std::thread::spawn(move || -> io::Result<MockServer> {
         server2.accept()?;
-        let _req = server2.recv_http_q()?;
+        let req = server2.recv_http_q()?;
+        assert_eq!(req.body(), buf_copy.as_bytes());
         server2.send_http_response_q(HttpResponse::empty().with_status(200, "OK"))?;
         Ok(server2)
     });
@@ -1761,6 +1768,84 @@ fn test_multi_url_settings_negotiation_failover() -> TestResult {
     // If we got here, settings were successfully negotiated via server2.
     assert_eq!(sender.protocol_version(), ProtocolVersion::V2);
 
+    _ = s1_thread.join().unwrap()?;
+    _ = s2_thread.join().unwrap()?;
+    Ok(())
+}
+
+/// Test that connection refused on server1 triggers failover to server2.
+#[test]
+fn test_multi_url_failover_on_connection_refused() -> TestResult {
+    // server1 is dropped immediately so its port refuses connections.
+    let server1 = MockServer::new()?;
+    let s1_port = server1.port;
+    drop(server1);
+
+    let mut server2 = MockServer::new()?;
+
+    let mut sender = SenderBuilder::new(Protocol::Http, "127.0.0.1", s1_port)
+        .address(server2.host, server2.port)?
+        .protocol_version(ProtocolVersion::V2)?
+        .retry_timeout(Duration::from_secs(5))?
+        .build()?;
+
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("test")?
+        .column_f64("x", 1.0)?
+        .at_now()?;
+    let buf_copy = buffer.clone();
+
+    let s2_thread = std::thread::spawn(move || -> io::Result<MockServer> {
+        server2.accept()?;
+        let req = server2.recv_http_q()?;
+        assert_eq!(req.body(), buf_copy.as_bytes());
+        server2.send_http_response_q(HttpResponse::empty().with_status(200, "OK"))?;
+        Ok(server2)
+    });
+
+    sender.flush(&mut buffer)?;
+    _ = s2_thread.join().unwrap()?;
+    Ok(())
+}
+
+/// Test that 502 Bad Gateway triggers failover.
+#[test]
+fn test_multi_url_failover_on_502() -> TestResult {
+    let mut server1 = MockServer::new()?;
+    let mut server2 = MockServer::new()?;
+
+    let mut sender = SenderBuilder::new(Protocol::Http, server1.host, server1.port)
+        .address(server2.host, server2.port)?
+        .protocol_version(ProtocolVersion::V2)?
+        .retry_timeout(Duration::from_secs(5))?
+        .build()?;
+
+    let mut buffer = sender.new_buffer();
+    buffer
+        .table("test")?
+        .column_f64("x", 1.0)?
+        .at_now()?;
+    let buf_copy = buffer.clone();
+
+    let s1_thread = std::thread::spawn(move || -> io::Result<MockServer> {
+        server1.accept()?;
+        let _req = server1.recv_http_q()?;
+        server1.send_http_response_q(
+            HttpResponse::empty().with_status(502, "Bad Gateway"),
+        )?;
+        Ok(server1)
+    });
+
+    let s2_thread = std::thread::spawn(move || -> io::Result<MockServer> {
+        server2.accept()?;
+        let req = server2.recv_http_q()?;
+        assert_eq!(req.body(), buf_copy.as_bytes());
+        server2.send_http_response_q(HttpResponse::empty().with_status(200, "OK"))?;
+        Ok(server2)
+    });
+
+    sender.flush(&mut buffer)?;
     _ = s1_thread.join().unwrap()?;
     _ = s2_thread.join().unwrap()?;
     Ok(())

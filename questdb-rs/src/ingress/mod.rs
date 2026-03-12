@@ -1326,6 +1326,15 @@ fn split_addr<'a>(addr: &'a str, default_port: &'a str) -> Result<(&'a str, &'a 
             }
         }
     } else {
+        // Detect bare IPv6 addresses without brackets (e.g. "::1" or "fe80::1").
+        // These are ambiguous with host:port notation, so require bracket notation.
+        if addr.matches(':').count() > 1 {
+            return Err(error::fmt!(
+                ConfigError,
+                "IPv6 address {:?} must use bracket notation, e.g. [::1] or [::1]:9000",
+                addr
+            ));
+        }
         match addr.rsplit_once(':') {
             Some((host, port)) => {
                 if host.is_empty() {

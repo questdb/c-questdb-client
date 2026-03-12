@@ -972,3 +972,44 @@ fn multi_url_addr_params_skipped_correctly() {
     let http = builder.http.as_ref().unwrap();
     assert_eq!(*http.retry_timeout, Duration::from_millis(5000));
 }
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn multi_url_ipv6_bracket_empty_port_after_colon() {
+    // [::1]: — bracket notation with trailing colon but no port value.
+    let result = SenderBuilder::from_conf("http::addr=[::1]:;");
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ConfigError);
+    assert!(err.msg().contains("Empty port"), "Error: {}", err.msg());
+}
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn multi_url_bare_ipv6_rejected() {
+    // Bare IPv6 without brackets should be rejected with a helpful message.
+    let result = SenderBuilder::from_conf("http::addr=::1;");
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ConfigError);
+    assert!(
+        err.msg().contains("bracket notation"),
+        "Error should mention bracket notation: {}",
+        err.msg()
+    );
+}
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn multi_url_bare_ipv6_full_rejected() {
+    // Full bare IPv6 address like fe80::1 should also be rejected.
+    let result = SenderBuilder::from_conf("http::addr=fe80::1;");
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ConfigError);
+    assert!(
+        err.msg().contains("bracket notation"),
+        "Error should mention bracket notation: {}",
+        err.msg()
+    );
+}
