@@ -218,7 +218,7 @@ fn test_json_error(
 fn test_no_connection(
     #[values(ProtocolVersion::V1, ProtocolVersion::V2)] version: ProtocolVersion,
 ) -> TestResult {
-    let mut sender = SenderBuilder::new(Protocol::Http, "127.0.0.1", 1)
+    let mut sender = SenderBuilder::new(Protocol::Http, "127.0.0.1", 1)?
         .protocol_version(version)?
         .build()?;
     let mut buffer = sender.new_buffer();
@@ -881,7 +881,7 @@ fn test_multi_url_send_to_first_address() -> TestResult {
     let mut server1 = MockServer::new()?;
     let server2 = MockServer::new()?;
 
-    let mut sender = SenderBuilder::new(Protocol::Http, server1.host, server1.port)
+    let mut sender = SenderBuilder::new(Protocol::Http, server1.host, server1.port)?
         .address(server2.host, server2.port)?
         .protocol_version(ProtocolVersion::V2)?
         .build()?;
@@ -915,7 +915,7 @@ fn test_multi_url_failover_on_retriable_error() -> TestResult {
     let mut server1 = MockServer::new()?;
     let mut server2 = MockServer::new()?;
 
-    let mut sender = SenderBuilder::new(Protocol::Http, server1.host, server1.port)
+    let mut sender = SenderBuilder::new(Protocol::Http, server1.host, server1.port)?
         .address(server2.host, server2.port)?
         .protocol_version(ProtocolVersion::V2)?
         .retry_timeout(Duration::from_secs(5))?
@@ -964,7 +964,7 @@ fn test_multi_url_failover_on_503() -> TestResult {
     let mut server1 = MockServer::new()?;
     let mut server2 = MockServer::new()?;
 
-    let mut sender = SenderBuilder::new(Protocol::Http, server1.host, server1.port)
+    let mut sender = SenderBuilder::new(Protocol::Http, server1.host, server1.port)?
         .address(server2.host, server2.port)?
         .protocol_version(ProtocolVersion::V2)?
         .retry_timeout(Duration::from_secs(5))?
@@ -1008,7 +1008,7 @@ fn test_multi_url_all_servers_unavailable() -> TestResult {
     let mut server1 = MockServer::new()?;
     let mut server2 = MockServer::new()?;
 
-    let mut sender = SenderBuilder::new(Protocol::Http, server1.host, server1.port)
+    let mut sender = SenderBuilder::new(Protocol::Http, server1.host, server1.port)?
         .address(server2.host, server2.port)?
         .protocol_version(ProtocolVersion::V2)?
         .retry_timeout(Duration::from_millis(200))?
@@ -1087,7 +1087,7 @@ fn test_multi_url_round_robin_rotation() -> TestResult {
     let mut server1 = MockServer::new()?;
     let mut server2 = MockServer::new()?;
 
-    let mut sender = SenderBuilder::new(Protocol::Http, server1.host, server1.port)
+    let mut sender = SenderBuilder::new(Protocol::Http, server1.host, server1.port)?
         .address(server2.host, server2.port)?
         .protocol_version(ProtocolVersion::V2)?
         .retry_timeout(Duration::from_secs(5))?
@@ -1155,7 +1155,7 @@ fn test_multi_url_non_retriable_error_no_failover() -> TestResult {
     let mut server1 = MockServer::new()?;
     let _server2 = MockServer::new()?;
 
-    let mut sender = SenderBuilder::new(Protocol::Http, server1.host, server1.port)
+    let mut sender = SenderBuilder::new(Protocol::Http, server1.host, server1.port)?
         .address(_server2.host, _server2.port)?
         .protocol_version(ProtocolVersion::V2)?
         .retry_timeout(Duration::from_secs(5))?
@@ -1193,7 +1193,7 @@ fn test_multi_url_auth_error_no_failover() -> TestResult {
     let mut server1 = MockServer::new()?;
     let _server2 = MockServer::new()?;
 
-    let mut sender = SenderBuilder::new(Protocol::Http, server1.host, server1.port)
+    let mut sender = SenderBuilder::new(Protocol::Http, server1.host, server1.port)?
         .address(_server2.host, _server2.port)?
         .protocol_version(ProtocolVersion::V2)?
         .retry_timeout(Duration::from_secs(5))?
@@ -1233,7 +1233,7 @@ fn test_multi_url_failover_on_504() -> TestResult {
     let mut server1 = MockServer::new()?;
     let mut server2 = MockServer::new()?;
 
-    let mut sender = SenderBuilder::new(Protocol::Http, server1.host, server1.port)
+    let mut sender = SenderBuilder::new(Protocol::Http, server1.host, server1.port)?
         .address(server2.host, server2.port)?
         .protocol_version(ProtocolVersion::V2)?
         .retry_timeout(Duration::from_secs(5))?
@@ -1278,7 +1278,7 @@ fn test_multi_url_three_servers_failover_chain() -> TestResult {
     let mut server2 = MockServer::new()?;
     let mut server3 = MockServer::new()?;
 
-    let mut sender = SenderBuilder::new(Protocol::Http, server1.host, server1.port)
+    let mut sender = SenderBuilder::new(Protocol::Http, server1.host, server1.port)?
         .address(server2.host, server2.port)?
         .address(server3.host, server3.port)?
         .protocol_version(ProtocolVersion::V2)?
@@ -1337,7 +1337,7 @@ fn test_multi_url_successful_first_attempt_no_rotation() -> TestResult {
     let mut server1 = MockServer::new()?;
     let _server2 = MockServer::new()?;
 
-    let mut sender = SenderBuilder::new(Protocol::Http, server1.host, server1.port)
+    let mut sender = SenderBuilder::new(Protocol::Http, server1.host, server1.port)?
         .address(_server2.host, _server2.port)?
         .protocol_version(ProtocolVersion::V2)?
         .build()?;
@@ -1417,7 +1417,7 @@ fn test_multi_url_failover_on_507() -> TestResult {
     let mut server1 = MockServer::new()?;
     let mut server2 = MockServer::new()?;
 
-    let mut sender = SenderBuilder::new(Protocol::Http, server1.host, server1.port)
+    let mut sender = SenderBuilder::new(Protocol::Http, server1.host, server1.port)?
         .address(server2.host, server2.port)?
         .protocol_version(ProtocolVersion::V2)?
         .retry_timeout(Duration::from_secs(5))?
@@ -1462,7 +1462,7 @@ fn test_multi_url_failover_on_request_timeout() -> TestResult {
     let server1 = MockServer::new()?;
     let mut server2 = MockServer::new()?;
 
-    let mut sender = SenderBuilder::new(Protocol::Http, server1.host, server1.port)
+    let mut sender = SenderBuilder::new(Protocol::Http, server1.host, server1.port)?
         .address(server2.host, server2.port)?
         .protocol_version(ProtocolVersion::V2)?
         .request_timeout(Duration::from_millis(100))?
@@ -1514,7 +1514,7 @@ fn test_multi_url_retriable_status_codes() -> TestResult {
         let mut server1 = MockServer::new()?;
         let mut server2 = MockServer::new()?;
 
-        let mut sender = SenderBuilder::new(Protocol::Http, server1.host, server1.port)
+        let mut sender = SenderBuilder::new(Protocol::Http, server1.host, server1.port)?
             .address(server2.host, server2.port)?
             .protocol_version(ProtocolVersion::V2)?
             .retry_timeout(Duration::from_secs(5))?
@@ -1572,7 +1572,7 @@ fn test_multi_url_non_retriable_status_codes() -> TestResult {
         let mut server1 = MockServer::new()?;
         let _server2 = MockServer::new()?;
 
-        let mut sender = SenderBuilder::new(Protocol::Http, server1.host, server1.port)
+        let mut sender = SenderBuilder::new(Protocol::Http, server1.host, server1.port)?
             .address(_server2.host, _server2.port)?
             .protocol_version(ProtocolVersion::V2)?
             .retry_timeout(Duration::from_secs(5))?
@@ -1683,7 +1683,7 @@ fn test_multi_url_failover_on_421() -> TestResult {
     let mut server1 = MockServer::new()?;
     let mut server2 = MockServer::new()?;
 
-    let mut sender = SenderBuilder::new(Protocol::Http, server1.host, server1.port)
+    let mut sender = SenderBuilder::new(Protocol::Http, server1.host, server1.port)?
         .address(server2.host, server2.port)?
         .protocol_version(ProtocolVersion::V2)?
         .retry_timeout(Duration::from_secs(5))?
@@ -1761,7 +1761,7 @@ fn test_multi_url_settings_negotiation_failover() -> TestResult {
     });
 
     // auto protocol version triggers settings negotiation
-    let sender = SenderBuilder::new(Protocol::Http, "127.0.0.1", s1_port)
+    let sender = SenderBuilder::new(Protocol::Http, "127.0.0.1", s1_port)?
         .address("127.0.0.1", s2_port)?
         .build()?;
 
@@ -1783,7 +1783,7 @@ fn test_multi_url_failover_on_connection_refused() -> TestResult {
 
     let mut server2 = MockServer::new()?;
 
-    let mut sender = SenderBuilder::new(Protocol::Http, "127.0.0.1", s1_port)
+    let mut sender = SenderBuilder::new(Protocol::Http, "127.0.0.1", s1_port)?
         .address(server2.host, server2.port)?
         .protocol_version(ProtocolVersion::V2)?
         .retry_timeout(Duration::from_secs(5))?
@@ -1815,7 +1815,7 @@ fn test_multi_url_failover_on_502() -> TestResult {
     let mut server1 = MockServer::new()?;
     let mut server2 = MockServer::new()?;
 
-    let mut sender = SenderBuilder::new(Protocol::Http, server1.host, server1.port)
+    let mut sender = SenderBuilder::new(Protocol::Http, server1.host, server1.port)?
         .address(server2.host, server2.port)?
         .protocol_version(ProtocolVersion::V2)?
         .retry_timeout(Duration::from_secs(5))?

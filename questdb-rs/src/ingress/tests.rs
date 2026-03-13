@@ -178,6 +178,7 @@ fn zero_timeout_forbidden() {
 
     assert_conf_err(
         SenderBuilder::new(Protocol::Http, "localhost", 9000)
+            .unwrap()
             .request_timeout(Duration::from_millis(0)),
         "\"request_timeout\" must be greater than 0.",
     );
@@ -214,6 +215,7 @@ fn inconsistent_http_auth() {
 #[test]
 fn cant_use_basic_auth_with_tcp() {
     let builder = SenderBuilder::new(Protocol::Tcp, "localhost", 9000)
+        .unwrap()
         .username("user123")
         .unwrap()
         .password("pass321")
@@ -228,6 +230,7 @@ fn cant_use_basic_auth_with_tcp() {
 #[test]
 fn cant_use_token_auth_with_tcp() {
     let builder = SenderBuilder::new(Protocol::Tcp, "localhost", 9000)
+        .unwrap()
         .token("token123")
         .unwrap();
     assert_conf_err(
@@ -281,7 +284,7 @@ fn cant_use_ecdsa_auth_with_http_ex_tcp_support() {
 #[cfg(feature = "sync-sender-tcp")]
 #[test]
 fn set_auth_specifies_tcp() {
-    let mut builder = SenderBuilder::new(Protocol::Tcp, "localhost", 9000);
+    let mut builder = SenderBuilder::new(Protocol::Tcp, "localhost", 9000).unwrap();
     assert_eq!(builder.protocol, Protocol::Tcp);
     builder = builder
         .username("key_id123")
@@ -298,7 +301,7 @@ fn set_auth_specifies_tcp() {
 #[cfg(feature = "sync-sender-tcp")]
 #[test]
 fn set_net_interface_specifies_tcp() {
-    let builder = SenderBuilder::new(Protocol::Tcp, "localhost", 9000);
+    let builder = SenderBuilder::new(Protocol::Tcp, "localhost", 9000).unwrap();
     assert_eq!(builder.protocol, Protocol::Tcp);
     builder.bind_interface("55.88.0.4").unwrap();
 }
@@ -518,6 +521,7 @@ fn connect_timeout_uses_request_timeout() {
     use std::time::Instant;
     let request_timeout = Duration::from_millis(10);
     let builder = SenderBuilder::new(Protocol::Http, "127.0.0.2", "1111")
+        .unwrap()
         .request_timeout(request_timeout)
         .unwrap()
         .protocol_version(ProtocolVersion::V2)
@@ -676,6 +680,7 @@ fn multi_url_tcps_rejects_multiple_addresses() {
 #[test]
 fn multi_url_programmatic_address_chaining() {
     let builder = SenderBuilder::new(Protocol::Http, "host1", 9000)
+        .unwrap()
         .address("host2", 9001u16)
         .unwrap()
         .address("host3", 9002u16)
@@ -690,6 +695,7 @@ fn multi_url_programmatic_address_chaining() {
 #[test]
 fn multi_url_programmatic_address_with_string_port() {
     let builder = SenderBuilder::new(Protocol::Http, "host1", "9000")
+        .unwrap()
         .address("host2", "9001")
         .unwrap();
     assert_eq!(builder.addresses.len(), 2);
@@ -699,7 +705,7 @@ fn multi_url_programmatic_address_with_string_port() {
 #[cfg(all(feature = "sync-sender-tcp", feature = "sync-sender-http"))]
 #[test]
 fn multi_url_programmatic_tcp_rejects_address() {
-    let builder = SenderBuilder::new(Protocol::Tcp, "host1", 9009);
+    let builder = SenderBuilder::new(Protocol::Tcp, "host1", 9009).unwrap();
     assert_conf_err(
         builder.address("host2", 9009u16),
         "Multiple addresses are only supported for HTTP/HTTPS protocols.",
@@ -709,7 +715,7 @@ fn multi_url_programmatic_tcp_rejects_address() {
 #[cfg(feature = "sync-sender-http")]
 #[test]
 fn multi_url_many_addresses() {
-    let mut builder = SenderBuilder::new(Protocol::Http, "host0", 9000);
+    let mut builder = SenderBuilder::new(Protocol::Http, "host0", 9000).unwrap();
     for i in 1..20 {
         builder = builder
             .address(format!("host{i}"), (9000 + i) as u16)
@@ -1017,6 +1023,7 @@ fn multi_url_bare_ipv6_full_rejected() {
 #[test]
 fn multi_url_address_rejects_empty_host() {
     let result = SenderBuilder::new(Protocol::Http, "localhost", "9000")
+        .unwrap()
         .address("", "9001");
     assert!(result.is_err());
     let err = result.unwrap_err();
@@ -1027,7 +1034,26 @@ fn multi_url_address_rejects_empty_host() {
 #[test]
 fn multi_url_address_rejects_empty_port() {
     let result = SenderBuilder::new(Protocol::Http, "localhost", "9000")
+        .unwrap()
         .address("host2", "");
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ConfigError);
+    assert!(err.msg().contains("Empty port"));
+}
+
+#[test]
+fn new_rejects_empty_host() {
+    let result = SenderBuilder::new(Protocol::Http, "", "9000");
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ConfigError);
+    assert!(err.msg().contains("Empty host"));
+}
+
+#[test]
+fn new_rejects_empty_port() {
+    let result = SenderBuilder::new(Protocol::Http, "localhost", "");
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert_eq!(err.code(), ErrorCode::ConfigError);

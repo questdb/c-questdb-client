@@ -348,10 +348,10 @@ impl Protocol {
 ///
 /// # fn main() -> Result<()> {
 /// # #[cfg(feature = "sync-sender-http")] {
-/// let mut sender = SenderBuilder::new(Protocol::Http, "localhost", 9000).build()?;
+/// let mut sender = SenderBuilder::new(Protocol::Http, "localhost", 9000)?.build()?;
 /// # }
 /// # #[cfg(all(not(feature = "sync-sender-http"), feature = "sync-sender-tcp"))] {
-/// let mut sender = SenderBuilder::new(Protocol::Tcp, "localhost", 9009).build()?;
+/// let mut sender = SenderBuilder::new(Protocol::Tcp, "localhost", 9009)?.build()?;
 /// # }
 /// # Ok(())
 /// # }
@@ -433,7 +433,7 @@ impl SenderBuilder {
         let default_port = protocol.default_port();
 
         let (host, port) = split_addr(addrs[0], default_port)?;
-        let mut builder = SenderBuilder::new(protocol, host, port);
+        let mut builder = SenderBuilder::new(protocol, host, port)?;
 
         // Add any additional addresses (multi-url support).
         for addr in &addrs[1..] {
@@ -623,19 +623,26 @@ impl SenderBuilder {
     /// # fn main() -> Result<()> {
     /// # #[cfg(feature = "sync-sender-tcp")] {
     /// let mut sender = SenderBuilder::new(
-    ///     Protocol::Tcp, "localhost", 9009).build()?;
+    ///     Protocol::Tcp, "localhost", 9009)?.build()?;
     /// # }
     /// # #[cfg(all(not(feature = "sync-sender-tcp"), feature = "sync-sender-http"))] {
     /// let mut sender = SenderBuilder::new(
-    ///     Protocol::Http, "localhost", 9000).build()?;
+    ///     Protocol::Http, "localhost", 9000)?.build()?;
     /// # }
     /// # Ok(())
     /// # }
     /// ```
-    pub fn new<H: Into<String>, P: Into<Port>>(protocol: Protocol, host: H, port: P) -> Self {
+    pub fn new<H: Into<String>, P: Into<Port>>(protocol: Protocol, host: H, port: P) -> Result<Self> {
         let host = host.into();
         let port: Port = port.into();
         let port = port.0;
+
+        if host.is_empty() {
+            return Err(error::fmt!(ConfigError, "Empty host in address"));
+        }
+        if port.is_empty() {
+            return Err(error::fmt!(ConfigError, "Empty port in address"));
+        }
 
         #[cfg(feature = "tls-webpki-certs")]
         let tls_ca = CertificateAuthority::WebpkiRoots;
@@ -646,7 +653,7 @@ impl SenderBuilder {
         #[cfg(not(any(feature = "tls-webpki-certs", feature = "tls-native-certs")))]
         let tls_ca = CertificateAuthority::PemFile;
 
-        Self {
+        Ok(Self {
             protocol,
             addresses: vec![(host, port)],
             net_interface: ConfigSetting::new_default(None),
@@ -677,7 +684,7 @@ impl SenderBuilder {
             } else {
                 None
             },
-        }
+        })
     }
 
     /// Select local outbound interface.
@@ -720,7 +727,7 @@ impl SenderBuilder {
     ///
     /// # fn main() -> Result<()> {
     /// # #[cfg(feature = "sync-sender-http")] {
-    /// let mut sender = SenderBuilder::new(Protocol::Http, "host1", 9000)
+    /// let mut sender = SenderBuilder::new(Protocol::Http, "host1", 9000)?
     ///     .address("host2", 9000)?
     ///     .address("host3", 9000)?
     ///     .build()?;
