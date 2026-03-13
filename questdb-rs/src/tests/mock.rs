@@ -628,21 +628,21 @@ impl MockServer {
 
     #[cfg(feature = "sync-sender-tcp")]
     pub fn lsb_tcp(&self) -> SenderBuilder {
-        SenderBuilder::new(Protocol::Tcp, self.host, self.port)
+        SenderBuilder::new(Protocol::Tcp, self.host, self.port).unwrap()
     }
 
     #[cfg(feature = "sync-sender-tcp")]
     pub fn lsb_tcps(&self) -> SenderBuilder {
-        SenderBuilder::new(Protocol::Tcps, self.host, self.port)
+        SenderBuilder::new(Protocol::Tcps, self.host, self.port).unwrap()
     }
 
     #[cfg(feature = "sync-sender-http")]
     pub fn lsb_http(&self) -> SenderBuilder {
-        SenderBuilder::new(Protocol::Http, self.host, self.port)
+        SenderBuilder::new(Protocol::Http, self.host, self.port).unwrap()
     }
 
     #[cfg(feature = "sync-sender-http")]
     pub fn lsb_https(&self) -> SenderBuilder {
-        SenderBuilder::new(Protocol::Https, self.host, self.port)
+        SenderBuilder::new(Protocol::Https, self.host, self.port).unwrap()
     }
 }

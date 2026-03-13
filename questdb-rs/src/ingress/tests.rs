@@ -33,8 +33,8 @@ use tempfile::TempDir;
 fn http_simple() {
     let builder = SenderBuilder::from_conf("http::addr=127.0.0.1;").unwrap();
     assert_eq!(builder.protocol, Protocol::Http);
-    assert_specified_eq(&builder.host, "127.0.0.1");
-    assert_specified_eq(&builder.port, Protocol::Http.default_port());
+    assert_eq!(builder.addresses[0].0, "127.0.0.1");
+    assert_eq!(builder.addresses[0].1, Protocol::Http.default_port());
     assert!(!builder.protocol.tls_enabled());
 }
 
@@ -43,8 +43,8 @@ fn http_simple() {
 fn https_simple() {
     let builder = SenderBuilder::from_conf("https::addr=localhost;").unwrap();
     assert_eq!(builder.protocol, Protocol::Https);
-    assert_specified_eq(&builder.host, "localhost");
-    assert_specified_eq(&builder.port, Protocol::Https.default_port());
+    assert_eq!(builder.addresses[0].0, "localhost");
+    assert_eq!(builder.addresses[0].1, Protocol::Https.default_port());
     assert!(builder.protocol.tls_enabled());
 
     #[cfg(feature = "tls-webpki-certs")]
@@ -59,8 +59,8 @@ fn https_simple() {
 fn tcp_simple() {
     let builder = SenderBuilder::from_conf("tcp::addr=127.0.0.1;").unwrap();
     assert_eq!(builder.protocol, Protocol::Tcp);
-    assert_specified_eq(&builder.port, Protocol::Tcp.default_port());
-    assert_specified_eq(&builder.host, "127.0.0.1");
+    assert_eq!(builder.addresses[0].1, Protocol::Tcp.default_port());
+    assert_eq!(builder.addresses[0].0, "127.0.0.1");
     assert!(!builder.protocol.tls_enabled());
 }
 
@@ -69,8 +69,8 @@ fn tcp_simple() {
 fn tcps_simple() {
     let builder = SenderBuilder::from_conf("tcps::addr=localhost;").unwrap();
     assert_eq!(builder.protocol, Protocol::Tcps);
-    assert_specified_eq(&builder.host, "localhost");
-    assert_specified_eq(&builder.port, Protocol::Tcps.default_port());
+    assert_eq!(builder.addresses[0].0, "localhost");
+    assert_eq!(builder.addresses[0].1, Protocol::Tcps.default_port());
     assert!(builder.protocol.tls_enabled());
 
     #[cfg(feature = "tls-webpki-certs")]
@@ -178,6 +178,7 @@ fn zero_timeout_forbidden() {
 
     assert_conf_err(
         SenderBuilder::new(Protocol::Http, "localhost", 9000)
+            .unwrap()
             .request_timeout(Duration::from_millis(0)),
         "\"request_timeout\" must be greater than 0.",
     );
@@ -214,6 +215,7 @@ fn inconsistent_http_auth() {
 #[test]
 fn cant_use_basic_auth_with_tcp() {
     let builder = SenderBuilder::new(Protocol::Tcp, "localhost", 9000)
+        .unwrap()
         .username("user123")
         .unwrap()
         .password("pass321")
@@ -228,6 +230,7 @@ fn cant_use_basic_auth_with_tcp() {
 #[test]
 fn cant_use_token_auth_with_tcp() {
     let builder = SenderBuilder::new(Protocol::Tcp, "localhost", 9000)
+        .unwrap()
         .token("token123")
         .unwrap();
     assert_conf_err(
@@ -281,7 +284,7 @@ fn cant_use_ecdsa_auth_with_http_ex_tcp_support() {
 #[cfg(feature = "sync-sender-tcp")]
 #[test]
 fn set_auth_specifies_tcp() {
-    let mut builder = SenderBuilder::new(Protocol::Tcp, "localhost", 9000);
+    let mut builder = SenderBuilder::new(Protocol::Tcp, "localhost", 9000).unwrap();
     assert_eq!(builder.protocol, Protocol::Tcp);
     builder = builder
         .username("key_id123")
@@ -298,7 +301,7 @@ fn set_auth_specifies_tcp() {
 #[cfg(feature = "sync-sender-tcp")]
 #[test]
 fn set_net_interface_specifies_tcp() {
-    let builder = SenderBuilder::new(Protocol::Tcp, "localhost", 9000);
+    let builder = SenderBuilder::new(Protocol::Tcp, "localhost", 9000).unwrap();
     assert_eq!(builder.protocol, Protocol::Tcp);
     builder.bind_interface("55.88.0.4").unwrap();
 }
@@ -518,6 +521,7 @@ fn connect_timeout_uses_request_timeout() {
     use std::time::Instant;
     let request_timeout = Duration::from_millis(10);
     let builder = SenderBuilder::new(Protocol::Http, "127.0.0.2", "1111")
+        .unwrap()
         .request_timeout(request_timeout)
         .unwrap()
         .protocol_version(ProtocolVersion::V2)
@@ -575,6 +579,234 @@ fn auto_flush_bytes_unsupported() {
     );
 }
 
+// ==================== Multi-URL Config Parsing Tests ====================
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn multi_url_parse_multiple_addresses_from_config_string() {
+    let builder = SenderBuilder::from_conf(
+        "http::addr=host1:9000;addr=host2:9001;addr=host3:9002;",
+    )
+    .unwrap();
+    assert_eq!(builder.addresses.len(), 3);
+    assert_eq!(builder.addresses[0], ("host1".to_string(), "9000".to_string()));
+    assert_eq!(builder.addresses[1], ("host2".to_string(), "9001".to_string()));
+    assert_eq!(builder.addresses[2], ("host3".to_string(), "9002".to_string()));
+}
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn multi_url_parse_addresses_with_default_port() {
+    let builder = SenderBuilder::from_conf(
+        "http::addr=host1;addr=host2;addr=host3;",
+    )
+    .unwrap();
+    assert_eq!(builder.addresses.len(), 3);
+    assert_eq!(builder.addresses[0], ("host1".to_string(), "9000".to_string()));
+    assert_eq!(builder.addresses[1], ("host2".to_string(), "9000".to_string()));
+    assert_eq!(builder.addresses[2], ("host3".to_string(), "9000".to_string()));
+}
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn multi_url_parse_mixed_ports_and_defaults() {
+    let builder = SenderBuilder::from_conf(
+        "http::addr=host1:8080;addr=host2;addr=host3:9009;",
+    )
+    .unwrap();
+    assert_eq!(builder.addresses.len(), 3);
+    assert_eq!(builder.addresses[0], ("host1".to_string(), "8080".to_string()));
+    assert_eq!(builder.addresses[1], ("host2".to_string(), "9000".to_string()));
+    assert_eq!(builder.addresses[2], ("host3".to_string(), "9009".to_string()));
+}
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn multi_url_https_default_port() {
+    let builder = SenderBuilder::from_conf(
+        "https::addr=host1;addr=host2;",
+    )
+    .unwrap();
+    assert_eq!(builder.addresses.len(), 2);
+    assert_eq!(builder.addresses[0].1, "9000");
+    assert_eq!(builder.addresses[1].1, "9000");
+}
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn multi_url_single_address_defaults_to_one() {
+    let builder = SenderBuilder::from_conf("http::addr=localhost:9000;").unwrap();
+    assert_eq!(builder.addresses.len(), 1);
+    assert_eq!(builder.addresses[0], ("localhost".to_string(), "9000".to_string()));
+}
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn multi_url_preserves_other_params() {
+    let builder = SenderBuilder::from_conf(
+        "http::addr=host1:9000;addr=host2:9001;username=user1;password=pass1;retry_timeout=5000;",
+    )
+    .unwrap();
+    assert_eq!(builder.addresses.len(), 2);
+    let auth = builder.build_auth().unwrap();
+    match auth.unwrap() {
+        conf::AuthParams::Basic(conf::BasicAuthParams { username, password }) => {
+            assert_eq!(username, "user1");
+            assert_eq!(password, "pass1");
+        }
+        _ => panic!("Expected AuthParams::Basic"),
+    }
+}
+
+#[cfg(feature = "sync-sender-tcp")]
+#[test]
+fn multi_url_tcp_rejects_multiple_addresses() {
+    assert_conf_err(
+        SenderBuilder::from_conf("tcp::addr=host1:9009;addr=host2:9009;"),
+        "Multiple addresses are only supported for HTTP/HTTPS protocols.",
+    );
+}
+
+#[cfg(feature = "sync-sender-tcp")]
+#[test]
+fn multi_url_tcps_rejects_multiple_addresses() {
+    assert_conf_err(
+        SenderBuilder::from_conf("tcps::addr=host1:9009;addr=host2:9009;"),
+        "Multiple addresses are only supported for HTTP/HTTPS protocols.",
+    );
+}
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn multi_url_programmatic_address_chaining() {
+    let builder = SenderBuilder::new(Protocol::Http, "host1", 9000)
+        .unwrap()
+        .address("host2", 9001u16)
+        .unwrap()
+        .address("host3", 9002u16)
+        .unwrap();
+    assert_eq!(builder.addresses.len(), 3);
+    assert_eq!(builder.addresses[0], ("host1".to_string(), "9000".to_string()));
+    assert_eq!(builder.addresses[1], ("host2".to_string(), "9001".to_string()));
+    assert_eq!(builder.addresses[2], ("host3".to_string(), "9002".to_string()));
+}
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn multi_url_programmatic_address_with_string_port() {
+    let builder = SenderBuilder::new(Protocol::Http, "host1", "9000")
+        .unwrap()
+        .address("host2", "9001")
+        .unwrap();
+    assert_eq!(builder.addresses.len(), 2);
+    assert_eq!(builder.addresses[1], ("host2".to_string(), "9001".to_string()));
+}
+
+#[cfg(all(feature = "sync-sender-tcp", feature = "sync-sender-http"))]
+#[test]
+fn multi_url_programmatic_tcp_rejects_address() {
+    let builder = SenderBuilder::new(Protocol::Tcp, "host1", 9009).unwrap();
+    assert_conf_err(
+        builder.address("host2", 9009u16),
+        "Multiple addresses are only supported for HTTP/HTTPS protocols.",
+    );
+}
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn multi_url_many_addresses() {
+    let mut builder = SenderBuilder::new(Protocol::Http, "host0", 9000).unwrap();
+    for i in 1..20 {
+        builder = builder
+            .address(format!("host{i}"), (9000 + i) as u16)
+            .unwrap();
+    }
+    assert_eq!(builder.addresses.len(), 20);
+    for i in 0..20 {
+        assert_eq!(builder.addresses[i].0, format!("host{i}"));
+    }
+}
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn multi_url_duplicate_addresses_allowed() {
+    let builder = SenderBuilder::from_conf(
+        "http::addr=host1:9000;addr=host1:9000;addr=host1:9000;",
+    )
+    .unwrap();
+    assert_eq!(builder.addresses.len(), 3);
+    assert_eq!(builder.addresses[0], builder.addresses[1]);
+    assert_eq!(builder.addresses[1], builder.addresses[2]);
+}
+
+// ==================== Fuzz-like Config Parsing Tests ====================
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn multi_url_fuzz_random_addr_combinations() {
+    // Test various valid multi-addr configurations.
+    let test_cases = vec![
+        "http::addr=a:1;",
+        "http::addr=a:1;addr=b:2;",
+        "http::addr=a:1;addr=b:2;addr=c:3;",
+        "http::addr=localhost;addr=127.0.0.1:8080;",
+        "http::addr=my-host.example.com:9000;addr=other-host.example.com;",
+        "https::addr=secure1:443;addr=secure2:443;",
+        "http::addr=a:1;addr=b:2;addr=c:3;addr=d:4;addr=e:5;",
+        "http::addr=h:1;addr=h:2;addr=h:3;addr=h:4;addr=h:5;addr=h:6;addr=h:7;addr=h:8;addr=h:9;addr=h:10;",
+    ];
+
+    for conf_str in test_cases {
+        let builder = SenderBuilder::from_conf(conf_str);
+        assert!(
+            builder.is_ok(),
+            "Failed to parse config: {conf_str}: {:?}",
+            builder.err()
+        );
+    }
+}
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn multi_url_fuzz_addr_with_all_params() {
+    let conf = "http::addr=h1:9000;addr=h2:9001;username=u;password=p;request_timeout=5000;retry_timeout=3000;request_min_throughput=1024;max_buf_size=2048;";
+    let builder = SenderBuilder::from_conf(conf).unwrap();
+    assert_eq!(builder.addresses.len(), 2);
+    let http = builder.http.as_ref().unwrap();
+    assert_specified_eq(&http.request_timeout, Duration::from_millis(5000));
+    assert_specified_eq(&http.retry_timeout, Duration::from_millis(3000));
+    assert_specified_eq(&http.request_min_throughput, 1024u64);
+}
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn multi_url_addr_ordering_matters() {
+    // Ensure the first addr is the primary.
+    let builder = SenderBuilder::from_conf(
+        "http::addr=primary:9000;addr=secondary:9001;addr=tertiary:9002;",
+    )
+    .unwrap();
+    assert_eq!(builder.addresses[0].0, "primary");
+    assert_eq!(builder.addresses[1].0, "secondary");
+    assert_eq!(builder.addresses[2].0, "tertiary");
+}
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn multi_url_addr_interleaved_with_other_params() {
+    // addr params interleaved with other params should still work.
+    let builder = SenderBuilder::from_conf(
+        "http::addr=h1:9000;username=u;addr=h2:9001;password=p;addr=h3:9002;",
+    )
+    .unwrap();
+    assert_eq!(builder.addresses.len(), 3);
+    assert_eq!(builder.addresses[0].0, "h1");
+    assert_eq!(builder.addresses[1].0, "h2");
+    assert_eq!(builder.addresses[2].0, "h3");
+    let auth = builder.build_auth().unwrap();
+    assert!(matches!(auth, Some(conf::AuthParams::Basic(_))));
+}
+
 fn assert_specified_eq<V: PartialEq + Debug, IntoV: Into<V>>(
     actual: &ConfigSetting<V>,
     expected: IntoV,
@@ -605,4 +837,225 @@ fn assert_conf_err<T, M: AsRef<str>>(result: Result<T>, expect_msg: M) {
     };
     assert_eq!(err.code(), ErrorCode::ConfigError);
     assert_eq!(err.msg(), expect_msg.as_ref());
+}
+
+// === IPv6 address parsing tests (Fix #12) ===
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn multi_url_ipv6_bracket_notation_with_port() {
+    let builder = SenderBuilder::from_conf("http::addr=[::1]:9000;").unwrap();
+    assert_eq!(builder.addresses.len(), 1);
+    assert_eq!(builder.addresses[0].0, "::1");
+    assert_eq!(builder.addresses[0].1, "9000");
+}
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn multi_url_ipv6_bracket_notation_default_port() {
+    let builder = SenderBuilder::from_conf("http::addr=[::1];").unwrap();
+    assert_eq!(builder.addresses.len(), 1);
+    assert_eq!(builder.addresses[0].0, "::1");
+    assert_eq!(builder.addresses[0].1, Protocol::Http.default_port());
+}
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn multi_url_ipv6_multiple_addrs() {
+    let builder = SenderBuilder::from_conf(
+        "http::addr=[::1]:9000;addr=[2001:db8::1]:9001;addr=host3:9002;",
+    )
+    .unwrap();
+    assert_eq!(builder.addresses.len(), 3);
+    assert_eq!(builder.addresses[0], ("::1".to_string(), "9000".to_string()));
+    assert_eq!(
+        builder.addresses[1],
+        ("2001:db8::1".to_string(), "9001".to_string())
+    );
+    assert_eq!(
+        builder.addresses[2],
+        ("host3".to_string(), "9002".to_string())
+    );
+}
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn multi_url_ipv6_full_address() {
+    let builder =
+        SenderBuilder::from_conf("http::addr=[2001:0db8:85a3::8a2e:0370:7334]:9000;").unwrap();
+    assert_eq!(builder.addresses[0].0, "2001:0db8:85a3::8a2e:0370:7334");
+    assert_eq!(builder.addresses[0].1, "9000");
+}
+
+// === Empty host/port validation tests (Fix #13) ===
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn multi_url_empty_addr_rejected() {
+    let result = SenderBuilder::from_conf("http::addr=;");
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ConfigError);
+}
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn multi_url_empty_port_rejected() {
+    let result = SenderBuilder::from_conf("http::addr=host:;");
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ConfigError);
+    assert!(err.msg().contains("Empty port"), "Error: {}", err.msg());
+}
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn multi_url_empty_host_rejected() {
+    let result = SenderBuilder::from_conf("http::addr=:9000;");
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ConfigError);
+    assert!(err.msg().contains("Empty host"), "Error: {}", err.msg());
+}
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn multi_url_ipv6_unterminated_bracket() {
+    let result = SenderBuilder::from_conf("http::addr=[::1:9000;");
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ConfigError);
+    assert!(
+        err.msg().contains("Unterminated bracket"),
+        "Error: {}",
+        err.msg()
+    );
+}
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn multi_url_ipv6_empty_bracket_host() {
+    let result = SenderBuilder::from_conf("http::addr=[]:9000;");
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ConfigError);
+    assert!(err.msg().contains("Empty host"), "Error: {}", err.msg());
+}
+
+// === split_addr with rsplit_once preserves backward compat (Fix #12) ===
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn multi_url_regular_hostname_with_port() {
+    // Standard host:port still works with rsplit_once
+    let builder = SenderBuilder::from_conf("http::addr=myhost.example.com:9000;").unwrap();
+    assert_eq!(builder.addresses[0].0, "myhost.example.com");
+    assert_eq!(builder.addresses[0].1, "9000");
+}
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn multi_url_hostname_no_port_default() {
+    let builder = SenderBuilder::from_conf("http::addr=myhost;").unwrap();
+    assert_eq!(builder.addresses[0].0, "myhost");
+    assert_eq!(builder.addresses[0].1, Protocol::Http.default_port());
+}
+
+// === Dead code removal verification (Fix #11) ===
+// The `first_addr_seen` variable has been removed. If it returns, this test
+// will still pass, but verifying that multiple addr keys are correctly skipped
+// in the params loop (the behavior first_addr_seen was trying to support).
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn multi_url_addr_params_skipped_correctly() {
+    // Three addr keys plus other params - all addr entries should be skipped in the loop,
+    // and other params applied correctly.
+    let builder = SenderBuilder::from_conf(
+        "http::addr=host1:9000;addr=host2:9001;addr=host3:9002;retry_timeout=5000;",
+    )
+    .unwrap();
+    assert_eq!(builder.addresses.len(), 3);
+    let http = builder.http.as_ref().unwrap();
+    assert_eq!(*http.retry_timeout, Duration::from_millis(5000));
+}
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn multi_url_ipv6_bracket_empty_port_after_colon() {
+    // [::1]: — bracket notation with trailing colon but no port value.
+    let result = SenderBuilder::from_conf("http::addr=[::1]:;");
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ConfigError);
+    assert!(err.msg().contains("Empty port"), "Error: {}", err.msg());
+}
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn multi_url_bare_ipv6_rejected() {
+    // Bare IPv6 without brackets should be rejected with a helpful message.
+    let result = SenderBuilder::from_conf("http::addr=::1;");
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ConfigError);
+    assert!(
+        err.msg().contains("bracket notation"),
+        "Error should mention bracket notation: {}",
+        err.msg()
+    );
+}
+
+#[cfg(feature = "sync-sender-http")]
+#[test]
+fn multi_url_bare_ipv6_full_rejected() {
+    // Full bare IPv6 address like fe80::1 should also be rejected.
+    let result = SenderBuilder::from_conf("http::addr=fe80::1;");
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ConfigError);
+    assert!(
+        err.msg().contains("bracket notation"),
+        "Error should mention bracket notation: {}",
+        err.msg()
+    );
+}
+
+#[test]
+fn multi_url_address_rejects_empty_host() {
+    let result = SenderBuilder::new(Protocol::Http, "localhost", "9000")
+        .unwrap()
+        .address("", "9001");
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ConfigError);
+    assert!(err.msg().contains("Empty host"));
+}
+
+#[test]
+fn multi_url_address_rejects_empty_port() {
+    let result = SenderBuilder::new(Protocol::Http, "localhost", "9000")
+        .unwrap()
+        .address("host2", "");
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ConfigError);
+    assert!(err.msg().contains("Empty port"));
+}
+
+#[test]
+fn new_rejects_empty_host() {
+    let result = SenderBuilder::new(Protocol::Http, "", "9000");
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ConfigError);
+    assert!(err.msg().contains("Empty host"));
+}
+
+#[test]
+fn new_rejects_empty_port() {
+    let result = SenderBuilder::new(Protocol::Http, "localhost", "");
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ConfigError);
+    assert!(err.msg().contains("Empty port"));
 }

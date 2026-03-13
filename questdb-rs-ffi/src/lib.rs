@@ -166,7 +166,7 @@ macro_rules! upd_opts {
                     // already cleaned up object.
                     // To avoid double-freeing, we need to construct a valid "dummy"
                     // object on top of the memory that is still owned by the caller.
-                    let dummy = SenderBuilder::new(Protocol::Tcp, "127.0.0.1", 1);
+                    let dummy = SenderBuilder::new(Protocol::Tcp, "127.0.0.1", 1).unwrap();
                     ptr::write(builder_ref, dummy);
                     return false;
                 }
@@ -1435,7 +1435,8 @@ pub unsafe extern "C" fn line_sender_opts_new(
     host: line_sender_utf8,
     port: u16,
 ) -> *mut line_sender_opts {
-    let builder = SenderBuilder::new(protocol.into(), host.as_str(), port);
+    let builder = SenderBuilder::new(protocol.into(), host.as_str(), port)
+        .expect("valid host and port");
     let builder = builder
         .user_agent(concat!("questdb/c/", env!("CARGO_PKG_VERSION")))
         .expect("user_agent set");
@@ -1450,7 +1451,8 @@ pub unsafe extern "C" fn line_sender_opts_new_service(
     host: line_sender_utf8,
     port: line_sender_utf8,
 ) -> *mut line_sender_opts {
-    let builder = SenderBuilder::new(protocol.into(), host.as_str(), port.as_str());
+    let builder = SenderBuilder::new(protocol.into(), host.as_str(), port.as_str())
+        .expect("valid host and port");
     let builder = builder
         .user_agent(concat!("questdb/c/", env!("CARGO_PKG_VERSION")))
         .expect("user_agent set");
@@ -1469,6 +1471,22 @@ pub unsafe extern "C" fn line_sender_opts_bind_interface(
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     unsafe { upd_opts!(opts, err_out, bind_interface, bind_interface.as_str()) }
+}
+
+/// Add an additional address for failover (HTTP/HTTPS only).
+///
+/// When multiple addresses are configured, the sender will rotate through
+/// them in round-robin fashion when a retriable error occurs during flush.
+///
+/// Multiple addresses are only supported for HTTP/HTTPS protocols.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_opts_address(
+    opts: *mut line_sender_opts,
+    host: line_sender_utf8,
+    port: line_sender_utf8,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe { upd_opts!(opts, err_out, address, host.as_str(), port.as_str()) }
 }
 
 /// Set the username for authentication.

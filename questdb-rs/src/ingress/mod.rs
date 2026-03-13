@@ -29,7 +29,6 @@ pub use self::timestamp::*;
 use crate::error::{self, Result, fmt};
 use crate::ingress::conf::ConfigSetting;
 use core::time::Duration;
-use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter, Write};
 
 use std::ops::Deref;
@@ -50,7 +49,7 @@ use ring::{
     signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair},
 };
 
-mod conf;
+pub(crate) mod conf;
 
 pub(crate) mod ndarr;
 
@@ -59,7 +58,7 @@ mod timestamp;
 mod buffer;
 pub use buffer::*;
 
-mod sender;
+pub(crate) mod sender;
 pub use sender::*;
 
 mod decimal;
@@ -74,7 +73,6 @@ pub const MAX_ARRAY_DIM_LEN: usize = 0x0FFF_FFFF; // 1 << 28 - 1
 
 pub(crate) const ARRAY_BINARY_FORMAT_TYPE: u8 = 14;
 pub(crate) const DOUBLE_BINARY_FORMAT_TYPE: u8 = 16;
-#[allow(dead_code)]
 pub const DECIMAL_BINARY_FORMAT_TYPE: u8 = 23;
 
 /// The version of InfluxDB Line Protocol used to communicate with the server.
@@ -180,9 +178,23 @@ impl From<u16> for Port {
     }
 }
 
-fn validate_auto_flush_params(params: &HashMap<String, String>) -> Result<()> {
-    if let Some(auto_flush) = params.get("auto_flush")
-        && auto_flush.as_str() != "off"
+/// Helper to find the last value for a key in a `Vec<(String, String)>`.
+fn conf_params_get<'a>(params: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    params
+        .iter()
+        .rev()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
+}
+
+/// Helper to check if a key exists in params.
+fn conf_params_contains(params: &[(String, String)], key: &str) -> bool {
+    params.iter().any(|(k, _)| k == key)
+}
+
+fn validate_auto_flush_params(params: &[(String, String)]) -> Result<()> {
+    if let Some(auto_flush) = conf_params_get(params, "auto_flush")
+        && auto_flush != "off"
     {
         return Err(error::fmt!(
             ConfigError,
@@ -192,7 +204,7 @@ fn validate_auto_flush_params(params: &HashMap<String, String>) -> Result<()> {
     }
 
     for &param in ["auto_flush_rows", "auto_flush_bytes"].iter() {
-        if params.contains_key(param) {
+        if conf_params_contains(params, param) {
             return Err(error::fmt!(
                 ConfigError,
                 "Invalid configuration parameter {:?}. This client does not support auto-flush",
@@ -336,10 +348,10 @@ impl Protocol {
 ///
 /// # fn main() -> Result<()> {
 /// # #[cfg(feature = "sync-sender-http")] {
-/// let mut sender = SenderBuilder::new(Protocol::Http, "localhost", 9000).build()?;
+/// let mut sender = SenderBuilder::new(Protocol::Http, "localhost", 9000)?.build()?;
 /// # }
 /// # #[cfg(all(not(feature = "sync-sender-http"), feature = "sync-sender-tcp"))] {
-/// let mut sender = SenderBuilder::new(Protocol::Tcp, "localhost", 9009).build()?;
+/// let mut sender = SenderBuilder::new(Protocol::Tcp, "localhost", 9009)?.build()?;
 /// # }
 /// # Ok(())
 /// # }
@@ -347,8 +359,7 @@ impl Protocol {
 #[derive(Debug, Clone)]
 pub struct SenderBuilder {
     protocol: Protocol,
-    host: ConfigSetting<String>,
-    port: ConfigSetting<String>,
+    addresses: Vec<(String, String)>,
     net_interface: ConfigSetting<Option<String>>,
     max_buf_size: ConfigSetting<usize>,
     max_name_len: ConfigSetting<usize>,
@@ -411,22 +422,33 @@ impl SenderBuilder {
 
         let protocol = Protocol::from_schema(service)?;
 
-        let Some(addr) = params.get("addr") else {
+        let addrs: Vec<&str> = conf.get_all("addr");
+        if addrs.is_empty() {
             return Err(error::fmt!(
                 ConfigError,
                 "Missing \"addr\" parameter in config string"
             ));
-        };
-        let (host, port) = match addr.split_once(':') {
-            Some((h, p)) => (h, p),
-            None => (addr.as_str(), protocol.default_port()),
-        };
-        let mut builder = SenderBuilder::new(protocol, host, port);
+        }
+
+        let default_port = protocol.default_port();
+
+        let (host, port) = split_addr(addrs[0], default_port)?;
+        let mut builder = SenderBuilder::new(protocol, host, port)?;
+
+        // Add any additional addresses (multi-url support).
+        for addr in &addrs[1..] {
+            let (h, p) = split_addr(addr, default_port)?;
+            builder = builder.address(h, p)?;
+        }
 
         validate_auto_flush_params(params)?;
 
         for (key, val) in params.iter().map(|(k, v)| (k.as_str(), v.as_str())) {
             builder = match key {
+                "addr" => {
+                    // Already handled above; skip all addr entries.
+                    builder
+                }
                 "username" => builder.username(val)?,
                 "password" => builder.password(val)?,
                 "token" => builder.token(val)?,
@@ -601,19 +623,26 @@ impl SenderBuilder {
     /// # fn main() -> Result<()> {
     /// # #[cfg(feature = "sync-sender-tcp")] {
     /// let mut sender = SenderBuilder::new(
-    ///     Protocol::Tcp, "localhost", 9009).build()?;
+    ///     Protocol::Tcp, "localhost", 9009)?.build()?;
     /// # }
     /// # #[cfg(all(not(feature = "sync-sender-tcp"), feature = "sync-sender-http"))] {
     /// let mut sender = SenderBuilder::new(
-    ///     Protocol::Http, "localhost", 9000).build()?;
+    ///     Protocol::Http, "localhost", 9000)?.build()?;
     /// # }
     /// # Ok(())
     /// # }
     /// ```
-    pub fn new<H: Into<String>, P: Into<Port>>(protocol: Protocol, host: H, port: P) -> Self {
+    pub fn new<H: Into<String>, P: Into<Port>>(protocol: Protocol, host: H, port: P) -> Result<Self> {
         let host = host.into();
         let port: Port = port.into();
         let port = port.0;
+
+        if host.is_empty() {
+            return Err(error::fmt!(ConfigError, "Empty host in address"));
+        }
+        if port.is_empty() {
+            return Err(error::fmt!(ConfigError, "Empty port in address"));
+        }
 
         #[cfg(feature = "tls-webpki-certs")]
         let tls_ca = CertificateAuthority::WebpkiRoots;
@@ -624,10 +653,9 @@ impl SenderBuilder {
         #[cfg(not(any(feature = "tls-webpki-certs", feature = "tls-native-certs")))]
         let tls_ca = CertificateAuthority::PemFile;
 
-        Self {
+        Ok(Self {
             protocol,
-            host: ConfigSetting::new_specified(host),
-            port: ConfigSetting::new_specified(port),
+            addresses: vec![(host, port)],
             net_interface: ConfigSetting::new_default(None),
             max_buf_size: ConfigSetting::new_default(100 * 1024 * 1024),
             max_name_len: ConfigSetting::new_default(MAX_NAME_LEN_DEFAULT),
@@ -656,7 +684,7 @@ impl SenderBuilder {
             } else {
                 None
             },
-        }
+        })
     }
 
     /// Select local outbound interface.
@@ -683,6 +711,48 @@ impl SenderBuilder {
                 "The \"bind_interface\" setting can only be used with the TCP protocol."
             ))
         }
+    }
+
+    /// Add an additional address for failover (HTTP/HTTPS only).
+    ///
+    /// When multiple addresses are configured, the sender will rotate through
+    /// them in round-robin fashion when a retriable error occurs during flush.
+    ///
+    /// Multiple addresses are only supported for HTTP/HTTPS protocols.
+    /// TCP is a stateful connection and does not support failover.
+    ///
+    /// ```no_run
+    /// # use questdb::Result;
+    /// use questdb::ingress::{Protocol, SenderBuilder};
+    ///
+    /// # fn main() -> Result<()> {
+    /// # #[cfg(feature = "sync-sender-http")] {
+    /// let mut sender = SenderBuilder::new(Protocol::Http, "host1", 9000)?
+    ///     .address("host2", 9000)?
+    ///     .address("host3", 9000)?
+    ///     .build()?;
+    /// # }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn address<H: Into<String>, P: Into<Port>>(mut self, host: H, port: P) -> Result<Self> {
+        #[cfg(feature = "_sender-tcp")]
+        if self.protocol.is_tcpx() {
+            return Err(error::fmt!(
+                ConfigError,
+                "Multiple addresses are only supported for HTTP/HTTPS protocols."
+            ));
+        }
+        let host = host.into();
+        let port: Port = port.into();
+        if host.is_empty() {
+            return Err(error::fmt!(ConfigError, "Empty host in address"));
+        }
+        if port.0.is_empty() {
+            return Err(error::fmt!(ConfigError, "Empty port in address"));
+        }
+        self.addresses.push((host, port.0));
+        Ok(self)
     }
 
     /// Set the username for authentication.
@@ -1049,7 +1119,17 @@ impl SenderBuilder {
     /// requires authentication or TLS, these will also be completed before
     /// returning.
     pub fn build(&self) -> Result<Sender> {
-        let mut descr = format!("Sender[host={:?},port={:?},", self.host, self.port);
+        let (primary_host, primary_port) = &self.addresses[0];
+        let mut descr = if self.addresses.len() == 1 {
+            format!("Sender[host={primary_host:?},port={primary_port:?},")
+        } else {
+            let addrs: Vec<String> = self
+                .addresses
+                .iter()
+                .map(|(h, p)| format!("{h}:{p}"))
+                .collect();
+            format!("Sender[addresses={addrs:?},")
+        };
 
         if self.protocol.tls_enabled() {
             write!(descr, "tls=enabled,").unwrap();
@@ -1070,11 +1150,11 @@ impl SenderBuilder {
 
         let auth = self.build_auth()?;
 
-        let handler = match self.protocol {
+        let mut handler = match self.protocol {
             #[cfg(feature = "sync-sender-tcp")]
             Protocol::Tcp | Protocol::Tcps => connect_tcp(
-                self.host.as_str(),
-                self.port.as_str(),
+                primary_host.as_str(),
+                primary_port.as_str(),
                 self.net_interface.deref().as_deref(),
                 *self.auth_timeout,
                 tls_settings,
@@ -1094,18 +1174,11 @@ impl SenderBuilder {
 
                 let http_config = self.http.as_ref().unwrap();
                 let user_agent = http_config.user_agent.as_str();
-                let connector = TcpConnector::default();
-
-                let agent_builder = ureq::Agent::config_builder()
-                    .user_agent(user_agent)
-                    .no_delay(true);
 
                 let tls_config = match tls_settings {
                     Some(tls_settings) => Some(tls::configure_tls(tls_settings)?),
                     None => None,
                 };
-
-                let connector = connector.chain(TlsConnector::new(tls_config));
 
                 let auth = match auth {
                     Some(conf::AuthParams::Basic(ref auth)) => Some(auth.to_header_string()),
@@ -1121,24 +1194,47 @@ impl SenderBuilder {
                     }
                     None => None,
                 };
-                let agent_builder = agent_builder
-                    .timeout_connect(Some(*http_config.request_timeout.deref()))
-                    .http_status_as_error(false);
-                let agent = ureq::Agent::with_parts(
-                    agent_builder.build(),
-                    connector,
-                    ureq::unversioned::resolver::DefaultResolver::default(),
-                );
+
                 let proto = self.protocol.schema();
-                let url = format!(
-                    "{}://{}:{}/write",
-                    proto,
-                    self.host.deref(),
-                    self.port.deref()
-                );
+
+                // Build a per-address endpoint for each configured address.
+                let mut endpoints = Vec::with_capacity(self.addresses.len());
+                for (host, port) in &self.addresses {
+                    let connector = TcpConnector::default();
+                    let connector = connector.chain(TlsConnector::new(tls_config.clone()));
+
+                    let agent_builder = ureq::Agent::config_builder()
+                        .user_agent(user_agent)
+                        .no_delay(true)
+                        .timeout_connect(Some(*http_config.request_timeout.deref()))
+                        .http_status_as_error(false);
+                    let agent = ureq::Agent::with_parts(
+                        agent_builder.build(),
+                        connector,
+                        ureq::unversioned::resolver::DefaultResolver::default(),
+                    );
+                    let (url, settings_url) = if host.contains(':') {
+                        // IPv6 literal — needs brackets in URLs
+                        (
+                            format!("{proto}://[{host}]:{port}/write"),
+                            format!("{proto}://[{host}]:{port}/settings"),
+                        )
+                    } else {
+                        (
+                            format!("{proto}://{host}:{port}/write"),
+                            format!("{proto}://{host}:{port}/settings"),
+                        )
+                    };
+                    endpoints.push(HttpEndpoint {
+                        agent,
+                        url,
+                        settings_url,
+                    });
+                }
+
                 SyncProtocolHandler::SyncHttp(SyncHttpHandlerState {
-                    agent,
-                    url,
+                    endpoints,
+                    current_index: 0,
                     auth,
                     config: self.http.as_ref().unwrap().clone(),
                 })
@@ -1156,15 +1252,9 @@ impl SenderBuilder {
                 #[cfg(feature = "sync-sender-http")]
                 Protocol::Http | Protocol::Https => {
                     #[allow(irrefutable_let_patterns)]
-                    if let SyncProtocolHandler::SyncHttp(http_state) = &handler {
-                        let settings_url = &format!(
-                            "{}://{}:{}/settings",
-                            self.protocol.schema(),
-                            self.host.deref(),
-                            self.port.deref()
-                        );
+                    if let SyncProtocolHandler::SyncHttp(ref mut http_state) = handler {
                         let (protocol_versions, server_max_name_len) =
-                            read_server_settings(http_state, settings_url, max_name_len)?;
+                            read_server_settings(http_state, max_name_len)?;
                         max_name_len = server_max_name_len;
                         SUPPORTED_PROTOCOL_VERSIONS
                             .iter()
@@ -1227,6 +1317,65 @@ fn validate_value<T: AsRef<str>>(value: T) -> Result<T> {
         }
     }
     Ok(value)
+}
+
+/// Parse a host:port address string, handling IPv6 bracket notation.
+/// Returns (host, port) or (addr, default_port) if no port separator is found.
+fn split_addr<'a>(addr: &'a str, default_port: &'a str) -> Result<(&'a str, &'a str)> {
+    if let Some(bracketed) = addr.strip_prefix('[') {
+        // IPv6 bracket notation: [::1]:9000
+        match bracketed.split_once("]:") {
+            Some((host, port)) => {
+                let host = host.trim();
+                let port = port.trim();
+                if host.is_empty() {
+                    return Err(error::fmt!(ConfigError, "Empty host in addr: {:?}", addr));
+                }
+                if port.is_empty() {
+                    return Err(error::fmt!(ConfigError, "Empty port in addr: {:?}", addr));
+                }
+                Ok((host, port))
+            }
+            None => {
+                // Bracket with no port: [::1]
+                let host = bracketed.strip_suffix(']').ok_or_else(|| {
+                    error::fmt!(ConfigError, "Unterminated bracket in addr: {:?}", addr)
+                })?;
+                let host = host.trim();
+                if host.is_empty() {
+                    return Err(error::fmt!(ConfigError, "Empty host in addr: {:?}", addr));
+                }
+                Ok((host, default_port))
+            }
+        }
+    } else {
+        // Detect bare IPv6 addresses without brackets (e.g. "::1" or "fe80::1").
+        // These are ambiguous with host:port notation, so require bracket notation.
+        if addr.matches(':').count() > 1 {
+            return Err(error::fmt!(
+                ConfigError,
+                "IPv6 address {:?} must use bracket notation, e.g. [::1] or [::1]:9000",
+                addr
+            ));
+        }
+        match addr.rsplit_once(':') {
+            Some((host, port)) => {
+                if host.is_empty() {
+                    return Err(error::fmt!(ConfigError, "Empty host in addr: {:?}", addr));
+                }
+                if port.is_empty() {
+                    return Err(error::fmt!(ConfigError, "Empty port in addr: {:?}", addr));
+                }
+                Ok((host, port))
+            }
+            None => {
+                if addr.is_empty() {
+                    return Err(error::fmt!(ConfigError, "Empty addr value"));
+                }
+                Ok((addr, default_port))
+            }
+        }
+    }
 }
 
 fn parse_conf_value<T>(param_name: &str, str_value: &str) -> Result<T>

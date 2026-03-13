@@ -10,7 +10,7 @@ crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
 libc = "0.2"
-questdb-confstr-ffi = { version = "0.1.1", optional = true }
+questdb-confstr-ffi = { path = "/home/nick/repos/questdb-confstr-rs/questdb-confstr-ffi", version = "0.2.0", optional = true }
 
 [dependencies.questdb-rs]
 path = "../questdb-rs"

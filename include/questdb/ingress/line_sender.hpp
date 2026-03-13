@@ -802,6 +802,19 @@ public:
     }
 
     /**
+     * Add an additional address for failover (HTTP/HTTPS only).
+     *
+     * When multiple addresses are configured, the sender will rotate
+     * through them in round-robin fashion when a retriable error occurs.
+     */
+    opts& address(utf8_view host, utf8_view port)
+    {
+        line_sender_error::wrapped_call(
+            ::line_sender_opts_address, _impl, host._impl, port._impl);
+        return *this;
+    }
+
+    /**
      * Set the username for authentication.
      *
      * For TCP this is the `kid` part of the ECDSA key set.

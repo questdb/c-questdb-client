@@ -831,6 +831,21 @@ bool line_sender_opts_bind_interface(
     line_sender_error** err_out);
 
 /**
+ * Add an additional address for failover (HTTP/HTTPS only).
+ *
+ * When multiple addresses are configured, the sender will rotate through
+ * them in round-robin fashion when a retriable error occurs during flush.
+ *
+ * Multiple addresses are only supported for HTTP/HTTPS protocols.
+ */
+LINESENDER_API
+bool line_sender_opts_address(
+    line_sender_opts* opts,
+    line_sender_utf8 host,
+    line_sender_utf8 port,
+    line_sender_error** err_out);
+
+/**
  * Set the username for authentication.
  *
  * For TCP, this is the `kid` part of the ECDSA key set.
