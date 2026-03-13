@@ -39,7 +39,7 @@ use std::io::Write;
 use crate::ingress::map_io_to_socket_err;
 
 #[cfg(feature = "sync-sender-http")]
-mod http;
+pub(crate) mod http;
 
 #[cfg(feature = "sync-sender-http")]
 pub(crate) use http::*;

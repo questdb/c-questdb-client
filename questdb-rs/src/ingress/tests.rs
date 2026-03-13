@@ -1013,3 +1013,23 @@ fn multi_url_bare_ipv6_full_rejected() {
         err.msg()
     );
 }
+
+#[test]
+fn multi_url_address_rejects_empty_host() {
+    let result = SenderBuilder::new(Protocol::Http, "localhost", "9000")
+        .address("", "9001");
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ConfigError);
+    assert!(err.msg().contains("Empty host"));
+}
+
+#[test]
+fn multi_url_address_rejects_empty_port() {
+    let result = SenderBuilder::new(Protocol::Http, "localhost", "9000")
+        .address("host2", "");
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ConfigError);
+    assert!(err.msg().contains("Empty port"));
+}

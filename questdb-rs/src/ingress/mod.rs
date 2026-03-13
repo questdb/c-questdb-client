@@ -49,7 +49,7 @@ use ring::{
     signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair},
 };
 
-mod conf;
+pub(crate) mod conf;
 
 pub(crate) mod ndarr;
 
@@ -58,7 +58,7 @@ mod timestamp;
 mod buffer;
 pub use buffer::*;
 
-mod sender;
+pub(crate) mod sender;
 pub use sender::*;
 
 mod decimal;
@@ -738,6 +738,12 @@ impl SenderBuilder {
         }
         let host = host.into();
         let port: Port = port.into();
+        if host.is_empty() {
+            return Err(error::fmt!(ConfigError, "Empty host in address"));
+        }
+        if port.0.is_empty() {
+            return Err(error::fmt!(ConfigError, "Empty port in address"));
+        }
         self.addresses.push((host, port.0));
         Ok(self)
     }
@@ -1200,8 +1206,18 @@ impl SenderBuilder {
                         connector,
                         ureq::unversioned::resolver::DefaultResolver::default(),
                     );
-                    let url = format!("{proto}://{host}:{port}/write");
-                    let settings_url = format!("{proto}://{host}:{port}/settings");
+                    let (url, settings_url) = if host.contains(':') {
+                        // IPv6 literal — needs brackets in URLs
+                        (
+                            format!("{proto}://[{host}]:{port}/write"),
+                            format!("{proto}://[{host}]:{port}/settings"),
+                        )
+                    } else {
+                        (
+                            format!("{proto}://{host}:{port}/write"),
+                            format!("{proto}://{host}:{port}/settings"),
+                        )
+                    };
                     endpoints.push(HttpEndpoint {
                         agent,
                         url,

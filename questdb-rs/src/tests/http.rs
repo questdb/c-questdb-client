@@ -1867,3 +1867,101 @@ fn test_buffer_protocol_version1_not_support_array() -> TestResult {
     );
     Ok(())
 }
+
+// --- Rotation unit tests (moved from ingress/sender/http.rs) ---
+
+mod rotation {
+    use crate::ingress::conf;
+    use crate::ingress::sender::http::{HttpEndpoint, SyncHttpHandlerState};
+
+    fn make_dummy_agent() -> ureq::Agent {
+        ureq::Agent::new_with_defaults()
+    }
+
+    fn make_endpoint(host: &str, port: u16) -> HttpEndpoint {
+        HttpEndpoint {
+            agent: make_dummy_agent(),
+            url: format!("http://{host}:{port}/write"),
+            settings_url: format!("http://{host}:{port}/settings"),
+        }
+    }
+
+    fn make_state(hosts: &[(&str, u16)]) -> SyncHttpHandlerState {
+        let endpoints: Vec<HttpEndpoint> = hosts
+            .iter()
+            .map(|(h, p)| make_endpoint(h, *p))
+            .collect();
+        SyncHttpHandlerState {
+            endpoints,
+            current_index: 0,
+            auth: None,
+            config: conf::HttpConfig::default(),
+        }
+    }
+
+    #[test]
+    fn rotation_single_endpoint_no_op() {
+        let mut state = make_state(&[("host1", 9000)]);
+        assert_eq!(state.current_index, 0);
+        assert_eq!(state.current_endpoint().url, "http://host1:9000/write");
+        state.rotate();
+        assert_eq!(state.current_index, 0);
+        assert_eq!(state.current_endpoint().url, "http://host1:9000/write");
+    }
+
+    #[test]
+    fn rotation_round_robin_three() {
+        let mut state = make_state(&[("host1", 9000), ("host2", 9001), ("host3", 9002)]);
+
+        assert_eq!(state.current_endpoint().url, "http://host1:9000/write");
+        state.rotate();
+        assert_eq!(state.current_endpoint().url, "http://host2:9001/write");
+        state.rotate();
+        assert_eq!(state.current_endpoint().url, "http://host3:9002/write");
+        state.rotate();
+        assert_eq!(state.current_endpoint().url, "http://host1:9000/write");
+        state.rotate();
+        assert_eq!(state.current_endpoint().url, "http://host2:9001/write");
+    }
+
+    #[test]
+    fn rotation_two_endpoints_alternates() {
+        let mut state = make_state(&[("a", 1), ("b", 2)]);
+
+        for _ in 0..10 {
+            assert_eq!(state.current_index, 0);
+            state.rotate();
+            assert_eq!(state.current_index, 1);
+            state.rotate();
+        }
+    }
+
+    #[test]
+    fn rotation_wraps_at_boundary() {
+        let mut state = make_state(&[("a", 1), ("b", 2), ("c", 3), ("d", 4), ("e", 5)]);
+        for i in 0..25 {
+            assert_eq!(state.current_index, i % 5);
+            state.rotate();
+        }
+    }
+
+    #[test]
+    fn current_endpoint_returns_correct_endpoint() {
+        let state = make_state(&[("first", 1000), ("second", 2000), ("third", 3000)]);
+        assert_eq!(state.current_endpoint().url, "http://first:1000/write");
+        assert_eq!(
+            state.current_endpoint().settings_url,
+            "http://first:1000/settings"
+        );
+    }
+
+    #[test]
+    fn rotation_after_manual_index_set() {
+        let mut state = make_state(&[("a", 1), ("b", 2), ("c", 3)]);
+        state.current_index = 2;
+        state.rotate();
+        assert_eq!(state.current_index, 0); // wraps from 2 -> 0
+        state.rotate();
+        assert_eq!(state.current_index, 1);
+    }
+}
