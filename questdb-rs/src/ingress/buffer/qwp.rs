@@ -286,7 +286,10 @@ impl QwpSizeHint {
 
         if same_group {
             let previous_len = self.planner.current_len;
-            match self.planner.add_row(row, row_entries, name_bytes, value_bytes, table_name.len()) {
+            match self
+                .planner
+                .add_row(row, row_entries, name_bytes, value_bytes, table_name.len())
+            {
                 Ok(()) => {
                     let new_len = self.planner.current_len;
                     self.committed_len = self.committed_len - previous_len + new_len;
@@ -498,7 +501,11 @@ impl QwpBuffer {
             let start = segment.row_start as usize;
             for i in 0..segment.row_count as usize {
                 let row = &self.rows[start + i];
-                let last_seg_table = if i == 0 { prev_seg_table } else { Some(segment.table) };
+                let last_seg_table = if i == 0 {
+                    prev_seg_table
+                } else {
+                    Some(segment.table)
+                };
                 let _ = self.size_hint.add_committed_row(
                     row,
                     &self.entries,
@@ -567,8 +574,7 @@ impl QwpBuffer {
     }
 
     fn name_str(&self, ns: NameSlice) -> &str {
-        std::str::from_utf8(&self.name_bytes[ns.0.as_range()])
-            .expect("name must be valid UTF-8")
+        std::str::from_utf8(&self.name_bytes[ns.0.as_range()]).expect("name must be valid UTF-8")
     }
 
     fn rollback_pending(&mut self) {
@@ -1061,7 +1067,6 @@ impl QwpSendScratch {
     }
 }
 
-
 /// Synthetic designated-timestamp entry used when iterating row specs.
 /// The empty column name is represented as a zero-length NameSlice.
 const DESIGNATED_TS_NAME: NameSlice = NameSlice(ByteSlice { offset: 0, len: 0 });
@@ -1075,7 +1080,6 @@ fn designated_ts_entry(ts: DesignatedTs) -> EntryMeta {
         },
     }
 }
-
 
 // --- Symbol dictionary entry (flat arena, linked per column) ---
 
@@ -1222,10 +1226,8 @@ impl ColumnStats {
 
     fn is_nullable(&self, row_count: usize) -> bool {
         self.base_nullable
-            || (kind_supports_sparse_nulls(self.kind)
-                && (self.non_null_count as usize) < row_count)
+            || (kind_supports_sparse_nulls(self.kind) && (self.non_null_count as usize) < row_count)
     }
-
 }
 
 // --- Checkpoint types ---
@@ -1654,7 +1656,14 @@ fn encode_row_group_from_scratch(
 
     // Column payloads
     for col in &planner.columns {
-        encode_column_from_cells(col, row_count, &planner.cells, &planner.symbol_dict, value_bytes, out)?;
+        encode_column_from_cells(
+            col,
+            row_count,
+            &planner.cells,
+            &planner.symbol_dict,
+            value_bytes,
+            out,
+        )?;
     }
 
     // Fill header
@@ -1678,7 +1687,10 @@ struct CellIter<'a> {
 
 impl<'a> CellIter<'a> {
     fn new(cells: &'a [CellRef], head: u32) -> Self {
-        Self { cells, cursor: head }
+        Self {
+            cells,
+            cursor: head,
+        }
     }
 }
 
@@ -2047,7 +2059,13 @@ mod tests {
             for row in rows {
                 let row_entries = buf.entries_for_row(row);
                 planner
-                    .add_row(row, row_entries, &buf.name_bytes, &buf.value_bytes, table_name.len())
+                    .add_row(
+                        row,
+                        row_entries,
+                        &buf.name_bytes,
+                        &buf.value_bytes,
+                        table_name.len(),
+                    )
                     .unwrap();
             }
             let estimated = planner.current_len;
@@ -2087,7 +2105,13 @@ mod tests {
             for row in rows {
                 let row_entries = buf.entries_for_row(row);
                 planner
-                    .add_row(row, row_entries, &buf.name_bytes, &buf.value_bytes, table_name.len())
+                    .add_row(
+                        row,
+                        row_entries,
+                        &buf.name_bytes,
+                        &buf.value_bytes,
+                        table_name.len(),
+                    )
                     .unwrap();
             }
             let estimated = planner.current_len;
@@ -2380,7 +2404,10 @@ mod tests {
 
         buf.clear();
         let cap_after = buf.capacity();
-        assert_eq!(cap_before, cap_after, "capacity must not drop after clear()");
+        assert_eq!(
+            cap_before, cap_after,
+            "capacity must not drop after clear()"
+        );
 
         // Refill
         for i in 0..10 {
@@ -2589,10 +2616,7 @@ mod tests {
         let mut buf = QwpBuffer::new(127);
 
         // Row 1: only "x"
-        buf.table("t")
-            .unwrap()
-            .column_i64("x", 1)
-            .unwrap();
+        buf.table("t").unwrap().column_i64("x", 1).unwrap();
         buf.at_now().unwrap();
 
         // Row 2: "x" and "y" (introduces new column)
@@ -2668,7 +2692,10 @@ mod tests {
         buf.clear();
 
         // Capacity should be stable
-        assert!(buf.capacity() <= cap * 2, "capacity should not grow unboundedly");
+        assert!(
+            buf.capacity() <= cap * 2,
+            "capacity should not grow unboundedly"
+        );
     }
 
     #[test]
@@ -2738,8 +2765,7 @@ mod tests {
         // Verify each datagram is valid (starts with QWP1 header)
         for d in &datagrams {
             assert_eq!(&d[0..4], b"QWP1");
-            let payload_len =
-                u32::from_le_bytes([d[8], d[9], d[10], d[11]]) as usize;
+            let payload_len = u32::from_le_bytes([d[8], d[9], d[10], d[11]]) as usize;
             assert_eq!(payload_len, d.len() - QWP_MESSAGE_HEADER_SIZE);
         }
 
