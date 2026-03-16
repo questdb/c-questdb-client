@@ -128,6 +128,8 @@ stages:
           - template: compile.yaml
           - script: |
               git clone --depth 1 --branch $(QUESTDB_SERVER_BRANCH) https://github.com/questdb/questdb.git
+              cd questdb
+              git submodule update --init --depth 1 java-questdb-client
             displayName: git clone questdb
           - task: Maven@3
             displayName: "Compile QuestDB"
