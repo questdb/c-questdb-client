@@ -32,6 +32,8 @@ static bool example(const char* host, const char* port, const char* table)
         goto on_error;
 
     buffer = line_sender_buffer_new_for_sender(sender);
+    if (!buffer)
+        goto on_error;
 
     line_sender_table_name table_name = {0, NULL};
     if (!line_sender_table_name_init(&table_name, strlen(table), table, &err))
@@ -67,11 +69,14 @@ static bool example(const char* host, const char* port, const char* table)
     line_sender_close(sender);
     return true;
 
-on_error:;
-    size_t err_len = 0;
-    const char* err_msg = line_sender_error_msg(err, &err_len);
-    fprintf(stderr, "Error running example: %.*s\n", (int)err_len, err_msg);
-    line_sender_error_free(err);
+on_error:
+    if (err)
+    {
+        size_t err_len = 0;
+        const char* err_msg = line_sender_error_msg(err, &err_len);
+        fprintf(stderr, "Error running example: %.*s\n", (int)err_len, err_msg);
+        line_sender_error_free(err);
+    }
     line_sender_buffer_free(buffer);
     line_sender_close(sender);
     return false;

@@ -89,7 +89,7 @@ impl<'a> Decoder<'a> {
     }
 
     fn read_exact(&mut self, len: usize) -> Result<&'a [u8], String> {
-        if self.pos + len > self.bytes.len() {
+        if len > self.bytes.len() - self.pos {
             return Err(format!(
                 "unexpected end of datagram: need {} bytes, have {}",
                 len,

@@ -891,6 +891,13 @@ impl QwpBuffer {
     /// Test-only helper that collects datagrams into a Vec.
     #[cfg(test)]
     fn encode_datagrams(&self, max_datagram_size: usize) -> crate::Result<Vec<Vec<u8>>> {
+        if self.pending.table.is_some() {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "Cannot flush with an incomplete row. \
+                 Call `at` or `at_now` to complete the pending row."
+            ));
+        }
         let mut datagrams = Vec::new();
         let mut planner = RowGroupPlanner::new();
         let mut datagram_buf = Vec::new();
@@ -977,6 +984,13 @@ impl QwpBuffer {
         max_datagram_size: usize,
         send: &mut dyn FnMut(&[u8]) -> crate::Result<()>,
     ) -> crate::Result<()> {
+        if self.pending.table.is_some() {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "Cannot flush with an incomplete row. \
+                 Call `at` or `at_now` to complete the pending row."
+            ));
+        }
         for segment in &self.segments {
             let rows = self.rows_for_segment(segment);
             let table_name = &self.name_bytes[segment.table.0.as_range()];

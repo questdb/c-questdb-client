@@ -68,7 +68,8 @@ public:
             raw_buffer,
             protocol_version::v1,
             init_buf_size,
-            max_name_len};
+            max_name_len,
+            true};
     }
 
     line_sender_buffer(const line_sender_buffer& other) noexcept
@@ -76,6 +77,7 @@ public:
         , _protocol_version{other._protocol_version}
         , _init_buf_size{other._init_buf_size}
         , _max_name_len{other._max_name_len}
+        , _is_qwp{other._is_qwp}
 
     {
     }
@@ -85,6 +87,7 @@ public:
         , _protocol_version{other._protocol_version}
         , _init_buf_size{other._init_buf_size}
         , _max_name_len{other._max_name_len}
+        , _is_qwp{other._is_qwp}
 
     {
         other._impl = nullptr;
@@ -102,6 +105,7 @@ public:
             _init_buf_size = other._init_buf_size;
             _max_name_len = other._max_name_len;
             _protocol_version = other._protocol_version;
+            _is_qwp = other._is_qwp;
         }
         return *this;
     }
@@ -115,6 +119,7 @@ public:
             _init_buf_size = other._init_buf_size;
             _max_name_len = other._max_name_len;
             _protocol_version = other._protocol_version;
+            _is_qwp = other._is_qwp;
             other._impl = nullptr;
         }
         return *this;
@@ -704,11 +709,13 @@ private:
         ::line_sender_buffer* impl,
         protocol_version version,
         size_t init_buf_size,
-        size_t max_name_len) noexcept
+        size_t max_name_len,
+        bool is_qwp = false) noexcept
         : _impl{impl}
         , _protocol_version{version}
         , _init_buf_size{init_buf_size}
         , _max_name_len{max_name_len}
+        , _is_qwp{is_qwp}
     {
     }
 
@@ -716,10 +723,19 @@ private:
     {
         if (!_impl)
         {
-            _impl = ::line_sender_buffer_with_max_name_len(
-                static_cast<::line_sender_protocol_version>(
-                    static_cast<int>(_protocol_version)),
-                _max_name_len);
+            if (_is_qwp)
+            {
+                _impl =
+                    ::line_sender_buffer_new_qwp_with_max_name_len(
+                        _max_name_len);
+            }
+            else
+            {
+                _impl = ::line_sender_buffer_with_max_name_len(
+                    static_cast<::line_sender_protocol_version>(
+                        static_cast<int>(_protocol_version)),
+                    _max_name_len);
+            }
             ::line_sender_buffer_reserve(_impl, _init_buf_size);
         }
     }
@@ -728,6 +744,7 @@ private:
     protocol_version _protocol_version;
     size_t _init_buf_size;
     size_t _max_name_len;
+    bool _is_qwp{false};
 
     friend class line_sender;
 };
@@ -1211,7 +1228,7 @@ public:
      * `protocol()`. Do not use this value to construct QWP/UDP buffers; use
      * `new_buffer()` instead.
      */
-    questdb::ingress::protocol_version protocol_version() const noexcept
+    questdb::ingress::protocol_version protocol_version() const
     {
         ensure_impl();
         return static_cast<enum protocol_version>(
@@ -1225,18 +1242,20 @@ public:
      * different buffer implementation than `line_sender_buffer{protocol_version()}`
      * when the sender uses QWP-over-UDP.
      */
-    line_sender_buffer new_buffer(size_t init_buf_size = 64 * 1024) noexcept
+    line_sender_buffer new_buffer(size_t init_buf_size = 64 * 1024)
     {
         ensure_impl();
         auto version = this->protocol_version();
         auto max_name_len = ::line_sender_get_max_name_len(_impl);
         auto* raw_buffer = ::line_sender_buffer_new_for_sender(_impl);
         ::line_sender_buffer_reserve(raw_buffer, init_buf_size);
+        bool is_qwp = this->protocol() == protocol::qwpudp;
         return line_sender_buffer{
             raw_buffer,
             version,
             init_buf_size,
-            max_name_len};
+            max_name_len,
+            is_qwp};
     }
 
     /**

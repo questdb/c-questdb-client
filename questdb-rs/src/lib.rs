@@ -25,7 +25,7 @@
 
 mod error;
 
-#[cfg(feature = "sync-sender-tcp")]
+#[cfg(any(feature = "sync-sender-tcp", feature = "sync-sender-qwp-udp"))]
 mod gai;
 
 pub mod ingress;

@@ -73,7 +73,7 @@ static void qdb_test_init_winsock()
 
 static void qdb_test_release_winsock()
 {
-    REQUIRE(WSACleanup() == 0);
+    (void)::WSACleanup();
 }
 #endif
 

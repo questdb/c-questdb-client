@@ -826,6 +826,12 @@ impl SenderBuilder {
                 "\"max_datagram_size\" must be greater than 0."
             ));
         }
+        if value > 65507 {
+            return Err(error::fmt!(
+                ConfigError,
+                "\"max_datagram_size\" must not exceed 65507 (UDP/IPv4 limit)."
+            ));
+        }
         let Some(qwp_udp) = &mut self.qwp_udp else {
             return Err(error::fmt!(
                 ConfigError,

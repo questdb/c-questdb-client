@@ -23,10 +23,11 @@
  ******************************************************************************/
 
 use crate::error;
+use crate::gai;
 use crate::ingress::SyncProtocolHandler;
 use crate::ingress::buffer::{QwpBuffer, QwpSendScratch};
 use crate::ingress::conf::QwpUdpConfig;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 
 pub(crate) struct SyncQwpUdpHandlerState {
     pub(crate) socket: UdpSocket,
@@ -38,54 +39,28 @@ pub(crate) struct SyncQwpUdpHandlerState {
 }
 
 fn resolve_udp_target(host: &str, port: &str) -> crate::Result<SocketAddrV4> {
-    let host_port = format!("{host}:{port}");
-    let addrs = host_port.to_socket_addrs().map_err(|io_err| {
+    let sock_addr = gai::resolve_host_port(host, port)?;
+    let addr = sock_addr.as_socket_ipv4().ok_or_else(|| {
         error::fmt!(
             CouldNotResolveAddr,
-            "Could not resolve {:?}: {}",
-            host_port,
-            io_err
+            "Could not resolve {:?}:{:?}: no IPv4 address found",
+            host,
+            port
         )
     })?;
-
-    addrs
-        .filter_map(|addr| match addr {
-            SocketAddr::V4(addr) => Some(addr),
-            SocketAddr::V6(_) => None,
-        })
-        .next()
-        .ok_or_else(|| {
-            error::fmt!(
-                CouldNotResolveAddr,
-                "Could not resolve {:?}: no IPv4 address found",
-                host_port
-            )
-        })
+    Ok(addr)
 }
 
 fn resolve_bind_addr(net_interface: &str) -> crate::Result<SocketAddrV4> {
-    let addrs = (net_interface, 0u16).to_socket_addrs().map_err(|io_err| {
+    let sock_addr = gai::resolve_host(net_interface)?;
+    let addr = sock_addr.as_socket_ipv4().ok_or_else(|| {
         error::fmt!(
             CouldNotResolveAddr,
-            "Could not resolve interface address {:?}: {}",
-            net_interface,
-            io_err
+            "Could not resolve interface address {:?}: no IPv4 address found",
+            net_interface
         )
     })?;
-
-    addrs
-        .filter_map(|addr| match addr {
-            SocketAddr::V4(addr) => Some(addr),
-            SocketAddr::V6(_) => None,
-        })
-        .next()
-        .ok_or_else(|| {
-            error::fmt!(
-                CouldNotResolveAddr,
-                "Could not resolve interface address {:?}: no IPv4 address found",
-                net_interface
-            )
-        })
+    Ok(SocketAddrV4::new(*addr.ip(), 0))
 }
 
 pub(crate) fn connect_qwp_udp(

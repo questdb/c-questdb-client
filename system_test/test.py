@@ -1243,9 +1243,10 @@ class TestQwpUdpSender(unittest.TestCase):
 
     @staticmethod
     def _micros_to_qdb_date(timestamp_us):
+        secs, remaining_us = divmod(timestamp_us, 1_000_000)
         return datetime.datetime.fromtimestamp(
-            timestamp_us / 1_000_000.0,
-            datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+            secs, datetime.timezone.utc).replace(
+            microsecond=remaining_us).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
 
     def _require_qwp_udp_system_test(self):
         # TODO: Remove this repo-only gate once QWP/UDP receiver support is
