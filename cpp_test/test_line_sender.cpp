@@ -143,10 +143,10 @@ public:
         FD_ZERO(&read_set);
         FD_SET(_socket, &read_set);
 
-        const auto secs = static_cast<long>(wait_timeout_sec);
-        const auto micros = static_cast<long>(
-            1000000.0 * (wait_timeout_sec - static_cast<double>(secs)));
-        timeval timeout{secs, micros};
+        timeval timeout{};
+        timeout.tv_sec = static_cast<decltype(timeout.tv_sec)>(wait_timeout_sec);
+        timeout.tv_usec = static_cast<decltype(timeout.tv_usec)>(
+            1000000.0 * (wait_timeout_sec - static_cast<double>(timeout.tv_sec)));
         const int nfds = static_cast<int>(_socket) + 1;
         const int ready =
             ::select(nfds, &read_set, nullptr, nullptr, &timeout);
