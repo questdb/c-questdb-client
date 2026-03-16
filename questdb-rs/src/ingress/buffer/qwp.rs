@@ -26,9 +26,7 @@ use crate::error;
 use crate::ingress::decimal::DecimalView;
 use crate::ingress::{ArrayElement, NdArrayView, Timestamp};
 use crate::{Error, ErrorCode};
-use std::collections::{HashMap, HashSet};
-use std::fmt::{Debug, Formatter};
-use std::hash::{DefaultHasher, Hash, Hasher};
+use std::fmt::Debug;
 
 use super::ilp::{ColumnName, TableName};
 
@@ -43,7 +41,134 @@ pub(crate) const QWP_TYPE_TIMESTAMP: u8 = 0x0A;
 pub(crate) const QWP_TYPE_TIMESTAMP_NANOS: u8 = 0x10;
 pub(crate) const QWP_TYPE_NULLABLE_FLAG: u8 = 0x80;
 pub(crate) const QWP_VERSION_1: u8 = 1;
-pub(crate) const QWP_DESIGNATED_TIMESTAMP_COLUMN_NAME: &str = "";
+// --- Arena slice types ---
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ByteSlice {
+    offset: u32,
+    len: u32,
+}
+
+impl ByteSlice {
+    fn as_range(&self) -> std::ops::Range<usize> {
+        self.offset as usize..(self.offset as usize + self.len as usize)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NameSlice(ByteSlice);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ValueSlice(ByteSlice);
+
+// --- Column kind ---
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ColumnKind {
+    Bool,
+    Symbol,
+    I64,
+    F64,
+    String,
+    TimestampMicros,
+    TimestampNanos,
+}
+
+// --- Designated timestamp ---
+
+#[derive(Clone, Copy, Debug)]
+enum DesignatedTs {
+    Micros(i64),
+    Nanos(i64),
+}
+
+// --- Value reference into arenas ---
+
+#[derive(Clone, Copy, Debug)]
+enum ValueRef {
+    Bool(bool),
+    I64(i64),
+    F64(f64),
+    TimestampMicros(i64),
+    TimestampNanos(i64),
+    Symbol(ValueSlice),
+    String(ValueSlice),
+}
+
+impl ValueRef {
+    fn kind(&self) -> ColumnKind {
+        match self {
+            ValueRef::Bool(_) => ColumnKind::Bool,
+            ValueRef::I64(_) => ColumnKind::I64,
+            ValueRef::F64(_) => ColumnKind::F64,
+            ValueRef::TimestampMicros(_) => ColumnKind::TimestampMicros,
+            ValueRef::TimestampNanos(_) => ColumnKind::TimestampNanos,
+            ValueRef::Symbol(_) => ColumnKind::Symbol,
+            ValueRef::String(_) => ColumnKind::String,
+        }
+    }
+}
+
+// --- Cell reference (planner scratch) ---
+
+const CELL_END: u32 = u32::MAX;
+
+#[derive(Clone, Copy, Debug)]
+struct CellRef {
+    row_idx: u16,
+    /// Pre-computed symbol dictionary index; unused for non-symbol columns.
+    symbol_dict_idx: u16,
+    next: u32,
+    value: ValueRef,
+}
+
+// --- Row and entry metadata ---
+
+#[derive(Clone, Copy, Debug)]
+struct RowMeta {
+    table: NameSlice,
+    entry_start: u32,
+    entry_count: u32,
+    designated_ts: Option<DesignatedTs>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct EntryMeta {
+    name: NameSlice,
+    value: ValueRef,
+}
+
+// --- Segment metadata ---
+
+#[derive(Clone, Copy, Debug)]
+struct SegmentMeta {
+    table: NameSlice,
+    row_start: u32,
+    row_count: u32,
+}
+
+// --- Pending row state ---
+
+#[derive(Clone, Copy, Debug)]
+struct PendingRowState {
+    table: Option<NameSlice>,
+    entry_start: u32,
+    name_bytes_start: u32,
+    value_bytes_start: u32,
+}
+
+impl PendingRowState {
+    fn empty() -> Self {
+        Self {
+            table: None,
+            entry_start: 0,
+            name_bytes_start: 0,
+            value_bytes_start: 0,
+        }
+    }
+}
+
+// --- Op state machine ---
 
 #[derive(Debug, Copy, Clone)]
 enum Op {
@@ -87,11 +212,13 @@ impl OpCase {
     }
 }
 
-#[derive(Clone)]
+// --- Buffer state ---
+
+#[derive(Clone, Copy, Debug)]
 struct BufferState {
     op_case: OpCase,
     row_count: usize,
-    first_table_name: Option<String>,
+    first_table_name: Option<NameSlice>,
     transactional: bool,
 }
 
@@ -106,158 +233,150 @@ impl BufferState {
     }
 }
 
+// --- Size hint ---
+
 #[derive(Clone, Debug)]
 struct QwpSizeHint {
     committed_len: usize,
-    active_group: Option<RowGroupEstimator>,
+    planner: RowGroupPlanner,
+    group_table: Option<NameSlice>,
 }
 
 impl QwpSizeHint {
     fn new() -> Self {
         Self {
             committed_len: 0,
-            active_group: None,
+            planner: RowGroupPlanner::new_stats_only(),
+            group_table: None,
         }
+    }
+
+    fn clear(&mut self) {
+        self.committed_len = 0;
+        self.planner.clear();
+        self.group_table = None;
     }
 
     fn len(&self) -> usize {
         self.committed_len
     }
 
-    fn add_committed_row(&mut self, row: &CommittedRow) -> crate::Result<()> {
-        let specs = row_value_specs(row);
-        if let Some(group) = self.active_group.as_mut()
-            && group.table_name == row.table_name
-        {
-            let previous_len = group.current_len();
-            let new_len = match group.estimate_len_with_specs(&specs) {
-                Ok(new_len) => new_len,
+    fn add_committed_row(
+        &mut self,
+        row: &RowMeta,
+        entries: &[EntryMeta],
+        name_bytes: &[u8],
+        value_bytes: &[u8],
+        last_segment_table: Option<NameSlice>,
+    ) -> crate::Result<()> {
+        let table_name = &name_bytes[row.table.0.as_range()];
+        let same_group = if let Some(group_table) = self.group_table {
+            if let Some(seg_table) = last_segment_table {
+                &name_bytes[group_table.0.as_range()] == table_name
+                    && &name_bytes[seg_table.0.as_range()] == table_name
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        let row_entries =
+            &entries[row.entry_start as usize..(row.entry_start + row.entry_count) as usize];
+
+        if same_group {
+            let previous_len = self.planner.current_len;
+            match self.planner.add_row(row, row_entries, name_bytes, value_bytes, table_name.len()) {
+                Ok(()) => {
+                    let new_len = self.planner.current_len;
+                    self.committed_len = self.committed_len - previous_len + new_len;
+                }
                 Err(err) if is_batched_type_change_error(&err) => {
-                    self.committed_len += standalone_row_group_len(row);
-                    self.active_group = None;
-                    return Ok(());
+                    self.committed_len +=
+                        standalone_row_group_len(row, row_entries, name_bytes, value_bytes);
+                    self.planner.clear();
+                    self.group_table = None;
                 }
                 Err(err) => return Err(err),
-            };
-            group.add_row_with_specs(&specs, new_len)?;
-            self.committed_len = self.committed_len - previous_len + new_len;
+            }
             return Ok(());
         }
 
-        let mut group = RowGroupEstimator::new(&row.table_name);
-        let new_len = group.estimate_len_with_specs(&specs)?;
-        group.add_row_with_specs(&specs, new_len)?;
-        self.committed_len += new_len;
-        self.active_group = Some(group);
+        self.planner.clear();
+        self.planner
+            .add_row(row, row_entries, name_bytes, value_bytes, table_name.len())?;
+        self.committed_len += self.planner.current_len;
+        self.group_table = Some(row.table);
         Ok(())
     }
 }
 
-impl Debug for BufferState {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BufferState")
-            .field("op_case", &self.op_case)
-            .field("row_count", &self.row_count)
-            .field("first_table_name", &self.first_table_name)
-            .field("transactional", &self.transactional)
-            .finish()
-    }
-}
+// --- Marker ---
+// Design doc proposes snapshotting QwpSizeHint here, but that would clone
+// the planner's Vecs on every set_marker(). Instead we store only scalar
+// arena lengths and recompute the size hint from committed rows on rewind.
+// The O(rows) replay cost on rewind_to_marker is acceptable since marker
+// rewind is not a steady-state hot path.
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 struct QwpMarker {
-    row_count: usize,
+    rows_len: u32,
+    entries_len: u32,
+    segments_len: u32,
+    tail_segment_row_count: Option<u32>,
+    name_bytes_len: u32,
+    value_bytes_len: u32,
     state: BufferState,
-    size_hint: QwpSizeHint,
 }
 
-#[derive(Clone, Debug)]
+// --- QwpBuffer ---
+
+#[derive(Debug)]
 pub(crate) struct QwpBuffer {
-    rows: Vec<CommittedRow>,
-    pending_row: Option<PendingRow>,
+    name_bytes: Vec<u8>,
+    value_bytes: Vec<u8>,
+    rows: Vec<RowMeta>,
+    entries: Vec<EntryMeta>,
+    segments: Vec<SegmentMeta>,
+    pending: PendingRowState,
     state: BufferState,
     size_hint: QwpSizeHint,
     marker: Option<QwpMarker>,
     max_name_len: usize,
 }
 
-#[derive(Clone, Debug)]
-struct PendingRow {
-    table_name: String,
-    entries: Vec<PendingEntry>,
-    seen_name_hashes: HashSet<u64>,
-}
-
-#[derive(Clone, Debug)]
-struct CommittedRow {
-    table_name: String,
-    entries: Vec<PendingEntry>,
-    designated_ts: Option<PendingTimestamp>,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct RowValueSpec<'a> {
-    name: &'a str,
-    value: ColumnValueRef<'a>,
-    kind: ColumnKind,
-}
-
-#[derive(Clone, Debug)]
-struct PendingEntry {
-    name: String,
-    value: PendingValue,
-}
-
-#[derive(Clone, Debug)]
-enum PendingValue {
-    Bool(bool),
-    Symbol(String),
-    I64(i64),
-    F64(f64),
-    String(String),
-    Timestamp(PendingTimestamp),
-}
-
-#[derive(Clone, Copy, Debug)]
-struct PendingTimestamp {
-    value: i64,
-    nanos: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ColumnKind {
-    Bool,
-    Symbol,
-    I64,
-    F64,
-    String,
-    TimestampMicros,
-    TimestampNanos,
-}
-
-#[derive(Debug)]
-struct BatchColumn<'a> {
-    name: String,
-    kind: ColumnKind,
-    nullable: bool,
-    values: Vec<Option<ColumnValueRef<'a>>>,
-}
-
-#[derive(Clone, Copy, Debug)]
-enum ColumnValueRef<'a> {
-    Bool(bool),
-    Symbol(&'a str),
-    I64(i64),
-    F64(f64),
-    String(&'a str),
-    Timestamp(i64),
+impl Clone for QwpBuffer {
+    fn clone(&self) -> Self {
+        // Copy only live data, not spare capacity
+        let name_bytes = self.name_bytes[..].to_vec();
+        let value_bytes = self.value_bytes[..].to_vec();
+        let rows = self.rows[..].to_vec();
+        let entries = self.entries[..].to_vec();
+        let segments = self.segments[..].to_vec();
+        Self {
+            name_bytes,
+            value_bytes,
+            rows,
+            entries,
+            segments,
+            pending: self.pending,
+            state: self.state,
+            size_hint: self.size_hint.clone(),
+            marker: self.marker,
+            max_name_len: self.max_name_len,
+        }
+    }
 }
 
 impl QwpBuffer {
     pub(crate) fn new(max_name_len: usize) -> Self {
         Self {
+            name_bytes: Vec::new(),
+            value_bytes: Vec::new(),
             rows: Vec::new(),
-            pending_row: None,
+            entries: Vec::new(),
+            segments: Vec::new(),
+            pending: PendingRowState::empty(),
             state: BufferState::new(),
             size_hint: QwpSizeHint::new(),
             marker: None,
@@ -265,7 +384,20 @@ impl QwpBuffer {
         }
     }
 
-    pub(crate) fn reserve(&mut self, _additional: usize) {}
+    pub(crate) fn reserve(&mut self, additional: usize) {
+        // Conservative worst-case: the minimum encoded schema contribution
+        // per column-entry is ~3 bytes (1-byte name varint + 1-byte name +
+        // 1-byte type). Assume 1 entry per row for the row bound.
+        // Multi-row packed-bool groups can still undercount rows, but the
+        // first flush cycle's retained capacity covers that gap.
+        let max_entries = additional / 3;
+        let max_rows = max_entries;
+        self.name_bytes.reserve(additional);
+        self.value_bytes.reserve(additional);
+        self.rows.reserve(max_rows.max(1));
+        self.entries.reserve(max_entries.max(1));
+        self.segments.reserve((max_rows / 4).max(1));
+    }
 
     pub(crate) fn len(&self) -> usize {
         self.size_hint.len() + self.pending_size_hint()
@@ -280,11 +412,15 @@ impl QwpBuffer {
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.pending_row.is_none() && self.rows.is_empty()
+        self.pending.table.is_none() && self.rows.is_empty()
     }
 
     pub(crate) fn capacity(&self) -> usize {
-        self.rows.capacity()
+        self.name_bytes.capacity()
+            + self.value_bytes.capacity()
+            + self.rows.capacity() * std::mem::size_of::<RowMeta>()
+            + self.entries.capacity() * std::mem::size_of::<EntryMeta>()
+            + self.segments.capacity() * std::mem::size_of::<SegmentMeta>()
     }
 
     pub(crate) fn as_bytes(&self) -> &[u8] {
@@ -303,19 +439,32 @@ impl QwpBuffer {
             ));
         }
         self.marker = Some(QwpMarker {
-            row_count: self.rows.len(),
-            state: self.state.clone(),
-            size_hint: self.size_hint.clone(),
+            rows_len: self.rows.len() as u32,
+            entries_len: self.entries.len() as u32,
+            segments_len: self.segments.len() as u32,
+            tail_segment_row_count: self.segments.last().map(|s| s.row_count),
+            name_bytes_len: self.name_bytes.len() as u32,
+            value_bytes_len: self.value_bytes.len() as u32,
+            state: self.state,
         });
         Ok(())
     }
 
     pub(crate) fn rewind_to_marker(&mut self) -> crate::Result<()> {
         if let Some(marker) = self.marker.take() {
-            self.rows.truncate(marker.row_count);
-            self.pending_row = None;
+            self.rows.truncate(marker.rows_len as usize);
+            self.entries.truncate(marker.entries_len as usize);
+            self.name_bytes.truncate(marker.name_bytes_len as usize);
+            self.value_bytes.truncate(marker.value_bytes_len as usize);
+            self.segments.truncate(marker.segments_len as usize);
+            if let Some(tail_row_count) = marker.tail_segment_row_count
+                && let Some(last_seg) = self.segments.last_mut()
+            {
+                last_seg.row_count = tail_row_count;
+            }
+            self.pending = PendingRowState::empty();
             self.state = marker.state;
-            self.size_hint = marker.size_hint;
+            self.recompute_size_hint();
             Ok(())
         } else {
             Err(error::fmt!(
@@ -330,11 +479,36 @@ impl QwpBuffer {
     }
 
     pub(crate) fn clear(&mut self) {
+        self.name_bytes.clear();
+        self.value_bytes.clear();
         self.rows.clear();
-        self.pending_row = None;
+        self.entries.clear();
+        self.segments.clear();
+        self.pending = PendingRowState::empty();
         self.state = BufferState::new();
-        self.size_hint = QwpSizeHint::new();
+        self.size_hint.clear();
         self.marker = None;
+    }
+
+    fn recompute_size_hint(&mut self) {
+        self.size_hint.clear();
+        let mut prev_seg_table: Option<NameSlice> = None;
+        for seg_idx in 0..self.segments.len() {
+            let segment = self.segments[seg_idx];
+            let start = segment.row_start as usize;
+            for i in 0..segment.row_count as usize {
+                let row = &self.rows[start + i];
+                let last_seg_table = if i == 0 { prev_seg_table } else { Some(segment.table) };
+                let _ = self.size_hint.add_committed_row(
+                    row,
+                    &self.entries,
+                    &self.name_bytes,
+                    &self.value_bytes,
+                    last_seg_table,
+                );
+            }
+            prev_seg_table = Some(segment.table);
+        }
     }
 
     pub(crate) fn check_can_flush(&self) -> crate::Result<()> {
@@ -366,33 +540,70 @@ impl QwpBuffer {
         Ok(())
     }
 
-    fn pending_row_mut(&mut self) -> &mut PendingRow {
-        self.pending_row
-            .as_mut()
-            .expect("pending row must exist after successful table()")
+    fn append_name(&mut self, name: &str) -> NameSlice {
+        debug_assert!(
+            self.name_bytes.len() + name.len() <= u32::MAX as usize,
+            "name_bytes arena overflow"
+        );
+        let offset = self.name_bytes.len() as u32;
+        self.name_bytes.extend_from_slice(name.as_bytes());
+        NameSlice(ByteSlice {
+            offset,
+            len: name.len() as u32,
+        })
     }
 
-    fn update_transactional_state(&mut self, table_name: &str) {
-        if let Some(first_table_name) = self.state.first_table_name.as_ref() {
-            if first_table_name != table_name {
+    fn append_value_str(&mut self, value: &str) -> ValueSlice {
+        debug_assert!(
+            self.value_bytes.len() + value.len() <= u32::MAX as usize,
+            "value_bytes arena overflow"
+        );
+        let offset = self.value_bytes.len() as u32;
+        self.value_bytes.extend_from_slice(value.as_bytes());
+        ValueSlice(ByteSlice {
+            offset,
+            len: value.len() as u32,
+        })
+    }
+
+    fn name_str(&self, ns: NameSlice) -> &str {
+        std::str::from_utf8(&self.name_bytes[ns.0.as_range()])
+            .expect("name must be valid UTF-8")
+    }
+
+    fn rollback_pending(&mut self) {
+        self.entries.truncate(self.pending.entry_start as usize);
+        self.name_bytes
+            .truncate(self.pending.name_bytes_start as usize);
+        self.value_bytes
+            .truncate(self.pending.value_bytes_start as usize);
+        self.pending.table = None;
+    }
+
+    fn update_transactional_state(&mut self, table_ns: NameSlice) {
+        if let Some(first_ns) = self.state.first_table_name {
+            let first_bytes = &self.name_bytes[first_ns.0.as_range()];
+            let current_bytes = &self.name_bytes[table_ns.0.as_range()];
+            if first_bytes != current_bytes {
                 self.state.transactional = false;
             }
         } else {
-            self.state.first_table_name = Some(table_name.to_owned());
+            self.state.first_table_name = Some(table_ns);
         }
     }
 
-    fn mark_pending_entry_name(&mut self, name: &str) -> crate::Result<()> {
-        let pending_row = self.pending_row_mut();
-        let name_hash = hash_name(name);
-        if !pending_row.seen_name_hashes.insert(name_hash)
-            && pending_row.entries.iter().any(|entry| entry.name == name)
-        {
-            return Err(error::fmt!(
-                InvalidApiCall,
-                "column '{}' already set for current row",
-                name
-            ));
+    fn mark_pending_entry_name(&self, name: &str) -> crate::Result<()> {
+        // Linear scan over current row's entries for duplicate detection
+        let start = self.pending.entry_start as usize;
+        for entry in &self.entries[start..] {
+            let entry_name = self.name_str(entry.name);
+            if entry_name == name {
+                return Err(error::fmt!(
+                    InvalidApiCall,
+                    "column '{}' already set for current row",
+                    name
+                ));
+            }
         }
         Ok(())
     }
@@ -406,13 +617,17 @@ impl QwpBuffer {
         self.validate_max_name_len(name.as_ref())?;
         self.check_op(Op::Table)?;
 
-        let table_name = name.as_ref().to_owned();
-        self.update_transactional_state(&table_name);
-        self.pending_row = Some(PendingRow {
-            table_name,
-            entries: Vec::new(),
-            seen_name_hashes: HashSet::new(),
-        });
+        // Record rollback points
+        self.pending = PendingRowState {
+            table: None, // set below
+            entry_start: self.entries.len() as u32,
+            name_bytes_start: self.name_bytes.len() as u32,
+            value_bytes_start: self.value_bytes.len() as u32,
+        };
+
+        let table_ns = self.append_name(name.as_ref());
+        self.update_transactional_state(table_ns);
+        self.pending.table = Some(table_ns);
         self.state.op_case = OpCase::TableWritten;
         Ok(self)
     }
@@ -427,9 +642,11 @@ impl QwpBuffer {
         self.validate_max_name_len(name.as_ref())?;
         self.check_op(Op::Symbol)?;
         self.mark_pending_entry_name(name.as_ref())?;
-        self.pending_row_mut().entries.push(PendingEntry {
-            name: name.as_ref().to_owned(),
-            value: PendingValue::Symbol(value.as_ref().to_owned()),
+        let name_ns = self.append_name(name.as_ref());
+        let value_vs = self.append_value_str(value.as_ref());
+        self.entries.push(EntryMeta {
+            name: name_ns,
+            value: ValueRef::Symbol(value_vs),
         });
         self.state.op_case = OpCase::SymbolWritten;
         Ok(self)
@@ -444,9 +661,10 @@ impl QwpBuffer {
         self.validate_max_name_len(name.as_ref())?;
         self.check_op(Op::Column)?;
         self.mark_pending_entry_name(name.as_ref())?;
-        self.pending_row_mut().entries.push(PendingEntry {
-            name: name.as_ref().to_owned(),
-            value: PendingValue::Bool(value),
+        let name_ns = self.append_name(name.as_ref());
+        self.entries.push(EntryMeta {
+            name: name_ns,
+            value: ValueRef::Bool(value),
         });
         self.state.op_case = OpCase::ColumnWritten;
         Ok(self)
@@ -461,9 +679,10 @@ impl QwpBuffer {
         self.validate_max_name_len(name.as_ref())?;
         self.check_op(Op::Column)?;
         self.mark_pending_entry_name(name.as_ref())?;
-        self.pending_row_mut().entries.push(PendingEntry {
-            name: name.as_ref().to_owned(),
-            value: PendingValue::I64(value),
+        let name_ns = self.append_name(name.as_ref());
+        self.entries.push(EntryMeta {
+            name: name_ns,
+            value: ValueRef::I64(value),
         });
         self.state.op_case = OpCase::ColumnWritten;
         Ok(self)
@@ -478,9 +697,10 @@ impl QwpBuffer {
         self.validate_max_name_len(name.as_ref())?;
         self.check_op(Op::Column)?;
         self.mark_pending_entry_name(name.as_ref())?;
-        self.pending_row_mut().entries.push(PendingEntry {
-            name: name.as_ref().to_owned(),
-            value: PendingValue::F64(value),
+        let name_ns = self.append_name(name.as_ref());
+        self.entries.push(EntryMeta {
+            name: name_ns,
+            value: ValueRef::F64(value),
         });
         self.state.op_case = OpCase::ColumnWritten;
         Ok(self)
@@ -496,9 +716,11 @@ impl QwpBuffer {
         self.validate_max_name_len(name.as_ref())?;
         self.check_op(Op::Column)?;
         self.mark_pending_entry_name(name.as_ref())?;
-        self.pending_row_mut().entries.push(PendingEntry {
-            name: name.as_ref().to_owned(),
-            value: PendingValue::String(value.as_ref().to_owned()),
+        let name_ns = self.append_name(name.as_ref());
+        let value_vs = self.append_value_str(value.as_ref());
+        self.entries.push(EntryMeta {
+            name: name_ns,
+            value: ValueRef::String(value_vs),
         });
         self.state.op_case = OpCase::ColumnWritten;
         Ok(self)
@@ -540,9 +762,15 @@ impl QwpBuffer {
         self.validate_max_name_len(name.as_ref())?;
         self.check_op(Op::Column)?;
         self.mark_pending_entry_name(name.as_ref())?;
-        self.pending_row_mut().entries.push(PendingEntry {
-            name: name.as_ref().to_owned(),
-            value: PendingValue::Timestamp(pending_timestamp(value.try_into()?)),
+        let ts: Timestamp = value.try_into()?;
+        let name_ns = self.append_name(name.as_ref());
+        let value_ref = match ts {
+            Timestamp::Micros(v) => ValueRef::TimestampMicros(v.as_i64()),
+            Timestamp::Nanos(v) => ValueRef::TimestampNanos(v.as_i64()),
+        };
+        self.entries.push(EntryMeta {
+            name: name_ns,
+            value: value_ref,
         });
         self.state.op_case = OpCase::ColumnWritten;
         Ok(self)
@@ -554,7 +782,7 @@ impl QwpBuffer {
         Error: From<T::Error>,
     {
         self.check_op(Op::At)?;
-        self.commit_current_row(Some(pending_timestamp(timestamp.try_into()?)))
+        self.commit_current_row(Some(to_designated_ts(timestamp.try_into()?)))
     }
 
     pub(crate) fn at_now(&mut self) -> crate::Result<()> {
@@ -562,191 +790,337 @@ impl QwpBuffer {
         self.commit_current_row(None)
     }
 
-    fn commit_current_row(&mut self, designated_ts: Option<PendingTimestamp>) -> crate::Result<()> {
-        let Some(pending_row) = self.pending_row.take() else {
-            return Err(error::fmt!(
-                InvalidApiCall,
-                "table() must be called before adding columns"
-            ));
+    fn commit_current_row(&mut self, designated_ts: Option<DesignatedTs>) -> crate::Result<()> {
+        let table_ns = match self.pending.table {
+            Some(ns) => ns,
+            None => {
+                return Err(error::fmt!(
+                    InvalidApiCall,
+                    "table() must be called before adding columns"
+                ));
+            }
         };
 
-        if pending_row.entries.is_empty() {
+        let entry_start = self.pending.entry_start;
+        let entry_count = self.entries.len() as u32 - entry_start;
+
+        if entry_count == 0 {
+            self.rollback_pending();
             return Err(error::fmt!(InvalidApiCall, "no columns were provided"));
         }
 
-        let committed_row = CommittedRow {
-            table_name: pending_row.table_name,
-            entries: pending_row.entries,
+        let row = RowMeta {
+            table: table_ns,
+            entry_start,
+            entry_count,
             designated_ts,
         };
-        self.size_hint.add_committed_row(&committed_row)?;
-        self.rows.push(committed_row);
+
+        let last_seg_table = self.segments.last().map(|s| s.table);
+        let same_table = if let Some(last_table) = last_seg_table {
+            self.name_bytes[last_table.0.as_range()] == self.name_bytes[table_ns.0.as_range()]
+        } else {
+            false
+        };
+
+        // Update size hint before segments (fallible, must not leave partial state)
+        self.size_hint.add_committed_row(
+            &row,
+            &self.entries,
+            &self.name_bytes,
+            &self.value_bytes,
+            last_seg_table,
+        )?;
+
+        // Update segments (infallible)
+        if same_table {
+            self.segments.last_mut().unwrap().row_count += 1;
+        } else {
+            self.segments.push(SegmentMeta {
+                table: table_ns,
+                row_start: self.rows.len() as u32,
+                row_count: 1,
+            });
+        }
+
+        self.rows.push(row);
         self.state.row_count += 1;
         self.state.op_case = OpCase::MayFlushOrTable;
+        self.pending.table = None;
         Ok(())
     }
 
     fn pending_size_hint(&self) -> usize {
-        let Some(pending_row) = self.pending_row.as_ref() else {
+        if self.pending.table.is_none() {
             return 0;
-        };
-
-        let mut size = pending_row.table_name.len();
-        for entry in &pending_row.entries {
-            size += entry.name.len();
+        }
+        let table_ns = self.pending.table.unwrap();
+        let mut size = table_ns.0.len as usize;
+        for entry in &self.entries[self.pending.entry_start as usize..] {
+            size += entry.name.0.len as usize;
             size += match &entry.value {
-                PendingValue::Bool(_) => 1,
-                PendingValue::Symbol(value) => value.len() + 3,
-                PendingValue::I64(_) | PendingValue::F64(_) => 8,
-                PendingValue::String(value) => value.len() + 9,
-                PendingValue::Timestamp(_) => 9,
+                ValueRef::Bool(_) => 1,
+                ValueRef::Symbol(vs) => vs.0.len as usize + 3,
+                ValueRef::I64(_) | ValueRef::F64(_) => 8,
+                ValueRef::String(vs) => vs.0.len as usize + 9,
+                ValueRef::TimestampMicros(_) | ValueRef::TimestampNanos(_) => 9,
             };
         }
         size + 1
     }
 
-    pub(crate) fn encode_datagrams(&self, max_datagram_size: usize) -> crate::Result<Vec<Vec<u8>>> {
+    fn rows_for_segment(&self, segment: &SegmentMeta) -> &[RowMeta] {
+        let start = segment.row_start as usize;
+        let end = start + segment.row_count as usize;
+        &self.rows[start..end]
+    }
+
+    fn entries_for_row(&self, row: &RowMeta) -> &[EntryMeta] {
+        let start = row.entry_start as usize;
+        let end = start + row.entry_count as usize;
+        &self.entries[start..end]
+    }
+
+    /// Encode datagrams for the current buffer contents.
+    /// Test-only helper that collects datagrams into a Vec.
+    #[cfg(test)]
+    fn encode_datagrams(&self, max_datagram_size: usize) -> crate::Result<Vec<Vec<u8>>> {
         let mut datagrams = Vec::new();
-        let mut start = 0usize;
-        while start < self.rows.len() {
-            let table_name = &self.rows[start].table_name;
-            let mut end = start + 1;
-            while end < self.rows.len() && self.rows[end].table_name == *table_name {
-                end += 1;
+        let mut planner = RowGroupPlanner::new();
+        let mut datagram_buf = Vec::new();
+
+        for segment in &self.segments {
+            let rows = self.rows_for_segment(segment);
+            let table_name = &self.name_bytes[segment.table.0.as_range()];
+
+            planner.clear();
+
+            for row in rows {
+                let row_entries = self.entries_for_row(row);
+
+                let cp = planner.checkpoint();
+                planner.add_row(
+                    row,
+                    row_entries,
+                    &self.name_bytes,
+                    &self.value_bytes,
+                    table_name.len(),
+                )?;
+
+                if cp.row_count > 0 && planner.current_len > max_datagram_size {
+                    planner.rollback(cp);
+
+                    encode_row_group_from_scratch(
+                        &planner,
+                        &self.name_bytes,
+                        &self.value_bytes,
+                        table_name,
+                        &mut datagram_buf,
+                    )?;
+                    datagrams.push(datagram_buf.clone());
+                    datagram_buf.clear();
+
+                    planner.clear();
+
+                    planner.add_row(
+                        row,
+                        row_entries,
+                        &self.name_bytes,
+                        &self.value_bytes,
+                        table_name.len(),
+                    )?;
+                    if planner.current_len > max_datagram_size {
+                        return Err(error::fmt!(
+                            InvalidApiCall,
+                            "single row exceeds maximum datagram size ({} bytes), estimated {} bytes",
+                            max_datagram_size,
+                            planner.current_len
+                        ));
+                    }
+                } else if planner.current_len > max_datagram_size {
+                    return Err(error::fmt!(
+                        InvalidApiCall,
+                        "single row exceeds maximum datagram size ({} bytes), estimated {} bytes",
+                        max_datagram_size,
+                        planner.current_len
+                    ));
+                }
             }
-            encode_row_group_with_splitting(
-                &self.rows[start..end],
-                max_datagram_size,
-                &mut datagrams,
-            )?;
-            start = end;
+
+            if planner.row_count() > 0 {
+                encode_row_group_from_scratch(
+                    &planner,
+                    &self.name_bytes,
+                    &self.value_bytes,
+                    table_name,
+                    &mut datagram_buf,
+                )?;
+                datagrams.push(datagram_buf.clone());
+                datagram_buf.clear();
+            }
         }
+
         Ok(datagrams)
     }
-}
 
-#[derive(Clone, Debug)]
-struct RowGroupEstimator {
-    table_name: String,
-    row_count: usize,
-    current_len: usize,
-    columns: Vec<EstimatedColumn>,
-    indexes: HashMap<String, usize>,
-}
-
-#[derive(Clone, Debug)]
-struct EstimatedColumn {
-    name: String,
-    kind: ColumnKind,
-    base_nullable: bool,
-    non_null_count: usize,
-    string_data_len: usize,
-    symbol_dict_bytes: usize,
-    symbol_row_index_bytes: usize,
-    symbol_indexes: HashMap<String, usize>,
-}
-
-impl RowGroupEstimator {
-    fn new(table_name: &str) -> Self {
-        Self {
-            table_name: table_name.to_owned(),
-            row_count: 0,
-            current_len: base_datagram_len(table_name, 0, 0),
-            columns: Vec::new(),
-            indexes: HashMap::new(),
-        }
-    }
-
-    fn row_count(&self) -> usize {
-        self.row_count
-    }
-
-    fn current_len(&self) -> usize {
-        self.current_len
-    }
-
-    fn estimate_len_with_specs(&self, specs: &[RowValueSpec<'_>]) -> crate::Result<usize> {
-        let new_row_count = self.row_count + 1;
-        let mut existing = Vec::<(usize, RowValueSpec<'_>)>::new();
-        let mut created = Vec::<RowValueSpec<'_>>::new();
-
-        for spec in specs {
-            if let Some(&idx) = self.indexes.get(spec.name) {
-                let column = &self.columns[idx];
-                if column.kind != spec.kind {
-                    return Err(error::fmt!(
-                        InvalidApiCall,
-                        "QWP/UDP column {:?} changes type within a batched table",
-                        spec.name
-                    ));
-                }
-                existing.push((idx, *spec));
-            } else {
-                created.push(*spec);
-            }
-        }
-
-        let mut total = base_datagram_len(
-            &self.table_name,
-            new_row_count,
-            self.columns.len() + created.len(),
-        );
-
-        for (idx, column) in self.columns.iter().enumerate() {
-            total += column.schema_len();
-            if let Some((_, spec)) = existing
-                .iter()
-                .find(|(existing_idx, _)| *existing_idx == idx)
-            {
-                total += column.payload_len_after_adding(new_row_count, spec.value)?;
-            } else {
-                total += column.payload_len(new_row_count);
-            }
-        }
-
-        for spec in created {
-            let column = EstimatedColumn::new(spec.name, spec.kind, spec.value)?;
-            total += column.schema_len();
-            total += column.payload_len(new_row_count);
-        }
-
-        Ok(total)
-    }
-
-    fn add_row_with_specs(
-        &mut self,
-        specs: &[RowValueSpec<'_>],
-        new_len: usize,
+    /// Streaming flush: encode and send datagrams directly to the socket.
+    /// Uses sender-owned scratch to avoid allocations.
+    pub(crate) fn flush_to_socket(
+        &self,
+        scratch: &mut QwpSendScratch,
+        max_datagram_size: usize,
+        send: &mut dyn FnMut(&[u8]) -> crate::Result<()>,
     ) -> crate::Result<()> {
-        for spec in specs {
-            if let Some(&idx) = self.indexes.get(spec.name) {
-                let column = &mut self.columns[idx];
-                if column.kind != spec.kind {
+        for segment in &self.segments {
+            let rows = self.rows_for_segment(segment);
+            let table_name = &self.name_bytes[segment.table.0.as_range()];
+
+            scratch.planner.clear();
+
+            for row in rows {
+                let row_entries = self.entries_for_row(row);
+
+                let cp = scratch.planner.checkpoint();
+                scratch.planner.add_row(
+                    row,
+                    row_entries,
+                    &self.name_bytes,
+                    &self.value_bytes,
+                    table_name.len(),
+                )?;
+
+                if cp.row_count > 0 && scratch.planner.current_len > max_datagram_size {
+                    scratch.planner.rollback(cp);
+
+                    scratch.datagram.clear();
+                    encode_row_group_from_scratch(
+                        &scratch.planner,
+                        &self.name_bytes,
+                        &self.value_bytes,
+                        table_name,
+                        &mut scratch.datagram,
+                    )?;
+                    send(&scratch.datagram)?;
+
+                    scratch.planner.clear();
+
+                    scratch.planner.add_row(
+                        row,
+                        row_entries,
+                        &self.name_bytes,
+                        &self.value_bytes,
+                        table_name.len(),
+                    )?;
+                    if scratch.planner.current_len > max_datagram_size {
+                        return Err(error::fmt!(
+                            InvalidApiCall,
+                            "single row exceeds maximum datagram size ({} bytes), estimated {} bytes",
+                            max_datagram_size,
+                            scratch.planner.current_len
+                        ));
+                    }
+                } else if scratch.planner.current_len > max_datagram_size {
                     return Err(error::fmt!(
                         InvalidApiCall,
-                        "QWP/UDP column {:?} changes type within a batched table",
-                        spec.name
+                        "single row exceeds maximum datagram size ({} bytes), estimated {} bytes",
+                        max_datagram_size,
+                        scratch.planner.current_len
                     ));
                 }
-                column.add_value(spec.value)?;
-            } else {
-                let idx = self.columns.len();
-                self.columns
-                    .push(EstimatedColumn::new(spec.name, spec.kind, spec.value)?);
-                self.indexes.insert(spec.name.to_owned(), idx);
+            }
+
+            if scratch.planner.row_count() > 0 {
+                scratch.datagram.clear();
+                encode_row_group_from_scratch(
+                    &scratch.planner,
+                    &self.name_bytes,
+                    &self.value_bytes,
+                    table_name,
+                    &mut scratch.datagram,
+                )?;
+                send(&scratch.datagram)?;
             }
         }
-
-        self.row_count += 1;
-        self.current_len = new_len;
         Ok(())
     }
 }
 
-impl EstimatedColumn {
-    fn new(name: &str, kind: ColumnKind, value: ColumnValueRef<'_>) -> crate::Result<Self> {
-        let mut column = Self {
-            name: name.to_owned(),
+// --- Sender scratch ---
+
+pub(crate) struct QwpSendScratch {
+    pub(crate) planner: RowGroupPlanner,
+    pub(crate) datagram: Vec<u8>,
+}
+
+impl QwpSendScratch {
+    pub(crate) fn new(max_datagram_size: usize) -> Self {
+        Self {
+            planner: RowGroupPlanner::new(),
+            datagram: Vec::with_capacity(max_datagram_size),
+        }
+    }
+}
+
+
+/// Synthetic designated-timestamp entry used when iterating row specs.
+/// The empty column name is represented as a zero-length NameSlice.
+const DESIGNATED_TS_NAME: NameSlice = NameSlice(ByteSlice { offset: 0, len: 0 });
+
+fn designated_ts_entry(ts: DesignatedTs) -> EntryMeta {
+    EntryMeta {
+        name: DESIGNATED_TS_NAME,
+        value: match ts {
+            DesignatedTs::Micros(v) => ValueRef::TimestampMicros(v),
+            DesignatedTs::Nanos(v) => ValueRef::TimestampNanos(v),
+        },
+    }
+}
+
+
+// --- Symbol dictionary entry (flat arena, linked per column) ---
+
+#[derive(Clone, Copy, Debug)]
+struct SymbolEntry {
+    value: ValueSlice,
+    next: u32,
+}
+
+// --- Column stats (all scalar, no nested Vecs) ---
+
+#[derive(Clone, Copy, Debug)]
+struct ColumnStats {
+    name: NameSlice,
+    non_null_count: u32,
+    string_data_len: u32,
+    symbol_dict_bytes: u32,
+    symbol_row_index_bytes: u32,
+    dict_head: u32,
+    dict_tail: u32,
+    cell_head: u32,
+    cell_tail: u32,
+    dict_count: u16,
+    cached_schema_len: u16,
+    kind: ColumnKind,
+    base_nullable: bool,
+}
+
+impl ColumnStats {
+    fn new(entry: &EntryMeta) -> Self {
+        let kind = entry.value.kind();
+        let name_len = entry.name.0.len as usize;
+        let cached_schema_len = (qwp_varint_size(name_len as u64) + name_len + 1) as u16;
+        Self {
+            name: entry.name,
+            non_null_count: 0,
+            string_data_len: 0,
+            symbol_dict_bytes: 0,
+            symbol_row_index_bytes: 0,
+            dict_head: CELL_END,
+            dict_tail: CELL_END,
+            cell_head: CELL_END,
+            cell_tail: CELL_END,
+            dict_count: 0,
+            cached_schema_len,
             kind,
             base_nullable: matches!(
                 kind,
@@ -755,18 +1129,7 @@ impl EstimatedColumn {
                     | ColumnKind::TimestampMicros
                     | ColumnKind::TimestampNanos
             ),
-            non_null_count: 0,
-            string_data_len: 0,
-            symbol_dict_bytes: 0,
-            symbol_row_index_bytes: 0,
-            symbol_indexes: HashMap::new(),
-        };
-        column.add_value(value)?;
-        Ok(column)
-    }
-
-    fn schema_len(&self) -> usize {
-        qwp_string_len(&self.name) + 1
+        }
     }
 
     fn payload_len(&self, row_count: usize) -> usize {
@@ -778,230 +1141,411 @@ impl EstimatedColumn {
                 ColumnKind::Bool => packed_bytes(row_count),
                 ColumnKind::I64 | ColumnKind::F64 => {
                     if nullable {
-                        self.non_null_count * 8
+                        self.non_null_count as usize * 8
                     } else {
                         row_count * 8
                     }
                 }
-                ColumnKind::TimestampMicros | ColumnKind::TimestampNanos => self.non_null_count * 8,
-                ColumnKind::String => 4 * (self.non_null_count + 1) + self.string_data_len,
+                ColumnKind::TimestampMicros | ColumnKind::TimestampNanos => {
+                    self.non_null_count as usize * 8
+                }
+                ColumnKind::String => {
+                    4 * (self.non_null_count as usize + 1) + self.string_data_len as usize
+                }
                 ColumnKind::Symbol => {
-                    qwp_varint_size(self.symbol_indexes.len() as u64)
-                        + self.symbol_dict_bytes
-                        + self.symbol_row_index_bytes
+                    qwp_varint_size(self.dict_count as u64)
+                        + self.symbol_dict_bytes as usize
+                        + self.symbol_row_index_bytes as usize
                 }
             }
     }
 
-    fn payload_len_after_adding(
-        &self,
-        row_count_after: usize,
-        value: ColumnValueRef<'_>,
-    ) -> crate::Result<usize> {
-        let non_null_count = self.non_null_count + 1;
-        let nullable = self.is_nullable_with_count(row_count_after, non_null_count);
-        let bitmap = if nullable {
-            bitmap_bytes(row_count_after)
-        } else {
-            0
-        };
-
-        let payload = match self.kind {
-            ColumnKind::Bool => {
-                match value {
-                    ColumnValueRef::Bool(_) => {}
-                    _ => {
-                        return Err(error::fmt!(
-                            InvalidApiCall,
-                            "internal QWP estimator type mismatch for boolean column"
-                        ));
-                    }
-                }
-                packed_bytes(row_count_after)
-            }
-            ColumnKind::I64 => {
-                match value {
-                    ColumnValueRef::I64(_) => {}
-                    _ => {
-                        return Err(error::fmt!(
-                            InvalidApiCall,
-                            "internal QWP estimator type mismatch for long column"
-                        ));
-                    }
-                }
-                if nullable {
-                    non_null_count * 8
-                } else {
-                    row_count_after * 8
-                }
-            }
-            ColumnKind::F64 => {
-                match value {
-                    ColumnValueRef::F64(_) => {}
-                    _ => {
-                        return Err(error::fmt!(
-                            InvalidApiCall,
-                            "internal QWP estimator type mismatch for double column"
-                        ));
-                    }
-                }
-                if nullable {
-                    non_null_count * 8
-                } else {
-                    row_count_after * 8
-                }
-            }
-            ColumnKind::TimestampMicros | ColumnKind::TimestampNanos => {
-                match value {
-                    ColumnValueRef::Timestamp(_) => {}
-                    _ => {
-                        return Err(error::fmt!(
-                            InvalidApiCall,
-                            "internal QWP estimator type mismatch for timestamp column"
-                        ));
-                    }
-                }
-                non_null_count * 8
-            }
-            ColumnKind::String => {
-                let text_len = match value {
-                    ColumnValueRef::String(text) => text.len(),
-                    _ => {
-                        return Err(error::fmt!(
-                            InvalidApiCall,
-                            "internal QWP estimator type mismatch for string column"
-                        ));
-                    }
-                };
-                4 * (non_null_count + 1) + self.string_data_len + text_len
-            }
-            ColumnKind::Symbol => {
-                let symbol = match value {
-                    ColumnValueRef::Symbol(symbol) => symbol,
-                    _ => {
-                        return Err(error::fmt!(
-                            InvalidApiCall,
-                            "internal QWP estimator type mismatch for symbol column"
-                        ));
-                    }
-                };
-                let (dict_len_after, dict_bytes_after, row_index_bytes_after) =
-                    if let Some(&idx) = self.symbol_indexes.get(symbol) {
-                        (
-                            self.symbol_indexes.len(),
-                            self.symbol_dict_bytes,
-                            self.symbol_row_index_bytes + qwp_varint_size(idx as u64),
-                        )
-                    } else {
-                        let idx = self.symbol_indexes.len();
-                        (
-                            idx + 1,
-                            self.symbol_dict_bytes + qwp_string_len(symbol),
-                            self.symbol_row_index_bytes + qwp_varint_size(idx as u64),
-                        )
-                    };
-
-                qwp_varint_size(dict_len_after as u64) + dict_bytes_after + row_index_bytes_after
-            }
-        };
-
-        Ok(bitmap + payload)
-    }
-
-    fn add_value(&mut self, value: ColumnValueRef<'_>) -> crate::Result<()> {
+    fn add_non_symbol_value(&mut self, value: &ValueRef) -> crate::Result<()> {
         match self.kind {
             ColumnKind::Bool => match value {
-                ColumnValueRef::Bool(_) => {
+                ValueRef::Bool(_) => {
                     self.non_null_count += 1;
                     Ok(())
                 }
                 _ => Err(error::fmt!(
                     InvalidApiCall,
-                    "internal QWP estimator type mismatch for boolean column"
+                    "internal QWP type mismatch for boolean column"
                 )),
             },
             ColumnKind::I64 => match value {
-                ColumnValueRef::I64(_) => {
+                ValueRef::I64(_) => {
                     self.non_null_count += 1;
                     Ok(())
                 }
                 _ => Err(error::fmt!(
                     InvalidApiCall,
-                    "internal QWP estimator type mismatch for long column"
+                    "internal QWP type mismatch for long column"
                 )),
             },
             ColumnKind::F64 => match value {
-                ColumnValueRef::F64(_) => {
+                ValueRef::F64(_) => {
                     self.non_null_count += 1;
                     Ok(())
                 }
                 _ => Err(error::fmt!(
                     InvalidApiCall,
-                    "internal QWP estimator type mismatch for double column"
+                    "internal QWP type mismatch for double column"
                 )),
             },
             ColumnKind::TimestampMicros | ColumnKind::TimestampNanos => match value {
-                ColumnValueRef::Timestamp(_) => {
+                ValueRef::TimestampMicros(_) | ValueRef::TimestampNanos(_) => {
                     self.non_null_count += 1;
                     Ok(())
                 }
                 _ => Err(error::fmt!(
                     InvalidApiCall,
-                    "internal QWP estimator type mismatch for timestamp column"
+                    "internal QWP type mismatch for timestamp column"
                 )),
             },
             ColumnKind::String => match value {
-                ColumnValueRef::String(text) => {
+                ValueRef::String(vs) => {
                     self.non_null_count += 1;
-                    self.string_data_len += text.len();
+                    self.string_data_len += vs.0.len;
                     Ok(())
                 }
                 _ => Err(error::fmt!(
                     InvalidApiCall,
-                    "internal QWP estimator type mismatch for string column"
+                    "internal QWP type mismatch for string column"
                 )),
             },
-            ColumnKind::Symbol => match value {
-                ColumnValueRef::Symbol(symbol) => {
-                    let idx = if let Some(&idx) = self.symbol_indexes.get(symbol) {
-                        idx
-                    } else {
-                        let idx = self.symbol_indexes.len();
-                        self.symbol_indexes.insert(symbol.to_owned(), idx);
-                        self.symbol_dict_bytes += qwp_string_len(symbol);
-                        idx
-                    };
-                    self.non_null_count += 1;
-                    self.symbol_row_index_bytes += qwp_varint_size(idx as u64);
-                    Ok(())
-                }
-                _ => Err(error::fmt!(
-                    InvalidApiCall,
-                    "internal QWP estimator type mismatch for symbol column"
-                )),
-            },
+            ColumnKind::Symbol => {
+                // Symbol accounting handled by RowGroupPlanner
+                Ok(())
+            }
         }
     }
 
     fn is_nullable(&self, row_count: usize) -> bool {
-        self.is_nullable_with_count(row_count, self.non_null_count)
+        self.base_nullable
+            || (kind_supports_sparse_nulls(self.kind)
+                && (self.non_null_count as usize) < row_count)
     }
 
-    fn is_nullable_with_count(&self, row_count: usize, non_null_count: usize) -> bool {
-        self.base_nullable || (kind_supports_sparse_nulls(self.kind) && non_null_count < row_count)
+}
+
+// --- Checkpoint types ---
+
+#[derive(Clone, Debug)]
+struct ColumnUndo {
+    non_null_count: u32,
+    string_data_len: u32,
+    symbol_dict_bytes: u32,
+    symbol_row_index_bytes: u32,
+    dict_tail: u32,
+    cell_tail: u32,
+    col_idx: u16,
+    dict_count: u16,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Checkpoint {
+    columns_len: usize,
+    cells_len: usize,
+    symbol_dict_len: usize,
+    row_count: usize,
+    current_len: usize,
+    total_schema_len: usize,
+}
+
+// --- Row group planner (unified estimator + flush scratch) ---
+
+pub(crate) struct RowGroupPlanner {
+    columns: Vec<ColumnStats>,
+    cells: Vec<CellRef>,
+    symbol_dict: Vec<SymbolEntry>,
+    undo_stack: Vec<ColumnUndo>,
+    row_count: usize,
+    current_len: usize,
+    total_schema_len: usize,
+    track_cells: bool,
+}
+
+impl Clone for RowGroupPlanner {
+    fn clone(&self) -> Self {
+        Self {
+            columns: self.columns.clone(),
+            cells: self.cells.clone(),
+            symbol_dict: self.symbol_dict.clone(),
+            undo_stack: Vec::new(),
+            row_count: self.row_count,
+            current_len: self.current_len,
+            total_schema_len: self.total_schema_len,
+            track_cells: self.track_cells,
+        }
     }
 }
 
-fn base_datagram_len(table_name: &str, row_count: usize, column_count: usize) -> usize {
+impl std::fmt::Debug for RowGroupPlanner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RowGroupPlanner")
+            .field("columns", &self.columns)
+            .field("cells_len", &self.cells.len())
+            .field("row_count", &self.row_count)
+            .field("current_len", &self.current_len)
+            .finish()
+    }
+}
+
+impl RowGroupPlanner {
+    fn new() -> Self {
+        Self {
+            columns: Vec::new(),
+            cells: Vec::new(),
+            symbol_dict: Vec::new(),
+            undo_stack: Vec::new(),
+            row_count: 0,
+            current_len: 0,
+            total_schema_len: 0,
+            track_cells: true,
+        }
+    }
+
+    fn new_stats_only() -> Self {
+        Self {
+            columns: Vec::new(),
+            cells: Vec::new(),
+            symbol_dict: Vec::new(),
+            undo_stack: Vec::new(),
+            row_count: 0,
+            current_len: 0,
+            total_schema_len: 0,
+            track_cells: false,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.columns.clear();
+        self.cells.clear();
+        self.symbol_dict.clear();
+        self.undo_stack.clear();
+        self.row_count = 0;
+        self.current_len = 0;
+        self.total_schema_len = 0;
+    }
+
+    fn row_count(&self) -> usize {
+        self.row_count
+    }
+
+    fn checkpoint(&self) -> Checkpoint {
+        Checkpoint {
+            columns_len: self.columns.len(),
+            cells_len: self.cells.len(),
+            symbol_dict_len: self.symbol_dict.len(),
+            row_count: self.row_count,
+            current_len: self.current_len,
+            total_schema_len: self.total_schema_len,
+        }
+    }
+
+    fn rollback(&mut self, cp: Checkpoint) {
+        for undo in self.undo_stack.drain(..).rev() {
+            let col = &mut self.columns[undo.col_idx as usize];
+            col.non_null_count = undo.non_null_count;
+            col.string_data_len = undo.string_data_len;
+            col.symbol_dict_bytes = undo.symbol_dict_bytes;
+            col.symbol_row_index_bytes = undo.symbol_row_index_bytes;
+            col.dict_tail = undo.dict_tail;
+            col.dict_count = undo.dict_count;
+            if col.dict_tail != CELL_END {
+                self.symbol_dict[col.dict_tail as usize].next = CELL_END;
+            } else {
+                col.dict_head = CELL_END;
+            }
+            col.cell_tail = undo.cell_tail;
+            if self.track_cells && col.cell_tail != CELL_END {
+                self.cells[col.cell_tail as usize].next = CELL_END;
+            } else {
+                col.cell_head = CELL_END;
+            }
+        }
+        self.columns.truncate(cp.columns_len);
+        self.cells.truncate(cp.cells_len);
+        self.symbol_dict.truncate(cp.symbol_dict_len);
+        self.row_count = cp.row_count;
+        self.current_len = cp.current_len;
+        self.total_schema_len = cp.total_schema_len;
+    }
+
+    fn add_row(
+        &mut self,
+        row: &RowMeta,
+        row_entries: &[EntryMeta],
+        name_bytes: &[u8],
+        value_bytes: &[u8],
+        table_name_len: usize,
+    ) -> crate::Result<()> {
+        if self.track_cells && self.row_count >= u16::MAX as usize {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "QWP/UDP row group exceeds maximum of {} rows",
+                u16::MAX
+            ));
+        }
+        self.undo_stack.clear();
+        let ts_entry = row.designated_ts.map(designated_ts_entry);
+        let extra = ts_entry.as_slice();
+        let row_idx = self.row_count as u16;
+
+        for entry in row_entries.iter().chain(extra.iter()) {
+            let entry_name = &name_bytes[entry.name.0.as_range()];
+            if let Some(idx) = self.find_column(entry_name, name_bytes) {
+                let col = &mut self.columns[idx];
+                if col.kind != entry.value.kind() {
+                    return Err(error::fmt!(
+                        InvalidApiCall,
+                        "QWP/UDP column {:?} changes type within a batched table",
+                        std::str::from_utf8(entry_name).unwrap_or("<invalid>")
+                    ));
+                }
+                self.undo_stack.push(ColumnUndo {
+                    non_null_count: col.non_null_count,
+                    string_data_len: col.string_data_len,
+                    symbol_dict_bytes: col.symbol_dict_bytes,
+                    symbol_row_index_bytes: col.symbol_row_index_bytes,
+                    dict_tail: col.dict_tail,
+                    cell_tail: col.cell_tail,
+                    col_idx: idx as u16,
+                    dict_count: col.dict_count,
+                });
+                if self.track_cells {
+                    let cell_idx = self.cells.len() as u32;
+                    self.cells.push(CellRef {
+                        row_idx,
+                        symbol_dict_idx: 0,
+                        next: CELL_END,
+                        value: entry.value,
+                    });
+                    if col.cell_tail != CELL_END {
+                        self.cells[col.cell_tail as usize].next = cell_idx;
+                    } else {
+                        col.cell_head = cell_idx;
+                    }
+                    col.cell_tail = cell_idx;
+                }
+                if col.kind == ColumnKind::Symbol {
+                    self.add_symbol_value(idx, &entry.value, value_bytes);
+                } else {
+                    col.add_non_symbol_value(&entry.value)?;
+                }
+            } else {
+                self.push_new_column(entry, value_bytes, row_idx)?;
+            }
+        }
+
+        self.row_count += 1;
+        self.recompute_len(table_name_len);
+        Ok(())
+    }
+
+    fn add_symbol_value(&mut self, col_idx: usize, value: &ValueRef, value_bytes: &[u8]) {
+        let ValueRef::Symbol(vs) = value else { return };
+        let col = &mut self.columns[col_idx];
+        col.non_null_count += 1;
+        let symbol_bytes = &value_bytes[vs.0.as_range()];
+        let mut cursor = col.dict_head;
+        let mut pos = 0usize;
+        let mut found_idx = None;
+        while cursor != CELL_END {
+            let de = &self.symbol_dict[cursor as usize];
+            if &value_bytes[de.value.0.as_range()] == symbol_bytes {
+                found_idx = Some(pos);
+                break;
+            }
+            cursor = de.next;
+            pos += 1;
+        }
+        let sym_idx = if let Some(idx) = found_idx {
+            idx
+        } else {
+            let idx = col.dict_count as usize;
+            col.symbol_dict_bytes += qwp_string_byte_len(symbol_bytes.len()) as u32;
+            let dict_idx = self.symbol_dict.len() as u32;
+            self.symbol_dict.push(SymbolEntry {
+                value: *vs,
+                next: CELL_END,
+            });
+            if col.dict_tail != CELL_END {
+                self.symbol_dict[col.dict_tail as usize].next = dict_idx;
+            } else {
+                col.dict_head = dict_idx;
+            }
+            col.dict_tail = dict_idx;
+            col.dict_count += 1;
+            idx
+        };
+        col.symbol_row_index_bytes += qwp_varint_size(sym_idx as u64) as u32;
+        if self.track_cells {
+            // Store pre-computed index so encoding is O(1) per cell
+            self.cells.last_mut().unwrap().symbol_dict_idx = sym_idx as u16;
+        }
+    }
+
+    fn recompute_len(&mut self, table_name_len: usize) {
+        let mut total = base_datagram_len(table_name_len, self.row_count, self.columns.len());
+        total += self.total_schema_len;
+        for col in &self.columns {
+            total += col.payload_len(self.row_count);
+        }
+        self.current_len = total;
+    }
+
+    fn push_new_column(
+        &mut self,
+        entry: &EntryMeta,
+        value_bytes: &[u8],
+        row_idx: u16,
+    ) -> crate::Result<()> {
+        let col = ColumnStats::new(entry);
+        self.total_schema_len += col.cached_schema_len as usize;
+        self.columns.push(col);
+        let col_idx = self.columns.len() - 1;
+
+        if self.track_cells {
+            let cell_idx = self.cells.len() as u32;
+            self.cells.push(CellRef {
+                row_idx,
+                symbol_dict_idx: 0,
+                next: CELL_END,
+                value: entry.value,
+            });
+            let col = &mut self.columns[col_idx];
+            col.cell_head = cell_idx;
+            col.cell_tail = cell_idx;
+        }
+
+        if entry.value.kind() == ColumnKind::Symbol {
+            self.add_symbol_value(col_idx, &entry.value, value_bytes);
+        } else {
+            self.columns[col_idx].add_non_symbol_value(&entry.value)?;
+        }
+        Ok(())
+    }
+
+    fn find_column(&self, name: &[u8], name_bytes: &[u8]) -> Option<usize> {
+        self.columns
+            .iter()
+            .position(|c| &name_bytes[c.name.0.as_range()] == name)
+    }
+}
+
+// --- Encoding functions ---
+
+fn base_datagram_len(table_name_len: usize, row_count: usize, column_count: usize) -> usize {
     QWP_MESSAGE_HEADER_SIZE
-        + qwp_string_len(table_name)
+        + qwp_string_byte_len(table_name_len)
         + qwp_varint_size(row_count as u64)
         + qwp_varint_size(column_count as u64)
         + 1
 }
 
-fn qwp_string_len(value: &str) -> usize {
-    qwp_varint_size(value.len() as u64) + value.len()
+fn qwp_string_byte_len(byte_len: usize) -> usize {
+    qwp_varint_size(byte_len as u64) + byte_len
 }
 
 fn qwp_varint_size(mut value: u64) -> usize {
@@ -1021,276 +1565,6 @@ fn bitmap_bytes(value_count: usize) -> usize {
     value_count.div_ceil(8)
 }
 
-fn row_value_specs(row: &CommittedRow) -> Vec<RowValueSpec<'_>> {
-    let mut specs =
-        Vec::with_capacity(row.entries.len() + usize::from(row.designated_ts.is_some()));
-    for entry in &row.entries {
-        specs.push(RowValueSpec {
-            name: &entry.name,
-            value: batch_value_ref(&entry.value),
-            kind: batch_kind_from_value(&entry.value),
-        });
-    }
-    if let Some(ts) = row.designated_ts {
-        specs.push(RowValueSpec {
-            name: QWP_DESIGNATED_TIMESTAMP_COLUMN_NAME,
-            value: ColumnValueRef::Timestamp(ts.value),
-            kind: if ts.nanos {
-                ColumnKind::TimestampNanos
-            } else {
-                ColumnKind::TimestampMicros
-            },
-        });
-    }
-    specs
-}
-
-fn standalone_row_group_len(row: &CommittedRow) -> usize {
-    estimated_row_group_len(std::slice::from_ref(row)).unwrap_or(0)
-}
-
-fn is_batched_type_change_error(err: &Error) -> bool {
-    err.code() == ErrorCode::InvalidApiCall
-        && err.msg().contains("changes type within a batched table")
-}
-
-fn estimated_row_group_len(rows: &[CommittedRow]) -> crate::Result<usize> {
-    let Some(first_row) = rows.first() else {
-        return Err(error::fmt!(
-            InvalidApiCall,
-            "cannot estimate empty QWP row group"
-        ));
-    };
-
-    let mut estimator = RowGroupEstimator::new(&first_row.table_name);
-    for row in rows {
-        let specs = row_value_specs(row);
-        let new_len = estimator.estimate_len_with_specs(&specs)?;
-        estimator.add_row_with_specs(&specs, new_len)?;
-    }
-    Ok(estimator.current_len())
-}
-
-fn write_qwp_varint(out: &mut Vec<u8>, mut value: u64) {
-    while value > 0x7F {
-        out.push(((value & 0x7F) as u8) | 0x80);
-        value >>= 7;
-    }
-    out.push(value as u8);
-}
-
-fn write_qwp_string(out: &mut Vec<u8>, value: &str) {
-    write_qwp_varint(out, value.len() as u64);
-    out.extend_from_slice(value.as_bytes());
-}
-
-fn encode_row_group_with_splitting(
-    rows: &[CommittedRow],
-    max_datagram_size: usize,
-    out: &mut Vec<Vec<u8>>,
-) -> crate::Result<()> {
-    let Some(first_row) = rows.first() else {
-        return Ok(());
-    };
-
-    let mut batch_start = 0usize;
-    let mut estimator = RowGroupEstimator::new(&first_row.table_name);
-
-    for (idx, row) in rows.iter().enumerate() {
-        let specs = row_value_specs(row);
-        let estimated_len = estimator.estimate_len_with_specs(&specs)?;
-        if estimator.row_count() > 0 && estimated_len > max_datagram_size {
-            out.push(encode_row_group(&rows[batch_start..idx])?);
-            batch_start = idx;
-            estimator = RowGroupEstimator::new(&row.table_name);
-
-            let single_row_len = estimator.estimate_len_with_specs(&specs)?;
-            if single_row_len > max_datagram_size {
-                return Err(error::fmt!(
-                    InvalidApiCall,
-                    "single row exceeds maximum datagram size ({} bytes), estimated {} bytes",
-                    max_datagram_size,
-                    single_row_len
-                ));
-            }
-            estimator.add_row_with_specs(&specs, single_row_len)?;
-        } else {
-            if estimated_len > max_datagram_size {
-                return Err(error::fmt!(
-                    InvalidApiCall,
-                    "single row exceeds maximum datagram size ({} bytes), estimated {} bytes",
-                    max_datagram_size,
-                    estimated_len
-                ));
-            }
-            estimator.add_row_with_specs(&specs, estimated_len)?;
-        }
-    }
-
-    if estimator.row_count() > 0 {
-        out.push(encode_row_group(&rows[batch_start..])?);
-    }
-    Ok(())
-}
-
-fn encode_row_group(rows: &[CommittedRow]) -> crate::Result<Vec<u8>> {
-    let Some(first_row) = rows.first() else {
-        return Err(error::fmt!(
-            InvalidApiCall,
-            "cannot encode empty QWP row group"
-        ));
-    };
-
-    let columns = build_batch_columns(rows)?;
-
-    let mut payload = Vec::new();
-    write_qwp_string(&mut payload, &first_row.table_name);
-    write_qwp_varint(&mut payload, rows.len() as u64);
-    write_qwp_varint(&mut payload, columns.len() as u64);
-    payload.push(QWP_SCHEMA_MODE_FULL);
-
-    for column in &columns {
-        write_qwp_string(&mut payload, &column.name);
-        payload.push(column.wire_type());
-    }
-
-    for column in &columns {
-        column.encode_payload(&mut payload)?;
-    }
-
-    let payload_len: u32 = payload
-        .len()
-        .try_into()
-        .map_err(|_| error::fmt!(InvalidApiCall, "QWP payload is too large"))?;
-
-    let mut datagram = Vec::with_capacity(QWP_MESSAGE_HEADER_SIZE + payload.len());
-    datagram.extend_from_slice(b"QWP1");
-    datagram.push(QWP_VERSION_1);
-    datagram.push(0);
-    datagram.extend_from_slice(&(1u16).to_le_bytes());
-    datagram.extend_from_slice(&payload_len.to_le_bytes());
-    datagram.extend_from_slice(&payload);
-    Ok(datagram)
-}
-
-fn build_batch_columns<'a>(rows: &'a [CommittedRow]) -> crate::Result<Vec<BatchColumn<'a>>> {
-    let row_count = rows.len();
-    let mut columns = Vec::<BatchColumn<'a>>::new();
-    let mut indexes = HashMap::<String, usize>::new();
-
-    for (row_idx, row) in rows.iter().enumerate() {
-        for entry in &row.entries {
-            add_batch_value(
-                &mut columns,
-                &mut indexes,
-                row_count,
-                row_idx,
-                &entry.name,
-                batch_value_ref(&entry.value),
-                batch_kind_from_value(&entry.value),
-                batch_nullable_from_value(&entry.value),
-            )?;
-        }
-
-        if let Some(ts) = row.designated_ts {
-            add_batch_value(
-                &mut columns,
-                &mut indexes,
-                row_count,
-                row_idx,
-                QWP_DESIGNATED_TIMESTAMP_COLUMN_NAME,
-                ColumnValueRef::Timestamp(ts.value),
-                if ts.nanos {
-                    ColumnKind::TimestampNanos
-                } else {
-                    ColumnKind::TimestampMicros
-                },
-                true,
-            )?;
-        }
-    }
-
-    for column in &mut columns {
-        if column.values.iter().any(Option::is_none) && kind_supports_sparse_nulls(column.kind) {
-            column.nullable = true;
-        }
-    }
-
-    Ok(columns)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn add_batch_value<'a>(
-    columns: &mut Vec<BatchColumn<'a>>,
-    indexes: &mut HashMap<String, usize>,
-    row_count: usize,
-    row_idx: usize,
-    name: &str,
-    value: ColumnValueRef<'a>,
-    kind: ColumnKind,
-    nullable: bool,
-) -> crate::Result<()> {
-    if let Some(&column_idx) = indexes.get(name) {
-        let column = &mut columns[column_idx];
-        if column.kind != kind || column.nullable != nullable {
-            return Err(error::fmt!(
-                InvalidApiCall,
-                "QWP/UDP column {:?} changes type within a batched table",
-                name
-            ));
-        }
-        column.values[row_idx] = Some(value);
-        return Ok(());
-    }
-
-    let mut values = vec![None; row_count];
-    values[row_idx] = Some(value);
-    let column_idx = columns.len();
-    columns.push(BatchColumn {
-        name: name.to_owned(),
-        kind,
-        nullable,
-        values,
-    });
-    indexes.insert(name.to_owned(), column_idx);
-    Ok(())
-}
-
-fn batch_value_ref(value: &PendingValue) -> ColumnValueRef<'_> {
-    match value {
-        PendingValue::Bool(value) => ColumnValueRef::Bool(*value),
-        PendingValue::Symbol(value) => ColumnValueRef::Symbol(value),
-        PendingValue::I64(value) => ColumnValueRef::I64(*value),
-        PendingValue::F64(value) => ColumnValueRef::F64(*value),
-        PendingValue::String(value) => ColumnValueRef::String(value),
-        PendingValue::Timestamp(value) => ColumnValueRef::Timestamp(value.value),
-    }
-}
-
-fn batch_kind_from_value(value: &PendingValue) -> ColumnKind {
-    match value {
-        PendingValue::Bool(_) => ColumnKind::Bool,
-        PendingValue::Symbol(_) => ColumnKind::Symbol,
-        PendingValue::I64(_) => ColumnKind::I64,
-        PendingValue::F64(_) => ColumnKind::F64,
-        PendingValue::String(_) => ColumnKind::String,
-        PendingValue::Timestamp(value) => {
-            if value.nanos {
-                ColumnKind::TimestampNanos
-            } else {
-                ColumnKind::TimestampMicros
-            }
-        }
-    }
-}
-
-fn batch_nullable_from_value(value: &PendingValue) -> bool {
-    matches!(
-        value,
-        PendingValue::Symbol(_) | PendingValue::String(_) | PendingValue::Timestamp(_)
-    )
-}
-
 fn kind_supports_sparse_nulls(kind: ColumnKind) -> bool {
     matches!(
         kind,
@@ -1301,253 +1575,324 @@ fn kind_supports_sparse_nulls(kind: ColumnKind) -> bool {
     )
 }
 
-impl<'a> BatchColumn<'a> {
-    fn wire_type(&self) -> u8 {
-        let ty = match self.kind {
-            ColumnKind::Bool => QWP_TYPE_BOOLEAN,
-            ColumnKind::Symbol => QWP_TYPE_SYMBOL,
-            ColumnKind::I64 => QWP_TYPE_LONG,
-            ColumnKind::F64 => QWP_TYPE_DOUBLE,
-            ColumnKind::String => QWP_TYPE_STRING,
-            ColumnKind::TimestampMicros => QWP_TYPE_TIMESTAMP,
-            ColumnKind::TimestampNanos => QWP_TYPE_TIMESTAMP_NANOS,
-        };
-        if self.nullable {
-            ty | QWP_TYPE_NULLABLE_FLAG
+fn standalone_row_group_len(
+    row: &RowMeta,
+    row_entries: &[EntryMeta],
+    name_bytes: &[u8],
+    value_bytes: &[u8],
+) -> usize {
+    let table_name = &name_bytes[row.table.0.as_range()];
+    let mut planner = RowGroupPlanner::new_stats_only();
+    match planner.add_row(row, row_entries, name_bytes, value_bytes, table_name.len()) {
+        Ok(()) => planner.current_len,
+        Err(_) => 0,
+    }
+}
+
+fn is_batched_type_change_error(err: &Error) -> bool {
+    err.code() == ErrorCode::InvalidApiCall
+        && err.msg().contains("changes type within a batched table")
+}
+
+fn write_qwp_varint(out: &mut Vec<u8>, mut value: u64) {
+    while value > 0x7F {
+        out.push(((value & 0x7F) as u8) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+fn write_qwp_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    write_qwp_varint(out, bytes.len() as u64);
+    out.extend_from_slice(bytes);
+}
+
+fn wire_type_byte(kind: ColumnKind, nullable: bool) -> u8 {
+    let ty = match kind {
+        ColumnKind::Bool => QWP_TYPE_BOOLEAN,
+        ColumnKind::Symbol => QWP_TYPE_SYMBOL,
+        ColumnKind::I64 => QWP_TYPE_LONG,
+        ColumnKind::F64 => QWP_TYPE_DOUBLE,
+        ColumnKind::String => QWP_TYPE_STRING,
+        ColumnKind::TimestampMicros => QWP_TYPE_TIMESTAMP,
+        ColumnKind::TimestampNanos => QWP_TYPE_TIMESTAMP_NANOS,
+    };
+    if nullable {
+        ty | QWP_TYPE_NULLABLE_FLAG
+    } else {
+        ty
+    }
+}
+
+/// Encode a row group directly from the planner's pre-indexed cells.
+/// No intermediate dense matrices or entry scanning - writes directly to `out`.
+fn encode_row_group_from_scratch(
+    planner: &RowGroupPlanner,
+    name_bytes: &[u8],
+    value_bytes: &[u8],
+    table_name: &[u8],
+    out: &mut Vec<u8>,
+) -> crate::Result<()> {
+    let row_count = planner.row_count;
+
+    // Write header placeholder
+    let header_start = out.len();
+    out.extend_from_slice(&[0u8; QWP_MESSAGE_HEADER_SIZE]);
+    let payload_start = out.len();
+
+    // Payload: table name, row count, column count, schema mode
+    write_qwp_bytes(out, table_name);
+    write_qwp_varint(out, row_count as u64);
+    write_qwp_varint(out, planner.columns.len() as u64);
+    out.push(QWP_SCHEMA_MODE_FULL);
+
+    // Schema
+    for col in &planner.columns {
+        write_qwp_bytes(out, &name_bytes[col.name.0.as_range()]);
+        out.push(wire_type_byte(col.kind, col.is_nullable(row_count)));
+    }
+
+    // Column payloads
+    for col in &planner.columns {
+        encode_column_from_cells(col, row_count, &planner.cells, &planner.symbol_dict, value_bytes, out)?;
+    }
+
+    // Fill header
+    let payload_len = (out.len() - payload_start) as u32;
+    out[header_start..header_start + 4].copy_from_slice(b"QWP1");
+    out[header_start + 4] = QWP_VERSION_1;
+    out[header_start + 5] = 0;
+    out[header_start + 6..header_start + 8].copy_from_slice(&1u16.to_le_bytes());
+    out[header_start + 8..header_start + 12].copy_from_slice(&payload_len.to_le_bytes());
+
+    Ok(())
+}
+
+// --- Cell iteration helpers ---
+
+/// Iterates non-null cells for a column via linked list.
+struct CellIter<'a> {
+    cells: &'a [CellRef],
+    cursor: u32,
+}
+
+impl<'a> CellIter<'a> {
+    fn new(cells: &'a [CellRef], head: u32) -> Self {
+        Self { cells, cursor: head }
+    }
+}
+
+impl<'a> Iterator for CellIter<'a> {
+    type Item = &'a CellRef;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.cursor == CELL_END {
+            return None;
+        }
+        let cell = &self.cells[self.cursor as usize];
+        self.cursor = cell.next;
+        Some(cell)
+    }
+}
+
+/// Iterates all rows 0..row_count, yielding `Some(&CellRef)` for non-null
+/// rows and `None` for gaps. Used for null bitmaps and non-nullable gap-filling.
+struct GapFillIter<'a> {
+    cells: &'a [CellRef],
+    cursor: u32,
+    next_non_null: u16,
+    row: u16,
+    row_count: u16,
+}
+
+impl<'a> GapFillIter<'a> {
+    fn new(cells: &'a [CellRef], head: u32, row_count: usize) -> Self {
+        let next_non_null = if head != CELL_END {
+            cells[head as usize].row_idx
         } else {
-            ty
+            u16::MAX
+        };
+        Self {
+            cells,
+            cursor: head,
+            next_non_null,
+            row: 0,
+            row_count: row_count as u16,
         }
     }
+}
 
-    fn encode_payload(&self, out: &mut Vec<u8>) -> crate::Result<()> {
-        if self.nullable {
-            write_null_bitmap(out, &self.values);
-        }
+impl<'a> Iterator for GapFillIter<'a> {
+    type Item = Option<&'a CellRef>;
 
-        match self.kind {
-            ColumnKind::Bool => self.encode_bool_payload(out),
-            ColumnKind::Symbol => self.encode_symbol_payload(out),
-            ColumnKind::I64 => self.encode_i64_payload(out),
-            ColumnKind::F64 => self.encode_f64_payload(out),
-            ColumnKind::String => self.encode_string_payload(out),
-            ColumnKind::TimestampMicros | ColumnKind::TimestampNanos => {
-                self.encode_timestamp_payload(out)
-            }
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.row >= self.row_count {
+            return None;
         }
+        let result = if self.row == self.next_non_null {
+            let cell = &self.cells[self.cursor as usize];
+            self.cursor = cell.next;
+            self.next_non_null = if self.cursor != CELL_END {
+                self.cells[self.cursor as usize].row_idx
+            } else {
+                u16::MAX
+            };
+            Some(cell)
+        } else {
+            None
+        };
+        self.row += 1;
+        Some(result)
     }
+}
 
-    fn encode_bool_payload(&self, out: &mut Vec<u8>) -> crate::Result<()> {
+/// Encode a single column's payload by following the pre-indexed cell linked list.
+/// O(cells_for_column) instead of O(rows * entries_per_row) name comparisons.
+fn encode_column_from_cells(
+    col: &ColumnStats,
+    row_count: usize,
+    cells: &[CellRef],
+    symbol_dict: &[SymbolEntry],
+    value_bytes: &[u8],
+    out: &mut Vec<u8>,
+) -> crate::Result<()> {
+    let nullable = col.is_nullable(row_count);
+
+    // Null bitmap
+    if nullable {
         let mut packed = 0u8;
         let mut bit_idx = 0u8;
-        if self.nullable {
-            for value in self.values.iter().flatten() {
-                let flag = match value {
-                    ColumnValueRef::Bool(value) => *value,
-                    _ => {
-                        return Err(error::fmt!(
-                            InvalidApiCall,
-                            "internal QWP encoder type mismatch for boolean column"
-                        ));
-                    }
-                };
-                if flag {
-                    packed |= 1 << bit_idx;
-                }
-                bit_idx += 1;
-                if bit_idx == 8 {
-                    out.push(packed);
-                    packed = 0;
-                    bit_idx = 0;
-                }
+        for maybe_cell in GapFillIter::new(cells, col.cell_head, row_count) {
+            if maybe_cell.is_none() {
+                packed |= 1 << bit_idx;
             }
-        } else {
-            for value in &self.values {
-                let flag = match value.unwrap_or(ColumnValueRef::Bool(false)) {
-                    ColumnValueRef::Bool(value) => value,
-                    _ => {
-                        return Err(error::fmt!(
-                            InvalidApiCall,
-                            "internal QWP encoder type mismatch for boolean column"
-                        ));
-                    }
-                };
-                if flag {
-                    packed |= 1 << bit_idx;
-                }
-                bit_idx += 1;
-                if bit_idx == 8 {
-                    out.push(packed);
-                    packed = 0;
-                    bit_idx = 0;
-                }
+            bit_idx += 1;
+            if bit_idx == 8 {
+                out.push(packed);
+                packed = 0;
+                bit_idx = 0;
             }
         }
         if bit_idx != 0 {
             out.push(packed);
         }
-        Ok(())
     }
 
-    fn encode_i64_payload(&self, out: &mut Vec<u8>) -> crate::Result<()> {
-        if self.nullable {
-            for value in self.values.iter().flatten() {
-                let encoded = match value {
-                    ColumnValueRef::I64(value) => *value,
-                    _ => {
-                        return Err(error::fmt!(
-                            InvalidApiCall,
-                            "internal QWP encoder type mismatch for long column"
-                        ));
+    match col.kind {
+        ColumnKind::Bool => {
+            let mut packed = 0u8;
+            let mut bit_idx = 0u8;
+            if nullable {
+                for cell in CellIter::new(cells, col.cell_head) {
+                    if matches!(cell.value, ValueRef::Bool(true)) {
+                        packed |= 1 << bit_idx;
                     }
-                };
-                out.extend_from_slice(&encoded.to_le_bytes());
-            }
-        } else {
-            for value in &self.values {
-                let encoded = match value.unwrap_or(ColumnValueRef::I64(i64::MIN)) {
-                    ColumnValueRef::I64(value) => value,
-                    _ => {
-                        return Err(error::fmt!(
-                            InvalidApiCall,
-                            "internal QWP encoder type mismatch for long column"
-                        ));
+                    bit_idx += 1;
+                    if bit_idx == 8 {
+                        out.push(packed);
+                        packed = 0;
+                        bit_idx = 0;
                     }
-                };
-                out.extend_from_slice(&encoded.to_le_bytes());
-            }
-        }
-        Ok(())
-    }
-
-    fn encode_f64_payload(&self, out: &mut Vec<u8>) -> crate::Result<()> {
-        if self.nullable {
-            for value in self.values.iter().flatten() {
-                let encoded = match value {
-                    ColumnValueRef::F64(value) => *value,
-                    _ => {
-                        return Err(error::fmt!(
-                            InvalidApiCall,
-                            "internal QWP encoder type mismatch for double column"
-                        ));
-                    }
-                };
-                out.extend_from_slice(&encoded.to_le_bytes());
-            }
-        } else {
-            for value in &self.values {
-                let encoded = match value.unwrap_or(ColumnValueRef::F64(f64::NAN)) {
-                    ColumnValueRef::F64(value) => value,
-                    _ => {
-                        return Err(error::fmt!(
-                            InvalidApiCall,
-                            "internal QWP encoder type mismatch for double column"
-                        ));
-                    }
-                };
-                out.extend_from_slice(&encoded.to_le_bytes());
-            }
-        }
-        Ok(())
-    }
-
-    fn encode_timestamp_payload(&self, out: &mut Vec<u8>) -> crate::Result<()> {
-        for value in self.values.iter().flatten() {
-            let encoded = match value {
-                ColumnValueRef::Timestamp(value) => *value,
-                _ => {
-                    return Err(error::fmt!(
-                        InvalidApiCall,
-                        "internal QWP encoder type mismatch for timestamp column"
-                    ));
                 }
-            };
-            out.extend_from_slice(&encoded.to_le_bytes());
-        }
-        Ok(())
-    }
-
-    fn encode_string_payload(&self, out: &mut Vec<u8>) -> crate::Result<()> {
-        let mut offsets = Vec::new();
-        offsets.push(0i32);
-        let mut data = Vec::new();
-        for value in self.values.iter().flatten() {
-            let text = match value {
-                ColumnValueRef::String(value) => *value,
-                _ => {
-                    return Err(error::fmt!(
-                        InvalidApiCall,
-                        "internal QWP encoder type mismatch for string column"
-                    ));
-                }
-            };
-            data.extend_from_slice(text.as_bytes());
-            let offset: i32 = data.len().try_into().map_err(|_| {
-                error::fmt!(InvalidApiCall, "QWP string payload exceeds i32 length")
-            })?;
-            offsets.push(offset);
-        }
-        for offset in offsets {
-            out.extend_from_slice(&offset.to_le_bytes());
-        }
-        out.extend_from_slice(&data);
-        Ok(())
-    }
-
-    fn encode_symbol_payload(&self, out: &mut Vec<u8>) -> crate::Result<()> {
-        let mut dict = Vec::<String>::new();
-        let mut dict_indexes = HashMap::<String, usize>::new();
-        let mut row_indexes = Vec::<usize>::new();
-
-        for value in self.values.iter().flatten() {
-            let symbol = match value {
-                ColumnValueRef::Symbol(value) => *value,
-                _ => {
-                    return Err(error::fmt!(
-                        InvalidApiCall,
-                        "internal QWP encoder type mismatch for symbol column"
-                    ));
-                }
-            };
-            let idx = if let Some(idx) = dict_indexes.get(symbol) {
-                *idx
             } else {
-                let idx = dict.len();
-                let key = symbol.to_owned();
-                dict.push(key.clone());
-                dict_indexes.insert(key, idx);
-                idx
-            };
-            row_indexes.push(idx);
+                for maybe_cell in GapFillIter::new(cells, col.cell_head, row_count) {
+                    if maybe_cell.is_some_and(|c| matches!(c.value, ValueRef::Bool(true))) {
+                        packed |= 1 << bit_idx;
+                    }
+                    bit_idx += 1;
+                    if bit_idx == 8 {
+                        out.push(packed);
+                        packed = 0;
+                        bit_idx = 0;
+                    }
+                }
+            }
+            if bit_idx != 0 {
+                out.push(packed);
+            }
         }
 
-        write_qwp_varint(out, dict.len() as u64);
-        for symbol in &dict {
-            write_qwp_string(out, symbol);
+        ColumnKind::I64 => {
+            if nullable {
+                for cell in CellIter::new(cells, col.cell_head) {
+                    if let ValueRef::I64(v) = cell.value {
+                        out.extend_from_slice(&v.to_le_bytes());
+                    }
+                }
+            } else {
+                for maybe_cell in GapFillIter::new(cells, col.cell_head, row_count) {
+                    let v = match maybe_cell.map(|c| c.value) {
+                        Some(ValueRef::I64(v)) => v,
+                        _ => i64::MIN,
+                    };
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+            }
         }
-        for idx in row_indexes {
-            write_qwp_varint(out, idx as u64);
-        }
-        Ok(())
-    }
-}
 
-fn write_null_bitmap(out: &mut Vec<u8>, values: &[Option<ColumnValueRef<'_>>]) {
-    let mut packed = 0u8;
-    let mut bit_idx = 0u8;
-    for value in values {
-        if value.is_none() {
-            packed |= 1 << bit_idx;
+        ColumnKind::F64 => {
+            if nullable {
+                for cell in CellIter::new(cells, col.cell_head) {
+                    if let ValueRef::F64(v) = cell.value {
+                        out.extend_from_slice(&v.to_le_bytes());
+                    }
+                }
+            } else {
+                for maybe_cell in GapFillIter::new(cells, col.cell_head, row_count) {
+                    let v = match maybe_cell.map(|c| c.value) {
+                        Some(ValueRef::F64(v)) => v,
+                        _ => f64::NAN,
+                    };
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+            }
         }
-        bit_idx += 1;
-        if bit_idx == 8 {
-            out.push(packed);
-            packed = 0;
-            bit_idx = 0;
+
+        ColumnKind::TimestampMicros | ColumnKind::TimestampNanos => {
+            for cell in CellIter::new(cells, col.cell_head) {
+                if let ValueRef::TimestampMicros(v) | ValueRef::TimestampNanos(v) = cell.value {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+        }
+
+        ColumnKind::String => {
+            let non_null_count = col.non_null_count as usize;
+            let offsets_start = out.len();
+            out.resize(out.len() + (non_null_count + 1) * 4, 0);
+            out[offsets_start..offsets_start + 4].copy_from_slice(&0i32.to_le_bytes());
+
+            let mut cumulative: i32 = 0;
+            let mut offset_idx = 1usize;
+            for cell in CellIter::new(cells, col.cell_head) {
+                if let ValueRef::String(vs) = cell.value {
+                    let text = &value_bytes[vs.0.as_range()];
+                    out.extend_from_slice(text);
+                    cumulative += text.len() as i32;
+                    let pos = offsets_start + offset_idx * 4;
+                    out[pos..pos + 4].copy_from_slice(&cumulative.to_le_bytes());
+                    offset_idx += 1;
+                }
+            }
+        }
+
+        ColumnKind::Symbol => {
+            // Dictionary via linked list
+            write_qwp_varint(out, col.dict_count as u64);
+            let mut dict_cursor = col.dict_head;
+            while dict_cursor != CELL_END {
+                let de = &symbol_dict[dict_cursor as usize];
+                write_qwp_bytes(out, &value_bytes[de.value.0.as_range()]);
+                dict_cursor = de.next;
+            }
+            // Row indexes from pre-computed cell indexes (O(1) per cell)
+            for cell in CellIter::new(cells, col.cell_head) {
+                write_qwp_varint(out, cell.symbol_dict_idx as u64);
+            }
         }
     }
-    if bit_idx != 0 {
-        out.push(packed);
-    }
+
+    Ok(())
 }
 
 fn unsupported_qwp_call(method: &str) -> crate::Error {
@@ -1558,22 +1903,10 @@ fn unsupported_qwp_call(method: &str) -> crate::Error {
     )
 }
 
-fn hash_name(name: &str) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    name.hash(&mut hasher);
-    hasher.finish()
-}
-
-fn pending_timestamp(timestamp: Timestamp) -> PendingTimestamp {
+fn to_designated_ts(timestamp: Timestamp) -> DesignatedTs {
     match timestamp {
-        Timestamp::Micros(ts) => PendingTimestamp {
-            value: ts.as_i64(),
-            nanos: false,
-        },
-        Timestamp::Nanos(ts) => PendingTimestamp {
-            value: ts.as_i64(),
-            nanos: true,
-        },
+        Timestamp::Micros(ts) => DesignatedTs::Micros(ts.as_i64()),
+        Timestamp::Nanos(ts) => DesignatedTs::Nanos(ts.as_i64()),
     }
 }
 
@@ -1581,6 +1914,18 @@ fn pending_timestamp(timestamp: Timestamp) -> PendingTimestamp {
 mod tests {
     use super::*;
     use crate::ingress::{TimestampMicros, TimestampNanos};
+
+    #[test]
+    fn qwp_struct_sizes() {
+        use std::mem::size_of;
+        assert_eq!(size_of::<ValueRef>(), 16);
+        assert_eq!(size_of::<CellRef>(), 24);
+        assert_eq!(size_of::<EntryMeta>(), 24);
+        assert_eq!(size_of::<RowMeta>(), 32);
+        assert_eq!(size_of::<ColumnStats>(), 48);
+        assert_eq!(size_of::<ColumnUndo>(), 28);
+        assert_eq!(size_of::<Option<DesignatedTs>>(), size_of::<DesignatedTs>());
+    }
 
     #[test]
     fn qwp_single_row_with_designated_timestamp_encodes_header() {
@@ -1697,8 +2042,26 @@ mod tests {
 
         for prefix_len in 1..=buf.rows.len() {
             let rows = &buf.rows[..prefix_len];
-            let estimated = estimated_row_group_len(rows).unwrap();
-            let actual = encode_row_group(rows).unwrap().len();
+            let table_name = buf.name_str(rows[0].table);
+            let mut planner = RowGroupPlanner::new();
+            for row in rows {
+                let row_entries = buf.entries_for_row(row);
+                planner
+                    .add_row(row, row_entries, &buf.name_bytes, &buf.value_bytes, table_name.len())
+                    .unwrap();
+            }
+            let estimated = planner.current_len;
+
+            let mut datagram_buf = Vec::new();
+            encode_row_group_from_scratch(
+                &planner,
+                &buf.name_bytes,
+                &buf.value_bytes,
+                table_name.as_bytes(),
+                &mut datagram_buf,
+            )
+            .unwrap();
+            let actual = datagram_buf.len();
             assert_eq!(estimated, actual, "prefix {prefix_len}");
         }
     }
@@ -1719,8 +2082,26 @@ mod tests {
 
         for prefix_len in 1..=buf.rows.len() {
             let rows = &buf.rows[..prefix_len];
-            let estimated = estimated_row_group_len(rows).unwrap();
-            let actual = encode_row_group(rows).unwrap().len();
+            let table_name = buf.name_str(rows[0].table);
+            let mut planner = RowGroupPlanner::new();
+            for row in rows {
+                let row_entries = buf.entries_for_row(row);
+                planner
+                    .add_row(row, row_entries, &buf.name_bytes, &buf.value_bytes, table_name.len())
+                    .unwrap();
+            }
+            let estimated = planner.current_len;
+
+            let mut datagram_buf = Vec::new();
+            encode_row_group_from_scratch(
+                &planner,
+                &buf.name_bytes,
+                &buf.value_bytes,
+                table_name.as_bytes(),
+                &mut datagram_buf,
+            )
+            .unwrap();
+            let actual = datagram_buf.len();
             assert_eq!(estimated, actual, "prefix {}", prefix_len);
         }
     }
@@ -1977,5 +2358,474 @@ mod tests {
             .map(Vec::len)
             .sum();
         assert_eq!(buf.len(), actual_after);
+    }
+
+    #[test]
+    fn qwp_retained_capacity_after_clear() {
+        let mut buf = QwpBuffer::new(127);
+
+        for i in 0..10 {
+            buf.table("trades")
+                .unwrap()
+                .symbol("sym", format!("SYM-{i}"))
+                .unwrap()
+                .column_i64("qty", i)
+                .unwrap()
+                .at_now()
+                .unwrap();
+        }
+
+        let cap_before = buf.capacity();
+        assert!(cap_before > 0);
+
+        buf.clear();
+        let cap_after = buf.capacity();
+        assert_eq!(cap_before, cap_after, "capacity must not drop after clear()");
+
+        // Refill
+        for i in 0..10 {
+            buf.table("trades")
+                .unwrap()
+                .symbol("sym", format!("SYM-{i}"))
+                .unwrap()
+                .column_i64("qty", i)
+                .unwrap()
+                .at_now()
+                .unwrap();
+        }
+
+        let cap_refilled = buf.capacity();
+        assert_eq!(
+            cap_before, cap_refilled,
+            "capacity must not change after refill with same workload"
+        );
+    }
+
+    #[test]
+    fn qwp_marker_rewind_tail_segment() {
+        let mut buf = QwpBuffer::new(127);
+
+        buf.table("trades")
+            .unwrap()
+            .symbol("sym", "ETH-USD")
+            .unwrap()
+            .column_i64("qty", 1)
+            .unwrap()
+            .at_now()
+            .unwrap();
+
+        buf.set_marker().unwrap();
+
+        // Add more rows to same table (same segment)
+        buf.table("trades")
+            .unwrap()
+            .symbol("sym", "BTC-USD")
+            .unwrap()
+            .column_i64("qty", 2)
+            .unwrap()
+            .at_now()
+            .unwrap();
+
+        buf.table("trades")
+            .unwrap()
+            .symbol("sym", "SOL-USD")
+            .unwrap()
+            .column_i64("qty", 3)
+            .unwrap()
+            .at_now()
+            .unwrap();
+
+        assert_eq!(buf.segments.len(), 1);
+        assert_eq!(buf.segments[0].row_count, 3);
+
+        buf.rewind_to_marker().unwrap();
+
+        assert_eq!(buf.segments.len(), 1);
+        assert_eq!(buf.segments[0].row_count, 1);
+        assert_eq!(buf.rows.len(), 1);
+
+        // Can continue adding rows
+        buf.table("trades")
+            .unwrap()
+            .symbol("sym", "DOGE-USD")
+            .unwrap()
+            .column_i64("qty", 4)
+            .unwrap()
+            .at_now()
+            .unwrap();
+
+        assert_eq!(buf.segments[0].row_count, 2);
+
+        let datagrams = buf.encode_datagrams(1400).unwrap();
+        assert_eq!(datagrams.len(), 1);
+    }
+
+    #[test]
+    fn qwp_clone_while_pending() {
+        let mut buf = QwpBuffer::new(127);
+
+        buf.table("trades")
+            .unwrap()
+            .symbol("sym", "ETH-USD")
+            .unwrap()
+            .column_i64("qty", 1)
+            .unwrap()
+            .at_now()
+            .unwrap();
+
+        // Start a new row but don't finish it
+        buf.table("trades")
+            .unwrap()
+            .symbol("sym", "BTC-USD")
+            .unwrap();
+
+        let mut cloned = buf.clone();
+
+        // Finish in original
+        buf.column_i64("qty", 2).unwrap();
+        buf.at_now().unwrap();
+
+        // Finish in clone with different data
+        cloned.column_f64("px", 42.5).unwrap();
+        cloned.at_now().unwrap();
+
+        assert_eq!(buf.row_count(), 2);
+        assert_eq!(cloned.row_count(), 2);
+
+        // They should produce different datagrams
+        let orig_dgrams = buf.encode_datagrams(1400).unwrap();
+        let cloned_dgrams = cloned.encode_datagrams(1400).unwrap();
+        assert_ne!(orig_dgrams, cloned_dgrams);
+    }
+
+    #[test]
+    fn qwp_line_sender_protocol_behavior_after_close() {
+        let mut buf = QwpBuffer::new(127);
+        buf.table("test")
+            .unwrap()
+            .symbol("s", "v")
+            .unwrap()
+            .column_i64("x", 1)
+            .unwrap();
+        buf.at_now().unwrap();
+
+        buf.clear();
+        assert!(buf.is_empty());
+        assert_eq!(buf.row_count(), 0);
+        assert_eq!(buf.len(), 0);
+    }
+
+    #[test]
+    fn qwp_single_row_oversize_returns_error() {
+        let mut buf = QwpBuffer::new(127);
+        buf.table("trades")
+            .unwrap()
+            .symbol("sym", "ETH-USD")
+            .unwrap()
+            .column_str("venue", "a]]very-long-string-that-makes-the-row-big")
+            .unwrap()
+            .column_i64("qty", 42)
+            .unwrap();
+        buf.at_now().unwrap();
+
+        // Use a very small max datagram size so one row can't fit
+        let result = buf.encode_datagrams(30);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("single row exceeds"));
+    }
+
+    #[test]
+    fn qwp_planner_checkpoint_rollback_restores_state() {
+        let mut planner = RowGroupPlanner::new();
+        let mut buf = QwpBuffer::new(127);
+
+        buf.table("t")
+            .unwrap()
+            .symbol("s", "a")
+            .unwrap()
+            .column_i64("x", 1)
+            .unwrap();
+        buf.at_now().unwrap();
+
+        buf.table("t")
+            .unwrap()
+            .symbol("s", "b")
+            .unwrap()
+            .column_i64("x", 2)
+            .unwrap();
+        buf.at_now().unwrap();
+
+        let row0 = &buf.rows[0];
+        let row1 = &buf.rows[1];
+        let entries0 = buf.entries_for_row(row0);
+        let entries1 = buf.entries_for_row(row1);
+
+        // Add first row
+        planner
+            .add_row(row0, entries0, &buf.name_bytes, &buf.value_bytes, "t".len())
+            .unwrap();
+        let len_after_1 = planner.current_len;
+        assert_eq!(planner.row_count(), 1);
+
+        // Checkpoint, add second row, then rollback
+        let cp = planner.checkpoint();
+        planner
+            .add_row(row1, entries1, &buf.name_bytes, &buf.value_bytes, "t".len())
+            .unwrap();
+        assert_eq!(planner.row_count(), 2);
+        assert!(planner.current_len > len_after_1);
+
+        planner.rollback(cp);
+        assert_eq!(planner.row_count(), 1);
+        assert_eq!(planner.current_len, len_after_1);
+        assert_eq!(planner.columns.len(), cp.columns_len);
+    }
+
+    #[test]
+    fn qwp_planner_rollback_returns_new_columns_to_pool() {
+        let mut planner = RowGroupPlanner::new();
+        let mut buf = QwpBuffer::new(127);
+
+        // Row 1: only "x"
+        buf.table("t")
+            .unwrap()
+            .column_i64("x", 1)
+            .unwrap();
+        buf.at_now().unwrap();
+
+        // Row 2: "x" and "y" (introduces new column)
+        buf.table("t")
+            .unwrap()
+            .column_i64("x", 2)
+            .unwrap()
+            .column_i64("y", 3)
+            .unwrap();
+        buf.at_now().unwrap();
+
+        let row0 = &buf.rows[0];
+        let row1 = &buf.rows[1];
+        let entries0 = buf.entries_for_row(row0);
+        let entries1 = buf.entries_for_row(row1);
+
+        planner
+            .add_row(row0, entries0, &buf.name_bytes, &buf.value_bytes, "t".len())
+            .unwrap();
+        assert_eq!(planner.columns.len(), 1); // just "x"
+
+        let cp = planner.checkpoint();
+        planner
+            .add_row(row1, entries1, &buf.name_bytes, &buf.value_bytes, "t".len())
+            .unwrap();
+        assert_eq!(planner.columns.len(), 2); // "x" + "y"
+
+        planner.rollback(cp);
+        assert_eq!(planner.columns.len(), 1); // "y" removed by truncate
+    }
+
+    #[test]
+    fn qwp_long_lived_churn_retains_capacity_without_unbounded_growth() {
+        let mut buf = QwpBuffer::new(127);
+        let mut scratch = QwpSendScratch::new(1400);
+
+        // Simulate many fill/flush/clear cycles with varying table names
+        for cycle in 0..20 {
+            for i in 0..5 {
+                let tname = format!("table_{}", cycle % 3);
+                buf.table(tname.as_str())
+                    .unwrap()
+                    .symbol("sym", format!("sym-{i}"))
+                    .unwrap()
+                    .column_i64("x", i)
+                    .unwrap();
+                buf.at_now().unwrap();
+            }
+
+            // Flush to a no-op sink
+            buf.flush_to_socket(&mut scratch, 1400, &mut |_| Ok(()))
+                .unwrap();
+            buf.clear();
+        }
+
+        // After many cycles, capacity should be bounded, not growing unboundedly.
+        // The pool should have reusable columns.
+        let cap = buf.capacity();
+        assert!(cap > 0);
+
+        // Do one more cycle and verify capacity doesn't grow
+        for i in 0..5 {
+            buf.table("table_0")
+                .unwrap()
+                .symbol("sym", format!("sym-{i}"))
+                .unwrap()
+                .column_i64("x", i)
+                .unwrap();
+            buf.at_now().unwrap();
+        }
+        buf.flush_to_socket(&mut scratch, 1400, &mut |_| Ok(()))
+            .unwrap();
+        buf.clear();
+
+        // Capacity should be stable
+        assert!(buf.capacity() <= cap * 2, "capacity should not grow unboundedly");
+    }
+
+    #[test]
+    fn qwp_sparse_wide_rows_planner_stays_bounded() {
+        // Test with rows that have very different column sets
+        let mut buf = QwpBuffer::new(127);
+
+        // Row 1: columns a, b, c
+        buf.table("wide")
+            .unwrap()
+            .column_i64("a", 1)
+            .unwrap()
+            .column_i64("b", 2)
+            .unwrap()
+            .column_i64("c", 3)
+            .unwrap();
+        buf.at_now().unwrap();
+
+        // Row 2: columns d, e, f (completely different)
+        buf.table("wide")
+            .unwrap()
+            .column_i64("d", 4)
+            .unwrap()
+            .column_i64("e", 5)
+            .unwrap()
+            .column_i64("f", 6)
+            .unwrap();
+        buf.at_now().unwrap();
+
+        // Row 3: columns a, d (mix)
+        buf.table("wide")
+            .unwrap()
+            .column_i64("a", 7)
+            .unwrap()
+            .column_i64("d", 8)
+            .unwrap();
+        buf.at_now().unwrap();
+
+        // Should produce valid datagrams
+        let datagrams = buf.encode_datagrams(1400).unwrap();
+        assert_eq!(datagrams.len(), 1);
+
+        // Verify estimated len matches actual
+        let estimated = buf.len();
+        let actual: usize = datagrams.iter().map(Vec::len).sum();
+        assert_eq!(estimated, actual);
+    }
+
+    #[test]
+    fn qwp_split_near_varint_boundary() {
+        // Create rows that push symbol dictionary size across varint boundary (128 symbols)
+        let mut buf = QwpBuffer::new(127);
+        for i in 0..140 {
+            buf.table("syms")
+                .unwrap()
+                .symbol("s", format!("v{i}"))
+                .unwrap()
+                .column_i64("x", i)
+                .unwrap();
+            buf.at_now().unwrap();
+        }
+
+        // Use a size that forces splits around the varint boundary
+        let datagrams = buf.encode_datagrams(400).unwrap();
+        assert!(datagrams.len() > 1);
+
+        // Verify each datagram is valid (starts with QWP1 header)
+        for d in &datagrams {
+            assert_eq!(&d[0..4], b"QWP1");
+            let payload_len =
+                u32::from_le_bytes([d[8], d[9], d[10], d[11]]) as usize;
+            assert_eq!(payload_len, d.len() - QWP_MESSAGE_HEADER_SIZE);
+        }
+
+        // Verify total estimated len matches actual
+        let estimated = buf.len();
+        // The estimated len is for unsplit encoding, so it should match
+        // a single-datagram encoding
+        let unsplit: usize = buf
+            .encode_datagrams(usize::MAX)
+            .unwrap()
+            .iter()
+            .map(Vec::len)
+            .sum();
+        assert_eq!(estimated, unsplit);
+    }
+
+    /// Run with: `cargo test --features sync-sender-qwp-udp -- qwp_zero_alloc --ignored --test-threads=1`
+    #[test]
+    #[ignore = "requires single-threaded execution: --test-threads=1"]
+    fn qwp_zero_alloc_steady_state_after_prewarm() {
+        use crate::alloc_counter;
+
+        // Prewarm: fill buffer and scratch, flush, clear
+        let mut buf = QwpBuffer::new(127);
+        let mut scratch = QwpSendScratch::new(1400);
+
+        // Use fixed-length strings to avoid format! allocations in the hot loop
+        let symbols = ["AAA", "BBB", "CCC", "DDD", "EEE"];
+        let venues = ["tokyo", "london", "newyork", "paris", "berlin"];
+
+        // Warmup cycle: ensure all vecs have grown to needed capacity
+        for i in 0..5 {
+            buf.table("trades")
+                .unwrap()
+                .symbol("sym", symbols[i])
+                .unwrap()
+                .column_i64("qty", i as i64)
+                .unwrap()
+                .column_str("venue", venues[i])
+                .unwrap();
+            buf.at_now().unwrap();
+        }
+        buf.flush_to_socket(&mut scratch, 1400, &mut |_| Ok(()))
+            .unwrap();
+        buf.clear();
+
+        // Second warmup to ensure planner pool is populated
+        for i in 0..5 {
+            buf.table("trades")
+                .unwrap()
+                .symbol("sym", symbols[i])
+                .unwrap()
+                .column_i64("qty", i as i64)
+                .unwrap()
+                .column_str("venue", venues[i])
+                .unwrap();
+            buf.at_now().unwrap();
+        }
+        buf.flush_to_socket(&mut scratch, 1400, &mut |_| Ok(()))
+            .unwrap();
+        buf.clear();
+
+        // Now measure steady-state allocations
+        alloc_counter::start_counting();
+
+        for _cycle in 0..5 {
+            for i in 0..5 {
+                buf.table("trades")
+                    .unwrap()
+                    .symbol("sym", symbols[i])
+                    .unwrap()
+                    .column_i64("qty", i as i64)
+                    .unwrap()
+                    .column_str("venue", venues[i])
+                    .unwrap();
+                buf.at_now().unwrap();
+            }
+            buf.flush_to_socket(&mut scratch, 1400, &mut |_| Ok(()))
+                .unwrap();
+            buf.clear();
+        }
+
+        let alloc_count = alloc_counter::stop_counting();
+        assert_eq!(
+            alloc_count, 0,
+            "Expected zero allocations in steady state after prewarm, got {alloc_count}"
+        );
     }
 }

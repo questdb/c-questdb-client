@@ -155,7 +155,7 @@ impl Sender {
     fn flush_impl(&mut self, buf: &Buffer, transactional: bool) -> Result<()> {
         #[cfg(feature = "sync-sender-qwp-udp")]
         #[allow(irrefutable_let_patterns)]
-        if let SyncProtocolHandler::SyncQwpUdp(ref state) = self.handler {
+        if let SyncProtocolHandler::SyncQwpUdp(ref mut state) = self.handler {
             let qwp = buf.as_qwp().ok_or_else(|| {
                 error::fmt!(
                     InvalidApiCall,

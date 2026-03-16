@@ -38,6 +38,8 @@ pub use self::ilp::{ColumnName, TableName};
 
 #[cfg(feature = "_sender-qwp-udp")]
 pub(crate) use self::qwp::QwpBuffer;
+#[cfg(feature = "_sender-qwp-udp")]
+pub(crate) use self::qwp::QwpSendScratch;
 
 #[derive(Clone, Debug)]
 enum BufferInner {

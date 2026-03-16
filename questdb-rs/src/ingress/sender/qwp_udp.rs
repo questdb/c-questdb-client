@@ -24,19 +24,17 @@
 
 use crate::error;
 use crate::ingress::SyncProtocolHandler;
-use crate::ingress::buffer::QwpBuffer;
+use crate::ingress::buffer::{QwpBuffer, QwpSendScratch};
 use crate::ingress::conf::QwpUdpConfig;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs, UdpSocket};
 
 pub(crate) struct SyncQwpUdpHandlerState {
-    #[allow(dead_code)]
     pub(crate) socket: UdpSocket,
-    #[allow(dead_code)]
     pub(crate) target_addr: SocketAddrV4,
-    #[allow(dead_code)]
     pub(crate) max_datagram_size: usize,
     #[allow(dead_code)]
     pub(crate) multicast_ttl: u32,
+    pub(crate) scratch: QwpSendScratch,
 }
 
 fn resolve_udp_target(host: &str, port: &str) -> crate::Result<SocketAddrV4> {
@@ -131,38 +129,48 @@ pub(crate) fn connect_qwp_udp(
             )
         })?;
 
+    let max_datagram_size = *qwp_udp.max_datagram_size;
+
     Ok(SyncProtocolHandler::SyncQwpUdp(SyncQwpUdpHandlerState {
         socket,
         target_addr,
-        max_datagram_size: *qwp_udp.max_datagram_size,
+        max_datagram_size,
         multicast_ttl: *qwp_udp.multicast_ttl,
+        scratch: QwpSendScratch::new(max_datagram_size),
     }))
 }
 
 pub(crate) fn flush_qwp_udp(
-    state: &SyncQwpUdpHandlerState,
+    state: &mut SyncQwpUdpHandlerState,
     buffer: &QwpBuffer,
 ) -> crate::Result<()> {
-    for datagram in buffer.encode_datagrams(state.max_datagram_size)? {
-        let sent = state.socket.send(&datagram).map_err(|io_err| {
-            error::fmt!(
-                SocketError,
-                "Could not send UDP datagram to {:?}: {}",
-                state.target_addr,
-                io_err
-            )
-        })?;
+    let target_addr = state.target_addr;
+    let max_datagram_size = state.max_datagram_size;
 
-        if sent != datagram.len() {
-            return Err(error::fmt!(
-                SocketError,
-                "Could not send complete UDP datagram to {:?}: wrote {} of {} bytes",
-                state.target_addr,
-                sent,
-                datagram.len()
-            ));
-        }
-    }
+    buffer.flush_to_socket(
+        &mut state.scratch,
+        max_datagram_size,
+        &mut |datagram: &[u8]| {
+            let sent = state.socket.send(datagram).map_err(|io_err| {
+                error::fmt!(
+                    SocketError,
+                    "Could not send UDP datagram to {:?}: {}",
+                    target_addr,
+                    io_err
+                )
+            })?;
 
-    Ok(())
+            if sent != datagram.len() {
+                return Err(error::fmt!(
+                    SocketError,
+                    "Could not send complete UDP datagram to {:?}: wrote {} of {} bytes",
+                    target_addr,
+                    sent,
+                    datagram.len()
+                ));
+            }
+
+            Ok(())
+        },
+    )
 }
