@@ -576,7 +576,7 @@ fn qwp_udp_encodes_sparse_timestamp_columns_as_nullable_nulls() -> TestResult {
 #[test]
 fn qwp_udp_rejects_mixed_designated_timestamp_precisions_within_table_batch() -> TestResult {
     let mock = QwpUdpMock::new()?;
-    let mut sender = mock.sender_builder().build()?;
+    let sender = mock.sender_builder().build()?;
     let mut buffer = sender.new_buffer();
 
     buffer
@@ -584,19 +584,88 @@ fn qwp_udp_rejects_mixed_designated_timestamp_precisions_within_table_batch() ->
         .symbol("sym", "ETH-USD")?
         .column_i64("qty", 1)?
         .at(TimestampMicros::new(123_456))?;
-    buffer
-        .table("trades")?
-        .symbol("sym", "BTC-USD")?
-        .column_i64("qty", 2)?
-        .at(TimestampNanos::new(789_000))?;
-
     let size_hint = buffer.len();
     assert!(size_hint > 0);
 
+    buffer
+        .table("trades")?
+        .symbol("sym", "BTC-USD")?
+        .column_i64("qty", 2)?;
+
     assert_err_contains(
-        sender.flush_and_keep(&buffer),
+        buffer.at(TimestampNanos::new(789_000)),
         ErrorCode::InvalidApiCall,
-        r#"QWP/UDP column "" changes type within a batched table"#,
+        "QWP/UDP designated timestamp changes type within a batched table",
+    );
+    assert_eq!(buffer.row_count(), 1);
+    assert_eq!(buffer.len(), size_hint);
+
+    Ok(())
+}
+
+#[test]
+fn qwp_udp_recovers_after_failed_designated_timestamp_commit() -> TestResult {
+    let mock = QwpUdpMock::new()?;
+    let mut sender = mock.sender_builder().build()?;
+    let mut buffer = sender.new_buffer();
+    let mut expected = sender.new_buffer();
+
+    buffer
+        .table("trades")?
+        .symbol("sym", "ETH-USD")?
+        .column_i64("qty", 1)?
+        .at(TimestampMicros::new(123_456))?;
+    expected
+        .table("trades")?
+        .symbol("sym", "ETH-USD")?
+        .column_i64("qty", 1)?
+        .at(TimestampMicros::new(123_456))?;
+    let size_hint = buffer.len();
+
+    buffer
+        .table("trades")?
+        .symbol("sym", "BTC-USD")?
+        .column_i64("qty", 2)?;
+    assert_err_contains(
+        buffer.at(TimestampNanos::new(789_000)),
+        ErrorCode::InvalidApiCall,
+        "QWP/UDP designated timestamp changes type within a batched table",
+    );
+
+    assert_eq!(buffer.row_count(), 1);
+    assert_eq!(buffer.len(), size_hint);
+
+    buffer
+        .table("trades")?
+        .symbol("sym", "SOL-USD")?
+        .column_i64("qty", 3)?
+        .at(TimestampMicros::new(999_000))?;
+    expected
+        .table("trades")?
+        .symbol("sym", "SOL-USD")?
+        .column_i64("qty", 3)?
+        .at(TimestampMicros::new(999_000))?;
+
+    assert_eq!(buffer.len(), expected.len());
+
+    sender.flush(&mut buffer)?;
+    let decoded = decode_datagram(&mock.recv_datagram()?).expect("datagram should decode");
+    assert_eq!(decoded.table.name, "trades");
+    assert_eq!(decoded.table.row_count, 2);
+    assert_eq!(
+        decoded.table.rows,
+        vec![
+            vec![
+                DecodedValue::Symbol("ETH-USD".to_owned()),
+                DecodedValue::I64(1),
+                DecodedValue::TimestampMicros(123_456),
+            ],
+            vec![
+                DecodedValue::Symbol("SOL-USD".to_owned()),
+                DecodedValue::I64(3),
+                DecodedValue::TimestampMicros(999_000),
+            ],
+        ]
     );
 
     Ok(())
@@ -605,7 +674,7 @@ fn qwp_udp_rejects_mixed_designated_timestamp_precisions_within_table_batch() ->
 #[test]
 fn qwp_udp_rejects_mixed_timestamp_column_precisions_within_table_batch() -> TestResult {
     let mock = QwpUdpMock::new()?;
-    let mut sender = mock.sender_builder().build()?;
+    let sender = mock.sender_builder().build()?;
     let mut buffer = sender.new_buffer();
 
     buffer
@@ -613,20 +682,21 @@ fn qwp_udp_rejects_mixed_timestamp_column_precisions_within_table_batch() -> Tes
         .symbol("sym", "ETH-USD")?
         .column_ts("event_ts", TimestampMicros::new(123_456))?
         .at_now()?;
-    buffer
-        .table("trades")?
-        .symbol("sym", "BTC-USD")?
-        .column_ts("event_ts", TimestampNanos::new(789_000))?
-        .at_now()?;
-
     let size_hint = buffer.len();
     assert!(size_hint > 0);
 
+    buffer
+        .table("trades")?
+        .symbol("sym", "BTC-USD")?
+        .column_ts("event_ts", TimestampNanos::new(789_000))?;
+
     assert_err_contains(
-        sender.flush_and_keep(&buffer),
+        buffer.at_now(),
         ErrorCode::InvalidApiCall,
         r#"QWP/UDP column "event_ts" changes type within a batched table"#,
     );
+    assert_eq!(buffer.row_count(), 1);
+    assert_eq!(buffer.len(), size_hint);
 
     Ok(())
 }

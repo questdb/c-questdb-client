@@ -319,22 +319,16 @@ impl QwpSizeHint {
 
         if same_group {
             let previous_len = self.planner.current_len;
-            match self
-                .planner
-                .add_row(row, row_entries, name_bytes, value_bytes, table_name.len())
+            let cp = self.planner.checkpoint();
+            if let Err(err) =
+                self.planner
+                    .add_row(row, row_entries, name_bytes, value_bytes, table_name.len())
             {
-                Ok(()) => {
-                    let new_len = self.planner.current_len;
-                    self.committed_len = self.committed_len - previous_len + new_len;
-                }
-                Err(err) if is_batched_type_change_error(&err) => {
-                    self.committed_len +=
-                        standalone_row_group_len(row, row_entries, name_bytes, value_bytes);
-                    self.planner.clear();
-                    self.group_table = None;
-                }
-                Err(err) => return Err(err),
+                self.planner.rollback(cp);
+                return Err(err);
             }
+            let new_len = self.planner.current_len;
+            self.committed_len = self.committed_len - previous_len + new_len;
             return Ok(());
         }
 
@@ -863,13 +857,17 @@ impl QwpBuffer {
         };
 
         // Update size hint before segments (fallible, must not leave partial state)
-        self.size_hint.add_committed_row(
+        if let Err(err) = self.size_hint.add_committed_row(
             &row,
             &self.entries,
             &self.name_bytes,
             &self.value_bytes,
             last_seg_table,
-        )?;
+        ) {
+            self.rollback_pending();
+            self.state.op_case = OpCase::MayFlushOrTable;
+            return Err(err);
+        }
 
         // Update segments (infallible)
         if same_table {
@@ -1125,6 +1123,21 @@ fn designated_ts_entry(ts: DesignatedTs) -> EntryMeta {
             DesignatedTs::Micros(v) => ValueRef::TimestampMicros(v),
             DesignatedTs::Nanos(v) => ValueRef::TimestampNanos(v),
         },
+    }
+}
+
+fn batched_type_change_error(entry_name: &[u8]) -> crate::Error {
+    if entry_name.is_empty() {
+        error::fmt!(
+            InvalidApiCall,
+            "QWP/UDP designated timestamp changes type within a batched table"
+        )
+    } else {
+        error::fmt!(
+            InvalidApiCall,
+            "QWP/UDP column {:?} changes type within a batched table",
+            std::str::from_utf8(entry_name).unwrap_or("<invalid>")
+        )
     }
 }
 
@@ -1446,11 +1459,7 @@ impl RowGroupPlanner {
             if let Some(idx) = self.find_column(entry_name, name_bytes) {
                 let col = &mut self.columns[idx];
                 if col.kind != entry.value.kind() {
-                    return Err(error::fmt!(
-                        InvalidApiCall,
-                        "QWP/UDP column {:?} changes type within a batched table",
-                        std::str::from_utf8(entry_name).unwrap_or("<invalid>")
-                    ));
+                    return Err(batched_type_change_error(entry_name));
                 }
                 self.undo_stack.push(ColumnUndo {
                     non_null_count: col.non_null_count,
@@ -1622,25 +1631,6 @@ fn kind_supports_sparse_nulls(kind: ColumnKind) -> bool {
             | ColumnKind::TimestampMicros
             | ColumnKind::TimestampNanos
     )
-}
-
-fn standalone_row_group_len(
-    row: &RowMeta,
-    row_entries: &[EntryMeta],
-    name_bytes: &[u8],
-    value_bytes: &[u8],
-) -> usize {
-    let table_name = &name_bytes[row.table.0.as_range()];
-    let mut planner = RowGroupPlanner::new_stats_only();
-    match planner.add_row(row, row_entries, name_bytes, value_bytes, table_name.len()) {
-        Ok(()) => planner.current_len,
-        Err(_) => 0,
-    }
-}
-
-fn is_batched_type_change_error(err: &Error) -> bool {
-    err.code() == ErrorCode::InvalidApiCall
-        && err.msg().contains("changes type within a batched table")
 }
 
 fn write_qwp_varint(out: &mut Vec<u8>, mut value: u64) {
