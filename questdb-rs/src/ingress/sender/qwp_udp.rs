@@ -33,8 +33,6 @@ pub(crate) struct SyncQwpUdpHandlerState {
     pub(crate) socket: UdpSocket,
     pub(crate) target_addr: SocketAddrV4,
     pub(crate) max_datagram_size: usize,
-    #[allow(dead_code)]
-    pub(crate) multicast_ttl: u32,
     pub(crate) scratch: QwpSendScratch,
 }
 
@@ -110,7 +108,6 @@ pub(crate) fn connect_qwp_udp(
         socket,
         target_addr,
         max_datagram_size,
-        multicast_ttl: *qwp_udp.multicast_ttl,
         scratch: QwpSendScratch::new(max_datagram_size),
     }))
 }
