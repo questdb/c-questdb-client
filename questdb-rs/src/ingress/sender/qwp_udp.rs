@@ -146,3 +146,35 @@ pub(crate) fn flush_qwp_udp(
         },
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ErrorCode;
+
+    #[test]
+    fn qwp_udp_flush_surfaces_socket_send_failure() {
+        let qwp_udp = QwpUdpConfig::default();
+        let mut handler = connect_qwp_udp("127.0.0.1", "9007", None, &qwp_udp).unwrap();
+        let SyncProtocolHandler::SyncQwpUdp(state) = &mut handler else {
+            panic!("Expected SyncQwpUdp handler");
+        };
+
+        state.socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+
+        let mut buffer = QwpBuffer::new(127);
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", "ETH-USD")
+            .unwrap()
+            .column_i64("qty", 1)
+            .unwrap()
+            .at_now()
+            .unwrap();
+
+        let err = flush_qwp_udp(state, &buffer).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::SocketError);
+        assert!(err.msg().contains("Could not send UDP datagram to"));
+    }
+}

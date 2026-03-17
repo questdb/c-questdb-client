@@ -23,7 +23,9 @@
  ******************************************************************************/
 
 use crate::ErrorCode;
-use crate::ingress::{Buffer, TimestampMicros, TimestampNanos};
+use crate::ingress::{Buffer, ProtocolVersion, TimestampMicros, TimestampNanos};
+#[cfg(feature = "sync-sender-tcp")]
+use crate::tests::mock::MockServer;
 use crate::tests::qwp_decode::{DecodedValue, decode_datagram};
 use crate::tests::{TestResult, assert_err_contains, qwp_mock::QwpUdpMock};
 
@@ -718,4 +720,226 @@ fn qwp_udp_rejects_not_yet_supported_column_types() -> TestResult {
     );
 
     Ok(())
+}
+
+#[test]
+fn qwp_udp_rejects_flushing_empty_buffer() -> TestResult {
+    let mock = QwpUdpMock::new()?;
+    let mut sender = mock.sender_builder().build()?;
+    let mut buffer = sender.new_buffer();
+
+    assert_err_contains(
+        sender.flush(&mut buffer),
+        ErrorCode::InvalidApiCall,
+        "State error: Bad call to `flush`",
+    );
+
+    Ok(())
+}
+
+#[test]
+fn qwp_udp_rejects_flushing_incomplete_row() -> TestResult {
+    let mock = QwpUdpMock::new()?;
+    let mut sender = mock.sender_builder().build()?;
+    let mut buffer = sender.new_buffer();
+
+    buffer.table("trades")?.symbol("sym", "ETH-USD")?;
+    assert_err_contains(
+        sender.flush(&mut buffer),
+        ErrorCode::InvalidApiCall,
+        "State error: Bad call to `flush`",
+    );
+
+    Ok(())
+}
+
+#[test]
+fn qwp_udp_rejects_column_arr() -> TestResult {
+    let mock = QwpUdpMock::new()?;
+    let sender = mock.sender_builder().build()?;
+    let mut buffer = sender.new_buffer();
+
+    buffer.table("trades")?;
+    assert_err_contains(
+        buffer.column_arr("samples", &[1.0f64, 2.0, 3.0]),
+        ErrorCode::InvalidApiCall,
+        "QWP/UDP support for `column_arr` is not implemented yet.",
+    );
+
+    Ok(())
+}
+
+#[cfg(feature = "sync-sender-tcp")]
+#[test]
+fn ilp_sender_rejects_qwp_buffer() -> TestResult {
+    let mut server = MockServer::new()?;
+    let mut sender = server.lsb_tcp().build()?;
+    server.accept()?;
+
+    let buffer = Buffer::new_qwp();
+    assert_err_contains(
+        sender.flush_and_keep(&buffer),
+        ErrorCode::InvalidApiCall,
+        "ILP sender requires an ILP buffer. QWP buffers must be flushed with a QWP/UDP sender.",
+    );
+
+    Ok(())
+}
+
+#[test]
+fn qwp_udp_clear_then_reuse_flushes_only_new_rows() -> TestResult {
+    let mock = QwpUdpMock::new()?;
+    let mut sender = mock.sender_builder().build()?;
+    let mut buffer = sender.new_buffer();
+
+    buffer
+        .table("stale_rows")?
+        .symbol("sym", "drop-me")?
+        .column_i64("qty", 1)?
+        .at_now()?;
+    buffer.clear();
+    assert!(buffer.is_empty());
+
+    buffer
+        .table("fresh_rows")?
+        .symbol("sym", "keep-me")?
+        .column_i64("qty", 2)?
+        .at_now()?;
+
+    sender.flush(&mut buffer)?;
+    let decoded = decode_datagram(&mock.recv_datagram()?).expect("datagram should decode");
+    assert_eq!(decoded.table.name, "fresh_rows");
+    assert_eq!(decoded.table.row_count, 1);
+    assert_eq!(
+        decoded.table.rows,
+        vec![vec![
+            DecodedValue::Symbol("keep-me".to_owned()),
+            DecodedValue::I64(2),
+        ]]
+    );
+
+    Ok(())
+}
+
+#[test]
+fn qwp_udp_allows_micros_and_nanos_designated_timestamps_in_separate_batches() -> TestResult {
+    let mock = QwpUdpMock::new()?;
+    let mut sender = mock.sender_builder().build()?;
+    let mut buffer = sender.new_buffer();
+
+    buffer
+        .table("trades")?
+        .symbol("sym", "micros-row")?
+        .column_i64("qty", 1)?
+        .at(TimestampMicros::new(123_456))?;
+    sender.flush(&mut buffer)?;
+
+    buffer
+        .table("trades")?
+        .symbol("sym", "nanos-row")?
+        .column_i64("qty", 2)?
+        .at(TimestampNanos::new(789_000))?;
+    sender.flush(&mut buffer)?;
+
+    let micros = decode_datagram(&mock.recv_datagram()?).expect("micros datagram should decode");
+    let nanos = decode_datagram(&mock.recv_datagram()?).expect("nanos datagram should decode");
+
+    assert_eq!(
+        micros.table.rows,
+        vec![vec![
+            DecodedValue::Symbol("micros-row".to_owned()),
+            DecodedValue::I64(1),
+            DecodedValue::TimestampMicros(123_456),
+        ]]
+    );
+    assert_eq!(
+        nanos.table.rows,
+        vec![vec![
+            DecodedValue::Symbol("nanos-row".to_owned()),
+            DecodedValue::I64(2),
+            DecodedValue::TimestampNanos(789_000),
+        ]]
+    );
+
+    Ok(())
+}
+
+#[test]
+fn qwp_udp_allows_mixed_at_and_at_now_within_same_table_batch() -> TestResult {
+    let mock = QwpUdpMock::new()?;
+    let mut sender = mock.sender_builder().build()?;
+    let mut buffer = sender.new_buffer();
+
+    buffer
+        .table("trades")?
+        .symbol("sym", "explicit-a")?
+        .column_i64("qty", 1)?
+        .at(TimestampMicros::new(123_456))?;
+    buffer
+        .table("trades")?
+        .symbol("sym", "server-now")?
+        .column_i64("qty", 2)?
+        .at_now()?;
+    buffer
+        .table("trades")?
+        .symbol("sym", "explicit-b")?
+        .column_i64("qty", 3)?
+        .at(TimestampMicros::new(789_000))?;
+
+    sender.flush(&mut buffer)?;
+    let decoded = decode_datagram(&mock.recv_datagram()?).expect("datagram should decode");
+    assert_eq!(decoded.table.name, "trades");
+    assert_eq!(decoded.table.row_count, 3);
+    assert_eq!(
+        decoded.table.rows,
+        vec![
+            vec![
+                DecodedValue::Symbol("explicit-a".to_owned()),
+                DecodedValue::I64(1),
+                DecodedValue::TimestampMicros(123_456),
+            ],
+            vec![
+                DecodedValue::Symbol("server-now".to_owned()),
+                DecodedValue::I64(2),
+                DecodedValue::Null,
+            ],
+            vec![
+                DecodedValue::Symbol("explicit-b".to_owned()),
+                DecodedValue::I64(3),
+                DecodedValue::TimestampMicros(789_000),
+            ],
+        ]
+    );
+
+    Ok(())
+}
+
+#[test]
+fn qwp_udp_clone_produces_identical_datagrams() -> TestResult {
+    let mock = QwpUdpMock::new()?;
+    let mut sender = mock.sender_builder().build()?;
+    let mut buffer = sender.new_buffer();
+
+    buffer
+        .table("trades")?
+        .symbol("sym", "ETH-USD")?
+        .column_i64("qty", 4)?
+        .column_str("venue", "binance")?
+        .at(TimestampMicros::new(123_456))?;
+
+    let cloned = buffer.clone();
+    sender.flush_and_keep(&buffer)?;
+    sender.flush_and_keep(&cloned)?;
+
+    let first = mock.recv_datagram()?;
+    let second = mock.recv_datagram()?;
+    assert_eq!(first, second);
+
+    Ok(())
+}
+
+#[test]
+fn qwp_buffer_reports_protocol_version_v1() {
+    let buffer = Buffer::new_qwp();
+    assert_eq!(buffer.protocol_version(), ProtocolVersion::V1);
 }

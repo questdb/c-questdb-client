@@ -31,7 +31,9 @@
 #include <questdb/ingress/line_sender.hpp>
 
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <sstream>
 #include <thread>
 #include <vector>
@@ -178,6 +180,58 @@ bool datagram_starts_with_qwp1(const std::vector<std::byte>& datagram)
     return datagram.size() >= 4 &&
         std::memcmp(datagram.data(), "QWP1", 4) == 0;
 }
+
+std::string line_sender_error_message(const ::line_sender_error* err)
+{
+    size_t len = 0;
+    const char* msg = ::line_sender_error_msg(err, &len);
+    return {msg, len};
+}
+
+static bool qdb_test_set_env_var(const char* name, const char* value)
+{
+#if defined(PLATFORM_WINDOWS)
+    return ::_putenv_s(name, value) == 0;
+#else
+    return ::setenv(name, value, 1) == 0;
+#endif
+}
+
+static void qdb_test_unset_env_var(const char* name)
+{
+#if defined(PLATFORM_WINDOWS)
+    (void)::_putenv_s(name, "");
+#else
+    (void)::unsetenv(name);
+#endif
+}
+
+class scoped_env_var
+{
+public:
+    scoped_env_var(const char* name, std::string value)
+        : _name{name}
+    {
+        if (const char* old_value = std::getenv(name))
+            _old_value = old_value;
+        REQUIRE(qdb_test_set_env_var(name, value.c_str()));
+    }
+
+    scoped_env_var(const scoped_env_var&) = delete;
+    scoped_env_var& operator=(const scoped_env_var&) = delete;
+
+    ~scoped_env_var()
+    {
+        if (_old_value)
+            (void)qdb_test_set_env_var(_name.c_str(), _old_value->c_str());
+        else
+            qdb_test_unset_env_var(_name.c_str());
+    }
+
+private:
+    std::string _name;
+    std::optional<std::string> _old_value;
+};
 
 template <typename F>
 class on_scope_exit
@@ -1376,10 +1430,12 @@ TEST_CASE("line_sender c api qwpudp basics")
     on_scope_exit opts_free_guard{[&] { ::line_sender_opts_free(opts); }};
 
     CHECK(::line_sender_opts_max_datagram_size(opts, 256, &err));
+    CHECK(::line_sender_opts_multicast_ttl(opts, 7, &err));
 
     ::line_sender* sender = ::line_sender_build(opts, &err);
     REQUIRE(sender != nullptr);
     on_scope_exit sender_close_guard{[&] { ::line_sender_close(sender); }};
+    CHECK(::line_sender_get_protocol(sender) == ::line_sender_protocol_qwpudp);
 
     ::line_sender_buffer* buffer = ::line_sender_buffer_new_for_sender(sender);
     REQUIRE(buffer != nullptr);
@@ -1446,6 +1502,80 @@ TEST_CASE("line_sender c api standalone qwpudp buffer")
 
     const auto datagram = receiver.recv_datagram();
     CHECK(datagram.size() >= 12);
+    CHECK(datagram_starts_with_qwp1(datagram));
+}
+
+TEST_CASE("line_sender c api qwpudp max name len and peek")
+{
+    ::line_sender_error* err = nullptr;
+    on_scope_exit error_free_guard{[&] {
+        if (err)
+            ::line_sender_error_free(err);
+    }};
+
+    ::line_sender_buffer* buffer = ::line_sender_buffer_new_qwp_with_max_name_len(4);
+    REQUIRE(buffer != nullptr);
+    on_scope_exit buffer_free_guard{[&] { ::line_sender_buffer_free(buffer); }};
+
+    auto peek = ::line_sender_buffer_peek(buffer);
+    CHECK(peek.len == 0);
+
+    const auto long_table = QDB_TABLE_NAME_LITERAL("trades");
+    CHECK_FALSE(::line_sender_buffer_table(buffer, long_table, &err));
+    REQUIRE(err != nullptr);
+    CHECK(
+        line_sender_error_message(err) ==
+        "Bad name: \"trades\": Too long (max 4 characters)");
+    ::line_sender_error_free(err);
+    err = nullptr;
+
+    const auto table = QDB_TABLE_NAME_LITERAL("t");
+    const auto sym = QDB_COLUMN_NAME_LITERAL("s");
+    const auto qty = QDB_COLUMN_NAME_LITERAL("q");
+    const auto sym_value = QDB_UTF8_LITERAL("ok");
+    CHECK(::line_sender_buffer_table(buffer, table, &err));
+    CHECK(::line_sender_buffer_symbol(buffer, sym, sym_value, &err));
+    CHECK(::line_sender_buffer_column_i64(buffer, qty, 7, &err));
+    CHECK(::line_sender_buffer_at_now(buffer, &err));
+
+    peek = ::line_sender_buffer_peek(buffer);
+    CHECK(peek.len == 0);
+}
+
+TEST_CASE("line_sender c api qwpudp from env")
+{
+    udp_capture receiver;
+    const std::string conf = "qwpudp::addr=127.0.0.1:"s +
+        std::to_string(receiver.port()) +
+        ";max_datagram_size=256;multicast_ttl=1;";
+    scoped_env_var env_var{"QDB_CLIENT_CONF", conf};
+
+    ::line_sender_error* err = nullptr;
+    on_scope_exit error_free_guard{[&] {
+        if (err)
+            ::line_sender_error_free(err);
+    }};
+
+    ::line_sender* sender = ::line_sender_from_env(&err);
+    REQUIRE(sender != nullptr);
+    on_scope_exit sender_close_guard{[&] { ::line_sender_close(sender); }};
+    CHECK(::line_sender_get_protocol(sender) == ::line_sender_protocol_qwpudp);
+
+    ::line_sender_buffer* buffer = ::line_sender_buffer_new_for_sender(sender);
+    REQUIRE(buffer != nullptr);
+    on_scope_exit buffer_free_guard{[&] { ::line_sender_buffer_free(buffer); }};
+
+    const auto table = QDB_TABLE_NAME_LITERAL("env_rows");
+    const auto sym = QDB_COLUMN_NAME_LITERAL("sym");
+    const auto qty = QDB_COLUMN_NAME_LITERAL("qty");
+    const auto sym_value = QDB_UTF8_LITERAL("from-env");
+    CHECK(::line_sender_buffer_table(buffer, table, &err));
+    CHECK(::line_sender_buffer_symbol(buffer, sym, sym_value, &err));
+    CHECK(::line_sender_buffer_column_i64(buffer, qty, 3, &err));
+    CHECK(::line_sender_buffer_at_now(buffer, &err));
+    CHECK(::line_sender_flush(sender, buffer, &err));
+
+    const auto datagram = receiver.recv_datagram();
     CHECK(datagram_starts_with_qwp1(datagram));
 }
 

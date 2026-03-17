@@ -346,6 +346,23 @@ fn qwpudp_max_datagram_size_requires_qwp_udp() {
 
 #[cfg(feature = "sync-sender-qwp-udp")]
 #[test]
+fn qwpudp_max_datagram_size_accepts_udp_limit_and_rejects_above_it() {
+    let builder = SenderBuilder::new(Protocol::QwpUdp, "localhost", 9007)
+        .max_datagram_size(65507)
+        .unwrap();
+    let Some(qwp_udp) = builder.qwp_udp.as_ref() else {
+        panic!("Expected Some(QwpUdpConfig)");
+    };
+    assert_specified_eq(&qwp_udp.max_datagram_size, 65507usize);
+
+    assert_conf_err(
+        SenderBuilder::new(Protocol::QwpUdp, "localhost", 9007).max_datagram_size(65508),
+        "\"max_datagram_size\" must not exceed 65507 (UDP/IPv4 limit).",
+    );
+}
+
+#[cfg(feature = "sync-sender-qwp-udp")]
+#[test]
 fn qwpudp_multicast_ttl_requires_qwp_udp() {
     assert_conf_err(
         SenderBuilder::new(Protocol::QwpUdp, "localhost", 9007).multicast_ttl(256),
@@ -357,6 +374,33 @@ fn qwpudp_multicast_ttl_requires_qwp_udp() {
         SenderBuilder::new(Protocol::Http, "localhost", 9000).multicast_ttl(1),
         "The \"multicast_ttl\" setting is only supported for QWP/UDP.",
     );
+}
+
+#[cfg(feature = "sync-sender-qwp-udp")]
+#[test]
+fn qwpudp_config_string_rejects_invalid_datagram_size_and_multicast_ttl() {
+    assert_conf_err(
+        SenderBuilder::from_conf("qwpudp::addr=localhost;max_datagram_size=0;"),
+        "\"max_datagram_size\" must be greater than 0.",
+    );
+    assert_conf_err(
+        SenderBuilder::from_conf("qwpudp::addr=localhost;max_datagram_size=65508;"),
+        "\"max_datagram_size\" must not exceed 65507 (UDP/IPv4 limit).",
+    );
+    assert_conf_err(
+        SenderBuilder::from_conf("qwpudp::addr=localhost;multicast_ttl=256;"),
+        "\"multicast_ttl\" must be between 0 and 255.",
+    );
+}
+
+#[cfg(feature = "sync-sender-qwp-udp")]
+#[test]
+fn qwpudp_bind_interface_is_supported_via_builder_api() {
+    let builder = SenderBuilder::new(Protocol::QwpUdp, "239.1.2.3", 9007)
+        .bind_interface("192.168.1.10")
+        .unwrap();
+    assert_eq!(builder.protocol, Protocol::QwpUdp);
+    assert_specified_eq(&builder.net_interface, Some("192.168.1.10".to_string()));
 }
 
 #[cfg(feature = "sync-sender-qwp-udp")]
