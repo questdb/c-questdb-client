@@ -1161,6 +1161,36 @@ struct ColumnStats {
 }
 
 impl ColumnStats {
+    fn payload_len_parts(
+        kind: ColumnKind,
+        base_nullable: bool,
+        row_count: usize,
+        non_null_count: u32,
+        string_data_len: u32,
+        symbol_dict_bytes: u32,
+        symbol_row_index_bytes: u32,
+        dict_count: u16,
+    ) -> usize {
+        let nullable = base_nullable
+            || (kind_supports_sparse_nulls(kind) && (non_null_count as usize) < row_count);
+        let bitmap = if nullable { bitmap_bytes(row_count) } else { 0 };
+
+        bitmap
+            + match kind {
+                ColumnKind::Bool => packed_bytes(row_count),
+                ColumnKind::I64 | ColumnKind::F64 => row_count * 8,
+                ColumnKind::TimestampMicros | ColumnKind::TimestampNanos => {
+                    non_null_count as usize * 8
+                }
+                ColumnKind::String => 4 * (non_null_count as usize + 1) + string_data_len as usize,
+                ColumnKind::Symbol => {
+                    qwp_varint_size(dict_count as u64)
+                        + symbol_dict_bytes as usize
+                        + symbol_row_index_bytes as usize
+                }
+            }
+    }
+
     fn new(entry: &EntryMeta) -> Self {
         let kind = entry.value.kind();
         let name_len = entry.name.0.len as usize;
@@ -1189,31 +1219,16 @@ impl ColumnStats {
     }
 
     fn payload_len(&self, row_count: usize) -> usize {
-        let nullable = self.is_nullable(row_count);
-        let bitmap = if nullable { bitmap_bytes(row_count) } else { 0 };
-
-        bitmap
-            + match self.kind {
-                ColumnKind::Bool => packed_bytes(row_count),
-                ColumnKind::I64 | ColumnKind::F64 => {
-                    if nullable {
-                        self.non_null_count as usize * 8
-                    } else {
-                        row_count * 8
-                    }
-                }
-                ColumnKind::TimestampMicros | ColumnKind::TimestampNanos => {
-                    self.non_null_count as usize * 8
-                }
-                ColumnKind::String => {
-                    4 * (self.non_null_count as usize + 1) + self.string_data_len as usize
-                }
-                ColumnKind::Symbol => {
-                    qwp_varint_size(self.dict_count as u64)
-                        + self.symbol_dict_bytes as usize
-                        + self.symbol_row_index_bytes as usize
-                }
-            }
+        Self::payload_len_parts(
+            self.kind,
+            self.base_nullable,
+            row_count,
+            self.non_null_count,
+            self.string_data_len,
+            self.symbol_dict_bytes,
+            self.symbol_row_index_bytes,
+            self.dict_count,
+        )
     }
 
     fn add_non_symbol_value(&mut self, value: &ValueRef) -> crate::Result<()> {
@@ -1304,6 +1319,9 @@ struct Checkpoint {
     row_count: usize,
     current_len: usize,
     total_schema_len: usize,
+    bool_column_count: usize,
+    fixed8_column_count: usize,
+    bitmap_column_count: usize,
 }
 
 // --- Row group planner (unified estimator + flush scratch) ---
@@ -1316,6 +1334,9 @@ pub(crate) struct RowGroupPlanner {
     row_count: usize,
     current_len: usize,
     total_schema_len: usize,
+    bool_column_count: usize,
+    fixed8_column_count: usize,
+    bitmap_column_count: usize,
     track_cells: bool,
 }
 
@@ -1329,6 +1350,9 @@ impl Clone for RowGroupPlanner {
             row_count: self.row_count,
             current_len: self.current_len,
             total_schema_len: self.total_schema_len,
+            bool_column_count: self.bool_column_count,
+            fixed8_column_count: self.fixed8_column_count,
+            bitmap_column_count: self.bitmap_column_count,
             track_cells: self.track_cells,
         }
     }
@@ -1367,6 +1391,9 @@ impl RowGroupPlanner {
             row_count: 0,
             current_len: 0,
             total_schema_len: 0,
+            bool_column_count: 0,
+            fixed8_column_count: 0,
+            bitmap_column_count: 0,
             track_cells: true,
         }
     }
@@ -1380,6 +1407,9 @@ impl RowGroupPlanner {
             row_count: 0,
             current_len: 0,
             total_schema_len: 0,
+            bool_column_count: 0,
+            fixed8_column_count: 0,
+            bitmap_column_count: 0,
             track_cells: false,
         }
     }
@@ -1392,6 +1422,9 @@ impl RowGroupPlanner {
         self.row_count = 0;
         self.current_len = 0;
         self.total_schema_len = 0;
+        self.bool_column_count = 0;
+        self.fixed8_column_count = 0;
+        self.bitmap_column_count = 0;
     }
 
     fn row_count(&self) -> usize {
@@ -1406,6 +1439,9 @@ impl RowGroupPlanner {
             row_count: self.row_count,
             current_len: self.current_len,
             total_schema_len: self.total_schema_len,
+            bool_column_count: self.bool_column_count,
+            fixed8_column_count: self.fixed8_column_count,
+            bitmap_column_count: self.bitmap_column_count,
         }
     }
 
@@ -1436,6 +1472,9 @@ impl RowGroupPlanner {
         self.row_count = cp.row_count;
         self.current_len = cp.current_len;
         self.total_schema_len = cp.total_schema_len;
+        self.bool_column_count = cp.bool_column_count;
+        self.fixed8_column_count = cp.fixed8_column_count;
+        self.bitmap_column_count = cp.bitmap_column_count;
     }
 
     fn add_row(
@@ -1453,6 +1492,12 @@ impl RowGroupPlanner {
                 u16::MAX
             ));
         }
+        let old_row_count = self.row_count;
+        let old_column_count = self.columns.len();
+        let old_total_schema_len = self.total_schema_len;
+        let old_bool_column_count = self.bool_column_count;
+        let old_fixed8_column_count = self.fixed8_column_count;
+        let old_bitmap_column_count = self.bitmap_column_count;
         self.undo_stack.clear();
         let ts_entry = row.designated_ts.map(designated_ts_entry);
         let extra = ts_entry.as_slice();
@@ -1501,8 +1546,69 @@ impl RowGroupPlanner {
             }
         }
 
-        self.row_count += 1;
-        self.recompute_len(table_name_len);
+        let new_row_count = old_row_count + 1;
+        if old_row_count == 0 {
+            let mut total = base_datagram_len(table_name_len, new_row_count, self.columns.len());
+            total += self.total_schema_len;
+            for col in &self.columns {
+                total += col.payload_len(new_row_count);
+            }
+            self.row_count = new_row_count;
+            self.current_len = total;
+            return Ok(());
+        }
+
+        let packed_delta = packed_bytes(new_row_count) - packed_bytes(old_row_count);
+        let bitmap_delta = bitmap_bytes(new_row_count) - bitmap_bytes(old_row_count);
+
+        let mut touched_bool_column_count = 0usize;
+        let mut touched_fixed8_column_count = 0usize;
+        let mut touched_bitmap_column_count = 0usize;
+        let mut delta =
+            qwp_varint_size(new_row_count as u64) - qwp_varint_size(old_row_count as u64);
+
+        for undo in &self.undo_stack {
+            let col = &self.columns[undo.col_idx as usize];
+            match col.kind {
+                ColumnKind::Bool => touched_bool_column_count += 1,
+                ColumnKind::I64 | ColumnKind::F64 => touched_fixed8_column_count += 1,
+                ColumnKind::Symbol
+                | ColumnKind::String
+                | ColumnKind::TimestampMicros
+                | ColumnKind::TimestampNanos => touched_bitmap_column_count += 1,
+            }
+            delta += col.payload_len(new_row_count)
+                - ColumnStats::payload_len_parts(
+                    col.kind,
+                    col.base_nullable,
+                    old_row_count,
+                    undo.non_null_count,
+                    undo.string_data_len,
+                    undo.symbol_dict_bytes,
+                    undo.symbol_row_index_bytes,
+                    undo.dict_count,
+                );
+        }
+
+        debug_assert!(touched_bool_column_count <= old_bool_column_count);
+        debug_assert!(touched_fixed8_column_count <= old_fixed8_column_count);
+        debug_assert!(touched_bitmap_column_count <= old_bitmap_column_count);
+
+        delta += (old_bool_column_count - touched_bool_column_count) * packed_delta;
+        delta += (old_fixed8_column_count - touched_fixed8_column_count) * 8;
+        delta += (old_bitmap_column_count - touched_bitmap_column_count) * bitmap_delta;
+
+        if self.columns.len() > old_column_count {
+            delta += qwp_varint_size(self.columns.len() as u64)
+                - qwp_varint_size(old_column_count as u64);
+            delta += self.total_schema_len - old_total_schema_len;
+            for col in &self.columns[old_column_count..] {
+                delta += col.payload_len(new_row_count);
+            }
+        }
+
+        self.row_count = new_row_count;
+        self.current_len += delta;
         Ok(())
     }
 
@@ -1571,15 +1677,6 @@ impl RowGroupPlanner {
         Ok(())
     }
 
-    fn recompute_len(&mut self, table_name_len: usize) {
-        let mut total = base_datagram_len(table_name_len, self.row_count, self.columns.len());
-        total += self.total_schema_len;
-        for col in &self.columns {
-            total += col.payload_len(self.row_count);
-        }
-        self.current_len = total;
-    }
-
     fn push_new_column(
         &mut self,
         entry: &EntryMeta,
@@ -1587,6 +1684,14 @@ impl RowGroupPlanner {
         row_idx: u16,
     ) -> crate::Result<()> {
         let col = ColumnStats::new(entry);
+        match col.kind {
+            ColumnKind::Bool => self.bool_column_count += 1,
+            ColumnKind::I64 | ColumnKind::F64 => self.fixed8_column_count += 1,
+            ColumnKind::Symbol
+            | ColumnKind::String
+            | ColumnKind::TimestampMicros
+            | ColumnKind::TimestampNanos => self.bitmap_column_count += 1,
+        }
         self.total_schema_len += col.cached_schema_len as usize;
         self.columns.push(col);
         let col_idx = self.columns.len() - 1;
@@ -1992,6 +2097,36 @@ fn to_designated_ts(timestamp: Timestamp) -> DesignatedTs {
 mod tests {
     use super::*;
     use crate::ingress::{TimestampMicros, TimestampNanos};
+
+    fn exact_planner_len(planner: &RowGroupPlanner, table_name_len: usize) -> usize {
+        if planner.row_count == 0 {
+            return 0;
+        }
+        let mut total = base_datagram_len(table_name_len, planner.row_count, planner.columns.len());
+        total += planner.total_schema_len;
+        for col in &planner.columns {
+            total += col.payload_len(planner.row_count);
+        }
+        total
+    }
+
+    fn encoded_planner_len(
+        planner: &RowGroupPlanner,
+        name_bytes: &[u8],
+        value_bytes: &[u8],
+        table_name: &str,
+    ) -> usize {
+        let mut datagram = Vec::new();
+        encode_row_group_from_scratch(
+            planner,
+            name_bytes,
+            value_bytes,
+            table_name.as_bytes(),
+            &mut datagram,
+        )
+        .unwrap();
+        datagram.len()
+    }
 
     #[test]
     fn qwp_struct_sizes() {
@@ -2950,6 +3085,168 @@ mod tests {
 
         planner.rollback(cp);
         assert_eq!(planner.columns.len(), 1); // "y" removed by truncate
+    }
+
+    #[test]
+    fn qwp_planner_incremental_len_stays_exact_across_rollback_and_reuse() {
+        let mut planner = RowGroupPlanner::new();
+        let mut buf = QwpBuffer::new(127);
+
+        buf.table("t").unwrap().column_i64("x", 1).unwrap();
+        buf.at_now().unwrap();
+
+        buf.table("t")
+            .unwrap()
+            .column_i64("x", 2)
+            .unwrap()
+            .column_bool("flag", true)
+            .unwrap();
+        buf.at_now().unwrap();
+
+        buf.table("t")
+            .unwrap()
+            .column_i64("x", 3)
+            .unwrap()
+            .column_str("note", "hello")
+            .unwrap();
+        buf.at_now().unwrap();
+
+        let row0 = &buf.rows[0];
+        let row1 = &buf.rows[1];
+        let row2 = &buf.rows[2];
+        let entries0 = buf.entries_for_row(row0);
+        let entries1 = buf.entries_for_row(row1);
+        let entries2 = buf.entries_for_row(row2);
+
+        planner
+            .add_row(row0, entries0, &buf.name_bytes, &buf.value_bytes, "t".len())
+            .unwrap();
+        assert_eq!(planner.current_len, exact_planner_len(&planner, "t".len()));
+
+        let cp = planner.checkpoint();
+        planner
+            .add_row(row1, entries1, &buf.name_bytes, &buf.value_bytes, "t".len())
+            .unwrap();
+        assert_eq!(planner.current_len, exact_planner_len(&planner, "t".len()));
+
+        planner.rollback(cp);
+        assert_eq!(planner.current_len, exact_planner_len(&planner, "t".len()));
+
+        planner
+            .add_row(row2, entries2, &buf.name_bytes, &buf.value_bytes, "t".len())
+            .unwrap();
+        assert_eq!(planner.current_len, exact_planner_len(&planner, "t".len()));
+    }
+
+    #[test]
+    fn qwp_planner_incremental_len_matches_actual_across_untouched_column_boundaries() {
+        let mut planner = RowGroupPlanner::new();
+        let mut buf = QwpBuffer::new(127);
+
+        buf.table("audit")
+            .unwrap()
+            .column_bool("active", true)
+            .unwrap()
+            .column_str("venue", "tokyo")
+            .unwrap()
+            .column_ts("event_ts", TimestampMicros::new(1))
+            .unwrap()
+            .column_i64("qty", 1)
+            .unwrap();
+        buf.at_now().unwrap();
+
+        for i in 2..=17 {
+            buf.table("audit").unwrap().column_i64("qty", i).unwrap();
+            buf.at_now().unwrap();
+        }
+
+        for prefix_len in 1..=buf.rows.len() {
+            let row = &buf.rows[prefix_len - 1];
+            let row_entries = buf.entries_for_row(row);
+            planner
+                .add_row(
+                    row,
+                    row_entries,
+                    &buf.name_bytes,
+                    &buf.value_bytes,
+                    "audit".len(),
+                )
+                .unwrap();
+            let actual = encoded_planner_len(&planner, &buf.name_bytes, &buf.value_bytes, "audit");
+            assert_eq!(planner.current_len, actual, "prefix {}", prefix_len);
+        }
+    }
+
+    #[test]
+    fn qwp_planner_incremental_len_matches_actual_when_late_schema_growth_crosses_varint_boundary()
+    {
+        let mut planner = RowGroupPlanner::new();
+        let mut buf = QwpBuffer::new(127);
+
+        buf.table("wide").unwrap().column_i64("base", 1).unwrap();
+        buf.at_now().unwrap();
+
+        buf.table("wide").unwrap().column_i64("base", 2).unwrap();
+        for idx in 0..127 {
+            let name = format!("c{idx:03}");
+            buf.column_i64(name.as_str(), idx as i64).unwrap();
+        }
+        buf.at_now().unwrap();
+
+        let row0 = &buf.rows[0];
+        let row1 = &buf.rows[1];
+        let entries0 = buf.entries_for_row(row0);
+        let entries1 = buf.entries_for_row(row1);
+
+        planner
+            .add_row(
+                row0,
+                entries0,
+                &buf.name_bytes,
+                &buf.value_bytes,
+                "wide".len(),
+            )
+            .unwrap();
+        planner
+            .add_row(
+                row1,
+                entries1,
+                &buf.name_bytes,
+                &buf.value_bytes,
+                "wide".len(),
+            )
+            .unwrap();
+
+        assert_eq!(planner.columns.len(), 128);
+        let actual = encoded_planner_len(&planner, &buf.name_bytes, &buf.value_bytes, "wide");
+        assert_eq!(planner.current_len, actual);
+    }
+
+    #[test]
+    fn qwp_size_hint_matches_unsplit_len_across_same_group_bitmap_boundaries() {
+        let mut buf = QwpBuffer::new(127);
+
+        for i in 1..=17 {
+            buf.table("audit").unwrap();
+            if i == 1 {
+                buf.column_bool("active", true)
+                    .unwrap()
+                    .column_str("venue", "tokyo")
+                    .unwrap()
+                    .column_ts("event_ts", TimestampMicros::new(1))
+                    .unwrap();
+            }
+            buf.column_i64("qty", i).unwrap();
+            buf.at_now().unwrap();
+
+            let actual: usize = buf
+                .encode_datagrams(usize::MAX)
+                .unwrap()
+                .iter()
+                .map(Vec::len)
+                .sum();
+            assert_eq!(buf.len(), actual, "after row {}", i);
+        }
     }
 
     #[test]
