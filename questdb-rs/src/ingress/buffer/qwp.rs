@@ -645,9 +645,10 @@ impl QwpBuffer {
     fn mark_pending_entry_name(&self, name: &str) -> crate::Result<()> {
         // Linear scan over current row's entries for duplicate detection
         let start = self.pending.entry_start as usize;
+        let name_bytes = name.as_bytes();
         for entry in &self.entries[start..] {
-            let entry_name = self.name_str(entry.name);
-            if entry_name == name {
+            let entry_name = &self.name_bytes[entry.name.0.as_range()];
+            if entry_name == name_bytes {
                 return Err(error::fmt!(
                     InvalidApiCall,
                     "column '{}' already set for current row",
