@@ -30,7 +30,29 @@ use std::fmt::Debug;
 
 use super::ilp::{ColumnName, TableName};
 
-pub(crate) const QWP_MESSAGE_HEADER_SIZE: usize = 12;
+/// Wire layout of a QWP datagram header.
+///
+/// ```text
+/// [0..4]   magic        "QWP1"
+/// [4]      version      protocol version (currently 1)
+/// [5]      flags        reserved
+/// [6..8]   table_count  little-endian u16
+/// [8..12]  payload_len  little-endian u32
+/// ```
+#[repr(C, packed)]
+pub(crate) struct QwpMessageHeader {
+    pub(crate) magic: [u8; 4],
+    pub(crate) version: u8,
+    pub(crate) flags: u8,
+    pub(crate) table_count: u16,
+    pub(crate) payload_len: u32,
+}
+
+pub(crate) const QWP_MESSAGE_HEADER_SIZE: usize = std::mem::size_of::<QwpMessageHeader>();
+
+// Compile-time guarantee that the header is exactly 12 bytes.
+const _: () = assert!(QWP_MESSAGE_HEADER_SIZE == 12);
+
 pub(crate) const QWP_SCHEMA_MODE_FULL: u8 = 0x00;
 pub(crate) const QWP_TYPE_BOOLEAN: u8 = 0x01;
 pub(crate) const QWP_TYPE_DOUBLE: u8 = 0x07;

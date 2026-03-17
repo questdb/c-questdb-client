@@ -22,7 +22,18 @@
  *
  ******************************************************************************/
 
-const HEADER_SIZE: usize = 12;
+/// Wire layout of a QWP datagram header (mirrors production definition).
+#[repr(C, packed)]
+struct QwpMessageHeader {
+    magic: [u8; 4],
+    version: u8,
+    flags: u8,
+    table_count: u16,
+    payload_len: u32,
+}
+
+const HEADER_SIZE: usize = std::mem::size_of::<QwpMessageHeader>();
+const _: () = assert!(HEADER_SIZE == 12);
 const NULLABLE_FLAG: u8 = 0x80;
 const TYPE_BOOLEAN: u8 = 0x01;
 const TYPE_LONG: u8 = 0x05;
