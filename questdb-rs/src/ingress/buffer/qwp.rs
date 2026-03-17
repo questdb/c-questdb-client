@@ -574,30 +574,47 @@ impl QwpBuffer {
         Ok(())
     }
 
-    fn append_name(&mut self, name: &str) -> NameSlice {
-        debug_assert!(
-            self.name_bytes.len() + name.len() <= u32::MAX as usize,
-            "name_bytes arena overflow"
-        );
-        let offset = self.name_bytes.len() as u32;
-        self.name_bytes.extend_from_slice(name.as_bytes());
-        NameSlice(ByteSlice {
-            offset,
-            len: name.len() as u32,
-        })
+    fn checked_arena_offset(
+        arena_len: usize,
+        append_len: usize,
+        arena_name: &'static str,
+    ) -> crate::Result<u32> {
+        let end = arena_len.checked_add(append_len).ok_or_else(|| {
+            error::fmt!(
+                InvalidApiCall,
+                "QWP/UDP {} arena exceeds maximum of {} bytes",
+                arena_name,
+                u32::MAX
+            )
+        })?;
+        if end > u32::MAX as usize {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "QWP/UDP {} arena exceeds maximum of {} bytes",
+                arena_name,
+                u32::MAX
+            ));
+        }
+        Ok(arena_len as u32)
     }
 
-    fn append_value_str(&mut self, value: &str) -> ValueSlice {
-        debug_assert!(
-            self.value_bytes.len() + value.len() <= u32::MAX as usize,
-            "value_bytes arena overflow"
-        );
-        let offset = self.value_bytes.len() as u32;
+    fn append_name(&mut self, name: &str) -> crate::Result<NameSlice> {
+        let offset = Self::checked_arena_offset(self.name_bytes.len(), name.len(), "name_bytes")?;
+        self.name_bytes.extend_from_slice(name.as_bytes());
+        Ok(NameSlice(ByteSlice {
+            offset,
+            len: name.len() as u32,
+        }))
+    }
+
+    fn append_value_str(&mut self, value: &str) -> crate::Result<ValueSlice> {
+        let offset =
+            Self::checked_arena_offset(self.value_bytes.len(), value.len(), "value_bytes")?;
         self.value_bytes.extend_from_slice(value.as_bytes());
-        ValueSlice(ByteSlice {
+        Ok(ValueSlice(ByteSlice {
             offset,
             len: value.len() as u32,
-        })
+        }))
     }
 
     fn name_str(&self, ns: NameSlice) -> &str {
@@ -658,7 +675,7 @@ impl QwpBuffer {
             value_bytes_start: self.value_bytes.len() as u32,
         };
 
-        let table_ns = self.append_name(name.as_ref());
+        let table_ns = self.append_name(name.as_ref())?;
         self.update_transactional_state(table_ns);
         self.pending.table = Some(table_ns);
         self.state.op_case = OpCase::TableWritten;
@@ -675,8 +692,8 @@ impl QwpBuffer {
         self.validate_max_name_len(name.as_ref())?;
         self.check_op(Op::Symbol)?;
         self.mark_pending_entry_name(name.as_ref())?;
-        let name_ns = self.append_name(name.as_ref());
-        let value_vs = self.append_value_str(value.as_ref());
+        let name_ns = self.append_name(name.as_ref())?;
+        let value_vs = self.append_value_str(value.as_ref())?;
         self.entries.push(EntryMeta {
             name: name_ns,
             value: ValueRef::Symbol(value_vs),
@@ -694,7 +711,7 @@ impl QwpBuffer {
         self.validate_max_name_len(name.as_ref())?;
         self.check_op(Op::Column)?;
         self.mark_pending_entry_name(name.as_ref())?;
-        let name_ns = self.append_name(name.as_ref());
+        let name_ns = self.append_name(name.as_ref())?;
         self.entries.push(EntryMeta {
             name: name_ns,
             value: ValueRef::Bool(value),
@@ -712,7 +729,7 @@ impl QwpBuffer {
         self.validate_max_name_len(name.as_ref())?;
         self.check_op(Op::Column)?;
         self.mark_pending_entry_name(name.as_ref())?;
-        let name_ns = self.append_name(name.as_ref());
+        let name_ns = self.append_name(name.as_ref())?;
         self.entries.push(EntryMeta {
             name: name_ns,
             value: ValueRef::I64(value),
@@ -730,7 +747,7 @@ impl QwpBuffer {
         self.validate_max_name_len(name.as_ref())?;
         self.check_op(Op::Column)?;
         self.mark_pending_entry_name(name.as_ref())?;
-        let name_ns = self.append_name(name.as_ref());
+        let name_ns = self.append_name(name.as_ref())?;
         self.entries.push(EntryMeta {
             name: name_ns,
             value: ValueRef::F64(value),
@@ -749,8 +766,8 @@ impl QwpBuffer {
         self.validate_max_name_len(name.as_ref())?;
         self.check_op(Op::Column)?;
         self.mark_pending_entry_name(name.as_ref())?;
-        let name_ns = self.append_name(name.as_ref());
-        let value_vs = self.append_value_str(value.as_ref());
+        let name_ns = self.append_name(name.as_ref())?;
+        let value_vs = self.append_value_str(value.as_ref())?;
         self.entries.push(EntryMeta {
             name: name_ns,
             value: ValueRef::String(value_vs),
@@ -796,7 +813,7 @@ impl QwpBuffer {
         self.check_op(Op::Column)?;
         self.mark_pending_entry_name(name.as_ref())?;
         let ts: Timestamp = value.try_into()?;
-        let name_ns = self.append_name(name.as_ref());
+        let name_ns = self.append_name(name.as_ref())?;
         let value_ref = match ts {
             Timestamp::Micros(v) => ValueRef::TimestampMicros(v.as_i64()),
             Timestamp::Nanos(v) => ValueRef::TimestampNanos(v.as_i64()),
@@ -1354,6 +1371,18 @@ impl std::fmt::Debug for RowGroupPlanner {
 }
 
 impl RowGroupPlanner {
+    fn checked_u16(value: usize, what: &'static str) -> crate::Result<u16> {
+        if value > u16::MAX as usize {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "QWP/UDP {} exceeds maximum of {}",
+                what,
+                u16::MAX
+            ));
+        }
+        Ok(value as u16)
+    }
+
     fn new() -> Self {
         Self {
             columns: Vec::new(),
@@ -1457,6 +1486,7 @@ impl RowGroupPlanner {
         for entry in row_entries.iter().chain(extra.iter()) {
             let entry_name = &name_bytes[entry.name.0.as_range()];
             if let Some(idx) = self.find_column(entry_name, name_bytes) {
+                let undo_col_idx = Self::checked_u16(idx, "column count")?;
                 let col = &mut self.columns[idx];
                 if col.kind != entry.value.kind() {
                     return Err(batched_type_change_error(entry_name));
@@ -1468,7 +1498,7 @@ impl RowGroupPlanner {
                     symbol_row_index_bytes: col.symbol_row_index_bytes,
                     dict_tail: col.dict_tail,
                     cell_tail: col.cell_tail,
-                    col_idx: idx as u16,
+                    col_idx: undo_col_idx,
                     dict_count: col.dict_count,
                 });
                 if self.track_cells {
@@ -1487,7 +1517,7 @@ impl RowGroupPlanner {
                     col.cell_tail = cell_idx;
                 }
                 if col.kind == ColumnKind::Symbol {
-                    self.add_symbol_value(idx, &entry.value, value_bytes);
+                    self.add_symbol_value(idx, &entry.value, value_bytes)?;
                 } else {
                     col.add_non_symbol_value(&entry.value)?;
                 }
@@ -1501,10 +1531,16 @@ impl RowGroupPlanner {
         Ok(())
     }
 
-    fn add_symbol_value(&mut self, col_idx: usize, value: &ValueRef, value_bytes: &[u8]) {
-        let ValueRef::Symbol(vs) = value else { return };
+    fn add_symbol_value(
+        &mut self,
+        col_idx: usize,
+        value: &ValueRef,
+        value_bytes: &[u8],
+    ) -> crate::Result<()> {
+        let ValueRef::Symbol(vs) = value else {
+            return Ok(());
+        };
         let col = &mut self.columns[col_idx];
-        col.non_null_count += 1;
         let symbol_bytes = &value_bytes[vs.0.as_range()];
         let mut cursor = col.dict_head;
         let mut pos = 0usize;
@@ -1521,7 +1557,24 @@ impl RowGroupPlanner {
         let sym_idx = if let Some(idx) = found_idx {
             idx
         } else {
+            if col.dict_count == u16::MAX {
+                return Err(error::fmt!(
+                    InvalidApiCall,
+                    "QWP/UDP symbol dictionary exceeds maximum of {} distinct values per column",
+                    u16::MAX
+                ));
+            }
             let idx = col.dict_count as usize;
+            idx
+        };
+        let symbol_dict_idx = if self.track_cells {
+            Some(Self::checked_u16(sym_idx, "symbol dictionary index")?)
+        } else {
+            None
+        };
+
+        col.non_null_count += 1;
+        if found_idx.is_none() {
             col.symbol_dict_bytes += qwp_string_byte_len(symbol_bytes.len()) as u32;
             let dict_idx = self.symbol_dict.len() as u32;
             self.symbol_dict.push(SymbolEntry {
@@ -1535,13 +1588,13 @@ impl RowGroupPlanner {
             }
             col.dict_tail = dict_idx;
             col.dict_count += 1;
-            idx
-        };
-        col.symbol_row_index_bytes += qwp_varint_size(sym_idx as u64) as u32;
-        if self.track_cells {
-            // Store pre-computed index so encoding is O(1) per cell
-            self.cells.last_mut().unwrap().symbol_dict_idx = sym_idx as u16;
         }
+        col.symbol_row_index_bytes += qwp_varint_size(sym_idx as u64) as u32;
+        if let Some(symbol_dict_idx) = symbol_dict_idx {
+            // Store pre-computed index so encoding is O(1) per cell
+            self.cells.last_mut().unwrap().symbol_dict_idx = symbol_dict_idx;
+        }
+        Ok(())
     }
 
     fn recompute_len(&mut self, table_name_len: usize) {
@@ -1578,7 +1631,7 @@ impl RowGroupPlanner {
         }
 
         if entry.value.kind() == ColumnKind::Symbol {
-            self.add_symbol_value(col_idx, &entry.value, value_bytes);
+            self.add_symbol_value(col_idx, &entry.value, value_bytes)?;
         } else {
             self.columns[col_idx].add_non_symbol_value(&entry.value)?;
         }
@@ -1976,6 +2029,60 @@ mod tests {
         assert_eq!(size_of::<ColumnStats>(), 48);
         assert_eq!(size_of::<ColumnUndo>(), 28);
         assert_eq!(size_of::<Option<DesignatedTs>>(), size_of::<DesignatedTs>());
+    }
+
+    #[test]
+    fn qwp_checked_arena_offset_rejects_overflow() {
+        let err = QwpBuffer::checked_arena_offset(u32::MAX as usize, 1, "name_bytes").unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert!(
+            err.msg()
+                .contains("QWP/UDP name_bytes arena exceeds maximum")
+        );
+
+        let err =
+            QwpBuffer::checked_arena_offset(u32::MAX as usize - 1, 2, "value_bytes").unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert!(
+            err.msg()
+                .contains("QWP/UDP value_bytes arena exceeds maximum")
+        );
+    }
+
+    #[test]
+    fn qwp_planner_checked_u16_rejects_overflow() {
+        let err = RowGroupPlanner::checked_u16(u16::MAX as usize + 1, "column count").unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("QWP/UDP column count exceeds maximum"));
+    }
+
+    #[test]
+    fn qwp_symbol_dictionary_rejects_more_than_u16_max_entries() {
+        let symbol_value = ValueRef::Symbol(ValueSlice(ByteSlice { offset: 0, len: 1 }));
+        let mut planner = RowGroupPlanner::new();
+        planner.columns.push(ColumnStats::new(&EntryMeta {
+            name: NameSlice(ByteSlice { offset: 0, len: 1 }),
+            value: symbol_value,
+        }));
+        planner.columns[0].dict_count = u16::MAX;
+        planner.cells.push(CellRef {
+            row_idx: 0,
+            symbol_dict_idx: 0,
+            next: CELL_END,
+            value: symbol_value,
+        });
+
+        let err = planner
+            .add_symbol_value(0, &symbol_value, b"a")
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert!(
+            err.msg()
+                .contains("QWP/UDP symbol dictionary exceeds maximum")
+        );
+        assert_eq!(planner.columns[0].dict_count, u16::MAX);
+        assert_eq!(planner.columns[0].non_null_count, 0);
+        assert!(planner.symbol_dict.is_empty());
     }
 
     #[test]
