@@ -212,6 +212,12 @@ public:
     scoped_env_var(const char* name, std::string value)
         : _name{name}
     {
+        // MSVC C4996: getenv is not thread-safe, but this is
+        // single-threaded test code and the value is immediately
+        // copied into a std::string, so it's safe here.
+#ifdef _MSC_VER
+#pragma warning(suppress: 4996)
+#endif
         if (const char* old_value = std::getenv(name))
             _old_value = old_value;
         REQUIRE(qdb_test_set_env_var(name, value.c_str()));
