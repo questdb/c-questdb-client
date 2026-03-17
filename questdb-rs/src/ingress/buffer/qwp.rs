@@ -25,7 +25,9 @@
 use crate::error;
 use crate::ingress::decimal::DecimalView;
 use crate::ingress::{ArrayElement, NdArrayView, Timestamp};
-use crate::{Error, ErrorCode};
+use crate::Error;
+#[cfg(test)]
+use crate::ErrorCode;
 use std::fmt::Debug;
 
 use super::ilp::{ColumnName, TableName};
@@ -553,6 +555,7 @@ impl QwpBuffer {
         }))
     }
 
+    #[cfg(test)]
     fn name_str(&self, ns: NameSlice) -> &str {
         std::str::from_utf8(&self.name_bytes[ns.0.as_range()]).expect("name must be valid UTF-8")
     }
@@ -1513,8 +1516,7 @@ impl RowGroupPlanner {
                     u16::MAX
                 ));
             }
-            let idx = col.dict_count as usize;
-            idx
+            col.dict_count as usize
         };
         let symbol_dict_idx = if self.track_cells {
             Some(Self::checked_u16(sym_idx, "symbol dictionary index")?)
