@@ -119,6 +119,25 @@ impl OpState {
         self.op_case.allows(Op::Table)
     }
 
+    pub(super) fn ensure_marker_can_be_set(self) -> crate::Result<()> {
+        if self.can_set_marker() {
+            Ok(())
+        } else {
+            Err(error::fmt!(
+                InvalidApiCall,
+                concat!(
+                    "Can't set the marker whilst constructing a line. ",
+                    "A marker may only be set on an empty buffer or after ",
+                    "`at` or `at_now` is called."
+                )
+            ))
+        }
+    }
+
+    pub(super) fn missing_marker_error() -> crate::Error {
+        error::fmt!(InvalidApiCall, "Can't rewind to the marker: No marker set.")
+    }
+
     pub(super) const fn allows_symbol(self) -> bool {
         self.op_case.allows(Op::Symbol)
     }
@@ -210,5 +229,26 @@ mod tests {
         state.finish_row();
         assert!(state.can_set_marker());
         assert!(!state.allows_symbol());
+    }
+
+    #[test]
+    fn op_state_reports_marker_errors() {
+        let mut state = OpState::new();
+        state.record_table();
+
+        let err = state.ensure_marker_can_be_set().unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert_eq!(
+            err.msg(),
+            concat!(
+                "Can't set the marker whilst constructing a line. ",
+                "A marker may only be set on an empty buffer or after ",
+                "`at` or `at_now` is called."
+            )
+        );
+
+        let err = OpState::missing_marker_error();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert_eq!(err.msg(), "Can't rewind to the marker: No marker set.");
     }
 }

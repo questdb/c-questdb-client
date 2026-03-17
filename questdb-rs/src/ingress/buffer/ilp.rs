@@ -517,16 +517,7 @@ impl Buffer {
     /// Once the marker is no longer needed, call
     /// [`clear_marker`](Buffer::clear_marker).
     pub fn set_marker(&mut self) -> crate::Result<()> {
-        if !self.state.op_state.can_set_marker() {
-            return Err(error::fmt!(
-                InvalidApiCall,
-                concat!(
-                    "Can't set the marker whilst constructing a line. ",
-                    "A marker may only be set on an empty buffer or after ",
-                    "`at` or `at_now` is called."
-                )
-            ));
-        }
+        self.state.op_state.ensure_marker_can_be_set()?;
         self.marker = Some((self.output.len(), self.state));
         Ok(())
     }
@@ -541,10 +532,7 @@ impl Buffer {
             self.state = state;
             Ok(())
         } else {
-            Err(error::fmt!(
-                InvalidApiCall,
-                "Can't rewind to the marker: No marker set."
-            ))
+            Err(OpState::missing_marker_error())
         }
     }
 

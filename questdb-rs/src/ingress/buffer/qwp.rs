@@ -415,16 +415,7 @@ impl QwpBuffer {
     }
 
     pub(crate) fn set_marker(&mut self) -> crate::Result<()> {
-        if !self.state.op_state.can_set_marker() {
-            return Err(error::fmt!(
-                InvalidApiCall,
-                concat!(
-                    "Can't set the marker whilst constructing a line. ",
-                    "A marker may only be set on an empty buffer or after ",
-                    "`at` or `at_now` is called."
-                )
-            ));
-        }
+        self.state.op_state.ensure_marker_can_be_set()?;
         self.marker = Some(QwpMarker {
             rows_len: self.rows.len() as u32,
             entries_len: self.entries.len() as u32,
@@ -454,10 +445,7 @@ impl QwpBuffer {
             self.recompute_size_hint();
             Ok(())
         } else {
-            Err(error::fmt!(
-                InvalidApiCall,
-                "Can't rewind to the marker: No marker set."
-            ))
+            Err(OpState::missing_marker_error())
         }
     }
 
