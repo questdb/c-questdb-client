@@ -174,7 +174,11 @@ impl Buffer {
         }
     }
 
-    /// Returns the currently allocated backing capacity in bytes.
+    /// Returns the current retained-capacity hint for the buffer.
+    ///
+    /// For ILP buffers, this is byte capacity. For QWP/UDP buffers, this is an
+    /// implementation-defined retained-capacity hint and should not be
+    /// interpreted as exact byte capacity.
     pub fn capacity(&self) -> usize {
         match &self.inner {
             BufferInner::Ilp(inner) => inner.capacity(),

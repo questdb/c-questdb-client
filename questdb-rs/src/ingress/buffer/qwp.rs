@@ -22,12 +22,12 @@
  *
  ******************************************************************************/
 
-use crate::error;
-use crate::ingress::decimal::DecimalView;
-use crate::ingress::{ArrayElement, NdArrayView, Timestamp};
 use crate::Error;
 #[cfg(test)]
 use crate::ErrorCode;
+use crate::error;
+use crate::ingress::decimal::DecimalView;
+use crate::ingress::{ArrayElement, NdArrayView, Timestamp};
 use std::fmt::Debug;
 
 use super::ilp::{ColumnName, TableName};
@@ -231,6 +231,7 @@ impl BufferState {
 struct QwpSizeHint {
     committed_len: usize,
     planner: RowGroupPlanner,
+    scratch: RowGroupPlanner,
     group_table: Option<NameSlice>,
 }
 
@@ -239,6 +240,7 @@ impl QwpSizeHint {
         Self {
             committed_len: 0,
             planner: RowGroupPlanner::new_stats_only(),
+            scratch: RowGroupPlanner::new_stats_only(),
             group_table: None,
         }
     }
@@ -246,6 +248,7 @@ impl QwpSizeHint {
     fn clear(&mut self) {
         self.committed_len = 0;
         self.planner.clear();
+        self.scratch.clear();
         self.group_table = None;
     }
 
@@ -291,10 +294,11 @@ impl QwpSizeHint {
             return Ok(());
         }
 
-        self.planner.clear();
-        self.planner
+        self.scratch.clear();
+        self.scratch
             .add_row(row, row_entries, name_bytes, value_bytes, table_name.len())?;
-        self.committed_len += self.planner.current_len;
+        self.committed_len += self.scratch.current_len;
+        std::mem::swap(&mut self.planner, &mut self.scratch);
         self.group_table = Some(row.table);
         Ok(())
     }
@@ -431,24 +435,27 @@ impl QwpBuffer {
     }
 
     pub(crate) fn rewind_to_marker(&mut self) -> crate::Result<()> {
-        if let Some(marker) = self.marker.take() {
-            self.rows.truncate(marker.rows_len as usize);
-            self.entries.truncate(marker.entries_len as usize);
-            self.name_bytes.truncate(marker.name_bytes_len as usize);
-            self.value_bytes.truncate(marker.value_bytes_len as usize);
-            self.segments.truncate(marker.segments_len as usize);
-            if let Some(tail_row_count) = marker.tail_segment_row_count
-                && let Some(last_seg) = self.segments.last_mut()
-            {
-                last_seg.row_count = tail_row_count;
-            }
-            self.pending = PendingRowState::empty();
-            self.state = marker.state;
-            self.recompute_size_hint();
-            Ok(())
-        } else {
-            Err(OpState::missing_marker_error())
+        let marker = self.marker.ok_or_else(OpState::missing_marker_error)?;
+        let size_hint = self.build_size_hint_for_target(
+            marker.segments_len as usize,
+            marker.tail_segment_row_count,
+        )?;
+
+        self.rows.truncate(marker.rows_len as usize);
+        self.entries.truncate(marker.entries_len as usize);
+        self.name_bytes.truncate(marker.name_bytes_len as usize);
+        self.value_bytes.truncate(marker.value_bytes_len as usize);
+        self.segments.truncate(marker.segments_len as usize);
+        if let Some(tail_row_count) = marker.tail_segment_row_count
+            && let Some(last_seg) = self.segments.last_mut()
+        {
+            last_seg.row_count = tail_row_count;
         }
+        self.pending = PendingRowState::empty();
+        self.state = marker.state;
+        self.size_hint = size_hint;
+        self.marker = None;
+        Ok(())
     }
 
     pub(crate) fn clear_marker(&mut self) {
@@ -467,29 +474,41 @@ impl QwpBuffer {
         self.marker = None;
     }
 
-    fn recompute_size_hint(&mut self) {
-        self.size_hint.clear();
+    fn build_size_hint_for_target(
+        &self,
+        segments_len: usize,
+        tail_segment_row_count: Option<u32>,
+    ) -> crate::Result<QwpSizeHint> {
+        let mut size_hint = QwpSizeHint::new();
         let mut prev_seg_table: Option<NameSlice> = None;
-        for seg_idx in 0..self.segments.len() {
+        for seg_idx in 0..segments_len {
             let segment = self.segments[seg_idx];
+            let row_count = if seg_idx + 1 == segments_len {
+                tail_segment_row_count.unwrap_or(segment.row_count)
+            } else {
+                segment.row_count
+            };
             let start = segment.row_start as usize;
-            for i in 0..segment.row_count as usize {
+            for i in 0..row_count as usize {
                 let row = &self.rows[start + i];
                 let last_seg_table = if i == 0 {
                     prev_seg_table
                 } else {
                     Some(segment.table)
                 };
-                let _ = self.size_hint.add_committed_row(
+                size_hint.add_committed_row(
                     row,
                     &self.entries,
                     &self.name_bytes,
                     &self.value_bytes,
                     last_seg_table,
-                );
+                )?;
             }
-            prev_seg_table = Some(segment.table);
+            if row_count > 0 {
+                prev_seg_table = Some(segment.table);
+            }
         }
+        Ok(size_hint)
     }
 
     pub(crate) fn check_can_flush(&self) -> crate::Result<()> {
@@ -834,7 +853,11 @@ impl QwpBuffer {
             last_seg_table,
         ) {
             self.rollback_pending();
-            self.state.op_state.finish_row();
+            if self.state.row_count == 0 {
+                self.state.op_state = OpState::new();
+            } else {
+                self.state.op_state.finish_row();
+            }
             return Err(err);
         }
 
@@ -2122,6 +2145,161 @@ mod tests {
 
         nanos_buf.at(TimestampNanos::new(2)).unwrap();
         assert_eq!(nanos_buf.row_count(), 1);
+    }
+
+    #[test]
+    fn qwp_size_hint_preserves_current_group_after_new_group_error() {
+        let mut buf = QwpBuffer::new(127);
+
+        buf.table("trades").unwrap().column_i64("qty", 1).unwrap();
+        buf.at_now().unwrap();
+
+        let len_before = buf.len();
+        let planner_len_before = buf.size_hint.planner.current_len;
+        let planner_rows_before = buf.size_hint.planner.row_count();
+        let group_table_before = buf.size_hint.group_table;
+        let last_seg_table = buf.segments.last().map(|segment| segment.table);
+
+        let bad_table = buf.append_name("quotes").unwrap();
+        let bad_name = buf.append_name("dup").unwrap();
+        let entry_start = buf.entries.len() as u32;
+        buf.entries.push(EntryMeta {
+            name: bad_name,
+            value: ValueRef::I64(1),
+        });
+        buf.entries.push(EntryMeta {
+            name: bad_name,
+            value: ValueRef::Bool(true),
+        });
+        let bad_row = RowMeta {
+            table: bad_table,
+            entry_start,
+            entry_count: 2,
+            designated_ts: None,
+        };
+
+        let err = buf
+            .size_hint
+            .add_committed_row(
+                &bad_row,
+                &buf.entries,
+                &buf.name_bytes,
+                &buf.value_bytes,
+                last_seg_table,
+            )
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert_eq!(
+            err.msg(),
+            r#"QWP/UDP column "dup" changes type within a batched table"#
+        );
+        assert_eq!(buf.size_hint.committed_len, len_before);
+        assert_eq!(buf.size_hint.planner.current_len, planner_len_before);
+        assert_eq!(buf.size_hint.planner.row_count(), planner_rows_before);
+        assert_eq!(buf.size_hint.group_table, group_table_before);
+
+        buf.table("trades").unwrap().column_i64("qty", 2).unwrap();
+        buf.at_now().unwrap();
+
+        let actual: usize = buf
+            .encode_datagrams(usize::MAX)
+            .unwrap()
+            .iter()
+            .map(Vec::len)
+            .sum();
+        assert_eq!(buf.len(), actual);
+    }
+
+    #[test]
+    fn qwp_first_row_size_hint_error_resets_flush_state_to_init() {
+        let mut buf = QwpBuffer::new(127);
+
+        buf.table("trades").unwrap().column_i64("qty", 1).unwrap();
+        let qty_name = buf.entries.last().unwrap().name;
+        buf.entries.push(EntryMeta {
+            name: qty_name,
+            value: ValueRef::Bool(true),
+        });
+
+        let err = buf.at_now().unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert_eq!(
+            err.msg(),
+            r#"QWP/UDP column "qty" changes type within a batched table"#
+        );
+        assert_eq!(buf.row_count(), 0);
+        assert!(buf.is_empty());
+
+        let flush_err = buf.check_can_flush().unwrap_err();
+        assert_eq!(flush_err.code(), ErrorCode::InvalidApiCall);
+        assert_eq!(
+            flush_err.msg(),
+            "State error: Bad call to `flush`, should have called `table` instead."
+        );
+
+        buf.table("trades").unwrap().column_i64("qty", 2).unwrap();
+        buf.at_now().unwrap();
+        assert_eq!(buf.row_count(), 1);
+    }
+
+    #[test]
+    fn qwp_later_size_hint_error_keeps_flushable_state() {
+        let mut buf = QwpBuffer::new(127);
+
+        buf.table("trades").unwrap().column_i64("qty", 1).unwrap();
+        buf.at_now().unwrap();
+
+        buf.table("trades")
+            .unwrap()
+            .column_bool("qty", true)
+            .unwrap();
+
+        let err = buf.at_now().unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert_eq!(
+            err.msg(),
+            r#"QWP/UDP column "qty" changes type within a batched table"#
+        );
+        assert_eq!(buf.row_count(), 1);
+        buf.check_can_flush().unwrap();
+    }
+
+    #[test]
+    fn qwp_rewind_to_marker_propagates_size_hint_replay_errors() {
+        let mut buf = QwpBuffer::new(127);
+
+        buf.table("trades").unwrap().column_i64("qty", 1).unwrap();
+        buf.at_now().unwrap();
+        buf.table("trades").unwrap().column_i64("qty", 2).unwrap();
+        buf.at_now().unwrap();
+        buf.set_marker().unwrap();
+        let marker_before = buf.marker.expect("marker should be set");
+        let len_before = buf.len();
+        let row_count_before = buf.row_count();
+        let rows_len_before = buf.rows.len();
+        let segments_len_before = buf.segments.len();
+
+        let second_row_entry_idx = buf.rows[1].entry_start as usize;
+        buf.entries[second_row_entry_idx].value = ValueRef::Bool(true);
+
+        let err = buf.rewind_to_marker().unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert_eq!(
+            err.msg(),
+            r#"QWP/UDP column "qty" changes type within a batched table"#
+        );
+        assert_eq!(buf.len(), len_before);
+        assert_eq!(buf.row_count(), row_count_before);
+        assert_eq!(buf.rows.len(), rows_len_before);
+        assert_eq!(buf.segments.len(), segments_len_before);
+        let marker_after = buf.marker.expect("marker should be preserved on failure");
+        assert_eq!(marker_after.rows_len, marker_before.rows_len);
+        assert_eq!(marker_after.entries_len, marker_before.entries_len);
+        assert_eq!(marker_after.segments_len, marker_before.segments_len);
+        assert_eq!(
+            marker_after.tail_segment_row_count,
+            marker_before.tail_segment_row_count
+        );
     }
 
     #[test]

@@ -704,6 +704,43 @@ fn qwp_udp_rejects_mixed_timestamp_column_precisions_within_table_batch() -> Tes
 }
 
 #[test]
+fn qwp_udp_round_trips_timestamp_nanos_columns() -> TestResult {
+    let mock = QwpUdpMock::new()?;
+    let mut sender = mock.sender_builder().build()?;
+    let mut buffer = sender.new_buffer();
+
+    buffer
+        .table("trades")?
+        .symbol("sym", "ETH-USD")?
+        .column_ts("event_ts", TimestampNanos::new(789_000))?
+        .at_now()?;
+
+    sender.flush(&mut buffer)?;
+
+    let decoded = decode_datagram(&mock.recv_datagram()?).expect("datagram should decode");
+    assert_eq!(decoded.table.name, "trades");
+    assert_eq!(decoded.table.row_count, 1);
+    assert_eq!(
+        decoded
+            .table
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["sym", "event_ts"]
+    );
+    assert_eq!(
+        decoded.table.rows,
+        vec![vec![
+            DecodedValue::Symbol("ETH-USD".to_owned()),
+            DecodedValue::TimestampNanos(789_000),
+        ]]
+    );
+
+    Ok(())
+}
+
+#[test]
 fn qwp_udp_rejects_not_yet_supported_column_types() -> TestResult {
     let mock = QwpUdpMock::new()?;
     let sender = mock.sender_builder().build()?;

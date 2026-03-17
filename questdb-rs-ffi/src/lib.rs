@@ -1485,9 +1485,10 @@ pub unsafe extern "C" fn line_sender_opts_new(
     port: u16,
 ) -> *mut line_sender_opts {
     let builder = SenderBuilder::new(protocol.into(), host.as_str(), port);
-    let builder = builder
-        .user_agent(concat!("questdb/c/", env!("CARGO_PKG_VERSION")))
-        .expect("user_agent set");
+    let builder = match builder.user_agent(concat!("questdb/c/", env!("CARGO_PKG_VERSION"))) {
+        Ok(builder) => builder,
+        Err(_) => return ptr::null_mut(),
+    };
     Box::into_raw(Box::new(line_sender_opts(builder)))
 }
 
@@ -1500,9 +1501,10 @@ pub unsafe extern "C" fn line_sender_opts_new_service(
     port: line_sender_utf8,
 ) -> *mut line_sender_opts {
     let builder = SenderBuilder::new(protocol.into(), host.as_str(), port.as_str());
-    let builder = builder
-        .user_agent(concat!("questdb/c/", env!("CARGO_PKG_VERSION")))
-        .expect("user_agent set");
+    let builder = match builder.user_agent(concat!("questdb/c/", env!("CARGO_PKG_VERSION"))) {
+        Ok(builder) => builder,
+        Err(_) => return ptr::null_mut(),
+    };
     Box::into_raw(Box::new(line_sender_opts(builder)))
 }
 
@@ -1840,9 +1842,11 @@ pub unsafe extern "C" fn line_sender_from_conf(
     unsafe {
         let config = config.as_str();
         let builder = bubble_err_to_c!(err_out, SenderBuilder::from_conf(config), ptr::null_mut());
-        let builder = builder
-            .user_agent(concat!("questdb/c/", env!("CARGO_PKG_VERSION")))
-            .expect("user_agent set");
+        let builder = bubble_err_to_c!(
+            err_out,
+            builder.user_agent(concat!("questdb/c/", env!("CARGO_PKG_VERSION"))),
+            ptr::null_mut()
+        );
         let sender = bubble_err_to_c!(err_out, builder.build(), ptr::null_mut());
         Box::into_raw(Box::new(line_sender(sender)))
     }
@@ -1863,9 +1867,11 @@ pub unsafe extern "C" fn line_sender_from_env(
 ) -> *mut line_sender {
     unsafe {
         let builder = bubble_err_to_c!(err_out, SenderBuilder::from_env(), ptr::null_mut());
-        let builder = builder
-            .user_agent(concat!("questdb/c/", env!("CARGO_PKG_VERSION")))
-            .expect("user_agent set");
+        let builder = bubble_err_to_c!(
+            err_out,
+            builder.user_agent(concat!("questdb/c/", env!("CARGO_PKG_VERSION"))),
+            ptr::null_mut()
+        );
         let sender = bubble_err_to_c!(err_out, builder.build(), ptr::null_mut());
         Box::into_raw(Box::new(line_sender(sender)))
     }

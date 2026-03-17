@@ -62,7 +62,8 @@ pub(crate) enum SyncProtocolHandler {
     SyncHttp(SyncHttpHandlerState),
 }
 
-/// Connects to a QuestDB instance and inserts data via the ILP protocol.
+/// Connects to a QuestDB instance and inserts data via the configured
+/// ingestion protocol.
 ///
 /// * To construct an instance, use [`Sender::from_conf`] or the [`SenderBuilder`].
 /// * To prepare messages, use [`Buffer`] objects.
@@ -107,7 +108,8 @@ impl Sender {
     ///
     /// The format of the string is: `"http::addr=host:port;key=value;...;"`.
     ///
-    /// Instead of `"http"`, you can also specify `"https"`, `"tcp"`, and `"tcps"`.
+    /// Instead of `"http"`, you can also specify `"https"`, `"tcp"`, `"tcps"`,
+    /// and `"qwpudp"`.
     ///
     /// We recommend HTTP for most cases because it provides more features, like
     /// reporting errors to the client and supporting transaction control. TCP can

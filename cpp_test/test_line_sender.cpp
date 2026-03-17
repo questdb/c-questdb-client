@@ -1636,6 +1636,81 @@ TEST_CASE("line_sender c++ standalone qwpudp buffer")
     CHECK(datagram_starts_with_qwp1(datagram));
 }
 
+TEST_CASE("line_sender c++ qwpudp rejects flush with incomplete row")
+{
+    udp_capture receiver;
+    questdb::ingress::opts opts{
+        questdb::ingress::protocol::qwpudp,
+        std::string("127.0.0.1"),
+        std::to_string(receiver.port())};
+    questdb::ingress::line_sender sender{opts};
+
+    questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
+    buffer.table("trades")
+        .symbol("sym", "ETH-USD")
+        .column("qty", int64_t{4});
+
+    CHECK_THROWS_WITH_AS(
+        sender.flush(buffer),
+        "State error: Bad call to `flush`, should have called `column` or "
+        "`at` instead.",
+        questdb::ingress::line_sender_error);
+}
+
+TEST_CASE("line_sender c++ qwpudp rejects ilp buffer")
+{
+    udp_capture receiver;
+    questdb::ingress::opts opts{
+        questdb::ingress::protocol::qwpudp,
+        std::string("127.0.0.1"),
+        std::to_string(receiver.port())};
+    questdb::ingress::line_sender sender{opts};
+
+    questdb::ingress::line_sender_buffer buffer{
+        questdb::ingress::protocol_version::v1};
+    buffer.table("trades").column("qty", int64_t{4}).at_now();
+
+    CHECK_THROWS_WITH_AS(
+        sender.flush(buffer),
+        "QWP/UDP sender requires a QWP buffer created by `Sender::new_buffer()`.",
+        questdb::ingress::line_sender_error);
+}
+
+TEST_CASE("line_sender c++ qwpudp rejects rows exceeding max datagram size")
+{
+    udp_capture receiver;
+    questdb::ingress::opts opts{
+        questdb::ingress::protocol::qwpudp,
+        std::string("127.0.0.1"),
+        std::to_string(receiver.port())};
+    opts.max_datagram_size(24);
+    questdb::ingress::line_sender sender{opts};
+
+    questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
+    buffer.table("trades")
+        .symbol("sym", "ETH-USD")
+        .column("qty", int64_t{4})
+        .at_now();
+
+    try
+    {
+        sender.flush(buffer);
+        CHECK_MESSAGE(false, "Expected exception");
+    }
+    catch (const questdb::ingress::line_sender_error& se)
+    {
+        std::string msg{se.what()};
+        CHECK_MESSAGE(
+            msg.find("single row exceeds maximum datagram size") !=
+                std::string::npos,
+            msg);
+    }
+    catch (...)
+    {
+        CHECK_MESSAGE(false, "Other exception raised.");
+    }
+}
+
 TEST_CASE("Http auto detect line protocol version failed")
 {
     try
