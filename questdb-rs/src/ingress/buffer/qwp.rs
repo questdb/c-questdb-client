@@ -832,7 +832,19 @@ impl QwpBuffer {
         Error: From<T::Error>,
     {
         self.check_op(Op::At)?;
-        self.commit_current_row(Some(to_designated_ts(timestamp.try_into()?)))
+        let timestamp: Timestamp = timestamp.try_into()?;
+        let number = match timestamp {
+            Timestamp::Micros(ts) => ts.as_i64(),
+            Timestamp::Nanos(ts) => ts.as_i64(),
+        };
+        if number < 0 {
+            return Err(error::fmt!(
+                InvalidTimestamp,
+                "Timestamp {} is negative. It must be >= 0.",
+                number
+            ));
+        }
+        self.commit_current_row(Some(to_designated_ts(timestamp)))
     }
 
     pub(crate) fn at_now(&mut self) -> crate::Result<()> {
@@ -2142,6 +2154,35 @@ mod tests {
             err.msg()
                 .contains("should have called `symbol` or `column` instead")
         );
+    }
+
+    #[test]
+    fn qwp_at_rejects_negative_designated_timestamps_without_losing_pending_row() {
+        let mut buf = QwpBuffer::new(127);
+        buf.table("trades").unwrap().column_i64("qty", 1).unwrap();
+
+        let err = buf.at(TimestampMicros::new(-1)).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidTimestamp);
+        assert_eq!(err.msg(), "Timestamp -1 is negative. It must be >= 0.");
+        assert_eq!(buf.row_count(), 0);
+
+        buf.at(TimestampMicros::new(1)).unwrap();
+        assert_eq!(buf.row_count(), 1);
+
+        let mut nanos_buf = QwpBuffer::new(127);
+        nanos_buf
+            .table("trades")
+            .unwrap()
+            .column_i64("qty", 1)
+            .unwrap();
+
+        let err = nanos_buf.at(TimestampNanos::new(-2)).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidTimestamp);
+        assert_eq!(err.msg(), "Timestamp -2 is negative. It must be >= 0.");
+        assert_eq!(nanos_buf.row_count(), 0);
+
+        nanos_buf.at(TimestampNanos::new(2)).unwrap();
+        assert_eq!(nanos_buf.row_count(), 1);
     }
 
     #[test]
