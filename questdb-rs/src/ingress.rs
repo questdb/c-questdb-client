@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-#![doc = include_str!("mod.md")]
+#![doc = include_str!("ingress/mod.md")]
 
 pub use self::ndarr::{ArrayElement, NdArrayView};
 pub use self::timestamp::*;
