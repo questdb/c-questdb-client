@@ -48,6 +48,17 @@ pub(crate) struct QwpMessageHeader {
     pub(crate) payload_len: u32,
 }
 
+impl QwpMessageHeader {
+    /// Serialize the header into the first [`QWP_MESSAGE_HEADER_SIZE`] bytes of `out`.
+    fn write_to(&self, out: &mut [u8]) {
+        out[..4].copy_from_slice(&self.magic);
+        out[4] = self.version;
+        out[5] = self.flags;
+        out[6..8].copy_from_slice(&self.table_count.to_le_bytes());
+        out[8..12].copy_from_slice(&self.payload_len.to_le_bytes());
+    }
+}
+
 pub(crate) const QWP_MESSAGE_HEADER_SIZE: usize = std::mem::size_of::<QwpMessageHeader>();
 
 // Compile-time guarantee that the header is exactly 12 bytes.
@@ -1703,12 +1714,14 @@ fn encode_row_group_from_scratch(
     }
 
     // Fill header
-    let payload_len = (out.len() - payload_start) as u32;
-    out[header_start..header_start + 4].copy_from_slice(b"QWP1");
-    out[header_start + 4] = QWP_VERSION_1;
-    out[header_start + 5] = 0;
-    out[header_start + 6..header_start + 8].copy_from_slice(&1u16.to_le_bytes());
-    out[header_start + 8..header_start + 12].copy_from_slice(&payload_len.to_le_bytes());
+    let header = QwpMessageHeader {
+        magic: *b"QWP1",
+        version: QWP_VERSION_1,
+        flags: 0,
+        table_count: 1,
+        payload_len: (out.len() - payload_start) as u32,
+    };
+    header.write_to(&mut out[header_start..header_start + QWP_MESSAGE_HEADER_SIZE]);
 
     Ok(())
 }
