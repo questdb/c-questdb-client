@@ -738,6 +738,47 @@ fn qwp_udp_rejects_flushing_empty_buffer() -> TestResult {
 }
 
 #[test]
+fn qwp_buffer_check_can_flush_tracks_public_state_machine() -> TestResult {
+    let mut buffer = Buffer::new_qwp();
+
+    let err = buffer.check_can_flush().unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert_eq!(
+        err.msg(),
+        "State error: Bad call to `flush`, should have called `table` instead."
+    );
+
+    buffer.table("trades")?;
+    let err = buffer.check_can_flush().unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert_eq!(
+        err.msg(),
+        "State error: Bad call to `flush`, should have called `symbol` or `column` instead."
+    );
+
+    buffer.symbol("sym", "ETH-USD")?;
+    let err = buffer.check_can_flush().unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert_eq!(
+        err.msg(),
+        "State error: Bad call to `flush`, should have called `symbol`, `column` or `at` instead."
+    );
+
+    buffer.column_i64("qty", 4)?;
+    let err = buffer.check_can_flush().unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert_eq!(
+        err.msg(),
+        "State error: Bad call to `flush`, should have called `column` or `at` instead."
+    );
+
+    buffer.at_now()?;
+    buffer.check_can_flush()?;
+
+    Ok(())
+}
+
+#[test]
 fn qwp_udp_rejects_flushing_incomplete_row() -> TestResult {
     let mock = QwpUdpMock::new()?;
     let mut sender = mock.sender_builder().build()?;

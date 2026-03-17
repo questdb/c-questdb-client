@@ -29,6 +29,7 @@ use crate::{Error, ErrorCode};
 use std::fmt::Debug;
 
 use super::ilp::{ColumnName, TableName};
+use super::op_state::{Op, OpState};
 
 /// Wire layout of a QWP datagram header.
 ///
@@ -201,55 +202,11 @@ impl PendingRowState {
     }
 }
 
-// --- Op state machine ---
-
-#[derive(Debug, Copy, Clone)]
-enum Op {
-    Table = 1,
-    Symbol = 1 << 1,
-    Column = 1 << 2,
-    At = 1 << 3,
-    Flush = 1 << 4,
-}
-
-impl Op {
-    fn descr(self) -> &'static str {
-        match self {
-            Op::Table => "table",
-            Op::Symbol => "symbol",
-            Op::Column => "column",
-            Op::At => "at",
-            Op::Flush => "flush",
-        }
-    }
-}
-
-#[derive(Debug, Copy, Clone, PartialEq)]
-enum OpCase {
-    Init = Op::Table as isize,
-    TableWritten = Op::Symbol as isize | Op::Column as isize,
-    SymbolWritten = Op::Symbol as isize | Op::Column as isize | Op::At as isize,
-    ColumnWritten = Op::Column as isize | Op::At as isize,
-    MayFlushOrTable = Op::Flush as isize | Op::Table as isize,
-}
-
-impl OpCase {
-    fn next_op_descr(self) -> &'static str {
-        match self {
-            OpCase::Init => "should have called `table` instead",
-            OpCase::TableWritten => "should have called `symbol` or `column` instead",
-            OpCase::SymbolWritten => "should have called `symbol`, `column` or `at` instead",
-            OpCase::ColumnWritten => "should have called `column` or `at` instead",
-            OpCase::MayFlushOrTable => "should have called `flush` or `table` instead",
-        }
-    }
-}
-
 // --- Buffer state ---
 
 #[derive(Clone, Copy, Debug)]
 struct BufferState {
-    op_case: OpCase,
+    op_state: OpState,
     row_count: usize,
     first_table_name: Option<NameSlice>,
     transactional: bool,
@@ -258,7 +215,7 @@ struct BufferState {
 impl BufferState {
     fn new() -> Self {
         Self {
-            op_case: OpCase::Init,
+            op_state: OpState::new(),
             row_count: 0,
             first_table_name: None,
             transactional: true,
@@ -458,7 +415,7 @@ impl QwpBuffer {
     }
 
     pub(crate) fn set_marker(&mut self) -> crate::Result<()> {
-        if (self.state.op_case as isize & Op::Table as isize) == 0 {
+        if !self.state.op_state.can_set_marker() {
             return Err(error::fmt!(
                 InvalidApiCall,
                 concat!(
@@ -550,16 +507,7 @@ impl QwpBuffer {
     }
 
     fn check_op(&self, op: Op) -> crate::Result<()> {
-        if (self.state.op_case as isize & op as isize) > 0 {
-            Ok(())
-        } else {
-            Err(error::fmt!(
-                InvalidApiCall,
-                "State error: Bad call to `{}`, {}.",
-                op.descr(),
-                self.state.op_case.next_op_descr()
-            ))
-        }
+        self.state.op_state.check(op)
     }
 
     fn validate_max_name_len(&self, name: &str) -> crate::Result<()> {
@@ -679,7 +627,7 @@ impl QwpBuffer {
         let table_ns = self.append_name(name.as_ref())?;
         self.update_transactional_state(table_ns);
         self.pending.table = Some(table_ns);
-        self.state.op_case = OpCase::TableWritten;
+        self.state.op_state.record_table();
         Ok(self)
     }
 
@@ -699,7 +647,7 @@ impl QwpBuffer {
             name: name_ns,
             value: ValueRef::Symbol(value_vs),
         });
-        self.state.op_case = OpCase::SymbolWritten;
+        self.state.op_state.record_symbol();
         Ok(self)
     }
 
@@ -717,7 +665,7 @@ impl QwpBuffer {
             name: name_ns,
             value: ValueRef::Bool(value),
         });
-        self.state.op_case = OpCase::ColumnWritten;
+        self.state.op_state.record_column();
         Ok(self)
     }
 
@@ -735,7 +683,7 @@ impl QwpBuffer {
             name: name_ns,
             value: ValueRef::I64(value),
         });
-        self.state.op_case = OpCase::ColumnWritten;
+        self.state.op_state.record_column();
         Ok(self)
     }
 
@@ -753,7 +701,7 @@ impl QwpBuffer {
             name: name_ns,
             value: ValueRef::F64(value),
         });
-        self.state.op_case = OpCase::ColumnWritten;
+        self.state.op_state.record_column();
         Ok(self)
     }
 
@@ -773,7 +721,7 @@ impl QwpBuffer {
             name: name_ns,
             value: ValueRef::String(value_vs),
         });
-        self.state.op_case = OpCase::ColumnWritten;
+        self.state.op_state.record_column();
         Ok(self)
     }
 
@@ -823,7 +771,7 @@ impl QwpBuffer {
             name: name_ns,
             value: value_ref,
         });
-        self.state.op_case = OpCase::ColumnWritten;
+        self.state.op_state.record_column();
         Ok(self)
     }
 
@@ -895,7 +843,7 @@ impl QwpBuffer {
             last_seg_table,
         ) {
             self.rollback_pending();
-            self.state.op_case = OpCase::MayFlushOrTable;
+            self.state.op_state.finish_row();
             return Err(err);
         }
 
@@ -912,7 +860,7 @@ impl QwpBuffer {
 
         self.rows.push(row);
         self.state.row_count += 1;
-        self.state.op_case = OpCase::MayFlushOrTable;
+        self.state.op_state.finish_row();
         self.pending.table = None;
         Ok(())
     }

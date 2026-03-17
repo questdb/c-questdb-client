@@ -33,6 +33,8 @@ use crate::{Error, error};
 use std::fmt::{Debug, Formatter};
 use std::num::NonZeroUsize;
 
+use super::op_state::{Op, OpState};
+
 fn write_escaped_impl<Q, C>(check_escape_fn: C, quoting_fn: Q, output: &mut Vec<u8>, s: &str)
 where
     C: Fn(u8) -> bool,
@@ -126,53 +128,11 @@ impl F64Serializer {
     }
 }
 
-#[derive(Debug, Copy, Clone)]
-enum Op {
-    Table = 1,
-    Symbol = 1 << 1,
-    Column = 1 << 2,
-    At = 1 << 3,
-    Flush = 1 << 4,
-}
-
-impl Op {
-    fn descr(self) -> &'static str {
-        match self {
-            Op::Table => "table",
-            Op::Symbol => "symbol",
-            Op::Column => "column",
-            Op::At => "at",
-            Op::Flush => "flush",
-        }
-    }
-}
-
-#[derive(Debug, Copy, Clone, PartialEq)]
-enum OpCase {
-    Init = Op::Table as isize,
-    TableWritten = Op::Symbol as isize | Op::Column as isize,
-    SymbolWritten = Op::Symbol as isize | Op::Column as isize | Op::At as isize,
-    ColumnWritten = Op::Column as isize | Op::At as isize,
-    MayFlushOrTable = Op::Flush as isize | Op::Table as isize,
-}
-
-impl OpCase {
-    fn next_op_descr(self) -> &'static str {
-        match self {
-            OpCase::Init => "should have called `table` instead",
-            OpCase::TableWritten => "should have called `symbol` or `column` instead",
-            OpCase::SymbolWritten => "should have called `symbol`, `column` or `at` instead",
-            OpCase::ColumnWritten => "should have called `column` or `at` instead",
-            OpCase::MayFlushOrTable => "should have called `flush` or `table` instead",
-        }
-    }
-}
-
 // IMPORTANT: This struct MUST remain `Copy` to ensure that
 // there are no heap allocations when performing marker operations.
 #[derive(Debug, Clone, Copy)]
 struct BufferState {
-    op_case: OpCase,
+    op_state: OpState,
     row_count: usize,
     first_table_len: Option<NonZeroUsize>,
     transactional: bool,
@@ -181,7 +141,7 @@ struct BufferState {
 impl BufferState {
     fn new() -> Self {
         Self {
-            op_case: OpCase::Init,
+            op_state: OpState::new(),
             row_count: 0,
             first_table_len: None,
             transactional: true,
@@ -557,7 +517,7 @@ impl Buffer {
     /// Once the marker is no longer needed, call
     /// [`clear_marker`](Buffer::clear_marker).
     pub fn set_marker(&mut self) -> crate::Result<()> {
-        if (self.state.op_case as isize & Op::Table as isize) == 0 {
+        if !self.state.op_state.can_set_marker() {
             return Err(error::fmt!(
                 InvalidApiCall,
                 concat!(
@@ -607,16 +567,7 @@ impl Buffer {
     /// Check if the next API operation is allowed as per the OP case state machine.
     #[inline(always)]
     fn check_op(&self, op: Op) -> crate::Result<()> {
-        if (self.state.op_case as isize & op as isize) > 0 {
-            Ok(())
-        } else {
-            Err(error::fmt!(
-                InvalidApiCall,
-                "State error: Bad call to `{}`, {}.",
-                op.descr(),
-                self.state.op_case.next_op_descr()
-            ))
-        }
+        self.state.op_state.check(op)
     }
 
     /// Checks if this buffer is ready to be flushed to a sender via one of the
@@ -680,7 +631,7 @@ impl Buffer {
         let table_begin = self.output.len();
         write_escaped_unquoted(&mut self.output, name.name);
         let table_end = self.output.len();
-        self.state.op_case = OpCase::TableWritten;
+        self.state.op_state.record_table();
 
         // A buffer stops being transactional if it targets multiple tables.
         if let Some(first_table_len) = &self.state.first_table_len {
@@ -766,7 +717,7 @@ impl Buffer {
         write_escaped_unquoted(&mut self.output, name.name);
         self.output.push(b'=');
         write_escaped_unquoted(&mut self.output, value.as_ref());
-        self.state.op_case = OpCase::SymbolWritten;
+        self.state.op_state.record_symbol();
         Ok(self)
     }
 
@@ -778,15 +729,14 @@ impl Buffer {
         let name: ColumnName<'a> = name.try_into()?;
         self.validate_max_name_len(name.name)?;
         self.check_op(Op::Column)?;
-        self.output
-            .push(if (self.state.op_case as isize & Op::Symbol as isize) > 0 {
-                b' '
-            } else {
-                b','
-            });
+        self.output.push(if self.state.op_state.allows_symbol() {
+            b' '
+        } else {
+            b','
+        });
         write_escaped_unquoted(&mut self.output, name.name);
         self.output.push(b'=');
-        self.state.op_case = OpCase::ColumnWritten;
+        self.state.op_state.record_column();
         Ok(self)
     }
 
@@ -1333,7 +1283,7 @@ impl Buffer {
         self.output.push(b' ');
         self.output.extend_from_slice(printed.as_bytes());
         self.output.extend_from_slice(termination.as_bytes());
-        self.state.op_case = OpCase::MayFlushOrTable;
+        self.state.op_state.finish_row();
         self.state.row_count += 1;
         Ok(())
     }
@@ -1370,7 +1320,7 @@ impl Buffer {
     pub fn at_now(&mut self) -> crate::Result<()> {
         self.check_op(Op::At)?;
         self.output.push(b'\n');
-        self.state.op_case = OpCase::MayFlushOrTable;
+        self.state.op_state.finish_row();
         self.state.row_count += 1;
         Ok(())
     }
