@@ -338,12 +338,11 @@ impl Sender {
         self.protocol
     }
 
-    /// Returns the sender's ILP protocol version.
+    /// Returns the sender's protocol version.
     ///
-    /// For protocol-neutral inspection, use [`Sender::protocol`].
-    ///
-    /// - Explicitly set version, or
-    /// - Auto-detected for HTTP transport, or [`ProtocolVersion::V1`] for TCP transport.
+    /// The returned value may be explicitly configured, auto-detected, or a
+    /// transport-defined default. Interpret it together with [`Sender::protocol`]
+    /// and [`ProtocolVersion`].
     pub fn protocol_version(&self) -> ProtocolVersion {
         self.protocol_version
     }

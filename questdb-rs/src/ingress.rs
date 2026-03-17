@@ -77,28 +77,24 @@ pub(crate) const DOUBLE_BINARY_FORMAT_TYPE: u8 = 16;
 #[allow(dead_code)]
 pub const DECIMAL_BINARY_FORMAT_TYPE: u8 = 23;
 
-/// The version of InfluxDB Line Protocol used to communicate with the server.
+/// Transport-scoped protocol version identifier used by the ingestion APIs.
+///
+/// Interpret this value together with the transport protocol.
+/// The same version number may correspond to different wire formats or feature
+/// sets on different transports.
 #[derive(Debug, Copy, Clone, PartialEq, PartialOrd)]
 pub enum ProtocolVersion {
-    /// Version 1 of Line Protocol.
-    /// Full-text protocol.
-    /// This version is compatible with the InfluxDB database.
+    /// Version 1.
     V1 = 1,
 
-    /// Version 2 of InfluxDB Line Protocol.
-    /// Uses binary format serialization for f64, and supports the array data type.
-    /// This version is specific to QuestDB and is not compatible with InfluxDB.
-    /// QuestDB server version 9.0.0 or later is required for `V2` support.
+    /// Version 2.
     V2 = 2,
 
-    /// Version 3 of InfluxDB Line Protocol.
-    /// Supports the decimal data type in text and binary formats.
-    /// This version is specific to QuestDB and is not compatible with InfluxDB.
-    /// QuestDB server version 9.2.0 or later is required for `V3` support.
+    /// Version 3.
     V3 = 3,
 }
 
-/// List of supported protocol versions, in order of preference (highest to lowest).
+/// List of supported ILP protocol versions, in order of preference (highest to lowest).
 #[cfg(feature = "_sender-http")]
 const SUPPORTED_PROTOCOL_VERSIONS: [ProtocolVersion; 3] = [
     ProtocolVersion::V3,
@@ -796,12 +792,13 @@ impl SenderBuilder {
         }
     }
 
-    /// Sets the ingestion protocol version.
+    /// Sets the protocol version for ILP transports.
     /// - HTTP transport automatically negotiates the protocol version by default(unset, **Strong Recommended**).
     ///   You can explicitly configure the protocol version to avoid the slight latency cost at connection time.
     /// - TCP transport does not negotiate the protocol version and uses [`ProtocolVersion::V1`] by
     ///   default. You must explicitly set [`ProtocolVersion::V2`] in order to ingest
     ///   arrays.
+    /// - QWP/UDP does not support explicit `protocol_version` configuration.
     ///
     /// **Note**: QuestDB server version 9.0.0 or later is required for [`ProtocolVersion::V2`] support.
     pub fn protocol_version(mut self, protocol_version: ProtocolVersion) -> Result<Self> {

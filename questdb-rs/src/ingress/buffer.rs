@@ -103,6 +103,9 @@ impl Buffer {
         }
     }
 
+    /// Returns the protocol version associated with this buffer.
+    ///
+    /// See [`ProtocolVersion`] for transport-specific interpretation.
     pub fn protocol_version(&self) -> ProtocolVersion {
         match &self.inner {
             BufferInner::Ilp(inner) => inner.protocol_version(),
@@ -111,6 +114,10 @@ impl Buffer {
         }
     }
 
+    /// Reserves capacity for at least `additional` more bytes of buffered data.
+    ///
+    /// For QWP/UDP buffers this reserves internal arena capacity used during
+    /// datagram planning and encoding.
     pub fn reserve(&mut self, additional: usize) {
         match &mut self.inner {
             BufferInner::Ilp(inner) => inner.reserve(additional),
@@ -119,6 +126,10 @@ impl Buffer {
         }
     }
 
+    /// Returns the current buffered size.
+    ///
+    /// For ILP buffers this is the exact serialized byte count. For QWP/UDP
+    /// buffers this is the size hint used for flush planning.
     pub fn len(&self) -> usize {
         match &self.inner {
             BufferInner::Ilp(inner) => inner.len(),
@@ -127,6 +138,10 @@ impl Buffer {
         }
     }
 
+    /// Returns the number of completed rows currently buffered.
+    ///
+    /// A row is counted only after [`Buffer::at`] or [`Buffer::at_now`] completes
+    /// it.
     pub fn row_count(&self) -> usize {
         match &self.inner {
             BufferInner::Ilp(inner) => inner.row_count(),
@@ -135,6 +150,12 @@ impl Buffer {
         }
     }
 
+    /// Returns whether the buffered batch is still eligible for transactional
+    /// flushing.
+    ///
+    /// This is `true` only while the buffer contains rows for at most one table.
+    /// Actual transactional behavior also depends on the transport; QWP/UDP does
+    /// not support transactional flushes.
     pub fn transactional(&self) -> bool {
         match &self.inner {
             BufferInner::Ilp(inner) => inner.transactional(),
@@ -143,6 +164,7 @@ impl Buffer {
         }
     }
 
+    /// Returns `true` if the buffer contains no committed or in-progress rows.
     pub fn is_empty(&self) -> bool {
         match &self.inner {
             BufferInner::Ilp(inner) => inner.is_empty(),
@@ -151,6 +173,7 @@ impl Buffer {
         }
     }
 
+    /// Returns the currently allocated backing capacity in bytes.
     pub fn capacity(&self) -> usize {
         match &self.inner {
             BufferInner::Ilp(inner) => inner.capacity(),
@@ -159,6 +182,10 @@ impl Buffer {
         }
     }
 
+    /// Returns the raw serialized ILP bytes currently stored in the buffer.
+    ///
+    /// QWP/UDP buffers build datagrams during flush, so this returns an empty
+    /// slice for QWP/UDP.
     pub fn as_bytes(&self) -> &[u8] {
         match &self.inner {
             BufferInner::Ilp(inner) => inner.as_bytes(),
@@ -167,6 +194,10 @@ impl Buffer {
         }
     }
 
+    /// Marks the current buffer state so it can later be restored with
+    /// [`Buffer::rewind_to_marker`].
+    ///
+    /// Setting a new marker replaces the previous one.
     pub fn set_marker(&mut self) -> crate::Result<()> {
         match &mut self.inner {
             BufferInner::Ilp(inner) => inner.set_marker(),
@@ -175,6 +206,9 @@ impl Buffer {
         }
     }
 
+    /// Rewinds the buffer to the most recent marker and then clears that marker.
+    ///
+    /// Returns an error if no marker is set.
     pub fn rewind_to_marker(&mut self) -> crate::Result<()> {
         match &mut self.inner {
             BufferInner::Ilp(inner) => inner.rewind_to_marker(),
@@ -183,6 +217,7 @@ impl Buffer {
         }
     }
 
+    /// Clears the current marker, if any.
     pub fn clear_marker(&mut self) {
         match &mut self.inner {
             BufferInner::Ilp(inner) => inner.clear_marker(),
@@ -191,6 +226,7 @@ impl Buffer {
         }
     }
 
+    /// Clears the buffer contents and marker while retaining allocated capacity.
     pub fn clear(&mut self) {
         match &mut self.inner {
             BufferInner::Ilp(inner) => inner.clear(),
@@ -199,6 +235,11 @@ impl Buffer {
         }
     }
 
+    /// Validates that the buffer is ready to be flushed with
+    /// [`crate::ingress::Sender::flush`] or one of its variants.
+    ///
+    /// Returns an error when the current API call sequence is incomplete, such
+    /// as an unfinished row.
     pub fn check_can_flush(&self) -> crate::Result<()> {
         match &self.inner {
             BufferInner::Ilp(inner) => inner.check_can_flush(),
@@ -207,6 +248,10 @@ impl Buffer {
         }
     }
 
+    /// Starts a new row for `name`.
+    ///
+    /// Every row must begin with a table name. See [`Buffer`] for the full call
+    /// sequence.
     pub fn table<'a, N>(&mut self, name: N) -> crate::Result<&mut Self>
     where
         N: TryInto<TableName<'a>>,
@@ -224,6 +269,9 @@ impl Buffer {
         Ok(self)
     }
 
+    /// Adds a symbol column to the current row.
+    ///
+    /// All symbol columns must be recorded before any non-symbol columns.
     pub fn symbol<'a, N, S>(&mut self, name: N, value: S) -> crate::Result<&mut Self>
     where
         N: TryInto<ColumnName<'a>>,
@@ -242,6 +290,7 @@ impl Buffer {
         Ok(self)
     }
 
+    /// Adds a boolean column to the current row.
     pub fn column_bool<'a, N>(&mut self, name: N, value: bool) -> crate::Result<&mut Self>
     where
         N: TryInto<ColumnName<'a>>,
@@ -259,6 +308,7 @@ impl Buffer {
         Ok(self)
     }
 
+    /// Adds an integer column to the current row.
     pub fn column_i64<'a, N>(&mut self, name: N, value: i64) -> crate::Result<&mut Self>
     where
         N: TryInto<ColumnName<'a>>,
@@ -276,6 +326,7 @@ impl Buffer {
         Ok(self)
     }
 
+    /// Adds a floating-point column to the current row.
     pub fn column_f64<'a, N>(&mut self, name: N, value: f64) -> crate::Result<&mut Self>
     where
         N: TryInto<ColumnName<'a>>,
@@ -293,6 +344,7 @@ impl Buffer {
         Ok(self)
     }
 
+    /// Adds a string column to the current row.
     pub fn column_str<'a, N, S>(&mut self, name: N, value: S) -> crate::Result<&mut Self>
     where
         N: TryInto<ColumnName<'a>>,
@@ -311,6 +363,10 @@ impl Buffer {
         Ok(self)
     }
 
+    /// Adds a decimal column to the current row.
+    ///
+    /// Returns an error if the active protocol does not support decimal values.
+    /// QWP/UDP buffers currently reject this call.
     pub fn column_dec<'a, N, S>(&mut self, name: N, value: S) -> crate::Result<&mut Self>
     where
         N: TryInto<ColumnName<'a>>,
@@ -331,6 +387,10 @@ impl Buffer {
     }
 
     #[allow(private_bounds)]
+    /// Adds an array column to the current row.
+    ///
+    /// Arrays require ILP protocol version 2 or later and are not currently
+    /// supported by QWP/UDP buffers.
     pub fn column_arr<'a, N, T, D>(&mut self, name: N, view: &T) -> crate::Result<&mut Self>
     where
         N: TryInto<ColumnName<'a>>,
@@ -350,6 +410,9 @@ impl Buffer {
         Ok(self)
     }
 
+    /// Adds a timestamp column to the current row.
+    ///
+    /// Accepts either microsecond or nanosecond timestamps.
     pub fn column_ts<'a, N, T>(&mut self, name: N, value: T) -> crate::Result<&mut Self>
     where
         N: TryInto<ColumnName<'a>>,
@@ -369,6 +432,10 @@ impl Buffer {
         Ok(self)
     }
 
+    /// Completes the current row with a designated timestamp.
+    ///
+    /// After this call you may begin the next row with [`Buffer::table`] or
+    /// flush the buffer. Accepts either microsecond or nanosecond timestamps.
     pub fn at<T>(&mut self, timestamp: T) -> crate::Result<()>
     where
         T: TryInto<Timestamp>,
@@ -381,6 +448,11 @@ impl Buffer {
         }
     }
 
+    /// Completes the current row without a designated timestamp so the server
+    /// assigns one.
+    ///
+    /// This is not equivalent to calling [`Buffer::at`] with the current client
+    /// time.
     pub fn at_now(&mut self) -> crate::Result<()> {
         match &mut self.inner {
             BufferInner::Ilp(inner) => inner.at_now(),
