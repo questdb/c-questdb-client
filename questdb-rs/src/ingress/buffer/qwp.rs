@@ -153,7 +153,7 @@ const CELL_END: u32 = u32::MAX;
 
 #[derive(Clone, Copy, Debug)]
 struct CellRef {
-    row_idx: u16,
+    row_idx: u32,
     /// Pre-computed symbol dictionary index; unused for non-symbol columns.
     symbol_dict_idx: u16,
     next: u32,
@@ -235,27 +235,53 @@ struct QwpSizeHint {
     planner: RowGroupPlanner,
     scratch: RowGroupPlanner,
     group_table: Option<NameSlice>,
+    completed: Vec<RowGroupPlanner>,
+    completed_count: usize,
 }
 
 impl QwpSizeHint {
     fn new() -> Self {
         Self {
             committed_len: 0,
-            planner: RowGroupPlanner::new_stats_only(),
-            scratch: RowGroupPlanner::new_stats_only(),
+            planner: RowGroupPlanner::new(),
+            scratch: RowGroupPlanner::new(),
             group_table: None,
+            completed: Vec::new(),
+            completed_count: 0,
         }
     }
 
     fn clear(&mut self) {
         self.committed_len = 0;
         self.planner.clear();
+        for p in &mut self.completed[..self.completed_count] {
+            p.clear();
+        }
+        // Ensure scratch retains capacity for the next cycle by swapping
+        // with a planner that was used (and thus has capacity). Without
+        // this, scratch can be left zero-capacity after a pool-growth
+        // cycle and would allocate on first use in the next cycle.
+        if self.completed_count > 0 {
+            std::mem::swap(&mut self.scratch, &mut self.completed[self.completed_count - 1]);
+        } else {
+            std::mem::swap(&mut self.scratch, &mut self.planner);
+        }
         self.scratch.clear();
+        self.completed_count = 0;
         self.group_table = None;
     }
 
     fn len(&self) -> usize {
         self.committed_len
+    }
+
+    fn segment_planner(&self, seg_idx: usize) -> &RowGroupPlanner {
+        if seg_idx < self.completed_count {
+            &self.completed[seg_idx]
+        } else {
+            debug_assert_eq!(seg_idx, self.completed_count);
+            &self.planner
+        }
     }
 
     fn add_committed_row(
@@ -300,7 +326,22 @@ impl QwpSizeHint {
         self.scratch
             .add_row(row, row_entries, name_bytes, value_bytes, table_name.len())?;
         self.committed_len += self.scratch.current_len;
-        std::mem::swap(&mut self.planner, &mut self.scratch);
+
+        if self.group_table.is_some() {
+            if self.completed_count < self.completed.len() {
+                std::mem::swap(
+                    &mut self.planner,
+                    &mut self.completed[self.completed_count],
+                );
+            } else {
+                let saved = std::mem::replace(&mut self.planner, RowGroupPlanner::new());
+                self.completed.push(saved);
+            }
+            self.completed_count += 1;
+            std::mem::swap(&mut self.planner, &mut self.scratch);
+        } else {
+            std::mem::swap(&mut self.planner, &mut self.scratch);
+        }
         self.group_table = Some(row.table);
         Ok(())
     }
@@ -1016,9 +1057,26 @@ impl QwpBuffer {
                  Call `at` or `at_now` to complete the pending row."
             ));
         }
-        for segment in &self.segments {
-            let rows = self.rows_for_segment(segment);
+        for (seg_idx, segment) in self.segments.iter().enumerate() {
             let table_name = &self.name_bytes[segment.table.0.as_range()];
+            let cached = self.size_hint.segment_planner(seg_idx);
+
+            // Fast path: segment fits in one datagram, encode from cached planner.
+            if cached.current_len <= max_datagram_size {
+                scratch.datagram.clear();
+                encode_row_group_from_scratch(
+                    cached,
+                    &self.name_bytes,
+                    &self.value_bytes,
+                    table_name,
+                    &mut scratch.datagram,
+                )?;
+                send(&scratch.datagram)?;
+                continue;
+            }
+
+            // Slow path: row-by-row replay for datagram splitting.
+            let rows = self.rows_for_segment(segment);
 
             scratch.planner.clear();
 
@@ -1353,7 +1411,6 @@ pub(crate) struct RowGroupPlanner {
     bool_column_count: usize,
     fixed8_column_count: usize,
     bitmap_column_count: usize,
-    track_cells: bool,
     symbol_hash_resize_epoch: u64,
     symbol_hasher: RandomState,
 }
@@ -1373,7 +1430,6 @@ impl Clone for RowGroupPlanner {
             bool_column_count: self.bool_column_count,
             fixed8_column_count: self.fixed8_column_count,
             bitmap_column_count: self.bitmap_column_count,
-            track_cells: self.track_cells,
             symbol_hash_resize_epoch: self.symbol_hash_resize_epoch,
             symbol_hasher: self.symbol_hasher.clone(),
         }
@@ -1418,27 +1474,6 @@ impl RowGroupPlanner {
             bool_column_count: 0,
             fixed8_column_count: 0,
             bitmap_column_count: 0,
-            track_cells: true,
-            symbol_hash_resize_epoch: 0,
-            symbol_hasher: RandomState::new(),
-        }
-    }
-
-    fn new_stats_only() -> Self {
-        Self {
-            columns: Vec::new(),
-            cells: Vec::new(),
-            symbol_dict: Vec::new(),
-            symbol_hash_buckets: Vec::new(),
-            undo_stack: Vec::new(),
-            symbol_lookup_undo: Vec::new(),
-            row_count: 0,
-            current_len: 0,
-            total_schema_len: 0,
-            bool_column_count: 0,
-            fixed8_column_count: 0,
-            bitmap_column_count: 0,
-            track_cells: false,
             symbol_hash_resize_epoch: 0,
             symbol_hasher: RandomState::new(),
         }
@@ -1495,7 +1530,7 @@ impl RowGroupPlanner {
                 col.dict_head = CELL_END;
             }
             col.cell_tail = undo.cell_tail;
-            if self.track_cells && col.cell_tail != CELL_END {
+            if col.cell_tail != CELL_END {
                 self.cells[col.cell_tail as usize].next = CELL_END;
             } else {
                 col.cell_head = CELL_END;
@@ -1534,13 +1569,6 @@ impl RowGroupPlanner {
         value_bytes: &[u8],
         table_name_len: usize,
     ) -> crate::Result<()> {
-        if self.track_cells && self.row_count >= u16::MAX as usize {
-            return Err(error::fmt!(
-                InvalidApiCall,
-                "QWP/UDP row group exceeds maximum of {} rows",
-                u16::MAX
-            ));
-        }
         let old_row_count = self.row_count;
         let old_column_count = self.columns.len();
         let old_total_schema_len = self.total_schema_len;
@@ -1550,7 +1578,7 @@ impl RowGroupPlanner {
         self.undo_stack.clear();
         let ts_entry = row.designated_ts.map(designated_ts_entry);
         let extra = ts_entry.as_slice();
-        let row_idx = self.row_count as u16;
+        let row_idx = self.row_count as u32;
 
         for entry in row_entries.iter().chain(extra.iter()) {
             let entry_name = &name_bytes[entry.name.0.as_range()];
@@ -1570,21 +1598,19 @@ impl RowGroupPlanner {
                     col_idx: undo_col_idx,
                     dict_count: col.dict_count,
                 });
-                if self.track_cells {
-                    let cell_idx = self.cells.len() as u32;
-                    self.cells.push(CellRef {
-                        row_idx,
-                        symbol_dict_idx: 0,
-                        next: CELL_END,
-                        value: entry.value,
-                    });
-                    if col.cell_tail != CELL_END {
-                        self.cells[col.cell_tail as usize].next = cell_idx;
-                    } else {
-                        col.cell_head = cell_idx;
-                    }
-                    col.cell_tail = cell_idx;
+                let cell_idx = self.cells.len() as u32;
+                self.cells.push(CellRef {
+                    row_idx,
+                    symbol_dict_idx: 0,
+                    next: CELL_END,
+                    value: entry.value,
+                });
+                if col.cell_tail != CELL_END {
+                    self.cells[col.cell_tail as usize].next = cell_idx;
+                } else {
+                    col.cell_head = cell_idx;
                 }
+                col.cell_tail = cell_idx;
                 if col.kind == ColumnKind::Symbol {
                     self.add_symbol_value(idx, &entry.value, value_bytes)?;
                 } else {
@@ -1701,11 +1727,7 @@ impl RowGroupPlanner {
             }
             col.dict_count as usize
         };
-        let symbol_dict_idx = if self.track_cells {
-            Some(Self::checked_u16(sym_idx, "symbol dictionary index")?)
-        } else {
-            None
-        };
+        let symbol_dict_idx = Self::checked_u16(sym_idx, "symbol dictionary index")?;
 
         let col = &mut self.columns[col_idx];
         col.non_null_count += 1;
@@ -1735,10 +1757,8 @@ impl RowGroupPlanner {
             col.dict_count += 1;
         }
         col.symbol_row_index_bytes += qwp_varint_size(sym_idx as u64) as u32;
-        if let Some(symbol_dict_idx) = symbol_dict_idx {
-            // Store pre-computed index so encoding is O(1) per cell
-            self.cells.last_mut().unwrap().symbol_dict_idx = symbol_dict_idx;
-        }
+        // Store pre-computed index so encoding is O(1) per cell
+        self.cells.last_mut().unwrap().symbol_dict_idx = symbol_dict_idx;
         Ok(())
     }
 
@@ -1782,7 +1802,7 @@ impl RowGroupPlanner {
         &mut self,
         entry: &EntryMeta,
         value_bytes: &[u8],
-        row_idx: u16,
+        row_idx: u32,
     ) -> crate::Result<()> {
         let col = ColumnStats::new(entry);
         match col.kind {
@@ -1797,18 +1817,16 @@ impl RowGroupPlanner {
         self.columns.push(col);
         let col_idx = self.columns.len() - 1;
 
-        if self.track_cells {
-            let cell_idx = self.cells.len() as u32;
-            self.cells.push(CellRef {
-                row_idx,
-                symbol_dict_idx: 0,
-                next: CELL_END,
-                value: entry.value,
-            });
-            let col = &mut self.columns[col_idx];
-            col.cell_head = cell_idx;
-            col.cell_tail = cell_idx;
-        }
+        let cell_idx = self.cells.len() as u32;
+        self.cells.push(CellRef {
+            row_idx,
+            symbol_dict_idx: 0,
+            next: CELL_END,
+            value: entry.value,
+        });
+        let col = &mut self.columns[col_idx];
+        col.cell_head = cell_idx;
+        col.cell_tail = cell_idx;
 
         if entry.value.kind() == ColumnKind::Symbol {
             self.add_symbol_value(col_idx, &entry.value, value_bytes)?;
@@ -1984,9 +2002,9 @@ impl<'a> Iterator for CellIter<'a> {
 struct GapFillIter<'a> {
     cells: &'a [CellRef],
     cursor: u32,
-    next_non_null: u16,
-    row: u16,
-    row_count: u16,
+    next_non_null: u32,
+    row: u32,
+    row_count: u32,
 }
 
 impl<'a> GapFillIter<'a> {
@@ -1994,14 +2012,14 @@ impl<'a> GapFillIter<'a> {
         let next_non_null = if head != CELL_END {
             cells[head as usize].row_idx
         } else {
-            u16::MAX
+            u32::MAX
         };
         Self {
             cells,
             cursor: head,
             next_non_null,
             row: 0,
-            row_count: row_count as u16,
+            row_count: row_count as u32,
         }
     }
 }
@@ -2019,7 +2037,7 @@ impl<'a> Iterator for GapFillIter<'a> {
             self.next_non_null = if self.cursor != CELL_END {
                 self.cells[self.cursor as usize].row_idx
             } else {
-                u16::MAX
+                u32::MAX
             };
             Some(cell)
         } else {
@@ -2233,7 +2251,7 @@ mod tests {
     fn qwp_struct_sizes() {
         use std::mem::size_of;
         assert_eq!(size_of::<ValueRef>(), 16);
-        assert_eq!(size_of::<CellRef>(), 24);
+        assert_eq!(size_of::<CellRef>(), 32);
         assert_eq!(size_of::<EntryMeta>(), 24);
         assert_eq!(size_of::<RowMeta>(), 32);
         assert_eq!(size_of::<SymbolEntry>(), 32);
@@ -3642,5 +3660,233 @@ mod tests {
             alloc_count, 0,
             "Expected zero allocations in steady state after prewarm, got {alloc_count}"
         );
+    }
+
+    /// Run with: `cargo test --features sync-sender-qwp-udp -- qwp_zero_alloc_multi_table --ignored --test-threads=1`
+    #[test]
+    #[ignore = "requires single-threaded execution: --test-threads=1"]
+    fn qwp_zero_alloc_multi_table_steady_state_after_prewarm() {
+        use crate::alloc_counter;
+
+        let mut buf = QwpBuffer::new(127);
+        let mut scratch = QwpSendScratch::new(1400);
+
+        let tables = ["trades", "quotes", "orders"];
+        let symbols = ["AAA", "BBB", "CCC"];
+
+        // Warmup cycle 1
+        for (i, table) in tables.iter().enumerate() {
+            buf.table(*table)
+                .unwrap()
+                .symbol("sym", symbols[i])
+                .unwrap()
+                .column_i64("x", i as i64)
+                .unwrap();
+            buf.at_now().unwrap();
+        }
+        buf.flush_to_socket(&mut scratch, 1400, &mut |_| Ok(()))
+            .unwrap();
+        buf.clear();
+
+        // Warmup cycle 2 (ensures planner pool is populated)
+        for (i, table) in tables.iter().enumerate() {
+            buf.table(*table)
+                .unwrap()
+                .symbol("sym", symbols[i])
+                .unwrap()
+                .column_i64("x", i as i64)
+                .unwrap();
+            buf.at_now().unwrap();
+        }
+        buf.flush_to_socket(&mut scratch, 1400, &mut |_| Ok(()))
+            .unwrap();
+        buf.clear();
+
+        alloc_counter::start_counting();
+
+        for _cycle in 0..5 {
+            for (i, table) in tables.iter().enumerate() {
+                buf.table(*table)
+                    .unwrap()
+                    .symbol("sym", symbols[i])
+                    .unwrap()
+                    .column_i64("x", i as i64)
+                    .unwrap();
+                buf.at_now().unwrap();
+            }
+            buf.flush_to_socket(&mut scratch, 1400, &mut |_| Ok(()))
+                .unwrap();
+            buf.clear();
+        }
+
+        let alloc_count = alloc_counter::stop_counting();
+        assert_eq!(
+            alloc_count, 0,
+            "Expected zero allocations in multi-table steady state, got {alloc_count}"
+        );
+    }
+
+    #[test]
+    fn qwp_flush_to_socket_matches_encode_datagrams_single_table() {
+        let mut buf = QwpBuffer::new(127);
+        let mut scratch = QwpSendScratch::new(1400);
+
+        for i in 0..10 {
+            buf.table("trades")
+                .unwrap()
+                .symbol("sym", format!("SYM-{i}"))
+                .unwrap()
+                .column_i64("qty", i)
+                .unwrap()
+                .column_str("venue", format!("venue-{i}"))
+                .unwrap();
+            buf.at_now().unwrap();
+        }
+
+        let reference = buf.encode_datagrams(1400).unwrap();
+
+        let mut socket_datagrams: Vec<Vec<u8>> = Vec::new();
+        buf.flush_to_socket(&mut scratch, 1400, &mut |datagram| {
+            socket_datagrams.push(datagram.to_vec());
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(reference, socket_datagrams);
+    }
+
+    #[test]
+    fn qwp_flush_to_socket_matches_encode_datagrams_multi_table() {
+        let mut buf = QwpBuffer::new(127);
+        let mut scratch = QwpSendScratch::new(1400);
+
+        buf.table("trades")
+            .unwrap()
+            .symbol("sym", "ETH-USD")
+            .unwrap()
+            .column_i64("qty", 4)
+            .unwrap();
+        buf.at_now().unwrap();
+
+        buf.table("quotes")
+            .unwrap()
+            .symbol("sym", "ETH-USD")
+            .unwrap()
+            .column_f64("px", 42.5)
+            .unwrap();
+        buf.at_now().unwrap();
+
+        buf.table("trades")
+            .unwrap()
+            .symbol("sym", "BTC-USD")
+            .unwrap()
+            .column_i64("qty", 9)
+            .unwrap();
+        buf.at_now().unwrap();
+
+        buf.table("orders")
+            .unwrap()
+            .column_str("id", "ord-123")
+            .unwrap()
+            .column_bool("filled", true)
+            .unwrap();
+        buf.at_now().unwrap();
+
+        let reference = buf.encode_datagrams(1400).unwrap();
+
+        let mut socket_datagrams: Vec<Vec<u8>> = Vec::new();
+        buf.flush_to_socket(&mut scratch, 1400, &mut |datagram| {
+            socket_datagrams.push(datagram.to_vec());
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(reference, socket_datagrams);
+    }
+
+    #[test]
+    fn qwp_flush_to_socket_large_segment_falls_back_to_replay() {
+        let mut buf = QwpBuffer::new(127);
+        let mut scratch = QwpSendScratch::new(200);
+
+        // Add enough rows to a single table so the segment exceeds a small
+        // max_datagram_size, forcing the slow path (datagram splitting).
+        for i in 0..50 {
+            buf.table("trades")
+                .unwrap()
+                .symbol("sym", format!("SYM-{i}"))
+                .unwrap()
+                .column_i64("qty", i)
+                .unwrap();
+            buf.at_now().unwrap();
+        }
+
+        let mut socket_datagrams: Vec<Vec<u8>> = Vec::new();
+        buf.flush_to_socket(&mut scratch, 200, &mut |datagram| {
+            socket_datagrams.push(datagram.to_vec());
+            Ok(())
+        })
+        .unwrap();
+
+        // Should have been split into multiple datagrams
+        assert!(
+            socket_datagrams.len() > 1,
+            "expected multiple datagrams, got {}",
+            socket_datagrams.len()
+        );
+
+        // Each datagram should be valid
+        for d in &socket_datagrams {
+            assert_eq!(&d[0..4], b"QWP1");
+            let payload_len = u32::from_le_bytes([d[8], d[9], d[10], d[11]]) as usize;
+            assert_eq!(payload_len, d.len() - QWP_MESSAGE_HEADER_SIZE);
+            assert!(d.len() <= 200, "datagram {} > 200", d.len());
+        }
+
+        // Compare against encode_datagrams (the replay oracle)
+        let reference = buf.encode_datagrams(200).unwrap();
+        assert_eq!(reference, socket_datagrams);
+    }
+
+    #[test]
+    fn qwp_flush_to_socket_mixed_fast_and_slow_paths() {
+        let mut buf = QwpBuffer::new(127);
+        let mut scratch = QwpSendScratch::new(300);
+
+        // First segment: small (fast path)
+        buf.table("meta")
+            .unwrap()
+            .column_i64("ver", 1)
+            .unwrap();
+        buf.at_now().unwrap();
+
+        // Second segment: large enough to need splitting (slow path)
+        for i in 0..40 {
+            buf.table("data")
+                .unwrap()
+                .symbol("key", format!("k-{i}"))
+                .unwrap()
+                .column_i64("val", i)
+                .unwrap();
+            buf.at_now().unwrap();
+        }
+
+        // Third segment: small again (fast path)
+        buf.table("footer")
+            .unwrap()
+            .column_bool("done", true)
+            .unwrap();
+        buf.at_now().unwrap();
+
+        let reference = buf.encode_datagrams(300).unwrap();
+
+        let mut socket_datagrams: Vec<Vec<u8>> = Vec::new();
+        buf.flush_to_socket(&mut scratch, 300, &mut |datagram| {
+            socket_datagrams.push(datagram.to_vec());
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(reference, socket_datagrams);
     }
 }
