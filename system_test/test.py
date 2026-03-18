@@ -1222,6 +1222,546 @@ class TestSender(unittest.TestCase):
             yaml.safe_load(f)
 
 
+class TestQwpUdpSender(unittest.TestCase):
+    def setUp(self):
+        test_name = self.id()
+        QDB_FIXTURE.http_sql_query(
+            f'select * from long_sequence(1) -- >>>>>>>>> BEGIN PYTHON UNIT TEST: {test_name}')
+
+    def tearDown(self):
+        test_name = self.id()
+        QDB_FIXTURE.http_sql_query(
+            f'select * from long_sequence(1) -- <<<<<<<<< END PYTHON UNIT TEST: {test_name}')
+
+    def _mk_qwpudp_sender(self, **kwargs):
+        return qls.Sender(
+            BUILD_MODE,
+            qls.Protocol.QWPUDP,
+            QDB_FIXTURE.host,
+            QDB_FIXTURE.qwp_udp_port,
+            **kwargs)
+
+    @staticmethod
+    def _micros_to_qdb_date(timestamp_us):
+        secs, remaining_us = divmod(timestamp_us, 1_000_000)
+        return datetime.datetime.fromtimestamp(
+            secs, datetime.timezone.utc).replace(
+            microsecond=remaining_us).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+
+    def _require_qwp_udp_system_test(self):
+        # TODO: Remove this repo-only gate once QWP/UDP receiver support is
+        # available in released QuestDB builds.
+        if not getattr(QDB_FIXTURE, 'qwp_udp', False):
+            self.skipTest('QWP/UDP system test requires repo-backed QWP receiver support')
+        if QDB_FIXTURE.http:
+            self.skipTest('QWP/UDP test only runs in the non-HTTP pass')
+        if QDB_FIXTURE.auth:
+            self.skipTest('QWP/UDP auth is not supported')
+        if (
+                BUILD_MODE == qls.BuildMode.CONF and
+                QDB_FIXTURE.protocol_version is not None):
+            self.skipTest('QWP/UDP development system test uses no ILP protocol version override')
+
+    def _test_qwp_udp_example(self, bin_name, table_name, expected_rows):
+        self._require_qwp_udp_system_test()
+        if BUILD_MODE != qls.BuildMode.API:
+            self.skipTest('BuildMode.API-only test')
+
+        proj = Project()
+        ext = '.exe' if sys.platform == 'win32' else ''
+        try:
+            bin_path = next(proj.build_dir.glob(f'**/{bin_name}{ext}'))
+        except StopIteration:
+            raise RuntimeError(f'Could not find {bin_name}{ext} in {proj.build_dir}')
+
+        args = [
+            str(bin_path),
+            '127.0.0.1',
+            str(QDB_FIXTURE.qwp_udp_port),
+            table_name]
+        subprocess.check_call(args, cwd=bin_path.parent)
+
+        resp = retry_check_table(
+            table_name, min_rows=len(expected_rows), timeout_sec=30)
+        self.assertEqual(
+            resp['columns'],
+            [
+                {'name': 'host', 'type': 'SYMBOL'},
+                {'name': 'active', 'type': 'BOOLEAN'},
+                {'name': 'qty', 'type': 'LONG'},
+                {'name': 'temp', 'type': 'DOUBLE'},
+                {'name': 'note', 'type': 'VARCHAR'},
+                {'name': 'timestamp', 'type': 'TIMESTAMP'},
+            ])
+        self.assertEqual(
+            sorted(row[:-1] for row in resp['dataset']),
+            sorted(expected_rows))
+
+    def test_c_example_qwp_udp(self):
+        table_name = 'c_qwp_ex_' + uuid.uuid4().hex[:8]
+        self._test_qwp_udp_example(
+            'line_sender_c_example_qwpudp',
+            table_name,
+            [['srv-api', True, 7, 21.5, 'example-row']])
+
+    def test_cpp_example_qwp_udp(self):
+        table_name = 'cpp_qwp_ex_' + uuid.uuid4().hex[:8]
+        self._test_qwp_udp_example(
+            'line_sender_cpp_example_qwpudp',
+            table_name,
+            [['srv-api', True, 7, 21.5, 'example-row']])
+
+    def test_c_batch_example_qwp_udp(self):
+        table_name = 'c_qwp_bt_' + uuid.uuid4().hex[:8]
+        self._test_qwp_udp_example(
+            'line_sender_c_example_qwpudp_batch',
+            table_name,
+            [
+                ['srv-a', True, 1, 20.5, 'batch-a'],
+                ['srv-b', False, 2, 22.5, 'batch-b'],
+            ])
+
+    def test_cpp_batch_example_qwp_udp(self):
+        table_name = 'cpp_qwp_bt_' + uuid.uuid4().hex[:8]
+        self._test_qwp_udp_example(
+            'line_sender_cpp_example_qwpudp_batch',
+            table_name,
+            [
+                ['srv-a', True, 1, 20.5, 'batch-a'],
+                ['srv-b', False, 2, 22.5, 'batch-b'],
+            ])
+
+    def test_insert_rows_over_qwp_udp(self):
+        self._require_qwp_udp_system_test()
+
+        table_name = 'qwp_udp_' + uuid.uuid4().hex
+        with self._mk_qwpudp_sender() as sender:
+            self.assertEqual(sender.protocol, qls.Protocol.QWPUDP)
+            for i in range(3):
+                (sender
+                 .table(table_name)
+                 .symbol('host', f'srv-{i}')
+                 .column('active', i % 2 == 0)
+                 .column('qty', i + 1)
+                 .column('temp', 20.5 + i)
+                 .column('note', f'row-{i}')
+                 .at_micros(1_700_000_000_000_000 + i))
+            sender.flush()
+
+        resp = retry_check_table(table_name, min_rows=3, timeout_sec=30)
+        exp_columns = [
+            {'name': 'host', 'type': 'SYMBOL'},
+            {'name': 'active', 'type': 'BOOLEAN'},
+            {'name': 'qty', 'type': 'LONG'},
+            {'name': 'temp', 'type': 'DOUBLE'},
+            {'name': 'note', 'type': 'VARCHAR'},
+            {'name': 'timestamp', 'type': 'TIMESTAMP'}]
+        self.assertEqual(resp['columns'], exp_columns)
+
+        scrubbed_dataset = [row[:-1] for row in resp['dataset']]
+        self.assertEqual(
+            scrubbed_dataset,
+            [
+                ['srv-0', True, 1, 20.5, 'row-0'],
+                ['srv-1', False, 2, 21.5, 'row-1'],
+                ['srv-2', True, 3, 22.5, 'row-2'],
+            ])
+
+    def test_insert_rows_over_qwp_udp_with_mixed_at_now(self):
+        self._require_qwp_udp_system_test()
+
+        first_ts_us = 1_700_000_000_000_000
+        third_ts_us = 1_700_000_000_100_000
+        table_name = 'qwp_udp_at_now_' + uuid.uuid4().hex
+        with self._mk_qwpudp_sender() as sender:
+            (sender
+             .table(table_name)
+             .symbol('host', 'exp-a')
+             .column('qty', 1)
+             .at_micros(first_ts_us))
+            (sender
+             .table(table_name)
+             .symbol('host', 'srv-now')
+             .column('qty', 2)
+             .at_now())
+            (sender
+             .table(table_name)
+             .symbol('host', 'exp-b')
+             .column('qty', 3)
+             .at_micros(third_ts_us))
+            sender.flush()
+
+        retry_check_table(table_name, min_rows=3, timeout_sec=30)
+        resp = sql_query(
+            f"select host, qty, timestamp from '{table_name}' order by host")
+        self.assertEqual(
+            resp['columns'],
+            [
+                {'name': 'host', 'type': 'SYMBOL'},
+                {'name': 'qty', 'type': 'LONG'},
+                {'name': 'timestamp', 'type': 'TIMESTAMP'},
+            ])
+
+        rows_by_host = {row[0]: row[1:] for row in resp['dataset']}
+        self.assertEqual(
+            rows_by_host['exp-a'],
+            [1, self._micros_to_qdb_date(first_ts_us)])
+        self.assertEqual(
+            rows_by_host['exp-b'],
+            [3, self._micros_to_qdb_date(third_ts_us)])
+
+        server_row = rows_by_host['srv-now']
+        self.assertEqual(server_row[0], 2)
+        self.assertIsInstance(server_row[1], str)
+        self.assertTrue(server_row[1].endswith('Z'))
+        self.assertNotEqual(server_row[1], self._micros_to_qdb_date(first_ts_us))
+        self.assertNotEqual(server_row[1], self._micros_to_qdb_date(third_ts_us))
+
+    def test_flush_and_keep_resends_rows_over_qwp_udp(self):
+        self._require_qwp_udp_system_test()
+
+        row_ts_us = 1_700_000_000_200_000
+        table_name = 'qwp_udp_keep_' + uuid.uuid4().hex
+        with self._mk_qwpudp_sender() as sender:
+            (sender
+             .table(table_name)
+             .symbol('host', 'dup-host')
+             .column('qty', 7)
+             .at_micros(row_ts_us))
+            sender.flush(sender.buffer, clear=False)
+            sender.flush()
+
+        resp = retry_check_table(table_name, min_rows=2, timeout_sec=30)
+        self.assertEqual(
+            resp['columns'],
+            [
+                {'name': 'host', 'type': 'SYMBOL'},
+                {'name': 'qty', 'type': 'LONG'},
+                {'name': 'timestamp', 'type': 'TIMESTAMP'},
+            ])
+
+        self.assertEqual(
+            resp['dataset'],
+            [
+                ['dup-host', 7, self._micros_to_qdb_date(row_ts_us)],
+                ['dup-host', 7, self._micros_to_qdb_date(row_ts_us)],
+            ])
+
+    def test_small_max_datagram_size_splits_qwp_udp_flush(self):
+        self._require_qwp_udp_system_test()
+
+        table_name = 'q' + uuid.uuid4().hex[:8]
+        with self._mk_qwpudp_sender(max_datagram_size=55) as sender:
+            (sender
+             .table(table_name)
+             .symbol('sym', 'ETH-USD')
+             .column('qty', 1)
+             .at_now())
+            (sender
+             .table(table_name)
+             .symbol('sym', 'BTC-USD')
+             .column('qty', 2)
+             .at_now())
+            sender.flush()
+
+        resp = retry_check_table(table_name, min_rows=2, timeout_sec=30)
+        self.assertEqual(
+            resp['columns'],
+            [
+                {'name': 'sym', 'type': 'SYMBOL'},
+                {'name': 'qty', 'type': 'LONG'},
+                {'name': 'timestamp', 'type': 'TIMESTAMP'},
+            ])
+
+        scrubbed_dataset = sorted(row[:-1] for row in resp['dataset'])
+        self.assertEqual(
+            scrubbed_dataset,
+            [
+                ['BTC-USD', 2],
+                ['ETH-USD', 1],
+            ])
+
+    def test_switching_tables_and_back_preserves_qwp_udp_rows(self):
+        self._require_qwp_udp_system_test()
+
+        trades_table = 'qwp_tr_' + uuid.uuid4().hex[:8]
+        quotes_table = 'qwp_qt_' + uuid.uuid4().hex[:8]
+        with self._mk_qwpudp_sender() as sender:
+            (sender
+             .table(trades_table)
+             .symbol('sym', 'ETH-USD')
+             .column('qty', 1)
+             .at_now())
+            (sender
+             .table(quotes_table)
+             .symbol('sym', 'BTC-USD')
+             .column('qty', 2)
+             .at_now())
+            (sender
+             .table(trades_table)
+             .symbol('sym', 'SOL-USD')
+             .column('qty', 3)
+             .at_now())
+            sender.flush()
+
+        trades_resp = retry_check_table(trades_table, min_rows=2, timeout_sec=30)
+        quotes_resp = retry_check_table(quotes_table, min_rows=1, timeout_sec=30)
+        self.assertEqual(
+            sorted(row[:-1] for row in trades_resp['dataset']),
+            [
+                ['ETH-USD', 1],
+                ['SOL-USD', 3],
+            ])
+        self.assertEqual(
+            [row[:-1] for row in quotes_resp['dataset']],
+            [['BTC-USD', 2]])
+
+    def test_schema_expansion_backfills_qwp_udp_rows(self):
+        self._require_qwp_udp_system_test()
+
+        table_name = 'qwp_schema_' + uuid.uuid4().hex[:8]
+        with self._mk_qwpudp_sender() as sender:
+            (sender
+             .table(table_name)
+             .symbol('host', 'r1')
+             .at_now())
+            (sender
+             .table(table_name)
+             .symbol('host', 'r2')
+             .column('qty', 2)
+             .column('note', 'two')
+             .at_now())
+            (sender
+             .table(table_name)
+             .symbol('host', 'r3')
+             .column('note', 'three')
+             .at_now())
+            sender.flush()
+
+        resp = retry_check_table(table_name, min_rows=3, timeout_sec=30)
+        self.assertEqual(
+            resp['columns'],
+            [
+                {'name': 'host', 'type': 'SYMBOL'},
+                {'name': 'qty', 'type': 'LONG'},
+                {'name': 'note', 'type': 'VARCHAR'},
+                {'name': 'timestamp', 'type': 'TIMESTAMP'},
+            ])
+        self.assertEqual(
+            sorted(row[:-1] for row in resp['dataset']),
+            [
+                ['r1', None, None],
+                ['r2', 2, 'two'],
+                ['r3', None, 'three'],
+            ])
+
+    def test_sparse_boolean_columns_fill_false_for_qwp_udp(self):
+        self._require_qwp_udp_system_test()
+
+        table_name = 'qwp_bool_' + uuid.uuid4().hex[:8]
+        with self._mk_qwpudp_sender() as sender:
+            (sender
+             .table(table_name)
+             .symbol('host', 'r1')
+             .at_now())
+            (sender
+             .table(table_name)
+             .symbol('host', 'r2')
+             .column('active', True)
+             .at_now())
+            (sender
+             .table(table_name)
+             .symbol('host', 'r3')
+             .column('active', False)
+             .at_now())
+            sender.flush()
+
+        resp = retry_check_table(table_name, min_rows=3, timeout_sec=30)
+        self.assertEqual(
+            resp['columns'],
+            [
+                {'name': 'host', 'type': 'SYMBOL'},
+                {'name': 'active', 'type': 'BOOLEAN'},
+                {'name': 'timestamp', 'type': 'TIMESTAMP'},
+            ])
+        self.assertEqual(
+            sorted(row[:-1] for row in resp['dataset']),
+            [
+                ['r1', False],
+                ['r2', True],
+                ['r3', False],
+            ])
+
+    def test_sparse_long_and_double_columns_fill_null_for_qwp_udp(self):
+        self._require_qwp_udp_system_test()
+
+        table_name = 'qwp_num_' + uuid.uuid4().hex[:8]
+        with self._mk_qwpudp_sender() as sender:
+            (sender
+             .table(table_name)
+             .symbol('host', 'r1')
+             .at_now())
+            (sender
+             .table(table_name)
+             .symbol('host', 'r2')
+             .column('qty', 2)
+             .at_now())
+            (sender
+             .table(table_name)
+             .symbol('host', 'r3')
+             .column('temp', 33.5)
+             .at_now())
+            (sender
+             .table(table_name)
+             .symbol('host', 'r4')
+             .column('qty', 4)
+             .column('temp', 44.5)
+             .at_now())
+            sender.flush()
+
+        resp = retry_check_table(table_name, min_rows=4, timeout_sec=30)
+        self.assertEqual(
+            resp['columns'],
+            [
+                {'name': 'host', 'type': 'SYMBOL'},
+                {'name': 'qty', 'type': 'LONG'},
+                {'name': 'temp', 'type': 'DOUBLE'},
+                {'name': 'timestamp', 'type': 'TIMESTAMP'},
+            ])
+        self.assertEqual(
+            sorted(row[:-1] for row in resp['dataset']),
+            [
+                ['r1', None, None],
+                ['r2', 2, None],
+                ['r3', None, 33.5],
+                ['r4', 4, 44.5],
+            ])
+
+    def test_sparse_timestamp_columns_fill_null_for_qwp_udp(self):
+        self._require_qwp_udp_system_test()
+
+        table_name = 'qwp_sts_' + uuid.uuid4().hex[:8]
+        event_ts_us = 123_456
+        with self._mk_qwpudp_sender() as sender:
+            (sender
+             .table(table_name)
+             .symbol('host', 'r1')
+             .at_now())
+            (sender
+             .table(table_name)
+             .symbol('host', 'r2')
+             .column('event_ts', qls.TimestampMicros(event_ts_us))
+             .at_now())
+            (sender
+             .table(table_name)
+             .symbol('host', 'r3')
+             .at_now())
+            sender.flush()
+
+        resp = retry_check_table(table_name, min_rows=3, timeout_sec=30)
+        self.assertEqual(
+            resp['columns'],
+            [
+                {'name': 'host', 'type': 'SYMBOL'},
+                {'name': 'event_ts', 'type': 'TIMESTAMP'},
+                {'name': 'timestamp', 'type': 'TIMESTAMP'},
+            ])
+        self.assertEqual(
+            sorted(row[:-1] for row in resp['dataset']),
+            [
+                ['r1', None],
+                ['r2', self._micros_to_qdb_date(event_ts_us)],
+                ['r3', None],
+            ])
+
+    def test_transactional_flush_flag_is_rejected_for_qwp_udp(self):
+        self._require_qwp_udp_system_test()
+
+        table_name = 'qwp_txn_' + uuid.uuid4().hex[:8]
+        with self.assertRaisesRegex(qls.SenderError, r'Transactional flushes are not supported for QWP/UDP'):
+            with self._mk_qwpudp_sender() as sender:
+                (sender
+                 .table(table_name)
+                 .symbol('host', 'txn-host')
+                 .column('qty', 1)
+                 .at_now())
+                sender.flush(transactional=True)
+
+    def test_markers_rewind_qwp_udp_rows_before_flush(self):
+        self._require_qwp_udp_system_test()
+
+        table_name = 'qwp_mk_' + uuid.uuid4().hex[:8]
+        with self._mk_qwpudp_sender() as sender:
+            (sender
+             .table(table_name)
+             .symbol('host', 'keep-a')
+             .column('qty', 1)
+             .at_now())
+            sender.buffer.set_marker()
+            (sender
+             .table(table_name)
+             .symbol('host', 'drop-me')
+             .column('qty', 2))
+            sender.buffer.rewind_to_marker()
+            (sender
+             .table(table_name)
+             .symbol('host', 'keep-b')
+             .column('qty', 3)
+             .at_now())
+            sender.flush()
+
+        resp = retry_check_table(table_name, min_rows=2, timeout_sec=30)
+        self.assertEqual(
+            resp['columns'],
+            [
+                {'name': 'host', 'type': 'SYMBOL'},
+                {'name': 'qty', 'type': 'LONG'},
+                {'name': 'timestamp', 'type': 'TIMESTAMP'},
+            ])
+        self.assertEqual(
+            sorted(row[:-1] for row in resp['dataset']),
+            [
+                ['keep-a', 1],
+                ['keep-b', 3],
+            ])
+
+    def test_mixed_designated_timestamp_precisions_are_rejected_for_qwp_udp(self):
+        self._require_qwp_udp_system_test()
+
+        table_name = 'qwp_dts_' + uuid.uuid4().hex[:8]
+        with self.assertRaisesRegex(qls.SenderError, r'QWP/UDP column "" changes type within a batched table'):
+            with self._mk_qwpudp_sender() as sender:
+                (sender
+                 .table(table_name)
+                 .symbol('host', 'micros-row')
+                 .column('qty', 1)
+                 .at_micros(123_456))
+                (sender
+                 .table(table_name)
+                 .symbol('host', 'nanos-row')
+                 .column('qty', 2)
+                 .at(789_000))
+                sender.flush()
+
+    def test_mixed_timestamp_column_precisions_are_rejected_for_qwp_udp(self):
+        self._require_qwp_udp_system_test()
+
+        table_name = 'qwp_cts_' + uuid.uuid4().hex[:8]
+        with self.assertRaisesRegex(qls.SenderError, r'QWP/UDP column "event_ts" changes type within a batched table'):
+            with self._mk_qwpudp_sender() as sender:
+                (sender
+                 .table(table_name)
+                 .symbol('host', 'micros-row')
+                 .column('event_ts', qls.TimestampMicros(123_456))
+                 .at_now())
+                (sender
+                 .table(table_name)
+                 .symbol('host', 'nanos-row')
+                 .column('event_ts', qls.TimestampNanos(789_000))
+                 .at_now())
+                sender.flush()
+
+
 def parse_args():
     parser = argparse.ArgumentParser('Run system tests.')
     sub_p = parser.add_subparsers(dest='command')
@@ -1327,7 +1867,8 @@ def run_with_fixtures(args):
     for questdb_dir, auth in itertools.product(iter_versions(args), (False, True)):
         QDB_FIXTURE = QuestDbFixture(
             questdb_dir,
-            auth=auth)
+            auth=auth,
+            qwp_udp=bool(getattr(args, 'repo', None)))
         TLS_PROXY_FIXTURE = None
         try:
             sys.stderr.write(f'>>>> STARTING {questdb_dir} [auth={auth}] <<<<\n')

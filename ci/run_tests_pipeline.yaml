@@ -7,6 +7,7 @@ variables:
   Darwin-ARM: armosx
   Linux-ARM: armlinux
   Linux-X64: linux
+  QUESTDB_SERVER_BRANCH: jh_experiment_new_ilp
 
 stages:
   - stage: BuildAndTest
@@ -114,8 +115,8 @@ stages:
               cd tls_proxy
               cargo clippy --all-targets --all-features -- -D warnings
             displayName: "tls_proxy: clippy"
-      - job: TestVsQuestDBMaster
-        displayName: "Vs QuestDB 'master'"
+      - job: TestVsQuestDBBranch
+        displayName: "Vs QuestDB '$(QUESTDB_SERVER_BRANCH)'"
         pool:
           vmImage: "ubuntu-latest"
         timeoutInMinutes: 60
@@ -126,14 +127,16 @@ stages:
             submodules: false
           - template: compile.yaml
           - script: |
-              git clone --depth 1 https://github.com/questdb/questdb.git
+              git clone --depth 1 --branch $(QUESTDB_SERVER_BRANCH) https://github.com/questdb/questdb.git
+              cd questdb
+              git submodule update --init --depth 1 java-questdb-client
             displayName: git clone questdb
           - task: Maven@3
             displayName: "Compile QuestDB"
             inputs:
               mavenPOMFile: "questdb/pom.xml"
               jdkVersionOption: "1.17"
-              options: "-DskipTests -Pbuild-web-console"
+              options: "-DskipTests -Pbuild-web-console,local-client"
           - script: |
               python3 system_test/test.py run --repo ./questdb -v
             displayName: "integration test"

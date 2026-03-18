@@ -102,6 +102,15 @@ def discover_avail_ports(num_required):
     return free_ports
 
 
+def discover_avail_udp_port():
+    """Discover an available UDP port."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(('', 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return port
+
+
 class Project:
     def __init__(self):
         self.system_test_dir = pathlib.Path(__file__).absolute().parent
@@ -336,7 +345,17 @@ class QuestDbFixtureBase:
 
 
 class QuestDbExternalFixture(QuestDbFixtureBase):
-    def __init__(self, host, line_tcp_port, http_server_port, version, http, auth, protocol_version):
+    def __init__(
+            self,
+            host,
+            line_tcp_port,
+            http_server_port,
+            version,
+            http,
+            auth,
+            protocol_version,
+            qwp_udp=False,
+            qwp_udp_port=None):
         self.host = host
         self.line_tcp_port = line_tcp_port
         self.http_server_port = http_server_port
@@ -344,10 +363,19 @@ class QuestDbExternalFixture(QuestDbFixtureBase):
         self.http = http
         self.auth = auth
         self.protocol_version = protocol_version
+        self.qwp_udp = qwp_udp
+        self.qwp_udp_port = qwp_udp_port
 
 
 class QuestDbFixture(QuestDbFixtureBase):
-    def __init__(self, root_dir: pathlib.Path, auth=False, wrap_tls=False, http=False, protocol_version=None):
+    def __init__(
+            self,
+            root_dir: pathlib.Path,
+            auth=False,
+            wrap_tls=False,
+            http=False,
+            protocol_version=None,
+            qwp_udp=False):
         self._root_dir = root_dir
         self.version = _parse_version(self._root_dir.name)
         self._data_dir = self._root_dir / 'data'
@@ -360,6 +388,7 @@ class QuestDbFixture(QuestDbFixtureBase):
         self.host = '127.0.0.1'
         self.http_server_port = None
         self.line_tcp_port = None
+        self.qwp_udp_port = None
         self.pg_port = None
 
         self.wrap_tls = wrap_tls
@@ -373,6 +402,7 @@ class QuestDbFixture(QuestDbFixtureBase):
                 auth_file.write(AUTH_TXT)
         self.http = http
         self.protocol_version = protocol_version
+        self.qwp_udp = qwp_udp
 
     def print_log(self):
         with open(self._log_path, 'r', encoding='utf-8') as log_file:
@@ -383,8 +413,15 @@ class QuestDbFixture(QuestDbFixtureBase):
     def start(self):
         ports = discover_avail_ports(3)
         self.http_server_port, self.line_tcp_port, self.pg_port = ports
+        self.qwp_udp_port = discover_avail_udp_port() if self.qwp_udp else None
         auth_config = 'line.tcp.auth.db.path=conf/auth.txt' if self.auth else ''
         ilp_over_http_config = 'line.http.enabled=true' if self.http else ''
+        qwp_udp_enabled = 'true' if self.qwp_udp else 'false'
+        qwp_udp_bind = (
+            f'qwp.udp.bind.to=0.0.0.0:{self.qwp_udp_port}'
+            if self.qwp_udp else '')
+        qwp_udp_unicast = 'qwp.udp.unicast=true' if self.qwp_udp else ''
+        qwp_udp_commit_rate = 'qwp.udp.commit.rate=1' if self.qwp_udp else ''
         with open(self._conf_path, 'w', encoding='utf-8') as conf_file:
             conf_file.write(textwrap.dedent(rf'''
                 http.bind.to=0.0.0.0:{self.http_server_port}
@@ -392,6 +429,10 @@ class QuestDbFixture(QuestDbFixtureBase):
                 pg.net.bind.to=0.0.0.0:{self.pg_port}
                 http.min.enabled=false
                 line.udp.enabled=false
+                qwp.udp.enabled={qwp_udp_enabled}
+                {qwp_udp_bind}
+                {qwp_udp_unicast}
+                {qwp_udp_commit_rate}
                 line.tcp.maintenance.job.interval=100
                 line.tcp.min.idle.ms.before.writer.release=300
                 telemetry.enabled=false
@@ -414,7 +455,7 @@ class QuestDbFixture(QuestDbFixtureBase):
             '-m', 'io.questdb/io.questdb.ServerMain',
             '-d', str(self._data_dir)]
         sys.stderr.write(
-            f'Starting QuestDB: {launch_args!r} (auth: {self.auth}, http: {self.http})\n')
+            f'Starting QuestDB: {launch_args!r} (auth: {self.auth}, http: {self.http}, qwp_udp: {self.qwp_udp})\n')
         self._log = open(self._log_path, 'ab')
         try:
             self._proc = subprocess.Popen(

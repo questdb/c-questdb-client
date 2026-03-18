@@ -102,6 +102,9 @@ typedef enum line_sender_protocol
 
     /** InfluxDB Line Protocol over HTTP with TLS. */
     line_sender_protocol_https,
+
+    /** QuestWire Protocol over UDP. */
+    line_sender_protocol_qwpudp,
 } line_sender_protocol;
 
 /** The line protocol version used to write data to buffer. */
@@ -318,24 +321,42 @@ line_sender_column_name line_sender_column_name_assert(
 typedef struct line_sender_buffer line_sender_buffer;
 
 /**
- * Construct a `line_sender_buffer` with explicitly set `protocol_version` and
- * fixed 127-byte name length limit.
- * Prefer `line_sender_buffer_new_for_sender` which uses the sender's
- * configured protocol settings.
+ * Construct an ILP `line_sender_buffer` with explicitly set
+ * `protocol_version` and fixed 127-byte name length limit.
+ *
+ * This constructor is ILP-only. It does not create QWP/UDP buffers.
+ * For protocol-neutral construction, especially when using QWP/UDP, prefer
+ * `line_sender_buffer_new_for_sender(...)`.
  */
 LINESENDER_API
 line_sender_buffer* line_sender_buffer_new(
     line_sender_protocol_version version);
 
 /**
- * Construct a `line_sender_buffer` with explicitly set `protocol_version` and
- * a max name length limit.
- * Prefer `line_sender_buffer_new_for_sender` which uses the sender's
- * configured protocol and max name length limit settings.
+ * Construct an ILP `line_sender_buffer` with explicitly set
+ * `protocol_version` and a max name length limit.
+ *
+ * This constructor is ILP-only. It does not create QWP/UDP buffers.
+ * For protocol-neutral construction, especially when using QWP/UDP, prefer
+ * `line_sender_buffer_new_for_sender(...)`.
  */
 LINESENDER_API
 line_sender_buffer* line_sender_buffer_with_max_name_len(
     line_sender_protocol_version version, size_t max_name_len);
+
+/**
+ * Construct a QWP/UDP `line_sender_buffer` with fixed 127-byte name length
+ * limit.
+ */
+LINESENDER_API
+line_sender_buffer* line_sender_buffer_new_qwp(void);
+
+/**
+ * Construct a QWP/UDP `line_sender_buffer` with a max name length limit.
+ */
+LINESENDER_API
+line_sender_buffer* line_sender_buffer_new_qwp_with_max_name_len(
+    size_t max_name_len);
 
 /** Release the `line_sender_buffer` object. */
 LINESENDER_API
@@ -349,12 +370,21 @@ line_sender_buffer* line_sender_buffer_clone(const line_sender_buffer* buffer);
  * Pre-allocate to ensure the buffer has enough capacity for at least the
  * specified additional byte count. This may be rounded up.
  * This does not allocate if such additional capacity is already satisfied.
+ *
+ * For ILP buffers this is expressed in bytes. For QWP buffers this is only a
+ * best-effort hint and may be ignored.
  * See: `capacity`.
  */
 LINESENDER_API
 void line_sender_buffer_reserve(line_sender_buffer* buffer, size_t additional);
 
-/** Get the current capacity of the buffer. */
+/**
+ * Get the current buffer capacity.
+ *
+ * For ILP buffers this is byte capacity. For QWP buffers this is an
+ * implementation-defined capacity hint and should not be interpreted as byte
+ * capacity.
+ */
 LINESENDER_API
 size_t line_sender_buffer_capacity(const line_sender_buffer* buffer);
 
@@ -388,7 +418,12 @@ void line_sender_buffer_clear_marker(line_sender_buffer* buffer);
 LINESENDER_API
 void line_sender_buffer_clear(line_sender_buffer* buffer);
 
-/** The number of bytes accumulated in the buffer. */
+/**
+ * The current encoded size of the buffered data.
+ *
+ * For ILP buffers this is the exact pending byte length. For QWP buffers this
+ * is a buffered size hint, not the exact size of any eventual UDP datagram.
+ */
 LINESENDER_API
 size_t line_sender_buffer_size(const line_sender_buffer* buffer);
 
@@ -407,9 +442,13 @@ bool line_sender_buffer_transactional(const line_sender_buffer* buffer);
 /**
  * Get a read-only view into the buffer's bytes contents.
  *
+ * This is only meaningful for ILP buffers, where rows are accumulated in
+ * serialized form. For QWP buffers the return value is currently empty because
+ * rows are encoded into UDP datagrams only during `flush`.
+ *
  * @param[in] buffer Line sender buffer object.
  * @return read_only view with the byte representation of the line
- *         sender buffer's contents.
+ *         sender buffer's contents for ILP, or an empty view for QWP.
  */
 LINESENDER_API
 line_sender_buffer_view line_sender_buffer_peek(
@@ -801,7 +840,7 @@ line_sender_opts* line_sender_opts_from_env(line_sender_error** err_out);
  *
  * @param[in] protocol The protocol to use.
  * @param[in] host The QuestDB database host.
- * @param[in] port The QuestDB ILP TCP port.
+ * @param[in] port The QuestDB port for the selected protocol.
  */
 LINESENDER_API
 line_sender_opts* line_sender_opts_new(
@@ -828,6 +867,38 @@ LINESENDER_API
 bool line_sender_opts_bind_interface(
     line_sender_opts* opts,
     line_sender_utf8 bind_interface,
+    line_sender_error** err_out);
+
+/**
+ * Set the maximum QWP/UDP datagram size in bytes.
+ *
+ * `max_datagram_size` must be a positive, non-zero value.
+ * Passing 0 is treated as an error.
+ *
+ * This setting is only supported for `line_sender_protocol_qwpudp`.
+ * Returns `false` and sets `err_out` on constraint violation or
+ * protocol mismatch.
+ */
+LINESENDER_API
+bool line_sender_opts_max_datagram_size(
+    line_sender_opts* opts,
+    size_t max_datagram_size,
+    line_sender_error** err_out);
+
+/**
+ * Set the multicast TTL used for QWP/UDP sends.
+ *
+ * `multicast_ttl` must be in the 0–255 range (inclusive).
+ * Values greater than 255 are treated as an error.
+ *
+ * This setting is only supported for `line_sender_protocol_qwpudp`.
+ * Returns `false` and sets `err_out` on constraint violation or
+ * protocol mismatch.
+ */
+LINESENDER_API
+bool line_sender_opts_multicast_ttl(
+    line_sender_opts* opts,
+    uint32_t multicast_ttl,
     line_sender_error** err_out);
 
 /**
@@ -947,8 +1018,12 @@ bool line_sender_opts_tls_roots(
     line_sender_opts* opts, line_sender_utf8 path, line_sender_error** err_out);
 
 /**
- * Set the maximum buffer size in bytes that the client will flush to the
- * server. The default is 100 MiB.
+ * Set the maximum buffered size that the client will flush to the server.
+ * The default is 100 MiB.
+ *
+ * For ILP this applies to the exact pending byte length.
+ * For QWP/UDP this applies to the buffer size hint returned by
+ * `line_sender_buffer_size()`.
  */
 LINESENDER_API
 bool line_sender_opts_max_buf_size(
@@ -1074,7 +1149,19 @@ LINESENDER_API
 line_sender* line_sender_from_env(line_sender_error** err_out);
 
 /**
- * Return the sender's protocol version.
+ * Return the sender's configured transport protocol.
+ */
+LINESENDER_API
+line_sender_protocol line_sender_get_protocol(const line_sender* sender);
+
+/**
+ * Return the sender's ILP protocol version.
+ *
+ * This is meaningful for ILP senders. For protocol-neutral inspection, use
+ * `line_sender_get_protocol(...)`.
+ * Do not use this value to construct QWP/UDP buffers; use
+ * `line_sender_buffer_new_for_sender(...)` instead.
+ *
  * This is either the protocol version that was set explicitly,
  * or the one that was auto-detected during the connection process(Only for
  * HTTP). If connecting via TCP and not overridden, the value is
@@ -1091,20 +1178,21 @@ LINESENDER_API
 size_t line_sender_get_max_name_len(const line_sender* sender);
 
 /**
- * Construct a `line_sender_buffer` with the sender's
- * configured `protocol_version` and `max_name_len` settings.
- * This is equivalent to calling:
- *   line_sender_buffer_new(
- *       line_sender_get_protocol_version(sender),
- *       line_sender_get_max_name_len(sender))
+ * Construct a `line_sender_buffer` with the sender's configured settings.
+ *
+ * This is the preferred protocol-neutral constructor. It may produce a
+ * different buffer implementation than `line_sender_buffer_new(...)`, for
+ * example when the sender uses QWP-over-UDP.
  */
+LINESENDER_API
 line_sender_buffer* line_sender_buffer_new_for_sender(
     const line_sender* sender);
 
 /**
  * Tell whether the sender is no longer usable and must be closed.
  * This happens when there was an earlier failure.
- * This fuction is specific to TCP and is not relevant for HTTP.
+ * This fuction is specific to ILP-over-TCP and is not relevant for
+ * ILP-over-HTTP or QWP-over-UDP.
  * @param[in] sender Line sender object.
  * @return true if an error occurred with a sender and it must be closed.
  */
@@ -1135,6 +1223,9 @@ void line_sender_close(line_sender* sender);
  * to the underlying OS-level network socket, without waiting to actually
  * send it to the server. In the case of an error, the server will quietly
  * disconnect: consult the server logs for error messages.
+ *
+ * With QWP-over-UDP, the function sends one or more UDP datagrams and returns
+ * local socket errors only. A successful return does not guarantee delivery.
  *
  * HTTP should be the first choice, but use TCP if you need to continuously
  * send data to the server at a high rate.

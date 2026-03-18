@@ -94,6 +94,23 @@ impl Default for HttpConfig {
     }
 }
 
+#[cfg(feature = "_sender-qwp-udp")]
+#[derive(Debug, Clone)]
+pub(crate) struct QwpUdpConfig {
+    pub(crate) max_datagram_size: ConfigSetting<usize>,
+    pub(crate) multicast_ttl: ConfigSetting<u32>,
+}
+
+#[cfg(feature = "_sender-qwp-udp")]
+impl Default for QwpUdpConfig {
+    fn default() -> Self {
+        Self {
+            max_datagram_size: ConfigSetting::new_default(1400),
+            multicast_ttl: ConfigSetting::new_default(0),
+        }
+    }
+}
+
 #[cfg(feature = "_sender-http")]
 #[derive(PartialEq, Debug, Clone)]
 pub(crate) struct BasicAuthParams {

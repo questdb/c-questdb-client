@@ -275,6 +275,9 @@ pub enum line_sender_protocol {
 
     /// InfluxDB Line Protocol over HTTP with TLS.
     line_sender_protocol_https,
+
+    /// QuestWire Protocol over UDP.
+    line_sender_protocol_qwpudp,
 }
 
 impl From<Protocol> for line_sender_protocol {
@@ -284,6 +287,7 @@ impl From<Protocol> for line_sender_protocol {
             Protocol::Tcps => line_sender_protocol::line_sender_protocol_tcps,
             Protocol::Http => line_sender_protocol::line_sender_protocol_http,
             Protocol::Https => line_sender_protocol::line_sender_protocol_https,
+            Protocol::QwpUdp => line_sender_protocol::line_sender_protocol_qwpudp,
         }
     }
 }
@@ -295,6 +299,7 @@ impl From<line_sender_protocol> for Protocol {
             line_sender_protocol::line_sender_protocol_tcps => Protocol::Tcps,
             line_sender_protocol::line_sender_protocol_http => Protocol::Http,
             line_sender_protocol::line_sender_protocol_https => Protocol::Https,
+            line_sender_protocol::line_sender_protocol_qwpudp => Protocol::QwpUdp,
         }
     }
 }
@@ -701,8 +706,11 @@ pub unsafe extern "C" fn line_sender_column_name_assert(
 /// variants. A buffer object can be reused after flushing and clearing.
 pub struct line_sender_buffer(Buffer);
 
-/// Construct a `line_sender_buffer` with a `max_name_len` of `127`, which is the
-/// same as the QuestDB server default.
+/// Construct an ILP `line_sender_buffer` with a `max_name_len` of `127`, which
+/// is the same as the QuestDB server default.
+///
+/// This constructor is ILP-only. It does not create QWP/UDP buffers.
+/// For protocol-neutral construction, prefer `line_sender_buffer_new_for_sender`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_new(
     version: ProtocolVersion,
@@ -711,9 +719,13 @@ pub unsafe extern "C" fn line_sender_buffer_new(
     Box::into_raw(Box::new(line_sender_buffer(buffer)))
 }
 
-/// Construct a `line_sender_buffer` with a custom maximum length for table and
-/// column names. This should match the `cairo.max.file.name.length` setting of
-/// the QuestDB  server you're connecting to.
+/// Construct an ILP `line_sender_buffer` with a custom maximum length for table
+/// and column names. This should match the `cairo.max.file.name.length`
+/// setting of the QuestDB server you're connecting to.
+///
+/// This constructor is ILP-only. It does not create QWP/UDP buffers.
+/// For protocol-neutral construction, prefer `line_sender_buffer_new_for_sender`.
+///
 /// If the server does not configure it, the default is `127`, and you can
 /// call `line_sender_buffer_new()` instead.
 #[unsafe(no_mangle)]
@@ -722,6 +734,28 @@ pub unsafe extern "C" fn line_sender_buffer_with_max_name_len(
     max_name_len: size_t,
 ) -> *mut line_sender_buffer {
     let buffer = Buffer::with_max_name_len(version.into(), max_name_len);
+    Box::into_raw(Box::new(line_sender_buffer(buffer)))
+}
+
+/// Construct a QWP/UDP `line_sender_buffer` with a `max_name_len` of `127`,
+/// which is the same as the QuestDB server default.
+///
+/// This constructor is only available when QWP/UDP support is enabled.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_buffer_new_qwp() -> *mut line_sender_buffer {
+    let buffer = Buffer::new_qwp();
+    Box::into_raw(Box::new(line_sender_buffer(buffer)))
+}
+
+/// Construct a QWP/UDP `line_sender_buffer` with a custom maximum length for
+/// table and column names.
+///
+/// This constructor is only available when QWP/UDP support is enabled.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_buffer_new_qwp_with_max_name_len(
+    max_name_len: size_t,
+) -> *mut line_sender_buffer {
+    let buffer = Buffer::qwp_with_max_name_len(max_name_len);
     Box::into_raw(Box::new(line_sender_buffer(buffer)))
 }
 
@@ -757,6 +791,10 @@ pub unsafe extern "C" fn line_sender_buffer_clone(
 /// Pre-allocate to ensure the buffer has enough capacity for at least the
 /// specified additional byte count. This may be rounded up.
 /// This does not allocate if such additional capacity is already satisfied.
+///
+/// For ILP buffers this is expressed in bytes. For QWP buffers this is only a
+/// best-effort hint and may be ignored.
+///
 /// See: `capacity`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_reserve(
@@ -769,7 +807,11 @@ pub unsafe extern "C" fn line_sender_buffer_reserve(
     }
 }
 
-/// Get the current capacity of the buffer.
+/// Get the current buffer capacity.
+///
+/// For ILP buffers this is the number of bytes available before reallocation.
+/// For QWP buffers this is an implementation-defined capacity hint and should
+/// not be interpreted as byte capacity.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_capacity(buffer: *const line_sender_buffer) -> size_t {
     unsafe { unwrap_buffer(buffer).capacity() }
@@ -825,7 +867,10 @@ pub unsafe extern "C" fn line_sender_buffer_clear(buffer: *mut line_sender_buffe
     }
 }
 
-/// The number of bytes accumulated in the buffer.
+/// The current encoded size of the buffered data.
+///
+/// For ILP buffers this is the exact pending byte length. For QWP buffers this
+/// is a buffered size hint, not the exact size of any eventual UDP datagram.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_size(buffer: *const line_sender_buffer) -> size_t {
     unsafe {
@@ -865,10 +910,14 @@ pub struct line_sender_buffer_view {
 
 /// Provides a read-only view into the buffer's bytes content.
 ///
+/// This is only meaningful for ILP buffers, where rows are accumulated in
+/// serialized form. For QWP buffers the return value is currently empty because
+/// rows are encoded into UDP datagrams only during flush.
+///
 /// @param[in] buffer Line buffer object.
 /// @return A [`line_sender_buffer_view`] struct containing:
 /// - `buf`: Immutable pointer to the byte stream
-/// - `len`: Exact byte length of the data
+/// - `len`: Exact byte length of the data for ILP, or zero for QWP
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_peek(
     buffer: *const line_sender_buffer,
@@ -1436,9 +1485,10 @@ pub unsafe extern "C" fn line_sender_opts_new(
     port: u16,
 ) -> *mut line_sender_opts {
     let builder = SenderBuilder::new(protocol.into(), host.as_str(), port);
-    let builder = builder
-        .user_agent(concat!("questdb/c/", env!("CARGO_PKG_VERSION")))
-        .expect("user_agent set");
+    let builder = match builder.user_agent(concat!("questdb/c/", env!("CARGO_PKG_VERSION"))) {
+        Ok(builder) => builder,
+        Err(_) => return ptr::null_mut(),
+    };
     Box::into_raw(Box::new(line_sender_opts(builder)))
 }
 
@@ -1451,9 +1501,10 @@ pub unsafe extern "C" fn line_sender_opts_new_service(
     port: line_sender_utf8,
 ) -> *mut line_sender_opts {
     let builder = SenderBuilder::new(protocol.into(), host.as_str(), port.as_str());
-    let builder = builder
-        .user_agent(concat!("questdb/c/", env!("CARGO_PKG_VERSION")))
-        .expect("user_agent set");
+    let builder = match builder.user_agent(concat!("questdb/c/", env!("CARGO_PKG_VERSION"))) {
+        Ok(builder) => builder,
+        Err(_) => return ptr::null_mut(),
+    };
     Box::into_raw(Box::new(line_sender_opts(builder)))
 }
 
@@ -1469,6 +1520,26 @@ pub unsafe extern "C" fn line_sender_opts_bind_interface(
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     unsafe { upd_opts!(opts, err_out, bind_interface, bind_interface.as_str()) }
+}
+
+/// Set the maximum QWP/UDP datagram size in bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_opts_max_datagram_size(
+    opts: *mut line_sender_opts,
+    max_datagram_size: size_t,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe { upd_opts!(opts, err_out, max_datagram_size, max_datagram_size) }
+}
+
+/// Set the multicast TTL used for QWP/UDP sends.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_opts_multicast_ttl(
+    opts: *mut line_sender_opts,
+    multicast_ttl: u32,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe { upd_opts!(opts, err_out, multicast_ttl, multicast_ttl) }
 }
 
 /// Set the username for authentication.
@@ -1606,8 +1677,12 @@ pub unsafe extern "C" fn line_sender_opts_tls_roots(
     }
 }
 
-/// Set the maximum buffer size in bytes that the client will flush to the server.
+/// Set the maximum buffered size that the client will flush to the server.
 /// The default is 100 MiB.
+///
+/// For ILP this applies to the exact pending byte length.
+/// For QWP/UDP this applies to the buffer size hint returned by
+/// `line_sender_buffer_size()`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_opts_max_buf_size(
     opts: *mut line_sender_opts,
@@ -1767,9 +1842,11 @@ pub unsafe extern "C" fn line_sender_from_conf(
     unsafe {
         let config = config.as_str();
         let builder = bubble_err_to_c!(err_out, SenderBuilder::from_conf(config), ptr::null_mut());
-        let builder = builder
-            .user_agent(concat!("questdb/c/", env!("CARGO_PKG_VERSION")))
-            .expect("user_agent set");
+        let builder = bubble_err_to_c!(
+            err_out,
+            builder.user_agent(concat!("questdb/c/", env!("CARGO_PKG_VERSION"))),
+            ptr::null_mut()
+        );
         let sender = bubble_err_to_c!(err_out, builder.build(), ptr::null_mut());
         Box::into_raw(Box::new(line_sender(sender)))
     }
@@ -1790,9 +1867,11 @@ pub unsafe extern "C" fn line_sender_from_env(
 ) -> *mut line_sender {
     unsafe {
         let builder = bubble_err_to_c!(err_out, SenderBuilder::from_env(), ptr::null_mut());
-        let builder = builder
-            .user_agent(concat!("questdb/c/", env!("CARGO_PKG_VERSION")))
-            .expect("user_agent set");
+        let builder = bubble_err_to_c!(
+            err_out,
+            builder.user_agent(concat!("questdb/c/", env!("CARGO_PKG_VERSION"))),
+            ptr::null_mut()
+        );
         let sender = bubble_err_to_c!(err_out, builder.build(), ptr::null_mut());
         Box::into_raw(Box::new(line_sender(sender)))
     }
@@ -1806,7 +1885,19 @@ unsafe fn unwrap_sender_mut<'a>(sender: *mut line_sender) -> &'a mut Sender {
     unsafe { &mut (*sender).0 }
 }
 
-/// Returns the sender's protocol version
+/// Return the sender's configured transport protocol.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_get_protocol(
+    sender: *const line_sender,
+) -> line_sender_protocol {
+    unsafe { unwrap_sender(sender).protocol().into() }
+}
+
+/// Returns the sender's ILP protocol version
+///
+/// This is meaningful for ILP senders. For protocol-neutral inspection, use
+/// [`line_sender_get_protocol`]. Do not use this value to construct QWP/UDP
+/// buffers; use [`line_sender_buffer_new_for_sender`] instead.
 ///
 /// - Explicitly set version, or
 /// - Auto-detected during HTTP transport, or
@@ -1824,6 +1915,10 @@ pub unsafe extern "C" fn line_sender_get_max_name_len(sender: *const line_sender
 }
 
 /// Construct a [`line_sender_buffer`] using the sender's protocol settings.
+///
+/// This is the preferred protocol-neutral buffer constructor. It may produce a
+/// different buffer implementation than `line_sender_buffer_new(...)`, for
+/// example when the sender uses QWP-over-UDP.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_new_for_sender(
     sender: *const line_sender,

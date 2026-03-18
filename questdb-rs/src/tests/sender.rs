@@ -24,11 +24,11 @@
 
 use crate::{
     ErrorCode,
-    ingress::{
-        Buffer, DOUBLE_BINARY_FORMAT_TYPE, F64Serializer, Sender, TableName, Timestamp,
-        TimestampMicros, TimestampNanos,
-    },
+    ingress::{Buffer, Sender, TableName, Timestamp, TimestampMicros, TimestampNanos},
 };
+
+#[cfg(any(feature = "sync-sender-tcp", feature = "sync-sender-http"))]
+use crate::ingress::{DOUBLE_BINARY_FORMAT_TYPE, F64Serializer};
 
 use crate::ingress::ProtocolVersion;
 use crate::tests::TestResult;
@@ -292,6 +292,47 @@ fn test_table_name_too_long() -> TestResult {
         err.msg(),
         r#"Bad name: "a name too long": Too long (max 4 characters)"#
     );
+    Ok(())
+}
+
+#[test]
+fn ilp_buffer_check_can_flush_tracks_public_state_machine() -> TestResult {
+    let mut buffer = Buffer::new(ProtocolVersion::V3);
+
+    let err = buffer.check_can_flush().unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert_eq!(
+        err.msg(),
+        "State error: Bad call to `flush`, should have called `table` instead."
+    );
+
+    buffer.table("test")?;
+    let err = buffer.check_can_flush().unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert_eq!(
+        err.msg(),
+        "State error: Bad call to `flush`, should have called `symbol` or `column` instead."
+    );
+
+    buffer.symbol("sym", "ETH-USD")?;
+    let err = buffer.check_can_flush().unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert_eq!(
+        err.msg(),
+        "State error: Bad call to `flush`, should have called `symbol`, `column` or `at` instead."
+    );
+
+    buffer.column_f64("px", 2711.5)?;
+    let err = buffer.check_can_flush().unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert_eq!(
+        err.msg(),
+        "State error: Bad call to `flush`, should have called `column` or `at` instead."
+    );
+
+    buffer.at_now()?;
+    buffer.check_can_flush()?;
+
     Ok(())
 }
 
@@ -856,6 +897,7 @@ fn tcp_mismatched_buffer_and_sender_version() -> TestResult {
     Ok(())
 }
 
+#[cfg(any(feature = "sync-sender-tcp", feature = "sync-sender-http"))]
 pub(crate) fn f64_to_bytes(name: &str, value: f64, version: ProtocolVersion) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend_from_slice(name.as_bytes());

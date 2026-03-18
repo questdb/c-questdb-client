@@ -23,8 +23,14 @@
  ******************************************************************************/
 
 use crate::error::{self, Result};
-use crate::ingress::{Buffer, ProtocolVersion, SenderBuilder};
+use crate::ingress::{Buffer, Protocol, ProtocolVersion, SenderBuilder};
 use std::fmt::{Debug, Formatter};
+
+#[cfg(feature = "sync-sender-qwp-udp")]
+mod qwp_udp;
+
+#[cfg(feature = "sync-sender-qwp-udp")]
+pub(crate) use qwp_udp::*;
 
 #[cfg(feature = "sync-sender-tcp")]
 mod tcp;
@@ -44,7 +50,11 @@ mod http;
 #[cfg(feature = "sync-sender-http")]
 pub(crate) use http::*;
 
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum SyncProtocolHandler {
+    #[cfg(feature = "sync-sender-qwp-udp")]
+    SyncQwpUdp(SyncQwpUdpHandlerState),
+
     #[cfg(feature = "sync-sender-tcp")]
     SyncTcp(SyncConnection),
 
@@ -52,7 +62,8 @@ pub(crate) enum SyncProtocolHandler {
     SyncHttp(SyncHttpHandlerState),
 }
 
-/// Connects to a QuestDB instance and inserts data via the ILP protocol.
+/// Connects to a QuestDB instance and inserts data via the configured
+/// ingestion protocol.
 ///
 /// * To construct an instance, use [`Sender::from_conf`] or the [`SenderBuilder`].
 /// * To prepare messages, use [`Buffer`] objects.
@@ -62,6 +73,7 @@ pub struct Sender {
     handler: SyncProtocolHandler,
     connected: bool,
     max_buf_size: usize,
+    protocol: Protocol,
     protocol_version: ProtocolVersion,
     max_name_len: usize,
 }
@@ -77,6 +89,7 @@ impl Sender {
         descr: String,
         handler: SyncProtocolHandler,
         max_buf_size: usize,
+        protocol: Protocol,
         protocol_version: ProtocolVersion,
         max_name_len: usize,
     ) -> Self {
@@ -85,6 +98,7 @@ impl Sender {
             handler,
             connected: true,
             max_buf_size,
+            protocol,
             protocol_version,
             max_name_len,
         }
@@ -94,7 +108,8 @@ impl Sender {
     ///
     /// The format of the string is: `"http::addr=host:port;key=value;...;"`.
     ///
-    /// Instead of `"http"`, you can also specify `"https"`, `"tcp"`, and `"tcps"`.
+    /// Instead of `"http"`, you can also specify `"https"`, `"tcp"`, `"tcps"`,
+    /// and `"qwpudp"`.
     ///
     /// We recommend HTTP for most cases because it provides more features, like
     /// reporting errors to the client and supporting transaction control. TCP can
@@ -130,31 +145,69 @@ impl Sender {
 
     /// Creates a new [`Buffer`] using the sender's protocol settings
     pub fn new_buffer(&self) -> Buffer {
+        #[cfg(feature = "sync-sender-qwp-udp")]
+        if matches!(&self.handler, SyncProtocolHandler::SyncQwpUdp(_)) {
+            return Buffer::qwp_with_max_name_len(self.max_name_len);
+        }
+
         Buffer::with_max_name_len(self.protocol_version, self.max_name_len)
     }
 
     #[allow(unused_variables)]
     fn flush_impl(&mut self, buf: &Buffer, transactional: bool) -> Result<()> {
+        #[cfg(feature = "sync-sender-qwp-udp")]
+        #[allow(irrefutable_let_patterns)]
+        if let SyncProtocolHandler::SyncQwpUdp(ref mut state) = self.handler {
+            let qwp = buf.as_qwp().ok_or_else(|| {
+                error::fmt!(
+                    InvalidApiCall,
+                    "QWP/UDP sender requires a QWP buffer created by `Sender::new_buffer()`."
+                )
+            })?;
+            qwp.check_can_flush()?;
+            if qwp.len() > self.max_buf_size {
+                return Err(error::fmt!(
+                    InvalidApiCall,
+                    "Could not flush buffer: QWP buffer size hint of {} exceeds maximum configured allowed size of {} bytes.",
+                    qwp.len(),
+                    self.max_buf_size
+                ));
+            }
+            if transactional {
+                return Err(error::fmt!(
+                    InvalidApiCall,
+                    "Transactional flushes are not supported for QWP/UDP."
+                ));
+            }
+            return flush_qwp_udp(state, qwp);
+        }
+
         if !self.connected {
             return Err(error::fmt!(
                 SocketError,
                 "Could not flush buffer: not connected to database."
             ));
         }
-        buf.check_can_flush()?;
+        let ilp = buf.as_ilp().ok_or_else(|| {
+            error::fmt!(
+                InvalidApiCall,
+                "ILP sender requires an ILP buffer. QWP buffers must be flushed with a QWP/UDP sender."
+            )
+        })?;
+        ilp.check_can_flush()?;
 
-        if buf.len() > self.max_buf_size {
+        if ilp.len() > self.max_buf_size {
             return Err(error::fmt!(
                 InvalidApiCall,
                 "Could not flush buffer: Buffer size of {} exceeds maximum configured allowed size of {} bytes.",
-                buf.len(),
+                ilp.len(),
                 self.max_buf_size
             ));
         }
 
-        self.check_protocol_version(buf.protocol_version())?;
+        self.check_protocol_version(ilp.protocol_version())?;
 
-        let bytes = buf.as_bytes();
+        let bytes = ilp.as_bytes();
         if bytes.is_empty() {
             return Ok(());
         }
@@ -179,7 +232,7 @@ impl Sender {
             }
             #[cfg(feature = "sync-sender-http")]
             SyncProtocolHandler::SyncHttp(ref state) => {
-                if transactional && !buf.transactional() {
+                if transactional && !ilp.transactional() {
                     return Err(error::fmt!(
                         InvalidApiCall,
                         "Buffer contains lines for multiple tables. \
@@ -210,6 +263,8 @@ impl Sender {
                     Err(err) => Err(crate::error::Error::from_ureq_error(err, &state.url)),
                 }
             }
+            #[cfg(feature = "sync-sender-qwp-udp")]
+            SyncProtocolHandler::SyncQwpUdp(_) => unreachable!("handled above"),
         }
     }
 
@@ -280,10 +335,16 @@ impl Sender {
         !self.connected
     }
 
-    /// Returns the sender's protocol version
+    /// Returns the sender's configured transport protocol.
+    pub fn protocol(&self) -> Protocol {
+        self.protocol
+    }
+
+    /// Returns the sender's protocol version.
     ///
-    /// - Explicitly set version, or
-    /// - Auto-detected for HTTP transport, or [`ProtocolVersion::V1`] for TCP transport.
+    /// The returned value may be explicitly configured, auto-detected, or a
+    /// transport-defined default. Interpret it together with [`Sender::protocol`]
+    /// and [`ProtocolVersion`].
     pub fn protocol_version(&self) -> ProtocolVersion {
         self.protocol_version
     }
