@@ -28,7 +28,9 @@ use crate::ErrorCode;
 use crate::error;
 use crate::ingress::decimal::DecimalView;
 use crate::ingress::{ArrayElement, NdArrayView, Timestamp};
+use std::collections::hash_map::RandomState;
 use std::fmt::Debug;
+use std::hash::{BuildHasher, Hash, Hasher};
 
 use super::ilp::{ColumnName, TableName};
 use super::op_state::{Op, OpState};
@@ -1139,6 +1141,10 @@ fn batched_type_change_error(entry_name: &[u8]) -> crate::Error {
 struct SymbolEntry {
     value: ValueSlice,
     next: u32,
+    bucket_next: u32,
+    hash: u64,
+    col_idx: u16,
+    dict_idx: u16,
 }
 
 // --- Column stats (all scalar, no nested Vecs) ---
@@ -1312,16 +1318,24 @@ struct ColumnUndo {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct SymbolLookupUndo {
+    bucket_idx: usize,
+    previous_head: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct Checkpoint {
     columns_len: usize,
     cells_len: usize,
     symbol_dict_len: usize,
+    symbol_lookup_undo_len: usize,
     row_count: usize,
     current_len: usize,
     total_schema_len: usize,
     bool_column_count: usize,
     fixed8_column_count: usize,
     bitmap_column_count: usize,
+    symbol_hash_resize_epoch: u64,
 }
 
 // --- Row group planner (unified estimator + flush scratch) ---
@@ -1330,7 +1344,9 @@ pub(crate) struct RowGroupPlanner {
     columns: Vec<ColumnStats>,
     cells: Vec<CellRef>,
     symbol_dict: Vec<SymbolEntry>,
+    symbol_hash_buckets: Vec<u32>,
     undo_stack: Vec<ColumnUndo>,
+    symbol_lookup_undo: Vec<SymbolLookupUndo>,
     row_count: usize,
     current_len: usize,
     total_schema_len: usize,
@@ -1338,6 +1354,8 @@ pub(crate) struct RowGroupPlanner {
     fixed8_column_count: usize,
     bitmap_column_count: usize,
     track_cells: bool,
+    symbol_hash_resize_epoch: u64,
+    symbol_hasher: RandomState,
 }
 
 impl Clone for RowGroupPlanner {
@@ -1346,7 +1364,9 @@ impl Clone for RowGroupPlanner {
             columns: self.columns.clone(),
             cells: self.cells.clone(),
             symbol_dict: self.symbol_dict.clone(),
+            symbol_hash_buckets: self.symbol_hash_buckets.clone(),
             undo_stack: Vec::new(),
+            symbol_lookup_undo: Vec::new(),
             row_count: self.row_count,
             current_len: self.current_len,
             total_schema_len: self.total_schema_len,
@@ -1354,6 +1374,8 @@ impl Clone for RowGroupPlanner {
             fixed8_column_count: self.fixed8_column_count,
             bitmap_column_count: self.bitmap_column_count,
             track_cells: self.track_cells,
+            symbol_hash_resize_epoch: self.symbol_hash_resize_epoch,
+            symbol_hasher: self.symbol_hasher.clone(),
         }
     }
 }
@@ -1387,7 +1409,9 @@ impl RowGroupPlanner {
             columns: Vec::new(),
             cells: Vec::new(),
             symbol_dict: Vec::new(),
+            symbol_hash_buckets: Vec::new(),
             undo_stack: Vec::new(),
+            symbol_lookup_undo: Vec::new(),
             row_count: 0,
             current_len: 0,
             total_schema_len: 0,
@@ -1395,6 +1419,8 @@ impl RowGroupPlanner {
             fixed8_column_count: 0,
             bitmap_column_count: 0,
             track_cells: true,
+            symbol_hash_resize_epoch: 0,
+            symbol_hasher: RandomState::new(),
         }
     }
 
@@ -1403,7 +1429,9 @@ impl RowGroupPlanner {
             columns: Vec::new(),
             cells: Vec::new(),
             symbol_dict: Vec::new(),
+            symbol_hash_buckets: Vec::new(),
             undo_stack: Vec::new(),
+            symbol_lookup_undo: Vec::new(),
             row_count: 0,
             current_len: 0,
             total_schema_len: 0,
@@ -1411,6 +1439,8 @@ impl RowGroupPlanner {
             fixed8_column_count: 0,
             bitmap_column_count: 0,
             track_cells: false,
+            symbol_hash_resize_epoch: 0,
+            symbol_hasher: RandomState::new(),
         }
     }
 
@@ -1418,13 +1448,16 @@ impl RowGroupPlanner {
         self.columns.clear();
         self.cells.clear();
         self.symbol_dict.clear();
+        self.symbol_hash_buckets.fill(CELL_END);
         self.undo_stack.clear();
+        self.symbol_lookup_undo.clear();
         self.row_count = 0;
         self.current_len = 0;
         self.total_schema_len = 0;
         self.bool_column_count = 0;
         self.fixed8_column_count = 0;
         self.bitmap_column_count = 0;
+        self.symbol_hash_resize_epoch = 0;
     }
 
     fn row_count(&self) -> usize {
@@ -1436,12 +1469,14 @@ impl RowGroupPlanner {
             columns_len: self.columns.len(),
             cells_len: self.cells.len(),
             symbol_dict_len: self.symbol_dict.len(),
+            symbol_lookup_undo_len: self.symbol_lookup_undo.len(),
             row_count: self.row_count,
             current_len: self.current_len,
             total_schema_len: self.total_schema_len,
             bool_column_count: self.bool_column_count,
             fixed8_column_count: self.fixed8_column_count,
             bitmap_column_count: self.bitmap_column_count,
+            symbol_hash_resize_epoch: self.symbol_hash_resize_epoch,
         }
     }
 
@@ -1466,9 +1501,23 @@ impl RowGroupPlanner {
                 col.cell_head = CELL_END;
             }
         }
+        if self.symbol_hash_resize_epoch == cp.symbol_hash_resize_epoch {
+            for undo in self
+                .symbol_lookup_undo
+                .drain(cp.symbol_lookup_undo_len..)
+                .rev()
+            {
+                self.symbol_hash_buckets[undo.bucket_idx] = undo.previous_head;
+            }
+        } else {
+            self.symbol_lookup_undo.truncate(cp.symbol_lookup_undo_len);
+        }
         self.columns.truncate(cp.columns_len);
         self.cells.truncate(cp.cells_len);
         self.symbol_dict.truncate(cp.symbol_dict_len);
+        if self.symbol_hash_resize_epoch != cp.symbol_hash_resize_epoch {
+            self.rebuild_symbol_hash();
+        }
         self.row_count = cp.row_count;
         self.current_len = cp.current_len;
         self.total_schema_len = cp.total_schema_len;
@@ -1621,23 +1670,28 @@ impl RowGroupPlanner {
         let ValueRef::Symbol(vs) = value else {
             return Ok(());
         };
-        let col = &mut self.columns[col_idx];
         let symbol_bytes = &value_bytes[vs.0.as_range()];
-        let mut cursor = col.dict_head;
-        let mut pos = 0usize;
+        let col_idx_u16 = Self::checked_u16(col_idx, "column count")?;
+        let hash = self.hash_symbol_key(col_idx_u16, symbol_bytes);
+        self.ensure_symbol_hash_capacity(self.symbol_dict.len() + 1);
+        let bucket_idx = self.symbol_hash_bucket_idx(hash);
+        let mut cursor = self.symbol_hash_buckets[bucket_idx];
         let mut found_idx = None;
         while cursor != CELL_END {
             let de = &self.symbol_dict[cursor as usize];
-            if &value_bytes[de.value.0.as_range()] == symbol_bytes {
-                found_idx = Some(pos);
+            if de.hash == hash
+                && de.col_idx == col_idx_u16
+                && &value_bytes[de.value.0.as_range()] == symbol_bytes
+            {
+                found_idx = Some(de.dict_idx as usize);
                 break;
             }
-            cursor = de.next;
-            pos += 1;
+            cursor = de.bucket_next;
         }
         let sym_idx = if let Some(idx) = found_idx {
             idx
         } else {
+            let col = &self.columns[col_idx];
             if col.dict_count == u16::MAX {
                 return Err(error::fmt!(
                     InvalidApiCall,
@@ -1653,14 +1707,25 @@ impl RowGroupPlanner {
             None
         };
 
+        let col = &mut self.columns[col_idx];
         col.non_null_count += 1;
         if found_idx.is_none() {
             col.symbol_dict_bytes += qwp_string_byte_len(symbol_bytes.len()) as u32;
             let dict_idx = self.symbol_dict.len() as u32;
+            let previous_head = self.symbol_hash_buckets[bucket_idx];
+            self.symbol_lookup_undo.push(SymbolLookupUndo {
+                bucket_idx,
+                previous_head,
+            });
             self.symbol_dict.push(SymbolEntry {
                 value: *vs,
                 next: CELL_END,
+                bucket_next: previous_head,
+                hash,
+                col_idx: col_idx_u16,
+                dict_idx: col.dict_count,
             });
+            self.symbol_hash_buckets[bucket_idx] = dict_idx;
             if col.dict_tail != CELL_END {
                 self.symbol_dict[col.dict_tail as usize].next = dict_idx;
             } else {
@@ -1675,6 +1740,42 @@ impl RowGroupPlanner {
             self.cells.last_mut().unwrap().symbol_dict_idx = symbol_dict_idx;
         }
         Ok(())
+    }
+
+    fn hash_symbol_key(&self, col_idx: u16, symbol_bytes: &[u8]) -> u64 {
+        let mut hasher = self.symbol_hasher.build_hasher();
+        col_idx.hash(&mut hasher);
+        symbol_bytes.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn symbol_hash_bucket_idx(&self, hash: u64) -> usize {
+        debug_assert!(!self.symbol_hash_buckets.is_empty());
+        hash as usize & (self.symbol_hash_buckets.len() - 1)
+    }
+
+    fn ensure_symbol_hash_capacity(&mut self, required_entries: usize) {
+        let min_buckets = (required_entries.saturating_mul(2))
+            .next_power_of_two()
+            .max(16);
+        if self.symbol_hash_buckets.len() >= min_buckets {
+            return;
+        }
+        self.symbol_hash_buckets.resize(min_buckets, CELL_END);
+        self.symbol_hash_resize_epoch += 1;
+        self.rebuild_symbol_hash();
+    }
+
+    fn rebuild_symbol_hash(&mut self) {
+        if self.symbol_hash_buckets.is_empty() {
+            return;
+        }
+        self.symbol_hash_buckets.fill(CELL_END);
+        for (dict_idx, entry) in self.symbol_dict.iter_mut().enumerate() {
+            let bucket_idx = entry.hash as usize & (self.symbol_hash_buckets.len() - 1);
+            entry.bucket_next = self.symbol_hash_buckets[bucket_idx];
+            self.symbol_hash_buckets[bucket_idx] = dict_idx as u32;
+        }
     }
 
     fn push_new_column(
@@ -2135,8 +2236,10 @@ mod tests {
         assert_eq!(size_of::<CellRef>(), 24);
         assert_eq!(size_of::<EntryMeta>(), 24);
         assert_eq!(size_of::<RowMeta>(), 32);
+        assert_eq!(size_of::<SymbolEntry>(), 32);
         assert_eq!(size_of::<ColumnStats>(), 48);
         assert_eq!(size_of::<ColumnUndo>(), 28);
+        assert_eq!(size_of::<SymbolLookupUndo>(), 16);
         assert_eq!(size_of::<Option<DesignatedTs>>(), size_of::<DesignatedTs>());
     }
 
@@ -2192,6 +2295,91 @@ mod tests {
         assert_eq!(planner.columns[0].dict_count, u16::MAX);
         assert_eq!(planner.columns[0].non_null_count, 0);
         assert!(planner.symbol_dict.is_empty());
+    }
+
+    #[test]
+    fn qwp_planner_rollback_restores_symbol_hash_after_resize() {
+        let mut planner = RowGroupPlanner::new();
+        let mut buf = QwpBuffer::new(127);
+
+        for i in 0..7 {
+            buf.table("t")
+                .unwrap()
+                .symbol("s1", format!("v{i}"))
+                .unwrap()
+                .column_i64("x", i)
+                .unwrap();
+            buf.at_now().unwrap();
+        }
+
+        buf.table("t")
+            .unwrap()
+            .symbol("s1", "v7")
+            .unwrap()
+            .symbol("s2", "w0")
+            .unwrap()
+            .column_i64("x", 7)
+            .unwrap();
+        buf.at_now().unwrap();
+
+        buf.table("t")
+            .unwrap()
+            .symbol("s1", "v3")
+            .unwrap()
+            .symbol("s2", "w0")
+            .unwrap()
+            .column_i64("x", 8)
+            .unwrap();
+        buf.at_now().unwrap();
+
+        for row in &buf.rows[..7] {
+            planner
+                .add_row(
+                    row,
+                    buf.entries_for_row(row),
+                    &buf.name_bytes,
+                    &buf.value_bytes,
+                    "t".len(),
+                )
+                .unwrap();
+        }
+
+        let cp = planner.checkpoint();
+        let resize_row = &buf.rows[7];
+        planner
+            .add_row(
+                resize_row,
+                buf.entries_for_row(resize_row),
+                &buf.name_bytes,
+                &buf.value_bytes,
+                "t".len(),
+            )
+            .unwrap();
+        assert_eq!(
+            planner.current_len,
+            encoded_planner_len(&planner, &buf.name_bytes, &buf.value_bytes, "t")
+        );
+
+        planner.rollback(cp);
+        assert_eq!(
+            planner.current_len,
+            encoded_planner_len(&planner, &buf.name_bytes, &buf.value_bytes, "t")
+        );
+
+        let post_rollback_row = &buf.rows[8];
+        planner
+            .add_row(
+                post_rollback_row,
+                buf.entries_for_row(post_rollback_row),
+                &buf.name_bytes,
+                &buf.value_bytes,
+                "t".len(),
+            )
+            .unwrap();
+        assert_eq!(
+            planner.current_len,
+            encoded_planner_len(&planner, &buf.name_bytes, &buf.value_bytes, "t")
+        );
     }
 
     #[test]
