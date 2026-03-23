@@ -155,7 +155,7 @@ const CELL_END: u32 = u32::MAX;
 struct CellRef {
     row_idx: u32,
     /// Pre-computed symbol dictionary index; unused for non-symbol columns.
-    symbol_dict_idx: u16,
+    symbol_dict_idx: u32,
     next: u32,
     value: ValueRef,
 }
@@ -269,6 +269,12 @@ impl QwpSizeHint {
         self.scratch.clear();
         self.completed_count = 0;
         self.group_table = None;
+    }
+
+    fn reserve(&mut self, additional: usize, max_segments: usize) {
+        self.planner.reserve_for_encoded_bytes(additional);
+        self.scratch.reserve_for_encoded_bytes(additional);
+        self.completed.reserve(max_segments);
     }
 
     fn len(&self) -> usize {
@@ -433,11 +439,13 @@ impl QwpBuffer {
         // first flush cycle's retained capacity covers that gap.
         let max_entries = additional / 3;
         let max_rows = max_entries;
+        let max_segments = (max_rows / 4).max(1);
         self.name_bytes.reserve(additional);
         self.value_bytes.reserve(additional);
         self.rows.reserve(max_rows.max(1));
         self.entries.reserve(max_entries.max(1));
-        self.segments.reserve((max_rows / 4).max(1));
+        self.segments.reserve(max_segments);
+        self.size_hint.reserve(additional, max_segments);
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -1163,8 +1171,10 @@ pub(crate) struct QwpSendScratch {
 
 impl QwpSendScratch {
     pub(crate) fn new(max_datagram_size: usize) -> Self {
+        let mut planner = RowGroupPlanner::new();
+        planner.reserve_for_encoded_bytes(max_datagram_size);
         Self {
-            planner: RowGroupPlanner::new(),
+            planner,
             datagram: Vec::with_capacity(max_datagram_size),
         }
     }
@@ -1208,7 +1218,7 @@ struct SymbolEntry {
     bucket_next: u32,
     hash: u64,
     col_idx: u16,
-    dict_idx: u16,
+    dict_idx: u32,
 }
 
 // --- Column stats (all scalar, no nested Vecs) ---
@@ -1224,8 +1234,8 @@ struct ColumnStats {
     dict_tail: u32,
     cell_head: u32,
     cell_tail: u32,
-    dict_count: u16,
-    cached_schema_len: u16,
+    dict_count: u32,
+    cached_schema_len: usize,
     kind: ColumnKind,
     base_nullable: bool,
 }
@@ -1239,7 +1249,7 @@ impl ColumnStats {
         string_data_len: u32,
         symbol_dict_bytes: u32,
         symbol_row_index_bytes: u32,
-        dict_count: u16,
+        dict_count: u32,
     ) -> usize {
         let nullable = base_nullable
             || (kind_supports_sparse_nulls(kind) && (non_null_count as usize) < row_count);
@@ -1264,7 +1274,7 @@ impl ColumnStats {
     fn new(entry: &EntryMeta) -> Self {
         let kind = entry.value.kind();
         let name_len = entry.name.0.len as usize;
-        let cached_schema_len = (qwp_varint_size(name_len as u64) + name_len + 1) as u16;
+        let cached_schema_len = qwp_varint_size(name_len as u64) + name_len + 1;
         Self {
             name: entry.name,
             non_null_count: 0,
@@ -1378,7 +1388,7 @@ struct ColumnUndo {
     dict_tail: u32,
     cell_tail: u32,
     col_idx: u16,
-    dict_count: u16,
+    dict_count: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1466,6 +1476,18 @@ impl RowGroupPlanner {
         Ok(value as u16)
     }
 
+    fn checked_u32(value: usize, what: &'static str) -> crate::Result<u32> {
+        if value > u32::MAX as usize {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "QWP/UDP {} exceeds maximum of {}",
+                what,
+                u32::MAX
+            ));
+        }
+        Ok(value as u32)
+    }
+
     fn new() -> Self {
         Self {
             columns: Vec::new(),
@@ -1499,6 +1521,16 @@ impl RowGroupPlanner {
         self.fixed8_column_count = 0;
         self.bitmap_column_count = 0;
         self.symbol_hash_resize_epoch = 0;
+    }
+
+    fn reserve_for_encoded_bytes(&mut self, encoded_bytes: usize) {
+        let max_entries = (encoded_bytes / 3).max(1);
+        self.columns.reserve(max_entries);
+        self.cells.reserve(max_entries);
+        self.symbol_dict.reserve(max_entries);
+        self.undo_stack.reserve(max_entries);
+        self.symbol_lookup_undo.reserve(max_entries);
+        self.ensure_symbol_hash_capacity(max_entries);
     }
 
     fn row_count(&self) -> usize {
@@ -1723,23 +1755,15 @@ impl RowGroupPlanner {
         let sym_idx = if let Some(idx) = found_idx {
             idx
         } else {
-            let col = &self.columns[col_idx];
-            if col.dict_count == u16::MAX {
-                return Err(error::fmt!(
-                    InvalidApiCall,
-                    "QWP/UDP symbol dictionary exceeds maximum of {} distinct values per column",
-                    u16::MAX
-                ));
-            }
-            col.dict_count as usize
+            self.columns[col_idx].dict_count as usize
         };
-        let symbol_dict_idx = Self::checked_u16(sym_idx, "symbol dictionary index")?;
+        let symbol_dict_idx = Self::checked_u32(sym_idx, "symbol dictionary index")?;
 
         let col = &mut self.columns[col_idx];
         col.non_null_count += 1;
         if found_idx.is_none() {
             col.symbol_dict_bytes += qwp_string_byte_len(symbol_bytes.len()) as u32;
-            let dict_idx = self.symbol_dict.len() as u32;
+            let dict_idx = Self::checked_u32(self.symbol_dict.len(), "symbol dictionary length")?;
             let previous_head = self.symbol_hash_buckets[bucket_idx];
             self.symbol_lookup_undo.push(SymbolLookupUndo {
                 bucket_idx,
@@ -1821,7 +1845,7 @@ impl RowGroupPlanner {
             | ColumnKind::TimestampMicros
             | ColumnKind::TimestampNanos => self.bitmap_column_count += 1,
         }
-        self.total_schema_len += col.cached_schema_len as usize;
+        self.total_schema_len += col.cached_schema_len;
         self.columns.push(col);
         let col_idx = self.columns.len() - 1;
 
@@ -2263,8 +2287,8 @@ mod tests {
         assert_eq!(size_of::<EntryMeta>(), 24);
         assert_eq!(size_of::<RowMeta>(), 32);
         assert_eq!(size_of::<SymbolEntry>(), 32);
-        assert_eq!(size_of::<ColumnStats>(), 48);
-        assert_eq!(size_of::<ColumnUndo>(), 28);
+        assert_eq!(size_of::<ColumnStats>(), 56);
+        assert_eq!(size_of::<ColumnUndo>(), 32);
         assert_eq!(size_of::<SymbolLookupUndo>(), 16);
         assert_eq!(size_of::<Option<DesignatedTs>>(), size_of::<DesignatedTs>());
     }
@@ -2295,14 +2319,14 @@ mod tests {
     }
 
     #[test]
-    fn qwp_symbol_dictionary_rejects_more_than_u16_max_entries() {
+    fn qwp_symbol_dictionary_supports_more_than_u16_max_entries_per_segment() {
         let symbol_value = ValueRef::Symbol(ValueSlice(ByteSlice { offset: 0, len: 1 }));
         let mut planner = RowGroupPlanner::new();
         planner.columns.push(ColumnStats::new(&EntryMeta {
             name: NameSlice(ByteSlice { offset: 0, len: 1 }),
             value: symbol_value,
         }));
-        planner.columns[0].dict_count = u16::MAX;
+        planner.columns[0].dict_count = u16::MAX as u32;
         planner.cells.push(CellRef {
             row_idx: 0,
             symbol_dict_idx: 0,
@@ -2310,17 +2334,54 @@ mod tests {
             value: symbol_value,
         });
 
-        let err = planner
-            .add_symbol_value(0, &symbol_value, b"a")
-            .unwrap_err();
+        planner.add_symbol_value(0, &symbol_value, b"a").unwrap();
+
+        assert_eq!(planner.columns[0].dict_count, u16::MAX as u32 + 1);
+        assert_eq!(planner.columns[0].non_null_count, 1);
+        assert_eq!(planner.symbol_dict.len(), 1);
+        assert_eq!(planner.cells.last().unwrap().symbol_dict_idx, u16::MAX as u32);
+    }
+
+    #[test]
+    fn qwp_long_column_names_do_not_undercount_datagram_size() {
+        let long_name = "c".repeat(u16::MAX as usize + 1);
+        let mut buf = QwpBuffer::new(long_name.len());
+        buf.table("t")
+            .unwrap()
+            .column_i64(long_name.as_str(), 1)
+            .unwrap();
+        buf.at_now().unwrap();
+
+        assert!(buf.len() > 1400);
+
+        let err = buf.encode_datagrams(1400).unwrap_err();
         assert_eq!(err.code(), ErrorCode::InvalidApiCall);
-        assert!(
-            err.msg()
-                .contains("QWP/UDP symbol dictionary exceeds maximum")
-        );
-        assert_eq!(planner.columns[0].dict_count, u16::MAX);
-        assert_eq!(planner.columns[0].non_null_count, 0);
-        assert!(planner.symbol_dict.is_empty());
+        assert!(err.msg().contains("single row exceeds maximum datagram size"));
+    }
+
+    #[test]
+    fn qwp_flushes_segment_with_more_than_u16_max_distinct_symbols() {
+        let mut buf = QwpBuffer::new(127);
+        let mut scratch = QwpSendScratch::new(1400);
+
+        for i in 0..=u16::MAX {
+            buf.table("trades")
+                .unwrap()
+                .symbol("sym", i.to_string())
+                .unwrap();
+            buf.at_now().unwrap();
+        }
+
+        let mut datagram_count = 0usize;
+        buf.flush_to_socket(&mut scratch, 1400, &mut |datagram| {
+            datagram_count += 1;
+            assert!(datagram.len() <= 1400);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(buf.row_count(), u16::MAX as usize + 1);
+        assert!(datagram_count > 1);
     }
 
     #[test]
@@ -3089,6 +3150,42 @@ mod tests {
             cap_before, cap_refilled,
             "capacity must not change after refill with same workload"
         );
+    }
+
+    #[test]
+    fn qwp_reserve_prewarms_active_size_hint_planners() {
+        let mut buf = QwpBuffer::new(127);
+
+        buf.reserve(300);
+
+        assert!(buf.size_hint.planner.columns.capacity() > 0);
+        assert!(buf.size_hint.planner.cells.capacity() > 0);
+        assert!(buf.size_hint.planner.symbol_dict.capacity() > 0);
+        assert!(buf.size_hint.planner.undo_stack.capacity() > 0);
+        assert!(buf.size_hint.planner.symbol_lookup_undo.capacity() > 0);
+        assert!(buf.size_hint.planner.symbol_hash_buckets.len() >= 16);
+
+        assert!(buf.size_hint.scratch.columns.capacity() > 0);
+        assert!(buf.size_hint.scratch.cells.capacity() > 0);
+        assert!(buf.size_hint.scratch.symbol_dict.capacity() > 0);
+        assert!(buf.size_hint.scratch.undo_stack.capacity() > 0);
+        assert!(buf.size_hint.scratch.symbol_lookup_undo.capacity() > 0);
+        assert!(buf.size_hint.scratch.symbol_hash_buckets.len() >= 16);
+
+        assert!(buf.size_hint.completed.capacity() > 0);
+    }
+
+    #[test]
+    fn qwp_send_scratch_new_prewarms_planner_vectors() {
+        let scratch = QwpSendScratch::new(1400);
+
+        assert!(scratch.datagram.capacity() >= 1400);
+        assert!(scratch.planner.columns.capacity() > 0);
+        assert!(scratch.planner.cells.capacity() > 0);
+        assert!(scratch.planner.symbol_dict.capacity() > 0);
+        assert!(scratch.planner.undo_stack.capacity() > 0);
+        assert!(scratch.planner.symbol_lookup_undo.capacity() > 0);
+        assert!(scratch.planner.symbol_hash_buckets.len() >= 16);
     }
 
     #[test]

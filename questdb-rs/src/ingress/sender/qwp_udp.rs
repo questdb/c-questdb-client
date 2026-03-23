@@ -153,6 +153,17 @@ mod tests {
     use crate::ErrorCode;
 
     #[test]
+    fn qwp_udp_rejects_ipv6_only_targets() {
+        let err = match connect_qwp_udp("::1", "9007", None, &QwpUdpConfig::default()) {
+            Ok(_) => panic!("expected IPv6-only target resolution to fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code(), ErrorCode::CouldNotResolveAddr);
+        assert!(err.msg().contains("Could not resolve"));
+        assert!(err.msg().contains("::1"));
+    }
+
+    #[test]
     fn qwp_udp_flush_surfaces_socket_send_failure() {
         let qwp_udp = QwpUdpConfig::default();
         let mut handler = connect_qwp_udp("127.0.0.1", "9007", None, &qwp_udp).unwrap();

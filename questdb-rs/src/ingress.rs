@@ -816,6 +816,9 @@ impl SenderBuilder {
 
     #[cfg(feature = "_sender-qwp-udp")]
     /// Set the maximum datagram size in bytes for QWP/UDP transport.
+    ///
+    /// Current QWP/UDP transport support is IPv4-only, so the upper bound
+    /// matches the UDP/IPv4 payload limit.
     pub fn max_datagram_size(mut self, value: usize) -> Result<Self> {
         if value == 0 {
             return Err(error::fmt!(

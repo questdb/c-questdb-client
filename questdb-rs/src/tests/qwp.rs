@@ -414,6 +414,32 @@ fn qwp_udp_respects_max_buf_size_hint_limit() -> TestResult {
 }
 
 #[test]
+fn qwp_udp_long_names_do_not_bypass_max_buf_size_hint_limit() -> TestResult {
+    let mock = QwpUdpMock::new()?;
+    let max = 1400usize;
+    let long_name = "c".repeat(u16::MAX as usize + 1);
+    let mut sender = mock
+        .sender_builder()
+        .max_buf_size(max)?
+        .max_name_len(long_name.len())?
+        .build()?;
+    let mut buffer = sender.new_buffer();
+
+    buffer
+        .table("trades")?
+        .column_i64(long_name.as_str(), 1)?
+        .at_now()?;
+
+    assert!(buffer.len() > max);
+
+    let err = sender.flush_and_keep(&buffer).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert!(err.msg().contains("QWP buffer size hint"));
+
+    Ok(())
+}
+
+#[test]
 fn qwp_udp_encodes_sparse_boolean_columns_as_false_not_null() -> TestResult {
     let mock = QwpUdpMock::new()?;
     let mut sender = mock.sender_builder().build()?;

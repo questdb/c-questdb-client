@@ -19,8 +19,10 @@ under the path MTU to avoid fragmentation.
 
 In practice, that usually means designing around a 1500-byte Ethernet MTU:
 
+* the current QWP/UDP transport implementation is IPv4-only
 * IPv4 UDP payload budget is typically 1472 bytes
-* IPv6 UDP payload budget is typically 1452 bytes
+* IPv6 UDP payload budget is typically 1452 bytes if IPv6 transport is added
+  later
 * a configured default around 1400 bytes leaves operational headroom
 
 That assumption matters because it gives us a hard upper bound for hot-path
@@ -569,29 +571,36 @@ The public docs already allow QWP capacity to be implementation-defined.
 
 Proposed behavior:
 
-* `reserve(additional)` must reserve all buffer-side hot-path storage, not just
-  payload bytes
+* `reserve(additional)` reserves the primary buffer arenas and prewarms the
+  active size-hint planners used on the row-commit hot path
 * at minimum it reserves `name_bytes`, `value_bytes`, `rows`, `entries`, and
   `segments`
 * reserve calculations should use conservative worst-case bounds derived from
   `additional` bytes of eventual encoded payload
-* sender construction must separately prewarm `scratch.datagram` and all
-  planner-side vectors from configured `max_datagram_size`
+* sender construction separately prewarms `scratch.datagram` and the active
+  datagram-scratch planner vectors from configured `max_datagram_size`
+* the retained completed-planner pool is still topology-driven: workloads that
+  discover new table-switch patterns may grow that pool on first use, and those
+  allocations are treated as warmup rather than steady state
 * the intended operating point is that `max_datagram_size` is set to an
   MTU-safe value rather than relying on IP fragmentation
-* `capacity()` returns an implementation-defined retained-capacity hint, for
-  example the aggregate retained bytes across the major QWP arenas
+* `capacity()` returns an implementation-defined retained-capacity hint for the
+  primary buffer arenas; planner pools and sender scratch may retain additional
+  implementation-defined capacity that is not surfaced as an exact byte total
+* retained planner capacity is shaped by peak segment count and table-switch
+  topology, not only by the MTU-sized working set
 
 The important guarantees are:
 
 * `clear()` does not throw away retained QWP capacity
-* after `reserve()` and sender prewarm, bounded hot-path workloads do not need
-  further heap growth
+* after `reserve()`, sender prewarm, and any first-use warmup needed to
+  populate the retained planner pool for a bounded workload, hot-path batches
+  do not need further heap growth
 
 Before prewarm or reserve, vector growth is still allowed. Those allocations are
 acceptable outside steady state. Implementation may use `try_reserve` where it
 helps surface predictable errors, but the key requirement is that hot-path
-steady state is allocation-free after prewarm.
+steady state is allocation-free after prewarm or warmup.
 
 ## Behavior That Must Stay Identical
 
@@ -678,8 +687,8 @@ The redesign is complete when all of the following are true:
 * the public `Sender` API behavior is unchanged
 * the production send path no longer constructs `Vec<Vec<u8>>`
 * `clear()` preserves reusable QWP capacity across batches
-* after sender prewarm and buffer reserve, repeated bounded hot-path batches do
-  not allocate in steady state
+* after sender prewarm, buffer reserve, and any workload-specific first-use
+  warmup, repeated bounded hot-path batches do not allocate in steady state
 * repeated flushes reuse sender scratch instead of rebuilding fresh temporary
   containers
 * the hot path uses no generic heap-backed hash tables
