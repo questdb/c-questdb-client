@@ -809,7 +809,7 @@ typedef struct line_sender_opts line_sender_opts;
 /**
  * Create a new `line_sender_opts` instance from the given configuration
  * string. The format of the string is: "tcp::addr=host:port;key=value;...;"
- * Instead of "tcp" you can also specify "tcps", "http", and "https".
+ * Instead of "tcp" you can also specify "tcps", "http", "https", and "qwpudp".
  *
  * The accepted keys match one-for-one with the functions on
  * `line_sender_opts`. For example, this is a valid configuration string:

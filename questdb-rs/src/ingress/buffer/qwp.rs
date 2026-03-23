@@ -275,12 +275,17 @@ impl QwpSizeHint {
         self.committed_len
     }
 
-    fn segment_planner(&self, seg_idx: usize) -> &RowGroupPlanner {
+    fn segment_planner(&self, seg_idx: usize) -> crate::Result<&RowGroupPlanner> {
         if seg_idx < self.completed_count {
-            &self.completed[seg_idx]
+            Ok(&self.completed[seg_idx])
+        } else if seg_idx == self.completed_count {
+            Ok(&self.planner)
         } else {
-            debug_assert_eq!(seg_idx, self.completed_count);
-            &self.planner
+            Err(error::fmt!(
+                InvalidApiCall,
+                "internal error: missing cached planner for segment {}",
+                seg_idx
+            ))
         }
     }
 
@@ -897,7 +902,7 @@ impl QwpBuffer {
         ) {
             self.rollback_pending();
             if self.state.row_count == 0 {
-                self.state.op_state = OpState::new();
+                self.state = BufferState::new();
             } else {
                 self.state.op_state.finish_row();
             }
@@ -906,6 +911,8 @@ impl QwpBuffer {
 
         // Update segments (infallible)
         if same_table {
+            // `same_table` is only true when `last_seg_table` came from
+            // `self.segments.last()`, and `self.segments` has not changed since.
             self.segments.last_mut().unwrap().row_count += 1;
         } else {
             self.segments.push(SegmentMeta {
@@ -923,10 +930,9 @@ impl QwpBuffer {
     }
 
     fn pending_size_hint(&self) -> usize {
-        if self.pending.table.is_none() {
+        let Some(table_ns) = self.pending.table else {
             return 0;
-        }
-        let table_ns = self.pending.table.unwrap();
+        };
         let mut size = table_ns.0.len as usize;
         for entry in &self.entries[self.pending.entry_start as usize..] {
             size += entry.name.0.len as usize;
@@ -1059,7 +1065,7 @@ impl QwpBuffer {
         }
         for (seg_idx, segment) in self.segments.iter().enumerate() {
             let table_name = &self.name_bytes[segment.table.0.as_range()];
-            let cached = self.size_hint.segment_planner(seg_idx);
+            let cached = self.size_hint.segment_planner(seg_idx)?;
 
             // Fast path: segment fits in one datagram, encode from cached planner.
             if cached.current_len <= max_datagram_size {
@@ -1758,6 +1764,8 @@ impl RowGroupPlanner {
         }
         col.symbol_row_index_bytes += qwp_varint_size(sym_idx as u64) as u32;
         // Store pre-computed index so encoding is O(1) per cell
+        // Callers push the current cell immediately before invoking this helper,
+        // so the last cell is always the symbol cell whose dictionary index we set.
         self.cells.last_mut().unwrap().symbol_dict_idx = symbol_dict_idx;
         Ok(())
     }
@@ -2316,6 +2324,15 @@ mod tests {
     }
 
     #[test]
+    fn qwp_size_hint_segment_planner_rejects_out_of_range_index() {
+        let size_hint = QwpSizeHint::new();
+
+        let err = size_hint.segment_planner(1).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert_eq!(err.msg(), "internal error: missing cached planner for segment 1");
+    }
+
+    #[test]
     fn qwp_planner_rollback_restores_symbol_hash_after_resize() {
         let mut planner = RowGroupPlanner::new();
         let mut buf = QwpBuffer::new(127);
@@ -2555,7 +2572,7 @@ mod tests {
     fn qwp_first_row_size_hint_error_resets_flush_state_to_init() {
         let mut buf = QwpBuffer::new(127);
 
-        buf.table("trades").unwrap().column_i64("qty", 1).unwrap();
+        buf.table("longname").unwrap().column_i64("qty", 1).unwrap();
         let qty_name = buf.entries.last().unwrap().name;
         buf.entries.push(EntryMeta {
             name: qty_name,
@@ -2577,8 +2594,9 @@ mod tests {
             flush_err.msg(),
             "State error: Bad call to `flush`, should have called `table` instead."
         );
+        assert!(buf.transactional());
 
-        buf.table("trades").unwrap().column_i64("qty", 2).unwrap();
+        buf.table("hi").unwrap().column_i64("qty", 2).unwrap();
         buf.at_now().unwrap();
         assert_eq!(buf.row_count(), 1);
     }

@@ -770,7 +770,7 @@ public:
     /**
      * Create a new `opts` instance from the given configuration string.
      * The format of the string is: "tcp::addr=host:port;key=value;...;"
-     * Instead of "tcp" you can also specify "tcps", "http", and "https".
+     * Instead of "tcp" you can also specify "tcps", "http", "https", and "qwpudp".
      *
      * The accepted keys match one-for-one with the methods on `opts`.
      * For example, this is a valid configuration string:
@@ -1247,9 +1247,9 @@ public:
         ensure_impl();
         auto version = this->protocol_version();
         auto max_name_len = ::line_sender_get_max_name_len(_impl);
+        bool is_qwp = this->protocol() == protocol::qwpudp;
         auto* raw_buffer = ::line_sender_buffer_new_for_sender(_impl);
         ::line_sender_buffer_reserve(raw_buffer, init_buf_size);
-        bool is_qwp = this->protocol() == protocol::qwpudp;
         return line_sender_buffer{
             raw_buffer,
             version,

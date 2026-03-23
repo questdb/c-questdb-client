@@ -264,7 +264,10 @@ impl Sender {
                 }
             }
             #[cfg(feature = "sync-sender-qwp-udp")]
-            SyncProtocolHandler::SyncQwpUdp(_) => unreachable!("handled above"),
+            SyncProtocolHandler::SyncQwpUdp(_) => Err(error::fmt!(
+                InvalidApiCall,
+                "internal error: QWP/UDP handler in ILP flush path"
+            )),
         }
     }
 
