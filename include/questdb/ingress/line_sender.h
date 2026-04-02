@@ -321,6 +321,20 @@ line_sender_column_name line_sender_column_name_assert(
 typedef struct line_sender_buffer line_sender_buffer;
 
 /**
+ * Rollback handle captured from a sender buffer.
+ *
+ * Treat the fields as opaque implementation details.
+ *
+ * This is the stable C ABI v1 layout. Do not change field order or width
+ * without a breaking version bump.
+ */
+typedef struct line_sender_bookmark
+{
+    uint64_t origin;
+    uint64_t generation;
+} line_sender_bookmark;
+
+/**
  * Construct an ILP `line_sender_buffer` with explicitly set
  * `protocol_version` and fixed 127-byte name length limit.
  *
@@ -389,10 +403,41 @@ LINESENDER_API
 size_t line_sender_buffer_capacity(const line_sender_buffer* buffer);
 
 /**
+ * Capture a bookmark for the current buffer state.
+ *
+ * Capturing a new bookmark replaces the previously stored bookmark or marker.
+ */
+LINESENDER_API
+bool line_sender_buffer_bookmark(
+    line_sender_buffer* buffer,
+    line_sender_bookmark* out,
+    line_sender_error** err_out);
+
+/**
+ * Rewind the buffer to a previously captured bookmark.
+ *
+ * On success, the stored bookmark is consumed.
+ */
+LINESENDER_API
+bool line_sender_buffer_rewind_to_bookmark(
+    line_sender_buffer* buffer,
+    line_sender_bookmark bookmark,
+    line_sender_error** err_out);
+
+/**
+ * Discard a previously captured bookmark if it is still current.
+ */
+LINESENDER_API
+void line_sender_buffer_clear_bookmark(
+    line_sender_buffer* buffer,
+    line_sender_bookmark bookmark);
+
+/**
  * Mark a rewind point.
  * This allows undoing accumulated changes to the buffer for one or more
  * rows by calling `rewind_to_marker()`.
- * Any previous marker will be discarded.
+ * Any previously stored rewind point will be discarded, including one
+ * established by `line_sender_buffer_bookmark()`.
  * Once the marker is no longer needed, call `clear_marker()`.
  */
 LINESENDER_API
@@ -400,14 +445,21 @@ bool line_sender_buffer_set_marker(
     line_sender_buffer* buffer, line_sender_error** err_out);
 
 /**
- * Undo all changes since the last `set_marker()` call.
- * As a side-effect, this also clears the marker.
+ * Undo all changes since the currently stored rewind point was captured.
+ *
+ * This may rewind a state established by either
+ * `line_sender_buffer_set_marker()` or `line_sender_buffer_bookmark()`.
+ *
+ * As a side-effect, this also clears the stored rewind point.
  */
 LINESENDER_API
 bool line_sender_buffer_rewind_to_marker(
     line_sender_buffer* buffer, line_sender_error** err_out);
 
-/** Discard the marker. */
+/**
+ * Discard the currently stored rewind point, including one established by
+ * `line_sender_buffer_bookmark()`.
+ */
 LINESENDER_API
 void line_sender_buffer_clear_marker(line_sender_buffer* buffer);
 

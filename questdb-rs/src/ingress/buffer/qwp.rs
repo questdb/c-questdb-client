@@ -34,6 +34,7 @@ use std::hash::{BuildHasher, Hash, Hasher};
 
 use super::ilp::{ColumnName, TableName};
 use super::op_state::{Op, OpState};
+use super::{Bookmark, BufferBookmarkMeta, StoredBookmark};
 
 /// Wire layout of a QWP datagram header.
 ///
@@ -400,12 +401,11 @@ impl QwpSizeHint {
     }
 }
 
-// --- Marker ---
-// Design doc proposes snapshotting QwpSizeHint here, but that would clone
-// the planner's Vecs on every set_marker(). Instead we store only scalar
-// arena lengths and recompute the size hint from committed rows on rewind.
-// The O(rows) replay cost on rewind_to_marker is acceptable since marker
-// rewind is not a steady-state hot path.
+// --- Stored rewind state ---
+// We intentionally avoid snapshotting QwpSizeHint here because that would clone
+// planner Vecs on every capture. Instead we store only scalar arena lengths and
+// recompute the size hint from committed rows on rewind. The O(rows) replay
+// cost is acceptable because rewind is not a steady-state hot path.
 
 #[derive(Clone, Copy, Debug)]
 struct QwpMarker {
@@ -430,7 +430,8 @@ pub(crate) struct QwpBuffer {
     pending: PendingRowState,
     state: BufferState,
     size_hint: QwpSizeHint,
-    marker: Option<QwpMarker>,
+    bookmark_meta: BufferBookmarkMeta,
+    bookmark: StoredBookmark<QwpMarker>,
     max_name_len: usize,
 }
 
@@ -451,7 +452,12 @@ impl Clone for QwpBuffer {
             pending: self.pending,
             state: self.state,
             size_hint: self.size_hint.clone(),
-            marker: self.marker,
+            // Preserve the stored rewind payload so marker-based rewind on the
+            // clone matches historical behavior, but assign a fresh origin so
+            // explicit bookmarks from the source buffer still fail on the
+            // clone.
+            bookmark_meta: BufferBookmarkMeta::new(),
+            bookmark: self.bookmark,
             max_name_len: self.max_name_len,
         }
     }
@@ -468,7 +474,8 @@ impl QwpBuffer {
             pending: PendingRowState::empty(),
             state: BufferState::new(),
             size_hint: QwpSizeHint::new(),
-            marker: None,
+            bookmark_meta: BufferBookmarkMeta::new(),
+            bookmark: StoredBookmark::new(),
             max_name_len,
         }
     }
@@ -518,9 +525,8 @@ impl QwpBuffer {
         &[]
     }
 
-    pub(crate) fn set_marker(&mut self) -> crate::Result<()> {
-        self.state.op_state.ensure_marker_can_be_set()?;
-        self.marker = Some(QwpMarker {
+    fn snapshot_bookmark_state(&self) -> crate::Result<QwpMarker> {
+        Ok(QwpMarker {
             rows_len: checked_qwp_u32(self.rows.len(), "row metadata length")?,
             entries_len: checked_qwp_u32(self.entries.len(), "entry metadata length")?,
             segments_len: checked_qwp_u32(self.segments.len(), "segment metadata length")?,
@@ -528,12 +534,10 @@ impl QwpBuffer {
             name_bytes_len: checked_qwp_u32(self.name_bytes.len(), "name_bytes length")?,
             value_bytes_len: checked_qwp_u32(self.value_bytes.len(), "value_bytes length")?,
             state: self.state,
-        });
-        Ok(())
+        })
     }
 
-    pub(crate) fn rewind_to_marker(&mut self) -> crate::Result<()> {
-        let marker = self.marker.ok_or_else(OpState::missing_marker_error)?;
+    fn rewind_to_state(&mut self, marker: QwpMarker) -> crate::Result<()> {
         let size_hint = self.build_size_hint_for_target(
             marker.segments_len as usize,
             marker.tail_segment_row_count,
@@ -552,12 +556,40 @@ impl QwpBuffer {
         self.pending = PendingRowState::empty();
         self.state = marker.state;
         self.size_hint = size_hint;
-        self.marker = None;
+        self.bookmark.clear();
         Ok(())
     }
 
+    pub(crate) fn set_marker(&mut self) -> crate::Result<()> {
+        self.state.op_state.ensure_marker_can_be_set()?;
+        let marker = self.snapshot_bookmark_state()?;
+        self.bookmark.capture(self.bookmark_meta.origin(), marker);
+        Ok(())
+    }
+
+    pub(crate) fn bookmark(&mut self) -> crate::Result<Bookmark> {
+        self.state.op_state.ensure_bookmark_can_be_set()?;
+        let marker = self.snapshot_bookmark_state()?;
+        Ok(self.bookmark.capture(self.bookmark_meta.origin(), marker))
+    }
+
+    pub(crate) fn rewind_to_bookmark(&mut self, bookmark: Bookmark) -> crate::Result<()> {
+        let marker = self.bookmark.restore(self.bookmark_meta.origin(), bookmark)?;
+        self.rewind_to_state(marker)
+    }
+
+    pub(crate) fn clear_bookmark(&mut self, bookmark: Bookmark) {
+        self.bookmark
+            .clear_if_matches(self.bookmark_meta.origin(), bookmark);
+    }
+
+    pub(crate) fn rewind_to_marker(&mut self) -> crate::Result<()> {
+        let marker = self.bookmark.current().ok_or_else(OpState::missing_marker_error)?;
+        self.rewind_to_state(marker)
+    }
+
     pub(crate) fn clear_marker(&mut self) {
-        self.marker = None;
+        self.bookmark.clear();
     }
 
     pub(crate) fn clear(&mut self) {
@@ -569,7 +601,7 @@ impl QwpBuffer {
         self.pending = PendingRowState::empty();
         self.state = BufferState::new();
         self.size_hint.clear();
-        self.marker = None;
+        self.bookmark.clear();
     }
 
     fn build_size_hint_for_target(
@@ -2968,7 +3000,7 @@ mod tests {
         buf.table("trades").unwrap().column_i64("qty", 2).unwrap();
         buf.at_now().unwrap();
         buf.set_marker().unwrap();
-        let marker_before = buf.marker.expect("marker should be set");
+        let marker_before = buf.bookmark.current().expect("marker should be set");
         let len_before = buf.len();
         let row_count_before = buf.row_count();
         let rows_len_before = buf.rows.len();
@@ -2987,7 +3019,10 @@ mod tests {
         assert_eq!(buf.row_count(), row_count_before);
         assert_eq!(buf.rows.len(), rows_len_before);
         assert_eq!(buf.segments.len(), segments_len_before);
-        let marker_after = buf.marker.expect("marker should be preserved on failure");
+        let marker_after = buf
+            .bookmark
+            .current()
+            .expect("marker should be preserved on failure");
         assert_eq!(marker_after.rows_len, marker_before.rows_len);
         assert_eq!(marker_after.entries_len, marker_before.entries_len);
         assert_eq!(marker_after.segments_len, marker_before.segments_len);

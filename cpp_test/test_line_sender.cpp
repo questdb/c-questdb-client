@@ -1251,6 +1251,49 @@ TEST_CASE("Test Marker")
         buffer.rewind_to_marker(), questdb::ingress::line_sender_error);
 }
 
+TEST_CASE("Test Bookmark")
+{
+    questdb::ingress::line_sender_buffer buffer{
+        questdb::ingress::protocol_version::v1};
+
+    auto empty = buffer.bookmark();
+    buffer.table("test").symbol("a", "b").at_now();
+    CHECK(buffer.peek() == "test,a=b\n");
+
+    buffer.rewind_to_bookmark(empty);
+    CHECK(buffer.peek() == "");
+
+    auto stale = buffer.bookmark();
+    buffer.table("test").symbol("a", "b").at_now();
+    auto current = buffer.bookmark();
+    buffer.table("test").symbol("a", "c").at_now();
+
+    CHECK_THROWS_AS(
+        buffer.rewind_to_bookmark(stale),
+        questdb::ingress::line_sender_error);
+
+    buffer.rewind_to_bookmark(current);
+    CHECK(buffer.peek() == "test,a=b\n");
+
+    auto old_bookmark = buffer.bookmark();
+    buffer.table("test").symbol("a", "d").at_now();
+    buffer.set_marker();
+    CHECK_THROWS_AS(
+        buffer.rewind_to_bookmark(old_bookmark),
+        questdb::ingress::line_sender_error);
+
+    buffer.table("test").symbol("a", "e").at_now();
+    buffer.rewind_to_marker();
+    CHECK(buffer.peek() == "test,a=b\ntest,a=d\n");
+
+    auto cleared = buffer.bookmark();
+    buffer.table("test").symbol("a", "f").at_now();
+    buffer.clear_bookmark(cleared);
+    CHECK_THROWS_AS(
+        buffer.rewind_to_bookmark(cleared),
+        questdb::ingress::line_sender_error);
+}
+
 TEST_CASE("Moved View")
 {
     auto v1 = "abc"_tn;

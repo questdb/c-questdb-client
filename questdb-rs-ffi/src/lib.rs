@@ -706,6 +706,32 @@ pub unsafe extern "C" fn line_sender_column_name_assert(
 /// variants. A buffer object can be reused after flushing and clearing.
 pub struct line_sender_buffer(Buffer);
 
+/// Opaque rollback handle captured from a buffer.
+///
+/// This is the stable C ABI v1 layout. Do not change field order or width
+/// without a breaking version bump.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct line_sender_bookmark {
+    origin: u64,
+    generation: u64,
+}
+
+impl From<ingress::Bookmark> for line_sender_bookmark {
+    fn from(bookmark: ingress::Bookmark) -> Self {
+        Self {
+            origin: bookmark.origin(),
+            generation: bookmark.generation(),
+        }
+    }
+}
+
+impl From<line_sender_bookmark> for ingress::Bookmark {
+    fn from(bookmark: line_sender_bookmark) -> Self {
+        ingress::Bookmark::from_raw(bookmark.origin, bookmark.generation)
+    }
+}
+
 /// Construct an ILP `line_sender_buffer` with a `max_name_len` of `127`, which
 /// is the same as the QuestDB server default.
 ///
@@ -817,10 +843,52 @@ pub unsafe extern "C" fn line_sender_buffer_capacity(buffer: *const line_sender_
     unsafe { unwrap_buffer(buffer).capacity() }
 }
 
+/// Capture a bookmark for the current buffer state.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_buffer_bookmark(
+    buffer: *mut line_sender_buffer,
+    out: *mut line_sender_bookmark,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe {
+        let buffer = unwrap_buffer_mut(buffer);
+        let bookmark = bubble_err_to_c!(err_out, buffer.bookmark());
+        *out = bookmark.into();
+        true
+    }
+}
+
+/// Rewind the buffer to a previously captured bookmark.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_buffer_rewind_to_bookmark(
+    buffer: *mut line_sender_buffer,
+    bookmark: line_sender_bookmark,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe {
+        let buffer = unwrap_buffer_mut(buffer);
+        bubble_err_to_c!(err_out, buffer.rewind_to_bookmark(bookmark.into()));
+        true
+    }
+}
+
+/// Clear a previously captured bookmark if it is still current.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_buffer_clear_bookmark(
+    buffer: *mut line_sender_buffer,
+    bookmark: line_sender_bookmark,
+) {
+    unsafe {
+        let buffer = unwrap_buffer_mut(buffer);
+        buffer.clear_bookmark(bookmark.into());
+    }
+}
+
 /// Mark a rewind point.
 /// This allows undoing accumulated changes to the buffer for one or more
 /// rows by calling `rewind_to_marker`.
-/// Any previous marker will be discarded.
+/// Any previously stored rewind point will be discarded, including one
+/// established by `line_sender_buffer_bookmark`.
 /// Once the marker is no longer needed, call `clear_marker`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_set_marker(
@@ -834,8 +902,12 @@ pub unsafe extern "C" fn line_sender_buffer_set_marker(
     }
 }
 
-/// Undo all changes since the last `set_marker` call.
-/// As a side-effect, this also clears the marker.
+/// Undo all changes since the currently stored rewind point was captured.
+///
+/// This may rewind a state established by either `line_sender_buffer_set_marker`
+/// or `line_sender_buffer_bookmark`.
+///
+/// As a side-effect, this also clears the stored rewind point.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_rewind_to_marker(
     buffer: *mut line_sender_buffer,

@@ -120,16 +120,24 @@ impl OpState {
     }
 
     pub(super) fn ensure_marker_can_be_set(self) -> crate::Result<()> {
+        self.ensure_rewind_point_can_be_set("marker")
+    }
+
+    pub(super) fn ensure_bookmark_can_be_set(self) -> crate::Result<()> {
+        self.ensure_rewind_point_can_be_set("bookmark")
+    }
+
+    fn ensure_rewind_point_can_be_set(self, what: &'static str) -> crate::Result<()> {
         if self.can_set_marker() {
             Ok(())
         } else {
             Err(error::fmt!(
                 InvalidApiCall,
-                concat!(
-                    "Can't set the marker whilst constructing a line. ",
-                    "A marker may only be set on an empty buffer or after ",
-                    "`at` or `at_now` is called."
-                )
+                "Can't set the {} whilst constructing a line. \
+                A {} may only be set on an empty buffer or after `at` or \
+                `at_now` is called.",
+                what,
+                what
             ))
         }
     }

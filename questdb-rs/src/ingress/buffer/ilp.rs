@@ -34,6 +34,7 @@ use std::fmt::{Debug, Formatter};
 use std::num::NonZeroUsize;
 
 use super::op_state::{Op, OpState};
+use super::{Bookmark, BufferBookmarkMeta, StoredBookmark};
 
 fn write_escaped_impl<Q, C>(check_escape_fn: C, quoting_fn: Q, output: &mut Vec<u8>, s: &str)
 where
@@ -147,6 +148,12 @@ impl BufferState {
             transactional: true,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct IlpBookmarkState {
+    position: usize,
+    state: BufferState,
 }
 
 /// A validated table name.
@@ -425,13 +432,30 @@ impl AsRef<str> for ColumnName<'_> {
 /// [`buffer.rewind_to_marker()`](Buffer::rewind_to_marker) to go back to the
 /// marked last known good state.
 ///
-#[derive(Clone)]
 pub struct Buffer {
     output: Vec<u8>,
     state: BufferState,
-    marker: Option<(usize, BufferState)>,
+    bookmark_meta: BufferBookmarkMeta,
+    bookmark: StoredBookmark<IlpBookmarkState>,
     max_name_len: usize,
     protocol_version: ProtocolVersion,
+}
+
+impl Clone for Buffer {
+    fn clone(&self) -> Self {
+        Self {
+            output: self.output.clone(),
+            state: self.state,
+            // Preserve the stored rewind payload so marker-based rewind on the
+            // clone behaves like pre-bookmark clone semantics, but assign a
+            // fresh origin so explicit bookmarks from the source buffer fail on
+            // the clone.
+            bookmark_meta: BufferBookmarkMeta::new(),
+            bookmark: self.bookmark,
+            max_name_len: self.max_name_len,
+            protocol_version: self.protocol_version,
+        }
+    }
 }
 
 impl Buffer {
@@ -462,7 +486,8 @@ impl Buffer {
         Self {
             output: Vec::new(),
             state: BufferState::new(),
-            marker: None,
+            bookmark_meta: BufferBookmarkMeta::new(),
+            bookmark: StoredBookmark::new(),
             max_name_len,
             protocol_version,
         }
@@ -510,6 +535,19 @@ impl Buffer {
         &self.output
     }
 
+    fn snapshot_bookmark_state(&self) -> IlpBookmarkState {
+        IlpBookmarkState {
+            position: self.output.len(),
+            state: self.state,
+        }
+    }
+
+    fn apply_rewind(&mut self, bookmark_state: IlpBookmarkState) {
+        self.output.truncate(bookmark_state.position);
+        self.state = bookmark_state.state;
+        self.bookmark.clear();
+    }
+
     /// Mark a rewind point.
     /// This allows undoing accumulated changes to the buffer for one or more
     /// rows by calling [`rewind_to_marker`](Buffer::rewind_to_marker).
@@ -518,8 +556,31 @@ impl Buffer {
     /// [`clear_marker`](Buffer::clear_marker).
     pub fn set_marker(&mut self) -> crate::Result<()> {
         self.state.op_state.ensure_marker_can_be_set()?;
-        self.marker = Some((self.output.len(), self.state));
+        self.bookmark
+            .capture(self.bookmark_meta.origin(), self.snapshot_bookmark_state());
         Ok(())
+    }
+
+    /// Capture a bookmark for the current buffer state.
+    pub fn bookmark(&mut self) -> crate::Result<Bookmark> {
+        self.state.op_state.ensure_bookmark_can_be_set()?;
+        Ok(self.bookmark.capture(
+            self.bookmark_meta.origin(),
+            self.snapshot_bookmark_state(),
+        ))
+    }
+
+    pub fn rewind_to_bookmark(&mut self, bookmark: Bookmark) -> crate::Result<()> {
+        let bookmark_state = self
+            .bookmark
+            .restore(self.bookmark_meta.origin(), bookmark)?;
+        self.apply_rewind(bookmark_state);
+        Ok(())
+    }
+
+    pub fn clear_bookmark(&mut self, bookmark: Bookmark) {
+        self.bookmark
+            .clear_if_matches(self.bookmark_meta.origin(), bookmark);
     }
 
     /// Undo all changes since the last [`set_marker`](Buffer::set_marker)
@@ -527,9 +588,8 @@ impl Buffer {
     ///
     /// As a side effect, this also clears the marker.
     pub fn rewind_to_marker(&mut self) -> crate::Result<()> {
-        if let Some((position, state)) = self.marker.take() {
-            self.output.truncate(position);
-            self.state = state;
+        if let Some(bookmark_state) = self.bookmark.current() {
+            self.apply_rewind(bookmark_state);
             Ok(())
         } else {
             Err(OpState::missing_marker_error())
@@ -541,7 +601,7 @@ impl Buffer {
     ///
     /// Idempotent.
     pub fn clear_marker(&mut self) {
-        self.marker = None;
+        self.bookmark.clear();
     }
 
     /// Reset the buffer and clear contents whilst retaining
@@ -549,7 +609,7 @@ impl Buffer {
     pub fn clear(&mut self) {
         self.output.clear();
         self.state = BufferState::new();
-        self.marker = None;
+        self.bookmark.clear();
     }
 
     /// Check if the next API operation is allowed as per the OP case state machine.
@@ -1319,7 +1379,7 @@ impl Debug for Buffer {
         f.debug_struct("Buffer")
             .field("output", &DebugBytes(&self.output))
             .field("state", &self.state)
-            .field("marker", &self.marker)
+            .field("bookmark", &self.bookmark)
             .field("max_name_len", &self.max_name_len)
             .field("protocol_version", &self.protocol_version)
             .finish()

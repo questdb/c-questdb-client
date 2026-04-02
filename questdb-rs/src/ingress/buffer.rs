@@ -28,9 +28,10 @@ mod op_state;
 #[cfg(feature = "_sender-qwp-udp")]
 mod qwp;
 
-use crate::Error;
+use crate::{Error, error};
 use crate::ingress::ndarr::ArrayElementSealed;
 use crate::ingress::{ArrayElement, DecimalView, NdArrayView, ProtocolVersion, Timestamp};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) use self::ilp::Buffer as IlpBuffer;
 #[allow(unused_imports)]
@@ -41,6 +42,133 @@ pub use self::ilp::{ColumnName, TableName};
 pub(crate) use self::qwp::QwpBuffer;
 #[cfg(feature = "_sender-qwp-udp")]
 pub(crate) use self::qwp::QwpSendScratch;
+
+static NEXT_BOOKMARK_ORIGIN: AtomicU64 = AtomicU64::new(1);
+
+/// Opaque rollback handle captured from a [`Buffer`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Bookmark {
+    origin: u64,
+    generation: u64,
+}
+
+impl Bookmark {
+    /// Construct a bookmark from raw parts.
+    ///
+    /// This is exposed for FFI interop. Application code should prefer
+    /// [`Buffer::bookmark`].
+    #[doc(hidden)]
+    pub const fn from_raw(origin: u64, generation: u64) -> Self {
+        Self { origin, generation }
+    }
+
+    /// Return the originating buffer namespace for this bookmark.
+    ///
+    /// This accessor is primarily intended for FFI wrappers.
+    #[doc(hidden)]
+    pub const fn origin(self) -> u64 {
+        self.origin
+    }
+
+    /// Return the generation number associated with this bookmark.
+    ///
+    /// This accessor is primarily intended for FFI wrappers.
+    #[doc(hidden)]
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct BufferBookmarkMeta {
+    origin: u64,
+}
+
+impl BufferBookmarkMeta {
+    pub(super) fn new() -> Self {
+        Self {
+            origin: NEXT_BOOKMARK_ORIGIN.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+
+    pub(super) const fn origin(self) -> u64 {
+        self.origin
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct StoredBookmark<S: Copy> {
+    generation: u64,
+    state: Option<S>,
+}
+
+impl<S: Copy> StoredBookmark<S> {
+    pub(super) const fn new() -> Self {
+        Self {
+            generation: 0,
+            state: None,
+        }
+    }
+
+    pub(super) fn capture(&mut self, origin: u64, state: S) -> Bookmark {
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            self.generation = 1;
+        }
+        self.state = Some(state);
+        Bookmark::from_raw(origin, self.generation)
+    }
+
+    pub(super) const fn current(&self) -> Option<S> {
+        self.state
+    }
+
+    pub(super) fn restore(&self, origin: u64, bookmark: Bookmark) -> crate::Result<S> {
+        if bookmark.origin() != origin {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "Can't rewind to the bookmark: Bookmark does not belong to this buffer."
+            ));
+        }
+        if self.state.is_none() && self.generation == 0 {
+            // This path is mainly defensive for forged or FFI-constructed
+            // bookmarks. Normal Rust callers cannot obtain a matching-origin
+            // bookmark without first capturing one, which advances generation.
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "Can't rewind to the bookmark: No bookmark set."
+            ));
+        }
+        match self.state {
+            Some(state) if self.generation == bookmark.generation() => Ok(state),
+            _ => Err(error::fmt!(
+                InvalidApiCall,
+                "Can't rewind to the bookmark: Bookmark is stale."
+            )),
+        }
+    }
+
+    pub(super) fn clear_if_matches(&mut self, origin: u64, bookmark: Bookmark) {
+        if bookmark.origin() != origin {
+            // `clear_bookmark()` is intentionally a no-op in release builds so
+            // cleanup paths stay idempotent, but we still want debug builds to
+            // catch obvious cross-buffer misuse early.
+            debug_assert_eq!(
+                bookmark.origin(),
+                origin,
+                "attempted to clear a bookmark from a different buffer"
+            );
+            return;
+        }
+        if self.state.is_some() && self.generation == bookmark.generation() {
+            self.state = None;
+        }
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.state = None;
+    }
+}
 
 #[derive(Clone, Debug)]
 enum BufferInner {
@@ -205,7 +333,8 @@ impl Buffer {
     /// Marks the current buffer state so it can later be restored with
     /// [`Buffer::rewind_to_marker`].
     ///
-    /// Setting a new marker replaces the previous one.
+    /// Setting a new marker replaces the currently stored rewind point,
+    /// including one established by [`Buffer::bookmark`].
     pub fn set_marker(&mut self) -> crate::Result<()> {
         match &mut self.inner {
             BufferInner::Ilp(inner) => inner.set_marker(),
@@ -214,9 +343,44 @@ impl Buffer {
         }
     }
 
-    /// Rewinds the buffer to the most recent marker and then clears that marker.
+    /// Captures the current buffer state so it can later be restored with
+    /// [`Buffer::rewind_to_bookmark`].
     ///
-    /// Returns an error if no marker is set.
+    /// Capturing a new bookmark replaces the previous bookmark or marker.
+    pub fn bookmark(&mut self) -> crate::Result<Bookmark> {
+        match &mut self.inner {
+            BufferInner::Ilp(inner) => inner.bookmark(),
+            #[cfg(feature = "_sender-qwp-udp")]
+            BufferInner::Qwp(inner) => inner.bookmark(),
+        }
+    }
+
+    /// Rewinds the buffer to the state referenced by `bookmark` and then
+    /// clears that bookmark.
+    pub fn rewind_to_bookmark(&mut self, bookmark: Bookmark) -> crate::Result<()> {
+        match &mut self.inner {
+            BufferInner::Ilp(inner) => inner.rewind_to_bookmark(bookmark),
+            #[cfg(feature = "_sender-qwp-udp")]
+            BufferInner::Qwp(inner) => inner.rewind_to_bookmark(bookmark),
+        }
+    }
+
+    /// Clears `bookmark` if it is still the currently active bookmark.
+    pub fn clear_bookmark(&mut self, bookmark: Bookmark) {
+        match &mut self.inner {
+            BufferInner::Ilp(inner) => inner.clear_bookmark(bookmark),
+            #[cfg(feature = "_sender-qwp-udp")]
+            BufferInner::Qwp(inner) => inner.clear_bookmark(bookmark),
+        }
+    }
+
+    /// Rewinds the buffer to the currently stored rewind point and then clears
+    /// it.
+    ///
+    /// This may rewind a state established by either [`Buffer::set_marker`] or
+    /// [`Buffer::bookmark`].
+    ///
+    /// Returns an error if no rewind point is set.
     pub fn rewind_to_marker(&mut self) -> crate::Result<()> {
         match &mut self.inner {
             BufferInner::Ilp(inner) => inner.rewind_to_marker(),
@@ -225,7 +389,8 @@ impl Buffer {
         }
     }
 
-    /// Clears the current marker, if any.
+    /// Clears the current stored rewind point, including one established by
+    /// [`Buffer::bookmark`].
     pub fn clear_marker(&mut self) {
         match &mut self.inner {
             BufferInner::Ilp(inner) => inner.clear_marker(),
@@ -467,5 +632,20 @@ impl Buffer {
             #[cfg(feature = "_sender-qwp-udp")]
             BufferInner::Qwp(inner) => inner.at_now(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Bookmark, StoredBookmark};
+    use crate::ErrorCode;
+
+    #[test]
+    fn stored_bookmark_reports_missing_bookmark_when_never_captured() {
+        let bookmark = Bookmark::from_raw(7, 1);
+        let stored = StoredBookmark::<u8>::new();
+        let err = stored.restore(7, bookmark).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert_eq!(err.msg(), "Can't rewind to the bookmark: No bookmark set.");
     }
 }

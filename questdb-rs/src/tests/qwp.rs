@@ -265,6 +265,218 @@ fn qwp_udp_marker_rewind_discards_in_progress_row() -> TestResult {
 }
 
 #[test]
+fn qwp_udp_bookmarks_rewind_rows_and_transactional_state() -> TestResult {
+    let mock = QwpUdpMock::new()?;
+    let sender = mock.sender_builder().build()?;
+    let mut buffer = sender.new_buffer();
+
+    buffer
+        .table("trades")?
+        .symbol("sym", "ETH-USD")?
+        .column_i64("qty", 1)?
+        .at_now()?;
+    assert_eq!(buffer.row_count(), 1);
+    assert!(buffer.transactional());
+
+    let bookmark = buffer.bookmark()?;
+    buffer
+        .table("quotes")?
+        .symbol("sym", "BTC-USD")?
+        .column_i64("qty", 2)?
+        .at_now()?;
+    assert_eq!(buffer.row_count(), 2);
+    assert!(!buffer.transactional());
+
+    buffer.rewind_to_bookmark(bookmark)?;
+    assert_eq!(buffer.row_count(), 1);
+    assert!(buffer.transactional());
+
+    buffer
+        .table("trades")?
+        .symbol("sym", "SOL-USD")?
+        .column_i64("qty", 3)?
+        .at_now()?;
+    assert_eq!(buffer.row_count(), 2);
+    assert!(buffer.transactional());
+
+    Ok(())
+}
+
+#[test]
+fn qwp_udp_bookmark_and_marker_share_one_rewind_point() -> TestResult {
+    let mock = QwpUdpMock::new()?;
+    let sender = mock.sender_builder().build()?;
+    let mut buffer = sender.new_buffer();
+
+    buffer
+        .table("trades")?
+        .symbol("sym", "ETH-USD")?
+        .column_i64("qty", 1)?
+        .at_now()?;
+
+    let first = buffer.bookmark()?;
+    buffer
+        .table("trades")?
+        .symbol("sym", "BTC-USD")?
+        .column_i64("qty", 2)?
+        .at_now()?;
+    let second = buffer.bookmark()?;
+    buffer
+        .table("trades")?
+        .symbol("sym", "SOL-USD")?
+        .column_i64("qty", 3)?
+        .at_now()?;
+
+    let err = buffer.rewind_to_bookmark(first).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert_eq!(err.msg(), "Can't rewind to the bookmark: Bookmark is stale.");
+
+    buffer.rewind_to_bookmark(second)?;
+    assert_eq!(buffer.row_count(), 2);
+
+    let third = buffer.bookmark()?;
+    buffer
+        .table("trades")?
+        .symbol("sym", "XRP-USD")?
+        .column_i64("qty", 4)?
+        .at_now()?;
+    buffer.set_marker()?;
+
+    let err = buffer.rewind_to_bookmark(third).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert_eq!(err.msg(), "Can't rewind to the bookmark: Bookmark is stale.");
+
+    buffer
+        .table("trades")?
+        .symbol("sym", "ADA-USD")?
+        .column_i64("qty", 5)?
+        .at_now()?;
+    buffer.rewind_to_marker()?;
+    assert_eq!(buffer.row_count(), 3);
+
+    let fourth = buffer.bookmark()?;
+    buffer
+        .table("trades")?
+        .symbol("sym", "DOT-USD")?
+        .column_i64("qty", 6)?
+        .at_now()?;
+    buffer.clear_marker();
+    let err = buffer.rewind_to_bookmark(fourth).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert_eq!(err.msg(), "Can't rewind to the bookmark: Bookmark is stale.");
+
+    Ok(())
+}
+
+#[test]
+fn qwp_udp_bookmark_rejects_cross_buffer_use_after_clone() -> TestResult {
+    let mock = QwpUdpMock::new()?;
+    let sender = mock.sender_builder().build()?;
+    let mut original = sender.new_buffer();
+
+    original
+        .table("trades")?
+        .symbol("sym", "ETH-USD")?
+        .column_i64("qty", 1)?
+        .at_now()?;
+
+    let original_bookmark = original.bookmark()?;
+    let mut cloned = original.clone();
+
+    let err = cloned.rewind_to_bookmark(original_bookmark).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert_eq!(
+        err.msg(),
+        "Can't rewind to the bookmark: Bookmark does not belong to this buffer."
+    );
+
+    original
+        .table("trades")?
+        .symbol("sym", "BTC-USD")?
+        .column_i64("qty", 2)?
+        .at_now()?;
+    original.rewind_to_bookmark(original_bookmark)?;
+    assert_eq!(original.row_count(), 1);
+
+    let clone_bookmark = cloned.bookmark()?;
+    cloned
+        .table("trades")?
+        .symbol("sym", "SOL-USD")?
+        .column_i64("qty", 3)?
+        .at_now()?;
+    cloned.rewind_to_bookmark(clone_bookmark)?;
+    assert_eq!(cloned.row_count(), 1);
+
+    Ok(())
+}
+
+#[test]
+fn qwp_udp_clone_preserves_marker_rewind_state() -> TestResult {
+    let mock = QwpUdpMock::new()?;
+    let sender = mock.sender_builder().build()?;
+    let mut original = sender.new_buffer();
+
+    original
+        .table("trades")?
+        .symbol("sym", "ETH-USD")?
+        .column_i64("qty", 1)?
+        .at_now()?;
+    original.set_marker()?;
+    original
+        .table("trades")?
+        .symbol("sym", "BTC-USD")?
+        .column_i64("qty", 2)?
+        .at_now()?;
+
+    let mut cloned = original.clone();
+    cloned
+        .table("trades")?
+        .symbol("sym", "SOL-USD")?
+        .column_i64("qty", 3)?
+        .at_now()?;
+    cloned.rewind_to_marker()?;
+
+    assert_eq!(cloned.row_count(), 1);
+    assert_eq!(original.row_count(), 2);
+
+    Ok(())
+}
+
+#[test]
+fn qwp_udp_clear_bookmark_is_idempotent() -> TestResult {
+    let mock = QwpUdpMock::new()?;
+    let sender = mock.sender_builder().build()?;
+    let mut buffer = sender.new_buffer();
+
+    buffer
+        .table("trades")?
+        .symbol("sym", "ETH-USD")?
+        .column_i64("qty", 1)?
+        .at_now()?;
+    let cleared = buffer.bookmark()?;
+    buffer.clear_bookmark(cleared);
+    buffer.clear_bookmark(cleared);
+    let err = buffer.rewind_to_bookmark(cleared).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert_eq!(err.msg(), "Can't rewind to the bookmark: Bookmark is stale.");
+
+    let rewound = buffer.bookmark()?;
+    buffer
+        .table("trades")?
+        .symbol("sym", "BTC-USD")?
+        .column_i64("qty", 2)?
+        .at_now()?;
+    buffer.rewind_to_bookmark(rewound)?;
+    buffer.clear_bookmark(rewound);
+    buffer.clear_bookmark(rewound);
+    let err = buffer.rewind_to_bookmark(rewound).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert_eq!(err.msg(), "Can't rewind to the bookmark: Bookmark is stale.");
+
+    Ok(())
+}
+
+#[test]
 fn qwp_udp_rejects_marker_set_mid_row() -> TestResult {
     let mock = QwpUdpMock::new()?;
     let sender = mock.sender_builder().build()?;
@@ -276,6 +488,51 @@ fn qwp_udp_rejects_marker_set_mid_row() -> TestResult {
         ErrorCode::InvalidApiCall,
         "Can't set the marker whilst constructing a line.",
     );
+
+    Ok(())
+}
+
+#[test]
+fn qwp_udp_rejects_bookmark_set_mid_row() -> TestResult {
+    let mock = QwpUdpMock::new()?;
+    let sender = mock.sender_builder().build()?;
+    let mut buffer = sender.new_buffer();
+
+    buffer.table("trades")?.symbol("sym", "ETH-USD")?;
+    let err = buffer.bookmark().unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert_eq!(
+        err.msg(),
+        "Can't set the bookmark whilst constructing a line. A bookmark may only be set on an empty buffer or after `at` or `at_now` is called."
+    );
+
+    Ok(())
+}
+
+#[test]
+fn qwp_udp_successful_flush_invalidates_bookmark() -> TestResult {
+    let mock = QwpUdpMock::new()?;
+    let mut sender = mock.sender_builder().build()?;
+    let mut buffer = sender.new_buffer();
+
+    buffer
+        .table("trades")?
+        .symbol("sym", "ETH-USD")?
+        .column_i64("qty", 1)?
+        .at_now()?;
+    let bookmark = buffer.bookmark()?;
+    buffer
+        .table("trades")?
+        .symbol("sym", "BTC-USD")?
+        .column_i64("qty", 2)?
+        .at_now()?;
+
+    sender.flush(&mut buffer)?;
+    assert!(buffer.is_empty());
+
+    let err = buffer.rewind_to_bookmark(bookmark).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert_eq!(err.msg(), "Can't rewind to the bookmark: Bookmark is stale.");
 
     Ok(())
 }
@@ -301,6 +558,39 @@ fn qwp_udp_flush_and_keep_resends_rows() -> TestResult {
     let second = mock.recv_datagram()?;
     assert_eq!(first, second);
     assert!(buffer.is_empty());
+
+    Ok(())
+}
+
+#[test]
+fn qwp_udp_failed_flush_preserves_bookmark() -> TestResult {
+    let max = 1024;
+    let mock = QwpUdpMock::new()?;
+    let mut sender = mock.sender_builder().max_buf_size(max)?.build()?;
+    let mut buffer = sender.new_buffer();
+
+    buffer
+        .table("trades")?
+        .symbol("sym", "ETH-USD")?
+        .column_i64("qty", 1)?
+        .at_now()?;
+    let bookmark = buffer.bookmark()?;
+
+    while buffer.len() < max {
+        buffer
+            .table("trades")?
+            .symbol("sym", "BTC-USD")?
+            .column_i64("qty", 2)?
+            .at_now()?;
+    }
+
+    let err = sender.flush(&mut buffer).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert!(err.msg().contains("Could not flush buffer: QWP buffer size hint"));
+
+    buffer.rewind_to_bookmark(bookmark)?;
+    assert_eq!(buffer.row_count(), 1);
+    assert!(buffer.transactional());
 
     Ok(())
 }

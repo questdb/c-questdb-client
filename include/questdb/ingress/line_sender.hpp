@@ -29,6 +29,26 @@
 
 namespace questdb::ingress
 {
+class buffer_bookmark
+{
+public:
+    /** Default-constructed bookmarks are intentionally invalid. */
+    buffer_bookmark() noexcept
+        : _impl{0, 0}
+    {
+    }
+
+private:
+    explicit buffer_bookmark(::line_sender_bookmark impl) noexcept
+        : _impl{impl}
+    {
+    }
+
+    ::line_sender_bookmark _impl;
+
+    friend class line_sender_buffer;
+};
+
 class line_sender_buffer
 {
 public:
@@ -216,10 +236,48 @@ public:
     }
 
     /**
+     * Capture a bookmark for the current buffer state.
+     *
+     * Capturing a new bookmark replaces the previously stored bookmark or
+     * marker.
+     */
+    buffer_bookmark bookmark()
+    {
+        may_init();
+        ::line_sender_bookmark out{};
+        ::line_sender_error* c_err{nullptr};
+        if (::line_sender_buffer_bookmark(_impl, &out, &c_err))
+            return buffer_bookmark{out};
+        throw line_sender_error::from_c(c_err);
+    }
+
+    /**
+     * Rewind the buffer to a previously captured bookmark.
+     *
+     * On success, the stored bookmark is consumed.
+     */
+    void rewind_to_bookmark(buffer_bookmark bookmark)
+    {
+        may_init();
+        line_sender_error::wrapped_call(
+            ::line_sender_buffer_rewind_to_bookmark, _impl, bookmark._impl);
+    }
+
+    /**
+     * Discard a previously captured bookmark if it is still current.
+     */
+    void clear_bookmark(buffer_bookmark bookmark) noexcept
+    {
+        if (_impl)
+            ::line_sender_buffer_clear_bookmark(_impl, bookmark._impl);
+    }
+
+    /**
      * Mark a rewind point.
      * This allows undoing accumulated changes to the buffer for one or more
      * rows by calling `rewind_to_marker`.
-     * Any previous marker will be discarded.
+     * Any previously stored rewind point will be discarded, including one
+     * established by `bookmark()`.
      * Once the marker is no longer needed, call `clear_marker`.
      */
     void set_marker()
@@ -229,8 +287,12 @@ public:
     }
 
     /**
-     * Undo all changes since the last `set_marker` call.
-     * As a side-effect, this also clears the marker.
+     * Undo all changes since the currently stored rewind point was captured.
+     *
+     * This may rewind a state established by either `set_marker()` or
+     * `bookmark()`.
+     *
+     * As a side-effect, this also clears the stored rewind point.
      */
     void rewind_to_marker()
     {
@@ -239,7 +301,10 @@ public:
             ::line_sender_buffer_rewind_to_marker, _impl);
     }
 
-    /** Discard the marker. */
+    /**
+     * Discard the current stored rewind point, including one established by
+     * `bookmark()`.
+     */
     void clear_marker() noexcept
     {
         if (_impl)
