@@ -34,7 +34,6 @@ struct QwpMessageHeader {
 
 const HEADER_SIZE: usize = std::mem::size_of::<QwpMessageHeader>();
 const _: () = assert!(HEADER_SIZE == 12);
-const NULLABLE_FLAG: u8 = 0x80;
 const TYPE_BOOLEAN: u8 = 0x01;
 const TYPE_LONG: u8 = 0x05;
 const TYPE_DOUBLE: u8 = 0x07;
@@ -194,6 +193,13 @@ pub(crate) fn decode_datagram(bytes: &[u8]) -> Result<DecodedDatagram, String> {
     let row_count = decoder.read_varint()?;
     let column_count = decoder.read_varint()? as usize;
     let schema_mode = decoder.read_u8()?;
+    if schema_mode != 0 {
+        return Err(format!(
+            "decoder only supports full inline schemas, got schema mode {}",
+            schema_mode
+        ));
+    }
+    let _schema_id = decoder.read_varint()?;
 
     let mut columns = Vec::with_capacity(column_count);
     for _ in 0..column_count {
@@ -201,8 +207,8 @@ pub(crate) fn decode_datagram(bytes: &[u8]) -> Result<DecodedDatagram, String> {
         let type_code = decoder.read_u8()?;
         columns.push(DecodedColumn {
             name,
-            type_code: type_code & !NULLABLE_FLAG,
-            nullable: type_code & NULLABLE_FLAG != 0,
+            type_code,
+            nullable: false,
         });
     }
 
@@ -210,8 +216,10 @@ pub(crate) fn decode_datagram(bytes: &[u8]) -> Result<DecodedDatagram, String> {
         .try_into()
         .map_err(|_| format!("row count {} does not fit into usize", row_count))?;
     let mut column_values = Vec::with_capacity(column_count);
-    for column in &columns {
-        let has_value = if column.nullable {
+    for column in &mut columns {
+        let has_null_bitmap = decoder.read_u8()? != 0;
+        column.nullable = has_null_bitmap;
+        let has_value = if has_null_bitmap {
             let bitmap_size = row_count_usize.div_ceil(8);
             let bitmap = decoder.read_exact(bitmap_size)?;
             (0..row_count_usize)

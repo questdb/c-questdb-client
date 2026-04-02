@@ -575,8 +575,9 @@ Proposed behavior:
   active size-hint planners used on the row-commit hot path
 * at minimum it reserves `name_bytes`, `value_bytes`, `rows`, `entries`, and
   `segments`
-* reserve calculations should use conservative worst-case bounds derived from
-  `additional` bytes of eventual encoded payload
+* reserve calculations are heuristic for QWP and trade precision for bounded
+  upfront memory; dense shapes such as packed booleans may still grow past the
+  first estimate during warmup
 * sender construction separately prewarms `scratch.datagram` and the active
   datagram-scratch planner vectors from configured `max_datagram_size`
 * the retained completed-planner pool is still topology-driven: workloads that
@@ -594,8 +595,8 @@ The important guarantees are:
 
 * `clear()` does not throw away retained QWP capacity
 * after `reserve()`, sender prewarm, and any first-use warmup needed to
-  populate the retained planner pool for a bounded workload, hot-path batches
-  do not need further heap growth
+  establish the workload's retained planner and row-shape envelope, hot-path
+  batches do not need further heap growth
 
 Before prewarm or reserve, vector growth is still allowed. Those allocations are
 acceptable outside steady state. Implementation may use `try_reserve` where it

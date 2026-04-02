@@ -428,7 +428,10 @@ fn qwpudp_auth_settings_are_rejected_at_build() {
         "qwpudp::addr=localhost;token=token123;",
         "qwpudp::addr=localhost;username=user123;token=token123;",
     ] {
-        assert_conf_err(SenderBuilder::from_conf(conf).unwrap().build(), EXPECTED_ERR_MSG);
+        assert_conf_err(
+            SenderBuilder::from_conf(conf).unwrap().build(),
+            EXPECTED_ERR_MSG,
+        );
     }
 
     #[cfg(feature = "sync-sender-tcp")]
@@ -437,7 +440,10 @@ fn qwpudp_auth_settings_are_rejected_at_build() {
         "qwpudp::addr=localhost;token_y=pub_key2;",
         "qwpudp::addr=localhost;username=key_id123;token=priv_key123;token_x=pub_key1;token_y=pub_key2;",
     ] {
-        assert_conf_err(SenderBuilder::from_conf(conf).unwrap().build(), EXPECTED_ERR_MSG);
+        assert_conf_err(
+            SenderBuilder::from_conf(conf).unwrap().build(),
+            EXPECTED_ERR_MSG,
+        );
     }
 }
 

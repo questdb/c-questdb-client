@@ -115,10 +115,13 @@ impl Buffer {
         }
     }
 
-    /// Reserves capacity for at least `additional` more bytes of buffered data.
+    /// Reserves capacity associated with `additional` more bytes of buffered data.
     ///
-    /// For QWP/UDP buffers this reserves internal arena capacity used during
-    /// datagram planning and encoding.
+    /// For ILP buffers this reserves exact serialized-byte capacity. For
+    /// QWP/UDP buffers this is a heuristic prewarm of the internal arenas and
+    /// planner scratch used during datagram planning and encoding; it is not an
+    /// exact guarantee that [`Buffer::len`] can grow by `additional` bytes
+    /// without further allocation.
     pub fn reserve(&mut self, additional: usize) {
         match &mut self.inner {
             BufferInner::Ilp(inner) => inner.reserve(additional),

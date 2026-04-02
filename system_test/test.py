@@ -1248,6 +1248,13 @@ class TestQwpUdpSender(unittest.TestCase):
             secs, datetime.timezone.utc).replace(
             microsecond=remaining_us).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
 
+    @staticmethod
+    def _nanos_to_qdb_date(timestamp_ns):
+        secs, remaining_ns = divmod(timestamp_ns, 1_000_000_000)
+        base = datetime.datetime.fromtimestamp(
+            secs, datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S')
+        return f'{base}.{remaining_ns:09d}Z'
+
     def _require_qwp_udp_system_test(self):
         # TODO: Remove this repo-only gate once QWP/UDP receiver support is
         # available in released QuestDB builds.
@@ -1451,7 +1458,7 @@ class TestQwpUdpSender(unittest.TestCase):
         self._require_qwp_udp_system_test()
 
         table_name = 'q' + uuid.uuid4().hex[:8]
-        with self._mk_qwpudp_sender(max_datagram_size=55) as sender:
+        with self._mk_qwpudp_sender(max_datagram_size=58) as sender:
             (sender
              .table(table_name)
              .symbol('sym', 'ETH-USD')
@@ -1674,6 +1681,239 @@ class TestQwpUdpSender(unittest.TestCase):
                 ['r3', None],
             ])
 
+    def test_timestamp_nanos_columns_round_trip_over_qwp_udp(self):
+        self._require_qwp_udp_system_test()
+
+        table_name = 'qwp_nts_' + uuid.uuid4().hex[:8]
+        event_ts_ns = 123_456_789
+        with self._mk_qwpudp_sender() as sender:
+            (sender
+             .table(table_name)
+             .symbol('host', 'r1')
+             .at_now())
+            (sender
+             .table(table_name)
+             .symbol('host', 'r2')
+             .column('event_ts', qls.TimestampNanos(event_ts_ns))
+             .at_now())
+            (sender
+             .table(table_name)
+             .symbol('host', 'r3')
+             .at_now())
+            sender.flush()
+
+        resp = retry_check_table(table_name, min_rows=3, timeout_sec=30)
+        self.assertEqual(
+            resp['columns'],
+            [
+                {'name': 'host', 'type': 'SYMBOL'},
+                {'name': 'event_ts', 'type': 'TIMESTAMP_NS'},
+                {'name': 'timestamp', 'type': 'TIMESTAMP'},
+            ])
+        self.assertEqual(
+            sorted(row[:-1] for row in resp['dataset']),
+            [
+                ['r1', None],
+                ['r2', self._nanos_to_qdb_date(event_ts_ns)],
+                ['r3', None],
+            ])
+
+    def test_timestamp_micros_column_converts_into_existing_timestamp_ns_column_over_qwp_udp(self):
+        self._require_qwp_udp_system_test()
+
+        table_name = 'qwp_cmu_' + uuid.uuid4().hex[:8]
+        event_ts_us = 123_456
+        row_ts_us = 1_700_000_000_000_123
+        sql_query(
+            f'''CREATE TABLE "{table_name}" (
+                    host SYMBOL,
+                    event_ts TIMESTAMP_NS,
+                    timestamp TIMESTAMP
+                ) TIMESTAMP(timestamp) PARTITION BY DAY;''')
+
+        with self._mk_qwpudp_sender() as sender:
+            (sender
+             .table(table_name)
+             .symbol('host', 'r1')
+             .column('event_ts', qls.TimestampMicros(event_ts_us))
+             .at_micros(row_ts_us))
+            sender.flush()
+
+        resp = retry_check_table(table_name, min_rows=1, timeout_sec=30)
+        self.assertEqual(
+            resp['columns'],
+            [
+                {'name': 'host', 'type': 'SYMBOL'},
+                {'name': 'event_ts', 'type': 'TIMESTAMP_NS'},
+                {'name': 'timestamp', 'type': 'TIMESTAMP'},
+            ])
+        self.assertEqual(
+            resp['dataset'],
+            [['r1', self._nanos_to_qdb_date(event_ts_us * 1000), self._micros_to_qdb_date(row_ts_us)]])
+
+    def test_timestamp_nanos_column_converts_into_existing_timestamp_column_over_qwp_udp(self):
+        self._require_qwp_udp_system_test()
+
+        table_name = 'qwp_cnu_' + uuid.uuid4().hex[:8]
+        event_ts_ns = 123_456_789
+        row_ts_us = 1_700_000_000_000_456
+        sql_query(
+            f'''CREATE TABLE "{table_name}" (
+                    host SYMBOL,
+                    event_ts TIMESTAMP,
+                    timestamp TIMESTAMP
+                ) TIMESTAMP(timestamp) PARTITION BY DAY;''')
+
+        with self._mk_qwpudp_sender() as sender:
+            (sender
+             .table(table_name)
+             .symbol('host', 'r1')
+             .column('event_ts', qls.TimestampNanos(event_ts_ns))
+             .at_micros(row_ts_us))
+            sender.flush()
+
+        resp = retry_check_table(table_name, min_rows=1, timeout_sec=30)
+        self.assertEqual(
+            resp['columns'],
+            [
+                {'name': 'host', 'type': 'SYMBOL'},
+                {'name': 'event_ts', 'type': 'TIMESTAMP'},
+                {'name': 'timestamp', 'type': 'TIMESTAMP'},
+            ])
+        self.assertEqual(
+            resp['dataset'],
+            [['r1', self._micros_to_qdb_date(event_ts_ns // 1000), self._micros_to_qdb_date(row_ts_us)]])
+
+    def test_designated_timestamp_nanos_round_trip_over_qwp_udp(self):
+        self._require_qwp_udp_system_test()
+
+        table_name = 'qwp_dtns_' + uuid.uuid4().hex[:8]
+        row_ts_ns = 1_700_000_000_000_000_123
+        with self._mk_qwpudp_sender() as sender:
+            (sender
+             .table(table_name)
+             .symbol('host', 'nano-row')
+             .column('qty', 7)
+             .at(row_ts_ns))
+            sender.flush()
+
+        resp = retry_check_table(table_name, min_rows=1, timeout_sec=30)
+        self.assertEqual(
+            resp['columns'],
+            [
+                {'name': 'host', 'type': 'SYMBOL'},
+                {'name': 'qty', 'type': 'LONG'},
+                {'name': 'timestamp', 'type': 'TIMESTAMP_NS'},
+            ])
+        self.assertEqual(
+            resp['dataset'],
+            [['nano-row', 7, self._nanos_to_qdb_date(row_ts_ns)]])
+
+    def test_designated_timestamp_micros_converts_into_existing_timestamp_ns_table_over_qwp_udp(self):
+        self._require_qwp_udp_system_test()
+
+        table_name = 'qwp_dtmu_' + uuid.uuid4().hex[:8]
+        row_ts_us = 1_700_000_000_000_123
+        sql_query(
+            f'''CREATE TABLE "{table_name}" (
+                    host SYMBOL,
+                    qty LONG,
+                    timestamp TIMESTAMP_NS
+                ) TIMESTAMP(timestamp) PARTITION BY DAY;''')
+
+        with self._mk_qwpudp_sender() as sender:
+            (sender
+             .table(table_name)
+             .symbol('host', 'micro-row')
+             .column('qty', 7)
+             .at_micros(row_ts_us))
+            sender.flush()
+
+        resp = retry_check_table(table_name, min_rows=1, timeout_sec=30)
+        self.assertEqual(
+            resp['columns'],
+            [
+                {'name': 'host', 'type': 'SYMBOL'},
+                {'name': 'qty', 'type': 'LONG'},
+                {'name': 'timestamp', 'type': 'TIMESTAMP_NS'},
+            ])
+        self.assertEqual(
+            resp['dataset'],
+            [['micro-row', 7, self._nanos_to_qdb_date(row_ts_us * 1000)]])
+
+    def test_designated_timestamp_nanos_converts_into_existing_timestamp_table_over_qwp_udp(self):
+        self._require_qwp_udp_system_test()
+
+        table_name = 'qwp_dtnu_' + uuid.uuid4().hex[:8]
+        row_ts_ns = 1_700_000_000_000_456_789
+        sql_query(
+            f'''CREATE TABLE "{table_name}" (
+                    host SYMBOL,
+                    qty LONG,
+                    timestamp TIMESTAMP
+                ) TIMESTAMP(timestamp) PARTITION BY DAY;''')
+
+        with self._mk_qwpudp_sender() as sender:
+            (sender
+             .table(table_name)
+             .symbol('host', 'nano-row')
+             .column('qty', 7)
+             .at(row_ts_ns))
+            sender.flush()
+
+        resp = retry_check_table(table_name, min_rows=1, timeout_sec=30)
+        self.assertEqual(
+            resp['columns'],
+            [
+                {'name': 'host', 'type': 'SYMBOL'},
+                {'name': 'qty', 'type': 'LONG'},
+                {'name': 'timestamp', 'type': 'TIMESTAMP'},
+            ])
+        self.assertEqual(
+            resp['dataset'],
+            [['nano-row', 7, self._micros_to_qdb_date(row_ts_ns // 1000)]])
+
+    def test_utf8_and_empty_varchar_values_round_trip_over_qwp_udp(self):
+        self._require_qwp_udp_system_test()
+
+        table_name = 'qwp_utf8_' + uuid.uuid4().hex[:8]
+        with self._mk_qwpudp_sender() as sender:
+            (sender
+             .table(table_name)
+             .symbol('host', 'r1')
+             .symbol('label', 'm\u00fcnchen')
+             .column('note', '')
+             .at_micros(1_700_000_000_000_001))
+            (sender
+             .table(table_name)
+             .symbol('host', 'r2')
+             .symbol('label', '\u6771\u4eac')
+             .column('note', 'na\u00efve caf\u00e9')
+             .at_micros(1_700_000_000_000_002))
+            (sender
+             .table(table_name)
+             .symbol('host', 'r3')
+             .symbol('label', '\u043f\u0440\u0438\u0432\u0435\u0442')
+             .at_micros(1_700_000_000_000_003))
+            sender.flush()
+
+        retry_check_table(table_name, min_rows=3, timeout_sec=30)
+        resp = sql_query(f"select host, label, note from '{table_name}' order by host")
+        self.assertEqual(
+            resp['columns'],
+            [
+                {'name': 'host', 'type': 'SYMBOL'},
+                {'name': 'label', 'type': 'SYMBOL'},
+                {'name': 'note', 'type': 'VARCHAR'},
+            ])
+        self.assertEqual(
+            resp['dataset'],
+            [
+                ['r1', 'm\u00fcnchen', ''],
+                ['r2', '\u6771\u4eac', 'na\u00efve caf\u00e9'],
+                ['r3', '\u043f\u0440\u0438\u0432\u0435\u0442', None],
+            ])
+
     def test_transactional_flush_flag_is_rejected_for_qwp_udp(self):
         self._require_qwp_udp_system_test()
 
@@ -1729,7 +1969,9 @@ class TestQwpUdpSender(unittest.TestCase):
         self._require_qwp_udp_system_test()
 
         table_name = 'qwp_dts_' + uuid.uuid4().hex[:8]
-        with self.assertRaisesRegex(qls.SenderError, r'QWP/UDP column "" changes type within a batched table'):
+        with self.assertRaisesRegex(
+                qls.SenderError,
+                r'QWP/UDP designated timestamp changes type within a batched table'):
             with self._mk_qwpudp_sender() as sender:
                 (sender
                  .table(table_name)
