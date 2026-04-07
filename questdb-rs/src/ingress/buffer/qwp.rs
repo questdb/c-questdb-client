@@ -2060,6 +2060,9 @@ fn bitmap_bytes(value_count: usize) -> usize {
 }
 
 fn kind_supports_sparse_nulls(kind: ColumnKind) -> bool {
+    // QuestDB BOOLEAN is non-nullable, so sparse/missing bool values are
+    // encoded via the packed payload as `false` rather than through a null
+    // bitmap. Only the types below preserve sparse nulls explicitly.
     matches!(
         kind,
         ColumnKind::Symbol
