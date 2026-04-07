@@ -28,9 +28,9 @@ mod op_state;
 #[cfg(feature = "_sender-qwp-udp")]
 mod qwp;
 
-use crate::{Error, error};
 use crate::ingress::ndarr::ArrayElementSealed;
 use crate::ingress::{ArrayElement, DecimalView, NdArrayView, ProtocolVersion, Timestamp};
+use crate::{Error, error};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) use self::ilp::Buffer as IlpBuffer;

@@ -564,10 +564,9 @@ impl Buffer {
     /// Capture a bookmark for the current buffer state.
     pub fn bookmark(&mut self) -> crate::Result<Bookmark> {
         self.state.op_state.ensure_bookmark_can_be_set()?;
-        Ok(self.bookmark.capture(
-            self.bookmark_meta.origin(),
-            self.snapshot_bookmark_state(),
-        ))
+        Ok(self
+            .bookmark
+            .capture(self.bookmark_meta.origin(), self.snapshot_bookmark_state()))
     }
 
     pub fn rewind_to_bookmark(&mut self, bookmark: Bookmark) -> crate::Result<()> {

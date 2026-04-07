@@ -329,7 +329,10 @@ fn qwp_udp_bookmark_and_marker_share_one_rewind_point() -> TestResult {
 
     let err = buffer.rewind_to_bookmark(first).unwrap_err();
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
-    assert_eq!(err.msg(), "Can't rewind to the bookmark: Bookmark is stale.");
+    assert_eq!(
+        err.msg(),
+        "Can't rewind to the bookmark: Bookmark is stale."
+    );
 
     buffer.rewind_to_bookmark(second)?;
     assert_eq!(buffer.row_count(), 2);
@@ -344,7 +347,10 @@ fn qwp_udp_bookmark_and_marker_share_one_rewind_point() -> TestResult {
 
     let err = buffer.rewind_to_bookmark(third).unwrap_err();
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
-    assert_eq!(err.msg(), "Can't rewind to the bookmark: Bookmark is stale.");
+    assert_eq!(
+        err.msg(),
+        "Can't rewind to the bookmark: Bookmark is stale."
+    );
 
     buffer
         .table("trades")?
@@ -363,7 +369,10 @@ fn qwp_udp_bookmark_and_marker_share_one_rewind_point() -> TestResult {
     buffer.clear_marker();
     let err = buffer.rewind_to_bookmark(fourth).unwrap_err();
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
-    assert_eq!(err.msg(), "Can't rewind to the bookmark: Bookmark is stale.");
+    assert_eq!(
+        err.msg(),
+        "Can't rewind to the bookmark: Bookmark is stale."
+    );
 
     Ok(())
 }
@@ -458,7 +467,10 @@ fn qwp_udp_clear_bookmark_is_idempotent() -> TestResult {
     buffer.clear_bookmark(cleared);
     let err = buffer.rewind_to_bookmark(cleared).unwrap_err();
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
-    assert_eq!(err.msg(), "Can't rewind to the bookmark: Bookmark is stale.");
+    assert_eq!(
+        err.msg(),
+        "Can't rewind to the bookmark: Bookmark is stale."
+    );
 
     let rewound = buffer.bookmark()?;
     buffer
@@ -471,7 +483,10 @@ fn qwp_udp_clear_bookmark_is_idempotent() -> TestResult {
     buffer.clear_bookmark(rewound);
     let err = buffer.rewind_to_bookmark(rewound).unwrap_err();
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
-    assert_eq!(err.msg(), "Can't rewind to the bookmark: Bookmark is stale.");
+    assert_eq!(
+        err.msg(),
+        "Can't rewind to the bookmark: Bookmark is stale."
+    );
 
     Ok(())
 }
@@ -532,7 +547,10 @@ fn qwp_udp_successful_flush_invalidates_bookmark() -> TestResult {
 
     let err = buffer.rewind_to_bookmark(bookmark).unwrap_err();
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
-    assert_eq!(err.msg(), "Can't rewind to the bookmark: Bookmark is stale.");
+    assert_eq!(
+        err.msg(),
+        "Can't rewind to the bookmark: Bookmark is stale."
+    );
 
     Ok(())
 }
@@ -586,7 +604,10 @@ fn qwp_udp_failed_flush_preserves_bookmark() -> TestResult {
 
     let err = sender.flush(&mut buffer).unwrap_err();
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
-    assert!(err.msg().contains("Could not flush buffer: QWP buffer size hint"));
+    assert!(
+        err.msg()
+            .contains("Could not flush buffer: QWP buffer size hint")
+    );
 
     buffer.rewind_to_bookmark(bookmark)?;
     assert_eq!(buffer.row_count(), 1);

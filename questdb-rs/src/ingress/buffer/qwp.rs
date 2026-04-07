@@ -574,7 +574,9 @@ impl QwpBuffer {
     }
 
     pub(crate) fn rewind_to_bookmark(&mut self, bookmark: Bookmark) -> crate::Result<()> {
-        let marker = self.bookmark.restore(self.bookmark_meta.origin(), bookmark)?;
+        let marker = self
+            .bookmark
+            .restore(self.bookmark_meta.origin(), bookmark)?;
         self.rewind_to_state(marker)
     }
 
@@ -584,7 +586,10 @@ impl QwpBuffer {
     }
 
     pub(crate) fn rewind_to_marker(&mut self) -> crate::Result<()> {
-        let marker = self.bookmark.current().ok_or_else(OpState::missing_marker_error)?;
+        let marker = self
+            .bookmark
+            .current()
+            .ok_or_else(OpState::missing_marker_error)?;
         self.rewind_to_state(marker)
     }
 

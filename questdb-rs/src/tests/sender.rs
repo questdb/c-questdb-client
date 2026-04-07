@@ -506,7 +506,10 @@ fn test_bookmark_and_marker_share_one_rewind_point() -> TestResult {
 
     let err = buffer.rewind_to_bookmark(first).unwrap_err();
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
-    assert_eq!(err.msg(), "Can't rewind to the bookmark: Bookmark is stale.");
+    assert_eq!(
+        err.msg(),
+        "Can't rewind to the bookmark: Bookmark is stale."
+    );
 
     buffer.rewind_to_bookmark(second)?;
     assert_eq!(buffer.row_count(), 2);
@@ -517,7 +520,10 @@ fn test_bookmark_and_marker_share_one_rewind_point() -> TestResult {
 
     let err = buffer.rewind_to_bookmark(third).unwrap_err();
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
-    assert_eq!(err.msg(), "Can't rewind to the bookmark: Bookmark is stale.");
+    assert_eq!(
+        err.msg(),
+        "Can't rewind to the bookmark: Bookmark is stale."
+    );
 
     buffer.table("trades")?.symbol("sym", "ADA-USD")?.at_now()?;
     buffer.rewind_to_marker()?;
@@ -528,7 +534,10 @@ fn test_bookmark_and_marker_share_one_rewind_point() -> TestResult {
     buffer.clear_marker();
     let err = buffer.rewind_to_bookmark(fourth).unwrap_err();
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
-    assert_eq!(err.msg(), "Can't rewind to the bookmark: Bookmark is stale.");
+    assert_eq!(
+        err.msg(),
+        "Can't rewind to the bookmark: Bookmark is stale."
+    );
 
     Ok(())
 }
@@ -536,7 +545,10 @@ fn test_bookmark_and_marker_share_one_rewind_point() -> TestResult {
 #[test]
 fn test_bookmark_rejects_cross_buffer_use_after_clone() -> TestResult {
     let mut original = Buffer::new(ProtocolVersion::V2);
-    original.table("trades")?.symbol("sym", "ETH-USD")?.at_now()?;
+    original
+        .table("trades")?
+        .symbol("sym", "ETH-USD")?
+        .at_now()?;
 
     let original_bookmark = original.bookmark()?;
     let mut cloned = original.clone();
@@ -548,7 +560,10 @@ fn test_bookmark_rejects_cross_buffer_use_after_clone() -> TestResult {
         "Can't rewind to the bookmark: Bookmark does not belong to this buffer."
     );
 
-    original.table("trades")?.symbol("sym", "BTC-USD")?.at_now()?;
+    original
+        .table("trades")?
+        .symbol("sym", "BTC-USD")?
+        .at_now()?;
     original.rewind_to_bookmark(original_bookmark)?;
     assert_eq!(original.row_count(), 1);
 
@@ -563,9 +578,15 @@ fn test_bookmark_rejects_cross_buffer_use_after_clone() -> TestResult {
 #[test]
 fn test_clone_preserves_marker_rewind_state() -> TestResult {
     let mut original = Buffer::new(ProtocolVersion::V2);
-    original.table("trades")?.symbol("sym", "ETH-USD")?.at_now()?;
+    original
+        .table("trades")?
+        .symbol("sym", "ETH-USD")?
+        .at_now()?;
     original.set_marker()?;
-    original.table("trades")?.symbol("sym", "BTC-USD")?.at_now()?;
+    original
+        .table("trades")?
+        .symbol("sym", "BTC-USD")?
+        .at_now()?;
 
     let mut cloned = original.clone();
     cloned.table("trades")?.symbol("sym", "SOL-USD")?.at_now()?;
@@ -588,7 +609,10 @@ fn test_clear_bookmark_is_idempotent() -> TestResult {
     buffer.clear_bookmark(cleared);
     let err = buffer.rewind_to_bookmark(cleared).unwrap_err();
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
-    assert_eq!(err.msg(), "Can't rewind to the bookmark: Bookmark is stale.");
+    assert_eq!(
+        err.msg(),
+        "Can't rewind to the bookmark: Bookmark is stale."
+    );
 
     let rewound = buffer.bookmark()?;
     buffer.table("trades")?.symbol("sym", "BTC-USD")?.at_now()?;
@@ -597,7 +621,10 @@ fn test_clear_bookmark_is_idempotent() -> TestResult {
     buffer.clear_bookmark(rewound);
     let err = buffer.rewind_to_bookmark(rewound).unwrap_err();
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
-    assert_eq!(err.msg(), "Can't rewind to the bookmark: Bookmark is stale.");
+    assert_eq!(
+        err.msg(),
+        "Can't rewind to the bookmark: Bookmark is stale."
+    );
 
     Ok(())
 }
@@ -606,7 +633,10 @@ fn test_clear_bookmark_is_idempotent() -> TestResult {
 #[test]
 fn test_successful_flush_invalidates_bookmark() -> TestResult {
     let mut server = MockServer::new()?;
-    let mut sender = server.lsb_tcp().protocol_version(ProtocolVersion::V2)?.build()?;
+    let mut sender = server
+        .lsb_tcp()
+        .protocol_version(ProtocolVersion::V2)?
+        .build()?;
     server.accept()?;
 
     let mut buffer = sender.new_buffer();
@@ -619,7 +649,10 @@ fn test_successful_flush_invalidates_bookmark() -> TestResult {
 
     let err = buffer.rewind_to_bookmark(bookmark).unwrap_err();
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
-    assert_eq!(err.msg(), "Can't rewind to the bookmark: Bookmark is stale.");
+    assert_eq!(
+        err.msg(),
+        "Can't rewind to the bookmark: Bookmark is stale."
+    );
 
     Ok(())
 }

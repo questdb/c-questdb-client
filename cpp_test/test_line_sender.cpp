@@ -216,9 +216,13 @@ public:
         // single-threaded test code and the value is immediately
         // copied into a std::string, so it's safe here.
 #ifdef _MSC_VER
-#pragma warning(suppress: 4996)
+#pragma warning(push)
+#pragma warning(disable: 4996)
 #endif
         if (const char* old_value = std::getenv(name))
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
             _old_value = old_value;
         REQUIRE(qdb_test_set_env_var(name, value.c_str()));
     }
