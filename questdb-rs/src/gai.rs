@@ -85,7 +85,11 @@ pub(super) fn resolve_host_port_udp(host: &str, port: &str) -> super::Result<Soc
     resolve_host_port_with_socktype(host, port, SOCK_DGRAM)
 }
 
-fn resolve_host_port_with_socktype(host: &str, port: &str, socktype: i32) -> super::Result<SockAddr> {
+fn resolve_host_port_with_socktype(
+    host: &str,
+    port: &str,
+    socktype: i32,
+) -> super::Result<SockAddr> {
     let hints = AddrInfoHints {
         socktype,
         address: AF_INET,

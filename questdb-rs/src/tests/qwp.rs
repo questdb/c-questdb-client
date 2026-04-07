@@ -878,20 +878,11 @@ fn qwp_udp_bool_i64_f64_are_never_nullable_with_various_gap_patterns() -> TestRe
     let mut buffer = sender.new_buffer();
 
     // Row 0: only bool
-    buffer
-        .table("t")?
-        .column_bool("b", true)?
-        .at_now()?;
+    buffer.table("t")?.column_bool("b", true)?.at_now()?;
     // Row 1: only i64
-    buffer
-        .table("t")?
-        .column_i64("n", 42)?
-        .at_now()?;
+    buffer.table("t")?.column_i64("n", 42)?.at_now()?;
     // Row 2: only f64
-    buffer
-        .table("t")?
-        .column_f64("d", 3.14)?
-        .at_now()?;
+    buffer.table("t")?.column_f64("d", 3.14)?.at_now()?;
     // Row 3: all three present
     buffer
         .table("t")?
@@ -964,7 +955,11 @@ fn qwp_udp_dense_bool_i64_f64_columns_encode_all_values() -> TestResult {
     let decoded = decode_datagram(&mock.recv_datagram()?).expect("decode");
 
     for col in &decoded.table.columns {
-        assert!(!col.nullable, "dense column {:?} must be non-nullable", col.name);
+        assert!(
+            !col.nullable,
+            "dense column {:?} must be non-nullable",
+            col.name
+        );
     }
 
     for i in 0..5i64 {
