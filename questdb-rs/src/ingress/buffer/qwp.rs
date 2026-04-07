@@ -2268,32 +2268,23 @@ fn encode_column_from_cells(
     }
 
     match col.kind {
+        // Bool, I64 and F64 are never nullable in QWP: `base_nullable` is
+        // false and `kind_supports_sparse_nulls` excludes them.  Gaps are
+        // filled with sentinels (false / i64::MIN / NaN) matching QuestDB's
+        // internal storage, so no null bitmap is needed.
         ColumnKind::Bool => {
+            debug_assert!(!nullable, "Bool columns must not be nullable in QWP");
             let mut packed = 0u8;
             let mut bit_idx = 0u8;
-            if nullable {
-                for cell in CellIter::new(cells, col.cell_head) {
-                    if matches!(cell.value, ValueRef::Bool(true)) {
-                        packed |= 1 << bit_idx;
-                    }
-                    bit_idx += 1;
-                    if bit_idx == 8 {
-                        out.push(packed);
-                        packed = 0;
-                        bit_idx = 0;
-                    }
+            for maybe_cell in GapFillIter::new(cells, col.cell_head, row_count)? {
+                if maybe_cell.is_some_and(|c| matches!(c.value, ValueRef::Bool(true))) {
+                    packed |= 1 << bit_idx;
                 }
-            } else {
-                for maybe_cell in GapFillIter::new(cells, col.cell_head, row_count)? {
-                    if maybe_cell.is_some_and(|c| matches!(c.value, ValueRef::Bool(true))) {
-                        packed |= 1 << bit_idx;
-                    }
-                    bit_idx += 1;
-                    if bit_idx == 8 {
-                        out.push(packed);
-                        packed = 0;
-                        bit_idx = 0;
-                    }
+                bit_idx += 1;
+                if bit_idx == 8 {
+                    out.push(packed);
+                    packed = 0;
+                    bit_idx = 0;
                 }
             }
             if bit_idx != 0 {
@@ -2302,38 +2293,24 @@ fn encode_column_from_cells(
         }
 
         ColumnKind::I64 => {
-            if nullable {
-                for cell in CellIter::new(cells, col.cell_head) {
-                    if let ValueRef::I64(v) = cell.value {
-                        out.extend_from_slice(&v.to_le_bytes());
-                    }
-                }
-            } else {
-                for maybe_cell in GapFillIter::new(cells, col.cell_head, row_count)? {
-                    let v = match maybe_cell.map(|c| c.value) {
-                        Some(ValueRef::I64(v)) => v,
-                        _ => i64::MIN,
-                    };
-                    out.extend_from_slice(&v.to_le_bytes());
-                }
+            debug_assert!(!nullable, "I64 columns must not be nullable in QWP");
+            for maybe_cell in GapFillIter::new(cells, col.cell_head, row_count)? {
+                let v = match maybe_cell.map(|c| c.value) {
+                    Some(ValueRef::I64(v)) => v,
+                    _ => i64::MIN,
+                };
+                out.extend_from_slice(&v.to_le_bytes());
             }
         }
 
         ColumnKind::F64 => {
-            if nullable {
-                for cell in CellIter::new(cells, col.cell_head) {
-                    if let ValueRef::F64(v) = cell.value {
-                        out.extend_from_slice(&v.to_le_bytes());
-                    }
-                }
-            } else {
-                for maybe_cell in GapFillIter::new(cells, col.cell_head, row_count)? {
-                    let v = match maybe_cell.map(|c| c.value) {
-                        Some(ValueRef::F64(v)) => v,
-                        _ => f64::NAN,
-                    };
-                    out.extend_from_slice(&v.to_le_bytes());
-                }
+            debug_assert!(!nullable, "F64 columns must not be nullable in QWP");
+            for maybe_cell in GapFillIter::new(cells, col.cell_head, row_count)? {
+                let v = match maybe_cell.map(|c| c.value) {
+                    Some(ValueRef::F64(v)) => v,
+                    _ => f64::NAN,
+                };
+                out.extend_from_slice(&v.to_le_bytes());
             }
         }
 

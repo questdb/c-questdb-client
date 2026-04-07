@@ -872,6 +872,112 @@ fn qwp_udp_encodes_sparse_long_and_double_columns_as_non_nullable_sentinels() ->
 }
 
 #[test]
+fn qwp_udp_bool_i64_f64_are_never_nullable_with_various_gap_patterns() -> TestResult {
+    let mock = QwpUdpMock::new()?;
+    let mut sender = mock.sender_builder().build()?;
+    let mut buffer = sender.new_buffer();
+
+    // Row 0: only bool
+    buffer
+        .table("t")?
+        .column_bool("b", true)?
+        .at_now()?;
+    // Row 1: only i64
+    buffer
+        .table("t")?
+        .column_i64("n", 42)?
+        .at_now()?;
+    // Row 2: only f64
+    buffer
+        .table("t")?
+        .column_f64("d", 3.14)?
+        .at_now()?;
+    // Row 3: all three present
+    buffer
+        .table("t")?
+        .column_bool("b", false)?
+        .column_i64("n", -1)?
+        .column_f64("d", 2.72)?
+        .at_now()?;
+
+    sender.flush(&mut buffer)?;
+    let decoded = decode_datagram(&mock.recv_datagram()?).expect("decode");
+
+    // All three columns must be non-nullable (gap-filled with sentinels).
+    for col in &decoded.table.columns {
+        match col.name.as_str() {
+            "b" | "n" | "d" => assert!(
+                !col.nullable,
+                "column {:?} must be non-nullable, got nullable",
+                col.name
+            ),
+            _ => {}
+        }
+    }
+
+    // Row 0: b=true, n=MIN (gap), d=NaN (gap)
+    assert_eq!(decoded.table.rows[0][0], DecodedValue::Bool(true));
+    assert_eq!(decoded.table.rows[0][1], DecodedValue::I64(i64::MIN));
+    match &decoded.table.rows[0][2] {
+        DecodedValue::F64(v) => assert!(v.is_nan(), "expected NaN gap-fill"),
+        other => panic!("expected F64, got {other:?}"),
+    }
+
+    // Row 1: b=false (gap), n=42, d=NaN (gap)
+    assert_eq!(decoded.table.rows[1][0], DecodedValue::Bool(false));
+    assert_eq!(decoded.table.rows[1][1], DecodedValue::I64(42));
+    match &decoded.table.rows[1][2] {
+        DecodedValue::F64(v) => assert!(v.is_nan(), "expected NaN gap-fill"),
+        other => panic!("expected F64, got {other:?}"),
+    }
+
+    // Row 2: b=false (gap), n=MIN (gap), d=3.14
+    assert_eq!(decoded.table.rows[2][0], DecodedValue::Bool(false));
+    assert_eq!(decoded.table.rows[2][1], DecodedValue::I64(i64::MIN));
+    assert_eq!(decoded.table.rows[2][2], DecodedValue::F64(3.14));
+
+    // Row 3: b=false, n=-1, d=2.72
+    assert_eq!(decoded.table.rows[3][0], DecodedValue::Bool(false));
+    assert_eq!(decoded.table.rows[3][1], DecodedValue::I64(-1));
+    assert_eq!(decoded.table.rows[3][2], DecodedValue::F64(2.72));
+
+    Ok(())
+}
+
+#[test]
+fn qwp_udp_dense_bool_i64_f64_columns_encode_all_values() -> TestResult {
+    let mock = QwpUdpMock::new()?;
+    let mut sender = mock.sender_builder().build()?;
+    let mut buffer = sender.new_buffer();
+
+    // All rows have all three columns — no gaps at all.
+    for i in 0..5 {
+        buffer
+            .table("t")?
+            .column_bool("flag", i % 2 == 0)?
+            .column_i64("count", i)?
+            .column_f64("price", i as f64 * 1.5)?
+            .at_now()?;
+    }
+
+    sender.flush(&mut buffer)?;
+    let decoded = decode_datagram(&mock.recv_datagram()?).expect("decode");
+
+    for col in &decoded.table.columns {
+        assert!(!col.nullable, "dense column {:?} must be non-nullable", col.name);
+    }
+
+    for i in 0..5i64 {
+        let row = &decoded.table.rows[i as usize];
+        assert_eq!(row[0], DecodedValue::Bool(i % 2 == 0));
+        assert_eq!(row[1], DecodedValue::I64(i));
+        assert_eq!(row[2], DecodedValue::F64(i as f64 * 1.5));
+    }
+
+    Ok(())
+}
+
+#[test]
 fn qwp_udp_encodes_sparse_timestamp_columns_as_nullable_nulls() -> TestResult {
     let mock = QwpUdpMock::new()?;
     let mut sender = mock.sender_builder().build()?;
@@ -1350,4 +1456,144 @@ fn qwp_udp_clone_produces_identical_datagrams() -> TestResult {
 fn qwp_buffer_reports_protocol_version_v1() {
     let buffer = Buffer::new_qwp();
     assert_eq!(buffer.protocol_version(), ProtocolVersion::V1);
+}
+
+#[test]
+fn qwp_udp_sparse_micros_and_nanos_timestamps_in_same_batch() -> TestResult {
+    let mock = QwpUdpMock::new()?;
+    let mut sender = mock.sender_builder().build()?;
+    let mut buffer = sender.new_buffer();
+
+    buffer
+        .table("t")?
+        .column_ts("ts_us", TimestampMicros::new(100))?
+        .at_now()?;
+    buffer
+        .table("t")?
+        .column_ts("ts_ns", TimestampNanos::new(200))?
+        .at_now()?;
+    buffer
+        .table("t")?
+        .column_ts("ts_us", TimestampMicros::new(300))?
+        .column_ts("ts_ns", TimestampNanos::new(400))?
+        .at_now()?;
+
+    sender.flush(&mut buffer)?;
+    let decoded = decode_datagram(&mock.recv_datagram()?).expect("decode");
+
+    // Both timestamp columns must be nullable (they have gaps).
+    assert_eq!(
+        decoded
+            .table
+            .columns
+            .iter()
+            .map(|c| (c.name.as_str(), c.nullable))
+            .collect::<Vec<_>>(),
+        vec![("ts_us", true), ("ts_ns", true)]
+    );
+
+    // Row 0: ts_us=100, ts_ns=null
+    assert_eq!(
+        decoded.table.rows[0],
+        vec![DecodedValue::TimestampMicros(100), DecodedValue::Null]
+    );
+    // Row 1: ts_us=null, ts_ns=200
+    assert_eq!(
+        decoded.table.rows[1],
+        vec![DecodedValue::Null, DecodedValue::TimestampNanos(200)]
+    );
+    // Row 2: ts_us=300, ts_ns=400
+    assert_eq!(
+        decoded.table.rows[2],
+        vec![
+            DecodedValue::TimestampMicros(300),
+            DecodedValue::TimestampNanos(400)
+        ]
+    );
+
+    Ok(())
+}
+
+#[test]
+fn qwp_buffer_rejects_name_exceeding_max_name_len() -> TestResult {
+    let mut buffer = Buffer::qwp_with_max_name_len(10);
+
+    let long_name = "x".repeat(11);
+    let ok_name = "a".repeat(10);
+    let long_col = "y".repeat(11);
+    let ok_col = "b".repeat(10);
+
+    // Table name too long.
+    assert_err_contains(
+        buffer.table(long_name.as_str()),
+        ErrorCode::InvalidName,
+        "Too long",
+    );
+
+    // Table name within limit works.
+    buffer.table(ok_name.as_str())?;
+
+    // Column name too long.
+    assert_err_contains(
+        buffer.column_i64(long_col.as_str(), 1),
+        ErrorCode::InvalidName,
+        "Too long",
+    );
+
+    // Column name within limit works.
+    buffer.column_i64(ok_col.as_str(), 1)?;
+    buffer.at_now()?;
+
+    Ok(())
+}
+
+#[test]
+fn qwp_buffer_rejects_negative_designated_timestamp() -> TestResult {
+    let mut buffer = Buffer::new_qwp();
+
+    buffer.table("t")?.column_i64("x", 1)?;
+    assert_err_contains(
+        buffer.at(TimestampNanos::new(-1)),
+        ErrorCode::InvalidTimestamp,
+        "negative",
+    );
+
+    // Buffer should still be usable after the error.
+    buffer.at(TimestampNanos::new(42))?;
+    assert_eq!(buffer.row_count(), 1);
+
+    Ok(())
+}
+
+#[test]
+fn qwp_buffer_rejects_flush_with_incomplete_row() -> TestResult {
+    let mut buffer = Buffer::new_qwp();
+
+    buffer.table("t")?.column_i64("x", 1)?;
+    // Row not completed (no at/at_now call).
+    assert_err_contains(
+        buffer.check_can_flush(),
+        ErrorCode::InvalidApiCall,
+        "should have called `column` or `at` instead",
+    );
+
+    // Complete the row — flush should now be allowed.
+    buffer.at_now()?;
+    buffer.check_can_flush()?;
+
+    Ok(())
+}
+
+#[test]
+fn qwp_buffer_rejects_at_without_columns() -> TestResult {
+    let mut buffer = Buffer::new_qwp();
+
+    buffer.table("t")?;
+    assert_err_contains(
+        buffer.at_now(),
+        ErrorCode::InvalidApiCall,
+        "should have called `symbol` or `column` instead",
+    );
+
+    Ok(())
 }
