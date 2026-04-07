@@ -2886,12 +2886,8 @@ mod tests {
         assert_eq!(buf.row_count(), 0);
         assert!(buf.is_empty());
 
-        let flush_err = buf.check_can_flush().unwrap_err();
-        assert_eq!(flush_err.code(), ErrorCode::InvalidApiCall);
-        assert_eq!(
-            flush_err.msg(),
-            "State error: Bad call to `flush`, should have called `table` instead."
-        );
+        // After error rollback, buffer is empty — flush is a no-op.
+        buf.check_can_flush().unwrap();
         assert!(buf.transactional());
 
         buf.table("hi").unwrap().column_i64("qty", 2).unwrap();

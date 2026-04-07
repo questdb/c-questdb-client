@@ -165,6 +165,9 @@ impl Sender {
                 )
             })?;
             qwp.check_can_flush()?;
+            if qwp.is_empty() {
+                return Ok(());
+            }
             if qwp.len() > self.max_buf_size {
                 return Err(error::fmt!(
                     InvalidApiCall,
@@ -196,6 +199,11 @@ impl Sender {
         })?;
         ilp.check_can_flush()?;
 
+        let bytes = ilp.as_bytes();
+        if bytes.is_empty() {
+            return Ok(());
+        }
+
         if ilp.len() > self.max_buf_size {
             return Err(error::fmt!(
                 InvalidApiCall,
@@ -206,11 +214,6 @@ impl Sender {
         }
 
         self.check_protocol_version(ilp.protocol_version())?;
-
-        let bytes = ilp.as_bytes();
-        if bytes.is_empty() {
-            return Ok(());
-        }
         match self.handler {
             #[cfg(feature = "sync-sender-tcp")]
             SyncProtocolHandler::SyncTcp(ref mut conn) => {

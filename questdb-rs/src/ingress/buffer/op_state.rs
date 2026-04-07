@@ -67,7 +67,7 @@ enum OpCase {
 impl OpCase {
     const fn allowed_ops(self) -> u8 {
         match self {
-            OpCase::Init => Op::Table.bit(),
+            OpCase::Init => Op::Table.bit() | Op::Flush.bit(),
             OpCase::TableWritten => Op::Symbol.bit() | Op::Column.bit(),
             OpCase::SymbolWritten => Op::Symbol.bit() | Op::Column.bit() | Op::At.bit(),
             OpCase::ColumnWritten => Op::Column.bit() | Op::At.bit(),
@@ -81,7 +81,7 @@ impl OpCase {
 
     fn next_op_descr(self) -> &'static str {
         match self {
-            OpCase::Init => "should have called `table` instead",
+            OpCase::Init => "should have called `table` or `flush` instead",
             OpCase::TableWritten => "should have called `symbol` or `column` instead",
             OpCase::SymbolWritten => "should have called `symbol`, `column` or `at` instead",
             OpCase::ColumnWritten => "should have called `column` or `at` instead",
@@ -176,12 +176,8 @@ mod tests {
     fn op_state_reports_exact_error_messages() {
         let mut state = OpState::new();
 
-        let err = state.check(Op::Flush).unwrap_err();
-        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
-        assert_eq!(
-            err.msg(),
-            "State error: Bad call to `flush`, should have called `table` instead."
-        );
+        // Flush is allowed on an empty buffer (no-op).
+        state.check(Op::Flush).unwrap();
 
         state.record_table();
         let err = state.check(Op::Flush).unwrap_err();

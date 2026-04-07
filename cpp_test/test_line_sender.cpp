@@ -687,7 +687,7 @@ TEST_CASE("test multiple lines")
         server.msgs(1) == "metric1,tag3=value\\ 3,tag\\ 4=value:4 field5=f\n");
 }
 
-TEST_CASE("State machine testing -- flush without data.")
+TEST_CASE("State machine testing -- flush without data is no-op.")
 {
     questdb::ingress::test::mock_server server;
     questdb::ingress::line_sender sender{questdb::ingress::opts{
@@ -697,10 +697,7 @@ TEST_CASE("State machine testing -- flush without data.")
 
     questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
     CHECK(buffer.size() == 0);
-    CHECK_THROWS_WITH_AS(
-        sender.flush(buffer),
-        "State error: Bad call to `flush`, should have called `table` instead.",
-        questdb::ingress::line_sender_error);
+    sender.flush(buffer);
     CHECK(!sender.must_close());
     sender.close();
 }
@@ -1333,14 +1330,9 @@ TEST_CASE("Empty Buffer")
     questdb::ingress::test::mock_server server;
     questdb::ingress::line_sender sender{questdb::ingress::opts{
         questdb::ingress::protocol::tcp, "127.0.0.1", server.port()}};
-    CHECK_THROWS_WITH_AS(
-        sender.flush(b1),
-        "State error: Bad call to `flush`, should have called `table` instead.",
-        questdb::ingress::line_sender_error);
-    CHECK_THROWS_WITH_AS(
-        sender.flush_and_keep(b1),
-        "State error: Bad call to `flush`, should have called `table` instead.",
-        questdb::ingress::line_sender_error);
+    // Flushing an empty buffer is a no-op.
+    sender.flush(b1);
+    sender.flush_and_keep(b1);
 }
 
 TEST_CASE("Opts from conf")

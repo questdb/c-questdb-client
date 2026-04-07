@@ -299,12 +299,8 @@ fn test_table_name_too_long() -> TestResult {
 fn ilp_buffer_check_can_flush_tracks_public_state_machine() -> TestResult {
     let mut buffer = Buffer::new(ProtocolVersion::V3);
 
-    let err = buffer.check_can_flush().unwrap_err();
-    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
-    assert_eq!(
-        err.msg(),
-        "State error: Bad call to `flush`, should have called `table` instead."
-    );
+    // Flush is allowed on an empty buffer (no-op).
+    buffer.check_can_flush().unwrap();
 
     buffer.table("test")?;
     let err = buffer.check_can_flush().unwrap_err();

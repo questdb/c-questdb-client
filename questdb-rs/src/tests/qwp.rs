@@ -1097,16 +1097,13 @@ fn qwp_udp_rejects_not_yet_supported_column_types() -> TestResult {
 }
 
 #[test]
-fn qwp_udp_rejects_flushing_empty_buffer() -> TestResult {
+fn qwp_udp_flush_empty_buffer_is_noop() -> TestResult {
     let mock = QwpUdpMock::new()?;
     let mut sender = mock.sender_builder().build()?;
     let mut buffer = sender.new_buffer();
 
-    assert_err_contains(
-        sender.flush(&mut buffer),
-        ErrorCode::InvalidApiCall,
-        "State error: Bad call to `flush`",
-    );
+    // Flushing an empty buffer should be a no-op, not an error.
+    sender.flush(&mut buffer)?;
 
     Ok(())
 }
@@ -1115,12 +1112,8 @@ fn qwp_udp_rejects_flushing_empty_buffer() -> TestResult {
 fn qwp_buffer_check_can_flush_tracks_public_state_machine() -> TestResult {
     let mut buffer = Buffer::new_qwp();
 
-    let err = buffer.check_can_flush().unwrap_err();
-    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
-    assert_eq!(
-        err.msg(),
-        "State error: Bad call to `flush`, should have called `table` instead."
-    );
+    // Flush is allowed on an empty buffer (no-op).
+    buffer.check_can_flush().unwrap();
 
     buffer.table("trades")?;
     let err = buffer.check_can_flush().unwrap_err();
