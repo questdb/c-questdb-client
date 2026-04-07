@@ -1017,6 +1017,9 @@ bool line_sender_opts_token_y(
  * `line_sender_protocol_version_1` by default. You must explicitly set
  * `line_sender_protocol_version_2` in order to ingest arrays.
  *
+ * QWP/UDP does not support explicit protocol version configuration.
+ * Calling this function on QWP/UDP opts will return an error.
+ *
  * QuestDB server version 9.0.0 or later is required for
  * `line_sender_protocol_version_2` support.
  *

@@ -1157,10 +1157,13 @@ public:
      * `protocol_version::v1` by default. You must explicitly set
      * `protocol_version::v2` in order to ingest arrays.
      *
+     * QWP/UDP does not support explicit protocol version configuration.
+     * Calling this method on a QWP/UDP opts will throw.
+     *
      * QuestDB server version 9.0.0 or later is required for
      * `protocol_version::v2` support.
      */
-    opts& protocol_version(protocol_version version) noexcept
+    opts& protocol_version(protocol_version version)
     {
         const auto c_protocol_version =
             static_cast<::line_sender_protocol_version>(

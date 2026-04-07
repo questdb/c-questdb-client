@@ -142,37 +142,45 @@ macro_rules! generate_array_dims_branches {
 
 /// Update the Rust builder inside the C opts object
 /// after calling a method that takes ownership of the builder.
+///
+/// The builder setters consume `self` (Rust move semantics), so we
+/// `ptr::read` the builder out, call the setter, and `ptr::write` the
+/// result back. On error the consumed builder is gone, and we must
+/// write a valid object back to avoid a double-free.
+///
+/// We clone the builder before the consuming call and restore it on
+/// failure so the caller keeps their original configuration. This costs
+/// one shallow clone per setter call during one-time setup — acceptable
+/// since this path is only hit from C/C++ FFI, never from pure Rust.
+///
+/// Alternatives considered:
+/// - Private `&mut self` helpers on `SenderBuilder` called from FFI
+///   directly: eliminates the clone but requires `#[doc(hidden)] pub`
+///   visibility leaking across crates, and every new setter needs a
+///   companion method (desync risk).
+/// - Changing the public Rust API to `&mut self`: removes the problem
+///   entirely but is a semver-breaking change affecting all Rust users.
+/// - `ManuallyDrop`/`MaybeUninit`: these cannot reconstruct the old
+///   builder after a consuming setter drops it on error — a backup
+///   copy is still needed.
 macro_rules! upd_opts {
-    // This is square-peg-round-hole code.
-    // The C API is not designed to handle Rust's move semantics.
-    // So we're going to do some very unsafe things here.
-    // We need to extract a `T` from a `*mut T` and then replace it with
-    // another `T` in situ.
     ($opts:expr, $err_out:expr, $func:ident $(, $($args:expr),*)?) => {
         {
             let builder_ref: *mut SenderBuilder = &mut (*$opts).0;
             let forced_builder = ptr::read(&(*$opts).0);
+            let snapshot = forced_builder.clone();
             let new_builder_or_err = forced_builder.$func($($($args),*)?);
             let new_builder = match new_builder_or_err {
-                Ok(builder) => builder,
+                Ok(builder) => {
+                    drop(snapshot);
+                    builder
+                }
                 Err(err) => {
                     *$err_out = Box::into_raw(Box::new(line_sender_error(err)));
-                    // We're really messing with the borrow-checker here.
-                    // We've moved ownership of `forced_builder` (which is actually
-                    // just an alias of the real `SenderBuilder` owned by the caller
-                    // via a pointer - but the Rust compiler doesn't know that)
-                    // into this function.
-                    // This leaves the original caller holding a pointer to an
-                    // already cleaned up object.
-                    // To avoid double-freeing, we need to construct a valid "dummy"
-                    // object on top of the memory that is still owned by the caller.
-                    let dummy = SenderBuilder::new(Protocol::Tcp, "127.0.0.1", 1);
-                    ptr::write(builder_ref, dummy);
+                    ptr::write(builder_ref, snapshot);
                     return false;
                 }
             };
-
-            // Overwrite the original builder with the new one.
             ptr::write(builder_ref, new_builder);
             true
         }

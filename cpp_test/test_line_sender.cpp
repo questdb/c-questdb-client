@@ -1780,3 +1780,24 @@ TEST_CASE("Http auto detect line protocol version failed")
         CHECK_MESSAGE(false, "Other exception raised.");
     }
 }
+
+TEST_CASE("line_sender c++ qwpudp opts reusable after protocol_version error")
+{
+    udp_capture receiver;
+    questdb::ingress::opts opts{
+        questdb::ingress::protocol::qwpudp,
+        std::string("127.0.0.1"),
+        std::to_string(receiver.port())};
+
+    // protocol_version is rejected for QWP/UDP — catch the error.
+    CHECK_THROWS_AS(
+        opts.protocol_version(questdb::ingress::protocol_version::v2),
+        questdb::ingress::line_sender_error);
+
+    // The opts must still be usable with its original configuration.
+    questdb::ingress::line_sender sender{opts};
+    CHECK(sender.protocol_version() != questdb::ingress::protocol_version::v2);
+    questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
+    buffer.table("test").column("x", int64_t{1}).at_now();
+    sender.flush(buffer);
+}
