@@ -37,7 +37,7 @@ pub(crate) struct SyncQwpUdpHandlerState {
 }
 
 fn resolve_udp_target(host: &str, port: &str) -> crate::Result<SocketAddrV4> {
-    let sock_addr = gai::resolve_host_port(host, port)?;
+    let sock_addr = gai::resolve_host_port_udp(host, port)?;
     let addr = sock_addr.as_socket_ipv4().ok_or_else(|| {
         error::fmt!(
             CouldNotResolveAddr,
@@ -50,7 +50,7 @@ fn resolve_udp_target(host: &str, port: &str) -> crate::Result<SocketAddrV4> {
 }
 
 fn resolve_bind_addr(net_interface: &str) -> crate::Result<SocketAddrV4> {
-    let sock_addr = gai::resolve_host(net_interface)?;
+    let sock_addr = gai::resolve_host_udp(net_interface)?;
     let addr = sock_addr.as_socket_ipv4().ok_or_else(|| {
         error::fmt!(
             CouldNotResolveAddr,

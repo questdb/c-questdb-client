@@ -27,10 +27,10 @@ use dns_lookup::{AddrInfo, AddrInfoHints, AddrInfoIter, LookupError};
 use socket2::SockAddr;
 
 #[cfg(unix)]
-use libc::{AF_INET, SOCK_STREAM};
+use libc::{AF_INET, SOCK_DGRAM, SOCK_STREAM};
 
 #[cfg(windows)]
-use winapi::shared::ws2def::{AF_INET, SOCK_STREAM};
+use winapi::shared::ws2def::{AF_INET, SOCK_DGRAM, SOCK_STREAM};
 
 fn map_getaddrinfo_result(
     dest: &str,
@@ -61,8 +61,16 @@ fn map_getaddrinfo_result(
 }
 
 pub(super) fn resolve_host(host: &str) -> super::Result<SockAddr> {
+    resolve_host_with_socktype(host, SOCK_STREAM)
+}
+
+pub(super) fn resolve_host_udp(host: &str) -> super::Result<SockAddr> {
+    resolve_host_with_socktype(host, SOCK_DGRAM)
+}
+
+fn resolve_host_with_socktype(host: &str, socktype: i32) -> super::Result<SockAddr> {
     let hints = AddrInfoHints {
-        socktype: SOCK_STREAM,
+        socktype,
         address: AF_INET,
         ..AddrInfoHints::default()
     };
@@ -70,8 +78,16 @@ pub(super) fn resolve_host(host: &str) -> super::Result<SockAddr> {
 }
 
 pub(super) fn resolve_host_port(host: &str, port: &str) -> super::Result<SockAddr> {
+    resolve_host_port_with_socktype(host, port, SOCK_STREAM)
+}
+
+pub(super) fn resolve_host_port_udp(host: &str, port: &str) -> super::Result<SockAddr> {
+    resolve_host_port_with_socktype(host, port, SOCK_DGRAM)
+}
+
+fn resolve_host_port_with_socktype(host: &str, port: &str, socktype: i32) -> super::Result<SockAddr> {
     let hints = AddrInfoHints {
-        socktype: SOCK_STREAM,
+        socktype,
         address: AF_INET,
         ..AddrInfoHints::default()
     };
