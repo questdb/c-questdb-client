@@ -1773,6 +1773,130 @@ TEST_CASE("Http auto detect line protocol version failed")
     }
 }
 
+TEST_CASE("line_sender c api max_datagram_size rejected for tcp opts")
+{
+    ::line_sender_error* err = nullptr;
+    on_scope_exit error_free_guard{[&] {
+        if (err)
+            ::line_sender_error_free(err);
+    }};
+
+    const auto host = QDB_UTF8_LITERAL("127.0.0.1");
+    ::line_sender_opts* opts =
+        ::line_sender_opts_new(::line_sender_protocol_tcp, host, 9009);
+    REQUIRE(opts != nullptr);
+    on_scope_exit opts_free_guard{[&] { ::line_sender_opts_free(opts); }};
+
+    CHECK_FALSE(::line_sender_opts_max_datagram_size(opts, 256, &err));
+    REQUIRE(err != nullptr);
+    CHECK(line_sender_error_message(err).find("only supported for QWP/UDP") != std::string::npos);
+    ::line_sender_error_free(err);
+    err = nullptr;
+
+    CHECK_FALSE(::line_sender_opts_multicast_ttl(opts, 3, &err));
+    REQUIRE(err != nullptr);
+    CHECK(line_sender_error_message(err).find("only supported for QWP/UDP") != std::string::npos);
+}
+
+TEST_CASE("line_sender c++ qwpudp bookmark rewind and clear")
+{
+    udp_capture receiver;
+    questdb::ingress::opts opts{
+        questdb::ingress::protocol::qwpudp,
+        std::string("127.0.0.1"),
+        std::to_string(receiver.port())};
+    questdb::ingress::line_sender sender{opts};
+
+    questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
+    buffer.table("t").symbol("s", "a").column("x", int64_t{1}).at_now();
+
+    auto bm = buffer.bookmark();
+    buffer.table("t").symbol("s", "b").column("x", int64_t{2}).at_now();
+    CHECK(buffer.row_count() == 2);
+
+    buffer.rewind_to_bookmark(bm);
+    CHECK(buffer.row_count() == 1);
+
+    // Flush should send only the first row.
+    sender.flush(buffer);
+    auto datagram = receiver.recv_datagram();
+    CHECK(datagram_starts_with_qwp1(datagram));
+
+    // Clear bookmark and verify a stale bookmark is rejected.
+    buffer = sender.new_buffer();
+    buffer.table("t").symbol("s", "c").column("x", int64_t{3}).at_now();
+    auto bm2 = buffer.bookmark();
+    buffer.table("t").symbol("s", "d").column("x", int64_t{4}).at_now();
+    buffer.clear_bookmark(bm2);
+    CHECK_THROWS_AS(
+        buffer.rewind_to_bookmark(bm2),
+        questdb::ingress::line_sender_error);
+}
+
+TEST_CASE("line_sender c api flush empty qwpudp buffer is noop")
+{
+    udp_capture receiver;
+    ::line_sender_error* err = nullptr;
+    on_scope_exit error_free_guard{[&] {
+        if (err)
+            ::line_sender_error_free(err);
+    }};
+
+    const auto host = QDB_UTF8_LITERAL("127.0.0.1");
+    ::line_sender_opts* opts =
+        ::line_sender_opts_new(::line_sender_protocol_qwpudp, host, receiver.port());
+    REQUIRE(opts != nullptr);
+
+    ::line_sender* sender = ::line_sender_build(opts, &err);
+    REQUIRE(sender != nullptr);
+    on_scope_exit sender_close_guard{[&] { ::line_sender_close(sender); }};
+
+    ::line_sender_buffer* buffer = ::line_sender_buffer_new_for_sender(sender);
+    REQUIRE(buffer != nullptr);
+    on_scope_exit buffer_free_guard{[&] { ::line_sender_buffer_free(buffer); }};
+
+    // Empty buffer flush should succeed (no-op).
+    CHECK(::line_sender_flush(sender, buffer, &err));
+    CHECK(::line_sender_buffer_row_count(buffer) == 0);
+}
+
+TEST_CASE("line_sender c api qwp buffer rejected by tcp sender")
+{
+    questdb::ingress::test::mock_server server;
+    ::line_sender_error* err = nullptr;
+    on_scope_exit error_free_guard{[&] {
+        if (err)
+            ::line_sender_error_free(err);
+    }};
+
+    const auto host = QDB_UTF8_LITERAL("127.0.0.1");
+    ::line_sender_opts* opts =
+        ::line_sender_opts_new(::line_sender_protocol_tcp, host, server.port());
+    REQUIRE(opts != nullptr);
+
+    ::line_sender* sender = ::line_sender_build(opts, &err);
+    REQUIRE(sender != nullptr);
+    on_scope_exit sender_close_guard{[&] { ::line_sender_close(sender); }};
+    server.accept();
+
+    // Create a QWP buffer and try to flush it via a TCP sender.
+    ::line_sender_buffer* buffer = ::line_sender_buffer_new_qwp();
+    REQUIRE(buffer != nullptr);
+    on_scope_exit buffer_free_guard{[&] { ::line_sender_buffer_free(buffer); }};
+
+    const auto table = QDB_TABLE_NAME_LITERAL("t");
+    const auto col = QDB_COLUMN_NAME_LITERAL("x");
+    CHECK(::line_sender_buffer_table(buffer, table, &err));
+    CHECK(::line_sender_buffer_column_i64(buffer, col, 1, &err));
+    CHECK(::line_sender_buffer_at_now(buffer, &err));
+
+    CHECK_FALSE(::line_sender_flush(sender, buffer, &err));
+    REQUIRE(err != nullptr);
+    CHECK(
+        line_sender_error_message(err).find("ILP sender requires an ILP buffer") !=
+        std::string::npos);
+}
+
 TEST_CASE("line_sender c++ qwpudp opts reusable after protocol_version error")
 {
     udp_capture receiver;
