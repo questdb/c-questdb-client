@@ -1354,6 +1354,7 @@ struct ColumnStats {
 }
 
 impl ColumnStats {
+    #[allow(clippy::too_many_arguments)]
     fn payload_len_parts(
         kind: ColumnKind,
         base_nullable: bool,
