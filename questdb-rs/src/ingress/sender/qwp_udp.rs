@@ -122,8 +122,10 @@ pub(crate) fn flush_qwp_udp(
     buffer.flush_to_socket(
         &mut state.scratch,
         max_datagram_size,
+        // UDP sends are atomic: the kernel either accepts the full
+        // datagram or returns an error. No partial-write check needed.
         &mut |datagram: &[u8]| {
-            let sent = state.socket.send(datagram).map_err(|io_err| {
+            state.socket.send(datagram).map_err(|io_err| {
                 error::fmt!(
                     SocketError,
                     "Could not send UDP datagram to {:?}: {}",
@@ -131,17 +133,6 @@ pub(crate) fn flush_qwp_udp(
                     io_err
                 )
             })?;
-
-            if sent != datagram.len() {
-                return Err(error::fmt!(
-                    SocketError,
-                    "Could not send complete UDP datagram to {:?}: wrote {} of {} bytes",
-                    target_addr,
-                    sent,
-                    datagram.len()
-                ));
-            }
-
             Ok(())
         },
     )

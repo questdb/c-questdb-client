@@ -221,7 +221,7 @@ pub enum Protocol {
     Https,
 
     #[cfg(feature = "_sender-qwp-udp")]
-    /// Quest Wire Protocol over UDP datagrams.
+    /// Quest Wire Protocol over UDP datagrams (IPv4-only).
     QwpUdp,
 }
 

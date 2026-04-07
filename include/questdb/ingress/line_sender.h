@@ -103,7 +103,7 @@ typedef enum line_sender_protocol
     /** InfluxDB Line Protocol over HTTP with TLS. */
     line_sender_protocol_https,
 
-    /** QuestWire Protocol over UDP. */
+    /** QuestWire Protocol over UDP (IPv4-only). */
     line_sender_protocol_qwpudp,
 } line_sender_protocol;
 
