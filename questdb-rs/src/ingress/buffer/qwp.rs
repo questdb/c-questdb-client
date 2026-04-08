@@ -1063,6 +1063,8 @@ impl QwpBuffer {
         Ok(())
     }
 
+    /// Rough estimate for the uncommitted row; replaced by the accurate
+    /// `RowGroupPlanner` value once the row is committed via `at()`/`at_now()`.
     fn pending_size_hint(&self) -> usize {
         let Some(table_ns) = self.pending.table else {
             return 0;
