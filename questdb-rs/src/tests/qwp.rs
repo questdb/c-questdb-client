@@ -882,7 +882,7 @@ fn qwp_udp_bool_i64_f64_are_never_nullable_with_various_gap_patterns() -> TestRe
     // Row 1: only i64
     buffer.table("t")?.column_i64("n", 42)?.at_now()?;
     // Row 2: only f64
-    buffer.table("t")?.column_f64("d", 3.14)?.at_now()?;
+    buffer.table("t")?.column_f64("d", 1.23)?.at_now()?;
     // Row 3: all three present
     buffer
         .table("t")?
@@ -922,10 +922,10 @@ fn qwp_udp_bool_i64_f64_are_never_nullable_with_various_gap_patterns() -> TestRe
         other => panic!("expected F64, got {other:?}"),
     }
 
-    // Row 2: b=false (gap), n=MIN (gap), d=3.14
+    // Row 2: b=false (gap), n=MIN (gap), d=1.23
     assert_eq!(decoded.table.rows[2][0], DecodedValue::Bool(false));
     assert_eq!(decoded.table.rows[2][1], DecodedValue::I64(i64::MIN));
-    assert_eq!(decoded.table.rows[2][2], DecodedValue::F64(3.14));
+    assert_eq!(decoded.table.rows[2][2], DecodedValue::F64(1.23));
 
     // Row 3: b=false, n=-1, d=2.72
     assert_eq!(decoded.table.rows[3][0], DecodedValue::Bool(false));

@@ -9,5 +9,5 @@ if command -v cargo &>/dev/null; then
     cargo fmt --manifest-path questdb-rs/Cargo.toml --check
 
     echo "Running cargo clippy ..."
-    cargo clippy --manifest-path questdb-rs/Cargo.toml -- -D warnings
+    cargo clippy --manifest-path questdb-rs/Cargo.toml --all-targets --features almost-all-features -- -D warnings
 fi
