@@ -1094,9 +1094,15 @@ fn qwp_udp_encodes_sparse_string_columns_as_nullable_nulls() -> TestResult {
     assert_eq!(
         decoded.table.rows,
         vec![
-            vec![DecodedValue::I64(1), DecodedValue::String("alpha".to_owned())],
+            vec![
+                DecodedValue::I64(1),
+                DecodedValue::String("alpha".to_owned())
+            ],
             vec![DecodedValue::I64(2), DecodedValue::Null],
-            vec![DecodedValue::I64(3), DecodedValue::String("beta".to_owned())],
+            vec![
+                DecodedValue::I64(3),
+                DecodedValue::String("beta".to_owned())
+            ],
         ]
     );
 

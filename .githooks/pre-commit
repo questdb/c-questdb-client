@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -e
+
+# Check Rust formatting and clippy before committing.
+# Enable with: git config core.hooksPath .githooks
+
+if command -v cargo &>/dev/null; then
+    echo "Running cargo fmt --check ..."
+    cargo fmt --manifest-path questdb-rs/Cargo.toml --check
+
+    echo "Running cargo clippy ..."
+    cargo clippy --manifest-path questdb-rs/Cargo.toml -- -D warnings
+fi
