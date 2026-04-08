@@ -120,6 +120,17 @@ fn checked_qwp_usize_add(
     })
 }
 
+fn checked_qwp_usize_mul(a: usize, b: usize, what: &'static str) -> crate::Result<usize> {
+    a.checked_mul(b).ok_or_else(|| {
+        error::fmt!(
+            InvalidApiCall,
+            "QWP/UDP {} exceeds maximum of {}",
+            what,
+            usize::MAX
+        )
+    })
+}
+
 // --- Arena slice types ---
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -964,13 +975,32 @@ impl QwpBuffer {
 
         let entry_start = self.pending.entry_start;
         let last_seg_table = self.segments.last().map(|s| s.table);
-        let same_table = if let Some(last_table) = last_seg_table {
-            self.name_bytes[last_table.0.as_range()] == self.name_bytes[table_ns.0.as_range()]
+
+        // If the new row belongs to the same table as the last segment,
+        // we extend that segment instead of pushing a new one.
+        // Carry the segment index and precomputed new row count together
+        // so the later commit has no unwrap() calls.
+        let seg_extend: Option<usize> = if let (Some(last_table), Some(last_idx)) =
+            (last_seg_table, self.segments.len().checked_sub(1))
+        {
+            if self.name_bytes[last_table.0.as_range()] == self.name_bytes[table_ns.0.as_range()] {
+                Some(last_idx)
+            } else {
+                None
+            }
         } else {
-            false
+            None
         };
 
-        let (entry_count, row_start, same_table_row_count) = match (|| -> crate::Result<_> {
+        // seg_update: either extend an existing segment (with its index and
+        // precomputed new row count) or push a new one. Preflighting here
+        // avoids unwrap() calls in the infallible commit section below.
+        enum SegUpdate {
+            Extend { idx: usize, new_row_count: u32 },
+            PushNew,
+        }
+
+        let (entry_count, row_start, seg_update) = match (|| -> crate::Result<_> {
             let entries_len = checked_qwp_u32(self.entries.len(), "entry metadata length")?;
             let entry_count = entries_len.checked_sub(entry_start).ok_or_else(|| {
                 error::fmt!(
@@ -984,11 +1014,9 @@ impl QwpBuffer {
             }
 
             let row_start = checked_qwp_push_index(self.rows.len(), "row metadata length")?;
-            let same_table_row_count = if same_table {
-                Some(
-                    self.segments
-                        .last()
-                        .unwrap()
+            let seg_update = if let Some(seg_idx) = seg_extend {
+                let new_row_count =
+                    self.segments[seg_idx]
                         .row_count
                         .checked_add(1)
                         .ok_or_else(|| {
@@ -997,13 +1025,16 @@ impl QwpBuffer {
                                 "QWP/UDP segment row count exceeds maximum of {}",
                                 u32::MAX
                             )
-                        })?,
-                )
+                        })?;
+                SegUpdate::Extend {
+                    idx: seg_idx,
+                    new_row_count,
+                }
             } else {
                 checked_qwp_push_index(self.segments.len(), "segment metadata length")?;
-                None
+                SegUpdate::PushNew
             };
-            Ok((entry_count, row_start, same_table_row_count))
+            Ok((entry_count, row_start, seg_update))
         })() {
             Ok(values) => values,
             Err(err) => {
@@ -1033,14 +1064,17 @@ impl QwpBuffer {
 
         // Remaining updates are infallible because the last fallible checks
         // were preflighted above.
-        if same_table {
-            self.segments.last_mut().unwrap().row_count = same_table_row_count.unwrap();
-        } else {
-            self.segments.push(SegmentMeta {
-                table: table_ns,
-                row_start,
-                row_count: 1,
-            });
+        match seg_update {
+            SegUpdate::Extend { idx, new_row_count } => {
+                self.segments[idx].row_count = new_row_count;
+            }
+            SegUpdate::PushNew => {
+                self.segments.push(SegmentMeta {
+                    table: table_ns,
+                    row_start,
+                    row_count: 1,
+                });
+            }
         }
 
         self.rows.push(row);
@@ -1364,23 +1398,36 @@ impl ColumnStats {
         symbol_dict_bytes: usize,
         symbol_row_index_bytes: usize,
         dict_count: u32,
-    ) -> usize {
+    ) -> crate::Result<usize> {
         let nullable = base_nullable
             || (kind_supports_sparse_nulls(kind) && (non_null_count as usize) < row_count);
         let bitmap = if nullable { bitmap_bytes(row_count) } else { 0 };
 
-        1 + bitmap
-            + match kind {
-                ColumnKind::Bool => packed_bytes(row_count),
-                ColumnKind::I64 | ColumnKind::F64 => row_count * 8,
-                ColumnKind::TimestampMicros | ColumnKind::TimestampNanos => {
-                    non_null_count as usize * 8
-                }
-                ColumnKind::String => 4 * (non_null_count as usize + 1) + string_data_len,
-                ColumnKind::Symbol => {
-                    qwp_varint_size(dict_count as u64) + symbol_dict_bytes + symbol_row_index_bytes
-                }
+        let data_len = match kind {
+            ColumnKind::Bool => packed_bytes(row_count),
+            ColumnKind::I64 | ColumnKind::F64 => {
+                checked_qwp_usize_mul(row_count, 8, "column data size")?
             }
+            ColumnKind::TimestampMicros | ColumnKind::TimestampNanos => {
+                checked_qwp_usize_mul(non_null_count as usize, 8, "column data size")?
+            }
+            ColumnKind::String => {
+                let offset_count =
+                    checked_qwp_usize_add(non_null_count as usize, 1, "string offset count")?;
+                let offsets = checked_qwp_usize_mul(offset_count, 4, "string offset table")?;
+                checked_qwp_usize_add(offsets, string_data_len, "string column size")?
+            }
+            ColumnKind::Symbol => {
+                let base = checked_qwp_usize_add(
+                    qwp_varint_size(dict_count as u64),
+                    symbol_dict_bytes,
+                    "symbol column size",
+                )?;
+                checked_qwp_usize_add(base, symbol_row_index_bytes, "symbol column size")?
+            }
+        };
+        let with_bitmap = checked_qwp_usize_add(1, bitmap, "column header size")?;
+        checked_qwp_usize_add(with_bitmap, data_len, "column payload size")
     }
 
     fn new(entry: &EntryMeta) -> Self {
@@ -1410,7 +1457,7 @@ impl ColumnStats {
         }
     }
 
-    fn payload_len(&self, row_count: usize) -> usize {
+    fn payload_len(&self, row_count: usize) -> crate::Result<usize> {
         Self::payload_len_parts(
             self.kind,
             self.base_nullable,
@@ -1766,7 +1813,7 @@ impl RowGroupPlanner {
                 }
                 col.cell_tail = cell_idx;
                 if col.kind == ColumnKind::Symbol {
-                    self.add_symbol_value(idx, &entry.value, value_bytes)?;
+                    self.add_symbol_value(idx, cell_idx, &entry.value, value_bytes)?;
                 } else {
                     col.add_non_symbol_value(&entry.value)?;
                 }
@@ -1775,12 +1822,17 @@ impl RowGroupPlanner {
             }
         }
 
-        let new_row_count = old_row_count + 1;
+        let new_row_count = old_row_count.checked_add(1).ok_or_else(|| {
+            error::fmt!(
+                InvalidApiCall,
+                "QWP/UDP row group row count exceeds maximum"
+            )
+        })?;
         if old_row_count == 0 {
             let mut total = base_datagram_len(table_name_len, new_row_count, self.columns.len());
             total += self.total_schema_len;
             for col in &self.columns {
-                total += col.payload_len(new_row_count);
+                total += col.payload_len(new_row_count)?;
             }
             self.row_count = new_row_count;
             self.current_len = total;
@@ -1806,7 +1858,7 @@ impl RowGroupPlanner {
                 | ColumnKind::TimestampMicros
                 | ColumnKind::TimestampNanos => touched_bitmap_column_count += 1,
             }
-            delta += col.payload_len(new_row_count)
+            delta += col.payload_len(new_row_count)?
                 - ColumnStats::payload_len_parts(
                     col.kind,
                     col.base_nullable,
@@ -1816,7 +1868,7 @@ impl RowGroupPlanner {
                     undo.symbol_dict_bytes,
                     undo.symbol_row_index_bytes,
                     undo.dict_count,
-                );
+                )?;
         }
 
         debug_assert!(touched_bool_column_count <= old_bool_column_count);
@@ -1832,7 +1884,7 @@ impl RowGroupPlanner {
                 - qwp_varint_size(old_column_count as u64);
             delta += self.total_schema_len - old_total_schema_len;
             for col in &self.columns[old_column_count..] {
-                delta += col.payload_len(new_row_count);
+                delta += col.payload_len(new_row_count)?;
             }
         }
 
@@ -1844,6 +1896,7 @@ impl RowGroupPlanner {
     fn add_symbol_value(
         &mut self,
         col_idx: usize,
+        cell_idx: u32,
         value: &ValueRef,
         value_bytes: &[u8],
     ) -> crate::Result<()> {
@@ -1914,7 +1967,10 @@ impl RowGroupPlanner {
         col.symbol_row_index_bytes = new_symbol_row_index_bytes;
         if found_idx.is_none() {
             col.symbol_dict_bytes = new_symbol_dict_bytes;
-            let dict_idx = Self::checked_u32(self.symbol_dict.len(), "symbol dictionary length")?;
+            // Use push-index semantics: reject len >= u32::MAX so that
+            // valid indices are always < CELL_END (u32::MAX sentinel).
+            let dict_idx =
+                checked_qwp_push_index(self.symbol_dict.len(), "symbol dictionary length")?;
             let previous_head = self.symbol_hash_buckets[bucket_idx];
             self.symbol_lookup_undo.push(SymbolLookupUndo {
                 bucket_idx,
@@ -1937,10 +1993,10 @@ impl RowGroupPlanner {
             col.dict_tail = dict_idx;
             col.dict_count = new_dict_count;
         }
-        // Store pre-computed index so encoding is O(1) per cell
-        // Callers push the current cell immediately before invoking this helper,
-        // so the last cell is always the symbol cell whose dictionary index we set.
-        self.cells.last_mut().unwrap().symbol_dict_idx = symbol_dict_idx;
+        // Store pre-computed index so encoding is O(1) per cell.
+        // The caller passes the index of the cell it pushed immediately
+        // before invoking this helper.
+        self.cells[cell_idx as usize].symbol_dict_idx = symbol_dict_idx;
         Ok(())
     }
 
@@ -1972,13 +2028,14 @@ impl RowGroupPlanner {
         if self.symbol_hash_buckets.is_empty() {
             return;
         }
+        // All dict indices are < CELL_END because add_symbol_value uses
+        // checked_qwp_push_index, which rejects len >= u32::MAX.
+        debug_assert!(self.symbol_dict.len() <= u32::MAX as usize);
         self.symbol_hash_buckets.fill(CELL_END);
         for (dict_idx, entry) in self.symbol_dict.iter_mut().enumerate() {
             let bucket_idx = entry.hash as usize & (self.symbol_hash_buckets.len() - 1);
             entry.bucket_next = self.symbol_hash_buckets[bucket_idx];
-            self.symbol_hash_buckets[bucket_idx] =
-                checked_qwp_u32(dict_idx, "symbol dictionary length")
-                    .expect("symbol dictionary length is checked when entries are appended");
+            self.symbol_hash_buckets[bucket_idx] = dict_idx as u32;
         }
     }
 
@@ -2013,7 +2070,7 @@ impl RowGroupPlanner {
         col.cell_tail = cell_idx;
 
         if entry.value.kind() == ColumnKind::Symbol {
-            self.add_symbol_value(col_idx, &entry.value, value_bytes)?;
+            self.add_symbol_value(col_idx, cell_idx, &entry.value, value_bytes)?;
         } else {
             self.columns[col_idx].add_non_symbol_value(&entry.value)?;
         }
@@ -2388,7 +2445,7 @@ mod tests {
         let mut total = base_datagram_len(table_name_len, planner.row_count, planner.columns.len());
         total += planner.total_schema_len;
         for col in &planner.columns {
-            total += col.payload_len(planner.row_count);
+            total += col.payload_len(planner.row_count).unwrap();
         }
         total
     }
@@ -2514,7 +2571,7 @@ mod tests {
         planner.columns[0].symbol_row_index_bytes = usize::MAX;
 
         let err = planner
-            .add_symbol_value(0, &symbol_value, b"a")
+            .add_symbol_value(0, 0, &symbol_value, b"a")
             .unwrap_err();
         assert_eq!(err.code(), ErrorCode::InvalidApiCall);
         assert!(
@@ -2539,7 +2596,7 @@ mod tests {
             value: symbol_value,
         });
 
-        planner.add_symbol_value(0, &symbol_value, b"a").unwrap();
+        planner.add_symbol_value(0, 0, &symbol_value, b"a").unwrap();
 
         assert_eq!(planner.columns[0].dict_count, u16::MAX as u32 + 1);
         assert_eq!(planner.columns[0].non_null_count, 1);
