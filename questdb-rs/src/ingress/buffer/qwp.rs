@@ -2632,6 +2632,31 @@ mod tests {
     }
 
     #[test]
+    fn qwp_flushes_segment_with_exactly_u16_max_distinct_symbols() {
+        let mut buf = QwpBuffer::new(127);
+        let mut scratch = QwpSendScratch::new(1400);
+
+        for i in 0..u16::MAX {
+            buf.table("trades")
+                .unwrap()
+                .symbol("sym", i.to_string())
+                .unwrap();
+            buf.at_now().unwrap();
+        }
+
+        let mut datagram_count = 0usize;
+        buf.flush_to_socket(&mut scratch, 1400, &mut |datagram| {
+            datagram_count += 1;
+            assert!(datagram.len() <= 1400);
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(buf.row_count(), u16::MAX as usize);
+        assert!(datagram_count > 0);
+    }
+
+    #[test]
     fn qwp_size_hint_segment_planner_rejects_out_of_range_index() {
         let size_hint = QwpSizeHint::new();
 

@@ -1014,6 +1014,182 @@ fn qwp_udp_encodes_sparse_timestamp_columns_as_nullable_nulls() -> TestResult {
 }
 
 #[test]
+fn qwp_udp_encodes_sparse_symbol_columns_as_nullable_nulls() -> TestResult {
+    let mock = QwpUdpMock::new()?;
+    let mut sender = mock.sender_builder().build()?;
+    let mut buffer = sender.new_buffer();
+
+    buffer
+        .table("trades")?
+        .symbol("sym", "r1")?
+        .symbol("venue", "A")?
+        .at_now()?;
+    buffer.table("trades")?.symbol("sym", "r2")?.at_now()?;
+    buffer
+        .table("trades")?
+        .symbol("sym", "r3")?
+        .symbol("venue", "B")?
+        .at_now()?;
+
+    sender.flush(&mut buffer)?;
+    let decoded = decode_datagram(&mock.recv_datagram()?).expect("datagram should decode");
+    assert_eq!(decoded.table.name, "trades");
+    assert_eq!(
+        decoded
+            .table
+            .columns
+            .iter()
+            .map(|column| (column.name.as_str(), column.nullable))
+            .collect::<Vec<_>>(),
+        vec![("sym", true), ("venue", true)]
+    );
+    assert_eq!(
+        decoded.table.rows,
+        vec![
+            vec![
+                DecodedValue::Symbol("r1".to_owned()),
+                DecodedValue::Symbol("A".to_owned()),
+            ],
+            vec![DecodedValue::Symbol("r2".to_owned()), DecodedValue::Null],
+            vec![
+                DecodedValue::Symbol("r3".to_owned()),
+                DecodedValue::Symbol("B".to_owned()),
+            ],
+        ]
+    );
+
+    Ok(())
+}
+
+#[test]
+fn qwp_udp_encodes_sparse_string_columns_as_nullable_nulls() -> TestResult {
+    let mock = QwpUdpMock::new()?;
+    let mut sender = mock.sender_builder().build()?;
+    let mut buffer = sender.new_buffer();
+
+    buffer
+        .table("trades")?
+        .column_i64("seq", 1)?
+        .column_str("note", "alpha")?
+        .at_now()?;
+    buffer.table("trades")?.column_i64("seq", 2)?.at_now()?;
+    buffer
+        .table("trades")?
+        .column_i64("seq", 3)?
+        .column_str("note", "beta")?
+        .at_now()?;
+
+    sender.flush(&mut buffer)?;
+    let decoded = decode_datagram(&mock.recv_datagram()?).expect("datagram should decode");
+    assert_eq!(decoded.table.name, "trades");
+    assert_eq!(
+        decoded
+            .table
+            .columns
+            .iter()
+            .map(|column| (column.name.as_str(), column.nullable))
+            .collect::<Vec<_>>(),
+        vec![("seq", false), ("note", true)]
+    );
+    assert_eq!(
+        decoded.table.rows,
+        vec![
+            vec![DecodedValue::I64(1), DecodedValue::String("alpha".to_owned())],
+            vec![DecodedValue::I64(2), DecodedValue::Null],
+            vec![DecodedValue::I64(3), DecodedValue::String("beta".to_owned())],
+        ]
+    );
+
+    Ok(())
+}
+
+#[test]
+fn qwp_udp_round_trips_empty_and_utf8_strings() -> TestResult {
+    let mock = QwpUdpMock::new()?;
+    let mut sender = mock.sender_builder().build()?;
+    let mut buffer = sender.new_buffer();
+
+    buffer
+        .table("trades")?
+        .column_i64("seq", 1)?
+        .column_str("note", "")?
+        .at_now()?;
+    buffer
+        .table("trades")?
+        .column_i64("seq", 2)?
+        .column_str("note", "naive cafe")?
+        .at_now()?;
+    buffer
+        .table("trades")?
+        .column_i64("seq", 3)?
+        .column_str("note", "hello 🌍 東京")?
+        .at_now()?;
+
+    sender.flush(&mut buffer)?;
+    let decoded = decode_datagram(&mock.recv_datagram()?).expect("datagram should decode");
+    assert_eq!(decoded.table.name, "trades");
+    assert_eq!(
+        decoded.table.rows,
+        vec![
+            vec![DecodedValue::I64(1), DecodedValue::String("".to_owned())],
+            vec![
+                DecodedValue::I64(2),
+                DecodedValue::String("naive cafe".to_owned()),
+            ],
+            vec![
+                DecodedValue::I64(3),
+                DecodedValue::String("hello 🌍 東京".to_owned()),
+            ],
+        ]
+    );
+
+    Ok(())
+}
+
+#[test]
+fn qwp_udp_round_trips_empty_and_utf8_symbols() -> TestResult {
+    let mock = QwpUdpMock::new()?;
+    let mut sender = mock.sender_builder().build()?;
+    let mut buffer = sender.new_buffer();
+
+    buffer
+        .table("trades")?
+        .symbol("label", "")?
+        .column_i64("seq", 1)?
+        .at_now()?;
+    buffer
+        .table("trades")?
+        .symbol("label", "münchen")?
+        .column_i64("seq", 2)?
+        .at_now()?;
+    buffer
+        .table("trades")?
+        .symbol("label", "🚀 東京")?
+        .column_i64("seq", 3)?
+        .at_now()?;
+
+    sender.flush(&mut buffer)?;
+    let decoded = decode_datagram(&mock.recv_datagram()?).expect("datagram should decode");
+    assert_eq!(decoded.table.name, "trades");
+    assert_eq!(
+        decoded.table.rows,
+        vec![
+            vec![DecodedValue::Symbol("".to_owned()), DecodedValue::I64(1)],
+            vec![
+                DecodedValue::Symbol("münchen".to_owned()),
+                DecodedValue::I64(2),
+            ],
+            vec![
+                DecodedValue::Symbol("🚀 東京".to_owned()),
+                DecodedValue::I64(3),
+            ],
+        ]
+    );
+
+    Ok(())
+}
+
+#[test]
 fn qwp_udp_rejects_mixed_designated_timestamp_precisions_within_table_batch() -> TestResult {
     let mock = QwpUdpMock::new()?;
     let sender = mock.sender_builder().build()?;
