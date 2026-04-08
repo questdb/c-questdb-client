@@ -1917,3 +1917,433 @@ TEST_CASE("line_sender c++ qwpudp opts reusable after protocol_version error")
     buffer.table("test").column("x", int64_t{1}).at_now();
     sender.flush(buffer);
 }
+
+TEST_CASE("line_sender c++ qwpudp all column types with designated timestamp")
+{
+    udp_capture receiver;
+    questdb::ingress::opts opts{
+        questdb::ingress::protocol::qwpudp,
+        std::string("127.0.0.1"),
+        std::to_string(receiver.port())};
+    questdb::ingress::line_sender sender{opts};
+
+    questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
+    buffer.table("sensor_data")
+        .symbol("location", "NYC")
+        .column("active", true)
+        .column("count", int64_t{42})
+        .column("temperature", 23.5)
+        .column("label", "hello"_utf8)
+        .column("event_ts", questdb::ingress::timestamp_nanos{123456789})
+        .column("sample_ts", questdb::ingress::timestamp_micros{987654})
+        .at(questdb::ingress::timestamp_nanos{1000000000});
+
+    sender.flush(buffer);
+    CHECK(buffer.row_count() == 0);
+    const auto datagram = receiver.recv_datagram();
+    CHECK(datagram_starts_with_qwp1(datagram));
+    // Verify at least the header + one row was encoded.
+    CHECK(datagram.size() > 20);
+}
+
+TEST_CASE("line_sender c++ qwpudp at_micros designated timestamp")
+{
+    udp_capture receiver;
+    questdb::ingress::opts opts{
+        questdb::ingress::protocol::qwpudp,
+        std::string("127.0.0.1"),
+        std::to_string(receiver.port())};
+    questdb::ingress::line_sender sender{opts};
+
+    questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
+    buffer.table("ticks")
+        .symbol("sym", "AAPL")
+        .column("px", 150.25)
+        .at(questdb::ingress::timestamp_micros{5000000});
+
+    sender.flush(buffer);
+    const auto datagram = receiver.recv_datagram();
+    CHECK(datagram_starts_with_qwp1(datagram));
+}
+
+TEST_CASE("line_sender c++ qwpudp sparse columns across rows")
+{
+    udp_capture receiver;
+    questdb::ingress::opts opts{
+        questdb::ingress::protocol::qwpudp,
+        std::string("127.0.0.1"),
+        std::to_string(receiver.port())};
+    questdb::ingress::line_sender sender{opts};
+
+    questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
+    // Row 1: has "qty" and "active", no "px"
+    buffer.table("trades")
+        .symbol("sym", "ETH-USD")
+        .column("qty", int64_t{10})
+        .column("active", true)
+        .at_now();
+    // Row 2: has "px" and "active", no "qty"
+    buffer.table("trades")
+        .symbol("sym", "BTC-USD")
+        .column("px", 45000.0)
+        .column("active", false)
+        .at_now();
+    // Row 3: only "qty"
+    buffer.table("trades")
+        .symbol("sym", "SOL-USD")
+        .column("qty", int64_t{99})
+        .at_now();
+
+    CHECK(buffer.row_count() == 3);
+    sender.flush(buffer);
+    CHECK(buffer.row_count() == 0);
+    const auto datagram = receiver.recv_datagram();
+    CHECK(datagram_starts_with_qwp1(datagram));
+}
+
+TEST_CASE("line_sender c++ qwpudp multiple tables in one flush")
+{
+    udp_capture receiver;
+    questdb::ingress::opts opts{
+        questdb::ingress::protocol::qwpudp,
+        std::string("127.0.0.1"),
+        std::to_string(receiver.port())};
+    questdb::ingress::line_sender sender{opts};
+
+    questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
+    buffer.table("trades")
+        .symbol("sym", "ETH-USD")
+        .column("qty", int64_t{4})
+        .at_now();
+    buffer.table("quotes")
+        .symbol("sym", "BTC-USD")
+        .column("bid", 44000.0)
+        .at_now();
+    buffer.table("trades")
+        .symbol("sym", "SOL-USD")
+        .column("qty", int64_t{7})
+        .at_now();
+
+    CHECK(buffer.row_count() == 3);
+    sender.flush(buffer);
+    // Each table batch becomes a separate datagram.
+    const auto d1 = receiver.recv_datagram();
+    const auto d2 = receiver.recv_datagram();
+    CHECK(datagram_starts_with_qwp1(d1));
+    CHECK(datagram_starts_with_qwp1(d2));
+    // Three tables batches: trades(2 rows), quotes(1 row) -> 2 datagrams
+    // (the two "trades" rows that are separated by "quotes" become 2 batches)
+}
+
+TEST_CASE("line_sender c++ qwpudp clear and reuse buffer")
+{
+    udp_capture receiver;
+    questdb::ingress::opts opts{
+        questdb::ingress::protocol::qwpudp,
+        std::string("127.0.0.1"),
+        std::to_string(receiver.port())};
+    questdb::ingress::line_sender sender{opts};
+
+    questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
+    buffer.table("t").symbol("s", "a").column("x", int64_t{1}).at_now();
+    CHECK(buffer.row_count() == 1);
+
+    buffer.clear();
+    CHECK(buffer.row_count() == 0);
+
+    // Buffer should be reusable after clear.
+    buffer.table("t").symbol("s", "b").column("x", int64_t{2}).at_now();
+    CHECK(buffer.row_count() == 1);
+    sender.flush(buffer);
+    const auto datagram = receiver.recv_datagram();
+    CHECK(datagram_starts_with_qwp1(datagram));
+}
+
+TEST_CASE("line_sender c++ qwpudp flush_and_keep empty buffer is noop")
+{
+    udp_capture receiver;
+    questdb::ingress::opts opts{
+        questdb::ingress::protocol::qwpudp,
+        std::string("127.0.0.1"),
+        std::to_string(receiver.port())};
+    questdb::ingress::line_sender sender{opts};
+
+    questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
+    CHECK(buffer.row_count() == 0);
+
+    // Should not throw or send anything.
+    sender.flush_and_keep(buffer);
+    CHECK(buffer.row_count() == 0);
+}
+
+TEST_CASE("line_sender c api qwpudp bookmark rewind and stale rejection")
+{
+    udp_capture receiver;
+    ::line_sender_error* err = nullptr;
+    on_scope_exit error_free_guard{[&] {
+        if (err)
+            ::line_sender_error_free(err);
+    }};
+
+    const auto host = QDB_UTF8_LITERAL("127.0.0.1");
+    ::line_sender_opts* opts =
+        ::line_sender_opts_new(::line_sender_protocol_qwpudp, host, receiver.port());
+    REQUIRE(opts != nullptr);
+
+    ::line_sender* sender = ::line_sender_build(opts, &err);
+    REQUIRE(sender != nullptr);
+    on_scope_exit sender_close_guard{[&] { ::line_sender_close(sender); }};
+
+    ::line_sender_buffer* buffer = ::line_sender_buffer_new_for_sender(sender);
+    REQUIRE(buffer != nullptr);
+    on_scope_exit buffer_free_guard{[&] { ::line_sender_buffer_free(buffer); }};
+
+    const auto table = QDB_TABLE_NAME_LITERAL("t");
+    const auto col = QDB_COLUMN_NAME_LITERAL("x");
+
+    // Add a row, then bookmark.
+    CHECK(::line_sender_buffer_table(buffer, table, &err));
+    CHECK(::line_sender_buffer_column_i64(buffer, col, 1, &err));
+    CHECK(::line_sender_buffer_at_now(buffer, &err));
+    CHECK(::line_sender_buffer_row_count(buffer) == 1);
+
+    ::line_sender_bookmark bm{};
+    CHECK(::line_sender_buffer_bookmark(buffer, &bm, &err));
+
+    // Add a second row.
+    CHECK(::line_sender_buffer_table(buffer, table, &err));
+    CHECK(::line_sender_buffer_column_i64(buffer, col, 2, &err));
+    CHECK(::line_sender_buffer_at_now(buffer, &err));
+    CHECK(::line_sender_buffer_row_count(buffer) == 2);
+
+    // Rewind discards the second row.
+    CHECK(::line_sender_buffer_rewind_to_bookmark(buffer, bm, &err));
+    CHECK(::line_sender_buffer_row_count(buffer) == 1);
+
+    // Flush sends only the first row.
+    CHECK(::line_sender_flush(sender, buffer, &err));
+    const auto datagram = receiver.recv_datagram();
+    CHECK(datagram_starts_with_qwp1(datagram));
+
+    // After flush the bookmark is consumed; rewind should fail.
+    CHECK_FALSE(::line_sender_buffer_rewind_to_bookmark(buffer, bm, &err));
+    REQUIRE(err != nullptr);
+    ::line_sender_error_free(err);
+    err = nullptr;
+}
+
+TEST_CASE("line_sender c api qwpudp flush_and_keep via c api")
+{
+    udp_capture receiver;
+    ::line_sender_error* err = nullptr;
+    on_scope_exit error_free_guard{[&] {
+        if (err)
+            ::line_sender_error_free(err);
+    }};
+
+    const auto host = QDB_UTF8_LITERAL("127.0.0.1");
+    ::line_sender_opts* opts =
+        ::line_sender_opts_new(::line_sender_protocol_qwpudp, host, receiver.port());
+    REQUIRE(opts != nullptr);
+
+    ::line_sender* sender = ::line_sender_build(opts, &err);
+    REQUIRE(sender != nullptr);
+    on_scope_exit sender_close_guard{[&] { ::line_sender_close(sender); }};
+
+    ::line_sender_buffer* buffer = ::line_sender_buffer_new_for_sender(sender);
+    REQUIRE(buffer != nullptr);
+    on_scope_exit buffer_free_guard{[&] { ::line_sender_buffer_free(buffer); }};
+
+    const auto table = QDB_TABLE_NAME_LITERAL("t");
+    const auto col = QDB_COLUMN_NAME_LITERAL("x");
+
+    CHECK(::line_sender_buffer_table(buffer, table, &err));
+    CHECK(::line_sender_buffer_column_i64(buffer, col, 42, &err));
+    CHECK(::line_sender_buffer_at_now(buffer, &err));
+
+    // flush_and_keep preserves the buffer content.
+    CHECK(::line_sender_flush_and_keep(sender, buffer, &err));
+    CHECK(::line_sender_buffer_row_count(buffer) == 1);
+    const auto first = receiver.recv_datagram();
+    CHECK(datagram_starts_with_qwp1(first));
+
+    // Second flush_and_keep sends the same data.
+    CHECK(::line_sender_flush_and_keep(sender, buffer, &err));
+    CHECK(::line_sender_buffer_row_count(buffer) == 1);
+    const auto second = receiver.recv_datagram();
+    CHECK(second == first);
+
+    // Regular flush clears the buffer.
+    CHECK(::line_sender_flush(sender, buffer, &err));
+    CHECK(::line_sender_buffer_row_count(buffer) == 0);
+}
+
+TEST_CASE("line_sender c api qwpudp all column types with at_nanos")
+{
+    udp_capture receiver;
+    ::line_sender_error* err = nullptr;
+    on_scope_exit error_free_guard{[&] {
+        if (err)
+            ::line_sender_error_free(err);
+    }};
+
+    const auto host = QDB_UTF8_LITERAL("127.0.0.1");
+    ::line_sender_opts* opts =
+        ::line_sender_opts_new(::line_sender_protocol_qwpudp, host, receiver.port());
+    REQUIRE(opts != nullptr);
+
+    ::line_sender* sender = ::line_sender_build(opts, &err);
+    REQUIRE(sender != nullptr);
+    on_scope_exit sender_close_guard{[&] { ::line_sender_close(sender); }};
+
+    ::line_sender_buffer* buffer = ::line_sender_buffer_new_for_sender(sender);
+    REQUIRE(buffer != nullptr);
+    on_scope_exit buffer_free_guard{[&] { ::line_sender_buffer_free(buffer); }};
+
+    const auto table = QDB_TABLE_NAME_LITERAL("sensors");
+    const auto sym = QDB_COLUMN_NAME_LITERAL("loc");
+    const auto active = QDB_COLUMN_NAME_LITERAL("active");
+    const auto count = QDB_COLUMN_NAME_LITERAL("count");
+    const auto temp = QDB_COLUMN_NAME_LITERAL("temp");
+    const auto label = QDB_COLUMN_NAME_LITERAL("label");
+    const auto event_ts = QDB_COLUMN_NAME_LITERAL("event_ts");
+    const auto sym_value = QDB_UTF8_LITERAL("NYC");
+    const auto label_value = QDB_UTF8_LITERAL("sensor-a");
+
+    CHECK(::line_sender_buffer_table(buffer, table, &err));
+    CHECK(::line_sender_buffer_symbol(buffer, sym, sym_value, &err));
+    CHECK(::line_sender_buffer_column_bool(buffer, active, true, &err));
+    CHECK(::line_sender_buffer_column_i64(buffer, count, 100, &err));
+    CHECK(::line_sender_buffer_column_f64(buffer, temp, 22.75, &err));
+    CHECK(::line_sender_buffer_column_str(buffer, label, label_value, &err));
+    CHECK(::line_sender_buffer_column_ts_nanos(buffer, event_ts, 123456789, &err));
+    CHECK(::line_sender_buffer_at_nanos(buffer, 1000000000, &err));
+
+    CHECK(::line_sender_flush(sender, buffer, &err));
+    const auto datagram = receiver.recv_datagram();
+    CHECK(datagram_starts_with_qwp1(datagram));
+    CHECK(datagram.size() > 20);
+}
+
+TEST_CASE("line_sender c api qwpudp at_micros designated timestamp")
+{
+    udp_capture receiver;
+    ::line_sender_error* err = nullptr;
+    on_scope_exit error_free_guard{[&] {
+        if (err)
+            ::line_sender_error_free(err);
+    }};
+
+    const auto host = QDB_UTF8_LITERAL("127.0.0.1");
+    ::line_sender_opts* opts =
+        ::line_sender_opts_new(::line_sender_protocol_qwpudp, host, receiver.port());
+    REQUIRE(opts != nullptr);
+
+    ::line_sender* sender = ::line_sender_build(opts, &err);
+    REQUIRE(sender != nullptr);
+    on_scope_exit sender_close_guard{[&] { ::line_sender_close(sender); }};
+
+    ::line_sender_buffer* buffer = ::line_sender_buffer_new_for_sender(sender);
+    REQUIRE(buffer != nullptr);
+    on_scope_exit buffer_free_guard{[&] { ::line_sender_buffer_free(buffer); }};
+
+    const auto table = QDB_TABLE_NAME_LITERAL("ticks");
+    const auto col = QDB_COLUMN_NAME_LITERAL("px");
+
+    CHECK(::line_sender_buffer_table(buffer, table, &err));
+    CHECK(::line_sender_buffer_column_f64(buffer, col, 150.25, &err));
+    CHECK(::line_sender_buffer_at_micros(buffer, 5000000, &err));
+
+    CHECK(::line_sender_flush(sender, buffer, &err));
+    const auto datagram = receiver.recv_datagram();
+    CHECK(datagram_starts_with_qwp1(datagram));
+}
+
+TEST_CASE("line_sender c api qwpudp sparse columns across rows")
+{
+    udp_capture receiver;
+    ::line_sender_error* err = nullptr;
+    on_scope_exit error_free_guard{[&] {
+        if (err)
+            ::line_sender_error_free(err);
+    }};
+
+    const auto host = QDB_UTF8_LITERAL("127.0.0.1");
+    ::line_sender_opts* opts =
+        ::line_sender_opts_new(::line_sender_protocol_qwpudp, host, receiver.port());
+    REQUIRE(opts != nullptr);
+
+    ::line_sender* sender = ::line_sender_build(opts, &err);
+    REQUIRE(sender != nullptr);
+    on_scope_exit sender_close_guard{[&] { ::line_sender_close(sender); }};
+
+    ::line_sender_buffer* buffer = ::line_sender_buffer_new_for_sender(sender);
+    REQUIRE(buffer != nullptr);
+    on_scope_exit buffer_free_guard{[&] { ::line_sender_buffer_free(buffer); }};
+
+    const auto table = QDB_TABLE_NAME_LITERAL("trades");
+    const auto sym = QDB_COLUMN_NAME_LITERAL("sym");
+    const auto qty = QDB_COLUMN_NAME_LITERAL("qty");
+    const auto px = QDB_COLUMN_NAME_LITERAL("px");
+    const auto active = QDB_COLUMN_NAME_LITERAL("active");
+
+    // Row 1: has qty and active, no px.
+    CHECK(::line_sender_buffer_table(buffer, table, &err));
+    CHECK(::line_sender_buffer_symbol(buffer, sym, QDB_UTF8_LITERAL("ETH"), &err));
+    CHECK(::line_sender_buffer_column_i64(buffer, qty, 10, &err));
+    CHECK(::line_sender_buffer_column_bool(buffer, active, true, &err));
+    CHECK(::line_sender_buffer_at_now(buffer, &err));
+
+    // Row 2: has px and active, no qty.
+    CHECK(::line_sender_buffer_table(buffer, table, &err));
+    CHECK(::line_sender_buffer_symbol(buffer, sym, QDB_UTF8_LITERAL("BTC"), &err));
+    CHECK(::line_sender_buffer_column_f64(buffer, px, 45000.0, &err));
+    CHECK(::line_sender_buffer_column_bool(buffer, active, false, &err));
+    CHECK(::line_sender_buffer_at_now(buffer, &err));
+
+    // Row 3: only qty.
+    CHECK(::line_sender_buffer_table(buffer, table, &err));
+    CHECK(::line_sender_buffer_symbol(buffer, sym, QDB_UTF8_LITERAL("SOL"), &err));
+    CHECK(::line_sender_buffer_column_i64(buffer, qty, 99, &err));
+    CHECK(::line_sender_buffer_at_now(buffer, &err));
+
+    CHECK(::line_sender_buffer_row_count(buffer) == 3);
+    CHECK(::line_sender_flush(sender, buffer, &err));
+
+    const auto datagram = receiver.recv_datagram();
+    CHECK(datagram_starts_with_qwp1(datagram));
+}
+
+TEST_CASE("line_sender c++ qwpudp rejects duplicate column name")
+{
+    questdb::ingress::line_sender_buffer buffer =
+        questdb::ingress::line_sender_buffer::qwp_udp();
+
+    buffer.table("t").column("x", int64_t{1});
+    CHECK_THROWS_AS(
+        buffer.column("x", int64_t{2}),
+        questdb::ingress::line_sender_error);
+}
+
+TEST_CASE("line_sender c++ qwpudp new_buffer inherits max_name_len")
+{
+    udp_capture receiver;
+    questdb::ingress::opts opts{
+        questdb::ingress::protocol::qwpudp,
+        std::string("127.0.0.1"),
+        std::to_string(receiver.port())};
+    opts.max_name_len(16);
+    questdb::ingress::line_sender sender{opts};
+
+    questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
+    // Name with 17 chars should exceed the inherited max_name_len of 16.
+    CHECK_THROWS_AS(
+        buffer.table("abcdefghijklmnopq"),
+        questdb::ingress::line_sender_error);
+
+    // Name with exactly 16 chars should be fine.
+    buffer.table("abcdefghijklmnop").column("x", int64_t{1}).at_now();
+    sender.flush(buffer);
+    const auto datagram = receiver.recv_datagram();
+    CHECK(datagram_starts_with_qwp1(datagram));
+}
