@@ -282,17 +282,16 @@ impl Buffer {
         }
     }
 
-    /// Returns whether the buffered batch is still eligible for transactional
-    /// flushing.
+    /// Returns whether the buffered batch is transactional.
     ///
-    /// This is `true` only while the buffer contains rows for at most one table.
-    /// Actual transactional behavior also depends on the transport; QWP/UDP does
-    /// not support transactional flushes.
+    /// For ILP buffers this is `true` only while the buffer contains rows for
+    /// at most one table. QWP/UDP does not support transactional flushes, so
+    /// QWP buffers always return `false`.
     pub fn transactional(&self) -> bool {
         match &self.inner {
             BufferInner::Ilp(inner) => inner.transactional(),
             #[cfg(feature = "_sender-qwp-udp")]
-            BufferInner::Qwp(inner) => inner.transactional(),
+            BufferInner::Qwp(_) => false,
         }
     }
 

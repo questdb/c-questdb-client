@@ -610,7 +610,7 @@ The redesign must preserve all of the following:
 * public `Sender` and `Buffer` method behavior
 * QWP flush clearing semantics
 * marker and rewind semantics
-* transactional flag behavior
+* QWP `Buffer::transactional()` behavior (`false` for QWP buffers)
 * maximum-name-length validation
 * duplicate-column detection within a row
 * type-change errors within a contiguous same-table batch
@@ -637,7 +637,7 @@ accidentally as a side-effect of the internal rewrite.
 * introduce flat arenas and arena-specific slice types
 * switch row commit logic to produce `RowMeta` / `EntryMeta`
 * make `clear()` and marker rewind length-based
-* port `len()` / `row_count()` / `transactional()` to the new storage
+* port `len()` / `row_count()` to the new storage
 
 ### Phase 2: Replace flush scratch
 

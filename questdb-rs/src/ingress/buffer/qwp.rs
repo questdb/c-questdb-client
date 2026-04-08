@@ -266,8 +266,6 @@ impl PendingRowState {
 struct BufferState {
     op_state: OpState,
     row_count: usize,
-    first_table_name: Option<NameSlice>,
-    transactional: bool,
 }
 
 impl BufferState {
@@ -275,8 +273,6 @@ impl BufferState {
         Self {
             op_state: OpState::new(),
             row_count: 0,
-            first_table_name: None,
-            transactional: true,
         }
     }
 }
@@ -516,10 +512,6 @@ impl QwpBuffer {
         self.state.row_count
     }
 
-    pub(crate) fn transactional(&self) -> bool {
-        self.state.transactional
-    }
-
     pub(crate) fn is_empty(&self) -> bool {
         self.pending.table.is_none() && self.rows.is_empty()
     }
@@ -738,18 +730,6 @@ impl QwpBuffer {
         Ok(())
     }
 
-    fn update_transactional_state(&mut self, table_ns: NameSlice) {
-        if let Some(first_ns) = self.state.first_table_name {
-            let first_bytes = &self.name_bytes[first_ns.0.as_range()];
-            let current_bytes = &self.name_bytes[table_ns.0.as_range()];
-            if first_bytes != current_bytes {
-                self.state.transactional = false;
-            }
-        } else {
-            self.state.first_table_name = Some(table_ns);
-        }
-    }
-
     fn mark_pending_entry_name(&self, name: &str) -> crate::Result<()> {
         // Linear scan over current row's entries for duplicate detection
         let start = self.pending.entry_start as usize;
@@ -786,7 +766,6 @@ impl QwpBuffer {
         };
 
         let table_ns = self.append_name(name.as_ref())?;
-        self.update_transactional_state(table_ns);
         self.pending.table = Some(table_ns);
         self.state.op_state.record_table();
         Ok(self)
@@ -2922,7 +2901,6 @@ mod tests {
 
         // After error rollback, buffer is empty — flush is a no-op.
         buf.check_can_flush().unwrap();
-        assert!(buf.transactional());
 
         buf.table("hi").unwrap().column_i64("qty", 2).unwrap();
         buf.at_now().unwrap();
@@ -2981,12 +2959,9 @@ mod tests {
         assert_eq!(buf.row_count(), 1);
         assert_eq!(buf.state.op_state, state_before.op_state);
         assert_eq!(buf.state.row_count, state_before.row_count);
-        assert_eq!(buf.state.first_table_name, state_before.first_table_name);
-        assert_eq!(buf.state.transactional, state_before.transactional);
         assert_eq!(buf.entries.len(), entries_len_before);
         assert_eq!(buf.name_bytes.len(), name_bytes_len_before);
         assert_eq!(buf.value_bytes.len(), value_bytes_len_before);
-        assert!(buf.transactional());
         assert!(buf.pending.table.is_none());
         buf.check_can_flush().unwrap();
     }
@@ -3019,8 +2994,6 @@ mod tests {
         assert_eq!(buf.row_count(), 1);
         assert_eq!(buf.state.op_state, state_before.op_state);
         assert_eq!(buf.state.row_count, state_before.row_count);
-        assert_eq!(buf.state.first_table_name, state_before.first_table_name);
-        assert_eq!(buf.state.transactional, state_before.transactional);
         assert_eq!(buf.size_hint.planner.current_len, planner_len_before);
         assert_eq!(buf.size_hint.planner.row_count(), planner_rows_before);
         assert_eq!(buf.entries.len(), entries_len_before);

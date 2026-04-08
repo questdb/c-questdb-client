@@ -280,7 +280,8 @@ impl Sender {
     /// A flush is transactional iff all the rows belong to the same table. This allows
     /// QuestDB to treat the flush as a single database transaction, because it doesn't
     /// support transactions spanning multiple tables. Additionally, only ILP-over-HTTP
-    /// supports transactional flushes.
+    /// supports transactional flushes; QWP/UDP is a best-effort datagram transport and
+    /// has no flush-level atomicity guarantee.
     ///
     /// If the flush wouldn't be transactional, this function returns an error and
     /// doesn't flush any data.
@@ -320,6 +321,11 @@ impl Sender {
     /// underlying OS-level network socket, without waiting to actually send it to the
     /// server. In the case of an error, the server will quietly disconnect: consult the
     /// server logs for error messages.
+    ///
+    /// With QWP-over-UDP, the function sends one or more UDP datagrams and returns
+    /// local socket errors only. A successful return does not guarantee delivery, and
+    /// when a flush spans multiple datagrams there is no all-or-nothing guarantee for
+    /// the logical batch.
     ///
     /// HTTP should be the first choice, but use TCP if you need to continuously send
     /// data to the server at a high rate.

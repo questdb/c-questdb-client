@@ -199,7 +199,7 @@ fn qwp_udp_splits_batched_rows_when_datagram_size_is_too_small() -> TestResult {
 }
 
 #[test]
-fn qwp_udp_markers_rewind_rows_and_transactional_state() -> TestResult {
+fn qwp_udp_markers_rewind_rows() -> TestResult {
     let mock = QwpUdpMock::new()?;
     let sender = mock.sender_builder().build()?;
     let mut buffer = sender.new_buffer();
@@ -210,7 +210,7 @@ fn qwp_udp_markers_rewind_rows_and_transactional_state() -> TestResult {
         .column_i64("qty", 1)?
         .at_now()?;
     assert_eq!(buffer.row_count(), 1);
-    assert!(buffer.transactional());
+    assert!(!buffer.transactional());
 
     buffer.set_marker()?;
     buffer
@@ -223,7 +223,7 @@ fn qwp_udp_markers_rewind_rows_and_transactional_state() -> TestResult {
 
     buffer.rewind_to_marker()?;
     assert_eq!(buffer.row_count(), 1);
-    assert!(buffer.transactional());
+    assert!(!buffer.transactional());
 
     buffer
         .table("trades")?
@@ -231,7 +231,7 @@ fn qwp_udp_markers_rewind_rows_and_transactional_state() -> TestResult {
         .column_i64("qty", 3)?
         .at_now()?;
     assert_eq!(buffer.row_count(), 2);
-    assert!(buffer.transactional());
+    assert!(!buffer.transactional());
 
     Ok(())
 }
@@ -253,7 +253,7 @@ fn qwp_udp_marker_rewind_discards_in_progress_row() -> TestResult {
     buffer.rewind_to_marker()?;
 
     assert_eq!(buffer.row_count(), 1);
-    assert!(buffer.transactional());
+    assert!(!buffer.transactional());
 
     sender.flush(&mut buffer)?;
     let datagram = mock.recv_datagram()?;
@@ -265,7 +265,7 @@ fn qwp_udp_marker_rewind_discards_in_progress_row() -> TestResult {
 }
 
 #[test]
-fn qwp_udp_bookmarks_rewind_rows_and_transactional_state() -> TestResult {
+fn qwp_udp_bookmarks_rewind_rows() -> TestResult {
     let mock = QwpUdpMock::new()?;
     let sender = mock.sender_builder().build()?;
     let mut buffer = sender.new_buffer();
@@ -276,7 +276,7 @@ fn qwp_udp_bookmarks_rewind_rows_and_transactional_state() -> TestResult {
         .column_i64("qty", 1)?
         .at_now()?;
     assert_eq!(buffer.row_count(), 1);
-    assert!(buffer.transactional());
+    assert!(!buffer.transactional());
 
     let bookmark = buffer.bookmark()?;
     buffer
@@ -289,7 +289,7 @@ fn qwp_udp_bookmarks_rewind_rows_and_transactional_state() -> TestResult {
 
     buffer.rewind_to_bookmark(bookmark)?;
     assert_eq!(buffer.row_count(), 1);
-    assert!(buffer.transactional());
+    assert!(!buffer.transactional());
 
     buffer
         .table("trades")?
@@ -297,7 +297,7 @@ fn qwp_udp_bookmarks_rewind_rows_and_transactional_state() -> TestResult {
         .column_i64("qty", 3)?
         .at_now()?;
     assert_eq!(buffer.row_count(), 2);
-    assert!(buffer.transactional());
+    assert!(!buffer.transactional());
 
     Ok(())
 }
@@ -611,7 +611,7 @@ fn qwp_udp_failed_flush_preserves_bookmark() -> TestResult {
 
     buffer.rewind_to_bookmark(bookmark)?;
     assert_eq!(buffer.row_count(), 1);
-    assert!(buffer.transactional());
+    assert!(!buffer.transactional());
 
     Ok(())
 }

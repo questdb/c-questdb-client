@@ -63,8 +63,8 @@ QuestDB instances), call
 
 # Error Handling
 
-The two supported transport modes, HTTP and TCP, handle errors very differently.
-In a nutshell, HTTP is much better at error handling.
+The supported transport modes handle errors very differently. In a nutshell,
+HTTP is much better at error handling.
 
 ## TCP
 
@@ -74,6 +74,16 @@ on the reason. When this has happened, the sender transitions into an error
 state, and it is permanently unusable. You must drop it and create a new sender.
 You can inspect the sender's error state by calling
 [`sender.must_close()`](Sender::must_close).
+
+## QWP/UDP
+
+QWP/UDP is a best-effort datagram transport. A `flush()` call sends one or more
+UDP datagrams and can report only local socket errors. A successful return does
+not guarantee delivery, server-side processing, or flush-level atomicity.
+
+When one logical flush spans multiple datagrams, some datagrams may already
+have been emitted before a later send fails. In that case, retrying the same
+buffer may duplicate rows that were already sent.
 
 ## HTTP
 

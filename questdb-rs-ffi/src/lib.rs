@@ -968,9 +968,11 @@ pub unsafe extern "C" fn line_sender_buffer_row_count(buffer: *const line_sender
     }
 }
 
-/// Tell whether the buffer is transactional. It is transactional iff it contains
-/// data for at most one table. Additionally, you must send the buffer over HTTP to
-/// get transactional behavior.
+/// Tell whether the buffer is transactional.
+///
+/// ILP buffers are transactional iff they contain data for at most one table.
+/// QWP/UDP does not support transactional flushes, so QWP buffers always return
+/// `false`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_transactional(
     buffer: *const line_sender_buffer,
@@ -2048,6 +2050,11 @@ pub unsafe extern "C" fn line_sender_close(sender: *mut line_sender) {
 /// server. In the case of an error, the server will quietly disconnect: consult the
 /// server logs for error messages.
 ///
+/// With QWP-over-UDP, the function sends one or more UDP datagrams and returns
+/// local socket errors only. A successful return does not guarantee delivery, and
+/// when a flush spans multiple datagrams there is no all-or-nothing guarantee for
+/// the logical batch.
+///
 /// HTTP should be the first choice, but use TCP if you need to continuously send
 /// data to the server at a high rate.
 ///
@@ -2100,7 +2107,8 @@ pub unsafe extern "C" fn line_sender_flush_and_keep(
 /// A flush is transactional iff all the rows belong to the same table. This allows
 /// QuestDB to treat the flush as a single database transaction, because it doesn't
 /// support transactions spanning multiple tables. Additionally, only ILP-over-HTTP
-/// supports transactional flushes.
+/// supports transactional flushes; QWP/UDP is a best-effort datagram transport and
+/// has no flush-level atomicity guarantee.
 ///
 /// If the flush wouldn't be transactional, this function returns an error and
 /// doesn't flush any data.
