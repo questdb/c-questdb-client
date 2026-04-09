@@ -27,7 +27,8 @@ use crate::Error;
 use crate::ErrorCode;
 use crate::error;
 use crate::ingress::decimal::DecimalView;
-use crate::ingress::{ArrayElement, NdArrayView, Timestamp};
+use crate::ingress::ndarr::{self, ArrayElementSealed};
+use crate::ingress::{ArrayElement, MAX_ARRAY_DIMS, NdArrayView, Timestamp};
 use std::collections::hash_map::RandomState;
 use std::fmt::Debug;
 use std::hash::{BuildHasher, Hash, Hasher};
@@ -78,6 +79,7 @@ pub(crate) const QWP_TYPE_STRING: u8 = 0x08;
 pub(crate) const QWP_TYPE_SYMBOL: u8 = 0x09;
 pub(crate) const QWP_TYPE_TIMESTAMP: u8 = 0x0A;
 pub(crate) const QWP_TYPE_TIMESTAMP_NANOS: u8 = 0x10;
+pub(crate) const QWP_TYPE_DOUBLE_ARRAY: u8 = 0x11;
 pub(crate) const QWP_VERSION_1: u8 = 1;
 const QWP_INLINE_SCHEMA_ID: u64 = 0;
 
@@ -160,6 +162,7 @@ enum ColumnKind {
     I64,
     F64,
     String,
+    DoubleArray,
     TimestampMicros,
     TimestampNanos,
 }
@@ -183,6 +186,7 @@ enum ValueRef {
     TimestampNanos(i64),
     Symbol(ValueSlice),
     String(ValueSlice),
+    DoubleArray(ValueSlice),
 }
 
 impl ValueRef {
@@ -195,6 +199,7 @@ impl ValueRef {
             ValueRef::TimestampNanos(_) => ColumnKind::TimestampNanos,
             ValueRef::Symbol(_) => ColumnKind::Symbol,
             ValueRef::String(_) => ColumnKind::String,
+            ValueRef::DoubleArray(_) => ColumnKind::DoubleArray,
         }
     }
 }
@@ -708,6 +713,74 @@ impl QwpBuffer {
         Ok(ValueSlice(ByteSlice { offset, len }))
     }
 
+    fn append_value_f64_array<T, D>(&mut self, view: &T) -> crate::Result<ValueSlice>
+    where
+        T: NdArrayView<D>,
+        D: ArrayElement + ArrayElementSealed,
+    {
+        if D::type_tag() != <f64 as ArrayElementSealed>::type_tag() {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "QWP/UDP currently supports only f64 arrays"
+            ));
+        }
+
+        let ndim = view.ndim();
+        if ndim == 0 {
+            return Err(error::fmt!(
+                ArrayError,
+                "Zero-dimensional arrays are not supported",
+            ));
+        }
+        if ndim > MAX_ARRAY_DIMS {
+            return Err(error::fmt!(
+                ArrayError,
+                "Array dimension mismatch: expected at most {} dimensions, but got {}",
+                MAX_ARRAY_DIMS,
+                ndim
+            ));
+        }
+
+        let array_buf_size = ndarr::check_and_get_array_bytes_size(view)?;
+        let shape_header_size = checked_qwp_usize_mul(ndim, 4, "array shape header size")?;
+        let payload_len = checked_qwp_usize_add(1, shape_header_size, "array payload size")?;
+        let payload_len = checked_qwp_usize_add(payload_len, array_buf_size, "array payload size")?;
+
+        let offset =
+            Self::checked_arena_offset(self.value_bytes.len(), payload_len, "value_bytes")?;
+        let len = checked_qwp_u32(payload_len, "array value length")?;
+
+        let start = self.value_bytes.len();
+        self.value_bytes.push(ndim as u8);
+        for i in 0..ndim {
+            let dim = view.dim(i)?;
+            // This should already hold because `check_and_get_array_bytes_size()`
+            // enforces `MAX_ARRAY_DIM_LEN`, but keep the narrowing explicit so
+            // any future limit changes still fail with a precise error here.
+            let dim = u32::try_from(dim).map_err(|_| {
+                error::fmt!(
+                    ArrayError,
+                    "Array dimension {} exceeds maximum encodable size of {}",
+                    i,
+                    u32::MAX
+                )
+            })?;
+            self.value_bytes.extend_from_slice(&dim.to_le_bytes());
+        }
+        let data_start = self.value_bytes.len();
+        self.value_bytes.resize(data_start + array_buf_size, 0);
+        if let Err(err) = ndarr::write_array_data(
+            view,
+            &mut self.value_bytes[data_start..data_start + array_buf_size],
+            array_buf_size,
+        ) {
+            self.value_bytes.truncate(start);
+            return Err(err);
+        }
+
+        Ok(ValueSlice(ByteSlice { offset, len }))
+    }
+
     #[cfg(test)]
     fn name_str(&self, ns: NameSlice) -> &str {
         std::str::from_utf8(&self.name_bytes[ns.0.as_range()]).expect("name must be valid UTF-8")
@@ -876,18 +949,25 @@ impl QwpBuffer {
     }
 
     #[allow(private_bounds)]
-    pub(crate) fn column_arr<'a, N, T, D>(
-        &mut self,
-        _name: N,
-        _view: &T,
-    ) -> crate::Result<&mut Self>
+    pub(crate) fn column_arr<'a, N, T, D>(&mut self, name: N, view: &T) -> crate::Result<&mut Self>
     where
         N: TryInto<ColumnName<'a>>,
         T: NdArrayView<D>,
-        D: ArrayElement,
+        D: ArrayElement + ArrayElementSealed,
         Error: From<N::Error>,
     {
-        Err(unsupported_qwp_call("column_arr"))
+        let name: ColumnName<'a> = name.try_into()?;
+        self.validate_max_name_len(name.as_ref())?;
+        self.check_op(Op::Column)?;
+        self.mark_pending_entry_name(name.as_ref())?;
+        let name_ns = self.append_name(name.as_ref())?;
+        let value_vs = self.append_value_f64_array(view)?;
+        self.push_entry(EntryMeta {
+            name: name_ns,
+            value: ValueRef::DoubleArray(value_vs),
+        })?;
+        self.state.op_state.record_column();
+        Ok(self)
     }
 
     pub(crate) fn column_ts<'a, N, T>(&mut self, name: N, value: T) -> crate::Result<&mut Self>
@@ -1077,6 +1157,7 @@ impl QwpBuffer {
                 ValueRef::Symbol(vs) => vs.0.len as usize + 3,
                 ValueRef::I64(_) | ValueRef::F64(_) => 8,
                 ValueRef::String(vs) => vs.0.len as usize + 9,
+                ValueRef::DoubleArray(vs) => vs.0.len as usize + 5,
                 ValueRef::TimestampMicros(_) | ValueRef::TimestampNanos(_) => 9,
             };
         }
@@ -1355,7 +1436,7 @@ struct SymbolEntry {
 struct ColumnStats {
     name: NameSlice,
     non_null_count: u32,
-    string_data_len: usize,
+    variable_data_len: usize,
     symbol_dict_bytes: usize,
     symbol_row_index_bytes: usize,
     dict_head: u32,
@@ -1375,7 +1456,7 @@ impl ColumnStats {
         base_nullable: bool,
         row_count: usize,
         non_null_count: u32,
-        string_data_len: usize,
+        variable_data_len: usize,
         symbol_dict_bytes: usize,
         symbol_row_index_bytes: usize,
         dict_count: u32,
@@ -1396,8 +1477,9 @@ impl ColumnStats {
                 let offset_count =
                     checked_qwp_usize_add(non_null_count as usize, 1, "string offset count")?;
                 let offsets = checked_qwp_usize_mul(offset_count, 4, "string offset table")?;
-                checked_qwp_usize_add(offsets, string_data_len, "string column size")?
+                checked_qwp_usize_add(offsets, variable_data_len, "string column size")?
             }
+            ColumnKind::DoubleArray => variable_data_len,
             ColumnKind::Symbol => {
                 let base = checked_qwp_usize_add(
                     qwp_varint_size(dict_count as u64),
@@ -1418,7 +1500,7 @@ impl ColumnStats {
         Self {
             name: entry.name,
             non_null_count: 0,
-            string_data_len: 0,
+            variable_data_len: 0,
             symbol_dict_bytes: 0,
             symbol_row_index_bytes: 0,
             dict_head: CELL_END,
@@ -1432,6 +1514,7 @@ impl ColumnStats {
                 kind,
                 ColumnKind::Symbol
                     | ColumnKind::String
+                    | ColumnKind::DoubleArray
                     | ColumnKind::TimestampMicros
                     | ColumnKind::TimestampNanos
             ),
@@ -1444,7 +1527,7 @@ impl ColumnStats {
             self.base_nullable,
             row_count,
             self.non_null_count,
-            self.string_data_len,
+            self.variable_data_len,
             self.symbol_dict_bytes,
             self.symbol_row_index_bytes,
             self.dict_count,
@@ -1502,18 +1585,34 @@ impl ColumnStats {
             },
             ColumnKind::String => match value {
                 ValueRef::String(vs) => {
-                    let new_string_data_len = checked_qwp_usize_add(
-                        self.string_data_len,
+                    let new_variable_data_len = checked_qwp_usize_add(
+                        self.variable_data_len,
                         vs.0.len as usize,
                         "string payload bytes",
                     )?;
                     self.non_null_count = new_non_null_count;
-                    self.string_data_len = new_string_data_len;
+                    self.variable_data_len = new_variable_data_len;
                     Ok(())
                 }
                 _ => Err(error::fmt!(
                     InvalidApiCall,
                     "internal QWP type mismatch for string column"
+                )),
+            },
+            ColumnKind::DoubleArray => match value {
+                ValueRef::DoubleArray(vs) => {
+                    let new_variable_data_len = checked_qwp_usize_add(
+                        self.variable_data_len,
+                        vs.0.len as usize,
+                        "array payload bytes",
+                    )?;
+                    self.non_null_count = new_non_null_count;
+                    self.variable_data_len = new_variable_data_len;
+                    Ok(())
+                }
+                _ => Err(error::fmt!(
+                    InvalidApiCall,
+                    "internal QWP type mismatch for double array column"
                 )),
             },
             ColumnKind::Symbol => {
@@ -1534,7 +1633,7 @@ impl ColumnStats {
 #[derive(Clone, Debug)]
 struct ColumnUndo {
     non_null_count: u32,
-    string_data_len: usize,
+    variable_data_len: usize,
     symbol_dict_bytes: usize,
     symbol_row_index_bytes: usize,
     dict_tail: u32,
@@ -1701,7 +1800,7 @@ impl RowGroupPlanner {
         for undo in self.undo_stack.drain(..).rev() {
             let col = &mut self.columns[undo.col_idx as usize];
             col.non_null_count = undo.non_null_count;
-            col.string_data_len = undo.string_data_len;
+            col.variable_data_len = undo.variable_data_len;
             col.symbol_dict_bytes = undo.symbol_dict_bytes;
             col.symbol_row_index_bytes = undo.symbol_row_index_bytes;
             col.dict_tail = undo.dict_tail;
@@ -1772,7 +1871,7 @@ impl RowGroupPlanner {
                 }
                 self.undo_stack.push(ColumnUndo {
                     non_null_count: col.non_null_count,
-                    string_data_len: col.string_data_len,
+                    variable_data_len: col.variable_data_len,
                     symbol_dict_bytes: col.symbol_dict_bytes,
                     symbol_row_index_bytes: col.symbol_row_index_bytes,
                     dict_tail: col.dict_tail,
@@ -1836,6 +1935,7 @@ impl RowGroupPlanner {
                 ColumnKind::I64 | ColumnKind::F64 => touched_fixed8_column_count += 1,
                 ColumnKind::Symbol
                 | ColumnKind::String
+                | ColumnKind::DoubleArray
                 | ColumnKind::TimestampMicros
                 | ColumnKind::TimestampNanos => touched_bitmap_column_count += 1,
             }
@@ -1845,7 +1945,7 @@ impl RowGroupPlanner {
                     col.base_nullable,
                     old_row_count,
                     undo.non_null_count,
-                    undo.string_data_len,
+                    undo.variable_data_len,
                     undo.symbol_dict_bytes,
                     undo.symbol_row_index_bytes,
                     undo.dict_count,
@@ -2032,6 +2132,7 @@ impl RowGroupPlanner {
             ColumnKind::I64 | ColumnKind::F64 => self.fixed8_column_count += 1,
             ColumnKind::Symbol
             | ColumnKind::String
+            | ColumnKind::DoubleArray
             | ColumnKind::TimestampMicros
             | ColumnKind::TimestampNanos => self.bitmap_column_count += 1,
         }
@@ -2105,6 +2206,7 @@ fn kind_supports_sparse_nulls(kind: ColumnKind) -> bool {
         kind,
         ColumnKind::Symbol
             | ColumnKind::String
+            | ColumnKind::DoubleArray
             | ColumnKind::TimestampMicros
             | ColumnKind::TimestampNanos
     )
@@ -2131,6 +2233,7 @@ fn wire_type_byte(kind: ColumnKind, nullable: bool) -> u8 {
         ColumnKind::I64 => QWP_TYPE_LONG,
         ColumnKind::F64 => QWP_TYPE_DOUBLE,
         ColumnKind::String => QWP_TYPE_STRING,
+        ColumnKind::DoubleArray => QWP_TYPE_DOUBLE_ARRAY,
         ColumnKind::TimestampMicros => QWP_TYPE_TIMESTAMP,
         ColumnKind::TimestampNanos => QWP_TYPE_TIMESTAMP_NANOS,
     }
@@ -2380,6 +2483,14 @@ fn encode_column_from_cells(
             }
         }
 
+        ColumnKind::DoubleArray => {
+            for cell in CellIter::new(cells, col.cell_head) {
+                if let ValueRef::DoubleArray(vs) = cell.value {
+                    out.extend_from_slice(&value_bytes[vs.0.as_range()]);
+                }
+            }
+        }
+
         ColumnKind::Symbol => {
             // Dictionary via linked list
             write_qwp_varint(out, col.dict_count as u64);
@@ -2525,7 +2636,7 @@ mod tests {
             name: NameSlice(ByteSlice { offset: 0, len: 1 }),
             value: string_value,
         });
-        col.string_data_len = usize::MAX;
+        col.variable_data_len = usize::MAX;
 
         let err = col.add_non_symbol_value(&string_value).unwrap_err();
         assert_eq!(err.code(), ErrorCode::InvalidApiCall);

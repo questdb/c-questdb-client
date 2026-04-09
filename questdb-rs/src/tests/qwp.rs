@@ -1445,16 +1445,56 @@ fn qwp_udp_rejects_flushing_incomplete_row() -> TestResult {
 }
 
 #[test]
-fn qwp_udp_rejects_column_arr() -> TestResult {
+fn qwp_udp_round_trips_f64_array_columns() -> TestResult {
     let mock = QwpUdpMock::new()?;
-    let sender = mock.sender_builder().build()?;
+    let mut sender = mock.sender_builder().build()?;
     let mut buffer = sender.new_buffer();
+    let contiguous = [1.0f64, 2.0, 3.0];
+    let non_contiguous = vec![vec![4.0f64, 5.0], vec![6.0, 7.0]];
 
-    buffer.table("trades")?;
-    assert_err_contains(
-        buffer.column_arr("samples", &[1.0f64, 2.0, 3.0]),
-        ErrorCode::InvalidApiCall,
-        "QWP/UDP support for `column_arr` is not implemented yet.",
+    buffer
+        .table("trades")?
+        .column_i64("seq", 1)?
+        .column_arr("samples", &contiguous)?
+        .at_now()?;
+    buffer.table("trades")?.column_i64("seq", 2)?.at_now()?;
+    buffer
+        .table("trades")?
+        .column_i64("seq", 3)?
+        .column_arr("samples", &non_contiguous)?
+        .at_now()?;
+
+    sender.flush(&mut buffer)?;
+    let decoded = decode_datagram(&mock.recv_datagram()?).expect("datagram should decode");
+    assert_eq!(decoded.table.name, "trades");
+    assert_eq!(
+        decoded
+            .table
+            .columns
+            .iter()
+            .map(|column| (column.name.as_str(), column.type_code, column.nullable))
+            .collect::<Vec<_>>(),
+        vec![("seq", 0x05, false), ("samples", 0x11, true)]
+    );
+    assert_eq!(
+        decoded.table.rows,
+        vec![
+            vec![
+                DecodedValue::I64(1),
+                DecodedValue::F64Array {
+                    shape: vec![3],
+                    values: vec![1.0, 2.0, 3.0],
+                },
+            ],
+            vec![DecodedValue::I64(2), DecodedValue::Null],
+            vec![
+                DecodedValue::I64(3),
+                DecodedValue::F64Array {
+                    shape: vec![2, 2],
+                    values: vec![4.0, 5.0, 6.0, 7.0],
+                },
+            ],
+        ]
     );
 
     Ok(())

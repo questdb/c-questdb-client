@@ -561,8 +561,8 @@ impl Buffer {
     #[allow(private_bounds)]
     /// Adds an array column to the current row.
     ///
-    /// Arrays require ILP protocol version 2 or later and are not currently
-    /// supported by QWP/UDP buffers.
+    /// Arrays require ILP protocol version 2 or later. QWP/UDP currently
+    /// supports `f64` arrays.
     pub fn column_arr<'a, N, T, D>(&mut self, name: N, view: &T) -> crate::Result<&mut Self>
     where
         N: TryInto<ColumnName<'a>>,

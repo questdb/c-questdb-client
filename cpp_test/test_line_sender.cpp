@@ -30,6 +30,7 @@
 #include <questdb/ingress/line_sender.h>
 #include <questdb/ingress/line_sender.hpp>
 
+#include <array>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -179,6 +180,166 @@ bool datagram_starts_with_qwp1(const std::vector<std::byte>& datagram)
 {
     return datagram.size() >= 4 &&
         std::memcmp(datagram.data(), "QWP1", 4) == 0;
+}
+
+struct qwp_test_decoded_column
+{
+    std::string name;
+    uint8_t type_code;
+};
+
+struct qwp_test_decoded_array_datagram
+{
+    std::string table_name;
+    uint64_t row_count;
+    qwp_test_decoded_column column;
+    std::vector<uint32_t> shape;
+    std::vector<double> values;
+};
+
+class qwp_test_decoder
+{
+public:
+    explicit qwp_test_decoder(const std::vector<std::byte>& bytes)
+        : _bytes{bytes}
+        , _pos{0}
+    {
+    }
+
+    uint8_t read_u8()
+    {
+        require_available(1);
+        return std::to_integer<uint8_t>(_bytes[_pos++]);
+    }
+
+    std::vector<std::byte> read_exact(size_t len)
+    {
+        require_available(len);
+        const size_t start = _pos;
+        _pos += len;
+        return {
+            _bytes.begin() + static_cast<std::ptrdiff_t>(start),
+            _bytes.begin() + static_cast<std::ptrdiff_t>(_pos)};
+    }
+
+    uint32_t read_u32()
+    {
+        const auto bytes = read_exact(4);
+        std::array<uint8_t, 4> raw{};
+        for (size_t i = 0; i < raw.size(); ++i)
+            raw[i] = std::to_integer<uint8_t>(bytes[i]);
+        return
+            static_cast<uint32_t>(raw[0]) |
+            (static_cast<uint32_t>(raw[1]) << 8) |
+            (static_cast<uint32_t>(raw[2]) << 16) |
+            (static_cast<uint32_t>(raw[3]) << 24);
+    }
+
+    uint64_t read_varint()
+    {
+        uint32_t shift = 0;
+        uint64_t value = 0;
+        for (;;)
+        {
+            const uint8_t byte = read_u8();
+            value |= static_cast<uint64_t>(byte & 0x7f) << shift;
+            if ((byte & 0x80) == 0)
+                return value;
+            shift += 7;
+            REQUIRE(shift < 64);
+        }
+    }
+
+    std::string read_string()
+    {
+        const auto len = static_cast<size_t>(read_varint());
+        const auto bytes = read_exact(len);
+        return {
+            reinterpret_cast<const char*>(bytes.data()),
+            bytes.size()};
+    }
+
+    double read_f64()
+    {
+        const auto bytes = read_exact(8);
+        std::array<uint8_t, 8> raw{};
+        for (size_t i = 0; i < raw.size(); ++i)
+            raw[i] = std::to_integer<uint8_t>(bytes[i]);
+        double value = 0.0;
+        std::memcpy(&value, raw.data(), sizeof(value));
+        return value;
+    }
+
+    size_t remaining() const
+    {
+        return _bytes.size() - _pos;
+    }
+
+private:
+    void require_available(size_t len) const
+    {
+        REQUIRE(_pos + len <= _bytes.size());
+    }
+
+    const std::vector<std::byte>& _bytes;
+    size_t _pos;
+};
+
+qwp_test_decoded_array_datagram decode_single_array_qwp_datagram(
+    const std::vector<std::byte>& datagram)
+{
+    constexpr uint8_t qwp_type_double_array = 0x11;
+    REQUIRE(datagram.size() >= 12);
+    REQUIRE(datagram_starts_with_qwp1(datagram));
+    CHECK(std::to_integer<uint8_t>(datagram[4]) == 1);
+    CHECK(std::to_integer<uint8_t>(datagram[6]) == 1);
+    CHECK(std::to_integer<uint8_t>(datagram[7]) == 0);
+    const uint32_t payload_len =
+        static_cast<uint32_t>(std::to_integer<uint8_t>(datagram[8])) |
+        (static_cast<uint32_t>(std::to_integer<uint8_t>(datagram[9])) << 8) |
+        (static_cast<uint32_t>(std::to_integer<uint8_t>(datagram[10])) << 16) |
+        (static_cast<uint32_t>(std::to_integer<uint8_t>(datagram[11])) << 24);
+    REQUIRE(datagram.size() == 12u + payload_len);
+
+    std::vector<std::byte> payload{
+        datagram.begin() + 12,
+        datagram.end()};
+    qwp_test_decoder decoder{payload};
+    qwp_test_decoded_array_datagram decoded{};
+    decoded.table_name = decoder.read_string();
+    decoded.row_count = decoder.read_varint();
+    REQUIRE(decoded.row_count == 1);
+    REQUIRE(decoder.read_varint() == 1);
+    REQUIRE(decoder.read_u8() == 0);
+    (void)decoder.read_varint(); // schema id
+
+    decoded.column.name = decoder.read_string();
+    decoded.column.type_code = decoder.read_u8();
+    REQUIRE(decoded.column.type_code == qwp_type_double_array);
+
+    const bool has_null_bitmap = decoder.read_u8() != 0;
+    if (has_null_bitmap)
+    {
+        const auto bitmap = decoder.read_exact(1);
+        REQUIRE(std::to_integer<uint8_t>(bitmap[0]) == 0);
+    }
+
+    const uint8_t rank = decoder.read_u8();
+    decoded.shape.reserve(rank);
+    size_t value_count = 1;
+    for (size_t i = 0; i < rank; ++i)
+    {
+        const uint32_t dim = decoder.read_u32();
+        decoded.shape.push_back(dim);
+        value_count *= dim;
+    }
+
+    decoded.values.reserve(value_count);
+    for (size_t i = 0; i < value_count; ++i)
+        decoded.values.push_back(decoder.read_f64());
+
+    REQUIRE(decoder.remaining() == 0);
+    return decoded;
 }
 
 std::string line_sender_error_message(const ::line_sender_error* err)
@@ -1550,6 +1711,58 @@ TEST_CASE("line_sender c api standalone qwpudp buffer")
     CHECK(datagram_starts_with_qwp1(datagram));
 }
 
+TEST_CASE("line_sender c api qwpudp f64 array column")
+{
+    udp_capture receiver;
+    ::line_sender_error* err = nullptr;
+    on_scope_exit error_free_guard{[&] {
+        if (err)
+            ::line_sender_error_free(err);
+    }};
+
+    const auto host = QDB_UTF8_LITERAL("127.0.0.1");
+    ::line_sender_opts* opts =
+        ::line_sender_opts_new(::line_sender_protocol_qwpudp, host, receiver.port());
+    REQUIRE(opts != nullptr);
+    on_scope_exit opts_free_guard{[&] { ::line_sender_opts_free(opts); }};
+
+    ::line_sender* sender = ::line_sender_build(opts, &err);
+    REQUIRE(sender != nullptr);
+    on_scope_exit sender_close_guard{[&] { ::line_sender_close(sender); }};
+
+    ::line_sender_buffer* buffer = ::line_sender_buffer_new_for_sender(sender);
+    REQUIRE(buffer != nullptr);
+    on_scope_exit buffer_free_guard{[&] { ::line_sender_buffer_free(buffer); }};
+
+    const auto table = QDB_TABLE_NAME_LITERAL("arrays");
+    const auto arr_col = QDB_COLUMN_NAME_LITERAL("arr");
+    uintptr_t shape[] = {2, 2};
+    std::array<double, 4> arr_data = {1.5, 2.0, -3.25, 4.75};
+
+    CHECK(::line_sender_buffer_table(buffer, table, &err));
+    CHECK(
+        ::line_sender_buffer_column_f64_arr_c_major(
+            buffer,
+            arr_col,
+            2,
+            shape,
+            arr_data.data(),
+            arr_data.size(),
+            &err));
+    CHECK(::line_sender_buffer_at_now(buffer, &err));
+    CHECK(::line_sender_flush(sender, buffer, &err));
+    CHECK(::line_sender_buffer_row_count(buffer) == 0);
+
+    const auto datagram = receiver.recv_datagram();
+    const auto decoded = decode_single_array_qwp_datagram(datagram);
+    CHECK(decoded.table_name == "arrays");
+    CHECK(decoded.column.name == "arr");
+    CHECK(decoded.shape == std::vector<uint32_t>{2, 2});
+    REQUIRE(decoded.values.size() == arr_data.size());
+    for (size_t i = 0; i < arr_data.size(); ++i)
+        CHECK(decoded.values[i] == doctest::Approx(arr_data[i]));
+}
+
 TEST_CASE("line_sender c api qwpudp max name len and peek")
 {
     ::line_sender_error* err = nullptr;
@@ -1673,6 +1886,36 @@ TEST_CASE("line_sender c++ standalone qwpudp buffer")
     CHECK(buffer.row_count() == 0);
     const auto datagram = receiver.recv_datagram();
     CHECK(datagram_starts_with_qwp1(datagram));
+}
+
+TEST_CASE("line_sender c++ qwpudp f64 array column")
+{
+    udp_capture receiver;
+    questdb::ingress::opts opts{
+        questdb::ingress::protocol::qwpudp,
+        std::string("127.0.0.1"),
+        std::to_string(receiver.port())};
+    questdb::ingress::line_sender sender{opts};
+
+    uintptr_t shape[] = {2, 3};
+    std::array<double, 6> arr_data = {10.0, 11.5, 12.0, 13.25, 14.0, 15.75};
+    questdb::ingress::array::row_major_view<double> arr{
+        2, shape, arr_data.data(), arr_data.size()};
+
+    questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
+    buffer.table("cpp_arrays").column("arr", arr).at_now();
+
+    sender.flush(buffer);
+    CHECK(buffer.row_count() == 0);
+
+    const auto datagram = receiver.recv_datagram();
+    const auto decoded = decode_single_array_qwp_datagram(datagram);
+    CHECK(decoded.table_name == "cpp_arrays");
+    CHECK(decoded.column.name == "arr");
+    CHECK(decoded.shape == std::vector<uint32_t>{2, 3});
+    REQUIRE(decoded.values.size() == arr_data.size());
+    for (size_t i = 0; i < arr_data.size(); ++i)
+        CHECK(decoded.values[i] == doctest::Approx(arr_data[i]));
 }
 
 TEST_CASE("line_sender c++ qwpudp rejects flush with incomplete row")

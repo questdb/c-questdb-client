@@ -41,6 +41,7 @@ const TYPE_STRING: u8 = 0x08;
 const TYPE_SYMBOL: u8 = 0x09;
 const TYPE_TIMESTAMP: u8 = 0x0A;
 const TYPE_TIMESTAMP_NANOS: u8 = 0x10;
+const TYPE_DOUBLE_ARRAY: u8 = 0x11;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DecodedDatagram {
@@ -74,6 +75,7 @@ pub(crate) enum DecodedValue {
     I64(i64),
     F64(f64),
     String(String),
+    F64Array { shape: Vec<usize>, values: Vec<f64> },
     TimestampMicros(i64),
     TimestampNanos(i64),
     Null,
@@ -353,6 +355,40 @@ pub(crate) fn decode_datagram(bytes: &[u8]) -> Result<DecodedDatagram, String> {
                         .map_err(|err| format!("invalid utf-8 in string value: {err}"))?;
                     values.push(DecodedValue::String(value.to_owned()));
                     next_offset += 1;
+                }
+                values
+            }
+            TYPE_DOUBLE_ARRAY => {
+                let non_null_count = has_value.iter().filter(|&&present| present).count();
+                let mut raw_values = Vec::with_capacity(non_null_count);
+                for _ in 0..non_null_count {
+                    let ndim = decoder.read_u8()? as usize;
+                    let mut shape = Vec::with_capacity(ndim);
+                    let mut elem_count = 1usize;
+                    for _ in 0..ndim {
+                        let dim = usize::try_from(decoder.read_i32()?)
+                            .map_err(|_| "negative array dimension".to_owned())?;
+                        elem_count = elem_count
+                            .checked_mul(dim)
+                            .ok_or_else(|| "array element count overflow".to_owned())?;
+                        shape.push(dim);
+                    }
+                    let mut values = Vec::with_capacity(elem_count);
+                    for _ in 0..elem_count {
+                        values.push(decoder.read_f64()?);
+                    }
+                    raw_values.push(DecodedValue::F64Array { shape, values });
+                }
+
+                let mut next_value = 0usize;
+                let mut values = Vec::with_capacity(row_count_usize);
+                for present in &has_value {
+                    if !present {
+                        values.push(DecodedValue::Null);
+                        continue;
+                    }
+                    values.push(raw_values[next_value].clone());
+                    next_value += 1;
                 }
                 values
             }
