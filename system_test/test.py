@@ -1378,6 +1378,44 @@ class TestQwpUdpSender(unittest.TestCase):
                 ['srv-2', True, 3, 22.5, 'row-2'],
             ])
 
+    def test_f64_array_columns_round_trip_over_qwp_udp(self):
+        self._require_qwp_udp_system_test()
+        if QDB_FIXTURE.version < FIRST_ARRAYS_RELEASE:
+            self.skipTest('No array support in this version of QuestDB.')
+
+        table_name = 'qwp_arr_' + uuid.uuid4().hex[:8]
+        array1 = np.array(
+            [
+                [[1.1, 2.2], [3.3, 4.4]],
+                [[5.5, 6.6], [7.7, 8.8]]
+            ],
+            dtype=np.float64
+        )
+        array2 = array1.T
+        array3 = array1[::-1, ::-1]
+
+        with self._mk_qwpudp_sender() as sender:
+            (sender
+             .table(table_name)
+             .column_f64_arr('f64_arr1', array1)
+             .column_f64_arr('f64_arr2', array2)
+             .column_f64_arr('f64_arr3', array3)
+             .at_now())
+            sender.flush()
+
+        resp = retry_check_table(table_name, min_rows=1, timeout_sec=30)
+        exp_columns = [
+            {'dim': 3, 'elemType': 'DOUBLE', 'name': 'f64_arr1', 'type': 'ARRAY'},
+            {'dim': 3, 'elemType': 'DOUBLE', 'name': 'f64_arr2', 'type': 'ARRAY'},
+            {'dim': 3, 'elemType': 'DOUBLE', 'name': 'f64_arr3', 'type': 'ARRAY'},
+            {'name': 'timestamp', 'type': 'TIMESTAMP'}]
+        self.assertEqual(resp['columns'], exp_columns)
+        expected_data = [[[[[1.1, 2.2], [3.3, 4.4]], [[5.5, 6.6], [7.7, 8.8]]],
+                          [[[1.1, 5.5], [3.3, 7.7]], [[2.2, 6.6], [4.4, 8.8]]],
+                          [[[7.7, 8.8], [5.5, 6.6]], [[3.3, 4.4], [1.1, 2.2]]]]]
+        scrubbed_data = [row[:-1] for row in resp['dataset']]
+        self.assertEqual(scrubbed_data, expected_data)
+
     def test_decimal_columns_round_trip_over_qwp_udp(self):
         self._require_qwp_udp_system_test()
         if QDB_FIXTURE.version < DECIMAL_RELEASE:
