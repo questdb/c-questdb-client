@@ -538,7 +538,8 @@ impl Buffer {
     /// Adds a decimal column to the current row.
     ///
     /// Returns an error if the active protocol does not support decimal values.
-    /// QWP/UDP buffers currently reject this call.
+    /// QWP/UDP accepts the same decimal input forms as ILP and encodes them as
+    /// nullable DECIMAL256 columns on the wire.
     pub fn column_dec<'a, N, S>(&mut self, name: N, value: S) -> crate::Result<&mut Self>
     where
         N: TryInto<ColumnName<'a>>,

@@ -80,8 +80,14 @@ pub(crate) const QWP_TYPE_SYMBOL: u8 = 0x09;
 pub(crate) const QWP_TYPE_TIMESTAMP: u8 = 0x0A;
 pub(crate) const QWP_TYPE_TIMESTAMP_NANOS: u8 = 0x10;
 pub(crate) const QWP_TYPE_DOUBLE_ARRAY: u8 = 0x11;
+pub(crate) const QWP_TYPE_DECIMAL256: u8 = 0x15;
 pub(crate) const QWP_VERSION_1: u8 = 1;
 const QWP_INLINE_SCHEMA_ID: u64 = 0;
+const QWP_DECIMAL_MAX_SCALE: u8 = 76;
+const QWP_DECIMAL_MAG_LIMBS: usize = 4;
+const QWP_DECIMAL_MAG_BYTES: usize = QWP_DECIMAL_MAG_LIMBS * 8;
+const QWP_STORED_DECIMAL_LEN: usize = 1 + 1 + QWP_DECIMAL_MAG_BYTES;
+const QWP_DECIMAL_SIGN_BIT: u64 = 1u64 << 63;
 
 fn checked_qwp_u32(value: usize, what: &'static str) -> crate::Result<u32> {
     if value > u32::MAX as usize {
@@ -133,6 +139,369 @@ fn checked_qwp_usize_mul(a: usize, b: usize, what: &'static str) -> crate::Resul
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StoredQwpDecimal {
+    scale: u8,
+    negative: bool,
+    magnitude: [u64; QWP_DECIMAL_MAG_LIMBS],
+}
+
+impl StoredQwpDecimal {
+    fn from_decimal_view(value: DecimalView<'_>) -> crate::Result<Option<Self>> {
+        match value {
+            DecimalView::String { value } => parse_decimal_text(value),
+            DecimalView::Scaled { scale, value } => {
+                if scale > QWP_DECIMAL_MAX_SCALE {
+                    return Err(invalid_decimal_error(format!(
+                        "QuestDB decimal scale cannot exceed {}, got {}",
+                        QWP_DECIMAL_MAX_SCALE,
+                        scale
+                    )));
+                }
+                let (magnitude, negative) = sign_mag_from_signed_be(value.as_ref())?;
+                Ok(Some(Self {
+                    scale,
+                    negative,
+                    magnitude,
+                }))
+            }
+        }
+    }
+
+    fn from_stored_bytes(bytes: &[u8]) -> crate::Result<Self> {
+        if bytes.len() != QWP_STORED_DECIMAL_LEN {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "internal QWP decimal value length mismatch: expected {}, got {}",
+                QWP_STORED_DECIMAL_LEN,
+                bytes.len()
+            ));
+        }
+
+        let mut magnitude = [0u64; QWP_DECIMAL_MAG_LIMBS];
+        for (idx, limb) in magnitude.iter_mut().enumerate() {
+            let start = 2 + idx * 8;
+            let end = start + 8;
+            let raw: [u8; 8] = bytes[start..end]
+                .try_into()
+                .expect("slice length is validated above");
+            *limb = u64::from_le_bytes(raw);
+        }
+
+        let negative = bytes[1] != 0 && !mag_is_zero(&magnitude);
+        Ok(Self {
+            scale: bytes[0],
+            negative,
+            magnitude,
+        })
+    }
+
+    fn write_to(&self, out: &mut Vec<u8>) {
+        out.push(self.scale);
+        out.push(u8::from(self.negative && !mag_is_zero(&self.magnitude)));
+        for limb in self.magnitude {
+            out.extend_from_slice(&limb.to_le_bytes());
+        }
+    }
+
+    fn wire_bytes_with_scale(&self, target_scale: u8) -> crate::Result<[u8; QWP_DECIMAL_MAG_BYTES]> {
+        if target_scale < self.scale {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "internal QWP decimal scale regression: target {} < value {}",
+                target_scale,
+                self.scale
+            ));
+        }
+
+        let mut magnitude = self.magnitude;
+        for _ in 0..u32::from(target_scale - self.scale) {
+            mul_mag_small(
+                &mut magnitude,
+                10,
+                "QWP decimal rescale exceeds DECIMAL256 range",
+            )?;
+        }
+        let signed_range_err = if target_scale == self.scale {
+            "QWP decimal value exceeds signed DECIMAL256 range"
+        } else {
+            "QWP decimal rescale exceeds signed DECIMAL256 range"
+        };
+        sign_mag_to_twos_le_bytes(
+            self.negative && !mag_is_zero(&magnitude),
+            &magnitude,
+            signed_range_err,
+        )
+    }
+}
+
+fn invalid_decimal_error(msg: impl Into<String>) -> crate::Error {
+    error::fmt!(InvalidDecimal, "{}", msg.into())
+}
+
+fn mag_is_zero(magnitude: &[u64; QWP_DECIMAL_MAG_LIMBS]) -> bool {
+    magnitude.iter().all(|&limb| limb == 0)
+}
+
+fn add_mag_small(
+    magnitude: &mut [u64; QWP_DECIMAL_MAG_LIMBS],
+    addend: u32,
+    err_msg: &'static str,
+) -> crate::Result<()> {
+    let mut carry = u128::from(addend);
+    for limb in magnitude.iter_mut() {
+        let sum = u128::from(*limb) + carry;
+        *limb = sum as u64;
+        carry = sum >> 64;
+        if carry == 0 {
+            return Ok(());
+        }
+    }
+    Err(invalid_decimal_error(err_msg))
+}
+
+fn mul_mag_small(
+    magnitude: &mut [u64; QWP_DECIMAL_MAG_LIMBS],
+    factor: u32,
+    err_msg: &'static str,
+) -> crate::Result<()> {
+    let mut carry = 0u128;
+    for limb in magnitude.iter_mut() {
+        let product = u128::from(*limb) * u128::from(factor) + carry;
+        *limb = product as u64;
+        carry = product >> 64;
+    }
+    if carry != 0 {
+        return Err(invalid_decimal_error(err_msg));
+    }
+    Ok(())
+}
+
+fn negate_twos_complement_be(bytes: &mut [u8]) {
+    for byte in bytes.iter_mut() {
+        *byte = !*byte;
+    }
+    let mut carry = 1u16;
+    for byte in bytes.iter_mut().rev() {
+        let sum = u16::from(*byte) + carry;
+        *byte = sum as u8;
+        carry = sum >> 8;
+        if carry == 0 {
+            break;
+        }
+    }
+}
+
+fn sign_mag_from_signed_be(
+    bytes: &[u8],
+) -> crate::Result<([u64; QWP_DECIMAL_MAG_LIMBS], bool)> {
+    if bytes.len() > QWP_DECIMAL_MAG_BYTES {
+        return Err(invalid_decimal_error(format!(
+            "QWP/UDP decimal mantissa exceeds {} bytes",
+            QWP_DECIMAL_MAG_BYTES
+        )));
+    }
+    if bytes.is_empty() {
+        return Ok(([0; QWP_DECIMAL_MAG_LIMBS], false));
+    }
+
+    let negative = bytes[0] & 0x80 != 0;
+    let mut extended = [if negative { 0xFF } else { 0x00 }; QWP_DECIMAL_MAG_BYTES];
+    extended[QWP_DECIMAL_MAG_BYTES - bytes.len()..].copy_from_slice(bytes);
+    if negative {
+        negate_twos_complement_be(&mut extended);
+    }
+
+    let mut magnitude = [0u64; QWP_DECIMAL_MAG_LIMBS];
+    for (idx, limb) in magnitude.iter_mut().enumerate() {
+        let start = QWP_DECIMAL_MAG_BYTES - (idx + 1) * 8;
+        let end = start + 8;
+        let raw: [u8; 8] = extended[start..end]
+            .try_into()
+            .expect("fixed-width decimal slice");
+        *limb = u64::from_be_bytes(raw);
+    }
+    let negative = negative && !mag_is_zero(&magnitude);
+    Ok((magnitude, negative))
+}
+
+fn sign_mag_to_twos_le_bytes(
+    negative: bool,
+    magnitude: &[u64; QWP_DECIMAL_MAG_LIMBS],
+    err_msg: &'static str,
+) -> crate::Result<[u8; QWP_DECIMAL_MAG_BYTES]> {
+    ensure_signed_decimal256_fits(negative, magnitude, err_msg)?;
+    let mut out = [0u8; QWP_DECIMAL_MAG_BYTES];
+    for (idx, limb) in magnitude.iter().enumerate() {
+        let start = idx * 8;
+        out[start..start + 8].copy_from_slice(&limb.to_le_bytes());
+    }
+    if negative && !mag_is_zero(magnitude) {
+        for byte in &mut out {
+            *byte = !*byte;
+        }
+        let mut carry = 1u16;
+        for byte in &mut out {
+            let sum = u16::from(*byte) + carry;
+            *byte = sum as u8;
+            carry = sum >> 8;
+            if carry == 0 {
+                break;
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn ensure_signed_decimal256_fits(
+    negative: bool,
+    magnitude: &[u64; QWP_DECIMAL_MAG_LIMBS],
+    err_msg: &'static str,
+) -> crate::Result<()> {
+    let high = magnitude[QWP_DECIMAL_MAG_LIMBS - 1];
+    let lower_non_zero = magnitude[..QWP_DECIMAL_MAG_LIMBS - 1]
+        .iter()
+        .any(|&limb| limb != 0);
+
+    let fits = if negative {
+        high < QWP_DECIMAL_SIGN_BIT || (high == QWP_DECIMAL_SIGN_BIT && !lower_non_zero)
+    } else {
+        high < QWP_DECIMAL_SIGN_BIT
+    };
+
+    if fits {
+        Ok(())
+    } else {
+        Err(invalid_decimal_error(err_msg))
+    }
+}
+
+fn parse_decimal_text(value: &str) -> crate::Result<Option<StoredQwpDecimal>> {
+    if value.is_empty() {
+        return Err(invalid_decimal_error("empty decimal value"));
+    }
+
+    let (negative, body) = match value.as_bytes()[0] {
+        b'+' => (false, &value[1..]),
+        b'-' => (true, &value[1..]),
+        _ => (false, value),
+    };
+    if body.eq_ignore_ascii_case("nan") || body.eq_ignore_ascii_case("infinity") {
+        return Ok(None);
+    }
+    if body.is_empty() {
+        return Err(invalid_decimal_error("missing decimal digits"));
+    }
+
+    let mut magnitude = [0u64; QWP_DECIMAL_MAG_LIMBS];
+    let mut seen_digit = false;
+    let mut seen_point = false;
+    let mut seen_exp = false;
+    let mut seen_exp_sign = false;
+    let mut seen_exp_digit = false;
+    let mut exp_negative = false;
+    let mut frac_digits = 0u32;
+    let mut exponent = 0u32;
+
+    for byte in body.bytes() {
+        match byte {
+            b'0'..=b'9' if !seen_exp => {
+                seen_digit = true;
+                mul_mag_small(
+                    &mut magnitude,
+                    10,
+                    "QWP/UDP decimal value exceeds DECIMAL256 range",
+                )?;
+                add_mag_small(
+                    &mut magnitude,
+                    u32::from(byte - b'0'),
+                    "QWP/UDP decimal value exceeds DECIMAL256 range",
+                )?;
+                if seen_point {
+                    frac_digits = frac_digits.checked_add(1).ok_or_else(|| {
+                        invalid_decimal_error("decimal scale exceeds supported range")
+                    })?;
+                }
+            }
+            b'0'..=b'9' => {
+                seen_exp_digit = true;
+                exponent = exponent
+                    .checked_mul(10)
+                    .and_then(|value| value.checked_add(u32::from(byte - b'0')))
+                    .ok_or_else(|| invalid_decimal_error("decimal exponent is too large"))?;
+            }
+            b'.' if !seen_point && !seen_exp => seen_point = true,
+            b'e' | b'E' if !seen_exp && seen_digit => seen_exp = true,
+            b'+' | b'-' if seen_exp && !seen_exp_sign && !seen_exp_digit => {
+                seen_exp_sign = true;
+                exp_negative = byte == b'-';
+            }
+            _ => {
+                return Err(invalid_decimal_error(format!(
+                    "invalid decimal value {:?}",
+                    value
+                )))
+            }
+        }
+    }
+
+    if !seen_digit {
+        return Err(invalid_decimal_error(format!(
+            "invalid decimal value {:?}",
+            value
+        )));
+    }
+    if seen_exp && !seen_exp_digit {
+        return Err(invalid_decimal_error(format!(
+            "invalid decimal exponent in {:?}",
+            value
+        )));
+    }
+
+    let exponent = if exp_negative {
+        -(i64::from(exponent))
+    } else {
+        i64::from(exponent)
+    };
+    let mut scale = i64::from(frac_digits) - exponent;
+    if scale < 0 {
+        let delta = (-scale) as u32;
+        if mag_is_zero(&magnitude) {
+            scale = 0;
+        } else {
+            // `10^77` still fits in 256 unsigned bits, so allow that much
+            // multiplication here and rely on the final signed DECIMAL256
+            // range check during wire encoding.
+            if delta > 77 {
+                return Err(invalid_decimal_error(
+                    "QWP/UDP decimal rescale exceeds DECIMAL256 range",
+                ));
+            }
+            for _ in 0..delta {
+                mul_mag_small(
+                    &mut magnitude,
+                    10,
+                    "QWP/UDP decimal rescale exceeds DECIMAL256 range",
+                )?;
+            }
+            scale = 0;
+        }
+    }
+    if scale > i64::from(QWP_DECIMAL_MAX_SCALE) {
+        return Err(invalid_decimal_error(format!(
+            "QuestDB decimal scale cannot exceed {}, got {}",
+            QWP_DECIMAL_MAX_SCALE,
+            scale
+        )));
+    }
+
+    Ok(Some(StoredQwpDecimal {
+        scale: scale as u8,
+        negative: negative && !mag_is_zero(&magnitude),
+        magnitude,
+    }))
+}
+
 // --- Arena slice types ---
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -162,6 +531,7 @@ enum ColumnKind {
     I64,
     F64,
     String,
+    Decimal,
     DoubleArray,
     TimestampMicros,
     TimestampNanos,
@@ -186,6 +556,8 @@ enum ValueRef {
     TimestampNanos(i64),
     Symbol(ValueSlice),
     String(ValueSlice),
+    DecimalNull,
+    Decimal(ValueSlice),
     DoubleArray(ValueSlice),
 }
 
@@ -199,6 +571,8 @@ impl ValueRef {
             ValueRef::TimestampNanos(_) => ColumnKind::TimestampNanos,
             ValueRef::Symbol(_) => ColumnKind::Symbol,
             ValueRef::String(_) => ColumnKind::String,
+            ValueRef::DecimalNull => ColumnKind::Decimal,
+            ValueRef::Decimal(_) => ColumnKind::Decimal,
             ValueRef::DoubleArray(_) => ColumnKind::DoubleArray,
         }
     }
@@ -713,6 +1087,20 @@ impl QwpBuffer {
         Ok(ValueSlice(ByteSlice { offset, len }))
     }
 
+    fn append_value_decimal(&mut self, value: DecimalView<'_>) -> crate::Result<Option<ValueSlice>> {
+        let Some(decimal) = StoredQwpDecimal::from_decimal_view(value)? else {
+            return Ok(None);
+        };
+        let offset = Self::checked_arena_offset(
+            self.value_bytes.len(),
+            QWP_STORED_DECIMAL_LEN,
+            "value_bytes",
+        )?;
+        let len = checked_qwp_u32(QWP_STORED_DECIMAL_LEN, "decimal value length")?;
+        decimal.write_to(&mut self.value_bytes);
+        Ok(Some(ValueSlice(ByteSlice { offset, len })))
+    }
+
     fn append_value_f64_array<T, D>(&mut self, view: &T) -> crate::Result<ValueSlice>
     where
         T: NdArrayView<D>,
@@ -938,14 +1326,29 @@ impl QwpBuffer {
         Ok(self)
     }
 
-    pub(crate) fn column_dec<'a, N, S>(&mut self, _name: N, _value: S) -> crate::Result<&mut Self>
+    pub(crate) fn column_dec<'a, N, S>(&mut self, name: N, value: S) -> crate::Result<&mut Self>
     where
         N: TryInto<ColumnName<'a>>,
         S: TryInto<DecimalView<'a>>,
         Error: From<N::Error>,
         Error: From<S::Error>,
     {
-        Err(unsupported_qwp_call("column_dec"))
+        let name: ColumnName<'a> = name.try_into()?;
+        self.validate_max_name_len(name.as_ref())?;
+        self.check_op(Op::Column)?;
+        let value: DecimalView<'a> = value.try_into()?;
+        self.mark_pending_entry_name(name.as_ref())?;
+        let name_ns = self.append_name(name.as_ref())?;
+        let value_ref = match self.append_value_decimal(value)? {
+            Some(value_vs) => ValueRef::Decimal(value_vs),
+            None => ValueRef::DecimalNull,
+        };
+        self.push_entry(EntryMeta {
+            name: name_ns,
+            value: value_ref,
+        })?;
+        self.state.op_state.record_column();
+        Ok(self)
     }
 
     #[allow(private_bounds)]
@@ -1157,6 +1560,8 @@ impl QwpBuffer {
                 ValueRef::Symbol(vs) => vs.0.len as usize + 3,
                 ValueRef::I64(_) | ValueRef::F64(_) => 8,
                 ValueRef::String(vs) => vs.0.len as usize + 9,
+                ValueRef::DecimalNull => 1,
+                ValueRef::Decimal(vs) => vs.0.len as usize + 2,
                 ValueRef::DoubleArray(vs) => vs.0.len as usize + 5,
                 ValueRef::TimestampMicros(_) | ValueRef::TimestampNanos(_) => 9,
             };
@@ -1439,6 +1844,7 @@ struct ColumnStats {
     variable_data_len: usize,
     symbol_dict_bytes: usize,
     symbol_row_index_bytes: usize,
+    decimal_scale: u8,
     dict_head: u32,
     dict_tail: u32,
     cell_head: u32,
@@ -1470,6 +1876,15 @@ impl ColumnStats {
             ColumnKind::I64 | ColumnKind::F64 => {
                 checked_qwp_usize_mul(row_count, 8, "column data size")?
             }
+            ColumnKind::Decimal => checked_qwp_usize_add(
+                1,
+                checked_qwp_usize_mul(
+                    non_null_count as usize,
+                    QWP_DECIMAL_MAG_BYTES,
+                    "decimal column size",
+                )?,
+                "decimal column size",
+            )?,
             ColumnKind::TimestampMicros | ColumnKind::TimestampNanos => {
                 checked_qwp_usize_mul(non_null_count as usize, 8, "column data size")?
             }
@@ -1503,6 +1918,7 @@ impl ColumnStats {
             variable_data_len: 0,
             symbol_dict_bytes: 0,
             symbol_row_index_bytes: 0,
+            decimal_scale: 0,
             dict_head: CELL_END,
             dict_tail: CELL_END,
             cell_head: CELL_END,
@@ -1514,6 +1930,7 @@ impl ColumnStats {
                 kind,
                 ColumnKind::Symbol
                     | ColumnKind::String
+                    | ColumnKind::Decimal
                     | ColumnKind::DoubleArray
                     | ColumnKind::TimestampMicros
                     | ColumnKind::TimestampNanos
@@ -1534,7 +1951,7 @@ impl ColumnStats {
         )
     }
 
-    fn add_non_symbol_value(&mut self, value: &ValueRef) -> crate::Result<()> {
+    fn add_non_symbol_value(&mut self, value: &ValueRef, value_bytes: &[u8]) -> crate::Result<()> {
         let new_non_null_count = self.non_null_count.checked_add(1).ok_or_else(|| {
             error::fmt!(
                 InvalidApiCall,
@@ -1571,6 +1988,19 @@ impl ColumnStats {
                 _ => Err(error::fmt!(
                     InvalidApiCall,
                     "internal QWP type mismatch for double column"
+                )),
+            },
+            ColumnKind::Decimal => match value {
+                ValueRef::DecimalNull => Ok(()),
+                ValueRef::Decimal(vs) => {
+                    let stored = StoredQwpDecimal::from_stored_bytes(&value_bytes[vs.0.as_range()])?;
+                    self.non_null_count = new_non_null_count;
+                    self.decimal_scale = self.decimal_scale.max(stored.scale);
+                    Ok(())
+                }
+                _ => Err(error::fmt!(
+                    InvalidApiCall,
+                    "internal QWP type mismatch for decimal column"
                 )),
             },
             ColumnKind::TimestampMicros | ColumnKind::TimestampNanos => match value {
@@ -1636,6 +2066,7 @@ struct ColumnUndo {
     variable_data_len: usize,
     symbol_dict_bytes: usize,
     symbol_row_index_bytes: usize,
+    decimal_scale: u8,
     dict_tail: u32,
     cell_tail: u32,
     col_idx: u16,
@@ -1803,6 +2234,7 @@ impl RowGroupPlanner {
             col.variable_data_len = undo.variable_data_len;
             col.symbol_dict_bytes = undo.symbol_dict_bytes;
             col.symbol_row_index_bytes = undo.symbol_row_index_bytes;
+            col.decimal_scale = undo.decimal_scale;
             col.dict_tail = undo.dict_tail;
             col.dict_count = undo.dict_count;
             if col.dict_tail != CELL_END {
@@ -1874,6 +2306,7 @@ impl RowGroupPlanner {
                     variable_data_len: col.variable_data_len,
                     symbol_dict_bytes: col.symbol_dict_bytes,
                     symbol_row_index_bytes: col.symbol_row_index_bytes,
+                    decimal_scale: col.decimal_scale,
                     dict_tail: col.dict_tail,
                     cell_tail: col.cell_tail,
                     col_idx: undo_col_idx,
@@ -1895,7 +2328,7 @@ impl RowGroupPlanner {
                 if col.kind == ColumnKind::Symbol {
                     self.add_symbol_value(idx, cell_idx, &entry.value, value_bytes)?;
                 } else {
-                    col.add_non_symbol_value(&entry.value)?;
+                    col.add_non_symbol_value(&entry.value, value_bytes)?;
                 }
             } else {
                 self.push_new_column(entry, value_bytes, row_idx)?;
@@ -1935,6 +2368,7 @@ impl RowGroupPlanner {
                 ColumnKind::I64 | ColumnKind::F64 => touched_fixed8_column_count += 1,
                 ColumnKind::Symbol
                 | ColumnKind::String
+                | ColumnKind::Decimal
                 | ColumnKind::DoubleArray
                 | ColumnKind::TimestampMicros
                 | ColumnKind::TimestampNanos => touched_bitmap_column_count += 1,
@@ -2132,6 +2566,7 @@ impl RowGroupPlanner {
             ColumnKind::I64 | ColumnKind::F64 => self.fixed8_column_count += 1,
             ColumnKind::Symbol
             | ColumnKind::String
+            | ColumnKind::Decimal
             | ColumnKind::DoubleArray
             | ColumnKind::TimestampMicros
             | ColumnKind::TimestampNanos => self.bitmap_column_count += 1,
@@ -2154,7 +2589,7 @@ impl RowGroupPlanner {
         if entry.value.kind() == ColumnKind::Symbol {
             self.add_symbol_value(col_idx, cell_idx, &entry.value, value_bytes)?;
         } else {
-            self.columns[col_idx].add_non_symbol_value(&entry.value)?;
+            self.columns[col_idx].add_non_symbol_value(&entry.value, value_bytes)?;
         }
         Ok(())
     }
@@ -2206,6 +2641,7 @@ fn kind_supports_sparse_nulls(kind: ColumnKind) -> bool {
         kind,
         ColumnKind::Symbol
             | ColumnKind::String
+            | ColumnKind::Decimal
             | ColumnKind::DoubleArray
             | ColumnKind::TimestampMicros
             | ColumnKind::TimestampNanos
@@ -2225,6 +2661,10 @@ fn write_qwp_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
 
+fn cell_value_is_null(value: ValueRef) -> bool {
+    matches!(value, ValueRef::DecimalNull)
+}
+
 fn wire_type_byte(kind: ColumnKind, nullable: bool) -> u8 {
     let _ = nullable;
     match kind {
@@ -2233,6 +2673,7 @@ fn wire_type_byte(kind: ColumnKind, nullable: bool) -> u8 {
         ColumnKind::I64 => QWP_TYPE_LONG,
         ColumnKind::F64 => QWP_TYPE_DOUBLE,
         ColumnKind::String => QWP_TYPE_STRING,
+        ColumnKind::Decimal => QWP_TYPE_DECIMAL256,
         ColumnKind::DoubleArray => QWP_TYPE_DOUBLE_ARRAY,
         ColumnKind::TimestampMicros => QWP_TYPE_TIMESTAMP,
         ColumnKind::TimestampNanos => QWP_TYPE_TIMESTAMP_NANOS,
@@ -2393,7 +2834,7 @@ fn encode_column_from_cells(
         let mut packed = 0u8;
         let mut bit_idx = 0u8;
         for maybe_cell in GapFillIter::new(cells, col.cell_head, row_count)? {
-            if maybe_cell.is_none() {
+            if maybe_cell.is_none_or(|cell| cell_value_is_null(cell.value)) {
                 packed |= 1 << bit_idx;
             }
             bit_idx += 1;
@@ -2483,6 +2924,25 @@ fn encode_column_from_cells(
             }
         }
 
+        ColumnKind::Decimal => {
+            out.push(col.decimal_scale);
+            for cell in CellIter::new(cells, col.cell_head) {
+                match cell.value {
+                    ValueRef::DecimalNull => {}
+                    ValueRef::Decimal(vs) => {
+                        let stored = StoredQwpDecimal::from_stored_bytes(&value_bytes[vs.0.as_range()])?;
+                        out.extend_from_slice(&stored.wire_bytes_with_scale(col.decimal_scale)?);
+                    }
+                    _ => {
+                        return Err(error::fmt!(
+                            InvalidApiCall,
+                            "internal QWP type mismatch for decimal column"
+                        ));
+                    }
+                }
+            }
+        }
+
         ColumnKind::DoubleArray => {
             for cell in CellIter::new(cells, col.cell_head) {
                 if let ValueRef::DoubleArray(vs) = cell.value {
@@ -2508,14 +2968,6 @@ fn encode_column_from_cells(
     }
 
     Ok(())
-}
-
-fn unsupported_qwp_call(method: &str) -> crate::Error {
-    error::fmt!(
-        InvalidApiCall,
-        "QWP/UDP support for `{}` is not implemented yet.",
-        method
-    )
 }
 
 fn to_designated_ts(timestamp: Timestamp) -> DesignatedTs {
@@ -2638,7 +3090,7 @@ mod tests {
         });
         col.variable_data_len = usize::MAX;
 
-        let err = col.add_non_symbol_value(&string_value).unwrap_err();
+        let err = col.add_non_symbol_value(&string_value, &[]).unwrap_err();
         assert_eq!(err.code(), ErrorCode::InvalidApiCall);
         assert!(
             err.msg()

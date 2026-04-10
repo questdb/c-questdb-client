@@ -42,6 +42,9 @@ const TYPE_SYMBOL: u8 = 0x09;
 const TYPE_TIMESTAMP: u8 = 0x0A;
 const TYPE_TIMESTAMP_NANOS: u8 = 0x10;
 const TYPE_DOUBLE_ARRAY: u8 = 0x11;
+const TYPE_DECIMAL64: u8 = 0x13;
+const TYPE_DECIMAL128: u8 = 0x14;
+const TYPE_DECIMAL256: u8 = 0x15;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DecodedDatagram {
@@ -75,6 +78,7 @@ pub(crate) enum DecodedValue {
     I64(i64),
     F64(f64),
     String(String),
+    Decimal { scale: u8, unscaled_be: Vec<u8> },
     F64Array { shape: Vec<usize>, values: Vec<f64> },
     TimestampMicros(i64),
     TimestampNanos(i64),
@@ -157,6 +161,29 @@ impl<'a> Decoder<'a> {
         raw.copy_from_slice(bytes);
         Ok(i32::from_le_bytes(raw))
     }
+}
+
+fn trim_signed_be(bytes: &[u8]) -> Vec<u8> {
+    if bytes.is_empty() {
+        return vec![0];
+    }
+    let negative = bytes[0] & 0x80 != 0;
+    let mut keep_from = 0usize;
+    while keep_from < bytes.len() - 1 {
+        let current = bytes[keep_from];
+        let next = bytes[keep_from + 1];
+        let should_trim = if negative {
+            current == 0xFF && (next & 0x80) == 0x80
+        } else {
+            current == 0x00 && (next & 0x80) == 0x00
+        };
+        if should_trim {
+            keep_from += 1;
+        } else {
+            break;
+        }
+    }
+    bytes[keep_from..].to_vec()
 }
 
 pub(crate) fn decode_datagram(bytes: &[u8]) -> Result<DecodedDatagram, String> {
@@ -324,6 +351,38 @@ pub(crate) fn decode_datagram(bytes: &[u8]) -> Result<DecodedDatagram, String> {
                         continue;
                     }
                     values.push(DecodedValue::F64(raw_values[next_value]));
+                    next_value += 1;
+                }
+                values
+            }
+            TYPE_DECIMAL64 | TYPE_DECIMAL128 | TYPE_DECIMAL256 => {
+                let width = match column.type_code {
+                    TYPE_DECIMAL64 => 8,
+                    TYPE_DECIMAL128 => 16,
+                    TYPE_DECIMAL256 => 32,
+                    _ => unreachable!(),
+                };
+                let scale = decoder.read_u8()?;
+                let non_null_count = has_value.iter().filter(|&&present| present).count();
+                let mut raw_values = Vec::with_capacity(non_null_count);
+                for _ in 0..non_null_count {
+                    let le = decoder.read_exact(width)?;
+                    let mut be = le.to_vec();
+                    be.reverse();
+                    raw_values.push(DecodedValue::Decimal {
+                        scale,
+                        unscaled_be: trim_signed_be(&be),
+                    });
+                }
+
+                let mut next_value = 0usize;
+                let mut values = Vec::with_capacity(row_count_usize);
+                for present in &has_value {
+                    if !present {
+                        values.push(DecodedValue::Null);
+                        continue;
+                    }
+                    values.push(raw_values[next_value].clone());
                     next_value += 1;
                 }
                 values

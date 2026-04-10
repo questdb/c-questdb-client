@@ -23,11 +23,54 @@
  ******************************************************************************/
 
 use crate::ErrorCode;
-use crate::ingress::{Buffer, ProtocolVersion, TimestampMicros, TimestampNanos};
+use crate::ingress::{Buffer, DecimalView, ProtocolVersion, TimestampMicros, TimestampNanos};
 #[cfg(feature = "sync-sender-tcp")]
 use crate::tests::mock::MockServer;
 use crate::tests::qwp_decode::{DecodedValue, decode_datagram};
 use crate::tests::{TestResult, assert_err_contains, qwp_mock::QwpUdpMock};
+
+const DECIMAL256_MAX_POS_STR: &str =
+    "57896044618658097711785492504343953926634992332820282019728792003956564819967";
+const DECIMAL256_MIN_NEG_STR: &str =
+    "-57896044618658097711785492504343953926634992332820282019728792003956564819968";
+const DECIMAL256_POSITIVE_OVERFLOW_STR: &str =
+    "57896044618658097711785492504343953926634992332820282019728792003956564819968";
+const DECIMAL256_SIGNED_RESCALE_OVERFLOW_BASE_STR: &str =
+    "5789604461865809771178549250434395392663499233282028201972879200395656481997";
+
+fn trim_signed_be(bytes: &[u8]) -> Vec<u8> {
+    if bytes.is_empty() {
+        return vec![0];
+    }
+    let negative = bytes[0] & 0x80 != 0;
+    let mut keep_from = 0usize;
+    while keep_from < bytes.len() - 1 {
+        let current = bytes[keep_from];
+        let next = bytes[keep_from + 1];
+        let should_trim = if negative {
+            current == 0xFF && (next & 0x80) == 0x80
+        } else {
+            current == 0x00 && (next & 0x80) == 0x00
+        };
+        if should_trim {
+            keep_from += 1;
+        } else {
+            break;
+        }
+    }
+    bytes[keep_from..].to_vec()
+}
+
+fn expected_decimal_bytes(scale: u8, unscaled_be: &[u8]) -> DecodedValue {
+    DecodedValue::Decimal {
+        scale,
+        unscaled_be: trim_signed_be(unscaled_be),
+    }
+}
+
+fn expected_decimal(scale: u8, unscaled: i128) -> DecodedValue {
+    expected_decimal_bytes(scale, &unscaled.to_be_bytes())
+}
 
 #[test]
 fn qwp_udp_flushes_supported_rows_to_mock_receiver() -> TestResult {
@@ -1361,19 +1404,239 @@ fn qwp_udp_round_trips_timestamp_nanos_columns() -> TestResult {
 }
 
 #[test]
-fn qwp_udp_rejects_not_yet_supported_column_types() -> TestResult {
+fn qwp_udp_round_trips_decimal_columns() -> TestResult {
+    let mock = QwpUdpMock::new()?;
+    let mut sender = mock.sender_builder().build()?;
+    let mut buffer = sender.new_buffer();
+
+    let neg_345 = DecimalView::try_new_scaled(2, &[0xFE, 0xA7][..])?;
+
+    buffer
+        .table("trades")?
+        .column_dec("price", "1.2")?
+        .at_now()?;
+    buffer
+        .table("trades")?
+        .column_dec("price", "NaN")?
+        .at_now()?;
+    buffer
+        .table("trades")?
+        .column_dec("price", neg_345)?
+        .at_now()?;
+    buffer
+        .table("trades")?
+        .column_dec("price", "1.5e-3")?
+        .at_now()?;
+
+    sender.flush(&mut buffer)?;
+    let decoded = decode_datagram(&mock.recv_datagram()?).expect("datagram should decode");
+
+    assert_eq!(decoded.table.name, "trades");
+    assert_eq!(decoded.table.row_count, 4);
+    assert_eq!(
+        decoded
+            .table
+            .columns
+            .iter()
+            .map(|column| (column.name.as_str(), column.type_code, column.nullable))
+            .collect::<Vec<_>>(),
+        vec![("price", 0x15, true)]
+    );
+    assert_eq!(
+        decoded.table.rows,
+        vec![
+            vec![expected_decimal(4, 12_000)],
+            vec![DecodedValue::Null],
+            vec![expected_decimal(4, -34_500)],
+            vec![expected_decimal(4, 15)],
+        ]
+    );
+
+    Ok(())
+}
+
+#[test]
+fn qwp_udp_round_trips_zero_decimal_with_large_positive_exponent() -> TestResult {
+    let mock = QwpUdpMock::new()?;
+    let mut sender = mock.sender_builder().build()?;
+    let mut buffer = sender.new_buffer();
+
+    buffer
+        .table("trades")?
+        .column_dec("price", "0e999999999")?
+        .at_now()?;
+
+    sender.flush(&mut buffer)?;
+    let decoded = decode_datagram(&mock.recv_datagram()?).expect("datagram should decode");
+
+    assert_eq!(decoded.table.name, "trades");
+    assert_eq!(decoded.table.row_count, 1);
+    assert_eq!(decoded.table.rows, vec![vec![expected_decimal(0, 0)]]);
+
+    Ok(())
+}
+
+#[test]
+fn qwp_udp_round_trips_decimal256_signed_boundaries() -> TestResult {
+    let mock = QwpUdpMock::new()?;
+    let mut sender = mock.sender_builder().build()?;
+    let mut buffer = sender.new_buffer();
+
+    buffer
+        .table("trades")?
+        .column_dec("price", DECIMAL256_MAX_POS_STR)?
+        .at_now()?;
+    buffer
+        .table("trades")?
+        .column_dec("price", DECIMAL256_MIN_NEG_STR)?
+        .at_now()?;
+
+    sender.flush(&mut buffer)?;
+    let decoded = decode_datagram(&mock.recv_datagram()?).expect("datagram should decode");
+
+    let mut max_positive = vec![0x7f];
+    max_positive.extend([0xff; 31]);
+    let mut min_negative = vec![0x80];
+    min_negative.extend([0x00; 31]);
+
+    assert_eq!(decoded.table.name, "trades");
+    assert_eq!(decoded.table.row_count, 2);
+    assert_eq!(
+        decoded.table.rows,
+        vec![
+            vec![expected_decimal_bytes(0, &max_positive)],
+            vec![expected_decimal_bytes(0, &min_negative)],
+        ]
+    );
+
+    Ok(())
+}
+
+#[test]
+fn qwp_udp_round_trips_negative_zero_decimal_as_zero() -> TestResult {
+    let mock = QwpUdpMock::new()?;
+    let mut sender = mock.sender_builder().build()?;
+    let mut buffer = sender.new_buffer();
+
+    buffer
+        .table("trades")?
+        .column_dec("price", "-0.0")?
+        .at_now()?;
+
+    sender.flush(&mut buffer)?;
+    let decoded = decode_datagram(&mock.recv_datagram()?).expect("datagram should decode");
+
+    assert_eq!(decoded.table.row_count, 1);
+    assert_eq!(decoded.table.rows, vec![vec![expected_decimal(1, 0)]]);
+
+    Ok(())
+}
+
+#[test]
+fn qwp_udp_rejects_positive_decimal_above_signed_256_limit() -> TestResult {
+    let mock = QwpUdpMock::new()?;
+    let mut sender = mock.sender_builder().build()?;
+    let mut buffer = sender.new_buffer();
+
+    buffer
+        .table("trades")?
+        .column_dec("price", DECIMAL256_POSITIVE_OVERFLOW_STR)?
+        .at_now()?;
+
+    assert_err_contains(
+        sender.flush(&mut buffer),
+        ErrorCode::InvalidDecimal,
+        "signed DECIMAL256 range",
+    );
+    assert_eq!(buffer.row_count(), 1);
+
+    Ok(())
+}
+
+#[test]
+fn qwp_udp_rejects_signed_decimal_overflow_after_scale_unification() -> TestResult {
+    let mock = QwpUdpMock::new()?;
+    let mut sender = mock.sender_builder().build()?;
+    let mut buffer = sender.new_buffer();
+
+    buffer
+        .table("trades")?
+        .column_dec("price", DECIMAL256_SIGNED_RESCALE_OVERFLOW_BASE_STR)?
+        .at_now()?;
+    buffer
+        .table("trades")?
+        .column_dec("price", "0.1")?
+        .at_now()?;
+
+    assert_err_contains(
+        sender.flush(&mut buffer),
+        ErrorCode::InvalidDecimal,
+        "signed DECIMAL256 range",
+    );
+    assert_eq!(buffer.row_count(), 2);
+
+    Ok(())
+}
+
+#[test]
+fn qwp_udp_marker_rewind_restores_decimal_scale() -> TestResult {
+    let mock = QwpUdpMock::new()?;
+    let mut sender = mock.sender_builder().build()?;
+    let mut buffer = sender.new_buffer();
+
+    buffer
+        .table("trades")?
+        .column_dec("price", "1.2")?
+        .at_now()?;
+    buffer.set_marker()?;
+    buffer
+        .table("trades")?
+        .column_dec("price", "1.5e-3")?
+        .at_now()?;
+
+    buffer.rewind_to_marker()?;
+    sender.flush(&mut buffer)?;
+    let decoded = decode_datagram(&mock.recv_datagram()?).expect("datagram should decode");
+
+    assert_eq!(decoded.table.row_count, 1);
+    assert_eq!(decoded.table.rows, vec![vec![expected_decimal(1, 12)]]);
+
+    Ok(())
+}
+
+#[test]
+fn qwp_udp_rejects_scaled_decimal_with_scale_above_limit() -> TestResult {
     let mock = QwpUdpMock::new()?;
     let sender = mock.sender_builder().build()?;
     let mut buffer = sender.new_buffer();
 
     buffer.table("trades")?;
-    buffer.column_bool("active", true)?;
-    buffer.column_str("venue", "binance")?;
-    buffer.column_ts("event_ts", TimestampMicros::new(55))?;
     assert_err_contains(
-        buffer.column_dec("price_dec", "12.34"),
-        ErrorCode::InvalidApiCall,
-        "QWP/UDP support for `column_dec` is not implemented yet.",
+        buffer.column_dec(
+            "price",
+            DecimalView::Scaled {
+                scale: 255,
+                value: vec![1].into(),
+            },
+        ),
+        ErrorCode::InvalidDecimal,
+        "scale cannot exceed 76",
+    );
+
+    Ok(())
+}
+
+#[test]
+fn qwp_udp_rejects_invalid_decimal_text() -> TestResult {
+    let mock = QwpUdpMock::new()?;
+    let sender = mock.sender_builder().build()?;
+    let mut buffer = sender.new_buffer();
+
+    buffer.table("trades")?;
+    assert_err_contains(
+        buffer.column_dec("price", "1.2.3"),
+        ErrorCode::InvalidDecimal,
+        "invalid decimal",
     );
 
     Ok(())

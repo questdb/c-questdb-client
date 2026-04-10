@@ -58,6 +58,10 @@ BUILD_MODE = None
 # The first QuestDB version that supports array types.
 FIRST_ARRAYS_RELEASE = (8, 3, 3)
 DECIMAL_RELEASE = (9, 2, 0)
+QWP_DECIMAL256_POSITIVE_OVERFLOW = Decimal(
+    "57896044618658097711785492504343953926634992332820282019728792003956564819968")
+QWP_DECIMAL256_SIGNED_RESCALE_OVERFLOW_BASE = Decimal(
+    "5789604461865809771178549250434395392663499233282028201972879200395656481997")
 
 
 def retry_check_table(*args, **kwargs):
@@ -1373,6 +1377,81 @@ class TestQwpUdpSender(unittest.TestCase):
                 ['srv-1', False, 2, 21.5, 'row-1'],
                 ['srv-2', True, 3, 22.5, 'row-2'],
             ])
+
+    def test_decimal_columns_round_trip_over_qwp_udp(self):
+        self._require_qwp_udp_system_test()
+        if QDB_FIXTURE.version < DECIMAL_RELEASE:
+            self.skipTest('No decimal support in this version of QuestDB.')
+
+        table_name = 'qwp_dec_' + uuid.uuid4().hex[:8]
+        sql_query(
+            f"CREATE TABLE '{table_name}' ("
+            "d DECIMAL(18,4), "
+            "ts TIMESTAMP"
+            ") TIMESTAMP(ts) PARTITION BY DAY WAL")
+
+        decimals = [
+            Decimal("1.2"),
+            Decimal("-3.45"),
+            Decimal("0.0015"),
+            Decimal("NaN"),
+            Decimal("Infinity"),
+            Decimal("-0"),
+        ]
+        base_ts = 1_700_000_000_000_000
+
+        with self._mk_qwpudp_sender() as sender:
+            for idx, dec in enumerate(decimals):
+                (sender
+                 .table(table_name)
+                 .column('d', dec)
+                 .at_micros(base_ts + idx))
+            sender.flush()
+
+        resp = retry_check_table(table_name, min_rows=len(decimals), timeout_sec=30)
+        self.assertEqual(
+            resp['columns'],
+            [
+                {'name': 'd', 'type': 'DECIMAL(18,4)'},
+                {'name': 'ts', 'type': 'TIMESTAMP'},
+            ])
+
+        resp = sql_query(f"select d from '{table_name}' order by ts")
+        self.assertEqual(
+            [row[0] for row in resp['dataset']],
+            ['1.2000', '-3.4500', '0.0015', None, None, '0.0000'])
+
+    def test_decimal_signed_overflow_is_rejected_over_qwp_udp(self):
+        self._require_qwp_udp_system_test()
+        if QDB_FIXTURE.version < DECIMAL_RELEASE:
+            self.skipTest('No decimal support in this version of QuestDB.')
+
+        table_name = 'qwp_dec_over_' + uuid.uuid4().hex[:8]
+        with self._mk_qwpudp_sender() as sender:
+            (sender
+             .table(table_name)
+             .column('d', QWP_DECIMAL256_POSITIVE_OVERFLOW)
+             .at_now())
+            with self.assertRaisesRegex(qls.SenderError, r'.*signed DECIMAL256 range.*'):
+                sender.flush()
+
+    def test_decimal_signed_rescale_overflow_is_rejected_over_qwp_udp(self):
+        self._require_qwp_udp_system_test()
+        if QDB_FIXTURE.version < DECIMAL_RELEASE:
+            self.skipTest('No decimal support in this version of QuestDB.')
+
+        table_name = 'qwp_dec_scale_' + uuid.uuid4().hex[:8]
+        with self._mk_qwpudp_sender() as sender:
+            (sender
+             .table(table_name)
+             .column('d', QWP_DECIMAL256_SIGNED_RESCALE_OVERFLOW_BASE)
+             .at_now())
+            (sender
+             .table(table_name)
+             .column('d', Decimal('0.1'))
+             .at_now())
+            with self.assertRaisesRegex(qls.SenderError, r'.*signed DECIMAL256 range.*'):
+                sender.flush()
 
     def test_insert_rows_over_qwp_udp_with_mixed_at_now(self):
         self._require_qwp_udp_system_test()

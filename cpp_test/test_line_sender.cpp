@@ -51,6 +51,13 @@
 using namespace std::string_literals;
 using namespace questdb::ingress::literals;
 
+constexpr auto qwp_decimal256_max_positive =
+    "57896044618658097711785492504343953926634992332820282019728792003956564819967";
+constexpr auto qwp_decimal256_min_negative =
+    "-57896044618658097711785492504343953926634992332820282019728792003956564819968";
+constexpr auto qwp_decimal256_positive_overflow =
+    "57896044618658097711785492504343953926634992332820282019728792003956564819968";
+
 #if defined(PLATFORM_UNIX)
 #    define QDB_TEST_CLOSESOCKET ::close
 typedef const void* qdb_test_setsockopt_arg_t;
@@ -197,6 +204,16 @@ struct qwp_test_decoded_array_datagram
     std::vector<double> values;
 };
 
+struct qwp_test_decoded_decimal_datagram
+{
+    std::string table_name;
+    uint64_t row_count;
+    qwp_test_decoded_column column;
+    bool nullable;
+    uint8_t scale;
+    std::vector<std::optional<std::vector<uint8_t>>> values;
+};
+
 class qwp_test_decoder
 {
 public:
@@ -337,6 +354,131 @@ qwp_test_decoded_array_datagram decode_single_array_qwp_datagram(
     decoded.values.reserve(value_count);
     for (size_t i = 0; i < value_count; ++i)
         decoded.values.push_back(decoder.read_f64());
+
+    REQUIRE(decoder.remaining() == 0);
+    return decoded;
+}
+
+std::vector<uint8_t> trim_signed_be_bytes(const std::vector<uint8_t>& bytes)
+{
+    REQUIRE(!bytes.empty());
+    const bool negative = (bytes[0] & 0x80u) != 0;
+    size_t keep_from = 0;
+    while (keep_from + 1 < bytes.size())
+    {
+        const uint8_t current = bytes[keep_from];
+        const uint8_t next = bytes[keep_from + 1];
+        const bool should_trim = negative ?
+            (current == 0xffu && (next & 0x80u) != 0) :
+            (current == 0x00u && (next & 0x80u) == 0);
+        if (!should_trim)
+            break;
+        ++keep_from;
+    }
+    return {
+        bytes.begin() + static_cast<std::ptrdiff_t>(keep_from),
+        bytes.end()};
+}
+
+std::vector<uint8_t> trimmed_signed_i64_be(int64_t value)
+{
+    std::array<uint8_t, 8> raw{};
+    auto bits = static_cast<uint64_t>(value);
+    for (size_t i = 0; i < raw.size(); ++i)
+    {
+        raw[raw.size() - 1 - i] = static_cast<uint8_t>(bits & 0xffu);
+        bits >>= 8;
+    }
+    return trim_signed_be_bytes({raw.begin(), raw.end()});
+}
+
+std::vector<uint8_t> qwp_decimal256_max_positive_bytes()
+{
+    std::vector<uint8_t> out(32, 0xffu);
+    out[0] = 0x7fu;
+    return out;
+}
+
+std::vector<uint8_t> qwp_decimal256_min_negative_bytes()
+{
+    std::vector<uint8_t> out(32, 0x00u);
+    out[0] = 0x80u;
+    return out;
+}
+
+qwp_test_decoded_decimal_datagram decode_single_decimal_qwp_datagram(
+    const std::vector<std::byte>& datagram)
+{
+    constexpr uint8_t qwp_type_decimal64 = 0x13;
+    constexpr uint8_t qwp_type_decimal128 = 0x14;
+    constexpr uint8_t qwp_type_decimal256 = 0x15;
+    REQUIRE(datagram.size() >= 12);
+    REQUIRE(datagram_starts_with_qwp1(datagram));
+    CHECK(std::to_integer<uint8_t>(datagram[4]) == 1);
+    CHECK(std::to_integer<uint8_t>(datagram[6]) == 1);
+    CHECK(std::to_integer<uint8_t>(datagram[7]) == 0);
+    const uint32_t payload_len =
+        static_cast<uint32_t>(std::to_integer<uint8_t>(datagram[8])) |
+        (static_cast<uint32_t>(std::to_integer<uint8_t>(datagram[9])) << 8) |
+        (static_cast<uint32_t>(std::to_integer<uint8_t>(datagram[10])) << 16) |
+        (static_cast<uint32_t>(std::to_integer<uint8_t>(datagram[11])) << 24);
+    REQUIRE(datagram.size() == 12u + payload_len);
+
+    std::vector<std::byte> payload{
+        datagram.begin() + 12,
+        datagram.end()};
+    qwp_test_decoder decoder{payload};
+    qwp_test_decoded_decimal_datagram decoded{};
+    decoded.table_name = decoder.read_string();
+    decoded.row_count = decoder.read_varint();
+    REQUIRE(decoder.read_varint() == 1);
+    REQUIRE(decoder.read_u8() == 0);
+    (void)decoder.read_varint(); // schema id
+
+    decoded.column.name = decoder.read_string();
+    decoded.column.type_code = decoder.read_u8();
+    const bool decimal_type_ok =
+        decoded.column.type_code == qwp_type_decimal64 ||
+        decoded.column.type_code == qwp_type_decimal128 ||
+        decoded.column.type_code == qwp_type_decimal256;
+    REQUIRE(decimal_type_ok);
+
+    decoded.nullable = decoder.read_u8() != 0;
+    std::vector<bool> has_value(
+        static_cast<size_t>(decoded.row_count),
+        true);
+    if (decoded.nullable)
+    {
+        const size_t bitmap_len = (has_value.size() + 7) / 8;
+        const auto bitmap = decoder.read_exact(bitmap_len);
+        for (size_t row = 0; row < has_value.size(); ++row)
+        {
+            const uint8_t packed = std::to_integer<uint8_t>(bitmap[row / 8]);
+            if ((packed & (1u << (row % 8))) != 0)
+                has_value[row] = false;
+        }
+    }
+
+    decoded.scale = decoder.read_u8();
+    const size_t width = decoded.column.type_code == qwp_type_decimal64 ? 8 :
+        (decoded.column.type_code == qwp_type_decimal128 ? 16 : 32);
+
+    decoded.values.reserve(has_value.size());
+    for (bool present : has_value)
+    {
+        if (!present)
+        {
+            decoded.values.push_back(std::nullopt);
+            continue;
+        }
+
+        auto le = decoder.read_exact(width);
+        std::vector<uint8_t> be;
+        be.reserve(le.size());
+        for (auto it = le.rbegin(); it != le.rend(); ++it)
+            be.push_back(std::to_integer<uint8_t>(*it));
+        decoded.values.push_back(trim_signed_be_bytes(be));
+    }
 
     REQUIRE(decoder.remaining() == 0);
     return decoded;
@@ -1763,6 +1905,185 @@ TEST_CASE("line_sender c api qwpudp f64 array column")
         CHECK(decoded.values[i] == doctest::Approx(arr_data[i]));
 }
 
+TEST_CASE("line_sender c api qwpudp decimal column")
+{
+    udp_capture receiver;
+    ::line_sender_error* err = nullptr;
+    on_scope_exit error_free_guard{[&] {
+        if (err)
+            ::line_sender_error_free(err);
+    }};
+
+    const auto host = QDB_UTF8_LITERAL("127.0.0.1");
+    ::line_sender_opts* opts =
+        ::line_sender_opts_new(::line_sender_protocol_qwpudp, host, receiver.port());
+    REQUIRE(opts != nullptr);
+    on_scope_exit opts_free_guard{[&] { ::line_sender_opts_free(opts); }};
+
+    ::line_sender* sender = ::line_sender_build(opts, &err);
+    REQUIRE(sender != nullptr);
+    on_scope_exit sender_close_guard{[&] { ::line_sender_close(sender); }};
+
+    ::line_sender_buffer* buffer = ::line_sender_buffer_new_for_sender(sender);
+    REQUIRE(buffer != nullptr);
+    on_scope_exit buffer_free_guard{[&] { ::line_sender_buffer_free(buffer); }};
+
+    const auto table = QDB_TABLE_NAME_LITERAL("decimals");
+    const auto price = QDB_COLUMN_NAME_LITERAL("price");
+    const uint8_t neg_345[] = {0xfe, 0xa7};
+
+    CHECK(::line_sender_buffer_table(buffer, table, &err));
+    CHECK(::line_sender_buffer_column_dec_str(buffer, price, "1.2", 3, &err));
+    CHECK(::line_sender_buffer_at_now(buffer, &err));
+
+    CHECK(::line_sender_buffer_table(buffer, table, &err));
+    CHECK(::line_sender_buffer_column_dec_str(buffer, price, "NaN", 3, &err));
+    CHECK(::line_sender_buffer_at_now(buffer, &err));
+
+    CHECK(::line_sender_buffer_table(buffer, table, &err));
+    CHECK(
+        ::line_sender_buffer_column_dec(
+            buffer,
+            price,
+            2,
+            neg_345,
+            sizeof(neg_345),
+            &err));
+    CHECK(::line_sender_buffer_at_now(buffer, &err));
+
+    CHECK(::line_sender_buffer_table(buffer, table, &err));
+    CHECK(::line_sender_buffer_column_dec_str(buffer, price, "1.5e-3", 6, &err));
+    CHECK(::line_sender_buffer_at_now(buffer, &err));
+
+    CHECK(::line_sender_flush(sender, buffer, &err));
+    CHECK(::line_sender_buffer_row_count(buffer) == 0);
+
+    const auto datagram = receiver.recv_datagram();
+    const auto decoded = decode_single_decimal_qwp_datagram(datagram);
+    CHECK(decoded.table_name == "decimals");
+    CHECK(decoded.row_count == 4);
+    CHECK(decoded.column.name == "price");
+    CHECK(decoded.column.type_code == 0x15);
+    CHECK(decoded.nullable);
+    CHECK(decoded.scale == 4);
+    REQUIRE(decoded.values.size() == 4);
+    REQUIRE(decoded.values[0].has_value());
+    CHECK(*decoded.values[0] == trimmed_signed_i64_be(12'000));
+    CHECK(!decoded.values[1].has_value());
+    REQUIRE(decoded.values[2].has_value());
+    CHECK(*decoded.values[2] == trimmed_signed_i64_be(-34'500));
+    REQUIRE(decoded.values[3].has_value());
+    CHECK(*decoded.values[3] == trimmed_signed_i64_be(15));
+}
+
+TEST_CASE("line_sender c api qwpudp decimal signed boundaries")
+{
+    udp_capture receiver;
+    ::line_sender_error* err = nullptr;
+    on_scope_exit error_free_guard{[&] {
+        if (err)
+            ::line_sender_error_free(err);
+    }};
+
+    const auto host = QDB_UTF8_LITERAL("127.0.0.1");
+    ::line_sender_opts* opts =
+        ::line_sender_opts_new(::line_sender_protocol_qwpudp, host, receiver.port());
+    REQUIRE(opts != nullptr);
+    on_scope_exit opts_free_guard{[&] { ::line_sender_opts_free(opts); }};
+
+    ::line_sender* sender = ::line_sender_build(opts, &err);
+    REQUIRE(sender != nullptr);
+    on_scope_exit sender_close_guard{[&] { ::line_sender_close(sender); }};
+
+    ::line_sender_buffer* buffer = ::line_sender_buffer_new_for_sender(sender);
+    REQUIRE(buffer != nullptr);
+    on_scope_exit buffer_free_guard{[&] { ::line_sender_buffer_free(buffer); }};
+
+    const auto table = QDB_TABLE_NAME_LITERAL("decimals");
+    const auto price = QDB_COLUMN_NAME_LITERAL("price");
+
+    CHECK(::line_sender_buffer_table(buffer, table, &err));
+    CHECK(
+        ::line_sender_buffer_column_dec_str(
+            buffer,
+            price,
+            qwp_decimal256_max_positive,
+            std::strlen(qwp_decimal256_max_positive),
+            &err));
+    CHECK(::line_sender_buffer_at_now(buffer, &err));
+
+    CHECK(::line_sender_buffer_table(buffer, table, &err));
+    CHECK(
+        ::line_sender_buffer_column_dec_str(
+            buffer,
+            price,
+            qwp_decimal256_min_negative,
+            std::strlen(qwp_decimal256_min_negative),
+            &err));
+    CHECK(::line_sender_buffer_at_now(buffer, &err));
+
+    CHECK(::line_sender_flush(sender, buffer, &err));
+    CHECK(::line_sender_buffer_row_count(buffer) == 0);
+
+    const auto datagram = receiver.recv_datagram();
+    const auto decoded = decode_single_decimal_qwp_datagram(datagram);
+    CHECK(decoded.table_name == "decimals");
+    CHECK(decoded.row_count == 2);
+    CHECK(decoded.column.name == "price");
+    CHECK(decoded.column.type_code == 0x15);
+    CHECK(decoded.nullable);
+    CHECK(decoded.scale == 0);
+    REQUIRE(decoded.values.size() == 2);
+    REQUIRE(decoded.values[0].has_value());
+    CHECK(*decoded.values[0] == qwp_decimal256_max_positive_bytes());
+    REQUIRE(decoded.values[1].has_value());
+    CHECK(*decoded.values[1] == qwp_decimal256_min_negative_bytes());
+}
+
+TEST_CASE("line_sender c api qwpudp decimal rejects signed overflow")
+{
+    udp_capture receiver;
+    ::line_sender_error* err = nullptr;
+    on_scope_exit error_free_guard{[&] {
+        if (err)
+            ::line_sender_error_free(err);
+    }};
+
+    const auto host = QDB_UTF8_LITERAL("127.0.0.1");
+    ::line_sender_opts* opts =
+        ::line_sender_opts_new(::line_sender_protocol_qwpudp, host, receiver.port());
+    REQUIRE(opts != nullptr);
+    on_scope_exit opts_free_guard{[&] { ::line_sender_opts_free(opts); }};
+
+    ::line_sender* sender = ::line_sender_build(opts, &err);
+    REQUIRE(sender != nullptr);
+    on_scope_exit sender_close_guard{[&] { ::line_sender_close(sender); }};
+
+    ::line_sender_buffer* buffer = ::line_sender_buffer_new_for_sender(sender);
+    REQUIRE(buffer != nullptr);
+    on_scope_exit buffer_free_guard{[&] { ::line_sender_buffer_free(buffer); }};
+
+    const auto table = QDB_TABLE_NAME_LITERAL("decimals");
+    const auto price = QDB_COLUMN_NAME_LITERAL("price");
+
+    CHECK(::line_sender_buffer_table(buffer, table, &err));
+    CHECK(
+        ::line_sender_buffer_column_dec_str(
+            buffer,
+            price,
+            qwp_decimal256_positive_overflow,
+            std::strlen(qwp_decimal256_positive_overflow),
+            &err));
+    CHECK(::line_sender_buffer_at_now(buffer, &err));
+
+    CHECK_FALSE(::line_sender_flush(sender, buffer, &err));
+    REQUIRE(err != nullptr);
+    CHECK(
+        line_sender_error_message(err).find("signed DECIMAL256 range") !=
+        std::string::npos);
+    CHECK(::line_sender_buffer_row_count(buffer) == 1);
+}
+
 TEST_CASE("line_sender c api qwpudp max name len and peek")
 {
     ::line_sender_error* err = nullptr;
@@ -1916,6 +2237,130 @@ TEST_CASE("line_sender c++ qwpudp f64 array column")
     REQUIRE(decoded.values.size() == arr_data.size());
     for (size_t i = 0; i < arr_data.size(); ++i)
         CHECK(decoded.values[i] == doctest::Approx(arr_data[i]));
+}
+
+TEST_CASE("line_sender c++ qwpudp decimal column")
+{
+    udp_capture receiver;
+    questdb::ingress::opts opts{
+        questdb::ingress::protocol::qwpudp,
+        std::string("127.0.0.1"),
+        std::to_string(receiver.port())};
+    questdb::ingress::line_sender sender{opts};
+
+    const std::array<uint8_t, 2> neg_345 = {0xfe, 0xa7};
+    const auto neg_345_decimal =
+        questdb::ingress::decimal::decimal_view{2, neg_345};
+
+    questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
+    buffer.table("cpp_decimals")
+        .column(
+            "price",
+            questdb::ingress::decimal::decimal_str_view{std::string_view{"1.2"}})
+        .at_now();
+    buffer.table("cpp_decimals")
+        .column(
+            "price",
+            questdb::ingress::decimal::decimal_str_view{std::string_view{"NaN"}})
+        .at_now();
+    buffer.table("cpp_decimals").column("price", neg_345_decimal).at_now();
+    buffer.table("cpp_decimals")
+        .column(
+            "price",
+            questdb::ingress::decimal::decimal_str_view{std::string_view{"1.5e-3"}})
+        .at_now();
+
+    sender.flush(buffer);
+    CHECK(buffer.row_count() == 0);
+
+    const auto datagram = receiver.recv_datagram();
+    const auto decoded = decode_single_decimal_qwp_datagram(datagram);
+    CHECK(decoded.table_name == "cpp_decimals");
+    CHECK(decoded.row_count == 4);
+    CHECK(decoded.column.name == "price");
+    CHECK(decoded.column.type_code == 0x15);
+    CHECK(decoded.nullable);
+    CHECK(decoded.scale == 4);
+    REQUIRE(decoded.values.size() == 4);
+    REQUIRE(decoded.values[0].has_value());
+    CHECK(*decoded.values[0] == trimmed_signed_i64_be(12'000));
+    CHECK(!decoded.values[1].has_value());
+    REQUIRE(decoded.values[2].has_value());
+    CHECK(*decoded.values[2] == trimmed_signed_i64_be(-34'500));
+    REQUIRE(decoded.values[3].has_value());
+    CHECK(*decoded.values[3] == trimmed_signed_i64_be(15));
+}
+
+TEST_CASE("line_sender c++ qwpudp decimal signed boundaries")
+{
+    udp_capture receiver;
+    questdb::ingress::opts opts{
+        questdb::ingress::protocol::qwpudp,
+        std::string("127.0.0.1"),
+        std::to_string(receiver.port())};
+    questdb::ingress::line_sender sender{opts};
+
+    questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
+    buffer.table("cpp_decimals")
+        .column(
+            "price",
+            questdb::ingress::decimal::decimal_str_view{
+                std::string_view{qwp_decimal256_max_positive}})
+        .at_now();
+    buffer.table("cpp_decimals")
+        .column(
+            "price",
+            questdb::ingress::decimal::decimal_str_view{
+                std::string_view{qwp_decimal256_min_negative}})
+        .at_now();
+
+    sender.flush(buffer);
+    CHECK(buffer.row_count() == 0);
+
+    const auto datagram = receiver.recv_datagram();
+    const auto decoded = decode_single_decimal_qwp_datagram(datagram);
+    CHECK(decoded.table_name == "cpp_decimals");
+    CHECK(decoded.row_count == 2);
+    CHECK(decoded.column.name == "price");
+    CHECK(decoded.column.type_code == 0x15);
+    CHECK(decoded.nullable);
+    CHECK(decoded.scale == 0);
+    REQUIRE(decoded.values.size() == 2);
+    REQUIRE(decoded.values[0].has_value());
+    CHECK(*decoded.values[0] == qwp_decimal256_max_positive_bytes());
+    REQUIRE(decoded.values[1].has_value());
+    CHECK(*decoded.values[1] == qwp_decimal256_min_negative_bytes());
+}
+
+TEST_CASE("line_sender c++ qwpudp decimal rejects signed overflow")
+{
+    udp_capture receiver;
+    questdb::ingress::opts opts{
+        questdb::ingress::protocol::qwpudp,
+        std::string("127.0.0.1"),
+        std::to_string(receiver.port())};
+    questdb::ingress::line_sender sender{opts};
+
+    questdb::ingress::line_sender_buffer buffer = sender.new_buffer();
+    buffer.table("cpp_decimals")
+        .column(
+            "price",
+            questdb::ingress::decimal::decimal_str_view{
+                std::string_view{qwp_decimal256_positive_overflow}})
+        .at_now();
+
+    bool threw = false;
+    try
+    {
+        sender.flush(buffer);
+    }
+    catch (const questdb::ingress::line_sender_error& ex)
+    {
+        threw = true;
+        CHECK(std::string{ex.what()}.find("signed DECIMAL256 range") != std::string::npos);
+    }
+    CHECK(threw);
+    CHECK(buffer.row_count() == 1);
 }
 
 TEST_CASE("line_sender c++ qwpudp rejects flush with incomplete row")
