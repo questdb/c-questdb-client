@@ -410,6 +410,12 @@ pub(crate) fn decode_datagram(bytes: &[u8]) -> Result<DecodedDatagram, String> {
                     let end = usize::try_from(offsets[next_offset + 1]).map_err(|_| {
                         format!("invalid string end offset {}", offsets[next_offset + 1])
                     })?;
+                    if start > end || end > data.len() {
+                        return Err(format!(
+                            "invalid string offsets: start={start}, end={end}, data_len={}",
+                            data.len()
+                        ));
+                    }
                     let value = std::str::from_utf8(&data[start..end])
                         .map_err(|err| format!("invalid utf-8 in string value: {err}"))?;
                     values.push(DecodedValue::String(value.to_owned()));
