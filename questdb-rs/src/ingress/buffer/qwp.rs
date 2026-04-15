@@ -154,8 +154,7 @@ impl StoredQwpDecimal {
                 if scale > QWP_DECIMAL_MAX_SCALE {
                     return Err(invalid_decimal_error(format!(
                         "QuestDB decimal scale cannot exceed {}, got {}",
-                        QWP_DECIMAL_MAX_SCALE,
-                        scale
+                        QWP_DECIMAL_MAX_SCALE, scale
                     )));
                 }
                 let (magnitude, negative) = sign_mag_from_signed_be(value.as_ref())?;
@@ -204,7 +203,10 @@ impl StoredQwpDecimal {
         }
     }
 
-    fn wire_bytes_with_scale(&self, target_scale: u8) -> crate::Result<[u8; QWP_DECIMAL_MAG_BYTES]> {
+    fn wire_bytes_with_scale(
+        &self,
+        target_scale: u8,
+    ) -> crate::Result<[u8; QWP_DECIMAL_MAG_BYTES]> {
         if target_scale < self.scale {
             return Err(error::fmt!(
                 InvalidApiCall,
@@ -292,9 +294,7 @@ fn negate_twos_complement_be(bytes: &mut [u8]) {
     }
 }
 
-fn sign_mag_from_signed_be(
-    bytes: &[u8],
-) -> crate::Result<([u64; QWP_DECIMAL_MAG_LIMBS], bool)> {
+fn sign_mag_from_signed_be(bytes: &[u8]) -> crate::Result<([u64; QWP_DECIMAL_MAG_LIMBS], bool)> {
     if bytes.len() > QWP_DECIMAL_MAG_BYTES {
         return Err(invalid_decimal_error(format!(
             "QWP/UDP decimal mantissa exceeds {} bytes",
@@ -440,7 +440,7 @@ fn parse_decimal_text(value: &str) -> crate::Result<Option<StoredQwpDecimal>> {
                 return Err(invalid_decimal_error(format!(
                     "invalid decimal value {:?}",
                     value
-                )))
+                )));
             }
         }
     }
@@ -490,8 +490,7 @@ fn parse_decimal_text(value: &str) -> crate::Result<Option<StoredQwpDecimal>> {
     if scale > i64::from(QWP_DECIMAL_MAX_SCALE) {
         return Err(invalid_decimal_error(format!(
             "QuestDB decimal scale cannot exceed {}, got {}",
-            QWP_DECIMAL_MAX_SCALE,
-            scale
+            QWP_DECIMAL_MAX_SCALE, scale
         )));
     }
 
@@ -1087,7 +1086,10 @@ impl QwpBuffer {
         Ok(ValueSlice(ByteSlice { offset, len }))
     }
 
-    fn append_value_decimal(&mut self, value: DecimalView<'_>) -> crate::Result<Option<ValueSlice>> {
+    fn append_value_decimal(
+        &mut self,
+        value: DecimalView<'_>,
+    ) -> crate::Result<Option<ValueSlice>> {
         let Some(decimal) = StoredQwpDecimal::from_decimal_view(value)? else {
             return Ok(None);
         };
@@ -1993,7 +1995,8 @@ impl ColumnStats {
             ColumnKind::Decimal => match value {
                 ValueRef::DecimalNull => Ok(()),
                 ValueRef::Decimal(vs) => {
-                    let stored = StoredQwpDecimal::from_stored_bytes(&value_bytes[vs.0.as_range()])?;
+                    let stored =
+                        StoredQwpDecimal::from_stored_bytes(&value_bytes[vs.0.as_range()])?;
                     self.non_null_count = new_non_null_count;
                     self.decimal_scale = self.decimal_scale.max(stored.scale);
                     Ok(())
@@ -2930,7 +2933,8 @@ fn encode_column_from_cells(
                 match cell.value {
                     ValueRef::DecimalNull => {}
                     ValueRef::Decimal(vs) => {
-                        let stored = StoredQwpDecimal::from_stored_bytes(&value_bytes[vs.0.as_range()])?;
+                        let stored =
+                            StoredQwpDecimal::from_stored_bytes(&value_bytes[vs.0.as_range()])?;
                         out.extend_from_slice(&stored.wire_bytes_with_scale(col.decimal_scale)?);
                     }
                     _ => {
