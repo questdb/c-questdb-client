@@ -852,6 +852,8 @@ pub unsafe extern "C" fn line_sender_buffer_capacity(buffer: *const line_sender_
 }
 
 /// Capture a bookmark for the current buffer state.
+///
+/// `buffer` and `out` must be non-NULL; `err_out` is optional.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_bookmark(
     buffer: *mut line_sender_buffer,

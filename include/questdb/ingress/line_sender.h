@@ -38,6 +38,16 @@ extern "C" {
 #    define LINESENDER_API
 #endif
 
+/////////// Pointer argument conventions.
+/**
+ * Unless a function's documentation states otherwise, every pointer
+ * parameter must be non-NULL. Passing NULL where non-NULL is required
+ * is undefined behaviour and will typically crash the process.
+ *
+ * The only pointer consistently documented as optional is `err_out`:
+ * callers may pass NULL to discard error information on failure.
+ */
+
 /////////// Error handling.
 /** An error that occurred when using the line sender. */
 typedef struct line_sender_error line_sender_error;
@@ -406,6 +416,10 @@ size_t line_sender_buffer_capacity(const line_sender_buffer* buffer);
  * Capture a bookmark for the current buffer state.
  *
  * Capturing a new bookmark replaces the previously stored bookmark or marker.
+ *
+ * @param[in] buffer Buffer to bookmark. Must be non-NULL.
+ * @param[out] out Receives the captured bookmark on success. Must be non-NULL.
+ * @param[out] err_out Set to an error object on failure (if non-NULL).
  */
 LINESENDER_API
 bool line_sender_buffer_bookmark(
