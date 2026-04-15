@@ -1245,12 +1245,20 @@ impl SenderBuilder {
                 })
             }
             #[cfg(feature = "sync-sender-qwp-udp")]
-            Protocol::QwpUdp => connect_qwp_udp(
-                self.host.as_str(),
-                self.port.as_str(),
-                self.net_interface.deref().as_deref(),
-                self.qwp_udp.as_ref().expect("qwp config missing"),
-            )?,
+            Protocol::QwpUdp => {
+                let Some(qwp_udp) = self.qwp_udp.as_ref() else {
+                    return Err(error::fmt!(
+                        ConfigError,
+                        "QWP/UDP configuration is missing."
+                    ));
+                };
+                connect_qwp_udp(
+                    self.host.as_str(),
+                    self.port.as_str(),
+                    self.net_interface.deref().as_deref(),
+                    qwp_udp,
+                )?
+            }
         };
 
         #[allow(unused_mut)]
