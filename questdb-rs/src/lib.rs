@@ -62,12 +62,21 @@ mod alloc_counter {
         }
     }
 
+    /// Begin counting allocations made through the global allocator.
+    ///
+    /// The counter and the enable flag are process-global, so *any* allocation
+    /// on *any* thread between [`start_counting`] and [`stop_counting`] is
+    /// included. Tests that assert on the result must therefore run
+    /// single-threaded: mark them `#[ignore]` and run with `--test-threads=1`
+    /// (see the existing `qwp_zero_alloc_*` tests for the convention).
     pub fn start_counting() -> usize {
         ALLOC_COUNT.store(0, Ordering::SeqCst);
         COUNTING.store(true, Ordering::SeqCst);
         0
     }
 
+    /// Stop counting and return the number of allocations observed since
+    /// [`start_counting`]. Same single-thread constraint as `start_counting`.
     pub fn stop_counting() -> usize {
         COUNTING.store(false, Ordering::SeqCst);
         ALLOC_COUNT.load(Ordering::SeqCst)
