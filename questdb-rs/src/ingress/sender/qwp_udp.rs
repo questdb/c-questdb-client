@@ -158,6 +158,7 @@ mod tests {
     fn qwp_udp_flush_surfaces_socket_send_failure() {
         let qwp_udp = QwpUdpConfig::default();
         let mut handler = connect_qwp_udp("127.0.0.1", "9007", None, &qwp_udp).unwrap();
+        #[allow(irrefutable_let_patterns)]
         let SyncProtocolHandler::SyncQwpUdp(state) = &mut handler else {
             panic!("Expected SyncQwpUdp handler");
         };

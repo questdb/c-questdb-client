@@ -1,10 +1,12 @@
 use crate::error::{Result, fmt};
 use crate::ingress::CertificateAuthority;
+#[cfg(any(feature = "_sender-tcp", feature = "_sender-http"))]
 use rustls::RootCertStore;
 use rustls_pki_types::CertificateDer;
 use rustls_pki_types::pem::PemObject;
 use std::fs::File;
 use std::path::Path;
+#[cfg(any(feature = "_sender-tcp", feature = "_sender-http"))]
 use std::sync::Arc;
 
 #[cfg(feature = "insecure-skip-verify")]
@@ -117,6 +119,10 @@ pub(crate) enum TlsSettings {
     #[cfg(all(feature = "tls-webpki-certs", feature = "tls-native-certs"))]
     WebpkiAndOsRoots,
 
+    #[cfg_attr(
+        not(any(feature = "_sender-tcp", feature = "_sender-http")),
+        allow(dead_code)
+    )]
     PemFile(Vec<CertificateDer<'static>>),
 }
 
@@ -211,6 +217,7 @@ impl TlsSettings {
     }
 }
 
+#[cfg(any(feature = "_sender-tcp", feature = "_sender-http"))]
 pub(crate) fn configure_tls(tls: TlsSettings) -> Result<Arc<rustls::ClientConfig>> {
     let mut root_store = RootCertStore::empty();
 

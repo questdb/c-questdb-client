@@ -27,10 +27,18 @@ use dns_lookup::{AddrInfo, AddrInfoHints, AddrInfoIter, LookupError};
 use socket2::SockAddr;
 
 #[cfg(unix)]
-use libc::{AF_INET, SOCK_DGRAM, SOCK_STREAM};
+use libc::AF_INET;
+#[cfg(all(unix, feature = "sync-sender-qwp-udp"))]
+use libc::SOCK_DGRAM;
+#[cfg(all(unix, feature = "sync-sender-tcp"))]
+use libc::SOCK_STREAM;
 
 #[cfg(windows)]
-use winapi::shared::ws2def::{AF_INET, SOCK_DGRAM, SOCK_STREAM};
+use winapi::shared::ws2def::AF_INET;
+#[cfg(all(windows, feature = "sync-sender-qwp-udp"))]
+use winapi::shared::ws2def::SOCK_DGRAM;
+#[cfg(all(windows, feature = "sync-sender-tcp"))]
+use winapi::shared::ws2def::SOCK_STREAM;
 
 fn map_getaddrinfo_result(
     dest: &str,
@@ -60,10 +68,12 @@ fn map_getaddrinfo_result(
     }
 }
 
+#[cfg(feature = "sync-sender-tcp")]
 pub(super) fn resolve_host(host: &str) -> super::Result<SockAddr> {
     resolve_host_with_socktype(host, SOCK_STREAM)
 }
 
+#[cfg(feature = "sync-sender-qwp-udp")]
 pub(super) fn resolve_host_udp(host: &str) -> super::Result<SockAddr> {
     resolve_host_with_socktype(host, SOCK_DGRAM)
 }
@@ -77,10 +87,12 @@ fn resolve_host_with_socktype(host: &str, socktype: i32) -> super::Result<SockAd
     map_getaddrinfo_result(host, dns_lookup::getaddrinfo(Some(host), None, Some(hints)))
 }
 
+#[cfg(feature = "sync-sender-tcp")]
 pub(super) fn resolve_host_port(host: &str, port: &str) -> super::Result<SockAddr> {
     resolve_host_port_with_socktype(host, port, SOCK_STREAM)
 }
 
+#[cfg(feature = "sync-sender-qwp-udp")]
 pub(super) fn resolve_host_port_udp(host: &str, port: &str) -> super::Result<SockAddr> {
     resolve_host_port_with_socktype(host, port, SOCK_DGRAM)
 }
