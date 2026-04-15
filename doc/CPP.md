@@ -24,6 +24,10 @@
 **HTTP**
 - [Example using HTTP](../examples/line_sender_cpp_example_http.cpp)
 
+**QWP/UDP**
+- [Example using QWP/UDP](../examples/line_sender_cpp_example_qwpudp.cpp)
+- [Batched QWP/UDP ingestion](../examples/line_sender_cpp_example_qwpudp_batch.cpp)
+
 **Array Handling**
 - [Array with byte strides](../examples/line_sender_cpp_example_array_byte_strides.cpp)
 - [Array with element strides](../examples/line_sender_cpp_example_array_elem_strides.cpp)
