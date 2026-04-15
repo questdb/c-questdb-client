@@ -145,8 +145,8 @@ configuration parameters and their semantics.
 You can inspect the contents of a constructed buffer at any time calling:
 * C: `line_sender_buffer_peek`
 * C++: `buffer.peek()`
-* Rust: `buffer.as_str()`
+* Rust: `buffer.as_bytes()` (wrap in `std::str::from_utf8(..)` for ILP)
 
 This byte-level inspection is only meaningful for ILP buffers. QWP buffers are
-encoded into UDP datagrams during `flush`, so `peek`/`as_str` are not useful
-there.
+encoded into UDP datagrams during `flush`, so `peek` / `as_bytes` are not
+useful there — `as_bytes` returns an empty slice for QWP buffers.
