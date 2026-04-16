@@ -419,48 +419,62 @@ fn qwpudp_bind_interface_is_supported_via_builder_api() {
 
 #[cfg(feature = "sync-sender-qwp-udp")]
 #[test]
-fn qwpudp_auth_settings_are_rejected_at_build() {
-    const EXPECTED_ERR_MSG: &str = "Authentication settings are not supported for QWP/UDP.";
-
-    for conf in [
-        "qwpudp::addr=localhost;username=user123;",
-        "qwpudp::addr=localhost;password=pass321;",
-        "qwpudp::addr=localhost;token=token123;",
-        "qwpudp::addr=localhost;username=user123;token=token123;",
-    ] {
-        assert_conf_err(
-            SenderBuilder::from_conf(conf).unwrap().build(),
-            EXPECTED_ERR_MSG,
-        );
-    }
+fn qwpudp_auth_settings_are_rejected_at_config_time() {
+    // Config string: from_conf itself must fail.
+    assert_conf_err(
+        SenderBuilder::from_conf("qwpudp::addr=localhost;username=user123;"),
+        "The \"username\" setting is not supported for QWP/UDP.",
+    );
+    assert_conf_err(
+        SenderBuilder::from_conf("qwpudp::addr=localhost;password=pass321;"),
+        "The \"password\" setting is not supported for QWP/UDP.",
+    );
+    assert_conf_err(
+        SenderBuilder::from_conf("qwpudp::addr=localhost;token=token123;"),
+        "The \"token\" setting is not supported for QWP/UDP.",
+    );
 
     #[cfg(feature = "sync-sender-tcp")]
-    for conf in [
-        "qwpudp::addr=localhost;token_x=pub_key1;",
-        "qwpudp::addr=localhost;token_y=pub_key2;",
-        "qwpudp::addr=localhost;username=key_id123;token=priv_key123;token_x=pub_key1;token_y=pub_key2;",
-    ] {
+    {
         assert_conf_err(
-            SenderBuilder::from_conf(conf).unwrap().build(),
-            EXPECTED_ERR_MSG,
+            SenderBuilder::from_conf("qwpudp::addr=localhost;token_x=pub_key1;"),
+            "The \"token_x\" setting is not supported for QWP/UDP.",
+        );
+        assert_conf_err(
+            SenderBuilder::from_conf("qwpudp::addr=localhost;token_y=pub_key2;"),
+            "The \"token_y\" setting is not supported for QWP/UDP.",
         );
     }
+
+    // Builder API: setter must fail.
+    assert_conf_err(
+        SenderBuilder::new(Protocol::QwpUdp, "localhost", 9007).username("user123"),
+        "The \"username\" setting is not supported for QWP/UDP.",
+    );
+    assert_conf_err(
+        SenderBuilder::new(Protocol::QwpUdp, "localhost", 9007).password("pass321"),
+        "The \"password\" setting is not supported for QWP/UDP.",
+    );
+    assert_conf_err(
+        SenderBuilder::new(Protocol::QwpUdp, "localhost", 9007).token("token123"),
+        "The \"token\" setting is not supported for QWP/UDP.",
+    );
 }
 
 #[cfg(feature = "sync-sender-qwp-udp")]
 #[test]
-fn qwpudp_auth_timeout_is_rejected() {
-    for builder in [
-        SenderBuilder::from_conf("qwpudp::addr=localhost;auth_timeout=100;").unwrap(),
+fn qwpudp_auth_timeout_is_rejected_at_config_time() {
+    // Config string: from_conf itself must fail.
+    assert_conf_err(
+        SenderBuilder::from_conf("qwpudp::addr=localhost;auth_timeout=100;"),
+        "The \"auth_timeout\" setting is not supported for QWP/UDP.",
+    );
+    // Builder API: setter must fail.
+    assert_conf_err(
         SenderBuilder::new(Protocol::QwpUdp, "localhost", 9007)
-            .auth_timeout(Duration::from_millis(100))
-            .unwrap(),
-    ] {
-        assert_conf_err(
-            builder.build(),
-            "The \"auth_timeout\" setting is not supported for QWP/UDP.",
-        );
-    }
+            .auth_timeout(Duration::from_millis(100)),
+        "The \"auth_timeout\" setting is not supported for QWP/UDP.",
+    );
 }
 
 #[cfg(feature = "sync-sender-tcp")]

@@ -729,6 +729,8 @@ impl SenderBuilder {
     /// For HTTP, this is a part of basic authentication.
     /// See also: [`password`](SenderBuilder::password).
     pub fn username(mut self, username: &str) -> Result<Self> {
+        #[cfg(feature = "_sender-qwp-udp")]
+        self.reject_if_qwp_udp("username")?;
         self.username
             .set_specified("username", Some(validate_value(username.to_string())?))?;
         Ok(self)
@@ -737,6 +739,8 @@ impl SenderBuilder {
     /// Set the password for basic HTTP authentication.
     /// See also: [`username`](SenderBuilder::username).
     pub fn password(mut self, password: &str) -> Result<Self> {
+        #[cfg(feature = "_sender-qwp-udp")]
+        self.reject_if_qwp_udp("password")?;
         self.password
             .set_specified("password", Some(validate_value(password.to_string())?))?;
         Ok(self)
@@ -745,6 +749,8 @@ impl SenderBuilder {
     /// Set the Token (Bearer) Authentication parameter for HTTP,
     /// or the ECDSA private key for TCP authentication.
     pub fn token(mut self, token: &str) -> Result<Self> {
+        #[cfg(feature = "_sender-qwp-udp")]
+        self.reject_if_qwp_udp("token")?;
         self.token
             .set_specified("token", Some(validate_value(token.to_string())?))?;
         Ok(self)
@@ -752,6 +758,8 @@ impl SenderBuilder {
 
     /// Set the ECDSA public key X for TCP authentication.
     pub fn token_x(self, token_x: &str) -> Result<Self> {
+        #[cfg(feature = "_sender-qwp-udp")]
+        self.reject_if_qwp_udp("token_x")?;
         #[cfg(feature = "_sender-tcp")]
         {
             let mut builder = self;
@@ -773,6 +781,8 @@ impl SenderBuilder {
 
     /// Set the ECDSA public key Y for TCP authentication.
     pub fn token_y(self, token_y: &str) -> Result<Self> {
+        #[cfg(feature = "_sender-qwp-udp")]
+        self.reject_if_qwp_udp("token_y")?;
         #[cfg(feature = "_sender-tcp")]
         {
             let mut builder = self;
@@ -803,12 +813,7 @@ impl SenderBuilder {
     /// **Note**: QuestDB server version 9.0.0 or later is required for [`ProtocolVersion::V2`] support.
     pub fn protocol_version(mut self, protocol_version: ProtocolVersion) -> Result<Self> {
         #[cfg(feature = "_sender-qwp-udp")]
-        if self.protocol.is_qwp_udp() {
-            return Err(error::fmt!(
-                ConfigError,
-                "The \"protocol_version\" setting is not supported for QWP/UDP."
-            ));
-        }
+        self.reject_if_qwp_udp("protocol_version")?;
         self.protocol_version
             .set_specified("protocol_version", Some(protocol_version))?;
         Ok(self)
@@ -869,8 +874,21 @@ impl SenderBuilder {
     /// the TLS handshake and authentication process. This only applies to TCP.
     /// The default is 15 seconds.
     pub fn auth_timeout(mut self, value: Duration) -> Result<Self> {
+        #[cfg(feature = "_sender-qwp-udp")]
+        self.reject_if_qwp_udp("auth_timeout")?;
         self.auth_timeout.set_specified("auth_timeout", value)?;
         Ok(self)
+    }
+
+    #[cfg(feature = "_sender-qwp-udp")]
+    fn reject_if_qwp_udp(&self, setting: &str) -> Result<()> {
+        if self.protocol.is_qwp_udp() {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"{setting}\" setting is not supported for QWP/UDP."
+            ));
+        }
+        Ok(())
     }
 
     /// Ensure that TLS is enabled for the protocol.
@@ -1166,9 +1184,6 @@ impl SenderBuilder {
             self.tls_roots.deref().as_deref(),
         )?;
 
-        #[cfg(feature = "_sender-qwp-udp")]
-        self.validate_qwp_udp_settings()?;
-
         let auth = self.build_auth()?;
 
         let handler = match self.protocol {
@@ -1341,45 +1356,6 @@ impl SenderBuilder {
             ConfigError,
             "The {param_name:?} setting can only be used with the {supported} protocol."
         ))
-    }
-
-    #[cfg(feature = "_sender-qwp-udp")]
-    fn validate_qwp_udp_settings(&self) -> Result<()> {
-        if !self.protocol.is_qwp_udp() {
-            return Ok(());
-        }
-
-        if self.username.is_some() || self.password.is_some() || self.token.is_some() || {
-            #[cfg(feature = "_sender-tcp")]
-            {
-                self.token_x.is_some() || self.token_y.is_some()
-            }
-            #[cfg(not(feature = "_sender-tcp"))]
-            {
-                false
-            }
-        } {
-            return Err(error::fmt!(
-                ConfigError,
-                "Authentication settings are not supported for QWP/UDP."
-            ));
-        }
-
-        if self.protocol_version.is_some() {
-            return Err(error::fmt!(
-                ConfigError,
-                "The \"protocol_version\" setting is not supported for QWP/UDP."
-            ));
-        }
-
-        if matches!(self.auth_timeout, ConfigSetting::Specified(_)) {
-            return Err(error::fmt!(
-                ConfigError,
-                "The \"auth_timeout\" setting is not supported for QWP/UDP."
-            ));
-        }
-
-        Ok(())
     }
 }
 
