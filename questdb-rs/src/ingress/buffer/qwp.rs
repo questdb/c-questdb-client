@@ -3073,6 +3073,17 @@ mod tests {
     }
 
     #[test]
+    fn qwp_push_index_rejects_cell_end_collision() {
+        let err =
+            checked_qwp_push_index(CELL_END as usize, "symbol dictionary length").unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert!(
+            err.msg()
+                .contains("QWP/UDP symbol dictionary length exceeds maximum")
+        );
+    }
+
+    #[test]
     fn qwp_gap_fill_iter_rejects_row_count_overflow() {
         let err = match GapFillIter::new(&[], CELL_END, u32::MAX as usize + 1) {
             Ok(_) => panic!("expected row_count overflow to fail"),

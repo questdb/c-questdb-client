@@ -2553,6 +2553,72 @@ TEST_CASE("line_sender c api max_datagram_size rejected for tcp opts")
     CHECK(line_sender_error_message(err).find("only supported for QWP/UDP") != std::string::npos);
 }
 
+TEST_CASE("line_sender c api qwpudp opts reject invalid datagram settings")
+{
+    ::line_sender_error* err = nullptr;
+    on_scope_exit error_free_guard{[&] {
+        if (err)
+            ::line_sender_error_free(err);
+    }};
+
+    const auto host = QDB_UTF8_LITERAL("127.0.0.1");
+    ::line_sender_opts* opts =
+        ::line_sender_opts_new(::line_sender_protocol_qwpudp, host, 9009);
+    REQUIRE(opts != nullptr);
+    on_scope_exit opts_free_guard{[&] { ::line_sender_opts_free(opts); }};
+
+    CHECK_FALSE(::line_sender_opts_max_datagram_size(opts, 0, &err));
+    REQUIRE(err != nullptr);
+    CHECK(
+        line_sender_error_message(err).find("greater than 0") !=
+        std::string::npos);
+    ::line_sender_error_free(err);
+    err = nullptr;
+
+    CHECK_FALSE(::line_sender_opts_multicast_ttl(opts, 256, &err));
+    REQUIRE(err != nullptr);
+    CHECK(
+        line_sender_error_message(err).find("between 0 and 255") !=
+        std::string::npos);
+}
+
+TEST_CASE("line_sender c api qwpudp array rank bounds are rejected")
+{
+    ::line_sender_error* err = nullptr;
+    on_scope_exit error_free_guard{[&] {
+        if (err)
+            ::line_sender_error_free(err);
+    }};
+
+    ::line_sender_buffer* buffer = ::line_sender_buffer_new_qwp();
+    REQUIRE(buffer != nullptr);
+    on_scope_exit buffer_free_guard{[&] { ::line_sender_buffer_free(buffer); }};
+
+    const auto table = QDB_TABLE_NAME_LITERAL("t");
+    const auto col = QDB_COLUMN_NAME_LITERAL("arr");
+    CHECK(::line_sender_buffer_table(buffer, table, &err));
+
+    uintptr_t shape_one[] = {1};
+    double data[] = {1.0};
+    CHECK_FALSE(::line_sender_buffer_column_f64_arr_c_major(
+        buffer, col, 0, shape_one, data, 1, &err));
+    REQUIRE(err != nullptr);
+    CHECK(
+        line_sender_error_message(err).find("Zero-dimensional arrays") !=
+        std::string::npos);
+    ::line_sender_error_free(err);
+    err = nullptr;
+
+    std::array<uintptr_t, 33> shape_33{};
+    shape_33.fill(1);
+    CHECK_FALSE(::line_sender_buffer_column_f64_arr_c_major(
+        buffer, col, shape_33.size(), shape_33.data(), data, 1, &err));
+    REQUIRE(err != nullptr);
+    CHECK(
+        line_sender_error_message(err).find("expected at most") !=
+        std::string::npos);
+}
+
 TEST_CASE("line_sender c++ qwpudp bookmark rewind and clear")
 {
     udp_capture receiver;

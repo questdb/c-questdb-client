@@ -915,6 +915,55 @@ fn qwp_udp_encodes_sparse_long_and_double_columns_as_non_nullable_sentinels() ->
 }
 
 #[test]
+fn qwp_udp_round_trips_user_supplied_special_f64_values() -> TestResult {
+    let mock = QwpUdpMock::new()?;
+    let mut sender = mock.sender_builder().build()?;
+    let mut buffer = sender.new_buffer();
+
+    buffer
+        .table("trades")?
+        .column_f64("px", f64::NAN)?
+        .at_now()?;
+    buffer
+        .table("trades")?
+        .column_f64("px", f64::INFINITY)?
+        .at_now()?;
+    buffer
+        .table("trades")?
+        .column_f64("px", f64::NEG_INFINITY)?
+        .at_now()?;
+
+    sender.flush(&mut buffer)?;
+    let decoded = decode_datagram(&mock.recv_datagram()?).expect("datagram should decode");
+
+    assert_eq!(decoded.table.name, "trades");
+    assert_eq!(decoded.table.row_count, 3);
+    assert_eq!(
+        decoded
+            .table
+            .columns
+            .iter()
+            .map(|column| (column.name.as_str(), column.type_code, column.nullable))
+            .collect::<Vec<_>>(),
+        vec![("px", 0x07, false)]
+    );
+    match decoded.table.rows[0][0] {
+        DecodedValue::F64(value) => assert!(value.is_nan()),
+        ref other => panic!("expected user-supplied NaN, got {other:?}"),
+    }
+    assert_eq!(
+        decoded.table.rows[1],
+        vec![DecodedValue::F64(f64::INFINITY)]
+    );
+    assert_eq!(
+        decoded.table.rows[2],
+        vec![DecodedValue::F64(f64::NEG_INFINITY)]
+    );
+
+    Ok(())
+}
+
+#[test]
 fn qwp_udp_bool_i64_f64_are_never_nullable_with_various_gap_patterns() -> TestResult {
     let mock = QwpUdpMock::new()?;
     let mut sender = mock.sender_builder().build()?;
@@ -1456,6 +1505,43 @@ fn qwp_udp_round_trips_decimal_columns() -> TestResult {
 }
 
 #[test]
+fn qwp_udp_decimal_infinities_are_encoded_as_nulls() -> TestResult {
+    let mock = QwpUdpMock::new()?;
+    let mut sender = mock.sender_builder().build()?;
+    let mut buffer = sender.new_buffer();
+
+    buffer
+        .table("trades")?
+        .column_dec("price", "Infinity")?
+        .at_now()?;
+    buffer
+        .table("trades")?
+        .column_dec("price", "-Infinity")?
+        .at_now()?;
+
+    sender.flush(&mut buffer)?;
+    let decoded = decode_datagram(&mock.recv_datagram()?).expect("datagram should decode");
+
+    assert_eq!(decoded.table.name, "trades");
+    assert_eq!(decoded.table.row_count, 2);
+    assert_eq!(
+        decoded
+            .table
+            .columns
+            .iter()
+            .map(|column| (column.name.as_str(), column.type_code, column.nullable))
+            .collect::<Vec<_>>(),
+        vec![("price", 0x15, true)]
+    );
+    assert_eq!(
+        decoded.table.rows,
+        vec![vec![DecodedValue::Null], vec![DecodedValue::Null]]
+    );
+
+    Ok(())
+}
+
+#[test]
 fn qwp_udp_round_trips_zero_decimal_with_large_positive_exponent() -> TestResult {
     let mock = QwpUdpMock::new()?;
     let mut sender = mock.sender_builder().build()?;
@@ -1643,6 +1729,28 @@ fn qwp_udp_rejects_invalid_decimal_text() -> TestResult {
 }
 
 #[test]
+fn qwp_udp_rejects_decimal_text_edge_cases() -> TestResult {
+    for (value, expected_msg) in [
+        ("", "empty decimal value"),
+        ("+", "missing decimal digits"),
+        ("-", "missing decimal digits"),
+    ] {
+        let mock = QwpUdpMock::new()?;
+        let sender = mock.sender_builder().build()?;
+        let mut buffer = sender.new_buffer();
+        buffer.table("trades")?;
+
+        assert_err_contains(
+            buffer.column_dec("price", value),
+            ErrorCode::InvalidDecimal,
+            expected_msg,
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
 fn qwp_udp_flush_empty_buffer_is_noop() -> TestResult {
     let mock = QwpUdpMock::new()?;
     let mut sender = mock.sender_builder().build()?;
@@ -1714,6 +1822,7 @@ fn qwp_udp_round_trips_f64_array_columns() -> TestResult {
     let mut sender = mock.sender_builder().build()?;
     let mut buffer = sender.new_buffer();
     let contiguous = [1.0f64, 2.0, 3.0];
+    let empty: [f64; 0] = [];
     let non_contiguous = vec![vec![4.0f64, 5.0], vec![6.0, 7.0]];
 
     buffer
@@ -1726,6 +1835,11 @@ fn qwp_udp_round_trips_f64_array_columns() -> TestResult {
         .table("trades")?
         .column_i64("seq", 3)?
         .column_arr("samples", &non_contiguous)?
+        .at_now()?;
+    buffer
+        .table("trades")?
+        .column_i64("seq", 4)?
+        .column_arr("samples", &empty)?
         .at_now()?;
 
     sender.flush(&mut buffer)?;
@@ -1756,6 +1870,13 @@ fn qwp_udp_round_trips_f64_array_columns() -> TestResult {
                 DecodedValue::F64Array {
                     shape: vec![2, 2],
                     values: vec![4.0, 5.0, 6.0, 7.0],
+                },
+            ],
+            vec![
+                DecodedValue::I64(4),
+                DecodedValue::F64Array {
+                    shape: vec![0],
+                    values: vec![],
                 },
             ],
         ]
@@ -2024,6 +2145,20 @@ fn qwp_buffer_rejects_name_exceeding_max_name_len() -> TestResult {
     // Column name within limit works.
     buffer.column_i64(ok_col.as_str(), 1)?;
     buffer.at_now()?;
+
+    Ok(())
+}
+
+#[test]
+fn qwp_buffer_rejects_bad_character_column_name() -> TestResult {
+    let mut buffer = Buffer::new_qwp();
+
+    buffer.table("trades")?;
+    assert_err_contains(
+        buffer.column_i64("bad?name", 1),
+        ErrorCode::InvalidName,
+        "can't contain",
+    );
 
     Ok(())
 }
