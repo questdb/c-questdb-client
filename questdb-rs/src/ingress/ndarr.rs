@@ -85,17 +85,37 @@ where
     }
 
     // For non-contiguous memory layouts, direct raw pointer operations are preferred.
+    if buf.len() < expect_size {
+        return Err(error::fmt!(
+            ArrayError,
+            "Buffer capacity {} < required {}",
+            buf.len(),
+            expect_size
+        ));
+    }
+
     let elem_size = size_of::<T>();
-    let mut total_len = 0;
-    for (i, &element) in array.iter().enumerate() {
+    let mut total_len = 0usize;
+    for &element in array.iter() {
+        let end = total_len
+            .checked_add(elem_size)
+            .ok_or_else(|| error::fmt!(ArrayError, "Array write buffer length overflow"))?;
+        if end > expect_size {
+            return Err(error::fmt!(
+                ArrayError,
+                "Array write buffer length mismatch (actual: {}, expected: {})",
+                end,
+                expect_size
+            ));
+        }
         unsafe {
             std::ptr::copy_nonoverlapping(
                 &element as *const T as *const u8,
-                buf.as_mut_ptr().add(i * elem_size),
+                buf.as_mut_ptr().add(total_len),
                 elem_size,
             )
         }
-        total_len += elem_size;
+        total_len = end;
     }
     if total_len != expect_size {
         return Err(error::fmt!(
