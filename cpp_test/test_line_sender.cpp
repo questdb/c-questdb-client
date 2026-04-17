@@ -1508,6 +1508,20 @@ TEST_CASE("test timestamp_micros and timestamp_nanos::now()")
         half_second_micros);
 }
 
+TEST_CASE("line_sender c++ buffer copies default-constructed buffer")
+{
+    questdb::ingress::line_sender_buffer source{
+        questdb::ingress::protocol_version::v1};
+
+    questdb::ingress::line_sender_buffer copied{source};
+    CHECK(copied.peek() == "");
+
+    questdb::ingress::line_sender_buffer assigned{
+        questdb::ingress::protocol_version::v2};
+    assigned = source;
+    CHECK(assigned.peek() == "");
+}
+
 TEST_CASE("Test Marker")
 {
     questdb::ingress::line_sender_buffer buffer{

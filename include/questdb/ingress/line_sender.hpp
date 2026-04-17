@@ -93,7 +93,8 @@ public:
     }
 
     line_sender_buffer(const line_sender_buffer& other) noexcept
-        : _impl{::line_sender_buffer_clone(other._impl)}
+        : _impl{
+              other._impl ? ::line_sender_buffer_clone(other._impl) : nullptr}
         , _protocol_version{other._protocol_version}
         , _init_buf_size{other._init_buf_size}
         , _max_name_len{other._max_name_len}
