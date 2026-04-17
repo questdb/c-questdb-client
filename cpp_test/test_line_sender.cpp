@@ -2767,10 +2767,11 @@ TEST_CASE("line_sender c++ qwpudp multiple tables in one flush")
     // Each table batch becomes a separate datagram.
     const auto d1 = receiver.recv_datagram();
     const auto d2 = receiver.recv_datagram();
+    const auto d3 = receiver.recv_datagram();
     CHECK(datagram_starts_with_qwp1(d1));
     CHECK(datagram_starts_with_qwp1(d2));
-    // Three tables batches: trades(2 rows), quotes(1 row) -> 2 datagrams
-    // (the two "trades" rows that are separated by "quotes" become 2 batches)
+    CHECK(datagram_starts_with_qwp1(d3));
+    // Three contiguous table batches: trades, quotes, trades -> 3 datagrams.
 }
 
 TEST_CASE("line_sender c++ qwpudp clear and reuse buffer")
