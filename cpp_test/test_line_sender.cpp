@@ -2461,6 +2461,42 @@ TEST_CASE("Http auto detect line protocol version failed")
     }
 }
 
+TEST_CASE("line_sender c api err_out may be null on failure")
+{
+    ::line_sender_utf8 utf8{0, nullptr};
+    const char invalid_utf8[] = {static_cast<char>(0xff)};
+    CHECK_FALSE(::line_sender_utf8_init(
+        &utf8, sizeof(invalid_utf8), invalid_utf8, nullptr));
+
+    const auto host = QDB_UTF8_LITERAL("127.0.0.1");
+    ::line_sender_opts* opts =
+        ::line_sender_opts_new(::line_sender_protocol_tcp, host, 9009);
+    REQUIRE(opts != nullptr);
+    on_scope_exit opts_free_guard{[&] { ::line_sender_opts_free(opts); }};
+
+    CHECK_FALSE(::line_sender_opts_max_datagram_size(opts, 256, nullptr));
+    CHECK_FALSE(::line_sender_opts_multicast_ttl(opts, 3, nullptr));
+
+    ::line_sender_buffer* buffer = ::line_sender_buffer_new_qwp();
+    REQUIRE(buffer != nullptr);
+    on_scope_exit buffer_free_guard{[&] { ::line_sender_buffer_free(buffer); }};
+
+    const auto col = QDB_COLUMN_NAME_LITERAL("x");
+    CHECK_FALSE(::line_sender_buffer_column_dec_str(
+        buffer, col, "not_decimal?", 12, nullptr));
+
+    uintptr_t shape[] = {1};
+    double data[] = {1.0};
+    CHECK_FALSE(::line_sender_buffer_column_f64_arr_c_major(
+        buffer, col, 0, shape, data, 1, nullptr));
+
+    ::line_sender_bookmark bookmark{};
+    CHECK(::line_sender_buffer_bookmark(buffer, &bookmark, nullptr));
+    ::line_sender_buffer_clear_bookmark(buffer, bookmark);
+    CHECK_FALSE(
+        ::line_sender_buffer_rewind_to_bookmark(buffer, bookmark, nullptr));
+}
+
 TEST_CASE("line_sender c api max_datagram_size rejected for tcp opts")
 {
     ::line_sender_error* err = nullptr;

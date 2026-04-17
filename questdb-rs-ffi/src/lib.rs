@@ -53,8 +53,7 @@ macro_rules! bubble_err_to_c {
         match $expression {
             Ok(value) => value,
             Err(err) => {
-                let err_ptr = Box::into_raw(Box::new(line_sender_error(err)));
-                *$err_out = err_ptr;
+                set_err_out_from_error($err_out, err);
                 return $sentinel;
             }
         }
@@ -86,8 +85,7 @@ macro_rules! new_stride_array {
         let view = match StrideArrayView::<f64, $m, $n>::new($shape, $strides, $data, $data_len) {
             Ok(value) => value,
             Err(err) => {
-                let err_ptr = Box::into_raw(Box::new(line_sender_error(err)));
-                *$err_out = err_ptr;
+                set_err_out_from_error($err_out, err);
                 return false;
             }
         };
@@ -103,12 +101,13 @@ macro_rules! generate_array_dims_branches {
     ($rank:expr, $m:literal, $shape:expr, $strides:expr, $data:expr, $data_len:expr, $err_out:expr, $buffer:expr, $name:expr => $($n:literal),*) => {
         match $rank {
             0 => {
-                let err = fmt_error!(
-                    ArrayError,
-                    "Zero-dimensional arrays are not supported",
-                );
-                let err_ptr = Box::into_raw(Box::new(line_sender_error(err)));
-                *$err_out = err_ptr;
+                if !$err_out.is_null() {
+                    let err = fmt_error!(
+                        ArrayError,
+                        "Zero-dimensional arrays are not supported",
+                    );
+                    set_err_out_from_error($err_out, err);
+                }
                 return false;
             }
             $(
@@ -126,14 +125,15 @@ macro_rules! generate_array_dims_branches {
                 ),
             )*
             other => {
-                let err = fmt_error!(
-                    ArrayError,
-                    "Array dimension mismatch: expected at most {} dimensions, but got {}",
-                    32,
-                    other
-                );
-                let err_ptr = Box::into_raw(Box::new(line_sender_error(err)));
-                *$err_out = err_ptr;
+                if !$err_out.is_null() {
+                    let err = fmt_error!(
+                        ArrayError,
+                        "Array dimension mismatch: expected at most {} dimensions, but got {}",
+                        32,
+                        other
+                    );
+                    set_err_out_from_error($err_out, err);
+                }
                 return false;
             }
         }
@@ -176,7 +176,7 @@ macro_rules! upd_opts {
                     builder
                 }
                 Err(err) => {
-                    *$err_out = Box::into_raw(Box::new(line_sender_error(err)));
+                    set_err_out_from_error($err_out, err);
                     ptr::write(builder_ref, snapshot);
                     return false;
                 }
@@ -474,50 +474,61 @@ fn describe_buf(buf: &[u8]) -> String {
     output
 }
 
-unsafe fn set_err_out(err_out: *mut *mut line_sender_error, code: ErrorCode, msg: String) {
-    let err = line_sender_error(Error::new(code, msg));
-    let err_ptr = Box::into_raw(Box::new(err));
-    unsafe {
-        *err_out = err_ptr;
-    }
-}
-
-fn unwrap_utf8_or_str(buf: &[u8]) -> Result<&str, String> {
-    match str::from_utf8(buf) {
-        Ok(str_ref) => Ok(str_ref),
-        Err(u8err) => {
-            let buf_descr = describe_buf(buf);
-            let msg = if let Some(_err_len) = u8err.error_len() {
-                format!(
-                    concat!(
-                        "Bad string \"{}\": Invalid UTF-8. ",
-                        "Illegal codepoint starting at byte index {}."
-                    ),
-                    buf_descr,
-                    u8err.valid_up_to()
-                )
-            } else {
-                // needs more input
-                format!(
-                    concat!(
-                        "Bad string \"{}\": Invalid UTF-8. Incomplete ",
-                        "multi-byte codepoint at end of string. ",
-                        "Bad codepoint starting at byte index {}."
-                    ),
-                    buf_descr,
-                    u8err.valid_up_to()
-                )
-            };
-            Err(msg)
+#[cold]
+unsafe fn set_err_out_from_error(err_out: *mut *mut line_sender_error, err: Error) {
+    // `err_out` is optional in the C API; avoid allocating when the caller
+    // intentionally discards error details.
+    if !err_out.is_null() {
+        let err_ptr = Box::into_raw(Box::new(line_sender_error(err)));
+        unsafe {
+            *err_out = err_ptr;
         }
     }
 }
 
+#[cold]
+unsafe fn set_err_out(err_out: *mut *mut line_sender_error, code: ErrorCode, msg: String) {
+    if !err_out.is_null() {
+        unsafe { set_err_out_from_error(err_out, Error::new(code, msg)) };
+    }
+}
+
+fn describe_utf8_error(buf: &[u8], u8err: str::Utf8Error) -> String {
+    let buf_descr = describe_buf(buf);
+    if let Some(_err_len) = u8err.error_len() {
+        format!(
+            concat!(
+                "Bad string \"{}\": Invalid UTF-8. ",
+                "Illegal codepoint starting at byte index {}."
+            ),
+            buf_descr,
+            u8err.valid_up_to()
+        )
+    } else {
+        format!(
+            concat!(
+                "Bad string \"{}\": Invalid UTF-8. Incomplete ",
+                "multi-byte codepoint at end of string. ",
+                "Bad codepoint starting at byte index {}."
+            ),
+            buf_descr,
+            u8err.valid_up_to()
+        )
+    }
+}
+
+fn unwrap_utf8_or_str(buf: &[u8]) -> Result<&str, String> {
+    str::from_utf8(buf).map_err(|u8err| describe_utf8_error(buf, u8err))
+}
+
 unsafe fn unwrap_utf8(buf: &[u8], err_out: *mut *mut line_sender_error) -> Option<&str> {
-    match unwrap_utf8_or_str(buf) {
+    match str::from_utf8(buf) {
         Ok(str_ref) => Some(str_ref),
-        Err(msg) => {
-            unsafe { set_err_out(err_out, ErrorCode::InvalidUtf8, msg) };
+        Err(u8err) => {
+            if !err_out.is_null() {
+                let msg = describe_utf8_error(buf, u8err);
+                unsafe { set_err_out(err_out, ErrorCode::InvalidUtf8, msg) };
+            }
             None
         }
     }
@@ -1176,11 +1187,16 @@ pub unsafe extern "C" fn line_sender_buffer_column_dec_str(
             | b't'
             | b'y' => {}
             _ => {
-                unsafe {
-                    *err_out = Box::into_raw(Box::new(line_sender_error(questdb::Error::new(
-                        questdb::ErrorCode::InvalidDecimal,
-                        format!("Decimal string contains invalid character {:?}", b),
-                    ))));
+                if !err_out.is_null() {
+                    unsafe {
+                        set_err_out_from_error(
+                            err_out,
+                            questdb::Error::new(
+                                questdb::ErrorCode::InvalidDecimal,
+                                format!("Decimal string contains invalid character {:?}", b),
+                            ),
+                        );
+                    }
                 }
                 return false;
             }
@@ -1261,8 +1277,7 @@ pub unsafe extern "C" fn line_sender_buffer_column_f64_arr_c_major(
         let view = match CMajorArrayView::<f64>::new(rank, shape, data, data_len) {
             Ok(value) => value,
             Err(err) => {
-                let err_ptr = Box::into_raw(Box::new(line_sender_error(err)));
-                *err_out = err_ptr;
+                set_err_out_from_error(err_out, err);
                 return false;
             }
         };
