@@ -127,7 +127,13 @@ where
             ));
         }
         // following dimension's length may be zero, so check the size in out of loop
-        size *= dim;
+        size = size.checked_mul(dim).ok_or_else(|| {
+            error::fmt!(
+                ArrayError,
+                "Array buffer size overflow: maximum: {}",
+                MAX_ARRAY_BUFFER_SIZE
+            )
+        })?;
     }
 
     if size > MAX_ARRAY_BUFFER_SIZE {

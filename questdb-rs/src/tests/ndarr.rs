@@ -23,7 +23,10 @@
  ******************************************************************************/
 
 use crate::ErrorCode;
-use crate::ingress::{ARRAY_BINARY_FORMAT_TYPE, Buffer, NdArrayView, ProtocolVersion};
+use crate::ingress::ndarr::check_and_get_array_bytes_size;
+use crate::ingress::{
+    ARRAY_BINARY_FORMAT_TYPE, Buffer, MAX_ARRAY_DIM_LEN, NdArrayView, ProtocolVersion,
+};
 use crate::tests::TestResult;
 
 #[cfg(feature = "ndarray")]
@@ -65,6 +68,35 @@ impl TryFrom<u8> for ArrayColumnTypeTag {
             _ => Err(format!("Unsupported column type tag {value} for arrays")),
         }
     }
+}
+
+struct OverflowingArrayShape;
+
+impl NdArrayView<f64> for OverflowingArrayShape {
+    type Iter<'a> = std::iter::Empty<&'a f64>;
+
+    fn ndim(&self) -> usize {
+        4
+    }
+
+    fn dim(&self, _index: usize) -> crate::Result<usize> {
+        Ok(MAX_ARRAY_DIM_LEN)
+    }
+
+    fn as_slice(&self) -> Option<&[f64]> {
+        None
+    }
+
+    fn iter(&self) -> Self::Iter<'_> {
+        std::iter::empty()
+    }
+}
+
+#[test]
+fn test_array_byte_size_overflow_is_error() {
+    let err = check_and_get_array_bytes_size(&OverflowingArrayShape).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ArrayError);
+    assert!(err.msg().contains("Array buffer size"));
 }
 
 #[test]
