@@ -63,4 +63,26 @@ impl QwpUdpMock {
         }
         Ok(datagrams)
     }
+
+    pub fn assert_no_datagram(&self) -> io::Result<()> {
+        let previous_timeout = self.socket.read_timeout()?;
+        self.socket
+            .set_read_timeout(Some(Duration::from_millis(50)))?;
+        let result = self.recv_datagram();
+        self.socket.set_read_timeout(previous_timeout)?;
+
+        match result {
+            Ok(datagram) => Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("unexpected datagram of {} bytes", datagram.len()),
+            )),
+            Err(err)
+                if err.kind() == io::ErrorKind::WouldBlock
+                    || err.kind() == io::ErrorKind::TimedOut =>
+            {
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
+    }
 }

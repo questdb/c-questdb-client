@@ -1650,6 +1650,7 @@ fn qwp_udp_flush_empty_buffer_is_noop() -> TestResult {
 
     // Flushing an empty buffer should be a no-op, not an error.
     sender.flush(&mut buffer)?;
+    mock.assert_no_datagram()?;
 
     Ok(())
 }

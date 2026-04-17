@@ -178,6 +178,23 @@ public:
         return buffer;
     }
 
+    bool has_datagram(double wait_timeout_sec = 0.05) const
+    {
+        fd_set read_set;
+        FD_ZERO(&read_set);
+        FD_SET(_socket, &read_set);
+
+        timeval timeout{};
+        timeout.tv_sec = static_cast<decltype(timeout.tv_sec)>(wait_timeout_sec);
+        timeout.tv_usec = static_cast<decltype(timeout.tv_usec)>(
+            1000000.0 * (wait_timeout_sec - static_cast<double>(timeout.tv_sec)));
+        const int nfds = static_cast<int>(_socket) + 1;
+        const int ready =
+            ::select(nfds, &read_set, nullptr, nullptr, &timeout);
+        REQUIRE(ready >= 0);
+        return ready == 1;
+    }
+
 private:
     socketfd_t _socket;
     uint16_t _port;
@@ -2596,6 +2613,7 @@ TEST_CASE("line_sender c api flush empty qwpudp buffer is noop")
     // Empty buffer flush should succeed (no-op).
     CHECK(::line_sender_flush(sender, buffer, &err));
     CHECK(::line_sender_buffer_row_count(buffer) == 0);
+    CHECK_FALSE(receiver.has_datagram());
 }
 
 TEST_CASE("line_sender c api qwp buffer rejected by tcp sender")
@@ -2813,6 +2831,7 @@ TEST_CASE("line_sender c++ qwpudp flush_and_keep empty buffer is noop")
     // Should not throw or send anything.
     sender.flush_and_keep(buffer);
     CHECK(buffer.row_count() == 0);
+    CHECK_FALSE(receiver.has_datagram());
 }
 
 TEST_CASE("line_sender c api qwpudp bookmark rewind and stale rejection")
