@@ -148,9 +148,10 @@ macro_rules! generate_array_dims_branches {
 /// result back. On error the consumed builder is gone, and we must
 /// write a valid object back to avoid a double-free.
 ///
-/// We clone the builder before the consuming call and restore it on
-/// failure so the caller keeps their original configuration. This costs
-/// one shallow clone per setter call during one-time setup — acceptable
+/// We clone the builder before moving it out and restore that snapshot on
+/// failure so the caller keeps their original configuration. Cloning before
+/// `ptr::read` keeps the original object valid if snapshot allocation panics.
+/// This costs one clone per setter call during one-time setup — acceptable
 /// since this path is only hit from C/C++ FFI, never from pure Rust.
 ///
 /// Alternatives considered:
@@ -167,8 +168,8 @@ macro_rules! upd_opts {
     ($opts:expr, $err_out:expr, $func:ident $(, $($args:expr),*)?) => {
         {
             let builder_ref: *mut SenderBuilder = &mut (*$opts).0;
+            let snapshot = (*$opts).0.clone();
             let forced_builder = ptr::read(&(*$opts).0);
-            let snapshot = forced_builder.clone();
             let new_builder_or_err = forced_builder.$func($($($args),*)?);
             let new_builder = match new_builder_or_err {
                 Ok(builder) => {
