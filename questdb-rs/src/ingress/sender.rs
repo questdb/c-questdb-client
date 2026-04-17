@@ -356,7 +356,9 @@ impl Sender {
     ///
     /// The returned value may be explicitly configured, auto-detected, or a
     /// transport-defined default. Interpret it together with [`Sender::protocol`]
-    /// and [`ProtocolVersion`].
+    /// and [`ProtocolVersion`]. For QWP/UDP this reports the QWP datagram
+    /// version, currently represented as [`ProtocolVersion::V1`]; it is not an
+    /// ILP feature version.
     pub fn protocol_version(&self) -> ProtocolVersion {
         self.protocol_version
     }

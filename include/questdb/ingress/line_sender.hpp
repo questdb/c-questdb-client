@@ -1297,6 +1297,8 @@ public:
      * This is meaningful for ILP senders. For protocol-neutral inspection, use
      * `protocol()`. Do not use this value to construct QWP/UDP buffers; use
      * `new_buffer()` instead.
+     * For QWP/UDP senders this reports the QWP datagram version, currently
+     * represented as `protocol_version::v1`; it is not an ILP feature version.
      */
     questdb::ingress::protocol_version protocol_version() const
     {

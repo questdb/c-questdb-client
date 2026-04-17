@@ -1999,6 +1999,8 @@ pub unsafe extern "C" fn line_sender_get_protocol(
 /// This is meaningful for ILP senders. For protocol-neutral inspection, use
 /// [`line_sender_get_protocol`]. Do not use this value to construct QWP/UDP
 /// buffers; use [`line_sender_buffer_new_for_sender`] instead.
+/// For QWP/UDP senders this reports the QWP datagram version, currently
+/// represented as [`ProtocolVersion::V1`]; it is not an ILP feature version.
 ///
 /// - Explicitly set version, or
 /// - Auto-detected during HTTP transport, or

@@ -234,7 +234,10 @@ impl Buffer {
 
     /// Returns the protocol version associated with this buffer.
     ///
-    /// See [`ProtocolVersion`] for transport-specific interpretation.
+    /// For ILP buffers this is the ILP protocol version. For QWP/UDP buffers
+    /// this is the QWP datagram version, currently represented as
+    /// [`ProtocolVersion::V1`]. Interpret the value together with the buffer
+    /// transport; do not use it by itself for ILP feature gating.
     pub fn protocol_version(&self) -> ProtocolVersion {
         match &self.inner {
             BufferInner::Ilp(inner) => inner.protocol_version(),

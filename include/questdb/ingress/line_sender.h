@@ -1233,6 +1233,9 @@ line_sender_protocol line_sender_get_protocol(const line_sender* sender);
  * `line_sender_get_protocol(...)`.
  * Do not use this value to construct QWP/UDP buffers; use
  * `line_sender_buffer_new_for_sender(...)` instead.
+ * For QWP/UDP senders this reports the QWP datagram version, currently
+ * represented as `line_sender_protocol_version_1`; it is not an ILP feature
+ * version.
  *
  * This is either the protocol version that was set explicitly,
  * or the one that was auto-detected during the connection process(Only for
