@@ -47,9 +47,11 @@ connectionless, so the server cannot verify client identity at the protocol
 layer, and datagram contents travel unencrypted.
 
 Passing `username`, `password`, `token`, `token_x`, `token_y`, or
-`auth_timeout` to a `qwpudp::` sender is rejected at build time with the
-error `Authentication settings are not supported for QWP/UDP.` There is no
-`qwpudps://` (TLS) scheme.
+`auth_timeout` to a `qwpudp::` sender is rejected when the setting is applied,
+either while parsing a config string or while calling the corresponding builder
+method. The error names the unsupported setting, for example
+`The "username" setting is not supported for QWP/UDP.` There is no `qwpudps://`
+(TLS) scheme.
 
 QWP/UDP is therefore intended for **trusted private networks only** —
 typically a co-located client and server, or a network segment under your
