@@ -1170,8 +1170,9 @@ void line_sender_opts_free(line_sender_opts* opts);
  * returning.
  *
  * The sender should be accessed by only a single thread a time.
- * @param[in] opts Options for the connection.
- * @note The opts object is freed.
+ * @param[in] opts Options for the connection. Must be non-NULL.
+ * @note The caller retains ownership of `opts` and must release it with
+ * `line_sender_opts_free()` when it is no longer needed.
  */
 LINESENDER_API
 line_sender* line_sender_build(

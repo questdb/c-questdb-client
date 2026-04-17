@@ -1899,7 +1899,9 @@ pub struct line_sender(Sender);
 ///
 /// The sender should be accessed by only a single thread a time.
 ///
-/// @param[in] opts Options for the connection.
+/// @param[in] opts Options for the connection. Must be non-NULL.
+/// The caller retains ownership of `opts` and must release it with
+/// `line_sender_opts_free` when it is no longer needed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_build(
     opts: *const line_sender_opts,
