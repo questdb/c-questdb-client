@@ -45,17 +45,7 @@ fn map_getaddrinfo_result(
     result: Result<AddrInfoIter, LookupError>,
 ) -> crate::Result<SockAddr> {
     match result {
-        Ok(mut addrs) => {
-            let addr: AddrInfo = addrs.next().unwrap().map_err(|io_err| {
-                error::fmt!(
-                    CouldNotResolveAddr,
-                    "Could not resolve {:?}: {}",
-                    dest,
-                    io_err
-                )
-            })?;
-            Ok(addr.sockaddr.into())
-        }
+        Ok(mut addrs) => map_first_addrinfo(dest, addrs.next()),
         Err(lookup_err) => {
             let io_err: std::io::Error = lookup_err.into();
             Err(error::fmt!(
@@ -65,6 +55,26 @@ fn map_getaddrinfo_result(
                 io_err
             ))
         }
+    }
+}
+
+fn map_first_addrinfo(
+    dest: &str,
+    result: Option<std::io::Result<AddrInfo>>,
+) -> crate::Result<SockAddr> {
+    match result {
+        Some(Ok(addr)) => Ok(addr.sockaddr.into()),
+        Some(Err(io_err)) => Err(error::fmt!(
+            CouldNotResolveAddr,
+            "Could not resolve {:?}: {}",
+            dest,
+            io_err
+        )),
+        None => Err(error::fmt!(
+            CouldNotResolveAddr,
+            "Could not resolve {:?}: no addresses returned",
+            dest
+        )),
     }
 }
 
@@ -112,4 +122,21 @@ fn resolve_host_port_with_socktype(
         &host_port,
         dns_lookup::getaddrinfo(Some(host), Some(port), Some(hints)),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ErrorCode;
+
+    #[test]
+    fn empty_getaddrinfo_result_is_error() {
+        let err = map_first_addrinfo("example.invalid:9009", None).unwrap_err();
+
+        assert_eq!(err.code(), ErrorCode::CouldNotResolveAddr);
+        assert!(
+            err.msg()
+                .contains("Could not resolve \"example.invalid:9009\": no addresses returned")
+        );
+    }
 }
