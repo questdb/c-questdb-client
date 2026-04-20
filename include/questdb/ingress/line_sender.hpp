@@ -900,7 +900,7 @@ public:
     }
 
     opts(const opts& other) noexcept
-        : _impl{::line_sender_opts_clone(other._impl)}
+        : _impl{other._impl ? ::line_sender_opts_clone(other._impl) : nullptr}
     {
     }
 
@@ -915,7 +915,8 @@ public:
         if (this != &other)
         {
             reset();
-            _impl = ::line_sender_opts_clone(other._impl);
+            _impl =
+                other._impl ? ::line_sender_opts_clone(other._impl) : nullptr;
         }
         return *this;
     }

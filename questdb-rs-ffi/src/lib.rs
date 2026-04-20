@@ -1869,6 +1869,9 @@ pub unsafe extern "C" fn line_sender_opts_clone(
     opts: *const line_sender_opts,
 ) -> *mut line_sender_opts {
     unsafe {
+        if opts.is_null() {
+            return ptr::null_mut();
+        }
         let builder = &(*opts).0;
         let new_builder = builder.clone();
         Box::into_raw(Box::new(line_sender_opts(new_builder)))

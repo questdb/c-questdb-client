@@ -1153,11 +1153,15 @@ bool line_sender_opts_user_agent(
 /**
  * Duplicate the `line_sender_opts` object.
  * Both old and new objects will have to be freed.
+ * Returns NULL if `opts` is NULL.
  */
 LINESENDER_API
 line_sender_opts* line_sender_opts_clone(line_sender_opts* opts);
 
-/** Release the `line_sender_opts` object. */
+/**
+ * Release the `line_sender_opts` object.
+ * Passing NULL is a no-op.
+ */
 LINESENDER_API
 void line_sender_opts_free(line_sender_opts* opts);
 

@@ -1413,10 +1413,18 @@ TEST_CASE("os certs")
 
 TEST_CASE("Opts copy ctor, assignment and move testing.")
 {
+    CHECK(::line_sender_opts_clone(nullptr) == nullptr);
+
     {
         questdb::ingress::opts opts1{
             questdb::ingress::protocol::tcp, "127.0.0.1", "9009"};
         questdb::ingress::opts opts2{std::move(opts1)};
+        // opts1 is moved-from (internal _impl is null); copying and assigning
+        // from it must not crash.
+        questdb::ingress::opts opts3{opts1};
+        questdb::ingress::opts opts4{
+            questdb::ingress::protocol::tcp, "127.0.0.1", "9009"};
+        opts4 = opts1;
     }
 
     {
