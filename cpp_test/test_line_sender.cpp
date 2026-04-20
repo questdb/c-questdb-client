@@ -1826,6 +1826,9 @@ TEST_CASE("line_sender c api qwpudp basics")
     REQUIRE(sender != nullptr);
     on_scope_exit sender_close_guard{[&] { ::line_sender_close(sender); }};
     CHECK(::line_sender_get_protocol(sender) == ::line_sender_protocol_qwpudp);
+    CHECK(
+        ::line_sender_get_protocol_version(sender) ==
+        ::line_sender_protocol_version_1);
 
     ::line_sender_buffer* buffer = ::line_sender_buffer_new_for_sender(sender);
     REQUIRE(buffer != nullptr);
