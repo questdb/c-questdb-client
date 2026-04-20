@@ -11,3 +11,6 @@ questdb-rs/Cargo.lock
 include/questdb/ingress/line_sender.gen.h
 cython/questdb/ingress/line_sender.pxd
 profile.out
+__pycache__/
+corrosion/test/cpp2rust/cpp2rust/rust/rust_dependency/Cargo.lock
+corrosion/test/rustflags/rustflags/rust/some_dependency/Cargo.lock
