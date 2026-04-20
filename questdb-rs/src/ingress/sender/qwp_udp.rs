@@ -167,6 +167,23 @@ mod tests {
     }
 
     #[test]
+    fn qwp_udp_sets_multicast_ttl_on_socket() {
+        let mut qwp_udp = QwpUdpConfig::default();
+        qwp_udp
+            .multicast_ttl
+            .set_specified("multicast_ttl", 7)
+            .unwrap();
+
+        let handler = connect_qwp_udp("127.0.0.1", "9007", None, &qwp_udp).unwrap();
+        #[allow(irrefutable_let_patterns)]
+        let SyncProtocolHandler::SyncQwpUdp(ref state) = handler else {
+            panic!("Expected SyncQwpUdp handler");
+        };
+
+        assert_eq!(state.socket.multicast_ttl_v4().unwrap(), 7);
+    }
+
+    #[test]
     fn qwp_udp_flush_surfaces_socket_send_failure() {
         let qwp_udp = QwpUdpConfig::default();
         let mut handler = connect_qwp_udp("127.0.0.1", "9007", None, &qwp_udp).unwrap();
