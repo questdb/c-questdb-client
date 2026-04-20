@@ -69,6 +69,7 @@ mod alloc_counter {
     /// included. Tests that assert on the result must therefore run
     /// single-threaded: mark them `#[ignore]` and run with `--test-threads=1`
     /// (see the existing `qwp_zero_alloc_*` tests for the convention).
+    #[cfg(feature = "_sender-qwp-udp")]
     pub fn start_counting() -> usize {
         ALLOC_COUNT.store(0, Ordering::SeqCst);
         COUNTING.store(true, Ordering::SeqCst);
@@ -77,6 +78,7 @@ mod alloc_counter {
 
     /// Stop counting and return the number of allocations observed since
     /// [`start_counting`]. Same single-thread constraint as `start_counting`.
+    #[cfg(feature = "_sender-qwp-udp")]
     pub fn stop_counting() -> usize {
         COUNTING.store(false, Ordering::SeqCst);
         ALLOC_COUNT.load(Ordering::SeqCst)
