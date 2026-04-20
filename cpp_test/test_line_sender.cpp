@@ -2908,6 +2908,78 @@ TEST_CASE("line_sender c++ qwpudp flush_and_keep empty buffer is noop")
     CHECK_FALSE(receiver.has_datagram());
 }
 
+TEST_CASE("line_sender c api qwpudp marker rewind rows")
+{
+    udp_capture receiver;
+    ::line_sender_error* err = nullptr;
+    on_scope_exit error_free_guard{[&] {
+        if (err)
+            ::line_sender_error_free(err);
+    }};
+
+    const auto host = QDB_UTF8_LITERAL("127.0.0.1");
+    ::line_sender_opts* opts =
+        ::line_sender_opts_new(::line_sender_protocol_qwpudp, host, receiver.port());
+    REQUIRE(opts != nullptr);
+    on_scope_exit opts_free_guard{[&] { ::line_sender_opts_free(opts); }};
+
+    ::line_sender* sender = ::line_sender_build(opts, &err);
+    REQUIRE(sender != nullptr);
+    on_scope_exit sender_close_guard{[&] { ::line_sender_close(sender); }};
+
+    ::line_sender_buffer* buffer = ::line_sender_buffer_new_for_sender(sender);
+    REQUIRE(buffer != nullptr);
+    on_scope_exit buffer_free_guard{[&] { ::line_sender_buffer_free(buffer); }};
+
+    const auto trades = QDB_TABLE_NAME_LITERAL("trades");
+    const auto quotes = QDB_TABLE_NAME_LITERAL("quotes");
+    const auto sym = QDB_COLUMN_NAME_LITERAL("sym");
+    const auto qty = QDB_COLUMN_NAME_LITERAL("qty");
+
+    CHECK(::line_sender_buffer_table(buffer, trades, &err));
+    CHECK(::line_sender_buffer_symbol(buffer, sym, QDB_UTF8_LITERAL("ETH-USD"), &err));
+    CHECK(::line_sender_buffer_column_i64(buffer, qty, 1, &err));
+    CHECK(::line_sender_buffer_at_now(buffer, &err));
+    CHECK(::line_sender_buffer_row_count(buffer) == 1);
+    CHECK_FALSE(::line_sender_buffer_transactional(buffer));
+
+    CHECK(::line_sender_buffer_set_marker(buffer, &err));
+    CHECK(::line_sender_buffer_table(buffer, quotes, &err));
+    CHECK(::line_sender_buffer_symbol(buffer, sym, QDB_UTF8_LITERAL("BTC-USD"), &err));
+    CHECK(::line_sender_buffer_column_i64(buffer, qty, 2, &err));
+    CHECK(::line_sender_buffer_at_now(buffer, &err));
+    CHECK(::line_sender_buffer_row_count(buffer) == 2);
+
+    CHECK(::line_sender_buffer_rewind_to_marker(buffer, &err));
+    CHECK(::line_sender_buffer_row_count(buffer) == 1);
+    CHECK_FALSE(::line_sender_buffer_transactional(buffer));
+
+    CHECK(::line_sender_buffer_table(buffer, trades, &err));
+    CHECK(::line_sender_buffer_symbol(buffer, sym, QDB_UTF8_LITERAL("SOL-USD"), &err));
+    CHECK(::line_sender_buffer_column_i64(buffer, qty, 3, &err));
+    CHECK(::line_sender_buffer_at_now(buffer, &err));
+    CHECK(::line_sender_buffer_row_count(buffer) == 2);
+
+    CHECK_FALSE(::line_sender_buffer_rewind_to_marker(buffer, &err));
+    REQUIRE(err != nullptr);
+    ::line_sender_error_free(err);
+    err = nullptr;
+
+    CHECK(::line_sender_flush(sender, buffer, &err));
+    CHECK(::line_sender_buffer_row_count(buffer) == 0);
+    const auto datagram = receiver.recv_datagram();
+    CHECK(datagram_starts_with_qwp1(datagram));
+    const std::string datagram_text{
+        reinterpret_cast<const char*>(datagram.data()),
+        datagram.size()};
+    CHECK(datagram_text.find("trades") != std::string::npos);
+    CHECK(datagram_text.find("ETH-USD") != std::string::npos);
+    CHECK(datagram_text.find("SOL-USD") != std::string::npos);
+    CHECK(datagram_text.find("quotes") == std::string::npos);
+    CHECK(datagram_text.find("BTC-USD") == std::string::npos);
+    CHECK_FALSE(receiver.has_datagram());
+}
+
 TEST_CASE("line_sender c api qwpudp bookmark rewind and stale rejection")
 {
     udp_capture receiver;
