@@ -70,6 +70,7 @@ pub(crate) const QWP_MESSAGE_HEADER_SIZE: usize = std::mem::size_of::<QwpMessage
 
 // Compile-time guarantee that the header is exactly 12 bytes.
 const _: () = assert!(QWP_MESSAGE_HEADER_SIZE == 12);
+const _: () = assert!(MAX_ARRAY_DIMS <= u8::MAX as usize);
 
 pub(crate) const QWP_SCHEMA_MODE_FULL: u8 = 0x00;
 pub(crate) const QWP_TYPE_BOOLEAN: u8 = 0x01;
@@ -1068,7 +1069,7 @@ impl QwpBuffer {
                 u32::MAX
             ));
         }
-        checked_qwp_u32(arena_len, arena_name)
+        Ok(arena_len as u32)
     }
 
     fn append_name(&mut self, name: &str) -> crate::Result<NameSlice> {
@@ -1140,8 +1141,16 @@ impl QwpBuffer {
             Self::checked_arena_offset(self.value_bytes.len(), payload_len, "value_bytes")?;
         let len = checked_qwp_u32(payload_len, "array value length")?;
 
+        let ndim_u8 = u8::try_from(ndim).map_err(|_| {
+            error::fmt!(
+                ArrayError,
+                "Array dimension rank exceeds maximum encodable size of {}",
+                u8::MAX
+            )
+        })?;
+
         let start = self.value_bytes.len();
-        self.value_bytes.push(ndim as u8);
+        self.value_bytes.push(ndim_u8);
         for i in 0..ndim {
             let dim = view.dim(i)?;
             // This should already hold because `check_and_get_array_bytes_size()`
@@ -2910,7 +2919,17 @@ fn encode_column_from_cells(
         ColumnKind::String => {
             let non_null_count = col.non_null_count as usize;
             let offsets_start = out.len();
-            out.resize(out.len() + (non_null_count + 1) * 4, 0);
+            debug_assert!(
+                non_null_count
+                    .checked_add(1)
+                    .and_then(|n| n.checked_mul(4))
+                    .is_some()
+            );
+            let offset_count = checked_qwp_usize_add(non_null_count, 1, "string offset count")?;
+            let offset_table_len = checked_qwp_usize_mul(offset_count, 4, "string offset table")?;
+            let offsets_end =
+                checked_qwp_usize_add(offsets_start, offset_table_len, "string offset table")?;
+            out.resize(offsets_end, 0);
             out[offsets_start..offsets_start + 4].copy_from_slice(&0i32.to_le_bytes());
 
             let mut cumulative: i32 = 0;
