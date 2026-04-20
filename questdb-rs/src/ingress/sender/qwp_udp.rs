@@ -167,6 +167,23 @@ mod tests {
     }
 
     #[test]
+    fn qwp_udp_binds_requested_interface() {
+        let handler = connect_qwp_udp(
+            "127.0.0.1",
+            "9007",
+            Some("127.0.0.1"),
+            &QwpUdpConfig::default(),
+        )
+        .unwrap();
+        #[allow(irrefutable_let_patterns)]
+        let SyncProtocolHandler::SyncQwpUdp(ref state) = handler else {
+            panic!("Expected SyncQwpUdp handler");
+        };
+
+        assert_eq!(state.socket.local_addr().unwrap().ip(), Ipv4Addr::LOCALHOST);
+    }
+
+    #[test]
     fn qwp_udp_sets_multicast_ttl_on_socket() {
         let mut qwp_udp = QwpUdpConfig::default();
         qwp_udp
