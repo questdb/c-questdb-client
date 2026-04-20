@@ -72,10 +72,10 @@ impl QwpUdpMock {
         self.socket.set_read_timeout(previous_timeout)?;
 
         match result {
-            Ok(datagram) => Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("unexpected datagram of {} bytes", datagram.len()),
-            )),
+            Ok(datagram) => Err(io::Error::other(format!(
+                "unexpected datagram of {} bytes",
+                datagram.len()
+            ))),
             Err(err)
                 if err.kind() == io::ErrorKind::WouldBlock
                     || err.kind() == io::ErrorKind::TimedOut =>
