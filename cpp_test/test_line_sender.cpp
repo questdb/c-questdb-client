@@ -32,11 +32,17 @@
 
 #include <array>
 #include <chrono>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <optional>
 #include <sstream>
+#include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #if defined(PLATFORM_UNIX)
@@ -57,6 +63,14 @@ constexpr auto qwp_decimal256_min_negative =
     "-57896044618658097711785492504343953926634992332820282019728792003956564819968";
 constexpr auto qwp_decimal256_positive_overflow =
     "57896044618658097711785492504343953926634992332820282019728792003956564819968";
+constexpr uint8_t qwp_test_type_boolean = 0x01;
+constexpr uint8_t qwp_test_type_long = 0x05;
+constexpr uint8_t qwp_test_type_double = 0x07;
+constexpr uint8_t qwp_test_type_string = 0x08;
+constexpr uint8_t qwp_test_type_symbol = 0x09;
+constexpr uint8_t qwp_test_type_timestamp = 0x0A;
+constexpr uint8_t qwp_test_type_timestamp_nanos = 0x10;
+constexpr size_t qwp_test_message_header_size = 12;
 
 #if defined(PLATFORM_UNIX)
 #    define QDB_TEST_CLOSESOCKET ::close
@@ -231,6 +245,42 @@ struct qwp_test_decoded_decimal_datagram
     std::vector<std::optional<std::vector<uint8_t>>> values;
 };
 
+enum class qwp_test_decoded_value_kind
+{
+    null,
+    boolean,
+    symbol,
+    i64,
+    f64,
+    string,
+    timestamp_micros,
+    timestamp_nanos,
+};
+
+struct qwp_test_decoded_value
+{
+    qwp_test_decoded_value_kind kind{qwp_test_decoded_value_kind::null};
+    bool bool_value{false};
+    int64_t i64_value{0};
+    double f64_value{0.0};
+    std::string string_value;
+};
+
+struct qwp_test_decoded_scalar_column
+{
+    std::string name;
+    uint8_t type_code{0};
+    bool nullable{false};
+};
+
+struct qwp_test_decoded_scalar_datagram
+{
+    std::string table_name;
+    uint64_t row_count{0};
+    std::vector<qwp_test_decoded_scalar_column> columns;
+    std::vector<std::vector<qwp_test_decoded_value>> rows;
+};
+
 class qwp_test_decoder
 {
 public:
@@ -269,6 +319,39 @@ public:
             (static_cast<uint32_t>(raw[3]) << 24);
     }
 
+    uint64_t read_u64()
+    {
+        const auto bytes = read_exact(8);
+        std::array<uint8_t, 8> raw{};
+        for (size_t i = 0; i < raw.size(); ++i)
+            raw[i] = std::to_integer<uint8_t>(bytes[i]);
+        return
+            static_cast<uint64_t>(raw[0]) |
+            (static_cast<uint64_t>(raw[1]) << 8) |
+            (static_cast<uint64_t>(raw[2]) << 16) |
+            (static_cast<uint64_t>(raw[3]) << 24) |
+            (static_cast<uint64_t>(raw[4]) << 32) |
+            (static_cast<uint64_t>(raw[5]) << 40) |
+            (static_cast<uint64_t>(raw[6]) << 48) |
+            (static_cast<uint64_t>(raw[7]) << 56);
+    }
+
+    int32_t read_i32()
+    {
+        const uint32_t bits = read_u32();
+        int32_t value = 0;
+        std::memcpy(&value, &bits, sizeof(value));
+        return value;
+    }
+
+    int64_t read_i64()
+    {
+        const uint64_t bits = read_u64();
+        int64_t value = 0;
+        std::memcpy(&value, &bits, sizeof(value));
+        return value;
+    }
+
     uint64_t read_varint()
     {
         uint32_t shift = 0;
@@ -295,12 +378,9 @@ public:
 
     double read_f64()
     {
-        const auto bytes = read_exact(8);
-        std::array<uint8_t, 8> raw{};
-        for (size_t i = 0; i < raw.size(); ++i)
-            raw[i] = std::to_integer<uint8_t>(bytes[i]);
+        const uint64_t bits = read_u64();
         double value = 0.0;
-        std::memcpy(&value, raw.data(), sizeof(value));
+        std::memcpy(&value, &bits, sizeof(value));
         return value;
     }
 
@@ -318,6 +398,411 @@ private:
     const std::vector<std::byte>& _bytes;
     size_t _pos;
 };
+
+std::vector<std::byte> qwp_test_payload_from_datagram(
+    const std::vector<std::byte>& datagram)
+{
+    REQUIRE(datagram.size() >= qwp_test_message_header_size);
+    REQUIRE(datagram_starts_with_qwp1(datagram));
+    CHECK(std::to_integer<uint8_t>(datagram[4]) == 1);
+    CHECK(std::to_integer<uint8_t>(datagram[5]) == 0);
+    CHECK(std::to_integer<uint8_t>(datagram[6]) == 1);
+    CHECK(std::to_integer<uint8_t>(datagram[7]) == 0);
+    const uint32_t payload_len =
+        static_cast<uint32_t>(std::to_integer<uint8_t>(datagram[8])) |
+        (static_cast<uint32_t>(std::to_integer<uint8_t>(datagram[9])) << 8) |
+        (static_cast<uint32_t>(std::to_integer<uint8_t>(datagram[10])) << 16) |
+        (static_cast<uint32_t>(std::to_integer<uint8_t>(datagram[11])) << 24);
+    REQUIRE(datagram.size() == qwp_test_message_header_size + payload_len);
+    return {
+        datagram.begin() + static_cast<std::ptrdiff_t>(qwp_test_message_header_size),
+        datagram.end()};
+}
+
+qwp_test_decoded_value qwp_test_null_value()
+{
+    return {};
+}
+
+qwp_test_decoded_value qwp_test_bool_value(bool value)
+{
+    qwp_test_decoded_value out{};
+    out.kind = qwp_test_decoded_value_kind::boolean;
+    out.bool_value = value;
+    return out;
+}
+
+qwp_test_decoded_value qwp_test_i64_value(int64_t value)
+{
+    qwp_test_decoded_value out{};
+    out.kind = qwp_test_decoded_value_kind::i64;
+    out.i64_value = value;
+    return out;
+}
+
+qwp_test_decoded_value qwp_test_f64_value(double value)
+{
+    qwp_test_decoded_value out{};
+    out.kind = qwp_test_decoded_value_kind::f64;
+    out.f64_value = value;
+    return out;
+}
+
+qwp_test_decoded_value qwp_test_string_value(
+    qwp_test_decoded_value_kind kind,
+    std::string value)
+{
+    qwp_test_decoded_value out{};
+    out.kind = kind;
+    out.string_value = std::move(value);
+    return out;
+}
+
+qwp_test_decoded_value qwp_test_timestamp_value(
+    qwp_test_decoded_value_kind kind,
+    int64_t value)
+{
+    qwp_test_decoded_value out{};
+    out.kind = kind;
+    out.i64_value = value;
+    return out;
+}
+
+size_t qwp_test_non_null_count(const std::vector<bool>& has_value)
+{
+    size_t count = 0;
+    for (bool present : has_value)
+    {
+        if (present)
+            ++count;
+    }
+    return count;
+}
+
+std::vector<qwp_test_decoded_value> qwp_test_read_column_values(
+    qwp_test_decoder& decoder,
+    uint8_t type_code,
+    const std::vector<bool>& has_value)
+{
+    const size_t row_count = has_value.size();
+    const size_t non_null_count = qwp_test_non_null_count(has_value);
+
+    switch (type_code)
+    {
+    case qwp_test_type_boolean:
+    {
+        const size_t packed_size = (non_null_count + 7) / 8;
+        const auto bytes = decoder.read_exact(packed_size);
+        std::vector<bool> raw_values;
+        raw_values.reserve(non_null_count);
+        for (size_t value_idx = 0; value_idx < non_null_count; ++value_idx)
+        {
+            const uint8_t byte =
+                std::to_integer<uint8_t>(bytes[value_idx / 8]);
+            raw_values.push_back((byte & (1u << (value_idx % 8))) != 0);
+        }
+
+        size_t next_value = 0;
+        std::vector<qwp_test_decoded_value> values;
+        values.reserve(row_count);
+        for (bool present : has_value)
+        {
+            if (!present)
+            {
+                values.push_back(qwp_test_null_value());
+                continue;
+            }
+            values.push_back(qwp_test_bool_value(raw_values[next_value++]));
+        }
+        return values;
+    }
+    case qwp_test_type_symbol:
+    {
+        const size_t dict_size = static_cast<size_t>(decoder.read_varint());
+        std::vector<std::string> dict;
+        dict.reserve(dict_size);
+        for (size_t i = 0; i < dict_size; ++i)
+            dict.push_back(decoder.read_string());
+
+        std::vector<size_t> indexes;
+        indexes.reserve(non_null_count);
+        for (size_t i = 0; i < non_null_count; ++i)
+            indexes.push_back(static_cast<size_t>(decoder.read_varint()));
+
+        size_t next_index = 0;
+        std::vector<qwp_test_decoded_value> values;
+        values.reserve(row_count);
+        for (bool present : has_value)
+        {
+            if (!present)
+            {
+                values.push_back(qwp_test_null_value());
+                continue;
+            }
+            const size_t idx = indexes[next_index++];
+            REQUIRE(idx < dict.size());
+            values.push_back(qwp_test_string_value(
+                qwp_test_decoded_value_kind::symbol,
+                dict[idx]));
+        }
+        return values;
+    }
+    case qwp_test_type_long:
+    {
+        std::vector<qwp_test_decoded_value> raw_values;
+        raw_values.reserve(non_null_count);
+        for (size_t i = 0; i < non_null_count; ++i)
+            raw_values.push_back(qwp_test_i64_value(decoder.read_i64()));
+
+        size_t next_value = 0;
+        std::vector<qwp_test_decoded_value> values;
+        values.reserve(row_count);
+        for (bool present : has_value)
+        {
+            values.push_back(
+                present ? raw_values[next_value++] : qwp_test_null_value());
+        }
+        return values;
+    }
+    case qwp_test_type_double:
+    {
+        std::vector<qwp_test_decoded_value> raw_values;
+        raw_values.reserve(non_null_count);
+        for (size_t i = 0; i < non_null_count; ++i)
+            raw_values.push_back(qwp_test_f64_value(decoder.read_f64()));
+
+        size_t next_value = 0;
+        std::vector<qwp_test_decoded_value> values;
+        values.reserve(row_count);
+        for (bool present : has_value)
+        {
+            values.push_back(
+                present ? raw_values[next_value++] : qwp_test_null_value());
+        }
+        return values;
+    }
+    case qwp_test_type_string:
+    {
+        std::vector<int32_t> offsets;
+        offsets.reserve(non_null_count + 1);
+        for (size_t i = 0; i < non_null_count + 1; ++i)
+            offsets.push_back(decoder.read_i32());
+        REQUIRE(!offsets.empty());
+        REQUIRE(offsets.back() >= 0);
+        const auto data = decoder.read_exact(static_cast<size_t>(offsets.back()));
+
+        size_t next_offset = 0;
+        std::vector<qwp_test_decoded_value> values;
+        values.reserve(row_count);
+        for (bool present : has_value)
+        {
+            if (!present)
+            {
+                values.push_back(qwp_test_null_value());
+                continue;
+            }
+            REQUIRE(next_offset + 1 < offsets.size());
+            const int32_t start_i32 = offsets[next_offset];
+            const int32_t end_i32 = offsets[next_offset + 1];
+            REQUIRE(start_i32 >= 0);
+            REQUIRE(end_i32 >= start_i32);
+            const size_t start = static_cast<size_t>(start_i32);
+            const size_t end = static_cast<size_t>(end_i32);
+            REQUIRE(end <= data.size());
+            values.push_back(qwp_test_string_value(
+                qwp_test_decoded_value_kind::string,
+                std::string{
+                    reinterpret_cast<const char*>(data.data()) + start,
+                    end - start}));
+            ++next_offset;
+        }
+        return values;
+    }
+    case qwp_test_type_timestamp:
+    case qwp_test_type_timestamp_nanos:
+    {
+        const auto kind = type_code == qwp_test_type_timestamp ?
+            qwp_test_decoded_value_kind::timestamp_micros :
+            qwp_test_decoded_value_kind::timestamp_nanos;
+        std::vector<qwp_test_decoded_value> raw_values;
+        raw_values.reserve(non_null_count);
+        for (size_t i = 0; i < non_null_count; ++i)
+            raw_values.push_back(qwp_test_timestamp_value(kind, decoder.read_i64()));
+
+        size_t next_value = 0;
+        std::vector<qwp_test_decoded_value> values;
+        values.reserve(row_count);
+        for (bool present : has_value)
+        {
+            values.push_back(
+                present ? raw_values[next_value++] : qwp_test_null_value());
+        }
+        return values;
+    }
+    default:
+        FAIL("unsupported QWP test type code");
+        return {};
+    }
+}
+
+qwp_test_decoded_scalar_datagram decode_single_scalar_qwp_datagram(
+    const std::vector<std::byte>& datagram)
+{
+    const auto payload = qwp_test_payload_from_datagram(datagram);
+    qwp_test_decoder decoder{payload};
+    qwp_test_decoded_scalar_datagram decoded{};
+    decoded.table_name = decoder.read_string();
+    decoded.row_count = decoder.read_varint();
+    const size_t row_count = static_cast<size_t>(decoded.row_count);
+    const size_t column_count = static_cast<size_t>(decoder.read_varint());
+    REQUIRE(decoder.read_u8() == 0);
+    REQUIRE(decoder.read_varint() == 0);
+
+    decoded.columns.reserve(column_count);
+    for (size_t i = 0; i < column_count; ++i)
+    {
+        qwp_test_decoded_scalar_column column{};
+        column.name = decoder.read_string();
+        column.type_code = decoder.read_u8();
+        decoded.columns.push_back(std::move(column));
+    }
+
+    std::vector<std::vector<qwp_test_decoded_value>> column_values;
+    column_values.reserve(column_count);
+    for (auto& column : decoded.columns)
+    {
+        column.nullable = decoder.read_u8() != 0;
+        std::vector<bool> has_value(row_count, true);
+        if (column.nullable)
+        {
+            const size_t bitmap_len = (row_count + 7) / 8;
+            const auto bitmap = decoder.read_exact(bitmap_len);
+            for (size_t row = 0; row < row_count; ++row)
+            {
+                const uint8_t byte = std::to_integer<uint8_t>(bitmap[row / 8]);
+                if ((byte & (1u << (row % 8))) != 0)
+                    has_value[row] = false;
+            }
+        }
+        column_values.push_back(qwp_test_read_column_values(
+            decoder,
+            column.type_code,
+            has_value));
+    }
+
+    decoded.rows.assign(row_count, {});
+    for (auto& row : decoded.rows)
+        row.reserve(column_count);
+    for (const auto& values : column_values)
+    {
+        REQUIRE(values.size() == row_count);
+        for (size_t row = 0; row < row_count; ++row)
+            decoded.rows[row].push_back(values[row]);
+    }
+
+    REQUIRE(decoder.remaining() == 0);
+    return decoded;
+}
+
+size_t qwp_test_column_index(
+    const qwp_test_decoded_scalar_datagram& decoded,
+    const std::string& name)
+{
+    for (size_t i = 0; i < decoded.columns.size(); ++i)
+    {
+        if (decoded.columns[i].name == name)
+            return i;
+    }
+    FAIL("QWP test column not found");
+    return 0;
+}
+
+void qwp_check_column(
+    const qwp_test_decoded_scalar_datagram& decoded,
+    const std::string& name,
+    uint8_t type_code,
+    bool nullable)
+{
+    const size_t index = qwp_test_column_index(decoded, name);
+    CHECK(decoded.columns[index].type_code == type_code);
+    CHECK(decoded.columns[index].nullable == nullable);
+}
+
+void qwp_check_column_count(
+    const qwp_test_decoded_scalar_datagram& decoded,
+    size_t expected)
+{
+    CHECK(decoded.columns.size() == expected);
+    for (const auto& row : decoded.rows)
+        CHECK(row.size() == expected);
+}
+
+const qwp_test_decoded_value& qwp_cell(
+    const qwp_test_decoded_scalar_datagram& decoded,
+    size_t row,
+    const std::string& column_name)
+{
+    REQUIRE(row < decoded.rows.size());
+    const size_t column = qwp_test_column_index(decoded, column_name);
+    REQUIRE(column < decoded.rows[row].size());
+    return decoded.rows[row][column];
+}
+
+void qwp_expect_bool(const qwp_test_decoded_value& value, bool expected)
+{
+    REQUIRE(value.kind == qwp_test_decoded_value_kind::boolean);
+    CHECK(value.bool_value == expected);
+}
+
+void qwp_expect_symbol(
+    const qwp_test_decoded_value& value,
+    const std::string& expected)
+{
+    REQUIRE(value.kind == qwp_test_decoded_value_kind::symbol);
+    CHECK(value.string_value == expected);
+}
+
+void qwp_expect_i64(const qwp_test_decoded_value& value, int64_t expected)
+{
+    REQUIRE(value.kind == qwp_test_decoded_value_kind::i64);
+    CHECK(value.i64_value == expected);
+}
+
+void qwp_expect_f64(const qwp_test_decoded_value& value, double expected)
+{
+    REQUIRE(value.kind == qwp_test_decoded_value_kind::f64);
+    CHECK(value.f64_value == doctest::Approx(expected));
+}
+
+void qwp_expect_f64_nan(const qwp_test_decoded_value& value)
+{
+    REQUIRE(value.kind == qwp_test_decoded_value_kind::f64);
+    CHECK(std::isnan(value.f64_value));
+}
+
+void qwp_expect_string(
+    const qwp_test_decoded_value& value,
+    const std::string& expected)
+{
+    REQUIRE(value.kind == qwp_test_decoded_value_kind::string);
+    CHECK(value.string_value == expected);
+}
+
+void qwp_expect_timestamp_micros(
+    const qwp_test_decoded_value& value,
+    int64_t expected)
+{
+    REQUIRE(value.kind == qwp_test_decoded_value_kind::timestamp_micros);
+    CHECK(value.i64_value == expected);
+}
+
+void qwp_expect_timestamp_nanos(
+    const qwp_test_decoded_value& value,
+    int64_t expected)
+{
+    REQUIRE(value.kind == qwp_test_decoded_value_kind::timestamp_nanos);
+    CHECK(value.i64_value == expected);
+}
 
 qwp_test_decoded_array_datagram decode_single_array_qwp_datagram(
     const std::vector<std::byte>& datagram)
@@ -2838,9 +3323,30 @@ TEST_CASE("line_sender c++ qwpudp all column types with designated timestamp")
     sender.flush(buffer);
     CHECK(buffer.row_count() == 0);
     const auto datagram = receiver.recv_datagram();
-    CHECK(datagram_starts_with_qwp1(datagram));
-    // Verify at least the header + one row was encoded.
-    CHECK(datagram.size() > 20);
+    const auto decoded = decode_single_scalar_qwp_datagram(datagram);
+    CHECK(decoded.table_name == "sensor_data");
+    CHECK(decoded.row_count == 1);
+    qwp_check_column_count(decoded, 8);
+    qwp_check_column(decoded, "location", qwp_test_type_symbol, true);
+    qwp_check_column(decoded, "active", qwp_test_type_boolean, false);
+    qwp_check_column(decoded, "count", qwp_test_type_long, false);
+    qwp_check_column(decoded, "temperature", qwp_test_type_double, false);
+    qwp_check_column(decoded, "label", qwp_test_type_string, true);
+    qwp_check_column(
+        decoded,
+        "event_ts",
+        qwp_test_type_timestamp_nanos,
+        true);
+    qwp_check_column(decoded, "sample_ts", qwp_test_type_timestamp, true);
+    qwp_check_column(decoded, "", qwp_test_type_timestamp_nanos, true);
+    qwp_expect_symbol(qwp_cell(decoded, 0, "location"), "NYC");
+    qwp_expect_bool(qwp_cell(decoded, 0, "active"), true);
+    qwp_expect_i64(qwp_cell(decoded, 0, "count"), 42);
+    qwp_expect_f64(qwp_cell(decoded, 0, "temperature"), 23.5);
+    qwp_expect_string(qwp_cell(decoded, 0, "label"), "hello");
+    qwp_expect_timestamp_nanos(qwp_cell(decoded, 0, "event_ts"), 123456789);
+    qwp_expect_timestamp_micros(qwp_cell(decoded, 0, "sample_ts"), 987654);
+    qwp_expect_timestamp_nanos(qwp_cell(decoded, 0, ""), 1000000000);
 }
 
 TEST_CASE("line_sender c++ qwpudp at_micros designated timestamp")
@@ -2860,7 +3366,16 @@ TEST_CASE("line_sender c++ qwpudp at_micros designated timestamp")
 
     sender.flush(buffer);
     const auto datagram = receiver.recv_datagram();
-    CHECK(datagram_starts_with_qwp1(datagram));
+    const auto decoded = decode_single_scalar_qwp_datagram(datagram);
+    CHECK(decoded.table_name == "ticks");
+    CHECK(decoded.row_count == 1);
+    qwp_check_column_count(decoded, 3);
+    qwp_check_column(decoded, "sym", qwp_test_type_symbol, true);
+    qwp_check_column(decoded, "px", qwp_test_type_double, false);
+    qwp_check_column(decoded, "", qwp_test_type_timestamp, true);
+    qwp_expect_symbol(qwp_cell(decoded, 0, "sym"), "AAPL");
+    qwp_expect_f64(qwp_cell(decoded, 0, "px"), 150.25);
+    qwp_expect_timestamp_micros(qwp_cell(decoded, 0, ""), 5000000);
 }
 
 TEST_CASE("line_sender c++ qwpudp sparse columns across rows")
@@ -2895,7 +3410,28 @@ TEST_CASE("line_sender c++ qwpudp sparse columns across rows")
     sender.flush(buffer);
     CHECK(buffer.row_count() == 0);
     const auto datagram = receiver.recv_datagram();
-    CHECK(datagram_starts_with_qwp1(datagram));
+    const auto decoded = decode_single_scalar_qwp_datagram(datagram);
+    CHECK(decoded.table_name == "trades");
+    CHECK(decoded.row_count == 3);
+    qwp_check_column_count(decoded, 4);
+    qwp_check_column(decoded, "sym", qwp_test_type_symbol, true);
+    qwp_check_column(decoded, "qty", qwp_test_type_long, false);
+    qwp_check_column(decoded, "active", qwp_test_type_boolean, false);
+    qwp_check_column(decoded, "px", qwp_test_type_double, false);
+    qwp_expect_symbol(qwp_cell(decoded, 0, "sym"), "ETH-USD");
+    qwp_expect_i64(qwp_cell(decoded, 0, "qty"), 10);
+    qwp_expect_bool(qwp_cell(decoded, 0, "active"), true);
+    qwp_expect_f64_nan(qwp_cell(decoded, 0, "px"));
+    qwp_expect_symbol(qwp_cell(decoded, 1, "sym"), "BTC-USD");
+    qwp_expect_i64(
+        qwp_cell(decoded, 1, "qty"),
+        std::numeric_limits<int64_t>::min());
+    qwp_expect_bool(qwp_cell(decoded, 1, "active"), false);
+    qwp_expect_f64(qwp_cell(decoded, 1, "px"), 45000.0);
+    qwp_expect_symbol(qwp_cell(decoded, 2, "sym"), "SOL-USD");
+    qwp_expect_i64(qwp_cell(decoded, 2, "qty"), 99);
+    qwp_expect_bool(qwp_cell(decoded, 2, "active"), false);
+    qwp_expect_f64_nan(qwp_cell(decoded, 2, "px"));
 }
 
 TEST_CASE("line_sender c++ qwpudp multiple tables in one flush")
@@ -2924,12 +3460,30 @@ TEST_CASE("line_sender c++ qwpudp multiple tables in one flush")
     CHECK(buffer.row_count() == 3);
     sender.flush(buffer);
     // Each table batch becomes a separate datagram.
-    const auto d1 = receiver.recv_datagram();
-    const auto d2 = receiver.recv_datagram();
-    const auto d3 = receiver.recv_datagram();
-    CHECK(datagram_starts_with_qwp1(d1));
-    CHECK(datagram_starts_with_qwp1(d2));
-    CHECK(datagram_starts_with_qwp1(d3));
+    const auto d1 = decode_single_scalar_qwp_datagram(receiver.recv_datagram());
+    const auto d2 = decode_single_scalar_qwp_datagram(receiver.recv_datagram());
+    const auto d3 = decode_single_scalar_qwp_datagram(receiver.recv_datagram());
+    CHECK(d1.table_name == "trades");
+    CHECK(d1.row_count == 1);
+    qwp_check_column_count(d1, 2);
+    qwp_check_column(d1, "sym", qwp_test_type_symbol, true);
+    qwp_check_column(d1, "qty", qwp_test_type_long, false);
+    qwp_expect_symbol(qwp_cell(d1, 0, "sym"), "ETH-USD");
+    qwp_expect_i64(qwp_cell(d1, 0, "qty"), 4);
+    CHECK(d2.table_name == "quotes");
+    CHECK(d2.row_count == 1);
+    qwp_check_column_count(d2, 2);
+    qwp_check_column(d2, "sym", qwp_test_type_symbol, true);
+    qwp_check_column(d2, "bid", qwp_test_type_double, false);
+    qwp_expect_symbol(qwp_cell(d2, 0, "sym"), "BTC-USD");
+    qwp_expect_f64(qwp_cell(d2, 0, "bid"), 44000.0);
+    CHECK(d3.table_name == "trades");
+    CHECK(d3.row_count == 1);
+    qwp_check_column_count(d3, 2);
+    qwp_check_column(d3, "sym", qwp_test_type_symbol, true);
+    qwp_check_column(d3, "qty", qwp_test_type_long, false);
+    qwp_expect_symbol(qwp_cell(d3, 0, "sym"), "SOL-USD");
+    qwp_expect_i64(qwp_cell(d3, 0, "qty"), 7);
     // Three contiguous table batches: trades, quotes, trades -> 3 datagrams.
 }
 
@@ -2954,7 +3508,14 @@ TEST_CASE("line_sender c++ qwpudp clear and reuse buffer")
     CHECK(buffer.row_count() == 1);
     sender.flush(buffer);
     const auto datagram = receiver.recv_datagram();
-    CHECK(datagram_starts_with_qwp1(datagram));
+    const auto decoded = decode_single_scalar_qwp_datagram(datagram);
+    CHECK(decoded.table_name == "t");
+    CHECK(decoded.row_count == 1);
+    qwp_check_column_count(decoded, 2);
+    qwp_check_column(decoded, "s", qwp_test_type_symbol, true);
+    qwp_check_column(decoded, "x", qwp_test_type_long, false);
+    qwp_expect_symbol(qwp_cell(decoded, 0, "s"), "b");
+    qwp_expect_i64(qwp_cell(decoded, 0, "x"), 2);
 }
 
 TEST_CASE("line_sender c++ qwpudp flush_and_keep empty buffer is noop")
@@ -3195,8 +3756,28 @@ TEST_CASE("line_sender c api qwpudp all column types with at_nanos")
 
     CHECK(::line_sender_flush(sender, buffer, &err));
     const auto datagram = receiver.recv_datagram();
-    CHECK(datagram_starts_with_qwp1(datagram));
-    CHECK(datagram.size() > 20);
+    const auto decoded = decode_single_scalar_qwp_datagram(datagram);
+    CHECK(decoded.table_name == "sensors");
+    CHECK(decoded.row_count == 1);
+    qwp_check_column_count(decoded, 7);
+    qwp_check_column(decoded, "loc", qwp_test_type_symbol, true);
+    qwp_check_column(decoded, "active", qwp_test_type_boolean, false);
+    qwp_check_column(decoded, "count", qwp_test_type_long, false);
+    qwp_check_column(decoded, "temp", qwp_test_type_double, false);
+    qwp_check_column(decoded, "label", qwp_test_type_string, true);
+    qwp_check_column(
+        decoded,
+        "event_ts",
+        qwp_test_type_timestamp_nanos,
+        true);
+    qwp_check_column(decoded, "", qwp_test_type_timestamp_nanos, true);
+    qwp_expect_symbol(qwp_cell(decoded, 0, "loc"), "NYC");
+    qwp_expect_bool(qwp_cell(decoded, 0, "active"), true);
+    qwp_expect_i64(qwp_cell(decoded, 0, "count"), 100);
+    qwp_expect_f64(qwp_cell(decoded, 0, "temp"), 22.75);
+    qwp_expect_string(qwp_cell(decoded, 0, "label"), "sensor-a");
+    qwp_expect_timestamp_nanos(qwp_cell(decoded, 0, "event_ts"), 123456789);
+    qwp_expect_timestamp_nanos(qwp_cell(decoded, 0, ""), 1000000000);
 }
 
 TEST_CASE("line_sender c api qwpudp at_micros designated timestamp")
@@ -3231,7 +3812,14 @@ TEST_CASE("line_sender c api qwpudp at_micros designated timestamp")
 
     CHECK(::line_sender_flush(sender, buffer, &err));
     const auto datagram = receiver.recv_datagram();
-    CHECK(datagram_starts_with_qwp1(datagram));
+    const auto decoded = decode_single_scalar_qwp_datagram(datagram);
+    CHECK(decoded.table_name == "ticks");
+    CHECK(decoded.row_count == 1);
+    qwp_check_column_count(decoded, 2);
+    qwp_check_column(decoded, "px", qwp_test_type_double, false);
+    qwp_check_column(decoded, "", qwp_test_type_timestamp, true);
+    qwp_expect_f64(qwp_cell(decoded, 0, "px"), 150.25);
+    qwp_expect_timestamp_micros(qwp_cell(decoded, 0, ""), 5000000);
 }
 
 TEST_CASE("line_sender c api qwpudp sparse columns across rows")
@@ -3287,7 +3875,28 @@ TEST_CASE("line_sender c api qwpudp sparse columns across rows")
     CHECK(::line_sender_flush(sender, buffer, &err));
 
     const auto datagram = receiver.recv_datagram();
-    CHECK(datagram_starts_with_qwp1(datagram));
+    const auto decoded = decode_single_scalar_qwp_datagram(datagram);
+    CHECK(decoded.table_name == "trades");
+    CHECK(decoded.row_count == 3);
+    qwp_check_column_count(decoded, 4);
+    qwp_check_column(decoded, "sym", qwp_test_type_symbol, true);
+    qwp_check_column(decoded, "qty", qwp_test_type_long, false);
+    qwp_check_column(decoded, "active", qwp_test_type_boolean, false);
+    qwp_check_column(decoded, "px", qwp_test_type_double, false);
+    qwp_expect_symbol(qwp_cell(decoded, 0, "sym"), "ETH");
+    qwp_expect_i64(qwp_cell(decoded, 0, "qty"), 10);
+    qwp_expect_bool(qwp_cell(decoded, 0, "active"), true);
+    qwp_expect_f64_nan(qwp_cell(decoded, 0, "px"));
+    qwp_expect_symbol(qwp_cell(decoded, 1, "sym"), "BTC");
+    qwp_expect_i64(
+        qwp_cell(decoded, 1, "qty"),
+        std::numeric_limits<int64_t>::min());
+    qwp_expect_bool(qwp_cell(decoded, 1, "active"), false);
+    qwp_expect_f64(qwp_cell(decoded, 1, "px"), 45000.0);
+    qwp_expect_symbol(qwp_cell(decoded, 2, "sym"), "SOL");
+    qwp_expect_i64(qwp_cell(decoded, 2, "qty"), 99);
+    qwp_expect_bool(qwp_cell(decoded, 2, "active"), false);
+    qwp_expect_f64_nan(qwp_cell(decoded, 2, "px"));
 }
 
 TEST_CASE("line_sender c++ qwpudp rejects duplicate column name")
