@@ -64,14 +64,20 @@ mod danger {
     }
 }
 
-#[cfg(feature = "tls-webpki-certs")]
+#[cfg(all(
+    feature = "tls-webpki-certs",
+    any(feature = "_sender-tcp", feature = "_sender-http"),
+))]
 fn add_webpki_roots(root_store: &mut RootCertStore) {
     root_store
         .roots
         .extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())
 }
 
-#[cfg(feature = "tls-native-certs")]
+#[cfg(all(
+    feature = "tls-native-certs",
+    any(feature = "_sender-tcp", feature = "_sender-http"),
+))]
 fn unpack_os_native_certs(
     res: rustls_native_certs::CertificateResult,
 ) -> crate::Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
@@ -90,7 +96,10 @@ fn unpack_os_native_certs(
     Ok(res.certs)
 }
 
-#[cfg(feature = "tls-native-certs")]
+#[cfg(all(
+    feature = "tls-native-certs",
+    any(feature = "_sender-tcp", feature = "_sender-http"),
+))]
 fn add_os_roots(root_store: &mut RootCertStore) -> crate::Result<()> {
     let os_certs = unpack_os_native_certs(rustls_native_certs::load_native_certs())?;
 
