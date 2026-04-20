@@ -2737,6 +2737,7 @@ TEST_CASE("line_sender c api flush empty qwpudp buffer is noop")
     ::line_sender_opts* opts =
         ::line_sender_opts_new(::line_sender_protocol_qwpudp, host, receiver.port());
     REQUIRE(opts != nullptr);
+    on_scope_exit opts_free_guard{[&] { ::line_sender_opts_free(opts); }};
 
     ::line_sender* sender = ::line_sender_build(opts, &err);
     REQUIRE(sender != nullptr);
@@ -2765,6 +2766,7 @@ TEST_CASE("line_sender c api qwp buffer rejected by tcp sender")
     ::line_sender_opts* opts =
         ::line_sender_opts_new(::line_sender_protocol_tcp, host, server.port());
     REQUIRE(opts != nullptr);
+    on_scope_exit opts_free_guard{[&] { ::line_sender_opts_free(opts); }};
 
     ::line_sender* sender = ::line_sender_build(opts, &err);
     REQUIRE(sender != nullptr);
@@ -3055,6 +3057,7 @@ TEST_CASE("line_sender c api qwpudp bookmark rewind and stale rejection")
     ::line_sender_opts* opts =
         ::line_sender_opts_new(::line_sender_protocol_qwpudp, host, receiver.port());
     REQUIRE(opts != nullptr);
+    on_scope_exit opts_free_guard{[&] { ::line_sender_opts_free(opts); }};
 
     ::line_sender* sender = ::line_sender_build(opts, &err);
     REQUIRE(sender != nullptr);
@@ -3111,6 +3114,7 @@ TEST_CASE("line_sender c api qwpudp flush_and_keep via c api")
     ::line_sender_opts* opts =
         ::line_sender_opts_new(::line_sender_protocol_qwpudp, host, receiver.port());
     REQUIRE(opts != nullptr);
+    on_scope_exit opts_free_guard{[&] { ::line_sender_opts_free(opts); }};
 
     ::line_sender* sender = ::line_sender_build(opts, &err);
     REQUIRE(sender != nullptr);
@@ -3157,6 +3161,7 @@ TEST_CASE("line_sender c api qwpudp all column types with at_nanos")
     ::line_sender_opts* opts =
         ::line_sender_opts_new(::line_sender_protocol_qwpudp, host, receiver.port());
     REQUIRE(opts != nullptr);
+    on_scope_exit opts_free_guard{[&] { ::line_sender_opts_free(opts); }};
 
     ::line_sender* sender = ::line_sender_build(opts, &err);
     REQUIRE(sender != nullptr);
@@ -3204,6 +3209,7 @@ TEST_CASE("line_sender c api qwpudp at_micros designated timestamp")
     ::line_sender_opts* opts =
         ::line_sender_opts_new(::line_sender_protocol_qwpudp, host, receiver.port());
     REQUIRE(opts != nullptr);
+    on_scope_exit opts_free_guard{[&] { ::line_sender_opts_free(opts); }};
 
     ::line_sender* sender = ::line_sender_build(opts, &err);
     REQUIRE(sender != nullptr);
@@ -3238,6 +3244,7 @@ TEST_CASE("line_sender c api qwpudp sparse columns across rows")
     ::line_sender_opts* opts =
         ::line_sender_opts_new(::line_sender_protocol_qwpudp, host, receiver.port());
     REQUIRE(opts != nullptr);
+    on_scope_exit opts_free_guard{[&] { ::line_sender_opts_free(opts); }};
 
     ::line_sender* sender = ::line_sender_build(opts, &err);
     REQUIRE(sender != nullptr);
