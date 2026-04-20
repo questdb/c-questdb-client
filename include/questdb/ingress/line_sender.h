@@ -418,7 +418,8 @@ size_t line_sender_buffer_capacity(const line_sender_buffer* buffer);
  * Capturing a new bookmark replaces the previously stored bookmark or marker.
  *
  * @param[in] buffer Buffer to bookmark. Must be non-NULL.
- * @param[out] out Receives the captured bookmark on success. Must be non-NULL.
+ * @param[out] out Receives the captured bookmark on success. Passing NULL
+ * returns false and sets `err_out` if provided.
  * @param[out] err_out Set to an error object on failure (if non-NULL).
  */
 LINESENDER_API

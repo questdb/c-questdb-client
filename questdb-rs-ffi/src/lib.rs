@@ -865,7 +865,8 @@ pub unsafe extern "C" fn line_sender_buffer_capacity(buffer: *const line_sender_
 
 /// Capture a bookmark for the current buffer state.
 ///
-/// `buffer` and `out` must be non-NULL; `err_out` is optional.
+/// `buffer` must be non-NULL. `out` must be non-NULL on success; passing NULL
+/// returns false and sets `err_out` if provided. `err_out` is optional.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_bookmark(
     buffer: *mut line_sender_buffer,
@@ -873,6 +874,14 @@ pub unsafe extern "C" fn line_sender_buffer_bookmark(
     err_out: *mut *mut line_sender_error,
 ) -> bool {
     unsafe {
+        if out.is_null() {
+            set_err_out(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "line_sender_buffer_bookmark `out` must be non-NULL.".to_owned(),
+            );
+            return false;
+        }
         let buffer = unwrap_buffer_mut(buffer);
         let bookmark = bubble_err_to_c!(err_out, buffer.bookmark());
         *out = bookmark.into();

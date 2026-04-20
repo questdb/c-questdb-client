@@ -2536,6 +2536,50 @@ TEST_CASE("line_sender c api err_out may be null on failure")
         ::line_sender_buffer_rewind_to_bookmark(buffer, bookmark, nullptr));
 }
 
+TEST_CASE("line_sender c api bookmark out may be null")
+{
+    ::line_sender_error* err = nullptr;
+    on_scope_exit error_free_guard{[&] {
+        if (err)
+            ::line_sender_error_free(err);
+    }};
+
+    ::line_sender_buffer* buffer = ::line_sender_buffer_new_qwp();
+    REQUIRE(buffer != nullptr);
+    on_scope_exit buffer_free_guard{[&] { ::line_sender_buffer_free(buffer); }};
+
+    const auto table = QDB_TABLE_NAME_LITERAL("t");
+    const auto col = QDB_COLUMN_NAME_LITERAL("x");
+
+    CHECK(::line_sender_buffer_table(buffer, table, &err));
+    CHECK(::line_sender_buffer_column_i64(buffer, col, 1, &err));
+    CHECK(::line_sender_buffer_at_now(buffer, &err));
+    CHECK(::line_sender_buffer_row_count(buffer) == 1);
+
+    CHECK_FALSE(::line_sender_buffer_bookmark(buffer, nullptr, &err));
+    REQUIRE(err != nullptr);
+    CHECK(
+        ::line_sender_error_get_code(err) ==
+        ::line_sender_error_invalid_api_call);
+    CHECK(line_sender_error_message(err).find("out") != std::string::npos);
+    ::line_sender_error_free(err);
+    err = nullptr;
+
+    CHECK(::line_sender_buffer_table(buffer, table, &err));
+    CHECK(::line_sender_buffer_column_i64(buffer, col, 2, &err));
+    CHECK(::line_sender_buffer_at_now(buffer, &err));
+    CHECK(::line_sender_buffer_row_count(buffer) == 2);
+
+    CHECK_FALSE(::line_sender_buffer_rewind_to_marker(buffer, &err));
+    REQUIRE(err != nullptr);
+    CHECK(
+        ::line_sender_error_get_code(err) ==
+        ::line_sender_error_invalid_api_call);
+    ::line_sender_error_free(err);
+    err = nullptr;
+    CHECK(::line_sender_buffer_row_count(buffer) == 2);
+}
+
 TEST_CASE("line_sender c api max_datagram_size rejected for tcp opts")
 {
     ::line_sender_error* err = nullptr;
