@@ -724,7 +724,10 @@ pub unsafe extern "C" fn line_sender_column_name_assert(
 
 /// Accumulates a batch of rows to be sent via `line_sender_flush()` or its
 /// variants. A buffer object can be reused after flushing and clearing.
-pub struct line_sender_buffer(Buffer);
+pub struct line_sender_buffer {
+    buffer: Buffer,
+    empty_peek_buf_is_null: bool,
+}
 
 /// Opaque rollback handle captured from a buffer.
 ///
@@ -762,7 +765,10 @@ pub unsafe extern "C" fn line_sender_buffer_new(
     version: ProtocolVersion,
 ) -> *mut line_sender_buffer {
     let buffer = Buffer::new(version.into());
-    Box::into_raw(Box::new(line_sender_buffer(buffer)))
+    Box::into_raw(Box::new(line_sender_buffer {
+        buffer,
+        empty_peek_buf_is_null: false,
+    }))
 }
 
 /// Construct an ILP `line_sender_buffer` with a custom maximum length for table
@@ -780,7 +786,10 @@ pub unsafe extern "C" fn line_sender_buffer_with_max_name_len(
     max_name_len: size_t,
 ) -> *mut line_sender_buffer {
     let buffer = Buffer::with_max_name_len(version.into(), max_name_len);
-    Box::into_raw(Box::new(line_sender_buffer(buffer)))
+    Box::into_raw(Box::new(line_sender_buffer {
+        buffer,
+        empty_peek_buf_is_null: false,
+    }))
 }
 
 /// Construct a QWP/UDP `line_sender_buffer` with a `max_name_len` of `127`,
@@ -790,7 +799,10 @@ pub unsafe extern "C" fn line_sender_buffer_with_max_name_len(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_new_qwp() -> *mut line_sender_buffer {
     let buffer = Buffer::new_qwp();
-    Box::into_raw(Box::new(line_sender_buffer(buffer)))
+    Box::into_raw(Box::new(line_sender_buffer {
+        buffer,
+        empty_peek_buf_is_null: true,
+    }))
 }
 
 /// Construct a QWP/UDP `line_sender_buffer` with a custom maximum length for
@@ -802,7 +814,10 @@ pub unsafe extern "C" fn line_sender_buffer_new_qwp_with_max_name_len(
     max_name_len: size_t,
 ) -> *mut line_sender_buffer {
     let buffer = Buffer::qwp_with_max_name_len(max_name_len);
-    Box::into_raw(Box::new(line_sender_buffer(buffer)))
+    Box::into_raw(Box::new(line_sender_buffer {
+        buffer,
+        empty_peek_buf_is_null: true,
+    }))
 }
 
 /// Release the `line_sender_buffer` object.
@@ -816,11 +831,11 @@ pub unsafe extern "C" fn line_sender_buffer_free(buffer: *mut line_sender_buffer
 }
 
 unsafe fn unwrap_buffer<'a>(buffer: *const line_sender_buffer) -> &'a Buffer {
-    unsafe { &(*buffer).0 }
+    unsafe { &(*buffer).buffer }
 }
 
 unsafe fn unwrap_buffer_mut<'a>(buffer: *mut line_sender_buffer) -> &'a mut Buffer {
-    unsafe { &mut (*buffer).0 }
+    unsafe { &mut (*buffer).buffer }
 }
 
 /// Create a new copy of the buffer.
@@ -829,8 +844,12 @@ pub unsafe extern "C" fn line_sender_buffer_clone(
     buffer: *const line_sender_buffer,
 ) -> *mut line_sender_buffer {
     unsafe {
-        let new_buffer = unwrap_buffer(buffer).clone();
-        Box::into_raw(Box::new(line_sender_buffer(new_buffer)))
+        let buffer = &*buffer;
+        let new_buffer = buffer.buffer.clone();
+        Box::into_raw(Box::new(line_sender_buffer {
+            buffer: new_buffer,
+            empty_peek_buf_is_null: buffer.empty_peek_buf_is_null,
+        }))
     }
 }
 
@@ -1023,16 +1042,22 @@ pub struct line_sender_buffer_view {
 /// @return A [`line_sender_buffer_view`] struct containing:
 /// - `buf`: Immutable pointer to the byte stream
 /// - `len`: Exact byte length of the data for ILP, or zero for QWP
+///
+/// For QWP buffers this returns an empty view with `len == 0` and `buf == NULL`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_buffer_peek(
     buffer: *const line_sender_buffer,
 ) -> line_sender_buffer_view {
     unsafe {
-        let buffer = unwrap_buffer(buffer);
-        let buf: &[u8] = buffer.as_bytes();
+        let buffer = &*buffer;
+        let buf: &[u8] = buffer.buffer.as_bytes();
         line_sender_buffer_view {
             len: buf.len(),
-            buf: buf.as_ptr(),
+            buf: if buf.is_empty() && buffer.empty_peek_buf_is_null {
+                ptr::null()
+            } else {
+                buf.as_ptr()
+            },
         }
     }
 }
@@ -2042,7 +2067,10 @@ pub unsafe extern "C" fn line_sender_buffer_new_for_sender(
     unsafe {
         let sender = unwrap_sender(sender);
         let buffer = sender.new_buffer();
-        Box::into_raw(Box::new(line_sender_buffer(buffer)))
+        Box::into_raw(Box::new(line_sender_buffer {
+            buffer,
+            empty_peek_buf_is_null: sender.protocol() == Protocol::QwpUdp,
+        }))
     }
 }
 

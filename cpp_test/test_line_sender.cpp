@@ -698,6 +698,9 @@ TEST_CASE("line_sender c api basics")
     CHECK(::line_sender_column_name_init(&f1_name, 2, "f1", &err));
     ::line_sender_buffer* buffer = line_sender_buffer_new_for_sender(sender);
     CHECK(buffer != nullptr);
+    auto peek = ::line_sender_buffer_peek(buffer);
+    CHECK(peek.len == 0);
+    CHECK(peek.buf != nullptr);
     CHECK(::line_sender_buffer_table(buffer, table_name, &err));
     CHECK(::line_sender_buffer_symbol(buffer, t1_name, v1_utf8, &err));
     CHECK(::line_sender_buffer_column_f64(buffer, f1_name, 0.5, &err));
@@ -1827,6 +1830,9 @@ TEST_CASE("line_sender c api qwpudp basics")
     ::line_sender_buffer* buffer = ::line_sender_buffer_new_for_sender(sender);
     REQUIRE(buffer != nullptr);
     on_scope_exit buffer_free_guard{[&] { ::line_sender_buffer_free(buffer); }};
+    auto peek = ::line_sender_buffer_peek(buffer);
+    CHECK(peek.len == 0);
+    CHECK(peek.buf == nullptr);
 
     const auto table = QDB_TABLE_NAME_LITERAL("trades");
     const auto sym = QDB_COLUMN_NAME_LITERAL("sym");
@@ -1875,6 +1881,9 @@ TEST_CASE("line_sender c api standalone qwpudp buffer")
     ::line_sender_buffer* buffer = ::line_sender_buffer_new_qwp();
     REQUIRE(buffer != nullptr);
     on_scope_exit buffer_free_guard{[&] { ::line_sender_buffer_free(buffer); }};
+    auto peek = ::line_sender_buffer_peek(buffer);
+    CHECK(peek.len == 0);
+    CHECK(peek.buf == nullptr);
 
     const auto table = QDB_TABLE_NAME_LITERAL("quotes");
     const auto sym = QDB_COLUMN_NAME_LITERAL("sym");
@@ -2137,6 +2146,7 @@ TEST_CASE("line_sender c api qwpudp max name len and peek")
 
     auto peek = ::line_sender_buffer_peek(buffer);
     CHECK(peek.len == 0);
+    CHECK(peek.buf == nullptr);
 
     const auto long_table = QDB_TABLE_NAME_LITERAL("trades");
     CHECK_FALSE(::line_sender_buffer_table(buffer, long_table, &err));
@@ -2158,6 +2168,14 @@ TEST_CASE("line_sender c api qwpudp max name len and peek")
 
     peek = ::line_sender_buffer_peek(buffer);
     CHECK(peek.len == 0);
+    CHECK(peek.buf == nullptr);
+
+    ::line_sender_buffer* cloned = ::line_sender_buffer_clone(buffer);
+    REQUIRE(cloned != nullptr);
+    on_scope_exit cloned_free_guard{[&] { ::line_sender_buffer_free(cloned); }};
+    peek = ::line_sender_buffer_peek(cloned);
+    CHECK(peek.len == 0);
+    CHECK(peek.buf == nullptr);
 }
 
 TEST_CASE("line_sender c api qwpudp from env")

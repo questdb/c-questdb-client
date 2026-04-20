@@ -226,7 +226,8 @@ line_sender_utf8 line_sender_utf8_assert(size_t len, const char* buf);
 
 /**
  * Non-owning view of sender buffer, Modifying the buffer will invalidate
- * the borrowed buffer
+ * the borrowed buffer. Callers must not read from `buf` when `len` is zero;
+ * empty views may use a NULL `buf`.
  */
 typedef struct line_sender_buffer_view
 {
@@ -517,7 +518,8 @@ bool line_sender_buffer_transactional(const line_sender_buffer* buffer);
  *
  * @param[in] buffer Line sender buffer object.
  * @return read_only view with the byte representation of the line
- *         sender buffer's contents for ILP, or an empty view for QWP.
+ *         sender buffer's contents for ILP, or an empty view with `len == 0`
+ *         and `buf == NULL` for QWP.
  */
 LINESENDER_API
 line_sender_buffer_view line_sender_buffer_peek(
