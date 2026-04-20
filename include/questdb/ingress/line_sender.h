@@ -959,6 +959,10 @@ bool line_sender_opts_max_datagram_size(
 /**
  * Set the multicast TTL used for QWP/UDP sends.
  *
+ * The default is 1. Use a value greater than 0 when sending to a multicast
+ * address. A value of 0 prevents multicast datagrams from leaving the local
+ * host.
+ *
  * `multicast_ttl` must be in the 0–255 range (inclusive).
  * Values greater than 255 are treated as an error.
  *

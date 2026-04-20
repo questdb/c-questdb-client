@@ -106,7 +106,7 @@ impl Default for QwpUdpConfig {
     fn default() -> Self {
         Self {
             max_datagram_size: ConfigSetting::new_default(1400),
-            multicast_ttl: ConfigSetting::new_default(0),
+            multicast_ttl: ConfigSetting::new_default(1),
         }
     }
 }

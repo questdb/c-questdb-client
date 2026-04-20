@@ -1667,6 +1667,10 @@ pub unsafe extern "C" fn line_sender_opts_max_datagram_size(
 }
 
 /// Set the multicast TTL used for QWP/UDP sends.
+///
+/// The default is 1. Use a value greater than 0 when sending to a multicast
+/// address. A value of 0 prevents multicast datagrams from leaving the local
+/// host.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_opts_multicast_ttl(
     opts: *mut line_sender_opts,

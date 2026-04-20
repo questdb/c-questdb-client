@@ -961,6 +961,10 @@ public:
     /**
      * Set the multicast TTL used for QWP/UDP sends.
      *
+     * The default is 1. Use a value greater than 0 when sending to a multicast
+     * address. A value of 0 prevents multicast datagrams from leaving the local
+     * host.
+     *
      * This setting is only supported for `protocol::qwpudp`.
      */
     opts& multicast_ttl(uint32_t multicast_ttl)

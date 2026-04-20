@@ -850,7 +850,10 @@ impl SenderBuilder {
     }
 
     #[cfg(feature = "_sender-qwp-udp")]
-    /// Set the multicast TTL for QWP/UDP transport.
+    /// Set the multicast TTL for QWP/UDP transport. The default is 1.
+    ///
+    /// Use a value greater than 0 when sending to a multicast address. A value
+    /// of 0 prevents multicast datagrams from leaving the local host.
     pub fn multicast_ttl(mut self, value: u32) -> Result<Self> {
         if value > 255 {
             return Err(error::fmt!(

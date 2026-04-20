@@ -90,7 +90,7 @@ fn qwpudp_simple() {
     assert!(!builder.protocol.tls_enabled());
     let qwp_udp = builder.qwp_udp.as_ref().unwrap();
     assert_defaulted_eq(&qwp_udp.max_datagram_size, 1400usize);
-    assert_defaulted_eq(&qwp_udp.multicast_ttl, 0u32);
+    assert_defaulted_eq(&qwp_udp.multicast_ttl, 1u32);
 }
 
 #[cfg(feature = "sync-sender-qwp-udp")]
