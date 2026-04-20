@@ -144,13 +144,13 @@ macro_rules! generate_array_dims_branches {
 /// after calling a method that takes ownership of the builder.
 ///
 /// The builder setters consume `self` (Rust move semantics), so we
-/// `ptr::read` the builder out, call the setter, and `ptr::write` the
-/// result back. On error the consumed builder is gone, and we must
-/// write a valid object back to avoid a double-free.
+/// clone the current builder, call the setter on the clone, and commit the
+/// returned builder only on success.
 ///
-/// We clone the builder before moving it out and restore that snapshot on
-/// failure so the caller keeps their original configuration. Cloning before
-/// `ptr::read` keeps the original object valid if snapshot allocation panics.
+/// This keeps the original object valid on validation errors and during
+/// unwinding if a setter panics; the live `line_sender_opts` object never
+/// contains duplicated stale owned bits.
+///
 /// This costs one clone per setter call during one-time setup — acceptable
 /// since this path is only hit from C/C++ FFI, never from pure Rust.
 ///
@@ -167,22 +167,16 @@ macro_rules! generate_array_dims_branches {
 macro_rules! upd_opts {
     ($opts:expr, $err_out:expr, $func:ident $(, $($args:expr),*)?) => {
         {
-            let builder_ref: *mut SenderBuilder = &mut (*$opts).0;
-            let snapshot = (*$opts).0.clone();
-            let forced_builder = ptr::read(&(*$opts).0);
-            let new_builder_or_err = forced_builder.$func($($($args),*)?);
+            let builder_ref: &mut SenderBuilder = &mut (*$opts).0;
+            let new_builder_or_err = builder_ref.clone().$func($($($args),*)?);
             let new_builder = match new_builder_or_err {
-                Ok(builder) => {
-                    drop(snapshot);
-                    builder
-                }
+                Ok(builder) => builder,
                 Err(err) => {
                     set_err_out_from_error($err_out, err);
-                    ptr::write(builder_ref, snapshot);
                     return false;
                 }
             };
-            ptr::write(builder_ref, new_builder);
+            *builder_ref = new_builder;
             true
         }
     };
