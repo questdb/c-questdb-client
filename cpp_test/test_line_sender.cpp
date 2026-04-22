@@ -2123,6 +2123,13 @@ TEST_CASE("Test Bookmark")
     CHECK_THROWS_AS(
         buffer.rewind_to_bookmark(cleared),
         questdb::ingress::line_sender_error);
+
+    auto retained = buffer.bookmark();
+    buffer.table("test").symbol("a", "g").at_now();
+    questdb::ingress::buffer_bookmark invalid{};
+    buffer.clear_bookmark(invalid);
+    buffer.rewind_to_bookmark(retained);
+    CHECK(buffer.peek() == "test,a=b\ntest,a=d\ntest,a=f\n");
 }
 
 TEST_CASE("Moved View")

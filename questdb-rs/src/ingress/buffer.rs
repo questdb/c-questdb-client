@@ -149,6 +149,9 @@ impl<S: Copy> StoredBookmark<S> {
     }
 
     pub(super) fn clear_if_matches(&mut self, origin: u64, bookmark: Bookmark) {
+        if bookmark.origin() == 0 {
+            return;
+        }
         if bookmark.origin() != origin {
             // `clear_bookmark()` is intentionally a no-op in release builds so
             // cleanup paths stay idempotent, but we still want debug builds to
@@ -650,5 +653,15 @@ mod tests {
         let err = stored.restore(7, bookmark).unwrap_err();
         assert_eq!(err.code(), ErrorCode::InvalidApiCall);
         assert_eq!(err.msg(), "Can't rewind to the bookmark: No bookmark set.");
+    }
+
+    #[test]
+    fn stored_bookmark_ignores_invalid_zero_origin_clear() {
+        let mut stored = StoredBookmark::<u8>::new();
+        let bookmark = stored.capture(7, 42);
+
+        stored.clear_if_matches(7, Bookmark::from_raw(0, 0));
+
+        assert_eq!(stored.restore(7, bookmark).unwrap(), 42);
     }
 }
