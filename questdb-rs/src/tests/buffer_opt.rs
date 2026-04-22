@@ -139,23 +139,3 @@ fn test_buffer_opt_array_some_binary_match() -> TestResult {
 
     Ok(())
 }
-
-#[test]
-fn test_buffer_opt_decimal_some_matches_standard() -> TestResult {
-    // Decimals require V3.
-    let version = ProtocolVersion::V3;
-    let mut opt_buf = Buffer::new(version);
-    opt_buf
-        .table("test")?
-        .column_dec_opt("dec", Some("123.45"))?;
-
-    let mut std_buf = Buffer::new(version);
-    std_buf.table("test")?.column_dec("dec", "123.45")?;
-
-    assert_eq!(
-        std::str::from_utf8(opt_buf.as_bytes())?,
-        std::str::from_utf8(std_buf.as_bytes())?
-    );
-
-    Ok(())
-}

@@ -871,7 +871,9 @@ impl Buffer {
     }
 
     /// Record a boolean value for the given column if the value is `Some`.
-    /// If the value is `None`, this is a no-op and the column is skipped.
+    /// If the value is `None`, this is a no-op and the column is skipped
+    /// entirely — it is **not** written as `false`. If you need an explicit
+    /// `false`, call [`Self::column_bool`] directly.
     ///
     /// This is a convenience wrapper around [`Self::column_bool`].
     ///
