@@ -214,15 +214,13 @@ impl<'a> TableName<'a> {
         let mut prev = '\0';
         for (index, c) in name.chars().enumerate() {
             match c {
-                '.' => {
-                    if index == 0 || index == name.len() - 1 || prev == '.' {
-                        return Err(error::fmt!(
-                            InvalidName,
-                            concat!("Bad string {:?}: ", "Found invalid dot `.` at position {}."),
-                            name,
-                            index
-                        ));
-                    }
+                '.' if (index == 0 || index == name.len() - 1 || prev == '.') => {
+                    return Err(error::fmt!(
+                        InvalidName,
+                        concat!("Bad string {:?}: ", "Found invalid dot `.` at position {}."),
+                        name,
+                        index
+                    ));
                 }
                 '?' | ',' | '\'' | '\"' | '\\' | '/' | ':' | ')' | '(' | '+' | '*' | '%' | '~'
                 | '\r' | '\n' | '\0' | '\u{0001}' | '\u{0002}' | '\u{0003}' | '\u{0004}'
