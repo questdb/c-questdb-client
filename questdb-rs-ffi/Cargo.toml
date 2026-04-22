@@ -21,7 +21,6 @@ features = [
     "tls-webpki-certs",
     "tls-native-certs",
     "sync-sender",
-    "sync-sender-qwp-udp"
 ]
 
 [features]

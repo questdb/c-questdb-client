@@ -2065,9 +2065,10 @@ pub unsafe extern "C" fn line_sender_buffer_new_for_sender(
     unsafe {
         let sender = unwrap_sender(sender);
         let buffer = sender.new_buffer();
+        let empty_peek_buf_is_null = sender.protocol() == Protocol::QwpUdp;
         Box::into_raw(Box::new(line_sender_buffer {
             buffer,
-            empty_peek_buf_is_null: sender.protocol() == Protocol::QwpUdp,
+            empty_peek_buf_is_null,
         }))
     }
 }
