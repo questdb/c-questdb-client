@@ -32,11 +32,10 @@ use rstest::rstest;
 // Buffer Option (_opt) integration tests
 // ============================================================================
 
-#[rstest]
-fn test_buffer_opt_some_matches_standard(
-    // We use V3 because it supports all datatypes, including arrays and decimals
-    #[values(ProtocolVersion::V3)] version: ProtocolVersion,
-) -> TestResult {
+#[test]
+fn test_buffer_opt_some_matches_standard() -> TestResult {
+    // V3 is required to exercise every `_opt` method — decimals and arrays need it.
+    let version = ProtocolVersion::V3;
     let mut opt_buf = Buffer::new(version);
 
     // Shared data
@@ -81,7 +80,10 @@ fn test_buffer_opt_some_matches_standard(
 
 #[rstest]
 fn test_buffer_opt_none_skips_columns(
-    #[values(ProtocolVersion::V3)] version: ProtocolVersion,
+    // `_opt(None)` short-circuits before any version check, so the output
+    // should be identical across every protocol version.
+    #[values(ProtocolVersion::V1, ProtocolVersion::V2, ProtocolVersion::V3)]
+    version: ProtocolVersion,
 ) -> TestResult {
     let mut buffer = Buffer::new(version);
 
@@ -138,10 +140,10 @@ fn test_buffer_opt_array_some_binary_match() -> TestResult {
     Ok(())
 }
 
-#[rstest]
-fn test_buffer_opt_decimal_some_matches_standard(
-    #[values(ProtocolVersion::V3)] version: ProtocolVersion, // Decimals require V3
-) -> TestResult {
+#[test]
+fn test_buffer_opt_decimal_some_matches_standard() -> TestResult {
+    // Decimals require V3.
+    let version = ProtocolVersion::V3;
     let mut opt_buf = Buffer::new(version);
     opt_buf
         .table("test")?

@@ -1269,7 +1269,7 @@ impl Buffer {
     /// (e.g., it requires Protocol Version 3 or higher).
     ///
     /// **Tip:** If you have an `Option<Decimal>`, use `.as_ref()` to pass it
-    /// without consuming the original string.
+    /// without consuming the original value.
     ///
     /// # Errors
     ///
@@ -1279,6 +1279,8 @@ impl Buffer {
     /// # Examples
     ///
     /// ```no_run
+    /// # #[cfg(feature = "bigdecimal")]
+    /// # {
     /// # use questdb::Result;
     /// # use questdb::ingress::{Buffer, SenderBuilder};
     /// use bigdecimal::BigDecimal;
@@ -1288,11 +1290,12 @@ impl Buffer {
     /// # let mut buffer = sender.new_buffer();
     /// # buffer.table("x")?;
     /// let val: Option<BigDecimal> = Some(BigDecimal::from_str("0.123456789012345678901234567890").unwrap());
-    /// buffer.column_dec_opt("col_name", val)?;
+    /// buffer.column_dec_opt("col_name", val.as_ref())?;
     ///
     /// let no_val: Option<BigDecimal> = None;
-    /// buffer.column_dec_opt("skipped_col", no_val)?;
+    /// buffer.column_dec_opt("skipped_col", no_val.as_ref())?;
     /// # Ok(())
+    /// # }
     /// # }
     /// ```
     pub fn column_dec_opt<'a, N, S>(
@@ -1448,12 +1451,11 @@ impl Buffer {
     /// # let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
     /// # let mut buffer = sender.new_buffer();
     /// # buffer.table("x")?;
-    /// let array_2d = vec![vec![1.1, 2.2], vec![3.3, 4.4]];
-    /// let val = Some(&array_2d);
-    /// buffer.column_arr_opt("array_col", val)?;
+    /// let val: Option<Vec<Vec<f64>>> = Some(vec![vec![1.1, 2.2], vec![3.3, 4.4]]);
+    /// buffer.column_arr_opt("array_col", val.as_ref())?;
     ///
-    /// let no_val: Option<&Vec<Vec<f64>>> = None;
-    /// buffer.column_arr_opt("skipped_col", no_val)?;
+    /// let no_val: Option<Vec<Vec<f64>>> = None;
+    /// buffer.column_arr_opt("skipped_col", no_val.as_ref())?;
     /// # Ok(())
     /// # }
     /// ```
