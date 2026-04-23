@@ -26,7 +26,7 @@ use crate::ErrorCode;
 use crate::ingress::{Buffer, DecimalView, ProtocolVersion, TimestampMicros, TimestampNanos};
 #[cfg(feature = "sync-sender-tcp")]
 use crate::tests::mock::MockServer;
-use crate::tests::qwp_decode::{DecodedValue, decode_datagram};
+use crate::tests::qwp_decode::{DecodedValue, TYPE_VARCHAR, decode_datagram};
 use crate::tests::{TestResult, assert_err_contains, qwp_mock::QwpUdpMock};
 
 const DECIMAL256_MAX_POS_STR: &str =
@@ -1179,9 +1179,9 @@ fn qwp_udp_encodes_sparse_string_columns_as_nullable_nulls() -> TestResult {
             .table
             .columns
             .iter()
-            .map(|column| (column.name.as_str(), column.nullable))
+            .map(|column| (column.name.as_str(), column.type_code, column.nullable))
             .collect::<Vec<_>>(),
-        vec![("seq", false), ("note", true)]
+        vec![("seq", 0x05, false), ("note", TYPE_VARCHAR, true)]
     );
     assert_eq!(
         decoded.table.rows,
@@ -1226,6 +1226,15 @@ fn qwp_udp_round_trips_empty_and_utf8_strings() -> TestResult {
     sender.flush(&mut buffer)?;
     let decoded = decode_datagram(&mock.recv_datagram()?).expect("datagram should decode");
     assert_eq!(decoded.table.name, "trades");
+    assert_eq!(
+        decoded
+            .table
+            .columns
+            .iter()
+            .map(|column| (column.name.as_str(), column.type_code, column.nullable))
+            .collect::<Vec<_>>(),
+        vec![("seq", 0x05, false), ("note", TYPE_VARCHAR, true)]
+    );
     assert_eq!(
         decoded.table.rows,
         vec![

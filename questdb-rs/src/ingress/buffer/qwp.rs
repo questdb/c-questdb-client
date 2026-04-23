@@ -76,7 +76,8 @@ pub(crate) const QWP_SCHEMA_MODE_FULL: u8 = 0x00;
 pub(crate) const QWP_TYPE_BOOLEAN: u8 = 0x01;
 pub(crate) const QWP_TYPE_DOUBLE: u8 = 0x07;
 pub(crate) const QWP_TYPE_LONG: u8 = 0x05;
-pub(crate) const QWP_TYPE_STRING: u8 = 0x08;
+// Match the newer Java QWP client/spec text column type.
+pub(crate) const QWP_TYPE_VARCHAR: u8 = 0x0F;
 pub(crate) const QWP_TYPE_SYMBOL: u8 = 0x09;
 pub(crate) const QWP_TYPE_TIMESTAMP: u8 = 0x0A;
 pub(crate) const QWP_TYPE_TIMESTAMP_NANOS: u8 = 0x10;
@@ -2684,7 +2685,7 @@ fn wire_type_byte(kind: ColumnKind, nullable: bool) -> u8 {
         ColumnKind::Symbol => QWP_TYPE_SYMBOL,
         ColumnKind::I64 => QWP_TYPE_LONG,
         ColumnKind::F64 => QWP_TYPE_DOUBLE,
-        ColumnKind::String => QWP_TYPE_STRING,
+        ColumnKind::String => QWP_TYPE_VARCHAR,
         ColumnKind::Decimal => QWP_TYPE_DECIMAL256,
         ColumnKind::DoubleArray => QWP_TYPE_DOUBLE_ARRAY,
         ColumnKind::TimestampMicros => QWP_TYPE_TIMESTAMP,

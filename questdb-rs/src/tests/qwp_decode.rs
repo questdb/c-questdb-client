@@ -37,7 +37,7 @@ const _: () = assert!(HEADER_SIZE == 12);
 const TYPE_BOOLEAN: u8 = 0x01;
 const TYPE_LONG: u8 = 0x05;
 const TYPE_DOUBLE: u8 = 0x07;
-const TYPE_STRING: u8 = 0x08;
+pub(crate) const TYPE_VARCHAR: u8 = 0x0F;
 const TYPE_SYMBOL: u8 = 0x09;
 const TYPE_TIMESTAMP: u8 = 0x0A;
 const TYPE_TIMESTAMP_NANOS: u8 = 0x10;
@@ -387,7 +387,7 @@ pub(crate) fn decode_datagram(bytes: &[u8]) -> Result<DecodedDatagram, String> {
                 }
                 values
             }
-            TYPE_STRING => {
+            TYPE_VARCHAR => {
                 let non_null_count = has_value.iter().filter(|&&present| present).count();
                 let offset_count = non_null_count + 1;
                 let mut offsets = Vec::with_capacity(offset_count);
