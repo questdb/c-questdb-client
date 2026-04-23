@@ -88,7 +88,6 @@ const QWP_INLINE_SCHEMA_ID: u64 = 0;
 const QWP_DECIMAL_MAX_SCALE: u8 = 76;
 const QWP_DECIMAL_MAG_LIMBS: usize = 4;
 const QWP_DECIMAL_MAG_BYTES: usize = QWP_DECIMAL_MAG_LIMBS * 8;
-const QWP_STORED_DECIMAL_LEN: usize = 1 + 1 + QWP_DECIMAL_MAG_BYTES;
 const QWP_DECIMAL_SIGN_BIT: u64 = 1u64 << 63;
 
 fn checked_qwp_u32(value: usize, what: &'static str) -> crate::Result<u32> {
@@ -169,42 +168,6 @@ impl StoredQwpDecimal {
         }
     }
 
-    fn from_stored_bytes(bytes: &[u8]) -> crate::Result<Self> {
-        if bytes.len() != QWP_STORED_DECIMAL_LEN {
-            return Err(error::fmt!(
-                InvalidApiCall,
-                "internal QWP decimal value length mismatch: expected {}, got {}",
-                QWP_STORED_DECIMAL_LEN,
-                bytes.len()
-            ));
-        }
-
-        let mut magnitude = [0u64; QWP_DECIMAL_MAG_LIMBS];
-        for (idx, limb) in magnitude.iter_mut().enumerate() {
-            let start = 2 + idx * 8;
-            let end = start + 8;
-            let raw: [u8; 8] = bytes[start..end]
-                .try_into()
-                .expect("slice length is validated above");
-            *limb = u64::from_le_bytes(raw);
-        }
-
-        let negative = bytes[1] != 0 && !mag_is_zero(&magnitude);
-        Ok(Self {
-            scale: bytes[0],
-            negative,
-            magnitude,
-        })
-    }
-
-    fn write_to(&self, out: &mut Vec<u8>) {
-        out.push(self.scale);
-        out.push(u8::from(self.negative && !mag_is_zero(&self.magnitude)));
-        for limb in self.magnitude {
-            out.extend_from_slice(&limb.to_le_bytes());
-        }
-    }
-
     fn wire_bytes_with_scale(
         &self,
         target_scale: u8,
@@ -236,6 +199,12 @@ impl StoredQwpDecimal {
             &magnitude,
             signed_range_err,
         )
+    }
+
+    fn write_magnitude_to(&self, out: &mut Vec<u8>) {
+        for limb in self.magnitude {
+            out.extend_from_slice(&limb.to_le_bytes());
+        }
     }
 }
 
@@ -523,6 +492,51 @@ struct NameSlice(ByteSlice);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ValueSlice(ByteSlice);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DecimalValue {
+    magnitude: ValueSlice,
+    scale: u8,
+    negative: bool,
+}
+
+impl DecimalValue {
+    fn load_magnitude(self, value_bytes: &[u8]) -> crate::Result<[u64; QWP_DECIMAL_MAG_LIMBS]> {
+        let bytes = &value_bytes[self.magnitude.0.as_range()];
+        if bytes.len() != QWP_DECIMAL_MAG_BYTES {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "internal QWP decimal magnitude length mismatch: expected {}, got {}",
+                QWP_DECIMAL_MAG_BYTES,
+                bytes.len()
+            ));
+        }
+
+        let mut magnitude = [0u64; QWP_DECIMAL_MAG_LIMBS];
+        for (idx, limb) in magnitude.iter_mut().enumerate() {
+            let start = idx * 8;
+            let end = start + 8;
+            let raw: [u8; 8] = bytes[start..end]
+                .try_into()
+                .expect("slice length is validated above");
+            *limb = u64::from_le_bytes(raw);
+        }
+        Ok(magnitude)
+    }
+
+    fn wire_bytes_with_scale(
+        self,
+        value_bytes: &[u8],
+        target_scale: u8,
+    ) -> crate::Result<[u8; QWP_DECIMAL_MAG_BYTES]> {
+        StoredQwpDecimal {
+            scale: self.scale,
+            negative: self.negative,
+            magnitude: self.load_magnitude(value_bytes)?,
+        }
+        .wire_bytes_with_scale(target_scale)
+    }
+}
+
 // --- Column kind ---
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -558,7 +572,7 @@ enum ValueRef {
     Symbol(ValueSlice),
     String(ValueSlice),
     DecimalNull,
-    Decimal(ValueSlice),
+    Decimal(DecimalValue),
     DoubleArray(ValueSlice),
 }
 
@@ -755,8 +769,13 @@ impl QwpSizeHint {
             let previous_len = self.planner.current_len;
             let cp = self.planner.checkpoint();
             if let Err(err) =
-                self.planner
-                    .add_row(row, row_entries, name_bytes, value_bytes, table_name.len())
+                self.planner.add_row(
+                    row,
+                    row_entries,
+                    name_bytes,
+                    value_bytes,
+                    table_name.len(),
+                )
             {
                 self.planner.rollback(cp);
                 return Err(err);
@@ -767,8 +786,13 @@ impl QwpSizeHint {
         }
 
         self.scratch.clear();
-        self.scratch
-            .add_row(row, row_entries, name_bytes, value_bytes, table_name.len())?;
+        self.scratch.add_row(
+            row,
+            row_entries,
+            name_bytes,
+            value_bytes,
+            table_name.len(),
+        )?;
         self.committed_len += self.scratch.current_len;
 
         if self.group_table.is_some() {
@@ -1091,18 +1115,24 @@ impl QwpBuffer {
     fn append_value_decimal(
         &mut self,
         value: DecimalView<'_>,
-    ) -> crate::Result<Option<ValueSlice>> {
+    ) -> crate::Result<Option<DecimalValue>> {
         let Some(decimal) = StoredQwpDecimal::from_decimal_view(value)? else {
             return Ok(None);
         };
         let offset = Self::checked_arena_offset(
             self.value_bytes.len(),
-            QWP_STORED_DECIMAL_LEN,
+            QWP_DECIMAL_MAG_BYTES,
             "value_bytes",
         )?;
-        let len = checked_qwp_u32(QWP_STORED_DECIMAL_LEN, "decimal value length")?;
-        decimal.write_to(&mut self.value_bytes);
-        Ok(Some(ValueSlice(ByteSlice { offset, len })))
+        decimal.write_magnitude_to(&mut self.value_bytes);
+        Ok(Some(DecimalValue {
+            magnitude: ValueSlice(ByteSlice {
+                offset,
+                len: checked_qwp_u32(QWP_DECIMAL_MAG_BYTES, "decimal magnitude length")?,
+            }),
+            scale: decimal.scale,
+            negative: decimal.negative,
+        }))
     }
 
     fn append_value_f64_array<T, D>(&mut self, view: &T) -> crate::Result<ValueSlice>
@@ -1352,7 +1382,7 @@ impl QwpBuffer {
         self.mark_pending_entry_name(name.as_ref())?;
         let name_ns = self.append_name(name.as_ref())?;
         let value_ref = match self.append_value_decimal(value)? {
-            Some(value_vs) => ValueRef::Decimal(value_vs),
+            Some(value_ref) => ValueRef::Decimal(value_ref),
             None => ValueRef::DecimalNull,
         };
         self.push_entry(EntryMeta {
@@ -1573,7 +1603,7 @@ impl QwpBuffer {
                 ValueRef::I64(_) | ValueRef::F64(_) => 8,
                 ValueRef::String(vs) => vs.0.len as usize + 9,
                 ValueRef::DecimalNull => 1,
-                ValueRef::Decimal(vs) => vs.0.len as usize + 2,
+                ValueRef::Decimal(_) => QWP_DECIMAL_MAG_BYTES + 4,
                 ValueRef::DoubleArray(vs) => vs.0.len as usize + 5,
                 ValueRef::TimestampMicros(_) | ValueRef::TimestampNanos(_) => 9,
             };
@@ -1966,7 +1996,7 @@ impl ColumnStats {
         )
     }
 
-    fn add_non_symbol_value(&mut self, value: &ValueRef, value_bytes: &[u8]) -> crate::Result<()> {
+    fn add_non_symbol_value(&mut self, value: &ValueRef) -> crate::Result<()> {
         let new_non_null_count = self.non_null_count.checked_add(1).ok_or_else(|| {
             error::fmt!(
                 InvalidApiCall,
@@ -2007,11 +2037,9 @@ impl ColumnStats {
             },
             ColumnKind::Decimal => match value {
                 ValueRef::DecimalNull => Ok(()),
-                ValueRef::Decimal(vs) => {
-                    let stored =
-                        StoredQwpDecimal::from_stored_bytes(&value_bytes[vs.0.as_range()])?;
+                ValueRef::Decimal(decimal_value) => {
                     self.non_null_count = new_non_null_count;
-                    self.decimal_scale = self.decimal_scale.max(stored.scale);
+                    self.decimal_scale = self.decimal_scale.max(decimal_value.scale);
                     Ok(())
                 }
                 _ => Err(error::fmt!(
@@ -2344,7 +2372,7 @@ impl RowGroupPlanner {
                 if col.kind == ColumnKind::Symbol {
                     self.add_symbol_value(idx, cell_idx, &entry.value, value_bytes)?;
                 } else {
-                    col.add_non_symbol_value(&entry.value, value_bytes)?;
+                    col.add_non_symbol_value(&entry.value)?;
                 }
             } else {
                 self.push_new_column(entry, value_bytes, row_idx)?;
@@ -2605,7 +2633,7 @@ impl RowGroupPlanner {
         if entry.value.kind() == ColumnKind::Symbol {
             self.add_symbol_value(col_idx, cell_idx, &entry.value, value_bytes)?;
         } else {
-            self.columns[col_idx].add_non_symbol_value(&entry.value, value_bytes)?;
+            self.columns[col_idx].add_non_symbol_value(&entry.value)?;
         }
         Ok(())
     }
@@ -2955,10 +2983,10 @@ fn encode_column_from_cells(
             for cell in CellIter::new(cells, col.cell_head) {
                 match cell.value {
                     ValueRef::DecimalNull => {}
-                    ValueRef::Decimal(vs) => {
-                        let stored =
-                            StoredQwpDecimal::from_stored_bytes(&value_bytes[vs.0.as_range()])?;
-                        out.extend_from_slice(&stored.wire_bytes_with_scale(col.decimal_scale)?);
+                    ValueRef::Decimal(decimal_value) => {
+                        out.extend_from_slice(
+                            &decimal_value.wire_bytes_with_scale(value_bytes, col.decimal_scale)?,
+                        );
                     }
                     _ => {
                         return Err(error::fmt!(
@@ -3072,6 +3100,74 @@ mod tests {
     }
 
     #[test]
+    fn qwp_decimal_failed_commit_restores_decimal_value_bytes_len() {
+        let mut buf = QwpBuffer::new(127);
+
+        buf.table("trades").unwrap().column_dec("price", "1.2").unwrap();
+        assert_eq!(buf.value_bytes.len(), QWP_DECIMAL_MAG_BYTES);
+        let value_bytes_cap_before = buf.value_bytes.capacity();
+        let price_name = buf.entries.last().unwrap().name;
+        buf.entries.push(EntryMeta {
+            name: price_name,
+            value: ValueRef::Bool(true),
+        });
+
+        let err = buf.at_now().unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+        assert_eq!(
+            err.msg(),
+            r#"QWP/UDP column "price" changes type within a batched table"#
+        );
+        assert!(buf.pending.table.is_none());
+        assert!(buf.is_empty());
+        assert_eq!(buf.value_bytes.len(), 0);
+        assert_eq!(buf.value_bytes.capacity(), value_bytes_cap_before);
+    }
+
+    #[test]
+    fn qwp_decimal_marker_rewind_truncates_decimal_value_bytes() {
+        let mut buf = QwpBuffer::new(127);
+
+        buf.table("trades").unwrap().column_dec("price", "1.2").unwrap();
+        buf.at_now().unwrap();
+        assert_eq!(buf.value_bytes.len(), QWP_DECIMAL_MAG_BYTES);
+
+        buf.set_marker().unwrap();
+        buf.table("trades")
+            .unwrap()
+            .column_dec("price", "1.5e-3")
+            .unwrap();
+        buf.at_now().unwrap();
+        assert_eq!(buf.value_bytes.len(), QWP_DECIMAL_MAG_BYTES * 2);
+
+        buf.rewind_to_marker().unwrap();
+        assert_eq!(buf.row_count(), 1);
+        assert_eq!(buf.value_bytes.len(), QWP_DECIMAL_MAG_BYTES);
+    }
+
+    #[test]
+    fn qwp_decimal_clear_resets_value_bytes_but_retains_capacity() {
+        let mut buf = QwpBuffer::new(127);
+
+        for _ in 0..10 {
+            buf.table("trades")
+                .unwrap()
+                .column_dec("price", "1.25")
+                .unwrap()
+                .at_now()
+                .unwrap();
+        }
+
+        let value_bytes_cap_before = buf.value_bytes.capacity();
+        assert!(value_bytes_cap_before > 0);
+        assert_eq!(buf.value_bytes.len(), QWP_DECIMAL_MAG_BYTES * 10);
+
+        buf.clear();
+        assert_eq!(buf.value_bytes.len(), 0);
+        assert_eq!(buf.value_bytes.capacity(), value_bytes_cap_before);
+    }
+
+    #[test]
     fn qwp_planner_checked_u16_rejects_overflow() {
         let err = RowGroupPlanner::checked_u16(u16::MAX as usize + 1, "column count").unwrap_err();
         assert_eq!(err.code(), ErrorCode::InvalidApiCall);
@@ -3128,7 +3224,7 @@ mod tests {
         });
         col.variable_data_len = usize::MAX;
 
-        let err = col.add_non_symbol_value(&string_value, &[]).unwrap_err();
+        let err = col.add_non_symbol_value(&string_value).unwrap_err();
         assert_eq!(err.code(), ErrorCode::InvalidApiCall);
         assert!(
             err.msg()
@@ -3331,13 +3427,23 @@ mod tests {
             .unwrap();
         assert_eq!(
             planner.current_len,
-            encoded_planner_len(&planner, &buf.name_bytes, &buf.value_bytes, "t")
+            encoded_planner_len(
+                &planner,
+                &buf.name_bytes,
+                &buf.value_bytes,
+                "t",
+            )
         );
 
         planner.rollback(cp);
         assert_eq!(
             planner.current_len,
-            encoded_planner_len(&planner, &buf.name_bytes, &buf.value_bytes, "t")
+            encoded_planner_len(
+                &planner,
+                &buf.name_bytes,
+                &buf.value_bytes,
+                "t",
+            )
         );
 
         let post_rollback_row = &buf.rows[8];
@@ -3352,7 +3458,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             planner.current_len,
-            encoded_planner_len(&planner, &buf.name_bytes, &buf.value_bytes, "t")
+            encoded_planner_len(
+                &planner,
+                &buf.name_bytes,
+                &buf.value_bytes,
+                "t",
+            )
         );
     }
 
@@ -4301,7 +4412,13 @@ mod tests {
 
         // Add first row
         planner
-            .add_row(row0, entries0, &buf.name_bytes, &buf.value_bytes, "t".len())
+            .add_row(
+                row0,
+                entries0,
+                &buf.name_bytes,
+                &buf.value_bytes,
+                "t".len(),
+            )
             .unwrap();
         let len_after_1 = planner.current_len;
         assert_eq!(planner.row_count(), 1);
@@ -4309,7 +4426,13 @@ mod tests {
         // Checkpoint, add second row, then rollback
         let cp = planner.checkpoint();
         planner
-            .add_row(row1, entries1, &buf.name_bytes, &buf.value_bytes, "t".len())
+            .add_row(
+                row1,
+                entries1,
+                &buf.name_bytes,
+                &buf.value_bytes,
+                "t".len(),
+            )
             .unwrap();
         assert_eq!(planner.row_count(), 2);
         assert!(planner.current_len > len_after_1);
@@ -4344,13 +4467,25 @@ mod tests {
         let entries1 = buf.entries_for_row(row1);
 
         planner
-            .add_row(row0, entries0, &buf.name_bytes, &buf.value_bytes, "t".len())
+            .add_row(
+                row0,
+                entries0,
+                &buf.name_bytes,
+                &buf.value_bytes,
+                "t".len(),
+            )
             .unwrap();
         assert_eq!(planner.columns.len(), 1); // just "x"
 
         let cp = planner.checkpoint();
         planner
-            .add_row(row1, entries1, &buf.name_bytes, &buf.value_bytes, "t".len())
+            .add_row(
+                row1,
+                entries1,
+                &buf.name_bytes,
+                &buf.value_bytes,
+                "t".len(),
+            )
             .unwrap();
         assert_eq!(planner.columns.len(), 2); // "x" + "y"
 
@@ -4390,13 +4525,25 @@ mod tests {
         let entries2 = buf.entries_for_row(row2);
 
         planner
-            .add_row(row0, entries0, &buf.name_bytes, &buf.value_bytes, "t".len())
+            .add_row(
+                row0,
+                entries0,
+                &buf.name_bytes,
+                &buf.value_bytes,
+                "t".len(),
+            )
             .unwrap();
         assert_eq!(planner.current_len, exact_planner_len(&planner, "t".len()));
 
         let cp = planner.checkpoint();
         planner
-            .add_row(row1, entries1, &buf.name_bytes, &buf.value_bytes, "t".len())
+            .add_row(
+                row1,
+                entries1,
+                &buf.name_bytes,
+                &buf.value_bytes,
+                "t".len(),
+            )
             .unwrap();
         assert_eq!(planner.current_len, exact_planner_len(&planner, "t".len()));
 
@@ -4404,7 +4551,13 @@ mod tests {
         assert_eq!(planner.current_len, exact_planner_len(&planner, "t".len()));
 
         planner
-            .add_row(row2, entries2, &buf.name_bytes, &buf.value_bytes, "t".len())
+            .add_row(
+                row2,
+                entries2,
+                &buf.name_bytes,
+                &buf.value_bytes,
+                "t".len(),
+            )
             .unwrap();
         assert_eq!(planner.current_len, exact_planner_len(&planner, "t".len()));
     }
@@ -4443,7 +4596,12 @@ mod tests {
                     "audit".len(),
                 )
                 .unwrap();
-            let actual = encoded_planner_len(&planner, &buf.name_bytes, &buf.value_bytes, "audit");
+            let actual = encoded_planner_len(
+                &planner,
+                &buf.name_bytes,
+                &buf.value_bytes,
+                "audit",
+            );
             assert_eq!(planner.current_len, actual, "prefix {}", prefix_len);
         }
     }
@@ -4489,7 +4647,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(planner.columns.len(), 128);
-        let actual = encoded_planner_len(&planner, &buf.name_bytes, &buf.value_bytes, "wide");
+        let actual = encoded_planner_len(
+            &planner,
+            &buf.name_bytes,
+            &buf.value_bytes,
+            "wide",
+        );
         assert_eq!(planner.current_len, actual);
     }
 
