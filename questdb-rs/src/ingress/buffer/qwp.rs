@@ -2416,8 +2416,11 @@ impl RowGroupPlanner {
                 | ColumnKind::TimestampMicros
                 | ColumnKind::TimestampNanos => {
                     touched_sparse_column_count += 1;
-                    if uses_null_bitmap(col.supports_sparse_nulls, old_row_count, undo.non_null_count)
-                    {
+                    if uses_null_bitmap(
+                        col.supports_sparse_nulls,
+                        old_row_count,
+                        undo.non_null_count,
+                    ) {
                         touched_old_active_bitmap_column_count += 1;
                     }
                     if col.uses_null_bitmap(new_row_count) {
@@ -3546,23 +3549,18 @@ mod tests {
             designated_ts,
         )
             .prop_map(
-                |(
-                    symbol,
-                    string_value,
-                    decimal_value,
-                    array_values,
-                    ts_value,
-                    designated_ts,
-                )| PropRow {
-                    symbol,
-                    bool_value: None,
-                    i64_value: None,
-                    f64_value: None,
-                    string_value,
-                    decimal_value,
-                    array_values,
-                    ts_value,
-                    designated_ts,
+                |(symbol, string_value, decimal_value, array_values, ts_value, designated_ts)| {
+                    PropRow {
+                        symbol,
+                        bool_value: None,
+                        i64_value: None,
+                        f64_value: None,
+                        string_value,
+                        decimal_value,
+                        array_values,
+                        ts_value,
+                        designated_ts,
+                    }
                 },
             )
             .boxed()
@@ -5641,8 +5639,8 @@ mod tests {
     }
 
     #[test]
-    fn qwp_planner_incremental_len_matches_actual_across_untouched_column_boundaries_dense_sparse_transition_emits_bitmap(
-    ) {
+    fn qwp_planner_incremental_len_matches_actual_across_untouched_column_boundaries_dense_sparse_transition_emits_bitmap()
+     {
         let mut planner = RowGroupPlanner::new();
         let mut buf = QwpBuffer::new(127);
 
@@ -5665,7 +5663,10 @@ mod tests {
                 "audit".len(),
             )
             .unwrap();
-        assert_eq!(planner.current_len, exact_planner_len(&planner, "audit".len()));
+        assert_eq!(
+            planner.current_len,
+            exact_planner_len(&planner, "audit".len())
+        );
         assert_eq!(
             planner.current_len,
             encoded_planner_len(&planner, &buf.name_bytes, &buf.value_bytes, "audit")
@@ -5689,7 +5690,10 @@ mod tests {
             .find(|column| column.name == "venue")
             .unwrap();
         assert!(!venue.nullable, "dense first row must skip null bitmap");
-        assert_eq!(decoded.table.rows[0][0], DecodedValue::String("tokyo".to_owned()));
+        assert_eq!(
+            decoded.table.rows[0][0],
+            DecodedValue::String("tokyo".to_owned())
+        );
 
         buf.table("audit").unwrap().column_i64("qty", 2).unwrap();
         buf.at_now().unwrap();
@@ -5705,7 +5709,10 @@ mod tests {
                 "audit".len(),
             )
             .unwrap();
-        assert_eq!(planner.current_len, exact_planner_len(&planner, "audit".len()));
+        assert_eq!(
+            planner.current_len,
+            exact_planner_len(&planner, "audit".len())
+        );
         assert_eq!(
             planner.current_len,
             encoded_planner_len(&planner, &buf.name_bytes, &buf.value_bytes, "audit")
@@ -5729,7 +5736,10 @@ mod tests {
             .find(|column| column.name == "venue")
             .unwrap();
         assert!(venue.nullable, "later omission must enable null bitmap");
-        assert_eq!(decoded.table.rows[0][0], DecodedValue::String("tokyo".to_owned()));
+        assert_eq!(
+            decoded.table.rows[0][0],
+            DecodedValue::String("tokyo".to_owned())
+        );
         assert_eq!(decoded.table.rows[1][0], DecodedValue::Null);
     }
 
