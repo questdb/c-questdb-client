@@ -3653,7 +3653,7 @@ mod tests {
 
     proptest! {
         #![proptest_config(ProptestConfig {
-            cases: 48,
+            cases: 256,
             .. ProptestConfig::default()
         })]
 
