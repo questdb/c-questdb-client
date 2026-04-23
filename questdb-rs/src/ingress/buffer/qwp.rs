@@ -1593,6 +1593,24 @@ impl QwpBuffer {
         &self.entries[start..end]
     }
 
+    fn encode_planner_to_scratch_and_send(
+        &self,
+        planner: &RowGroupPlanner,
+        table_name: &[u8],
+        datagram: &mut Vec<u8>,
+        send: &mut dyn FnMut(&[u8]) -> crate::Result<()>,
+    ) -> crate::Result<()> {
+        datagram.clear();
+        encode_row_group_from_scratch(
+            planner,
+            &self.name_bytes,
+            &self.value_bytes,
+            table_name,
+            datagram,
+        )?;
+        send(datagram)
+    }
+
     /// Encode datagrams for the current buffer contents.
     /// Test-only helper that collects datagrams into a Vec.
     #[cfg(test)]
@@ -1703,15 +1721,12 @@ impl QwpBuffer {
 
             // Fast path: segment fits in one datagram, encode from cached planner.
             if cached.current_len <= max_datagram_size {
-                scratch.datagram.clear();
-                encode_row_group_from_scratch(
+                self.encode_planner_to_scratch_and_send(
                     cached,
-                    &self.name_bytes,
-                    &self.value_bytes,
                     table_name,
                     &mut scratch.datagram,
+                    send,
                 )?;
-                send(&scratch.datagram)?;
                 continue;
             }
 
@@ -1735,15 +1750,9 @@ impl QwpBuffer {
                 if cp.row_count > 0 && scratch.planner.current_len > max_datagram_size {
                     scratch.planner.rollback(cp);
 
-                    scratch.datagram.clear();
-                    encode_row_group_from_scratch(
-                        &scratch.planner,
-                        &self.name_bytes,
-                        &self.value_bytes,
-                        table_name,
-                        &mut scratch.datagram,
-                    )?;
-                    send(&scratch.datagram)?;
+                    let planner = &scratch.planner;
+                    let datagram = &mut scratch.datagram;
+                    self.encode_planner_to_scratch_and_send(planner, table_name, datagram, send)?;
 
                     scratch.planner.clear();
 
@@ -1773,15 +1782,9 @@ impl QwpBuffer {
             }
 
             if scratch.planner.row_count() > 0 {
-                scratch.datagram.clear();
-                encode_row_group_from_scratch(
-                    &scratch.planner,
-                    &self.name_bytes,
-                    &self.value_bytes,
-                    table_name,
-                    &mut scratch.datagram,
-                )?;
-                send(&scratch.datagram)?;
+                let planner = &scratch.planner;
+                let datagram = &mut scratch.datagram;
+                self.encode_planner_to_scratch_and_send(planner, table_name, datagram, send)?;
             }
         }
         Ok(())
