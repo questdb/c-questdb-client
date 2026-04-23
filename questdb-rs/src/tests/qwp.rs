@@ -637,13 +637,15 @@ fn qwp_udp_failed_flush_preserves_bookmark() -> TestResult {
         .at_now()?;
     let bookmark = buffer.bookmark()?;
 
-    while buffer.len() < max {
+    while buffer.len() <= max {
         buffer
             .table("trades")?
             .symbol("sym", "BTC-USD")?
             .column_i64("qty", 2)?
             .at_now()?;
     }
+
+    assert!(buffer.len() > max);
 
     let err = sender.flush(&mut buffer).unwrap_err();
     assert_eq!(err.code(), ErrorCode::InvalidApiCall);
@@ -821,7 +823,7 @@ fn qwp_udp_encodes_sparse_boolean_columns_as_false_not_null() -> TestResult {
             .iter()
             .map(|column| (column.name.as_str(), column.nullable))
             .collect::<Vec<_>>(),
-        vec![("sym", true), ("active", false)]
+        vec![("sym", false), ("active", false)]
     );
     assert_eq!(
         decoded.table.rows,
@@ -878,7 +880,7 @@ fn qwp_udp_encodes_sparse_long_and_double_columns_as_non_nullable_sentinels() ->
             .iter()
             .map(|column| (column.name.as_str(), column.nullable))
             .collect::<Vec<_>>(),
-        vec![("sym", true), ("qty", false), ("px", false)]
+        vec![("sym", false), ("qty", false), ("px", false)]
     );
     assert_eq!(
         decoded.table.rows[0][0],
@@ -1088,7 +1090,7 @@ fn qwp_udp_encodes_sparse_timestamp_columns_as_nullable_nulls() -> TestResult {
             .iter()
             .map(|column| (column.name.as_str(), column.nullable))
             .collect::<Vec<_>>(),
-        vec![("sym", true), ("event_ts", true)]
+        vec![("sym", false), ("event_ts", true)]
     );
     assert_eq!(
         decoded.table.rows,
@@ -1133,7 +1135,7 @@ fn qwp_udp_encodes_sparse_symbol_columns_as_nullable_nulls() -> TestResult {
             .iter()
             .map(|column| (column.name.as_str(), column.nullable))
             .collect::<Vec<_>>(),
-        vec![("sym", true), ("venue", true)]
+        vec![("sym", false), ("venue", true)]
     );
     assert_eq!(
         decoded.table.rows,
@@ -1233,7 +1235,7 @@ fn qwp_udp_round_trips_empty_and_utf8_strings() -> TestResult {
             .iter()
             .map(|column| (column.name.as_str(), column.type_code, column.nullable))
             .collect::<Vec<_>>(),
-        vec![("seq", 0x05, false), ("note", TYPE_VARCHAR, true)]
+        vec![("seq", 0x05, false), ("note", TYPE_VARCHAR, false)]
     );
     assert_eq!(
         decoded.table.rows,

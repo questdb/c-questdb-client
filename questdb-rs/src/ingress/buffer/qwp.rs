@@ -1887,14 +1887,14 @@ struct ColumnStats {
     dict_count: u32,
     cached_schema_len: usize,
     kind: ColumnKind,
-    base_nullable: bool,
+    supports_sparse_nulls: bool,
 }
 
 impl ColumnStats {
     #[allow(clippy::too_many_arguments)]
     fn payload_len_parts(
         kind: ColumnKind,
-        base_nullable: bool,
+        supports_sparse_nulls: bool,
         row_count: usize,
         non_null_count: u32,
         variable_data_len: usize,
@@ -1902,9 +1902,12 @@ impl ColumnStats {
         symbol_row_index_bytes: usize,
         dict_count: u32,
     ) -> crate::Result<usize> {
-        let nullable = base_nullable
-            || (kind_supports_sparse_nulls(kind) && (non_null_count as usize) < row_count);
-        let bitmap = if nullable { bitmap_bytes(row_count) } else { 0 };
+        let uses_null_bitmap = uses_null_bitmap(supports_sparse_nulls, row_count, non_null_count);
+        let bitmap = if uses_null_bitmap {
+            bitmap_bytes(row_count)
+        } else {
+            0
+        };
 
         let data_len = match kind {
             ColumnKind::Bool => packed_bytes(row_count),
@@ -1961,22 +1964,14 @@ impl ColumnStats {
             dict_count: 0,
             cached_schema_len,
             kind,
-            base_nullable: matches!(
-                kind,
-                ColumnKind::Symbol
-                    | ColumnKind::String
-                    | ColumnKind::Decimal
-                    | ColumnKind::DoubleArray
-                    | ColumnKind::TimestampMicros
-                    | ColumnKind::TimestampNanos
-            ),
+            supports_sparse_nulls: kind_supports_sparse_nulls(kind),
         }
     }
 
     fn payload_len(&self, row_count: usize) -> crate::Result<usize> {
         Self::payload_len_parts(
             self.kind,
-            self.base_nullable,
+            self.supports_sparse_nulls,
             row_count,
             self.non_null_count,
             self.variable_data_len,
@@ -2086,9 +2081,8 @@ impl ColumnStats {
         }
     }
 
-    fn is_nullable(&self, row_count: usize) -> bool {
-        self.base_nullable
-            || (kind_supports_sparse_nulls(self.kind) && (self.non_null_count as usize) < row_count)
+    fn uses_null_bitmap(&self, row_count: usize) -> bool {
+        uses_null_bitmap(self.supports_sparse_nulls, row_count, self.non_null_count)
     }
 }
 
@@ -2124,7 +2118,8 @@ struct Checkpoint {
     total_schema_len: usize,
     bool_column_count: usize,
     fixed8_column_count: usize,
-    bitmap_column_count: usize,
+    sparse_column_count: usize,
+    active_bitmap_column_count: usize,
     symbol_hash_resize_epoch: u64,
 }
 
@@ -2142,7 +2137,8 @@ pub(crate) struct RowGroupPlanner {
     total_schema_len: usize,
     bool_column_count: usize,
     fixed8_column_count: usize,
-    bitmap_column_count: usize,
+    sparse_column_count: usize,
+    active_bitmap_column_count: usize,
     symbol_hash_resize_epoch: u64,
     symbol_hasher: RandomState,
 }
@@ -2161,7 +2157,8 @@ impl Clone for RowGroupPlanner {
             total_schema_len: self.total_schema_len,
             bool_column_count: self.bool_column_count,
             fixed8_column_count: self.fixed8_column_count,
-            bitmap_column_count: self.bitmap_column_count,
+            sparse_column_count: self.sparse_column_count,
+            active_bitmap_column_count: self.active_bitmap_column_count,
             symbol_hash_resize_epoch: self.symbol_hash_resize_epoch,
             symbol_hasher: self.symbol_hasher.clone(),
         }
@@ -2209,7 +2206,8 @@ impl RowGroupPlanner {
             total_schema_len: 0,
             bool_column_count: 0,
             fixed8_column_count: 0,
-            bitmap_column_count: 0,
+            sparse_column_count: 0,
+            active_bitmap_column_count: 0,
             symbol_hash_resize_epoch: 0,
             symbol_hasher: RandomState::new(),
         }
@@ -2227,7 +2225,8 @@ impl RowGroupPlanner {
         self.total_schema_len = 0;
         self.bool_column_count = 0;
         self.fixed8_column_count = 0;
-        self.bitmap_column_count = 0;
+        self.sparse_column_count = 0;
+        self.active_bitmap_column_count = 0;
         self.symbol_hash_resize_epoch = 0;
     }
 
@@ -2256,7 +2255,8 @@ impl RowGroupPlanner {
             total_schema_len: self.total_schema_len,
             bool_column_count: self.bool_column_count,
             fixed8_column_count: self.fixed8_column_count,
-            bitmap_column_count: self.bitmap_column_count,
+            sparse_column_count: self.sparse_column_count,
+            active_bitmap_column_count: self.active_bitmap_column_count,
             symbol_hash_resize_epoch: self.symbol_hash_resize_epoch,
         }
     }
@@ -2305,7 +2305,8 @@ impl RowGroupPlanner {
         self.total_schema_len = cp.total_schema_len;
         self.bool_column_count = cp.bool_column_count;
         self.fixed8_column_count = cp.fixed8_column_count;
-        self.bitmap_column_count = cp.bitmap_column_count;
+        self.sparse_column_count = cp.sparse_column_count;
+        self.active_bitmap_column_count = cp.active_bitmap_column_count;
     }
 
     fn add_row(
@@ -2321,7 +2322,8 @@ impl RowGroupPlanner {
         let old_total_schema_len = self.total_schema_len;
         let old_bool_column_count = self.bool_column_count;
         let old_fixed8_column_count = self.fixed8_column_count;
-        let old_bitmap_column_count = self.bitmap_column_count;
+        let old_sparse_column_count = self.sparse_column_count;
+        let old_active_bitmap_column_count = self.active_bitmap_column_count;
         self.undo_stack.clear();
         let ts_entry = row.designated_ts.map(designated_ts_entry);
         let extra = ts_entry.as_slice();
@@ -2378,11 +2380,16 @@ impl RowGroupPlanner {
         if old_row_count == 0 {
             let mut total = base_datagram_len(table_name_len, new_row_count, self.columns.len());
             total += self.total_schema_len;
+            let mut active_bitmap_column_count = 0usize;
             for col in &self.columns {
                 total += col.payload_len(new_row_count)?;
+                if col.uses_null_bitmap(new_row_count) {
+                    active_bitmap_column_count += 1;
+                }
             }
             self.row_count = new_row_count;
             self.current_len = total;
+            self.active_bitmap_column_count = active_bitmap_column_count;
             return Ok(());
         }
 
@@ -2391,7 +2398,9 @@ impl RowGroupPlanner {
 
         let mut touched_bool_column_count = 0usize;
         let mut touched_fixed8_column_count = 0usize;
-        let mut touched_bitmap_column_count = 0usize;
+        let mut touched_sparse_column_count = 0usize;
+        let mut touched_old_active_bitmap_column_count = 0usize;
+        let mut touched_new_active_bitmap_column_count = 0usize;
         let mut delta =
             qwp_varint_size(new_row_count as u64) - qwp_varint_size(old_row_count as u64);
 
@@ -2405,12 +2414,21 @@ impl RowGroupPlanner {
                 | ColumnKind::Decimal
                 | ColumnKind::DoubleArray
                 | ColumnKind::TimestampMicros
-                | ColumnKind::TimestampNanos => touched_bitmap_column_count += 1,
+                | ColumnKind::TimestampNanos => {
+                    touched_sparse_column_count += 1;
+                    if uses_null_bitmap(col.supports_sparse_nulls, old_row_count, undo.non_null_count)
+                    {
+                        touched_old_active_bitmap_column_count += 1;
+                    }
+                    if col.uses_null_bitmap(new_row_count) {
+                        touched_new_active_bitmap_column_count += 1;
+                    }
+                }
             }
             delta += col.payload_len(new_row_count)?
                 - ColumnStats::payload_len_parts(
                     col.kind,
-                    col.base_nullable,
+                    col.supports_sparse_nulls,
                     old_row_count,
                     undo.non_null_count,
                     undo.variable_data_len,
@@ -2422,23 +2440,40 @@ impl RowGroupPlanner {
 
         debug_assert!(touched_bool_column_count <= old_bool_column_count);
         debug_assert!(touched_fixed8_column_count <= old_fixed8_column_count);
-        debug_assert!(touched_bitmap_column_count <= old_bitmap_column_count);
+        debug_assert!(touched_sparse_column_count <= old_sparse_column_count);
+        debug_assert!(touched_old_active_bitmap_column_count <= old_active_bitmap_column_count);
 
         delta += (old_bool_column_count - touched_bool_column_count) * packed_delta;
         delta += (old_fixed8_column_count - touched_fixed8_column_count) * 8;
-        delta += (old_bitmap_column_count - touched_bitmap_column_count) * bitmap_delta;
+        let old_dense_sparse_column_count =
+            old_sparse_column_count - old_active_bitmap_column_count;
+        let touched_old_dense_sparse_column_count =
+            touched_sparse_column_count - touched_old_active_bitmap_column_count;
+        debug_assert!(touched_old_dense_sparse_column_count <= old_dense_sparse_column_count);
+        delta += (old_active_bitmap_column_count - touched_old_active_bitmap_column_count)
+            * bitmap_delta;
+        delta += (old_dense_sparse_column_count - touched_old_dense_sparse_column_count)
+            * bitmap_bytes(new_row_count);
 
+        let mut new_bitmap_column_count = 0usize;
         if self.columns.len() > old_column_count {
             delta += qwp_varint_size(self.columns.len() as u64)
                 - qwp_varint_size(old_column_count as u64);
             delta += self.total_schema_len - old_total_schema_len;
             for col in &self.columns[old_column_count..] {
                 delta += col.payload_len(new_row_count)?;
+                if col.uses_null_bitmap(new_row_count) {
+                    new_bitmap_column_count += 1;
+                }
             }
         }
 
         self.row_count = new_row_count;
         self.current_len += delta;
+        self.active_bitmap_column_count = (old_sparse_column_count - touched_sparse_column_count)
+            + touched_new_active_bitmap_column_count
+            + new_bitmap_column_count;
+        debug_assert!(self.active_bitmap_column_count <= self.sparse_column_count);
         Ok(())
     }
 
@@ -2603,7 +2638,7 @@ impl RowGroupPlanner {
             | ColumnKind::Decimal
             | ColumnKind::DoubleArray
             | ColumnKind::TimestampMicros
-            | ColumnKind::TimestampNanos => self.bitmap_column_count += 1,
+            | ColumnKind::TimestampNanos => self.sparse_column_count += 1,
         }
         self.total_schema_len += col.cached_schema_len;
         self.columns.push(col);
@@ -2665,6 +2700,10 @@ fn packed_bytes(value_count: usize) -> usize {
 
 fn bitmap_bytes(value_count: usize) -> usize {
     value_count.div_ceil(8)
+}
+
+fn uses_null_bitmap(supports_sparse_nulls: bool, row_count: usize, non_null_count: u32) -> bool {
+    supports_sparse_nulls && (non_null_count as usize) < row_count
 }
 
 fn kind_supports_sparse_nulls(kind: ColumnKind) -> bool {
@@ -2740,7 +2779,7 @@ fn encode_row_group_from_scratch(
     // Schema
     for col in &planner.columns {
         write_qwp_bytes(out, &name_bytes[col.name.0.as_range()]);
-        out.push(wire_type_byte(col.kind, col.is_nullable(row_count)));
+        out.push(wire_type_byte(col.kind, col.uses_null_bitmap(row_count)));
     }
 
     // Column payloads
@@ -2859,12 +2898,12 @@ fn encode_column_from_cells(
     value_bytes: &[u8],
     out: &mut Vec<u8>,
 ) -> crate::Result<()> {
-    let nullable = col.is_nullable(row_count);
+    let uses_null_bitmap = col.uses_null_bitmap(row_count);
 
-    out.push(u8::from(nullable));
+    out.push(u8::from(uses_null_bitmap));
 
     // Null bitmap
-    if nullable {
+    if uses_null_bitmap {
         let mut packed = 0u8;
         let mut bit_idx = 0u8;
         for maybe_cell in GapFillIter::new(cells, col.cell_head, row_count)? {
@@ -2884,12 +2923,14 @@ fn encode_column_from_cells(
     }
 
     match col.kind {
-        // Bool, I64 and F64 are never nullable in QWP: `base_nullable` is
-        // false and `kind_supports_sparse_nulls` excludes them.  Gaps are
-        // filled with sentinels (false / i64::MIN / NaN) matching QuestDB's
-        // internal storage, so no null bitmap is needed.
+        // Bool, I64 and F64 never use null bitmaps in QWP. Gaps are filled
+        // with sentinels (false / i64::MIN / NaN) matching QuestDB's internal
+        // storage, so no null bitmap is needed.
         ColumnKind::Bool => {
-            debug_assert!(!nullable, "Bool columns must not be nullable in QWP");
+            debug_assert!(
+                !uses_null_bitmap,
+                "Bool columns must not use null bitmaps in QWP"
+            );
             let mut packed = 0u8;
             let mut bit_idx = 0u8;
             for maybe_cell in GapFillIter::new(cells, col.cell_head, row_count)? {
@@ -2909,7 +2950,10 @@ fn encode_column_from_cells(
         }
 
         ColumnKind::I64 => {
-            debug_assert!(!nullable, "I64 columns must not be nullable in QWP");
+            debug_assert!(
+                !uses_null_bitmap,
+                "I64 columns must not use null bitmaps in QWP"
+            );
             for maybe_cell in GapFillIter::new(cells, col.cell_head, row_count)? {
                 let v = match maybe_cell.map(|c| c.value) {
                     Some(ValueRef::I64(v)) => v,
@@ -2920,7 +2964,10 @@ fn encode_column_from_cells(
         }
 
         ColumnKind::F64 => {
-            debug_assert!(!nullable, "F64 columns must not be nullable in QWP");
+            debug_assert!(
+                !uses_null_bitmap,
+                "F64 columns must not use null bitmaps in QWP"
+            );
             for maybe_cell in GapFillIter::new(cells, col.cell_head, row_count)? {
                 let v = match maybe_cell.map(|c| c.value) {
                     Some(ValueRef::F64(v)) => v,
@@ -3026,7 +3073,7 @@ fn to_designated_ts(timestamp: Timestamp) -> DesignatedTs {
 mod tests {
     use super::*;
     use crate::ingress::{TimestampMicros, TimestampNanos};
-    use crate::tests::qwp_decode::{DecodedValue, decode_datagram};
+    use crate::tests::qwp_decode::{DecodedDatagram, DecodedValue, decode_datagram};
     use proptest::prelude::*;
     use std::collections::BTreeMap;
 
@@ -3093,6 +3140,9 @@ mod tests {
         has_i64: bool,
         has_f64: bool,
         has_string: bool,
+        has_decimal: bool,
+        decimal_scale: Option<u8>,
+        has_array: bool,
         ts_kind: Option<PropTsKind>,
         designated_ts_kind: Option<PropTsKind>,
     }
@@ -3104,6 +3154,8 @@ mod tests {
         i64_value: Option<i64>,
         f64_value: Option<f64>,
         string_value: Option<String>,
+        decimal_value: Option<String>,
+        array_values: Option<Vec<f64>>,
         ts_value: Option<i64>,
         designated_ts: Option<i64>,
     }
@@ -3126,6 +3178,8 @@ mod tests {
         I64(i64),
         F64(u64),
         String(String),
+        Decimal { scale: u8, unscaled_be: Vec<u8> },
+        F64Array { shape: Vec<usize>, values: Vec<u64> },
         TimestampMicros(i64),
         TimestampNanos(i64),
         Null,
@@ -3137,6 +3191,8 @@ mod tests {
         I64,
         F64,
         String,
+        Decimal,
+        F64Array,
         TimestampMicros,
         TimestampNanos,
     }
@@ -3148,6 +3204,9 @@ mod tests {
         i64_col: bool,
         f64_col: bool,
         string_col: bool,
+        decimal_col: bool,
+        decimal_scale: u8,
+        array_col: bool,
         ts_col: Option<PropTsKind>,
         designated_ts: Option<PropTsKind>,
     }
@@ -3178,6 +3237,43 @@ mod tests {
             .boxed()
     }
 
+    fn prop_decimal_scale_strategy() -> BoxedStrategy<u8> {
+        (0u8..=3u8).boxed()
+    }
+
+    fn format_decimal_string(unscaled: i64, scale: u8) -> String {
+        if scale == 0 {
+            return unscaled.to_string();
+        }
+
+        let negative = unscaled < 0;
+        let digits = unscaled.abs().to_string();
+        let scale_usize = scale as usize;
+        let mut out = String::new();
+        if negative {
+            out.push('-');
+        }
+        if digits.len() <= scale_usize {
+            out.push_str("0.");
+            for _ in 0..(scale_usize - digits.len()) {
+                out.push('0');
+            }
+            out.push_str(&digits);
+        } else {
+            let split = digits.len() - scale_usize;
+            out.push_str(&digits[..split]);
+            out.push('.');
+            out.push_str(&digits[split..]);
+        }
+        out
+    }
+
+    fn prop_decimal_string_with_scale(scale: u8) -> BoxedStrategy<String> {
+        (-50_000i64..=50_000i64)
+            .prop_map(move |unscaled| format_decimal_string(unscaled, scale))
+            .boxed()
+    }
+
     fn prop_row_count_strategy() -> BoxedStrategy<usize> {
         prop_oneof![
             8 => 1usize..=4usize,
@@ -3197,8 +3293,11 @@ mod tests {
             any::<bool>(),
             any::<bool>(),
             any::<bool>(),
+            any::<bool>(),
+            any::<bool>(),
             prop_oneof![2 => Just(None), 1 => prop_ts_kind_strategy().prop_map(Some)],
             prop_oneof![2 => Just(None), 1 => prop_ts_kind_strategy().prop_map(Some)],
+            prop_decimal_scale_strategy(),
         )
             .prop_map(
                 |(
@@ -3208,8 +3307,11 @@ mod tests {
                     has_i64,
                     has_f64,
                     has_string,
+                    has_decimal,
+                    has_array,
                     ts_kind,
                     designated_ts_kind,
+                    decimal_scale,
                 )| PropSegmentConfig {
                     table,
                     has_symbol,
@@ -3217,6 +3319,9 @@ mod tests {
                     has_i64,
                     has_f64,
                     has_string,
+                    has_decimal,
+                    decimal_scale: has_decimal.then_some(decimal_scale),
+                    has_array,
                     ts_kind,
                     designated_ts_kind,
                 },
@@ -3227,6 +3332,8 @@ mod tests {
                     || cfg.has_i64
                     || cfg.has_f64
                     || cfg.has_string
+                    || cfg.has_decimal
+                    || cfg.has_array
                     || cfg.ts_kind.is_some()
             })
             .boxed()
@@ -3278,6 +3385,24 @@ mod tests {
         } else {
             Just(None::<String>).boxed()
         };
+        let decimal_value = if let Some(scale) = cfg.decimal_scale {
+            prop_oneof![
+                1 => Just(None::<String>),
+                3 => prop_decimal_string_with_scale(scale).prop_map(Some),
+            ]
+            .boxed()
+        } else {
+            Just(None::<String>).boxed()
+        };
+        let array_values = if cfg.has_array {
+            prop_oneof![
+                1 => Just(None::<Vec<f64>>),
+                3 => prop::collection::vec(prop_f64_strategy(), 0..=4).prop_map(Some),
+            ]
+            .boxed()
+        } else {
+            Just(None::<Vec<f64>>).boxed()
+        };
         let ts_value = if cfg.ts_kind.is_some() {
             prop_oneof![
                 1 => Just(None::<i64>),
@@ -3303,6 +3428,8 @@ mod tests {
             i64_value,
             f64_value,
             string_value,
+            decimal_value,
+            array_values,
             ts_value,
             designated_ts,
         )
@@ -3313,6 +3440,8 @@ mod tests {
                     i64_value,
                     f64_value,
                     string_value,
+                    decimal_value,
+                    array_values,
                     ts_value,
                     designated_ts,
                 )| PropRow {
@@ -3321,6 +3450,8 @@ mod tests {
                     i64_value,
                     f64_value,
                     string_value,
+                    decimal_value,
+                    array_values,
                     ts_value,
                     designated_ts,
                 },
@@ -3331,6 +3462,8 @@ mod tests {
                     || row.i64_value.is_some()
                     || row.f64_value.is_some()
                     || row.string_value.is_some()
+                    || row.decimal_value.is_some()
+                    || row.array_values.is_some()
                     || row.ts_value.is_some()
             })
             .boxed()
@@ -3370,6 +3503,157 @@ mod tests {
             .boxed()
     }
 
+    fn prop_dense_nullable_row_strategy(cfg: PropSegmentConfig) -> BoxedStrategy<PropRow> {
+        let symbol = if cfg.has_symbol {
+            prop_small_text(8).prop_map(Some).boxed()
+        } else {
+            Just(None::<String>).boxed()
+        };
+        let string_value = if cfg.has_string {
+            prop_small_text(12).prop_map(Some).boxed()
+        } else {
+            Just(None::<String>).boxed()
+        };
+        let decimal_value = if let Some(scale) = cfg.decimal_scale {
+            prop_decimal_string_with_scale(scale).prop_map(Some).boxed()
+        } else {
+            Just(None::<String>).boxed()
+        };
+        let array_values = if cfg.has_array {
+            prop::collection::vec(prop_f64_strategy(), 0..=4)
+                .prop_map(Some)
+                .boxed()
+        } else {
+            Just(None::<Vec<f64>>).boxed()
+        };
+        let ts_value = if cfg.ts_kind.is_some() {
+            (0i64..=2_000).prop_map(Some).boxed()
+        } else {
+            Just(None::<i64>).boxed()
+        };
+        let designated_ts = if cfg.designated_ts_kind.is_some() {
+            (0i64..=2_000).prop_map(Some).boxed()
+        } else {
+            Just(None::<i64>).boxed()
+        };
+
+        (
+            symbol,
+            string_value,
+            decimal_value,
+            array_values,
+            ts_value,
+            designated_ts,
+        )
+            .prop_map(
+                |(
+                    symbol,
+                    string_value,
+                    decimal_value,
+                    array_values,
+                    ts_value,
+                    designated_ts,
+                )| PropRow {
+                    symbol,
+                    bool_value: None,
+                    i64_value: None,
+                    f64_value: None,
+                    string_value,
+                    decimal_value,
+                    array_values,
+                    ts_value,
+                    designated_ts,
+                },
+            )
+            .boxed()
+    }
+
+    fn prop_dense_nullable_segment_strategy() -> BoxedStrategy<PropSegment> {
+        (
+            prop_table_strategy(),
+            any::<bool>(),
+            any::<bool>(),
+            any::<bool>(),
+            any::<bool>(),
+            prop_oneof![Just(None), prop_ts_kind_strategy().prop_map(Some)],
+            prop_oneof![Just(None), prop_ts_kind_strategy().prop_map(Some)],
+            prop_decimal_scale_strategy(),
+        )
+            .prop_map(
+                |(
+                    table,
+                    has_symbol,
+                    has_string,
+                    has_decimal,
+                    has_array,
+                    ts_kind,
+                    designated_ts_kind,
+                    decimal_scale,
+                )| PropSegmentConfig {
+                    table,
+                    has_symbol,
+                    has_bool: false,
+                    has_i64: false,
+                    has_f64: false,
+                    has_string,
+                    has_decimal,
+                    decimal_scale: has_decimal.then_some(decimal_scale),
+                    has_array,
+                    ts_kind,
+                    designated_ts_kind,
+                },
+            )
+            .prop_filter(
+                "segment must include at least one Java-nullable column value",
+                |cfg| {
+                    cfg.has_symbol
+                        || cfg.has_string
+                        || cfg.has_decimal
+                        || cfg.has_array
+                        || cfg.ts_kind.is_some()
+                },
+            )
+            .prop_flat_map(|cfg| {
+                let row_strategy = prop_dense_nullable_row_strategy(cfg.clone());
+                let cfg_for_rows = cfg.clone();
+                prop_row_count_strategy().prop_flat_map(move |row_count| {
+                    let cfg_for_segment = cfg_for_rows.clone();
+                    prop::collection::vec(row_strategy.clone(), row_count..=row_count).prop_map(
+                        move |rows| PropSegment {
+                            config: cfg_for_segment.clone(),
+                            rows,
+                        },
+                    )
+                })
+            })
+            .boxed()
+    }
+
+    fn prop_java_decimal_rejection_pair_strategy() -> BoxedStrategy<(String, String)> {
+        (
+            0u8..=2u8,
+            -5_000i64..=5_000i64,
+            any::<bool>(),
+            0i64..=5_000i64,
+            1u8..=2u8,
+            1u8..=9u8,
+        )
+            .prop_map(
+                |(first_scale, first_unscaled, negative, base, extra_scale, tail_digit)| {
+                    let first = format_decimal_string(first_unscaled, first_scale);
+                    let later_scale = first_scale + extra_scale;
+                    let mut later_unscaled =
+                        base * 10i64.pow(u32::from(extra_scale)) + i64::from(tail_digit);
+                    if negative {
+                        later_unscaled = -later_unscaled;
+                    }
+                    let later = format_decimal_string(later_unscaled, later_scale);
+                    (first, later)
+                },
+            )
+            .boxed()
+    }
+
     fn active_schema(segment: &PropSegment) -> ActiveSegmentSchema {
         let mut schema = ActiveSegmentSchema::default();
         for row in &segment.rows {
@@ -3378,6 +3662,11 @@ mod tests {
             schema.i64_col |= row.i64_value.is_some();
             schema.f64_col |= row.f64_value.is_some();
             schema.string_col |= row.string_value.is_some();
+            if row.decimal_value.is_some() {
+                schema.decimal_col = true;
+                schema.decimal_scale = segment.config.decimal_scale.unwrap_or(0);
+            }
+            schema.array_col |= row.array_values.is_some();
             if row.ts_value.is_some() {
                 schema.ts_col = segment.config.ts_kind;
             }
@@ -3413,6 +3702,12 @@ mod tests {
         }
         if let Some(value) = row.string_value.as_deref() {
             buf.column_str("note", value).unwrap();
+        }
+        if let Some(value) = row.decimal_value.as_deref() {
+            buf.column_dec("price", value).unwrap();
+        }
+        if let Some(values) = row.array_values.as_ref() {
+            buf.column_arr("samples", values).unwrap();
         }
         if let Some(value) = row.ts_value {
             match segment.config.ts_kind.expect("ts value requires ts kind") {
@@ -3483,6 +3778,24 @@ mod tests {
                         },
                     );
                 }
+                if schema.decimal_col {
+                    fields.insert(
+                        "price".to_owned(),
+                        match row.decimal_value.as_deref() {
+                            Some(value) => semantic_decimal_from_text(value),
+                            None => SemanticValue::Null,
+                        },
+                    );
+                }
+                if schema.array_col {
+                    fields.insert(
+                        "samples".to_owned(),
+                        match row.array_values.as_ref() {
+                            Some(values) => semantic_f64_array(values),
+                            None => SemanticValue::Null,
+                        },
+                    );
+                }
                 if let Some(kind) = schema.ts_col {
                     fields.insert(
                         "event_ts".to_owned(),
@@ -3514,6 +3827,51 @@ mod tests {
         match kind {
             PropTsKind::Micros => SemanticValue::TimestampMicros(value),
             PropTsKind::Nanos => SemanticValue::TimestampNanos(value),
+        }
+    }
+
+    fn trim_signed_be(bytes: &[u8]) -> Vec<u8> {
+        if bytes.is_empty() {
+            return vec![0];
+        }
+        let negative = bytes[0] & 0x80 != 0;
+        let mut keep_from = 0usize;
+        while keep_from < bytes.len() - 1 {
+            let current = bytes[keep_from];
+            let next = bytes[keep_from + 1];
+            let should_trim = if negative {
+                current == 0xFF && (next & 0x80) == 0x80
+            } else {
+                current == 0x00 && (next & 0x80) == 0x00
+            };
+            if should_trim {
+                keep_from += 1;
+            } else {
+                break;
+            }
+        }
+        bytes[keep_from..].to_vec()
+    }
+
+    fn semantic_decimal_from_text(value: &str) -> SemanticValue {
+        let decimal = parse_decimal_text(value)
+            .unwrap()
+            .expect("finite generated decimal must parse");
+        let mut be = decimal
+            .wire_bytes_with_scale(decimal.scale)
+            .unwrap()
+            .to_vec();
+        be.reverse();
+        SemanticValue::Decimal {
+            scale: decimal.scale,
+            unscaled_be: trim_signed_be(&be),
+        }
+    }
+
+    fn semantic_f64_array(values: &[f64]) -> SemanticValue {
+        SemanticValue::F64Array {
+            shape: vec![values.len()],
+            values: values.iter().map(|value| value.to_bits()).collect(),
         }
     }
 
@@ -3578,10 +3936,11 @@ mod tests {
                 DecodedValue::I64(_) => return SemanticKind::I64,
                 DecodedValue::F64(_) => return SemanticKind::F64,
                 DecodedValue::Symbol(_) | DecodedValue::String(_) => return SemanticKind::String,
+                DecodedValue::Decimal { .. } => return SemanticKind::Decimal,
+                DecodedValue::F64Array { .. } => return SemanticKind::F64Array,
                 DecodedValue::TimestampMicros(_) => return SemanticKind::TimestampMicros,
                 DecodedValue::TimestampNanos(_) => return SemanticKind::TimestampNanos,
                 DecodedValue::Null => {}
-                other => panic!("unexpected decoded value in property schema inference: {other:?}"),
             }
         }
         panic!(
@@ -3596,6 +3955,8 @@ mod tests {
             SemanticKind::I64 => SemanticValue::I64(i64::MIN),
             SemanticKind::F64 => SemanticValue::F64(f64::NAN.to_bits()),
             SemanticKind::String => SemanticValue::Null,
+            SemanticKind::Decimal => SemanticValue::Null,
+            SemanticKind::F64Array => SemanticValue::Null,
             SemanticKind::TimestampMicros => SemanticValue::Null,
             SemanticKind::TimestampNanos => SemanticValue::Null,
         }
@@ -3609,11 +3970,48 @@ mod tests {
             }
             DecodedValue::I64(value) => SemanticValue::I64(value),
             DecodedValue::F64(value) => SemanticValue::F64(value.to_bits()),
+            DecodedValue::Decimal { scale, unscaled_be } => {
+                SemanticValue::Decimal { scale, unscaled_be }
+            }
+            DecodedValue::F64Array { shape, values } => SemanticValue::F64Array {
+                shape,
+                values: values.into_iter().map(f64::to_bits).collect(),
+            },
             DecodedValue::TimestampMicros(value) => SemanticValue::TimestampMicros(value),
             DecodedValue::TimestampNanos(value) => SemanticValue::TimestampNanos(value),
             DecodedValue::Null => SemanticValue::Null,
-            other => panic!("unexpected decoded value in property test: {other:?}"),
         }
+    }
+
+    fn java_dense_nullable_column_names(cfg: &PropSegmentConfig) -> Vec<&'static str> {
+        let mut names = Vec::new();
+        if cfg.has_symbol {
+            names.push("sym");
+        }
+        if cfg.has_string {
+            names.push("note");
+        }
+        if cfg.has_decimal {
+            names.push("price");
+        }
+        if cfg.has_array {
+            names.push("samples");
+        }
+        if cfg.ts_kind.is_some() {
+            names.push("event_ts");
+        }
+        if cfg.designated_ts_kind.is_some() {
+            names.push("");
+        }
+        names
+    }
+
+    fn encode_unsplit_single_segment(segment: &PropSegment) -> DecodedDatagram {
+        let mut buf = QwpBuffer::new(512);
+        apply_segments(&mut buf, std::slice::from_ref(segment));
+        let datagrams = buf.encode_datagrams(usize::MAX).unwrap();
+        assert_eq!(datagrams.len(), 1, "single segment should stay unsplit");
+        decode_datagram(&datagrams[0]).unwrap()
     }
 
     fn total_rows(segments: &[PropSegment]) -> usize {
@@ -3722,6 +4120,54 @@ mod tests {
 
             let rewound_len: usize = after.iter().map(Vec::len).sum();
             prop_assert_eq!(buf.len(), rewound_len);
+        }
+
+        #[test]
+        fn qwp_prop_java_dense_nullable_columns_skip_null_bitmaps(
+            segment in prop_dense_nullable_segment_strategy(),
+        ) {
+            let decoded = encode_unsplit_single_segment(&segment);
+            for name in java_dense_nullable_column_names(&segment.config) {
+                let column = decoded
+                    .table
+                    .columns
+                    .iter()
+                    .find(|column| column.name == name)
+                    .unwrap_or_else(|| panic!("missing expected column {name:?} in decoded datagram"));
+                prop_assert!(
+                    !column.nullable,
+                    "Java QWP writer uses null_flag=0 when nullCount==0, but Rust emitted a bitmap for column {:?}",
+                    name
+                );
+            }
+        }
+
+        #[test]
+        fn qwp_prop_java_decimal_first_scale_contract(
+            (first, later) in prop_java_decimal_rejection_pair_strategy(),
+        ) {
+            let mut buf = QwpBuffer::new(512);
+            buf.table("trades")
+                .unwrap()
+                .column_dec("price", first.as_str())
+                .unwrap()
+                .at(TimestampMicros::new(1))
+                .unwrap();
+
+            let rust_result = (|| -> crate::Result<()> {
+                buf.table("trades")?
+                    .column_dec("price", later.as_str())?
+                    .at(TimestampMicros::new(2))?;
+                let _ = buf.encode_datagrams(usize::MAX)?;
+                Ok(())
+            })();
+
+            prop_assert!(
+                rust_result.is_err(),
+                "Java QWP sender would reject decimal scale change from {:?} to {:?}, but Rust accepted it",
+                first,
+                later
+            );
         }
     }
 
@@ -5192,6 +5638,99 @@ mod tests {
             let actual = encoded_planner_len(&planner, &buf.name_bytes, &buf.value_bytes, "audit");
             assert_eq!(planner.current_len, actual, "prefix {}", prefix_len);
         }
+    }
+
+    #[test]
+    fn qwp_planner_incremental_len_matches_actual_across_untouched_column_boundaries_dense_sparse_transition_emits_bitmap(
+    ) {
+        let mut planner = RowGroupPlanner::new();
+        let mut buf = QwpBuffer::new(127);
+
+        buf.table("audit")
+            .unwrap()
+            .column_str("venue", "tokyo")
+            .unwrap()
+            .column_i64("qty", 1)
+            .unwrap();
+        buf.at_now().unwrap();
+
+        let row0 = &buf.rows[0];
+        let entries0 = buf.entries_for_row(row0);
+        planner
+            .add_row(
+                row0,
+                entries0,
+                &buf.name_bytes,
+                &buf.value_bytes,
+                "audit".len(),
+            )
+            .unwrap();
+        assert_eq!(planner.current_len, exact_planner_len(&planner, "audit".len()));
+        assert_eq!(
+            planner.current_len,
+            encoded_planner_len(&planner, &buf.name_bytes, &buf.value_bytes, "audit")
+        );
+        assert_eq!(planner.active_bitmap_column_count, 0);
+
+        let mut datagram = Vec::new();
+        encode_row_group_from_scratch(
+            &planner,
+            &buf.name_bytes,
+            &buf.value_bytes,
+            b"audit",
+            &mut datagram,
+        )
+        .unwrap();
+        let decoded = decode_datagram(&datagram).unwrap();
+        let venue = decoded
+            .table
+            .columns
+            .iter()
+            .find(|column| column.name == "venue")
+            .unwrap();
+        assert!(!venue.nullable, "dense first row must skip null bitmap");
+        assert_eq!(decoded.table.rows[0][0], DecodedValue::String("tokyo".to_owned()));
+
+        buf.table("audit").unwrap().column_i64("qty", 2).unwrap();
+        buf.at_now().unwrap();
+
+        let row1 = &buf.rows[1];
+        let entries1 = buf.entries_for_row(row1);
+        planner
+            .add_row(
+                row1,
+                entries1,
+                &buf.name_bytes,
+                &buf.value_bytes,
+                "audit".len(),
+            )
+            .unwrap();
+        assert_eq!(planner.current_len, exact_planner_len(&planner, "audit".len()));
+        assert_eq!(
+            planner.current_len,
+            encoded_planner_len(&planner, &buf.name_bytes, &buf.value_bytes, "audit")
+        );
+        assert_eq!(planner.active_bitmap_column_count, 1);
+
+        datagram.clear();
+        encode_row_group_from_scratch(
+            &planner,
+            &buf.name_bytes,
+            &buf.value_bytes,
+            b"audit",
+            &mut datagram,
+        )
+        .unwrap();
+        let decoded = decode_datagram(&datagram).unwrap();
+        let venue = decoded
+            .table
+            .columns
+            .iter()
+            .find(|column| column.name == "venue")
+            .unwrap();
+        assert!(venue.nullable, "later omission must enable null bitmap");
+        assert_eq!(decoded.table.rows[0][0], DecodedValue::String("tokyo".to_owned()));
+        assert_eq!(decoded.table.rows[1][0], DecodedValue::Null);
     }
 
     #[test]
