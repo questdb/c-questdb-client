@@ -66,9 +66,9 @@ constexpr auto qwp_decimal256_positive_overflow =
 constexpr uint8_t qwp_test_type_boolean = 0x01;
 constexpr uint8_t qwp_test_type_long = 0x05;
 constexpr uint8_t qwp_test_type_double = 0x07;
-constexpr uint8_t qwp_test_type_string = 0x08;
 constexpr uint8_t qwp_test_type_symbol = 0x09;
 constexpr uint8_t qwp_test_type_timestamp = 0x0A;
+constexpr uint8_t qwp_test_type_varchar = 0x0F;
 constexpr uint8_t qwp_test_type_timestamp_nanos = 0x10;
 constexpr size_t qwp_test_message_header_size = 12;
 
@@ -581,7 +581,7 @@ std::vector<qwp_test_decoded_value> qwp_test_read_column_values(
         }
         return values;
     }
-    case qwp_test_type_string:
+    case qwp_test_type_varchar:
     {
         std::vector<int32_t> offsets;
         offsets.reserve(non_null_count + 1);
@@ -2574,7 +2574,7 @@ TEST_CASE("line_sender c api qwpudp decimal signed boundaries")
     CHECK(decoded.row_count == 2);
     CHECK(decoded.column.name == "price");
     CHECK(decoded.column.type_code == 0x15);
-    CHECK(decoded.nullable);
+    CHECK_FALSE(decoded.nullable);
     CHECK(decoded.scale == 0);
     REQUIRE(decoded.values.size() == 2);
     REQUIRE(decoded.values[0].has_value());
@@ -2875,7 +2875,7 @@ TEST_CASE("line_sender c++ qwpudp decimal signed boundaries")
     CHECK(decoded.row_count == 2);
     CHECK(decoded.column.name == "price");
     CHECK(decoded.column.type_code == 0x15);
-    CHECK(decoded.nullable);
+    CHECK_FALSE(decoded.nullable);
     CHECK(decoded.scale == 0);
     REQUIRE(decoded.values.size() == 2);
     REQUIRE(decoded.values[0].has_value());
@@ -3334,18 +3334,18 @@ TEST_CASE("line_sender c++ qwpudp all column types with designated timestamp")
     CHECK(decoded.table_name == "sensor_data");
     CHECK(decoded.row_count == 1);
     qwp_check_column_count(decoded, 8);
-    qwp_check_column(decoded, "location", qwp_test_type_symbol, true);
+    qwp_check_column(decoded, "location", qwp_test_type_symbol, false);
     qwp_check_column(decoded, "active", qwp_test_type_boolean, false);
     qwp_check_column(decoded, "count", qwp_test_type_long, false);
     qwp_check_column(decoded, "temperature", qwp_test_type_double, false);
-    qwp_check_column(decoded, "label", qwp_test_type_string, true);
+    qwp_check_column(decoded, "label", qwp_test_type_varchar, false);
     qwp_check_column(
         decoded,
         "event_ts",
         qwp_test_type_timestamp_nanos,
-        true);
-    qwp_check_column(decoded, "sample_ts", qwp_test_type_timestamp, true);
-    qwp_check_column(decoded, "", qwp_test_type_timestamp_nanos, true);
+        false);
+    qwp_check_column(decoded, "sample_ts", qwp_test_type_timestamp, false);
+    qwp_check_column(decoded, "", qwp_test_type_timestamp_nanos, false);
     qwp_expect_symbol(qwp_cell(decoded, 0, "location"), "NYC");
     qwp_expect_bool(qwp_cell(decoded, 0, "active"), true);
     qwp_expect_i64(qwp_cell(decoded, 0, "count"), 42);
@@ -3377,9 +3377,9 @@ TEST_CASE("line_sender c++ qwpudp at_micros designated timestamp")
     CHECK(decoded.table_name == "ticks");
     CHECK(decoded.row_count == 1);
     qwp_check_column_count(decoded, 3);
-    qwp_check_column(decoded, "sym", qwp_test_type_symbol, true);
+    qwp_check_column(decoded, "sym", qwp_test_type_symbol, false);
     qwp_check_column(decoded, "px", qwp_test_type_double, false);
-    qwp_check_column(decoded, "", qwp_test_type_timestamp, true);
+    qwp_check_column(decoded, "", qwp_test_type_timestamp, false);
     qwp_expect_symbol(qwp_cell(decoded, 0, "sym"), "AAPL");
     qwp_expect_f64(qwp_cell(decoded, 0, "px"), 150.25);
     qwp_expect_timestamp_micros(qwp_cell(decoded, 0, ""), 5000000);
@@ -3421,7 +3421,7 @@ TEST_CASE("line_sender c++ qwpudp sparse columns across rows")
     CHECK(decoded.table_name == "trades");
     CHECK(decoded.row_count == 3);
     qwp_check_column_count(decoded, 4);
-    qwp_check_column(decoded, "sym", qwp_test_type_symbol, true);
+    qwp_check_column(decoded, "sym", qwp_test_type_symbol, false);
     qwp_check_column(decoded, "qty", qwp_test_type_long, false);
     qwp_check_column(decoded, "active", qwp_test_type_boolean, false);
     qwp_check_column(decoded, "px", qwp_test_type_double, false);
@@ -3473,21 +3473,21 @@ TEST_CASE("line_sender c++ qwpudp multiple tables in one flush")
     CHECK(d1.table_name == "trades");
     CHECK(d1.row_count == 1);
     qwp_check_column_count(d1, 2);
-    qwp_check_column(d1, "sym", qwp_test_type_symbol, true);
+    qwp_check_column(d1, "sym", qwp_test_type_symbol, false);
     qwp_check_column(d1, "qty", qwp_test_type_long, false);
     qwp_expect_symbol(qwp_cell(d1, 0, "sym"), "ETH-USD");
     qwp_expect_i64(qwp_cell(d1, 0, "qty"), 4);
     CHECK(d2.table_name == "quotes");
     CHECK(d2.row_count == 1);
     qwp_check_column_count(d2, 2);
-    qwp_check_column(d2, "sym", qwp_test_type_symbol, true);
+    qwp_check_column(d2, "sym", qwp_test_type_symbol, false);
     qwp_check_column(d2, "bid", qwp_test_type_double, false);
     qwp_expect_symbol(qwp_cell(d2, 0, "sym"), "BTC-USD");
     qwp_expect_f64(qwp_cell(d2, 0, "bid"), 44000.0);
     CHECK(d3.table_name == "trades");
     CHECK(d3.row_count == 1);
     qwp_check_column_count(d3, 2);
-    qwp_check_column(d3, "sym", qwp_test_type_symbol, true);
+    qwp_check_column(d3, "sym", qwp_test_type_symbol, false);
     qwp_check_column(d3, "qty", qwp_test_type_long, false);
     qwp_expect_symbol(qwp_cell(d3, 0, "sym"), "SOL-USD");
     qwp_expect_i64(qwp_cell(d3, 0, "qty"), 7);
@@ -3519,7 +3519,7 @@ TEST_CASE("line_sender c++ qwpudp clear and reuse buffer")
     CHECK(decoded.table_name == "t");
     CHECK(decoded.row_count == 1);
     qwp_check_column_count(decoded, 2);
-    qwp_check_column(decoded, "s", qwp_test_type_symbol, true);
+    qwp_check_column(decoded, "s", qwp_test_type_symbol, false);
     qwp_check_column(decoded, "x", qwp_test_type_long, false);
     qwp_expect_symbol(qwp_cell(decoded, 0, "s"), "b");
     qwp_expect_i64(qwp_cell(decoded, 0, "x"), 2);
@@ -3767,17 +3767,17 @@ TEST_CASE("line_sender c api qwpudp all column types with at_nanos")
     CHECK(decoded.table_name == "sensors");
     CHECK(decoded.row_count == 1);
     qwp_check_column_count(decoded, 7);
-    qwp_check_column(decoded, "loc", qwp_test_type_symbol, true);
+    qwp_check_column(decoded, "loc", qwp_test_type_symbol, false);
     qwp_check_column(decoded, "active", qwp_test_type_boolean, false);
     qwp_check_column(decoded, "count", qwp_test_type_long, false);
     qwp_check_column(decoded, "temp", qwp_test_type_double, false);
-    qwp_check_column(decoded, "label", qwp_test_type_string, true);
+    qwp_check_column(decoded, "label", qwp_test_type_varchar, false);
     qwp_check_column(
         decoded,
         "event_ts",
         qwp_test_type_timestamp_nanos,
-        true);
-    qwp_check_column(decoded, "", qwp_test_type_timestamp_nanos, true);
+        false);
+    qwp_check_column(decoded, "", qwp_test_type_timestamp_nanos, false);
     qwp_expect_symbol(qwp_cell(decoded, 0, "loc"), "NYC");
     qwp_expect_bool(qwp_cell(decoded, 0, "active"), true);
     qwp_expect_i64(qwp_cell(decoded, 0, "count"), 100);
@@ -3824,7 +3824,7 @@ TEST_CASE("line_sender c api qwpudp at_micros designated timestamp")
     CHECK(decoded.row_count == 1);
     qwp_check_column_count(decoded, 2);
     qwp_check_column(decoded, "px", qwp_test_type_double, false);
-    qwp_check_column(decoded, "", qwp_test_type_timestamp, true);
+    qwp_check_column(decoded, "", qwp_test_type_timestamp, false);
     qwp_expect_f64(qwp_cell(decoded, 0, "px"), 150.25);
     qwp_expect_timestamp_micros(qwp_cell(decoded, 0, ""), 5000000);
 }
@@ -3886,7 +3886,7 @@ TEST_CASE("line_sender c api qwpudp sparse columns across rows")
     CHECK(decoded.table_name == "trades");
     CHECK(decoded.row_count == 3);
     qwp_check_column_count(decoded, 4);
-    qwp_check_column(decoded, "sym", qwp_test_type_symbol, true);
+    qwp_check_column(decoded, "sym", qwp_test_type_symbol, false);
     qwp_check_column(decoded, "qty", qwp_test_type_long, false);
     qwp_check_column(decoded, "active", qwp_test_type_boolean, false);
     qwp_check_column(decoded, "px", qwp_test_type_double, false);
