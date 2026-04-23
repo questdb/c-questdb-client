@@ -769,13 +769,8 @@ impl QwpSizeHint {
             let previous_len = self.planner.current_len;
             let cp = self.planner.checkpoint();
             if let Err(err) =
-                self.planner.add_row(
-                    row,
-                    row_entries,
-                    name_bytes,
-                    value_bytes,
-                    table_name.len(),
-                )
+                self.planner
+                    .add_row(row, row_entries, name_bytes, value_bytes, table_name.len())
             {
                 self.planner.rollback(cp);
                 return Err(err);
@@ -786,13 +781,8 @@ impl QwpSizeHint {
         }
 
         self.scratch.clear();
-        self.scratch.add_row(
-            row,
-            row_entries,
-            name_bytes,
-            value_bytes,
-            table_name.len(),
-        )?;
+        self.scratch
+            .add_row(row, row_entries, name_bytes, value_bytes, table_name.len())?;
         self.committed_len += self.scratch.current_len;
 
         if self.group_table.is_some() {
@@ -3036,6 +3026,9 @@ fn to_designated_ts(timestamp: Timestamp) -> DesignatedTs {
 mod tests {
     use super::*;
     use crate::ingress::{TimestampMicros, TimestampNanos};
+    use crate::tests::qwp_decode::{DecodedValue, decode_datagram};
+    use proptest::prelude::*;
+    use std::collections::BTreeMap;
 
     fn exact_planner_len(planner: &RowGroupPlanner, table_name_len: usize) -> usize {
         if planner.row_count == 0 {
@@ -3067,6 +3060,583 @@ mod tests {
         datagram.len()
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum PropTable {
+        Trades,
+        Quotes,
+        Metrics,
+        Audit,
+    }
+
+    impl PropTable {
+        fn as_str(self) -> &'static str {
+            match self {
+                Self::Trades => "trades",
+                Self::Quotes => "quotes",
+                Self::Metrics => "metrics",
+                Self::Audit => "audit",
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum PropTsKind {
+        Micros,
+        Nanos,
+    }
+
+    #[derive(Clone, Debug)]
+    struct PropSegmentConfig {
+        table: PropTable,
+        has_symbol: bool,
+        has_bool: bool,
+        has_i64: bool,
+        has_f64: bool,
+        has_string: bool,
+        ts_kind: Option<PropTsKind>,
+        designated_ts_kind: Option<PropTsKind>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct PropRow {
+        symbol: Option<String>,
+        bool_value: Option<bool>,
+        i64_value: Option<i64>,
+        f64_value: Option<f64>,
+        string_value: Option<String>,
+        ts_value: Option<i64>,
+        designated_ts: Option<i64>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct PropSegment {
+        config: PropSegmentConfig,
+        rows: Vec<PropRow>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct SemanticRow {
+        table: String,
+        fields: BTreeMap<String, SemanticValue>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum SemanticValue {
+        Bool(bool),
+        I64(i64),
+        F64(u64),
+        String(String),
+        TimestampMicros(i64),
+        TimestampNanos(i64),
+        Null,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum SemanticKind {
+        Bool,
+        I64,
+        F64,
+        String,
+        TimestampMicros,
+        TimestampNanos,
+    }
+
+    #[derive(Clone, Copy, Debug, Default)]
+    struct ActiveSegmentSchema {
+        symbol: bool,
+        bool_col: bool,
+        i64_col: bool,
+        f64_col: bool,
+        string_col: bool,
+        ts_col: Option<PropTsKind>,
+        designated_ts: Option<PropTsKind>,
+    }
+
+    fn prop_table_strategy() -> BoxedStrategy<PropTable> {
+        prop_oneof![
+            Just(PropTable::Trades),
+            Just(PropTable::Quotes),
+            Just(PropTable::Metrics),
+            Just(PropTable::Audit),
+        ]
+        .boxed()
+    }
+
+    fn prop_ts_kind_strategy() -> BoxedStrategy<PropTsKind> {
+        prop_oneof![Just(PropTsKind::Micros), Just(PropTsKind::Nanos)].boxed()
+    }
+
+    fn prop_small_text(max_len: usize) -> BoxedStrategy<String> {
+        proptest::string::string_regex(&format!("[a-z0-9_-]{{0,{max_len}}}"))
+            .unwrap()
+            .boxed()
+    }
+
+    fn prop_f64_strategy() -> BoxedStrategy<f64> {
+        ((-500i32..=500), (0u8..=3))
+            .prop_map(|(whole, frac)| f64::from(whole) + f64::from(frac) / 4.0)
+            .boxed()
+    }
+
+    fn prop_row_count_strategy() -> BoxedStrategy<usize> {
+        prop_oneof![
+            8 => 1usize..=4usize,
+            2 => 5usize..=8usize,
+            1 => Just(15usize),
+            1 => Just(16usize),
+            1 => Just(17usize),
+        ]
+        .boxed()
+    }
+
+    fn prop_segment_config_strategy() -> BoxedStrategy<PropSegmentConfig> {
+        (
+            prop_table_strategy(),
+            any::<bool>(),
+            any::<bool>(),
+            any::<bool>(),
+            any::<bool>(),
+            any::<bool>(),
+            prop_oneof![2 => Just(None), 1 => prop_ts_kind_strategy().prop_map(Some)],
+            prop_oneof![2 => Just(None), 1 => prop_ts_kind_strategy().prop_map(Some)],
+        )
+            .prop_map(
+                |(
+                    table,
+                    has_symbol,
+                    has_bool,
+                    has_i64,
+                    has_f64,
+                    has_string,
+                    ts_kind,
+                    designated_ts_kind,
+                )| PropSegmentConfig {
+                    table,
+                    has_symbol,
+                    has_bool,
+                    has_i64,
+                    has_f64,
+                    has_string,
+                    ts_kind,
+                    designated_ts_kind,
+                },
+            )
+            .prop_filter("segment must expose at least one actual field", |cfg| {
+                cfg.has_symbol
+                    || cfg.has_bool
+                    || cfg.has_i64
+                    || cfg.has_f64
+                    || cfg.has_string
+                    || cfg.ts_kind.is_some()
+            })
+            .boxed()
+    }
+
+    fn prop_row_strategy(cfg: PropSegmentConfig) -> BoxedStrategy<PropRow> {
+        let symbol = if cfg.has_symbol {
+            prop_oneof![
+                1 => Just(None::<String>),
+                3 => prop_small_text(8).prop_map(Some),
+            ]
+            .boxed()
+        } else {
+            Just(None::<String>).boxed()
+        };
+        let bool_value = if cfg.has_bool {
+            prop_oneof![
+                1 => Just(None::<bool>),
+                3 => any::<bool>().prop_map(Some),
+            ]
+            .boxed()
+        } else {
+            Just(None::<bool>).boxed()
+        };
+        let i64_value = if cfg.has_i64 {
+            prop_oneof![
+                1 => Just(None::<i64>),
+                3 => (-2_000i64..=2_000).prop_map(Some),
+            ]
+            .boxed()
+        } else {
+            Just(None::<i64>).boxed()
+        };
+        let f64_value = if cfg.has_f64 {
+            prop_oneof![
+                1 => Just(None::<f64>),
+                3 => prop_f64_strategy().prop_map(Some),
+            ]
+            .boxed()
+        } else {
+            Just(None::<f64>).boxed()
+        };
+        let string_value = if cfg.has_string {
+            prop_oneof![
+                1 => Just(None::<String>),
+                3 => prop_small_text(12).prop_map(Some),
+            ]
+            .boxed()
+        } else {
+            Just(None::<String>).boxed()
+        };
+        let ts_value = if cfg.ts_kind.is_some() {
+            prop_oneof![
+                1 => Just(None::<i64>),
+                3 => (-2_000i64..=2_000).prop_map(Some),
+            ]
+            .boxed()
+        } else {
+            Just(None::<i64>).boxed()
+        };
+        let designated_ts = if cfg.designated_ts_kind.is_some() {
+            prop_oneof![
+                1 => Just(None::<i64>),
+                3 => (0i64..=2_000).prop_map(Some),
+            ]
+            .boxed()
+        } else {
+            Just(None::<i64>).boxed()
+        };
+
+        (
+            symbol,
+            bool_value,
+            i64_value,
+            f64_value,
+            string_value,
+            ts_value,
+            designated_ts,
+        )
+            .prop_map(
+                |(
+                    symbol,
+                    bool_value,
+                    i64_value,
+                    f64_value,
+                    string_value,
+                    ts_value,
+                    designated_ts,
+                )| PropRow {
+                    symbol,
+                    bool_value,
+                    i64_value,
+                    f64_value,
+                    string_value,
+                    ts_value,
+                    designated_ts,
+                },
+            )
+            .prop_filter("row must commit at least one field", |row| {
+                row.symbol.is_some()
+                    || row.bool_value.is_some()
+                    || row.i64_value.is_some()
+                    || row.f64_value.is_some()
+                    || row.string_value.is_some()
+                    || row.ts_value.is_some()
+            })
+            .boxed()
+    }
+
+    fn prop_segment_strategy() -> BoxedStrategy<PropSegment> {
+        prop_segment_config_strategy()
+            .prop_flat_map(|cfg| {
+                let row_strategy = prop_row_strategy(cfg.clone());
+                let cfg_for_rows = cfg.clone();
+                prop_row_count_strategy().prop_flat_map(move |row_count| {
+                    let cfg_for_segment = cfg_for_rows.clone();
+                    prop::collection::vec(row_strategy.clone(), row_count..=row_count).prop_map(
+                        move |rows| PropSegment {
+                            config: cfg_for_segment.clone(),
+                            rows,
+                        },
+                    )
+                })
+            })
+            .boxed()
+    }
+
+    fn prop_scenario_strategy(
+        min_segments: usize,
+        max_segments: usize,
+    ) -> BoxedStrategy<Vec<PropSegment>> {
+        prop::collection::vec(prop_segment_strategy(), min_segments..=max_segments)
+            .prop_filter(
+                "adjacent segments must not target the same table",
+                |segments| {
+                    !segments
+                        .windows(2)
+                        .any(|pair| pair[0].config.table == pair[1].config.table)
+                },
+            )
+            .boxed()
+    }
+
+    fn active_schema(segment: &PropSegment) -> ActiveSegmentSchema {
+        let mut schema = ActiveSegmentSchema::default();
+        for row in &segment.rows {
+            schema.symbol |= row.symbol.is_some();
+            schema.bool_col |= row.bool_value.is_some();
+            schema.i64_col |= row.i64_value.is_some();
+            schema.f64_col |= row.f64_value.is_some();
+            schema.string_col |= row.string_value.is_some();
+            if row.ts_value.is_some() {
+                schema.ts_col = segment.config.ts_kind;
+            }
+            if row.designated_ts.is_some() {
+                schema.designated_ts = segment.config.designated_ts_kind;
+            }
+        }
+        schema
+    }
+
+    fn apply_segments(buf: &mut QwpBuffer, segments: &[PropSegment]) {
+        for segment in segments {
+            for row in &segment.rows {
+                apply_row(buf, segment, row);
+            }
+        }
+    }
+
+    fn apply_row(buf: &mut QwpBuffer, segment: &PropSegment, row: &PropRow) {
+        buf.table(segment.config.table.as_str()).unwrap();
+
+        if let Some(value) = row.symbol.as_deref() {
+            buf.symbol("sym", value).unwrap();
+        }
+        if let Some(value) = row.bool_value {
+            buf.column_bool("flag", value).unwrap();
+        }
+        if let Some(value) = row.i64_value {
+            buf.column_i64("qty", value).unwrap();
+        }
+        if let Some(value) = row.f64_value {
+            buf.column_f64("px", value).unwrap();
+        }
+        if let Some(value) = row.string_value.as_deref() {
+            buf.column_str("note", value).unwrap();
+        }
+        if let Some(value) = row.ts_value {
+            match segment.config.ts_kind.expect("ts value requires ts kind") {
+                PropTsKind::Micros => {
+                    buf.column_ts("event_ts", TimestampMicros::new(value))
+                        .unwrap();
+                }
+                PropTsKind::Nanos => {
+                    buf.column_ts("event_ts", TimestampNanos::new(value))
+                        .unwrap();
+                }
+            }
+        }
+
+        if let Some(value) = row.designated_ts {
+            match segment
+                .config
+                .designated_ts_kind
+                .expect("designated ts value requires ts kind")
+            {
+                PropTsKind::Micros => buf.at(TimestampMicros::new(value)).unwrap(),
+                PropTsKind::Nanos => buf.at(TimestampNanos::new(value)).unwrap(),
+            }
+        } else {
+            buf.at_now().unwrap();
+        }
+    }
+
+    fn semantic_rows_from_segments(segments: &[PropSegment]) -> Vec<SemanticRow> {
+        let mut rows = Vec::new();
+        for segment in segments {
+            let schema = active_schema(segment);
+            for row in &segment.rows {
+                let mut fields = BTreeMap::new();
+                if schema.symbol {
+                    fields.insert(
+                        "sym".to_owned(),
+                        match &row.symbol {
+                            Some(value) => SemanticValue::String(value.clone()),
+                            None => SemanticValue::Null,
+                        },
+                    );
+                }
+                if schema.bool_col {
+                    fields.insert(
+                        "flag".to_owned(),
+                        SemanticValue::Bool(row.bool_value.unwrap_or(false)),
+                    );
+                }
+                if schema.i64_col {
+                    fields.insert(
+                        "qty".to_owned(),
+                        SemanticValue::I64(row.i64_value.unwrap_or(i64::MIN)),
+                    );
+                }
+                if schema.f64_col {
+                    fields.insert(
+                        "px".to_owned(),
+                        SemanticValue::F64(row.f64_value.unwrap_or(f64::NAN).to_bits()),
+                    );
+                }
+                if schema.string_col {
+                    fields.insert(
+                        "note".to_owned(),
+                        match &row.string_value {
+                            Some(value) => SemanticValue::String(value.clone()),
+                            None => SemanticValue::Null,
+                        },
+                    );
+                }
+                if let Some(kind) = schema.ts_col {
+                    fields.insert(
+                        "event_ts".to_owned(),
+                        match row.ts_value {
+                            Some(value) => semantic_ts(kind, value),
+                            None => SemanticValue::Null,
+                        },
+                    );
+                }
+                if let Some(kind) = schema.designated_ts {
+                    fields.insert(
+                        String::new(),
+                        match row.designated_ts {
+                            Some(value) => semantic_ts(kind, value),
+                            None => SemanticValue::Null,
+                        },
+                    );
+                }
+                rows.push(SemanticRow {
+                    table: segment.config.table.as_str().to_owned(),
+                    fields,
+                });
+            }
+        }
+        rows
+    }
+
+    fn semantic_ts(kind: PropTsKind, value: i64) -> SemanticValue {
+        match kind {
+            PropTsKind::Micros => SemanticValue::TimestampMicros(value),
+            PropTsKind::Nanos => SemanticValue::TimestampNanos(value),
+        }
+    }
+
+    fn semantic_rows_from_datagrams(datagrams: &[Vec<u8>]) -> Vec<SemanticRow> {
+        let decoded = datagrams
+            .iter()
+            .map(|datagram| decode_datagram(datagram).unwrap())
+            .collect::<Vec<_>>();
+        let mut rows = Vec::new();
+        let mut group_start = 0usize;
+        while group_start < decoded.len() {
+            let table_name = decoded[group_start].table.name.clone();
+            let mut group_end = group_start + 1;
+            while group_end < decoded.len() && decoded[group_end].table.name == table_name {
+                group_end += 1;
+            }
+            let schema = semantic_group_schema(&decoded[group_start..group_end]);
+            for datagram in &decoded[group_start..group_end] {
+                let columns = &datagram.table.columns;
+                for decoded_row in &datagram.table.rows {
+                    let mut fields = BTreeMap::new();
+                    for (column, value) in columns.iter().zip(decoded_row.iter().cloned()) {
+                        fields.insert(column.name.clone(), semantic_value_from_decoded(value));
+                    }
+                    for (name, kind) in &schema {
+                        fields
+                            .entry(name.clone())
+                            .or_insert_with(|| default_semantic_value(*kind));
+                    }
+                    rows.push(SemanticRow {
+                        table: table_name.clone(),
+                        fields,
+                    });
+                }
+            }
+            group_start = group_end;
+        }
+        rows
+    }
+
+    fn semantic_group_schema(
+        decoded: &[crate::tests::qwp_decode::DecodedDatagram],
+    ) -> BTreeMap<String, SemanticKind> {
+        let mut schema = BTreeMap::new();
+        for datagram in decoded {
+            for (col_idx, column) in datagram.table.columns.iter().enumerate() {
+                schema
+                    .entry(column.name.clone())
+                    .or_insert_with(|| infer_semantic_kind(datagram, col_idx));
+            }
+        }
+        schema
+    }
+
+    fn infer_semantic_kind(
+        datagram: &crate::tests::qwp_decode::DecodedDatagram,
+        col_idx: usize,
+    ) -> SemanticKind {
+        for row in &datagram.table.rows {
+            match &row[col_idx] {
+                DecodedValue::Bool(_) => return SemanticKind::Bool,
+                DecodedValue::I64(_) => return SemanticKind::I64,
+                DecodedValue::F64(_) => return SemanticKind::F64,
+                DecodedValue::Symbol(_) | DecodedValue::String(_) => return SemanticKind::String,
+                DecodedValue::TimestampMicros(_) => return SemanticKind::TimestampMicros,
+                DecodedValue::TimestampNanos(_) => return SemanticKind::TimestampNanos,
+                DecodedValue::Null => {}
+                other => panic!("unexpected decoded value in property schema inference: {other:?}"),
+            }
+        }
+        panic!(
+            "property schema inference saw all-null column {:?} in decoded datagram",
+            datagram.table.columns[col_idx].name
+        );
+    }
+
+    fn default_semantic_value(kind: SemanticKind) -> SemanticValue {
+        match kind {
+            SemanticKind::Bool => SemanticValue::Bool(false),
+            SemanticKind::I64 => SemanticValue::I64(i64::MIN),
+            SemanticKind::F64 => SemanticValue::F64(f64::NAN.to_bits()),
+            SemanticKind::String => SemanticValue::Null,
+            SemanticKind::TimestampMicros => SemanticValue::Null,
+            SemanticKind::TimestampNanos => SemanticValue::Null,
+        }
+    }
+
+    fn semantic_value_from_decoded(value: DecodedValue) -> SemanticValue {
+        match value {
+            DecodedValue::Bool(value) => SemanticValue::Bool(value),
+            DecodedValue::Symbol(value) | DecodedValue::String(value) => {
+                SemanticValue::String(value)
+            }
+            DecodedValue::I64(value) => SemanticValue::I64(value),
+            DecodedValue::F64(value) => SemanticValue::F64(value.to_bits()),
+            DecodedValue::TimestampMicros(value) => SemanticValue::TimestampMicros(value),
+            DecodedValue::TimestampNanos(value) => SemanticValue::TimestampNanos(value),
+            DecodedValue::Null => SemanticValue::Null,
+            other => panic!("unexpected decoded value in property test: {other:?}"),
+        }
+    }
+
+    fn total_rows(segments: &[PropSegment]) -> usize {
+        segments.iter().map(|segment| segment.rows.len()).sum()
+    }
+
+    fn max_single_row_datagram_len(segments: &[PropSegment]) -> usize {
+        let mut max_len = 0;
+        for segment in segments {
+            for row in &segment.rows {
+                let one_row = PropSegment {
+                    config: segment.config.clone(),
+                    rows: vec![row.clone()],
+                };
+                let mut buf = QwpBuffer::new(127);
+                apply_segments(&mut buf, &[one_row]);
+                let datagram = buf.encode_datagrams(usize::MAX).unwrap();
+                max_len = max_len.max(datagram[0].len());
+            }
+        }
+        max_len
+    }
+
     #[test]
     fn qwp_struct_sizes() {
         use std::mem::size_of;
@@ -3079,6 +3649,80 @@ mod tests {
         assert_eq!(size_of::<ColumnUndo>(), 48);
         assert_eq!(size_of::<SymbolLookupUndo>(), 16);
         assert_eq!(size_of::<Option<DesignatedTs>>(), size_of::<DesignatedTs>());
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 48,
+            .. ProptestConfig::default()
+        })]
+
+        #[test]
+        fn qwp_prop_encode_decode_roundtrip(
+            segments in prop_scenario_strategy(1, 4),
+        ) {
+            let expected = semantic_rows_from_segments(&segments);
+            let mut buf = QwpBuffer::new(127);
+            apply_segments(&mut buf, &segments);
+
+            prop_assert_eq!(buf.row_count(), total_rows(&segments));
+
+            let datagrams = buf.encode_datagrams(usize::MAX).unwrap();
+            let actual = semantic_rows_from_datagrams(&datagrams);
+            prop_assert_eq!(actual, expected);
+
+            let encoded_len: usize = datagrams.iter().map(Vec::len).sum();
+            prop_assert_eq!(buf.len(), encoded_len);
+        }
+
+        #[test]
+        fn qwp_prop_split_preserves_semantics(
+            segments in prop_scenario_strategy(1, 4),
+            extra in 0usize..64usize,
+        ) {
+            let mut buf = QwpBuffer::new(127);
+            apply_segments(&mut buf, &segments);
+
+            let unsplit = buf.encode_datagrams(usize::MAX).unwrap();
+            let max_datagram_size = max_single_row_datagram_len(&segments) + extra;
+            let split = buf.encode_datagrams(max_datagram_size).unwrap();
+
+            prop_assert_eq!(
+                semantic_rows_from_datagrams(&split),
+                semantic_rows_from_datagrams(&unsplit),
+            );
+
+            let unsplit_len: usize = unsplit.iter().map(Vec::len).sum();
+            prop_assert_eq!(buf.len(), unsplit_len);
+        }
+
+        #[test]
+        fn qwp_prop_marker_rewind_restores_exact_datagrams(
+            prefix in prop_scenario_strategy(0, 3),
+            suffix in prop_scenario_strategy(1, 3),
+        ) {
+            prop_assume!(
+                prefix.is_empty()
+                    || suffix.is_empty()
+                    || prefix.last().unwrap().config.table != suffix.first().unwrap().config.table
+            );
+
+            let prefix_expected = semantic_rows_from_segments(&prefix);
+            let mut buf = QwpBuffer::new(127);
+            apply_segments(&mut buf, &prefix);
+            let before = buf.encode_datagrams(usize::MAX).unwrap();
+
+            buf.set_marker().unwrap();
+            apply_segments(&mut buf, &suffix);
+            buf.rewind_to_marker().unwrap();
+
+            let after = buf.encode_datagrams(usize::MAX).unwrap();
+            prop_assert_eq!(&after, &before);
+            prop_assert_eq!(semantic_rows_from_datagrams(&after), prefix_expected);
+
+            let rewound_len: usize = after.iter().map(Vec::len).sum();
+            prop_assert_eq!(buf.len(), rewound_len);
+        }
     }
 
     #[test]
@@ -3103,7 +3747,10 @@ mod tests {
     fn qwp_decimal_failed_commit_restores_decimal_value_bytes_len() {
         let mut buf = QwpBuffer::new(127);
 
-        buf.table("trades").unwrap().column_dec("price", "1.2").unwrap();
+        buf.table("trades")
+            .unwrap()
+            .column_dec("price", "1.2")
+            .unwrap();
         assert_eq!(buf.value_bytes.len(), QWP_DECIMAL_MAG_BYTES);
         let value_bytes_cap_before = buf.value_bytes.capacity();
         let price_name = buf.entries.last().unwrap().name;
@@ -3128,7 +3775,10 @@ mod tests {
     fn qwp_decimal_marker_rewind_truncates_decimal_value_bytes() {
         let mut buf = QwpBuffer::new(127);
 
-        buf.table("trades").unwrap().column_dec("price", "1.2").unwrap();
+        buf.table("trades")
+            .unwrap()
+            .column_dec("price", "1.2")
+            .unwrap();
         buf.at_now().unwrap();
         assert_eq!(buf.value_bytes.len(), QWP_DECIMAL_MAG_BYTES);
 
@@ -3427,23 +4077,13 @@ mod tests {
             .unwrap();
         assert_eq!(
             planner.current_len,
-            encoded_planner_len(
-                &planner,
-                &buf.name_bytes,
-                &buf.value_bytes,
-                "t",
-            )
+            encoded_planner_len(&planner, &buf.name_bytes, &buf.value_bytes, "t",)
         );
 
         planner.rollback(cp);
         assert_eq!(
             planner.current_len,
-            encoded_planner_len(
-                &planner,
-                &buf.name_bytes,
-                &buf.value_bytes,
-                "t",
-            )
+            encoded_planner_len(&planner, &buf.name_bytes, &buf.value_bytes, "t",)
         );
 
         let post_rollback_row = &buf.rows[8];
@@ -3458,12 +4098,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             planner.current_len,
-            encoded_planner_len(
-                &planner,
-                &buf.name_bytes,
-                &buf.value_bytes,
-                "t",
-            )
+            encoded_planner_len(&planner, &buf.name_bytes, &buf.value_bytes, "t",)
         );
     }
 
@@ -4412,13 +5047,7 @@ mod tests {
 
         // Add first row
         planner
-            .add_row(
-                row0,
-                entries0,
-                &buf.name_bytes,
-                &buf.value_bytes,
-                "t".len(),
-            )
+            .add_row(row0, entries0, &buf.name_bytes, &buf.value_bytes, "t".len())
             .unwrap();
         let len_after_1 = planner.current_len;
         assert_eq!(planner.row_count(), 1);
@@ -4426,13 +5055,7 @@ mod tests {
         // Checkpoint, add second row, then rollback
         let cp = planner.checkpoint();
         planner
-            .add_row(
-                row1,
-                entries1,
-                &buf.name_bytes,
-                &buf.value_bytes,
-                "t".len(),
-            )
+            .add_row(row1, entries1, &buf.name_bytes, &buf.value_bytes, "t".len())
             .unwrap();
         assert_eq!(planner.row_count(), 2);
         assert!(planner.current_len > len_after_1);
@@ -4467,25 +5090,13 @@ mod tests {
         let entries1 = buf.entries_for_row(row1);
 
         planner
-            .add_row(
-                row0,
-                entries0,
-                &buf.name_bytes,
-                &buf.value_bytes,
-                "t".len(),
-            )
+            .add_row(row0, entries0, &buf.name_bytes, &buf.value_bytes, "t".len())
             .unwrap();
         assert_eq!(planner.columns.len(), 1); // just "x"
 
         let cp = planner.checkpoint();
         planner
-            .add_row(
-                row1,
-                entries1,
-                &buf.name_bytes,
-                &buf.value_bytes,
-                "t".len(),
-            )
+            .add_row(row1, entries1, &buf.name_bytes, &buf.value_bytes, "t".len())
             .unwrap();
         assert_eq!(planner.columns.len(), 2); // "x" + "y"
 
@@ -4525,25 +5136,13 @@ mod tests {
         let entries2 = buf.entries_for_row(row2);
 
         planner
-            .add_row(
-                row0,
-                entries0,
-                &buf.name_bytes,
-                &buf.value_bytes,
-                "t".len(),
-            )
+            .add_row(row0, entries0, &buf.name_bytes, &buf.value_bytes, "t".len())
             .unwrap();
         assert_eq!(planner.current_len, exact_planner_len(&planner, "t".len()));
 
         let cp = planner.checkpoint();
         planner
-            .add_row(
-                row1,
-                entries1,
-                &buf.name_bytes,
-                &buf.value_bytes,
-                "t".len(),
-            )
+            .add_row(row1, entries1, &buf.name_bytes, &buf.value_bytes, "t".len())
             .unwrap();
         assert_eq!(planner.current_len, exact_planner_len(&planner, "t".len()));
 
@@ -4551,13 +5150,7 @@ mod tests {
         assert_eq!(planner.current_len, exact_planner_len(&planner, "t".len()));
 
         planner
-            .add_row(
-                row2,
-                entries2,
-                &buf.name_bytes,
-                &buf.value_bytes,
-                "t".len(),
-            )
+            .add_row(row2, entries2, &buf.name_bytes, &buf.value_bytes, "t".len())
             .unwrap();
         assert_eq!(planner.current_len, exact_planner_len(&planner, "t".len()));
     }
@@ -4596,12 +5189,7 @@ mod tests {
                     "audit".len(),
                 )
                 .unwrap();
-            let actual = encoded_planner_len(
-                &planner,
-                &buf.name_bytes,
-                &buf.value_bytes,
-                "audit",
-            );
+            let actual = encoded_planner_len(&planner, &buf.name_bytes, &buf.value_bytes, "audit");
             assert_eq!(planner.current_len, actual, "prefix {}", prefix_len);
         }
     }
@@ -4647,12 +5235,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(planner.columns.len(), 128);
-        let actual = encoded_planner_len(
-            &planner,
-            &buf.name_bytes,
-            &buf.value_bytes,
-            "wide",
-        );
+        let actual = encoded_planner_len(&planner, &buf.name_bytes, &buf.value_bytes, "wide");
         assert_eq!(planner.current_len, actual);
     }
 

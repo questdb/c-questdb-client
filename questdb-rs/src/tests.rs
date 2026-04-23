@@ -34,7 +34,7 @@ mod mock;
 mod qwp;
 
 #[cfg(feature = "sync-sender-qwp-udp")]
-mod qwp_decode;
+pub(crate) mod qwp_decode;
 
 #[cfg(feature = "sync-sender-qwp-udp")]
 mod qwp_mock;
