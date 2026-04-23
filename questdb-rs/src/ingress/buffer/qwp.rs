@@ -3627,7 +3627,7 @@ mod tests {
             .boxed()
     }
 
-    fn prop_java_decimal_rejection_pair_strategy() -> BoxedStrategy<(String, String)> {
+    fn prop_decimal_scale_widening_pair_strategy() -> BoxedStrategy<(String, String)> {
         (
             0u8..=2u8,
             -5_000i64..=5_000i64,
@@ -3862,6 +3862,21 @@ mod tests {
         be.reverse();
         SemanticValue::Decimal {
             scale: decimal.scale,
+            unscaled_be: trim_signed_be(&be),
+        }
+    }
+
+    fn decoded_decimal_from_text_with_scale(value: &str, target_scale: u8) -> DecodedValue {
+        let decimal = parse_decimal_text(value)
+            .unwrap()
+            .expect("finite generated decimal must parse");
+        let mut be = decimal
+            .wire_bytes_with_scale(target_scale)
+            .unwrap()
+            .to_vec();
+        be.reverse();
+        DecodedValue::Decimal {
+            scale: target_scale,
             unscaled_be: trim_signed_be(&be),
         }
     }
@@ -4141,30 +4156,37 @@ mod tests {
         }
 
         #[test]
-        fn qwp_prop_java_decimal_first_scale_contract(
-            (first, later) in prop_java_decimal_rejection_pair_strategy(),
+        fn qwp_prop_decimal_scale_widening_preserves_values(
+            (first, later) in prop_decimal_scale_widening_pair_strategy(),
         ) {
+            let later_decimal = parse_decimal_text(later.as_str())
+                .unwrap()
+                .expect("finite generated decimal must parse");
             let mut buf = QwpBuffer::new(512);
             buf.table("trades")
                 .unwrap()
                 .column_dec("price", first.as_str())
                 .unwrap()
-                .at(TimestampMicros::new(1))
+                .at_now()
                 .unwrap();
 
-            let rust_result = (|| -> crate::Result<()> {
-                buf.table("trades")?
-                    .column_dec("price", later.as_str())?
-                    .at(TimestampMicros::new(2))?;
-                let _ = buf.encode_datagrams(usize::MAX)?;
-                Ok(())
-            })();
+            buf.table("trades")
+                .unwrap()
+                .column_dec("price", later.as_str())
+                .unwrap()
+                .at_now()
+                .unwrap();
 
-            prop_assert!(
-                rust_result.is_err(),
-                "Java QWP sender would reject decimal scale change from {:?} to {:?}, but Rust accepted it",
-                first,
-                later
+            let datagrams = buf.encode_datagrams(usize::MAX).unwrap();
+            prop_assert_eq!(datagrams.len(), 1);
+
+            let decoded = decode_datagram(&datagrams[0]).expect("datagram should decode");
+            prop_assert_eq!(
+                decoded.table.rows,
+                vec![
+                    vec![decoded_decimal_from_text_with_scale(first.as_str(), later_decimal.scale)],
+                    vec![decoded_decimal_from_text_with_scale(later.as_str(), later_decimal.scale)],
+                ],
             );
         }
     }
