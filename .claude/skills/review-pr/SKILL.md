@@ -141,7 +141,7 @@ Review the diff for:
 
 ## Step 4: Output
 
-Present ONLY verified findings (false positives are excluded). Structure as:
+Present verified findings in the Critical/Moderate/Minor sections, and list dismissed false positives in a dedicated "Downgraded" section so the author can audit the verification reasoning. Structure as:
 
 ### Critical
 Issues that must be fixed before merge. Each must include:
