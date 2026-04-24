@@ -822,8 +822,14 @@ impl SenderBuilder {
     #[cfg(feature = "_sender-qwp-udp")]
     /// Set the maximum datagram size in bytes for QWP/UDP transport.
     ///
-    /// Current QWP/UDP transport support is IPv4-only, so the upper bound
-    /// matches the UDP/IPv4 payload limit.
+    /// `value` must be between 1 and 65,507 bytes, inclusive. The upper bound
+    /// is the UDP/IPv4 payload limit, not a recommended operating size. The
+    /// default is 1,400 bytes, leaving room for IPv4 and UDP headers under a
+    /// common 1,500-byte Ethernet MTU. If you raise this value, keep it within
+    /// the effective UDP payload budget for the path MTU. Oversized IPv4
+    /// packets may be fragmented when fragmentation is allowed, or dropped when
+    /// it is not; fragmented UDP is fragile because losing any fragment loses
+    /// the whole datagram.
     pub fn max_datagram_size(mut self, value: usize) -> Result<Self> {
         if value == 0 {
             return Err(error::fmt!(

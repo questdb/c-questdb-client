@@ -949,6 +949,16 @@ public:
     /**
      * Set the maximum QWP/UDP datagram size in bytes.
      *
+     * `max_datagram_size` must be between 1 and 65,507 bytes, inclusive.
+     * Values outside this range are rejected.
+     * The upper bound is the UDP/IPv4 payload limit, not a recommended
+     * operating size. The default is 1,400 bytes, leaving room for IPv4 and
+     * UDP headers under a common 1,500-byte Ethernet MTU. If you raise this
+     * value, keep it within the effective UDP payload budget for the path MTU.
+     * Oversized IPv4 packets may be fragmented when fragmentation is allowed,
+     * or dropped when it is not; fragmented UDP is fragile because losing any
+     * fragment loses the whole datagram.
+     *
      * This setting is only supported for `protocol::qwpudp`.
      */
     opts& max_datagram_size(size_t max_datagram_size)
