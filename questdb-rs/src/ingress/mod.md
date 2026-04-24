@@ -326,6 +326,45 @@ buffer.table(table_name)?.column_f64(price_name, 39269.98)?.at(TimestampNanos::n
 # }
 ```
 
+## Handling Optional Data (NULLs)
+
+In QuestDB, `NULL` values are represented by simply omitting the column for that specific row. 
+
+To make working with Rust's `Option<T>` ergonomic and keep the fluent builder chain unbroken, the [`Buffer`] API provides `_opt` variants for all column methods (e.g., [`column_str_opt`](Buffer::column_str_opt), [`column_f64_opt`](Buffer::column_f64_opt)). 
+
+If the provided value is `Some(v)`, the column is written normally. If the value is `None`, the method acts as a no-op and skips the column.
+
+**Note on ownership:** For types that implement `Copy` (like `i64`, `f64`, `bool`), you can pass the `Option` directly. For heap-allocated types like `String` or `Vec`, use `.as_ref()` or `.as_deref()` to pass a reference without consuming the original value.
+
+```rust no_run
+# use questdb::Result;
+use questdb::ingress::{Buffer, SenderBuilder, TimestampNanos};
+
+# fn main() -> Result<()> {
+  let mut sender = SenderBuilder::from_conf("https::addr=localhost:9000;")?.build()?;
+  let mut buffer = sender.new_buffer();
+  struct SensorData {
+      sensor_id: Option<String>,
+      temperature: Option<f64>,
+      humidity: Option<f64>,
+  }
+
+  let data = SensorData { sensor_id: Some("sensor-1".to_string()), temperature: Some(22.5), humidity: None };
+
+  buffer
+      .table("sensors")?
+      .symbol("location", "factory-1")?
+      // Writes the sensor_id column if it's Some, otherwise skips it (stored as NULL in QuestDB)
+      .symbol_opt("sensor_id", data.sensor_id.as_deref())?
+      // Writes the temperature column
+      .column_f64_opt("temperature", data.temperature)? 
+      // Silently skips the humidity column (stored as NULL in QuestDB)
+      .column_f64_opt("humidity", data.humidity)?       
+      .at(TimestampNanos::now())?;
+#   Ok(())
+# }
+```
+
 ## Decimal Datatype
 
 The [`Buffer::column_dec`](Buffer::column_dec) method supports efficient ingestion of decimal values using several convenient types:
