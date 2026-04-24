@@ -139,3 +139,45 @@ fn test_buffer_opt_array_some_binary_match() -> TestResult {
 
     Ok(())
 }
+
+#[test]
+fn test_every_column_writing_method_has_opt_variant() {
+    // Meta-test: scan buffer.rs and assert every column-writing method has a
+    // matching `_opt` sibling. Catches the case where someone adds a new
+    // method like `uuid` (à la `symbol`) or `column_uuid` without the
+    // `_opt` companion.
+    //
+    // Column writers are identified by the `N: TryInto<ColumnName<'a>>` bound
+    // rather than by name prefix - so `symbol` and any future unprefixed
+    // additions are caught too. The `[^{]*` segment in the writer regex
+    // matches across newlines (it does not exclude `\n`), so it spans
+    // multi-line `where` clauses without needing dotall.
+    let src = include_str!("../ingress/buffer.rs");
+
+    let pub_fn = regex::Regex::new(r"pub fn (\w+)").unwrap();
+    let writer = regex::Regex::new(r"pub fn (\w+)[^{]*TryInto<ColumnName").unwrap();
+
+    let all_pub_fns: std::collections::HashSet<&str> = pub_fn
+        .captures_iter(src)
+        .map(|c| c.get(1).unwrap().as_str())
+        .collect();
+
+    let writers: Vec<&str> = writer
+        .captures_iter(src)
+        .map(|c| c.get(1).unwrap().as_str())
+        .collect();
+
+    // Guard against a wrong include_str! path silently passing the test.
+    assert!(!writers.is_empty(), "no column writers found — wrong path?");
+
+    let missing: Vec<&&str> = writers
+        .iter()
+        .filter(|n| !n.ends_with("_opt"))
+        .filter(|n| !all_pub_fns.contains(format!("{n}_opt").as_str()))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "Buffer column-writing methods missing `_opt` variants: {missing:?}"
+    );
+}

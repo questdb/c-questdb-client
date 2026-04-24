@@ -58,6 +58,7 @@ chrono = "0.4.31"
 tempfile = "3"
 webpki-roots = "1.0.1"
 rstest = "0.26.1"
+regex = "1"
 
 [features]
 default = ["sync-sender", "tls-webpki-certs", "ring-crypto"]
