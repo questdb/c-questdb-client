@@ -1110,14 +1110,14 @@ public:
     /**
      * Get the current protocol version used by the sender.
      */
-    questdb::ingress::protocol_version protocol_version() const noexcept
+    questdb::ingress::protocol_version protocol_version() const
     {
         ensure_impl();
         return static_cast<enum protocol_version>(
             static_cast<int>(::line_sender_get_protocol_version(_impl)));
     }
 
-    line_sender_buffer new_buffer(size_t init_buf_size = 64 * 1024) noexcept
+    line_sender_buffer new_buffer(size_t init_buf_size = 64 * 1024)
     {
         ensure_impl();
         return line_sender_buffer{
