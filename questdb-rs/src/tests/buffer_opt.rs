@@ -152,10 +152,14 @@ fn test_every_column_writing_method_has_opt_variant() {
     // additions are caught too. The `[^{]*` segment in the writer regex
     // matches across newlines (it does not exclude `\n`), so it spans
     // multi-line `where` clauses without needing dotall.
+    //
+    // The `(?m)^\s*` anchor restricts matches to start at the indentation
+    // of an impl item, so a stray `pub fn ...` inside a `///` doc example
+    // can never be picked up.
     let src = include_str!("../ingress/buffer.rs");
 
-    let pub_fn = regex::Regex::new(r"pub fn (\w+)").unwrap();
-    let writer = regex::Regex::new(r"pub fn (\w+)[^{]*TryInto<ColumnName").unwrap();
+    let pub_fn = regex::Regex::new(r"(?m)^\s*pub fn (\w+)").unwrap();
+    let writer = regex::Regex::new(r"(?m)^\s*pub fn (\w+)[^{]*TryInto<ColumnName").unwrap();
 
     let all_pub_fns: std::collections::HashSet<&str> = pub_fn
         .captures_iter(src)
