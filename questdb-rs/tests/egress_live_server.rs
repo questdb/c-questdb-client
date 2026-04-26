@@ -675,6 +675,138 @@ fn binary_round_trip() {
 }
 
 // ---------------------------------------------------------------------------
+// Arrays (DOUBLE[] / DOUBLE[][])
+// ---------------------------------------------------------------------------
+//
+// LONG_ARRAY is in the protocol but the server doesn't emit it; only
+// DOUBLE arrays are exercised end-to-end. Population uses SQL INSERT
+// with ARRAY[...] literals against WAL tables, mirroring the QuestDB
+// QwpEgressBootstrapTest / QwpEgressTypesExhaustiveTest pattern.
+
+#[test]
+fn double_array_1d_varying_lengths() {
+    let srv = server();
+    let table = unique_table("darr_1d");
+    srv.http_exec(&format!(
+        "CREATE TABLE \"{}\" (d DOUBLE[], ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY WAL",
+        table
+    ));
+    srv.http_exec(&format!(
+        "INSERT INTO \"{0}\" VALUES \
+         (ARRAY[1.0, 2.0, 3.0], 1::TIMESTAMP), \
+         (ARRAY[4.0, 5.0], 2::TIMESTAMP), \
+         (ARRAY[7.5], 3::TIMESTAMP)",
+        table
+    ));
+    wait_for_rows(srv, &table, 3);
+
+    select_one_batch(
+        srv,
+        &format!("select d from \"{}\" order by ts", table),
+        |view| {
+            let ColumnView::DoubleArray(c) = view.column(0).unwrap() else {
+                panic!("col 0 not double_array: {:?}", view.column(0).unwrap().kind())
+            };
+            assert_eq!(c.len(), 3);
+
+            assert_eq!(c.shape(0), Some(&[3u32][..]));
+            assert_eq!(c.element_count(0), 3);
+            assert_eq!(c.element(0, 0), Some(1.0));
+            assert_eq!(c.element(0, 1), Some(2.0));
+            assert_eq!(c.element(0, 2), Some(3.0));
+
+            assert_eq!(c.shape(1), Some(&[2u32][..]));
+            assert_eq!(c.element_count(1), 2);
+            assert_eq!(c.element(1, 0), Some(4.0));
+            assert_eq!(c.element(1, 1), Some(5.0));
+
+            assert_eq!(c.shape(2), Some(&[1u32][..]));
+            assert_eq!(c.element(2, 0), Some(7.5));
+        },
+    );
+}
+
+#[test]
+fn double_array_2d_row_major() {
+    let srv = server();
+    let table = unique_table("darr_2d");
+    srv.http_exec(&format!(
+        "CREATE TABLE \"{}\" (m DOUBLE[][], ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY WAL",
+        table
+    ));
+    srv.http_exec(&format!(
+        "INSERT INTO \"{0}\" VALUES \
+         (ARRAY[[1.0, 2.0], [3.0, 4.0]], 1::TIMESTAMP), \
+         (ARRAY[[10.0, 20.0, 30.0], [40.0, 50.0, 60.0]], 2::TIMESTAMP)",
+        table
+    ));
+    wait_for_rows(srv, &table, 2);
+
+    select_one_batch(
+        srv,
+        &format!("select m from \"{}\" order by ts", table),
+        |view| {
+            let ColumnView::DoubleArray(c) = view.column(0).unwrap() else { panic!() };
+            assert_eq!(c.len(), 2);
+
+            // Row 0: 2x2 row-major.
+            assert_eq!(c.shape(0), Some(&[2u32, 2][..]));
+            assert_eq!(c.element_count(0), 4);
+            for (i, expected) in [1.0, 2.0, 3.0, 4.0].iter().enumerate() {
+                assert_eq!(c.element(0, i), Some(*expected), "row 0 idx {}", i);
+            }
+
+            // Row 1: 2x3 row-major.
+            assert_eq!(c.shape(1), Some(&[2u32, 3][..]));
+            assert_eq!(c.element_count(1), 6);
+            for (i, expected) in [10.0, 20.0, 30.0, 40.0, 50.0, 60.0].iter().enumerate() {
+                assert_eq!(c.element(1, i), Some(*expected), "row 1 idx {}", i);
+            }
+        },
+    );
+}
+
+#[test]
+fn double_array_with_null_array_row() {
+    let srv = server();
+    let table = unique_table("darr_null");
+    srv.http_exec(&format!(
+        "CREATE TABLE \"{}\" (d DOUBLE[], ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY WAL",
+        table
+    ));
+    srv.http_exec(&format!(
+        "INSERT INTO \"{0}\" VALUES \
+         (ARRAY[1.0], 1::TIMESTAMP), \
+         (NULL, 2::TIMESTAMP), \
+         (ARRAY[2.5, 3.5], 3::TIMESTAMP)",
+        table
+    ));
+    wait_for_rows(srv, &table, 3);
+
+    select_one_batch(
+        srv,
+        &format!("select d from \"{}\" order by ts", table),
+        |view| {
+            let ColumnView::DoubleArray(c) = view.column(0).unwrap() else { panic!() };
+            assert_eq!(c.len(), 3);
+
+            assert!(!c.is_null(0));
+            assert_eq!(c.element(0, 0), Some(1.0));
+
+            assert!(c.is_null(1));
+            assert_eq!(c.shape(1), None);
+            assert_eq!(c.element_count(1), 0);
+            assert_eq!(c.element(1, 0), None);
+
+            assert!(!c.is_null(2));
+            assert_eq!(c.shape(2), Some(&[2u32][..]));
+            assert_eq!(c.element(2, 0), Some(2.5));
+            assert_eq!(c.element(2, 1), Some(3.5));
+        },
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Symbol
 // ---------------------------------------------------------------------------
 
