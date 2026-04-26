@@ -293,29 +293,27 @@ pub fn decode_result_batch(
     let row_count = r.read_varint_usize()?;
     let col_count = r.read_varint_usize()?;
 
-    // Schema section.
-    let consumed = {
+    // Schema section. col_count comes from the table block above; the
+    // schema section itself does not re-emit it.
+    let (schema_id, schema_bytes) = {
         let schema_section = r.remaining();
-        let dec = registry.decode_section(schema_section)?;
-        let id = dec.schema_id;
-        let consumed = dec.bytes_consumed;
-        // Sanity-check the schema's column count.
-        let schema = registry
-            .get(id)
-            .expect("schema must be present after decode_section");
-        if schema.len() != col_count {
-            return Err(fmt!(
-                ProtocolError,
-                "schema {} has {} columns but batch announced {}",
-                id,
-                schema.len(),
-                col_count
-            ));
-        }
-        (id, consumed)
+        let dec = registry.decode_section(schema_section, col_count)?;
+        (dec.schema_id, dec.bytes_consumed)
     };
-    let (schema_id, schema_bytes) = consumed;
     r.advance(schema_bytes)?;
+    let schema_cols = registry
+        .get(schema_id)
+        .expect("schema must be present after decode_section")
+        .len();
+    if schema_cols != col_count {
+        return Err(fmt!(
+            ProtocolError,
+            "schema {} has {} columns but batch announced {}",
+            schema_id,
+            schema_cols,
+            col_count
+        ));
+    }
 
     // Pull out the schema columns by value to avoid borrowing the registry
     // while we mutate it (we don't, in this loop, but borrow-check isn't
@@ -931,11 +929,11 @@ mod tests {
             encode_u64(self.row_count as u64, &mut out);
             encode_u64(self.cols.len() as u64, &mut out);
 
-            // Schema section.
+            // Schema section. col_count is in the table block above; the
+            // schema section itself does not re-emit it.
             out.push(self.schema_mode as u8);
             encode_u64(self.schema_id, &mut out);
             if matches!(self.schema_mode, SchemaMode::Full) {
-                encode_u64(self.cols.len() as u64, &mut out);
                 for (name, kind) in &self.cols {
                     encode_u64(name.len() as u64, &mut out);
                     out.extend_from_slice(name.as_bytes());
@@ -1223,7 +1221,7 @@ mod tests {
         let mut bytes = Vec::new();
         let mut cur: u8 = 0;
         let mut bits: u32 = 0;
-        let mut write_bit = |b: u8, bytes: &mut Vec<u8>, cur: &mut u8, bits: &mut u32| {
+        let write_bit = |b: u8, bytes: &mut Vec<u8>, cur: &mut u8, bits: &mut u32| {
             *cur |= (b & 1) << *bits;
             *bits += 1;
             if *bits == 8 {
@@ -1232,7 +1230,7 @@ mod tests {
                 *bits = 0;
             }
         };
-        let mut write_bits = |val: u64, n: u32, bytes: &mut Vec<u8>, cur: &mut u8, bits: &mut u32| {
+        let write_bits = |val: u64, n: u32, bytes: &mut Vec<u8>, cur: &mut u8, bits: &mut u32| {
             for i in 0..n {
                 write_bit(((val >> i) & 1) as u8, bytes, cur, bits);
             }

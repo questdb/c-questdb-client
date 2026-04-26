@@ -120,13 +120,12 @@ impl WsTransport {
         self.server_version
     }
 
-    /// Write a complete QWP frame as a single WebSocket binary message.
-    pub fn write_frame(&mut self, header: FrameHeader, payload: &[u8]) -> Result<()> {
-        let mut buf = Vec::with_capacity(HEADER_LEN + payload.len());
-        buf.extend_from_slice(&header.to_bytes());
-        buf.extend_from_slice(payload);
+    /// Write a client-to-server message as a single WebSocket binary
+    /// message. Per QWP, client frames are bare payloads — only
+    /// server-to-client frames carry the 12-byte `QWP1` header.
+    pub fn write_message(&mut self, payload: &[u8]) -> Result<()> {
         self.socket
-            .send(Message::Binary(buf.into()))
+            .send(Message::Binary(payload.to_vec().into()))
             .map_err(|e| map_ws_error(e, ErrorCode::SocketError))?;
         Ok(())
     }

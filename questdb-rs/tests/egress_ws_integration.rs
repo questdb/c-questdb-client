@@ -78,11 +78,10 @@ fn build_simple_long_batch(request_id: i64, batch_seq: u64, values: &[i64]) -> V
     encode_u64(batch_seq, &mut p);
     encode_u64(0, &mut p); // table name_len
     encode_u64(values.len() as u64, &mut p); // row_count
-    encode_u64(1, &mut p); // col_count
+    encode_u64(1, &mut p); // col_count (in the table block; schema section does NOT re-emit this)
     // Schema: full, id=1, one Long col "v"
     p.push(SchemaMode::Full as u8);
     encode_u64(1, &mut p); // schema_id
-    encode_u64(1, &mut p); // 1 column
     encode_u64(1, &mut p); // name_len
     p.push(b'v');
     p.push(ColumnKind::Long.as_u8());

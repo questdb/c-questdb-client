@@ -62,6 +62,7 @@ tempfile = "3"
 webpki-roots = "1.0.1"
 rstest = "0.26.1"
 tungstenite = { version = "0.27", default-features = false, features = ["handshake"] }
+ureq = { version = "3.1.2, <3.2.0", default-features = false, features = ["rustls"] }
 
 [features]
 default = ["sync-sender", "tls-webpki-certs", "ring-crypto"]
@@ -110,6 +111,11 @@ bigdecimal = ["dep:bigdecimal"]
 
 ## Sync QWP egress reader over WebSocket (plain `ws://`).
 sync-reader-ws = ["_egress", "dep:tungstenite"]
+
+## Run integration tests against a real QuestDB server launched from the
+## `questdb/` submodule. Requires JDK 25 + Maven and a built jar at
+## `../questdb/core/target/questdb-*-SNAPSHOT.jar`.
+live-server-tests = ["sync-reader-ws", "sync-sender-http"]
 
 # Hidden derived features, used in code to enable-disable code sections. Don't use directly.
 _sender-tcp = []

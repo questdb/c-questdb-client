@@ -41,7 +41,6 @@ use std::net::Ipv4Addr;
 use crate::egress::binds::{Bind, check_bindable, encode_bind};
 use crate::egress::column_kind::ColumnKind;
 use crate::egress::error::{Result, fmt};
-use crate::egress::wire::header::{FrameHeader, HEADER_LEN};
 use crate::egress::wire::msg_kind::MsgKind;
 use crate::egress::wire::varint;
 
@@ -87,18 +86,9 @@ impl QueryRequest {
         &self.binds
     }
 
-    /// Serialize this request as a complete framed message
-    /// (12-byte header + payload) into `out`.
-    ///
-    /// `version` is the QWP version negotiated at HTTP-upgrade time and
-    /// goes into the frame header; the server closes the connection on
-    /// mismatch.
-    pub fn encode(&self, version: u8, out: &mut Vec<u8>) -> Result<()> {
-        let header_start = out.len();
-        out.resize(out.len() + HEADER_LEN, 0);
-
-        let payload_start = out.len();
-
+    /// Serialize this request as a bare QWP client→server payload (no
+    /// 12-byte QWP1 header; only server→client frames carry it).
+    pub fn encode(&self, out: &mut Vec<u8>) -> Result<()> {
         out.push(MsgKind::QueryRequest.as_u8());
         out.extend_from_slice(&self.request_id.to_le_bytes());
         varint::encode_u64(self.sql.len() as u64, out);
@@ -108,27 +98,6 @@ impl QueryRequest {
         for bind in &self.binds {
             encode_bind(bind, out)?;
         }
-
-        let payload_len = out.len() - payload_start;
-        let payload_len = u32::try_from(payload_len).map_err(|_| {
-            fmt!(
-                ProtocolError,
-                "QUERY_REQUEST payload too large: {} bytes",
-                payload_len
-            )
-        })?;
-
-        let header = FrameHeader {
-            version,
-            flags: 0,
-            table_count: 0,
-            payload_length: payload_len,
-        };
-        let header_slot: &mut [u8; HEADER_LEN] = (&mut out[header_start..header_start + HEADER_LEN])
-            .try_into()
-            .expect("reserved HEADER_LEN bytes");
-        header.write(header_slot);
-
         Ok(())
     }
 }
@@ -286,11 +255,6 @@ impl QueryRequestBuilder {
 mod tests {
     use super::*;
     use crate::egress::error::ErrorCode;
-    use crate::egress::wire::header::MAGIC;
-
-    fn parse_header(bytes: &[u8]) -> FrameHeader {
-        FrameHeader::parse(bytes).unwrap()
-    }
 
     #[test]
     fn no_binds_byte_exact() {
@@ -299,25 +263,16 @@ mod tests {
             .build()
             .unwrap();
         let mut buf = Vec::new();
-        req.encode(1, &mut buf).unwrap();
+        req.encode(&mut buf).unwrap();
 
-        // Header: magic | v=1 | flags=0 | table_count=0 | payload_length
-        assert_eq!(&buf[0..4], &MAGIC.to_le_bytes());
-        let h = parse_header(&buf);
-        assert_eq!(h.version, 1);
-        assert_eq!(h.flags, 0);
-        assert_eq!(h.table_count, 0);
-
-        // Payload: 0x10 | i64 LE 0x2A | varint(8) | "SELECT 1" | varint(0) | varint(0)
-        let payload = &buf[HEADER_LEN..];
-        assert_eq!(payload[0], 0x10);
-        assert_eq!(&payload[1..9], &0x2Ai64.to_le_bytes());
-        assert_eq!(payload[9], 0x08); // varint sql_length
-        assert_eq!(&payload[10..18], b"SELECT 1");
-        assert_eq!(payload[18], 0x00); // varint initial_credit = 0
-        assert_eq!(payload[19], 0x00); // varint bind_count = 0
-        assert_eq!(payload.len(), 20);
-        assert_eq!(h.payload_length as usize, payload.len());
+        // Bare client→server payload: msg_kind | i64 rid | varint(8) | sql | varint(0) | varint(0)
+        assert_eq!(buf[0], 0x10);
+        assert_eq!(&buf[1..9], &0x2Ai64.to_le_bytes());
+        assert_eq!(buf[9], 0x08); // varint sql_length
+        assert_eq!(&buf[10..18], b"SELECT 1");
+        assert_eq!(buf[18], 0x00); // varint initial_credit = 0
+        assert_eq!(buf[19], 0x00); // varint bind_count = 0
+        assert_eq!(buf.len(), 20);
     }
 
     #[test]
@@ -330,11 +285,8 @@ mod tests {
             .build()
             .unwrap();
         let mut buf = Vec::new();
-        req.encode(2, &mut buf).unwrap();
-        let h = parse_header(&buf);
-        assert_eq!(h.version, 2);
+        req.encode(&mut buf).unwrap();
 
-        let payload = &buf[HEADER_LEN..];
         // 0x10 | i64 LE 1 | varint(1)=0x01 | "X" | varint(0) | varint(3)=0x03
         // | bind1: 0x05 0x00 i64 LE 42
         // | bind2: 0x0F 0x00 [offsets 0,2 as u32_le ×2] 'h' 'i'
@@ -352,8 +304,7 @@ mod tests {
         expected.extend_from_slice(&2u32.to_le_bytes());
         expected.extend_from_slice(&[b'h', b'i']);
         expected.extend_from_slice(&[0x01, 0x01, 0x01]);
-        assert_eq!(payload, expected.as_slice());
-        assert_eq!(h.payload_length as usize, payload.len());
+        assert_eq!(buf, expected);
     }
 
     #[test]
@@ -363,11 +314,10 @@ mod tests {
             .build()
             .unwrap();
         let mut buf = Vec::new();
-        req.encode(1, &mut buf).unwrap();
-        let payload = &buf[HEADER_LEN..];
+        req.encode(&mut buf).unwrap();
         // After 0x10 + 8-byte rid + varint(1) + 'X' = 11 bytes, then varint(0x4000)
         // varint(0x4000) = 0x80 0x80 0x01
-        assert_eq!(&payload[11..14], &[0x80, 0x80, 0x01]);
+        assert_eq!(&buf[11..14], &[0x80, 0x80, 0x01]);
     }
 
     #[test]
@@ -399,7 +349,8 @@ mod tests {
     }
 
     #[test]
-    fn header_payload_length_matches() {
+    fn encode_length_grows_monotonically_with_binds() {
+        let mut prev = 0usize;
         for binds in 0..50 {
             let mut b = QueryRequest::builder("SELECT * FROM t");
             for _ in 0..binds {
@@ -407,14 +358,15 @@ mod tests {
             }
             let req = b.build().unwrap();
             let mut buf = Vec::new();
-            req.encode(1, &mut buf).unwrap();
-            let h = parse_header(&buf);
-            assert_eq!(
-                h.payload_length as usize,
-                buf.len() - HEADER_LEN,
-                "binds={}",
-                binds
+            req.encode(&mut buf).unwrap();
+            assert!(
+                buf.len() > prev || binds == 0,
+                "binds={} len={} prev={}",
+                binds,
+                buf.len(),
+                prev
             );
+            prev = buf.len();
         }
     }
 }

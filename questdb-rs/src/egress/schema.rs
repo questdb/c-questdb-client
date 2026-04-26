@@ -153,9 +153,10 @@ impl SchemaRegistry {
     }
 
     /// Decode the `schema_mode`+`schema_id`+(optional full-schema) preamble
-    /// from `bytes`. On `Full`, populates the registry. On `Reference`, the
-    /// referenced `schema_id` must already be registered or the call errors.
-    pub fn decode_section(&mut self, bytes: &[u8]) -> Result<DecodedSchema> {
+    /// from `bytes`. On `Full`, populates the registry with `col_count`
+    /// columns (the value lives in the table block, not the schema section).
+    /// On `Reference`, the referenced `schema_id` must already be registered.
+    pub fn decode_section(&mut self, bytes: &[u8], col_count: usize) -> Result<DecodedSchema> {
         if bytes.is_empty() {
             return Err(fmt!(ProtocolError, "schema section truncated: empty"));
         }
@@ -180,8 +181,6 @@ impl SchemaRegistry {
                 })
             }
             SchemaMode::Full => {
-                let (col_count, n) = varint::decode_usize(&bytes[cursor..])?;
-                cursor += n;
                 let mut cols = Vec::with_capacity(col_count);
                 for i in 0..col_count {
                     let (name_len, n) = varint::decode_usize(&bytes[cursor..])?;
@@ -238,7 +237,7 @@ mod tests {
     fn build_full(schema_id: u64, cols: &[(&str, ColumnKind)]) -> Vec<u8> {
         let mut out = vec![SchemaMode::Full as u8];
         encode_u64(schema_id, &mut out);
-        encode_u64(cols.len() as u64, &mut out);
+        // No col_count varint: it lives in the table block, not the schema section.
         for (name, kind) in cols {
             encode_u64(name.len() as u64, &mut out);
             out.extend_from_slice(name.as_bytes());
@@ -257,7 +256,7 @@ mod tests {
     fn decode_full_schema() {
         let bytes = build_full(7, &[("ts", ColumnKind::TimestampNanos), ("v", ColumnKind::Double)]);
         let mut reg = SchemaRegistry::new();
-        let r = reg.decode_section(&bytes).unwrap();
+        let r = reg.decode_section(&bytes, 2).unwrap();
         assert_eq!(r.schema_id, 7);
         assert!(r.was_full);
         assert_eq!(r.bytes_consumed, bytes.len());
@@ -273,8 +272,8 @@ mod tests {
     fn decode_reference_after_full() {
         let mut reg = SchemaRegistry::new();
         let full = build_full(3, &[("a", ColumnKind::Int)]);
-        reg.decode_section(&full).unwrap();
-        let r = reg.decode_section(&build_ref(3)).unwrap();
+        reg.decode_section(&full, 1).unwrap();
+        let r = reg.decode_section(&build_ref(3), 1).unwrap();
         assert_eq!(r.schema_id, 3);
         assert!(!r.was_full);
         assert_eq!(reg.get(3).unwrap().column(0).unwrap().name, "a");
@@ -283,7 +282,7 @@ mod tests {
     #[test]
     fn reference_to_unknown_id_rejected() {
         let mut reg = SchemaRegistry::new();
-        let err = reg.decode_section(&build_ref(99)).unwrap_err();
+        let err = reg.decode_section(&build_ref(99), 0).unwrap_err();
         assert_eq!(err.code(), ErrorCode::ProtocolError);
         assert!(err.msg().contains("99"));
     }
@@ -292,7 +291,7 @@ mod tests {
     fn unknown_schema_mode_rejected() {
         let mut reg = SchemaRegistry::new();
         let bytes = vec![0x05, 0x00];
-        let err = reg.decode_section(&bytes).unwrap_err();
+        let err = reg.decode_section(&bytes, 0).unwrap_err();
         assert_eq!(err.code(), ErrorCode::ProtocolError);
     }
 
@@ -301,22 +300,22 @@ mod tests {
         let mut bytes = build_full(1, &[("col", ColumnKind::Long)]);
         bytes.pop(); // drop the type_code
         let mut reg = SchemaRegistry::new();
-        let err = reg.decode_section(&bytes).unwrap_err();
+        let err = reg.decode_section(&bytes, 1).unwrap_err();
         assert_eq!(err.code(), ErrorCode::ProtocolError);
     }
 
     #[test]
     fn empty_section_rejected() {
         let mut reg = SchemaRegistry::new();
-        let err = reg.decode_section(&[]).unwrap_err();
+        let err = reg.decode_section(&[], 0).unwrap_err();
         assert_eq!(err.code(), ErrorCode::ProtocolError);
     }
 
     #[test]
     fn reset_clears_registry() {
         let mut reg = SchemaRegistry::new();
-        reg.decode_section(&build_full(1, &[("c", ColumnKind::Int)])).unwrap();
-        reg.decode_section(&build_full(2, &[("c", ColumnKind::Int)])).unwrap();
+        reg.decode_section(&build_full(1, &[("c", ColumnKind::Int)]), 1).unwrap();
+        reg.decode_section(&build_full(2, &[("c", ColumnKind::Int)]), 1).unwrap();
         assert_eq!(reg.len(), 2);
         reg.reset();
         assert_eq!(reg.len(), 0);
@@ -325,11 +324,9 @@ mod tests {
 
     #[test]
     fn full_replaces_existing_id() {
-        // Spec allows reusing an id with a different schema; the new full
-        // schema replaces the old one.
         let mut reg = SchemaRegistry::new();
-        reg.decode_section(&build_full(5, &[("a", ColumnKind::Int)])).unwrap();
-        reg.decode_section(&build_full(5, &[("b", ColumnKind::Long)])).unwrap();
+        reg.decode_section(&build_full(5, &[("a", ColumnKind::Int)]), 1).unwrap();
+        reg.decode_section(&build_full(5, &[("b", ColumnKind::Long)]), 1).unwrap();
         assert_eq!(reg.get(5).unwrap().column(0).unwrap().name, "b");
         assert_eq!(reg.get(5).unwrap().column(0).unwrap().kind, ColumnKind::Long);
     }
@@ -337,7 +334,7 @@ mod tests {
     #[test]
     fn zero_column_schema_is_valid() {
         let mut reg = SchemaRegistry::new();
-        reg.decode_section(&build_full(0, &[])).unwrap();
+        reg.decode_section(&build_full(0, &[]), 0).unwrap();
         assert!(reg.get(0).unwrap().is_empty());
     }
 }

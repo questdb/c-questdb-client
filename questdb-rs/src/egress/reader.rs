@@ -43,7 +43,6 @@ use crate::egress::schema::{Schema, SchemaRegistry};
 use crate::egress::server_event::{ServerEvent, decode_frame};
 use crate::egress::symbol_dict::SymbolDict;
 use crate::egress::transport::WsTransport;
-use crate::egress::wire::header::{FrameHeader, HEADER_LEN};
 use crate::egress::wire::msg_kind::MsgKind;
 
 // ---------------------------------------------------------------------------
@@ -233,14 +232,9 @@ impl<'r> ReaderQuery<'r> {
         self.reader.next_request_id = self.reader.next_request_id.wrapping_add(1);
 
         let req = self.builder.request_id(request_id).build()?;
-        let mut buf = Vec::with_capacity(HEADER_LEN + 64);
-        req.encode(self.reader.transport.server_version(), &mut buf)?;
-        // encode() wrote header+payload; transport write_frame wants them
-        // separated.
-        let header = FrameHeader::parse(&buf[..HEADER_LEN])?;
-        self.reader
-            .transport
-            .write_frame(header, &buf[HEADER_LEN..])?;
+        let mut buf = Vec::with_capacity(64);
+        req.encode(&mut buf)?;
+        self.reader.transport.write_message(&buf)?;
 
         self.reader.cursor_active = true;
         Ok(Cursor {
@@ -357,13 +351,7 @@ impl<'r> Cursor<'r> {
         let mut payload = Vec::with_capacity(9);
         payload.push(MsgKind::Cancel.as_u8());
         payload.extend_from_slice(&self.request_id.to_le_bytes());
-        let header = FrameHeader {
-            version: self.reader.transport.server_version(),
-            flags: 0,
-            table_count: 0,
-            payload_length: payload.len() as u32,
-        };
-        self.reader.transport.write_frame(header, &payload)?;
+        self.reader.transport.write_message(&payload)?;
 
         // Drain until terminal — swallow batches between CANCEL and the
         // server's terminal acknowledgement.
