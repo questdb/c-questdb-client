@@ -33,6 +33,7 @@
 
 use std::net::TcpStream;
 
+use bytes::Bytes;
 use tungstenite::client::IntoClientRequest;
 use tungstenite::handshake::client::generate_key;
 use tungstenite::http::{HeaderName, HeaderValue, Request, Uri};
@@ -142,7 +143,7 @@ impl WsTransport {
     /// Read the next QWP frame (header + payload). Pings/pongs are
     /// handled transparently; a `Close` from the server surfaces as a
     /// `SocketError`.
-    pub fn read_frame(&mut self) -> Result<(FrameHeader, Vec<u8>)> {
+    pub fn read_frame(&mut self) -> Result<(FrameHeader, Bytes)> {
         loop {
             let msg = self
                 .socket
@@ -174,7 +175,9 @@ impl WsTransport {
                             bytes.len() - HEADER_LEN
                         ));
                     }
-                    let payload = bytes[HEADER_LEN..].to_vec();
+                    // Zero-copy slice: `Bytes` is ref-counted, so `slice` only
+                    // bumps the refcount and updates the offset/length.
+                    let payload = bytes.slice(HEADER_LEN..);
                     return Ok((header, payload));
                 }
                 Message::Close(frame) => {

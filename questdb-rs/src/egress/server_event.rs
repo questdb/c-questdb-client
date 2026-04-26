@@ -34,6 +34,7 @@ use crate::egress::wire::ByteReader;
 use crate::egress::wire::cache_reset::{resets_dict, resets_schemas};
 use crate::egress::wire::header::FrameHeader;
 use crate::egress::wire::msg_kind::{MsgKind, StatusCode};
+use bytes::Bytes;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -117,7 +118,7 @@ pub enum ServerEvent {
 /// caller's cursor / state machine should react to.
 pub fn decode_frame(
     header: FrameHeader,
-    payload: &[u8],
+    payload: &Bytes,
     dict: &mut SymbolDict,
     registry: &mut SchemaRegistry,
 ) -> Result<ServerEvent> {
@@ -294,12 +295,12 @@ mod tests {
 
     // --- RESULT_END ---------------------------------------------------------
 
-    fn build_result_end(rid: i64, final_seq: u64, total_rows: u64) -> Vec<u8> {
+    fn build_result_end(rid: i64, final_seq: u64, total_rows: u64) -> Bytes {
         let mut p = vec![MsgKind::ResultEnd.as_u8()];
         p.extend_from_slice(&rid.to_le_bytes());
         encode_u64(final_seq, &mut p);
         encode_u64(total_rows, &mut p);
-        p
+        Bytes::from(p)
     }
 
     #[test]
@@ -324,13 +325,13 @@ mod tests {
 
     // --- QUERY_ERROR --------------------------------------------------------
 
-    fn build_query_error(rid: i64, status: StatusCode, msg: &str) -> Vec<u8> {
+    fn build_query_error(rid: i64, status: StatusCode, msg: &str) -> Bytes {
         let mut p = vec![MsgKind::QueryError.as_u8()];
         p.extend_from_slice(&rid.to_le_bytes());
         p.push(status.as_u8());
         p.extend_from_slice(&(msg.len() as u16).to_le_bytes());
         p.extend_from_slice(msg.as_bytes());
-        p
+        Bytes::from(p)
     }
 
     #[test]
@@ -355,11 +356,12 @@ mod tests {
 
     #[test]
     fn query_error_truncated_message_rejected() {
-        let mut payload = build_query_error(1, StatusCode::InternalError, "details");
-        payload.truncate(payload.len() - 3); // chop the message tail
+        let payload = build_query_error(1, StatusCode::InternalError, "details");
+        let truncated = payload.slice(..payload.len() - 3);
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let err = decode_frame(header(payload.len()), &payload, &mut dict, &mut reg).unwrap_err();
+        let err =
+            decode_frame(header(truncated.len()), &truncated, &mut dict, &mut reg).unwrap_err();
         assert_eq!(err.code(), ErrorCode::ProtocolError);
     }
 
@@ -370,6 +372,7 @@ mod tests {
         p.push(StatusCode::InternalError.as_u8());
         p.extend_from_slice(&2u16.to_le_bytes());
         p.extend_from_slice(&[0xFF, 0xFE]);
+        let p = Bytes::from(p);
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
         let err = decode_frame(header(p.len()), &p, &mut dict, &mut reg).unwrap_err();
@@ -384,6 +387,7 @@ mod tests {
         p.extend_from_slice(&5i64.to_le_bytes());
         p.push(0xAB); // op_type
         encode_u64(0, &mut p); // rows_affected for DDL
+        let p = Bytes::from(p);
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
         let event = decode_frame(header(p.len()), &p, &mut dict, &mut reg).unwrap();
@@ -403,8 +407,8 @@ mod tests {
 
     // --- CACHE_RESET --------------------------------------------------------
 
-    fn build_cache_reset(mask: u8) -> Vec<u8> {
-        vec![MsgKind::CacheReset.as_u8(), mask]
+    fn build_cache_reset(mask: u8) -> Bytes {
+        Bytes::from(vec![MsgKind::CacheReset.as_u8(), mask])
     }
 
     #[test]
@@ -449,7 +453,7 @@ mod tests {
 
     // --- SERVER_INFO --------------------------------------------------------
 
-    fn build_server_info(role: u8, cluster: &str, node: &str) -> Vec<u8> {
+    fn build_server_info(role: u8, cluster: &str, node: &str) -> Bytes {
         let mut p = vec![MsgKind::ServerInfo.as_u8()];
         p.push(role);
         p.extend_from_slice(&7u64.to_le_bytes()); // epoch
@@ -459,7 +463,7 @@ mod tests {
         p.extend_from_slice(cluster.as_bytes());
         p.extend_from_slice(&(node.len() as u16).to_le_bytes());
         p.extend_from_slice(node.as_bytes());
-        p
+        Bytes::from(p)
     }
 
     #[test]
@@ -497,7 +501,8 @@ mod tests {
     fn empty_payload_rejected() {
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let err = decode_frame(header(0), &[], &mut dict, &mut reg).unwrap_err();
+        let empty = Bytes::new();
+        let err = decode_frame(header(0), &empty, &mut dict, &mut reg).unwrap_err();
         assert_eq!(err.code(), ErrorCode::ProtocolError);
     }
 
@@ -505,7 +510,8 @@ mod tests {
     fn unknown_msg_kind_rejected() {
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let err = decode_frame(header(1), &[0xAA], &mut dict, &mut reg).unwrap_err();
+        let p = Bytes::from(vec![0xAA]);
+        let err = decode_frame(header(1), &p, &mut dict, &mut reg).unwrap_err();
         assert_eq!(err.code(), ErrorCode::ProtocolError);
     }
 
@@ -518,7 +524,8 @@ mod tests {
         ] {
             let mut dict = SymbolDict::new();
             let mut reg = SchemaRegistry::new();
-            let err = decode_frame(header(1), &[k], &mut dict, &mut reg).unwrap_err();
+            let p = Bytes::from(vec![k]);
+            let err = decode_frame(header(1), &p, &mut dict, &mut reg).unwrap_err();
             assert_eq!(err.code(), ErrorCode::ProtocolError);
             assert!(err.msg().contains("client-only"));
         }
@@ -526,8 +533,10 @@ mod tests {
 
     #[test]
     fn trailing_bytes_rejected_for_simple_messages() {
-        let mut payload = build_result_end(1, 0, 0);
-        payload.push(0xFF);
+        let payload = build_result_end(1, 0, 0);
+        let mut bytes_vec: Vec<u8> = payload.to_vec();
+        bytes_vec.push(0xFF);
+        let payload = Bytes::from(bytes_vec);
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
         let err = decode_frame(header(payload.len()), &payload, &mut dict, &mut reg).unwrap_err();

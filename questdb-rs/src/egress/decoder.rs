@@ -71,18 +71,33 @@ use crate::egress::symbol_dict::SymbolDict;
 use crate::egress::wire::ByteReader;
 use crate::egress::wire::header::flags;
 use crate::egress::wire::msg_kind::MsgKind;
+use bytes::Bytes;
+
+/// Take a zero-copy owned slice of `n` bytes from `parent` starting at the
+/// reader's current position, and advance the reader.
+fn read_owned(r: &mut ByteReader<'_>, parent: &Bytes, n: usize) -> Result<Bytes> {
+    let start = r.pos();
+    r.advance(n)?;
+    Ok(parent.slice(start..start + n))
+}
 
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
 /// Owned column data extracted from a `RESULT_BATCH`.
+///
+/// `values` and `validity` are typically zero-copy `Bytes` slices into the
+/// frame's payload buffer (or, after FLAG_ZSTD, into the decompressed body).
+/// Paths that *have* to materialize new bytes (BOOLEAN bit-unpacking, GORILLA
+/// temporal expansion, null-bearing fixed-width densification) wrap a fresh
+/// `Vec<u8>` via `Bytes::from(vec)`.
 #[derive(Debug, Clone)]
 pub struct ColumnBuffer {
     /// Raw little-endian element bytes. Length = `row_count * elem_size`.
-    pub values: Vec<u8>,
+    pub values: Bytes,
     /// `Some` iff the column carried a null bitmap (`null_flag != 0`).
-    pub validity: Option<Vec<u8>>,
+    pub validity: Option<Bytes>,
 }
 
 /// Owned per-column data tagged by QWP type.
@@ -99,7 +114,7 @@ pub enum DecodedColumn {
         /// Dense per-row codes; `0` in null slots (validity is the
         /// source of truth for null vs id-zero).
         codes: Vec<u32>,
-        validity: Option<Vec<u8>>,
+        validity: Option<Bytes>,
         /// `Some` when the column carried its own dict inline
         /// (FLAG_DELTA_SYMBOL_DICT clear). `None` means codes index
         /// the connection-scoped dict. Each SYMBOL column in a batch
@@ -121,14 +136,15 @@ pub enum DecodedColumn {
         /// Dense per-row offsets (length `row_count + 1`); null rows are
         /// zero-length entries.
         offsets: Vec<u32>,
-        /// Concatenated UTF-8 bytes (validated at decode time).
-        data: Vec<u8>,
-        validity: Option<Vec<u8>>,
+        /// Concatenated UTF-8 bytes (validated at decode time). Borrowed
+        /// from the frame payload via `Bytes::slice`.
+        data: Bytes,
+        validity: Option<Bytes>,
     },
     Binary {
         offsets: Vec<u32>,
-        data: Vec<u8>,
-        validity: Option<Vec<u8>>,
+        data: Bytes,
+        validity: Option<Bytes>,
     },
     Geohash {
         buffer: ColumnBuffer,
@@ -155,12 +171,12 @@ pub struct ArrayBuffers {
     /// Byte offsets into `data` per row; length `row_count + 1`.
     pub data_offsets: Vec<u32>,
     /// Concatenated little-endian element bytes (8 B per element).
-    pub data: Vec<u8>,
+    pub data: Bytes,
     /// Concatenated per-row shape entries (one `u32` per dimension).
     pub shapes: Vec<u32>,
     /// Offsets into `shapes` per row; length `row_count + 1`.
     pub shape_offsets: Vec<u32>,
-    pub validity: Option<Vec<u8>>,
+    pub validity: Option<Bytes>,
 }
 
 /// One decoded `RESULT_BATCH`.
@@ -303,7 +319,7 @@ fn validity_of<'a>(buf: &'a ColumnBuffer, row_count: usize) -> Validity<'a> {
     validity_from_opt(&buf.validity, row_count)
 }
 
-fn validity_from_opt<'a>(validity: &'a Option<Vec<u8>>, row_count: usize) -> Validity<'a> {
+fn validity_from_opt<'a>(validity: &'a Option<Bytes>, row_count: usize) -> Validity<'a> {
     match validity {
         None => Validity::None,
         Some(bytes) => Validity::from_bitmap(bytes, row_count),
@@ -318,7 +334,7 @@ fn validity_from_opt<'a>(validity: &'a Option<Vec<u8>>, row_count: usize) -> Val
 /// header). Mutates `dict` if the batch carries a delta dict section, and
 /// `registry` if the batch carries a full schema.
 pub fn decode_result_batch(
-    payload: &[u8],
+    payload: &Bytes,
     flags_byte: u8,
     dict: &mut SymbolDict,
     registry: &mut SchemaRegistry,
@@ -339,12 +355,13 @@ pub fn decode_result_batch(
     // The `msg_kind / request_id / batch_seq` prefix is always
     // uncompressed; FLAG_ZSTD covers everything after it (delta-dict
     // section + table block + per-column data) as a single zstd frame.
-    let decompressed_owned: Option<Vec<u8>>;
-    let body: &[u8] = if flags_byte & flags::ZSTD != 0 {
+    // `body` is the parent Bytes used by per-column decoders for zero-copy
+    // slicing — either a slice into `payload` (no compression) or a
+    // freshly-owned Bytes wrapping the decompressed Vec.
+    let body: Bytes = if flags_byte & flags::ZSTD != 0 {
         #[cfg(feature = "compression-zstd")]
         {
-            decompressed_owned = Some(zstd_decompress_body(r.remaining())?);
-            decompressed_owned.as_ref().unwrap()
+            Bytes::from(zstd_decompress_body(r.remaining())?)
         }
         #[cfg(not(feature = "compression-zstd"))]
         {
@@ -355,11 +372,9 @@ pub fn decode_result_batch(
             ));
         }
     } else {
-        decompressed_owned = None;
-        r.remaining()
+        payload.slice(r.pos()..)
     };
-    let _ = &decompressed_owned; // Keep the owned buffer alive for `body`.
-    let mut r = ByteReader::new(body);
+    let mut r = ByteReader::new(&body);
 
     if flags_byte & flags::DELTA_SYMBOL_DICT != 0 {
         let consumed = dict.apply_delta_from_bytes(r.remaining())?;
@@ -408,13 +423,20 @@ pub fn decode_result_batch(
     let mut columns = Vec::with_capacity(col_count);
     let connection_dict_size = dict.len();
     for (i, kind) in kinds.iter().enumerate() {
-        let col = decode_column(&mut r, *kind, row_count, flags_byte, connection_dict_size)
-            .map_err(|e| {
-                Error::new(
-                    e.code(),
-                    format!("column {}/{} ({}): {}", i, col_count, kind.name(), e.msg()),
-                )
-            })?;
+        let col = decode_column(
+            &mut r,
+            &body,
+            *kind,
+            row_count,
+            flags_byte,
+            connection_dict_size,
+        )
+        .map_err(|e| {
+            Error::new(
+                e.code(),
+                format!("column {}/{} ({}): {}", i, col_count, kind.name(), e.msg()),
+            )
+        })?;
         columns.push(col);
     }
 
@@ -442,35 +464,36 @@ pub fn decode_result_batch(
 
 fn decode_column(
     r: &mut ByteReader<'_>,
+    parent: &Bytes,
     kind: ColumnKind,
     row_count: usize,
     flags_byte: u8,
     connection_dict_size: usize,
 ) -> Result<DecodedColumn> {
     Ok(match kind {
-        ColumnKind::Boolean => DecodedColumn::Boolean(decode_boolean(r, row_count)?),
-        ColumnKind::Byte => DecodedColumn::Byte(decode_fixed(r, row_count, 1)?),
-        ColumnKind::Short => DecodedColumn::Short(decode_fixed(r, row_count, 2)?),
-        ColumnKind::Int => DecodedColumn::Int(decode_fixed(r, row_count, 4)?),
-        ColumnKind::Long => DecodedColumn::Long(decode_fixed(r, row_count, 8)?),
-        ColumnKind::Float => DecodedColumn::Float(decode_fixed(r, row_count, 4)?),
-        ColumnKind::Double => DecodedColumn::Double(decode_fixed(r, row_count, 8)?),
-        ColumnKind::Char => DecodedColumn::Char(decode_fixed(r, row_count, 2)?),
-        ColumnKind::Ipv4 => DecodedColumn::Ipv4(decode_fixed(r, row_count, 4)?),
-        ColumnKind::Uuid => DecodedColumn::Uuid(decode_fixed(r, row_count, 16)?),
-        ColumnKind::Long256 => DecodedColumn::Long256(decode_fixed(r, row_count, 32)?),
+        ColumnKind::Boolean => DecodedColumn::Boolean(decode_boolean(r, parent, row_count)?),
+        ColumnKind::Byte => DecodedColumn::Byte(decode_fixed(r, parent, row_count, 1)?),
+        ColumnKind::Short => DecodedColumn::Short(decode_fixed(r, parent, row_count, 2)?),
+        ColumnKind::Int => DecodedColumn::Int(decode_fixed(r, parent, row_count, 4)?),
+        ColumnKind::Long => DecodedColumn::Long(decode_fixed(r, parent, row_count, 8)?),
+        ColumnKind::Float => DecodedColumn::Float(decode_fixed(r, parent, row_count, 4)?),
+        ColumnKind::Double => DecodedColumn::Double(decode_fixed(r, parent, row_count, 8)?),
+        ColumnKind::Char => DecodedColumn::Char(decode_fixed(r, parent, row_count, 2)?),
+        ColumnKind::Ipv4 => DecodedColumn::Ipv4(decode_fixed(r, parent, row_count, 4)?),
+        ColumnKind::Uuid => DecodedColumn::Uuid(decode_fixed(r, parent, row_count, 16)?),
+        ColumnKind::Long256 => DecodedColumn::Long256(decode_fixed(r, parent, row_count, 32)?),
 
         ColumnKind::Timestamp => {
-            DecodedColumn::Timestamp(decode_temporal(r, row_count, flags_byte)?)
+            DecodedColumn::Timestamp(decode_temporal(r, parent, row_count, flags_byte)?)
         }
-        ColumnKind::Date => DecodedColumn::Date(decode_temporal(r, row_count, flags_byte)?),
+        ColumnKind::Date => DecodedColumn::Date(decode_temporal(r, parent, row_count, flags_byte)?),
         ColumnKind::TimestampNanos => {
-            DecodedColumn::TimestampNanos(decode_temporal(r, row_count, flags_byte)?)
+            DecodedColumn::TimestampNanos(decode_temporal(r, parent, row_count, flags_byte)?)
         }
 
         ColumnKind::Symbol => {
             let (codes, validity, local_dict) =
-                decode_symbol(r, row_count, flags_byte, connection_dict_size)?;
+                decode_symbol(r, parent, row_count, flags_byte, connection_dict_size)?;
             DecodedColumn::Symbol {
                 codes,
                 validity,
@@ -479,12 +502,13 @@ fn decode_column(
         }
 
         ColumnKind::Decimal64 => {
-            let (scale, buffer) = decode_decimal64(r, row_count)?;
+            let (scale, buffer) = decode_decimal64(r, parent, row_count)?;
             DecodedColumn::Decimal64 { buffer, scale }
         }
 
         ColumnKind::Varchar => {
-            let (offsets, data, validity) = decode_varlen(r, row_count, /*utf8=*/ true)?;
+            let (offsets, data, validity) =
+                decode_varlen(r, parent, row_count, /*utf8=*/ true)?;
             DecodedColumn::Varchar {
                 offsets,
                 data,
@@ -492,7 +516,8 @@ fn decode_column(
             }
         }
         ColumnKind::Binary => {
-            let (offsets, data, validity) = decode_varlen(r, row_count, /*utf8=*/ false)?;
+            let (offsets, data, validity) =
+                decode_varlen(r, parent, row_count, /*utf8=*/ false)?;
             DecodedColumn::Binary {
                 offsets,
                 data,
@@ -501,7 +526,7 @@ fn decode_column(
         }
 
         ColumnKind::Geohash => {
-            let (buffer, byte_width, precision_bits) = decode_geohash(r, row_count)?;
+            let (buffer, byte_width, precision_bits) = decode_geohash(r, parent, row_count)?;
             DecodedColumn::Geohash {
                 buffer,
                 byte_width,
@@ -509,16 +534,16 @@ fn decode_column(
             }
         }
         ColumnKind::Decimal128 => {
-            let (scale, buffer) = decode_decimal_wide(r, row_count, 16)?;
+            let (scale, buffer) = decode_decimal_wide(r, parent, row_count, 16)?;
             DecodedColumn::Decimal128 { buffer, scale }
         }
         ColumnKind::Decimal256 => {
-            let (scale, buffer) = decode_decimal_wide(r, row_count, 32)?;
+            let (scale, buffer) = decode_decimal_wide(r, parent, row_count, 32)?;
             DecodedColumn::Decimal256 { buffer, scale }
         }
 
-        ColumnKind::DoubleArray => DecodedColumn::DoubleArray(decode_array(r, row_count)?),
-        ColumnKind::LongArray => DecodedColumn::LongArray(decode_array(r, row_count)?),
+        ColumnKind::DoubleArray => DecodedColumn::DoubleArray(decode_array(r, parent, row_count)?),
+        ColumnKind::LongArray => DecodedColumn::LongArray(decode_array(r, parent, row_count)?),
     })
 }
 
@@ -532,8 +557,8 @@ const MAX_ARRAY_ELEMENTS_PER_ROW: u64 = 16 * 1024 * 1024;
 /// Per non-null row: `1B nDims` + `nDims × u32_le dim_lens` + `prod(dims) × 8 LE element bytes`.
 /// Element type only differs by interpretation — wire is identical, so
 /// one decoder serves both.
-fn decode_array(r: &mut ByteReader<'_>, row_count: usize) -> Result<ArrayBuffers> {
-    let validity = decode_validity(r, row_count)?;
+fn decode_array(r: &mut ByteReader<'_>, parent: &Bytes, row_count: usize) -> Result<ArrayBuffers> {
+    let validity = decode_validity(r, parent, row_count)?;
 
     let mut data_offsets = Vec::with_capacity(row_count + 1);
     let mut data: Vec<u8> = Vec::new();
@@ -599,7 +624,7 @@ fn decode_array(r: &mut ByteReader<'_>, row_count: usize) -> Result<ArrayBuffers
 
     Ok(ArrayBuffers {
         data_offsets,
-        data,
+        data: Bytes::from(data),
         shapes,
         shape_offsets,
         validity,
@@ -610,8 +635,12 @@ fn decode_array(r: &mut ByteReader<'_>, row_count: usize) -> Result<ArrayBuffers
 ///
 /// Wire: `varint precision_bits` (1..60), then `non_null × ceil(precision_bits/8)`
 /// LE bytes. Densified into `row_count × byte_width` with null slots zeroed.
-fn decode_geohash(r: &mut ByteReader<'_>, row_count: usize) -> Result<(ColumnBuffer, u8, u8)> {
-    let validity = decode_validity(r, row_count)?;
+fn decode_geohash(
+    r: &mut ByteReader<'_>,
+    parent: &Bytes,
+    row_count: usize,
+) -> Result<(ColumnBuffer, u8, u8)> {
+    let validity = decode_validity(r, parent, row_count)?;
     let precision_bits = r.read_varint_u64()?;
     if precision_bits == 0 || precision_bits > 60 {
         return Err(fmt!(
@@ -621,7 +650,7 @@ fn decode_geohash(r: &mut ByteReader<'_>, row_count: usize) -> Result<(ColumnBuf
         ));
     }
     let byte_width = precision_bits.div_ceil(8) as u8;
-    let buffer = densify_fixed(r, row_count, byte_width as usize, validity)?;
+    let buffer = densify_fixed(r, parent, row_count, byte_width as usize, validity)?;
     Ok((buffer, byte_width, precision_bits as u8))
 }
 
@@ -629,12 +658,13 @@ fn decode_geohash(r: &mut ByteReader<'_>, row_count: usize) -> Result<(ColumnBuf
 /// LE bytes; densified.
 fn decode_decimal_wide(
     r: &mut ByteReader<'_>,
+    parent: &Bytes,
     row_count: usize,
     width: usize,
 ) -> Result<(i8, ColumnBuffer)> {
-    let validity = decode_validity(r, row_count)?;
+    let validity = decode_validity(r, parent, row_count)?;
     let scale = r.read_u8()? as i8;
-    let buffer = densify_fixed(r, row_count, width, validity)?;
+    let buffer = densify_fixed(r, parent, row_count, width, validity)?;
     Ok((scale, buffer))
 }
 
@@ -642,16 +672,19 @@ fn decode_decimal_wide(
 /// write them into a `row_count × elem_size` dense buffer.
 fn densify_fixed(
     r: &mut ByteReader<'_>,
+    parent: &Bytes,
     row_count: usize,
     elem_size: usize,
-    validity: Option<Vec<u8>>,
+    validity: Option<Bytes>,
 ) -> Result<ColumnBuffer> {
     let dense_len = row_count
         .checked_mul(elem_size)
         .ok_or_else(|| fmt!(ProtocolError, "fixed column size overflow"))?;
     match &validity {
         None => {
-            let values = r.read_bytes(dense_len)?.to_vec();
+            // Zero-copy: borrow the packed values straight out of the
+            // payload buffer instead of allocating + memcpy'ing.
+            let values = read_owned(r, parent, dense_len)?;
             Ok(ColumnBuffer { values, validity })
         }
         Some(bitmap) => {
@@ -667,7 +700,7 @@ fn densify_fixed(
                 }
             }
             Ok(ColumnBuffer {
-                values: dense,
+                values: Bytes::from(dense),
                 validity,
             })
         }
@@ -681,10 +714,15 @@ fn densify_fixed(
 /// (`row_count + 1` entries; null rows zero-length) plus the original
 /// compact data buffer (string boundaries are unchanged by densification).
 /// `(offsets, data, validity)` for a decoded VARCHAR / BINARY column body.
-type VarlenBuffers = (Vec<u32>, Vec<u8>, Option<Vec<u8>>);
+type VarlenBuffers = (Vec<u32>, Bytes, Option<Bytes>);
 
-fn decode_varlen(r: &mut ByteReader<'_>, row_count: usize, utf8: bool) -> Result<VarlenBuffers> {
-    let validity = decode_validity(r, row_count)?;
+fn decode_varlen(
+    r: &mut ByteReader<'_>,
+    parent: &Bytes,
+    row_count: usize,
+    utf8: bool,
+) -> Result<VarlenBuffers> {
+    let validity = decode_validity(r, parent, row_count)?;
     let non_null = match &validity {
         None => row_count,
         Some(bitmap) => row_count - count_nulls(bitmap, row_count),
@@ -720,9 +758,9 @@ fn decode_varlen(r: &mut ByteReader<'_>, row_count: usize, utf8: bool) -> Result
         }
     }
 
-    // Read the concatenated data bytes.
+    // Borrow the concatenated data bytes from the payload — zero-copy.
     let data_len = compact[non_null] as usize;
-    let data = r.read_bytes(data_len)?.to_vec();
+    let data = read_owned(r, parent, data_len)?;
 
     if utf8 {
         std::str::from_utf8(&data)
@@ -745,32 +783,40 @@ fn decode_varlen(r: &mut ByteReader<'_>, row_count: usize, utf8: bool) -> Result
     Ok((dense, data, validity))
 }
 
-fn decode_validity(r: &mut ByteReader<'_>, row_count: usize) -> Result<Option<Vec<u8>>> {
+fn decode_validity(
+    r: &mut ByteReader<'_>,
+    parent: &Bytes,
+    row_count: usize,
+) -> Result<Option<Bytes>> {
     let null_flag = r.read_u8()?;
     if null_flag == 0 {
         return Ok(None);
     }
     let bitmap_len = row_count.div_ceil(8);
-    let bytes = r.read_bytes(bitmap_len)?;
-    Ok(Some(bytes.to_vec()))
+    Ok(Some(read_owned(r, parent, bitmap_len)?))
 }
 
 /// Read `non_null_count × elem_size` compact bytes from the wire and write
 /// them into a dense `row_count × elem_size` buffer, with null slots zeroed.
 fn decode_fixed(
     r: &mut ByteReader<'_>,
+    parent: &Bytes,
     row_count: usize,
     elem_size: usize,
 ) -> Result<ColumnBuffer> {
-    let validity = decode_validity(r, row_count)?;
-    densify_fixed(r, row_count, elem_size, validity)
+    let validity = decode_validity(r, parent, row_count)?;
+    densify_fixed(r, parent, row_count, elem_size, validity)
 }
 
 /// QWP `BOOLEAN`: not nullable on the wire (validity always absent), values
 /// bit-packed into `ceil(row_count/8)` bytes. We expand to one byte per row
 /// so `FixedColumn<u8>` can address rows in O(1).
-fn decode_boolean(r: &mut ByteReader<'_>, row_count: usize) -> Result<ColumnBuffer> {
-    let validity = decode_validity(r, row_count)?;
+fn decode_boolean(
+    r: &mut ByteReader<'_>,
+    parent: &Bytes,
+    row_count: usize,
+) -> Result<ColumnBuffer> {
+    let validity = decode_validity(r, parent, row_count)?;
     let non_null = match &validity {
         None => row_count,
         Some(bitmap) => row_count - count_nulls(bitmap, row_count),
@@ -788,22 +834,23 @@ fn decode_boolean(r: &mut ByteReader<'_>, row_count: usize) -> Result<ColumnBuff
         }
     }
     Ok(ColumnBuffer {
-        values: dense,
+        values: Bytes::from(dense),
         validity,
     })
 }
 
 fn decode_temporal(
     r: &mut ByteReader<'_>,
+    parent: &Bytes,
     row_count: usize,
     flags_byte: u8,
 ) -> Result<ColumnBuffer> {
     if flags_byte & flags::GORILLA == 0 {
-        return decode_fixed(r, row_count, 8);
+        return decode_fixed(r, parent, row_count, 8);
     }
 
     // Validity comes first under FLAG_GORILLA, same as every other column.
-    let validity = decode_validity(r, row_count)?;
+    let validity = decode_validity(r, parent, row_count)?;
     let non_null = match &validity {
         None => row_count,
         Some(bitmap) => row_count - count_nulls(bitmap, row_count),
@@ -811,7 +858,7 @@ fn decode_temporal(
 
     let disc = r.read_u8()?;
     match disc {
-        0x00 => densify_fixed(r, row_count, 8, validity),
+        0x00 => densify_fixed(r, parent, row_count, 8, validity),
         0x01 => decode_gorilla_temporal(r, row_count, non_null, validity),
         other => Err(fmt!(
             ProtocolError,
@@ -825,7 +872,7 @@ fn decode_gorilla_temporal(
     r: &mut ByteReader<'_>,
     row_count: usize,
     non_null: usize,
-    validity: Option<Vec<u8>>,
+    validity: Option<Bytes>,
 ) -> Result<ColumnBuffer> {
     if non_null < 3 {
         return Err(fmt!(
@@ -862,7 +909,7 @@ fn decode_gorilla_temporal(
         }
     }
     Ok(ColumnBuffer {
-        values: dense,
+        values: Bytes::from(dense),
         validity,
     })
 }
@@ -883,15 +930,16 @@ fn decode_gorilla_temporal(
 /// truth for null-vs-id-zero. Bounds checks reject ids beyond the
 /// active dict's size and dict_size beyond row_count.
 /// `(codes, validity, local_dict)` for a decoded SYMBOL column body.
-type SymbolBuffers = (Vec<u32>, Option<Vec<u8>>, Option<SymbolDict>);
+type SymbolBuffers = (Vec<u32>, Option<Bytes>, Option<SymbolDict>);
 
 fn decode_symbol(
     r: &mut ByteReader<'_>,
+    parent: &Bytes,
     row_count: usize,
     flags_byte: u8,
     connection_dict_size: usize,
 ) -> Result<SymbolBuffers> {
-    let validity = decode_validity(r, row_count)?;
+    let validity = decode_validity(r, parent, row_count)?;
 
     let (active_dict_size, local_dict) = if flags_byte & flags::DELTA_SYMBOL_DICT != 0 {
         // Delta mode: ids index the connection-scoped dict.
@@ -954,8 +1002,12 @@ fn decode_symbol(
 
 /// DECIMAL64: column-level 1-byte scale follows the validity section, then
 /// `non_null_count × 8` LE bytes; densified like the fixed-width path.
-fn decode_decimal64(r: &mut ByteReader<'_>, row_count: usize) -> Result<(i8, ColumnBuffer)> {
-    let (scale, buffer) = decode_decimal_wide(r, row_count, 8)?;
+fn decode_decimal64(
+    r: &mut ByteReader<'_>,
+    parent: &Bytes,
+    row_count: usize,
+) -> Result<(i8, ColumnBuffer)> {
+    let (scale, buffer) = decode_decimal_wide(r, parent, row_count, 8)?;
     Ok((scale, buffer))
 }
 
@@ -1030,7 +1082,7 @@ fn is_null_at(bitmap: &[u8], row: usize) -> bool {
     (bitmap[row >> 3] >> (row & 7)) & 1 != 0
 }
 
-fn is_null_at_opt(validity: &Option<Vec<u8>>, row: usize) -> bool {
+fn is_null_at_opt(validity: &Option<Bytes>, row: usize) -> bool {
     match validity {
         None => false,
         Some(bitmap) => is_null_at(bitmap, row),
@@ -1103,7 +1155,7 @@ mod tests {
             self
         }
 
-        fn build(self) -> (u8, Vec<u8>) {
+        fn build(self) -> (u8, Bytes) {
             let mut out = Vec::new();
             out.push(MsgKind::ResultBatch.as_u8());
             out.extend_from_slice(&self.request_id.to_le_bytes());
@@ -1139,7 +1191,7 @@ mod tests {
                 out.extend_from_slice(&data);
             }
 
-            (self.flags, out)
+            (self.flags, Bytes::from(out))
         }
     }
 
@@ -1515,6 +1567,7 @@ mod tests {
         let mut zstd_payload = Vec::new();
         zstd_payload.extend_from_slice(prefix);
         zstd_payload.extend_from_slice(&compressed_body);
+        let zstd_payload = Bytes::from(zstd_payload);
 
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
@@ -1541,6 +1594,7 @@ mod tests {
         };
         let mut payload = raw_payload[..prefix_len].to_vec();
         payload.extend_from_slice(&[0u8, 0, 0, 0]); // not a zstd frame
+        let payload = Bytes::from(payload);
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
         let err = decode_result_batch(&payload, flags::ZSTD, &mut dict, &mut reg).unwrap_err();
@@ -2082,10 +2136,12 @@ mod tests {
 
     #[test]
     fn trailing_bytes_rejected() {
-        let (flags_byte, mut payload) = BatchBuilder::new(1)
+        let (flags_byte, payload) = BatchBuilder::new(1)
             .add_column("v", ColumnKind::Long, col_no_nulls(&le_i64s(&[7])))
             .build();
-        payload.push(0xAA); // trailing byte
+        let mut bytes_vec: Vec<u8> = payload.to_vec();
+        bytes_vec.push(0xAA); // trailing byte
+        let payload = Bytes::from(bytes_vec);
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
         let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap_err();

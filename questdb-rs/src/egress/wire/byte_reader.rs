@@ -42,6 +42,12 @@ impl<'a> ByteReader<'a> {
         Self { bytes, pos: 0 }
     }
 
+    /// Current absolute byte offset into the originally-supplied buffer.
+    /// Use with the parent payload `Bytes` to take a zero-copy owned slice.
+    pub(crate) fn pos(&self) -> usize {
+        self.pos
+    }
+
     pub(crate) fn remaining(&self) -> &'a [u8] {
         &self.bytes[self.pos..]
     }

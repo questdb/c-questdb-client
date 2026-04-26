@@ -208,6 +208,7 @@ name = "questdb-rs"
 version = "6.1.0"
 dependencies = [
  "base64ct",
+ "bytes",
  "dns-lookup",
  "indoc",
  "itoa",

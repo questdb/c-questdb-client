@@ -24,6 +24,10 @@ dns-lookup = "3.0.0"
 base64ct = { version = "1.7", features = ["alloc"] }
 ryu = { version = "1.0" }
 itoa = "1.0"
+# Used in the QWP egress decoder for zero-copy slicing of frame payloads.
+# Re-exported by `tungstenite` but referenced unconditionally here so the
+# decoder compiles regardless of which transport features are enabled.
+bytes = "1.7"
 aws-lc-rs = { version = "1.13", optional = true }
 ring = { version = "0.17.14", optional = true }
 rustls-pki-types = "1.12.0"
@@ -165,3 +169,11 @@ required-features = ["sync-sender-http", "ndarray", "rust_decimal"]
 [[example]]
 name = "protocol_version"
 required-features = ["sync-sender-http", "ndarray", "bigdecimal"]
+
+[[example]]
+name = "qwp_egress_latency"
+required-features = ["sync-reader-ws"]
+
+[[example]]
+name = "qwp_egress_read_wide"
+required-features = ["sync-reader-ws", "sync-sender-http"]

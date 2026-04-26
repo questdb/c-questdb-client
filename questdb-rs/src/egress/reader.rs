@@ -63,6 +63,9 @@ pub struct Reader {
     /// Captured eagerly during connect so multi-addr role filtering
     /// can dismiss endpoints whose role doesn't match `target`.
     server_info: Option<ServerInfo>,
+    /// Total wire bytes (header + payload) consumed since connect.
+    /// Updated on every frame the reader pulls off the transport.
+    bytes_received: u64,
 }
 
 impl Reader {
@@ -101,6 +104,7 @@ impl Reader {
                 next_request_id: 1,
                 cursor_active: false,
                 server_info: None,
+                bytes_received: 0,
             };
             // Eagerly consume the unsolicited SERVER_INFO frame on v2+.
             if reader.transport.server_version() >= 2 {
@@ -148,9 +152,17 @@ impl Reader {
             .unwrap_or_else(|| fmt!(SocketError, "all {} endpoints unreachable", cfg.addrs.len())))
     }
 
+    /// Total wire bytes (frame header + payload) read off the transport
+    /// since this connection was opened. Useful for benchmarking the
+    /// effective throughput a query produces.
+    pub fn bytes_received(&self) -> u64 {
+        self.bytes_received
+    }
+
     /// Read one frame and expect it to be `SERVER_INFO`; store it.
     fn consume_server_info(&mut self) -> Result<()> {
         let (header, payload) = self.transport.read_frame()?;
+        self.bytes_received += HEADER_LEN as u64 + header.payload_length as u64;
         let event = decode_frame(header, &payload, &mut self.dict, &mut self.registry)?;
         match event {
             ServerEvent::ServerInfo(info) => {
@@ -393,6 +405,7 @@ impl<'r> Cursor<'r> {
             let (header, payload) = self.reader.transport.read_frame()?;
             // Capture wire size BEFORE decode (header is consumed).
             let wire_bytes = HEADER_LEN as u64 + header.payload_length as u64;
+            self.reader.bytes_received += wire_bytes;
             let event = decode_frame(
                 header,
                 &payload,
