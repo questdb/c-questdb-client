@@ -890,6 +890,98 @@ fn cursor_terminal_after_select() {
 }
 
 #[test]
+fn multi_batch_streaming() {
+    // Seed N rows and force the server to split the result by setting
+    // X-QWP-Max-Batch-Rows; verify multiple RESULT_BATCH frames arrive
+    // with monotonic batch_seq, the row count adds up, and reused
+    // schemas (mode 0x01) work mid-stream.
+    let srv = server();
+    let table = unique_table("multi_batch");
+    srv.http_exec(&format!(
+        "create table \"{}\" (i long, d double, ts timestamp) timestamp(ts) partition by day wal",
+        table
+    ));
+
+    const TOTAL: usize = 5_000;
+    const PER_BATCH: usize = 1_000;
+    let mut sender = make_sender(srv, ProtocolVersion::V2);
+    let mut buf = sender.new_buffer();
+    for i in 0..TOTAL as i64 {
+        buf.table(table.as_str())
+            .unwrap()
+            .column_i64("i", i)
+            .unwrap()
+            .column_f64("d", i as f64 * 0.5)
+            .unwrap()
+            .at(TimestampNanos::new(1_700_000_000_000_000_000 + i * 1_000_000))
+            .unwrap();
+    }
+    sender.flush(&mut buf).expect("flush");
+    wait_for_rows(srv, &table, TOTAL);
+
+    // Open a dedicated reader with the per-batch row cap set; the
+    // process-wide fixture connection isn't suitable here.
+    let conf = format!("{};max_batch_rows={}", srv.qwp_conf(), PER_BATCH);
+    let mut reader = Reader::from_conf(&conf).expect("reader");
+    let mut cursor = reader
+        .query(&format!("select i, d from \"{}\" order by ts", table))
+        .execute()
+        .expect("execute");
+
+    let mut batch_count = 0usize;
+    let mut total_rows = 0usize;
+    let mut last_batch_seq: Option<u64> = None;
+    let mut first_value: Option<i64> = None;
+    let mut last_value: Option<i64> = None;
+    let mut last_d: Option<f64> = None;
+
+    while let Some(view) = cursor.next_batch().expect("next_batch") {
+        batch_count += 1;
+        let rows = view.row_count();
+
+        // batch_seq must be monotonically increasing.
+        let seq = view.batch_seq();
+        if let Some(prev) = last_batch_seq {
+            assert!(
+                seq > prev,
+                "batch_seq must increase: prev={} this={}",
+                prev,
+                seq
+            );
+        }
+        last_batch_seq = Some(seq);
+
+        let ColumnView::Long(i_col) = view.column(0).unwrap() else { panic!("col 0") };
+        let ColumnView::Double(d_col) = view.column(1).unwrap() else { panic!("col 1") };
+
+        // Spot-check first and last row of each batch.
+        if first_value.is_none() {
+            first_value = Some(i_col.value(0));
+        }
+        if rows > 0 {
+            last_value = Some(i_col.value(rows - 1));
+            last_d = Some(d_col.value(rows - 1));
+        }
+
+        total_rows += rows;
+    }
+
+    assert!(
+        batch_count >= TOTAL / PER_BATCH,
+        "expected at least {} batches, got {}",
+        TOTAL / PER_BATCH,
+        batch_count
+    );
+    assert_eq!(total_rows, TOTAL, "row count mismatch");
+    assert_eq!(first_value, Some(0));
+    assert_eq!(last_value, Some(TOTAL as i64 - 1));
+    assert_eq!(last_d, Some((TOTAL as f64 - 1.0) * 0.5));
+
+    // Cursor should be in End state, not Error.
+    assert!(matches!(cursor.terminal(), Some(Terminal::End { .. })));
+}
+
+#[test]
 fn null_handling_long_densifies() {
     let srv = server();
     let table = unique_table("nulls");
