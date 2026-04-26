@@ -904,6 +904,69 @@ fn bind_double_literal_passthrough() {
 }
 
 #[test]
+fn bind_timestamp_micros_passthrough() {
+    let srv = server();
+    let mut reader = make_reader(srv);
+    let mut cur = reader
+        .query("select $1::timestamp as v")
+        .bind_timestamp_micros(1_700_000_000_123_456)
+        .execute()
+        .expect("execute");
+    let view = cur.next_batch().expect("next").expect("Some");
+    let ColumnView::Timestamp(c) = view.column(0).unwrap() else {
+        panic!("col 0 not timestamp: got {:?}", view.column(0).unwrap().kind())
+    };
+    assert_eq!(c.value(0), 1_700_000_000_123_456);
+}
+
+#[test]
+fn bind_symbol_via_varchar_cast() {
+    // The QWP client doesn't currently expose a Bind::Symbol value
+    // variant (server-side dict lookup is required); the practical path
+    // for binding a symbol value is to bind a VARCHAR and cast it on
+    // the server. This test pins that workflow against a real server
+    // so we know the documented pattern works.
+    let srv = server();
+    let table = unique_table("bind_sym");
+    srv.http_exec(&format!(
+        "create table \"{}\" (s symbol, v long, ts timestamp) timestamp(ts) partition by day wal",
+        table
+    ));
+    let mut sender = make_sender(srv, ProtocolVersion::V2);
+    let mut buf = sender.new_buffer();
+    for (i, sym) in ["AAPL", "MSFT", "GOOG", "AAPL"].iter().enumerate() {
+        buf.table(table.as_str())
+            .unwrap()
+            .symbol("s", *sym)
+            .unwrap()
+            .column_i64("v", i as i64)
+            .unwrap()
+            .at(TimestampNanos::new(1_700_000_000_000_000_000 + i as i64 * 1_000_000))
+            .unwrap();
+    }
+    sender.flush(&mut buf).expect("flush");
+    wait_for_rows(srv, &table, 4);
+
+    let mut reader = make_reader(srv);
+    let mut cur = reader
+        .query(&format!(
+            "select s, v from \"{}\" where s = cast($1 as symbol) order by ts",
+            table
+        ))
+        .bind_varchar("AAPL")
+        .execute()
+        .expect("execute");
+    let view = cur.next_batch().expect("next").expect("Some");
+    assert_eq!(view.row_count(), 2);
+    let ColumnView::Symbol(s) = view.column(0).unwrap() else { panic!() };
+    let ColumnView::Long(v) = view.column(1).unwrap() else { panic!() };
+    assert_eq!(s.resolve(0), Some("AAPL"));
+    assert_eq!(s.resolve(1), Some("AAPL"));
+    assert_eq!(v.value(0), 0);
+    assert_eq!(v.value(1), 3);
+}
+
+#[test]
 fn bind_timestamp_nanos_passthrough() {
     let srv = server();
     let mut reader = make_reader(srv);
@@ -1012,6 +1075,317 @@ fn bind_typed_null_long() {
     let view = cur.next_batch().expect("next").expect("Some");
     let ColumnView::Long(c) = view.column(0).unwrap() else { panic!() };
     assert!(c.is_null(0), "expected null long bind to surface as null row");
+}
+
+// --- Narrow integer binds --------------------------------------------------
+
+#[test]
+fn bind_byte_passthrough() {
+    let srv = server();
+    let mut reader = make_reader(srv);
+    let mut cur = reader
+        .query("select $1::byte as v")
+        .bind_i8(-7)
+        .execute()
+        .expect("execute");
+    let view = cur.next_batch().expect("next").expect("Some");
+    let ColumnView::Byte(c) = view.column(0).unwrap() else {
+        panic!("col 0 not byte: got {:?}", view.column(0).unwrap().kind())
+    };
+    assert_eq!(c.value(0), -7);
+}
+
+#[test]
+fn bind_short_passthrough() {
+    let srv = server();
+    let mut reader = make_reader(srv);
+    let mut cur = reader
+        .query("select $1::short as v")
+        .bind_i16(-30000)
+        .execute()
+        .expect("execute");
+    let view = cur.next_batch().expect("next").expect("Some");
+    let ColumnView::Short(c) = view.column(0).unwrap() else {
+        panic!("col 0 not short: got {:?}", view.column(0).unwrap().kind())
+    };
+    assert_eq!(c.value(0), -30000);
+}
+
+#[test]
+fn bind_int_passthrough() {
+    let srv = server();
+    let mut reader = make_reader(srv);
+    let mut cur = reader
+        .query("select $1::int as v")
+        .bind_i32(0x0102_0304)
+        .execute()
+        .expect("execute");
+    let view = cur.next_batch().expect("next").expect("Some");
+    let ColumnView::Int(c) = view.column(0).unwrap() else {
+        panic!("col 0 not int: got {:?}", view.column(0).unwrap().kind())
+    };
+    assert_eq!(c.value(0), 0x0102_0304);
+}
+
+#[test]
+fn bind_float_passthrough() {
+    // QuestDB's SELECT scalar pipeline promotes FLOAT to DOUBLE on the
+    // result side, so the FLOAT bind comes back as a Double column.
+    // We assert on the value, not the kind.
+    let srv = server();
+    let mut reader = make_reader(srv);
+    let mut cur = reader
+        .query("select $1::float as v")
+        .bind_f32(2.5f32)
+        .execute()
+        .expect("execute");
+    let view = cur.next_batch().expect("next").expect("Some");
+    match view.column(0).unwrap() {
+        ColumnView::Float(c) => assert_eq!(c.value(0), 2.5f32),
+        ColumnView::Double(c) => assert_eq!(c.value(0), 2.5f64),
+        other => panic!("col 0 unexpected kind: {:?}", other.kind()),
+    }
+}
+
+// --- Network / wide types --------------------------------------------------
+
+#[test]
+fn bind_ipv4_rejected_client_side() {
+    // The QuestDB server does not accept IPv4 as a bind value (see
+    // QwpBindValues.java in the Java reference client). The Rust client
+    // rejects these at builder time so the user gets a clear error
+    // instead of a server-side parse failure with a stale request_id.
+    use std::net::Ipv4Addr;
+    let srv = server();
+    let mut reader = make_reader(srv);
+    match reader
+        .query("select 1")
+        .bind_ipv4(Ipv4Addr::new(127, 0, 0, 1))
+        .execute()
+    {
+        Err(e) => assert_eq!(e.code(), questdb::egress::ErrorCode::InvalidBind),
+        Ok(_) => panic!("expected client-side rejection"),
+    }
+}
+
+#[test]
+fn bind_uuid_passthrough() {
+    let srv = server();
+    let mut reader = make_reader(srv);
+    // 16 bytes. We bind raw bytes; the server stores them as a UUID.
+    // We just verify the round-trip matches what we sent.
+    let bytes: [u8; 16] = [
+        0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00,
+        0x00,
+    ];
+    let mut cur = reader
+        .query("select $1::uuid as v")
+        .bind_uuid_bytes(bytes)
+        .execute()
+        .expect("execute");
+    let view = cur.next_batch().expect("next").expect("Some");
+    let ColumnView::Uuid(c) = view.column(0).unwrap() else {
+        panic!("col 0 not uuid: got {:?}", view.column(0).unwrap().kind())
+    };
+    assert_eq!(c.value(0), &bytes);
+}
+
+#[test]
+fn bind_long256_passthrough() {
+    let srv = server();
+    let mut reader = make_reader(srv);
+    let bytes: [u8; 32] = std::array::from_fn(|i| i as u8 + 1);
+    let mut cur = reader
+        .query("select $1::long256 as v")
+        .bind_long256(bytes)
+        .execute()
+        .expect("execute");
+    let view = cur.next_batch().expect("next").expect("Some");
+    let ColumnView::Long256(c) = view.column(0).unwrap() else {
+        panic!("col 0 not long256: got {:?}", view.column(0).unwrap().kind())
+    };
+    assert_eq!(c.value(0), &bytes);
+}
+
+#[test]
+fn bind_char_passthrough() {
+    let srv = server();
+    let mut reader = make_reader(srv);
+    let mut cur = reader
+        .query("select $1::char as v")
+        .bind_char(b'Q' as u16)
+        .execute()
+        .expect("execute");
+    let view = cur.next_batch().expect("next").expect("Some");
+    let ColumnView::Char(c) = view.column(0).unwrap() else {
+        panic!("col 0 not char: got {:?}", view.column(0).unwrap().kind())
+    };
+    assert_eq!(c.value(0), b'Q' as u16);
+}
+
+#[test]
+fn bind_binary_rejected_client_side() {
+    // BINARY isn't accepted as a bind by the server either; client-side
+    // rejection keeps the failure mode clear.
+    let srv = server();
+    let mut reader = make_reader(srv);
+    match reader
+        .query("select 1")
+        .bind_binary(vec![0xDE, 0xAD])
+        .execute()
+    {
+        Err(e) => assert_eq!(e.code(), questdb::egress::ErrorCode::InvalidBind),
+        Ok(_) => panic!("expected client-side rejection"),
+    }
+}
+
+// --- Wide decimals ---------------------------------------------------------
+
+#[test]
+fn bind_decimal128_passthrough() {
+    let srv = server();
+    let mut reader = make_reader(srv);
+    let mut cur = reader
+        .query("select $1::decimal(38,4) as v")
+        .bind_decimal128(123_4567i128, 4) // 12.34567 with scale=4 -> mantissa 1234567 (clamped to 4dp)
+        .execute()
+        .expect("execute");
+    let view = cur.next_batch().expect("next").expect("Some");
+    let ColumnView::Decimal128(c) = view.column(0).unwrap() else {
+        panic!("col 0 not decimal128: got {:?}", view.column(0).unwrap().kind())
+    };
+    assert_eq!(c.scale(), 4);
+    assert_eq!(c.value(0), 123_4567i128);
+}
+
+#[test]
+fn bind_decimal256_passthrough() {
+    let srv = server();
+    let mut reader = make_reader(srv);
+    // i256 mantissa as 32 LE bytes: low 8 bytes = 999_888_777, rest zero.
+    let mut bytes = [0u8; 32];
+    bytes[..8].copy_from_slice(&999_888_777i64.to_le_bytes());
+    let mut cur = reader
+        .query("select $1::decimal(60,6) as v")
+        .bind_decimal256(bytes, 6)
+        .execute()
+        .expect("execute");
+    let view = cur.next_batch().expect("next").expect("Some");
+    let ColumnView::Decimal256(c) = view.column(0).unwrap() else {
+        panic!("col 0 not decimal256: got {:?}", view.column(0).unwrap().kind())
+    };
+    assert_eq!(c.scale(), 6);
+    let got = c.value(0);
+    let lo = i64::from_le_bytes(got[..8].try_into().unwrap());
+    assert_eq!(lo, 999_888_777);
+    assert!(got[8..].iter().all(|b| *b == 0));
+}
+
+// --- Geohash ---------------------------------------------------------------
+
+#[test]
+fn bind_geohash_passthrough() {
+    let srv = server();
+    let mut reader = make_reader(srv);
+    // 40 bits = 8 chars in geohash(8c). We bind a u64 zero-extended to
+    // 5 bytes (ceil(40/8)) on the wire.
+    let value: u64 = 0xAA_BB_CC_DD_EE;
+    let mut cur = reader
+        .query("select cast($1 as geohash(8c)) v")
+        .bind_geohash(value, 40)
+        .execute()
+        .expect("execute");
+    let view = cur.next_batch().expect("next").expect("Some");
+    let ColumnView::Geohash(c) = view.column(0).unwrap() else {
+        panic!("col 0 not geohash: got {:?}", view.column(0).unwrap().kind())
+    };
+    assert_eq!(c.precision_bits(), 40);
+    assert_eq!(c.byte_width(), 5);
+    assert_eq!(c.value(0), value);
+}
+
+// --- Typed-NULL with column-level args -------------------------------------
+
+#[test]
+fn bind_null_varchar_emits_null_row() {
+    let srv = server();
+    let mut reader = make_reader(srv);
+    let mut cur = reader
+        .query("select $1::varchar as v")
+        .bind_null_varchar()
+        .execute()
+        .expect("execute");
+    let view = cur.next_batch().expect("next").expect("Some");
+    let ColumnView::Varchar(c) = view.column(0).unwrap() else { panic!() };
+    assert!(c.is_null(0));
+    assert_eq!(c.value(0), None);
+}
+
+#[test]
+fn bind_null_binary_rejected_client_side() {
+    let srv = server();
+    let mut reader = make_reader(srv);
+    match reader.query("select 1").bind_null_binary().execute() {
+        Err(e) => assert_eq!(e.code(), questdb::egress::ErrorCode::InvalidBind),
+        Ok(_) => panic!("expected client-side rejection"),
+    }
+}
+
+#[test]
+fn bind_null_decimal64_with_scale() {
+    let srv = server();
+    let mut reader = make_reader(srv);
+    let mut cur = reader
+        .query("select $1::decimal(18,2) as v")
+        .bind_null_decimal64(2)
+        .execute()
+        .expect("execute");
+    let view = cur.next_batch().expect("next").expect("Some");
+    let ColumnView::Decimal64(c) = view.column(0).unwrap() else { panic!() };
+    assert!(c.is_null(0));
+}
+
+#[test]
+fn bind_null_decimal128_with_scale() {
+    let srv = server();
+    let mut reader = make_reader(srv);
+    let mut cur = reader
+        .query("select $1::decimal(38,4) as v")
+        .bind_null_decimal128(4)
+        .execute()
+        .expect("execute");
+    let view = cur.next_batch().expect("next").expect("Some");
+    let ColumnView::Decimal128(c) = view.column(0).unwrap() else { panic!() };
+    assert!(c.is_null(0));
+}
+
+#[test]
+fn bind_null_decimal256_with_scale() {
+    let srv = server();
+    let mut reader = make_reader(srv);
+    let mut cur = reader
+        .query("select $1::decimal(60,6) as v")
+        .bind_null_decimal256(6)
+        .execute()
+        .expect("execute");
+    let view = cur.next_batch().expect("next").expect("Some");
+    let ColumnView::Decimal256(c) = view.column(0).unwrap() else { panic!() };
+    assert!(c.is_null(0));
+}
+
+#[test]
+fn bind_null_geohash_with_precision() {
+    let srv = server();
+    let mut reader = make_reader(srv);
+    let mut cur = reader
+        .query("select cast($1 as geohash(8c)) v")
+        .bind_null_geohash(40)
+        .execute()
+        .expect("execute");
+    let view = cur.next_batch().expect("next").expect("Some");
+    let ColumnView::Geohash(c) = view.column(0).unwrap() else { panic!() };
+    assert!(c.is_null(0));
+    assert_eq!(c.precision_bits(), 40);
 }
 
 // ---------------------------------------------------------------------------

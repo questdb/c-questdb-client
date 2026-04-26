@@ -269,11 +269,20 @@ fn write_varlen_offsets(byte_lens: &[usize], out: &mut Vec<u8>) -> Result<()> {
     Ok(())
 }
 
-/// Reject bind kinds the public builder doesn't expose. SYMBOL and array
-/// types remain unsupported as binds for v1.
+/// Reject bind kinds the server doesn't accept as bind values.
+///
+/// Per the Java reference client (`QwpBindValues.java:252-253`), the
+/// server-side bind decoder does not accept SYMBOL, BINARY, IPv4, or
+/// any array type as bind values. Surfacing the rejection client-side
+/// avoids ambiguous server errors (the server's QUERY_ERROR for these
+/// arrives with `request_id=0`, breaking correlation).
 pub fn check_bindable(kind: ColumnKind) -> Result<()> {
     match kind {
-        ColumnKind::Symbol | ColumnKind::DoubleArray | ColumnKind::LongArray => Err(fmt!(
+        ColumnKind::Symbol
+        | ColumnKind::Binary
+        | ColumnKind::Ipv4
+        | ColumnKind::DoubleArray
+        | ColumnKind::LongArray => Err(fmt!(
             InvalidBind,
             "bind not supported for type {} (0x{:02X})",
             kind.name(),
@@ -509,8 +518,11 @@ mod tests {
     // --- check_bindable ----------------------------------------------------
 
     #[test]
-    fn check_bindable_rejects_symbol_and_arrays() {
+    fn check_bindable_rejects_server_unsupported() {
+        // Per the Java client, server doesn't accept these as binds.
         assert!(check_bindable(ColumnKind::Symbol).is_err());
+        assert!(check_bindable(ColumnKind::Binary).is_err());
+        assert!(check_bindable(ColumnKind::Ipv4).is_err());
         assert!(check_bindable(ColumnKind::DoubleArray).is_err());
         assert!(check_bindable(ColumnKind::LongArray).is_err());
     }
@@ -529,11 +541,9 @@ mod tests {
             ColumnKind::TimestampNanos,
             ColumnKind::Date,
             ColumnKind::Uuid,
-            ColumnKind::Ipv4,
             ColumnKind::Long256,
             ColumnKind::Char,
             ColumnKind::Varchar,
-            ColumnKind::Binary,
             ColumnKind::Decimal64,
             ColumnKind::Decimal128,
             ColumnKind::Decimal256,
