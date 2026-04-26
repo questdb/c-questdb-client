@@ -154,6 +154,8 @@ impl<'r> ReaderQuery<'r> {
     bind_method!(bind_timestamp_nanos, v: i64);
     bind_method!(bind_date_millis, v: i64);
     bind_method!(bind_uuid_bytes, v: [u8; 16]);
+    bind_method!(bind_long256, v: [u8; 32]);
+    bind_method!(bind_char, v: u16);
     bind_method!(bind_ipv4, v: Ipv4Addr);
 
     pub fn bind_varchar<S: Into<String>>(mut self, v: S) -> Self {
@@ -166,8 +168,53 @@ impl<'r> ReaderQuery<'r> {
         self
     }
 
+    pub fn bind_decimal128(mut self, value: i128, scale: i8) -> Self {
+        self.builder = self.builder.bind_decimal128(value, scale);
+        self
+    }
+
+    pub fn bind_decimal256(mut self, bytes: [u8; 32], scale: i8) -> Self {
+        self.builder = self.builder.bind_decimal256(bytes, scale);
+        self
+    }
+
+    pub fn bind_geohash(mut self, value: u64, precision_bits: u8) -> Self {
+        self.builder = self.builder.bind_geohash(value, precision_bits);
+        self
+    }
+
     pub fn bind_binary<B: Into<Vec<u8>>>(mut self, v: B) -> Self {
         self.builder = self.builder.bind_binary(v);
+        self
+    }
+
+    pub fn bind_null_varchar(mut self) -> Self {
+        self.builder = self.builder.bind_null_varchar();
+        self
+    }
+
+    pub fn bind_null_binary(mut self) -> Self {
+        self.builder = self.builder.bind_null_binary();
+        self
+    }
+
+    pub fn bind_null_decimal64(mut self, scale: i8) -> Self {
+        self.builder = self.builder.bind_null_decimal64(scale);
+        self
+    }
+
+    pub fn bind_null_decimal128(mut self, scale: i8) -> Self {
+        self.builder = self.builder.bind_null_decimal128(scale);
+        self
+    }
+
+    pub fn bind_null_decimal256(mut self, scale: i8) -> Self {
+        self.builder = self.builder.bind_null_decimal256(scale);
+        self
+    }
+
+    pub fn bind_null_geohash(mut self, precision_bits: u8) -> Self {
+        self.builder = self.builder.bind_null_geohash(precision_bits);
         self
     }
 

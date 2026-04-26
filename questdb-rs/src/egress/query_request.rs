@@ -204,14 +204,50 @@ impl QueryRequestBuilder {
     pub fn bind_uuid_bytes(self, v: [u8; 16]) -> Self {
         self.bind(Bind::Uuid(v))
     }
+    pub fn bind_long256(self, v: [u8; 32]) -> Self {
+        self.bind(Bind::Long256(v))
+    }
+    pub fn bind_char(self, v: u16) -> Self {
+        self.bind(Bind::Char(v))
+    }
     pub fn bind_ipv4(self, v: Ipv4Addr) -> Self {
         self.bind(Bind::Ipv4(v))
     }
     pub fn bind_decimal64(self, value: i64, scale: i8) -> Self {
         self.bind(Bind::Decimal64 { value, scale })
     }
+    pub fn bind_decimal128(self, value: i128, scale: i8) -> Self {
+        self.bind(Bind::Decimal128 { value, scale })
+    }
+    pub fn bind_decimal256(self, bytes: [u8; 32], scale: i8) -> Self {
+        self.bind(Bind::Decimal256 { bytes, scale })
+    }
+    pub fn bind_geohash(self, value: u64, precision_bits: u8) -> Self {
+        self.bind(Bind::Geohash {
+            value,
+            precision_bits,
+        })
+    }
     pub fn bind_binary<B: Into<Vec<u8>>>(self, v: B) -> Self {
         self.bind(Bind::Binary(v.into()))
+    }
+    pub fn bind_null_varchar(self) -> Self {
+        self.bind(Bind::NullVarchar)
+    }
+    pub fn bind_null_binary(self) -> Self {
+        self.bind(Bind::NullBinary)
+    }
+    pub fn bind_null_decimal64(self, scale: i8) -> Self {
+        self.bind(Bind::NullDecimal64 { scale })
+    }
+    pub fn bind_null_decimal128(self, scale: i8) -> Self {
+        self.bind(Bind::NullDecimal128 { scale })
+    }
+    pub fn bind_null_decimal256(self, scale: i8) -> Self {
+        self.bind(Bind::NullDecimal256 { scale })
+    }
+    pub fn bind_null_geohash(self, precision_bits: u8) -> Self {
+        self.bind(Bind::NullGeohash { precision_bits })
     }
 
     /// Validate and finalize.
@@ -301,7 +337,7 @@ mod tests {
         let payload = &buf[HEADER_LEN..];
         // 0x10 | i64 LE 1 | varint(1)=0x01 | "X" | varint(0) | varint(3)=0x03
         // | bind1: 0x05 0x00 i64 LE 42
-        // | bind2: 0x0F 0x00 0x02 'h' 'i'
+        // | bind2: 0x0F 0x00 [offsets 0,2 as u32_le ×2] 'h' 'i'
         // | bind3: 0x01 0x01 0x01
         let mut expected = vec![0x10];
         expected.extend_from_slice(&1i64.to_le_bytes());
@@ -311,7 +347,10 @@ mod tests {
         expected.push(0x03); // bind_count=3
         expected.extend_from_slice(&[0x05, 0x00]);
         expected.extend_from_slice(&42i64.to_le_bytes());
-        expected.extend_from_slice(&[0x0F, 0x00, 0x02, b'h', b'i']);
+        expected.extend_from_slice(&[0x0F, 0x00]);
+        expected.extend_from_slice(&0u32.to_le_bytes());
+        expected.extend_from_slice(&2u32.to_le_bytes());
+        expected.extend_from_slice(&[b'h', b'i']);
         expected.extend_from_slice(&[0x01, 0x01, 0x01]);
         assert_eq!(payload, expected.as_slice());
         assert_eq!(h.payload_length as usize, payload.len());
