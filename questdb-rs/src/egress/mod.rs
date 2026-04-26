@@ -31,9 +31,11 @@
 //! Transport, decoder, and `Reader`/`Cursor`/`Batch` types land in
 //! follow-up changes.
 
+pub mod auth;
 pub mod binds;
 pub mod column;
 pub mod column_kind;
+pub mod config;
 pub mod decoder;
 pub mod error;
 pub mod query_request;
@@ -42,7 +44,9 @@ pub mod server_event;
 pub mod symbol_dict;
 pub mod wire;
 
+pub use auth::AuthMode;
 pub use binds::Bind;
+pub use config::{Compression, ReaderConfig, Target, TlsVerify};
 pub use column::{
     BinaryColumn, ColumnView, Decimal128Column, Decimal256Column, Decimal64Column,
     DoubleArrayColumn, FixedBytesColumn, FixedColumn, FixedWidth, GeohashColumn, Long256Column,
