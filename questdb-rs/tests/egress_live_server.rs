@@ -858,6 +858,163 @@ fn query_error_for_bad_sql() {
 }
 
 // ---------------------------------------------------------------------------
+// Bind parameters
+// ---------------------------------------------------------------------------
+
+#[test]
+fn bind_long_literal_passthrough() {
+    let srv = server();
+    let mut reader = make_reader(srv);
+    let mut cur = reader
+        .query("select $1::long as v")
+        .bind_i64(0x0102_0304_0506_0708)
+        .execute()
+        .expect("execute");
+    let view = cur.next_batch().expect("next").expect("Some");
+    let ColumnView::Long(c) = view.column(0).unwrap() else { panic!("col 0") };
+    assert_eq!(c.value(0), 0x0102_0304_0506_0708);
+}
+
+#[test]
+fn bind_varchar_literal_passthrough() {
+    let srv = server();
+    let mut reader = make_reader(srv);
+    let mut cur = reader
+        .query("select $1::varchar as v")
+        .bind_varchar("café")
+        .execute()
+        .expect("execute");
+    let view = cur.next_batch().expect("next").expect("Some");
+    let ColumnView::Varchar(c) = view.column(0).unwrap() else { panic!("col 0") };
+    assert_eq!(c.value(0), Some("café"));
+}
+
+#[test]
+fn bind_double_literal_passthrough() {
+    let srv = server();
+    let mut reader = make_reader(srv);
+    let mut cur = reader
+        .query("select $1::double as v")
+        .bind_f64(2.718281828)
+        .execute()
+        .expect("execute");
+    let view = cur.next_batch().expect("next").expect("Some");
+    let ColumnView::Double(c) = view.column(0).unwrap() else { panic!("col 0") };
+    assert_eq!(c.value(0), 2.718281828);
+}
+
+#[test]
+fn bind_timestamp_nanos_passthrough() {
+    let srv = server();
+    let mut reader = make_reader(srv);
+    let mut cur = reader
+        .query("select $1::timestamp_ns as v")
+        .bind_timestamp_nanos(1_700_000_000_123_456_789)
+        .execute()
+        .expect("execute");
+    let view = cur.next_batch().expect("next").expect("Some");
+    let ColumnView::TimestampNanos(c) = view.column(0).unwrap() else {
+        panic!("col 0 not timestamp_nanos: got {:?}", view.column(0).unwrap().kind())
+    };
+    assert_eq!(c.value(0), 1_700_000_000_123_456_789);
+}
+
+#[test]
+fn bind_decimal64_passthrough() {
+    let srv = server();
+    let mut reader = make_reader(srv);
+    // Bind value is stored as scale=2 decimal: 12345 / 100 = 123.45.
+    let mut cur = reader
+        .query("select $1::decimal(18,2) as v")
+        .bind_decimal64(12345, 2)
+        .execute()
+        .expect("execute");
+    let view = cur.next_batch().expect("next").expect("Some");
+    let ColumnView::Decimal64(c) = view.column(0).unwrap() else {
+        panic!("col 0 not decimal64: got {:?}", view.column(0).unwrap().kind())
+    };
+    assert_eq!(c.scale(), 2);
+    assert_eq!(c.value(0), 12345);
+}
+
+#[test]
+fn bind_multiple_binds_in_one_query() {
+    let srv = server();
+    let mut reader = make_reader(srv);
+    let mut cur = reader
+        .query("select $1::long as a, $2::varchar as b, $3::double as c")
+        .bind_i64(42)
+        .bind_varchar("hello")
+        .bind_f64(3.5)
+        .execute()
+        .expect("execute");
+    let view = cur.next_batch().expect("next").expect("Some");
+    assert_eq!(view.column_count(), 3);
+
+    let ColumnView::Long(a) = view.column(0).unwrap() else { panic!("col 0") };
+    let ColumnView::Varchar(b) = view.column(1).unwrap() else { panic!("col 1") };
+    let ColumnView::Double(c) = view.column(2).unwrap() else { panic!("col 2") };
+    assert_eq!(a.value(0), 42);
+    assert_eq!(b.value(0), Some("hello"));
+    assert_eq!(c.value(0), 3.5);
+}
+
+#[test]
+fn bind_in_where_clause_filters_rows() {
+    let srv = server();
+    let table = unique_table("bind_filter");
+    srv.http_exec(&format!(
+        "create table \"{}\" (id long, ts timestamp) timestamp(ts) partition by day wal",
+        table
+    ));
+    let mut sender = make_sender(srv, ProtocolVersion::V2);
+    let mut buf = sender.new_buffer();
+    for i in 0..10i64 {
+        buf.table(table.as_str())
+            .unwrap()
+            .column_i64("id", i)
+            .unwrap()
+            .at(TimestampNanos::new(1_700_000_000_000_000_000 + i * 1_000_000))
+            .unwrap();
+    }
+    sender.flush(&mut buf).expect("flush");
+    wait_for_rows(srv, &table, 10);
+
+    let mut reader = make_reader(srv);
+    let mut cur = reader
+        .query(&format!(
+            "select id from \"{}\" where id >= $1 and id < $2 order by id",
+            table
+        ))
+        .bind_i64(3)
+        .bind_i64(7)
+        .execute()
+        .expect("execute");
+    let view = cur.next_batch().expect("next").expect("Some");
+    assert_eq!(view.row_count(), 4); // ids 3,4,5,6
+    let ColumnView::Long(c) = view.column(0).unwrap() else { panic!() };
+    assert_eq!(c.value(0), 3);
+    assert_eq!(c.value(1), 4);
+    assert_eq!(c.value(2), 5);
+    assert_eq!(c.value(3), 6);
+}
+
+#[test]
+fn bind_typed_null_long() {
+    use questdb::egress::column_kind::ColumnKind;
+    let srv = server();
+    let mut reader = make_reader(srv);
+    let mut cur = reader
+        .query("select $1::long as v")
+        .bind_null(ColumnKind::Long)
+        .execute()
+        .expect("execute");
+    let view = cur.next_batch().expect("next").expect("Some");
+    let ColumnView::Long(c) = view.column(0).unwrap() else { panic!() };
+    assert!(c.is_null(0), "expected null long bind to surface as null row");
+}
+
+// ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
 
@@ -966,6 +1123,10 @@ fn multi_batch_streaming() {
         total_rows += rows;
     }
 
+    eprintln!(
+        "[multi_batch_streaming] batches={} total_rows={} max_batch_seq={:?}",
+        batch_count, total_rows, last_batch_seq
+    );
     assert!(
         batch_count >= TOTAL / PER_BATCH,
         "expected at least {} batches, got {}",
