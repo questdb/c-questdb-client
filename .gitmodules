@@ -1,0 +1,4 @@
+[submodule "questdb"]
+	path = questdb
+	url = https://github.com/questdb/questdb.git
+	branch = master
