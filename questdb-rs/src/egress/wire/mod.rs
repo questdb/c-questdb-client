@@ -24,6 +24,7 @@
 
 //! QWP wire codec primitives: frame header, varint, message kinds.
 
+pub mod bit_reader;
 pub mod byte_reader;
 pub mod cache_reset;
 pub mod header;

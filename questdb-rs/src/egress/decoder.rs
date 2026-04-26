@@ -707,24 +707,74 @@ fn decode_temporal(
     row_count: usize,
     flags_byte: u8,
 ) -> Result<ColumnBuffer> {
-    if flags_byte & flags::GORILLA != 0 {
-        // The discriminator precedes validity per the spec.
-        let disc = r.read_u8()?;
-        if disc == 0x01 {
-            return Err(fmt!(
-                UnsupportedServer,
-                "Gorilla-encoded temporals are not yet supported by this client"
-            ));
-        }
-        if disc != 0x00 {
-            return Err(fmt!(
-                ProtocolError,
-                "unknown temporal encoding discriminator 0x{:02X}",
-                disc
-            ));
+    if flags_byte & flags::GORILLA == 0 {
+        return decode_fixed(r, row_count, 8);
+    }
+
+    // Validity comes first under FLAG_GORILLA, same as every other column.
+    let validity = decode_validity(r, row_count)?;
+    let non_null = match &validity {
+        None => row_count,
+        Some(bitmap) => row_count - count_nulls(bitmap, row_count),
+    };
+
+    let disc = r.read_u8()?;
+    match disc {
+        0x00 => densify_fixed(r, row_count, 8, validity),
+        0x01 => decode_gorilla_temporal(r, row_count, non_null, validity),
+        other => Err(fmt!(
+            ProtocolError,
+            "unknown temporal encoding discriminator 0x{:02X}",
+            other
+        )),
+    }
+}
+
+fn decode_gorilla_temporal(
+    r: &mut ByteReader<'_>,
+    row_count: usize,
+    non_null: usize,
+    validity: Option<Vec<u8>>,
+) -> Result<ColumnBuffer> {
+    if non_null < 3 {
+        return Err(fmt!(
+            ProtocolError,
+            "Gorilla-encoded column must have non_null >= 3 (got {})",
+            non_null
+        ));
+    }
+    // Two i64 LE seed timestamps, then the bitstream.
+    let seed = r.read_bytes(16)?;
+    let first_ts = i64::from_le_bytes(seed[..8].try_into().unwrap());
+    let second_ts = i64::from_le_bytes(seed[8..16].try_into().unwrap());
+
+    let bitstream = r.remaining();
+    let mut decoder =
+        crate::egress::gorilla::GorillaDecoder::new(first_ts, second_ts, bitstream);
+
+    let mut decoded = Vec::with_capacity(non_null);
+    decoded.push(first_ts);
+    decoded.push(second_ts);
+    for _ in 2..non_null {
+        decoded.push(decoder.decode_next()?);
+    }
+    let consumed = decoder.bytes_consumed();
+    r.advance(consumed)?;
+
+    // Densify into row_count × 8 with null slots zeroed.
+    let mut dense = vec![0u8; row_count * 8];
+    let mut next = 0usize;
+    for row in 0..row_count {
+        if !is_null_at_opt(&validity, row) {
+            let v = decoded[next];
+            dense[row * 8..row * 8 + 8].copy_from_slice(&v.to_le_bytes());
+            next += 1;
         }
     }
-    decode_fixed(r, row_count, 8)
+    Ok(ColumnBuffer {
+        values: dense,
+        validity,
+    })
 }
 
 /// SYMBOL: connection-scoped delta dict path only. Per non-null row, a varint
@@ -1106,23 +1156,131 @@ mod tests {
     }
 
     #[test]
-    fn rejects_gorilla_encoded_timestamp() {
-        // 1 timestamp column, gorilla flag, discriminator 0x01.
-        let mut col_data = vec![0x01u8]; // gorilla discriminator
-        // The decoder rejects before reading further.
+    fn rejects_unknown_temporal_discriminator() {
+        // 1 timestamp column, gorilla flag, but an unknown discriminator
+        // (0x02 — not raw, not Gorilla).
+        let mut col_data = vec![0x00u8]; // null_flag = no bitmap (1 row, no nulls)
+        col_data.push(0x02); // unknown discriminator
         let (_, payload) = BatchBuilder::new(1)
             .with_flags(flags::GORILLA)
-            .add_column("ts", ColumnKind::TimestampNanos, {
-                col_data.push(0x00);
-                col_data.extend_from_slice(&0i64.to_le_bytes());
-                col_data
-            })
+            .add_column("ts", ColumnKind::TimestampNanos, col_data)
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
         let err = decode_result_batch(&payload, flags::GORILLA, &mut dict, &mut reg).unwrap_err();
-        assert_eq!(err.code(), ErrorCode::UnsupportedServer);
-        assert!(err.msg().to_lowercase().contains("gorilla"));
+        assert_eq!(err.code(), ErrorCode::ProtocolError);
+        assert!(err.msg().to_lowercase().contains("discriminator"));
+    }
+
+    #[test]
+    fn rejects_gorilla_with_too_few_non_null() {
+        // Gorilla requires non_null >= 3 (server shortcuts the 1-2 case to
+        // raw); fewer than 3 in the Gorilla branch is malformed.
+        let mut col_data = vec![0x00u8]; // null_flag
+        col_data.push(0x01); // gorilla discriminator
+        // 2 seed timestamps would be 16 bytes, but row_count=2 < 3.
+        col_data.extend_from_slice(&0i64.to_le_bytes());
+        col_data.extend_from_slice(&100i64.to_le_bytes());
+        let (_, payload) = BatchBuilder::new(2)
+            .with_flags(flags::GORILLA)
+            .add_column("ts", ColumnKind::TimestampNanos, col_data)
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let err = decode_result_batch(&payload, flags::GORILLA, &mut dict, &mut reg).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ProtocolError);
+    }
+
+    #[test]
+    fn raw_temporal_under_gorilla_flag_decodes() {
+        // Under FLAG_GORILLA the column body is `validity, disc, ...`. With
+        // disc=0x00 the values are plain i64 LE (densified for nulls).
+        let mut col_data = vec![0x00u8]; // no bitmap
+        col_data.push(0x00); // disc = raw
+        col_data.extend_from_slice(&le_i64s(&[10, 20, 30]));
+        let (_, payload) = BatchBuilder::new(3)
+            .with_flags(flags::GORILLA)
+            .add_column("ts", ColumnKind::TimestampNanos, col_data)
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let batch = decode_result_batch(&payload, flags::GORILLA, &mut dict, &mut reg).unwrap();
+        let view = batch.column_view(0, &dict).unwrap();
+        let ColumnView::TimestampNanos(c) = view else { panic!() };
+        assert_eq!(c.value(0), 10);
+        assert_eq!(c.value(1), 20);
+        assert_eq!(c.value(2), 30);
+    }
+
+    #[test]
+    fn decode_gorilla_temporal_round_trip() {
+        // Encode a synthetic Gorilla bitstream matching the Java encoder
+        // and verify the decoder produces the same timestamps.
+        let timestamps: [i64; 6] = [1_000, 1_100, 1_200, 1_310, 1_405, 1_488];
+        // First two are seed; remaining are DoD-encoded.
+        let mut prev_delta = timestamps[1] - timestamps[0];
+        let mut prev_ts = timestamps[1];
+        let mut bytes = Vec::new();
+        let mut cur: u8 = 0;
+        let mut bits: u32 = 0;
+        let mut write_bit = |b: u8, bytes: &mut Vec<u8>, cur: &mut u8, bits: &mut u32| {
+            *cur |= (b & 1) << *bits;
+            *bits += 1;
+            if *bits == 8 {
+                bytes.push(*cur);
+                *cur = 0;
+                *bits = 0;
+            }
+        };
+        let mut write_bits = |val: u64, n: u32, bytes: &mut Vec<u8>, cur: &mut u8, bits: &mut u32| {
+            for i in 0..n {
+                write_bit(((val >> i) & 1) as u8, bytes, cur, bits);
+            }
+        };
+        for &ts in &timestamps[2..] {
+            let delta = ts - prev_ts;
+            let dod = delta - prev_delta;
+            if dod == 0 {
+                write_bit(0, &mut bytes, &mut cur, &mut bits);
+            } else if (-64..=63).contains(&dod) {
+                write_bits(0b01, 2, &mut bytes, &mut cur, &mut bits);
+                write_bits((dod as u64) & 0x7F, 7, &mut bytes, &mut cur, &mut bits);
+            } else if (-256..=255).contains(&dod) {
+                write_bits(0b011, 3, &mut bytes, &mut cur, &mut bits);
+                write_bits((dod as u64) & 0x1FF, 9, &mut bytes, &mut cur, &mut bits);
+            } else if (-2048..=2047).contains(&dod) {
+                write_bits(0b0111, 4, &mut bytes, &mut cur, &mut bits);
+                write_bits((dod as u64) & 0xFFF, 12, &mut bytes, &mut cur, &mut bits);
+            } else {
+                write_bits(0b1111, 4, &mut bytes, &mut cur, &mut bits);
+                write_bits((dod as u64) & 0xFFFF_FFFF, 32, &mut bytes, &mut cur, &mut bits);
+            }
+            prev_delta = delta;
+            prev_ts = ts;
+        }
+        if bits > 0 {
+            bytes.push(cur);
+        }
+
+        // Build the column body: validity (no nulls), disc=0x01, 16-byte seed, bitstream.
+        let mut col = vec![0x00u8]; // null_flag
+        col.push(0x01); // gorilla disc
+        col.extend_from_slice(&timestamps[0].to_le_bytes());
+        col.extend_from_slice(&timestamps[1].to_le_bytes());
+        col.extend_from_slice(&bytes);
+
+        let (_, payload) = BatchBuilder::new(timestamps.len())
+            .with_flags(flags::GORILLA)
+            .add_column("ts", ColumnKind::TimestampNanos, col)
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let batch = decode_result_batch(&payload, flags::GORILLA, &mut dict, &mut reg).unwrap();
+        let view = batch.column_view(0, &dict).unwrap();
+        let ColumnView::TimestampNanos(c) = view else { panic!() };
+        for (i, &expected) in timestamps.iter().enumerate() {
+            assert_eq!(c.value(i), expected, "row {}", i);
+        }
     }
 
     fn build_double_array_row(shape: &[u32], elements: &[f64]) -> Vec<u8> {

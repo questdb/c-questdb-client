@@ -38,6 +38,7 @@ pub mod column_kind;
 pub mod config;
 pub mod decoder;
 pub mod error;
+pub mod gorilla;
 pub mod query_request;
 pub mod schema;
 #[cfg(feature = "sync-reader-ws")]
