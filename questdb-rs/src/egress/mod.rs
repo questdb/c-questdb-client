@@ -45,11 +45,11 @@ pub mod wire;
 pub use binds::Bind;
 pub use column::{
     BinaryColumn, ColumnView, Decimal128Column, Decimal256Column, Decimal64Column,
-    FixedBytesColumn, FixedColumn, FixedWidth, GeohashColumn, Long256Column, SymbolColumn,
-    UuidColumn, Validity, VarcharColumn,
+    DoubleArrayColumn, FixedBytesColumn, FixedColumn, FixedWidth, GeohashColumn, Long256Column,
+    LongArrayColumn, SymbolColumn, UuidColumn, Validity, VarcharColumn,
 };
 pub use column_kind::ColumnKind;
-pub use decoder::{ColumnBuffer, DecodedBatch, DecodedColumn, decode_result_batch};
+pub use decoder::{ArrayBuffers, ColumnBuffer, DecodedBatch, DecodedColumn, decode_result_batch};
 pub use error::{Error, ErrorCode, Result};
 pub use query_request::{QueryRequest, QueryRequestBuilder};
 pub use schema::{DecodedSchema, Schema, SchemaColumn, SchemaMode, SchemaRegistry};

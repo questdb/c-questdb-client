@@ -712,6 +712,182 @@ impl<'a> Decimal256Column<'a> {
 }
 
 // ---------------------------------------------------------------------------
+// DOUBLE_ARRAY / LONG_ARRAY
+// ---------------------------------------------------------------------------
+
+/// Borrowed view over per-row shape + flat element bytes for an array
+/// column. Each row is independently shaped (n-D); null rows have
+/// zero-length shape and zero-length data slices.
+///
+/// Used internally by [`DoubleArrayColumn`] and [`LongArrayColumn`].
+#[derive(Debug, Clone, Copy)]
+struct ArrayLayout<'a> {
+    /// Byte offsets into `data` per row; length `row_count + 1`.
+    data_offsets: &'a [u32],
+    /// Concatenated little-endian element bytes for all non-null rows.
+    data: &'a [u8],
+    /// Concatenated per-row shape entries.
+    shapes: &'a [u32],
+    /// Offsets into `shapes` per row; length `row_count + 1`.
+    shape_offsets: &'a [u32],
+    validity: Validity<'a>,
+}
+
+impl<'a> ArrayLayout<'a> {
+    fn len(&self) -> usize {
+        self.data_offsets.len().saturating_sub(1)
+    }
+
+    fn shape(&self, row: usize) -> Option<&'a [u32]> {
+        if self.validity.is_null(row) {
+            return None;
+        }
+        let s = *self.shape_offsets.get(row)? as usize;
+        let e = *self.shape_offsets.get(row + 1)? as usize;
+        self.shapes.get(s..e)
+    }
+
+    fn raw(&self, row: usize) -> Option<&'a [u8]> {
+        if self.validity.is_null(row) {
+            return None;
+        }
+        let s = *self.data_offsets.get(row)? as usize;
+        let e = *self.data_offsets.get(row + 1)? as usize;
+        self.data.get(s..e)
+    }
+}
+
+/// `DOUBLE_ARRAY` column: per-row n-D shape and flat little-endian `f64`
+/// elements.
+#[derive(Debug, Clone, Copy)]
+pub struct DoubleArrayColumn<'a> {
+    inner: ArrayLayout<'a>,
+}
+
+impl<'a> DoubleArrayColumn<'a> {
+    pub fn new(
+        data_offsets: &'a [u32],
+        data: &'a [u8],
+        shapes: &'a [u32],
+        shape_offsets: &'a [u32],
+        validity: Validity<'a>,
+    ) -> Self {
+        Self {
+            inner: ArrayLayout {
+                data_offsets,
+                data,
+                shapes,
+                shape_offsets,
+                validity,
+            },
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.len() == 0
+    }
+
+    pub fn validity(&self) -> Validity<'a> {
+        self.inner.validity
+    }
+
+    pub fn is_null(&self, row: usize) -> bool {
+        self.inner.validity.is_null(row)
+    }
+
+    /// Per-row shape (`None` for null rows).
+    pub fn shape(&self, row: usize) -> Option<&'a [u32]> {
+        self.inner.shape(row)
+    }
+
+    /// Flat little-endian element bytes for `row` (`None` for null rows).
+    /// Decode each 8-byte chunk as `f64::from_le_bytes`.
+    pub fn raw(&self, row: usize) -> Option<&'a [u8]> {
+        self.inner.raw(row)
+    }
+
+    /// Element count for `row` (product of shape; 0 for null rows).
+    pub fn element_count(&self, row: usize) -> usize {
+        self.raw(row).map(|b| b.len() / 8).unwrap_or(0)
+    }
+
+    /// Decode element at flat index `idx` of `row`. Caller must respect
+    /// shape ordering; this is row-major flat indexing.
+    pub fn element(&self, row: usize, idx: usize) -> Option<f64> {
+        let bytes = self.raw(row)?;
+        let s = idx.checked_mul(8)?;
+        let chunk = bytes.get(s..s + 8)?;
+        Some(f64::from_le_bytes(chunk.try_into().expect("8 bytes")))
+    }
+}
+
+/// `LONG_ARRAY` column: per-row n-D shape and flat little-endian `i64`
+/// elements.
+#[derive(Debug, Clone, Copy)]
+pub struct LongArrayColumn<'a> {
+    inner: ArrayLayout<'a>,
+}
+
+impl<'a> LongArrayColumn<'a> {
+    pub fn new(
+        data_offsets: &'a [u32],
+        data: &'a [u8],
+        shapes: &'a [u32],
+        shape_offsets: &'a [u32],
+        validity: Validity<'a>,
+    ) -> Self {
+        Self {
+            inner: ArrayLayout {
+                data_offsets,
+                data,
+                shapes,
+                shape_offsets,
+                validity,
+            },
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.len() == 0
+    }
+
+    pub fn validity(&self) -> Validity<'a> {
+        self.inner.validity
+    }
+
+    pub fn is_null(&self, row: usize) -> bool {
+        self.inner.validity.is_null(row)
+    }
+
+    pub fn shape(&self, row: usize) -> Option<&'a [u32]> {
+        self.inner.shape(row)
+    }
+
+    pub fn raw(&self, row: usize) -> Option<&'a [u8]> {
+        self.inner.raw(row)
+    }
+
+    pub fn element_count(&self, row: usize) -> usize {
+        self.raw(row).map(|b| b.len() / 8).unwrap_or(0)
+    }
+
+    pub fn element(&self, row: usize, idx: usize) -> Option<i64> {
+        let bytes = self.raw(row)?;
+        let s = idx.checked_mul(8)?;
+        let chunk = bytes.get(s..s + 8)?;
+        Some(i64::from_le_bytes(chunk.try_into().expect("8 bytes")))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ColumnView discriminated union
 // ---------------------------------------------------------------------------
 
@@ -748,6 +924,8 @@ pub enum ColumnView<'a> {
     Geohash(GeohashColumn<'a>),
     Decimal128(Decimal128Column<'a>),
     Decimal256(Decimal256Column<'a>),
+    DoubleArray(DoubleArrayColumn<'a>),
+    LongArray(LongArrayColumn<'a>),
 }
 
 impl ColumnView<'_> {
@@ -774,6 +952,8 @@ impl ColumnView<'_> {
             ColumnView::Geohash(_) => ColumnKind::Geohash,
             ColumnView::Decimal128(_) => ColumnKind::Decimal128,
             ColumnView::Decimal256(_) => ColumnKind::Decimal256,
+            ColumnView::DoubleArray(_) => ColumnKind::DoubleArray,
+            ColumnView::LongArray(_) => ColumnKind::LongArray,
         }
     }
 
@@ -800,6 +980,8 @@ impl ColumnView<'_> {
             ColumnView::Geohash(c) => c.len(),
             ColumnView::Decimal128(c) => c.len(),
             ColumnView::Decimal256(c) => c.len(),
+            ColumnView::DoubleArray(c) => c.len(),
+            ColumnView::LongArray(c) => c.len(),
         }
     }
 
@@ -830,6 +1012,8 @@ impl ColumnView<'_> {
             ColumnView::Geohash(c) => c.is_null(row),
             ColumnView::Decimal128(c) => c.is_null(row),
             ColumnView::Decimal256(c) => c.is_null(row),
+            ColumnView::DoubleArray(c) => c.is_null(row),
+            ColumnView::LongArray(c) => c.is_null(row),
         }
     }
 }

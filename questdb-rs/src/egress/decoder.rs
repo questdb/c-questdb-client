@@ -60,8 +60,9 @@
 //!   DECIMAL128/256, DOUBLE_ARRAY, LONG_ARRAY
 
 use crate::egress::column::{
-    BinaryColumn, ColumnView, Decimal128Column, Decimal256Column, Decimal64Column, FixedColumn,
-    GeohashColumn, Long256Column, SymbolColumn, UuidColumn, Validity, VarcharColumn,
+    BinaryColumn, ColumnView, Decimal128Column, Decimal256Column, Decimal64Column,
+    DoubleArrayColumn, FixedColumn, GeohashColumn, Long256Column, LongArrayColumn, SymbolColumn,
+    UuidColumn, Validity, VarcharColumn,
 };
 use crate::egress::column_kind::ColumnKind;
 use crate::egress::error::{Error, Result, fmt};
@@ -137,6 +138,24 @@ pub enum DecodedColumn {
         buffer: ColumnBuffer,
         scale: i8,
     },
+    DoubleArray(ArrayBuffers),
+    LongArray(ArrayBuffers),
+}
+
+/// Owned per-column buffers for an array column. All four offset/buffer
+/// arrays are dense over `row_count`; null rows have empty shape and data
+/// slices.
+#[derive(Debug, Clone)]
+pub struct ArrayBuffers {
+    /// Byte offsets into `data` per row; length `row_count + 1`.
+    pub data_offsets: Vec<u32>,
+    /// Concatenated little-endian element bytes (8 B per element).
+    pub data: Vec<u8>,
+    /// Concatenated per-row shape entries (one `u32` per dimension).
+    pub shapes: Vec<u32>,
+    /// Offsets into `shapes` per row; length `row_count + 1`.
+    pub shape_offsets: Vec<u32>,
+    pub validity: Option<Vec<u8>>,
 }
 
 /// One decoded `RESULT_BATCH`.
@@ -201,6 +220,20 @@ impl DecodedBatch {
             DecodedColumn::Decimal256 { buffer, scale } => ColumnView::Decimal256(
                 Decimal256Column::new(&buffer.values, validity_of(buffer, self.row_count), *scale),
             ),
+            DecodedColumn::DoubleArray(b) => ColumnView::DoubleArray(DoubleArrayColumn::new(
+                &b.data_offsets,
+                &b.data,
+                &b.shapes,
+                &b.shape_offsets,
+                validity_from_opt(&b.validity, self.row_count),
+            )),
+            DecodedColumn::LongArray(b) => ColumnView::LongArray(LongArrayColumn::new(
+                &b.data_offsets,
+                &b.data,
+                &b.shapes,
+                &b.shape_offsets,
+                validity_from_opt(&b.validity, self.row_count),
+            )),
         })
     }
 }
@@ -386,14 +419,93 @@ fn decode_column(
             DecodedColumn::Decimal256 { buffer, scale }
         }
 
-        ColumnKind::DoubleArray | ColumnKind::LongArray => {
+        ColumnKind::DoubleArray => DecodedColumn::DoubleArray(decode_array(r, row_count)?),
+        ColumnKind::LongArray => DecodedColumn::LongArray(decode_array(r, row_count)?),
+    })
+}
+
+/// Maximum element count we accept for a single array row, as a guard
+/// against decode-bombs from a hostile server. 16M elements × 8 B = 128 MiB
+/// per row, which already exceeds the per-batch wire cap.
+const MAX_ARRAY_ELEMENTS_PER_ROW: u64 = 16 * 1024 * 1024;
+
+/// DOUBLE_ARRAY / LONG_ARRAY column body (after validity).
+///
+/// Per non-null row: `1B nDims` + `nDims × u32_le dim_lens` + `prod(dims) × 8 LE element bytes`.
+/// Element type only differs by interpretation — wire is identical, so
+/// one decoder serves both.
+fn decode_array(r: &mut ByteReader<'_>, row_count: usize) -> Result<ArrayBuffers> {
+    let validity = decode_validity(r, row_count)?;
+
+    let mut data_offsets = Vec::with_capacity(row_count + 1);
+    let mut data: Vec<u8> = Vec::new();
+    let mut shapes: Vec<u32> = Vec::new();
+    let mut shape_offsets = Vec::with_capacity(row_count + 1);
+
+    data_offsets.push(0u32);
+    shape_offsets.push(0u32);
+
+    for row in 0..row_count {
+        if is_null_at_opt(&validity, row) {
+            data_offsets.push(*data_offsets.last().unwrap());
+            shape_offsets.push(*shape_offsets.last().unwrap());
+            continue;
+        }
+
+        let n_dims = r.read_u8()? as usize;
+        if n_dims == 0 {
             return Err(fmt!(
-                UnsupportedServer,
-                "decoder does not yet support column kind {} (0x{:02X})",
-                kind.name(),
-                kind.as_u8()
+                ProtocolError,
+                "array row {} has nDims=0 (must be >= 1)",
+                row
             ));
         }
+
+        let mut total: u64 = 1;
+        let dims_start = shapes.len();
+        for d in 0..n_dims {
+            let dim_bytes = r.read_bytes(4)?;
+            let dim = u32::from_le_bytes(dim_bytes.try_into().unwrap());
+            shapes.push(dim);
+            total = total.checked_mul(dim as u64).ok_or_else(|| {
+                fmt!(
+                    ProtocolError,
+                    "array row {} shape product overflow at dim {}",
+                    row,
+                    d
+                )
+            })?;
+        }
+        if total > MAX_ARRAY_ELEMENTS_PER_ROW {
+            return Err(fmt!(
+                LimitExceeded,
+                "array row {} has {} elements (max {})",
+                row,
+                total,
+                MAX_ARRAY_ELEMENTS_PER_ROW
+            ));
+        }
+        let byte_count = (total as usize)
+            .checked_mul(8)
+            .ok_or_else(|| fmt!(ProtocolError, "array row {} byte count overflow", row))?;
+        let elements = r.read_bytes(byte_count)?;
+        data.extend_from_slice(elements);
+
+        let new_data_off = u32::try_from(data.len()).map_err(|_| {
+            fmt!(ProtocolError, "array column data exceeds u32 byte offset")
+        })?;
+        data_offsets.push(new_data_off);
+        let new_shape_off = u32::try_from(dims_start + n_dims)
+            .map_err(|_| fmt!(ProtocolError, "array column shape table exceeds u32"))?;
+        shape_offsets.push(new_shape_off);
+    }
+
+    Ok(ArrayBuffers {
+        data_offsets,
+        data,
+        shapes,
+        shape_offsets,
+        validity,
     })
 }
 
@@ -1013,17 +1125,104 @@ mod tests {
         assert!(err.msg().to_lowercase().contains("gorilla"));
     }
 
+    fn build_double_array_row(shape: &[u32], elements: &[f64]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(shape.len() as u8);
+        for d in shape {
+            out.extend_from_slice(&d.to_le_bytes());
+        }
+        for e in elements {
+            out.extend_from_slice(&e.to_le_bytes());
+        }
+        out
+    }
+
+    fn build_long_array_row(shape: &[u32], elements: &[i64]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(shape.len() as u8);
+        for d in shape {
+            out.extend_from_slice(&d.to_le_bytes());
+        }
+        for e in elements {
+            out.extend_from_slice(&e.to_le_bytes());
+        }
+        out
+    }
+
     #[test]
-    fn rejects_unsupported_column_kind() {
-        // DoubleArray isn't decoded yet.
+    fn decode_double_array_1d_no_nulls() {
+        let mut col = vec![0x00u8]; // null_flag
+        col.extend_from_slice(&build_double_array_row(&[3], &[1.0, 2.0, 3.0]));
+        col.extend_from_slice(&build_double_array_row(&[2], &[10.0, 20.0]));
+        let (flags_byte, payload) = BatchBuilder::new(2)
+            .add_column("a", ColumnKind::DoubleArray, col)
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let view = batch.column_view(0, &dict).unwrap();
+        let ColumnView::DoubleArray(c) = view else { panic!() };
+        assert_eq!(c.len(), 2);
+        assert_eq!(c.shape(0), Some(&[3u32][..]));
+        assert_eq!(c.element_count(0), 3);
+        assert_eq!(c.element(0, 0), Some(1.0));
+        assert_eq!(c.element(0, 2), Some(3.0));
+        assert_eq!(c.shape(1), Some(&[2u32][..]));
+        assert_eq!(c.element(1, 1), Some(20.0));
+    }
+
+    #[test]
+    fn decode_long_array_2d_with_nulls() {
+        // 3 rows: [[1,2],[3,4]], NULL, [[7,8,9]]
+        // Bitmap: row 1 null = 0b00000010 = 0x02
+        let mut col = vec![0x01u8, 0x02];
+        col.extend_from_slice(&build_long_array_row(&[2, 2], &[1, 2, 3, 4]));
+        col.extend_from_slice(&build_long_array_row(&[1, 3], &[7, 8, 9]));
+        let (flags_byte, payload) = BatchBuilder::new(3)
+            .add_column("a", ColumnKind::LongArray, col)
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let view = batch.column_view(0, &dict).unwrap();
+        let ColumnView::LongArray(c) = view else { panic!() };
+        assert_eq!(c.len(), 3);
+        assert_eq!(c.shape(0), Some(&[2u32, 2][..]));
+        assert_eq!(c.element_count(0), 4);
+        assert_eq!(c.element(0, 3), Some(4));
+        assert!(c.is_null(1));
+        assert_eq!(c.shape(1), None);
+        assert_eq!(c.shape(2), Some(&[1u32, 3][..]));
+        assert_eq!(c.element(2, 0), Some(7));
+        assert_eq!(c.element(2, 2), Some(9));
+    }
+
+    #[test]
+    fn decode_array_zero_dims_rejected() {
+        let mut col = vec![0x00u8];
+        col.push(0u8); // nDims = 0
         let (flags_byte, payload) = BatchBuilder::new(1)
-            .add_column("a", ColumnKind::DoubleArray, vec![0x00u8])
+            .add_column("a", ColumnKind::DoubleArray, col)
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
         let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap_err();
-        assert_eq!(err.code(), ErrorCode::UnsupportedServer);
-        assert!(err.msg().contains("double_array"));
+        assert_eq!(err.code(), ErrorCode::ProtocolError);
+    }
+
+    #[test]
+    fn decode_array_huge_row_rejected() {
+        // Single row with shape claiming MAX+1 elements via a single dim.
+        let mut col = vec![0x00u8, 1]; // nDims=1
+        let big = (MAX_ARRAY_ELEMENTS_PER_ROW + 1) as u32;
+        col.extend_from_slice(&big.to_le_bytes());
+        let (flags_byte, payload) = BatchBuilder::new(1)
+            .add_column("a", ColumnKind::LongArray, col)
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::LimitExceeded);
     }
 
     fn varchar_col_no_nulls(values: &[&str]) -> Vec<u8> {

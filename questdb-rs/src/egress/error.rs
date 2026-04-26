@@ -84,6 +84,10 @@ pub enum ErrorCode {
     /// Server-reported QWP `SECURITY_ERROR` (status `0x08`).
     ServerSecurityError,
 
+    /// Client-side limit hit (e.g. an array row exceeds the configured
+    /// per-row element cap).
+    LimitExceeded,
+
     /// Server-reported QWP `LIMIT_EXCEEDED` (status `0x0B`).
     ServerLimitExceeded,
 
