@@ -60,8 +60,8 @@
 //!   DECIMAL128/256, DOUBLE_ARRAY, LONG_ARRAY
 
 use crate::egress::column::{
-    BinaryColumn, ColumnView, Decimal64Column, FixedColumn, Long256Column, SymbolColumn,
-    UuidColumn, Validity, VarcharColumn,
+    BinaryColumn, ColumnView, Decimal128Column, Decimal256Column, Decimal64Column, FixedColumn,
+    GeohashColumn, Long256Column, SymbolColumn, UuidColumn, Validity, VarcharColumn,
 };
 use crate::egress::column_kind::ColumnKind;
 use crate::egress::error::{Error, Result, fmt};
@@ -124,6 +124,19 @@ pub enum DecodedColumn {
         data: Vec<u8>,
         validity: Option<Vec<u8>>,
     },
+    Geohash {
+        buffer: ColumnBuffer,
+        byte_width: u8,
+        precision_bits: u8,
+    },
+    Decimal128 {
+        buffer: ColumnBuffer,
+        scale: i8,
+    },
+    Decimal256 {
+        buffer: ColumnBuffer,
+        scale: i8,
+    },
 }
 
 /// One decoded `RESULT_BATCH`.
@@ -173,6 +186,20 @@ impl DecodedBatch {
             ),
             DecodedColumn::Binary { offsets, data, validity } => ColumnView::Binary(
                 BinaryColumn::new(offsets, data, validity_from_opt(validity, self.row_count)),
+            ),
+            DecodedColumn::Geohash { buffer, byte_width, precision_bits } => ColumnView::Geohash(
+                GeohashColumn::new(
+                    &buffer.values,
+                    *byte_width,
+                    *precision_bits,
+                    validity_of(buffer, self.row_count),
+                ),
+            ),
+            DecodedColumn::Decimal128 { buffer, scale } => ColumnView::Decimal128(
+                Decimal128Column::new(&buffer.values, validity_of(buffer, self.row_count), *scale),
+            ),
+            DecodedColumn::Decimal256 { buffer, scale } => ColumnView::Decimal256(
+                Decimal256Column::new(&buffer.values, validity_of(buffer, self.row_count), *scale),
             ),
         })
     }
@@ -342,11 +369,24 @@ fn decode_column(
             DecodedColumn::Binary { offsets, data, validity }
         }
 
-        ColumnKind::Geohash
-        | ColumnKind::Decimal128
-        | ColumnKind::Decimal256
-        | ColumnKind::DoubleArray
-        | ColumnKind::LongArray => {
+        ColumnKind::Geohash => {
+            let (buffer, byte_width, precision_bits) = decode_geohash(r, row_count)?;
+            DecodedColumn::Geohash {
+                buffer,
+                byte_width,
+                precision_bits,
+            }
+        }
+        ColumnKind::Decimal128 => {
+            let (scale, buffer) = decode_decimal_wide(r, row_count, 16)?;
+            DecodedColumn::Decimal128 { buffer, scale }
+        }
+        ColumnKind::Decimal256 => {
+            let (scale, buffer) = decode_decimal_wide(r, row_count, 32)?;
+            DecodedColumn::Decimal256 { buffer, scale }
+        }
+
+        ColumnKind::DoubleArray | ColumnKind::LongArray => {
             return Err(fmt!(
                 UnsupportedServer,
                 "decoder does not yet support column kind {} (0x{:02X})",
@@ -355,6 +395,78 @@ fn decode_column(
             ));
         }
     })
+}
+
+/// GEOHASH column body (after validity).
+///
+/// Wire: `varint precision_bits` (1..60), then `non_null × ceil(precision_bits/8)`
+/// LE bytes. Densified into `row_count × byte_width` with null slots zeroed.
+fn decode_geohash(
+    r: &mut ByteReader<'_>,
+    row_count: usize,
+) -> Result<(ColumnBuffer, u8, u8)> {
+    let validity = decode_validity(r, row_count)?;
+    let precision_bits = r.read_varint_u64()?;
+    if precision_bits == 0 || precision_bits > 60 {
+        return Err(fmt!(
+            ProtocolError,
+            "geohash precision_bits {} outside 1..=60",
+            precision_bits
+        ));
+    }
+    let byte_width = ((precision_bits + 7) / 8) as u8;
+    let buffer = densify_fixed(r, row_count, byte_width as usize, validity)?;
+    Ok((buffer, byte_width, precision_bits as u8))
+}
+
+/// DECIMAL128 / DECIMAL256: column-level 1-byte scale, then non_null × width
+/// LE bytes; densified.
+fn decode_decimal_wide(
+    r: &mut ByteReader<'_>,
+    row_count: usize,
+    width: usize,
+) -> Result<(i8, ColumnBuffer)> {
+    let validity = decode_validity(r, row_count)?;
+    let scale = r.read_u8()? as i8;
+    let buffer = densify_fixed(r, row_count, width, validity)?;
+    Ok((scale, buffer))
+}
+
+/// Common helper: read `non_null × elem_size` compact bytes from `r` and
+/// write them into a `row_count × elem_size` dense buffer.
+fn densify_fixed(
+    r: &mut ByteReader<'_>,
+    row_count: usize,
+    elem_size: usize,
+    validity: Option<Vec<u8>>,
+) -> Result<ColumnBuffer> {
+    let dense_len = row_count
+        .checked_mul(elem_size)
+        .ok_or_else(|| fmt!(ProtocolError, "fixed column size overflow"))?;
+    match &validity {
+        None => {
+            let values = r.read_bytes(dense_len)?.to_vec();
+            Ok(ColumnBuffer { values, validity })
+        }
+        Some(bitmap) => {
+            let non_null = row_count - count_nulls(bitmap, row_count);
+            let compact = r.read_bytes(non_null * elem_size)?;
+            let mut dense = vec![0u8; dense_len];
+            let mut src = 0usize;
+            for row in 0..row_count {
+                if !is_null_at(bitmap, row) {
+                    let dst = row * elem_size;
+                    dense[dst..dst + elem_size]
+                        .copy_from_slice(&compact[src..src + elem_size]);
+                    src += elem_size;
+                }
+            }
+            Ok(ColumnBuffer {
+                values: dense,
+                validity,
+            })
+        }
+    }
 }
 
 /// VARCHAR / BINARY column body (after the validity section).
@@ -448,34 +560,7 @@ fn decode_fixed(
     elem_size: usize,
 ) -> Result<ColumnBuffer> {
     let validity = decode_validity(r, row_count)?;
-    let dense_len = row_count
-        .checked_mul(elem_size)
-        .ok_or_else(|| fmt!(ProtocolError, "fixed column size overflow"))?;
-
-    match &validity {
-        None => {
-            let values = r.read_bytes(dense_len)?.to_vec();
-            Ok(ColumnBuffer { values, validity })
-        }
-        Some(bitmap) => {
-            let non_null = row_count - count_nulls(bitmap, row_count);
-            let compact_len = non_null * elem_size;
-            let compact = r.read_bytes(compact_len)?;
-            let mut dense = vec![0u8; dense_len];
-            let mut src = 0usize;
-            for row in 0..row_count {
-                if !is_null_at(bitmap, row) {
-                    let dst = row * elem_size;
-                    dense[dst..dst + elem_size].copy_from_slice(&compact[src..src + elem_size]);
-                    src += elem_size;
-                }
-            }
-            Ok(ColumnBuffer {
-                values: dense,
-                validity,
-            })
-        }
-    }
+    densify_fixed(r, row_count, elem_size, validity)
 }
 
 /// QWP `BOOLEAN`: not nullable on the wire (validity always absent), values
@@ -573,34 +658,7 @@ fn decode_decimal64(
     r: &mut ByteReader<'_>,
     row_count: usize,
 ) -> Result<(i8, ColumnBuffer)> {
-    let validity = decode_validity(r, row_count)?;
-    let scale = r.read_u8()? as i8;
-    let dense_len = row_count
-        .checked_mul(8)
-        .ok_or_else(|| fmt!(ProtocolError, "decimal column size overflow"))?;
-    let buffer = match &validity {
-        None => {
-            let values = r.read_bytes(dense_len)?.to_vec();
-            ColumnBuffer { values, validity }
-        }
-        Some(bitmap) => {
-            let non_null = row_count - count_nulls(bitmap, row_count);
-            let compact = r.read_bytes(non_null * 8)?;
-            let mut dense = vec![0u8; dense_len];
-            let mut src = 0usize;
-            for row in 0..row_count {
-                if !is_null_at(bitmap, row) {
-                    let dst = row * 8;
-                    dense[dst..dst + 8].copy_from_slice(&compact[src..src + 8]);
-                    src += 8;
-                }
-            }
-            ColumnBuffer {
-                values: dense,
-                validity,
-            }
-        }
-    };
+    let (scale, buffer) = decode_decimal_wide(r, row_count, 8)?;
     Ok((scale, buffer))
 }
 
@@ -957,15 +1015,15 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_column_kind() {
-        // Geohash isn't in the modelled set yet.
+        // DoubleArray isn't decoded yet.
         let (flags_byte, payload) = BatchBuilder::new(1)
-            .add_column("g", ColumnKind::Geohash, vec![0x00u8])
+            .add_column("a", ColumnKind::DoubleArray, vec![0x00u8])
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
         let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap_err();
         assert_eq!(err.code(), ErrorCode::UnsupportedServer);
-        assert!(err.msg().contains("geohash"));
+        assert!(err.msg().contains("double_array"));
     }
 
     fn varchar_col_no_nulls(values: &[&str]) -> Vec<u8> {
@@ -1108,6 +1166,112 @@ mod tests {
         let mut reg = SchemaRegistry::new();
         let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap_err();
         assert_eq!(err.code(), ErrorCode::ProtocolError);
+    }
+
+    fn le_i128s(vs: &[i128]) -> Vec<u8> {
+        let mut o = Vec::new();
+        for v in vs {
+            o.extend_from_slice(&v.to_le_bytes());
+        }
+        o
+    }
+
+    #[test]
+    fn decode_geohash_8bit() {
+        // 3 rows, no nulls. precision_bits=8 (varint = 0x08), 1 byte each.
+        let mut col = vec![0x00u8]; // null_flag
+        encode_u64(8, &mut col); // precision_bits
+        col.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+        let (flags_byte, payload) = BatchBuilder::new(3)
+            .add_column("g", ColumnKind::Geohash, col)
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let view = batch.column_view(0, &dict).unwrap();
+        let ColumnView::Geohash(c) = view else { panic!() };
+        assert_eq!(c.precision_bits(), 8);
+        assert_eq!(c.byte_width(), 1);
+        assert_eq!(c.len(), 3);
+        assert_eq!(c.value(0), 0xAA);
+        assert_eq!(c.value(1), 0xBB);
+        assert_eq!(c.value(2), 0xCC);
+    }
+
+    #[test]
+    fn decode_geohash_60bit_with_nulls() {
+        // 4 rows; row 1 null. precision_bits=60, byte_width=8.
+        let mut col = vec![0x01u8, 0x02]; // null_flag=1, bitmap row1
+        encode_u64(60, &mut col);
+        // 3 non-null × 8 bytes
+        col.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
+        col.extend_from_slice(&0xAAAA_BBBB_CCCC_DDDDu64.to_le_bytes());
+        col.extend_from_slice(&0x1111_2222_3333_4444u64.to_le_bytes());
+        let (flags_byte, payload) = BatchBuilder::new(4)
+            .add_column("g", ColumnKind::Geohash, col)
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let view = batch.column_view(0, &dict).unwrap();
+        let ColumnView::Geohash(c) = view else { panic!() };
+        assert_eq!(c.precision_bits(), 60);
+        assert_eq!(c.byte_width(), 8);
+        assert!(!c.is_null(0));
+        assert!(c.is_null(1));
+        assert_eq!(c.value(0), 0x0102_0304_0506_0708);
+        assert_eq!(c.value(2), 0xAAAA_BBBB_CCCC_DDDD);
+        assert_eq!(c.value(3), 0x1111_2222_3333_4444);
+    }
+
+    #[test]
+    fn decode_geohash_invalid_precision_rejected() {
+        let mut col = vec![0x00u8];
+        encode_u64(0, &mut col); // precision_bits=0 invalid
+        let (flags_byte, payload) = BatchBuilder::new(0)
+            .add_column("g", ColumnKind::Geohash, col)
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ProtocolError);
+    }
+
+    #[test]
+    fn decode_decimal128_with_scale() {
+        let mut col = vec![0x00u8, 0x04]; // null_flag, scale=4
+        col.extend_from_slice(&le_i128s(&[100_000i128, -42i128]));
+        let (flags_byte, payload) = BatchBuilder::new(2)
+            .add_column("p", ColumnKind::Decimal128, col)
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let view = batch.column_view(0, &dict).unwrap();
+        let ColumnView::Decimal128(c) = view else { panic!() };
+        assert_eq!(c.scale(), 4);
+        assert_eq!(c.value(0), 100_000i128);
+        assert_eq!(c.value(1), -42i128);
+    }
+
+    #[test]
+    fn decode_decimal256_passes_raw_bytes() {
+        let mut col = vec![0x00u8, 0x06]; // null_flag, scale=6
+        let row0: [u8; 32] = std::array::from_fn(|i| i as u8);
+        let row1: [u8; 32] = std::array::from_fn(|i| (255 - i) as u8);
+        col.extend_from_slice(&row0);
+        col.extend_from_slice(&row1);
+        let (flags_byte, payload) = BatchBuilder::new(2)
+            .add_column("p", ColumnKind::Decimal256, col)
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let view = batch.column_view(0, &dict).unwrap();
+        let ColumnView::Decimal256(c) = view else { panic!() };
+        assert_eq!(c.scale(), 6);
+        assert_eq!(c.value(0), &row0);
+        assert_eq!(c.value(1), &row1);
     }
 
     #[test]

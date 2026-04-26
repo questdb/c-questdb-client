@@ -525,6 +525,193 @@ impl<'a> BinaryColumn<'a> {
 }
 
 // ---------------------------------------------------------------------------
+// GEOHASH
+// ---------------------------------------------------------------------------
+
+/// GEOHASH column.
+///
+/// Wire carries a column-level `precision_bits` (1..60) and packs each row
+/// into `ceil(precision_bits / 8)` little-endian bytes. The decoder
+/// densifies into `row_count × byte_width`. Values can be inspected raw or
+/// zero-extended to `u64` via [`value`](Self::value).
+#[derive(Debug, Clone, Copy)]
+pub struct GeohashColumn<'a> {
+    raw: &'a [u8],
+    byte_width: u8,
+    precision_bits: u8,
+    validity: Validity<'a>,
+}
+
+impl<'a> GeohashColumn<'a> {
+    pub fn new(
+        raw: &'a [u8],
+        byte_width: u8,
+        precision_bits: u8,
+        validity: Validity<'a>,
+    ) -> Self {
+        debug_assert!(byte_width >= 1 && byte_width <= 8);
+        debug_assert_eq!(raw.len() % byte_width as usize, 0);
+        Self {
+            raw,
+            byte_width,
+            precision_bits,
+            validity,
+        }
+    }
+
+    pub fn precision_bits(&self) -> u8 {
+        self.precision_bits
+    }
+
+    pub fn byte_width(&self) -> u8 {
+        self.byte_width
+    }
+
+    pub fn len(&self) -> usize {
+        if self.byte_width == 0 {
+            0
+        } else {
+            self.raw.len() / self.byte_width as usize
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.raw.is_empty()
+    }
+
+    pub fn validity(&self) -> Validity<'a> {
+        self.validity
+    }
+
+    pub fn is_null(&self, row: usize) -> bool {
+        self.validity.is_null(row)
+    }
+
+    pub fn raw(&self) -> &'a [u8] {
+        self.raw
+    }
+
+    /// Zero-extend the row's `byte_width` LE bytes to a `u64`.
+    pub fn value(&self, row: usize) -> u64 {
+        let bw = self.byte_width as usize;
+        let s = row * bw;
+        let mut buf = [0u8; 8];
+        buf[..bw].copy_from_slice(&self.raw[s..s + bw]);
+        u64::from_le_bytes(buf)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DECIMAL128 / DECIMAL256
+// ---------------------------------------------------------------------------
+
+/// DECIMAL128 column: 16-byte little-endian mantissa per row, single column-
+/// level scale.
+#[derive(Debug, Clone, Copy)]
+pub struct Decimal128Column<'a> {
+    raw: &'a [u8],
+    scale: i8,
+    validity: Validity<'a>,
+}
+
+impl<'a> Decimal128Column<'a> {
+    pub fn new(raw: &'a [u8], validity: Validity<'a>, scale: i8) -> Self {
+        debug_assert_eq!(raw.len() % 16, 0);
+        Self {
+            raw,
+            scale,
+            validity,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.raw.len() / 16
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.raw.is_empty()
+    }
+
+    pub fn scale(&self) -> i8 {
+        self.scale
+    }
+
+    pub fn validity(&self) -> Validity<'a> {
+        self.validity
+    }
+
+    pub fn is_null(&self, row: usize) -> bool {
+        self.validity.is_null(row)
+    }
+
+    pub fn raw(&self) -> &'a [u8] {
+        self.raw
+    }
+
+    /// Mantissa for `row` as `i128`. Use [`scale`](Self::scale) to
+    /// interpret the decimal point.
+    #[inline]
+    pub fn value(&self, row: usize) -> i128 {
+        let s = row * 16;
+        i128::from_le_bytes(self.raw[s..s + 16].try_into().expect("16-byte row"))
+    }
+}
+
+/// DECIMAL256 column: 32-byte mantissa per row, single column-level scale.
+///
+/// Rust has no native 256-bit integer; the accessor returns the raw 32
+/// little-endian bytes and leaves higher-level decoding (e.g. via
+/// `bigdecimal`) to the consumer.
+#[derive(Debug, Clone, Copy)]
+pub struct Decimal256Column<'a> {
+    raw: &'a [u8],
+    scale: i8,
+    validity: Validity<'a>,
+}
+
+impl<'a> Decimal256Column<'a> {
+    pub fn new(raw: &'a [u8], validity: Validity<'a>, scale: i8) -> Self {
+        debug_assert_eq!(raw.len() % 32, 0);
+        Self {
+            raw,
+            scale,
+            validity,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.raw.len() / 32
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.raw.is_empty()
+    }
+
+    pub fn scale(&self) -> i8 {
+        self.scale
+    }
+
+    pub fn validity(&self) -> Validity<'a> {
+        self.validity
+    }
+
+    pub fn is_null(&self, row: usize) -> bool {
+        self.validity.is_null(row)
+    }
+
+    pub fn raw(&self) -> &'a [u8] {
+        self.raw
+    }
+
+    /// Raw 32 LE bytes for `row`. Apply scale via a wider decimal type.
+    #[inline]
+    pub fn value(&self, row: usize) -> &'a [u8; 32] {
+        let s = row * 32;
+        (&self.raw[s..s + 32]).try_into().expect("32-byte row")
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ColumnView discriminated union
 // ---------------------------------------------------------------------------
 
@@ -558,6 +745,9 @@ pub enum ColumnView<'a> {
     Ipv4(FixedColumn<'a, u32>),
     Varchar(VarcharColumn<'a>),
     Binary(BinaryColumn<'a>),
+    Geohash(GeohashColumn<'a>),
+    Decimal128(Decimal128Column<'a>),
+    Decimal256(Decimal256Column<'a>),
 }
 
 impl ColumnView<'_> {
@@ -581,6 +771,9 @@ impl ColumnView<'_> {
             ColumnView::Ipv4(_) => ColumnKind::Ipv4,
             ColumnView::Varchar(_) => ColumnKind::Varchar,
             ColumnView::Binary(_) => ColumnKind::Binary,
+            ColumnView::Geohash(_) => ColumnKind::Geohash,
+            ColumnView::Decimal128(_) => ColumnKind::Decimal128,
+            ColumnView::Decimal256(_) => ColumnKind::Decimal256,
         }
     }
 
@@ -604,6 +797,9 @@ impl ColumnView<'_> {
             ColumnView::Ipv4(c) => c.len(),
             ColumnView::Varchar(c) => c.len(),
             ColumnView::Binary(c) => c.len(),
+            ColumnView::Geohash(c) => c.len(),
+            ColumnView::Decimal128(c) => c.len(),
+            ColumnView::Decimal256(c) => c.len(),
         }
     }
 
@@ -631,6 +827,9 @@ impl ColumnView<'_> {
             ColumnView::Ipv4(c) => c.is_null(row),
             ColumnView::Varchar(c) => c.is_null(row),
             ColumnView::Binary(c) => c.is_null(row),
+            ColumnView::Geohash(c) => c.is_null(row),
+            ColumnView::Decimal128(c) => c.is_null(row),
+            ColumnView::Decimal256(c) => c.is_null(row),
         }
     }
 }

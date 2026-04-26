@@ -44,8 +44,9 @@ pub mod wire;
 
 pub use binds::Bind;
 pub use column::{
-    BinaryColumn, ColumnView, Decimal64Column, FixedBytesColumn, FixedColumn, FixedWidth,
-    Long256Column, SymbolColumn, UuidColumn, Validity, VarcharColumn,
+    BinaryColumn, ColumnView, Decimal128Column, Decimal256Column, Decimal64Column,
+    FixedBytesColumn, FixedColumn, FixedWidth, GeohashColumn, Long256Column, SymbolColumn,
+    UuidColumn, Validity, VarcharColumn,
 };
 pub use column_kind::ColumnKind;
 pub use decoder::{ColumnBuffer, DecodedBatch, DecodedColumn, decode_result_batch};
