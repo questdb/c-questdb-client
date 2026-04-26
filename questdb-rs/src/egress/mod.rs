@@ -32,13 +32,22 @@
 //! follow-up changes.
 
 pub mod binds;
+pub mod column;
 pub mod column_kind;
 pub mod error;
 pub mod query_request;
+pub mod schema;
+pub mod symbol_dict;
 pub mod wire;
 
 pub use binds::Bind;
+pub use column::{
+    ColumnView, Decimal64Column, FixedBytesColumn, FixedColumn, FixedWidth, Long256Column,
+    SymbolColumn, UuidColumn, Validity,
+};
 pub use column_kind::ColumnKind;
 pub use error::{Error, ErrorCode, Result};
 pub use query_request::{QueryRequest, QueryRequestBuilder};
-pub use wire::{FrameHeader, MsgKind, StatusCode};
+pub use schema::{DecodedSchema, Schema, SchemaColumn, SchemaMode, SchemaRegistry};
+pub use symbol_dict::SymbolDict;
+pub use wire::{FrameHeader, MsgKind, RESET_MASK_DICT, RESET_MASK_SCHEMAS, StatusCode};

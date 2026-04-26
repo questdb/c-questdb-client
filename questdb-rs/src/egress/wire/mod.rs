@@ -24,10 +24,12 @@
 
 //! QWP wire codec primitives: frame header, varint, message kinds.
 
+pub mod cache_reset;
 pub mod header;
 pub mod msg_kind;
 pub mod varint;
 
+pub use cache_reset::{RESET_MASK_DICT, RESET_MASK_SCHEMAS};
 pub use header::{FrameHeader, HEADER_LEN, MAGIC, flags};
 pub use msg_kind::{MsgKind, StatusCode};
 pub use varint::{MAX_VARINT_LEN_U64, decode_u64, decode_usize, encode_u64};
