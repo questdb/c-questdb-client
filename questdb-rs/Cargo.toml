@@ -63,7 +63,7 @@ tempfile = "3"
 webpki-roots = "1.0.1"
 rstest = "0.26.1"
 tungstenite = { version = "0.27", default-features = false, features = ["handshake"] }
-ureq = { version = "3.1.2, <3.2.0", default-features = false, features = ["rustls"] }
+ureq = { version = "3.1.2, <3.2.0", default-features = false }
 
 [features]
 default = ["sync-sender", "tls-webpki-certs", "ring-crypto"]
