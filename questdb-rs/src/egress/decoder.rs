@@ -96,10 +96,15 @@ pub enum DecodedColumn {
     Float(ColumnBuffer),
     Double(ColumnBuffer),
     Symbol {
-        /// Dense per-row connection-scoped codes; `0` in null slots
-        /// (validity is the source of truth for null vs id-zero).
+        /// Dense per-row codes; `0` in null slots (validity is the
+        /// source of truth for null vs id-zero).
         codes: Vec<u32>,
         validity: Option<Vec<u8>>,
+        /// `Some` when the column carried its own dict inline
+        /// (FLAG_DELTA_SYMBOL_DICT clear). `None` means codes index
+        /// the connection-scoped dict. Each SYMBOL column in a batch
+        /// gets its own local dict — they're not interchangeable.
+        local_dict: Option<SymbolDict>,
     },
     Timestamp(ColumnBuffer),
     Date(ColumnBuffer),
@@ -198,11 +203,14 @@ impl DecodedBatch {
             DecodedColumn::Uuid(b) => ColumnView::Uuid(UuidColumn::new(&b.values, validity_of(b, self.row_count))),
             DecodedColumn::Long256(b) => ColumnView::Long256(Long256Column::new(&b.values, validity_of(b, self.row_count))),
             DecodedColumn::Decimal64 { buffer, scale } => ColumnView::Decimal64(Decimal64Column::new(&buffer.values, validity_of(buffer, self.row_count), *scale)),
-            DecodedColumn::Symbol { codes, validity } => ColumnView::Symbol(SymbolColumn::new(
-                codes,
-                validity_from_opt(validity, self.row_count),
-                dict,
-            )),
+            DecodedColumn::Symbol { codes, validity, local_dict } => {
+                let active_dict = local_dict.as_ref().unwrap_or(dict);
+                ColumnView::Symbol(SymbolColumn::new(
+                    codes,
+                    validity_from_opt(validity, self.row_count),
+                    active_dict,
+                ))
+            }
             DecodedColumn::Varchar { offsets, data, validity } => ColumnView::Varchar(
                 VarcharColumn::new(offsets, data, validity_from_opt(validity, self.row_count)),
             ),
@@ -348,13 +356,15 @@ pub fn decode_result_batch(
         .collect();
 
     let mut columns = Vec::with_capacity(col_count);
+    let connection_dict_size = dict.len();
     for (i, kind) in kinds.iter().enumerate() {
-        let col = decode_column(&mut r, *kind, row_count, flags_byte).map_err(|e| {
-            Error::new(
-                e.code(),
-                format!("column {}/{} ({}): {}", i, col_count, kind.name(), e.msg()),
-            )
-        })?;
+        let col = decode_column(&mut r, *kind, row_count, flags_byte, connection_dict_size)
+            .map_err(|e| {
+                Error::new(
+                    e.code(),
+                    format!("column {}/{} ({}): {}", i, col_count, kind.name(), e.msg()),
+                )
+            })?;
         columns.push(col);
     }
 
@@ -385,6 +395,7 @@ fn decode_column(
     kind: ColumnKind,
     row_count: usize,
     flags_byte: u8,
+    connection_dict_size: usize,
 ) -> Result<DecodedColumn> {
     Ok(match kind {
         ColumnKind::Boolean => DecodedColumn::Boolean(decode_boolean(r, row_count)?),
@@ -404,8 +415,13 @@ fn decode_column(
         ColumnKind::TimestampNanos => DecodedColumn::TimestampNanos(decode_temporal(r, row_count, flags_byte)?),
 
         ColumnKind::Symbol => {
-            let (codes, validity) = decode_symbol(r, row_count)?;
-            DecodedColumn::Symbol { codes, validity }
+            let (codes, validity, local_dict) =
+                decode_symbol(r, row_count, flags_byte, connection_dict_size)?;
+            DecodedColumn::Symbol {
+                codes,
+                validity,
+                local_dict,
+            }
         }
 
         ColumnKind::Decimal64 => {
@@ -797,19 +813,58 @@ fn decode_gorilla_temporal(
     })
 }
 
-/// SYMBOL: connection-scoped delta dict path only. Per non-null row, a varint
-/// id follows; we expand into a dense `row_count` `u32` buffer with `0` in
-/// null slots (validity bitmap is the source of truth for null-vs-id-zero).
-//
-// TODO(qwp): also support the column-local dict mode (varint dict_size +
-// per-entry varint len + bytes preceding the per-row codes). The per-batch
-// signal for which mode is in effect needs to be confirmed against the
-// reference decoder before implementing.
+/// SYMBOL column body. Two modes per the spec:
+///
+/// - **Delta / connection-scoped** (FLAG_DELTA_SYMBOL_DICT set on the
+///   batch): no per-column dict; per-row varint ids index into the
+///   connection-scoped dict that was just (optionally) extended by the
+///   batch's delta-dict section.
+/// - **Column-local** (flag clear): the column body opens with
+///   `varint dict_size` then `dict_size × (varint len + bytes)`; the
+///   per-row ids index into THAT dict only. Each SYMBOL column in the
+///   batch carries its own independent local dict.
+///
+/// Either way we densify the per-row ids into a `row_count`-sized
+/// `u32` buffer with `0` in null slots; validity is the source of
+/// truth for null-vs-id-zero. Bounds checks reject ids beyond the
+/// active dict's size and dict_size beyond row_count.
 fn decode_symbol(
     r: &mut ByteReader<'_>,
     row_count: usize,
-) -> Result<(Vec<u32>, Option<Vec<u8>>)> {
+    flags_byte: u8,
+    connection_dict_size: usize,
+) -> Result<(Vec<u32>, Option<Vec<u8>>, Option<SymbolDict>)> {
     let validity = decode_validity(r, row_count)?;
+
+    let (active_dict_size, local_dict) = if flags_byte & flags::DELTA_SYMBOL_DICT != 0 {
+        // Delta mode: ids index the connection-scoped dict.
+        (connection_dict_size, None)
+    } else {
+        // Column-local: read inline dict.
+        let dict_size = r.read_varint_usize()?;
+        if dict_size > row_count {
+            return Err(fmt!(
+                ProtocolError,
+                "SYMBOL column-local dict_size {} > row_count {}",
+                dict_size,
+                row_count
+            ));
+        }
+        let mut entries: Vec<&[u8]> = Vec::with_capacity(dict_size);
+        for i in 0..dict_size {
+            let entry_len = r.read_varint_usize().map_err(|e| {
+                Error::new(
+                    e.code(),
+                    format!("SYMBOL local dict entry {} length: {}", i, e.msg()),
+                )
+            })?;
+            entries.push(r.read_bytes(entry_len)?);
+        }
+        let mut local = SymbolDict::new();
+        local.apply_delta(0, entries.into_iter())?;
+        (dict_size, Some(local))
+    };
+
     let mut codes = vec![0u32; row_count];
     for row in 0..row_count {
         if is_null_at_opt(&validity, row) {
@@ -829,9 +884,18 @@ fn decode_symbol(
                 row
             )
         })?;
+        if (code32 as usize) >= active_dict_size {
+            return Err(fmt!(
+                ProtocolError,
+                "symbol id {} at row {} out of range (dict size {})",
+                code32,
+                row,
+                active_dict_size
+            ));
+        }
         codes[row] = code32;
     }
-    Ok((codes, validity))
+    Ok((codes, validity, local_dict))
 }
 
 /// DECIMAL64: column-level 1-byte scale follows the validity section, then
@@ -1143,6 +1207,135 @@ mod tests {
         assert_eq!(c.value(2), 1);
         assert_eq!(c.value(3), 1);
         assert_eq!(c.value(4), 0);
+    }
+
+    /// Build a column-local SYMBOL column body: validity + dict + per-row ids.
+    fn symbol_column_local(bitmap: Option<&[u8]>, dict: &[&str], codes_per_non_null: &[u64]) -> Vec<u8> {
+        let mut col = Vec::new();
+        if let Some(bm) = bitmap {
+            col.push(0x01);
+            col.extend_from_slice(bm);
+        } else {
+            col.push(0x00);
+        }
+        encode_u64(dict.len() as u64, &mut col); // dict_size
+        for entry in dict {
+            encode_u64(entry.len() as u64, &mut col);
+            col.extend_from_slice(entry.as_bytes());
+        }
+        for code in codes_per_non_null {
+            encode_u64(*code, &mut col);
+        }
+        col
+    }
+
+    #[test]
+    fn decode_symbol_column_local_no_nulls() {
+        // 3 rows, FLAG_DELTA_SYMBOL_DICT clear, dict ["AAPL","MSFT","GOOG"],
+        // ids [0, 1, 2].
+        let col = symbol_column_local(None, &["AAPL", "MSFT", "GOOG"], &[0, 1, 2]);
+        let (flags_byte, payload) = BatchBuilder::new(3)
+            .add_column("s", ColumnKind::Symbol, col)
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        // Connection dict stays empty — column-local mode doesn't touch it.
+        assert_eq!(dict.len(), 0);
+
+        let view = batch.column_view(0, &dict).unwrap();
+        let ColumnView::Symbol(s) = view else { panic!() };
+        assert_eq!(s.resolve(0), Some("AAPL"));
+        assert_eq!(s.resolve(1), Some("MSFT"));
+        assert_eq!(s.resolve(2), Some("GOOG"));
+    }
+
+    #[test]
+    fn decode_symbol_column_local_with_nulls() {
+        // 4 rows; row 1 null. bitmap = 0x02, dict ["X", "Y"], codes [1, 0, 0]
+        // (3 non-null rows: 0->Y, 2->X, 3->X).
+        let col = symbol_column_local(Some(&[0x02]), &["X", "Y"], &[1, 0, 0]);
+        let (flags_byte, payload) = BatchBuilder::new(4)
+            .add_column("s", ColumnKind::Symbol, col)
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+
+        let view = batch.column_view(0, &dict).unwrap();
+        let ColumnView::Symbol(s) = view else { panic!() };
+        assert_eq!(s.resolve(0), Some("Y"));
+        assert!(s.is_null(1));
+        assert_eq!(s.resolve(1), None);
+        assert_eq!(s.resolve(2), Some("X"));
+        assert_eq!(s.resolve(3), Some("X"));
+    }
+
+    #[test]
+    fn decode_symbol_column_local_independent_per_column() {
+        // Two SYMBOL columns in one batch, each with its own dict.
+        // The codes happen to overlap (both use id 0) but resolve to
+        // different strings — confirming column-local independence.
+        let col_a = symbol_column_local(None, &["alpha", "beta"], &[0, 1]);
+        let col_b = symbol_column_local(None, &["one", "two"], &[1, 0]);
+        let (flags_byte, payload) = BatchBuilder::new(2)
+            .add_column("a", ColumnKind::Symbol, col_a)
+            .add_column("b", ColumnKind::Symbol, col_b)
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+
+        let ColumnView::Symbol(a) = batch.column_view(0, &dict).unwrap() else { panic!() };
+        let ColumnView::Symbol(b) = batch.column_view(1, &dict).unwrap() else { panic!() };
+        assert_eq!(a.resolve(0), Some("alpha"));
+        assert_eq!(a.resolve(1), Some("beta"));
+        assert_eq!(b.resolve(0), Some("two"));
+        assert_eq!(b.resolve(1), Some("one"));
+    }
+
+    #[test]
+    fn decode_symbol_column_local_id_out_of_range_rejected() {
+        // dict has 2 entries but a row references id 5.
+        let col = symbol_column_local(None, &["a", "b"], &[0, 5]);
+        let (flags_byte, payload) = BatchBuilder::new(2)
+            .add_column("s", ColumnKind::Symbol, col)
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ProtocolError);
+        assert!(err.msg().contains("out of range"));
+    }
+
+    #[test]
+    fn decode_symbol_column_local_dict_size_exceeds_rows_rejected() {
+        // 1 row but dict claims 5 entries — Java reference rejects this.
+        let mut col = vec![0x00u8]; // null_flag
+        encode_u64(5, &mut col); // dict_size > row_count
+        let (flags_byte, payload) = BatchBuilder::new(1)
+            .add_column("s", ColumnKind::Symbol, col)
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ProtocolError);
+    }
+
+    #[test]
+    fn decode_symbol_delta_id_out_of_range_rejected() {
+        // Connection dict has 2 entries (AAPL, MSFT), batch references id 9.
+        let mut col_data = vec![0x00u8]; // null_flag
+        encode_u64(9, &mut col_data); // bogus id
+        let (flags_byte, payload) = BatchBuilder::new(1)
+            .with_dict_delta(0, vec!["AAPL", "MSFT"])
+            .add_column("s", ColumnKind::Symbol, col_data)
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ProtocolError);
+        assert!(err.msg().contains("out of range"));
     }
 
     #[test]
