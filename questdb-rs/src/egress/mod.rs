@@ -34,9 +34,11 @@
 pub mod binds;
 pub mod column;
 pub mod column_kind;
+pub mod decoder;
 pub mod error;
 pub mod query_request;
 pub mod schema;
+pub mod server_event;
 pub mod symbol_dict;
 pub mod wire;
 
@@ -46,8 +48,10 @@ pub use column::{
     SymbolColumn, UuidColumn, Validity,
 };
 pub use column_kind::ColumnKind;
+pub use decoder::{ColumnBuffer, DecodedBatch, DecodedColumn, decode_result_batch};
 pub use error::{Error, ErrorCode, Result};
 pub use query_request::{QueryRequest, QueryRequestBuilder};
 pub use schema::{DecodedSchema, Schema, SchemaColumn, SchemaMode, SchemaRegistry};
+pub use server_event::{ServerEvent, ServerInfo, ServerRole, decode_frame};
 pub use symbol_dict::SymbolDict;
 pub use wire::{FrameHeader, MsgKind, RESET_MASK_DICT, RESET_MASK_SCHEMAS, StatusCode};
