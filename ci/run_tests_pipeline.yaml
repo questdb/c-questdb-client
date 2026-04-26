@@ -128,11 +128,19 @@ stages:
           - script: |
               git clone --depth 1 https://github.com/questdb/questdb.git
             displayName: git clone questdb
+          - script: |
+              set -euo pipefail
+              JDK_URL="https://api.adoptium.net/v3/binary/latest/25/ga/linux/x64/jdk/hotspot/normal/eclipse"
+              sudo mkdir -p /opt/jdk25
+              curl -fsSL "$JDK_URL" | sudo tar -xz -C /opt/jdk25 --strip-components=1
+              echo "##vso[task.setvariable variable=JAVA_HOME]/opt/jdk25"
+              echo "##vso[task.prependpath]/opt/jdk25/bin"
+            displayName: "Install JDK 25 (required by QuestDB master)"
           - task: Maven@3
             displayName: "Compile QuestDB"
             inputs:
               mavenPOMFile: "questdb/pom.xml"
-              jdkVersionOption: "1.17"
+              jdkVersionOption: "default"
               options: "-DskipTests -Pbuild-web-console"
           - script: |
               python3 system_test/test.py run --repo ./questdb -v
