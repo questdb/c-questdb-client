@@ -277,42 +277,35 @@ pub type Long256Column<'a> = FixedBytesColumn<'a, 32>;
 // Symbol column
 // ---------------------------------------------------------------------------
 
-/// SYMBOL column: dense `u32` codes (one per non-null row) plus a borrowed
-/// reference to the connection-scoped dictionary.
+/// SYMBOL column: dense per-row `u32` codes plus a borrowed reference to
+/// the connection-scoped dictionary.
 ///
-/// The wire encodes codes as a varint stream over non-null rows; the
-/// decoder unpacks them into `codes` so random access is O(1).
+/// The wire encodes codes as a compact varint stream over non-null rows;
+/// the decoder densifies that into a `row_count`-sized `u32` slice with
+/// `0` in null slots. The validity bitmap is the source of truth for
+/// null vs id-zero, so random access is O(1).
 #[derive(Debug, Clone, Copy)]
 pub struct SymbolColumn<'a> {
-    /// One code per non-null row, in row order.
     codes: &'a [u32],
-    /// Per-row null bitmap; total row count lives here too.
     validity: Validity<'a>,
-    row_count: usize,
     dict: &'a SymbolDict,
 }
 
 impl<'a> SymbolColumn<'a> {
-    pub fn new(
-        codes: &'a [u32],
-        validity: Validity<'a>,
-        row_count: usize,
-        dict: &'a SymbolDict,
-    ) -> Self {
+    pub fn new(codes: &'a [u32], validity: Validity<'a>, dict: &'a SymbolDict) -> Self {
         Self {
             codes,
             validity,
-            row_count,
             dict,
         }
     }
 
     pub fn len(&self) -> usize {
-        self.row_count
+        self.codes.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.row_count == 0
+        self.codes.is_empty()
     }
 
     pub fn validity(&self) -> Validity<'a> {
@@ -323,7 +316,7 @@ impl<'a> SymbolColumn<'a> {
         self.validity.is_null(row)
     }
 
-    /// Connection-scoped codes, one per non-null row, in row order.
+    /// Dense per-row codes (`0` in null slots — see [`is_null`](Self::is_null)).
     pub fn codes(&self) -> &'a [u32] {
         self.codes
     }
@@ -337,30 +330,8 @@ impl<'a> SymbolColumn<'a> {
         if self.is_null(row) {
             return None;
         }
-        let idx = self.non_null_index(row)?;
-        let code = *self.codes.get(idx)?;
+        let code = *self.codes.get(row)?;
         self.dict.get(code)
-    }
-
-    /// Number of non-null rows preceding `row`. O(row) — fine for sequential
-    /// iteration; a future decoder optimization may pre-materialize this.
-    fn non_null_index(&self, row: usize) -> Option<usize> {
-        if row >= self.row_count {
-            return None;
-        }
-        match self.validity {
-            Validity::None => Some(row),
-            Validity::Bitmap { bytes, .. } => {
-                let mut count = 0usize;
-                for r in 0..row {
-                    let byte = bytes[r >> 3];
-                    if (byte >> (r & 7)) & 1 == 0 {
-                        count += 1;
-                    }
-                }
-                Some(count)
-            }
-        }
     }
 }
 
@@ -641,9 +612,10 @@ mod tests {
             .unwrap();
 
         // 4 rows: AAPL, NULL, MSFT, GOOG. Bitmap row1 null → 0b0000_0010 = 0x02
-        let codes = [0u32, 1, 2]; // 3 non-null rows
+        // Codes are dense per row, with `0` (garbage) in the null slot.
+        let codes = [0u32, 0, 1, 2];
         let bm = [0x02u8];
-        let col = SymbolColumn::new(&codes, Validity::from_bitmap(&bm, 4), 4, &dict);
+        let col = SymbolColumn::new(&codes, Validity::from_bitmap(&bm, 4), &dict);
 
         assert_eq!(col.len(), 4);
         assert_eq!(col.resolve(0), Some("AAPL"));
@@ -657,7 +629,7 @@ mod tests {
         let mut dict = SymbolDict::new();
         dict.apply_delta(0, [b"x".as_slice(), b"y".as_slice()]).unwrap();
         let codes = [1u32, 0, 1];
-        let col = SymbolColumn::new(&codes, Validity::None, 3, &dict);
+        let col = SymbolColumn::new(&codes, Validity::None, &dict);
         assert_eq!(col.resolve(0), Some("y"));
         assert_eq!(col.resolve(1), Some("x"));
         assert_eq!(col.resolve(2), Some("y"));

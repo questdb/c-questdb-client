@@ -94,10 +94,10 @@ pub enum DecodedColumn {
     Float(ColumnBuffer),
     Double(ColumnBuffer),
     Symbol {
-        /// Connection-scoped codes, dense over non-null rows in row order.
+        /// Dense per-row connection-scoped codes; `0` in null slots
+        /// (validity is the source of truth for null vs id-zero).
         codes: Vec<u32>,
         validity: Option<Vec<u8>>,
-        row_count: usize,
     },
     Timestamp(ColumnBuffer),
     Date(ColumnBuffer),
@@ -149,10 +149,9 @@ impl DecodedBatch {
             DecodedColumn::Uuid(b) => ColumnView::Uuid(UuidColumn::new(&b.values, validity_of(b, self.row_count))),
             DecodedColumn::Long256(b) => ColumnView::Long256(Long256Column::new(&b.values, validity_of(b, self.row_count))),
             DecodedColumn::Decimal64 { buffer, scale } => ColumnView::Decimal64(Decimal64Column::new(&buffer.values, validity_of(buffer, self.row_count), *scale)),
-            DecodedColumn::Symbol { codes, validity, row_count } => ColumnView::Symbol(SymbolColumn::new(
+            DecodedColumn::Symbol { codes, validity } => ColumnView::Symbol(SymbolColumn::new(
                 codes,
-                validity_from_opt(validity, *row_count),
-                *row_count,
+                validity_from_opt(validity, self.row_count),
                 dict,
             )),
         })
@@ -288,7 +287,7 @@ fn decode_column(
     flags_byte: u8,
 ) -> Result<DecodedColumn> {
     Ok(match kind {
-        ColumnKind::Boolean => DecodedColumn::Boolean(decode_fixed(r, row_count, 1)?),
+        ColumnKind::Boolean => DecodedColumn::Boolean(decode_boolean(r, row_count)?),
         ColumnKind::Byte => DecodedColumn::Byte(decode_fixed(r, row_count, 1)?),
         ColumnKind::Short => DecodedColumn::Short(decode_fixed(r, row_count, 2)?),
         ColumnKind::Int => DecodedColumn::Int(decode_fixed(r, row_count, 4)?),
@@ -306,11 +305,7 @@ fn decode_column(
 
         ColumnKind::Symbol => {
             let (codes, validity) = decode_symbol(r, row_count)?;
-            DecodedColumn::Symbol {
-                codes,
-                validity,
-                row_count,
-            }
+            DecodedColumn::Symbol { codes, validity }
         }
 
         ColumnKind::Decimal64 => {
@@ -345,17 +340,69 @@ fn decode_validity(r: &mut ByteReader<'_>, row_count: usize) -> Result<Option<Ve
     Ok(Some(bytes.to_vec()))
 }
 
+/// Read `non_null_count × elem_size` compact bytes from the wire and write
+/// them into a dense `row_count × elem_size` buffer, with null slots zeroed.
 fn decode_fixed(
     r: &mut ByteReader<'_>,
     row_count: usize,
     elem_size: usize,
 ) -> Result<ColumnBuffer> {
     let validity = decode_validity(r, row_count)?;
-    let len = row_count
+    let dense_len = row_count
         .checked_mul(elem_size)
         .ok_or_else(|| fmt!(ProtocolError, "fixed column size overflow"))?;
-    let values = r.read_bytes(len)?.to_vec();
-    Ok(ColumnBuffer { values, validity })
+
+    match &validity {
+        None => {
+            let values = r.read_bytes(dense_len)?.to_vec();
+            Ok(ColumnBuffer { values, validity })
+        }
+        Some(bitmap) => {
+            let non_null = row_count - count_nulls(bitmap, row_count);
+            let compact_len = non_null * elem_size;
+            let compact = r.read_bytes(compact_len)?;
+            let mut dense = vec![0u8; dense_len];
+            let mut src = 0usize;
+            for row in 0..row_count {
+                if !is_null_at(bitmap, row) {
+                    let dst = row * elem_size;
+                    dense[dst..dst + elem_size].copy_from_slice(&compact[src..src + elem_size]);
+                    src += elem_size;
+                }
+            }
+            Ok(ColumnBuffer {
+                values: dense,
+                validity,
+            })
+        }
+    }
+}
+
+/// QWP `BOOLEAN`: not nullable on the wire (validity always absent), values
+/// bit-packed into `ceil(row_count/8)` bytes. We expand to one byte per row
+/// so `FixedColumn<u8>` can address rows in O(1).
+fn decode_boolean(r: &mut ByteReader<'_>, row_count: usize) -> Result<ColumnBuffer> {
+    let validity = decode_validity(r, row_count)?;
+    let non_null = match &validity {
+        None => row_count,
+        Some(bitmap) => row_count - count_nulls(bitmap, row_count),
+    };
+    let bit_bytes = non_null.div_ceil(8);
+    let bits = r.read_bytes(bit_bytes)?.to_vec();
+
+    let mut dense = vec![0u8; row_count];
+    let mut src_bit = 0usize;
+    for row in 0..row_count {
+        if !is_null_at_opt(&validity, row) {
+            let b = bits[src_bit >> 3];
+            dense[row] = (b >> (src_bit & 7)) & 1;
+            src_bit += 1;
+        }
+    }
+    Ok(ColumnBuffer {
+        values: dense,
+        validity,
+    })
 }
 
 fn decode_temporal(
@@ -383,57 +430,99 @@ fn decode_temporal(
     decode_fixed(r, row_count, 8)
 }
 
+/// SYMBOL: connection-scoped delta dict path only. Per non-null row, a varint
+/// id follows; we expand into a dense `row_count` `u32` buffer with `0` in
+/// null slots (validity bitmap is the source of truth for null-vs-id-zero).
+//
+// TODO(qwp): also support the column-local dict mode (varint dict_size +
+// per-entry varint len + bytes preceding the per-row codes). The per-batch
+// signal for which mode is in effect needs to be confirmed against the
+// reference decoder before implementing.
 fn decode_symbol(
     r: &mut ByteReader<'_>,
     row_count: usize,
 ) -> Result<(Vec<u32>, Option<Vec<u8>>)> {
     let validity = decode_validity(r, row_count)?;
-    let non_null = match &validity {
-        None => row_count,
-        Some(bytes) => row_count - count_nulls(bytes, row_count),
-    };
-    let mut codes = Vec::with_capacity(non_null);
-    for i in 0..non_null {
+    let mut codes = vec![0u32; row_count];
+    for row in 0..row_count {
+        if is_null_at_opt(&validity, row) {
+            continue;
+        }
         let code = r.read_varint_u64().map_err(|e| {
             Error::new(
                 e.code(),
-                format!("symbol code at non-null position {}: {}", i, e.msg()),
+                format!("symbol code at row {}: {}", row, e.msg()),
             )
         })?;
         let code32 = u32::try_from(code).map_err(|_| {
             fmt!(
                 ProtocolError,
-                "symbol code {} at position {} exceeds u32",
+                "symbol code {} at row {} exceeds u32",
                 code,
-                i
+                row
             )
         })?;
-        codes.push(code32);
+        codes[row] = code32;
     }
     Ok((codes, validity))
 }
 
+/// DECIMAL64: column-level 1-byte scale follows the validity section, then
+/// `non_null_count × 8` LE bytes; densified like the fixed-width path.
 fn decode_decimal64(
     r: &mut ByteReader<'_>,
     row_count: usize,
 ) -> Result<(i8, ColumnBuffer)> {
     let validity = decode_validity(r, row_count)?;
     let scale = r.read_u8()? as i8;
-    let len = row_count
+    let dense_len = row_count
         .checked_mul(8)
         .ok_or_else(|| fmt!(ProtocolError, "decimal column size overflow"))?;
-    let values = r.read_bytes(len)?.to_vec();
-    Ok((scale, ColumnBuffer { values, validity }))
+    let buffer = match &validity {
+        None => {
+            let values = r.read_bytes(dense_len)?.to_vec();
+            ColumnBuffer { values, validity }
+        }
+        Some(bitmap) => {
+            let non_null = row_count - count_nulls(bitmap, row_count);
+            let compact = r.read_bytes(non_null * 8)?;
+            let mut dense = vec![0u8; dense_len];
+            let mut src = 0usize;
+            for row in 0..row_count {
+                if !is_null_at(bitmap, row) {
+                    let dst = row * 8;
+                    dense[dst..dst + 8].copy_from_slice(&compact[src..src + 8]);
+                    src += 8;
+                }
+            }
+            ColumnBuffer {
+                values: dense,
+                validity,
+            }
+        }
+    };
+    Ok((scale, buffer))
 }
 
 fn count_nulls(bitmap: &[u8], row_count: usize) -> usize {
     let mut nulls = 0usize;
     for r in 0..row_count {
-        if (bitmap[r >> 3] >> (r & 7)) & 1 != 0 {
+        if is_null_at(bitmap, r) {
             nulls += 1;
         }
     }
     nulls
+}
+
+fn is_null_at(bitmap: &[u8], row: usize) -> bool {
+    (bitmap[row >> 3] >> (row & 7)) & 1 != 0
+}
+
+fn is_null_at_opt(validity: &Option<Vec<u8>>, row: usize) -> bool {
+    match validity {
+        None => false,
+        Some(bitmap) => is_null_at(bitmap, row),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -588,13 +677,13 @@ mod tests {
     }
 
     #[test]
-    fn decode_long_with_nulls() {
-        // 4 rows; row 1 is null.
+    fn decode_long_with_nulls_densifies() {
+        // 4 rows; row 1 is null. Wire is COMPACT: only 3 i64 values present.
         let (flags_byte, payload) = BatchBuilder::new(4)
             .add_column(
                 "v",
                 ColumnKind::Long,
-                col_with_bitmap(&[0x02], &le_i64s(&[10, 0, 30, 40])),
+                col_with_bitmap(&[0x02], &le_i64s(&[10, 30, 40])),
             )
             .build();
 
@@ -606,9 +695,56 @@ mod tests {
         assert!(!c.is_null(0));
         assert!(c.is_null(1));
         assert!(!c.is_null(2));
+        assert!(!c.is_null(3));
         assert_eq!(c.value(0), 10);
+        // Row 1 is null; densified slot is zero per the decoder's contract.
+        assert_eq!(c.value(1), 0);
         assert_eq!(c.value(2), 30);
         assert_eq!(c.value(3), 40);
+    }
+
+    #[test]
+    fn decode_long_densifies_multiple_nulls() {
+        // 8 rows; rows 1, 4, 7 null. Bitmap: bits 1,4,7 = 0b1001_0010 = 0x92
+        let (flags_byte, payload) = BatchBuilder::new(8)
+            .add_column(
+                "v",
+                ColumnKind::Long,
+                col_with_bitmap(&[0x92], &le_i64s(&[100, 102, 103, 105, 106])),
+            )
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let view = batch.column_view(0, &dict).unwrap();
+        let ColumnView::Long(c) = view else { panic!() };
+        let expected: Vec<Option<i64>> = vec![
+            Some(100), None, Some(102), Some(103), None, Some(105), Some(106), None,
+        ];
+        let got: Vec<Option<i64>> = (0..8)
+            .map(|r| if c.is_null(r) { None } else { Some(c.value(r)) })
+            .collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn decode_boolean_bit_packed() {
+        // 5 rows, no nulls. Wire bits (LSB-first) for [t, f, t, t, f]:
+        // bit0=1, bit1=0, bit2=1, bit3=1, bit4=0 → 0b0000_1101 = 0x0D
+        let (flags_byte, payload) = BatchBuilder::new(5)
+            .add_column("b", ColumnKind::Boolean, col_no_nulls(&[0x0D]))
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let view = batch.column_view(0, &dict).unwrap();
+        let ColumnView::Boolean(c) = view else { panic!() };
+        assert_eq!(c.len(), 5);
+        assert_eq!(c.value(0), 1);
+        assert_eq!(c.value(1), 0);
+        assert_eq!(c.value(2), 1);
+        assert_eq!(c.value(3), 1);
+        assert_eq!(c.value(4), 0);
     }
 
     #[test]
