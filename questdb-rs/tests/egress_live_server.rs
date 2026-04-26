@@ -1393,6 +1393,95 @@ fn bind_null_geohash_with_precision() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn exec_done_for_ddl_and_insert() {
+    // Drives non-SELECT statements through the egress channel and
+    // verifies each terminates with `EXEC_DONE` (0x16) rather than
+    // `RESULT_END` (0x12). next_batch returns Ok(None) immediately on
+    // the first call (no batches arrive), with the terminal accessor
+    // surfacing the rows_affected and op_type fields.
+    let srv = server();
+    let table = unique_table("exec_done");
+    let mut reader = make_reader(srv);
+
+    // 1) CREATE TABLE -> EXEC_DONE (DDL: rows_affected = 0).
+    {
+        let mut cur = reader
+            .query(&format!(
+                "create table \"{}\" (v long, ts timestamp) timestamp(ts) partition by day wal",
+                table
+            ))
+            .execute()
+            .expect("execute create");
+        assert!(
+            cur.next_batch().expect("next create").is_none(),
+            "CREATE TABLE should not produce RESULT_BATCH frames"
+        );
+        match cur.terminal() {
+            Some(Terminal::ExecDone {
+                op_type,
+                rows_affected,
+            }) => {
+                assert_eq!(*rows_affected, 0, "CREATE TABLE: rows_affected = 0");
+                eprintln!("[exec_done create] op_type=0x{:02X}", op_type);
+            }
+            other => panic!("expected ExecDone for CREATE TABLE, got {:?}", other),
+        }
+    }
+
+    // 2) INSERT INTO ... VALUES -> EXEC_DONE with rows_affected = N.
+    {
+        let mut cur = reader
+            .query(&format!(
+                "insert into \"{}\" values \
+                 (10, '2026-01-01T00:00:00.000Z'), \
+                 (20, '2026-01-01T00:00:01.000Z'), \
+                 (30, '2026-01-01T00:00:02.000Z')",
+                table
+            ))
+            .execute()
+            .expect("execute insert");
+        assert!(cur.next_batch().expect("next insert").is_none());
+        match cur.terminal() {
+            Some(Terminal::ExecDone {
+                op_type,
+                rows_affected,
+            }) => {
+                assert_eq!(*rows_affected, 3, "INSERT: rows_affected = 3");
+                eprintln!("[exec_done insert] op_type=0x{:02X}", op_type);
+            }
+            other => panic!("expected ExecDone for INSERT, got {:?}", other),
+        }
+    }
+
+    // 3) Sanity: a follow-up SELECT on the same connection still works
+    //    (the cursor lifecycle reset correctly after EXEC_DONE).
+    wait_for_rows(srv, &table, 3);
+    {
+        let mut cur = reader
+            .query(&format!("select v from \"{}\" order by ts", table))
+            .execute()
+            .expect("execute select");
+        let view = cur.next_batch().expect("next select").expect("Some batch");
+        let ColumnView::Long(c) = view.column(0).unwrap() else { panic!() };
+        assert_eq!(c.value(0), 10);
+        assert_eq!(c.value(1), 20);
+        assert_eq!(c.value(2), 30);
+        while cur.next_batch().expect("drain").is_some() {}
+        assert!(matches!(cur.terminal(), Some(Terminal::End { .. })));
+    }
+
+    // 4) DROP TABLE -> EXEC_DONE.
+    {
+        let mut cur = reader
+            .query(&format!("drop table \"{}\"", table))
+            .execute()
+            .expect("execute drop");
+        assert!(cur.next_batch().expect("next drop").is_none());
+        assert!(matches!(cur.terminal(), Some(Terminal::ExecDone { .. })));
+    }
+}
+
+#[test]
 fn cursor_terminal_after_select() {
     let srv = server();
     let table = unique_table("term");
