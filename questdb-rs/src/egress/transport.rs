@@ -60,10 +60,19 @@ impl WsTransport {
     /// Connect to the configured endpoint, perform the WS handshake with
     /// the negotiation headers, and validate the server's response.
     pub fn connect(config: &ReaderConfig) -> Result<Self> {
-        if config.tls {
+        // TLS uses tungstenite's bundled rustls + webpki-roots. Custom
+        // roots (`tls_roots`/`tls_roots_password`) and `tls_verify=unsafe_off`
+        // are not yet honoured — they're parsed and rejected as configured
+        // by `ReaderConfig`, but a future commit will build a custom
+        // `rustls::ClientConfig` and pass it via `tungstenite::Connector`.
+        if config.tls
+            && (config.tls_roots.is_some()
+                || config.tls_roots_password.is_some()
+                || matches!(config.tls_verify, crate::egress::TlsVerify::UnsafeOff))
+        {
             return Err(fmt!(
                 ConfigError,
-                "TLS (qwps://) transport is not yet wired up; use qwp:// for now"
+                "custom tls_roots / tls_verify=unsafe_off are not yet honoured by the WebSocket transport"
             ));
         }
         let url = config.url();

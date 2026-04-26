@@ -43,7 +43,7 @@ rust_decimal = { version = "1.38.0", optional = true }
 bigdecimal = { version = "0.4.8", optional = true }
 
 # Sync WebSocket transport for QWP egress reader.
-tungstenite = { version = "0.27", default-features = false, features = ["handshake"], optional = true }
+tungstenite = { version = "0.27", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3.9", features = ["ws2def"] }
