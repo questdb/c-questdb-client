@@ -412,6 +412,12 @@ impl<'c> BatchView<'c> {
         self.decoded.batch_seq
     }
 
+    /// Per-batch wire flags from the frame header. Useful for asserting
+    /// that compression / Gorilla paths were actually exercised.
+    pub fn flags(&self) -> u8 {
+        self.decoded.flags
+    }
+
     pub fn schema(&self) -> &'c Schema {
         self.schema
     }

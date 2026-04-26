@@ -166,6 +166,9 @@ pub struct DecodedBatch {
     pub schema_id: u64,
     pub row_count: usize,
     pub columns: Vec<DecodedColumn>,
+    /// Per-batch wire flags from the frame header (`FLAG_GORILLA`,
+    /// `FLAG_DELTA_SYMBOL_DICT`, `FLAG_ZSTD`).
+    pub flags: u8,
 }
 
 impl DecodedBatch {
@@ -262,13 +265,6 @@ pub fn decode_result_batch(
     dict: &mut SymbolDict,
     registry: &mut SchemaRegistry,
 ) -> Result<DecodedBatch> {
-    if flags_byte & flags::ZSTD != 0 {
-        return Err(fmt!(
-            UnsupportedServer,
-            "FLAG_ZSTD payload compression is not yet supported by this client"
-        ));
-    }
-
     let mut r = ByteReader::new(payload);
 
     let kind = r.read_u8()?;
@@ -281,6 +277,31 @@ pub fn decode_result_batch(
     }
     let request_id = r.read_i64_le()?;
     let batch_seq = r.read_varint_u64()?;
+
+    // The `msg_kind / request_id / batch_seq` prefix is always
+    // uncompressed; FLAG_ZSTD covers everything after it (delta-dict
+    // section + table block + per-column data) as a single zstd frame.
+    let decompressed_owned: Option<Vec<u8>>;
+    let body: &[u8] = if flags_byte & flags::ZSTD != 0 {
+        #[cfg(feature = "compression-zstd")]
+        {
+            decompressed_owned = Some(zstd_decompress_body(r.remaining())?);
+            decompressed_owned.as_ref().unwrap()
+        }
+        #[cfg(not(feature = "compression-zstd"))]
+        {
+            return Err(fmt!(
+                UnsupportedServer,
+                "server sent FLAG_ZSTD batch but client was built without the \
+                 `compression-zstd` feature"
+            ));
+        }
+    } else {
+        decompressed_owned = None;
+        r.remaining()
+    };
+    let _ = &decompressed_owned; // Keep the owned buffer alive for `body`.
+    let mut r = ByteReader::new(body);
 
     if flags_byte & flags::DELTA_SYMBOL_DICT != 0 {
         let consumed = dict.apply_delta_from_bytes(r.remaining())?;
@@ -351,6 +372,7 @@ pub fn decode_result_batch(
         schema_id,
         row_count,
         columns,
+        flags: flags_byte,
     })
 }
 
@@ -822,6 +844,64 @@ fn decode_decimal64(
     Ok((scale, buffer))
 }
 
+/// Maximum zstd-decompressed `RESULT_BATCH` body size we accept. Matches
+/// the per-batch wire cap from the spec (16 MiB) with a 4x safety margin
+/// so legitimate frames never trip the cap.
+#[cfg(feature = "compression-zstd")]
+const MAX_ZSTD_DECOMPRESSED: u64 = 64 * 1024 * 1024;
+
+/// Decompress a single zstd frame containing the body of a
+/// `RESULT_BATCH`. The frame header must declare a content size
+/// (`ZSTD_c_contentSizeFlag` is on by default in the server encoder);
+/// rejecting "unknown" content size keeps decode-bomb amplification
+/// closed.
+#[cfg(feature = "compression-zstd")]
+fn zstd_decompress_body(compressed: &[u8]) -> Result<Vec<u8>> {
+    let size = match zstd::zstd_safe::get_frame_content_size(compressed) {
+        Ok(Some(n)) => n,
+        Ok(None) => {
+            return Err(fmt!(
+                ProtocolError,
+                "zstd frame missing content size (protocol violation)"
+            ));
+        }
+        Err(_) => {
+            return Err(fmt!(
+                ProtocolError,
+                "invalid zstd frame header (truncated, bad magic, or content size > u64::MAX)"
+            ));
+        }
+    };
+    if size > MAX_ZSTD_DECOMPRESSED {
+        return Err(fmt!(
+            LimitExceeded,
+            "zstd frame content size {} exceeds client cap {}",
+            size,
+            MAX_ZSTD_DECOMPRESSED
+        ));
+    }
+    let usize_size = usize::try_from(size).map_err(|_| {
+        fmt!(
+            LimitExceeded,
+            "zstd frame content size {} does not fit in usize",
+            size
+        )
+    })?;
+
+    let decompressed = zstd::bulk::decompress(compressed, usize_size).map_err(|e| {
+        fmt!(ProtocolError, "zstd decompress failed: {}", e)
+    })?;
+    if decompressed.len() != usize_size {
+        return Err(fmt!(
+            ProtocolError,
+            "zstd decompressed size {} != frame content size {}",
+            decompressed.len(),
+            size
+        ));
+    }
+    Ok(decompressed)
+}
+
 fn count_nulls(bitmap: &[u8], row_count: usize) -> usize {
     let mut nulls = 0usize;
     for r in 0..row_count {
@@ -1144,13 +1224,63 @@ mod tests {
         assert_eq!(c.value(0), 42);
     }
 
+    #[cfg(feature = "compression-zstd")]
     #[test]
-    fn rejects_zstd_flag() {
-        let (_, payload) = BatchBuilder::new(0).build();
+    fn zstd_round_trips_simple_long_batch() {
+        // Build a raw RESULT_BATCH, then re-pack the body bytes (after
+        // msg_kind / request_id / batch_seq) as a zstd frame and verify
+        // the decoder restores the original meaning when FLAG_ZSTD is set.
+        let (_, raw_payload) = BatchBuilder::new(3)
+            .add_column("v", ColumnKind::Long, col_no_nulls(&le_i64s(&[10, 20, 30])))
+            .build();
+
+        // Split: 1 byte msg_kind + 8 bytes request_id + varint batch_seq
+        // is uncompressed; the rest is the body we'll compress.
+        let prefix_len = {
+            let mut r = ByteReader::new(&raw_payload);
+            r.read_u8().unwrap();
+            r.read_i64_le().unwrap();
+            r.read_varint_u64().unwrap();
+            // r.bytes - r.remaining() is awkward; use difference.
+            raw_payload.len() - r.remaining().len()
+        };
+        let prefix = &raw_payload[..prefix_len];
+        let body = &raw_payload[prefix_len..];
+
+        let compressed_body = zstd::bulk::compress(body, 0).expect("zstd compress");
+        let mut zstd_payload = Vec::new();
+        zstd_payload.extend_from_slice(prefix);
+        zstd_payload.extend_from_slice(&compressed_body);
+
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let batch = decode_result_batch(&zstd_payload, flags::ZSTD, &mut dict, &mut reg).unwrap();
+        assert_eq!(batch.row_count, 3);
+        let view = batch.column_view(0, &dict).unwrap();
+        let ColumnView::Long(c) = view else { panic!() };
+        assert_eq!(c.value(0), 10);
+        assert_eq!(c.value(1), 20);
+        assert_eq!(c.value(2), 30);
+    }
+
+    #[cfg(feature = "compression-zstd")]
+    #[test]
+    fn zstd_invalid_frame_is_protocol_error() {
+        // Build a payload with a valid prefix + bogus zstd body bytes.
+        let (_, raw_payload) = BatchBuilder::new(0).build();
+        let prefix_len = {
+            let mut r = ByteReader::new(&raw_payload);
+            r.read_u8().unwrap();
+            r.read_i64_le().unwrap();
+            r.read_varint_u64().unwrap();
+            raw_payload.len() - r.remaining().len()
+        };
+        let mut payload = raw_payload[..prefix_len].to_vec();
+        payload.extend_from_slice(&[0u8, 0, 0, 0]); // not a zstd frame
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
         let err = decode_result_batch(&payload, flags::ZSTD, &mut dict, &mut reg).unwrap_err();
-        assert_eq!(err.code(), ErrorCode::UnsupportedServer);
+        assert_eq!(err.code(), ErrorCode::ProtocolError);
     }
 
     #[test]

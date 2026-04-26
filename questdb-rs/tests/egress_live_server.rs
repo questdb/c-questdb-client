@@ -1669,6 +1669,96 @@ fn multi_batch_with_mixed_nulls_and_symbols() {
 }
 
 #[test]
+fn zstd_compressed_multi_batch() {
+    // Connect with compression=zstd and run the same multi-batch query
+    // pattern; verify the FLAG_ZSTD decode path produces identical
+    // results to the raw path. Server picks per-batch whether to
+    // compress (FLAG_ZSTD set) or send raw, so we must accept both
+    // bit patterns transparently.
+    let srv = server();
+    let table = unique_table("zstd_multibatch");
+    srv.http_exec(&format!(
+        "create table \"{}\" (i long, d double, ts timestamp) timestamp(ts) partition by day wal",
+        table
+    ));
+
+    const TOTAL: usize = 5_000;
+    const PER_BATCH: usize = 1_000;
+    let mut sender = make_sender(srv, ProtocolVersion::V2);
+    let mut buf = sender.new_buffer();
+    for i in 0..TOTAL as i64 {
+        buf.table(table.as_str())
+            .unwrap()
+            .column_i64("i", i)
+            .unwrap()
+            .column_f64("d", i as f64 * 0.5)
+            .unwrap()
+            .at(TimestampNanos::new(1_700_000_000_000_000_000 + i * 1_000_000))
+            .unwrap();
+    }
+    sender.flush(&mut buf).expect("flush");
+    wait_for_rows(srv, &table, TOTAL);
+
+    // compression=zstd advertises only zstd; auto would advertise both.
+    // Either accepts FLAG_ZSTD on the server side; we use zstd to be
+    // explicit that the path is exercised.
+    let conf = format!(
+        "{};max_batch_rows={};compression=zstd",
+        srv.qwp_conf(),
+        PER_BATCH
+    );
+    let mut reader = Reader::from_conf(&conf).expect("reader");
+    let mut cursor = reader
+        .query(&format!("select i, d from \"{}\" order by ts", table))
+        .execute()
+        .expect("execute");
+
+    use questdb::egress::wire::flags as wire_flags;
+    let mut batch_count = 0usize;
+    let mut compressed_batches = 0usize;
+    let mut total_rows = 0usize;
+    let mut first_value: Option<i64> = None;
+    let mut last_value: Option<i64> = None;
+
+    while let Some(view) = cursor.next_batch().expect("next_batch") {
+        batch_count += 1;
+        if view.flags() & wire_flags::ZSTD != 0 {
+            compressed_batches += 1;
+        }
+        let rows = view.row_count();
+        let ColumnView::Long(i_col) = view.column(0).unwrap() else { panic!() };
+        let ColumnView::Double(d_col) = view.column(1).unwrap() else { panic!() };
+        if first_value.is_none() {
+            first_value = Some(i_col.value(0));
+        }
+        if rows > 0 {
+            last_value = Some(i_col.value(rows - 1));
+            let last_i = i_col.value(rows - 1);
+            assert_eq!(d_col.value(rows - 1), last_i as f64 * 0.5);
+        }
+        total_rows += rows;
+    }
+
+    eprintln!(
+        "[zstd_compressed_multi_batch] batches={} (compressed={}) rows={}",
+        batch_count, compressed_batches, total_rows
+    );
+    assert_eq!(total_rows, TOTAL);
+    assert!(batch_count >= TOTAL / PER_BATCH);
+    assert_eq!(first_value, Some(0));
+    assert_eq!(last_value, Some(TOTAL as i64 - 1));
+    // The server doesn't HAVE to compress, but with compression=zstd
+    // negotiated and 5000 rows of monotonic-int data (highly
+    // compressible), at least some batches should arrive zstd-encoded.
+    // If 0, our decoder didn't exercise the FLAG_ZSTD path.
+    assert!(
+        compressed_batches > 0,
+        "no batches arrived with FLAG_ZSTD set; zstd decode path not exercised"
+    );
+    assert!(matches!(cursor.terminal(), Some(Terminal::End { .. })));
+}
+
+#[test]
 fn null_handling_long_densifies() {
     let srv = server();
     let table = unique_table("nulls");

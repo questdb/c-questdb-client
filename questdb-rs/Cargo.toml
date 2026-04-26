@@ -44,6 +44,7 @@ bigdecimal = { version = "0.4.8", optional = true }
 
 # Sync WebSocket transport for QWP egress reader.
 tungstenite = { version = "0.27", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"], optional = true }
+zstd = { version = "0.13", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3.9", features = ["ws2def"] }
@@ -110,7 +111,10 @@ rust_decimal = ["dep:rust_decimal"]
 bigdecimal = ["dep:bigdecimal"]
 
 ## Sync QWP egress reader over WebSocket (plain `ws://`).
-sync-reader-ws = ["_egress", "dep:tungstenite"]
+sync-reader-ws = ["_egress", "dep:tungstenite", "compression-zstd"]
+
+## Decompression for `FLAG_ZSTD` `RESULT_BATCH` payloads.
+compression-zstd = ["_egress", "dep:zstd"]
 
 ## Run integration tests against a real QuestDB server launched from the
 ## `questdb/` submodule. Requires JDK 25 + Maven and a built jar at

@@ -38,7 +38,7 @@
 //! | `addr`             | required; `host:port` or `host`                          |
 //! | `path`             | endpoint path (`/read/v1`)                               |
 //! | `max_version`      | QWP version to advertise (`2`)                           |
-//! | `compression`      | `raw` only for now (`zstd`/`auto` not yet decoded) (`raw`) |
+//! | `compression`      | `raw` / `zstd` / `auto` — `zstd`/`auto` require the `compression-zstd` feature (`raw`) |
 //! | `max_batch_rows`   | sent only when non-zero (`0` = server default)           |
 //! | `client_id`        | optional; sent only when set                             |
 //! | `durable_ack`      | `true`/`false` (`false`)                                 |
@@ -283,13 +283,17 @@ impl ReaderConfig {
             }
         }
 
-        // Compression we can actually decode end-to-end is currently `raw` only.
-        if !matches!(compression, Compression::Raw) {
-            return Err(fmt!(
-                ConfigError,
-                "\"compression\" {:?} is not yet supported by this client; use \"raw\"",
-                compression.header_token()
-            ));
+        // zstd / auto require the compression-zstd feature.
+        #[cfg(not(feature = "compression-zstd"))]
+        {
+            if !matches!(compression, Compression::Raw) {
+                return Err(fmt!(
+                    ConfigError,
+                    "\"compression\" {:?} requires the `compression-zstd` crate feature; \
+                     either enable it or use \"raw\"",
+                    compression.header_token()
+                ));
+            }
         }
 
         // tls_verify=unsafe_off needs the crate feature.
@@ -464,12 +468,22 @@ mod tests {
         assert_eq!(err.code(), ErrorCode::ConfigError);
     }
 
+    #[cfg(not(feature = "compression-zstd"))]
     #[test]
-    fn compression_zstd_rejected_for_now() {
+    fn compression_zstd_rejected_without_feature() {
         let err = ReaderConfig::from_conf("qwp::addr=h:1;compression=zstd").unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
         let err = ReaderConfig::from_conf("qwp::addr=h:1;compression=auto").unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
+    }
+
+    #[cfg(feature = "compression-zstd")]
+    #[test]
+    fn compression_zstd_accepted_with_feature() {
+        let c = ReaderConfig::from_conf("qwp::addr=h:1;compression=zstd").unwrap();
+        assert_eq!(c.compression, Compression::Zstd);
+        let c = ReaderConfig::from_conf("qwp::addr=h:1;compression=auto").unwrap();
+        assert_eq!(c.compression, Compression::Auto);
     }
 
     #[test]
