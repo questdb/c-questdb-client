@@ -60,7 +60,8 @@
 //!   DECIMAL128/256, DOUBLE_ARRAY, LONG_ARRAY
 
 use crate::egress::column::{
-    ColumnView, Decimal64Column, FixedColumn, Long256Column, SymbolColumn, UuidColumn, Validity,
+    BinaryColumn, ColumnView, Decimal64Column, FixedColumn, Long256Column, SymbolColumn,
+    UuidColumn, Validity, VarcharColumn,
 };
 use crate::egress::column_kind::ColumnKind;
 use crate::egress::error::{Error, Result, fmt};
@@ -110,6 +111,19 @@ pub enum DecodedColumn {
     },
     Char(ColumnBuffer),
     Ipv4(ColumnBuffer),
+    Varchar {
+        /// Dense per-row offsets (length `row_count + 1`); null rows are
+        /// zero-length entries.
+        offsets: Vec<u32>,
+        /// Concatenated UTF-8 bytes (validated at decode time).
+        data: Vec<u8>,
+        validity: Option<Vec<u8>>,
+    },
+    Binary {
+        offsets: Vec<u32>,
+        data: Vec<u8>,
+        validity: Option<Vec<u8>>,
+    },
 }
 
 /// One decoded `RESULT_BATCH`.
@@ -154,6 +168,12 @@ impl DecodedBatch {
                 validity_from_opt(validity, self.row_count),
                 dict,
             )),
+            DecodedColumn::Varchar { offsets, data, validity } => ColumnView::Varchar(
+                VarcharColumn::new(offsets, data, validity_from_opt(validity, self.row_count)),
+            ),
+            DecodedColumn::Binary { offsets, data, validity } => ColumnView::Binary(
+                BinaryColumn::new(offsets, data, validity_from_opt(validity, self.row_count)),
+            ),
         })
     }
 }
@@ -313,9 +333,16 @@ fn decode_column(
             DecodedColumn::Decimal64 { buffer, scale }
         }
 
-        ColumnKind::Varchar
-        | ColumnKind::Binary
-        | ColumnKind::Geohash
+        ColumnKind::Varchar => {
+            let (offsets, data, validity) = decode_varlen(r, row_count, /*utf8=*/ true)?;
+            DecodedColumn::Varchar { offsets, data, validity }
+        }
+        ColumnKind::Binary => {
+            let (offsets, data, validity) = decode_varlen(r, row_count, /*utf8=*/ false)?;
+            DecodedColumn::Binary { offsets, data, validity }
+        }
+
+        ColumnKind::Geohash
         | ColumnKind::Decimal128
         | ColumnKind::Decimal256
         | ColumnKind::DoubleArray
@@ -328,6 +355,79 @@ fn decode_column(
             ));
         }
     })
+}
+
+/// VARCHAR / BINARY column body (after the validity section).
+///
+/// Wire layout: `(non_null + 1) × u32_le` offsets, then `compact_offsets[non_null]`
+/// bytes of concatenated values. Returns dense per-row offsets
+/// (`row_count + 1` entries; null rows zero-length) plus the original
+/// compact data buffer (string boundaries are unchanged by densification).
+fn decode_varlen(
+    r: &mut ByteReader<'_>,
+    row_count: usize,
+    utf8: bool,
+) -> Result<(Vec<u32>, Vec<u8>, Option<Vec<u8>>)> {
+    let validity = decode_validity(r, row_count)?;
+    let non_null = match &validity {
+        None => row_count,
+        Some(bitmap) => row_count - count_nulls(bitmap, row_count),
+    };
+
+    // Read the compact offsets array.
+    let offsets_byte_len = (non_null + 1)
+        .checked_mul(4)
+        .ok_or_else(|| fmt!(ProtocolError, "varlen offsets size overflow"))?;
+    let offsets_bytes = r.read_bytes(offsets_byte_len)?;
+    let mut compact = Vec::with_capacity(non_null + 1);
+    for chunk in offsets_bytes.chunks_exact(4) {
+        compact.push(u32::from_le_bytes(chunk.try_into().unwrap()));
+    }
+
+    // Validate offsets are monotonically non-decreasing and start at 0.
+    if compact[0] != 0 {
+        return Err(fmt!(
+            ProtocolError,
+            "varlen offsets must start at 0, got {}",
+            compact[0]
+        ));
+    }
+    for i in 1..compact.len() {
+        if compact[i] < compact[i - 1] {
+            return Err(fmt!(
+                ProtocolError,
+                "varlen offsets not monotonic at index {}: {} < {}",
+                i,
+                compact[i],
+                compact[i - 1]
+            ));
+        }
+    }
+
+    // Read the concatenated data bytes.
+    let data_len = compact[non_null] as usize;
+    let data = r.read_bytes(data_len)?.to_vec();
+
+    if utf8 {
+        std::str::from_utf8(&data).map_err(|e| {
+            fmt!(InvalidUtf8, "varchar data buffer not valid UTF-8: {}", e)
+        })?;
+    }
+
+    // Densify offsets to row_count + 1 entries.
+    let mut dense = vec![0u32; row_count + 1];
+    let mut k = 0usize; // walked non-null entries
+    for row in 0..row_count {
+        if is_null_at_opt(&validity, row) {
+            dense[row + 1] = dense[row];
+        } else {
+            let len = compact[k + 1] - compact[k];
+            dense[row + 1] = dense[row] + len;
+            k += 1;
+        }
+    }
+
+    Ok((dense, data, validity))
 }
 
 fn decode_validity(r: &mut ByteReader<'_>, row_count: usize) -> Result<Option<Vec<u8>>> {
@@ -857,14 +957,178 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_column_kind() {
+        // Geohash isn't in the modelled set yet.
         let (flags_byte, payload) = BatchBuilder::new(1)
-            .add_column("s", ColumnKind::Varchar, vec![0x00u8])
+            .add_column("g", ColumnKind::Geohash, vec![0x00u8])
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
         let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap_err();
         assert_eq!(err.code(), ErrorCode::UnsupportedServer);
-        assert!(err.msg().contains("varchar"));
+        assert!(err.msg().contains("geohash"));
+    }
+
+    fn varchar_col_no_nulls(values: &[&str]) -> Vec<u8> {
+        let mut out = vec![0x00u8]; // null_flag
+        let mut total = 0u32;
+        out.extend_from_slice(&total.to_le_bytes());
+        for v in values {
+            total += v.len() as u32;
+            out.extend_from_slice(&total.to_le_bytes());
+        }
+        for v in values {
+            out.extend_from_slice(v.as_bytes());
+        }
+        out
+    }
+
+    fn varchar_col_with_bitmap(bitmap: &[u8], non_null_values: &[&str]) -> Vec<u8> {
+        let mut out = vec![0x01u8];
+        out.extend_from_slice(bitmap);
+        let mut total = 0u32;
+        out.extend_from_slice(&total.to_le_bytes());
+        for v in non_null_values {
+            total += v.len() as u32;
+            out.extend_from_slice(&total.to_le_bytes());
+        }
+        for v in non_null_values {
+            out.extend_from_slice(v.as_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn decode_varchar_no_nulls() {
+        let (flags_byte, payload) = BatchBuilder::new(3)
+            .add_column("s", ColumnKind::Varchar, varchar_col_no_nulls(&["foo", "", "café"]))
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let view = batch.column_view(0, &dict).unwrap();
+        let ColumnView::Varchar(c) = view else { panic!() };
+        assert_eq!(c.len(), 3);
+        assert_eq!(c.value(0), Some("foo"));
+        assert_eq!(c.value(1), Some(""));
+        assert_eq!(c.value(2), Some("café"));
+    }
+
+    #[test]
+    fn decode_varchar_with_nulls_densifies_offsets() {
+        // 4 rows; rows 0,2 valid; row 1 null; row 3 null.
+        // Bitmap bits 1 and 3 set → 0b0000_1010 = 0x0A
+        let (flags_byte, payload) = BatchBuilder::new(4)
+            .add_column(
+                "s",
+                ColumnKind::Varchar,
+                varchar_col_with_bitmap(&[0x0A], &["hello", "world"]),
+            )
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let view = batch.column_view(0, &dict).unwrap();
+        let ColumnView::Varchar(c) = view else { panic!() };
+        assert_eq!(c.len(), 4);
+        assert_eq!(c.value(0), Some("hello"));
+        assert_eq!(c.value(1), None);
+        assert_eq!(c.value(2), Some("world"));
+        assert_eq!(c.value(3), None);
+        // Dense offsets: [0, 5, 5, 10, 10]
+        assert_eq!(c.offsets(), &[0u32, 5, 5, 10, 10]);
+    }
+
+    #[test]
+    fn decode_varchar_invalid_utf8_rejected() {
+        let mut col = vec![0x00u8]; // null_flag
+        // 1 row, len 2
+        col.extend_from_slice(&0u32.to_le_bytes());
+        col.extend_from_slice(&2u32.to_le_bytes());
+        col.extend_from_slice(&[0xFF, 0xFE]); // invalid UTF-8
+        let (flags_byte, payload) = BatchBuilder::new(1)
+            .add_column("s", ColumnKind::Varchar, col)
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidUtf8);
+    }
+
+    #[test]
+    fn decode_binary_no_nulls() {
+        let mut col = vec![0x00u8];
+        // offsets [0, 3, 5]
+        for o in [0u32, 3, 5] {
+            col.extend_from_slice(&o.to_le_bytes());
+        }
+        col.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0x42]);
+        let (flags_byte, payload) = BatchBuilder::new(2)
+            .add_column("b", ColumnKind::Binary, col)
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let view = batch.column_view(0, &dict).unwrap();
+        let ColumnView::Binary(c) = view else { panic!() };
+        assert_eq!(c.len(), 2);
+        assert_eq!(c.value(0), Some([0xDEu8, 0xAD, 0xBE].as_slice()));
+        assert_eq!(c.value(1), Some([0xEFu8, 0x42].as_slice()));
+    }
+
+    #[test]
+    fn decode_binary_invalid_utf8_accepted() {
+        // BINARY treats bytes as opaque — 0xFF 0xFE roundtrips fine.
+        let mut col = vec![0x00u8];
+        col.extend_from_slice(&0u32.to_le_bytes());
+        col.extend_from_slice(&2u32.to_le_bytes());
+        col.extend_from_slice(&[0xFF, 0xFE]);
+        let (flags_byte, payload) = BatchBuilder::new(1)
+            .add_column("b", ColumnKind::Binary, col)
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let view = batch.column_view(0, &dict).unwrap();
+        let ColumnView::Binary(c) = view else { panic!() };
+        assert_eq!(c.value(0), Some([0xFFu8, 0xFE].as_slice()));
+    }
+
+    #[test]
+    fn decode_varlen_non_monotonic_rejected() {
+        let mut col = vec![0x00u8];
+        // offsets [0, 5, 3] — second offset goes backward
+        for o in [0u32, 5, 3] {
+            col.extend_from_slice(&o.to_le_bytes());
+        }
+        col.extend_from_slice(&[0u8; 5]);
+        let (flags_byte, payload) = BatchBuilder::new(2)
+            .add_column("s", ColumnKind::Varchar, col)
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ProtocolError);
+    }
+
+    #[test]
+    fn decode_varchar_all_null_column() {
+        // 3 rows, all null. Bitmap: 0b00000111 = 0x07
+        // Compact has 0 non-null entries → offsets has 1 entry [0], no data.
+        let mut col = vec![0x01u8, 0x07];
+        col.extend_from_slice(&0u32.to_le_bytes());
+        let (flags_byte, payload) = BatchBuilder::new(3)
+            .add_column("s", ColumnKind::Varchar, col)
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let view = batch.column_view(0, &dict).unwrap();
+        let ColumnView::Varchar(c) = view else { panic!() };
+        assert_eq!(c.len(), 3);
+        assert_eq!(c.value(0), None);
+        assert_eq!(c.value(1), None);
+        assert_eq!(c.value(2), None);
+        assert_eq!(c.offsets(), &[0u32, 0, 0, 0]);
     }
 
     #[test]

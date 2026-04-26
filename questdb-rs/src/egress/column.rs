@@ -387,6 +387,144 @@ impl<'a> Decimal64Column<'a> {
 }
 
 // ---------------------------------------------------------------------------
+// Variable-length columns (VARCHAR, BINARY)
+// ---------------------------------------------------------------------------
+
+/// Per-row offsets into a flat byte buffer.
+///
+/// `offsets` has `row_count + 1` entries; the bytes for row `i` live at
+/// `data[offsets[i]..offsets[i+1]]`. Null rows are represented as
+/// zero-length entries (`offsets[i] == offsets[i+1]`); the validity
+/// bitmap remains the source of truth for "null vs empty".
+///
+/// Used internally by [`VarcharColumn`] and [`BinaryColumn`] so they
+/// share offset semantics.
+#[derive(Debug, Clone, Copy)]
+struct VarlenLayout<'a> {
+    offsets: &'a [u32],
+    data: &'a [u8],
+    validity: Validity<'a>,
+}
+
+impl<'a> VarlenLayout<'a> {
+    fn len(&self) -> usize {
+        self.offsets.len().saturating_sub(1)
+    }
+
+    fn slice(&self, row: usize) -> Option<&'a [u8]> {
+        if self.validity.is_null(row) {
+            return None;
+        }
+        let s = *self.offsets.get(row)? as usize;
+        let e = *self.offsets.get(row + 1)? as usize;
+        self.data.get(s..e)
+    }
+}
+
+/// VARCHAR column.
+#[derive(Debug, Clone, Copy)]
+pub struct VarcharColumn<'a> {
+    inner: VarlenLayout<'a>,
+}
+
+impl<'a> VarcharColumn<'a> {
+    /// Construct from caller-validated buffers. The `data` slice must be
+    /// valid UTF-8 across the entire byte range; the decoder validates
+    /// once at decode time so [`value`](Self::value) can use
+    /// `from_utf8_unchecked` per row.
+    pub fn new(offsets: &'a [u32], data: &'a [u8], validity: Validity<'a>) -> Self {
+        Self {
+            inner: VarlenLayout {
+                offsets,
+                data,
+                validity,
+            },
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.len() == 0
+    }
+
+    pub fn validity(&self) -> Validity<'a> {
+        self.inner.validity
+    }
+
+    pub fn is_null(&self, row: usize) -> bool {
+        self.inner.validity.is_null(row)
+    }
+
+    pub fn offsets(&self) -> &'a [u32] {
+        self.inner.offsets
+    }
+
+    pub fn data(&self) -> &'a [u8] {
+        self.inner.data
+    }
+
+    /// UTF-8 string for `row`. `None` for null rows.
+    #[inline]
+    pub fn value(&self, row: usize) -> Option<&'a str> {
+        let bytes = self.inner.slice(row)?;
+        // Safety: the decoder validated the entire data buffer as UTF-8;
+        // any sub-slice on a string boundary is also valid UTF-8.
+        Some(unsafe { std::str::from_utf8_unchecked(bytes) })
+    }
+}
+
+/// BINARY column. Same offset/data shape as [`VarcharColumn`] but bytes
+/// are opaque.
+#[derive(Debug, Clone, Copy)]
+pub struct BinaryColumn<'a> {
+    inner: VarlenLayout<'a>,
+}
+
+impl<'a> BinaryColumn<'a> {
+    pub fn new(offsets: &'a [u32], data: &'a [u8], validity: Validity<'a>) -> Self {
+        Self {
+            inner: VarlenLayout {
+                offsets,
+                data,
+                validity,
+            },
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.len() == 0
+    }
+
+    pub fn validity(&self) -> Validity<'a> {
+        self.inner.validity
+    }
+
+    pub fn is_null(&self, row: usize) -> bool {
+        self.inner.validity.is_null(row)
+    }
+
+    pub fn offsets(&self) -> &'a [u32] {
+        self.inner.offsets
+    }
+
+    pub fn data(&self) -> &'a [u8] {
+        self.inner.data
+    }
+
+    #[inline]
+    pub fn value(&self, row: usize) -> Option<&'a [u8]> {
+        self.inner.slice(row)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ColumnView discriminated union
 // ---------------------------------------------------------------------------
 
@@ -418,6 +556,8 @@ pub enum ColumnView<'a> {
     Char(FixedColumn<'a, u16>),
     /// IPv4 address as a host-order u32 (server emits LE).
     Ipv4(FixedColumn<'a, u32>),
+    Varchar(VarcharColumn<'a>),
+    Binary(BinaryColumn<'a>),
 }
 
 impl ColumnView<'_> {
@@ -439,6 +579,8 @@ impl ColumnView<'_> {
             ColumnView::Decimal64(_) => ColumnKind::Decimal64,
             ColumnView::Char(_) => ColumnKind::Char,
             ColumnView::Ipv4(_) => ColumnKind::Ipv4,
+            ColumnView::Varchar(_) => ColumnKind::Varchar,
+            ColumnView::Binary(_) => ColumnKind::Binary,
         }
     }
 
@@ -460,6 +602,8 @@ impl ColumnView<'_> {
             ColumnView::Decimal64(c) => c.len(),
             ColumnView::Char(c) => c.len(),
             ColumnView::Ipv4(c) => c.len(),
+            ColumnView::Varchar(c) => c.len(),
+            ColumnView::Binary(c) => c.len(),
         }
     }
 
@@ -485,6 +629,8 @@ impl ColumnView<'_> {
             ColumnView::Decimal64(c) => c.is_null(row),
             ColumnView::Char(c) => c.is_null(row),
             ColumnView::Ipv4(c) => c.is_null(row),
+            ColumnView::Varchar(c) => c.is_null(row),
+            ColumnView::Binary(c) => c.is_null(row),
         }
     }
 }
