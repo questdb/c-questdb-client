@@ -1393,6 +1393,63 @@ fn bind_null_geohash_with_precision() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn credit_flow_control_keeps_server_streaming() {
+    // Sets a per-request initial_credit that's smaller than the data
+    // the server has to send, then iterates. Without auto-CREDIT
+    // replenishment the server would stall after the row-floor batch
+    // and `next_batch` would block / time out.
+    //
+    // Sizing: 5000 rows × (8 long + 8 double = 16 bytes payload) is
+    // ~80 KiB of column data alone. initial_credit=4 KiB is well below
+    // any single batch wire size, so without flow control replenishment
+    // we'd see at most one batch (the row-floor exception) before the
+    // server pauses.
+    let srv = server();
+    let table = unique_table("credit_flow");
+    srv.http_exec(&format!(
+        "create table \"{}\" (i long, d double, ts timestamp) timestamp(ts) partition by day wal",
+        table
+    ));
+
+    const TOTAL: usize = 5_000;
+    let mut sender = make_sender(srv, ProtocolVersion::V2);
+    let mut buf = sender.new_buffer();
+    for i in 0..TOTAL as i64 {
+        buf.table(table.as_str())
+            .unwrap()
+            .column_i64("i", i)
+            .unwrap()
+            .column_f64("d", i as f64 * 0.5)
+            .unwrap()
+            .at(TimestampNanos::new(1_700_000_000_000_000_000 + i * 1_000_000))
+            .unwrap();
+    }
+    sender.flush(&mut buf).expect("flush");
+    wait_for_rows(srv, &table, TOTAL);
+
+    // Build a Reader with no initial_credit on the connection itself,
+    // then set initial_credit on the per-query builder.
+    let conf = format!("{};max_batch_rows=500", srv.qwp_conf());
+    let mut reader = Reader::from_conf(&conf).expect("reader");
+    let mut cursor = reader
+        .query(&format!("select i, d from \"{}\" order by ts", table))
+        .initial_credit(4 * 1024) // 4 KiB; smaller than a single batch
+        .execute()
+        .expect("execute");
+
+    let mut total_rows = 0usize;
+    let mut batch_count = 0usize;
+    while let Some(view) = cursor.next_batch().expect("next_batch") {
+        batch_count += 1;
+        total_rows += view.row_count();
+    }
+    eprintln!("[credit_flow] batches={} rows={}", batch_count, total_rows);
+    assert_eq!(total_rows, TOTAL);
+    assert!(batch_count >= 5);
+    assert!(matches!(cursor.terminal(), Some(Terminal::End { .. })));
+}
+
+#[test]
 fn exec_done_for_ddl_and_insert() {
     // Drives non-SELECT statements through the egress channel and
     // verifies each terminates with `EXEC_DONE` (0x16) rather than

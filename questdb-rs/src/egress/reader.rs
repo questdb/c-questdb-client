@@ -43,7 +43,9 @@ use crate::egress::schema::{Schema, SchemaRegistry};
 use crate::egress::server_event::{ServerEvent, decode_frame};
 use crate::egress::symbol_dict::SymbolDict;
 use crate::egress::transport::WsTransport;
+use crate::egress::wire::header::HEADER_LEN;
 use crate::egress::wire::msg_kind::MsgKind;
+use crate::egress::wire::varint;
 
 // ---------------------------------------------------------------------------
 // Reader
@@ -232,6 +234,7 @@ impl<'r> ReaderQuery<'r> {
         self.reader.next_request_id = self.reader.next_request_id.wrapping_add(1);
 
         let req = self.builder.request_id(request_id).build()?;
+        let credit_enabled = req.initial_credit() > 0;
         let mut buf = Vec::with_capacity(64);
         req.encode(&mut buf)?;
         self.reader.transport.write_message(&buf)?;
@@ -242,6 +245,7 @@ impl<'r> ReaderQuery<'r> {
             request_id,
             last_batch: None,
             terminal: None,
+            credit_enabled,
         })
     }
 }
@@ -270,6 +274,12 @@ pub struct Cursor<'r> {
     request_id: i64,
     last_batch: Option<DecodedBatch>,
     terminal: Option<Terminal>,
+    /// `true` when the QUERY_REQUEST set `initial_credit > 0`. The
+    /// cursor then auto-emits a CREDIT (`0x15`) frame after each
+    /// RESULT_BATCH consumed, replenishing the server's per-request
+    /// budget by exactly the wire size of the batch we just received
+    /// (12-byte header + payload).
+    credit_enabled: bool,
 }
 
 impl<'r> Cursor<'r> {
@@ -290,6 +300,8 @@ impl<'r> Cursor<'r> {
         }
         loop {
             let (header, payload) = self.reader.transport.read_frame()?;
+            // Capture wire size BEFORE decode (header is consumed).
+            let wire_bytes = HEADER_LEN as u64 + header.payload_length as u64;
             let event =
                 decode_frame(header, &payload, &mut self.reader.dict, &mut self.reader.registry)?;
             match event {
@@ -301,6 +313,13 @@ impl<'r> Cursor<'r> {
                             b.request_id,
                             self.request_id
                         ));
+                    }
+                    // Replenish the server's per-request byte budget for
+                    // the bytes we just took off the wire. The wire bytes
+                    // are no longer pinned in our buffer; sending CREDIT
+                    // here matches the server's "release on drain" policy.
+                    if self.credit_enabled {
+                        self.send_credit_frame(wire_bytes)?;
                     }
                     self.last_batch = Some(b);
                     let last = self.last_batch.as_ref().unwrap();
@@ -370,6 +389,24 @@ impl<'r> Cursor<'r> {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Manually grant the server `additional_bytes` of read budget on
+    /// this cursor's request. Useful when the user wants a larger
+    /// outstanding window than the per-batch auto-replenishment would
+    /// give them, or when initial_credit was 0 but the user changes
+    /// their mind mid-stream.
+    pub fn add_credit(&mut self, additional_bytes: u64) -> Result<()> {
+        self.send_credit_frame(additional_bytes)
+    }
+
+    fn send_credit_frame(&mut self, additional_bytes: u64) -> Result<()> {
+        let mut payload = Vec::with_capacity(16);
+        payload.push(MsgKind::Credit.as_u8());
+        payload.extend_from_slice(&self.request_id.to_le_bytes());
+        varint::encode_u64(additional_bytes, &mut payload);
+        self.reader.transport.write_message(&payload)?;
         Ok(())
     }
 
