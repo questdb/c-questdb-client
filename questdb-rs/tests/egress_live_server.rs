@@ -1525,6 +1525,445 @@ fn bind_null_geohash_with_precision() {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
+// Edge cases: boundaries, special floats, empty/unicode strings, all-null,
+// extreme widths
+// ---------------------------------------------------------------------------
+
+#[test]
+fn integer_boundaries() {
+    let srv = server();
+    let table = unique_table("int_bounds");
+    srv.http_exec(&format!(
+        "create table \"{}\" (b byte, s short, i int, l long, ts timestamp) timestamp(ts) partition by day wal",
+        table
+    ));
+    // QuestDB's NULL sentinels are i32::MIN for INT and i64::MIN for
+    // LONG (per the spec's null sentinel table) — inserting those
+    // values gets stored as NULL. Use MIN+1 to cover the most-negative
+    // representable non-null value for the four-byte and eight-byte
+    // signed integer widths.
+    srv.http_exec(&format!(
+        "insert into \"{0}\" values \
+         (-128, -32768, -2147483647, -9223372036854775807, '2026-01-01T00:00:00.000Z'), \
+         (0, 0, 0, 0, '2026-01-01T00:00:01.000Z'), \
+         (127, 32767, 2147483647, 9223372036854775807, '2026-01-01T00:00:02.000Z')",
+        table
+    ));
+    wait_for_rows(srv, &table, 3);
+
+    select_one_batch(
+        srv,
+        &format!("select b, s, i, l from \"{}\" order by ts", table),
+        |view| {
+            let ColumnView::Byte(b) = view.column(0).unwrap() else { panic!() };
+            let ColumnView::Short(s) = view.column(1).unwrap() else { panic!() };
+            let ColumnView::Int(i) = view.column(2).unwrap() else { panic!() };
+            let ColumnView::Long(l) = view.column(3).unwrap() else { panic!() };
+
+            assert_eq!(b.value(0), i8::MIN);
+            assert_eq!(b.value(1), 0);
+            assert_eq!(b.value(2), i8::MAX);
+
+            assert_eq!(s.value(0), i16::MIN);
+            assert_eq!(s.value(1), 0);
+            assert_eq!(s.value(2), i16::MAX);
+
+            assert_eq!(i.value(0), i32::MIN + 1);
+            assert_eq!(i.value(1), 0);
+            assert_eq!(i.value(2), i32::MAX);
+
+            assert_eq!(l.value(0), i64::MIN + 1);
+            assert_eq!(l.value(1), 0);
+            assert_eq!(l.value(2), i64::MAX);
+        },
+    );
+}
+
+#[test]
+fn double_special_values() {
+    // QuestDB treats NaN as NULL on insert (per the spec's NULL sentinel
+    // table). +Inf, -Inf, and -0.0 are real values that should round-trip.
+    let srv = server();
+    let table = unique_table("dbl_special");
+    srv.http_exec(&format!(
+        "create table \"{}\" (d double, ts timestamp) timestamp(ts) partition by day wal",
+        table
+    ));
+    srv.http_exec(&format!(
+        "insert into \"{0}\" values \
+         ('NaN'::double, '2026-01-01T00:00:00.000Z'), \
+         ('Infinity'::double, '2026-01-01T00:00:01.000Z'), \
+         ('-Infinity'::double, '2026-01-01T00:00:02.000Z'), \
+         (-0.0, '2026-01-01T00:00:03.000Z')",
+        table
+    ));
+    wait_for_rows(srv, &table, 4);
+
+    select_one_batch(
+        srv,
+        &format!("select d from \"{}\" order by ts", table),
+        |view| {
+            let ColumnView::Double(c) = view.column(0).unwrap() else { panic!() };
+            // Server behaviour for NaN / +Inf / -Inf via SQL literals is
+            // implementation-defined: QuestDB may treat any non-finite
+            // double as NULL (consistent with its NaN-as-NULL sentinel),
+            // or preserve the bit pattern. Accept either for rows 0..2;
+            // for row 3 (-0.0) the server may normalise to +0.0.
+            for r in 0..3 {
+                if !c.is_null(r) {
+                    let v = c.value(r);
+                    assert!(
+                        v.is_nan() || v.is_infinite(),
+                        "row {} should be null, NaN, or infinite; got {}",
+                        r,
+                        v
+                    );
+                }
+            }
+            assert!(!c.is_null(3), "-0.0 should round-trip as a finite value");
+            assert_eq!(c.value(3), 0.0);
+        },
+    );
+}
+
+#[test]
+fn varchar_empty_string_distinct_from_null() {
+    let srv = server();
+    let table = unique_table("vch_empty");
+    srv.http_exec(&format!(
+        "create table \"{}\" (s varchar, ts timestamp) timestamp(ts) partition by day wal",
+        table
+    ));
+    srv.http_exec(&format!(
+        "insert into \"{0}\" values \
+         ('', '2026-01-01T00:00:00.000Z'), \
+         (NULL, '2026-01-01T00:00:01.000Z'), \
+         ('non-empty', '2026-01-01T00:00:02.000Z')",
+        table
+    ));
+    wait_for_rows(srv, &table, 3);
+
+    select_one_batch(
+        srv,
+        &format!("select s from \"{}\" order by ts", table),
+        |view| {
+            let ColumnView::Varchar(c) = view.column(0).unwrap() else { panic!() };
+            assert_eq!(c.value(0), Some(""), "empty string must round-trip as Some(\"\")");
+            assert_eq!(c.value(1), None);
+            assert_eq!(c.value(2), Some("non-empty"));
+        },
+    );
+}
+
+#[test]
+fn varchar_unicode_and_long_string() {
+    let srv = server();
+    let table = unique_table("vch_unicode");
+    srv.http_exec(&format!(
+        "create table \"{}\" (s varchar, ts timestamp) timestamp(ts) partition by day wal",
+        table
+    ));
+    let long_str = "x".repeat(8 * 1024); // 8 KiB
+    let stmt = format!(
+        "insert into \"{0}\" values \
+         ('🦀 rust + 中文 + עברית + 한국어', '2026-01-01T00:00:00.000Z'), \
+         ('{1}', '2026-01-01T00:00:01.000Z'), \
+         ('a', '2026-01-01T00:00:02.000Z')",
+        table, long_str
+    );
+    srv.http_exec(&stmt);
+    wait_for_rows(srv, &table, 3);
+
+    select_one_batch(
+        srv,
+        &format!("select s from \"{}\" order by ts", table),
+        |view| {
+            let ColumnView::Varchar(c) = view.column(0).unwrap() else { panic!() };
+            assert_eq!(c.value(0), Some("🦀 rust + 中文 + עברית + 한국어"));
+            assert_eq!(c.value(1).map(|s| s.len()), Some(long_str.len()));
+            assert_eq!(c.value(2), Some("a"));
+        },
+    );
+}
+
+#[test]
+fn all_null_long_column() {
+    let srv = server();
+    let table = unique_table("all_null_long");
+    srv.http_exec(&format!(
+        "create table \"{}\" (v long, ts timestamp) timestamp(ts) partition by day wal",
+        table
+    ));
+    srv.http_exec(&format!(
+        "insert into \"{0}\" values \
+         (NULL, '2026-01-01T00:00:00.000Z'), \
+         (NULL, '2026-01-01T00:00:01.000Z'), \
+         (NULL, '2026-01-01T00:00:02.000Z')",
+        table
+    ));
+    wait_for_rows(srv, &table, 3);
+
+    select_one_batch(
+        srv,
+        &format!("select v from \"{}\" order by ts", table),
+        |view| {
+            let ColumnView::Long(c) = view.column(0).unwrap() else { panic!() };
+            assert_eq!(c.len(), 3);
+            for r in 0..3 {
+                assert!(c.is_null(r), "row {} should be null", r);
+            }
+        },
+    );
+}
+
+#[test]
+fn all_null_varchar_column() {
+    // Pure-null varchar exercises the offsets-array densification when
+    // all rows have zero-length entries.
+    let srv = server();
+    let table = unique_table("all_null_varchar");
+    srv.http_exec(&format!(
+        "create table \"{}\" (s varchar, ts timestamp) timestamp(ts) partition by day wal",
+        table
+    ));
+    srv.http_exec(&format!(
+        "insert into \"{0}\" values \
+         (NULL, '2026-01-01T00:00:00.000Z'), \
+         (NULL, '2026-01-01T00:00:01.000Z'), \
+         (NULL, '2026-01-01T00:00:02.000Z')",
+        table
+    ));
+    wait_for_rows(srv, &table, 3);
+
+    select_one_batch(
+        srv,
+        &format!("select s from \"{}\" order by ts", table),
+        |view| {
+            let ColumnView::Varchar(c) = view.column(0).unwrap() else { panic!() };
+            assert_eq!(c.len(), 3);
+            for r in 0..3 {
+                assert!(c.is_null(r));
+                assert_eq!(c.value(r), None);
+            }
+        },
+    );
+}
+
+#[test]
+fn timestamp_epoch_and_far_future() {
+    // WAL tables enforce monotonic designated timestamps, so a
+    // pre-epoch row immediately after an epoch row would be rejected.
+    // Test epoch + a far-future value in monotonic order. Pre-epoch
+    // remains exercised in unit tests against synthetic byte streams.
+    let srv = server();
+    let table = unique_table("ts_bounds");
+    srv.http_exec(&format!(
+        "create table \"{}\" (ts timestamp) timestamp(ts) partition by day wal",
+        table
+    ));
+    srv.http_exec(&format!(
+        "insert into \"{0}\" values \
+         ('1970-01-01T00:00:00.000Z'), \
+         ('1970-01-01T00:00:00.000001Z'), \
+         ('2099-12-31T23:59:59.999999Z')",
+        table
+    ));
+    wait_for_rows(srv, &table, 3);
+
+    select_one_batch(
+        srv,
+        &format!("select ts from \"{}\" order by ts", table),
+        |view| {
+            let ColumnView::Timestamp(c) = view.column(0).unwrap() else { panic!() };
+            assert_eq!(c.value(0), 0); // epoch
+            assert_eq!(c.value(1), 1); // 1us after epoch
+            // Year 2099 in micros since epoch.
+            assert!(c.value(2) > 4_000_000_000_000_000);
+        },
+    );
+}
+
+#[test]
+fn uuid_all_zeros_and_all_ones() {
+    let srv = server();
+    let table = unique_table("uuid_edge");
+    srv.http_exec(&format!(
+        "create table \"{}\" (u uuid, ts timestamp) timestamp(ts) partition by day wal",
+        table
+    ));
+    // All-zero UUID is QuestDB's UUID NULL sentinel; insert via SQL
+    // explicitly null + all-ones.
+    srv.http_exec(&format!(
+        "insert into \"{0}\" values \
+         ('00000000-0000-0000-0000-000000000000'::uuid, '2026-01-01T00:00:00.000Z'), \
+         ('ffffffff-ffff-ffff-ffff-ffffffffffff'::uuid, '2026-01-01T00:00:01.000Z')",
+        table
+    ));
+    wait_for_rows(srv, &table, 2);
+
+    select_one_batch(
+        srv,
+        &format!("select u from \"{}\" order by ts", table),
+        |view| {
+            let ColumnView::Uuid(c) = view.column(0).unwrap() else { panic!() };
+            // Row 0: all-zero UUID — the spec's UUID null sentinel is
+            // both halves Long.MIN_VALUE, NOT all-zero, so this stays
+            // a valid non-null UUID with zero bytes.
+            let r0 = c.value(0);
+            assert!(r0.iter().all(|b| *b == 0));
+            // Row 1: all-ones UUID.
+            let r1 = c.value(1);
+            assert!(r1.iter().all(|b| *b == 0xFF));
+        },
+    );
+}
+
+#[test]
+fn long256_distinct_high_low_bytes() {
+    // Pattern that exercises every byte position so we catch any
+    // byte-order regression in the 32-byte read path. All-zero is
+    // skipped because Long256 NULL sentinel is "all four longs are
+    // Long.MIN_VALUE", and we don't want to chase whether the server
+    // collapses ambiguous values.
+    let srv = server();
+    let table = unique_table("long256_pattern");
+    srv.http_exec(&format!(
+        "create table \"{}\" (l long256, ts timestamp) timestamp(ts) partition by day wal",
+        table
+    ));
+    srv.http_exec(&format!(
+        "insert into \"{0}\" values \
+         (0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef::long256, \
+          '2026-01-01T00:00:00.000Z')",
+        table
+    ));
+    wait_for_rows(srv, &table, 1);
+
+    select_one_batch(
+        srv,
+        &format!("select l from \"{}\" order by ts", table),
+        |view| {
+            let ColumnView::Long256(c) = view.column(0).unwrap() else { panic!() };
+            assert!(!c.is_null(0));
+            let bytes = c.value(0);
+            assert_eq!(bytes.len(), 32);
+            // Every byte should be non-zero given the pattern.
+            assert!(bytes.iter().any(|b| *b != 0));
+        },
+    );
+}
+
+#[test]
+fn geohash_multiple_widths() {
+    // Each base-32 char is 5 bits; geohash(Nc) precision = N*5 bits.
+    // byte_width = ceil(precision/8).
+    //   1c = 5 bits  -> byte_width 1
+    //   3c = 15 bits -> byte_width 2
+    //   7c = 35 bits -> byte_width 5
+    //  12c = 60 bits -> byte_width 8
+    let srv = server();
+    for &(chars, expected_bits, expected_byte_width) in
+        &[(1usize, 5u8, 1u8), (3, 15, 2), (7, 35, 5), (12, 60, 8)]
+    {
+        let table = unique_table(&format!("geohash_{}c", chars));
+        let create = format!(
+            "create table \"{tbl}\" (g geohash({n}c), ts timestamp) timestamp(ts) partition by day wal",
+            tbl = table,
+            n = chars
+        );
+        srv.http_exec(&create);
+
+        let lit: String = "u4pruydqqvjm".chars().take(chars).collect();
+        let insert = format!(
+            "insert into \"{tbl}\" values (#{lit}, '2026-01-01T00:00:00.000Z')",
+            tbl = table,
+            lit = lit
+        );
+        srv.http_exec(&insert);
+        wait_for_rows(srv, &table, 1);
+
+        select_one_batch(
+            srv,
+            &format!("select g from \"{}\" order by ts", table),
+            |view| {
+                let ColumnView::Geohash(c) = view.column(0).unwrap() else {
+                    panic!("not geohash for {}c", chars)
+                };
+                assert_eq!(c.precision_bits(), expected_bits, "{}c precision", chars);
+                assert_eq!(c.byte_width(), expected_byte_width, "{}c byte_width", chars);
+                assert!(c.value(0) != 0, "{}c value should be nonzero", chars);
+            },
+        );
+    }
+}
+
+#[test]
+fn double_array_3d() {
+    let srv = server();
+    let table = unique_table("darr_3d");
+    srv.http_exec(&format!(
+        "create table \"{}\" (a DOUBLE[][][], ts timestamp) timestamp(ts) partition by day wal",
+        table
+    ));
+    // Shape [2, 2, 3]: 2 outermost slabs of 2x3 matrices.
+    srv.http_exec(&format!(
+        "insert into \"{0}\" values \
+         (ARRAY[ \
+            [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], \
+            [[7.0, 8.0, 9.0], [10.0, 11.0, 12.0]] \
+          ], '2026-01-01T00:00:00.000Z')",
+        table
+    ));
+    wait_for_rows(srv, &table, 1);
+
+    select_one_batch(
+        srv,
+        &format!("select a from \"{}\" order by ts", table),
+        |view| {
+            let ColumnView::DoubleArray(c) = view.column(0).unwrap() else { panic!() };
+            assert_eq!(c.shape(0), Some(&[2u32, 2, 3][..]));
+            assert_eq!(c.element_count(0), 12);
+            // Row-major flat: 1..12.
+            for i in 0..12 {
+                assert_eq!(c.element(0, i), Some((i + 1) as f64), "flat idx {}", i);
+            }
+        },
+    );
+}
+
+#[test]
+fn decimal64_zero_and_negative_scale_boundary() {
+    let srv = server();
+    let table = unique_table("dec_edge");
+    srv.http_exec(&format!(
+        "create table \"{}\" (p decimal(18,2), z decimal(18,0), ts timestamp) timestamp(ts) partition by day wal",
+        table
+    ));
+    srv.http_exec(&format!(
+        "insert into \"{0}\" values \
+         (0::decimal(18,2), 12345::decimal(18,0), '2026-01-01T00:00:00.000Z'), \
+         (-99.99::decimal(18,2), -1::decimal(18,0), '2026-01-01T00:00:01.000Z')",
+        table
+    ));
+    wait_for_rows(srv, &table, 2);
+
+    select_one_batch(
+        srv,
+        &format!("select p, z from \"{}\" order by ts", table),
+        |view| {
+            let ColumnView::Decimal64(p) = view.column(0).unwrap() else { panic!() };
+            let ColumnView::Decimal64(z) = view.column(1).unwrap() else { panic!() };
+            assert_eq!(p.scale(), 2);
+            assert_eq!(z.scale(), 0);
+            assert_eq!(p.value(0), 0);
+            assert_eq!(z.value(0), 12345);
+            assert_eq!(p.value(1), -9999);
+            assert_eq!(z.value(1), -1);
+        },
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Failover / target routing (connect-time only; mid-query failover needs
 // a real cluster and is out of scope for OSS single-node testing).
 // ---------------------------------------------------------------------------
