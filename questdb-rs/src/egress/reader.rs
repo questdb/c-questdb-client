@@ -66,6 +66,12 @@ pub struct Reader {
     /// Total wire bytes (header + payload) consumed since connect.
     /// Updated on every frame the reader pulls off the transport.
     bytes_received: u64,
+    /// Diagnostic: nanoseconds spent in `transport.read_frame()` since
+    /// connect. Useful for splitting "wait on the socket" from "decode
+    /// CPU" in throughput benchmarks.
+    read_ns: u128,
+    /// Diagnostic: nanoseconds spent in `decode_frame()` since connect.
+    decode_ns: u128,
 }
 
 impl Reader {
@@ -105,6 +111,8 @@ impl Reader {
                 cursor_active: false,
                 server_info: None,
                 bytes_received: 0,
+                read_ns: 0,
+                decode_ns: 0,
             };
             // Eagerly consume the unsolicited SERVER_INFO frame on v2+.
             if reader.transport.server_version() >= 2 {
@@ -157,6 +165,20 @@ impl Reader {
     /// effective throughput a query produces.
     pub fn bytes_received(&self) -> u64 {
         self.bytes_received
+    }
+
+    /// Diagnostic accumulators (nanoseconds): time spent in
+    /// `transport.read_frame()` and `decode_frame()` respectively.
+    /// Reset to zero by `reset_timing()`.
+    pub fn read_ns(&self) -> u128 {
+        self.read_ns
+    }
+    pub fn decode_ns(&self) -> u128 {
+        self.decode_ns
+    }
+    pub fn reset_timing(&mut self) {
+        self.read_ns = 0;
+        self.decode_ns = 0;
     }
 
     /// Read one frame and expect it to be `SERVER_INFO`; store it.
@@ -402,16 +424,20 @@ impl<'r> Cursor<'r> {
             return Ok(None);
         }
         loop {
+            let t0 = std::time::Instant::now();
             let (header, payload) = self.reader.transport.read_frame()?;
+            self.reader.read_ns += t0.elapsed().as_nanos();
             // Capture wire size BEFORE decode (header is consumed).
             let wire_bytes = HEADER_LEN as u64 + header.payload_length as u64;
             self.reader.bytes_received += wire_bytes;
+            let t1 = std::time::Instant::now();
             let event = decode_frame(
                 header,
                 &payload,
                 &mut self.reader.dict,
                 &mut self.reader.registry,
             )?;
+            self.reader.decode_ns += t1.elapsed().as_nanos();
             match event {
                 ServerEvent::Batch(b) => {
                     if b.request_id != self.request_id {

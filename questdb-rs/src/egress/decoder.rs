@@ -767,6 +767,13 @@ fn decode_varlen(
             .map_err(|e| fmt!(InvalidUtf8, "varchar data buffer not valid UTF-8: {}", e))?;
     }
 
+    // No-null fast path: compact has `row_count + 1` entries already, in
+    // exactly the dense layout the user-facing column expects. Reuse it.
+    if validity.is_none() {
+        debug_assert_eq!(compact.len(), row_count + 1);
+        return Ok((compact, data, validity));
+    }
+
     // Densify offsets to row_count + 1 entries.
     let mut dense = vec![0u32; row_count + 1];
     let mut k = 0usize; // walked non-null entries
@@ -970,34 +977,109 @@ fn decode_symbol(
         (dict_size, Some(local))
     };
 
-    let mut codes = vec![0u32; row_count];
-    for (row, slot) in codes.iter_mut().enumerate() {
-        if is_null_at_opt(&validity, row) {
-            continue;
+    let codes = if validity.is_none() {
+        decode_codes_no_nulls(r, row_count, active_dict_size)?
+    } else {
+        let mut codes = vec![0u32; row_count];
+        for (row, slot) in codes.iter_mut().enumerate() {
+            if is_null_at_opt(&validity, row) {
+                continue;
+            }
+            let code = r.read_varint_u64().map_err(|e| {
+                Error::new(e.code(), format!("symbol code at row {}: {}", row, e.msg()))
+            })?;
+            let code32 = u32::try_from(code).map_err(|_| {
+                fmt!(
+                    ProtocolError,
+                    "symbol code {} at row {} exceeds u32",
+                    code,
+                    row
+                )
+            })?;
+            if (code32 as usize) >= active_dict_size {
+                return Err(fmt!(
+                    ProtocolError,
+                    "symbol id {} at row {} out of range (dict size {})",
+                    code32,
+                    row,
+                    active_dict_size
+                ));
+            }
+            *slot = code32;
         }
-        let code = r.read_varint_u64().map_err(|e| {
-            Error::new(e.code(), format!("symbol code at row {}: {}", row, e.msg()))
-        })?;
-        let code32 = u32::try_from(code).map_err(|_| {
-            fmt!(
-                ProtocolError,
-                "symbol code {} at row {} exceeds u32",
-                code,
-                row
-            )
-        })?;
-        if (code32 as usize) >= active_dict_size {
-            return Err(fmt!(
-                ProtocolError,
-                "symbol id {} at row {} out of range (dict size {})",
-                code32,
-                row,
-                active_dict_size
-            ));
-        }
-        *slot = code32;
-    }
+        codes
+    };
     Ok((codes, validity, local_dict))
+}
+
+/// No-null fast path for SYMBOL code densification.
+///
+/// Inlines the 1-, 2-, and 3-byte varint cases (covers every code <= 2^21,
+/// which is more than enough for our 100k-cardinality bench data); falls
+/// back to the generic decoder for longer values. The bounds check against
+/// the active dict size runs as a separate pass after decode so the inner
+/// loop is straight-line and auto-vectorizes nicely.
+fn decode_codes_no_nulls(
+    r: &mut ByteReader<'_>,
+    row_count: usize,
+    active_dict_size: usize,
+) -> Result<Vec<u32>> {
+    let mut codes = vec![0u32; row_count];
+    let bytes = r.remaining();
+    let mut pos = 0usize;
+    let limit = bytes.len();
+
+    for slot in codes.iter_mut() {
+        // Fast path: try 1-, 2-, 3-byte varints if at least 3 bytes remain.
+        if pos + 3 <= limit {
+            let b0 = bytes[pos];
+            if b0 < 0x80 {
+                *slot = b0 as u32;
+                pos += 1;
+                continue;
+            }
+            let b1 = bytes[pos + 1];
+            if b1 < 0x80 {
+                *slot = (b0 & 0x7F) as u32 | ((b1 as u32) << 7);
+                pos += 2;
+                continue;
+            }
+            let b2 = bytes[pos + 2];
+            if b2 < 0x80 {
+                *slot = (b0 & 0x7F) as u32 | (((b1 & 0x7F) as u32) << 7) | ((b2 as u32) << 14);
+                pos += 3;
+                continue;
+            }
+        }
+        // Slow path: longer varints or near end of buffer. Catches 4- and
+        // 5-byte u32-fitting cases plus any over-u32 we have to error on.
+        let (v, n) = crate::egress::wire::varint::decode_u64(&bytes[pos..])
+            .map_err(|e| Error::new(e.code(), format!("symbol code: {}", e.msg())))?;
+        *slot =
+            u32::try_from(v).map_err(|_| fmt!(ProtocolError, "symbol code {} exceeds u32", v))?;
+        pos += n;
+    }
+    r.advance(pos)?;
+
+    // Single-pass bounds check after decode. This pass auto-vectorizes
+    // (compares u32 lanes to a scalar) and is a few percent of the total.
+    let dict_size_u32 = u32::try_from(active_dict_size).map_err(|_| {
+        fmt!(
+            ProtocolError,
+            "active dict size {} exceeds u32",
+            active_dict_size
+        )
+    })?;
+    if let Some((row, &bad)) = codes.iter().enumerate().find(|&(_, &c)| c >= dict_size_u32) {
+        return Err(fmt!(
+            ProtocolError,
+            "symbol id {} at row {} out of range (dict size {})",
+            bad,
+            row,
+            active_dict_size
+        ));
+    }
+    Ok(codes)
 }
 
 /// DECIMAL64: column-level 1-byte scale follows the validity section, then

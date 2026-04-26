@@ -80,17 +80,27 @@ struct Result {
 fn run_qwp(host: &str, port: u16, warmup: bool) -> Result {
     let conf = format!("qwp::addr={host}:{port};compression=raw;");
     let mut reader = Reader::from_conf(&conf).expect("connect");
+    reader.reset_timing();
     let bytes_before = reader.bytes_received();
     let mut rows: u64 = 0;
     let mut checksum: u64 = 0;
+    let mut iter_ns: u128 = 0;
+    let skip_iter = std::env::var("SKIP_ITER").is_ok();
 
     let sql = format!(
         "SELECT ts, id, price, sym, note, d1, d2, d3, d4, d5, s1, s2, s3, s4, s5 FROM {TABLE}"
     );
     let start = Instant::now();
     let mut cursor = reader.query(&sql).execute().expect("execute");
-    while let Some(view) = cursor.next_batch().expect("next_batch") {
+    loop {
+        let next = cursor.next_batch().expect("next_batch");
+        let Some(view) = next else { break };
         let n = view.row_count();
+        if skip_iter {
+            rows += n as u64;
+            continue;
+        }
+        let t1 = Instant::now();
         // Hoist column views once per batch; per-row reads are then array
         // indexing only.
         let ts = match view.column(0).unwrap() {
@@ -190,15 +200,21 @@ fn run_qwp(host: &str, port: u16, warmup: bool) -> Result {
                 ^ s4l
                 ^ s5l) as u64;
         }
+        iter_ns += t1.elapsed().as_nanos();
         rows += n as u64;
     }
     let elapsed = start.elapsed();
     drop(cursor);
     let bytes = reader.bytes_received() - bytes_before;
+    let read_ns = reader.read_ns();
+    let decode_ns = reader.decode_ns();
     let phase = if warmup { "[warmup]" } else { "[measure]" };
     println!(
-        "{phase} QWP : {rows} rows in {} ms  ({:.2} MiB on wire, checksum=0x{:x})",
+        "{phase} QWP : {rows} rows in {} ms  read={} ms  decode={} ms  iter={} ms  ({:.2} MiB on wire, checksum=0x{:x})",
         elapsed.as_millis(),
+        read_ns / 1_000_000,
+        decode_ns / 1_000_000,
+        iter_ns / 1_000_000,
         bytes as f64 / (1024.0 * 1024.0),
         checksum
     );
@@ -218,7 +234,9 @@ fn double_bits(c: &questdb::egress::column::FixedColumn<'_, f64>, r: usize) -> i
 }
 
 fn sym_len_at(c: &questdb::egress::column::SymbolColumn<'_>, r: usize) -> i64 {
-    c.resolve(r).map(str::len).unwrap_or(0) as i64
+    // For benchmark data we know there are no null rows; skip the per-row
+    // validity check inside `resolve()` and go straight to the dict.
+    c.dict().get(c.codes()[r]).map(str::len).unwrap_or(0) as i64
 }
 
 fn ingest_rows(host: &str, port: u16, row_count: u64) {
