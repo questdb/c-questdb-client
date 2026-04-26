@@ -162,7 +162,11 @@ impl QuestDbServer {
         let log = std::fs::read_to_string(&self.log_path).unwrap_or_default();
         let lines: Vec<&str> = log.lines().collect();
         let start = lines.len().saturating_sub(n);
-        eprintln!("--- jvm.log tail ({} of {}) ---", lines.len() - start, lines.len());
+        eprintln!(
+            "--- jvm.log tail ({} of {}) ---",
+            lines.len() - start,
+            lines.len()
+        );
         for line in &lines[start..] {
             eprintln!("{}", line);
         }
@@ -253,10 +257,7 @@ impl QuestDbServer {
     fn wait_for_ping(&self, log_path: &Path) {
         let host = self.host.clone();
         let port = self.http_port;
-        let up = poll_until(
-            || http_status(&host, port, PING_PATH) == 204,
-            PING_TIMEOUT,
-        );
+        let up = poll_until(|| http_status(&host, port, PING_PATH) == 204, PING_TIMEOUT);
         if !up {
             eprintln!(
                 "[live-server] /ping did not respond on http://{}:{} within {:?}; dumping JVM log:",

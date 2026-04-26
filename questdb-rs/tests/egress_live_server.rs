@@ -172,7 +172,9 @@ fn long_double_boolean_int_no_nulls() {
             .unwrap()
             .column_i64("i", i + 1)
             .unwrap()
-            .at(TimestampNanos::new(1_700_000_000_000_000_000 + i * 1_000_000))
+            .at(TimestampNanos::new(
+                1_700_000_000_000_000_000 + i * 1_000_000,
+            ))
             .unwrap();
     }
     sender.flush(&mut buf).expect("flush");
@@ -183,9 +185,15 @@ fn long_double_boolean_int_no_nulls() {
         &format!("select l, d, b, i from \"{}\" order by ts", table),
         |view| {
             assert_eq!(view.row_count(), 3);
-            let ColumnView::Long(l) = view.column(0).unwrap() else { panic!("col 0") };
-            let ColumnView::Double(d) = view.column(1).unwrap() else { panic!("col 1") };
-            let ColumnView::Boolean(b) = view.column(2).unwrap() else { panic!("col 2") };
+            let ColumnView::Long(l) = view.column(0).unwrap() else {
+                panic!("col 0")
+            };
+            let ColumnView::Double(d) = view.column(1).unwrap() else {
+                panic!("col 1")
+            };
+            let ColumnView::Boolean(b) = view.column(2).unwrap() else {
+                panic!("col 2")
+            };
             let i_kind = view.column(3).unwrap().kind();
             assert_eq!(l.value(0), 100);
             assert_eq!(l.value(1), 101);
@@ -231,8 +239,12 @@ fn narrowing_byte_short_via_server_cast() {
         srv,
         &format!("select b, s from \"{}\" order by ts", table),
         |view| {
-            let ColumnView::Byte(b) = view.column(0).unwrap() else { panic!("col 0") };
-            let ColumnView::Short(s) = view.column(1).unwrap() else { panic!("col 1") };
+            let ColumnView::Byte(b) = view.column(0).unwrap() else {
+                panic!("col 0")
+            };
+            let ColumnView::Short(s) = view.column(1).unwrap() else {
+                panic!("col 1")
+            };
             assert_eq!(b.value(0), 1);
             assert_eq!(b.value(1), 2);
             assert_eq!(b.value(2), 3);
@@ -261,7 +273,9 @@ fn float_round_trip() {
         srv,
         &format!("select f from \"{}\" order by ts", table),
         |view| {
-            let ColumnView::Float(c) = view.column(0).unwrap() else { panic!("col 0") };
+            let ColumnView::Float(c) = view.column(0).unwrap() else {
+                panic!("col 0")
+            };
             assert_eq!(c.value(0), 1.5);
             assert_eq!(c.value(1), -2.25);
             assert_eq!(c.value(2), 3.125);
@@ -287,7 +301,9 @@ fn ipv4_round_trip() {
         srv,
         &format!("select a from \"{}\" order by ts", table),
         |view| {
-            let ColumnView::Ipv4(c) = view.column(0).unwrap() else { panic!("col 0") };
+            let ColumnView::Ipv4(c) = view.column(0).unwrap() else {
+                panic!("col 0")
+            };
             // 127.0.0.1 = 0x7F000001
             assert_eq!(c.value(0), 0x7F00_0001);
             // 192.168.1.1 = 0xC0A80101
@@ -314,7 +330,9 @@ fn uuid_round_trip() {
         srv,
         &format!("select u from \"{}\" order by ts", table),
         |view| {
-            let ColumnView::Uuid(c) = view.column(0).unwrap() else { panic!("col 0") };
+            let ColumnView::Uuid(c) = view.column(0).unwrap() else {
+                panic!("col 0")
+            };
             // 16 bytes — verify length and basic shape; exact byte order
             // is QuestDB-internal. We just confirm it's non-zero and the
             // round-trip ran end-to-end.
@@ -343,7 +361,9 @@ fn char_round_trip() {
         srv,
         &format!("select c from \"{}\" order by ts", table),
         |view| {
-            let ColumnView::Char(c) = view.column(0).unwrap() else { panic!("col 0") };
+            let ColumnView::Char(c) = view.column(0).unwrap() else {
+                panic!("col 0")
+            };
             assert_eq!(c.value(0), b'A' as u16);
             assert_eq!(c.value(1), b'Z' as u16);
         },
@@ -372,7 +392,9 @@ fn long256_round_trip() {
         srv,
         &format!("select l from \"{}\" order by ts", table),
         |view| {
-            let ColumnView::Long256(c) = view.column(0).unwrap() else { panic!("col 0") };
+            let ColumnView::Long256(c) = view.column(0).unwrap() else {
+                panic!("col 0")
+            };
             let bytes = c.value(0);
             assert_eq!(bytes.len(), 32);
             assert!(bytes.iter().any(|b| *b != 0));
@@ -413,8 +435,12 @@ fn timestamp_micros_with_gorilla_path() {
         &format!("select ts, v from \"{}\" order by ts", table),
         |view| {
             assert_eq!(view.row_count(), expected_ts.len());
-            let ColumnView::Timestamp(ts_col) = view.column(0).unwrap() else { panic!("col 0") };
-            let ColumnView::Long(v) = view.column(1).unwrap() else { panic!("col 1") };
+            let ColumnView::Timestamp(ts_col) = view.column(0).unwrap() else {
+                panic!("col 0")
+            };
+            let ColumnView::Long(v) = view.column(1).unwrap() else {
+                panic!("col 1")
+            };
             for (i, expected_ns) in expected_ts.iter().enumerate() {
                 let expected_us = expected_ns / 1_000;
                 assert_eq!(ts_col.value(i), expected_us, "row {}", i);
@@ -443,7 +469,10 @@ fn timestamp_nanos_round_trip() {
         &format!("select n from \"{}\" order by ts", table),
         |view| {
             let ColumnView::TimestampNanos(c) = view.column(0).unwrap() else {
-                panic!("col 0 not timestamp_nanos: got {:?}", view.column(0).unwrap().kind())
+                panic!(
+                    "col 0 not timestamp_nanos: got {:?}",
+                    view.column(0).unwrap().kind()
+                )
             };
             assert_eq!(c.value(0), 1_700_000_000_123_456_789i64);
         },
@@ -468,7 +497,9 @@ fn date_round_trip() {
         srv,
         &format!("select d from \"{}\" order by ts", table),
         |view| {
-            let ColumnView::Date(c) = view.column(0).unwrap() else { panic!("col 0 not date") };
+            let ColumnView::Date(c) = view.column(0).unwrap() else {
+                panic!("col 0 not date")
+            };
             // QuestDB DATE is millis since epoch. 2026-04-26 in UTC.
             // We just verify it's a sane positive number; exact ms varies
             // by timezone behaviour and isn't worth pinning.
@@ -504,7 +535,10 @@ fn decimal64_round_trip() {
         &format!("select p from \"{}\" order by ts", table),
         |view| {
             let ColumnView::Decimal64(c) = view.column(0).unwrap() else {
-                panic!("col 0 not decimal64: got {:?}", view.column(0).unwrap().kind())
+                panic!(
+                    "col 0 not decimal64: got {:?}",
+                    view.column(0).unwrap().kind()
+                )
             };
             assert_eq!(c.scale(), 2);
             assert_eq!(c.value(0), 12345);
@@ -532,7 +566,10 @@ fn decimal128_round_trip() {
         &format!("select p from \"{}\" order by ts", table),
         |view| {
             let ColumnView::Decimal128(c) = view.column(0).unwrap() else {
-                panic!("col 0 not decimal128: got {:?}", view.column(0).unwrap().kind())
+                panic!(
+                    "col 0 not decimal128: got {:?}",
+                    view.column(0).unwrap().kind()
+                )
             };
             assert_eq!(c.scale(), 4);
             assert_eq!(c.value(0), 1_000_000i128); // 100 * 10^4
@@ -559,7 +596,10 @@ fn decimal256_round_trip() {
         &format!("select p from \"{}\" order by ts", table),
         |view| {
             let ColumnView::Decimal256(c) = view.column(0).unwrap() else {
-                panic!("col 0 not decimal256: got {:?}", view.column(0).unwrap().kind())
+                panic!(
+                    "col 0 not decimal256: got {:?}",
+                    view.column(0).unwrap().kind()
+                )
             };
             assert_eq!(c.scale(), 6);
             // 123.456789 -> mantissa 123_456_789 (low 8 bytes of the i256).
@@ -598,7 +638,10 @@ fn geohash_round_trip() {
         &format!("select g from \"{}\" order by ts", table),
         |view| {
             let ColumnView::Geohash(c) = view.column(0).unwrap() else {
-                panic!("col 0 not geohash: got {:?}", view.column(0).unwrap().kind())
+                panic!(
+                    "col 0 not geohash: got {:?}",
+                    view.column(0).unwrap().kind()
+                )
             };
             assert_eq!(c.precision_bits(), 40);
             assert_eq!(c.byte_width(), 5);
@@ -628,7 +671,9 @@ fn varchar_round_trip() {
             .unwrap()
             .column_str("s", *s)
             .unwrap()
-            .at(TimestampNanos::new(1_700_000_000_000_000_000 + i as i64 * 1_000_000))
+            .at(TimestampNanos::new(
+                1_700_000_000_000_000_000 + i as i64 * 1_000_000,
+            ))
             .unwrap();
     }
     sender.flush(&mut buf).expect("flush");
@@ -639,7 +684,9 @@ fn varchar_round_trip() {
         &format!("select s from \"{}\" order by ts", table),
         |view| {
             assert_eq!(view.row_count(), strings.len());
-            let ColumnView::Varchar(c) = view.column(0).unwrap() else { panic!("col 0") };
+            let ColumnView::Varchar(c) = view.column(0).unwrap() else {
+                panic!("col 0")
+            };
             for (i, expected) in strings.iter().enumerate() {
                 assert_eq!(c.value(i), Some(*expected), "row {}", i);
             }
@@ -705,7 +752,10 @@ fn double_array_1d_varying_lengths() {
         &format!("select d from \"{}\" order by ts", table),
         |view| {
             let ColumnView::DoubleArray(c) = view.column(0).unwrap() else {
-                panic!("col 0 not double_array: {:?}", view.column(0).unwrap().kind())
+                panic!(
+                    "col 0 not double_array: {:?}",
+                    view.column(0).unwrap().kind()
+                )
             };
             assert_eq!(c.len(), 3);
 
@@ -746,7 +796,9 @@ fn double_array_2d_row_major() {
         srv,
         &format!("select m from \"{}\" order by ts", table),
         |view| {
-            let ColumnView::DoubleArray(c) = view.column(0).unwrap() else { panic!() };
+            let ColumnView::DoubleArray(c) = view.column(0).unwrap() else {
+                panic!()
+            };
             assert_eq!(c.len(), 2);
 
             // Row 0: 2x2 row-major.
@@ -787,7 +839,9 @@ fn double_array_with_null_array_row() {
         srv,
         &format!("select d from \"{}\" order by ts", table),
         |view| {
-            let ColumnView::DoubleArray(c) = view.column(0).unwrap() else { panic!() };
+            let ColumnView::DoubleArray(c) = view.column(0).unwrap() else {
+                panic!()
+            };
             assert_eq!(c.len(), 3);
 
             assert!(!c.is_null(0));
@@ -829,7 +883,9 @@ fn symbol_with_dict() {
             .unwrap()
             .column_i64("v", (i as i64) * 10)
             .unwrap()
-            .at(TimestampNanos::new(1_700_000_000_000_000_000 + i as i64 * 1_000_000))
+            .at(TimestampNanos::new(
+                1_700_000_000_000_000_000 + i as i64 * 1_000_000,
+            ))
             .unwrap();
     }
     sender.flush(&mut buf).expect("flush");
@@ -840,8 +896,12 @@ fn symbol_with_dict() {
         &format!("select s, v from \"{}\" order by ts", table),
         |view| {
             assert_eq!(view.row_count(), symbols.len());
-            let ColumnView::Symbol(s) = view.column(0).unwrap() else { panic!("col 0") };
-            let ColumnView::Long(v) = view.column(1).unwrap() else { panic!("col 1") };
+            let ColumnView::Symbol(s) = view.column(0).unwrap() else {
+                panic!("col 0")
+            };
+            let ColumnView::Long(v) = view.column(1).unwrap() else {
+                panic!("col 1")
+            };
             for (i, expected) in symbols.iter().enumerate() {
                 assert_eq!(s.resolve(i), Some(*expected));
                 assert_eq!(v.value(i), i as i64 * 10);
@@ -867,7 +927,9 @@ fn symbol_dict_persists_across_queries() {
             .unwrap()
             .symbol("s", *sym)
             .unwrap()
-            .at(TimestampNanos::new(1_700_000_000_000_000_000 + i as i64 * 1_000_000))
+            .at(TimestampNanos::new(
+                1_700_000_000_000_000_000 + i as i64 * 1_000_000,
+            ))
             .unwrap();
     }
     sender.flush(&mut buf).expect("flush");
@@ -881,7 +943,9 @@ fn symbol_dict_persists_across_queries() {
             .execute()
             .expect("execute");
         let view = cur.next_batch().expect("next").expect("Some");
-        let ColumnView::Symbol(s) = view.column(0).unwrap() else { panic!() };
+        let ColumnView::Symbol(s) = view.column(0).unwrap() else {
+            panic!()
+        };
         for (i, expected) in symbols.iter().enumerate() {
             assert_eq!(s.resolve(i), Some(*expected));
         }
@@ -889,7 +953,10 @@ fn symbol_dict_persists_across_queries() {
         while cur.next_batch().expect("drain").is_some() {}
     }
     let dict_size_after_first = reader.symbol_dict().len();
-    assert!(dict_size_after_first >= 3, "dict should have at least 3 entries");
+    assert!(
+        dict_size_after_first >= 3,
+        "dict should have at least 3 entries"
+    );
 
     // Second query on same connection: dict should be reused (server
     // shouldn't retransmit "alpha"/"beta"/"gamma").
@@ -899,7 +966,9 @@ fn symbol_dict_persists_across_queries() {
             .execute()
             .expect("execute");
         let view = cur.next_batch().expect("next").expect("Some");
-        let ColumnView::Symbol(s) = view.column(0).unwrap() else { panic!() };
+        let ColumnView::Symbol(s) = view.column(0).unwrap() else {
+            panic!()
+        };
         for (i, expected) in symbols.iter().enumerate() {
             assert_eq!(s.resolve(i), Some(*expected));
         }
@@ -928,7 +997,9 @@ fn schema_reference_after_full() {
             .unwrap()
             .column_i64("v", i)
             .unwrap()
-            .at(TimestampNanos::new(1_700_000_000_000_000_000 + i * 1_000_000))
+            .at(TimestampNanos::new(
+                1_700_000_000_000_000_000 + i * 1_000_000,
+            ))
             .unwrap();
     }
     sender.flush(&mut buf).expect("flush");
@@ -1003,7 +1074,9 @@ fn bind_long_literal_passthrough() {
         .execute()
         .expect("execute");
     let view = cur.next_batch().expect("next").expect("Some");
-    let ColumnView::Long(c) = view.column(0).unwrap() else { panic!("col 0") };
+    let ColumnView::Long(c) = view.column(0).unwrap() else {
+        panic!("col 0")
+    };
     assert_eq!(c.value(0), 0x0102_0304_0506_0708);
 }
 
@@ -1017,7 +1090,9 @@ fn bind_varchar_literal_passthrough() {
         .execute()
         .expect("execute");
     let view = cur.next_batch().expect("next").expect("Some");
-    let ColumnView::Varchar(c) = view.column(0).unwrap() else { panic!("col 0") };
+    let ColumnView::Varchar(c) = view.column(0).unwrap() else {
+        panic!("col 0")
+    };
     assert_eq!(c.value(0), Some("café"));
 }
 
@@ -1031,7 +1106,9 @@ fn bind_double_literal_passthrough() {
         .execute()
         .expect("execute");
     let view = cur.next_batch().expect("next").expect("Some");
-    let ColumnView::Double(c) = view.column(0).unwrap() else { panic!("col 0") };
+    let ColumnView::Double(c) = view.column(0).unwrap() else {
+        panic!("col 0")
+    };
     assert_eq!(c.value(0), 2.718281828);
 }
 
@@ -1046,7 +1123,10 @@ fn bind_timestamp_micros_passthrough() {
         .expect("execute");
     let view = cur.next_batch().expect("next").expect("Some");
     let ColumnView::Timestamp(c) = view.column(0).unwrap() else {
-        panic!("col 0 not timestamp: got {:?}", view.column(0).unwrap().kind())
+        panic!(
+            "col 0 not timestamp: got {:?}",
+            view.column(0).unwrap().kind()
+        )
     };
     assert_eq!(c.value(0), 1_700_000_000_123_456);
 }
@@ -1073,7 +1153,9 @@ fn bind_symbol_via_varchar_cast() {
             .unwrap()
             .column_i64("v", i as i64)
             .unwrap()
-            .at(TimestampNanos::new(1_700_000_000_000_000_000 + i as i64 * 1_000_000))
+            .at(TimestampNanos::new(
+                1_700_000_000_000_000_000 + i as i64 * 1_000_000,
+            ))
             .unwrap();
     }
     sender.flush(&mut buf).expect("flush");
@@ -1090,8 +1172,12 @@ fn bind_symbol_via_varchar_cast() {
         .expect("execute");
     let view = cur.next_batch().expect("next").expect("Some");
     assert_eq!(view.row_count(), 2);
-    let ColumnView::Symbol(s) = view.column(0).unwrap() else { panic!() };
-    let ColumnView::Long(v) = view.column(1).unwrap() else { panic!() };
+    let ColumnView::Symbol(s) = view.column(0).unwrap() else {
+        panic!()
+    };
+    let ColumnView::Long(v) = view.column(1).unwrap() else {
+        panic!()
+    };
     assert_eq!(s.resolve(0), Some("AAPL"));
     assert_eq!(s.resolve(1), Some("AAPL"));
     assert_eq!(v.value(0), 0);
@@ -1109,7 +1195,10 @@ fn bind_timestamp_nanos_passthrough() {
         .expect("execute");
     let view = cur.next_batch().expect("next").expect("Some");
     let ColumnView::TimestampNanos(c) = view.column(0).unwrap() else {
-        panic!("col 0 not timestamp_nanos: got {:?}", view.column(0).unwrap().kind())
+        panic!(
+            "col 0 not timestamp_nanos: got {:?}",
+            view.column(0).unwrap().kind()
+        )
     };
     assert_eq!(c.value(0), 1_700_000_000_123_456_789);
 }
@@ -1126,7 +1215,10 @@ fn bind_decimal64_passthrough() {
         .expect("execute");
     let view = cur.next_batch().expect("next").expect("Some");
     let ColumnView::Decimal64(c) = view.column(0).unwrap() else {
-        panic!("col 0 not decimal64: got {:?}", view.column(0).unwrap().kind())
+        panic!(
+            "col 0 not decimal64: got {:?}",
+            view.column(0).unwrap().kind()
+        )
     };
     assert_eq!(c.scale(), 2);
     assert_eq!(c.value(0), 12345);
@@ -1146,9 +1238,15 @@ fn bind_multiple_binds_in_one_query() {
     let view = cur.next_batch().expect("next").expect("Some");
     assert_eq!(view.column_count(), 3);
 
-    let ColumnView::Long(a) = view.column(0).unwrap() else { panic!("col 0") };
-    let ColumnView::Varchar(b) = view.column(1).unwrap() else { panic!("col 1") };
-    let ColumnView::Double(c) = view.column(2).unwrap() else { panic!("col 2") };
+    let ColumnView::Long(a) = view.column(0).unwrap() else {
+        panic!("col 0")
+    };
+    let ColumnView::Varchar(b) = view.column(1).unwrap() else {
+        panic!("col 1")
+    };
+    let ColumnView::Double(c) = view.column(2).unwrap() else {
+        panic!("col 2")
+    };
     assert_eq!(a.value(0), 42);
     assert_eq!(b.value(0), Some("hello"));
     assert_eq!(c.value(0), 3.5);
@@ -1169,7 +1267,9 @@ fn bind_in_where_clause_filters_rows() {
             .unwrap()
             .column_i64("id", i)
             .unwrap()
-            .at(TimestampNanos::new(1_700_000_000_000_000_000 + i * 1_000_000))
+            .at(TimestampNanos::new(
+                1_700_000_000_000_000_000 + i * 1_000_000,
+            ))
             .unwrap();
     }
     sender.flush(&mut buf).expect("flush");
@@ -1187,7 +1287,9 @@ fn bind_in_where_clause_filters_rows() {
         .expect("execute");
     let view = cur.next_batch().expect("next").expect("Some");
     assert_eq!(view.row_count(), 4); // ids 3,4,5,6
-    let ColumnView::Long(c) = view.column(0).unwrap() else { panic!() };
+    let ColumnView::Long(c) = view.column(0).unwrap() else {
+        panic!()
+    };
     assert_eq!(c.value(0), 3);
     assert_eq!(c.value(1), 4);
     assert_eq!(c.value(2), 5);
@@ -1205,8 +1307,13 @@ fn bind_typed_null_long() {
         .execute()
         .expect("execute");
     let view = cur.next_batch().expect("next").expect("Some");
-    let ColumnView::Long(c) = view.column(0).unwrap() else { panic!() };
-    assert!(c.is_null(0), "expected null long bind to surface as null row");
+    let ColumnView::Long(c) = view.column(0).unwrap() else {
+        panic!()
+    };
+    assert!(
+        c.is_null(0),
+        "expected null long bind to surface as null row"
+    );
 }
 
 // --- Narrow integer binds --------------------------------------------------
@@ -1334,7 +1441,10 @@ fn bind_long256_passthrough() {
         .expect("execute");
     let view = cur.next_batch().expect("next").expect("Some");
     let ColumnView::Long256(c) = view.column(0).unwrap() else {
-        panic!("col 0 not long256: got {:?}", view.column(0).unwrap().kind())
+        panic!(
+            "col 0 not long256: got {:?}",
+            view.column(0).unwrap().kind()
+        )
     };
     assert_eq!(c.value(0), &bytes);
 }
@@ -1384,7 +1494,10 @@ fn bind_decimal128_passthrough() {
         .expect("execute");
     let view = cur.next_batch().expect("next").expect("Some");
     let ColumnView::Decimal128(c) = view.column(0).unwrap() else {
-        panic!("col 0 not decimal128: got {:?}", view.column(0).unwrap().kind())
+        panic!(
+            "col 0 not decimal128: got {:?}",
+            view.column(0).unwrap().kind()
+        )
     };
     assert_eq!(c.scale(), 4);
     assert_eq!(c.value(0), 123_4567i128);
@@ -1404,7 +1517,10 @@ fn bind_decimal256_passthrough() {
         .expect("execute");
     let view = cur.next_batch().expect("next").expect("Some");
     let ColumnView::Decimal256(c) = view.column(0).unwrap() else {
-        panic!("col 0 not decimal256: got {:?}", view.column(0).unwrap().kind())
+        panic!(
+            "col 0 not decimal256: got {:?}",
+            view.column(0).unwrap().kind()
+        )
     };
     assert_eq!(c.scale(), 6);
     let got = c.value(0);
@@ -1429,7 +1545,10 @@ fn bind_geohash_passthrough() {
         .expect("execute");
     let view = cur.next_batch().expect("next").expect("Some");
     let ColumnView::Geohash(c) = view.column(0).unwrap() else {
-        panic!("col 0 not geohash: got {:?}", view.column(0).unwrap().kind())
+        panic!(
+            "col 0 not geohash: got {:?}",
+            view.column(0).unwrap().kind()
+        )
     };
     assert_eq!(c.precision_bits(), 40);
     assert_eq!(c.byte_width(), 5);
@@ -1448,7 +1567,9 @@ fn bind_null_varchar_emits_null_row() {
         .execute()
         .expect("execute");
     let view = cur.next_batch().expect("next").expect("Some");
-    let ColumnView::Varchar(c) = view.column(0).unwrap() else { panic!() };
+    let ColumnView::Varchar(c) = view.column(0).unwrap() else {
+        panic!()
+    };
     assert!(c.is_null(0));
     assert_eq!(c.value(0), None);
 }
@@ -1473,7 +1594,9 @@ fn bind_null_decimal64_with_scale() {
         .execute()
         .expect("execute");
     let view = cur.next_batch().expect("next").expect("Some");
-    let ColumnView::Decimal64(c) = view.column(0).unwrap() else { panic!() };
+    let ColumnView::Decimal64(c) = view.column(0).unwrap() else {
+        panic!()
+    };
     assert!(c.is_null(0));
 }
 
@@ -1487,7 +1610,9 @@ fn bind_null_decimal128_with_scale() {
         .execute()
         .expect("execute");
     let view = cur.next_batch().expect("next").expect("Some");
-    let ColumnView::Decimal128(c) = view.column(0).unwrap() else { panic!() };
+    let ColumnView::Decimal128(c) = view.column(0).unwrap() else {
+        panic!()
+    };
     assert!(c.is_null(0));
 }
 
@@ -1501,7 +1626,9 @@ fn bind_null_decimal256_with_scale() {
         .execute()
         .expect("execute");
     let view = cur.next_batch().expect("next").expect("Some");
-    let ColumnView::Decimal256(c) = view.column(0).unwrap() else { panic!() };
+    let ColumnView::Decimal256(c) = view.column(0).unwrap() else {
+        panic!()
+    };
     assert!(c.is_null(0));
 }
 
@@ -1515,7 +1642,9 @@ fn bind_null_geohash_with_precision() {
         .execute()
         .expect("execute");
     let view = cur.next_batch().expect("next").expect("Some");
-    let ColumnView::Geohash(c) = view.column(0).unwrap() else { panic!() };
+    let ColumnView::Geohash(c) = view.column(0).unwrap() else {
+        panic!()
+    };
     assert!(c.is_null(0));
     assert_eq!(c.precision_bits(), 40);
 }
@@ -1555,10 +1684,18 @@ fn integer_boundaries() {
         srv,
         &format!("select b, s, i, l from \"{}\" order by ts", table),
         |view| {
-            let ColumnView::Byte(b) = view.column(0).unwrap() else { panic!() };
-            let ColumnView::Short(s) = view.column(1).unwrap() else { panic!() };
-            let ColumnView::Int(i) = view.column(2).unwrap() else { panic!() };
-            let ColumnView::Long(l) = view.column(3).unwrap() else { panic!() };
+            let ColumnView::Byte(b) = view.column(0).unwrap() else {
+                panic!()
+            };
+            let ColumnView::Short(s) = view.column(1).unwrap() else {
+                panic!()
+            };
+            let ColumnView::Int(i) = view.column(2).unwrap() else {
+                panic!()
+            };
+            let ColumnView::Long(l) = view.column(3).unwrap() else {
+                panic!()
+            };
 
             assert_eq!(b.value(0), i8::MIN);
             assert_eq!(b.value(1), 0);
@@ -1603,7 +1740,9 @@ fn double_special_values() {
         srv,
         &format!("select d from \"{}\" order by ts", table),
         |view| {
-            let ColumnView::Double(c) = view.column(0).unwrap() else { panic!() };
+            let ColumnView::Double(c) = view.column(0).unwrap() else {
+                panic!()
+            };
             // Server behaviour for NaN / +Inf / -Inf via SQL literals is
             // implementation-defined: QuestDB may treat any non-finite
             // double as NULL (consistent with its NaN-as-NULL sentinel),
@@ -1647,8 +1786,14 @@ fn varchar_empty_string_distinct_from_null() {
         srv,
         &format!("select s from \"{}\" order by ts", table),
         |view| {
-            let ColumnView::Varchar(c) = view.column(0).unwrap() else { panic!() };
-            assert_eq!(c.value(0), Some(""), "empty string must round-trip as Some(\"\")");
+            let ColumnView::Varchar(c) = view.column(0).unwrap() else {
+                panic!()
+            };
+            assert_eq!(
+                c.value(0),
+                Some(""),
+                "empty string must round-trip as Some(\"\")"
+            );
             assert_eq!(c.value(1), None);
             assert_eq!(c.value(2), Some("non-empty"));
         },
@@ -1678,7 +1823,9 @@ fn varchar_unicode_and_long_string() {
         srv,
         &format!("select s from \"{}\" order by ts", table),
         |view| {
-            let ColumnView::Varchar(c) = view.column(0).unwrap() else { panic!() };
+            let ColumnView::Varchar(c) = view.column(0).unwrap() else {
+                panic!()
+            };
             assert_eq!(c.value(0), Some("🦀 rust + 中文 + עברית + 한국어"));
             assert_eq!(c.value(1).map(|s| s.len()), Some(long_str.len()));
             assert_eq!(c.value(2), Some("a"));
@@ -1707,7 +1854,9 @@ fn all_null_long_column() {
         srv,
         &format!("select v from \"{}\" order by ts", table),
         |view| {
-            let ColumnView::Long(c) = view.column(0).unwrap() else { panic!() };
+            let ColumnView::Long(c) = view.column(0).unwrap() else {
+                panic!()
+            };
             assert_eq!(c.len(), 3);
             for r in 0..3 {
                 assert!(c.is_null(r), "row {} should be null", r);
@@ -1739,7 +1888,9 @@ fn all_null_varchar_column() {
         srv,
         &format!("select s from \"{}\" order by ts", table),
         |view| {
-            let ColumnView::Varchar(c) = view.column(0).unwrap() else { panic!() };
+            let ColumnView::Varchar(c) = view.column(0).unwrap() else {
+                panic!()
+            };
             assert_eq!(c.len(), 3);
             for r in 0..3 {
                 assert!(c.is_null(r));
@@ -1774,7 +1925,9 @@ fn timestamp_epoch_and_far_future() {
         srv,
         &format!("select ts from \"{}\" order by ts", table),
         |view| {
-            let ColumnView::Timestamp(c) = view.column(0).unwrap() else { panic!() };
+            let ColumnView::Timestamp(c) = view.column(0).unwrap() else {
+                panic!()
+            };
             assert_eq!(c.value(0), 0); // epoch
             assert_eq!(c.value(1), 1); // 1us after epoch
             // Year 2099 in micros since epoch.
@@ -1805,7 +1958,9 @@ fn uuid_all_zeros_and_all_ones() {
         srv,
         &format!("select u from \"{}\" order by ts", table),
         |view| {
-            let ColumnView::Uuid(c) = view.column(0).unwrap() else { panic!() };
+            let ColumnView::Uuid(c) = view.column(0).unwrap() else {
+                panic!()
+            };
             // Row 0: all-zero UUID — the spec's UUID null sentinel is
             // both halves Long.MIN_VALUE, NOT all-zero, so this stays
             // a valid non-null UUID with zero bytes.
@@ -1843,7 +1998,9 @@ fn long256_distinct_high_low_bytes() {
         srv,
         &format!("select l from \"{}\" order by ts", table),
         |view| {
-            let ColumnView::Long256(c) = view.column(0).unwrap() else { panic!() };
+            let ColumnView::Long256(c) = view.column(0).unwrap() else {
+                panic!()
+            };
             assert!(!c.is_null(0));
             let bytes = c.value(0);
             assert_eq!(bytes.len(), 32);
@@ -1920,7 +2077,9 @@ fn double_array_3d() {
         srv,
         &format!("select a from \"{}\" order by ts", table),
         |view| {
-            let ColumnView::DoubleArray(c) = view.column(0).unwrap() else { panic!() };
+            let ColumnView::DoubleArray(c) = view.column(0).unwrap() else {
+                panic!()
+            };
             assert_eq!(c.shape(0), Some(&[2u32, 2, 3][..]));
             assert_eq!(c.element_count(0), 12);
             // Row-major flat: 1..12.
@@ -1951,8 +2110,12 @@ fn decimal64_zero_and_negative_scale_boundary() {
         srv,
         &format!("select p, z from \"{}\" order by ts", table),
         |view| {
-            let ColumnView::Decimal64(p) = view.column(0).unwrap() else { panic!() };
-            let ColumnView::Decimal64(z) = view.column(1).unwrap() else { panic!() };
+            let ColumnView::Decimal64(p) = view.column(0).unwrap() else {
+                panic!()
+            };
+            let ColumnView::Decimal64(z) = view.column(1).unwrap() else {
+                panic!()
+            };
             assert_eq!(p.scale(), 2);
             assert_eq!(z.scale(), 0);
             assert_eq!(p.value(0), 0);
@@ -1972,7 +2135,9 @@ fn decimal64_zero_and_negative_scale_boundary() {
 fn server_info_exposes_role() {
     let srv = server();
     let reader = make_reader(srv);
-    let info = reader.server_info().expect("v2 server must emit SERVER_INFO");
+    let info = reader
+        .server_info()
+        .expect("v2 server must emit SERVER_INFO");
     // Single-node OSS emits STANDALONE; cluster_id and node_id are
     // cluster-only fields and may be empty.
     assert_eq!(info.role, questdb::egress::ServerRole::Standalone);
@@ -2021,10 +2186,7 @@ fn multi_addr_walks_past_unreachable_endpoint() {
     // First addr is a non-listening loopback port; second is the real
     // server. The walk should fall through to the live one.
     let srv = server();
-    let conf = format!(
-        "qwp::addr=127.0.0.1:1,127.0.0.1:{}",
-        srv.http_port
-    );
+    let conf = format!("qwp::addr=127.0.0.1:1,127.0.0.1:{}", srv.http_port);
     let mut reader = Reader::from_conf(&conf).expect("walk past unreachable");
     let info = reader.server_info().expect("server_info");
     assert_eq!(info.role, questdb::egress::ServerRole::Standalone);
@@ -2063,7 +2225,9 @@ fn credit_flow_control_keeps_server_streaming() {
             .unwrap()
             .column_f64("d", i as f64 * 0.5)
             .unwrap()
-            .at(TimestampNanos::new(1_700_000_000_000_000_000 + i * 1_000_000))
+            .at(TimestampNanos::new(
+                1_700_000_000_000_000_000 + i * 1_000_000,
+            ))
             .unwrap();
     }
     sender.flush(&mut buf).expect("flush");
@@ -2161,7 +2325,9 @@ fn exec_done_for_ddl_and_insert() {
             .execute()
             .expect("execute select");
         let view = cur.next_batch().expect("next select").expect("Some batch");
-        let ColumnView::Long(c) = view.column(0).unwrap() else { panic!() };
+        let ColumnView::Long(c) = view.column(0).unwrap() else {
+            panic!()
+        };
         assert_eq!(c.value(0), 10);
         assert_eq!(c.value(1), 20);
         assert_eq!(c.value(2), 30);
@@ -2232,7 +2398,9 @@ fn multi_batch_streaming() {
             .unwrap()
             .column_f64("d", i as f64 * 0.5)
             .unwrap()
-            .at(TimestampNanos::new(1_700_000_000_000_000_000 + i * 1_000_000))
+            .at(TimestampNanos::new(
+                1_700_000_000_000_000_000 + i * 1_000_000,
+            ))
             .unwrap();
     }
     sender.flush(&mut buf).expect("flush");
@@ -2270,8 +2438,12 @@ fn multi_batch_streaming() {
         }
         last_batch_seq = Some(seq);
 
-        let ColumnView::Long(i_col) = view.column(0).unwrap() else { panic!("col 0") };
-        let ColumnView::Double(d_col) = view.column(1).unwrap() else { panic!("col 1") };
+        let ColumnView::Long(i_col) = view.column(0).unwrap() else {
+            panic!("col 0")
+        };
+        let ColumnView::Double(d_col) = view.column(1).unwrap() else {
+            panic!("col 1")
+        };
 
         // Spot-check first and last row of each batch.
         if first_value.is_none() {
@@ -2325,7 +2497,9 @@ fn multi_batch_with_mixed_nulls_and_symbols() {
     const TOTAL: usize = 5_000;
     const PER_BATCH: usize = 500;
     const DISTINCT_SYMBOLS: usize = 50;
-    let symbols: Vec<String> = (0..DISTINCT_SYMBOLS).map(|i| format!("SYM{:03}", i)).collect();
+    let symbols: Vec<String> = (0..DISTINCT_SYMBOLS)
+        .map(|i| format!("SYM{:03}", i))
+        .collect();
 
     let mut sender = make_sender(srv, ProtocolVersion::V2);
     let mut buf = sender.new_buffer();
@@ -2376,8 +2550,12 @@ fn multi_batch_with_mixed_nulls_and_symbols() {
         }
         last_batch_seq = Some(seq);
 
-        let ColumnView::Symbol(s) = view.column(0).unwrap() else { panic!("col 0") };
-        let ColumnView::Long(v) = view.column(1).unwrap() else { panic!("col 1") };
+        let ColumnView::Symbol(s) = view.column(0).unwrap() else {
+            panic!("col 0")
+        };
+        let ColumnView::Long(v) = view.column(1).unwrap() else {
+            panic!("col 1")
+        };
 
         // Walk the batch, validate per-row expectations against the
         // pattern we inserted. Each batch must round-trip its own
@@ -2481,7 +2659,9 @@ fn zstd_compressed_multi_batch() {
             .unwrap()
             .column_f64("d", i as f64 * 0.5)
             .unwrap()
-            .at(TimestampNanos::new(1_700_000_000_000_000_000 + i * 1_000_000))
+            .at(TimestampNanos::new(
+                1_700_000_000_000_000_000 + i * 1_000_000,
+            ))
             .unwrap();
     }
     sender.flush(&mut buf).expect("flush");
@@ -2514,8 +2694,12 @@ fn zstd_compressed_multi_batch() {
             compressed_batches += 1;
         }
         let rows = view.row_count();
-        let ColumnView::Long(i_col) = view.column(0).unwrap() else { panic!() };
-        let ColumnView::Double(d_col) = view.column(1).unwrap() else { panic!() };
+        let ColumnView::Long(i_col) = view.column(0).unwrap() else {
+            panic!()
+        };
+        let ColumnView::Double(d_col) = view.column(1).unwrap() else {
+            panic!()
+        };
         if first_value.is_none() {
             first_value = Some(i_col.value(0));
         }
@@ -2565,7 +2749,9 @@ fn null_handling_long_densifies() {
         srv,
         &format!("select v from \"{}\" order by ts", table),
         |view| {
-            let ColumnView::Long(c) = view.column(0).unwrap() else { panic!() };
+            let ColumnView::Long(c) = view.column(0).unwrap() else {
+                panic!()
+            };
             assert_eq!(c.value(0), 10);
             assert!(c.is_null(1));
             assert_eq!(c.value(2), 30);

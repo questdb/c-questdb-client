@@ -60,7 +60,7 @@
 //!   DECIMAL128/256, DOUBLE_ARRAY, LONG_ARRAY
 
 use crate::egress::column::{
-    BinaryColumn, ColumnView, Decimal128Column, Decimal256Column, Decimal64Column,
+    BinaryColumn, ColumnView, Decimal64Column, Decimal128Column, Decimal256Column,
     DoubleArrayColumn, FixedColumn, GeohashColumn, Long256Column, LongArrayColumn, SymbolColumn,
     UuidColumn, Validity, VarcharColumn,
 };
@@ -188,22 +188,58 @@ impl DecodedBatch {
             .get(idx)
             .ok_or_else(|| fmt!(InvalidApiCall, "column index {} out of range", idx))?;
         Ok(match col {
-            DecodedColumn::Boolean(b) => ColumnView::Boolean(FixedColumn::new(&b.values, validity_of(b, self.row_count))),
-            DecodedColumn::Byte(b) => ColumnView::Byte(FixedColumn::new(&b.values, validity_of(b, self.row_count))),
-            DecodedColumn::Short(b) => ColumnView::Short(FixedColumn::new(&b.values, validity_of(b, self.row_count))),
-            DecodedColumn::Int(b) => ColumnView::Int(FixedColumn::new(&b.values, validity_of(b, self.row_count))),
-            DecodedColumn::Long(b) => ColumnView::Long(FixedColumn::new(&b.values, validity_of(b, self.row_count))),
-            DecodedColumn::Float(b) => ColumnView::Float(FixedColumn::new(&b.values, validity_of(b, self.row_count))),
-            DecodedColumn::Double(b) => ColumnView::Double(FixedColumn::new(&b.values, validity_of(b, self.row_count))),
-            DecodedColumn::Timestamp(b) => ColumnView::Timestamp(FixedColumn::new(&b.values, validity_of(b, self.row_count))),
-            DecodedColumn::Date(b) => ColumnView::Date(FixedColumn::new(&b.values, validity_of(b, self.row_count))),
-            DecodedColumn::TimestampNanos(b) => ColumnView::TimestampNanos(FixedColumn::new(&b.values, validity_of(b, self.row_count))),
-            DecodedColumn::Char(b) => ColumnView::Char(FixedColumn::new(&b.values, validity_of(b, self.row_count))),
-            DecodedColumn::Ipv4(b) => ColumnView::Ipv4(FixedColumn::new(&b.values, validity_of(b, self.row_count))),
-            DecodedColumn::Uuid(b) => ColumnView::Uuid(UuidColumn::new(&b.values, validity_of(b, self.row_count))),
-            DecodedColumn::Long256(b) => ColumnView::Long256(Long256Column::new(&b.values, validity_of(b, self.row_count))),
-            DecodedColumn::Decimal64 { buffer, scale } => ColumnView::Decimal64(Decimal64Column::new(&buffer.values, validity_of(buffer, self.row_count), *scale)),
-            DecodedColumn::Symbol { codes, validity, local_dict } => {
+            DecodedColumn::Boolean(b) => {
+                ColumnView::Boolean(FixedColumn::new(&b.values, validity_of(b, self.row_count)))
+            }
+            DecodedColumn::Byte(b) => {
+                ColumnView::Byte(FixedColumn::new(&b.values, validity_of(b, self.row_count)))
+            }
+            DecodedColumn::Short(b) => {
+                ColumnView::Short(FixedColumn::new(&b.values, validity_of(b, self.row_count)))
+            }
+            DecodedColumn::Int(b) => {
+                ColumnView::Int(FixedColumn::new(&b.values, validity_of(b, self.row_count)))
+            }
+            DecodedColumn::Long(b) => {
+                ColumnView::Long(FixedColumn::new(&b.values, validity_of(b, self.row_count)))
+            }
+            DecodedColumn::Float(b) => {
+                ColumnView::Float(FixedColumn::new(&b.values, validity_of(b, self.row_count)))
+            }
+            DecodedColumn::Double(b) => {
+                ColumnView::Double(FixedColumn::new(&b.values, validity_of(b, self.row_count)))
+            }
+            DecodedColumn::Timestamp(b) => {
+                ColumnView::Timestamp(FixedColumn::new(&b.values, validity_of(b, self.row_count)))
+            }
+            DecodedColumn::Date(b) => {
+                ColumnView::Date(FixedColumn::new(&b.values, validity_of(b, self.row_count)))
+            }
+            DecodedColumn::TimestampNanos(b) => ColumnView::TimestampNanos(FixedColumn::new(
+                &b.values,
+                validity_of(b, self.row_count),
+            )),
+            DecodedColumn::Char(b) => {
+                ColumnView::Char(FixedColumn::new(&b.values, validity_of(b, self.row_count)))
+            }
+            DecodedColumn::Ipv4(b) => {
+                ColumnView::Ipv4(FixedColumn::new(&b.values, validity_of(b, self.row_count)))
+            }
+            DecodedColumn::Uuid(b) => {
+                ColumnView::Uuid(UuidColumn::new(&b.values, validity_of(b, self.row_count)))
+            }
+            DecodedColumn::Long256(b) => ColumnView::Long256(Long256Column::new(
+                &b.values,
+                validity_of(b, self.row_count),
+            )),
+            DecodedColumn::Decimal64 { buffer, scale } => ColumnView::Decimal64(
+                Decimal64Column::new(&buffer.values, validity_of(buffer, self.row_count), *scale),
+            ),
+            DecodedColumn::Symbol {
+                codes,
+                validity,
+                local_dict,
+            } => {
                 let active_dict = local_dict.as_ref().unwrap_or(dict);
                 ColumnView::Symbol(SymbolColumn::new(
                     codes,
@@ -211,20 +247,34 @@ impl DecodedBatch {
                     active_dict,
                 ))
             }
-            DecodedColumn::Varchar { offsets, data, validity } => ColumnView::Varchar(
-                VarcharColumn::new(offsets, data, validity_from_opt(validity, self.row_count)),
-            ),
-            DecodedColumn::Binary { offsets, data, validity } => ColumnView::Binary(
-                BinaryColumn::new(offsets, data, validity_from_opt(validity, self.row_count)),
-            ),
-            DecodedColumn::Geohash { buffer, byte_width, precision_bits } => ColumnView::Geohash(
-                GeohashColumn::new(
-                    &buffer.values,
-                    *byte_width,
-                    *precision_bits,
-                    validity_of(buffer, self.row_count),
-                ),
-            ),
+            DecodedColumn::Varchar {
+                offsets,
+                data,
+                validity,
+            } => ColumnView::Varchar(VarcharColumn::new(
+                offsets,
+                data,
+                validity_from_opt(validity, self.row_count),
+            )),
+            DecodedColumn::Binary {
+                offsets,
+                data,
+                validity,
+            } => ColumnView::Binary(BinaryColumn::new(
+                offsets,
+                data,
+                validity_from_opt(validity, self.row_count),
+            )),
+            DecodedColumn::Geohash {
+                buffer,
+                byte_width,
+                precision_bits,
+            } => ColumnView::Geohash(GeohashColumn::new(
+                &buffer.values,
+                *byte_width,
+                *precision_bits,
+                validity_of(buffer, self.row_count),
+            )),
             DecodedColumn::Decimal128 { buffer, scale } => ColumnView::Decimal128(
                 Decimal128Column::new(&buffer.values, validity_of(buffer, self.row_count), *scale),
             ),
@@ -410,9 +460,13 @@ fn decode_column(
         ColumnKind::Uuid => DecodedColumn::Uuid(decode_fixed(r, row_count, 16)?),
         ColumnKind::Long256 => DecodedColumn::Long256(decode_fixed(r, row_count, 32)?),
 
-        ColumnKind::Timestamp => DecodedColumn::Timestamp(decode_temporal(r, row_count, flags_byte)?),
+        ColumnKind::Timestamp => {
+            DecodedColumn::Timestamp(decode_temporal(r, row_count, flags_byte)?)
+        }
         ColumnKind::Date => DecodedColumn::Date(decode_temporal(r, row_count, flags_byte)?),
-        ColumnKind::TimestampNanos => DecodedColumn::TimestampNanos(decode_temporal(r, row_count, flags_byte)?),
+        ColumnKind::TimestampNanos => {
+            DecodedColumn::TimestampNanos(decode_temporal(r, row_count, flags_byte)?)
+        }
 
         ColumnKind::Symbol => {
             let (codes, validity, local_dict) =
@@ -431,11 +485,19 @@ fn decode_column(
 
         ColumnKind::Varchar => {
             let (offsets, data, validity) = decode_varlen(r, row_count, /*utf8=*/ true)?;
-            DecodedColumn::Varchar { offsets, data, validity }
+            DecodedColumn::Varchar {
+                offsets,
+                data,
+                validity,
+            }
         }
         ColumnKind::Binary => {
             let (offsets, data, validity) = decode_varlen(r, row_count, /*utf8=*/ false)?;
-            DecodedColumn::Binary { offsets, data, validity }
+            DecodedColumn::Binary {
+                offsets,
+                data,
+                validity,
+            }
         }
 
         ColumnKind::Geohash => {
@@ -527,9 +589,8 @@ fn decode_array(r: &mut ByteReader<'_>, row_count: usize) -> Result<ArrayBuffers
         let elements = r.read_bytes(byte_count)?;
         data.extend_from_slice(elements);
 
-        let new_data_off = u32::try_from(data.len()).map_err(|_| {
-            fmt!(ProtocolError, "array column data exceeds u32 byte offset")
-        })?;
+        let new_data_off = u32::try_from(data.len())
+            .map_err(|_| fmt!(ProtocolError, "array column data exceeds u32 byte offset"))?;
         data_offsets.push(new_data_off);
         let new_shape_off = u32::try_from(dims_start + n_dims)
             .map_err(|_| fmt!(ProtocolError, "array column shape table exceeds u32"))?;
@@ -549,10 +610,7 @@ fn decode_array(r: &mut ByteReader<'_>, row_count: usize) -> Result<ArrayBuffers
 ///
 /// Wire: `varint precision_bits` (1..60), then `non_null × ceil(precision_bits/8)`
 /// LE bytes. Densified into `row_count × byte_width` with null slots zeroed.
-fn decode_geohash(
-    r: &mut ByteReader<'_>,
-    row_count: usize,
-) -> Result<(ColumnBuffer, u8, u8)> {
+fn decode_geohash(r: &mut ByteReader<'_>, row_count: usize) -> Result<(ColumnBuffer, u8, u8)> {
     let validity = decode_validity(r, row_count)?;
     let precision_bits = r.read_varint_u64()?;
     if precision_bits == 0 || precision_bits > 60 {
@@ -562,7 +620,7 @@ fn decode_geohash(
             precision_bits
         ));
     }
-    let byte_width = ((precision_bits + 7) / 8) as u8;
+    let byte_width = precision_bits.div_ceil(8) as u8;
     let buffer = densify_fixed(r, row_count, byte_width as usize, validity)?;
     Ok((buffer, byte_width, precision_bits as u8))
 }
@@ -604,8 +662,7 @@ fn densify_fixed(
             for row in 0..row_count {
                 if !is_null_at(bitmap, row) {
                     let dst = row * elem_size;
-                    dense[dst..dst + elem_size]
-                        .copy_from_slice(&compact[src..src + elem_size]);
+                    dense[dst..dst + elem_size].copy_from_slice(&compact[src..src + elem_size]);
                     src += elem_size;
                 }
             }
@@ -623,11 +680,10 @@ fn densify_fixed(
 /// bytes of concatenated values. Returns dense per-row offsets
 /// (`row_count + 1` entries; null rows zero-length) plus the original
 /// compact data buffer (string boundaries are unchanged by densification).
-fn decode_varlen(
-    r: &mut ByteReader<'_>,
-    row_count: usize,
-    utf8: bool,
-) -> Result<(Vec<u32>, Vec<u8>, Option<Vec<u8>>)> {
+/// `(offsets, data, validity)` for a decoded VARCHAR / BINARY column body.
+type VarlenBuffers = (Vec<u32>, Vec<u8>, Option<Vec<u8>>);
+
+fn decode_varlen(r: &mut ByteReader<'_>, row_count: usize, utf8: bool) -> Result<VarlenBuffers> {
     let validity = decode_validity(r, row_count)?;
     let non_null = match &validity {
         None => row_count,
@@ -669,9 +725,8 @@ fn decode_varlen(
     let data = r.read_bytes(data_len)?.to_vec();
 
     if utf8 {
-        std::str::from_utf8(&data).map_err(|e| {
-            fmt!(InvalidUtf8, "varchar data buffer not valid UTF-8: {}", e)
-        })?;
+        std::str::from_utf8(&data)
+            .map_err(|e| fmt!(InvalidUtf8, "varchar data buffer not valid UTF-8: {}", e))?;
     }
 
     // Densify offsets to row_count + 1 entries.
@@ -725,10 +780,10 @@ fn decode_boolean(r: &mut ByteReader<'_>, row_count: usize) -> Result<ColumnBuff
 
     let mut dense = vec![0u8; row_count];
     let mut src_bit = 0usize;
-    for row in 0..row_count {
+    for (row, slot) in dense.iter_mut().enumerate() {
         if !is_null_at_opt(&validity, row) {
             let b = bits[src_bit >> 3];
-            dense[row] = (b >> (src_bit & 7)) & 1;
+            *slot = (b >> (src_bit & 7)) & 1;
             src_bit += 1;
         }
     }
@@ -785,8 +840,7 @@ fn decode_gorilla_temporal(
     let second_ts = i64::from_le_bytes(seed[8..16].try_into().unwrap());
 
     let bitstream = r.remaining();
-    let mut decoder =
-        crate::egress::gorilla::GorillaDecoder::new(first_ts, second_ts, bitstream);
+    let mut decoder = crate::egress::gorilla::GorillaDecoder::new(first_ts, second_ts, bitstream);
 
     let mut decoded = Vec::with_capacity(non_null);
     decoded.push(first_ts);
@@ -828,12 +882,15 @@ fn decode_gorilla_temporal(
 /// `u32` buffer with `0` in null slots; validity is the source of
 /// truth for null-vs-id-zero. Bounds checks reject ids beyond the
 /// active dict's size and dict_size beyond row_count.
+/// `(codes, validity, local_dict)` for a decoded SYMBOL column body.
+type SymbolBuffers = (Vec<u32>, Option<Vec<u8>>, Option<SymbolDict>);
+
 fn decode_symbol(
     r: &mut ByteReader<'_>,
     row_count: usize,
     flags_byte: u8,
     connection_dict_size: usize,
-) -> Result<(Vec<u32>, Option<Vec<u8>>, Option<SymbolDict>)> {
+) -> Result<SymbolBuffers> {
     let validity = decode_validity(r, row_count)?;
 
     let (active_dict_size, local_dict) = if flags_byte & flags::DELTA_SYMBOL_DICT != 0 {
@@ -861,20 +918,17 @@ fn decode_symbol(
             entries.push(r.read_bytes(entry_len)?);
         }
         let mut local = SymbolDict::new();
-        local.apply_delta(0, entries.into_iter())?;
+        local.apply_delta(0, entries)?;
         (dict_size, Some(local))
     };
 
     let mut codes = vec![0u32; row_count];
-    for row in 0..row_count {
+    for (row, slot) in codes.iter_mut().enumerate() {
         if is_null_at_opt(&validity, row) {
             continue;
         }
         let code = r.read_varint_u64().map_err(|e| {
-            Error::new(
-                e.code(),
-                format!("symbol code at row {}: {}", row, e.msg()),
-            )
+            Error::new(e.code(), format!("symbol code at row {}: {}", row, e.msg()))
         })?;
         let code32 = u32::try_from(code).map_err(|_| {
             fmt!(
@@ -893,17 +947,14 @@ fn decode_symbol(
                 active_dict_size
             ));
         }
-        codes[row] = code32;
+        *slot = code32;
     }
     Ok((codes, validity, local_dict))
 }
 
 /// DECIMAL64: column-level 1-byte scale follows the validity section, then
 /// `non_null_count × 8` LE bytes; densified like the fixed-width path.
-fn decode_decimal64(
-    r: &mut ByteReader<'_>,
-    row_count: usize,
-) -> Result<(i8, ColumnBuffer)> {
+fn decode_decimal64(r: &mut ByteReader<'_>, row_count: usize) -> Result<(i8, ColumnBuffer)> {
     let (scale, buffer) = decode_decimal_wide(r, row_count, 8)?;
     Ok((scale, buffer))
 }
@@ -952,9 +1003,8 @@ fn zstd_decompress_body(compressed: &[u8]) -> Result<Vec<u8>> {
         )
     })?;
 
-    let decompressed = zstd::bulk::decompress(compressed, usize_size).map_err(|e| {
-        fmt!(ProtocolError, "zstd decompress failed: {}", e)
-    })?;
+    let decompressed = zstd::bulk::decompress(compressed, usize_size)
+        .map_err(|e| fmt!(ProtocolError, "zstd decompress failed: {}", e))?;
     if decompressed.len() != usize_size {
         return Err(fmt!(
             ProtocolError,
@@ -1181,7 +1231,14 @@ mod tests {
         let view = batch.column_view(0, &dict).unwrap();
         let ColumnView::Long(c) = view else { panic!() };
         let expected: Vec<Option<i64>> = vec![
-            Some(100), None, Some(102), Some(103), None, Some(105), Some(106), None,
+            Some(100),
+            None,
+            Some(102),
+            Some(103),
+            None,
+            Some(105),
+            Some(106),
+            None,
         ];
         let got: Vec<Option<i64>> = (0..8)
             .map(|r| if c.is_null(r) { None } else { Some(c.value(r)) })
@@ -1200,7 +1257,9 @@ mod tests {
         let mut reg = SchemaRegistry::new();
         let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
         let view = batch.column_view(0, &dict).unwrap();
-        let ColumnView::Boolean(c) = view else { panic!() };
+        let ColumnView::Boolean(c) = view else {
+            panic!()
+        };
         assert_eq!(c.len(), 5);
         assert_eq!(c.value(0), 1);
         assert_eq!(c.value(1), 0);
@@ -1210,7 +1269,11 @@ mod tests {
     }
 
     /// Build a column-local SYMBOL column body: validity + dict + per-row ids.
-    fn symbol_column_local(bitmap: Option<&[u8]>, dict: &[&str], codes_per_non_null: &[u64]) -> Vec<u8> {
+    fn symbol_column_local(
+        bitmap: Option<&[u8]>,
+        dict: &[&str],
+        codes_per_non_null: &[u64],
+    ) -> Vec<u8> {
         let mut col = Vec::new();
         if let Some(bm) = bitmap {
             col.push(0x01);
@@ -1244,7 +1307,9 @@ mod tests {
         assert_eq!(dict.len(), 0);
 
         let view = batch.column_view(0, &dict).unwrap();
-        let ColumnView::Symbol(s) = view else { panic!() };
+        let ColumnView::Symbol(s) = view else {
+            panic!()
+        };
         assert_eq!(s.resolve(0), Some("AAPL"));
         assert_eq!(s.resolve(1), Some("MSFT"));
         assert_eq!(s.resolve(2), Some("GOOG"));
@@ -1263,7 +1328,9 @@ mod tests {
         let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
 
         let view = batch.column_view(0, &dict).unwrap();
-        let ColumnView::Symbol(s) = view else { panic!() };
+        let ColumnView::Symbol(s) = view else {
+            panic!()
+        };
         assert_eq!(s.resolve(0), Some("Y"));
         assert!(s.is_null(1));
         assert_eq!(s.resolve(1), None);
@@ -1286,8 +1353,12 @@ mod tests {
         let mut reg = SchemaRegistry::new();
         let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
 
-        let ColumnView::Symbol(a) = batch.column_view(0, &dict).unwrap() else { panic!() };
-        let ColumnView::Symbol(b) = batch.column_view(1, &dict).unwrap() else { panic!() };
+        let ColumnView::Symbol(a) = batch.column_view(0, &dict).unwrap() else {
+            panic!()
+        };
+        let ColumnView::Symbol(b) = batch.column_view(1, &dict).unwrap() else {
+            panic!()
+        };
         assert_eq!(a.resolve(0), Some("alpha"));
         assert_eq!(a.resolve(1), Some("beta"));
         assert_eq!(b.resolve(0), Some("two"));
@@ -1358,7 +1429,9 @@ mod tests {
         assert_eq!(dict.len(), 2);
 
         let view = batch.column_view(0, &dict).unwrap();
-        let ColumnView::Symbol(s) = view else { panic!() };
+        let ColumnView::Symbol(s) = view else {
+            panic!()
+        };
         assert_eq!(s.len(), 3);
         assert_eq!(s.resolve(0), Some("AAPL"));
         assert_eq!(s.resolve(1), None);
@@ -1368,22 +1441,20 @@ mod tests {
     #[test]
     fn decode_decimal64_with_scale() {
         let (flags_byte, payload) = BatchBuilder::new(2)
-            .add_column(
-                "p",
-                ColumnKind::Decimal64,
-                {
-                    let mut d = vec![0x00u8, 0x02]; // null_flag=0, scale=2
-                    d.extend_from_slice(&le_i64s(&[12345, 6789]));
-                    d
-                },
-            )
+            .add_column("p", ColumnKind::Decimal64, {
+                let mut d = vec![0x00u8, 0x02]; // null_flag=0, scale=2
+                d.extend_from_slice(&le_i64s(&[12345, 6789]));
+                d
+            })
             .build();
 
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
         let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
         let view = batch.column_view(0, &dict).unwrap();
-        let ColumnView::Decimal64(d) = view else { panic!() };
+        let ColumnView::Decimal64(d) = view else {
+            panic!()
+        };
         assert_eq!(d.scale(), 2);
         assert_eq!(d.value(0), 12345);
         assert_eq!(d.value(1), 6789);
@@ -1527,7 +1598,9 @@ mod tests {
         let mut reg = SchemaRegistry::new();
         let batch = decode_result_batch(&payload, flags::GORILLA, &mut dict, &mut reg).unwrap();
         let view = batch.column_view(0, &dict).unwrap();
-        let ColumnView::TimestampNanos(c) = view else { panic!() };
+        let ColumnView::TimestampNanos(c) = view else {
+            panic!()
+        };
         assert_eq!(c.value(0), 10);
         assert_eq!(c.value(1), 20);
         assert_eq!(c.value(2), 30);
@@ -1574,7 +1647,13 @@ mod tests {
                 write_bits((dod as u64) & 0xFFF, 12, &mut bytes, &mut cur, &mut bits);
             } else {
                 write_bits(0b1111, 4, &mut bytes, &mut cur, &mut bits);
-                write_bits((dod as u64) & 0xFFFF_FFFF, 32, &mut bytes, &mut cur, &mut bits);
+                write_bits(
+                    (dod as u64) & 0xFFFF_FFFF,
+                    32,
+                    &mut bytes,
+                    &mut cur,
+                    &mut bits,
+                );
             }
             prev_delta = delta;
             prev_ts = ts;
@@ -1598,7 +1677,9 @@ mod tests {
         let mut reg = SchemaRegistry::new();
         let batch = decode_result_batch(&payload, flags::GORILLA, &mut dict, &mut reg).unwrap();
         let view = batch.column_view(0, &dict).unwrap();
-        let ColumnView::TimestampNanos(c) = view else { panic!() };
+        let ColumnView::TimestampNanos(c) = view else {
+            panic!()
+        };
         for (i, &expected) in timestamps.iter().enumerate() {
             assert_eq!(c.value(i), expected, "row {}", i);
         }
@@ -1640,7 +1721,9 @@ mod tests {
         let mut reg = SchemaRegistry::new();
         let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
         let view = batch.column_view(0, &dict).unwrap();
-        let ColumnView::DoubleArray(c) = view else { panic!() };
+        let ColumnView::DoubleArray(c) = view else {
+            panic!()
+        };
         assert_eq!(c.len(), 2);
         assert_eq!(c.shape(0), Some(&[3u32][..]));
         assert_eq!(c.element_count(0), 3);
@@ -1664,7 +1747,9 @@ mod tests {
         let mut reg = SchemaRegistry::new();
         let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
         let view = batch.column_view(0, &dict).unwrap();
-        let ColumnView::LongArray(c) = view else { panic!() };
+        let ColumnView::LongArray(c) = view else {
+            panic!()
+        };
         assert_eq!(c.len(), 3);
         assert_eq!(c.shape(0), Some(&[2u32, 2][..]));
         assert_eq!(c.element_count(0), 4);
@@ -1736,13 +1821,19 @@ mod tests {
     #[test]
     fn decode_varchar_no_nulls() {
         let (flags_byte, payload) = BatchBuilder::new(3)
-            .add_column("s", ColumnKind::Varchar, varchar_col_no_nulls(&["foo", "", "café"]))
+            .add_column(
+                "s",
+                ColumnKind::Varchar,
+                varchar_col_no_nulls(&["foo", "", "café"]),
+            )
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
         let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
         let view = batch.column_view(0, &dict).unwrap();
-        let ColumnView::Varchar(c) = view else { panic!() };
+        let ColumnView::Varchar(c) = view else {
+            panic!()
+        };
         assert_eq!(c.len(), 3);
         assert_eq!(c.value(0), Some("foo"));
         assert_eq!(c.value(1), Some(""));
@@ -1764,7 +1855,9 @@ mod tests {
         let mut reg = SchemaRegistry::new();
         let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
         let view = batch.column_view(0, &dict).unwrap();
-        let ColumnView::Varchar(c) = view else { panic!() };
+        let ColumnView::Varchar(c) = view else {
+            panic!()
+        };
         assert_eq!(c.len(), 4);
         assert_eq!(c.value(0), Some("hello"));
         assert_eq!(c.value(1), None);
@@ -1805,7 +1898,9 @@ mod tests {
         let mut reg = SchemaRegistry::new();
         let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
         let view = batch.column_view(0, &dict).unwrap();
-        let ColumnView::Binary(c) = view else { panic!() };
+        let ColumnView::Binary(c) = view else {
+            panic!()
+        };
         assert_eq!(c.len(), 2);
         assert_eq!(c.value(0), Some([0xDEu8, 0xAD, 0xBE].as_slice()));
         assert_eq!(c.value(1), Some([0xEFu8, 0x42].as_slice()));
@@ -1825,7 +1920,9 @@ mod tests {
         let mut reg = SchemaRegistry::new();
         let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
         let view = batch.column_view(0, &dict).unwrap();
-        let ColumnView::Binary(c) = view else { panic!() };
+        let ColumnView::Binary(c) = view else {
+            panic!()
+        };
         assert_eq!(c.value(0), Some([0xFFu8, 0xFE].as_slice()));
     }
 
@@ -1867,7 +1964,9 @@ mod tests {
         let mut reg = SchemaRegistry::new();
         let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
         let view = batch.column_view(0, &dict).unwrap();
-        let ColumnView::Geohash(c) = view else { panic!() };
+        let ColumnView::Geohash(c) = view else {
+            panic!()
+        };
         assert_eq!(c.precision_bits(), 8);
         assert_eq!(c.byte_width(), 1);
         assert_eq!(c.len(), 3);
@@ -1892,7 +1991,9 @@ mod tests {
         let mut reg = SchemaRegistry::new();
         let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
         let view = batch.column_view(0, &dict).unwrap();
-        let ColumnView::Geohash(c) = view else { panic!() };
+        let ColumnView::Geohash(c) = view else {
+            panic!()
+        };
         assert_eq!(c.precision_bits(), 60);
         assert_eq!(c.byte_width(), 8);
         assert!(!c.is_null(0));
@@ -1926,7 +2027,9 @@ mod tests {
         let mut reg = SchemaRegistry::new();
         let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
         let view = batch.column_view(0, &dict).unwrap();
-        let ColumnView::Decimal128(c) = view else { panic!() };
+        let ColumnView::Decimal128(c) = view else {
+            panic!()
+        };
         assert_eq!(c.scale(), 4);
         assert_eq!(c.value(0), 100_000i128);
         assert_eq!(c.value(1), -42i128);
@@ -1946,7 +2049,9 @@ mod tests {
         let mut reg = SchemaRegistry::new();
         let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
         let view = batch.column_view(0, &dict).unwrap();
-        let ColumnView::Decimal256(c) = view else { panic!() };
+        let ColumnView::Decimal256(c) = view else {
+            panic!()
+        };
         assert_eq!(c.scale(), 6);
         assert_eq!(c.value(0), &row0);
         assert_eq!(c.value(1), &row1);
@@ -1965,7 +2070,9 @@ mod tests {
         let mut reg = SchemaRegistry::new();
         let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
         let view = batch.column_view(0, &dict).unwrap();
-        let ColumnView::Varchar(c) = view else { panic!() };
+        let ColumnView::Varchar(c) = view else {
+            panic!()
+        };
         assert_eq!(c.len(), 3);
         assert_eq!(c.value(0), None);
         assert_eq!(c.value(1), None);
@@ -2003,12 +2110,16 @@ mod tests {
         // 2 rows, 2 cols: long, double
         let (flags_byte, payload) = BatchBuilder::new(2)
             .add_column("a", ColumnKind::Long, col_no_nulls(&le_i64s(&[10, 20])))
-            .add_column("b", ColumnKind::Double, col_no_nulls(&{
-                let mut o = Vec::new();
-                o.extend_from_slice(&1.5f64.to_le_bytes());
-                o.extend_from_slice(&2.5f64.to_le_bytes());
-                o
-            }))
+            .add_column(
+                "b",
+                ColumnKind::Double,
+                col_no_nulls(&{
+                    let mut o = Vec::new();
+                    o.extend_from_slice(&1.5f64.to_le_bytes());
+                    o.extend_from_slice(&2.5f64.to_le_bytes());
+                    o
+                }),
+            )
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();

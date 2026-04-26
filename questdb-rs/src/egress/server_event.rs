@@ -309,7 +309,11 @@ mod tests {
         let mut reg = SchemaRegistry::new();
         let event = decode_frame(header(payload.len()), &payload, &mut dict, &mut reg).unwrap();
         match event {
-            ServerEvent::End { request_id, final_seq, total_rows } => {
+            ServerEvent::End {
+                request_id,
+                final_seq,
+                total_rows,
+            } => {
                 assert_eq!(request_id, 42);
                 assert_eq!(final_seq, 7);
                 assert_eq!(total_rows, 1000);
@@ -336,7 +340,11 @@ mod tests {
         let mut reg = SchemaRegistry::new();
         let event = decode_frame(header(payload.len()), &payload, &mut dict, &mut reg).unwrap();
         match event {
-            ServerEvent::Error { request_id, status, message } => {
+            ServerEvent::Error {
+                request_id,
+                status,
+                message,
+            } => {
                 assert_eq!(request_id, 9);
                 assert_eq!(status, StatusCode::ParseError);
                 assert_eq!(message, "bad SQL");
@@ -380,7 +388,11 @@ mod tests {
         let mut reg = SchemaRegistry::new();
         let event = decode_frame(header(p.len()), &p, &mut dict, &mut reg).unwrap();
         match event {
-            ServerEvent::ExecDone { request_id, op_type, rows_affected } => {
+            ServerEvent::ExecDone {
+                request_id,
+                op_type,
+                rows_affected,
+            } => {
                 assert_eq!(request_id, 5);
                 assert_eq!(op_type, 0xAB);
                 assert_eq!(rows_affected, 0);

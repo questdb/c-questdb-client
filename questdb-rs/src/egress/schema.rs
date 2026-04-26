@@ -189,11 +189,7 @@ impl SchemaRegistry {
                         fmt!(ProtocolError, "schema column {} name length overflow", i)
                     })?;
                     if name_end > bytes.len() {
-                        return Err(fmt!(
-                            ProtocolError,
-                            "schema column {} name truncated",
-                            i
-                        ));
+                        return Err(fmt!(ProtocolError, "schema column {} name truncated", i));
                     }
                     let name = std::str::from_utf8(&bytes[cursor..name_end])
                         .map_err(|e| {
@@ -254,7 +250,13 @@ mod tests {
 
     #[test]
     fn decode_full_schema() {
-        let bytes = build_full(7, &[("ts", ColumnKind::TimestampNanos), ("v", ColumnKind::Double)]);
+        let bytes = build_full(
+            7,
+            &[
+                ("ts", ColumnKind::TimestampNanos),
+                ("v", ColumnKind::Double),
+            ],
+        );
         let mut reg = SchemaRegistry::new();
         let r = reg.decode_section(&bytes, 2).unwrap();
         assert_eq!(r.schema_id, 7);
@@ -314,8 +316,10 @@ mod tests {
     #[test]
     fn reset_clears_registry() {
         let mut reg = SchemaRegistry::new();
-        reg.decode_section(&build_full(1, &[("c", ColumnKind::Int)]), 1).unwrap();
-        reg.decode_section(&build_full(2, &[("c", ColumnKind::Int)]), 1).unwrap();
+        reg.decode_section(&build_full(1, &[("c", ColumnKind::Int)]), 1)
+            .unwrap();
+        reg.decode_section(&build_full(2, &[("c", ColumnKind::Int)]), 1)
+            .unwrap();
         assert_eq!(reg.len(), 2);
         reg.reset();
         assert_eq!(reg.len(), 0);
@@ -325,10 +329,15 @@ mod tests {
     #[test]
     fn full_replaces_existing_id() {
         let mut reg = SchemaRegistry::new();
-        reg.decode_section(&build_full(5, &[("a", ColumnKind::Int)]), 1).unwrap();
-        reg.decode_section(&build_full(5, &[("b", ColumnKind::Long)]), 1).unwrap();
+        reg.decode_section(&build_full(5, &[("a", ColumnKind::Int)]), 1)
+            .unwrap();
+        reg.decode_section(&build_full(5, &[("b", ColumnKind::Long)]), 1)
+            .unwrap();
         assert_eq!(reg.get(5).unwrap().column(0).unwrap().name, "b");
-        assert_eq!(reg.get(5).unwrap().column(0).unwrap().kind, ColumnKind::Long);
+        assert_eq!(
+            reg.get(5).unwrap().column(0).unwrap().kind,
+            ColumnKind::Long
+        );
     }
 
     #[test]

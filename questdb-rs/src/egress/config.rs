@@ -148,9 +148,9 @@ impl ReaderConfig {
         let params = conf.params();
 
         // Required: addr (single `host[:port]` or comma-separated list)
-        let addr = params.get("addr").ok_or_else(|| {
-            fmt!(ConfigError, "Missing \"addr\" parameter in config string")
-        })?;
+        let addr = params
+            .get("addr")
+            .ok_or_else(|| fmt!(ConfigError, "Missing \"addr\" parameter in config string"))?;
         let default_port = if tls {
             DEFAULT_TLS_PORT
         } else {
@@ -159,11 +159,7 @@ impl ReaderConfig {
         let mut addrs: Vec<(String, u16)> = Vec::new();
         for (i, entry) in addr.split(',').map(str::trim).enumerate() {
             if entry.is_empty() {
-                return Err(fmt!(
-                    ConfigError,
-                    "Empty entry {} in \"addr\" list",
-                    i
-                ));
+                return Err(fmt!(ConfigError, "Empty entry {} in \"addr\" list", i));
             }
             let (host, port_str) = match entry.rsplit_once(':') {
                 Some((h, p)) => (h.to_string(), p.to_string()),
@@ -249,10 +245,7 @@ impl ReaderConfig {
                 }
                 "client_id" => {
                     if val.contains('\n') || val.contains('\r') {
-                        return Err(fmt!(
-                            ConfigError,
-                            "\"client_id\" must not contain CR or LF"
-                        ));
+                        return Err(fmt!(ConfigError, "\"client_id\" must not contain CR or LF"));
                     }
                     client_id = Some(val.to_string());
                 }
@@ -294,15 +287,13 @@ impl ReaderConfig {
                 "tls_roots_password" => tls_roots_password = Some(val.to_string()),
 
                 // Failover keys aren't wired through Phase 1; accept and ignore.
-                "failover" | "failover_max_attempts" | "failover_backoff_initial_ms"
+                "failover"
+                | "failover_max_attempts"
+                | "failover_backoff_initial_ms"
                 | "failover_backoff_max_ms" => {}
 
                 other => {
-                    return Err(fmt!(
-                        ConfigError,
-                        "Unknown config key \"{}\"",
-                        other
-                    ));
+                    return Err(fmt!(ConfigError, "Unknown config key \"{}\"", other));
                 }
             }
         }
@@ -408,14 +399,8 @@ fn parse_value<T>(name: &str, raw: &str) -> Result<T>
 where
     T: FromStr,
 {
-    raw.parse::<T>().map_err(|_| {
-        fmt!(
-            ConfigError,
-            "Could not parse \"{}\" value: {:?}",
-            name,
-            raw
-        )
-    })
+    raw.parse::<T>()
+        .map_err(|_| fmt!(ConfigError, "Could not parse \"{}\" value: {:?}", name, raw))
 }
 
 fn parse_bool(name: &str, raw: &str) -> Result<bool> {
@@ -475,8 +460,7 @@ mod tests {
 
     #[test]
     fn basic_auth_in_conf() {
-        let c =
-            ReaderConfig::from_conf("qwp::addr=h:1;username=admin;password=quest").unwrap();
+        let c = ReaderConfig::from_conf("qwp::addr=h:1;username=admin;password=quest").unwrap();
         assert_eq!(
             c.auth.header_value(),
             Some("Basic YWRtaW46cXVlc3Q=".to_string())
@@ -491,10 +475,8 @@ mod tests {
 
     #[test]
     fn auth_modes_mutually_exclusive() {
-        let err = ReaderConfig::from_conf(
-            "qwp::addr=h:1;username=u;password=p;token=t",
-        )
-        .unwrap_err();
+        let err =
+            ReaderConfig::from_conf("qwp::addr=h:1;username=u;password=p;token=t").unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
     }
 
@@ -530,10 +512,7 @@ mod tests {
 
     #[test]
     fn multi_addr_parses() {
-        let c = ReaderConfig::from_conf(
-            "qwp::addr=h1:9000,h2:9001,h3,h4:9999;",
-        )
-        .unwrap();
+        let c = ReaderConfig::from_conf("qwp::addr=h1:9000,h2:9001,h3,h4:9999;").unwrap();
         assert_eq!(c.addrs.len(), 4);
         assert_eq!(c.addrs[0], ("h1".to_string(), 9000));
         assert_eq!(c.addrs[1], ("h2".to_string(), 9001));
@@ -611,13 +590,11 @@ mod tests {
     #[test]
     fn durable_ack_synonyms() {
         for v in &["true", "on", "yes", "1"] {
-            let c = ReaderConfig::from_conf(&format!("qwp::addr=h:1;durable_ack={};", v))
-                .unwrap();
+            let c = ReaderConfig::from_conf(format!("qwp::addr=h:1;durable_ack={};", v)).unwrap();
             assert!(c.durable_ack, "{}", v);
         }
         for v in &["false", "off", "no", "0"] {
-            let c = ReaderConfig::from_conf(&format!("qwp::addr=h:1;durable_ack={};", v))
-                .unwrap();
+            let c = ReaderConfig::from_conf(format!("qwp::addr=h:1;durable_ack={};", v)).unwrap();
             assert!(!c.durable_ack, "{}", v);
         }
     }

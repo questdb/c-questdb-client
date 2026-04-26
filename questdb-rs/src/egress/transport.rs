@@ -178,11 +178,7 @@ impl WsTransport {
                     return Ok((header, payload));
                 }
                 Message::Close(frame) => {
-                    return Err(fmt!(
-                        SocketError,
-                        "server closed WebSocket: {:?}",
-                        frame
-                    ));
+                    return Err(fmt!(SocketError, "server closed WebSocket: {:?}", frame));
                 }
                 // Tungstenite auto-ponds; nothing to do for ping/pong.
                 Message::Ping(_) | Message::Pong(_) => continue,
@@ -228,9 +224,9 @@ fn read_version_header(headers: &tungstenite::http::HeaderMap) -> Result<u8> {
                 "server response missing X-QWP-Version header"
             )
         })?;
-    let s = raw.to_str().map_err(|_| {
-        fmt!(HandshakeError, "X-QWP-Version header is not valid ASCII")
-    })?;
+    let s = raw
+        .to_str()
+        .map_err(|_| fmt!(HandshakeError, "X-QWP-Version header is not valid ASCII"))?;
     s.trim()
         .parse::<u8>()
         .map_err(|_| fmt!(HandshakeError, "X-QWP-Version {:?} is not a u8", s))

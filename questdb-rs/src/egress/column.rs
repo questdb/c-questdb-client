@@ -156,7 +156,11 @@ pub struct FixedColumn<'a, T: FixedWidth> {
 
 impl<'a, T: FixedWidth> FixedColumn<'a, T> {
     pub fn new(raw: &'a [u8], validity: Validity<'a>) -> Self {
-        debug_assert_eq!(raw.len() % T::SIZE, 0, "raw length must be multiple of element size");
+        debug_assert_eq!(
+            raw.len() % T::SIZE,
+            0,
+            "raw length must be multiple of element size"
+        );
         Self {
             raw,
             validity,
@@ -266,7 +270,9 @@ impl<'a, const N: usize> FixedBytesColumn<'a, N> {
     #[inline]
     pub fn value(&self, row: usize) -> &'a [u8; N] {
         let s = row * N;
-        (&self.raw[s..s + N]).try_into().expect("FixedBytesColumn slice length")
+        (&self.raw[s..s + N])
+            .try_into()
+            .expect("FixedBytesColumn slice length")
     }
 }
 
@@ -543,13 +549,8 @@ pub struct GeohashColumn<'a> {
 }
 
 impl<'a> GeohashColumn<'a> {
-    pub fn new(
-        raw: &'a [u8],
-        byte_width: u8,
-        precision_bits: u8,
-        validity: Validity<'a>,
-    ) -> Self {
-        debug_assert!(byte_width >= 1 && byte_width <= 8);
+    pub fn new(raw: &'a [u8], byte_width: u8, precision_bits: u8, validity: Validity<'a>) -> Self {
+        debug_assert!((1..=8).contains(&byte_width));
         debug_assert_eq!(raw.len() % byte_width as usize, 0);
         Self {
             raw,
@@ -1085,7 +1086,10 @@ mod tests {
         assert_eq!(col.value(1), -2);
         assert_eq!(col.value(2), 0x0102_0304_0506_0708);
         let collected: Vec<_> = col.iter().collect();
-        assert_eq!(collected, vec![Some(1i64), Some(-2), Some(0x0102_0304_0506_0708)]);
+        assert_eq!(
+            collected,
+            vec![Some(1i64), Some(-2), Some(0x0102_0304_0506_0708)]
+        );
     }
 
     #[test]
@@ -1137,8 +1141,11 @@ mod tests {
     #[test]
     fn symbol_resolves_codes_through_dict() {
         let mut dict = SymbolDict::new();
-        dict.apply_delta(0, [b"AAPL".as_slice(), b"MSFT".as_slice(), b"GOOG".as_slice()])
-            .unwrap();
+        dict.apply_delta(
+            0,
+            [b"AAPL".as_slice(), b"MSFT".as_slice(), b"GOOG".as_slice()],
+        )
+        .unwrap();
 
         // 4 rows: AAPL, NULL, MSFT, GOOG. Bitmap row1 null → 0b0000_0010 = 0x02
         // Codes are dense per row, with `0` (garbage) in the null slot.
@@ -1156,7 +1163,8 @@ mod tests {
     #[test]
     fn symbol_no_nulls_path() {
         let mut dict = SymbolDict::new();
-        dict.apply_delta(0, [b"x".as_slice(), b"y".as_slice()]).unwrap();
+        dict.apply_delta(0, [b"x".as_slice(), b"y".as_slice()])
+            .unwrap();
         let codes = [1u32, 0, 1];
         let col = SymbolColumn::new(&codes, Validity::None, &dict);
         assert_eq!(col.resolve(0), Some("y"));
@@ -1191,10 +1199,7 @@ mod tests {
     fn column_view_is_null_dispatches() {
         let raw = le_i64s(&[1, 2, 3]);
         let bm = [0x02u8]; // row 1 null
-        let v = ColumnView::Long(FixedColumn::<i64>::new(
-            &raw,
-            Validity::from_bitmap(&bm, 3),
-        ));
+        let v = ColumnView::Long(FixedColumn::<i64>::new(&raw, Validity::from_bitmap(&bm, 3)));
         assert!(!v.is_null(0));
         assert!(v.is_null(1));
         assert!(!v.is_null(2));

@@ -165,8 +165,7 @@ mod tests {
         assert_eq!(err.code(), ErrorCode::ConfigError);
         let err = AuthMode::from_parts(None, None, Some("t"), Some("v")).unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
-        let err =
-            AuthMode::from_parts(Some("u"), Some("p"), None, Some("v")).unwrap_err();
+        let err = AuthMode::from_parts(Some("u"), Some("p"), None, Some("v")).unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
     }
 

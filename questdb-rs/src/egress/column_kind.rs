@@ -88,8 +88,19 @@ impl ColumnKind {
             0x16 => ColumnKind::Char,
             0x17 => ColumnKind::Binary,
             0x18 => ColumnKind::Ipv4,
-            0x08 => return Err(fmt!(ProtocolError, "type code 0x08 is reserved (was STRING)")),
-            other => return Err(fmt!(ProtocolError, "unknown column type code 0x{:02X}", other)),
+            0x08 => {
+                return Err(fmt!(
+                    ProtocolError,
+                    "type code 0x08 is reserved (was STRING)"
+                ));
+            }
+            other => {
+                return Err(fmt!(
+                    ProtocolError,
+                    "unknown column type code 0x{:02X}",
+                    other
+                ));
+            }
         })
     }
 

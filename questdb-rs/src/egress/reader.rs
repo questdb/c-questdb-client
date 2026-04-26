@@ -144,9 +144,8 @@ impl Reader {
                 cfg.target
             ));
         }
-        Err(last_transport_err.unwrap_or_else(|| {
-            fmt!(SocketError, "all {} endpoints unreachable", cfg.addrs.len())
-        }))
+        Err(last_transport_err
+            .unwrap_or_else(|| fmt!(SocketError, "all {} endpoints unreachable", cfg.addrs.len())))
     }
 
     /// Read one frame and expect it to be `SERVER_INFO`; store it.
@@ -394,8 +393,12 @@ impl<'r> Cursor<'r> {
             let (header, payload) = self.reader.transport.read_frame()?;
             // Capture wire size BEFORE decode (header is consumed).
             let wire_bytes = HEADER_LEN as u64 + header.payload_length as u64;
-            let event =
-                decode_frame(header, &payload, &mut self.reader.dict, &mut self.reader.registry)?;
+            let event = decode_frame(
+                header,
+                &payload,
+                &mut self.reader.dict,
+                &mut self.reader.registry,
+            )?;
             match event {
                 ServerEvent::Batch(b) => {
                     if b.request_id != self.request_id {
@@ -428,19 +431,37 @@ impl<'r> Cursor<'r> {
                         schema,
                     }));
                 }
-                ServerEvent::End { request_id, final_seq, total_rows } => {
+                ServerEvent::End {
+                    request_id,
+                    final_seq,
+                    total_rows,
+                } => {
                     self.check_rid(request_id, "RESULT_END")?;
-                    self.terminal = Some(Terminal::End { final_seq, total_rows });
+                    self.terminal = Some(Terminal::End {
+                        final_seq,
+                        total_rows,
+                    });
                     self.reader.cursor_active = false;
                     return Ok(None);
                 }
-                ServerEvent::ExecDone { request_id, op_type, rows_affected } => {
+                ServerEvent::ExecDone {
+                    request_id,
+                    op_type,
+                    rows_affected,
+                } => {
                     self.check_rid(request_id, "EXEC_DONE")?;
-                    self.terminal = Some(Terminal::ExecDone { op_type, rows_affected });
+                    self.terminal = Some(Terminal::ExecDone {
+                        op_type,
+                        rows_affected,
+                    });
                     self.reader.cursor_active = false;
                     return Ok(None);
                 }
-                ServerEvent::Error { request_id, status, message } => {
+                ServerEvent::Error {
+                    request_id,
+                    status,
+                    message,
+                } => {
                     self.check_rid(request_id, "QUERY_ERROR")?;
                     self.reader.cursor_active = false;
                     return Err(map_server_status(status, message));
@@ -471,10 +492,7 @@ impl<'r> Cursor<'r> {
                 Ok(Some(_)) => {} // discarded
                 Ok(None) => break,
                 Err(e) => {
-                    if matches!(
-                        e.code(),
-                        crate::egress::ErrorCode::Cancelled
-                    ) {
+                    if matches!(e.code(), crate::egress::ErrorCode::Cancelled) {
                         break;
                     }
                     return Err(e);

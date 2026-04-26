@@ -238,9 +238,8 @@ impl QueryRequestBuilder {
             ));
         }
         for (i, bind) in self.binds.iter().enumerate() {
-            check_bindable(bind.kind()).map_err(|e| {
-                fmt!(InvalidBind, "bind ${}: {}", i + 1, e.msg())
-            })?;
+            check_bindable(bind.kind())
+                .map_err(|e| fmt!(InvalidBind, "bind ${}: {}", i + 1, e.msg()))?;
         }
         Ok(QueryRequest {
             request_id: self.request_id,
@@ -302,7 +301,7 @@ mod tests {
         expected.extend_from_slice(&[0x0F, 0x00]);
         expected.extend_from_slice(&0u32.to_le_bytes());
         expected.extend_from_slice(&2u32.to_le_bytes());
-        expected.extend_from_slice(&[b'h', b'i']);
+        expected.extend_from_slice(b"hi");
         expected.extend_from_slice(&[0x01, 0x01, 0x01]);
         assert_eq!(buf, expected);
     }

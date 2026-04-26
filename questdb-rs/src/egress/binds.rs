@@ -70,13 +70,21 @@ pub enum Bind {
     /// Typed NULL for BINARY (same offsets-array reason).
     NullBinary,
     /// Typed NULL for DECIMAL64 (scale must be on the wire).
-    NullDecimal64 { scale: i8 },
+    NullDecimal64 {
+        scale: i8,
+    },
     /// Typed NULL for DECIMAL128.
-    NullDecimal128 { scale: i8 },
+    NullDecimal128 {
+        scale: i8,
+    },
     /// Typed NULL for DECIMAL256.
-    NullDecimal256 { scale: i8 },
+    NullDecimal256 {
+        scale: i8,
+    },
     /// Typed NULL for GEOHASH (precision must be on the wire).
-    NullGeohash { precision_bits: u8 },
+    NullGeohash {
+        precision_bits: u8,
+    },
 
     // --- Value binds -------------------------------------------------------
     Bool(bool),
@@ -106,14 +114,26 @@ pub enum Bind {
     Char(u16),
     Ipv4(Ipv4Addr),
     /// QWP `DECIMAL64`: i64 mantissa + scale.
-    Decimal64 { value: i64, scale: i8 },
+    Decimal64 {
+        value: i64,
+        scale: i8,
+    },
     /// QWP `DECIMAL128`: i128 mantissa + scale.
-    Decimal128 { value: i128, scale: i8 },
+    Decimal128 {
+        value: i128,
+        scale: i8,
+    },
     /// QWP `DECIMAL256`: 32-byte LE mantissa + scale.
-    Decimal256 { bytes: [u8; 32], scale: i8 },
+    Decimal256 {
+        bytes: [u8; 32],
+        scale: i8,
+    },
     /// QWP `GEOHASH`: zero-extended u64 + precision_bits (1..60). The
     /// least-significant `ceil(precision_bits/8)` bytes are written.
-    Geohash { value: u64, precision_bits: u8 },
+    Geohash {
+        value: u64,
+        precision_bits: u8,
+    },
 }
 
 impl Bind {
@@ -243,7 +263,7 @@ pub fn encode_bind(bind: &Bind, out: &mut Vec<u8>) -> Result<()> {
             value,
             precision_bits,
         } => {
-            let bw = ((*precision_bits as usize) + 7) / 8;
+            let bw = (*precision_bits as usize).div_ceil(8);
             let bytes = value.to_le_bytes();
             out.extend_from_slice(&bytes[..bw]);
         }
@@ -258,9 +278,8 @@ fn write_varlen_offsets(byte_lens: &[usize], out: &mut Vec<u8>) -> Result<()> {
     let mut total: u32 = 0;
     out.extend_from_slice(&total.to_le_bytes());
     for &len in byte_lens {
-        let len32 = u32::try_from(len).map_err(|_| {
-            fmt!(InvalidBind, "varlen bind value too large: {} bytes", len)
-        })?;
+        let len32 = u32::try_from(len)
+            .map_err(|_| fmt!(InvalidBind, "varlen bind value too large: {} bytes", len))?;
         total = total
             .checked_add(len32)
             .ok_or_else(|| fmt!(InvalidBind, "varlen bind offsets overflow u32"))?;
@@ -496,10 +515,7 @@ mod tests {
     #[test]
     fn varchar_null_emits_single_zero_offset() {
         // 0x0F, 0x01, 0x01, [0u32]
-        assert_eq!(
-            enc(Bind::NullVarchar),
-            vec![0x0F, 0x01, 0x01, 0, 0, 0, 0]
-        );
+        assert_eq!(enc(Bind::NullVarchar), vec![0x0F, 0x01, 0x01, 0, 0, 0, 0]);
     }
 
     #[test]
@@ -549,13 +565,16 @@ mod tests {
             ColumnKind::Decimal256,
             ColumnKind::Geohash,
         ] {
-            check_bindable(k).expect(k.name());
+            check_bindable(k).unwrap_or_else(|_| panic!("{}", k.name()));
         }
     }
 
     #[test]
     fn null_bind_kind_preserved() {
-        assert_eq!(Bind::NullDecimal64 { scale: 0 }.kind(), ColumnKind::Decimal64);
+        assert_eq!(
+            Bind::NullDecimal64 { scale: 0 }.kind(),
+            ColumnKind::Decimal64
+        );
         assert_eq!(Bind::NullVarchar.kind(), ColumnKind::Varchar);
         assert_eq!(
             Bind::NullGeohash { precision_bits: 8 }.kind(),

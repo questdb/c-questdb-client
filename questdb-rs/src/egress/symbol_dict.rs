@@ -143,7 +143,11 @@ impl SymbolDict {
             let (entry_len, n) = varint::decode_usize(&bytes[cursor..])?;
             cursor += n;
             let end = cursor.checked_add(entry_len).ok_or_else(|| {
-                fmt!(ProtocolError, "symbol dict entry length overflow at i={}", i)
+                fmt!(
+                    ProtocolError,
+                    "symbol dict entry length overflow at i={}",
+                    i
+                )
             })?;
             if end > bytes.len() {
                 return Err(fmt!(

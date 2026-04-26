@@ -64,7 +64,7 @@ impl<'a> BitReader<'a> {
     /// Bytes consumed so far, rounded up — useful for advancing an outer
     /// byte cursor past the bitstream.
     pub fn bytes_consumed(&self) -> usize {
-        ((self.bits_read + 7) / 8) as usize
+        self.bits_read.div_ceil(8) as usize
     }
 
     /// Read one bit (0 or 1).
@@ -238,7 +238,10 @@ mod tests {
     fn over_64_bits_rejected() {
         let bytes = [0u8; 16];
         let mut r = BitReader::new(&bytes);
-        assert_eq!(r.read_bits(65).unwrap_err().code(), ErrorCode::ProtocolError);
+        assert_eq!(
+            r.read_bits(65).unwrap_err().code(),
+            ErrorCode::ProtocolError
+        );
     }
 
     #[test]
