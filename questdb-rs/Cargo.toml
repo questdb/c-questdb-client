@@ -42,6 +42,9 @@ ndarray = { version = "0.16", optional = true }
 rust_decimal = { version = "1.38.0", optional = true }
 bigdecimal = { version = "0.4.8", optional = true }
 
+# Sync WebSocket transport for QWP egress reader.
+tungstenite = { version = "0.27", default-features = false, features = ["handshake"], optional = true }
+
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3.9", features = ["ws2def"] }
 
@@ -58,6 +61,7 @@ chrono = "0.4.31"
 tempfile = "3"
 webpki-roots = "1.0.1"
 rstest = "0.26.1"
+tungstenite = { version = "0.27", default-features = false, features = ["handshake"] }
 
 [features]
 default = ["sync-sender", "tls-webpki-certs", "ring-crypto"]
@@ -104,8 +108,8 @@ rust_decimal = ["dep:rust_decimal"]
 ## Enable serialization of bigdecimal::BigDecimal in ILP
 bigdecimal = ["dep:bigdecimal"]
 
-## Sync QWP egress reader over WebSocket. (Transport implementation pending.)
-sync-reader-ws = ["_egress"]
+## Sync QWP egress reader over WebSocket (plain `ws://`).
+sync-reader-ws = ["_egress", "dep:tungstenite"]
 
 # Hidden derived features, used in code to enable-disable code sections. Don't use directly.
 _sender-tcp = []

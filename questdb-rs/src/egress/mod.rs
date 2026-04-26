@@ -40,8 +40,12 @@ pub mod decoder;
 pub mod error;
 pub mod query_request;
 pub mod schema;
+#[cfg(feature = "sync-reader-ws")]
+pub mod reader;
 pub mod server_event;
 pub mod symbol_dict;
+#[cfg(feature = "sync-reader-ws")]
+pub mod transport;
 pub mod wire;
 
 pub use auth::AuthMode;
@@ -57,6 +61,8 @@ pub use decoder::{ArrayBuffers, ColumnBuffer, DecodedBatch, DecodedColumn, decod
 pub use error::{Error, ErrorCode, Result};
 pub use query_request::{QueryRequest, QueryRequestBuilder};
 pub use schema::{DecodedSchema, Schema, SchemaColumn, SchemaMode, SchemaRegistry};
+#[cfg(feature = "sync-reader-ws")]
+pub use reader::{BatchView, Cursor, Reader, ReaderQuery, Terminal};
 pub use server_event::{ServerEvent, ServerInfo, ServerRole, decode_frame};
 pub use symbol_dict::SymbolDict;
 pub use wire::{FrameHeader, MsgKind, RESET_MASK_DICT, RESET_MASK_SCHEMAS, StatusCode};

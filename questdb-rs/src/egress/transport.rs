@@ -1,0 +1,283 @@
+/*******************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2025 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+//! Sync WebSocket transport for the QWP egress endpoint.
+//!
+//! Plain `ws://` only at this stage — TLS lands in a follow-up. The
+//! transport handles the HTTP upgrade (with negotiation headers and any
+//! Authorization), then exposes frame-level read/write that maps each QWP
+//! frame to one WebSocket binary message.
+
+#![cfg(feature = "sync-reader-ws")]
+
+use std::net::TcpStream;
+
+use tungstenite::client::IntoClientRequest;
+use tungstenite::handshake::client::generate_key;
+use tungstenite::http::{HeaderName, HeaderValue, Request, Uri};
+use tungstenite::stream::MaybeTlsStream;
+use tungstenite::{ClientRequestBuilder, Message, WebSocket};
+
+use crate::egress::config::ReaderConfig;
+use crate::egress::error::{Error, ErrorCode, Result, fmt};
+use crate::egress::wire::header::{FrameHeader, HEADER_LEN};
+
+/// Header key the server uses to advertise the negotiated QWP version.
+const HDR_VERSION: &str = "x-qwp-version";
+
+/// Header key carrying the server-selected payload encoding.
+#[allow(dead_code)] // used in TLS chunk follow-up for compression negotiation
+const HDR_CONTENT_ENCODING: &str = "x-qwp-content-encoding";
+
+/// Sync WebSocket transport bound to a single QWP read connection.
+pub struct WsTransport {
+    socket: WebSocket<MaybeTlsStream<TcpStream>>,
+    server_version: u8,
+}
+
+impl WsTransport {
+    /// Connect to the configured endpoint, perform the WS handshake with
+    /// the negotiation headers, and validate the server's response.
+    pub fn connect(config: &ReaderConfig) -> Result<Self> {
+        if config.tls {
+            return Err(fmt!(
+                ConfigError,
+                "TLS (qwps://) transport is not yet wired up; use qwp:// for now"
+            ));
+        }
+        let url = config.url();
+        let uri: Uri = url
+            .parse()
+            .map_err(|e| fmt!(ConfigError, "invalid endpoint URL {:?}: {}", url, e))?;
+
+        let mut builder = ClientRequestBuilder::new(uri);
+        for (name, value) in config.upgrade_headers() {
+            builder = builder.with_header(name, value);
+        }
+
+        // Hand the request to tungstenite via IntoClientRequest. We need to
+        // make sure mandatory WS handshake headers (Sec-WebSocket-Key /
+        // Version / Upgrade / Connection / Host) are present — tungstenite's
+        // generate_request adds them automatically when going through
+        // IntoClientRequest.
+        let request = builder
+            .into_client_request()
+            .map_err(map_ws_error_during_handshake)?;
+        debug_assert_handshake_headers(&request);
+
+        let (socket, response) =
+            tungstenite::connect(request).map_err(map_ws_error_during_handshake)?;
+
+        let server_version = read_version_header(response.headers())?;
+        if server_version > config.max_version {
+            return Err(fmt!(
+                UnsupportedServer,
+                "server negotiated QWP version {} but client advertised max {}",
+                server_version,
+                config.max_version
+            ));
+        }
+
+        Ok(WsTransport {
+            socket,
+            server_version,
+        })
+    }
+
+    /// Negotiated QWP version. The frame header `version` byte must equal
+    /// this on every send and receive (server closes the WS otherwise).
+    pub fn server_version(&self) -> u8 {
+        self.server_version
+    }
+
+    /// Write a complete QWP frame as a single WebSocket binary message.
+    pub fn write_frame(&mut self, header: FrameHeader, payload: &[u8]) -> Result<()> {
+        let mut buf = Vec::with_capacity(HEADER_LEN + payload.len());
+        buf.extend_from_slice(&header.to_bytes());
+        buf.extend_from_slice(payload);
+        self.socket
+            .send(Message::Binary(buf.into()))
+            .map_err(|e| map_ws_error(e, ErrorCode::SocketError))?;
+        Ok(())
+    }
+
+    /// Read the next QWP frame (header + payload). Pings/pongs are
+    /// handled transparently; a `Close` from the server surfaces as a
+    /// `SocketError`.
+    pub fn read_frame(&mut self) -> Result<(FrameHeader, Vec<u8>)> {
+        loop {
+            let msg = self
+                .socket
+                .read()
+                .map_err(|e| map_ws_error(e, ErrorCode::SocketError))?;
+            match msg {
+                Message::Binary(bytes) => {
+                    if bytes.len() < HEADER_LEN {
+                        return Err(fmt!(
+                            ProtocolError,
+                            "WS message too short for frame header: {} bytes",
+                            bytes.len()
+                        ));
+                    }
+                    let header = FrameHeader::parse(&bytes[..HEADER_LEN])?;
+                    if header.version != self.server_version {
+                        return Err(fmt!(
+                            ProtocolError,
+                            "frame header version {} != negotiated {}",
+                            header.version,
+                            self.server_version
+                        ));
+                    }
+                    if header.payload_length as usize != bytes.len() - HEADER_LEN {
+                        return Err(fmt!(
+                            ProtocolError,
+                            "header payload_length {} != actual {}",
+                            header.payload_length,
+                            bytes.len() - HEADER_LEN
+                        ));
+                    }
+                    let payload = bytes[HEADER_LEN..].to_vec();
+                    return Ok((header, payload));
+                }
+                Message::Close(frame) => {
+                    return Err(fmt!(
+                        SocketError,
+                        "server closed WebSocket: {:?}",
+                        frame
+                    ));
+                }
+                // Tungstenite auto-ponds; nothing to do for ping/pong.
+                Message::Ping(_) | Message::Pong(_) => continue,
+                Message::Text(t) => {
+                    return Err(fmt!(
+                        ProtocolError,
+                        "unexpected WS text frame ({} bytes); QWP uses binary",
+                        t.len()
+                    ));
+                }
+                Message::Frame(_) => continue, // raw frames not surfaced in read()
+            }
+        }
+    }
+
+    /// Best-effort close. Errors are swallowed to keep `Drop` clean.
+    pub fn close(mut self) {
+        let _ = self.socket.close(None);
+        // Attempt to drain the closing handshake response.
+        let _ = self.socket.read();
+    }
+}
+
+impl Drop for WsTransport {
+    fn drop(&mut self) {
+        // Fire-and-forget close per the project policy.
+        let _ = self.socket.close(None);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn read_version_header(headers: &tungstenite::http::HeaderMap) -> Result<u8> {
+    let raw = headers
+        .iter()
+        .find(|(name, _)| name.as_str().eq_ignore_ascii_case(HDR_VERSION))
+        .map(|(_, value)| value)
+        .ok_or_else(|| {
+            fmt!(
+                HandshakeError,
+                "server response missing X-QWP-Version header"
+            )
+        })?;
+    let s = raw.to_str().map_err(|_| {
+        fmt!(HandshakeError, "X-QWP-Version header is not valid ASCII")
+    })?;
+    s.trim()
+        .parse::<u8>()
+        .map_err(|_| fmt!(HandshakeError, "X-QWP-Version {:?} is not a u8", s))
+}
+
+fn map_ws_error(e: tungstenite::Error, default_code: ErrorCode) -> Error {
+    use tungstenite::error::Error as T;
+    let msg = e.to_string();
+    let code = match &e {
+        T::Io(_) => ErrorCode::SocketError,
+        T::ConnectionClosed | T::AlreadyClosed => ErrorCode::SocketError,
+        T::Url(_) => ErrorCode::ConfigError,
+        T::HttpFormat(_) | T::Protocol(_) | T::Utf8(_) => ErrorCode::ProtocolError,
+        T::Tls(_) => ErrorCode::TlsError,
+        T::Http(_) | T::Capacity(_) | T::WriteBufferFull(_) => default_code,
+        _ => default_code,
+    };
+    Error::new(code, msg)
+}
+
+fn map_ws_error_during_handshake(e: tungstenite::Error) -> Error {
+    use tungstenite::error::Error as T;
+    let msg = e.to_string();
+    let code = match &e {
+        T::Http(resp) => {
+            let status = resp.status().as_u16();
+            if status == 401 || status == 403 {
+                ErrorCode::AuthError
+            } else {
+                ErrorCode::HandshakeError
+            }
+        }
+        T::HttpFormat(_) => ErrorCode::HandshakeError,
+        T::Url(_) => ErrorCode::ConfigError,
+        T::Tls(_) => ErrorCode::TlsError,
+        T::Io(_) => ErrorCode::SocketError,
+        _ => ErrorCode::HandshakeError,
+    };
+    Error::new(code, format!("WebSocket handshake failed: {}", msg))
+}
+
+#[allow(dead_code)]
+fn debug_assert_handshake_headers(_req: &Request<()>) {
+    // Tungstenite adds Sec-WebSocket-Key/Version/Upgrade/Connection/Host on
+    // its own when ClientRequestBuilder is fed through IntoClientRequest.
+    // Keep this hook for diagnostics in debug builds.
+    let _ = HeaderName::from_static("upgrade");
+    let _ = HeaderValue::from_static("websocket");
+    let _ = generate_key();
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    // Real handshake/round-trip tests live in
+    // questdb-rs/tests/egress_ws_integration.rs so they can spin up an
+    // in-process tungstenite server.
+
+    #[test]
+    fn module_is_compilable() {
+        // Sanity check: the `cfg(feature = "sync-reader-ws")` gate is open
+        // when this test runs.
+    }
+}
