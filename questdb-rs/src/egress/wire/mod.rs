@@ -21,18 +21,13 @@
  *  limitations under the License.
  *
  ******************************************************************************/
-#![doc = include_str!("../README.md")]
 
-mod error;
+//! QWP wire codec primitives: frame header, varint, message kinds.
 
-#[cfg(feature = "sync-sender-tcp")]
-mod gai;
+pub mod header;
+pub mod msg_kind;
+pub mod varint;
 
-pub mod ingress;
-
-pub mod egress;
-
-pub use error::*;
-
-#[cfg(test)]
-mod tests;
+pub use header::{FrameHeader, HEADER_LEN, MAGIC, flags};
+pub use msg_kind::{MsgKind, StatusCode};
+pub use varint::{MAX_VARINT_LEN_U64, decode_u64, decode_usize, encode_u64};

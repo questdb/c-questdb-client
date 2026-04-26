@@ -21,18 +21,24 @@
  *  limitations under the License.
  *
  ******************************************************************************/
-#![doc = include_str!("../README.md")]
 
-mod error;
+//! QuestDB Wire Protocol (QWP) egress reader.
+//!
+//! Implements the client side of the QWP egress extension: a binary,
+//! columnar, WebSocket-based read protocol for streaming query results
+//! from QuestDB. This module currently contains the wire codec foundation
+//! (frame header, varint, message kinds, column type codes, errors).
+//! Transport, decoder, and `Reader`/`Cursor`/`Batch` types land in
+//! follow-up changes.
 
-#[cfg(feature = "sync-sender-tcp")]
-mod gai;
+pub mod binds;
+pub mod column_kind;
+pub mod error;
+pub mod query_request;
+pub mod wire;
 
-pub mod ingress;
-
-pub mod egress;
-
-pub use error::*;
-
-#[cfg(test)]
-mod tests;
+pub use binds::Bind;
+pub use column_kind::ColumnKind;
+pub use error::{Error, ErrorCode, Result};
+pub use query_request::{QueryRequest, QueryRequestBuilder};
+pub use wire::{FrameHeader, MsgKind, StatusCode};
