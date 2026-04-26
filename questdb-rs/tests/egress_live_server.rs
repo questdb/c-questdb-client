@@ -1517,6 +1517,158 @@ fn multi_batch_streaming() {
 }
 
 #[test]
+fn multi_batch_with_mixed_nulls_and_symbols() {
+    // Stresses the most-interesting decoder paths together:
+    //  - delta-dict on first batch, schema-reference after
+    //  - dense decoding of long with nulls (bitmap + values per row)
+    //  - dense decoding of symbol codes with nulls (codes only over
+    //    non-null rows on the wire, densified to per-row u32)
+    //  - cross-batch symbol resolution via the connection-scoped dict
+    //    (batch 2+ reference codes the dict already carries)
+    let srv = server();
+    let table = unique_table("mixed_nulls_multibatch");
+    // `flag` is a never-null filler so ILP always has at least one
+    // column to write per row; the SELECT below ignores it.
+    srv.http_exec(&format!(
+        "create table \"{}\" (s symbol, v long, flag boolean, ts timestamp) timestamp(ts) partition by day wal",
+        table
+    ));
+
+    const TOTAL: usize = 5_000;
+    const PER_BATCH: usize = 500;
+    const DISTINCT_SYMBOLS: usize = 50;
+    let symbols: Vec<String> = (0..DISTINCT_SYMBOLS).map(|i| format!("SYM{:03}", i)).collect();
+
+    let mut sender = make_sender(srv, ProtocolVersion::V2);
+    let mut buf = sender.new_buffer();
+    // Null cycles coprime with DISTINCT_SYMBOLS (50) so every symbol id
+    // is visited at least once on a non-null row.
+    for i in 0..TOTAL {
+        let null_sym = i % 11 == 0;
+        let null_v = i % 7 == 0;
+        let mut row = buf.table(table.as_str()).unwrap();
+        if !null_sym {
+            row = row.symbol("s", &symbols[i % DISTINCT_SYMBOLS]).unwrap();
+        }
+        if !null_v {
+            row = row.column_i64("v", i as i64 * 3).unwrap();
+        }
+        row.column_bool("flag", true)
+            .unwrap()
+            .at(TimestampNanos::new(
+                1_700_000_000_000_000_000 + i as i64 * 1_000_000,
+            ))
+            .unwrap();
+    }
+    sender.flush(&mut buf).expect("flush");
+    wait_for_rows(srv, &table, TOTAL);
+
+    let conf = format!("{};max_batch_rows={}", srv.qwp_conf(), PER_BATCH);
+    let mut reader = Reader::from_conf(&conf).expect("reader");
+    let mut cursor = reader
+        .query(&format!("select s, v from \"{}\" order by ts", table))
+        .execute()
+        .expect("execute");
+
+    let mut batch_count = 0usize;
+    let mut total_rows = 0usize;
+    let mut last_batch_seq: Option<u64> = None;
+    let mut total_null_sym = 0usize;
+    let mut total_null_v = 0usize;
+    let mut spot_checks_done = 0usize;
+
+    while let Some(view) = cursor.next_batch().expect("next_batch") {
+        batch_count += 1;
+        let rows = view.row_count();
+        total_rows += rows;
+
+        let seq = view.batch_seq();
+        if let Some(prev) = last_batch_seq {
+            assert!(seq > prev, "batch_seq must increase");
+        }
+        last_batch_seq = Some(seq);
+
+        let ColumnView::Symbol(s) = view.column(0).unwrap() else { panic!("col 0") };
+        let ColumnView::Long(v) = view.column(1).unwrap() else { panic!("col 1") };
+
+        // Walk the batch, validate per-row expectations against the
+        // pattern we inserted. Each batch must round-trip its own
+        // densified buffers correctly even though the dict was sent
+        // only on the first batch.
+        for r in 0..rows {
+            let global_row = total_rows - rows + r;
+            let null_sym_expected = global_row % 11 == 0;
+            let null_v_expected = global_row % 7 == 0;
+
+            // Symbol null bitmap.
+            assert_eq!(
+                s.is_null(r),
+                null_sym_expected,
+                "row {} sym null mismatch",
+                global_row
+            );
+            if null_sym_expected {
+                total_null_sym += 1;
+                assert_eq!(s.resolve(r), None);
+            } else {
+                let expected = &symbols[global_row % DISTINCT_SYMBOLS];
+                assert_eq!(
+                    s.resolve(r),
+                    Some(expected.as_str()),
+                    "row {} sym mismatch",
+                    global_row
+                );
+            }
+
+            // Long null bitmap + densified value.
+            assert_eq!(
+                v.is_null(r),
+                null_v_expected,
+                "row {} v null mismatch",
+                global_row
+            );
+            if null_v_expected {
+                total_null_v += 1;
+            } else {
+                assert_eq!(
+                    v.value(r),
+                    global_row as i64 * 3,
+                    "row {} v mismatch",
+                    global_row
+                );
+            }
+
+            spot_checks_done += 1;
+        }
+    }
+
+    eprintln!(
+        "[mixed_nulls_multibatch] batches={} rows={} null_sym={} null_v={}",
+        batch_count, total_rows, total_null_sym, total_null_v
+    );
+
+    assert_eq!(total_rows, TOTAL);
+    assert!(
+        batch_count >= TOTAL / PER_BATCH,
+        "expected at least {} batches, got {}",
+        TOTAL / PER_BATCH,
+        batch_count
+    );
+    // Sanity: pattern-implied null counts. div_ceil counts row indices
+    // 0, k, 2k, ... up to TOTAL-1.
+    assert_eq!(total_null_sym, TOTAL.div_ceil(11));
+    assert_eq!(total_null_v, TOTAL.div_ceil(7));
+    assert_eq!(spot_checks_done, TOTAL);
+
+    assert!(matches!(cursor.terminal(), Some(Terminal::End { .. })));
+    drop(cursor);
+
+    // Connection-scoped dict should carry exactly DISTINCT_SYMBOLS
+    // entries. (Batch 2+ used schema reference + no delta dict.)
+    assert_eq!(reader.symbol_dict().len(), DISTINCT_SYMBOLS);
+}
+
+#[test]
 fn null_handling_long_densifies() {
     let srv = server();
     let table = unique_table("nulls");
