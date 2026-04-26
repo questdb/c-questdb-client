@@ -55,6 +55,11 @@ pub enum ErrorCode {
     /// Server returned an unsupported QWP version, encoding, or capability.
     UnsupportedServer,
 
+    /// All endpoints connected, but none advertised a role matching the
+    /// configured `target` filter (e.g. `target=replica` against a
+    /// single-node OSS server that emits `STANDALONE`).
+    RoleMismatch,
+
     /// Wire-format violation: bad magic, truncated frame, unknown discriminant,
     /// invalid varint, schema/symbol-dict reference miss, etc.
     ProtocolError,

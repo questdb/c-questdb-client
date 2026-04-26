@@ -109,8 +109,10 @@ pub enum TlsVerify {
 /// Fully validated reader configuration.
 #[derive(Debug, Clone)]
 pub struct ReaderConfig {
-    pub host: String,
-    pub port: u16,
+    /// Endpoints to walk on connect, in order. The Reader tries each
+    /// until one accepts the WS handshake and (when v2) advertises a
+    /// role matching `target`.
+    pub addrs: Vec<(String, u16)>,
     pub tls: bool,
     pub path: String,
     pub max_version: u8,
@@ -145,27 +147,49 @@ impl ReaderConfig {
         };
         let params = conf.params();
 
-        // Required: addr
+        // Required: addr (single `host[:port]` or comma-separated list)
         let addr = params.get("addr").ok_or_else(|| {
             fmt!(ConfigError, "Missing \"addr\" parameter in config string")
         })?;
-        let (host, port_str) = match addr.split_once(':') {
-            Some((h, p)) => (h.to_string(), p.to_string()),
-            None => (
-                addr.clone(),
-                if tls {
-                    DEFAULT_TLS_PORT.to_string()
-                } else {
-                    DEFAULT_PLAIN_PORT.to_string()
-                },
-            ),
+        let default_port = if tls {
+            DEFAULT_TLS_PORT
+        } else {
+            DEFAULT_PLAIN_PORT
         };
-        if host.is_empty() {
-            return Err(fmt!(ConfigError, "Empty host in \"addr\" parameter"));
+        let mut addrs: Vec<(String, u16)> = Vec::new();
+        for (i, entry) in addr.split(',').map(str::trim).enumerate() {
+            if entry.is_empty() {
+                return Err(fmt!(
+                    ConfigError,
+                    "Empty entry {} in \"addr\" list",
+                    i
+                ));
+            }
+            let (host, port_str) = match entry.rsplit_once(':') {
+                Some((h, p)) => (h.to_string(), p.to_string()),
+                None => (entry.to_string(), default_port.to_string()),
+            };
+            if host.is_empty() {
+                return Err(fmt!(
+                    ConfigError,
+                    "Empty host in \"addr\" entry {}: {:?}",
+                    i,
+                    entry
+                ));
+            }
+            let port: u16 = port_str.parse().map_err(|_| {
+                fmt!(
+                    ConfigError,
+                    "Invalid port in \"addr\" entry {}: {:?}",
+                    i,
+                    entry
+                )
+            })?;
+            addrs.push((host, port));
         }
-        let port: u16 = port_str
-            .parse()
-            .map_err(|_| fmt!(ConfigError, "Invalid port in \"addr\": {}", port_str))?;
+        if addrs.is_empty() {
+            return Err(fmt!(ConfigError, "\"addr\" parameter is empty"));
+        }
 
         // Optional / typed
         let mut path: String = DEFAULT_PATH.to_string();
@@ -323,8 +347,7 @@ impl ReaderConfig {
         )?;
 
         Ok(ReaderConfig {
-            host,
-            port,
+            addrs,
             tls,
             path,
             max_version,
@@ -340,10 +363,17 @@ impl ReaderConfig {
         })
     }
 
-    /// Build the URL for the WebSocket upgrade.
-    pub fn url(&self) -> String {
+    /// Build the URL for the WebSocket upgrade against the endpoint at
+    /// `idx` in [`addrs`](Self::addrs). Panics if `idx` is out of range.
+    pub fn url_for(&self, idx: usize) -> String {
+        let (host, port) = &self.addrs[idx];
         let scheme = if self.tls { "wss" } else { "ws" };
-        format!("{}://{}:{}{}", scheme, self.host, self.port, self.path)
+        format!("{}://{}:{}{}", scheme, host, port, self.path)
+    }
+
+    /// First endpoint URL — convenience for single-addr configs.
+    pub fn url(&self) -> String {
+        self.url_for(0)
     }
 
     /// Build the negotiation headers as `(name, value)` pairs in the order
@@ -409,8 +439,8 @@ mod tests {
     #[test]
     fn minimal_plain_conf() {
         let c = ReaderConfig::from_conf("qwp::addr=localhost:9000").unwrap();
-        assert_eq!(c.host, "localhost");
-        assert_eq!(c.port, 9000);
+        assert_eq!(c.addrs.len(), 1);
+        assert_eq!(c.addrs[0], ("localhost".to_string(), 9000));
         assert!(!c.tls);
         assert_eq!(c.path, DEFAULT_PATH);
         assert_eq!(c.max_version, HIGHEST_KNOWN_VERSION);
@@ -499,6 +529,25 @@ mod tests {
     }
 
     #[test]
+    fn multi_addr_parses() {
+        let c = ReaderConfig::from_conf(
+            "qwp::addr=h1:9000,h2:9001,h3,h4:9999;",
+        )
+        .unwrap();
+        assert_eq!(c.addrs.len(), 4);
+        assert_eq!(c.addrs[0], ("h1".to_string(), 9000));
+        assert_eq!(c.addrs[1], ("h2".to_string(), 9001));
+        assert_eq!(c.addrs[2], ("h3".to_string(), 9000)); // default port
+        assert_eq!(c.addrs[3], ("h4".to_string(), 9999));
+    }
+
+    #[test]
+    fn empty_addr_entry_rejected() {
+        let err = ReaderConfig::from_conf("qwp::addr=h1:9000,,h2:9001;").unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+    }
+
+    #[test]
     fn target_invalid_rejected() {
         let err = ReaderConfig::from_conf("qwp::addr=h:1;target=leader").unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
@@ -544,7 +593,7 @@ mod tests {
     #[test]
     fn default_port_when_omitted() {
         let c = ReaderConfig::from_conf("qwp::addr=localhost").unwrap();
-        assert_eq!(c.port, 9000);
+        assert_eq!(c.addrs[0].1, 9000);
     }
 
     #[test]
@@ -580,6 +629,6 @@ mod tests {
             "qwp::addr=h:1;failover=on;failover_max_attempts=3;failover_backoff_initial_ms=100;failover_backoff_max_ms=2000",
         )
         .unwrap();
-        assert_eq!(c.host, "h");
+        assert_eq!(c.addrs[0].0, "h");
     }
 }

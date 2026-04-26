@@ -35,12 +35,12 @@ use std::net::Ipv4Addr;
 use crate::egress::binds::Bind;
 use crate::egress::column::ColumnView;
 use crate::egress::column_kind::ColumnKind;
-use crate::egress::config::ReaderConfig;
+use crate::egress::config::{ReaderConfig, Target};
 use crate::egress::decoder::DecodedBatch;
 use crate::egress::error::{Result, fmt};
 use crate::egress::query_request::{QueryRequest, QueryRequestBuilder};
 use crate::egress::schema::{Schema, SchemaRegistry};
-use crate::egress::server_event::{ServerEvent, decode_frame};
+use crate::egress::server_event::{ServerEvent, ServerInfo, ServerRole, decode_frame};
 use crate::egress::symbol_dict::SymbolDict;
 use crate::egress::transport::WsTransport;
 use crate::egress::wire::header::HEADER_LEN;
@@ -59,6 +59,10 @@ pub struct Reader {
     registry: SchemaRegistry,
     next_request_id: i64,
     cursor_active: bool,
+    /// Server's `SERVER_INFO` (`0x18`) — `None` when negotiated v1.
+    /// Captured eagerly during connect so multi-addr role filtering
+    /// can dismiss endpoints whose role doesn't match `target`.
+    server_info: Option<ServerInfo>,
 }
 
 impl Reader {
@@ -68,16 +72,104 @@ impl Reader {
         Self::from_config(&cfg)
     }
 
-    /// Open a new connection using an already-built [`ReaderConfig`].
+    /// Walk `cfg.addrs` in order, opening each endpoint and eagerly
+    /// consuming the v2 `SERVER_INFO` frame. Accepts the first endpoint
+    /// whose role matches `cfg.target`. Returns:
+    ///
+    /// - `RoleMismatch` if every endpoint connected but none advertised
+    ///   a matching role (last-seen role surfaced in the message).
+    /// - `SocketError` if every endpoint failed at the transport layer
+    ///   (refused / timed out / TLS error / etc.).
+    /// - whatever the last attempt returned otherwise.
     pub fn from_config(cfg: &ReaderConfig) -> Result<Self> {
-        let transport = WsTransport::connect(cfg)?;
-        Ok(Reader {
-            transport,
-            dict: SymbolDict::new(),
-            registry: SchemaRegistry::new(),
-            next_request_id: 1,
-            cursor_active: false,
-        })
+        let mut last_transport_err: Option<crate::egress::Error> = None;
+        let mut last_mismatched: Option<ServerInfo> = None;
+        let mut saw_v1_with_filter = false;
+
+        for idx in 0..cfg.addrs.len() {
+            let transport = match WsTransport::connect_to(cfg, idx) {
+                Ok(t) => t,
+                Err(e) => {
+                    last_transport_err = Some(e);
+                    continue;
+                }
+            };
+            let mut reader = Reader {
+                transport,
+                dict: SymbolDict::new(),
+                registry: SchemaRegistry::new(),
+                next_request_id: 1,
+                cursor_active: false,
+                server_info: None,
+            };
+            // Eagerly consume the unsolicited SERVER_INFO frame on v2+.
+            if reader.transport.server_version() >= 2 {
+                match reader.consume_server_info() {
+                    Ok(()) => {}
+                    Err(e) => {
+                        last_transport_err = Some(e);
+                        continue;
+                    }
+                }
+            }
+
+            // Role filter.
+            if !matches!(cfg.target, Target::Any) {
+                let Some(info) = reader.server_info.as_ref() else {
+                    // v1 server can't satisfy a specific-role filter.
+                    saw_v1_with_filter = true;
+                    continue;
+                };
+                if !target_matches(cfg.target, info.role) {
+                    last_mismatched = Some(info.clone());
+                    continue;
+                }
+            }
+            return Ok(reader);
+        }
+
+        if let Some(info) = last_mismatched {
+            return Err(fmt!(
+                RoleMismatch,
+                "no endpoint matches target={:?}; last observed role={:?} cluster={:?}",
+                cfg.target,
+                info.role,
+                info.cluster_id
+            ));
+        }
+        if saw_v1_with_filter {
+            return Err(fmt!(
+                RoleMismatch,
+                "no endpoint matches target={:?}; at least one endpoint negotiated v1 and cannot supply a role",
+                cfg.target
+            ));
+        }
+        Err(last_transport_err.unwrap_or_else(|| {
+            fmt!(SocketError, "all {} endpoints unreachable", cfg.addrs.len())
+        }))
+    }
+
+    /// Read one frame and expect it to be `SERVER_INFO`; store it.
+    fn consume_server_info(&mut self) -> Result<()> {
+        let (header, payload) = self.transport.read_frame()?;
+        let event = decode_frame(header, &payload, &mut self.dict, &mut self.registry)?;
+        match event {
+            ServerEvent::ServerInfo(info) => {
+                self.server_info = Some(info);
+                Ok(())
+            }
+            other => Err(fmt!(
+                ProtocolError,
+                "expected SERVER_INFO as first v2 frame, got {:?}",
+                std::mem::discriminant(&other)
+            )),
+        }
+    }
+
+    /// `SERVER_INFO` (`0x18`) captured at connect time, when negotiated
+    /// version >= 2. `None` for v1 servers.
+    pub fn server_info(&self) -> Option<&ServerInfo> {
+        self.server_info.as_ref()
     }
 
     /// Negotiated QWP version this connection is using.
@@ -470,6 +562,20 @@ impl<'c> BatchView<'c> {
     /// Project a single column to a typed view.
     pub fn column(&self, idx: usize) -> Result<ColumnView<'_>> {
         self.decoded.column_view(idx, self.dict)
+    }
+}
+
+/// Per the Java reference (`QwpQueryClient.matchesTarget`):
+/// `STANDALONE` counts as `PRIMARY` so single-node OSS deployments work
+/// with `target=primary`.
+fn target_matches(target: Target, role: ServerRole) -> bool {
+    match target {
+        Target::Any => true,
+        Target::Primary => matches!(
+            role,
+            ServerRole::Primary | ServerRole::PrimaryCatchup | ServerRole::Standalone
+        ),
+        Target::Replica => matches!(role, ServerRole::Replica),
     }
 }
 

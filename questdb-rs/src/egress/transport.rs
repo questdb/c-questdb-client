@@ -57,14 +57,23 @@ pub struct WsTransport {
 }
 
 impl WsTransport {
-    /// Connect to the configured endpoint, perform the WS handshake with
-    /// the negotiation headers, and validate the server's response.
+    /// Connect to the first endpoint in `config.addrs`. Convenience for
+    /// single-addr configs; multi-addr callers (with target filtering)
+    /// use [`connect_to`](Self::connect_to) per endpoint.
     pub fn connect(config: &ReaderConfig) -> Result<Self> {
-        // TLS uses tungstenite's bundled rustls + webpki-roots. Custom
-        // roots (`tls_roots`/`tls_roots_password`) and `tls_verify=unsafe_off`
-        // are not yet honoured — they're parsed and rejected as configured
-        // by `ReaderConfig`, but a future commit will build a custom
-        // `rustls::ClientConfig` and pass it via `tungstenite::Connector`.
+        Self::connect_to(config, 0)
+    }
+
+    /// Connect to a specific endpoint in `config.addrs` by index.
+    pub fn connect_to(config: &ReaderConfig, addr_idx: usize) -> Result<Self> {
+        if addr_idx >= config.addrs.len() {
+            return Err(fmt!(
+                ConfigError,
+                "addr index {} out of range ({} endpoints)",
+                addr_idx,
+                config.addrs.len()
+            ));
+        }
         if config.tls
             && (config.tls_roots.is_some()
                 || config.tls_roots_password.is_some()
@@ -75,7 +84,7 @@ impl WsTransport {
                 "custom tls_roots / tls_verify=unsafe_off are not yet honoured by the WebSocket transport"
             ));
         }
-        let url = config.url();
+        let url = config.url_for(addr_idx);
         let uri: Uri = url
             .parse()
             .map_err(|e| fmt!(ConfigError, "invalid endpoint URL {:?}: {}", url, e))?;

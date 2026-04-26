@@ -1392,6 +1392,77 @@ fn bind_null_geohash_with_precision() {
 // Lifecycle
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Failover / target routing (connect-time only; mid-query failover needs
+// a real cluster and is out of scope for OSS single-node testing).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn server_info_exposes_role() {
+    let srv = server();
+    let reader = make_reader(srv);
+    let info = reader.server_info().expect("v2 server must emit SERVER_INFO");
+    // Single-node OSS emits STANDALONE; cluster_id and node_id are
+    // cluster-only fields and may be empty.
+    assert_eq!(info.role, questdb::egress::ServerRole::Standalone);
+    eprintln!(
+        "[server_info] role={:?} cluster_id={:?} node_id={:?} epoch={}",
+        info.role, info.cluster_id, info.node_id, info.epoch
+    );
+}
+
+#[test]
+fn target_primary_accepts_standalone() {
+    // STANDALONE counts as PRIMARY for routing — single-node OSS works
+    // with target=primary out of the box.
+    let srv = server();
+    let conf = format!("{};target=primary", srv.qwp_conf());
+    let mut reader = Reader::from_conf(&conf).expect("connect with target=primary");
+    let info = reader.server_info().expect("server_info");
+    assert_eq!(info.role, questdb::egress::ServerRole::Standalone);
+    // Connection works for queries.
+    let mut cur = reader.query("select 1").execute().expect("execute");
+    let view = cur.next_batch().expect("next").expect("Some");
+    assert_eq!(view.row_count(), 1);
+}
+
+#[test]
+fn target_replica_rejects_standalone() {
+    // target=replica wants a REPLICA-role node; STANDALONE doesn't
+    // match, so the connect-time walk should reject every endpoint.
+    let srv = server();
+    let conf = format!("{};target=replica", srv.qwp_conf());
+    match Reader::from_conf(&conf) {
+        Err(e) => {
+            assert_eq!(e.code(), questdb::egress::ErrorCode::RoleMismatch);
+            assert!(
+                e.msg().contains("Replica") || e.msg().to_lowercase().contains("replica"),
+                "expected target name in message; got {:?}",
+                e.msg()
+            );
+        }
+        Ok(_) => panic!("expected RoleMismatch against STANDALONE server"),
+    }
+}
+
+#[test]
+fn multi_addr_walks_past_unreachable_endpoint() {
+    // First addr is a non-listening loopback port; second is the real
+    // server. The walk should fall through to the live one.
+    let srv = server();
+    let conf = format!(
+        "qwp::addr=127.0.0.1:1,127.0.0.1:{}",
+        srv.http_port
+    );
+    let mut reader = Reader::from_conf(&conf).expect("walk past unreachable");
+    let info = reader.server_info().expect("server_info");
+    assert_eq!(info.role, questdb::egress::ServerRole::Standalone);
+    // Connection actually works.
+    let mut cur = reader.query("select 1").execute().expect("execute");
+    let view = cur.next_batch().expect("next").expect("Some");
+    assert_eq!(view.row_count(), 1);
+}
+
 #[test]
 fn credit_flow_control_keeps_server_streaming() {
     // Sets a per-request initial_credit that's smaller than the data
