@@ -281,6 +281,12 @@ pub enum line_sender_protocol {
 
     /// QuestWire Protocol over UDP.
     line_sender_protocol_qwpudp,
+
+    /// QuestWire Protocol over WebSocket.
+    line_sender_protocol_qwpws,
+
+    /// QuestWire Protocol over WebSocket Secure (TLS).
+    line_sender_protocol_qwpwss,
 }
 
 impl From<Protocol> for line_sender_protocol {
@@ -291,6 +297,8 @@ impl From<Protocol> for line_sender_protocol {
             Protocol::Http => line_sender_protocol::line_sender_protocol_http,
             Protocol::Https => line_sender_protocol::line_sender_protocol_https,
             Protocol::QwpUdp => line_sender_protocol::line_sender_protocol_qwpudp,
+            Protocol::QwpWs => line_sender_protocol::line_sender_protocol_qwpws,
+            Protocol::QwpWss => line_sender_protocol::line_sender_protocol_qwpwss,
         }
     }
 }
@@ -303,6 +311,8 @@ impl From<line_sender_protocol> for Protocol {
             line_sender_protocol::line_sender_protocol_http => Protocol::Http,
             line_sender_protocol::line_sender_protocol_https => Protocol::Https,
             line_sender_protocol::line_sender_protocol_qwpudp => Protocol::QwpUdp,
+            line_sender_protocol::line_sender_protocol_qwpws => Protocol::QwpWs,
+            line_sender_protocol::line_sender_protocol_qwpwss => Protocol::QwpWss,
         }
     }
 }

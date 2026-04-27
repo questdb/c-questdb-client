@@ -111,14 +111,63 @@ impl Default for QwpUdpConfig {
     }
 }
 
-#[cfg(feature = "_sender-http")]
+#[cfg(feature = "_sender-qwp-ws")]
+#[derive(Debug, Clone)]
+pub(crate) struct QwpWsConfig {
+    pub(crate) connect_timeout: ConfigSetting<std::time::Duration>,
+    pub(crate) request_timeout: ConfigSetting<std::time::Duration>,
+    pub(crate) client_id: ConfigSetting<Option<String>>,
+    pub(crate) max_protocol_version: ConfigSetting<u32>,
+    pub(crate) request_durable_ack: ConfigSetting<bool>,
+    /// Maximum number of unacknowledged messages in flight on a single
+    /// pipelined async sender. Matches the spec's per-connection cap.
+    pub(crate) max_in_flight: ConfigSetting<usize>,
+    /// Whether to auto-reconnect and replay on transport-level failures.
+    /// When `true` (the default), a transport error during flush triggers a
+    /// bounded reconnect loop; the sender stays usable. When `false`, the
+    /// first transport error latches a sticky terminal failure and the user
+    /// must discard the sender.
+    pub(crate) failover: ConfigSetting<bool>,
+    /// Maximum number of reconnect attempts per failed flush.
+    pub(crate) max_failover_attempts: ConfigSetting<u32>,
+    /// First reconnect delay; doubles up to `failover_max_backoff` per attempt.
+    pub(crate) failover_initial_backoff: ConfigSetting<std::time::Duration>,
+    /// Cap on the per-attempt reconnect delay.
+    pub(crate) failover_max_backoff: ConfigSetting<std::time::Duration>,
+    /// Total wall-clock budget for the reconnect loop; once exceeded the
+    /// failover gives up even if attempts remain.
+    pub(crate) failover_total_budget: ConfigSetting<std::time::Duration>,
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+impl Default for QwpWsConfig {
+    fn default() -> Self {
+        Self {
+            connect_timeout: ConfigSetting::new_default(std::time::Duration::from_secs(10)),
+            request_timeout: ConfigSetting::new_default(std::time::Duration::from_secs(30)),
+            client_id: ConfigSetting::new_default(None),
+            max_protocol_version: ConfigSetting::new_default(1),
+            request_durable_ack: ConfigSetting::new_default(false),
+            max_in_flight: ConfigSetting::new_default(128),
+            failover: ConfigSetting::new_default(true),
+            max_failover_attempts: ConfigSetting::new_default(3),
+            failover_initial_backoff: ConfigSetting::new_default(
+                std::time::Duration::from_millis(100),
+            ),
+            failover_max_backoff: ConfigSetting::new_default(std::time::Duration::from_secs(5)),
+            failover_total_budget: ConfigSetting::new_default(std::time::Duration::from_secs(30)),
+        }
+    }
+}
+
+#[cfg(any(feature = "_sender-http", feature = "_sender-qwp-ws"))]
 #[derive(PartialEq, Debug, Clone)]
 pub(crate) struct BasicAuthParams {
     pub(crate) username: String,
     pub(crate) password: String,
 }
 
-#[cfg(feature = "_sender-http")]
+#[cfg(any(feature = "_sender-http", feature = "_sender-qwp-ws"))]
 impl BasicAuthParams {
     pub(crate) fn to_header_string(&self) -> String {
         use base64ct::{Base64, Encoding};
@@ -128,13 +177,13 @@ impl BasicAuthParams {
     }
 }
 
-#[cfg(feature = "_sender-http")]
+#[cfg(any(feature = "_sender-http", feature = "_sender-qwp-ws"))]
 #[derive(PartialEq, Debug, Clone)]
 pub(crate) struct TokenAuthParams {
     pub(crate) token: String,
 }
 
-#[cfg(feature = "_sender-http")]
+#[cfg(any(feature = "_sender-http", feature = "_sender-qwp-ws"))]
 impl TokenAuthParams {
     pub(crate) fn to_header_string(&self) -> crate::Result<String> {
         if self.token.contains('\n') {
@@ -161,9 +210,9 @@ pub(crate) enum AuthParams {
     #[cfg(feature = "_sender-tcp")]
     Ecdsa(EcdsaAuthParams),
 
-    #[cfg(feature = "_sender-http")]
+    #[cfg(any(feature = "_sender-http", feature = "_sender-qwp-ws"))]
     Basic(BasicAuthParams),
 
-    #[cfg(feature = "_sender-http")]
+    #[cfg(any(feature = "_sender-http", feature = "_sender-qwp-ws"))]
     Token(TokenAuthParams),
 }

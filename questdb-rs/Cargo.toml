@@ -41,6 +41,8 @@ rand = { version = "0.9.0", optional = true }
 ndarray = { version = "0.16", optional = true }
 rust_decimal = { version = "1.38.0", optional = true }
 bigdecimal = { version = "0.4.8", optional = true }
+tokio = { version = "1.40", default-features = false, features = ["rt", "net", "io-util", "time", "macros", "sync"], optional = true }
+tokio-rustls = { version = "0.26", default-features = false, optional = true }
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3.9", features = ["ws2def"] }
@@ -63,8 +65,13 @@ proptest = "1.6.0"
 [features]
 default = ["sync-sender", "tls-webpki-certs", "ring-crypto"]
 
-## Sync senders: ILP/TCP + ILP/HTTP + QWP/UDP
-sync-sender = ["sync-sender-tcp", "sync-sender-http", "sync-sender-qwp-udp"]
+## Sync senders: ILP/TCP + ILP/HTTP + QWP/UDP + QWP/WS
+sync-sender = [
+    "sync-sender-tcp",
+    "sync-sender-http",
+    "sync-sender-qwp-udp",
+    "sync-sender-qwp-ws",
+]
 
 ## Sync ILP/TCP
 sync-sender-tcp = ["_sync-sender", "_sender-tcp", "dep:socket2"]
@@ -81,6 +88,18 @@ sync-sender-http = [
 ## Sync QWP/UDP
 sync-sender-qwp-udp = ["_sync-sender", "_sender-qwp-udp", "dep:socket2"]
 
+## Sync QWP/WebSocket
+sync-sender-qwp-ws = ["_sync-sender", "_sender-qwp-ws", "dep:rand"]
+
+## Async QWP/WebSocket (tokio runtime)
+async-sender-qwp-ws = [
+    "_async-sender",
+    "_sender-qwp-ws",
+    "dep:rand",
+    "dep:tokio",
+    "dep:tokio-rustls",
+]
+
 ## Allow use OS-provided root TLS certificates
 tls-native-certs = ["dep:rustls-native-certs"]
 
@@ -88,10 +107,18 @@ tls-native-certs = ["dep:rustls-native-certs"]
 tls-webpki-certs = ["dep:webpki-roots"]
 
 ## Use `aws-lc-rs` as the cryto library.
-aws-lc-crypto = ["dep:aws-lc-rs", "rustls/aws-lc-rs"]
+aws-lc-crypto = [
+    "dep:aws-lc-rs",
+    "rustls/aws-lc-rs",
+    "tokio-rustls?/aws-lc-rs",
+]
 
 ## Use `ring` as the crypto library.
-ring-crypto = ["dep:ring", "rustls/ring"]
+ring-crypto = [
+    "dep:ring",
+    "rustls/ring",
+    "tokio-rustls?/ring",
+]
 
 ## Allow skipping verification of insecure certificates.
 insecure-skip-verify = []
@@ -112,7 +139,9 @@ bigdecimal = ["dep:bigdecimal"]
 _sender-tcp = []
 _sender-http = []
 _sender-qwp-udp = []
+_sender-qwp-ws = []
 _sync-sender = []
+_async-sender = []
 
 ## Enable all cross-compatible features.
 ## The `aws-lc-crypto` and `ring-crypto` features are mutually exclusive,
@@ -121,6 +150,7 @@ _sync-sender = []
 ## This is useful for quickly running `cargo test` or `cargo clippy`.
 almost-all-features = [
     "sync-sender",
+    "async-sender-qwp-ws",
     "tls-webpki-certs",
     "tls-native-certs",
     "ring-crypto",

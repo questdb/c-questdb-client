@@ -38,6 +38,13 @@ pub(crate) mod qwp_decode;
 
 #[cfg(feature = "sync-sender-qwp-udp")]
 mod qwp_mock;
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+mod qwp_ws;
+
+#[cfg(feature = "async-sender-qwp-ws")]
+mod qwp_ws_async;
+
 mod sender;
 
 mod decimal;

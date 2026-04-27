@@ -84,7 +84,7 @@ pub enum ErrorCode {
 }
 
 /// An error that occurred when using QuestDB client library.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct Error {
     code: ErrorCode,
     msg: String,

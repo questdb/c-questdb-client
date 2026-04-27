@@ -73,6 +73,8 @@ const _: () = assert!(QWP_MESSAGE_HEADER_SIZE == 12);
 const _: () = assert!(MAX_ARRAY_DIMS <= u8::MAX as usize);
 
 pub(crate) const QWP_SCHEMA_MODE_FULL: u8 = 0x00;
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) const QWP_SCHEMA_MODE_REFERENCE: u8 = 0x01;
 pub(crate) const QWP_TYPE_BOOLEAN: u8 = 0x01;
 pub(crate) const QWP_TYPE_DOUBLE: u8 = 0x07;
 pub(crate) const QWP_TYPE_LONG: u8 = 0x05;
@@ -1827,6 +1829,330 @@ impl QwpSendScratch {
             datagram: Vec::with_capacity(max_datagram_size),
         }
     }
+}
+
+// --- WebSocket (delta-symbol-dict) encoder ---
+
+#[cfg(feature = "_sender-qwp-ws")]
+const QWP_FLAG_DELTA_SYMBOL_DICT: u8 = 0x08;
+
+/// Connection-scoped global symbol dictionary used by the QWP/WebSocket
+/// transport's delta-symbol-dict mode.
+///
+/// The dictionary is owned by the sender and lives for the duration of the
+/// WebSocket connection. New symbols added during a flush are recorded in the
+/// per-message delta section so the server can rebuild the same global
+/// dictionary; on reconnect both sides reset.
+#[cfg(feature = "_sender-qwp-ws")]
+#[derive(Debug, Default)]
+pub(crate) struct SymbolGlobalDict {
+    map: std::collections::HashMap<Vec<u8>, u64>,
+    next_id: u64,
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+impl SymbolGlobalDict {
+    pub(crate) fn new() -> Self {
+        Self {
+            map: std::collections::HashMap::new(),
+            next_id: 0,
+        }
+    }
+
+    pub(crate) fn len(&self) -> u64 {
+        self.next_id
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn reset(&mut self) {
+        self.map.clear();
+        self.next_id = 0;
+    }
+
+    /// Returns `(global_id, is_new)`.
+    fn intern(&mut self, bytes: &[u8]) -> (u64, bool) {
+        if let Some(&id) = self.map.get(bytes) {
+            return (id, false);
+        }
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.map.insert(bytes.to_vec(), id);
+        (id, true)
+    }
+}
+
+/// Reusable scratch buffers for encoding a single QWP/WebSocket message.
+#[cfg(feature = "_sender-qwp-ws")]
+#[derive(Default)]
+pub(crate) struct QwpWsEncodeScratch {
+    pub(crate) message: Vec<u8>,
+    /// Per-segment, per-column-local-index mapping to global symbol IDs.
+    /// Populated during the pre-pass of `encode_ws_message` and consumed by
+    /// the symbol-column writer.
+    per_segment_symbol_globals: Vec<Vec<Vec<u64>>>,
+    /// Reusable buffer holding the on-the-wire bytes of one schema's column
+    /// definitions: `(varint name_len, name, type_code)*`. Doubles as the
+    /// signature key for the schema registry and as the payload to splice into
+    /// the message in full mode, avoiding a second pass over the columns.
+    schema_signature: Vec<u8>,
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+impl QwpWsEncodeScratch {
+    pub(crate) fn new() -> Self {
+        Self {
+            message: Vec::with_capacity(16 * 1024),
+            per_segment_symbol_globals: Vec::new(),
+            schema_signature: Vec::new(),
+        }
+    }
+}
+
+/// Connection-scoped schema registry used by the QWP/WebSocket transport's
+/// reference-mode schemas (§9). The first time a particular column-set
+/// signature is seen on a connection, the encoder assigns a fresh id and emits
+/// it in full mode; subsequent batches with the same signature emit reference
+/// mode (just the id), saving the per-message column-definition bytes.
+///
+/// Two tables that happen to have the same column shape may share an id — the
+/// server's registry stores the column set only, and the table name lives in
+/// the table header.
+#[cfg(feature = "_sender-qwp-ws")]
+#[derive(Debug, Default)]
+pub(crate) struct SchemaRegistry {
+    map: std::collections::HashMap<Vec<u8>, u64>,
+    next_id: u64,
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+impl SchemaRegistry {
+    pub(crate) fn new() -> Self {
+        Self {
+            map: std::collections::HashMap::new(),
+            next_id: 0,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn reset(&mut self) {
+        self.map.clear();
+        self.next_id = 0;
+    }
+
+    /// Returns `(schema_id, is_new)`. When `is_new` is true the caller must
+    /// emit full-mode (column definitions inline) so the server registers the
+    /// id; otherwise it should emit reference-mode (just the id).
+    fn intern(&mut self, signature: &[u8]) -> (u64, bool) {
+        if let Some(&id) = self.map.get(signature) {
+            return (id, false);
+        }
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.map.insert(signature.to_vec(), id);
+        (id, true)
+    }
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+impl QwpBuffer {
+    /// Encode all currently-buffered table blocks into a single QWP/WebSocket
+    /// message using delta-symbol-dict mode (FLAG_DELTA_SYMBOL_DICT).
+    ///
+    /// New symbols discovered while encoding are added to `global_dict` and
+    /// recorded in the message's delta section so the server can mirror the
+    /// dictionary state. The encoded payload lands in `scratch.message`.
+    pub(crate) fn encode_ws_message(
+        &self,
+        scratch: &mut QwpWsEncodeScratch,
+        global_dict: &mut SymbolGlobalDict,
+        schema_registry: &mut SchemaRegistry,
+        version: u8,
+    ) -> crate::Result<()> {
+        if self.pending.table.is_some() {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "Cannot flush with an incomplete row. \
+                 Call `at` or `at_now` to complete the pending row."
+            ));
+        }
+
+        let out = &mut scratch.message;
+        out.clear();
+
+        // Header placeholder (filled at the end).
+        let header_start = out.len();
+        out.extend_from_slice(&[0u8; QWP_MESSAGE_HEADER_SIZE]);
+        let payload_start = out.len();
+
+        // ---- Pass 1: build per-segment symbol-id mapping & collect new entries ----
+        scratch.per_segment_symbol_globals.clear();
+        scratch
+            .per_segment_symbol_globals
+            .reserve(self.segments.len());
+        let delta_start = global_dict.len();
+        // Collect new symbol byte ranges (referencing self.value_bytes) in the
+        // order they receive global IDs.
+        let mut new_symbol_ranges: Vec<std::ops::Range<usize>> = Vec::new();
+
+        for (seg_idx, _) in self.segments.iter().enumerate() {
+            let planner = self.size_hint.segment_planner(seg_idx)?;
+            let mut per_col: Vec<Vec<u64>> = Vec::with_capacity(planner.columns.len());
+            for col in &planner.columns {
+                let mut globals_for_col: Vec<u64> = Vec::new();
+                if matches!(col.kind, ColumnKind::Symbol) {
+                    globals_for_col.reserve(col.dict_count as usize);
+                    let mut cursor = col.dict_head;
+                    while cursor != CELL_END {
+                        let entry = &planner.symbol_dict[cursor as usize];
+                        let range = entry.value.0.as_range();
+                        let bytes = &self.value_bytes[range.clone()];
+                        let (gid, is_new) = global_dict.intern(bytes);
+                        globals_for_col.push(gid);
+                        if is_new {
+                            new_symbol_ranges.push(range);
+                        }
+                        cursor = entry.next;
+                    }
+                }
+                per_col.push(globals_for_col);
+            }
+            scratch.per_segment_symbol_globals.push(per_col);
+        }
+
+        // ---- Delta dictionary section ----
+        write_qwp_varint(out, delta_start);
+        write_qwp_varint(out, new_symbol_ranges.len() as u64);
+        for range in &new_symbol_ranges {
+            let bytes = &self.value_bytes[range.clone()];
+            write_qwp_bytes(out, bytes);
+        }
+
+        // ---- Table blocks ----
+        let table_count: u16 = checked_qwp_u16(self.segments.len(), "WS message table count")?;
+        for (seg_idx, segment) in self.segments.iter().enumerate() {
+            let planner = self.size_hint.segment_planner(seg_idx)?;
+            let table_name = &self.name_bytes[segment.table.0.as_range()];
+            let row_count = planner.row_count;
+
+            // Table header
+            write_qwp_bytes(out, table_name);
+            write_qwp_varint(out, row_count as u64);
+            write_qwp_varint(out, planner.columns.len() as u64);
+
+            // Schema: build the column-definition byte sequence once. It is
+            // both the registry key (column-set signature) and the payload we
+            // splice inline when emitting full mode.
+            scratch.schema_signature.clear();
+            for col in &planner.columns {
+                write_qwp_bytes(
+                    &mut scratch.schema_signature,
+                    &self.name_bytes[col.name.0.as_range()],
+                );
+                scratch
+                    .schema_signature
+                    .push(wire_type_byte(col.kind, col.uses_null_bitmap(row_count)));
+            }
+            let (schema_id, is_new) = schema_registry.intern(&scratch.schema_signature);
+            if is_new {
+                out.push(QWP_SCHEMA_MODE_FULL);
+                write_qwp_varint(out, schema_id);
+                out.extend_from_slice(&scratch.schema_signature);
+            } else {
+                out.push(QWP_SCHEMA_MODE_REFERENCE);
+                write_qwp_varint(out, schema_id);
+            }
+
+            // Column payloads
+            for (col_idx, col) in planner.columns.iter().enumerate() {
+                if matches!(col.kind, ColumnKind::Symbol) {
+                    let globals = &scratch.per_segment_symbol_globals[seg_idx][col_idx];
+                    encode_symbol_column_delta_dict(col, row_count, &planner.cells, globals, out)?;
+                } else {
+                    encode_column_from_cells(
+                        col,
+                        row_count,
+                        &planner.cells,
+                        &planner.symbol_dict,
+                        &self.value_bytes,
+                        out,
+                    )?;
+                }
+            }
+        }
+
+        // Fill header
+        let header = QwpMessageHeader {
+            magic: *b"QWP1",
+            version,
+            flags: QWP_FLAG_DELTA_SYMBOL_DICT,
+            table_count,
+            payload_len: checked_qwp_u32(
+                out.len() - payload_start,
+                "WS message payload length",
+            )?,
+        };
+        header.write_to(&mut out[header_start..header_start + QWP_MESSAGE_HEADER_SIZE]);
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+fn checked_qwp_u16(value: usize, what: &'static str) -> crate::Result<u16> {
+    if value > u16::MAX as usize {
+        return Err(error::fmt!(
+            InvalidApiCall,
+            "QWP {} exceeds maximum of {}",
+            what,
+            u16::MAX
+        ));
+    }
+    Ok(value as u16)
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+fn encode_symbol_column_delta_dict(
+    col: &ColumnStats,
+    row_count: usize,
+    cells: &[CellRef],
+    globals: &[u64],
+    out: &mut Vec<u8>,
+) -> crate::Result<()> {
+    let uses_null_bitmap = col.uses_null_bitmap(row_count);
+    out.push(u8::from(uses_null_bitmap));
+
+    if uses_null_bitmap {
+        let mut packed = 0u8;
+        let mut bit_idx = 0u8;
+        for maybe_cell in GapFillIter::new(cells, col.cell_head, row_count)? {
+            if maybe_cell.is_none_or(|cell| cell_value_is_null(cell.value)) {
+                packed |= 1 << bit_idx;
+            }
+            bit_idx += 1;
+            if bit_idx == 8 {
+                out.push(packed);
+                packed = 0;
+                bit_idx = 0;
+            }
+        }
+        if bit_idx != 0 {
+            out.push(packed);
+        }
+    }
+
+    // Varint global IDs for each non-null row, in row order.
+    for cell in CellIter::new(cells, col.cell_head) {
+        let local_idx = cell.symbol_dict_idx as usize;
+        let gid = globals.get(local_idx).copied().ok_or_else(|| {
+            error::fmt!(
+                InvalidApiCall,
+                "internal QWP/WS encoder error: missing global symbol id for column-local index {}",
+                local_idx
+            )
+        })?;
+        write_qwp_varint(out, gid);
+    }
+    Ok(())
 }
 
 /// Synthetic designated-timestamp entry used when iterating row specs.

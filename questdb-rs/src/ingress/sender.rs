@@ -32,6 +32,21 @@ mod qwp_udp;
 #[cfg(feature = "sync-sender-qwp-udp")]
 pub(crate) use qwp_udp::*;
 
+#[cfg(feature = "_sender-qwp-ws")]
+mod qwp_ws_codec;
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+mod qwp_ws;
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+pub(crate) use qwp_ws::*;
+
+#[cfg(feature = "async-sender-qwp-ws")]
+mod qwp_ws_async;
+
+#[cfg(feature = "async-sender-qwp-ws")]
+pub(crate) use qwp_ws_async::*;
+
 #[cfg(feature = "sync-sender-tcp")]
 mod tcp;
 
@@ -54,6 +69,9 @@ pub(crate) use http::*;
 pub(crate) enum SyncProtocolHandler {
     #[cfg(feature = "sync-sender-qwp-udp")]
     SyncQwpUdp(SyncQwpUdpHandlerState),
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    SyncQwpWs(Box<SyncQwpWsHandlerState>),
 
     #[cfg(feature = "sync-sender-tcp")]
     SyncTcp(SyncConnection),
@@ -150,6 +168,11 @@ impl Sender {
             return Buffer::qwp_with_max_name_len(self.max_name_len);
         }
 
+        #[cfg(feature = "sync-sender-qwp-ws")]
+        if matches!(&self.handler, SyncProtocolHandler::SyncQwpWs(_)) {
+            return Buffer::qwp_with_max_name_len(self.max_name_len);
+        }
+
         Buffer::with_max_name_len(self.protocol_version, self.max_name_len)
     }
 
@@ -183,6 +206,39 @@ impl Sender {
                 ));
             }
             return flush_qwp_udp(state, qwp);
+        }
+
+        #[cfg(feature = "sync-sender-qwp-ws")]
+        if let SyncProtocolHandler::SyncQwpWs(ref mut state) = self.handler {
+            let qwp = buf.as_qwp().ok_or_else(|| {
+                error::fmt!(
+                    InvalidApiCall,
+                    "QWP/WebSocket sender requires a QWP buffer created by `Sender::new_buffer()`."
+                )
+            })?;
+            qwp.check_can_flush()?;
+            if qwp.is_empty() {
+                return Ok(());
+            }
+            if qwp.len() > self.max_buf_size {
+                return Err(error::fmt!(
+                    InvalidApiCall,
+                    "Could not flush buffer: QWP buffer size hint of {} exceeds maximum configured allowed size of {} bytes.",
+                    qwp.len(),
+                    self.max_buf_size
+                ));
+            }
+            if transactional {
+                return Err(error::fmt!(
+                    InvalidApiCall,
+                    "Transactional flushes are not supported for QWP/WebSocket."
+                ));
+            }
+            return flush_qwp_ws(state, qwp).inspect_err(|err| {
+                if matches!(err.code(), crate::ErrorCode::SocketError) {
+                    self.connected = false;
+                }
+            });
         }
 
         if !self.connected {
@@ -270,6 +326,11 @@ impl Sender {
             SyncProtocolHandler::SyncQwpUdp(_) => Err(error::fmt!(
                 InvalidApiCall,
                 "internal error: QWP/UDP handler in ILP flush path"
+            )),
+            #[cfg(feature = "sync-sender-qwp-ws")]
+            SyncProtocolHandler::SyncQwpWs(_) => Err(error::fmt!(
+                InvalidApiCall,
+                "internal error: QWP/WebSocket handler in ILP flush path"
             )),
         }
     }

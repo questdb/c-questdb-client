@@ -298,7 +298,11 @@ pub mod json_tests {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(all(
-        any(feature = "_sender-tcp", feature = "_sender-http"),
+        any(
+            feature = "_sender-tcp",
+            feature = "_sender-http",
+            feature = "_sender-qwp-ws"
+        ),
         not(any(feature = "tls-webpki-certs", feature = "tls-native-certs"))
     ))]
     compile_error!(
@@ -308,14 +312,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(any(
         feature = "_sender-tcp",
         feature = "_sender-http",
-        feature = "_sender-qwp-udp"
+        feature = "_sender-qwp-udp",
+        feature = "_sender-qwp-ws"
     )))]
     compile_error!(
-        "At least one of `sync-sender-tcp`, `sync-sender-http` or `sync-sender-qwp-udp` features must be enabled"
+        "At least one of `sync-sender-tcp`, `sync-sender-http`, `sync-sender-qwp-udp` or `sync-sender-qwp-ws` features must be enabled"
     );
 
     #[cfg(all(
-        any(feature = "_sender-tcp", feature = "_sender-http"),
+        any(
+            feature = "_sender-tcp",
+            feature = "_sender-http",
+            feature = "_sender-qwp-ws"
+        ),
         not(any(feature = "aws-lc-crypto", feature = "ring-crypto"))
     ))]
     compile_error!(
@@ -323,7 +332,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     #[cfg(all(
-        any(feature = "_sender-tcp", feature = "_sender-http"),
+        any(
+            feature = "_sender-tcp",
+            feature = "_sender-http",
+            feature = "_sender-qwp-ws"
+        ),
         feature = "aws-lc-crypto",
         feature = "ring-crypto"
     ))]

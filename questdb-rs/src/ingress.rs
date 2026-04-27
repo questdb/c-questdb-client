@@ -223,6 +223,14 @@ pub enum Protocol {
     #[cfg(feature = "_sender-qwp-udp")]
     /// Quest Wire Protocol over UDP datagrams (IPv4-only).
     QwpUdp,
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    /// Quest Wire Protocol over WebSocket (RFC 6455).
+    QwpWs,
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    /// Quest Wire Protocol over WebSocket Secure (TLS).
+    QwpWss,
 }
 
 impl Display for Protocol {
@@ -240,6 +248,8 @@ impl Protocol {
             Protocol::Http | Protocol::Https => "9000",
             #[cfg(feature = "_sender-qwp-udp")]
             Protocol::QwpUdp => "9007",
+            #[cfg(feature = "_sender-qwp-ws")]
+            Protocol::QwpWs | Protocol::QwpWss => "9000",
         }
     }
 
@@ -255,6 +265,10 @@ impl Protocol {
             Protocol::Https => true,
             #[cfg(feature = "_sender-qwp-udp")]
             Protocol::QwpUdp => false,
+            #[cfg(feature = "_sender-qwp-ws")]
+            Protocol::QwpWs => false,
+            #[cfg(feature = "_sender-qwp-ws")]
+            Protocol::QwpWss => true,
         }
     }
 
@@ -266,6 +280,8 @@ impl Protocol {
             Protocol::Http | Protocol::Https => false,
             #[cfg(feature = "_sender-qwp-udp")]
             Protocol::QwpUdp => false,
+            #[cfg(feature = "_sender-qwp-ws")]
+            Protocol::QwpWs | Protocol::QwpWss => false,
         }
     }
 
@@ -277,12 +293,35 @@ impl Protocol {
             Protocol::Http | Protocol::Https => true,
             #[cfg(feature = "_sender-qwp-udp")]
             Protocol::QwpUdp => false,
+            #[cfg(feature = "_sender-qwp-ws")]
+            Protocol::QwpWs | Protocol::QwpWss => false,
         }
     }
 
     #[cfg(feature = "_sender-qwp-udp")]
     fn is_qwp_udp(&self) -> bool {
         matches!(self, Protocol::QwpUdp)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn is_qwp_ws(&self) -> bool {
+        matches!(self, Protocol::QwpWs | Protocol::QwpWss)
+    }
+
+    /// True if the protocol authenticates via HTTP-style headers
+    /// (basic / bearer-token), i.e. ILP/HTTP or QWP/WebSocket.
+    #[cfg(any(feature = "_sender-http", feature = "_sender-qwp-ws"))]
+    fn accepts_http_auth(&self) -> bool {
+        let mut accepts = false;
+        #[cfg(feature = "_sender-http")]
+        if self.is_httpx() {
+            accepts = true;
+        }
+        #[cfg(feature = "_sender-qwp-ws")]
+        if self.is_qwp_ws() {
+            accepts = true;
+        }
+        accepts
     }
 
     fn schema(&self) -> &str {
@@ -297,6 +336,10 @@ impl Protocol {
             Protocol::Https => "https",
             #[cfg(feature = "_sender-qwp-udp")]
             Protocol::QwpUdp => "qwpudp",
+            #[cfg(feature = "_sender-qwp-ws")]
+            Protocol::QwpWs => "qwpws",
+            #[cfg(feature = "_sender-qwp-ws")]
+            Protocol::QwpWss => "qwpwss",
         }
     }
 
@@ -312,6 +355,10 @@ impl Protocol {
             "https" => Ok(Protocol::Https),
             #[cfg(feature = "_sender-qwp-udp")]
             "qwpudp" => Ok(Protocol::QwpUdp),
+            #[cfg(feature = "_sender-qwp-ws")]
+            "qwpws" => Ok(Protocol::QwpWs),
+            #[cfg(feature = "_sender-qwp-ws")]
+            "qwpwss" => Ok(Protocol::QwpWss),
             _ => Err(error::fmt!(ConfigError, "Unsupported protocol: {}", schema)),
         }
     }
@@ -394,6 +441,41 @@ pub struct SenderBuilder {
 
     #[cfg(feature = "_sender-qwp-udp")]
     qwp_udp: Option<conf::QwpUdpConfig>,
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    qwp_ws: Option<conf::QwpWsConfig>,
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    failover_callback: Option<FailoverCallback>,
+}
+
+/// User-supplied hook invoked when a QWP/WebSocket sender finishes a successful
+/// failover (reconnect + replay). Mirrors Java's `onFailoverReset()` semantics:
+/// the callback fires after the connection has been re-established and the
+/// in-flight messages have been replayed, before the user-visible flush call
+/// returns success.
+///
+/// Use it to reset application-level state that depends on the lifetime of a
+/// single QuestDB connection. The callback runs synchronously on whatever
+/// thread (sync sender) or task (async sender) detected the recovery, so keep
+/// it short and non-blocking.
+#[cfg(feature = "_sender-qwp-ws")]
+#[derive(Clone)]
+pub struct FailoverCallback(pub(crate) std::sync::Arc<dyn Fn() + Send + Sync>);
+
+#[cfg(feature = "_sender-qwp-ws")]
+impl FailoverCallback {
+    /// Wrap a closure as a failover callback.
+    pub fn new<F: Fn() + Send + Sync + 'static>(f: F) -> Self {
+        FailoverCallback(std::sync::Arc::new(f))
+    }
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+impl Debug for FailoverCallback {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FailoverCallback(..)")
+    }
 }
 
 impl SenderBuilder {
@@ -458,6 +540,38 @@ impl SenderBuilder {
                 "max_datagram_size" => builder.max_datagram_size(parse_conf_value(key, val)?)?,
                 #[cfg(feature = "_sender-qwp-udp")]
                 "multicast_ttl" => builder.multicast_ttl(parse_conf_value(key, val)?)?,
+                #[cfg(feature = "_sender-qwp-ws")]
+                "max_in_flight" => builder.max_in_flight(parse_conf_value(key, val)?)?,
+                #[cfg(feature = "_sender-qwp-ws")]
+                "failover" => {
+                    let on = match val {
+                        "on" => true,
+                        "off" => false,
+                        _ => {
+                            return Err(error::fmt!(
+                                ConfigError,
+                                r##"Config parameter "failover" must be either "on" or "off"."##,
+                            ));
+                        }
+                    };
+                    builder.failover(on)?
+                }
+                #[cfg(feature = "_sender-qwp-ws")]
+                "max_failover_attempts" => {
+                    builder.max_failover_attempts(parse_conf_value(key, val)?)?
+                }
+                #[cfg(feature = "_sender-qwp-ws")]
+                "failover_initial_backoff" => builder.failover_initial_backoff(
+                    Duration::from_millis(parse_conf_value(key, val)?),
+                )?,
+                #[cfg(feature = "_sender-qwp-ws")]
+                "failover_max_backoff" => builder.failover_max_backoff(
+                    Duration::from_millis(parse_conf_value(key, val)?),
+                )?,
+                #[cfg(feature = "_sender-qwp-ws")]
+                "failover_total_budget" => builder.failover_total_budget(
+                    Duration::from_millis(parse_conf_value(key, val)?),
+                )?,
                 "protocol_version" => match val {
                     "1" => builder.protocol_version(ProtocolVersion::V1)?,
                     "2" => builder.protocol_version(ProtocolVersion::V2)?,
@@ -691,6 +805,16 @@ impl SenderBuilder {
             } else {
                 None
             },
+
+            #[cfg(feature = "_sender-qwp-ws")]
+            qwp_ws: if protocol.is_qwp_ws() {
+                Some(conf::QwpWsConfig::default())
+            } else {
+                None
+            },
+
+            #[cfg(feature = "_sender-qwp-ws")]
+            failover_callback: None,
         }
     }
 
@@ -876,6 +1000,128 @@ impl SenderBuilder {
         qwp_udp
             .multicast_ttl
             .set_specified("multicast_ttl", value)?;
+        Ok(self)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    /// Maximum number of unacknowledged messages a pipelined async QWP/WebSocket
+    /// sender keeps in flight at once. The default is 128, matching the spec's
+    /// `Max in-flight batches` limit.
+    ///
+    /// The window provides backpressure: once it's full, subsequent
+    /// `flush().await` calls park until the server acknowledges an earlier
+    /// message. Smaller windows reduce client memory and bound the impact of a
+    /// stuck server; larger windows increase throughput on high-RTT links.
+    pub fn max_in_flight(mut self, value: usize) -> Result<Self> {
+        if value == 0 {
+            return Err(error::fmt!(
+                ConfigError,
+                "\"max_in_flight\" must be greater than 0."
+            ));
+        }
+        let Some(qwp_ws) = &mut self.qwp_ws else {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"max_in_flight\" setting is only supported for QWP/WebSocket."
+            ));
+        };
+        qwp_ws.max_in_flight.set_specified("max_in_flight", value)?;
+        Ok(self)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    /// Enable or disable transport-level failover (auto-reconnect + replay).
+    /// Default `true`. When disabled, a transport error during flush latches
+    /// a sticky terminal failure on the sender (the user must rebuild it).
+    pub fn failover(mut self, value: bool) -> Result<Self> {
+        let Some(qwp_ws) = &mut self.qwp_ws else {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"failover\" setting is only supported for QWP/WebSocket."
+            ));
+        };
+        qwp_ws.failover.set_specified("failover", value)?;
+        Ok(self)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    /// Maximum number of reconnect attempts per failed flush. Default 3.
+    pub fn max_failover_attempts(mut self, value: u32) -> Result<Self> {
+        if value == 0 {
+            return Err(error::fmt!(
+                ConfigError,
+                "\"max_failover_attempts\" must be greater than 0."
+            ));
+        }
+        let Some(qwp_ws) = &mut self.qwp_ws else {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"max_failover_attempts\" setting is only supported for QWP/WebSocket."
+            ));
+        };
+        qwp_ws
+            .max_failover_attempts
+            .set_specified("max_failover_attempts", value)?;
+        Ok(self)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    /// First reconnect delay after a transport failure. Each subsequent
+    /// attempt doubles up to `failover_max_backoff`. Default 100ms.
+    pub fn failover_initial_backoff(mut self, value: Duration) -> Result<Self> {
+        let Some(qwp_ws) = &mut self.qwp_ws else {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"failover_initial_backoff\" setting is only supported for QWP/WebSocket."
+            ));
+        };
+        qwp_ws
+            .failover_initial_backoff
+            .set_specified("failover_initial_backoff", value)?;
+        Ok(self)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    /// Cap on the per-attempt reconnect delay. Default 5s.
+    pub fn failover_max_backoff(mut self, value: Duration) -> Result<Self> {
+        let Some(qwp_ws) = &mut self.qwp_ws else {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"failover_max_backoff\" setting is only supported for QWP/WebSocket."
+            ));
+        };
+        qwp_ws
+            .failover_max_backoff
+            .set_specified("failover_max_backoff", value)?;
+        Ok(self)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    /// Total wall-clock budget for the failover loop. Default 30s.
+    pub fn failover_total_budget(mut self, value: Duration) -> Result<Self> {
+        let Some(qwp_ws) = &mut self.qwp_ws else {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"failover_total_budget\" setting is only supported for QWP/WebSocket."
+            ));
+        };
+        qwp_ws
+            .failover_total_budget
+            .set_specified("failover_total_budget", value)?;
+        Ok(self)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    /// Register a callback that fires after each successful failover
+    /// (reconnect + replay). See [`FailoverCallback`].
+    pub fn on_failover_reset(mut self, cb: FailoverCallback) -> Result<Self> {
+        if self.qwp_ws.is_none() {
+            return Err(error::fmt!(
+                ConfigError,
+                "\"on_failover_reset\" is only supported for QWP/WebSocket."
+            ));
+        }
+        self.failover_callback = Some(cb);
         Ok(self)
     }
 
@@ -1115,34 +1361,40 @@ impl SenderBuilder {
                     r##"Incomplete ECDSA authentication parameters. Specify either all or none of: "username", "token", "token_x", "token_y"."##,
                 ))
             }
-            #[cfg(feature = "_sender-http")]
-            (protocol, Some(username), Some(password), None, None, None) if protocol.is_httpx() => {
+            #[cfg(any(feature = "_sender-http", feature = "_sender-qwp-ws"))]
+            (protocol, Some(username), Some(password), None, None, None)
+                if protocol.accepts_http_auth() =>
+            {
                 Ok(Some(conf::AuthParams::Basic(conf::BasicAuthParams {
                     username: username.to_string(),
                     password: password.to_string(),
                 })))
             }
-            #[cfg(feature = "_sender-http")]
-            (protocol, Some(_username), None, None, None, None) if protocol.is_httpx() => {
+            #[cfg(any(feature = "_sender-http", feature = "_sender-qwp-ws"))]
+            (protocol, Some(_username), None, None, None, None)
+                if protocol.accepts_http_auth() =>
+            {
                 Err(error::fmt!(
                     ConfigError,
                     r##"Basic authentication parameter "username" is present, but "password" is missing."##,
                 ))
             }
-            #[cfg(feature = "_sender-http")]
-            (protocol, None, Some(_password), None, None, None) if protocol.is_httpx() => {
+            #[cfg(any(feature = "_sender-http", feature = "_sender-qwp-ws"))]
+            (protocol, None, Some(_password), None, None, None)
+                if protocol.accepts_http_auth() =>
+            {
                 Err(error::fmt!(
                     ConfigError,
                     r##"Basic authentication parameter "password" is present, but "username" is missing."##,
                 ))
             }
-            #[cfg(feature = "sync-sender-http")]
-            (protocol, None, None, Some(token), None, None) if protocol.is_httpx() => {
+            #[cfg(any(feature = "_sender-http", feature = "_sender-qwp-ws"))]
+            (protocol, None, None, Some(token), None, None) if protocol.accepts_http_auth() => {
                 Ok(Some(conf::AuthParams::Token(conf::TokenAuthParams {
                     token: token.to_string(),
                 })))
             }
-            #[cfg(feature = "sync-sender-http")]
+            #[cfg(feature = "_sender-http")]
             (protocol, Some(_username), None, Some(_token), Some(_token_x), Some(_token_y))
                 if protocol.is_httpx() =>
             {
@@ -1163,6 +1415,61 @@ impl SenderBuilder {
                 r##"Incomplete authentication parameters. Check "username", "password", "token", "token_x" and "token_y" parameters are set correctly."##,
             )),
         }
+    }
+
+    /// Build an async [`AsyncSender`] for QWP over WebSocket. Only the
+    /// `Protocol::QwpWs` and `Protocol::QwpWss` protocols are accepted; other
+    /// protocols return a `ConfigError`.
+    #[cfg(feature = "async-sender-qwp-ws")]
+    pub async fn build_async(&self) -> Result<AsyncSender> {
+        if !self.protocol.is_qwp_ws() {
+            return Err(error::fmt!(
+                ConfigError,
+                "build_async() is only supported for QWP/WebSocket protocols (qwpws, qwpwss); \
+                 use build() for sync transports."
+            ));
+        }
+        if self.net_interface.is_some() {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "net_interface is not supported for QWP over WebSocket."
+            ));
+        }
+        let tls_settings = tls::TlsSettings::build(
+            self.protocol.tls_enabled(),
+            #[cfg(feature = "insecure-skip-verify")]
+            *self.tls_verify,
+            *self.tls_ca,
+            self.tls_roots.deref().as_deref(),
+        )?;
+        let auth = self.build_auth()?;
+        let basic_auth = match &auth {
+            Some(conf::AuthParams::Basic(b)) => Some(b.to_header_string()),
+            Some(conf::AuthParams::Token(t)) => Some(t.to_header_string()?),
+            #[cfg(feature = "_sender-tcp")]
+            Some(conf::AuthParams::Ecdsa(_)) => {
+                return Err(error::fmt!(
+                    AuthError,
+                    "ECDSA authentication is not supported for QWP/WebSocket. \
+                     Use basic or token authentication instead."
+                ));
+            }
+            None => None,
+        };
+        let qwp_ws = self.qwp_ws.as_ref().ok_or_else(|| {
+            error::fmt!(ConfigError, "QWP/WebSocket configuration is missing.")
+        })?;
+        connect_async_qwp_ws(
+            self.host.as_str(),
+            self.port.as_str(),
+            matches!(self.protocol, Protocol::QwpWss),
+            tls_settings,
+            qwp_ws,
+            basic_auth,
+            *self.max_buf_size,
+            self.failover_callback.clone(),
+        )
+        .await
     }
 
     #[cfg(feature = "_sync-sender")]
@@ -1283,6 +1590,43 @@ impl SenderBuilder {
                     qwp_udp,
                 )?
             }
+            #[cfg(feature = "sync-sender-qwp-ws")]
+            Protocol::QwpWs | Protocol::QwpWss => {
+                if self.net_interface.is_some() {
+                    return Err(error::fmt!(
+                        InvalidApiCall,
+                        "net_interface is not supported for QWP over WebSocket."
+                    ));
+                }
+                let Some(qwp_ws) = self.qwp_ws.as_ref() else {
+                    return Err(error::fmt!(
+                        ConfigError,
+                        "QWP/WebSocket configuration is missing."
+                    ));
+                };
+                let basic_auth = match &auth {
+                    Some(conf::AuthParams::Basic(b)) => Some(b.to_header_string()),
+                    Some(conf::AuthParams::Token(t)) => Some(t.to_header_string()?),
+                    #[cfg(feature = "_sender-tcp")]
+                    Some(conf::AuthParams::Ecdsa(_)) => {
+                        return Err(error::fmt!(
+                            AuthError,
+                            "ECDSA authentication is not supported for QWP/WebSocket. \
+                             Use basic or token authentication instead."
+                        ));
+                    }
+                    None => None,
+                };
+                connect_qwp_ws(
+                    self.host.as_str(),
+                    self.port.as_str(),
+                    matches!(self.protocol, Protocol::QwpWss),
+                    tls_settings,
+                    qwp_ws,
+                    basic_auth,
+                    self.failover_callback.clone(),
+                )?
+            }
         };
 
         #[allow(unused_mut)]
@@ -1323,6 +1667,8 @@ impl SenderBuilder {
                 }
                 #[cfg(feature = "sync-sender-qwp-udp")]
                 Protocol::QwpUdp => ProtocolVersion::V1,
+                #[cfg(feature = "sync-sender-qwp-ws")]
+                Protocol::QwpWs | Protocol::QwpWss => ProtocolVersion::V1,
             },
         };
 
