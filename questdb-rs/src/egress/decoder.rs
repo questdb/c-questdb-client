@@ -52,12 +52,13 @@
 //!   type-specific values
 //! ```
 //!
-//! Limitations of this decoder (rejected with `UnsupportedServer`):
-//! - `FLAG_ZSTD` payload compression
-//! - Gorilla-encoded timestamps/dates (per-column discriminator `0x01`)
-//! - Column kinds whose wire format isn't yet modelled in
-//!   [`ColumnView`](super::column::ColumnView): VARCHAR, BINARY, GEOHASH,
-//!   DECIMAL128/256, DOUBLE_ARRAY, LONG_ARRAY
+//! `FLAG_ZSTD` payloads are decoded via the optional `compression-zstd`
+//! crate feature; an unfeatured build rejects them with
+//! `ErrorCode::UnsupportedServer`. Gorilla-encoded timestamps/dates
+//! (per-column discriminator `0x01`) are handled by the
+//! [`super::gorilla`] module's bitstream decoder. Every column kind in
+//! [`super::column_kind::ColumnKind`] has a matching
+//! [`super::column::ColumnView`] variant.
 
 use crate::egress::column::{
     BinaryColumn, ColumnView, Decimal64Column, Decimal128Column, Decimal256Column,
@@ -386,6 +387,20 @@ pub fn decode_result_batch(
     r.read_bytes(name_len)?; // table name; ignored for query results
     let row_count = r.read_varint_usize()?;
     let col_count = r.read_varint_usize()?;
+    // Sanity-cap the wire-supplied column count before any code path
+    // turns it into a `Vec::with_capacity(col_count)` — without this
+    // a hostile or corrupted varint could request a multi-GiB up-front
+    // allocation and OOM the client before the bytes-too-short check
+    // ever runs. QuestDB's own table column cap is well under this.
+    const MAX_COLS: usize = 4096;
+    if col_count > MAX_COLS {
+        return Err(fmt!(
+            ProtocolError,
+            "table block declares {} columns; max supported is {}",
+            col_count,
+            MAX_COLS
+        ));
+    }
 
     // Schema section. col_count comes from the table block above; the
     // schema section itself does not re-emit it.

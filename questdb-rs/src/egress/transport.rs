@@ -24,10 +24,12 @@
 
 //! Sync WebSocket transport for the QWP egress endpoint.
 //!
-//! Plain `ws://` only at this stage — TLS lands in a follow-up. The
-//! transport handles the HTTP upgrade (with negotiation headers and any
-//! Authorization), then exposes frame-level read/write that maps each QWP
-//! frame to one WebSocket binary message.
+//! Supports both `ws://` and `wss://` via `MaybeTlsStream`. The transport
+//! handles the HTTP upgrade (with negotiation headers and any
+//! Authorization), then exposes frame-level read/write that maps each
+//! QWP frame to one WebSocket binary message. Custom `tls_roots` and
+//! `tls_verify=unsafe_off` are accepted in config parsing but rejected
+//! at connect time — those knobs are wired through in a follow-up.
 
 #![cfg(feature = "sync-reader-ws")]
 
@@ -203,6 +205,15 @@ impl WsTransport {
         // Attempt to drain the closing handshake response.
         let _ = self.socket.read();
     }
+
+    /// Best-effort in-place close. Initiates the WS closing handshake
+    /// without consuming `self` so callers borrowing `&mut WsTransport`
+    /// (e.g. `Cursor::Drop`) can release the connection. Errors are
+    /// swallowed; subsequent reads/writes on this transport will fail
+    /// at the tungstenite layer.
+    pub fn close_in_place(&mut self) {
+        let _ = self.socket.close(None);
+    }
 }
 
 impl Drop for WsTransport {
@@ -236,11 +247,18 @@ fn read_version_header(headers: &tungstenite::http::HeaderMap) -> Result<u8> {
 }
 
 fn map_ws_error(e: tungstenite::Error, default_code: ErrorCode) -> Error {
-    use tungstenite::error::Error as T;
+    use tungstenite::error::{Error as T, ProtocolError as P};
     let msg = e.to_string();
     let code = match &e {
         T::Io(_) => ErrorCode::SocketError,
         T::ConnectionClosed | T::AlreadyClosed => ErrorCode::SocketError,
+        // Send/receive after a Close frame is a transport-state error,
+        // not a wire-format error — surface it as SocketError so
+        // callers see a consistent "connection is gone" code regardless
+        // of which tungstenite variant fires post-close.
+        T::Protocol(P::SendAfterClosing) | T::Protocol(P::ReceivedAfterClosing) => {
+            ErrorCode::SocketError
+        }
         T::Url(_) => ErrorCode::ConfigError,
         T::HttpFormat(_) | T::Protocol(_) | T::Utf8(_) => ErrorCode::ProtocolError,
         T::Tls(_) => ErrorCode::TlsError,

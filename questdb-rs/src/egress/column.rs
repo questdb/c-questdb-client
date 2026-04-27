@@ -41,11 +41,9 @@
 //! Fixed-width numerics (Bool, Byte, Short, Int, Long, Float, Double, Ipv4),
 //! temporals (Timestamp µs / Date ms / TimestampNanos), 16-byte UUID,
 //! 32-byte Long256, 2-byte Char, Symbol (dense u32 codes + dict reference),
-//! Decimal64 (i64 mantissa + scale).
-//!
-//! Varchar, Binary, Geohash, Decimal128/256, and array types land in a
-//! follow-up once the ingress wire layout for varlen / array columns is
-//! confirmed.
+//! Decimal64/128/256 (mantissa + scale), Geohash (variable byte width),
+//! Varchar / Binary (varlen with offset table), and DOUBLE_ARRAY /
+//! LONG_ARRAY (multi-dimensional array views).
 
 use std::marker::PhantomData;
 
@@ -894,9 +892,10 @@ impl<'a> LongArrayColumn<'a> {
 
 /// Typed view over a single column in a `RESULT_BATCH`.
 ///
-/// Variants present here are the ones with a finalised wire encoding;
-/// VARCHAR, BINARY, GEOHASH, DECIMAL128/256, and array types are decoded
-/// in a follow-up.
+/// Covers every column kind the QWP egress decoder produces today:
+/// fixed-width numerics and temporals, UUID, Long256, Char, Symbol,
+/// Decimal64/128/256, Geohash, Varchar, Binary, and DOUBLE_ARRAY /
+/// LONG_ARRAY.
 #[derive(Debug, Clone, Copy)]
 pub enum ColumnView<'a> {
     Boolean(FixedColumn<'a, u8>),

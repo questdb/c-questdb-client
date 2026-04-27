@@ -25,8 +25,13 @@
 //! `Reader` (per-connection) + `Cursor` (per-query) public API.
 //!
 //! Phase 1: a single in-flight query per connection (runtime-checked, not
-//! type-encoded). Drop sends a best-effort WS close. Cancellation issues a
-//! CANCEL frame and drains until the terminal frame.
+//! type-encoded). `Cursor::cancel()` issues a CANCEL frame and drains
+//! until the terminal frame, leaving the Reader reusable. Dropping a
+//! cursor before it has reached a terminal closes the underlying
+//! WebSocket: subsequent operations on the Reader fail at the transport
+//! layer (open a fresh Reader to recover). Call `Cursor::cancel()` (or
+//! read until `next_batch()` returns `None`) before drop if you want to
+//! keep the existing connection alive.
 
 #![cfg(feature = "sync-reader-ws")]
 
@@ -66,6 +71,12 @@ pub struct Reader {
     /// Total wire bytes (header + payload) consumed since connect.
     /// Updated on every frame the reader pulls off the transport.
     bytes_received: u64,
+    /// Total bytes granted to the server via CREDIT (`0x15`) frames
+    /// since connect. Sums every per-batch auto-replenishment, every
+    /// `Cursor::add_credit` call, and the cancel-time wake nudge. Used
+    /// by tests to catch regressions where cancel keeps topping up the
+    /// budget while draining frames it intends to discard.
+    credit_granted_total: u64,
     /// Diagnostic: nanoseconds spent in `transport.read_frame()` since
     /// connect. Useful for splitting "wait on the socket" from "decode
     /// CPU" in throughput benchmarks.
@@ -111,6 +122,7 @@ impl Reader {
                 cursor_active: false,
                 server_info: None,
                 bytes_received: 0,
+                credit_granted_total: 0,
                 read_ns: 0,
                 decode_ns: 0,
             };
@@ -165,6 +177,15 @@ impl Reader {
     /// effective throughput a query produces.
     pub fn bytes_received(&self) -> u64 {
         self.bytes_received
+    }
+
+    /// Total bytes granted to the server via CREDIT (`0x15`) frames
+    /// since this connection was opened. Useful for verifying that
+    /// flow-control replenishment behaves as expected — in particular,
+    /// that `Cursor::cancel()` doesn't continue topping up the server's
+    /// budget while draining frames it's about to discard.
+    pub fn credit_granted_total(&self) -> u64 {
+        self.credit_granted_total
     }
 
     /// Diagnostic accumulators (nanoseconds): time spent in
@@ -356,7 +377,12 @@ impl<'r> ReaderQuery<'r> {
             ));
         }
         let request_id = self.reader.next_request_id;
-        self.reader.next_request_id = self.reader.next_request_id.wrapping_add(1);
+        // Skip 0 and negatives on wrap. Practically unreachable on a
+        // single connection, but keeps `request_id` strictly positive
+        // — `0` is the sentinel some server-side code paths use for
+        // "no active streaming request".
+        let next = self.reader.next_request_id.wrapping_add(1);
+        self.reader.next_request_id = if next <= 0 { 1 } else { next };
 
         let req = self.builder.request_id(request_id).build()?;
         let credit_enabled = req.initial_credit() > 0;
@@ -371,6 +397,8 @@ impl<'r> ReaderQuery<'r> {
             last_batch: None,
             terminal: None,
             credit_enabled,
+            cancelling: false,
+            done: false,
         })
     }
 }
@@ -405,6 +433,24 @@ pub struct Cursor<'r> {
     /// budget by exactly the wire size of the batch we just received
     /// (12-byte header + payload).
     credit_enabled: bool,
+    /// Set once `cancel()` has written its CANCEL frame and entered the
+    /// drain loop. Suppresses auto-credit replenishment for the rest of
+    /// the cursor's life so the server's budget is allowed to drain to
+    /// zero — this is the backpressure that hastens the post-cancel
+    /// terminal. Without this, every drained batch would top the budget
+    /// back up and the server could keep streaming at full rate until
+    /// it finally observed the CANCEL on its input socket.
+    cancelling: bool,
+    /// Set once any terminal frame has been observed for this cursor:
+    /// `RESULT_END`, `EXEC_DONE`, or `QUERY_ERROR` (including the
+    /// `STATUS_CANCELLED` reply to `cancel()`). Drives the early
+    /// return in `next_batch()` so a follow-up call doesn't try to
+    /// read another frame off a server that has already finished with
+    /// this `request_id`. `terminal` (the public lifecycle accessor)
+    /// only stores the success terminals — error terminals are
+    /// surfaced via the `Err` return and don't need a structured
+    /// representation here.
+    done: bool,
 }
 
 impl<'r> Cursor<'r> {
@@ -417,10 +463,17 @@ impl<'r> Cursor<'r> {
         self.terminal.as_ref()
     }
 
+    /// Pass-through to [`Reader::credit_granted_total`]. Exists so
+    /// callers holding the cursor's mutable borrow on the reader can
+    /// still observe the connection-level CREDIT-bytes counter.
+    pub fn credit_granted_total(&self) -> u64 {
+        self.reader.credit_granted_total
+    }
+
     /// Advance the cursor by one batch. Returns `Ok(None)` when the stream
     /// has terminated (success). `QUERY_ERROR` becomes `Err`.
     pub fn next_batch(&mut self) -> Result<Option<BatchView<'_>>> {
-        if self.terminal.is_some() {
+        if self.done {
             return Ok(None);
         }
         loop {
@@ -452,7 +505,12 @@ impl<'r> Cursor<'r> {
                     // the bytes we just took off the wire. The wire bytes
                     // are no longer pinned in our buffer; sending CREDIT
                     // here matches the server's "release on drain" policy.
-                    if self.credit_enabled {
+                    //
+                    // Suppress replenishment once `cancel()` has started
+                    // draining: topping the server's budget back up while
+                    // we're throwing the bytes away defeats the very
+                    // backpressure that should be hastening cancellation.
+                    if self.credit_enabled && !self.cancelling {
                         self.send_credit_frame(wire_bytes)?;
                     }
                     self.last_batch = Some(b);
@@ -481,6 +539,7 @@ impl<'r> Cursor<'r> {
                         total_rows,
                     });
                     self.reader.cursor_active = false;
+                    self.done = true;
                     return Ok(None);
                 }
                 ServerEvent::ExecDone {
@@ -494,6 +553,7 @@ impl<'r> Cursor<'r> {
                         rows_affected,
                     });
                     self.reader.cursor_active = false;
+                    self.done = true;
                     return Ok(None);
                 }
                 ServerEvent::Error {
@@ -503,6 +563,7 @@ impl<'r> Cursor<'r> {
                 } => {
                     self.check_rid(request_id, "QUERY_ERROR")?;
                     self.reader.cursor_active = false;
+                    self.done = true;
                     return Err(map_server_status(status, message));
                 }
                 ServerEvent::CacheReset { .. } | ServerEvent::ServerInfo(_) => {
@@ -516,17 +577,37 @@ impl<'r> Cursor<'r> {
     /// Send a CANCEL frame and drain until the server emits a terminal
     /// frame for this request.
     pub fn cancel(&mut self) -> Result<()> {
-        if self.terminal.is_some() {
+        if self.done {
             return Ok(());
         }
         let mut payload = Vec::with_capacity(9);
         payload.push(MsgKind::Cancel.as_u8());
         payload.extend_from_slice(&self.request_id.to_le_bytes());
         self.reader.transport.write_message(&payload)?;
+        // Wake the server in case it's already credit-suspended. The
+        // server's `handleCancel` only sets a flag; the cancel takes
+        // effect when `streamResults` is next re-entered, which on a
+        // credit-suspended stream happens only via `handleCredit`. A
+        // 1-byte top-up is enough — `streamResults` checks the cancel
+        // flag before the credit check, so the abort path fires
+        // immediately and emits the terminal QUERY_ERROR. Without this
+        // nudge a `cancel()` against a credit-suspended server would
+        // deadlock.
+        if self.credit_enabled {
+            self.send_credit_frame(1)?;
+        }
+        // Stop topping up the server's credit window for the rest of
+        // the drain — once the server has been told to cancel, we want
+        // the remaining budget to bleed off so it stops generating new
+        // batches rather than continuing to stream behind the cancel.
+        self.cancelling = true;
 
-        // Drain until terminal — swallow batches between CANCEL and the
-        // server's terminal acknowledgement.
-        while self.terminal.is_none() {
+        // Drain until any terminal frame (RESULT_END / EXEC_DONE /
+        // QUERY_ERROR including STATUS_CANCELLED) — swallow batches
+        // between CANCEL and the server's acknowledgement. `done` is
+        // the right guard here, not `terminal`: an error terminal
+        // sets `done` but leaves `terminal` as `None`.
+        while !self.done {
             match self.next_batch() {
                 Ok(Some(_)) => {} // discarded
                 Ok(None) => break,
@@ -556,6 +637,8 @@ impl<'r> Cursor<'r> {
         payload.extend_from_slice(&self.request_id.to_le_bytes());
         varint::encode_u64(additional_bytes, &mut payload);
         self.reader.transport.write_message(&payload)?;
+        self.reader.credit_granted_total =
+            self.reader.credit_granted_total.saturating_add(additional_bytes);
         Ok(())
     }
 
@@ -575,10 +658,21 @@ impl<'r> Cursor<'r> {
 
 impl Drop for Cursor<'_> {
     fn drop(&mut self) {
-        // Fire-and-forget per the project policy. The transport's own Drop
-        // closes the WS; that releases any server-side resources tied to
-        // this request_id.
-        self.reader.cursor_active = false;
+        // `cursor_active` is cleared by `next_batch()` on every terminal
+        // path (RESULT_END, EXEC_DONE, QUERY_ERROR) and by `cancel()`
+        // once it's drained. If it's still set at drop time, this cursor
+        // was abandoned mid-stream: query frames are still en route on
+        // the WS, and reusing the Reader for a new query would let the
+        // next cursor pick them up and trip the request_id check.
+        //
+        // Tear down the WebSocket so the server stops streaming and
+        // releases request-scoped resources. Subsequent operations on
+        // this Reader will fail at the transport layer — the user must
+        // open a fresh Reader to recover.
+        if self.reader.cursor_active {
+            self.reader.transport.close_in_place();
+            self.reader.cursor_active = false;
+        }
     }
 }
 

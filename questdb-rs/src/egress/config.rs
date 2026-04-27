@@ -302,11 +302,16 @@ impl ReaderConfig {
         #[cfg(not(feature = "compression-zstd"))]
         {
             if !matches!(compression, Compression::Raw) {
+                let user_token = match compression {
+                    Compression::Raw => "raw",
+                    Compression::Zstd => "zstd",
+                    Compression::Auto => "auto",
+                };
                 return Err(fmt!(
                     ConfigError,
-                    "\"compression\" {:?} requires the `compression-zstd` crate feature; \
+                    "\"compression={}\" requires the `compression-zstd` crate feature; \
                      either enable it or use \"raw\"",
-                    compression.header_token()
+                    user_token
                 ));
             }
         }

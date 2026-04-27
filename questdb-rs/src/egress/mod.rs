@@ -26,10 +26,11 @@
 //!
 //! Implements the client side of the QWP egress extension: a binary,
 //! columnar, WebSocket-based read protocol for streaming query results
-//! from QuestDB. This module currently contains the wire codec foundation
-//! (frame header, varint, message kinds, column type codes, errors).
-//! Transport, decoder, and `Reader`/`Cursor`/`Batch` types land in
-//! follow-up changes.
+//! from QuestDB. The module bundles the wire codec foundation (frame
+//! header, varint, message kinds, column type codes, errors), the
+//! `RESULT_BATCH` decoder and column views, the symbol/schema
+//! registries, and — when `sync-reader-ws` is enabled — the WebSocket
+//! transport and `Reader`/`Cursor`/`BatchView` streaming API.
 
 pub mod auth;
 pub mod binds;

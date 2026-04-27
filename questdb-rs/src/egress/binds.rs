@@ -33,7 +33,7 @@
 //! [bitmap]:   u8                present iff null_flag == 0x01; LSB-first, 1 = NULL
 //! column args:                  always present (even when zero values), per type:
 //!   DECIMAL64/128/256:          1 B scale
-//!   GEOHASH:                    varint precision_bits (1..60)
+//!   GEOHASH:                    varint precision_bits (1..=60)
 //!   VARCHAR/BINARY:             (non_null + 1) × u32_le offsets
 //!   everything else:            (no args)
 //! values × non_null:            type-specific layout (see per-type docs below)
@@ -128,7 +128,7 @@ pub enum Bind {
         bytes: [u8; 32],
         scale: i8,
     },
-    /// QWP `GEOHASH`: zero-extended u64 + precision_bits (1..60). The
+    /// QWP `GEOHASH`: zero-extended u64 + precision_bits (1..=60). The
     /// least-significant `ceil(precision_bits/8)` bytes are written.
     Geohash {
         value: u64,

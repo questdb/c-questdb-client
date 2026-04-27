@@ -127,6 +127,20 @@ pub fn decode_frame(
     }
     let kind_byte = payload[0];
     let kind = MsgKind::from_u8(kind_byte)?;
+    // Per `wire/header.rs`, `table_count` is `1` for `RESULT_BATCH` (the
+    // only frame that carries an actual table block) and `0` everywhere
+    // else. Catch frame-vs-kind drift up front rather than letting it
+    // surface as a confusing per-message decode failure downstream.
+    let expected_tc = if matches!(kind, MsgKind::ResultBatch) { 1 } else { 0 };
+    if header.table_count != expected_tc {
+        return Err(fmt!(
+            ProtocolError,
+            "frame for msg_kind 0x{:02X} has table_count {} (expected {})",
+            kind_byte,
+            header.table_count,
+            expected_tc
+        ));
+    }
     match kind {
         MsgKind::ResultBatch => Ok(ServerEvent::Batch(decode_result_batch(
             payload,
