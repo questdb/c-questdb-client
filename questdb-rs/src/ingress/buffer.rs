@@ -468,6 +468,20 @@ impl Buffer {
         Ok(self)
     }
 
+    /// Adds a symbol column if `value` is `Some`; otherwise leaves the row unchanged.
+    pub fn symbol_opt<'a, N, S>(&mut self, name: N, value: Option<S>) -> crate::Result<&mut Self>
+    where
+        N: TryInto<ColumnName<'a>>,
+        S: AsRef<str>,
+        Error: From<N::Error>,
+    {
+        if let Some(value) = value {
+            self.symbol(name, value)
+        } else {
+            Ok(self)
+        }
+    }
+
     /// Adds a boolean column to the current row.
     pub fn column_bool<'a, N>(&mut self, name: N, value: bool) -> crate::Result<&mut Self>
     where
@@ -484,6 +498,23 @@ impl Buffer {
             }
         }
         Ok(self)
+    }
+
+    /// Adds a boolean column if `value` is `Some`; otherwise leaves the row unchanged.
+    pub fn column_bool_opt<'a, N>(
+        &mut self,
+        name: N,
+        value: Option<bool>,
+    ) -> crate::Result<&mut Self>
+    where
+        N: TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        if let Some(value) = value {
+            self.column_bool(name, value)
+        } else {
+            Ok(self)
+        }
     }
 
     /// Adds an integer column to the current row.
@@ -504,6 +535,19 @@ impl Buffer {
         Ok(self)
     }
 
+    /// Adds an integer column if `value` is `Some`; otherwise leaves the row unchanged.
+    pub fn column_i64_opt<'a, N>(&mut self, name: N, value: Option<i64>) -> crate::Result<&mut Self>
+    where
+        N: TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        if let Some(value) = value {
+            self.column_i64(name, value)
+        } else {
+            Ok(self)
+        }
+    }
+
     /// Adds a floating-point column to the current row.
     pub fn column_f64<'a, N>(&mut self, name: N, value: f64) -> crate::Result<&mut Self>
     where
@@ -520,6 +564,19 @@ impl Buffer {
             }
         }
         Ok(self)
+    }
+
+    /// Adds a floating-point column if `value` is `Some`; otherwise leaves the row unchanged.
+    pub fn column_f64_opt<'a, N>(&mut self, name: N, value: Option<f64>) -> crate::Result<&mut Self>
+    where
+        N: TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
+    {
+        if let Some(value) = value {
+            self.column_f64(name, value)
+        } else {
+            Ok(self)
+        }
     }
 
     /// Adds a string column to the current row.
@@ -539,6 +596,24 @@ impl Buffer {
             }
         }
         Ok(self)
+    }
+
+    /// Adds a string column if `value` is `Some`; otherwise leaves the row unchanged.
+    pub fn column_str_opt<'a, N, S>(
+        &mut self,
+        name: N,
+        value: Option<S>,
+    ) -> crate::Result<&mut Self>
+    where
+        N: TryInto<ColumnName<'a>>,
+        S: AsRef<str>,
+        Error: From<N::Error>,
+    {
+        if let Some(value) = value {
+            self.column_str(name, value)
+        } else {
+            Ok(self)
+        }
     }
 
     /// Adds a decimal column to the current row.
@@ -565,6 +640,25 @@ impl Buffer {
         Ok(self)
     }
 
+    /// Adds a decimal column if `value` is `Some`; otherwise leaves the row unchanged.
+    pub fn column_dec_opt<'a, N, S>(
+        &mut self,
+        name: N,
+        value: Option<S>,
+    ) -> crate::Result<&mut Self>
+    where
+        N: TryInto<ColumnName<'a>>,
+        S: TryInto<DecimalView<'a>>,
+        Error: From<N::Error>,
+        Error: From<S::Error>,
+    {
+        if let Some(value) = value {
+            self.column_dec(name, value)
+        } else {
+            Ok(self)
+        }
+    }
+
     #[allow(private_bounds)]
     /// Adds an array column to the current row.
     ///
@@ -589,6 +683,26 @@ impl Buffer {
         Ok(self)
     }
 
+    /// Adds an array column if `value` is `Some`; otherwise leaves the row unchanged.
+    #[allow(private_bounds)]
+    pub fn column_arr_opt<'a, N, T, D>(
+        &mut self,
+        name: N,
+        value: Option<&T>,
+    ) -> crate::Result<&mut Self>
+    where
+        N: TryInto<ColumnName<'a>>,
+        T: NdArrayView<D>,
+        D: ArrayElement + ArrayElementSealed,
+        Error: From<N::Error>,
+    {
+        if let Some(value) = value {
+            self.column_arr(name, value)
+        } else {
+            Ok(self)
+        }
+    }
+
     /// Adds a timestamp column to the current row.
     ///
     /// Accepts either microsecond or nanosecond timestamps.
@@ -609,6 +723,21 @@ impl Buffer {
             }
         }
         Ok(self)
+    }
+
+    /// Adds a timestamp column if `value` is `Some`; otherwise leaves the row unchanged.
+    pub fn column_ts_opt<'a, N, T>(&mut self, name: N, value: Option<T>) -> crate::Result<&mut Self>
+    where
+        N: TryInto<ColumnName<'a>>,
+        T: TryInto<Timestamp>,
+        Error: From<N::Error>,
+        Error: From<T::Error>,
+    {
+        if let Some(value) = value {
+            self.column_ts(name, value)
+        } else {
+            Ok(self)
+        }
     }
 
     /// Completes the current row with a designated timestamp.
