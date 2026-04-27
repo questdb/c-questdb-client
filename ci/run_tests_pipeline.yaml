@@ -134,8 +134,11 @@ stages:
             displayName: "Compile QuestDB"
             inputs:
               mavenPOMFile: "questdb/pom.xml"
-              jdkVersionOption: "1.17"
+              javaHomeOption: "Path"
+              jdkDirectory: "$(JAVA_HOME_25_X64)"
               options: "-DskipTests -Pbuild-web-console,local-client"
           - script: |
               python3 system_test/test.py run --repo ./questdb -v
+            env:
+              JAVA_HOME: $(JAVA_HOME_25_X64)
             displayName: "integration test"
