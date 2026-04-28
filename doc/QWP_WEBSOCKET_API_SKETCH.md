@@ -105,12 +105,19 @@ pub enum QwpDeliveryOutcome {
 }
 
 #[derive(Debug)]
+pub enum QwpDriveOutcome {
+    Idle,
+    Progress,
+    Terminal,
+}
+
+#[derive(Debug)]
 pub enum QwpCloseOutcome {
     Drained,
     Timeout {
-        published_fsn: u64,
-        server_acked_fsn: u64,
-        completed_fsn: u64,
+        published_fsn: Option<u64>,
+        server_acked_fsn: Option<u64>,
+        completed_fsn: Option<u64>,
     },
     Terminal {
         error: QwpErrorSummary,
@@ -224,7 +231,8 @@ Manual progress can also be explicit:
 let receipt = sender.submit(&mut buffer)?;
 
 while sender.receipt_status(receipt).is_pending() {
-    if let Some(event) = sender.drive_once(Duration::from_millis(10))? {
+    sender.drive_once(Duration::from_millis(10))?;
+    while let Some(event) = sender.poll_event() {
         println!("qwp event: {event:?}");
     }
 }
@@ -382,6 +390,16 @@ typedef struct {
 } line_sender_qwpws_event;
 
 typedef enum {
+    LINE_SENDER_QWPWS_DRIVE_IDLE = 0,
+    LINE_SENDER_QWPWS_DRIVE_PROGRESS = 1,
+    LINE_SENDER_QWPWS_DRIVE_TERMINAL = 2
+} line_sender_qwpws_drive_kind;
+
+typedef struct {
+    line_sender_qwpws_drive_kind kind;
+} line_sender_qwpws_drive_outcome;
+
+typedef enum {
     LINE_SENDER_QWPWS_CLOSE_DRAINED = 0,
     LINE_SENDER_QWPWS_CLOSE_TIMEOUT = 1,
     LINE_SENDER_QWPWS_CLOSE_TERMINAL = 2
@@ -389,8 +407,11 @@ typedef enum {
 
 typedef struct {
     line_sender_qwpws_close_status status;
+    bool has_published_fsn;
     uint64_t published_fsn;
+    bool has_server_acked_fsn;
     uint64_t server_acked_fsn;
+    bool has_completed_fsn;
     uint64_t completed_fsn;
 } line_sender_qwpws_close_result;
 
@@ -428,10 +449,7 @@ bool line_sender_qwpws_wait(
 bool line_sender_qwpws_drive_once(
         line_sender_qwpws_sender *sender,
         int64_t timeout_micros,
-        line_sender_qwpws_event *event_out,
-        char *message_buf,
-        size_t message_buf_len,
-        size_t *message_len_out,
+        line_sender_qwpws_drive_outcome *outcome_out,
         line_sender_error **err_out);
 
 bool line_sender_qwpws_poll_event(
@@ -463,10 +481,14 @@ existing `line_sender_buffer_new_qwp()` is also acceptable in examples where the
 maximum name length does not depend on sender configuration.
 
 Server messages for poisoned, terminal, or other diagnostic states are copied
-into caller-provided storage. `message_len_out`, when non-NULL, receives the
-full message length before truncation. If `message_buf` is too small, the
-returned event or wait result sets `message_truncated=true`. `message_buf` may
-be NULL only when `message_buf_len == 0`.
+into caller-provided storage by `wait()` and `poll_event()`. `message_len_out`,
+when non-NULL, receives the full message length before truncation. If
+`message_buf` is too small, the returned event or wait result sets
+`message_truncated=true`. `message_buf` may be NULL only when
+`message_buf_len == 0`.
+
+`drive_once()` is progress-only. It may produce events internally, but
+`poll_event()` is the only event consumer.
 
 Threaded adapter ownership conversion consumes the manual handle on success:
 

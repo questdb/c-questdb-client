@@ -112,6 +112,12 @@ pub enum QwpDeliveryOutcome {
     Timeout,
 }
 
+pub enum QwpDriveOutcome {
+    Idle,
+    Progress,
+    Terminal,
+}
+
 impl QwpWsSender {
     pub fn open(opts: QwpWsOptions) -> Result<Self>;
 
@@ -120,7 +126,7 @@ impl QwpWsSender {
     pub fn submit(&mut self, buffer: &mut Buffer) -> Result<QwpReceipt>;
     pub fn submit_and_keep(&mut self, buffer: &Buffer) -> Result<QwpReceipt>;
 
-    pub fn drive_once(&mut self, timeout: Duration) -> Result<Option<QwpEvent>>;
+    pub fn drive_once(&mut self, timeout: Duration) -> Result<QwpDriveOutcome>;
     pub fn poll_event(&mut self) -> Option<QwpEvent>;
     pub fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus;
     pub fn wait(&mut self, receipt: QwpReceipt, timeout: Duration) -> Result<QwpDeliveryOutcome>;
@@ -136,7 +142,9 @@ Properties:
 - `submit()` publishes to the local engine and returns a receipt. It does not wait for server ACK.
 - `submit()` clears the caller buffer only after successful publication.
 - `submit_and_keep()` publishes the same data without clearing the caller buffer.
-- `drive_once()` is the low-level progress primitive. It performs bounded I/O, reconnect, replay, ACK handling, poison handling, and event production.
+- `drive_once()` is the low-level progress primitive. It performs bounded I/O,
+  reconnect, replay, ACK handling, poison handling, and event production, but it
+  does not consume events. `poll_event()` is the only event consumer.
 - `wait()` is a convenience loop over `drive_once()` plus receipt-status checks.
 
 The low-level type should prefer `&mut self` methods. That gives Rust callers a clear single-driver ownership model and avoids internal locks on the hot path.
@@ -596,6 +604,11 @@ Events are transition notifications, not authoritative state. `receipt_status()`
 progress may produce events, but they should not consume them; `poll_event()`
 is the consumer API.
 
+Message text used by `wait()` and receipt/outcome queries must not depend on the
+event ring. A poison or terminal event may be dropped or already polled, so the
+core must retain bounded diagnostic details with the affected receipt or sender
+state for as long as that state remains observable.
+
 ## Server error classification
 
 Current QWP response statuses include:
@@ -758,6 +771,11 @@ Dropping a sender should be equivalent to fast close. It should not attempt surp
 
 Use value receipts, not heap-allocated completion handles. This avoids per-submit allocation and makes ownership simple.
 
+C callers allocate the output structs, so the first ABI shape should be treated
+as frozen once released. Do not add speculative reserved fields to every struct;
+if later server features need more detail, add explicit v2 structs/functions or
+detail accessors.
+
 ```c
 typedef struct line_sender_qwpws line_sender_qwpws;
 
@@ -787,6 +805,16 @@ typedef struct {
 } line_sender_qwpws_event;
 
 typedef enum {
+    LINE_SENDER_QWPWS_DRIVE_IDLE = 0,
+    LINE_SENDER_QWPWS_DRIVE_PROGRESS,
+    LINE_SENDER_QWPWS_DRIVE_TERMINAL
+} line_sender_qwpws_drive_kind;
+
+typedef struct {
+    line_sender_qwpws_drive_kind kind;
+} line_sender_qwpws_drive_outcome;
+
+typedef enum {
     LINE_SENDER_QWPWS_RECEIPT_INVALID = 0,
     LINE_SENDER_QWPWS_RECEIPT_PENDING,
     LINE_SENDER_QWPWS_RECEIPT_ACKED,
@@ -804,8 +832,7 @@ typedef enum {
     LINE_SENDER_QWPWS_DELIVERY_ACKED = 0,
     LINE_SENDER_QWPWS_DELIVERY_POISONED,
     LINE_SENDER_QWPWS_DELIVERY_TIMEOUT,
-    LINE_SENDER_QWPWS_DELIVERY_TERMINAL,
-    LINE_SENDER_QWPWS_DELIVERY_INVALID_RECEIPT
+    LINE_SENDER_QWPWS_DELIVERY_TERMINAL
 } line_sender_qwpws_delivery_kind;
 
 typedef struct {
@@ -823,12 +850,25 @@ typedef enum {
 
 typedef struct {
     line_sender_qwpws_close_kind kind;
+    bool has_published_fsn;
     uint64_t published_fsn;
+    bool has_server_acked_fsn;
+    uint64_t server_acked_fsn;
+    bool has_completed_fsn;
     uint64_t completed_fsn;
 } line_sender_qwpws_close_outcome;
 ```
 
 For `LINE_SENDER_QWPWS_EVENT_ACKED`, `fsn` is the highest cumulatively ACKed FSN, not necessarily a single-frame ACK. `wire_sequence` is the highest cumulatively ACKed wire sequence on the current connection. ACKed-through and completed-through are intentionally different across poison gaps: `completed_fsn` can advance past a poisoned frame while `server_acked_fsn` cannot.
+
+`LINE_SENDER_QWPWS_EVENT_DURABLE_ACK` is intentionally only a notification in
+the first ABI shape. Per-table durable ACK detail should be added later through a
+separate detail accessor or v2 event struct if callers need it.
+
+Poison file paths are also deferred from the first C ABI shape. The low-level C
+outcome carries status and bounded message text. A future quarantine-detail
+accessor can expose durable poison paths without growing every delivery/event
+struct now.
 
 Construction:
 
@@ -866,10 +906,7 @@ bool line_sender_qwpws_submit_and_keep(
 bool line_sender_qwpws_drive_once(
     line_sender_qwpws* sender,
     uint64_t timeout_millis,
-    line_sender_qwpws_event* event_out,
-    char* message_buf,
-    size_t message_buf_len,
-    size_t* message_len_out,
+    line_sender_qwpws_drive_outcome* outcome_out,
     line_sender_error** err_out);
 
 bool line_sender_qwpws_poll_event(
@@ -920,25 +957,41 @@ Rules:
 - `submit` returns a receipt only after local publication.
 - `submit` clears the buffer only after successful publication.
 - `submit_and_keep` never clears the buffer.
-- `drive_once` progresses network I/O on the caller thread.
+- Core submit calls require `receipt_out`. A no-receipt convenience can be added
+  later as a thin wrapper that discards the value receipt, but it should not
+  change local publication semantics.
+- `drive_once` progresses network I/O on the caller thread and writes only a
+  drive outcome. It may produce events internally, but callers observe those
+  events only through `poll_event`.
 - `wait` is a manual-sender convenience loop over `drive_once()` plus receipt
   status checks.
 - Starting the threaded adapter consumes the manual sender handle. There is no
   runtime "runner active" mode on a manual sender.
 - Message text is copied into caller-provided storage.
 - `line_sender_error` allocation is allowed only on error paths.
+- New QWP/WS FFI functions catch Rust panics and convert them to API failures.
+  Rust panics must not cross the C ABI boundary.
 
 Pointer contract:
 
 - Input handles are required to be non-NULL unless the function is documented as a free/close no-op.
 - `err_out` is optional. Passing NULL discards error details.
-- `receipt_out`, `event_out`, `status_out`, `outcome_out`, `threaded_out`, and close `outcome_out` are required. Passing NULL returns `false` and sets `err_out` if provided.
+- `receipt_out`, `event_out`, `status_out`, `outcome_out`, `threaded_out`, and close `outcome_out` are required for functions that declare them. Passing NULL returns `false` and sets `err_out` if provided.
 - `message_len_out` is optional. When non-NULL, it receives the full message length before truncation.
 - `message_buf` may be NULL only when `message_buf_len == 0`.
 - If `message_buf` is too small, the copied message is truncated and the returned event/outcome sets `message_truncated=true`.
 - On success, required output structs are always initialized, including `NONE`, `TIMEOUT`, and other non-error states.
-- Timeout, pending, not-drained, and no-event states are not reported through `err_out`; they are normal outcomes.
-- For `wait`, `receipt_status`, and `close_drain`, the boolean return reports whether the API call itself succeeded and initialized the output. Delivery state is reported only through the output enum.
+- Timeout, pending, not-drained, idle, and no-event states are not reported through `err_out`; they are normal outcomes.
+- For `drive_once`, `wait`, `receipt_status`, and `close_drain`, the boolean
+  return reports whether the API call itself succeeded and initialized the
+  output. Progress, delivery, status, and close state are reported only through
+  the output enum/struct.
+- `receipt_status` can report `LINE_SENDER_QWPWS_RECEIPT_INVALID` as a normal
+  status query result. `wait` on an invalid or unknown receipt is an API failure:
+  it returns `false` and sets `err_out` when provided.
+- Close outcome FSN fields are valid only when their matching `has_*` field is
+  true. This avoids sentinel values when a sender has not published, ACKed, or
+  completed any frame.
 
 Optional explicit threaded adapter:
 
@@ -985,9 +1038,12 @@ auto buffer = sender.new_buffer();
 auto receipt = sender.submit(buffer);        // clears buffer on success
 auto receipt2 = sender.submit_and_keep(buffer);
 
-while (auto event = sender.drive_once(10ms)) {
-    if (event.kind() == event_kind::poisoned) {
-        // inspect status/message/path
+while (sender.receipt_status(receipt).is_pending()) {
+    sender.drive_once(10ms);
+    while (auto event = sender.poll_event()) {
+        if (event.kind() == event_kind::poisoned) {
+            // inspect status/message
+        }
     }
 }
 
@@ -1141,11 +1197,17 @@ C ABI tests:
 - `open_mode=lazy` construct performs no network I/O,
 - new QWP buffer for sender,
 - submit/drive/wait happy path,
+- `drive_once` reports idle/progress/terminal without consuming events,
+- `poll_event` is the only event consumer,
+- `receipt_status` can report invalid receipts while `wait` rejects them as API
+  failures,
+- close outcome initializes `has_*` flags correctly when no frame has been
+  published, ACKed, or completed,
 - caller-provided message buffer truncates safely,
 - no hidden thread before runner start,
 - explicit runner starts/stops cleanly,
-- `drive_once` rejects while a runner owns progress,
-- `wait` is passive while a runner owns progress,
+- threaded start consumes the manual handle so manual `drive_once`/`wait` cannot
+  race the runner through normal API use,
 - NULL required output pointers fail cleanly and optional `err_out` may be NULL,
 - C++ RAII wrappers free exactly once.
 
@@ -1165,3 +1227,5 @@ System tests:
 3. Should volatile queue mode support poison persistence through an explicit `poison_dir`?
 4. Can the server add `disposition = RETRYABLE | POISON | TERMINAL` before the FFI ABI is frozen?
 5. What are the initial defaults for `sf_segment_bytes` and `sf_max_total_bytes`?
+6. Should poison/quarantine file paths and per-table durable ACK details be v2
+   C ABI accessors, or are they important enough for v1?

@@ -540,11 +540,14 @@ implementation is wired through.
 If Step 2 already introduced type-only ownership stubs, extend those stubs rather
 than adding a parallel C surface.
 
+This step validates ABI shape, pointer contracts, and state vocabulary only. It
+should not wire real WebSocket transport or durable storage into the C ABI.
+
 Cover:
 
 - sender construction and free
 - buffer creation
-- submit with and without receipt
+- submit and submit-and-keep with required value receipts
 - receipt status
 - wait outcome
 - event polling
@@ -558,6 +561,13 @@ Validation target:
 - Rust panics cannot cross the FFI boundary.
 - C distinguishes API failure from non-error states such as pending, timeout,
   drained, and not drained.
+- The core C submit calls keep receipt outputs required. A no-receipt
+  convenience can be added later as a wrapper if examples prove it useful, but
+  it should not weaken the core publication contract.
+- `drive_once` is progress-only and does not consume events; `poll_event` is the
+  only C event consumer.
+- `receipt_status` may report an invalid receipt, but `wait` on an invalid or
+  unknown receipt is an API failure.
 - Threaded adapter start consumes the manual sender handle on success, leaves it
   unchanged on failure, and does not require runtime "runner active" checks on
   the manual API.
