@@ -43,6 +43,8 @@ pub(crate) struct ManualDriverPrototype<Q = VolatileFrameQueue> {
     server: FakeOrderedServer,
     terminal: bool,
     terminal_fsn: Option<u64>,
+    closing: bool,
+    retry_budget_remaining: Option<usize>,
 }
 
 impl ManualDriverPrototype<VolatileFrameQueue> {
@@ -55,6 +57,8 @@ impl ManualDriverPrototype<VolatileFrameQueue> {
             server,
             terminal: false,
             terminal_fsn: None,
+            closing: false,
+            retry_budget_remaining: None,
         })
     }
 }
@@ -66,12 +70,32 @@ impl<Q: ManualDriverQueue> ManualDriverPrototype<Q> {
             server,
             terminal: false,
             terminal_fsn: None,
+            closing: false,
+            retry_budget_remaining: None,
+        }
+    }
+
+    pub(crate) fn from_queue_with_retry_budget(
+        queue: Q,
+        server: FakeOrderedServer,
+        retry_budget: usize,
+    ) -> Self {
+        Self {
+            queue,
+            server,
+            terminal: false,
+            terminal_fsn: None,
+            closing: false,
+            retry_budget_remaining: Some(retry_budget),
         }
     }
 
     pub(crate) fn try_submit(&mut self, payload: &[u8]) -> Result<QwpReceipt, DriverError> {
         if self.terminal {
             return Err(DriverError::Terminal);
+        }
+        if self.closing {
+            return Err(DriverError::Closing);
         }
         self.queue.try_submit(payload)
     }
@@ -85,6 +109,9 @@ impl<Q: ManualDriverQueue> ManualDriverPrototype<Q> {
         loop {
             if self.terminal {
                 return Err(DriverError::Terminal);
+            }
+            if self.closing {
+                return Err(DriverError::Closing);
             }
             match self.queue.try_submit(payload) {
                 Ok(receipt) => return Ok(receipt),
@@ -118,6 +145,7 @@ impl<Q: ManualDriverQueue> ManualDriverPrototype<Q> {
                     | DriverError::CorruptLog { .. }
                     | DriverError::SubmitTimedOut
                     | DriverError::Terminal
+                    | DriverError::Closing
                     | DriverError::UnknownReceipt { .. }),
                 ) => return Err(err),
             }
@@ -175,6 +203,7 @@ impl<Q: ManualDriverQueue> ManualDriverPrototype<Q> {
                 | DriverError::CorruptLog { .. }
                 | DriverError::SubmitTimedOut
                 | DriverError::Terminal
+                | DriverError::Closing
                 | DriverError::UnknownReceipt { .. }),
             ) => Err(err),
         }
@@ -195,6 +224,33 @@ impl<Q: ManualDriverQueue> ManualDriverPrototype<Q> {
         Ok(self
             .delivery_status(receipt)?
             .unwrap_or(DeliveryOutcome::Timeout))
+    }
+
+    pub(crate) fn close_drain_steps(
+        &mut self,
+        max_drive_steps: usize,
+    ) -> Result<CloseOutcome, DriverError> {
+        self.closing = true;
+
+        for _ in 0..max_drive_steps {
+            if self.terminal {
+                return Ok(CloseOutcome::Terminal);
+            }
+            if self.all_published_receipts_resolved() {
+                return Ok(CloseOutcome::Drained);
+            }
+            if self.drive_once()? == DriveOutcome::Terminal {
+                return Ok(CloseOutcome::Terminal);
+            }
+        }
+
+        if self.terminal {
+            Ok(CloseOutcome::Terminal)
+        } else if self.all_published_receipts_resolved() {
+            Ok(CloseOutcome::Drained)
+        } else {
+            Ok(CloseOutcome::Timeout)
+        }
     }
 
     pub(crate) fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus {
@@ -222,6 +278,16 @@ impl<Q: ManualDriverQueue> ManualDriverPrototype<Q> {
         }
     }
 
+    fn all_published_receipts_resolved(&self) -> bool {
+        match self.queue.published_fsn() {
+            None => true,
+            Some(published_fsn) => self
+                .queue
+                .completed_fsn()
+                .is_some_and(|completed_fsn| completed_fsn >= published_fsn),
+        }
+    }
+
     fn apply_response(
         &mut self,
         response: FakeServerResponse,
@@ -245,17 +311,32 @@ impl<Q: ManualDriverQueue> ManualDriverPrototype<Q> {
                 })
             }
             FakeServerResponse::RetryableFailure => {
-                self.queue.restart_connection();
-                Ok(DriveOutcome::Reconnected {
-                    reason: ReconnectReason::RetryableFailure,
-                })
+                if let Some(remaining) = &mut self.retry_budget_remaining {
+                    if *remaining == 0 {
+                        self.mark_terminal();
+                        return Ok(DriveOutcome::Terminal);
+                    }
+                    *remaining -= 1;
+                }
+                self.restart_for_retryable_failure()
             }
             FakeServerResponse::TerminalFailure => {
-                self.terminal = true;
-                self.terminal_fsn = self.queue.published_fsn();
+                self.mark_terminal();
                 Ok(DriveOutcome::Terminal)
             }
         }
+    }
+
+    fn restart_for_retryable_failure(&mut self) -> Result<DriveOutcome, DriverError> {
+        self.queue.restart_connection();
+        Ok(DriveOutcome::Reconnected {
+            reason: ReconnectReason::RetryableFailure,
+        })
+    }
+
+    fn mark_terminal(&mut self) {
+        self.terminal = true;
+        self.terminal_fsn = self.queue.published_fsn();
     }
 }
 
@@ -267,6 +348,7 @@ pub(crate) trait ManualDriverQueue {
     fn restart_connection(&mut self);
     fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus;
     fn published_fsn(&self) -> Option<u64>;
+    fn completed_fsn(&self) -> Option<u64>;
 }
 
 impl ManualDriverQueue for VolatileFrameQueue {
@@ -296,6 +378,10 @@ impl ManualDriverQueue for VolatileFrameQueue {
 
     fn published_fsn(&self) -> Option<u64> {
         VolatileFrameQueue::published_fsn(self)
+    }
+
+    fn completed_fsn(&self) -> Option<u64> {
+        VolatileFrameQueue::completed_fsn(self)
     }
 }
 
@@ -327,6 +413,10 @@ impl ManualDriverQueue for SfFrameQueue {
     fn published_fsn(&self) -> Option<u64> {
         SfFrameQueue::published_fsn(self)
     }
+
+    fn completed_fsn(&self) -> Option<u64> {
+        SfFrameQueue::completed_fsn(self)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -336,6 +426,7 @@ pub(crate) enum DriverError {
     CorruptLog { offset: usize, reason: &'static str },
     SubmitTimedOut,
     Terminal,
+    Closing,
     UnknownReceipt { fsn: u64 },
 }
 
@@ -377,6 +468,13 @@ pub(crate) enum DeliveryOutcome {
     Poisoned,
     Terminal,
     Timeout,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CloseOutcome {
+    Drained,
+    Timeout,
+    Terminal,
 }
 
 #[derive(Debug)]
@@ -469,6 +567,17 @@ mod tests {
         ManualDriverPrototype::new(options(8, 1024, 4), server).unwrap()
     }
 
+    fn driver_with_retry_budget(
+        server: FakeOrderedServer,
+        retry_budget: usize,
+    ) -> ManualDriverPrototype {
+        ManualDriverPrototype::from_queue_with_retry_budget(
+            VolatileFrameQueue::new(options(8, 1024, 4)).unwrap(),
+            server,
+            retry_budget,
+        )
+    }
+
     fn sf_options(dir: &TempDir) -> SfQueueOptions {
         SfQueueOptions {
             dir: dir.path().to_path_buf(),
@@ -480,6 +589,18 @@ mod tests {
 
     fn sf_driver(dir: &TempDir, server: FakeOrderedServer) -> ManualDriverPrototype<SfFrameQueue> {
         ManualDriverPrototype::from_queue(SfFrameQueue::open(sf_options(dir)).unwrap(), server)
+    }
+
+    fn sf_driver_with_retry_budget(
+        dir: &TempDir,
+        server: FakeOrderedServer,
+        retry_budget: usize,
+    ) -> ManualDriverPrototype<SfFrameQueue> {
+        ManualDriverPrototype::from_queue_with_retry_budget(
+            SfFrameQueue::open(sf_options(dir)).unwrap(),
+            server,
+            retry_budget,
+        )
     }
 
     #[test]
@@ -711,6 +832,98 @@ mod tests {
     }
 
     #[test]
+    fn retry_budget_exhaustion_terminalizes_current_unresolved_receipts() {
+        let mut driver = driver_with_retry_budget(
+            FakeOrderedServer::scripted([
+                FakeSendResult::RetryableFailure,
+                FakeSendResult::RetryableFailure,
+            ]),
+            1,
+        );
+        let first = driver.try_submit(b"first").unwrap();
+        let second = driver.try_submit(b"second").unwrap();
+
+        assert_eq!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::RetryableFailure,
+            }
+        );
+        assert_eq!(
+            driver.receipt_status(first),
+            QwpReceiptStatus::Published { fsn: 0 }
+        );
+
+        assert_eq!(driver.drive_once().unwrap(), DriveOutcome::Terminal);
+        assert_eq!(
+            driver.receipt_status(first),
+            QwpReceiptStatus::Terminal { fsn: 0 }
+        );
+        assert_eq!(
+            driver.receipt_status(second),
+            QwpReceiptStatus::Terminal { fsn: 1 }
+        );
+        assert_eq!(driver.try_submit(b"third"), Err(DriverError::Terminal));
+    }
+
+    #[test]
+    fn close_drain_drives_until_all_published_receipts_resolve() {
+        let mut driver = driver(FakeOrderedServer::ack_each_send());
+        let first = driver.try_submit(b"first").unwrap();
+        let second = driver.try_submit(b"second").unwrap();
+
+        assert_eq!(driver.close_drain_steps(2).unwrap(), CloseOutcome::Drained);
+
+        assert_eq!(
+            driver.receipt_status(first),
+            QwpReceiptStatus::Acked { fsn: 0 }
+        );
+        assert_eq!(
+            driver.receipt_status(second),
+            QwpReceiptStatus::Acked { fsn: 1 }
+        );
+        assert_eq!(driver.try_submit(b"third"), Err(DriverError::Closing));
+    }
+
+    #[test]
+    fn close_drain_timeout_keeps_existing_receipt_observable() {
+        let mut driver = driver(FakeOrderedServer::no_response());
+        let receipt = driver.try_submit(b"payload").unwrap();
+
+        assert_eq!(driver.close_drain_steps(1).unwrap(), CloseOutcome::Timeout);
+
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Sent {
+                fsn: 0,
+                wire_seq: 0,
+            }
+        );
+        assert_eq!(
+            driver.wait_steps(receipt, 0).unwrap(),
+            DeliveryOutcome::Timeout
+        );
+        assert_eq!(driver.try_submit(b"next"), Err(DriverError::Closing));
+    }
+
+    #[test]
+    fn close_drain_reports_terminal_failure() {
+        let mut driver = driver(FakeOrderedServer::scripted([
+            FakeSendResult::TerminalFailure,
+        ]));
+        let receipt = driver.try_submit(b"payload").unwrap();
+
+        assert_eq!(driver.close_drain_steps(1).unwrap(), CloseOutcome::Terminal);
+
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Terminal { fsn: 0 }
+        );
+        assert_eq!(driver.drive_once().unwrap(), DriveOutcome::Terminal);
+        assert_eq!(driver.try_submit(b"next"), Err(DriverError::Terminal));
+    }
+
+    #[test]
     fn terminal_failure_marks_unresolved_receipts_and_rejects_future_submit() {
         let mut driver = driver(FakeOrderedServer::scripted([
             FakeSendResult::NoResponse,
@@ -901,6 +1114,73 @@ mod tests {
         assert_eq!(
             driver.receipt_status(receipt),
             QwpReceiptStatus::Published { fsn: 0 }
+        );
+    }
+
+    #[test]
+    fn sf_close_drain_timeout_leaves_unresolved_frame_recoverable() {
+        let dir = TempDir::new().unwrap();
+        let receipt;
+        {
+            let mut driver = sf_driver(&dir, FakeOrderedServer::no_response());
+            receipt = driver.try_submit(b"payload").unwrap();
+
+            assert_eq!(driver.close_drain_steps(1).unwrap(), CloseOutcome::Timeout);
+            assert_eq!(
+                driver.receipt_status(receipt),
+                QwpReceiptStatus::Sent {
+                    fsn: 0,
+                    wire_seq: 0,
+                }
+            );
+            assert_eq!(driver.try_submit(b"next"), Err(DriverError::Closing));
+        }
+
+        let mut recovered = sf_driver(&dir, FakeOrderedServer::ack_each_send());
+
+        assert_eq!(
+            recovered.receipt_status(receipt),
+            QwpReceiptStatus::Published { fsn: 0 }
+        );
+        assert_eq!(
+            recovered.close_drain_steps(1).unwrap(),
+            CloseOutcome::Drained
+        );
+        assert_eq!(
+            recovered.receipt_status(receipt),
+            QwpReceiptStatus::Acked { fsn: 0 }
+        );
+    }
+
+    #[test]
+    fn sf_retry_budget_exhaustion_leaves_unresolved_frame_recoverable() {
+        let dir = TempDir::new().unwrap();
+        let receipt;
+        {
+            let mut driver = sf_driver_with_retry_budget(
+                &dir,
+                FakeOrderedServer::scripted([FakeSendResult::RetryableFailure]),
+                0,
+            );
+            receipt = driver.try_submit(b"payload").unwrap();
+
+            assert_eq!(driver.drive_once().unwrap(), DriveOutcome::Terminal);
+            assert_eq!(
+                driver.receipt_status(receipt),
+                QwpReceiptStatus::Terminal { fsn: 0 }
+            );
+            assert_eq!(driver.try_submit(b"next"), Err(DriverError::Terminal));
+        }
+
+        let mut recovered = sf_driver(&dir, FakeOrderedServer::ack_each_send());
+
+        assert_eq!(
+            recovered.receipt_status(receipt),
+            QwpReceiptStatus::Published { fsn: 0 }
+        );
+        assert_eq!(
+            recovered.wait_steps(receipt, 1).unwrap(),
+            DeliveryOutcome::Acked
         );
     }
 

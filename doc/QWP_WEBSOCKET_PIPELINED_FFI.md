@@ -725,6 +725,11 @@ close_drain(timeout)
 - returns whether everything was ACKed/quarantined,
 - leaves uncompleted SF frames recoverable.
 
+If `close_drain()` times out, the current sender remains closing: new
+submissions fail, but existing receipts remain observable and unresolved SF
+frames remain recoverable by a newly created sender. If progress becomes
+terminal during close drain, the close outcome is terminal rather than timeout.
+
 ```rust
 close_fast()
 ```

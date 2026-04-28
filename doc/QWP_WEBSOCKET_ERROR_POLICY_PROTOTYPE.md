@@ -17,6 +17,9 @@ Implemented:
   queue
 - driver-level terminal state distinct from queue, storage, and poison state
 - `QwpReceiptStatus::Terminal` and `DeliveryOutcome::Terminal`
+- close-drain outcomes: drained, timeout, terminal
+- retry-budget exhaustion that terminalizes the current sender without
+  completing durable SF records
 - `DriverError::Storage` and `DriverError::CorruptLog` so storage failures do
   not collapse into delivery outcomes
 
@@ -27,10 +30,9 @@ recover the still-unresolved SF frames and replay them.
 
 Not implemented in this slice:
 
-- close-drain semantics
-- reconnect budget counters
 - auth or upgrade rejection detail
 - write/internal server error classification
+- event polling agreement
 - real-server error taxonomy probing
 - durable poison files
 
@@ -45,6 +47,15 @@ Rust unit tests cover:
   submissions on the current driver
 - terminal failure does not poison recovered SF frames; a recreated SF driver can
   replay and ACK the still-unresolved frame
+- close drain rejects new submissions, drives existing receipts to drained,
+  returns timeout while preserving existing receipt observability, and returns
+  terminal when terminal failure occurs during drain
+- close-drain timeout in SF mode leaves unresolved frames recoverable by a newly
+  created sender
+- retry-budget exhaustion terminalizes current unresolved receipts and rejects
+  future submissions
+- retry-budget exhaustion in SF mode leaves unresolved frames recoverable by a
+  newly created sender
 - an SF-backed driver reopens and replays from the first unresolved FSN with
   wire sequence `0`
 - an SF-backed driver persists an ordered reject, poison gap, and later ACK
@@ -53,55 +64,57 @@ Rust unit tests cover:
 Targeted validation commands:
 
 ```bash
-cargo fmt --manifest-path questdb-rs/Cargo.toml
+cargo fmt --check --manifest-path questdb-rs/Cargo.toml
 cargo test --manifest-path questdb-rs/Cargo.toml qwp_ws_driver
 cargo test --manifest-path questdb-rs/Cargo.toml qwp_ws
 ```
 
 Result:
 
-- manual driver filter: 22 passed
-- widened QWP filter: 91 passed, 2 ignored
+- manual driver filter: 28 passed
+- widened QWP filter: 97 passed, 2 ignored
 
 ## Local reflection
 
 - How does this particular step feel?
 
-  The queue seam is small and mechanical. Running the same driver against the
-  SF queue is the right pressure point before adding more policy states.
+  The queue seam is small and mechanical. Running close-drain and retry-budget
+  behaviour through the same volatile/SF driver path is the right pressure point
+  before adding a real event ring or FFI outcomes.
 
 - What was simpler or more awkward than expected?
 
-  Terminal state is cleaner as a driver-layer overlay than as a durable queue
-  completion record. The awkward part is that `receipt_status()` now combines
-  queue state with driver terminal state; the production API should make that
-  layering explicit so storage recovery and current-sender delivery outcomes do
-  not blur together.
+  Terminal and closing state are cleaner as driver-layer overlays than as
+  durable queue completion records. The awkward part is that `receipt_status()`
+  now combines queue state with driver lifecycle state; the production API
+  should make that layering explicit so storage recovery, close outcomes, and
+  current-sender delivery outcomes do not blur together.
 
 - Did the API or implementation shape create accidental complexity?
 
-  Not yet, but terminal handling is the first sign that queue state and sender
-  lifecycle state must remain separate. If later close-drain or reconnect-budget
-  work needs more overlays, the core should probably expose a small status
-  composer rather than scattering these checks across adapters.
+  The main complexity is status composition. Queue state, closing state,
+  terminal state, and future event-ring state are related but not the same. The
+  core should probably expose a small status composer rather than scattering
+  these checks across adapters.
 
 ## Global reflection
 
 - How does this fit into the bigger QWP/WebSocket Store-and-Forward design?
 
   It strengthens the distinction between durable facts and current-driver
-  outcomes. ACK and poison are durable completion facts. Terminal failure can
-  end the current sender and current receipts without destroying recoverable SF
-  data.
+  outcomes. ACK and poison are durable completion facts. Terminal failure,
+  retry-budget exhaustion, and close timeout can affect the current sender
+  without destroying recoverable SF data.
 
 - Did this step strengthen or weaken the core assumptions?
 
-  It strengthened them. The same manual driver can now exercise volatile and SF
-  queues, and the SF queue can survive terminal sender failure without being
-  converted into poison or data loss.
+  It strengthened them. The same manual driver now exercises volatile and SF
+  queues for poison, close, and retry outcomes, and the SF queue can survive
+  terminal sender failure or close timeout without being converted into poison
+  or data loss.
 
 - Should the next step proceed, or should the design be adjusted first?
 
-  Continue Step 9 before moving to Step 10. The next slice should add close-drain
-  and reconnect-budget behaviour through the same queue seam, then Step 10
-  should validate real-server error taxonomy before any FFI outcome enum hardens.
+  Continue Step 9 only far enough to add event polling agreement. After that,
+  Step 10 should validate real-server error taxonomy before any FFI outcome enum
+  hardens.
