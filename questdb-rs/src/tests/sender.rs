@@ -1105,6 +1105,7 @@ fn test_tls_insecure_skip_verify(
     Ok(())
 }
 
+#[cfg(feature = "_sync-sender")]
 #[test]
 fn bad_uppercase_protocol() {
     let res = Sender::from_conf("TCP::addr=localhost:9009;");

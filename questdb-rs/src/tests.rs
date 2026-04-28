@@ -33,7 +33,7 @@ mod mock;
 #[cfg(feature = "sync-sender-qwp-udp")]
 mod qwp;
 
-#[cfg(feature = "sync-sender-qwp-udp")]
+#[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
 pub(crate) mod qwp_decode;
 
 #[cfg(feature = "sync-sender-qwp-udp")]

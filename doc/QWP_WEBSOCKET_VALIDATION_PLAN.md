@@ -24,8 +24,10 @@ As of 2026-04-28:
   `doc/QWP_WEBSOCKET_SELF_SUFFICIENT_REPLAY_PROBE.md`.
 - Step 4 also corrected the client-side wire-sequence assumption: the first
   QWP/WebSocket frame on a fresh connection is ACKed as sequence `0`.
-- Step 5 queue work is unblocked by Rust-vs-server protocol validation and the
-  core Java/Rust replay payload parity fixture.
+- Step 5 has a transport-free volatile queue and receipt prototype with
+  reflection in `doc/QWP_WEBSOCKET_VOLATILE_QUEUE_PROTOTYPE.md`.
+- Step 6 has a manual-driver prototype over a fake ordered server with
+  reflection in `doc/QWP_WEBSOCKET_MANUAL_DRIVER_PROTOTYPE.md`.
 - Extended Java/Rust fixtures for arrays, decimals, UTF-8 strings, sparse
   columns, and schema evolution remain recommended before hardening the full
   product surface.

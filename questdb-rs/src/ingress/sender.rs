@@ -23,7 +23,9 @@
  ******************************************************************************/
 
 use crate::error::{self, Result};
-use crate::ingress::{Buffer, Protocol, ProtocolVersion, SenderBuilder};
+#[cfg(feature = "_sync-sender")]
+use crate::ingress::SenderBuilder;
+use crate::ingress::{Buffer, Protocol, ProtocolVersion};
 use std::fmt::{Debug, Formatter};
 
 #[cfg(feature = "sync-sender-qwp-udp")]
@@ -36,7 +38,13 @@ pub(crate) use qwp_udp::*;
 mod qwp_ws_codec;
 
 #[cfg(feature = "_sender-qwp-ws")]
+mod qwp_ws_driver;
+
+#[cfg(feature = "_sender-qwp-ws")]
 mod qwp_ws_ownership;
+
+#[cfg(feature = "_sender-qwp-ws")]
+mod qwp_ws_queue;
 
 #[cfg(feature = "_sender-qwp-ws")]
 pub use qwp_ws_ownership::*;
@@ -151,6 +159,7 @@ impl Sender {
     /// returns once the connection is fully established. If the connection
     /// requires authentication or TLS, these will also be completed before
     /// returning.
+    #[cfg(feature = "_sync-sender")]
     pub fn from_conf<T: AsRef<str>>(conf: T) -> Result<Self> {
         SenderBuilder::from_conf(conf)?.build()
     }
@@ -163,6 +172,7 @@ impl Sender {
     /// returns once the connection is fully established. If the connection
     /// requires authentication or TLS, these will also be completed before
     /// returning.
+    #[cfg(feature = "_sync-sender")]
     pub fn from_env() -> Result<Self> {
         SenderBuilder::from_env()?.build()
     }
