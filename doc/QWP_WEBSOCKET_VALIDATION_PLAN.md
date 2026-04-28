@@ -30,6 +30,8 @@ As of 2026-04-28:
   reflection in `doc/QWP_WEBSOCKET_MANUAL_DRIVER_PROTOTYPE.md`.
 - Step 7 has a passing real-server ACK/order/reject probe in
   `doc/QWP_WEBSOCKET_ACK_ORDER_REJECT_PROBE.md`.
+- Step 8 has a minimal file-backed SF queue prototype and reflection in
+  `doc/QWP_WEBSOCKET_SF_QUEUE_PROTOTYPE.md`.
 - Extended Java/Rust fixtures for arrays, decimals, UTF-8 strings, sparse
   columns, and schema evolution remain recommended before hardening the full
   product surface.

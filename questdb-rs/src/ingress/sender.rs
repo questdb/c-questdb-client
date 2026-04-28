@@ -47,6 +47,9 @@ mod qwp_ws_ownership;
 mod qwp_ws_queue;
 
 #[cfg(feature = "_sender-qwp-ws")]
+mod qwp_ws_sf_queue;
+
+#[cfg(feature = "_sender-qwp-ws")]
 pub use qwp_ws_ownership::*;
 
 #[cfg(feature = "sync-sender-qwp-ws")]
