@@ -35,6 +35,12 @@ pub(crate) use qwp_udp::*;
 #[cfg(feature = "_sender-qwp-ws")]
 mod qwp_ws_codec;
 
+#[cfg(feature = "_sender-qwp-ws")]
+mod qwp_ws_ownership;
+
+#[cfg(feature = "_sender-qwp-ws")]
+pub use qwp_ws_ownership::*;
+
 #[cfg(feature = "sync-sender-qwp-ws")]
 mod qwp_ws;
 

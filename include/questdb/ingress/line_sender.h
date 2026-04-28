@@ -873,6 +873,16 @@ bool line_sender_buffer_check_can_flush(
 typedef struct line_sender line_sender;
 
 /**
+ * Type-only QWP/WebSocket sender ownership prototype.
+ */
+typedef struct line_sender_qwpws line_sender_qwpws;
+
+/**
+ * Type-only QWP/WebSocket threaded ownership prototype.
+ */
+typedef struct line_sender_qwpws_threaded line_sender_qwpws_threaded;
+
+/**
  * Accumulates parameters for a new `line_sender` object.
  */
 typedef struct line_sender_opts line_sender_opts;
@@ -1298,6 +1308,41 @@ bool line_sender_must_close(const line_sender* sender);
  */
 LINESENDER_API
 void line_sender_close(line_sender* sender);
+
+/**
+ * Create a type-only QWP/WebSocket sender ownership prototype.
+ *
+ * This validates ownership conversion before transport, queue, or encoder
+ * implementation exists. The config is intentionally ignored for now.
+ */
+LINESENDER_API
+line_sender_qwpws* line_sender_qwpws_new(
+    line_sender_utf8 config, line_sender_error** err_out);
+
+/**
+ * Free a type-only QWP/WebSocket sender ownership prototype.
+ */
+LINESENDER_API
+void line_sender_qwpws_free(line_sender_qwpws* sender);
+
+/**
+ * Consume a manual QWP/WebSocket sender prototype into a threaded prototype.
+ *
+ * On success, `*sender` is set to NULL and `threaded_out` receives ownership.
+ * On failure, `*sender` remains unchanged.
+ */
+LINESENDER_API
+bool line_sender_qwpws_threaded_start(
+    line_sender_qwpws** sender,
+    line_sender_qwpws_threaded** threaded_out,
+    line_sender_error** err_out);
+
+/**
+ * Stop and free a type-only QWP/WebSocket threaded prototype.
+ */
+LINESENDER_API
+void line_sender_qwpws_threaded_stop(
+    line_sender_qwpws_threaded* threaded);
 
 /**
  * Send the given buffer of rows to the QuestDB server, clearing the buffer.

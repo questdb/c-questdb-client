@@ -37,8 +37,8 @@ use std::str;
 use questdb::{
     Error, ErrorCode, ingress,
     ingress::{
-        Buffer, CertificateAuthority, ColumnName, Protocol, Sender, SenderBuilder, TableName,
-        TimestampMicros, TimestampNanos,
+        Buffer, CertificateAuthority, ColumnName, Protocol, QwpWsOptions, QwpWsSender,
+        QwpWsThreadedSender, Sender, SenderBuilder, TableName, TimestampMicros, TimestampNanos,
     },
 };
 
@@ -1945,6 +1945,12 @@ pub unsafe extern "C" fn line_sender_opts_free(opts: *mut line_sender_opts) {
 /// one of its variants with this object to send them.
 pub struct line_sender(Sender);
 
+/// Type-only QWP/WebSocket sender ownership prototype.
+pub struct line_sender_qwpws(Option<QwpWsSender>);
+
+/// Type-only QWP/WebSocket threaded ownership prototype.
+pub struct line_sender_qwpws_threaded(QwpWsThreadedSender);
+
 /// Create a new line sender instance from the given options object.
 ///
 /// In the case of TCP, this synchronously establishes the TCP connection, and
@@ -2113,6 +2119,105 @@ pub unsafe extern "C" fn line_sender_close(sender: *mut line_sender) {
     }
 }
 
+/// Create a type-only QWP/WebSocket sender ownership prototype.
+///
+/// This validates handle ownership before transport, queue, or encoder
+/// implementation exists. The config argument is intentionally ignored.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_qwpws_new(
+    _config: line_sender_utf8,
+    err_out: *mut *mut line_sender_error,
+) -> *mut line_sender_qwpws {
+    let sender = match QwpWsSender::open(QwpWsOptions::default()) {
+        Ok(sender) => sender,
+        Err(err) => {
+            unsafe { set_err_out_from_error(err_out, err) };
+            return ptr::null_mut();
+        }
+    };
+    Box::into_raw(Box::new(line_sender_qwpws(Some(sender))))
+}
+
+/// Free a type-only QWP/WebSocket sender ownership prototype.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_qwpws_free(sender: *mut line_sender_qwpws) {
+    unsafe {
+        if !sender.is_null() {
+            drop(Box::from_raw(sender));
+        }
+    }
+}
+
+/// Consume a manual QWP/WebSocket sender prototype into a threaded prototype.
+///
+/// On success, `*sender` is set to NULL and `threaded_out` receives ownership.
+/// On failure, `*sender` remains unchanged.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_qwpws_threaded_start(
+    sender: *mut *mut line_sender_qwpws,
+    threaded_out: *mut *mut line_sender_qwpws_threaded,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    unsafe {
+        if sender.is_null() {
+            set_err_out(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "QWP/WS threaded start requires a non-NULL sender pointer".to_string(),
+            );
+            return false;
+        }
+        let sender_ptr = *sender;
+        if sender_ptr.is_null() {
+            set_err_out(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "QWP/WS threaded start requires a non-NULL sender handle".to_string(),
+            );
+            return false;
+        }
+        if threaded_out.is_null() {
+            set_err_out(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "QWP/WS threaded start requires a non-NULL threaded_out".to_string(),
+            );
+            return false;
+        }
+
+        let manual = match (*sender_ptr).0.take() {
+            Some(manual) => manual,
+            None => {
+                set_err_out(
+                    err_out,
+                    ErrorCode::InvalidApiCall,
+                    "QWP/WS sender handle has already been consumed".to_string(),
+                );
+                return false;
+            }
+        };
+
+        let threaded = QwpWsThreadedSender::from_sender_type_only(manual);
+        drop(Box::from_raw(sender_ptr));
+        *sender = ptr::null_mut();
+        *threaded_out = Box::into_raw(Box::new(line_sender_qwpws_threaded(threaded)));
+        true
+    }
+}
+
+/// Stop and free a type-only QWP/WebSocket threaded prototype.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_qwpws_threaded_stop(
+    threaded: *mut line_sender_qwpws_threaded,
+) {
+    unsafe {
+        if !threaded.is_null() {
+            let threaded = Box::from_raw(threaded);
+            threaded.0.stop();
+        }
+    }
+}
+
 /// Send the given buffer of rows to the QuestDB server, clearing the buffer.
 ///
 /// After this function returns, the buffer is empty and ready for the next batch.
@@ -2241,5 +2346,78 @@ pub unsafe fn _build_system_hack(err: *mut questdb_conf_str_parse_err) {
     unsafe {
         use questdb_confstr_ffi::questdb_conf_str_parse_err_free;
         questdb_conf_str_parse_err_free(err);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_utf8() -> line_sender_utf8 {
+        line_sender_utf8 {
+            len: 0,
+            buf: ptr::null(),
+        }
+    }
+
+    #[test]
+    fn qwpws_threaded_start_consumes_sender_handle() {
+        unsafe {
+            let mut err = ptr::null_mut();
+            let mut sender = line_sender_qwpws_new(empty_utf8(), &mut err);
+            assert!(!sender.is_null());
+            assert!(err.is_null());
+
+            let mut threaded = ptr::null_mut();
+            assert!(line_sender_qwpws_threaded_start(
+                &mut sender,
+                &mut threaded,
+                &mut err
+            ));
+            assert!(err.is_null());
+            assert!(sender.is_null());
+            assert!(!threaded.is_null());
+
+            line_sender_qwpws_threaded_stop(threaded);
+        }
+    }
+
+    #[test]
+    fn qwpws_threaded_start_rejects_null_sender_pointer() {
+        unsafe {
+            let mut err = ptr::null_mut();
+            let mut threaded = ptr::null_mut();
+
+            assert!(!line_sender_qwpws_threaded_start(
+                ptr::null_mut(),
+                &mut threaded,
+                &mut err
+            ));
+            assert!(threaded.is_null());
+            assert!(!err.is_null());
+
+            line_sender_error_free(err);
+        }
+    }
+
+    #[test]
+    fn qwpws_threaded_start_rejects_null_threaded_out_without_consuming_sender() {
+        unsafe {
+            let mut err = ptr::null_mut();
+            let mut sender = line_sender_qwpws_new(empty_utf8(), &mut err);
+            assert!(!sender.is_null());
+            assert!(err.is_null());
+
+            assert!(!line_sender_qwpws_threaded_start(
+                &mut sender,
+                ptr::null_mut(),
+                &mut err
+            ));
+            assert!(!sender.is_null());
+            assert!(!err.is_null());
+
+            line_sender_error_free(err);
+            line_sender_qwpws_free(sender);
+        }
     }
 }

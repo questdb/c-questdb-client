@@ -197,7 +197,10 @@ pub(super) fn parse_http_header_block(block: &[u8]) -> crate::Result<ParsedHttpH
         .map_err(|_| error::fmt!(SocketError, "Upgrade response headers are not UTF-8"))?;
     let mut lines = header_text.split("\r\n");
     let status_line = lines.next().ok_or_else(|| {
-        error::fmt!(SocketError, "WebSocket upgrade response missing status line")
+        error::fmt!(
+            SocketError,
+            "WebSocket upgrade response missing status line"
+        )
     })?;
     let mut parts = status_line.splitn(3, ' ');
     let _http_ver = parts.next();
@@ -301,10 +304,7 @@ pub(super) enum ResponseAction {
     DurableAck,
 }
 
-pub(super) fn parse_response(
-    payload: &[u8],
-    expected_seq: u64,
-) -> crate::Result<ResponseAction> {
+pub(super) fn parse_response(payload: &[u8], expected_seq: u64) -> crate::Result<ResponseAction> {
     if payload.is_empty() {
         return Err(error::fmt!(SocketError, "Empty QWP response frame"));
     }
@@ -379,9 +379,9 @@ fn parse_error_body(payload: &[u8]) -> crate::Result<(u64, String)> {
     }
     let seq = u64::from_le_bytes(payload[1..9].try_into().unwrap());
     let msg_len = u16::from_le_bytes(payload[9..11].try_into().unwrap()) as usize;
-    let msg_end = 11usize.checked_add(msg_len).ok_or_else(|| {
-        error::fmt!(SocketError, "QWP error response message length overflow")
-    })?;
+    let msg_end = 11usize
+        .checked_add(msg_len)
+        .ok_or_else(|| error::fmt!(SocketError, "QWP error response message length overflow"))?;
     if payload.len() < msg_end {
         return Err(error::fmt!(
             SocketError,

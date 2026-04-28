@@ -1,6 +1,6 @@
 # QWP/WebSocket pipelined design validation plan
 
-Status: **draft**. This document is a validation plan for
+Status: **active draft**. This document is a validation plan for
 `doc/QWP_WEBSOCKET_PIPELINED_FFI.md`, not an implementation schedule.
 
 The goal is to validate the main design decisions for pipelined QWP over
@@ -8,6 +8,24 @@ WebSocket with Store-and-Forward in Rust and the C/C++/Python FFI layers.
 
 The plan is intentionally iterative. Each step should validate one design bet,
 then stop for reflection before adding the next layer.
+
+## Current progress
+
+As of 2026-04-28:
+
+- Step 1 has a sketch in `doc/QWP_WEBSOCKET_API_SKETCH.md`.
+- Step 2 has a type-only ownership prototype and reflection in
+  `doc/QWP_WEBSOCKET_PROGRESS_OWNERSHIP_PROTOTYPE.md`.
+- Step 3 has a Rust encoder-only byte-shape spike and reflection in
+  `doc/QWP_WEBSOCKET_REPLAY_ENCODER_SPIKE.md`.
+- Step 3 Java/Rust golden payload parity is still open.
+- Step 4 has a passing real-server self-sufficient replay probe in
+  `doc/QWP_WEBSOCKET_SELF_SUFFICIENT_REPLAY_PROBE.md`.
+- Step 4 also corrected the client-side wire-sequence assumption: the first
+  QWP/WebSocket frame on a fresh connection is ACKed as sequence `0`.
+- Step 5 queue work is unblocked by Rust-vs-server protocol validation, but the
+  Step 3 Java/Rust golden payload parity question must still be resolved or
+  deliberately deferred with rationale.
 
 ## Validation discipline
 
@@ -64,6 +82,11 @@ the design to match the protocol truth, then adjust the mock.
 
 Java is a reference implementation for the v1 dense replay shape, not a
 substitute for validation.
+
+The Rust encoder spike may start with Rust-only byte-shape tests. Before queue
+work turns replay payloads into product state, add the Java/Rust fixtures below
+or explicitly record that real-server semantic validation, not byte-for-byte Java
+parity, is the compatibility gate for v1.
 
 Before implementation depends on Java-compatible behavior, add small golden
 fixtures that compare Java and Rust at the QWP application-payload layer:
@@ -183,6 +206,16 @@ Implement the Java-style v1 replay encoding path behind focused tests first.
 Every frame stored by the new pipelined sender must be valid as the first QWP
 data frame on a fresh WebSocket connection.
 
+This step has two layers:
+
+- Rust byte-shape tests for the replay encoder.
+- Java/Rust replay payload fixtures, or documented real-server-validated
+  semantic equivalence.
+
+The Rust-only encoder layer is enough to proceed to Step 4. It is not enough to
+proceed to Step 5 unless Step 4 passes and the Java parity question is either
+resolved or deliberately deferred with rationale.
+
 Validation target:
 
 - Stored frames contain enough schema information for independent replay.
@@ -221,6 +254,10 @@ Global reflection:
 Before building the queue around the encoder assumption, validate it against a
 real QuestDB server.
 
+This is a hard gate before Step 5. The harness should exercise the replay
+encoder directly; it should not require the volatile queue, disk
+Store-and-Forward, receipts, or the new sender state machine.
+
 Use the smallest harness that can:
 
 - open a real QWP/WebSocket connection
@@ -229,6 +266,8 @@ Use the smallest harness that can:
 - reconnect
 - send that later frame alone as the first QWP data frame on the new connection
 - verify the expected rows are visible in QuestDB
+- capture the unmasked QWP payload bytes and relevant QWP header fields for the
+  first and replayed frames
 
 Validation target:
 
@@ -241,6 +280,8 @@ Validation target:
   least one repeated-symbol and one higher-cardinality scenario.
 - If Java-generated and Rust-generated fixture payloads differ, both variants
   ingest to the same table contents or the design stops for protocol review.
+- If Java fixtures are not available yet, the probe validates Rust-vs-server
+  protocol truth only. It must not be described as Java compatibility proof.
 
 Design pressure to watch:
 
@@ -477,6 +518,9 @@ Global reflection:
 
 Add C ABI stubs and tests for ownership and output-pointer contracts before full
 implementation is wired through.
+
+If Step 2 already introduced type-only ownership stubs, extend those stubs rather
+than adding a parallel C surface.
 
 Cover:
 

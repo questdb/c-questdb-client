@@ -35,6 +35,7 @@ use std::time::Duration;
 use crate::ingress::{Protocol, SenderBuilder};
 
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const FIRST_WIRE_SEQUENCE: u64 = 0;
 
 fn read_request_until_blank<R: Read>(stream: &mut R) -> std::io::Result<Vec<u8>> {
     let mut buf = Vec::new();
@@ -120,8 +121,13 @@ fn compute_accept(key_b64: &str) -> String {
 }
 
 fn sha1(input: &[u8]) -> [u8; 20] {
-    let (mut h0, mut h1, mut h2, mut h3, mut h4) =
-        (0x67452301u32, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0);
+    let (mut h0, mut h1, mut h2, mut h3, mut h4) = (
+        0x67452301u32,
+        0xEFCDAB89,
+        0x98BADCFE,
+        0x10325476,
+        0xC3D2E1F0,
+    );
     let bit_len = (input.len() as u64).wrapping_mul(8);
     let mut p = Vec::with_capacity(input.len() + 64);
     p.extend_from_slice(input);
@@ -172,7 +178,7 @@ fn sha1(input: &[u8]) -> [u8; 20] {
 }
 
 /// Spawn a single-connection server that performs the upgrade then echoes back
-/// `n` OK frames in sequence (sequence numbers 1..=n).
+/// `n` OK frames in sequence (sequence numbers 0 through n-1).
 fn spawn_ok_server(messages: usize) -> (u16, mpsc::Receiver<Vec<u8>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -180,8 +186,12 @@ fn spawn_ok_server(messages: usize) -> (u16, mpsc::Receiver<Vec<u8>>) {
 
     thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
 
         let req_bytes = read_request_until_blank(&mut stream).unwrap();
         let req = String::from_utf8_lossy(&req_bytes).to_string();
@@ -197,7 +207,7 @@ fn spawn_ok_server(messages: usize) -> (u16, mpsc::Receiver<Vec<u8>>) {
         );
         stream.write_all(resp.as_bytes()).unwrap();
 
-        for seq in 1..=messages {
+        for seq in 0..messages {
             let (_fin, _op, payload) = read_frame(&mut stream).unwrap();
             tx.send(payload).unwrap();
             let mut ok = vec![0u8];
@@ -278,8 +288,12 @@ async fn async_qwp_ws_server_error_propagates() {
 
     thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
         let req_bytes = read_request_until_blank(&mut stream).unwrap();
         let req = String::from_utf8_lossy(&req_bytes).to_string();
         let key = parse_header(&req, "Sec-WebSocket-Key").unwrap();
@@ -297,7 +311,7 @@ async fn async_qwp_ws_server_error_propagates() {
         let msg = b"async parse error";
         let mut err = Vec::new();
         err.push(0x05u8);
-        err.extend_from_slice(&1u64.to_le_bytes());
+        err.extend_from_slice(&FIRST_WIRE_SEQUENCE.to_le_bytes());
         err.extend_from_slice(&(msg.len() as u16).to_le_bytes());
         err.extend_from_slice(msg);
         write_server_binary_frame(&mut stream, &err).unwrap();
@@ -364,7 +378,7 @@ fn spawn_pipelined_server(n: usize) -> (u16, std::sync::mpsc::Receiver<usize>) {
         }
 
         // Phase 2: ack in reverse order to prove the client matches by sequence.
-        for seq in (1..=n).rev() {
+        for seq in (0..n).rev() {
             let mut ok = vec![0u8];
             ok.extend_from_slice(&(seq as u64).to_le_bytes());
             ok.extend_from_slice(&0u16.to_le_bytes());
@@ -432,8 +446,12 @@ async fn async_qwp_ws_max_in_flight_throttles() {
 
     thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
         let req_bytes = read_request_until_blank(&mut stream).unwrap();
         let req = String::from_utf8_lossy(&req_bytes).to_string();
         let key = parse_header(&req, "Sec-WebSocket-Key").unwrap();
@@ -448,21 +466,21 @@ async fn async_qwp_ws_max_in_flight_throttles() {
         );
         stream.write_all(resp.as_bytes()).unwrap();
 
-        // Frame 1
+        // Frame 1 uses wire sequence 0.
         let _ = read_frame(&mut stream).unwrap();
         frame_tx.send(std::time::Instant::now()).unwrap();
         thread::sleep(Duration::from_millis(150));
         let mut ok = vec![0u8];
-        ok.extend_from_slice(&1u64.to_le_bytes());
+        ok.extend_from_slice(&FIRST_WIRE_SEQUENCE.to_le_bytes());
         ok.extend_from_slice(&0u16.to_le_bytes());
         write_server_binary_frame(&mut stream, &ok).unwrap();
         ack_tx.send(std::time::Instant::now()).unwrap();
 
-        // Frame 2 -- must not arrive until *after* ack 1 if window=1.
+        // Frame 2 -- must not arrive until *after* ack 0 if window=1.
         let _ = read_frame(&mut stream).unwrap();
         frame_tx.send(std::time::Instant::now()).unwrap();
         let mut ok = vec![0u8];
-        ok.extend_from_slice(&2u64.to_le_bytes());
+        ok.extend_from_slice(&1u64.to_le_bytes());
         ok.extend_from_slice(&0u16.to_le_bytes());
         write_server_binary_frame(&mut stream, &ok).unwrap();
 
@@ -481,13 +499,23 @@ async fn async_qwp_ws_max_in_flight_throttles() {
     let s1 = sender.clone();
     let h1 = tokio::spawn(async move {
         let mut buf = s1.new_buffer();
-        buf.table("t").unwrap().column_i64("v", 1).unwrap().at_now().unwrap();
+        buf.table("t")
+            .unwrap()
+            .column_i64("v", 1)
+            .unwrap()
+            .at_now()
+            .unwrap();
         s1.flush(&mut buf).await
     });
     let s2 = sender.clone();
     let h2 = tokio::spawn(async move {
         let mut buf = s2.new_buffer();
-        buf.table("t").unwrap().column_i64("v", 2).unwrap().at_now().unwrap();
+        buf.table("t")
+            .unwrap()
+            .column_i64("v", 2)
+            .unwrap()
+            .at_now()
+            .unwrap();
         s2.flush(&mut buf).await
     });
 
@@ -499,7 +527,7 @@ async fn async_qwp_ws_max_in_flight_throttles() {
     let frame2 = frame_rx.recv().unwrap();
     assert!(
         frame2 >= ack1,
-        "with max_in_flight=1, frame 2 must not be sent before ack 1; got frame1={:?}, ack1={:?}, frame2={:?}",
+        "with max_in_flight=1, frame 2 must not be sent before ack 0; got frame1={:?}, ack0={:?}, frame2={:?}",
         frame1,
         ack1,
         frame2
@@ -536,7 +564,8 @@ fn spawn_dropping_then_recovering_server(
 
         // Generation 1: read whatever frames arrive then drop without acking.
         let (mut s1, _) = listener.accept().unwrap();
-        s1.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        s1.set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
         s1.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
         do_upgrade(&mut s1);
         loop {
@@ -547,12 +576,12 @@ fn spawn_dropping_then_recovering_server(
         }
         drop(s1);
 
-        // Generation 2: read replayed frames, ack each in order with seq=i.
+        // Generation 2: read replayed frames, ack each with zero-based sequence ids.
         let (mut s2, _) = listener.accept().unwrap();
         s2.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         s2.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
         do_upgrade(&mut s2);
-        for i in 1..=expected_replay_count as u64 {
+        for i in 0..expected_replay_count as u64 {
             let (_fin, _op, payload) = read_frame(&mut s2).unwrap();
             tx.send((2, payload)).unwrap();
             let mut ok = vec![0u8];
@@ -625,7 +654,10 @@ async fn async_qwp_ws_failover_replays_in_flight_messages() {
             gen2 += 1;
         }
     }
-    assert_eq!(gen2, N, "expected {N} replayed frames on the new connection");
+    assert_eq!(
+        gen2, N,
+        "expected {N} replayed frames on the new connection"
+    );
 }
 
 #[tokio::test]
@@ -660,13 +692,23 @@ async fn async_qwp_ws_failover_disabled_latches_terminal_error() {
         .await
         .unwrap();
     let mut buf = sender.new_buffer();
-    buf.table("t").unwrap().column_i64("v", 1).unwrap().at_now().unwrap();
+    buf.table("t")
+        .unwrap()
+        .column_i64("v", 1)
+        .unwrap()
+        .at_now()
+        .unwrap();
     let err = sender.flush(&mut buf).await.unwrap_err();
     assert_eq!(err.code(), crate::ErrorCode::SocketError);
 
     // A subsequent flush sees the latched error.
     let mut buf2 = sender.new_buffer();
-    buf2.table("t").unwrap().column_i64("v", 2).unwrap().at_now().unwrap();
+    buf2.table("t")
+        .unwrap()
+        .column_i64("v", 2)
+        .unwrap()
+        .at_now()
+        .unwrap();
     let err2 = sender.flush(&mut buf2).await.unwrap_err();
     assert_eq!(err2.code(), crate::ErrorCode::SocketError);
 }

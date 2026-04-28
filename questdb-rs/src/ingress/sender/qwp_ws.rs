@@ -285,9 +285,13 @@ pub(crate) fn perform_upgrade<S: Read + Write>(
         request_durable_ack,
     );
 
-    stream
-        .write_all(req.as_bytes())
-        .map_err(|io| error::fmt!(SocketError, "Could not send WebSocket upgrade request: {}", io))?;
+    stream.write_all(req.as_bytes()).map_err(|io| {
+        error::fmt!(
+            SocketError,
+            "Could not send WebSocket upgrade request: {}",
+            io
+        )
+    })?;
 
     let header_block = read_http_header_block(stream)?;
     let parsed = codec::parse_http_header_block(&header_block)?;
@@ -322,7 +326,6 @@ fn read_http_header_block<R: Read>(stream: &mut R) -> crate::Result<Vec<u8>> {
     }
 }
 
-
 // ---------- connect ----------
 
 /// Establish a fresh QWP/WebSocket connection: TCP → optional TLS → HTTP
@@ -340,17 +343,33 @@ fn establish_connection(
     let connect_timeout = *qwp_ws.connect_timeout;
     let request_timeout = *qwp_ws.request_timeout;
 
-    let addr = (host, port.parse::<u16>().map_err(|_| {
-        error::fmt!(ConfigError, "Invalid port: {:?}", port)
-    })?)
+    let addr = (
+        host,
+        port.parse::<u16>()
+            .map_err(|_| error::fmt!(ConfigError, "Invalid port: {:?}", port))?,
+    )
         .to_socket_addrs()
-        .map_err(|io| error::fmt!(CouldNotResolveAddr, "Could not resolve {}:{}: {}", host, port, io))?
+        .map_err(|io| {
+            error::fmt!(
+                CouldNotResolveAddr,
+                "Could not resolve {}:{}: {}",
+                host,
+                port,
+                io
+            )
+        })?
         .next()
-        .ok_or_else(|| error::fmt!(CouldNotResolveAddr, "No address found for {}:{}", host, port))?;
+        .ok_or_else(|| {
+            error::fmt!(
+                CouldNotResolveAddr,
+                "No address found for {}:{}",
+                host,
+                port
+            )
+        })?;
 
-    let tcp = TcpStream::connect_timeout(&addr, connect_timeout).map_err(|io| {
-        error::fmt!(SocketError, "Could not connect to {}: {}", addr, io)
-    })?;
+    let tcp = TcpStream::connect_timeout(&addr, connect_timeout)
+        .map_err(|io| error::fmt!(SocketError, "Could not connect to {}: {}", addr, io))?;
     tcp.set_nodelay(true).ok();
     tcp.set_read_timeout(Some(request_timeout)).ok();
     tcp.set_write_timeout(Some(request_timeout)).ok();
@@ -360,9 +379,10 @@ fn establish_connection(
             error::fmt!(ConfigError, "TLS settings missing for QWP/WebSocket Secure")
         })?;
         let cfg: Arc<rustls::ClientConfig> = configure_tls(tls)?;
-        let server_name = host.to_string().try_into().map_err(|e| {
-            error::fmt!(TlsError, "Invalid TLS server name {:?}: {}", host, e)
-        })?;
+        let server_name = host
+            .to_string()
+            .try_into()
+            .map_err(|e| error::fmt!(TlsError, "Invalid TLS server name {:?}: {}", host, e))?;
         let conn = rustls::ClientConnection::new(cfg, server_name)
             .map_err(|e| error::fmt!(TlsError, "TLS handshake setup failed: {}", e))?;
         WsStream::Tls(Box::new(rustls::StreamOwned::new(conn, tcp)))
@@ -415,28 +435,30 @@ pub(crate) fn connect_qwp_ws(
         auth_header.as_deref(),
     )?;
 
-    Ok(SyncProtocolHandler::SyncQwpWs(Box::new(SyncQwpWsHandlerState {
-        stream,
-        request_timeout: *qwp_ws.request_timeout,
-        negotiated_version,
-        global_dict: SymbolGlobalDict::new(),
-        schema_registry: SchemaRegistry::new(),
-        scratch: QwpWsEncodeScratch::new(),
-        recv: Vec::new(),
-        send_buf: Vec::with_capacity(16 * 1024),
-        request_durable_ack: *qwp_ws.request_durable_ack,
-        sequence: 0,
-        reconnect: ReconnectParams {
-            host: host.to_string(),
-            port: port.to_string(),
-            use_tls,
-            tls_settings,
-            auth_header,
-            qwp_ws: qwp_ws.clone(),
-            on_failover_reset,
+    Ok(SyncProtocolHandler::SyncQwpWs(Box::new(
+        SyncQwpWsHandlerState {
+            stream,
+            request_timeout: *qwp_ws.request_timeout,
+            negotiated_version,
+            global_dict: SymbolGlobalDict::new(),
+            schema_registry: SchemaRegistry::new(),
+            scratch: QwpWsEncodeScratch::new(),
+            recv: Vec::new(),
+            send_buf: Vec::with_capacity(16 * 1024),
+            request_durable_ack: *qwp_ws.request_durable_ack,
+            sequence: 0,
+            reconnect: ReconnectParams {
+                host: host.to_string(),
+                port: port.to_string(),
+                use_tls,
+                tls_settings,
+                auth_header,
+                qwp_ws: qwp_ws.clone(),
+                on_failover_reset,
+            },
+            terminal_error: None,
         },
-        terminal_error: None,
-    })))
+    )))
 }
 
 // ---------- send / receive ----------
@@ -471,12 +493,9 @@ fn is_transport_error(err: &crate::Error) -> bool {
     matches!(err.code(), crate::ErrorCode::SocketError)
 }
 
-fn flush_once(
-    state: &mut SyncQwpWsHandlerState,
-    buffer: &QwpBuffer,
-) -> crate::Result<()> {
-    let seq = state.sequence.wrapping_add(1);
-    state.sequence = seq;
+fn flush_once(state: &mut SyncQwpWsHandlerState, buffer: &QwpBuffer) -> crate::Result<()> {
+    let seq = state.sequence;
+    state.sequence = state.sequence.wrapping_add(1);
 
     state.scratch.message.clear();
     buffer.encode_ws_message(
@@ -486,8 +505,12 @@ fn flush_once(
         state.negotiated_version,
     )?;
 
-    write_binary_frame(&mut state.stream, &mut state.send_buf, &state.scratch.message)
-        .map_err(|io| error::fmt!(SocketError, "Could not send WebSocket frame: {}", io))?;
+    write_binary_frame(
+        &mut state.stream,
+        &mut state.send_buf,
+        &state.scratch.message,
+    )
+    .map_err(|io| error::fmt!(SocketError, "Could not send WebSocket frame: {}", io))?;
     state
         .stream
         .flush()
@@ -585,5 +608,4 @@ mod tests {
         assert_eq!(out[1] & 0x80, 0x80); // masked
         assert_eq!(out[1] & 0x7F, 5); // length
     }
-
 }

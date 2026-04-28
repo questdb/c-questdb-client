@@ -1847,6 +1847,7 @@ const QWP_FLAG_DELTA_SYMBOL_DICT: u8 = 0x08;
 #[derive(Debug, Default)]
 pub(crate) struct SymbolGlobalDict {
     map: std::collections::HashMap<Vec<u8>, u64>,
+    entries: Vec<Vec<u8>>,
     next_id: u64,
 }
 
@@ -1855,6 +1856,7 @@ impl SymbolGlobalDict {
     pub(crate) fn new() -> Self {
         Self {
             map: std::collections::HashMap::new(),
+            entries: Vec::new(),
             next_id: 0,
         }
     }
@@ -1866,7 +1868,14 @@ impl SymbolGlobalDict {
     #[allow(dead_code)]
     pub(crate) fn reset(&mut self) {
         self.map.clear();
+        self.entries.clear();
         self.next_id = 0;
+    }
+
+    #[allow(dead_code)]
+    fn entry(&self, id: u64) -> Option<&[u8]> {
+        let index = usize::try_from(id).ok()?;
+        self.entries.get(index).map(Vec::as_slice)
     }
 
     /// Returns `(global_id, is_new)`.
@@ -1876,7 +1885,9 @@ impl SymbolGlobalDict {
         }
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
-        self.map.insert(bytes.to_vec(), id);
+        let owned = bytes.to_vec();
+        self.entries.push(owned.clone());
+        self.map.insert(owned, id);
         (id, true)
     }
 }
@@ -1895,6 +1906,9 @@ pub(crate) struct QwpWsEncodeScratch {
     /// signature key for the schema registry and as the payload to splice into
     /// the message in full mode, avoiding a second pass over the columns.
     schema_signature: Vec<u8>,
+    /// Per-message schema ids for the self-sufficient replay encoder.
+    #[allow(dead_code)]
+    replay_schema_registry: SchemaRegistry,
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -1904,6 +1918,7 @@ impl QwpWsEncodeScratch {
             message: Vec::with_capacity(16 * 1024),
             per_segment_symbol_globals: Vec::new(),
             schema_signature: Vec::new(),
+            replay_schema_registry: SchemaRegistry::new(),
         }
     }
 }
@@ -2086,9 +2101,149 @@ impl QwpBuffer {
             version,
             flags: QWP_FLAG_DELTA_SYMBOL_DICT,
             table_count,
+            payload_len: checked_qwp_u32(out.len() - payload_start, "WS message payload length")?,
+        };
+        header.write_to(&mut out[header_start..header_start + QWP_MESSAGE_HEADER_SIZE]);
+
+        Ok(())
+    }
+
+    /// Encode all currently-buffered table blocks into one self-sufficient
+    /// QWP/WebSocket message for replayable Store-and-Forward storage.
+    ///
+    /// This is the Java-style v1 replay shape: every frame carries the dense
+    /// global symbol dictionary prefix from id 0 through the highest symbol id
+    /// referenced by this frame, and every table block carries its full schema.
+    #[allow(dead_code)]
+    pub(crate) fn encode_ws_replay_message(
+        &self,
+        scratch: &mut QwpWsEncodeScratch,
+        global_dict: &mut SymbolGlobalDict,
+        version: u8,
+    ) -> crate::Result<()> {
+        if self.pending.table.is_some() {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "Cannot flush with an incomplete row. \
+                 Call `at` or `at_now` to complete the pending row."
+            ));
+        }
+
+        let out = &mut scratch.message;
+        out.clear();
+
+        // Header placeholder (filled at the end).
+        let header_start = out.len();
+        out.extend_from_slice(&[0u8; QWP_MESSAGE_HEADER_SIZE]);
+        let payload_start = out.len();
+
+        // ---- Pass 1: map frame-local symbol ids to connection-global ids ----
+        scratch.per_segment_symbol_globals.clear();
+        scratch
+            .per_segment_symbol_globals
+            .reserve(self.segments.len());
+        let mut highest_referenced_symbol_id: Option<u64> = None;
+
+        for (seg_idx, _) in self.segments.iter().enumerate() {
+            let planner = self.size_hint.segment_planner(seg_idx)?;
+            let mut per_col: Vec<Vec<u64>> = Vec::with_capacity(planner.columns.len());
+            for col in &planner.columns {
+                let mut globals_for_col: Vec<u64> = Vec::new();
+                if matches!(col.kind, ColumnKind::Symbol) {
+                    globals_for_col.reserve(col.dict_count as usize);
+                    let mut cursor = col.dict_head;
+                    while cursor != CELL_END {
+                        let entry = &planner.symbol_dict[cursor as usize];
+                        let range = entry.value.0.as_range();
+                        let bytes = &self.value_bytes[range];
+                        let (gid, _) = global_dict.intern(bytes);
+                        highest_referenced_symbol_id = Some(
+                            highest_referenced_symbol_id.map_or(gid, |highest| highest.max(gid)),
+                        );
+                        globals_for_col.push(gid);
+                        cursor = entry.next;
+                    }
+                }
+                per_col.push(globals_for_col);
+            }
+            scratch.per_segment_symbol_globals.push(per_col);
+        }
+
+        // ---- Dense dictionary prefix section ----
+        write_qwp_varint(out, 0);
+        let dense_count = highest_referenced_symbol_id.map_or(0, |highest| highest + 1);
+        write_qwp_varint(out, dense_count);
+        for id in 0..dense_count {
+            let bytes = global_dict.entry(id).ok_or_else(|| {
+                error::fmt!(
+                    InvalidApiCall,
+                    "internal QWP/WS replay encoder error: missing global symbol id {}",
+                    id
+                )
+            })?;
+            write_qwp_bytes(out, bytes);
+        }
+
+        // ---- Table blocks ----
+        scratch.replay_schema_registry.reset();
+        let table_count: u16 = checked_qwp_u16(self.segments.len(), "WS message table count")?;
+        for (seg_idx, segment) in self.segments.iter().enumerate() {
+            let planner = self.size_hint.segment_planner(seg_idx)?;
+            let table_name = &self.name_bytes[segment.table.0.as_range()];
+            let row_count = planner.row_count;
+
+            // Table header
+            write_qwp_bytes(out, table_name);
+            write_qwp_varint(out, row_count as u64);
+            write_qwp_varint(out, planner.columns.len() as u64);
+
+            // Always emit full schema. The schema id is still included because
+            // it is part of QWP full-schema mode, but this replay path never
+            // emits reference-only table blocks.
+            scratch.schema_signature.clear();
+            for col in &planner.columns {
+                write_qwp_bytes(
+                    &mut scratch.schema_signature,
+                    &self.name_bytes[col.name.0.as_range()],
+                );
+                scratch
+                    .schema_signature
+                    .push(wire_type_byte(col.kind, col.uses_null_bitmap(row_count)));
+            }
+            let (schema_id, _) = scratch
+                .replay_schema_registry
+                .intern(&scratch.schema_signature);
+            out.push(QWP_SCHEMA_MODE_FULL);
+            write_qwp_varint(out, schema_id);
+            out.extend_from_slice(&scratch.schema_signature);
+
+            // Column payloads
+            for (col_idx, col) in planner.columns.iter().enumerate() {
+                if matches!(col.kind, ColumnKind::Symbol) {
+                    let globals = &scratch.per_segment_symbol_globals[seg_idx][col_idx];
+                    encode_symbol_column_delta_dict(col, row_count, &planner.cells, globals, out)?;
+                } else {
+                    encode_column_from_cells(
+                        col,
+                        row_count,
+                        &planner.cells,
+                        &planner.symbol_dict,
+                        &self.value_bytes,
+                        out,
+                    )?;
+                }
+            }
+        }
+
+        // Fill header
+        let header = QwpMessageHeader {
+            magic: *b"QWP1",
+            version,
+            flags: QWP_FLAG_DELTA_SYMBOL_DICT,
+            table_count,
             payload_len: checked_qwp_u32(
                 out.len() - payload_start,
-                "WS message payload length",
+                "WS replay message payload length",
             )?,
         };
         header.write_to(&mut out[header_start..header_start + QWP_MESSAGE_HEADER_SIZE]);
@@ -3434,6 +3589,73 @@ mod tests {
         )
         .unwrap();
         datagram.len()
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn read_test_varint(bytes: &[u8], pos: &mut usize) -> u64 {
+        let mut shift = 0;
+        let mut value = 0u64;
+        loop {
+            let b = bytes[*pos];
+            *pos += 1;
+            value |= u64::from(b & 0x7f) << shift;
+            if b & 0x80 == 0 {
+                return value;
+            }
+            shift += 7;
+        }
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn read_test_bytes(bytes: &[u8], pos: &mut usize) -> Vec<u8> {
+        let len = read_test_varint(bytes, pos) as usize;
+        let out = bytes[*pos..*pos + len].to_vec();
+        *pos += len;
+        out
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn ws_delta_entries(message: &[u8]) -> (u64, Vec<Vec<u8>>, usize) {
+        assert_eq!(&message[0..4], b"QWP1");
+        assert_eq!(message[4], QWP_VERSION_1);
+        assert_eq!(
+            message[5] & QWP_FLAG_DELTA_SYMBOL_DICT,
+            QWP_FLAG_DELTA_SYMBOL_DICT
+        );
+        assert_eq!(
+            u32::from_le_bytes([message[8], message[9], message[10], message[11]]) as usize,
+            message.len() - QWP_MESSAGE_HEADER_SIZE
+        );
+
+        let mut pos = QWP_MESSAGE_HEADER_SIZE;
+        let delta_start = read_test_varint(message, &mut pos);
+        let delta_count = read_test_varint(message, &mut pos);
+        let mut entries = Vec::new();
+        for _ in 0..delta_count {
+            entries.push(read_test_bytes(message, &mut pos));
+        }
+        (delta_start, entries, pos)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn first_ws_schema_mode(message: &[u8]) -> u8 {
+        let (_, _, mut pos) = ws_delta_entries(message);
+        let _table_name = read_test_bytes(message, &mut pos);
+        let _row_count = read_test_varint(message, &mut pos);
+        let _column_count = read_test_varint(message, &mut pos);
+        message[pos]
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn add_trade_row(buf: &mut QwpBuffer, sym: &str, qty: i64) {
+        buf.table("trades")
+            .unwrap()
+            .symbol("sym", sym)
+            .unwrap()
+            .column_i64("qty", qty)
+            .unwrap()
+            .at_now()
+            .unwrap();
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4914,6 +5136,115 @@ mod tests {
         assert_eq!(
             u32::from_le_bytes([datagram[8], datagram[9], datagram[10], datagram[11]]) as usize,
             datagram.len() - QWP_MESSAGE_HEADER_SIZE
+        );
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_replay_reemits_dense_symbol_prefix_on_later_frame() {
+        let mut buf = QwpBuffer::new(127);
+        let mut scratch = QwpWsEncodeScratch::new();
+        let mut global_dict = SymbolGlobalDict::new();
+
+        add_trade_row(&mut buf, "BTC-USD", 1);
+        buf.encode_ws_replay_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
+            .unwrap();
+        let first = scratch.message.clone();
+        let (delta_start, entries, _) = ws_delta_entries(&first);
+        assert_eq!(delta_start, 0);
+        assert_eq!(entries, vec![b"BTC-USD".to_vec()]);
+        assert_eq!(first_ws_schema_mode(&first), QWP_SCHEMA_MODE_FULL);
+
+        buf.clear();
+        add_trade_row(&mut buf, "BTC-USD", 2);
+        buf.encode_ws_replay_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
+            .unwrap();
+        let second = scratch.message.clone();
+        let (delta_start, entries, _) = ws_delta_entries(&second);
+        assert_eq!(delta_start, 0);
+        assert_eq!(
+            entries,
+            vec![b"BTC-USD".to_vec()],
+            "replay frames must re-emit already-known symbols"
+        );
+        assert_eq!(first_ws_schema_mode(&second), QWP_SCHEMA_MODE_FULL);
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_replay_dense_prefix_includes_lower_symbol_ids() {
+        let mut buf = QwpBuffer::new(127);
+        let mut scratch = QwpWsEncodeScratch::new();
+        let mut global_dict = SymbolGlobalDict::new();
+
+        add_trade_row(&mut buf, "A", 1);
+        add_trade_row(&mut buf, "B", 2);
+        add_trade_row(&mut buf, "C", 3);
+        buf.encode_ws_replay_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
+            .unwrap();
+
+        buf.clear();
+        add_trade_row(&mut buf, "C", 4);
+        buf.encode_ws_replay_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
+            .unwrap();
+
+        let replay = scratch.message.clone();
+        let (delta_start, entries, _) = ws_delta_entries(&replay);
+        assert_eq!(delta_start, 0);
+        assert_eq!(
+            entries,
+            vec![b"A".to_vec(), b"B".to_vec(), b"C".to_vec()],
+            "a frame referencing id 2 must carry the dense 0..=2 prefix"
+        );
+        assert_eq!(first_ws_schema_mode(&replay), QWP_SCHEMA_MODE_FULL);
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_replay_does_not_mutate_delta_encoder_schema_refs() {
+        let mut buf = QwpBuffer::new(127);
+        let mut replay_scratch = QwpWsEncodeScratch::new();
+        let mut replay_dict = SymbolGlobalDict::new();
+        let mut delta_scratch = QwpWsEncodeScratch::new();
+        let mut delta_dict = SymbolGlobalDict::new();
+        let mut schema_registry = SchemaRegistry::new();
+
+        add_trade_row(&mut buf, "ETH-USD", 1);
+        buf.encode_ws_message(
+            &mut delta_scratch,
+            &mut delta_dict,
+            &mut schema_registry,
+            QWP_VERSION_1,
+        )
+        .unwrap();
+        buf.encode_ws_replay_message(&mut replay_scratch, &mut replay_dict, QWP_VERSION_1)
+            .unwrap();
+        assert_eq!(
+            first_ws_schema_mode(&replay_scratch.message),
+            QWP_SCHEMA_MODE_FULL
+        );
+
+        buf.clear();
+        add_trade_row(&mut buf, "ETH-USD", 2);
+        buf.encode_ws_message(
+            &mut delta_scratch,
+            &mut delta_dict,
+            &mut schema_registry,
+            QWP_VERSION_1,
+        )
+        .unwrap();
+        assert_eq!(
+            first_ws_schema_mode(&delta_scratch.message),
+            QWP_SCHEMA_MODE_REFERENCE,
+            "existing delta encoder should keep reference-schema behavior"
+        );
+
+        buf.encode_ws_replay_message(&mut replay_scratch, &mut replay_dict, QWP_VERSION_1)
+            .unwrap();
+        assert_eq!(
+            first_ws_schema_mode(&replay_scratch.message),
+            QWP_SCHEMA_MODE_FULL,
+            "replay encoder must always emit full schema"
         );
     }
 

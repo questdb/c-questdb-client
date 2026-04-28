@@ -561,17 +561,14 @@ impl SenderBuilder {
                     builder.max_failover_attempts(parse_conf_value(key, val)?)?
                 }
                 #[cfg(feature = "_sender-qwp-ws")]
-                "failover_initial_backoff" => builder.failover_initial_backoff(
-                    Duration::from_millis(parse_conf_value(key, val)?),
-                )?,
+                "failover_initial_backoff" => builder
+                    .failover_initial_backoff(Duration::from_millis(parse_conf_value(key, val)?))?,
                 #[cfg(feature = "_sender-qwp-ws")]
-                "failover_max_backoff" => builder.failover_max_backoff(
-                    Duration::from_millis(parse_conf_value(key, val)?),
-                )?,
+                "failover_max_backoff" => builder
+                    .failover_max_backoff(Duration::from_millis(parse_conf_value(key, val)?))?,
                 #[cfg(feature = "_sender-qwp-ws")]
-                "failover_total_budget" => builder.failover_total_budget(
-                    Duration::from_millis(parse_conf_value(key, val)?),
-                )?,
+                "failover_total_budget" => builder
+                    .failover_total_budget(Duration::from_millis(parse_conf_value(key, val)?))?,
                 "protocol_version" => match val {
                     "1" => builder.protocol_version(ProtocolVersion::V1)?,
                     "2" => builder.protocol_version(ProtocolVersion::V2)?,
@@ -1371,18 +1368,14 @@ impl SenderBuilder {
                 })))
             }
             #[cfg(any(feature = "_sender-http", feature = "_sender-qwp-ws"))]
-            (protocol, Some(_username), None, None, None, None)
-                if protocol.accepts_http_auth() =>
-            {
+            (protocol, Some(_username), None, None, None, None) if protocol.accepts_http_auth() => {
                 Err(error::fmt!(
                     ConfigError,
                     r##"Basic authentication parameter "username" is present, but "password" is missing."##,
                 ))
             }
             #[cfg(any(feature = "_sender-http", feature = "_sender-qwp-ws"))]
-            (protocol, None, Some(_password), None, None, None)
-                if protocol.accepts_http_auth() =>
-            {
+            (protocol, None, Some(_password), None, None, None) if protocol.accepts_http_auth() => {
                 Err(error::fmt!(
                     ConfigError,
                     r##"Basic authentication parameter "password" is present, but "username" is missing."##,
@@ -1456,9 +1449,10 @@ impl SenderBuilder {
             }
             None => None,
         };
-        let qwp_ws = self.qwp_ws.as_ref().ok_or_else(|| {
-            error::fmt!(ConfigError, "QWP/WebSocket configuration is missing.")
-        })?;
+        let qwp_ws = self
+            .qwp_ws
+            .as_ref()
+            .ok_or_else(|| error::fmt!(ConfigError, "QWP/WebSocket configuration is missing."))?;
         connect_async_qwp_ws(
             self.host.as_str(),
             self.port.as_str(),

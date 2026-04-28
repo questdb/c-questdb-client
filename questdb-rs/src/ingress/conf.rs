@@ -151,9 +151,9 @@ impl Default for QwpWsConfig {
             max_in_flight: ConfigSetting::new_default(128),
             failover: ConfigSetting::new_default(true),
             max_failover_attempts: ConfigSetting::new_default(3),
-            failover_initial_backoff: ConfigSetting::new_default(
-                std::time::Duration::from_millis(100),
-            ),
+            failover_initial_backoff: ConfigSetting::new_default(std::time::Duration::from_millis(
+                100,
+            )),
             failover_max_backoff: ConfigSetting::new_default(std::time::Duration::from_secs(5)),
             failover_total_budget: ConfigSetting::new_default(std::time::Duration::from_secs(30)),
         }

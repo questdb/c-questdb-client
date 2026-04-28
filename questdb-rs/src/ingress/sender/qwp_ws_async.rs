@@ -236,7 +236,10 @@ struct ReconnectParams {
 impl std::fmt::Debug for AsyncSender {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AsyncSender")
-            .field("negotiated_version", &*self.inner.negotiated_version.lock().unwrap())
+            .field(
+                "negotiated_version",
+                &*self.inner.negotiated_version.lock().unwrap(),
+            )
             .finish()
     }
 }
@@ -295,9 +298,9 @@ impl AsyncSender {
             .acquire_owned()
             .await
             .map_err(|_| {
-                self.inner.snapshot_error().unwrap_or_else(|| {
-                    error::fmt!(SocketError, "QWP/WS sender closed")
-                })
+                self.inner
+                    .snapshot_error()
+                    .unwrap_or_else(|| error::fmt!(SocketError, "QWP/WS sender closed"))
             })?;
 
         // Try to register the message until we catch the connection in a
@@ -336,8 +339,8 @@ impl AsyncSender {
             // relative to drain+replay.
             let enc = &mut *enc_guard;
             let version = *self.inner.negotiated_version.lock().unwrap();
-            enc.next_sequence = enc.next_sequence.wrapping_add(1);
             let seq = enc.next_sequence;
+            enc.next_sequence = enc.next_sequence.wrapping_add(1);
 
             enc.scratch.message.clear();
             qwp.encode_ws_message(
@@ -516,18 +519,14 @@ async fn reader_task(
                 }
                 match codec::parse_pipelined_response(&payload) {
                     Ok(PipelinedResponse::Ok { sequence }) => {
-                        if let Some(inflight) =
-                            inner.in_flight.lock().unwrap().remove(&sequence)
-                        {
+                        if let Some(inflight) = inner.in_flight.lock().unwrap().remove(&sequence) {
                             let _ = inflight.tx.send(Ok(()));
                         }
                     }
                     Ok(PipelinedResponse::Error { sequence, err }) => {
                         // Per-message server errors are non-terminal: they go
                         // back to the matching flush, the connection stays.
-                        if let Some(inflight) =
-                            inner.in_flight.lock().unwrap().remove(&sequence)
-                        {
+                        if let Some(inflight) = inner.in_flight.lock().unwrap().remove(&sequence) {
                             let _ = inflight.tx.send(Err(err));
                         }
                     }
@@ -637,14 +636,15 @@ async fn try_reconnect(inner: &Arc<Inner>) -> crate::Result<()> {
             let qwp = match inflight.buffer.as_qwp() {
                 Some(q) => q,
                 None => {
-                    let _ = inflight
-                        .tx
-                        .send(Err(error::fmt!(InvalidApiCall, "QWP/WS replay: non-QWP buffer")));
+                    let _ = inflight.tx.send(Err(error::fmt!(
+                        InvalidApiCall,
+                        "QWP/WS replay: non-QWP buffer"
+                    )));
                     continue;
                 }
             };
-            enc.next_sequence = enc.next_sequence.wrapping_add(1);
             let new_seq = enc.next_sequence;
+            enc.next_sequence = enc.next_sequence.wrapping_add(1);
             enc.scratch.message.clear();
             if let Err(e) = qwp.encode_ws_message(
                 &mut enc.scratch,
@@ -786,11 +786,7 @@ async fn read_frame(read_half: &mut ReadHalfKind) -> crate::Result<(bool, u8, Ve
     Ok((fin, opcode, payload))
 }
 
-async fn read_exact(
-    read_half: &mut ReadHalfKind,
-    buf: &mut [u8],
-    what: &str,
-) -> crate::Result<()> {
+async fn read_exact(read_half: &mut ReadHalfKind, buf: &mut [u8], what: &str) -> crate::Result<()> {
     read_half
         .read_exact(buf)
         .await
@@ -819,10 +815,13 @@ async fn perform_upgrade(
         client_id,
         request_durable_ack,
     );
-    stream
-        .write_all(req.as_bytes())
-        .await
-        .map_err(|io| error::fmt!(SocketError, "Could not send WebSocket upgrade request: {}", io))?;
+    stream.write_all(req.as_bytes()).await.map_err(|io| {
+        error::fmt!(
+            SocketError,
+            "Could not send WebSocket upgrade request: {}",
+            io
+        )
+    })?;
 
     let header_block = read_http_header_block(stream).await?;
     let parsed = codec::parse_http_header_block(&header_block)?;
@@ -889,11 +888,7 @@ async fn establish_connection(
             ));
         }
         Err(_) => {
-            return Err(error::fmt!(
-                SocketError,
-                "Timed out connecting to {}",
-                addr
-            ));
+            return Err(error::fmt!(SocketError, "Timed out connecting to {}", addr));
         }
     };
     tcp.set_nodelay(true).ok();

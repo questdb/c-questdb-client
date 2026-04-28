@@ -37,6 +37,7 @@ use std::time::Duration;
 use crate::ingress::{Protocol, SenderBuilder};
 
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const FIRST_WIRE_SEQUENCE: u64 = 0;
 
 // ---------- mock server ----------
 
@@ -135,8 +136,13 @@ fn compute_accept(key_b64: &str) -> String {
 // validate the upgrade handshake from the server side without poking at
 // internals. ~50 lines is cheaper than another dependency.
 fn sha1(input: &[u8]) -> [u8; 20] {
-    let (mut h0, mut h1, mut h2, mut h3, mut h4) =
-        (0x67452301u32, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0);
+    let (mut h0, mut h1, mut h2, mut h3, mut h4) = (
+        0x67452301u32,
+        0xEFCDAB89,
+        0x98BADCFE,
+        0x10325476,
+        0xC3D2E1F0,
+    );
     let bit_len = (input.len() as u64).wrapping_mul(8);
     let mut p = Vec::with_capacity(input.len() + 64);
     p.extend_from_slice(input);
@@ -188,7 +194,7 @@ fn sha1(input: &[u8]) -> [u8; 20] {
 
 /// Accept exactly one connection, do the upgrade, read frames, and return them
 /// to the test thread. The first frame received is replied to with an OK
-/// response (status=0x00, sequence=1, table_count=0).
+/// response (status=0x00, sequence=0, table_count=0).
 fn spawn_mock_server() -> (u16, mpsc::Receiver<MockResult>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -228,10 +234,10 @@ fn spawn_mock_server() -> (u16, mpsc::Receiver<MockResult>) {
         let (_fin, _opcode, payload) = read_frame(&mut stream).unwrap();
         received_frames.push(payload);
 
-        // Reply: OK status, sequence=1, table_count=0
+        // Reply: OK status, sequence=0, table_count=0
         let mut ok = Vec::new();
         ok.push(0x00u8);
-        ok.extend_from_slice(&1u64.to_le_bytes());
+        ok.extend_from_slice(&FIRST_WIRE_SEQUENCE.to_le_bytes());
         ok.extend_from_slice(&0u16.to_le_bytes());
         write_server_binary_frame(&mut stream, &ok).unwrap();
 
@@ -271,7 +277,11 @@ fn qwp_ws_round_trip_minimal_message() {
 
     // Validate the upgrade request basics.
     assert!(
-        result.request_lines.first().unwrap().contains("/api/v4/write"),
+        result
+            .request_lines
+            .first()
+            .unwrap()
+            .contains("/api/v4/write"),
         "request line: {:?}",
         result.request_lines.first()
     );
@@ -312,8 +322,12 @@ fn qwp_ws_subsequent_message_has_empty_delta() {
 
     thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
 
         let req_bytes = read_request_until_blank(&mut stream).unwrap();
         let req = String::from_utf8_lossy(&req_bytes).to_string();
@@ -329,7 +343,7 @@ fn qwp_ws_subsequent_message_has_empty_delta() {
         );
         stream.write_all(resp.as_bytes()).unwrap();
 
-        for seq in 1u64..=2 {
+        for seq in 0u64..2 {
             let (_fin, _op, payload) = read_frame(&mut stream).unwrap();
             tx.send(payload).unwrap();
             let mut ok = vec![0u8];
@@ -408,7 +422,7 @@ fn qwp_ws_reference_schema_used_when_columns_match() {
              \r\n"
         );
         stream.write_all(resp.as_bytes()).unwrap();
-        for seq in 1u64..=3 {
+        for seq in 0u64..3 {
             let (_fin, _op, payload) = read_frame(&mut stream).unwrap();
             tx.send(payload).unwrap();
             let mut ok = vec![0u8];
@@ -489,7 +503,7 @@ fn qwp_ws_full_schema_re_emitted_when_columns_change() {
              \r\n"
         );
         stream.write_all(resp.as_bytes()).unwrap();
-        for seq in 1u64..=2 {
+        for seq in 0u64..2 {
             let (_fin, _op, payload) = read_frame(&mut stream).unwrap();
             tx.send(payload).unwrap();
             let mut ok = vec![0u8];
@@ -531,7 +545,10 @@ fn qwp_ws_full_schema_re_emitted_when_columns_change() {
     let (mode1, id1) = read_schema_mode_and_id(&m1);
     let (mode2, id2) = read_schema_mode_and_id(&m2);
     assert_eq!(mode1, 0x00);
-    assert_eq!(mode2, 0x00, "different column set must re-register full schema");
+    assert_eq!(
+        mode2, 0x00,
+        "different column set must re-register full schema"
+    );
     assert_ne!(id1, id2, "new schema must get a fresh id");
 }
 
@@ -588,8 +605,12 @@ fn qwp_ws_server_error_response_is_surfaced() {
 
     thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
 
         let req_bytes = read_request_until_blank(&mut stream).unwrap();
         let req = String::from_utf8_lossy(&req_bytes).to_string();
@@ -609,7 +630,7 @@ fn qwp_ws_server_error_response_is_surfaced() {
         let msg = b"bad column";
         let mut err = Vec::new();
         err.push(0x05u8); // PARSE_ERROR
-        err.extend_from_slice(&1u64.to_le_bytes());
+        err.extend_from_slice(&FIRST_WIRE_SEQUENCE.to_le_bytes());
         err.extend_from_slice(&(msg.len() as u16).to_le_bytes());
         err.extend_from_slice(msg);
         write_server_binary_frame(&mut stream, &err).unwrap();
@@ -679,8 +700,8 @@ fn spawn_dropping_then_recovering_server() -> (u16, std::sync::mpsc::Receiver<Ve
         let (_fin, _op, payload) = read_frame(&mut s2).unwrap();
         tx.send(payload).unwrap();
         let mut ok = vec![0u8];
-        // First post-reconnect message gets sequence 1 from a fresh counter.
-        ok.extend_from_slice(&1u64.to_le_bytes());
+        // First post-reconnect message gets sequence 0 from a fresh counter.
+        ok.extend_from_slice(&FIRST_WIRE_SEQUENCE.to_le_bytes());
         ok.extend_from_slice(&0u16.to_le_bytes());
         write_server_binary_frame(&mut s2, &ok).unwrap();
         thread::sleep(Duration::from_millis(50));
@@ -746,11 +767,7 @@ fn qwp_ws_from_conf_parses_failover_keys() {
 
     let bad = "qwpws::addr=localhost:9000;failover=maybe;";
     let err = SenderBuilder::from_conf(bad).unwrap_err();
-    assert!(
-        err.msg().contains("\"failover\""),
-        "got: {}",
-        err.msg()
-    );
+    assert!(err.msg().contains("\"failover\""), "got: {}", err.msg());
 }
 
 #[test]
@@ -787,14 +804,24 @@ fn qwp_ws_sync_failover_disabled_latches_terminal_error() {
         .build()
         .unwrap();
     let mut buf = sender.new_buffer();
-    buf.table("t").unwrap().column_i64("v", 1).unwrap().at_now().unwrap();
+    buf.table("t")
+        .unwrap()
+        .column_i64("v", 1)
+        .unwrap()
+        .at_now()
+        .unwrap();
 
     let err1 = sender.flush(&mut buf).unwrap_err();
     assert_eq!(err1.code(), crate::ErrorCode::SocketError);
 
     // A second attempt sees the latched error directly without trying I/O.
     let mut buf2 = sender.new_buffer();
-    buf2.table("t").unwrap().column_i64("v", 2).unwrap().at_now().unwrap();
+    buf2.table("t")
+        .unwrap()
+        .column_i64("v", 2)
+        .unwrap()
+        .at_now()
+        .unwrap();
     let err2 = sender.flush(&mut buf2).unwrap_err();
     assert_eq!(err2.code(), crate::ErrorCode::SocketError);
 }
