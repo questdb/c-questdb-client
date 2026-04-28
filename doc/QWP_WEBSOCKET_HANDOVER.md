@@ -160,6 +160,27 @@ Real-server probes should happen early, especially for:
 - cumulative ACK/order/close behavior,
 - server error taxonomy.
 
+### Java/Rust drift guard
+
+Java is the v1 replay reference, but only for wire behavior. Rust should not copy
+Java's public API shape or background-thread model.
+
+Guard against drift with golden fixtures that compare unmasked QWP application
+payload bytes for the same logical batches. Do not compare WebSocket frame bytes;
+client mask keys are generated fresh on every send and replay.
+
+Fixture coverage should include:
+
+- full schema mode and disabled schema references,
+- dense symbol dictionary prefix from id `0` through the highest referenced id,
+- repeated table/schema and repeated symbol batches,
+- a later stored frame replayed alone on a fresh connection,
+- arrays, decimals, timestamps, UTF-8, sparse columns, and schema evolution.
+
+If Java and Rust payload bytes differ for an agreed non-semantic reason, document
+that reason and use a real-server probe to prove both payloads ingest to the same
+rows.
+
 ## Open questions
 
 1. Primary Rust verb:
@@ -240,15 +261,16 @@ Do not implement transport before this sketch feels right.
 
 1. Type-only progress ownership prototype.
 2. Java-style dense self-sufficient replay encoder spike.
-3. Real-server replay probe for a later frame sent alone on a fresh connection.
-4. Volatile bounded queue plus receipts with fake cumulative ACKs.
-5. Manual synchronous driver with fake server.
-6. Real-server ACK/order/close probe.
-7. Minimal Store-and-Forward disk queue.
-8. Fake-server error policy validation.
-9. Real-server error taxonomy probe.
-10. FFI shape pass.
-11. Full real WebSocket integration.
+3. Java/Rust golden payload fixtures for replay-mode QWP bytes.
+4. Real-server replay probe for a later frame sent alone on a fresh connection.
+5. Volatile bounded queue plus receipts with fake cumulative ACKs.
+6. Manual synchronous driver with fake server.
+7. Real-server ACK/order/close probe.
+8. Minimal Store-and-Forward disk queue.
+9. Fake-server error policy validation.
+10. Real-server error taxonomy probe.
+11. FFI shape pass.
+12. Full real WebSocket integration.
 
 Stop and redesign if any real-server probe invalidates a core assumption.
 
@@ -264,3 +286,6 @@ Stop and redesign if any real-server probe invalidates a core assumption.
 - Do not treat Java's current tests as real-server semantic proof; the Java
   notes say its `TestWebSocketServer` sees opaque bytes and does not parse QWP
   semantics.
+- Do not let Java/Rust compatibility checks compare masked WebSocket bytes.
+  Compare unmasked QWP payload bytes and validate protocol behavior against a
+  real server.

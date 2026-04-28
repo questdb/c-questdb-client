@@ -175,15 +175,16 @@ This is still threadless. Calls like `flush()` or `wait()` drive the connection 
 ### Explicit background runner
 
 ```rust
-let (sender, runner) = QwpWsSender::open_with_runner(opts)?;
-let handle = std::thread::spawn(move || runner.run());
+let sender = QwpWsSender::open(opts)?;
+let threaded = QwpWsThreadedSender::start(sender)?;
 ```
 
 Rules:
 
 - The method name and type make the thread explicit.
-- The user owns the thread.
-- Dropping the sender does not spawn a drainer.
+- Starting the threaded adapter consumes the manual sender.
+- Once consumed, the original sender cannot also call `drive_once()` or `wait()`
+  as a progress owner.
 - The runner uses the same core event and receipt semantics.
 
 ### Tokio adapter
@@ -288,6 +289,52 @@ select between connection-delta and self-sufficient replay encoding.
 Tests must store a later frame from a repeated-schema/repeated-symbol workload
 and replay that frame alone against a fresh mock connection. That replay must
 succeed without having sent the earlier frame.
+
+## Java/Rust compatibility drift risks
+
+The Java client is the closest working reference for cursor-style
+Store-and-Forward, but it should not become an implicit, untested dependency.
+Rust v1 should copy the Java-way replay invariant deliberately, then validate
+the shared protocol behavior with fixtures and real-server probes.
+
+The main drift risks are:
+
+- Wire constants, status codes, feature/version negotiation, and close/error
+  codes can diverge if Rust copies stale Java constants instead of the protocol
+  source of truth.
+- ACK identity can drift. Java maps connection-local `wireSeq` to durable FSN
+  through `fsnAtZero + wireSeq`; Rust must keep the same separation between
+  durable FSN and per-connection wire sequence, especially after reconnect.
+- Self-sufficient replay can drift in small details: `confirmedMaxId = -1`,
+  full schema mode, no schema references, and dense symbol dictionary prefix
+  from id `0` through the highest referenced id.
+- The v1 dense dictionary rule is intentionally Java-compatible, not a protocol
+  ideal. If Rust later supports sparse referenced-entry dictionaries or durable
+  state checkpoints, that is a new protocol/design step rather than a local
+  encoder tweak.
+- WebSocket masking can make byte comparisons misleading. Java/Rust golden tests
+  should compare unmasked QWP application payload bytes, not WebSocket frames,
+  because client mask keys are intentionally fresh on every send.
+- Error policy will intentionally differ unless Java changes too. Java currently
+  treats non-success server ACKs as terminal. Rust may add quarantine-and-continue
+  semantics, but the server status taxonomy and frame-granularity rejection must
+  still match reality.
+- Durability names may intentionally differ. Rust splits `volatile` from
+  file-backed `page_cache`/`flush`/`append`; Java naming should not be copied if
+  it hides fsync boundaries.
+- Close semantics can drift because Java has a background I/O loop while Rust's
+  low-level API is threadless by default. Shared behavior should be defined in
+  terms of submitted, ACKed, quarantined, and recoverable frames, not Java thread
+  lifecycle.
+- Encoding edge cases can drift across clients even when the happy path matches:
+  arrays, decimals, timestamps, UTF-8, sparse columns, table/schema evolution,
+  and symbol reuse need fixture coverage.
+
+Validation should include Java/Rust golden cases. For the same logical batches,
+Java and Rust should emit equivalent unmasked QWP payloads for v1 replay mode.
+When exact byte equality is not practical because an agreed non-semantic field
+differs, the fixture should document the field and the real-server probe should
+verify that both payloads ingest to the same rows.
 
 ## Store-and-Forward engine
 
@@ -786,8 +833,11 @@ Rules:
 - `submit` returns a receipt only after local publication.
 - `submit` clears the buffer only after successful publication.
 - `submit_and_keep` never clears the buffer.
-- `drive_once` progresses network I/O on the caller thread when no runner owns progress.
-- `wait` progresses network I/O only when no runner owns progress; while a runner is active, `wait` is passive and observes receipt state driven by the runner.
+- `drive_once` progresses network I/O on the caller thread.
+- `wait` is a manual-sender convenience loop over `drive_once()` plus receipt
+  status checks.
+- Starting the threaded adapter consumes the manual sender handle. There is no
+  runtime "runner active" mode on a manual sender.
 - Message text is copied into caller-provided storage.
 - `line_sender_error` allocation is allowed only on error paths.
 
@@ -795,7 +845,7 @@ Pointer contract:
 
 - Input handles are required to be non-NULL unless the function is documented as a free/close no-op.
 - `err_out` is optional. Passing NULL discards error details.
-- `receipt_out`, `event_out`, `status_out`, `outcome_out`, `runner_out`, and close `outcome_out` are required. Passing NULL returns `false` and sets `err_out` if provided.
+- `receipt_out`, `event_out`, `status_out`, `outcome_out`, `threaded_out`, and close `outcome_out` are required. Passing NULL returns `false` and sets `err_out` if provided.
 - `message_len_out` is optional. When non-NULL, it receives the full message length before truncation.
 - `message_buf` may be NULL only when `message_buf_len == 0`.
 - If `message_buf` is too small, the copied message is truncated and the returned event/outcome sets `message_truncated=true`.
@@ -803,31 +853,38 @@ Pointer contract:
 - Timeout, pending, not-drained, and no-event states are not reported through `err_out`; they are normal outcomes.
 - For `wait`, `receipt_status`, and `close_drain`, the boolean return reports whether the API call itself succeeded and initialized the output. Delivery state is reported only through the output enum.
 
-Optional explicit runner:
+Optional explicit threaded adapter:
 
 ```c
-typedef struct line_sender_qwpws_runner line_sender_qwpws_runner;
+typedef struct line_sender_qwpws_threaded line_sender_qwpws_threaded;
 
-bool line_sender_qwpws_runner_start(
-    line_sender_qwpws* sender,
-    line_sender_qwpws_runner** runner_out,
+bool line_sender_qwpws_threaded_start(
+    line_sender_qwpws** sender,
+    line_sender_qwpws_threaded** threaded_out,
     line_sender_error** err_out);
 
-void line_sender_qwpws_runner_stop(line_sender_qwpws_runner* runner);
+void line_sender_qwpws_threaded_stop(line_sender_qwpws_threaded* threaded);
 ```
 
 This is the only C API that may start a thread.
 
-Runner ownership and legal operations:
+Threaded ownership and legal operations:
 
-- `runner_start` does not consume `sender`; it creates a runner handle that owns the single progress driver until stopped.
-- The runner holds its own internal reference to the sender state, so `line_sender_qwpws_free(sender)` must not create a use-after-free. Freeing the sender handle while a runner exists closes the user handle, but the runner remains responsible for stopping and releasing its reference.
-- The caller must eventually call `line_sender_qwpws_runner_stop(runner)`.
-- While a runner is active, `line_sender_qwpws_drive_once` rejects with an error because progress is runner-owned.
-- While a runner is active, `line_sender_qwpws_wait` is passive: it blocks on condition variables/state changes and never performs socket I/O.
-- While a runner is active, `submit`, `submit_and_keep`, `receipt_status`, `poll_event`, `close_drain`, and `close_fast` remain legal if the implementation provides the synchronization for them.
-- `close_drain` while a runner is active stops accepting new submissions and passively waits for the runner to complete or time out.
-- `close_fast` asks the runner to stop promptly and marks unresolved volatile frames lost / unresolved SF frames recoverable.
+- `threaded_start` consumes the manual sender handle on success.
+- The caller passes `&sender`; on success, `*sender` is set to `NULL` and the
+  returned threaded handle owns the core.
+- On failure, `*sender` remains unchanged and the caller still owns it.
+- Passing a NULL `sender` pointer, a NULL `*sender`, or a NULL `threaded_out`
+  returns `false` and sets `err_out` if provided.
+- The caller must eventually call `line_sender_qwpws_threaded_stop(threaded)`.
+- Manual operations such as `line_sender_qwpws_drive_once` and
+  `line_sender_qwpws_wait` are no longer available through the consumed sender.
+- The threaded API should expose its own synchronized submit, wait, poll, drain,
+  and close calls rather than reusing the manual handle with runtime
+  "runner active" checks.
+- Stopping the runner returns no manual sender. If the application wants manual
+  control again, it should close the threaded sender and create or recover a new
+  manual sender from the same SF slot.
 
 ## C++ wrapper shape
 
@@ -915,8 +972,11 @@ C ABI:
 
 - Without a runner, callers must serialize access to the sender handle.
 - Exactly one driver may own network progress at a time.
-- With a runner active, the runner owns progress. Synchronous `drive_once` is illegal; `wait` and `close_drain` become passive waiters.
-- Functions that remain legal while the runner is active must be internally synchronized by the implementation.
+- The manual sender is the progress owner until it is consumed by a threaded or
+  async adapter.
+- After a threaded adapter consumes the manual sender, callers use only the
+  threaded handle's synchronized API.
+- The manual API does not contain a runtime "runner active" state.
 
 Future multi-producer support should be a wrapper over the core with a bounded preallocated submission ring. It should not be the v1 low-level primitive.
 
@@ -950,14 +1010,15 @@ Candidate config keys:
 3. Implement fixed-capacity in-flight table and event ring.
 4. Implement `drive_once`, `wait`, and close semantics.
 5. Add the Java-style self-sufficient replay encoder path and tests proving a later frame replays alone on a fresh connection.
-6. Encode all frames published by the new core in self-sufficient replay form.
-7. Add C ABI for construct, new buffer, submit, drive, poll event, wait, receipt status, close.
-8. Add mock-server tests for pipelining, cumulative ACKs, ordered server errors, close, and no buffer clear on failed submit.
-9. Add file-backed `queue_mode=sf` segment storage and recovery.
-10. Add poison policy and poison files.
-11. Add explicit background runner with passive wait semantics.
-12. Add Tokio adapter.
-13. Add C++ and Python wrappers after the C ABI is stable.
+6. Add Java/Rust golden payload fixtures for replay-mode QWP bytes.
+7. Encode all frames published by the new core in self-sufficient replay form.
+8. Add C ABI for construct, new buffer, submit, drive, poll event, wait, receipt status, close.
+9. Add mock-server tests for pipelining, cumulative ACKs, ordered server errors, close, and no buffer clear on failed submit.
+10. Add file-backed `queue_mode=sf` segment storage and recovery.
+11. Add poison policy and poison files.
+12. Add explicit background runner as an ownership-consuming adapter.
+13. Add Tokio adapter.
+14. Add C++ and Python wrappers after the C ABI is stable.
 
 ## Tests
 
@@ -979,6 +1040,9 @@ Rust core tests:
 - close fast leaves SF frames recoverable,
 - event ring overflow increments dropped counter,
 - self-sufficient replay encoder emits full schema and the required symbol dictionary prefix for every frame,
+- Java/Rust replay-mode fixtures agree on unmasked QWP payload bytes, or document
+  any agreed non-semantic byte differences and validate them against a real
+  server,
 - a stored later frame from a repeated-schema/repeated-symbol workload can be sent alone on a fresh connection,
 - SF segment records store unmasked QWP payload bytes, not WebSocket headers or masked payloads,
 - replaying the same stored frame can use a fresh WebSocket mask key without changing the stored bytes,

@@ -60,6 +60,27 @@ Each real-server probe should record:
 If a real-server probe fails, do not patch the mock to match the design. Update
 the design to match the protocol truth, then adjust the mock.
 
+## Java compatibility gates
+
+Java is a reference implementation for the v1 dense replay shape, not a
+substitute for validation.
+
+Before implementation depends on Java-compatible behavior, add small golden
+fixtures that compare Java and Rust at the QWP application-payload layer:
+
+- Compare unmasked QWP payload bytes, not WebSocket frames. Client mask keys are
+  intentionally fresh per send, so masked frame bytes should differ.
+- Cover full schema mode, disabled schema references, repeated table/schema use,
+  repeated symbols, high symbol ids, arrays, decimals, timestamps, UTF-8, sparse
+  columns, and schema evolution across batches.
+- Include at least one fixture where a later batch is stored and replayed alone
+  on a fresh connection.
+- Record whether any byte difference is semantically intentional. If so, validate
+  both payloads against a real server and document the observed rows.
+
+These fixtures should not lock Rust into Java's public API or Java's threading
+model. They lock down the wire behavior that both clients rely on.
+
 ## Step 1: API sketch first
 
 Write the intended end-user code as if the implementation already existed.
@@ -171,6 +192,8 @@ Validation target:
   and masked payload bytes are not stored and are not part of durable identity.
 - Replaying a later stored frame alone after reconnect/restart succeeds.
 - The public API does not expose a durability-dependent encoding choice.
+- Java and Rust replay-mode fixtures agree on unmasked QWP payload bytes for the
+  v1 dense cases, or document a real-server-validated semantic equivalence.
 
 Design pressure to watch:
 
@@ -216,6 +239,8 @@ Validation target:
 - The rows are not merely ACKed; they are queryable with the expected values.
 - The probe records the byte-size overhead of the dense dictionary prefix for at
   least one repeated-symbol and one higher-cardinality scenario.
+- If Java-generated and Rust-generated fixture payloads differ, both variants
+  ingest to the same table contents or the design stops for protocol review.
 
 Design pressure to watch:
 
@@ -471,6 +496,9 @@ Validation target:
 - Rust panics cannot cross the FFI boundary.
 - C distinguishes API failure from non-error states such as pending, timeout,
   drained, and not drained.
+- Threaded adapter start consumes the manual sender handle on success, leaves it
+  unchanged on failure, and does not require runtime "runner active" checks on
+  the manual API.
 - C++ and Python wrappers do not need extra semantic inventions.
 
 Design pressure to watch:
@@ -570,6 +598,8 @@ Stop and redesign before continuing if any of these happen:
   path.
 - A real-server probe invalidates the self-sufficient-frame, ACK-ordering, or
   error-taxonomy assumptions.
+- Java/Rust golden payload fixtures disagree in a way that is not explained by a
+  documented non-semantic field and validated against a real server.
 - Real WebSocket integration requires a hidden background thread in the low-level
   API.
 
