@@ -1,0 +1,571 @@
+# QWP/WebSocket pipelined design validation plan
+
+Status: **draft**. This document is a validation plan for
+`doc/QWP_WEBSOCKET_PIPELINED_FFI.md`, not an implementation schedule.
+
+The goal is to validate the main design decisions for pipelined QWP over
+WebSocket with Store-and-Forward in Rust and the C/C++/Python FFI layers.
+
+The plan is intentionally iterative. Each step should validate one design bet,
+then stop for reflection before adding the next layer.
+
+## Validation discipline
+
+Work one step at a time.
+
+After each step, write a short note with exactly these headings:
+
+```text
+Local reflection
+- How does this particular step feel?
+- What was simpler or more awkward than expected?
+- Did the API or implementation shape create accidental complexity?
+
+Global reflection
+- How does this fit into the bigger QWP/WebSocket Store-and-Forward design?
+- Did this step strengthen or weaken the core assumptions?
+- Should the next step proceed, or should the design be adjusted first?
+```
+
+If either reflection feels bad, stop and adjust the design before continuing.
+
+This is the main value of the plan: it should reveal weak assumptions while the
+cost of changing them is still small.
+
+## Mock and real-server split
+
+Use mocks and real-server probes for different jobs:
+
+```text
+Mocks validate client design.
+Real-server probes validate protocol truth.
+Full integration validates the product.
+```
+
+Mocks are the right tool for queue invariants, receipt state, crash recovery,
+progress ownership, and FFI shape. They are not enough for protocol assumptions.
+
+Real-server probes should be narrow gates, not full integration work. A probe
+can be a throwaway harness or a focused ignored test. Its job is to invalidate
+bad assumptions early.
+
+Each real-server probe should record:
+
+- QuestDB build/version used
+- relevant server configuration
+- exact client-side scenario
+- observed server response, close behavior, or table result
+- whether the design can proceed unchanged
+
+If a real-server probe fails, do not patch the mock to match the design. Update
+the design to match the protocol truth, then adjust the mock.
+
+## Step 1: API sketch first
+
+Write the intended end-user code as if the implementation already existed.
+
+Cover at least:
+
+- Rust manual/synchronous use
+- Rust threaded adapter use
+- Rust Tokio adapter use
+- C use
+- C++ RAII use
+- Python blocking use
+- Python asyncio use, if planned
+
+Validation target:
+
+- `Sender` and `Buffer` remain separate.
+- There is no silent background thread in the low-level API.
+- Submission, delivery, timeout, and close semantics are visible from names.
+- Receipts are easy to understand as value IDs.
+- The API does not make FFI users model Rust futures or Tokio.
+
+Design pressure to watch:
+
+- `flush()` may be familiar, but can hide whether it means local acceptance or
+  server delivery.
+- `submit()` is more precise, but may feel less compatible with current
+  `Sender::flush()` usage.
+- Receipt-returning and non-receipt convenience methods should not duplicate too
+  much surface area.
+
+Local reflection:
+
+- Does the API feel simpler than the current `Sender` + `Buffer` shape, or did
+  pipelining add too much ceremony?
+
+Global reflection:
+
+- Does the sketch preserve the core principles: Buffer/Sender segregation,
+  explicit progress ownership, runtime-neutral FFI, and observable delivery?
+
+## Step 2: Progress ownership prototype
+
+Model only the type ownership transitions. Do not implement real networking.
+
+Prototype shapes such as:
+
+```rust
+pub struct QwpWsSender;
+pub struct QwpWsThreadedSender;
+pub struct QwpWsAsyncSender;
+
+impl QwpWsThreadedSender {
+    pub fn start(sender: QwpWsSender) -> Result<Self>;
+}
+
+impl QwpWsAsyncSender {
+    pub fn from_sender(sender: QwpWsSender) -> Result<Self>;
+}
+```
+
+For FFI, model consuming ownership explicitly:
+
+```c
+bool line_sender_qwpws_threaded_start(
+        line_sender_qwpws_sender **sender,
+        line_sender_qwpws_threaded **threaded_out,
+        line_sender_error **err_out);
+```
+
+On success, `*sender` is set to `NULL`.
+
+Validation target:
+
+- A sender core has exactly one progress owner.
+- Manual, threaded, and async modes are represented by ownership, not mode flags.
+- No API allows `drive_once()` and a background runner to race on the same core.
+- FFI handle ownership cannot produce use-after-free through normal API use.
+
+Design pressure to watch:
+
+- If too many methods need "driver already active" errors, the ownership model is
+  leaking.
+- If adapters need to borrow rather than own the sender, progress ownership is
+  probably unclear.
+
+Local reflection:
+
+- Is it obvious who drives progress at every point?
+
+Global reflection:
+
+- Did the type model avoid stateful magic, or are we recreating runtime mode
+  switches under different names?
+
+## Step 3: Self-sufficient QWP frame spike
+
+Implement the Java-style v1 replay encoding path behind focused tests first.
+
+Every frame stored by the new pipelined sender must be valid as the first QWP
+data frame on a fresh WebSocket connection.
+
+Validation target:
+
+- Stored frames contain enough schema information for independent replay.
+- Stored frames contain the symbol dictionary prefix needed by their symbol IDs.
+- Replaying a later stored frame alone after reconnect/restart succeeds.
+- The public API does not expose a durability-dependent encoding choice.
+
+Design pressure to watch:
+
+- The encoder should not infect normal row-building ergonomics.
+- The cost of repeated schema/symbol material should be visible in benchmarks,
+  but should not block the correctness-first v1.
+
+Local reflection:
+
+- Is the encoder change localized, or does it make the buffer model harder to
+  understand?
+
+Global reflection:
+
+- Does this provide a correct Store-and-Forward baseline before optimizing with
+  state-only QWP messages or checkpoints?
+
+## Step 4: Real-server protocol probe: self-sufficient replay
+
+Before building the queue around the encoder assumption, validate it against a
+real QuestDB server.
+
+Use the smallest harness that can:
+
+- open a real QWP/WebSocket connection
+- send one self-sufficient frame
+- build a later frame that repeats schema/symbol usage
+- reconnect
+- send that later frame alone as the first QWP data frame on the new connection
+- verify the expected rows are visible in QuestDB
+
+Validation target:
+
+- A Java-style self-sufficient later frame is accepted as the first data frame
+  on a fresh WebSocket connection.
+- The server does not require hidden connection-local schema or symbol state
+  beyond what the frame carries.
+- The rows are not merely ACKed; they are queryable with the expected values.
+
+Design pressure to watch:
+
+- If the server accepts the frame but data is wrong, the encoder contract is
+  still invalid.
+- If a later frame cannot stand alone, Store-and-Forward needs a different v1
+  replay contract before queue work proceeds.
+
+Local reflection:
+
+- Did the real server confirm the encoder assumption cleanly, or did the probe
+  require special setup that should become part of the design?
+
+Global reflection:
+
+- Can the rest of the validation ladder safely treat self-sufficient stored
+  frames as protocol truth?
+
+## Step 5: Volatile queue and receipts
+
+Build an in-memory bounded queue with monotonically increasing 64-bit frame
+sequence numbers. Do not add disk durability yet.
+
+Use a fake server that can produce cumulative ACKs.
+
+Validation target:
+
+- Submission produces value receipts.
+- Receipt status is derivable from queue state.
+- Backpressure is observable and deterministic.
+- ACK coalescing works with strictly in-order server processing.
+- Later frames never jump earlier unresolved frames.
+
+Design pressure to watch:
+
+- Receipt APIs should feel like value IDs, not heap completion handles.
+- Queue full behavior must be clear for both blocking and non-blocking calls.
+
+Local reflection:
+
+- Do receipts, status polling, and backpressure feel natural in Rust?
+
+Global reflection:
+
+- Does the pipeline model remain understandable without durability and reconnect
+  noise?
+
+## Step 6: Manual synchronous driver
+
+Add `drive_once`, blocking submit convenience, and `wait` against a fake ordered
+server.
+
+The fake server should support:
+
+- cumulative ACKs
+- response coalescing
+- disconnects
+- retryable transport failures
+- deterministic frame rejection
+
+Validation target:
+
+- Manual `QwpWsSender` is the sole progress owner.
+- Blocking calls drive progress only while they own the sender mutably.
+- `submit()` blocks only until local queue/store acceptance.
+- `wait()` observes server delivery outcome for a receipt.
+- Timeouts are outcomes where appropriate, not confused with protocol errors.
+
+Design pressure to watch:
+
+- If `submit()` and `wait()` have surprising blocking behavior, rename or split
+  the methods before implementing real transport.
+- If `flush()` is kept as an alias, its local-acceptance semantics must be
+  impossible to miss.
+
+Local reflection:
+
+- Are blocking calls easy to reason about from a caller's point of view?
+
+Global reflection:
+
+- Does the "one progress owner" model survive real control flow?
+
+## Step 7: Real-server protocol probe: ACK, order, and close
+
+Before relying on the fake ordered server too heavily, validate the response
+contract against a real QuestDB server.
+
+Use a narrow harness that can send multiple QWP/WebSocket frames without waiting
+for each response before sending the next.
+
+Cover:
+
+- strictly in-order server processing
+- cumulative ACKs for the highest successful frame
+- response coalescing, if observable
+- disconnect or close while frames are in flight
+- reconnect after a clean or abrupt close
+
+Validation target:
+
+- The server never reports success for a later frame while an earlier frame is
+  unresolved.
+- A cumulative ACK can be treated as ACK for all lower unresolved frame sequence
+  numbers.
+- Close and EOF behavior map cleanly into retryable, terminal, or drained
+  outcomes.
+
+Design pressure to watch:
+
+- If the server can produce out-of-order application outcomes, the receipt and
+  queue model must change before disk durability is added.
+- If close behavior is ambiguous, do not harden public close semantics yet.
+
+Local reflection:
+
+- Did the server behavior match the fake ordered server closely enough?
+
+Global reflection:
+
+- Are the ordering and ACK assumptions strong enough to build durable replay on
+  top?
+
+## Step 8: Minimal Store-and-Forward disk queue
+
+Replace the volatile queue with a file-backed queue. Keep the fake server.
+
+Start with the smallest durability surface that can validate replay:
+
+- append frame
+- publish receipt
+- recover queue after restart
+- replay from the first unresolved frame
+- truncate or mark acknowledged frames
+
+Validation target:
+
+- Durability mode is orthogonal to public API semantics.
+- Caller buffers can be cleared after local publication.
+- Process restart does not lose published frames.
+- Replay preserves submission order.
+- The design distinguishes volatile memory mode from file-backed page-cache
+  durability.
+
+Design pressure to watch:
+
+- If disk durability changes user-facing encoding or receipt behavior, the
+  abstraction is too leaky.
+- If cleanup rules are hard to explain, crash recovery probably needs a simpler
+  journal contract.
+
+Local reflection:
+
+- Is the disk queue small and mechanical, or is it driving API design?
+
+Global reflection:
+
+- Can crash/restart behavior be explained without special cases?
+
+## Step 9: Error policy validation
+
+Use the fake server and disk queue to validate the error model.
+
+Cover:
+
+- retryable transport errors
+- reconnect budget exhaustion
+- auth or upgrade rejection
+- parse/schema poison frame
+- write/internal server error
+- cumulative ACK followed by error
+- close while frames are unresolved
+
+Validation target:
+
+- Retryable failures preserve ordering and keep retrying within policy.
+- Terminal failures are surfaced to the caller.
+- Poison frames are quarantined and reported rather than silently lost.
+- A deterministic bad frame does not brick the sender forever.
+- `receipt_status`, `wait`, and event polling agree.
+
+Design pressure to watch:
+
+- If one enum is forced to represent events, receipt status, wait outcomes, and
+  close outcomes, split it before the C ABI hardens.
+- If poison handling requires row-level information the server does not provide,
+  keep v1 at frame-level quarantine.
+
+Local reflection:
+
+- Are errors surfaced at the right time and at the right API layer?
+
+Global reflection:
+
+- Does the model avoid both silent data loss and permanent sender bricking?
+
+## Step 10: Real-server protocol probe: error taxonomy
+
+Before hardening the FFI outcome enums, validate server error behavior with a
+real QuestDB server where practical.
+
+Cover reproducible cases such as:
+
+- schema mismatch
+- parse error or malformed frame
+- auth or upgrade rejection
+- write failure, if a reliable server-side setup exists
+- internal error, only if there is a deterministic test hook
+
+Validation target:
+
+- Server statuses map cleanly into retryable, terminal, poisoned, or unknown.
+- Rejected frames are identified at frame granularity.
+- ACK-before-error behavior matches the cumulative ACK model.
+- The connection state after each error is understood.
+
+Design pressure to watch:
+
+- If the server does not expose enough information to classify an error, the
+  client API must surface `Unknown` rather than guessing.
+- If schema/parse failures close the connection before a useful status arrives,
+  poison handling may need to be conservative.
+
+Local reflection:
+
+- Did the real server provide enough information for a stable error contract?
+
+Global reflection:
+
+- Can the FFI expose durable error semantics without inventing details the
+  server does not provide?
+
+## Step 11: FFI shape pass
+
+Add C ABI stubs and tests for ownership and output-pointer contracts before full
+implementation is wired through.
+
+Cover:
+
+- sender construction and free
+- buffer creation
+- submit with and without receipt
+- receipt status
+- wait outcome
+- event polling
+- close outcome
+- threaded adapter ownership conversion, if included
+
+Validation target:
+
+- Every output pointer is documented as required or optional.
+- Null handling is explicit and tested.
+- Rust panics cannot cross the FFI boundary.
+- C distinguishes API failure from non-error states such as pending, timeout,
+  drained, and not drained.
+- C++ and Python wrappers do not need extra semantic inventions.
+
+Design pressure to watch:
+
+- If C callers need to pass too many pointers for common cases, add convenience
+  calls rather than weakening the core contract.
+- If Python needs behavior that C cannot observe, the ABI is incomplete.
+
+Local reflection:
+
+- Are ownership, lifetime, null, and timeout rules unambiguous?
+
+Global reflection:
+
+- Can all language layers expose the same semantics without pretending to be
+  Rust?
+
+## Step 12: Real WebSocket integration
+
+Replace the fake transport with real QWP/WebSocket transport while keeping the
+validated queue and public API shape.
+
+Validation target:
+
+- Real connection setup fits `open_mode=connected` and `open_mode=lazy`.
+- Real cumulative ACK handling matches the fake-server model.
+- Reconnect and replay do not require public API changes.
+- Authentication, WebSocket upgrade, and close behavior map into the existing
+  error/outcome model.
+
+Design pressure to watch:
+
+- If networking forces public API changes, revisit the fake-server assumptions.
+- If the real protocol requires hidden tasks to make progress, the low-level
+  contract has been violated.
+
+Local reflection:
+
+- Did the real transport fit the state machine, or did it expose missing states?
+
+Global reflection:
+
+- Were the earlier fake-server validation and real-server probes predictive
+  enough?
+
+## Step 13: Ergonomics and design review
+
+Re-read the original API sketches and compare them with the implemented shape.
+
+Exercise real examples:
+
+- single-threaded Rust ingestion
+- high-throughput Rust ingestion with explicit progress
+- C producer loop
+- C++ RAII wrapper
+- Python blocking wrapper
+- crash/restart Store-and-Forward recovery demo
+- poison-frame demo
+
+Validation target:
+
+- Common use remains short and understandable.
+- Advanced use does not require undocumented sequencing.
+- Naming matches actual blocking and delivery semantics.
+- The v1 design is still a small correctness-first design.
+
+Design pressure to watch:
+
+- If examples need long explanations, simplify the API before optimizing.
+- If the implementation already assumes state-only messages or checkpoints,
+  the v1 scope has drifted.
+
+Local reflection:
+
+- What feels awkward only after using the API end to end?
+
+Global reflection:
+
+- Are we still building the intended v1, or did validation reveal a better
+  design?
+
+## Stop conditions
+
+Stop and redesign before continuing if any of these happen:
+
+- Progress ownership depends on runtime flags instead of ownership.
+- Durable and volatile modes require different public encoding semantics.
+- The C ABI cannot express Rust outcomes without lossy mapping.
+- `submit()`, `flush()`, or `wait()` names do not match their blocking behavior.
+- Store-and-Forward can silently drop data.
+- A poison frame can permanently brick recovery without a documented operator
+  path.
+- A real-server probe invalidates the self-sufficient-frame, ACK-ordering, or
+  error-taxonomy assumptions.
+- Real WebSocket integration requires a hidden background thread in the low-level
+  API.
+
+## Expected output of each step
+
+Each step should leave behind:
+
+- the smallest useful prototype or test artifact
+- a short `Local reflection`
+- a short `Global reflection`
+- a decision: proceed, adjust, or abandon that design branch
+
+The reflections are not optional. They are the feedback loop that keeps this
+from becoming a large unvalidated implementation.
