@@ -403,7 +403,19 @@ Use a fixed-capacity ordered ring sized by `max_in_flight`. Do not use `BTreeMap
 
 ## WebSocket framing without steady-state hot-path allocation
 
-Client-to-server WebSocket payloads must be masked. Durable QWP payload bytes must not be modified in place.
+The durable queue stores QWP application payload bytes, not WebSocket frames.
+WebSocket headers, mask keys, and masked payload bytes are transport artifacts.
+They must not be part of the durable frame identity, segment CRC, receipt state,
+or replay comparison.
+
+Client-to-server WebSocket payloads must be masked. Apply masking fresh on every
+send or replay after reading the stored QWP payload. The same stored FSN may be
+sent multiple times with different WebSocket mask keys; the server must observe
+the same unmasked QWP payload each time.
+
+Durable QWP payload bytes must not be modified in place. If masking is done by
+copy-and-XOR, copy from the stored payload into send scratch and mask the copy.
+If masking is streamed, XOR only the outbound chunks.
 
 Use one of these steady-state allocation-free approaches:
 
@@ -421,6 +433,10 @@ for each payload chunk:
 
 The random mask is stack data. The WebSocket header is stack data. No `Vec` growth is allowed during steady-state sends.
 
+Client-originated control frames, such as close, ping, and pong, follow the same
+transport rule: mask them at the WebSocket layer and keep that state out of the
+QWP/SF engine.
+
 Inbound responses are small. Preallocate:
 
 ```text
@@ -428,6 +444,9 @@ read_header_scratch
 response_payload_scratch
 max_error_message_bytes
 ```
+
+Server-to-client WebSocket frames are expected to be unmasked. A masked server
+response is a WebSocket protocol error, not a QWP delivery outcome.
 
 If the server error message exceeds the configured buffer, truncate it and set `message_truncated=true` in the event/outcome.
 
@@ -960,7 +979,10 @@ Rust core tests:
 - close fast leaves SF frames recoverable,
 - event ring overflow increments dropped counter,
 - self-sufficient replay encoder emits full schema and the required symbol dictionary prefix for every frame,
-- a stored later frame from a repeated-schema/repeated-symbol workload can be sent alone on a fresh connection.
+- a stored later frame from a repeated-schema/repeated-symbol workload can be sent alone on a fresh connection,
+- SF segment records store unmasked QWP payload bytes, not WebSocket headers or masked payloads,
+- replaying the same stored frame can use a fresh WebSocket mask key without changing the stored bytes,
+- masked server-to-client WebSocket frames are rejected as protocol errors.
 
 C ABI tests:
 

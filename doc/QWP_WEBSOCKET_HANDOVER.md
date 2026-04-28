@@ -127,6 +127,21 @@ symbol id repeats every lower dictionary entry.
 Future optimizations can add sparse referenced-entry dictionaries, state-only
 QWP messages, and durable state checkpoints. Do not make v1 depend on those.
 
+### WebSocket masking boundary
+
+Store unmasked QWP payload bytes in volatile/SF queues.
+
+WebSocket headers, mask keys, and masked payload bytes are transport artifacts.
+They are generated fresh for every client-to-server send or replay and must not
+be part of durable frame identity, segment CRC, receipt state, or replay
+comparison.
+
+Replaying the same FSN can use a different WebSocket mask key. That is correct
+as long as the server observes the same unmasked QWP payload.
+
+Server-to-client frames are expected to be unmasked. A masked server response is
+a WebSocket protocol error, not a QWP delivery outcome.
+
 ### Real-server probes
 
 Mocks are necessary but insufficient.
@@ -243,6 +258,7 @@ Stop and redesign if any real-server probe invalidates a core assumption.
 - Do not expose Tokio concepts through C.
 - Do not make `flush()` sometimes drive, sometimes passively wait, and sometimes
   fail because a runner owns progress.
+- Do not store WebSocket framing or masked payload bytes in the durable queue.
 - Do not freeze C enums before real-server error behavior is known.
 - Do not optimize away dense replay before v1 end-to-end correctness is proven.
 - Do not treat Java's current tests as real-server semantic proof; the Java

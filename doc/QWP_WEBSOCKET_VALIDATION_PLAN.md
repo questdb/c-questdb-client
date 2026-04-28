@@ -167,12 +167,16 @@ Validation target:
 - Stored frames contain enough schema information for independent replay.
 - Stored frames contain the dense symbol dictionary prefix from id `0` through
   the highest symbol id referenced by the frame.
+- Stored frames are unmasked QWP payload bytes. WebSocket headers, mask keys,
+  and masked payload bytes are not stored and are not part of durable identity.
 - Replaying a later stored frame alone after reconnect/restart succeeds.
 - The public API does not expose a durability-dependent encoding choice.
 
 Design pressure to watch:
 
 - The encoder should not infect normal row-building ergonomics.
+- WebSocket masking should stay below the QWP/SF layer. If masking leaks into
+  stored frame identity, replay and CRC semantics are wrong.
 - The cost of repeated schema/symbol material should be visible in benchmarks,
   but should not block the correctness-first v1.
 - The v1 dense dictionary rule is intentionally not scalable for long-running
@@ -492,6 +496,11 @@ validated queue and public API shape.
 Validation target:
 
 - Real connection setup fits `open_mode=connected` and `open_mode=lazy`.
+- Client-to-server frames are masked on the wire, but durable/SF records remain
+  unmasked QWP payloads.
+- Replaying the same stored QWP payload applies a fresh WebSocket mask without
+  mutating durable bytes.
+- Masked server-to-client frames are treated as WebSocket protocol errors.
 - Real cumulative ACK handling matches the fake-server model.
 - Reconnect and replay do not require public API changes.
 - Authentication, WebSocket upgrade, and close behavior map into the existing
