@@ -701,6 +701,12 @@ Reconnect budget exhaustion:
 - all unresolved receipts become terminal,
 - future submit calls fail until the sender is recreated.
 
+For file-backed SF mode, terminalizing the current sender's receipts does not
+ACK, poison, quarantine, or delete unresolved SF records. Those frames remain in
+the slot and can be recovered by a newly created sender after the operator fixes
+configuration, credentials, or server availability. Only ACK and
+poison/quarantine outcomes append durable completion records.
+
 Security/upgrade failures:
 
 - terminal immediately,

@@ -35,14 +35,17 @@ use std::collections::VecDeque;
 use super::qwp_ws_queue::{
     QueueError, QwpReceipt, QwpReceiptStatus, SentFrame, VolatileFrameQueue, VolatileQueueOptions,
 };
+use super::qwp_ws_sf_queue::{SfFrameQueue, SfQueueError};
 
 #[derive(Debug)]
-pub(crate) struct ManualDriverPrototype {
-    queue: VolatileFrameQueue,
+pub(crate) struct ManualDriverPrototype<Q = VolatileFrameQueue> {
+    queue: Q,
     server: FakeOrderedServer,
+    terminal: bool,
+    terminal_fsn: Option<u64>,
 }
 
-impl ManualDriverPrototype {
+impl ManualDriverPrototype<VolatileFrameQueue> {
     pub(crate) fn new(
         options: VolatileQueueOptions,
         server: FakeOrderedServer,
@@ -50,11 +53,27 @@ impl ManualDriverPrototype {
         Ok(Self {
             queue: VolatileFrameQueue::new(options)?,
             server,
+            terminal: false,
+            terminal_fsn: None,
         })
+    }
+}
+
+impl<Q: ManualDriverQueue> ManualDriverPrototype<Q> {
+    pub(crate) fn from_queue(queue: Q, server: FakeOrderedServer) -> Self {
+        Self {
+            queue,
+            server,
+            terminal: false,
+            terminal_fsn: None,
+        }
     }
 
     pub(crate) fn try_submit(&mut self, payload: &[u8]) -> Result<QwpReceipt, DriverError> {
-        Ok(self.queue.try_submit(payload)?)
+        if self.terminal {
+            return Err(DriverError::Terminal);
+        }
+        self.queue.try_submit(payload)
     }
 
     pub(crate) fn submit_with_drive_limit(
@@ -64,36 +83,52 @@ impl ManualDriverPrototype {
     ) -> Result<QwpReceipt, DriverError> {
         let mut drive_steps = 0;
         loop {
+            if self.terminal {
+                return Err(DriverError::Terminal);
+            }
             match self.queue.try_submit(payload) {
                 Ok(receipt) => return Ok(receipt),
-                Err(QueueError::FrameCapacityFull { .. } | QueueError::ByteCapacityFull { .. })
-                    if drive_steps < max_drive_steps =>
-                {
+                Err(DriverError::Queue(
+                    QueueError::FrameCapacityFull { .. } | QueueError::ByteCapacityFull { .. },
+                )) if drive_steps < max_drive_steps => {
                     self.drive_once()?;
                     drive_steps += 1;
                 }
-                Err(QueueError::FrameCapacityFull { .. } | QueueError::ByteCapacityFull { .. }) => {
+                Err(DriverError::Queue(
+                    QueueError::FrameCapacityFull { .. } | QueueError::ByteCapacityFull { .. },
+                )) => {
                     return Err(DriverError::SubmitTimedOut);
                 }
                 Err(
-                    err @ (QueueError::InvalidCapacity
-                    | QueueError::EmptyPayload
-                    | QueueError::PayloadExceedsByteCapacity { .. }
-                    | QueueError::MaxInFlightReached { .. }
-                    | QueueError::NoUnsentFrame
-                    | QueueError::ProtocolAckWithoutConnection
-                    | QueueError::ProtocolAckBeyondSent { .. }
-                    | QueueError::ProtocolAckedUnsentFrame { .. }
-                    | QueueError::ProtocolRejectWithoutConnection
-                    | QueueError::ProtocolRejectBeyondSent { .. }
-                    | QueueError::ProtocolRejectedUnsentFrame { .. }
-                    | QueueError::SequenceOverflow),
-                ) => return Err(err.into()),
+                    err @ (DriverError::Queue(
+                        QueueError::InvalidCapacity
+                        | QueueError::EmptyPayload
+                        | QueueError::PayloadExceedsByteCapacity { .. }
+                        | QueueError::MaxInFlightReached { .. }
+                        | QueueError::NoUnsentFrame
+                        | QueueError::ProtocolAckWithoutConnection
+                        | QueueError::ProtocolAckBeyondSent { .. }
+                        | QueueError::ProtocolAckedUnsentFrame { .. }
+                        | QueueError::ProtocolRejectWithoutConnection
+                        | QueueError::ProtocolRejectBeyondSent { .. }
+                        | QueueError::ProtocolRejectedUnsentFrame { .. }
+                        | QueueError::SequenceOverflow,
+                    )
+                    | DriverError::Storage
+                    | DriverError::CorruptLog { .. }
+                    | DriverError::SubmitTimedOut
+                    | DriverError::Terminal
+                    | DriverError::UnknownReceipt { .. }),
+                ) => return Err(err),
             }
         }
     }
 
     pub(crate) fn drive_once(&mut self) -> Result<DriveOutcome, DriverError> {
+        if self.terminal {
+            return Ok(DriveOutcome::Terminal);
+        }
+
         if let Some(response) = self.server.poll_response() {
             return self.apply_response(response);
         }
@@ -114,24 +149,34 @@ impl ManualDriverPrototype {
                 FakeSendResult::RetryableFailure => {
                     self.apply_response(FakeServerResponse::RetryableFailure)
                 }
+                FakeSendResult::TerminalFailure => {
+                    self.apply_response(FakeServerResponse::TerminalFailure)
+                }
             },
-            Err(QueueError::NoUnsentFrame | QueueError::MaxInFlightReached { .. }) => {
-                Ok(DriveOutcome::Idle)
-            }
+            Err(DriverError::Queue(
+                QueueError::NoUnsentFrame | QueueError::MaxInFlightReached { .. },
+            )) => Ok(DriveOutcome::Idle),
             Err(
-                err @ (QueueError::InvalidCapacity
-                | QueueError::EmptyPayload
-                | QueueError::FrameCapacityFull { .. }
-                | QueueError::PayloadExceedsByteCapacity { .. }
-                | QueueError::ByteCapacityFull { .. }
-                | QueueError::ProtocolAckWithoutConnection
-                | QueueError::ProtocolAckBeyondSent { .. }
-                | QueueError::ProtocolAckedUnsentFrame { .. }
-                | QueueError::ProtocolRejectWithoutConnection
-                | QueueError::ProtocolRejectBeyondSent { .. }
-                | QueueError::ProtocolRejectedUnsentFrame { .. }
-                | QueueError::SequenceOverflow),
-            ) => Err(err.into()),
+                err @ (DriverError::Queue(
+                    QueueError::InvalidCapacity
+                    | QueueError::EmptyPayload
+                    | QueueError::FrameCapacityFull { .. }
+                    | QueueError::PayloadExceedsByteCapacity { .. }
+                    | QueueError::ByteCapacityFull { .. }
+                    | QueueError::ProtocolAckWithoutConnection
+                    | QueueError::ProtocolAckBeyondSent { .. }
+                    | QueueError::ProtocolAckedUnsentFrame { .. }
+                    | QueueError::ProtocolRejectWithoutConnection
+                    | QueueError::ProtocolRejectBeyondSent { .. }
+                    | QueueError::ProtocolRejectedUnsentFrame { .. }
+                    | QueueError::SequenceOverflow,
+                )
+                | DriverError::Storage
+                | DriverError::CorruptLog { .. }
+                | DriverError::SubmitTimedOut
+                | DriverError::Terminal
+                | DriverError::UnknownReceipt { .. }),
+            ) => Err(err),
         }
     }
 
@@ -153,7 +198,14 @@ impl ManualDriverPrototype {
     }
 
     pub(crate) fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus {
-        self.queue.receipt_status(receipt)
+        let status = self.queue.receipt_status(receipt);
+        if let Some(terminal_fsn) = self.terminal_fsn
+            && receipt.fsn <= terminal_fsn
+            && status.is_pending()
+        {
+            return QwpReceiptStatus::Terminal { fsn: receipt.fsn };
+        }
+        status
     }
 
     pub(crate) fn sent_frames(&self) -> &[SentFrame] {
@@ -161,9 +213,10 @@ impl ManualDriverPrototype {
     }
 
     fn delivery_status(&self, receipt: QwpReceipt) -> Result<Option<DeliveryOutcome>, DriverError> {
-        match self.queue.receipt_status(receipt) {
+        match self.receipt_status(receipt) {
             QwpReceiptStatus::Acked { .. } => Ok(Some(DeliveryOutcome::Acked)),
             QwpReceiptStatus::Poisoned { .. } => Ok(Some(DeliveryOutcome::Poisoned)),
+            QwpReceiptStatus::Terminal { .. } => Ok(Some(DeliveryOutcome::Terminal)),
             QwpReceiptStatus::Published { .. } | QwpReceiptStatus::Sent { .. } => Ok(None),
             QwpReceiptStatus::Unknown { fsn } => Err(DriverError::UnknownReceipt { fsn }),
         }
@@ -197,20 +250,108 @@ impl ManualDriverPrototype {
                     reason: ReconnectReason::RetryableFailure,
                 })
             }
+            FakeServerResponse::TerminalFailure => {
+                self.terminal = true;
+                self.terminal_fsn = self.queue.published_fsn();
+                Ok(DriveOutcome::Terminal)
+            }
         }
+    }
+}
+
+pub(crate) trait ManualDriverQueue {
+    fn try_submit(&mut self, payload: &[u8]) -> Result<QwpReceipt, DriverError>;
+    fn send_next(&mut self) -> Result<SentFrame, DriverError>;
+    fn ack_wire(&mut self, wire_seq: u64) -> Result<(), DriverError>;
+    fn reject_wire(&mut self, wire_seq: u64) -> Result<QwpReceipt, DriverError>;
+    fn restart_connection(&mut self);
+    fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus;
+    fn published_fsn(&self) -> Option<u64>;
+}
+
+impl ManualDriverQueue for VolatileFrameQueue {
+    fn try_submit(&mut self, payload: &[u8]) -> Result<QwpReceipt, DriverError> {
+        Ok(VolatileFrameQueue::try_submit(self, payload)?)
+    }
+
+    fn send_next(&mut self) -> Result<SentFrame, DriverError> {
+        Ok(VolatileFrameQueue::send_next(self)?)
+    }
+
+    fn ack_wire(&mut self, wire_seq: u64) -> Result<(), DriverError> {
+        Ok(VolatileFrameQueue::ack_wire(self, wire_seq)?)
+    }
+
+    fn reject_wire(&mut self, wire_seq: u64) -> Result<QwpReceipt, DriverError> {
+        Ok(VolatileFrameQueue::reject_wire(self, wire_seq)?)
+    }
+
+    fn restart_connection(&mut self) {
+        VolatileFrameQueue::restart_connection(self);
+    }
+
+    fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus {
+        VolatileFrameQueue::receipt_status(self, receipt)
+    }
+
+    fn published_fsn(&self) -> Option<u64> {
+        VolatileFrameQueue::published_fsn(self)
+    }
+}
+
+impl ManualDriverQueue for SfFrameQueue {
+    fn try_submit(&mut self, payload: &[u8]) -> Result<QwpReceipt, DriverError> {
+        Ok(SfFrameQueue::try_submit(self, payload)?)
+    }
+
+    fn send_next(&mut self) -> Result<SentFrame, DriverError> {
+        Ok(SfFrameQueue::send_next(self)?)
+    }
+
+    fn ack_wire(&mut self, wire_seq: u64) -> Result<(), DriverError> {
+        Ok(SfFrameQueue::ack_wire(self, wire_seq)?)
+    }
+
+    fn reject_wire(&mut self, wire_seq: u64) -> Result<QwpReceipt, DriverError> {
+        Ok(SfFrameQueue::reject_wire(self, wire_seq)?)
+    }
+
+    fn restart_connection(&mut self) {
+        SfFrameQueue::restart_connection(self);
+    }
+
+    fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus {
+        SfFrameQueue::receipt_status(self, receipt)
+    }
+
+    fn published_fsn(&self) -> Option<u64> {
+        SfFrameQueue::published_fsn(self)
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DriverError {
     Queue(QueueError),
+    Storage,
+    CorruptLog { offset: usize, reason: &'static str },
     SubmitTimedOut,
+    Terminal,
     UnknownReceipt { fsn: u64 },
 }
 
 impl From<QueueError> for DriverError {
     fn from(value: QueueError) -> Self {
         Self::Queue(value)
+    }
+}
+
+impl From<SfQueueError> for DriverError {
+    fn from(value: SfQueueError) -> Self {
+        match value {
+            SfQueueError::Queue(err) => Self::Queue(err),
+            SfQueueError::Io(_) => Self::Storage,
+            SfQueueError::CorruptLog { offset, reason } => Self::CorruptLog { offset, reason },
+        }
     }
 }
 
@@ -221,6 +362,7 @@ pub(crate) enum DriveOutcome {
     Acked { wire_seq: u64 },
     Poisoned { fsn: u64, wire_seq: u64 },
     Reconnected { reason: ReconnectReason },
+    Terminal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -233,6 +375,7 @@ pub(crate) enum ReconnectReason {
 pub(crate) enum DeliveryOutcome {
     Acked,
     Poisoned,
+    Terminal,
     Timeout,
 }
 
@@ -296,6 +439,7 @@ pub(crate) enum FakeSendResult {
     RejectWire { wire_seq: u64 },
     Disconnect,
     RetryableFailure,
+    TerminalFailure,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -304,11 +448,14 @@ pub(crate) enum FakeServerResponse {
     Reject { wire_seq: u64 },
     Disconnect,
     RetryableFailure,
+    TerminalFailure,
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::qwp_ws_sf_queue::SfQueueOptions;
     use super::*;
+    use tempfile::TempDir;
 
     fn options(max_frames: usize, max_bytes: usize, max_in_flight: usize) -> VolatileQueueOptions {
         VolatileQueueOptions {
@@ -320,6 +467,19 @@ mod tests {
 
     fn driver(server: FakeOrderedServer) -> ManualDriverPrototype {
         ManualDriverPrototype::new(options(8, 1024, 4), server).unwrap()
+    }
+
+    fn sf_options(dir: &TempDir) -> SfQueueOptions {
+        SfQueueOptions {
+            dir: dir.path().to_path_buf(),
+            max_frames: 8,
+            max_bytes: 1024,
+            max_in_flight: 4,
+        }
+    }
+
+    fn sf_driver(dir: &TempDir, server: FakeOrderedServer) -> ManualDriverPrototype<SfFrameQueue> {
+        ManualDriverPrototype::from_queue(SfFrameQueue::open(sf_options(dir)).unwrap(), server)
     }
 
     #[test]
@@ -551,6 +711,37 @@ mod tests {
     }
 
     #[test]
+    fn terminal_failure_marks_unresolved_receipts_and_rejects_future_submit() {
+        let mut driver = driver(FakeOrderedServer::scripted([
+            FakeSendResult::NoResponse,
+            FakeSendResult::TerminalFailure,
+        ]));
+        let first = driver.try_submit(b"first").unwrap();
+        let second = driver.try_submit(b"second").unwrap();
+
+        assert!(matches!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::Sent(_)
+        ));
+        assert_eq!(driver.drive_once().unwrap(), DriveOutcome::Terminal);
+
+        assert_eq!(
+            driver.receipt_status(first),
+            QwpReceiptStatus::Terminal { fsn: 0 }
+        );
+        assert_eq!(
+            driver.receipt_status(second),
+            QwpReceiptStatus::Terminal { fsn: 1 }
+        );
+        assert_eq!(
+            driver.wait_steps(first, 0).unwrap(),
+            DeliveryOutcome::Terminal
+        );
+        assert_eq!(driver.drive_once().unwrap(), DriveOutcome::Terminal);
+        assert_eq!(driver.try_submit(b"third"), Err(DriverError::Terminal));
+    }
+
+    #[test]
     fn ordered_reject_acks_prior_frame_and_leaves_later_frame_unresolved() {
         let mut driver = driver(FakeOrderedServer::scripted([
             FakeSendResult::NoResponse,
@@ -710,6 +901,159 @@ mod tests {
         assert_eq!(
             driver.receipt_status(receipt),
             QwpReceiptStatus::Published { fsn: 0 }
+        );
+    }
+
+    #[test]
+    fn sf_driver_reopens_and_replays_from_first_unresolved_fsn() {
+        let dir = TempDir::new().unwrap();
+        let first;
+        let second;
+        let third;
+        {
+            let mut driver = sf_driver(
+                &dir,
+                FakeOrderedServer::scripted([FakeSendResult::AckSent, FakeSendResult::NoResponse]),
+            );
+            first = driver.try_submit(b"first").unwrap();
+            second = driver.try_submit(b"second").unwrap();
+            third = driver.try_submit(b"third").unwrap();
+
+            assert_eq!(
+                driver.drive_once().unwrap(),
+                DriveOutcome::Acked { wire_seq: 0 }
+            );
+            assert_eq!(
+                driver.drive_once().unwrap(),
+                DriveOutcome::Sent(SentFrame {
+                    fsn: 1,
+                    wire_seq: 1,
+                    payload_len: 6,
+                })
+            );
+        }
+
+        let mut recovered = sf_driver(&dir, FakeOrderedServer::ack_each_send());
+
+        assert_eq!(
+            recovered.receipt_status(first),
+            QwpReceiptStatus::Acked { fsn: 0 }
+        );
+        assert_eq!(
+            recovered.receipt_status(second),
+            QwpReceiptStatus::Published { fsn: 1 }
+        );
+        assert_eq!(
+            recovered.receipt_status(third),
+            QwpReceiptStatus::Published { fsn: 2 }
+        );
+        assert_eq!(
+            recovered.drive_once().unwrap(),
+            DriveOutcome::Acked { wire_seq: 0 }
+        );
+        assert_eq!(
+            recovered.sent_frames(),
+            &[SentFrame {
+                fsn: 1,
+                wire_seq: 0,
+                payload_len: 6,
+            }]
+        );
+        assert_eq!(
+            recovered.receipt_status(second),
+            QwpReceiptStatus::Acked { fsn: 1 }
+        );
+    }
+
+    #[test]
+    fn sf_driver_persists_poison_gap_and_later_ack_after_reopen() {
+        let dir = TempDir::new().unwrap();
+        let first;
+        let second;
+        let third;
+        {
+            let mut driver = sf_driver(
+                &dir,
+                FakeOrderedServer::scripted([
+                    FakeSendResult::NoResponse,
+                    FakeSendResult::RejectWire { wire_seq: 1 },
+                    FakeSendResult::AckWire { wire_seq: 2 },
+                ]),
+            );
+            first = driver.try_submit(b"first").unwrap();
+            second = driver.try_submit(b"second").unwrap();
+            third = driver.try_submit(b"third").unwrap();
+
+            assert!(matches!(
+                driver.drive_once().unwrap(),
+                DriveOutcome::Sent(_)
+            ));
+            assert_eq!(
+                driver.drive_once().unwrap(),
+                DriveOutcome::Poisoned {
+                    fsn: 1,
+                    wire_seq: 1,
+                }
+            );
+            assert_eq!(
+                driver.drive_once().unwrap(),
+                DriveOutcome::Acked { wire_seq: 2 }
+            );
+        }
+
+        let mut recovered = sf_driver(&dir, FakeOrderedServer::no_response());
+
+        assert_eq!(
+            recovered.wait_steps(first, 0).unwrap(),
+            DeliveryOutcome::Acked
+        );
+        assert_eq!(
+            recovered.wait_steps(second, 0).unwrap(),
+            DeliveryOutcome::Poisoned
+        );
+        assert_eq!(
+            recovered.wait_steps(third, 0).unwrap(),
+            DeliveryOutcome::Acked
+        );
+        assert!(recovered.sent_frames().is_empty());
+    }
+
+    #[test]
+    fn sf_driver_terminal_failure_does_not_poison_recovered_frames() {
+        let dir = TempDir::new().unwrap();
+        let first;
+        {
+            let mut driver = sf_driver(
+                &dir,
+                FakeOrderedServer::scripted([FakeSendResult::TerminalFailure]),
+            );
+            first = driver.try_submit(b"first").unwrap();
+
+            assert_eq!(driver.drive_once().unwrap(), DriveOutcome::Terminal);
+            assert_eq!(
+                driver.receipt_status(first),
+                QwpReceiptStatus::Terminal { fsn: 0 }
+            );
+            assert_eq!(driver.try_submit(b"second"), Err(DriverError::Terminal));
+        }
+
+        let mut recovered = sf_driver(&dir, FakeOrderedServer::ack_each_send());
+
+        assert_eq!(
+            recovered.receipt_status(first),
+            QwpReceiptStatus::Published { fsn: 0 }
+        );
+        assert_eq!(
+            recovered.wait_steps(first, 1).unwrap(),
+            DeliveryOutcome::Acked
+        );
+        assert_eq!(
+            recovered.sent_frames(),
+            &[SentFrame {
+                fsn: 0,
+                wire_seq: 0,
+                payload_len: 5,
+            }]
         );
     }
 }

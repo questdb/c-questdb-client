@@ -42,6 +42,7 @@ pub(crate) enum QwpReceiptStatus {
     Sent { fsn: u64, wire_seq: u64 },
     Acked { fsn: u64 },
     Poisoned { fsn: u64 },
+    Terminal { fsn: u64 },
 }
 
 impl QwpReceiptStatus {
@@ -623,6 +624,7 @@ mod tests {
         assert!(!QwpReceiptStatus::Unknown { fsn: 0 }.is_pending());
         assert!(!QwpReceiptStatus::Acked { fsn: 0 }.is_pending());
         assert!(!QwpReceiptStatus::Poisoned { fsn: 0 }.is_pending());
+        assert!(!QwpReceiptStatus::Terminal { fsn: 0 }.is_pending());
     }
 
     #[test]
