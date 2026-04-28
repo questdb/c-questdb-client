@@ -2,7 +2,7 @@
 
 Date: 2026-04-28
 
-Status: partial validation note for Step 9 of
+Status: mock-side validation note for Step 9 of
 `doc/QWP_WEBSOCKET_VALIDATION_PLAN.md`.
 
 ## Prototype scope
@@ -20,6 +20,7 @@ Implemented:
 - close-drain outcomes: drained, timeout, terminal
 - retry-budget exhaustion that terminalizes the current sender without
   completing durable SF records
+- a bounded driver event ring and `poll_event()` for transition notifications
 - `DriverError::Storage` and `DriverError::CorruptLog` so storage failures do
   not collapse into delivery outcomes
 
@@ -28,11 +29,15 @@ current sender instance. In file-backed SF mode, terminalizing current receipts
 does not append ACK or poison completion records. A newly created sender can
 recover the still-unresolved SF frames and replay them.
 
+Events are not authoritative state. They are ordered transition notifications
+for observability. `receipt_status()`, `wait()`, and `close_drain()` remain the
+state surfaces; event overflow increments a drop counter and must not corrupt
+receipt or delivery outcomes.
+
 Not implemented in this slice:
 
 - auth or upgrade rejection detail
 - write/internal server error classification
-- event polling agreement
 - real-server error taxonomy probing
 - durable poison files
 
@@ -56,6 +61,16 @@ Rust unit tests cover:
   future submissions
 - retry-budget exhaustion in SF mode leaves unresolved frames recoverable by a
   newly created sender
+- successful submit queues a `Published` event, while failed submit queues no
+  event
+- send, cumulative ACK, poison, reconnect, and terminal events agree with
+  `receipt_status()` and `wait()`
+- terminal transition queues one `Terminal` event; sticky terminal progress does
+  not duplicate it
+- event ring overflow drops old events and increments a counter without
+  corrupting receipt status
+- `close_drain()` is irreversible once started, including if progress returns a
+  protocol/API error
 - an SF-backed driver reopens and replays from the first unresolved FSN with
   wire sequence `0`
 - an SF-backed driver persists an ordered reject, poison gap, and later ACK
@@ -71,31 +86,31 @@ cargo test --manifest-path questdb-rs/Cargo.toml qwp_ws
 
 Result:
 
-- manual driver filter: 28 passed
-- widened QWP filter: 97 passed, 2 ignored
+- manual driver filter: 37 passed
+- widened QWP filter: 106 passed, 2 ignored
 
 ## Local reflection
 
 - How does this particular step feel?
 
-  The queue seam is small and mechanical. Running close-drain and retry-budget
-  behaviour through the same volatile/SF driver path is the right pressure point
-  before adding a real event ring or FFI outcomes.
+  The queue seam is small and mechanical. Adding events at existing transition
+  points did not require a second state machine, which is the important result:
+  events can stay observational rather than authoritative.
 
 - What was simpler or more awkward than expected?
 
   Terminal and closing state are cleaner as driver-layer overlays than as
-  durable queue completion records. The awkward part is that `receipt_status()`
-  now combines queue state with driver lifecycle state; the production API
-  should make that layering explicit so storage recovery, close outcomes, and
-  current-sender delivery outcomes do not blur together.
+  durable queue completion records. Event overflow was simpler than expected
+  once direct accessors remained authoritative. The awkward part is still status
+  composition: `receipt_status()` combines queue state with driver lifecycle
+  state, and production code should make that layering explicit.
 
 - Did the API or implementation shape create accidental complexity?
 
   The main complexity is status composition. Queue state, closing state,
-  terminal state, and future event-ring state are related but not the same. The
-  core should probably expose a small status composer rather than scattering
-  these checks across adapters.
+  terminal state, and event history are related but not the same. The core
+  should probably expose a small status composer rather than scattering these
+  checks across adapters.
 
 ## Global reflection
 
@@ -103,18 +118,19 @@ Result:
 
   It strengthens the distinction between durable facts and current-driver
   outcomes. ACK and poison are durable completion facts. Terminal failure,
-  retry-budget exhaustion, and close timeout can affect the current sender
-  without destroying recoverable SF data.
+  retry-budget exhaustion, close timeout, and event loss can affect the current
+  sender or observability surface without destroying recoverable SF data.
 
 - Did this step strengthen or weaken the core assumptions?
 
   It strengthened them. The same manual driver now exercises volatile and SF
-  queues for poison, close, and retry outcomes, and the SF queue can survive
-  terminal sender failure or close timeout without being converted into poison
-  or data loss.
+  queues for poison, close, retry, and event-observation outcomes. The SF queue
+  can survive terminal sender failure or close timeout without being converted
+  into poison or data loss, and receipt state remains valid even when events
+  overflow.
 
 - Should the next step proceed, or should the design be adjusted first?
 
-  Continue Step 9 only far enough to add event polling agreement. After that,
-  Step 10 should validate real-server error taxonomy before any FFI outcome enum
-  hardens.
+  Proceed to Step 10. The remaining uncertainty is protocol truth: real-server
+  error taxonomy and error payload shape should be validated before any FFI
+  outcome enum hardens.

@@ -591,6 +591,11 @@ pub enum QwpEvent {
 
 The event ring is preallocated. On overflow, increment `events_dropped_total` and retain the latest terminal/poison state in direct accessors.
 
+Events are transition notifications, not authoritative state. `receipt_status()`,
+`wait()`, and `close_drain()` remain the state surfaces. Calls that drive
+progress may produce events, but they should not consume them; `poll_event()`
+is the consumer API.
+
 ## Server error classification
 
 Current QWP response statuses include:

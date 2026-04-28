@@ -32,9 +32,10 @@ As of 2026-04-28:
   `doc/QWP_WEBSOCKET_ACK_ORDER_REJECT_PROBE.md`.
 - Step 8 has a minimal file-backed SF queue prototype and reflection in
   `doc/QWP_WEBSOCKET_SF_QUEUE_PROTOTYPE.md`.
-- Step 9 has driver/SF seam coverage for poison, terminal, close-drain, and
-  retry-budget behaviour in `doc/QWP_WEBSOCKET_ERROR_POLICY_PROTOTYPE.md`;
-  event polling and real-server taxonomy validation remain open.
+- Step 9 has driver/SF seam coverage for poison, terminal, close-drain,
+  retry-budget behaviour, and event polling agreement in
+  `doc/QWP_WEBSOCKET_ERROR_POLICY_PROTOTYPE.md`; real-server taxonomy
+  validation remains open.
 - Extended Java/Rust fixtures for arrays, decimals, UTF-8 strings, sparse
   columns, and schema evolution remain recommended before hardening the full
   product surface.
