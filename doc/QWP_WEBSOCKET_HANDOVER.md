@@ -62,6 +62,23 @@ line_sender_qwpws_threaded_start(&sender, &threaded, &err);
 /* sender is NULL on success */
 ```
 
+Stopping the threaded adapter does not return the original manual sender. If an
+application wants manual control again, it should close the threaded handle and
+create or recover a new manual sender from the same SF slot.
+
+### Open behavior
+
+`open()` is allowed to do real setup work. The default should be
+`open_mode=connected`, which may perform bounded DNS, TCP/TLS, WebSocket upgrade,
+protocol negotiation, and auth work. It must still not start a background thread
+or keep progressing after it returns.
+
+`open_mode=lazy` is the explicit local-only setup mode. It may parse config,
+allocate, initialize/recover the queue, and accept local submissions before the
+first successful connection if queue capacity is available. The first
+`drive_once()`, `wait()`, or `close_drain()` can then perform connection work on
+the caller's thread.
+
 ### Local acceptance vs server delivery
 
 The Java client's `flush()` returns after publishing into its local engine, not
@@ -203,9 +220,11 @@ rows.
    error probes confirm what the server actually reports.
 
 5. C ABI result shape:
-   Do not collapse events, receipt status, wait outcome, and close outcome into
-   one enum. C needs distinct status/outcome structs so timeout, pending,
-   drained, poisoned, and API failure are observable without abusing `err_out`.
+   The high-level decision is settled: do not collapse events, receipt status,
+   wait outcome, and close outcome into one enum. C needs distinct status/outcome
+   structs so timeout, pending, drained, poisoned, and API failure are observable
+   without abusing `err_out`. Exact function names and wrapper ergonomics can
+   still be refined in the API sketch.
 
 6. Durability boundary:
    A receipt must not be returned until the frame satisfies the selected queue
@@ -278,8 +297,9 @@ Stop and redesign if any real-server probe invalidates a core assumption.
 
 - Do not let the low-level API silently start a thread.
 - Do not expose Tokio concepts through C.
-- Do not make `flush()` sometimes drive, sometimes passively wait, and sometimes
-  fail because a runner owns progress.
+- Do not let manual and threaded APIs share a live sender handle through runtime
+  "runner active" checks. Threaded/async adapters should consume the manual
+  sender.
 - Do not store WebSocket framing or masked payload bytes in the durable queue.
 - Do not freeze C enums before real-server error behavior is known.
 - Do not optimize away dense replay before v1 end-to-end correctness is proven.
