@@ -18,14 +18,17 @@ As of 2026-04-28:
   `doc/QWP_WEBSOCKET_PROGRESS_OWNERSHIP_PROTOTYPE.md`.
 - Step 3 has a Rust encoder-only byte-shape spike and reflection in
   `doc/QWP_WEBSOCKET_REPLAY_ENCODER_SPIKE.md`.
-- Step 3 Java/Rust golden payload parity is still open.
+- Step 3 has a Java/Rust replay payload golden fixture and reflection in
+  `doc/QWP_WEBSOCKET_JAVA_RUST_GOLDEN_PAYLOADS.md`.
 - Step 4 has a passing real-server self-sufficient replay probe in
   `doc/QWP_WEBSOCKET_SELF_SUFFICIENT_REPLAY_PROBE.md`.
 - Step 4 also corrected the client-side wire-sequence assumption: the first
   QWP/WebSocket frame on a fresh connection is ACKed as sequence `0`.
-- Step 5 queue work is unblocked by Rust-vs-server protocol validation, but the
-  Step 3 Java/Rust golden payload parity question must still be resolved or
-  deliberately deferred with rationale.
+- Step 5 queue work is unblocked by Rust-vs-server protocol validation and the
+  core Java/Rust replay payload parity fixture.
+- Extended Java/Rust fixtures for arrays, decimals, UTF-8 strings, sparse
+  columns, and schema evolution remain recommended before hardening the full
+  product surface.
 
 ## Validation discipline
 
@@ -84,18 +87,20 @@ Java is a reference implementation for the v1 dense replay shape, not a
 substitute for validation.
 
 The Rust encoder spike may start with Rust-only byte-shape tests. Before queue
-work turns replay payloads into product state, add the Java/Rust fixtures below
-or explicitly record that real-server semantic validation, not byte-for-byte Java
-parity, is the compatibility gate for v1.
+work turns replay payloads into product state, add the core Java/Rust fixture
+below or explicitly record that real-server semantic validation, not
+byte-for-byte Java parity, is the compatibility gate for v1.
 
 Before implementation depends on Java-compatible behavior, add small golden
 fixtures that compare Java and Rust at the QWP application-payload layer:
 
 - Compare unmasked QWP payload bytes, not WebSocket frames. Client mask keys are
   intentionally fresh per send, so masked frame bytes should differ.
-- Cover full schema mode, disabled schema references, repeated table/schema use,
-  repeated symbols, high symbol ids, arrays, decimals, timestamps, UTF-8, sparse
-  columns, and schema evolution across batches.
+- The first queue-blocking fixture should cover full schema mode, disabled
+  schema references, repeated table/schema use, repeated symbols, high symbol
+  ids, timestamps, and a later replay batch.
+- Extended fixtures should later cover arrays, decimals, UTF-8, sparse columns,
+  and schema evolution across batches.
 - Include at least one fixture where a later batch is stored and replayed alone
   on a fresh connection.
 - Record whether any byte difference is semantically intentional. If so, validate

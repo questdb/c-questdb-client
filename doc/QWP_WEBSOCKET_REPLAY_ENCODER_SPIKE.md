@@ -32,6 +32,9 @@ Store-and-Forward implementation was added in this step.
   `0`, `1`, and `2`.
 - Replay encoding always emits full schema mode even when the existing delta
   encoder would emit schema-reference mode.
+- A follow-up Java/Rust golden test now compares exact unmasked replay payload
+  bytes for the core dense replay case; see
+  `doc/QWP_WEBSOCKET_JAVA_RUST_GOLDEN_PAYLOADS.md`.
 - Existing QWP/WebSocket tests still pass, including tests that assert the old
   connection-delta encoder emits empty symbol deltas and schema references.
 
@@ -65,8 +68,10 @@ Store-and-Forward implementation was added in this step.
 - Did this step strengthen or weaken the core assumptions?
 
   It strengthens the self-sufficient-frame assumption at the byte-shape level.
-  It does not prove real-server acceptance; that remains the next protocol
-  truth gate.
+  It did not initially prove real-server acceptance or Java parity; those
+  follow-up gates now have focused notes in
+  `doc/QWP_WEBSOCKET_SELF_SUFFICIENT_REPLAY_PROBE.md` and
+  `doc/QWP_WEBSOCKET_JAVA_RUST_GOLDEN_PAYLOADS.md`.
 
 - Should the next step proceed, or should the design be adjusted first?
 

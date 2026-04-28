@@ -99,6 +99,6 @@ use zero-based per-connection wire sequences.
 
 - Should the next step proceed, or should the design be adjusted first?
 
-  The real-server replay gate is passed. Before Step 5, make an explicit
-  decision on whether Java/Rust byte-for-byte replay payload parity must be done
-  now or can be deferred in favor of this Rust-vs-server semantic validation.
+  The real-server replay gate is passed. The core Java/Rust payload parity gate
+  is now covered separately in
+  `doc/QWP_WEBSOCKET_JAVA_RUST_GOLDEN_PAYLOADS.md`, so Step 5 can proceed.
