@@ -138,9 +138,15 @@ durable-ACK probes complete.
 `QwpDeliveryOutcome::Poisoned` includes the FSN even though the caller already
 has the receipt. That redundancy is intentional for logging and callback
 ergonomics. `QwpCloseOutcome` does not have a separate poisoned variant in this
-sketch: under `PoisonPolicy::Stop`, a poison observed during close makes the
-sender terminal; under quarantine policy, poison is reported through receipt
-state and events while close can still drain.
+sketch: poison is a receipt completion state. Under `PoisonPolicy::Stop`, the
+sender stops sending new frames after already-sent in-flight frames are
+resolved; under quarantine policy, poison is reported through receipt state and
+events while sending can continue. In both modes, close can only report drained
+after all published receipts are resolved as ACKed or poisoned.
+
+`server_acked_fsn` and `completed_fsn` are distinct. After a poison gap,
+`completed_fsn` may advance through ACKed later receipts while
+`server_acked_fsn` remains before the poisoned FSN.
 
 ## Rust manual sender
 

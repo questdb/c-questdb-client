@@ -350,6 +350,11 @@ completed_fsn       highest contiguous frame ACKed or quarantined
 
 Do not count quarantined frames as server ACKed.
 
+A frame is *resolved* when its receipt reaches a final delivery state:
+ACKed, poisoned/quarantined, or terminal. `completed_fsn` advances through
+contiguous resolved frames. `server_acked_fsn` advances only through contiguous
+ACKed frames and can therefore lag behind `completed_fsn` across poison gaps.
+
 ### Volatile queue mode
 
 Volatile queue mode uses a preallocated in-memory ring of frame slots.
@@ -432,9 +437,26 @@ connection-scoped encoder state is reset
 
 The server processes submitted WebSocket frames strictly in wire-sequence order. Responses do not complete arbitrary later frames ahead of earlier frames.
 
-The server may coalesce successful ACKs by sending only the highest successful wire sequence. An `OK(sequence=N)` response means every unresolved successful frame up to `N` is accepted. The client maps that cumulative wire sequence to the corresponding FSN and advances `server_acked_fsn` through that FSN.
+The server may coalesce successful ACKs by sending only the highest successful wire sequence. An `OK(sequence=N)` response means every unresolved successful frame up to `N` is accepted unless a prior poison gap prevents contiguous server ACK advancement. The client maps that cumulative wire sequence to the corresponding FSN, marks covered successful receipts ACKed, and advances `server_acked_fsn` only through contiguous ACKed FSNs.
 
 If the server sends an error for sequence `N`, prior unresolved frames below `N` are treated as ACKed if they were covered by the server's ordering guarantee. Frame `N` follows the server-error classification and poison policy. Later frames remain unresolved until a later cumulative OK or error response resolves them.
+
+Responses resolve frames; poison policy only decides whether new frames may be
+sent after the already-sent in-flight window is resolved. The driver must not
+stop reading immediately on a deterministic server error because the server can
+still accept and later ACK frames that were already in flight.
+
+Example:
+
+```text
+OK(0), Error(1), OK(2)
+
+receipt 0      ACKed
+receipt 1      Poisoned
+receipt 2      ACKed
+server_acked   0
+completed      2
+```
 
 The in-flight table must be preallocated:
 
@@ -577,15 +599,21 @@ Low-level default.
 
 Behavior:
 
-- rejected frame remains in the main queue,
-- sender becomes terminal,
-- next checkpoint surfaces the rejection,
-- user decides whether to inspect, delete, repair, or replay.
+- stop sending new frames after a poison is observed,
+- continue reading responses for already-sent in-flight frames until they are
+  resolved or transport fails,
+- mark the rejected frame completed as poisoned,
+- after the in-flight window is resolved, pause or become terminal according to
+  the API layer,
+- next checkpoint surfaces the rejection and the user decides whether to
+  inspect, delete, repair, or replay.
 
 Trade-off:
 
 - no implicit skip,
-- one bad frame can stop the sender indefinitely.
+- one bad frame can stop future sending indefinitely,
+- later frames already in flight may still complete and must not be replayed
+  just because an earlier frame was poisoned.
 
 ### QuarantineAndContinue
 
@@ -597,7 +625,7 @@ Behavior:
 - write metadata,
 - advance `completed_fsn`,
 - emit a poison event,
-- continue with later frames.
+- continue resolving already-sent frames and continue sending later frames.
 
 Suggested poison layout:
 
@@ -741,7 +769,7 @@ typedef struct {
 } line_sender_qwpws_close_outcome;
 ```
 
-For `LINE_SENDER_QWPWS_EVENT_ACKED`, `fsn` is the highest cumulatively ACKed FSN, not necessarily a single-frame ACK. `wire_sequence` is the highest cumulatively ACKed wire sequence on the current connection.
+For `LINE_SENDER_QWPWS_EVENT_ACKED`, `fsn` is the highest cumulatively ACKed FSN, not necessarily a single-frame ACK. `wire_sequence` is the highest cumulatively ACKed wire sequence on the current connection. ACKed-through and completed-through are intentionally different across poison gaps: `completed_fsn` can advance past a poisoned frame while `server_acked_fsn` cannot.
 
 Construction:
 

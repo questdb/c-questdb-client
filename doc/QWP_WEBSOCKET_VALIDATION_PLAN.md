@@ -28,6 +28,8 @@ As of 2026-04-28:
   reflection in `doc/QWP_WEBSOCKET_VOLATILE_QUEUE_PROTOTYPE.md`.
 - Step 6 has a manual-driver prototype over a fake ordered server with
   reflection in `doc/QWP_WEBSOCKET_MANUAL_DRIVER_PROTOTYPE.md`.
+- Step 7 has a passing real-server ACK/order/reject probe in
+  `doc/QWP_WEBSOCKET_ACK_ORDER_REJECT_PROBE.md`.
 - Extended Java/Rust fixtures for arrays, decimals, UTF-8 strings, sparse
   columns, and schema evolution remain recommended before hardening the full
   product surface.
@@ -390,10 +392,10 @@ Cover:
 
 Validation target:
 
-- The server never reports success for a later frame while an earlier frame is
-  unresolved.
+- The server never reports success for a later frame while an earlier frame has
+  no response. A server error counts as resolving that earlier frame.
 - A cumulative ACK can be treated as ACK for all lower unresolved frame sequence
-  numbers.
+  numbers until a poison gap prevents contiguous server-ACK advancement.
 - Close and EOF behavior map cleanly into retryable, terminal, or drained
   outcomes.
 

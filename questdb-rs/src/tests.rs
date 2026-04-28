@@ -45,6 +45,9 @@ mod qwp_ws;
 #[cfg(all(feature = "sync-sender-qwp-ws", feature = "sync-sender-http"))]
 mod qwp_ws_replay_probe;
 
+#[cfg(all(feature = "sync-sender-qwp-ws", feature = "sync-sender-http"))]
+mod qwp_ws_protocol_probe;
+
 #[cfg(feature = "sync-sender-qwp-ws")]
 mod qwp_ws_java_golden;
 
