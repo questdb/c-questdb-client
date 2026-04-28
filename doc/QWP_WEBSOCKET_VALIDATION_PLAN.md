@@ -39,6 +39,18 @@ As of 2026-04-28:
   schema mismatch, and deterministic value/type coercion in
   `doc/QWP_WEBSOCKET_ERROR_TAXONOMY_PROBE.md`; auth/upgrade rejection and
   deterministic internal/retryable write failure remain deferred.
+- Step 11 has C ABI shape stubs for value receipts, progress-only drive,
+  event polling, receipt status, wait, close outcomes, and threaded ownership.
+  The public C header parses as C and C++; receipt status uses
+  `line_sender_qwpws_get_receipt_status` to avoid the C typedef/function
+  namespace collision.
+- Step 12 has started with a Rust-only transport seam for the manual driver:
+  fake-server behavior is now behind `ManualDriverTransport`, queued payload
+  bytes are passed through the seam, and the queue/driver boundary is two-phase:
+  transport write success commits `Sent`, while write failure leaves the receipt
+  `Published` and enters the reconnect policy. A non-fake test transport covers
+  accepted-send failure, pre-commit write failure, and read-side poll failure
+  before real WebSocket I/O is wired in.
 - Extended Java/Rust fixtures for arrays, decimals, UTF-8 strings, sparse
   columns, and schema evolution remain recommended before hardening the full
   product surface.

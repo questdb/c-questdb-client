@@ -36,7 +36,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-use super::qwp_ws_queue::{QueueError, QwpReceipt, QwpReceiptStatus, SentFrame};
+use super::qwp_ws_queue::{OutboundFrame, QueueError, QwpReceipt, QwpReceiptStatus, SentFrame};
 
 const LOG_FILE_NAME: &str = "qwp-ws-sf.log";
 const LOG_MAGIC: &[u8; 8] = b"QWPSF001";
@@ -184,6 +184,15 @@ impl SfFrameQueue {
     }
 
     pub(crate) fn send_next(&mut self) -> Result<SentFrame, SfQueueError> {
+        let frame = {
+            let outbound = self.next_outbound_frame()?;
+            outbound.sent_frame()
+        };
+        self.commit_sent(frame)?;
+        Ok(frame)
+    }
+
+    pub(crate) fn next_outbound_frame(&self) -> Result<OutboundFrame<'_>, SfQueueError> {
         if self.in_flight.is_full() {
             return Err(QueueError::MaxInFlightReached {
                 max_in_flight: self.in_flight.capacity(),
@@ -194,28 +203,62 @@ impl SfFrameQueue {
         let Some(offset) = self.first_published_offset() else {
             return Err(QueueError::NoUnsentFrame.into());
         };
-        self.ensure_connection_started()?;
 
         let wire_seq = self.connection.next_wire_seq;
-        self.connection.next_wire_seq = self
+        wire_seq
+            .checked_add(1)
+            .ok_or(QueueError::SequenceOverflow)?;
+
+        let frame = &self.frames[offset];
+        Ok(OutboundFrame {
+            fsn: frame.fsn,
+            wire_seq,
+            payload: &frame.payload,
+        })
+    }
+
+    pub(crate) fn commit_sent(&mut self, frame: SentFrame) -> Result<(), SfQueueError> {
+        if self.in_flight.is_full() {
+            return Err(QueueError::MaxInFlightReached {
+                max_in_flight: self.in_flight.capacity(),
+            }
+            .into());
+        }
+
+        let Some(offset) = self.first_published_offset() else {
+            return Err(QueueError::NoUnsentFrame.into());
+        };
+        let stored = &self.frames[offset];
+        if stored.fsn != frame.fsn
+            || !matches!(stored.state, FrameState::Published)
+            || stored.payload.len() != frame.payload_len
+            || self.connection.next_wire_seq != frame.wire_seq
+        {
+            return Err(QueueError::OutboundFrameUnavailable {
+                fsn: frame.fsn,
+                wire_seq: frame.wire_seq,
+            }
+            .into());
+        }
+        let next_wire_seq = self
             .connection
             .next_wire_seq
             .checked_add(1)
             .ok_or(QueueError::SequenceOverflow)?;
-        self.connection.last_sent_wire_seq = Some(wire_seq);
 
-        let frame = &mut self.frames[offset];
-        frame.state = FrameState::Sent { wire_seq };
+        self.ensure_connection_started()?;
+        self.connection.next_wire_seq = next_wire_seq;
+        self.connection.last_sent_wire_seq = Some(frame.wire_seq);
+
+        let stored = &mut self.frames[offset];
+        stored.state = FrameState::Sent {
+            wire_seq: frame.wire_seq,
+        };
         self.in_flight.push(InFlightSlot {
-            fsn: frame.fsn,
-            wire_seq,
+            fsn: stored.fsn,
+            wire_seq: frame.wire_seq,
         })?;
-
-        Ok(SentFrame {
-            fsn: frame.fsn,
-            wire_seq,
-            payload_len: frame.payload.len(),
-        })
+        Ok(())
     }
 
     pub(crate) fn ack_wire(&mut self, wire_seq: u64) -> Result<(), SfQueueError> {

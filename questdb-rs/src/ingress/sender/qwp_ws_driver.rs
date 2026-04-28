@@ -24,25 +24,26 @@
 
 #![allow(dead_code)]
 
-//! Manual QWP/WebSocket driver prototype over a fake ordered server.
+//! Manual QWP/WebSocket driver prototype over an explicit transport seam.
 //!
-//! This module validates Step 6 control flow without real WebSocket I/O. The
-//! driver owns the queue and fake server; every progress method takes
+//! This module validates Step 6 control flow without hard-wiring real WebSocket
+//! I/O. The driver owns the queue and transport; every progress method takes
 //! `&mut self`, preserving the one-progress-owner rule from Step 2.
 
 use std::collections::VecDeque;
 
 use super::qwp_ws_queue::{
-    QueueError, QwpReceipt, QwpReceiptStatus, SentFrame, VolatileFrameQueue, VolatileQueueOptions,
+    OutboundFrame, QueueError, QwpReceipt, QwpReceiptStatus, SentFrame, VolatileFrameQueue,
+    VolatileQueueOptions,
 };
 use super::qwp_ws_sf_queue::{SfFrameQueue, SfQueueError};
 
 const DEFAULT_EVENT_CAPACITY: usize = 1024;
 
 #[derive(Debug)]
-pub(crate) struct ManualDriverPrototype<Q = VolatileFrameQueue> {
+pub(crate) struct ManualDriverPrototype<Q = VolatileFrameQueue, T = FakeOrderedServer> {
     queue: Q,
-    server: FakeOrderedServer,
+    transport: T,
     events: DriverEventRing,
     terminal: bool,
     terminal_fsn: Option<u64>,
@@ -57,7 +58,7 @@ impl ManualDriverPrototype<VolatileFrameQueue> {
     ) -> Result<Self, DriverError> {
         Ok(Self {
             queue: VolatileFrameQueue::new(options)?,
-            server,
+            transport: server,
             events: DriverEventRing::new(DEFAULT_EVENT_CAPACITY),
             terminal: false,
             terminal_fsn: None,
@@ -67,11 +68,11 @@ impl ManualDriverPrototype<VolatileFrameQueue> {
     }
 }
 
-impl<Q: ManualDriverQueue> ManualDriverPrototype<Q> {
-    pub(crate) fn from_queue(queue: Q, server: FakeOrderedServer) -> Self {
+impl<Q: ManualDriverQueue, T: ManualDriverTransport> ManualDriverPrototype<Q, T> {
+    pub(crate) fn from_queue(queue: Q, transport: T) -> Self {
         Self {
             queue,
-            server,
+            transport,
             events: DriverEventRing::new(DEFAULT_EVENT_CAPACITY),
             terminal: false,
             terminal_fsn: None,
@@ -82,12 +83,12 @@ impl<Q: ManualDriverQueue> ManualDriverPrototype<Q> {
 
     pub(crate) fn from_queue_with_retry_budget(
         queue: Q,
-        server: FakeOrderedServer,
+        transport: T,
         retry_budget: usize,
     ) -> Self {
         Self {
             queue,
-            server,
+            transport,
             events: DriverEventRing::new(DEFAULT_EVENT_CAPACITY),
             terminal: false,
             terminal_fsn: None,
@@ -98,12 +99,12 @@ impl<Q: ManualDriverQueue> ManualDriverPrototype<Q> {
 
     pub(crate) fn from_queue_with_event_capacity(
         queue: Q,
-        server: FakeOrderedServer,
+        transport: T,
         event_capacity: usize,
     ) -> Self {
         Self {
             queue,
-            server,
+            transport,
             events: DriverEventRing::new(event_capacity),
             terminal: false,
             terminal_fsn: None,
@@ -166,8 +167,10 @@ impl<Q: ManualDriverQueue> ManualDriverPrototype<Q> {
                         | QueueError::ProtocolRejectWithoutConnection
                         | QueueError::ProtocolRejectBeyondSent { .. }
                         | QueueError::ProtocolRejectedUnsentFrame { .. }
+                        | QueueError::OutboundFrameUnavailable { .. }
                         | QueueError::SequenceOverflow,
                     )
+                    | DriverError::Transport
                     | DriverError::Storage
                     | DriverError::CorruptLog { .. }
                     | DriverError::SubmitTimedOut
@@ -184,36 +187,29 @@ impl<Q: ManualDriverQueue> ManualDriverPrototype<Q> {
             return Ok(DriveOutcome::Terminal);
         }
 
-        if let Some(response) = self.server.poll_response() {
-            return self.apply_response(response);
+        match self.transport.poll_response() {
+            Ok(Some(response)) => return self.apply_response(response),
+            Ok(None) => {}
+            Err(failure) => return self.apply_transport_failure(failure),
         }
 
-        match self.queue.send_next() {
-            Ok(frame) => {
+        match self.queue.next_outbound_frame() {
+            Ok(outbound) => {
+                let frame = outbound.sent_frame();
+                let send_result = match self.transport.send_frame(outbound) {
+                    Ok(result) => result,
+                    Err(failure) => return self.apply_transport_failure(failure),
+                };
+                self.queue.commit_sent(frame)?;
                 self.push_event(DriverEvent::Sent {
                     fsn: frame.fsn,
                     wire_seq: frame.wire_seq,
                 });
-                match self.server.on_send(frame) {
-                    FakeSendResult::NoResponse => Ok(DriveOutcome::Sent(frame)),
-                    FakeSendResult::AckSent => self.apply_response(FakeServerResponse::Ack {
-                        wire_seq: frame.wire_seq,
-                    }),
-                    FakeSendResult::AckWire { wire_seq } => {
-                        self.apply_response(FakeServerResponse::Ack { wire_seq })
-                    }
-                    FakeSendResult::RejectWire { wire_seq } => {
-                        self.apply_response(FakeServerResponse::Reject { wire_seq })
-                    }
-                    FakeSendResult::Disconnect => {
-                        self.apply_response(FakeServerResponse::Disconnect)
-                    }
-                    FakeSendResult::RetryableFailure => {
-                        self.apply_response(FakeServerResponse::RetryableFailure)
-                    }
-                    FakeSendResult::TerminalFailure => {
-                        self.apply_response(FakeServerResponse::TerminalFailure)
-                    }
+
+                match send_result {
+                    TransportSendResult::NoResponse => Ok(DriveOutcome::Sent(frame)),
+                    TransportSendResult::Response(response) => self.apply_response(response),
+                    TransportSendResult::Failure(failure) => self.apply_transport_failure(failure),
                 }
             }
             Err(DriverError::Queue(
@@ -232,8 +228,10 @@ impl<Q: ManualDriverQueue> ManualDriverPrototype<Q> {
                     | QueueError::ProtocolRejectWithoutConnection
                     | QueueError::ProtocolRejectBeyondSent { .. }
                     | QueueError::ProtocolRejectedUnsentFrame { .. }
+                    | QueueError::OutboundFrameUnavailable { .. }
                     | QueueError::SequenceOverflow,
                 )
+                | DriverError::Transport
                 | DriverError::Storage
                 | DriverError::CorruptLog { .. }
                 | DriverError::SubmitTimedOut
@@ -300,7 +298,7 @@ impl<Q: ManualDriverQueue> ManualDriverPrototype<Q> {
     }
 
     pub(crate) fn sent_frames(&self) -> &[SentFrame] {
-        self.server.sent_frames()
+        self.transport.sent_frames()
     }
 
     pub(crate) fn poll_event(&mut self) -> Option<DriverEvent> {
@@ -331,12 +329,9 @@ impl<Q: ManualDriverQueue> ManualDriverPrototype<Q> {
         }
     }
 
-    fn apply_response(
-        &mut self,
-        response: FakeServerResponse,
-    ) -> Result<DriveOutcome, DriverError> {
+    fn apply_response(&mut self, response: TransportResponse) -> Result<DriveOutcome, DriverError> {
         match response {
-            FakeServerResponse::Ack { wire_seq } => {
+            TransportResponse::Ack { wire_seq } => {
                 let completed_before = self.queue.completed_fsn();
                 self.queue.ack_wire(wire_seq)?;
                 let completed_after = self.queue.completed_fsn();
@@ -346,7 +341,7 @@ impl<Q: ManualDriverQueue> ManualDriverPrototype<Q> {
                 }
                 Ok(DriveOutcome::Acked { wire_seq })
             }
-            FakeServerResponse::Reject { wire_seq } => {
+            TransportResponse::Reject { wire_seq } => {
                 let receipt = self.queue.reject_wire(wire_seq)?;
                 if wire_seq > 0 {
                     self.push_event(DriverEvent::AckedThrough {
@@ -363,8 +358,16 @@ impl<Q: ManualDriverQueue> ManualDriverPrototype<Q> {
                     wire_seq,
                 })
             }
-            FakeServerResponse::Disconnect => self.restart_connection(ReconnectReason::Disconnect),
-            FakeServerResponse::RetryableFailure => {
+        }
+    }
+
+    fn apply_transport_failure(
+        &mut self,
+        failure: TransportFailure,
+    ) -> Result<DriveOutcome, DriverError> {
+        match failure {
+            TransportFailure::Disconnect => self.restart_connection(ReconnectReason::Disconnect),
+            TransportFailure::Retryable => {
                 if let Some(remaining) = &mut self.retry_budget_remaining {
                     if *remaining == 0 {
                         self.mark_terminal();
@@ -374,7 +377,7 @@ impl<Q: ManualDriverQueue> ManualDriverPrototype<Q> {
                 }
                 self.restart_for_retryable_failure()
             }
-            FakeServerResponse::TerminalFailure => {
+            TransportFailure::Terminal => {
                 self.mark_terminal();
                 Ok(DriveOutcome::Terminal)
             }
@@ -386,6 +389,7 @@ impl<Q: ManualDriverQueue> ManualDriverPrototype<Q> {
     }
 
     fn restart_connection(&mut self, reason: ReconnectReason) -> Result<DriveOutcome, DriverError> {
+        self.transport.restart_connection(reason)?;
         self.queue.restart_connection();
         self.push_event(DriverEvent::Reconnected { reason });
         Ok(DriveOutcome::Reconnected { reason })
@@ -406,7 +410,8 @@ impl<Q: ManualDriverQueue> ManualDriverPrototype<Q> {
 
 pub(crate) trait ManualDriverQueue {
     fn try_submit(&mut self, payload: &[u8]) -> Result<QwpReceipt, DriverError>;
-    fn send_next(&mut self) -> Result<SentFrame, DriverError>;
+    fn next_outbound_frame(&self) -> Result<OutboundFrame<'_>, DriverError>;
+    fn commit_sent(&mut self, frame: SentFrame) -> Result<(), DriverError>;
     fn ack_wire(&mut self, wire_seq: u64) -> Result<(), DriverError>;
     fn reject_wire(&mut self, wire_seq: u64) -> Result<QwpReceipt, DriverError>;
     fn restart_connection(&mut self);
@@ -416,13 +421,33 @@ pub(crate) trait ManualDriverQueue {
     fn fsn_for_wire_seq(&self, wire_seq: u64) -> Result<u64, DriverError>;
 }
 
+pub(crate) trait ManualDriverTransport {
+    fn poll_response(&mut self) -> Result<Option<TransportResponse>, TransportFailure>;
+    fn send_frame(
+        &mut self,
+        frame: OutboundFrame<'_>,
+    ) -> Result<TransportSendResult, TransportFailure>;
+
+    fn restart_connection(&mut self, _reason: ReconnectReason) -> Result<(), DriverError> {
+        Ok(())
+    }
+
+    fn sent_frames(&self) -> &[SentFrame] {
+        &[]
+    }
+}
+
 impl ManualDriverQueue for VolatileFrameQueue {
     fn try_submit(&mut self, payload: &[u8]) -> Result<QwpReceipt, DriverError> {
         Ok(VolatileFrameQueue::try_submit(self, payload)?)
     }
 
-    fn send_next(&mut self) -> Result<SentFrame, DriverError> {
-        Ok(VolatileFrameQueue::send_next(self)?)
+    fn next_outbound_frame(&self) -> Result<OutboundFrame<'_>, DriverError> {
+        Ok(VolatileFrameQueue::next_outbound_frame(self)?)
+    }
+
+    fn commit_sent(&mut self, frame: SentFrame) -> Result<(), DriverError> {
+        Ok(VolatileFrameQueue::commit_sent(self, frame)?)
     }
 
     fn ack_wire(&mut self, wire_seq: u64) -> Result<(), DriverError> {
@@ -463,8 +488,12 @@ impl ManualDriverQueue for SfFrameQueue {
         Ok(SfFrameQueue::try_submit(self, payload)?)
     }
 
-    fn send_next(&mut self) -> Result<SentFrame, DriverError> {
-        Ok(SfFrameQueue::send_next(self)?)
+    fn next_outbound_frame(&self) -> Result<OutboundFrame<'_>, DriverError> {
+        Ok(SfFrameQueue::next_outbound_frame(self)?)
+    }
+
+    fn commit_sent(&mut self, frame: SentFrame) -> Result<(), DriverError> {
+        Ok(SfFrameQueue::commit_sent(self, frame)?)
     }
 
     fn ack_wire(&mut self, wire_seq: u64) -> Result<(), DriverError> {
@@ -503,6 +532,7 @@ impl ManualDriverQueue for SfFrameQueue {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DriverError {
     Queue(QueueError),
+    Transport,
     Storage,
     CorruptLog { offset: usize, reason: &'static str },
     SubmitTimedOut,
@@ -568,6 +598,28 @@ pub(crate) enum CloseOutcome {
     Terminal,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransportSendResult {
+    NoResponse,
+    Response(TransportResponse),
+    Failure(TransportFailure),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransportFailure {
+    Disconnect,
+    Retryable,
+    Terminal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransportResponse {
+    Ack { wire_seq: u64 },
+    Reject { wire_seq: u64 },
+}
+
+pub(crate) type FakeServerResponse = TransportResponse;
+
 #[derive(Debug)]
 struct DriverEventRing {
     events: VecDeque<DriverEvent>,
@@ -608,7 +660,7 @@ impl DriverEventRing {
 #[derive(Debug)]
 pub(crate) struct FakeOrderedServer {
     send_results: VecDeque<FakeSendResult>,
-    poll_responses: VecDeque<FakeServerResponse>,
+    poll_responses: VecDeque<TransportResponse>,
     default_send_result: FakeSendResult,
     sent_frames: Vec<SentFrame>,
 }
@@ -628,7 +680,7 @@ impl FakeOrderedServer {
         server
     }
 
-    pub(crate) fn push_response(&mut self, response: FakeServerResponse) {
+    pub(crate) fn push_response(&mut self, response: TransportResponse) {
         self.poll_responses.push_back(response);
     }
 
@@ -644,16 +696,49 @@ impl FakeOrderedServer {
             sent_frames: Vec::new(),
         }
     }
+}
 
-    fn poll_response(&mut self) -> Option<FakeServerResponse> {
-        self.poll_responses.pop_front()
+impl ManualDriverTransport for FakeOrderedServer {
+    fn poll_response(&mut self) -> Result<Option<TransportResponse>, TransportFailure> {
+        Ok(self.poll_responses.pop_front())
     }
 
-    fn on_send(&mut self, frame: SentFrame) -> FakeSendResult {
+    fn send_frame(
+        &mut self,
+        frame: OutboundFrame<'_>,
+    ) -> Result<TransportSendResult, TransportFailure> {
+        let frame = frame.sent_frame();
+        let wire_seq = frame.wire_seq;
         self.sent_frames.push(frame);
-        self.send_results
+        let result = self
+            .send_results
             .pop_front()
-            .unwrap_or(self.default_send_result)
+            .unwrap_or(self.default_send_result);
+        Ok(match result {
+            FakeSendResult::NoResponse => TransportSendResult::NoResponse,
+            FakeSendResult::AckSent => {
+                TransportSendResult::Response(TransportResponse::Ack { wire_seq })
+            }
+            FakeSendResult::AckWire { wire_seq } => {
+                TransportSendResult::Response(TransportResponse::Ack { wire_seq })
+            }
+            FakeSendResult::RejectWire { wire_seq } => {
+                TransportSendResult::Response(TransportResponse::Reject { wire_seq })
+            }
+            FakeSendResult::Disconnect => {
+                TransportSendResult::Failure(TransportFailure::Disconnect)
+            }
+            FakeSendResult::RetryableFailure => {
+                TransportSendResult::Failure(TransportFailure::Retryable)
+            }
+            FakeSendResult::TerminalFailure => {
+                TransportSendResult::Failure(TransportFailure::Terminal)
+            }
+        })
+    }
+
+    fn sent_frames(&self) -> &[SentFrame] {
+        &self.sent_frames
     }
 }
 
@@ -668,19 +753,11 @@ pub(crate) enum FakeSendResult {
     TerminalFailure,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FakeServerResponse {
-    Ack { wire_seq: u64 },
-    Reject { wire_seq: u64 },
-    Disconnect,
-    RetryableFailure,
-    TerminalFailure,
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::qwp_ws_sf_queue::SfQueueOptions;
     use super::*;
+    use std::collections::VecDeque;
     use tempfile::TempDir;
 
     fn options(max_frames: usize, max_bytes: usize, max_in_flight: usize) -> VolatileQueueOptions {
@@ -717,12 +794,75 @@ mod tests {
         )
     }
 
-    fn drain_events(driver: &mut ManualDriverPrototype) -> Vec<DriverEvent> {
+    fn drain_events<Q: ManualDriverQueue, T: ManualDriverTransport>(
+        driver: &mut ManualDriverPrototype<Q, T>,
+    ) -> Vec<DriverEvent> {
         let mut events = Vec::new();
         while let Some(event) = driver.poll_event() {
             events.push(event);
         }
         events
+    }
+
+    #[derive(Debug)]
+    struct TestTransport {
+        send_results: VecDeque<Result<TransportSendResult, TransportFailure>>,
+        poll_results: VecDeque<Result<Option<TransportResponse>, TransportFailure>>,
+        restart_result: Result<(), DriverError>,
+        sent_frames: Vec<SentFrame>,
+        sent_payloads: Vec<Vec<u8>>,
+    }
+
+    impl TestTransport {
+        fn scripted(
+            send_results: impl IntoIterator<Item = Result<TransportSendResult, TransportFailure>>,
+        ) -> Self {
+            Self {
+                send_results: send_results.into_iter().collect(),
+                poll_results: VecDeque::new(),
+                restart_result: Ok(()),
+                sent_frames: Vec::new(),
+                sent_payloads: Vec::new(),
+            }
+        }
+
+        fn with_restart_result(mut self, restart_result: Result<(), DriverError>) -> Self {
+            self.restart_result = restart_result;
+            self
+        }
+
+        fn with_poll_results(
+            mut self,
+            poll_results: impl IntoIterator<Item = Result<Option<TransportResponse>, TransportFailure>>,
+        ) -> Self {
+            self.poll_results = poll_results.into_iter().collect();
+            self
+        }
+    }
+
+    impl ManualDriverTransport for TestTransport {
+        fn poll_response(&mut self) -> Result<Option<TransportResponse>, TransportFailure> {
+            self.poll_results.pop_front().unwrap_or(Ok(None))
+        }
+
+        fn send_frame(
+            &mut self,
+            frame: OutboundFrame<'_>,
+        ) -> Result<TransportSendResult, TransportFailure> {
+            self.sent_frames.push(frame.sent_frame());
+            self.sent_payloads.push(frame.payload.to_vec());
+            self.send_results
+                .pop_front()
+                .unwrap_or(Ok(TransportSendResult::NoResponse))
+        }
+
+        fn restart_connection(&mut self, _reason: ReconnectReason) -> Result<(), DriverError> {
+            self.restart_result
+        }
+
+        fn sent_frames(&self) -> &[SentFrame] {
+            &self.sent_frames
+        }
     }
 
     fn sf_options(dir: &TempDir) -> SfQueueOptions {
@@ -897,6 +1037,113 @@ mod tests {
     }
 
     #[test]
+    fn transport_reconnect_failure_keeps_sent_receipt_observable() {
+        let transport = TestTransport::scripted([Ok(TransportSendResult::Failure(
+            TransportFailure::Disconnect,
+        ))])
+        .with_restart_result(Err(DriverError::Transport));
+        let mut driver = ManualDriverPrototype::from_queue(
+            VolatileFrameQueue::new(options(8, 1024, 4)).unwrap(),
+            transport,
+        );
+        let receipt = driver.try_submit(b"payload").unwrap();
+
+        assert_eq!(driver.drive_once(), Err(DriverError::Transport));
+        assert_eq!(driver.transport.sent_payloads, vec![b"payload".to_vec()]);
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Sent {
+                fsn: 0,
+                wire_seq: 0,
+            }
+        );
+        assert_eq!(
+            drain_events(&mut driver),
+            vec![
+                DriverEvent::Published { fsn: 0 },
+                DriverEvent::Sent {
+                    fsn: 0,
+                    wire_seq: 0,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn transport_write_failure_does_not_commit_sent_receipt() {
+        let transport = TestTransport::scripted([Err(TransportFailure::Disconnect)]);
+        let mut driver = ManualDriverPrototype::from_queue(
+            VolatileFrameQueue::new(options(8, 1024, 4)).unwrap(),
+            transport,
+        );
+        let receipt = driver.try_submit(b"payload").unwrap();
+
+        assert_eq!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::Disconnect,
+            }
+        );
+        assert_eq!(driver.transport.sent_payloads, vec![b"payload".to_vec()]);
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Published { fsn: 0 }
+        );
+        assert_eq!(
+            drain_events(&mut driver),
+            vec![
+                DriverEvent::Published { fsn: 0 },
+                DriverEvent::Reconnected {
+                    reason: ReconnectReason::Disconnect,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn transport_poll_failure_enters_reconnect_policy() {
+        let transport = TestTransport::scripted([Ok(TransportSendResult::NoResponse)])
+            .with_poll_results([Ok(None), Err(TransportFailure::Disconnect)]);
+        let mut driver = ManualDriverPrototype::from_queue(
+            VolatileFrameQueue::new(options(8, 1024, 4)).unwrap(),
+            transport,
+        );
+        let receipt = driver.try_submit(b"payload").unwrap();
+
+        assert_eq!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::Sent(SentFrame {
+                fsn: 0,
+                wire_seq: 0,
+                payload_len: 7,
+            })
+        );
+        assert_eq!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::Disconnect,
+            }
+        );
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Published { fsn: 0 }
+        );
+        assert_eq!(
+            drain_events(&mut driver),
+            vec![
+                DriverEvent::Published { fsn: 0 },
+                DriverEvent::Sent {
+                    fsn: 0,
+                    wire_seq: 0,
+                },
+                DriverEvent::Reconnected {
+                    reason: ReconnectReason::Disconnect,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn wait_drives_until_receipt_acked() {
         let mut driver = driver(FakeOrderedServer::ack_each_send());
         let receipt = driver.try_submit(b"payload").unwrap();
@@ -997,7 +1244,7 @@ mod tests {
             DriveOutcome::Acked { wire_seq: 1 }
         );
         driver
-            .server
+            .transport
             .push_response(FakeServerResponse::Ack { wire_seq: 0 });
         assert_eq!(
             driver.drive_once().unwrap(),

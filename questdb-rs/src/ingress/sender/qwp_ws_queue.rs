@@ -69,6 +69,23 @@ pub(crate) struct SentFrame {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OutboundFrame<'a> {
+    pub(crate) fsn: u64,
+    pub(crate) wire_seq: u64,
+    pub(crate) payload: &'a [u8],
+}
+
+impl OutboundFrame<'_> {
+    pub(crate) fn sent_frame(&self) -> SentFrame {
+        SentFrame {
+            fsn: self.fsn,
+            wire_seq: self.wire_seq,
+            payload_len: self.payload.len(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum QueueError {
     InvalidCapacity,
     EmptyPayload,
@@ -103,6 +120,10 @@ pub(crate) enum QueueError {
     },
     ProtocolRejectedUnsentFrame {
         fsn: u64,
+    },
+    OutboundFrameUnavailable {
+        fsn: u64,
+        wire_seq: u64,
     },
     SequenceOverflow,
 }
@@ -203,6 +224,15 @@ impl VolatileFrameQueue {
     }
 
     pub(crate) fn send_next(&mut self) -> Result<SentFrame, QueueError> {
+        let frame = {
+            let outbound = self.next_outbound_frame()?;
+            outbound.sent_frame()
+        };
+        self.commit_sent(frame)?;
+        Ok(frame)
+    }
+
+    pub(crate) fn next_outbound_frame(&self) -> Result<OutboundFrame<'_>, QueueError> {
         if self.in_flight.is_full() {
             return Err(QueueError::MaxInFlightReached {
                 max_in_flight: self.in_flight.capacity(),
@@ -212,29 +242,62 @@ impl VolatileFrameQueue {
         let Some(offset) = self.first_published_offset() else {
             return Err(QueueError::NoUnsentFrame);
         };
-        self.ensure_connection_started()?;
 
         let wire_seq = self.connection.next_wire_seq;
-        self.connection.next_wire_seq = self
+        wire_seq
+            .checked_add(1)
+            .ok_or(QueueError::SequenceOverflow)?;
+
+        let index = self.slot_index(offset);
+        let slot = &self.slots[index];
+        Ok(OutboundFrame {
+            fsn: slot.fsn,
+            wire_seq,
+            payload: &slot.payload,
+        })
+    }
+
+    pub(crate) fn commit_sent(&mut self, frame: SentFrame) -> Result<(), QueueError> {
+        if self.in_flight.is_full() {
+            return Err(QueueError::MaxInFlightReached {
+                max_in_flight: self.in_flight.capacity(),
+            });
+        }
+
+        let Some(offset) = self.first_published_offset() else {
+            return Err(QueueError::NoUnsentFrame);
+        };
+        let index = self.slot_index(offset);
+        let slot = &self.slots[index];
+        if slot.fsn != frame.fsn
+            || !matches!(slot.state, FrameState::Published)
+            || slot.payload.len() != frame.payload_len
+            || self.connection.next_wire_seq != frame.wire_seq
+        {
+            return Err(QueueError::OutboundFrameUnavailable {
+                fsn: frame.fsn,
+                wire_seq: frame.wire_seq,
+            });
+        }
+        let next_wire_seq = self
             .connection
             .next_wire_seq
             .checked_add(1)
             .ok_or(QueueError::SequenceOverflow)?;
-        self.connection.last_sent_wire_seq = Some(wire_seq);
 
-        let index = self.slot_index(offset);
+        self.ensure_connection_started()?;
+        self.connection.next_wire_seq = next_wire_seq;
+        self.connection.last_sent_wire_seq = Some(frame.wire_seq);
+
         let slot = &mut self.slots[index];
-        slot.state = FrameState::Sent { wire_seq };
+        slot.state = FrameState::Sent {
+            wire_seq: frame.wire_seq,
+        };
         self.in_flight.push(InFlightSlot {
             fsn: slot.fsn,
-            wire_seq,
+            wire_seq: frame.wire_seq,
         })?;
-
-        Ok(SentFrame {
-            fsn: slot.fsn,
-            wire_seq,
-            payload_len: slot.payload.len(),
-        })
+        Ok(())
     }
 
     pub(crate) fn ack_wire(&mut self, wire_seq: u64) -> Result<(), QueueError> {
