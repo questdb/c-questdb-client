@@ -355,6 +355,25 @@ ACKed, poisoned/quarantined, or terminal. `completed_fsn` advances through
 contiguous resolved frames. `server_acked_fsn` advances only through contiguous
 ACKed frames and can therefore lag behind `completed_fsn` across poison gaps.
 
+Durable state is deliberately smaller than runtime state. The queue stores:
+
+- publication records: FSN plus self-sufficient QWP payload bytes,
+- ACK-through completion records,
+- poison/quarantine completion records.
+
+The queue does not store connection-local state:
+
+- `Sent` receipt status,
+- WebSocket wire sequence,
+- in-flight table contents,
+- WebSocket mask keys,
+- WebSocket headers or masked payload bytes.
+
+After process recovery, every unresolved frame is `Published`, not `Sent`.
+The next connection rebuilds its in-flight table from scratch, maps the oldest
+unresolved FSN to wire sequence `0`, and replays from there. This is the same
+model as reconnect replay; process restart only discards more volatile state.
+
 ### Volatile queue mode
 
 Volatile queue mode uses a preallocated in-memory ring of frame slots.
@@ -400,7 +419,18 @@ Publication must be crash-recoverable:
 3. Write checksum.
 4. Publish the record with one ordered cursor or commit marker update.
 
-Recovery ignores partial or checksum-invalid tail records.
+Completion records are append-only logical state. ACK-through records may be
+replayed idempotently if they reference frames that are already completed.
+Poison/quarantine records are not idempotent: duplicate poison markers, poison
+for unpublished frames, and poison for already completed frames indicate a
+corrupt journal.
+
+Recovery ignores partial or checksum-invalid tail records. Before appending new
+records, the implementation must truncate any ignored tail so later records
+cannot accidentally extend bytes that were previously treated as uncommitted.
+Non-tail corruption is not a delivery outcome; it is a storage error that should
+prevent opening the sender until the slot is repaired or recovered by operator
+policy.
 
 Queue mode and durability are separate concepts:
 
@@ -434,6 +464,11 @@ wire_seq = 0
 replay starts at first unresolved FSN
 connection-scoped encoder state is reset
 ```
+
+The same reset happens after process recovery from file-backed SF state. Durable
+FSN remains stable, but wire sequence is always per connection. Therefore an
+ACK for `wire_seq = 0` on a recovered connection maps to the oldest unresolved
+FSN, not necessarily FSN `0`.
 
 The server processes submitted WebSocket frames strictly in wire-sequence order. Responses do not complete arbitrary later frames ahead of earlier frames.
 

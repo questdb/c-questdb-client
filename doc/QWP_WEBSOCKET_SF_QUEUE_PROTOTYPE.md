@@ -120,6 +120,6 @@ Result:
 - Should the next step proceed, or should the design be adjusted first?
 
   Proceed to Step 9, but the next implementation slice should probably factor a
-  small queue trait or driver seam before adding more policy tests. Duplicating
-  fake-driver logic for volatile and SF modes is acceptable for this spike, but
-  it should not become the production structure.
+  small queue trait or driver seam before integrating the file-backed queue with
+  the manual driver. The Step 8 tests intentionally stayed at the queue and
+  filesystem-behaviour level instead of adding another fake transport layer.
