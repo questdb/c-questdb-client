@@ -608,7 +608,7 @@ Current QWP response statuses include:
 | `SCHEMA_MISMATCH` | Bad schema/data for table | Poison candidate |
 | `SECURITY_ERROR` | Auth/authorization | Terminal |
 | `INTERNAL_ERROR` | Server internal error | Retryable until budget exhausts |
-| `WRITE_ERROR` | Server write failure | Retryable until budget exhausts |
+| `WRITE_ERROR` | Server write failure, for example not accepting writes | Retryable candidate until budget exhausts |
 | unknown | Unknown | Terminal |
 
 The preferred wire contract is stronger:
@@ -620,7 +620,15 @@ message
 disposition = RETRYABLE | POISON | TERMINAL
 ```
 
-Without `disposition`, clients are guessing. The fallback above is conservative: ambiguous server errors stall and eventually become terminal, but they are not silently quarantined as bad data.
+Without `disposition`, clients are still applying policy rather than receiving a
+server guarantee. The fallback above is conservative: ambiguous retryable
+candidates are bounded by retry budget, and they are never silently dropped.
+
+A real-server probe after the server taxonomy fix showed that a deterministic
+string-to-DOUBLE failure is reported as `SCHEMA_MISMATCH`, not `WRITE_ERROR`,
+while still being sequence-specific: the bad frame is reported with its sequence
+and a later valid frame can still be ACKed. This keeps bad-data handling in the
+poison path and narrows `WRITE_ERROR` back toward operational write failures.
 
 ## Poison policy
 

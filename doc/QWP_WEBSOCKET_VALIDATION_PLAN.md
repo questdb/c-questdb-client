@@ -34,8 +34,11 @@ As of 2026-04-28:
   `doc/QWP_WEBSOCKET_SF_QUEUE_PROTOTYPE.md`.
 - Step 9 has driver/SF seam coverage for poison, terminal, close-drain,
   retry-budget behaviour, and event polling agreement in
-  `doc/QWP_WEBSOCKET_ERROR_POLICY_PROTOTYPE.md`; real-server taxonomy
-  validation remains open.
+  `doc/QWP_WEBSOCKET_ERROR_POLICY_PROTOTYPE.md`.
+- Step 10 has a first real-server error taxonomy probe for parse error,
+  schema mismatch, and deterministic value/type coercion in
+  `doc/QWP_WEBSOCKET_ERROR_TAXONOMY_PROBE.md`; auth/upgrade rejection and
+  deterministic internal/retryable write failure remain deferred.
 - Extended Java/Rust fixtures for arrays, decimals, UTF-8 strings, sparse
   columns, and schema evolution remain recommended before hardening the full
   product surface.
