@@ -28,7 +28,9 @@ use libc::{c_char, size_t};
 use questdb::ingress::DecimalView;
 use std::ascii;
 use std::boxed::Box;
+use std::collections::VecDeque;
 use std::convert::{From, Into};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::ptr;
 use std::slice;
@@ -1945,11 +1947,455 @@ pub unsafe extern "C" fn line_sender_opts_free(opts: *mut line_sender_opts) {
 /// one of its variants with this object to send them.
 pub struct line_sender(Sender);
 
-/// Type-only QWP/WebSocket sender ownership prototype.
-pub struct line_sender_qwpws(Option<QwpWsSender>);
+/// Shape-only QWP/WebSocket sender prototype.
+pub struct line_sender_qwpws {
+    sender: Option<QwpWsSender>,
+    state: QwpWsFfiShapeState,
+}
 
-/// Type-only QWP/WebSocket threaded ownership prototype.
+/// Shape-only QWP/WebSocket threaded ownership prototype.
 pub struct line_sender_qwpws_threaded(QwpWsThreadedSender);
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct line_sender_qwpws_receipt {
+    fsn: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum line_sender_qwpws_event_kind {
+    LINE_SENDER_QWPWS_EVENT_NONE = 0,
+    LINE_SENDER_QWPWS_EVENT_PUBLISHED,
+    LINE_SENDER_QWPWS_EVENT_SENT,
+    LINE_SENDER_QWPWS_EVENT_ACKED,
+    LINE_SENDER_QWPWS_EVENT_DURABLE_ACK,
+    LINE_SENDER_QWPWS_EVENT_RETRYING,
+    LINE_SENDER_QWPWS_EVENT_RECONNECTED,
+    LINE_SENDER_QWPWS_EVENT_POISONED,
+    LINE_SENDER_QWPWS_EVENT_BACKPRESSURE,
+    LINE_SENDER_QWPWS_EVENT_TERMINAL,
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct line_sender_qwpws_event {
+    kind: line_sender_qwpws_event_kind,
+    fsn: u64,
+    wire_sequence: u64,
+    qwp_status: u8,
+    message_truncated: bool,
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum line_sender_qwpws_drive_kind {
+    LINE_SENDER_QWPWS_DRIVE_IDLE = 0,
+    LINE_SENDER_QWPWS_DRIVE_PROGRESS,
+    LINE_SENDER_QWPWS_DRIVE_TERMINAL,
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct line_sender_qwpws_drive_outcome {
+    kind: line_sender_qwpws_drive_kind,
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum line_sender_qwpws_receipt_status_kind {
+    LINE_SENDER_QWPWS_RECEIPT_INVALID = 0,
+    LINE_SENDER_QWPWS_RECEIPT_PENDING,
+    LINE_SENDER_QWPWS_RECEIPT_ACKED,
+    LINE_SENDER_QWPWS_RECEIPT_POISONED,
+    LINE_SENDER_QWPWS_RECEIPT_TERMINAL,
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct line_sender_qwpws_receipt_status {
+    kind: line_sender_qwpws_receipt_status_kind,
+    fsn: u64,
+    qwp_status: u8,
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum line_sender_qwpws_delivery_kind {
+    LINE_SENDER_QWPWS_DELIVERY_ACKED = 0,
+    LINE_SENDER_QWPWS_DELIVERY_POISONED,
+    LINE_SENDER_QWPWS_DELIVERY_TIMEOUT,
+    LINE_SENDER_QWPWS_DELIVERY_TERMINAL,
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct line_sender_qwpws_delivery {
+    kind: line_sender_qwpws_delivery_kind,
+    fsn: u64,
+    qwp_status: u8,
+    message_truncated: bool,
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum line_sender_qwpws_close_kind {
+    LINE_SENDER_QWPWS_CLOSE_DRAINED = 0,
+    LINE_SENDER_QWPWS_CLOSE_TIMEOUT,
+    LINE_SENDER_QWPWS_CLOSE_TERMINAL,
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct line_sender_qwpws_close_outcome {
+    kind: line_sender_qwpws_close_kind,
+    has_published_fsn: bool,
+    published_fsn: u64,
+    has_server_acked_fsn: bool,
+    server_acked_fsn: u64,
+    has_completed_fsn: bool,
+    completed_fsn: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QwpWsFfiReceiptState {
+    Pending,
+    Acked,
+}
+
+#[derive(Debug, Clone)]
+struct QwpWsFfiEventRecord {
+    kind: line_sender_qwpws_event_kind,
+    fsn: u64,
+    wire_sequence: u64,
+    qwp_status: u8,
+    message: String,
+}
+
+#[derive(Debug, Default)]
+struct QwpWsFfiShapeState {
+    next_fsn: u64,
+    receipts: Vec<QwpWsFfiReceiptState>,
+    events: VecDeque<QwpWsFfiEventRecord>,
+    published_fsn: Option<u64>,
+    server_acked_fsn: Option<u64>,
+    completed_fsn: Option<u64>,
+    terminal: bool,
+}
+
+impl QwpWsFfiShapeState {
+    fn publish(&mut self) -> Result<line_sender_qwpws_receipt, Error> {
+        if self.terminal {
+            return Err(Error::new(
+                ErrorCode::InvalidApiCall,
+                "QWP/WS sender is closed",
+            ));
+        }
+        let fsn = self.next_fsn;
+        self.next_fsn = self.next_fsn.checked_add(1).ok_or_else(|| {
+            Error::new(
+                ErrorCode::InvalidApiCall,
+                "QWP/WS receipt sequence overflow",
+            )
+        })?;
+        self.receipts.push(QwpWsFfiReceiptState::Pending);
+        self.published_fsn = Some(fsn);
+        self.events.push_back(QwpWsFfiEventRecord {
+            kind: line_sender_qwpws_event_kind::LINE_SENDER_QWPWS_EVENT_PUBLISHED,
+            fsn,
+            wire_sequence: 0,
+            qwp_status: 0,
+            message: String::new(),
+        });
+        Ok(line_sender_qwpws_receipt { fsn })
+    }
+
+    fn receipt_status(
+        &self,
+        receipt: line_sender_qwpws_receipt,
+    ) -> line_sender_qwpws_receipt_status {
+        let Some(index) = usize::try_from(receipt.fsn).ok() else {
+            return line_sender_qwpws_receipt_status {
+                kind: line_sender_qwpws_receipt_status_kind::LINE_SENDER_QWPWS_RECEIPT_INVALID,
+                fsn: receipt.fsn,
+                qwp_status: 0,
+            };
+        };
+        let Some(state) = self.receipts.get(index) else {
+            return line_sender_qwpws_receipt_status {
+                kind: line_sender_qwpws_receipt_status_kind::LINE_SENDER_QWPWS_RECEIPT_INVALID,
+                fsn: receipt.fsn,
+                qwp_status: 0,
+            };
+        };
+
+        line_sender_qwpws_receipt_status {
+            kind: match state {
+                QwpWsFfiReceiptState::Pending if self.terminal => {
+                    line_sender_qwpws_receipt_status_kind::LINE_SENDER_QWPWS_RECEIPT_TERMINAL
+                }
+                QwpWsFfiReceiptState::Pending => {
+                    line_sender_qwpws_receipt_status_kind::LINE_SENDER_QWPWS_RECEIPT_PENDING
+                }
+                QwpWsFfiReceiptState::Acked => {
+                    line_sender_qwpws_receipt_status_kind::LINE_SENDER_QWPWS_RECEIPT_ACKED
+                }
+            },
+            fsn: receipt.fsn,
+            qwp_status: 0,
+        }
+    }
+
+    fn ack_first_pending(&mut self) -> Option<u64> {
+        let fsn = self
+            .receipts
+            .iter()
+            .position(|state| *state == QwpWsFfiReceiptState::Pending)? as u64;
+        self.mark_acked(fsn);
+        Some(fsn)
+    }
+
+    fn ack_through(&mut self, fsn: u64) {
+        let Some(fsn) = usize::try_from(fsn).ok() else {
+            return;
+        };
+        let last = usize::min(fsn, self.receipts.len().saturating_sub(1));
+        for index in 0..=last {
+            if self.receipts[index] == QwpWsFfiReceiptState::Pending {
+                self.mark_acked(index as u64);
+            }
+        }
+    }
+
+    fn mark_acked(&mut self, fsn: u64) {
+        let Some(index) = usize::try_from(fsn).ok() else {
+            return;
+        };
+        if let Some(state) = self.receipts.get_mut(index) {
+            *state = QwpWsFfiReceiptState::Acked;
+            self.server_acked_fsn = Some(fsn);
+            self.completed_fsn = Some(fsn);
+            self.events.push_back(QwpWsFfiEventRecord {
+                kind: line_sender_qwpws_event_kind::LINE_SENDER_QWPWS_EVENT_ACKED,
+                fsn,
+                wire_sequence: fsn,
+                qwp_status: 0,
+                message: String::new(),
+            });
+        }
+    }
+
+    fn has_pending(&self) -> bool {
+        self.receipts
+            .iter()
+            .any(|state| *state == QwpWsFfiReceiptState::Pending)
+    }
+
+    fn close_outcome(&self, kind: line_sender_qwpws_close_kind) -> line_sender_qwpws_close_outcome {
+        line_sender_qwpws_close_outcome {
+            kind,
+            has_published_fsn: self.published_fsn.is_some(),
+            published_fsn: self.published_fsn.unwrap_or(0),
+            has_server_acked_fsn: self.server_acked_fsn.is_some(),
+            server_acked_fsn: self.server_acked_fsn.unwrap_or(0),
+            has_completed_fsn: self.completed_fsn.is_some(),
+            completed_fsn: self.completed_fsn.unwrap_or(0),
+        }
+    }
+}
+
+fn qwpws_catch_bool<F>(err_out: *mut *mut line_sender_error, f: F) -> bool
+where
+    F: FnOnce() -> bool,
+{
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(value) => value,
+        Err(_) => {
+            unsafe {
+                set_err_out(
+                    err_out,
+                    ErrorCode::InvalidApiCall,
+                    "QWP/WS FFI call panicked".to_string(),
+                );
+            }
+            false
+        }
+    }
+}
+
+fn qwpws_catch_ptr<T, F>(err_out: *mut *mut line_sender_error, f: F) -> *mut T
+where
+    F: FnOnce() -> *mut T,
+{
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(value) => value,
+        Err(_) => {
+            unsafe {
+                set_err_out(
+                    err_out,
+                    ErrorCode::InvalidApiCall,
+                    "QWP/WS FFI call panicked".to_string(),
+                );
+            }
+            ptr::null_mut()
+        }
+    }
+}
+
+unsafe fn qwpws_sender_ref<'a>(
+    sender: *const line_sender_qwpws,
+    err_out: *mut *mut line_sender_error,
+    function: &str,
+) -> Option<&'a line_sender_qwpws> {
+    if sender.is_null() {
+        unsafe {
+            set_err_out(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                format!("{function} requires a non-NULL sender"),
+            );
+        }
+        return None;
+    }
+    let sender_ref = unsafe { &*sender };
+    if sender_ref.sender.is_none() {
+        unsafe {
+            set_err_out(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                format!("{function} requires an unconsumed sender"),
+            );
+        }
+        return None;
+    }
+    Some(sender_ref)
+}
+
+unsafe fn qwpws_sender_mut<'a>(
+    sender: *mut line_sender_qwpws,
+    err_out: *mut *mut line_sender_error,
+    function: &str,
+) -> Option<&'a mut line_sender_qwpws> {
+    if sender.is_null() {
+        unsafe {
+            set_err_out(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                format!("{function} requires a non-NULL sender"),
+            );
+        }
+        return None;
+    }
+    let sender_ref = unsafe { &mut *sender };
+    if sender_ref.sender.is_none() {
+        unsafe {
+            set_err_out(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                format!("{function} requires an unconsumed sender"),
+            );
+        }
+        return None;
+    }
+    Some(sender_ref)
+}
+
+unsafe fn qwpws_buffer_ref<'a>(
+    buffer: *const line_sender_buffer,
+    err_out: *mut *mut line_sender_error,
+    function: &str,
+) -> Option<&'a line_sender_buffer> {
+    if buffer.is_null() {
+        unsafe {
+            set_err_out(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                format!("{function} requires a non-NULL buffer"),
+            );
+        }
+        return None;
+    }
+    let buffer_ref = unsafe { &*buffer };
+    if !buffer_ref.empty_peek_buf_is_null {
+        unsafe {
+            set_err_out(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                format!("{function} requires a QWP buffer"),
+            );
+        }
+        return None;
+    }
+    Some(buffer_ref)
+}
+
+unsafe fn qwpws_buffer_mut<'a>(
+    buffer: *mut line_sender_buffer,
+    err_out: *mut *mut line_sender_error,
+    function: &str,
+) -> Option<&'a mut line_sender_buffer> {
+    if buffer.is_null() {
+        unsafe {
+            set_err_out(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                format!("{function} requires a non-NULL buffer"),
+            );
+        }
+        return None;
+    }
+    let buffer_ref = unsafe { &mut *buffer };
+    if !buffer_ref.empty_peek_buf_is_null {
+        unsafe {
+            set_err_out(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                format!("{function} requires a QWP buffer"),
+            );
+        }
+        return None;
+    }
+    Some(buffer_ref)
+}
+
+unsafe fn qwpws_validate_message_buffer(
+    message_buf: *mut c_char,
+    message_buf_len: size_t,
+    err_out: *mut *mut line_sender_error,
+    function: &str,
+) -> bool {
+    if message_buf.is_null() && message_buf_len != 0 {
+        unsafe {
+            set_err_out(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                format!("{function} requires message_buf to be non-NULL when message_buf_len > 0"),
+            );
+        }
+        return false;
+    }
+    true
+}
+
+unsafe fn qwpws_copy_message(
+    message: &str,
+    message_buf: *mut c_char,
+    message_buf_len: size_t,
+    message_len_out: *mut size_t,
+) -> bool {
+    if !message_len_out.is_null() {
+        unsafe {
+            *message_len_out = message.len();
+        }
+    }
+    let copy_len = usize::min(message.len(), message_buf_len);
+    if copy_len != 0 {
+        unsafe {
+            ptr::copy_nonoverlapping(message.as_ptr(), message_buf as *mut u8, copy_len);
+        }
+    }
+    copy_len < message.len()
+}
 
 /// Create a new line sender instance from the given options object.
 ///
@@ -2119,33 +2565,376 @@ pub unsafe extern "C" fn line_sender_close(sender: *mut line_sender) {
     }
 }
 
-/// Create a type-only QWP/WebSocket sender ownership prototype.
+/// Create a shape-only QWP/WebSocket sender prototype.
 ///
-/// This validates handle ownership before transport, queue, or encoder
-/// implementation exists. The config argument is intentionally ignored.
+/// This validates ABI shape and ownership before transport, queue, or encoder
+/// implementation is wired through. The config argument is intentionally ignored.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_qwpws_new(
     _config: line_sender_utf8,
     err_out: *mut *mut line_sender_error,
 ) -> *mut line_sender_qwpws {
-    let sender = match QwpWsSender::open(QwpWsOptions::default()) {
-        Ok(sender) => sender,
-        Err(err) => {
-            unsafe { set_err_out_from_error(err_out, err) };
-            return ptr::null_mut();
-        }
-    };
-    Box::into_raw(Box::new(line_sender_qwpws(Some(sender))))
+    qwpws_catch_ptr(err_out, || {
+        let sender = match QwpWsSender::open(QwpWsOptions::default()) {
+            Ok(sender) => sender,
+            Err(err) => {
+                unsafe { set_err_out_from_error(err_out, err) };
+                return ptr::null_mut();
+            }
+        };
+        Box::into_raw(Box::new(line_sender_qwpws {
+            sender: Some(sender),
+            state: QwpWsFfiShapeState::default(),
+        }))
+    })
 }
 
-/// Free a type-only QWP/WebSocket sender ownership prototype.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_qwpws_new_buffer(
+    sender: *const line_sender_qwpws,
+    err_out: *mut *mut line_sender_error,
+) -> *mut line_sender_buffer {
+    qwpws_catch_ptr(err_out, || unsafe {
+        let Some(_sender) = qwpws_sender_ref(sender, err_out, "line_sender_qwpws_new_buffer")
+        else {
+            return ptr::null_mut();
+        };
+        Box::into_raw(Box::new(line_sender_buffer {
+            buffer: Buffer::new_qwp(),
+            empty_peek_buf_is_null: true,
+        }))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_qwpws_submit(
+    sender: *mut line_sender_qwpws,
+    buffer: *mut line_sender_buffer,
+    receipt_out: *mut line_sender_qwpws_receipt,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    qwpws_catch_bool(err_out, || unsafe {
+        if receipt_out.is_null() {
+            set_err_out(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "line_sender_qwpws_submit requires a non-NULL receipt_out".to_string(),
+            );
+            return false;
+        }
+        let Some(sender) = qwpws_sender_mut(sender, err_out, "line_sender_qwpws_submit") else {
+            return false;
+        };
+        let Some(buffer) = qwpws_buffer_mut(buffer, err_out, "line_sender_qwpws_submit") else {
+            return false;
+        };
+        match buffer.buffer.check_can_flush() {
+            Ok(()) => {}
+            Err(err) => {
+                set_err_out_from_error(err_out, err);
+                return false;
+            }
+        }
+        let receipt = match sender.state.publish() {
+            Ok(receipt) => receipt,
+            Err(err) => {
+                set_err_out_from_error(err_out, err);
+                return false;
+            }
+        };
+        buffer.buffer.clear();
+        *receipt_out = receipt;
+        true
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_qwpws_submit_and_keep(
+    sender: *mut line_sender_qwpws,
+    buffer: *const line_sender_buffer,
+    receipt_out: *mut line_sender_qwpws_receipt,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    qwpws_catch_bool(err_out, || unsafe {
+        if receipt_out.is_null() {
+            set_err_out(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "line_sender_qwpws_submit_and_keep requires a non-NULL receipt_out".to_string(),
+            );
+            return false;
+        }
+        let Some(sender) = qwpws_sender_mut(sender, err_out, "line_sender_qwpws_submit_and_keep")
+        else {
+            return false;
+        };
+        let Some(buffer) = qwpws_buffer_ref(buffer, err_out, "line_sender_qwpws_submit_and_keep")
+        else {
+            return false;
+        };
+        match buffer.buffer.check_can_flush() {
+            Ok(()) => {}
+            Err(err) => {
+                set_err_out_from_error(err_out, err);
+                return false;
+            }
+        }
+        let receipt = match sender.state.publish() {
+            Ok(receipt) => receipt,
+            Err(err) => {
+                set_err_out_from_error(err_out, err);
+                return false;
+            }
+        };
+        *receipt_out = receipt;
+        true
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_qwpws_drive_once(
+    sender: *mut line_sender_qwpws,
+    _timeout_millis: u64,
+    outcome_out: *mut line_sender_qwpws_drive_outcome,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    qwpws_catch_bool(err_out, || unsafe {
+        if outcome_out.is_null() {
+            set_err_out(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "line_sender_qwpws_drive_once requires a non-NULL outcome_out".to_string(),
+            );
+            return false;
+        }
+        let Some(sender) = qwpws_sender_mut(sender, err_out, "line_sender_qwpws_drive_once") else {
+            return false;
+        };
+        let kind = if sender.state.terminal {
+            line_sender_qwpws_drive_kind::LINE_SENDER_QWPWS_DRIVE_TERMINAL
+        } else if sender.state.ack_first_pending().is_some() {
+            line_sender_qwpws_drive_kind::LINE_SENDER_QWPWS_DRIVE_PROGRESS
+        } else {
+            line_sender_qwpws_drive_kind::LINE_SENDER_QWPWS_DRIVE_IDLE
+        };
+        *outcome_out = line_sender_qwpws_drive_outcome { kind };
+        true
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_qwpws_poll_event(
+    sender: *mut line_sender_qwpws,
+    event_out: *mut line_sender_qwpws_event,
+    message_buf: *mut c_char,
+    message_buf_len: size_t,
+    message_len_out: *mut size_t,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    qwpws_catch_bool(err_out, || unsafe {
+        if event_out.is_null() {
+            set_err_out(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "line_sender_qwpws_poll_event requires a non-NULL event_out".to_string(),
+            );
+            return false;
+        }
+        if !qwpws_validate_message_buffer(
+            message_buf,
+            message_buf_len,
+            err_out,
+            "line_sender_qwpws_poll_event",
+        ) {
+            return false;
+        }
+        let Some(sender) = qwpws_sender_mut(sender, err_out, "line_sender_qwpws_poll_event") else {
+            return false;
+        };
+        let Some(event) = sender.state.events.pop_front() else {
+            let mut output = line_sender_qwpws_event {
+                kind: line_sender_qwpws_event_kind::LINE_SENDER_QWPWS_EVENT_NONE,
+                fsn: 0,
+                wire_sequence: 0,
+                qwp_status: 0,
+                message_truncated: false,
+            };
+            output.message_truncated =
+                qwpws_copy_message("", message_buf, message_buf_len, message_len_out);
+            *event_out = output;
+            return true;
+        };
+        let mut output = line_sender_qwpws_event {
+            kind: event.kind,
+            fsn: event.fsn,
+            wire_sequence: event.wire_sequence,
+            qwp_status: event.qwp_status,
+            message_truncated: false,
+        };
+        output.message_truncated = qwpws_copy_message(
+            &event.message,
+            message_buf,
+            message_buf_len,
+            message_len_out,
+        );
+        *event_out = output;
+        true
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_qwpws_get_receipt_status(
+    sender: *const line_sender_qwpws,
+    receipt: line_sender_qwpws_receipt,
+    status_out: *mut line_sender_qwpws_receipt_status,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    qwpws_catch_bool(err_out, || unsafe {
+        if status_out.is_null() {
+            set_err_out(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "line_sender_qwpws_get_receipt_status requires a non-NULL status_out".to_string(),
+            );
+            return false;
+        }
+        let Some(sender) =
+            qwpws_sender_ref(sender, err_out, "line_sender_qwpws_get_receipt_status")
+        else {
+            return false;
+        };
+        *status_out = sender.state.receipt_status(receipt);
+        true
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_qwpws_wait(
+    sender: *mut line_sender_qwpws,
+    receipt: line_sender_qwpws_receipt,
+    timeout_millis: u64,
+    outcome_out: *mut line_sender_qwpws_delivery,
+    message_buf: *mut c_char,
+    message_buf_len: size_t,
+    message_len_out: *mut size_t,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    qwpws_catch_bool(err_out, || unsafe {
+        if outcome_out.is_null() {
+            set_err_out(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "line_sender_qwpws_wait requires a non-NULL outcome_out".to_string(),
+            );
+            return false;
+        }
+        if !qwpws_validate_message_buffer(
+            message_buf,
+            message_buf_len,
+            err_out,
+            "line_sender_qwpws_wait",
+        ) {
+            return false;
+        }
+        let Some(sender) = qwpws_sender_mut(sender, err_out, "line_sender_qwpws_wait") else {
+            return false;
+        };
+        let status = sender.state.receipt_status(receipt);
+        if status.kind == line_sender_qwpws_receipt_status_kind::LINE_SENDER_QWPWS_RECEIPT_INVALID {
+            set_err_out(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                format!("unknown QWP/WS receipt fsn={}", receipt.fsn),
+            );
+            return false;
+        }
+        if status.kind == line_sender_qwpws_receipt_status_kind::LINE_SENDER_QWPWS_RECEIPT_PENDING
+            && timeout_millis != 0
+        {
+            sender.state.ack_through(receipt.fsn);
+        }
+        let status = sender.state.receipt_status(receipt);
+        let kind = match status.kind {
+            line_sender_qwpws_receipt_status_kind::LINE_SENDER_QWPWS_RECEIPT_ACKED => {
+                line_sender_qwpws_delivery_kind::LINE_SENDER_QWPWS_DELIVERY_ACKED
+            }
+            line_sender_qwpws_receipt_status_kind::LINE_SENDER_QWPWS_RECEIPT_PENDING => {
+                line_sender_qwpws_delivery_kind::LINE_SENDER_QWPWS_DELIVERY_TIMEOUT
+            }
+            line_sender_qwpws_receipt_status_kind::LINE_SENDER_QWPWS_RECEIPT_POISONED => {
+                line_sender_qwpws_delivery_kind::LINE_SENDER_QWPWS_DELIVERY_POISONED
+            }
+            line_sender_qwpws_receipt_status_kind::LINE_SENDER_QWPWS_RECEIPT_TERMINAL => {
+                line_sender_qwpws_delivery_kind::LINE_SENDER_QWPWS_DELIVERY_TERMINAL
+            }
+            line_sender_qwpws_receipt_status_kind::LINE_SENDER_QWPWS_RECEIPT_INVALID => {
+                unreachable!("invalid receipt was handled above")
+            }
+        };
+        let mut outcome = line_sender_qwpws_delivery {
+            kind,
+            fsn: receipt.fsn,
+            qwp_status: status.qwp_status,
+            message_truncated: false,
+        };
+        outcome.message_truncated =
+            qwpws_copy_message("", message_buf, message_buf_len, message_len_out);
+        *outcome_out = outcome;
+        true
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_qwpws_close_drain(
+    sender: *mut line_sender_qwpws,
+    timeout_millis: u64,
+    outcome_out: *mut line_sender_qwpws_close_outcome,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    qwpws_catch_bool(err_out, || unsafe {
+        if outcome_out.is_null() {
+            set_err_out(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "line_sender_qwpws_close_drain requires a non-NULL outcome_out".to_string(),
+            );
+            return false;
+        }
+        let Some(sender) = qwpws_sender_mut(sender, err_out, "line_sender_qwpws_close_drain")
+        else {
+            return false;
+        };
+        let kind = if sender.state.terminal {
+            line_sender_qwpws_close_kind::LINE_SENDER_QWPWS_CLOSE_TERMINAL
+        } else if sender.state.has_pending() && timeout_millis == 0 {
+            line_sender_qwpws_close_kind::LINE_SENDER_QWPWS_CLOSE_TIMEOUT
+        } else {
+            while sender.state.ack_first_pending().is_some() {}
+            sender.state.terminal = true;
+            line_sender_qwpws_close_kind::LINE_SENDER_QWPWS_CLOSE_DRAINED
+        };
+        *outcome_out = sender.state.close_outcome(kind);
+        true
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_qwpws_close_fast(sender: *mut line_sender_qwpws) {
+    let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
+        if let Some(sender) = sender.as_mut() {
+            sender.state.terminal = true;
+        }
+    }));
+}
+
+/// Free a shape-only QWP/WebSocket sender prototype.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_qwpws_free(sender: *mut line_sender_qwpws) {
-    unsafe {
+    let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
         if !sender.is_null() {
             drop(Box::from_raw(sender));
         }
-    }
+    }));
 }
 
 /// Consume a manual QWP/WebSocket sender prototype into a threaded prototype.
@@ -2158,7 +2947,7 @@ pub unsafe extern "C" fn line_sender_qwpws_threaded_start(
     threaded_out: *mut *mut line_sender_qwpws_threaded,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    unsafe {
+    qwpws_catch_bool(err_out, || unsafe {
         if sender.is_null() {
             set_err_out(
                 err_out,
@@ -2184,8 +2973,16 @@ pub unsafe extern "C" fn line_sender_qwpws_threaded_start(
             );
             return false;
         }
+        if (*sender_ptr).state.terminal {
+            set_err_out(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "QWP/WS threaded start requires an open sender".to_string(),
+            );
+            return false;
+        }
 
-        let manual = match (*sender_ptr).0.take() {
+        let manual = match (*sender_ptr).sender.take() {
             Some(manual) => manual,
             None => {
                 set_err_out(
@@ -2202,20 +2999,20 @@ pub unsafe extern "C" fn line_sender_qwpws_threaded_start(
         *sender = ptr::null_mut();
         *threaded_out = Box::into_raw(Box::new(line_sender_qwpws_threaded(threaded)));
         true
-    }
+    })
 }
 
-/// Stop and free a type-only QWP/WebSocket threaded prototype.
+/// Stop and free a shape-only QWP/WebSocket threaded prototype.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_qwpws_threaded_stop(
     threaded: *mut line_sender_qwpws_threaded,
 ) {
-    unsafe {
+    let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
         if !threaded.is_null() {
             let threaded = Box::from_raw(threaded);
             threaded.0.stop();
         }
-    }
+    }));
 }
 
 /// Send the given buffer of rows to the QuestDB server, clearing the buffer.
@@ -2360,13 +3157,544 @@ mod tests {
         }
     }
 
+    fn table_name(bytes: &'static [u8]) -> line_sender_table_name {
+        unsafe { line_sender_table_name_assert(bytes.len(), bytes.as_ptr() as *const c_char) }
+    }
+
+    fn column_name(bytes: &'static [u8]) -> line_sender_column_name {
+        unsafe { line_sender_column_name_assert(bytes.len(), bytes.as_ptr() as *const c_char) }
+    }
+
+    fn free_err(err: &mut *mut line_sender_error) {
+        unsafe {
+            line_sender_error_free(*err);
+        }
+        *err = ptr::null_mut();
+    }
+
+    fn new_qwpws_sender(err: &mut *mut line_sender_error) -> *mut line_sender_qwpws {
+        let sender = unsafe { line_sender_qwpws_new(empty_utf8(), err) };
+        assert!(!sender.is_null());
+        assert!(err.is_null());
+        sender
+    }
+
+    fn new_qwpws_buffer(
+        sender: *const line_sender_qwpws,
+        err: &mut *mut line_sender_error,
+    ) -> *mut line_sender_buffer {
+        let buffer = unsafe { line_sender_qwpws_new_buffer(sender, err) };
+        assert!(!buffer.is_null());
+        assert!(err.is_null());
+        buffer
+    }
+
+    fn add_qwp_row(buffer: *mut line_sender_buffer, err: &mut *mut line_sender_error) {
+        unsafe {
+            assert!(line_sender_buffer_table(buffer, table_name(b"tab"), err));
+            assert!(err.is_null());
+            assert!(line_sender_buffer_column_i64(
+                buffer,
+                column_name(b"val"),
+                42,
+                err
+            ));
+            assert!(err.is_null());
+            assert!(line_sender_buffer_at_nanos(buffer, 1_000, err));
+            assert!(err.is_null());
+            assert_eq!(line_sender_buffer_row_count(buffer), 1);
+        }
+    }
+
+    #[test]
+    fn qwpws_new_buffer_rejects_null_sender() {
+        unsafe {
+            let mut err = ptr::null_mut();
+
+            let buffer = line_sender_qwpws_new_buffer(ptr::null(), &mut err);
+
+            assert!(buffer.is_null());
+            assert!(!err.is_null());
+            line_sender_error_free(err);
+        }
+    }
+
+    #[test]
+    fn qwpws_submit_clears_buffer_and_publishes_event() {
+        unsafe {
+            let mut err = ptr::null_mut();
+            let sender = new_qwpws_sender(&mut err);
+            let buffer = new_qwpws_buffer(sender, &mut err);
+            add_qwp_row(buffer, &mut err);
+
+            let mut receipt = line_sender_qwpws_receipt { fsn: u64::MAX };
+            assert!(line_sender_qwpws_submit(
+                sender,
+                buffer,
+                &mut receipt,
+                &mut err
+            ));
+            assert!(err.is_null());
+            assert_eq!(receipt.fsn, 0);
+            assert_eq!(line_sender_buffer_row_count(buffer), 0);
+
+            let mut event = line_sender_qwpws_event {
+                kind: line_sender_qwpws_event_kind::LINE_SENDER_QWPWS_EVENT_NONE,
+                fsn: u64::MAX,
+                wire_sequence: u64::MAX,
+                qwp_status: u8::MAX,
+                message_truncated: true,
+            };
+            let mut message_len = size_t::MAX;
+            assert!(line_sender_qwpws_poll_event(
+                sender,
+                &mut event,
+                ptr::null_mut(),
+                0,
+                &mut message_len,
+                &mut err
+            ));
+            assert!(err.is_null());
+            assert_eq!(
+                event.kind,
+                line_sender_qwpws_event_kind::LINE_SENDER_QWPWS_EVENT_PUBLISHED
+            );
+            assert_eq!(event.fsn, receipt.fsn);
+            assert!(!event.message_truncated);
+            assert_eq!(message_len, 0);
+
+            assert!(line_sender_qwpws_poll_event(
+                sender,
+                &mut event,
+                ptr::null_mut(),
+                0,
+                &mut message_len,
+                &mut err
+            ));
+            assert_eq!(
+                event.kind,
+                line_sender_qwpws_event_kind::LINE_SENDER_QWPWS_EVENT_NONE
+            );
+
+            line_sender_buffer_free(buffer);
+            line_sender_qwpws_free(sender);
+        }
+    }
+
+    #[test]
+    fn qwpws_submit_requires_receipt_without_clearing_buffer() {
+        unsafe {
+            let mut err = ptr::null_mut();
+            let sender = new_qwpws_sender(&mut err);
+            let buffer = new_qwpws_buffer(sender, &mut err);
+            add_qwp_row(buffer, &mut err);
+
+            assert!(!line_sender_qwpws_submit(
+                sender,
+                buffer,
+                ptr::null_mut(),
+                &mut err
+            ));
+            assert!(!err.is_null());
+            assert_eq!(line_sender_buffer_row_count(buffer), 1);
+
+            free_err(&mut err);
+            line_sender_buffer_free(buffer);
+            line_sender_qwpws_free(sender);
+        }
+    }
+
+    #[test]
+    fn qwpws_submit_failure_tolerates_null_err_out() {
+        unsafe {
+            let mut err = ptr::null_mut();
+            let sender = new_qwpws_sender(&mut err);
+            let buffer = new_qwpws_buffer(sender, &mut err);
+            add_qwp_row(buffer, &mut err);
+
+            assert!(!line_sender_qwpws_submit(
+                sender,
+                buffer,
+                ptr::null_mut(),
+                ptr::null_mut()
+            ));
+            assert_eq!(line_sender_buffer_row_count(buffer), 1);
+
+            line_sender_buffer_free(buffer);
+            line_sender_qwpws_free(sender);
+        }
+    }
+
+    #[test]
+    fn qwpws_submit_rejects_ilp_buffer() {
+        unsafe {
+            let mut err = ptr::null_mut();
+            let sender = new_qwpws_sender(&mut err);
+            let buffer = line_sender_buffer_new(ProtocolVersion::V2);
+            let mut receipt = line_sender_qwpws_receipt { fsn: u64::MAX };
+
+            assert!(!line_sender_qwpws_submit(
+                sender,
+                buffer,
+                &mut receipt,
+                &mut err
+            ));
+            assert!(!err.is_null());
+
+            free_err(&mut err);
+            line_sender_buffer_free(buffer);
+            line_sender_qwpws_free(sender);
+        }
+    }
+
+    #[test]
+    fn qwpws_submit_and_keep_preserves_buffer() {
+        unsafe {
+            let mut err = ptr::null_mut();
+            let sender = new_qwpws_sender(&mut err);
+            let buffer = new_qwpws_buffer(sender, &mut err);
+            add_qwp_row(buffer, &mut err);
+
+            let mut receipt = line_sender_qwpws_receipt { fsn: u64::MAX };
+            assert!(line_sender_qwpws_submit_and_keep(
+                sender,
+                buffer,
+                &mut receipt,
+                &mut err
+            ));
+            assert!(err.is_null());
+            assert_eq!(receipt.fsn, 0);
+            assert_eq!(line_sender_buffer_row_count(buffer), 1);
+
+            line_sender_buffer_free(buffer);
+            line_sender_qwpws_free(sender);
+        }
+    }
+
+    #[test]
+    fn qwpws_drive_once_reports_progress_without_consuming_events() {
+        unsafe {
+            let mut err = ptr::null_mut();
+            let sender = new_qwpws_sender(&mut err);
+            let buffer = new_qwpws_buffer(sender, &mut err);
+            add_qwp_row(buffer, &mut err);
+
+            let mut receipt = line_sender_qwpws_receipt { fsn: u64::MAX };
+            assert!(line_sender_qwpws_submit_and_keep(
+                sender,
+                buffer,
+                &mut receipt,
+                &mut err
+            ));
+
+            let mut drive = line_sender_qwpws_drive_outcome {
+                kind: line_sender_qwpws_drive_kind::LINE_SENDER_QWPWS_DRIVE_IDLE,
+            };
+            assert!(line_sender_qwpws_drive_once(
+                sender, 0, &mut drive, &mut err
+            ));
+            assert_eq!(
+                drive.kind,
+                line_sender_qwpws_drive_kind::LINE_SENDER_QWPWS_DRIVE_PROGRESS
+            );
+
+            let mut event = line_sender_qwpws_event {
+                kind: line_sender_qwpws_event_kind::LINE_SENDER_QWPWS_EVENT_NONE,
+                fsn: 0,
+                wire_sequence: 0,
+                qwp_status: 0,
+                message_truncated: false,
+            };
+            assert!(line_sender_qwpws_poll_event(
+                sender,
+                &mut event,
+                ptr::null_mut(),
+                0,
+                ptr::null_mut(),
+                &mut err
+            ));
+            assert_eq!(
+                event.kind,
+                line_sender_qwpws_event_kind::LINE_SENDER_QWPWS_EVENT_PUBLISHED
+            );
+            assert!(line_sender_qwpws_poll_event(
+                sender,
+                &mut event,
+                ptr::null_mut(),
+                0,
+                ptr::null_mut(),
+                &mut err
+            ));
+            assert_eq!(
+                event.kind,
+                line_sender_qwpws_event_kind::LINE_SENDER_QWPWS_EVENT_ACKED
+            );
+            assert_eq!(event.fsn, receipt.fsn);
+
+            line_sender_buffer_free(buffer);
+            line_sender_qwpws_free(sender);
+        }
+    }
+
+    #[test]
+    fn qwpws_receipt_status_reports_invalid_without_error() {
+        unsafe {
+            let mut err = ptr::null_mut();
+            let sender = new_qwpws_sender(&mut err);
+            let mut status = line_sender_qwpws_receipt_status {
+                kind: line_sender_qwpws_receipt_status_kind::LINE_SENDER_QWPWS_RECEIPT_PENDING,
+                fsn: 0,
+                qwp_status: 0,
+            };
+
+            assert!(line_sender_qwpws_get_receipt_status(
+                sender,
+                line_sender_qwpws_receipt { fsn: 99 },
+                &mut status,
+                &mut err
+            ));
+            assert!(err.is_null());
+            assert_eq!(
+                status.kind,
+                line_sender_qwpws_receipt_status_kind::LINE_SENDER_QWPWS_RECEIPT_INVALID
+            );
+            assert_eq!(status.fsn, 99);
+
+            line_sender_qwpws_free(sender);
+        }
+    }
+
+    #[test]
+    fn qwpws_wait_invalid_receipt_is_api_error() {
+        unsafe {
+            let mut err = ptr::null_mut();
+            let sender = new_qwpws_sender(&mut err);
+            let mut delivery = line_sender_qwpws_delivery {
+                kind: line_sender_qwpws_delivery_kind::LINE_SENDER_QWPWS_DELIVERY_ACKED,
+                fsn: 0,
+                qwp_status: 0,
+                message_truncated: false,
+            };
+
+            assert!(!line_sender_qwpws_wait(
+                sender,
+                line_sender_qwpws_receipt { fsn: 99 },
+                0,
+                &mut delivery,
+                ptr::null_mut(),
+                0,
+                ptr::null_mut(),
+                &mut err
+            ));
+            assert!(!err.is_null());
+
+            free_err(&mut err);
+            line_sender_qwpws_free(sender);
+        }
+    }
+
+    #[test]
+    fn qwpws_wait_zero_timeout_returns_timeout_for_pending_receipt() {
+        unsafe {
+            let mut err = ptr::null_mut();
+            let sender = new_qwpws_sender(&mut err);
+            let buffer = new_qwpws_buffer(sender, &mut err);
+            add_qwp_row(buffer, &mut err);
+
+            let mut receipt = line_sender_qwpws_receipt { fsn: u64::MAX };
+            assert!(line_sender_qwpws_submit(
+                sender,
+                buffer,
+                &mut receipt,
+                &mut err
+            ));
+            let mut delivery = line_sender_qwpws_delivery {
+                kind: line_sender_qwpws_delivery_kind::LINE_SENDER_QWPWS_DELIVERY_ACKED,
+                fsn: u64::MAX,
+                qwp_status: u8::MAX,
+                message_truncated: true,
+            };
+            let mut message_len = size_t::MAX;
+
+            assert!(line_sender_qwpws_wait(
+                sender,
+                receipt,
+                0,
+                &mut delivery,
+                ptr::null_mut(),
+                0,
+                &mut message_len,
+                &mut err
+            ));
+            assert!(err.is_null());
+            assert_eq!(
+                delivery.kind,
+                line_sender_qwpws_delivery_kind::LINE_SENDER_QWPWS_DELIVERY_TIMEOUT
+            );
+            assert_eq!(delivery.fsn, receipt.fsn);
+            assert!(!delivery.message_truncated);
+            assert_eq!(message_len, 0);
+
+            line_sender_buffer_free(buffer);
+            line_sender_qwpws_free(sender);
+        }
+    }
+
+    #[test]
+    fn qwpws_poll_event_validates_message_buffer_without_consuming_event() {
+        unsafe {
+            let mut err = ptr::null_mut();
+            let sender = new_qwpws_sender(&mut err);
+            let buffer = new_qwpws_buffer(sender, &mut err);
+            add_qwp_row(buffer, &mut err);
+
+            let mut receipt = line_sender_qwpws_receipt { fsn: u64::MAX };
+            assert!(line_sender_qwpws_submit(
+                sender,
+                buffer,
+                &mut receipt,
+                &mut err
+            ));
+            let mut event = line_sender_qwpws_event {
+                kind: line_sender_qwpws_event_kind::LINE_SENDER_QWPWS_EVENT_NONE,
+                fsn: 0,
+                wire_sequence: 0,
+                qwp_status: 0,
+                message_truncated: false,
+            };
+
+            assert!(!line_sender_qwpws_poll_event(
+                sender,
+                &mut event,
+                ptr::null_mut(),
+                1,
+                ptr::null_mut(),
+                &mut err
+            ));
+            assert!(!err.is_null());
+            free_err(&mut err);
+
+            assert!(line_sender_qwpws_poll_event(
+                sender,
+                &mut event,
+                ptr::null_mut(),
+                0,
+                ptr::null_mut(),
+                &mut err
+            ));
+            assert_eq!(
+                event.kind,
+                line_sender_qwpws_event_kind::LINE_SENDER_QWPWS_EVENT_PUBLISHED
+            );
+            assert_eq!(event.fsn, receipt.fsn);
+
+            line_sender_buffer_free(buffer);
+            line_sender_qwpws_free(sender);
+        }
+    }
+
+    #[test]
+    fn qwpws_close_drain_empty_has_no_watermarks() {
+        unsafe {
+            let mut err = ptr::null_mut();
+            let sender = new_qwpws_sender(&mut err);
+            let mut outcome = line_sender_qwpws_close_outcome {
+                kind: line_sender_qwpws_close_kind::LINE_SENDER_QWPWS_CLOSE_TERMINAL,
+                has_published_fsn: true,
+                published_fsn: u64::MAX,
+                has_server_acked_fsn: true,
+                server_acked_fsn: u64::MAX,
+                has_completed_fsn: true,
+                completed_fsn: u64::MAX,
+            };
+
+            assert!(line_sender_qwpws_close_drain(
+                sender,
+                0,
+                &mut outcome,
+                &mut err
+            ));
+            assert!(err.is_null());
+            assert_eq!(
+                outcome.kind,
+                line_sender_qwpws_close_kind::LINE_SENDER_QWPWS_CLOSE_DRAINED
+            );
+            assert!(!outcome.has_published_fsn);
+            assert!(!outcome.has_server_acked_fsn);
+            assert!(!outcome.has_completed_fsn);
+
+            let mut drive = line_sender_qwpws_drive_outcome {
+                kind: line_sender_qwpws_drive_kind::LINE_SENDER_QWPWS_DRIVE_IDLE,
+            };
+            assert!(line_sender_qwpws_drive_once(
+                sender, 0, &mut drive, &mut err
+            ));
+            assert_eq!(
+                drive.kind,
+                line_sender_qwpws_drive_kind::LINE_SENDER_QWPWS_DRIVE_TERMINAL
+            );
+
+            line_sender_qwpws_free(sender);
+        }
+    }
+
+    #[test]
+    fn qwpws_close_fast_blocks_new_submit_and_reports_terminal_wait() {
+        unsafe {
+            let mut err = ptr::null_mut();
+            let sender = new_qwpws_sender(&mut err);
+            let buffer = new_qwpws_buffer(sender, &mut err);
+            add_qwp_row(buffer, &mut err);
+
+            let mut receipt = line_sender_qwpws_receipt { fsn: u64::MAX };
+            assert!(line_sender_qwpws_submit_and_keep(
+                sender,
+                buffer,
+                &mut receipt,
+                &mut err
+            ));
+            line_sender_qwpws_close_fast(sender);
+
+            let mut delivery = line_sender_qwpws_delivery {
+                kind: line_sender_qwpws_delivery_kind::LINE_SENDER_QWPWS_DELIVERY_ACKED,
+                fsn: 0,
+                qwp_status: 0,
+                message_truncated: false,
+            };
+            assert!(line_sender_qwpws_wait(
+                sender,
+                receipt,
+                1,
+                &mut delivery,
+                ptr::null_mut(),
+                0,
+                ptr::null_mut(),
+                &mut err
+            ));
+            assert_eq!(
+                delivery.kind,
+                line_sender_qwpws_delivery_kind::LINE_SENDER_QWPWS_DELIVERY_TERMINAL
+            );
+
+            assert!(!line_sender_qwpws_submit_and_keep(
+                sender,
+                buffer,
+                &mut receipt,
+                &mut err
+            ));
+            assert!(!err.is_null());
+            free_err(&mut err);
+
+            line_sender_buffer_free(buffer);
+            line_sender_qwpws_free(sender);
+        }
+    }
+
     #[test]
     fn qwpws_threaded_start_consumes_sender_handle() {
         unsafe {
             let mut err = ptr::null_mut();
-            let mut sender = line_sender_qwpws_new(empty_utf8(), &mut err);
-            assert!(!sender.is_null());
-            assert!(err.is_null());
+            let mut sender = new_qwpws_sender(&mut err);
 
             let mut threaded = ptr::null_mut();
             assert!(line_sender_qwpws_threaded_start(
@@ -2404,9 +3732,7 @@ mod tests {
     fn qwpws_threaded_start_rejects_null_threaded_out_without_consuming_sender() {
         unsafe {
             let mut err = ptr::null_mut();
-            let mut sender = line_sender_qwpws_new(empty_utf8(), &mut err);
-            assert!(!sender.is_null());
-            assert!(err.is_null());
+            let mut sender = new_qwpws_sender(&mut err);
 
             assert!(!line_sender_qwpws_threaded_start(
                 &mut sender,
@@ -2414,6 +3740,28 @@ mod tests {
                 &mut err
             ));
             assert!(!sender.is_null());
+            assert!(!err.is_null());
+
+            line_sender_error_free(err);
+            line_sender_qwpws_free(sender);
+        }
+    }
+
+    #[test]
+    fn qwpws_threaded_start_rejects_closed_sender_without_consuming_sender() {
+        unsafe {
+            let mut err = ptr::null_mut();
+            let mut sender = new_qwpws_sender(&mut err);
+            line_sender_qwpws_close_fast(sender);
+
+            let mut threaded = ptr::null_mut();
+            assert!(!line_sender_qwpws_threaded_start(
+                &mut sender,
+                &mut threaded,
+                &mut err
+            ));
+            assert!(!sender.is_null());
+            assert!(threaded.is_null());
             assert!(!err.is_null());
 
             line_sender_error_free(err);

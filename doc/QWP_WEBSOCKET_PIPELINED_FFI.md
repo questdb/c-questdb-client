@@ -931,7 +931,7 @@ bool line_sender_qwpws_wait(
     size_t* message_len_out,
     line_sender_error** err_out);
 
-bool line_sender_qwpws_receipt_status(
+bool line_sender_qwpws_get_receipt_status(
     const line_sender_qwpws* sender,
     line_sender_qwpws_receipt receipt,
     line_sender_qwpws_receipt_status* status_out,
