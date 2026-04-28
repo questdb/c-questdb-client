@@ -226,6 +226,12 @@ This means the sender cannot hold references into the caller buffer. It must cop
 The first version follows the Java cursor-SF approach: every data frame
 published by the new pipelined sender is self-sufficient.
 
+The v1 dictionary strategy is deliberately dense and Java-compatible. If a
+frame references symbol id `N`, the frame carries the connection-global
+dictionary entries from id `0` through `N`, even if the frame only uses a small
+subset of those ids. This is the simplest correctness-first replay contract and
+matches the Java cursor-SF approach, but it is not the final scalability target.
+
 This is not a user-selectable durability encoding mode. It is the invariant for
 the new pipelined core in both `volatile` and `sf` queue modes, because both
 modes may need to replay unresolved frames after reconnect and both let the
@@ -256,13 +262,15 @@ fresh server connection. It does not require a frame-local symbol id space in
 the first version.
 
 This costs more bytes than connection-delta encoding, especially for
-long-running high-cardinality symbol workloads. That cost is accepted for v1 so
-the replay contract can be validated before optimizing it.
+long-running high-cardinality symbol workloads. In the worst case, a frame that
+uses one old high-numbered symbol id still repeats every lower dictionary entry.
+That scalability limit is accepted for v1 so the end-to-end replay contract can
+be validated before optimizing it.
 
 Future optimization should preserve the same replay invariant by adding
-explicit protocol support for state-only QWP messages and durable state
-checkpoints. It should not make correctness depend on whether a user selected a
-durability mode.
+explicit protocol support for sparse referenced-entry dictionaries, state-only
+QWP messages, and durable state checkpoints. It should not make correctness
+depend on whether a user selected a durability mode.
 
 ### Encoder work item
 

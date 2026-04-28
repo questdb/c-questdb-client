@@ -165,7 +165,8 @@ data frame on a fresh WebSocket connection.
 Validation target:
 
 - Stored frames contain enough schema information for independent replay.
-- Stored frames contain the symbol dictionary prefix needed by their symbol IDs.
+- Stored frames contain the dense symbol dictionary prefix from id `0` through
+  the highest symbol id referenced by the frame.
 - Replaying a later stored frame alone after reconnect/restart succeeds.
 - The public API does not expose a durability-dependent encoding choice.
 
@@ -174,6 +175,9 @@ Design pressure to watch:
 - The encoder should not infect normal row-building ergonomics.
 - The cost of repeated schema/symbol material should be visible in benchmarks,
   but should not block the correctness-first v1.
+- The v1 dense dictionary rule is intentionally not scalable for long-running
+  high-cardinality symbol workloads. Treat sparse referenced-entry dictionaries
+  as a later optimization, not a v1 requirement.
 
 Local reflection:
 
@@ -206,6 +210,8 @@ Validation target:
 - The server does not require hidden connection-local schema or symbol state
   beyond what the frame carries.
 - The rows are not merely ACKed; they are queryable with the expected values.
+- The probe records the byte-size overhead of the dense dictionary prefix for at
+  least one repeated-symbol and one higher-cardinality scenario.
 
 Design pressure to watch:
 
