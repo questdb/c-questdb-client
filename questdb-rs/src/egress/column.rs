@@ -82,7 +82,7 @@ impl<'a> Validity<'a> {
                 if row >= *row_count {
                     return false;
                 }
-                let byte = bytes[row >> 3];
+                let byte = bytes.get(row >> 3).copied().unwrap_or(0);
                 (byte >> (row & 7)) & 1 != 0
             }
         }
@@ -1074,6 +1074,26 @@ mod tests {
             assert!(!v.is_null(r));
         }
         assert!(v.is_null(9));
+    }
+
+    #[test]
+    fn validity_bitmap_short_buffer_does_not_panic() {
+        // Caller-supplied bitmap is shorter than ceil(row_count / 8); is_null
+        // must treat the missing tail as zero (not null) instead of panicking.
+        let bytes: [u8; 0] = [];
+        let v = Validity::from_bitmap(&bytes, 100);
+        for r in 0..100 {
+            assert!(!v.is_null(r));
+        }
+
+        let bytes = [0xFFu8];
+        let v = Validity::from_bitmap(&bytes, 100);
+        for r in 0..8 {
+            assert!(v.is_null(r));
+        }
+        for r in 8..100 {
+            assert!(!v.is_null(r));
+        }
     }
 
     #[test]
