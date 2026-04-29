@@ -40,7 +40,9 @@ use rustls::RootCertStore;
 use rustls_pki_types::CertificateDer;
 use rustls_pki_types::pem::PemObject;
 
-use crate::egress::config::{ReaderConfig, TlsVerify};
+use crate::egress::config::ReaderConfig;
+#[cfg(feature = "insecure-skip-verify")]
+use crate::egress::config::TlsVerify;
 use crate::egress::error::{Result, fmt};
 use crate::ingress::CertificateAuthority;
 
