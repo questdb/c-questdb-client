@@ -45,9 +45,6 @@ use crate::egress::column_kind::ColumnKind;
 use crate::egress::error::{Result, fmt};
 use crate::egress::wire::varint;
 
-/// Server-advertised soft cap on registered schemas per connection.
-pub const SOFT_CAP_SCHEMAS: usize = 4096;
-
 /// A single column in a result schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchemaColumn {

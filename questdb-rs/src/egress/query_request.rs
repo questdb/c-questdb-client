@@ -70,20 +70,8 @@ impl QueryRequest {
         }
     }
 
-    pub fn request_id(&self) -> i64 {
-        self.request_id
-    }
-
-    pub fn sql(&self) -> &str {
-        &self.sql
-    }
-
     pub fn initial_credit(&self) -> u64 {
         self.initial_credit
-    }
-
-    pub fn binds(&self) -> &[Bind] {
-        &self.binds
     }
 
     /// Serialize this request as a bare QWP client→server payload (no

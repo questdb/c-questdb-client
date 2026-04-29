@@ -45,12 +45,6 @@
 use crate::egress::error::{Result, fmt};
 use crate::egress::wire::varint;
 
-/// Server-advertised soft cap on entry count per connection.
-pub const SOFT_CAP_ENTRIES: usize = 100_000;
-
-/// Server-advertised soft cap on heap (UTF-8 bytes) per connection.
-pub const SOFT_CAP_HEAP_BYTES: usize = 8 * 1024 * 1024;
-
 #[derive(Debug, Clone, Copy)]
 struct Entry {
     offset: u32,

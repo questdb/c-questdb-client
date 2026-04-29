@@ -79,13 +79,6 @@ pub struct WsTransport {
 }
 
 impl WsTransport {
-    /// Connect to the first endpoint in `config.addrs`. Convenience for
-    /// single-addr configs; multi-addr callers (with target filtering)
-    /// use [`connect_to`](Self::connect_to) per endpoint.
-    pub fn connect(config: &ReaderConfig) -> Result<Self> {
-        Self::connect_to(config, 0)
-    }
-
     /// Connect to a specific endpoint in `config.addrs` by index.
     pub fn connect_to(config: &ReaderConfig, addr_idx: usize) -> Result<Self> {
         if addr_idx >= config.addrs.len() {
@@ -234,11 +227,6 @@ impl WsTransport {
     /// stuck-but-not-RST'd peer cannot hang the cancel forever.
     pub fn set_read_timeout(&mut self, timeout: Option<Duration>) {
         set_tcp_read_timeout(self.socket.get_mut(), timeout);
-    }
-
-    /// Best-effort close. Errors are swallowed to keep `Drop` clean.
-    pub fn close(mut self) {
-        teardown_inplace(&mut self.socket);
     }
 
     /// Best-effort in-place close. Initiates the WS closing handshake

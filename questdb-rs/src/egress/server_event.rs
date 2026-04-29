@@ -102,7 +102,15 @@ pub enum ServerEvent {
         rows_affected: u64,
     },
     /// `CACHE_RESET` (`0x17`). Mask bits already applied to dict/registry.
-    CacheReset { mask: u8 },
+    CacheReset {
+        // `mask` is matched literally by tests (pattern `mask: 0x01`)
+        // but never read by the consumers — `decode_frame` performs
+        // the resets in place before returning the event. Marked
+        // `allow(dead_code)` so the wire-level visibility stays
+        // honest without tripping `-D dead_code`.
+        #[allow(dead_code)]
+        mask: u8,
+    },
     /// `SERVER_INFO` (`0x18`).
     ServerInfo(ServerInfo),
 }
@@ -434,7 +442,7 @@ mod tests {
         let mut dict = SymbolDict::new();
         dict.apply_delta(0, [b"x".as_slice()]).unwrap();
         let mut reg = SchemaRegistry::new();
-        reg.insert(1, crate::egress::Schema::new());
+        reg.insert(1, crate::egress::schema::Schema::new());
 
         let payload = build_cache_reset(0x01);
         let event = decode_frame(header(payload.len()), &payload, &mut dict, &mut reg).unwrap();
@@ -448,7 +456,7 @@ mod tests {
         let mut dict = SymbolDict::new();
         dict.apply_delta(0, [b"x".as_slice()]).unwrap();
         let mut reg = SchemaRegistry::new();
-        reg.insert(1, crate::egress::Schema::new());
+        reg.insert(1, crate::egress::schema::Schema::new());
 
         let payload = build_cache_reset(0x02);
         decode_frame(header(payload.len()), &payload, &mut dict, &mut reg).unwrap();
@@ -461,7 +469,7 @@ mod tests {
         let mut dict = SymbolDict::new();
         dict.apply_delta(0, [b"x".as_slice()]).unwrap();
         let mut reg = SchemaRegistry::new();
-        reg.insert(1, crate::egress::Schema::new());
+        reg.insert(1, crate::egress::schema::Schema::new());
 
         let payload = build_cache_reset(0x03);
         decode_frame(header(payload.len()), &payload, &mut dict, &mut reg).unwrap();
