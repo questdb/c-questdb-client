@@ -23,7 +23,6 @@
 
 use std::sync::{Arc, Mutex};
 
-use questdb::egress::column::ColumnView;
 use questdb::egress::{FailoverEvent, Reader};
 
 fn main() {
@@ -44,10 +43,11 @@ fn main() {
         reader.server_info().map(|i| i.role)
     );
 
-    // Shared accumulator: the callback clears it on failover so the
-    // replayed batches don't double-count.
-    let rows: Arc<Mutex<Vec<i64>>> = Arc::new(Mutex::new(Vec::new()));
-    let rows_for_cb = Arc::clone(&rows);
+    // Shared row counter: the callback resets it on failover so the
+    // replayed batches don't double-count. Real handlers would buffer
+    // the actual row data here and dispatch on `batch.schema()`.
+    let rows_received: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
+    let rows_for_cb = Arc::clone(&rows_received);
 
     let mut cursor = reader
         .query(&sql)
@@ -66,7 +66,7 @@ fn main() {
             );
             // Discard whatever the previous connection delivered — the
             // server will resend from `batch_seq=0` on the new endpoint.
-            rows_for_cb.lock().unwrap().clear();
+            *rows_for_cb.lock().unwrap() = 0;
         })
         .execute()
         .expect("execute");
@@ -74,23 +74,15 @@ fn main() {
     let mut total_batches = 0u64;
     while let Some(batch) = cursor.next_batch().expect("next") {
         total_batches += 1;
-        // Best-effort projection of column 0 as an i64. Real handlers
-        // would dispatch on `batch.schema()` and project every column.
-        if let Ok(ColumnView::Long(c)) = batch.column(0) {
-            let mut guard = rows.lock().unwrap();
-            for i in 0..batch.row_count() {
-                guard.push(c.value(i));
-            }
-        }
+        *rows_received.lock().unwrap() += batch.row_count() as u64;
     }
     let resets = cursor.failover_resets();
     drop(cursor);
 
-    let final_rows = rows.lock().unwrap();
     eprintln!(
         "completed: batches={} rows={} failover_resets={} final_endpoint={}",
         total_batches,
-        final_rows.len(),
+        *rows_received.lock().unwrap(),
         resets,
         reader.current_addr(),
     );
