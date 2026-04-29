@@ -54,6 +54,13 @@ use crate::egress::column_kind::ColumnKind;
 use crate::egress::error::{Result, fmt};
 use crate::egress::wire::varint;
 
+/// Inclusive upper bound on a DECIMAL column's scale, matching the
+/// server's `Decimals.MAX_SCALE`. Negative scales and scales above
+/// this bound are rejected client-side at encode time so the user
+/// gets `InvalidBind` immediately rather than a generic `QUERY_ERROR`
+/// from the server.
+pub const MAX_DECIMAL_SCALE: i8 = 38;
+
 /// Typed bind value.
 ///
 /// Position is implicit in the order binds are emitted into a `QUERY_REQUEST`
@@ -234,6 +241,14 @@ pub fn encode_bind(bind: &Bind, out: &mut Vec<u8>) -> Result<()> {
         | Bind::NullDecimal64 { scale }
         | Bind::NullDecimal128 { scale }
         | Bind::NullDecimal256 { scale } => {
+            if *scale < 0 || *scale > MAX_DECIMAL_SCALE {
+                return Err(fmt!(
+                    InvalidBind,
+                    "decimal scale {} outside 0..={}",
+                    scale,
+                    MAX_DECIMAL_SCALE
+                ));
+            }
             out.push(*scale as u8);
         }
         // GEOHASH: column-level varint precision_bits.
@@ -442,6 +457,66 @@ mod tests {
             enc(Bind::NullDecimal64 { scale: 4 }),
             vec![0x13, 0x01, 0x01, 0x04]
         );
+    }
+
+    #[test]
+    fn decimal_scale_negative_rejected() {
+        // Encode-time check: scale must be 0..=MAX_DECIMAL_SCALE.
+        // Without this guard, `*scale as u8` would emit 0xFF and the
+        // server would later return a generic QUERY_ERROR.
+        for bind in [
+            Bind::Decimal64 {
+                value: 0,
+                scale: -1,
+            },
+            Bind::Decimal128 {
+                value: 0,
+                scale: -1,
+            },
+            Bind::Decimal256 {
+                bytes: [0; 32],
+                scale: -1,
+            },
+            Bind::NullDecimal64 { scale: -1 },
+            Bind::NullDecimal128 { scale: -1 },
+            Bind::NullDecimal256 { scale: -1 },
+        ] {
+            let mut out = Vec::new();
+            let err = encode_bind(&bind, &mut out).unwrap_err();
+            assert_eq!(err.code(), crate::egress::ErrorCode::InvalidBind);
+            assert!(
+                err.msg().contains("decimal scale"),
+                "expected scale error msg, got: {}",
+                err.msg()
+            );
+        }
+    }
+
+    #[test]
+    fn decimal_scale_above_max_rejected() {
+        // 39 is the smallest positive value above MAX_DECIMAL_SCALE.
+        for bind in [
+            Bind::Decimal64 {
+                value: 0,
+                scale: 39,
+            },
+            Bind::NullDecimal128 { scale: 39 },
+            Bind::NullDecimal256 { scale: i8::MAX },
+        ] {
+            let mut out = Vec::new();
+            let err = encode_bind(&bind, &mut out).unwrap_err();
+            assert_eq!(err.code(), crate::egress::ErrorCode::InvalidBind);
+        }
+    }
+
+    #[test]
+    fn decimal_scale_at_boundaries_accepted() {
+        // 0 and MAX_DECIMAL_SCALE must encode cleanly.
+        for scale in [0i8, MAX_DECIMAL_SCALE] {
+            let mut out = Vec::new();
+            encode_bind(&Bind::NullDecimal64 { scale }, &mut out).unwrap();
+            assert_eq!(out.last().copied(), Some(scale as u8));
+        }
     }
 
     #[test]

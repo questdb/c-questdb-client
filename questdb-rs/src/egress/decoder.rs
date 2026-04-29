@@ -686,6 +686,14 @@ fn decode_decimal_wide(
 ) -> Result<(i8, ColumnBuffer)> {
     let validity = decode_validity(r, parent, row_count)?;
     let scale = r.read_u8()? as i8;
+    if !(0..=crate::egress::binds::MAX_DECIMAL_SCALE).contains(&scale) {
+        return Err(fmt!(
+            ProtocolError,
+            "decimal scale {} outside 0..={}",
+            scale,
+            crate::egress::binds::MAX_DECIMAL_SCALE
+        ));
+    }
     let buffer = densify_fixed(r, parent, row_count, width, validity)?;
     Ok((scale, buffer))
 }
@@ -1614,6 +1622,55 @@ mod tests {
         assert_eq!(d.scale(), 2);
         assert_eq!(d.value(0), 12345);
         assert_eq!(d.value(1), 6789);
+    }
+
+    #[test]
+    fn decode_decimal_rejects_negative_scale() {
+        // Server-emitted scale of 0xFF (i8 -1) must surface as a
+        // ProtocolError, not silently become a negative scale that
+        // misinterprets every value in the column.
+        for kind in [
+            ColumnKind::Decimal64,
+            ColumnKind::Decimal128,
+            ColumnKind::Decimal256,
+        ] {
+            let width = match kind {
+                ColumnKind::Decimal64 => 8,
+                ColumnKind::Decimal128 => 16,
+                ColumnKind::Decimal256 => 32,
+                _ => unreachable!(),
+            };
+            let mut data = vec![0x00u8, 0xFF]; // null_flag=0, scale=-1
+            data.extend(std::iter::repeat_n(0u8, width)); // 1 row of zeros
+            let (flags_byte, payload) = BatchBuilder::new(1)
+                .add_column("p", kind, data)
+                .build();
+
+            let mut dict = SymbolDict::new();
+            let mut reg = SchemaRegistry::new();
+            let err =
+                decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap_err();
+            assert_eq!(err.code(), crate::egress::ErrorCode::ProtocolError);
+            assert!(
+                err.msg().contains("decimal scale"),
+                "expected scale error msg, got: {}",
+                err.msg()
+            );
+        }
+    }
+
+    #[test]
+    fn decode_decimal_rejects_scale_above_max() {
+        // 39 = MAX_DECIMAL_SCALE + 1.
+        let mut data = vec![0x00u8, 39u8];
+        data.extend(std::iter::repeat_n(0u8, 8));
+        let (flags_byte, payload) = BatchBuilder::new(1)
+            .add_column("p", ColumnKind::Decimal64, data)
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap_err();
+        assert_eq!(err.code(), crate::egress::ErrorCode::ProtocolError);
     }
 
     #[test]
