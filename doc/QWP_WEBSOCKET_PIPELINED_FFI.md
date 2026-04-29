@@ -750,6 +750,13 @@ Do not add a Rust-only dead-letter file subsystem in v1. Match Java's model:
 - drop-and-continue only for the Java-compatible categories,
 - latch terminal categories so the next producer call reports the error.
 
+The Java client has no client-owned dead-letter file format for rejected
+batches. Its drop-and-continue path advances the acknowledged FSN so the
+existing Store-and-Forward trim path can forget the rejected bytes, and it
+delivers a structured `SenderError` to user code. Java's `.corrupt` files are a
+different mechanism: recovery quarantine for damaged `.sfa` segment files, not
+dead-letter storage for server-rejected batches.
+
 Users that need durable dead-letter storage can implement it in the error
 handler by joining the reported FSN span to their own producer-side log. The
 client should not create dead-letter files or expose a rejection-policy knob

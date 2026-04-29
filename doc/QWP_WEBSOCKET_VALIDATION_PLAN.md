@@ -491,6 +491,10 @@ durable evidence that earlier frames were acknowledged is that fully ACKed seale
 segments may have been removed. If a crash happens before trim, retained frames
 may replay again. That is the Java-compatible at-least-once model.
 
+Do not confuse Java's `.corrupt` recovery quarantine with dead-letter storage.
+`.corrupt` files preserve damaged segment files for postmortem recovery; they
+are not created for server-rejected batches.
+
 Validation target:
 
 - Durability mode is orthogonal to public API semantics.
@@ -504,6 +508,9 @@ Validation target:
 - Torn-tail recovery matches Java: stop at the first invalid frame and append
   from that offset.
 - ACK/drop-and-continue rejection leaves no Rust-only completion marker on disk.
+- DROP_AND_CONTINUE does not create client-owned dead-letter files; the
+  observable artifact is the structured rejection event/error plus normal
+  ACK-driven segment trim.
 
 Design pressure to watch:
 
@@ -546,6 +553,10 @@ Validation target:
 - Terminal failures are surfaced to the caller.
 - Java-compatible drop-and-continue server rejections are reported with raw
   status/message and affected FSN instead of being silently lost.
+- Drop-and-continue has Java's dead-letter boundary: the client reports the
+  structured rejection and does not persist a rejected-batch file. Users that
+  need durable dead letters implement them in their error handler or producer
+  log.
 - A deterministic bad frame does not brick the sender forever.
 - `receipt_status`, `wait`, and event polling agree.
 

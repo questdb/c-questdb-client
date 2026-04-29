@@ -8,8 +8,9 @@ This is no longer only a design discussion. Steps 1-11 are validated by docs,
 Rust prototypes, real-server probes, and C ABI shape stubs. Step 12 now has a
 first Rust-only blocking WS/WSS transport adapter and a Rust-only publication
 shell behind the manual driver seam. The publication path has passed real
-QuestDB submit/wait and reconnect/replay e2e probes, but the new pipelined
-Store-and-Forward core is not wired into the public product API or C ABI yet.
+QuestDB submit/wait, reconnect/replay, and Java-compatible `.sfa` recovery e2e
+probes, but the new pipelined Store-and-Forward core is not wired into the
+public product API or C ABI yet.
 
 Do not read this as production readiness. The existing `qwpws` sync/async sender
 paths still exist separately. The new pipelined/SF sender core is being built
@@ -38,6 +39,8 @@ behind prototypes before product API integration.
 - `questdb-rs/src/ingress/sender/qwp_ws_queue.rs` - volatile queue prototype.
 - `questdb-rs/src/ingress/sender/qwp_ws_sfa_segment.rs` - Java-compatible
   `.sfa` segment codec spike.
+- `questdb-rs/src/ingress/sender/qwp_ws_sfa_queue.rs` - Java-compatible
+  `.sfa` queue adapter behind the manual driver seam.
 - `questdb-rs/src/ingress/sender/qwp_ws_sf_queue.rs` - retired Rust-only
   file-backed SF queue prototype, now compiled only for tests and no longer
   wired into the driver seam.
@@ -68,14 +71,14 @@ Current branch:
 ia_qwp_ws
 ```
 
-Most recent committed checkpoint before the reconnect-probe slice:
+Most recent committed checkpoint:
 
 ```text
-7b9ca2e Add QWP WebSocket publication shell and e2e probe
+6a49e5c Add QWP WebSocket SFA recovery probe
 ```
 
-Recent validation after the Step 12 publication-shell and reconnect-probe
-slices:
+Recent validation after the Step 12 publication-shell, reconnect-probe, and
+`.sfa` recovery slices:
 
 ```bash
 cargo test --manifest-path questdb-rs/Cargo.toml qwp_ws_driver
@@ -95,6 +98,12 @@ QDB_QWP_WS_RECONNECT_PROBE=1 \
     cargo test --manifest-path questdb-rs/Cargo.toml \
     qwp_ws_publication_driver_reconnect_replays_only_unacked_rows \
     -- --ignored --nocapture
+cargo test --manifest-path questdb-rs/Cargo.toml --lib qwp_ws_sfa
+QDB_QWP_WS_SFA_PROBE=1 \
+    cargo test --manifest-path questdb-rs/Cargo.toml --lib \
+    qwp_ws_sfa_recovered_frame_is_delivered_and_cleaned_up \
+    -- --ignored --nocapture
+cargo test --manifest-path questdb-rs/Cargo.toml --lib
 cargo fmt --manifest-path questdb-rs/Cargo.toml --check
 git diff --check
 ```
@@ -108,6 +117,9 @@ minimal _sender-qwp-ws driver filter: 43 passed, with existing unused-code warni
 qwp_ws_async with async-sender-qwp-ws: 8 passed
 real QuestDB publication probe: 1 passed
 real QuestDB reconnect probe: 1 passed
+qwp_ws_sfa: 22 passed, 3 ignored
+real QuestDB .sfa recovery probe: 1 passed
+cargo test --lib: 475 passed, 10 ignored
 format and whitespace checks passed
 ```
 
@@ -227,8 +239,8 @@ After process recovery, retained frames are `Published`; replay rebuilds
 connection-local state from scratch. Previous receipt handles and runtime
 ACK/rejection status are gone.
 
-`questdb-rs/src/ingress/sender/qwp_ws_sfa_segment.rs` is the first product-format
-spike. It currently validates:
+`questdb-rs/src/ingress/sender/qwp_ws_sfa_segment.rs` is the product-format
+segment codec spike. It currently validates:
 
 - Java `SF01` header bytes,
 - Java frame envelope `[crc32c][payloadLen][payload]`,
@@ -244,10 +256,25 @@ Normal Rust tests use committed hex fixtures under
 `questdb-rs/src/tests/interop/qwp-ws-sfa/`. The ignored cross-client fixture is
 the regeneration/proof tool for those bytes.
 
-It does not yet implement slot locking, segment-ring recovery, rotation,
-ACK-driven trim, or a non-ignored CI fixture. The cross-client fixture compiles
-a small Java helper into `/tmp` and uses the local Java client checkout from
-`QDB_JAVA_CLIENT_CORE` or
+`questdb-rs/src/ingress/sender/qwp_ws_sfa_queue.rs` is the Java-compatible
+queue adapter behind the manual driver seam. It currently validates:
+
+- open/create of Java-compatible `.sfa` segments,
+- frame publication only after durable append succeeds,
+- restart recovery as `Published` frames,
+- replay from the oldest retained FSN with zero-based wire sequence,
+- segment rotation and recovery in FSN order,
+- ACK-driven trimming of fully ACKed sealed segments,
+- clean close removing fully drained `.sfa` files,
+- close timeout retaining recoverable frames,
+- manual-driver replay of recovered `.sfa` frames,
+- real QuestDB replay of a recovered `.sfa` frame through
+  `BlockingQwpWsTransport`.
+
+It does not yet implement product slot layout, slot locking, `sf_dir` /
+`sender_id` config wiring, orphan draining, or a non-ignored CI fixture. The
+cross-client fixture compiles a small Java helper into `/tmp` and uses the local
+Java client checkout from `QDB_JAVA_CLIENT_CORE` or
 `/home/jara/devel/oss/questdb-arrays/java-questdb-client/core`.
 
 ### Manual driver and transport seam
@@ -415,12 +442,11 @@ conversion before the real driver is wired through.
   `Rejected` naming before ABI hardening.
 - No C++ or Python wrapper implementation has been added for the new QWP/WS
   shape.
-- Java-compatible product SF queue integration is missing. The retired Rust-only
-  journal prototype is no longer wired into the driver seam. The remaining
-  product work is `.sfa` segment files, Java header/frame CRC layout, slot
-  locking, segment rotation, ACK-driven trim, cross-client recovery, and
-  Java-compatible `sf_durability` parse-and-fail behavior for reserved
-  `flush`/`append` modes.
+- Java-compatible `.sfa` queue integration exists behind the manual driver seam,
+  but product slot wiring is missing. The remaining product work is
+  `<sf_dir>/<sender_id>/` layout, slot locking, config parsing, public core
+  integration, orphan draining, and Java-compatible `sf_durability`
+  parse-and-fail behavior for reserved `flush`/`append` modes.
 - Cross-client `.sfa` golden fixture is present but ignored by default because it
   depends on the local Java client checkout, `javac`, and Maven classpath
   discovery.
@@ -430,8 +456,14 @@ conversion before the real driver is wired through.
   yet proven by a real-server probe.
 - Auth/upgrade rejection and ambiguous operational write/internal errors still
   need taxonomy validation.
-- The real transport adapter and publication shell have real QuestDB submit/wait
-  and reconnect replay probes, but not yet Java-compatible `.sfa` durability.
+- The real transport adapter and publication shell have real QuestDB submit/wait,
+  reconnect replay, and recovered `.sfa` replay probes, but not yet product
+  config or public API wiring.
+- Java has no client-owned dead-letter file format for rejected batches. Rust v1
+  should not add one. Java's `.corrupt` files are recovery quarantine for
+  damaged `.sfa` segments, not server-rejection dead letters; rejected batches
+  are reported through structured errors/events and forgotten via the normal
+  ACK/trim path.
 - The v1 dense dictionary replay shape is correctness-first and can be expensive
   for long-running high-cardinality symbol workloads.
 - Reserved-but-unused symbol IDs from failed submit attempts are acceptable in
@@ -441,33 +473,33 @@ conversion before the real driver is wired through.
 
 ## Recommended next step
 
-Move to Java-compatible `.sfa` Store-and-Forward integration, but keep it narrow.
+Move to the product slot/config boundary, but keep it narrow.
 
-The volatile publication path and reconnect behavior are now proven against real
-QuestDB. The next slice should connect the publication shell to the
-Java-compatible segment-ring queue rather than adding public API, FFI, threaded
-adapters, or extending the old custom SF journal.
+The Java-compatible `.sfa` queue now fits the publication/driver seam and has a
+real QuestDB recovery probe. The next slice should make the queue open like the
+product will open it, rather than adding FFI, threaded adapters, or wrapper
+APIs.
 
 Suggested slice:
 
-1. Implement the smallest `ManualDriverQueue` adapter over the Java-compatible
-   `.sfa` segment files: open/create slot, append full frame envelopes, recover
-   retained frames, expose replay from the oldest retained FSN.
-2. Keep durable state Java-compatible: retained segment files and frame payloads
-   only. Do not add Rust-only ACK, rejection, receipt, wire-sequence, or in-flight
-   records.
-3. Add behavior tests for restart/recovery and replay order using the committed
-   `.sfa` fixtures where possible.
-4. Add one ignored real-server probe after the adapter exists: publish through
-   `.sfa`, simulate process recovery or reopen, replay unresolved frames through
-   `BlockingQwpWsTransport`, and verify rows are queryable.
-5. Keep public API and C ABI wiring deferred until the `.sfa` queue proves it
-   fits the existing publication/driver seam.
+1. Add the smallest product slot wrapper over `SfaFrameQueue`: derive
+   `<sf_dir>/<sender_id>/`, create the slot directory, and keep `sf_dir` as the
+   only Store-and-Forward on-switch.
+2. Add Java-compatible exclusive slot locking and behavior tests for
+   same-slot contention.
+3. Add config parsing/validation for `sf_dir`, `sender_id`, `sf_max_bytes`,
+   `sf_max_total_bytes`, and `sf_durability`, including parse-and-fail behavior
+   for reserved `flush`/`append` values.
+4. Preserve the simple durable model: `.sfa` segment files and QWP payload bytes
+   only. Do not add Rust-only ACK, rejection, receipt, wire-sequence, in-flight,
+   or dead-letter records.
+5. Re-run the `.sfa` recovery real-server probe through the product slot wrapper
+   before wiring public API or C ABI.
 
-Do not start with threaded adapters, C++/Python wrappers, SF compaction, or
-performance optimization. The main de-risking question is now whether
-Java-compatible disk storage fits the current publication/driver seam without
-public API changes.
+Do not start with threaded adapters, C++/Python wrappers, orphan draining, SF
+compaction, or performance optimization. The main de-risking question is now
+whether Java-compatible slot ownership and config fit the current manual core
+without public API changes.
 
 ## Commands worth re-running
 
@@ -517,6 +549,11 @@ env QDB_QWP_WS_PUBLICATION_PROBE=1 \
 env QDB_QWP_WS_RECONNECT_PROBE=1 \
     cargo test --manifest-path questdb-rs/Cargo.toml \
     qwp_ws_publication_driver_reconnect_replays_only_unacked_rows \
+    -- --ignored --nocapture
+
+env QDB_QWP_WS_SFA_PROBE=1 \
+    cargo test --manifest-path questdb-rs/Cargo.toml --lib \
+    qwp_ws_sfa_recovered_frame_is_delivered_and_cleaned_up \
     -- --ignored --nocapture
 ```
 
