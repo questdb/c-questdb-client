@@ -74,7 +74,7 @@ ia_qwp_ws
 Most recent committed checkpoint:
 
 ```text
-6a49e5c Add QWP WebSocket SFA recovery probe
+e9ad30d Add QWP WebSocket SFA slot ownership
 ```
 
 Recent validation after the Step 12 publication-shell, reconnect-probe, and
@@ -121,6 +121,24 @@ qwp_ws_sfa: 22 passed, 3 ignored
 real QuestDB .sfa recovery probe: 1 passed
 cargo test --lib: 475 passed, 10 ignored
 format and whitespace checks passed
+```
+
+Latest config-boundary validation:
+
+```bash
+cargo test --manifest-path questdb-rs/Cargo.toml qwpws_store_and_forward --lib
+cargo test --manifest-path questdb-rs/Cargo.toml qwp_ws --lib
+cargo test --manifest-path questdb-rs/Cargo.toml \
+    --features async-sender-qwp-ws \
+    qwpws_store_and_forward --lib
+```
+
+Observed result:
+
+```text
+qwpws_store_and_forward: 5 passed
+qwp_ws: 142 passed, 8 ignored
+qwpws_store_and_forward with async-sender-qwp-ws: 5 passed
 ```
 
 The ignored tests are real-server probes gated by environment variables.
@@ -276,9 +294,17 @@ above that queue. It currently validates Java-compatible
 `<sf_dir>/<sender_id>/` layout and exclusive `<slot>/.lock` ownership, including
 same-slot contention and distinct-slot coexistence.
 
-It does not yet implement `sf_dir` / `sender_id` config wiring, orphan draining,
-or a non-ignored CI fixture. The cross-client fixture compiles a small Java
-helper into `/tmp` and uses the local Java client checkout from
+`SenderBuilder::from_conf` now parses and validates the Java-compatible SF
+config keys: `sf_dir`, `sender_id`, `sf_max_bytes`, `sf_max_total_bytes`, and
+`sf_durability`. The size parser mirrors Java's `k` / `m` / `g` / `t` suffixes,
+case-insensitive units, and optional trailing `b`. The public sync/async sender
+still rejects SF runtime knobs before connecting because that product path is
+not yet wired to the new pipelined queue/driver core; this prevents silently
+accepting config that would be ignored.
+
+It does not yet implement orphan draining or a non-ignored CI fixture. The
+cross-client fixture compiles a small Java helper into `/tmp` and uses the local
+Java client checkout from
 `QDB_JAVA_CLIENT_CORE` or
 `/home/jara/devel/oss/questdb-arrays/java-questdb-client/core`.
 
@@ -449,9 +475,10 @@ conversion before the real driver is wired through.
   shape.
 - Java-compatible `.sfa` queue integration exists behind the manual driver seam,
   and the product slot wrapper now derives `<sf_dir>/<sender_id>/` and holds the
-  Java-compatible `.lock`. The remaining product work is config parsing, public
-  core integration, orphan draining, and Java-compatible `sf_durability`
-  parse-and-fail behavior for reserved `flush`/`append` modes.
+  Java-compatible `.lock`. Config parsing now exists, including Java-compatible
+  `sf_durability` parse-and-fail behavior for reserved `flush`/`append` modes.
+  The remaining product work is public core integration, config-derived queue
+  selection, orphan draining, and FFI/API exposure.
 - Cross-client `.sfa` golden fixture is present but ignored by default because it
   depends on the local Java client checkout, `javac`, and Maven classpath
   discovery.
@@ -478,33 +505,29 @@ conversion before the real driver is wired through.
 
 ## Recommended next step
 
-Move from the product slot wrapper to the product config boundary, but keep it
-narrow.
+Move from validated product config to config-derived queue selection, but keep
+that slice internal to the new manual core.
 
-The Java-compatible `.sfa` queue now fits the publication/driver seam and has a
-real QuestDB recovery probe through the slot wrapper. The next slice should make
-the product config open that path, rather than adding FFI, threaded adapters, or
-wrapper APIs.
+The public sync/async sender still uses the older QWP/WebSocket path. Do not
+make `sf_dir` work there by special-casing storage into the old path, and do not
+let it silently no-op. The next useful slice is to let the new publication
+driver choose its queue from `QwpWsConfig`:
 
-Suggested slice:
-
-1. Add config parsing/validation for `sf_dir`, `sender_id`, `sf_max_bytes`,
-   `sf_max_total_bytes`, and `sf_durability`, including parse-and-fail behavior
-   for reserved `flush`/`append` values.
-2. Wire `sf_dir` presence to `SfaSlotQueue` as the only Store-and-Forward
-   on-switch; leave `sf_dir` unset on the current memory-backed path.
-3. Preserve the simple durable model: `.sfa` segment files and QWP payload bytes
-   only. Do not add Rust-only ACK, rejection, receipt, wire-sequence, in-flight,
-   or dead-letter records.
-4. Add behavior tests for config-derived same-slot contention and distinct
-   sender IDs.
-5. Re-run the `.sfa` recovery real-server probe through the config-derived slot
+1. Add a small internal queue factory for the manual core: `sf_dir` unset opens
+   the existing memory queue; `sf_dir` set opens `SfaSlotQueue` under
+   `<sf_dir>/<sender_id>/`.
+2. Preserve Java's simple durable model: `.sfa` segment files and QWP payload
+   bytes only. Do not add Rust-only ACK, rejection, receipt, wire-sequence,
+   in-flight, or dead-letter records.
+3. Add behavior tests for config-derived same-slot contention, distinct sender
+   IDs, and memory-vs-SF mode selection.
+4. Re-run the `.sfa` recovery real-server probe through the config-derived slot
    path before wiring public API or C ABI.
 
 Do not start with threaded adapters, C++/Python wrappers, orphan draining, SF
 compaction, or performance optimization. The main de-risking question is now
-whether Java-compatible config fits the current manual core without public API
-changes.
+whether Java-compatible config can drive the new manual core without widening
+the public API.
 
 ## Commands worth re-running
 

@@ -1201,6 +1201,13 @@ Candidate config keys:
 | `drain_orphans` | `false` | Adopt sibling SF slots on startup. |
 | `max_background_drainers` | 4 | Cap concurrent orphan drainers. |
 
+Rust currently parses and validates the Java-compatible `sf_*` / `sender_id`
+config keys, including Java's size suffixes (`k`, `m`, `g`, `t` with optional
+trailing `b`) and reserved `sf_durability=flush|append` values. Until the
+public sender is moved onto the new pipelined queue/driver core, SF runtime
+knobs such as `sf_dir` and `sf_max_bytes` must fail before connecting rather
+than being silently ignored.
+
 ## First implementation slice
 
 1. Add the Java-style self-sufficient replay encoder path and tests proving a later frame replays alone on a fresh connection.

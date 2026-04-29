@@ -24,6 +24,8 @@
 
 use crate::{Error, ErrorCode, Result};
 use std::ops::Deref;
+#[cfg(feature = "_sender-qwp-ws")]
+use std::path::PathBuf;
 
 /// Wraps a SenderBuilder config setting with the intent of tracking
 /// whether the value was user-specified or defaulted.
@@ -59,6 +61,10 @@ impl<T: PartialEq> ConfigSetting<T> {
                 format!("{setting_name:?} is already specified"),
             )),
         }
+    }
+
+    pub(crate) fn is_specified(&self) -> bool {
+        matches!(self, ConfigSetting::Specified(_))
     }
 }
 
@@ -112,6 +118,38 @@ impl Default for QwpUdpConfig {
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
+pub(crate) const QWP_WS_DEFAULT_SENDER_ID: &str = "default";
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) const QWP_WS_DEFAULT_SF_SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
+
+#[cfg(feature = "_sender-qwp-ws")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SfDurability {
+    Memory,
+    Flush,
+    Append,
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+impl SfDurability {
+    pub(crate) fn as_conf_value(self) -> &'static str {
+        match self {
+            Self::Memory => "memory",
+            Self::Flush => "flush",
+            Self::Append => "append",
+        }
+    }
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) fn is_valid_qwp_ws_sender_id(sender_id: &str) -> bool {
+    !sender_id.is_empty()
+        && sender_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
 #[derive(Debug, Clone)]
 pub(crate) struct QwpWsConfig {
     pub(crate) connect_timeout: ConfigSetting<std::time::Duration>,
@@ -137,6 +175,11 @@ pub(crate) struct QwpWsConfig {
     /// Total wall-clock budget for the reconnect loop; once exceeded the
     /// failover gives up even if attempts remain.
     pub(crate) failover_total_budget: ConfigSetting<std::time::Duration>,
+    pub(crate) sf_dir: ConfigSetting<Option<PathBuf>>,
+    pub(crate) sender_id: ConfigSetting<String>,
+    pub(crate) sf_max_bytes: ConfigSetting<u64>,
+    pub(crate) sf_max_total_bytes: ConfigSetting<Option<u64>>,
+    pub(crate) sf_durability: ConfigSetting<SfDurability>,
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -156,7 +199,21 @@ impl Default for QwpWsConfig {
             )),
             failover_max_backoff: ConfigSetting::new_default(std::time::Duration::from_secs(5)),
             failover_total_budget: ConfigSetting::new_default(std::time::Duration::from_secs(30)),
+            sf_dir: ConfigSetting::new_default(None),
+            sender_id: ConfigSetting::new_default(QWP_WS_DEFAULT_SENDER_ID.to_owned()),
+            sf_max_bytes: ConfigSetting::new_default(QWP_WS_DEFAULT_SF_SEGMENT_BYTES),
+            sf_max_total_bytes: ConfigSetting::new_default(None),
+            sf_durability: ConfigSetting::new_default(SfDurability::Memory),
         }
+    }
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+impl QwpWsConfig {
+    pub(crate) fn sf_requires_public_sender_wiring(&self) -> bool {
+        self.sf_dir.is_some()
+            || self.sf_max_bytes.is_specified()
+            || self.sf_max_total_bytes.is_specified()
     }
 }
 

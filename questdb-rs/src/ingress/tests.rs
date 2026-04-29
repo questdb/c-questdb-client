@@ -118,6 +118,106 @@ fn qwpudp_sender_reports_transport_protocol() {
     assert_eq!(sender.protocol(), Protocol::QwpUdp);
 }
 
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpws_store_and_forward_config_parses_java_keys() {
+    let builder = SenderBuilder::from_conf(
+        "qwpws::addr=localhost:9000;\
+         sf_dir=/tmp/qdb-rust-sf;\
+         sender_id=primary-1;\
+         sf_max_bytes=64mb;\
+         sf_max_total_bytes=4G;\
+         sf_durability=memory;",
+    )
+    .unwrap();
+
+    assert_eq!(builder.protocol, Protocol::QwpWs);
+    let qwp_ws = builder.qwp_ws.as_ref().unwrap();
+    assert_specified_eq(&qwp_ws.sf_dir, Some(PathBuf::from("/tmp/qdb-rust-sf")));
+    assert_specified_eq(&qwp_ws.sender_id, "primary-1".to_owned());
+    assert_specified_eq(&qwp_ws.sf_max_bytes, 64 * 1024 * 1024_u64);
+    assert_specified_eq(&qwp_ws.sf_max_total_bytes, Some(4 * 1024 * 1024 * 1024_u64));
+    assert_specified_eq(&qwp_ws.sf_durability, conf::SfDurability::Memory);
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpws_store_and_forward_defaults_match_java() {
+    let builder = SenderBuilder::from_conf("qwpws::addr=localhost:9000;").unwrap();
+    let qwp_ws = builder.qwp_ws.as_ref().unwrap();
+
+    assert_defaulted_eq(&qwp_ws.sender_id, "default".to_owned());
+    assert_defaulted_eq(&qwp_ws.sf_max_bytes, 4 * 1024 * 1024_u64);
+    assert_defaulted_eq(&qwp_ws.sf_max_total_bytes, None);
+    assert_defaulted_eq(&qwp_ws.sf_durability, conf::SfDurability::Memory);
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpws_store_and_forward_size_suffixes_match_java_config_surface() {
+    for (input, expected) in [
+        ("64k", 64 * 1024_u64),
+        ("64KB", 64 * 1024_u64),
+        ("64m", 64 * 1024 * 1024_u64),
+        ("4g", 4 * 1024 * 1024 * 1024_u64),
+        ("1T", 1024_u64 * 1024 * 1024 * 1024),
+    ] {
+        let conf = format!("qwpws::addr=localhost:9000;sf_max_bytes={input};");
+        let builder = SenderBuilder::from_conf(conf).unwrap();
+        let qwp_ws = builder.qwp_ws.as_ref().unwrap();
+        assert_specified_eq(&qwp_ws.sf_max_bytes, expected);
+    }
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpws_store_and_forward_config_rejects_invalid_java_keys() {
+    assert_conf_err(
+        SenderBuilder::from_conf("qwpws::addr=localhost:9000;sender_id=bad/id;"),
+        "invalid sender_id [value=bad/id, allowed-chars=[A-Za-z0-9_-]]",
+    );
+    assert_conf_err(
+        SenderBuilder::from_conf("qwpws::addr=localhost:9000;sf_max_bytes=64mi;"),
+        "invalid sf_max_bytes [value=64mi]",
+    );
+    assert_conf_err(
+        SenderBuilder::from_conf("qwpws::addr=localhost:9000;sf_durability=sync;"),
+        "invalid sf_durability [value=sync, allowed-values=[memory, flush, append]]",
+    );
+}
+
+#[cfg(all(feature = "sync-sender-qwp-ws", feature = "sync-sender-tcp"))]
+#[test]
+fn qwpws_store_and_forward_config_is_websocket_only() {
+    assert_conf_err(
+        SenderBuilder::from_conf("tcp::addr=localhost:9009;sf_dir=/tmp/qdb-rust-sf;"),
+        "The \"sf_dir\" setting is only supported for QWP/WebSocket.",
+    );
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpws_store_and_forward_config_is_not_silently_ignored_by_public_sender() {
+    assert_conf_err(
+        SenderBuilder::from_conf("qwpws::addr=127.0.0.1:1;sf_dir=/tmp/qdb-rust-sf;")
+            .unwrap()
+            .build(),
+        "QWP/WebSocket Store-and-Forward config is parsed and validated, but this public sender path is not wired to the Store-and-Forward queue yet.",
+    );
+    assert_conf_err(
+        SenderBuilder::from_conf("qwpws::addr=127.0.0.1:1;sf_durability=flush;")
+            .unwrap()
+            .build(),
+        "sf_durability=flush is not yet supported (deferred follow-up; use sf_durability=memory)",
+    );
+    assert_conf_err(
+        SenderBuilder::from_conf("qwpws::addr=127.0.0.1:1;sf_durability=append;")
+            .unwrap()
+            .build(),
+        "sf_durability=append is not yet supported (deferred follow-up; use sf_durability=memory)",
+    );
+}
+
 #[cfg(feature = "sync-sender-tcp")]
 #[test]
 fn invalid_value() {

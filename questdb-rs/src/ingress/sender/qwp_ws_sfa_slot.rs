@@ -45,8 +45,9 @@ use std::os::fd::AsRawFd;
 use super::qwp_ws_driver::{DriverError, ManualDriverQueue};
 use super::qwp_ws_queue::{OutboundFrame, QwpReceipt, QwpReceiptStatus, SentFrame};
 use super::qwp_ws_sfa_queue::{SfaFrameQueue, SfaQueueError, SfaQueueOptions};
+use crate::ingress::conf::{QWP_WS_DEFAULT_SENDER_ID, is_valid_qwp_ws_sender_id};
 
-pub(crate) const DEFAULT_SENDER_ID: &str = "default";
+pub(crate) const DEFAULT_SENDER_ID: &str = QWP_WS_DEFAULT_SENDER_ID;
 const LOCK_FILE_NAME: &str = ".lock";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,11 +202,7 @@ fn validate_slot_dir(slot_dir: &Path) -> Result<(), SfaQueueError> {
 }
 
 fn validate_sender_id(sender_id: &str) -> Result<(), SfaQueueError> {
-    if sender_id.is_empty()
-        || !sender_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-    {
+    if !is_valid_qwp_ws_sender_id(sender_id) {
         return Err(SfaQueueError::InvalidSenderId {
             sender_id: sender_id.to_owned(),
         });

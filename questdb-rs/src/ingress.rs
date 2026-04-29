@@ -545,6 +545,22 @@ impl SenderBuilder {
                 #[cfg(feature = "_sender-qwp-ws")]
                 "max_in_flight" => builder.max_in_flight(parse_conf_value(key, val)?)?,
                 #[cfg(feature = "_sender-qwp-ws")]
+                "sf_dir" => builder.store_and_forward_dir(PathBuf::from(val))?,
+                #[cfg(feature = "_sender-qwp-ws")]
+                "sender_id" => builder.sender_id(val)?,
+                #[cfg(feature = "_sender-qwp-ws")]
+                "sf_max_bytes" => {
+                    builder.store_and_forward_max_bytes(parse_size_conf_value(key, val)?)?
+                }
+                #[cfg(feature = "_sender-qwp-ws")]
+                "sf_max_total_bytes" => {
+                    builder.store_and_forward_max_total_bytes(parse_size_conf_value(key, val)?)?
+                }
+                #[cfg(feature = "_sender-qwp-ws")]
+                "sf_durability" => {
+                    builder.store_and_forward_durability(parse_sf_durability_value(val)?)?
+                }
+                #[cfg(feature = "_sender-qwp-ws")]
                 "failover" => {
                     let on = match val {
                         "on" => true,
@@ -1029,6 +1045,94 @@ impl SenderBuilder {
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
+    fn store_and_forward_dir(mut self, dir: PathBuf) -> Result<Self> {
+        if dir.as_os_str().is_empty() {
+            return Err(error::fmt!(ConfigError, "\"sf_dir\" cannot be empty."));
+        }
+        let Some(qwp_ws) = &mut self.qwp_ws else {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"sf_dir\" setting is only supported for QWP/WebSocket."
+            ));
+        };
+        qwp_ws.sf_dir.set_specified("sf_dir", Some(dir))?;
+        Ok(self)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn sender_id(mut self, sender_id: &str) -> Result<Self> {
+        let sender_id = validate_value(sender_id)?;
+        if !conf::is_valid_qwp_ws_sender_id(sender_id) {
+            return Err(error::fmt!(
+                ConfigError,
+                "invalid sender_id [value={sender_id}, allowed-chars=[A-Za-z0-9_-]]"
+            ));
+        }
+        let Some(qwp_ws) = &mut self.qwp_ws else {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"sender_id\" setting is only supported for QWP/WebSocket."
+            ));
+        };
+        qwp_ws
+            .sender_id
+            .set_specified("sender_id", sender_id.to_owned())?;
+        Ok(self)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn store_and_forward_max_bytes(mut self, value: u64) -> Result<Self> {
+        if value == 0 {
+            return Err(error::fmt!(
+                ConfigError,
+                "\"sf_max_bytes\" must be greater than 0."
+            ));
+        }
+        let Some(qwp_ws) = &mut self.qwp_ws else {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"sf_max_bytes\" setting is only supported for QWP/WebSocket."
+            ));
+        };
+        qwp_ws.sf_max_bytes.set_specified("sf_max_bytes", value)?;
+        Ok(self)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn store_and_forward_max_total_bytes(mut self, value: u64) -> Result<Self> {
+        if value == 0 {
+            return Err(error::fmt!(
+                ConfigError,
+                "\"sf_max_total_bytes\" must be greater than 0."
+            ));
+        }
+        let Some(qwp_ws) = &mut self.qwp_ws else {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"sf_max_total_bytes\" setting is only supported for QWP/WebSocket."
+            ));
+        };
+        qwp_ws
+            .sf_max_total_bytes
+            .set_specified("sf_max_total_bytes", Some(value))?;
+        Ok(self)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn store_and_forward_durability(mut self, durability: conf::SfDurability) -> Result<Self> {
+        let Some(qwp_ws) = &mut self.qwp_ws else {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"sf_durability\" setting is only supported for QWP/WebSocket."
+            ));
+        };
+        qwp_ws
+            .sf_durability
+            .set_specified("sf_durability", durability)?;
+        Ok(self)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
     /// Enable or disable transport-level failover (auto-reconnect + replay).
     /// Default `true`. When disabled, a transport error during flush latches
     /// a sticky terminal failure on the sender (the user must rebuild it).
@@ -1455,6 +1559,7 @@ impl SenderBuilder {
             .qwp_ws
             .as_ref()
             .ok_or_else(|| error::fmt!(ConfigError, "QWP/WebSocket configuration is missing."))?;
+        reject_unsupported_qwp_ws_sf_config(qwp_ws)?;
         connect_async_qwp_ws(
             self.host.as_str(),
             self.port.as_str(),
@@ -1600,6 +1705,7 @@ impl SenderBuilder {
                         "QWP/WebSocket configuration is missing."
                     ));
                 };
+                reject_unsupported_qwp_ws_sf_config(qwp_ws)?;
                 let basic_auth = match &auth {
                     Some(conf::AuthParams::Basic(b)) => Some(b.to_header_string()),
                     Some(conf::AuthParams::Token(t)) => Some(t.to_header_string()?),
@@ -1736,6 +1842,101 @@ where
             "Could not parse {param_name:?} to number: {e:?}"
         )
     })
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+fn parse_size_conf_value(param_name: &str, str_value: &str) -> Result<u64> {
+    let mut end = str_value.len();
+    if end == 0 {
+        return Err(error::fmt!(
+            ConfigError,
+            "invalid {param_name} [value={str_value}]"
+        ));
+    }
+
+    let bytes = str_value.as_bytes();
+    if matches!(bytes[end - 1], b'b' | b'B') {
+        end -= 1;
+    }
+
+    let multiplier = if end > 0 {
+        match bytes[end - 1] {
+            b'k' | b'K' => {
+                end -= 1;
+                1024
+            }
+            b'm' | b'M' => {
+                end -= 1;
+                1024 * 1024
+            }
+            b'g' | b'G' => {
+                end -= 1;
+                1024 * 1024 * 1024
+            }
+            b't' | b'T' => {
+                end -= 1;
+                1024_u64 * 1024 * 1024 * 1024
+            }
+            _ => 1,
+        }
+    } else {
+        1
+    };
+
+    if end == 0 {
+        return Err(error::fmt!(
+            ConfigError,
+            "invalid {param_name} [value={str_value}]"
+        ));
+    }
+
+    let digits = &str_value[..end];
+    let value = digits
+        .parse::<u64>()
+        .map_err(|_| error::fmt!(ConfigError, "invalid {param_name} [value={str_value}]"))?;
+    value.checked_mul(multiplier).ok_or_else(|| {
+        error::fmt!(
+            ConfigError,
+            "{param_name} overflows u64 [value={str_value}]"
+        )
+    })
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+fn parse_sf_durability_value(str_value: &str) -> Result<conf::SfDurability> {
+    if str_value.eq_ignore_ascii_case("memory") {
+        return Ok(conf::SfDurability::Memory);
+    }
+    if str_value.eq_ignore_ascii_case("flush") {
+        return Ok(conf::SfDurability::Flush);
+    }
+    if str_value.eq_ignore_ascii_case("append") {
+        return Ok(conf::SfDurability::Append);
+    }
+    Err(error::fmt!(
+        ConfigError,
+        "invalid sf_durability [value={str_value}, allowed-values=[memory, flush, append]]"
+    ))
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+fn reject_unsupported_qwp_ws_sf_config(qwp_ws: &conf::QwpWsConfig) -> Result<()> {
+    if *qwp_ws.sf_durability != conf::SfDurability::Memory {
+        let durability = qwp_ws.sf_durability.as_conf_value();
+        return Err(error::fmt!(
+            ConfigError,
+            "sf_durability={durability} is not yet supported (deferred follow-up; use sf_durability=memory)"
+        ));
+    }
+
+    if qwp_ws.sf_requires_public_sender_wiring() {
+        return Err(error::fmt!(
+            ConfigError,
+            "QWP/WebSocket Store-and-Forward config is parsed and validated, but this public sender path is not wired to the Store-and-Forward queue yet."
+        ));
+    }
+
+    Ok(())
 }
 
 #[cfg(feature = "_sender-tcp")]
