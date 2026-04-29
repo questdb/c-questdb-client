@@ -175,5 +175,9 @@ name = "qwp_egress_latency"
 required-features = ["sync-reader-ws"]
 
 [[example]]
+name = "qwp_egress_failover"
+required-features = ["sync-reader-ws"]
+
+[[example]]
 name = "qwp_egress_read_wide"
 required-features = ["sync-reader-ws", "sync-sender-http"]
