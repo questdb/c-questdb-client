@@ -195,6 +195,7 @@ impl<Q: ManualDriverQueue, T: ManualDriverTransport> ManualDriverPrototype<Q, T>
                         | QueueError::SequenceOverflow,
                     )
                     | DriverError::Transport(_)
+                    | DriverError::Storage(_)
                     | DriverError::SubmitTimedOut
                     | DriverError::Terminal
                     | DriverError::Closing
@@ -266,6 +267,7 @@ impl<Q: ManualDriverQueue, T: ManualDriverTransport> ManualDriverPrototype<Q, T>
                     | QueueError::SequenceOverflow,
                 )
                 | DriverError::Transport(_)
+                | DriverError::Storage(_)
                 | DriverError::SubmitTimedOut
                 | DriverError::Terminal
                 | DriverError::Closing
@@ -302,6 +304,7 @@ impl<Q: ManualDriverQueue, T: ManualDriverTransport> ManualDriverPrototype<Q, T>
                 return Ok(CloseOutcome::Terminal);
             }
             if self.all_published_receipts_resolved() {
+                self.queue.close()?;
                 return Ok(CloseOutcome::Drained);
             }
             if self.drive_once()? == DriveOutcome::Terminal {
@@ -312,6 +315,7 @@ impl<Q: ManualDriverQueue, T: ManualDriverTransport> ManualDriverPrototype<Q, T>
         if self.terminal {
             Ok(CloseOutcome::Terminal)
         } else if self.all_published_receipts_resolved() {
+            self.queue.close()?;
             Ok(CloseOutcome::Drained)
         } else {
             Ok(CloseOutcome::Timeout)
@@ -458,6 +462,9 @@ pub(crate) trait ManualDriverQueue {
     fn commit_sent(&mut self, frame: SentFrame) -> Result<(), DriverError>;
     fn ack_wire(&mut self, wire_seq: u64) -> Result<(), DriverError>;
     fn reject_wire(&mut self, wire_seq: u64) -> Result<QwpReceipt, DriverError>;
+    fn close(&mut self) -> Result<(), DriverError> {
+        Ok(())
+    }
     fn restart_connection(&mut self);
     fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus;
     fn published_fsn(&self) -> Option<u64>;
@@ -706,6 +713,7 @@ impl ManualDriverQueue for VolatileFrameQueue {
 pub(crate) enum DriverError {
     Queue(QueueError),
     Transport(Error),
+    Storage(Error),
     SubmitTimedOut,
     Terminal,
     Closing,
