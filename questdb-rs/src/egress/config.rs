@@ -120,12 +120,12 @@ pub struct Endpoint {
 impl Endpoint {
     /// Construct an endpoint from any string-like host and a port.
     ///
-    /// The host is taken verbatim — no DNS resolution, no
-    /// IPv6 bracket-stripping. Round-tripping through
-    /// [`Display`](std::fmt::Display) re-introduces brackets only
-    /// when the host already contains a `:` (so an IPv6 literal
-    /// formats as `[::1]:9000` while a hostname or IPv4 stays
-    /// `host:port`).
+    /// The host is taken verbatim — no DNS resolution. For IPv6
+    /// literals pass the bare address (`"::1"`), not the bracketed form
+    /// (`"[::1]"`); [`Display`](std::fmt::Display) re-introduces brackets
+    /// when formatting any host that contains `:`. The connect-string
+    /// parser strips brackets in the same way, so an `addr=[::1]:9000`
+    /// entry stores `host = "::1"`.
     pub fn new<S: Into<String>>(host: S, port: u16) -> Self {
         Endpoint {
             host: host.into(),
@@ -282,9 +282,42 @@ impl ReaderConfig {
             if entry.is_empty() {
                 return Err(fmt!(ConfigError, "Empty entry {} in \"addr\" list", i));
             }
-            let (host, port_str) = match entry.rsplit_once(':') {
-                Some((h, p)) => (h.to_string(), p.to_string()),
-                None => (entry.to_string(), default_port.to_string()),
+            // IPv6 literals must be bracketed per RFC 3986 §3.2.2 to
+            // disambiguate the authority's port colon from the address's
+            // own colons. Strip the brackets here so the canonical stored
+            // form is bare; `Endpoint::Display` re-introduces them when
+            // formatting any host that contains `:`. Without this the
+            // brackets get re-applied on top of the stored ones,
+            // producing `ws://[[::1]]:9000/...` and a URL parse error.
+            let (host, port_str) = if let Some(rest) = entry.strip_prefix('[') {
+                let close = rest.find(']').ok_or_else(|| {
+                    fmt!(
+                        ConfigError,
+                        "Bracketed addr entry {} missing closing ']': {:?}",
+                        i,
+                        entry
+                    )
+                })?;
+                let host = rest[..close].to_string();
+                let after = &rest[close + 1..];
+                let port_str = if after.is_empty() {
+                    default_port.to_string()
+                } else if let Some(p) = after.strip_prefix(':') {
+                    p.to_string()
+                } else {
+                    return Err(fmt!(
+                        ConfigError,
+                        "Unexpected characters after ']' in addr entry {}: {:?}",
+                        i,
+                        entry
+                    ));
+                };
+                (host, port_str)
+            } else {
+                match entry.rsplit_once(':') {
+                    Some((h, p)) => (h.to_string(), p.to_string()),
+                    None => (entry.to_string(), default_port.to_string()),
+                }
             };
             if host.is_empty() {
                 return Err(fmt!(
@@ -955,15 +988,49 @@ mod tests {
     fn endpoint_display_ipv6_brackets() {
         // IPv6 literals contain `:` and would otherwise produce an
         // ambiguous `host:port` collision. Bracketing follows
-        // RFC 3986 §3.2.2 (`IP-literal`). The connect-string parser
-        // doesn't currently accept IPv6 input, but `Endpoint::new`
-        // and FailoverEvent surfacing must still format losslessly
-        // for diagnostics.
+        // RFC 3986 §3.2.2 (`IP-literal`).
         assert_eq!(Endpoint::new("::1", 9000).to_string(), "[::1]:9000");
         assert_eq!(
             Endpoint::new("2001:db8::1", 443).to_string(),
             "[2001:db8::1]:443"
         );
+    }
+
+    #[test]
+    fn ipv6_addr_parses_with_explicit_port() {
+        let c = ReaderConfig::from_conf("qwp::addr=[::1]:9000").unwrap();
+        assert_eq!(c.addrs.len(), 1);
+        // Stored host is bare; brackets re-applied only by Display.
+        assert_eq!(c.addrs[0], Endpoint::new("::1", 9000));
+        assert_eq!(c.url_for(0), "ws://[::1]:9000/read/v1");
+    }
+
+    #[test]
+    fn ipv6_addr_default_port() {
+        let c = ReaderConfig::from_conf("qwp::addr=[2001:db8::1]").unwrap();
+        assert_eq!(c.addrs[0], Endpoint::new("2001:db8::1", 9000));
+        assert_eq!(c.url_for(0), "ws://[2001:db8::1]:9000/read/v1");
+    }
+
+    #[test]
+    fn ipv6_addr_in_multi_addr_list() {
+        let c = ReaderConfig::from_conf("qwp::addr=[::1]:9000,h2:9001,[2001:db8::5]").unwrap();
+        assert_eq!(c.addrs.len(), 3);
+        assert_eq!(c.addrs[0], Endpoint::new("::1", 9000));
+        assert_eq!(c.addrs[1], Endpoint::new("h2", 9001));
+        assert_eq!(c.addrs[2], Endpoint::new("2001:db8::5", 9000));
+    }
+
+    #[test]
+    fn ipv6_addr_missing_close_bracket_rejected() {
+        let err = ReaderConfig::from_conf("qwp::addr=[::1:9000").unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+    }
+
+    #[test]
+    fn ipv6_addr_garbage_after_bracket_rejected() {
+        let err = ReaderConfig::from_conf("qwp::addr=[::1]junk").unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
     }
 
     #[test]
