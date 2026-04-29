@@ -1491,9 +1491,7 @@ mod tests {
         let mut reg = SchemaRegistry::new();
         let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
         let view = batch.column_view(0, &dict).unwrap();
-        let ColumnView::Float(c) = view else {
-            panic!()
-        };
+        let ColumnView::Float(c) = view else { panic!() };
         assert_eq!(c.value(0), 1.5_f32);
         assert_eq!(c.value(1).to_bits(), 0u32);
         assert_eq!(c.value(2), 3.5_f32);
@@ -1550,9 +1548,7 @@ mod tests {
         let mut reg = SchemaRegistry::new();
         let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
         let view = batch.column_view(0, &dict).unwrap();
-        let ColumnView::Short(c) = view else {
-            panic!()
-        };
+        let ColumnView::Short(c) = view else { panic!() };
         assert_eq!(c.value(0), -1);
         assert_eq!(c.value(1), -2);
         assert_eq!(c.value(2), 0); // densified zero
@@ -1816,14 +1812,11 @@ mod tests {
             };
             let mut data = vec![0x00u8, 0xFF]; // null_flag=0, scale=-1
             data.extend(std::iter::repeat_n(0u8, width)); // 1 row of zeros
-            let (flags_byte, payload) = BatchBuilder::new(1)
-                .add_column("p", kind, data)
-                .build();
+            let (flags_byte, payload) = BatchBuilder::new(1).add_column("p", kind, data).build();
 
             let mut dict = SymbolDict::new();
             let mut reg = SchemaRegistry::new();
-            let err =
-                decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap_err();
+            let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap_err();
             assert_eq!(err.code(), crate::egress::ErrorCode::ProtocolError);
             assert!(
                 err.msg().contains("decimal scale"),
