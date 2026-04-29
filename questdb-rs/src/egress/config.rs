@@ -42,7 +42,11 @@
 //! | `max_batch_rows`   | sent only when non-zero (`0` = server default)           |
 //! | `client_id`        | optional; sent only when set                             |
 //! | `durable_ack`      | `true`/`false` (`false`)                                 |
-//! | `target`           | `any`/`primary`/`replica` (Phase 1: parsed but unused)   |
+//! | `target`           | `any`/`primary`/`replica` (default `any`)                |
+//! | `failover`         | `true`/`false` — mid-query reconnect on transport failure (`true`) |
+//! | `failover_max_attempts`        | retry attempts after a transport failure (`8`, must be `>= 1`); ignored when `failover=off` |
+//! | `failover_backoff_initial_ms`  | initial backoff between attempts (`50`); ignored when `failover=off` |
+//! | `failover_backoff_max_ms`      | max backoff between attempts (`1000`); ignored when `failover=off` |
 //! | `username`         | basic auth                                               |
 //! | `password`         | basic auth                                               |
 //! | `token`            | bearer / OIDC                                            |
@@ -89,13 +93,96 @@ impl Compression {
     }
 }
 
-/// Server-routing target hint (negotiation only — no failover yet).
+/// Server-routing target hint. Drives both connect-time endpoint walking
+/// and mid-query failover endpoint selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target {
     Any,
     Primary,
     Replica,
 }
+
+/// A `host:port` endpoint as parsed from a connect string. Used in
+/// the [`ReaderConfig::addrs`] list and surfaced to user code via
+/// [`crate::egress::FailoverEvent`] and [`crate::egress::Reader::current_addr`].
+///
+/// Named struct (rather than a `(String, u16)` tuple) so callers can
+/// write `ev.failed_addr.host` / `ep.port` instead of the opaque `.0`
+/// / `.1` accessors. Cheap to clone (small `String` plus `u16`); the
+/// few hot paths that build many of these per failover go through
+/// the underlying `Vec<Endpoint>` directly to avoid extra clones.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Endpoint {
+    pub host: String,
+    pub port: u16,
+}
+
+impl Endpoint {
+    /// Construct an endpoint from any string-like host and a port.
+    ///
+    /// The host is taken verbatim — no DNS resolution, no
+    /// IPv6 bracket-stripping. Round-tripping through
+    /// [`Display`](std::fmt::Display) re-introduces brackets only
+    /// when the host already contains a `:` (so an IPv6 literal
+    /// formats as `[::1]:9000` while a hostname or IPv4 stays
+    /// `host:port`).
+    pub fn new<S: Into<String>>(host: S, port: u16) -> Self {
+        Endpoint {
+            host: host.into(),
+            port,
+        }
+    }
+}
+
+/// Format as `host:port`. Hosts that contain a `:` (IPv6 literals)
+/// are bracketed — `[::1]:9000` — so the output round-trips
+/// unambiguously through the standard authority-component grammar
+/// (RFC 3986 §3.2.2). Hostnames, IPv4 literals, and any host without
+/// a colon format unbracketed for the common case.
+impl std::fmt::Display for Endpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.host.contains(':') {
+            write!(f, "[{}]:{}", self.host, self.port)
+        } else {
+            write!(f, "{}:{}", self.host, self.port)
+        }
+    }
+}
+
+/// Default failover knobs. Match the Java `QwpQueryClient` reference
+/// (`DEFAULT_FAILOVER_*` constants) so connect strings behave the same
+/// in either client.
+pub const DEFAULT_FAILOVER_ENABLED: bool = true;
+pub const DEFAULT_FAILOVER_MAX_ATTEMPTS: u32 = 8;
+pub const DEFAULT_FAILOVER_BACKOFF_INITIAL_MS: u64 = 50;
+pub const DEFAULT_FAILOVER_BACKOFF_MAX_MS: u64 = 1_000;
+
+/// Hard upper bound on `failover_max_attempts`. Defensive: at the
+/// minute-scale this is far past where extending the retry budget
+/// stops being useful, and combined with [`MAX_ADDRS`] it keeps the
+/// address-rotation arithmetic
+/// `(failed_idx + 1 + attempt as usize) % n` safely inside `usize`
+/// on 32-bit targets. Java doesn't cap explicitly; this cap is well
+/// above any realistic config.
+pub const MAX_FAILOVER_MAX_ATTEMPTS: u32 = 1024;
+
+/// Hard upper bound on the parsed address-list length. Real connect
+/// strings target a single cluster (a handful of endpoints); this
+/// cap exists so the address-rotation arithmetic in
+/// [`crate::egress::Reader::reconnect_with_failover`]
+/// (`(failed_idx + 1 + attempt as usize) % n`) is provably free of
+/// `usize` overflow on 32-bit targets given
+/// [`MAX_FAILOVER_MAX_ATTEMPTS`]. Without this cap the "32-bit
+/// safety" claim was a soft assertion that nothing actually
+/// enforced.
+pub const MAX_ADDRS: usize = 1024;
+
+/// Hard upper bound on `failover_backoff_max_ms`. Caps a misconfigured
+/// connect string from issuing multi-hour `thread::sleep` calls
+/// during a failover storm. One hour is far past any operationally
+/// useful backoff — beyond this, the user wants application-level
+/// circuit breaking, not transport-level retry.
+pub const MAX_FAILOVER_BACKOFF_MAX_MS: u64 = 60 * 60 * 1_000;
 
 /// TLS verification policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,12 +194,22 @@ pub enum TlsVerify {
 }
 
 /// Fully validated reader configuration.
+///
+/// Marked `#[non_exhaustive]` so future config knobs (and there will
+/// be more — the failover/auth/TLS surfaces are still maturing) can
+/// be added without breaking downstream code that pattern-matches
+/// or struct-literals this type. Construct via [`Self::from_conf`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ReaderConfig {
     /// Endpoints to walk on connect, in order. The Reader tries each
     /// until one accepts the WS handshake and (when v2) advertises a
     /// role matching `target`.
-    pub addrs: Vec<(String, u16)>,
+    ///
+    /// Crate-private to keep external code from mutating the address
+    /// list after a `Reader` has been built around an `Arc<ReaderConfig>`
+    /// snapshot. Read-only access is via [`Self::addrs`].
+    pub(crate) addrs: Vec<Endpoint>,
     pub tls: bool,
     pub path: String,
     pub max_version: u8,
@@ -121,6 +218,30 @@ pub struct ReaderConfig {
     pub client_id: Option<String>,
     pub durable_ack: bool,
     pub target: Target,
+    /// Mid-query failover. When `true` and the transport fails after a
+    /// `QUERY_REQUEST` has been submitted, the cursor reconnects to the
+    /// next endpoint (rotating, skipping the failed one first), replays
+    /// the query with a fresh `request_id`, and resumes from `batch_seq=0`
+    /// on the new connection. The user-side handler must reset any
+    /// accumulated rows when notified via the
+    /// [`ReaderQuery::on_failover_reset`](crate::egress::ReaderQuery::on_failover_reset)
+    /// callback.
+    ///
+    /// When `false`, the `failover_*` tunables below are accepted by
+    /// the parser (so configs aren't rejected on a partial enable/disable
+    /// flip) but have no effect — transport failures surface immediately.
+    pub failover: bool,
+    /// Number of retry attempts after a transport failure (default `8`).
+    /// Total of `1 + failover_max_attempts` connect attempts before the
+    /// failure is propagated. Must be `>= 1`. Ignored when
+    /// [`failover`](Self::failover) is `false`.
+    pub failover_max_attempts: u32,
+    /// Initial backoff between failover attempts, in milliseconds.
+    /// Ignored when [`failover`](Self::failover) is `false`.
+    pub failover_backoff_initial_ms: u64,
+    /// Maximum (capped) backoff between failover attempts, in milliseconds.
+    /// Ignored when [`failover`](Self::failover) is `false`.
+    pub failover_backoff_max_ms: u64,
     pub auth: AuthMode,
     pub tls_verify: TlsVerify,
     pub tls_roots: Option<String>,
@@ -156,7 +277,7 @@ impl ReaderConfig {
         } else {
             DEFAULT_PLAIN_PORT
         };
-        let mut addrs: Vec<(String, u16)> = Vec::new();
+        let mut addrs: Vec<Endpoint> = Vec::new();
         for (i, entry) in addr.split(',').map(str::trim).enumerate() {
             if entry.is_empty() {
                 return Err(fmt!(ConfigError, "Empty entry {} in \"addr\" list", i));
@@ -181,10 +302,18 @@ impl ReaderConfig {
                     entry
                 )
             })?;
-            addrs.push((host, port));
+            addrs.push(Endpoint { host, port });
         }
         if addrs.is_empty() {
             return Err(fmt!(ConfigError, "\"addr\" parameter is empty"));
+        }
+        if addrs.len() > MAX_ADDRS {
+            return Err(fmt!(
+                ConfigError,
+                "\"addr\" list length {} exceeds the hard cap of {}",
+                addrs.len(),
+                MAX_ADDRS
+            ));
         }
 
         // Optional / typed
@@ -195,6 +324,10 @@ impl ReaderConfig {
         let mut client_id: Option<String> = None;
         let mut durable_ack = false;
         let mut target = Target::Any;
+        let mut failover = DEFAULT_FAILOVER_ENABLED;
+        let mut failover_max_attempts: u32 = DEFAULT_FAILOVER_MAX_ATTEMPTS;
+        let mut failover_backoff_initial_ms: u64 = DEFAULT_FAILOVER_BACKOFF_INITIAL_MS;
+        let mut failover_backoff_max_ms: u64 = DEFAULT_FAILOVER_BACKOFF_MAX_MS;
         let mut tls_verify = TlsVerify::On;
         let mut tls_roots: Option<String> = None;
         let mut tls_roots_password: Option<String> = None;
@@ -286,11 +419,18 @@ impl ReaderConfig {
                 "tls_roots" => tls_roots = Some(val.to_string()),
                 "tls_roots_password" => tls_roots_password = Some(val.to_string()),
 
-                // Failover keys aren't wired through Phase 1; accept and ignore.
-                "failover"
-                | "failover_max_attempts"
-                | "failover_backoff_initial_ms"
-                | "failover_backoff_max_ms" => {}
+                "failover" => {
+                    failover = parse_bool("failover", val)?;
+                }
+                "failover_max_attempts" => {
+                    failover_max_attempts = parse_value("failover_max_attempts", val)?;
+                }
+                "failover_backoff_initial_ms" => {
+                    failover_backoff_initial_ms = parse_value("failover_backoff_initial_ms", val)?;
+                }
+                "failover_backoff_max_ms" => {
+                    failover_backoff_max_ms = parse_value("failover_backoff_max_ms", val)?;
+                }
 
                 other => {
                     return Err(fmt!(ConfigError, "Unknown config key \"{}\"", other));
@@ -327,6 +467,43 @@ impl ReaderConfig {
             }
         }
 
+        if failover_max_attempts == 0 {
+            return Err(fmt!(
+                ConfigError,
+                "\"failover_max_attempts\" must be >= 1 (use \"failover=off\" to disable failover entirely)"
+            ));
+        }
+        if failover_max_attempts > MAX_FAILOVER_MAX_ATTEMPTS {
+            return Err(fmt!(
+                ConfigError,
+                "\"failover_max_attempts\" {} exceeds the hard cap of {}",
+                failover_max_attempts,
+                MAX_FAILOVER_MAX_ATTEMPTS
+            ));
+        }
+        if failover_backoff_initial_ms == 0 {
+            return Err(fmt!(
+                ConfigError,
+                "\"failover_backoff_initial_ms\" must be > 0"
+            ));
+        }
+        if failover_backoff_max_ms < failover_backoff_initial_ms {
+            return Err(fmt!(
+                ConfigError,
+                "\"failover_backoff_max_ms\" ({}) must be >= \"failover_backoff_initial_ms\" ({})",
+                failover_backoff_max_ms,
+                failover_backoff_initial_ms
+            ));
+        }
+        if failover_backoff_max_ms > MAX_FAILOVER_BACKOFF_MAX_MS {
+            return Err(fmt!(
+                ConfigError,
+                "\"failover_backoff_max_ms\" {} exceeds the hard cap of {} (1 hour)",
+                failover_backoff_max_ms,
+                MAX_FAILOVER_BACKOFF_MAX_MS
+            ));
+        }
+
         // tls_* knobs only make sense with TLS scheme.
         if !tls && (tls_roots.is_some() || tls_roots_password.is_some()) {
             return Err(fmt!(
@@ -352,6 +529,10 @@ impl ReaderConfig {
             client_id,
             durable_ack,
             target,
+            failover,
+            failover_max_attempts,
+            failover_backoff_initial_ms,
+            failover_backoff_max_ms,
             auth,
             tls_verify,
             tls_roots,
@@ -359,12 +540,21 @@ impl ReaderConfig {
         })
     }
 
+    /// Read-only view of the parsed endpoint list. The list is populated
+    /// by [`from_conf`](Self::from_conf) and frozen for the lifetime of
+    /// the config — this getter is the only public access path.
+    pub fn addrs(&self) -> &[Endpoint] {
+        &self.addrs
+    }
+
     /// Build the URL for the WebSocket upgrade against the endpoint at
     /// `idx` in [`addrs`](Self::addrs). Panics if `idx` is out of range.
     pub fn url_for(&self, idx: usize) -> String {
-        let (host, port) = &self.addrs[idx];
+        let ep = &self.addrs[idx];
         let scheme = if self.tls { "wss" } else { "ws" };
-        format!("{}://{}:{}{}", scheme, host, port, self.path)
+        // `{ep}` formats as `host:port` (or `[host]:port` for IPv6
+        // literals), giving an unambiguous URL authority component.
+        format!("{}://{}{}", scheme, ep, self.path)
     }
 
     /// First endpoint URL — convenience for single-addr configs.
@@ -430,7 +620,7 @@ mod tests {
     fn minimal_plain_conf() {
         let c = ReaderConfig::from_conf("qwp::addr=localhost:9000").unwrap();
         assert_eq!(c.addrs.len(), 1);
-        assert_eq!(c.addrs[0], ("localhost".to_string(), 9000));
+        assert_eq!(c.addrs[0], Endpoint::new("localhost", 9000));
         assert!(!c.tls);
         assert_eq!(c.path, DEFAULT_PATH);
         assert_eq!(c.max_version, HIGHEST_KNOWN_VERSION);
@@ -519,10 +709,10 @@ mod tests {
     fn multi_addr_parses() {
         let c = ReaderConfig::from_conf("qwp::addr=h1:9000,h2:9001,h3,h4:9999;").unwrap();
         assert_eq!(c.addrs.len(), 4);
-        assert_eq!(c.addrs[0], ("h1".to_string(), 9000));
-        assert_eq!(c.addrs[1], ("h2".to_string(), 9001));
-        assert_eq!(c.addrs[2], ("h3".to_string(), 9000)); // default port
-        assert_eq!(c.addrs[3], ("h4".to_string(), 9999));
+        assert_eq!(c.addrs[0], Endpoint::new("h1", 9000));
+        assert_eq!(c.addrs[1], Endpoint::new("h2", 9001));
+        assert_eq!(c.addrs[2], Endpoint::new("h3", 9000)); // default port
+        assert_eq!(c.addrs[3], Endpoint::new("h4", 9999));
     }
 
     #[test]
@@ -577,7 +767,7 @@ mod tests {
     #[test]
     fn default_port_when_omitted() {
         let c = ReaderConfig::from_conf("qwp::addr=localhost").unwrap();
-        assert_eq!(c.addrs[0].1, 9000);
+        assert_eq!(c.addrs[0].port, 9000);
     }
 
     #[test]
@@ -605,12 +795,183 @@ mod tests {
     }
 
     #[test]
-    fn failover_keys_accepted_silently() {
-        // Phase 1: parse but don't act.
+    fn failover_defaults() {
+        let c = ReaderConfig::from_conf("qwp::addr=h:1").unwrap();
+        assert!(c.failover);
+        assert_eq!(c.failover_max_attempts, DEFAULT_FAILOVER_MAX_ATTEMPTS);
+        assert_eq!(
+            c.failover_backoff_initial_ms,
+            DEFAULT_FAILOVER_BACKOFF_INITIAL_MS
+        );
+        assert_eq!(c.failover_backoff_max_ms, DEFAULT_FAILOVER_BACKOFF_MAX_MS);
+    }
+
+    #[test]
+    fn failover_keys_parsed() {
         let c = ReaderConfig::from_conf(
-            "qwp::addr=h:1;failover=on;failover_max_attempts=3;failover_backoff_initial_ms=100;failover_backoff_max_ms=2000",
+            "qwp::addr=h:1;failover=off;failover_max_attempts=3;failover_backoff_initial_ms=100;failover_backoff_max_ms=2000",
         )
         .unwrap();
-        assert_eq!(c.addrs[0].0, "h");
+        assert!(!c.failover);
+        assert_eq!(c.failover_max_attempts, 3);
+        assert_eq!(c.failover_backoff_initial_ms, 100);
+        assert_eq!(c.failover_backoff_max_ms, 2000);
+    }
+
+    #[test]
+    fn failover_backoff_initial_zero_rejected() {
+        let err =
+            ReaderConfig::from_conf("qwp::addr=h:1;failover_backoff_initial_ms=0").unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+    }
+
+    #[test]
+    fn failover_backoff_max_below_initial_rejected() {
+        let err = ReaderConfig::from_conf(
+            "qwp::addr=h:1;failover_backoff_initial_ms=500;failover_backoff_max_ms=100",
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+    }
+
+    #[test]
+    fn failover_invalid_attempts_rejected() {
+        let err = ReaderConfig::from_conf("qwp::addr=h:1;failover_max_attempts=abc").unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+    }
+
+    #[test]
+    fn failover_max_attempts_above_cap_rejected() {
+        let conf = format!(
+            "qwp::addr=h:1;failover_max_attempts={}",
+            MAX_FAILOVER_MAX_ATTEMPTS + 1
+        );
+        let err = ReaderConfig::from_conf(&conf).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+        assert!(err.msg().contains("exceeds the hard cap"));
+    }
+
+    #[test]
+    fn failover_max_attempts_at_cap_accepted() {
+        let conf = format!(
+            "qwp::addr=h:1;failover_max_attempts={}",
+            MAX_FAILOVER_MAX_ATTEMPTS
+        );
+        let c = ReaderConfig::from_conf(&conf).unwrap();
+        assert_eq!(c.failover_max_attempts, MAX_FAILOVER_MAX_ATTEMPTS);
+    }
+
+    #[test]
+    fn failover_backoff_max_above_cap_rejected() {
+        // N6 regression guard: a misconfigured `failover_backoff_max_ms`
+        // beyond `MAX_FAILOVER_BACKOFF_MAX_MS` (1 hour) must be
+        // rejected at parse time so a failover storm can't burn
+        // multi-hour `thread::sleep` calls inside the cursor.
+        let conf = format!(
+            "qwp::addr=h:1;failover_backoff_initial_ms=1;failover_backoff_max_ms={}",
+            MAX_FAILOVER_BACKOFF_MAX_MS + 1
+        );
+        let err = ReaderConfig::from_conf(&conf).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+        assert!(
+            err.msg().contains("exceeds the hard cap"),
+            "msg: {}",
+            err.msg()
+        );
+    }
+
+    #[test]
+    fn failover_backoff_max_at_cap_accepted() {
+        let conf = format!(
+            "qwp::addr=h:1;failover_backoff_initial_ms=1;failover_backoff_max_ms={}",
+            MAX_FAILOVER_BACKOFF_MAX_MS
+        );
+        let c = ReaderConfig::from_conf(&conf).unwrap();
+        assert_eq!(c.failover_backoff_max_ms, MAX_FAILOVER_BACKOFF_MAX_MS);
+    }
+
+    #[test]
+    fn addrs_above_cap_rejected() {
+        // N5 regression guard: enforce `MAX_ADDRS` so the
+        // address-rotation arithmetic in
+        // `Reader::reconnect_with_failover` is provably free of usize
+        // overflow on 32-bit targets.
+        let mut addr = String::from("qwp::addr=");
+        for i in 0..(MAX_ADDRS + 1) {
+            if i > 0 {
+                addr.push(',');
+            }
+            addr.push_str(&format!("h{}:9000", i));
+        }
+        let err = ReaderConfig::from_conf(&addr).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+        assert!(
+            err.msg().contains("exceeds the hard cap"),
+            "msg: {}",
+            err.msg()
+        );
+    }
+
+    #[test]
+    fn failover_max_attempts_zero_rejected() {
+        // Matches Java QwpQueryClient.java:401 — `failover_max_attempts must be >= 1`.
+        // Users who want failover entirely off should set `failover=off`.
+        let err = ReaderConfig::from_conf("qwp::addr=h:1;failover_max_attempts=0").unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+        assert!(
+            err.msg().contains("failover_max_attempts"),
+            "msg: {}",
+            err.msg()
+        );
+    }
+
+    #[test]
+    fn endpoint_display_common_cases() {
+        // Hostnames and IPv4 literals format unbracketed — `host:port`
+        // is the path users will actually see in connect strings,
+        // logs, and `FailoverEvent` output. This is the contract the
+        // failover doctest and example rely on.
+        assert_eq!(
+            Endpoint::new("localhost", 9000).to_string(),
+            "localhost:9000"
+        );
+        assert_eq!(Endpoint::new("db-a", 9000).to_string(), "db-a:9000");
+        assert_eq!(
+            Endpoint::new("127.0.0.1", 9000).to_string(),
+            "127.0.0.1:9000"
+        );
+        // Round-trip into a connect string parser: an Endpoint
+        // formatted via Display must parse back into an
+        // equal-by-value Endpoint, which keeps log lines and
+        // diagnostic output safe to feed back into a new connect
+        // string without quoting/escaping bookkeeping.
+        let ep = Endpoint::new("example.com", 1234);
+        let conf = format!("qwp::addr={}", ep);
+        let parsed = ReaderConfig::from_conf(&conf).expect("parse round-trip");
+        assert_eq!(parsed.addrs(), &[ep]);
+    }
+
+    #[test]
+    fn endpoint_display_ipv6_brackets() {
+        // IPv6 literals contain `:` and would otherwise produce an
+        // ambiguous `host:port` collision. Bracketing follows
+        // RFC 3986 §3.2.2 (`IP-literal`). The connect-string parser
+        // doesn't currently accept IPv6 input, but `Endpoint::new`
+        // and FailoverEvent surfacing must still format losslessly
+        // for diagnostics.
+        assert_eq!(Endpoint::new("::1", 9000).to_string(), "[::1]:9000");
+        assert_eq!(
+            Endpoint::new("2001:db8::1", 443).to_string(),
+            "[2001:db8::1]:443"
+        );
+    }
+
+    #[test]
+    fn url_for_uses_endpoint_display() {
+        // `url_for` was migrated to format via `{ep}`. Lock the
+        // common-case URL string so the migration didn't introduce
+        // a regression for the predominant non-IPv6 path users see.
+        let c = ReaderConfig::from_conf("qwp::addr=db-a:9000;path=/exec").unwrap();
+        assert_eq!(c.url_for(0), "ws://db-a:9000/exec");
     }
 }

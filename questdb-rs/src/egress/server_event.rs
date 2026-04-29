@@ -131,7 +131,11 @@ pub fn decode_frame(
     // only frame that carries an actual table block) and `0` everywhere
     // else. Catch frame-vs-kind drift up front rather than letting it
     // surface as a confusing per-message decode failure downstream.
-    let expected_tc = if matches!(kind, MsgKind::ResultBatch) { 1 } else { 0 };
+    let expected_tc = if matches!(kind, MsgKind::ResultBatch) {
+        1
+    } else {
+        0
+    };
     if header.table_count != expected_tc {
         return Err(fmt!(
             ProtocolError,

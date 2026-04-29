@@ -30,10 +30,14 @@
 //! QWP frame to one WebSocket binary message. Custom `tls_roots` and
 //! `tls_verify=unsafe_off` are accepted in config parsing but rejected
 //! at connect time — those knobs are wired through in a follow-up.
+//!
+//! The `sync-reader-ws` feature gate is applied at the module
+//! declaration in `egress/mod.rs`; an inner `#![cfg(...)]` here would
+//! duplicate that gate (clippy::duplicated_attributes) without
+//! changing what's compiled.
 
-#![cfg(feature = "sync-reader-ws")]
-
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
+use std::time::Duration;
 
 use bytes::Bytes;
 use tungstenite::client::IntoClientRequest;
@@ -45,6 +49,21 @@ use tungstenite::{ClientRequestBuilder, Message, WebSocket};
 use crate::egress::config::ReaderConfig;
 use crate::egress::error::{Error, ErrorCode, Result, fmt};
 use crate::egress::wire::header::{FrameHeader, HEADER_LEN};
+
+/// Per-write upper bound applied to the underlying `TcpStream` after a
+/// successful handshake. Caps any single `write()` syscall — including
+/// the WS Close frame written from `Drop` / `close_in_place` — so a
+/// stuck-but-not-RST'd peer can't hang the calling thread indefinitely.
+/// Generous enough that realistic large-payload writes (multi-MB binds)
+/// are not affected, tight enough that failover teardown stays
+/// responsive.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Shorter timeout applied right before the WS Close write on
+/// teardown. The connection is being released regardless; a graceful
+/// close-frame ACK is best-effort, so prioritise fast FD release over
+/// peer-friendliness.
+const CLOSE_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// Header key the server uses to advertise the negotiated QWP version.
 const HDR_VERSION: &str = "x-qwp-version";
@@ -120,10 +139,17 @@ impl WsTransport {
             ));
         }
 
-        Ok(WsTransport {
+        let mut transport = WsTransport {
             socket,
             server_version,
-        })
+        };
+        // Bound every subsequent write to the peer. Without this, a
+        // stuck/blackholed peer can hang the WS Close in `Drop` /
+        // `close_in_place` indefinitely — defeating the failover
+        // backoff schedule, and making `Cursor::cancel()` look like
+        // it's hung on a network blip. See `WRITE_TIMEOUT`.
+        set_tcp_write_timeout(transport.socket.get_mut(), Some(WRITE_TIMEOUT));
+        Ok(transport)
     }
 
     /// Negotiated QWP version. The frame header `version` byte must equal
@@ -201,26 +227,73 @@ impl WsTransport {
 
     /// Best-effort close. Errors are swallowed to keep `Drop` clean.
     pub fn close(mut self) {
-        let _ = self.socket.close(None);
-        // Attempt to drain the closing handshake response.
-        let _ = self.socket.read();
+        teardown_inplace(&mut self.socket);
     }
 
     /// Best-effort in-place close. Initiates the WS closing handshake
     /// without consuming `self` so callers borrowing `&mut WsTransport`
-    /// (e.g. `Cursor::Drop`) can release the connection. Errors are
-    /// swallowed; subsequent reads/writes on this transport will fail
-    /// at the tungstenite layer.
+    /// (e.g. `Cursor::Drop`) can release the connection.
+    ///
+    /// Tightens the write timeout to `CLOSE_TIMEOUT` for the WS Close
+    /// write, then issues a TCP `Shutdown::Both` so the FD is released
+    /// regardless of peer state. Subsequent reads/writes on this
+    /// transport will fail at the tungstenite layer. Bounded
+    /// teardown: critical on the failover path, where a stuck peer
+    /// would otherwise stall the calling thread before the backoff
+    /// sleep had a chance to start.
     pub fn close_in_place(&mut self) {
-        let _ = self.socket.close(None);
+        teardown_inplace(&mut self.socket);
     }
 }
 
 impl Drop for WsTransport {
     fn drop(&mut self) {
-        // Fire-and-forget close per the project policy.
-        let _ = self.socket.close(None);
+        // Fire-and-forget close per the project policy. Bounded by
+        // `CLOSE_TIMEOUT` plus the unconditional `Shutdown::Both` —
+        // see `close_in_place`.
+        teardown_inplace(&mut self.socket);
     }
+}
+
+/// Set `set_write_timeout` on the underlying `TcpStream`, walking
+/// through any TLS wrapper. The `MaybeTlsStream` enum is
+/// `#[non_exhaustive]`; the `_` arm is for future variants we don't
+/// know how to peel.
+fn set_tcp_write_timeout(stream: &mut MaybeTlsStream<TcpStream>, timeout: Option<Duration>) {
+    match stream {
+        MaybeTlsStream::Plain(s) => {
+            let _ = s.set_write_timeout(timeout);
+        }
+        MaybeTlsStream::Rustls(s) => {
+            let _ = s.sock.set_write_timeout(timeout);
+        }
+        _ => {}
+    }
+}
+
+/// Issue a TCP-level shutdown(Both) on the underlying `TcpStream`.
+/// Releases the FD synchronously regardless of peer state — the WS
+/// Close write may or may not have made it through.
+fn shutdown_tcp(stream: &mut MaybeTlsStream<TcpStream>) {
+    match stream {
+        MaybeTlsStream::Plain(s) => {
+            let _ = s.shutdown(Shutdown::Both);
+        }
+        MaybeTlsStream::Rustls(s) => {
+            let _ = s.sock.shutdown(Shutdown::Both);
+        }
+        _ => {}
+    }
+}
+
+/// Bounded teardown sequence: tighten write timeout, attempt the WS
+/// Close (best-effort), then TCP-shutdown to force FD release. Used
+/// by `Drop`, `close_in_place`, and the `close` consuming variant so
+/// they share identical semantics.
+fn teardown_inplace(socket: &mut WebSocket<MaybeTlsStream<TcpStream>>) {
+    set_tcp_write_timeout(socket.get_mut(), Some(CLOSE_TIMEOUT));
+    let _ = socket.close(None);
+    shutdown_tcp(socket.get_mut());
 }
 
 // ---------------------------------------------------------------------------
@@ -247,7 +320,7 @@ fn read_version_header(headers: &tungstenite::http::HeaderMap) -> Result<u8> {
 }
 
 fn map_ws_error(e: tungstenite::Error, default_code: ErrorCode) -> Error {
-    use tungstenite::error::{Error as T, ProtocolError as P};
+    use tungstenite::error::{Error as T, ProtocolError as P, UrlError as U};
     let msg = e.to_string();
     let code = match &e {
         T::Io(_) => ErrorCode::SocketError,
@@ -259,6 +332,11 @@ fn map_ws_error(e: tungstenite::Error, default_code: ErrorCode) -> Error {
         T::Protocol(P::SendAfterClosing) | T::Protocol(P::ReceivedAfterClosing) => {
             ErrorCode::SocketError
         }
+        // `UnableToConnect` is tungstenite's catch-all for refused /
+        // unreachable / DNS-failed connects — that's a transport
+        // failure, not a config one, and the failover machinery
+        // depends on `SocketError` to keep walking the address list.
+        T::Url(U::UnableToConnect(_)) => ErrorCode::SocketError,
         T::Url(_) => ErrorCode::ConfigError,
         T::HttpFormat(_) | T::Protocol(_) | T::Utf8(_) => ErrorCode::ProtocolError,
         T::Tls(_) => ErrorCode::TlsError,
@@ -269,7 +347,7 @@ fn map_ws_error(e: tungstenite::Error, default_code: ErrorCode) -> Error {
 }
 
 fn map_ws_error_during_handshake(e: tungstenite::Error) -> Error {
-    use tungstenite::error::Error as T;
+    use tungstenite::error::{Error as T, UrlError as U};
     let msg = e.to_string();
     let code = match &e {
         T::Http(resp) => {
@@ -281,6 +359,11 @@ fn map_ws_error_during_handshake(e: tungstenite::Error) -> Error {
             }
         }
         T::HttpFormat(_) => ErrorCode::HandshakeError,
+        // See `map_ws_error`: `UnableToConnect` is a transport failure.
+        // Misclassifying it as `ConfigError` defeats both the initial
+        // connect walk's continue-past-unreachable behaviour and the
+        // mid-query failover's transport-error eligibility.
+        T::Url(U::UnableToConnect(_)) => ErrorCode::SocketError,
         T::Url(_) => ErrorCode::ConfigError,
         T::Tls(_) => ErrorCode::TlsError,
         T::Io(_) => ErrorCode::SocketError,

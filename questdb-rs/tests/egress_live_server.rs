@@ -2794,10 +2794,7 @@ fn cancel_then_drop_allows_reuse() {
 
     // Reader is clean — query 2 should succeed end-to-end.
     let mut cur2 = reader.query("select 2 as v").execute().expect("execute 2");
-    let view = cur2
-        .next_batch()
-        .expect("next_batch")
-        .expect("Some batch");
+    let view = cur2.next_batch().expect("next_batch").expect("Some batch");
     assert_eq!(view.row_count(), 1);
     let v = match view.column(0).unwrap() {
         ColumnView::Long(c) => c.value(0),
@@ -3004,11 +3001,9 @@ fn cursor_short_circuits_after_query_error() {
         );
 
         // And one more for good measure — idempotent.
-        let third = assert_returns_within(
-            Duration::from_secs(3),
-            "third next_batch",
-            || cur.next_batch().expect("third next_batch returns Ok"),
-        );
+        let third = assert_returns_within(Duration::from_secs(3), "third next_batch", || {
+            cur.next_batch().expect("third next_batch returns Ok")
+        });
         assert!(third.is_none());
     }
 
@@ -3017,17 +3012,14 @@ fn cursor_short_circuits_after_query_error() {
     // itself finished afterwards.
     {
         let mut reader = make_reader(srv);
-        let mut cur = reader
-            .query("select 1 as v")
-            .execute()
-            .expect("execute");
+        let mut cur = reader.query("select 1 as v").execute().expect("execute");
         cur.cancel().expect("cancel returns Ok");
 
-        let post_cancel = assert_returns_within(
-            Duration::from_secs(3),
-            "next_batch after cancel",
-            || cur.next_batch().expect("next_batch after cancel returns Ok"),
-        );
+        let post_cancel =
+            assert_returns_within(Duration::from_secs(3), "next_batch after cancel", || {
+                cur.next_batch()
+                    .expect("next_batch after cancel returns Ok")
+            });
         assert!(
             post_cancel.is_none(),
             "next_batch after a successful cancel must return Ok(None)"

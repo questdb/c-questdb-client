@@ -101,7 +101,7 @@ pub enum ErrorCode {
 }
 
 /// Egress error.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error {
     code: ErrorCode,
     msg: String,

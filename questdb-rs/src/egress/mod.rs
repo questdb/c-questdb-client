@@ -58,12 +58,16 @@ pub use column::{
     LongArrayColumn, SymbolColumn, UuidColumn, Validity, VarcharColumn,
 };
 pub use column_kind::ColumnKind;
-pub use config::{Compression, ReaderConfig, Target, TlsVerify};
+pub use config::{
+    Compression, DEFAULT_FAILOVER_BACKOFF_INITIAL_MS, DEFAULT_FAILOVER_BACKOFF_MAX_MS,
+    DEFAULT_FAILOVER_ENABLED, DEFAULT_FAILOVER_MAX_ATTEMPTS, Endpoint, MAX_ADDRS,
+    MAX_FAILOVER_BACKOFF_MAX_MS, MAX_FAILOVER_MAX_ATTEMPTS, ReaderConfig, Target, TlsVerify,
+};
 pub use decoder::{ArrayBuffers, ColumnBuffer, DecodedBatch, DecodedColumn, decode_result_batch};
 pub use error::{Error, ErrorCode, Result};
 pub use query_request::{QueryRequest, QueryRequestBuilder};
 #[cfg(feature = "sync-reader-ws")]
-pub use reader::{BatchView, Cursor, Reader, ReaderQuery, Terminal};
+pub use reader::{BatchView, Cursor, FailoverEvent, Reader, ReaderQuery, Terminal};
 pub use schema::{DecodedSchema, Schema, SchemaColumn, SchemaMode, SchemaRegistry};
 pub use server_event::{ServerEvent, ServerInfo, ServerRole, decode_frame};
 pub use symbol_dict::SymbolDict;
