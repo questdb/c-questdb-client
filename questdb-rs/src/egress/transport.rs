@@ -27,9 +27,10 @@
 //! Supports both `ws://` and `wss://` via `MaybeTlsStream`. The transport
 //! handles the HTTP upgrade (with negotiation headers and any
 //! Authorization), then exposes frame-level read/write that maps each
-//! QWP frame to one WebSocket binary message. Custom `tls_roots` and
-//! `tls_verify=unsafe_off` are accepted in config parsing but rejected
-//! at connect time — those knobs are wired through in a follow-up.
+//! QWP frame to one WebSocket binary message. TLS is wired through
+//! `tungstenite::Connector::Rustls` with a `rustls::ClientConfig`
+//! built from the egress connect-string knobs (`tls_ca`, `tls_roots`,
+//! `tls_verify`) — see `egress/tls.rs`.
 //!
 //! The `sync-reader-ws` feature gate is applied at the module
 //! declaration in `egress/mod.rs`; an inner `#![cfg(...)]` here would
@@ -41,13 +42,15 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use tungstenite::client::IntoClientRequest;
+use tungstenite::handshake::HandshakeError;
 use tungstenite::handshake::client::generate_key;
 use tungstenite::http::{HeaderName, HeaderValue, Request, Uri};
 use tungstenite::stream::MaybeTlsStream;
-use tungstenite::{ClientRequestBuilder, Message, WebSocket};
+use tungstenite::{ClientRequestBuilder, Connector, Message, WebSocket};
 
 use crate::egress::config::ReaderConfig;
 use crate::egress::error::{Error, ErrorCode, Result, fmt};
+use crate::egress::tls::build_client_config;
 use crate::egress::wire::header::{FrameHeader, HEADER_LEN};
 
 /// Per-write upper bound applied to the underlying `TcpStream` after a
@@ -89,16 +92,7 @@ impl WsTransport {
                 config.addrs.len()
             ));
         }
-        if config.tls
-            && (config.tls_roots.is_some()
-                || config.tls_roots_password.is_some()
-                || matches!(config.tls_verify, crate::egress::TlsVerify::UnsafeOff))
-        {
-            return Err(fmt!(
-                ConfigError,
-                "custom tls_roots / tls_verify=unsafe_off are not yet honoured by the WebSocket transport"
-            ));
-        }
+        let endpoint = &config.addrs[addr_idx];
         let url = config.url_for(addr_idx);
         let uri: Uri = url
             .parse()
@@ -119,8 +113,16 @@ impl WsTransport {
             .map_err(map_ws_error_during_handshake)?;
         debug_assert_handshake_headers(&request);
 
-        let (socket, response) =
-            tungstenite::connect(request).map_err(map_ws_error_during_handshake)?;
+        // Resolve & TCP-connect ourselves so we can hand a custom
+        // `rustls::ClientConfig` (with the negotiated `tls_ca` /
+        // `tls_roots` / `tls_verify` knobs) to tungstenite. Going
+        // through `tungstenite::connect()` would force the built-in
+        // webpki-roots config and bypass any of the user's TLS knobs.
+        let tcp = TcpStream::connect((endpoint.host.as_str(), endpoint.port))
+            .map_err(|e| fmt!(SocketError, "could not connect to {}: {}", endpoint, e))?;
+        let connector = build_client_config(config)?.map(Connector::Rustls);
+        let (socket, response) = tungstenite::client_tls_with_config(request, tcp, None, connector)
+            .map_err(map_handshake_error)?;
 
         let server_version = read_version_header(response.headers())?;
         if server_version > config.max_version {
@@ -358,6 +360,23 @@ fn map_ws_error(e: tungstenite::Error, default_code: ErrorCode) -> Error {
         _ => default_code,
     };
     Error::new(code, msg)
+}
+
+/// Convert a `HandshakeError` from `client_tls_with_config` into an
+/// egress `Error`. The `Interrupted` variant is unreachable on blocking
+/// IO, but we surface it as a handshake failure rather than panicking
+/// — defensive in case a future tungstenite version makes the path
+/// reachable.
+fn map_handshake_error(
+    e: HandshakeError<tungstenite::ClientHandshake<MaybeTlsStream<TcpStream>>>,
+) -> Error {
+    match e {
+        HandshakeError::Failure(err) => map_ws_error_during_handshake(err),
+        HandshakeError::Interrupted(_) => fmt!(
+            HandshakeError,
+            "WebSocket handshake interrupted; non-blocking sockets are not supported"
+        ),
+    }
 }
 
 fn map_ws_error_during_handshake(e: tungstenite::Error) -> Error {

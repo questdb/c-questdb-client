@@ -59,6 +59,8 @@ pub(crate) mod schema;
 pub(crate) mod server_event;
 pub(crate) mod symbol_dict;
 #[cfg(feature = "sync-reader-ws")]
+pub(crate) mod tls;
+#[cfg(feature = "sync-reader-ws")]
 pub(crate) mod transport;
 pub mod wire;
 
@@ -67,6 +69,7 @@ pub mod wire;
 // internals — column views, wire codecs the tests pin) or is fully
 // crate-private. Adding to this list commits the crate to a semver
 // contract; trim aggressively.
+pub use crate::ingress::CertificateAuthority;
 pub use binds::Bind;
 pub use column::{
     BinaryColumn, ColumnView, Decimal64Column, Decimal128Column, Decimal256Column,

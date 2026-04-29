@@ -43,7 +43,11 @@ pub enum AuthMode {
     None,
     /// HTTP Basic: `Basic base64(user:password)`.
     Basic { username: String, password: String },
-    /// Bearer / OIDC: `Bearer <access_token>`.
+    /// `Bearer <token>`. Carries either an OIDC access token or a
+    /// QuestDB REST token — the server's `EntHttpAuthenticator` routes
+    /// both `Bearer` and `Token` schemes through the same validator
+    /// (REST token check first, OIDC fallback), so a single client-side
+    /// mode covers both server-side identity sources.
     Bearer { token: String },
     /// Escape hatch: emit the value as-is.
     Verbatim { value: String },

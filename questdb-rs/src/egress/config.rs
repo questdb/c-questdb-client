@@ -49,16 +49,22 @@
 //! | `failover_backoff_max_ms`      | max backoff between attempts (`1000`); ignored when `failover=off` |
 //! | `username`         | basic auth                                               |
 //! | `password`         | basic auth                                               |
-//! | `token`            | bearer / OIDC                                            |
+//! | `token`            | OIDC access token or QuestDB REST token — sent as `Bearer <token>` |
 //! | `auth`             | verbatim Authorization value                             |
 //! | `tls_verify`       | `on`/`unsafe_off` (`on`)                                 |
-//! | `tls_roots`        | path to a PEM bundle                                     |
-//! | `tls_roots_password` | password for the PEM bundle                             |
+//! | `tls_ca`           | `webpki_roots` / `os_roots` / `webpki_and_os_roots` / `pem_file` (depends on enabled features) |
+//! | `tls_roots`        | path to a PEM bundle (also implies `tls_ca=pem_file`)    |
+//!
+//! `tls_roots_password` is intentionally not supported — rustls reads
+//! unencrypted PEM-encoded bundles, and the password concept only
+//! applies to JKS/PKCS12 keystores. Setting it produces a config error.
 
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use crate::egress::auth::AuthMode;
 use crate::egress::error::{Result, fmt};
+use crate::ingress::CertificateAuthority;
 
 /// Default endpoint path (mirrors the Java client).
 pub const DEFAULT_PATH: &str = "/read/v1";
@@ -244,8 +250,8 @@ pub struct ReaderConfig {
     pub failover_backoff_max_ms: u64,
     pub auth: AuthMode,
     pub tls_verify: TlsVerify,
-    pub tls_roots: Option<String>,
-    pub tls_roots_password: Option<String>,
+    pub tls_ca: CertificateAuthority,
+    pub tls_roots: Option<PathBuf>,
 }
 
 impl ReaderConfig {
@@ -362,8 +368,9 @@ impl ReaderConfig {
         let mut failover_backoff_initial_ms: u64 = DEFAULT_FAILOVER_BACKOFF_INITIAL_MS;
         let mut failover_backoff_max_ms: u64 = DEFAULT_FAILOVER_BACKOFF_MAX_MS;
         let mut tls_verify = TlsVerify::On;
-        let mut tls_roots: Option<String> = None;
-        let mut tls_roots_password: Option<String> = None;
+        let mut tls_ca = default_tls_ca();
+        let mut tls_ca_explicit = false;
+        let mut tls_roots: Option<PathBuf> = None;
 
         let mut username: Option<String> = None;
         let mut password: Option<String> = None;
@@ -449,8 +456,27 @@ impl ReaderConfig {
                         }
                     };
                 }
-                "tls_roots" => tls_roots = Some(val.to_string()),
-                "tls_roots_password" => tls_roots_password = Some(val.to_string()),
+                "tls_ca" => {
+                    tls_ca = parse_tls_ca(val)?;
+                    tls_ca_explicit = true;
+                }
+                "tls_roots" => {
+                    let path = PathBuf::from_str(val).map_err(|e| {
+                        fmt!(
+                            ConfigError,
+                            "Invalid path for \"tls_roots\" ({:?}): {}",
+                            val,
+                            e
+                        )
+                    })?;
+                    tls_roots = Some(path);
+                }
+                "tls_roots_password" => {
+                    return Err(fmt!(
+                        ConfigError,
+                        "\"tls_roots_password\" is not supported (rustls reads unencrypted PEM)"
+                    ));
+                }
 
                 "failover" => {
                     failover = parse_bool("failover", val)?;
@@ -538,11 +564,24 @@ impl ReaderConfig {
         }
 
         // tls_* knobs only make sense with TLS scheme.
-        if !tls && (tls_roots.is_some() || tls_roots_password.is_some()) {
+        if !tls && (tls_roots.is_some() || tls_ca_explicit) {
             return Err(fmt!(
                 ConfigError,
                 "TLS-related keys require the \"qwps\" scheme"
             ));
+        }
+
+        // `tls_roots=<path>` implies `tls_ca=pem_file` unless the caller
+        // also explicitly set a different `tls_ca` (in which case we error
+        // because the combination is contradictory).
+        if tls_roots.is_some() {
+            if tls_ca_explicit && tls_ca != CertificateAuthority::PemFile {
+                return Err(fmt!(
+                    ConfigError,
+                    "\"tls_roots\" requires \"tls_ca=pem_file\" (or omit \"tls_ca\")"
+                ));
+            }
+            tls_ca = CertificateAuthority::PemFile;
         }
 
         let auth = AuthMode::from_parts(
@@ -568,8 +607,8 @@ impl ReaderConfig {
             failover_backoff_max_ms,
             auth,
             tls_verify,
+            tls_ca,
             tls_roots,
-            tls_roots_password,
         })
     }
 
@@ -621,6 +660,65 @@ impl ReaderConfig {
         }
         headers
     }
+}
+
+/// Default `tls_ca` mirrors the ingress sender: prefer webpki roots if
+/// the bundled-certs feature is on, fall back to OS roots, and finally
+/// to `pem_file` (which forces the user to supply `tls_roots`). Keeps
+/// `qwps://` working out of the box on the common feature combos.
+fn default_tls_ca() -> CertificateAuthority {
+    #[cfg(feature = "tls-webpki-certs")]
+    {
+        CertificateAuthority::WebpkiRoots
+    }
+    #[cfg(all(not(feature = "tls-webpki-certs"), feature = "tls-native-certs"))]
+    {
+        CertificateAuthority::OsRoots
+    }
+    #[cfg(not(any(feature = "tls-webpki-certs", feature = "tls-native-certs")))]
+    {
+        CertificateAuthority::PemFile
+    }
+}
+
+fn parse_tls_ca(val: &str) -> Result<CertificateAuthority> {
+    Ok(match val {
+        #[cfg(feature = "tls-webpki-certs")]
+        "webpki_roots" => CertificateAuthority::WebpkiRoots,
+        #[cfg(not(feature = "tls-webpki-certs"))]
+        "webpki_roots" => {
+            return Err(fmt!(
+                ConfigError,
+                "\"tls_ca=webpki_roots\" requires the \"tls-webpki-certs\" feature"
+            ));
+        }
+        #[cfg(feature = "tls-native-certs")]
+        "os_roots" => CertificateAuthority::OsRoots,
+        #[cfg(not(feature = "tls-native-certs"))]
+        "os_roots" => {
+            return Err(fmt!(
+                ConfigError,
+                "\"tls_ca=os_roots\" requires the \"tls-native-certs\" feature"
+            ));
+        }
+        #[cfg(all(feature = "tls-webpki-certs", feature = "tls-native-certs"))]
+        "webpki_and_os_roots" => CertificateAuthority::WebpkiAndOsRoots,
+        #[cfg(not(all(feature = "tls-webpki-certs", feature = "tls-native-certs")))]
+        "webpki_and_os_roots" => {
+            return Err(fmt!(
+                ConfigError,
+                "\"tls_ca=webpki_and_os_roots\" requires both the \"tls-webpki-certs\" and \"tls-native-certs\" features"
+            ));
+        }
+        "pem_file" => CertificateAuthority::PemFile,
+        other => {
+            return Err(fmt!(
+                ConfigError,
+                "\"tls_ca\" must be one of webpki_roots|os_roots|webpki_and_os_roots|pem_file (got {:?})",
+                other
+            ));
+        }
+    })
 }
 
 fn parse_value<T>(name: &str, raw: &str) -> Result<T>
@@ -813,6 +911,64 @@ mod tests {
     fn tls_keys_with_plain_scheme_rejected() {
         let err = ReaderConfig::from_conf("qwp::addr=h:1;tls_roots=/tmp/x").unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
+        let err = ReaderConfig::from_conf("qwp::addr=h:1;tls_ca=pem_file").unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+    }
+
+    #[test]
+    fn tls_roots_password_rejected() {
+        // PEM bundles are unencrypted under rustls; the JKS/PKCS12
+        // password concept doesn't translate. Setting it must fail
+        // loudly rather than silently doing nothing.
+        let err = ReaderConfig::from_conf("qwps::addr=h:1;tls_roots_password=secret").unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+        assert!(
+            err.msg().contains("tls_roots_password"),
+            "msg: {}",
+            err.msg()
+        );
+    }
+
+    #[test]
+    fn tls_roots_implies_pem_file_ca() {
+        let c = ReaderConfig::from_conf("qwps::addr=h:1;tls_roots=/path/to/roots.pem").unwrap();
+        assert_eq!(c.tls_ca, CertificateAuthority::PemFile);
+        assert_eq!(
+            c.tls_roots.as_deref(),
+            Some(std::path::Path::new("/path/to/roots.pem"))
+        );
+    }
+
+    #[test]
+    fn tls_roots_with_conflicting_ca_rejected() {
+        #[cfg(feature = "tls-webpki-certs")]
+        {
+            let err =
+                ReaderConfig::from_conf("qwps::addr=h:1;tls_ca=webpki_roots;tls_roots=/tmp/x")
+                    .unwrap_err();
+            assert_eq!(err.code(), ErrorCode::ConfigError);
+        }
+    }
+
+    #[test]
+    fn tls_ca_pem_file_explicit() {
+        let c =
+            ReaderConfig::from_conf("qwps::addr=h:1;tls_ca=pem_file;tls_roots=/tmp/r.pem").unwrap();
+        assert_eq!(c.tls_ca, CertificateAuthority::PemFile);
+    }
+
+    #[test]
+    fn tls_ca_invalid_value_rejected() {
+        let err = ReaderConfig::from_conf("qwps::addr=h:1;tls_ca=mystery").unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+    }
+
+    #[cfg(feature = "tls-webpki-certs")]
+    #[test]
+    fn tls_ca_webpki_roots_default() {
+        let c = ReaderConfig::from_conf("qwps::addr=h:1").unwrap();
+        assert_eq!(c.tls_ca, CertificateAuthority::WebpkiRoots);
+        assert_eq!(c.tls_roots, None);
     }
 
     #[test]
