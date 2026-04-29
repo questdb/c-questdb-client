@@ -22,22 +22,25 @@
  *
  ******************************************************************************/
 
-//! Ignored real-server probe for the Step 12 publication path.
+//! Ignored real-server probes for the Step 12 publication path.
 //!
-//! This exercises the prototype product path against a real QuestDB server:
-//! `Buffer -> replay payload -> volatile queue -> manual driver -> real
-//! WebSocket transport -> queryable row`.
+//! These exercise the prototype product path against a real QuestDB server:
+//! `Buffer -> replay payload -> frame queue -> manual driver -> real WebSocket
+//! transport -> queryable row`.
 
+use std::fs;
 use std::io::{Error as IoError, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ingress::qwp_ws_test_support::{
-    DeliveryOutcome, ManualDriverPrototype, QwpWsPublicationDriver, VolatileFrameQueue,
-    VolatileQueueOptions, connect_blocking_transport,
+    CloseOutcome, DeliveryOutcome, ManualDriverPrototype, QwpWsPublicationDriver, SfaFrameQueue,
+    SfaQueueOptions, VolatileFrameQueue, VolatileQueueOptions, connect_blocking_transport,
 };
 use crate::ingress::{Buffer, TimestampNanos};
+use tempfile::TempDir;
 
 use super::{TestError, TestResult};
 
@@ -171,6 +174,72 @@ fn qwp_ws_publication_driver_reconnect_replays_only_unacked_rows() -> TestResult
     Ok(())
 }
 
+#[test]
+#[ignore = "requires a real QuestDB server and QDB_QWP_WS_SFA_PROBE=1"]
+fn qwp_ws_sfa_recovered_frame_is_delivered_and_cleaned_up() -> TestResult {
+    if std::env::var("QDB_QWP_WS_SFA_PROBE").as_deref() != Ok("1") {
+        eprintln!("set QDB_QWP_WS_SFA_PROBE=1 to run the real-server SFA replay probe");
+        return Ok(());
+    }
+
+    let config = ProbeConfig::from_env()?;
+    let table = unique_table_name("qwp_sfa_probe");
+    eprintln!("QuestDB build: {}", query_build(&config)?);
+    eprintln!("probe table: {table}");
+    let _cleanup = TableCleanup::new(config.clone(), table.clone());
+    let sf_dir = TempDir::new()?;
+
+    let receipt = {
+        let transport = connect_blocking_transport(
+            config.host.clone(),
+            config.qwp_ws_port.to_string(),
+            config.auth_header.clone(),
+        )?;
+        let queue = SfaFrameQueue::open(sfa_options(sf_dir.path())).map_err(proto_err)?;
+        let driver = ManualDriverPrototype::from_queue(queue, transport);
+        let mut publisher = QwpWsPublicationDriver::new(driver, 1);
+        let row = build_row(&table, "SYM_SFA_REPLAYED", 77, 777.5, 77)?;
+
+        publisher
+            .try_submit_qwp(row.as_qwp().unwrap())
+            .map_err(proto_err)?
+    };
+    assert_eq!(
+        sfa_file_count(sf_dir.path())?,
+        1,
+        "unacknowledged SFA frame must remain recoverable after sender drop"
+    );
+
+    let transport = connect_blocking_transport(
+        config.host.clone(),
+        config.qwp_ws_port.to_string(),
+        config.auth_header.clone(),
+    )?;
+    let queue = SfaFrameQueue::open(sfa_options(sf_dir.path())).map_err(proto_err)?;
+    let driver = ManualDriverPrototype::from_queue(queue, transport);
+    let mut publisher = QwpWsPublicationDriver::new(driver, 1);
+
+    assert_eq!(
+        publisher.wait_steps(receipt, 8).map_err(proto_err)?,
+        DeliveryOutcome::Acked
+    );
+    assert_eq!(
+        publisher.close_drain_steps(0).map_err(proto_err)?,
+        CloseOutcome::Drained
+    );
+    assert_eq!(
+        sfa_file_count(sf_dir.path())?,
+        0,
+        "cleanly ACKed SFA frames must not replay on the next sender"
+    );
+
+    let count = wait_for_count(&config, &table, 1, Duration::from_secs(10))?;
+    assert_eq!(count, 1);
+    assert!(has_row(&config, &table, "SYM_SFA_REPLAYED", 77, 777.5)?);
+
+    Ok(())
+}
+
 fn build_row(table: &str, sym: &str, qty: i64, px: f64, ts_offset: i64) -> ProbeResult<Buffer> {
     let mut buffer = Buffer::new_qwp();
     buffer
@@ -180,6 +249,31 @@ fn build_row(table: &str, sym: &str, qty: i64, px: f64, ts_offset: i64) -> Probe
         .column_f64("px", px)?
         .at(TimestampNanos::new(1_700_000_000_000_000_000 + ts_offset))?;
     Ok(buffer)
+}
+
+fn sfa_options(slot_dir: &Path) -> SfaQueueOptions {
+    SfaQueueOptions {
+        slot_dir: slot_dir.to_path_buf(),
+        segment_size_bytes: 64 * 1024,
+        max_frames: 8,
+        max_bytes: 64 * 1024,
+        max_in_flight: 4,
+    }
+}
+
+fn sfa_file_count(dir: &Path) -> ProbeResult<usize> {
+    let mut count = 0usize;
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".sfa"))
+        {
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 struct TableCleanup {

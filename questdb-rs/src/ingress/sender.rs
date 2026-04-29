@@ -64,10 +64,11 @@ pub use qwp_ws_ownership::*;
 #[cfg(all(test, feature = "sync-sender-qwp-ws"))]
 pub(crate) mod qwp_ws_test_support {
     pub(crate) use super::qwp_ws_driver::{
-        BlockingQwpWsTransport, DeliveryOutcome, ManualDriverPrototype,
+        BlockingQwpWsTransport, CloseOutcome, DeliveryOutcome, ManualDriverPrototype,
     };
     pub(crate) use super::qwp_ws_publisher::QwpWsPublicationDriver;
     pub(crate) use super::qwp_ws_queue::{VolatileFrameQueue, VolatileQueueOptions};
+    pub(crate) use super::qwp_ws_sfa_queue::{SfaFrameQueue, SfaQueueOptions};
 
     pub(crate) fn connect_blocking_transport(
         host: impl Into<String>,
