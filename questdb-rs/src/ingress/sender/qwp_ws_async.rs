@@ -340,7 +340,6 @@ impl AsyncSender {
             let enc = &mut *enc_guard;
             let version = *self.inner.negotiated_version.lock().unwrap();
             let seq = enc.next_sequence;
-            enc.next_sequence = enc.next_sequence.wrapping_add(1);
 
             enc.scratch.message.clear();
             qwp.encode_ws_message(
@@ -349,6 +348,7 @@ impl AsyncSender {
                 &mut enc.schema_registry,
                 version,
             )?;
+            enc.next_sequence = enc.next_sequence.wrapping_add(1);
 
             let mut frame = Vec::with_capacity(enc.scratch.message.len() + 14);
             codec::write_frame_to_buf(

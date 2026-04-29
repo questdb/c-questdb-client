@@ -325,14 +325,12 @@ pub(super) fn parse_response(payload: &[u8], expected_seq: u64) -> crate::Result
 /// Variant of `parse_response` for pipelined senders: rather than verifying a
 /// single expected sequence, return the sequence so the caller can dispatch
 /// the result to the matching in-flight request.
-#[cfg(feature = "_async-sender")]
 pub(super) enum PipelinedResponse {
     Ok { sequence: u64 },
     DurableAck,
     Error { sequence: u64, err: crate::Error },
 }
 
-#[cfg(feature = "_async-sender")]
 pub(super) fn parse_pipelined_response(payload: &[u8]) -> crate::Result<PipelinedResponse> {
     if payload.is_empty() {
         return Err(error::fmt!(SocketError, "Empty QWP response frame"));

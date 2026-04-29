@@ -1,13 +1,14 @@
 # QWP/WebSocket pipelined Store-and-Forward handover
 
-Date: 2026-04-28
+Date: 2026-04-29
 
 Status: active validation branch for the Rust client plus C FFI shape.
 
 This is no longer only a design discussion. Steps 1-11 are validated by docs,
-Rust prototypes, real-server probes, and C ABI shape stubs. Step 12 has started:
-the manual driver now has an explicit Rust transport seam, but real WebSocket I/O
-is not wired into the new pipelined Store-and-Forward core yet.
+Rust prototypes, real-server probes, and C ABI shape stubs. Step 12 has a first
+Rust-only blocking WS/WSS transport adapter behind the manual driver seam, but
+the new pipelined Store-and-Forward core is not wired into the public product
+API or C ABI yet.
 
 Do not read this as production readiness. The existing `qwpws` sync/async sender
 paths still exist separately. The new pipelined/SF sender core is being built
@@ -23,6 +24,8 @@ behind prototypes before product API integration.
   policy notes.
 - `doc/QWP_WEBSOCKET_ERROR_TAXONOMY_PROBE.md` - latest real-server error
   taxonomy results.
+- `doc/QWP_WEBSOCKET_REAL_TRANSPORT_PROTOTYPE.md` - first real blocking WS/WSS
+  transport slice for the manual driver.
 - `questdb-rs/src/ingress/sender/qwp_ws_driver.rs` - current manual driver
   prototype and transport seam.
 - `questdb-rs/src/ingress/sender/qwp_ws_queue.rs` - volatile queue prototype.
@@ -50,26 +53,33 @@ Current branch:
 ia_qwp_ws
 ```
 
-Most recent code checkpoint before this handover refresh:
+Most recent code checkpoint before the 2026-04-29 working-copy changes:
 
 ```text
 2ef1d4c Refine QWP WebSocket transport seam
 ```
 
-Recent validation from that checkpoint:
+Recent validation after the Step 12 blocking transport slice:
 
 ```bash
+cargo test --manifest-path questdb-rs/Cargo.toml encode_failure_does_not_consume_sequence
+cargo test --manifest-path questdb-rs/Cargo.toml qwp_ws_driver
+cargo test --manifest-path questdb-rs/Cargo.toml blocking_real_
 cargo test --manifest-path questdb-rs/Cargo.toml qwp_ws
+cargo test --manifest-path questdb-rs/Cargo.toml --features async-sender-qwp-ws qwp_ws_async
 cargo fmt --manifest-path questdb-rs/Cargo.toml --check
-cargo test --manifest-path questdb-rs-ffi/Cargo.toml qwpws
 git diff --check
 ```
 
 Observed result:
 
 ```text
-qwp_ws: 109 passed, 3 ignored
-qwpws FFI shape: 17 passed
+encode failure regression: 1 passed
+qwp_ws_driver: 43 passed
+blocking real transport mock tests: 3 passed
+qwp_ws: 113 passed, 3 ignored
+qwp_ws_async with async-sender-qwp-ws: 8 passed
+format and whitespace checks passed
 ```
 
 The ignored tests are real-server probes gated by environment variables.
@@ -202,6 +212,19 @@ This seam was refined because the first transport split had two problems:
 
 Both are fixed in the current branch.
 
+The first real transport adapter now exists as `BlockingQwpWsTransport` behind
+the same seam. It reuses the current sync QWP/WebSocket TCP/TLS/upgrade/frame
+helpers, writes masked client frames, parses real QWP/WebSocket response frames,
+handles cumulative ACK after multiple sends, and is covered by local in-process
+plain WS and WSS tests. This is still a manual-driver prototype path, not public
+product API integration.
+
+The next architectural seam is above the queue: product submission must encode a
+caller `Buffer` into a self-sufficient replay payload, then publish those bytes
+to the queue. The current driver tests still submit opaque payload bytes
+directly, which is correct for transport validation but not sufficient for the
+next real-server product-path gate.
+
 ### C ABI shape stubs
 
 The public C header and Rust FFI crate contain shape-only QWP/WebSocket stubs:
@@ -255,11 +278,20 @@ conversion before the real driver is wired through.
   FSN, not terminalize all later in-flight frames by default.
 - Events are observability notifications, not authoritative state; receipt
   status and wait/close outcomes are authoritative.
+- Fallible work must not advance externally visible state before its commit
+  point: encode failure does not consume wire sequence; failed payload
+  materialization does not return a receipt; failed local/SF publication does
+  not clear the caller buffer; failed transport write does not mark `Sent`.
+- Blocking real transports may need send-before-poll progress so coalesced ACKs
+  cannot stall the in-flight window. Fake transports can remain poll-first for
+  protocol-error fixtures.
 
 ## Known gaps and risks
 
-- Real WebSocket integration for the new manual driver is still the next major
-  implementation step.
+- A Rust-only `Buffer -> replay payload -> queue` publication shell has not been
+  wired into the manual driver/core path yet.
+- Real-server validation through the new manual driver transport is still
+  missing for the full publication path.
 - `open_mode=connected` vs `open_mode=lazy` has design text but no real new-core
   implementation.
 - The FFI shape stubs are not connected to the real queue/driver prototypes.
@@ -273,8 +305,9 @@ conversion before the real driver is wired through.
   real-server probe.
 - Auth/upgrade rejection and ambiguous operational write/internal errors still
   need taxonomy validation.
-- The real transport must preserve the two-phase send rule: no `Sent` commit
-  before the transport accepts the local write.
+- The real transport adapter has local mock WS/WSS coverage, but not yet a real
+  QuestDB submit/wait or reconnect replay probe through
+  `Buffer -> replay payload -> queue -> BlockingQwpWsTransport`.
 - The v1 dense dictionary replay shape is correctness-first and can be expensive
   for long-running high-cardinality symbol workloads.
 
@@ -282,25 +315,24 @@ conversion before the real driver is wired through.
 
 Continue Step 12, but keep it narrow.
 
-Implement the first real transport adapter behind `ManualDriverTransport` rather
-than changing public API or FFI. The adapter should prove that the existing
-driver seam can handle real WebSocket I/O.
+Add a Rust-only publication shell first, then one real-server integration/probe
+that uses `BlockingQwpWsTransport` through the manual driver seam, not the old
+sync sender path.
 
 Suggested slice:
 
-1. Add a small blocking WebSocket transport object for the manual driver.
-2. Reuse existing upgrade/frame helpers from the current sync QWP/WebSocket path
-   where practical.
-3. Keep payload ownership as borrowed `OutboundFrame` input for now; do not
-   introduce background tasks or async buffering in the core.
-4. Map read/write EOF and local I/O failures to `TransportFailure`.
-5. Map QWP OK/error responses to `TransportResponse::Ack` and
-   `TransportResponse::Reject`.
-6. Preserve the two-phase send behavior in tests:
-   write failure before commit leaves receipt `Published`;
-   accepted write followed by reconnect failure can leave receipt `Sent`.
-7. Add one real-server integration/probe that uses the manual driver seam, not
-   the old sync sender, for a valid submit/wait and a reconnect replay case.
+1. Add a narrow Rust-only owner for replay encoding state:
+   `QwpWsEncodeScratch`, `SymbolGlobalDict`, negotiated QWP version, and queue.
+2. Make its submit path perform `Buffer -> encode_ws_replay_message -> queue
+   publication`, returning a receipt only after successful publication.
+3. Verify failed encoding/publication does not clear the caller buffer or
+   consume externally visible sequence/receipt state.
+4. Run valid submit/wait against a real QuestDB QWP/WebSocket endpoint through
+   that publication path and `BlockingQwpWsTransport`.
+5. Add a reconnect replay case through the same path.
+6. Keep this as an ignored/gated probe until the required QuestDB server setup is
+   explicit and cheap to reproduce.
+7. Record observed ACK, close, and error behavior in a short reflection note.
 
 Do not start with threaded adapters, C++/Python wrappers, SF compaction, or
 performance optimization. The main de-risking question is whether real blocking

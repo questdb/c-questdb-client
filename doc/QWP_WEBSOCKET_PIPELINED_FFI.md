@@ -145,6 +145,11 @@ Properties:
 - `drive_once()` is the low-level progress primitive. It performs bounded I/O,
   reconnect, replay, ACK handling, poison handling, and event production, but it
   does not consume events. `poll_event()` is the only event consumer.
+- For blocking transports, `drive_once()` should prefer sending already
+  published frames while the in-flight window has room before performing a
+  blocking response poll. A blocking read must only happen when there is
+  in-flight work to observe and no immediately sendable frame, or when a
+  higher-level wait/close loop is explicitly waiting for delivery progress.
 - `wait()` is a convenience loop over `drive_once()` plus receipt-status checks.
 
 The low-level type should prefer `&mut self` methods. That gives Rust callers a clear single-driver ownership model and avoids internal locks on the hot path.
@@ -229,6 +234,23 @@ If submission fails before publication, the buffer is not cleared.
 If submission succeeds, the caller can immediately reuse the buffer. Server ACK or rejection is reported later through the receipt and event APIs.
 
 This means the sender cannot hold references into the caller buffer. It must copy encoded bytes into sender-owned memory or SF storage. The steady-state no-allocation requirement is met by sizing and reusing that storage, not by borrowing the caller buffer.
+
+### Commit-point invariant
+
+Fallible work must not advance externally observable state before its commit
+point:
+
+- encoding failure must not consume a QWP/WebSocket wire sequence,
+- failed payload materialization must not assign an FSN or return a receipt,
+- failed local publication must not clear the caller buffer,
+- failed SF append must not advance the published cursor,
+- failed transport write/flush must not mark a frame `Sent`,
+- failed durable completion write must not report ACKed or poisoned completion
+  in SF mode.
+
+This invariant is more important than the internal helper boundaries. The core
+may refactor encoding, queue, and transport code, but the observable state
+transitions must remain commit-after-success.
 
 ## Self-sufficient replay frames
 
@@ -1148,13 +1170,13 @@ Candidate config keys:
 
 ## First implementation slice
 
-1. Add the threadless `QwpWsSender` core with `queue_mode=volatile` only.
-2. Return value receipts from `submit`; no completion handles.
-3. Implement fixed-capacity in-flight table and event ring.
-4. Implement `drive_once`, `wait`, and close semantics.
-5. Add the Java-style self-sufficient replay encoder path and tests proving a later frame replays alone on a fresh connection.
-6. Add Java/Rust golden payload fixtures for replay-mode QWP bytes.
-7. Encode all frames published by the new core in self-sufficient replay form.
+1. Add the Java-style self-sufficient replay encoder path and tests proving a later frame replays alone on a fresh connection.
+2. Add Java/Rust golden payload fixtures for replay-mode QWP bytes.
+3. Add the threadless `QwpWsSender` core with `queue_mode=volatile` only.
+4. Wire `submit` through `Buffer -> replay payload -> queue publication`; return value receipts only after publication.
+5. Implement fixed-capacity in-flight table and event ring.
+6. Implement `drive_once`, `wait`, and close semantics.
+7. Validate the full Rust-only path against real QWP/WebSocket: replay payload publication, manual driver transport, ACK, and reconnect replay.
 8. Add C ABI for construct, new buffer, submit, drive, poll event, wait, receipt status, close.
 9. Add mock-server tests for pipelining, cumulative ACKs, ordered server errors, close, and no buffer clear on failed submit.
 10. Add file-backed `queue_mode=sf` segment storage and recovery.

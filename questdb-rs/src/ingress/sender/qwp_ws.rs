@@ -330,7 +330,7 @@ fn read_http_header_block<R: Read>(stream: &mut R) -> crate::Result<Vec<u8>> {
 
 /// Establish a fresh QWP/WebSocket connection: TCP → optional TLS → HTTP
 /// upgrade. Returns the connected stream and the version the server picked.
-fn establish_connection(
+pub(crate) fn establish_connection(
     host: &str,
     port: &str,
     use_tls: bool,
@@ -495,7 +495,6 @@ fn is_transport_error(err: &crate::Error) -> bool {
 
 fn flush_once(state: &mut SyncQwpWsHandlerState, buffer: &QwpBuffer) -> crate::Result<()> {
     let seq = state.sequence;
-    state.sequence = state.sequence.wrapping_add(1);
 
     state.scratch.message.clear();
     buffer.encode_ws_message(
@@ -504,6 +503,7 @@ fn flush_once(state: &mut SyncQwpWsHandlerState, buffer: &QwpBuffer) -> crate::R
         &mut state.schema_registry,
         state.negotiated_version,
     )?;
+    state.sequence = state.sequence.wrapping_add(1);
 
     write_binary_frame(
         &mut state.stream,
@@ -607,5 +607,60 @@ mod tests {
         assert_eq!(out[0], 0x82); // FIN | binary
         assert_eq!(out[1] & 0x80, 0x80); // masked
         assert_eq!(out[1] & 0x7F, 5); // length
+    }
+
+    #[test]
+    fn encode_failure_does_not_consume_sequence() {
+        use crate::ingress::Buffer;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let (_server, _) = listener.accept().unwrap();
+
+        let qwp_ws = QwpWsConfig::default();
+        let mut state = SyncQwpWsHandlerState {
+            stream: WsStream::Plain(client),
+            request_timeout: *qwp_ws.request_timeout,
+            negotiated_version: 1,
+            global_dict: SymbolGlobalDict::new(),
+            schema_registry: SchemaRegistry::new(),
+            scratch: QwpWsEncodeScratch::new(),
+            recv: Vec::new(),
+            send_buf: Vec::new(),
+            request_durable_ack: false,
+            sequence: 7,
+            reconnect: ReconnectParams {
+                host: "127.0.0.1".to_string(),
+                port: port.to_string(),
+                use_tls: false,
+                tls_settings: None,
+                auth_header: None,
+                qwp_ws,
+                on_failover_reset: None,
+            },
+            terminal_error: None,
+        };
+
+        let mut buffer = Buffer::qwp_with_max_name_len(127);
+        for i in 0..=u16::MAX {
+            let table = format!("t{i}");
+            buffer
+                .table(table.as_str())
+                .unwrap()
+                .column_i64("v", i as i64)
+                .unwrap()
+                .at_now()
+                .unwrap();
+        }
+
+        let err = flush_once(&mut state, buffer.as_qwp().unwrap()).unwrap_err();
+
+        assert!(
+            err.msg().contains("WS message table count exceeds maximum"),
+            "got: {}",
+            err.msg()
+        );
+        assert_eq!(state.sequence, 7);
     }
 }

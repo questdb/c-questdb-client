@@ -11,7 +11,7 @@ then stop for reflection before adding the next layer.
 
 ## Current progress
 
-As of 2026-04-28:
+As of 2026-04-29:
 
 - Step 1 has a sketch in `doc/QWP_WEBSOCKET_API_SKETCH.md`.
 - Step 2 has a type-only ownership prototype and reflection in
@@ -44,13 +44,14 @@ As of 2026-04-28:
   The public C header parses as C and C++; receipt status uses
   `line_sender_qwpws_get_receipt_status` to avoid the C typedef/function
   namespace collision.
-- Step 12 has started with a Rust-only transport seam for the manual driver:
-  fake-server behavior is now behind `ManualDriverTransport`, queued payload
-  bytes are passed through the seam, and the queue/driver boundary is two-phase:
-  transport write success commits `Sent`, while write failure leaves the receipt
-  `Published` and enters the reconnect policy. A non-fake test transport covers
-  accepted-send failure, pre-commit write failure, and read-side poll failure
-  before real WebSocket I/O is wired in.
+- Step 12 has a first real blocking WS/WSS transport adapter behind
+  `ManualDriverTransport`, with reflection in
+  `doc/QWP_WEBSOCKET_REAL_TRANSPORT_PROTOTYPE.md`. The adapter reuses the
+  existing sync connection and frame helpers, keeps stored payload identity as
+  unmasked QWP bytes, preserves the two-phase send rule, and handles cumulative
+  ACK after multiple sends. It is validated against in-process plain WS and WSS
+  mock servers, not yet against a real QuestDB server through the manual driver
+  or through a `Buffer -> replay payload -> queue` publication shell.
 - Extended Java/Rust fixtures for arrays, decimals, UTF-8 strings, sparse
   columns, and schema evolution remain recommended before hardening the full
   product surface.
@@ -607,6 +608,8 @@ validated queue and public API shape.
 
 Validation target:
 
+- A Rust-only publication shell encodes a caller `Buffer` into a
+  self-sufficient replay payload before queue publication.
 - Real connection setup fits `open_mode=connected` and `open_mode=lazy`.
 - Client-to-server frames are masked on the wire, but durable/SF records remain
   unmasked QWP payloads.
@@ -615,11 +618,15 @@ Validation target:
 - Masked server-to-client frames are treated as WebSocket protocol errors.
 - Real cumulative ACK handling matches the fake-server model.
 - Reconnect and replay do not require public API changes.
+- Real-server submit/wait and reconnect replay use the same publication path
+  intended for the product core, not opaque test payload bytes.
 - Authentication, WebSocket upgrade, and close behavior map into the existing
   error/outcome model.
 
 Design pressure to watch:
 
+- If the publication shell makes `submit()` allocate or mutate caller buffers
+  before successful publication, revisit the commit points before adding FFI.
 - If networking forces public API changes, revisit the fake-server assumptions.
 - If the real protocol requires hidden tasks to make progress, the low-level
   contract has been violated.

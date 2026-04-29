@@ -31,7 +31,20 @@
 //! `&mut self`, preserving the one-progress-owner rule from Step 2.
 
 use std::collections::VecDeque;
+#[cfg(feature = "sync-sender-qwp-ws")]
+use std::io::Write;
 
+#[cfg(feature = "sync-sender-qwp-ws")]
+use crate::ErrorCode;
+#[cfg(feature = "sync-sender-qwp-ws")]
+use crate::ingress::conf::QwpWsConfig;
+#[cfg(feature = "sync-sender-qwp-ws")]
+use crate::ingress::tls::TlsSettings;
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+use super::qwp_ws::{WsStream, establish_connection, read_message, write_binary_frame};
+#[cfg(feature = "sync-sender-qwp-ws")]
+use super::qwp_ws_codec::{self as codec, PipelinedResponse, WS_OPCODE_BINARY};
 use super::qwp_ws_queue::{
     OutboundFrame, QueueError, QwpReceipt, QwpReceiptStatus, SentFrame, VolatileFrameQueue,
     VolatileQueueOptions,
@@ -187,10 +200,12 @@ impl<Q: ManualDriverQueue, T: ManualDriverTransport> ManualDriverPrototype<Q, T>
             return Ok(DriveOutcome::Terminal);
         }
 
-        match self.transport.poll_response() {
-            Ok(Some(response)) => return self.apply_response(response),
-            Ok(None) => {}
-            Err(failure) => return self.apply_transport_failure(failure),
+        if !self.transport.send_before_poll() {
+            match self.transport.poll_response() {
+                Ok(Some(response)) => return self.apply_response(response),
+                Ok(None) => {}
+                Err(failure) => return self.apply_transport_failure(failure),
+            }
         }
 
         match self.queue.next_outbound_frame() {
@@ -214,7 +229,17 @@ impl<Q: ManualDriverQueue, T: ManualDriverTransport> ManualDriverPrototype<Q, T>
             }
             Err(DriverError::Queue(
                 QueueError::NoUnsentFrame | QueueError::MaxInFlightReached { .. },
-            )) => Ok(DriveOutcome::Idle),
+            )) => {
+                if self.transport.send_before_poll() {
+                    match self.transport.poll_response() {
+                        Ok(Some(response)) => self.apply_response(response),
+                        Ok(None) => Ok(DriveOutcome::Idle),
+                        Err(failure) => self.apply_transport_failure(failure),
+                    }
+                } else {
+                    Ok(DriveOutcome::Idle)
+                }
+            }
             Err(
                 err @ (DriverError::Queue(
                     QueueError::InvalidCapacity
@@ -428,12 +453,165 @@ pub(crate) trait ManualDriverTransport {
         frame: OutboundFrame<'_>,
     ) -> Result<TransportSendResult, TransportFailure>;
 
+    fn send_before_poll(&self) -> bool {
+        false
+    }
+
     fn restart_connection(&mut self, _reason: ReconnectReason) -> Result<(), DriverError> {
         Ok(())
     }
 
     fn sent_frames(&self) -> &[SentFrame] {
         &[]
+    }
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+pub(crate) struct BlockingQwpWsTransport {
+    host: String,
+    port: String,
+    use_tls: bool,
+    tls_settings: Option<TlsSettings>,
+    qwp_ws: QwpWsConfig,
+    auth_header: Option<String>,
+    stream: WsStream,
+    recv: Vec<u8>,
+    send_buf: Vec<u8>,
+    pending_wire_sequences: VecDeque<u64>,
+    sent_frames: Vec<SentFrame>,
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+impl BlockingQwpWsTransport {
+    pub(crate) fn connect(
+        host: impl Into<String>,
+        port: impl Into<String>,
+        use_tls: bool,
+        tls_settings: Option<TlsSettings>,
+        qwp_ws: QwpWsConfig,
+        auth_header: Option<String>,
+    ) -> crate::Result<Self> {
+        let host = host.into();
+        let port = port.into();
+        let (stream, _version) = establish_connection(
+            &host,
+            &port,
+            use_tls,
+            tls_settings.clone(),
+            &qwp_ws,
+            auth_header.as_deref(),
+        )?;
+        Ok(Self {
+            host,
+            port,
+            use_tls,
+            tls_settings,
+            qwp_ws,
+            auth_header,
+            stream,
+            recv: Vec::new(),
+            send_buf: Vec::with_capacity(16 * 1024),
+            pending_wire_sequences: VecDeque::new(),
+            sent_frames: Vec::new(),
+        })
+    }
+
+    fn reconnect(&mut self) -> Result<(), DriverError> {
+        let (stream, _version) = establish_connection(
+            &self.host,
+            &self.port,
+            self.use_tls,
+            self.tls_settings.clone(),
+            &self.qwp_ws,
+            self.auth_header.as_deref(),
+        )
+        .map_err(|_| DriverError::Transport)?;
+        self.stream = stream;
+        self.recv.clear();
+        self.send_buf.clear();
+        self.pending_wire_sequences.clear();
+        Ok(())
+    }
+
+    fn complete_pending_through(&mut self, sequence: u64) {
+        while let Some(wire_seq) = self.pending_wire_sequences.front() {
+            if *wire_seq > sequence {
+                break;
+            }
+            self.pending_wire_sequences.pop_front();
+        }
+    }
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+impl ManualDriverTransport for BlockingQwpWsTransport {
+    fn send_before_poll(&self) -> bool {
+        true
+    }
+
+    fn poll_response(&mut self) -> Result<Option<TransportResponse>, TransportFailure> {
+        if self.pending_wire_sequences.is_empty() {
+            return Ok(None);
+        }
+
+        let opcode =
+            read_message(&mut self.stream, &mut self.send_buf, &mut self.recv).map_err(|err| {
+                match err.code() {
+                    ErrorCode::SocketError => TransportFailure::Disconnect,
+                    ErrorCode::AuthError | ErrorCode::ProtocolVersionError => {
+                        TransportFailure::Terminal
+                    }
+                    _ => TransportFailure::Terminal,
+                }
+            })?;
+        if opcode != WS_OPCODE_BINARY {
+            return Err(TransportFailure::Terminal);
+        }
+
+        match codec::parse_pipelined_response(&self.recv) {
+            Ok(PipelinedResponse::Ok { sequence }) => {
+                self.complete_pending_through(sequence);
+                Ok(Some(TransportResponse::Ack { wire_seq: sequence }))
+            }
+            Ok(PipelinedResponse::DurableAck) => Ok(None),
+            Ok(PipelinedResponse::Error { sequence, err }) => match err.code() {
+                ErrorCode::InvalidApiCall => {
+                    self.complete_pending_through(sequence);
+                    Ok(Some(TransportResponse::Reject { wire_seq: sequence }))
+                }
+                ErrorCode::ServerFlushError | ErrorCode::SocketError => {
+                    Err(TransportFailure::Retryable)
+                }
+                ErrorCode::AuthError | ErrorCode::ProtocolVersionError => {
+                    Err(TransportFailure::Terminal)
+                }
+                _ => Err(TransportFailure::Terminal),
+            },
+            Err(_) => Err(TransportFailure::Terminal),
+        }
+    }
+
+    fn send_frame(
+        &mut self,
+        frame: OutboundFrame<'_>,
+    ) -> Result<TransportSendResult, TransportFailure> {
+        let sent_frame = frame.sent_frame();
+        write_binary_frame(&mut self.stream, &mut self.send_buf, frame.payload)
+            .map_err(|_| TransportFailure::Disconnect)?;
+        self.stream
+            .flush()
+            .map_err(|_| TransportFailure::Disconnect)?;
+        self.pending_wire_sequences.push_back(frame.wire_seq);
+        self.sent_frames.push(sent_frame);
+        Ok(TransportSendResult::NoResponse)
+    }
+
+    fn restart_connection(&mut self, _reason: ReconnectReason) -> Result<(), DriverError> {
+        self.reconnect()
+    }
+
+    fn sent_frames(&self) -> &[SentFrame] {
+        &self.sent_frames
     }
 }
 
@@ -758,7 +936,26 @@ mod tests {
     use super::super::qwp_ws_sf_queue::SfQueueOptions;
     use super::*;
     use std::collections::VecDeque;
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    use std::fs::File;
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    use std::io::{Read, Write};
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    use std::net::TcpListener;
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    use std::sync::mpsc;
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    use std::thread;
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    use std::time::Duration;
     use tempfile::TempDir;
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    use rustls::{ServerConfig, StreamOwned, server::ServerConnection};
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    use rustls_pki_types::pem::PemObject;
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
     fn options(max_frames: usize, max_bytes: usize, max_in_flight: usize) -> VolatileQueueOptions {
         VolatileQueueOptions {
@@ -890,6 +1087,209 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    fn tls_certs_dir() -> std::path::PathBuf {
+        let mut certs_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        certs_dir.pop();
+        certs_dir.push("tls_certs");
+        certs_dir
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    fn tls_server_config() -> std::sync::Arc<ServerConfig> {
+        let certs_dir = tls_certs_dir();
+        let cert_file = File::open(certs_dir.join("server.crt")).unwrap();
+        let private_key_file = File::open(certs_dir.join("server.key")).unwrap();
+        let certs = CertificateDer::pem_reader_iter(cert_file)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let private_key = PrivateKeyDer::from_pem_reader(private_key_file).unwrap();
+        std::sync::Arc::new(
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(certs, private_key)
+                .unwrap(),
+        )
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    fn tls_client_settings() -> TlsSettings {
+        let cert_file = File::open(tls_certs_dir().join("server_rootCA.pem")).unwrap();
+        let certs = CertificateDer::pem_reader_iter(cert_file)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        TlsSettings::PemFile(certs)
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    fn read_request_until_blank<S: Read>(stream: &mut S) -> std::io::Result<String> {
+        let mut bytes = Vec::new();
+        let mut tmp = [0u8; 256];
+        loop {
+            let n = stream.read(&mut tmp)?;
+            if n == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&tmp[..n]);
+            if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        Ok(String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    fn header_value(request: &str, name: &str) -> String {
+        request
+            .split("\r\n")
+            .find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                key.trim()
+                    .eq_ignore_ascii_case(name)
+                    .then(|| value.trim().to_string())
+            })
+            .unwrap()
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    fn read_client_frame<S: Read>(stream: &mut S) -> std::io::Result<Vec<u8>> {
+        let mut hdr = [0u8; 2];
+        stream.read_exact(&mut hdr)?;
+        let len_short = hdr[1] & 0x7f;
+        let payload_len = match len_short {
+            126 => {
+                let mut bytes = [0u8; 2];
+                stream.read_exact(&mut bytes)?;
+                u16::from_be_bytes(bytes) as usize
+            }
+            127 => {
+                let mut bytes = [0u8; 8];
+                stream.read_exact(&mut bytes)?;
+                u64::from_be_bytes(bytes) as usize
+            }
+            len => len as usize,
+        };
+        let mut mask = [0u8; 4];
+        stream.read_exact(&mut mask)?;
+        let mut payload = vec![0u8; payload_len];
+        stream.read_exact(&mut payload)?;
+        for (index, byte) in payload.iter_mut().enumerate() {
+            *byte ^= mask[index & 3];
+        }
+        Ok(payload)
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    fn write_server_binary_frame<S: Write>(stream: &mut S, payload: &[u8]) -> std::io::Result<()> {
+        let mut frame = vec![0x82];
+        match payload.len() {
+            len @ 0..=125 => frame.push(len as u8),
+            len @ 126..=0xffff => {
+                frame.push(126);
+                frame.extend_from_slice(&(len as u16).to_be_bytes());
+            }
+            len => {
+                frame.push(127);
+                frame.extend_from_slice(&(len as u64).to_be_bytes());
+            }
+        }
+        frame.extend_from_slice(payload);
+        stream.write_all(&frame)
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    fn write_ok_response<S: Write>(stream: &mut S, wire_seq: u64) -> std::io::Result<()> {
+        let mut ok = vec![0u8];
+        ok.extend_from_slice(&wire_seq.to_le_bytes());
+        ok.extend_from_slice(&0u16.to_le_bytes());
+        write_server_binary_frame(stream, &ok)
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    #[derive(Clone, Copy)]
+    enum RealServerAckMode {
+        AckEach,
+        CumulativeAfterAll,
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    fn serve_qwp_ws_connection<S: Read + Write>(
+        stream: &mut S,
+        frames: usize,
+        payload_tx: mpsc::Sender<Vec<u8>>,
+        ack_mode: RealServerAckMode,
+    ) {
+        let request = read_request_until_blank(stream).unwrap();
+        let accept = codec::compute_accept(&header_value(&request, "Sec-WebSocket-Key"));
+        let response = format!(
+            "HTTP/1.1 101 Switching Protocols\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Accept: {accept}\r\n\
+             X-QWP-Version: 1\r\n\
+             \r\n"
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+
+        match ack_mode {
+            RealServerAckMode::AckEach => {
+                for wire_seq in 0..frames {
+                    let payload = read_client_frame(stream).unwrap();
+                    payload_tx.send(payload).unwrap();
+                    write_ok_response(stream, wire_seq as u64).unwrap();
+                }
+            }
+            RealServerAckMode::CumulativeAfterAll => {
+                for _ in 0..frames {
+                    let payload = read_client_frame(stream).unwrap();
+                    payload_tx.send(payload).unwrap();
+                }
+                if frames > 0 {
+                    write_ok_response(stream, frames as u64 - 1).unwrap();
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    fn spawn_real_qwp_ws_server(
+        use_tls: bool,
+        frames: usize,
+    ) -> (String, u16, mpsc::Receiver<Vec<u8>>) {
+        spawn_real_qwp_ws_server_with_ack_mode(use_tls, frames, RealServerAckMode::AckEach)
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    fn spawn_real_qwp_ws_server_with_ack_mode(
+        use_tls: bool,
+        frames: usize,
+        ack_mode: RealServerAckMode,
+    ) -> (String, u16, mpsc::Receiver<Vec<u8>>) {
+        let host = if use_tls { "localhost" } else { "127.0.0.1" };
+        let listener = TcpListener::bind((host, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (payload_tx, payload_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            if use_tls {
+                let server = ServerConnection::new(tls_server_config()).unwrap();
+                let mut stream = StreamOwned::new(server, stream);
+                serve_qwp_ws_connection(&mut stream, frames, payload_tx, ack_mode);
+            } else {
+                let mut stream = stream;
+                serve_qwp_ws_connection(&mut stream, frames, payload_tx, ack_mode);
+            }
+        });
+        (host.to_string(), port, payload_rx)
+    }
+
     #[test]
     fn submit_returns_before_ack() {
         let mut driver = driver(FakeOrderedServer::ack_each_send());
@@ -901,6 +1301,131 @@ mod tests {
             QwpReceiptStatus::Published { fsn: 0 }
         );
         assert!(driver.sent_frames().is_empty());
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    #[test]
+    fn blocking_real_ws_transport_drives_submit_and_wait() {
+        let (host, port, payload_rx) = spawn_real_qwp_ws_server(false, 1);
+        let transport = BlockingQwpWsTransport::connect(
+            host,
+            port.to_string(),
+            false,
+            None,
+            QwpWsConfig::default(),
+            None,
+        )
+        .unwrap();
+        let mut driver = ManualDriverPrototype::from_queue(
+            VolatileFrameQueue::new(options(8, 1024, 4)).unwrap(),
+            transport,
+        );
+
+        let receipt = driver.try_submit(b"qwp-payload").unwrap();
+        let outcome = driver.wait_steps(receipt, 4).unwrap();
+
+        assert_eq!(outcome, DeliveryOutcome::Acked);
+        assert_eq!(
+            payload_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            b"qwp-payload"
+        );
+        assert_eq!(
+            driver.sent_frames(),
+            &[SentFrame {
+                fsn: 0,
+                wire_seq: 0,
+                payload_len: b"qwp-payload".len(),
+            }]
+        );
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    #[test]
+    fn blocking_real_ws_transport_handles_cumulative_ack_after_multiple_sends() {
+        let (host, port, payload_rx) =
+            spawn_real_qwp_ws_server_with_ack_mode(false, 2, RealServerAckMode::CumulativeAfterAll);
+        let transport = BlockingQwpWsTransport::connect(
+            host,
+            port.to_string(),
+            false,
+            None,
+            QwpWsConfig::default(),
+            None,
+        )
+        .unwrap();
+        let mut driver = ManualDriverPrototype::from_queue(
+            VolatileFrameQueue::new(options(8, 1024, 4)).unwrap(),
+            transport,
+        );
+
+        let first = driver.try_submit(b"qwp-payload-0").unwrap();
+        let second = driver.try_submit(b"qwp-payload-1").unwrap();
+        let outcome = driver.wait_steps(second, 6).unwrap();
+
+        assert_eq!(outcome, DeliveryOutcome::Acked);
+        assert_eq!(
+            driver.receipt_status(first),
+            QwpReceiptStatus::Acked { fsn: 0 }
+        );
+        assert_eq!(
+            payload_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            b"qwp-payload-0"
+        );
+        assert_eq!(
+            payload_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            b"qwp-payload-1"
+        );
+        assert_eq!(
+            driver.sent_frames(),
+            &[
+                SentFrame {
+                    fsn: 0,
+                    wire_seq: 0,
+                    payload_len: b"qwp-payload-0".len(),
+                },
+                SentFrame {
+                    fsn: 1,
+                    wire_seq: 1,
+                    payload_len: b"qwp-payload-1".len(),
+                },
+            ]
+        );
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    #[test]
+    fn blocking_real_wss_transport_drives_submit_and_wait() {
+        let (host, port, payload_rx) = spawn_real_qwp_ws_server(true, 1);
+        let transport = BlockingQwpWsTransport::connect(
+            host,
+            port.to_string(),
+            true,
+            Some(tls_client_settings()),
+            QwpWsConfig::default(),
+            None,
+        )
+        .unwrap();
+        let mut driver = ManualDriverPrototype::from_queue(
+            VolatileFrameQueue::new(options(8, 1024, 4)).unwrap(),
+            transport,
+        );
+
+        let receipt = driver.try_submit(b"qwp-secure-payload").unwrap();
+        let outcome = driver.wait_steps(receipt, 4).unwrap();
+
+        assert_eq!(outcome, DeliveryOutcome::Acked);
+        assert_eq!(
+            payload_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            b"qwp-secure-payload"
+        );
+        assert_eq!(
+            driver.sent_frames(),
+            &[SentFrame {
+                fsn: 0,
+                wire_seq: 0,
+                payload_len: b"qwp-secure-payload".len(),
+            }]
+        );
     }
 
     #[test]
