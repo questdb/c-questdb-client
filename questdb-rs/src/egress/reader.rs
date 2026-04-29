@@ -1649,6 +1649,52 @@ mod tests {
         }
     }
 
+    /// Pin the `StatusCode` → `ErrorCode` mapping. Every server-reported
+    /// terminal status maps to a distinct `ErrorCode`; a refactor that
+    /// merges two arms (e.g. lumps `LimitExceeded` and `InternalError`
+    /// together) would silently swallow useful per-status discrimination.
+    /// Adding a new `StatusCode` variant later forces this test to be
+    /// updated — that's the point.
+    #[test]
+    fn map_server_status_matrix() {
+        use crate::egress::wire::msg_kind::StatusCode as S;
+        use ErrorCode as C;
+
+        let cases: &[(S, C)] = &[
+            (S::SchemaMismatch, C::ServerSchemaMismatch),
+            (S::ParseError, C::ServerParseError),
+            (S::InternalError, C::ServerInternalError),
+            (S::SecurityError, C::ServerSecurityError),
+            (S::Cancelled, C::Cancelled),
+            (S::LimitExceeded, C::ServerLimitExceeded),
+        ];
+
+        for (status, expected_code) in cases {
+            let err = map_server_status(*status, "msg".to_string());
+            assert_eq!(
+                err.code(),
+                *expected_code,
+                "status {:?} should map to {:?}",
+                status,
+                expected_code
+            );
+            assert_eq!(err.msg(), "msg");
+        }
+
+        // Sanity: each ErrorCode in the table is unique. If two
+        // statuses ever collapse to the same code, this assertion
+        // surfaces it — the matrix above could be wrong-but-passing if
+        // both sides changed in lockstep.
+        let mut seen = std::collections::HashSet::new();
+        for (_, code) in cases {
+            assert!(
+                seen.insert(*code),
+                "ErrorCode {:?} mapped from two distinct StatusCode values",
+                code
+            );
+        }
+    }
+
     /// Pin `prefer_over_trigger`: the failover loop surfaces these
     /// codes in place of the original transport `trigger` because
     /// they tell the user *what to fix* (credentials, topology,

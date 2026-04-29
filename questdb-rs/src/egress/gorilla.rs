@@ -230,4 +230,171 @@ mod tests {
         let mut dec = GorillaDecoder::new(0, 100, &[]);
         assert!(dec.decode_next().is_err());
     }
+
+    // ------------------------------------------------------------------
+    // Fixed-vector tests
+    //
+    // The roundtrip tests above use an in-test encoder that mirrors the
+    // decoder. A symmetric encoder/decoder shift bug (e.g. both reading
+    // and writing 8 bits where the spec says 7) would round-trip
+    // cleanly but disagree with the server. The tests below pin the
+    // expected bitstream BYTES for each bucket — independent of the
+    // in-test encoder — so the wire contract is anchored against
+    // hand-coded layouts.
+    // ------------------------------------------------------------------
+
+    /// Pack a sequence of `0`/`1` bits into bytes LSB-first inside each
+    /// byte (matches the Gorilla wire layout described at the top of
+    /// this file). Independent of `GorillaEncoder`, so the resulting
+    /// bytes are a true fixed vector.
+    fn bits_to_bytes(bits: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0u8; bits.len().div_ceil(8).max(1)];
+        for (i, &b) in bits.iter().enumerate() {
+            bytes[i / 8] |= (b & 1) << (i % 8);
+        }
+        bytes
+    }
+
+    /// Seed the decoder so that `prev_delta = 0`, `prev_ts = 0`. Then a
+    /// single decoded timestamp equals the DoD itself: ts = 0 + (0 + dod).
+    fn decode_one_dod(bitstream: &[u8]) -> i64 {
+        let mut dec = GorillaDecoder::new(0, 0, bitstream);
+        dec.decode_next().unwrap()
+    }
+
+    /// Append the LSB-first bits of `value` (`n` bits, sign-truncated)
+    /// to `bits`.
+    fn push_bits_le(bits: &mut Vec<u8>, value: i64, n: u32) {
+        let mask: u64 = if n == 64 { u64::MAX } else { (1u64 << n) - 1 };
+        let v = (value as u64) & mask;
+        for i in 0..n {
+            bits.push(((v >> i) & 1) as u8);
+        }
+    }
+
+    #[test]
+    fn fixed_vector_dod_zero() {
+        // Wire layout: just the single '0' bit. After flushing, byte 0
+        // has bit 0 unset; the decoder reads bit 0 and returns DoD=0.
+        let bs = bits_to_bytes(&[0]);
+        assert_eq!(bs, vec![0x00]);
+        assert_eq!(decode_one_dod(&bs), 0);
+    }
+
+    #[test]
+    fn fixed_vector_seven_bit_bucket_min_max() {
+        // 7-bit bucket: prefix '10' (bit0=1, bit1=0), then 7 bits of
+        // `dod & 0x7F` LSB-first.
+        for &dod in &[1i64, -1, 63, -64, 32, -32, 16, -16] {
+            let mut bits = vec![1u8, 0u8];
+            push_bits_le(&mut bits, dod, 7);
+            let bs = bits_to_bytes(&bits);
+            assert_eq!(decode_one_dod(&bs), dod, "dod={}", dod);
+        }
+    }
+
+    #[test]
+    fn fixed_vector_seven_bit_bucket_byte_layout() {
+        // DoD = 1 (positive, smallest non-zero): bits = [1,0,1,0,0,0,0,0,0]
+        // Byte 0: bits 0..=7 = [1,0,1,0,0,0,0,0] = 0x05
+        // Byte 1: bit 0 = 0 → 0x00
+        let bs = bits_to_bytes(&[1, 0, 1, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(bs, vec![0x05, 0x00]);
+        assert_eq!(decode_one_dod(&bs), 1);
+
+        // DoD = -64 (smallest negative, 7-bit two's complement = 0x40)
+        // bits = [1,0, 0,0,0,0,0,0,1] → byte 0 = 0x01, byte 1 = 0x01
+        let bs = bits_to_bytes(&[1, 0, 0, 0, 0, 0, 0, 0, 1]);
+        assert_eq!(bs, vec![0x01, 0x01]);
+        assert_eq!(decode_one_dod(&bs), -64);
+    }
+
+    #[test]
+    fn fixed_vector_nine_bit_bucket_boundary_64_minus_65() {
+        // DoD = 64 must use the 9-bit bucket: prefix '110' (bit0=1,
+        // bit1=1, bit2=0), then 9 bits of `64 & 0x1FF` LSB-first.
+        let mut bits = vec![1u8, 1, 0];
+        push_bits_le(&mut bits, 64, 9);
+        let bs = bits_to_bytes(&bits);
+        assert_eq!(decode_one_dod(&bs), 64);
+
+        // DoD = -65 must also fall into the 9-bit bucket.
+        let mut bits = vec![1u8, 1, 0];
+        push_bits_le(&mut bits, -65, 9);
+        let bs = bits_to_bytes(&bits);
+        assert_eq!(decode_one_dod(&bs), -65);
+    }
+
+    #[test]
+    fn fixed_vector_nine_bit_bucket_min_max() {
+        // 9-bit bucket signed range: [-256, 255].
+        for &dod in &[64i64, -65, 100, -100, 255, -256, 200, -200] {
+            let mut bits = vec![1u8, 1, 0];
+            push_bits_le(&mut bits, dod, 9);
+            let bs = bits_to_bytes(&bits);
+            assert_eq!(decode_one_dod(&bs), dod, "dod={}", dod);
+        }
+    }
+
+    #[test]
+    fn fixed_vector_twelve_bit_bucket_boundary_256_minus_257() {
+        // DoD = 256 → 12-bit bucket: prefix '1110' (bit0..3 = 1,1,1,0),
+        // then 12 bits LSB-first.
+        let mut bits = vec![1u8, 1, 1, 0];
+        push_bits_le(&mut bits, 256, 12);
+        let bs = bits_to_bytes(&bits);
+        assert_eq!(decode_one_dod(&bs), 256);
+
+        let mut bits = vec![1u8, 1, 1, 0];
+        push_bits_le(&mut bits, -257, 12);
+        let bs = bits_to_bytes(&bits);
+        assert_eq!(decode_one_dod(&bs), -257);
+    }
+
+    #[test]
+    fn fixed_vector_twelve_bit_bucket_min_max() {
+        // 12-bit bucket signed range: [-2048, 2047].
+        for &dod in &[256i64, -257, 1000, -1000, 2047, -2048, 1500, -1500] {
+            let mut bits = vec![1u8, 1, 1, 0];
+            push_bits_le(&mut bits, dod, 12);
+            let bs = bits_to_bytes(&bits);
+            assert_eq!(decode_one_dod(&bs), dod, "dod={}", dod);
+        }
+    }
+
+    #[test]
+    fn fixed_vector_thirty_two_bit_bucket_boundary_2048_minus_2049() {
+        // DoD = 2048 → 32-bit bucket: prefix '1111' (bit0..3 = all 1),
+        // then 32 bits LSB-first of `dod as i32`.
+        let mut bits = vec![1u8, 1, 1, 1];
+        push_bits_le(&mut bits, 2048, 32);
+        let bs = bits_to_bytes(&bits);
+        assert_eq!(decode_one_dod(&bs), 2048);
+
+        let mut bits = vec![1u8, 1, 1, 1];
+        push_bits_le(&mut bits, -2049, 32);
+        let bs = bits_to_bytes(&bits);
+        assert_eq!(decode_one_dod(&bs), -2049);
+    }
+
+    #[test]
+    fn fixed_vector_thirty_two_bit_extremes() {
+        // The 32-bit bucket payload is sign-extended to i64 by
+        // `BitReader::read_signed`. Pin behaviour at i32::MIN /
+        // i32::MAX and a value near i32::MIN that would silently
+        // lose its sign if `read_signed` zero-extended instead.
+        for &dod in &[
+            i32::MIN as i64,
+            i32::MIN as i64 + 1,
+            i32::MAX as i64,
+            i32::MAX as i64 - 1,
+            -1_000_000_000,
+            1_000_000_000,
+        ] {
+            let mut bits = vec![1u8, 1, 1, 1];
+            push_bits_le(&mut bits, dod, 32);
+            let bs = bits_to_bytes(&bits);
+            assert_eq!(decode_one_dod(&bs), dod, "dod={}", dod);
+        }
+    }
 }

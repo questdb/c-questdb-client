@@ -50,6 +50,7 @@ use tungstenite::{Message, WebSocket, accept_hdr};
 const MAGIC: [u8; 4] = *b"QWP1";
 const MSG_QUERY_REQUEST: u8 = 0x10;
 const MSG_RESULT_END: u8 = 0x12;
+const MSG_CACHE_RESET: u8 = 0x17;
 const MSG_SERVER_INFO: u8 = 0x18;
 
 /// Wrap a payload in a 12-byte QWP1 frame header.
@@ -98,6 +99,13 @@ fn result_end_frame(request_id: i64) -> Vec<u8> {
     encode_varint_u64(0, &mut payload); // final_seq
     encode_varint_u64(0, &mut payload); // total_rows
     framed(2, 0, 0, &payload)
+}
+
+/// `CACHE_RESET` frame. `mask = 0x01` clears the per-connection symbol
+/// dict, `0x02` clears the schema registry, `0x03` clears both. The
+/// payload is just `[msg_kind, mask]`.
+fn cache_reset_frame(mask: u8) -> Vec<u8> {
+    framed(2, 0, 0, &[MSG_CACHE_RESET, mask])
 }
 
 // ---------------------------------------------------------------------------
@@ -483,6 +491,45 @@ fn happy_path_no_failover() {
         0,
         "on_failover_reset must not fire on the happy path"
     );
+}
+
+#[test]
+fn cache_reset_mid_stream_does_not_break_cursor() {
+    // The server emits CACHE_RESET to invalidate the per-connection
+    // symbol dict and/or schema registry. The decoder applies the
+    // resets in `decode_frame` before returning `ServerEvent::CacheReset`,
+    // and `next_batch` is supposed to swallow that event and continue
+    // reading. Live coverage is hard (the real server emits
+    // CACHE_RESET only under specific dict/schema-aging conditions)
+    // so the contract is pinned here against a scripted mock.
+    //
+    // Sends both reset masks in sequence (dict, then schemas, then
+    // both at once) to exercise every bit of the mask without making
+    // assumptions about which kind of reset is "common."
+    let srv = MockServer::start(vec![vec![
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "n1".into(),
+        },
+        Action::AwaitQueryRequest,
+        Action::SendRaw(cache_reset_frame(0x01)), // clear dict
+        Action::SendRaw(cache_reset_frame(0x02)), // clear schemas
+        Action::SendRaw(cache_reset_frame(0x03)), // clear both
+        Action::SendResultEnd,
+    ]]);
+    let conf = format!("qwp::addr={}", srv.url());
+    let mut reader = Reader::from_conf(&conf).expect("connect");
+    let mut cursor = reader.query("select 1").execute().expect("execute");
+    // The CacheReset events must not surface as Err or as a phantom
+    // batch — the cursor should drive straight through to the
+    // RESULT_END terminal.
+    assert!(
+        cursor.next_batch().expect("next_batch").is_none(),
+        "cursor must terminate at RESULT_END after CACHE_RESET frames"
+    );
+    // No failover is involved; the connection stays on the same
+    // endpoint throughout.
+    assert_eq!(cursor.failover_resets(), 0);
 }
 
 #[test]

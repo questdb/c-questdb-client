@@ -1410,6 +1410,180 @@ mod tests {
         assert_eq!(got, expected);
     }
 
+    // The wire-to-dense gather is shared across every fixed-width
+    // primitive — the regression that landed in commit `a89e0fc`
+    // ("decode compact wire and densify per row") was specific to the
+    // Long path's inline assertions, but the same compact-vs-dense
+    // bug surface applies to Double / Float / Int / Short / Byte.
+    // These tests pin the contract for each: non-null wire values land
+    // at the right dense indices, and null slots read as zero.
+
+    fn le_f64s(vs: &[f64]) -> Vec<u8> {
+        let mut o = Vec::new();
+        for v in vs {
+            o.extend_from_slice(&v.to_le_bytes());
+        }
+        o
+    }
+
+    fn le_f32s(vs: &[f32]) -> Vec<u8> {
+        let mut o = Vec::new();
+        for v in vs {
+            o.extend_from_slice(&v.to_le_bytes());
+        }
+        o
+    }
+
+    fn le_i32s(vs: &[i32]) -> Vec<u8> {
+        let mut o = Vec::new();
+        for v in vs {
+            o.extend_from_slice(&v.to_le_bytes());
+        }
+        o
+    }
+
+    fn le_i16s(vs: &[i16]) -> Vec<u8> {
+        let mut o = Vec::new();
+        for v in vs {
+            o.extend_from_slice(&v.to_le_bytes());
+        }
+        o
+    }
+
+    #[test]
+    fn decode_double_with_nulls_densifies() {
+        // 4 rows; row 1 null. Wire: 3 f64 values + bitmap 0x02.
+        let (flags_byte, payload) = BatchBuilder::new(4)
+            .add_column(
+                "v",
+                ColumnKind::Double,
+                col_with_bitmap(&[0x02], &le_f64s(&[1.5, 3.5, 4.5])),
+            )
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let view = batch.column_view(0, &dict).unwrap();
+        let ColumnView::Double(c) = view else {
+            panic!()
+        };
+        assert!(!c.is_null(0));
+        assert!(c.is_null(1));
+        assert!(!c.is_null(2));
+        assert!(!c.is_null(3));
+        assert_eq!(c.value(0), 1.5);
+        // Densified zero in the null slot.
+        assert_eq!(c.value(1).to_bits(), 0u64);
+        assert_eq!(c.value(2), 3.5);
+        assert_eq!(c.value(3), 4.5);
+    }
+
+    #[test]
+    fn decode_float_with_nulls_densifies() {
+        let (flags_byte, payload) = BatchBuilder::new(4)
+            .add_column(
+                "v",
+                ColumnKind::Float,
+                col_with_bitmap(&[0x02], &le_f32s(&[1.5_f32, 3.5_f32, 4.5_f32])),
+            )
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let view = batch.column_view(0, &dict).unwrap();
+        let ColumnView::Float(c) = view else {
+            panic!()
+        };
+        assert_eq!(c.value(0), 1.5_f32);
+        assert_eq!(c.value(1).to_bits(), 0u32);
+        assert_eq!(c.value(2), 3.5_f32);
+        assert_eq!(c.value(3), 4.5_f32);
+    }
+
+    #[test]
+    fn decode_int_with_nulls_densifies() {
+        // 8 rows; rows 1, 4, 7 null (bitmap 0x92). 5 i32 values on the wire.
+        let (flags_byte, payload) = BatchBuilder::new(8)
+            .add_column(
+                "v",
+                ColumnKind::Int,
+                col_with_bitmap(&[0x92], &le_i32s(&[10, 12, 13, 15, 16])),
+            )
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let view = batch.column_view(0, &dict).unwrap();
+        let ColumnView::Int(c) = view else { panic!() };
+        let expected: Vec<Option<i32>> = vec![
+            Some(10),
+            None,
+            Some(12),
+            Some(13),
+            None,
+            Some(15),
+            Some(16),
+            None,
+        ];
+        let got: Vec<Option<i32>> = (0..8)
+            .map(|r| if c.is_null(r) { None } else { Some(c.value(r)) })
+            .collect();
+        assert_eq!(got, expected);
+        // Spot-check that null slots read as zero (dense buffer
+        // contract, not just `is_null` agreeing).
+        assert_eq!(c.value(1), 0);
+        assert_eq!(c.value(4), 0);
+        assert_eq!(c.value(7), 0);
+    }
+
+    #[test]
+    fn decode_short_with_nulls_densifies() {
+        // 4 rows; row 2 null. Wire: 3 i16 values, bitmap 0x04.
+        let (flags_byte, payload) = BatchBuilder::new(4)
+            .add_column(
+                "v",
+                ColumnKind::Short,
+                col_with_bitmap(&[0x04], &le_i16s(&[-1, -2, -3])),
+            )
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let view = batch.column_view(0, &dict).unwrap();
+        let ColumnView::Short(c) = view else {
+            panic!()
+        };
+        assert_eq!(c.value(0), -1);
+        assert_eq!(c.value(1), -2);
+        assert_eq!(c.value(2), 0); // densified zero
+        assert!(c.is_null(2));
+        assert_eq!(c.value(3), -3);
+    }
+
+    #[test]
+    fn decode_byte_with_nulls_densifies() {
+        // 5 rows; rows 0, 3 null (bitmap 0b0000_1001 = 0x09). 3 i8 values.
+        let (flags_byte, payload) = BatchBuilder::new(5)
+            .add_column(
+                "v",
+                ColumnKind::Byte,
+                col_with_bitmap(&[0x09], &[0x7F, 0x80, 0xFF]),
+            )
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let view = batch.column_view(0, &dict).unwrap();
+        let ColumnView::Byte(c) = view else { panic!() };
+        assert!(c.is_null(0));
+        assert!(c.is_null(3));
+        assert_eq!(c.value(0), 0); // densified zero
+        assert_eq!(c.value(1), 0x7F);
+        assert_eq!(c.value(2), -128); // 0x80 as i8
+        assert_eq!(c.value(3), 0); // densified zero
+        assert_eq!(c.value(4), -1); // 0xFF as i8
+    }
+
     #[test]
     fn decode_boolean_bit_packed() {
         // 5 rows, no nulls. Wire bits (LSB-first) for [t, f, t, t, f]:

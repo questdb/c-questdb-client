@@ -434,6 +434,17 @@ fn timestamp_micros_with_gorilla_path() {
         srv,
         &format!("select ts, v from \"{}\" order by ts", table),
         |view| {
+            // The point of the test name is to exercise FLAG_GORILLA;
+            // assert it explicitly so a server-side change in
+            // encoding heuristics doesn't silently turn this into a
+            // raw-encoding regression test.
+            use questdb::egress::wire::flags as wire_flags;
+            assert!(
+                view.flags() & wire_flags::GORILLA != 0,
+                "expected FLAG_GORILLA on this batch, got flags=0x{:02X}",
+                view.flags()
+            );
+
             assert_eq!(view.row_count(), expected_ts.len());
             let ColumnView::Timestamp(ts_col) = view.column(0).unwrap() else {
                 panic!("col 0")
@@ -1860,6 +1871,16 @@ fn all_null_long_column() {
             assert_eq!(c.len(), 3);
             for r in 0..3 {
                 assert!(c.is_null(r), "row {} should be null", r);
+                // Pin the densification contract from commit a89e0fc:
+                // null slots must read as zero, not garbage from a
+                // cleared-but-still-stale buffer or out-of-bounds
+                // densification math.
+                assert_eq!(
+                    c.value(r),
+                    0,
+                    "null slot at row {} must be densified to zero",
+                    r
+                );
             }
         },
     );
@@ -1896,6 +1917,19 @@ fn all_null_varchar_column() {
                 assert!(c.is_null(r));
                 assert_eq!(c.value(r), None);
             }
+            // Densification contract for varchar with all-null:
+            // the dense offsets array is sized `row_count + 1` and
+            // every entry is zero (null slots inherit the previous
+            // offset, seeded at 0). The data buffer carries no bytes.
+            // Without this, a per-row densify bug could leave stale
+            // offsets that point into an unrelated column's data.
+            assert_eq!(c.offsets().len(), 4, "row_count + 1 entries");
+            assert!(
+                c.offsets().iter().all(|&o| o == 0),
+                "all-null varchar offsets must all be zero, got {:?}",
+                c.offsets()
+            );
+            assert_eq!(c.data().len(), 0, "no payload bytes for an all-null column");
         },
     );
 }
