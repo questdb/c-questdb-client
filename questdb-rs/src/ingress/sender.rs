@@ -55,6 +55,9 @@ mod qwp_ws_sfa_segment;
 #[cfg(feature = "_sender-qwp-ws")]
 mod qwp_ws_sfa_queue;
 
+#[cfg(feature = "_sender-qwp-ws")]
+mod qwp_ws_sfa_slot;
+
 #[cfg(all(test, feature = "_sender-qwp-ws"))]
 mod qwp_ws_sf_queue;
 
@@ -68,7 +71,7 @@ pub(crate) mod qwp_ws_test_support {
     };
     pub(crate) use super::qwp_ws_publisher::QwpWsPublicationDriver;
     pub(crate) use super::qwp_ws_queue::{VolatileFrameQueue, VolatileQueueOptions};
-    pub(crate) use super::qwp_ws_sfa_queue::{SfaFrameQueue, SfaQueueOptions};
+    pub(crate) use super::qwp_ws_sfa_slot::{SfaSlotOptions, SfaSlotQueue};
 
     pub(crate) fn connect_blocking_transport(
         host: impl Into<String>,

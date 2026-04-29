@@ -269,12 +269,17 @@ queue adapter behind the manual driver seam. It currently validates:
 - close timeout retaining recoverable frames,
 - manual-driver replay of recovered `.sfa` frames,
 - real QuestDB replay of a recovered `.sfa` frame through
-  `BlockingQwpWsTransport`.
+  `BlockingQwpWsTransport` opened through the product slot wrapper.
 
-It does not yet implement product slot layout, slot locking, `sf_dir` /
-`sender_id` config wiring, orphan draining, or a non-ignored CI fixture. The
-cross-client fixture compiles a small Java helper into `/tmp` and uses the local
-Java client checkout from `QDB_JAVA_CLIENT_CORE` or
+`questdb-rs/src/ingress/sender/qwp_ws_sfa_slot.rs` is the product slot wrapper
+above that queue. It currently validates Java-compatible
+`<sf_dir>/<sender_id>/` layout and exclusive `<slot>/.lock` ownership, including
+same-slot contention and distinct-slot coexistence.
+
+It does not yet implement `sf_dir` / `sender_id` config wiring, orphan draining,
+or a non-ignored CI fixture. The cross-client fixture compiles a small Java
+helper into `/tmp` and uses the local Java client checkout from
+`QDB_JAVA_CLIENT_CORE` or
 `/home/jara/devel/oss/questdb-arrays/java-questdb-client/core`.
 
 ### Manual driver and transport seam
@@ -443,9 +448,9 @@ conversion before the real driver is wired through.
 - No C++ or Python wrapper implementation has been added for the new QWP/WS
   shape.
 - Java-compatible `.sfa` queue integration exists behind the manual driver seam,
-  but product slot wiring is missing. The remaining product work is
-  `<sf_dir>/<sender_id>/` layout, slot locking, config parsing, public core
-  integration, orphan draining, and Java-compatible `sf_durability`
+  and the product slot wrapper now derives `<sf_dir>/<sender_id>/` and holds the
+  Java-compatible `.lock`. The remaining product work is config parsing, public
+  core integration, orphan draining, and Java-compatible `sf_durability`
   parse-and-fail behavior for reserved `flush`/`append` modes.
 - Cross-client `.sfa` golden fixture is present but ignored by default because it
   depends on the local Java client checkout, `javac`, and Maven classpath
@@ -473,33 +478,33 @@ conversion before the real driver is wired through.
 
 ## Recommended next step
 
-Move to the product slot/config boundary, but keep it narrow.
+Move from the product slot wrapper to the product config boundary, but keep it
+narrow.
 
 The Java-compatible `.sfa` queue now fits the publication/driver seam and has a
-real QuestDB recovery probe. The next slice should make the queue open like the
-product will open it, rather than adding FFI, threaded adapters, or wrapper
-APIs.
+real QuestDB recovery probe through the slot wrapper. The next slice should make
+the product config open that path, rather than adding FFI, threaded adapters, or
+wrapper APIs.
 
 Suggested slice:
 
-1. Add the smallest product slot wrapper over `SfaFrameQueue`: derive
-   `<sf_dir>/<sender_id>/`, create the slot directory, and keep `sf_dir` as the
-   only Store-and-Forward on-switch.
-2. Add Java-compatible exclusive slot locking and behavior tests for
-   same-slot contention.
-3. Add config parsing/validation for `sf_dir`, `sender_id`, `sf_max_bytes`,
+1. Add config parsing/validation for `sf_dir`, `sender_id`, `sf_max_bytes`,
    `sf_max_total_bytes`, and `sf_durability`, including parse-and-fail behavior
    for reserved `flush`/`append` values.
-4. Preserve the simple durable model: `.sfa` segment files and QWP payload bytes
+2. Wire `sf_dir` presence to `SfaSlotQueue` as the only Store-and-Forward
+   on-switch; leave `sf_dir` unset on the current memory-backed path.
+3. Preserve the simple durable model: `.sfa` segment files and QWP payload bytes
    only. Do not add Rust-only ACK, rejection, receipt, wire-sequence, in-flight,
    or dead-letter records.
-5. Re-run the `.sfa` recovery real-server probe through the product slot wrapper
-   before wiring public API or C ABI.
+4. Add behavior tests for config-derived same-slot contention and distinct
+   sender IDs.
+5. Re-run the `.sfa` recovery real-server probe through the config-derived slot
+   path before wiring public API or C ABI.
 
 Do not start with threaded adapters, C++/Python wrappers, orphan draining, SF
 compaction, or performance optimization. The main de-risking question is now
-whether Java-compatible slot ownership and config fit the current manual core
-without public API changes.
+whether Java-compatible config fits the current manual core without public API
+changes.
 
 ## Commands worth re-running
 

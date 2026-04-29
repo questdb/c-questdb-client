@@ -36,8 +36,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ingress::qwp_ws_test_support::{
-    CloseOutcome, DeliveryOutcome, ManualDriverPrototype, QwpWsPublicationDriver, SfaFrameQueue,
-    SfaQueueOptions, VolatileFrameQueue, VolatileQueueOptions, connect_blocking_transport,
+    CloseOutcome, DeliveryOutcome, ManualDriverPrototype, QwpWsPublicationDriver, SfaSlotOptions,
+    SfaSlotQueue, VolatileFrameQueue, VolatileQueueOptions, connect_blocking_transport,
 };
 use crate::ingress::{Buffer, TimestampNanos};
 use tempfile::TempDir;
@@ -195,7 +195,7 @@ fn qwp_ws_sfa_recovered_frame_is_delivered_and_cleaned_up() -> TestResult {
             config.qwp_ws_port.to_string(),
             config.auth_header.clone(),
         )?;
-        let queue = SfaFrameQueue::open(sfa_options(sf_dir.path())).map_err(proto_err)?;
+        let queue = SfaSlotQueue::open(sfa_options(sf_dir.path())).map_err(proto_err)?;
         let driver = ManualDriverPrototype::from_queue(queue, transport);
         let mut publisher = QwpWsPublicationDriver::new(driver, 1);
         let row = build_row(&table, "SYM_SFA_REPLAYED", 77, 777.5, 77)?;
@@ -205,7 +205,7 @@ fn qwp_ws_sfa_recovered_frame_is_delivered_and_cleaned_up() -> TestResult {
             .map_err(proto_err)?
     };
     assert_eq!(
-        sfa_file_count(sf_dir.path())?,
+        sfa_file_count(&sfa_slot_dir(sf_dir.path()))?,
         1,
         "unacknowledged SFA frame must remain recoverable after sender drop"
     );
@@ -215,7 +215,7 @@ fn qwp_ws_sfa_recovered_frame_is_delivered_and_cleaned_up() -> TestResult {
         config.qwp_ws_port.to_string(),
         config.auth_header.clone(),
     )?;
-    let queue = SfaFrameQueue::open(sfa_options(sf_dir.path())).map_err(proto_err)?;
+    let queue = SfaSlotQueue::open(sfa_options(sf_dir.path())).map_err(proto_err)?;
     let driver = ManualDriverPrototype::from_queue(queue, transport);
     let mut publisher = QwpWsPublicationDriver::new(driver, 1);
 
@@ -228,7 +228,7 @@ fn qwp_ws_sfa_recovered_frame_is_delivered_and_cleaned_up() -> TestResult {
         CloseOutcome::Drained
     );
     assert_eq!(
-        sfa_file_count(sf_dir.path())?,
+        sfa_file_count(&sfa_slot_dir(sf_dir.path()))?,
         0,
         "cleanly ACKed SFA frames must not replay on the next sender"
     );
@@ -251,14 +251,19 @@ fn build_row(table: &str, sym: &str, qty: i64, px: f64, ts_offset: i64) -> Probe
     Ok(buffer)
 }
 
-fn sfa_options(slot_dir: &Path) -> SfaQueueOptions {
-    SfaQueueOptions {
-        slot_dir: slot_dir.to_path_buf(),
+fn sfa_options(sf_dir: &Path) -> SfaSlotOptions {
+    SfaSlotOptions {
+        sf_dir: sf_dir.to_path_buf(),
+        sender_id: "default".to_string(),
         segment_size_bytes: 64 * 1024,
         max_frames: 8,
         max_bytes: 64 * 1024,
         max_in_flight: 4,
     }
+}
+
+fn sfa_slot_dir(sf_dir: &Path) -> std::path::PathBuf {
+    sf_dir.join("default")
 }
 
 fn sfa_file_count(dir: &Path) -> ProbeResult<usize> {

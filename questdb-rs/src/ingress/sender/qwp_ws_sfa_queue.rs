@@ -60,6 +60,10 @@ pub(crate) enum SfaQueueError {
     Queue(QueueError),
     Segment(SfaSegmentError),
     Io(io::Error),
+    InvalidSfDir,
+    InvalidSenderId { sender_id: String },
+    SlotInUse { slot_dir: PathBuf, holder: String },
+    SlotLockUnsupported,
     CorruptSegments { reason: &'static str },
     Closed,
 }
