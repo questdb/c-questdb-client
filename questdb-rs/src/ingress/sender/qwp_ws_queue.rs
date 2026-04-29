@@ -41,7 +41,7 @@ pub(crate) enum QwpReceiptStatus {
     Published { fsn: u64 },
     Sent { fsn: u64, wire_seq: u64 },
     Acked { fsn: u64 },
-    Poisoned { fsn: u64 },
+    Rejected { fsn: u64 },
     Terminal { fsn: u64 },
 }
 
@@ -139,7 +139,7 @@ pub(crate) struct VolatileFrameQueue {
     published_fsn: Option<u64>,
     server_acked_fsn: Option<u64>,
     completed_fsn: Option<u64>,
-    poisoned_fsns: Vec<u64>,
+    rejected_fsns: Vec<u64>,
     connection: ConnectionState,
     in_flight: InFlightRing,
 }
@@ -167,7 +167,7 @@ impl VolatileFrameQueue {
             published_fsn: None,
             server_acked_fsn: None,
             completed_fsn: None,
-            poisoned_fsns: Vec::new(),
+            rejected_fsns: Vec::new(),
             connection: ConnectionState::default(),
             in_flight: InFlightRing::new(options.max_in_flight),
         })
@@ -355,20 +355,20 @@ impl VolatileFrameQueue {
             self.advance_server_acked_to(prior_fsn);
         }
 
-        self.complete_poisoned(rejected_fsn)?;
+        self.complete_rejected(rejected_fsn)?;
         Ok(QwpReceipt { fsn: rejected_fsn })
     }
 
     fn advance_server_acked_to(&mut self, acked_fsn: u64) {
         let candidate = match self
-            .poisoned_fsns
+            .rejected_fsns
             .iter()
             .copied()
-            .filter(|poisoned_fsn| *poisoned_fsn <= acked_fsn)
+            .filter(|rejected_fsn| *rejected_fsn <= acked_fsn)
             .min()
         {
             Some(0) => None,
-            Some(first_poisoned_fsn) => Some(first_poisoned_fsn - 1),
+            Some(first_rejected_fsn) => Some(first_rejected_fsn - 1),
             None => Some(acked_fsn),
         };
 
@@ -394,8 +394,8 @@ impl VolatileFrameQueue {
 
     pub(crate) fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus {
         let fsn = receipt.fsn;
-        if self.poisoned_fsns.contains(&fsn) {
-            return QwpReceiptStatus::Poisoned { fsn };
+        if self.rejected_fsns.contains(&fsn) {
+            return QwpReceiptStatus::Rejected { fsn };
         }
         if self
             .completed_fsn
@@ -499,7 +499,7 @@ impl VolatileFrameQueue {
         Ok(())
     }
 
-    fn complete_poisoned(&mut self, rejected_fsn: u64) -> Result<(), QueueError> {
+    fn complete_rejected(&mut self, rejected_fsn: u64) -> Result<(), QueueError> {
         if self.len == 0 || self.slots[self.head].fsn != rejected_fsn {
             return Err(QueueError::ProtocolRejectedUnsentFrame { fsn: rejected_fsn });
         }
@@ -511,7 +511,7 @@ impl VolatileFrameQueue {
         self.slots[self.head].payload.clear();
         self.slots[self.head].state = FrameState::Free;
         self.completed_fsn = Some(rejected_fsn);
-        self.poisoned_fsns.push(rejected_fsn);
+        self.rejected_fsns.push(rejected_fsn);
         self.head = (self.head + 1) % self.slots.len();
         self.len -= 1;
         self.in_flight.pop_acked_through(rejected_fsn);
@@ -686,7 +686,7 @@ mod tests {
     fn pending_helper_is_false_for_terminal_statuses() {
         assert!(!QwpReceiptStatus::Unknown { fsn: 0 }.is_pending());
         assert!(!QwpReceiptStatus::Acked { fsn: 0 }.is_pending());
-        assert!(!QwpReceiptStatus::Poisoned { fsn: 0 }.is_pending());
+        assert!(!QwpReceiptStatus::Rejected { fsn: 0 }.is_pending());
         assert!(!QwpReceiptStatus::Terminal { fsn: 0 }.is_pending());
     }
 
@@ -959,7 +959,7 @@ mod tests {
     }
 
     #[test]
-    fn reject_marks_frame_poisoned_acks_prior_only_and_leaves_later_unresolved() {
+    fn reject_marks_frame_rejected_acks_prior_only_and_leaves_later_unresolved() {
         let mut queue = queue(4, 1024, 3);
         let first = queue.try_submit(b"first").unwrap();
         let second = queue.try_submit(b"second").unwrap();
@@ -978,7 +978,7 @@ mod tests {
         );
         assert_eq!(
             queue.receipt_status(second),
-            QwpReceiptStatus::Poisoned { fsn: 1 }
+            QwpReceiptStatus::Rejected { fsn: 1 }
         );
         assert_eq!(
             queue.receipt_status(third),
@@ -990,7 +990,7 @@ mod tests {
     }
 
     #[test]
-    fn first_frame_poison_gap_prevents_server_acked_from_advancing() {
+    fn first_frame_rejection_gap_prevents_server_acked_from_advancing() {
         let mut queue = queue(4, 1024, 3);
         let first = queue.try_submit(b"first").unwrap();
         let second = queue.try_submit(b"second").unwrap();
@@ -1004,7 +1004,7 @@ mod tests {
         assert_eq!(queue.completed_fsn(), Some(1));
         assert_eq!(
             queue.receipt_status(first),
-            QwpReceiptStatus::Poisoned { fsn: 0 }
+            QwpReceiptStatus::Rejected { fsn: 0 }
         );
         assert_eq!(
             queue.receipt_status(second),
@@ -1083,7 +1083,7 @@ mod tests {
     }
 
     #[test]
-    fn ack_after_reject_completes_later_receipt_without_crossing_poison_gap() {
+    fn ack_after_reject_completes_later_receipt_without_crossing_rejection_gap() {
         let mut queue = queue(4, 1024, 3);
         let first = queue.try_submit(b"first").unwrap();
         let second = queue.try_submit(b"second").unwrap();
@@ -1103,7 +1103,7 @@ mod tests {
         );
         assert_eq!(
             queue.receipt_status(second),
-            QwpReceiptStatus::Poisoned { fsn: 1 }
+            QwpReceiptStatus::Rejected { fsn: 1 }
         );
         assert_eq!(
             queue.receipt_status(third),

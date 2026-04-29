@@ -68,6 +68,10 @@ environment variables.
   next product-path slice should insert the missing publication shell that
   encodes caller `Buffer` contents into self-sufficient replay payloads before
   queue publication.
+- That publication shell should keep replay dictionary state simple and
+  append-only. Failed submissions may reserve internal symbol IDs, but the
+  externally visible commit point remains queue publication: no FSN, receipt,
+  queued bytes, wire sequence, or caller-buffer clear before that succeeds.
 
 ## Global reflection
 

@@ -43,7 +43,7 @@ const LOG_MAGIC: &[u8; 8] = b"QWPSF001";
 const RECORD_HEADER_LEN: usize = 4;
 const TAG_FRAME: u8 = b'F';
 const TAG_ACK_THROUGH: u8 = b'A';
-const TAG_POISON: u8 = b'P';
+const TAG_REJECTION: u8 = b'R';
 const CONTROL_BODY_LEN: usize = 1 + 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,7 +84,7 @@ pub(crate) struct SfFrameQueue {
     published_fsn: Option<u64>,
     server_acked_fsn: Option<u64>,
     completed_fsn: Option<u64>,
-    poisoned_fsns: Vec<u64>,
+    rejected_fsns: Vec<u64>,
     connection: ConnectionState,
     in_flight: InFlightRing,
 }
@@ -123,7 +123,7 @@ impl SfFrameQueue {
             published_fsn: recovered.published_fsn,
             server_acked_fsn: recovered.server_acked_fsn,
             completed_fsn: recovered.completed_fsn,
-            poisoned_fsns: recovered.poisoned_fsns,
+            rejected_fsns: recovered.rejected_fsns,
             connection: ConnectionState::default(),
             in_flight: InFlightRing::new(options.max_in_flight),
         })
@@ -289,11 +289,11 @@ impl SfFrameQueue {
         let rejected_fsn = self.fsn_for_wire(wire_seq, AckKind::Reject)?;
         self.ensure_rejectable(rejected_fsn)?;
 
-        self.append_poison(rejected_fsn)?;
+        self.append_rejection(rejected_fsn)?;
         if rejected_fsn > 0 {
             self.advance_server_acked_to(rejected_fsn - 1);
         }
-        self.apply_poison(rejected_fsn);
+        self.apply_rejection(rejected_fsn);
 
         Ok(QwpReceipt { fsn: rejected_fsn })
     }
@@ -310,8 +310,8 @@ impl SfFrameQueue {
 
     pub(crate) fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus {
         let fsn = receipt.fsn;
-        if self.poisoned_fsns.contains(&fsn) {
-            return QwpReceiptStatus::Poisoned { fsn };
+        if self.rejected_fsns.contains(&fsn) {
+            return QwpReceiptStatus::Rejected { fsn };
         }
         if self
             .completed_fsn
@@ -377,8 +377,8 @@ impl SfFrameQueue {
         append_record(&mut self.log, TAG_ACK_THROUGH, fsn, &[])
     }
 
-    fn append_poison(&mut self, fsn: u64) -> Result<(), SfQueueError> {
-        append_record(&mut self.log, TAG_POISON, fsn, &[])
+    fn append_rejection(&mut self, fsn: u64) -> Result<(), SfQueueError> {
+        append_record(&mut self.log, TAG_REJECTION, fsn, &[])
     }
 
     fn ensure_connection_started(&mut self) -> Result<(), QueueError> {
@@ -478,7 +478,7 @@ impl SfFrameQueue {
         self.in_flight.pop_acked_through(acked_fsn);
     }
 
-    fn apply_poison(&mut self, rejected_fsn: u64) {
+    fn apply_rejection(&mut self, rejected_fsn: u64) {
         while self
             .frames
             .front()
@@ -489,20 +489,20 @@ impl SfFrameQueue {
             self.completed_fsn = Some(frame.fsn);
         }
 
-        self.poisoned_fsns.push(rejected_fsn);
+        self.rejected_fsns.push(rejected_fsn);
         self.in_flight.pop_acked_through(rejected_fsn);
     }
 
     fn advance_server_acked_to(&mut self, acked_fsn: u64) {
         let candidate = match self
-            .poisoned_fsns
+            .rejected_fsns
             .iter()
             .copied()
-            .filter(|poisoned_fsn| *poisoned_fsn <= acked_fsn)
+            .filter(|rejected_fsn| *rejected_fsn <= acked_fsn)
             .min()
         {
             Some(0) => None,
-            Some(first_poisoned_fsn) => Some(first_poisoned_fsn - 1),
+            Some(first_rejected_fsn) => Some(first_rejected_fsn - 1),
             None => Some(acked_fsn),
         };
 
@@ -529,7 +529,7 @@ struct RecoveredQueue {
     published_fsn: Option<u64>,
     server_acked_fsn: Option<u64>,
     completed_fsn: Option<u64>,
-    poisoned_fsns: Vec<u64>,
+    rejected_fsns: Vec<u64>,
 }
 
 impl RecoveredQueue {
@@ -542,7 +542,7 @@ impl RecoveredQueue {
             published_fsn: None,
             server_acked_fsn: None,
             completed_fsn: None,
-            poisoned_fsns: Vec::new(),
+            rejected_fsns: Vec::new(),
         }
     }
 
@@ -628,20 +628,20 @@ impl RecoveredQueue {
         Ok(())
     }
 
-    fn apply_poison(&mut self, fsn: u64, offset: usize) -> Result<(), SfQueueError> {
+    fn apply_rejection(&mut self, fsn: u64, offset: usize) -> Result<(), SfQueueError> {
         if self
             .published_fsn
             .is_none_or(|published_fsn| fsn > published_fsn)
         {
             return Err(SfQueueError::CorruptLog {
                 offset,
-                reason: "poison references unpublished frame",
+                reason: "rejection references unpublished frame",
             });
         }
-        if self.poisoned_fsns.contains(&fsn) {
+        if self.rejected_fsns.contains(&fsn) {
             return Err(SfQueueError::CorruptLog {
                 offset,
-                reason: "duplicate poison marker",
+                reason: "duplicate rejection marker",
             });
         }
         if self
@@ -650,7 +650,7 @@ impl RecoveredQueue {
         {
             return Err(SfQueueError::CorruptLog {
                 offset,
-                reason: "poison references completed frame",
+                reason: "rejection references completed frame",
             });
         }
 
@@ -665,7 +665,7 @@ impl RecoveredQueue {
         {
             self.completed_fsn = Some(fsn);
         }
-        self.poisoned_fsns.push(fsn);
+        self.rejected_fsns.push(fsn);
         if fsn > 0 {
             self.advance_server_acked_to(fsn - 1);
         }
@@ -674,14 +674,14 @@ impl RecoveredQueue {
 
     fn advance_server_acked_to(&mut self, acked_fsn: u64) {
         let candidate = match self
-            .poisoned_fsns
+            .rejected_fsns
             .iter()
             .copied()
-            .filter(|poisoned_fsn| *poisoned_fsn <= acked_fsn)
+            .filter(|rejected_fsn| *rejected_fsn <= acked_fsn)
             .min()
         {
             Some(0) => None,
-            Some(first_poisoned_fsn) => Some(first_poisoned_fsn - 1),
+            Some(first_rejected_fsn) => Some(first_rejected_fsn - 1),
             None => Some(acked_fsn),
         };
 
@@ -768,8 +768,8 @@ fn recover_log(
             TAG_ACK_THROUGH if len == CONTROL_BODY_LEN => {
                 recovered.apply_ack_through(fsn, offset)?
             }
-            TAG_POISON if len == CONTROL_BODY_LEN => recovered.apply_poison(fsn, offset)?,
-            TAG_ACK_THROUGH | TAG_POISON => {
+            TAG_REJECTION if len == CONTROL_BODY_LEN => recovered.apply_rejection(fsn, offset)?,
+            TAG_ACK_THROUGH | TAG_REJECTION => {
                 return Err(SfQueueError::CorruptLog {
                     offset,
                     reason: "control record has payload",
@@ -1183,7 +1183,7 @@ mod tests {
     }
 
     #[test]
-    fn first_frame_poison_gap_survives_restart() {
+    fn first_frame_rejection_gap_survives_restart() {
         let dir = TempDir::new().unwrap();
         {
             let mut queue = open(&dir);
@@ -1204,7 +1204,7 @@ mod tests {
         assert_eq!(recovered.completed_fsn(), Some(1));
         assert_eq!(
             recovered.receipt_status(QwpReceipt { fsn: 0 }),
-            QwpReceiptStatus::Poisoned { fsn: 0 }
+            QwpReceiptStatus::Rejected { fsn: 0 }
         );
         assert_eq!(
             recovered.receipt_status(QwpReceipt { fsn: 1 }),
@@ -1352,7 +1352,7 @@ mod tests {
     }
 
     #[test]
-    fn poison_gap_survives_restart_and_later_ack_does_not_advance_server_acked() {
+    fn rejection_gap_survives_restart_and_later_ack_does_not_advance_server_acked() {
         let dir = TempDir::new().unwrap();
         let first;
         let second;
@@ -1378,7 +1378,7 @@ mod tests {
         );
         assert_eq!(
             recovered.receipt_status(second),
-            QwpReceiptStatus::Poisoned { fsn: 1 }
+            QwpReceiptStatus::Rejected { fsn: 1 }
         );
         assert_eq!(
             recovered.receipt_status(third),
@@ -1404,7 +1404,7 @@ mod tests {
     }
 
     #[test]
-    fn completion_after_poison_gap_survives_second_restart() {
+    fn completion_after_rejection_gap_survives_second_restart() {
         let dir = TempDir::new().unwrap();
         {
             let mut queue = open(&dir);
@@ -1430,7 +1430,7 @@ mod tests {
         );
         assert_eq!(
             recovered.receipt_status(QwpReceipt { fsn: 1 }),
-            QwpReceiptStatus::Poisoned { fsn: 1 }
+            QwpReceiptStatus::Rejected { fsn: 1 }
         );
         assert_eq!(
             recovered.receipt_status(QwpReceipt { fsn: 2 }),
@@ -1538,10 +1538,10 @@ mod tests {
         );
 
         write_log(&dir, LOG_MAGIC);
-        append_raw_record(&dir, TAG_POISON, 0, &[]);
+        append_raw_record(&dir, TAG_REJECTION, 0, &[]);
         assert_corrupt_log(
             SfFrameQueue::open(options(&dir)),
-            "poison references unpublished frame",
+            "rejection references unpublished frame",
         );
     }
 
@@ -1590,7 +1590,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_rejects_poison_marker_for_completed_frame() {
+    fn recovery_rejects_rejection_marker_for_completed_frame() {
         let dir = TempDir::new().unwrap();
         {
             let mut queue = open(&dir);
@@ -1601,21 +1601,21 @@ mod tests {
 
         let log_path = dir.path().join(LOG_FILE_NAME);
         let mut log = OpenOptions::new().append(true).open(log_path).unwrap();
-        append_record(&mut log, TAG_POISON, 0, &[]).unwrap();
+        append_record(&mut log, TAG_REJECTION, 0, &[]).unwrap();
 
         let err = SfFrameQueue::open(options(&dir)).unwrap_err();
 
         assert!(matches!(
             err,
             SfQueueError::CorruptLog {
-                reason: "poison references completed frame",
+                reason: "rejection references completed frame",
                 ..
             }
         ));
     }
 
     #[test]
-    fn recovery_rejects_duplicate_poison_marker() {
+    fn recovery_rejects_duplicate_rejection_marker() {
         let dir = TempDir::new().unwrap();
         {
             let mut queue = open(&dir);
@@ -1624,13 +1624,16 @@ mod tests {
             queue.reject_wire(0).unwrap();
         }
 
-        append_raw_record(&dir, TAG_POISON, 0, &[]);
+        append_raw_record(&dir, TAG_REJECTION, 0, &[]);
 
-        assert_corrupt_log(SfFrameQueue::open(options(&dir)), "duplicate poison marker");
+        assert_corrupt_log(
+            SfFrameQueue::open(options(&dir)),
+            "duplicate rejection marker",
+        );
     }
 
     #[test]
-    fn stale_ack_after_poison_gap_does_not_append_duplicate_marker() {
+    fn stale_ack_after_rejection_gap_does_not_append_duplicate_marker() {
         let dir = TempDir::new().unwrap();
         let log_path = dir.path().join(LOG_FILE_NAME);
         {

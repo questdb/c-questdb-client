@@ -1972,7 +1972,7 @@ pub enum line_sender_qwpws_event_kind {
     LINE_SENDER_QWPWS_EVENT_DURABLE_ACK,
     LINE_SENDER_QWPWS_EVENT_RETRYING,
     LINE_SENDER_QWPWS_EVENT_RECONNECTED,
-    LINE_SENDER_QWPWS_EVENT_POISONED,
+    LINE_SENDER_QWPWS_EVENT_REJECTED,
     LINE_SENDER_QWPWS_EVENT_BACKPRESSURE,
     LINE_SENDER_QWPWS_EVENT_TERMINAL,
 }
@@ -2007,7 +2007,7 @@ pub enum line_sender_qwpws_receipt_status_kind {
     LINE_SENDER_QWPWS_RECEIPT_INVALID = 0,
     LINE_SENDER_QWPWS_RECEIPT_PENDING,
     LINE_SENDER_QWPWS_RECEIPT_ACKED,
-    LINE_SENDER_QWPWS_RECEIPT_POISONED,
+    LINE_SENDER_QWPWS_RECEIPT_REJECTED,
     LINE_SENDER_QWPWS_RECEIPT_TERMINAL,
 }
 
@@ -2023,7 +2023,7 @@ pub struct line_sender_qwpws_receipt_status {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum line_sender_qwpws_delivery_kind {
     LINE_SENDER_QWPWS_DELIVERY_ACKED = 0,
-    LINE_SENDER_QWPWS_DELIVERY_POISONED,
+    LINE_SENDER_QWPWS_DELIVERY_REJECTED,
     LINE_SENDER_QWPWS_DELIVERY_TIMEOUT,
     LINE_SENDER_QWPWS_DELIVERY_TERMINAL,
 }
@@ -2861,8 +2861,8 @@ pub unsafe extern "C" fn line_sender_qwpws_wait(
             line_sender_qwpws_receipt_status_kind::LINE_SENDER_QWPWS_RECEIPT_PENDING => {
                 line_sender_qwpws_delivery_kind::LINE_SENDER_QWPWS_DELIVERY_TIMEOUT
             }
-            line_sender_qwpws_receipt_status_kind::LINE_SENDER_QWPWS_RECEIPT_POISONED => {
-                line_sender_qwpws_delivery_kind::LINE_SENDER_QWPWS_DELIVERY_POISONED
+            line_sender_qwpws_receipt_status_kind::LINE_SENDER_QWPWS_RECEIPT_REJECTED => {
+                line_sender_qwpws_delivery_kind::LINE_SENDER_QWPWS_DELIVERY_REJECTED
             }
             line_sender_qwpws_receipt_status_kind::LINE_SENDER_QWPWS_RECEIPT_TERMINAL => {
                 line_sender_qwpws_delivery_kind::LINE_SENDER_QWPWS_DELIVERY_TERMINAL

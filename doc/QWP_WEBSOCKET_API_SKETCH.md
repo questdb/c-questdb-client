@@ -1,4 +1,4 @@
-# QWP/WebSocket pipelined Store-and-Forward API sketch
+# QWP/WebSocket pipelined API sketch
 
 Date: 2026-04-28
 
@@ -38,20 +38,8 @@ pub struct QwpReceipt {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum QwpOpenMode {
-    Connected,
-    Lazy,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum QwpQueueMode {
-    Volatile,
-    StoreAndForward,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QwpSfDurability {
-    PageCache,
+    Memory,
     Flush,
     Append,
 }
@@ -68,7 +56,7 @@ pub enum QwpReceiptStatus {
     Acked {
         fsn: u64,
     },
-    Poisoned {
+    Rejected {
         fsn: u64,
         status: QwpStatus,
     },
@@ -90,11 +78,10 @@ impl QwpReceiptStatus {
 #[derive(Debug)]
 pub enum QwpDeliveryOutcome {
     Acked,
-    Poisoned {
+    Rejected {
         fsn: u64,
         status: QwpStatus,
         message_truncated: bool,
-        poison_path: Option<std::path::PathBuf>,
     },
     Timeout {
         status: QwpReceiptStatus,
@@ -132,28 +119,27 @@ pub enum QwpEvent {
     DurableAck { details: Option<QwpDurableAckDetails> },
     Retrying { attempt: u32, elapsed: std::time::Duration, error: QwpErrorSummary },
     Reconnected { replay_from_fsn: u64, attempts: u32, elapsed: std::time::Duration },
-    Poisoned { fsn: u64, status: QwpStatus, message_truncated: bool },
+    Rejected { fsn: u64, status: QwpStatus, message_truncated: bool },
     Backpressure { duration: std::time::Duration, reason: QwpBackpressureReason },
     Terminal { error: QwpErrorSummary },
 }
 ```
 
-`QwpStatus`, `QwpErrorSummary`, `QwpDurableAckDetails`, and exact poison enum
+`QwpStatus`, `QwpErrorSummary`, `QwpDurableAckDetails`, and exact rejection enum
 values are deliberately left provisional until real-server error taxonomy and
 durable-ACK probes complete.
 
-`QwpDeliveryOutcome::Poisoned` includes the FSN even though the caller already
+`QwpDeliveryOutcome::Rejected` includes the FSN even though the caller already
 has the receipt. That redundancy is intentional for logging and callback
-ergonomics. `QwpCloseOutcome` does not have a separate poisoned variant in this
-sketch: poison is a receipt completion state. Under `PoisonPolicy::Stop`, the
-sender stops sending new frames after already-sent in-flight frames are
-resolved; under quarantine policy, poison is reported through receipt state and
-events while sending can continue. In both modes, close can only report drained
-after all published receipts are resolved as ACKed or poisoned.
+ergonomics. `QwpCloseOutcome` does not have a separate rejected variant in this
+sketch: server rejection is a receipt completion state. Policy decides whether
+the sender can continue or must halt for the specific server status. In either
+case, close can only report drained after all published receipts are resolved as
+ACKed or rejected.
 
-`server_acked_fsn` and `completed_fsn` are distinct. After a poison gap,
+`server_acked_fsn` and `completed_fsn` are distinct. After a rejection gap,
 `completed_fsn` may advance through ACKed later receipts while
-`server_acked_fsn` remains before the poisoned FSN.
+`server_acked_fsn` remains before the rejected FSN.
 
 ## Rust manual sender
 
@@ -164,15 +150,13 @@ the caller invokes `submit()`, `drive_once()`, `wait()`, or `close_drain()`.
 ```rust
 use std::time::Duration;
 use questdb::ingress::{
-    Buffer, QwpCloseOutcome, QwpDeliveryOutcome, QwpOpenMode, QwpQueueMode,
-    QwpWsOptions, QwpWsSender, TimestampNanos,
+    Buffer, QwpCloseOutcome, QwpDeliveryOutcome, QwpWsOptions, QwpWsSender,
+    TimestampNanos,
 };
 
 fn manual_submit_and_wait() -> questdb::Result<()> {
     let opts = QwpWsOptions::from_conf(
         "qwpws::addr=localhost:9000;\
-         open_mode=connected;\
-         queue_mode=sf;\
          sf_dir=/var/lib/my-app/qdb-sf;\
          sender_id=prices;",
     )?;
@@ -195,7 +179,7 @@ fn manual_submit_and_wait() -> questdb::Result<()> {
         QwpDeliveryOutcome::Timeout { status } => {
             eprintln!("still waiting for server ACK: {status:?}");
         }
-        QwpDeliveryOutcome::Poisoned { fsn, status, .. } => {
+        QwpDeliveryOutcome::Rejected { fsn, status, .. } => {
             eprintln!("server rejected frame {fsn}: {status:?}");
         }
         QwpDeliveryOutcome::Terminal { error } => {
@@ -327,7 +311,7 @@ typedef struct {
 ```
 
 Submit and wait use distinct result shapes. `err_out` is for API failure only.
-Timeout, pending, poisoned, and drained states are normal outcomes.
+Timeout, pending, rejected, and drained states are normal outcomes.
 
 ```c
 typedef enum {
@@ -343,7 +327,7 @@ typedef struct {
 typedef enum {
     LINE_SENDER_QWPWS_WAIT_ACKED = 0,
     LINE_SENDER_QWPWS_WAIT_TIMEOUT = 1,
-    LINE_SENDER_QWPWS_WAIT_POISONED = 2,
+    LINE_SENDER_QWPWS_WAIT_REJECTED = 2,
     LINE_SENDER_QWPWS_WAIT_TERMINAL = 3
 } line_sender_qwpws_wait_status;
 
@@ -358,7 +342,7 @@ typedef enum {
     LINE_SENDER_QWPWS_RECEIPT_INVALID = 0,
     LINE_SENDER_QWPWS_RECEIPT_PENDING = 1,
     LINE_SENDER_QWPWS_RECEIPT_ACKED = 2,
-    LINE_SENDER_QWPWS_RECEIPT_POISONED = 3,
+    LINE_SENDER_QWPWS_RECEIPT_REJECTED = 3,
     LINE_SENDER_QWPWS_RECEIPT_TERMINAL = 4
 } line_sender_qwpws_receipt_status_kind;
 
@@ -376,7 +360,7 @@ typedef enum {
     LINE_SENDER_QWPWS_EVENT_DURABLE_ACK = 4,
     LINE_SENDER_QWPWS_EVENT_RETRYING = 5,
     LINE_SENDER_QWPWS_EVENT_RECONNECTED = 6,
-    LINE_SENDER_QWPWS_EVENT_POISONED = 7,
+    LINE_SENDER_QWPWS_EVENT_REJECTED = 7,
     LINE_SENDER_QWPWS_EVENT_BACKPRESSURE = 8,
     LINE_SENDER_QWPWS_EVENT_TERMINAL = 9
 } line_sender_qwpws_event_kind;
@@ -480,7 +464,7 @@ void line_sender_qwpws_free(line_sender_qwpws_sender *sender);
 existing `line_sender_buffer_new_qwp()` is also acceptable in examples where the
 maximum name length does not depend on sender configuration.
 
-Server messages for poisoned, terminal, or other diagnostic states are copied
+Server messages for rejected, terminal, or other diagnostic states are copied
 into caller-provided storage by `wait()` and `poll_event()`. `message_len_out`,
 when non-NULL, receives the full message length before truncation. If
 `message_buf` is too small, the returned event or wait result sets
@@ -552,7 +536,7 @@ server delivery.
 ```cpp
 questdb::ingress::qwpws_sender sender =
     questdb::ingress::qwpws_sender::from_conf(
-        "qwpws::addr=localhost:9000;queue_mode=sf;sf_dir=/var/lib/app/qdb-sf;");
+        "qwpws::addr=localhost:9000;sf_dir=/var/lib/app/qdb-sf;");
 
 questdb::ingress::line_sender_buffer buffer =
     questdb::ingress::line_sender_buffer::qwp();
@@ -574,8 +558,8 @@ if (outcome.is_timeout()) {
 sender.close_drain(std::chrono::seconds{5});
 ```
 
-Exceptions map to API failures. Timeouts, poison, and not-drained close results
-are value outcomes.
+Exceptions map to API failures. Timeouts, server rejection, and not-drained close
+results are value outcomes.
 
 Threaded ownership is also type-level:
 
@@ -596,7 +580,7 @@ from datetime import timedelta
 from questdb.ingress import QwpWsSender
 
 sender = QwpWsSender.from_conf(
-    "qwpws::addr=localhost:9000;queue_mode=sf;sf_dir=/var/lib/app/qdb-sf;"
+    "qwpws::addr=localhost:9000;sf_dir=/var/lib/app/qdb-sf;"
 )
 
 buf = sender.new_buffer()
@@ -652,10 +636,11 @@ change to the core delivery contract.
 - Default call returns after local acceptance only: yes.
 - Receipt-returning call: `submit()` always returns `QwpReceipt` when it
   publishes a non-empty frame. `submit_and_keep()` also returns a receipt.
-- Operations that block: `open()` may block according to `open_mode` and
-  connection timeouts; `submit()` may block for local queue capacity up to the
-  append timeout; `wait()` and `close_drain()` drive progress until their
-  timeout; `drive_once()` performs bounded progress once.
+- Operations that block: `open()` performs initial connection by default and is
+  bounded by connect/request timeouts; `initial_connect_retry=true` retries
+  startup with the reconnect policy. `submit()` may block for local queue
+  capacity up to the append timeout; `wait()` and `close_drain()` drive progress
+  until their timeout; `drive_once()` performs bounded progress once.
 - Operations that poll: `receipt_status()` and `poll_event()` are non-blocking.
 - Operations that drive progress: manual `drive_once()`, `wait()`,
   `close_drain()`, and possibly `submit()` when waiting for local capacity.
@@ -698,7 +683,7 @@ Do not add a `flush()` alias to the low-level core during the first prototype.
 - What looks awkward in the examples?
 
   C has several result structs and the names are long. That is still preferable
-  to collapsing timeout, poison, terminal, pending, and API failure into one
+  to collapsing timeout, server rejection, terminal, pending, and API failure into one
   boolean plus `err_out`. Python and C++ can hide the naming weight without
   losing the semantics.
 

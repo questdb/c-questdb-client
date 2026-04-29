@@ -337,7 +337,7 @@ impl<Q: ManualDriverQueue, T: ManualDriverTransport> ManualDriverPrototype<Q, T>
     fn delivery_status(&self, receipt: QwpReceipt) -> Result<Option<DeliveryOutcome>, DriverError> {
         match self.receipt_status(receipt) {
             QwpReceiptStatus::Acked { .. } => Ok(Some(DeliveryOutcome::Acked)),
-            QwpReceiptStatus::Poisoned { .. } => Ok(Some(DeliveryOutcome::Poisoned)),
+            QwpReceiptStatus::Rejected { .. } => Ok(Some(DeliveryOutcome::Rejected)),
             QwpReceiptStatus::Terminal { .. } => Ok(Some(DeliveryOutcome::Terminal)),
             QwpReceiptStatus::Published { .. } | QwpReceiptStatus::Sent { .. } => Ok(None),
             QwpReceiptStatus::Unknown { fsn } => Err(DriverError::UnknownReceipt { fsn }),
@@ -374,11 +374,11 @@ impl<Q: ManualDriverQueue, T: ManualDriverTransport> ManualDriverPrototype<Q, T>
                         wire_seq: wire_seq - 1,
                     });
                 }
-                self.push_event(DriverEvent::Poisoned {
+                self.push_event(DriverEvent::Rejected {
                     fsn: receipt.fsn,
                     wire_seq,
                 });
-                Ok(DriveOutcome::Poisoned {
+                Ok(DriveOutcome::Rejected {
                     fsn: receipt.fsn,
                     wire_seq,
                 })
@@ -740,7 +740,7 @@ pub(crate) enum DriveOutcome {
     Idle,
     Sent(SentFrame),
     Acked { wire_seq: u64 },
-    Poisoned { fsn: u64, wire_seq: u64 },
+    Rejected { fsn: u64, wire_seq: u64 },
     Reconnected { reason: ReconnectReason },
     Terminal,
 }
@@ -750,7 +750,7 @@ pub(crate) enum DriverEvent {
     Published { fsn: u64 },
     Sent { fsn: u64, wire_seq: u64 },
     AckedThrough { fsn: u64, wire_seq: u64 },
-    Poisoned { fsn: u64, wire_seq: u64 },
+    Rejected { fsn: u64, wire_seq: u64 },
     Reconnected { reason: ReconnectReason },
     Terminal,
 }
@@ -764,7 +764,7 @@ pub(crate) enum ReconnectReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DeliveryOutcome {
     Acked,
-    Poisoned,
+    Rejected,
     Terminal,
     Timeout,
 }
@@ -2123,7 +2123,7 @@ mod tests {
         ));
         assert_eq!(
             driver.drive_once().unwrap(),
-            DriveOutcome::Poisoned {
+            DriveOutcome::Rejected {
                 fsn: 1,
                 wire_seq: 1
             }
@@ -2135,7 +2135,7 @@ mod tests {
         );
         assert_eq!(
             driver.receipt_status(second),
-            QwpReceiptStatus::Poisoned { fsn: 1 }
+            QwpReceiptStatus::Rejected { fsn: 1 }
         );
         assert_eq!(
             driver.receipt_status(third),
@@ -2144,7 +2144,7 @@ mod tests {
     }
 
     #[test]
-    fn poison_event_agrees_with_wait_and_receipt_status() {
+    fn rejection_event_agrees_with_wait_and_receipt_status() {
         let mut driver = driver(FakeOrderedServer::scripted([
             FakeSendResult::NoResponse,
             FakeSendResult::RejectWire { wire_seq: 1 },
@@ -2156,7 +2156,7 @@ mod tests {
         driver.drive_once().unwrap();
         assert_eq!(
             driver.wait_steps(second, 1).unwrap(),
-            DeliveryOutcome::Poisoned
+            DeliveryOutcome::Rejected
         );
 
         assert_eq!(
@@ -2177,7 +2177,7 @@ mod tests {
                     fsn: 0,
                     wire_seq: 0,
                 },
-                DriverEvent::Poisoned {
+                DriverEvent::Rejected {
                     fsn: 1,
                     wire_seq: 1,
                 },
@@ -2189,7 +2189,7 @@ mod tests {
         );
         assert_eq!(
             driver.receipt_status(second),
-            QwpReceiptStatus::Poisoned { fsn: 1 }
+            QwpReceiptStatus::Rejected { fsn: 1 }
         );
         assert_eq!(
             driver.receipt_status(third),
@@ -2214,7 +2214,7 @@ mod tests {
         ));
         assert_eq!(
             driver.drive_once().unwrap(),
-            DriveOutcome::Poisoned {
+            DriveOutcome::Rejected {
                 fsn: 1,
                 wire_seq: 1
             }
@@ -2230,7 +2230,7 @@ mod tests {
         );
         assert_eq!(
             driver.receipt_status(second),
-            QwpReceiptStatus::Poisoned { fsn: 1 }
+            QwpReceiptStatus::Rejected { fsn: 1 }
         );
         assert_eq!(
             driver.receipt_status(third),
@@ -2239,7 +2239,7 @@ mod tests {
     }
 
     #[test]
-    fn wait_reports_poisoned_receipt() {
+    fn wait_reports_rejected_receipt() {
         let mut driver = driver(FakeOrderedServer::scripted([FakeSendResult::RejectWire {
             wire_seq: 0,
         }]));
@@ -2247,10 +2247,10 @@ mod tests {
 
         let outcome = driver.wait_steps(receipt, 1).unwrap();
 
-        assert_eq!(outcome, DeliveryOutcome::Poisoned);
+        assert_eq!(outcome, DeliveryOutcome::Rejected);
         assert_eq!(
             driver.receipt_status(receipt),
-            QwpReceiptStatus::Poisoned { fsn: 0 }
+            QwpReceiptStatus::Rejected { fsn: 0 }
         );
     }
 
@@ -2489,7 +2489,7 @@ mod tests {
     }
 
     #[test]
-    fn sf_driver_persists_poison_gap_and_later_ack_after_reopen() {
+    fn sf_driver_persists_rejection_gap_and_later_ack_after_reopen() {
         let dir = TempDir::new().unwrap();
         let first;
         let second;
@@ -2513,7 +2513,7 @@ mod tests {
             ));
             assert_eq!(
                 driver.drive_once().unwrap(),
-                DriveOutcome::Poisoned {
+                DriveOutcome::Rejected {
                     fsn: 1,
                     wire_seq: 1,
                 }
@@ -2532,7 +2532,7 @@ mod tests {
         );
         assert_eq!(
             recovered.wait_steps(second, 0).unwrap(),
-            DeliveryOutcome::Poisoned
+            DeliveryOutcome::Rejected
         );
         assert_eq!(
             recovered.wait_steps(third, 0).unwrap(),
@@ -2542,7 +2542,7 @@ mod tests {
     }
 
     #[test]
-    fn sf_driver_terminal_failure_does_not_poison_recovered_frames() {
+    fn sf_driver_terminal_failure_does_not_mark_recovered_frames_rejected() {
         let dir = TempDir::new().unwrap();
         let first;
         {

@@ -142,13 +142,13 @@ prototype:
 
 - monotonically increasing FSNs starting at `0`,
 - value receipts,
-- `Published`, `Sent`, `Acked`, `Poisoned`, `Terminal`, and `Unknown` status
+- `Published`, `Sent`, `Acked`, `Rejected`, `Terminal`, and `Unknown` status
   vocabulary,
 - bounded frame and byte capacity,
 - fixed in-flight ring,
 - zero-based per-connection wire sequence,
 - cumulative ACK handling,
-- ordered rejection/poison gaps,
+- ordered rejection gaps,
 - reconnect replay from the oldest unresolved FSN.
 
 The queue now has a two-phase send boundary for the driver:
@@ -170,10 +170,10 @@ queue prototype:
 - append-only journal,
 - frame publication records,
 - ACK-through completion records,
-- poison completion records,
+- server-rejection completion records,
 - recovery from incomplete tails,
 - malformed-log rejection,
-- ACK and poison state surviving restart.
+- ACK and rejection state surviving restart.
 
 The SF journal deliberately does not persist connection-local facts:
 
@@ -251,7 +251,7 @@ Important constraints already represented:
 - `poll_event` owns event consumption and bounded message copying,
 - invalid receipt status is queryable without API failure,
 - `wait` on invalid receipt is API failure,
-- timeout, drained, poisoned, terminal, and pending are normal outcomes where
+- timeout, drained, rejected, terminal, and pending are normal outcomes where
   appropriate, not overloaded `err_out` failures,
 - threaded start consumes the manual handle on success and sets `*sender = NULL`.
 
@@ -274,14 +274,19 @@ conversion before the real driver is wired through.
 - WebSocket masking is transport-local and regenerated for each send/replay.
 - Process recovery discards volatile connection state and replays unresolved
   frames from the oldest unresolved FSN.
-- Frame-local deterministic server errors should poison/quarantine the affected
-  FSN, not terminalize all later in-flight frames by default.
+- Frame-local deterministic server errors should resolve the affected FSN using
+  Java-compatible rejection policy, not terminalize all later in-flight frames by
+  default.
 - Events are observability notifications, not authoritative state; receipt
   status and wait/close outcomes are authoritative.
 - Fallible work must not advance externally visible state before its commit
   point: encode failure does not consume wire sequence; failed payload
   materialization does not return a receipt; failed local/SF publication does
   not clear the caller buffer; failed transport write does not mark `Sent`.
+- `SymbolGlobalDict` is append-only internal encoder state, not part of the
+  externally visible commit boundary. Failed materialization/publication may
+  reserve symbol IDs, but must not publish bytes, assign an FSN, return a
+  receipt, consume a wire sequence, or clear the caller buffer.
 - Blocking real transports may need send-before-poll progress so coalesced ACKs
   cannot stall the in-flight window. Fake transports can remain poll-first for
   protocol-error fixtures.
@@ -292,13 +297,16 @@ conversion before the real driver is wired through.
   wired into the manual driver/core path yet.
 - Real-server validation through the new manual driver transport is still
   missing for the full publication path.
-- `open_mode=connected` vs `open_mode=lazy` has design text but no real new-core
-  implementation.
+- Java-compatible initial connection configuration (`initial_connect_retry`)
+  still has design text but no real new-core implementation.
 - The FFI shape stubs are not connected to the real queue/driver prototypes.
+- Active queue/driver/FFI prototype vocabulary now uses Java-compatible
+  `Rejected` naming before ABI hardening.
 - No C++ or Python wrapper implementation has been added for the new QWP/WS
   shape.
 - Durable SF prototype lacks segment rotation, compaction, checksums, and
-  selectable fsync durability modes.
+  Java-compatible `sf_durability` parse-and-fail behavior for reserved
+  `flush`/`append` modes.
 - Extended Java/Rust golden fixtures are still missing arrays, decimals, UTF-8,
   sparse columns, and schema evolution.
 - Close/EOF semantics with unresolved in-flight frames are not yet proven by a
@@ -310,6 +318,10 @@ conversion before the real driver is wired through.
   `Buffer -> replay payload -> queue -> BlockingQwpWsTransport`.
 - The v1 dense dictionary replay shape is correctness-first and can be expensive
   for long-running high-cardinality symbol workloads.
+- Reserved-but-unused symbol IDs from failed submit attempts are acceptable in
+  v1 because every replay frame carries the dense prefix needed by the symbols it
+  references. Avoid adding dictionary checkpoint/rollback unless that public
+  contract changes or the bloat is measured as material.
 
 ## Recommended next step
 
@@ -325,8 +337,9 @@ Suggested slice:
    `QwpWsEncodeScratch`, `SymbolGlobalDict`, negotiated QWP version, and queue.
 2. Make its submit path perform `Buffer -> encode_ws_replay_message -> queue
    publication`, returning a receipt only after successful publication.
-3. Verify failed encoding/publication does not clear the caller buffer or
-   consume externally visible sequence/receipt state.
+3. Keep `SymbolGlobalDict` append-only and non-transactional. Verify failed
+   encoding/publication does not clear the caller buffer, publish bytes, assign
+   an FSN, return a receipt, or consume a wire sequence.
 4. Run valid submit/wait against a real QuestDB QWP/WebSocket endpoint through
    that publication path and `BlockingQwpWsTransport`.
 5. Add a reconnect replay case through the same path.

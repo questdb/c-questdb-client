@@ -32,7 +32,7 @@ As of 2026-04-29:
   `doc/QWP_WEBSOCKET_ACK_ORDER_REJECT_PROBE.md`.
 - Step 8 has a minimal file-backed SF queue prototype and reflection in
   `doc/QWP_WEBSOCKET_SF_QUEUE_PROTOTYPE.md`.
-- Step 9 has driver/SF seam coverage for poison, terminal, close-drain,
+- Step 9 has driver/SF seam coverage for server rejection, terminal, close-drain,
   retry-budget behaviour, and event polling agreement in
   `doc/QWP_WEBSOCKET_ERROR_POLICY_PROTOTYPE.md`.
 - Step 10 has a first real-server error taxonomy probe for parse error,
@@ -417,7 +417,7 @@ Validation target:
 - The server never reports success for a later frame while an earlier frame has
   no response. A server error counts as resolving that earlier frame.
 - A cumulative ACK can be treated as ACK for all lower unresolved frame sequence
-  numbers until a poison gap prevents contiguous server-ACK advancement.
+  numbers until a rejection gap prevents contiguous server-ACK advancement.
 - Close and EOF behavior map cleanly into retryable, terminal, or drained
   outcomes.
 
@@ -481,7 +481,7 @@ Cover:
 - retryable transport errors
 - reconnect budget exhaustion
 - auth or upgrade rejection
-- parse/schema poison frame
+- parse/schema server rejection
 - write/internal server error
 - cumulative ACK followed by error
 - close while frames are unresolved
@@ -490,7 +490,8 @@ Validation target:
 
 - Retryable failures preserve ordering and keep retrying within policy.
 - Terminal failures are surfaced to the caller.
-- Poison frames are quarantined and reported rather than silently lost.
+- Java-compatible drop-and-continue server rejections are reported with raw
+  status/message and affected FSN instead of being silently lost.
 - A deterministic bad frame does not brick the sender forever.
 - `receipt_status`, `wait`, and event polling agree.
 
@@ -498,8 +499,8 @@ Design pressure to watch:
 
 - If one enum is forced to represent events, receipt status, wait outcomes, and
   close outcomes, split it before the C ABI hardens.
-- If poison handling requires row-level information the server does not provide,
-  keep v1 at frame-level quarantine.
+- If rejection handling requires row-level information the server does not
+  provide, keep v1 at frame-level reporting.
 
 Local reflection:
 
@@ -524,7 +525,7 @@ Cover reproducible cases such as:
 
 Validation target:
 
-- Server statuses map cleanly into retryable, terminal, poisoned, or unknown.
+- Server statuses map cleanly into retryable, terminal, rejected, or unknown.
 - Rejected frames are identified at frame granularity.
 - ACK-before-error behavior matches the cumulative ACK model.
 - The connection state after each error is understood.
@@ -534,7 +535,7 @@ Design pressure to watch:
 - If the server does not expose enough information to classify an error, the
   client API must surface `Unknown` rather than guessing.
 - If schema/parse failures close the connection before a useful status arrives,
-  poison handling may need to be conservative.
+  rejection handling may need to be conservative.
 
 Local reflection:
 
@@ -610,7 +611,10 @@ Validation target:
 
 - A Rust-only publication shell encodes a caller `Buffer` into a
   self-sufficient replay payload before queue publication.
-- Real connection setup fits `open_mode=connected` and `open_mode=lazy`.
+- The publication shell owns append-only replay encoder state:
+  `QwpWsEncodeScratch`, `SymbolGlobalDict`, and the negotiated QWP version.
+- Real connection setup follows Java semantics: initial connect is attempted by
+  default, and `initial_connect_retry` opts into bounded startup retry.
 - Client-to-server frames are masked on the wire, but durable/SF records remain
   unmasked QWP payloads.
 - Replaying the same stored QWP payload applies a fresh WebSocket mask without
@@ -622,11 +626,20 @@ Validation target:
   intended for the product core, not opaque test payload bytes.
 - Authentication, WebSocket upgrade, and close behavior map into the existing
   error/outcome model.
+- Failed encode or queue publication may reserve internal symbol IDs, but must
+  not assign an FSN, return a receipt, enqueue bytes, consume a wire sequence,
+  or clear the caller buffer.
+- A successful frame after a failed submit remains self-sufficient when replayed
+  on a fresh connection, even if the dense dictionary prefix includes
+  reserved-but-unused lower IDs.
 
 Design pressure to watch:
 
 - If the publication shell makes `submit()` allocate or mutate caller buffers
   before successful publication, revisit the commit points before adding FFI.
+- Do not add `SymbolGlobalDict` checkpoint/rollback unless a stronger public
+  "failed submit has no internal side effects" contract is deliberately chosen,
+  or dictionary bloat is proven material.
 - If networking forces public API changes, revisit the fake-server assumptions.
 - If the real protocol requires hidden tasks to make progress, the low-level
   contract has been violated.
@@ -652,7 +665,7 @@ Exercise real examples:
 - C++ RAII wrapper
 - Python blocking wrapper
 - crash/restart Store-and-Forward recovery demo
-- poison-frame demo
+- server-rejection demo
 
 Validation target:
 
@@ -685,7 +698,7 @@ Stop and redesign before continuing if any of these happen:
 - The C ABI cannot express Rust outcomes without lossy mapping.
 - `submit()`, `flush()`, or `wait()` names do not match their blocking behavior.
 - Store-and-Forward can silently drop data.
-- A poison frame can permanently brick recovery without a documented operator
+- A rejected frame can permanently brick recovery without a documented operator
   path.
 - A real-server probe invalidates the self-sufficient-frame, ACK-ordering, or
   error-taxonomy assumptions.

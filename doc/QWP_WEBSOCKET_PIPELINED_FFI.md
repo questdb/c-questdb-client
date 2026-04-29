@@ -32,7 +32,10 @@ That is not the target shape for durable pipelined FFI:
 - The steady-state hot path should not allocate after warm-up and sizing.
 - Store-and-Forward means a submitted batch must survive reconnect, process restart, and caller buffer reuse.
 
-The Java client is useful as a reference for durability and reconnect semantics, not as an API shape to copy directly.
+The Java client is the reference for durable WebSocket feature set,
+configuration names, and reconnect semantics. Rust can keep a smaller manual
+core internally, but public knobs should match Java unless a language boundary
+requires a different shape.
 
 ## Goals
 
@@ -47,7 +50,8 @@ The Java client is useful as a reference for durability and reconnect semantics,
 - Avoid heap allocation on steady-state submit, drive, ACK, and replay paths.
 - Preserve submission order: later batches cannot jump an earlier unresolved batch.
 - Avoid infinite replay of deterministic bad batches.
-- Avoid silent data loss: "skip" must mean "quarantine and report".
+- Avoid silent data loss: server rejections must be observable through receipts,
+  events, or error handlers.
 
 ## Non-goals
 
@@ -104,10 +108,9 @@ pub struct QwpReceipt {
 
 pub enum QwpDeliveryOutcome {
     Acked,
-    Poisoned {
+    Rejected {
         status: QwpStatus,
         message_truncated: bool,
-        poison_path: Option<PathBuf>,
     },
     Timeout,
 }
@@ -138,13 +141,16 @@ impl QwpWsSender {
 
 Properties:
 
-- `open()` always performs local setup. With `open_mode=connected` it also performs bounded initial TCP/TLS/WebSocket/auth work. With `open_mode=lazy` it performs local setup only.
+- `open()` performs local setup and initial TCP/TLS/WebSocket/auth work by
+  default. `initial_connect_retry` controls whether initial connection failures
+  retry with the reconnect policy or fail fast.
 - `submit()` publishes to the local engine and returns a receipt. It does not wait for server ACK.
 - `submit()` clears the caller buffer only after successful publication.
 - `submit_and_keep()` publishes the same data without clearing the caller buffer.
 - `drive_once()` is the low-level progress primitive. It performs bounded I/O,
-  reconnect, replay, ACK handling, poison handling, and event production, but it
-  does not consume events. `poll_event()` is the only event consumer.
+  reconnect, replay, ACK handling, server-rejection handling, and event
+  production, but it does not consume events. `poll_event()` is the only event
+  consumer.
 - For blocking transports, `drive_once()` should prefer sending already
   published frames while the in-flight window has room before performing a
   blocking response poll. A blocking read must only happen when there is
@@ -156,9 +162,17 @@ The low-level type should prefer `&mut self` methods. That gives Rust callers a 
 
 ## Open and initial connection
 
-There is one constructor. `open_mode` controls whether it performs initial network work.
+There is one constructor. It follows the Java sender model:
 
-With `open_mode=connected` (the default), `open()` is allowed to do real connection setup:
+- local setup always happens,
+- initial connection is attempted by default,
+- initial failures fail fast unless `initial_connect_retry=true`,
+- `initial_connect_retry=true` uses the same bounded backoff policy as
+  reconnect,
+- authentication, authorization, and protocol/upgrade failures are terminal
+  even when initial retry is enabled.
+
+Initial connection work may include:
 
 - DNS resolution,
 - TCP connect,
@@ -167,11 +181,11 @@ With `open_mode=connected` (the default), `open()` is allowed to do real connect
 - protocol negotiation,
 - authentication failure detection.
 
-All of that work must be bounded by configured connect/request timeouts. `open()` still must not start a background thread, spawn a Tokio task, or continue sending/replaying after it returns.
-
-With `open_mode=lazy`, `open()` performs only local setup: config parsing, allocation, queue initialization, SF slot locking, and SF recovery. A lazy sender can accept `submit()` calls before the first successful connection as long as local queue capacity is available. The first `drive_once()`, `wait()`, or `close_drain()` may then perform initial connection work.
-
-The default `open_mode=connected` matches user expectations for a sender constructor: bad host, bad TLS, bad auth, and incompatible server versions fail early. `open_mode=lazy` is the explicit escape hatch for applications that want to buffer locally while QuestDB is unavailable.
+All of that work must be bounded by configured connect/request timeouts. The
+manual core still must not start a background thread, spawn a Tokio task, or
+continue sending/replaying after `open()` returns. There is no public lazy
+constructor mode in v1; applications that want to tolerate startup ordering use
+`initial_connect_retry=true`, matching Java.
 
 ## Optional adapters
 
@@ -245,12 +259,21 @@ point:
 - failed local publication must not clear the caller buffer,
 - failed SF append must not advance the published cursor,
 - failed transport write/flush must not mark a frame `Sent`,
-- failed durable completion write must not report ACKed or poisoned completion
+- failed durable completion write must not report ACKed or rejected completion
   in SF mode.
 
 This invariant is more important than the internal helper boundaries. The core
 may refactor encoding, queue, and transport code, but the observable state
 transitions must remain commit-after-success.
+
+`SymbolGlobalDict` is not part of this external commit boundary. It is
+append-only sender encoding state, like the Java cursor-SF global dictionary.
+A failed encode or failed queue publication may reserve symbol IDs internally.
+That must not return a receipt, assign an FSN, enqueue bytes, consume a wire
+sequence, or clear the caller buffer. Because v1 replay frames carry the dense
+dictionary prefix needed by their row payloads, reserved-but-unused lower IDs are
+valid. They may make later frames larger, but they do not require dictionary
+checkpoint/rollback for correctness.
 
 ## Self-sufficient replay frames
 
@@ -292,6 +315,12 @@ replayable frame repeats the dictionary prefix needed to define those ids on a
 fresh server connection. It does not require a frame-local symbol id space in
 the first version.
 
+The dictionary is intentionally simple and append-only in v1. A symbol ID
+reserved by a failed submission attempt may appear later as part of the dense
+prefix even if no published frame references that symbol. This mirrors the
+state model of the Java sender, where symbol IDs are assigned before cursor
+publication and only the sent watermark is commit-after-success.
+
 This costs more bytes than connection-delta encoding, especially for
 long-running high-cardinality symbol workloads. In the worst case, a frame that
 uses one old high-numbered symbol id still repeats every lower dictionary entry.
@@ -315,6 +344,11 @@ The new pipelined core needs an encoder entry point that always emits the
 Java-style self-sufficient replay form described above. It can share machinery
 with the existing connection-delta encoder, but the new core must not expose or
 select between connection-delta and self-sufficient replay encoding.
+
+The replay encoder does not need transactional dictionary rollback. Tests should
+instead lock down the public boundary: failed materialization/publication returns
+no receipt and publishes no bytes, while a later successful frame remains
+self-sufficient even if earlier failed attempts reserved dictionary IDs.
 
 Tests must store a later frame from a repeated-schema/repeated-symbol workload
 and replay that frame alone against a fresh mock connection. That replay must
@@ -345,16 +379,16 @@ The main drift risks are:
 - WebSocket masking can make byte comparisons misleading. Java/Rust golden tests
   should compare unmasked QWP application payload bytes, not WebSocket frames,
   because client mask keys are intentionally fresh on every send.
-- Error policy will intentionally differ unless Java changes too. Java currently
-  treats non-success server ACKs as terminal. Rust may add quarantine-and-continue
-  semantics, but the server status taxonomy and frame-granularity rejection must
-  still match reality.
-- Durability names may intentionally differ. Rust splits `volatile` from
-  file-backed `page_cache`/`flush`/`append`; Java naming should not be copied if
-  it hides fsync boundaries.
+- Error policy can drift if Rust invents a richer rejection/dead-letter model.
+  Match Java's default server-rejection categories first, preserve raw
+  status/message, and add new policy only if Java grows the same surface.
+- Durability naming can drift if Rust exposes internal queue names. Public
+  configuration should follow Java: `sf_dir` unset means memory mode, `sf_dir`
+  set means SF mode, and `sf_durability` uses Java's `memory` / `flush` /
+  `append` labels.
 - Close semantics can drift because Java has a background I/O loop while Rust's
   low-level API is threadless by default. Shared behavior should be defined in
-  terms of submitted, ACKed, quarantined, and recoverable frames, not Java thread
+  terms of submitted, ACKed, rejected, and recoverable frames, not Java thread
   lifecycle.
 - Encoding edge cases can drift across clients even when the happy path matches:
   arrays, decimals, timestamps, UTF-8, sparse columns, table/schema evolution,
@@ -375,21 +409,21 @@ Core cursors:
 ```text
 published_fsn       highest frame published into the engine
 server_acked_fsn    highest contiguous frame accepted by the server
-completed_fsn       highest contiguous frame ACKed or quarantined
+completed_fsn       highest contiguous frame ACKed or server-rejected
 ```
 
-Do not count quarantined frames as server ACKed.
+Do not count rejected frames as server ACKed.
 
 A frame is *resolved* when its receipt reaches a final delivery state:
-ACKed, poisoned/quarantined, or terminal. `completed_fsn` advances through
-contiguous resolved frames. `server_acked_fsn` advances only through contiguous
-ACKed frames and can therefore lag behind `completed_fsn` across poison gaps.
+ACKed, server-rejected, or terminal. `completed_fsn` advances through contiguous
+resolved frames. `server_acked_fsn` advances only through contiguous ACKed frames
+and can therefore lag behind `completed_fsn` across rejection gaps.
 
 Durable state is deliberately smaller than runtime state. The queue stores:
 
 - publication records: FSN plus self-sufficient QWP payload bytes,
 - ACK-through completion records,
-- poison/quarantine completion records.
+- server-rejection completion records.
 
 The queue does not store connection-local state:
 
@@ -424,7 +458,6 @@ File-backed Store-and-Forward mode stores frames in segment files under a sender
   .lock
   segment-0000000000000001.qwpws
   segment-0000000000000002.qwpws
-  .poison/
 ```
 
 Segment record shape:
@@ -451,9 +484,9 @@ Publication must be crash-recoverable:
 
 Completion records are append-only logical state. ACK-through records may be
 replayed idempotently if they reference frames that are already completed.
-Poison/quarantine records are not idempotent: duplicate poison markers, poison
-for unpublished frames, and poison for already completed frames indicate a
-corrupt journal.
+Server-rejection completion records must identify the rejected FSN and raw
+server status/message. Duplicate rejection markers, rejection for unpublished
+frames, and rejection for already completed frames indicate a corrupt journal.
 
 Recovery ignores partial or checksum-invalid tail records. Before appending new
 records, the implementation must truncate any ignored tail so later records
@@ -462,24 +495,28 @@ Non-tail corruption is not a delivery outcome; it is a storage error that should
 prevent opening the sender until the slot is repaired or recovered by operator
 policy.
 
-Queue mode and durability are separate concepts:
+Public mode selection follows Java:
 
-| Queue mode | Storage | Survives process crash | Survives OS crash |
+| Public mode | Trigger | Storage | Survives process crash | Survives OS crash |
 |---|---|---|---|
-| `volatile` | preallocated RAM ring | No | No |
-| `sf` | segment files under `sf_dir` | Yes, after publication | Depends on `sf_durability` |
+| Memory | `sf_dir` unset | preallocated RAM ring | No | No |
+| Store-and-Forward | `sf_dir` set | segment files under `<sf_dir>/<sender_id>/` | Yes, after publication | Not guaranteed in v1 |
 
-`sf_durability` only applies when `queue_mode=sf`:
+`sf_durability` is a Java-compatible knob for SF mode. The public values are
+`memory`, `flush`, and `append`. v1 supports only `memory`, meaning copied to
+the mmap/page cache and published without an fsync guarantee. `flush` and
+`append` are reserved and should fail loudly until implemented, matching Java's
+current behavior.
 
 | SF durability | Submit returns after | Survives process crash | Survives OS crash |
 |---|---|---|---|
-| `page_cache` | record copied into mmap/page cache and published | Yes | Not guaranteed |
-| `flush` | published bytes flushed on explicit flush/drain boundary | Yes | Yes after flush boundary |
-| `append` | each published frame is flushed before receipt returns | Yes | Yes per receipt |
+| `memory` | record copied into mmap/page cache and published | Yes | Not guaranteed |
+| `flush` | reserved; fail until implemented | Yes | Yes after flush boundary |
+| `append` | reserved; fail until implemented | Yes | Yes per receipt |
 
-This deliberately avoids overloading "memory". `volatile` means no files. `page_cache` means file-backed SF without fsync on every submit.
-
-Names can align with Java where useful, but Rust should document the exact fsync boundary for each mode.
+Internally the Rust code may still call these volatile and SF queues. The public
+configuration should not expose a separate mode flag; the presence of `sf_dir`
+is the mode switch.
 
 ## Pipelining model
 
@@ -502,12 +539,15 @@ FSN, not necessarily FSN `0`.
 
 The server processes submitted WebSocket frames strictly in wire-sequence order. Responses do not complete arbitrary later frames ahead of earlier frames.
 
-The server may coalesce successful ACKs by sending only the highest successful wire sequence. An `OK(sequence=N)` response means every unresolved successful frame up to `N` is accepted unless a prior poison gap prevents contiguous server ACK advancement. The client maps that cumulative wire sequence to the corresponding FSN, marks covered successful receipts ACKed, and advances `server_acked_fsn` only through contiguous ACKed FSNs.
+The server may coalesce successful ACKs by sending only the highest successful wire sequence. An `OK(sequence=N)` response means every unresolved successful frame up to `N` is accepted unless a prior rejection gap prevents contiguous server ACK advancement. The client maps that cumulative wire sequence to the corresponding FSN, marks covered successful receipts ACKed, and advances `server_acked_fsn` only through contiguous ACKed FSNs.
 
-If the server sends an error for sequence `N`, prior unresolved frames below `N` are treated as ACKed if they were covered by the server's ordering guarantee. Frame `N` follows the server-error classification and poison policy. Later frames remain unresolved until a later cumulative OK or error response resolves them.
+If the server sends an error for sequence `N`, prior unresolved frames below `N`
+are treated as ACKed if they were covered by the server's ordering guarantee.
+Frame `N` follows the Java-compatible server-rejection policy. Later frames
+remain unresolved until a later cumulative OK or error response resolves them.
 
-Responses resolve frames; poison policy only decides whether new frames may be
-sent after the already-sent in-flight window is resolved. The driver must not
+Responses resolve frames. Rejection policy only decides whether the sender keeps
+sending after the already-sent in-flight window is resolved. The driver must not
 stop reading immediately on a deterministic server error because the server can
 still accept and later ACK frames that were already in flight.
 
@@ -517,7 +557,7 @@ Example:
 OK(0), Error(1), OK(2)
 
 receipt 0      ACKed
-receipt 1      Poisoned
+receipt 1      Rejected
 receipt 2      ACKed
 server_acked   0
 completed      2
@@ -613,13 +653,13 @@ pub enum QwpEvent {
     DurableAck { /* per-table durable details, if requested */ },
     Retrying { attempt: u32, elapsed: Duration, error: QwpErrorSummary },
     Reconnected { replay_from_fsn: u64, attempts: u32, elapsed: Duration },
-    Poisoned { fsn: u64, status: QwpStatus, message_truncated: bool },
+    Rejected { fsn: u64, status: QwpStatus, message_truncated: bool },
     Backpressure { duration: Duration, reason: BackpressureReason },
     Terminal { error: QwpErrorSummary },
 }
 ```
 
-The event ring is preallocated. On overflow, increment `events_dropped_total` and retain the latest terminal/poison state in direct accessors.
+The event ring is preallocated. On overflow, increment `events_dropped_total` and retain the latest terminal/rejection state in direct accessors.
 
 Events are transition notifications, not authoritative state. `receipt_status()`,
 `wait()`, and `close_drain()` remain the state surfaces. Calls that drive
@@ -627,9 +667,9 @@ progress may produce events, but they should not consume them; `poll_event()`
 is the consumer API.
 
 Message text used by `wait()` and receipt/outcome queries must not depend on the
-event ring. A poison or terminal event may be dropped or already polled, so the
-core must retain bounded diagnostic details with the affected receipt or sender
-state for as long as that state remains observable.
+event ring. A rejection or terminal event may be dropped or already polled, so
+the core must retain bounded diagnostic details with the affected receipt or
+sender state for as long as that state remains observable.
 
 ## Server error classification
 
@@ -639,11 +679,11 @@ Current QWP response statuses include:
 |---|---|---|
 | `OK` | Batch accepted | ACK |
 | `DURABLE_ACK` | Per-table durability notification | Event, not batch completion |
-| `PARSE_ERROR` | Bad payload | Poison candidate |
-| `SCHEMA_MISMATCH` | Bad schema/data for table | Poison candidate |
+| `SCHEMA_MISMATCH` | Bad schema/data for table | Drop-and-continue / rejected receipt |
 | `SECURITY_ERROR` | Auth/authorization | Terminal |
-| `INTERNAL_ERROR` | Server internal error | Retryable until budget exhausts |
-| `WRITE_ERROR` | Server write failure, for example not accepting writes | Retryable candidate until budget exhausts |
+| `PARSE_ERROR` | Bad payload | Terminal |
+| `INTERNAL_ERROR` | Server internal error | Terminal |
+| `WRITE_ERROR` | Non-critical write failure | Drop-and-continue / rejected receipt |
 | unknown | Unknown | Terminal |
 
 The preferred wire contract is stronger:
@@ -652,86 +692,36 @@ The preferred wire contract is stronger:
 status
 sequence
 message
-disposition = RETRYABLE | POISON | TERMINAL
+disposition = RETRYABLE | DROP_AND_CONTINUE | TERMINAL
 ```
 
 Without `disposition`, clients are still applying policy rather than receiving a
-server guarantee. The fallback above is conservative: ambiguous retryable
-candidates are bounded by retry budget, and they are never silently dropped.
+server guarantee. The fallback above follows Java's current defaults: schema and
+write rejections are frame-local and reportable; parse, internal, security,
+protocol, and unknown errors halt the sender.
 
 A real-server probe after the server taxonomy fix showed that a deterministic
 string-to-DOUBLE failure is reported as `SCHEMA_MISMATCH`, not `WRITE_ERROR`,
 while still being sequence-specific: the bad frame is reported with its sequence
 and a later valid frame can still be ACKed. This keeps bad-data handling in the
-poison path and narrows `WRITE_ERROR` back toward operational write failures.
+frame-local rejection path and narrows `WRITE_ERROR` back toward operational
+write failures.
 
-## Poison policy
+## Server rejection reporting
 
-Expose poison handling explicitly:
+Do not add a Rust-only dead-letter file subsystem in v1. Match Java's model:
 
-```rust
-pub enum PoisonPolicy {
-    Stop,
-    QuarantineAndContinue,
-}
-```
+- preserve raw server status, wire sequence, message, affected FSN span, and
+  table attribution when available,
+- expose the rejected frame through receipt status / wait outcome,
+- publish a transition event or call the configured handler,
+- drop-and-continue only for the Java-compatible categories,
+- latch terminal categories so the next producer call reports the error.
 
-### Stop
-
-Low-level default.
-
-Behavior:
-
-- stop sending new frames after a poison is observed,
-- continue reading responses for already-sent in-flight frames until they are
-  resolved or transport fails,
-- mark the rejected frame completed as poisoned,
-- after the in-flight window is resolved, pause or become terminal according to
-  the API layer,
-- next checkpoint surfaces the rejection and the user decides whether to
-  inspect, delete, repair, or replay.
-
-Trade-off:
-
-- no implicit skip,
-- one bad frame can stop future sending indefinitely,
-- later frames already in flight may still complete and must not be replayed
-  just because an earlier frame was poisoned.
-
-### QuarantineAndContinue
-
-Operational liveness mode.
-
-Behavior:
-
-- copy the rejected frame to `.poison`,
-- write metadata,
-- advance `completed_fsn`,
-- emit a poison event,
-- continue resolving already-sent frames and continue sending later frames.
-
-Suggested poison layout:
-
-```text
-<sf_dir>/<sender_id>/.poison/<fsn>.qwp
-<sf_dir>/<sender_id>/.poison/<fsn>.json
-```
-
-Suggested metadata:
-
-```json
-{
-  "fsn": 42,
-  "wireSequence": 7,
-  "status": "SCHEMA_MISMATCH",
-  "statusCode": 3,
-  "message": "server message, maybe truncated in event",
-  "payloadBytes": 1024,
-  "checksum": "..."
-}
-```
-
-In volatile queue mode, quarantine can only be in-memory unless the user provides a poison directory. The API must report that poison data is not durable in that configuration.
+Users that need durable dead-letter storage can implement it in the error
+handler by joining the reported FSN span to their own producer-side log. The
+client should not create dead-letter files or expose a rejection-policy knob
+unless Java grows that feature too.
 
 ## Reconnect and replay
 
@@ -750,10 +740,10 @@ Reconnect budget exhaustion:
 - future submit calls fail until the sender is recreated.
 
 For file-backed SF mode, terminalizing the current sender's receipts does not
-ACK, poison, quarantine, or delete unresolved SF records. Those frames remain in
-the slot and can be recovered by a newly created sender after the operator fixes
-configuration, credentials, or server availability. Only ACK and
-poison/quarantine outcomes append durable completion records.
+ACK, reject, or delete unresolved SF records. Those frames remain in the slot and
+can be recovered by a newly created sender after the operator fixes
+configuration, credentials, or server availability. Only ACK and server-rejection
+outcomes append durable completion records.
 
 Security/upgrade failures:
 
@@ -770,7 +760,7 @@ close_drain(timeout)
 
 - stops accepting new submissions,
 - drives until all published frames are completed or timeout expires,
-- returns whether everything was ACKed/quarantined,
+- returns whether everything was ACKed or server-rejected,
 - leaves uncompleted SF frames recoverable.
 
 If `close_drain()` times out, the current sender remains closing: new
@@ -813,7 +803,7 @@ typedef enum {
     LINE_SENDER_QWPWS_EVENT_DURABLE_ACK,
     LINE_SENDER_QWPWS_EVENT_RETRYING,
     LINE_SENDER_QWPWS_EVENT_RECONNECTED,
-    LINE_SENDER_QWPWS_EVENT_POISONED,
+    LINE_SENDER_QWPWS_EVENT_REJECTED,
     LINE_SENDER_QWPWS_EVENT_BACKPRESSURE,
     LINE_SENDER_QWPWS_EVENT_TERMINAL
 } line_sender_qwpws_event_kind;
@@ -840,7 +830,7 @@ typedef enum {
     LINE_SENDER_QWPWS_RECEIPT_INVALID = 0,
     LINE_SENDER_QWPWS_RECEIPT_PENDING,
     LINE_SENDER_QWPWS_RECEIPT_ACKED,
-    LINE_SENDER_QWPWS_RECEIPT_POISONED,
+    LINE_SENDER_QWPWS_RECEIPT_REJECTED,
     LINE_SENDER_QWPWS_RECEIPT_TERMINAL
 } line_sender_qwpws_receipt_status_kind;
 
@@ -852,7 +842,7 @@ typedef struct {
 
 typedef enum {
     LINE_SENDER_QWPWS_DELIVERY_ACKED = 0,
-    LINE_SENDER_QWPWS_DELIVERY_POISONED,
+    LINE_SENDER_QWPWS_DELIVERY_REJECTED,
     LINE_SENDER_QWPWS_DELIVERY_TIMEOUT,
     LINE_SENDER_QWPWS_DELIVERY_TERMINAL
 } line_sender_qwpws_delivery_kind;
@@ -881,16 +871,16 @@ typedef struct {
 } line_sender_qwpws_close_outcome;
 ```
 
-For `LINE_SENDER_QWPWS_EVENT_ACKED`, `fsn` is the highest cumulatively ACKed FSN, not necessarily a single-frame ACK. `wire_sequence` is the highest cumulatively ACKed wire sequence on the current connection. ACKed-through and completed-through are intentionally different across poison gaps: `completed_fsn` can advance past a poisoned frame while `server_acked_fsn` cannot.
+For `LINE_SENDER_QWPWS_EVENT_ACKED`, `fsn` is the highest cumulatively ACKed FSN, not necessarily a single-frame ACK. `wire_sequence` is the highest cumulatively ACKed wire sequence on the current connection. ACKed-through and completed-through are intentionally different across rejection gaps: `completed_fsn` can advance past a rejected frame while `server_acked_fsn` cannot.
 
 `LINE_SENDER_QWPWS_EVENT_DURABLE_ACK` is intentionally only a notification in
 the first ABI shape. Per-table durable ACK detail should be added later through a
 separate detail accessor or v2 event struct if callers need it.
 
-Poison file paths are also deferred from the first C ABI shape. The low-level C
-outcome carries status and bounded message text. A future quarantine-detail
-accessor can expose durable poison paths without growing every delivery/event
-struct now.
+Client-managed dead-letter file paths are not part of the first C ABI
+shape. The low-level C outcome carries status and bounded message text. Add a
+separate detail accessor later only if Java grows an equivalent durable
+dead-letter feature.
 
 Construction:
 
@@ -975,7 +965,9 @@ void line_sender_qwpws_close_fast(line_sender_qwpws* sender);
 Rules:
 
 - No C call starts a thread unless its name says so explicitly.
-- `line_sender_qwpws_new` follows `open_mode`: `connected` may perform bounded initial connection work, while `lazy` performs local setup only.
+- `line_sender_qwpws_new` follows Java connection semantics: it performs local
+  setup and initial connection work by default; `initial_connect_retry` controls
+  bounded startup retry.
 - `submit` returns a receipt only after local publication.
 - `submit` clears the buffer only after successful publication.
 - `submit_and_keep` never clears the buffer.
@@ -1063,7 +1055,7 @@ auto receipt2 = sender.submit_and_keep(buffer);
 while (sender.receipt_status(receipt).is_pending()) {
     sender.drive_once(10ms);
     while (auto event = sender.poll_event()) {
-        if (event.kind() == event_kind::poisoned) {
+        if (event.kind() == event_kind::rejected) {
             // inspect status/message
         }
     }
@@ -1113,7 +1105,7 @@ Allowed allocations:
 - first use of a table/schema/symbol shape if the caller has not prewarmed or reserved enough state,
 - configured capacity growth outside the steady-state envelope,
 - error object creation,
-- poison metadata file writing,
+- user error-handler/dead-letter file writing outside the core,
 - recovery path setup,
 - reconnect setup if it rebuilds non-hot state,
 - optional high-level adapters that document allocation.
@@ -1153,34 +1145,36 @@ Candidate config keys:
 |---|---|---|
 | `max_in_flight` | 128 | Sent but unresolved frames per connection. |
 | `max_frame_bytes` | existing QWP cap | Maximum encoded QWP frame. |
-| `queue_mode` | `volatile` | `volatile` RAM ring or file-backed `sf`. |
-| `sf_dir` | unset | Required when `queue_mode=sf`; parent for sender slots. |
+| `sf_dir` | unset | Enables file-backed SF when set; otherwise memory mode. |
 | `sender_id` | `default` | Slot name under `sf_dir`. |
-| `sf_max_total_bytes` | TBD | Total queued bytes before submit backpressure. |
-| `sf_segment_bytes` | TBD | Segment file size. |
-| `sf_durability` | `page_cache` | `page_cache`, `flush`, or `append`; only valid with `queue_mode=sf`. |
-| `poison_policy` | `stop` | `stop` or `quarantine`. |
+| `sf_max_bytes` | 4 MiB | Segment size, matching Java naming. |
+| `sf_max_total_bytes` | 128 MiB memory / 10 GiB SF | Total queued bytes before submit backpressure. |
+| `sf_durability` | `memory` | Java-compatible values are `memory`, `flush`, `append`; v1 supports only `memory` and fails loudly for the reserved values. |
+| `sf_append_deadline_millis` | 30000 | Deadline for submit/flush waiting on local capacity. |
 | `event_capacity` | 1024 | Preallocated event ring size. |
 | `max_error_message_bytes` | 1024 | Bounded server message storage. |
 | `reconnect_max_duration_millis` | 300000 | Per-outage retry budget. |
 | `reconnect_initial_backoff_millis` | 100 | Initial reconnect backoff. |
 | `reconnect_max_backoff_millis` | 5000 | Backoff cap. |
-| `open_mode` | `connected` | `connected` validates network/auth during construction; `lazy` performs local setup only. |
+| `initial_connect_retry` | `false` | Retry initial connect with reconnect policy. |
 | `close_flush_timeout_millis` | 5000 | Default high-level close drain timeout. |
+| `drain_orphans` | `false` | Adopt sibling SF slots on startup. |
+| `max_background_drainers` | 4 | Cap concurrent orphan drainers. |
 
 ## First implementation slice
 
 1. Add the Java-style self-sufficient replay encoder path and tests proving a later frame replays alone on a fresh connection.
 2. Add Java/Rust golden payload fixtures for replay-mode QWP bytes.
-3. Add the threadless `QwpWsSender` core with `queue_mode=volatile` only.
+3. Add the threadless `QwpWsSender` core with Java-style memory mode
+   (`sf_dir` unset) only.
 4. Wire `submit` through `Buffer -> replay payload -> queue publication`; return value receipts only after publication.
 5. Implement fixed-capacity in-flight table and event ring.
 6. Implement `drive_once`, `wait`, and close semantics.
 7. Validate the full Rust-only path against real QWP/WebSocket: replay payload publication, manual driver transport, ACK, and reconnect replay.
 8. Add C ABI for construct, new buffer, submit, drive, poll event, wait, receipt status, close.
 9. Add mock-server tests for pipelining, cumulative ACKs, ordered server errors, close, and no buffer clear on failed submit.
-10. Add file-backed `queue_mode=sf` segment storage and recovery.
-11. Add poison policy and poison files.
+10. Add file-backed SF segment storage and recovery behind `sf_dir`.
+11. Add Java-compatible server rejection reporting and handler plumbing.
 12. Add explicit background runner as an ownership-consuming adapter.
 13. Add Tokio adapter.
 14. Add C++ and Python wrappers after the C ABI is stable.
@@ -1191,14 +1185,16 @@ Rust core tests:
 
 - submit returns before ACK,
 - connected `open()` validates initial connection without starting a thread,
-- `open_mode=lazy` accepts local submissions before first connection,
+- `initial_connect_retry=true` retries startup connection with the reconnect
+  policy,
 - successful submit clears buffer,
 - failed submit preserves buffer,
 - `submit_and_keep` preserves buffer,
 - `max_in_flight` applies backpressure without steady-state allocation,
 - cumulative ACK completes all covered receipts,
 - ordered server errors leave later receipts unresolved until a later response resolves them,
-- server parse/schema rejection follows poison policy,
+- server rejection follows Java-compatible defaults and preserves raw
+  status/message,
 - retryable transport failure replays from first unresolved FSN,
 - reconnect exhaustion marks unresolved receipts terminal,
 - close drain waits for published receipts,
@@ -1216,7 +1212,7 @@ Rust core tests:
 C ABI tests:
 
 - construct from config,
-- `open_mode=lazy` construct performs no network I/O,
+- `initial_connect_retry` is parsed and bounded by reconnect configuration,
 - new QWP buffer for sender,
 - submit/drive/wait happy path,
 - `drive_once` reports idle/progress/terminal without consuming events,
@@ -1240,14 +1236,17 @@ System tests:
 - schema expansion across batches,
 - arrays, decimals, timestamps, UTF-8, sparse columns,
 - process kill and SF recovery,
-- poison file creation for deterministic bad batch.
+- Java-compatible server rejection reporting.
 
 ## Open questions
 
-1. Is `Stop` the right default for every low-level API, with `QuarantineAndContinue` opt-in?
-2. Should high-level Python default to quarantine for operational liveness, or inherit low-level `Stop`?
-3. Should volatile queue mode support poison persistence through an explicit `poison_dir`?
-4. Can the server add `disposition = RETRYABLE | POISON | TERMINAL` before the FFI ABI is frozen?
-5. What are the initial defaults for `sf_segment_bytes` and `sf_max_total_bytes`?
-6. Should poison/quarantine file paths and per-table durable ACK details be v2
-   C ABI accessors, or are they important enough for v1?
+1. Can the server add `disposition = RETRYABLE | DROP_AND_CONTINUE | TERMINAL`
+   before the FFI ABI is frozen?
+2. Are Java's `SCHEMA_MISMATCH` / `WRITE_ERROR` drop-and-continue defaults the
+   right defaults for all FFI users, or should Rust expose only the raw
+   rejection and let wrappers choose?
+3. Should `flush` and `append` values for `sf_durability` remain parse-and-fail
+   until implemented, exactly like Java, or be omitted from C constants until
+   they work?
+4. Should per-table durable ACK details be v2 C ABI accessors, or are they
+   important enough for v1?
