@@ -51,9 +51,16 @@ As of 2026-04-29:
   `doc/QWP_WEBSOCKET_REAL_TRANSPORT_PROTOTYPE.md`. The adapter reuses the
   existing sync connection and frame helpers, keeps stored payload identity as
   unmasked QWP bytes, preserves the two-phase send rule, and handles cumulative
-  ACK after multiple sends. It is validated against in-process plain WS and WSS
-  mock servers, not yet against a real QuestDB server through the manual driver
-  or through a `Buffer -> replay payload -> queue` publication shell.
+  ACK after multiple sends.
+- Step 12 also has a Rust-only publication shell with reflection in
+  `doc/QWP_WEBSOCKET_PUBLICATION_SHELL_PROTOTYPE.md`. The shell owns replay
+  encoder state and publishes `Buffer -> replay payload -> queue` bytes through
+  the manual driver.
+- Step 12 now has a real QuestDB publication e2e probe with reflection in
+  `doc/QWP_WEBSOCKET_PUBLICATION_E2E_PROBE.md`. It validates
+  `Buffer -> replay payload -> volatile queue -> manual driver ->
+  BlockingQwpWsTransport -> QuestDB -> queryable row`. Reconnect through this
+  full path is still pending.
 - Extended Java/Rust fixtures for arrays, decimals, UTF-8 strings, sparse
   columns, and schema evolution remain recommended before hardening the full
   product surface.

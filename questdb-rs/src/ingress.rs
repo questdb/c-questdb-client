@@ -60,6 +60,8 @@ mod buffer;
 pub use buffer::*;
 
 mod sender;
+#[cfg(all(test, feature = "sync-sender-qwp-ws"))]
+pub(crate) use sender::qwp_ws_test_support;
 pub use sender::*;
 
 mod decimal;

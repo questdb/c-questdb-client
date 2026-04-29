@@ -933,8 +933,11 @@ pub(crate) enum FakeSendResult {
 
 #[cfg(test)]
 mod tests {
+    use super::super::qwp_ws_publisher::{QwpWsPublicationDriver, QwpWsPublicationError};
     use super::super::qwp_ws_sf_queue::SfQueueOptions;
     use super::*;
+    use crate::ingress::buffer::{QwpWsEncodeScratch, SymbolGlobalDict};
+    use crate::ingress::{Buffer, TimestampNanos};
     use std::collections::VecDeque;
     #[cfg(feature = "sync-sender-qwp-ws")]
     use std::fs::File;
@@ -989,6 +992,33 @@ mod tests {
             server,
             event_capacity,
         )
+    }
+
+    fn qwp_buffer(sym: &str, qty: i64, ts: i64) -> Buffer {
+        let mut buffer = Buffer::new_qwp();
+        buffer
+            .table("trades")
+            .unwrap()
+            .symbol("sym", sym)
+            .unwrap()
+            .column_i64("qty", qty)
+            .unwrap()
+            .column_f64("px", 100.0 + qty as f64)
+            .unwrap()
+            .at(TimestampNanos::new(ts))
+            .unwrap();
+        buffer
+    }
+
+    fn replay_payload(buffer: &Buffer) -> Vec<u8> {
+        let mut scratch = QwpWsEncodeScratch::new();
+        let mut global_dict = SymbolGlobalDict::new();
+        buffer
+            .as_qwp()
+            .unwrap()
+            .encode_ws_replay_message(&mut scratch, &mut global_dict, 1)
+            .unwrap();
+        scratch.message
     }
 
     fn drain_events<Q: ManualDriverQueue, T: ManualDriverTransport>(
@@ -1085,6 +1115,89 @@ mod tests {
             server,
             retry_budget,
         )
+    }
+
+    #[test]
+    fn publisher_sends_replay_payload_to_driver_transport() {
+        let buffer = qwp_buffer("SYM_001", 7, 1_000);
+        let expected = replay_payload(&buffer);
+        let driver = ManualDriverPrototype::from_queue(
+            VolatileFrameQueue::new(options(8, 4096, 4)).unwrap(),
+            TestTransport::scripted([Ok(TransportSendResult::NoResponse)]),
+        );
+        let mut publisher = QwpWsPublicationDriver::new(driver, 1);
+
+        let receipt = publisher.try_submit_qwp(buffer.as_qwp().unwrap()).unwrap();
+        let outcome = publisher.drive_once().unwrap();
+
+        assert_eq!(receipt, QwpReceipt { fsn: 0 });
+        assert_eq!(
+            outcome,
+            DriveOutcome::Sent(SentFrame {
+                fsn: 0,
+                wire_seq: 0,
+                payload_len: expected.len(),
+            })
+        );
+        let driver = publisher.into_driver();
+        assert_eq!(driver.transport.sent_payloads, vec![expected]);
+    }
+
+    #[test]
+    fn publisher_rejects_empty_buffer_without_publication() {
+        let buffer = Buffer::new_qwp();
+        let driver = ManualDriverPrototype::from_queue(
+            VolatileFrameQueue::new(options(8, 4096, 4)).unwrap(),
+            TestTransport::scripted([]),
+        );
+        let mut publisher = QwpWsPublicationDriver::new(driver, 1);
+
+        let err = publisher
+            .try_submit_qwp(buffer.as_qwp().unwrap())
+            .unwrap_err();
+
+        match err {
+            QwpWsPublicationError::Encode(err) => {
+                assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
+                assert_eq!(err.msg(), "Cannot submit an empty QWP/WebSocket buffer.");
+            }
+            QwpWsPublicationError::Driver(err) => panic!("unexpected driver error: {err:?}"),
+        }
+        assert!(publisher.sent_frames().is_empty());
+        let driver = publisher.into_driver();
+        assert!(driver.transport.sent_payloads.is_empty());
+    }
+
+    #[test]
+    fn publisher_failed_queue_publication_does_not_consume_fsn() {
+        let first = qwp_buffer("SYM_001", 1, 1_000);
+        let second = qwp_buffer("SYM_002", 2, 2_000);
+        let third = qwp_buffer("SYM_003", 3, 3_000);
+        let driver = ManualDriverPrototype::from_queue(
+            VolatileFrameQueue::new(options(1, 4096, 1)).unwrap(),
+            TestTransport::scripted([Ok(TransportSendResult::Response(TransportResponse::Ack {
+                wire_seq: 0,
+            }))]),
+        );
+        let mut publisher = QwpWsPublicationDriver::new(driver, 1);
+
+        let first_receipt = publisher.try_submit_qwp(first.as_qwp().unwrap()).unwrap();
+        let err = publisher
+            .try_submit_qwp(second.as_qwp().unwrap())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            QwpWsPublicationError::Driver(DriverError::Queue(QueueError::FrameCapacityFull {
+                max_frames: 1
+            }))
+        ));
+        assert_eq!(
+            publisher.wait_steps(first_receipt, 2).unwrap(),
+            DeliveryOutcome::Acked
+        );
+
+        let third_receipt = publisher.try_submit_qwp(third.as_qwp().unwrap()).unwrap();
+        assert_eq!(third_receipt, QwpReceipt { fsn: 1 });
     }
 
     #[cfg(feature = "sync-sender-qwp-ws")]
@@ -1335,6 +1448,45 @@ mod tests {
                 fsn: 0,
                 wire_seq: 0,
                 payload_len: b"qwp-payload".len(),
+            }]
+        );
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    #[test]
+    fn blocking_real_ws_transport_sends_publication_replay_payload() {
+        let buffer = qwp_buffer("SYM_REAL", 42, 42_000);
+        let expected = replay_payload(&buffer);
+        let (host, port, payload_rx) = spawn_real_qwp_ws_server(false, 1);
+        let transport = BlockingQwpWsTransport::connect(
+            host,
+            port.to_string(),
+            false,
+            None,
+            QwpWsConfig::default(),
+            None,
+        )
+        .unwrap();
+        let driver = ManualDriverPrototype::from_queue(
+            VolatileFrameQueue::new(options(8, 4096, 4)).unwrap(),
+            transport,
+        );
+        let mut publisher = QwpWsPublicationDriver::new(driver, 1);
+
+        let receipt = publisher.try_submit_qwp(buffer.as_qwp().unwrap()).unwrap();
+        let outcome = publisher.wait_steps(receipt, 4).unwrap();
+
+        assert_eq!(outcome, DeliveryOutcome::Acked);
+        assert_eq!(
+            payload_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            expected
+        );
+        assert_eq!(
+            publisher.sent_frames(),
+            &[SentFrame {
+                fsn: 0,
+                wire_seq: 0,
+                payload_len: expected.len(),
             }]
         );
     }

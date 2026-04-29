@@ -44,6 +44,9 @@ mod qwp_ws_driver;
 mod qwp_ws_ownership;
 
 #[cfg(feature = "_sender-qwp-ws")]
+mod qwp_ws_publisher;
+
+#[cfg(feature = "_sender-qwp-ws")]
 mod qwp_ws_queue;
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -54,6 +57,30 @@ mod qwp_ws_sf_queue;
 
 #[cfg(feature = "_sender-qwp-ws")]
 pub use qwp_ws_ownership::*;
+
+#[cfg(all(test, feature = "sync-sender-qwp-ws"))]
+pub(crate) mod qwp_ws_test_support {
+    pub(crate) use super::qwp_ws_driver::{
+        BlockingQwpWsTransport, DeliveryOutcome, ManualDriverPrototype,
+    };
+    pub(crate) use super::qwp_ws_publisher::QwpWsPublicationDriver;
+    pub(crate) use super::qwp_ws_queue::{VolatileFrameQueue, VolatileQueueOptions};
+
+    pub(crate) fn connect_blocking_transport(
+        host: impl Into<String>,
+        port: impl Into<String>,
+        auth_header: Option<String>,
+    ) -> crate::Result<BlockingQwpWsTransport> {
+        BlockingQwpWsTransport::connect(
+            host,
+            port,
+            false,
+            None,
+            crate::ingress::conf::QwpWsConfig::default(),
+            auth_header,
+        )
+    }
+}
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 mod qwp_ws;

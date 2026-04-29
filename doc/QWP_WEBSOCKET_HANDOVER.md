@@ -5,10 +5,11 @@ Date: 2026-04-29
 Status: active validation branch for the Rust client plus C FFI shape.
 
 This is no longer only a design discussion. Steps 1-11 are validated by docs,
-Rust prototypes, real-server probes, and C ABI shape stubs. Step 12 has a first
-Rust-only blocking WS/WSS transport adapter behind the manual driver seam, but
-the new pipelined Store-and-Forward core is not wired into the public product
-API or C ABI yet.
+Rust prototypes, real-server probes, and C ABI shape stubs. Step 12 now has a
+first Rust-only blocking WS/WSS transport adapter and a Rust-only publication
+shell behind the manual driver seam. The publication path has passed a real
+QuestDB e2e probe, but the new pipelined Store-and-Forward core is not wired
+into the public product API or C ABI yet.
 
 Do not read this as production readiness. The existing `qwpws` sync/async sender
 paths still exist separately. The new pipelined/SF sender core is being built
@@ -26,8 +27,14 @@ behind prototypes before product API integration.
   taxonomy results.
 - `doc/QWP_WEBSOCKET_REAL_TRANSPORT_PROTOTYPE.md` - first real blocking WS/WSS
   transport slice for the manual driver.
+- `doc/QWP_WEBSOCKET_PUBLICATION_SHELL_PROTOTYPE.md` - Rust-only
+  `Buffer -> replay payload -> queue` publication slice for the manual driver.
+- `doc/QWP_WEBSOCKET_PUBLICATION_E2E_PROBE.md` - real QuestDB e2e publication
+  probe through the manual driver and blocking transport.
 - `questdb-rs/src/ingress/sender/qwp_ws_driver.rs` - current manual driver
   prototype and transport seam.
+- `questdb-rs/src/ingress/sender/qwp_ws_publisher.rs` - replay publication
+  shell above the manual driver.
 - `questdb-rs/src/ingress/sender/qwp_ws_queue.rs` - volatile queue prototype.
 - `questdb-rs/src/ingress/sender/qwp_ws_sfa_segment.rs` - Java-compatible
   `.sfa` segment codec spike.
@@ -60,20 +67,28 @@ Current branch:
 ia_qwp_ws
 ```
 
-Most recent code checkpoint before the 2026-04-29 working-copy changes:
+Most recent committed checkpoint before the publication-shell slice:
 
 ```text
-338512e Simplify QWP WebSocket rejection design
+015bc69 Add Java-compatible QWP WebSocket SFA fixtures
 ```
 
-Recent validation after the Step 12 blocking transport slice:
+Recent validation after the Step 12 publication-shell slice:
 
 ```bash
-cargo test --manifest-path questdb-rs/Cargo.toml encode_failure_does_not_consume_sequence
 cargo test --manifest-path questdb-rs/Cargo.toml qwp_ws_driver
-cargo test --manifest-path questdb-rs/Cargo.toml blocking_real_
 cargo test --manifest-path questdb-rs/Cargo.toml qwp_ws
-cargo test --manifest-path questdb-rs/Cargo.toml --features async-sender-qwp-ws qwp_ws_async
+cargo test --manifest-path questdb-rs/Cargo.toml \
+    --no-default-features \
+    --features _sender-qwp-ws,tls-webpki-certs,ring-crypto \
+    qwp_ws_driver
+cargo test --manifest-path questdb-rs/Cargo.toml \
+    --features async-sender-qwp-ws \
+    qwp_ws_async
+QDB_QWP_WS_PUBLICATION_PROBE=1 \
+    cargo test --manifest-path questdb-rs/Cargo.toml \
+    qwp_ws_publication_driver_submit_waits_and_row_is_queryable \
+    -- --ignored --nocapture
 cargo fmt --manifest-path questdb-rs/Cargo.toml --check
 git diff --check
 ```
@@ -81,11 +96,11 @@ git diff --check
 Observed result:
 
 ```text
-encode failure regression: 1 passed
-qwp_ws_driver: 43 passed
-blocking real transport mock tests: 3 passed
-qwp_ws: 113 passed, 3 ignored
+qwp_ws_driver: 47 passed
+qwp_ws: 126 passed, 6 ignored
+minimal _sender-qwp-ws driver filter: 43 passed, with existing unused-code warnings
 qwp_ws_async with async-sender-qwp-ws: 8 passed
+real QuestDB publication probe: 1 passed
 format and whitespace checks passed
 ```
 
@@ -256,11 +271,52 @@ handles cumulative ACK after multiple sends, and is covered by local in-process
 plain WS and WSS tests. This is still a manual-driver prototype path, not public
 product API integration.
 
-The next architectural seam is above the queue: product submission must encode a
-caller `Buffer` into a self-sufficient replay payload, then publish those bytes
-to the queue. The current driver tests still submit opaque payload bytes
-directly, which is correct for transport validation but not sufficient for the
-next real-server product-path gate.
+### Publication shell
+
+`questdb-rs/src/ingress/sender/qwp_ws_publisher.rs` is the first Rust-only
+publication owner above the manual driver. It owns:
+
+- `QwpWsEncodeScratch`,
+- `SymbolGlobalDict`,
+- negotiated QWP version,
+- `ManualDriverPrototype<Q, T>`.
+
+Its submit path is:
+
+```text
+QwpBuffer -> encode_ws_replay_message -> ManualDriverPrototype::try_submit
+```
+
+The driver remains payload-opaque. The shell returns a receipt only after queue
+publication succeeds. Failed queue publication may reserve internal symbol IDs,
+but it does not enqueue bytes, assign an FSN, return a receipt, consume a wire
+sequence, or clear the caller buffer.
+
+Focused coverage now verifies:
+
+- exact replay payload bytes reach the driver transport,
+- empty buffers are rejected before encoding and publication,
+- failed queue publication does not consume an FSN,
+- `BlockingQwpWsTransport` can submit/wait through this publication path against
+  the local in-process WS harness.
+
+This is still not public product API integration and not yet a real QuestDB
+reconnect probe through the full path.
+
+### Real publication e2e
+
+`questdb-rs/src/tests/qwp_ws_publication_probe.rs` validates the current
+publication path against a real QuestDB server:
+
+```text
+Buffer -> replay payload -> volatile queue -> manual driver -> BlockingQwpWsTransport -> QuestDB
+```
+
+The probe is ignored by default and gated by `QDB_QWP_WS_PUBLICATION_PROBE=1`.
+It submits a QWP buffer through `QwpWsPublicationDriver`, waits for the receipt,
+then queries QuestDB over HTTP and verifies the inserted symbol, long, and double
+values. It asserts user-visible behavior only; it does not lock in internal
+driver state, event order, or private queue fields.
 
 ### C ABI shape stubs
 
@@ -330,10 +386,9 @@ conversion before the real driver is wired through.
 
 ## Known gaps and risks
 
-- A Rust-only `Buffer -> replay payload -> queue` publication shell has not been
-  wired into the manual driver/core path yet.
-- Real-server validation through the new manual driver transport is still
-  missing for the full publication path.
+- Reconnect replay through
+  `Buffer -> replay payload -> queue -> BlockingQwpWsTransport` is not yet
+  covered.
 - Java-compatible initial connection configuration (`initial_connect_retry`)
   still has design text but no real new-core implementation.
 - The FFI shape stubs are not connected to the real queue/driver prototypes.
@@ -354,8 +409,8 @@ conversion before the real driver is wired through.
   real-server probe.
 - Auth/upgrade rejection and ambiguous operational write/internal errors still
   need taxonomy validation.
-- The real transport adapter has local mock WS/WSS coverage, but not yet a real
-  QuestDB submit/wait or reconnect replay probe through
+- The real transport adapter and publication shell have a real QuestDB
+  submit/wait probe, but not yet a real reconnect replay probe through
   `Buffer -> replay payload -> queue -> BlockingQwpWsTransport`.
 - The v1 dense dictionary replay shape is correctness-first and can be expensive
   for long-running high-cardinality symbol workloads.
@@ -368,30 +423,29 @@ conversion before the real driver is wired through.
 
 Continue Step 12, but keep it narrow.
 
-Add a Rust-only publication shell first, then one real-server integration/probe
-that uses `BlockingQwpWsTransport` through the manual driver seam, not the old
-sync sender path.
+The publication shell and real submit/wait path exist now. The next slice should
+prove reconnect through that same path rather than adding public API or FFI
+surface.
 
 Suggested slice:
 
-1. Add a narrow Rust-only owner for replay encoding state:
-   `QwpWsEncodeScratch`, `SymbolGlobalDict`, negotiated QWP version, and queue.
-2. Make its submit path perform `Buffer -> encode_ws_replay_message -> queue
-   publication`, returning a receipt only after successful publication.
-3. Keep `SymbolGlobalDict` append-only and non-transactional. Verify failed
-   encoding/publication does not clear the caller buffer, publish bytes, assign
-   an FSN, return a receipt, or consume a wire sequence.
-4. Run valid submit/wait against a real QuestDB QWP/WebSocket endpoint through
-   that publication path and `BlockingQwpWsTransport`.
-5. Add a reconnect replay case through the same path.
-6. Keep this as an ignored/gated probe until the required QuestDB server setup is
+1. Add a real reconnect replay probe through
+   `QwpWsPublicationDriver -> BlockingQwpWsTransport`, using a small fault proxy
+   in front of QuestDB rather than a fake server.
+2. The probe should assert behavior only: ACKed frames are not replayed,
+   unresolved frames are replayed after reconnect, replayed payloads are accepted
+   on a fresh server connection, and the rows become queryable.
+3. Keep real-server checks ignored/gated until the required QuestDB server setup is
    explicit and cheap to reproduce.
-7. Record observed ACK, close, and error behavior in a short reflection note.
+4. Record observed ACK, close, and error behavior in a short reflection note.
+5. After the real path is proven, connect the publication shell to the
+   Java-compatible `.sfa` segment-ring queue rather than extending the old custom
+   SF journal.
 
 Do not start with threaded adapters, C++/Python wrappers, SF compaction, or
-performance optimization. The main de-risking question is whether real blocking
-WebSocket I/O fits the current manual driver state machine without public API
-changes.
+performance optimization. The main de-risking question is now whether reconnect,
+real-server behavior, and Java-compatible disk storage fit the current
+publication/driver seam without public API changes.
 
 ## Commands worth re-running
 
