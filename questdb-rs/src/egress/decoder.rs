@@ -268,11 +268,18 @@ impl DecodedBatch {
                 offsets,
                 data,
                 validity,
-            } => ColumnView::Varchar(VarcharColumn::new(
-                offsets,
-                data,
-                validity_from_opt(validity, self.row_count),
-            )),
+            } => {
+                // Safety: `decode_varchar` validates the concatenated
+                // `data` buffer as UTF-8 and only emits offsets at
+                // codepoint boundaries (see decoder.rs `decode_varchar`,
+                // the `std::str::from_utf8(&data)` check around the
+                // `utf8` flag). Both invariants required by
+                // `VarcharColumn::new` therefore hold.
+                let view = unsafe {
+                    VarcharColumn::new(offsets, data, validity_from_opt(validity, self.row_count))
+                };
+                ColumnView::Varchar(view)
+            }
             DecodedColumn::Binary {
                 offsets,
                 data,

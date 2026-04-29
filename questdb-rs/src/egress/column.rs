@@ -432,11 +432,21 @@ pub struct VarcharColumn<'a> {
 }
 
 impl<'a> VarcharColumn<'a> {
-    /// Construct from caller-validated buffers. The `data` slice must be
-    /// valid UTF-8 across the entire byte range; the decoder validates
-    /// once at decode time so [`value`](Self::value) can use
-    /// `from_utf8_unchecked` per row.
-    pub fn new(offsets: &'a [u32], data: &'a [u8], validity: Validity<'a>) -> Self {
+    /// Construct from caller-validated buffers.
+    ///
+    /// # Safety
+    ///
+    /// The entire `data` byte range, from offset `0` up to the largest
+    /// value referenced by `offsets`, must be valid UTF-8 *and* every
+    /// `(offsets[i], offsets[i+1])` pair must lie on a UTF-8 character
+    /// boundary. [`value`](Self::value) reads each row through
+    /// `from_utf8_unchecked` for performance; violating this contract
+    /// produces an invalid `&str` and is undefined behavior.
+    ///
+    /// The decoder upholds this invariant by validating the concatenated
+    /// `data` buffer once at decode time and only emitting offsets at
+    /// codepoint boundaries.
+    pub unsafe fn new(offsets: &'a [u32], data: &'a [u8], validity: Validity<'a>) -> Self {
         Self {
             inner: VarlenLayout {
                 offsets,
@@ -474,8 +484,9 @@ impl<'a> VarcharColumn<'a> {
     #[inline]
     pub fn value(&self, row: usize) -> Option<&'a str> {
         let bytes = self.inner.slice(row)?;
-        // Safety: the decoder validated the entire data buffer as UTF-8;
-        // any sub-slice on a string boundary is also valid UTF-8.
+        // Safety: `VarcharColumn::new` is an `unsafe fn` whose contract
+        // requires `data` to be valid UTF-8 across every offset boundary,
+        // so any sub-slice produced by `inner.slice` is also valid UTF-8.
         Some(unsafe { std::str::from_utf8_unchecked(bytes) })
     }
 }
