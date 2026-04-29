@@ -31,7 +31,9 @@ As of 2026-04-29:
 - Step 7 has a passing real-server ACK/order/reject probe in
   `doc/QWP_WEBSOCKET_ACK_ORDER_REJECT_PROBE.md`.
 - Step 8 has a minimal file-backed SF queue prototype and reflection in
-  `doc/QWP_WEBSOCKET_SF_QUEUE_PROTOTYPE.md`.
+  `doc/QWP_WEBSOCKET_SF_QUEUE_PROTOTYPE.md`. That prototype validated recovery
+  mechanics but is not the product disk format; the product SF store must use
+  the Java-compatible `.sfa` segment format.
 - Step 9 has driver/SF seam coverage for server rejection, terminal, close-drain,
   retry-budget behaviour, and event polling agreement in
   `doc/QWP_WEBSOCKET_ERROR_POLICY_PROTOTYPE.md`.
@@ -118,7 +120,9 @@ below or explicitly record that real-server semantic validation, not
 byte-for-byte Java parity, is the compatibility gate for v1.
 
 Before implementation depends on Java-compatible behavior, add small golden
-fixtures that compare Java and Rust at the QWP application-payload layer:
+fixtures at two layers.
+
+QWP payload fixtures compare Java and Rust at the application-payload layer:
 
 - Compare unmasked QWP payload bytes, not WebSocket frames. Client mask keys are
   intentionally fresh per send, so masked frame bytes should differ.
@@ -132,8 +136,23 @@ fixtures that compare Java and Rust at the QWP application-payload layer:
 - Record whether any byte difference is semantically intentional. If so, validate
   both payloads against a real server and document the observed rows.
 
+Store-and-Forward disk fixtures compare Java and Rust at the `.sfa` segment
+layer:
+
+- Compare the 24-byte segment header: magic `SF01`, version `1`, zero
+  flags/reserved, `baseSeq`, and `createdMicros` field placement.
+- Compare frame envelopes: `[u32 crc32c][u32 payloadLen][payload]`, with CRC32C
+  computed over `payloadLen || payload`.
+- Include a Java-written slot that Rust opens and replays, and a Rust-written
+  slot that Java opens and replays.
+- Include recovery of a torn tail: the reader must stop at the first invalid
+  frame and append from that offset, matching Java behavior.
+- Verify there are no Rust-only ACK or rejection records on disk. ACK/rejection
+  state is represented only by retained vs trimmed segment files.
+
 These fixtures should not lock Rust into Java's public API or Java's threading
-model. They lock down the wire behavior that both clients rely on.
+model. They lock down the wire behavior and disk contract that both clients rely
+on.
 
 ## Step 1: API sketch first
 
@@ -436,17 +455,30 @@ Global reflection:
 - Are the ordering and ACK assumptions strong enough to build durable replay on
   top?
 
-## Step 8: Minimal Store-and-Forward disk queue
+## Step 8: Java-compatible Store-and-Forward disk queue
 
 Replace the volatile queue with a file-backed queue. Keep the fake server.
 
-Start with the smallest durability surface that can validate replay:
+The first prototype used a Rust-specific journal. Do not evolve that journal into
+the product disk format. The product queue must use the Java client `.sfa`
+segment layout so a slot written by one client can be recovered by the other.
 
-- append frame
-- publish receipt
-- recover queue after restart
-- replay from the first unresolved frame
-- truncate or mark acknowledged frames
+Start with the smallest Java-compatible durability surface that can validate
+replay:
+
+- create and lock `<sf_dir>/<sender_id>/`,
+- create `sf-initial.sfa` with the Java segment header,
+- append frames as `[crc32c][payloadLen][payload]`,
+- publish receipt only after the complete frame is visible to the queue,
+- recover `.sfa` files after restart by scanning valid frames,
+- replay from the lowest retained FSN,
+- rotate to `sf-<generation>.sfa`,
+- trim fully ACKed sealed segments.
+
+Do not add durable ACK-through, rejection, or dead-letter records. The only
+durable evidence that earlier frames were acknowledged is that fully ACKed sealed
+segments may have been removed. If a crash happens before trim, retained frames
+may replay again. That is the Java-compatible at-least-once model.
 
 Validation target:
 
@@ -456,21 +488,32 @@ Validation target:
 - Replay preserves submission order.
 - The design distinguishes volatile memory mode from file-backed page-cache
   durability.
+- Java can recover a Rust-written `.sfa` slot.
+- Rust can recover a Java-written `.sfa` slot.
+- Torn-tail recovery matches Java: stop at the first invalid frame and append
+  from that offset.
+- ACK/drop-and-continue rejection leaves no Rust-only completion marker on disk.
 
 Design pressure to watch:
 
 - If disk durability changes user-facing encoding or receipt behavior, the
   abstraction is too leaky.
-- If cleanup rules are hard to explain, crash recovery probably needs a simpler
-  journal contract.
+- If cleanup rules require durable per-frame completion records, the design has
+  drifted away from Java and should stop.
+- If the `.sfa` format cannot be described as a small mechanical segment reader
+  and writer, implementation is probably carrying too much product policy.
 
 Local reflection:
 
 - Is the disk queue small and mechanical, or is it driving API design?
+- Can each retained byte be explained as either Java segment metadata or QWP
+  payload bytes?
 
 Global reflection:
 
 - Can crash/restart behavior be explained without special cases?
+- Can a user move a Store-and-Forward slot between Java and Rust and still
+  recover it?
 
 ## Step 9: Error policy validation
 
@@ -704,6 +747,8 @@ Stop and redesign before continuing if any of these happen:
   error-taxonomy assumptions.
 - Java/Rust golden payload fixtures disagree in a way that is not explained by a
   documented non-semantic field and validated against a real server.
+- Java/Rust `.sfa` golden fixtures disagree in segment header, frame envelope,
+  CRC, recovery cursor, or replay order.
 - Real WebSocket integration requires a hidden background thread in the low-level
   API.
 

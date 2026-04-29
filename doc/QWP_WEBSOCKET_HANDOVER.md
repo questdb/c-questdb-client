@@ -42,6 +42,11 @@ Useful Java/server references:
   `/home/jara/devel/oss/questdb-arrays/java-questdb-client/core/src/main/java/io/questdb/client/cutlass/qwp/client/QwpWebSocketSender.java`
 - Java SF send loop:
   `/home/jara/devel/oss/questdb-arrays/java-questdb-client/core/src/main/java/io/questdb/client/cutlass/qwp/client/sf/cursor/CursorWebSocketSendLoop.java`
+- Java SF segment format:
+  `/home/jara/devel/oss/questdb-arrays/java-questdb-client/core/src/main/java/io/questdb/client/cutlass/qwp/client/sf/cursor/MmapSegment.java`
+- Java SF segment ring and slot lock:
+  `/home/jara/devel/oss/questdb-arrays/java-questdb-client/core/src/main/java/io/questdb/client/cutlass/qwp/client/sf/cursor/SegmentRing.java`
+  `/home/jara/devel/oss/questdb-arrays/java-questdb-client/core/src/main/java/io/questdb/client/cutlass/qwp/client/sf/cursor/SlotLock.java`
 - Server source used for taxonomy checks:
   `/home/jara/devel/oss/questdb-arrays`
 
@@ -56,7 +61,7 @@ ia_qwp_ws
 Most recent code checkpoint before the 2026-04-29 working-copy changes:
 
 ```text
-2ef1d4c Refine QWP WebSocket transport seam
+338512e Simplify QWP WebSocket rejection design
 ```
 
 Recent validation after the Step 12 blocking transport slice:
@@ -164,8 +169,8 @@ This is deliberate. A local transport write failure must not create a fake
 
 ### Store-and-Forward prototype
 
-`questdb-rs/src/ingress/sender/qwp_ws_sf_queue.rs` implements the file-backed SF
-queue prototype:
+`questdb-rs/src/ingress/sender/qwp_ws_sf_queue.rs` implements the current
+file-backed SF queue prototype:
 
 - append-only journal,
 - frame publication records,
@@ -175,7 +180,13 @@ queue prototype:
 - malformed-log rejection,
 - ACK and rejection state surviving restart.
 
-The SF journal deliberately does not persist connection-local facts:
+This prototype is no longer the product disk design. The new requirement is
+byte-compatible Store-and-Forward with the Java client. Product SF must replace
+the custom `qwp-ws-sf.log` journal with Java `.sfa` segment files under
+`<sf_dir>/<sender_id>/`, using the Java header, frame envelope, CRC32C,
+recovery scan, slot lock, rotation, and ACK-driven segment trim model.
+
+The product `.sfa` store must also avoid connection-local facts:
 
 - `Sent` receipt status,
 - wire sequence,
@@ -183,8 +194,9 @@ The SF journal deliberately does not persist connection-local facts:
 - WebSocket mask keys,
 - masked WebSocket bytes.
 
-After process recovery, unresolved frames are `Published`; replay rebuilds
-connection-local state from scratch.
+After process recovery, retained frames are `Published`; replay rebuilds
+connection-local state from scratch. Previous receipt handles and runtime
+ACK/rejection status are gone.
 
 ### Manual driver and transport seam
 
@@ -304,9 +316,13 @@ conversion before the real driver is wired through.
   `Rejected` naming before ABI hardening.
 - No C++ or Python wrapper implementation has been added for the new QWP/WS
   shape.
-- Durable SF prototype lacks segment rotation, compaction, checksums, and
-  Java-compatible `sf_durability` parse-and-fail behavior for reserved
-  `flush`/`append` modes.
+- Durable SF prototype is not Java disk-format-compatible. It lacks `.sfa`
+  segment files, Java header/frame CRC layout, slot locking, segment rotation,
+  ACK-driven trim, cross-client recovery, and Java-compatible `sf_durability`
+  parse-and-fail behavior for reserved `flush`/`append` modes.
+- Java/Rust `.sfa` golden fixtures are missing: Java-written slot opened by
+  Rust, Rust-written slot opened by Java, header/frame CRC fixture, and torn-tail
+  recovery fixture.
 - Extended Java/Rust golden fixtures are still missing arrays, decimals, UTF-8,
   sparse columns, and schema evolution.
 - Close/EOF semantics with unresolved in-flight frames are not yet proven by a

@@ -259,8 +259,8 @@ point:
 - failed local publication must not clear the caller buffer,
 - failed SF append must not advance the published cursor,
 - failed transport write/flush must not mark a frame `Sent`,
-- failed durable completion write must not report ACKed or rejected completion
-  in SF mode.
+- failed ACK-driven segment trim must not delete partially ACKed frames or invent
+  a durable completion marker.
 
 This invariant is more important than the internal helper boundaries. The core
 may refactor encoding, queue, and transport code, but the observable state
@@ -379,6 +379,9 @@ The main drift risks are:
 - WebSocket masking can make byte comparisons misleading. Java/Rust golden tests
   should compare unmasked QWP application payload bytes, not WebSocket frames,
   because client mask keys are intentionally fresh on every send.
+- Store-and-Forward disk format can drift if Rust invents its own journal. The
+  product file-backed format must be Java's `.sfa` segment format, not a
+  Rust-specific log with ACK or rejection records.
 - Error policy can drift if Rust invents a richer rejection/dead-letter model.
   Match Java's default server-rejection categories first, preserve raw
   status/message, and add new policy only if Java grows the same surface.
@@ -394,11 +397,12 @@ The main drift risks are:
   arrays, decimals, timestamps, UTF-8, sparse columns, table/schema evolution,
   and symbol reuse need fixture coverage.
 
-Validation should include Java/Rust golden cases. For the same logical batches,
-Java and Rust should emit equivalent unmasked QWP payloads for v1 replay mode.
-When exact byte equality is not practical because an agreed non-semantic field
-differs, the fixture should document the field and the real-server probe should
-verify that both payloads ingest to the same rows.
+Validation should include Java/Rust golden cases at two layers. For the same
+logical batches, Java and Rust should emit equivalent unmasked QWP payloads for
+v1 replay mode. For file-backed SF, Java and Rust should read and write the same
+`.sfa` segment files. When exact payload byte equality is not practical because
+an agreed non-semantic field differs, the fixture should document the field and
+the real-server probe should verify that both payloads ingest to the same rows.
 
 ## Store-and-Forward engine
 
@@ -419,11 +423,20 @@ ACKed, server-rejected, or terminal. `completed_fsn` advances through contiguous
 resolved frames. `server_acked_fsn` advances only through contiguous ACKed frames
 and can therefore lag behind `completed_fsn` across rejection gaps.
 
-Durable state is deliberately smaller than runtime state. The queue stores:
+Durable state is deliberately smaller than runtime state. The queue stores only
+retained publication data:
 
-- publication records: FSN plus self-sufficient QWP payload bytes,
-- ACK-through completion records,
-- server-rejection completion records.
+- Java-compatible `.sfa` segment files,
+- each segment's base FSN,
+- self-sufficient QWP payload bytes per frame,
+- CRC32C enough to recover through torn tails.
+
+The queue does not store ACK-through records, rejection records, receipt handles,
+or server status payloads. ACK and rejection outcomes are runtime facts. Their
+only durable effect is indirect: fully ACKed sealed segments may be trimmed from
+the slot. After a process crash, retained frames may be replayed even if the
+previous process had already received an ACK for them but had not durably trimmed
+the containing segment. This is the Java-compatible at-least-once model.
 
 The queue does not store connection-local state:
 
@@ -433,10 +446,11 @@ The queue does not store connection-local state:
 - WebSocket mask keys,
 - WebSocket headers or masked payload bytes.
 
-After process recovery, every unresolved frame is `Published`, not `Sent`.
-The next connection rebuilds its in-flight table from scratch, maps the oldest
-unresolved FSN to wire sequence `0`, and replays from there. This is the same
-model as reconnect replay; process restart only discards more volatile state.
+After process recovery, every retained frame is `Published`, not `Sent`.
+The next connection rebuilds its in-flight table from scratch, maps the lowest
+retained FSN to wire sequence `0`, and replays from there. This is the same
+model as reconnect replay, except process restart may replay retained frames
+whose previous runtime ACK state was lost before segment trim.
 
 ### Volatile queue mode
 
@@ -451,54 +465,72 @@ Properties:
 
 ### File-backed SF queue mode
 
-File-backed Store-and-Forward mode stores frames in segment files under a sender slot:
+File-backed Store-and-Forward mode stores frames in Java-compatible segment files
+under a sender slot:
 
 ```text
 <sf_dir>/<sender_id>/
   .lock
-  segment-0000000000000001.qwpws
-  segment-0000000000000002.qwpws
+  sf-initial.sfa
+  sf-0000000000000001.sfa
+  sf-0000000000000002.sfa
 ```
 
-Segment record shape:
+The disk format is the Java client `.sfa` format. Rust must match the bytes Java
+writes; on supported little-endian platforms that means the layout below. Golden
+fixtures protect this contract.
 
 ```text
-record_header {
-    magic
-    header_version
-    fsn
-    payload_len
-    checksum
-    flags
+segment_header {
+    u32 magic        // 'SF01'
+    u8  version      // 1
+    u8  flags        // 0
+    u16 reserved     // 0
+    u64 base_seq     // FSN of first frame in this segment
+    u64 created_us
 }
-payload bytes
-commit marker / published cursor
+
+frame {
+    u32 crc32c       // over payload_len followed by payload bytes
+    u32 payload_len
+    u8  payload[payload_len]
+}
 ```
 
-Publication must be crash-recoverable:
+There are no Rust-specific record tags, no WebSocket frame headers, and no
+WebSocket mask bytes in the segment. The stored frame payload is the unmasked QWP
+application payload sent as one WebSocket binary message.
 
-1. Write header as not committed.
-2. Write payload.
-3. Write checksum.
-4. Publish the record with one ordered cursor or commit marker update.
+Publication follows the Java segment invariant:
 
-Completion records are append-only logical state. ACK-through records may be
-replayed idempotently if they reference frames that are already completed.
-Server-rejection completion records must identify the rejected FSN and raw
-server status/message. Duplicate rejection markers, rejection for unpublished
-frames, and rejection for already completed frames indicate a corrupt journal.
+1. Reserve the frame header and write `payload_len` at frame offset `+4`.
+2. Write payload bytes after the frame header.
+3. Compute CRC32C over `payload_len || payload` and write it at frame offset `0`.
+4. Advance the in-process published cursor only after the complete frame is in
+   the segment mapping.
 
-Recovery ignores partial or checksum-invalid tail records. Before appending new
-records, the implementation must truncate any ignored tail so later records
-cannot accidentally extend bytes that were previously treated as uncommitted.
-Non-tail corruption is not a delivery outcome; it is a storage error that should
-prevent opening the sender until the slot is repaired or recovered by operator
-policy.
+Recovery scans each `.sfa` file from the segment header through valid frames.
+The first frame with a negative length, a length past the file end, or a CRC32C
+mismatch is a torn tail. The recovered append cursor is positioned at that frame
+so the next append overwrites it. Segment files are sorted by `base_seq`; the
+recovered ranges must be contiguous. The highest-base segment becomes active and
+older segments become sealed.
+
+The `.lock` file is part of the slot contract. A sender must hold an exclusive
+slot lock before it recovers, appends, rotates, or trims `.sfa` files. Two live
+writers in one slot would corrupt the FSN sequence and must fail at startup.
+
+ACK handling follows Java's segment-trim model. Runtime ACKs advance an in-memory
+ACK cursor. Fully ACKed sealed segments may be closed and unlinked. Active
+segments are not rewritten to remove individual ACKed frames. Server
+drop-and-continue rejection advances the same ACK cursor for the rejected FSN and
+reports the rejection to the user; halt/terminal rejection leaves bytes in place.
+No rejection marker is written to disk.
 
 Public mode selection follows Java:
 
 | Public mode | Trigger | Storage | Survives process crash | Survives OS crash |
-|---|---|---|---|
+|---|---|---|---|---|
 | Memory | `sf_dir` unset | preallocated RAM ring | No | No |
 | Store-and-Forward | `sf_dir` set | segment files under `<sf_dir>/<sender_id>/` | Yes, after publication | Not guaranteed in v1 |
 
@@ -740,10 +772,11 @@ Reconnect budget exhaustion:
 - future submit calls fail until the sender is recreated.
 
 For file-backed SF mode, terminalizing the current sender's receipts does not
-ACK, reject, or delete unresolved SF records. Those frames remain in the slot and
-can be recovered by a newly created sender after the operator fixes
-configuration, credentials, or server availability. Only ACK and server-rejection
-outcomes append durable completion records.
+ACK, reject, or delete unresolved retained SF frames. Those frames remain in the
+slot and can be recovered by a newly created sender after the operator fixes
+configuration, credentials, or server availability. ACK and server-rejection
+outcomes do not append durable completion records; they only affect runtime
+receipt state and, for ACK/drop-and-continue, ACK-driven segment trim.
 
 Security/upgrade failures:
 
@@ -1173,11 +1206,14 @@ Candidate config keys:
 7. Validate the full Rust-only path against real QWP/WebSocket: replay payload publication, manual driver transport, ACK, and reconnect replay.
 8. Add C ABI for construct, new buffer, submit, drive, poll event, wait, receipt status, close.
 9. Add mock-server tests for pipelining, cumulative ACKs, ordered server errors, close, and no buffer clear on failed submit.
-10. Add file-backed SF segment storage and recovery behind `sf_dir`.
-11. Add Java-compatible server rejection reporting and handler plumbing.
-12. Add explicit background runner as an ownership-consuming adapter.
-13. Add Tokio adapter.
-14. Add C++ and Python wrappers after the C ABI is stable.
+10. Add Java-compatible `.sfa` file-backed SF segment storage, recovery, slot
+    locking, rotation, and ACK-driven trim behind `sf_dir`.
+11. Add Java/Rust `.sfa` golden fixtures before treating the disk format as a
+    product contract.
+12. Add Java-compatible server rejection reporting and handler plumbing.
+13. Add explicit background runner as an ownership-consuming adapter.
+14. Add Tokio adapter.
+15. Add C++ and Python wrappers after the C ABI is stable.
 
 ## Tests
 
@@ -1205,7 +1241,18 @@ Rust core tests:
   any agreed non-semantic byte differences and validate them against a real
   server,
 - a stored later frame from a repeated-schema/repeated-symbol workload can be sent alone on a fresh connection,
-- SF segment records store unmasked QWP payload bytes, not WebSocket headers or masked payloads,
+- Java/Rust `.sfa` header golden fixture agrees on magic `SF01`, version `1`,
+  flags/reserved zero, `base_seq`, and `created_us` field placement,
+- Java/Rust `.sfa` frame golden fixture agrees on
+  `[crc32c][payload_len][payload]`, including CRC32C over
+  `payload_len || payload`,
+- a Java-written SF slot can be opened by Rust and replayed in FSN order,
+- a Rust-written SF slot can be opened by Java and replayed in FSN order,
+- recovery ignores a torn tail in the same way as Java and appends at the first
+  invalid frame offset,
+- ACK/drop-and-continue rejection does not create Rust-only disk records; only
+  ACK-driven segment trim changes the retained `.sfa` set,
+- SF segment frames store unmasked QWP payload bytes, not WebSocket headers or masked payloads,
 - replaying the same stored frame can use a fresh WebSocket mask key without changing the stored bytes,
 - masked server-to-client WebSocket frames are rejected as protocol errors.
 
