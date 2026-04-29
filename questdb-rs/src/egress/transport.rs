@@ -225,6 +225,17 @@ impl WsTransport {
         }
     }
 
+    /// Apply (or clear) a TCP read timeout on the underlying stream.
+    ///
+    /// `Some(t)` causes the next blocking read that goes longer than `t`
+    /// to surface as an `Io` error from tungstenite (`SocketError`);
+    /// `None` reverts to the default (no timeout). Used by
+    /// `Cursor::cancel()` to bound the post-CANCEL drain so a
+    /// stuck-but-not-RST'd peer cannot hang the cancel forever.
+    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) {
+        set_tcp_read_timeout(self.socket.get_mut(), timeout);
+    }
+
     /// Best-effort close. Errors are swallowed to keep `Drop` clean.
     pub fn close(mut self) {
         teardown_inplace(&mut self.socket);
@@ -266,6 +277,21 @@ fn set_tcp_write_timeout(stream: &mut MaybeTlsStream<TcpStream>, timeout: Option
         }
         MaybeTlsStream::Rustls(s) => {
             let _ = s.sock.set_write_timeout(timeout);
+        }
+        _ => {}
+    }
+}
+
+/// Set `set_read_timeout` on the underlying `TcpStream`, walking through
+/// any TLS wrapper. Same `_` arm rationale as
+/// [`set_tcp_write_timeout`].
+fn set_tcp_read_timeout(stream: &mut MaybeTlsStream<TcpStream>, timeout: Option<Duration>) {
+    match stream {
+        MaybeTlsStream::Plain(s) => {
+            let _ = s.set_read_timeout(timeout);
+        }
+        MaybeTlsStream::Rustls(s) => {
+            let _ = s.sock.set_read_timeout(timeout);
         }
         _ => {}
     }

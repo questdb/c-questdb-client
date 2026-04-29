@@ -789,6 +789,18 @@ impl<'r> ReaderQuery<'r> {
 /// and re-encoding the entire builder + binds.
 const REQUEST_ID_OFFSET: usize = 1;
 
+/// Bounded read timeout applied to the underlying TCP stream for the
+/// duration of [`Cursor::cancel`]'s post-CANCEL drain.
+///
+/// Without this, a stuck-but-not-RST'd peer that stops sending bytes
+/// after we deliver the CANCEL frame would block the drain
+/// indefinitely. The drain consumes whatever batches the server
+/// already had in flight plus the terminal QUERY_ERROR; under healthy
+/// operation each frame arrives within milliseconds. 30 s is far past
+/// any realistic batch transit and short enough that an unresponsive
+/// peer surfaces a clear error rather than appearing to hang.
+const CANCEL_DRAIN_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 // ---------------------------------------------------------------------------
 // Cursor + BatchView
 // ---------------------------------------------------------------------------
@@ -918,8 +930,11 @@ impl<'r> Cursor<'r> {
                         || !self.reader.cfg.failover
                         || !is_failover_eligible(e.code())
                     {
-                        self.reader.cursor_active = false;
-                        self.done = true;
+                        // Match every other terminal path in this loop:
+                        // tear down the WS so the cursor's flags stay
+                        // coherent with the transport state, no half-cooked
+                        // cursors that defer cleanup to `Reader::Drop`.
+                        self.terminate_with_close();
                         return Err(e);
                     }
                     self.failover_reconnect_and_replay(e)?;
@@ -1244,13 +1259,14 @@ impl<'r> Cursor<'r> {
     /// Send a CANCEL frame and drain until the server emits a terminal
     /// frame for this request.
     ///
-    /// Blocking. Issues a synchronous WS write of the CANCEL frame,
-    /// then drains via [`Self::next_batch`] — which is itself blocking
-    /// during failover (see that method's doc). The underlying
-    /// `TcpStream` has a generous bound on per-syscall write time
-    /// (see `transport.rs::WRITE_TIMEOUT`) so a stuck-but-not-RST'd
-    /// peer cannot hang the cancel forever; expect the call to return
-    /// within that bound at worst.
+    /// Blocking, but bounded. The CANCEL write inherits the transport's
+    /// `WRITE_TIMEOUT`; the post-CANCEL drain runs with a TCP read
+    /// timeout of [`CANCEL_DRAIN_READ_TIMEOUT`] installed for the
+    /// duration of the loop, so a stuck-but-not-RST'd peer surfaces as
+    /// a `SocketError` rather than hanging the calling thread. If the
+    /// CANCEL write itself fails, the transport is torn down before
+    /// the error is returned so the cursor's flags and the underlying
+    /// connection state are left coherent.
     pub fn cancel(&mut self) -> Result<()> {
         if self.done {
             return Ok(());
@@ -1275,7 +1291,21 @@ impl<'r> Cursor<'r> {
         let mut payload = Vec::with_capacity(9);
         payload.push(MsgKind::Cancel.as_u8());
         payload.extend_from_slice(&self.request_id.to_le_bytes());
-        self.reader.transport_mut()?.write_message(&payload)?;
+
+        // Capture the CANCEL write error explicitly: a `?` here would
+        // leave `cancelling=true, done=false, transport=Some(broken)`,
+        // and the half-broken transport would only be cleaned up when
+        // `Reader::Drop` ran. Tearing it down here keeps the cursor's
+        // flags and the transport in lockstep with the other terminal
+        // paths in `next_batch`.
+        let write_outcome = match self.reader.transport_mut() {
+            Ok(t) => t.write_message(&payload),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = write_outcome {
+            self.terminate_with_close();
+            return Err(e);
+        }
         // Wake the server in case it's already credit-suspended. The
         // server's `handleCancel` only sets a flag; the cancel takes
         // effect when `streamResults` is next re-entered, which on a
@@ -1300,11 +1330,21 @@ impl<'r> Cursor<'r> {
             let _ = self.send_credit_frame(1);
         }
 
+        // Bound the drain reads. tungstenite's `read()` is otherwise a
+        // pure blocking syscall; only the TCP-level timeout can
+        // interrupt it on a stuck peer. The credit-nudge write above
+        // may have torn the transport down (best-effort `let _ =`),
+        // so guard against `transport == None`.
+        if let Some(t) = self.reader.transport.as_mut() {
+            t.set_read_timeout(Some(CANCEL_DRAIN_READ_TIMEOUT));
+        }
+
         // Drain until any terminal frame (RESULT_END / EXEC_DONE /
         // QUERY_ERROR including STATUS_CANCELLED) — swallow batches
         // between CANCEL and the server's acknowledgement. `done` is
         // the right guard here, not `terminal`: an error terminal
         // sets `done` but leaves `terminal` as `None`.
+        let mut drain_result: Result<()> = Ok(());
         while !self.done {
             match self.next_batch() {
                 Ok(Some(_)) => {} // discarded
@@ -1313,11 +1353,21 @@ impl<'r> Cursor<'r> {
                     if matches!(e.code(), crate::egress::ErrorCode::Cancelled) {
                         break;
                     }
-                    return Err(e);
+                    drain_result = Err(e);
+                    break;
                 }
             }
         }
-        Ok(())
+
+        // Restore the default (no-op) read timeout. If `next_batch`
+        // hit a non-cancelled error, it has already called
+        // `terminate_with_close` and the transport is `None`; nothing
+        // to restore.
+        if let Some(t) = self.reader.transport.as_mut() {
+            t.set_read_timeout(None);
+        }
+
+        drain_result
     }
 
     /// Manually grant the server `additional_bytes` of read budget on
