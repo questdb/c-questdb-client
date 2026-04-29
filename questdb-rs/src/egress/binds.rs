@@ -31,10 +31,10 @@
 //! type_code:  u8
 //! null_flag:  u8                0x00 = no bitmap; 0x01 = bitmap follows
 //! [bitmap]:   u8                present iff null_flag == 0x01; LSB-first, 1 = NULL
-//! column args:                  always present (even when zero values), per type:
-//!   DECIMAL64/128/256:          1 B scale
-//!   GEOHASH:                    varint precision_bits (1..=60)
-//!   VARCHAR/BINARY:             (non_null + 1) × u32_le offsets
+//! column args:                  per type, present per the rules below:
+//!   DECIMAL64/128/256:          1 B scale (always present, including nulls)
+//!   GEOHASH:                    varint precision_bits (1..=60; always present)
+//!   VARCHAR/BINARY:             (non_null + 1) × u32_le offsets — non-null only
 //!   everything else:            (no args)
 //! values × non_null:            type-specific layout (see per-type docs below)
 //! ```
@@ -44,7 +44,9 @@
 //! - simple types emit `[type, 0x01, 0x01]`
 //! - DECIMAL\* emit `[type, 0x01, 0x01, scale]`
 //! - GEOHASH emits `[type, 0x01, 0x01, varint(precision_bits)]`
-//! - VARCHAR/BINARY emit `[type, 0x01, 0x01, 0,0,0,0]` (single offset = 0)
+//! - VARCHAR/BINARY emit `[type, 0x01, 0x01]` (the server's bind decoder
+//!   skips the offsets array on the null branch — emitting them would
+//!   poison the next bind in a multi-bind QUERY_REQUEST)
 
 use std::net::Ipv4Addr;
 
@@ -219,11 +221,13 @@ pub fn encode_bind(bind: &Bind, out: &mut Vec<u8>) -> Result<()> {
             }
             varint::encode_u64(*precision_bits as u64, out);
         }
-        // VARCHAR/BINARY: (non_null + 1) × u32_le offsets array. For null
-        // binds non_null is 0 → a single `0u32`.
+        // VARCHAR/BINARY: (non_null + 1) × u32_le offsets array — only
+        // emitted on the non-null branch. Java's QwpEgressRequestDecoder
+        // (TYPE_VARCHAR) reads these 8 bytes only when isNull == false; on
+        // the null branch it advances p by zero, so emitting an empty
+        // offsets array here would be re-read as part of the *next* bind.
         Bind::Varchar(s) => write_varlen_offsets(&[s.len()], out)?,
         Bind::Binary(b) => write_varlen_offsets(&[b.len()], out)?,
-        Bind::NullVarchar | Bind::NullBinary => write_varlen_offsets(&[], out)?,
         _ => {}
     }
 
@@ -513,9 +517,11 @@ mod tests {
     }
 
     #[test]
-    fn varchar_null_emits_single_zero_offset() {
-        // 0x0F, 0x01, 0x01, [0u32]
-        assert_eq!(enc(Bind::NullVarchar), vec![0x0F, 0x01, 0x01, 0, 0, 0, 0]);
+    fn varchar_null_emits_no_offsets_array() {
+        // 0x0F, 0x01, 0x01 — no trailing offsets. Java's TYPE_VARCHAR
+        // bind decoder skips offsets on the null branch; emitting them
+        // would corrupt any following bind in the same QUERY_REQUEST.
+        assert_eq!(enc(Bind::NullVarchar), vec![0x0F, 0x01, 0x01]);
     }
 
     #[test]
@@ -527,8 +533,24 @@ mod tests {
     }
 
     #[test]
-    fn binary_null_emits_single_zero_offset() {
-        assert_eq!(enc(Bind::NullBinary), vec![0x17, 0x01, 0x01, 0, 0, 0, 0]);
+    fn binary_null_emits_no_offsets_array() {
+        // Mirrors NullVarchar: no trailing offsets on the null branch.
+        assert_eq!(enc(Bind::NullBinary), vec![0x17, 0x01, 0x01]);
+    }
+
+    #[test]
+    fn null_varchar_then_i32_concatenates_cleanly() {
+        // Regression: previously NullVarchar emitted 4 trailing zero offset
+        // bytes that the server's bind decoder did NOT consume, so the next
+        // bind's leading bytes were misread.
+        let mut out = Vec::new();
+        encode_bind(&Bind::NullVarchar, &mut out).unwrap();
+        encode_bind(&Bind::I32(7), &mut out).unwrap();
+        // [type=Varchar, null_flag, bitmap] || [type=Int, null_flag, 4 LE bytes]
+        assert_eq!(
+            out,
+            vec![0x0F, 0x01, 0x01, 0x04, 0x00, 0x07, 0x00, 0x00, 0x00]
+        );
     }
 
     // --- check_bindable ----------------------------------------------------
