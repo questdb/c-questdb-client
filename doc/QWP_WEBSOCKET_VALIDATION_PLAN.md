@@ -56,11 +56,12 @@ As of 2026-04-29:
   `doc/QWP_WEBSOCKET_PUBLICATION_SHELL_PROTOTYPE.md`. The shell owns replay
   encoder state and publishes `Buffer -> replay payload -> queue` bytes through
   the manual driver.
-- Step 12 now has a real QuestDB publication e2e probe with reflection in
-  `doc/QWP_WEBSOCKET_PUBLICATION_E2E_PROBE.md`. It validates
+- Step 12 now has real QuestDB publication and reconnect e2e probes with
+  reflection in `doc/QWP_WEBSOCKET_PUBLICATION_E2E_PROBE.md`. They validate
   `Buffer -> replay payload -> volatile queue -> manual driver ->
-  BlockingQwpWsTransport -> QuestDB -> queryable row`. Reconnect through this
-  full path is still pending.
+  BlockingQwpWsTransport -> QuestDB -> queryable row`, including a fault-proxy
+  reconnect case where an already-ACKed frame is not duplicated and an
+  unresolved frame is replayed after reconnect.
 - Extended Java/Rust fixtures for arrays, decimals, UTF-8 strings, sparse
   columns, and schema evolution remain recommended before hardening the full
   product surface.

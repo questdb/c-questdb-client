@@ -2,7 +2,7 @@
 
 Date: 2026-04-29
 
-Status: real QuestDB e2e publication path validated.
+Status: real QuestDB e2e publication and reconnect path validated.
 
 ## Scope
 
@@ -16,16 +16,23 @@ Buffer -> replay payload -> volatile queue -> manual driver -> BlockingQwpWsTran
 It does not use the old sync `qwpws` sender path and does not assert internal
 driver state.
 
+The reconnect variant places a small fault proxy between
+`BlockingQwpWsTransport` and QuestDB. The proxy forwards the first frame and its
+ACK, reads but drops the second frame before QuestDB sees it, closes the client
+connection, then accepts the reconnect and forwards the replayed second frame to
+QuestDB.
+
 ## Test
 
 `questdb-rs/src/tests/qwp_ws_publication_probe.rs` contains the ignored,
-environment-gated test:
+environment-gated tests:
 
 ```text
 qwp_ws_publication_driver_submit_waits_and_row_is_queryable
+qwp_ws_publication_driver_reconnect_replays_only_unacked_rows
 ```
 
-The test:
+The submit/wait test:
 
 - creates a unique table name,
 - submits a real QWP buffer through `QwpWsPublicationDriver`,
@@ -33,12 +40,26 @@ The test:
 - queries QuestDB over HTTP until the row is visible,
 - verifies the inserted symbol, long, and double values.
 
-Run command:
+The reconnect test:
+
+- submits two real QWP buffers through `QwpWsPublicationDriver`,
+- proves the first row is ACKed before the forced disconnect,
+- drops the second frame before QuestDB receives it,
+- lets the driver reconnect through the same transport seam,
+- verifies the second receipt is ACKed after replay,
+- queries QuestDB and verifies exactly two expected rows are visible.
+
+Run commands:
 
 ```bash
 QDB_QWP_WS_PUBLICATION_PROBE=1 \
     cargo test --manifest-path questdb-rs/Cargo.toml \
     qwp_ws_publication_driver_submit_waits_and_row_is_queryable \
+    -- --ignored --nocapture
+
+QDB_QWP_WS_RECONNECT_PROBE=1 \
+    cargo test --manifest-path questdb-rs/Cargo.toml \
+    qwp_ws_publication_driver_reconnect_replays_only_unacked_rows \
     -- --ignored --nocapture
 ```
 
@@ -59,27 +80,31 @@ Run against a local QuestDB server:
 ```text
 QuestDB build: Build Information: unknown [DEVELOPMENT], JDK unknown, Commit Hash unknown
 qwp_ws_publication_driver_submit_waits_and_row_is_queryable ... ok
+qwp_ws_publication_driver_reconnect_replays_only_unacked_rows ... ok
 ```
 
-The probe passed: the row became queryable with the expected values.
+Both probes passed. The submit/wait row became queryable with the expected
+values. The reconnect probe observed two ACKed receipts and exactly two
+queryable rows, so the already-ACKed first row was not duplicated and the
+unresolved second row was replayed after reconnect.
 
 ## Local Reflection
 
 - The publication shell works as a real client path, not only as a local mock
   boundary.
-- The test asserts user-visible behavior: receipt wait succeeds and the row is
-  queryable. It intentionally does not assert `sent_frames`, event order,
+- The tests assert user-visible behavior: receipt waits succeed and rows are
+  queryable. They intentionally do not assert `sent_frames`, event order,
   `fsn_at_zero`, or other internal mechanics.
+- The fault proxy is deliberately narrow. It proves the reconnect/replay
+  behavior we need without becoming a second fake QuestDB implementation.
 - The crate-private test hook is limited to prototype tests and does not change
   the public API.
 
 ## Global Reflection
 
 - This removes the biggest uncertainty from the last slice: the publication
-  shell and blocking transport can ingest through a real QuestDB server.
-- Reconnect remains the next protocol-level uncertainty. The next e2e should
-  use a fault proxy in front of real QuestDB to prove that ACKed frames are not
-  replayed, unresolved frames are replayed, and the replayed frame is accepted
-  on a fresh server connection with wire sequence `0`.
-- Java-compatible `.sfa` integration should still wait until reconnect is proven
-  through the same real publication path.
+  shell, blocking transport, reconnect, and replay can ingest through a real
+  QuestDB server.
+- The next architecture risk is no longer the volatile publication path. It is
+  wiring this path to the Java-compatible `.sfa` segment-ring queue without
+  changing public API semantics or storing connection-local state.

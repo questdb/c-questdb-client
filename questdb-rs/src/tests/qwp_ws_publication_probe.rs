@@ -28,7 +28,9 @@
 //! `Buffer -> replay payload -> volatile queue -> manual driver -> real
 //! WebSocket transport -> queryable row`.
 
-use std::io::{Error as IoError, ErrorKind};
+use std::io::{Error as IoError, ErrorKind, Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ingress::qwp_ws_test_support::{
@@ -40,6 +42,10 @@ use crate::ingress::{Buffer, TimestampNanos};
 use super::{TestError, TestResult};
 
 type ProbeResult<T> = std::result::Result<T, TestError>;
+type ProxyResult<T> = std::io::Result<T>;
+
+const QWP_STATUS_OK: u8 = 0x00;
+const QWP_STATUS_DURABLE_ACK: u8 = 0x02;
 
 #[derive(Clone, Debug)]
 struct ProbeConfig {
@@ -101,6 +107,81 @@ fn qwp_ws_publication_driver_submit_waits_and_row_is_queryable() -> TestResult {
     Ok(())
 }
 
+#[test]
+#[ignore = "requires a real QuestDB server and QDB_QWP_WS_RECONNECT_PROBE=1"]
+fn qwp_ws_publication_driver_reconnect_replays_only_unacked_rows() -> TestResult {
+    if std::env::var("QDB_QWP_WS_RECONNECT_PROBE").as_deref() != Ok("1") {
+        eprintln!("set QDB_QWP_WS_RECONNECT_PROBE=1 to run the real-server reconnect probe");
+        return Ok(());
+    }
+
+    let config = ProbeConfig::from_env()?;
+    let table = unique_table_name("qwp_reconnect_probe");
+    eprintln!("QuestDB build: {}", query_build(&config)?);
+    eprintln!("probe table: {table}");
+    let _cleanup = TableCleanup::new(config.clone(), table.clone());
+    let proxy = FaultProxy::spawn(&config)?;
+
+    let transport = connect_blocking_transport(
+        "127.0.0.1",
+        proxy.port.to_string(),
+        config.auth_header.clone(),
+    )?;
+    let queue = VolatileFrameQueue::new(VolatileQueueOptions {
+        max_frames: 8,
+        max_bytes: 64 * 1024,
+        max_in_flight: 4,
+    })
+    .map_err(proto_err)?;
+    let driver = ManualDriverPrototype::from_queue(queue, transport);
+    let mut publisher = QwpWsPublicationDriver::new(driver, 1);
+
+    let first = build_row(&table, "SYM_RECONNECT_ACKED", 10, 100.5, 10)?;
+    let second = build_row(&table, "SYM_RECONNECT_REPLAYED", 20, 200.5, 20)?;
+    let first_receipt = publisher
+        .try_submit_qwp(first.as_qwp().unwrap())
+        .map_err(proto_err)?;
+    let second_receipt = publisher
+        .try_submit_qwp(second.as_qwp().unwrap())
+        .map_err(proto_err)?;
+
+    let second_outcome = publisher.wait_steps(second_receipt, 16).map_err(proto_err);
+    let proxy_result = proxy.join();
+    assert_eq!(second_outcome?, DeliveryOutcome::Acked);
+    assert_eq!(
+        publisher.wait_steps(first_receipt, 0).map_err(proto_err)?,
+        DeliveryOutcome::Acked
+    );
+    proxy_result?;
+
+    let count = wait_for_count(&config, &table, 2, Duration::from_secs(10))?;
+    assert_eq!(
+        count, 2,
+        "reconnect replay should not duplicate the already-ACKed first row"
+    );
+    assert!(has_row(&config, &table, "SYM_RECONNECT_ACKED", 10, 100.5)?);
+    assert!(has_row(
+        &config,
+        &table,
+        "SYM_RECONNECT_REPLAYED",
+        20,
+        200.5
+    )?);
+
+    Ok(())
+}
+
+fn build_row(table: &str, sym: &str, qty: i64, px: f64, ts_offset: i64) -> ProbeResult<Buffer> {
+    let mut buffer = Buffer::new_qwp();
+    buffer
+        .table(table)?
+        .symbol("sym", sym)?
+        .column_i64("qty", qty)?
+        .column_f64("px", px)?
+        .at(TimestampNanos::new(1_700_000_000_000_000_000 + ts_offset))?;
+    Ok(buffer)
+}
+
 struct TableCleanup {
     config: ProbeConfig,
     table: String,
@@ -145,6 +226,223 @@ impl ProbeConfig {
             http_port,
             auth_header,
         })
+    }
+}
+
+struct FaultProxy {
+    port: u16,
+    handle: thread::JoinHandle<ProxyResult<()>>,
+}
+
+impl FaultProxy {
+    fn spawn(config: &ProbeConfig) -> ProbeResult<Self> {
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        listener.set_nonblocking(true)?;
+        let port = listener.local_addr()?.port();
+        let target_host = config.host.clone();
+        let target_port = config.qwp_ws_port;
+        let handle =
+            thread::spawn(move || run_reconnect_fault_proxy(listener, target_host, target_port));
+        Ok(Self { port, handle })
+    }
+
+    fn join(self) -> ProbeResult<()> {
+        match self.handle.join() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => Err(Box::new(err)),
+            Err(_) => Err(Box::new(IoError::new(
+                ErrorKind::Other,
+                "fault proxy thread panicked",
+            ))),
+        }
+    }
+}
+
+fn run_reconnect_fault_proxy(
+    listener: TcpListener,
+    target_host: String,
+    target_port: u16,
+) -> ProxyResult<()> {
+    let target = format!("{target_host}:{target_port}");
+
+    let mut client = accept_with_timeout(&listener, Duration::from_secs(10))?;
+    let mut upstream = TcpStream::connect(&target)?;
+    configure_stream(&mut client)?;
+    configure_stream(&mut upstream)?;
+    proxy_handshake(&mut client, &mut upstream)?;
+
+    let first_frame = read_ws_frame_raw(&mut client)?;
+    upstream.write_all(&first_frame.raw)?;
+    upstream.flush()?;
+    forward_until_ok(&mut upstream, &mut client, 0)?;
+
+    let _dropped_unacked_frame = read_ws_frame_raw(&mut client)?;
+    drop(client);
+    drop(upstream);
+
+    let mut client = accept_with_timeout(&listener, Duration::from_secs(10))?;
+    let mut upstream = TcpStream::connect(&target)?;
+    configure_stream(&mut client)?;
+    configure_stream(&mut upstream)?;
+    proxy_handshake(&mut client, &mut upstream)?;
+
+    let replayed_frame = read_ws_frame_raw(&mut client)?;
+    upstream.write_all(&replayed_frame.raw)?;
+    upstream.flush()?;
+    forward_until_ok(&mut upstream, &mut client, 0)?;
+
+    Ok(())
+}
+
+fn accept_with_timeout(listener: &TcpListener, timeout: Duration) -> ProxyResult<TcpStream> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match listener.accept() {
+            Ok((stream, _addr)) => return Ok(stream),
+            Err(err) if err.kind() == ErrorKind::WouldBlock && Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                return Err(IoError::new(
+                    ErrorKind::TimedOut,
+                    "timed out waiting for reconnect probe client",
+                ));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn configure_stream(stream: &mut TcpStream) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_nodelay(true).ok();
+    Ok(())
+}
+
+fn proxy_handshake(client: &mut TcpStream, upstream: &mut TcpStream) -> ProxyResult<()> {
+    let request = read_until_http_header_end(client)?;
+    upstream.write_all(&request)?;
+    upstream.flush()?;
+
+    let response = read_until_http_header_end(upstream)?;
+    client.write_all(&response)?;
+    client.flush()?;
+    Ok(())
+}
+
+fn read_until_http_header_end(stream: &mut TcpStream) -> ProxyResult<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        stream.read_exact(&mut byte)?;
+        bytes.push(byte[0]);
+        if bytes.ends_with(b"\r\n\r\n") {
+            return Ok(bytes);
+        }
+        if bytes.len() > 64 * 1024 {
+            return Err(IoError::new(
+                ErrorKind::InvalidData,
+                "HTTP header exceeded 64 KiB in reconnect fault proxy",
+            ));
+        }
+    }
+}
+
+struct RawWsFrame {
+    raw: Vec<u8>,
+    payload: Vec<u8>,
+}
+
+fn read_ws_frame_raw(stream: &mut TcpStream) -> ProxyResult<RawWsFrame> {
+    let mut header = [0u8; 2];
+    stream.read_exact(&mut header)?;
+    let mut raw = header.to_vec();
+    let masked = header[1] & 0x80 != 0;
+    let len_short = header[1] & 0x7f;
+    let payload_len = match len_short {
+        126 => {
+            let mut bytes = [0u8; 2];
+            stream.read_exact(&mut bytes)?;
+            raw.extend_from_slice(&bytes);
+            u16::from_be_bytes(bytes) as usize
+        }
+        127 => {
+            let mut bytes = [0u8; 8];
+            stream.read_exact(&mut bytes)?;
+            raw.extend_from_slice(&bytes);
+            u64::from_be_bytes(bytes) as usize
+        }
+        len => len as usize,
+    };
+    let mut mask = [0u8; 4];
+    if masked {
+        stream.read_exact(&mut mask)?;
+        raw.extend_from_slice(&mask);
+    }
+    let mut payload = vec![0u8; payload_len];
+    stream.read_exact(&mut payload)?;
+    raw.extend_from_slice(&payload);
+    if masked {
+        for (index, byte) in payload.iter_mut().enumerate() {
+            *byte ^= mask[index & 3];
+        }
+    }
+    Ok(RawWsFrame { raw, payload })
+}
+
+fn forward_until_ok(
+    upstream: &mut TcpStream,
+    client: &mut TcpStream,
+    target_sequence: u64,
+) -> ProxyResult<()> {
+    loop {
+        let frame = read_ws_frame_raw(upstream)?;
+        client.write_all(&frame.raw)?;
+        client.flush()?;
+        match qwp_response_kind(&frame.payload)? {
+            QwpResponseKind::Ok { sequence } if sequence == target_sequence => return Ok(()),
+            QwpResponseKind::Ok { sequence } => {
+                return Err(IoError::new(
+                    ErrorKind::InvalidData,
+                    format!("expected OK sequence {target_sequence}, got {sequence}"),
+                ));
+            }
+            QwpResponseKind::DurableAck => {}
+            QwpResponseKind::Other(status) => {
+                return Err(IoError::new(
+                    ErrorKind::InvalidData,
+                    format!("unexpected QWP response status 0x{status:02x}"),
+                ));
+            }
+        }
+    }
+}
+
+enum QwpResponseKind {
+    Ok { sequence: u64 },
+    DurableAck,
+    Other(u8),
+}
+
+fn qwp_response_kind(payload: &[u8]) -> ProxyResult<QwpResponseKind> {
+    let status = *payload
+        .first()
+        .ok_or_else(|| IoError::new(ErrorKind::UnexpectedEof, "empty QWP response"))?;
+    match status {
+        QWP_STATUS_OK => {
+            if payload.len() < 9 {
+                return Err(IoError::new(
+                    ErrorKind::UnexpectedEof,
+                    "QWP OK response missing sequence",
+                ));
+            }
+            Ok(QwpResponseKind::Ok {
+                sequence: u64::from_le_bytes(payload[1..9].try_into().unwrap()),
+            })
+        }
+        QWP_STATUS_DURABLE_ACK => Ok(QwpResponseKind::DurableAck),
+        other => Ok(QwpResponseKind::Other(other)),
     }
 }
 
@@ -201,7 +499,17 @@ fn wait_for_count(
 }
 
 fn has_publication_row(config: &ProbeConfig, table: &str) -> ProbeResult<bool> {
-    let sql = format!("select sym, qty, px from '{table}' where qty = 42");
+    has_row(config, table, "SYM_PUBLICATION", 42, 123.5)
+}
+
+fn has_row(
+    config: &ProbeConfig,
+    table: &str,
+    expected_sym: &str,
+    expected_qty: i64,
+    expected_px: f64,
+) -> ProbeResult<bool> {
+    let sql = format!("select sym, qty, px from '{table}' where qty = {expected_qty}");
     let value = query_json(config, &sql)?;
     let Some(rows) = value.get("dataset").and_then(|dataset| dataset.as_array()) else {
         return Ok(false);
@@ -210,9 +518,9 @@ fn has_publication_row(config: &ProbeConfig, table: &str) -> ProbeResult<bool> {
         let Some(row) = row.as_array() else {
             return false;
         };
-        row.first().and_then(|value| value.as_str()) == Some("SYM_PUBLICATION")
-            && row.get(1).and_then(|value| value.as_i64()) == Some(42)
-            && row.get(2).and_then(|value| value.as_f64()) == Some(123.5)
+        row.first().and_then(|value| value.as_str()) == Some(expected_sym)
+            && row.get(1).and_then(|value| value.as_i64()) == Some(expected_qty)
+            && row.get(2).and_then(|value| value.as_f64()) == Some(expected_px)
     }))
 }
 

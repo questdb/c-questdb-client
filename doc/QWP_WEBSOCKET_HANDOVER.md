@@ -7,9 +7,9 @@ Status: active validation branch for the Rust client plus C FFI shape.
 This is no longer only a design discussion. Steps 1-11 are validated by docs,
 Rust prototypes, real-server probes, and C ABI shape stubs. Step 12 now has a
 first Rust-only blocking WS/WSS transport adapter and a Rust-only publication
-shell behind the manual driver seam. The publication path has passed a real
-QuestDB e2e probe, but the new pipelined Store-and-Forward core is not wired
-into the public product API or C ABI yet.
+shell behind the manual driver seam. The publication path has passed real
+QuestDB submit/wait and reconnect/replay e2e probes, but the new pipelined
+Store-and-Forward core is not wired into the public product API or C ABI yet.
 
 Do not read this as production readiness. The existing `qwpws` sync/async sender
 paths still exist separately. The new pipelined/SF sender core is being built
@@ -30,7 +30,7 @@ behind prototypes before product API integration.
 - `doc/QWP_WEBSOCKET_PUBLICATION_SHELL_PROTOTYPE.md` - Rust-only
   `Buffer -> replay payload -> queue` publication slice for the manual driver.
 - `doc/QWP_WEBSOCKET_PUBLICATION_E2E_PROBE.md` - real QuestDB e2e publication
-  probe through the manual driver and blocking transport.
+  and reconnect probes through the manual driver and blocking transport.
 - `questdb-rs/src/ingress/sender/qwp_ws_driver.rs` - current manual driver
   prototype and transport seam.
 - `questdb-rs/src/ingress/sender/qwp_ws_publisher.rs` - replay publication
@@ -67,13 +67,14 @@ Current branch:
 ia_qwp_ws
 ```
 
-Most recent committed checkpoint before the publication-shell slice:
+Most recent committed checkpoint before the reconnect-probe slice:
 
 ```text
-015bc69 Add Java-compatible QWP WebSocket SFA fixtures
+7b9ca2e Add QWP WebSocket publication shell and e2e probe
 ```
 
-Recent validation after the Step 12 publication-shell slice:
+Recent validation after the Step 12 publication-shell and reconnect-probe
+slices:
 
 ```bash
 cargo test --manifest-path questdb-rs/Cargo.toml qwp_ws_driver
@@ -89,6 +90,10 @@ QDB_QWP_WS_PUBLICATION_PROBE=1 \
     cargo test --manifest-path questdb-rs/Cargo.toml \
     qwp_ws_publication_driver_submit_waits_and_row_is_queryable \
     -- --ignored --nocapture
+QDB_QWP_WS_RECONNECT_PROBE=1 \
+    cargo test --manifest-path questdb-rs/Cargo.toml \
+    qwp_ws_publication_driver_reconnect_replays_only_unacked_rows \
+    -- --ignored --nocapture
 cargo fmt --manifest-path questdb-rs/Cargo.toml --check
 git diff --check
 ```
@@ -101,6 +106,7 @@ qwp_ws: 126 passed, 6 ignored
 minimal _sender-qwp-ws driver filter: 43 passed, with existing unused-code warnings
 qwp_ws_async with async-sender-qwp-ws: 8 passed
 real QuestDB publication probe: 1 passed
+real QuestDB reconnect probe: 1 passed
 format and whitespace checks passed
 ```
 
@@ -149,12 +155,15 @@ Real-server probes have validated:
   error.
 - After the server fix in `questdb-arrays`, deterministic string-to-DOUBLE
   coercion failure is surfaced as `SCHEMA_MISMATCH`, not `WRITE_ERROR`.
+- The publication driver can reconnect through the real blocking transport after
+  an abrupt close, avoid replaying an already-ACKed frame, replay an unresolved
+  frame on a fresh QuestDB connection, and make both expected rows queryable.
 
 Still not validated by real server:
 
 - auth/upgrade rejection taxonomy,
 - deterministic internal/retryable write failure taxonomy,
-- close/EOF behavior while frames are in flight,
+- broader close/EOF behavior with multiple unresolved in-flight frames,
 - full product integration using the new queue/driver core.
 
 ### Queue and receipt prototypes
@@ -298,12 +307,15 @@ Focused coverage now verifies:
 - empty buffers are rejected before encoding and publication,
 - failed queue publication does not consume an FSN,
 - `BlockingQwpWsTransport` can submit/wait through this publication path against
-  the local in-process WS harness.
+  the local in-process WS harness,
+- a real QuestDB submit/wait probe makes the row queryable,
+- a real QuestDB reconnect probe does not duplicate the ACKed row and does
+  replay the unresolved row.
 
 This is still not public product API integration and not yet a real QuestDB
-reconnect probe through the full path.
+`.sfa` Store-and-Forward integration.
 
-### Real publication e2e
+### Real publication and reconnect e2e
 
 `questdb-rs/src/tests/qwp_ws_publication_probe.rs` validates the current
 publication path against a real QuestDB server:
@@ -312,11 +324,18 @@ publication path against a real QuestDB server:
 Buffer -> replay payload -> volatile queue -> manual driver -> BlockingQwpWsTransport -> QuestDB
 ```
 
-The probe is ignored by default and gated by `QDB_QWP_WS_PUBLICATION_PROBE=1`.
-It submits a QWP buffer through `QwpWsPublicationDriver`, waits for the receipt,
-then queries QuestDB over HTTP and verifies the inserted symbol, long, and double
-values. It asserts user-visible behavior only; it does not lock in internal
-driver state, event order, or private queue fields.
+The probes are ignored by default and gated by
+`QDB_QWP_WS_PUBLICATION_PROBE=1` or `QDB_QWP_WS_RECONNECT_PROBE=1`. The
+submit/wait probe submits a QWP buffer through `QwpWsPublicationDriver`, waits
+for the receipt, then queries QuestDB over HTTP and verifies the inserted
+symbol, long, and double values.
+
+The reconnect probe uses a fault proxy in front of real QuestDB. It forwards and
+ACKs the first frame, drops the second frame before QuestDB receives it, closes
+the client connection, accepts the reconnect, forwards the replayed second
+frame, then verifies both receipts and exactly two queryable rows. It asserts
+user-visible behavior only; it does not lock in internal driver state, event
+order, or private queue fields.
 
 ### C ABI shape stubs
 
@@ -386,9 +405,6 @@ conversion before the real driver is wired through.
 
 ## Known gaps and risks
 
-- Reconnect replay through
-  `Buffer -> replay payload -> queue -> BlockingQwpWsTransport` is not yet
-  covered.
 - Java-compatible initial connection configuration (`initial_connect_retry`)
   still has design text but no real new-core implementation.
 - The FFI shape stubs are not connected to the real queue/driver prototypes.
@@ -405,13 +421,12 @@ conversion before the real driver is wired through.
   discovery.
 - Extended Java/Rust golden fixtures are still missing arrays, decimals, UTF-8,
   sparse columns, and schema evolution.
-- Close/EOF semantics with unresolved in-flight frames are not yet proven by a
-  real-server probe.
+- Close/EOF semantics beyond the single forced-disconnect replay probe are not
+  yet proven by a real-server probe.
 - Auth/upgrade rejection and ambiguous operational write/internal errors still
   need taxonomy validation.
-- The real transport adapter and publication shell have a real QuestDB
-  submit/wait probe, but not yet a real reconnect replay probe through
-  `Buffer -> replay payload -> queue -> BlockingQwpWsTransport`.
+- The real transport adapter and publication shell have real QuestDB submit/wait
+  and reconnect replay probes, but not yet Java-compatible `.sfa` durability.
 - The v1 dense dictionary replay shape is correctness-first and can be expensive
   for long-running high-cardinality symbol workloads.
 - Reserved-but-unused symbol IDs from failed submit attempts are acceptable in
@@ -421,31 +436,33 @@ conversion before the real driver is wired through.
 
 ## Recommended next step
 
-Continue Step 12, but keep it narrow.
+Move to Java-compatible `.sfa` Store-and-Forward integration, but keep it narrow.
 
-The publication shell and real submit/wait path exist now. The next slice should
-prove reconnect through that same path rather than adding public API or FFI
-surface.
+The volatile publication path and reconnect behavior are now proven against real
+QuestDB. The next slice should connect the publication shell to the
+Java-compatible segment-ring queue rather than adding public API, FFI, threaded
+adapters, or extending the old custom SF journal.
 
 Suggested slice:
 
-1. Add a real reconnect replay probe through
-   `QwpWsPublicationDriver -> BlockingQwpWsTransport`, using a small fault proxy
-   in front of QuestDB rather than a fake server.
-2. The probe should assert behavior only: ACKed frames are not replayed,
-   unresolved frames are replayed after reconnect, replayed payloads are accepted
-   on a fresh server connection, and the rows become queryable.
-3. Keep real-server checks ignored/gated until the required QuestDB server setup is
-   explicit and cheap to reproduce.
-4. Record observed ACK, close, and error behavior in a short reflection note.
-5. After the real path is proven, connect the publication shell to the
-   Java-compatible `.sfa` segment-ring queue rather than extending the old custom
-   SF journal.
+1. Implement the smallest `ManualDriverQueue` adapter over the Java-compatible
+   `.sfa` segment files: open/create slot, append full frame envelopes, recover
+   retained frames, expose replay from the oldest retained FSN.
+2. Keep durable state Java-compatible: retained segment files and frame payloads
+   only. Do not add Rust-only ACK, rejection, receipt, wire-sequence, or in-flight
+   records.
+3. Add behavior tests for restart/recovery and replay order using the committed
+   `.sfa` fixtures where possible.
+4. Add one ignored real-server probe after the adapter exists: publish through
+   `.sfa`, simulate process recovery or reopen, replay unresolved frames through
+   `BlockingQwpWsTransport`, and verify rows are queryable.
+5. Keep public API and C ABI wiring deferred until the `.sfa` queue proves it
+   fits the existing publication/driver seam.
 
 Do not start with threaded adapters, C++/Python wrappers, SF compaction, or
-performance optimization. The main de-risking question is now whether reconnect,
-real-server behavior, and Java-compatible disk storage fit the current
-publication/driver seam without public API changes.
+performance optimization. The main de-risking question is now whether
+Java-compatible disk storage fits the current publication/driver seam without
+public API changes.
 
 ## Commands worth re-running
 
@@ -485,6 +502,16 @@ env QDB_QWP_WS_PROTOCOL_PROBE=1 \
 env QDB_QWP_WS_ERROR_TAXONOMY_PROBE=1 \
     cargo test --manifest-path questdb-rs/Cargo.toml \
     qwp_ws_real_server_error_taxonomy_probe \
+    -- --ignored --nocapture
+
+env QDB_QWP_WS_PUBLICATION_PROBE=1 \
+    cargo test --manifest-path questdb-rs/Cargo.toml \
+    qwp_ws_publication_driver_submit_waits_and_row_is_queryable \
+    -- --ignored --nocapture
+
+env QDB_QWP_WS_RECONNECT_PROBE=1 \
+    cargo test --manifest-path questdb-rs/Cargo.toml \
+    qwp_ws_publication_driver_reconnect_replays_only_unacked_rows \
     -- --ignored --nocapture
 ```
 
