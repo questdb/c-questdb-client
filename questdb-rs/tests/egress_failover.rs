@@ -271,6 +271,7 @@ impl Drop for MockServer {
 /// Per-connection worker: handle WS handshake (or reject), then run
 /// the script to completion. Errors are swallowed — the test asserts
 /// against the client side, not the mock side.
+#[allow(clippy::result_large_err)] // Closure signature is fixed by tungstenite::accept_hdr.
 fn run_script(stream: TcpStream, script: Script, captured_requests: Arc<Mutex<Vec<Vec<u8>>>>) {
     // Decide upfront if this connection wants to reject the upgrade.
     let reject = script.iter().any(|a| matches!(a, Action::Reject401));
