@@ -35,21 +35,22 @@ use std::collections::VecDeque;
 use std::io::Write;
 
 #[cfg(feature = "sync-sender-qwp-ws")]
-use crate::ErrorCode;
+use crate::error;
 #[cfg(feature = "sync-sender-qwp-ws")]
 use crate::ingress::conf::QwpWsConfig;
 #[cfg(feature = "sync-sender-qwp-ws")]
 use crate::ingress::tls::TlsSettings;
+use crate::{Error, ErrorCode};
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 use super::qwp_ws::{WsStream, establish_connection, read_message, write_binary_frame};
 #[cfg(feature = "sync-sender-qwp-ws")]
-use super::qwp_ws_codec::{self as codec, PipelinedResponse, WS_OPCODE_BINARY};
+use super::qwp_ws_codec::WS_OPCODE_BINARY;
+use super::qwp_ws_codec::{self as codec, PipelinedResponse};
 use super::qwp_ws_queue::{
     OutboundFrame, QueueError, QwpReceipt, QwpReceiptStatus, SentFrame, VolatileFrameQueue,
     VolatileQueueOptions,
 };
-use super::qwp_ws_sf_queue::{SfFrameQueue, SfQueueError};
 
 const DEFAULT_EVENT_CAPACITY: usize = 1024;
 
@@ -60,6 +61,8 @@ pub(crate) struct ManualDriverPrototype<Q = VolatileFrameQueue, T = FakeOrderedS
     events: DriverEventRing,
     terminal: bool,
     terminal_fsn: Option<u64>,
+    terminal_error: Option<Error>,
+    last_server_error: Option<QwpServerError>,
     closing: bool,
     retry_budget_remaining: Option<usize>,
 }
@@ -75,6 +78,8 @@ impl ManualDriverPrototype<VolatileFrameQueue> {
             events: DriverEventRing::new(DEFAULT_EVENT_CAPACITY),
             terminal: false,
             terminal_fsn: None,
+            terminal_error: None,
+            last_server_error: None,
             closing: false,
             retry_budget_remaining: None,
         })
@@ -89,6 +94,8 @@ impl<Q: ManualDriverQueue, T: ManualDriverTransport> ManualDriverPrototype<Q, T>
             events: DriverEventRing::new(DEFAULT_EVENT_CAPACITY),
             terminal: false,
             terminal_fsn: None,
+            terminal_error: None,
+            last_server_error: None,
             closing: false,
             retry_budget_remaining: None,
         }
@@ -105,6 +112,8 @@ impl<Q: ManualDriverQueue, T: ManualDriverTransport> ManualDriverPrototype<Q, T>
             events: DriverEventRing::new(DEFAULT_EVENT_CAPACITY),
             terminal: false,
             terminal_fsn: None,
+            terminal_error: None,
+            last_server_error: None,
             closing: false,
             retry_budget_remaining: Some(retry_budget),
         }
@@ -121,6 +130,8 @@ impl<Q: ManualDriverQueue, T: ManualDriverTransport> ManualDriverPrototype<Q, T>
             events: DriverEventRing::new(event_capacity),
             terminal: false,
             terminal_fsn: None,
+            terminal_error: None,
+            last_server_error: None,
             closing: false,
             retry_budget_remaining: None,
         }
@@ -183,9 +194,7 @@ impl<Q: ManualDriverQueue, T: ManualDriverTransport> ManualDriverPrototype<Q, T>
                         | QueueError::OutboundFrameUnavailable { .. }
                         | QueueError::SequenceOverflow,
                     )
-                    | DriverError::Transport
-                    | DriverError::Storage
-                    | DriverError::CorruptLog { .. }
+                    | DriverError::Transport(_)
                     | DriverError::SubmitTimedOut
                     | DriverError::Terminal
                     | DriverError::Closing
@@ -256,9 +265,7 @@ impl<Q: ManualDriverQueue, T: ManualDriverTransport> ManualDriverPrototype<Q, T>
                     | QueueError::OutboundFrameUnavailable { .. }
                     | QueueError::SequenceOverflow,
                 )
-                | DriverError::Transport
-                | DriverError::Storage
-                | DriverError::CorruptLog { .. }
+                | DriverError::Transport(_)
                 | DriverError::SubmitTimedOut
                 | DriverError::Terminal
                 | DriverError::Closing
@@ -334,6 +341,14 @@ impl<Q: ManualDriverQueue, T: ManualDriverTransport> ManualDriverPrototype<Q, T>
         self.events.dropped_total()
     }
 
+    pub(crate) fn terminal_error(&self) -> Option<&Error> {
+        self.terminal_error.as_ref()
+    }
+
+    pub(crate) fn last_server_error(&self) -> Option<&QwpServerError> {
+        self.last_server_error.as_ref()
+    }
+
     fn delivery_status(&self, receipt: QwpReceipt) -> Result<Option<DeliveryOutcome>, DriverError> {
         match self.receipt_status(receipt) {
             QwpReceiptStatus::Acked { .. } => Ok(Some(DeliveryOutcome::Acked)),
@@ -366,8 +381,9 @@ impl<Q: ManualDriverQueue, T: ManualDriverTransport> ManualDriverPrototype<Q, T>
                 }
                 Ok(DriveOutcome::Acked { wire_seq })
             }
-            TransportResponse::Reject { wire_seq } => {
+            TransportResponse::Reject { wire_seq, error } => {
                 let receipt = self.queue.reject_wire(wire_seq)?;
+                self.last_server_error = Some(error);
                 if wire_seq > 0 {
                     self.push_event(DriverEvent::AckedThrough {
                         fsn: receipt.fsn - 1,
@@ -391,19 +407,21 @@ impl<Q: ManualDriverQueue, T: ManualDriverTransport> ManualDriverPrototype<Q, T>
         failure: TransportFailure,
     ) -> Result<DriveOutcome, DriverError> {
         match failure {
-            TransportFailure::Disconnect => self.restart_connection(ReconnectReason::Disconnect),
-            TransportFailure::Retryable => {
+            TransportFailure::Disconnect(_error) => {
+                self.restart_connection(ReconnectReason::Disconnect)
+            }
+            TransportFailure::Retryable(error) => {
                 if let Some(remaining) = &mut self.retry_budget_remaining {
                     if *remaining == 0 {
-                        self.mark_terminal();
+                        self.mark_terminal(Some(error));
                         return Ok(DriveOutcome::Terminal);
                     }
                     *remaining -= 1;
                 }
                 self.restart_for_retryable_failure()
             }
-            TransportFailure::Terminal => {
-                self.mark_terminal();
+            TransportFailure::Terminal(error) => {
+                self.mark_terminal(Some(error));
                 Ok(DriveOutcome::Terminal)
             }
         }
@@ -420,10 +438,11 @@ impl<Q: ManualDriverQueue, T: ManualDriverTransport> ManualDriverPrototype<Q, T>
         Ok(DriveOutcome::Reconnected { reason })
     }
 
-    fn mark_terminal(&mut self) {
+    fn mark_terminal(&mut self, error: Option<Error>) {
         if !self.terminal {
             self.terminal = true;
             self.terminal_fsn = self.queue.published_fsn();
+            self.terminal_error = error;
             self.push_event(DriverEvent::Terminal);
         }
     }
@@ -525,7 +544,7 @@ impl BlockingQwpWsTransport {
             &self.qwp_ws,
             self.auth_header.as_deref(),
         )
-        .map_err(|_| DriverError::Transport)?;
+        .map_err(DriverError::Transport)?;
         self.stream = stream;
         self.recv.clear();
         self.send_buf.clear();
@@ -543,6 +562,29 @@ impl BlockingQwpWsTransport {
     }
 }
 
+fn decode_transport_response(
+    payload: &[u8],
+) -> Result<Option<TransportResponse>, TransportFailure> {
+    match codec::parse_pipelined_response(payload) {
+        Ok(PipelinedResponse::Ok { sequence }) => {
+            Ok(Some(TransportResponse::Ack { wire_seq: sequence }))
+        }
+        Ok(PipelinedResponse::DurableAck) => Ok(None),
+        Ok(PipelinedResponse::Error(error)) => {
+            let wire_seq = error.sequence;
+            let server_error = QwpServerError::from(error);
+            match server_error_policy(server_error.status) {
+                ServerErrorPolicy::RejectAndContinue => Ok(Some(TransportResponse::Reject {
+                    wire_seq,
+                    error: server_error,
+                })),
+                ServerErrorPolicy::Terminal => Err(TransportFailure::Terminal(server_error.error)),
+            }
+        }
+        Err(err) => Err(TransportFailure::Terminal(err)),
+    }
+}
+
 #[cfg(feature = "sync-sender-qwp-ws")]
 impl ManualDriverTransport for BlockingQwpWsTransport {
     fn send_before_poll(&self) -> bool {
@@ -557,38 +599,28 @@ impl ManualDriverTransport for BlockingQwpWsTransport {
         let opcode =
             read_message(&mut self.stream, &mut self.send_buf, &mut self.recv).map_err(|err| {
                 match err.code() {
-                    ErrorCode::SocketError => TransportFailure::Disconnect,
+                    ErrorCode::SocketError => TransportFailure::Disconnect(err),
                     ErrorCode::AuthError | ErrorCode::ProtocolVersionError => {
-                        TransportFailure::Terminal
+                        TransportFailure::Terminal(err)
                     }
-                    _ => TransportFailure::Terminal,
+                    _ => TransportFailure::Terminal(err),
                 }
             })?;
         if opcode != WS_OPCODE_BINARY {
-            return Err(TransportFailure::Terminal);
+            return Err(TransportFailure::Terminal(error::fmt!(
+                SocketError,
+                "QWP/WebSocket server response was not a binary frame"
+            )));
         }
 
-        match codec::parse_pipelined_response(&self.recv) {
-            Ok(PipelinedResponse::Ok { sequence }) => {
-                self.complete_pending_through(sequence);
-                Ok(Some(TransportResponse::Ack { wire_seq: sequence }))
-            }
-            Ok(PipelinedResponse::DurableAck) => Ok(None),
-            Ok(PipelinedResponse::Error { sequence, err }) => match err.code() {
-                ErrorCode::InvalidApiCall => {
-                    self.complete_pending_through(sequence);
-                    Ok(Some(TransportResponse::Reject { wire_seq: sequence }))
-                }
-                ErrorCode::ServerFlushError | ErrorCode::SocketError => {
-                    Err(TransportFailure::Retryable)
-                }
-                ErrorCode::AuthError | ErrorCode::ProtocolVersionError => {
-                    Err(TransportFailure::Terminal)
-                }
-                _ => Err(TransportFailure::Terminal),
-            },
-            Err(_) => Err(TransportFailure::Terminal),
+        let response = decode_transport_response(&self.recv)?;
+        if let Some(
+            TransportResponse::Ack { wire_seq } | TransportResponse::Reject { wire_seq, .. },
+        ) = &response
+        {
+            self.complete_pending_through(*wire_seq);
         }
+        Ok(response)
     }
 
     fn send_frame(
@@ -596,11 +628,20 @@ impl ManualDriverTransport for BlockingQwpWsTransport {
         frame: OutboundFrame<'_>,
     ) -> Result<TransportSendResult, TransportFailure> {
         let sent_frame = frame.sent_frame();
-        write_binary_frame(&mut self.stream, &mut self.send_buf, frame.payload)
-            .map_err(|_| TransportFailure::Disconnect)?;
-        self.stream
-            .flush()
-            .map_err(|_| TransportFailure::Disconnect)?;
+        write_binary_frame(&mut self.stream, &mut self.send_buf, frame.payload).map_err(|io| {
+            TransportFailure::Disconnect(error::fmt!(
+                SocketError,
+                "Could not send WebSocket frame: {}",
+                io
+            ))
+        })?;
+        self.stream.flush().map_err(|io| {
+            TransportFailure::Disconnect(error::fmt!(
+                SocketError,
+                "Could not flush WebSocket frame: {}",
+                io
+            ))
+        })?;
         self.pending_wire_sequences.push_back(frame.wire_seq);
         self.sent_frames.push(sent_frame);
         Ok(TransportSendResult::NoResponse)
@@ -661,58 +702,10 @@ impl ManualDriverQueue for VolatileFrameQueue {
     }
 }
 
-impl ManualDriverQueue for SfFrameQueue {
-    fn try_submit(&mut self, payload: &[u8]) -> Result<QwpReceipt, DriverError> {
-        Ok(SfFrameQueue::try_submit(self, payload)?)
-    }
-
-    fn next_outbound_frame(&self) -> Result<OutboundFrame<'_>, DriverError> {
-        Ok(SfFrameQueue::next_outbound_frame(self)?)
-    }
-
-    fn commit_sent(&mut self, frame: SentFrame) -> Result<(), DriverError> {
-        Ok(SfFrameQueue::commit_sent(self, frame)?)
-    }
-
-    fn ack_wire(&mut self, wire_seq: u64) -> Result<(), DriverError> {
-        Ok(SfFrameQueue::ack_wire(self, wire_seq)?)
-    }
-
-    fn reject_wire(&mut self, wire_seq: u64) -> Result<QwpReceipt, DriverError> {
-        Ok(SfFrameQueue::reject_wire(self, wire_seq)?)
-    }
-
-    fn restart_connection(&mut self) {
-        SfFrameQueue::restart_connection(self);
-    }
-
-    fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus {
-        SfFrameQueue::receipt_status(self, receipt)
-    }
-
-    fn published_fsn(&self) -> Option<u64> {
-        SfFrameQueue::published_fsn(self)
-    }
-
-    fn completed_fsn(&self) -> Option<u64> {
-        SfFrameQueue::completed_fsn(self)
-    }
-
-    fn fsn_for_wire_seq(&self, wire_seq: u64) -> Result<u64, DriverError> {
-        let fsn_at_zero = SfFrameQueue::fsn_at_zero(self)
-            .ok_or(DriverError::Queue(QueueError::ProtocolAckWithoutConnection))?;
-        fsn_at_zero
-            .checked_add(wire_seq)
-            .ok_or(DriverError::Queue(QueueError::SequenceOverflow))
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum DriverError {
     Queue(QueueError),
-    Transport,
-    Storage,
-    CorruptLog { offset: usize, reason: &'static str },
+    Transport(Error),
     SubmitTimedOut,
     Terminal,
     Closing,
@@ -725,14 +718,43 @@ impl From<QueueError> for DriverError {
     }
 }
 
-impl From<SfQueueError> for DriverError {
-    fn from(value: SfQueueError) -> Self {
-        match value {
-            SfQueueError::Queue(err) => Self::Queue(err),
-            SfQueueError::Io(_) => Self::Storage,
-            SfQueueError::CorruptLog { offset, reason } => Self::CorruptLog { offset, reason },
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct QwpServerError {
+    pub(crate) status: u8,
+    pub(crate) message: String,
+    pub(crate) error: Error,
+}
+
+impl From<codec::PipelinedError> for QwpServerError {
+    fn from(value: codec::PipelinedError) -> Self {
+        Self {
+            status: value.status,
+            message: value.message,
+            error: value.err,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerErrorPolicy {
+    RejectAndContinue,
+    Terminal,
+}
+
+fn server_error_policy(status: u8) -> ServerErrorPolicy {
+    match status {
+        codec::WS_STATUS_SCHEMA_MISMATCH | codec::WS_STATUS_WRITE_ERROR => {
+            ServerErrorPolicy::RejectAndContinue
+        }
+        codec::WS_STATUS_PARSE_ERROR
+        | codec::WS_STATUS_INTERNAL_ERROR
+        | codec::WS_STATUS_SECURITY_ERROR => ServerErrorPolicy::Terminal,
+        _ => ServerErrorPolicy::Terminal,
+    }
+}
+
+fn fake_transport_error(message: &'static str) -> Error {
+    Error::new(ErrorCode::SocketError, message)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -776,24 +798,29 @@ pub(crate) enum CloseOutcome {
     Terminal,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum TransportSendResult {
     NoResponse,
     Response(TransportResponse),
     Failure(TransportFailure),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum TransportFailure {
-    Disconnect,
-    Retryable,
-    Terminal,
+    Disconnect(Error),
+    Retryable(Error),
+    Terminal(Error),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum TransportResponse {
-    Ack { wire_seq: u64 },
-    Reject { wire_seq: u64 },
+    Ack {
+        wire_seq: u64,
+    },
+    Reject {
+        wire_seq: u64,
+        error: QwpServerError,
+    },
 }
 
 pub(crate) type FakeServerResponse = TransportResponse;
@@ -901,17 +928,24 @@ impl ManualDriverTransport for FakeOrderedServer {
                 TransportSendResult::Response(TransportResponse::Ack { wire_seq })
             }
             FakeSendResult::RejectWire { wire_seq } => {
-                TransportSendResult::Response(TransportResponse::Reject { wire_seq })
+                TransportSendResult::Response(TransportResponse::Reject {
+                    wire_seq,
+                    error: QwpServerError {
+                        status: codec::WS_STATUS_SCHEMA_MISMATCH,
+                        message: "fake schema mismatch".to_string(),
+                        error: Error::new(ErrorCode::InvalidApiCall, "fake schema mismatch"),
+                    },
+                })
             }
-            FakeSendResult::Disconnect => {
-                TransportSendResult::Failure(TransportFailure::Disconnect)
-            }
-            FakeSendResult::RetryableFailure => {
-                TransportSendResult::Failure(TransportFailure::Retryable)
-            }
-            FakeSendResult::TerminalFailure => {
-                TransportSendResult::Failure(TransportFailure::Terminal)
-            }
+            FakeSendResult::Disconnect => TransportSendResult::Failure(
+                TransportFailure::Disconnect(fake_transport_error("fake disconnect")),
+            ),
+            FakeSendResult::RetryableFailure => TransportSendResult::Failure(
+                TransportFailure::Retryable(fake_transport_error("fake retryable failure")),
+            ),
+            FakeSendResult::TerminalFailure => TransportSendResult::Failure(
+                TransportFailure::Terminal(fake_transport_error("fake terminal failure")),
+            ),
         })
     }
 
@@ -934,7 +968,6 @@ pub(crate) enum FakeSendResult {
 #[cfg(test)]
 mod tests {
     use super::super::qwp_ws_publisher::{QwpWsPublicationDriver, QwpWsPublicationError};
-    use super::super::qwp_ws_sf_queue::SfQueueOptions;
     use super::*;
     use crate::ingress::buffer::{QwpWsEncodeScratch, SymbolGlobalDict};
     use crate::ingress::{Buffer, TimestampNanos};
@@ -951,7 +984,6 @@ mod tests {
     use std::thread;
     #[cfg(feature = "sync-sender-qwp-ws")]
     use std::time::Duration;
-    use tempfile::TempDir;
 
     #[cfg(feature = "sync-sender-qwp-ws")]
     use rustls::{ServerConfig, StreamOwned, server::ServerConnection};
@@ -1021,6 +1053,16 @@ mod tests {
         scratch.message
     }
 
+    fn qwp_error_payload(status: u8, sequence: u64, message: &str) -> Vec<u8> {
+        let msg = message.as_bytes();
+        let mut payload = Vec::with_capacity(11 + msg.len());
+        payload.push(status);
+        payload.extend_from_slice(&sequence.to_le_bytes());
+        payload.extend_from_slice(&(msg.len() as u16).to_le_bytes());
+        payload.extend_from_slice(msg);
+        payload
+    }
+
     fn drain_events<Q: ManualDriverQueue, T: ManualDriverTransport>(
         driver: &mut ManualDriverPrototype<Q, T>,
     ) -> Vec<DriverEvent> {
@@ -1084,37 +1126,12 @@ mod tests {
         }
 
         fn restart_connection(&mut self, _reason: ReconnectReason) -> Result<(), DriverError> {
-            self.restart_result
+            self.restart_result.clone()
         }
 
         fn sent_frames(&self) -> &[SentFrame] {
             &self.sent_frames
         }
-    }
-
-    fn sf_options(dir: &TempDir) -> SfQueueOptions {
-        SfQueueOptions {
-            dir: dir.path().to_path_buf(),
-            max_frames: 8,
-            max_bytes: 1024,
-            max_in_flight: 4,
-        }
-    }
-
-    fn sf_driver(dir: &TempDir, server: FakeOrderedServer) -> ManualDriverPrototype<SfFrameQueue> {
-        ManualDriverPrototype::from_queue(SfFrameQueue::open(sf_options(dir)).unwrap(), server)
-    }
-
-    fn sf_driver_with_retry_budget(
-        dir: &TempDir,
-        server: FakeOrderedServer,
-        retry_budget: usize,
-    ) -> ManualDriverPrototype<SfFrameQueue> {
-        ManualDriverPrototype::from_queue_with_retry_budget(
-            SfFrameQueue::open(sf_options(dir)).unwrap(),
-            server,
-            retry_budget,
-        )
     }
 
     #[test]
@@ -1716,16 +1733,23 @@ mod tests {
     #[test]
     fn transport_reconnect_failure_keeps_sent_receipt_observable() {
         let transport = TestTransport::scripted([Ok(TransportSendResult::Failure(
-            TransportFailure::Disconnect,
+            TransportFailure::Disconnect(fake_transport_error("disconnect before reconnect")),
         ))])
-        .with_restart_result(Err(DriverError::Transport));
+        .with_restart_result(Err(DriverError::Transport(fake_transport_error(
+            "reconnect failed",
+        ))));
         let mut driver = ManualDriverPrototype::from_queue(
             VolatileFrameQueue::new(options(8, 1024, 4)).unwrap(),
             transport,
         );
         let receipt = driver.try_submit(b"payload").unwrap();
 
-        assert_eq!(driver.drive_once(), Err(DriverError::Transport));
+        assert_eq!(
+            driver.drive_once(),
+            Err(DriverError::Transport(fake_transport_error(
+                "reconnect failed"
+            )))
+        );
         assert_eq!(driver.transport.sent_payloads, vec![b"payload".to_vec()]);
         assert_eq!(
             driver.receipt_status(receipt),
@@ -1748,7 +1772,9 @@ mod tests {
 
     #[test]
     fn transport_write_failure_does_not_commit_sent_receipt() {
-        let transport = TestTransport::scripted([Err(TransportFailure::Disconnect)]);
+        let transport = TestTransport::scripted([Err(TransportFailure::Disconnect(
+            fake_transport_error("write failed"),
+        ))]);
         let mut driver = ManualDriverPrototype::from_queue(
             VolatileFrameQueue::new(options(8, 1024, 4)).unwrap(),
             transport,
@@ -1780,7 +1806,12 @@ mod tests {
     #[test]
     fn transport_poll_failure_enters_reconnect_policy() {
         let transport = TestTransport::scripted([Ok(TransportSendResult::NoResponse)])
-            .with_poll_results([Ok(None), Err(TransportFailure::Disconnect)]);
+            .with_poll_results([
+                Ok(None),
+                Err(TransportFailure::Disconnect(fake_transport_error(
+                    "poll failed",
+                ))),
+            ]);
         let mut driver = ManualDriverPrototype::from_queue(
             VolatileFrameQueue::new(options(8, 1024, 4)).unwrap(),
             transport,
@@ -1818,6 +1849,51 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn raw_qwp_schema_and_write_errors_reject_and_continue_like_java() {
+        for (status, expected_code) in [
+            (codec::WS_STATUS_SCHEMA_MISMATCH, ErrorCode::InvalidApiCall),
+            (codec::WS_STATUS_WRITE_ERROR, ErrorCode::ServerFlushError),
+        ] {
+            let payload = qwp_error_payload(status, 42, "server says no");
+
+            let response = decode_transport_response(&payload).unwrap().unwrap();
+
+            match response {
+                TransportResponse::Reject { wire_seq, error } => {
+                    assert_eq!(wire_seq, 42);
+                    assert_eq!(error.status, status);
+                    assert_eq!(error.message, "server says no");
+                    assert_eq!(error.error.code(), expected_code);
+                    assert!(error.error.msg().contains("server says no"));
+                }
+                other => panic!("unexpected response: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn raw_qwp_parse_internal_security_and_unknown_errors_are_terminal_like_java() {
+        for (status, expected_code) in [
+            (codec::WS_STATUS_PARSE_ERROR, ErrorCode::InvalidApiCall),
+            (codec::WS_STATUS_INTERNAL_ERROR, ErrorCode::ServerFlushError),
+            (codec::WS_STATUS_SECURITY_ERROR, ErrorCode::AuthError),
+            (0x7f, ErrorCode::ServerFlushError),
+        ] {
+            let payload = qwp_error_payload(status, 7, "fatal server error");
+
+            let err = decode_transport_response(&payload).unwrap_err();
+
+            match err {
+                TransportFailure::Terminal(err) => {
+                    assert_eq!(err.code(), expected_code);
+                    assert!(err.msg().contains("fatal server error"));
+                }
+                other => panic!("unexpected transport failure: {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -2242,6 +2318,10 @@ mod tests {
             DriveOutcome::Sent(_)
         ));
         assert_eq!(driver.drive_once().unwrap(), DriveOutcome::Terminal);
+        assert_eq!(
+            driver.terminal_error().map(Error::msg),
+            Some("fake terminal failure")
+        );
 
         assert_eq!(
             driver.receipt_status(first),
@@ -2288,6 +2368,12 @@ mod tests {
         assert_eq!(
             driver.receipt_status(second),
             QwpReceiptStatus::Rejected { fsn: 1 }
+        );
+        assert_eq!(
+            driver
+                .last_server_error()
+                .map(|err| (err.status, err.message.as_str())),
+            Some((codec::WS_STATUS_SCHEMA_MISMATCH, "fake schema mismatch"))
         );
         assert_eq!(
             driver.receipt_status(third),
@@ -2509,226 +2595,6 @@ mod tests {
         assert_eq!(
             driver.receipt_status(second),
             QwpReceiptStatus::Acked { fsn: 1 }
-        );
-    }
-
-    #[test]
-    fn sf_close_drain_timeout_leaves_unresolved_frame_recoverable() {
-        let dir = TempDir::new().unwrap();
-        let receipt;
-        {
-            let mut driver = sf_driver(&dir, FakeOrderedServer::no_response());
-            receipt = driver.try_submit(b"payload").unwrap();
-
-            assert_eq!(driver.close_drain_steps(1).unwrap(), CloseOutcome::Timeout);
-            assert_eq!(
-                driver.receipt_status(receipt),
-                QwpReceiptStatus::Sent {
-                    fsn: 0,
-                    wire_seq: 0,
-                }
-            );
-            assert_eq!(driver.try_submit(b"next"), Err(DriverError::Closing));
-        }
-
-        let mut recovered = sf_driver(&dir, FakeOrderedServer::ack_each_send());
-
-        assert_eq!(
-            recovered.receipt_status(receipt),
-            QwpReceiptStatus::Published { fsn: 0 }
-        );
-        assert_eq!(
-            recovered.close_drain_steps(1).unwrap(),
-            CloseOutcome::Drained
-        );
-        assert_eq!(
-            recovered.receipt_status(receipt),
-            QwpReceiptStatus::Acked { fsn: 0 }
-        );
-    }
-
-    #[test]
-    fn sf_retry_budget_exhaustion_leaves_unresolved_frame_recoverable() {
-        let dir = TempDir::new().unwrap();
-        let receipt;
-        {
-            let mut driver = sf_driver_with_retry_budget(
-                &dir,
-                FakeOrderedServer::scripted([FakeSendResult::RetryableFailure]),
-                0,
-            );
-            receipt = driver.try_submit(b"payload").unwrap();
-
-            assert_eq!(driver.drive_once().unwrap(), DriveOutcome::Terminal);
-            assert_eq!(
-                driver.receipt_status(receipt),
-                QwpReceiptStatus::Terminal { fsn: 0 }
-            );
-            assert_eq!(driver.try_submit(b"next"), Err(DriverError::Terminal));
-        }
-
-        let mut recovered = sf_driver(&dir, FakeOrderedServer::ack_each_send());
-
-        assert_eq!(
-            recovered.receipt_status(receipt),
-            QwpReceiptStatus::Published { fsn: 0 }
-        );
-        assert_eq!(
-            recovered.wait_steps(receipt, 1).unwrap(),
-            DeliveryOutcome::Acked
-        );
-    }
-
-    #[test]
-    fn sf_driver_reopens_and_replays_from_first_unresolved_fsn() {
-        let dir = TempDir::new().unwrap();
-        let first;
-        let second;
-        let third;
-        {
-            let mut driver = sf_driver(
-                &dir,
-                FakeOrderedServer::scripted([FakeSendResult::AckSent, FakeSendResult::NoResponse]),
-            );
-            first = driver.try_submit(b"first").unwrap();
-            second = driver.try_submit(b"second").unwrap();
-            third = driver.try_submit(b"third").unwrap();
-
-            assert_eq!(
-                driver.drive_once().unwrap(),
-                DriveOutcome::Acked { wire_seq: 0 }
-            );
-            assert_eq!(
-                driver.drive_once().unwrap(),
-                DriveOutcome::Sent(SentFrame {
-                    fsn: 1,
-                    wire_seq: 1,
-                    payload_len: 6,
-                })
-            );
-        }
-
-        let mut recovered = sf_driver(&dir, FakeOrderedServer::ack_each_send());
-
-        assert_eq!(
-            recovered.receipt_status(first),
-            QwpReceiptStatus::Acked { fsn: 0 }
-        );
-        assert_eq!(
-            recovered.receipt_status(second),
-            QwpReceiptStatus::Published { fsn: 1 }
-        );
-        assert_eq!(
-            recovered.receipt_status(third),
-            QwpReceiptStatus::Published { fsn: 2 }
-        );
-        assert_eq!(
-            recovered.drive_once().unwrap(),
-            DriveOutcome::Acked { wire_seq: 0 }
-        );
-        assert_eq!(
-            recovered.sent_frames(),
-            &[SentFrame {
-                fsn: 1,
-                wire_seq: 0,
-                payload_len: 6,
-            }]
-        );
-        assert_eq!(
-            recovered.receipt_status(second),
-            QwpReceiptStatus::Acked { fsn: 1 }
-        );
-    }
-
-    #[test]
-    fn sf_driver_persists_rejection_gap_and_later_ack_after_reopen() {
-        let dir = TempDir::new().unwrap();
-        let first;
-        let second;
-        let third;
-        {
-            let mut driver = sf_driver(
-                &dir,
-                FakeOrderedServer::scripted([
-                    FakeSendResult::NoResponse,
-                    FakeSendResult::RejectWire { wire_seq: 1 },
-                    FakeSendResult::AckWire { wire_seq: 2 },
-                ]),
-            );
-            first = driver.try_submit(b"first").unwrap();
-            second = driver.try_submit(b"second").unwrap();
-            third = driver.try_submit(b"third").unwrap();
-
-            assert!(matches!(
-                driver.drive_once().unwrap(),
-                DriveOutcome::Sent(_)
-            ));
-            assert_eq!(
-                driver.drive_once().unwrap(),
-                DriveOutcome::Rejected {
-                    fsn: 1,
-                    wire_seq: 1,
-                }
-            );
-            assert_eq!(
-                driver.drive_once().unwrap(),
-                DriveOutcome::Acked { wire_seq: 2 }
-            );
-        }
-
-        let mut recovered = sf_driver(&dir, FakeOrderedServer::no_response());
-
-        assert_eq!(
-            recovered.wait_steps(first, 0).unwrap(),
-            DeliveryOutcome::Acked
-        );
-        assert_eq!(
-            recovered.wait_steps(second, 0).unwrap(),
-            DeliveryOutcome::Rejected
-        );
-        assert_eq!(
-            recovered.wait_steps(third, 0).unwrap(),
-            DeliveryOutcome::Acked
-        );
-        assert!(recovered.sent_frames().is_empty());
-    }
-
-    #[test]
-    fn sf_driver_terminal_failure_does_not_mark_recovered_frames_rejected() {
-        let dir = TempDir::new().unwrap();
-        let first;
-        {
-            let mut driver = sf_driver(
-                &dir,
-                FakeOrderedServer::scripted([FakeSendResult::TerminalFailure]),
-            );
-            first = driver.try_submit(b"first").unwrap();
-
-            assert_eq!(driver.drive_once().unwrap(), DriveOutcome::Terminal);
-            assert_eq!(
-                driver.receipt_status(first),
-                QwpReceiptStatus::Terminal { fsn: 0 }
-            );
-            assert_eq!(driver.try_submit(b"second"), Err(DriverError::Terminal));
-        }
-
-        let mut recovered = sf_driver(&dir, FakeOrderedServer::ack_each_send());
-
-        assert_eq!(
-            recovered.receipt_status(first),
-            QwpReceiptStatus::Published { fsn: 0 }
-        );
-        assert_eq!(
-            recovered.wait_steps(first, 1).unwrap(),
-            DeliveryOutcome::Acked
-        );
-        assert_eq!(
-            recovered.sent_frames(),
-            &[SentFrame {
-                fsn: 0,
-                wire_seq: 0,
-                payload_len: 5,
-            }]
         );
     }
 }

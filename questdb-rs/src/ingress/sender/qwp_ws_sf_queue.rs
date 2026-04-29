@@ -24,12 +24,12 @@
 
 #![allow(dead_code)]
 
-//! Minimal file-backed Store-and-Forward QWP/WebSocket queue prototype.
+//! Retired Rust-only Store-and-Forward QWP/WebSocket queue prototype.
 //!
-//! This module validates the Step 8 durability model without real WebSocket I/O
-//! or public FFI shape. The journal stores only local publication and receipt
-//! completion records. Connection-local state such as `Sent` and WebSocket wire
-//! sequence is deliberately not durable.
+//! This module is kept under `cfg(test)` as historical validation coverage for
+//! recovery mechanics. It is not the product disk format and is no longer wired
+//! into the manual driver. Product Store-and-Forward must use Java-compatible
+//! `.sfa` segment files instead.
 
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};

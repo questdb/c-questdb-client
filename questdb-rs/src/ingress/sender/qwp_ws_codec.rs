@@ -41,6 +41,11 @@ pub(super) const WS_OPCODE_PONG: u8 = 0xA;
 
 pub(super) const WS_STATUS_OK: u8 = 0x00;
 pub(super) const WS_STATUS_DURABLE_ACK: u8 = 0x02;
+pub(super) const WS_STATUS_SCHEMA_MISMATCH: u8 = 0x03;
+pub(super) const WS_STATUS_PARSE_ERROR: u8 = 0x05;
+pub(super) const WS_STATUS_INTERNAL_ERROR: u8 = 0x06;
+pub(super) const WS_STATUS_SECURITY_ERROR: u8 = 0x08;
+pub(super) const WS_STATUS_WRITE_ERROR: u8 = 0x09;
 
 /// 256 MiB cap on a single inbound frame -- well above QWP's 16 MB batch limit
 /// but small enough to refuse obviously bogus declared lengths early.
@@ -317,7 +322,7 @@ pub(super) fn parse_response(payload: &[u8], expected_seq: u64) -> crate::Result
         WS_STATUS_DURABLE_ACK => Ok(ResponseAction::DurableAck),
         _ => {
             let (_seq, msg) = parse_error_body(payload)?;
-            Err(map_error_status(status, msg))
+            Err(map_error_status(status, &msg))
         }
     }
 }
@@ -325,10 +330,17 @@ pub(super) fn parse_response(payload: &[u8], expected_seq: u64) -> crate::Result
 /// Variant of `parse_response` for pipelined senders: rather than verifying a
 /// single expected sequence, return the sequence so the caller can dispatch
 /// the result to the matching in-flight request.
+pub(super) struct PipelinedError {
+    pub(super) sequence: u64,
+    pub(super) status: u8,
+    pub(super) message: String,
+    pub(super) err: crate::Error,
+}
+
 pub(super) enum PipelinedResponse {
     Ok { sequence: u64 },
     DurableAck,
-    Error { sequence: u64, err: crate::Error },
+    Error(PipelinedError),
 }
 
 pub(super) fn parse_pipelined_response(payload: &[u8]) -> crate::Result<PipelinedResponse> {
@@ -347,10 +359,13 @@ pub(super) fn parse_pipelined_response(payload: &[u8]) -> crate::Result<Pipeline
         WS_STATUS_DURABLE_ACK => Ok(PipelinedResponse::DurableAck),
         _ => {
             let (sequence, msg) = parse_error_body(payload)?;
-            Ok(PipelinedResponse::Error {
+            let err = map_error_status(status, &msg);
+            Ok(PipelinedResponse::Error(PipelinedError {
                 sequence,
-                err: map_error_status(status, msg),
-            })
+                status,
+                message: msg,
+                err,
+            }))
         }
     }
 }
@@ -393,13 +408,15 @@ fn parse_error_body(payload: &[u8]) -> crate::Result<(u64, String)> {
     Ok((seq, msg))
 }
 
-fn map_error_status(status: u8, msg: String) -> crate::Error {
+fn map_error_status(status: u8, msg: &str) -> crate::Error {
     match status {
-        0x03 => error::fmt!(InvalidApiCall, "QWP schema mismatch: {}", msg),
-        0x05 => error::fmt!(InvalidApiCall, "QWP parse error: {}", msg),
-        0x06 => error::fmt!(ServerFlushError, "QWP server internal error: {}", msg),
-        0x08 => error::fmt!(AuthError, "QWP authorization failure: {}", msg),
-        0x09 => error::fmt!(ServerFlushError, "QWP write error: {}", msg),
+        WS_STATUS_SCHEMA_MISMATCH => error::fmt!(InvalidApiCall, "QWP schema mismatch: {}", msg),
+        WS_STATUS_PARSE_ERROR => error::fmt!(InvalidApiCall, "QWP parse error: {}", msg),
+        WS_STATUS_INTERNAL_ERROR => {
+            error::fmt!(ServerFlushError, "QWP server internal error: {}", msg)
+        }
+        WS_STATUS_SECURITY_ERROR => error::fmt!(AuthError, "QWP authorization failure: {}", msg),
+        WS_STATUS_WRITE_ERROR => error::fmt!(ServerFlushError, "QWP write error: {}", msg),
         other => error::fmt!(
             ServerFlushError,
             "QWP error (status 0x{:02x}): {}",

@@ -32,10 +32,11 @@ As of 2026-04-29:
   `doc/QWP_WEBSOCKET_ACK_ORDER_REJECT_PROBE.md`.
 - Step 8 has a minimal file-backed SF queue prototype and reflection in
   `doc/QWP_WEBSOCKET_SF_QUEUE_PROTOTYPE.md`. That prototype validated recovery
-  mechanics but is not the product disk format; the product SF store must use
-  the Java-compatible `.sfa` segment format.
-- Step 9 has driver/SF seam coverage for server rejection, terminal, close-drain,
-  retry-budget behaviour, and event polling agreement in
+  mechanics but is not the product disk format and is no longer wired into the
+  driver seam. The product SF store must use the Java-compatible `.sfa` segment
+  format.
+- Step 9 has driver/error seam coverage for server rejection, terminal,
+  close-drain, retry-budget behaviour, and event polling agreement in
   `doc/QWP_WEBSOCKET_ERROR_POLICY_PROTOTYPE.md`.
 - Step 10 has a first real-server error taxonomy probe for parse error,
   schema mismatch, and deterministic value/type coercion in
@@ -470,6 +471,8 @@ Replace the volatile queue with a file-backed queue. Keep the fake server.
 The first prototype used a Rust-specific journal. Do not evolve that journal into
 the product disk format. The product queue must use the Java client `.sfa`
 segment layout so a slot written by one client can be recovered by the other.
+The Rust-specific journal prototype is now test-only and must not be used as the
+driver integration substrate.
 
 Start with the smallest Java-compatible durability surface that can validate
 replay:

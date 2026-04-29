@@ -213,6 +213,12 @@ fn read_frame<R: Read>(stream: &mut R) -> crate::Result<(bool, u8, Vec<u8>)> {
     let fin = (hdr[0] & 0x80) != 0;
     let opcode = hdr[0] & 0x0F;
     let masked = (hdr[1] & 0x80) != 0;
+    if masked {
+        return Err(error::fmt!(
+            SocketError,
+            "WebSocket server frame must not be masked"
+        ));
+    }
     let len_short = hdr[1] & 0x7F;
     let payload_len: u64 = match len_short {
         126 => {
@@ -236,19 +242,9 @@ fn read_frame<R: Read>(stream: &mut R) -> crate::Result<(bool, u8, Vec<u8>)> {
         ));
     }
 
-    let mut mask = [0u8; 4];
-    if masked {
-        read_exact_io(stream, &mut mask, "WebSocket frame mask")?;
-    }
-
     let mut payload = vec![0u8; payload_len as usize];
     if !payload.is_empty() {
         read_exact_io(stream, &mut payload, "WebSocket frame payload")?;
-    }
-    if masked {
-        for (i, b) in payload.iter_mut().enumerate() {
-            *b ^= mask[i & 3];
-        }
     }
     Ok((fin, opcode, payload))
 }
@@ -607,6 +603,25 @@ mod tests {
         assert_eq!(out[0], 0x82); // FIN | binary
         assert_eq!(out[1] & 0x80, 0x80); // masked
         assert_eq!(out[1] & 0x7F, 5); // length
+    }
+
+    #[test]
+    fn masked_server_frame_is_protocol_error() {
+        let mut masked_frame = Vec::new();
+        codec::write_frame_to_buf(&mut masked_frame, true, WS_OPCODE_BINARY, b"hello", [0; 4]);
+        let err = read_message(
+            &mut std::io::Cursor::new(masked_frame),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        assert!(
+            err.msg().contains("must not be masked"),
+            "got: {}",
+            err.msg()
+        );
     }
 
     #[test]

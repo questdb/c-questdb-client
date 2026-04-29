@@ -52,7 +52,7 @@ mod qwp_ws_queue;
 #[cfg(feature = "_sender-qwp-ws")]
 mod qwp_ws_sfa_segment;
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(all(test, feature = "_sender-qwp-ws"))]
 mod qwp_ws_sf_queue;
 
 #[cfg(feature = "_sender-qwp-ws")]

@@ -38,8 +38,9 @@ behind prototypes before product API integration.
 - `questdb-rs/src/ingress/sender/qwp_ws_queue.rs` - volatile queue prototype.
 - `questdb-rs/src/ingress/sender/qwp_ws_sfa_segment.rs` - Java-compatible
   `.sfa` segment codec spike.
-- `questdb-rs/src/ingress/sender/qwp_ws_sf_queue.rs` - file-backed SF queue
-  prototype.
+- `questdb-rs/src/ingress/sender/qwp_ws_sf_queue.rs` - retired Rust-only
+  file-backed SF queue prototype, now compiled only for tests and no longer
+  wired into the driver seam.
 - `questdb-rs-ffi/src/lib.rs` and `include/questdb/ingress/line_sender.h` -
   shape-only C ABI stubs.
 
@@ -195,7 +196,7 @@ This is deliberate. A local transport write failure must not create a fake
 
 ### Store-and-Forward prototype
 
-`questdb-rs/src/ingress/sender/qwp_ws_sf_queue.rs` implements the current
+`questdb-rs/src/ingress/sender/qwp_ws_sf_queue.rs` is a retired Rust-only
 file-backed SF queue prototype:
 
 - append-only journal,
@@ -206,9 +207,11 @@ file-backed SF queue prototype:
 - malformed-log rejection,
 - ACK and rejection state surviving restart.
 
-This prototype is no longer the product disk design. The new requirement is
-byte-compatible Store-and-Forward with the Java client. Product SF must replace
-the custom `qwp-ws-sf.log` journal with Java `.sfa` segment files under
+This prototype is no longer the product disk design and is no longer wired into
+`ManualDriverPrototype`. It is compiled only for tests so its recovery coverage
+can remain available while product SF moves to byte-compatible
+Store-and-Forward with the Java client. Product SF must use Java `.sfa` segment
+files under
 `<sf_dir>/<sender_id>/`, using the Java header, frame envelope, CRC32C,
 recovery scan, slot lock, rotation, and ACK-driven segment trim model.
 
@@ -412,10 +415,12 @@ conversion before the real driver is wired through.
   `Rejected` naming before ABI hardening.
 - No C++ or Python wrapper implementation has been added for the new QWP/WS
   shape.
-- Durable SF prototype is not Java disk-format-compatible. It lacks `.sfa`
-  segment files, Java header/frame CRC layout, slot locking, segment rotation,
-  ACK-driven trim, cross-client recovery, and Java-compatible `sf_durability`
-  parse-and-fail behavior for reserved `flush`/`append` modes.
+- Java-compatible product SF queue integration is missing. The retired Rust-only
+  journal prototype is no longer wired into the driver seam. The remaining
+  product work is `.sfa` segment files, Java header/frame CRC layout, slot
+  locking, segment rotation, ACK-driven trim, cross-client recovery, and
+  Java-compatible `sf_durability` parse-and-fail behavior for reserved
+  `flush`/`append` modes.
 - Cross-client `.sfa` golden fixture is present but ignored by default because it
   depends on the local Java client checkout, `javac`, and Maven classpath
   discovery.

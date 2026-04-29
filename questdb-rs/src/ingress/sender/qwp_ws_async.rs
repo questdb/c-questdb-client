@@ -523,11 +523,16 @@ async fn reader_task(
                             let _ = inflight.tx.send(Ok(()));
                         }
                     }
-                    Ok(PipelinedResponse::Error { sequence, err }) => {
+                    Ok(PipelinedResponse::Error(server_error)) => {
                         // Per-message server errors are non-terminal: they go
                         // back to the matching flush, the connection stays.
-                        if let Some(inflight) = inner.in_flight.lock().unwrap().remove(&sequence) {
-                            let _ = inflight.tx.send(Err(err));
+                        if let Some(inflight) = inner
+                            .in_flight
+                            .lock()
+                            .unwrap()
+                            .remove(&server_error.sequence)
+                        {
+                            let _ = inflight.tx.send(Err(server_error.err));
                         }
                     }
                     Ok(PipelinedResponse::DurableAck) => continue,
