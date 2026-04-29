@@ -188,6 +188,32 @@ impl Bind {
 
 /// Append the wire encoding of `bind` to `out`.
 pub fn encode_bind(bind: &Bind, out: &mut Vec<u8>) -> Result<()> {
+    // `Bind::Null(k)` only encodes the simple no-args null body. For kinds
+    // whose null wire encoding requires column-level metadata (DECIMAL*
+    // scale, GEOHASH precision_bits) — or whose null layout differs from a
+    // bare `[type, 0x01, 0x01]` (VARCHAR / BINARY) — emitting `Bind::Null(k)`
+    // would silently produce wire bytes that desynchronise the server's
+    // bind decoder. Reject early, point at the dedicated variant.
+    if let Bind::Null(k) = bind {
+        let dedicated = match k {
+            ColumnKind::Varchar => Some("Bind::NullVarchar"),
+            ColumnKind::Binary => Some("Bind::NullBinary"),
+            ColumnKind::Decimal64 => Some("Bind::NullDecimal64 { scale }"),
+            ColumnKind::Decimal128 => Some("Bind::NullDecimal128 { scale }"),
+            ColumnKind::Decimal256 => Some("Bind::NullDecimal256 { scale }"),
+            ColumnKind::Geohash => Some("Bind::NullGeohash { precision_bits }"),
+            _ => None,
+        };
+        if let Some(variant) = dedicated {
+            return Err(fmt!(
+                InvalidBind,
+                "Bind::Null({}) is invalid: this kind needs column-level metadata on the wire; use {} instead",
+                k.name(),
+                variant
+            ));
+        }
+    }
+
     out.push(bind.kind().as_u8());
 
     let null = bind.is_null();
@@ -588,6 +614,59 @@ mod tests {
             ColumnKind::Geohash,
         ] {
             check_bindable(k).unwrap_or_else(|_| panic!("{}", k.name()));
+        }
+    }
+
+    #[test]
+    fn null_bind_rejects_kinds_with_column_args() {
+        // Each of these kinds requires column-level metadata in its null wire
+        // body (DECIMAL* scale, GEOHASH precision_bits) or a different null
+        // layout (VARCHAR / BINARY skip the offsets array on null). Using the
+        // generic `Bind::Null(k)` constructor would silently emit the wrong
+        // bytes; encode_bind must reject and direct the user to the dedicated
+        // variant.
+        for kind in [
+            ColumnKind::Varchar,
+            ColumnKind::Binary,
+            ColumnKind::Decimal64,
+            ColumnKind::Decimal128,
+            ColumnKind::Decimal256,
+            ColumnKind::Geohash,
+        ] {
+            let mut out = Vec::new();
+            let err = encode_bind(&Bind::Null(kind), &mut out).unwrap_err();
+            assert_eq!(err.code(), crate::egress::ErrorCode::InvalidBind);
+            assert!(
+                out.is_empty(),
+                "encode_bind must not write any bytes on rejection (kind={})",
+                kind.name()
+            );
+        }
+    }
+
+    #[test]
+    fn null_bind_accepts_simple_kinds() {
+        for kind in [
+            ColumnKind::Boolean,
+            ColumnKind::Byte,
+            ColumnKind::Short,
+            ColumnKind::Int,
+            ColumnKind::Long,
+            ColumnKind::Float,
+            ColumnKind::Double,
+            ColumnKind::Timestamp,
+            ColumnKind::TimestampNanos,
+            ColumnKind::Date,
+            ColumnKind::Uuid,
+            ColumnKind::Long256,
+            ColumnKind::Char,
+            ColumnKind::Ipv4,
+        ] {
+            let mut out = Vec::new();
+            encode_bind(&Bind::Null(kind), &mut out)
+                .unwrap_or_else(|_| panic!("Bind::Null({}) should encode", kind.name()));
+            // Simple null layout: [type, null_flag=0x01, bitmap=0x01]
+            assert_eq!(out, vec![kind.as_u8(), 0x01, 0x01]);
         }
     }
 
