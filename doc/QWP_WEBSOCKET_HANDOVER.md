@@ -29,6 +29,8 @@ behind prototypes before product API integration.
 - `questdb-rs/src/ingress/sender/qwp_ws_driver.rs` - current manual driver
   prototype and transport seam.
 - `questdb-rs/src/ingress/sender/qwp_ws_queue.rs` - volatile queue prototype.
+- `questdb-rs/src/ingress/sender/qwp_ws_sfa_segment.rs` - Java-compatible
+  `.sfa` segment codec spike.
 - `questdb-rs/src/ingress/sender/qwp_ws_sf_queue.rs` - file-backed SF queue
   prototype.
 - `questdb-rs-ffi/src/lib.rs` and `include/questdb/ingress/line_sender.h` -
@@ -198,6 +200,29 @@ After process recovery, retained frames are `Published`; replay rebuilds
 connection-local state from scratch. Previous receipt handles and runtime
 ACK/rejection status are gone.
 
+`questdb-rs/src/ingress/sender/qwp_ws_sfa_segment.rs` is the first product-format
+spike. It currently validates:
+
+- Java `SF01` header bytes,
+- Java frame envelope `[crc32c][payloadLen][payload]`,
+- CRC32C using Java's known `123456789` vector,
+- `sf-initial.sfa` and `sf-<generation:016x>.sfa` naming,
+- clean zero-tail recovery,
+- torn-tail detection on CRC mismatch,
+- create/open/append cursor behavior for one segment.
+- ignored cross-client fixture where Java writes a segment Rust opens, Rust
+  writes a segment Java opens, and torn-tail recovery agrees in both directions.
+
+Normal Rust tests use committed hex fixtures under
+`questdb-rs/src/tests/interop/qwp-ws-sfa/`. The ignored cross-client fixture is
+the regeneration/proof tool for those bytes.
+
+It does not yet implement slot locking, segment-ring recovery, rotation,
+ACK-driven trim, or a non-ignored CI fixture. The cross-client fixture compiles
+a small Java helper into `/tmp` and uses the local Java client checkout from
+`QDB_JAVA_CLIENT_CORE` or
+`/home/jara/devel/oss/questdb-arrays/java-questdb-client/core`.
+
 ### Manual driver and transport seam
 
 `questdb-rs/src/ingress/sender/qwp_ws_driver.rs` contains the manual driver
@@ -320,9 +345,9 @@ conversion before the real driver is wired through.
   segment files, Java header/frame CRC layout, slot locking, segment rotation,
   ACK-driven trim, cross-client recovery, and Java-compatible `sf_durability`
   parse-and-fail behavior for reserved `flush`/`append` modes.
-- Java/Rust `.sfa` golden fixtures are missing: Java-written slot opened by
-  Rust, Rust-written slot opened by Java, header/frame CRC fixture, and torn-tail
-  recovery fixture.
+- Cross-client `.sfa` golden fixture is present but ignored by default because it
+  depends on the local Java client checkout, `javac`, and Maven classpath
+  discovery.
 - Extended Java/Rust golden fixtures are still missing arrays, decimals, UTF-8,
   sparse columns, and schema evolution.
 - Close/EOF semantics with unresolved in-flight frames are not yet proven by a
