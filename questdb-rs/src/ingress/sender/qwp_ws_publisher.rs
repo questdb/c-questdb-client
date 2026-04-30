@@ -80,6 +80,14 @@ impl<Q: ManualDriverQueue, T: ManualDriverTransport> QwpWsPublicationDriver<Q, T
         self.driver.drive_once()
     }
 
+    pub(crate) fn drive_send_once(&mut self) -> Result<DriveOutcome, DriverError> {
+        self.driver.drive_send_once()
+    }
+
+    pub(crate) fn drive_receive_once(&mut self) -> Result<DriveOutcome, DriverError> {
+        self.driver.drive_receive_once()
+    }
+
     pub(crate) fn wait_steps(
         &mut self,
         receipt: QwpReceipt,
