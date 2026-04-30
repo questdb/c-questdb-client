@@ -92,6 +92,14 @@ force two sender cores with different durability and replay semantics. Future
 async support should be an ownership-consuming adapter over the same
 queue/driver core, not a parallel implementation.
 
+The native Rust manual sender has started moving onto the same core. The first
+public slice exposes `SenderBuilder::build_qwp_ws()` and
+`QwpWsSender::from_conf(...)`, value receipts, explicit `drive_once`, receipt
+status polling, bounded wait, and bounded close-drain methods. The existing
+`Sender::flush()` path remains the compatibility wrapper; it should keep moving
+toward a thin call pattern over the same native sender semantics rather than a
+separate QWP/WebSocket product path.
+
 ## Design principle
 
 Split the sender into three layers:
@@ -118,61 +126,80 @@ Low-level Rust API:
 ```rust
 pub struct QwpWsSender { /* threadless core */ }
 
-pub struct QwpReceipt {
-    pub fsn: u64,
-}
+pub struct QwpWsReceipt { /* value receipt; exposes fsn() */ }
 
-pub enum QwpDeliveryOutcome {
+pub enum QwpWsDeliveryOutcome {
     Acked,
-    Rejected {
-        status: QwpStatus,
-        message_truncated: bool,
-    },
+    Rejected(QwpWsRejection),
     Timeout,
 }
 
-pub enum QwpDriveOutcome {
+pub struct QwpWsRejection {
+    pub fsn: u64,
+    pub wire_sequence: u64,
+    pub status: u8,
+    pub message: String,
+}
+
+pub enum QwpWsDriveOutcome {
     Idle,
-    Progress,
+    Sent { fsn: u64, wire_sequence: u64 },
+    Acked { wire_sequence: u64 },
+    Rejected { fsn: u64, wire_sequence: u64 },
+    Reconnected { reason: QwpWsReconnectReason },
     Terminal,
 }
 
 impl QwpWsSender {
-    pub fn open(opts: QwpWsOptions) -> Result<Self>;
+    pub fn from_conf(conf: impl AsRef<str>) -> Result<Self>;
 
     pub fn new_buffer(&self) -> Buffer;
 
-    pub fn submit(&mut self, buffer: &mut Buffer) -> Result<QwpReceipt>;
-    pub fn submit_and_keep(&mut self, buffer: &Buffer) -> Result<QwpReceipt>;
+    pub fn submit(&mut self, buffer: &mut Buffer) -> Result<QwpWsReceipt>;
+    pub fn submit_and_keep(&mut self, buffer: &Buffer) -> Result<QwpWsReceipt>;
 
-    pub fn drive_once(&mut self, timeout: Duration) -> Result<QwpDriveOutcome>;
-    pub fn poll_event(&mut self) -> Option<QwpEvent>;
-    pub fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus;
-    pub fn wait(&mut self, receipt: QwpReceipt, timeout: Duration) -> Result<QwpDeliveryOutcome>;
+    pub fn drive_once(&mut self) -> Result<QwpWsDriveOutcome>;
+    pub fn receipt_status(&self, receipt: QwpWsReceipt) -> Result<QwpWsReceiptStatus>;
+    pub fn wait(&mut self, receipt: QwpWsReceipt) -> Result<QwpWsDeliveryOutcome>;
+    pub fn wait_steps(
+        &mut self,
+        receipt: QwpWsReceipt,
+        max_drive_steps: usize,
+    ) -> Result<QwpWsDeliveryOutcome>;
 
-    pub fn close_drain(&mut self, timeout: Duration) -> Result<CloseOutcome>;
-    pub fn close_fast(&mut self);
+    pub fn close_drain(&mut self) -> Result<QwpWsCloseOutcome>;
+    pub fn close_drain_steps(&mut self, max_drive_steps: usize) -> Result<QwpWsCloseOutcome>;
+}
+
+impl SenderBuilder {
+    pub fn build_qwp_ws(&self) -> Result<QwpWsSender>;
 }
 ```
 
 Properties:
 
-- `open()` performs local setup and initial TCP/TLS/WebSocket/auth work by
-  default. `initial_connect_retry` controls whether initial connection failures
+- `build_qwp_ws()` / `from_conf()` reuse the same Java-compatible configuration
+  parser and validation as `Sender::from_conf`.
+- Initial TCP/TLS/WebSocket/auth work is performed before the sender is
+  returned. `initial_connect_retry` controls whether initial connection failures
   retry with the reconnect policy or fail fast.
 - `submit()` publishes to the local engine and returns a receipt. It does not wait for server ACK.
 - `submit()` clears the caller buffer only after successful publication.
 - `submit_and_keep()` publishes the same data without clearing the caller buffer.
-- `drive_once()` is the low-level progress primitive. It performs bounded I/O,
+- `drive_once()` is the low-level progress primitive. It performs one I/O,
   reconnect, replay, ACK handling, server-rejection handling, and event
-  production, but it does not consume events. `poll_event()` is the only event
-  consumer.
+  production step.
 - For blocking transports, `drive_once()` should prefer sending already
   published frames while the in-flight window has room before performing a
   blocking response poll. A blocking read must only happen when there is
   in-flight work to observe and no immediately sendable frame, or when a
   higher-level wait/close loop is explicitly waiting for delivery progress.
 - `wait()` is a convenience loop over `drive_once()` plus receipt-status checks.
+  The current Rust slice uses the configured bounded step budget; a duration
+  timeout may be added later if it is needed by Rust callers or FFI parity.
+- Rejections carry the rejected FSN, wire sequence, server status byte, and
+  server message for the exact receipt waited by the caller. Terminal
+  transport/protocol failures are returned as `Err(crate::Error)`.
 
 The low-level type should prefer `&mut self` methods. That gives Rust callers a clear single-driver ownership model and avoids internal locks on the hot path.
 
@@ -1271,14 +1298,22 @@ Validated in the current Rust branch:
     config key is rejected explicitly because the current Rust sync sender has no
     fallible close-drain surface; explicit `close_drain(timeout)` remains part of
     the future QWPWS manual/FFI API.
+14. Native Rust manual QWP/WebSocket API first slice:
+    `SenderBuilder::build_qwp_ws()`, `QwpWsSender::from_conf`, value receipts,
+    explicit progress driving, receipt status, bounded wait, and behavioral mock
+    coverage proving two batches can be sent before waiting for a cumulative ACK,
+    per-receipt rejection diagnostics, plus a gated real-server public manual
+    sender submit/wait probe.
 
 Remaining product work:
 
-1. Wire the C ABI stubs to the real queue/driver core.
-2. Finish Java-compatible server rejection reporting through the public/FFI
+1. Refactor `Sender::flush()` to be a thin compatibility wrapper over the native
+   Rust manual sender semantics where that keeps the code simpler.
+2. Wire the C ABI stubs to the real queue/driver core.
+3. Finish Java-compatible server rejection reporting through the public/FFI
    surfaces without adding Rust-only dead-letter files or callbacks.
-3. Add explicit background runner as an ownership-consuming adapter.
-4. Add C++ and Python wrappers after the C ABI is stable.
+4. Add explicit background runner as an ownership-consuming adapter.
+5. Add C++ and Python wrappers after the C ABI is stable.
 
 ## Tests
 

@@ -93,6 +93,7 @@ pub(crate) struct ManualDriverPrototype<Q = VolatileFrameQueue, T = FakeOrderedS
     terminal_fsn: Option<u64>,
     terminal_error: Option<Error>,
     last_server_error: Option<QwpServerError>,
+    rejected_frames: VecDeque<QwpRejectedFrame>,
     closing: bool,
     reconnect_policy: ReconnectPolicy,
 }
@@ -110,6 +111,7 @@ impl ManualDriverPrototype<VolatileFrameQueue> {
             terminal_fsn: None,
             terminal_error: None,
             last_server_error: None,
+            rejected_frames: VecDeque::new(),
             closing: false,
             reconnect_policy: ReconnectPolicy::no_backoff(Duration::MAX),
         })
@@ -126,6 +128,7 @@ impl<Q: ManualDriverQueue, T: ManualDriverTransport> ManualDriverPrototype<Q, T>
             terminal_fsn: None,
             terminal_error: None,
             last_server_error: None,
+            rejected_frames: VecDeque::new(),
             closing: false,
             reconnect_policy: ReconnectPolicy::no_backoff(Duration::MAX),
         }
@@ -144,6 +147,7 @@ impl<Q: ManualDriverQueue, T: ManualDriverTransport> ManualDriverPrototype<Q, T>
             terminal_fsn: None,
             terminal_error: None,
             last_server_error: None,
+            rejected_frames: VecDeque::new(),
             closing: false,
             reconnect_policy,
         }
@@ -162,6 +166,7 @@ impl<Q: ManualDriverQueue, T: ManualDriverTransport> ManualDriverPrototype<Q, T>
             terminal_fsn: None,
             terminal_error: None,
             last_server_error: None,
+            rejected_frames: VecDeque::new(),
             closing: false,
             reconnect_policy: ReconnectPolicy::no_backoff(Duration::MAX),
         }
@@ -383,6 +388,12 @@ impl<Q: ManualDriverQueue, T: ManualDriverTransport> ManualDriverPrototype<Q, T>
         self.last_server_error.as_ref()
     }
 
+    pub(crate) fn rejected_frame(&self, receipt: QwpReceipt) -> Option<&QwpRejectedFrame> {
+        self.rejected_frames
+            .iter()
+            .find(|rejected| rejected.fsn == receipt.fsn)
+    }
+
     fn delivery_status(&self, receipt: QwpReceipt) -> Result<Option<DeliveryOutcome>, DriverError> {
         match self.receipt_status(receipt) {
             QwpReceiptStatus::Acked { .. } => Ok(Some(DeliveryOutcome::Acked)),
@@ -417,7 +428,13 @@ impl<Q: ManualDriverQueue, T: ManualDriverTransport> ManualDriverPrototype<Q, T>
             }
             TransportResponse::Reject { wire_seq, error } => {
                 let receipt = self.queue.reject_wire(wire_seq)?;
-                self.last_server_error = Some(error);
+                let rejected = QwpRejectedFrame {
+                    fsn: receipt.fsn,
+                    wire_seq,
+                    error,
+                };
+                self.last_server_error = Some(rejected.error.clone());
+                self.rejected_frames.push_back(rejected);
                 if wire_seq > 0 {
                     self.push_event(DriverEvent::AckedThrough {
                         fsn: receipt.fsn - 1,
@@ -837,6 +854,13 @@ pub(crate) struct QwpServerError {
     pub(crate) status: u8,
     pub(crate) message: String,
     pub(crate) error: Error,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct QwpRejectedFrame {
+    pub(crate) fsn: u64,
+    pub(crate) wire_seq: u64,
+    pub(crate) error: QwpServerError,
 }
 
 impl From<codec::PipelinedError> for QwpServerError {

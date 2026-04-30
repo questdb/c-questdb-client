@@ -1594,19 +1594,7 @@ impl SenderBuilder {
                     ));
                 };
                 reject_unsupported_qwp_ws_sf_config(qwp_ws)?;
-                let basic_auth = match &auth {
-                    Some(conf::AuthParams::Basic(b)) => Some(b.to_header_string()),
-                    Some(conf::AuthParams::Token(t)) => Some(t.to_header_string()?),
-                    #[cfg(feature = "_sender-tcp")]
-                    Some(conf::AuthParams::Ecdsa(_)) => {
-                        return Err(error::fmt!(
-                            AuthError,
-                            "ECDSA authentication is not supported for QWP/WebSocket. \
-                             Use basic or token authentication instead."
-                        ));
-                    }
-                    None => None,
-                };
+                let basic_auth = qwp_ws_auth_header(&auth)?;
                 connect_qwp_ws(
                     self.host.as_str(),
                     self.port.as_str(),
@@ -1677,6 +1665,63 @@ impl SenderBuilder {
         );
 
         Ok(sender)
+    }
+
+    /// Build the native manual QWP/WebSocket sender.
+    ///
+    /// Unlike [`Sender::flush`], this exposes QWP/WebSocket publication receipts
+    /// and lets the caller drive progress and wait for acknowledgments directly.
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    pub fn build_qwp_ws(&self) -> Result<sender::QwpWsSender> {
+        if !self.protocol.is_qwp_ws() {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "build_qwp_ws is only supported for QWP/WebSocket protocols."
+            ));
+        }
+        if self.net_interface.is_some() {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "net_interface is not supported for QWP over WebSocket."
+            ));
+        }
+
+        #[cfg(feature = "insecure-skip-verify")]
+        let tls_verify = *self.tls_verify;
+
+        #[allow(unused_variables)]
+        let tls_settings = tls::TlsSettings::build(
+            self.protocol.tls_enabled(),
+            #[cfg(feature = "insecure-skip-verify")]
+            tls_verify,
+            *self.tls_ca,
+            self.tls_roots.deref().as_deref(),
+        )?;
+
+        let Some(qwp_ws) = self.qwp_ws.as_ref() else {
+            return Err(error::fmt!(
+                ConfigError,
+                "QWP/WebSocket configuration is missing."
+            ));
+        };
+        reject_unsupported_qwp_ws_sf_config(qwp_ws)?;
+        let auth = self.build_auth()?;
+        let auth_header = qwp_ws_auth_header(&auth)?;
+        let publisher = open_qwp_ws_publisher(
+            self.host.as_str(),
+            self.port.as_str(),
+            matches!(self.protocol, Protocol::QwpWss),
+            tls_settings,
+            qwp_ws,
+            auth_header,
+        )?;
+
+        Ok(sender::QwpWsSender::from_publisher(
+            publisher,
+            max_flush_drive_steps(qwp_ws),
+            *self.max_buf_size,
+            *self.max_name_len,
+        ))
     }
 
     #[cfg(any(feature = "_sender-tcp", feature = "_sender-qwp-udp"))]
@@ -1840,6 +1885,21 @@ fn reject_unsupported_qwp_ws_sf_config(qwp_ws: &conf::QwpWsConfig) -> Result<()>
     }
 
     Ok(())
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+fn qwp_ws_auth_header(auth: &Option<conf::AuthParams>) -> Result<Option<String>> {
+    match auth {
+        Some(conf::AuthParams::Basic(b)) => Ok(Some(b.to_header_string())),
+        Some(conf::AuthParams::Token(t)) => Ok(Some(t.to_header_string()?)),
+        #[cfg(feature = "_sender-tcp")]
+        Some(conf::AuthParams::Ecdsa(_)) => Err(error::fmt!(
+            AuthError,
+            "ECDSA authentication is not supported for QWP/WebSocket. \
+             Use basic or token authentication instead."
+        )),
+        None => Ok(None),
+    }
 }
 
 #[cfg(feature = "_sender-tcp")]

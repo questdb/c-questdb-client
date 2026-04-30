@@ -39,7 +39,7 @@ use crate::ingress::qwp_ws_test_support::{
     CloseOutcome, DeliveryOutcome, ManualDriverPrototype, QwpWsPublicationDriver, SfaSlotOptions,
     SfaSlotQueue, VolatileFrameQueue, VolatileQueueOptions, connect_blocking_transport,
 };
-use crate::ingress::{Buffer, SenderBuilder, TimestampNanos};
+use crate::ingress::{Buffer, QwpWsDeliveryOutcome, SenderBuilder, TimestampNanos};
 use tempfile::TempDir;
 
 use super::{TestError, TestResult};
@@ -106,6 +106,46 @@ fn qwp_ws_publication_driver_submit_waits_and_row_is_queryable() -> TestResult {
         has_publication_row(&config, &table)?,
         "expected row with sym=SYM_PUBLICATION, qty=42, px=123.5"
     );
+
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a real QuestDB server and QDB_QWP_WS_PUBLIC_MANUAL_PROBE=1"]
+fn qwp_ws_public_manual_sender_submit_waits_and_row_is_queryable() -> TestResult {
+    if std::env::var("QDB_QWP_WS_PUBLIC_MANUAL_PROBE").as_deref() != Ok("1") {
+        eprintln!("set QDB_QWP_WS_PUBLIC_MANUAL_PROBE=1 to run the public manual sender probe");
+        return Ok(());
+    }
+
+    let config = ProbeConfig::from_env()?;
+    if config.auth_header.is_some() {
+        return Err(Box::new(IoError::new(
+            ErrorKind::InvalidInput,
+            "QDB_QWP_WS_PUBLIC_MANUAL_PROBE does not support QDB_QWP_WS_AUTH_HEADER yet; use an unauthenticated local QuestDB server",
+        )));
+    }
+
+    let table = unique_table_name("qwp_public_manual_probe");
+    eprintln!("QuestDB build: {}", query_build(&config)?);
+    eprintln!("probe table: {table}");
+    let _cleanup = TableCleanup::new(config.clone(), table.clone());
+
+    let conf = format!(
+        "qwpws::addr={}:{};max_in_flight=4;",
+        config.host, config.qwp_ws_port
+    );
+    let mut sender = SenderBuilder::from_conf(conf)?.build_qwp_ws()?;
+    let mut buffer = sender.new_buffer();
+    write_row(&mut buffer, &table, "SYM_PUBLIC_MANUAL", 33, 333.5, 33)?;
+
+    let receipt = sender.submit(&mut buffer)?;
+    assert!(buffer.is_empty());
+    assert_eq!(sender.wait_steps(receipt, 16)?, QwpWsDeliveryOutcome::Acked);
+
+    let count = wait_for_count(&config, &table, 1, Duration::from_secs(10))?;
+    assert_eq!(count, 1);
+    assert!(has_row(&config, &table, "SYM_PUBLIC_MANUAL", 33, 333.5)?);
 
     Ok(())
 }

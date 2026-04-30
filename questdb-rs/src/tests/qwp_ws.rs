@@ -33,7 +33,9 @@ use std::thread;
 use std::time::Duration;
 
 use crate::ErrorCode;
-use crate::ingress::{Protocol, SenderBuilder};
+use crate::ingress::{
+    Protocol, QwpWsDeliveryOutcome, QwpWsDriveOutcome, QwpWsReceiptStatus, SenderBuilder,
+};
 
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const FIRST_WIRE_SEQUENCE: u64 = 0;
@@ -330,6 +332,225 @@ fn qwp_ws_round_trip_minimal_message() {
     // followed by varint(7) "ETH-USD"
     assert_eq!(payload[2], 0x07);
     assert_eq!(&payload[3..10], b"ETH-USD");
+}
+
+#[test]
+fn qwp_ws_manual_sender_can_pipeline_before_waiting() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (frames_tx, frames_rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        let req_bytes = read_request_until_blank(&mut stream).unwrap();
+        let req = String::from_utf8_lossy(&req_bytes).to_string();
+        let key = parse_header(&req, "Sec-WebSocket-Key").unwrap();
+        let accept = compute_accept(&key);
+        let response = format!(
+            "HTTP/1.1 101 Switching Protocols\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Accept: {accept}\r\n\
+             X-QWP-Version: 1\r\n\
+             \r\n"
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+
+        let mut received = Vec::new();
+        let (_fin, _opcode, first) = read_frame(&mut stream).unwrap();
+        received.push(first);
+        let (_fin, _opcode, second) = read_frame(&mut stream).unwrap();
+        received.push(second);
+        frames_tx.send(received).unwrap();
+
+        write_qwp_ok_response(&mut stream, FIRST_WIRE_SEQUENCE + 1).unwrap();
+        thread::sleep(Duration::from_millis(50));
+    });
+
+    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+        .max_in_flight(2)
+        .unwrap()
+        .build_qwp_ws()
+        .unwrap();
+
+    let mut first = sender.new_buffer();
+    first
+        .table("trades")
+        .unwrap()
+        .symbol("sym", "ETH-USD")
+        .unwrap()
+        .column_i64("qty", 7)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    let first_receipt = sender.submit(&mut first).unwrap();
+    assert!(first.is_empty());
+    let first_fsn = first_receipt.fsn();
+
+    let mut second = sender.new_buffer();
+    second
+        .table("trades")
+        .unwrap()
+        .symbol("sym", "BTC-USD")
+        .unwrap()
+        .column_i64("qty", 11)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    let second_receipt = sender.submit(&mut second).unwrap();
+    assert!(second.is_empty());
+    let second_fsn = second_receipt.fsn();
+    assert!(second_fsn > first_fsn);
+
+    assert_eq!(
+        sender.receipt_status(first_receipt).unwrap(),
+        QwpWsReceiptStatus::Published { fsn: first_fsn }
+    );
+    assert_eq!(
+        sender.receipt_status(second_receipt).unwrap(),
+        QwpWsReceiptStatus::Published { fsn: second_fsn }
+    );
+
+    assert_eq!(
+        sender.drive_once().unwrap(),
+        QwpWsDriveOutcome::Sent {
+            fsn: first_fsn,
+            wire_sequence: FIRST_WIRE_SEQUENCE,
+        }
+    );
+    assert_eq!(
+        sender.drive_once().unwrap(),
+        QwpWsDriveOutcome::Sent {
+            fsn: second_fsn,
+            wire_sequence: FIRST_WIRE_SEQUENCE + 1,
+        }
+    );
+
+    let frames = frames_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(frames.len(), 2);
+    assert_eq!(&frames[0][0..4], b"QWP1");
+    assert_eq!(&frames[1][0..4], b"QWP1");
+
+    assert_eq!(
+        sender.wait_steps(second_receipt, 4).unwrap(),
+        QwpWsDeliveryOutcome::Acked
+    );
+    assert_eq!(
+        sender.receipt_status(first_receipt).unwrap(),
+        QwpWsReceiptStatus::Acked { fsn: first_fsn }
+    );
+    assert_eq!(
+        sender.receipt_status(second_receipt).unwrap(),
+        QwpWsReceiptStatus::Acked { fsn: second_fsn }
+    );
+}
+
+#[test]
+fn qwp_ws_manual_sender_reports_rejection_for_exact_receipt() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        let req_bytes = read_request_until_blank(&mut stream).unwrap();
+        let req = String::from_utf8_lossy(&req_bytes).to_string();
+        let key = parse_header(&req, "Sec-WebSocket-Key").unwrap();
+        let accept = compute_accept(&key);
+        let response = format!(
+            "HTTP/1.1 101 Switching Protocols\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Accept: {accept}\r\n\
+             X-QWP-Version: 1\r\n\
+             \r\n"
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+
+        let (_fin, _opcode, _first) = read_frame(&mut stream).unwrap();
+        let (_fin, _opcode, _second) = read_frame(&mut stream).unwrap();
+        write_qwp_error_response(
+            &mut stream,
+            QWP_STATUS_SCHEMA_MISMATCH,
+            FIRST_WIRE_SEQUENCE,
+            b"first bad",
+        )
+        .unwrap();
+        write_qwp_error_response(
+            &mut stream,
+            QWP_STATUS_SCHEMA_MISMATCH,
+            FIRST_WIRE_SEQUENCE + 1,
+            b"second bad",
+        )
+        .unwrap();
+        thread::sleep(Duration::from_millis(50));
+    });
+
+    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+        .max_in_flight(2)
+        .unwrap()
+        .build_qwp_ws()
+        .unwrap();
+
+    let mut first = sender.new_buffer();
+    first
+        .table("trades")
+        .unwrap()
+        .column_i64("qty", 1)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    let first_receipt = sender.submit(&mut first).unwrap();
+
+    let mut second = sender.new_buffer();
+    second
+        .table("trades")
+        .unwrap()
+        .column_i64("qty", 2)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    let second_receipt = sender.submit(&mut second).unwrap();
+
+    assert!(matches!(
+        sender.drive_once().unwrap(),
+        QwpWsDriveOutcome::Sent { .. }
+    ));
+    assert!(matches!(
+        sender.drive_once().unwrap(),
+        QwpWsDriveOutcome::Sent { .. }
+    ));
+
+    let second_rejection = match sender.wait_steps(second_receipt, 4).unwrap() {
+        QwpWsDeliveryOutcome::Rejected(rejection) => rejection,
+        other => panic!("expected second receipt rejection, got {other:?}"),
+    };
+    assert_eq!(second_rejection.fsn, second_receipt.fsn());
+    assert_eq!(second_rejection.wire_sequence, FIRST_WIRE_SEQUENCE + 1);
+    assert_eq!(second_rejection.status, QWP_STATUS_SCHEMA_MISMATCH);
+    assert_eq!(second_rejection.message, "second bad");
+
+    let first_rejection = match sender.wait_steps(first_receipt, 0).unwrap() {
+        QwpWsDeliveryOutcome::Rejected(rejection) => rejection,
+        other => panic!("expected first receipt rejection, got {other:?}"),
+    };
+    assert_eq!(first_rejection.fsn, first_receipt.fsn());
+    assert_eq!(first_rejection.wire_sequence, FIRST_WIRE_SEQUENCE);
+    assert_eq!(first_rejection.status, QWP_STATUS_SCHEMA_MISMATCH);
+    assert_eq!(first_rejection.message, "first bad");
 }
 
 #[test]

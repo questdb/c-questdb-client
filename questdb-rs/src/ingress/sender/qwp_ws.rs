@@ -102,14 +102,15 @@ impl Write for WsStream {
 
 // ---------- handler state ----------
 
-type SyncQwpWsPublisher = QwpWsPublicationDriver<ConfiguredQwpWsQueue, BlockingQwpWsTransport>;
+pub(crate) type SyncQwpWsPublisher =
+    QwpWsPublicationDriver<ConfiguredQwpWsQueue, BlockingQwpWsTransport>;
 
 pub(crate) struct SyncQwpWsHandlerState {
-    publisher: SyncQwpWsPublisher,
-    max_flush_drive_steps: usize,
+    pub(crate) publisher: SyncQwpWsPublisher,
+    pub(crate) max_flush_drive_steps: usize,
 }
 
-enum ConfiguredQwpWsQueue {
+pub(crate) enum ConfiguredQwpWsQueue {
     Memory(VolatileFrameQueue),
     StoreAndForward(SfaSlotQueue),
 }
@@ -559,6 +560,25 @@ pub(crate) fn connect_qwp_ws(
     qwp_ws: &QwpWsConfig,
     auth_header: Option<String>,
 ) -> crate::Result<SyncProtocolHandler> {
+    let publisher = open_qwp_ws_publisher(host, port, use_tls, tls_settings, qwp_ws, auth_header)?;
+
+    Ok(SyncProtocolHandler::SyncQwpWs(Box::new(
+        SyncQwpWsHandlerState {
+            publisher,
+            max_flush_drive_steps: max_flush_drive_steps(qwp_ws),
+        },
+    )))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn open_qwp_ws_publisher(
+    host: &str,
+    port: &str,
+    use_tls: bool,
+    tls_settings: Option<TlsSettings>,
+    qwp_ws: &QwpWsConfig,
+    auth_header: Option<String>,
+) -> crate::Result<SyncQwpWsPublisher> {
     let queue = ConfiguredQwpWsQueue::open(qwp_ws)?;
     let transport =
         connect_blocking_transport(host, port, use_tls, tls_settings, qwp_ws, auth_header)?;
@@ -573,12 +593,7 @@ pub(crate) fn connect_qwp_ws(
         ),
     );
 
-    Ok(SyncProtocolHandler::SyncQwpWs(Box::new(
-        SyncQwpWsHandlerState {
-            publisher: QwpWsPublicationDriver::new(driver, negotiated_version),
-            max_flush_drive_steps: max_flush_drive_steps(qwp_ws),
-        },
-    )))
+    Ok(QwpWsPublicationDriver::new(driver, negotiated_version))
 }
 
 fn connect_blocking_transport(
@@ -696,7 +711,7 @@ pub(crate) fn flush_qwp_ws(
     }
 }
 
-fn max_flush_drive_steps(qwp_ws: &QwpWsConfig) -> usize {
+pub(crate) fn max_flush_drive_steps(qwp_ws: &QwpWsConfig) -> usize {
     (*qwp_ws.max_in_flight).saturating_add(4).max(16)
 }
 
@@ -704,14 +719,17 @@ fn double_duration(duration: Duration) -> Duration {
     duration.checked_mul(2).unwrap_or(Duration::MAX)
 }
 
-fn publication_error_to_error(err: QwpWsPublicationError) -> crate::Error {
+pub(crate) fn publication_error_to_error(err: QwpWsPublicationError) -> crate::Error {
     match err {
         QwpWsPublicationError::Encode(err) => err,
         QwpWsPublicationError::Driver(err) => driver_error_to_error_without_state(err),
     }
 }
 
-fn driver_error_to_error(publisher: &SyncQwpWsPublisher, err: DriverError) -> crate::Error {
+pub(crate) fn driver_error_to_error(
+    publisher: &SyncQwpWsPublisher,
+    err: DriverError,
+) -> crate::Error {
     match err {
         DriverError::Terminal => publisher
             .terminal_error()

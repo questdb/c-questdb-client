@@ -529,6 +529,14 @@ conversion before the real driver is wired through.
   and replay-safe payloads, plus a gated real-server public `Sender` probe that
   recovers a failed `sf_dir` flush from the same Java-compatible slot and cleans
   the `.sfa` files after ACK/close.
+- The native Rust manual API is now the first-class pipelined surface:
+  `SenderBuilder::build_qwp_ws()` / `QwpWsSender::from_conf(...)` create a
+  manual sender with value receipts, explicit `drive_once`, receipt status,
+  bounded wait, and bounded close-drain. A mock-server test proves two batches
+  can be sent before waiting and then resolved by one cumulative ACK; another
+  proves per-receipt rejection diagnostics are not overwritten by later
+  rejections; a gated real-server probe verifies public manual submit/wait writes
+  a queryable row.
 - Java has no client-owned dead-letter file format for rejected batches. Rust v1
   should not add one. Java's `.corrupt` files are recovery quarantine for
   damaged `.sfa` segments, not server-rejection dead letters; rejected batches
@@ -543,16 +551,19 @@ conversion before the real driver is wired through.
 
 ## Recommended next step
 
-The public sync product path now has a real-server SFA recovery probe, and the
-older Tokio async sender has been removed to keep one maintained QWP/WebSocket
-core.
+The public sync product path now has a real-server SFA recovery probe, the
+native Rust manual sender exposes the first pipelined API slice, and the older
+Tokio async sender has been removed to keep one maintained QWP/WebSocket core.
 
 1. Preserve Java's simple durable model: `.sfa` segment files and QWP payload
    bytes only. Do not add Rust-only ACK, rejection, receipt, wire-sequence,
    in-flight, or dead-letter records.
-2. Finish Java-compatible server rejection reporting through the public/FFI
+2. Keep collapsing `Sender::flush()` toward a compatibility wrapper over the
+   native manual sender semantics when it removes duplication without obscuring
+   errors.
+3. Finish Java-compatible server rejection reporting through the public/FFI
    surfaces without adding dead-letter files or callbacks.
-3. Wire the C ABI stubs to the real queue/driver core.
+4. Wire the C ABI stubs to the real queue/driver core.
 
 Do not start with C++/Python wrappers, orphan draining, SF compaction, or
 performance optimization. Future async support should be an explicit adapter

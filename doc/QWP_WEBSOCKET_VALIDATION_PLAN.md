@@ -184,6 +184,8 @@ Validation target:
 - Submission, delivery, timeout, and close semantics are visible from names.
 - Receipts are easy to understand as value IDs.
 - The API does not make FFI users model Rust futures or a specific async runtime.
+- The native Rust API is pipelined too. C/FFI should wrap Rust's manual sender,
+  not be the only pipelined surface.
 
 Design pressure to watch:
 
@@ -203,6 +205,22 @@ Global reflection:
 
 - Does the sketch preserve the core principles: Buffer/Sender segregation,
   explicit progress ownership, runtime-neutral FFI, and observable delivery?
+
+Current validated slice:
+
+- `SenderBuilder::build_qwp_ws()` and `QwpWsSender::from_conf(...)` create the
+  native Rust manual sender from the same config validation used by
+  `Sender::from_conf`.
+- `QwpWsSender::submit()` / `submit_and_keep()` return value receipts after
+  local publication and do not wait for server ACK.
+- `drive_once`, `receipt_status`, `wait` / `wait_steps`, and `close_drain` /
+  `close_drain_steps` expose manual progress without a hidden runner.
+- A behavioral mock-server test proves two submitted buffers can be sent before
+  waiting, then resolved by one cumulative ACK.
+- A behavioral mock-server test proves per-receipt rejection diagnostics are not
+  overwritten when receipts are waited out of rejection order.
+- A gated real-server probe verifies public manual `submit` / `wait_steps`
+  writes a queryable row through a local QuestDB server.
 
 ## Step 2: Progress ownership prototype
 
@@ -695,6 +713,8 @@ Validation target:
   intended for the product core, not opaque test payload bytes.
 - The public sync `Sender` path uses the same publication driver and
   config-derived queue selection as the validated manual core.
+- The native Rust manual `QwpWsSender` path uses the same publication driver and
+  config-derived queue selection as the public sync compatibility path.
 - The public sync `Sender` path has a live QuestDB SFA recovery probe covering
   failed flush, reopen from the same Java-style slot, replay, follow-up ACK, and
   cleanup.
