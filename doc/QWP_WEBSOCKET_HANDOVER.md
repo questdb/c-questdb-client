@@ -9,6 +9,12 @@ Rust prototypes, real-server probes, C ABI shape stubs, and the first public
 sync `qwpws` cutover. The public sync sender now uses the publication driver and
 chooses its queue from `QwpWsConfig`: `sf_dir` unset uses the volatile queue,
 and `sf_dir` set opens the Java-compatible `<sf_dir>/<sender_id>/` SFA slot.
+The high-level `Sender` path also has the first sender-owned runner slice:
+`flush()` publishes locally, clears the caller buffer on successful local
+publication, and returns without waiting for the submitted frame's ACK. It may
+still wait for local capacity or an in-progress reconnect critical section.
+Ordinary socket send and non-blocking receive polling have been moved outside
+the publication mutex; reconnect/backoff remains the next coupling to remove.
 The public reconnect configuration now follows the Java ingestion sender model:
 duration-bound reconnect, no max-attempt cap, no failover callback, and
 `initial_connect_retry` as the explicit startup retry opt-in.
@@ -20,9 +26,15 @@ C ABI still contains shape-only stubs rather than the real queue/driver core.
 The latest architecture adjustment is that the ordinary high-level `Sender`
 path should converge on Java's product semantics: QWP/WebSocket `flush()`
 publishes into bounded local memory/SFA storage and returns without waiting for
-the server ACK, while a sender-owned runner advances WebSocket I/O. The manual
-`QwpWsSender` remains the threadless progress-owner API for advanced Rust users,
-tests, and FFI wiring.
+the submitted frame's server ACK, while a sender-owned runner advances
+WebSocket I/O. This does not mean every call is network-independent: local
+capacity and the current reconnect critical section may still make a producer
+call wait. The target shape is the Java architecture: a publication store/cursor
+with short synchronized access, plus a runner/I/O loop that owns transport,
+wire sequencing, reconnect/backoff, and replay. The manual `QwpWsSender`
+remains the threadless progress-owner API for advanced Rust users, tests, and
+FFI wiring; it should not be the permanent architectural center of the
+high-level runner.
 
 ## Read first
 
@@ -49,9 +61,6 @@ tests, and FFI wiring.
   `.sfa` segment codec spike.
 - `questdb-rs/src/ingress/sender/qwp_ws_sfa_queue.rs` - Java-compatible
   `.sfa` queue adapter behind the manual driver seam.
-- `questdb-rs/src/ingress/sender/qwp_ws_sf_queue.rs` - retired Rust-only
-  file-backed SF queue prototype, now compiled only for tests and no longer
-  wired into the driver seam.
 - `questdb-rs-ffi/src/lib.rs` and `include/questdb/ingress/line_sender.h` -
   shape-only C ABI stubs.
 
@@ -79,10 +88,10 @@ Current branch:
 ia_qwp_ws
 ```
 
-Most recent committed checkpoint:
+Previous committed checkpoint before the high-level runner slice:
 
 ```text
-0a5c59c Simplify QWP WebSocket sender ownership
+40a3cc5 Simplify QWP WebSocket driver progress steps
 ```
 
 Recent validation after the publication-shell, reconnect, `.sfa` recovery,
@@ -93,7 +102,7 @@ cargo test --manifest-path questdb-rs/Cargo.toml qwp_ws_driver
 cargo test --manifest-path questdb-rs/Cargo.toml qwp_ws
 cargo test --manifest-path questdb-rs/Cargo.toml \
     --no-default-features \
-    --features _sender-qwp-ws,tls-webpki-certs,ring-crypto \
+    --features sync-sender-qwp-ws,tls-webpki-certs,ring-crypto \
     qwp_ws_driver
 QDB_QWP_WS_PUBLICATION_PROBE=1 \
     cargo test --manifest-path questdb-rs/Cargo.toml \
@@ -110,7 +119,7 @@ QDB_QWP_WS_SFA_PROBE=1 \
     -- --ignored --nocapture
 QDB_QWP_WS_PUBLIC_SFA_PROBE=1 \
     cargo test --manifest-path questdb-rs/Cargo.toml --lib \
-    qwp_ws_public_sender_sfa_recovers_after_failed_flush \
+    qwp_ws_public_sender_sfa_recovers_after_unacked_disconnect \
     -- --ignored --nocapture
 cargo test --manifest-path questdb-rs/Cargo.toml --lib
 cargo fmt --manifest-path questdb-rs/Cargo.toml --check
@@ -121,13 +130,15 @@ Observed result:
 
 ```text
 qwp_ws_driver: 47 passed
-qwp_ws: 143 passed, 9 ignored
-minimal _sender-qwp-ws driver filter: 40 passed, with reduced-feature unused-code warnings
+qwp_ws: 148 passed, 10 ignored
+minimal sync-sender-qwp-ws qwp_ws filter: 148 passed, 2 ignored, with
+    reduced-feature unused-code warnings
 real QuestDB publication probe: 1 passed
 real QuestDB reconnect probe: 1 passed
 qwp_ws_sfa: 22 passed, 3 ignored
 real QuestDB .sfa recovery probe: 1 passed
-real QuestDB public Sender SFA recovery probe: 1 passed
+real QuestDB public Sender SFA recovery probe: 1 passed under
+    local-publication runner semantics
 cargo test --lib: 487 passed, 11 ignored
 format and whitespace checks passed
 ```
@@ -164,6 +175,23 @@ Observed result:
 qwp_ws: 143 passed, 9 ignored
 qwpws_store_and_forward: 6 passed
 minimal sync-sender-qwp-ws qwpws_store_and_forward: 5 passed, with existing reduced-feature unused-code warnings
+```
+
+Latest high-level runner send/receive decoupling validation:
+
+```bash
+cargo test --manifest-path questdb-rs/Cargo.toml \
+    threaded_runner_accepts_publication_while_transport_send_is_blocked --lib
+cargo test --manifest-path questdb-rs/Cargo.toml qwp_ws --lib
+git diff --check
+```
+
+Observed result:
+
+```text
+blocked-send publication regression: 1 passed
+qwp_ws: 115 passed, 10 ignored
+whitespace check passed
 ```
 
 ## What is implemented
@@ -228,50 +256,29 @@ Still not validated by real server:
 ### Queue and receipt prototypes
 
 `questdb-rs/src/ingress/sender/qwp_ws_queue.rs` implements the volatile queue
-prototype:
+publication log:
 
 - monotonically increasing FSNs starting at `0`,
 - value receipts,
-- `Published`, `Sent`, `Acked`, `Rejected`, `Terminal`, and `Unknown` status
+- `Published`, `Acked`, `Rejected`, `Terminal`, and `Unknown` status
   vocabulary,
 - bounded frame and byte capacity,
-- fixed in-flight ring,
-- zero-based per-connection wire sequence,
-- cumulative ACK handling,
-- ordered rejection gaps,
-- reconnect replay from the oldest unresolved FSN.
+- retained payload lookup by FSN,
+- cumulative completion by FSN,
+- server rejection by FSN.
 
-The queue now has a two-phase send boundary for the driver:
+Connection-local send state is no longer part of the queue. The manual driver
+owns the `SendCursor`: fixed in-flight bound, zero-based per-connection wire
+sequence, wire-to-FSN ACK mapping, `Sent` status overlay, and reconnect replay
+from the oldest unresolved FSN. This keeps volatile and `.sfa` storage as
+publication logs rather than transport state machines.
 
-```text
-next_outbound_frame() -> borrowed payload candidate
-transport accepts write
-commit_sent() -> receipt becomes Sent
-```
+### Java-compatible Store-and-Forward
 
-This is deliberate. A local transport write failure must not create a fake
-`Sent` receipt or emit a `Sent` event.
-
-### Store-and-Forward prototype
-
-`questdb-rs/src/ingress/sender/qwp_ws_sf_queue.rs` is a retired Rust-only
-file-backed SF queue prototype:
-
-- append-only journal,
-- frame publication records,
-- ACK-through completion records,
-- server-rejection completion records,
-- recovery from incomplete tails,
-- malformed-log rejection,
-- ACK and rejection state surviving restart.
-
-This prototype is no longer the product disk design and is no longer wired into
-`ManualDriverPrototype`. It is compiled only for tests so its recovery coverage
-can remain available while product SF moves to byte-compatible
-Store-and-Forward with the Java client. Product SF must use Java `.sfa` segment
-files under
-`<sf_dir>/<sender_id>/`, using the Java header, frame envelope, CRC32C,
-recovery scan, slot lock, rotation, and ACK-driven segment trim model.
+Product SF uses Java `.sfa` segment files under `<sf_dir>/<sender_id>/`, using
+the Java header, frame envelope, CRC32C, recovery scan, slot lock, rotation, and
+resolved-frame segment trim model. The old Rust-only SF prototype has been
+removed so there is only one disk-store architecture in the source tree.
 
 The product `.sfa` store must also avoid connection-local facts:
 
@@ -308,9 +315,9 @@ queue adapter behind the manual driver seam. It currently validates:
 - open/create of Java-compatible `.sfa` segments,
 - frame publication only after durable append succeeds,
 - restart recovery as `Published` frames,
-- replay from the oldest retained FSN with zero-based wire sequence,
+- retained payload lookup from the oldest retained FSN,
 - segment rotation and recovery in FSN order,
-- ACK-driven trimming of fully ACKed sealed segments,
+- resolved-frame trimming of fully completed sealed segments,
 - clean close removing fully drained `.sfa` files,
 - close timeout retaining recoverable frames,
 - manual-driver replay of recovered `.sfa` frames,
@@ -351,7 +358,7 @@ Java client checkout from
 
 `questdb-rs/src/ingress/sender/qwp_ws_driver.rs` contains the manual driver
 prototype. It currently supports both volatile and SF queue implementations via
-`ManualDriverQueue`.
+the `PublicationLog` trait.
 
 The fake ordered server is now behind `ManualDriverTransport`. The driver seam
 is intentionally transport-shaped before real I/O is wired:
@@ -541,9 +548,10 @@ conversion before the real driver is wired through.
 - The real transport adapter and publication shell have real QuestDB submit/wait,
   reconnect replay, and recovered `.sfa` replay probes. The public sync cutover
   has mock-server coverage for config-derived SFA opening, reconnect, rejection,
-  and replay-safe payloads, plus a gated real-server public `Sender` probe that
-  recovers a failed `sf_dir` flush from the same Java-compatible slot and cleans
-  the `.sfa` files after ACK/close.
+  replay-safe payloads, and high-level `flush()` returning before ACK. The
+  gated real-server public `Sender` SFA recovery probe covers local
+  publication, an unacked disconnect, same-slot recovery, and replay before
+  follow-up work. ACK cleanup remains part of the explicit close/drain gap.
 - The native Rust manual API is now the first-class pipelined surface:
   `SenderBuilder::build_qwp_ws()` / `QwpWsSender::from_conf(...)` create a
   manual sender with value receipts, explicit `drive_once`, receipt status,
@@ -552,11 +560,20 @@ conversion before the real driver is wired through.
   proves per-receipt rejection diagnostics are not overwritten by later
   rejections; a gated real-server probe verifies public manual submit/wait writes
   a queryable row.
-- The current public `Sender::flush()` QWP/WebSocket path still waits for the
-  submitted frame's server outcome. That is now explicitly a staging behavior.
-  The target is Java-like local publication plus a sender-owned runner, bounded
-  by `sf_max_total_bytes` and `sf_append_deadline_millis`, with asynchronous
-  server rejection observation through a bounded pollable error/event path.
+- The current public `Sender::flush()` QWP/WebSocket path now returns after
+  local publication and does not wait for the submitted frame's ACK. It may
+  still wait for local capacity or for the current in-progress reconnect
+  critical section, and it relies on a sender-owned runner for WebSocket
+  progress. Ordinary socket send and non-blocking receive poll no longer hold
+  the publication mutex.
+  Remaining gaps are Java-compatible local backpressure
+  (`sf_append_deadline_millis`), close/drain semantics, and bounded public
+  observation for asynchronous server rejections. The manual driver now has a
+  Java-like `PublicationLog` boundary: local publication owns FSNs/payload
+  retention, and the driver owns connection-local wire sequencing, in-flight
+  state, ACK mapping, and reconnect replay cursor. The high-level runner should
+  converge on the Java-shaped store/runner split rather than turning the manual
+  driver into a permanent background-runner core.
 - Java has no client-owned dead-letter file format for rejected batches. Rust v1
   should not add one. Java's `.corrupt` files are recovery quarantine for
   damaged `.sfa` segments, not server-rejection dead letters; rejected batches
@@ -571,25 +588,22 @@ conversion before the real driver is wired through.
 
 ## Recommended next step
 
-The public sync product path now has a real-server SFA recovery probe, the
-native Rust manual sender exposes the first pipelined API slice, and the older
-Tokio async sender has been removed to keep one maintained QWP/WebSocket core.
+The public sync product path now has a sender-owned runner, the native Rust
+manual sender exposes the first pipelined API slice, and the older Tokio async
+sender has been removed to keep one maintained QWP/WebSocket core.
 
 1. Preserve Java's simple durable model: `.sfa` segment files and QWP payload
    bytes only. Do not add Rust-only ACK, rejection, receipt, wire-sequence,
    in-flight, or dead-letter records.
-2. Introduce the shared cursor-engine boundary needed by both the manual sender
-   and the high-level `Sender` runner.
-3. Change the high-level QWP/WebSocket `Sender::flush()` target toward Java
-   semantics: local publication and buffer clear, no wait for the new frame's
-   ACK. `flush_and_keep()` should share those delivery semantics while
-   preserving the caller buffer. Do not do this as a foreground-only
-   "publish and kick one send" change: that leaves no progress owner to observe
-   disconnects after `flush()` returns and regresses reconnect/replay.
-4. Add Java-compatible local backpressure semantics:
+2. Build on the shared `PublicationLog` boundary so local append/backpressure is
+   governed by the local log, not by runner-owned blocking socket I/O.
+3. Add Java-compatible local backpressure semantics:
    `sf_max_total_bytes` plus `sf_append_deadline_millis`. The append-deadline
    key is currently recognized and rejected until the runner slice can enforce
    it on local-publication backpressure.
+4. Add Java-compatible high-level close/drain behavior. Rust `Drop` cannot
+   return errors, so decide the explicit API shape before accepting
+   `close_flush_timeout_millis`.
 5. Finish Java-compatible server rejection reporting through the public/FFI
    surfaces without adding dead-letter files or mandatory callbacks.
 6. Wire the C ABI stubs to the real queue/driver core.
@@ -655,7 +669,7 @@ env QDB_QWP_WS_SFA_PROBE=1 \
 
 env QDB_QWP_WS_PUBLIC_SFA_PROBE=1 \
     cargo test --manifest-path questdb-rs/Cargo.toml --lib \
-    qwp_ws_public_sender_sfa_recovers_after_failed_flush \
+    qwp_ws_public_sender_sfa_recovers_after_unacked_disconnect \
     -- --ignored --nocapture
 ```
 

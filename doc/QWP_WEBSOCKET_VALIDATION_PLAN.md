@@ -70,9 +70,13 @@ As of 2026-04-29:
   product surface.
 - The 2026-04-30 design adjustment is that the ordinary Rust `Sender` should
   converge on Java's high-level model: `flush()` publishes into bounded local
-  memory/SFA storage and returns without waiting for the server ACK, while a
-  sender-owned runner advances WebSocket I/O. The manual `QwpWsSender` remains
-  the threadless progress-owner API.
+  memory/SFA storage and returns without waiting for the submitted frame's
+  server ACK, while a sender-owned runner advances WebSocket I/O. `flush()` may
+  still wait for local capacity or the current reconnect critical section. The
+  latest runner slice already moves ordinary socket send and non-blocking
+  receive polling outside the publication mutex; reconnect/backoff remains the
+  next coupling to remove. The manual `QwpWsSender` remains the threadless
+  progress-owner API.
 
 ## Validation discipline
 
@@ -536,13 +540,14 @@ Validation target:
 - Torn-tail recovery matches Java: stop at the first invalid frame and append
   from that offset.
 - ACK/drop-and-continue rejection leaves no Rust-only completion marker on disk.
-- The public sync `Sender` path, not only the manual driver shell, can retain a
-  failed `sf_dir` flush, recover it from the same `<sf_dir>/<sender_id>/` slot
-  on a new sender, deliver it before follow-up work, and remove retained `.sfa`
-  files after ACK/close.
+- The public sync `Sender` path, not only the manual driver shell, can publish
+  into `sf_dir`, survive a disconnect before ACK, recover retained work from the
+  same `<sf_dir>/<sender_id>/` slot on a new sender, deliver it before follow-up
+  work, and later remove retained `.sfa` files once high-level close/drain is
+  implemented.
 - DROP_AND_CONTINUE does not create client-owned dead-letter files; the
   observable artifact is the structured rejection event/error plus normal
-  ACK-driven segment trim.
+  resolved-frame segment trim.
 
 Design pressure to watch:
 
@@ -727,9 +732,10 @@ Validation target:
   config-derived queue selection as the validated manual core.
 - The native Rust manual `QwpWsSender` path uses the same publication driver and
   config-derived queue selection as the public sync compatibility path.
-- The public sync `Sender` path has a live QuestDB SFA recovery probe covering
-  failed flush, reopen from the same Java-style slot, replay, follow-up ACK, and
-  cleanup.
+- The public sync `Sender` path has a live QuestDB SFA recovery probe for runner
+  semantics: local publication succeeds, a proxy drops the unACKed frame, the
+  next sender reopens the same Java-style slot, replay happens before follow-up
+  work. Cleanup remains part of the high-level close/drain gap.
 - The old Tokio `build_async()` path is removed rather than maintained as a
   second QWP/WebSocket implementation. Future async support should be an adapter
   over the same queue/driver core.
@@ -766,8 +772,7 @@ Global reflection:
 
 ## Step 13: Java-like high-level Sender runner
 
-Validate the product API shift from the current staging behavior to the Java
-behavior:
+Validate the product API shift to Java behavior:
 
 ```text
 Sender::flush(&mut Buffer)
@@ -781,17 +786,34 @@ This step should start by re-reading Java's `QwpWebSocketSender.flush()`,
 `flush_qwp_ws()` / queue code. If Java changed again, update the design before
 coding.
 
+First runner slice status: high-level `flush()` and `flush_and_keep()` now
+return after local publication, and a sender-owned runner advances WebSocket
+I/O. Mock-server coverage proves delayed-ACK `flush()`, delayed-ACK
+`flush_and_keep()`, and two high-level `flush()` calls before the first ACK.
+The manual driver now uses a `PublicationLog` boundary: local publication owns
+FSNs and retained payloads, while the driver owns connection-local wire
+sequencing, in-flight state, ACK mapping, and reconnect replay cursor. The
+latest runner slice performs ordinary socket send and non-blocking receive poll
+outside the publication mutex, with behavioral coverage proving that a blocked
+send does not block another local publication. The remaining architectural work
+in this step is to make the high-level runner a direct Java-shaped I/O loop over
+the publication store instead of growing the manual driver as its center, and
+then finish reconnect/backoff decoupling, local-capacity backpressure/deadline,
+close/drain, and async rejection observability.
+
 Validation target:
 
 - High-level `Sender::flush()` returns after local publication and before the
-  server ACK for the newly published frame.
+  server ACK for the newly published frame. The target contract allows waiting
+  for local capacity, terminal state checks, or explicit close/shutdown
+  coordination, not for ordinary socket send/poll or reconnect backoff.
 - High-level `Sender::flush_and_keep()` has the same delivery semantics while
   preserving the caller buffer.
 - Two `flush()` calls can publish and be sent before the first ACK, bounded by
   `max_in_flight`.
 - The foreground path clears the caller buffer only after successful local
   publication.
-- A full local cursor blocks until ACK-driven trim frees space, or returns an
+- A full local cursor blocks until resolved-frame trim frees space, or returns an
   append-deadline error after `sf_append_deadline_millis`. Current Rust
   recognizes and rejects that Java key; the runner slice must accept it only
   after validating that the stored value actually controls local-publication
@@ -803,6 +825,9 @@ Validation target:
   portable way to report close-time delivery failures.
 - Manual `QwpWsSender::drive_once()` and the high-level background runner cannot
   drive the same core at the same time.
+- The manual driver remains a threadless manual-progress API. The high-level
+  runner should converge on a direct publication-store plus I/O-loop ownership
+  model, not a growing permanent `detach_*` surface on the manual driver.
 - Memory mode and SFA mode share the same publication and error semantics; only
   process-crash recovery differs.
 
@@ -812,6 +837,10 @@ Behavioral tests should include:
 - `flush_and_keep()` mock-server coverage proving local publication without
   clearing the buffer,
 - cumulative-ACK mock server proving multiple flushes pipeline,
+- blocked-send runner fixture proving ordinary transport send does not block
+  another local publication while capacity remains,
+- blocked-reconnect runner fixture proving reconnect/backoff does not block
+  another local publication while capacity remains,
 - capacity/backpressure fixture proving wait-for-trim and deadline expiry,
 - server-rejection fixture proving pollable async observability without
   dead-letter files or I/O-thread callbacks,
@@ -829,6 +858,8 @@ Design pressure to watch:
 
 - If the runner requires an unbounded payload channel, the design is drifting
   away from Java's bounded cursor model.
+- If the runner gains more detach/finish operations for each new behavior, stop
+  and extract the Java-shaped store/runner ownership boundary instead.
 - If `flush()` waits for the server ACK except under test-only timing, the
   product semantics did not change.
 - If high-level rejection reporting requires user callbacks inside the I/O

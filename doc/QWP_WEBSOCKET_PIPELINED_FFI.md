@@ -77,13 +77,14 @@ requires a different shape.
 
 ## Current Rust behavior
 
-The public sync QWP/WebSocket sender now uses the replay publication driver. Its
-`flush()` compatibility API still sends one logical frame and waits for the
-matching server outcome before returning, but the bytes flow through the new
-path:
+The public sync QWP/WebSocket sender now uses the replay publication driver and
+a sender-owned runner. Its `flush()` compatibility API publishes one logical
+frame into the local volatile/SFA queue and returns without waiting for the
+matching server ACK. It may still wait for local capacity or an in-progress
+reconnect critical section:
 
 ```text
-Buffer -> replay payload -> volatile queue or SFA slot -> blocking WS transport
+Buffer -> replay payload -> volatile queue or SFA slot -> runner-owned WS transport
 ```
 
 With `sf_dir` unset the sync sender uses the volatile queue. With `sf_dir` set
@@ -104,17 +105,15 @@ public slice exposes `SenderBuilder::build_qwp_ws()` and
 `QwpWsSender::from_conf(...)`, value receipts, explicit `drive_once`, receipt
 status polling, bounded wait, and bounded close-drain methods.
 
-The current `Sender::flush()` compatibility path is intentionally still
-stricter than Java: it publishes one logical frame and waits for that frame's
-server outcome. That is a staging state, not the target product contract. The
-Java-like target is:
+The current high-level `Sender::flush()` path now follows the Java-like
+publication boundary:
 
 ```text
 Sender::flush(&mut Buffer)
   -> encode replay-safe QWP payload
   -> publish into bounded local memory/SFA cursor
   -> clear the caller buffer
-  -> return without waiting for server ACK
+  -> return without waiting for the submitted frame's server ACK
 ```
 
 Transport progress, ACK handling, reconnect, replay, server rejection reporting,
@@ -122,33 +121,60 @@ and segment trim then belong to a sender-owned runner. This keeps the end-user
 API close to the existing `Sender` API and close to Java, while preserving the
 manual sender as an advanced/testing/FFI progress-owner surface.
 
+The no-ACK-wait boundary is not a promise that producer calls never wait on
+network-adjacent state. Producer calls may wait for local capacity or for an
+in-progress reconnect critical section to finish before they can publish
+locally. Ordinary send and non-blocking receive polling have already moved out
+of the publication mutex; reconnect/backoff remains the important coupling to
+remove.
+
+This is still not the finished product contract. The manual driver now has a
+Java-like `PublicationLog` boundary: local publication owns FSNs and payload
+retention, while the driver owns the connection-local wire cursor, in-flight
+window, ACK mapping, reconnect replay cursor, and `wireSeq -> FSN` translation.
+The high-level runner is still transitionally layered through that manual
+driver. The target architecture is not to grow a permanent family of
+`detach_*` driver operations. The target is the Java-shaped split: a
+publication store/cursor with short synchronized access, plus a runner that owns
+transport, reconnect/backoff, wire sequencing, and replay. Local-capacity
+waiting is not yet governed by `sf_append_deadline_millis`, close/drain behavior
+is not yet Java-compatible, and asynchronous rejection observation is not yet
+exposed through a bounded public event/error surface.
+
 ## Design principle
 
-Split the sender into three layers:
+Split the sender into Java-like ownership layers:
 
 ```text
 Buffer API
   User-owned row accumulation. Not thread-safe. Reusable after submit succeeds.
 
-QWP/WebSocket cursor engine
-  Shared publication and replay state. Owns the bounded memory/SFA cursor,
-  FSN assignment, retained payload bytes, ACK/rejection application, segment
-  trim, and recovery. This is the storage/backpressure contract.
+Publication store / cursor
+  Shared local publication state. Owns the bounded memory/SFA store, FSN
+  assignment, retained payload bytes, ACK/rejection application, segment trim,
+  and recovery. This is the storage/backpressure contract, equivalent in role
+  to Java's CursorSendEngine plus SegmentRing.
 
-Progress engine
-  Owns connection state, in-flight slots, reconnect/replay logic, transport
-  scratch buffers, and server-response classification. It can be driven inline
-  by the manual sender or by a background runner owned by `Sender`.
+Runner / I/O loop
+  Owns socket state, in-flight window, connection-local wire sequence mapping,
+  reconnect/backoff, replay cursor, transport scratch buffers, and
+  server-response classification. This is equivalent in role to Java's
+  CursorWebSocketSendLoop.
 
 Adapters
   Existing high-level `Sender`, manual `QwpWsSender`, explicit threaded/async
   adapters, C ABI, C++ RAII, Python wrappers.
 ```
 
-The cursor/progress engines are the contract. Adapters must not change delivery
-semantics. A simple Rust implementation may use `Mutex`/`Condvar` between the
-foreground publisher and the runner; copying Java's lock-free internals is not a
-v1 requirement.
+The publication store and runner are the product contract. Adapters must not
+change delivery semantics. A simple Rust implementation may use
+`Mutex`/`Condvar` between the foreground publisher and the runner; copying
+Java's lock-free internals is not a v1 requirement.
+
+The manual driver is a separate ownership mode and a useful validation tool. It
+can stay monolithic because callers hold `&mut self` while driving progress. It
+should not remain the architectural center of the high-level `Sender` runner if
+that forces the threaded path to grow more transitional detach/finish APIs.
 
 ## Public Rust shape
 
@@ -169,11 +195,15 @@ Properties:
   cursor and clears the caller buffer only after publication succeeds.
 - `Sender::flush_and_keep()` has the same local-publication semantics but
   preserves the caller buffer.
-- `Sender::flush()` can block for local backpressure when the cursor is at
-  `sf_max_total_bytes`; it waits up to `sf_append_deadline_millis` for
-  ACK-driven trim to free space.
-- `Sender::flush()` checks for already-latched terminal errors before/after
+- `Sender::flush()` should block for local backpressure when the cursor is at
+  `sf_max_total_bytes`; once implemented, it waits up to
+  `sf_append_deadline_millis` for resolved-frame trim to free space.
+- `Sender::flush()` checks for already-latched terminal errors before local
   publication, but it does not wait for the newly published frame to be ACKed.
+- `Sender::flush()` may currently wait behind an in-progress reconnect critical
+  section. The target contract is that reconnect/backoff belongs to the runner
+  and does not block local publication except through local capacity, terminal
+  state, or explicit close/shutdown coordination.
 - Server rejections observed after `flush()` returns are surfaced through a
   bounded pollable error/event path and, for terminal policies, by latching the
   error so a later producer call fails. The first Rust surface should be polling
@@ -379,8 +409,8 @@ point:
 - failed local publication must not clear the caller buffer,
 - failed SF append must not advance the published cursor,
 - failed transport write/flush must not mark a frame `Sent`,
-- failed ACK-driven segment trim must not delete partially ACKed frames or invent
-  a durable completion marker.
+- failed resolved-frame segment trim must not delete partially resolved frames or
+  invent a durable completion marker.
 
 This invariant is more important than the internal helper boundaries. The core
 may refactor encoding, queue, and transport code, but the observable state
@@ -532,16 +562,14 @@ Core cursors:
 
 ```text
 published_fsn       highest frame published into the engine
-server_acked_fsn    highest contiguous frame accepted by the server
 completed_fsn       highest contiguous frame ACKed or server-rejected
 ```
 
-Do not count rejected frames as server ACKed.
-
 A frame is *resolved* when its receipt reaches a final delivery state:
-ACKed, server-rejected, or terminal. `completed_fsn` advances through contiguous
-resolved frames. `server_acked_fsn` advances only through contiguous ACKed frames
-and can therefore lag behind `completed_fsn` across rejection gaps.
+ACKed, server-rejected, or terminal. `completed_fsn` advances through
+contiguous resolved frames. The first ABI does not carry a second
+server-acked-through cursor; it reports ACK and rejection events directly and
+keeps the durable store focused on retained publication payloads.
 
 Durable state is deliberately smaller than runtime state. The queue stores only
 retained publication data:
@@ -691,7 +719,7 @@ FSN, not necessarily FSN `0`.
 
 The server processes submitted WebSocket frames strictly in wire-sequence order. Responses do not complete arbitrary later frames ahead of earlier frames.
 
-The server may coalesce successful ACKs by sending only the highest successful wire sequence. An `OK(sequence=N)` response means every unresolved successful frame up to `N` is accepted unless a prior rejection gap prevents contiguous server ACK advancement. The client maps that cumulative wire sequence to the corresponding FSN, marks covered successful receipts ACKed, and advances `server_acked_fsn` only through contiguous ACKed FSNs.
+The server may coalesce successful ACKs by sending only the highest successful wire sequence. An `OK(sequence=N)` response means every unresolved successful frame up to `N` is accepted. The client maps that cumulative wire sequence to the corresponding FSN and marks covered successful receipts ACKed.
 
 If the server sends an error for sequence `N`, prior unresolved frames below `N`
 are treated as ACKed if they were covered by the server's ordering guarantee.
@@ -711,7 +739,6 @@ OK(0), Error(1), OK(2)
 receipt 0      ACKed
 receipt 1      Rejected
 receipt 2      ACKed
-server_acked   0
 completed      2
 ```
 
@@ -890,10 +917,18 @@ feature too.
 Retryable transport failures:
 
 - preserve order,
-- reconnect with bounded backoff,
+- reconnect with bounded backoff owned by the runner, not the publication
+  store lock,
 - reset wire sequence,
 - replay from the first unresolved FSN,
 - keep receipts valid.
+
+On reconnect success the runner performs one short store/driver commit: restore
+the transport, restart wire mapping from the first unresolved FSN, publish a
+`Reconnected` event, and resume replay. On budget exhaustion or terminal
+upgrade/auth failure it performs one short terminal commit against the currently
+published FSN. The reconnect loop itself should be stop-aware and should not
+hold the local-publication mutex while sleeping or attempting a new connection.
 
 Reconnect budget exhaustion:
 
@@ -906,7 +941,7 @@ ACK, reject, or delete unresolved retained SF frames. Those frames remain in the
 slot and can be recovered by a newly created sender after the operator fixes
 configuration, credentials, or server availability. ACK and server-rejection
 outcomes do not append durable completion records; they only affect runtime
-receipt state and, for ACK/drop-and-continue, ACK-driven segment trim.
+receipt state and resolved-frame segment trim.
 
 Security/upgrade failures:
 
@@ -1043,14 +1078,16 @@ typedef struct {
     line_sender_qwpws_close_kind kind;
     bool has_published_fsn;
     uint64_t published_fsn;
-    bool has_server_acked_fsn;
-    uint64_t server_acked_fsn;
     bool has_completed_fsn;
     uint64_t completed_fsn;
 } line_sender_qwpws_close_outcome;
 ```
 
-For `LINE_SENDER_QWPWS_EVENT_ACKED`, `fsn` is the highest cumulatively ACKed FSN, not necessarily a single-frame ACK. `wire_sequence` is the highest cumulatively ACKed wire sequence on the current connection. ACKed-through and completed-through are intentionally different across rejection gaps: `completed_fsn` can advance past a rejected frame while `server_acked_fsn` cannot.
+For `LINE_SENDER_QWPWS_EVENT_ACKED`, `fsn` is the highest cumulatively ACKed
+FSN, not necessarily a single-frame ACK. `wire_sequence` is the highest
+cumulatively ACKed wire sequence on the current connection. Rejection details
+are reported by `LINE_SENDER_QWPWS_EVENT_REJECTED`; close/drain progress only
+needs `published_fsn` and `completed_fsn`.
 
 `LINE_SENDER_QWPWS_EVENT_DURABLE_ACK` is intentionally only a notification in
 the first ABI shape. Per-table durable ACK detail should be added later through a
@@ -1355,12 +1392,12 @@ alias for the current blocking startup retry behavior. Java's `async` spelling
 is rejected explicitly until the adapter behavior exists.
 
 Rust recognizes `sf_append_deadline_millis` and rejects it explicitly because
-the current high-level `Sender::flush()` still waits for the submitted frame
-outcome and does not own local-publication backpressure. The key should be
-accepted only with behavioral tests proving that it controls local-capacity
-waiting. `event_capacity` is not exposed yet. It belongs to the Java-like
-high-level runner design and should be added with behavioral tests before
-exposing asynchronous rejection observation.
+the current high-level `Sender::flush()` runner does not yet enforce
+Java-compatible local-capacity waiting. The key should be accepted only with
+behavioral tests proving that it controls local publication/backpressure, not
+server ACK waiting. `event_capacity` is not exposed yet. It belongs to the
+Java-like high-level runner design and should be added with behavioral tests
+before exposing asynchronous rejection observation.
 
 ## Implementation progress
 
@@ -1381,7 +1418,8 @@ Validated in the current Rust branch:
    close behavior, no buffer clear on failed submit, replay-safe payloads, and
    dropped-upgrade startup retry.
 8. Java-compatible `.sfa` segment/slot storage, recovery, `.lock` plus
-   `.lock.pid` slot ownership, rotation, and ACK-driven trim behind `sf_dir`.
+   `.lock.pid` slot ownership, rotation, and resolved-frame trim behind
+   `sf_dir`.
 9. Java/Rust `.sfa` golden fixtures for segment header/frame bytes.
 10. Public sync `qwpws` sender cutover to the publication driver with
     config-derived volatile/SFA queue selection.
@@ -1389,9 +1427,10 @@ Validated in the current Rust branch:
     `initial_connect_retry` including the supported `sync` spelling, explicit
     rejection of unsupported `async`, no max-attempt cap, and no Rust-only
     failover callback.
-12. Gated real-server public sync `Sender` probe for `sf_dir`: failed flush
-    leaves recoverable work, a new sender with the same `sender_id` replays it,
-    and ACK/close removes the retained `.sfa` files.
+12. Gated real-server public sync `Sender` probe for `sf_dir`: validated
+    recovery after local publication, proxy-dropped unacked frame, same-slot
+    reopen, and replay before follow-up work. Cleanup through the
+    high-level sender remains part of the close/drain gap.
 13. Public sync close-boundary decision: Java's `close_flush_timeout_millis`
     config key is rejected explicitly because the current Rust sync sender has no
     fallible close-drain surface; explicit `close_drain(timeout)` remains part of
@@ -1402,23 +1441,37 @@ Validated in the current Rust branch:
     coverage proving two batches can be sent before waiting for a cumulative ACK,
     per-receipt rejection diagnostics, plus a gated real-server public manual
     sender submit/wait probe.
+15. High-level Rust `Sender` runner first slice: `Sender::flush()` publishes
+    locally and clears the caller buffer without waiting for ACK, a background
+    runner advances send/receive/reconnect progress, schema/write rejections use
+    Java's drop-and-continue policy, and mock tests prove one and two high-level
+    flushes can return before ACK.
+16. High-level runner send/receive decoupling slice: replay encoding happens on
+    the foreground path before local publication; outbound frames carry shared
+    payload handles; the runner performs ordinary `send_frame()` and
+    non-blocking receive polling outside the publication mutex; a behavioral
+    test proves a second local publication completes while the first transport
+    send is blocked.
 
 Remaining product work:
 
-1. Introduce the shared cursor-engine boundary used by both manual and
-   high-level `Sender` paths.
-2. Add the high-level `Sender` runner so QWP/WebSocket `flush()` publishes
-   locally and returns without waiting for the server ACK.
-   A foreground-only "publish and kick one send" shortcut is not sufficient:
-   it leaves no progress owner to detect disconnects after `flush()` returns and
-   breaks reconnect/replay behavior.
-3. Add bounded local-publication backpressure with
+1. Finish the Java-shaped high-level runner/store split. The manual driver can
+   remain monolithic for explicit `&mut self` driving, but the high-level runner
+   should own transport, reconnect/backoff, wire sequencing, and replay directly
+   over a short-locked publication store instead of accumulating more permanent
+   detach operations on the manual driver.
+2. Add bounded local-publication backpressure with
    `sf_append_deadline_millis`, matching Java's `appendBlocking()` behavior.
-4. Finish Java-compatible server rejection reporting through bounded pollable
+3. Decouple reconnect/backoff/restart from local publication: a reconnect in
+   progress must not block new local publications while capacity remains.
+4. Add Java-compatible high-level close/drain semantics. Rust `Drop` cannot
+   return errors, so the explicit API shape must be decided before accepting
+   `close_flush_timeout_millis`.
+5. Finish Java-compatible server rejection reporting through bounded pollable
    public/FFI surfaces without adding Rust-only dead-letter files, client-owned
    quarantine, or mandatory callbacks.
-5. Wire the C ABI stubs to the real queue/driver core.
-6. Add receipt-oriented threaded/async adapters, C++ wrappers, and Python
+6. Wire the C ABI stubs to the real queue/driver core.
+7. Add receipt-oriented threaded/async adapters, C++ wrappers, and Python
    wrappers after the core public semantics are stable.
 
 ## Tests
@@ -1430,7 +1483,11 @@ Rust core tests:
 - high-level `Sender::flush_and_keep()` has the same delivery semantics and
   preserves the caller buffer,
 - two high-level `flush()` calls can pipeline before the first ACK,
-- a full cursor blocks until ACK-driven trim frees capacity or the append
+- a blocked transport send does not block another local publication while
+  capacity remains,
+- a blocked reconnect/backoff loop does not block another local publication
+  while capacity remains,
+- a full cursor blocks until resolved-frame trim frees capacity or the append
   deadline expires,
 - manual sender construction validates initial connection without starting a thread,
 - `initial_connect_retry=true` retries startup connection with the reconnect
@@ -1464,7 +1521,7 @@ Rust core tests:
 - recovery ignores a torn tail in the same way as Java and appends at the first
   invalid frame offset,
 - ACK/drop-and-continue rejection does not create Rust-only disk records; only
-  ACK-driven segment trim changes the retained `.sfa` set,
+  resolved-frame segment trim changes the retained `.sfa` set,
 - SF segment frames store unmasked QWP payload bytes, not WebSocket headers or masked payloads,
 - replaying the same stored frame can use a fresh WebSocket mask key without changing the stored bytes,
 - masked server-to-client WebSocket frames are rejected as protocol errors.
@@ -1492,7 +1549,8 @@ C ABI tests:
 System tests:
 
 - live QuestDB QWP/WebSocket ingestion,
-- public sync `Sender` SFA recovery after a failed flush against live QuestDB,
+- public sync `Sender` SFA recovery after local publication and disconnect
+  against live QuestDB,
 - many in-flight batches,
 - schema expansion across batches,
 - arrays, decimals, timestamps, UTF-8, sparse columns,

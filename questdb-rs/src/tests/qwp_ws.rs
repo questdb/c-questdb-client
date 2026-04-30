@@ -32,7 +32,6 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use crate::ErrorCode;
 use crate::ingress::{
     Protocol, QwpWsDeliveryOutcome, QwpWsDriveOutcome, QwpWsReceiptStatus, SenderBuilder,
 };
@@ -156,6 +155,28 @@ fn compute_accept(key_b64: &str) -> String {
     let combined = format!("{key_b64}{WS_GUID}");
     let digest = sha1(combined.as_bytes());
     Base64::encode_string(&digest)
+}
+
+fn upgrade_mock_stream(stream: &mut TcpStream) -> Vec<String> {
+    let req_bytes = read_request_until_blank(stream).unwrap();
+    let req = String::from_utf8_lossy(&req_bytes).to_string();
+    let request_lines: Vec<String> = req
+        .split("\r\n")
+        .take_while(|l| !l.is_empty())
+        .map(String::from)
+        .collect();
+    let key = parse_header(&req, "Sec-WebSocket-Key").expect("missing Sec-WebSocket-Key");
+    let accept = compute_accept(&key);
+    let response = format!(
+        "HTTP/1.1 101 Switching Protocols\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Accept: {accept}\r\n\
+         X-QWP-Version: 1\r\n\
+         \r\n"
+    );
+    stream.write_all(response.as_bytes()).unwrap();
+    request_lines
 }
 
 // Mirror of the production SHA-1 used by the sender, reproduced here to
@@ -908,16 +929,31 @@ fn qwp_ws_server_error_response_is_surfaced() {
         .at_now()
         .unwrap();
 
+    sender.flush(&mut buf).unwrap();
+    assert!(buf.is_empty());
+
+    thread::sleep(Duration::from_millis(100));
+
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 2)
+        .unwrap()
+        .at_now()
+        .unwrap();
     let err = sender.flush(&mut buf).unwrap_err();
     assert!(
         err.msg().contains("bad column"),
         "expected server error in message, got: {}",
         err.msg()
     );
+    assert!(
+        !buf.is_empty(),
+        "terminal async error must not clear a newly prepared buffer"
+    );
 }
 
 #[test]
-fn qwp_ws_schema_rejection_surfaces_error_and_sender_continues() {
+fn qwp_ws_schema_rejection_drops_and_sender_continues() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::channel();
@@ -975,16 +1011,9 @@ fn qwp_ws_schema_rejection_surfaces_error_and_sender_continues() {
         .at_now()
         .unwrap();
 
-    let err = sender.flush(&mut buf).unwrap_err();
-    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
-    assert!(
-        err.msg().contains("QWP schema mismatch") && err.msg().contains("bad schema"),
-        "expected schema rejection in message, got: {}",
-        err.msg()
-    );
-    assert!(!buf.is_empty(), "failed flush must leave the buffer intact");
+    sender.flush(&mut buf).unwrap();
+    assert!(buf.is_empty());
 
-    buf.clear();
     buf.table("trades")
         .unwrap()
         .column_i64("qty", 2)
@@ -996,6 +1025,147 @@ fn qwp_ws_schema_rejection_surfaces_error_and_sender_continues() {
 
     let received_frames = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(received_frames.len(), 2);
+}
+
+#[test]
+fn qwp_ws_high_level_flush_returns_before_ack() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (frame_tx, frame_rx) = mpsc::channel();
+    let (ack_tx, ack_rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        upgrade_mock_stream(&mut stream);
+
+        let (_fin, _opcode, payload) = read_frame(&mut stream).unwrap();
+        frame_tx.send(payload).unwrap();
+        ack_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        write_qwp_ok_response(&mut stream, FIRST_WIRE_SEQUENCE).unwrap();
+        thread::sleep(Duration::from_millis(50));
+    });
+
+    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+        .build()
+        .unwrap();
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 1)
+        .unwrap()
+        .at_now()
+        .unwrap();
+
+    sender.flush(&mut buf).unwrap();
+    assert!(buf.is_empty());
+    let frame = frame_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(&frame[0..4], b"QWP1");
+    ack_tx.send(()).unwrap();
+}
+
+#[test]
+fn qwp_ws_high_level_flush_and_keep_returns_before_ack_and_preserves_buffer() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (frame_tx, frame_rx) = mpsc::channel();
+    let (ack_tx, ack_rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        upgrade_mock_stream(&mut stream);
+
+        let (_fin, _opcode, payload) = read_frame(&mut stream).unwrap();
+        frame_tx.send(payload).unwrap();
+        ack_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        write_qwp_ok_response(&mut stream, FIRST_WIRE_SEQUENCE).unwrap();
+        thread::sleep(Duration::from_millis(50));
+    });
+
+    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+        .build()
+        .unwrap();
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 1)
+        .unwrap()
+        .at_now()
+        .unwrap();
+
+    sender.flush_and_keep(&buf).unwrap();
+    assert!(!buf.is_empty());
+    let frame = frame_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(&frame[0..4], b"QWP1");
+    ack_tx.send(()).unwrap();
+}
+
+#[test]
+fn qwp_ws_high_level_flushes_pipeline_before_ack() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (frames_tx, frames_rx) = mpsc::channel();
+    let (ack_tx, ack_rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        upgrade_mock_stream(&mut stream);
+
+        let mut frames = Vec::new();
+        let (_fin, _opcode, first) = read_frame(&mut stream).unwrap();
+        frames.push(first);
+        let (_fin, _opcode, second) = read_frame(&mut stream).unwrap();
+        frames.push(second);
+        frames_tx.send(frames).unwrap();
+        ack_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        write_qwp_ok_response(&mut stream, FIRST_WIRE_SEQUENCE + 1).unwrap();
+        thread::sleep(Duration::from_millis(50));
+    });
+
+    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+        .max_in_flight(2)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 1)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    sender.flush(&mut buf).unwrap();
+
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 2)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    sender.flush(&mut buf).unwrap();
+
+    let frames = frames_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(frames.len(), 2);
+    assert!(frames.iter().all(|frame| &frame[0..4] == b"QWP1"));
+    ack_tx.send(()).unwrap();
 }
 
 // ---------- reconnect tests ----------

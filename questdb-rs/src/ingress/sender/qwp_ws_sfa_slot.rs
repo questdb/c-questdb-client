@@ -41,8 +41,8 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 
-use super::qwp_ws_driver::{DriverError, ManualDriverQueue};
-use super::qwp_ws_queue::{OutboundFrame, QwpReceipt, QwpReceiptStatus, SentFrame};
+use super::qwp_ws_driver::{DriverError, PublicationLog};
+use super::qwp_ws_queue::{QwpReceipt, QwpReceiptStatus, SharedPayload};
 use super::qwp_ws_sfa_queue::{SfaFrameQueue, SfaQueueError, SfaQueueOptions};
 use crate::ingress::conf::{QWP_WS_DEFAULT_SENDER_ID, is_valid_qwp_ws_sender_id};
 
@@ -106,33 +106,29 @@ impl Drop for SfaSlotQueue {
     }
 }
 
-impl ManualDriverQueue for SfaSlotQueue {
-    fn try_submit(&mut self, payload: &[u8]) -> Result<QwpReceipt, DriverError> {
+impl PublicationLog for SfaSlotQueue {
+    fn try_publish(&mut self, payload: &[u8]) -> Result<QwpReceipt, DriverError> {
         Ok(self.queue.try_submit(payload)?)
     }
 
-    fn next_outbound_frame(&self) -> Result<OutboundFrame<'_>, DriverError> {
-        Ok(self.queue.next_outbound_frame()?)
+    fn shared_payload_for_fsn(&self, fsn: u64) -> Result<Option<SharedPayload>, DriverError> {
+        Ok(self.queue.shared_payload_for_fsn(fsn))
     }
 
-    fn commit_sent(&mut self, frame: SentFrame) -> Result<(), DriverError> {
-        Ok(self.queue.commit_sent(frame)?)
+    fn oldest_unresolved_fsn(&self) -> Option<u64> {
+        self.queue.oldest_unresolved_fsn()
     }
 
-    fn ack_wire(&mut self, wire_seq: u64) -> Result<(), DriverError> {
-        Ok(self.queue.ack_wire(wire_seq)?)
-    }
-
-    fn reject_wire(&mut self, wire_seq: u64) -> Result<QwpReceipt, DriverError> {
-        Ok(self.queue.reject_wire(wire_seq)?)
+    fn complete_through(&mut self, fsn: u64) -> Result<(), DriverError> {
+        Ok(self.queue.complete_through_fsn(fsn)?)
     }
 
     fn close(&mut self) -> Result<(), DriverError> {
         Ok(SfaSlotQueue::close(self)?)
     }
 
-    fn restart_connection(&mut self) {
-        self.queue.restart_connection();
+    fn reject_fsn(&mut self, fsn: u64) -> Result<QwpReceipt, DriverError> {
+        Ok(self.queue.reject_fsn(fsn)?)
     }
 
     fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus {
@@ -147,8 +143,8 @@ impl ManualDriverQueue for SfaSlotQueue {
         self.queue.completed_fsn()
     }
 
-    fn fsn_for_wire_seq(&self, wire_seq: u64) -> Result<u64, DriverError> {
-        Ok(self.queue.fsn_for_wire_seq(wire_seq)?)
+    fn max_in_flight(&self) -> usize {
+        self.queue.max_in_flight()
     }
 }
 

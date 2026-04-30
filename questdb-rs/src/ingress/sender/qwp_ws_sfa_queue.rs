@@ -35,12 +35,13 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error;
 
-use super::qwp_ws_driver::{DriverError, ManualDriverQueue};
-use super::qwp_ws_queue::{OutboundFrame, QueueError, QwpReceipt, QwpReceiptStatus, SentFrame};
+use super::qwp_ws_driver::{DriverError, PublicationLog};
+use super::qwp_ws_queue::{QueueError, QwpReceipt, QwpReceiptStatus, SharedPayload};
 use super::qwp_ws_sfa_segment::{
     FRAME_HEADER_SIZE, HEADER_SIZE, INITIAL_SEGMENT_FILE_NAME, SfaFrame, SfaSegment,
     SfaSegmentError, initial_segment_path, scan_file, spare_segment_path,
@@ -112,11 +113,9 @@ pub(crate) struct SfaFrameQueue {
     segment_size_bytes: u64,
     next_fsn: u64,
     published_fsn: Option<u64>,
-    server_acked_fsn: Option<u64>,
     completed_fsn: Option<u64>,
     rejected_fsns: Vec<u64>,
-    connection: ConnectionState,
-    in_flight: InFlightRing,
+    max_in_flight: usize,
     next_generation: u64,
     closed: bool,
 }
@@ -156,7 +155,7 @@ impl SfaFrameQueue {
             };
 
         let published_fsn = next_fsn.checked_sub(1);
-        let server_acked_fsn = frames.front().and_then(|frame| frame.fsn.checked_sub(1));
+        let completed_fsn = frames.front().and_then(|frame| frame.fsn.checked_sub(1));
 
         Ok(Self {
             slot_dir: options.slot_dir,
@@ -169,11 +168,9 @@ impl SfaFrameQueue {
             segment_size_bytes: options.segment_size_bytes,
             next_fsn,
             published_fsn,
-            server_acked_fsn,
-            completed_fsn: server_acked_fsn,
+            completed_fsn,
             rejected_fsns: Vec::new(),
-            connection: ConnectionState::default(),
-            in_flight: InFlightRing::new(options.max_in_flight),
+            max_in_flight: options.max_in_flight,
             next_generation,
             closed: false,
         })
@@ -202,145 +199,58 @@ impl SfaFrameQueue {
             .next_fsn
             .checked_add(1)
             .ok_or(QueueError::SequenceOverflow)?;
-        self.append_to_active(payload)?;
+        let stored_payload: SharedPayload = Arc::from(payload);
+        self.append_to_active(stored_payload.as_ref())?;
 
         self.next_fsn = next_fsn;
         self.published_fsn = Some(fsn);
-        self.bytes_used += payload.len();
+        self.bytes_used += stored_payload.len();
         self.frames.push_back(SfaQueuedFrame {
             fsn,
-            payload: payload.to_vec(),
-            state: FrameState::Published,
+            payload: stored_payload,
         });
 
         Ok(QwpReceipt { fsn })
     }
 
-    pub(crate) fn send_next(&mut self) -> Result<SentFrame, SfaQueueError> {
-        let frame = {
-            let outbound = self.next_outbound_frame()?;
-            outbound.sent_frame()
-        };
-        self.commit_sent(frame)?;
-        Ok(frame)
-    }
-
-    pub(crate) fn next_outbound_frame(&self) -> Result<OutboundFrame<'_>, SfaQueueError> {
-        if self.in_flight.is_full() {
-            return Err(QueueError::MaxInFlightReached {
-                max_in_flight: self.in_flight.capacity(),
-            }
-            .into());
-        }
-
-        let Some(offset) = self.first_published_offset() else {
-            return Err(QueueError::NoUnsentFrame.into());
-        };
-
-        let wire_seq = self.connection.next_wire_seq;
-        wire_seq
-            .checked_add(1)
-            .ok_or(QueueError::SequenceOverflow)?;
-
-        let frame = &self.frames[offset];
-        Ok(OutboundFrame {
-            fsn: frame.fsn,
-            wire_seq,
-            payload: &frame.payload,
-        })
-    }
-
-    pub(crate) fn commit_sent(&mut self, frame: SentFrame) -> Result<(), SfaQueueError> {
-        if self.in_flight.is_full() {
-            return Err(QueueError::MaxInFlightReached {
-                max_in_flight: self.in_flight.capacity(),
-            }
-            .into());
-        }
-
-        let Some(offset) = self.first_published_offset() else {
-            return Err(QueueError::NoUnsentFrame.into());
-        };
-        let stored = &self.frames[offset];
-        if stored.fsn != frame.fsn
-            || !matches!(stored.state, FrameState::Published)
-            || stored.payload.len() != frame.payload_len
-            || self.connection.next_wire_seq != frame.wire_seq
-        {
-            return Err(QueueError::OutboundFrameUnavailable {
-                fsn: frame.fsn,
-                wire_seq: frame.wire_seq,
-            }
-            .into());
-        }
-        let next_wire_seq = self
-            .connection
-            .next_wire_seq
-            .checked_add(1)
-            .ok_or(QueueError::SequenceOverflow)?;
-
-        self.ensure_connection_started()?;
-        self.connection.next_wire_seq = next_wire_seq;
-        self.connection.last_sent_wire_seq = Some(frame.wire_seq);
-
-        let stored = &mut self.frames[offset];
-        stored.state = FrameState::Sent {
-            wire_seq: frame.wire_seq,
-        };
-        self.in_flight.push(InFlightSlot {
-            fsn: stored.fsn,
-            wire_seq: frame.wire_seq,
-        })?;
-        Ok(())
-    }
-
-    pub(crate) fn ack_wire(&mut self, wire_seq: u64) -> Result<(), SfaQueueError> {
-        let acked_fsn = self.fsn_for_wire(wire_seq, AckKind::Ack)?;
-
-        if self
-            .server_acked_fsn
-            .is_some_and(|server_acked_fsn| acked_fsn <= server_acked_fsn)
-        {
-            self.trim_acked_sealed_segments()?;
-            return Ok(());
-        }
+    pub(crate) fn complete_through_fsn(&mut self, acked_fsn: u64) -> Result<(), SfaQueueError> {
         if self
             .completed_fsn
             .is_some_and(|completed_fsn| acked_fsn <= completed_fsn)
         {
-            self.advance_server_acked_to(acked_fsn);
             self.trim_acked_sealed_segments()?;
             return Ok(());
         }
+        let Some(published_fsn) = self.published_fsn else {
+            return Err(QueueError::ProtocolAckedUnsentFrame { fsn: acked_fsn }.into());
+        };
+        if acked_fsn > published_fsn {
+            return Err(QueueError::ProtocolAckedUnsentFrame { fsn: acked_fsn }.into());
+        }
 
-        self.ensure_ackable_through(acked_fsn)?;
         self.apply_ack_through(acked_fsn);
-        self.advance_server_acked_to(acked_fsn);
         self.trim_acked_sealed_segments()?;
         Ok(())
     }
 
-    pub(crate) fn reject_wire(&mut self, wire_seq: u64) -> Result<QwpReceipt, SfaQueueError> {
-        let rejected_fsn = self.fsn_for_wire(wire_seq, AckKind::Reject)?;
-        self.ensure_rejectable(rejected_fsn)?;
-
-        if rejected_fsn > 0 {
-            self.advance_server_acked_to(rejected_fsn - 1);
+    pub(crate) fn reject_fsn(&mut self, rejected_fsn: u64) -> Result<QwpReceipt, SfaQueueError> {
+        if self
+            .published_fsn
+            .is_none_or(|published_fsn| rejected_fsn > published_fsn)
+        {
+            return Err(QueueError::ProtocolRejectedUnsentFrame { fsn: rejected_fsn }.into());
         }
+        if self.payload_for_fsn(rejected_fsn).is_none() {
+            return Err(QueueError::ProtocolRejectedUnsentFrame { fsn: rejected_fsn }.into());
+        }
+
         self.apply_rejection(rejected_fsn);
+        if !self.rejected_fsns.contains(&rejected_fsn) {
+            self.rejected_fsns.push(rejected_fsn);
+        }
         self.trim_acked_sealed_segments()?;
 
         Ok(QwpReceipt { fsn: rejected_fsn })
-    }
-
-    pub(crate) fn restart_connection(&mut self) {
-        self.in_flight.clear();
-        self.connection = ConnectionState::default();
-        for frame in &mut self.frames {
-            if matches!(frame.state, FrameState::Sent { .. }) {
-                frame.state = FrameState::Published;
-            }
-        }
     }
 
     pub(crate) fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus {
@@ -362,18 +272,23 @@ impl SfaFrameQueue {
         }
 
         if let Some(frame) = self.frame_for_fsn(fsn) {
-            return match frame.state {
-                FrameState::Published => QwpReceiptStatus::Published { fsn },
-                FrameState::Sent { wire_seq } => QwpReceiptStatus::Sent { fsn, wire_seq },
-            };
+            return QwpReceiptStatus::Published { fsn: frame.fsn };
         }
 
         QwpReceiptStatus::Unknown { fsn }
     }
 
     pub(crate) fn payload_for_fsn(&self, fsn: u64) -> Option<&[u8]> {
+        self.frame_for_fsn(fsn).map(|frame| frame.payload.as_ref())
+    }
+
+    pub(crate) fn shared_payload_for_fsn(&self, fsn: u64) -> Option<SharedPayload> {
         self.frame_for_fsn(fsn)
-            .map(|frame| frame.payload.as_slice())
+            .map(|frame| Arc::clone(&frame.payload))
+    }
+
+    pub(crate) fn oldest_unresolved_fsn(&self) -> Option<u64> {
+        self.frames.front().map(|frame| frame.fsn)
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -384,24 +299,16 @@ impl SfaFrameQueue {
         self.bytes_used
     }
 
-    pub(crate) fn in_flight_len(&self) -> usize {
-        self.in_flight.len()
-    }
-
-    pub(crate) fn fsn_at_zero(&self) -> Option<u64> {
-        self.connection.fsn_at_zero
-    }
-
     pub(crate) fn published_fsn(&self) -> Option<u64> {
         self.published_fsn
     }
 
-    pub(crate) fn server_acked_fsn(&self) -> Option<u64> {
-        self.server_acked_fsn
-    }
-
     pub(crate) fn completed_fsn(&self) -> Option<u64> {
         self.completed_fsn
+    }
+
+    pub(crate) fn max_in_flight(&self) -> usize {
+        self.max_in_flight
     }
 
     fn validate_submit(&self, payload: &[u8]) -> Result<(), QueueError> {
@@ -500,7 +407,7 @@ impl SfaFrameQueue {
     }
 
     fn trim_acked_sealed_segments(&mut self) -> Result<(), SfaQueueError> {
-        let Some(acked_fsn) = self.server_acked_fsn else {
+        let Some(acked_fsn) = self.completed_fsn else {
             return Ok(());
         };
 
@@ -519,89 +426,6 @@ impl SfaFrameQueue {
         Ok(())
     }
 
-    fn ensure_connection_started(&mut self) -> Result<(), QueueError> {
-        if self.connection.fsn_at_zero.is_none() {
-            self.connection.fsn_at_zero = Some(self.oldest_unresolved_fsn()?);
-        }
-        Ok(())
-    }
-
-    fn oldest_unresolved_fsn(&self) -> Result<u64, QueueError> {
-        self.frames
-            .front()
-            .map(|frame| frame.fsn)
-            .ok_or(QueueError::NoUnsentFrame)
-    }
-
-    fn first_published_offset(&self) -> Option<usize> {
-        self.frames
-            .iter()
-            .position(|frame| matches!(frame.state, FrameState::Published))
-    }
-
-    fn fsn_for_wire(&self, wire_seq: u64, kind: AckKind) -> Result<u64, QueueError> {
-        let Some(fsn_at_zero) = self.connection.fsn_at_zero else {
-            return Err(match kind {
-                AckKind::Ack => QueueError::ProtocolAckWithoutConnection,
-                AckKind::Reject => QueueError::ProtocolRejectWithoutConnection,
-            });
-        };
-        let last_sent_wire_seq = self.connection.last_sent_wire_seq;
-        if last_sent_wire_seq.is_none_or(|last_sent| wire_seq > last_sent) {
-            return Err(match kind {
-                AckKind::Ack => QueueError::ProtocolAckBeyondSent {
-                    wire_seq,
-                    last_sent_wire_seq,
-                },
-                AckKind::Reject => QueueError::ProtocolRejectBeyondSent {
-                    wire_seq,
-                    last_sent_wire_seq,
-                },
-            });
-        }
-
-        fsn_at_zero
-            .checked_add(wire_seq)
-            .ok_or(QueueError::SequenceOverflow)
-    }
-
-    fn ensure_ackable_through(&self, acked_fsn: u64) -> Result<(), QueueError> {
-        for frame in &self.frames {
-            if frame.fsn > acked_fsn {
-                break;
-            }
-            if !matches!(frame.state, FrameState::Sent { .. }) {
-                return Err(QueueError::ProtocolAckedUnsentFrame { fsn: frame.fsn });
-            }
-        }
-        Ok(())
-    }
-
-    fn ensure_rejectable(&self, rejected_fsn: u64) -> Result<(), QueueError> {
-        let mut saw_rejected = false;
-        for frame in &self.frames {
-            if frame.fsn > rejected_fsn {
-                break;
-            }
-            if !matches!(frame.state, FrameState::Sent { .. }) {
-                return if frame.fsn == rejected_fsn {
-                    Err(QueueError::ProtocolRejectedUnsentFrame { fsn: frame.fsn })
-                } else {
-                    Err(QueueError::ProtocolAckedUnsentFrame { fsn: frame.fsn })
-                };
-            }
-            if frame.fsn == rejected_fsn {
-                saw_rejected = true;
-            }
-        }
-
-        if saw_rejected {
-            Ok(())
-        } else {
-            Err(QueueError::ProtocolRejectedUnsentFrame { fsn: rejected_fsn })
-        }
-    }
-
     fn apply_ack_through(&mut self, acked_fsn: u64) {
         while self
             .frames
@@ -612,8 +436,6 @@ impl SfaFrameQueue {
             self.bytes_used -= frame.payload.len();
             self.completed_fsn = Some(frame.fsn);
         }
-
-        self.in_flight.pop_acked_through(acked_fsn);
     }
 
     fn apply_rejection(&mut self, rejected_fsn: u64) {
@@ -625,31 +447,6 @@ impl SfaFrameQueue {
             let frame = self.frames.pop_front().unwrap();
             self.bytes_used -= frame.payload.len();
             self.completed_fsn = Some(frame.fsn);
-        }
-
-        self.rejected_fsns.push(rejected_fsn);
-        self.in_flight.pop_acked_through(rejected_fsn);
-    }
-
-    fn advance_server_acked_to(&mut self, acked_fsn: u64) {
-        let candidate = match self
-            .rejected_fsns
-            .iter()
-            .copied()
-            .filter(|rejected_fsn| *rejected_fsn <= acked_fsn)
-            .min()
-        {
-            Some(0) => None,
-            Some(first_rejected_fsn) => Some(first_rejected_fsn - 1),
-            None => Some(acked_fsn),
-        };
-
-        if let Some(candidate) = candidate
-            && self
-                .server_acked_fsn
-                .is_none_or(|server_acked_fsn| candidate > server_acked_fsn)
-        {
-            self.server_acked_fsn = Some(candidate);
         }
     }
 
@@ -679,33 +476,29 @@ impl SfaFrameQueue {
     }
 }
 
-impl ManualDriverQueue for SfaFrameQueue {
-    fn try_submit(&mut self, payload: &[u8]) -> Result<QwpReceipt, DriverError> {
+impl PublicationLog for SfaFrameQueue {
+    fn try_publish(&mut self, payload: &[u8]) -> Result<QwpReceipt, DriverError> {
         Ok(SfaFrameQueue::try_submit(self, payload)?)
     }
 
-    fn next_outbound_frame(&self) -> Result<OutboundFrame<'_>, DriverError> {
-        Ok(SfaFrameQueue::next_outbound_frame(self)?)
+    fn shared_payload_for_fsn(&self, fsn: u64) -> Result<Option<SharedPayload>, DriverError> {
+        Ok(SfaFrameQueue::shared_payload_for_fsn(self, fsn))
     }
 
-    fn commit_sent(&mut self, frame: SentFrame) -> Result<(), DriverError> {
-        Ok(SfaFrameQueue::commit_sent(self, frame)?)
+    fn oldest_unresolved_fsn(&self) -> Option<u64> {
+        SfaFrameQueue::oldest_unresolved_fsn(self)
     }
 
-    fn ack_wire(&mut self, wire_seq: u64) -> Result<(), DriverError> {
-        Ok(SfaFrameQueue::ack_wire(self, wire_seq)?)
-    }
-
-    fn reject_wire(&mut self, wire_seq: u64) -> Result<QwpReceipt, DriverError> {
-        Ok(SfaFrameQueue::reject_wire(self, wire_seq)?)
+    fn complete_through(&mut self, fsn: u64) -> Result<(), DriverError> {
+        Ok(SfaFrameQueue::complete_through_fsn(self, fsn)?)
     }
 
     fn close(&mut self) -> Result<(), DriverError> {
         Ok(SfaFrameQueue::close(self)?)
     }
 
-    fn restart_connection(&mut self) {
-        SfaFrameQueue::restart_connection(self);
+    fn reject_fsn(&mut self, fsn: u64) -> Result<QwpReceipt, DriverError> {
+        Ok(SfaFrameQueue::reject_fsn(self, fsn)?)
     }
 
     fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus {
@@ -720,8 +513,8 @@ impl ManualDriverQueue for SfaFrameQueue {
         SfaFrameQueue::completed_fsn(self)
     }
 
-    fn fsn_for_wire_seq(&self, wire_seq: u64) -> Result<u64, DriverError> {
-        Ok(self.fsn_for_wire(wire_seq, AckKind::Ack)?)
+    fn max_in_flight(&self) -> usize {
+        SfaFrameQueue::max_in_flight(self)
     }
 }
 
@@ -802,8 +595,7 @@ fn recover_segments(options: &SfaQueueOptions) -> Result<Option<RecoveredSegment
             validate_recovered_frame(frame, &mut bytes_used, options)?;
             frames.push_back(SfaQueuedFrame {
                 fsn: frame.fsn,
-                payload: frame.payload.clone(),
-                state: FrameState::Published,
+                payload: Arc::from(frame.payload.as_slice()),
             });
         }
     }
@@ -971,94 +763,7 @@ impl SfaSegmentMeta {
 #[derive(Debug)]
 struct SfaQueuedFrame {
     fsn: u64,
-    payload: Vec<u8>,
-    state: FrameState,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FrameState {
-    Published,
-    Sent { wire_seq: u64 },
-}
-
-#[derive(Debug, Default)]
-struct ConnectionState {
-    fsn_at_zero: Option<u64>,
-    next_wire_seq: u64,
-    last_sent_wire_seq: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct InFlightSlot {
-    fsn: u64,
-    wire_seq: u64,
-}
-
-#[derive(Debug)]
-struct InFlightRing {
-    slots: Vec<InFlightSlot>,
-    head: usize,
-    len: usize,
-}
-
-impl InFlightRing {
-    fn new(capacity: usize) -> Self {
-        Self {
-            slots: vec![InFlightSlot::default(); capacity],
-            head: 0,
-            len: 0,
-        }
-    }
-
-    fn capacity(&self) -> usize {
-        self.slots.len()
-    }
-
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    fn is_full(&self) -> bool {
-        self.len == self.slots.len()
-    }
-
-    fn push(&mut self, slot: InFlightSlot) -> Result<(), QueueError> {
-        if self.is_full() {
-            return Err(QueueError::MaxInFlightReached {
-                max_in_flight: self.capacity(),
-            });
-        }
-        let tail = self.slot_index(self.len);
-        self.slots[tail] = slot;
-        self.len += 1;
-        Ok(())
-    }
-
-    fn pop_acked_through(&mut self, acked_fsn: u64) {
-        while self.len > 0 {
-            let slot = self.slots[self.head];
-            if slot.fsn > acked_fsn {
-                break;
-            }
-            self.head = (self.head + 1) % self.slots.len();
-            self.len -= 1;
-        }
-    }
-
-    fn clear(&mut self) {
-        self.head = 0;
-        self.len = 0;
-    }
-
-    fn slot_index(&self, offset: usize) -> usize {
-        (self.head + offset) % self.slots.len()
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum AckKind {
-    Ack,
-    Reject,
+    payload: SharedPayload,
 }
 
 #[cfg(test)]
@@ -1151,29 +856,14 @@ mod tests {
         )
         .unwrap();
 
-        let mut queue = open(&dir);
+        let queue = open(&dir);
 
         assert_eq!(queue.len(), 2);
         assert_eq!(queue.published_fsn(), Some(43));
-        assert_eq!(queue.server_acked_fsn(), Some(41));
+        assert_eq!(queue.completed_fsn(), Some(41));
+        assert_eq!(queue.oldest_unresolved_fsn(), Some(42));
         assert_eq!(queue.payload_for_fsn(42), Some(&b"one"[..]));
         assert_eq!(queue.payload_for_fsn(43), Some(&b"two-two"[..]));
-        assert_eq!(
-            queue.send_next().unwrap(),
-            SentFrame {
-                fsn: 42,
-                wire_seq: 0,
-                payload_len: 3,
-            }
-        );
-        assert_eq!(
-            queue.send_next().unwrap(),
-            SentFrame {
-                fsn: 43,
-                wire_seq: 1,
-                payload_len: 7,
-            }
-        );
     }
 
     #[test]
@@ -1231,8 +921,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let mut queue = open(&dir);
         queue.try_submit(b"first").unwrap();
-        queue.send_next().unwrap();
-        queue.ack_wire(0).unwrap();
+        queue.complete_through_fsn(0).unwrap();
 
         queue.close().unwrap();
 
@@ -1247,8 +936,7 @@ mod tests {
             let mut queue = open(&dir);
             first = queue.try_submit(b"first").unwrap();
             queue.try_submit(b"second").unwrap();
-            queue.send_next().unwrap();
-            queue.ack_wire(0).unwrap();
+            queue.complete_through_fsn(0).unwrap();
 
             assert_eq!(
                 queue.receipt_status(first),
@@ -1256,35 +944,22 @@ mod tests {
             );
         }
 
-        let mut recovered = open(&dir);
+        let recovered = open(&dir);
 
         assert_eq!(
             recovered.receipt_status(first),
             QwpReceiptStatus::Published { fsn: 0 }
         );
-        assert_eq!(
-            recovered.send_next().unwrap(),
-            SentFrame {
-                fsn: 0,
-                wire_seq: 0,
-                payload_len: 5,
-            }
-        );
+        assert_eq!(recovered.payload_for_fsn(0), Some(&b"first"[..]));
     }
 
     #[test]
-    fn restart_replays_sent_frames_with_zero_based_wire_sequence() {
+    fn unresolved_frames_remain_published_until_completion() {
         let dir = TempDir::new().unwrap();
         let mut queue = open(&dir);
         let first = queue.try_submit(b"first").unwrap();
         let second = queue.try_submit(b"second").unwrap();
 
-        queue.send_next().unwrap();
-        queue.send_next().unwrap();
-        queue.restart_connection();
-
-        assert_eq!(queue.fsn_at_zero(), None);
-        assert_eq!(queue.in_flight_len(), 0);
         assert_eq!(
             queue.receipt_status(first),
             QwpReceiptStatus::Published { fsn: 0 }
@@ -1293,14 +968,8 @@ mod tests {
             queue.receipt_status(second),
             QwpReceiptStatus::Published { fsn: 1 }
         );
-        assert_eq!(
-            queue.send_next().unwrap(),
-            SentFrame {
-                fsn: 0,
-                wire_seq: 0,
-                payload_len: 5,
-            }
-        );
+        assert_eq!(queue.payload_for_fsn(0), Some(&b"first"[..]));
+        assert_eq!(queue.payload_for_fsn(1), Some(&b"second"[..]));
     }
 
     #[test]
@@ -1319,11 +988,10 @@ mod tests {
         assert_eq!(scan_file(&first_path).unwrap().header.base_seq, 0);
         assert_eq!(scan_file(&second_path).unwrap().header.base_seq, 1);
 
-        let mut recovered = SfaFrameQueue::open(options_with(&dir, 38, 8, 1024, 4)).unwrap();
+        let recovered = SfaFrameQueue::open(options_with(&dir, 38, 8, 1024, 4)).unwrap();
         assert_eq!(recovered.payload_for_fsn(0), Some(&b"first"[..]));
         assert_eq!(recovered.payload_for_fsn(1), Some(&b"second"[..]));
-        assert_eq!(recovered.send_next().unwrap().fsn, 0);
-        assert_eq!(recovered.send_next().unwrap().fsn, 1);
+        assert_eq!(recovered.oldest_unresolved_fsn(), Some(0));
     }
 
     #[test]
@@ -1335,9 +1003,7 @@ mod tests {
         queue.try_submit(b"first").unwrap();
         queue.try_submit(b"second").unwrap();
 
-        queue.send_next().unwrap();
-        queue.send_next().unwrap();
-        queue.ack_wire(1).unwrap();
+        queue.complete_through_fsn(1).unwrap();
 
         assert!(!first_path.exists());
         assert!(second_path.exists());

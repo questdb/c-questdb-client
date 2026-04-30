@@ -30,6 +30,10 @@
 //! WebSocket I/O, disk Store-and-Forward, or public FFI shape. Frames are opaque
 //! QWP payload bytes; the replay encoder is validated separately.
 
+use std::sync::Arc;
+
+pub(crate) type SharedPayload = Arc<[u8]>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct QwpReceipt {
     pub(crate) fsn: u64,
@@ -68,14 +72,14 @@ pub(crate) struct SentFrame {
     pub(crate) payload_len: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct OutboundFrame<'a> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OutboundFrame {
     pub(crate) fsn: u64,
     pub(crate) wire_seq: u64,
-    pub(crate) payload: &'a [u8],
+    pub(crate) payload: SharedPayload,
 }
 
-impl OutboundFrame<'_> {
+impl OutboundFrame {
     pub(crate) fn sent_frame(&self) -> SentFrame {
         SentFrame {
             fsn: self.fsn,
@@ -137,11 +141,9 @@ pub(crate) struct VolatileFrameQueue {
     max_bytes: usize,
     next_fsn: u64,
     published_fsn: Option<u64>,
-    server_acked_fsn: Option<u64>,
     completed_fsn: Option<u64>,
     rejected_fsns: Vec<u64>,
-    connection: ConnectionState,
-    in_flight: InFlightRing,
+    max_in_flight: usize,
 }
 
 impl VolatileFrameQueue {
@@ -165,11 +167,9 @@ impl VolatileFrameQueue {
             max_bytes: options.max_bytes,
             next_fsn: 0,
             published_fsn: None,
-            server_acked_fsn: None,
             completed_fsn: None,
             rejected_fsns: Vec::new(),
-            connection: ConnectionState::default(),
-            in_flight: InFlightRing::new(options.max_in_flight),
+            max_in_flight: options.max_in_flight,
         })
     }
 
@@ -212,8 +212,7 @@ impl VolatileFrameQueue {
         let tail = self.slot_index(self.len);
         let slot = &mut self.slots[tail];
         slot.fsn = fsn;
-        slot.payload.clear();
-        slot.payload.extend_from_slice(payload);
+        slot.payload = Some(Arc::from(payload));
         slot.state = FrameState::Published;
 
         self.len += 1;
@@ -223,173 +222,67 @@ impl VolatileFrameQueue {
         Ok(QwpReceipt { fsn })
     }
 
-    pub(crate) fn send_next(&mut self) -> Result<SentFrame, QueueError> {
-        let frame = {
-            let outbound = self.next_outbound_frame()?;
-            outbound.sent_frame()
-        };
-        self.commit_sent(frame)?;
-        Ok(frame)
+    pub(crate) fn payload_for_fsn(&self, fsn: u64) -> Option<&[u8]> {
+        self.slot_for_fsn(fsn)
+            .filter(|slot| !matches!(slot.state, FrameState::Free))
+            .and_then(|slot| slot.payload.as_deref())
     }
 
-    pub(crate) fn next_outbound_frame(&self) -> Result<OutboundFrame<'_>, QueueError> {
-        if self.in_flight.is_full() {
-            return Err(QueueError::MaxInFlightReached {
-                max_in_flight: self.in_flight.capacity(),
-            });
-        }
-
-        let Some(offset) = self.first_published_offset() else {
-            return Err(QueueError::NoUnsentFrame);
-        };
-
-        let wire_seq = self.connection.next_wire_seq;
-        wire_seq
-            .checked_add(1)
-            .ok_or(QueueError::SequenceOverflow)?;
-
-        let index = self.slot_index(offset);
-        let slot = &self.slots[index];
-        Ok(OutboundFrame {
-            fsn: slot.fsn,
-            wire_seq,
-            payload: &slot.payload,
-        })
+    pub(crate) fn shared_payload_for_fsn(&self, fsn: u64) -> Option<SharedPayload> {
+        self.slot_for_fsn(fsn)
+            .filter(|slot| !matches!(slot.state, FrameState::Free))
+            .and_then(|slot| slot.payload.clone())
     }
 
-    pub(crate) fn commit_sent(&mut self, frame: SentFrame) -> Result<(), QueueError> {
-        if self.in_flight.is_full() {
-            return Err(QueueError::MaxInFlightReached {
-                max_in_flight: self.in_flight.capacity(),
-            });
-        }
-
-        let Some(offset) = self.first_published_offset() else {
-            return Err(QueueError::NoUnsentFrame);
-        };
-        let index = self.slot_index(offset);
-        let slot = &self.slots[index];
-        if slot.fsn != frame.fsn
-            || !matches!(slot.state, FrameState::Published)
-            || slot.payload.len() != frame.payload_len
-            || self.connection.next_wire_seq != frame.wire_seq
-        {
-            return Err(QueueError::OutboundFrameUnavailable {
-                fsn: frame.fsn,
-                wire_seq: frame.wire_seq,
-            });
-        }
-        let next_wire_seq = self
-            .connection
-            .next_wire_seq
-            .checked_add(1)
-            .ok_or(QueueError::SequenceOverflow)?;
-
-        self.ensure_connection_started()?;
-        self.connection.next_wire_seq = next_wire_seq;
-        self.connection.last_sent_wire_seq = Some(frame.wire_seq);
-
-        let slot = &mut self.slots[index];
-        slot.state = FrameState::Sent {
-            wire_seq: frame.wire_seq,
-        };
-        self.in_flight.push(InFlightSlot {
-            fsn: slot.fsn,
-            wire_seq: frame.wire_seq,
-        })?;
-        Ok(())
+    pub(crate) fn oldest_unresolved_fsn(&self) -> Option<u64> {
+        (self.len > 0).then(|| self.slots[self.head].fsn)
     }
 
-    pub(crate) fn ack_wire(&mut self, wire_seq: u64) -> Result<(), QueueError> {
-        let Some(fsn_at_zero) = self.connection.fsn_at_zero else {
-            return Err(QueueError::ProtocolAckWithoutConnection);
-        };
-        let last_sent_wire_seq = self.connection.last_sent_wire_seq;
-        if last_sent_wire_seq.is_none_or(|last_sent| wire_seq > last_sent) {
-            return Err(QueueError::ProtocolAckBeyondSent {
-                wire_seq,
-                last_sent_wire_seq,
-            });
-        }
-
-        let acked_fsn = fsn_at_zero
-            .checked_add(wire_seq)
-            .ok_or(QueueError::SequenceOverflow)?;
-
+    pub(crate) fn complete_through_fsn(&mut self, acked_fsn: u64) -> Result<(), QueueError> {
         if self
-            .server_acked_fsn
-            .is_some_and(|server_acked_fsn| acked_fsn <= server_acked_fsn)
+            .completed_fsn
+            .is_some_and(|completed_fsn| acked_fsn <= completed_fsn)
         {
             return Ok(());
         }
+        let Some(published_fsn) = self.published_fsn else {
+            return Err(QueueError::ProtocolAckedUnsentFrame { fsn: acked_fsn });
+        };
+        if acked_fsn > published_fsn {
+            return Err(QueueError::ProtocolAckedUnsentFrame { fsn: acked_fsn });
+        }
 
-        self.complete_through(acked_fsn)?;
-        self.advance_server_acked_to(acked_fsn);
+        while self.len > 0 && self.slots[self.head].fsn <= acked_fsn {
+            let head = self.head;
+            let fsn = self.slots[head].fsn;
+            if let Some(payload) = self.slots[head].payload.take() {
+                self.bytes_used -= payload.len();
+            }
+            self.slots[head].state = FrameState::Free;
+            self.completed_fsn = Some(fsn);
+            self.head = (self.head + 1) % self.slots.len();
+            self.len -= 1;
+        }
+
         Ok(())
     }
 
-    pub(crate) fn reject_wire(&mut self, wire_seq: u64) -> Result<QwpReceipt, QueueError> {
-        let Some(fsn_at_zero) = self.connection.fsn_at_zero else {
-            return Err(QueueError::ProtocolRejectWithoutConnection);
-        };
-        let last_sent_wire_seq = self.connection.last_sent_wire_seq;
-        if last_sent_wire_seq.is_none_or(|last_sent| wire_seq > last_sent) {
-            return Err(QueueError::ProtocolRejectBeyondSent {
-                wire_seq,
-                last_sent_wire_seq,
-            });
+    pub(crate) fn reject_fsn(&mut self, rejected_fsn: u64) -> Result<QwpReceipt, QueueError> {
+        if self
+            .published_fsn
+            .is_none_or(|published_fsn| rejected_fsn > published_fsn)
+        {
+            return Err(QueueError::ProtocolRejectedUnsentFrame { fsn: rejected_fsn });
+        }
+        if self.payload_for_fsn(rejected_fsn).is_none() {
+            return Err(QueueError::ProtocolRejectedUnsentFrame { fsn: rejected_fsn });
         }
 
-        let rejected_fsn = fsn_at_zero
-            .checked_add(wire_seq)
-            .ok_or(QueueError::SequenceOverflow)?;
-
-        if rejected_fsn > fsn_at_zero {
-            let prior_fsn = rejected_fsn - 1;
-            if self
-                .completed_fsn
-                .is_none_or(|completed_fsn| prior_fsn > completed_fsn)
-            {
-                self.complete_through(prior_fsn)?;
-            }
-            self.advance_server_acked_to(prior_fsn);
+        self.complete_through_fsn(rejected_fsn)?;
+        if !self.rejected_fsns.contains(&rejected_fsn) {
+            self.rejected_fsns.push(rejected_fsn);
         }
-
-        self.complete_rejected(rejected_fsn)?;
         Ok(QwpReceipt { fsn: rejected_fsn })
-    }
-
-    fn advance_server_acked_to(&mut self, acked_fsn: u64) {
-        let candidate = match self
-            .rejected_fsns
-            .iter()
-            .copied()
-            .filter(|rejected_fsn| *rejected_fsn <= acked_fsn)
-            .min()
-        {
-            Some(0) => None,
-            Some(first_rejected_fsn) => Some(first_rejected_fsn - 1),
-            None => Some(acked_fsn),
-        };
-
-        if let Some(candidate) = candidate
-            && self
-                .server_acked_fsn
-                .is_none_or(|server_acked_fsn| candidate > server_acked_fsn)
-        {
-            self.server_acked_fsn = Some(candidate);
-        }
-    }
-
-    pub(crate) fn restart_connection(&mut self) {
-        self.in_flight.clear();
-        self.connection = ConnectionState::default();
-        for offset in 0..self.len {
-            let index = self.slot_index(offset);
-            if matches!(self.slots[index].state, FrameState::Sent { .. }) {
-                self.slots[index].state = FrameState::Published;
-            }
-        }
     }
 
     pub(crate) fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus {
@@ -413,7 +306,6 @@ impl VolatileFrameQueue {
         if let Some(slot) = self.slot_for_fsn(fsn) {
             return match slot.state {
                 FrameState::Published => QwpReceiptStatus::Published { fsn },
-                FrameState::Sent { wire_seq } => QwpReceiptStatus::Sent { fsn, wire_seq },
                 FrameState::Free => QwpReceiptStatus::Unknown { fsn },
             };
         }
@@ -429,93 +321,16 @@ impl VolatileFrameQueue {
         self.bytes_used
     }
 
-    pub(crate) fn in_flight_len(&self) -> usize {
-        self.in_flight.len()
-    }
-
-    pub(crate) fn fsn_at_zero(&self) -> Option<u64> {
-        self.connection.fsn_at_zero
-    }
-
     pub(crate) fn published_fsn(&self) -> Option<u64> {
         self.published_fsn
-    }
-
-    pub(crate) fn server_acked_fsn(&self) -> Option<u64> {
-        self.server_acked_fsn
     }
 
     pub(crate) fn completed_fsn(&self) -> Option<u64> {
         self.completed_fsn
     }
 
-    fn ensure_connection_started(&mut self) -> Result<(), QueueError> {
-        if self.connection.fsn_at_zero.is_none() {
-            self.connection.fsn_at_zero = Some(self.oldest_unresolved_fsn()?);
-        }
-        Ok(())
-    }
-
-    fn oldest_unresolved_fsn(&self) -> Result<u64, QueueError> {
-        if self.len == 0 {
-            return Err(QueueError::NoUnsentFrame);
-        }
-        Ok(self.slots[self.head].fsn)
-    }
-
-    fn first_published_offset(&self) -> Option<usize> {
-        (0..self.len).find(|offset| {
-            let index = self.slot_index(*offset);
-            matches!(self.slots[index].state, FrameState::Published)
-        })
-    }
-
-    fn complete_through(&mut self, acked_fsn: u64) -> Result<(), QueueError> {
-        let mut complete_count = 0;
-        for offset in 0..self.len {
-            let index = self.slot_index(offset);
-            let slot = &self.slots[index];
-            if slot.fsn > acked_fsn {
-                break;
-            }
-            if !matches!(slot.state, FrameState::Sent { .. }) {
-                return Err(QueueError::ProtocolAckedUnsentFrame { fsn: slot.fsn });
-            }
-            complete_count += 1;
-        }
-
-        for _ in 0..complete_count {
-            let head = self.head;
-            let fsn = self.slots[head].fsn;
-            self.bytes_used -= self.slots[head].payload.len();
-            self.slots[head].payload.clear();
-            self.slots[head].state = FrameState::Free;
-            self.completed_fsn = Some(fsn);
-            self.head = (self.head + 1) % self.slots.len();
-            self.len -= 1;
-        }
-
-        self.in_flight.pop_acked_through(acked_fsn);
-        Ok(())
-    }
-
-    fn complete_rejected(&mut self, rejected_fsn: u64) -> Result<(), QueueError> {
-        if self.len == 0 || self.slots[self.head].fsn != rejected_fsn {
-            return Err(QueueError::ProtocolRejectedUnsentFrame { fsn: rejected_fsn });
-        }
-        if !matches!(self.slots[self.head].state, FrameState::Sent { .. }) {
-            return Err(QueueError::ProtocolRejectedUnsentFrame { fsn: rejected_fsn });
-        }
-
-        self.bytes_used -= self.slots[self.head].payload.len();
-        self.slots[self.head].payload.clear();
-        self.slots[self.head].state = FrameState::Free;
-        self.completed_fsn = Some(rejected_fsn);
-        self.rejected_fsns.push(rejected_fsn);
-        self.head = (self.head + 1) % self.slots.len();
-        self.len -= 1;
-        self.in_flight.pop_acked_through(rejected_fsn);
-        Ok(())
+    pub(crate) fn max_in_flight(&self) -> usize {
+        self.max_in_flight
     }
 
     fn slot_for_fsn(&self, fsn: u64) -> Option<&FrameSlot> {
@@ -541,7 +356,7 @@ impl VolatileFrameQueue {
 #[derive(Debug, Default)]
 struct FrameSlot {
     fsn: u64,
-    payload: Vec<u8>,
+    payload: Option<SharedPayload>,
     state: FrameState,
 }
 
@@ -550,83 +365,6 @@ enum FrameState {
     #[default]
     Free,
     Published,
-    Sent {
-        wire_seq: u64,
-    },
-}
-
-#[derive(Debug, Default)]
-struct ConnectionState {
-    fsn_at_zero: Option<u64>,
-    next_wire_seq: u64,
-    last_sent_wire_seq: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct InFlightSlot {
-    fsn: u64,
-    wire_seq: u64,
-}
-
-#[derive(Debug)]
-struct InFlightRing {
-    slots: Vec<InFlightSlot>,
-    head: usize,
-    len: usize,
-}
-
-impl InFlightRing {
-    fn new(capacity: usize) -> Self {
-        Self {
-            slots: vec![InFlightSlot::default(); capacity],
-            head: 0,
-            len: 0,
-        }
-    }
-
-    fn capacity(&self) -> usize {
-        self.slots.len()
-    }
-
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    fn is_full(&self) -> bool {
-        self.len == self.slots.len()
-    }
-
-    fn push(&mut self, slot: InFlightSlot) -> Result<(), QueueError> {
-        if self.is_full() {
-            return Err(QueueError::MaxInFlightReached {
-                max_in_flight: self.capacity(),
-            });
-        }
-        let tail = self.slot_index(self.len);
-        self.slots[tail] = slot;
-        self.len += 1;
-        Ok(())
-    }
-
-    fn pop_acked_through(&mut self, acked_fsn: u64) {
-        while self.len > 0 {
-            let slot = self.slots[self.head];
-            if slot.fsn > acked_fsn {
-                break;
-            }
-            self.head = (self.head + 1) % self.slots.len();
-            self.len -= 1;
-        }
-    }
-
-    fn clear(&mut self) {
-        self.head = 0;
-        self.len = 0;
-    }
-
-    fn slot_index(&self, offset: usize) -> usize {
-        (self.head + offset) % self.slots.len()
-    }
 }
 
 #[cfg(test)]
@@ -720,13 +458,6 @@ mod tests {
     }
 
     #[test]
-    fn send_next_on_empty_queue_returns_no_unsent_frame() {
-        let mut queue = queue(1, 1024, 1);
-
-        assert_eq!(queue.send_next(), Err(QueueError::NoUnsentFrame));
-    }
-
-    #[test]
     fn byte_capacity_arithmetic_overflow_is_reported_as_capacity_full() {
         let mut queue = queue(4, usize::MAX, 2);
         queue.bytes_used = usize::MAX;
@@ -763,8 +494,7 @@ mod tests {
             QwpReceiptStatus::Published { fsn: 1 }
         );
 
-        queue.send_next().unwrap();
-        queue.ack_wire(0).unwrap();
+        queue.complete_through_fsn(0).unwrap();
 
         let third = queue.try_submit(b"fg").unwrap();
         assert_eq!(third, QwpReceipt { fsn: 2 });
@@ -794,60 +524,13 @@ mod tests {
     }
 
     #[test]
-    fn send_assigns_zero_based_wire_sequences_in_fsn_order() {
-        let mut queue = queue(4, 1024, 3);
-        let first = queue.try_submit(b"first").unwrap();
-        let second = queue.try_submit(b"second").unwrap();
-
-        assert_eq!(
-            queue.send_next().unwrap(),
-            SentFrame {
-                fsn: 0,
-                wire_seq: 0,
-                payload_len: 5
-            }
-        );
-        assert_eq!(queue.fsn_at_zero(), Some(0));
-        assert_eq!(
-            queue.receipt_status(first),
-            QwpReceiptStatus::Sent {
-                fsn: 0,
-                wire_seq: 0
-            }
-        );
-
-        assert_eq!(
-            queue.send_next().unwrap(),
-            SentFrame {
-                fsn: 1,
-                wire_seq: 1,
-                payload_len: 6
-            }
-        );
-        assert_eq!(
-            queue.receipt_status(second),
-            QwpReceiptStatus::Sent {
-                fsn: 1,
-                wire_seq: 1
-            }
-        );
-        assert_eq!(queue.send_next(), Err(QueueError::NoUnsentFrame));
-    }
-
-    #[test]
-    fn max_in_flight_applies_backpressure_to_sends_not_submission() {
+    fn max_in_flight_is_configuration_for_driver_cursor_not_submission() {
         let mut queue = queue(4, 1024, 2);
         queue.try_submit(b"a").unwrap();
         queue.try_submit(b"b").unwrap();
         let third = queue.try_submit(b"c").unwrap();
 
-        queue.send_next().unwrap();
-        queue.send_next().unwrap();
-
-        assert_eq!(
-            queue.send_next(),
-            Err(QueueError::MaxInFlightReached { max_in_flight: 2 })
-        );
+        assert_eq!(queue.max_in_flight(), 2);
         assert_eq!(
             queue.receipt_status(third),
             QwpReceiptStatus::Published { fsn: 2 }
@@ -860,17 +543,12 @@ mod tests {
         let first = queue.try_submit(b"a").unwrap();
         let second = queue.try_submit(b"bb").unwrap();
         let third = queue.try_submit(b"ccc").unwrap();
-        queue.send_next().unwrap();
-        queue.send_next().unwrap();
-        queue.send_next().unwrap();
 
-        queue.ack_wire(2).unwrap();
+        queue.complete_through_fsn(2).unwrap();
 
-        assert_eq!(queue.server_acked_fsn(), Some(2));
         assert_eq!(queue.completed_fsn(), Some(2));
         assert_eq!(queue.len(), 0);
         assert_eq!(queue.bytes_used(), 0);
-        assert_eq!(queue.in_flight_len(), 0);
         assert_eq!(
             queue.receipt_status(first),
             QwpReceiptStatus::Acked { fsn: 0 }
@@ -886,52 +564,33 @@ mod tests {
     }
 
     #[test]
-    fn later_frames_never_jump_earlier_unresolved_frames() {
+    fn oldest_unresolved_payload_advances_in_fsn_order() {
         let mut queue = queue(4, 1024, 3);
         let first = queue.try_submit(b"first").unwrap();
         let second = queue.try_submit(b"second").unwrap();
         let third = queue.try_submit(b"third").unwrap();
 
-        let sent_first = queue.send_next().unwrap();
-        let sent_second = queue.send_next().unwrap();
-        let sent_third = queue.send_next().unwrap();
+        assert_eq!(first.fsn, 0);
+        assert_eq!(second.fsn, 1);
+        assert_eq!(third.fsn, 2);
+        assert_eq!(queue.oldest_unresolved_fsn(), Some(0));
+        assert_eq!(queue.payload_for_fsn(0), Some(&b"first"[..]));
 
-        assert_eq!(sent_first.fsn, first.fsn);
-        assert_eq!(sent_second.fsn, second.fsn);
-        assert_eq!(sent_third.fsn, third.fsn);
-        assert_eq!(sent_first.wire_seq, 0);
-        assert_eq!(sent_second.wire_seq, 1);
-        assert_eq!(sent_third.wire_seq, 2);
+        queue.complete_through_fsn(0).unwrap();
+
+        assert_eq!(queue.oldest_unresolved_fsn(), Some(1));
+        assert_eq!(queue.payload_for_fsn(1), Some(&b"second"[..]));
     }
 
     #[test]
-    fn ack_beyond_last_sent_is_protocol_error() {
-        let mut queue = queue(4, 1024, 3);
-        queue.try_submit(b"a").unwrap();
-        queue.try_submit(b"b").unwrap();
-        queue.send_next().unwrap();
-
-        assert_eq!(
-            queue.ack_wire(1),
-            Err(QueueError::ProtocolAckBeyondSent {
-                wire_seq: 1,
-                last_sent_wire_seq: Some(0)
-            })
-        );
-    }
-
-    #[test]
-    fn stale_ack_is_ignored_after_receipt_already_completed() {
+    fn stale_completion_is_ignored_after_receipt_already_completed() {
         let mut queue = queue(4, 1024, 3);
         let first = queue.try_submit(b"first").unwrap();
         let second = queue.try_submit(b"second").unwrap();
-        queue.send_next().unwrap();
-        queue.send_next().unwrap();
-        queue.ack_wire(1).unwrap();
 
-        queue.ack_wire(0).unwrap();
+        queue.complete_through_fsn(1).unwrap();
+        queue.complete_through_fsn(0).unwrap();
 
-        assert_eq!(queue.server_acked_fsn(), Some(1));
         assert_eq!(queue.completed_fsn(), Some(1));
         assert_eq!(
             queue.receipt_status(first),
@@ -940,21 +599,6 @@ mod tests {
         assert_eq!(
             queue.receipt_status(second),
             QwpReceiptStatus::Acked { fsn: 1 }
-        );
-    }
-
-    #[test]
-    fn ack_covering_published_but_unsent_frame_is_protocol_error() {
-        let mut queue = queue(4, 1024, 3);
-        queue.try_submit(b"first").unwrap();
-        queue.try_submit(b"second").unwrap();
-        queue.send_next().unwrap();
-
-        queue.connection.last_sent_wire_seq = Some(1);
-
-        assert_eq!(
-            queue.ack_wire(1),
-            Err(QueueError::ProtocolAckedUnsentFrame { fsn: 1 })
         );
     }
 
@@ -964,13 +608,9 @@ mod tests {
         let first = queue.try_submit(b"first").unwrap();
         let second = queue.try_submit(b"second").unwrap();
         let third = queue.try_submit(b"third").unwrap();
-        queue.send_next().unwrap();
-        queue.send_next().unwrap();
-        queue.send_next().unwrap();
 
-        assert_eq!(queue.reject_wire(1).unwrap(), second);
+        assert_eq!(queue.reject_fsn(1).unwrap(), second);
 
-        assert_eq!(queue.server_acked_fsn(), Some(0));
         assert_eq!(queue.completed_fsn(), Some(1));
         assert_eq!(
             queue.receipt_status(first),
@@ -982,59 +622,7 @@ mod tests {
         );
         assert_eq!(
             queue.receipt_status(third),
-            QwpReceiptStatus::Sent {
-                fsn: 2,
-                wire_seq: 2
-            }
-        );
-    }
-
-    #[test]
-    fn first_frame_rejection_gap_prevents_server_acked_from_advancing() {
-        let mut queue = queue(4, 1024, 3);
-        let first = queue.try_submit(b"first").unwrap();
-        let second = queue.try_submit(b"second").unwrap();
-        queue.send_next().unwrap();
-        queue.send_next().unwrap();
-
-        queue.reject_wire(0).unwrap();
-        queue.ack_wire(1).unwrap();
-
-        assert_eq!(queue.server_acked_fsn(), None);
-        assert_eq!(queue.completed_fsn(), Some(1));
-        assert_eq!(
-            queue.receipt_status(first),
-            QwpReceiptStatus::Rejected { fsn: 0 }
-        );
-        assert_eq!(
-            queue.receipt_status(second),
-            QwpReceiptStatus::Acked { fsn: 1 }
-        );
-    }
-
-    #[test]
-    fn reject_without_connection_is_protocol_error() {
-        let mut queue = queue(4, 1024, 3);
-        queue.try_submit(b"first").unwrap();
-
-        assert_eq!(
-            queue.reject_wire(0),
-            Err(QueueError::ProtocolRejectWithoutConnection)
-        );
-    }
-
-    #[test]
-    fn reject_beyond_last_sent_is_protocol_error() {
-        let mut queue = queue(4, 1024, 3);
-        queue.try_submit(b"first").unwrap();
-        queue.send_next().unwrap();
-
-        assert_eq!(
-            queue.reject_wire(1),
-            Err(QueueError::ProtocolRejectBeyondSent {
-                wire_seq: 1,
-                last_sent_wire_seq: Some(0)
-            })
+            QwpReceiptStatus::Published { fsn: 2 }
         );
     }
 
@@ -1043,59 +631,35 @@ mod tests {
         let mut queue = queue(4, 1024, 3);
         queue.try_submit(b"first").unwrap();
         queue.try_submit(b"second").unwrap();
-        queue.send_next().unwrap();
-        queue.send_next().unwrap();
-        queue.ack_wire(0).unwrap();
+        queue.complete_through_fsn(0).unwrap();
 
         assert_eq!(
-            queue.reject_wire(0),
+            queue.reject_fsn(0),
             Err(QueueError::ProtocolRejectedUnsentFrame { fsn: 0 })
         );
     }
 
     #[test]
-    fn reject_published_frame_with_forged_connection_state_is_protocol_error() {
+    fn reject_unknown_frame_is_protocol_error() {
         let mut queue = queue(4, 1024, 3);
         queue.try_submit(b"first").unwrap();
-        queue.connection.fsn_at_zero = Some(0);
-        queue.connection.last_sent_wire_seq = Some(0);
 
         assert_eq!(
-            queue.reject_wire(0),
-            Err(QueueError::ProtocolRejectedUnsentFrame { fsn: 0 })
+            queue.reject_fsn(1),
+            Err(QueueError::ProtocolRejectedUnsentFrame { fsn: 1 })
         );
     }
 
     #[test]
-    fn reject_published_but_unsent_frame_is_protocol_error() {
-        let mut queue = queue(4, 1024, 3);
-        queue.try_submit(b"first").unwrap();
-        queue.try_submit(b"second").unwrap();
-        queue.send_next().unwrap();
-
-        assert_eq!(
-            queue.reject_wire(1),
-            Err(QueueError::ProtocolRejectBeyondSent {
-                wire_seq: 1,
-                last_sent_wire_seq: Some(0)
-            })
-        );
-    }
-
-    #[test]
-    fn ack_after_reject_completes_later_receipt_without_crossing_rejection_gap() {
+    fn completion_after_reject_completes_later_receipt() {
         let mut queue = queue(4, 1024, 3);
         let first = queue.try_submit(b"first").unwrap();
         let second = queue.try_submit(b"second").unwrap();
         let third = queue.try_submit(b"third").unwrap();
-        queue.send_next().unwrap();
-        queue.send_next().unwrap();
-        queue.send_next().unwrap();
 
-        queue.reject_wire(1).unwrap();
-        queue.ack_wire(2).unwrap();
+        queue.reject_fsn(1).unwrap();
+        queue.complete_through_fsn(2).unwrap();
 
-        assert_eq!(queue.server_acked_fsn(), Some(0));
         assert_eq!(queue.completed_fsn(), Some(2));
         assert_eq!(
             queue.receipt_status(first),
@@ -1112,35 +676,16 @@ mod tests {
     }
 
     #[test]
-    fn in_flight_ring_rejects_direct_push_when_full() {
-        let mut ring = InFlightRing::new(1);
-        ring.push(InFlightSlot {
-            fsn: 0,
-            wire_seq: 0,
-        })
-        .unwrap();
-
-        assert_eq!(
-            ring.push(InFlightSlot {
-                fsn: 1,
-                wire_seq: 1,
-            }),
-            Err(QueueError::MaxInFlightReached { max_in_flight: 1 })
-        );
-    }
-
-    #[test]
     fn receipt_status_distinguishes_old_future_and_completed_unknowns() {
         let mut queue = queue(4, 1024, 3);
         let first = queue.try_submit(b"first").unwrap();
-        queue.send_next().unwrap();
 
         assert_eq!(
             queue.receipt_status(QwpReceipt { fsn: 99 }),
             QwpReceiptStatus::Unknown { fsn: 99 }
         );
 
-        queue.ack_wire(0).unwrap();
+        queue.complete_through_fsn(0).unwrap();
 
         assert_eq!(
             queue.receipt_status(first),
@@ -1149,69 +694,6 @@ mod tests {
         assert_eq!(
             queue.receipt_status(QwpReceipt { fsn: 99 }),
             QwpReceiptStatus::Unknown { fsn: 99 }
-        );
-    }
-
-    #[test]
-    fn reconnect_resets_wire_sequence_and_replays_from_oldest_unresolved() {
-        let mut queue = queue(4, 1024, 3);
-        let first = queue.try_submit(b"first").unwrap();
-        let second = queue.try_submit(b"second").unwrap();
-        let third = queue.try_submit(b"third").unwrap();
-
-        queue.send_next().unwrap();
-        queue.send_next().unwrap();
-        queue.ack_wire(0).unwrap();
-
-        assert_eq!(
-            queue.receipt_status(first),
-            QwpReceiptStatus::Acked { fsn: 0 }
-        );
-        assert_eq!(
-            queue.receipt_status(second),
-            QwpReceiptStatus::Sent {
-                fsn: 1,
-                wire_seq: 1
-            }
-        );
-        assert_eq!(
-            queue.receipt_status(third),
-            QwpReceiptStatus::Published { fsn: 2 }
-        );
-
-        queue.restart_connection();
-
-        assert_eq!(queue.fsn_at_zero(), None);
-        assert_eq!(
-            queue.receipt_status(second),
-            QwpReceiptStatus::Published { fsn: 1 }
-        );
-        assert_eq!(
-            queue.send_next().unwrap(),
-            SentFrame {
-                fsn: 1,
-                wire_seq: 0,
-                payload_len: 6
-            }
-        );
-        assert_eq!(queue.fsn_at_zero(), Some(1));
-        assert_eq!(
-            queue.send_next().unwrap(),
-            SentFrame {
-                fsn: 2,
-                wire_seq: 1,
-                payload_len: 5
-            }
-        );
-        queue.ack_wire(1).unwrap();
-
-        assert_eq!(
-            queue.receipt_status(second),
-            QwpReceiptStatus::Acked { fsn: 1 }
-        );
-        assert_eq!(
-            queue.receipt_status(third),
-            QwpReceiptStatus::Acked { fsn: 2 }
         );
     }
 }

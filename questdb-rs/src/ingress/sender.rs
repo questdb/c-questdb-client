@@ -58,9 +58,6 @@ mod qwp_ws_sfa_queue;
 #[cfg(feature = "_sender-qwp-ws")]
 mod qwp_ws_sfa_slot;
 
-#[cfg(all(test, feature = "_sender-qwp-ws"))]
-mod qwp_ws_sf_queue;
-
 #[cfg(feature = "_sender-qwp-ws")]
 pub use qwp_ws_ownership::*;
 
@@ -437,6 +434,14 @@ impl Sender {
     /// local socket errors only. A successful return does not guarantee delivery, and
     /// when a flush spans multiple datagrams there is no all-or-nothing guarantee for
     /// the logical batch.
+    ///
+    /// With QWP-over-WebSocket, the function publishes the rows into local
+    /// memory or Store-and-Forward storage and returns without waiting for the
+    /// submitted frame's server ACK. It may still wait for local capacity or
+    /// for an in-progress reconnect/progress critical section. A background
+    /// runner sends, receives ACKs, reconnects, and replays as needed. Server
+    /// or transport failures observed later are reported by subsequent sender
+    /// calls.
     ///
     /// HTTP should be the first choice, but use TCP if you need to continuously send
     /// data to the server at a high rate.

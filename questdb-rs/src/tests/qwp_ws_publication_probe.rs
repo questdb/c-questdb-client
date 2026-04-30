@@ -282,7 +282,7 @@ fn qwp_ws_sfa_recovered_frame_is_delivered_and_cleaned_up() -> TestResult {
 
 #[test]
 #[ignore = "requires a real QuestDB server and QDB_QWP_WS_PUBLIC_SFA_PROBE=1"]
-fn qwp_ws_public_sender_sfa_recovers_after_failed_flush() -> TestResult {
+fn qwp_ws_public_sender_sfa_recovers_after_unacked_disconnect() -> TestResult {
     if std::env::var("QDB_QWP_WS_PUBLIC_SFA_PROBE").as_deref() != Ok("1") {
         eprintln!("set QDB_QWP_WS_PUBLIC_SFA_PROBE=1 to run the public Sender SFA probe");
         return Ok(());
@@ -306,7 +306,7 @@ fn qwp_ws_public_sender_sfa_recovers_after_failed_flush() -> TestResult {
 
     let proxy = DropUnackedFrameProxy::spawn(&config)?;
     let first_conf = public_sfa_conf("127.0.0.1", proxy.port, sf_dir.path(), sender_id, true);
-    let flush_err = {
+    {
         let mut sender = SenderBuilder::from_conf(first_conf)?.build()?;
         let mut buffer = sender.new_buffer();
         write_row(
@@ -317,14 +317,17 @@ fn qwp_ws_public_sender_sfa_recovers_after_failed_flush() -> TestResult {
             777.5,
             77,
         )?;
-        sender.flush(&mut buffer).unwrap_err()
-    };
-    assert_eq!(flush_err.code(), crate::ErrorCode::SocketError);
-    proxy.join()?;
+        sender.flush(&mut buffer)?;
+        assert!(
+            buffer.is_empty(),
+            "locally published QWP/WebSocket flush must clear the caller buffer"
+        );
+        proxy.join()?;
+    }
     let retained_sfa_files = sfa_file_count(&slot_dir)?;
     assert!(
         retained_sfa_files > 0,
-        "failed public Sender flush must leave its QWP frame recoverable"
+        "unACKed public Sender flush must leave its QWP frame recoverable"
     );
 
     let second_conf = public_sfa_conf(
@@ -346,32 +349,27 @@ fn qwp_ws_public_sender_sfa_recovers_after_failed_flush() -> TestResult {
             88,
         )?;
         sender.flush(&mut buffer)?;
-    }
 
-    let count = wait_for_count(&config, &table, 2, Duration::from_secs(10))?;
-    assert_eq!(
-        count, 2,
-        "public Sender SFA recovery should deliver the retained row exactly once before the follow-up"
-    );
-    assert!(has_row(
-        &config,
-        &table,
-        "SYM_PUBLIC_SFA_REPLAYED",
-        77,
-        777.5
-    )?);
-    assert!(has_row(
-        &config,
-        &table,
-        "SYM_PUBLIC_SFA_FOLLOWUP",
-        88,
-        888.5
-    )?);
-    assert_eq!(
-        sfa_file_count(&slot_dir)?,
-        0,
-        "ACKed public Sender SFA frames must be cleaned up on close"
-    );
+        let count = wait_for_count(&config, &table, 2, Duration::from_secs(10))?;
+        assert_eq!(
+            count, 2,
+            "public Sender SFA recovery should deliver the retained row exactly once before the follow-up"
+        );
+        assert!(has_row(
+            &config,
+            &table,
+            "SYM_PUBLIC_SFA_REPLAYED",
+            77,
+            777.5
+        )?);
+        assert!(has_row(
+            &config,
+            &table,
+            "SYM_PUBLIC_SFA_FOLLOWUP",
+            88,
+            888.5
+        )?);
+    }
 
     Ok(())
 }

@@ -28,7 +28,8 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -45,13 +46,13 @@ use super::qwp_ws_codec::{
     WS_OPCODE_CONTINUATION, WS_OPCODE_PING, WS_OPCODE_PONG, WS_OPCODE_TEXT,
 };
 use super::qwp_ws_driver::{
-    BlockingQwpWsTransport, DeliveryOutcome, DriverError, ManualDriverPrototype, ManualDriverQueue,
-    ReconnectPolicy, reconnect_error_is_terminal,
+    BlockingQwpWsTransport, DetachedReceive, DetachedSend, DriveOutcome, DriverError,
+    ManualDriverPrototype, ManualDriverTransport, PublicationLog, ReconnectPolicy,
+    reconnect_error_is_terminal,
 };
-use super::qwp_ws_publisher::{QwpWsPublicationDriver, QwpWsPublicationError};
+use super::qwp_ws_publisher::{QwpWsPublicationDriver, QwpWsPublicationError, QwpWsReplayEncoder};
 use super::qwp_ws_queue::{
-    OutboundFrame, QwpReceipt, QwpReceiptStatus, SentFrame, VolatileFrameQueue,
-    VolatileQueueOptions,
+    QwpReceipt, QwpReceiptStatus, SharedPayload, VolatileFrameQueue, VolatileQueueOptions,
 };
 use super::qwp_ws_sfa_slot::{SfaSlotOptions, SfaSlotQueue};
 
@@ -73,6 +74,37 @@ impl WsStream {
         sock.set_read_timeout(read)?;
         sock.set_write_timeout(write)?;
         Ok(())
+    }
+
+    pub(crate) fn can_read_without_blocking(&mut self) -> std::io::Result<bool> {
+        match self {
+            WsStream::Plain(sock) => tcp_has_readable_bytes(sock),
+            WsStream::Tls(stream) => {
+                let tls_buffer_ready = match stream.conn.reader().into_first_chunk() {
+                    Ok(_) => true,
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => false,
+                    Err(err) => return Err(err),
+                };
+                if tls_buffer_ready {
+                    return Ok(true);
+                }
+                tcp_has_readable_bytes(stream.get_ref())
+            }
+        }
+    }
+}
+
+fn tcp_has_readable_bytes(sock: &TcpStream) -> std::io::Result<bool> {
+    sock.set_nonblocking(true)?;
+    let mut byte = [0u8; 1];
+    let peek_result = match sock.peek(&mut byte) {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
+        Err(err) => Err(err),
+    };
+    match (peek_result, sock.set_nonblocking(false)) {
+        (_, Err(err)) => Err(err),
+        (result, Ok(())) => result,
     }
 }
 
@@ -106,8 +138,191 @@ pub(crate) type SyncQwpWsPublisher =
     QwpWsPublicationDriver<ConfiguredQwpWsQueue, BlockingQwpWsTransport>;
 
 pub(crate) struct SyncQwpWsHandlerState {
-    pub(crate) publisher: SyncQwpWsPublisher,
-    pub(crate) max_flush_drive_steps: usize,
+    encoder: QwpWsReplayEncoder,
+    runner: SyncQwpWsRunner,
+}
+
+pub(crate) struct SyncQwpWsRunner<Q = ConfiguredQwpWsQueue, T = BlockingQwpWsTransport> {
+    shared: Arc<Mutex<SyncQwpWsRunnerShared<Q, T>>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+struct SyncQwpWsRunnerShared<Q = ConfiguredQwpWsQueue, T = BlockingQwpWsTransport> {
+    publisher: QwpWsPublicationDriver<Q, T>,
+    terminal_error: Option<crate::Error>,
+}
+
+impl<Q, T> SyncQwpWsRunner<Q, T>
+where
+    Q: PublicationLog + Send + 'static,
+    T: ManualDriverTransport + Send + 'static,
+{
+    fn start(publisher: QwpWsPublicationDriver<Q, T>) -> Self {
+        let shared = Arc::new(Mutex::new(SyncQwpWsRunnerShared {
+            publisher,
+            terminal_error: None,
+        }));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_shared = Arc::clone(&shared);
+        let thread_stop = Arc::clone(&stop);
+        let thread = thread::spawn(move || {
+            while !thread_stop.load(Ordering::Acquire) {
+                match Self::drive_detached_step(&thread_shared) {
+                    RunnerStep::Idle => thread::sleep(Duration::from_micros(50)),
+                    RunnerStep::Continue => {}
+                    RunnerStep::Stop => break,
+                    RunnerStep::Send(send) => {
+                        match Self::finish_detached_send(&thread_shared, send) {
+                            RunnerStep::Idle => thread::sleep(Duration::from_micros(50)),
+                            RunnerStep::Continue => {}
+                            RunnerStep::Stop => break,
+                            RunnerStep::Send(_) | RunnerStep::Receive(_) => unreachable!(),
+                        }
+                    }
+                    RunnerStep::Receive(receive) => {
+                        match Self::finish_detached_receive(&thread_shared, receive) {
+                            RunnerStep::Idle => thread::sleep(Duration::from_micros(50)),
+                            RunnerStep::Continue => {}
+                            RunnerStep::Stop => break,
+                            RunnerStep::Send(_) | RunnerStep::Receive(_) => unreachable!(),
+                        }
+                    }
+                }
+            }
+        });
+
+        Self {
+            shared,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn publish_replay_payload(&self, payload: &[u8]) -> crate::Result<()> {
+        let mut shared = self.lock_shared()?;
+        shared.check_error()?;
+        shared
+            .publisher
+            .try_submit_replay_payload(payload)
+            .map_err(driver_error_to_error_without_state)?;
+        Ok(())
+    }
+
+    fn lock_shared(&self) -> crate::Result<std::sync::MutexGuard<'_, SyncQwpWsRunnerShared<Q, T>>> {
+        self.shared
+            .lock()
+            .map_err(|_| error::fmt!(SocketError, "QWP/WebSocket runner state lock is poisoned"))
+    }
+
+    fn drive_detached_step(shared: &Arc<Mutex<SyncQwpWsRunnerShared<Q, T>>>) -> RunnerStep<T> {
+        let mut shared = match shared.lock() {
+            Ok(shared) => shared,
+            Err(_) => return RunnerStep::Stop,
+        };
+        if shared.terminal_error.is_some() || shared.publisher.is_terminal() {
+            return RunnerStep::Stop;
+        }
+        match shared.publisher.detach_send_available() {
+            Ok(Some(send)) => RunnerStep::Send(send),
+            Ok(None) => match shared.publisher.detach_receive_ready() {
+                Some(receive) => RunnerStep::Receive(receive),
+                None => RunnerStep::Stop,
+            },
+            Err(err) => shared.store_driver_error(err),
+        }
+    }
+
+    fn finish_detached_send(
+        shared: &Arc<Mutex<SyncQwpWsRunnerShared<Q, T>>>,
+        send: DetachedSend<T>,
+    ) -> RunnerStep<T> {
+        let DetachedSend {
+            mut transport,
+            outbound,
+            frame,
+        } = send;
+        let send_result = transport.send_frame(outbound);
+        let mut shared = match shared.lock() {
+            Ok(shared) => shared,
+            Err(_) => return RunnerStep::Stop,
+        };
+        match shared
+            .publisher
+            .finish_detached_send(transport, frame, send_result)
+        {
+            Ok(DriveOutcome::Idle) => RunnerStep::Idle,
+            Ok(DriveOutcome::Terminal) => RunnerStep::Stop,
+            Ok(_) => RunnerStep::Continue,
+            Err(err) => shared.store_driver_error(err),
+        }
+    }
+
+    fn finish_detached_receive(
+        shared: &Arc<Mutex<SyncQwpWsRunnerShared<Q, T>>>,
+        receive: DetachedReceive<T>,
+    ) -> RunnerStep<T> {
+        let DetachedReceive { mut transport } = receive;
+        let response = transport.try_poll_response();
+        let mut shared = match shared.lock() {
+            Ok(shared) => shared,
+            Err(_) => return RunnerStep::Stop,
+        };
+        match shared
+            .publisher
+            .finish_detached_receive(transport, response)
+        {
+            Ok(DriveOutcome::Idle) => RunnerStep::Idle,
+            Ok(DriveOutcome::Terminal) => RunnerStep::Stop,
+            Ok(_) => RunnerStep::Continue,
+            Err(err) => shared.store_driver_error(err),
+        }
+    }
+}
+
+enum RunnerStep<T> {
+    Idle,
+    Continue,
+    Stop,
+    Send(DetachedSend<T>),
+    Receive(DetachedReceive<T>),
+}
+
+impl<Q, T> SyncQwpWsRunnerShared<Q, T>
+where
+    Q: PublicationLog,
+    T: ManualDriverTransport,
+{
+    fn check_error(&self) -> crate::Result<()> {
+        if let Some(err) = self.terminal_error.clone() {
+            return Err(err);
+        }
+        if let Some(err) = self.publisher.terminal_error() {
+            return Err(err.clone());
+        }
+        Ok(())
+    }
+
+    fn store_error(&mut self, err: crate::Error) {
+        if self.terminal_error.is_none() {
+            self.terminal_error = Some(err);
+        }
+    }
+
+    fn store_driver_error(&mut self, err: DriverError) -> RunnerStep<T> {
+        let err = driver_error_to_error(&self.publisher, err);
+        self.store_error(err);
+        RunnerStep::Stop
+    }
+}
+
+impl<Q, T> Drop for SyncQwpWsRunner<Q, T> {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 pub(crate) enum ConfiguredQwpWsQueue {
@@ -183,39 +398,39 @@ fn usize_from_config(name: &str, value: u64) -> crate::Result<usize> {
     })
 }
 
-impl ManualDriverQueue for ConfiguredQwpWsQueue {
-    fn try_submit(&mut self, payload: &[u8]) -> Result<QwpReceipt, DriverError> {
+impl PublicationLog for ConfiguredQwpWsQueue {
+    fn try_publish(&mut self, payload: &[u8]) -> Result<QwpReceipt, DriverError> {
         match self {
             Self::Memory(queue) => Ok(queue.try_submit(payload)?),
-            Self::StoreAndForward(queue) => queue.try_submit(payload),
+            Self::StoreAndForward(queue) => PublicationLog::try_publish(queue, payload),
         }
     }
 
-    fn next_outbound_frame(&self) -> Result<OutboundFrame<'_>, DriverError> {
+    fn shared_payload_for_fsn(&self, fsn: u64) -> Result<Option<SharedPayload>, DriverError> {
         match self {
-            Self::Memory(queue) => Ok(queue.next_outbound_frame()?),
-            Self::StoreAndForward(queue) => queue.next_outbound_frame(),
+            Self::Memory(queue) => Ok(queue.shared_payload_for_fsn(fsn)),
+            Self::StoreAndForward(queue) => PublicationLog::shared_payload_for_fsn(queue, fsn),
         }
     }
 
-    fn commit_sent(&mut self, frame: SentFrame) -> Result<(), DriverError> {
+    fn oldest_unresolved_fsn(&self) -> Option<u64> {
         match self {
-            Self::Memory(queue) => Ok(queue.commit_sent(frame)?),
-            Self::StoreAndForward(queue) => queue.commit_sent(frame),
+            Self::Memory(queue) => queue.oldest_unresolved_fsn(),
+            Self::StoreAndForward(queue) => PublicationLog::oldest_unresolved_fsn(queue),
         }
     }
 
-    fn ack_wire(&mut self, wire_seq: u64) -> Result<(), DriverError> {
+    fn complete_through(&mut self, fsn: u64) -> Result<(), DriverError> {
         match self {
-            Self::Memory(queue) => Ok(queue.ack_wire(wire_seq)?),
-            Self::StoreAndForward(queue) => queue.ack_wire(wire_seq),
+            Self::Memory(queue) => Ok(queue.complete_through_fsn(fsn)?),
+            Self::StoreAndForward(queue) => PublicationLog::complete_through(queue, fsn),
         }
     }
 
-    fn reject_wire(&mut self, wire_seq: u64) -> Result<QwpReceipt, DriverError> {
+    fn reject_fsn(&mut self, fsn: u64) -> Result<QwpReceipt, DriverError> {
         match self {
-            Self::Memory(queue) => Ok(queue.reject_wire(wire_seq)?),
-            Self::StoreAndForward(queue) => queue.reject_wire(wire_seq),
+            Self::Memory(queue) => Ok(queue.reject_fsn(fsn)?),
+            Self::StoreAndForward(queue) => PublicationLog::reject_fsn(queue, fsn),
         }
     }
 
@@ -226,38 +441,31 @@ impl ManualDriverQueue for ConfiguredQwpWsQueue {
         }
     }
 
-    fn restart_connection(&mut self) {
-        match self {
-            Self::Memory(queue) => queue.restart_connection(),
-            Self::StoreAndForward(queue) => queue.restart_connection(),
-        }
-    }
-
     fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus {
         match self {
             Self::Memory(queue) => queue.receipt_status(receipt),
-            Self::StoreAndForward(queue) => queue.receipt_status(receipt),
+            Self::StoreAndForward(queue) => PublicationLog::receipt_status(queue, receipt),
         }
     }
 
     fn published_fsn(&self) -> Option<u64> {
         match self {
             Self::Memory(queue) => queue.published_fsn(),
-            Self::StoreAndForward(queue) => queue.published_fsn(),
+            Self::StoreAndForward(queue) => PublicationLog::published_fsn(queue),
         }
     }
 
     fn completed_fsn(&self) -> Option<u64> {
         match self {
             Self::Memory(queue) => queue.completed_fsn(),
-            Self::StoreAndForward(queue) => queue.completed_fsn(),
+            Self::StoreAndForward(queue) => PublicationLog::completed_fsn(queue),
         }
     }
 
-    fn fsn_for_wire_seq(&self, wire_seq: u64) -> Result<u64, DriverError> {
+    fn max_in_flight(&self) -> usize {
         match self {
-            Self::Memory(queue) => queue.fsn_for_wire_seq(wire_seq),
-            Self::StoreAndForward(queue) => queue.fsn_for_wire_seq(wire_seq),
+            Self::Memory(queue) => queue.max_in_flight(),
+            Self::StoreAndForward(queue) => PublicationLog::max_in_flight(queue),
         }
     }
 }
@@ -561,11 +769,12 @@ pub(crate) fn connect_qwp_ws(
     auth_header: Option<String>,
 ) -> crate::Result<SyncProtocolHandler> {
     let publisher = open_qwp_ws_publisher(host, port, use_tls, tls_settings, qwp_ws, auth_header)?;
+    let negotiated_version = publisher.version();
 
     Ok(SyncProtocolHandler::SyncQwpWs(Box::new(
         SyncQwpWsHandlerState {
-            publisher,
-            max_flush_drive_steps: max_flush_drive_steps(qwp_ws),
+            encoder: QwpWsReplayEncoder::new(negotiated_version),
+            runner: SyncQwpWsRunner::start(publisher),
         },
     )))
 }
@@ -676,39 +885,14 @@ fn connect_blocking_transport_with_retry(
 
 // ---------- send / receive ----------
 
-/// Public flush entry point: publish through the replay queue, drive the
-/// transport, and wait synchronously for the submitted frame's outcome.
+/// Public flush entry point: publish through the replay queue and return once
+/// the frame is locally accepted. A sender-owned runner advances WebSocket I/O.
 pub(crate) fn flush_qwp_ws(
     state: &mut SyncQwpWsHandlerState,
     buffer: &QwpBuffer,
 ) -> crate::Result<()> {
-    let receipt = state
-        .publisher
-        .submit_qwp_with_drive_limit(buffer, state.max_flush_drive_steps)
-        .map_err(publication_error_to_error)?;
-
-    let outcome = state
-        .publisher
-        .wait_steps(receipt, state.max_flush_drive_steps)
-        .map_err(|err| driver_error_to_error(&state.publisher, err))?;
-
-    match outcome {
-        DeliveryOutcome::Acked => Ok(()),
-        DeliveryOutcome::Rejected => Err(state
-            .publisher
-            .last_server_error()
-            .map(|err| err.error.clone())
-            .unwrap_or_else(|| error::fmt!(SocketError, "QWP/WebSocket frame was rejected"))),
-        DeliveryOutcome::Terminal => Err(state
-            .publisher
-            .terminal_error()
-            .cloned()
-            .unwrap_or_else(|| error::fmt!(SocketError, "QWP/WebSocket sender is terminal"))),
-        DeliveryOutcome::Timeout => Err(error::fmt!(
-            SocketError,
-            "QWP/WebSocket flush timed out before the server acknowledged the frame"
-        )),
-    }
+    let payload = state.encoder.encode(buffer)?;
+    state.runner.publish_replay_payload(payload)
 }
 
 pub(crate) fn max_flush_drive_steps(qwp_ws: &QwpWsConfig) -> usize {
@@ -726,10 +910,14 @@ pub(crate) fn publication_error_to_error(err: QwpWsPublicationError) -> crate::E
     }
 }
 
-pub(crate) fn driver_error_to_error(
-    publisher: &SyncQwpWsPublisher,
+pub(crate) fn driver_error_to_error<Q, T>(
+    publisher: &QwpWsPublicationDriver<Q, T>,
     err: DriverError,
-) -> crate::Error {
+) -> crate::Error
+where
+    Q: PublicationLog,
+    T: ManualDriverTransport,
+{
     match err {
         DriverError::Terminal => publisher
             .terminal_error()
@@ -762,7 +950,10 @@ fn driver_error_to_error_without_state(err: DriverError) -> crate::Error {
 
 #[cfg(test)]
 mod tests {
+    use super::super::qwp_ws_driver::{TransportFailure, TransportResponse, TransportSendResult};
+    use super::super::qwp_ws_queue::{OutboundFrame, SentFrame};
     use super::*;
+    use std::sync::{Arc, mpsc};
 
     #[test]
     fn frame_short_payload_is_masked() {
@@ -791,5 +982,86 @@ mod tests {
             "got: {}",
             err.msg()
         );
+    }
+
+    #[derive(Debug)]
+    struct BlockingFirstSendTransport {
+        send_started: mpsc::Sender<()>,
+        release_send: mpsc::Receiver<()>,
+        should_block_send: bool,
+        sent_frames: Vec<SentFrame>,
+    }
+
+    impl ManualDriverTransport for BlockingFirstSendTransport {
+        fn poll_response(&mut self) -> Result<Option<TransportResponse>, TransportFailure> {
+            Ok(None)
+        }
+
+        fn send_frame(
+            &mut self,
+            frame: OutboundFrame,
+        ) -> Result<TransportSendResult, TransportFailure> {
+            let sent_frame = frame.sent_frame();
+            if self.should_block_send {
+                self.should_block_send = false;
+                self.send_started.send(()).unwrap();
+                self.release_send
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+            }
+            self.sent_frames.push(sent_frame);
+            Ok(TransportSendResult::NoResponse)
+        }
+
+        fn sent_frames(&self) -> &[SentFrame] {
+            &self.sent_frames
+        }
+    }
+
+    #[test]
+    fn threaded_runner_accepts_publication_while_transport_send_is_blocked() {
+        let (send_started_tx, send_started_rx) = mpsc::channel();
+        let (release_send_tx, release_send_rx) = mpsc::channel();
+        let queue = VolatileFrameQueue::new(VolatileQueueOptions {
+            max_frames: 2,
+            max_bytes: 1024,
+            max_in_flight: 1,
+        })
+        .unwrap();
+        let transport = BlockingFirstSendTransport {
+            send_started: send_started_tx,
+            release_send: release_send_rx,
+            should_block_send: true,
+            sent_frames: Vec::new(),
+        };
+        let driver = ManualDriverPrototype::from_queue(queue, transport);
+        let publisher = QwpWsPublicationDriver::new(driver, 1);
+        let runner = Arc::new(SyncQwpWsRunner::start(publisher));
+
+        runner.publish_replay_payload(b"first").unwrap();
+        send_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+
+        let (published_tx, published_rx) = mpsc::channel();
+        let publish_runner = Arc::clone(&runner);
+        let publish_thread = std::thread::spawn(move || {
+            let result = publish_runner.publish_replay_payload(b"second");
+            let _ = published_tx.send(result.map(|_| ()));
+        });
+
+        let publish_result = match published_rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(result) => result,
+            Err(err) => {
+                let _ = release_send_tx.send(());
+                publish_thread.join().unwrap();
+                panic!("publication waited for blocked transport send: {err:?}");
+            }
+        };
+        publish_result.unwrap();
+        publish_thread.join().unwrap();
+
+        release_send_tx.send(()).unwrap();
+        drop(runner);
     }
 }

@@ -53,6 +53,10 @@ ia_qwp_ws
 Rust currently has:
 
 - public sync `qwpws` cut over to the queue/publication driver,
+- high-level `Sender::flush()` / `flush_and_keep()` local-publication semantics
+  with a sender-owned runner advancing WebSocket I/O,
+- ordinary socket send and non-blocking receive polling outside the publication
+  mutex; reconnect/backoff is still the next runner/store coupling to remove,
 - volatile queue when `sf_dir` is unset,
 - Java-style `.sfa` slot queue when `sf_dir` is set,
 - `initial_connect_retry=sync` as an alias for current blocking startup retry,
@@ -137,7 +141,7 @@ Status values:
 | J6 | todo | Operational recovery / adapter layer | Orphan drainer scope check | Java now has real background orphan drainers and `.failed` sentinel behavior; Rust intentionally does not. | Re-read Java orphan scanner/drainer code and Rust SFA recovery scope; validate whether this is needed before public release. | Decision recorded; no partial drainer implementation without a real recovery scenario and behavioral test. |
 | J7 | todo | Documentation architecture | Docs sync after code slices | Handover, validation plan, and design proposal should not contradict the implemented contract. | Cross-read changed docs plus `QWP_WEBSOCKET_HANDOVER.md`, `QWP_WEBSOCKET_VALIDATION_PLAN.md`, and `QWP_WEBSOCKET_PIPELINED_FFI.md`. | Docs name current behavior, known gaps, and validation evidence without promising unimplemented Java features. |
 | J8 | done | Public sync error surface | Frame-local server rejection behavior | Java treats schema/write rejections as drop-and-continue and exposes the server message. Rust should report the rejection without making the sender terminal. | Re-read Java `CursorWebSocketSendLoop` and `SenderError`; inspect Rust codec/driver/public flush path and existing coverage. | Public mock-server test rejects the first flush with schema mismatch, verifies the server message and error category, then successfully flushes a second frame on the same sender. |
-| J9 | validating | Public `Sender` semantics | Java-like local-publication flush | Java `Sender.flush()` publishes into the cursor engine and returns before ACK; Rust's current public staging path waits for the submitted frame outcome. | Re-read Java `QwpWebSocketSender.flush()`, `CursorSendEngine.appendBlocking()`, Rust `flush_qwp_ws()`, `flush_and_keep()`, config parsing, and queue capacity semantics. | High-level Rust `Sender::flush()` / `flush_and_keep()` locally publish, pipeline before ACK, apply bounded append backpressure via `sf_append_deadline_millis`, and report later rejections through a bounded pollable observer path. |
+| J9 | partial | Public `Sender` semantics | Java-like local-publication flush | Java `Sender.flush()` publishes into the cursor engine and returns before ACK; Rust now has the local-publication runner slice but still lacks append-deadline backpressure and bounded post-flush rejection observation. | Re-read Java `QwpWebSocketSender.flush()`, `CursorSendEngine.appendBlocking()`, Rust `flush_qwp_ws()`, `flush_and_keep()`, config parsing, and queue capacity semantics. | High-level Rust `Sender::flush()` / `flush_and_keep()` locally publish, pipeline before ACK, apply bounded append backpressure via `sf_append_deadline_millis`, and report later rejections through a bounded pollable observer path. |
 
 ## Slice Notes
 
@@ -176,8 +180,10 @@ terminal startup failures are delivered asynchronously.
 Rust's current public sync sender has a different observable contract:
 
 - `build()` connects,
-- `flush()` publishes and waits for the server outcome,
-- no background thread is started implicitly.
+- `flush()` publishes locally and returns before the newly submitted frame's
+  ACK,
+- the background runner starts only after the blocking initial connection
+  succeeds.
 
 Do not paper over that mismatch. Until Rust has a real implementation for the
 async lifecycle, `initial_connect_retry=async` must be rejected clearly. It must
@@ -287,9 +293,9 @@ Evidence:
 - Java: `initial_connect_retry=async` is a real lifecycle mode, not just a
   parser synonym; it returns a sender before a socket exists and reports
   startup terminal failures asynchronously.
-- Rust: current sync `qwpws` connects during `build()` and `flush()` waits for
-  the submitted frame's server outcome; accepting `async` without changing that
-  lifecycle would be misleading.
+- Rust: current sync `qwpws` still connects during `build()`. Its high-level
+  `flush()` now publishes locally, but accepting `async` without changing
+  construction and startup-error delivery would still be misleading.
 - Validation: source comparison only; implementation slice still needs parser
   tests.
 Result:
@@ -365,24 +371,25 @@ Evidence:
 - Java: `QwpWebSocketSender.flush()` publishes into the cursor engine and does
   not wait for server ACK; local backpressure is bounded by
   `sf_max_total_bytes` and `sf_append_deadline_millis`.
-- Rust: current public `flush_qwp_ws()` publishes one frame and waits for the
-  submitted frame's server outcome. The manual `QwpWsSender::submit()` already
-  has local-publication receipt semantics, but the ordinary `Sender` API is not
-  Java-like yet. Rust recognizes `sf_append_deadline_millis` and rejects it
-  until the current sender can use it for local-publication backpressure.
-- Validation: design-doc update only; code validation starts with behavioral
-  tests for delayed ACK, pipelined `flush()` / `flush_and_keep()`, append
-  backpressure, append-deadline config acceptance, and pollable async rejection
-  observation. A local experiment that only removed the ACK wait and kicked one
-  send step passed the happy-path pipeline test but regressed the existing
-  reconnect/replay tests because no progress owner remained to observe the
-  disconnect after `flush()` returned. Current Rust config tests cover
-  fail-fast rejection while the behavior is absent.
+- Rust: high-level `flush_qwp_ws()` now encodes a replay-safe payload, publishes
+  locally into memory/SFA storage, clears the caller buffer only after local
+  publication, and returns before ACK while a sender-owned runner advances
+  transport progress. The latest runner slice moves ordinary send and
+  non-blocking receive polling outside the publication mutex. Rust still
+  recognizes and rejects `sf_append_deadline_millis` until the current sender
+  can use it for Java-compatible local-publication backpressure, and
+  reconnect/backoff remains the next runner/store coupling to remove.
+- Validation: behavioral mock tests cover delayed ACK, pipelined `flush()` /
+  `flush_and_keep()`, schema/write rejection drop-and-continue, reconnect
+  replay, and a blocked transport send that does not block another local
+  publication. Remaining validation starts with blocked-reconnect publication,
+  append backpressure, append-deadline config acceptance, and pollable async
+  rejection observation.
 Result:
-- validating: append-deadline config remains rejected until it affects runtime
-  backpressure; introduce a shared cursor-engine boundary and high-level
-  `Sender` runner before changing public `Sender::flush()` semantics. Do not
-  ship a partial "publish and kick" cutover.
+- partial: local-publication `flush()` and the first runner ownership slices are
+  in place. Append-deadline config remains rejected until it affects runtime
+  backpressure. Continue converging toward the Java-shaped store/runner split
+  rather than growing the manual driver as the permanent high-level runner core.
 
 ## Open Questions
 

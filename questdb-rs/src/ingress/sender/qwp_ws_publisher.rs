@@ -26,43 +26,85 @@
 
 //! Replay-publication shell for the pipelined QWP/WebSocket prototype.
 //!
-//! The manual driver is intentionally payload-opaque. This owner sits one level
-//! above it: it holds connection-scoped replay encoder state, turns a QWP buffer
-//! into a self-sufficient replay payload, then publishes those bytes to the
-//! driver's queue.
+//! The manual driver is intentionally payload-opaque. This module sits one level
+//! above it: the replay encoder turns a QWP buffer into a self-sufficient replay
+//! payload, and the publication driver publishes those bytes to the driver's
+//! queue.
 
 use crate::error;
 use crate::ingress::buffer::{QwpBuffer, QwpWsEncodeScratch, SymbolGlobalDict};
 
 use super::qwp_ws_driver::{
-    CloseOutcome, DeliveryOutcome, DriveOutcome, DriverError, DriverEvent, ManualDriverPrototype,
-    ManualDriverQueue, ManualDriverTransport, QwpRejectedFrame, QwpServerError,
+    CloseOutcome, DeliveryOutcome, DetachedReceive, DetachedSend, DriveOutcome, DriverError,
+    DriverEvent, ManualDriverPrototype, ManualDriverTransport, PublicationLog, QwpRejectedFrame,
+    QwpServerError, TransportFailure, TransportResponse, TransportSendResult,
 };
 use super::qwp_ws_queue::{QwpReceipt, QwpReceiptStatus, SentFrame};
 
 pub(crate) struct QwpWsPublicationDriver<Q, T> {
     driver: ManualDriverPrototype<Q, T>,
+    encoder: QwpWsReplayEncoder,
+}
+
+pub(crate) struct QwpWsReplayEncoder {
     scratch: QwpWsEncodeScratch,
     global_dict: SymbolGlobalDict,
     version: u8,
 }
 
-impl<Q: ManualDriverQueue, T: ManualDriverTransport> QwpWsPublicationDriver<Q, T> {
-    pub(crate) fn new(driver: ManualDriverPrototype<Q, T>, version: u8) -> Self {
+impl QwpWsReplayEncoder {
+    pub(crate) fn new(version: u8) -> Self {
         Self {
-            driver,
             scratch: QwpWsEncodeScratch::new(),
             global_dict: SymbolGlobalDict::new(),
             version,
         }
     }
 
+    pub(crate) fn version(&self) -> u8 {
+        self.version
+    }
+
+    pub(crate) fn encode(&mut self, buffer: &QwpBuffer) -> crate::Result<&[u8]> {
+        if buffer.is_empty() {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "Cannot submit an empty QWP/WebSocket buffer."
+            ));
+        }
+        buffer.encode_ws_replay_message(&mut self.scratch, &mut self.global_dict, self.version)?;
+        Ok(&self.scratch.message)
+    }
+}
+
+impl<Q: PublicationLog, T: ManualDriverTransport> QwpWsPublicationDriver<Q, T> {
+    pub(crate) fn new(driver: ManualDriverPrototype<Q, T>, version: u8) -> Self {
+        Self {
+            driver,
+            encoder: QwpWsReplayEncoder::new(version),
+        }
+    }
+
+    pub(crate) fn version(&self) -> u8 {
+        self.encoder.version()
+    }
+
     pub(crate) fn try_submit_qwp(
         &mut self,
         buffer: &QwpBuffer,
     ) -> Result<QwpReceipt, QwpWsPublicationError> {
-        self.encode_replay(buffer)?;
-        Ok(self.driver.try_submit(&self.scratch.message)?)
+        let payload = self
+            .encoder
+            .encode(buffer)
+            .map_err(QwpWsPublicationError::Encode)?;
+        Ok(self.driver.try_submit(payload)?)
+    }
+
+    pub(crate) fn try_submit_replay_payload(
+        &mut self,
+        payload: &[u8],
+    ) -> Result<QwpReceipt, DriverError> {
+        self.driver.try_submit(payload)
     }
 
     pub(crate) fn submit_qwp_with_drive_limit(
@@ -70,10 +112,13 @@ impl<Q: ManualDriverQueue, T: ManualDriverTransport> QwpWsPublicationDriver<Q, T
         buffer: &QwpBuffer,
         max_drive_steps: usize,
     ) -> Result<QwpReceipt, QwpWsPublicationError> {
-        self.encode_replay(buffer)?;
+        let payload = self
+            .encoder
+            .encode(buffer)
+            .map_err(QwpWsPublicationError::Encode)?;
         Ok(self
             .driver
-            .submit_with_drive_limit(&self.scratch.message, max_drive_steps)?)
+            .submit_with_drive_limit(payload, max_drive_steps)?)
     }
 
     pub(crate) fn drive_once(&mut self) -> Result<DriveOutcome, DriverError> {
@@ -86,6 +131,40 @@ impl<Q: ManualDriverQueue, T: ManualDriverTransport> QwpWsPublicationDriver<Q, T
 
     pub(crate) fn drive_receive_once(&mut self) -> Result<DriveOutcome, DriverError> {
         self.driver.drive_receive_once()
+    }
+
+    pub(crate) fn drive_receive_ready_once(&mut self) -> Result<DriveOutcome, DriverError> {
+        self.driver.drive_receive_ready_once()
+    }
+
+    pub(crate) fn is_terminal(&self) -> bool {
+        self.driver.is_terminal()
+    }
+
+    pub(crate) fn detach_send_available(&mut self) -> Result<Option<DetachedSend<T>>, DriverError> {
+        self.driver.detach_send_available()
+    }
+
+    pub(crate) fn finish_detached_send(
+        &mut self,
+        transport: T,
+        frame: SentFrame,
+        send_result: Result<TransportSendResult, TransportFailure>,
+    ) -> Result<DriveOutcome, DriverError> {
+        self.driver
+            .finish_detached_send(transport, frame, send_result)
+    }
+
+    pub(crate) fn detach_receive_ready(&mut self) -> Option<DetachedReceive<T>> {
+        self.driver.detach_receive_ready()
+    }
+
+    pub(crate) fn finish_detached_receive(
+        &mut self,
+        transport: T,
+        response: Result<Option<TransportResponse>, TransportFailure>,
+    ) -> Result<DriveOutcome, DriverError> {
+        self.driver.finish_detached_receive(transport, response)
     }
 
     pub(crate) fn wait_steps(
@@ -133,18 +212,6 @@ impl<Q: ManualDriverQueue, T: ManualDriverTransport> QwpWsPublicationDriver<Q, T
 
     pub(crate) fn into_driver(self) -> ManualDriverPrototype<Q, T> {
         self.driver
-    }
-
-    fn encode_replay(&mut self, buffer: &QwpBuffer) -> Result<(), QwpWsPublicationError> {
-        if buffer.is_empty() {
-            return Err(QwpWsPublicationError::Encode(error::fmt!(
-                InvalidApiCall,
-                "Cannot submit an empty QWP/WebSocket buffer."
-            )));
-        }
-        buffer
-            .encode_ws_replay_message(&mut self.scratch, &mut self.global_dict, self.version)
-            .map_err(QwpWsPublicationError::Encode)
     }
 }
 
