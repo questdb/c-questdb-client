@@ -1,6 +1,6 @@
 # QWP/WebSocket pipelined Store-and-Forward handover
 
-Date: 2026-04-29
+Date: 2026-04-30
 
 Status: active validation branch for the Rust client plus C FFI shape.
 
@@ -9,6 +9,9 @@ Rust prototypes, real-server probes, C ABI shape stubs, and the first public
 sync `qwpws` cutover. The public sync sender now uses the publication driver and
 chooses its queue from `QwpWsConfig`: `sf_dir` unset uses the volatile queue,
 and `sf_dir` set opens the Java-compatible `<sf_dir>/<sender_id>/` SFA slot.
+The public reconnect configuration now follows the Java ingestion sender model:
+duration-bound reconnect, no max-attempt cap, no failover callback, and
+`initial_connect_retry` as the explicit startup retry opt-in.
 
 Do not read this as production readiness. The async `qwpws` sender still uses
 the older Tokio path and rejects SF queue config before connecting. The C ABI
@@ -72,7 +75,7 @@ ia_qwp_ws
 Most recent committed checkpoint:
 
 ```text
-917df16 Add QWP WebSocket SF config boundary
+13041e4 Align QWP WebSocket reconnect with Java
 ```
 
 Recent validation after the Step 12 publication-shell, reconnect-probe, and
@@ -135,13 +138,13 @@ Observed result:
 
 ```text
 qwpws_store_and_forward: 6 passed
-qwp_ws: 142 passed, 8 ignored
+qwp_ws: 143 passed, 8 ignored
 qwpws_store_and_forward with async-sender-qwp-ws: 6 passed
 ```
 
 The ignored tests are real-server probes gated by environment variables.
 
-Latest public sync cutover validation:
+Latest public sync cutover and Java reconnect-parity validation:
 
 ```bash
 cargo test --manifest-path questdb-rs/Cargo.toml qwp_ws --lib
@@ -156,7 +159,7 @@ cargo test --manifest-path questdb-rs/Cargo.toml qwpws_store_and_forward \
 Observed result:
 
 ```text
-qwp_ws: 142 passed, 8 ignored
+qwp_ws: 143 passed, 8 ignored
 qwpws_store_and_forward: 6 passed
 qwp_ws_async with async-sender-qwp-ws: 9 passed
 minimal sync-sender-qwp-ws qwpws_store_and_forward: 5 passed, with existing reduced-feature unused-code warnings
@@ -499,6 +502,8 @@ conversion before the real driver is wired through.
 - Java-compatible initial connection configuration (`initial_connect_retry`) is
   implemented in the public sync and async Rust sender paths and covered by
   dropped-upgrade mock-server tests.
+- Java-compatible reconnect configuration is now duration-bound, without the
+  Rust-only max-attempt cap or failover callback prototype.
 - The FFI shape stubs are not connected to the real queue/driver prototypes.
 - Active queue/driver/FFI prototype vocabulary now uses Java-compatible
   `Rejected` naming before ABI hardening.
@@ -539,19 +544,18 @@ conversion before the real driver is wired through.
 
 ## Recommended next step
 
-Validate the public sync product path end to end, then cut or retire the
-remaining older async path deliberately.
+Validate the public sync product path end to end, then decide the older async
+path deliberately.
 
 1. Add or run a real QuestDB public `Sender` probe with `sf_dir` enabled:
    publish, drop/reopen from the same slot, replay retained bytes, and verify
    cleanup after ACK.
-2. Add focused behavior tests for async `build_async()` rejecting SF queue
-   config until it is cut over or retired.
-3. Preserve Java's simple durable model: `.sfa` segment files and QWP payload
+2. Preserve Java's simple durable model: `.sfa` segment files and QWP payload
    bytes only. Do not add Rust-only ACK, rejection, receipt, wire-sequence,
    in-flight, or dead-letter records.
-4. Decide whether the async public sender should be rewritten on the publication
-   driver or deprecated behind the planned explicit adapters.
+3. Decide whether the async public sender should be rewritten on the publication
+   driver or deprecated behind the planned explicit adapters. Its SF queue
+   config rejection tests are already in place.
 
 Do not start with C++/Python wrappers, orphan draining, SF compaction, or
 performance optimization. The main de-risking question is now whether the public

@@ -55,7 +55,7 @@ requires a different shape.
 - Preserve submission order: later batches cannot jump an earlier unresolved batch.
 - Avoid infinite replay of deterministic bad batches.
 - Avoid silent data loss: server rejections must be observable through receipts,
-  events, or error handlers.
+  wait outcomes, or events.
 
 ## Non-goals
 
@@ -769,7 +769,7 @@ Do not add a Rust-only dead-letter file subsystem in v1. Match Java's model:
 - preserve raw server status, wire sequence, message, affected FSN span, and
   table attribution when available,
 - expose the rejected frame through receipt status / wait outcome,
-- publish a transition event or call the configured handler,
+- publish a transition event for observability,
 - drop-and-continue only for the Java-compatible categories,
 - latch terminal categories so the next producer call reports the error.
 
@@ -780,10 +780,11 @@ delivers a structured `SenderError` to user code. Java's `.corrupt` files are a
 different mechanism: recovery quarantine for damaged `.sfa` segment files, not
 dead-letter storage for server-rejected batches.
 
-Users that need durable dead-letter storage can implement it in the error
-handler by joining the reported FSN span to their own producer-side log. The
-client should not create dead-letter files or expose a rejection-policy knob
-unless Java grows that feature too.
+Users that need durable dead-letter storage can implement it in their own
+producer/error-handling layer by joining the reported FSN span to their
+producer-side log. The client should not create dead-letter files, install a
+Rust-only callback, or expose a rejection-policy knob unless Java grows that
+feature too.
 
 ## Reconnect and replay
 
@@ -1233,28 +1234,42 @@ connecting because it has not been moved onto the queue/driver core. The public
 sync and async sender paths now parse and apply Java-compatible reconnect keys,
 including `initial_connect_retry` for startup retry.
 
-## First implementation slice
+## Implementation progress
 
-1. Add the Java-style self-sufficient replay encoder path and tests proving a later frame replays alone on a fresh connection.
-2. Add Java/Rust golden payload fixtures for replay-mode QWP bytes.
-3. Add the threadless `QwpWsSender` core with Java-style memory mode
-   (`sf_dir` unset) first.
-4. Wire `submit` through `Buffer -> replay payload -> queue publication`; return value receipts only after publication.
-5. Implement fixed-capacity in-flight table and event ring.
-6. Implement `drive_once`, `wait`, and close semantics.
-7. Validate the full Rust-only path against real QWP/WebSocket: replay payload publication, manual driver transport, ACK, and reconnect replay.
-8. Add C ABI for construct, new buffer, submit, drive, poll event, wait, receipt status, close.
-9. Add mock-server tests for pipelining, cumulative ACKs, ordered server errors, close, and no buffer clear on failed submit.
-10. Add Java-compatible `.sfa` file-backed SF segment storage, recovery, slot
-    locking, rotation, and ACK-driven trim behind `sf_dir`.
-11. Add Java/Rust `.sfa` golden fixtures before treating the disk format as a
-    product contract.
-12. Wire the public sync `qwpws` sender to the publication driver and
+Validated in the current Rust branch:
+
+1. Java-style self-sufficient replay encoder path and tests proving a later
+   frame can replay alone on a fresh connection.
+2. Java/Rust golden payload fixtures for replay-mode QWP bytes.
+3. Threadless manual driver core with Java-style memory mode when `sf_dir` is
+   unset.
+4. `Buffer -> replay payload -> queue publication` shell with value receipts
+   returned only after local publication.
+5. Fixed-capacity in-flight table, event ring, `drive_once`, `wait`, and close
+   semantics in the manual core.
+6. Real QWP/WebSocket blocking transport behind the manual driver, including ACK
+   handling and reconnect replay.
+7. Mock-server tests for pipelining, cumulative ACKs, ordered server errors,
+   close behavior, no buffer clear on failed submit, replay-safe payloads, and
+   dropped-upgrade startup retry.
+8. Java-compatible `.sfa` segment/slot storage, recovery, locking, rotation, and
+   ACK-driven trim behind `sf_dir`.
+9. Java/Rust `.sfa` golden fixtures for segment header/frame bytes.
+10. Public sync `qwpws` sender cutover to the publication driver with
     config-derived volatile/SFA queue selection.
-13. Add Java-compatible server rejection reporting and handler plumbing.
-14. Add explicit background runner as an ownership-consuming adapter.
-15. Add or retire the Tokio adapter.
-16. Add C++ and Python wrappers after the C ABI is stable.
+11. Java ingestion reconnect surface: `reconnect_*` keys,
+    `initial_connect_retry`, no max-attempt cap, and no Rust-only failover
+    callback.
+
+Remaining product work:
+
+1. Wire the C ABI stubs to the real queue/driver core.
+2. Add or promote real-server public `Sender` probes for `sf_dir` recovery.
+3. Finish Java-compatible server rejection reporting through the public/FFI
+   surfaces without adding Rust-only dead-letter files or callbacks.
+4. Add explicit background runner as an ownership-consuming adapter.
+5. Cut over or retire the older Tokio async sender.
+6. Add C++ and Python wrappers after the C ABI is stable.
 
 ## Tests
 
