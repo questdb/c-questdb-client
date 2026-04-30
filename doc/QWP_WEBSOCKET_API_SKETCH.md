@@ -29,7 +29,7 @@ document whether it means local publication only or server delivery.
 ```rust
 pub struct QwpWsSender;
 pub struct QwpWsThreadedSender;
-pub struct QwpWsTokioSender;
+pub struct QwpWsAsyncSender;
 pub struct QwpWsDriver;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -260,18 +260,18 @@ Stopping a threaded sender does not return the original manual sender. To
 resume manual control, close the threaded handle and open or recover a new
 manual sender from the same Store-and-Forward slot.
 
-## Rust Tokio adapter
+## Rust Async adapter
 
-Tokio support is an adapter. The caller decides whether and where to spawn the
-driver. Tokio types should not appear in the C ABI.
+Async support is an adapter over the same sender core. Runtime-specific types
+should not appear in the C ABI.
 
 ```rust
 use std::time::Duration;
-use questdb::ingress::{QwpDeliveryOutcome, QwpWsTokioSender};
+use questdb::ingress::{QwpDeliveryOutcome, QwpWsAsyncSender, QwpWsSender};
 
-async fn tokio_sender() -> questdb::Result<()> {
-    let (sender, driver) = QwpWsTokioSender::open(opts()).await?;
-    let driver_task = tokio::spawn(async move { driver.run().await });
+async fn async_sender() -> questdb::Result<()> {
+    let sender = QwpWsSender::open(opts())?;
+    let sender = QwpWsAsyncSender::from_sender(sender)?;
 
     let mut buffer = sender.new_buffer();
     buffer.table("events")?.symbol("kind", "click")?.column_i64("user", 7)?.at_now()?;
@@ -285,7 +285,6 @@ async fn tokio_sender() -> questdb::Result<()> {
     }
 
     sender.close_drain(Duration::from_secs(5)).await?;
-    driver_task.await??;
     Ok(())
 }
 ```
@@ -644,7 +643,7 @@ change to the core delivery contract.
 - Operations that poll: `receipt_status()` and `poll_event()` are non-blocking.
 - Operations that drive progress: manual `drive_once()`, `wait()`,
   `close_drain()`, and possibly `submit()` when waiting for local capacity.
-  Threaded and Tokio adapters delegate progress to their explicit driver.
+  Threaded and async adapters delegate progress to their explicit driver.
 - Timeout surfacing: local publication timeout is an API error because no
   receipt exists; delivery timeout is a `QwpDeliveryOutcome::Timeout`; close
   timeout is a `QwpCloseOutcome::Timeout`.
@@ -693,8 +692,8 @@ Do not add a `flush()` alias to the low-level core during the first prototype.
   runtime-neutral FFI, and observable delivery?
 
   Yes. `Buffer` remains caller-owned and reusable after successful `submit()`.
-  Manual, threaded, and Tokio modes are represented by ownership conversion.
-  Tokio is not visible through C. Delivery is observable through receipts,
+  Manual, threaded, and async modes are represented by ownership conversion.
+  Async runtime details are not visible through C. Delivery is observable through receipts,
   status polling, wait outcomes, close outcomes, and events.
 
 - Should the design proceed to a type-only progress ownership prototype?

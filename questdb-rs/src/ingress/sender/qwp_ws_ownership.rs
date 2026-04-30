@@ -102,8 +102,8 @@ impl QwpWsThreadedSender {
 
 /// Explicit async ownership adapter.
 ///
-/// This is runtime-neutral in the type-only prototype. A later Tokio adapter can
-/// build on the same ownership conversion without exposing Tokio through C.
+/// This is runtime-neutral in the type-only prototype. A later async adapter can
+/// build on the same ownership conversion without exposing a runtime through C.
 #[derive(Debug)]
 pub struct QwpWsAsyncSender {
     inner: QwpWsSender,

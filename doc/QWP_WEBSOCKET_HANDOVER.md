@@ -13,9 +13,10 @@ The public reconnect configuration now follows the Java ingestion sender model:
 duration-bound reconnect, no max-attempt cap, no failover callback, and
 `initial_connect_retry` as the explicit startup retry opt-in.
 
-Do not read this as production readiness. The async `qwpws` sender still uses
-the older Tokio path and rejects SF queue config before connecting. The C ABI
-still contains shape-only stubs rather than the real queue/driver core.
+Do not read this as production readiness. The older Tokio `qwpws` sender was an
+experiment and has been removed instead of maintained as a second implementation.
+Future async support should be an adapter over the single queue/driver core. The
+C ABI still contains shape-only stubs rather than the real queue/driver core.
 
 ## Read first
 
@@ -75,11 +76,11 @@ ia_qwp_ws
 Most recent committed checkpoint:
 
 ```text
-13041e4 Align QWP WebSocket reconnect with Java
+aeaf750 Add public QWP WebSocket SFA recovery probe
 ```
 
-Recent validation after the Step 12 publication-shell, reconnect-probe, and
-`.sfa` recovery slices:
+Recent validation after the publication-shell, reconnect, `.sfa` recovery,
+public sync cutover, and Java reconnect-parity slices:
 
 ```bash
 cargo test --manifest-path questdb-rs/Cargo.toml qwp_ws_driver
@@ -88,9 +89,6 @@ cargo test --manifest-path questdb-rs/Cargo.toml \
     --no-default-features \
     --features _sender-qwp-ws,tls-webpki-certs,ring-crypto \
     qwp_ws_driver
-cargo test --manifest-path questdb-rs/Cargo.toml \
-    --features async-sender-qwp-ws \
-    qwp_ws_async
 QDB_QWP_WS_PUBLICATION_PROBE=1 \
     cargo test --manifest-path questdb-rs/Cargo.toml \
     qwp_ws_publication_driver_submit_waits_and_row_is_queryable \
@@ -104,6 +102,10 @@ QDB_QWP_WS_SFA_PROBE=1 \
     cargo test --manifest-path questdb-rs/Cargo.toml --lib \
     qwp_ws_sfa_recovered_frame_is_delivered_and_cleaned_up \
     -- --ignored --nocapture
+QDB_QWP_WS_PUBLIC_SFA_PROBE=1 \
+    cargo test --manifest-path questdb-rs/Cargo.toml --lib \
+    qwp_ws_public_sender_sfa_recovers_after_failed_flush \
+    -- --ignored --nocapture
 cargo test --manifest-path questdb-rs/Cargo.toml --lib
 cargo fmt --manifest-path questdb-rs/Cargo.toml --check
 git diff --check
@@ -113,14 +115,14 @@ Observed result:
 
 ```text
 qwp_ws_driver: 47 passed
-qwp_ws: 126 passed, 6 ignored
-minimal _sender-qwp-ws driver filter: 43 passed, with existing unused-code warnings
-qwp_ws_async with async-sender-qwp-ws: 9 passed
+qwp_ws: 143 passed, 9 ignored
+minimal _sender-qwp-ws driver filter: 40 passed, with reduced-feature unused-code warnings
 real QuestDB publication probe: 1 passed
 real QuestDB reconnect probe: 1 passed
 qwp_ws_sfa: 22 passed, 3 ignored
 real QuestDB .sfa recovery probe: 1 passed
-cargo test --lib: 475 passed, 10 ignored
+real QuestDB public Sender SFA recovery probe: 1 passed
+cargo test --lib: 487 passed, 11 ignored
 format and whitespace checks passed
 ```
 
@@ -129,17 +131,13 @@ Latest config-boundary validation:
 ```bash
 cargo test --manifest-path questdb-rs/Cargo.toml qwpws_store_and_forward --lib
 cargo test --manifest-path questdb-rs/Cargo.toml qwp_ws --lib
-cargo test --manifest-path questdb-rs/Cargo.toml \
-    --features async-sender-qwp-ws \
-    qwpws_store_and_forward --lib
 ```
 
 Observed result:
 
 ```text
 qwpws_store_and_forward: 6 passed
-qwp_ws: 143 passed, 8 ignored
-qwpws_store_and_forward with async-sender-qwp-ws: 6 passed
+qwp_ws: 143 passed, 9 ignored
 ```
 
 The ignored tests are real-server probes gated by environment variables.
@@ -149,8 +147,6 @@ Latest public sync cutover and Java reconnect-parity validation:
 ```bash
 cargo test --manifest-path questdb-rs/Cargo.toml qwp_ws --lib
 cargo test --manifest-path questdb-rs/Cargo.toml qwpws_store_and_forward --lib
-cargo test --manifest-path questdb-rs/Cargo.toml qwp_ws_async --lib \
-    --features async-sender-qwp-ws
 cargo test --manifest-path questdb-rs/Cargo.toml qwpws_store_and_forward \
     --lib --no-default-features \
     --features sync-sender-qwp-ws,tls-webpki-certs,ring-crypto
@@ -159,9 +155,8 @@ cargo test --manifest-path questdb-rs/Cargo.toml qwpws_store_and_forward \
 Observed result:
 
 ```text
-qwp_ws: 143 passed, 8 ignored
+qwp_ws: 143 passed, 9 ignored
 qwpws_store_and_forward: 6 passed
-qwp_ws_async with async-sender-qwp-ws: 9 passed
 minimal sync-sender-qwp-ws qwpws_store_and_forward: 5 passed, with existing reduced-feature unused-code warnings
 ```
 
@@ -331,9 +326,9 @@ The public sync sender now uses config-derived queue selection:
 - `sf_durability=flush|append` still fails before connecting because v1 supports
   Java's default memory/page-cache durability only.
 
-The public async sender is not cut over in this slice. It still rejects `sf_dir`,
-`sf_max_bytes`, and `sf_max_total_bytes` before connecting so SF queue config
-cannot be silently accepted by the older Tokio path.
+The older Tokio public async sender has been removed. Future async support
+should be an adapter over the same queue/driver core, so SF queue config cannot
+silently take a second implementation path.
 
 It does not yet implement orphan draining or a non-ignored CI fixture. The
 cross-client fixture compiles a small Java helper into `/tmp` and uses the local
@@ -469,7 +464,7 @@ conversion before the real driver is wired through.
 
 - New pipelined SF core should be Rust-first and FFI-friendly.
 - Low-level core is threadless by default.
-- Background thread and Tokio integration are explicit adapters.
+- Background thread and async integration are explicit adapters.
 - Exactly one progress owner exists at a time.
 - `submit()` means local publication, not server ACK.
 - `wait()` means server delivery observation.
@@ -545,23 +540,20 @@ conversion before the real driver is wired through.
 
 ## Recommended next step
 
-The public sync product path now has a real-server SFA recovery probe. Decide
-the older async path deliberately before widening wrappers or background
-ownership.
+The public sync product path now has a real-server SFA recovery probe, and the
+older Tokio async sender has been removed to keep one maintained QWP/WebSocket
+core.
 
 1. Preserve Java's simple durable model: `.sfa` segment files and QWP payload
    bytes only. Do not add Rust-only ACK, rejection, receipt, wire-sequence,
    in-flight, or dead-letter records.
-2. Decide whether the async public sender should be rewritten on the publication
-   driver or deprecated behind the planned explicit adapters. Its SF queue
-   config rejection tests are already in place.
-3. Finish Java-compatible server rejection reporting through the public/FFI
+2. Finish Java-compatible server rejection reporting through the public/FFI
    surfaces without adding dead-letter files or callbacks.
+3. Wire the C ABI stubs to the real queue/driver core.
 
 Do not start with C++/Python wrappers, orphan draining, SF compaction, or
-performance optimization. The main de-risking question is now whether there
-should be one maintained QWP/WebSocket sender core or a second async
-implementation with a deliberately smaller feature surface.
+performance optimization. Future async support should be an explicit adapter
+over the same core, not a separate sender implementation.
 
 ## Commands worth re-running
 

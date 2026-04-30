@@ -1444,62 +1444,6 @@ impl SenderBuilder {
         }
     }
 
-    /// Build an async [`AsyncSender`] for QWP over WebSocket. Only the
-    /// `Protocol::QwpWs` and `Protocol::QwpWss` protocols are accepted; other
-    /// protocols return a `ConfigError`.
-    #[cfg(feature = "async-sender-qwp-ws")]
-    pub async fn build_async(&self) -> Result<AsyncSender> {
-        if !self.protocol.is_qwp_ws() {
-            return Err(error::fmt!(
-                ConfigError,
-                "build_async() is only supported for QWP/WebSocket protocols (qwpws, qwpwss); \
-                 use build() for sync transports."
-            ));
-        }
-        if self.net_interface.is_some() {
-            return Err(error::fmt!(
-                InvalidApiCall,
-                "net_interface is not supported for QWP over WebSocket."
-            ));
-        }
-        let tls_settings = tls::TlsSettings::build(
-            self.protocol.tls_enabled(),
-            #[cfg(feature = "insecure-skip-verify")]
-            *self.tls_verify,
-            *self.tls_ca,
-            self.tls_roots.deref().as_deref(),
-        )?;
-        let auth = self.build_auth()?;
-        let basic_auth = match &auth {
-            Some(conf::AuthParams::Basic(b)) => Some(b.to_header_string()),
-            Some(conf::AuthParams::Token(t)) => Some(t.to_header_string()?),
-            #[cfg(feature = "_sender-tcp")]
-            Some(conf::AuthParams::Ecdsa(_)) => {
-                return Err(error::fmt!(
-                    AuthError,
-                    "ECDSA authentication is not supported for QWP/WebSocket. \
-                     Use basic or token authentication instead."
-                ));
-            }
-            None => None,
-        };
-        let qwp_ws = self
-            .qwp_ws
-            .as_ref()
-            .ok_or_else(|| error::fmt!(ConfigError, "QWP/WebSocket configuration is missing."))?;
-        reject_unsupported_async_qwp_ws_sf_config(qwp_ws)?;
-        connect_async_qwp_ws(
-            self.host.as_str(),
-            self.port.as_str(),
-            matches!(self.protocol, Protocol::QwpWss),
-            tls_settings,
-            qwp_ws,
-            basic_auth,
-            *self.max_buf_size,
-        )
-        .await
-    }
-
     #[cfg(feature = "_sync-sender")]
     /// Build the sender.
     ///
@@ -1869,18 +1813,6 @@ fn reject_unsupported_qwp_ws_sf_config(qwp_ws: &conf::QwpWsConfig) -> Result<()>
         ));
     }
 
-    Ok(())
-}
-
-#[cfg(feature = "async-sender-qwp-ws")]
-fn reject_unsupported_async_qwp_ws_sf_config(qwp_ws: &conf::QwpWsConfig) -> Result<()> {
-    reject_unsupported_qwp_ws_sf_config(qwp_ws)?;
-    if qwp_ws.sf_queue_config_is_specified() {
-        return Err(error::fmt!(
-            ConfigError,
-            "QWP/WebSocket Store-and-Forward queue config is not supported by build_async() yet; use build() or omit sf_dir, sf_max_bytes, and sf_max_total_bytes."
-        ));
-    }
     Ok(())
 }
 

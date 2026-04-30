@@ -171,7 +171,7 @@ Cover at least:
 
 - Rust manual/synchronous use
 - Rust threaded adapter use
-- Rust Tokio adapter use
+- Rust async adapter use
 - C use
 - C++ RAII use
 - Python blocking use
@@ -183,7 +183,7 @@ Validation target:
 - There is no silent background thread in the low-level API.
 - Submission, delivery, timeout, and close semantics are visible from names.
 - Receipts are easy to understand as value IDs.
-- The API does not make FFI users model Rust futures or Tokio.
+- The API does not make FFI users model Rust futures or a specific async runtime.
 
 Design pressure to watch:
 
@@ -698,9 +698,9 @@ Validation target:
 - The public sync `Sender` path has a live QuestDB SFA recovery probe covering
   failed flush, reopen from the same Java-style slot, replay, follow-up ACK, and
   cleanup.
-- The public async `build_async()` path fails loudly for SF queue config until
-  it is cut over or retired, rather than silently ignoring `sf_dir` or queue
-  sizing.
+- The old Tokio `build_async()` path is removed rather than maintained as a
+  second QWP/WebSocket implementation. Future async support should be an adapter
+  over the same queue/driver core.
 - Authentication, WebSocket upgrade, and close behavior map into the existing
   error/outcome model.
 - Failed encode or queue publication may reserve internal symbol IDs, but must

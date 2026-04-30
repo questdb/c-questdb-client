@@ -216,13 +216,6 @@ impl QwpWsConfig {
         };
         default_max_total_bytes.max(self.sf_max_bytes.saturating_mul(2))
     }
-
-    #[cfg(feature = "async-sender-qwp-ws")]
-    pub(crate) fn sf_queue_config_is_specified(&self) -> bool {
-        self.sf_dir.is_some()
-            || matches!(self.sf_max_bytes, ConfigSetting::Specified(_))
-            || matches!(self.sf_max_total_bytes, ConfigSetting::Specified(_))
-    }
 }
 
 #[cfg(any(feature = "_sender-http", feature = "_sender-qwp-ws"))]

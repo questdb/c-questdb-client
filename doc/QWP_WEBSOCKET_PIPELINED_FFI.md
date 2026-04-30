@@ -10,7 +10,6 @@ Java reference point:
 Rust code touched by this design:
 - `questdb-rs/src/ingress/buffer/qwp.rs`
 - `questdb-rs/src/ingress/sender/qwp_ws.rs`
-- `questdb-rs/src/ingress/sender/qwp_ws_async.rs`
 - `questdb-rs/src/ingress/sender/qwp_ws_codec.rs`
 - `questdb-rs/src/ingress/sender/qwp_ws_driver.rs`
 - `questdb-rs/src/ingress/sender/qwp_ws_publisher.rs`
@@ -24,13 +23,15 @@ Validation plan:
 
 ## Context
 
-The current Rust client already has QWP/UDP buffers, synchronous QWP/WebSocket,
-and a Tokio-based async QWP/WebSocket sender.
+The current Rust client already has QWP/UDP buffers and synchronous
+QWP/WebSocket. The earlier Tokio QWP/WebSocket sender was an experiment and is
+removed rather than maintained as a second implementation.
 
 That is not the target shape for durable pipelined FFI:
 
 - Rust, C, and C++ historically keep `Sender` and `Buffer` separate.
-- C and C++ callers should not need to understand Tokio or Rust futures.
+- C and C++ callers should not need to understand Rust futures or any specific
+  async runtime.
 - Python can build blocking, future, or asyncio wrappers, but the C ABI should remain runtime-neutral.
 - The low-level API must not silently start a background thread.
 - The steady-state hot path should not allocate after warm-up and sizing.
@@ -49,7 +50,8 @@ requires a different shape.
 - Let callers reuse or clear a `Buffer` immediately after successful submission.
 - Expose deterministic delivery state through receipts, outcomes, and events.
 - Keep the core API threadless by default.
-- Provide optional blocking-thread and Tokio adapters explicitly.
+- Provide optional blocking-thread or async adapters explicitly after the core
+  is stable.
 - Keep the C ABI simple and stable enough for C++, Python, and other FFI consumers.
 - Avoid heap allocation on steady-state submit, drive, ACK, and replay paths.
 - Preserve submission order: later batches cannot jump an earlier unresolved batch.
@@ -61,7 +63,7 @@ requires a different shape.
 
 - Replacing the existing synchronous `line_sender` ABI.
 - Making QWP/UDP use this WebSocket pipelining API.
-- Exposing Tokio handles through C.
+- Exposing async-runtime handles through C.
 - Starting orphan drainers automatically.
 - Row-level recovery inside a rejected QWP batch.
 - Exactly-once delivery without server-side idempotency or deduplication.
@@ -82,22 +84,12 @@ it opens the Java-compatible `<sf_dir>/<sender_id>/` slot and stores unmasked
 QWP payload bytes in `.sfa` segment files. `sf_durability=flush|append` remains
 reserved and fails before connecting.
 
-The async QWP/WebSocket sender is still the older Tokio implementation. It is
-already pipelined. It uses Tokio tasks, an unbounded writer channel, an in-flight
-`BTreeMap`, `oneshot` completions, and cloned `Buffer` values for replay. That
-is workable for a Rust async API, but it conflicts with the FFI and hot-path
-constraints:
-
-- Tokio is mandatory for that path.
-- Construction and reconnect spawn tasks.
-- Submission allocates for channels, maps, frames, and completion state.
-- In-flight replay stores cloned buffers rather than durable self-sufficient frames.
-- `flush()` waits for completion rather than returning a submission receipt.
-- SF queue config is rejected by `build_async()` until the async path is cut over
-  or retired.
-
-The durable Rust design reuses protocol helpers where useful, but the FFI target
-should be the new queue/driver core rather than the current Tokio sender.
+The old Tokio QWP/WebSocket sender is no longer part of the product surface. It
+used tasks, an unbounded writer channel, an in-flight `BTreeMap`, `oneshot`
+completions, and cloned `Buffer` values for replay. Keeping that path would
+force two sender cores with different durability and replay semantics. Future
+async support should be an ownership-consuming adapter over the same
+queue/driver core, not a parallel implementation.
 
 ## Design principle
 
@@ -112,7 +104,7 @@ QWP/WebSocket SF core
   in-flight slots, event ring, and preallocated scratch buffers.
 
 Adapters
-  Blocking convenience API, explicit background runner, Tokio integration,
+  Blocking convenience API, explicit background runner, async integration,
   C ABI, C++ RAII, Python wrappers.
 ```
 
@@ -205,7 +197,7 @@ Initial connection work may include:
 - authentication failure detection.
 
 All of that work must be bounded by configured connect/request timeouts. The
-manual core still must not start a background thread, spawn a Tokio task, or
+manual core still must not start a background thread, spawn a runtime task, or
 continue sending/replaying after `open()` returns. There is no public lazy
 constructor mode in v1; applications that want to tolerate startup ordering use
 `initial_connect_retry=true`, matching Java.
@@ -237,19 +229,20 @@ Rules:
   as a progress owner.
 - The runner uses the same core event and receipt semantics.
 
-### Tokio adapter
+### Future async adapter
 
 ```rust
-let (sender, driver) = QwpWsTokioSender::open(opts).await?;
-tokio::spawn(driver.run());
+let sender = QwpWsSender::open(opts)?;
+let async_sender = QwpWsAsyncSender::from_sender(sender)?;
 ```
 
 Rules:
 
-- Tokio support is optional and feature-gated.
-- Tokio integration is an adapter, not the core implementation.
-- The caller chooses whether and where to spawn the driver.
-- Async multi-producer ergonomics may allocate in the adapter, but the core steady-state hot path remains allocation-free after warm-up.
+- Async integration is an adapter, not the core implementation.
+- Runtime-specific code must not duplicate the QWP/WebSocket sender core.
+- The adapter consumes the manual sender so there is only one progress owner.
+- Async multi-producer ergonomics may allocate in the adapter, but the core
+  steady-state hot path remains allocation-free after warm-up.
 
 ## Buffer and submit contract
 
@@ -1270,8 +1263,7 @@ Remaining product work:
 2. Finish Java-compatible server rejection reporting through the public/FFI
    surfaces without adding Rust-only dead-letter files or callbacks.
 3. Add explicit background runner as an ownership-consuming adapter.
-4. Cut over or retire the older Tokio async sender.
-5. Add C++ and Python wrappers after the C ABI is stable.
+4. Add C++ and Python wrappers after the C ABI is stable.
 
 ## Tests
 
@@ -1280,7 +1272,7 @@ Rust core tests:
 - submit returns before ACK,
 - connected `open()` validates initial connection without starting a thread,
 - `initial_connect_retry=true` retries startup connection with the reconnect
-  policy; sync and async public sender paths cover this with a dropped-upgrade
+  policy; the sync public sender path covers this with a dropped-upgrade
   mock-server test,
 - successful submit clears buffer,
 - failed submit preserves buffer,

@@ -95,12 +95,6 @@ mod qwp_ws;
 #[cfg(feature = "sync-sender-qwp-ws")]
 pub(crate) use qwp_ws::*;
 
-#[cfg(feature = "async-sender-qwp-ws")]
-mod qwp_ws_async;
-
-#[cfg(feature = "async-sender-qwp-ws")]
-pub(crate) use qwp_ws_async::*;
-
 #[cfg(feature = "sync-sender-tcp")]
 mod tcp;
 

@@ -54,9 +54,6 @@ mod qwp_ws_publication_probe;
 #[cfg(feature = "sync-sender-qwp-ws")]
 mod qwp_ws_java_golden;
 
-#[cfg(feature = "async-sender-qwp-ws")]
-mod qwp_ws_async;
-
 mod sender;
 
 mod decimal;
