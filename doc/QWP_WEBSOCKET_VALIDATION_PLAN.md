@@ -68,6 +68,11 @@ As of 2026-04-29:
 - Extended Java/Rust fixtures for arrays, decimals, UTF-8 strings, sparse
   columns, and schema evolution remain recommended before hardening the full
   product surface.
+- The 2026-04-30 design adjustment is that the ordinary Rust `Sender` should
+  converge on Java's high-level model: `flush()` publishes into bounded local
+  memory/SFA storage and returns without waiting for the server ACK, while a
+  sender-owned runner advances WebSocket I/O. The manual `QwpWsSender` remains
+  the threadless progress-owner API.
 
 ## Validation discipline
 
@@ -759,7 +764,87 @@ Global reflection:
 - Were the earlier fake-server validation and real-server probes predictive
   enough?
 
-## Step 13: Ergonomics and design review
+## Step 13: Java-like high-level Sender runner
+
+Validate the product API shift from the current staging behavior to the Java
+behavior:
+
+```text
+Sender::flush(&mut Buffer)
+  -> local publication into bounded memory/SFA cursor
+  -> buffer cleared on success
+  -> background runner sends, reconnects, replays, ACKs, rejects, trims
+```
+
+This step should start by re-reading Java's `QwpWebSocketSender.flush()`,
+`CursorSendEngine.appendBlocking()`, `SegmentRing`, and current Rust
+`flush_qwp_ws()` / queue code. If Java changed again, update the design before
+coding.
+
+Validation target:
+
+- High-level `Sender::flush()` returns after local publication and before the
+  server ACK for the newly published frame.
+- High-level `Sender::flush_and_keep()` has the same delivery semantics while
+  preserving the caller buffer.
+- Two `flush()` calls can publish and be sent before the first ACK, bounded by
+  `max_in_flight`.
+- The foreground path clears the caller buffer only after successful local
+  publication.
+- A full local cursor blocks until ACK-driven trim frees space, or returns an
+  append-deadline error after `sf_append_deadline_millis`. This includes adding
+  and validating Rust config parsing for that Java key before relying on it.
+- Server rejection observed after `flush()` returns is observable through a
+  bounded pollable error/event path. Terminal categories are latched so a later
+  producer call fails. Do not require callbacks for the first runner slice.
+- Drop/void close remains best-effort; explicit drain APIs are the only
+  portable way to report close-time delivery failures.
+- Manual `QwpWsSender::drive_once()` and the high-level background runner cannot
+  drive the same core at the same time.
+- Memory mode and SFA mode share the same publication and error semantics; only
+  process-crash recovery differs.
+
+Behavioral tests should include:
+
+- delayed-ACK mock server proving `flush()` returns before ACK,
+- `flush_and_keep()` mock-server coverage proving local publication without
+  clearing the buffer,
+- cumulative-ACK mock server proving multiple flushes pipeline,
+- capacity/backpressure fixture proving wait-for-trim and deadline expiry,
+- server-rejection fixture proving pollable async observability without
+  dead-letter files or I/O-thread callbacks,
+- SFA recovery fixture proving a locally published but unACKed frame survives
+  process-style sender rebuild.
+
+Real-server gates should be narrow:
+
+- publish two frames without waiting for the first ACK and verify rows,
+- force a reconnect after local publication and verify replay,
+- verify a schema/write rejection is reported through the high-level pollable
+  observer while later valid data can still be accepted.
+
+Design pressure to watch:
+
+- If the runner requires an unbounded payload channel, the design is drifting
+  away from Java's bounded cursor model.
+- If `flush()` waits for the server ACK except under test-only timing, the
+  product semantics did not change.
+- If high-level rejection reporting requires user callbacks inside the I/O
+  thread, add a bounded dispatcher/queue instead.
+- If close behavior becomes hard to explain across Rust/C/C++/Python, keep
+  destructor/void close best-effort and make drain explicit.
+
+Local reflection:
+
+- Did the background runner make the common API simpler, or did it leak too
+  much receipt/manual machinery into `Sender`?
+
+Global reflection:
+
+- Are we now closer to Java's product model while preserving Rust's explicit
+  manual/FFI escape hatch?
+
+## Step 14: Ergonomics and design review
 
 Re-read the original API sketches and compare them with the implemented shape.
 

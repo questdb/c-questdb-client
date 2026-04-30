@@ -17,6 +17,12 @@ Do not read this as production readiness. The older Tokio `qwpws` sender was an
 experiment and has been removed instead of maintained as a second implementation.
 Future async support should be an adapter over the single queue/driver core. The
 C ABI still contains shape-only stubs rather than the real queue/driver core.
+The latest architecture adjustment is that the ordinary high-level `Sender`
+path should converge on Java's product semantics: QWP/WebSocket `flush()`
+publishes into bounded local memory/SFA storage and returns without waiting for
+the server ACK, while a sender-owned runner advances WebSocket I/O. The manual
+`QwpWsSender` remains the threadless progress-owner API for advanced Rust users,
+tests, and FFI wiring.
 
 ## Read first
 
@@ -76,7 +82,7 @@ ia_qwp_ws
 Most recent committed checkpoint:
 
 ```text
-aeaf750 Add public QWP WebSocket SFA recovery probe
+0a5c59c Simplify QWP WebSocket sender ownership
 ```
 
 Recent validation after the publication-shell, reconnect, `.sfa` recovery,
@@ -168,6 +174,9 @@ minimal sync-sender-qwp-ws qwpws_store_and_forward: 5 passed, with existing redu
 - `submit()` means local publication and returns a value receipt.
 - `wait(receipt, timeout)` means delivery observation and may drive progress.
 - `flush()` is intentionally not the primary low-level verb.
+- For the ordinary `Sender` API, `flush()` should retain the familiar
+  `Sender`/`Buffer` shape but adopt Java's meaning: local publication and buffer
+  clear, not server delivery confirmation.
 - Future threaded and async ownership should be modeled by consuming adapters,
   not runtime "runner active" flags. The live Rust API currently exposes the
   real manual sender path only.
@@ -466,7 +475,10 @@ conversion before the real driver is wired through.
 
 - New pipelined SF core should be Rust-first and FFI-friendly.
 - Low-level core is threadless by default.
-- Background thread and async integration are explicit adapters.
+- The ordinary high-level `Sender` may own a background runner; that is the
+  Java-like product surface, not the manual core.
+- Receipt-oriented threaded and async integration are explicit adapters over the
+  same core, not separate sender implementations.
 - Exactly one progress owner exists at a time.
 - `submit()` means local publication, not server ACK.
 - `wait()` means server delivery observation.
@@ -540,6 +552,11 @@ conversion before the real driver is wired through.
   proves per-receipt rejection diagnostics are not overwritten by later
   rejections; a gated real-server probe verifies public manual submit/wait writes
   a queryable row.
+- The current public `Sender::flush()` QWP/WebSocket path still waits for the
+  submitted frame's server outcome. That is now explicitly a staging behavior.
+  The target is Java-like local publication plus a sender-owned runner, bounded
+  by `sf_max_total_bytes` and `sf_append_deadline_millis`, with asynchronous
+  server rejection observation through a bounded pollable error/event path.
 - Java has no client-owned dead-letter file format for rejected batches. Rust v1
   should not add one. Java's `.corrupt` files are recovery quarantine for
   damaged `.sfa` segments, not server-rejection dead letters; rejected batches
@@ -561,12 +578,18 @@ Tokio async sender has been removed to keep one maintained QWP/WebSocket core.
 1. Preserve Java's simple durable model: `.sfa` segment files and QWP payload
    bytes only. Do not add Rust-only ACK, rejection, receipt, wire-sequence,
    in-flight, or dead-letter records.
-2. Keep collapsing `Sender::flush()` toward a compatibility wrapper over the
-   native manual sender semantics when it removes duplication without obscuring
-   errors.
-3. Finish Java-compatible server rejection reporting through the public/FFI
-   surfaces without adding dead-letter files or callbacks.
-4. Wire the C ABI stubs to the real queue/driver core.
+2. Introduce the shared cursor-engine boundary needed by both the manual sender
+   and the high-level `Sender` runner.
+3. Change the high-level QWP/WebSocket `Sender::flush()` target toward Java
+   semantics: local publication and buffer clear, no wait for the new frame's
+   ACK. `flush_and_keep()` should share those delivery semantics while
+   preserving the caller buffer.
+4. Add Java-compatible local backpressure semantics:
+   `sf_max_total_bytes` plus `sf_append_deadline_millis`. The append-deadline
+   key is not parsed by current Rust yet and should be added with this slice.
+5. Finish Java-compatible server rejection reporting through the public/FFI
+   surfaces without adding dead-letter files or mandatory callbacks.
+6. Wire the C ABI stubs to the real queue/driver core.
 
 Do not start with C++/Python wrappers, orphan draining, SF compaction, or
 performance optimization. Future async support should be an explicit adapter

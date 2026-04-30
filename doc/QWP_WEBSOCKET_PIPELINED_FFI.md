@@ -33,7 +33,10 @@ That is not the target shape for durable pipelined FFI:
 - C and C++ callers should not need to understand Rust futures or any specific
   async runtime.
 - Python can build blocking, future, or asyncio wrappers, but the C ABI should remain runtime-neutral.
-- The low-level API must not silently start a background thread.
+- The low-level/manual API must not silently start a background thread.
+- The ordinary `Sender` API should stay ergonomic and Java-like: `flush()`
+  publishes locally, while a sender-owned runner advances WebSocket I/O in the
+  background.
 - The steady-state hot path should not allocate after warm-up and sizing.
 - Store-and-Forward means a submitted batch must survive reconnect, process restart, and caller buffer reuse.
 
@@ -48,10 +51,14 @@ requires a different shape.
 - Add Store-and-Forward durability for submitted batches.
 - Preserve `Sender` / `Buffer` separation.
 - Let callers reuse or clear a `Buffer` immediately after successful submission.
-- Expose deterministic delivery state through receipts, outcomes, and events.
-- Keep the core API threadless by default.
-- Provide optional blocking-thread or async adapters explicitly after the core
-  is stable.
+- Keep the existing `Sender` / `Buffer` API as the normal user-facing shape.
+- Make `Sender::flush()` for QWP/WebSocket mean local publication, matching the
+  Java client, rather than waiting for the server ACK.
+- Expose deterministic delivery state through receipts, outcomes, and events on
+  the manual/FFI surfaces.
+- Keep the manual core threadless by default.
+- Provide optional explicit manual, threaded, or async adapters over the same
+  engine rather than maintaining multiple sender implementations.
 - Keep the C ABI simple and stable enough for C++, Python, and other FFI consumers.
 - Avoid heap allocation on steady-state submit, drive, ACK, and replay paths.
 - Preserve submission order: later batches cannot jump an earlier unresolved batch.
@@ -95,10 +102,25 @@ queue/driver core, not a parallel implementation.
 The native Rust manual sender has started moving onto the same core. The first
 public slice exposes `SenderBuilder::build_qwp_ws()` and
 `QwpWsSender::from_conf(...)`, value receipts, explicit `drive_once`, receipt
-status polling, bounded wait, and bounded close-drain methods. The existing
-`Sender::flush()` path remains the compatibility wrapper; it should keep moving
-toward a thin call pattern over the same native sender semantics rather than a
-separate QWP/WebSocket product path.
+status polling, bounded wait, and bounded close-drain methods.
+
+The current `Sender::flush()` compatibility path is intentionally still
+stricter than Java: it publishes one logical frame and waits for that frame's
+server outcome. That is a staging state, not the target product contract. The
+Java-like target is:
+
+```text
+Sender::flush(&mut Buffer)
+  -> encode replay-safe QWP payload
+  -> publish into bounded local memory/SFA cursor
+  -> clear the caller buffer
+  -> return without waiting for server ACK
+```
+
+Transport progress, ACK handling, reconnect, replay, server rejection reporting,
+and segment trim then belong to a sender-owned runner. This keeps the end-user
+API close to the existing `Sender` API and close to Java, while preserving the
+manual sender as an advanced/testing/FFI progress-owner surface.
 
 ## Design principle
 
@@ -108,18 +130,57 @@ Split the sender into three layers:
 Buffer API
   User-owned row accumulation. Not thread-safe. Reusable after submit succeeds.
 
-QWP/WebSocket SF core
-  Threadless state machine. Owns the durable queue, connection state,
-  in-flight slots, event ring, and preallocated scratch buffers.
+QWP/WebSocket cursor engine
+  Shared publication and replay state. Owns the bounded memory/SFA cursor,
+  FSN assignment, retained payload bytes, ACK/rejection application, segment
+  trim, and recovery. This is the storage/backpressure contract.
+
+Progress engine
+  Owns connection state, in-flight slots, reconnect/replay logic, transport
+  scratch buffers, and server-response classification. It can be driven inline
+  by the manual sender or by a background runner owned by `Sender`.
 
 Adapters
-  Blocking convenience API, explicit background runner, async integration,
-  C ABI, C++ RAII, Python wrappers.
+  Existing high-level `Sender`, manual `QwpWsSender`, explicit threaded/async
+  adapters, C ABI, C++ RAII, Python wrappers.
 ```
 
-The core is the contract. Adapters must not change delivery semantics.
+The cursor/progress engines are the contract. Adapters must not change delivery
+semantics. A simple Rust implementation may use `Mutex`/`Condvar` between the
+foreground publisher and the runner; copying Java's lock-free internals is not a
+v1 requirement.
 
 ## Public Rust shape
+
+Normal Rust API:
+
+```rust
+let mut sender = Sender::from_conf(
+    "qwpws::addr=localhost:9000;sf_dir=/var/lib/qdb-sf;sender_id=primary")?;
+let mut buffer = sender.new_buffer();
+
+// Build rows...
+sender.flush(&mut buffer)?; // local publication; does not wait for server ACK
+```
+
+Properties:
+
+- `Sender::flush()` publishes the replay-safe payload into the bounded local
+  cursor and clears the caller buffer only after publication succeeds.
+- `Sender::flush_and_keep()` has the same local-publication semantics but
+  preserves the caller buffer.
+- `Sender::flush()` can block for local backpressure when the cursor is at
+  `sf_max_total_bytes`; it waits up to `sf_append_deadline_millis` for
+  ACK-driven trim to free space.
+- `Sender::flush()` checks for already-latched terminal errors before/after
+  publication, but it does not wait for the newly published frame to be ACKed.
+- Server rejections observed after `flush()` returns are surfaced through a
+  bounded pollable error/event path and, for terminal policies, by latching the
+  error so a later producer call fails. The first Rust surface should be polling
+  / accessors; callbacks can be layered later without running user code on the
+  I/O thread.
+- The background runner is an implementation detail of this high-level sender,
+  not a second QWP/WebSocket implementation.
 
 Low-level Rust API:
 
@@ -201,7 +262,10 @@ Properties:
   server message for the exact receipt waited by the caller. Terminal
   transport/protocol failures are returned as `Err(crate::Error)`.
 
-The low-level type should prefer `&mut self` methods. That gives Rust callers a clear single-driver ownership model and avoids internal locks on the hot path.
+The low-level type should prefer `&mut self` methods. That gives Rust callers a
+clear single-driver ownership model and avoids internal locks on the manual hot
+path. It remains useful for advanced callers, tests, and FFI wiring, but it is
+not the ergonomic default for ordinary ingestion.
 
 ## Open and initial connection
 
@@ -225,16 +289,24 @@ Initial connection work may include:
 - authentication failure detection.
 
 All of that work must be bounded by configured connect/request timeouts. The
-manual core still must not start a background thread, spawn a runtime task, or
-continue sending/replaying after construction returns. There is no public lazy
-constructor mode in v1; applications that want to tolerate startup ordering use
-`initial_connect_retry=true`, matching Java.
+manual sender still must not start a background thread, spawn a runtime task, or
+continue sending/replaying after construction returns. The high-level
+`Sender::from_conf(qwpws::...)` path may own a background runner because that is
+the Java-like product surface; it must make the lifecycle explicit in docs and
+must not share progress ownership with a manual sender.
+
+There is no public lazy constructor mode in v1. Applications that want to
+tolerate startup ordering use `initial_connect_retry=true`, matching Java's
+blocking startup retry. Java's `initial_connect_retry=async` remains unsupported
+until Rust has a real background initial-connect lifecycle.
 
 ## Optional adapters
 
 Threaded and async adapters are design targets, not live API, until their
 progress behavior exists. The live Rust API must not expose a fake background or
-async sender that only stores the manual sender.
+async sender that only stores the manual sender. The high-level `Sender` runner
+is separate from these adapters: it preserves the existing `Sender` API, while
+adapter types expose receipt-oriented advanced control.
 
 ### Blocking adapter
 
@@ -246,7 +318,7 @@ pub struct BlockingQwpWsSender {
 
 This is still threadless. Calls like `flush()` or `wait()` drive the connection synchronously on the caller's thread.
 
-### Explicit background runner
+### Explicit receipt-oriented background runner
 
 ```rust
 let sender = SenderBuilder::from_conf(conf)?.build_qwp_ws()?;
@@ -794,6 +866,8 @@ Do not add a Rust-only dead-letter file subsystem in v1. Match Java's model:
 - preserve raw server status, wire sequence, message, affected FSN span, and
   table attribution when available,
 - expose the rejected frame through receipt status / wait outcome,
+- expose high-level `Sender` rejections through a bounded pollable error/event
+  path because `flush()` may already have returned,
 - publish a transition event for observability,
 - drop-and-continue only for the Java-compatible categories,
 - latch terminal categories so the next producer call reports the error.
@@ -841,7 +915,9 @@ Security/upgrade failures:
 
 ## Close behavior
 
-No close path starts a background thread.
+The manual sender does not start a background thread. The high-level `Sender`
+may already have a runner because that is how it makes Java-like `flush()`
+possible.
 
 ```rust
 close_drain(timeout)
@@ -868,12 +944,19 @@ close_fast()
 
 Dropping a sender should be equivalent to fast close. It should not attempt surprise draining.
 
-Java exposes `close_flush_timeout_millis` because Java's WebSocket sender owns
-row buffers and its `close()` can flush and then report drain failures. The Rust
-public sync `Sender` has external buffers and no fallible drop path, so that
-configuration is intentionally rejected until a real explicit QWPWS
-`close_drain(timeout)` surface is wired. Users of the current sync sender should
-call `flush()` before dropping it.
+Java exposes `close_flush_timeout_millis` because Java's WebSocket sender has a
+background I/O loop and `close()` can wait for already-published frames to be
+ACKed before shutdown. Rust cannot report failures from `Drop`, C
+`line_sender_close()`, or C++ destructors. Therefore the portable contract is:
+
+- `Drop` / void close / destructor: best-effort fast close.
+- explicit `close_drain(timeout)` or equivalent: fallible drain with timeout and
+  terminal-error reporting.
+- `close_flush_timeout_millis`: accepted only when the high-level Rust `Sender`
+  has a public fallible close/drain path that can honor it.
+
+Until that path exists, the current Rust sync sender rejects
+`close_flush_timeout_millis` explicitly instead of accepting it as a no-op.
 
 ## C ABI shape
 
@@ -1160,7 +1243,10 @@ while (sender.receipt_status(receipt).is_pending()) {
 auto outcome = sender.wait(receipt, 30s);
 ```
 
-C++ can offer RAII and exceptions over the C ABI. It should not hide a background thread unless the user chooses a runner type.
+C++ can offer RAII and exceptions over the C ABI. Its destructor should remain
+best-effort/no-throw; explicit drain APIs should report delivery failures. If a
+C++ wrapper chooses a background runner shape, that should be visible in the
+type or construction path rather than hidden behind the manual sender handle.
 
 ## Python wrapper shape
 
@@ -1246,8 +1332,8 @@ Candidate config keys:
 | `sf_max_bytes` | 4 MiB | Segment size, matching Java naming. |
 | `sf_max_total_bytes` | 128 MiB memory / 10 GiB SF | Total queued bytes before submit backpressure. |
 | `sf_durability` | `memory` | Java-compatible values are `memory`, `flush`, `append`; v1 supports only `memory` and fails loudly for the reserved values. |
-| `sf_append_deadline_millis` | 30000 | Deadline for submit/flush waiting on local capacity. |
-| `event_capacity` | 1024 | Preallocated event ring size. |
+| `sf_append_deadline_millis` | 30000 | Deadline for submit/flush waiting on local capacity; planned for the Java-like high-level runner, not parsed by current Rust yet. |
+| `event_capacity` | 1024 | Preallocated event ring size; planned for high-level async rejection/error observation. |
 | `max_error_message_bytes` | 1024 | Bounded server message storage. |
 | `reconnect_max_duration_millis` | 300000 | Per-outage retry budget. |
 | `reconnect_initial_backoff_millis` | 100 | Initial reconnect backoff. |
@@ -1267,6 +1353,11 @@ duration/backoff reconnect keys plus boolean `initial_connect_retry` for startup
 retry. Java's newer `initial_connect_retry=sync` spelling is accepted as an
 alias for the current blocking startup retry behavior. Java's `async` spelling
 is rejected explicitly until the adapter behavior exists.
+
+Rust does not yet parse `sf_append_deadline_millis` or expose
+`event_capacity`. Those keys are part of the Java-like high-level runner design
+and should be added with behavioral tests before switching `Sender::flush()` to
+local-publication semantics.
 
 ## Implementation progress
 
@@ -1311,19 +1402,30 @@ Validated in the current Rust branch:
 
 Remaining product work:
 
-1. Refactor `Sender::flush()` to be a thin compatibility wrapper over the native
-   Rust manual sender semantics where that keeps the code simpler.
-2. Wire the C ABI stubs to the real queue/driver core.
-3. Finish Java-compatible server rejection reporting through the public/FFI
-   surfaces without adding Rust-only dead-letter files or callbacks.
-4. Add explicit background runner as an ownership-consuming adapter.
-5. Add C++ and Python wrappers after the C ABI is stable.
+1. Introduce the shared cursor-engine boundary used by both manual and
+   high-level `Sender` paths.
+2. Add the high-level `Sender` runner so QWP/WebSocket `flush()` publishes
+   locally and returns without waiting for the server ACK.
+3. Add bounded local-publication backpressure with
+   `sf_append_deadline_millis`, matching Java's `appendBlocking()` behavior.
+4. Finish Java-compatible server rejection reporting through bounded pollable
+   public/FFI surfaces without adding Rust-only dead-letter files, client-owned
+   quarantine, or mandatory callbacks.
+5. Wire the C ABI stubs to the real queue/driver core.
+6. Add receipt-oriented threaded/async adapters, C++ wrappers, and Python
+   wrappers after the core public semantics are stable.
 
 ## Tests
 
 Rust core tests:
 
 - submit returns before ACK,
+- high-level `Sender::flush()` returns after local publication before ACK,
+- high-level `Sender::flush_and_keep()` has the same delivery semantics and
+  preserves the caller buffer,
+- two high-level `flush()` calls can pipeline before the first ACK,
+- a full cursor blocks until ACK-driven trim frees capacity or the append
+  deadline expires,
 - manual sender construction validates initial connection without starting a thread,
 - `initial_connect_retry=true` retries startup connection with the reconnect
   policy; the sync public sender path covers this with a dropped-upgrade
