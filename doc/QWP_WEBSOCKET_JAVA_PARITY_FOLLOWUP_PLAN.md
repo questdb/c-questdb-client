@@ -137,7 +137,7 @@ Status values:
 | J6 | todo | Operational recovery / adapter layer | Orphan drainer scope check | Java now has real background orphan drainers and `.failed` sentinel behavior; Rust intentionally does not. | Re-read Java orphan scanner/drainer code and Rust SFA recovery scope; validate whether this is needed before public release. | Decision recorded; no partial drainer implementation without a real recovery scenario and behavioral test. |
 | J7 | todo | Documentation architecture | Docs sync after code slices | Handover, validation plan, and design proposal should not contradict the implemented contract. | Cross-read changed docs plus `QWP_WEBSOCKET_HANDOVER.md`, `QWP_WEBSOCKET_VALIDATION_PLAN.md`, and `QWP_WEBSOCKET_PIPELINED_FFI.md`. | Docs name current behavior, known gaps, and validation evidence without promising unimplemented Java features. |
 | J8 | done | Public sync error surface | Frame-local server rejection behavior | Java treats schema/write rejections as drop-and-continue and exposes the server message. Rust should report the rejection without making the sender terminal. | Re-read Java `CursorWebSocketSendLoop` and `SenderError`; inspect Rust codec/driver/public flush path and existing coverage. | Public mock-server test rejects the first flush with schema mismatch, verifies the server message and error category, then successfully flushes a second frame on the same sender. |
-| J9 | todo | Public `Sender` semantics | Java-like local-publication flush | Java `Sender.flush()` publishes into the cursor engine and returns before ACK; Rust's current public staging path waits for the submitted frame outcome. | Re-read Java `QwpWebSocketSender.flush()`, `CursorSendEngine.appendBlocking()`, Rust `flush_qwp_ws()`, `flush_and_keep()`, config parsing, and queue capacity semantics. | High-level Rust `Sender::flush()` / `flush_and_keep()` locally publish, pipeline before ACK, apply bounded append backpressure via parsed `sf_append_deadline_millis`, and report later rejections through a bounded pollable observer path. |
+| J9 | validating | Public `Sender` semantics | Java-like local-publication flush | Java `Sender.flush()` publishes into the cursor engine and returns before ACK; Rust's current public staging path waits for the submitted frame outcome. | Re-read Java `QwpWebSocketSender.flush()`, `CursorSendEngine.appendBlocking()`, Rust `flush_qwp_ws()`, `flush_and_keep()`, config parsing, and queue capacity semantics. | High-level Rust `Sender::flush()` / `flush_and_keep()` locally publish, pipeline before ACK, apply bounded append backpressure via `sf_append_deadline_millis`, and report later rejections through a bounded pollable observer path. |
 
 ## Slice Notes
 
@@ -368,14 +368,21 @@ Evidence:
 - Rust: current public `flush_qwp_ws()` publishes one frame and waits for the
   submitted frame's server outcome. The manual `QwpWsSender::submit()` already
   has local-publication receipt semantics, but the ordinary `Sender` API is not
-  Java-like yet. Current Rust also does not parse `sf_append_deadline_millis`.
+  Java-like yet. Rust recognizes `sf_append_deadline_millis` and rejects it
+  until the current sender can use it for local-publication backpressure.
 - Validation: design-doc update only; code validation starts with behavioral
   tests for delayed ACK, pipelined `flush()` / `flush_and_keep()`, append
-  backpressure, append-deadline config parsing, and pollable async rejection
-  observation.
+  backpressure, append-deadline config acceptance, and pollable async rejection
+  observation. A local experiment that only removed the ACK wait and kicked one
+  send step passed the happy-path pipeline test but regressed the existing
+  reconnect/replay tests because no progress owner remained to observe the
+  disconnect after `flush()` returned. Current Rust config tests cover
+  fail-fast rejection while the behavior is absent.
 Result:
-- todo: introduce a shared cursor-engine boundary and high-level `Sender`
-  runner before changing public `Sender::flush()` semantics.
+- validating: append-deadline config remains rejected until it affects runtime
+  backpressure; introduce a shared cursor-engine boundary and high-level
+  `Sender` runner before changing public `Sender::flush()` semantics. Do not
+  ship a partial "publish and kick" cutover.
 
 ## Open Questions
 

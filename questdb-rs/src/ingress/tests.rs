@@ -185,6 +185,10 @@ fn qwpws_store_and_forward_config_rejects_invalid_java_keys() {
         "invalid sf_durability [value=sync, allowed-values=[memory, flush, append]]",
     );
     assert_conf_err(
+        SenderBuilder::from_conf("qwpws::addr=localhost:9000;sf_append_deadline_millis=1234;"),
+        "\"sf_append_deadline_millis\" is not supported by the Rust QWP/WebSocket sync sender yet; local-publication backpressure is not implemented.",
+    );
+    assert_conf_err(
         SenderBuilder::from_conf("qwpws::addr=localhost:9000;close_flush_timeout_millis=5000;"),
         "\"close_flush_timeout_millis\" is not supported by the Rust QWP/WebSocket sync sender yet; call flush before dropping the sender.",
     );
@@ -200,6 +204,10 @@ fn qwpws_store_and_forward_config_is_websocket_only() {
     assert_conf_err(
         SenderBuilder::from_conf("tcp::addr=localhost:9009;close_flush_timeout_millis=5000;"),
         "The \"close_flush_timeout_millis\" setting is only supported for QWP/WebSocket.",
+    );
+    assert_conf_err(
+        SenderBuilder::from_conf("tcp::addr=localhost:9009;sf_append_deadline_millis=5000;"),
+        "The \"sf_append_deadline_millis\" setting is only supported for QWP/WebSocket.",
     );
 }
 

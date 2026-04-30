@@ -583,10 +583,13 @@ Tokio async sender has been removed to keep one maintained QWP/WebSocket core.
 3. Change the high-level QWP/WebSocket `Sender::flush()` target toward Java
    semantics: local publication and buffer clear, no wait for the new frame's
    ACK. `flush_and_keep()` should share those delivery semantics while
-   preserving the caller buffer.
+   preserving the caller buffer. Do not do this as a foreground-only
+   "publish and kick one send" change: that leaves no progress owner to observe
+   disconnects after `flush()` returns and regresses reconnect/replay.
 4. Add Java-compatible local backpressure semantics:
    `sf_max_total_bytes` plus `sf_append_deadline_millis`. The append-deadline
-   key is not parsed by current Rust yet and should be added with this slice.
+   key is currently recognized and rejected until the runner slice can enforce
+   it on local-publication backpressure.
 5. Finish Java-compatible server rejection reporting through the public/FFI
    surfaces without adding dead-letter files or mandatory callbacks.
 6. Wire the C ABI stubs to the real queue/driver core.

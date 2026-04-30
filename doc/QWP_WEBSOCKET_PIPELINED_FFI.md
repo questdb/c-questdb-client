@@ -1332,7 +1332,7 @@ Candidate config keys:
 | `sf_max_bytes` | 4 MiB | Segment size, matching Java naming. |
 | `sf_max_total_bytes` | 128 MiB memory / 10 GiB SF | Total queued bytes before submit backpressure. |
 | `sf_durability` | `memory` | Java-compatible values are `memory`, `flush`, `append`; v1 supports only `memory` and fails loudly for the reserved values. |
-| `sf_append_deadline_millis` | 30000 | Deadline for submit/flush waiting on local capacity; planned for the Java-like high-level runner, not parsed by current Rust yet. |
+| `sf_append_deadline_millis` | 30000 | Deadline for submit/flush waiting on local capacity; current Rust recognizes and rejects this key until the Java-like high-level runner can enforce it. |
 | `event_capacity` | 1024 | Preallocated event ring size; planned for high-level async rejection/error observation. |
 | `max_error_message_bytes` | 1024 | Bounded server message storage. |
 | `reconnect_max_duration_millis` | 300000 | Per-outage retry budget. |
@@ -1354,10 +1354,13 @@ retry. Java's newer `initial_connect_retry=sync` spelling is accepted as an
 alias for the current blocking startup retry behavior. Java's `async` spelling
 is rejected explicitly until the adapter behavior exists.
 
-Rust does not yet parse `sf_append_deadline_millis` or expose
-`event_capacity`. Those keys are part of the Java-like high-level runner design
-and should be added with behavioral tests before switching `Sender::flush()` to
-local-publication semantics.
+Rust recognizes `sf_append_deadline_millis` and rejects it explicitly because
+the current high-level `Sender::flush()` still waits for the submitted frame
+outcome and does not own local-publication backpressure. The key should be
+accepted only with behavioral tests proving that it controls local-capacity
+waiting. `event_capacity` is not exposed yet. It belongs to the Java-like
+high-level runner design and should be added with behavioral tests before
+exposing asynchronous rejection observation.
 
 ## Implementation progress
 
@@ -1406,6 +1409,9 @@ Remaining product work:
    high-level `Sender` paths.
 2. Add the high-level `Sender` runner so QWP/WebSocket `flush()` publishes
    locally and returns without waiting for the server ACK.
+   A foreground-only "publish and kick one send" shortcut is not sufficient:
+   it leaves no progress owner to detect disconnects after `flush()` returns and
+   breaks reconnect/replay behavior.
 3. Add bounded local-publication backpressure with
    `sf_append_deadline_millis`, matching Java's `appendBlocking()` behavior.
 4. Finish Java-compatible server rejection reporting through bounded pollable

@@ -792,8 +792,10 @@ Validation target:
 - The foreground path clears the caller buffer only after successful local
   publication.
 - A full local cursor blocks until ACK-driven trim frees space, or returns an
-  append-deadline error after `sf_append_deadline_millis`. This includes adding
-  and validating Rust config parsing for that Java key before relying on it.
+  append-deadline error after `sf_append_deadline_millis`. Current Rust
+  recognizes and rejects that Java key; the runner slice must accept it only
+  after validating that the stored value actually controls local-publication
+  backpressure.
 - Server rejection observed after `flush()` returns is observable through a
   bounded pollable error/event path. Terminal categories are latched so a later
   producer call fails. Do not require callbacks for the first runner slice.
