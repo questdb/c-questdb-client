@@ -31,7 +31,7 @@
 use std::fs;
 use std::io::{Error as IoError, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -39,7 +39,7 @@ use crate::ingress::qwp_ws_test_support::{
     CloseOutcome, DeliveryOutcome, ManualDriverPrototype, QwpWsPublicationDriver, SfaSlotOptions,
     SfaSlotQueue, VolatileFrameQueue, VolatileQueueOptions, connect_blocking_transport,
 };
-use crate::ingress::{Buffer, TimestampNanos};
+use crate::ingress::{Buffer, SenderBuilder, TimestampNanos};
 use tempfile::TempDir;
 
 use super::{TestError, TestResult};
@@ -240,15 +240,142 @@ fn qwp_ws_sfa_recovered_frame_is_delivered_and_cleaned_up() -> TestResult {
     Ok(())
 }
 
+#[test]
+#[ignore = "requires a real QuestDB server and QDB_QWP_WS_PUBLIC_SFA_PROBE=1"]
+fn qwp_ws_public_sender_sfa_recovers_after_failed_flush() -> TestResult {
+    if std::env::var("QDB_QWP_WS_PUBLIC_SFA_PROBE").as_deref() != Ok("1") {
+        eprintln!("set QDB_QWP_WS_PUBLIC_SFA_PROBE=1 to run the public Sender SFA probe");
+        return Ok(());
+    }
+
+    let config = ProbeConfig::from_env()?;
+    if config.auth_header.is_some() {
+        return Err(Box::new(IoError::new(
+            ErrorKind::InvalidInput,
+            "QDB_QWP_WS_PUBLIC_SFA_PROBE does not support QDB_QWP_WS_AUTH_HEADER yet; use an unauthenticated local QuestDB server",
+        )));
+    }
+
+    let table = unique_table_name("qwp_public_sfa_probe");
+    eprintln!("QuestDB build: {}", query_build(&config)?);
+    eprintln!("probe table: {table}");
+    let _cleanup = TableCleanup::new(config.clone(), table.clone());
+    let sf_dir = TempDir::new()?;
+    let sender_id = "public_probe";
+    let slot_dir = sfa_slot_dir_for_sender(sf_dir.path(), sender_id);
+
+    let proxy = DropUnackedFrameProxy::spawn(&config)?;
+    let first_conf = public_sfa_conf("127.0.0.1", proxy.port, sf_dir.path(), sender_id, true);
+    let flush_err = {
+        let mut sender = SenderBuilder::from_conf(first_conf)?.build()?;
+        let mut buffer = sender.new_buffer();
+        write_row(
+            &mut buffer,
+            &table,
+            "SYM_PUBLIC_SFA_REPLAYED",
+            77,
+            777.5,
+            77,
+        )?;
+        sender.flush(&mut buffer).unwrap_err()
+    };
+    assert_eq!(flush_err.code(), crate::ErrorCode::SocketError);
+    proxy.join()?;
+    let retained_sfa_files = sfa_file_count(&slot_dir)?;
+    assert!(
+        retained_sfa_files > 0,
+        "failed public Sender flush must leave its QWP frame recoverable"
+    );
+
+    let second_conf = public_sfa_conf(
+        &config.host,
+        config.qwp_ws_port,
+        sf_dir.path(),
+        sender_id,
+        false,
+    );
+    {
+        let mut sender = SenderBuilder::from_conf(second_conf)?.build()?;
+        let mut buffer = sender.new_buffer();
+        write_row(
+            &mut buffer,
+            &table,
+            "SYM_PUBLIC_SFA_FOLLOWUP",
+            88,
+            888.5,
+            88,
+        )?;
+        sender.flush(&mut buffer)?;
+    }
+
+    let count = wait_for_count(&config, &table, 2, Duration::from_secs(10))?;
+    assert_eq!(
+        count, 2,
+        "public Sender SFA recovery should deliver the retained row exactly once before the follow-up"
+    );
+    assert!(has_row(
+        &config,
+        &table,
+        "SYM_PUBLIC_SFA_REPLAYED",
+        77,
+        777.5
+    )?);
+    assert!(has_row(
+        &config,
+        &table,
+        "SYM_PUBLIC_SFA_FOLLOWUP",
+        88,
+        888.5
+    )?);
+    assert_eq!(
+        sfa_file_count(&slot_dir)?,
+        0,
+        "ACKed public Sender SFA frames must be cleaned up on close"
+    );
+
+    Ok(())
+}
+
 fn build_row(table: &str, sym: &str, qty: i64, px: f64, ts_offset: i64) -> ProbeResult<Buffer> {
     let mut buffer = Buffer::new_qwp();
+    write_row(&mut buffer, table, sym, qty, px, ts_offset)?;
+    Ok(buffer)
+}
+
+fn write_row(
+    buffer: &mut Buffer,
+    table: &str,
+    sym: &str,
+    qty: i64,
+    px: f64,
+    ts_offset: i64,
+) -> ProbeResult<()> {
     buffer
         .table(table)?
         .symbol("sym", sym)?
         .column_i64("qty", qty)?
         .column_f64("px", px)?
         .at(TimestampNanos::new(1_700_000_000_000_000_000 + ts_offset))?;
-    Ok(buffer)
+    Ok(())
+}
+
+fn public_sfa_conf(
+    host: &str,
+    port: u16,
+    sf_dir: &Path,
+    sender_id: &str,
+    short_reconnect: bool,
+) -> String {
+    let mut conf = format!(
+        "qwpws::addr={host}:{port};sf_dir={};sender_id={sender_id};sf_max_bytes=64k;sf_max_total_bytes=128k;max_in_flight=4;",
+        sf_dir.display()
+    );
+    if short_reconnect {
+        conf.push_str(
+            "reconnect_max_duration_millis=25;reconnect_initial_backoff_millis=1;reconnect_max_backoff_millis=1;",
+        );
+    }
+    conf
 }
 
 fn sfa_options(sf_dir: &Path) -> SfaSlotOptions {
@@ -263,7 +390,11 @@ fn sfa_options(sf_dir: &Path) -> SfaSlotOptions {
 }
 
 fn sfa_slot_dir(sf_dir: &Path) -> std::path::PathBuf {
-    sf_dir.join("default")
+    sfa_slot_dir_for_sender(sf_dir, "default")
+}
+
+fn sfa_slot_dir_for_sender(sf_dir: &Path, sender_id: &str) -> PathBuf {
+    sf_dir.join(sender_id)
 }
 
 fn sfa_file_count(dir: &Path) -> ProbeResult<usize> {
@@ -357,6 +488,35 @@ impl FaultProxy {
     }
 }
 
+struct DropUnackedFrameProxy {
+    port: u16,
+    handle: thread::JoinHandle<ProxyResult<()>>,
+}
+
+impl DropUnackedFrameProxy {
+    fn spawn(config: &ProbeConfig) -> ProbeResult<Self> {
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        listener.set_nonblocking(true)?;
+        let port = listener.local_addr()?.port();
+        let target_host = config.host.clone();
+        let target_port = config.qwp_ws_port;
+        let handle =
+            thread::spawn(move || run_drop_unacked_frame_proxy(listener, target_host, target_port));
+        Ok(Self { port, handle })
+    }
+
+    fn join(self) -> ProbeResult<()> {
+        match self.handle.join() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => Err(Box::new(err)),
+            Err(_) => Err(Box::new(IoError::new(
+                ErrorKind::Other,
+                "drop-unacked proxy thread panicked",
+            ))),
+        }
+    }
+}
+
 fn run_reconnect_fault_proxy(
     listener: TcpListener,
     target_host: String,
@@ -390,6 +550,33 @@ fn run_reconnect_fault_proxy(
     upstream.flush()?;
     forward_until_ok(&mut upstream, &mut client, 0)?;
 
+    Ok(())
+}
+
+fn run_drop_unacked_frame_proxy(
+    listener: TcpListener,
+    target_host: String,
+    target_port: u16,
+) -> ProxyResult<()> {
+    let target = format!("{target_host}:{target_port}");
+
+    let mut client = accept_with_timeout(&listener, Duration::from_secs(10))?;
+    let mut upstream = TcpStream::connect(&target)?;
+    configure_stream(&mut client)?;
+    configure_stream(&mut upstream)?;
+    proxy_handshake(&mut client, &mut upstream)?;
+
+    let dropped_frame = read_ws_frame_raw(&mut client)?;
+    if !dropped_frame.payload.starts_with(b"QWP1") {
+        return Err(IoError::new(
+            ErrorKind::InvalidData,
+            "public SFA probe expected a QWP message frame",
+        ));
+    }
+
+    drop(listener);
+    drop(client);
+    drop(upstream);
     Ok(())
 }
 

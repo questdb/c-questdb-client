@@ -528,8 +528,9 @@ conversion before the real driver is wired through.
 - The real transport adapter and publication shell have real QuestDB submit/wait,
   reconnect replay, and recovered `.sfa` replay probes. The public sync cutover
   has mock-server coverage for config-derived SFA opening, reconnect, rejection,
-  and replay-safe payloads; it still needs a public `Sender` real-server SF
-  recovery probe.
+  and replay-safe payloads, plus a gated real-server public `Sender` probe that
+  recovers a failed `sf_dir` flush from the same Java-compatible slot and cleans
+  the `.sfa` files after ACK/close.
 - Java has no client-owned dead-letter file format for rejected batches. Rust v1
   should not add one. Java's `.corrupt` files are recovery quarantine for
   damaged `.sfa` segments, not server-rejection dead letters; rejected batches
@@ -544,23 +545,23 @@ conversion before the real driver is wired through.
 
 ## Recommended next step
 
-Validate the public sync product path end to end, then decide the older async
-path deliberately.
+The public sync product path now has a real-server SFA recovery probe. Decide
+the older async path deliberately before widening wrappers or background
+ownership.
 
-1. Add or run a real QuestDB public `Sender` probe with `sf_dir` enabled:
-   publish, drop/reopen from the same slot, replay retained bytes, and verify
-   cleanup after ACK.
-2. Preserve Java's simple durable model: `.sfa` segment files and QWP payload
+1. Preserve Java's simple durable model: `.sfa` segment files and QWP payload
    bytes only. Do not add Rust-only ACK, rejection, receipt, wire-sequence,
    in-flight, or dead-letter records.
-3. Decide whether the async public sender should be rewritten on the publication
+2. Decide whether the async public sender should be rewritten on the publication
    driver or deprecated behind the planned explicit adapters. Its SF queue
    config rejection tests are already in place.
+3. Finish Java-compatible server rejection reporting through the public/FFI
+   surfaces without adding dead-letter files or callbacks.
 
 Do not start with C++/Python wrappers, orphan draining, SF compaction, or
-performance optimization. The main de-risking question is now whether the public
-sync cutover behaves correctly against real QuestDB with Java-compatible SFA
-storage.
+performance optimization. The main de-risking question is now whether there
+should be one maintained QWP/WebSocket sender core or a second async
+implementation with a deliberately smaller feature surface.
 
 ## Commands worth re-running
 
@@ -615,6 +616,11 @@ env QDB_QWP_WS_RECONNECT_PROBE=1 \
 env QDB_QWP_WS_SFA_PROBE=1 \
     cargo test --manifest-path questdb-rs/Cargo.toml --lib \
     qwp_ws_sfa_recovered_frame_is_delivered_and_cleaned_up \
+    -- --ignored --nocapture
+
+env QDB_QWP_WS_PUBLIC_SFA_PROBE=1 \
+    cargo test --manifest-path questdb-rs/Cargo.toml --lib \
+    qwp_ws_public_sender_sfa_recovers_after_failed_flush \
     -- --ignored --nocapture
 ```
 

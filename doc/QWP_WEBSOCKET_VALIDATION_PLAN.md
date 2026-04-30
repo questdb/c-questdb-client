@@ -508,6 +508,10 @@ Validation target:
 - Torn-tail recovery matches Java: stop at the first invalid frame and append
   from that offset.
 - ACK/drop-and-continue rejection leaves no Rust-only completion marker on disk.
+- The public sync `Sender` path, not only the manual driver shell, can retain a
+  failed `sf_dir` flush, recover it from the same `<sf_dir>/<sender_id>/` slot
+  on a new sender, deliver it before follow-up work, and remove retained `.sfa`
+  files after ACK/close.
 - DROP_AND_CONTINUE does not create client-owned dead-letter files; the
   observable artifact is the structured rejection event/error plus normal
   ACK-driven segment trim.
@@ -691,6 +695,9 @@ Validation target:
   intended for the product core, not opaque test payload bytes.
 - The public sync `Sender` path uses the same publication driver and
   config-derived queue selection as the validated manual core.
+- The public sync `Sender` path has a live QuestDB SFA recovery probe covering
+  failed flush, reopen from the same Java-style slot, replay, follow-up ACK, and
+  cleanup.
 - The public async `build_async()` path fails loudly for SF queue config until
   it is cut over or retired, rather than silently ignoring `sf_dir` or queue
   sizing.

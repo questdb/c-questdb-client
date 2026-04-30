@@ -1260,16 +1260,18 @@ Validated in the current Rust branch:
 11. Java ingestion reconnect surface: `reconnect_*` keys,
     `initial_connect_retry`, no max-attempt cap, and no Rust-only failover
     callback.
+12. Gated real-server public sync `Sender` probe for `sf_dir`: failed flush
+    leaves recoverable work, a new sender with the same `sender_id` replays it,
+    and ACK/close removes the retained `.sfa` files.
 
 Remaining product work:
 
 1. Wire the C ABI stubs to the real queue/driver core.
-2. Add or promote real-server public `Sender` probes for `sf_dir` recovery.
-3. Finish Java-compatible server rejection reporting through the public/FFI
+2. Finish Java-compatible server rejection reporting through the public/FFI
    surfaces without adding Rust-only dead-letter files or callbacks.
-4. Add explicit background runner as an ownership-consuming adapter.
-5. Cut over or retire the older Tokio async sender.
-6. Add C++ and Python wrappers after the C ABI is stable.
+3. Add explicit background runner as an ownership-consuming adapter.
+4. Cut over or retire the older Tokio async sender.
+5. Add C++ and Python wrappers after the C ABI is stable.
 
 ## Tests
 
@@ -1336,6 +1338,7 @@ C ABI tests:
 System tests:
 
 - live QuestDB QWP/WebSocket ingestion,
+- public sync `Sender` SFA recovery after a failed flush against live QuestDB,
 - many in-flight batches,
 - schema expansion across batches,
 - arrays, decimals, timestamps, UTF-8, sparse columns,
