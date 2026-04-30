@@ -164,11 +164,20 @@ impl SchemaRegistry {
 
         match mode {
             SchemaMode::Reference => {
-                if !self.by_id.contains_key(&schema_id) {
-                    return Err(fmt!(
+                let schema = self.by_id.get(&schema_id).ok_or_else(|| {
+                    fmt!(
                         ProtocolError,
                         "schema reference {} not in registry",
                         schema_id
+                    )
+                })?;
+                if schema.len() != col_count {
+                    return Err(fmt!(
+                        ProtocolError,
+                        "schema {} has {} columns but table block declares {}",
+                        schema_id,
+                        schema.len(),
+                        col_count
                     ));
                 }
                 Ok(DecodedSchema {
@@ -178,7 +187,11 @@ impl SchemaRegistry {
                 })
             }
             SchemaMode::Full => {
-                let mut cols = Vec::with_capacity(col_count);
+                // Clamp initial capacity by remaining bytes so a hostile
+                // `col_count` can't trigger an oversized allocation before
+                // the loop discovers the section is too short.
+                let safe_cap = col_count.min(bytes.len().saturating_sub(cursor));
+                let mut cols = Vec::with_capacity(safe_cap);
                 for i in 0..col_count {
                     let (name_len, n) = varint::decode_usize(&bytes[cursor..])?;
                     cursor += n;

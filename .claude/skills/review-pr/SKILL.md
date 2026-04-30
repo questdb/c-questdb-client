@@ -29,9 +29,9 @@ You are a senior QuestDB engineer performing a blocking code review. The QuestDB
 Fetch PR metadata, diff, and any review comments:
 
 ```bash
-gh pr view $ARGUMENTS --json number,title,body,labels,state
-gh pr diff $ARGUMENTS
-gh pr view $ARGUMENTS --comments
+gh pr view "$ARGUMENTS" --json number,title,body,labels,state
+gh pr diff "$ARGUMENTS"
+gh pr view "$ARGUMENTS" --comments
 ```
 
 ## Step 2: PR title and description

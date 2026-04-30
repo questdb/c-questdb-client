@@ -31,7 +31,9 @@ use crate::egress::error::{Result, fmt};
 use crate::egress::schema::SchemaRegistry;
 use crate::egress::symbol_dict::SymbolDict;
 use crate::egress::wire::ByteReader;
-use crate::egress::wire::cache_reset::{resets_dict, resets_schemas};
+use crate::egress::wire::cache_reset::{
+    RESET_MASK_DICT, RESET_MASK_SCHEMAS, resets_dict, resets_schemas,
+};
 use crate::egress::wire::header::FrameHeader;
 use crate::egress::wire::msg_kind::{MsgKind, StatusCode};
 use bytes::Bytes;
@@ -232,6 +234,15 @@ fn decode_cache_reset(
     let mut r = ByteReader::new(payload);
     expect_kind(&mut r, MsgKind::CacheReset)?;
     let mask = r.read_u8()?;
+    const KNOWN_MASKS: u8 = RESET_MASK_DICT | RESET_MASK_SCHEMAS;
+    let unknown = mask & !KNOWN_MASKS;
+    if unknown != 0 {
+        return Err(fmt!(
+            ProtocolError,
+            "CACHE_RESET has unknown mask bits 0x{:02X}",
+            unknown
+        ));
+    }
     expect_eof(&r, "CACHE_RESET")?;
     if resets_dict(mask) {
         dict.reset();

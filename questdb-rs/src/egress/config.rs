@@ -394,8 +394,13 @@ impl ReaderConfig {
                 }
                 "max_version" => {
                     let v: u8 = parse_value("max_version", val)?;
-                    if v == 0 {
-                        return Err(fmt!(ConfigError, "\"max_version\" must be >= 1"));
+                    if !(1..=HIGHEST_KNOWN_VERSION).contains(&v) {
+                        return Err(fmt!(
+                            ConfigError,
+                            "\"max_version\" must be in 1..={} (got {})",
+                            HIGHEST_KNOWN_VERSION,
+                            v
+                        ));
                     }
                     max_version = v;
                 }
