@@ -32,10 +32,14 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+use crate::ErrorCode;
 use crate::ingress::{Protocol, SenderBuilder};
 
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const FIRST_WIRE_SEQUENCE: u64 = 0;
+const QWP_STATUS_OK: u8 = 0x00;
+const QWP_STATUS_SCHEMA_MISMATCH: u8 = 0x03;
+const QWP_STATUS_PARSE_ERROR: u8 = 0x05;
 
 // ---------- mock server ----------
 
@@ -121,6 +125,28 @@ fn write_server_binary_frame(stream: &mut TcpStream, payload: &[u8]) -> std::io:
     }
     frame.extend_from_slice(payload);
     stream.write_all(&frame)
+}
+
+fn write_qwp_ok_response(stream: &mut TcpStream, wire_seq: u64) -> std::io::Result<()> {
+    let mut ok = Vec::new();
+    ok.push(QWP_STATUS_OK);
+    ok.extend_from_slice(&wire_seq.to_le_bytes());
+    ok.extend_from_slice(&0u16.to_le_bytes());
+    write_server_binary_frame(stream, &ok)
+}
+
+fn write_qwp_error_response(
+    stream: &mut TcpStream,
+    status: u8,
+    wire_seq: u64,
+    msg: &[u8],
+) -> std::io::Result<()> {
+    let mut err = Vec::new();
+    err.push(status);
+    err.extend_from_slice(&wire_seq.to_le_bytes());
+    err.extend_from_slice(&(msg.len() as u16).to_le_bytes());
+    err.extend_from_slice(msg);
+    write_server_binary_frame(stream, &err)
 }
 
 fn compute_accept(key_b64: &str) -> String {
@@ -233,11 +259,7 @@ fn spawn_mock_server() -> (u16, mpsc::Receiver<MockResult>) {
         received_frames.push(payload);
 
         // Reply: OK status, sequence=0, table_count=0
-        let mut ok = Vec::new();
-        ok.push(0x00u8);
-        ok.extend_from_slice(&FIRST_WIRE_SEQUENCE.to_le_bytes());
-        ok.extend_from_slice(&0u16.to_le_bytes());
-        write_server_binary_frame(&mut stream, &ok).unwrap();
+        write_qwp_ok_response(&mut stream, FIRST_WIRE_SEQUENCE).unwrap();
 
         let _ = tx.send(MockResult {
             request_lines,
@@ -644,13 +666,13 @@ fn qwp_ws_server_error_response_is_surfaced() {
         stream.write_all(resp.as_bytes()).unwrap();
         let _ = read_frame(&mut stream).unwrap();
 
-        let msg = b"bad column";
-        let mut err = Vec::new();
-        err.push(0x05u8); // PARSE_ERROR
-        err.extend_from_slice(&FIRST_WIRE_SEQUENCE.to_le_bytes());
-        err.extend_from_slice(&(msg.len() as u16).to_le_bytes());
-        err.extend_from_slice(msg);
-        write_server_binary_frame(&mut stream, &err).unwrap();
+        write_qwp_error_response(
+            &mut stream,
+            QWP_STATUS_PARSE_ERROR,
+            FIRST_WIRE_SEQUENCE,
+            b"bad column",
+        )
+        .unwrap();
         thread::sleep(Duration::from_millis(50));
     });
 
@@ -671,6 +693,88 @@ fn qwp_ws_server_error_response_is_surfaced() {
         "expected server error in message, got: {}",
         err.msg()
     );
+}
+
+#[test]
+fn qwp_ws_schema_rejection_surfaces_error_and_sender_continues() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        let req_bytes = read_request_until_blank(&mut stream).unwrap();
+        let req = String::from_utf8_lossy(&req_bytes).to_string();
+        let key = parse_header(&req, "Sec-WebSocket-Key").unwrap();
+        let accept = compute_accept(&key);
+        let resp = format!(
+            "HTTP/1.1 101 Switching Protocols\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Accept: {accept}\r\n\
+             X-QWP-Version: 1\r\n\
+             \r\n"
+        );
+        stream.write_all(resp.as_bytes()).unwrap();
+
+        let mut received_frames = Vec::new();
+        let (_fin, _opcode, first) = read_frame(&mut stream).unwrap();
+        received_frames.push(first);
+        write_qwp_error_response(
+            &mut stream,
+            QWP_STATUS_SCHEMA_MISMATCH,
+            FIRST_WIRE_SEQUENCE,
+            b"bad schema",
+        )
+        .unwrap();
+
+        let (_fin, _opcode, second) = read_frame(&mut stream).unwrap();
+        received_frames.push(second);
+        write_qwp_ok_response(&mut stream, FIRST_WIRE_SEQUENCE + 1).unwrap();
+
+        tx.send(received_frames).unwrap();
+        thread::sleep(Duration::from_millis(50));
+    });
+
+    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+        .build()
+        .unwrap();
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 1)
+        .unwrap()
+        .at_now()
+        .unwrap();
+
+    let err = sender.flush(&mut buf).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert!(
+        err.msg().contains("QWP schema mismatch") && err.msg().contains("bad schema"),
+        "expected schema rejection in message, got: {}",
+        err.msg()
+    );
+    assert!(!buf.is_empty(), "failed flush must leave the buffer intact");
+
+    buf.clear();
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 2)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    sender.flush(&mut buf).unwrap();
+    assert!(buf.is_empty());
+
+    let received_frames = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(received_frames.len(), 2);
 }
 
 // ---------- reconnect tests ----------

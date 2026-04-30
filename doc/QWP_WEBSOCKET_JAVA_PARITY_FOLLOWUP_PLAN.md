@@ -58,6 +58,8 @@ Rust currently has:
 - `initial_connect_retry=sync` as an alias for current blocking startup retry,
 - explicit rejection for unsupported `initial_connect_retry=async`,
 - Java-style `.lock` ownership plus diagnostic `.lock.pid` holder sidecar,
+- Java-compatible public sync handling for frame-local schema/write rejection
+  policy,
 - no background orphan drainer implementation,
 - no Java-style `initial_connect_retry=async` behavior.
 
@@ -128,6 +130,7 @@ Status values:
 | J5 | todo | Public close / FFI boundary | Close-drain and terminal close semantics | Java now treats close-drain timeout and latched terminal errors as observable close failures. | Compare Java `close()` with Rust public sync close, FFI `close_drain`, and existing `CloseOutcome`; decide which public surfaces need parity. | Close behavior is either aligned or the difference is documented as a consequence of Rust's explicit close APIs. |
 | J6 | todo | Operational recovery / adapter layer | Orphan drainer scope check | Java now has real background orphan drainers and `.failed` sentinel behavior; Rust intentionally does not. | Re-read Java orphan scanner/drainer code and Rust SFA recovery scope; validate whether this is needed before public release. | Decision recorded; no partial drainer implementation without a real recovery scenario and behavioral test. |
 | J7 | todo | Documentation architecture | Docs sync after code slices | Handover, validation plan, and design proposal should not contradict the implemented contract. | Cross-read changed docs plus `QWP_WEBSOCKET_HANDOVER.md`, `QWP_WEBSOCKET_VALIDATION_PLAN.md`, and `QWP_WEBSOCKET_PIPELINED_FFI.md`. | Docs name current behavior, known gaps, and validation evidence without promising unimplemented Java features. |
+| J8 | done | Public sync error surface | Frame-local server rejection behavior | Java treats schema/write rejections as drop-and-continue and exposes the server message. Rust should report the rejection without making the sender terminal. | Re-read Java `CursorWebSocketSendLoop` and `SenderError`; inspect Rust codec/driver/public flush path and existing coverage. | Public mock-server test rejects the first flush with schema mismatch, verifies the server message and error category, then successfully flushes a second frame on the same sender. |
 
 ## Slice Notes
 
@@ -299,6 +302,23 @@ Evidence:
 Result:
 - deferred: do not implement Java-style `ASYNC` initial connect in the sync
   sender now. Revisit only as part of an explicit threaded/async adapter design.
+
+2026-04-30 - J8 - validate public sync frame-local rejection behavior
+Evidence:
+- Java: `CursorWebSocketSendLoop` classifies schema mismatch and write errors as
+  drop-and-continue server rejections and exposes structured `SenderError`
+  details including category, policy, raw status, server message, and affected
+  sequence range.
+- Rust: `qwp_ws_codec.rs` maps schema mismatch/write statuses to non-terminal
+  transport responses; `qwp_ws_driver.rs` resolves the affected receipt and
+  stores the server error; `flush_qwp_ws()` returns that server-derived error for
+  the rejected flush.
+- Validation: `cargo test qwp_ws_schema_rejection_surfaces_error_and_sender_continues`;
+  `cargo test qwp_ws_server_error_response_is_surfaced`; `cargo test raw_qwp`.
+Result:
+- done for the public sync sender surface. Future pipelined FFI work still needs
+  per-receipt diagnostic accessors so rejection details do not depend on the
+  event ring or a single last-error slot.
 
 ## Open Questions
 
