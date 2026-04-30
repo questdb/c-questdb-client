@@ -55,8 +55,8 @@ Rust currently has:
 - public sync `qwpws` cut over to the queue/publication driver,
 - volatile queue when `sf_dir` is unset,
 - Java-style `.sfa` slot queue when `sf_dir` is set,
-- boolean `initial_connect_retry`,
-- slot lock PID stored in `.lock`, not Java's new `.lock.pid`,
+- boolean `initial_connect_retry` (`sync`/`async` parser compatibility is J2),
+- Java-style `.lock` ownership plus diagnostic `.lock.pid` holder sidecar,
 - no background orphan drainer implementation,
 - no Java-style `initial_connect_retry=async` behavior.
 

@@ -494,9 +494,11 @@ conversion before the real driver is wired through.
 
 ## Known gaps and risks
 
-- Java-compatible initial connection configuration (`initial_connect_retry`) is
-  implemented in the public sync and async Rust sender paths and covered by
-  dropped-upgrade mock-server tests.
+- Boolean initial connection retry configuration (`initial_connect_retry`) is
+  implemented in the public sync Rust sender path and covered by dropped-upgrade
+  mock-server tests. Java's newer `sync` / `async` mode names are tracked in the
+  Java-parity follow-up plan: `sync` should become an alias, while `async` must
+  be rejected until a real explicit adapter exists.
 - Java-compatible reconnect configuration is now duration-bound, without the
   Rust-only max-attempt cap or failover callback prototype.
 - The FFI shape stubs are not connected to the real queue/driver prototypes.
@@ -506,11 +508,12 @@ conversion before the real driver is wired through.
   shape.
 - Java-compatible `.sfa` queue integration exists behind the manual driver seam,
   and the product slot wrapper now derives `<sf_dir>/<sender_id>/` and holds the
-  Java-compatible `.lock`. Config parsing now exists, including Java-compatible
-  `sf_durability` parse-and-fail behavior for reserved `flush`/`append` modes.
-  The sync product path now selects volatile vs SFA queue from config. Remaining
-  product work includes async-path cutover or retirement, orphan draining, and
-  FFI/API exposure.
+  Java-compatible `.lock` with a diagnostic `.lock.pid` holder sidecar. Config
+  parsing now exists, including Java-compatible `sf_durability` parse-and-fail
+  behavior for reserved `flush`/`append` modes. The sync product path now selects
+  volatile vs SFA queue from config. Remaining product work includes orphan
+  draining scope decisions and FFI/API exposure; future async support should be
+  an explicit adapter over this core.
 - Cross-client `.sfa` golden fixture is present but ignored by default because it
   depends on the local Java client checkout, `javac`, and Maven classpath
   discovery.

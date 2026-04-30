@@ -80,9 +80,10 @@ Buffer -> replay payload -> volatile queue or SFA slot -> blocking WS transport
 ```
 
 With `sf_dir` unset the sync sender uses the volatile queue. With `sf_dir` set
-it opens the Java-compatible `<sf_dir>/<sender_id>/` slot and stores unmasked
-QWP payload bytes in `.sfa` segment files. `sf_durability=flush|append` remains
-reserved and fails before connecting.
+it opens the Java-compatible `<sf_dir>/<sender_id>/` slot, holds `.lock`, writes
+the diagnostic holder sidecar to `.lock.pid`, and stores unmasked QWP payload
+bytes in `.sfa` segment files. `sf_durability=flush|append` remains reserved and
+fails before connecting.
 
 The old Tokio QWP/WebSocket sender is no longer part of the product surface. It
 used tasks, an unbounded writer channel, an in-flight `BTreeMap`, `oneshot`
@@ -1221,11 +1222,13 @@ Candidate config keys:
 Rust currently parses and validates the Java-compatible `sf_*` / `sender_id`
 config keys, including Java's size suffixes (`k`, `m`, `g`, `t` with optional
 trailing `b`) and reserved `sf_durability=flush|append` values. The public sync
-sender uses those keys to choose and size the volatile or SFA queue. The async
-sender still rejects `sf_dir`, `sf_max_bytes`, and `sf_max_total_bytes` before
-connecting because it has not been moved onto the queue/driver core. The public
-sync and async sender paths now parse and apply Java-compatible reconnect keys,
-including `initial_connect_retry` for startup retry.
+sender uses those keys to choose and size the volatile or SFA queue. The old
+Tokio async sender has been removed; future async support should be an explicit
+adapter over the same queue/driver core. The public sync path parses and applies
+duration/backoff reconnect keys plus boolean `initial_connect_retry` for startup
+retry. Java's newer `initial_connect_retry=sync` / `async` parser surface is
+tracked separately: `sync` should alias the current behavior, and `async` should
+be rejected until the adapter behavior exists.
 
 ## Implementation progress
 
@@ -1245,8 +1248,8 @@ Validated in the current Rust branch:
 7. Mock-server tests for pipelining, cumulative ACKs, ordered server errors,
    close behavior, no buffer clear on failed submit, replay-safe payloads, and
    dropped-upgrade startup retry.
-8. Java-compatible `.sfa` segment/slot storage, recovery, locking, rotation, and
-   ACK-driven trim behind `sf_dir`.
+8. Java-compatible `.sfa` segment/slot storage, recovery, `.lock` plus
+   `.lock.pid` slot ownership, rotation, and ACK-driven trim behind `sf_dir`.
 9. Java/Rust `.sfa` golden fixtures for segment header/frame bytes.
 10. Public sync `qwpws` sender cutover to the publication driver with
     config-derived volatile/SFA queue selection.
