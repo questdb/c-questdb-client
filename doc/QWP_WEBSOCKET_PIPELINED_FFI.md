@@ -837,6 +837,13 @@ close_fast()
 
 Dropping a sender should be equivalent to fast close. It should not attempt surprise draining.
 
+Java exposes `close_flush_timeout_millis` because Java's WebSocket sender owns
+row buffers and its `close()` can flush and then report drain failures. The Rust
+public sync `Sender` has external buffers and no fallible drop path, so that
+configuration is intentionally rejected until a real explicit QWPWS
+`close_drain(timeout)` surface is wired. Users of the current sync sender should
+call `flush()` before dropping it.
+
 ## C ABI shape
 
 Use value receipts, not heap-allocated completion handles. This avoids per-submit allocation and makes ownership simple.
@@ -1260,6 +1267,10 @@ Validated in the current Rust branch:
 12. Gated real-server public sync `Sender` probe for `sf_dir`: failed flush
     leaves recoverable work, a new sender with the same `sender_id` replays it,
     and ACK/close removes the retained `.sfa` files.
+13. Public sync close-boundary decision: Java's `close_flush_timeout_millis`
+    config key is rejected explicitly because the current Rust sync sender has no
+    fallible close-drain surface; explicit `close_drain(timeout)` remains part of
+    the future QWPWS manual/FFI API.
 
 Remaining product work:
 

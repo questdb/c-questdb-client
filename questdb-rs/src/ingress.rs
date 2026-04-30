@@ -542,6 +542,8 @@ impl SenderBuilder {
                 "initial_connect_retry" => {
                     builder.initial_connect_retry(parse_initial_connect_retry_value(val)?)?
                 }
+                #[cfg(feature = "_sender-qwp-ws")]
+                "close_flush_timeout_millis" => builder.reject_close_flush_timeout_millis()?,
                 "protocol_version" => match val {
                     "1" => builder.protocol_version(ProtocolVersion::V1)?,
                     "2" => builder.protocol_version(ProtocolVersion::V2)?,
@@ -1154,6 +1156,21 @@ impl SenderBuilder {
             .initial_connect_retry
             .set_specified("initial_connect_retry", value)?;
         Ok(self)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn reject_close_flush_timeout_millis(self) -> Result<Self> {
+        if self.qwp_ws.is_none() {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"close_flush_timeout_millis\" setting is only supported for QWP/WebSocket."
+            ));
+        }
+
+        Err(error::fmt!(
+            ConfigError,
+            "\"close_flush_timeout_millis\" is not supported by the Rust QWP/WebSocket sync sender yet; call flush before dropping the sender."
+        ))
     }
 
     /// Configure how long to wait for messages from the QuestDB server during

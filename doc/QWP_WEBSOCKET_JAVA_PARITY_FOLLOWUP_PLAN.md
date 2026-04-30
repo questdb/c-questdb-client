@@ -57,6 +57,8 @@ Rust currently has:
 - Java-style `.sfa` slot queue when `sf_dir` is set,
 - `initial_connect_retry=sync` as an alias for current blocking startup retry,
 - explicit rejection for unsupported `initial_connect_retry=async`,
+- explicit rejection for Java's `close_flush_timeout_millis` key until Rust has
+  a public close path that can report drain failures,
 - Java-style `.lock` ownership plus diagnostic `.lock.pid` holder sidecar,
 - Java-compatible public sync handling for frame-local schema/write rejection
   policy,
@@ -127,7 +129,7 @@ Status values:
 | J2 | done | Public config surface | `initial_connect_retry` parser surface | Java now accepts `off/false/on/true/sync/async`; Rust should match supported names without pretending to support Java's async lifecycle. | Re-read Java `Sender.java` parsing and Rust config parser; confirm the unsupported-mode error text. | `sync` is accepted as an alias for the existing retry behavior, and `async` is rejected clearly until the behavior exists. |
 | J3 | deferred | Adapter / lifecycle boundary | Initial-connect mode design | Java's `ASYNC` returns before any socket exists; Rust sync sender currently connects before `build()` returns and `flush()` waits for ACK. | Before resuming, trace Rust open/flush semantics and compare to Java async flush semantics. | Not implemented now. Java-style background initial connect is deferred to a future explicit adapter design; the sync sender must not silently start a background connector. |
 | J4 | todo | Driver / error surface | Reconnect budget exhaustion classification | Java distinguishes never-connected config-likely failures from connection-lost transient failures. | Re-read Java `hasEverConnected` handling; inspect Rust driver/transport reconnect state and current error messages. | Rust either reports equivalent classification or records why the current public error surface should stay simpler for now. |
-| J5 | todo | Public close / FFI boundary | Close-drain and terminal close semantics | Java now treats close-drain timeout and latched terminal errors as observable close failures. | Compare Java `close()` with Rust public sync close, FFI `close_drain`, and existing `CloseOutcome`; decide which public surfaces need parity. | Close behavior is either aligned or the difference is documented as a consequence of Rust's explicit close APIs. |
+| J5 | done | Public close / FFI boundary | Close-drain and terminal close semantics | Java now treats close-drain timeout and latched terminal errors as observable close failures. | Compare Java `close()` with Rust public sync close, FFI `close_drain`, and existing `CloseOutcome`; decide which public surfaces need parity. | Rust public sync `Sender` keeps fast-drop semantics and rejects `close_flush_timeout_millis` explicitly; real drain reporting remains an explicit QWPWS close-drain API to wire with the FFI/manual sender. |
 | J6 | todo | Operational recovery / adapter layer | Orphan drainer scope check | Java now has real background orphan drainers and `.failed` sentinel behavior; Rust intentionally does not. | Re-read Java orphan scanner/drainer code and Rust SFA recovery scope; validate whether this is needed before public release. | Decision recorded; no partial drainer implementation without a real recovery scenario and behavioral test. |
 | J7 | todo | Documentation architecture | Docs sync after code slices | Handover, validation plan, and design proposal should not contradict the implemented contract. | Cross-read changed docs plus `QWP_WEBSOCKET_HANDOVER.md`, `QWP_WEBSOCKET_VALIDATION_PLAN.md`, and `QWP_WEBSOCKET_PIPELINED_FFI.md`. | Docs name current behavior, known gaps, and validation evidence without promising unimplemented Java features. |
 | J8 | done | Public sync error surface | Frame-local server rejection behavior | Java treats schema/write rejections as drop-and-continue and exposes the server message. Rust should report the rejection without making the sender terminal. | Re-read Java `CursorWebSocketSendLoop` and `SenderError`; inspect Rust codec/driver/public flush path and existing coverage. | Public mock-server test rejects the first flush with schema mismatch, verifies the server message and error category, then successfully flushes a second frame on the same sender. |
@@ -206,18 +208,31 @@ Questions to answer first:
 
 ### J5: Close Semantics
 
-Current hypothesis: Rust already has a more explicit close-drain shape in the
-FFI sketch and driver prototype, while Java folds this into `close()`. Do not
-force identical method shape if the observable data-loss signal is already
-clearer in Rust.
+Decision: Rust should not mimic Java's `close()` shape on the public sync
+`Sender`.
+
+Java owns row buffers inside the sender, has a background I/O loop, and can make
+`close()` flush user-thread state, wait for ACKs, and throw on timeout or
+latched terminal errors. Rust's current public sync API is different: buffers are
+external, `flush()` waits for the submitted batch's server outcome, and dropping
+the sender has no return channel for drain failures. Blocking and failing from
+drop would be surprising and would still not flush an external `Buffer`.
+
+Therefore:
+
+- `close_flush_timeout_millis` must not be accepted as a no-op.
+- The current sync sender rejects that Java config key with an explicit message
+  telling users to flush before dropping the sender.
+- The explicit `close_drain(timeout)` / `close_fast()` shape remains the right
+  Rust/FFI model for future pipelined QWPWS APIs where submitted receipts can be
+  pending after a call returns.
 
 Questions to answer first:
 
-- What does plain `line_sender_close()` promise for QWP/WebSocket today?
-- Does it silently drop unresolved SFA data, or does SFA recovery make that
-acceptable?
-- Should timeout be a return value, an error, or only part of the explicit
-  `qwpws_close_drain` API?
+- When wiring the real QWPWS FFI sender, should `close_drain(timeout)` return a
+  value outcome only, or also expose the terminal/drain error text directly?
+- Should wrappers offer Java-style close behavior as convenience over explicit
+  `flush()` / `close_drain()`, or keep the Rust/C boundary explicit?
 
 ### J6: Orphan Drainers
 
@@ -320,6 +335,23 @@ Result:
   per-receipt diagnostic accessors so rejection details do not depend on the
   event ring or a single last-error slot.
 
+2026-04-30 - J5 - keep sync close explicit and reject Java close timeout key
+Evidence:
+- Java: `QwpWebSocketSender.close()` flushes sender-owned pending rows, drains up
+  to `closeFlushTimeoutMillis`, and rethrows close-drain or latched terminal
+  errors after cleanup. Java config exposes `close_flush_timeout_millis` for that
+  behavior.
+- Rust: public sync `Sender` uses external buffers and each `flush()` waits for
+  the submitted frame's server outcome. Dropping `Sender` has no error return
+  channel. The manual driver already has `close_drain_steps()` / `CloseOutcome`
+  for the future QWPWS API shape.
+- Validation: `cargo test qwpws_store_and_forward_config_rejects_invalid_java_keys`;
+  `cargo test qwpws_store_and_forward_config_is_websocket_only`.
+Result:
+- done for the public sync config surface: `close_flush_timeout_millis` is now a
+  known unsupported Java key, not a silently ignored no-op. Real close-drain
+  behavior remains an explicit QWPWS FFI/manual sender follow-up.
+
 ## Open Questions
 
 - What should the eventual explicit threaded/async adapter API look like if we
@@ -328,3 +360,5 @@ Result:
   for the public event/error API?
 - Is orphan draining required for the first public SFA release, or can it remain
   a documented Java gap while single-slot recovery ships?
+- Should wrappers expose a Java-style close convenience after the explicit
+  QWPWS close-drain API is wired?
