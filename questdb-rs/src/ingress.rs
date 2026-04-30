@@ -540,7 +540,7 @@ impl SenderBuilder {
                     .reconnect_max_backoff(Duration::from_millis(parse_conf_value(key, val)?))?,
                 #[cfg(feature = "_sender-qwp-ws")]
                 "initial_connect_retry" => {
-                    builder.initial_connect_retry(parse_conf_bool(key, val)?)?
+                    builder.initial_connect_retry(parse_initial_connect_retry_value(val)?)?
                 }
                 "protocol_version" => match val {
                     "1" => builder.protocol_version(ProtocolVersion::V1)?,
@@ -1715,16 +1715,25 @@ where
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
-fn parse_conf_bool(param_name: &str, str_value: &str) -> Result<bool> {
+fn parse_initial_connect_retry_value(str_value: &str) -> Result<bool> {
     if str_value.eq_ignore_ascii_case("on") || str_value.eq_ignore_ascii_case("true") {
+        return Ok(true);
+    }
+    if str_value.eq_ignore_ascii_case("sync") {
         return Ok(true);
     }
     if str_value.eq_ignore_ascii_case("off") || str_value.eq_ignore_ascii_case("false") {
         return Ok(false);
     }
+    if str_value.eq_ignore_ascii_case("async") {
+        return Err(error::fmt!(
+            ConfigError,
+            "initial_connect_retry=async is not supported by the Rust QWP/WebSocket sender yet; use initial_connect_retry=sync for blocking startup retry"
+        ));
+    }
     Err(error::fmt!(
         ConfigError,
-        "invalid {param_name} [value={str_value}, allowed-values=[on, off, true, false]]"
+        "invalid initial_connect_retry [value={str_value}, allowed-values=[on, off, true, false, sync], unsupported-values=[async]]"
     ))
 }
 

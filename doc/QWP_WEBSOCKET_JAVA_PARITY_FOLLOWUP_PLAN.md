@@ -55,7 +55,8 @@ Rust currently has:
 - public sync `qwpws` cut over to the queue/publication driver,
 - volatile queue when `sf_dir` is unset,
 - Java-style `.sfa` slot queue when `sf_dir` is set,
-- boolean `initial_connect_retry` (`sync`/`async` parser compatibility is J2),
+- `initial_connect_retry=sync` as an alias for current blocking startup retry,
+- explicit rejection for unsupported `initial_connect_retry=async`,
 - Java-style `.lock` ownership plus diagnostic `.lock.pid` holder sidecar,
 - no background orphan drainer implementation,
 - no Java-style `initial_connect_retry=async` behavior.
@@ -121,7 +122,7 @@ Status values:
 | ID | Status | Architecture layer | Slice | Why it matters | Required first validation | Completion signal |
 | --- | --- | --- | --- | --- | --- | --- |
 | J1 | done | SFA slot / disk contract | Slot lock `.lock.pid` parity | Java moved holder PID out of `.lock`; on-disk slot layout should match. | Re-read Java `SlotLock.java`; re-read Rust `qwp_ws_sfa_slot.rs`; confirm whether `.lock.pid` is only diagnostic and stale-safe. | Rust creates `.lock` plus `.lock.pid`, reads holder from `.lock.pid`, and existing lock behavior remains unchanged. |
-| J2 | todo | Public config surface | `initial_connect_retry` parser surface | Java now accepts `off/false/on/true/sync/async`; Rust still parses boolean only. | Re-read Java `Sender.java` parsing and Rust config parser; confirm the unsupported-mode error text. | `sync` is accepted as an alias for the existing retry behavior, and `async` is rejected clearly until the behavior exists. |
+| J2 | done | Public config surface | `initial_connect_retry` parser surface | Java now accepts `off/false/on/true/sync/async`; Rust should match supported names without pretending to support Java's async lifecycle. | Re-read Java `Sender.java` parsing and Rust config parser; confirm the unsupported-mode error text. | `sync` is accepted as an alias for the existing retry behavior, and `async` is rejected clearly until the behavior exists. |
 | J3 | deferred | Adapter / lifecycle boundary | Initial-connect mode design | Java's `ASYNC` returns before any socket exists; Rust sync sender currently connects before `build()` returns and `flush()` waits for ACK. | Before resuming, trace Rust open/flush semantics and compare to Java async flush semantics. | Not implemented now. Java-style background initial connect is deferred to a future explicit adapter design; the sync sender must not silently start a background connector. |
 | J4 | todo | Driver / error surface | Reconnect budget exhaustion classification | Java distinguishes never-connected config-likely failures from connection-lost transient failures. | Re-read Java `hasEverConnected` handling; inspect Rust driver/transport reconnect state and current error messages. | Rust either reports equivalent classification or records why the current public error surface should stay simpler for now. |
 | J5 | todo | Public close / FFI boundary | Close-drain and terminal close semantics | Java now treats close-drain timeout and latched terminal errors as observable close failures. | Compare Java `close()` with Rust public sync close, FFI `close_drain`, and existing `CloseOutcome`; decide which public surfaces need parity. | Close behavior is either aligned or the difference is documented as a consequence of Rust's explicit close APIs. |
@@ -271,6 +272,20 @@ Result:
 - follow-up: accept `sync` as an alias for existing retry behavior, reject
   `async` with an explicit unsupported-mode error until the real behavior
   exists.
+
+2026-04-30 - J2 - parser surface aligned for supported modes
+Evidence:
+- Java: config parsing accepts `on` / `true` / `sync` as `SYNC`, `off` /
+  `false` as `OFF`, and `async` as the real background `ASYNC` lifecycle mode.
+- Rust: `initial_connect_retry=sync` now aliases the existing blocking startup
+  retry behavior; `initial_connect_retry=async` fails during config parsing with
+  an explicit unsupported-mode error.
+- Validation: `cargo test --manifest-path questdb-rs/Cargo.toml --lib
+  qwp_ws_from_conf_parses_java_reconnect_keys`; `cargo test --manifest-path
+  questdb-rs/Cargo.toml --lib
+  qwp_ws_sync_initial_connect_retry_survives_dropped_upgrade`.
+Result:
+- done.
 
 2026-04-30 - J3 - defer Java-style async initial connect
 Evidence:

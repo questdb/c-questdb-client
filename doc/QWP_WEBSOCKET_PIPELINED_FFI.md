@@ -1226,9 +1226,9 @@ sender uses those keys to choose and size the volatile or SFA queue. The old
 Tokio async sender has been removed; future async support should be an explicit
 adapter over the same queue/driver core. The public sync path parses and applies
 duration/backoff reconnect keys plus boolean `initial_connect_retry` for startup
-retry. Java's newer `initial_connect_retry=sync` / `async` parser surface is
-tracked separately: `sync` should alias the current behavior, and `async` should
-be rejected until the adapter behavior exists.
+retry. Java's newer `initial_connect_retry=sync` spelling is accepted as an
+alias for the current blocking startup retry behavior. Java's `async` spelling
+is rejected explicitly until the adapter behavior exists.
 
 ## Implementation progress
 
@@ -1254,8 +1254,9 @@ Validated in the current Rust branch:
 10. Public sync `qwpws` sender cutover to the publication driver with
     config-derived volatile/SFA queue selection.
 11. Java ingestion reconnect surface: `reconnect_*` keys,
-    `initial_connect_retry`, no max-attempt cap, and no Rust-only failover
-    callback.
+    `initial_connect_retry` including the supported `sync` spelling, explicit
+    rejection of unsupported `async`, no max-attempt cap, and no Rust-only
+    failover callback.
 12. Gated real-server public sync `Sender` probe for `sf_dir`: failed flush
     leaves recoverable work, a new sender with the same `sender_id` replays it,
     and ACK/close removes the retained `.sfa` files.

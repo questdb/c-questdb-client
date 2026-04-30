@@ -932,8 +932,19 @@ fn qwp_ws_from_conf_parses_java_reconnect_keys() {
                 initial_connect_retry=on;";
     SenderBuilder::from_conf(conf).unwrap();
 
+    let conf_sync = "qwpws::addr=localhost:9000;initial_connect_retry=sync;";
+    SenderBuilder::from_conf(conf_sync).unwrap();
+
     let conf_false = "qwpws::addr=localhost:9000;initial_connect_retry=false;";
     SenderBuilder::from_conf(conf_false).unwrap();
+
+    let unsupported = "qwpws::addr=localhost:9000;initial_connect_retry=async;";
+    let err = SenderBuilder::from_conf(unsupported).unwrap_err();
+    assert!(
+        err.msg().contains("initial_connect_retry=async") && err.msg().contains("not supported"),
+        "got: {}",
+        err.msg()
+    );
 
     let bad = "qwpws::addr=localhost:9000;initial_connect_retry=maybe;";
     let err = SenderBuilder::from_conf(bad).unwrap_err();

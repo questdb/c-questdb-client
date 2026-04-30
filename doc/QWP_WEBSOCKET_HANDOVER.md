@@ -494,11 +494,11 @@ conversion before the real driver is wired through.
 
 ## Known gaps and risks
 
-- Boolean initial connection retry configuration (`initial_connect_retry`) is
-  implemented in the public sync Rust sender path and covered by dropped-upgrade
-  mock-server tests. Java's newer `sync` / `async` mode names are tracked in the
-  Java-parity follow-up plan: `sync` should become an alias, while `async` must
-  be rejected until a real explicit adapter exists.
+- Initial connection retry configuration (`initial_connect_retry`) is implemented
+  in the public sync Rust sender path and covered by dropped-upgrade mock-server
+  tests. The config parser accepts Java's `sync` spelling as an alias for the
+  existing blocking startup retry behavior. Java's `async` spelling is rejected
+  explicitly until a real explicit adapter exists.
 - Java-compatible reconnect configuration is now duration-bound, without the
   Rust-only max-attempt cap or failover callback prototype.
 - The FFI shape stubs are not connected to the real queue/driver prototypes.
