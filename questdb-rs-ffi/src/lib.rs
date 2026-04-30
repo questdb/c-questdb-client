@@ -39,8 +39,8 @@ use std::str;
 use questdb::{
     Error, ErrorCode, ingress,
     ingress::{
-        Buffer, CertificateAuthority, ColumnName, Protocol, QwpWsOptions, QwpWsSender,
-        QwpWsThreadedSender, Sender, SenderBuilder, TableName, TimestampMicros, TimestampNanos,
+        Buffer, CertificateAuthority, ColumnName, Protocol, Sender, SenderBuilder, TableName,
+        TimestampMicros, TimestampNanos,
     },
 };
 
@@ -1947,14 +1947,17 @@ pub unsafe extern "C" fn line_sender_opts_free(opts: *mut line_sender_opts) {
 /// one of its variants with this object to send them.
 pub struct line_sender(Sender);
 
-/// Shape-only QWP/WebSocket sender prototype.
+#[derive(Debug, Default)]
+struct QwpWsFfiShapeSender;
+
+/// Shape-only QWP/WebSocket sender placeholder.
 pub struct line_sender_qwpws {
-    sender: Option<QwpWsSender>,
+    sender: Option<QwpWsFfiShapeSender>,
     state: QwpWsFfiShapeState,
 }
 
-/// Shape-only QWP/WebSocket threaded ownership prototype.
-pub struct line_sender_qwpws_threaded(QwpWsThreadedSender);
+/// Shape-only QWP/WebSocket threaded ownership placeholder.
+pub struct line_sender_qwpws_threaded(QwpWsFfiShapeSender);
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -2565,7 +2568,7 @@ pub unsafe extern "C" fn line_sender_close(sender: *mut line_sender) {
     }
 }
 
-/// Create a shape-only QWP/WebSocket sender prototype.
+/// Create a shape-only QWP/WebSocket sender placeholder.
 ///
 /// This validates ABI shape and ownership before transport, queue, or encoder
 /// implementation is wired through. The config argument is intentionally ignored.
@@ -2575,15 +2578,8 @@ pub unsafe extern "C" fn line_sender_qwpws_new(
     err_out: *mut *mut line_sender_error,
 ) -> *mut line_sender_qwpws {
     qwpws_catch_ptr(err_out, || {
-        let sender = match QwpWsSender::open(QwpWsOptions::default()) {
-            Ok(sender) => sender,
-            Err(err) => {
-                unsafe { set_err_out_from_error(err_out, err) };
-                return ptr::null_mut();
-            }
-        };
         Box::into_raw(Box::new(line_sender_qwpws {
-            sender: Some(sender),
+            sender: Some(QwpWsFfiShapeSender),
             state: QwpWsFfiShapeState::default(),
         }))
     })
@@ -2927,7 +2923,7 @@ pub unsafe extern "C" fn line_sender_qwpws_close_fast(sender: *mut line_sender_q
     }));
 }
 
-/// Free a shape-only QWP/WebSocket sender prototype.
+/// Free a shape-only QWP/WebSocket sender placeholder.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_qwpws_free(sender: *mut line_sender_qwpws) {
     let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
@@ -2937,7 +2933,7 @@ pub unsafe extern "C" fn line_sender_qwpws_free(sender: *mut line_sender_qwpws) 
     }));
 }
 
-/// Consume a manual QWP/WebSocket sender prototype into a threaded prototype.
+/// Consume a manual QWP/WebSocket sender placeholder into a threaded placeholder.
 ///
 /// On success, `*sender` is set to NULL and `threaded_out` receives ownership.
 /// On failure, `*sender` remains unchanged.
@@ -2994,15 +2990,14 @@ pub unsafe extern "C" fn line_sender_qwpws_threaded_start(
             }
         };
 
-        let threaded = QwpWsThreadedSender::from_sender_type_only(manual);
         drop(Box::from_raw(sender_ptr));
         *sender = ptr::null_mut();
-        *threaded_out = Box::into_raw(Box::new(line_sender_qwpws_threaded(threaded)));
+        *threaded_out = Box::into_raw(Box::new(line_sender_qwpws_threaded(manual)));
         true
     })
 }
 
-/// Stop and free a shape-only QWP/WebSocket threaded prototype.
+/// Stop and free a shape-only QWP/WebSocket threaded placeholder.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_qwpws_threaded_stop(
     threaded: *mut line_sender_qwpws_threaded,
@@ -3010,7 +3005,7 @@ pub unsafe extern "C" fn line_sender_qwpws_threaded_stop(
     let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
         if !threaded.is_null() {
             let threaded = Box::from_raw(threaded);
-            threaded.0.stop();
+            let line_sender_qwpws_threaded(_sender) = *threaded;
         }
     }));
 }

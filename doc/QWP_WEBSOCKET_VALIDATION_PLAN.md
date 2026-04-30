@@ -15,7 +15,9 @@ As of 2026-04-29:
 
 - Step 1 has a sketch in `doc/QWP_WEBSOCKET_API_SKETCH.md`.
 - Step 2 has a type-only ownership prototype and reflection in
-  `doc/QWP_WEBSOCKET_PROGRESS_OWNERSHIP_PROTOTYPE.md`.
+  `doc/QWP_WEBSOCKET_PROGRESS_OWNERSHIP_PROTOTYPE.md`; the live Rust manual
+  sender has since been simplified so it only represents a real connected
+  progress owner.
 - Step 3 has a Rust encoder-only byte-shape spike and reflection in
   `doc/QWP_WEBSOCKET_REPLAY_ENCODER_SPIKE.md`.
 - Step 3 has a Java/Rust replay payload golden fixture and reflection in
@@ -221,6 +223,8 @@ Current validated slice:
   overwritten when receipts are waited out of rejection order.
 - A gated real-server probe verifies public manual `submit` / `wait_steps`
   writes a queryable row through a local QuestDB server.
+- The live Rust API exposes only the real manual sender path; threaded and async
+  adapters remain design targets until their progress behavior exists.
 
 ## Step 2: Progress ownership prototype
 
@@ -256,7 +260,8 @@ On success, `*sender` is set to `NULL`.
 Validation target:
 
 - A sender core has exactly one progress owner.
-- Manual, threaded, and async modes are represented by ownership, not mode flags.
+- Future manual, threaded, and async modes are represented by ownership, not
+  mode flags.
 - No API allows `drive_once()` and a background runner to race on the same core.
 - FFI handle ownership cannot produce use-after-free through normal API use.
 
@@ -639,7 +644,9 @@ Add C ABI stubs and tests for ownership and output-pointer contracts before full
 implementation is wired through.
 
 If Step 2 already introduced type-only ownership stubs, extend those stubs rather
-than adding a parallel C surface.
+than adding a parallel C surface. Keep those stubs out of the live Rust manual
+sender once the real sender exists; until the C ABI is wired through, FFI-only
+shape state should stay local to the FFI crate.
 
 This step validates ABI shape, pointer contracts, and state vocabulary only. It
 should not wire real WebSocket transport or durable storage into the C ABI.

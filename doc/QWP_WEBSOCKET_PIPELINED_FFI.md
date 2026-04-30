@@ -226,11 +226,15 @@ Initial connection work may include:
 
 All of that work must be bounded by configured connect/request timeouts. The
 manual core still must not start a background thread, spawn a runtime task, or
-continue sending/replaying after `open()` returns. There is no public lazy
+continue sending/replaying after construction returns. There is no public lazy
 constructor mode in v1; applications that want to tolerate startup ordering use
 `initial_connect_retry=true`, matching Java.
 
 ## Optional adapters
+
+Threaded and async adapters are design targets, not live API, until their
+progress behavior exists. The live Rust API must not expose a fake background or
+async sender that only stores the manual sender.
 
 ### Blocking adapter
 
@@ -245,7 +249,7 @@ This is still threadless. Calls like `flush()` or `wait()` drive the connection 
 ### Explicit background runner
 
 ```rust
-let sender = QwpWsSender::open(opts)?;
+let sender = SenderBuilder::from_conf(conf)?.build_qwp_ws()?;
 let threaded = QwpWsThreadedSender::start(sender)?;
 ```
 
@@ -260,7 +264,7 @@ Rules:
 ### Future async adapter
 
 ```rust
-let sender = QwpWsSender::open(opts)?;
+let sender = SenderBuilder::from_conf(conf)?.build_qwp_ws()?;
 let async_sender = QwpWsAsyncSender::from_sender(sender)?;
 ```
 
@@ -1171,7 +1175,7 @@ The C ABI remains the stable base. Python object allocation is acceptable in the
 
 ## Steady-state allocation rule
 
-The allocation target is steady state, not first use. After `open()`, warm-up, and buffer/queue sizing, the following paths should not allocate for workloads within configured bounds:
+The allocation target is steady state, not first use. After construction, warm-up, and buffer/queue sizing, the following paths should not allocate for workloads within configured bounds:
 
 - `submit` for frames within configured bounds,
 - `drive_once` send of already-published frames,
@@ -1320,7 +1324,7 @@ Remaining product work:
 Rust core tests:
 
 - submit returns before ACK,
-- connected `open()` validates initial connection without starting a thread,
+- manual sender construction validates initial connection without starting a thread,
 - `initial_connect_retry=true` retries startup connection with the reconnect
   policy; the sync public sender path covers this with a dropped-upgrade
   mock-server test,

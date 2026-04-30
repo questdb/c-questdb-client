@@ -24,11 +24,11 @@
 
 //! Native QWP/WebSocket progress ownership.
 //!
-//! The manual sender owns the publication queue and transport driver. Threaded
-//! and async adapters consume it instead of sharing a separate progress owner.
+//! The manual sender owns the publication queue and transport driver. Future
+//! threaded or async adapters should consume it instead of sharing a separate
+//! progress owner.
 
 use std::fmt::{Debug, Formatter};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error;
 use crate::ingress::Buffer;
@@ -49,15 +49,6 @@ use crate::ingress::sender::qwp_ws_queue::{
 use crate::ingress::sender::{
     SyncQwpWsPublisher, driver_error_to_error, publication_error_to_error,
 };
-
-static NEXT_PROTOTYPE_ID: AtomicU64 = AtomicU64::new(1);
-
-/// Placeholder options for the FFI ownership prototype.
-#[doc(hidden)]
-#[derive(Debug, Default, Clone)]
-pub struct QwpWsOptions {
-    _private: (),
-}
 
 /// Handle returned when a QWP/WebSocket batch is locally published.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,43 +119,26 @@ pub enum QwpWsCloseOutcome {
 
 /// Threadless QWP/WebSocket sender core.
 pub struct QwpWsSender {
-    prototype_id: u64,
     max_drive_steps: usize,
     max_buf_size: usize,
     max_name_len: usize,
 
     #[cfg(feature = "sync-sender-qwp-ws")]
-    publisher: Option<SyncQwpWsPublisher>,
+    publisher: SyncQwpWsPublisher,
 }
 
 impl Debug for QwpWsSender {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let mut debug = f.debug_struct("QwpWsSender");
         debug
-            .field("prototype_id", &self.prototype_id)
             .field("max_drive_steps", &self.max_drive_steps)
             .field("max_buf_size", &self.max_buf_size)
             .field("max_name_len", &self.max_name_len);
-        #[cfg(feature = "sync-sender-qwp-ws")]
-        debug.field("connected", &self.publisher.is_some());
         debug.finish()
     }
 }
 
 impl QwpWsSender {
-    /// Construct a type-only sender prototype for FFI ownership tests.
-    #[doc(hidden)]
-    pub fn open(_opts: QwpWsOptions) -> crate::Result<Self> {
-        Ok(Self {
-            prototype_id: NEXT_PROTOTYPE_ID.fetch_add(1, Ordering::Relaxed),
-            max_drive_steps: 0,
-            max_buf_size: usize::MAX,
-            max_name_len: 127,
-            #[cfg(feature = "sync-sender-qwp-ws")]
-            publisher: None,
-        })
-    }
-
     /// Create a manual QWP/WebSocket sender from the same configuration string
     /// accepted by [`crate::ingress::Sender::from_conf`].
     #[cfg(feature = "sync-sender-qwp-ws")]
@@ -180,11 +154,10 @@ impl QwpWsSender {
         max_name_len: usize,
     ) -> Self {
         Self {
-            prototype_id: NEXT_PROTOTYPE_ID.fetch_add(1, Ordering::Relaxed),
             max_drive_steps,
             max_buf_size,
             max_name_len,
-            publisher: Some(publisher),
+            publisher,
         }
     }
 
@@ -205,11 +178,7 @@ impl QwpWsSender {
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn submit_and_keep(&mut self, buf: &Buffer) -> crate::Result<QwpWsReceipt> {
         let qwp = self.qwp_buffer(buf)?;
-        match self
-            .publisher_mut()?
-            .try_submit_qwp(qwp)
-            .map(QwpWsReceipt::from)
-        {
+        match self.publisher.try_submit_qwp(qwp).map(QwpWsReceipt::from) {
             Ok(receipt) => Ok(receipt),
             Err(err) => Err(publication_error_to_error(err)),
         }
@@ -218,10 +187,9 @@ impl QwpWsSender {
     /// Drive one send/receive/reconnect step.
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn drive_once(&mut self) -> crate::Result<QwpWsDriveOutcome> {
-        let publisher = self.publisher_mut()?;
-        match publisher.drive_once() {
+        match self.publisher.drive_once() {
             Ok(outcome) => Ok(outcome.into()),
-            Err(err) => Err(driver_error_to_error(publisher, err)),
+            Err(err) => Err(driver_error_to_error(&self.publisher, err)),
         }
     }
 
@@ -239,11 +207,10 @@ impl QwpWsSender {
         max_drive_steps: usize,
     ) -> crate::Result<QwpWsDeliveryOutcome> {
         let receipt = receipt.into();
-        let publisher = self.publisher_mut()?;
-        match publisher.wait_steps(receipt, max_drive_steps) {
+        match self.publisher.wait_steps(receipt, max_drive_steps) {
             Ok(DeliveryOutcome::Acked) => Ok(QwpWsDeliveryOutcome::Acked),
             Ok(DeliveryOutcome::Rejected) => {
-                let rejection = publisher.rejected_frame(receipt).ok_or_else(|| {
+                let rejection = self.publisher.rejected_frame(receipt).ok_or_else(|| {
                     error::fmt!(
                         SocketError,
                         "QWP/WebSocket frame was rejected, but rejection details are unavailable"
@@ -251,19 +218,20 @@ impl QwpWsSender {
                 })?;
                 Ok(QwpWsDeliveryOutcome::Rejected(rejection.into()))
             }
-            Ok(DeliveryOutcome::Terminal) => Err(publisher
-                .terminal_error()
-                .cloned()
-                .unwrap_or_else(|| error::fmt!(SocketError, "QWP/WebSocket sender is terminal"))),
+            Ok(DeliveryOutcome::Terminal) => {
+                Err(self.publisher.terminal_error().cloned().unwrap_or_else(|| {
+                    error::fmt!(SocketError, "QWP/WebSocket sender is terminal")
+                }))
+            }
             Ok(DeliveryOutcome::Timeout) => Ok(QwpWsDeliveryOutcome::Timeout),
-            Err(err) => Err(driver_error_to_error(publisher, err)),
+            Err(err) => Err(driver_error_to_error(&self.publisher, err)),
         }
     }
 
     /// Return the current local status for a receipt.
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn receipt_status(&self, receipt: QwpWsReceipt) -> crate::Result<QwpWsReceiptStatus> {
-        Ok(self.publisher_ref()?.receipt_status(receipt.into()).into())
+        Ok(self.publisher.receipt_status(receipt.into()).into())
     }
 
     /// Drain all locally published frames before closing the queue.
@@ -278,37 +246,10 @@ impl QwpWsSender {
         &mut self,
         max_drive_steps: usize,
     ) -> crate::Result<QwpWsCloseOutcome> {
-        let publisher = self.publisher_mut()?;
-        match publisher.close_drain_steps(max_drive_steps) {
+        match self.publisher.close_drain_steps(max_drive_steps) {
             Ok(outcome) => Ok(outcome.into()),
-            Err(err) => Err(driver_error_to_error(publisher, err)),
+            Err(err) => Err(driver_error_to_error(&self.publisher, err)),
         }
-    }
-
-    /// Test/debug identifier preserved when ownership moves into adapters.
-    #[doc(hidden)]
-    pub fn prototype_id(&self) -> u64 {
-        self.prototype_id
-    }
-
-    #[cfg(feature = "sync-sender-qwp-ws")]
-    fn publisher_ref(&self) -> crate::Result<&SyncQwpWsPublisher> {
-        self.publisher.as_ref().ok_or_else(|| {
-            error::fmt!(
-                InvalidApiCall,
-                "QWP/WebSocket sender was not opened from a connection configuration"
-            )
-        })
-    }
-
-    #[cfg(feature = "sync-sender-qwp-ws")]
-    fn publisher_mut(&mut self) -> crate::Result<&mut SyncQwpWsPublisher> {
-        self.publisher.as_mut().ok_or_else(|| {
-            error::fmt!(
-                InvalidApiCall,
-                "QWP/WebSocket sender was not opened from a connection configuration"
-            )
-        })
     }
 
     #[cfg(feature = "sync-sender-qwp-ws")]
@@ -417,91 +358,5 @@ impl From<CloseOutcome> for QwpWsCloseOutcome {
             CloseOutcome::Timeout => Self::Timeout,
             CloseOutcome::Terminal => Self::Terminal,
         }
-    }
-}
-
-/// Explicit background-thread ownership adapter.
-///
-/// The adapter owns the sender core. Stopping or dropping this value does not
-/// return the manual sender.
-#[derive(Debug)]
-pub struct QwpWsThreadedSender {
-    inner: QwpWsSender,
-}
-
-impl QwpWsThreadedSender {
-    /// Consume a manual sender and make this value the sole progress owner.
-    pub fn start(sender: QwpWsSender) -> crate::Result<Self> {
-        Ok(Self::from_sender_type_only(sender))
-    }
-
-    #[doc(hidden)]
-    pub fn from_sender_type_only(sender: QwpWsSender) -> Self {
-        Self { inner: sender }
-    }
-
-    /// Stop the prototype runner without returning the manual sender.
-    pub fn stop(self) {}
-
-    /// Test/debug identifier preserved from the consumed manual sender.
-    #[doc(hidden)]
-    pub fn prototype_id(&self) -> u64 {
-        self.inner.prototype_id()
-    }
-}
-
-/// Explicit async ownership adapter.
-///
-/// This is runtime-neutral in the type-only prototype. A later async adapter can
-/// build on the same ownership conversion without exposing a runtime through C.
-#[derive(Debug)]
-pub struct QwpWsAsyncSender {
-    inner: QwpWsSender,
-}
-
-impl QwpWsAsyncSender {
-    /// Consume a manual sender and make this value the sole progress owner.
-    pub fn from_sender(sender: QwpWsSender) -> crate::Result<Self> {
-        Ok(Self { inner: sender })
-    }
-
-    /// Test/debug identifier preserved from the consumed manual sender.
-    #[doc(hidden)]
-    pub fn prototype_id(&self) -> u64 {
-        self.inner.prototype_id()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn threaded_adapter_consumes_manual_sender() {
-        let sender = QwpWsSender::open(QwpWsOptions::default()).unwrap();
-        let id = sender.prototype_id();
-
-        let threaded = QwpWsThreadedSender::start(sender).unwrap();
-
-        assert_eq!(threaded.prototype_id(), id);
-        threaded.stop();
-    }
-
-    #[test]
-    fn async_adapter_consumes_manual_sender() {
-        let sender = QwpWsSender::open(QwpWsOptions::default()).unwrap();
-        let id = sender.prototype_id();
-
-        let async_sender = QwpWsAsyncSender::from_sender(sender).unwrap();
-
-        assert_eq!(async_sender.prototype_id(), id);
-    }
-
-    #[test]
-    fn prototype_sender_is_not_a_connected_progress_owner() {
-        let mut sender = QwpWsSender::open(QwpWsOptions::default()).unwrap();
-
-        let err = sender.drive_once().unwrap_err();
-        assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
     }
 }

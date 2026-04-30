@@ -168,10 +168,12 @@ minimal sync-sender-qwp-ws qwpws_store_and_forward: 5 passed, with existing redu
 - `submit()` means local publication and returns a value receipt.
 - `wait(receipt, timeout)` means delivery observation and may drive progress.
 - `flush()` is intentionally not the primary low-level verb.
-- Manual, threaded, and async ownership are modeled by consuming adapters, not
-  runtime "runner active" flags.
-- `questdb-rs/src/ingress/sender/qwp_ws_ownership.rs` validates the Rust
-  type-only ownership shape.
+- Future threaded and async ownership should be modeled by consuming adapters,
+  not runtime "runner active" flags. The live Rust API currently exposes the
+  real manual sender path only.
+- `questdb-rs/src/ingress/sender/qwp_ws_ownership.rs` now contains only the real
+  connected manual sender shape; FFI-only ownership placeholders live in
+  `questdb-rs-ffi/src/lib.rs` until the C ABI is wired to the real sender.
 
 ### Replay payload shape
 
@@ -501,7 +503,8 @@ conversion before the real driver is wired through.
   explicitly until a real explicit adapter exists.
 - Java-compatible reconnect configuration is now duration-bound, without the
   Rust-only max-attempt cap or failover callback prototype.
-- The FFI shape stubs are not connected to the real queue/driver prototypes.
+- The FFI shape stubs are not connected to the real queue/driver prototypes and
+  intentionally use FFI-local placeholder state rather than the live Rust sender.
 - Active queue/driver/FFI prototype vocabulary now uses Java-compatible
   `Rejected` naming before ABI hardening.
 - No C++ or Python wrapper implementation has been added for the new QWP/WS

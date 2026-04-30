@@ -5,6 +5,9 @@ Date: 2026-04-28
 Status: Step 1 sketch for `doc/QWP_WEBSOCKET_VALIDATION_PLAN.md`.
 This is not an implementation contract yet. The goal is to write the intended
 end-user code before committing to transport, queue, or FFI details.
+The live Rust API currently exposes the real manual sender path only; threaded
+and async examples below remain design targets until their progress behavior is
+implemented.
 
 ## Design stance
 
@@ -150,18 +153,16 @@ the caller invokes `submit()`, `drive_once()`, `wait()`, or `close_drain()`.
 ```rust
 use std::time::Duration;
 use questdb::ingress::{
-    Buffer, QwpCloseOutcome, QwpDeliveryOutcome, QwpWsOptions, QwpWsSender,
-    TimestampNanos,
+    Buffer, QwpCloseOutcome, QwpDeliveryOutcome, SenderBuilder, TimestampNanos,
 };
 
 fn manual_submit_and_wait() -> questdb::Result<()> {
-    let opts = QwpWsOptions::from_conf(
+    let mut sender = SenderBuilder::from_conf(
         "qwpws::addr=localhost:9000;\
          sf_dir=/var/lib/my-app/qdb-sf;\
          sender_id=prices;",
-    )?;
-
-    let mut sender = QwpWsSender::open(opts)?;
+    )?
+    .build_qwp_ws()?;
     let mut buffer = sender.new_buffer();
 
     buffer
@@ -229,10 +230,10 @@ manual driver and a background runner from racing the same core.
 
 ```rust
 use std::time::Duration;
-use questdb::ingress::{QwpDeliveryOutcome, QwpWsSender, QwpWsThreadedSender};
+use questdb::ingress::{QwpDeliveryOutcome, QwpWsThreadedSender, SenderBuilder};
 
 fn threaded_sender() -> questdb::Result<()> {
-    let sender = QwpWsSender::open(opts())?;
+    let sender = SenderBuilder::from_conf(conf())?.build_qwp_ws()?;
     let threaded = QwpWsThreadedSender::start(sender)?;
 
     let mut buffer = threaded.new_buffer();
@@ -267,10 +268,10 @@ should not appear in the C ABI.
 
 ```rust
 use std::time::Duration;
-use questdb::ingress::{QwpDeliveryOutcome, QwpWsAsyncSender, QwpWsSender};
+use questdb::ingress::{QwpDeliveryOutcome, QwpWsAsyncSender, SenderBuilder};
 
 async fn async_sender() -> questdb::Result<()> {
-    let sender = QwpWsSender::open(opts())?;
+    let sender = SenderBuilder::from_conf(conf())?.build_qwp_ws()?;
     let sender = QwpWsAsyncSender::from_sender(sender)?;
 
     let mut buffer = sender.new_buffer();
@@ -692,9 +693,9 @@ Do not add a `flush()` alias to the low-level core during the first prototype.
   runtime-neutral FFI, and observable delivery?
 
   Yes. `Buffer` remains caller-owned and reusable after successful `submit()`.
-  Manual, threaded, and async modes are represented by ownership conversion.
-  Async runtime details are not visible through C. Delivery is observable through receipts,
-  status polling, wait outcomes, close outcomes, and events.
+  Future threaded and async modes are represented by ownership conversion.
+  Async runtime details are not visible through C. Delivery is observable
+  through receipts, status polling, wait outcomes, close outcomes, and events.
 
 - Should the design proceed to a type-only progress ownership prototype?
 
