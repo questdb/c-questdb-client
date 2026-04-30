@@ -33,6 +33,7 @@
 use std::collections::VecDeque;
 #[cfg(feature = "sync-sender-qwp-ws")]
 use std::io::Write;
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 use crate::error;
@@ -54,6 +55,35 @@ use super::qwp_ws_queue::{
 
 const DEFAULT_EVENT_CAPACITY: usize = 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReconnectPolicy {
+    max_duration: Duration,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+}
+
+impl ReconnectPolicy {
+    pub(crate) fn bounded(
+        max_duration: Duration,
+        initial_backoff: Duration,
+        max_backoff: Duration,
+    ) -> Self {
+        Self {
+            max_duration,
+            initial_backoff,
+            max_backoff,
+        }
+    }
+
+    fn no_backoff(max_duration: Duration) -> Self {
+        Self {
+            max_duration,
+            initial_backoff: Duration::ZERO,
+            max_backoff: Duration::ZERO,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ManualDriverPrototype<Q = VolatileFrameQueue, T = FakeOrderedServer> {
     queue: Q,
@@ -64,7 +94,7 @@ pub(crate) struct ManualDriverPrototype<Q = VolatileFrameQueue, T = FakeOrderedS
     terminal_error: Option<Error>,
     last_server_error: Option<QwpServerError>,
     closing: bool,
-    retry_budget_remaining: Option<usize>,
+    reconnect_policy: ReconnectPolicy,
 }
 
 impl ManualDriverPrototype<VolatileFrameQueue> {
@@ -81,7 +111,7 @@ impl ManualDriverPrototype<VolatileFrameQueue> {
             terminal_error: None,
             last_server_error: None,
             closing: false,
-            retry_budget_remaining: None,
+            reconnect_policy: ReconnectPolicy::no_backoff(Duration::MAX),
         })
     }
 }
@@ -97,14 +127,14 @@ impl<Q: ManualDriverQueue, T: ManualDriverTransport> ManualDriverPrototype<Q, T>
             terminal_error: None,
             last_server_error: None,
             closing: false,
-            retry_budget_remaining: None,
+            reconnect_policy: ReconnectPolicy::no_backoff(Duration::MAX),
         }
     }
 
-    pub(crate) fn from_queue_with_retry_budget(
+    pub(crate) fn from_queue_with_reconnect_policy(
         queue: Q,
         transport: T,
-        retry_budget: usize,
+        reconnect_policy: ReconnectPolicy,
     ) -> Self {
         Self {
             queue,
@@ -115,7 +145,7 @@ impl<Q: ManualDriverQueue, T: ManualDriverTransport> ManualDriverPrototype<Q, T>
             terminal_error: None,
             last_server_error: None,
             closing: false,
-            retry_budget_remaining: Some(retry_budget),
+            reconnect_policy,
         }
     }
 
@@ -133,7 +163,7 @@ impl<Q: ManualDriverQueue, T: ManualDriverTransport> ManualDriverPrototype<Q, T>
             terminal_error: None,
             last_server_error: None,
             closing: false,
-            retry_budget_remaining: None,
+            reconnect_policy: ReconnectPolicy::no_backoff(Duration::MAX),
         }
     }
 
@@ -411,18 +441,11 @@ impl<Q: ManualDriverQueue, T: ManualDriverTransport> ManualDriverPrototype<Q, T>
         failure: TransportFailure,
     ) -> Result<DriveOutcome, DriverError> {
         match failure {
-            TransportFailure::Disconnect(_error) => {
-                self.restart_connection(ReconnectReason::Disconnect)
+            TransportFailure::Disconnect(error) => {
+                self.reconnect_with_policy(ReconnectReason::Disconnect, error)
             }
             TransportFailure::Retryable(error) => {
-                if let Some(remaining) = &mut self.retry_budget_remaining {
-                    if *remaining == 0 {
-                        self.mark_terminal(Some(error));
-                        return Ok(DriveOutcome::Terminal);
-                    }
-                    *remaining -= 1;
-                }
-                self.restart_for_retryable_failure()
+                self.reconnect_with_policy(ReconnectReason::RetryableFailure, error)
             }
             TransportFailure::Terminal(error) => {
                 self.mark_terminal(Some(error));
@@ -431,15 +454,50 @@ impl<Q: ManualDriverQueue, T: ManualDriverTransport> ManualDriverPrototype<Q, T>
         }
     }
 
-    fn restart_for_retryable_failure(&mut self) -> Result<DriveOutcome, DriverError> {
-        self.restart_connection(ReconnectReason::RetryableFailure)
-    }
+    fn reconnect_with_policy(
+        &mut self,
+        reason: ReconnectReason,
+        initial_error: Error,
+    ) -> Result<DriveOutcome, DriverError> {
+        let policy = self.reconnect_policy;
+        let deadline = Instant::now().checked_add(policy.max_duration);
+        if reconnect_deadline_expired(deadline) {
+            self.mark_terminal(Some(initial_error));
+            return Ok(DriveOutcome::Terminal);
+        }
 
-    fn restart_connection(&mut self, reason: ReconnectReason) -> Result<DriveOutcome, DriverError> {
-        self.transport.restart_connection(reason)?;
-        self.queue.restart_connection();
-        self.push_event(DriverEvent::Reconnected { reason });
-        Ok(DriveOutcome::Reconnected { reason })
+        let mut attempts = 0usize;
+        let mut backoff = policy.initial_backoff;
+        let mut last_error = initial_error;
+
+        while !reconnect_deadline_expired(deadline) {
+            if attempts > 0 {
+                if !sleep_before_reconnect(deadline, backoff) {
+                    break;
+                }
+                backoff = double_duration(backoff).min(policy.max_backoff);
+            }
+
+            attempts += 1;
+            match self.transport.restart_connection(reason) {
+                Ok(()) => {
+                    self.queue.restart_connection();
+                    self.push_event(DriverEvent::Reconnected { reason });
+                    return Ok(DriveOutcome::Reconnected { reason });
+                }
+                Err(err) => match reconnect_attempt_error(err) {
+                    Ok(err) if reconnect_error_is_terminal(&err) => {
+                        self.mark_terminal(Some(err));
+                        return Ok(DriveOutcome::Terminal);
+                    }
+                    Ok(err) => last_error = err,
+                    Err(err) => return Err(err),
+                },
+            }
+        }
+
+        self.mark_terminal(Some(last_error));
+        Ok(DriveOutcome::Terminal)
     }
 
     fn mark_terminal(&mut self, error: Option<Error>) {
@@ -454,6 +512,47 @@ impl<Q: ManualDriverQueue, T: ManualDriverTransport> ManualDriverPrototype<Q, T>
     fn push_event(&mut self, event: DriverEvent) {
         self.events.push(event);
     }
+}
+
+fn reconnect_attempt_error(err: DriverError) -> Result<Error, DriverError> {
+    match err {
+        DriverError::Transport(err) | DriverError::Storage(err) => Ok(err),
+        err => Err(err),
+    }
+}
+
+pub(crate) fn reconnect_error_is_terminal(err: &Error) -> bool {
+    matches!(
+        err.code(),
+        ErrorCode::AuthError | ErrorCode::ProtocolVersionError
+    )
+}
+
+fn reconnect_deadline_expired(deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|deadline| Instant::now() >= deadline)
+}
+
+fn sleep_before_reconnect(deadline: Option<Instant>, backoff: Duration) -> bool {
+    if backoff.is_zero() {
+        return !reconnect_deadline_expired(deadline);
+    }
+
+    let sleep_for = match deadline {
+        Some(deadline) => {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            backoff.min(remaining)
+        }
+        None => backoff,
+    };
+    std::thread::sleep(sleep_for);
+    !reconnect_deadline_expired(deadline)
+}
+
+fn double_duration(duration: Duration) -> Duration {
+    duration.checked_mul(2).unwrap_or(Duration::MAX)
 }
 
 pub(crate) trait ManualDriverQueue {
@@ -500,6 +599,7 @@ pub(crate) struct BlockingQwpWsTransport {
     tls_settings: Option<TlsSettings>,
     qwp_ws: QwpWsConfig,
     auth_header: Option<String>,
+    negotiated_version: u8,
     stream: WsStream,
     recv: Vec<u8>,
     send_buf: Vec<u8>,
@@ -519,7 +619,7 @@ impl BlockingQwpWsTransport {
     ) -> crate::Result<Self> {
         let host = host.into();
         let port = port.into();
-        let (stream, _version) = establish_connection(
+        let (stream, negotiated_version) = establish_connection(
             &host,
             &port,
             use_tls,
@@ -534,6 +634,7 @@ impl BlockingQwpWsTransport {
             tls_settings,
             qwp_ws,
             auth_header,
+            negotiated_version,
             stream,
             recv: Vec::new(),
             send_buf: Vec::with_capacity(16 * 1024),
@@ -542,8 +643,12 @@ impl BlockingQwpWsTransport {
         })
     }
 
+    pub(crate) fn negotiated_version(&self) -> u8 {
+        self.negotiated_version
+    }
+
     fn reconnect(&mut self) -> Result<(), DriverError> {
-        let (stream, _version) = establish_connection(
+        let (stream, negotiated_version) = establish_connection(
             &self.host,
             &self.port,
             self.use_tls,
@@ -553,6 +658,7 @@ impl BlockingQwpWsTransport {
         )
         .map_err(DriverError::Transport)?;
         self.stream = stream;
+        self.negotiated_version = negotiated_version;
         self.recv.clear();
         self.send_buf.clear();
         self.pending_wire_sequences.clear();
@@ -1012,17 +1118,6 @@ mod tests {
         ManualDriverPrototype::new(options(8, 1024, 4), server).unwrap()
     }
 
-    fn driver_with_retry_budget(
-        server: FakeOrderedServer,
-        retry_budget: usize,
-    ) -> ManualDriverPrototype {
-        ManualDriverPrototype::from_queue_with_retry_budget(
-            VolatileFrameQueue::new(options(8, 1024, 4)).unwrap(),
-            server,
-            retry_budget,
-        )
-    }
-
     fn driver_with_event_capacity(
         server: FakeOrderedServer,
         event_capacity: usize,
@@ -1085,7 +1180,8 @@ mod tests {
     struct TestTransport {
         send_results: VecDeque<Result<TransportSendResult, TransportFailure>>,
         poll_results: VecDeque<Result<Option<TransportResponse>, TransportFailure>>,
-        restart_result: Result<(), DriverError>,
+        restart_results: VecDeque<Result<(), DriverError>>,
+        restart_attempts: usize,
         sent_frames: Vec<SentFrame>,
         sent_payloads: Vec<Vec<u8>>,
     }
@@ -1097,14 +1193,18 @@ mod tests {
             Self {
                 send_results: send_results.into_iter().collect(),
                 poll_results: VecDeque::new(),
-                restart_result: Ok(()),
+                restart_results: VecDeque::new(),
+                restart_attempts: 0,
                 sent_frames: Vec::new(),
                 sent_payloads: Vec::new(),
             }
         }
 
-        fn with_restart_result(mut self, restart_result: Result<(), DriverError>) -> Self {
-            self.restart_result = restart_result;
+        fn with_restart_results(
+            mut self,
+            restart_results: impl IntoIterator<Item = Result<(), DriverError>>,
+        ) -> Self {
+            self.restart_results = restart_results.into_iter().collect();
             self
         }
 
@@ -1134,7 +1234,8 @@ mod tests {
         }
 
         fn restart_connection(&mut self, _reason: ReconnectReason) -> Result<(), DriverError> {
-            self.restart_result.clone()
+            self.restart_attempts += 1;
+            self.restart_results.pop_front().unwrap_or(Ok(()))
         }
 
         fn sent_frames(&self) -> &[SentFrame] {
@@ -1739,32 +1840,34 @@ mod tests {
     }
 
     #[test]
-    fn transport_reconnect_failure_keeps_sent_receipt_observable() {
+    fn reconnect_policy_retries_failed_reconnect_until_success() {
         let transport = TestTransport::scripted([Ok(TransportSendResult::Failure(
             TransportFailure::Disconnect(fake_transport_error("disconnect before reconnect")),
         ))])
-        .with_restart_result(Err(DriverError::Transport(fake_transport_error(
-            "reconnect failed",
-        ))));
-        let mut driver = ManualDriverPrototype::from_queue(
+        .with_restart_results([
+            Err(DriverError::Transport(fake_transport_error(
+                "reconnect failed once",
+            ))),
+            Ok(()),
+        ]);
+        let mut driver = ManualDriverPrototype::from_queue_with_reconnect_policy(
             VolatileFrameQueue::new(options(8, 1024, 4)).unwrap(),
             transport,
+            ReconnectPolicy::no_backoff(Duration::from_secs(1)),
         );
         let receipt = driver.try_submit(b"payload").unwrap();
 
         assert_eq!(
-            driver.drive_once(),
-            Err(DriverError::Transport(fake_transport_error(
-                "reconnect failed"
-            )))
+            driver.drive_once().unwrap(),
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::Disconnect,
+            }
         );
+        assert_eq!(driver.transport.restart_attempts, 2);
         assert_eq!(driver.transport.sent_payloads, vec![b"payload".to_vec()]);
         assert_eq!(
             driver.receipt_status(receipt),
-            QwpReceiptStatus::Sent {
-                fsn: 0,
-                wire_seq: 0,
-            }
+            QwpReceiptStatus::Published { fsn: 0 }
         );
         assert_eq!(
             drain_events(&mut driver),
@@ -1773,6 +1876,9 @@ mod tests {
                 DriverEvent::Sent {
                     fsn: 0,
                     wire_seq: 0,
+                },
+                DriverEvent::Reconnected {
+                    reason: ReconnectReason::Disconnect,
                 },
             ]
         );
@@ -2167,29 +2273,31 @@ mod tests {
     }
 
     #[test]
-    fn retry_budget_exhaustion_terminalizes_current_unresolved_receipts() {
-        let mut driver = driver_with_retry_budget(
-            FakeOrderedServer::scripted([
-                FakeSendResult::RetryableFailure,
-                FakeSendResult::RetryableFailure,
-            ]),
-            1,
+    fn reconnect_policy_exhaustion_terminalizes_current_unresolved_receipts() {
+        let transport = TestTransport::scripted([Ok(TransportSendResult::Failure(
+            TransportFailure::Retryable(fake_transport_error("retryable outage")),
+        ))])
+        .with_restart_results([Err(DriverError::Transport(fake_transport_error(
+            "reconnect failed once",
+        )))]);
+        let mut driver = ManualDriverPrototype::from_queue_with_reconnect_policy(
+            VolatileFrameQueue::new(options(8, 1024, 4)).unwrap(),
+            transport,
+            ReconnectPolicy::bounded(
+                Duration::from_millis(1),
+                Duration::from_millis(10),
+                Duration::from_millis(10),
+            ),
         );
         let first = driver.try_submit(b"first").unwrap();
         let second = driver.try_submit(b"second").unwrap();
 
-        assert_eq!(
-            driver.drive_once().unwrap(),
-            DriveOutcome::Reconnected {
-                reason: ReconnectReason::RetryableFailure,
-            }
-        );
-        assert_eq!(
-            driver.receipt_status(first),
-            QwpReceiptStatus::Published { fsn: 0 }
-        );
-
         assert_eq!(driver.drive_once().unwrap(), DriveOutcome::Terminal);
+        assert_eq!(driver.transport.restart_attempts, 1);
+        assert_eq!(
+            driver.terminal_error().map(Error::msg),
+            Some("reconnect failed once")
+        );
         assert_eq!(
             driver.receipt_status(first),
             QwpReceiptStatus::Terminal { fsn: 0 }

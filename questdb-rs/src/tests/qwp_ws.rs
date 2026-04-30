@@ -28,8 +28,6 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -313,7 +311,31 @@ fn qwp_ws_round_trip_minimal_message() {
 }
 
 #[test]
-fn qwp_ws_subsequent_message_has_empty_delta() {
+fn qwp_ws_store_and_forward_config_opens_java_slot_layout() {
+    let (port, rx) = spawn_mock_server();
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    let conf = format!(
+        "qwpws::addr=127.0.0.1:{port};sf_dir={};sender_id=primary;",
+        sf_dir.path().display()
+    );
+
+    let mut sender = SenderBuilder::from_conf(conf).unwrap().build().unwrap();
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 7)
+        .unwrap()
+        .at_now()
+        .unwrap();
+
+    sender.flush(&mut buf).unwrap();
+
+    let _ = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(sf_dir.path().join("primary").join(".lock").exists());
+}
+
+#[test]
+fn qwp_ws_subsequent_message_reemits_replay_dictionary_and_full_schema() {
     // Run two consecutive flushes against a server that processes both. We
     // build a slightly extended mock inline.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -368,7 +390,9 @@ fn qwp_ws_subsequent_message_has_empty_delta() {
         .unwrap();
     sender.flush(&mut buf).unwrap();
 
-    // Second flush reuses the same global symbol -- delta_count must be 0.
+    // Second flush reuses the same global symbol. The replay-safe public path
+    // still re-emits the dense dictionary prefix so the frame can stand alone
+    // after Store-and-Forward recovery or reconnect.
     buf.table("trades")
         .unwrap()
         .symbol("sym", "BTC-USD")
@@ -384,19 +408,21 @@ fn qwp_ws_subsequent_message_has_empty_delta() {
 
     assert!(second.len() >= 12);
     let payload = &second[12..];
-    // delta_start = 1 (one symbol already global), delta_count = 0.
-    assert_eq!(payload[0], 0x01);
-    assert_eq!(payload[1], 0x00);
+    // delta_start = 0, delta_count = 1, followed by "BTC-USD".
+    assert_eq!(payload[0], 0x00);
+    assert_eq!(payload[1], 0x01);
+    assert_eq!(payload[2], 0x07);
+    assert_eq!(&payload[3..10], b"BTC-USD");
 
-    // First message: full schema (0x00). Second: reference schema (0x01).
+    // Replay-safe public QWP/WS frames always carry full schema.
     assert_eq!(read_schema_mode(&first), 0x00);
-    assert_eq!(read_schema_mode(&second), 0x01);
+    assert_eq!(read_schema_mode(&second), 0x00);
 }
 
 #[test]
-fn qwp_ws_reference_schema_used_when_columns_match() {
-    // Two flushes with identical schema → second message must use ref mode and
-    // omit the column definitions, even though the rows differ.
+fn qwp_ws_replay_full_schema_used_when_columns_match() {
+    // Public QWP/WS now uses the replay-safe encoder. Even when schemas match,
+    // every frame carries its full schema so it can be delivered independently.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::channel();
@@ -454,26 +480,16 @@ fn qwp_ws_reference_schema_used_when_columns_match() {
     let m2 = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     let m3 = rx.recv_timeout(Duration::from_secs(5)).unwrap();
 
-    // First message must register the schema in full mode.
     assert_eq!(read_schema_mode(&m1), 0x00, "first message: full schema");
-    // Subsequent messages with the same column set use reference mode.
-    assert_eq!(read_schema_mode(&m2), 0x01, "second message: ref schema");
-    assert_eq!(read_schema_mode(&m3), 0x01, "third message: ref schema");
+    assert_eq!(read_schema_mode(&m2), 0x00, "second message: full schema");
+    assert_eq!(read_schema_mode(&m3), 0x00, "third message: full schema");
 
-    // Sanity check: both ref-mode messages reference id 0 (the first id minted).
+    let (_, m1_id) = read_schema_mode_and_id(&m1);
     let (_, m2_id) = read_schema_mode_and_id(&m2);
     let (_, m3_id) = read_schema_mode_and_id(&m3);
+    assert_eq!(m1_id, 0);
     assert_eq!(m2_id, 0);
     assert_eq!(m3_id, 0);
-
-    // The ref-mode payload must be smaller than the full-mode one despite
-    // carrying the same row count: ref mode drops the column-definition bytes.
-    assert!(
-        m2.len() < m1.len(),
-        "ref-mode message ({} bytes) should be smaller than full-mode ({} bytes)",
-        m2.len(),
-        m1.len()
-    );
 }
 
 #[test]
@@ -549,7 +565,8 @@ fn qwp_ws_full_schema_re_emitted_when_columns_change() {
         mode2, 0x00,
         "different column set must re-register full schema"
     );
-    assert_ne!(id1, id2, "new schema must get a fresh id");
+    assert_eq!(id1, 0, "replay schema registry is per frame");
+    assert_eq!(id2, 0, "replay schema registry is per frame");
 }
 
 // ---------- wire helpers ----------
@@ -656,7 +673,7 @@ fn qwp_ws_server_error_response_is_surfaced() {
     );
 }
 
-// ---------- failover tests ----------
+// ---------- reconnect tests ----------
 
 /// Two-connection mock: accept one upgrade, drop after reading the first
 /// frame (simulating mid-stream socket failure), then accept a *second*
@@ -711,19 +728,13 @@ fn spawn_dropping_then_recovering_server() -> (u16, std::sync::mpsc::Receiver<Ve
 }
 
 #[test]
-fn qwp_ws_sync_failover_reconnects_and_replays() {
+fn qwp_ws_sync_reconnects_and_replays() {
     let (port, rx) = spawn_dropping_then_recovering_server();
-    let callback_fired = Arc::new(AtomicBool::new(false));
-    let cb_flag = callback_fired.clone();
 
     let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
-        .failover_initial_backoff(Duration::from_millis(20))
+        .reconnect_initial_backoff(Duration::from_millis(20))
         .unwrap()
-        .failover_max_backoff(Duration::from_millis(50))
-        .unwrap()
-        .on_failover_reset(crate::ingress::FailoverCallback::new(move || {
-            cb_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-        }))
+        .reconnect_max_backoff(Duration::from_millis(50))
         .unwrap()
         .build()
         .unwrap();
@@ -739,7 +750,6 @@ fn qwp_ws_sync_failover_reconnects_and_replays() {
         .unwrap();
 
     sender.flush(&mut buf).unwrap();
-    assert!(callback_fired.load(std::sync::atomic::Ordering::SeqCst));
 
     // Both wire dumps should be identical QWP messages — replay re-encodes
     // against fresh state but with the same row, so the bytes match.
@@ -750,38 +760,113 @@ fn qwp_ws_sync_failover_reconnects_and_replays() {
 }
 
 #[test]
-fn qwp_ws_from_conf_parses_failover_keys() {
-    // Just exercises the parser surface: every new key is accepted. Building
-    // would also work but isn't necessary for parser coverage.
-    let conf = "qwpws::addr=localhost:9000;\
-                max_in_flight=64;\
-                failover=on;\
-                max_failover_attempts=5;\
-                failover_initial_backoff=200;\
-                failover_max_backoff=2000;\
-                failover_total_budget=20000;";
-    SenderBuilder::from_conf(conf).unwrap();
+fn qwp_ws_sync_reconnect_retries_failed_attempt() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (payload_tx, payload_rx) = mpsc::channel();
+    let (event_tx, event_rx) = mpsc::channel();
 
-    let conf_off = "qwpws::addr=localhost:9000;failover=off;";
-    SenderBuilder::from_conf(conf_off).unwrap();
+    thread::spawn(move || {
+        let do_upgrade = |stream: &mut TcpStream| {
+            let req_bytes = read_request_until_blank(stream).unwrap();
+            let req = String::from_utf8_lossy(&req_bytes).to_string();
+            let key = parse_header(&req, "Sec-WebSocket-Key").unwrap();
+            let accept = compute_accept(&key);
+            let resp = format!(
+                "HTTP/1.1 101 Switching Protocols\r\n\
+                 Upgrade: websocket\r\n\
+                 Connection: Upgrade\r\n\
+                 Sec-WebSocket-Accept: {accept}\r\n\
+                 X-QWP-Version: 1\r\n\
+                 \r\n"
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+        };
 
-    let bad = "qwpws::addr=localhost:9000;failover=maybe;";
-    let err = SenderBuilder::from_conf(bad).unwrap_err();
-    assert!(err.msg().contains("\"failover\""), "got: {}", err.msg());
+        let (mut s1, _) = listener.accept().unwrap();
+        s1.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s1.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        do_upgrade(&mut s1);
+        let (_fin, _op, payload) = read_frame(&mut s1).unwrap();
+        payload_tx.send(payload).unwrap();
+        drop(s1);
+
+        let (s2, _) = listener.accept().unwrap();
+        event_tx.send("failed_reconnect").unwrap();
+        drop(s2);
+
+        let (mut s3, _) = listener.accept().unwrap();
+        s3.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s3.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        do_upgrade(&mut s3);
+        let (_fin, _op, payload) = read_frame(&mut s3).unwrap();
+        payload_tx.send(payload).unwrap();
+        let mut ok = vec![0u8];
+        ok.extend_from_slice(&FIRST_WIRE_SEQUENCE.to_le_bytes());
+        ok.extend_from_slice(&0u16.to_le_bytes());
+        write_server_binary_frame(&mut s3, &ok).unwrap();
+        thread::sleep(Duration::from_millis(50));
+    });
+
+    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+        .reconnect_initial_backoff(Duration::from_millis(1))
+        .unwrap()
+        .reconnect_max_backoff(Duration::from_millis(1))
+        .unwrap()
+        .reconnect_max_duration(Duration::from_secs(5))
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .symbol("sym", "ETH-USD")
+        .unwrap()
+        .column_i64("qty", 7)
+        .unwrap()
+        .at_now()
+        .unwrap();
+
+    sender.flush(&mut buf).unwrap();
+
+    assert_eq!(
+        event_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "failed_reconnect"
+    );
+    let frame1 = payload_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let frame2 = payload_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(&frame1[0..4], b"QWP1");
+    assert_eq!(frame1, frame2);
 }
 
 #[test]
-fn qwp_ws_sync_failover_disabled_latches_terminal_error() {
-    // Server accepts upgrade then drops. With failover off, the first flush
-    // returns SocketError; subsequent flushes return the same error.
+fn qwp_ws_sync_initial_connect_retry_survives_dropped_upgrade() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
+    let (payload_tx, payload_rx) = mpsc::channel();
+    let (event_tx, event_rx) = mpsc::channel();
 
     thread::spawn(move || {
-        let (mut s, _) = listener.accept().unwrap();
-        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        s.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
-        let req_bytes = read_request_until_blank(&mut s).unwrap();
+        let (mut first, _) = listener.accept().unwrap();
+        first
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        first
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let _ = read_request_until_blank(&mut first).unwrap();
+        event_tx.send("dropped_initial_upgrade").unwrap();
+        drop(first);
+
+        let (mut second, _) = listener.accept().unwrap();
+        second
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        second
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let req_bytes = read_request_until_blank(&mut second).unwrap();
         let req = String::from_utf8_lossy(&req_bytes).to_string();
         let key = parse_header(&req, "Sec-WebSocket-Key").unwrap();
         let accept = compute_accept(&key);
@@ -793,35 +878,68 @@ fn qwp_ws_sync_failover_disabled_latches_terminal_error() {
              X-QWP-Version: 1\r\n\
              \r\n"
         );
-        s.write_all(resp.as_bytes()).unwrap();
-        let _ = read_frame(&mut s).unwrap();
-        drop(s); // close mid-flight
+        second.write_all(resp.as_bytes()).unwrap();
+        let (_fin, _op, payload) = read_frame(&mut second).unwrap();
+        payload_tx.send(payload).unwrap();
+        let mut ok = vec![0u8];
+        ok.extend_from_slice(&FIRST_WIRE_SEQUENCE.to_le_bytes());
+        ok.extend_from_slice(&0u16.to_le_bytes());
+        write_server_binary_frame(&mut second, &ok).unwrap();
+        thread::sleep(Duration::from_millis(50));
     });
 
     let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
-        .failover(false)
+        .initial_connect_retry(true)
+        .unwrap()
+        .reconnect_initial_backoff(Duration::from_millis(1))
+        .unwrap()
+        .reconnect_max_backoff(Duration::from_millis(1))
+        .unwrap()
+        .reconnect_max_duration(Duration::from_secs(5))
         .unwrap()
         .build()
         .unwrap();
+
+    assert_eq!(
+        event_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "dropped_initial_upgrade"
+    );
+
     let mut buf = sender.new_buffer();
-    buf.table("t")
+    buf.table("trades")
         .unwrap()
-        .column_i64("v", 1)
+        .symbol("sym", "ETH-USD")
         .unwrap()
-        .at_now()
-        .unwrap();
-
-    let err1 = sender.flush(&mut buf).unwrap_err();
-    assert_eq!(err1.code(), crate::ErrorCode::SocketError);
-
-    // A second attempt sees the latched error directly without trying I/O.
-    let mut buf2 = sender.new_buffer();
-    buf2.table("t")
-        .unwrap()
-        .column_i64("v", 2)
+        .column_i64("qty", 7)
         .unwrap()
         .at_now()
         .unwrap();
-    let err2 = sender.flush(&mut buf2).unwrap_err();
-    assert_eq!(err2.code(), crate::ErrorCode::SocketError);
+    sender.flush(&mut buf).unwrap();
+
+    let frame = payload_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(&frame[0..4], b"QWP1");
+}
+
+#[test]
+fn qwp_ws_from_conf_parses_java_reconnect_keys() {
+    // Just exercises the parser surface: every new key is accepted. Building
+    // would also work but isn't necessary for parser coverage.
+    let conf = "qwpws::addr=localhost:9000;\
+                max_in_flight=64;\
+                reconnect_max_duration_millis=20000;\
+                reconnect_initial_backoff_millis=200;\
+                reconnect_max_backoff_millis=2000;\
+                initial_connect_retry=on;";
+    SenderBuilder::from_conf(conf).unwrap();
+
+    let conf_false = "qwpws::addr=localhost:9000;initial_connect_retry=false;";
+    SenderBuilder::from_conf(conf_false).unwrap();
+
+    let bad = "qwpws::addr=localhost:9000;initial_connect_retry=maybe;";
+    let err = SenderBuilder::from_conf(bad).unwrap_err();
+    assert!(
+        err.msg().contains("initial_connect_retry"),
+        "got: {}",
+        err.msg()
+    );
 }

@@ -446,38 +446,6 @@ pub struct SenderBuilder {
 
     #[cfg(feature = "_sender-qwp-ws")]
     qwp_ws: Option<conf::QwpWsConfig>,
-
-    #[cfg(feature = "_sender-qwp-ws")]
-    failover_callback: Option<FailoverCallback>,
-}
-
-/// User-supplied hook invoked when a QWP/WebSocket sender finishes a successful
-/// failover (reconnect + replay). Mirrors Java's `onFailoverReset()` semantics:
-/// the callback fires after the connection has been re-established and the
-/// in-flight messages have been replayed, before the user-visible flush call
-/// returns success.
-///
-/// Use it to reset application-level state that depends on the lifetime of a
-/// single QuestDB connection. The callback runs synchronously on whatever
-/// thread (sync sender) or task (async sender) detected the recovery, so keep
-/// it short and non-blocking.
-#[cfg(feature = "_sender-qwp-ws")]
-#[derive(Clone)]
-pub struct FailoverCallback(pub(crate) std::sync::Arc<dyn Fn() + Send + Sync>);
-
-#[cfg(feature = "_sender-qwp-ws")]
-impl FailoverCallback {
-    /// Wrap a closure as a failover callback.
-    pub fn new<F: Fn() + Send + Sync + 'static>(f: F) -> Self {
-        FailoverCallback(std::sync::Arc::new(f))
-    }
-}
-
-#[cfg(feature = "_sender-qwp-ws")]
-impl Debug for FailoverCallback {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.write_str("FailoverCallback(..)")
-    }
 }
 
 impl SenderBuilder {
@@ -561,32 +529,19 @@ impl SenderBuilder {
                     builder.store_and_forward_durability(parse_sf_durability_value(val)?)?
                 }
                 #[cfg(feature = "_sender-qwp-ws")]
-                "failover" => {
-                    let on = match val {
-                        "on" => true,
-                        "off" => false,
-                        _ => {
-                            return Err(error::fmt!(
-                                ConfigError,
-                                r##"Config parameter "failover" must be either "on" or "off"."##,
-                            ));
-                        }
-                    };
-                    builder.failover(on)?
+                "reconnect_max_duration_millis" => builder
+                    .reconnect_max_duration(Duration::from_millis(parse_conf_value(key, val)?))?,
+                #[cfg(feature = "_sender-qwp-ws")]
+                "reconnect_initial_backoff_millis" => builder.reconnect_initial_backoff(
+                    Duration::from_millis(parse_conf_value(key, val)?),
+                )?,
+                #[cfg(feature = "_sender-qwp-ws")]
+                "reconnect_max_backoff_millis" => builder
+                    .reconnect_max_backoff(Duration::from_millis(parse_conf_value(key, val)?))?,
+                #[cfg(feature = "_sender-qwp-ws")]
+                "initial_connect_retry" => {
+                    builder.initial_connect_retry(parse_conf_bool(key, val)?)?
                 }
-                #[cfg(feature = "_sender-qwp-ws")]
-                "max_failover_attempts" => {
-                    builder.max_failover_attempts(parse_conf_value(key, val)?)?
-                }
-                #[cfg(feature = "_sender-qwp-ws")]
-                "failover_initial_backoff" => builder
-                    .failover_initial_backoff(Duration::from_millis(parse_conf_value(key, val)?))?,
-                #[cfg(feature = "_sender-qwp-ws")]
-                "failover_max_backoff" => builder
-                    .failover_max_backoff(Duration::from_millis(parse_conf_value(key, val)?))?,
-                #[cfg(feature = "_sender-qwp-ws")]
-                "failover_total_budget" => builder
-                    .failover_total_budget(Duration::from_millis(parse_conf_value(key, val)?))?,
                 "protocol_version" => match val {
                     "1" => builder.protocol_version(ProtocolVersion::V1)?,
                     "2" => builder.protocol_version(ProtocolVersion::V2)?,
@@ -827,9 +782,6 @@ impl SenderBuilder {
             } else {
                 None
             },
-
-            #[cfg(feature = "_sender-qwp-ws")]
-            failover_callback: None,
         }
     }
 
@@ -1133,98 +1085,74 @@ impl SenderBuilder {
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
-    /// Enable or disable transport-level failover (auto-reconnect + replay).
-    /// Default `true`. When disabled, a transport error during flush latches
-    /// a sticky terminal failure on the sender (the user must rebuild it).
-    pub fn failover(mut self, value: bool) -> Result<Self> {
+    /// Per-outage reconnect retry budget. Default 300s.
+    pub fn reconnect_max_duration(mut self, value: Duration) -> Result<Self> {
         let Some(qwp_ws) = &mut self.qwp_ws else {
             return Err(error::fmt!(
                 ConfigError,
-                "The \"failover\" setting is only supported for QWP/WebSocket."
+                "The \"reconnect_max_duration_millis\" setting is only supported for QWP/WebSocket."
             ));
         };
-        qwp_ws.failover.set_specified("failover", value)?;
+        qwp_ws
+            .reconnect_max_duration
+            .set_specified("reconnect_max_duration_millis", value)?;
         Ok(self)
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
-    /// Maximum number of reconnect attempts per failed flush. Default 3.
-    pub fn max_failover_attempts(mut self, value: u32) -> Result<Self> {
-        if value == 0 {
+    /// Initial reconnect backoff. Default 100ms.
+    pub fn reconnect_initial_backoff(mut self, value: Duration) -> Result<Self> {
+        if value.is_zero() {
             return Err(error::fmt!(
                 ConfigError,
-                "\"max_failover_attempts\" must be greater than 0."
+                "\"reconnect_initial_backoff_millis\" must be greater than 0."
             ));
         }
         let Some(qwp_ws) = &mut self.qwp_ws else {
             return Err(error::fmt!(
                 ConfigError,
-                "The \"max_failover_attempts\" setting is only supported for QWP/WebSocket."
+                "The \"reconnect_initial_backoff_millis\" setting is only supported for QWP/WebSocket."
             ));
         };
         qwp_ws
-            .max_failover_attempts
-            .set_specified("max_failover_attempts", value)?;
-        Ok(self)
-    }
-
-    #[cfg(feature = "_sender-qwp-ws")]
-    /// First reconnect delay after a transport failure. Each subsequent
-    /// attempt doubles up to `failover_max_backoff`. Default 100ms.
-    pub fn failover_initial_backoff(mut self, value: Duration) -> Result<Self> {
-        let Some(qwp_ws) = &mut self.qwp_ws else {
-            return Err(error::fmt!(
-                ConfigError,
-                "The \"failover_initial_backoff\" setting is only supported for QWP/WebSocket."
-            ));
-        };
-        qwp_ws
-            .failover_initial_backoff
-            .set_specified("failover_initial_backoff", value)?;
+            .reconnect_initial_backoff
+            .set_specified("reconnect_initial_backoff_millis", value)?;
         Ok(self)
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
     /// Cap on the per-attempt reconnect delay. Default 5s.
-    pub fn failover_max_backoff(mut self, value: Duration) -> Result<Self> {
-        let Some(qwp_ws) = &mut self.qwp_ws else {
+    pub fn reconnect_max_backoff(mut self, value: Duration) -> Result<Self> {
+        if value.is_zero() {
             return Err(error::fmt!(
                 ConfigError,
-                "The \"failover_max_backoff\" setting is only supported for QWP/WebSocket."
-            ));
-        };
-        qwp_ws
-            .failover_max_backoff
-            .set_specified("failover_max_backoff", value)?;
-        Ok(self)
-    }
-
-    #[cfg(feature = "_sender-qwp-ws")]
-    /// Total wall-clock budget for the failover loop. Default 30s.
-    pub fn failover_total_budget(mut self, value: Duration) -> Result<Self> {
-        let Some(qwp_ws) = &mut self.qwp_ws else {
-            return Err(error::fmt!(
-                ConfigError,
-                "The \"failover_total_budget\" setting is only supported for QWP/WebSocket."
-            ));
-        };
-        qwp_ws
-            .failover_total_budget
-            .set_specified("failover_total_budget", value)?;
-        Ok(self)
-    }
-
-    #[cfg(feature = "_sender-qwp-ws")]
-    /// Register a callback that fires after each successful failover
-    /// (reconnect + replay). See [`FailoverCallback`].
-    pub fn on_failover_reset(mut self, cb: FailoverCallback) -> Result<Self> {
-        if self.qwp_ws.is_none() {
-            return Err(error::fmt!(
-                ConfigError,
-                "\"on_failover_reset\" is only supported for QWP/WebSocket."
+                "\"reconnect_max_backoff_millis\" must be greater than 0."
             ));
         }
-        self.failover_callback = Some(cb);
+        let Some(qwp_ws) = &mut self.qwp_ws else {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"reconnect_max_backoff_millis\" setting is only supported for QWP/WebSocket."
+            ));
+        };
+        qwp_ws
+            .reconnect_max_backoff
+            .set_specified("reconnect_max_backoff_millis", value)?;
+        Ok(self)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    /// Retry the initial connection using the reconnect policy. Default false.
+    pub fn initial_connect_retry(mut self, value: bool) -> Result<Self> {
+        let Some(qwp_ws) = &mut self.qwp_ws else {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"initial_connect_retry\" setting is only supported for QWP/WebSocket."
+            ));
+        };
+        qwp_ws
+            .initial_connect_retry
+            .set_specified("initial_connect_retry", value)?;
         Ok(self)
     }
 
@@ -1559,7 +1487,7 @@ impl SenderBuilder {
             .qwp_ws
             .as_ref()
             .ok_or_else(|| error::fmt!(ConfigError, "QWP/WebSocket configuration is missing."))?;
-        reject_unsupported_qwp_ws_sf_config(qwp_ws)?;
+        reject_unsupported_async_qwp_ws_sf_config(qwp_ws)?;
         connect_async_qwp_ws(
             self.host.as_str(),
             self.port.as_str(),
@@ -1568,7 +1496,6 @@ impl SenderBuilder {
             qwp_ws,
             basic_auth,
             *self.max_buf_size,
-            self.failover_callback.clone(),
         )
         .await
     }
@@ -1726,7 +1653,6 @@ impl SenderBuilder {
                     tls_settings,
                     qwp_ws,
                     basic_auth,
-                    self.failover_callback.clone(),
                 )?
             }
         };
@@ -1845,6 +1771,20 @@ where
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
+fn parse_conf_bool(param_name: &str, str_value: &str) -> Result<bool> {
+    if str_value.eq_ignore_ascii_case("on") || str_value.eq_ignore_ascii_case("true") {
+        return Ok(true);
+    }
+    if str_value.eq_ignore_ascii_case("off") || str_value.eq_ignore_ascii_case("false") {
+        return Ok(false);
+    }
+    Err(error::fmt!(
+        ConfigError,
+        "invalid {param_name} [value={str_value}, allowed-values=[on, off, true, false]]"
+    ))
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
 fn parse_size_conf_value(param_name: &str, str_value: &str) -> Result<u64> {
     let mut end = str_value.len();
     if end == 0 {
@@ -1929,13 +1869,18 @@ fn reject_unsupported_qwp_ws_sf_config(qwp_ws: &conf::QwpWsConfig) -> Result<()>
         ));
     }
 
-    if qwp_ws.sf_requires_public_sender_wiring() {
+    Ok(())
+}
+
+#[cfg(feature = "async-sender-qwp-ws")]
+fn reject_unsupported_async_qwp_ws_sf_config(qwp_ws: &conf::QwpWsConfig) -> Result<()> {
+    reject_unsupported_qwp_ws_sf_config(qwp_ws)?;
+    if qwp_ws.sf_queue_config_is_specified() {
         return Err(error::fmt!(
             ConfigError,
-            "QWP/WebSocket Store-and-Forward config is parsed and validated, but this public sender path is not wired to the Store-and-Forward queue yet."
+            "QWP/WebSocket Store-and-Forward queue config is not supported by build_async() yet; use build() or omit sf_dir, sf_max_bytes, and sf_max_total_bytes."
         ));
     }
-
     Ok(())
 }
 

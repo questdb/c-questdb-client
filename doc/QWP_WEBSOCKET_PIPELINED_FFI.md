@@ -12,6 +12,10 @@ Rust code touched by this design:
 - `questdb-rs/src/ingress/sender/qwp_ws.rs`
 - `questdb-rs/src/ingress/sender/qwp_ws_async.rs`
 - `questdb-rs/src/ingress/sender/qwp_ws_codec.rs`
+- `questdb-rs/src/ingress/sender/qwp_ws_driver.rs`
+- `questdb-rs/src/ingress/sender/qwp_ws_publisher.rs`
+- `questdb-rs/src/ingress/sender/qwp_ws_sfa_slot.rs`
+- `questdb-rs/src/ingress/sender/qwp_ws_sfa_queue.rs`
 - `include/questdb/ingress/line_sender.h`
 - `include/questdb/ingress/line_sender_core.hpp`
 
@@ -64,17 +68,36 @@ requires a different shape.
 
 ## Current Rust behavior
 
-The sync QWP/WebSocket sender sends one frame and waits for its matching response before returning.
+The public sync QWP/WebSocket sender now uses the replay publication driver. Its
+`flush()` compatibility API still sends one logical frame and waits for the
+matching server outcome before returning, but the bytes flow through the new
+path:
 
-The async QWP/WebSocket sender is already pipelined. It uses Tokio tasks, an unbounded writer channel, an in-flight `BTreeMap`, `oneshot` completions, and cloned `Buffer` values for replay. That is workable for a Rust async API, but it conflicts with the FFI and hot-path constraints:
+```text
+Buffer -> replay payload -> volatile queue or SFA slot -> blocking WS transport
+```
+
+With `sf_dir` unset the sync sender uses the volatile queue. With `sf_dir` set
+it opens the Java-compatible `<sf_dir>/<sender_id>/` slot and stores unmasked
+QWP payload bytes in `.sfa` segment files. `sf_durability=flush|append` remains
+reserved and fails before connecting.
+
+The async QWP/WebSocket sender is still the older Tokio implementation. It is
+already pipelined. It uses Tokio tasks, an unbounded writer channel, an in-flight
+`BTreeMap`, `oneshot` completions, and cloned `Buffer` values for replay. That
+is workable for a Rust async API, but it conflicts with the FFI and hot-path
+constraints:
 
 - Tokio is mandatory for that path.
 - Construction and reconnect spawn tasks.
 - Submission allocates for channels, maps, frames, and completion state.
 - In-flight replay stores cloned buffers rather than durable self-sufficient frames.
 - `flush()` waits for completion rather than returning a submission receipt.
+- SF queue config is rejected by `build_async()` until the async path is cut over
+  or retired.
 
-The durable Rust design should reuse the protocol codec and tests where useful, but should introduce a new core rather than layering FFI over the current Tokio sender.
+The durable Rust design reuses protocol helpers where useful, but the FFI target
+should be the new queue/driver core rather than the current Tokio sender.
 
 ## Design principle
 
@@ -1203,17 +1226,19 @@ Candidate config keys:
 
 Rust currently parses and validates the Java-compatible `sf_*` / `sender_id`
 config keys, including Java's size suffixes (`k`, `m`, `g`, `t` with optional
-trailing `b`) and reserved `sf_durability=flush|append` values. Until the
-public sender is moved onto the new pipelined queue/driver core, SF runtime
-knobs such as `sf_dir` and `sf_max_bytes` must fail before connecting rather
-than being silently ignored.
+trailing `b`) and reserved `sf_durability=flush|append` values. The public sync
+sender uses those keys to choose and size the volatile or SFA queue. The async
+sender still rejects `sf_dir`, `sf_max_bytes`, and `sf_max_total_bytes` before
+connecting because it has not been moved onto the queue/driver core. The public
+sync and async sender paths now parse and apply Java-compatible reconnect keys,
+including `initial_connect_retry` for startup retry.
 
 ## First implementation slice
 
 1. Add the Java-style self-sufficient replay encoder path and tests proving a later frame replays alone on a fresh connection.
 2. Add Java/Rust golden payload fixtures for replay-mode QWP bytes.
 3. Add the threadless `QwpWsSender` core with Java-style memory mode
-   (`sf_dir` unset) only.
+   (`sf_dir` unset) first.
 4. Wire `submit` through `Buffer -> replay payload -> queue publication`; return value receipts only after publication.
 5. Implement fixed-capacity in-flight table and event ring.
 6. Implement `drive_once`, `wait`, and close semantics.
@@ -1224,10 +1249,12 @@ than being silently ignored.
     locking, rotation, and ACK-driven trim behind `sf_dir`.
 11. Add Java/Rust `.sfa` golden fixtures before treating the disk format as a
     product contract.
-12. Add Java-compatible server rejection reporting and handler plumbing.
-13. Add explicit background runner as an ownership-consuming adapter.
-14. Add Tokio adapter.
-15. Add C++ and Python wrappers after the C ABI is stable.
+12. Wire the public sync `qwpws` sender to the publication driver and
+    config-derived volatile/SFA queue selection.
+13. Add Java-compatible server rejection reporting and handler plumbing.
+14. Add explicit background runner as an ownership-consuming adapter.
+15. Add or retire the Tokio adapter.
+16. Add C++ and Python wrappers after the C ABI is stable.
 
 ## Tests
 
@@ -1236,7 +1263,8 @@ Rust core tests:
 - submit returns before ACK,
 - connected `open()` validates initial connection without starting a thread,
 - `initial_connect_retry=true` retries startup connection with the reconnect
-  policy,
+  policy; sync and async public sender paths cover this with a dropped-upgrade
+  mock-server test,
 - successful submit clears buffer,
 - failed submit preserves buffer,
 - `submit_and_keep` preserves buffer,

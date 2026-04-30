@@ -29,20 +29,31 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use rand::RngCore;
 
 use crate::error;
 use crate::ingress::SyncProtocolHandler;
-use crate::ingress::buffer::{QwpBuffer, QwpWsEncodeScratch, SchemaRegistry, SymbolGlobalDict};
-use crate::ingress::conf::QwpWsConfig;
+use crate::ingress::buffer::QwpBuffer;
+use crate::ingress::conf::{QwpWsConfig, SfDurability};
 use crate::ingress::tls::{TlsSettings, configure_tls};
 
 use super::qwp_ws_codec::{
-    self as codec, MAX_INBOUND_FRAME_BYTES, ResponseAction, WS_OPCODE_BINARY, WS_OPCODE_CLOSE,
+    self as codec, MAX_INBOUND_FRAME_BYTES, WS_OPCODE_BINARY, WS_OPCODE_CLOSE,
     WS_OPCODE_CONTINUATION, WS_OPCODE_PING, WS_OPCODE_PONG, WS_OPCODE_TEXT,
 };
+use super::qwp_ws_driver::{
+    BlockingQwpWsTransport, DeliveryOutcome, DriverError, ManualDriverPrototype, ManualDriverQueue,
+    ReconnectPolicy, reconnect_error_is_terminal,
+};
+use super::qwp_ws_publisher::{QwpWsPublicationDriver, QwpWsPublicationError};
+use super::qwp_ws_queue::{
+    OutboundFrame, QwpReceipt, QwpReceiptStatus, SentFrame, VolatileFrameQueue,
+    VolatileQueueOptions,
+};
+use super::qwp_ws_sfa_slot::{SfaSlotOptions, SfaSlotQueue};
 
 // ---------- transport ----------
 
@@ -91,36 +102,163 @@ impl Write for WsStream {
 
 // ---------- handler state ----------
 
+type SyncQwpWsPublisher = QwpWsPublicationDriver<ConfiguredQwpWsQueue, BlockingQwpWsTransport>;
+
 pub(crate) struct SyncQwpWsHandlerState {
-    pub(crate) stream: WsStream,
-    #[allow(dead_code)]
-    pub(crate) request_timeout: Duration,
-    pub(crate) negotiated_version: u8,
-    pub(crate) global_dict: SymbolGlobalDict,
-    pub(crate) schema_registry: SchemaRegistry,
-    pub(crate) scratch: QwpWsEncodeScratch,
-    pub(crate) recv: Vec<u8>,
-    pub(crate) send_buf: Vec<u8>,
-    #[allow(dead_code)]
-    pub(crate) request_durable_ack: bool,
-    pub(crate) sequence: u64,
-    /// Inputs needed to re-establish the connection on a failover. Populated
-    /// at construction time so a flush mid-stream doesn't have to re-read
-    /// `SenderBuilder` state.
-    pub(crate) reconnect: ReconnectParams,
-    /// Latched once we exhaust failover and the sender becomes unusable.
-    pub(crate) terminal_error: Option<crate::Error>,
+    publisher: SyncQwpWsPublisher,
+    max_flush_drive_steps: usize,
 }
 
-#[derive(Clone)]
-pub(crate) struct ReconnectParams {
-    pub(crate) host: String,
-    pub(crate) port: String,
-    pub(crate) use_tls: bool,
-    pub(crate) tls_settings: Option<crate::ingress::tls::TlsSettings>,
-    pub(crate) auth_header: Option<String>,
-    pub(crate) qwp_ws: crate::ingress::conf::QwpWsConfig,
-    pub(crate) on_failover_reset: Option<crate::ingress::FailoverCallback>,
+enum ConfiguredQwpWsQueue {
+    Memory(VolatileFrameQueue),
+    StoreAndForward(SfaSlotQueue),
+}
+
+impl ConfiguredQwpWsQueue {
+    fn open(qwp_ws: &QwpWsConfig) -> crate::Result<Self> {
+        if *qwp_ws.sf_durability != SfDurability::Memory {
+            let durability = qwp_ws.sf_durability.as_conf_value();
+            return Err(error::fmt!(
+                ConfigError,
+                "sf_durability={durability} is not yet supported (deferred follow-up; use sf_durability=memory)"
+            ));
+        }
+
+        let max_bytes = usize_from_config("sf_max_total_bytes", qwp_ws.sf_max_total_bytes())?;
+        let max_frames = configured_max_frames(qwp_ws)?;
+        let max_in_flight = *qwp_ws.max_in_flight;
+
+        if let Some(sf_dir) = qwp_ws.sf_dir.as_ref() {
+            return Ok(Self::StoreAndForward(
+                SfaSlotQueue::open(SfaSlotOptions {
+                    sf_dir: sf_dir.clone(),
+                    sender_id: qwp_ws.sender_id.to_string(),
+                    segment_size_bytes: *qwp_ws.sf_max_bytes,
+                    max_frames,
+                    max_bytes,
+                    max_in_flight,
+                })
+                .map_err(|err| {
+                    error::fmt!(
+                        SocketError,
+                        "Could not open QWP/WebSocket Store-and-Forward queue: {:?}",
+                        err
+                    )
+                })?,
+            ));
+        }
+
+        Ok(Self::Memory(
+            VolatileFrameQueue::new(VolatileQueueOptions {
+                max_frames,
+                max_bytes,
+                max_in_flight,
+            })
+            .map_err(|err| {
+                error::fmt!(
+                    ConfigError,
+                    "Invalid QWP/WebSocket memory queue configuration: {:?}",
+                    err
+                )
+            })?,
+        ))
+    }
+}
+
+fn configured_max_frames(qwp_ws: &QwpWsConfig) -> crate::Result<usize> {
+    let max_total_bytes = qwp_ws.sf_max_total_bytes();
+    let segment_bytes = (*qwp_ws.sf_max_bytes).max(1);
+    let frames_by_bytes = max_total_bytes.div_ceil(segment_bytes).max(1);
+    let frames = frames_by_bytes.max(*qwp_ws.max_in_flight as u64);
+    usize_from_config("computed QWP/WebSocket max_frames", frames)
+}
+
+fn usize_from_config(name: &str, value: u64) -> crate::Result<usize> {
+    usize::try_from(value).map_err(|_| {
+        error::fmt!(
+            ConfigError,
+            "{name} value is too large for this platform [value={value}]"
+        )
+    })
+}
+
+impl ManualDriverQueue for ConfiguredQwpWsQueue {
+    fn try_submit(&mut self, payload: &[u8]) -> Result<QwpReceipt, DriverError> {
+        match self {
+            Self::Memory(queue) => Ok(queue.try_submit(payload)?),
+            Self::StoreAndForward(queue) => queue.try_submit(payload),
+        }
+    }
+
+    fn next_outbound_frame(&self) -> Result<OutboundFrame<'_>, DriverError> {
+        match self {
+            Self::Memory(queue) => Ok(queue.next_outbound_frame()?),
+            Self::StoreAndForward(queue) => queue.next_outbound_frame(),
+        }
+    }
+
+    fn commit_sent(&mut self, frame: SentFrame) -> Result<(), DriverError> {
+        match self {
+            Self::Memory(queue) => Ok(queue.commit_sent(frame)?),
+            Self::StoreAndForward(queue) => queue.commit_sent(frame),
+        }
+    }
+
+    fn ack_wire(&mut self, wire_seq: u64) -> Result<(), DriverError> {
+        match self {
+            Self::Memory(queue) => Ok(queue.ack_wire(wire_seq)?),
+            Self::StoreAndForward(queue) => queue.ack_wire(wire_seq),
+        }
+    }
+
+    fn reject_wire(&mut self, wire_seq: u64) -> Result<QwpReceipt, DriverError> {
+        match self {
+            Self::Memory(queue) => Ok(queue.reject_wire(wire_seq)?),
+            Self::StoreAndForward(queue) => queue.reject_wire(wire_seq),
+        }
+    }
+
+    fn close(&mut self) -> Result<(), DriverError> {
+        match self {
+            Self::Memory(queue) => queue.close(),
+            Self::StoreAndForward(queue) => Ok(queue.close()?),
+        }
+    }
+
+    fn restart_connection(&mut self) {
+        match self {
+            Self::Memory(queue) => queue.restart_connection(),
+            Self::StoreAndForward(queue) => queue.restart_connection(),
+        }
+    }
+
+    fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus {
+        match self {
+            Self::Memory(queue) => queue.receipt_status(receipt),
+            Self::StoreAndForward(queue) => queue.receipt_status(receipt),
+        }
+    }
+
+    fn published_fsn(&self) -> Option<u64> {
+        match self {
+            Self::Memory(queue) => queue.published_fsn(),
+            Self::StoreAndForward(queue) => queue.published_fsn(),
+        }
+    }
+
+    fn completed_fsn(&self) -> Option<u64> {
+        match self {
+            Self::Memory(queue) => queue.completed_fsn(),
+            Self::StoreAndForward(queue) => queue.completed_fsn(),
+        }
+    }
+
+    fn fsn_for_wire_seq(&self, wire_seq: u64) -> Result<u64, DriverError> {
+        match self {
+            Self::Memory(queue) => queue.fsn_for_wire_seq(wire_seq),
+            Self::StoreAndForward(queue) => queue.fsn_for_wire_seq(wire_seq),
+        }
+    }
 }
 
 // ---------- minimal SHA-1 for Sec-WebSocket-Accept ----------
@@ -420,175 +558,188 @@ pub(crate) fn connect_qwp_ws(
     tls_settings: Option<TlsSettings>,
     qwp_ws: &QwpWsConfig,
     auth_header: Option<String>,
-    on_failover_reset: Option<crate::ingress::FailoverCallback>,
 ) -> crate::Result<SyncProtocolHandler> {
-    let (stream, negotiated_version) = establish_connection(
-        host,
-        port,
-        use_tls,
-        tls_settings.clone(),
-        qwp_ws,
-        auth_header.as_deref(),
-    )?;
+    let queue = ConfiguredQwpWsQueue::open(qwp_ws)?;
+    let transport =
+        connect_blocking_transport(host, port, use_tls, tls_settings, qwp_ws, auth_header)?;
+    let negotiated_version = transport.negotiated_version();
+    let driver = ManualDriverPrototype::from_queue_with_reconnect_policy(
+        queue,
+        transport,
+        ReconnectPolicy::bounded(
+            *qwp_ws.reconnect_max_duration,
+            *qwp_ws.reconnect_initial_backoff,
+            *qwp_ws.reconnect_max_backoff,
+        ),
+    );
 
     Ok(SyncProtocolHandler::SyncQwpWs(Box::new(
         SyncQwpWsHandlerState {
-            stream,
-            request_timeout: *qwp_ws.request_timeout,
-            negotiated_version,
-            global_dict: SymbolGlobalDict::new(),
-            schema_registry: SchemaRegistry::new(),
-            scratch: QwpWsEncodeScratch::new(),
-            recv: Vec::new(),
-            send_buf: Vec::with_capacity(16 * 1024),
-            request_durable_ack: *qwp_ws.request_durable_ack,
-            sequence: 0,
-            reconnect: ReconnectParams {
-                host: host.to_string(),
-                port: port.to_string(),
-                use_tls,
-                tls_settings,
-                auth_header,
-                qwp_ws: qwp_ws.clone(),
-                on_failover_reset,
-            },
-            terminal_error: None,
+            publisher: QwpWsPublicationDriver::new(driver, negotiated_version),
+            max_flush_drive_steps: max_flush_drive_steps(qwp_ws),
         },
     )))
 }
 
+fn connect_blocking_transport(
+    host: &str,
+    port: &str,
+    use_tls: bool,
+    tls_settings: Option<TlsSettings>,
+    qwp_ws: &QwpWsConfig,
+    auth_header: Option<String>,
+) -> crate::Result<BlockingQwpWsTransport> {
+    if *qwp_ws.initial_connect_retry {
+        connect_blocking_transport_with_retry(
+            host,
+            port,
+            use_tls,
+            tls_settings,
+            qwp_ws,
+            auth_header,
+        )
+    } else {
+        BlockingQwpWsTransport::connect(
+            host,
+            port,
+            use_tls,
+            tls_settings,
+            qwp_ws.clone(),
+            auth_header,
+        )
+    }
+}
+
+fn connect_blocking_transport_with_retry(
+    host: &str,
+    port: &str,
+    use_tls: bool,
+    tls_settings: Option<TlsSettings>,
+    qwp_ws: &QwpWsConfig,
+    auth_header: Option<String>,
+) -> crate::Result<BlockingQwpWsTransport> {
+    let deadline = Instant::now().checked_add(*qwp_ws.reconnect_max_duration);
+    let mut attempts = 0usize;
+    let mut backoff = *qwp_ws.reconnect_initial_backoff;
+    let mut last_error = None;
+
+    while deadline.map_or(true, |deadline| Instant::now() < deadline) {
+        attempts += 1;
+        match BlockingQwpWsTransport::connect(
+            host,
+            port,
+            use_tls,
+            tls_settings.clone(),
+            qwp_ws.clone(),
+            auth_header.clone(),
+        ) {
+            Ok(transport) => return Ok(transport),
+            Err(err) if reconnect_error_is_terminal(&err) => return Err(err),
+            Err(err) => last_error = Some(err),
+        }
+
+        let Some(deadline) = deadline else {
+            thread::sleep(backoff);
+            backoff = double_duration(backoff).min(*qwp_ws.reconnect_max_backoff);
+            continue;
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        thread::sleep(backoff.min(remaining));
+        backoff = double_duration(backoff).min(*qwp_ws.reconnect_max_backoff);
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        error::fmt!(
+            SocketError,
+            "QWP/WebSocket initial connect retry budget exhausted after {attempts} attempts"
+        )
+    }))
+}
+
 // ---------- send / receive ----------
 
-/// Public flush entry point: dispatches to the failover loop when enabled, or
-/// to a single attempt otherwise.
+/// Public flush entry point: publish through the replay queue, drive the
+/// transport, and wait synchronously for the submitted frame's outcome.
 pub(crate) fn flush_qwp_ws(
     state: &mut SyncQwpWsHandlerState,
     buffer: &QwpBuffer,
 ) -> crate::Result<()> {
-    if let Some(err) = &state.terminal_error {
-        return Err(err.clone());
-    }
+    let receipt = state
+        .publisher
+        .submit_qwp_with_drive_limit(buffer, state.max_flush_drive_steps)
+        .map_err(publication_error_to_error)?;
 
-    match flush_once(state, buffer) {
-        Ok(()) => Ok(()),
-        Err(err) if is_transport_error(&err) && *state.reconnect.qwp_ws.failover => {
-            attempt_failover(state, buffer, err)
-        }
-        Err(err) => {
-            if is_transport_error(&err) {
-                // failover=off: latch a terminal error so subsequent flushes
-                // surface it directly (the user must rebuild the sender).
-                state.terminal_error = Some(err.clone());
-            }
-            Err(err)
-        }
-    }
-}
+    let outcome = state
+        .publisher
+        .wait_steps(receipt, state.max_flush_drive_steps)
+        .map_err(|err| driver_error_to_error(&state.publisher, err))?;
 
-fn is_transport_error(err: &crate::Error) -> bool {
-    matches!(err.code(), crate::ErrorCode::SocketError)
-}
-
-fn flush_once(state: &mut SyncQwpWsHandlerState, buffer: &QwpBuffer) -> crate::Result<()> {
-    let seq = state.sequence;
-
-    state.scratch.message.clear();
-    buffer.encode_ws_message(
-        &mut state.scratch,
-        &mut state.global_dict,
-        &mut state.schema_registry,
-        state.negotiated_version,
-    )?;
-    state.sequence = state.sequence.wrapping_add(1);
-
-    write_binary_frame(
-        &mut state.stream,
-        &mut state.send_buf,
-        &state.scratch.message,
-    )
-    .map_err(|io| error::fmt!(SocketError, "Could not send WebSocket frame: {}", io))?;
-    state
-        .stream
-        .flush()
-        .map_err(|io| error::fmt!(SocketError, "Could not flush WebSocket frame: {}", io))?;
-
-    // Read response frames until we see a non-durable-ack response.
-    loop {
-        let opcode = read_message(&mut state.stream, &mut state.send_buf, &mut state.recv)?;
-        if opcode != WS_OPCODE_BINARY {
-            return Err(error::fmt!(
-                SocketError,
-                "QWP/WS expected binary response frame, got opcode 0x{:x}",
-                opcode
-            ));
-        }
-        match codec::parse_response(&state.recv, seq)? {
-            ResponseAction::Ok => return Ok(()),
-            ResponseAction::DurableAck => {
-                // Durable-acks are notifications; keep reading until we see the
-                // matching OK/error for this sequence number.
-                continue;
-            }
-        }
+    match outcome {
+        DeliveryOutcome::Acked => Ok(()),
+        DeliveryOutcome::Rejected => Err(state
+            .publisher
+            .last_server_error()
+            .map(|err| err.error.clone())
+            .unwrap_or_else(|| error::fmt!(SocketError, "QWP/WebSocket frame was rejected"))),
+        DeliveryOutcome::Terminal => Err(state
+            .publisher
+            .terminal_error()
+            .cloned()
+            .unwrap_or_else(|| error::fmt!(SocketError, "QWP/WebSocket sender is terminal"))),
+        DeliveryOutcome::Timeout => Err(error::fmt!(
+            SocketError,
+            "QWP/WebSocket flush timed out before the server acknowledged the frame"
+        )),
     }
 }
 
-/// Reconnect loop: bounded number of attempts, exponential backoff capped at
-/// `failover_max_backoff`, total wall-clock budget. On each attempt we drop
-/// the dead stream, re-establish the connection (TCP/TLS/upgrade), reset all
-/// connection-scoped encoder state, and replay the user's buffer through
-/// `flush_once`. The first success returns `Ok` and fires the user callback.
-fn attempt_failover(
-    state: &mut SyncQwpWsHandlerState,
-    buffer: &QwpBuffer,
-    initial_err: crate::Error,
-) -> crate::Result<()> {
-    let attempts = *state.reconnect.qwp_ws.max_failover_attempts;
-    let mut backoff = *state.reconnect.qwp_ws.failover_initial_backoff;
-    let max_backoff = *state.reconnect.qwp_ws.failover_max_backoff;
-    let deadline = std::time::Instant::now() + *state.reconnect.qwp_ws.failover_total_budget;
-
-    let mut last_err = initial_err;
-    for _ in 0..attempts {
-        if std::time::Instant::now() >= deadline {
-            break;
-        }
-        std::thread::sleep(backoff);
-        backoff = backoff.saturating_mul(2).min(max_backoff);
-
-        match reconnect_and_replay(state, buffer) {
-            Ok(()) => {
-                if let Some(cb) = &state.reconnect.on_failover_reset {
-                    (cb.0)();
-                }
-                return Ok(());
-            }
-            Err(e) => last_err = e,
-        }
-    }
-    state.terminal_error = Some(last_err.clone());
-    Err(last_err)
+fn max_flush_drive_steps(qwp_ws: &QwpWsConfig) -> usize {
+    (*qwp_ws.max_in_flight).saturating_add(4).max(16)
 }
 
-fn reconnect_and_replay(
-    state: &mut SyncQwpWsHandlerState,
-    buffer: &QwpBuffer,
-) -> crate::Result<()> {
-    let (stream, version) = establish_connection(
-        &state.reconnect.host,
-        &state.reconnect.port,
-        state.reconnect.use_tls,
-        state.reconnect.tls_settings.clone(),
-        &state.reconnect.qwp_ws,
-        state.reconnect.auth_header.as_deref(),
-    )?;
-    state.stream = stream;
-    state.negotiated_version = version;
-    // Server resets connection-scoped state on its end; we must too.
-    state.global_dict = SymbolGlobalDict::new();
-    state.schema_registry = SchemaRegistry::new();
-    state.sequence = 0;
-    flush_once(state, buffer)
+fn double_duration(duration: Duration) -> Duration {
+    duration.checked_mul(2).unwrap_or(Duration::MAX)
+}
+
+fn publication_error_to_error(err: QwpWsPublicationError) -> crate::Error {
+    match err {
+        QwpWsPublicationError::Encode(err) => err,
+        QwpWsPublicationError::Driver(err) => driver_error_to_error_without_state(err),
+    }
+}
+
+fn driver_error_to_error(publisher: &SyncQwpWsPublisher, err: DriverError) -> crate::Error {
+    match err {
+        DriverError::Terminal => publisher
+            .terminal_error()
+            .cloned()
+            .unwrap_or_else(|| error::fmt!(SocketError, "QWP/WebSocket sender is terminal")),
+        err => driver_error_to_error_without_state(err),
+    }
+}
+
+fn driver_error_to_error_without_state(err: DriverError) -> crate::Error {
+    match err {
+        DriverError::Transport(err) | DriverError::Storage(err) => err,
+        DriverError::Queue(err) => error::fmt!(
+            InvalidApiCall,
+            "QWP/WebSocket queue rejected publication: {:?}",
+            err
+        ),
+        DriverError::SubmitTimedOut => error::fmt!(
+            SocketError,
+            "QWP/WebSocket flush timed out waiting for local queue capacity"
+        ),
+        DriverError::Terminal => error::fmt!(SocketError, "QWP/WebSocket sender is terminal"),
+        DriverError::Closing => error::fmt!(InvalidApiCall, "QWP/WebSocket sender is closing"),
+        DriverError::UnknownReceipt { fsn } => error::fmt!(
+            InvalidApiCall,
+            "QWP/WebSocket receipt is unknown [fsn={fsn}]"
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -622,60 +773,5 @@ mod tests {
             "got: {}",
             err.msg()
         );
-    }
-
-    #[test]
-    fn encode_failure_does_not_consume_sequence() {
-        use crate::ingress::Buffer;
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let client = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        let (_server, _) = listener.accept().unwrap();
-
-        let qwp_ws = QwpWsConfig::default();
-        let mut state = SyncQwpWsHandlerState {
-            stream: WsStream::Plain(client),
-            request_timeout: *qwp_ws.request_timeout,
-            negotiated_version: 1,
-            global_dict: SymbolGlobalDict::new(),
-            schema_registry: SchemaRegistry::new(),
-            scratch: QwpWsEncodeScratch::new(),
-            recv: Vec::new(),
-            send_buf: Vec::new(),
-            request_durable_ack: false,
-            sequence: 7,
-            reconnect: ReconnectParams {
-                host: "127.0.0.1".to_string(),
-                port: port.to_string(),
-                use_tls: false,
-                tls_settings: None,
-                auth_header: None,
-                qwp_ws,
-                on_failover_reset: None,
-            },
-            terminal_error: None,
-        };
-
-        let mut buffer = Buffer::qwp_with_max_name_len(127);
-        for i in 0..=u16::MAX {
-            let table = format!("t{i}");
-            buffer
-                .table(table.as_str())
-                .unwrap()
-                .column_i64("v", i as i64)
-                .unwrap()
-                .at_now()
-                .unwrap();
-        }
-
-        let err = flush_once(&mut state, buffer.as_qwp().unwrap()).unwrap_err();
-
-        assert!(
-            err.msg().contains("WS message table count exceeds maximum"),
-            "got: {}",
-            err.msg()
-        );
-        assert_eq!(state.sequence, 7);
     }
 }

@@ -22,7 +22,7 @@
  *
  ******************************************************************************/
 
-//! Async, pipelined QWP/WebSocket transport with optional auto-reconnect.
+//! Async, pipelined QWP/WebSocket transport with auto-reconnect.
 //!
 //! ## Concurrency model
 //!
@@ -40,7 +40,7 @@
 //!   the writer's mpsc. Doing all five steps under one lock makes the
 //!   assigned sequence match wire order.
 //!
-//! ## Failover (`failover=true`, the default)
+//! ## Reconnect
 //!
 //! * Connection state lives in `Inner.state`: `Healthy { write_tx }`,
 //!   `Reconnecting`, or `Failed`.
@@ -60,13 +60,11 @@
 //!   every in-flight oneshot completes with the latched error, and any
 //!   future `flush()` returns that error directly.
 //!
-//! ## At-least-once on failover
+//! ## At-least-once on reconnect
 //!
 //! A message that the server fully committed before the socket died may be
 //! replayed and inserted again. QWP doesn't have client-supplied idempotency
-//! keys; this matches the Java reference client's semantics. Set
-//! `failover=false` if exactly-once is required (the user must then handle
-//! reconnect by rebuilding the sender themselves).
+//! keys; this matches the Java reference client's semantics.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -79,12 +77,12 @@ use tokio::sync::{Mutex as AsyncMutex, Notify, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 
-use crate::Error;
 use crate::error;
+use crate::ingress::Buffer;
 use crate::ingress::buffer::{QwpWsEncodeScratch, SchemaRegistry, SymbolGlobalDict};
 use crate::ingress::conf::QwpWsConfig;
 use crate::ingress::tls::{TlsSettings, configure_tls};
-use crate::ingress::{Buffer, FailoverCallback};
+use crate::{Error, ErrorCode};
 
 use super::qwp_ws_codec::{
     self as codec, MAX_INBOUND_FRAME_BYTES, PipelinedResponse, WS_OPCODE_BINARY, WS_OPCODE_CLOSE,
@@ -187,14 +185,8 @@ struct Inner {
     /// Sticky terminal error. Once set, every flush returns this directly.
     error_state: StdMutex<Option<Error>>,
 
-    /// Inputs for re-establishing the connection on failover.
+    /// Inputs for re-establishing the connection after a transport failure.
     reconnect: ReconnectParams,
-
-    /// Whether a transport error triggers reconnect+replay (default) or
-    /// latches the sender as terminally failed.
-    failover: bool,
-
-    on_failover_reset: Option<FailoverCallback>,
 
     max_buf_size: usize,
     request_timeout: Duration,
@@ -557,14 +549,9 @@ async fn reader_task(
     }
 }
 
-/// Common path for reader/writer-detected I/O failure. With failover enabled,
-/// transitions to Reconnecting and spawns the supervisor; otherwise latches
-/// the error.
+/// Common path for reader/writer-detected I/O failure. Transitions to
+/// Reconnecting and spawns the supervisor.
 fn handle_io_failure(inner: &Arc<Inner>, err: Error) {
-    if !inner.failover {
-        inner.fail_terminal(err);
-        return;
-    }
     if inner.try_begin_reconnect() {
         let inner_cloned = inner.clone();
         tokio::spawn(async move {
@@ -574,36 +561,46 @@ fn handle_io_failure(inner: &Arc<Inner>, err: Error) {
     // If we lost the race, the other task already kicked off the supervisor.
 }
 
-async fn reconnect_supervisor(inner: Arc<Inner>, _initial_err: Error) {
+async fn reconnect_supervisor(inner: Arc<Inner>, initial_err: Error) {
     let cfg = &inner.reconnect.qwp_ws;
-    let attempts = *cfg.max_failover_attempts;
-    let mut backoff = *cfg.failover_initial_backoff;
-    let max_backoff = *cfg.failover_max_backoff;
-    let deadline = Instant::now() + *cfg.failover_total_budget;
+    let mut backoff = *cfg.reconnect_initial_backoff;
+    let max_backoff = *cfg.reconnect_max_backoff;
+    let deadline = Instant::now().checked_add(*cfg.reconnect_max_duration);
 
-    let mut last_err: Option<Error> = None;
-    for _ in 0..attempts {
-        if Instant::now() >= deadline {
+    let mut last_err = initial_err;
+    let mut attempts = 0usize;
+    loop {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             break;
         }
-        sleep(backoff).await;
-        backoff = backoff.saturating_mul(2).min(max_backoff);
-
-        match try_reconnect(&inner).await {
-            Ok(()) => {
-                if let Some(cb) = inner.on_failover_reset.as_ref() {
-                    let cb = cb.0.clone();
-                    // The callback is `Fn`, so synchronous from our side.
-                    cb();
+        if attempts > 0 {
+            if let Some(deadline) = deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
                 }
+                sleep(backoff.min(remaining)).await;
+            } else {
+                sleep(backoff).await;
+            }
+            backoff = backoff.saturating_mul(2).min(max_backoff);
+        }
+        attempts += 1;
+        match try_reconnect(&inner).await {
+            Ok(()) => return,
+            Err(e)
+                if matches!(
+                    e.code(),
+                    ErrorCode::AuthError | ErrorCode::ProtocolVersionError
+                ) =>
+            {
+                inner.fail_terminal(e);
                 return;
             }
-            Err(e) => last_err = Some(e),
+            Err(e) => last_err = e,
         }
     }
-    inner.fail_terminal(
-        last_err.unwrap_or_else(|| error::fmt!(SocketError, "QWP/WS failover exhausted")),
-    );
+    inner.fail_terminal(last_err);
 }
 
 async fn try_reconnect(inner: &Arc<Inner>) -> crate::Result<()> {
@@ -956,13 +953,11 @@ pub(crate) async fn connect_async_qwp_ws(
     qwp_ws: &QwpWsConfig,
     auth_header: Option<String>,
     max_buf_size: usize,
-    on_failover_reset: Option<FailoverCallback>,
 ) -> crate::Result<AsyncSender> {
     let max_in_flight = *qwp_ws.max_in_flight;
     let request_timeout = *qwp_ws.request_timeout;
-    let failover = *qwp_ws.failover;
 
-    let (stream, negotiated_version) = establish_connection(
+    let (stream, negotiated_version) = establish_initial_connection(
         host,
         port,
         use_tls,
@@ -998,8 +993,6 @@ pub(crate) async fn connect_async_qwp_ws(
             auth_header,
             qwp_ws: qwp_ws.clone(),
         },
-        failover,
-        on_failover_reset,
         max_buf_size,
         request_timeout,
         negotiated_version: StdMutex::new(negotiated_version),
@@ -1014,4 +1007,68 @@ pub(crate) async fn connect_async_qwp_ws(
         tokio::spawn(reader_task(inner.clone(), read_half, write_tx));
 
     Ok(AsyncSender { inner })
+}
+
+async fn establish_initial_connection(
+    host: &str,
+    port: &str,
+    use_tls: bool,
+    tls_settings: Option<TlsSettings>,
+    qwp_ws: &QwpWsConfig,
+    auth_header: Option<&str>,
+) -> crate::Result<(FullStream, u8)> {
+    if !*qwp_ws.initial_connect_retry {
+        return establish_connection(host, port, use_tls, tls_settings, qwp_ws, auth_header).await;
+    }
+
+    let deadline = Instant::now().checked_add(*qwp_ws.reconnect_max_duration);
+    let mut attempts = 0usize;
+    let mut backoff = *qwp_ws.reconnect_initial_backoff;
+    let mut last_error = None;
+
+    loop {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            break;
+        }
+        attempts += 1;
+        match establish_connection(
+            host,
+            port,
+            use_tls,
+            tls_settings.clone(),
+            qwp_ws,
+            auth_header,
+        )
+        .await
+        {
+            Ok(connection) => return Ok(connection),
+            Err(e)
+                if matches!(
+                    e.code(),
+                    ErrorCode::AuthError | ErrorCode::ProtocolVersionError
+                ) =>
+            {
+                return Err(e);
+            }
+            Err(e) => last_error = Some(e),
+        }
+
+        if let Some(deadline) = deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            sleep(backoff.min(remaining)).await;
+        } else {
+            sleep(backoff).await;
+        }
+        backoff = backoff.saturating_mul(2).min(*qwp_ws.reconnect_max_backoff);
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        error::fmt!(
+            SocketError,
+            "QWP/WebSocket initial connect retry budget exhausted after {attempts} attempts"
+        )
+    }))
 }

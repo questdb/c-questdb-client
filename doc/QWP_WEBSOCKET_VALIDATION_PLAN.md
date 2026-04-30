@@ -689,6 +689,11 @@ Validation target:
 - Reconnect and replay do not require public API changes.
 - Real-server submit/wait and reconnect replay use the same publication path
   intended for the product core, not opaque test payload bytes.
+- The public sync `Sender` path uses the same publication driver and
+  config-derived queue selection as the validated manual core.
+- The public async `build_async()` path fails loudly for SF queue config until
+  it is cut over or retired, rather than silently ignoring `sf_dir` or queue
+  sizing.
 - Authentication, WebSocket upgrade, and close behavior map into the existing
   error/outcome model.
 - Failed encode or queue publication may reserve internal symbol IDs, but must
@@ -708,6 +713,8 @@ Design pressure to watch:
 - If networking forces public API changes, revisit the fake-server assumptions.
 - If the real protocol requires hidden tasks to make progress, the low-level
   contract has been violated.
+- If the public sync compatibility API needs a second parallel transport path,
+  the old path has not really been removed.
 
 Local reflection:
 

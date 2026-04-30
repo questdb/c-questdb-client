@@ -197,13 +197,7 @@ fn qwpws_store_and_forward_config_is_websocket_only() {
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 #[test]
-fn qwpws_store_and_forward_config_is_not_silently_ignored_by_public_sender() {
-    assert_conf_err(
-        SenderBuilder::from_conf("qwpws::addr=127.0.0.1:1;sf_dir=/tmp/qdb-rust-sf;")
-            .unwrap()
-            .build(),
-        "QWP/WebSocket Store-and-Forward config is parsed and validated, but this public sender path is not wired to the Store-and-Forward queue yet.",
-    );
+fn qwpws_store_and_forward_reserved_durability_fails_before_connect() {
     assert_conf_err(
         SenderBuilder::from_conf("qwpws::addr=127.0.0.1:1;sf_durability=flush;")
             .unwrap()

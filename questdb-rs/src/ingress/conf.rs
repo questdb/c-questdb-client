@@ -62,10 +62,6 @@ impl<T: PartialEq> ConfigSetting<T> {
             )),
         }
     }
-
-    pub(crate) fn is_specified(&self) -> bool {
-        matches!(self, ConfigSetting::Specified(_))
-    }
 }
 
 impl<T: PartialEq> Deref for ConfigSetting<T> {
@@ -121,6 +117,10 @@ impl Default for QwpUdpConfig {
 pub(crate) const QWP_WS_DEFAULT_SENDER_ID: &str = "default";
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) const QWP_WS_DEFAULT_SF_SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) const QWP_WS_DEFAULT_SF_MEMORY_MAX_TOTAL_BYTES: u64 = 128 * 1024 * 1024;
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) const QWP_WS_DEFAULT_SF_DISK_MAX_TOTAL_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
 #[cfg(feature = "_sender-qwp-ws")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,21 +160,16 @@ pub(crate) struct QwpWsConfig {
     /// Maximum number of unacknowledged messages in flight on a single
     /// pipelined async sender. Matches the spec's per-connection cap.
     pub(crate) max_in_flight: ConfigSetting<usize>,
-    /// Whether to auto-reconnect and replay on transport-level failures.
-    /// When `true` (the default), a transport error during flush triggers a
-    /// bounded reconnect loop; the sender stays usable. When `false`, the
-    /// first transport error latches a sticky terminal failure and the user
-    /// must discard the sender.
-    pub(crate) failover: ConfigSetting<bool>,
-    /// Maximum number of reconnect attempts per failed flush.
-    pub(crate) max_failover_attempts: ConfigSetting<u32>,
-    /// First reconnect delay; doubles up to `failover_max_backoff` per attempt.
-    pub(crate) failover_initial_backoff: ConfigSetting<std::time::Duration>,
+    /// Per-outage wall-clock budget for the reconnect loop.
+    pub(crate) reconnect_max_duration: ConfigSetting<std::time::Duration>,
+    /// Initial reconnect backoff; the reconnect loop doubles the delay up to
+    /// `reconnect_max_backoff`.
+    pub(crate) reconnect_initial_backoff: ConfigSetting<std::time::Duration>,
     /// Cap on the per-attempt reconnect delay.
-    pub(crate) failover_max_backoff: ConfigSetting<std::time::Duration>,
-    /// Total wall-clock budget for the reconnect loop; once exceeded the
-    /// failover gives up even if attempts remain.
-    pub(crate) failover_total_budget: ConfigSetting<std::time::Duration>,
+    pub(crate) reconnect_max_backoff: ConfigSetting<std::time::Duration>,
+    /// Whether the initial connect should use the reconnect policy. Default
+    /// false, matching Java's fail-fast startup behavior.
+    pub(crate) initial_connect_retry: ConfigSetting<bool>,
     pub(crate) sf_dir: ConfigSetting<Option<PathBuf>>,
     pub(crate) sender_id: ConfigSetting<String>,
     pub(crate) sf_max_bytes: ConfigSetting<u64>,
@@ -192,13 +187,12 @@ impl Default for QwpWsConfig {
             max_protocol_version: ConfigSetting::new_default(1),
             request_durable_ack: ConfigSetting::new_default(false),
             max_in_flight: ConfigSetting::new_default(128),
-            failover: ConfigSetting::new_default(true),
-            max_failover_attempts: ConfigSetting::new_default(3),
-            failover_initial_backoff: ConfigSetting::new_default(std::time::Duration::from_millis(
-                100,
-            )),
-            failover_max_backoff: ConfigSetting::new_default(std::time::Duration::from_secs(5)),
-            failover_total_budget: ConfigSetting::new_default(std::time::Duration::from_secs(30)),
+            reconnect_max_duration: ConfigSetting::new_default(std::time::Duration::from_secs(300)),
+            reconnect_initial_backoff: ConfigSetting::new_default(
+                std::time::Duration::from_millis(100),
+            ),
+            reconnect_max_backoff: ConfigSetting::new_default(std::time::Duration::from_secs(5)),
+            initial_connect_retry: ConfigSetting::new_default(false),
             sf_dir: ConfigSetting::new_default(None),
             sender_id: ConfigSetting::new_default(QWP_WS_DEFAULT_SENDER_ID.to_owned()),
             sf_max_bytes: ConfigSetting::new_default(QWP_WS_DEFAULT_SF_SEGMENT_BYTES),
@@ -210,10 +204,24 @@ impl Default for QwpWsConfig {
 
 #[cfg(feature = "_sender-qwp-ws")]
 impl QwpWsConfig {
-    pub(crate) fn sf_requires_public_sender_wiring(&self) -> bool {
+    pub(crate) fn sf_max_total_bytes(&self) -> u64 {
+        if let Some(max_total_bytes) = *self.sf_max_total_bytes {
+            return max_total_bytes;
+        }
+
+        let default_max_total_bytes = if self.sf_dir.is_some() {
+            QWP_WS_DEFAULT_SF_DISK_MAX_TOTAL_BYTES
+        } else {
+            QWP_WS_DEFAULT_SF_MEMORY_MAX_TOTAL_BYTES
+        };
+        default_max_total_bytes.max(self.sf_max_bytes.saturating_mul(2))
+    }
+
+    #[cfg(feature = "async-sender-qwp-ws")]
+    pub(crate) fn sf_queue_config_is_specified(&self) -> bool {
         self.sf_dir.is_some()
-            || self.sf_max_bytes.is_specified()
-            || self.sf_max_total_bytes.is_specified()
+            || matches!(self.sf_max_bytes, ConfigSetting::Specified(_))
+            || matches!(self.sf_max_total_bytes, ConfigSetting::Specified(_))
     }
 }
 

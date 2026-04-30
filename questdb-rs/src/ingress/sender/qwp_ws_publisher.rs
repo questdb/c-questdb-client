@@ -36,7 +36,7 @@ use crate::ingress::buffer::{QwpBuffer, QwpWsEncodeScratch, SymbolGlobalDict};
 
 use super::qwp_ws_driver::{
     CloseOutcome, DeliveryOutcome, DriveOutcome, DriverError, DriverEvent, ManualDriverPrototype,
-    ManualDriverQueue, ManualDriverTransport,
+    ManualDriverQueue, ManualDriverTransport, QwpServerError,
 };
 use super::qwp_ws_queue::{QwpReceipt, QwpReceiptStatus, SentFrame};
 
@@ -109,6 +109,14 @@ impl<Q: ManualDriverQueue, T: ManualDriverTransport> QwpWsPublicationDriver<Q, T
 
     pub(crate) fn events_dropped_total(&self) -> u64 {
         self.driver.events_dropped_total()
+    }
+
+    pub(crate) fn terminal_error(&self) -> Option<&crate::Error> {
+        self.driver.terminal_error()
+    }
+
+    pub(crate) fn last_server_error(&self) -> Option<&QwpServerError> {
+        self.driver.last_server_error()
     }
 
     pub(crate) fn into_driver(self) -> ManualDriverPrototype<Q, T> {

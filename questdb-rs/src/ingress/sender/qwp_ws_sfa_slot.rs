@@ -99,6 +99,12 @@ impl SfaSlotQueue {
     }
 }
 
+impl Drop for SfaSlotQueue {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+
 impl ManualDriverQueue for SfaSlotQueue {
     fn try_submit(&mut self, payload: &[u8]) -> Result<QwpReceipt, DriverError> {
         Ok(self.queue.try_submit(payload)?)

@@ -222,6 +222,28 @@ fn spawn_ok_server(messages: usize) -> (u16, mpsc::Receiver<Vec<u8>>) {
 }
 
 #[tokio::test]
+async fn async_qwp_ws_rejects_store_and_forward_queue_config_before_connect() {
+    for conf in [
+        "qwpws::addr=127.0.0.1:1;sf_dir=/tmp/qdb-rust-sf;",
+        "qwpws::addr=127.0.0.1:1;sf_max_bytes=64m;",
+        "qwpws::addr=127.0.0.1:1;sf_max_total_bytes=1g;",
+    ] {
+        let err = SenderBuilder::from_conf(conf)
+            .unwrap()
+            .build_async()
+            .await
+            .unwrap_err();
+        assert!(
+            err.msg().contains(
+                "QWP/WebSocket Store-and-Forward queue config is not supported by build_async() yet"
+            ),
+            "unexpected error for {conf}: {}",
+            err.msg()
+        );
+    }
+}
+
+#[tokio::test]
 async fn async_qwp_ws_round_trip_minimal_message() {
     let (port, rx) = spawn_ok_server(1);
 
@@ -251,6 +273,87 @@ async fn async_qwp_ws_round_trip_minimal_message() {
     assert_eq!(payload[1], 0x01);
     assert_eq!(payload[2], 0x07);
     assert_eq!(&payload[3..10], b"ETH-USD");
+}
+
+#[tokio::test]
+async fn async_qwp_ws_initial_connect_retry_survives_dropped_upgrade() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (payload_tx, payload_rx) = mpsc::channel();
+    let (event_tx, event_rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        first
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        first
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let _ = read_request_until_blank(&mut first).unwrap();
+        event_tx.send("dropped_initial_upgrade").unwrap();
+        drop(first);
+
+        let (mut second, _) = listener.accept().unwrap();
+        second
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        second
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let req_bytes = read_request_until_blank(&mut second).unwrap();
+        let req = String::from_utf8_lossy(&req_bytes).to_string();
+        let key = parse_header(&req, "Sec-WebSocket-Key").unwrap();
+        let accept = compute_accept(&key);
+        let resp = format!(
+            "HTTP/1.1 101 Switching Protocols\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Accept: {accept}\r\n\
+             X-QWP-Version: 1\r\n\
+             \r\n"
+        );
+        second.write_all(resp.as_bytes()).unwrap();
+        let (_fin, _op, payload) = read_frame(&mut second).unwrap();
+        payload_tx.send(payload).unwrap();
+        let mut ok = vec![0u8];
+        ok.extend_from_slice(&FIRST_WIRE_SEQUENCE.to_le_bytes());
+        ok.extend_from_slice(&0u16.to_le_bytes());
+        write_server_binary_frame(&mut second, &ok).unwrap();
+        thread::sleep(Duration::from_millis(50));
+    });
+
+    let sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+        .initial_connect_retry(true)
+        .unwrap()
+        .reconnect_initial_backoff(Duration::from_millis(1))
+        .unwrap()
+        .reconnect_max_backoff(Duration::from_millis(1))
+        .unwrap()
+        .reconnect_max_duration(Duration::from_secs(5))
+        .unwrap()
+        .build_async()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        event_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        "dropped_initial_upgrade"
+    );
+
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .symbol("sym", "ETH-USD")
+        .unwrap()
+        .column_i64("qty", 7)
+        .unwrap()
+        .at_now()
+        .unwrap();
+    sender.flush(&mut buf).await.unwrap();
+
+    let frame = payload_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(&frame[0..4], b"QWP1");
 }
 
 #[tokio::test]
@@ -596,24 +699,17 @@ fn spawn_dropping_then_recovering_server(
 }
 
 #[tokio::test]
-async fn async_qwp_ws_failover_replays_in_flight_messages() {
+async fn async_qwp_ws_reconnect_replays_in_flight_messages() {
     const N: usize = 4;
     let (port, rx) = spawn_dropping_then_recovering_server(N);
-
-    let cb_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let cb_count_for_cb = cb_count.clone();
 
     let sender = std::sync::Arc::new(
         SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
             .max_in_flight(N)
             .unwrap()
-            .failover_initial_backoff(Duration::from_millis(20))
+            .reconnect_initial_backoff(Duration::from_millis(20))
             .unwrap()
-            .failover_max_backoff(Duration::from_millis(50))
-            .unwrap()
-            .on_failover_reset(crate::ingress::FailoverCallback::new(move || {
-                cb_count_for_cb.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            }))
+            .reconnect_max_backoff(Duration::from_millis(50))
             .unwrap()
             .build_async()
             .await
@@ -641,12 +737,6 @@ async fn async_qwp_ws_failover_replays_in_flight_messages() {
         h.await.unwrap().unwrap();
     }
 
-    assert_eq!(
-        cb_count.load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "callback should fire exactly once per recovery"
-    );
-
     // Server received some frames on connection 1 and exactly N on connection 2.
     let mut gen2 = 0;
     while let Ok((generation, _payload)) = rx.recv_timeout(Duration::from_secs(1)) {
@@ -658,59 +748,6 @@ async fn async_qwp_ws_failover_replays_in_flight_messages() {
         gen2, N,
         "expected {N} replayed frames on the new connection"
     );
-}
-
-#[tokio::test]
-async fn async_qwp_ws_failover_disabled_latches_terminal_error() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    thread::spawn(move || {
-        let (mut s, _) = listener.accept().unwrap();
-        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        s.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
-        let req_bytes = read_request_until_blank(&mut s).unwrap();
-        let req = String::from_utf8_lossy(&req_bytes).to_string();
-        let key = parse_header(&req, "Sec-WebSocket-Key").unwrap();
-        let accept = compute_accept(&key);
-        let resp = format!(
-            "HTTP/1.1 101 Switching Protocols\r\n\
-             Upgrade: websocket\r\n\
-             Connection: Upgrade\r\n\
-             Sec-WebSocket-Accept: {accept}\r\n\
-             X-QWP-Version: 1\r\n\
-             \r\n"
-        );
-        s.write_all(resp.as_bytes()).unwrap();
-        let _ = read_frame(&mut s).unwrap();
-        drop(s);
-    });
-
-    let sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
-        .failover(false)
-        .unwrap()
-        .build_async()
-        .await
-        .unwrap();
-    let mut buf = sender.new_buffer();
-    buf.table("t")
-        .unwrap()
-        .column_i64("v", 1)
-        .unwrap()
-        .at_now()
-        .unwrap();
-    let err = sender.flush(&mut buf).await.unwrap_err();
-    assert_eq!(err.code(), crate::ErrorCode::SocketError);
-
-    // A subsequent flush sees the latched error.
-    let mut buf2 = sender.new_buffer();
-    buf2.table("t")
-        .unwrap()
-        .column_i64("v", 2)
-        .unwrap()
-        .at_now()
-        .unwrap();
-    let err2 = sender.flush(&mut buf2).await.unwrap_err();
-    assert_eq!(err2.code(), crate::ErrorCode::SocketError);
 }
 
 #[tokio::test]

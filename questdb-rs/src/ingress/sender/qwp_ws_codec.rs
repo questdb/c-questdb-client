@@ -304,32 +304,8 @@ pub(super) fn ws_close_reason(payload: &[u8]) -> String {
 
 // ---------- QWP response decoding ----------
 
-pub(super) enum ResponseAction {
-    Ok,
-    DurableAck,
-}
-
-pub(super) fn parse_response(payload: &[u8], expected_seq: u64) -> crate::Result<ResponseAction> {
-    if payload.is_empty() {
-        return Err(error::fmt!(SocketError, "Empty QWP response frame"));
-    }
-    let status = payload[0];
-    match status {
-        WS_STATUS_OK => {
-            verify_seq(payload, expected_seq)?;
-            Ok(ResponseAction::Ok)
-        }
-        WS_STATUS_DURABLE_ACK => Ok(ResponseAction::DurableAck),
-        _ => {
-            let (_seq, msg) = parse_error_body(payload)?;
-            Err(map_error_status(status, &msg))
-        }
-    }
-}
-
-/// Variant of `parse_response` for pipelined senders: rather than verifying a
-/// single expected sequence, return the sequence so the caller can dispatch
-/// the result to the matching in-flight request.
+/// Parse a QWP/WebSocket response and return the sequence so callers can
+/// dispatch the result to the matching in-flight request.
 pub(super) struct PipelinedError {
     pub(super) sequence: u64,
     pub(super) status: u8,
@@ -368,22 +344,6 @@ pub(super) fn parse_pipelined_response(payload: &[u8]) -> crate::Result<Pipeline
             }))
         }
     }
-}
-
-fn verify_seq(payload: &[u8], expected: u64) -> crate::Result<()> {
-    if payload.len() < 1 + 8 {
-        return Err(error::fmt!(SocketError, "QWP OK response truncated"));
-    }
-    let seq = u64::from_le_bytes(payload[1..9].try_into().unwrap());
-    if seq != expected {
-        return Err(error::fmt!(
-            SocketError,
-            "QWP response sequence mismatch: expected {}, got {}",
-            expected,
-            seq
-        ));
-    }
-    Ok(())
 }
 
 fn parse_error_body(payload: &[u8]) -> crate::Result<(u64, String)> {
