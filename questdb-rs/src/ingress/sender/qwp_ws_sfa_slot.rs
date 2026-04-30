@@ -28,15 +28,14 @@
 //!
 //! `SfaFrameQueue` owns the Java `.sfa` file format for one slot directory. This
 //! layer owns the product protocol around that queue: `sf_dir` is a group root,
-//! `sender_id` names the slot under it, and `<sf_dir>/<sender_id>/.lock` is held
-//! for the queue lifetime.
+//! `sender_id` names the slot under it, `<sf_dir>/<sender_id>/.lock` is held for
+//! the queue lifetime, and `<sf_dir>/<sender_id>/.lock.pid` records the
+//! diagnostic holder PID.
 
 use std::fs;
 #[cfg(unix)]
 use std::fs::{File, OpenOptions};
 use std::io;
-#[cfg(unix)]
-use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
@@ -49,6 +48,8 @@ use crate::ingress::conf::{QWP_WS_DEFAULT_SENDER_ID, is_valid_qwp_ws_sender_id};
 
 pub(crate) const DEFAULT_SENDER_ID: &str = QWP_WS_DEFAULT_SENDER_ID;
 const LOCK_FILE_NAME: &str = ".lock";
+#[cfg(unix)]
+const LOCK_PID_FILE_NAME: &str = ".lock.pid";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SfaSlotOptions {
@@ -172,17 +173,18 @@ impl SlotLock {
     #[cfg(unix)]
     fn lock_file(slot_dir: PathBuf) -> Result<Self, SfaQueueError> {
         let lock_path = slot_dir.join(LOCK_FILE_NAME);
-        let mut file = OpenOptions::new()
+        let pid_path = slot_dir.join(LOCK_PID_FILE_NAME);
+        let file = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
             .open(&lock_path)?;
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc != 0 {
-            let holder = read_lock_holder(&lock_path);
+            let holder = read_lock_holder(&pid_path);
             return Err(SfaQueueError::SlotInUse { slot_dir, holder });
         }
-        write_pid(&mut file)?;
+        write_pid(&pid_path);
         Ok(Self { slot_dir, file })
     }
 
@@ -225,8 +227,8 @@ fn ensure_dir(path: &Path) -> Result<(), io::Error> {
 }
 
 #[cfg(unix)]
-fn read_lock_holder(lock_path: &Path) -> String {
-    match fs::read(lock_path) {
+fn read_lock_holder(pid_path: &Path) -> String {
+    match fs::read(pid_path) {
         Ok(bytes) if !bytes.is_empty() => {
             let len = bytes.len().min(64);
             let holder = String::from_utf8_lossy(&bytes[..len]).trim().to_owned();
@@ -241,11 +243,9 @@ fn read_lock_holder(lock_path: &Path) -> String {
 }
 
 #[cfg(unix)]
-fn write_pid(file: &mut File) -> Result<(), io::Error> {
+fn write_pid(pid_path: &Path) {
     let payload = format!("{}\n", std::process::id());
-    file.set_len(0)?;
-    file.seek(SeekFrom::Start(0))?;
-    file.write_all(payload.as_bytes())
+    let _ = fs::write(pid_path, payload);
 }
 
 #[cfg(test)]
@@ -289,6 +289,7 @@ mod tests {
         assert_eq!(queue.slot_dir(), Some(slot_dir.as_path()));
         assert!(slot_dir.is_dir());
         assert!(slot_dir.join(LOCK_FILE_NAME).exists());
+        assert!(slot_dir.join(LOCK_PID_FILE_NAME).exists());
         assert!(initial_segment_path(&slot_dir).exists());
     }
 
@@ -298,6 +299,8 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let sf_dir = temp.path().join("sf-root");
         let _first = SfaSlotQueue::open(options(&sf_dir, DEFAULT_SENDER_ID)).unwrap();
+        let pid_path = sf_dir.join(DEFAULT_SENDER_ID).join(LOCK_PID_FILE_NAME);
+        fs::write(&pid_path, b"4242\n").unwrap();
 
         let err = SfaSlotQueue::open(options(&sf_dir, DEFAULT_SENDER_ID)).unwrap_err();
 
@@ -307,7 +310,7 @@ mod tests {
                 slot_dir,
                 holder
             } if slot_dir == sf_dir.join(DEFAULT_SENDER_ID)
-                && holder.starts_with("pid=")
+                && holder == "pid=4242"
         ));
     }
 
@@ -331,9 +334,11 @@ mod tests {
         let sf_dir = temp.path().join("sf-root");
         let mut first = SfaSlotQueue::open(options(&sf_dir, DEFAULT_SENDER_ID)).unwrap();
         let lock_path = sf_dir.join(DEFAULT_SENDER_ID).join(LOCK_FILE_NAME);
+        let pid_path = sf_dir.join(DEFAULT_SENDER_ID).join(LOCK_PID_FILE_NAME);
 
         first.close().unwrap();
         assert!(lock_path.exists());
+        assert!(pid_path.exists());
 
         let second = SfaSlotQueue::open(options(&sf_dir, DEFAULT_SENDER_ID)).unwrap();
         assert_eq!(

@@ -120,7 +120,7 @@ Status values:
 
 | ID | Status | Architecture layer | Slice | Why it matters | Required first validation | Completion signal |
 | --- | --- | --- | --- | --- | --- | --- |
-| J1 | todo | SFA slot / disk contract | Slot lock `.lock.pid` parity | Java moved holder PID out of `.lock`; on-disk slot layout should match. | Re-read Java `SlotLock.java`; re-read Rust `qwp_ws_sfa_slot.rs`; confirm whether `.lock.pid` is only diagnostic and stale-safe. | Rust creates `.lock` plus `.lock.pid`, reads holder from `.lock.pid`, and existing lock behavior remains unchanged. |
+| J1 | done | SFA slot / disk contract | Slot lock `.lock.pid` parity | Java moved holder PID out of `.lock`; on-disk slot layout should match. | Re-read Java `SlotLock.java`; re-read Rust `qwp_ws_sfa_slot.rs`; confirm whether `.lock.pid` is only diagnostic and stale-safe. | Rust creates `.lock` plus `.lock.pid`, reads holder from `.lock.pid`, and existing lock behavior remains unchanged. |
 | J2 | todo | Public config surface | `initial_connect_retry` parser surface | Java now accepts `off/false/on/true/sync/async`; Rust still parses boolean only. | Re-read Java `Sender.java` parsing and Rust config parser; confirm the unsupported-mode error text. | `sync` is accepted as an alias for the existing retry behavior, and `async` is rejected clearly until the behavior exists. |
 | J3 | deferred | Adapter / lifecycle boundary | Initial-connect mode design | Java's `ASYNC` returns before any socket exists; Rust sync sender currently connects before `build()` returns and `flush()` waits for ACK. | Before resuming, trace Rust open/flush semantics and compare to Java async flush semantics. | Not implemented now. Java-style background initial connect is deferred to a future explicit adapter design; the sync sender must not silently start a background connector. |
 | J4 | todo | Driver / error surface | Reconnect budget exhaustion classification | Java distinguishes never-connected config-likely failures from connection-lost transient failures. | Re-read Java `hasEverConnected` handling; inspect Rust driver/transport reconnect state and current error messages. | Rust either reports equivalent classification or records why the current public error surface should stay simpler for now. |
@@ -242,6 +242,20 @@ Evidence:
 Result:
 - done/deferred/follow-up
 ```
+
+2026-04-30 - J1 - match Java `.lock.pid` slot holder sidecar
+Evidence:
+- Java: `SlotLock` keeps `.lock` as the actual lock file, writes holder PID to
+  `.lock.pid`, reads holder diagnostics from `.lock.pid`, and treats PID writes
+  as best-effort.
+- Rust: `qwp_ws_sfa_slot.rs` now keeps flock ownership on `.lock`, writes the
+  holder PID sidecar to `.lock.pid`, reads contention diagnostics from that
+  sidecar, and leaves both files behind for slot reuse.
+- Validation: `cargo test --manifest-path questdb-rs/Cargo.toml --lib
+  qwp_ws_sfa_slot`; `cargo test --manifest-path questdb-rs/Cargo.toml --lib
+  qwp_ws_sfa`.
+Result:
+- done.
 
 2026-04-30 - J2/J3 - reject `initial_connect_retry=async` until implemented
 Evidence:
