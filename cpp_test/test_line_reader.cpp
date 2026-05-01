@@ -72,13 +72,17 @@ namespace
 
 // MSVC flags `std::getenv` as deprecated (C4996) in favour of `_dupenv_s`,
 // but the function is standard C/C++ and the test's usage is single-threaded.
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4996)
+#endif
 inline const char* env_or_null(const char* name)
 {
-#ifdef _MSC_VER
-#pragma warning(suppress : 4996)
-#endif
     return std::getenv(name);
 }
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 
 std::string broker_host()
 {
