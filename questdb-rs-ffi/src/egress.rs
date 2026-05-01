@@ -180,7 +180,7 @@ unsafe fn set_reader_err(
 /// boundary, or (b) this module's `validated_utf8`, which always
 /// re-validates. New egress entry points should reach for (b).
 mod utf8_in {
-    use super::{line_sender_utf8, Error, ErrorCode};
+    use super::{Error, ErrorCode, line_sender_utf8};
 
     pub(super) fn validated_utf8(v: &line_sender_utf8) -> Result<&str, Error> {
         v.validated_utf8().map_err(|e| {
@@ -571,7 +571,11 @@ pub unsafe extern "C" fn line_reader_current_addr_port(reader: *const line_reade
 
 #[inline]
 fn u128_to_u64_sat(v: u128) -> u64 {
-    if v > u64::MAX as u128 { u64::MAX } else { v as u64 }
+    if v > u64::MAX as u128 {
+        u64::MAX
+    } else {
+        v as u64
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -657,9 +661,7 @@ pub unsafe extern "C" fn line_reader_server_info_role_byte(
 
 /// NULL-safe: returns 0 when `si` is NULL.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn line_reader_server_info_epoch(
-    si: *const line_reader_server_info,
-) -> u64 {
+pub unsafe extern "C" fn line_reader_server_info_epoch(si: *const line_reader_server_info) -> u64 {
     unsafe { server_info_ref(si).map(|s| s.epoch).unwrap_or(0) }
 }
 
@@ -924,8 +926,7 @@ pub unsafe extern "C" fn line_reader_query_on_failover_reset(
         // responsible for its lifetime — see the header docs.
         let trampoline = move |event: &FailoverEvent| {
             if let Some(c_cb) = callback {
-                let opaque = event as *const FailoverEvent
-                    as *const line_reader_failover_event;
+                let opaque = event as *const FailoverEvent as *const line_reader_failover_event;
                 c_cb(opaque, user_data)
             }
         };
@@ -1676,11 +1677,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_bool(
                 set_reader_err(
                     err_out,
                     ErrorCode::InvalidApiCall,
-                    format!(
-                        "column {} is {:?}, not BOOLEAN",
-                        col_idx,
-                        other.kind()
-                    ),
+                    format!("column {} is {:?}, not BOOLEAN", col_idx, other.kind()),
                 );
                 return false;
             }
@@ -2420,11 +2417,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_double_array(
                 set_reader_err(
                     err_out,
                     ErrorCode::InvalidApiCall,
-                    format!(
-                        "column {} is {:?}, not DOUBLE_ARRAY",
-                        col_idx,
-                        other.kind()
-                    ),
+                    format!("column {} is {:?}, not DOUBLE_ARRAY", col_idx, other.kind()),
                 );
                 return false;
             }
@@ -2531,11 +2524,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_double_array_element(
                 set_reader_err(
                     err_out,
                     ErrorCode::InvalidApiCall,
-                    format!(
-                        "column {} is {:?}, not DOUBLE_ARRAY",
-                        col_idx,
-                        other.kind()
-                    ),
+                    format!("column {} is {:?}, not DOUBLE_ARRAY", col_idx, other.kind()),
                 );
                 return false;
             }
@@ -2594,11 +2583,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_long_array(
                 set_reader_err(
                     err_out,
                     ErrorCode::InvalidApiCall,
-                    format!(
-                        "column {} is {:?}, not LONG_ARRAY",
-                        col_idx,
-                        other.kind()
-                    ),
+                    format!("column {} is {:?}, not LONG_ARRAY", col_idx, other.kind()),
                 );
                 return false;
             }
@@ -2698,11 +2683,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_long_array_element(
                 set_reader_err(
                     err_out,
                     ErrorCode::InvalidApiCall,
-                    format!(
-                        "column {} is {:?}, not LONG_ARRAY",
-                        col_idx,
-                        other.kind()
-                    ),
+                    format!("column {} is {:?}, not LONG_ARRAY", col_idx, other.kind()),
                 );
                 return false;
             }
@@ -3197,8 +3178,7 @@ mod tests {
         unsafe {
             let err = make_error(ErrorCode::InvalidApiCall, "boom");
             let got = line_reader_error_get_code(err) as u32;
-            let want =
-                line_reader_error_code::line_reader_error_invalid_api_call as u32;
+            let want = line_reader_error_code::line_reader_error_invalid_api_call as u32;
             assert_eq!(got, want);
             let mut len: size_t = 0;
             let p = line_reader_error_msg(err, &mut len);
@@ -3286,35 +3266,109 @@ mod tests {
     #[test]
     fn column_kind_round_trips_for_every_variant() {
         let pairs = [
-            (ColumnKind::Boolean, line_reader_column_kind::line_reader_column_kind_boolean),
-            (ColumnKind::Byte, line_reader_column_kind::line_reader_column_kind_byte),
-            (ColumnKind::Short, line_reader_column_kind::line_reader_column_kind_short),
-            (ColumnKind::Int, line_reader_column_kind::line_reader_column_kind_int),
-            (ColumnKind::Long, line_reader_column_kind::line_reader_column_kind_long),
-            (ColumnKind::Float, line_reader_column_kind::line_reader_column_kind_float),
-            (ColumnKind::Double, line_reader_column_kind::line_reader_column_kind_double),
-            (ColumnKind::Symbol, line_reader_column_kind::line_reader_column_kind_symbol),
-            (ColumnKind::Timestamp, line_reader_column_kind::line_reader_column_kind_timestamp),
-            (ColumnKind::Date, line_reader_column_kind::line_reader_column_kind_date),
-            (ColumnKind::Uuid, line_reader_column_kind::line_reader_column_kind_uuid),
-            (ColumnKind::Geohash, line_reader_column_kind::line_reader_column_kind_geohash),
-            (ColumnKind::Varchar, line_reader_column_kind::line_reader_column_kind_varchar),
-            (ColumnKind::TimestampNanos, line_reader_column_kind::line_reader_column_kind_timestamp_nanos),
-            (ColumnKind::DoubleArray, line_reader_column_kind::line_reader_column_kind_double_array),
-            (ColumnKind::LongArray, line_reader_column_kind::line_reader_column_kind_long_array),
-            (ColumnKind::Decimal64, line_reader_column_kind::line_reader_column_kind_decimal64),
-            (ColumnKind::Decimal128, line_reader_column_kind::line_reader_column_kind_decimal128),
-            (ColumnKind::Decimal256, line_reader_column_kind::line_reader_column_kind_decimal256),
-            (ColumnKind::Char, line_reader_column_kind::line_reader_column_kind_char),
-            (ColumnKind::Binary, line_reader_column_kind::line_reader_column_kind_binary),
-            (ColumnKind::Long256, line_reader_column_kind::line_reader_column_kind_long256),
-            (ColumnKind::Ipv4, line_reader_column_kind::line_reader_column_kind_ipv4),
+            (
+                ColumnKind::Boolean,
+                line_reader_column_kind::line_reader_column_kind_boolean,
+            ),
+            (
+                ColumnKind::Byte,
+                line_reader_column_kind::line_reader_column_kind_byte,
+            ),
+            (
+                ColumnKind::Short,
+                line_reader_column_kind::line_reader_column_kind_short,
+            ),
+            (
+                ColumnKind::Int,
+                line_reader_column_kind::line_reader_column_kind_int,
+            ),
+            (
+                ColumnKind::Long,
+                line_reader_column_kind::line_reader_column_kind_long,
+            ),
+            (
+                ColumnKind::Float,
+                line_reader_column_kind::line_reader_column_kind_float,
+            ),
+            (
+                ColumnKind::Double,
+                line_reader_column_kind::line_reader_column_kind_double,
+            ),
+            (
+                ColumnKind::Symbol,
+                line_reader_column_kind::line_reader_column_kind_symbol,
+            ),
+            (
+                ColumnKind::Timestamp,
+                line_reader_column_kind::line_reader_column_kind_timestamp,
+            ),
+            (
+                ColumnKind::Date,
+                line_reader_column_kind::line_reader_column_kind_date,
+            ),
+            (
+                ColumnKind::Uuid,
+                line_reader_column_kind::line_reader_column_kind_uuid,
+            ),
+            (
+                ColumnKind::Geohash,
+                line_reader_column_kind::line_reader_column_kind_geohash,
+            ),
+            (
+                ColumnKind::Varchar,
+                line_reader_column_kind::line_reader_column_kind_varchar,
+            ),
+            (
+                ColumnKind::TimestampNanos,
+                line_reader_column_kind::line_reader_column_kind_timestamp_nanos,
+            ),
+            (
+                ColumnKind::DoubleArray,
+                line_reader_column_kind::line_reader_column_kind_double_array,
+            ),
+            (
+                ColumnKind::LongArray,
+                line_reader_column_kind::line_reader_column_kind_long_array,
+            ),
+            (
+                ColumnKind::Decimal64,
+                line_reader_column_kind::line_reader_column_kind_decimal64,
+            ),
+            (
+                ColumnKind::Decimal128,
+                line_reader_column_kind::line_reader_column_kind_decimal128,
+            ),
+            (
+                ColumnKind::Decimal256,
+                line_reader_column_kind::line_reader_column_kind_decimal256,
+            ),
+            (
+                ColumnKind::Char,
+                line_reader_column_kind::line_reader_column_kind_char,
+            ),
+            (
+                ColumnKind::Binary,
+                line_reader_column_kind::line_reader_column_kind_binary,
+            ),
+            (
+                ColumnKind::Long256,
+                line_reader_column_kind::line_reader_column_kind_long256,
+            ),
+            (
+                ColumnKind::Ipv4,
+                line_reader_column_kind::line_reader_column_kind_ipv4,
+            ),
         ];
         for (rust, c) in pairs {
             let mapped: line_reader_column_kind = rust.into();
             assert_eq!(mapped, c, "rust→c mapping for {:?}", rust);
             // Discriminant equals wire byte.
-            assert_eq!(mapped as u8, rust.as_u8(), "wire-byte mismatch for {:?}", rust);
+            assert_eq!(
+                mapped as u8,
+                rust.as_u8(),
+                "wire-byte mismatch for {:?}",
+                rust
+            );
             assert_eq!(column_kind_from_c(c), rust, "c→rust mapping for {:?}", rust);
         }
     }
@@ -3346,10 +3400,7 @@ mod tests {
     // live Reader.
     static CB_HITS: AtomicU32 = AtomicU32::new(0);
 
-    unsafe extern "C" fn test_cb(
-        _ev: *const line_reader_failover_event,
-        user_data: *mut c_void,
-    ) {
+    unsafe extern "C" fn test_cb(_ev: *const line_reader_failover_event, user_data: *mut c_void) {
         CB_HITS.fetch_add(1, Ordering::SeqCst);
         // The user_data round-trip must preserve the bit pattern.
         assert_eq!(user_data as usize, 0xdead_beef_usize);
@@ -3395,4 +3446,3 @@ mod tests {
         // is a no-op when the C callback slot is empty.
     }
 }
-
