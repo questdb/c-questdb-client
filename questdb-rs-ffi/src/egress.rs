@@ -372,7 +372,14 @@ pub unsafe extern "C" fn line_reader_from_conf(
                 return ptr::null_mut();
             }
         };
-        let reader = reader_bubble!(err_out, Reader::from_conf(conf), ptr::null_mut());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Reader::from_conf(conf)
+        }));
+        let reader_result = match result {
+            Ok(r) => r,
+            Err(_) => std::process::abort(),
+        };
+        let reader = reader_bubble!(err_out, reader_result, ptr::null_mut());
         Box::into_raw(Box::new(line_reader(
             UnsafeCell::new(reader),
             AtomicBool::new(false),
@@ -413,7 +420,14 @@ pub unsafe extern "C" fn line_reader_from_env(
                 return ptr::null_mut();
             }
         };
-        let reader = reader_bubble!(err_out, Reader::from_conf(&conf), ptr::null_mut());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Reader::from_conf(&conf)
+        }));
+        let reader_result = match result {
+            Ok(r) => r,
+            Err(_) => std::process::abort(),
+        };
+        let reader = reader_bubble!(err_out, reader_result, ptr::null_mut());
         Box::into_raw(Box::new(line_reader(
             UnsafeCell::new(reader),
             AtomicBool::new(false),

@@ -100,11 +100,18 @@ pub struct Reader {
     /// Total wire bytes (header + payload) consumed since connect.
     /// Updated on every frame the reader pulls off the transport.
     ///
-    /// Atomic so the FFI stat getters can observe a well-defined value
-    /// even when called from a thread other than the one driving the
-    /// in-flight cursor (the Reader handle migrates between threads;
-    /// the cursor pumps these counters as it runs). `Relaxed` is
-    /// sufficient — these are pure counters with no associated
+    /// Atomic to keep this counter and the three siblings below
+    /// (`credit_granted_total`, `read_ns`, `decode_ns`) race-free with
+    /// the cursor mutation loop. The one-thread-at-a-time rule that
+    /// governs the rest of the Reader API is intentionally relaxed for
+    /// these four counters and `reset_timing`: their getters take
+    /// `&self`, touch only atomics, and may be invoked concurrently
+    /// from a monitoring thread while another thread is driving a
+    /// cursor. Every other accessor (`current_addr`, `server_info`,
+    /// `server_version`) reads non-atomic state and remains bound by
+    /// the one-thread-at-a-time contract — racing them with an
+    /// in-flight cursor is undefined behaviour. `Relaxed` is
+    /// sufficient: these are pure counters with no associated
     /// happens-before requirement on other state.
     bytes_received: AtomicU64,
     /// Total bytes granted to the server via CREDIT (`0x15`) frames

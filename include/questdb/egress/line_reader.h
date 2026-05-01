@@ -79,6 +79,23 @@ extern "C" {
 // move the storage that another thread is reading. Never share a
 // borrowed pointer across threads without explicit external locking that
 // also serialises every operation on the owning handle.
+//
+// Concurrent-stat exception: a narrow set of `line_reader` getters are
+// safe to call from a monitoring thread while another thread is driving
+// a query/cursor on the same reader, because they touch only atomic
+// counters:
+//
+//   `line_reader_bytes_received`
+//   `line_reader_credit_granted_total`
+//   `line_reader_read_ns`
+//   `line_reader_decode_ns`
+//   `line_reader_reset_timing`
+//
+// All other reader getters — including `line_reader_server_version`,
+// `line_reader_current_addr_host`, `line_reader_current_addr_port`, and
+// `line_reader_current_server_info` — read non-atomic state that the
+// cursor thread mutates during failover, and remain bound by the
+// one-thread-at-a-time rule.
 
 /////////// Pointer preconditions.
 //
