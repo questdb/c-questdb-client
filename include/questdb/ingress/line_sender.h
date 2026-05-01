@@ -1204,11 +1204,11 @@ bool line_sender_flush_and_keep_with_flags(
 
 /** Get the current time in nanoseconds since the Unix epoch (UTC). */
 LINESENDER_API
-int64_t line_sender_now_nanos();
+int64_t line_sender_now_nanos(void);
 
 /** Get the current time in microseconds since the Unix epoch (UTC). */
 LINESENDER_API
-int64_t line_sender_now_micros();
+int64_t line_sender_now_micros(void);
 
 #ifdef __cplusplus
 }

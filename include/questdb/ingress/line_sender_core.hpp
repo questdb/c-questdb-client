@@ -273,7 +273,7 @@ namespace literals
  * auto validated = "A UTF-8 encoded string"_utf8;
  * @endcode
  */
-inline utf8_view operator"" _utf8(const char* buf, size_t len)
+inline utf8_view operator""_utf8(const char* buf, size_t len)
 {
     return utf8_view{buf, len};
 }
@@ -284,7 +284,7 @@ inline utf8_view operator"" _utf8(const char* buf, size_t len)
  * auto table_name = "events"_tn;
  * @endcode
  */
-inline table_name_view operator"" _tn(const char* buf, size_t len)
+inline table_name_view operator""_tn(const char* buf, size_t len)
 {
     return table_name_view{buf, len};
 }
@@ -295,7 +295,7 @@ inline table_name_view operator"" _tn(const char* buf, size_t len)
  * auto column_name = "events"_cn;
  * @endcode
  */
-inline column_name_view operator"" _cn(const char* buf, size_t len)
+inline column_name_view operator""_cn(const char* buf, size_t len)
 {
     return column_name_view{buf, len};
 }
