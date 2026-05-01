@@ -260,6 +260,7 @@ pub unsafe extern "C" fn line_reader_error_free(error: *mut line_reader_error) {
 /// values match the QWP wire codes (and `ColumnKind::as_u8()`).
 #[repr(C)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
 pub enum line_reader_column_kind {
     line_reader_column_kind_boolean = 0x01,
     line_reader_column_kind_byte = 0x02,
@@ -594,6 +595,7 @@ pub struct line_reader_server_info {
 /// arm — call `line_reader_server_info_role_byte` to recover it.
 #[repr(C)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
 pub enum line_reader_server_role {
     line_reader_server_role_standalone = 0,
     line_reader_server_role_primary = 1,
@@ -2912,6 +2914,7 @@ pub unsafe extern "C" fn line_reader_cursor_batch_flags(
 /// Terminal kind for the cursor.
 #[repr(C)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
 pub enum line_reader_terminal_kind {
     /// No terminal observed yet (stream is still active or errored out
     /// without a structured terminal).
@@ -3431,7 +3434,7 @@ mod tests {
         let user_data = 0xdead_beef_usize as *mut c_void;
         // The C callback receives the event as an opaque pointer; we never
         // construct a Rust `&FailoverEvent`, so a bogus address is fine.
-        let ev = 0x1usize as *const line_reader_failover_event;
+        let ev = std::ptr::dangling::<line_reader_failover_event>();
         dispatch_via_trampoline(cb, user_data, ev);
         assert_eq!(CB_HITS.load(Ordering::SeqCst), 1);
     }
