@@ -793,8 +793,23 @@ fn decode_varlen(
     let data = read_owned(r, parent, data_len)?;
 
     if utf8 {
-        std::str::from_utf8(&data)
+        // `VarcharColumn::new` requires every offset to lie on a UTF-8
+        // codepoint boundary; validating the buffer as a whole is not
+        // sufficient. e.g. `data = [0xC3, 0xB1]` (the codepoint `ñ`) with
+        // offsets `[0, 1, 2]` passes the global UTF-8 check, but the row-0
+        // slice `[0xC3]` is not valid UTF-8 and would later be handed to
+        // `from_utf8_unchecked` — undefined behaviour.
+        let s = std::str::from_utf8(&data)
             .map_err(|e| fmt!(InvalidUtf8, "varchar data buffer not valid UTF-8: {}", e))?;
+        for &off in &compact {
+            if !s.is_char_boundary(off as usize) {
+                return Err(fmt!(
+                    InvalidUtf8,
+                    "varchar offset {} does not lie on a UTF-8 codepoint boundary",
+                    off
+                ));
+            }
+        }
     }
 
     // No-null fast path: compact has `row_count + 1` entries already, in
@@ -2277,6 +2292,27 @@ mod tests {
         col.extend_from_slice(&2u32.to_le_bytes());
         col.extend_from_slice(&[0xFF, 0xFE]); // invalid UTF-8
         let (flags_byte, payload) = BatchBuilder::new(1)
+            .add_column("s", ColumnKind::Varchar, col)
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidUtf8);
+    }
+
+    #[test]
+    fn decode_varchar_offset_splitting_codepoint_rejected() {
+        // `data = [0xC3, 0xB1]` is the codepoint `ñ` — valid UTF-8 as a
+        // whole. Offsets `[0, 1, 2]` would split it: row 0 = `[0xC3]`,
+        // row 1 = `[0xB1]`. Both rows are invalid UTF-8 in isolation;
+        // handing them to `from_utf8_unchecked` is UB. The decoder must
+        // reject this rather than relying on a global `from_utf8` check.
+        let mut col = vec![0x00u8]; // null_flag = 0
+        for o in [0u32, 1, 2] {
+            col.extend_from_slice(&o.to_le_bytes());
+        }
+        col.extend_from_slice(&[0xC3, 0xB1]);
+        let (flags_byte, payload) = BatchBuilder::new(2)
             .add_column("s", ColumnKind::Varchar, col)
             .build();
         let mut dict = SymbolDict::new();

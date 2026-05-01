@@ -263,10 +263,15 @@ line_reader* line_reader_from_env(
  *
  * Any `line_reader_query` or `line_reader_cursor` obtained from this reader
  * MUST be freed/closed first. Closing the reader while a query or cursor is
- * still live is undefined behaviour: the cursor's internal reference to the
- * reader becomes dangling and any subsequent operation on it is use-after-
- * free. The library does NOT detect or prevent this — typical symptoms are
- * SIGSEGV or silent memory corruption.
+ * still live is a contract violation: a cursor holds an internal reference
+ * to the reader that would otherwise dangle.
+ *
+ * As defense-in-depth, the library detects this via an atomic active-flag
+ * compare-and-swap. On detection it prints a diagnostic to stderr and
+ * **leaks the reader** (handle and underlying socket) rather than freeing
+ * it — leaking is finite and safe; freeing here would let the next
+ * allocation alias the live cursor's reference and cause silent memory
+ * corruption. Free the cursor / query first to avoid the leak.
  */
 LINEREADER_API
 void line_reader_close(line_reader* reader);

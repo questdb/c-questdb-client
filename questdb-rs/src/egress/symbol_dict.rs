@@ -116,6 +116,12 @@ impl SymbolDict {
 
     /// Decode + apply a delta directly from the wire bytes. Returns the
     /// number of bytes consumed.
+    ///
+    /// All-or-nothing: if any entry in the delta is malformed, the dict
+    /// is rolled back to its pre-call state. Without this, a partial
+    /// failure would leave `self.entries.len()` between the old and new
+    /// expected values, and every subsequent delta would mismatch the
+    /// `delta_start` check above and break the connection until reset.
     pub fn apply_delta_from_bytes(&mut self, bytes: &[u8]) -> Result<usize> {
         let mut cursor = 0usize;
         let (delta_start, n) = varint::decode_u64(&bytes[cursor..])?;
@@ -133,29 +139,38 @@ impl SymbolDict {
             ));
         }
 
-        for i in 0..delta_count {
-            let (entry_len, n) = varint::decode_usize(&bytes[cursor..])?;
-            cursor += n;
-            let end = cursor.checked_add(entry_len).ok_or_else(|| {
-                fmt!(
-                    ProtocolError,
-                    "symbol dict entry length overflow at i={}",
-                    i
-                )
-            })?;
-            if end > bytes.len() {
-                return Err(fmt!(
-                    ProtocolError,
-                    "symbol dict truncated at entry {}: need {} bytes, have {}",
-                    i,
-                    entry_len,
-                    bytes.len() - cursor
-                ));
+        let snapshot_entries = self.entries.len();
+        let snapshot_arena = self.arena.len();
+        let result: Result<usize> = (|| {
+            for i in 0..delta_count {
+                let (entry_len, n) = varint::decode_usize(&bytes[cursor..])?;
+                cursor += n;
+                let end = cursor.checked_add(entry_len).ok_or_else(|| {
+                    fmt!(
+                        ProtocolError,
+                        "symbol dict entry length overflow at i={}",
+                        i
+                    )
+                })?;
+                if end > bytes.len() {
+                    return Err(fmt!(
+                        ProtocolError,
+                        "symbol dict truncated at entry {}: need {} bytes, have {}",
+                        i,
+                        entry_len,
+                        bytes.len() - cursor
+                    ));
+                }
+                self.push_one(&bytes[cursor..end])?;
+                cursor = end;
             }
-            self.push_one(&bytes[cursor..end])?;
-            cursor = end;
+            Ok(cursor)
+        })();
+        if result.is_err() {
+            self.entries.truncate(snapshot_entries);
+            self.arena.truncate(snapshot_arena);
         }
-        Ok(cursor)
+        result
     }
 
     fn push_one(&mut self, bytes: &[u8]) -> Result<()> {
@@ -247,6 +262,36 @@ mod tests {
         let bytes2 = build_delta(2, &["GOOG"]);
         d.apply_delta_from_bytes(&bytes2).unwrap();
         assert_eq!(d.get(2), Some("GOOG"));
+    }
+
+    #[test]
+    fn from_bytes_partial_failure_rolls_back() {
+        // Build a delta where the first entry is fine and the second is
+        // truncated. Without rollback, the dict would commit the first
+        // entry and the delta_start of every subsequent batch would
+        // mismatch.
+        let mut d = SymbolDict::new();
+        d.apply_delta(0, [b"first".as_slice()]).unwrap();
+        let snapshot_len = d.len();
+        let snapshot_heap = d.heap_bytes();
+
+        let mut bytes = Vec::new();
+        encode_u64(snapshot_len as u64, &mut bytes); // delta_start
+        encode_u64(2, &mut bytes); // delta_count
+        encode_u64(2, &mut bytes); // entry 0 len
+        bytes.extend_from_slice(b"ok");
+        encode_u64(10, &mut bytes); // entry 1 claims 10 bytes
+        bytes.extend_from_slice(b"abc"); // only 3 follow → truncated
+
+        let err = d.apply_delta_from_bytes(&bytes).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ProtocolError);
+        // Dict reverted to snapshot: subsequent delta_start check uses
+        // the original length.
+        assert_eq!(d.len(), snapshot_len);
+        assert_eq!(d.heap_bytes(), snapshot_heap);
+        let next = build_delta(snapshot_len as u64, &["recovered"]);
+        d.apply_delta_from_bytes(&next).unwrap();
+        assert_eq!(d.get(snapshot_len as u32), Some("recovered"));
     }
 
     #[test]

@@ -1138,6 +1138,16 @@ pub unsafe extern "C" fn line_reader_query_execute(
     err_out: *mut *mut line_reader_error,
 ) -> *mut line_reader_cursor {
     unsafe {
+        // Defense-in-depth: `Box::from_raw(null)` is officially UB —
+        // strictly worse than a SIGSEGV. Reject NULL early instead.
+        if query.is_null() {
+            set_reader_err(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "line_reader_query_execute called with NULL query",
+            );
+            return ptr::null_mut();
+        }
         let mut boxed = Box::from_raw(query);
         let q: ReaderQuery<'static> = ManuallyDrop::take(&mut boxed.inner);
         let reader = boxed.reader;
