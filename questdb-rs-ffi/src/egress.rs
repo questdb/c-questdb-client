@@ -962,8 +962,9 @@ pub unsafe extern "C" fn line_reader_query_on_failover_reset(
                 // path may panic. An unwind through this `extern "C"` frame
                 // would be UB, so catch and abort. C++ users get the same
                 // protection from the wrapper's noexcept trampoline.
-                let result =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c_cb(opaque, user_data)));
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    c_cb(opaque, user_data)
+                }));
                 if result.is_err() {
                     std::process::abort();
                 }
@@ -1607,16 +1608,15 @@ pub unsafe extern "C" fn line_reader_cursor_next_batch(
         // the cursor (and therefore the batch's backing buffers) lives
         // at least as long as the FFI call sequence ends with
         // `_cursor_free`.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            match inner.next_batch() {
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match inner.next_batch() {
                 Ok(Some(batch)) => {
                     let batch_static: BatchView<'static> = std::mem::transmute(batch);
                     Ok(Some(batch_static))
                 }
                 Ok(None) => Ok(None),
                 Err(e) => Err(e),
-            }
-        }));
+            }));
         let next = match result {
             Ok(r) => r,
             Err(_) => std::process::abort(),
