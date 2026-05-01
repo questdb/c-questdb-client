@@ -114,8 +114,11 @@ rust_decimal = ["dep:rust_decimal"]
 ## Enable serialization of bigdecimal::BigDecimal in ILP
 bigdecimal = ["dep:bigdecimal"]
 
-## Sync QWP egress reader over WebSocket (plain `ws://`).
-sync-reader-ws = ["_egress", "dep:tungstenite", "compression-zstd"]
+## Sync QWP egress reader over WebSocket (plain `ws://`). Does NOT
+## pull in `compression-zstd`: zstd is opt-in. Without it, the decoder
+## still compiles but rejects `FLAG_ZSTD` batches at runtime with an
+## `UnsupportedServer` error.
+sync-reader-ws = ["_egress", "dep:tungstenite"]
 
 ## Decompression for `FLAG_ZSTD` `RESULT_BATCH` payloads.
 compression-zstd = ["_egress", "dep:zstd"]
@@ -123,7 +126,7 @@ compression-zstd = ["_egress", "dep:zstd"]
 ## Run integration tests against a real QuestDB server launched from the
 ## `questdb/` submodule. Requires JDK 25 + Maven and a built jar at
 ## `../questdb/core/target/questdb-*-SNAPSHOT.jar`.
-live-server-tests = ["sync-reader-ws", "sync-sender-http"]
+live-server-tests = ["sync-reader-ws", "compression-zstd", "sync-sender-http"]
 
 # Hidden derived features, used in code to enable-disable code sections. Don't use directly.
 _sender-tcp = []
@@ -139,6 +142,7 @@ _egress = []
 almost-all-features = [
     "sync-sender",
     "sync-reader-ws",
+    "compression-zstd",
     "tls-webpki-certs",
     "tls-native-certs",
     "ring-crypto",
