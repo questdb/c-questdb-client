@@ -45,6 +45,9 @@ use questdb::{
 mod ndarr;
 use ndarr::StrideArrayView;
 
+#[cfg(feature = "sync-reader-ws")]
+mod egress;
+
 macro_rules! bubble_err_to_c {
     ($err_out:expr, $expression:expr) => {
         bubble_err_to_c!($err_out, $expression, false)
@@ -429,8 +432,44 @@ pub struct line_sender_utf8 {
 }
 
 impl line_sender_utf8 {
-    fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
+        // `slice::from_raw_parts` requires a non-null, properly aligned
+        // pointer even when `len == 0`; a hand-rolled
+        // `line_sender_utf8 { buf: NULL, len: 0 }` (legal-looking from C)
+        // would otherwise be instant UB. Substitute an empty slice.
+        if self.buf.is_null() {
+            return "";
+        }
         unsafe { str::from_utf8_unchecked(slice::from_raw_parts(self.buf as *const u8, self.len)) }
+    }
+
+    /// Re-validate the buffer as UTF-8 and return a borrowed `&str`.
+    /// Egress entry points that receive a `line_sender_utf8` from C
+    /// MUST consume the parameter via this method (typically through the
+    /// `egress::utf8_in` chokepoint) rather than `as_str()`: the public
+    /// C struct layout means a misbehaving caller can hand-roll a
+    /// `line_sender_utf8` with arbitrary bytes (skipping
+    /// `line_sender_utf8_init`'s validation), and `as_str()` would
+    /// silently feed those bytes to `from_utf8_unchecked` — instant UB
+    /// the moment upstream walks the slice.
+    ///
+    /// Returning `Result<&str, Utf8Error>` (rather than a raw byte slice
+    /// for the caller to re-validate) is deliberate: there is no
+    /// `as_bytes()` escape hatch for egress to misuse. The only ways to
+    /// extract content from a `line_sender_utf8` are this method
+    /// (always validates) and `as_str()` (trusted-caller-only, used by
+    /// ingress where the inputs went through `line_sender_utf8_init`).
+    #[cfg(feature = "sync-reader-ws")]
+    pub(crate) fn validated_utf8(&self) -> Result<&str, std::str::Utf8Error> {
+        // Same NULL-guard as `as_str`: `slice::from_raw_parts` is UB on a
+        // null pointer even with `len == 0`. Treat NULL+0 as the empty
+        // string (which is valid UTF-8).
+        let bytes: &[u8] = if self.buf.is_null() {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(self.buf as *const u8, self.len) }
+        };
+        std::str::from_utf8(bytes)
     }
 }
 

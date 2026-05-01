@@ -20,12 +20,36 @@ features = [
     "insecure-skip-verify",
     "tls-webpki-certs",
     "tls-native-certs",
-    "sync-sender"
+    "sync-sender",
 ]
 
 [features]
+# No default features. Existing consumers who only want the line sender
+# get exactly that — the egress reader is opt-in. Enable
+# `sync-reader-ws` explicitly (in Cargo.toml or via `--features`) to
+# bring the `line_reader_*` symbols back in.
+default = []
 # Expose the config parsing C API.
 # This used by `py-questdb-client` to parse the config file.
 # It is exposed here to avoid having multiple copies of the `questdb-confstr`
 # crate in the final binary.
 confstr-ffi = ["dep:questdb-confstr-ffi"]
+# Expose the synchronous WebSocket egress reader API (`line_reader_*`).
+# Forwarded to the upstream `questdb-rs` feature of the same name.
+# Opt-in (NOT a default feature) so existing builds of `questdb-rs-ffi`
+# don't silently grow ~70 new exported symbols + a WebSocket transport
+# dependency. The in-tree CMake build enables it via
+# `corrosion_import_crate(FEATURES sync-reader-ws ...)`.
+sync-reader-ws = ["questdb-rs/sync-reader-ws"]
+
+# Abort on panic. A panic that unwinds across the C FFI boundary is
+# undefined behaviour, and this crate's surface is too wide to wrap every
+# upstream call site in `catch_unwind`. Aborting is the standard policy
+# for `cdylib` FFI crates: any panic — debug assertion, arithmetic on
+# attacker-controlled wire data, slice indexing, custom allocator OOM —
+# terminates the process cleanly instead of unwinding into C.
+[profile.release]
+panic = "abort"
+
+[profile.dev]
+panic = "abort"

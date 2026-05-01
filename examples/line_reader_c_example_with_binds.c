@@ -1,0 +1,86 @@
+#include <questdb/egress/line_reader.h>
+#include <stdio.h>
+#include <stdbool.h>
+#include <stdlib.h>
+#include <string.h>
+
+int main(int argc, const char* argv[])
+{
+    (void)argc;
+    (void)argv;
+
+    line_reader_error* err = NULL;
+    line_reader* reader = NULL;
+    line_reader_query* query = NULL;
+    line_reader_cursor* cursor = NULL;
+
+    line_sender_utf8 conf = QDB_UTF8_LITERAL("qwp::addr=localhost:9000;");
+    reader = line_reader_from_conf(conf, &err);
+    if (!reader)
+        goto on_error;
+
+    /* SQL with two placeholders: $1 = INT, $2 = VARCHAR. */
+    line_sender_utf8 sql = QDB_UTF8_LITERAL(
+        "SELECT $1::int * x AS scaled, $2 AS label FROM long_sequence(3)");
+
+    query = line_reader_query_new(reader, sql, &err);
+    if (!query)
+        goto on_error;
+
+    line_reader_query_bind_i32(query, 7);
+    line_reader_query_bind_varchar(query, QDB_UTF8_LITERAL("widgets"));
+
+    cursor = line_reader_query_execute(query, &err);
+    query = NULL; /* execute consumed and freed the query handle */
+    if (!cursor)
+        goto on_error;
+
+    int rc;
+    while ((rc = line_reader_cursor_next_batch(cursor, &err)) == 1)
+    {
+        const size_t rows = line_reader_cursor_row_count(cursor);
+        for (size_t r = 0; r < rows; ++r)
+        {
+            int32_t scaled = 0;
+            bool n_null = false;
+            if (!line_reader_cursor_get_i32(cursor, 0, r, &scaled, &n_null, &err))
+                goto on_error;
+
+            const char* label = NULL;
+            size_t label_len = 0;
+            bool s_null = false;
+            if (!line_reader_cursor_get_varchar(
+                    cursor, 1, r, &label, &label_len, &s_null, &err))
+                goto on_error;
+
+            // Print "NULL" rather than substituting a sentinel value:
+            // a literal `0` for an i32 column or an empty string for a
+            // varchar column would silently mask SQL NULLs in
+            // production output. Always branch on the *_null flag.
+            if (n_null)
+                printf("scaled=NULL");
+            else
+                printf("scaled=%d", scaled);
+            if (s_null)
+                printf(" label=NULL\n");
+            else
+                printf(" label=%.*s\n", (int)label_len, label);
+        }
+    }
+    if (rc < 0)
+        goto on_error;
+
+    line_reader_cursor_free(cursor);
+    line_reader_close(reader);
+    return 0;
+
+on_error:;
+    size_t err_len = 0;
+    const char* err_msg = line_reader_error_msg(err, &err_len);
+    fprintf(stderr, "Error: %.*s\n", (int)err_len, err_msg);
+    line_reader_error_free(err);
+    line_reader_query_free(query);
+    line_reader_cursor_free(cursor);
+    line_reader_close(reader);
+    return 1;
+}
