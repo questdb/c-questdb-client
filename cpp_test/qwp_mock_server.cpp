@@ -434,17 +434,13 @@ std::vector<uint8_t> decimal64_column_bytes(
 }
 
 std::vector<uint8_t> decimal128_column_bytes(
-    const std::vector<__int128>& values, int8_t scale)
+    const std::vector<std::array<uint8_t, 16>>& values, int8_t scale)
 {
     std::vector<uint8_t> out;
     out.push_back(0x00);
     encode_varint_u64(uint64_t(uint8_t(scale)), out);
-    for (__int128 v : values)
-    {
-        unsigned __int128 u = (unsigned __int128)v;
-        for (int i = 0; i < 16; ++i)
-            out.push_back(uint8_t(u >> (i * 8)));
-    }
+    for (const auto& v : values)
+        out.insert(out.end(), v.begin(), v.end());
     return out;
 }
 

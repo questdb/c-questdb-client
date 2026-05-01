@@ -174,9 +174,11 @@ std::vector<uint8_t> fixed_column_bytes_nullable(
 std::vector<uint8_t> decimal64_column_bytes(
     const std::vector<int64_t>& values, int8_t scale);
 
-// Build a DECIMAL128 column body: `[validity][varint scale][non_null × 16 bytes LE i128]`.
+// Build a DECIMAL128 column body: `[validity][varint scale][non_null × 16 raw LE bytes]`.
+// Each entry in `values` is the raw 16-byte two's-complement little-endian
+// mantissa exactly as it should appear on the wire.
 std::vector<uint8_t> decimal128_column_bytes(
-    const std::vector<__int128>& values, int8_t scale);
+    const std::vector<std::array<uint8_t, 16>>& values, int8_t scale);
 
 // Build a DECIMAL256 column body: `[validity][1B scale][non_null × 32 raw LE bytes]`.
 // Each entry in `values` is the raw 32-byte two's-complement little-endian

@@ -272,8 +272,9 @@ TEST_CASE("mock: column getter — decimal64 with non-zero scale")
 
 TEST_CASE("mock: column getter — decimal128 with negative i128 mantissa")
 {
-    // i128 = -1 packs as low = UINT64_MAX, high = -1.
-    __int128 val = (__int128)(-1);
+    // i128 = -1 in two's-complement LE is sixteen 0xFF bytes.
+    std::array<uint8_t, 16> val;
+    val.fill(0xFF);
     auto body = qm::decimal128_column_bytes({val}, /*scale=*/0);
     qm::ColumnSpec c{"d", qm::COL_DECIMAL128, std::move(body)};
 
