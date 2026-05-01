@@ -41,6 +41,7 @@
 
 use std::net::Ipv4Addr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::egress::binds::Bind;
@@ -98,19 +99,28 @@ pub struct Reader {
     server_info: Option<ServerInfo>,
     /// Total wire bytes (header + payload) consumed since connect.
     /// Updated on every frame the reader pulls off the transport.
-    bytes_received: u64,
+    ///
+    /// Atomic so the FFI stat getters can observe a well-defined value
+    /// even when called from a thread other than the one driving the
+    /// in-flight cursor (the Reader handle migrates between threads;
+    /// the cursor pumps these counters as it runs). `Relaxed` is
+    /// sufficient — these are pure counters with no associated
+    /// happens-before requirement on other state.
+    bytes_received: AtomicU64,
     /// Total bytes granted to the server via CREDIT (`0x15`) frames
     /// since connect. Sums every per-batch auto-replenishment, every
     /// `Cursor::add_credit` call, and the cancel-time wake nudge. Used
     /// by tests to catch regressions where cancel keeps topping up the
     /// budget while draining frames it intends to discard.
-    credit_granted_total: u64,
+    credit_granted_total: AtomicU64,
     /// Diagnostic: nanoseconds spent in `transport.read_frame()` since
     /// connect. Useful for splitting "wait on the socket" from "decode
-    /// CPU" in throughput benchmarks.
-    read_ns: u128,
+    /// CPU" in throughput benchmarks. Saturates at `u64::MAX`
+    /// (~584 years) to avoid wrap-around.
+    read_ns: AtomicU64,
     /// Diagnostic: nanoseconds spent in `decode_frame()` since connect.
-    decode_ns: u128,
+    /// Saturates at `u64::MAX`.
+    decode_ns: AtomicU64,
 }
 
 impl Reader {
@@ -210,10 +220,10 @@ impl Reader {
             next_request_id: 1,
             cursor_active: false,
             server_info: None,
-            bytes_received: 0,
-            credit_granted_total: 0,
-            read_ns: 0,
-            decode_ns: 0,
+            bytes_received: AtomicU64::new(0),
+            credit_granted_total: AtomicU64::new(0),
+            read_ns: AtomicU64::new(0),
+            decode_ns: AtomicU64::new(0),
         };
         if reader.transport_mut()?.server_version() >= 2 {
             reader.consume_server_info()?;
@@ -393,7 +403,7 @@ impl Reader {
     /// since this connection was opened. Useful for benchmarking the
     /// effective throughput a query produces.
     pub fn bytes_received(&self) -> u64 {
-        self.bytes_received
+        self.bytes_received.load(Ordering::Relaxed)
     }
 
     /// Total bytes granted to the server via CREDIT (`0x15`) frames
@@ -402,29 +412,34 @@ impl Reader {
     /// that `Cursor::cancel()` doesn't continue topping up the server's
     /// budget while draining frames it's about to discard.
     pub fn credit_granted_total(&self) -> u64 {
-        self.credit_granted_total
+        self.credit_granted_total.load(Ordering::Relaxed)
     }
 
-    /// Diagnostic accumulators (nanoseconds): time spent in
-    /// `transport.read_frame()` and `decode_frame()` respectively.
-    /// Reset to zero by `reset_timing()`.
-    pub fn read_ns(&self) -> u128 {
-        self.read_ns
+    /// Diagnostic accumulator (nanoseconds): time spent in
+    /// `transport.read_frame()`. Saturates at `u64::MAX` (~584 years).
+    /// Reset to zero by [`Reader::reset_timing`].
+    pub fn read_ns(&self) -> u64 {
+        self.read_ns.load(Ordering::Relaxed)
     }
-    pub fn decode_ns(&self) -> u128 {
-        self.decode_ns
+    /// Diagnostic accumulator (nanoseconds): time spent in
+    /// `decode_frame()`. Saturates at `u64::MAX`.
+    /// Reset to zero by [`Reader::reset_timing`].
+    pub fn decode_ns(&self) -> u64 {
+        self.decode_ns.load(Ordering::Relaxed)
     }
-    pub fn reset_timing(&mut self) {
-        self.read_ns = 0;
-        self.decode_ns = 0;
+    /// Reset both `read_ns` and `decode_ns` accumulators to zero.
+    pub fn reset_timing(&self) {
+        self.read_ns.store(0, Ordering::Relaxed);
+        self.decode_ns.store(0, Ordering::Relaxed);
     }
 
     /// Read one frame and expect it to be `SERVER_INFO`; store it.
     fn consume_server_info(&mut self) -> Result<()> {
         let (header, payload) = self.transport_mut()?.read_frame()?;
-        self.bytes_received = self
-            .bytes_received
-            .saturating_add(HEADER_LEN as u64 + header.payload_length as u64);
+        self.bytes_received.fetch_add(
+            HEADER_LEN as u64 + header.payload_length as u64,
+            Ordering::Relaxed,
+        );
         let event = decode_frame(header, &payload, &mut self.dict, &mut self.registry)?;
         match event {
             ServerEvent::ServerInfo(info) => {
@@ -470,6 +485,7 @@ impl Reader {
             builder: QueryRequest::builder(sql),
             error: None,
             on_failover_reset: None,
+            _not_send: std::marker::PhantomData,
         }
     }
 }
@@ -539,6 +555,13 @@ type FailoverResetCallback<'r> = Box<dyn FnMut(&FailoverEvent) + 'r>;
 
 /// Borrows a `Reader` exclusively while the query is being constructed and
 /// (eventually) the cursor is live.
+///
+/// `ReaderQuery` is unconditionally `!Send`. The failover-reset callback
+/// can capture non-`Send` state (the C FFI trampoline captures
+/// `*mut c_void` `user_data`), so allowing the type to migrate threads
+/// based on whether a callback is currently installed would be a leaky
+/// abstraction. The `_not_send` marker pins the choice regardless of
+/// callback presence.
 pub struct ReaderQuery<'r> {
     reader: &'r mut Reader,
     builder: QueryRequestBuilder,
@@ -548,6 +571,8 @@ pub struct ReaderQuery<'r> {
     /// Optional handler called every time the cursor reconnects after a
     /// transport-level failure (see [`FailoverEvent`]).
     on_failover_reset: Option<FailoverResetCallback<'r>>,
+    /// Pin `!Send` regardless of whether the callback is installed.
+    _not_send: std::marker::PhantomData<*const ()>,
 }
 
 macro_rules! bind_method {
@@ -777,6 +802,7 @@ impl<'r> ReaderQuery<'r> {
             encoded_request,
             on_failover_reset: self.on_failover_reset,
             failover_resets: 0,
+            _not_send: std::marker::PhantomData,
         })
     }
 }
@@ -820,6 +846,13 @@ pub enum Terminal {
 /// `next_batch` advances the stream by one batch, returning `None` once a
 /// terminal frame arrives (which is then accessible via [`Cursor::terminal`]).
 /// `cancel` sends a `CANCEL` frame and drains until the server's terminal.
+///
+/// `Cursor` is unconditionally `!Send`. The failover-reset callback can
+/// capture non-`Send` state (the C FFI trampoline captures
+/// `*mut c_void` `user_data`); pinning `!Send` regardless of whether a
+/// callback is currently installed avoids a leaky abstraction whereby
+/// a Cursor that happens not to have a callback would be `Send` and
+/// then suddenly stop being so when one is installed.
 pub struct Cursor<'r> {
     reader: &'r mut Reader,
     request_id: i64,
@@ -865,6 +898,8 @@ pub struct Cursor<'r> {
     /// surfaced via the `Err` return and don't need a structured
     /// representation here.
     done: bool,
+    /// Pin `!Send` regardless of whether the callback is installed.
+    _not_send: std::marker::PhantomData<*const ()>,
 }
 
 impl<'r> Cursor<'r> {
@@ -881,7 +916,7 @@ impl<'r> Cursor<'r> {
     /// callers holding the cursor's mutable borrow on the reader can
     /// still observe the connection-level CREDIT-bytes counter.
     pub fn credit_granted_total(&self) -> u64 {
-        self.reader.credit_granted_total
+        self.reader.credit_granted_total.load(Ordering::Relaxed)
     }
 
     /// Advance the cursor by one batch. Returns `Ok(None)` when the stream
@@ -959,10 +994,10 @@ impl<'r> Cursor<'r> {
             // Account for decode time on both arms — the error path is
             // rare and terminal, but skipping the sample makes the
             // metric subtly biased toward "successful decodes are slow."
-            self.reader.decode_ns = self
-                .reader
-                .decode_ns
-                .saturating_add(t1.elapsed().as_nanos());
+            self.reader.decode_ns.fetch_add(
+                u64::try_from(t1.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
             let event = match decode_result {
                 Ok(ev) => ev,
                 Err(e) => {
@@ -1118,9 +1153,14 @@ impl<'r> Cursor<'r> {
     ) -> Result<(crate::egress::wire::header::FrameHeader, bytes::Bytes)> {
         let t0 = std::time::Instant::now();
         let (header, payload) = self.reader.transport_mut()?.read_frame()?;
-        self.reader.read_ns = self.reader.read_ns.saturating_add(t0.elapsed().as_nanos());
+        self.reader.read_ns.fetch_add(
+            u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
         let wire_bytes = HEADER_LEN as u64 + header.payload_length as u64;
-        self.reader.bytes_received = self.reader.bytes_received.saturating_add(wire_bytes);
+        self.reader
+            .bytes_received
+            .fetch_add(wire_bytes, Ordering::Relaxed);
         Ok((header, payload))
     }
 
@@ -1385,10 +1425,9 @@ impl<'r> Cursor<'r> {
         payload.extend_from_slice(&self.request_id.to_le_bytes());
         varint::encode_u64(additional_bytes, &mut payload);
         self.reader.transport_mut()?.write_message(&payload)?;
-        self.reader.credit_granted_total = self
-            .reader
+        self.reader
             .credit_granted_total
-            .saturating_add(additional_bytes);
+            .fetch_add(additional_bytes, Ordering::Relaxed);
         Ok(())
     }
 

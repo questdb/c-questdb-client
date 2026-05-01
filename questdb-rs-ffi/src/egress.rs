@@ -476,37 +476,64 @@ pub unsafe extern "C" fn line_reader_close(reader: *mut line_reader) {
 }
 
 /// Cumulative bytes successfully read from the wire across the reader's
-/// lifetime (header + payload, before decoding).
+/// lifetime (header + payload, before decoding). Returns `0` for a NULL
+/// handle (defense-in-depth — passing NULL is a contract violation).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_bytes_received(reader: *const line_reader) -> u64 {
-    unsafe { (*(*reader).0.get()).bytes_received() }
+    unsafe {
+        if reader.is_null() {
+            return 0;
+        }
+        (*(*reader).0.get()).bytes_received()
+    }
 }
 
 /// Cumulative bytes of CREDIT this reader has granted the server across
-/// every cursor on this connection.
+/// every cursor on this connection. Returns `0` for a NULL handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_credit_granted_total(reader: *const line_reader) -> u64 {
-    unsafe { (*(*reader).0.get()).credit_granted_total() }
+    unsafe {
+        if reader.is_null() {
+            return 0;
+        }
+        (*(*reader).0.get()).credit_granted_total()
+    }
 }
 
 /// Cumulative wall-clock nanoseconds spent in `read` calls. Saturates at
-/// `u64::MAX` (rust returns `u128`; that overflow corresponds to ~584 years).
+/// `u64::MAX` (~584 years). Returns `0` for a NULL handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_read_ns(reader: *const line_reader) -> u64 {
-    unsafe { u128_to_u64_sat((*(*reader).0.get()).read_ns()) }
+    unsafe {
+        if reader.is_null() {
+            return 0;
+        }
+        (*(*reader).0.get()).read_ns()
+    }
 }
 
 /// Cumulative wall-clock nanoseconds spent decoding frames. Saturates at
-/// `u64::MAX`.
+/// `u64::MAX`. Returns `0` for a NULL handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_decode_ns(reader: *const line_reader) -> u64 {
-    unsafe { u128_to_u64_sat((*(*reader).0.get()).decode_ns()) }
+    unsafe {
+        if reader.is_null() {
+            return 0;
+        }
+        (*(*reader).0.get()).decode_ns()
+    }
 }
 
-/// Reset the cumulative `read_ns` / `decode_ns` counters to zero.
+/// Reset the cumulative `read_ns` / `decode_ns` counters to zero. No-op
+/// for a NULL handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_reset_timing(reader: *mut line_reader) {
-    unsafe { (*(*reader).0.get()).reset_timing() }
+    unsafe {
+        if reader.is_null() {
+            return;
+        }
+        (*(*reader).0.get()).reset_timing()
+    }
 }
 
 /// Get the negotiated QWP server version (1..=`HIGHEST_KNOWN_VERSION`).
@@ -929,7 +956,17 @@ pub unsafe extern "C" fn line_reader_query_on_failover_reset(
         let trampoline = move |event: &FailoverEvent| {
             if let Some(c_cb) = callback {
                 let opaque = event as *const FailoverEvent as *const line_reader_failover_event;
-                c_cb(opaque, user_data)
+                // The user callback is C code; it cannot itself panic, but it
+                // may re-enter Rust (e.g. by calling a stat getter — itself a
+                // contract violation but still possible) and that re-entrant
+                // path may panic. An unwind through this `extern "C"` frame
+                // would be UB, so catch and abort. C++ users get the same
+                // protection from the wrapper's noexcept trampoline.
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c_cb(opaque, user_data)));
+                if result.is_err() {
+                    std::process::abort();
+                }
             }
         };
         mutate_query(query, |q| q.on_failover_reset(trampoline));
@@ -985,9 +1022,17 @@ pub unsafe extern "C" fn line_reader_query_new(
         // than silently producing two `&mut Reader` borrows. A bare
         // `load`+`store` pair would let two threads both pass the
         // check.
+        //
+        // Success ordering is `AcqRel` (matching `_close`'s CAS at line
+        // 458): we both `Acquire` any prior writes that the previous
+        // owner-thread released via `_query_free` / `_cursor_free`, and
+        // `Release` so that the imminent mutations through the
+        // laundered `&mut Reader` are properly published to whichever
+        // thread next observes `active=false`. `Acquire`-only on the
+        // success arm would skip the `Release` half of that handover.
         if (*reader)
             .1
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Acquire)
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
             set_reader_err(
@@ -1172,6 +1217,17 @@ where
     F: FnOnce(ReaderQuery<'static>) -> ReaderQuery<'static>,
 {
     unsafe {
+        // NULL handle is a contract violation. Match the existing
+        // `eprintln + abort` policy used for NULL `value` arguments in
+        // `bind_binary` / `bind_uuid` / `bind_decimal128` / etc., rather
+        // than silently dereferencing into UB.
+        if query.is_null() {
+            eprintln!(
+                "line_reader_query_bind_*: NULL query handle. \
+                 This is a contract violation; aborting."
+            );
+            std::process::abort();
+        }
         if (*query).deferred_err.is_some() {
             return;
         }
@@ -1540,9 +1596,33 @@ pub unsafe extern "C" fn line_reader_cursor_next_batch(
         // `c.current_batch` below; the explicit binding (`inner`) keeps
         // borrowck happy across the match.
         let inner: &mut Cursor<'static> = c.cursor_for_mut();
-        match inner.next_batch() {
-            Ok(Some(batch)) => {
-                let batch_static: BatchView<'static> = std::mem::transmute(batch);
+        // The decoder pipeline (varint parse, schema/dict bookkeeping,
+        // Gorilla decode, validity walks) contains panic sites that an
+        // unwind would propagate through this `extern "C"` frame — UB.
+        // Catch and abort, matching the policy in `_query_new` and
+        // `_query_execute`. The lifetime launder happens INSIDE the
+        // closure: `BatchView<'_>` borrows from `inner`, which the
+        // closure can't return as a borrow of a captured variable. The
+        // launder is sound for the same reason as in `_query_new` —
+        // the cursor (and therefore the batch's backing buffers) lives
+        // at least as long as the FFI call sequence ends with
+        // `_cursor_free`.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            match inner.next_batch() {
+                Ok(Some(batch)) => {
+                    let batch_static: BatchView<'static> = std::mem::transmute(batch);
+                    Ok(Some(batch_static))
+                }
+                Ok(None) => Ok(None),
+                Err(e) => Err(e),
+            }
+        }));
+        let next = match result {
+            Ok(r) => r,
+            Err(_) => std::process::abort(),
+        };
+        match next {
+            Ok(Some(batch_static)) => {
                 c.current_batch = Some(batch_static);
                 1
             }
@@ -3008,7 +3088,15 @@ pub unsafe extern "C" fn line_reader_cursor_cancel(
     unsafe {
         // Routes through `cursor_for_mut` to maintain the BatchView /
         // &mut Cursor exclusion invariant — see line_reader_cursor docs.
-        match (*cursor).cursor_for_mut().cancel() {
+        // `cancel()` runs the drain loop which can panic (decoder paths);
+        // catch and abort to keep panics from crossing the FFI boundary.
+        let inner = (*cursor).cursor_for_mut();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inner.cancel()));
+        let res = match result {
+            Ok(r) => r,
+            Err(_) => std::process::abort(),
+        };
+        match res {
             Ok(()) => true,
             Err(e) => {
                 *err_out = Box::into_raw(Box::new(line_reader_error(e)));
@@ -3028,7 +3116,17 @@ pub unsafe extern "C" fn line_reader_cursor_add_credit(
 ) -> bool {
     unsafe {
         // Routes through `cursor_for_mut` — see line_reader_cursor docs.
-        match (*cursor).cursor_for_mut().add_credit(additional_bytes) {
+        // Catch any unwind out of `add_credit` to keep panics from crossing
+        // the FFI boundary.
+        let inner = (*cursor).cursor_for_mut();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            inner.add_credit(additional_bytes)
+        }));
+        let res = match result {
+            Ok(r) => r,
+            Err(_) => std::process::abort(),
+        };
+        match res {
             Ok(()) => true,
             Err(e) => {
                 *err_out = Box::into_raw(Box::new(line_reader_error(e)));

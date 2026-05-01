@@ -825,12 +825,24 @@ fn decode_validity(
     parent: &Bytes,
     row_count: usize,
 ) -> Result<Option<Bytes>> {
+    // Per the QWP wire spec the null_flag is 0x00 (no bitmap) or 0x01
+    // (bitmap follows). Reject any other byte rather than silently
+    // treating it as 0x01 — matches the strict-mask handling in
+    // `cache_reset` decoding and surfaces server-side or wire-corruption
+    // bugs immediately instead of hiding them.
     let null_flag = r.read_u8()?;
-    if null_flag == 0 {
-        return Ok(None);
+    match null_flag {
+        0 => Ok(None),
+        1 => {
+            let bitmap_len = row_count.div_ceil(8);
+            Ok(Some(read_owned(r, parent, bitmap_len)?))
+        }
+        other => Err(fmt!(
+            ProtocolError,
+            "unknown null_flag 0x{:02X}; expected 0x00 or 0x01",
+            other
+        )),
     }
-    let bitmap_len = row_count.div_ceil(8);
-    Ok(Some(read_owned(r, parent, bitmap_len)?))
 }
 
 /// Read `non_null_count × elem_size` compact bytes from the wire and write
@@ -935,8 +947,16 @@ fn decode_gorilla_temporal(
     let consumed = decoder.bytes_consumed();
     r.advance(consumed)?;
 
-    // Densify into row_count × 8 with null slots zeroed.
-    let mut dense = vec![0u8; row_count * 8];
+    // Densify into row_count × 8 with null slots zeroed. `checked_mul`
+    // mirrors the guard in `densify_fixed` — `row_count` comes from a
+    // wire varint that has no per-row size cap, so a 32-bit `usize`
+    // (or, more theoretically, a malformed frame on 64-bit) could wrap
+    // and produce an undersized buffer that the per-row write below
+    // then overruns.
+    let dense_len = row_count
+        .checked_mul(8)
+        .ok_or_else(|| fmt!(ProtocolError, "gorilla temporal column size overflow"))?;
+    let mut dense = vec![0u8; dense_len];
     let mut next = 0usize;
     for row in 0..row_count {
         if !is_null_at_opt(&validity, row) {

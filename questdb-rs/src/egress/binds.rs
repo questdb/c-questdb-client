@@ -300,6 +300,15 @@ pub fn encode_bind(bind: &Bind, out: &mut Vec<u8>) -> Result<()> {
         }
         Bind::Uuid(b) => out.extend_from_slice(b),
         Bind::Long256(b) => out.extend_from_slice(b),
+        // The Java reference server rejects IPv4, BINARY, SYMBOL, and
+        // arrays as bind values (see `check_bindable` below). Both
+        // `Bind::Ipv4` and `Bind::Binary` arms here are reachable only
+        // if the bind-set is encoded without going through
+        // `QueryRequestBuilder::build` (which calls `check_bindable`).
+        // We keep wire encodings here for completeness and forward
+        // compatibility — if the server later relaxes its rejection
+        // list, just drop the offending kind from `check_bindable` and
+        // the encoder is already correct.
         Bind::Ipv4(addr) => out.extend_from_slice(&u32::from(*addr).to_le_bytes()),
         Bind::Decimal64 { value, .. } => out.extend_from_slice(&value.to_le_bytes()),
         Bind::Decimal128 { value, .. } => out.extend_from_slice(&value.to_le_bytes()),

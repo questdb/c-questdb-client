@@ -189,7 +189,12 @@ impl<'a, T: FixedWidth> FixedColumn<'a, T> {
 
     /// Decode the value at `row`. Caller should consult [`is_null`](Self::is_null)
     /// separately; this returns the underlying bit-pattern regardless.
+    ///
+    /// # Panics
+    /// Panics if `row >= self.len()`. `#[track_caller]` makes the panic
+    /// point at the offending call site rather than into this accessor.
     #[inline]
+    #[track_caller]
     pub fn value(&self, row: usize) -> T {
         let s = row * T::SIZE;
         T::from_le(&self.raw[s..s + T::SIZE])
@@ -265,7 +270,11 @@ impl<'a, const N: usize> FixedBytesColumn<'a, N> {
     }
 
     /// `&[u8; N]` for the requested row.
+    ///
+    /// # Panics
+    /// Panics if `row >= self.len()`.
     #[inline]
+    #[track_caller]
     pub fn value(&self, row: usize) -> &'a [u8; N] {
         let s = row * N;
         (&self.raw[s..s + N])
@@ -384,7 +393,11 @@ impl<'a> Decimal64Column<'a> {
     }
 
     /// Mantissa for `row`. Use `scale()` to interpret the decimal point.
+    ///
+    /// # Panics
+    /// Panics if `row >= self.len()`.
     #[inline]
+    #[track_caller]
     pub fn value(&self, row: usize) -> i64 {
         self.values.value(row)
     }
@@ -481,7 +494,11 @@ impl<'a> VarcharColumn<'a> {
     }
 
     /// UTF-8 string for `row`. `None` for null rows.
+    ///
+    /// # Panics
+    /// Panics if `row >= self.len()`.
     #[inline]
+    #[track_caller]
     pub fn value(&self, row: usize) -> Option<&'a str> {
         let bytes = self.inner.slice(row)?;
         // Safety: `VarcharColumn::new` is an `unsafe fn` whose contract
@@ -533,7 +550,12 @@ impl<'a> BinaryColumn<'a> {
         self.inner.data
     }
 
+    /// Raw bytes for `row`. `None` for null rows.
+    ///
+    /// # Panics
+    /// Panics if `row >= self.len()`.
     #[inline]
+    #[track_caller]
     pub fn value(&self, row: usize) -> Option<&'a [u8]> {
         self.inner.slice(row)
     }
@@ -602,6 +624,10 @@ impl<'a> GeohashColumn<'a> {
     }
 
     /// Zero-extend the row's `byte_width` LE bytes to a `u64`.
+    ///
+    /// # Panics
+    /// Panics if `row >= self.len()`.
+    #[track_caller]
     pub fn value(&self, row: usize) -> u64 {
         let bw = self.byte_width as usize;
         let s = row * bw;
@@ -660,7 +686,11 @@ impl<'a> Decimal128Column<'a> {
 
     /// Mantissa for `row` as `i128`. Use [`scale`](Self::scale) to
     /// interpret the decimal point.
+    ///
+    /// # Panics
+    /// Panics if `row >= self.len()`.
     #[inline]
+    #[track_caller]
     pub fn value(&self, row: usize) -> i128 {
         let s = row * 16;
         i128::from_le_bytes(self.raw[s..s + 16].try_into().expect("16-byte row"))
@@ -714,7 +744,11 @@ impl<'a> Decimal256Column<'a> {
     }
 
     /// Raw 32 LE bytes for `row`. Apply scale via a wider decimal type.
+    ///
+    /// # Panics
+    /// Panics if `row >= self.len()`.
     #[inline]
+    #[track_caller]
     pub fn value(&self, row: usize) -> &'a [u8; 32] {
         let s = row * 32;
         (&self.raw[s..s + 32]).try_into().expect("32-byte row")

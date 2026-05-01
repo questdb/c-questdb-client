@@ -124,16 +124,24 @@ impl WsTransport {
         let (socket, response) = tungstenite::client_tls_with_config(request, tcp, None, connector)
             .map_err(map_handshake_error)?;
 
-        let server_version = read_version_header(response.headers())?;
-        if server_version > config.max_version {
-            return Err(fmt!(
-                UnsupportedServer,
-                "server negotiated QWP version {} but client advertised max {}",
-                server_version,
-                config.max_version
-            ));
-        }
-
+        // Build the `WsTransport` struct *before* the version check so
+        // any failure path (here or elsewhere) goes through `Drop for
+        // WsTransport`, which sends the WS Close frame and shuts the
+        // socket down cleanly. A bare `socket` drop closes the FD but
+        // skips the courtesy Close — the server then sees a half-closed
+        // TCP and has to wait for its read timeout to clean up.
+        let server_version = match read_version_header(response.headers()) {
+            Ok(v) => v,
+            Err(e) => {
+                let mut transport = WsTransport {
+                    socket,
+                    server_version: 0,
+                };
+                set_tcp_write_timeout(transport.socket.get_mut(), Some(WRITE_TIMEOUT));
+                drop(transport);
+                return Err(e);
+            }
+        };
         let mut transport = WsTransport {
             socket,
             server_version,
@@ -144,6 +152,17 @@ impl WsTransport {
         // backoff schedule, and making `Cursor::cancel()` look like
         // it's hung on a network blip. See `WRITE_TIMEOUT`.
         set_tcp_write_timeout(transport.socket.get_mut(), Some(WRITE_TIMEOUT));
+        if server_version > config.max_version {
+            // Drop runs the graceful Close (set_tcp_write_timeout above
+            // ensures we don't block forever on a misbehaving peer).
+            drop(transport);
+            return Err(fmt!(
+                UnsupportedServer,
+                "server negotiated QWP version {} but client advertised max {}",
+                server_version,
+                config.max_version
+            ));
+        }
         Ok(transport)
     }
 

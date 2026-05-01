@@ -560,29 +560,47 @@ public:
      */
     query prepare(::questdb::ingress::utf8_view sql);
 
-    /** Cumulative bytes successfully read from the wire. */
-    uint64_t bytes_received() const noexcept
+    /** Cumulative bytes successfully read from the wire.
+     *  @throws line_reader_error if this reader has been moved from. */
+    uint64_t bytes_received() const
     {
+        ensure_impl();
         return ::line_reader_bytes_received(_impl);
     }
-    /** Cumulative CREDIT bytes granted to the server on this connection. */
-    uint64_t credit_granted_total() const noexcept
+    /** Cumulative CREDIT bytes granted to the server on this connection.
+     *  @throws line_reader_error if this reader has been moved from. */
+    uint64_t credit_granted_total() const
     {
+        ensure_impl();
         return ::line_reader_credit_granted_total(_impl);
     }
-    /** Cumulative `read` time in nanoseconds (saturating). */
-    uint64_t read_ns() const noexcept { return ::line_reader_read_ns(_impl); }
-    /** Cumulative decode time in nanoseconds (saturating). */
-    uint64_t decode_ns() const noexcept
+    /** Cumulative `read` time in nanoseconds (saturating).
+     *  @throws line_reader_error if this reader has been moved from. */
+    uint64_t read_ns() const
     {
+        ensure_impl();
+        return ::line_reader_read_ns(_impl);
+    }
+    /** Cumulative decode time in nanoseconds (saturating).
+     *  @throws line_reader_error if this reader has been moved from. */
+    uint64_t decode_ns() const
+    {
+        ensure_impl();
         return ::line_reader_decode_ns(_impl);
     }
-    void reset_timing() noexcept { ::line_reader_reset_timing(_impl); }
+    /** @throws line_reader_error if this reader has been moved from. */
+    void reset_timing()
+    {
+        ensure_impl();
+        ::line_reader_reset_timing(_impl);
+    }
 
     /** Negotiated QWP server version.
-     *  @throws line_reader_error if the connection is not yet established. */
+     *  @throws line_reader_error if the connection is not yet established
+     *          or this reader has been moved from. */
     uint8_t server_version() const
     {
+        ensure_impl();
         uint8_t v = 0;
         line_reader_error::wrapped_call(
             ::line_reader_server_version, _impl, &v);
@@ -590,28 +608,47 @@ public:
     }
 
     /** Last-seen `SERVER_INFO`, or empty for v1 servers. The view is
-     *  invalidated by any reader operation that may reconnect. */
-    server_info_view server_info() const noexcept
+     *  invalidated by any reader operation that may reconnect.
+     *  @throws line_reader_error if this reader has been moved from. */
+    server_info_view server_info() const
     {
+        ensure_impl();
         return server_info_view{::line_reader_current_server_info(_impl)};
     }
 
-    /** Host of the endpoint the reader is currently connected to. */
-    std::string_view current_host() const noexcept
+    /** Host of the endpoint the reader is currently connected to.
+     *  @throws line_reader_error if this reader has been moved from. */
+    std::string_view current_host() const
     {
+        ensure_impl();
         const char* buf = nullptr;
         size_t len = 0;
         ::line_reader_current_addr_host(_impl, &buf, &len);
         return {buf, len};
     }
-    /** Port of the endpoint the reader is currently connected to. */
-    uint16_t current_port() const noexcept
+    /** Port of the endpoint the reader is currently connected to.
+     *  @throws line_reader_error if this reader has been moved from. */
+    uint16_t current_port() const
     {
+        ensure_impl();
         return ::line_reader_current_addr_port(_impl);
     }
 
 private:
     explicit reader(::line_reader* impl) noexcept : _impl{impl} {}
+
+    /// Throw `line_reader_error{invalid_api_call}` if `_impl` is null.
+    /// A null `_impl` means the reader has been moved from or already
+    /// closed — calling any method that derefs it would pass `nullptr`
+    /// into the C layer where `(*reader).0.get()` is instant UB. Throwing
+    /// instead keeps the C++ surface defined for misuse.
+    void ensure_impl() const
+    {
+        if (!_impl)
+            throw line_reader_error{
+                error_code::invalid_api_call,
+                "reader has been closed or moved from."};
+    }
 
     ::line_reader* _impl;
     friend class cursor;
@@ -855,11 +892,21 @@ public:
         // tracked here in `_callback`; on `execute()` we transfer it to
         // the cursor. On query free without execute, the unique_ptr drops
         // the closure.
-        _callback = std::make_unique<failover_callback>(std::move(cb));
+        //
+        // Allocation order matters: build the new unique_ptr into a
+        // local first, register it with the C side, and only then swap
+        // it into `_callback`. A previous version assigned to `_callback`
+        // first, which would destroy the prior payload before allocating
+        // the new one — if `make_unique` then threw (OOM under a strict
+        // allocator), the C side would be left holding a dangling
+        // pointer to the destroyed callback.
+        auto new_callback =
+            std::make_unique<failover_callback>(std::move(cb));
         ::line_reader_query_on_failover_reset(
             _impl,
             &query::trampoline,
-            _callback.get());
+            new_callback.get());
+        _callback = std::move(new_callback);
         return *this;
     }
 
@@ -953,24 +1000,30 @@ public:
      */
     bool next_batch()
     {
+        ensure_impl();
         ::line_reader_error* c_err{nullptr};
         const int rc = ::line_reader_cursor_next_batch(_impl, &c_err);
         if (rc < 0) throw line_reader_error::from_c(c_err);
         return rc > 0;
     }
 
-    size_t row_count() const noexcept
+    /** @throws line_reader_error if this cursor has been moved from. */
+    size_t row_count() const
     {
+        ensure_impl();
         return ::line_reader_cursor_row_count(_impl);
     }
 
-    size_t column_count() const noexcept
+    /** @throws line_reader_error if this cursor has been moved from. */
+    size_t column_count() const
     {
+        ensure_impl();
         return ::line_reader_cursor_column_count(_impl);
     }
 
     egress::column_kind column_kind(size_t col_idx) const
     {
+        ensure_impl();
         ::line_reader_column_kind k{};
         line_reader_error::wrapped_call(
             ::line_reader_cursor_column_kind, _impl, col_idx, &k);
@@ -986,6 +1039,7 @@ public:
      */
     std::string_view column_name(size_t col_idx) const
     {
+        ensure_impl();
         const char* buf = nullptr;
         size_t len = 0;
         line_reader_error::wrapped_call(
@@ -996,6 +1050,7 @@ public:
     /** Read a `BOOLEAN` value; `std::nullopt` if NULL. */
     nullable<bool> get_bool(size_t col_idx, size_t row_idx) const
     {
+        ensure_impl();
         bool v = false, is_null = false;
         line_reader_error::wrapped_call(
             ::line_reader_cursor_get_bool,
@@ -1014,6 +1069,7 @@ public:
      */
     nullable<int64_t> get_i64(size_t col_idx, size_t row_idx) const
     {
+        ensure_impl();
         int64_t v = 0;
         bool is_null = false;
         line_reader_error::wrapped_call(
@@ -1029,6 +1085,7 @@ public:
     /** Read a `DOUBLE` value; `std::nullopt` if NULL. */
     nullable<double> get_f64(size_t col_idx, size_t row_idx) const
     {
+        ensure_impl();
         double v = 0.0;
         bool is_null = false;
         line_reader_error::wrapped_call(
@@ -1044,6 +1101,7 @@ public:
     /** Read a `BYTE` value. */
     nullable<int8_t> get_i8(size_t col_idx, size_t row_idx) const
     {
+        ensure_impl();
         int8_t v = 0;
         bool is_null = false;
         line_reader_error::wrapped_call(
@@ -1054,6 +1112,7 @@ public:
     /** Read a `SHORT` value. */
     nullable<int16_t> get_i16(size_t col_idx, size_t row_idx) const
     {
+        ensure_impl();
         int16_t v = 0;
         bool is_null = false;
         line_reader_error::wrapped_call(
@@ -1064,6 +1123,7 @@ public:
     /** Read an `INT` value. Throws on `IPV4` — use `get_ipv4`. */
     nullable<int32_t> get_i32(size_t col_idx, size_t row_idx) const
     {
+        ensure_impl();
         int32_t v = 0;
         bool is_null = false;
         line_reader_error::wrapped_call(
@@ -1075,6 +1135,7 @@ public:
      *  `(a<<24)|(b<<16)|(c<<8)|d`. */
     nullable<uint32_t> get_ipv4(size_t col_idx, size_t row_idx) const
     {
+        ensure_impl();
         uint32_t v = 0;
         bool is_null = false;
         line_reader_error::wrapped_call(
@@ -1085,6 +1146,7 @@ public:
     /** Read a `FLOAT` value. */
     nullable<float> get_f32(size_t col_idx, size_t row_idx) const
     {
+        ensure_impl();
         float v = 0.0f;
         bool is_null = false;
         line_reader_error::wrapped_call(
@@ -1095,6 +1157,7 @@ public:
     /** Read a `CHAR` value (16-bit UTF-16 code unit). */
     nullable<uint16_t> get_char(size_t col_idx, size_t row_idx) const
     {
+        ensure_impl();
         uint16_t v = 0;
         bool is_null = false;
         line_reader_error::wrapped_call(
@@ -1106,6 +1169,7 @@ public:
     nullable<std::array<uint8_t, 16>> get_uuid(
         size_t col_idx, size_t row_idx) const
     {
+        ensure_impl();
         std::array<uint8_t, 16> v{};
         bool is_null = false;
         line_reader_error::wrapped_call(
@@ -1123,6 +1187,7 @@ public:
     nullable<std::array<uint8_t, 32>> get_long256(
         size_t col_idx, size_t row_idx) const
     {
+        ensure_impl();
         std::array<uint8_t, 32> v{};
         bool is_null = false;
         line_reader_error::wrapped_call(
@@ -1144,6 +1209,7 @@ public:
     nullable<std::string_view> get_varchar(
         size_t col_idx, size_t row_idx) const
     {
+        ensure_impl();
         const char* buf = nullptr;
         size_t len = 0;
         bool is_null = false;
@@ -1161,6 +1227,7 @@ public:
 
     nullable<binary_view> get_binary(size_t col_idx, size_t row_idx) const
     {
+        ensure_impl();
         const uint8_t* buf = nullptr;
         size_t len = 0;
         bool is_null = false;
@@ -1181,6 +1248,7 @@ public:
     nullable<std::string_view> get_symbol(
         size_t col_idx, size_t row_idx) const
     {
+        ensure_impl();
         const char* buf = nullptr;
         size_t len = 0;
         bool is_null = false;
@@ -1199,6 +1267,7 @@ public:
     /** Read a `DECIMAL64` value (mantissa + scale). */
     nullable<decimal64> get_decimal64(size_t col_idx, size_t row_idx) const
     {
+        ensure_impl();
         decimal64 d{};
         bool is_null = false;
         line_reader_error::wrapped_call(
@@ -1216,6 +1285,7 @@ public:
     /** Read a `DECIMAL128` value (i64 limbs low/high + scale). */
     nullable<decimal128> get_decimal128(size_t col_idx, size_t row_idx) const
     {
+        ensure_impl();
         decimal128 d{};
         bool is_null = false;
         line_reader_error::wrapped_call(
@@ -1234,6 +1304,7 @@ public:
     /** Read a `DECIMAL256` value (32 LE bytes + scale). */
     nullable<decimal256> get_decimal256(size_t col_idx, size_t row_idx) const
     {
+        ensure_impl();
         decimal256 d{};
         bool is_null = false;
         line_reader_error::wrapped_call(
@@ -1251,6 +1322,7 @@ public:
     /** Read a `GEOHASH` value (zero-extended u64 + precision_bits). */
     nullable<geohash> get_geohash(size_t col_idx, size_t row_idx) const
     {
+        ensure_impl();
         geohash g{};
         bool is_null = false;
         line_reader_error::wrapped_call(
@@ -1269,6 +1341,7 @@ public:
     nullable<double_array_view> get_double_array(
         size_t col_idx, size_t row_idx) const
     {
+        ensure_impl();
         ::line_reader_double_array_view raw{};
         bool is_null = false;
         line_reader_error::wrapped_call(
@@ -1289,6 +1362,7 @@ public:
     nullable<double> get_double_array_element(
         size_t col_idx, size_t row_idx, size_t flat_idx) const
     {
+        ensure_impl();
         double v = 0.0;
         bool is_null = false;
         line_reader_error::wrapped_call(
@@ -1307,6 +1381,7 @@ public:
     nullable<long_array_view> get_long_array(
         size_t col_idx, size_t row_idx) const
     {
+        ensure_impl();
         ::line_reader_long_array_view raw{};
         bool is_null = false;
         line_reader_error::wrapped_call(
@@ -1327,6 +1402,7 @@ public:
     nullable<int64_t> get_long_array_element(
         size_t col_idx, size_t row_idx, size_t flat_idx) const
     {
+        ensure_impl();
         int64_t v = 0;
         bool is_null = false;
         line_reader_error::wrapped_call(
@@ -1348,6 +1424,7 @@ public:
      */
     validity_view column_validity(size_t col_idx) const
     {
+        ensure_impl();
         const uint8_t* buf = nullptr;
         size_t len = 0;
         line_reader_error::wrapped_call(
@@ -1357,73 +1434,95 @@ public:
 
     // ---- Introspection -----------------------------------------------------
 
-    int64_t request_id() const noexcept
+    /** @throws line_reader_error if this cursor has been moved from. */
+    int64_t request_id() const
     {
+        ensure_impl();
         return ::line_reader_cursor_request_id(_impl);
     }
-    uint64_t credit_granted_total() const noexcept
+    /** @throws line_reader_error if this cursor has been moved from. */
+    uint64_t credit_granted_total() const
     {
+        ensure_impl();
         return ::line_reader_cursor_credit_granted_total(_impl);
     }
-    uint32_t failover_resets() const noexcept
+    /** @throws line_reader_error if this cursor has been moved from. */
+    uint32_t failover_resets() const
     {
+        ensure_impl();
         return ::line_reader_cursor_failover_resets(_impl);
     }
-    std::string_view current_host() const noexcept
+    /** @throws line_reader_error if this cursor has been moved from. */
+    std::string_view current_host() const
     {
+        ensure_impl();
         const char* buf = nullptr;
         size_t len = 0;
         ::line_reader_cursor_current_addr_host(_impl, &buf, &len);
         return {buf, len};
     }
-    uint16_t current_port() const noexcept
+    /** @throws line_reader_error if this cursor has been moved from. */
+    uint16_t current_port() const
     {
+        ensure_impl();
         return ::line_reader_cursor_current_addr_port(_impl);
     }
 
-    /** `request_id` of the current batch; `std::nullopt` if no batch loaded. */
-    nullable<int64_t> batch_request_id() const noexcept
+    /** `request_id` of the current batch; `std::nullopt` if no batch loaded.
+     *  @throws line_reader_error if this cursor has been moved from. */
+    nullable<int64_t> batch_request_id() const
     {
+        ensure_impl();
         int64_t v = 0;
         if (!::line_reader_cursor_batch_request_id(_impl, &v))
             return std::nullopt;
         return v;
     }
-    /** `batch_seq` of the current batch; `std::nullopt` if no batch loaded. */
-    nullable<uint64_t> batch_seq() const noexcept
+    /** `batch_seq` of the current batch; `std::nullopt` if no batch loaded.
+     *  @throws line_reader_error if this cursor has been moved from. */
+    nullable<uint64_t> batch_seq() const
     {
+        ensure_impl();
         uint64_t v = 0;
         if (!::line_reader_cursor_batch_seq(_impl, &v))
             return std::nullopt;
         return v;
     }
-    /** Per-batch wire flags; `std::nullopt` if no batch loaded. */
-    nullable<uint8_t> batch_flags() const noexcept
+    /** Per-batch wire flags; `std::nullopt` if no batch loaded.
+     *  @throws line_reader_error if this cursor has been moved from. */
+    nullable<uint8_t> batch_flags() const
     {
+        ensure_impl();
         uint8_t v = 0;
         if (!::line_reader_cursor_batch_flags(_impl, &v))
             return std::nullopt;
         return v;
     }
 
-    egress::terminal_kind terminal_kind() const noexcept
+    /** @throws line_reader_error if this cursor has been moved from. */
+    egress::terminal_kind terminal_kind() const
     {
+        ensure_impl();
         return static_cast<egress::terminal_kind>(
             ::line_reader_cursor_terminal_kind(_impl));
     }
 
-    /** If the terminal is `RESULT_END`, return its info; otherwise nullopt. */
-    nullable<terminal_end_info> terminal_end() const noexcept
+    /** If the terminal is `RESULT_END`, return its info; otherwise nullopt.
+     *  @throws line_reader_error if this cursor has been moved from. */
+    nullable<terminal_end_info> terminal_end() const
     {
+        ensure_impl();
         terminal_end_info info{};
         if (!::line_reader_cursor_terminal_end(
                 _impl, &info.final_seq, &info.total_rows))
             return std::nullopt;
         return info;
     }
-    /** If the terminal is `EXEC_DONE`, return its info; otherwise nullopt. */
-    nullable<terminal_exec_done_info> terminal_exec_done() const noexcept
+    /** If the terminal is `EXEC_DONE`, return its info; otherwise nullopt.
+     *  @throws line_reader_error if this cursor has been moved from. */
+    nullable<terminal_exec_done_info> terminal_exec_done() const
     {
+        ensure_impl();
         terminal_exec_done_info info{};
         if (!::line_reader_cursor_terminal_exec_done(
                 _impl, &info.op_type, &info.rows_affected))
@@ -1434,22 +1533,39 @@ public:
     // ---- Lifecycle ---------------------------------------------------------
 
     /** Send a CANCEL frame and drain the stream until terminal.
-     *  @throws line_reader_error on transport failure. */
+     *  @throws line_reader_error on transport failure or if this cursor
+     *          has been moved from. */
     void cancel()
     {
+        ensure_impl();
         line_reader_error::wrapped_call(::line_reader_cursor_cancel, _impl);
     }
 
     /** Grant additional CREDIT to the server.
-     *  @throws line_reader_error on transport failure. */
+     *  @throws line_reader_error on transport failure or if this cursor
+     *          has been moved from. */
     void add_credit(uint64_t additional_bytes)
     {
+        ensure_impl();
         line_reader_error::wrapped_call(
             ::line_reader_cursor_add_credit, _impl, additional_bytes);
     }
 
 private:
     explicit cursor(::line_reader_cursor* impl) noexcept : _impl{impl} {}
+
+    /// Throw `line_reader_error{invalid_api_call}` if `_impl` is null.
+    /// A null `_impl` means the cursor has been moved from or already
+    /// closed — calling any method that derefs it would pass `nullptr`
+    /// into the C layer where `&mut *cursor` is instant UB. Throwing
+    /// instead keeps the C++ surface defined for misuse.
+    void ensure_impl() const
+    {
+        if (!_impl)
+            throw line_reader_error{
+                error_code::invalid_api_call,
+                "cursor has been closed or moved from."};
+    }
 
     ::line_reader_cursor* _impl;
     /// Heap-stored failover callback transferred from `query::execute()`.
@@ -1462,6 +1578,7 @@ private:
 
 inline query reader::prepare(::questdb::ingress::utf8_view sql)
 {
+    ensure_impl();
     return query{line_reader_error::wrapped_call(
         ::line_reader_query_new, _impl, to_c_utf8(sql))};
 }
