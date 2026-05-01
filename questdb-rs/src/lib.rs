@@ -30,6 +30,7 @@ mod gai;
 
 pub mod ingress;
 
+#[cfg(feature = "_egress")]
 pub mod egress;
 
 pub use error::*;
