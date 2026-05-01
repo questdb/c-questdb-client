@@ -969,7 +969,7 @@ public:
         return ::line_reader_cursor_column_count(_impl);
     }
 
-    column_kind column_kind(size_t col_idx) const
+    egress::column_kind column_kind(size_t col_idx) const
     {
         ::line_reader_column_kind k{};
         line_reader_error::wrapped_call(
@@ -1406,7 +1406,7 @@ public:
         return v;
     }
 
-    terminal_kind terminal_kind() const noexcept
+    egress::terminal_kind terminal_kind() const noexcept
     {
         return static_cast<egress::terminal_kind>(
             ::line_reader_cursor_terminal_kind(_impl));
