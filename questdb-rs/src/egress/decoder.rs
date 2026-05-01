@@ -1216,11 +1216,15 @@ fn zstd_decompress_body(compressed: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn count_nulls(bitmap: &[u8], row_count: usize) -> usize {
-    let mut nulls = 0usize;
-    for r in 0..row_count {
-        if is_null_at(bitmap, r) {
-            nulls += 1;
-        }
+    let full_bytes = row_count >> 3;
+    let tail_bits = row_count & 7;
+    let mut nulls: usize = bitmap[..full_bytes]
+        .iter()
+        .map(|b| b.count_ones() as usize)
+        .sum();
+    if tail_bits != 0 {
+        let mask = (1u8 << tail_bits) - 1;
+        nulls += (bitmap[full_bytes] & mask).count_ones() as usize;
     }
     nulls
 }
