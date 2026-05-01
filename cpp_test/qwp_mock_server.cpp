@@ -29,6 +29,7 @@
 #include <ws2tcpip.h>
 #pragma comment(lib, "Ws2_32.lib")
 using socket_t = SOCKET;
+using ssize_t = std::intptr_t;
 #define INVALID_SOCKET_VALUE INVALID_SOCKET
 #define close_socket(s) closesocket(s)
 // Winsock spells the bidirectional shutdown constant differently.
@@ -852,6 +853,12 @@ struct MockServer::Impl
         }
 
         int64_t last_request_id = 0;
+#ifdef _MSC_VER
+#pragma warning(push)
+// MSVC C4456 fires spuriously on `auto* a = std::get_if<>(...)` in
+// successive `else if` branches even though each branch has its own scope.
+#pragma warning(disable : 4456)
+#endif
         for (const auto& action : script)
         {
             if (std::holds_alternative<ActionReject401>(action))
@@ -941,6 +948,9 @@ struct MockServer::Impl
                 return;
             }
         }
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 
         // Optional clean-close TBD; keep it simple — the reader's wait
         // for next frame on a closed socket already exits its loop.

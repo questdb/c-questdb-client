@@ -937,7 +937,7 @@ TEST_CASE("mock: get_double_array surfaces NULL row via std::nullopt")
 TEST_CASE("mock: get_char round-trip (u16 codepoint)")
 {
     qm::ColumnSpec c{"c", qm::COL_CHAR,
-                     qm::fixed_column_bytes(2, pack_le<uint16_t>({u'A', u'é'}))};
+                     qm::fixed_column_bytes(2, pack_le<uint16_t>({u'A', u'\u00E9'}))};
     qm::Script s = {
         qm::ActionSendServerInfo{},
         qm::ActionAwaitQueryRequest{},
@@ -954,7 +954,7 @@ TEST_CASE("mock: get_char round-trip (u16 codepoint)")
     REQUIRE(v0.has_value());
     CHECK(*v0 == uint16_t(u'A'));
     REQUIRE(v1.has_value());
-    CHECK(*v1 == uint16_t(u'é'));
+    CHECK(*v1 == uint16_t(u'\u00E9'));
 }
 
 TEST_CASE("mock: get_long256 round-trip (32 raw bytes)")

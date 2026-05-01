@@ -70,16 +70,26 @@ using namespace questdb::ingress::literals;
 namespace
 {
 
+// MSVC flags `std::getenv` as deprecated (C4996) in favour of `_dupenv_s`,
+// but the function is standard C/C++ and the test's usage is single-threaded.
+inline const char* env_or_null(const char* name)
+{
+#ifdef _MSC_VER
+#pragma warning(suppress : 4996)
+#endif
+    return std::getenv(name);
+}
+
 std::string broker_host()
 {
-    if (const char* h = std::getenv("QDB_LIVE_BROKER_HOST"))
+    if (const char* h = env_or_null("QDB_LIVE_BROKER_HOST"))
         return std::string{h};
     return "localhost";
 }
 
 uint16_t broker_http_port()
 {
-    if (const char* p = std::getenv("QDB_LIVE_BROKER_HTTP_PORT"))
+    if (const char* p = env_or_null("QDB_LIVE_BROKER_HTTP_PORT"))
         return static_cast<uint16_t>(std::atoi(p));
     return 9000;
 }
