@@ -1028,6 +1028,19 @@ pub unsafe extern "C" fn line_reader_query_new(
     err_out: *mut *mut line_reader_error,
 ) -> *mut line_reader_query {
     unsafe {
+        // NULL handle is a contract violation, but report it as a clean
+        // `InvalidApiCall` rather than SIGSEGV on the CAS deref below.
+        // Matches the defensive NULL-tolerance the reader stat getters
+        // (`_bytes_received`, `_credit_granted_total`, `_read_ns`,
+        // `_decode_ns`, `_reset_timing`, `_close`) already implement.
+        if reader.is_null() {
+            set_reader_err(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "line_reader_query_new: NULL reader handle",
+            );
+            return ptr::null_mut();
+        }
         // Compare-and-swap the active flag. The C contract forbids
         // concurrent calls on the same reader, so this is documented
         // user-side UB if it ever races — but a CAS at least gives a
@@ -1309,6 +1322,18 @@ pub unsafe extern "C" fn line_reader_query_bind_varchar(
     v: line_sender_utf8,
 ) {
     unsafe {
+        // NULL handle is a contract violation. Match `mutate_query`'s
+        // policy so the success and failure branches behave identically
+        // — otherwise a NULL handle paired with malformed UTF-8 would
+        // SIGSEGV on the deferred-error deref below instead of aborting
+        // cleanly.
+        if query.is_null() {
+            eprintln!(
+                "line_reader_query_bind_varchar: NULL query handle. \
+                 This is a contract violation; aborting."
+            );
+            std::process::abort();
+        }
         match validated_utf8(&v) {
             Ok(s) => {
                 let owned = s.to_owned();
