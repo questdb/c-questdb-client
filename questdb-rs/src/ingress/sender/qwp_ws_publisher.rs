@@ -35,7 +35,7 @@ use crate::ingress::buffer::{QwpBuffer, QwpWsEncodeScratch, SymbolGlobalDict};
 use super::qwp_ws_driver::{
     CloseOutcome, DeliveryOutcome, DriveOutcome, DriverError, ManualDriverPrototype,
     ManualDriverTransport, PublicationLog, QwpRejectedFrame, QwpWsPublicationStore,
-    ReconnectPolicy, SendCursor,
+    QwpWsSendCore,
 };
 use super::qwp_ws_queue::{QwpReceipt, QwpReceiptStatus};
 #[cfg(test)]
@@ -141,14 +141,7 @@ impl<Q: PublicationLog, T: ManualDriverTransport> QwpWsPublicationDriver<Q, T> {
         self.driver
     }
 
-    pub(crate) fn into_runner_parts(
-        self,
-    ) -> (
-        QwpWsPublicationStore<Q>,
-        SendCursor,
-        T,
-        ReconnectPolicy,
-    ) {
+    pub(crate) fn into_runner_parts(self) -> (QwpWsPublicationStore<Q>, QwpWsSendCore<T>) {
         self.driver.into_parts()
     }
 }

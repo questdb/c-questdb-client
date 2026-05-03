@@ -47,9 +47,9 @@ use super::qwp_ws_codec::{
 };
 use super::qwp_ws_driver::{
     BlockingQwpWsTransport, DriveOutcome, DriverError, ManualDriverPrototype,
-    ManualDriverTransport, PublicationLog, QwpWsPublicationStore, ReconnectPolicy,
-    ReconnectReason, SendCursor, TransportFailure, TransportSendResult,
-    reconnect_error_is_terminal,
+    ManualDriverTransport, PublicationLog, QwpWsPublicationStore, QwpWsReconnectProgress,
+    QwpWsSendCore, QwpWsSendProgress, QwpWsTransportFailureAction, ReconnectPolicy,
+    ReconnectReason, TransportFailure, reconnect_error_is_terminal,
 };
 use super::qwp_ws_publisher::{QwpWsPublicationDriver, QwpWsPublicationError, QwpWsReplayEncoder};
 use super::qwp_ws_queue::{
@@ -154,9 +154,7 @@ pub(crate) struct SyncQwpWsRunner<Q = ConfiguredQwpWsQueue> {
 // cursor state, reconnect, and backoff stay in the background loop so blocking
 // I/O cannot hold the publication mutex.
 struct SyncQwpWsRunnerCore<T = BlockingQwpWsTransport> {
-    transport: T,
-    send_cursor: SendCursor,
-    reconnect_policy: ReconnectPolicy,
+    send_core: QwpWsSendCore<T>,
 }
 
 impl<Q> SyncQwpWsRunner<Q>
@@ -167,16 +165,14 @@ where
     where
         T: ManualDriverTransport + Send + 'static,
     {
-        let (store, send_cursor, transport, reconnect_policy) = publisher.into_runner_parts();
+        let (store, send_core) = publisher.into_runner_parts();
         let shared = Arc::new(Mutex::new(store));
         let stop = Arc::new(AtomicBool::new(false));
         let thread_shared = Arc::clone(&shared);
         let thread_stop = Arc::clone(&stop);
         let thread = thread::spawn(move || {
             let mut core = SyncQwpWsRunnerCore {
-                transport,
-                send_cursor,
-                reconnect_policy,
+                send_core,
             };
             while !thread_stop.load(Ordering::Acquire) {
                 match core.drive_step(&thread_shared, &thread_stop) {
@@ -230,7 +226,7 @@ where
             if store.is_terminal() {
                 return RunnerStep::Stop;
             }
-            match store.next_outbound_frame(&mut self.send_cursor) {
+            match self.send_core.next_outbound_frame(&store) {
                 Ok(outbound) => outbound,
                 Err(err) => return store_driver_error(&mut store, err),
             }
@@ -251,39 +247,26 @@ where
     where
         Q: PublicationLog,
     {
-        let frame = outbound.sent_frame();
-        let send_result = self.transport.send_frame(outbound);
-        let mut store = match shared.lock() {
-            Ok(store) => store,
-            Err(_) => return RunnerStep::Stop,
-        };
+        let (frame, send_result) = self.send_core.send_frame(outbound);
         match send_result {
-            Ok(TransportSendResult::NoResponse) => {
-                match store.record_sent_frame(&mut self.send_cursor, frame) {
-                    Ok(()) => RunnerStep::Continue,
+            Ok(send_result) => {
+                let mut store = match shared.lock() {
+                    Ok(store) => store,
+                    Err(_) => return RunnerStep::Stop,
+                };
+                match self
+                    .send_core
+                    .finish_send_result(&mut store, frame, send_result)
+                {
+                    Ok(QwpWsSendProgress::Outcome(outcome)) => step_from_drive_outcome(outcome),
+                    Ok(QwpWsSendProgress::TransportFailure(failure)) => {
+                        drop(store);
+                        self.apply_transport_failure(shared, stop, failure)
+                    }
                     Err(err) => store_driver_error(&mut store, err),
                 }
             }
-            Ok(TransportSendResult::Response(response)) => {
-                if let Err(err) = store.record_sent_frame(&mut self.send_cursor, frame) {
-                    return store_driver_error(&mut store, err);
-                }
-                match store.apply_response(&mut self.send_cursor, response) {
-                    Ok(outcome) => step_from_drive_outcome(outcome),
-                    Err(err) => store_driver_error(&mut store, err),
-                }
-            }
-            Ok(TransportSendResult::Failure(failure)) => {
-                if let Err(err) = store.record_sent_frame(&mut self.send_cursor, frame) {
-                    return store_driver_error(&mut store, err);
-                }
-                drop(store);
-                self.apply_transport_failure(shared, stop, failure)
-            }
-            Err(failure) => {
-                drop(store);
-                self.apply_transport_failure(shared, stop, failure)
-            }
+            Err(failure) => self.apply_transport_failure(shared, stop, failure),
         }
     }
 
@@ -295,13 +278,13 @@ where
     where
         Q: PublicationLog,
     {
-        match self.transport.try_poll_response() {
+        match self.send_core.try_poll_response() {
             Ok(Some(response)) => {
                 let mut store = match shared.lock() {
                     Ok(store) => store,
                     Err(_) => return RunnerStep::Stop,
                 };
-                match store.apply_response(&mut self.send_cursor, response) {
+                match self.send_core.finish_response(&mut store, response) {
                     Ok(outcome) => step_from_drive_outcome(outcome),
                     Err(err) => store_driver_error(&mut store, err),
                 }
@@ -320,14 +303,12 @@ where
     where
         Q: PublicationLog,
     {
-        match failure {
-            TransportFailure::Disconnect(error) => {
-                self.reconnect_with_policy(shared, stop, ReconnectReason::Disconnect, error)
-            }
-            TransportFailure::Retryable(error) => {
-                self.reconnect_with_policy(shared, stop, ReconnectReason::RetryableFailure, error)
-            }
-            TransportFailure::Terminal(error) => {
+        match QwpWsSendCore::<T>::transport_failure_action(failure) {
+            QwpWsTransportFailureAction::Reconnect {
+                reason,
+                initial_error,
+            } => self.reconnect_with_policy(shared, stop, reason, initial_error),
+            QwpWsTransportFailureAction::Terminal(error) => {
                 let mut store = match shared.lock() {
                     Ok(store) => store,
                     Err(_) => return RunnerStep::Stop,
@@ -348,53 +329,30 @@ where
     where
         Q: PublicationLog,
     {
-        let deadline = Instant::now().checked_add(self.reconnect_policy.max_duration());
-        if runner_reconnect_deadline_expired(deadline) {
-            return mark_store_terminal(shared, initial_error);
-        }
-
-        let mut attempts = 0usize;
-        let mut backoff = self.reconnect_policy.initial_backoff();
-        let mut last_error = initial_error;
-
-        while !stop.load(Ordering::Acquire) && !runner_reconnect_deadline_expired(deadline) {
-            if attempts > 0 {
-                if !sleep_before_runner_reconnect(deadline, backoff, stop) {
-                    break;
-                }
-                backoff = double_duration(backoff).min(self.reconnect_policy.max_backoff());
+        let reconnect_result = self.send_core.reconnect_transport_with_policy(
+            reason,
+            initial_error,
+            || stop.load(Ordering::Acquire),
+            |deadline, backoff| sleep_before_runner_reconnect(deadline, backoff, stop),
+        );
+        match reconnect_result {
+            Ok(QwpWsReconnectProgress::Reconnected { reason }) => {
+                let mut store = match shared.lock() {
+                    Ok(store) => store,
+                    Err(_) => return RunnerStep::Stop,
+                };
+                let outcome = self.send_core.finish_reconnect_success(&mut store, reason);
+                step_from_drive_outcome(outcome)
             }
-
-            attempts += 1;
-            match self.transport.restart_connection(reason) {
-                Ok(()) => {
-                    let mut store = match shared.lock() {
-                        Ok(store) => store,
-                        Err(_) => return RunnerStep::Stop,
-                    };
-                    let outcome = store.finish_reconnect_success(&mut self.send_cursor, reason);
-                    return step_from_drive_outcome(outcome);
-                }
-                Err(err) => match runner_reconnect_attempt_error(err) {
-                    Ok(err) if reconnect_error_is_terminal(&err) => {
-                        return mark_store_terminal(shared, err);
-                    }
-                    Ok(err) => last_error = err,
-                    Err(err) => {
-                        let mut store = match shared.lock() {
-                            Ok(store) => store,
-                            Err(_) => return RunnerStep::Stop,
-                        };
-                        return store_driver_error(&mut store, err);
-                    }
-                },
+            Ok(QwpWsReconnectProgress::Terminal(error)) => mark_store_terminal(shared, error),
+            Ok(QwpWsReconnectProgress::Stopped) => RunnerStep::Stop,
+            Err(err) => {
+                let mut store = match shared.lock() {
+                    Ok(store) => store,
+                    Err(_) => return RunnerStep::Stop,
+                };
+                store_driver_error(&mut store, err)
             }
-        }
-
-        if stop.load(Ordering::Acquire) {
-            RunnerStep::Stop
-        } else {
-            mark_store_terminal(shared, last_error)
         }
     }
 }
@@ -458,13 +416,6 @@ fn mark_store_terminal<Q: PublicationLog>(
     };
     store.mark_terminal(Some(err));
     RunnerStep::Stop
-}
-
-fn runner_reconnect_attempt_error(err: DriverError) -> Result<crate::Error, DriverError> {
-    match err {
-        DriverError::Transport(err) | DriverError::Storage(err) => Ok(err),
-        err => Err(err),
-    }
 }
 
 fn runner_reconnect_deadline_expired(deadline: Option<Instant>) -> bool {
@@ -1136,7 +1087,8 @@ fn driver_error_to_error_without_state(err: DriverError) -> crate::Error {
 #[cfg(test)]
 mod tests {
     use super::super::qwp_ws_driver::{
-        DriverError, ReconnectReason, TransportFailure, TransportResponse, TransportSendResult,
+        DriverError, DriverEvent, ReconnectReason, TransportFailure, TransportResponse,
+        TransportSendResult,
     };
     use super::super::qwp_ws_queue::{OutboundFrame, SentFrame};
     use super::*;
@@ -1342,6 +1294,98 @@ mod tests {
         };
         publish_result.unwrap();
         publish_thread.join().unwrap();
+
+        release_reconnect_tx.send(()).unwrap();
+        drop(runner);
+    }
+
+    #[derive(Debug)]
+    struct ImmediateFailureReconnectTransport {
+        reconnect_started: mpsc::Sender<()>,
+        release_reconnect: mpsc::Receiver<()>,
+        should_fail_send: bool,
+        sent_frames: Vec<SentFrame>,
+    }
+
+    impl ManualDriverTransport for ImmediateFailureReconnectTransport {
+        fn poll_response(&mut self) -> Result<Option<TransportResponse>, TransportFailure> {
+            Ok(None)
+        }
+
+        fn send_frame(
+            &mut self,
+            frame: OutboundFrame,
+        ) -> Result<TransportSendResult, TransportFailure> {
+            let sent_frame = frame.sent_frame();
+            self.sent_frames.push(sent_frame);
+            if self.should_fail_send {
+                self.should_fail_send = false;
+                return Ok(TransportSendResult::Failure(TransportFailure::Disconnect(
+                    crate::Error::new(
+                        crate::ErrorCode::SocketError,
+                        "fake disconnect after send",
+                    ),
+                )));
+            }
+            Ok(TransportSendResult::NoResponse)
+        }
+
+        fn restart_connection(&mut self, _reason: ReconnectReason) -> Result<(), DriverError> {
+            self.reconnect_started.send(()).unwrap();
+            self.release_reconnect
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            Ok(())
+        }
+
+        fn sent_frames(&self) -> &[SentFrame] {
+            &self.sent_frames
+        }
+    }
+
+    #[test]
+    fn threaded_runner_records_immediate_transport_failure_as_sent_before_reconnect() {
+        let (reconnect_started_tx, reconnect_started_rx) = mpsc::channel();
+        let (release_reconnect_tx, release_reconnect_rx) = mpsc::channel();
+        let queue = VolatileFrameQueue::new(VolatileQueueOptions {
+            max_frames: 2,
+            max_bytes: 1024,
+            max_in_flight: 1,
+        })
+        .unwrap();
+        let transport = ImmediateFailureReconnectTransport {
+            reconnect_started: reconnect_started_tx,
+            release_reconnect: release_reconnect_rx,
+            should_fail_send: true,
+            sent_frames: Vec::new(),
+        };
+        let driver = ManualDriverPrototype::from_queue(queue, transport);
+        let publisher = QwpWsPublicationDriver::new(driver, 1);
+        let runner = Arc::new(SyncQwpWsRunner::start(publisher));
+
+        runner.publish_replay_payload(b"first").unwrap();
+        reconnect_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+
+        let events = {
+            let mut store = runner.lock_shared().unwrap();
+            let mut events = Vec::new();
+            while let Some(event) = store.poll_event() {
+                events.push(event);
+            }
+            events
+        };
+        assert_eq!(
+            events,
+            vec![
+                DriverEvent::Published { fsn: 0 },
+                DriverEvent::Sent {
+                    fsn: 0,
+                    wire_seq: 0,
+                },
+            ]
+        );
 
         release_reconnect_tx.send(()).unwrap();
         drop(runner);
