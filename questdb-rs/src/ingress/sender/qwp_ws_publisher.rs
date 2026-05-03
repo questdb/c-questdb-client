@@ -35,9 +35,10 @@ use crate::error;
 use crate::ingress::buffer::{QwpBuffer, QwpWsEncodeScratch, SymbolGlobalDict};
 
 use super::qwp_ws_driver::{
-    CloseOutcome, DeliveryOutcome, DetachedReceive, DetachedSend, DriveOutcome, DriverError,
-    DriverEvent, ManualDriverPrototype, ManualDriverTransport, PublicationLog, QwpRejectedFrame,
-    QwpServerError, TransportFailure, TransportResponse, TransportSendResult,
+    CloseOutcome, DeliveryOutcome, DetachedProgress, DetachedReceive, DetachedSend, DriveOutcome,
+    DriverError, DriverEvent, ManualDriverPrototype, ManualDriverTransport, PublicationLog,
+    QwpRejectedFrame, QwpServerError, ReconnectReason, TransportFailure, TransportResponse,
+    TransportSendResult,
 };
 use super::qwp_ws_queue::{QwpReceipt, QwpReceiptStatus, SentFrame};
 
@@ -150,7 +151,7 @@ impl<Q: PublicationLog, T: ManualDriverTransport> QwpWsPublicationDriver<Q, T> {
         transport: T,
         frame: SentFrame,
         send_result: Result<TransportSendResult, TransportFailure>,
-    ) -> Result<DriveOutcome, DriverError> {
+    ) -> Result<DetachedProgress<T>, DriverError> {
         self.driver
             .finish_detached_send(transport, frame, send_result)
     }
@@ -163,8 +164,30 @@ impl<Q: PublicationLog, T: ManualDriverTransport> QwpWsPublicationDriver<Q, T> {
         &mut self,
         transport: T,
         response: Result<Option<TransportResponse>, TransportFailure>,
-    ) -> Result<DriveOutcome, DriverError> {
+    ) -> Result<DetachedProgress<T>, DriverError> {
         self.driver.finish_detached_receive(transport, response)
+    }
+
+    pub(crate) fn finish_detached_reconnect_success(
+        &mut self,
+        transport: T,
+        reason: ReconnectReason,
+    ) -> Result<DriveOutcome, DriverError> {
+        self.driver
+            .finish_detached_reconnect_success(transport, reason)
+    }
+
+    pub(crate) fn finish_detached_reconnect_terminal(
+        &mut self,
+        transport: T,
+        error: crate::Error,
+    ) -> DriveOutcome {
+        self.driver
+            .finish_detached_reconnect_terminal(transport, error)
+    }
+
+    pub(crate) fn restore_detached_transport(&mut self, transport: T) {
+        self.driver.restore_detached_transport(transport);
     }
 
     pub(crate) fn wait_steps(

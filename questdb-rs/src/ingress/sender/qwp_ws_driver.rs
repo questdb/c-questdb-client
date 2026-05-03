@@ -83,6 +83,18 @@ impl ReconnectPolicy {
             max_backoff: Duration::ZERO,
         }
     }
+
+    pub(crate) fn max_duration(&self) -> Duration {
+        self.max_duration
+    }
+
+    pub(crate) fn initial_backoff(&self) -> Duration {
+        self.initial_backoff
+    }
+
+    pub(crate) fn max_backoff(&self) -> Duration {
+        self.max_backoff
+    }
 }
 
 #[derive(Debug)]
@@ -306,11 +318,7 @@ impl<Q: PublicationLog, T: ManualDriverTransport> ManualDriverPrototype<Q, T> {
             Ok(result) => result,
             Err(failure) => return self.apply_transport_failure(failure).map(Some),
         };
-        self.send_cursor.commit_sent(frame)?;
-        self.push_event(DriverEvent::Sent {
-            fsn: frame.fsn,
-            wire_seq: frame.wire_seq,
-        });
+        self.commit_sent_frame(frame)?;
 
         match send_result {
             TransportSendResult::NoResponse => Ok(Some(DriveOutcome::Sent(frame))),
@@ -584,22 +592,30 @@ impl<Q: PublicationLog, T: ManualDriverTransport> ManualDriverPrototype<Q, T> {
         transport: T,
         frame: SentFrame,
         send_result: Result<TransportSendResult, TransportFailure>,
-    ) -> Result<DriveOutcome, DriverError> {
-        self.restore_transport(transport);
+    ) -> Result<DetachedProgress<T>, DriverError> {
         let send_result = match send_result {
             Ok(send_result) => send_result,
-            Err(failure) => return self.apply_transport_failure(failure),
+            Err(failure) => return Ok(self.prepare_detached_failure(transport, failure)),
         };
-        self.send_cursor.commit_sent(frame)?;
-        self.push_event(DriverEvent::Sent {
-            fsn: frame.fsn,
-            wire_seq: frame.wire_seq,
-        });
 
         match send_result {
-            TransportSendResult::NoResponse => Ok(DriveOutcome::Sent(frame)),
-            TransportSendResult::Response(response) => self.apply_response(response),
-            TransportSendResult::Failure(failure) => self.apply_transport_failure(failure),
+            TransportSendResult::NoResponse => {
+                self.restore_transport(transport);
+                self.commit_sent_frame(frame)?;
+                Ok(DetachedProgress::Outcome(DriveOutcome::Sent(frame)))
+            }
+            TransportSendResult::Response(response) => {
+                self.restore_transport(transport);
+                self.commit_sent_frame(frame)?;
+                self.apply_response(response).map(DetachedProgress::Outcome)
+            }
+            TransportSendResult::Failure(failure) => {
+                if let Err(err) = self.commit_sent_frame(frame) {
+                    self.restore_transport(transport);
+                    return Err(err);
+                }
+                Ok(self.prepare_detached_failure(transport, failure))
+            }
         }
     }
 
@@ -616,13 +632,78 @@ impl<Q: PublicationLog, T: ManualDriverTransport> ManualDriverPrototype<Q, T> {
         &mut self,
         transport: T,
         response: Result<Option<TransportResponse>, TransportFailure>,
+    ) -> Result<DetachedProgress<T>, DriverError> {
+        match response {
+            Ok(Some(response)) => {
+                self.restore_transport(transport);
+                self.apply_response(response).map(DetachedProgress::Outcome)
+            }
+            Ok(None) => {
+                self.restore_transport(transport);
+                Ok(DetachedProgress::Outcome(DriveOutcome::Idle))
+            }
+            Err(failure) => Ok(self.prepare_detached_failure(transport, failure)),
+        }
+    }
+
+    pub(crate) fn finish_detached_reconnect_success(
+        &mut self,
+        transport: T,
+        reason: ReconnectReason,
     ) -> Result<DriveOutcome, DriverError> {
         self.restore_transport(transport);
-        match response {
-            Ok(Some(response)) => self.apply_response(response),
-            Ok(None) => Ok(DriveOutcome::Idle),
-            Err(failure) => self.apply_transport_failure(failure),
+        self.send_cursor.restart(&self.queue);
+        self.push_event(DriverEvent::Reconnected { reason });
+        Ok(DriveOutcome::Reconnected { reason })
+    }
+
+    pub(crate) fn finish_detached_reconnect_terminal(
+        &mut self,
+        transport: T,
+        error: Error,
+    ) -> DriveOutcome {
+        self.restore_transport(transport);
+        self.mark_terminal(Some(error));
+        DriveOutcome::Terminal
+    }
+
+    pub(crate) fn restore_detached_transport(&mut self, transport: T) {
+        self.restore_transport(transport);
+    }
+
+    fn prepare_detached_failure(
+        &mut self,
+        transport: T,
+        failure: TransportFailure,
+    ) -> DetachedProgress<T> {
+        match failure {
+            TransportFailure::Disconnect(error) => DetachedProgress::Reconnect(DetachedReconnect {
+                transport,
+                reason: ReconnectReason::Disconnect,
+                initial_error: error,
+                policy: self.reconnect_policy,
+            }),
+            TransportFailure::Retryable(error) => DetachedProgress::Reconnect(DetachedReconnect {
+                transport,
+                reason: ReconnectReason::RetryableFailure,
+                initial_error: error,
+                policy: self.reconnect_policy,
+            }),
+            TransportFailure::Terminal(error) => {
+                self.restore_transport(transport);
+                self.mark_terminal(Some(error));
+                DetachedProgress::Outcome(DriveOutcome::Terminal)
+            }
         }
+    }
+
+    fn commit_sent_frame(&mut self, frame: SentFrame) -> Result<(), DriverError> {
+        self.send_cursor.commit_sent(frame)?;
+        self.push_event(DriverEvent::Sent {
+            fsn: frame.fsn,
+            wire_seq: frame.wire_seq,
+        });
+        Ok(())
     }
 
     fn transport_mut(&mut self) -> &mut T {
@@ -1198,6 +1279,20 @@ pub(crate) struct DetachedSend<T> {
 #[derive(Debug)]
 pub(crate) struct DetachedReceive<T> {
     pub(crate) transport: T,
+}
+
+#[derive(Debug)]
+pub(crate) enum DetachedProgress<T> {
+    Outcome(DriveOutcome),
+    Reconnect(DetachedReconnect<T>),
+}
+
+#[derive(Debug)]
+pub(crate) struct DetachedReconnect<T> {
+    pub(crate) transport: T,
+    pub(crate) reason: ReconnectReason,
+    pub(crate) initial_error: Error,
+    pub(crate) policy: ReconnectPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq)]

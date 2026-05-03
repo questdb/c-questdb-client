@@ -55,8 +55,8 @@ Rust currently has:
 - public sync `qwpws` cut over to the queue/publication driver,
 - high-level `Sender::flush()` / `flush_and_keep()` local-publication semantics
   with a sender-owned runner advancing WebSocket I/O,
-- ordinary socket send and non-blocking receive polling outside the publication
-  mutex; reconnect/backoff is still the next runner/store coupling to remove,
+- ordinary socket send, non-blocking receive polling, and reconnect/backoff
+  outside the publication mutex,
 - volatile queue when `sf_dir` is unset,
 - Java-style `.sfa` slot queue when `sf_dir` is set,
 - `initial_connect_retry=sync` as an alias for current blocking startup retry,
@@ -374,17 +374,17 @@ Evidence:
 - Rust: high-level `flush_qwp_ws()` now encodes a replay-safe payload, publishes
   locally into memory/SFA storage, clears the caller buffer only after local
   publication, and returns before ACK while a sender-owned runner advances
-  transport progress. The latest runner slice moves ordinary send and
-  non-blocking receive polling outside the publication mutex. Rust still
-  recognizes and rejects `sf_append_deadline_millis` until the current sender
-  can use it for Java-compatible local-publication backpressure, and
-  reconnect/backoff remains the next runner/store coupling to remove.
+  transport progress. The latest runner slices move ordinary send,
+  non-blocking receive polling, and reconnect/backoff outside the publication
+  mutex. Rust still recognizes and rejects `sf_append_deadline_millis` until
+  the current sender can use it for Java-compatible local-publication
+  backpressure.
 - Validation: behavioral mock tests cover delayed ACK, pipelined `flush()` /
   `flush_and_keep()`, schema/write rejection drop-and-continue, reconnect
   replay, and a blocked transport send that does not block another local
-  publication. Remaining validation starts with blocked-reconnect publication,
-  append backpressure, append-deadline config acceptance, and pollable async
-  rejection observation.
+  publication. They now also cover blocked reconnect not blocking another local
+  publication. Remaining validation starts with append backpressure,
+  append-deadline config acceptance, and pollable async rejection observation.
 Result:
 - partial: local-publication `flush()` and the first runner ownership slices are
   in place. Append-deadline config remains rejected until it affects runtime

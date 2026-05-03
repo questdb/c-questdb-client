@@ -80,8 +80,7 @@ requires a different shape.
 The public sync QWP/WebSocket sender now uses the replay publication driver and
 a sender-owned runner. Its `flush()` compatibility API publishes one logical
 frame into the local volatile/SFA queue and returns without waiting for the
-matching server ACK. It may still wait for local capacity or an in-progress
-reconnect critical section:
+matching server ACK. It may still wait for local capacity:
 
 ```text
 Buffer -> replay payload -> volatile queue or SFA slot -> runner-owned WS transport
@@ -123,10 +122,8 @@ manual sender as an advanced/testing/FFI progress-owner surface.
 
 The no-ACK-wait boundary is not a promise that producer calls never wait on
 network-adjacent state. Producer calls may wait for local capacity or for an
-in-progress reconnect critical section to finish before they can publish
-locally. Ordinary send and non-blocking receive polling have already moved out
-of the publication mutex; reconnect/backoff remains the important coupling to
-remove.
+explicit close/shutdown coordination. Ordinary send, non-blocking receive
+polling, and reconnect/backoff have moved out of the publication mutex.
 
 This is still not the finished product contract. The manual driver now has a
 Java-like `PublicationLog` boundary: local publication owns FSNs and payload
@@ -200,10 +197,9 @@ Properties:
   `sf_append_deadline_millis` for resolved-frame trim to free space.
 - `Sender::flush()` checks for already-latched terminal errors before local
   publication, but it does not wait for the newly published frame to be ACKed.
-- `Sender::flush()` may currently wait behind an in-progress reconnect critical
-  section. The target contract is that reconnect/backoff belongs to the runner
-  and does not block local publication except through local capacity, terminal
-  state, or explicit close/shutdown coordination.
+- Reconnect/backoff belongs to the runner and does not block local publication
+  except through local capacity, terminal state, or explicit close/shutdown
+  coordination.
 - Server rejections observed after `flush()` returns are surfaced through a
   bounded pollable error/event path and, for terminal policies, by latching the
   error so a later producer call fails. The first Rust surface should be polling
@@ -1452,6 +1448,10 @@ Validated in the current Rust branch:
     non-blocking receive polling outside the publication mutex; a behavioral
     test proves a second local publication completes while the first transport
     send is blocked.
+17. High-level runner reconnect decoupling slice: detached transport failures
+    return an owned reconnect action; the runner sleeps, retries, and calls
+    `restart_connection()` outside the publication mutex; a behavioral test
+    proves a second local publication completes while reconnect is blocked.
 
 Remaining product work:
 
@@ -1462,16 +1462,14 @@ Remaining product work:
    detach operations on the manual driver.
 2. Add bounded local-publication backpressure with
    `sf_append_deadline_millis`, matching Java's `appendBlocking()` behavior.
-3. Decouple reconnect/backoff/restart from local publication: a reconnect in
-   progress must not block new local publications while capacity remains.
-4. Add Java-compatible high-level close/drain semantics. Rust `Drop` cannot
+3. Add Java-compatible high-level close/drain semantics. Rust `Drop` cannot
    return errors, so the explicit API shape must be decided before accepting
    `close_flush_timeout_millis`.
-5. Finish Java-compatible server rejection reporting through bounded pollable
+4. Finish Java-compatible server rejection reporting through bounded pollable
    public/FFI surfaces without adding Rust-only dead-letter files, client-owned
    quarantine, or mandatory callbacks.
-6. Wire the C ABI stubs to the real queue/driver core.
-7. Add receipt-oriented threaded/async adapters, C++ wrappers, and Python
+5. Wire the C ABI stubs to the real queue/driver core.
+6. Add receipt-oriented threaded/async adapters, C++ wrappers, and Python
    wrappers after the core public semantics are stable.
 
 ## Tests

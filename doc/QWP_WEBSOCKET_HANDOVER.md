@@ -12,9 +12,8 @@ and `sf_dir` set opens the Java-compatible `<sf_dir>/<sender_id>/` SFA slot.
 The high-level `Sender` path also has the first sender-owned runner slice:
 `flush()` publishes locally, clears the caller buffer on successful local
 publication, and returns without waiting for the submitted frame's ACK. It may
-still wait for local capacity or an in-progress reconnect critical section.
-Ordinary socket send and non-blocking receive polling have been moved outside
-the publication mutex; reconnect/backoff remains the next coupling to remove.
+still wait for local capacity. Ordinary socket send, non-blocking receive
+polling, and reconnect/backoff have been moved outside the publication mutex.
 The public reconnect configuration now follows the Java ingestion sender model:
 duration-bound reconnect, no max-attempt cap, no failover callback, and
 `initial_connect_retry` as the explicit startup retry opt-in.
@@ -28,13 +27,13 @@ path should converge on Java's product semantics: QWP/WebSocket `flush()`
 publishes into bounded local memory/SFA storage and returns without waiting for
 the submitted frame's server ACK, while a sender-owned runner advances
 WebSocket I/O. This does not mean every call is network-independent: local
-capacity and the current reconnect critical section may still make a producer
-call wait. The target shape is the Java architecture: a publication store/cursor
-with short synchronized access, plus a runner/I/O loop that owns transport,
-wire sequencing, reconnect/backoff, and replay. The manual `QwpWsSender`
-remains the threadless progress-owner API for advanced Rust users, tests, and
-FFI wiring; it should not be the permanent architectural center of the
-high-level runner.
+capacity may still make a producer call wait. The target shape is the Java
+architecture: a publication store/cursor with short synchronized access, plus a
+runner/I/O loop that owns transport, wire sequencing, reconnect/backoff, and
+replay. The current runner still uses private detached manual-driver operations
+as a transition; the manual `QwpWsSender` remains the threadless progress-owner
+API for advanced Rust users, tests, and FFI wiring, not the permanent
+architectural center of the high-level runner.
 
 ## Read first
 
@@ -562,10 +561,10 @@ conversion before the real driver is wired through.
   a queryable row.
 - The current public `Sender::flush()` QWP/WebSocket path now returns after
   local publication and does not wait for the submitted frame's ACK. It may
-  still wait for local capacity or for the current in-progress reconnect
-  critical section, and it relies on a sender-owned runner for WebSocket
-  progress. Ordinary socket send and non-blocking receive poll no longer hold
-  the publication mutex.
+  still wait for local capacity, and it relies on a sender-owned runner for
+  WebSocket progress. Ordinary socket send, non-blocking receive poll, and
+  reconnect/backoff no longer hold the publication mutex; behavioral runner
+  tests cover blocked send and blocked reconnect publication.
   Remaining gaps are Java-compatible local backpressure
   (`sf_append_deadline_millis`), close/drain semantics, and bounded public
   observation for asynchronous server rejections. The manual driver now has a

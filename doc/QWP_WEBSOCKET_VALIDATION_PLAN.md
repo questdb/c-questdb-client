@@ -72,10 +72,9 @@ As of 2026-04-29:
   converge on Java's high-level model: `flush()` publishes into bounded local
   memory/SFA storage and returns without waiting for the submitted frame's
   server ACK, while a sender-owned runner advances WebSocket I/O. `flush()` may
-  still wait for local capacity or the current reconnect critical section. The
-  latest runner slice already moves ordinary socket send and non-blocking
-  receive polling outside the publication mutex; reconnect/backoff remains the
-  next coupling to remove. The manual `QwpWsSender` remains the threadless
+  still wait for local capacity. The latest runner slices move ordinary socket
+  send, non-blocking receive polling, and reconnect/backoff outside the
+  publication mutex. The manual `QwpWsSender` remains the threadless
   progress-owner API.
 
 ## Validation discipline
@@ -793,13 +792,14 @@ I/O. Mock-server coverage proves delayed-ACK `flush()`, delayed-ACK
 The manual driver now uses a `PublicationLog` boundary: local publication owns
 FSNs and retained payloads, while the driver owns connection-local wire
 sequencing, in-flight state, ACK mapping, and reconnect replay cursor. The
-latest runner slice performs ordinary socket send and non-blocking receive poll
-outside the publication mutex, with behavioral coverage proving that a blocked
-send does not block another local publication. The remaining architectural work
-in this step is to make the high-level runner a direct Java-shaped I/O loop over
-the publication store instead of growing the manual driver as its center, and
-then finish reconnect/backoff decoupling, local-capacity backpressure/deadline,
-close/drain, and async rejection observability.
+latest runner slices perform ordinary socket send, non-blocking receive poll,
+and reconnect/backoff outside the publication mutex, with behavioral coverage
+proving that blocked send or blocked reconnect does not block another local
+publication. The remaining architectural work in this step is to make the
+high-level runner a direct Java-shaped I/O loop over the publication store
+instead of growing the manual driver as its center, and then finish
+local-capacity backpressure/deadline, close/drain, and async rejection
+observability.
 
 Validation target:
 

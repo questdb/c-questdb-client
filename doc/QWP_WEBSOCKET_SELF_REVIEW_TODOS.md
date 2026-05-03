@@ -39,7 +39,7 @@ observable, a behavioral fixture or real QuestDB server.
 | R1 | todo | high | Protocol parser | Make Rust QWP/WebSocket response parsing match Java/server framing. | Re-read Java `WebSocketResponse.java`; re-read Rust `qwp_ws_codec.rs`; confirm real server emits `tableCount` for OK and durable ACK frames. | Rust rejects truncated/trailing-garbage OK, durable ACK, and error frames; mock-server helpers emit realistic frames; tests show malformed responses do not advance ACK state. |
 | R2 | todo | medium | Rejection observability | Bound rejection state and avoid queue-owned rejection history. | Re-read Java `SenderErrorDispatcher`; inspect which Rust APIs need post-resolution rejection details. | Rejection details live in a bounded driver/event surface; volatile and SFA queues only own publication, retention, completion, and trim state. |
 | R3 | todo | medium | ACK/NACK defense | Align ACK/NACK beyond highest sent with Java clamping unless validation finds a stronger Rust reason to fail fast. | Re-read Java `CursorWebSocketSendLoop` ACK/NACK clamp; inspect current Rust error paths and tests. | A too-large ACK/NACK cannot complete unsent frames; behavior matches Java or the divergence is documented with a concrete reason. |
-| R4 | in progress | high | Runner architecture | Decouple high-level publication from blocking transport/reconnect progress. | Re-read Java `CursorSendEngine.appendBlocking`, `CursorWebSocketSendLoop`, and Rust `SyncQwpWsRunner`; decide the smallest globally coherent step toward an explicit store/runner split, not a larger manual-driver detach API. | `Sender::flush()` can publish locally while the runner is reconnecting or doing blocking I/O, subject only to local capacity/backpressure and terminal error checks. |
+| R4 | done | high | Runner architecture | Decouple high-level publication from blocking transport/reconnect progress. | Re-read Java `CursorSendEngine.appendBlocking`, `CursorWebSocketSendLoop`, and Rust `SyncQwpWsRunner`; decide the smallest globally coherent step toward an explicit store/runner split, not a larger manual-driver detach API. | `Sender::flush()` can publish locally while the runner is reconnecting or doing blocking I/O, subject only to local capacity/backpressure and terminal error checks. |
 | R5 | todo | high | Shutdown / close | Make runner shutdown and close/drain behavior explicit and Java-compatible. | Compare Java `close()` / `drainOnClose()` with Rust `Drop`, manual `close_drain`, and rejected `close_flush_timeout_millis`. | Background runner stop is not hostage to the full reconnect budget; explicit close-drain can report timeout/terminal errors before `close_flush_timeout_millis` is accepted. |
 | R6 | todo | low | Docs | Remove stale wording and sync docs after each code slice. | Search docs and Rust comments for old async/Tokio/manual-driver wording. | Docs describe current behavior, known gaps, and rejected config values without promising unimplemented features. |
 
@@ -105,9 +105,8 @@ This is defensive parity, not a new feature.
 The high-level runner is useful but still transitional. It is implemented by
 layering a background runner around the manual driver, while the Java design has
 a cleaner split between `CursorSendEngine` and `CursorWebSocketSendLoop`.
-Ordinary socket send/receive I/O has now moved outside the publication mutex,
-but reconnect/backoff still re-enters the manual driver's monolithic reconnect
-path under that mutex after a transport failure.
+Ordinary socket send/receive I/O and reconnect/backoff now run outside the
+publication mutex on the high-level runner path.
 
 First slice completed: replay encoding and symbol dictionary state were moved
 out of the runner-owned publisher for the high-level sync sender. Foreground
@@ -126,6 +125,13 @@ receive-ready transport from the publication driver, performs the transport
 reattaches the transport to commit the result. A focused runner test proves a
 second local publication can be accepted while the first transport send is
 blocked.
+
+Fourth slice completed: detached transport failures now return an owned
+reconnect action to the runner. The runner sleeps, retries, and calls
+`restart_connection()` outside the publication mutex, then briefly re-enters the
+driver to reset wire state on reconnect success or latch terminal failure on
+budget exhaustion. A behavioral runner test proves a second local publication
+can be accepted while reconnect is blocked.
 
 Current Java primitive findings, validated against current
 `java-questdb-client` source:
@@ -148,12 +154,12 @@ The product `Sender` runner should converge on Java's ownership model: short
 publication-store critical sections, plus runner-owned transport,
 wire-sequence mapping, reconnect/backoff, and replay cursor.
 
-Remaining coupling: transport failure handling still re-enters the existing
-driver reconnect policy under the publication mutex after the failing socket
-operation returns. The next R4 slice should be designed as a step toward the
-explicit store/runner split. A small private reconnect-outside-lock helper is
-acceptable as a transition only if it reduces, rather than entrenches, the
-manual-driver-centered shape.
+Remaining architectural debt: the high-level runner still uses private
+`detach_*` / `finish_detached_*` operations on the manual driver. That is an
+acceptable transition after R4 because the observable publication boundary is in
+place, but it should not become the final architecture. The next runner work
+should either make close/backpressure behavior explicit or replace the
+transitional detach surface with a clearer store/runner split.
 
 Design candidates to validate:
 

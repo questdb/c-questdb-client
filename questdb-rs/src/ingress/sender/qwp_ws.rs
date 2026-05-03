@@ -46,9 +46,9 @@ use super::qwp_ws_codec::{
     WS_OPCODE_CONTINUATION, WS_OPCODE_PING, WS_OPCODE_PONG, WS_OPCODE_TEXT,
 };
 use super::qwp_ws_driver::{
-    BlockingQwpWsTransport, DetachedReceive, DetachedSend, DriveOutcome, DriverError,
-    ManualDriverPrototype, ManualDriverTransport, PublicationLog, ReconnectPolicy,
-    reconnect_error_is_terminal,
+    BlockingQwpWsTransport, DetachedProgress, DetachedReceive, DetachedReconnect, DetachedSend,
+    DriveOutcome, DriverError, ManualDriverPrototype, ManualDriverTransport, PublicationLog,
+    ReconnectPolicy, ReconnectReason, reconnect_error_is_terminal,
 };
 use super::qwp_ws_publisher::{QwpWsPublicationDriver, QwpWsPublicationError, QwpWsReplayEncoder};
 use super::qwp_ws_queue::{
@@ -168,27 +168,27 @@ where
         let thread_stop = Arc::clone(&stop);
         let thread = thread::spawn(move || {
             while !thread_stop.load(Ordering::Acquire) {
-                match Self::drive_detached_step(&thread_shared) {
+                let step = match Self::drive_detached_step(&thread_shared) {
+                    RunnerStep::Send(send) => Self::finish_detached_send(&thread_shared, send),
+                    RunnerStep::Receive(receive) => {
+                        Self::finish_detached_receive(&thread_shared, receive)
+                    }
+                    step => step,
+                };
+                let step = match step {
+                    RunnerStep::Reconnect(reconnect) => {
+                        Self::finish_detached_reconnect(&thread_shared, &thread_stop, reconnect)
+                    }
+                    step => step,
+                };
+                match step {
                     RunnerStep::Idle => thread::sleep(Duration::from_micros(50)),
                     RunnerStep::Continue => {}
                     RunnerStep::Stop => break,
-                    RunnerStep::Send(send) => {
-                        match Self::finish_detached_send(&thread_shared, send) {
-                            RunnerStep::Idle => thread::sleep(Duration::from_micros(50)),
-                            RunnerStep::Continue => {}
-                            RunnerStep::Stop => break,
-                            RunnerStep::Send(_) | RunnerStep::Receive(_) => unreachable!(),
-                        }
+                    RunnerStep::Send(_) | RunnerStep::Receive(_) | RunnerStep::Reconnect(_) => {
+                        unreachable!()
                     }
-                    RunnerStep::Receive(receive) => {
-                        match Self::finish_detached_receive(&thread_shared, receive) {
-                            RunnerStep::Idle => thread::sleep(Duration::from_micros(50)),
-                            RunnerStep::Continue => {}
-                            RunnerStep::Stop => break,
-                            RunnerStep::Send(_) | RunnerStep::Receive(_) => unreachable!(),
-                        }
-                    }
-                }
+                };
             }
         });
 
@@ -251,9 +251,7 @@ where
             .publisher
             .finish_detached_send(transport, frame, send_result)
         {
-            Ok(DriveOutcome::Idle) => RunnerStep::Idle,
-            Ok(DriveOutcome::Terminal) => RunnerStep::Stop,
-            Ok(_) => RunnerStep::Continue,
+            Ok(progress) => Self::step_from_detached_progress(progress),
             Err(err) => shared.store_driver_error(err),
         }
     }
@@ -272,10 +270,72 @@ where
             .publisher
             .finish_detached_receive(transport, response)
         {
-            Ok(DriveOutcome::Idle) => RunnerStep::Idle,
-            Ok(DriveOutcome::Terminal) => RunnerStep::Stop,
-            Ok(_) => RunnerStep::Continue,
+            Ok(progress) => Self::step_from_detached_progress(progress),
             Err(err) => shared.store_driver_error(err),
+        }
+    }
+
+    fn finish_detached_reconnect(
+        shared: &Arc<Mutex<SyncQwpWsRunnerShared<Q, T>>>,
+        stop: &AtomicBool,
+        reconnect: DetachedReconnect<T>,
+    ) -> RunnerStep<T> {
+        match run_detached_reconnect(reconnect, stop) {
+            DetachedReconnectResult::Reconnected { transport, reason } => {
+                let mut shared = match shared.lock() {
+                    Ok(shared) => shared,
+                    Err(_) => return RunnerStep::Stop,
+                };
+                match shared
+                    .publisher
+                    .finish_detached_reconnect_success(transport, reason)
+                {
+                    Ok(outcome) => Self::step_from_drive_outcome(outcome),
+                    Err(err) => shared.store_driver_error(err),
+                }
+            }
+            DetachedReconnectResult::Terminal { transport, error } => {
+                let mut shared = match shared.lock() {
+                    Ok(shared) => shared,
+                    Err(_) => return RunnerStep::Stop,
+                };
+                let outcome = shared
+                    .publisher
+                    .finish_detached_reconnect_terminal(transport, error);
+                Self::step_from_drive_outcome(outcome)
+            }
+            DetachedReconnectResult::Stopped { transport } => {
+                if let Ok(mut shared) = shared.lock() {
+                    shared.publisher.restore_detached_transport(transport);
+                }
+                RunnerStep::Stop
+            }
+            DetachedReconnectResult::DriverError { transport, error } => {
+                let mut shared = match shared.lock() {
+                    Ok(shared) => shared,
+                    Err(_) => return RunnerStep::Stop,
+                };
+                shared.publisher.restore_detached_transport(transport);
+                shared.store_driver_error(error)
+            }
+        }
+    }
+
+    fn step_from_detached_progress(progress: DetachedProgress<T>) -> RunnerStep<T> {
+        match progress {
+            DetachedProgress::Outcome(outcome) => Self::step_from_drive_outcome(outcome),
+            DetachedProgress::Reconnect(reconnect) => RunnerStep::Reconnect(reconnect),
+        }
+    }
+
+    fn step_from_drive_outcome(outcome: DriveOutcome) -> RunnerStep<T> {
+        match outcome {
+            DriveOutcome::Idle => RunnerStep::Idle,
+            DriveOutcome::Terminal => RunnerStep::Stop,
+            DriveOutcome::Sent(_)
+            | DriveOutcome::Acked { .. }
+            | DriveOutcome::Rejected { .. }
+            | DriveOutcome::Reconnected { .. } => RunnerStep::Continue,
         }
     }
 }
@@ -286,6 +346,127 @@ enum RunnerStep<T> {
     Stop,
     Send(DetachedSend<T>),
     Receive(DetachedReceive<T>),
+    Reconnect(DetachedReconnect<T>),
+}
+
+enum DetachedReconnectResult<T> {
+    Reconnected {
+        transport: T,
+        reason: ReconnectReason,
+    },
+    Terminal {
+        transport: T,
+        error: crate::Error,
+    },
+    Stopped {
+        transport: T,
+    },
+    DriverError {
+        transport: T,
+        error: DriverError,
+    },
+}
+
+fn run_detached_reconnect<T>(
+    reconnect: DetachedReconnect<T>,
+    stop: &AtomicBool,
+) -> DetachedReconnectResult<T>
+where
+    T: ManualDriverTransport,
+{
+    let DetachedReconnect {
+        mut transport,
+        reason,
+        initial_error,
+        policy,
+    } = reconnect;
+    let deadline = Instant::now().checked_add(policy.max_duration());
+    if detached_reconnect_deadline_expired(deadline) {
+        return DetachedReconnectResult::Terminal {
+            transport,
+            error: initial_error,
+        };
+    }
+
+    let mut attempts = 0usize;
+    let mut backoff = policy.initial_backoff();
+    let mut last_error = initial_error;
+
+    while !stop.load(Ordering::Acquire) && !detached_reconnect_deadline_expired(deadline) {
+        if attempts > 0 {
+            if !sleep_before_detached_reconnect(deadline, backoff, stop) {
+                break;
+            }
+            backoff = double_duration(backoff).min(policy.max_backoff());
+        }
+
+        attempts += 1;
+        match transport.restart_connection(reason) {
+            Ok(()) => {
+                return DetachedReconnectResult::Reconnected { transport, reason };
+            }
+            Err(err) => match detached_reconnect_attempt_error(err) {
+                Ok(err) if reconnect_error_is_terminal(&err) => {
+                    return DetachedReconnectResult::Terminal {
+                        transport,
+                        error: err,
+                    };
+                }
+                Ok(err) => last_error = err,
+                Err(error) => return DetachedReconnectResult::DriverError { transport, error },
+            },
+        }
+    }
+
+    if stop.load(Ordering::Acquire) {
+        DetachedReconnectResult::Stopped { transport }
+    } else {
+        DetachedReconnectResult::Terminal {
+            transport,
+            error: last_error,
+        }
+    }
+}
+
+fn detached_reconnect_attempt_error(err: DriverError) -> Result<crate::Error, DriverError> {
+    match err {
+        DriverError::Transport(err) | DriverError::Storage(err) => Ok(err),
+        err => Err(err),
+    }
+}
+
+fn detached_reconnect_deadline_expired(deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|deadline| Instant::now() >= deadline)
+}
+
+fn sleep_before_detached_reconnect(
+    deadline: Option<Instant>,
+    backoff: Duration,
+    stop: &AtomicBool,
+) -> bool {
+    if backoff.is_zero() {
+        return !stop.load(Ordering::Acquire) && !detached_reconnect_deadline_expired(deadline);
+    }
+
+    let sleep_for = match deadline {
+        Some(deadline) => {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            backoff.min(remaining)
+        }
+        None => backoff,
+    };
+    let sleep_started = Instant::now();
+    while !stop.load(Ordering::Acquire) {
+        let remaining = sleep_for.saturating_sub(sleep_started.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        thread::sleep(remaining.min(Duration::from_millis(50)));
+    }
+    !stop.load(Ordering::Acquire) && !detached_reconnect_deadline_expired(deadline)
 }
 
 impl<Q, T> SyncQwpWsRunnerShared<Q, T>
@@ -950,7 +1131,9 @@ fn driver_error_to_error_without_state(err: DriverError) -> crate::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::super::qwp_ws_driver::{TransportFailure, TransportResponse, TransportSendResult};
+    use super::super::qwp_ws_driver::{
+        DriverError, ReconnectReason, TransportFailure, TransportResponse, TransportSendResult,
+    };
     use super::super::qwp_ws_queue::{OutboundFrame, SentFrame};
     use super::*;
     use std::sync::{Arc, mpsc};
@@ -1062,6 +1245,101 @@ mod tests {
         publish_thread.join().unwrap();
 
         release_send_tx.send(()).unwrap();
+        drop(runner);
+    }
+
+    #[derive(Debug)]
+    struct BlockingReconnectTransport {
+        send_started: mpsc::Sender<()>,
+        reconnect_started: mpsc::Sender<()>,
+        release_reconnect: mpsc::Receiver<()>,
+        should_fail_send: bool,
+        sent_frames: Vec<SentFrame>,
+    }
+
+    impl ManualDriverTransport for BlockingReconnectTransport {
+        fn poll_response(&mut self) -> Result<Option<TransportResponse>, TransportFailure> {
+            Ok(None)
+        }
+
+        fn send_frame(
+            &mut self,
+            frame: OutboundFrame,
+        ) -> Result<TransportSendResult, TransportFailure> {
+            if self.should_fail_send {
+                self.should_fail_send = false;
+                self.send_started.send(()).unwrap();
+                return Err(TransportFailure::Disconnect(crate::Error::new(
+                    crate::ErrorCode::SocketError,
+                    "fake disconnect before reconnect",
+                )));
+            }
+            self.sent_frames.push(frame.sent_frame());
+            Ok(TransportSendResult::NoResponse)
+        }
+
+        fn restart_connection(&mut self, _reason: ReconnectReason) -> Result<(), DriverError> {
+            self.reconnect_started.send(()).unwrap();
+            self.release_reconnect
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            Ok(())
+        }
+
+        fn sent_frames(&self) -> &[SentFrame] {
+            &self.sent_frames
+        }
+    }
+
+    #[test]
+    fn threaded_runner_accepts_publication_while_reconnect_is_blocked() {
+        let (send_started_tx, send_started_rx) = mpsc::channel();
+        let (reconnect_started_tx, reconnect_started_rx) = mpsc::channel();
+        let (release_reconnect_tx, release_reconnect_rx) = mpsc::channel();
+        let queue = VolatileFrameQueue::new(VolatileQueueOptions {
+            max_frames: 2,
+            max_bytes: 1024,
+            max_in_flight: 1,
+        })
+        .unwrap();
+        let transport = BlockingReconnectTransport {
+            send_started: send_started_tx,
+            reconnect_started: reconnect_started_tx,
+            release_reconnect: release_reconnect_rx,
+            should_fail_send: true,
+            sent_frames: Vec::new(),
+        };
+        let driver = ManualDriverPrototype::from_queue(queue, transport);
+        let publisher = QwpWsPublicationDriver::new(driver, 1);
+        let runner = Arc::new(SyncQwpWsRunner::start(publisher));
+
+        runner.publish_replay_payload(b"first").unwrap();
+        send_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        reconnect_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+
+        let (published_tx, published_rx) = mpsc::channel();
+        let publish_runner = Arc::clone(&runner);
+        let publish_thread = std::thread::spawn(move || {
+            let result = publish_runner.publish_replay_payload(b"second");
+            let _ = published_tx.send(result.map(|_| ()));
+        });
+
+        let publish_result = match published_rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(result) => result,
+            Err(err) => {
+                let _ = release_reconnect_tx.send(());
+                publish_thread.join().unwrap();
+                panic!("publication waited for blocked reconnect: {err:?}");
+            }
+        };
+        publish_result.unwrap();
+        publish_thread.join().unwrap();
+
+        release_reconnect_tx.send(()).unwrap();
         drop(runner);
     }
 }
