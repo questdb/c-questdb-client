@@ -22,9 +22,7 @@
  *
  ******************************************************************************/
 
-#![allow(dead_code)]
-
-//! Replay-publication shell for the pipelined QWP/WebSocket prototype.
+//! Replay-publication shell for the pipelined QWP/WebSocket sender.
 //!
 //! The manual driver is intentionally payload-opaque. This module sits one level
 //! above it: the replay encoder turns a QWP buffer into a self-sufficient replay
@@ -35,12 +33,13 @@ use crate::error;
 use crate::ingress::buffer::{QwpBuffer, QwpWsEncodeScratch, SymbolGlobalDict};
 
 use super::qwp_ws_driver::{
-    CloseOutcome, DeliveryOutcome, DetachedProgress, DetachedReceive, DetachedSend, DriveOutcome,
-    DriverError, DriverEvent, ManualDriverPrototype, ManualDriverTransport, PublicationLog,
-    QwpRejectedFrame, QwpServerError, ReconnectReason, TransportFailure, TransportResponse,
-    TransportSendResult,
+    CloseOutcome, DeliveryOutcome, DriveOutcome, DriverError, ManualDriverPrototype,
+    ManualDriverTransport, PublicationLog, QwpRejectedFrame, QwpWsPublicationStore,
+    ReconnectPolicy, SendCursor,
 };
-use super::qwp_ws_queue::{QwpReceipt, QwpReceiptStatus, SentFrame};
+use super::qwp_ws_queue::{QwpReceipt, QwpReceiptStatus};
+#[cfg(test)]
+use super::qwp_ws_queue::SentFrame;
 
 pub(crate) struct QwpWsPublicationDriver<Q, T> {
     driver: ManualDriverPrototype<Q, T>,
@@ -101,93 +100,8 @@ impl<Q: PublicationLog, T: ManualDriverTransport> QwpWsPublicationDriver<Q, T> {
         Ok(self.driver.try_submit(payload)?)
     }
 
-    pub(crate) fn try_submit_replay_payload(
-        &mut self,
-        payload: &[u8],
-    ) -> Result<QwpReceipt, DriverError> {
-        self.driver.try_submit(payload)
-    }
-
-    pub(crate) fn submit_qwp_with_drive_limit(
-        &mut self,
-        buffer: &QwpBuffer,
-        max_drive_steps: usize,
-    ) -> Result<QwpReceipt, QwpWsPublicationError> {
-        let payload = self
-            .encoder
-            .encode(buffer)
-            .map_err(QwpWsPublicationError::Encode)?;
-        Ok(self
-            .driver
-            .submit_with_drive_limit(payload, max_drive_steps)?)
-    }
-
     pub(crate) fn drive_once(&mut self) -> Result<DriveOutcome, DriverError> {
         self.driver.drive_once()
-    }
-
-    pub(crate) fn drive_send_once(&mut self) -> Result<DriveOutcome, DriverError> {
-        self.driver.drive_send_once()
-    }
-
-    pub(crate) fn drive_receive_once(&mut self) -> Result<DriveOutcome, DriverError> {
-        self.driver.drive_receive_once()
-    }
-
-    pub(crate) fn drive_receive_ready_once(&mut self) -> Result<DriveOutcome, DriverError> {
-        self.driver.drive_receive_ready_once()
-    }
-
-    pub(crate) fn is_terminal(&self) -> bool {
-        self.driver.is_terminal()
-    }
-
-    pub(crate) fn detach_send_available(&mut self) -> Result<Option<DetachedSend<T>>, DriverError> {
-        self.driver.detach_send_available()
-    }
-
-    pub(crate) fn finish_detached_send(
-        &mut self,
-        transport: T,
-        frame: SentFrame,
-        send_result: Result<TransportSendResult, TransportFailure>,
-    ) -> Result<DetachedProgress<T>, DriverError> {
-        self.driver
-            .finish_detached_send(transport, frame, send_result)
-    }
-
-    pub(crate) fn detach_receive_ready(&mut self) -> Option<DetachedReceive<T>> {
-        self.driver.detach_receive_ready()
-    }
-
-    pub(crate) fn finish_detached_receive(
-        &mut self,
-        transport: T,
-        response: Result<Option<TransportResponse>, TransportFailure>,
-    ) -> Result<DetachedProgress<T>, DriverError> {
-        self.driver.finish_detached_receive(transport, response)
-    }
-
-    pub(crate) fn finish_detached_reconnect_success(
-        &mut self,
-        transport: T,
-        reason: ReconnectReason,
-    ) -> Result<DriveOutcome, DriverError> {
-        self.driver
-            .finish_detached_reconnect_success(transport, reason)
-    }
-
-    pub(crate) fn finish_detached_reconnect_terminal(
-        &mut self,
-        transport: T,
-        error: crate::Error,
-    ) -> DriveOutcome {
-        self.driver
-            .finish_detached_reconnect_terminal(transport, error)
-    }
-
-    pub(crate) fn restore_detached_transport(&mut self, transport: T) {
-        self.driver.restore_detached_transport(transport);
     }
 
     pub(crate) fn wait_steps(
@@ -209,32 +123,33 @@ impl<Q: PublicationLog, T: ManualDriverTransport> QwpWsPublicationDriver<Q, T> {
         self.driver.receipt_status(receipt)
     }
 
+    #[cfg(test)]
     pub(crate) fn sent_frames(&self) -> &[SentFrame] {
         self.driver.sent_frames()
-    }
-
-    pub(crate) fn poll_event(&mut self) -> Option<DriverEvent> {
-        self.driver.poll_event()
-    }
-
-    pub(crate) fn events_dropped_total(&self) -> u64 {
-        self.driver.events_dropped_total()
     }
 
     pub(crate) fn terminal_error(&self) -> Option<&crate::Error> {
         self.driver.terminal_error()
     }
 
-    pub(crate) fn last_server_error(&self) -> Option<&QwpServerError> {
-        self.driver.last_server_error()
-    }
-
     pub(crate) fn rejected_frame(&self, receipt: QwpReceipt) -> Option<&QwpRejectedFrame> {
         self.driver.rejected_frame(receipt)
     }
 
+    #[cfg(test)]
     pub(crate) fn into_driver(self) -> ManualDriverPrototype<Q, T> {
         self.driver
+    }
+
+    pub(crate) fn into_runner_parts(
+        self,
+    ) -> (
+        QwpWsPublicationStore<Q>,
+        SendCursor,
+        T,
+        ReconnectPolicy,
+    ) {
+        self.driver.into_parts()
     }
 }
 
