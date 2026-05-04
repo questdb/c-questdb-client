@@ -2973,6 +2973,15 @@ mod tests {
         }
     }
 
+    fn read_error_message(err: *const line_sender_error) -> String {
+        unsafe {
+            let mut len = 0;
+            let ptr = line_sender_error_msg(err, &mut len);
+            let bytes = std::slice::from_raw_parts(ptr as *const u8, len);
+            String::from_utf8_lossy(bytes).into_owned()
+        }
+    }
+
     fn blank_qwpws_error_view() -> line_sender_qwpws_error_view {
         line_sender_qwpws_error_view {
             category: line_sender_qwpws_error_category::LINE_SENDER_QWPWS_ERROR_UNKNOWN,
@@ -3445,6 +3454,31 @@ mod tests {
 
             assert!(!line_sender_flush(sender, buffer, &mut err));
             assert!(!err.is_null());
+            let mut view = blank_qwpws_error_view();
+            assert!(line_sender_error_qwpws_get_view(err, &mut view));
+            assert_parse_halt_diagnostic(view);
+            free_err(&mut err);
+
+            assert!(line_sender_buffer_table(buffer, table_name(b"trades"), &mut err));
+            assert!(err.is_null());
+            assert!(line_sender_buffer_column_i64(
+                buffer,
+                column_name(b"price"),
+                43,
+                &mut err
+            ));
+            assert!(err.is_null());
+            assert!(!line_sender_flush(sender, buffer, &mut err));
+            assert!(!err.is_null());
+            let message = read_error_message(err);
+            assert!(
+                message.contains("ffi bad line"),
+                "terminal error should dominate local buffer validation, got: {message}"
+            );
+            assert!(
+                !message.contains("Bad call to `flush`"),
+                "local buffer validation should not mask terminal error: {message}"
+            );
             let mut view = blank_qwpws_error_view();
             assert!(line_sender_error_qwpws_get_view(err, &mut view));
             assert_parse_halt_diagnostic(view);

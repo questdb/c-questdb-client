@@ -242,6 +242,11 @@ impl Sender {
                 "QWP/WebSocket FSN methods are only supported for QWP/WebSocket senders."
             ));
         }
+        match &self.handler {
+            SyncProtocolHandler::SyncQwpWs(state) => qwp_ws_check_error_background(state)?,
+            SyncProtocolHandler::ManualQwpWs(state) => qwp_ws_check_error_manual(state)?,
+            _ => unreachable!("QWP/WebSocket handler was checked above"),
+        }
 
         let qwp = buf.as_qwp().ok_or_else(|| {
             error::fmt!(
@@ -251,11 +256,6 @@ impl Sender {
         })?;
         qwp.check_can_flush()?;
         if qwp.is_empty() {
-            match &self.handler {
-                SyncProtocolHandler::SyncQwpWs(state) => qwp_ws_check_error_background(state)?,
-                SyncProtocolHandler::ManualQwpWs(state) => qwp_ws_check_error_manual(state)?,
-                _ => unreachable!("QWP/WebSocket handler was checked above"),
-            }
             return Ok(None);
         }
         if qwp.len() > self.max_buf_size {

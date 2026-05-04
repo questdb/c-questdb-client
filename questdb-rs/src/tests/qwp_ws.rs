@@ -128,6 +128,38 @@ fn write_server_binary_frame(stream: &mut TcpStream, payload: &[u8]) -> std::io:
     stream.write_all(&frame)
 }
 
+fn write_server_frame(
+    stream: &mut TcpStream,
+    opcode: u8,
+    payload: &[u8],
+    masked: bool,
+) -> std::io::Result<()> {
+    let mut frame = vec![0x80 | (opcode & 0x0F)];
+    let mask_bit = if masked { 0x80 } else { 0 };
+    let plen = payload.len();
+    if plen <= 125 {
+        frame.push(mask_bit | plen as u8);
+    } else if plen <= 0xFFFF {
+        frame.push(mask_bit | 126);
+        frame.extend_from_slice(&(plen as u16).to_be_bytes());
+    } else {
+        frame.push(mask_bit | 127);
+        frame.extend_from_slice(&(plen as u64).to_be_bytes());
+    }
+
+    if masked {
+        let mask = [0u8; 4];
+        frame.extend_from_slice(&mask);
+        for (index, byte) in payload.iter().enumerate() {
+            frame.push(*byte ^ mask[index & 3]);
+        }
+    } else {
+        frame.extend_from_slice(payload);
+    }
+
+    stream.write_all(&frame)
+}
+
 fn write_server_close_frame(stream: &mut TcpStream, code: u16, reason: &str) -> std::io::Result<()> {
     let mut payload = Vec::new();
     payload.extend_from_slice(&code.to_be_bytes());
@@ -1159,9 +1191,24 @@ fn qwp_ws_terminal_close_is_pollable_as_protocol_violation() {
     buf.table("trades")
         .unwrap()
         .column_i64("qty", 2)
-        .unwrap()
-        .at_now()
         .unwrap();
+    let err = sender.flush(&mut buf).unwrap_err();
+    assert!(
+        err.msg().contains("ws-close[1002]: bad frame"),
+        "expected terminal close to dominate incomplete-row validation, got: {}",
+        err.msg()
+    );
+    assert!(
+        !err.msg().contains("Bad call to `flush`"),
+        "local buffer validation must not mask terminal close: {}",
+        err.msg()
+    );
+    assert!(
+        !buf.is_empty(),
+        "terminal async error must not clear a newly prepared buffer"
+    );
+
+    buf.at_now().unwrap();
     let err = sender.flush(&mut buf).unwrap_err();
     assert!(
         err.msg().contains("ws-close[1002]: bad frame"),
@@ -1171,6 +1218,97 @@ fn qwp_ws_terminal_close_is_pollable_as_protocol_violation() {
     assert!(
         !buf.is_empty(),
         "terminal async error must not clear a newly prepared buffer"
+    );
+}
+
+fn assert_server_protocol_violation<F>(write_bad_response: F, expected_message: &'static str)
+where
+    F: FnOnce(&mut TcpStream) -> std::io::Result<()> + Send + 'static,
+{
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (frame_tx, frame_rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        upgrade_mock_stream(&mut stream);
+
+        let (_fin, _opcode, payload) = read_frame(&mut stream).unwrap();
+        frame_tx.send(payload).unwrap();
+        write_bad_response(&mut stream).unwrap();
+        thread::sleep(Duration::from_millis(50));
+    });
+
+    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+        .build()
+        .unwrap();
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 1)
+        .unwrap()
+        .at_now()
+        .unwrap();
+
+    let fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
+    let frame = frame_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(&frame[0..4], b"QWP1");
+
+    let mut observed = None;
+    for _ in 0..500 {
+        if let Some(error) = sender.poll_qwp_ws_error().unwrap() {
+            observed = Some(error);
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let protocol_error = observed.expect("expected protocol violation diagnostic");
+    assert_eq!(
+        protocol_error.category,
+        QwpWsErrorCategory::ProtocolViolation
+    );
+    assert_eq!(protocol_error.applied_policy, QwpWsErrorPolicy::Halt);
+    assert_eq!(protocol_error.status, None);
+    assert_eq!(protocol_error.message_sequence, None);
+    assert_eq!(protocol_error.message.as_deref(), Some(expected_message));
+    assert_eq!(protocol_error.from_fsn, fsn);
+    assert_eq!(protocol_error.to_fsn, fsn);
+
+    let err = sender.flush(&mut buf).unwrap_err();
+    assert!(
+        err.msg().contains(expected_message),
+        "expected protocol violation in terminal message, got: {}",
+        err.msg()
+    );
+}
+
+#[test]
+fn qwp_ws_masked_server_frame_is_pollable_as_protocol_violation() {
+    assert_server_protocol_violation(
+        |stream| write_server_frame(stream, 0x2, b"masked", true),
+        "WebSocket server frame must not be masked",
+    );
+}
+
+#[test]
+fn qwp_ws_unknown_opcode_is_pollable_as_protocol_violation() {
+    assert_server_protocol_violation(
+        |stream| write_server_frame(stream, 0x0B, b"", false),
+        "Unknown WebSocket opcode: 0xb",
+    );
+}
+
+#[test]
+fn qwp_ws_text_response_is_pollable_as_protocol_violation() {
+    assert_server_protocol_violation(
+        |stream| write_server_frame(stream, 0x1, b"not-qwp", false),
+        "QWP/WebSocket server response was not a binary frame",
     );
 }
 

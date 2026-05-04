@@ -356,7 +356,7 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
 
     pub(crate) fn record_protocol_violation(
         &mut self,
-        close_code: u16,
+        close_code: Option<u16>,
         reason: String,
     ) -> Error {
         let from_fsn = self
@@ -364,10 +364,11 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
             .completed_fsn()
             .map_or(0, |fsn| fsn.saturating_add(1));
         let to_fsn = self.queue.published_fsn().unwrap_or(from_fsn).max(from_fsn);
-        let message = if reason.is_empty() {
-            format!("ws-close[{close_code}]")
-        } else {
-            format!("ws-close[{close_code}]: {reason}")
+        let message = match (close_code, reason.is_empty()) {
+            (Some(close_code), true) => format!("ws-close[{close_code}]"),
+            (Some(close_code), false) => format!("ws-close[{close_code}]: {reason}"),
+            (None, true) => "WebSocket protocol violation".to_string(),
+            (None, false) => reason,
         };
         let sender_error = QwpWsSenderError {
             category: QwpWsErrorCategory::ProtocolViolation,
@@ -1303,31 +1304,38 @@ impl ManualDriverTransport for BlockingQwpWsTransport {
             &mut self.recv,
         )
         .map_err(|err| {
-            if let super::qwp_ws::WsMessageError::Close(close) = err {
-                if let Some(close_code) = close.code
-                    && super::qwp_ws::is_terminal_ws_close_code(close_code)
-                {
-                    return TransportFailure::ProtocolViolation {
-                        close_code,
-                        reason: close.reason,
-                    };
+            match err {
+                super::qwp_ws::WsMessageError::Close(close) => {
+                    if let Some(close_code) = close.code
+                        && super::qwp_ws::is_terminal_ws_close_code(close_code)
+                    {
+                        return TransportFailure::ProtocolViolation {
+                            close_code: Some(close_code),
+                            reason: close.reason,
+                        };
+                    }
+                    TransportFailure::Disconnect(close.into_error())
                 }
-                return TransportFailure::Disconnect(close.into_error());
-            }
-            let err = err.into_error();
-            match err.code() {
-                ErrorCode::SocketError => TransportFailure::Disconnect(err),
-                ErrorCode::AuthError | ErrorCode::ProtocolVersionError => {
-                    TransportFailure::Terminal(err)
+                super::qwp_ws::WsMessageError::ProtocolViolation(reason) => {
+                    TransportFailure::ProtocolViolation {
+                        close_code: None,
+                        reason,
+                    }
                 }
-                _ => TransportFailure::Terminal(err),
+                super::qwp_ws::WsMessageError::Error(err) => match err.code() {
+                    ErrorCode::SocketError => TransportFailure::Disconnect(err),
+                    ErrorCode::AuthError | ErrorCode::ProtocolVersionError => {
+                        TransportFailure::Terminal(err)
+                    }
+                    _ => TransportFailure::Terminal(err),
+                }
             }
         })?;
         if opcode != WS_OPCODE_BINARY {
-            return Err(TransportFailure::Terminal(error::fmt!(
-                SocketError,
-                "QWP/WebSocket server response was not a binary frame"
-            )));
+            return Err(TransportFailure::ProtocolViolation {
+                close_code: None,
+                reason: "QWP/WebSocket server response was not a binary frame".to_string(),
+            });
         }
 
         let response = decode_transport_response(&self.recv)?;
@@ -1613,7 +1621,10 @@ pub(crate) enum TransportFailure {
     Disconnect(Error),
     Retryable(Error),
     Terminal(Error),
-    ProtocolViolation { close_code: u16, reason: String },
+    ProtocolViolation {
+        close_code: Option<u16>,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3518,7 +3529,7 @@ mod tests {
         assert_eq!(
             driver
                 .apply_transport_failure(TransportFailure::ProtocolViolation {
-                    close_code: 1002,
+                    close_code: Some(1002),
                     reason: "bad frame".to_string(),
                 })
                 .unwrap(),

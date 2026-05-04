@@ -890,6 +890,7 @@ impl WsCloseFrame {
 #[derive(Debug)]
 pub(crate) enum WsMessageError {
     Close(WsCloseFrame),
+    ProtocolViolation(String),
     Error(crate::Error),
 }
 
@@ -897,6 +898,9 @@ impl WsMessageError {
     pub(crate) fn into_error(self) -> crate::Error {
         match self {
             Self::Close(close) => close.into_error(),
+            Self::ProtocolViolation(reason) => {
+                error::fmt!(SocketError, "WebSocket protocol violation: {reason}")
+            }
             Self::Error(err) => err,
         }
     }
@@ -910,7 +914,7 @@ pub(crate) fn read_message_with_close<S: Read + Write>(
     out.clear();
     let mut first_opcode: Option<u8> = None;
     loop {
-        let (fin, opcode, payload) = read_frame(stream).map_err(WsMessageError::Error)?;
+        let (fin, opcode, payload) = read_frame(stream)?;
         match opcode {
             WS_OPCODE_PING => {
                 codec::write_frame_to_buf(scratch, true, WS_OPCODE_PONG, &payload, random_mask());
@@ -930,26 +934,23 @@ pub(crate) fn read_message_with_close<S: Read + Write>(
             }
             WS_OPCODE_TEXT | WS_OPCODE_BINARY => {
                 if first_opcode.is_some() {
-                    return Err(WsMessageError::Error(error::fmt!(
-                        SocketError,
-                        "Unexpected new data frame mid-message"
-                    )));
+                    return Err(WsMessageError::ProtocolViolation(
+                        "Unexpected new data frame mid-message".to_string(),
+                    ));
                 }
                 first_opcode = Some(opcode);
                 out.extend_from_slice(&payload);
             }
             WS_OPCODE_CONTINUATION => {
                 if first_opcode.is_none() {
-                    return Err(WsMessageError::Error(error::fmt!(
-                        SocketError,
-                        "Continuation frame without prior data frame"
-                    )));
+                    return Err(WsMessageError::ProtocolViolation(
+                        "Continuation frame without prior data frame".to_string(),
+                    ));
                 }
                 out.extend_from_slice(&payload);
             }
             other => {
-                return Err(WsMessageError::Error(error::fmt!(
-                    SocketError,
+                return Err(WsMessageError::ProtocolViolation(format!(
                     "Unknown WebSocket opcode: 0x{:x}",
                     other
                 )));
@@ -965,44 +966,45 @@ pub(crate) fn is_terminal_ws_close_code(code: u16) -> bool {
     matches!(code, 1002 | 1003 | 1007 | 1008 | 1009 | 1010)
 }
 
-fn read_frame<R: Read>(stream: &mut R) -> crate::Result<(bool, u8, Vec<u8>)> {
+fn read_frame<R: Read>(stream: &mut R) -> Result<(bool, u8, Vec<u8>), WsMessageError> {
     let mut hdr = [0u8; 2];
-    read_exact_io(stream, &mut hdr, "WebSocket frame header")?;
+    read_exact_io(stream, &mut hdr, "WebSocket frame header").map_err(WsMessageError::Error)?;
     let fin = (hdr[0] & 0x80) != 0;
     let opcode = hdr[0] & 0x0F;
     let masked = (hdr[1] & 0x80) != 0;
     if masked {
-        return Err(error::fmt!(
-            SocketError,
-            "WebSocket server frame must not be masked"
+        return Err(WsMessageError::ProtocolViolation(
+            "WebSocket server frame must not be masked".to_string(),
         ));
     }
     let len_short = hdr[1] & 0x7F;
     let payload_len: u64 = match len_short {
         126 => {
             let mut b = [0u8; 2];
-            read_exact_io(stream, &mut b, "WebSocket frame length")?;
+            read_exact_io(stream, &mut b, "WebSocket frame length")
+                .map_err(WsMessageError::Error)?;
             u16::from_be_bytes(b) as u64
         }
         127 => {
             let mut b = [0u8; 8];
-            read_exact_io(stream, &mut b, "WebSocket frame length")?;
+            read_exact_io(stream, &mut b, "WebSocket frame length")
+                .map_err(WsMessageError::Error)?;
             u64::from_be_bytes(b)
         }
         n => n as u64,
     };
 
     if payload_len > MAX_INBOUND_FRAME_BYTES {
-        return Err(error::fmt!(
-            SocketError,
+        return Err(WsMessageError::ProtocolViolation(format!(
             "WebSocket frame too large: {} bytes",
             payload_len
-        ));
+        )));
     }
 
     let mut payload = vec![0u8; payload_len as usize];
     if !payload.is_empty() {
-        read_exact_io(stream, &mut payload, "WebSocket frame payload")?;
+        read_exact_io(stream, &mut payload, "WebSocket frame payload")
+            .map_err(WsMessageError::Error)?;
     }
     Ok((fin, opcode, payload))
 }
