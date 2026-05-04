@@ -29,7 +29,9 @@
 #include <cstddef>
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <optional>
+#include <string>
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
@@ -109,6 +111,46 @@ enum class protocol
 
     /** QuestWire Protocol over UDP. */
     qwpudp,
+
+    /** QuestWire Protocol over WebSocket. */
+    qwpws,
+
+    /** QuestWire Protocol over WebSocket Secure (TLS). */
+    qwpwss,
+};
+
+enum class qwp_ws_progress
+{
+    background,
+    manual,
+};
+
+enum class qwp_ws_error_category
+{
+    schema_mismatch,
+    parse_error,
+    internal_error,
+    security_error,
+    write_error,
+    protocol_violation,
+    unknown,
+};
+
+enum class qwp_ws_error_policy
+{
+    drop_and_continue,
+    halt,
+};
+
+struct qwp_ws_error
+{
+    qwp_ws_error_category category;
+    qwp_ws_error_policy applied_policy;
+    std::optional<uint8_t> status;
+    std::string message;
+    std::optional<uint64_t> message_sequence;
+    uint64_t from_fsn;
+    uint64_t to_fsn;
 };
 
 enum class protocol_version
@@ -153,13 +195,19 @@ enum class ca
  * An error that occurred when using the line sender.
  *
  * Call `.what()` to obtain the ASCII-encoded error message.
+ * For QWP/WebSocket terminal diagnostics, `.qwp_ws_diagnostic()` returns the
+ * structured server or protocol error that halted the sender.
  */
 class line_sender_error : public std::runtime_error
 {
 public:
-    line_sender_error(line_sender_error_code code, const std::string& what)
+    line_sender_error(
+        line_sender_error_code code,
+        const std::string& what,
+        std::optional<qwp_ws_error> qwp_ws_diagnostic = std::nullopt)
         : std::runtime_error{what}
         , _code{code}
+        , _qwp_ws_diagnostic{std::move(qwp_ws_diagnostic)}
     {
     }
 
@@ -169,17 +217,46 @@ public:
         return _code;
     }
 
+    /** Structured diagnostic for a QWP/WebSocket HALT error, if available. */
+    const std::optional<qwp_ws_error>& qwp_ws_diagnostic() const noexcept
+    {
+        return _qwp_ws_diagnostic;
+    }
+
 private:
     inline static line_sender_error from_c(::line_sender_error* c_err)
     {
+        const std::unique_ptr<
+            ::line_sender_error,
+            decltype(&::line_sender_error_free)>
+            owned_err{c_err, ::line_sender_error_free};
         line_sender_error_code code = static_cast<line_sender_error_code>(
-            static_cast<int>(::line_sender_error_get_code(c_err)));
+            static_cast<int>(::line_sender_error_get_code(owned_err.get())));
         size_t c_len{0};
-        const char* c_msg{::line_sender_error_msg(c_err, &c_len)};
+        const char* c_msg{::line_sender_error_msg(owned_err.get(), &c_len)};
         std::string msg{c_msg, c_len};
-        line_sender_error err{code, msg};
-        ::line_sender_error_free(c_err);
-        return err;
+
+        std::optional<qwp_ws_error> qwp_ws_diagnostic;
+        line_sender_qwpws_error_view view{};
+        if (::line_sender_error_qwpws_get_view(owned_err.get(), &view))
+        {
+            qwp_ws_diagnostic = qwp_ws_error{
+                static_cast<qwp_ws_error_category>(
+                    static_cast<int>(view.category)),
+                static_cast<qwp_ws_error_policy>(
+                    static_cast<int>(view.applied_policy)),
+                view.has_status ? std::optional<uint8_t>{view.status}
+                                : std::nullopt,
+                view.message ? std::string{view.message, view.message_len}
+                             : std::string{},
+                view.has_message_sequence
+                    ? std::optional<uint64_t>{view.message_sequence}
+                    : std::nullopt,
+                view.from_fsn,
+                view.to_fsn};
+        }
+
+        return line_sender_error{code, msg, std::move(qwp_ws_diagnostic)};
     }
 
     template <typename F, typename... Args>
@@ -203,6 +280,7 @@ private:
     friend class basic_view;
 
     line_sender_error_code _code;
+    std::optional<qwp_ws_error> _qwp_ws_diagnostic;
 };
 
 /**

@@ -288,6 +288,11 @@ where
         Ok(store.poll_sender_error())
     }
 
+    fn terminal_sender_error(&self) -> crate::Result<Option<QwpWsSenderError>> {
+        let store = self.lock_shared()?;
+        Ok(store.terminal_sender_error().cloned())
+    }
+
     fn sender_errors_dropped_total(&self) -> crate::Result<u64> {
         let store = self.lock_shared()?;
         Ok(store.sender_errors_dropped_total())
@@ -1374,6 +1379,15 @@ pub(crate) fn qwp_ws_acked_fsn_manual(
     Ok(state.publisher.acked_fsn())
 }
 
+pub(crate) fn qwp_ws_check_error_background(state: &SyncQwpWsHandlerState) -> crate::Result<()> {
+    let store = state.runner.lock_shared()?;
+    check_store_error(&store)
+}
+
+pub(crate) fn qwp_ws_check_error_manual(state: &ManualQwpWsHandlerState) -> crate::Result<()> {
+    check_manual_publisher_error(state)
+}
+
 pub(crate) fn qwp_ws_poll_sender_error_background(
     state: &SyncQwpWsHandlerState,
 ) -> crate::Result<Option<QwpWsSenderError>> {
@@ -1384,6 +1398,18 @@ pub(crate) fn qwp_ws_poll_sender_error_manual(
     state: &mut ManualQwpWsHandlerState,
 ) -> crate::Result<Option<QwpWsSenderError>> {
     Ok(state.publisher.poll_sender_error())
+}
+
+pub(crate) fn qwp_ws_terminal_sender_error_background(
+    state: &SyncQwpWsHandlerState,
+) -> crate::Result<Option<QwpWsSenderError>> {
+    state.runner.terminal_sender_error()
+}
+
+pub(crate) fn qwp_ws_terminal_sender_error_manual(
+    state: &ManualQwpWsHandlerState,
+) -> crate::Result<Option<QwpWsSenderError>> {
+    Ok(state.publisher.terminal_sender_error().cloned())
 }
 
 pub(crate) fn qwp_ws_sender_errors_dropped_background(

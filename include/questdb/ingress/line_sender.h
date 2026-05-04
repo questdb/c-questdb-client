@@ -878,105 +878,50 @@ bool line_sender_buffer_check_can_flush(
  */
 typedef struct line_sender line_sender;
 
-/**
- * Shape-only QWP/WebSocket sender prototype.
- */
-typedef struct line_sender_qwpws line_sender_qwpws;
-
-typedef struct line_sender_qwpws_receipt
+typedef enum line_sender_qwpws_progress
 {
-    uint64_t fsn;
-} line_sender_qwpws_receipt;
+    LINE_SENDER_QWPWS_PROGRESS_BACKGROUND = 0,
+    LINE_SENDER_QWPWS_PROGRESS_MANUAL = 1,
+} line_sender_qwpws_progress;
 
-typedef enum line_sender_qwpws_event_kind
+typedef struct line_sender_qwpws_fsn
 {
-    LINE_SENDER_QWPWS_EVENT_NONE = 0,
-    LINE_SENDER_QWPWS_EVENT_PUBLISHED,
-    LINE_SENDER_QWPWS_EVENT_SENT,
-    LINE_SENDER_QWPWS_EVENT_ACKED,
-    LINE_SENDER_QWPWS_EVENT_DURABLE_ACK,
-    LINE_SENDER_QWPWS_EVENT_RETRYING,
-    LINE_SENDER_QWPWS_EVENT_RECONNECTED,
-    LINE_SENDER_QWPWS_EVENT_REJECTED,
-    LINE_SENDER_QWPWS_EVENT_BACKPRESSURE,
-    LINE_SENDER_QWPWS_EVENT_TERMINAL,
-} line_sender_qwpws_event_kind;
+    bool has_value;
+    uint64_t value;
+} line_sender_qwpws_fsn;
 
-typedef struct line_sender_qwpws_event
+typedef enum line_sender_qwpws_error_category
 {
-    line_sender_qwpws_event_kind kind;
-    uint64_t fsn;
-    uint64_t wire_sequence;
-    uint8_t qwp_status;
-    bool message_truncated;
-} line_sender_qwpws_event;
+    LINE_SENDER_QWPWS_ERROR_SCHEMA_MISMATCH = 0,
+    LINE_SENDER_QWPWS_ERROR_PARSE_ERROR = 1,
+    LINE_SENDER_QWPWS_ERROR_INTERNAL_ERROR = 2,
+    LINE_SENDER_QWPWS_ERROR_SECURITY_ERROR = 3,
+    LINE_SENDER_QWPWS_ERROR_WRITE_ERROR = 4,
+    LINE_SENDER_QWPWS_ERROR_PROTOCOL_VIOLATION = 5,
+    LINE_SENDER_QWPWS_ERROR_UNKNOWN = 6,
+} line_sender_qwpws_error_category;
 
-typedef enum line_sender_qwpws_drive_kind
+typedef enum line_sender_qwpws_error_policy
 {
-    LINE_SENDER_QWPWS_DRIVE_IDLE = 0,
-    LINE_SENDER_QWPWS_DRIVE_PROGRESS,
-    LINE_SENDER_QWPWS_DRIVE_TERMINAL,
-} line_sender_qwpws_drive_kind;
+    LINE_SENDER_QWPWS_ERROR_DROP_AND_CONTINUE = 0,
+    LINE_SENDER_QWPWS_ERROR_HALT = 1,
+} line_sender_qwpws_error_policy;
 
-typedef struct line_sender_qwpws_drive_outcome
+typedef struct line_sender_qwpws_error line_sender_qwpws_error;
+
+typedef struct line_sender_qwpws_error_view
 {
-    line_sender_qwpws_drive_kind kind;
-} line_sender_qwpws_drive_outcome;
-
-typedef enum line_sender_qwpws_receipt_status_kind
-{
-    LINE_SENDER_QWPWS_RECEIPT_INVALID = 0,
-    LINE_SENDER_QWPWS_RECEIPT_PENDING,
-    LINE_SENDER_QWPWS_RECEIPT_ACKED,
-    LINE_SENDER_QWPWS_RECEIPT_REJECTED,
-    LINE_SENDER_QWPWS_RECEIPT_TERMINAL,
-} line_sender_qwpws_receipt_status_kind;
-
-typedef struct line_sender_qwpws_receipt_status
-{
-    line_sender_qwpws_receipt_status_kind kind;
-    uint64_t fsn;
-    uint8_t qwp_status;
-} line_sender_qwpws_receipt_status;
-
-typedef enum line_sender_qwpws_delivery_kind
-{
-    LINE_SENDER_QWPWS_DELIVERY_ACKED = 0,
-    LINE_SENDER_QWPWS_DELIVERY_REJECTED,
-    LINE_SENDER_QWPWS_DELIVERY_TIMEOUT,
-    LINE_SENDER_QWPWS_DELIVERY_TERMINAL,
-} line_sender_qwpws_delivery_kind;
-
-typedef struct line_sender_qwpws_delivery
-{
-    line_sender_qwpws_delivery_kind kind;
-    uint64_t fsn;
-    uint8_t qwp_status;
-    bool message_truncated;
-} line_sender_qwpws_delivery;
-
-typedef enum line_sender_qwpws_close_kind
-{
-    LINE_SENDER_QWPWS_CLOSE_DRAINED = 0,
-    LINE_SENDER_QWPWS_CLOSE_TIMEOUT,
-    LINE_SENDER_QWPWS_CLOSE_TERMINAL,
-} line_sender_qwpws_close_kind;
-
-typedef struct line_sender_qwpws_close_outcome
-{
-    line_sender_qwpws_close_kind kind;
-    bool has_published_fsn;
-    uint64_t published_fsn;
-    bool has_server_acked_fsn;
-    uint64_t server_acked_fsn;
-    bool has_completed_fsn;
-    uint64_t completed_fsn;
-} line_sender_qwpws_close_outcome;
-
-/**
- * Shape-only QWP/WebSocket threaded ownership prototype.
- */
-typedef struct line_sender_qwpws_threaded line_sender_qwpws_threaded;
+    line_sender_qwpws_error_category category;
+    line_sender_qwpws_error_policy applied_policy;
+    bool has_status;
+    uint8_t status;
+    bool has_message_sequence;
+    uint64_t message_sequence;
+    uint64_t from_fsn;
+    uint64_t to_fsn;
+    const char* message;
+    size_t message_len;
+} line_sender_qwpws_error_view;
 
 /**
  * Accumulates parameters for a new `line_sender` object.
@@ -1088,6 +1033,18 @@ LINESENDER_API
 bool line_sender_opts_multicast_ttl(
     line_sender_opts* opts,
     uint32_t multicast_ttl,
+    line_sender_error** err_out);
+
+/**
+ * Control whether QWP/WebSocket progress is driven by a background thread or
+ * manually by the caller. The default is background progress. This setting is
+ * only supported for `line_sender_protocol_qwpws` and
+ * `line_sender_protocol_qwpwss`.
+ */
+LINESENDER_API
+bool line_sender_opts_qwpws_progress(
+    line_sender_opts* opts,
+    line_sender_qwpws_progress progress,
     line_sender_error** err_out);
 
 /**
@@ -1306,7 +1263,8 @@ line_sender* line_sender_build(
 /**
  * Create a new line sender instance from the given configuration string.
  * The format of the string is: "tcp::addr=host:port;key=value;...;"
- * Instead of "tcp" you can also specify "tcps", "http", and "https".
+ * Instead of "tcp" you can also specify "tcps", "http", "https",
+ * "qwpudp", "qwpws", and "qwpwss".
  *
  * The accepted keys match one-for-one with the functions on
  * `line_sender_opts`. For example, this is a valid configuration string:
@@ -1382,7 +1340,7 @@ size_t line_sender_get_max_name_len(const line_sender* sender);
  *
  * This is the preferred protocol-neutral constructor. It may produce a
  * different buffer implementation than `line_sender_buffer_new(...)`, for
- * example when the sender uses QWP-over-UDP.
+ * example when the sender uses QWP-over-UDP or QWP-over-WebSocket.
  */
 LINESENDER_API
 line_sender_buffer* line_sender_buffer_new_for_sender(
@@ -1407,152 +1365,127 @@ LINESENDER_API
 void line_sender_close(line_sender* sender);
 
 /**
- * Create a shape-only QWP/WebSocket sender prototype.
- *
- * This validates ABI shape and ownership before transport, queue, or encoder
- * implementation is wired through. The config is intentionally ignored for now.
+ * Publish a QWP/WebSocket buffer locally, clear it on success, and return the
+ * assigned frame sequence number. Empty buffers succeed with
+ * `fsn_out->has_value == false`.
  */
 LINESENDER_API
-line_sender_qwpws* line_sender_qwpws_new(
-    line_sender_utf8 config, line_sender_error** err_out);
-
-/**
- * Construct a QWP/WebSocket buffer compatible with the sender.
- */
-LINESENDER_API
-line_sender_buffer* line_sender_qwpws_new_buffer(
-    const line_sender_qwpws* sender,
-    line_sender_error** err_out);
-
-/**
- * Publish the buffer locally and clear it on success.
- *
- * `receipt_out` is required. Passing NULL returns false and sets `err_out` if
- * provided.
- */
-LINESENDER_API
-bool line_sender_qwpws_submit(
-    line_sender_qwpws* sender,
+bool line_sender_qwpws_flush_and_get_fsn(
+    line_sender* sender,
     line_sender_buffer* buffer,
-    line_sender_qwpws_receipt* receipt_out,
+    line_sender_qwpws_fsn* fsn_out,
     line_sender_error** err_out);
 
 /**
- * Publish the buffer locally without clearing it.
- *
- * `receipt_out` is required. Passing NULL returns false and sets `err_out` if
- * provided.
+ * Publish a QWP/WebSocket buffer locally without clearing it and return the
+ * assigned frame sequence number. Empty buffers succeed with
+ * `fsn_out->has_value == false`.
  */
 LINESENDER_API
-bool line_sender_qwpws_submit_and_keep(
-    line_sender_qwpws* sender,
+bool line_sender_qwpws_flush_and_keep_and_get_fsn(
+    line_sender* sender,
     const line_sender_buffer* buffer,
-    line_sender_qwpws_receipt* receipt_out,
+    line_sender_qwpws_fsn* fsn_out,
     line_sender_error** err_out);
 
 /**
- * Progress manual QWP/WebSocket work without consuming events.
- *
- * `outcome_out` is required. Idle, progress, and terminal are normal outcomes,
- * not `err_out` failures.
+ * Drive one QWP/WebSocket progress step for a sender built with
+ * `qwp_ws_progress=manual`.
  */
 LINESENDER_API
 bool line_sender_qwpws_drive_once(
-    line_sender_qwpws* sender,
+    line_sender* sender,
+    bool* progressed_out,
+    line_sender_error** err_out);
+
+/**
+ * Return the highest QWP/WebSocket frame sequence number published locally, or
+ * no value if no frame has been published.
+ */
+LINESENDER_API
+bool line_sender_qwpws_published_fsn(
+    const line_sender* sender,
+    line_sender_qwpws_fsn* fsn_out,
+    line_sender_error** err_out);
+
+/**
+ * Return the highest QWP/WebSocket frame sequence number completed by ACK or
+ * drop-and-continue rejection, or no value if no frame has completed.
+ */
+LINESENDER_API
+bool line_sender_qwpws_acked_fsn(
+    const line_sender* sender,
+    line_sender_qwpws_fsn* fsn_out,
+    line_sender_error** err_out);
+
+/**
+ * Wait until the QWP/WebSocket completion watermark reaches `fsn`.
+ * Timeout is a normal successful result with `*reached_out == false`.
+ */
+LINESENDER_API
+bool line_sender_qwpws_await_acked_fsn(
+    line_sender* sender,
+    uint64_t fsn,
     uint64_t timeout_millis,
-    line_sender_qwpws_drive_outcome* outcome_out,
+    bool* reached_out,
     line_sender_error** err_out);
 
 /**
- * Poll the next QWP/WebSocket event.
- *
- * `event_out` is required. `message_len_out` is optional. `message_buf` may be
- * NULL only when `message_buf_len == 0`; short buffers truncate the message and
- * set `event_out->message_truncated`.
+ * Poll the next structured QWP/WebSocket diagnostic. No diagnostic is a
+ * successful result with `*error_out == NULL`.
  */
 LINESENDER_API
-bool line_sender_qwpws_poll_event(
-    line_sender_qwpws* sender,
-    line_sender_qwpws_event* event_out,
-    char* message_buf,
-    size_t message_buf_len,
-    size_t* message_len_out,
+bool line_sender_qwpws_poll_error(
+    line_sender* sender,
+    line_sender_qwpws_error** error_out,
     line_sender_error** err_out);
 
 /**
- * Query receipt status without blocking.
+ * Return a borrowed view into an owned QWP/WebSocket diagnostic.
  *
- * `status_out` is required. An invalid receipt is reported as
- * `LINE_SENDER_QWPWS_RECEIPT_INVALID`, not as an API failure.
+ * The view's `message` pointer is valid until `error` is freed.
  */
 LINESENDER_API
-bool line_sender_qwpws_get_receipt_status(
-    const line_sender_qwpws* sender,
-    line_sender_qwpws_receipt receipt,
-    line_sender_qwpws_receipt_status* status_out,
-    line_sender_error** err_out);
+line_sender_qwpws_error_view line_sender_qwpws_error_get_view(
+    const line_sender_qwpws_error* error);
 
 /**
- * Wait for delivery of a receipt.
+ * If `error` carries a terminal QWP/WebSocket diagnostic, write a borrowed
+ * view into `view_out` and return true.
  *
- * `outcome_out` is required. Timeout and terminal delivery are normal outcomes.
- * Waiting on an invalid receipt is an API failure.
+ * The view's `message` pointer is valid until `error` is freed. Returns false
+ * when `error` has no QWP/WebSocket diagnostic, or when either pointer is NULL.
  */
 LINESENDER_API
-bool line_sender_qwpws_wait(
-    line_sender_qwpws* sender,
-    line_sender_qwpws_receipt receipt,
-    uint64_t timeout_millis,
-    line_sender_qwpws_delivery* outcome_out,
-    char* message_buf,
-    size_t message_buf_len,
-    size_t* message_len_out,
+bool line_sender_error_qwpws_get_view(
+    const line_sender_error* error,
+    line_sender_qwpws_error_view* view_out);
+
+/**
+ * Free an owned QWP/WebSocket diagnostic. Passing NULL is a no-op.
+ */
+LINESENDER_API
+void line_sender_qwpws_error_free(line_sender_qwpws_error* error);
+
+/**
+ * Return how many QWP/WebSocket diagnostics were dropped because the sender's
+ * bounded diagnostic ring was full.
+ */
+LINESENDER_API
+bool line_sender_qwpws_errors_dropped(
+    const line_sender* sender,
+    uint64_t* dropped_out,
     line_sender_error** err_out);
 
 /**
- * Drain pending QWP/WebSocket work before closing.
- *
- * `outcome_out` is required. Timeout and terminal close are normal outcomes.
- * Close watermark fields are valid only when their matching `has_*` flag is
- * true.
+ * Stop accepting new QWP/WebSocket publications and wait for already-published
+ * frames to resolve. Timeout and terminal failure are reported through
+ * `err_out`.
  */
 LINESENDER_API
 bool line_sender_qwpws_close_drain(
-    line_sender_qwpws* sender,
-    uint64_t timeout_millis,
-    line_sender_qwpws_close_outcome* outcome_out,
+    line_sender* sender,
     line_sender_error** err_out);
-
-/**
- * Close without draining. Passing NULL is a no-op.
- */
-LINESENDER_API
-void line_sender_qwpws_close_fast(line_sender_qwpws* sender);
-
-/**
- * Free a shape-only QWP/WebSocket sender prototype.
- */
-LINESENDER_API
-void line_sender_qwpws_free(line_sender_qwpws* sender);
-
-/**
- * Consume a manual QWP/WebSocket sender prototype into a threaded prototype.
- *
- * On success, `*sender` is set to NULL and `threaded_out` receives ownership.
- * On failure, `*sender` remains unchanged.
- */
-LINESENDER_API
-bool line_sender_qwpws_threaded_start(
-    line_sender_qwpws** sender,
-    line_sender_qwpws_threaded** threaded_out,
-    line_sender_error** err_out);
-
-/**
- * Stop and free a shape-only QWP/WebSocket threaded prototype.
- */
-LINESENDER_API
-void line_sender_qwpws_threaded_stop(
-    line_sender_qwpws_threaded* threaded);
 
 /**
  * Send the given buffer of rows to the QuestDB server, clearing the buffer.
@@ -1576,6 +1509,11 @@ void line_sender_qwpws_threaded_stop(
  * local socket errors only. A successful return does not guarantee delivery,
  * and when a flush spans multiple datagrams there is no all-or-nothing
  * guarantee for the logical batch.
+ *
+ * With QWP-over-WebSocket, the function publishes the buffer into the local
+ * sender queue and returns before the server necessarily ACKs the frame. Later
+ * terminal diagnostics fail subsequent sender calls and are also observable
+ * through the QWP/WebSocket diagnostic polling API.
  *
  * HTTP should be the first choice, but use TCP if you need to continuously
  * send data to the server at a high rate.

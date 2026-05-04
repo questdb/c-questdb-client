@@ -150,6 +150,10 @@ impl<Q: PublicationLog, T: ManualDriverTransport> QwpWsPublicationDriver<Q, T> {
         self.driver.terminal_error()
     }
 
+    pub(crate) fn terminal_sender_error(&self) -> Option<&QwpWsSenderError> {
+        self.driver.terminal_sender_error()
+    }
+
     pub(crate) fn is_terminal(&self) -> bool {
         self.driver.is_terminal()
     }

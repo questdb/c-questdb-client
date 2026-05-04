@@ -251,6 +251,11 @@ impl Sender {
         })?;
         qwp.check_can_flush()?;
         if qwp.is_empty() {
+            match &self.handler {
+                SyncProtocolHandler::SyncQwpWs(state) => qwp_ws_check_error_background(state)?,
+                SyncProtocolHandler::ManualQwpWs(state) => qwp_ws_check_error_manual(state)?,
+                _ => unreachable!("QWP/WebSocket handler was checked above"),
+            }
             return Ok(None);
         }
         if qwp.len() > self.max_buf_size {
@@ -600,6 +605,24 @@ impl Sender {
             _ => Err(error::fmt!(
                 InvalidApiCall,
                 "poll_qwp_ws_error is only supported for QWP/WebSocket senders."
+            )),
+        }
+    }
+
+    /// Return the structured QWP/WebSocket diagnostic that halted this sender,
+    /// if terminalization was caused by a QWP/WebSocket server or protocol
+    /// error.
+    ///
+    /// Unlike [`Sender::poll_qwp_ws_error`], this does not consume the diagnostic.
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    #[doc(hidden)]
+    pub fn qwp_ws_terminal_error(&self) -> Result<Option<QwpWsSenderError>> {
+        match &self.handler {
+            SyncProtocolHandler::SyncQwpWs(state) => qwp_ws_terminal_sender_error_background(state),
+            SyncProtocolHandler::ManualQwpWs(state) => qwp_ws_terminal_sender_error_manual(state),
+            _ => Err(error::fmt!(
+                InvalidApiCall,
+                "qwp_ws_terminal_error is only supported for QWP/WebSocket senders."
             )),
         }
     }

@@ -838,7 +838,8 @@ public:
     /**
      * Create a new `opts` instance from the given configuration string.
      * The format of the string is: "tcp::addr=host:port;key=value;...;"
-     * Instead of "tcp" you can also specify "tcps", "http", "https", and "qwpudp".
+     * Instead of "tcp" you can also specify "tcps", "http", "https",
+     * "qwpudp", "qwpws", and "qwpwss".
      *
      * The accepted keys match one-for-one with the methods on `opts`.
      * For example, this is a valid configuration string:
@@ -981,6 +982,22 @@ public:
     {
         line_sender_error::wrapped_call(
             ::line_sender_opts_multicast_ttl, _impl, multicast_ttl);
+        return *this;
+    }
+
+    /**
+     * Control whether QWP/WebSocket progress is driven by a background thread
+     * or manually by the caller. The default is background progress.
+     *
+     * This setting is only supported for `protocol::qwpws` and
+     * `protocol::qwpwss`.
+     */
+    opts& qwp_ws_progress(qwp_ws_progress progress)
+    {
+        const auto c_progress = static_cast<::line_sender_qwpws_progress>(
+            static_cast<int>(progress));
+        line_sender_error::wrapped_call(
+            ::line_sender_opts_qwpws_progress, _impl, c_progress);
         return *this;
     }
 
@@ -1231,7 +1248,8 @@ public:
     /**
      * Create a new line sender instance from the given configuration string.
      * The format of the string is: "tcp::addr=host:port;key=value;...;"
-     * Instead of "tcp" you can also specify "tcps", "http", and "https".
+     * Instead of "tcp" you can also specify "tcps", "http", "https",
+     * "qwpudp", "qwpws", and "qwpwss".
      *
      * The accepted keys match one-for-one with the methods on `opts`.
      * For example, this is a valid configuration string:
@@ -1328,14 +1346,17 @@ public:
      *
      * This is the preferred protocol-neutral constructor. It may produce a
      * different buffer implementation than `line_sender_buffer{protocol_version()}`
-     * when the sender uses QWP-over-UDP.
+     * when the sender uses QWP-over-UDP or QWP-over-WebSocket.
      */
     line_sender_buffer new_buffer(size_t init_buf_size = 64 * 1024)
     {
         ensure_impl();
         auto version = this->protocol_version();
         auto max_name_len = ::line_sender_get_max_name_len(_impl);
-        bool is_qwp = this->protocol() == protocol::qwpudp;
+        auto sender_protocol = this->protocol();
+        bool is_qwp = sender_protocol == protocol::qwpudp ||
+            sender_protocol == protocol::qwpws ||
+            sender_protocol == protocol::qwpwss;
         auto* raw_buffer = ::line_sender_buffer_new_for_sender(_impl);
         ::line_sender_buffer_reserve(raw_buffer, init_buf_size);
         return line_sender_buffer{
@@ -1368,6 +1389,11 @@ public:
      * returns local socket errors only. A successful return does not
      * guarantee delivery, and when a flush spans multiple datagrams there is
      * no all-or-nothing guarantee for the logical batch.
+     *
+     * With QWP-over-WebSocket, the function publishes the buffer into the
+     * local sender queue and returns before the server necessarily ACKs the
+     * frame. Later terminal diagnostics fail subsequent sender calls and are
+     * also observable through the QWP/WebSocket diagnostic polling API.
      *
      * HTTP should be the first choice, but use TCP if you need to continuously
      * send data to the server at a high rate.
@@ -1456,6 +1482,169 @@ public:
     }
 
     /**
+     * Publish a QWP/WebSocket buffer locally, clear it on success, and return
+     * the assigned frame sequence number. Empty buffers return `std::nullopt`.
+     */
+    std::optional<uint64_t> flush_and_get_fsn(line_sender_buffer& buffer)
+    {
+        buffer.may_init();
+        ensure_impl();
+        ::line_sender_qwpws_fsn fsn{};
+        line_sender_error::wrapped_call(
+            ::line_sender_qwpws_flush_and_get_fsn,
+            _impl,
+            buffer._impl,
+            &fsn);
+        return optional_fsn(fsn);
+    }
+
+    /**
+     * Publish a QWP/WebSocket buffer locally without clearing it and return the
+     * assigned frame sequence number. Empty buffers return `std::nullopt`.
+     */
+    std::optional<uint64_t> flush_and_keep_and_get_fsn(
+        const line_sender_buffer& buffer)
+    {
+        ensure_impl();
+        ::line_sender_qwpws_fsn fsn{};
+        if (buffer._impl)
+        {
+            line_sender_error::wrapped_call(
+                ::line_sender_qwpws_flush_and_keep_and_get_fsn,
+                _impl,
+                buffer._impl,
+                &fsn);
+        }
+        else
+        {
+            line_sender_buffer buffer2 = this->new_buffer(0);
+            line_sender_error::wrapped_call(
+                ::line_sender_qwpws_flush_and_keep_and_get_fsn,
+                _impl,
+                buffer2._impl,
+                &fsn);
+        }
+        return optional_fsn(fsn);
+    }
+
+    /**
+     * Return the highest QWP/WebSocket frame sequence number published locally,
+     * or `std::nullopt` if no frame has been published.
+     */
+    std::optional<uint64_t> published_fsn() const
+    {
+        ensure_impl();
+        ::line_sender_qwpws_fsn fsn{};
+        line_sender_error::wrapped_call(
+            ::line_sender_qwpws_published_fsn, _impl, &fsn);
+        return optional_fsn(fsn);
+    }
+
+    /**
+     * Return the highest QWP/WebSocket frame sequence number completed by ACK
+     * or drop-and-continue rejection, or `std::nullopt` if none has completed.
+     */
+    std::optional<uint64_t> acked_fsn() const
+    {
+        ensure_impl();
+        ::line_sender_qwpws_fsn fsn{};
+        line_sender_error::wrapped_call(
+            ::line_sender_qwpws_acked_fsn, _impl, &fsn);
+        return optional_fsn(fsn);
+    }
+
+    /**
+     * Wait until the QWP/WebSocket completion watermark reaches `fsn`.
+     * Returns false on timeout.
+     */
+    bool await_acked_fsn(
+        uint64_t fsn, std::chrono::milliseconds timeout)
+    {
+        ensure_impl();
+        const auto timeout_millis = checked_timeout_millis(timeout);
+        bool reached = false;
+        line_sender_error::wrapped_call(
+            ::line_sender_qwpws_await_acked_fsn,
+            _impl,
+            fsn,
+            timeout_millis,
+            &reached);
+        return reached;
+    }
+
+    /**
+     * Drive one QWP/WebSocket progress step when the sender was built with
+     * manual progress mode. Returns false when no immediate progress is
+     * available.
+     */
+    bool drive_once()
+    {
+        ensure_impl();
+        bool progressed = false;
+        line_sender_error::wrapped_call(
+            ::line_sender_qwpws_drive_once, _impl, &progressed);
+        return progressed;
+    }
+
+    /**
+     * Poll the next structured QWP/WebSocket diagnostic.
+     */
+    std::optional<qwp_ws_error> poll_qwp_ws_error()
+    {
+        ensure_impl();
+        ::line_sender_qwpws_error* c_error{nullptr};
+        line_sender_error::wrapped_call(
+            ::line_sender_qwpws_poll_error, _impl, &c_error);
+        if (!c_error)
+            return std::nullopt;
+
+        const std::unique_ptr<
+            ::line_sender_qwpws_error,
+            decltype(&::line_sender_qwpws_error_free)>
+            owned_error{c_error, ::line_sender_qwpws_error_free};
+        const auto view = ::line_sender_qwpws_error_get_view(owned_error.get());
+        qwp_ws_error error{
+            static_cast<qwp_ws_error_category>(
+                static_cast<int>(view.category)),
+            static_cast<qwp_ws_error_policy>(
+                static_cast<int>(view.applied_policy)),
+            view.has_status ? std::optional<uint8_t>{view.status}
+                            : std::nullopt,
+            view.message ? std::string{view.message, view.message_len}
+                         : std::string{},
+            view.has_message_sequence
+                ? std::optional<uint64_t>{view.message_sequence}
+                : std::nullopt,
+            view.from_fsn,
+            view.to_fsn};
+        return error;
+    }
+
+    /**
+     * Return how many QWP/WebSocket diagnostics were dropped because the
+     * bounded diagnostic ring was full.
+     */
+    uint64_t qwp_ws_errors_dropped() const
+    {
+        ensure_impl();
+        uint64_t dropped = 0;
+        line_sender_error::wrapped_call(
+            ::line_sender_qwpws_errors_dropped, _impl, &dropped);
+        return dropped;
+    }
+
+    /**
+     * Stop accepting new QWP/WebSocket publications and wait for already
+     * published frames to resolve. Throws on timeout or terminal failure.
+     */
+    void close_drain()
+    {
+        ensure_impl();
+        line_sender_error::wrapped_call(
+            ::line_sender_qwpws_close_drain, _impl);
+    }
+
+    /**
      * Check if an error occurred previously and the sender must be closed.
      * This happens when there was an earlier failure.
      * This method is specific to ILP-over-TCP and is not relevant for
@@ -1486,6 +1675,24 @@ public:
     }
 
 private:
+    static std::optional<uint64_t> optional_fsn(
+        const ::line_sender_qwpws_fsn& fsn)
+    {
+        if (fsn.has_value)
+            return fsn.value;
+        return std::nullopt;
+    }
+
+    static uint64_t checked_timeout_millis(
+        std::chrono::milliseconds timeout)
+    {
+        if (timeout.count() < 0)
+            throw line_sender_error{
+                line_sender_error_code::invalid_api_call,
+                "QWP/WebSocket ACK timeout must not be negative."};
+        return static_cast<uint64_t>(timeout.count());
+    }
+
     void ensure_impl() const
     {
         if (!_impl)

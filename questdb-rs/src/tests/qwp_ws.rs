@@ -1148,6 +1148,14 @@ fn qwp_ws_terminal_close_is_pollable_as_protocol_violation() {
     assert_eq!(sender.poll_qwp_ws_error().unwrap(), None);
     assert_eq!(sender.qwp_ws_errors_dropped().unwrap(), 0);
 
+    let err = sender.flush(&mut buf).unwrap_err();
+    assert!(
+        err.msg().contains("ws-close[1002]: bad frame"),
+        "expected terminal close in empty flush message, got: {}",
+        err.msg()
+    );
+    assert!(buf.is_empty(), "empty terminal flush must leave buffer empty");
+
     buf.table("trades")
         .unwrap()
         .column_i64("qty", 2)

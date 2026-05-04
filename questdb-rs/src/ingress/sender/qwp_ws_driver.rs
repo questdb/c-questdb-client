@@ -142,6 +142,7 @@ pub(crate) struct QwpWsPublicationStore<Q = VolatileFrameQueue> {
     terminal: bool,
     terminal_fsn: Option<u64>,
     terminal_error: Option<Error>,
+    terminal_sender_error: Option<QwpWsSenderError>,
     last_server_error: Option<QwpServerError>,
     rejected_frames: VecDeque<QwpRejectedFrame>,
     sender_errors: SenderErrorRing,
@@ -156,6 +157,7 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
             terminal: false,
             terminal_fsn: None,
             terminal_error: None,
+            terminal_sender_error: None,
             last_server_error: None,
             rejected_frames: VecDeque::new(),
             sender_errors: SenderErrorRing::new(event_capacity),
@@ -224,6 +226,7 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
                 let fsn = send_cursor.fsn_for_wire_seq(wire_seq, WireResponseKind::Reject)?;
                 if policy == QwpWsErrorPolicy::Halt {
                     let sender_error = sender_error_for_qwp_error(&error, wire_seq, fsn, policy);
+                    self.terminal_sender_error = Some(sender_error.clone());
                     self.sender_errors.push(sender_error);
                     self.last_server_error = Some(error.clone());
                     self.mark_terminal(Some(error.error.clone()));
@@ -366,7 +369,7 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         } else {
             format!("ws-close[{close_code}]: {reason}")
         };
-        self.sender_errors.push(QwpWsSenderError {
+        let sender_error = QwpWsSenderError {
             category: QwpWsErrorCategory::ProtocolViolation,
             applied_policy: QwpWsErrorPolicy::Halt,
             status: None,
@@ -374,7 +377,9 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
             message_sequence: None,
             from_fsn,
             to_fsn,
-        });
+        };
+        self.terminal_sender_error = Some(sender_error.clone());
+        self.sender_errors.push(sender_error);
         error::fmt!(SocketError, "QWP/WebSocket protocol violation: {message}")
     }
 
@@ -396,6 +401,10 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
 
     pub(crate) fn terminal_error(&self) -> Option<&Error> {
         self.terminal_error.as_ref()
+    }
+
+    pub(crate) fn terminal_sender_error(&self) -> Option<&QwpWsSenderError> {
+        self.terminal_sender_error.as_ref()
     }
 
     pub(crate) fn last_server_error(&self) -> Option<&QwpServerError> {
@@ -863,6 +872,10 @@ impl<Q: PublicationLog, T: ManualDriverTransport> ManualDriverPrototype<Q, T> {
 
     pub(crate) fn terminal_error(&self) -> Option<&Error> {
         self.store.terminal_error()
+    }
+
+    pub(crate) fn terminal_sender_error(&self) -> Option<&QwpWsSenderError> {
+        self.store.terminal_sender_error()
     }
 
     pub(crate) fn published_fsn(&self) -> Option<u64> {
@@ -3449,6 +3462,7 @@ mod tests {
         assert_eq!(error.message_sequence, Some(0));
         assert_eq!(error.from_fsn, 0);
         assert_eq!(error.to_fsn, 0);
+        assert_eq!(driver.terminal_sender_error(), None);
         assert_eq!(driver.poll_sender_error(), None);
     }
 
@@ -3475,6 +3489,15 @@ mod tests {
             QwpReceiptStatus::Terminal { fsn: 0 }
         );
 
+        let terminal_error = driver.terminal_sender_error().unwrap();
+        assert_eq!(terminal_error.category, QwpWsErrorCategory::ParseError);
+        assert_eq!(terminal_error.applied_policy, QwpWsErrorPolicy::Halt);
+        assert_eq!(terminal_error.status, Some(codec::WS_STATUS_PARSE_ERROR));
+        assert_eq!(terminal_error.message.as_deref(), Some("bad payload"));
+        assert_eq!(terminal_error.message_sequence, Some(0));
+        assert_eq!(terminal_error.from_fsn, 0);
+        assert_eq!(terminal_error.to_fsn, 0);
+
         let error = driver.poll_sender_error().unwrap();
         assert_eq!(error.category, QwpWsErrorCategory::ParseError);
         assert_eq!(error.applied_policy, QwpWsErrorPolicy::Halt);
@@ -3483,6 +3506,7 @@ mod tests {
         assert_eq!(error.message_sequence, Some(0));
         assert_eq!(error.from_fsn, 0);
         assert_eq!(error.to_fsn, 0);
+        assert_eq!(driver.terminal_sender_error(), Some(&error));
     }
 
     #[test]
@@ -3500,6 +3524,22 @@ mod tests {
                 .unwrap(),
             DriveOutcome::Terminal
         );
+
+        let terminal_error = driver.terminal_sender_error().unwrap();
+        assert_eq!(
+            terminal_error.category,
+            QwpWsErrorCategory::ProtocolViolation
+        );
+        assert_eq!(terminal_error.applied_policy, QwpWsErrorPolicy::Halt);
+        assert_eq!(terminal_error.status, None);
+        assert_eq!(terminal_error.message_sequence, None);
+        assert_eq!(terminal_error.from_fsn, 0);
+        assert_eq!(terminal_error.to_fsn, 1);
+        assert!(terminal_error
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("bad frame"));
 
         let error = driver.poll_sender_error().unwrap();
         assert_eq!(error.category, QwpWsErrorCategory::ProtocolViolation);

@@ -2739,6 +2739,91 @@ TEST_CASE("line_sender c++ qwpudp flush_and_keep resends datagram")
     CHECK(second == first);
 }
 
+TEST_CASE("line_sender c++ qwpws extension helpers reject qwpudp sender")
+{
+    udp_capture receiver;
+    questdb::ingress::opts opts{
+        questdb::ingress::protocol::qwpudp,
+        std::string("127.0.0.1"),
+        std::to_string(receiver.port())};
+    questdb::ingress::line_sender sender{opts};
+
+    try
+    {
+        (void)sender.published_fsn();
+        FAIL("published_fsn should reject non-QWP/WebSocket senders");
+    }
+    catch (const questdb::ingress::line_sender_error& ex)
+    {
+        CHECK(
+            ex.code() ==
+            questdb::ingress::line_sender_error_code::invalid_api_call);
+    }
+
+    CHECK_THROWS_AS(sender.acked_fsn(), questdb::ingress::line_sender_error);
+    CHECK_THROWS_AS(sender.drive_once(), questdb::ingress::line_sender_error);
+    CHECK_THROWS_AS(
+        sender.await_acked_fsn(0, std::chrono::milliseconds{0}),
+        questdb::ingress::line_sender_error);
+    CHECK_THROWS_AS(
+        sender.poll_qwp_ws_error(), questdb::ingress::line_sender_error);
+    CHECK_THROWS_AS(
+        sender.qwp_ws_errors_dropped(), questdb::ingress::line_sender_error);
+    CHECK_THROWS_AS(sender.close_drain(), questdb::ingress::line_sender_error);
+}
+
+TEST_CASE("line_sender_error c++ can carry qwpws diagnostic")
+{
+    questdb::ingress::qwp_ws_error diagnostic{
+        questdb::ingress::qwp_ws_error_category::parse_error,
+        questdb::ingress::qwp_ws_error_policy::halt,
+        std::optional<uint8_t>{2},
+        "bad line",
+        std::optional<uint64_t>{44},
+        5,
+        6};
+    questdb::ingress::line_sender_error error{
+        questdb::ingress::line_sender_error_code::socket_error,
+        "sender halted",
+        diagnostic};
+
+    REQUIRE(error.qwp_ws_diagnostic().has_value());
+    CHECK(
+        error.qwp_ws_diagnostic()->category ==
+        questdb::ingress::qwp_ws_error_category::parse_error);
+    CHECK(
+        error.qwp_ws_diagnostic()->applied_policy ==
+        questdb::ingress::qwp_ws_error_policy::halt);
+    CHECK(error.qwp_ws_diagnostic()->status == std::optional<uint8_t>{2});
+    CHECK(error.qwp_ws_diagnostic()->message == "bad line");
+    CHECK(
+        error.qwp_ws_diagnostic()->message_sequence ==
+        std::optional<uint64_t>{44});
+    CHECK(error.qwp_ws_diagnostic()->from_fsn == 5);
+    CHECK(error.qwp_ws_diagnostic()->to_fsn == 6);
+}
+
+TEST_CASE("line_sender c++ qwpws progress option rejects qwpudp opts")
+{
+    udp_capture receiver;
+    questdb::ingress::opts opts{
+        questdb::ingress::protocol::qwpudp,
+        std::string("127.0.0.1"),
+        std::to_string(receiver.port())};
+
+    try
+    {
+        opts.qwp_ws_progress(questdb::ingress::qwp_ws_progress::manual);
+        FAIL("qwp_ws_progress should reject non-QWP/WebSocket opts");
+    }
+    catch (const questdb::ingress::line_sender_error& ex)
+    {
+        CHECK(
+            ex.code() ==
+            questdb::ingress::line_sender_error_code::config_error);
+    }
+}
+
 TEST_CASE("line_sender c++ standalone qwpudp buffer")
 {
     udp_capture receiver;
