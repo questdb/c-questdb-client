@@ -138,6 +138,8 @@ For QWP/WebSocket:
 
 - success means the batch was published locally into bounded memory or SFA,
 - success does not mean the server has ACKed the batch,
+- `line_sender_flush()` on an empty QWP/WebSocket buffer succeeds as a no-op but
+  still checks for a latched terminal sender error,
 - `line_sender_flush()` clears the buffer only after local publication succeeds,
 - later terminal failures surface through subsequent sender calls and can carry
   the structured diagnostic on `line_sender_error*`,
@@ -188,7 +190,7 @@ Rules:
 
 - `fsn_out` is required.
 - Empty buffers return success with `fsn_out->has_value == false`.
-- On failure, the caller buffer is not cleared.
+- On failure, the caller's buffer is not cleared.
 - Transactional flush remains unsupported for QWP/WebSocket.
 
 ## Progress And Watermark Helpers
@@ -204,12 +206,12 @@ bool line_sender_qwpws_drive_once(
 
 Rules:
 
-- valid only for QWP/WebSocket senders built with `qwp_ws_progress=manual`,
+- valid only for QWP/WebSocket senders built with `qwp_ws_progress=manual`;
+  background QWP/WebSocket senders return `InvalidApiCall`,
 - returns success with `*progressed_out == false` when no immediate progress is
   available,
 - does not take a timeout; callers that want parking can sleep or wait in their
-  own scheduler,
-- returns `InvalidApiCall` for background QWP/WebSocket senders.
+  own scheduler.
 
 Watermark helpers are valid in both background and manual modes:
 
@@ -309,19 +311,24 @@ Rules:
 - no diagnostic is success with `*error_out == NULL`,
 - a returned diagnostic is owned by the caller and must be freed with
   `line_sender_qwpws_error_free()`,
-- the `message` pointer in `line_sender_qwpws_error_view` is valid until the
-  diagnostic object is freed,
+- the `message` pointer in `line_sender_qwpws_error_view` is not guaranteed to
+  be NUL-terminated; always use `message_len`,
+- the `message` pointer in a view from `line_sender_qwpws_error_get_view()` is
+  valid until the diagnostic object is freed,
 - QWP server non-OK responses set `has_status == true` and
   `has_message_sequence == true`,
-- terminal WebSocket protocol closes set `category ==
+- terminal WebSocket protocol violations, including terminal close frames and
+  malformed WebSocket frames/messages, set `category ==
   LINE_SENDER_QWPWS_ERROR_PROTOCOL_VIOLATION`, `has_status == false`, and
   `has_message_sequence == false`,
 - the function remains usable after terminalization so callers can inspect the
-  diagnostic that halted the sender.
+  diagnostic that halted the sender,
 - when a HALT diagnostic terminalizes the sender, the next failing sender call
   also returns a `line_sender_error*` whose structured diagnostic can be copied
   with `line_sender_error_qwpws_get_view()`. The returned view is borrowed from
-  the ordinary error object and is valid until `line_sender_error_free()`.
+  the ordinary error object and is valid until `line_sender_error_free()`. Copy
+  exactly `message_len` bytes from `view.message` before freeing the ordinary
+  error.
 
 The owned diagnostic object is intentional. A caller-provided message buffer
 would be adequate for C, but it is awkward for Cython and other language
@@ -366,26 +373,40 @@ failure, not a silent best-effort close.
 Background mode:
 
 ```c
+const char* conf = "qwpws::addr=localhost:9000;";
 line_sender_error* err = NULL;
 line_sender* sender = line_sender_from_conf(
         line_sender_utf8_assert(strlen(conf), conf),
         &err);
+if (sender == NULL) {
+    /* inspect err */
+    line_sender_error_free(err);
+    return;
+}
 
 line_sender_buffer* buffer = line_sender_buffer_new_for_sender(sender);
 /* append rows */
 
 if (!line_sender_flush(sender, buffer, &err)) {
     /* inspect err */
+    line_sender_error_free(err);
+    err = NULL;
 }
 
 line_sender_qwpws_error* qwp_err = NULL;
-if (line_sender_qwpws_poll_error(sender, &qwp_err, &err) && qwp_err != NULL) {
+if (!line_sender_qwpws_poll_error(sender, &qwp_err, &err)) {
+    /* inspect err */
+    line_sender_error_free(err);
+    err = NULL;
+} else if (qwp_err != NULL) {
     line_sender_qwpws_error_view view =
             line_sender_qwpws_error_get_view(qwp_err);
-    /* inspect view.category, view.applied_policy, view.message */
+    /* inspect view.category, view.applied_policy, view.message/message_len */
     line_sender_qwpws_error_free(qwp_err);
 }
 
+line_sender_buffer_free(buffer);
+/* Best-effort close. Use line_sender_qwpws_close_drain() for delivery-sensitive shutdown. */
 line_sender_close(sender);
 ```
 
@@ -393,21 +414,60 @@ Manual mode:
 
 ```c
 const char* conf = "qwpws::addr=localhost:9000;qwp_ws_progress=manual;";
+line_sender_error* err = NULL;
 line_sender* sender = line_sender_from_conf(
         line_sender_utf8_assert(strlen(conf), conf),
         &err);
+if (sender == NULL) {
+    /* inspect err */
+    line_sender_error_free(err);
+    return;
+}
+
+line_sender_buffer* buffer = line_sender_buffer_new_for_sender(sender);
+/* append rows */
 
 line_sender_qwpws_fsn fsn;
 if (line_sender_qwpws_flush_and_get_fsn(sender, buffer, &fsn, &err)
         && fsn.has_value) {
-    bool reached = false;
-    while (!reached) {
+    for (;;) {
+        line_sender_qwpws_fsn acked;
+        if (!line_sender_qwpws_acked_fsn(sender, &acked, &err)) {
+            /* inspect err */
+            line_sender_error_free(err);
+            err = NULL;
+            break;
+        }
+        if (acked.has_value && acked.value >= fsn.value) {
+            break;
+        }
+
         bool progressed = false;
-        line_sender_qwpws_drive_once(sender, &progressed, &err);
-        line_sender_qwpws_await_acked_fsn(sender, fsn.value, 10, &reached, &err);
+        if (!line_sender_qwpws_drive_once(sender, &progressed, &err)) {
+            /* inspect err */
+            line_sender_error_free(err);
+            err = NULL;
+            break;
+        }
+        if (!progressed) {
+            /* caller-owned park/sleep/yield */
+        }
     }
+} else if (err != NULL) {
+    /* inspect err */
+    line_sender_error_free(err);
+    err = NULL;
 }
+
+line_sender_buffer_free(buffer);
+/* Best-effort close. Use line_sender_qwpws_close_drain() for delivery-sensitive shutdown. */
+line_sender_close(sender);
 ```
+
+The manual example above shows genuine caller-owned progress: check the ACK
+watermark, call `drive_once()`, then park or yield in the caller's scheduler.
+For a simpler blocking wait in manual mode, call `line_sender_qwpws_await_acked_fsn()`
+directly; it already drives manual progress while waiting.
 
 ## Final C++ Wrapper Shape
 
@@ -516,11 +576,21 @@ auto buffer = sender.new_buffer();
 /* append rows */
 auto fsn = sender.flush_and_get_fsn(buffer);
 if (fsn) {
-    while (!sender.await_acked_fsn(*fsn, std::chrono::milliseconds{10})) {
-        sender.drive_once();
+    for (;;) {
+        auto acked = sender.acked_fsn();
+        if (acked && *acked >= *fsn) {
+            break;
+        }
+        if (!sender.drive_once()) {
+            /* caller-owned park/sleep/yield */
+        }
     }
 }
 ```
+
+For the convenience wait path, `sender.await_acked_fsn(*fsn, timeout)` is enough
+in manual mode; it drives progress internally. Use the explicit
+`acked_fsn()`/`drive_once()` loop only when the caller wants scheduler ownership.
 
 ## Final Python Wrapper Shape
 
@@ -564,11 +634,24 @@ sender.establish()
 
 fsn = sender.flush_and_get_fsn()
 if fsn is not None:
-    while not sender.await_acked_fsn(fsn, timeout_millis=10):
-        sender.drive_once()
+    while True:
+        acked = sender.acked_fsn()
+        if acked is not None and acked >= fsn:
+            break
+        if not sender.drive_once():
+            # caller-owned park/sleep/yield
+            pass
 
 sender.close_drain()
 ```
+
+As with C and C++, `await_acked_fsn()` is the convenience waiting API: in manual
+mode it drives progress internally. Use `acked_fsn()` plus `drive_once()` when the
+Python caller wants to own parking or event-loop integration.
+
+`Sender.establish()` follows the existing Python sender precedent: construction
+from config can be lazy, and callers that want connection errors before the first
+row/flush can establish explicitly.
 
 Suggested Python additions:
 
@@ -616,7 +699,7 @@ Python binding requirements:
 - do not silently discard QWP/WebSocket config keys in `Sender.from_conf()`;
   either delegate the full config to C when there are no Python-side overrides or
   reconstruct a synthetic config string that preserves every supported
-  QWP/WebSocket key,
+  QWP/WebSocket key, including at minimum `qwp_ws_progress`,
 - release the GIL around calls that can block on connection, append
   backpressure, ACK waiting, driver progress, or close-drain,
 - keep `Sender.close()` and context-manager exit as best-effort local
@@ -662,7 +745,7 @@ Before hardening the C ABI or language wrappers:
 4. C background mode rejects `line_sender_qwpws_drive_once()` with
    `InvalidApiCall`.
 5. C `line_sender_qwpws_poll_error()` observes schema/write drop-and-continue
-   errors and terminal parse/protocol-close errors.
+   errors and terminal parse/protocol-violation errors.
 6. C diagnostics use an owned object, so language bindings can copy complete
    server messages without truncation.
 7. C terminal `line_sender_error*` exposes the same HALT diagnostic without
@@ -670,8 +753,8 @@ Before hardening the C ABI or language wrappers:
 8. C++ wraps the same C functions without introducing a second sender class.
 9. Python wraps the same C functions through the existing `Sender` class without
    introducing a second sender class.
-10. Python `Sender.from_conf()` preserves QWP/WebSocket-specific config keys
-   instead of forwarding only `addr`.
+10. Python `Sender.from_conf()` preserves QWP/WebSocket-specific config keys,
+   including at minimum `qwp_ws_progress`, instead of forwarding only `addr`.
 11. Destructors/void close remain best-effort; explicit `close_drain()` is the
    only close path that reports delivery failure.
 
