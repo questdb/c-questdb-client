@@ -49,12 +49,12 @@ use super::qwp_ws_driver::{
     BlockingQwpWsTransport, DriveOutcome, DriverError, ManualDriverPrototype,
     ManualDriverTransport, PublicationLog, QwpWsPublicationStore, QwpWsReconnectProgress,
     QwpWsSendCore, QwpWsSendProgress, QwpWsTransportFailureAction, ReconnectPolicy,
-    ReconnectReason, TransportFailure, reconnect_error_is_terminal,
+    ReconnectReason, TransportFailure, lock_free_publish_error, reconnect_error_is_terminal,
 };
 use super::qwp_ws_publisher::{QwpWsPublicationDriver, QwpWsPublicationError, QwpWsReplayEncoder};
 use super::qwp_ws_queue::{
-    OutboundFrame, QwpReceipt, QwpReceiptStatus, SharedPayload, VolatileFrameQueue,
-    VolatileQueueOptions,
+    LockFreeVolatileProducer, LockFreeVolatilePublicationLog, OutboundFrame, QwpReceipt,
+    QwpReceiptStatus, SharedPayload, VolatileFrameQueue, VolatileQueueOptions,
 };
 use super::qwp_ws_sfa_slot::{SfaSlotOptions, SfaSlotQueue};
 
@@ -146,6 +146,7 @@ pub(crate) struct SyncQwpWsHandlerState {
 
 pub(crate) struct SyncQwpWsRunner<Q = ConfiguredQwpWsQueue> {
     shared: Arc<Mutex<QwpWsPublicationStore<Q>>>,
+    producer: Option<LockFreeVolatileProducer>,
     stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
 }
@@ -165,7 +166,8 @@ where
     where
         T: ManualDriverTransport + Send + 'static,
     {
-        let (store, send_core) = publisher.into_runner_parts();
+        let (mut store, send_core) = publisher.into_runner_parts();
+        let producer = store.claim_lock_free_producer();
         let shared = Arc::new(Mutex::new(store));
         let stop = Arc::new(AtomicBool::new(false));
         let thread_shared = Arc::clone(&shared);
@@ -185,12 +187,27 @@ where
 
         Self {
             shared,
+            producer,
             stop,
             thread: Some(thread),
         }
     }
 
-    fn publish_replay_payload(&self, payload: &[u8]) -> crate::Result<()> {
+    fn publish_replay_payload(&mut self, payload: &[u8]) -> crate::Result<()> {
+        if let Some(producer) = self.producer.as_mut() {
+            return match producer.try_submit(payload) {
+                Ok(_) => Ok(()),
+                Err(err) => {
+                    let err = lock_free_publish_error(err);
+                    if matches!(err, DriverError::Terminal) {
+                        let store = self.lock_shared()?;
+                        return Err(driver_error_to_error_from_store(&store, err));
+                    }
+                    Err(driver_error_to_error_without_state(err))
+                }
+            };
+        }
+
         let mut store = self.lock_shared()?;
         check_store_error(&store)?;
         store
@@ -462,7 +479,7 @@ impl<Q> Drop for SyncQwpWsRunner<Q> {
 }
 
 pub(crate) enum ConfiguredQwpWsQueue {
-    Memory(VolatileFrameQueue),
+    Memory(LockFreeVolatilePublicationLog),
     StoreAndForward(SfaSlotQueue),
 }
 
@@ -501,7 +518,7 @@ impl ConfiguredQwpWsQueue {
         }
 
         Ok(Self::Memory(
-            VolatileFrameQueue::new(VolatileQueueOptions {
+            LockFreeVolatilePublicationLog::new(VolatileQueueOptions {
                 max_frames,
                 max_bytes,
                 max_in_flight,
@@ -537,70 +554,91 @@ fn usize_from_config(name: &str, value: u64) -> crate::Result<usize> {
 impl PublicationLog for ConfiguredQwpWsQueue {
     fn try_publish(&mut self, payload: &[u8]) -> Result<QwpReceipt, DriverError> {
         match self {
-            Self::Memory(queue) => Ok(queue.try_submit(payload)?),
+            Self::Memory(queue) => PublicationLog::try_publish(queue, payload),
             Self::StoreAndForward(queue) => PublicationLog::try_publish(queue, payload),
+        }
+    }
+
+    fn claim_lock_free_producer(&mut self) -> Option<LockFreeVolatileProducer> {
+        match self {
+            Self::Memory(queue) => PublicationLog::claim_lock_free_producer(queue),
+            Self::StoreAndForward(queue) => PublicationLog::claim_lock_free_producer(queue),
         }
     }
 
     fn shared_payload_for_fsn(&self, fsn: u64) -> Result<Option<SharedPayload>, DriverError> {
         match self {
-            Self::Memory(queue) => Ok(queue.shared_payload_for_fsn(fsn)),
+            Self::Memory(queue) => PublicationLog::shared_payload_for_fsn(queue, fsn),
             Self::StoreAndForward(queue) => PublicationLog::shared_payload_for_fsn(queue, fsn),
         }
     }
 
     fn oldest_unresolved_fsn(&self) -> Option<u64> {
         match self {
-            Self::Memory(queue) => queue.oldest_unresolved_fsn(),
+            Self::Memory(queue) => PublicationLog::oldest_unresolved_fsn(queue),
             Self::StoreAndForward(queue) => PublicationLog::oldest_unresolved_fsn(queue),
         }
     }
 
     fn complete_through(&mut self, fsn: u64) -> Result<(), DriverError> {
         match self {
-            Self::Memory(queue) => Ok(queue.complete_through_fsn(fsn)?),
+            Self::Memory(queue) => PublicationLog::complete_through(queue, fsn),
             Self::StoreAndForward(queue) => PublicationLog::complete_through(queue, fsn),
         }
     }
 
     fn reject_fsn(&mut self, fsn: u64) -> Result<QwpReceipt, DriverError> {
         match self {
-            Self::Memory(queue) => Ok(queue.reject_fsn(fsn)?),
+            Self::Memory(queue) => PublicationLog::reject_fsn(queue, fsn),
             Self::StoreAndForward(queue) => PublicationLog::reject_fsn(queue, fsn),
+        }
+    }
+
+    fn close_for_publication(&self) {
+        match self {
+            Self::Memory(queue) => PublicationLog::close_for_publication(queue),
+            Self::StoreAndForward(queue) => PublicationLog::close_for_publication(queue),
+        }
+    }
+
+    fn terminalize_publication(&self) {
+        match self {
+            Self::Memory(queue) => PublicationLog::terminalize_publication(queue),
+            Self::StoreAndForward(queue) => PublicationLog::terminalize_publication(queue),
         }
     }
 
     fn close(&mut self) -> Result<(), DriverError> {
         match self {
-            Self::Memory(queue) => queue.close(),
+            Self::Memory(queue) => PublicationLog::close(queue),
             Self::StoreAndForward(queue) => Ok(queue.close()?),
         }
     }
 
     fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus {
         match self {
-            Self::Memory(queue) => queue.receipt_status(receipt),
+            Self::Memory(queue) => PublicationLog::receipt_status(queue, receipt),
             Self::StoreAndForward(queue) => PublicationLog::receipt_status(queue, receipt),
         }
     }
 
     fn published_fsn(&self) -> Option<u64> {
         match self {
-            Self::Memory(queue) => queue.published_fsn(),
+            Self::Memory(queue) => PublicationLog::published_fsn(queue),
             Self::StoreAndForward(queue) => PublicationLog::published_fsn(queue),
         }
     }
 
     fn completed_fsn(&self) -> Option<u64> {
         match self {
-            Self::Memory(queue) => queue.completed_fsn(),
+            Self::Memory(queue) => PublicationLog::completed_fsn(queue),
             Self::StoreAndForward(queue) => PublicationLog::completed_fsn(queue),
         }
     }
 
     fn max_in_flight(&self) -> usize {
         match self {
-            Self::Memory(queue) => queue.max_in_flight(),
+            Self::Memory(queue) => PublicationLog::max_in_flight(queue),
             Self::StoreAndForward(queue) => PublicationLog::max_in_flight(queue),
         }
     }
@@ -1092,7 +1130,7 @@ mod tests {
     };
     use super::super::qwp_ws_queue::{OutboundFrame, SentFrame};
     use super::*;
-    use std::sync::{Arc, mpsc};
+    use std::sync::mpsc;
 
     #[test]
     fn frame_short_payload_is_masked() {
@@ -1175,30 +1213,32 @@ mod tests {
         };
         let driver = ManualDriverPrototype::from_queue(queue, transport);
         let publisher = QwpWsPublicationDriver::new(driver, 1);
-        let runner = Arc::new(SyncQwpWsRunner::start(publisher));
+        let mut runner = SyncQwpWsRunner::start(publisher);
 
         runner.publish_replay_payload(b"first").unwrap();
         send_started_rx
             .recv_timeout(Duration::from_secs(5))
             .unwrap();
 
-        let (published_tx, published_rx) = mpsc::channel();
-        let publish_runner = Arc::clone(&runner);
-        let publish_thread = std::thread::spawn(move || {
-            let result = publish_runner.publish_replay_payload(b"second");
-            let _ = published_tx.send(result.map(|_| ()));
-        });
+        std::thread::scope(|scope| {
+            let (published_tx, published_rx) = mpsc::channel();
+            let runner = &mut runner;
+            let publish_thread = scope.spawn(move || {
+                let result = runner.publish_replay_payload(b"second");
+                let _ = published_tx.send(result.map(|_| ()));
+            });
 
-        let publish_result = match published_rx.recv_timeout(Duration::from_secs(2)) {
-            Ok(result) => result,
-            Err(err) => {
-                let _ = release_send_tx.send(());
-                publish_thread.join().unwrap();
-                panic!("publication waited for blocked transport send: {err:?}");
-            }
-        };
-        publish_result.unwrap();
-        publish_thread.join().unwrap();
+            let publish_result = match published_rx.recv_timeout(Duration::from_secs(2)) {
+                Ok(result) => result,
+                Err(err) => {
+                    let _ = release_send_tx.send(());
+                    publish_thread.join().unwrap();
+                    panic!("publication waited for blocked transport send: {err:?}");
+                }
+            };
+            publish_result.unwrap();
+            publish_thread.join().unwrap();
+        });
 
         release_send_tx.send(()).unwrap();
         drop(runner);
@@ -1267,7 +1307,7 @@ mod tests {
         };
         let driver = ManualDriverPrototype::from_queue(queue, transport);
         let publisher = QwpWsPublicationDriver::new(driver, 1);
-        let runner = Arc::new(SyncQwpWsRunner::start(publisher));
+        let mut runner = SyncQwpWsRunner::start(publisher);
 
         runner.publish_replay_payload(b"first").unwrap();
         send_started_rx
@@ -1277,23 +1317,25 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .unwrap();
 
-        let (published_tx, published_rx) = mpsc::channel();
-        let publish_runner = Arc::clone(&runner);
-        let publish_thread = std::thread::spawn(move || {
-            let result = publish_runner.publish_replay_payload(b"second");
-            let _ = published_tx.send(result.map(|_| ()));
-        });
+        std::thread::scope(|scope| {
+            let (published_tx, published_rx) = mpsc::channel();
+            let runner = &mut runner;
+            let publish_thread = scope.spawn(move || {
+                let result = runner.publish_replay_payload(b"second");
+                let _ = published_tx.send(result.map(|_| ()));
+            });
 
-        let publish_result = match published_rx.recv_timeout(Duration::from_secs(2)) {
-            Ok(result) => result,
-            Err(err) => {
-                let _ = release_reconnect_tx.send(());
-                publish_thread.join().unwrap();
-                panic!("publication waited for blocked reconnect: {err:?}");
-            }
-        };
-        publish_result.unwrap();
-        publish_thread.join().unwrap();
+            let publish_result = match published_rx.recv_timeout(Duration::from_secs(2)) {
+                Ok(result) => result,
+                Err(err) => {
+                    let _ = release_reconnect_tx.send(());
+                    publish_thread.join().unwrap();
+                    panic!("publication waited for blocked reconnect: {err:?}");
+                }
+            };
+            publish_result.unwrap();
+            publish_thread.join().unwrap();
+        });
 
         release_reconnect_tx.send(()).unwrap();
         drop(runner);
@@ -1361,7 +1403,7 @@ mod tests {
         };
         let driver = ManualDriverPrototype::from_queue(queue, transport);
         let publisher = QwpWsPublicationDriver::new(driver, 1);
-        let runner = Arc::new(SyncQwpWsRunner::start(publisher));
+        let mut runner = SyncQwpWsRunner::start(publisher);
 
         runner.publish_replay_payload(b"first").unwrap();
         reconnect_started_rx

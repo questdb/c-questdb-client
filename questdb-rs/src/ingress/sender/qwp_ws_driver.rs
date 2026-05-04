@@ -49,6 +49,7 @@ use super::qwp_ws::{WsStream, establish_connection, read_message, write_binary_f
 use super::qwp_ws_codec::WS_OPCODE_BINARY;
 use super::qwp_ws_codec::{self as codec, PipelinedResponse};
 use super::qwp_ws_queue::{
+    LockFreePublishError, LockFreeVolatileProducer, LockFreeVolatilePublicationLog,
     OutboundFrame, QueueError, QwpReceipt, QwpReceiptStatus, SentFrame, SharedPayload,
     VolatileFrameQueue, VolatileQueueOptions,
 };
@@ -171,6 +172,10 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         Ok(receipt)
     }
 
+    pub(crate) fn claim_lock_free_producer(&mut self) -> Option<LockFreeVolatileProducer> {
+        self.queue.claim_lock_free_producer()
+    }
+
     pub(crate) fn next_outbound_frame(
         &self,
         send_cursor: &mut SendCursor,
@@ -253,6 +258,7 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
     pub(crate) fn mark_terminal(&mut self, error: Option<Error>) {
         if !self.terminal {
             self.terminal = true;
+            self.queue.terminalize_publication();
             self.terminal_fsn = self.queue.published_fsn();
             self.terminal_error = error;
             self.push_event(DriverEvent::Terminal);
@@ -302,6 +308,7 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
 
     pub(crate) fn set_closing(&mut self) {
         self.closing = true;
+        self.queue.close_for_publication();
     }
 
     pub(crate) fn all_published_receipts_resolved(&self) -> bool {
@@ -851,10 +858,15 @@ fn double_duration(duration: Duration) -> Duration {
 
 pub(crate) trait PublicationLog {
     fn try_publish(&mut self, payload: &[u8]) -> Result<QwpReceipt, DriverError>;
+    fn claim_lock_free_producer(&mut self) -> Option<LockFreeVolatileProducer> {
+        None
+    }
     fn shared_payload_for_fsn(&self, fsn: u64) -> Result<Option<SharedPayload>, DriverError>;
     fn oldest_unresolved_fsn(&self) -> Option<u64>;
     fn complete_through(&mut self, fsn: u64) -> Result<(), DriverError>;
     fn reject_fsn(&mut self, fsn: u64) -> Result<QwpReceipt, DriverError>;
+    fn close_for_publication(&self) {}
+    fn terminalize_publication(&self) {}
     fn close(&mut self) -> Result<(), DriverError> {
         Ok(())
     }
@@ -1246,6 +1258,68 @@ impl PublicationLog for VolatileFrameQueue {
 
     fn max_in_flight(&self) -> usize {
         VolatileFrameQueue::max_in_flight(self)
+    }
+}
+
+impl PublicationLog for LockFreeVolatilePublicationLog {
+    fn try_publish(&mut self, payload: &[u8]) -> Result<QwpReceipt, DriverError> {
+        LockFreeVolatilePublicationLog::try_submit(self, payload).map_err(lock_free_publish_error)
+    }
+
+    fn claim_lock_free_producer(&mut self) -> Option<LockFreeVolatileProducer> {
+        LockFreeVolatilePublicationLog::claim_producer(self)
+    }
+
+    fn shared_payload_for_fsn(&self, fsn: u64) -> Result<Option<SharedPayload>, DriverError> {
+        Ok(LockFreeVolatilePublicationLog::shared_payload_for_fsn(
+            self, fsn,
+        ))
+    }
+
+    fn oldest_unresolved_fsn(&self) -> Option<u64> {
+        LockFreeVolatilePublicationLog::oldest_unresolved_fsn(self)
+    }
+
+    fn complete_through(&mut self, fsn: u64) -> Result<(), DriverError> {
+        Ok(LockFreeVolatilePublicationLog::complete_through_fsn(
+            self, fsn,
+        )?)
+    }
+
+    fn reject_fsn(&mut self, fsn: u64) -> Result<QwpReceipt, DriverError> {
+        Ok(LockFreeVolatilePublicationLog::reject_fsn(self, fsn)?)
+    }
+
+    fn close_for_publication(&self) {
+        LockFreeVolatilePublicationLog::close_for_publication(self);
+    }
+
+    fn terminalize_publication(&self) {
+        LockFreeVolatilePublicationLog::terminalize_publication(self);
+    }
+
+    fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus {
+        LockFreeVolatilePublicationLog::receipt_status(self, receipt)
+    }
+
+    fn published_fsn(&self) -> Option<u64> {
+        LockFreeVolatilePublicationLog::published_fsn(self)
+    }
+
+    fn completed_fsn(&self) -> Option<u64> {
+        LockFreeVolatilePublicationLog::completed_fsn(self)
+    }
+
+    fn max_in_flight(&self) -> usize {
+        LockFreeVolatilePublicationLog::max_in_flight(self)
+    }
+}
+
+pub(crate) fn lock_free_publish_error(err: LockFreePublishError) -> DriverError {
+    match err {
+        LockFreePublishError::Queue(err) => DriverError::Queue(err),
+        LockFreePublishError::Terminal => DriverError::Terminal,
+        LockFreePublishError::Closing => DriverError::Closing,
     }
 }
 

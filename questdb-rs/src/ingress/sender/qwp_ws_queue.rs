@@ -30,7 +30,10 @@
 //! WebSocket I/O, disk Store-and-Forward, or public FFI shape. Frames are opaque
 //! QWP payload bytes; the replay encoder is validated separately.
 
+use std::cell::UnsafeCell;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 pub(crate) type SharedPayload = Arc<[u8]>;
 
@@ -132,6 +135,19 @@ pub(crate) enum QueueError {
     SequenceOverflow,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LockFreePublishError {
+    Queue(QueueError),
+    Terminal,
+    Closing,
+}
+
+impl From<QueueError> for LockFreePublishError {
+    fn from(value: QueueError) -> Self {
+        Self::Queue(value)
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct VolatileFrameQueue {
     slots: Vec<FrameSlot>,
@@ -145,6 +161,54 @@ pub(crate) struct VolatileFrameQueue {
     rejected_fsns: Vec<u64>,
     max_in_flight: usize,
 }
+
+#[derive(Clone)]
+pub(crate) struct LockFreeVolatileFrameQueue {
+    inner: Arc<LockFreeVolatileFrameQueueInner>,
+}
+
+#[derive(Debug)]
+pub(crate) struct LockFreeVolatileProducer {
+    queue: LockFreeVolatileFrameQueue,
+}
+
+#[derive(Debug)]
+pub(crate) struct LockFreeVolatilePublicationLog {
+    queue: LockFreeVolatileFrameQueue,
+    producer: Option<LockFreeVolatileProducer>,
+}
+
+struct LockFreeVolatileFrameQueueInner {
+    slots: Box<[LockFreeFrameSlot]>,
+    max_bytes: usize,
+    max_in_flight: usize,
+    bytes_used: AtomicUsize,
+    next_fsn: AtomicU64,
+    published_upper: AtomicU64,
+    completed_upper: AtomicU64,
+    rejected_fsns: Mutex<Vec<u64>>,
+    publisher_state: AtomicU8,
+    producer_claimed: AtomicBool,
+    publish_active: AtomicBool,
+}
+
+struct LockFreeFrameSlot {
+    fsn: AtomicU64,
+    payload: UnsafeCell<Option<SharedPayload>>,
+    state: AtomicU8,
+}
+
+const LOCK_FREE_SLOT_FREE: u8 = 0;
+const LOCK_FREE_SLOT_PUBLISHED: u8 = 1;
+const LOCK_FREE_PUBLISHER_OPEN: u8 = 0;
+const LOCK_FREE_PUBLISHER_CLOSING: u8 = 1;
+const LOCK_FREE_PUBLISHER_TERMINAL: u8 = 2;
+
+// The log is deliberately SPSC: the sender thread owns the producer handle, and
+// the runner thread is the only consumer/completer. Slot payload access is gated
+// by release/acquire state transitions plus the completed cursor.
+unsafe impl Send for LockFreeVolatileFrameQueueInner {}
+unsafe impl Sync for LockFreeVolatileFrameQueueInner {}
 
 impl VolatileFrameQueue {
     pub(crate) fn new(options: VolatileQueueOptions) -> Result<Self, QueueError> {
@@ -353,6 +417,423 @@ impl VolatileFrameQueue {
     }
 }
 
+impl LockFreeVolatileFrameQueue {
+    pub(crate) fn new(options: VolatileQueueOptions) -> Result<Self, QueueError> {
+        if options.max_frames == 0 || options.max_bytes == 0 || options.max_in_flight == 0 {
+            return Err(QueueError::InvalidCapacity);
+        }
+        if options.max_in_flight > options.max_frames {
+            return Err(QueueError::InvalidCapacity);
+        }
+
+        let slots = (0..options.max_frames)
+            .map(|_| LockFreeFrameSlot {
+                fsn: AtomicU64::new(0),
+                payload: UnsafeCell::new(None),
+                state: AtomicU8::new(LOCK_FREE_SLOT_FREE),
+            })
+            .collect();
+
+        Ok(Self {
+            inner: Arc::new(LockFreeVolatileFrameQueueInner {
+                slots,
+                max_bytes: options.max_bytes,
+                max_in_flight: options.max_in_flight,
+                bytes_used: AtomicUsize::new(0),
+                next_fsn: AtomicU64::new(0),
+                published_upper: AtomicU64::new(0),
+                completed_upper: AtomicU64::new(0),
+                rejected_fsns: Mutex::new(Vec::new()),
+                publisher_state: AtomicU8::new(LOCK_FREE_PUBLISHER_OPEN),
+                producer_claimed: AtomicBool::new(false),
+                publish_active: AtomicBool::new(false),
+            }),
+        })
+    }
+
+    pub(crate) fn claim_producer(&self) -> Option<LockFreeVolatileProducer> {
+        self.inner
+            .producer_claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| LockFreeVolatileProducer {
+                queue: self.clone(),
+            })
+    }
+
+    pub(crate) fn close_for_publication(&self) {
+        let _ = self.inner.publisher_state.compare_exchange(
+            LOCK_FREE_PUBLISHER_OPEN,
+            LOCK_FREE_PUBLISHER_CLOSING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        self.wait_for_active_publish();
+    }
+
+    pub(crate) fn terminalize_publication(&self) {
+        self.inner
+            .publisher_state
+            .store(LOCK_FREE_PUBLISHER_TERMINAL, Ordering::Release);
+        self.wait_for_active_publish();
+    }
+
+    fn try_submit(&self, payload: &[u8]) -> Result<QwpReceipt, LockFreePublishError> {
+        let _guard = self.enter_publish()?;
+        self.try_submit_open(payload).map_err(Into::into)
+    }
+
+    pub(crate) fn shared_payload_for_fsn(&self, fsn: u64) -> Option<SharedPayload> {
+        if !self.fsn_is_published_and_unresolved(fsn) {
+            return None;
+        }
+        let slot = self.slot_for_fsn(fsn);
+        if slot.state.load(Ordering::Acquire) != LOCK_FREE_SLOT_PUBLISHED {
+            return None;
+        }
+        if slot.fsn.load(Ordering::Acquire) != fsn {
+            return None;
+        }
+
+        // SPSC invariant: only the runner thread clones/takes payloads after the
+        // producer publishes them. Completion cannot run concurrently with this
+        // read because both are driven by the same runner core.
+        unsafe { (&*slot.payload.get()).as_ref().map(Arc::clone) }
+    }
+
+    pub(crate) fn oldest_unresolved_fsn(&self) -> Option<u64> {
+        let completed = self.inner.completed_upper.load(Ordering::Acquire);
+        let published = self.inner.published_upper.load(Ordering::Acquire);
+        (completed < published).then_some(completed)
+    }
+
+    pub(crate) fn complete_through_fsn(&self, acked_fsn: u64) -> Result<(), QueueError> {
+        let target_upper = acked_fsn
+            .checked_add(1)
+            .ok_or(QueueError::ProtocolAckedUnsentFrame { fsn: acked_fsn })?;
+        let completed = self.inner.completed_upper.load(Ordering::Acquire);
+        if target_upper <= completed {
+            return Ok(());
+        }
+        let published = self.inner.published_upper.load(Ordering::Acquire);
+        if target_upper > published {
+            return Err(QueueError::ProtocolAckedUnsentFrame { fsn: acked_fsn });
+        }
+
+        for fsn in completed..target_upper {
+            let slot = self.slot_for_fsn(fsn);
+            if slot.fsn.load(Ordering::Acquire) != fsn
+                || slot.state.load(Ordering::Acquire) != LOCK_FREE_SLOT_PUBLISHED
+            {
+                return Err(QueueError::ProtocolAckedUnsentFrame { fsn });
+            }
+        }
+
+        for fsn in completed..target_upper {
+            let slot = self.slot_for_fsn(fsn);
+            // SPSC invariant: the producer cannot reuse this slot until it sees
+            // completed_upper advance, which happens after the slot is freed.
+            let payload = unsafe { (&mut *slot.payload.get()).take() };
+            if let Some(payload) = payload {
+                self.inner
+                    .bytes_used
+                    .fetch_sub(payload.len(), Ordering::AcqRel);
+            }
+            slot.state.store(LOCK_FREE_SLOT_FREE, Ordering::Release);
+        }
+
+        self.inner
+            .completed_upper
+            .store(target_upper, Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn reject_fsn(&self, rejected_fsn: u64) -> Result<QwpReceipt, QueueError> {
+        if !self.fsn_is_published_and_unresolved(rejected_fsn) {
+            return Err(QueueError::ProtocolRejectedUnsentFrame { fsn: rejected_fsn });
+        }
+        {
+            let mut rejected = self.inner.rejected_fsns.lock().map_err(|_| {
+                QueueError::ProtocolRejectedUnsentFrame { fsn: rejected_fsn }
+            })?;
+            if !rejected.contains(&rejected_fsn) {
+                rejected.push(rejected_fsn);
+            }
+        }
+        self.complete_through_fsn(rejected_fsn)?;
+        Ok(QwpReceipt { fsn: rejected_fsn })
+    }
+
+    pub(crate) fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus {
+        let fsn = receipt.fsn;
+        if let Ok(rejected) = self.inner.rejected_fsns.lock()
+            && rejected.contains(&fsn)
+        {
+            return QwpReceiptStatus::Rejected { fsn };
+        }
+        if fsn < self.inner.completed_upper.load(Ordering::Acquire) {
+            return QwpReceiptStatus::Acked { fsn };
+        }
+        if fsn >= self.inner.published_upper.load(Ordering::Acquire) {
+            return QwpReceiptStatus::Unknown { fsn };
+        }
+
+        let slot = self.slot_for_fsn(fsn);
+        if slot.fsn.load(Ordering::Acquire) == fsn
+            && slot.state.load(Ordering::Acquire) == LOCK_FREE_SLOT_PUBLISHED
+        {
+            QwpReceiptStatus::Published { fsn }
+        } else {
+            QwpReceiptStatus::Unknown { fsn }
+        }
+    }
+
+    pub(crate) fn published_fsn(&self) -> Option<u64> {
+        self.inner
+            .published_upper
+            .load(Ordering::Acquire)
+            .checked_sub(1)
+    }
+
+    pub(crate) fn completed_fsn(&self) -> Option<u64> {
+        self.inner
+            .completed_upper
+            .load(Ordering::Acquire)
+            .checked_sub(1)
+    }
+
+    pub(crate) fn max_in_flight(&self) -> usize {
+        self.inner.max_in_flight
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bytes_used(&self) -> usize {
+        self.inner.bytes_used.load(Ordering::Acquire)
+    }
+
+    fn try_submit_open(&self, payload: &[u8]) -> Result<QwpReceipt, QueueError> {
+        if payload.is_empty() {
+            return Err(QueueError::EmptyPayload);
+        }
+        if payload.len() > self.inner.max_bytes {
+            return Err(QueueError::PayloadExceedsByteCapacity {
+                payload_len: payload.len(),
+                max_bytes: self.inner.max_bytes,
+            });
+        }
+
+        let fsn = self.inner.next_fsn.load(Ordering::Relaxed);
+        let next_fsn = fsn.checked_add(1).ok_or(QueueError::SequenceOverflow)?;
+        let completed = self.inner.completed_upper.load(Ordering::Acquire);
+        if fsn.saturating_sub(completed) >= self.inner.slots.len() as u64 {
+            return Err(QueueError::FrameCapacityFull {
+                max_frames: self.inner.slots.len(),
+            });
+        }
+
+        self.reserve_bytes(payload.len())?;
+        let slot = self.slot_for_fsn(fsn);
+        if slot.state.load(Ordering::Acquire) != LOCK_FREE_SLOT_FREE {
+            self.inner.bytes_used.fetch_sub(payload.len(), Ordering::AcqRel);
+            return Err(QueueError::FrameCapacityFull {
+                max_frames: self.inner.slots.len(),
+            });
+        }
+
+        let stored_payload: SharedPayload = Arc::from(payload);
+        slot.fsn.store(fsn, Ordering::Relaxed);
+        unsafe {
+            *slot.payload.get() = Some(stored_payload);
+        }
+        slot.state
+            .store(LOCK_FREE_SLOT_PUBLISHED, Ordering::Release);
+        self.inner.next_fsn.store(next_fsn, Ordering::Relaxed);
+        self.inner
+            .published_upper
+            .store(next_fsn, Ordering::Release);
+
+        Ok(QwpReceipt { fsn })
+    }
+
+    fn reserve_bytes(&self, payload_len: usize) -> Result<(), QueueError> {
+        loop {
+            let bytes_used = self.inner.bytes_used.load(Ordering::Acquire);
+            let Some(new_bytes_used) = bytes_used.checked_add(payload_len) else {
+                return Err(QueueError::ByteCapacityFull {
+                    payload_len,
+                    bytes_used,
+                    max_bytes: self.inner.max_bytes,
+                });
+            };
+            if new_bytes_used > self.inner.max_bytes {
+                return Err(QueueError::ByteCapacityFull {
+                    payload_len,
+                    bytes_used,
+                    max_bytes: self.inner.max_bytes,
+                });
+            }
+            if self
+                .inner
+                .bytes_used
+                .compare_exchange_weak(
+                    bytes_used,
+                    new_bytes_used,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    fn fsn_is_published_and_unresolved(&self, fsn: u64) -> bool {
+        fsn >= self.inner.completed_upper.load(Ordering::Acquire)
+            && fsn < self.inner.published_upper.load(Ordering::Acquire)
+    }
+
+    fn enter_publish(&self) -> Result<PublishGuard<'_>, LockFreePublishError> {
+        match self.inner.publisher_state.load(Ordering::Acquire) {
+            LOCK_FREE_PUBLISHER_OPEN => {}
+            LOCK_FREE_PUBLISHER_CLOSING => return Err(LockFreePublishError::Closing),
+            LOCK_FREE_PUBLISHER_TERMINAL => return Err(LockFreePublishError::Terminal),
+            _ => return Err(LockFreePublishError::Terminal),
+        }
+
+        self.inner.publish_active.store(true, Ordering::Release);
+        match self.inner.publisher_state.load(Ordering::Acquire) {
+            LOCK_FREE_PUBLISHER_OPEN => Ok(PublishGuard {
+                active: &self.inner.publish_active,
+            }),
+            LOCK_FREE_PUBLISHER_CLOSING => {
+                self.inner.publish_active.store(false, Ordering::Release);
+                Err(LockFreePublishError::Closing)
+            }
+            LOCK_FREE_PUBLISHER_TERMINAL => {
+                self.inner.publish_active.store(false, Ordering::Release);
+                Err(LockFreePublishError::Terminal)
+            }
+            _ => {
+                self.inner.publish_active.store(false, Ordering::Release);
+                Err(LockFreePublishError::Terminal)
+            }
+        }
+    }
+
+    fn slot_for_fsn(&self, fsn: u64) -> &LockFreeFrameSlot {
+        let slot_index = (fsn % self.inner.slots.len() as u64) as usize;
+        &self.inner.slots[slot_index]
+    }
+
+    fn wait_for_active_publish(&self) {
+        while self.inner.publish_active.load(Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
+    }
+}
+
+struct PublishGuard<'a> {
+    active: &'a AtomicBool,
+}
+
+impl Drop for PublishGuard<'_> {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+    }
+}
+
+impl LockFreeVolatileProducer {
+    pub(crate) fn try_submit(
+        &mut self,
+        payload: &[u8],
+    ) -> Result<QwpReceipt, LockFreePublishError> {
+        self.queue.try_submit(payload)
+    }
+}
+
+impl LockFreeVolatilePublicationLog {
+    pub(crate) fn new(options: VolatileQueueOptions) -> Result<Self, QueueError> {
+        let queue = LockFreeVolatileFrameQueue::new(options)?;
+        let producer = queue.claim_producer();
+        Ok(Self { queue, producer })
+    }
+
+    pub(crate) fn claim_producer(&mut self) -> Option<LockFreeVolatileProducer> {
+        self.producer.take()
+    }
+
+    pub(crate) fn try_submit(
+        &mut self,
+        payload: &[u8],
+    ) -> Result<QwpReceipt, LockFreePublishError> {
+        let Some(producer) = self.producer.as_mut() else {
+            return Err(LockFreePublishError::Closing);
+        };
+        producer.try_submit(payload)
+    }
+
+    pub(crate) fn close_for_publication(&self) {
+        self.queue.close_for_publication();
+    }
+
+    pub(crate) fn terminalize_publication(&self) {
+        self.queue.terminalize_publication();
+    }
+
+    pub(crate) fn shared_payload_for_fsn(&self, fsn: u64) -> Option<SharedPayload> {
+        self.queue.shared_payload_for_fsn(fsn)
+    }
+
+    pub(crate) fn oldest_unresolved_fsn(&self) -> Option<u64> {
+        self.queue.oldest_unresolved_fsn()
+    }
+
+    pub(crate) fn complete_through_fsn(&self, acked_fsn: u64) -> Result<(), QueueError> {
+        self.queue.complete_through_fsn(acked_fsn)
+    }
+
+    pub(crate) fn reject_fsn(&self, rejected_fsn: u64) -> Result<QwpReceipt, QueueError> {
+        self.queue.reject_fsn(rejected_fsn)
+    }
+
+    pub(crate) fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus {
+        self.queue.receipt_status(receipt)
+    }
+
+    pub(crate) fn published_fsn(&self) -> Option<u64> {
+        self.queue.published_fsn()
+    }
+
+    pub(crate) fn completed_fsn(&self) -> Option<u64> {
+        self.queue.completed_fsn()
+    }
+
+    pub(crate) fn max_in_flight(&self) -> usize {
+        self.queue.max_in_flight()
+    }
+}
+
+impl std::fmt::Debug for LockFreeVolatileFrameQueue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LockFreeVolatileFrameQueue")
+            .field("max_frames", &self.inner.slots.len())
+            .field("max_bytes", &self.inner.max_bytes)
+            .field("max_in_flight", &self.inner.max_in_flight)
+            .field("bytes_used", &self.inner.bytes_used.load(Ordering::Relaxed))
+            .field("next_fsn", &self.inner.next_fsn.load(Ordering::Relaxed))
+            .field(
+                "published_upper",
+                &self.inner.published_upper.load(Ordering::Relaxed),
+            )
+            .field(
+                "completed_upper",
+                &self.inner.completed_upper.load(Ordering::Relaxed),
+            )
+            .finish()
+    }
+}
+
 #[derive(Debug, Default)]
 struct FrameSlot {
     fsn: u64,
@@ -373,6 +854,19 @@ mod tests {
 
     fn queue(max_frames: usize, max_bytes: usize, max_in_flight: usize) -> VolatileFrameQueue {
         VolatileFrameQueue::new(VolatileQueueOptions {
+            max_frames,
+            max_bytes,
+            max_in_flight,
+        })
+        .unwrap()
+    }
+
+    fn lock_free_queue(
+        max_frames: usize,
+        max_bytes: usize,
+        max_in_flight: usize,
+    ) -> LockFreeVolatileFrameQueue {
+        LockFreeVolatileFrameQueue::new(VolatileQueueOptions {
             max_frames,
             max_bytes,
             max_in_flight,
@@ -498,6 +992,121 @@ mod tests {
 
         let third = queue.try_submit(b"fg").unwrap();
         assert_eq!(third, QwpReceipt { fsn: 2 });
+    }
+
+    #[test]
+    fn lock_free_publish_returns_value_receipts_and_published_status() {
+        let queue = lock_free_queue(4, 1024, 2);
+        let mut producer = queue.claim_producer().unwrap();
+
+        let first = producer.try_submit(b"first").unwrap();
+        let second = producer.try_submit(b"second").unwrap();
+
+        assert_eq!(first, QwpReceipt { fsn: 0 });
+        assert_eq!(second, QwpReceipt { fsn: 1 });
+        assert_eq!(queue.published_fsn(), Some(1));
+        assert_eq!(
+            queue.shared_payload_for_fsn(0).as_deref(),
+            Some(&b"first"[..])
+        );
+        assert_eq!(
+            queue.receipt_status(first),
+            QwpReceiptStatus::Published { fsn: 0 }
+        );
+    }
+
+    #[test]
+    fn lock_free_queue_exposes_only_one_producer_handle() {
+        let queue = lock_free_queue(4, 1024, 2);
+
+        assert!(queue.claim_producer().is_some());
+        assert!(queue.claim_producer().is_none());
+    }
+
+    #[test]
+    fn lock_free_queue_reuses_slots_after_completion() {
+        let queue = lock_free_queue(2, 7, 2);
+        let mut producer = queue.claim_producer().unwrap();
+
+        let first = producer.try_submit(b"abc").unwrap();
+        let second = producer.try_submit(b"de").unwrap();
+
+        assert_eq!(
+            producer.try_submit(b"fg"),
+            Err(LockFreePublishError::Queue(QueueError::FrameCapacityFull {
+                max_frames: 2
+            }))
+        );
+
+        queue.complete_through_fsn(first.fsn).unwrap();
+        let third = producer.try_submit(b"fg").unwrap();
+
+        assert_eq!(second, QwpReceipt { fsn: 1 });
+        assert_eq!(third, QwpReceipt { fsn: 2 });
+        assert_eq!(
+            queue.shared_payload_for_fsn(third.fsn).as_deref(),
+            Some(&b"fg"[..])
+        );
+        assert_eq!(queue.bytes_used(), 4);
+    }
+
+    #[test]
+    fn lock_free_queue_releases_byte_capacity_on_ack() {
+        let queue = lock_free_queue(4, 5, 2);
+        let mut producer = queue.claim_producer().unwrap();
+
+        let first = producer.try_submit(b"abc").unwrap();
+        assert_eq!(
+            producer.try_submit(b"def"),
+            Err(LockFreePublishError::Queue(QueueError::ByteCapacityFull {
+                payload_len: 3,
+                bytes_used: 3,
+                max_bytes: 5
+            }))
+        );
+
+        queue.complete_through_fsn(first.fsn).unwrap();
+        let second = producer.try_submit(b"def").unwrap();
+
+        assert_eq!(second, QwpReceipt { fsn: 1 });
+        assert_eq!(queue.bytes_used(), 3);
+    }
+
+    #[test]
+    fn lock_free_reject_marks_receipt_rejected_and_completes_prior_frames() {
+        let queue = lock_free_queue(4, 1024, 4);
+        let mut producer = queue.claim_producer().unwrap();
+
+        let first = producer.try_submit(b"first").unwrap();
+        let second = producer.try_submit(b"second").unwrap();
+        let third = producer.try_submit(b"third").unwrap();
+
+        queue.reject_fsn(second.fsn).unwrap();
+
+        assert_eq!(
+            queue.receipt_status(first),
+            QwpReceiptStatus::Acked { fsn: first.fsn }
+        );
+        assert_eq!(
+            queue.receipt_status(second),
+            QwpReceiptStatus::Rejected { fsn: second.fsn }
+        );
+        assert_eq!(
+            queue.receipt_status(third),
+            QwpReceiptStatus::Published { fsn: third.fsn }
+        );
+    }
+
+    #[test]
+    fn lock_free_queue_closing_and_terminal_reject_publication() {
+        let queue = lock_free_queue(4, 1024, 2);
+        let mut producer = queue.claim_producer().unwrap();
+
+        queue.close_for_publication();
+        assert_eq!(producer.try_submit(b"payload"), Err(LockFreePublishError::Closing));
+
+        queue.terminalize_publication();
+        assert_eq!(producer.try_submit(b"payload"), Err(LockFreePublishError::Terminal));
     }
 
     #[test]
