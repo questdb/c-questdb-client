@@ -29,7 +29,7 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -147,6 +147,8 @@ pub(crate) struct SyncQwpWsHandlerState {
 pub(crate) struct SyncQwpWsRunner<Q = ConfiguredQwpWsQueue> {
     shared: Arc<Mutex<QwpWsPublicationStore<Q>>>,
     producer: Option<LockFreeVolatileProducer>,
+    backpressure: Arc<BackpressureNotifier>,
+    append_deadline: Duration,
     stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
 }
@@ -156,7 +158,17 @@ pub(crate) struct SyncQwpWsRunner<Q = ConfiguredQwpWsQueue> {
 // I/O cannot hold the publication mutex.
 struct SyncQwpWsRunnerCore<T = BlockingQwpWsTransport> {
     send_core: QwpWsSendCore<T>,
+    backpressure: Arc<BackpressureNotifier>,
 }
+
+#[derive(Debug)]
+struct BackpressureNotifier {
+    lock: Mutex<()>,
+    available: Condvar,
+}
+
+const DEFAULT_APPEND_DEADLINE: Duration = Duration::from_secs(30);
+const BACKPRESSURE_PARK: Duration = Duration::from_micros(50);
 
 impl<Q> SyncQwpWsRunner<Q>
 where
@@ -166,15 +178,28 @@ where
     where
         T: ManualDriverTransport + Send + 'static,
     {
+        Self::start_with_append_deadline(publisher, DEFAULT_APPEND_DEADLINE)
+    }
+
+    fn start_with_append_deadline<T>(
+        publisher: QwpWsPublicationDriver<Q, T>,
+        append_deadline: Duration,
+    ) -> Self
+    where
+        T: ManualDriverTransport + Send + 'static,
+    {
         let (mut store, send_core) = publisher.into_runner_parts();
         let producer = store.claim_lock_free_producer();
         let shared = Arc::new(Mutex::new(store));
+        let backpressure = Arc::new(BackpressureNotifier::new());
         let stop = Arc::new(AtomicBool::new(false));
         let thread_shared = Arc::clone(&shared);
+        let thread_backpressure = Arc::clone(&backpressure);
         let thread_stop = Arc::clone(&stop);
         let thread = thread::spawn(move || {
             let mut core = SyncQwpWsRunnerCore {
                 send_core,
+                backpressure: thread_backpressure,
             };
             while !thread_stop.load(Ordering::Acquire) {
                 match core.drive_step(&thread_shared, &thread_stop) {
@@ -188,38 +213,101 @@ where
         Self {
             shared,
             producer,
+            backpressure,
+            append_deadline,
             stop,
             thread: Some(thread),
         }
     }
 
     fn publish_replay_payload(&mut self, payload: &[u8]) -> crate::Result<()> {
-        if let Some(producer) = self.producer.as_mut() {
-            return match producer.try_submit(payload) {
-                Ok(_) => Ok(()),
-                Err(err) => {
-                    let err = lock_free_publish_error(err);
-                    if matches!(err, DriverError::Terminal) {
-                        let store = self.lock_shared()?;
-                        return Err(driver_error_to_error_from_store(&store, err));
+        let deadline = Instant::now().checked_add(self.append_deadline);
+        loop {
+            if let Some(producer) = self.producer.as_mut() {
+                match producer.try_submit(payload) {
+                    Ok(_) => return Ok(()),
+                    Err(err) => {
+                        let err = lock_free_publish_error(err);
+                        if driver_error_is_backpressure(&err) {
+                            if !self.wait_for_publication_capacity(deadline) {
+                                return Err(driver_error_to_error_without_state(
+                                    DriverError::SubmitTimedOut,
+                                ));
+                            }
+                            continue;
+                        }
+                        if matches!(err, DriverError::Terminal) {
+                            let store = self.lock_shared()?;
+                            return Err(driver_error_to_error_from_store(&store, err));
+                        }
+                        return Err(driver_error_to_error_without_state(err));
                     }
-                    Err(driver_error_to_error_without_state(err))
                 }
-            };
-        }
+            }
 
-        let mut store = self.lock_shared()?;
-        check_store_error(&store)?;
-        store
-            .try_submit(payload)
-            .map_err(driver_error_to_error_without_state)?;
-        Ok(())
+            let submit_result = {
+                let mut store = self.lock_shared()?;
+                check_store_error(&store)?;
+                store.try_submit(payload)
+            };
+            match submit_result {
+                Ok(_) => return Ok(()),
+                Err(err) if driver_error_is_backpressure(&err) => {
+                    if !self.wait_for_publication_capacity(deadline) {
+                        return Err(driver_error_to_error_without_state(
+                            DriverError::SubmitTimedOut,
+                        ));
+                    }
+                }
+                Err(err) => return Err(driver_error_to_error_without_state(err)),
+            }
+        }
     }
 
     fn lock_shared(&self) -> crate::Result<std::sync::MutexGuard<'_, QwpWsPublicationStore<Q>>> {
         self.shared
             .lock()
             .map_err(|_| error::fmt!(SocketError, "QWP/WebSocket runner state lock is poisoned"))
+    }
+
+    fn wait_for_publication_capacity(&self, deadline: Option<Instant>) -> bool {
+        self.backpressure.wait_until(deadline)
+    }
+}
+
+impl BackpressureNotifier {
+    fn new() -> Self {
+        Self {
+            lock: Mutex::new(()),
+            available: Condvar::new(),
+        }
+    }
+
+    fn notify_all(&self) {
+        self.available.notify_all();
+    }
+
+    fn wait_until(&self, deadline: Option<Instant>) -> bool {
+        if backpressure_deadline_expired(deadline) {
+            return false;
+        }
+
+        let wait_for = match deadline {
+            Some(deadline) => deadline
+                .saturating_duration_since(Instant::now())
+                .min(BACKPRESSURE_PARK),
+            None => BACKPRESSURE_PARK,
+        };
+        if wait_for.is_zero() {
+            return !backpressure_deadline_expired(deadline);
+        }
+
+        let guard = match self.lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let _ = self.available.wait_timeout(guard, wait_for);
+        !backpressure_deadline_expired(deadline)
     }
 }
 
@@ -245,7 +333,7 @@ where
             }
             match self.send_core.next_outbound_frame(&store) {
                 Ok(outbound) => outbound,
-                Err(err) => return store_driver_error(&mut store, err),
+                Err(err) => return self.store_driver_error(&mut store, err),
             }
         };
 
@@ -275,12 +363,15 @@ where
                     .send_core
                     .finish_send_result(&mut store, frame, send_result)
                 {
-                    Ok(QwpWsSendProgress::Outcome(outcome)) => step_from_drive_outcome(outcome),
+                    Ok(QwpWsSendProgress::Outcome(outcome)) => {
+                        self.backpressure.notify_all();
+                        step_from_drive_outcome(outcome)
+                    }
                     Ok(QwpWsSendProgress::TransportFailure(failure)) => {
                         drop(store);
                         self.apply_transport_failure(shared, stop, failure)
                     }
-                    Err(err) => store_driver_error(&mut store, err),
+                    Err(err) => self.store_driver_error(&mut store, err),
                 }
             }
             Err(failure) => self.apply_transport_failure(shared, stop, failure),
@@ -302,8 +393,11 @@ where
                     Err(_) => return RunnerStep::Stop,
                 };
                 match self.send_core.finish_response(&mut store, response) {
-                    Ok(outcome) => step_from_drive_outcome(outcome),
-                    Err(err) => store_driver_error(&mut store, err),
+                    Ok(outcome) => {
+                        self.backpressure.notify_all();
+                        step_from_drive_outcome(outcome)
+                    }
+                    Err(err) => self.store_driver_error(&mut store, err),
                 }
             }
             Ok(None) => RunnerStep::Idle,
@@ -331,6 +425,7 @@ where
                     Err(_) => return RunnerStep::Stop,
                 };
                 store.mark_terminal(Some(error));
+                self.backpressure.notify_all();
                 RunnerStep::Stop
             }
         }
@@ -361,16 +456,47 @@ where
                 let outcome = self.send_core.finish_reconnect_success(&mut store, reason);
                 step_from_drive_outcome(outcome)
             }
-            Ok(QwpWsReconnectProgress::Terminal(error)) => mark_store_terminal(shared, error),
+            Ok(QwpWsReconnectProgress::Terminal(error)) => self.mark_store_terminal(shared, error),
             Ok(QwpWsReconnectProgress::Stopped) => RunnerStep::Stop,
             Err(err) => {
                 let mut store = match shared.lock() {
                     Ok(store) => store,
                     Err(_) => return RunnerStep::Stop,
                 };
-                store_driver_error(&mut store, err)
+                self.store_driver_error(&mut store, err)
             }
         }
+    }
+
+    fn store_driver_error<Q>(
+        &self,
+        store: &mut QwpWsPublicationStore<Q>,
+        err: DriverError,
+    ) -> RunnerStep
+    where
+        Q: PublicationLog,
+    {
+        let err = driver_error_to_error_from_store(store, err);
+        store.mark_terminal(Some(err));
+        self.backpressure.notify_all();
+        RunnerStep::Stop
+    }
+
+    fn mark_store_terminal<Q>(
+        &self,
+        shared: &Arc<Mutex<QwpWsPublicationStore<Q>>>,
+        err: crate::Error,
+    ) -> RunnerStep
+    where
+        Q: PublicationLog,
+    {
+        let mut store = match shared.lock() {
+            Ok(store) => store,
+            Err(_) => return RunnerStep::Stop,
+        };
+        store.mark_terminal(Some(err));
+        self.backpressure.notify_all();
+        RunnerStep::Stop
     }
 }
 
@@ -401,15 +527,6 @@ fn check_store_error<Q: PublicationLog>(store: &QwpWsPublicationStore<Q>) -> cra
     Ok(())
 }
 
-fn store_driver_error<Q: PublicationLog>(
-    store: &mut QwpWsPublicationStore<Q>,
-    err: DriverError,
-) -> RunnerStep {
-    let err = driver_error_to_error_from_store(store, err);
-    store.mark_terminal(Some(err));
-    RunnerStep::Stop
-}
-
 fn driver_error_to_error_from_store<Q: PublicationLog>(
     store: &QwpWsPublicationStore<Q>,
     err: DriverError,
@@ -423,19 +540,11 @@ fn driver_error_to_error_from_store<Q: PublicationLog>(
     }
 }
 
-fn mark_store_terminal<Q: PublicationLog>(
-    shared: &Arc<Mutex<QwpWsPublicationStore<Q>>>,
-    err: crate::Error,
-) -> RunnerStep {
-    let mut store = match shared.lock() {
-        Ok(store) => store,
-        Err(_) => return RunnerStep::Stop,
-    };
-    store.mark_terminal(Some(err));
-    RunnerStep::Stop
+fn runner_reconnect_deadline_expired(deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|deadline| Instant::now() >= deadline)
 }
 
-fn runner_reconnect_deadline_expired(deadline: Option<Instant>) -> bool {
+fn backpressure_deadline_expired(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|deadline| Instant::now() >= deadline)
 }
 
@@ -948,7 +1057,10 @@ pub(crate) fn connect_qwp_ws(
     Ok(SyncProtocolHandler::SyncQwpWs(Box::new(
         SyncQwpWsHandlerState {
             encoder: QwpWsReplayEncoder::new(negotiated_version),
-            runner: SyncQwpWsRunner::start(publisher),
+            runner: SyncQwpWsRunner::start_with_append_deadline(
+                publisher,
+                *qwp_ws.request_timeout,
+            ),
         },
     )))
 }
@@ -1120,6 +1232,16 @@ fn driver_error_to_error_without_state(err: DriverError) -> crate::Error {
             "QWP/WebSocket receipt is unknown [fsn={fsn}]"
         ),
     }
+}
+
+fn driver_error_is_backpressure(err: &DriverError) -> bool {
+    matches!(
+        err,
+        DriverError::Queue(
+            super::qwp_ws_queue::QueueError::FrameCapacityFull { .. }
+                | super::qwp_ws_queue::QueueError::ByteCapacityFull { .. }
+        )
+    )
 }
 
 #[cfg(test)]
@@ -1339,6 +1461,179 @@ mod tests {
 
         release_reconnect_tx.send(()).unwrap();
         drop(runner);
+    }
+
+    #[derive(Debug)]
+    struct SignalResponseTransport {
+        sent_frame: mpsc::Sender<SentFrame>,
+        ack: mpsc::Receiver<()>,
+        terminal: mpsc::Receiver<()>,
+        sent_frames: Vec<SentFrame>,
+    }
+
+    impl ManualDriverTransport for SignalResponseTransport {
+        fn poll_response(&mut self) -> Result<Option<TransportResponse>, TransportFailure> {
+            if self.terminal.try_recv().is_ok() {
+                return Err(TransportFailure::Terminal(crate::Error::new(
+                    crate::ErrorCode::SocketError,
+                    "synthetic terminal failure",
+                )));
+            }
+            if self.ack.try_recv().is_ok() {
+                return Ok(Some(TransportResponse::Ack { wire_seq: 0 }));
+            }
+            Ok(None)
+        }
+
+        fn send_frame(
+            &mut self,
+            frame: OutboundFrame,
+        ) -> Result<TransportSendResult, TransportFailure> {
+            let sent_frame = frame.sent_frame();
+            self.sent_frames.push(sent_frame);
+            self.sent_frame.send(sent_frame).unwrap();
+            Ok(TransportSendResult::NoResponse)
+        }
+
+        fn sent_frames(&self) -> &[SentFrame] {
+            &self.sent_frames
+        }
+    }
+
+    #[test]
+    fn threaded_runner_waits_for_ack_when_lock_free_publication_is_backpressured() {
+        let (sent_tx, sent_rx) = mpsc::channel();
+        let (ack_tx, ack_rx) = mpsc::channel();
+        let (_terminal_tx, terminal_rx) = mpsc::channel();
+        let queue = LockFreeVolatilePublicationLog::new(VolatileQueueOptions {
+            max_frames: 1,
+            max_bytes: 1024,
+            max_in_flight: 1,
+        })
+        .unwrap();
+        let transport = SignalResponseTransport {
+            sent_frame: sent_tx,
+            ack: ack_rx,
+            terminal: terminal_rx,
+            sent_frames: Vec::new(),
+        };
+        let driver = ManualDriverPrototype::from_queue(queue, transport);
+        let publisher = QwpWsPublicationDriver::new(driver, 1);
+        let mut runner =
+            SyncQwpWsRunner::start_with_append_deadline(publisher, Duration::from_secs(5));
+
+        runner.publish_replay_payload(b"first").unwrap();
+        assert_eq!(
+            sent_rx.recv_timeout(Duration::from_secs(5)).unwrap().fsn,
+            0
+        );
+
+        std::thread::scope(|scope| {
+            let (published_tx, published_rx) = mpsc::channel();
+            let runner = &mut runner;
+            let publish_thread = scope.spawn(move || {
+                let result = runner.publish_replay_payload(b"second");
+                let _ = published_tx.send(result.map(|_| ()));
+            });
+
+            assert!(published_rx.recv_timeout(Duration::from_millis(50)).is_err());
+            ack_tx.send(()).unwrap();
+            published_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            publish_thread.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn threaded_runner_times_out_when_lock_free_publication_stays_backpressured() {
+        let (sent_tx, sent_rx) = mpsc::channel();
+        let (_ack_tx, ack_rx) = mpsc::channel();
+        let (_terminal_tx, terminal_rx) = mpsc::channel();
+        let queue = LockFreeVolatilePublicationLog::new(VolatileQueueOptions {
+            max_frames: 1,
+            max_bytes: 1024,
+            max_in_flight: 1,
+        })
+        .unwrap();
+        let transport = SignalResponseTransport {
+            sent_frame: sent_tx,
+            ack: ack_rx,
+            terminal: terminal_rx,
+            sent_frames: Vec::new(),
+        };
+        let driver = ManualDriverPrototype::from_queue(queue, transport);
+        let publisher = QwpWsPublicationDriver::new(driver, 1);
+        let mut runner =
+            SyncQwpWsRunner::start_with_append_deadline(publisher, Duration::from_millis(20));
+
+        runner.publish_replay_payload(b"first").unwrap();
+        assert_eq!(
+            sent_rx.recv_timeout(Duration::from_secs(5)).unwrap().fsn,
+            0
+        );
+
+        let err = runner.publish_replay_payload(b"second").unwrap_err();
+        assert_eq!(err.code(), crate::ErrorCode::SocketError);
+        assert!(
+            err.msg()
+                .contains("timed out waiting for local queue capacity"),
+            "got: {}",
+            err.msg()
+        );
+    }
+
+    #[test]
+    fn threaded_runner_wakes_backpressured_publication_on_terminal_error() {
+        let (sent_tx, sent_rx) = mpsc::channel();
+        let (_ack_tx, ack_rx) = mpsc::channel();
+        let (terminal_tx, terminal_rx) = mpsc::channel();
+        let queue = LockFreeVolatilePublicationLog::new(VolatileQueueOptions {
+            max_frames: 1,
+            max_bytes: 1024,
+            max_in_flight: 1,
+        })
+        .unwrap();
+        let transport = SignalResponseTransport {
+            sent_frame: sent_tx,
+            ack: ack_rx,
+            terminal: terminal_rx,
+            sent_frames: Vec::new(),
+        };
+        let driver = ManualDriverPrototype::from_queue(queue, transport);
+        let publisher = QwpWsPublicationDriver::new(driver, 1);
+        let mut runner =
+            SyncQwpWsRunner::start_with_append_deadline(publisher, Duration::from_secs(5));
+
+        runner.publish_replay_payload(b"first").unwrap();
+        assert_eq!(
+            sent_rx.recv_timeout(Duration::from_secs(5)).unwrap().fsn,
+            0
+        );
+
+        std::thread::scope(|scope| {
+            let (published_tx, published_rx) = mpsc::channel();
+            let runner = &mut runner;
+            let publish_thread = scope.spawn(move || {
+                let result = runner.publish_replay_payload(b"second");
+                let _ = published_tx.send(result.map(|_| ()));
+            });
+
+            assert!(published_rx.recv_timeout(Duration::from_millis(50)).is_err());
+            terminal_tx.send(()).unwrap();
+            let err = published_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(err.code(), crate::ErrorCode::SocketError);
+            assert!(
+                err.msg().contains("synthetic terminal failure"),
+                "got: {}",
+                err.msg()
+            );
+            publish_thread.join().unwrap();
+        });
     }
 
     #[derive(Debug)]
