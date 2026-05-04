@@ -34,10 +34,10 @@ use crate::ingress::buffer::{QwpBuffer, QwpWsEncodeScratch, SymbolGlobalDict};
 
 use super::qwp_ws_driver::{
     CloseOutcome, DeliveryOutcome, DriveOutcome, DriverError, ManualDriverPrototype,
-    ManualDriverTransport, PublicationLog, QwpRejectedFrame, QwpWsPublicationStore,
-    QwpWsSendCore,
+    ManualDriverTransport, PublicationLog, QwpWsPublicationStore, QwpWsSendCore,
 };
-use super::qwp_ws_queue::{QwpReceipt, QwpReceiptStatus};
+use super::qwp_ws_ownership::QwpWsSenderError;
+use super::qwp_ws_queue::QwpReceipt;
 #[cfg(test)]
 use super::qwp_ws_queue::SentFrame;
 
@@ -100,8 +100,26 @@ impl<Q: PublicationLog, T: ManualDriverTransport> QwpWsPublicationDriver<Q, T> {
         Ok(self.driver.try_submit(payload)?)
     }
 
+    pub(crate) fn submit_qwp_with_drive_limit(
+        &mut self,
+        buffer: &QwpBuffer,
+        max_drive_steps: usize,
+    ) -> Result<QwpReceipt, QwpWsPublicationError> {
+        let payload = self
+            .encoder
+            .encode(buffer)
+            .map_err(QwpWsPublicationError::Encode)?;
+        Ok(self
+            .driver
+            .submit_with_drive_limit(payload, max_drive_steps)?)
+    }
+
     pub(crate) fn drive_once(&mut self) -> Result<DriveOutcome, DriverError> {
         self.driver.drive_once()
+    }
+
+    pub(crate) fn drive_ready_once(&mut self) -> Result<DriveOutcome, DriverError> {
+        self.driver.drive_ready_once()
     }
 
     pub(crate) fn wait_steps(
@@ -119,8 +137,8 @@ impl<Q: PublicationLog, T: ManualDriverTransport> QwpWsPublicationDriver<Q, T> {
         self.driver.close_drain_steps(max_drive_steps)
     }
 
-    pub(crate) fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus {
-        self.driver.receipt_status(receipt)
+    pub(crate) fn close_drain_ready_once(&mut self) -> Result<CloseOutcome, DriverError> {
+        self.driver.close_drain_ready_once()
     }
 
     #[cfg(test)]
@@ -132,8 +150,24 @@ impl<Q: PublicationLog, T: ManualDriverTransport> QwpWsPublicationDriver<Q, T> {
         self.driver.terminal_error()
     }
 
-    pub(crate) fn rejected_frame(&self, receipt: QwpReceipt) -> Option<&QwpRejectedFrame> {
-        self.driver.rejected_frame(receipt)
+    pub(crate) fn is_terminal(&self) -> bool {
+        self.driver.is_terminal()
+    }
+
+    pub(crate) fn published_fsn(&self) -> Option<u64> {
+        self.driver.published_fsn()
+    }
+
+    pub(crate) fn acked_fsn(&self) -> Option<u64> {
+        self.driver.acked_fsn()
+    }
+
+    pub(crate) fn poll_sender_error(&mut self) -> Option<QwpWsSenderError> {
+        self.driver.poll_sender_error()
+    }
+
+    pub(crate) fn sender_errors_dropped_total(&self) -> u64 {
+        self.driver.sender_errors_dropped_total()
     }
 
     #[cfg(test)]

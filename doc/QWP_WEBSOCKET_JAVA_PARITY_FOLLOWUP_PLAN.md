@@ -61,8 +61,12 @@ Rust currently has:
 - Java-style `.sfa` slot queue when `sf_dir` is set,
 - `initial_connect_retry=sync` as an alias for current blocking startup retry,
 - explicit rejection for unsupported `initial_connect_retry=async`,
-- explicit rejection for Java's `close_flush_timeout_millis` key until Rust has
-  a public close path that can report drain failures,
+- explicit rejection for Java's `close_flush_timeout_millis` key until Rust
+  wires Java-compatible configurable close-drain timeout semantics,
+- a single public `Sender` surface for QWP/WebSocket: background progress is the
+  default, and `qwp_ws_progress=manual` lets callers avoid a background thread
+  while using `flush_and_get_fsn`, `published_fsn`, `acked_fsn`, `drive_once`,
+  and `await_acked_fsn`,
 - Java-style `.lock` ownership plus diagnostic `.lock.pid` holder sidecar,
 - Java-compatible public sync handling for frame-local schema/write rejection
   policy,
@@ -90,10 +94,11 @@ each slice.
 7. Do not add Rust-only durable dead-letter, quarantine, rollback, or completion
    records unless a fresh Java comparison shows that Java has equivalent product
    semantics.
-8. The ordinary Rust `Sender` API should converge on Java's product semantics:
+8. The ordinary Rust `Sender` API should stay the single product surface:
    `flush()` and `flush_and_keep()` publish into bounded local memory/SFA
-   storage and return without waiting for the newly published frame's ACK. The
-   manual `QwpWsSender` remains the threadless explicit progress-owner API.
+   storage and return without waiting for the newly published frame's ACK.
+   Rust's explicit-progress exception is a `qwp_ws_progress=manual` mode on the
+   same `Sender`, not a separate public sender type.
 
 ## Iteration Rule
 
@@ -137,11 +142,11 @@ Status values:
 | J2 | done | Public config surface | `initial_connect_retry` parser surface | Java now accepts `off/false/on/true/sync/async`; Rust should match supported names without pretending to support Java's async lifecycle. | Re-read Java `Sender.java` parsing and Rust config parser; confirm the unsupported-mode error text. | `sync` is accepted as an alias for the existing retry behavior, and `async` is rejected clearly until the behavior exists. |
 | J3 | deferred | Adapter / lifecycle boundary | Initial-connect mode design | Java's `ASYNC` returns before any socket exists; Rust currently rejects that spelling. High-level Rust `Sender` may later own a runner, but async initial connect is still a distinct lifecycle mode. | Before resuming, trace Java `InitialConnectMode.ASYNC`, Rust open/flush semantics, and the high-level runner design. | Not implemented now. `initial_connect_retry=async` stays rejected until the behavior exists. |
 | J4 | todo | Driver / error surface | Reconnect budget exhaustion classification | Java distinguishes never-connected config-likely failures from connection-lost transient failures. | Re-read Java `hasEverConnected` handling; inspect Rust driver/transport reconnect state and current error messages. | Rust either reports equivalent classification or records why the current public error surface should stay simpler for now. |
-| J5 | done | Public close / FFI boundary | Close-drain and terminal close semantics | Java now treats close-drain timeout and latched terminal errors as observable close failures. | Compare Java `close()` with Rust public close, FFI `close_drain`, and existing `CloseOutcome`; decide which public surfaces need parity. | Rust keeps drop/void-close fast and rejects `close_flush_timeout_millis` explicitly until real drain reporting is wired through an explicit QWPWS close-drain API. |
+| J5 | done | Public close / FFI boundary | Close-drain and terminal close semantics | Java now treats close-drain timeout and latched terminal errors as observable close failures. | Compare Java `close()` with Rust public close, FFI `close_drain`, and existing `CloseOutcome`; decide which public surfaces need parity. | Rust keeps drop/void-close fast, exposes explicit `Sender::close_drain()`, and rejects `close_flush_timeout_millis` until configurable timeout parity is wired. |
 | J6 | todo | Operational recovery / adapter layer | Orphan drainer scope check | Java now has real background orphan drainers and `.failed` sentinel behavior; Rust intentionally does not. | Re-read Java orphan scanner/drainer code and Rust SFA recovery scope; validate whether this is needed before public release. | Decision recorded; no partial drainer implementation without a real recovery scenario and behavioral test. |
 | J7 | todo | Documentation architecture | Docs sync after code slices | Handover, validation plan, and design proposal should not contradict the implemented contract. | Cross-read changed docs plus `QWP_WEBSOCKET_HANDOVER.md`, `QWP_WEBSOCKET_VALIDATION_PLAN.md`, and `QWP_WEBSOCKET_PIPELINED_FFI.md`. | Docs name current behavior, known gaps, and validation evidence without promising unimplemented Java features. |
 | J8 | done | Public sync error surface | Frame-local server rejection behavior | Java treats schema/write rejections as drop-and-continue and exposes the server message. Rust should report the rejection without making the sender terminal. | Re-read Java `CursorWebSocketSendLoop` and `SenderError`; inspect Rust codec/driver/public flush path and existing coverage. | Public mock-server test rejects the first flush with schema mismatch, verifies the server message and error category, then successfully flushes a second frame on the same sender. |
-| J9 | partial | Public `Sender` semantics | Java-like local-publication flush | Java `Sender.flush()` publishes into the cursor engine and returns before ACK; Rust now has the local-publication runner slice but still lacks append-deadline backpressure and bounded post-flush rejection observation. | Re-read Java `QwpWebSocketSender.flush()`, `CursorSendEngine.appendBlocking()`, Rust `flush_qwp_ws()`, `flush_and_keep()`, config parsing, and queue capacity semantics. | High-level Rust `Sender::flush()` / `flush_and_keep()` locally publish, pipeline before ACK, apply bounded append backpressure via `sf_append_deadline_millis`, and report later rejections through a bounded pollable observer path. |
+| J9 | partial | Public `Sender` semantics | Java-like local-publication flush | Java `Sender.flush()` publishes into the cursor engine and returns before ACK; Rust now has the local-publication runner slice and bounded post-flush diagnostics, but still rejects Java-configurable append-deadline backpressure. | Re-read Java `QwpWebSocketSender.flush()`, `CursorSendEngine.appendBlocking()`, Rust `flush_qwp_ws()`, `flush_and_keep()`, config parsing, and queue capacity semantics. | High-level Rust `Sender::flush()` / `flush_and_keep()` locally publish, pipeline before ACK, apply the current bounded append backpressure, and report later QWP/server-close diagnostics through a bounded pollable observer path. |
 
 ## Slice Notes
 
@@ -234,10 +239,11 @@ Therefore:
 
 - `close_flush_timeout_millis` must not be accepted as a no-op.
 - The current sync sender rejects that Java config key with an explicit message
-  telling users to flush before dropping the sender.
-- The explicit `close_drain(timeout)` / `close_fast()` shape remains the right
-  Rust/FFI model for future pipelined QWPWS APIs where submitted receipts can be
-  pending after a call returns.
+  pointing users at `Sender::close_drain()` for fallible drain behavior.
+- The explicit close-drain shape remains the right Rust/FFI model for pipelined
+  QWPWS APIs where submitted frames can be pending after a call returns. The
+  remaining gap is configurable Java-compatible timeout wiring, not the
+  existence of a fallible drain path.
 
 Questions to answer first:
 
@@ -338,15 +344,16 @@ Evidence:
   details including category, policy, raw status, server message, and affected
   sequence range.
 - Rust: `qwp_ws_codec.rs` maps schema mismatch/write statuses to non-terminal
-  transport responses; `qwp_ws_driver.rs` resolves the affected receipt and
-  stores the server error; `flush_qwp_ws()` returns that server-derived error for
-  the rejected flush.
-- Validation: `cargo test qwp_ws_schema_rejection_surfaces_error_and_sender_continues`;
+  transport responses; `qwp_ws_driver.rs` resolves the affected frame, stores
+  the server error, and lets the sender continue. After the Java-like
+  local-publication `flush()` cutover, rejected frames are not synchronously
+  reported by the publishing `flush()` call.
+- Validation: `cargo test qwp_ws_schema_rejection_drops_and_sender_continues`;
   `cargo test qwp_ws_server_error_response_is_surfaced`; `cargo test raw_qwp`.
 Result:
-- done for the public sync sender surface. Future pipelined FFI work still needs
-  per-receipt diagnostic accessors so rejection details do not depend on the
-  event ring or a single last-error slot.
+- done for drop-and-continue behavior on the public sync sender surface. Future
+  public/FFI work still needs a simple diagnostic path for server rejections so
+  rejection details do not depend on private driver state.
 
 2026-04-30 - J5 - keep sync close explicit and reject Java close timeout key
 Evidence:
@@ -355,16 +362,16 @@ Evidence:
   errors after cleanup. Java config exposes `close_flush_timeout_millis` for that
   behavior.
 - Rust: public `Sender` uses external buffers, and dropping `Sender` has no
-  error return channel. The manual driver already has `close_drain_steps()` /
-  `CloseOutcome` for the future QWPWS API shape; the high-level runner design
-  should expose an explicit fallible drain before accepting Java's close timeout
-  key.
+  error return channel. `Sender::close_drain()` is the explicit fallible close
+  path; Java's close timeout key should remain rejected until that timeout is
+  configurable with Java-compatible semantics.
 - Validation: `cargo test qwpws_store_and_forward_config_rejects_invalid_java_keys`;
   `cargo test qwpws_store_and_forward_config_is_websocket_only`.
 Result:
 - done for the public sync config surface: `close_flush_timeout_millis` is now a
-  known unsupported Java key, not a silently ignored no-op. Real close-drain
-  behavior remains an explicit QWPWS FFI/manual sender follow-up.
+  known unsupported Java key, not a silently ignored no-op. Public
+  `Sender::close_drain()` exists with the current built-in timeout; configurable
+  Java-compatible timeout wiring remains a follow-up.
 
 2026-04-30 - J9 - adjust target toward Java-like high-level Sender
 Evidence:
@@ -384,7 +391,8 @@ Evidence:
   replay, and a blocked transport send that does not block another local
   publication. They now also cover blocked reconnect not blocking another local
   publication. Remaining validation starts with append backpressure,
-  append-deadline config acceptance, and pollable async rejection observation.
+  append-deadline config acceptance, and FFI exposure for pollable async
+  diagnostics.
 Result:
 - partial: local-publication `flush()` and the first runner ownership slices are
   in place. Append-deadline config remains rejected until it affects runtime

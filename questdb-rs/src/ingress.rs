@@ -513,6 +513,8 @@ impl SenderBuilder {
                 #[cfg(feature = "_sender-qwp-ws")]
                 "max_in_flight" => builder.max_in_flight(parse_conf_value(key, val)?)?,
                 #[cfg(feature = "_sender-qwp-ws")]
+                "qwp_ws_progress" => builder.qwp_ws_progress(parse_qwp_ws_progress_value(val)?)?,
+                #[cfg(feature = "_sender-qwp-ws")]
                 "sf_dir" => builder.store_and_forward_dir(PathBuf::from(val))?,
                 #[cfg(feature = "_sender-qwp-ws")]
                 "sender_id" => builder.sender_id(val)?,
@@ -975,13 +977,13 @@ impl SenderBuilder {
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
-    /// Maximum number of unacknowledged messages a pipelined async QWP/WebSocket
+    /// Maximum number of unacknowledged messages a pipelined QWP/WebSocket
     /// sender keeps in flight at once. The default is 128, matching the spec's
     /// `Max in-flight batches` limit.
     ///
     /// The window provides backpressure: once it's full, subsequent
-    /// `flush().await` calls park until the server acknowledges an earlier
-    /// message. Smaller windows reduce client memory and bound the impact of a
+    /// `flush` calls may wait until the server acknowledges an earlier message.
+    /// Smaller windows reduce client memory and bound the impact of a
     /// stuck server; larger windows increase throughput on high-RTT links.
     pub fn max_in_flight(mut self, value: usize) -> Result<Self> {
         if value == 0 {
@@ -997,6 +999,23 @@ impl SenderBuilder {
             ));
         };
         qwp_ws.max_in_flight.set_specified("max_in_flight", value)?;
+        Ok(self)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    /// Control whether QWP/WebSocket progress is driven by a background thread
+    /// or manually by the caller. The default is [`QwpWsProgress::Background`],
+    /// matching the Java sender.
+    pub fn qwp_ws_progress(mut self, progress: QwpWsProgress) -> Result<Self> {
+        let Some(qwp_ws) = &mut self.qwp_ws else {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"qwp_ws_progress\" setting is only supported for QWP/WebSocket."
+            ));
+        };
+        qwp_ws
+            .progress
+            .set_specified("qwp_ws_progress", progress)?;
         Ok(self)
     }
 
@@ -1188,7 +1207,7 @@ impl SenderBuilder {
 
         Err(error::fmt!(
             ConfigError,
-            "\"close_flush_timeout_millis\" is not supported by the Rust QWP/WebSocket sync sender yet; call flush before dropping the sender."
+            "\"close_flush_timeout_millis\" is not supported by the Rust QWP/WebSocket sync sender yet; use Sender::close_drain() for explicit close-drain behavior."
         ))
     }
 
@@ -1614,14 +1633,25 @@ impl SenderBuilder {
                 };
                 reject_unsupported_qwp_ws_sf_config(qwp_ws)?;
                 let basic_auth = qwp_ws_auth_header(&auth)?;
-                connect_qwp_ws(
-                    self.host.as_str(),
-                    self.port.as_str(),
-                    matches!(self.protocol, Protocol::QwpWss),
-                    tls_settings,
-                    qwp_ws,
-                    basic_auth,
-                )?
+                if *qwp_ws.progress == QwpWsProgress::Manual {
+                    SyncProtocolHandler::ManualQwpWs(Box::new(open_manual_qwp_ws(
+                        self.host.as_str(),
+                        self.port.as_str(),
+                        matches!(self.protocol, Protocol::QwpWss),
+                        tls_settings,
+                        qwp_ws,
+                        basic_auth,
+                    )?))
+                } else {
+                    connect_qwp_ws(
+                        self.host.as_str(),
+                        self.port.as_str(),
+                        matches!(self.protocol, Protocol::QwpWss),
+                        tls_settings,
+                        qwp_ws,
+                        basic_auth,
+                    )?
+                }
             }
         };
 
@@ -1684,63 +1714,6 @@ impl SenderBuilder {
         );
 
         Ok(sender)
-    }
-
-    /// Build the native manual QWP/WebSocket sender.
-    ///
-    /// Unlike [`Sender::flush`], this exposes QWP/WebSocket publication receipts
-    /// and lets the caller drive progress and wait for acknowledgments directly.
-    #[cfg(feature = "sync-sender-qwp-ws")]
-    pub fn build_qwp_ws(&self) -> Result<sender::QwpWsSender> {
-        if !self.protocol.is_qwp_ws() {
-            return Err(error::fmt!(
-                InvalidApiCall,
-                "build_qwp_ws is only supported for QWP/WebSocket protocols."
-            ));
-        }
-        if self.net_interface.is_some() {
-            return Err(error::fmt!(
-                InvalidApiCall,
-                "net_interface is not supported for QWP over WebSocket."
-            ));
-        }
-
-        #[cfg(feature = "insecure-skip-verify")]
-        let tls_verify = *self.tls_verify;
-
-        #[allow(unused_variables)]
-        let tls_settings = tls::TlsSettings::build(
-            self.protocol.tls_enabled(),
-            #[cfg(feature = "insecure-skip-verify")]
-            tls_verify,
-            *self.tls_ca,
-            self.tls_roots.deref().as_deref(),
-        )?;
-
-        let Some(qwp_ws) = self.qwp_ws.as_ref() else {
-            return Err(error::fmt!(
-                ConfigError,
-                "QWP/WebSocket configuration is missing."
-            ));
-        };
-        reject_unsupported_qwp_ws_sf_config(qwp_ws)?;
-        let auth = self.build_auth()?;
-        let auth_header = qwp_ws_auth_header(&auth)?;
-        let publisher = open_qwp_ws_publisher(
-            self.host.as_str(),
-            self.port.as_str(),
-            matches!(self.protocol, Protocol::QwpWss),
-            tls_settings,
-            qwp_ws,
-            auth_header,
-        )?;
-
-        Ok(sender::QwpWsSender::from_publisher(
-            publisher,
-            max_flush_drive_steps(qwp_ws),
-            *self.max_buf_size,
-            *self.max_name_len,
-        ))
     }
 
     #[cfg(any(feature = "_sender-tcp", feature = "_sender-qwp-udp"))]
@@ -1890,6 +1863,20 @@ fn parse_sf_durability_value(str_value: &str) -> Result<conf::SfDurability> {
     Err(error::fmt!(
         ConfigError,
         "invalid sf_durability [value={str_value}, allowed-values=[memory, flush, append]]"
+    ))
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+fn parse_qwp_ws_progress_value(str_value: &str) -> Result<QwpWsProgress> {
+    if str_value.eq_ignore_ascii_case("background") {
+        return Ok(QwpWsProgress::Background);
+    }
+    if str_value.eq_ignore_ascii_case("manual") {
+        return Ok(QwpWsProgress::Manual);
+    }
+    Err(error::fmt!(
+        ConfigError,
+        "invalid qwp_ws_progress [value={str_value}, allowed-values=[background, manual]]"
     ))
 }
 

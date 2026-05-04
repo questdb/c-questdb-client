@@ -44,7 +44,7 @@ use crate::ingress::tls::TlsSettings;
 use crate::{Error, ErrorCode};
 
 #[cfg(feature = "sync-sender-qwp-ws")]
-use super::qwp_ws::{WsStream, establish_connection, read_message, write_binary_frame};
+use super::qwp_ws::{WsStream, establish_connection, write_binary_frame};
 #[cfg(feature = "sync-sender-qwp-ws")]
 use super::qwp_ws_codec::WS_OPCODE_BINARY;
 use super::qwp_ws_codec::{self as codec, PipelinedResponse};
@@ -53,6 +53,7 @@ use super::qwp_ws_queue::{
     OutboundFrame, QueueError, QwpReceipt, QwpReceiptStatus, SentFrame, SharedPayload,
     VolatileFrameQueue, VolatileQueueOptions,
 };
+use super::qwp_ws_ownership::{QwpWsErrorCategory, QwpWsErrorPolicy, QwpWsSenderError};
 
 const DEFAULT_EVENT_CAPACITY: usize = 1024;
 
@@ -143,6 +144,7 @@ pub(crate) struct QwpWsPublicationStore<Q = VolatileFrameQueue> {
     terminal_error: Option<Error>,
     last_server_error: Option<QwpServerError>,
     rejected_frames: VecDeque<QwpRejectedFrame>,
+    sender_errors: SenderErrorRing,
     closing: bool,
 }
 
@@ -156,6 +158,7 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
             terminal_error: None,
             last_server_error: None,
             rejected_frames: VecDeque::new(),
+            sender_errors: SenderErrorRing::new(event_capacity),
             closing: false,
         }
     }
@@ -217,7 +220,16 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
                 Ok(DriveOutcome::Acked { wire_seq })
             }
             TransportResponse::Reject { wire_seq, error } => {
+                let policy = server_error_policy(error.status);
                 let fsn = send_cursor.fsn_for_wire_seq(wire_seq, WireResponseKind::Reject)?;
+                if policy == QwpWsErrorPolicy::Halt {
+                    let sender_error = sender_error_for_qwp_error(&error, wire_seq, fsn, policy);
+                    self.sender_errors.push(sender_error);
+                    self.last_server_error = Some(error.clone());
+                    self.mark_terminal(Some(error.error.clone()));
+                    return Ok(DriveOutcome::Terminal);
+                }
+
                 let receipt = self.queue.reject_fsn(fsn)?;
                 send_cursor.ack_through(fsn);
                 let rejected = QwpRejectedFrame {
@@ -226,6 +238,12 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
                     error,
                 };
                 self.last_server_error = Some(rejected.error.clone());
+                self.sender_errors.push(sender_error_for_qwp_error(
+                    &rejected.error,
+                    wire_seq,
+                    receipt.fsn,
+                    policy,
+                ));
                 self.rejected_frames.push_back(rejected);
                 if wire_seq > 0 {
                     self.push_event(DriverEvent::AckedThrough {
@@ -321,8 +339,51 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         }
     }
 
+    pub(crate) fn published_fsn(&self) -> Option<u64> {
+        self.queue.published_fsn()
+    }
+
+    pub(crate) fn completed_fsn(&self) -> Option<u64> {
+        self.queue.completed_fsn()
+    }
+
     pub(crate) fn close_queue(&mut self) -> Result<(), DriverError> {
         self.queue.close()
+    }
+
+    pub(crate) fn record_protocol_violation(
+        &mut self,
+        close_code: u16,
+        reason: String,
+    ) -> Error {
+        let from_fsn = self
+            .queue
+            .completed_fsn()
+            .map_or(0, |fsn| fsn.saturating_add(1));
+        let to_fsn = self.queue.published_fsn().unwrap_or(from_fsn).max(from_fsn);
+        let message = if reason.is_empty() {
+            format!("ws-close[{close_code}]")
+        } else {
+            format!("ws-close[{close_code}]: {reason}")
+        };
+        self.sender_errors.push(QwpWsSenderError {
+            category: QwpWsErrorCategory::ProtocolViolation,
+            applied_policy: QwpWsErrorPolicy::Halt,
+            status: None,
+            message: Some(message.clone()),
+            message_sequence: None,
+            from_fsn,
+            to_fsn,
+        });
+        error::fmt!(SocketError, "QWP/WebSocket protocol violation: {message}")
+    }
+
+    pub(crate) fn poll_sender_error(&mut self) -> Option<QwpWsSenderError> {
+        self.sender_errors.pop()
+    }
+
+    pub(crate) fn sender_errors_dropped_total(&self) -> u64 {
+        self.sender_errors.dropped_total()
     }
 
     pub(crate) fn poll_event(&mut self) -> Option<DriverEvent> {
@@ -437,7 +498,9 @@ impl<T: ManualDriverTransport> QwpWsSendCore<T> {
         store.delivery_status(&self.send_cursor, receipt)
     }
 
-    pub(crate) fn transport_failure_action(
+    pub(crate) fn transport_failure_action<Q: PublicationLog>(
+        &mut self,
+        store: &mut QwpWsPublicationStore<Q>,
         failure: TransportFailure,
     ) -> QwpWsTransportFailureAction {
         match failure {
@@ -449,7 +512,15 @@ impl<T: ManualDriverTransport> QwpWsSendCore<T> {
                 reason: ReconnectReason::RetryableFailure,
                 initial_error,
             },
-            TransportFailure::Terminal(error) => QwpWsTransportFailureAction::Terminal(error),
+            TransportFailure::Terminal(error) => {
+                store.mark_terminal(Some(error.clone()));
+                QwpWsTransportFailureAction::Terminal(error)
+            }
+            TransportFailure::ProtocolViolation { close_code, reason } => {
+                let error = store.record_protocol_violation(close_code, reason);
+                store.mark_terminal(Some(error.clone()));
+                QwpWsTransportFailureAction::Terminal(error)
+            }
         }
     }
 
@@ -636,6 +707,18 @@ impl<Q: PublicationLog, T: ManualDriverTransport> ManualDriverPrototype<Q, T> {
         self.drive_receive_once()
     }
 
+    pub(crate) fn drive_ready_once(&mut self) -> Result<DriveOutcome, DriverError> {
+        if self.store.is_terminal() {
+            return Ok(DriveOutcome::Terminal);
+        }
+
+        if let Some(outcome) = self.drive_send_available()? {
+            return Ok(outcome);
+        }
+
+        self.drive_receive_ready_once()
+    }
+
     pub(crate) fn drive_send_once(&mut self) -> Result<DriveOutcome, DriverError> {
         if self.store.is_terminal() {
             return Ok(DriveOutcome::Terminal);
@@ -738,6 +821,30 @@ impl<Q: PublicationLog, T: ManualDriverTransport> ManualDriverPrototype<Q, T> {
         }
     }
 
+    pub(crate) fn close_drain_ready_once(&mut self) -> Result<CloseOutcome, DriverError> {
+        self.store.set_closing();
+
+        if self.store.is_terminal() {
+            return Ok(CloseOutcome::Terminal);
+        }
+        if self.store.all_published_receipts_resolved() {
+            self.store.close_queue()?;
+            return Ok(CloseOutcome::Drained);
+        }
+        if self.drive_ready_once()? == DriveOutcome::Terminal {
+            return Ok(CloseOutcome::Terminal);
+        }
+
+        if self.store.is_terminal() {
+            Ok(CloseOutcome::Terminal)
+        } else if self.store.all_published_receipts_resolved() {
+            self.store.close_queue()?;
+            Ok(CloseOutcome::Drained)
+        } else {
+            Ok(CloseOutcome::Timeout)
+        }
+    }
+
     pub(crate) fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus {
         self.send_core.receipt_status(&self.store, receipt)
     }
@@ -758,6 +865,22 @@ impl<Q: PublicationLog, T: ManualDriverTransport> ManualDriverPrototype<Q, T> {
         self.store.terminal_error()
     }
 
+    pub(crate) fn published_fsn(&self) -> Option<u64> {
+        self.store.queue.published_fsn()
+    }
+
+    pub(crate) fn acked_fsn(&self) -> Option<u64> {
+        self.store.queue.completed_fsn()
+    }
+
+    pub(crate) fn poll_sender_error(&mut self) -> Option<QwpWsSenderError> {
+        self.store.poll_sender_error()
+    }
+
+    pub(crate) fn sender_errors_dropped_total(&self) -> u64 {
+        self.store.sender_errors_dropped_total()
+    }
+
     pub(crate) fn last_server_error(&self) -> Option<&QwpServerError> {
         self.store.last_server_error()
     }
@@ -770,7 +893,10 @@ impl<Q: PublicationLog, T: ManualDriverTransport> ManualDriverPrototype<Q, T> {
         &mut self,
         failure: TransportFailure,
     ) -> Result<DriveOutcome, DriverError> {
-        match QwpWsSendCore::<T>::transport_failure_action(failure) {
+        match self
+            .send_core
+            .transport_failure_action(&mut self.store, failure)
+        {
             QwpWsTransportFailureAction::Reconnect {
                 reason,
                 initial_error,
@@ -1127,13 +1253,10 @@ fn decode_transport_response(
         Ok(PipelinedResponse::Error(error)) => {
             let wire_seq = error.sequence;
             let server_error = QwpServerError::from(error);
-            match server_error_policy(server_error.status) {
-                ServerErrorPolicy::RejectAndContinue => Ok(Some(TransportResponse::Reject {
-                    wire_seq,
-                    error: server_error,
-                })),
-                ServerErrorPolicy::Terminal => Err(TransportFailure::Terminal(server_error.error)),
-            }
+            Ok(Some(TransportResponse::Reject {
+                wire_seq,
+                error: server_error,
+            }))
         }
         Err(err) => Err(TransportFailure::Terminal(err)),
     }
@@ -1161,16 +1284,32 @@ impl ManualDriverTransport for BlockingQwpWsTransport {
             return Ok(None);
         }
 
-        let opcode =
-            read_message(&mut self.stream, &mut self.send_buf, &mut self.recv).map_err(|err| {
-                match err.code() {
-                    ErrorCode::SocketError => TransportFailure::Disconnect(err),
-                    ErrorCode::AuthError | ErrorCode::ProtocolVersionError => {
-                        TransportFailure::Terminal(err)
-                    }
-                    _ => TransportFailure::Terminal(err),
+        let opcode = super::qwp_ws::read_message_with_close(
+            &mut self.stream,
+            &mut self.send_buf,
+            &mut self.recv,
+        )
+        .map_err(|err| {
+            if let super::qwp_ws::WsMessageError::Close(close) = err {
+                if let Some(close_code) = close.code
+                    && super::qwp_ws::is_terminal_ws_close_code(close_code)
+                {
+                    return TransportFailure::ProtocolViolation {
+                        close_code,
+                        reason: close.reason,
+                    };
                 }
-            })?;
+                return TransportFailure::Disconnect(close.into_error());
+            }
+            let err = err.into_error();
+            match err.code() {
+                ErrorCode::SocketError => TransportFailure::Disconnect(err),
+                ErrorCode::AuthError | ErrorCode::ProtocolVersionError => {
+                    TransportFailure::Terminal(err)
+                }
+                _ => TransportFailure::Terminal(err),
+            }
+        })?;
         if opcode != WS_OPCODE_BINARY {
             return Err(TransportFailure::Terminal(error::fmt!(
                 SocketError,
@@ -1364,21 +1503,43 @@ impl From<codec::PipelinedError> for QwpServerError {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ServerErrorPolicy {
-    RejectAndContinue,
-    Terminal,
+fn server_error_category(status: u8) -> QwpWsErrorCategory {
+    match status {
+        codec::WS_STATUS_SCHEMA_MISMATCH => QwpWsErrorCategory::SchemaMismatch,
+        codec::WS_STATUS_PARSE_ERROR => QwpWsErrorCategory::ParseError,
+        codec::WS_STATUS_INTERNAL_ERROR => QwpWsErrorCategory::InternalError,
+        codec::WS_STATUS_SECURITY_ERROR => QwpWsErrorCategory::SecurityError,
+        codec::WS_STATUS_WRITE_ERROR => QwpWsErrorCategory::WriteError,
+        _ => QwpWsErrorCategory::Unknown,
+    }
 }
 
-fn server_error_policy(status: u8) -> ServerErrorPolicy {
+fn server_error_policy(status: u8) -> QwpWsErrorPolicy {
     match status {
         codec::WS_STATUS_SCHEMA_MISMATCH | codec::WS_STATUS_WRITE_ERROR => {
-            ServerErrorPolicy::RejectAndContinue
+            QwpWsErrorPolicy::DropAndContinue
         }
         codec::WS_STATUS_PARSE_ERROR
         | codec::WS_STATUS_INTERNAL_ERROR
-        | codec::WS_STATUS_SECURITY_ERROR => ServerErrorPolicy::Terminal,
-        _ => ServerErrorPolicy::Terminal,
+        | codec::WS_STATUS_SECURITY_ERROR => QwpWsErrorPolicy::Halt,
+        _ => QwpWsErrorPolicy::Halt,
+    }
+}
+
+fn sender_error_for_qwp_error(
+    error: &QwpServerError,
+    wire_seq: u64,
+    fsn: u64,
+    applied_policy: QwpWsErrorPolicy,
+) -> QwpWsSenderError {
+    QwpWsSenderError {
+        category: server_error_category(error.status),
+        applied_policy,
+        status: Some(error.status),
+        message: (!error.message.is_empty()).then(|| error.message.clone()),
+        message_sequence: Some(wire_seq),
+        from_fsn: fsn,
+        to_fsn: fsn,
     }
 }
 
@@ -1439,6 +1600,7 @@ pub(crate) enum TransportFailure {
     Disconnect(Error),
     Retryable(Error),
     Terminal(Error),
+    ProtocolViolation { close_code: u16, reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1459,6 +1621,43 @@ struct DriverEventRing {
     events: VecDeque<DriverEvent>,
     capacity: usize,
     dropped_total: u64,
+}
+
+#[derive(Debug)]
+struct SenderErrorRing {
+    errors: VecDeque<QwpWsSenderError>,
+    capacity: usize,
+    dropped_total: u64,
+}
+
+impl SenderErrorRing {
+    fn new(capacity: usize) -> Self {
+        Self {
+            errors: VecDeque::with_capacity(capacity),
+            capacity,
+            dropped_total: 0,
+        }
+    }
+
+    fn push(&mut self, error: QwpWsSenderError) {
+        if self.capacity == 0 {
+            self.dropped_total += 1;
+            return;
+        }
+        if self.errors.len() == self.capacity {
+            self.errors.pop_front();
+            self.dropped_total += 1;
+        }
+        self.errors.push_back(error);
+    }
+
+    fn pop(&mut self) -> Option<QwpWsSenderError> {
+        self.errors.pop_front()
+    }
+
+    fn dropped_total(&self) -> u64 {
+        self.dropped_total
+    }
 }
 
 impl DriverEventRing {
@@ -1599,7 +1798,7 @@ mod tests {
     use super::super::qwp_ws_publisher::{QwpWsPublicationDriver, QwpWsPublicationError};
     use super::*;
     use crate::ingress::buffer::{QwpWsEncodeScratch, SymbolGlobalDict};
-    use crate::ingress::{Buffer, TimestampNanos};
+    use crate::ingress::{Buffer, QwpWsErrorCategory, QwpWsErrorPolicy, TimestampNanos};
     use std::collections::VecDeque;
     #[cfg(feature = "sync-sender-qwp-ws")]
     use std::fs::File;
@@ -2605,14 +2804,16 @@ mod tests {
         ] {
             let payload = qwp_error_payload(status, 7, "fatal server error");
 
-            let err = decode_transport_response(&payload).unwrap_err();
+            let response = decode_transport_response(&payload).unwrap().unwrap();
 
-            match err {
-                TransportFailure::Terminal(err) => {
-                    assert_eq!(err.code(), expected_code);
-                    assert!(err.msg().contains("fatal server error"));
+            match response {
+                TransportResponse::Reject { wire_seq, error } => {
+                    assert_eq!(wire_seq, 7);
+                    assert_eq!(error.status, status);
+                    assert_eq!(error.error.code(), expected_code);
+                    assert!(error.error.msg().contains("fatal server error"));
                 }
-                other => panic!("unexpected transport failure: {other:?}"),
+                other => panic!("unexpected response: {other:?}"),
             }
         }
     }
@@ -3226,6 +3427,115 @@ mod tests {
             driver.receipt_status(receipt),
             QwpReceiptStatus::Rejected { fsn: 0 }
         );
+    }
+
+    #[test]
+    fn reject_and_continue_server_error_is_pollable() {
+        let mut driver = driver(FakeOrderedServer::scripted([FakeSendResult::RejectWire {
+            wire_seq: 0,
+        }]));
+        let receipt = driver.try_submit(b"payload").unwrap();
+
+        assert_eq!(
+            driver.wait_steps(receipt, 1).unwrap(),
+            DeliveryOutcome::Rejected
+        );
+
+        let error = driver.poll_sender_error().unwrap();
+        assert_eq!(error.category, QwpWsErrorCategory::SchemaMismatch);
+        assert_eq!(error.applied_policy, QwpWsErrorPolicy::DropAndContinue);
+        assert_eq!(error.status, Some(codec::WS_STATUS_SCHEMA_MISMATCH));
+        assert_eq!(error.message.as_deref(), Some("fake schema mismatch"));
+        assert_eq!(error.message_sequence, Some(0));
+        assert_eq!(error.from_fsn, 0);
+        assert_eq!(error.to_fsn, 0);
+        assert_eq!(driver.poll_sender_error(), None);
+    }
+
+    #[test]
+    fn terminal_qwp_server_error_is_pollable_after_terminalization() {
+        let mut driver = driver(FakeOrderedServer::no_response());
+        let receipt = driver.try_submit(b"payload").unwrap();
+        assert!(matches!(driver.drive_once().unwrap(), DriveOutcome::Sent(_)));
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::Reject {
+                wire_seq: 0,
+                error: QwpServerError {
+                    status: codec::WS_STATUS_PARSE_ERROR,
+                    message: "bad payload".to_string(),
+                    error: error::fmt!(InvalidApiCall, "QWP parse error: bad payload"),
+                },
+            });
+
+        assert_eq!(driver.drive_once().unwrap(), DriveOutcome::Terminal);
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Terminal { fsn: 0 }
+        );
+
+        let error = driver.poll_sender_error().unwrap();
+        assert_eq!(error.category, QwpWsErrorCategory::ParseError);
+        assert_eq!(error.applied_policy, QwpWsErrorPolicy::Halt);
+        assert_eq!(error.status, Some(codec::WS_STATUS_PARSE_ERROR));
+        assert_eq!(error.message.as_deref(), Some("bad payload"));
+        assert_eq!(error.message_sequence, Some(0));
+        assert_eq!(error.from_fsn, 0);
+        assert_eq!(error.to_fsn, 0);
+    }
+
+    #[test]
+    fn protocol_violation_error_records_unresolved_fsn_span() {
+        let mut driver = driver(FakeOrderedServer::no_response());
+        driver.try_submit(b"first").unwrap();
+        driver.try_submit(b"second").unwrap();
+
+        assert_eq!(
+            driver
+                .apply_transport_failure(TransportFailure::ProtocolViolation {
+                    close_code: 1002,
+                    reason: "bad frame".to_string(),
+                })
+                .unwrap(),
+            DriveOutcome::Terminal
+        );
+
+        let error = driver.poll_sender_error().unwrap();
+        assert_eq!(error.category, QwpWsErrorCategory::ProtocolViolation);
+        assert_eq!(error.applied_policy, QwpWsErrorPolicy::Halt);
+        assert_eq!(error.status, None);
+        assert_eq!(error.message_sequence, None);
+        assert_eq!(error.from_fsn, 0);
+        assert_eq!(error.to_fsn, 1);
+        assert!(error.message.unwrap().contains("bad frame"));
+    }
+
+    #[test]
+    fn sender_error_ring_overflow_drops_oldest_error() {
+        let mut driver = driver_with_event_capacity(
+            FakeOrderedServer::scripted([
+                FakeSendResult::RejectWire { wire_seq: 0 },
+                FakeSendResult::RejectWire { wire_seq: 1 },
+            ]),
+            1,
+        );
+        driver.try_submit(b"first").unwrap();
+        driver.try_submit(b"second").unwrap();
+
+        assert!(matches!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::Rejected { fsn: 0, .. }
+        ));
+        assert!(matches!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::Rejected { fsn: 1, .. }
+        ));
+
+        assert_eq!(driver.sender_errors_dropped_total(), 1);
+        let error = driver.poll_sender_error().unwrap();
+        assert_eq!(error.from_fsn, 1);
+        assert_eq!(driver.poll_sender_error(), None);
     }
 
     #[test]

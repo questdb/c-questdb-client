@@ -39,7 +39,7 @@ use crate::ingress::qwp_ws_test_support::{
     CloseOutcome, DeliveryOutcome, ManualDriverPrototype, QwpWsPublicationDriver, SfaSlotOptions,
     SfaSlotQueue, VolatileFrameQueue, VolatileQueueOptions, connect_blocking_transport,
 };
-use crate::ingress::{Buffer, QwpWsDeliveryOutcome, SenderBuilder, TimestampNanos};
+use crate::ingress::{Buffer, QwpWsProgress, SenderBuilder, TimestampNanos};
 use tempfile::TempDir;
 
 use super::{TestError, TestResult};
@@ -135,13 +135,15 @@ fn qwp_ws_public_manual_sender_submit_waits_and_row_is_queryable() -> TestResult
         "qwpws::addr={}:{};max_in_flight=4;",
         config.host, config.qwp_ws_port
     );
-    let mut sender = SenderBuilder::from_conf(conf)?.build_qwp_ws()?;
+    let mut sender = SenderBuilder::from_conf(conf)?
+        .qwp_ws_progress(QwpWsProgress::Manual)?
+        .build()?;
     let mut buffer = sender.new_buffer();
     write_row(&mut buffer, &table, "SYM_PUBLIC_MANUAL", 33, 333.5, 33)?;
 
-    let receipt = sender.submit(&mut buffer)?;
+    let fsn = sender.flush_and_get_fsn(&mut buffer)?.unwrap();
     assert!(buffer.is_empty());
-    assert_eq!(sender.wait_steps(receipt, 16)?, QwpWsDeliveryOutcome::Acked);
+    assert!(sender.await_acked_fsn(fsn, Duration::from_secs(10))?);
 
     let count = wait_for_count(&config, &table, 1, Duration::from_secs(10))?;
     assert_eq!(count, 1);

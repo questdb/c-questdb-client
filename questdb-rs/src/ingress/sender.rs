@@ -27,6 +27,8 @@ use crate::error::{self, Result};
 use crate::ingress::SenderBuilder;
 use crate::ingress::{Buffer, Protocol, ProtocolVersion};
 use std::fmt::{Debug, Formatter};
+#[cfg(feature = "sync-sender-qwp-ws")]
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "sync-sender-qwp-udp")]
 mod qwp_udp;
@@ -117,6 +119,9 @@ pub(crate) enum SyncProtocolHandler {
 
     #[cfg(feature = "sync-sender-qwp-ws")]
     SyncQwpWs(Box<SyncQwpWsHandlerState>),
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    ManualQwpWs(Box<ManualQwpWsHandlerState>),
 
     #[cfg(feature = "sync-sender-tcp")]
     SyncTcp(SyncConnection),
@@ -216,11 +221,65 @@ impl Sender {
         }
 
         #[cfg(feature = "sync-sender-qwp-ws")]
-        if matches!(&self.handler, SyncProtocolHandler::SyncQwpWs(_)) {
+        if matches!(
+            &self.handler,
+            SyncProtocolHandler::SyncQwpWs(_) | SyncProtocolHandler::ManualQwpWs(_)
+        ) {
             return Buffer::qwp_with_max_name_len(self.max_name_len);
         }
 
         Buffer::with_max_name_len(self.protocol_version, self.max_name_len)
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    fn flush_qwp_ws_buffer(&mut self, buf: &Buffer, transactional: bool) -> Result<Option<u64>> {
+        if !matches!(
+            &self.handler,
+            SyncProtocolHandler::SyncQwpWs(_) | SyncProtocolHandler::ManualQwpWs(_)
+        ) {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "QWP/WebSocket FSN methods are only supported for QWP/WebSocket senders."
+            ));
+        }
+
+        let qwp = buf.as_qwp().ok_or_else(|| {
+            error::fmt!(
+                InvalidApiCall,
+                "QWP/WebSocket sender requires a QWP buffer created by `Sender::new_buffer()`."
+            )
+        })?;
+        qwp.check_can_flush()?;
+        if qwp.is_empty() {
+            return Ok(None);
+        }
+        if qwp.len() > self.max_buf_size {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "Could not flush buffer: QWP buffer size hint of {} exceeds maximum configured allowed size of {} bytes.",
+                qwp.len(),
+                self.max_buf_size
+            ));
+        }
+        if transactional {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "Transactional flushes are not supported for QWP/WebSocket."
+            ));
+        }
+
+        let result = match &mut self.handler {
+            SyncProtocolHandler::SyncQwpWs(state) => flush_qwp_ws(state, qwp),
+            SyncProtocolHandler::ManualQwpWs(state) => flush_qwp_ws_manual(state, qwp),
+            _ => unreachable!("QWP/WebSocket handler was checked above"),
+        };
+        if result
+            .as_ref()
+            .is_err_and(|err| matches!(err.code(), crate::ErrorCode::SocketError))
+        {
+            self.connected = false;
+        }
+        result
     }
 
     #[allow(unused_variables)]
@@ -256,36 +315,13 @@ impl Sender {
         }
 
         #[cfg(feature = "sync-sender-qwp-ws")]
-        if let SyncProtocolHandler::SyncQwpWs(ref mut state) = self.handler {
-            let qwp = buf.as_qwp().ok_or_else(|| {
-                error::fmt!(
-                    InvalidApiCall,
-                    "QWP/WebSocket sender requires a QWP buffer created by `Sender::new_buffer()`."
-                )
-            })?;
-            qwp.check_can_flush()?;
-            if qwp.is_empty() {
-                return Ok(());
-            }
-            if qwp.len() > self.max_buf_size {
-                return Err(error::fmt!(
-                    InvalidApiCall,
-                    "Could not flush buffer: QWP buffer size hint of {} exceeds maximum configured allowed size of {} bytes.",
-                    qwp.len(),
-                    self.max_buf_size
-                ));
-            }
-            if transactional {
-                return Err(error::fmt!(
-                    InvalidApiCall,
-                    "Transactional flushes are not supported for QWP/WebSocket."
-                ));
-            }
-            return flush_qwp_ws(state, qwp).inspect_err(|err| {
-                if matches!(err.code(), crate::ErrorCode::SocketError) {
-                    self.connected = false;
-                }
-            });
+        if matches!(
+            &self.handler,
+            SyncProtocolHandler::SyncQwpWs(_) | SyncProtocolHandler::ManualQwpWs(_)
+        ) {
+            return self
+                .flush_qwp_ws_buffer(buf, transactional)
+                .map(|_| ());
         }
 
         if !self.connected {
@@ -379,6 +415,11 @@ impl Sender {
                 InvalidApiCall,
                 "internal error: QWP/WebSocket handler in ILP flush path"
             )),
+            #[cfg(feature = "sync-sender-qwp-ws")]
+            SyncProtocolHandler::ManualQwpWs(_) => Err(error::fmt!(
+                InvalidApiCall,
+                "internal error: manual QWP/WebSocket handler in ILP flush path"
+            )),
         }
     }
 
@@ -437,10 +478,12 @@ impl Sender {
     ///
     /// With QWP-over-WebSocket, the function publishes the rows into local
     /// memory or Store-and-Forward storage and returns without waiting for the
-    /// submitted frame's server ACK. It may still wait for local capacity or
-    /// for an in-progress reconnect/progress critical section. A background
-    /// runner sends, receives ACKs, reconnects, and replays as needed. Server
-    /// or transport failures observed later are reported by subsequent sender
+    /// submitted frame's server ACK. It may still wait for local capacity. In
+    /// the default background progress mode, a sender-owned runner sends,
+    /// receives ACKs, reconnects, and replays as needed. In manual progress
+    /// mode, the caller must use `Sender::drive_once` or
+    /// `Sender::await_acked_fsn` to advance WebSocket progress. Server or
+    /// transport failures observed later are reported by subsequent sender
     /// calls.
     ///
     /// HTTP should be the first choice, but use TCP if you need to continuously send
@@ -452,6 +495,172 @@ impl Sender {
         self.flush_impl(buf, false)?;
         buf.clear();
         Ok(())
+    }
+
+    /// Publish the QWP/WebSocket buffer and return the highest published frame
+    /// sequence number.
+    ///
+    /// This is QWP/WebSocket-specific. It has the same local-publication
+    /// semantics as [`Sender::flush`]: it returns after the frame is accepted
+    /// by the local replay queue, before the server necessarily ACKs it. Empty
+    /// buffers return `Ok(None)`.
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    pub fn flush_and_get_fsn(&mut self, buf: &mut Buffer) -> Result<Option<u64>> {
+        let fsn = self.flush_and_keep_and_get_fsn(buf)?;
+        buf.clear();
+        Ok(fsn)
+    }
+
+    /// Publish the QWP/WebSocket buffer without clearing it and return the
+    /// highest published frame sequence number.
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    pub fn flush_and_keep_and_get_fsn(&mut self, buf: &Buffer) -> Result<Option<u64>> {
+        self.flush_qwp_ws_buffer(buf, false)
+    }
+
+    /// Return the highest frame sequence number published locally by this
+    /// QWP/WebSocket sender, or `None` if no frame has been published.
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    pub fn published_fsn(&self) -> Result<Option<u64>> {
+        match &self.handler {
+            SyncProtocolHandler::SyncQwpWs(state) => qwp_ws_published_fsn_background(state),
+            SyncProtocolHandler::ManualQwpWs(state) => qwp_ws_published_fsn_manual(state),
+            _ => Err(error::fmt!(
+                InvalidApiCall,
+                "published_fsn is only supported for QWP/WebSocket senders."
+            )),
+        }
+    }
+
+    /// Return the highest frame sequence number completed by server ACK or
+    /// server-side reject-and-continue, or `None` if no frame has completed.
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    pub fn acked_fsn(&self) -> Result<Option<u64>> {
+        match &self.handler {
+            SyncProtocolHandler::SyncQwpWs(state) => qwp_ws_acked_fsn_background(state),
+            SyncProtocolHandler::ManualQwpWs(state) => qwp_ws_acked_fsn_manual(state),
+            _ => Err(error::fmt!(
+                InvalidApiCall,
+                "acked_fsn is only supported for QWP/WebSocket senders."
+            )),
+        }
+    }
+
+    /// Wait until the QWP/WebSocket cumulative completion watermark reaches
+    /// `fsn`.
+    ///
+    /// The watermark advances on server ACKs and server-side
+    /// reject-and-continue responses. Returns `Ok(true)` if the watermark is
+    /// reached before `timeout`, and `Ok(false)` on timeout. In manual progress
+    /// mode this method also drives WebSocket progress while waiting.
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    pub fn await_acked_fsn(&mut self, fsn: u64, timeout: Duration) -> Result<bool> {
+        if !matches!(
+            &self.handler,
+            SyncProtocolHandler::SyncQwpWs(_) | SyncProtocolHandler::ManualQwpWs(_)
+        ) {
+            return Err(error::fmt!(
+                InvalidApiCall,
+                "await_acked_fsn is only supported for QWP/WebSocket senders."
+            ));
+        }
+
+        let deadline = Instant::now().checked_add(timeout);
+        loop {
+            if self.acked_fsn()?.is_some_and(|acked| acked >= fsn) {
+                return Ok(true);
+            }
+            if qwp_ws_deadline_expired(deadline) {
+                return Ok(false);
+            }
+
+            match &mut self.handler {
+                SyncProtocolHandler::ManualQwpWs(state) => {
+                    if !qwp_ws_drive_once(state)? {
+                        qwp_ws_sleep_until(deadline);
+                    }
+                }
+                SyncProtocolHandler::SyncQwpWs(_) => qwp_ws_sleep_until(deadline),
+                _ => unreachable!("QWP/WebSocket handler was checked above"),
+            }
+        }
+    }
+
+    /// Poll the next structured QWP/WebSocket server error observed by this
+    /// sender.
+    ///
+    /// This reports QWP server non-OK responses and terminal WebSocket
+    /// protocol violations. It remains usable after the sender has halted so
+    /// callers can inspect the error that made it terminal.
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    pub fn poll_qwp_ws_error(&mut self) -> Result<Option<QwpWsSenderError>> {
+        match &mut self.handler {
+            SyncProtocolHandler::SyncQwpWs(state) => qwp_ws_poll_sender_error_background(state),
+            SyncProtocolHandler::ManualQwpWs(state) => qwp_ws_poll_sender_error_manual(state),
+            _ => Err(error::fmt!(
+                InvalidApiCall,
+                "poll_qwp_ws_error is only supported for QWP/WebSocket senders."
+            )),
+        }
+    }
+
+    /// Return how many QWP/WebSocket structured server errors were dropped
+    /// because the sender's bounded diagnostic ring was full.
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    pub fn qwp_ws_errors_dropped(&self) -> Result<u64> {
+        match &self.handler {
+            SyncProtocolHandler::SyncQwpWs(state) => qwp_ws_sender_errors_dropped_background(state),
+            SyncProtocolHandler::ManualQwpWs(state) => qwp_ws_sender_errors_dropped_manual(state),
+            _ => Err(error::fmt!(
+                InvalidApiCall,
+                "qwp_ws_errors_dropped is only supported for QWP/WebSocket senders."
+            )),
+        }
+    }
+
+    /// Drive one QWP/WebSocket progress step when the sender was built with
+    /// [`QwpWsProgress::Manual`].
+    ///
+    /// This sends at most one queued frame or polls one ready response. It
+    /// returns `Ok(false)` when no progress is immediately available.
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    pub fn drive_once(&mut self) -> Result<bool> {
+        match &mut self.handler {
+            SyncProtocolHandler::ManualQwpWs(state) => qwp_ws_drive_once(state),
+            SyncProtocolHandler::SyncQwpWs(_) => Err(error::fmt!(
+                InvalidApiCall,
+                "drive_once is only supported when qwp_ws_progress is manual."
+            )),
+            _ => Err(error::fmt!(
+                InvalidApiCall,
+                "drive_once is only supported for QWP/WebSocket senders."
+            )),
+        }
+    }
+
+    /// Stop accepting new QWP/WebSocket publications and wait for all already
+    /// published frames to complete.
+    ///
+    /// This uses the current built-in close-drain timeout. The Java-compatible
+    /// `close_flush_timeout_millis` config key is still rejected until Rust
+    /// exposes configurable close-drain timeout semantics.
+    #[cfg(feature = "sync-sender-qwp-ws")]
+    pub fn close_drain(&mut self) -> Result<()> {
+        let result = match &mut self.handler {
+            SyncProtocolHandler::SyncQwpWs(state) => qwp_ws_close_drain_background(state),
+            SyncProtocolHandler::ManualQwpWs(state) => qwp_ws_close_drain_manual(state),
+            _ => Err(error::fmt!(
+                InvalidApiCall,
+                "close_drain is only supported for QWP/WebSocket senders."
+            )),
+        };
+        if result
+            .as_ref()
+            .is_err_and(|err| matches!(err.code(), crate::ErrorCode::SocketError))
+        {
+            self.connected = false;
+        }
+        result
     }
 
     /// Tell whether the sender is no longer usable and must be dropped.
@@ -501,5 +710,24 @@ impl Sender {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+fn qwp_ws_deadline_expired(deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|deadline| Instant::now() >= deadline)
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+fn qwp_ws_sleep_until(deadline: Option<Instant>) {
+    const PARK: Duration = Duration::from_micros(50);
+    if qwp_ws_deadline_expired(deadline) {
+        return;
+    }
+    let sleep_for = deadline
+        .map(|deadline| deadline.saturating_duration_since(Instant::now()).min(PARK))
+        .unwrap_or(PARK);
+    if !sleep_for.is_zero() {
+        std::thread::sleep(sleep_for);
     }
 }

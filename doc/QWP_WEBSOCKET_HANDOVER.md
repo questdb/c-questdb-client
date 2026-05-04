@@ -30,10 +30,11 @@ WebSocket I/O. This does not mean every call is network-independent: local
 capacity may still make a producer call wait. The target shape is the Java
 architecture: a publication store/cursor with short synchronized access, plus a
 runner/I/O loop that owns transport, wire sequencing, reconnect/backoff, and
-replay. The current runner still uses private detached manual-driver operations
-as a transition; the manual `QwpWsSender` remains the threadless progress-owner
-API for advanced Rust users, tests, and FFI wiring, not the permanent
-architectural center of the high-level runner.
+replay. The current Rust public surface is now the single `Sender` type:
+background progress is the default, matching Java, while
+`qwp_ws_progress=manual` / `SenderBuilder::qwp_ws_progress(QwpWsProgress::Manual)`
+lets advanced users avoid a client-owned thread and call `drive_once()` or
+`await_acked_fsn(...)` themselves.
 
 ## Read first
 
@@ -551,23 +552,27 @@ conversion before the real driver is wired through.
   gated real-server public `Sender` SFA recovery probe covers local
   publication, an unacked disconnect, same-slot recovery, and replay before
   follow-up work. ACK cleanup remains part of the explicit close/drain gap.
-- The native Rust manual API is now the first-class pipelined surface:
-  `SenderBuilder::build_qwp_ws()` / `QwpWsSender::from_conf(...)` create a
-  manual sender with value receipts, explicit `drive_once`, receipt status,
-  bounded wait, and bounded close-drain. A mock-server test proves two batches
-  can be sent before waiting and then resolved by one cumulative ACK; another
-  proves per-receipt rejection diagnostics are not overwritten by later
-  rejections; a gated real-server probe verifies public manual submit/wait writes
-  a queryable row.
+- The native Rust manual API is now a mode of `Sender`, not a separate
+  `QwpWsSender` surface. `qwp_ws_progress=manual` builds the same QWP/WebSocket
+  sender without starting the background progress thread. `flush_and_get_fsn`
+  exposes the locally published FSN, `published_fsn` / `acked_fsn` expose Java-like
+  cumulative watermarks, and `drive_once` / `await_acked_fsn` let callers advance
+  or wait for progress explicitly. A mock-server test proves two batches can be
+  sent before waiting and then resolved by one cumulative ACK; another proves
+  reject-and-continue responses advance the cumulative ACK watermark; a gated
+  real-server probe verifies public manual publication writes a queryable row.
 - The current public `Sender::flush()` QWP/WebSocket path now returns after
   local publication and does not wait for the submitted frame's ACK. It may
   still wait for local capacity, and it relies on a sender-owned runner for
   WebSocket progress. Ordinary socket send, non-blocking receive poll, and
   reconnect/backoff no longer hold the publication mutex; behavioral runner
-  tests cover blocked send and blocked reconnect publication.
+  tests cover blocked send and blocked reconnect publication. QWP non-OK
+  responses and terminal WebSocket protocol closes are exposed through bounded
+  `Sender::poll_qwp_ws_error()` diagnostics, with drop-count observation via
+  `Sender::qwp_ws_errors_dropped()`.
   Remaining gaps are Java-compatible local backpressure
-  (`sf_append_deadline_millis`), close/drain semantics, and bounded public
-  observation for asynchronous server rejections. The manual driver now has a
+  (`sf_append_deadline_millis`), close/drain timeout semantics, and FFI exposure
+  of the public structured diagnostics. The manual driver now has a
   Java-like `PublicationLog` boundary: local publication owns FSNs/payload
   retention, and the driver owns connection-local wire sequencing, in-flight
   state, ACK mapping, and reconnect replay cursor. The high-level runner should
@@ -600,11 +605,11 @@ sender has been removed to keep one maintained QWP/WebSocket core.
    `sf_max_total_bytes` plus `sf_append_deadline_millis`. The append-deadline
    key is currently recognized and rejected until the runner slice can enforce
    it on local-publication backpressure.
-4. Add Java-compatible high-level close/drain behavior. Rust `Drop` cannot
-   return errors, so decide the explicit API shape before accepting
-   `close_flush_timeout_millis`.
-5. Finish Java-compatible server rejection reporting through the public/FFI
-   surfaces without adding dead-letter files or mandatory callbacks.
+4. Finish Java-compatible high-level close/drain timeout wiring. Rust `Drop`
+   cannot return errors, so keep `Sender::close_drain()` as the explicit
+   fallible API shape before accepting `close_flush_timeout_millis`.
+5. Extend the public structured QWP/WebSocket diagnostics through FFI without
+   adding dead-letter files or mandatory callbacks.
 6. Wire the C ABI stubs to the real queue/driver core.
 
 Do not start with C++/Python wrappers, orphan draining, SF compaction, or

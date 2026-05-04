@@ -74,8 +74,8 @@ As of 2026-04-29:
   server ACK, while a sender-owned runner advances WebSocket I/O. `flush()` may
   still wait for local capacity. The latest runner slices move ordinary socket
   send, non-blocking receive polling, and reconnect/backoff outside the
-  publication mutex. The manual `QwpWsSender` remains the threadless
-  progress-owner API.
+  publication mutex. The manual-progress API is now a mode of the same
+  `Sender`, selected with `qwp_ws_progress=manual`.
 
 ## Validation discipline
 
@@ -194,8 +194,8 @@ Validation target:
 - Submission, delivery, timeout, and close semantics are visible from names.
 - Receipts are easy to understand as value IDs.
 - The API does not make FFI users model Rust futures or a specific async runtime.
-- The native Rust API is pipelined too. C/FFI should wrap Rust's manual sender,
-  not be the only pipelined surface.
+- The native Rust API is pipelined too. C/FFI should wrap the same manual
+  `Sender` mode, not be the only pipelined surface.
 
 Design pressure to watch:
 
@@ -218,21 +218,22 @@ Global reflection:
 
 Current validated slice:
 
-- `SenderBuilder::build_qwp_ws()` and `QwpWsSender::from_conf(...)` create the
-  native Rust manual sender from the same config validation used by
-  `Sender::from_conf`.
-- `QwpWsSender::submit()` / `submit_and_keep()` return value receipts after
-  local publication and do not wait for server ACK.
-- `drive_once`, `receipt_status`, `wait` / `wait_steps`, and `close_drain` /
-  `close_drain_steps` expose manual progress without a hidden runner.
+- The native Rust manual API is now a `Sender` mode, selected with
+  `qwp_ws_progress=manual` or
+  `SenderBuilder::qwp_ws_progress(QwpWsProgress::Manual)`, from the same config
+  validation used by `Sender::from_conf`.
+- `Sender::flush_and_get_fsn()` / `flush_and_keep_and_get_fsn()` return the
+  locally published FSN and do not wait for server ACK.
+- `published_fsn`, `acked_fsn`, `drive_once`, `await_acked_fsn`, and
+  `close_drain` expose manual progress without a hidden runner.
 - A behavioral mock-server test proves two submitted buffers can be sent before
   waiting, then resolved by one cumulative ACK.
-- A behavioral mock-server test proves per-receipt rejection diagnostics are not
-  overwritten when receipts are waited out of rejection order.
-- A gated real-server probe verifies public manual `submit` / `wait_steps`
-  writes a queryable row through a local QuestDB server.
-- The live Rust API exposes only the real manual sender path; threaded and async
-  adapters remain design targets until their progress behavior exists.
+- A behavioral mock-server test proves reject-and-continue responses advance
+  the cumulative ACK watermark.
+- A gated real-server probe verifies public manual `flush_and_get_fsn` /
+  `await_acked_fsn` writes a queryable row through a local QuestDB server.
+- The live Rust API exposes one `Sender` surface; future async adapters remain
+  design targets until their progress behavior exists.
 
 ## Step 2: Progress ownership prototype
 
@@ -241,16 +242,18 @@ Model only the type ownership transitions. Do not implement real networking.
 Prototype shapes such as:
 
 ```rust
-pub struct QwpWsSender;
-pub struct QwpWsThreadedSender;
-pub struct QwpWsAsyncSender;
-
-impl QwpWsThreadedSender {
-    pub fn start(sender: QwpWsSender) -> Result<Self>;
+pub enum QwpWsProgress {
+    Background,
+    Manual,
 }
 
-impl QwpWsAsyncSender {
-    pub fn from_sender(sender: QwpWsSender) -> Result<Self>;
+impl SenderBuilder {
+    pub fn qwp_ws_progress(self, progress: QwpWsProgress) -> Result<Self>;
+}
+
+impl Sender {
+    pub fn drive_once(&mut self) -> Result<bool>;
+    pub fn await_acked_fsn(&mut self, fsn: u64, timeout: Duration) -> Result<bool>;
 }
 ```
 
@@ -434,10 +437,10 @@ The fake server should support:
 
 Validation target:
 
-- Manual `QwpWsSender` is the sole progress owner.
+- Manual `Sender` mode is the sole progress owner.
 - Blocking calls drive progress only while they own the sender mutably.
-- `submit()` blocks only until local queue/store acceptance.
-- `wait()` observes server delivery outcome for a receipt.
+- `flush_and_get_fsn()` blocks only until local queue/store acceptance.
+- `await_acked_fsn()` observes the cumulative server completion watermark.
 - Timeouts are outcomes where appropriate, not confused with protocol errors.
 
 Design pressure to watch:
@@ -729,8 +732,8 @@ Validation target:
   intended for the product core, not opaque test payload bytes.
 - The public sync `Sender` path uses the same publication driver and
   config-derived queue selection as the validated manual core.
-- The native Rust manual `QwpWsSender` path uses the same publication driver and
-  config-derived queue selection as the public sync compatibility path.
+- The native Rust manual `Sender` mode uses the same publication driver and
+  config-derived queue selection as the background `Sender` path.
 - The public sync `Sender` path has a live QuestDB SFA recovery probe for runner
   semantics: local publication succeeds, a proxy drops the unACKed frame, the
   next sender reopens the same Java-style slot, replay happens before follow-up
@@ -823,7 +826,7 @@ Validation target:
   producer call fails. Do not require callbacks for the first runner slice.
 - Drop/void close remains best-effort; explicit drain APIs are the only
   portable way to report close-time delivery failures.
-- Manual `QwpWsSender::drive_once()` and the high-level background runner cannot
+- Manual `Sender::drive_once()` and the high-level background runner cannot
   drive the same core at the same time.
 - The manual driver remains a threadless manual-progress API. The high-level
   runner should converge on a direct publication-store plus I/O-loop ownership

@@ -118,6 +118,28 @@ fn qwpudp_sender_reports_transport_protocol() {
     assert_eq!(sender.protocol(), Protocol::QwpUdp);
 }
 
+#[cfg(all(feature = "sync-sender-qwp-ws", feature = "sync-sender-qwp-udp"))]
+#[test]
+fn qwpws_error_polling_rejects_non_websocket_sender() {
+    let mut sender = SenderBuilder::new(Protocol::QwpUdp, "127.0.0.1", 9007)
+        .build()
+        .unwrap();
+
+    let err = sender.poll_qwp_ws_error().unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert!(
+        err.msg()
+            .contains("poll_qwp_ws_error is only supported for QWP/WebSocket")
+    );
+
+    let err = sender.qwp_ws_errors_dropped().unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+    assert!(
+        err.msg()
+            .contains("qwp_ws_errors_dropped is only supported for QWP/WebSocket")
+    );
+}
+
 #[cfg(feature = "sync-sender-qwp-ws")]
 #[test]
 fn qwpws_store_and_forward_config_parses_java_keys() {
@@ -150,6 +172,22 @@ fn qwpws_store_and_forward_defaults_match_java() {
     assert_defaulted_eq(&qwp_ws.sf_max_bytes, 4 * 1024 * 1024_u64);
     assert_defaulted_eq(&qwp_ws.sf_max_total_bytes, None);
     assert_defaulted_eq(&qwp_ws.sf_durability, conf::SfDurability::Memory);
+    assert_defaulted_eq(&qwp_ws.progress, QwpWsProgress::Background);
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
+fn qwpws_progress_config_parses_manual_and_background() {
+    let builder =
+        SenderBuilder::from_conf("qwpws::addr=localhost:9000;qwp_ws_progress=manual;").unwrap();
+    let qwp_ws = builder.qwp_ws.as_ref().unwrap();
+    assert_specified_eq(&qwp_ws.progress, QwpWsProgress::Manual);
+
+    let builder =
+        SenderBuilder::from_conf("qwpws::addr=localhost:9000;qwp_ws_progress=background;")
+            .unwrap();
+    let qwp_ws = builder.qwp_ws.as_ref().unwrap();
+    assert_specified_eq(&qwp_ws.progress, QwpWsProgress::Background);
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]
@@ -185,12 +223,16 @@ fn qwpws_store_and_forward_config_rejects_invalid_java_keys() {
         "invalid sf_durability [value=sync, allowed-values=[memory, flush, append]]",
     );
     assert_conf_err(
+        SenderBuilder::from_conf("qwpws::addr=localhost:9000;qwp_ws_progress=sync;"),
+        "invalid qwp_ws_progress [value=sync, allowed-values=[background, manual]]",
+    );
+    assert_conf_err(
         SenderBuilder::from_conf("qwpws::addr=localhost:9000;sf_append_deadline_millis=1234;"),
         "\"sf_append_deadline_millis\" is not supported by the Rust QWP/WebSocket sync sender yet; local-publication backpressure is not implemented.",
     );
     assert_conf_err(
         SenderBuilder::from_conf("qwpws::addr=localhost:9000;close_flush_timeout_millis=5000;"),
-        "\"close_flush_timeout_millis\" is not supported by the Rust QWP/WebSocket sync sender yet; call flush before dropping the sender.",
+        "\"close_flush_timeout_millis\" is not supported by the Rust QWP/WebSocket sync sender yet; use Sender::close_drain() for explicit close-drain behavior.",
     );
 }
 
@@ -208,6 +250,10 @@ fn qwpws_store_and_forward_config_is_websocket_only() {
     assert_conf_err(
         SenderBuilder::from_conf("tcp::addr=localhost:9009;sf_append_deadline_millis=5000;"),
         "The \"sf_append_deadline_millis\" setting is only supported for QWP/WebSocket.",
+    );
+    assert_conf_err(
+        SenderBuilder::from_conf("tcp::addr=localhost:9009;qwp_ws_progress=manual;"),
+        "The \"qwp_ws_progress\" setting is only supported for QWP/WebSocket.",
     );
 }
 

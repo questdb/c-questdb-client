@@ -46,11 +46,12 @@ use super::qwp_ws_codec::{
     WS_OPCODE_CONTINUATION, WS_OPCODE_PING, WS_OPCODE_PONG, WS_OPCODE_TEXT,
 };
 use super::qwp_ws_driver::{
-    BlockingQwpWsTransport, DriveOutcome, DriverError, ManualDriverPrototype,
+    BlockingQwpWsTransport, CloseOutcome, DriveOutcome, DriverError, ManualDriverPrototype,
     ManualDriverTransport, PublicationLog, QwpWsPublicationStore, QwpWsReconnectProgress,
     QwpWsSendCore, QwpWsSendProgress, QwpWsTransportFailureAction, ReconnectPolicy,
     ReconnectReason, TransportFailure, lock_free_publish_error, reconnect_error_is_terminal,
 };
+use super::qwp_ws_ownership::QwpWsSenderError;
 use super::qwp_ws_publisher::{QwpWsPublicationDriver, QwpWsPublicationError, QwpWsReplayEncoder};
 use super::qwp_ws_queue::{
     LockFreeVolatileProducer, LockFreeVolatilePublicationLog, OutboundFrame, QwpReceipt,
@@ -144,6 +145,11 @@ pub(crate) struct SyncQwpWsHandlerState {
     runner: SyncQwpWsRunner,
 }
 
+pub(crate) struct ManualQwpWsHandlerState {
+    publisher: SyncQwpWsPublisher,
+    max_drive_steps: usize,
+}
+
 pub(crate) struct SyncQwpWsRunner<Q = ConfiguredQwpWsQueue> {
     shared: Arc<Mutex<QwpWsPublicationStore<Q>>>,
     producer: Option<LockFreeVolatileProducer>,
@@ -169,6 +175,7 @@ struct BackpressureNotifier {
 
 const DEFAULT_APPEND_DEADLINE: Duration = Duration::from_secs(30);
 const BACKPRESSURE_PARK: Duration = Duration::from_micros(50);
+pub(crate) const DEFAULT_CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl<Q> SyncQwpWsRunner<Q>
 where
@@ -220,12 +227,12 @@ where
         }
     }
 
-    fn publish_replay_payload(&mut self, payload: &[u8]) -> crate::Result<()> {
+    fn publish_replay_payload(&mut self, payload: &[u8]) -> crate::Result<u64> {
         let deadline = Instant::now().checked_add(self.append_deadline);
         loop {
             if let Some(producer) = self.producer.as_mut() {
                 match producer.try_submit(payload) {
-                    Ok(_) => return Ok(()),
+                    Ok(receipt) => return Ok(receipt.fsn),
                     Err(err) => {
                         let err = lock_free_publish_error(err);
                         if driver_error_is_backpressure(&err) {
@@ -251,7 +258,7 @@ where
                 store.try_submit(payload)
             };
             match submit_result {
-                Ok(_) => return Ok(()),
+                Ok(receipt) => return Ok(receipt.fsn),
                 Err(err) if driver_error_is_backpressure(&err) => {
                     if !self.wait_for_publication_capacity(deadline) {
                         return Err(driver_error_to_error_without_state(
@@ -260,6 +267,63 @@ where
                     }
                 }
                 Err(err) => return Err(driver_error_to_error_without_state(err)),
+            }
+        }
+    }
+
+    fn published_fsn(&self) -> crate::Result<Option<u64>> {
+        let store = self.lock_shared()?;
+        check_store_error(&store)?;
+        Ok(store.published_fsn())
+    }
+
+    fn acked_fsn(&self) -> crate::Result<Option<u64>> {
+        let store = self.lock_shared()?;
+        check_store_error(&store)?;
+        Ok(store.completed_fsn())
+    }
+
+    fn poll_sender_error(&self) -> crate::Result<Option<QwpWsSenderError>> {
+        let mut store = self.lock_shared()?;
+        Ok(store.poll_sender_error())
+    }
+
+    fn sender_errors_dropped_total(&self) -> crate::Result<u64> {
+        let store = self.lock_shared()?;
+        Ok(store.sender_errors_dropped_total())
+    }
+
+    fn close_drain(&self, timeout: Duration) -> crate::Result<()> {
+        let deadline = Instant::now().checked_add(timeout);
+        {
+            let mut store = self.lock_shared()?;
+            check_store_error(&store)?;
+            store.set_closing();
+            if store.all_published_receipts_resolved() {
+                store
+                    .close_queue()
+                    .map_err(driver_error_to_error_without_state)?;
+                return Ok(());
+            }
+        }
+
+        loop {
+            {
+                let mut store = self.lock_shared()?;
+                check_store_error(&store)?;
+                if store.all_published_receipts_resolved() {
+                    store
+                        .close_queue()
+                        .map_err(driver_error_to_error_without_state)?;
+                    return Ok(());
+                }
+            }
+
+            if !self.wait_for_publication_capacity(deadline) {
+                return Err(error::fmt!(
+                    SocketError,
+                    "QWP/WebSocket close drain timed out before all published frames were acknowledged"
+                ));
             }
         }
     }
@@ -414,7 +478,15 @@ where
     where
         Q: PublicationLog,
     {
-        match QwpWsSendCore::<T>::transport_failure_action(failure) {
+        let action = {
+            let mut store = match shared.lock() {
+                Ok(store) => store,
+                Err(_) => return RunnerStep::Stop,
+            };
+            self.send_core
+                .transport_failure_action(&mut store, failure)
+        };
+        match action {
             QwpWsTransportFailureAction::Reconnect {
                 reason,
                 initial_error,
@@ -783,58 +855,109 @@ pub(crate) fn read_message<S: Read + Write>(
     scratch: &mut Vec<u8>,
     out: &mut Vec<u8>,
 ) -> crate::Result<u8> {
+    read_message_with_close(stream, scratch, out).map_err(WsMessageError::into_error)
+}
+
+#[derive(Debug)]
+pub(crate) struct WsCloseFrame {
+    pub(crate) code: Option<u16>,
+    pub(crate) reason: String,
+}
+
+impl WsCloseFrame {
+    pub(crate) fn into_error(self) -> crate::Error {
+        error::fmt!(
+            SocketError,
+            "WebSocket connection closed by server{}",
+            self.display_suffix()
+        )
+    }
+
+    fn display_suffix(&self) -> String {
+        match (self.code, self.reason.is_empty()) {
+            (Some(code), true) => format!(" (code={code})"),
+            (Some(code), false) => format!(" (code={code}, reason={})", self.reason),
+            (None, _) => String::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum WsMessageError {
+    Close(WsCloseFrame),
+    Error(crate::Error),
+}
+
+impl WsMessageError {
+    pub(crate) fn into_error(self) -> crate::Error {
+        match self {
+            Self::Close(close) => close.into_error(),
+            Self::Error(err) => err,
+        }
+    }
+}
+
+pub(crate) fn read_message_with_close<S: Read + Write>(
+    stream: &mut S,
+    scratch: &mut Vec<u8>,
+    out: &mut Vec<u8>,
+) -> Result<u8, WsMessageError> {
     out.clear();
     let mut first_opcode: Option<u8> = None;
     loop {
-        let (fin, opcode, payload) = read_frame(stream)?;
+        let (fin, opcode, payload) = read_frame(stream).map_err(WsMessageError::Error)?;
         match opcode {
             WS_OPCODE_PING => {
                 codec::write_frame_to_buf(scratch, true, WS_OPCODE_PONG, &payload, random_mask());
                 stream.write_all(scratch).map_err(|io| {
-                    error::fmt!(SocketError, "Could not send WebSocket PONG: {}", io)
+                    WsMessageError::Error(error::fmt!(
+                        SocketError,
+                        "Could not send WebSocket PONG: {}",
+                        io
+                    ))
                 })?;
                 continue;
             }
             WS_OPCODE_PONG => continue,
             WS_OPCODE_CLOSE => {
-                let reason = codec::ws_close_reason(&payload);
-                return Err(error::fmt!(
-                    SocketError,
-                    "WebSocket connection closed by server{}",
-                    reason
-                ));
+                let (code, reason) = codec::ws_close_details(&payload);
+                return Err(WsMessageError::Close(WsCloseFrame { code, reason }));
             }
             WS_OPCODE_TEXT | WS_OPCODE_BINARY => {
                 if first_opcode.is_some() {
-                    return Err(error::fmt!(
+                    return Err(WsMessageError::Error(error::fmt!(
                         SocketError,
                         "Unexpected new data frame mid-message"
-                    ));
+                    )));
                 }
                 first_opcode = Some(opcode);
                 out.extend_from_slice(&payload);
             }
             WS_OPCODE_CONTINUATION => {
                 if first_opcode.is_none() {
-                    return Err(error::fmt!(
+                    return Err(WsMessageError::Error(error::fmt!(
                         SocketError,
                         "Continuation frame without prior data frame"
-                    ));
+                    )));
                 }
                 out.extend_from_slice(&payload);
             }
             other => {
-                return Err(error::fmt!(
+                return Err(WsMessageError::Error(error::fmt!(
                     SocketError,
                     "Unknown WebSocket opcode: 0x{:x}",
                     other
-                ));
+                )));
             }
         }
         if fin {
             return Ok(first_opcode.unwrap());
         }
     }
+}
+
+pub(crate) fn is_terminal_ws_close_code(code: u16) -> bool {
+    matches!(code, 1002 | 1003 | 1007 | 1008 | 1009 | 1010)
 }
 
 fn read_frame<R: Read>(stream: &mut R) -> crate::Result<(bool, u8, Vec<u8>)> {
@@ -1066,6 +1189,22 @@ pub(crate) fn connect_qwp_ws(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(crate) fn open_manual_qwp_ws(
+    host: &str,
+    port: &str,
+    use_tls: bool,
+    tls_settings: Option<TlsSettings>,
+    qwp_ws: &QwpWsConfig,
+    auth_header: Option<String>,
+) -> crate::Result<ManualQwpWsHandlerState> {
+    let publisher = open_qwp_ws_publisher(host, port, use_tls, tls_settings, qwp_ws, auth_header)?;
+    Ok(ManualQwpWsHandlerState {
+        publisher,
+        max_drive_steps: max_flush_drive_steps(qwp_ws),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn open_qwp_ws_publisher(
     host: &str,
     port: &str,
@@ -1176,9 +1315,129 @@ fn connect_blocking_transport_with_retry(
 pub(crate) fn flush_qwp_ws(
     state: &mut SyncQwpWsHandlerState,
     buffer: &QwpBuffer,
-) -> crate::Result<()> {
+) -> crate::Result<Option<u64>> {
     let payload = state.encoder.encode(buffer)?;
-    state.runner.publish_replay_payload(payload)
+    state.runner.publish_replay_payload(payload).map(Some)
+}
+
+pub(crate) fn flush_qwp_ws_manual(
+    state: &mut ManualQwpWsHandlerState,
+    buffer: &QwpBuffer,
+) -> crate::Result<Option<u64>> {
+    let receipt = state
+        .publisher
+        .submit_qwp_with_drive_limit(buffer, state.max_drive_steps)
+        .map_err(|err| match err {
+            QwpWsPublicationError::Encode(err) => err,
+            QwpWsPublicationError::Driver(err) => driver_error_to_error(&state.publisher, err),
+        })?;
+    Ok(Some(receipt.fsn))
+}
+
+pub(crate) fn qwp_ws_drive_once(state: &mut ManualQwpWsHandlerState) -> crate::Result<bool> {
+    match state.publisher.drive_ready_once() {
+        Ok(DriveOutcome::Idle) => Ok(false),
+        Ok(DriveOutcome::Terminal) => qwp_ws_manual_terminal_error(state),
+        Ok(
+            DriveOutcome::Sent(_)
+            | DriveOutcome::Acked { .. }
+            | DriveOutcome::Rejected { .. }
+            | DriveOutcome::Reconnected { .. },
+        ) => Ok(true),
+        Err(err) => Err(driver_error_to_error(&state.publisher, err)),
+    }
+}
+
+pub(crate) fn qwp_ws_published_fsn_background(
+    state: &SyncQwpWsHandlerState,
+) -> crate::Result<Option<u64>> {
+    state.runner.published_fsn()
+}
+
+pub(crate) fn qwp_ws_acked_fsn_background(
+    state: &SyncQwpWsHandlerState,
+) -> crate::Result<Option<u64>> {
+    state.runner.acked_fsn()
+}
+
+pub(crate) fn qwp_ws_published_fsn_manual(
+    state: &ManualQwpWsHandlerState,
+) -> crate::Result<Option<u64>> {
+    check_manual_publisher_error(state)?;
+    Ok(state.publisher.published_fsn())
+}
+
+pub(crate) fn qwp_ws_acked_fsn_manual(
+    state: &ManualQwpWsHandlerState,
+) -> crate::Result<Option<u64>> {
+    check_manual_publisher_error(state)?;
+    Ok(state.publisher.acked_fsn())
+}
+
+pub(crate) fn qwp_ws_poll_sender_error_background(
+    state: &SyncQwpWsHandlerState,
+) -> crate::Result<Option<QwpWsSenderError>> {
+    state.runner.poll_sender_error()
+}
+
+pub(crate) fn qwp_ws_poll_sender_error_manual(
+    state: &mut ManualQwpWsHandlerState,
+) -> crate::Result<Option<QwpWsSenderError>> {
+    Ok(state.publisher.poll_sender_error())
+}
+
+pub(crate) fn qwp_ws_sender_errors_dropped_background(
+    state: &SyncQwpWsHandlerState,
+) -> crate::Result<u64> {
+    state.runner.sender_errors_dropped_total()
+}
+
+pub(crate) fn qwp_ws_sender_errors_dropped_manual(
+    state: &ManualQwpWsHandlerState,
+) -> crate::Result<u64> {
+    Ok(state.publisher.sender_errors_dropped_total())
+}
+
+pub(crate) fn qwp_ws_close_drain_background(state: &SyncQwpWsHandlerState) -> crate::Result<()> {
+    state.runner.close_drain(DEFAULT_CLOSE_DRAIN_TIMEOUT)
+}
+
+pub(crate) fn qwp_ws_close_drain_manual(state: &mut ManualQwpWsHandlerState) -> crate::Result<()> {
+    let deadline = Instant::now().checked_add(DEFAULT_CLOSE_DRAIN_TIMEOUT);
+    loop {
+        match state.publisher.close_drain_ready_once() {
+            Ok(CloseOutcome::Drained) => return Ok(()),
+            Ok(CloseOutcome::Terminal) => return qwp_ws_manual_terminal_error(state),
+            Ok(CloseOutcome::Timeout) => {
+                if backpressure_deadline_expired(deadline) {
+                    return Err(error::fmt!(
+                        SocketError,
+                        "QWP/WebSocket close drain timed out before all published frames were acknowledged"
+                    ));
+                }
+                thread::sleep(BACKPRESSURE_PARK);
+            }
+            Err(err) => return Err(driver_error_to_error(&state.publisher, err)),
+        }
+    }
+}
+
+fn check_manual_publisher_error(state: &ManualQwpWsHandlerState) -> crate::Result<()> {
+    if let Some(err) = state.publisher.terminal_error() {
+        return Err(err.clone());
+    }
+    if state.publisher.is_terminal() {
+        return Err(error::fmt!(SocketError, "QWP/WebSocket sender is terminal"));
+    }
+    Ok(())
+}
+
+fn qwp_ws_manual_terminal_error<T>(state: &ManualQwpWsHandlerState) -> crate::Result<T> {
+    Err(state
+        .publisher
+        .terminal_error()
+        .cloned()
+        .unwrap_or_else(|| error::fmt!(SocketError, "QWP/WebSocket sender is terminal")))
 }
 
 pub(crate) fn max_flush_drive_steps(qwp_ws: &QwpWsConfig) -> usize {
@@ -1187,13 +1446,6 @@ pub(crate) fn max_flush_drive_steps(qwp_ws: &QwpWsConfig) -> usize {
 
 fn double_duration(duration: Duration) -> Duration {
     duration.checked_mul(2).unwrap_or(Duration::MAX)
-}
-
-pub(crate) fn publication_error_to_error(err: QwpWsPublicationError) -> crate::Error {
-    match err {
-        QwpWsPublicationError::Encode(err) => err,
-        QwpWsPublicationError::Driver(err) => driver_error_to_error_without_state(err),
-    }
 }
 
 pub(crate) fn driver_error_to_error<Q, T>(

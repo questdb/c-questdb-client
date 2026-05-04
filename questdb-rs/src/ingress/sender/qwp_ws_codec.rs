@@ -288,17 +288,13 @@ pub(super) fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> 
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-pub(super) fn ws_close_reason(payload: &[u8]) -> String {
+pub(super) fn ws_close_details(payload: &[u8]) -> (Option<u16>, String) {
     if payload.len() >= 2 {
         let code = u16::from_be_bytes([payload[0], payload[1]]);
         let reason = std::str::from_utf8(&payload[2..]).unwrap_or("");
-        if reason.is_empty() {
-            format!(" (code={code})")
-        } else {
-            format!(" (code={code}, reason={reason})")
-        }
+        (Some(code), reason.to_string())
     } else {
-        String::new()
+        (None, String::new())
     }
 }
 

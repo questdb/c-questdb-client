@@ -23,6 +23,8 @@
  ******************************************************************************/
 
 use crate::{Error, ErrorCode, Result};
+#[cfg(feature = "_sender-qwp-ws")]
+use super::QwpWsProgress;
 use std::ops::Deref;
 #[cfg(feature = "_sender-qwp-ws")]
 use std::path::PathBuf;
@@ -175,6 +177,7 @@ pub(crate) struct QwpWsConfig {
     pub(crate) sf_max_bytes: ConfigSetting<u64>,
     pub(crate) sf_max_total_bytes: ConfigSetting<Option<u64>>,
     pub(crate) sf_durability: ConfigSetting<SfDurability>,
+    pub(crate) progress: ConfigSetting<QwpWsProgress>,
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -198,6 +201,7 @@ impl Default for QwpWsConfig {
             sf_max_bytes: ConfigSetting::new_default(QWP_WS_DEFAULT_SF_SEGMENT_BYTES),
             sf_max_total_bytes: ConfigSetting::new_default(None),
             sf_durability: ConfigSetting::new_default(SfDurability::Memory),
+            progress: ConfigSetting::new_default(QwpWsProgress::Background),
         }
     }
 }
