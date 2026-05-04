@@ -31,11 +31,81 @@
 //! QWP payload bytes; the replay encoder is validated separately.
 
 use std::cell::UnsafeCell;
+use std::ops::Deref;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
-pub(crate) type SharedPayload = Arc<[u8]>;
+#[derive(Clone)]
+pub(crate) struct SharedPayload {
+    storage: SharedPayloadStorage,
+}
+
+#[derive(Clone)]
+enum SharedPayloadStorage {
+    Owned(Arc<[u8]>),
+    LockFreeQueue {
+        queue: Arc<LockFreeVolatileFrameQueueInner>,
+        offset: usize,
+        len: usize,
+    },
+}
+
+impl SharedPayload {
+    pub(crate) fn copy_from_slice(payload: &[u8]) -> Self {
+        Self {
+            storage: SharedPayloadStorage::Owned(Arc::from(payload)),
+        }
+    }
+
+    fn lock_free_queue(
+        queue: Arc<LockFreeVolatileFrameQueueInner>,
+        offset: usize,
+        len: usize,
+    ) -> Self {
+        Self {
+            storage: SharedPayloadStorage::LockFreeQueue { queue, offset, len },
+        }
+    }
+}
+
+impl AsRef<[u8]> for SharedPayload {
+    fn as_ref(&self) -> &[u8] {
+        match &self.storage {
+            SharedPayloadStorage::Owned(payload) => payload.as_ref(),
+            SharedPayloadStorage::LockFreeQueue { queue, offset, len } => {
+                // SPSC invariant: published byte ranges are not reused until the
+                // runner completes their FSN. This view is used only for the
+                // synchronous send operation and is not stored by transports.
+                unsafe { &(&*queue.bytes.get())[*offset..*offset + *len] }
+            }
+        }
+    }
+}
+
+impl Deref for SharedPayload {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_ref()
+    }
+}
+
+impl std::fmt::Debug for SharedPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedPayload")
+            .field("len", &self.len())
+            .finish()
+    }
+}
+
+impl PartialEq for SharedPayload {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_ref() == other.as_ref()
+    }
+}
+
+impl Eq for SharedPayload {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct QwpReceipt {
@@ -180,9 +250,12 @@ pub(crate) struct LockFreeVolatilePublicationLog {
 
 struct LockFreeVolatileFrameQueueInner {
     slots: Box<[LockFreeFrameSlot]>,
+    bytes: UnsafeCell<Box<[u8]>>,
     max_bytes: usize,
     max_in_flight: usize,
     bytes_used: AtomicUsize,
+    byte_tail: AtomicUsize,
+    byte_head: AtomicUsize,
     next_fsn: AtomicU64,
     published_upper: AtomicU64,
     completed_upper: AtomicU64,
@@ -194,7 +267,9 @@ struct LockFreeVolatileFrameQueueInner {
 
 struct LockFreeFrameSlot {
     fsn: AtomicU64,
-    payload: UnsafeCell<Option<SharedPayload>>,
+    offset: AtomicUsize,
+    len: AtomicUsize,
+    reserved_len: AtomicUsize,
     state: AtomicU8,
 }
 
@@ -276,7 +351,7 @@ impl VolatileFrameQueue {
         let tail = self.slot_index(self.len);
         let slot = &mut self.slots[tail];
         slot.fsn = fsn;
-        slot.payload = Some(Arc::from(payload));
+        slot.payload = Some(SharedPayload::copy_from_slice(payload));
         slot.state = FrameState::Published;
 
         self.len += 1;
@@ -429,17 +504,23 @@ impl LockFreeVolatileFrameQueue {
         let slots = (0..options.max_frames)
             .map(|_| LockFreeFrameSlot {
                 fsn: AtomicU64::new(0),
-                payload: UnsafeCell::new(None),
+                offset: AtomicUsize::new(0),
+                len: AtomicUsize::new(0),
+                reserved_len: AtomicUsize::new(0),
                 state: AtomicU8::new(LOCK_FREE_SLOT_FREE),
             })
             .collect();
+        let bytes = vec![0; options.max_bytes].into_boxed_slice();
 
         Ok(Self {
             inner: Arc::new(LockFreeVolatileFrameQueueInner {
                 slots,
+                bytes: UnsafeCell::new(bytes),
                 max_bytes: options.max_bytes,
                 max_in_flight: options.max_in_flight,
                 bytes_used: AtomicUsize::new(0),
+                byte_tail: AtomicUsize::new(0),
+                byte_head: AtomicUsize::new(0),
                 next_fsn: AtomicU64::new(0),
                 published_upper: AtomicU64::new(0),
                 completed_upper: AtomicU64::new(0),
@@ -495,10 +576,13 @@ impl LockFreeVolatileFrameQueue {
             return None;
         }
 
-        // SPSC invariant: only the runner thread clones/takes payloads after the
-        // producer publishes them. Completion cannot run concurrently with this
-        // read because both are driven by the same runner core.
-        unsafe { (&*slot.payload.get()).as_ref().map(Arc::clone) }
+        let offset = slot.offset.load(Ordering::Acquire);
+        let len = slot.len.load(Ordering::Acquire);
+        Some(SharedPayload::lock_free_queue(
+            Arc::clone(&self.inner),
+            offset,
+            len,
+        ))
     }
 
     pub(crate) fn oldest_unresolved_fsn(&self) -> Option<u64> {
@@ -529,18 +613,20 @@ impl LockFreeVolatileFrameQueue {
             }
         }
 
+        let mut freed_bytes = 0usize;
         for fsn in completed..target_upper {
             let slot = self.slot_for_fsn(fsn);
             // SPSC invariant: the producer cannot reuse this slot until it sees
             // completed_upper advance, which happens after the slot is freed.
-            let payload = unsafe { (&mut *slot.payload.get()).take() };
-            if let Some(payload) = payload {
-                self.inner
-                    .bytes_used
-                    .fetch_sub(payload.len(), Ordering::AcqRel);
-            }
+            freed_bytes += slot.reserved_len.load(Ordering::Acquire);
             slot.state.store(LOCK_FREE_SLOT_FREE, Ordering::Release);
         }
+        self.inner
+            .byte_head
+            .fetch_add(freed_bytes, Ordering::AcqRel);
+        self.inner
+            .bytes_used
+            .fetch_sub(freed_bytes, Ordering::AcqRel);
 
         self.inner
             .completed_upper
@@ -553,9 +639,11 @@ impl LockFreeVolatileFrameQueue {
             return Err(QueueError::ProtocolRejectedUnsentFrame { fsn: rejected_fsn });
         }
         {
-            let mut rejected = self.inner.rejected_fsns.lock().map_err(|_| {
-                QueueError::ProtocolRejectedUnsentFrame { fsn: rejected_fsn }
-            })?;
+            let mut rejected = self
+                .inner
+                .rejected_fsns
+                .lock()
+                .map_err(|_| QueueError::ProtocolRejectedUnsentFrame { fsn: rejected_fsn })?;
             if !rejected.contains(&rejected_fsn) {
                 rejected.push(rejected_fsn);
             }
@@ -631,20 +719,23 @@ impl LockFreeVolatileFrameQueue {
             });
         }
 
-        self.reserve_bytes(payload.len())?;
         let slot = self.slot_for_fsn(fsn);
         if slot.state.load(Ordering::Acquire) != LOCK_FREE_SLOT_FREE {
-            self.inner.bytes_used.fetch_sub(payload.len(), Ordering::AcqRel);
             return Err(QueueError::FrameCapacityFull {
                 max_frames: self.inner.slots.len(),
             });
         }
 
-        let stored_payload: SharedPayload = Arc::from(payload);
-        slot.fsn.store(fsn, Ordering::Relaxed);
+        let reservation = self.reserve_byte_range(payload.len())?;
         unsafe {
-            *slot.payload.get() = Some(stored_payload);
+            (&mut *self.inner.bytes.get())[reservation.offset..reservation.offset + payload.len()]
+                .copy_from_slice(payload);
         }
+        slot.fsn.store(fsn, Ordering::Relaxed);
+        slot.offset.store(reservation.offset, Ordering::Relaxed);
+        slot.len.store(payload.len(), Ordering::Relaxed);
+        slot.reserved_len
+            .store(reservation.reserved_len, Ordering::Relaxed);
         slot.state
             .store(LOCK_FREE_SLOT_PUBLISHED, Ordering::Release);
         self.inner.next_fsn.store(next_fsn, Ordering::Relaxed);
@@ -655,37 +746,61 @@ impl LockFreeVolatileFrameQueue {
         Ok(QwpReceipt { fsn })
     }
 
-    fn reserve_bytes(&self, payload_len: usize) -> Result<(), QueueError> {
-        loop {
-            let bytes_used = self.inner.bytes_used.load(Ordering::Acquire);
-            let Some(new_bytes_used) = bytes_used.checked_add(payload_len) else {
-                return Err(QueueError::ByteCapacityFull {
-                    payload_len,
-                    bytes_used,
-                    max_bytes: self.inner.max_bytes,
-                });
-            };
-            if new_bytes_used > self.inner.max_bytes {
-                return Err(QueueError::ByteCapacityFull {
-                    payload_len,
-                    bytes_used,
-                    max_bytes: self.inner.max_bytes,
-                });
-            }
-            if self
-                .inner
-                .bytes_used
-                .compare_exchange_weak(
-                    bytes_used,
-                    new_bytes_used,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-            {
-                return Ok(());
-            }
+    fn reserve_byte_range(&self, payload_len: usize) -> Result<ByteReservation, QueueError> {
+        let mut tail = self.inner.byte_tail.load(Ordering::Relaxed);
+        let mut head = self.inner.byte_head.load(Ordering::Acquire);
+        let bytes_used = tail.saturating_sub(head);
+        if bytes_used == 0 && tail != 0 {
+            self.inner.byte_head.store(0, Ordering::Release);
+            self.inner.byte_tail.store(0, Ordering::Release);
+            head = 0;
+            tail = 0;
         }
+
+        let offset = tail % self.inner.max_bytes;
+        let padding = if offset + payload_len <= self.inner.max_bytes {
+            0
+        } else {
+            self.inner.max_bytes - offset
+        };
+        let reserved_len =
+            padding
+                .checked_add(payload_len)
+                .ok_or(QueueError::ByteCapacityFull {
+                    payload_len,
+                    bytes_used,
+                    max_bytes: self.inner.max_bytes,
+                })?;
+        let new_tail = tail
+            .checked_add(reserved_len)
+            .ok_or(QueueError::ByteCapacityFull {
+                payload_len,
+                bytes_used,
+                max_bytes: self.inner.max_bytes,
+            })?;
+        let new_bytes_used = new_tail
+            .checked_sub(head)
+            .ok_or(QueueError::ByteCapacityFull {
+                payload_len,
+                bytes_used,
+                max_bytes: self.inner.max_bytes,
+            })?;
+        if new_bytes_used > self.inner.max_bytes {
+            return Err(QueueError::ByteCapacityFull {
+                payload_len,
+                bytes_used,
+                max_bytes: self.inner.max_bytes,
+            });
+        }
+
+        self.inner.byte_tail.store(new_tail, Ordering::Release);
+        self.inner
+            .bytes_used
+            .fetch_add(reserved_len, Ordering::AcqRel);
+        Ok(ByteReservation {
+            offset: (offset + padding) % self.inner.max_bytes,
+            reserved_len,
+        })
     }
 
     fn fsn_is_published_and_unresolved(&self, fsn: u64) -> bool {
@@ -735,6 +850,11 @@ impl LockFreeVolatileFrameQueue {
 
 struct PublishGuard<'a> {
     active: &'a AtomicBool,
+}
+
+struct ByteReservation {
+    offset: usize,
+    reserved_len: usize,
 }
 
 impl Drop for PublishGuard<'_> {
@@ -821,6 +941,8 @@ impl std::fmt::Debug for LockFreeVolatileFrameQueue {
             .field("max_bytes", &self.inner.max_bytes)
             .field("max_in_flight", &self.inner.max_in_flight)
             .field("bytes_used", &self.inner.bytes_used.load(Ordering::Relaxed))
+            .field("byte_tail", &self.inner.byte_tail.load(Ordering::Relaxed))
+            .field("byte_head", &self.inner.byte_head.load(Ordering::Relaxed))
             .field("next_fsn", &self.inner.next_fsn.load(Ordering::Relaxed))
             .field(
                 "published_upper",
@@ -1073,6 +1195,84 @@ mod tests {
     }
 
     #[test]
+    fn lock_free_queue_wraps_payload_bytes_without_corruption() {
+        let queue = lock_free_queue(4, 8, 4);
+        let mut producer = queue.claim_producer().unwrap();
+
+        let first = producer.try_submit(b"aaaaa").unwrap();
+        let second = producer.try_submit(b"bb").unwrap();
+        queue.complete_through_fsn(first.fsn).unwrap();
+        let third = producer.try_submit(b"cccc").unwrap();
+
+        assert_eq!(
+            queue.shared_payload_for_fsn(second.fsn).as_deref(),
+            Some(&b"bb"[..])
+        );
+        assert_eq!(
+            queue.shared_payload_for_fsn(third.fsn).as_deref(),
+            Some(&b"cccc"[..])
+        );
+        assert_eq!(queue.bytes_used(), 7);
+
+        queue.complete_through_fsn(third.fsn).unwrap();
+        assert_eq!(queue.bytes_used(), 0);
+    }
+
+    #[test]
+    fn lock_free_reject_frees_wrapped_frame_and_byte_capacity() {
+        let queue = lock_free_queue(4, 8, 4);
+        let mut producer = queue.claim_producer().unwrap();
+
+        let first = producer.try_submit(b"aaaaa").unwrap();
+        let second = producer.try_submit(b"bb").unwrap();
+        queue.complete_through_fsn(first.fsn).unwrap();
+        let third = producer.try_submit(b"cccc").unwrap();
+
+        queue.reject_fsn(third.fsn).unwrap();
+
+        assert_eq!(
+            queue.receipt_status(second),
+            QwpReceiptStatus::Acked { fsn: second.fsn }
+        );
+        assert_eq!(
+            queue.receipt_status(third),
+            QwpReceiptStatus::Rejected { fsn: third.fsn }
+        );
+        assert_eq!(queue.bytes_used(), 0);
+        let fourth = producer.try_submit(b"dddddddd").unwrap();
+        assert_eq!(
+            queue.shared_payload_for_fsn(fourth.fsn).as_deref(),
+            Some(&b"dddddddd"[..])
+        );
+    }
+
+    /// Run with:
+    /// `cargo test --features sync-sender-qwp-ws --lib lock_free_publish_zero_alloc_after_warmup -- --ignored --test-threads=1`
+    #[test]
+    #[ignore]
+    fn lock_free_publish_zero_alloc_after_warmup() {
+        use crate::alloc_counter;
+
+        let queue = lock_free_queue(4, 64, 4);
+        let mut producer = queue.claim_producer().unwrap();
+
+        for _ in 0..4 {
+            let receipt = producer.try_submit(b"steady-state").unwrap();
+            queue.complete_through_fsn(receipt.fsn).unwrap();
+        }
+
+        alloc_counter::start_counting();
+        let receipt = producer.try_submit(b"steady-state").unwrap();
+        let alloc_count = alloc_counter::stop_counting();
+
+        assert_eq!(receipt, QwpReceipt { fsn: 4 });
+        assert_eq!(
+            alloc_count, 0,
+            "Expected zero allocations for warmed lock-free QWP/WebSocket memory publication, got {alloc_count}"
+        );
+    }
+
+    #[test]
     fn lock_free_reject_marks_receipt_rejected_and_completes_prior_frames() {
         let queue = lock_free_queue(4, 1024, 4);
         let mut producer = queue.claim_producer().unwrap();
@@ -1103,10 +1303,16 @@ mod tests {
         let mut producer = queue.claim_producer().unwrap();
 
         queue.close_for_publication();
-        assert_eq!(producer.try_submit(b"payload"), Err(LockFreePublishError::Closing));
+        assert_eq!(
+            producer.try_submit(b"payload"),
+            Err(LockFreePublishError::Closing)
+        );
 
         queue.terminalize_publication();
-        assert_eq!(producer.try_submit(b"payload"), Err(LockFreePublishError::Terminal));
+        assert_eq!(
+            producer.try_submit(b"payload"),
+            Err(LockFreePublishError::Terminal)
+        );
     }
 
     #[test]

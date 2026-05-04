@@ -1906,9 +1906,10 @@ pub(crate) struct QwpWsEncodeScratch {
     /// signature key for the schema registry and as the payload to splice into
     /// the message in full mode, avoiding a second pass over the columns.
     schema_signature: Vec<u8>,
-    /// Per-message schema ids for the self-sufficient replay encoder.
-    #[allow(dead_code)]
-    replay_schema_registry: SchemaRegistry,
+    /// Reusable per-message schema signatures for the self-sufficient replay
+    /// encoder.
+    replay_schema_signatures: Vec<Vec<u8>>,
+    replay_schema_count: usize,
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -1918,7 +1919,8 @@ impl QwpWsEncodeScratch {
             message: Vec::with_capacity(16 * 1024),
             per_segment_symbol_globals: Vec::new(),
             schema_signature: Vec::new(),
-            replay_schema_registry: SchemaRegistry::new(),
+            replay_schema_signatures: Vec::new(),
+            replay_schema_count: 0,
         }
     }
 }
@@ -1941,6 +1943,7 @@ pub(crate) struct SchemaRegistry {
 
 #[cfg(feature = "_sender-qwp-ws")]
 impl SchemaRegistry {
+    #[allow(dead_code)]
     pub(crate) fn new() -> Self {
         Self {
             map: std::collections::HashMap::new(),
@@ -1957,6 +1960,7 @@ impl SchemaRegistry {
     /// Returns `(schema_id, is_new)`. When `is_new` is true the caller must
     /// emit full-mode (column definitions inline) so the server registers the
     /// id; otherwise it should emit reference-mode (just the id).
+    #[allow(dead_code)]
     fn intern(&mut self, signature: &[u8]) -> (u64, bool) {
         if let Some(&id) = self.map.get(signature) {
             return (id, false);
@@ -1966,6 +1970,29 @@ impl SchemaRegistry {
         self.map.insert(signature.to_vec(), id);
         (id, true)
     }
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+fn intern_replay_schema_signature(
+    signatures: &mut Vec<Vec<u8>>,
+    active_count: &mut usize,
+    signature: &[u8],
+) -> u64 {
+    for (index, stored) in signatures.iter().take(*active_count).enumerate() {
+        if stored.as_slice() == signature {
+            return index as u64;
+        }
+    }
+
+    if *active_count == signatures.len() {
+        signatures.push(Vec::new());
+    }
+    let stored = &mut signatures[*active_count];
+    stored.clear();
+    stored.extend_from_slice(signature);
+    let id = *active_count as u64;
+    *active_count += 1;
+    id
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -2138,17 +2165,20 @@ impl QwpBuffer {
         let payload_start = out.len();
 
         // ---- Pass 1: map frame-local symbol ids to connection-global ids ----
-        scratch.per_segment_symbol_globals.clear();
-        scratch
-            .per_segment_symbol_globals
-            .reserve(self.segments.len());
+        while scratch.per_segment_symbol_globals.len() < self.segments.len() {
+            scratch.per_segment_symbol_globals.push(Vec::new());
+        }
         let mut highest_referenced_symbol_id: Option<u64> = None;
 
         for (seg_idx, _) in self.segments.iter().enumerate() {
             let planner = self.size_hint.segment_planner(seg_idx)?;
-            let mut per_col: Vec<Vec<u64>> = Vec::with_capacity(planner.columns.len());
-            for col in &planner.columns {
-                let mut globals_for_col: Vec<u64> = Vec::new();
+            let per_col = &mut scratch.per_segment_symbol_globals[seg_idx];
+            while per_col.len() < planner.columns.len() {
+                per_col.push(Vec::new());
+            }
+            for (col_idx, col) in planner.columns.iter().enumerate() {
+                let globals_for_col = &mut per_col[col_idx];
+                globals_for_col.clear();
                 if matches!(col.kind, ColumnKind::Symbol) {
                     globals_for_col.reserve(col.dict_count as usize);
                     let mut cursor = col.dict_head;
@@ -2164,9 +2194,7 @@ impl QwpBuffer {
                         cursor = entry.next;
                     }
                 }
-                per_col.push(globals_for_col);
             }
-            scratch.per_segment_symbol_globals.push(per_col);
         }
 
         // ---- Dense dictionary prefix section ----
@@ -2185,7 +2213,7 @@ impl QwpBuffer {
         }
 
         // ---- Table blocks ----
-        scratch.replay_schema_registry.reset();
+        scratch.replay_schema_count = 0;
         let table_count: u16 = checked_qwp_u16(self.segments.len(), "WS message table count")?;
         for (seg_idx, segment) in self.segments.iter().enumerate() {
             let planner = self.size_hint.segment_planner(seg_idx)?;
@@ -2210,9 +2238,11 @@ impl QwpBuffer {
                     .schema_signature
                     .push(wire_type_byte(col.kind, col.uses_null_bitmap(row_count)));
             }
-            let (schema_id, _) = scratch
-                .replay_schema_registry
-                .intern(&scratch.schema_signature);
+            let schema_id = intern_replay_schema_signature(
+                &mut scratch.replay_schema_signatures,
+                &mut scratch.replay_schema_count,
+                &scratch.schema_signature,
+            );
             out.push(QWP_SCHEMA_MODE_FULL);
             write_qwp_varint(out, schema_id);
             out.extend_from_slice(&scratch.schema_signature);

@@ -1160,6 +1160,8 @@ pub(crate) trait ManualDriverTransport {
         self.poll_response()
     }
 
+    // The outbound payload may be a queue-owned view. Transports must write or
+    // copy it synchronously and must not retain the frame after returning.
     fn send_frame(&mut self, frame: OutboundFrame)
     -> Result<TransportSendResult, TransportFailure>;
 
@@ -1185,6 +1187,7 @@ pub(crate) struct BlockingQwpWsTransport {
     recv: Vec<u8>,
     send_buf: Vec<u8>,
     pending_wire_sequences: VecDeque<u64>,
+    #[cfg(test)]
     sent_frames: Vec<SentFrame>,
 }
 
@@ -1220,6 +1223,7 @@ impl BlockingQwpWsTransport {
             recv: Vec::new(),
             send_buf: Vec::with_capacity(16 * 1024),
             pending_wire_sequences: VecDeque::new(),
+            #[cfg(test)]
             sent_frames: Vec::new(),
         })
     }
@@ -1352,6 +1356,7 @@ impl ManualDriverTransport for BlockingQwpWsTransport {
         &mut self,
         frame: OutboundFrame,
     ) -> Result<TransportSendResult, TransportFailure> {
+        #[cfg(test)]
         let sent_frame = frame.sent_frame();
         write_binary_frame(&mut self.stream, &mut self.send_buf, frame.payload.as_ref()).map_err(
             |io| {
@@ -1370,6 +1375,7 @@ impl ManualDriverTransport for BlockingQwpWsTransport {
             ))
         })?;
         self.pending_wire_sequences.push_back(frame.wire_seq);
+        #[cfg(test)]
         self.sent_frames.push(sent_frame);
         Ok(TransportSendResult::NoResponse)
     }
@@ -1379,7 +1385,14 @@ impl ManualDriverTransport for BlockingQwpWsTransport {
     }
 
     fn sent_frames(&self) -> &[SentFrame] {
-        &self.sent_frames
+        #[cfg(test)]
+        {
+            &self.sent_frames
+        }
+        #[cfg(not(test))]
+        {
+            &[]
+        }
     }
 }
 
@@ -2065,6 +2078,34 @@ mod tests {
 
         let third_receipt = publisher.try_submit_qwp(third.as_qwp().unwrap()).unwrap();
         assert_eq!(third_receipt, QwpReceipt { fsn: 1 });
+    }
+
+    /// Run with:
+    /// `cargo test --features sync-sender-qwp-ws --lib publisher_lock_free_memory_zero_alloc_after_warmup -- --ignored --test-threads=1`
+    #[test]
+    #[ignore]
+    fn publisher_lock_free_memory_zero_alloc_after_warmup() {
+        use crate::alloc_counter;
+
+        let buffer = qwp_buffer("SYM_001", 7, 1_000);
+        let queue = LockFreeVolatilePublicationLog::new(options(8, 4096, 4)).unwrap();
+        let driver = ManualDriverPrototype::from_queue(queue, FakeOrderedServer::ack_each_send());
+        let mut publisher = QwpWsPublicationDriver::new(driver, 1);
+
+        for _ in 0..4 {
+            let receipt = publisher.try_submit_qwp(buffer.as_qwp().unwrap()).unwrap();
+            assert_eq!(publisher.wait_steps(receipt, 4).unwrap(), DeliveryOutcome::Acked);
+        }
+
+        alloc_counter::start_counting();
+        let receipt = publisher.try_submit_qwp(buffer.as_qwp().unwrap()).unwrap();
+        let alloc_count = alloc_counter::stop_counting();
+
+        assert_eq!(receipt, QwpReceipt { fsn: 4 });
+        assert_eq!(
+            alloc_count, 0,
+            "Expected zero allocations for warmed QWP/WebSocket memory publication, got {alloc_count}"
+        );
     }
 
     #[cfg(feature = "sync-sender-qwp-ws")]

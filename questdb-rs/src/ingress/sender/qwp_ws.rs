@@ -913,11 +913,13 @@ pub(crate) fn read_message_with_close<S: Read + Write>(
 ) -> Result<u8, WsMessageError> {
     out.clear();
     let mut first_opcode: Option<u8> = None;
+    let mut control_payload = [0u8; MAX_CONTROL_FRAME_PAYLOAD_BYTES];
     loop {
-        let (fin, opcode, payload) = read_frame(stream)?;
-        match opcode {
+        let header = read_frame_header(stream)?;
+        match header.opcode {
             WS_OPCODE_PING => {
-                codec::write_frame_to_buf(scratch, true, WS_OPCODE_PONG, &payload, random_mask());
+                let payload = read_control_frame_payload(stream, header, &mut control_payload)?;
+                codec::write_frame_to_buf(scratch, true, WS_OPCODE_PONG, payload, random_mask());
                 stream.write_all(scratch).map_err(|io| {
                     WsMessageError::Error(error::fmt!(
                         SocketError,
@@ -927,9 +929,13 @@ pub(crate) fn read_message_with_close<S: Read + Write>(
                 })?;
                 continue;
             }
-            WS_OPCODE_PONG => continue,
+            WS_OPCODE_PONG => {
+                read_control_frame_payload(stream, header, &mut control_payload)?;
+                continue;
+            }
             WS_OPCODE_CLOSE => {
-                let (code, reason) = codec::ws_close_details(&payload);
+                let payload = read_control_frame_payload(stream, header, &mut control_payload)?;
+                let (code, reason) = codec::ws_close_details(payload);
                 return Err(WsMessageError::Close(WsCloseFrame { code, reason }));
             }
             WS_OPCODE_TEXT | WS_OPCODE_BINARY => {
@@ -938,8 +944,8 @@ pub(crate) fn read_message_with_close<S: Read + Write>(
                         "Unexpected new data frame mid-message".to_string(),
                     ));
                 }
-                first_opcode = Some(opcode);
-                out.extend_from_slice(&payload);
+                first_opcode = Some(header.opcode);
+                read_payload_into(stream, out, header.payload_len)?;
             }
             WS_OPCODE_CONTINUATION => {
                 if first_opcode.is_none() {
@@ -947,7 +953,7 @@ pub(crate) fn read_message_with_close<S: Read + Write>(
                         "Continuation frame without prior data frame".to_string(),
                     ));
                 }
-                out.extend_from_slice(&payload);
+                read_payload_into(stream, out, header.payload_len)?;
             }
             other => {
                 return Err(WsMessageError::ProtocolViolation(format!(
@@ -956,7 +962,7 @@ pub(crate) fn read_message_with_close<S: Read + Write>(
                 )));
             }
         }
-        if fin {
+        if header.fin {
             return Ok(first_opcode.unwrap());
         }
     }
@@ -966,7 +972,16 @@ pub(crate) fn is_terminal_ws_close_code(code: u16) -> bool {
     matches!(code, 1002 | 1003 | 1007 | 1008 | 1009 | 1010)
 }
 
-fn read_frame<R: Read>(stream: &mut R) -> Result<(bool, u8, Vec<u8>), WsMessageError> {
+#[derive(Debug, Clone, Copy)]
+struct FrameHeader {
+    fin: bool,
+    opcode: u8,
+    payload_len: usize,
+}
+
+const MAX_CONTROL_FRAME_PAYLOAD_BYTES: usize = 125;
+
+fn read_frame_header<R: Read>(stream: &mut R) -> Result<FrameHeader, WsMessageError> {
     let mut hdr = [0u8; 2];
     read_exact_io(stream, &mut hdr, "WebSocket frame header").map_err(WsMessageError::Error)?;
     let fin = (hdr[0] & 0x80) != 0;
@@ -1001,12 +1016,58 @@ fn read_frame<R: Read>(stream: &mut R) -> Result<(bool, u8, Vec<u8>), WsMessageE
         )));
     }
 
-    let mut payload = vec![0u8; payload_len as usize];
-    if !payload.is_empty() {
-        read_exact_io(stream, &mut payload, "WebSocket frame payload")
+    let payload_len = usize::try_from(payload_len).map_err(|_| {
+        WsMessageError::ProtocolViolation(format!(
+            "WebSocket frame too large for this platform: {} bytes",
+            payload_len
+        ))
+    })?;
+    Ok(FrameHeader {
+        fin,
+        opcode,
+        payload_len,
+    })
+}
+
+fn read_payload_into<R: Read>(
+    stream: &mut R,
+    out: &mut Vec<u8>,
+    payload_len: usize,
+) -> Result<(), WsMessageError> {
+    let start = out.len();
+    let end = start.checked_add(payload_len).ok_or_else(|| {
+        WsMessageError::ProtocolViolation("WebSocket message too large".to_string())
+    })?;
+    out.resize(end, 0);
+    if payload_len > 0 {
+        read_exact_io(stream, &mut out[start..end], "WebSocket frame payload")
             .map_err(WsMessageError::Error)?;
     }
-    Ok((fin, opcode, payload))
+    Ok(())
+}
+
+fn read_control_frame_payload<'a, R: Read>(
+    stream: &mut R,
+    header: FrameHeader,
+    payload: &'a mut [u8; MAX_CONTROL_FRAME_PAYLOAD_BYTES],
+) -> Result<&'a [u8], WsMessageError> {
+    if !header.fin {
+        return Err(WsMessageError::ProtocolViolation(
+            "WebSocket control frame must not be fragmented".to_string(),
+        ));
+    }
+    if header.payload_len > MAX_CONTROL_FRAME_PAYLOAD_BYTES {
+        return Err(WsMessageError::ProtocolViolation(format!(
+            "WebSocket control frame too large: {} bytes",
+            header.payload_len
+        )));
+    }
+    let payload = &mut payload[..header.payload_len];
+    if !payload.is_empty() {
+        read_exact_io(stream, payload, "WebSocket control frame payload")
+            .map_err(WsMessageError::Error)?;
+    }
+    Ok(payload)
 }
 
 fn read_exact_io<R: Read>(stream: &mut R, buf: &mut [u8], what: &str) -> crate::Result<()> {
@@ -1560,6 +1621,104 @@ mod tests {
             err.msg().contains("must not be masked"),
             "got: {}",
             err.msg()
+        );
+    }
+
+    struct InMemoryWs {
+        read: std::io::Cursor<Vec<u8>>,
+        written: Vec<u8>,
+    }
+
+    impl InMemoryWs {
+        fn new(read: Vec<u8>) -> Self {
+            Self {
+                read: std::io::Cursor::new(read),
+                written: Vec::new(),
+            }
+        }
+    }
+
+    impl std::io::Read for InMemoryWs {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            std::io::Read::read(&mut self.read, buf)
+        }
+    }
+
+    impl std::io::Write for InMemoryWs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn append_server_frame(out: &mut Vec<u8>, fin: bool, opcode: u8, payload: &[u8]) {
+        let fin_bit = if fin { 0x80 } else { 0x00 };
+        out.push(fin_bit | (opcode & 0x0F));
+        let plen = payload.len();
+        if plen <= 125 {
+            out.push(plen as u8);
+        } else if plen <= 0xFFFF {
+            out.push(126);
+            out.extend_from_slice(&(plen as u16).to_be_bytes());
+        } else {
+            out.push(127);
+            out.extend_from_slice(&(plen as u64).to_be_bytes());
+        }
+        out.extend_from_slice(payload);
+    }
+
+    #[test]
+    fn read_message_preserves_fragment_across_ping() {
+        let mut frames = Vec::new();
+        append_server_frame(&mut frames, false, WS_OPCODE_BINARY, b"hello ");
+        append_server_frame(&mut frames, true, WS_OPCODE_PING, b"p");
+        append_server_frame(&mut frames, true, WS_OPCODE_CONTINUATION, b"world");
+        let mut stream = InMemoryWs::new(frames);
+        let mut scratch = Vec::new();
+        let mut out = Vec::new();
+
+        let opcode = read_message_with_close(&mut stream, &mut scratch, &mut out).unwrap();
+
+        assert_eq!(opcode, WS_OPCODE_BINARY);
+        assert_eq!(out, b"hello world");
+        assert!(!stream.written.is_empty());
+    }
+
+    /// Run with:
+    /// `cargo test --features sync-sender-qwp-ws --lib read_message_zero_alloc_after_warmup -- --ignored --test-threads=1`
+    #[test]
+    #[ignore]
+    fn read_message_zero_alloc_after_warmup() {
+        use crate::alloc_counter;
+
+        let mut frame = Vec::new();
+        append_server_frame(&mut frame, true, WS_OPCODE_BINARY, b"\x00\x00");
+        let mut scratch = Vec::with_capacity(64);
+        let mut out = Vec::with_capacity(64);
+
+        let mut warmup = InMemoryWs::new(frame.clone());
+        assert_eq!(
+            read_message_with_close(&mut warmup, &mut scratch, &mut out).unwrap(),
+            WS_OPCODE_BINARY
+        );
+        assert_eq!(out, b"\x00\x00");
+
+        let mut counted = InMemoryWs::new(frame);
+        alloc_counter::start_counting();
+        assert_eq!(
+            read_message_with_close(&mut counted, &mut scratch, &mut out).unwrap(),
+            WS_OPCODE_BINARY
+        );
+        let alloc_count = alloc_counter::stop_counting();
+
+        assert_eq!(out, b"\x00\x00");
+        assert_eq!(
+            alloc_count, 0,
+            "Expected zero allocations for warmed QWP/WebSocket inbound message read, got {alloc_count}"
         );
     }
 

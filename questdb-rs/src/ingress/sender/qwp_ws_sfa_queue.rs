@@ -35,7 +35,6 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error;
@@ -199,7 +198,7 @@ impl SfaFrameQueue {
             .next_fsn
             .checked_add(1)
             .ok_or(QueueError::SequenceOverflow)?;
-        let stored_payload: SharedPayload = Arc::from(payload);
+        let stored_payload = SharedPayload::copy_from_slice(payload);
         self.append_to_active(stored_payload.as_ref())?;
 
         self.next_fsn = next_fsn;
@@ -283,8 +282,7 @@ impl SfaFrameQueue {
     }
 
     pub(crate) fn shared_payload_for_fsn(&self, fsn: u64) -> Option<SharedPayload> {
-        self.frame_for_fsn(fsn)
-            .map(|frame| Arc::clone(&frame.payload))
+        self.frame_for_fsn(fsn).map(|frame| frame.payload.clone())
     }
 
     pub(crate) fn oldest_unresolved_fsn(&self) -> Option<u64> {
@@ -595,7 +593,7 @@ fn recover_segments(options: &SfaQueueOptions) -> Result<Option<RecoveredSegment
             validate_recovered_frame(frame, &mut bytes_used, options)?;
             frames.push_back(SfaQueuedFrame {
                 fsn: frame.fsn,
-                payload: Arc::from(frame.payload.as_slice()),
+                payload: SharedPayload::copy_from_slice(frame.payload.as_slice()),
             });
         }
     }
