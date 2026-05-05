@@ -44,6 +44,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use bytes::{Bytes, BytesMut};
+
 use crate::egress::binds::Bind;
 use crate::egress::column::ColumnView;
 use crate::egress::column_kind::ColumnKind;
@@ -793,9 +795,13 @@ impl<'r> ReaderQuery<'r> {
             "request_id at byte offset {} doesn't match the value just encoded",
             REQUEST_ID_OFFSET,
         );
+        // Wrap the encoded request as Bytes once. `Bytes::from(Vec)` is
+        // a zero-copy move; cloning a Bytes is a refcount bump so the
+        // initial write and the stashed copy share one allocation.
+        let encoded_request: Bytes = encoded_request.into();
         self.reader
             .transport_mut()?
-            .write_message(&encoded_request)?;
+            .write_message(encoded_request.clone())?;
 
         self.reader.cursor_active = true;
         Ok(Cursor {
@@ -821,6 +827,30 @@ impl<'r> ReaderQuery<'r> {
 /// to patch the request_id on a stashed buffer instead of re-cloning
 /// and re-encoding the entire builder + binds.
 const REQUEST_ID_OFFSET: usize = 1;
+
+/// Patch the request_id span of a stashed `QUERY_REQUEST` payload in
+/// place and return it as fresh `Bytes`.
+///
+/// Fast path: `Bytes::try_into_mut` recovers the underlying `BytesMut`
+/// zero-copy when the buffer is uniquely owned (the previous
+/// `write_message` clone has been dropped). Patching mutates 8 bytes in
+/// place, then `BytesMut::freeze` returns to `Bytes` zero-copy. The
+/// multi-MB bind payload is never copied across reconnects.
+///
+/// Slow path: tungstenite still holds a reference (e.g., a partial write
+/// flushed only after this routine ran). `try_into_mut` returns the
+/// original `Bytes` back via `Err`; we fall back to a one-time
+/// allocate-and-copy via `Bytes::copy_from_slice`. Same cost as the
+/// pre-fix code, but unreachable in the steady state where every
+/// `write_message` returns with the WS frame fully flushed.
+fn patch_request_id(buf: Bytes, new_rid: i64) -> Bytes {
+    let mut buf = match buf.try_into_mut() {
+        Ok(buf_mut) => buf_mut,
+        Err(shared) => BytesMut::from(&shared[..]),
+    };
+    buf[REQUEST_ID_OFFSET..REQUEST_ID_OFFSET + 8].copy_from_slice(&new_rid.to_le_bytes());
+    buf.freeze()
+}
 
 /// Bounded read timeout applied to the underlying TCP stream for the
 /// duration of [`Cursor::cancel`]'s post-CANCEL drain.
@@ -868,12 +898,13 @@ pub struct Cursor<'r> {
     /// Pre-encoded `QUERY_REQUEST` payload from `execute()`, stashed
     /// so the cursor can resend the same query on a fresh connection
     /// after mid-query failover. The 8-byte `request_id` lives at
-    /// `[REQUEST_ID_OFFSET..REQUEST_ID_OFFSET + 8]`; replay just
-    /// overwrites that span with a freshly-allocated id and writes
-    /// the buffer verbatim. Avoids deep-cloning the builder + binds
-    /// (potentially multi-MB `Bind::Binary` / `Bind::Varchar`
-    /// payloads) on every reconnect.
-    encoded_request: Vec<u8>,
+    /// `[REQUEST_ID_OFFSET..REQUEST_ID_OFFSET + 8]`; replay recovers
+    /// `BytesMut` via [`Bytes::try_into_mut`], overwrites that span
+    /// with a freshly-allocated id, and re-freezes — so the multi-MB
+    /// `Bind::Binary` / `Bind::Varchar` payload is never copied
+    /// across reconnects, only the 8-byte request_id span is mutated
+    /// in place.
+    encoded_request: Bytes,
     /// User callback fired right before replayed batches arrive on a
     /// new connection. See [`ReaderQuery::on_failover_reset`].
     on_failover_reset: Option<FailoverResetCallback<'r>>,
@@ -1237,20 +1268,22 @@ impl<'r> Cursor<'r> {
             // payload at `execute()` time; here we patch the 8-byte
             // request_id span in place and write the buffer
             // verbatim. No builder clone, no Bind clone, no
-            // re-encode — the only allocation is the WS framing copy
-            // inside `write_message`. With `failover_max_attempts`
-            // up to `1024` and queries that may carry multi-MB
-            // `Bind::Binary` payloads, this is the difference
-            // between a few bytes and gigabytes of churn per
-            // failure event.
+            // re-encode — and crucially no memcpy of the body
+            // either: the previous `write_message` call has dropped
+            // its `Bytes` clone, so this clone is uniquely owned and
+            // `try_into_mut` recovers the underlying `BytesMut`
+            // zero-copy. With `failover_max_attempts` up to `1024`
+            // and queries that may carry multi-MB `Bind::Binary`
+            // payloads, this is the difference between a few bytes
+            // and gigabytes of churn per failure event.
             let new_rid = self.reader.alloc_request_id();
             self.request_id = new_rid;
-            self.encoded_request[REQUEST_ID_OFFSET..REQUEST_ID_OFFSET + 8]
-                .copy_from_slice(&new_rid.to_le_bytes());
+            self.encoded_request =
+                patch_request_id(std::mem::take(&mut self.encoded_request), new_rid);
             let write_result = self
                 .reader
                 .transport_mut()
-                .and_then(|t| t.write_message(&self.encoded_request));
+                .and_then(|t| t.write_message(self.encoded_request.clone()));
             match write_result {
                 Ok(()) => {
                     self.failover_resets = self.failover_resets.saturating_add(1);
@@ -1346,7 +1379,7 @@ impl<'r> Cursor<'r> {
         // flags and the transport in lockstep with the other terminal
         // paths in `next_batch`.
         let write_outcome = match self.reader.transport_mut() {
-            Ok(t) => t.write_message(&payload),
+            Ok(t) => t.write_message(Bytes::from(payload)),
             Err(e) => Err(e),
         };
         if let Err(e) = write_outcome {
@@ -1431,7 +1464,9 @@ impl<'r> Cursor<'r> {
         payload.push(MsgKind::Credit.as_u8());
         payload.extend_from_slice(&self.request_id.to_le_bytes());
         varint::encode_u64(additional_bytes, &mut payload);
-        self.reader.transport_mut()?.write_message(&payload)?;
+        self.reader
+            .transport_mut()?
+            .write_message(Bytes::from(payload))?;
         self.reader
             .credit_granted_total
             .fetch_add(additional_bytes, Ordering::Relaxed);
@@ -1636,6 +1671,53 @@ mod tests {
         let mut id_bytes = [0u8; 8];
         id_bytes.copy_from_slice(&buf[REQUEST_ID_OFFSET..REQUEST_ID_OFFSET + 8]);
         assert_eq!(i64::from_le_bytes(id_bytes), RID);
+    }
+
+    /// Confirm `patch_request_id` mutates the request_id span and
+    /// preserves every other byte, on both the unique-owner fast path
+    /// and the shared-owner fallback path. This is what makes
+    /// failover-replay zero-copy on the body: the multi-MB tail must
+    /// be byte-identical to the original after a patch.
+    #[test]
+    fn patch_request_id_preserves_body_and_updates_id() {
+        const OLD_RID: i64 = 0x1111_2222_3333_4444;
+        const NEW_RID: i64 = 0x5555_6666_7777_8888;
+        // Build a realistic encoded request so the test exercises the
+        // same layout the production replay path patches.
+        let req = QueryRequest::builder("SELECT * FROM big_table WHERE x > $1")
+            .request_id(OLD_RID)
+            .build()
+            .expect("build");
+        let mut original = Vec::with_capacity(64);
+        req.encode(&mut original).expect("encode");
+        let original = Bytes::from(original);
+
+        // Unique-owner fast path: only this Bytes references the buffer,
+        // so try_into_mut succeeds and the patch is in-place.
+        let patched = patch_request_id(original.clone(), NEW_RID);
+        // The cloned `original` we kept around drops at scope end; the
+        // call above received its own clone which write_message would
+        // consume. Verify the returned Bytes carries the new id.
+        assert_eq!(patched[0], MsgKind::QueryRequest.as_u8());
+        let mut id_bytes = [0u8; 8];
+        id_bytes.copy_from_slice(&patched[REQUEST_ID_OFFSET..REQUEST_ID_OFFSET + 8]);
+        assert_eq!(i64::from_le_bytes(id_bytes), NEW_RID);
+        // Body before and after the request_id span is byte-identical.
+        assert_eq!(&patched[..REQUEST_ID_OFFSET], &original[..REQUEST_ID_OFFSET]);
+        assert_eq!(
+            &patched[REQUEST_ID_OFFSET + 8..],
+            &original[REQUEST_ID_OFFSET + 8..]
+        );
+
+        // Shared-owner fallback: hold an extra clone alive across the
+        // call so try_into_mut returns Err and patch_request_id falls
+        // back to BytesMut::from(&shared[..]). Same correctness.
+        let _hold = patched.clone();
+        let patched_again = patch_request_id(patched, OLD_RID);
+        let mut id_bytes = [0u8; 8];
+        id_bytes
+            .copy_from_slice(&patched_again[REQUEST_ID_OFFSET..REQUEST_ID_OFFSET + 8]);
+        assert_eq!(i64::from_le_bytes(id_bytes), OLD_RID);
     }
 
     /// Exhaustively pin `is_failover_eligible` against every

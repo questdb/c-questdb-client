@@ -175,9 +175,18 @@ impl WsTransport {
     /// Write a client-to-server message as a single WebSocket binary
     /// message. Per QWP, client frames are bare payloads — only
     /// server-to-client frames carry the 12-byte `QWP1` header.
-    pub fn write_message(&mut self, payload: &[u8]) -> Result<()> {
+    ///
+    /// Takes `Bytes` by value so the caller can hand off a refcounted
+    /// buffer with no internal copy. Small one-shot frames (CREDIT,
+    /// CANCEL) construct a fresh `Vec<u8>` and convert via
+    /// `Bytes::from(vec)` (zero-copy move). The QUERY_REQUEST replay
+    /// path keeps the encoded body wrapped as `Bytes` across reconnects
+    /// and patches the request_id in place via `Bytes::try_into_mut`
+    /// then `BytesMut::freeze`, so the multi-MB bind payload is never
+    /// copied per failover.
+    pub fn write_message(&mut self, payload: Bytes) -> Result<()> {
         self.socket
-            .send(Message::Binary(payload.to_vec().into()))
+            .send(Message::Binary(payload))
             .map_err(|e| map_ws_error(e, ErrorCode::SocketError))?;
         Ok(())
     }
