@@ -5,8 +5,8 @@ Date: 2026-05-05
 Status: audit handoff, updated after the parser-completeness and internal
 durable-ACK-tracker implementation slices. Response parser completeness has
 been addressed in the current working tree; public durable ACK mode remains
-disabled while handshake validation, keepalive/read-loop behavior, and durable
-rejection handling are unfinished.
+disabled while handshake validation and keepalive/read-loop behavior are
+unfinished.
 
 This document records gaps found while comparing the Rust QWP/WebSocket
 Store-and-Forward implementation against the current QWP spec documents in:
@@ -65,8 +65,8 @@ new SF client spec.
 
 The largest missing areas are:
 
-- public durable ACK enablement: upgrade echo validation, keepalive/read-loop
-  behavior, and durable rejection handling,
+- public durable ACK enablement: upgrade echo validation and keepalive/read-loop
+  behavior,
 - connect-string compatibility and strict key handling,
 - Java/spec close, retry, and orphan-drainer semantics,
 - several SFA disk-format/recovery details where the spec and Java reference
@@ -107,11 +107,8 @@ Rust state:
   durable ACK tracker: durable OK releases the send window without completing
   the publication log, durable ACK watermarks drain consecutive covered OKs,
   empty OKs wait behind earlier non-empty OKs, stale durable watermarks do not
-  move backwards, and reconnect clears pending durable state for replay.
-- The internal durable rejection path currently fails closed for
-  drop-and-continue server rejections. Before public enablement, this still
-  needs Java-compatible ordered empty-placeholder handling so a rejected batch
-  cannot trim through earlier durable-pending OKs.
+  move backwards, durable drop-and-continue rejections enqueue ordered empty
+  placeholders, and reconnect clears pending durable state for replay.
 - Before public enablement, validate that durable-mode OK frames are emitted
   per sent message, with table entries for that message. If the server can
   coalesce/cumulate durable-mode OKs without emitting the skipped OK table
@@ -157,10 +154,9 @@ User exposure:
 Implementation direction:
 
 1. Validate durable ACK upgrade echo when requested.
-2. Implement Java-compatible durable-mode drop-and-continue rejection handling.
-3. Implement durable keepalive PINGs and make the read loop keep polling while
+2. Implement durable keepalive PINGs and make the read loop keep polling while
    durable confirmations are pending.
-4. Keep rejecting `request_durable_ack=on` until all of the above is true.
+3. Keep rejecting `request_durable_ack=on` until all of the above is true.
 
 ### 2. OK response parsing was incomplete (addressed)
 
@@ -638,11 +634,9 @@ new evidence:
 1. Resolve spec/reference mismatches first:
    `sf-initial.sfa`, unknown-key policy.
 2. Finish public durable ACK enablement behind the existing explicit
-   rejection: validate upgrade echo, implement Java-compatible ordered
-   empty-placeholder handling for durable-mode drop-and-continue rejections,
-   implement durable keepalive PINGs/read-loop polling while durable
-   confirmations are pending, and validate the durable OK
-   emission/coalescing contract.
+   rejection: validate upgrade echo, implement durable keepalive
+   PINGs/read-loop polling while durable confirmations are pending, and
+   validate the durable OK emission/coalescing contract.
 3. Implement Java-compatible close semantics and then accept
    `close_flush_timeout_millis`.
 4. Implement ACK clamping and ACK-timeout reconnect.

@@ -288,48 +288,27 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
                 let Some(tracker) = self.durable_ack.as_mut() else {
                     return Ok(DriveOutcome::Idle);
                 };
-                match tracker.apply_ack(table_seq_txns) {
-                    Some(completion) => self.complete_durable_through(send_cursor, completion),
-                    None => Ok(DriveOutcome::Idle),
-                }
+                tracker.apply_ack(table_seq_txns);
+                self.complete_ready_durable(send_cursor)
             }
             TransportResponse::Reject { wire_seq, error } => {
                 let policy = server_error_policy(error.status);
                 let fsn = send_cursor.fsn_for_wire_seq(wire_seq, WireResponseKind::Reject)?;
-                if policy == QwpWsErrorPolicy::Halt || self.durable_ack.is_some() {
-                    let applied_policy = if policy == QwpWsErrorPolicy::Halt {
-                        policy
-                    } else {
-                        // Durable drop-and-continue must enqueue an empty
-                        // placeholder behind preceding OKs. Until that path
-                        // exists, fail closed instead of trimming through
-                        // durable-pending frames.
-                        QwpWsErrorPolicy::Halt
-                    };
-                    let sender_error =
-                        sender_error_for_qwp_error(&error, wire_seq, fsn, applied_policy);
+                if policy == QwpWsErrorPolicy::Halt {
+                    let sender_error = sender_error_for_qwp_error(&error, wire_seq, fsn, policy);
                     self.terminal_sender_error = Some(sender_error.clone());
                     self.sender_errors.push(sender_error);
                     self.last_server_error = Some(error.clone());
                     self.mark_terminal(Some(error.error.clone()));
                     return Ok(DriveOutcome::Terminal);
                 }
+                if self.durable_ack.is_some() {
+                    return self.apply_durable_reject(send_cursor, wire_seq, fsn, error, policy);
+                }
 
                 let receipt = self.queue.reject_fsn(fsn)?;
                 send_cursor.ack_through(fsn);
-                let rejected = QwpRejectedFrame {
-                    fsn: receipt.fsn,
-                    wire_seq,
-                    error,
-                };
-                self.last_server_error = Some(rejected.error.clone());
-                self.sender_errors.push(sender_error_for_qwp_error(
-                    &rejected.error,
-                    wire_seq,
-                    receipt.fsn,
-                    policy,
-                ));
-                self.rejected_frames.push_back(rejected);
+                self.record_rejected_frame(receipt.fsn, wire_seq, error, policy);
                 if wire_seq > 0 {
                     self.push_event(DriverEvent::AckedThrough {
                         fsn: receipt.fsn - 1,
@@ -364,6 +343,10 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         table_seq_txns: Vec<TableSeqTxn>,
     ) -> Result<DriveOutcome, DriverError> {
         let fsn = send_cursor.fsn_for_wire_seq(wire_seq, WireResponseKind::Ack)?;
+        if self.is_rejected_fsn(fsn) {
+            send_cursor.ack_through(fsn);
+            return Ok(DriveOutcome::Idle);
+        }
         if self
             .queue
             .completed_fsn()
@@ -374,18 +357,62 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         }
         send_cursor.ack_through(fsn);
         let tracker = self.durable_ack.as_mut().expect("durable ACK mode");
-        match tracker.enqueue_ok(wire_seq, fsn, table_seq_txns) {
-            Some(completion) => self.complete_durable_through(send_cursor, completion),
-            None => Ok(DriveOutcome::Idle),
-        }
+        tracker.enqueue_ok(wire_seq, fsn, table_seq_txns);
+        self.complete_ready_durable(send_cursor)
     }
 
-    fn complete_durable_through(
+    fn apply_durable_reject(
         &mut self,
         send_cursor: &mut SendCursor,
-        completion: DurableCompletion,
+        wire_seq: u64,
+        fsn: u64,
+        error: QwpServerError,
+        policy: QwpWsErrorPolicy,
     ) -> Result<DriveOutcome, DriverError> {
-        self.complete_through(send_cursor, completion.fsn, completion.wire_seq)
+        send_cursor.ack_through(fsn);
+        if self.is_rejected_fsn(fsn)
+            || self
+                .queue
+                .completed_fsn()
+                .is_some_and(|completed_fsn| fsn <= completed_fsn)
+        {
+            return Ok(DriveOutcome::Idle);
+        }
+        self.record_rejected_frame(fsn, wire_seq, error, policy);
+        self.push_event(DriverEvent::Rejected { fsn, wire_seq });
+        let tracker = self.durable_ack.as_mut().expect("durable ACK mode");
+        tracker.enqueue_rejected(wire_seq, fsn);
+        self.complete_ready_durable(send_cursor)?;
+        Ok(DriveOutcome::Rejected { fsn, wire_seq })
+    }
+
+    fn complete_ready_durable(
+        &mut self,
+        send_cursor: &mut SendCursor,
+    ) -> Result<DriveOutcome, DriverError> {
+        let mut highest_resolved_wire_seq = None;
+        while let Some(resolved) = self
+            .durable_ack
+            .as_mut()
+            .and_then(DurableAckTracker::pop_ready)
+        {
+            match resolved {
+                DurableResolvedFrame::Ok(completion) => {
+                    self.complete_through(send_cursor, completion.fsn, completion.wire_seq)?;
+                    highest_resolved_wire_seq = Some(completion.wire_seq);
+                }
+                DurableResolvedFrame::Rejected { wire_seq, fsn } => {
+                    self.queue.reject_fsn(fsn)?;
+                    send_cursor.ack_through(fsn);
+                    highest_resolved_wire_seq = Some(wire_seq);
+                }
+            }
+        }
+        Ok(
+            highest_resolved_wire_seq.map_or(DriveOutcome::Idle, |wire_seq| DriveOutcome::Acked {
+                wire_seq,
+            }),
+        )
     }
 
     fn complete_through(
@@ -434,6 +461,9 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         receipt: QwpReceipt,
     ) -> QwpReceiptStatus {
         let status = self.queue.receipt_status(receipt);
+        if self.is_rejected_fsn(receipt.fsn) {
+            return QwpReceiptStatus::Rejected { fsn: receipt.fsn };
+        }
         if self.is_terminal() && status.is_pending() {
             return QwpReceiptStatus::Terminal { fsn: receipt.fsn };
         }
@@ -457,6 +487,29 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
             };
         }
         status
+    }
+
+    fn is_rejected_fsn(&self, fsn: u64) -> bool {
+        self.rejected_frames
+            .iter()
+            .any(|rejected| rejected.fsn == fsn)
+    }
+
+    fn record_rejected_frame(
+        &mut self,
+        fsn: u64,
+        wire_seq: u64,
+        error: QwpServerError,
+        policy: QwpWsErrorPolicy,
+    ) {
+        self.last_server_error = Some(error.clone());
+        self.sender_errors
+            .push(sender_error_for_qwp_error(&error, wire_seq, fsn, policy));
+        self.rejected_frames.push_back(QwpRejectedFrame {
+            fsn,
+            wire_seq,
+            error,
+        });
     }
 
     pub(crate) fn delivery_status(
@@ -1853,20 +1906,32 @@ pub(crate) struct TableSeqTxn {
 #[derive(Debug)]
 struct DurableAckTracker {
     table_watermarks: HashMap<String, i64>,
-    pending: VecDeque<PendingDurableOk>,
+    pending: VecDeque<PendingDurableFrame>,
 }
 
 #[derive(Debug)]
-struct PendingDurableOk {
-    wire_seq: u64,
-    fsn: u64,
-    table_seq_txns: Vec<TableSeqTxn>,
+enum PendingDurableFrame {
+    Ok {
+        wire_seq: u64,
+        fsn: u64,
+        table_seq_txns: Vec<TableSeqTxn>,
+    },
+    Rejected {
+        wire_seq: u64,
+        fsn: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DurableCompletion {
     wire_seq: u64,
     fsn: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurableResolvedFrame {
+    Ok(DurableCompletion),
+    Rejected { wire_seq: u64, fsn: u64 },
 }
 
 impl DurableAckTracker {
@@ -1882,21 +1947,20 @@ impl DurableAckTracker {
         self.pending.clear();
     }
 
-    fn enqueue_ok(
-        &mut self,
-        wire_seq: u64,
-        fsn: u64,
-        table_seq_txns: Vec<TableSeqTxn>,
-    ) -> Option<DurableCompletion> {
-        self.pending.push_back(PendingDurableOk {
+    fn enqueue_ok(&mut self, wire_seq: u64, fsn: u64, table_seq_txns: Vec<TableSeqTxn>) {
+        self.pending.push_back(PendingDurableFrame::Ok {
             wire_seq,
             fsn,
             table_seq_txns,
         });
-        self.drain_ready()
     }
 
-    fn apply_ack(&mut self, table_seq_txns: Vec<TableSeqTxn>) -> Option<DurableCompletion> {
+    fn enqueue_rejected(&mut self, wire_seq: u64, fsn: u64) {
+        self.pending
+            .push_back(PendingDurableFrame::Rejected { wire_seq, fsn });
+    }
+
+    fn apply_ack(&mut self, table_seq_txns: Vec<TableSeqTxn>) {
         for entry in table_seq_txns {
             match self.table_watermarks.get_mut(&entry.table) {
                 Some(current) if entry.seq_txn > *current => {
@@ -1908,40 +1972,60 @@ impl DurableAckTracker {
                 }
             }
         }
-        self.drain_ready()
     }
 
     fn pending_wire_seq_for_fsn(&self, fsn: u64) -> Option<u64> {
         self.pending
             .iter()
-            .find(|entry| entry.fsn == fsn)
-            .map(|entry| entry.wire_seq)
+            .find(|entry| entry.fsn() == fsn)
+            .map(PendingDurableFrame::wire_seq)
     }
 
-    fn drain_ready(&mut self) -> Option<DurableCompletion> {
-        let mut highest = None;
-        while self
+    fn pop_ready(&mut self) -> Option<DurableResolvedFrame> {
+        if !self
             .pending
             .front()
             .is_some_and(|entry| entry.is_covered_by(&self.table_watermarks))
         {
-            let entry = self.pending.pop_front().unwrap();
-            highest = Some(DurableCompletion {
-                wire_seq: entry.wire_seq,
-                fsn: entry.fsn,
-            });
+            return None;
         }
-        highest
+        match self.pending.pop_front().unwrap() {
+            PendingDurableFrame::Ok { wire_seq, fsn, .. } => {
+                Some(DurableResolvedFrame::Ok(DurableCompletion {
+                    wire_seq,
+                    fsn,
+                }))
+            }
+            PendingDurableFrame::Rejected { wire_seq, fsn } => {
+                Some(DurableResolvedFrame::Rejected { wire_seq, fsn })
+            }
+        }
     }
 }
 
-impl PendingDurableOk {
+impl PendingDurableFrame {
     fn is_covered_by(&self, table_watermarks: &HashMap<String, i64>) -> bool {
-        self.table_seq_txns.iter().all(|entry| {
-            table_watermarks
-                .get(&entry.table)
-                .is_some_and(|watermark| *watermark >= entry.seq_txn)
-        })
+        match self {
+            PendingDurableFrame::Ok { table_seq_txns, .. } => table_seq_txns.iter().all(|entry| {
+                table_watermarks
+                    .get(&entry.table)
+                    .is_some_and(|watermark| *watermark >= entry.seq_txn)
+            }),
+            PendingDurableFrame::Rejected { .. } => true,
+        }
+    }
+
+    fn fsn(&self) -> u64 {
+        match self {
+            PendingDurableFrame::Ok { fsn, .. } | PendingDurableFrame::Rejected { fsn, .. } => *fsn,
+        }
+    }
+
+    fn wire_seq(&self) -> u64 {
+        match self {
+            PendingDurableFrame::Ok { wire_seq, .. }
+            | PendingDurableFrame::Rejected { wire_seq, .. } => *wire_seq,
+        }
     }
 }
 
@@ -2244,6 +2328,14 @@ mod tests {
                 seq_txn: *seq_txn,
             })
             .collect()
+    }
+
+    fn schema_mismatch_error(message: &str) -> QwpServerError {
+        QwpServerError {
+            status: codec::WS_STATUS_SCHEMA_MISMATCH,
+            message: message.to_string(),
+            error: Error::new(ErrorCode::InvalidApiCall, message),
+        }
     }
 
     fn drain_events<Q: PublicationLog, T: ManualDriverTransport>(
@@ -3641,11 +3733,13 @@ mod tests {
     }
 
     #[test]
-    fn durable_reject_and_continue_policy_fails_closed_until_ordered_drop_is_implemented() {
+    fn durable_reject_placeholder_waits_for_prior_durable_ok() {
         let mut driver = durable_driver(FakeOrderedServer::no_response());
         let first = driver.try_submit(b"first").unwrap();
         let second = driver.try_submit(b"second").unwrap();
+        let third = driver.try_submit(b"third").unwrap();
 
+        driver.drive_send_once().unwrap();
         driver.drive_send_once().unwrap();
         driver.drive_send_once().unwrap();
         driver
@@ -3661,25 +3755,314 @@ mod tests {
             .transport
             .push_response(TransportResponse::Reject {
                 wire_seq: 1,
-                error: QwpServerError {
-                    status: codec::WS_STATUS_SCHEMA_MISMATCH,
-                    message: "schema changed".to_string(),
-                    error: Error::new(ErrorCode::InvalidApiCall, "schema changed"),
-                },
+                error: schema_mismatch_error("schema changed"),
             });
 
-        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Terminal);
+        assert_eq!(
+            driver.drive_receive_once().unwrap(),
+            DriveOutcome::Rejected {
+                fsn: 1,
+                wire_seq: 1
+            }
+        );
         assert_eq!(
             driver.receipt_status(first),
-            QwpReceiptStatus::Terminal { fsn: 0 }
+            QwpReceiptStatus::Sent {
+                fsn: 0,
+                wire_seq: 0
+            }
         );
         assert_eq!(
             driver.receipt_status(second),
-            QwpReceiptStatus::Terminal { fsn: 1 }
+            QwpReceiptStatus::Rejected { fsn: 1 }
         );
         assert_eq!(
-            driver.terminal_sender_error().map(|err| err.applied_policy),
-            Some(QwpWsErrorPolicy::Halt)
+            driver.receipt_status(third),
+            QwpReceiptStatus::Sent {
+                fsn: 2,
+                wire_seq: 2
+            }
+        );
+        assert_eq!(driver.acked_fsn(), None);
+        assert_eq!(
+            driver
+                .last_server_error()
+                .map(|err| (err.status, err.message.as_str())),
+            Some((codec::WS_STATUS_SCHEMA_MISMATCH, "schema changed"))
+        );
+        assert_eq!(
+            driver.poll_sender_error().map(|err| err.applied_policy),
+            Some(QwpWsErrorPolicy::DropAndContinue)
+        );
+
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableOk {
+                wire_seq: 2,
+                table_seq_txns: table_seq_txns(&[("quotes", 20)]),
+            });
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableAck {
+                table_seq_txns: table_seq_txns(&[("quotes", 20)]),
+            });
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
+        assert_eq!(driver.acked_fsn(), None);
+
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableAck {
+                table_seq_txns: table_seq_txns(&[("trades", 10)]),
+            });
+        assert_eq!(
+            driver.drive_receive_once().unwrap(),
+            DriveOutcome::Acked { wire_seq: 2 }
+        );
+        assert_eq!(
+            driver.receipt_status(first),
+            QwpReceiptStatus::Acked { fsn: 0 }
+        );
+        assert_eq!(
+            driver.receipt_status(second),
+            QwpReceiptStatus::Rejected { fsn: 1 }
+        );
+        assert_eq!(
+            driver.receipt_status(third),
+            QwpReceiptStatus::Acked { fsn: 2 }
+        );
+    }
+
+    #[test]
+    fn durable_consecutive_rejected_placeholders_drain_after_prior_ok() {
+        let mut driver = durable_driver(FakeOrderedServer::no_response());
+        let first = driver.try_submit(b"first").unwrap();
+        let second = driver.try_submit(b"second").unwrap();
+        let third = driver.try_submit(b"third").unwrap();
+        let fourth = driver.try_submit(b"fourth").unwrap();
+
+        driver.drive_send_once().unwrap();
+        driver.drive_send_once().unwrap();
+        driver.drive_send_once().unwrap();
+        driver.drive_send_once().unwrap();
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableOk {
+                wire_seq: 0,
+                table_seq_txns: table_seq_txns(&[("trades", 10)]),
+            });
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::Reject {
+                wire_seq: 1,
+                error: schema_mismatch_error("schema changed"),
+            });
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::Reject {
+                wire_seq: 2,
+                error: schema_mismatch_error("write failed"),
+            });
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableOk {
+                wire_seq: 3,
+                table_seq_txns: table_seq_txns(&[("quotes", 20)]),
+            });
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
+        assert!(matches!(
+            driver.drive_receive_once().unwrap(),
+            DriveOutcome::Rejected {
+                fsn: 1,
+                wire_seq: 1
+            }
+        ));
+        assert!(matches!(
+            driver.drive_receive_once().unwrap(),
+            DriveOutcome::Rejected {
+                fsn: 2,
+                wire_seq: 2
+            }
+        ));
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
+
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableAck {
+                table_seq_txns: table_seq_txns(&[("trades", 10)]),
+            });
+        assert_eq!(
+            driver.drive_receive_once().unwrap(),
+            DriveOutcome::Acked { wire_seq: 2 }
+        );
+        assert_eq!(
+            driver.receipt_status(first),
+            QwpReceiptStatus::Acked { fsn: 0 }
+        );
+        assert_eq!(
+            driver.receipt_status(second),
+            QwpReceiptStatus::Rejected { fsn: 1 }
+        );
+        assert_eq!(
+            driver.receipt_status(third),
+            QwpReceiptStatus::Rejected { fsn: 2 }
+        );
+        assert_eq!(
+            driver.receipt_status(fourth),
+            QwpReceiptStatus::Sent {
+                fsn: 3,
+                wire_seq: 3
+            }
+        );
+
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableAck {
+                table_seq_txns: table_seq_txns(&[("quotes", 20)]),
+            });
+        assert_eq!(
+            driver.drive_receive_once().unwrap(),
+            DriveOutcome::Acked { wire_seq: 3 }
+        );
+        assert_eq!(
+            driver.receipt_status(fourth),
+            QwpReceiptStatus::Acked { fsn: 3 }
+        );
+    }
+
+    #[test]
+    fn stale_durable_ok_for_rejected_frame_does_not_reblock_tracker() {
+        let mut driver = durable_driver(FakeOrderedServer::no_response());
+        let first = driver.try_submit(b"first").unwrap();
+        let second = driver.try_submit(b"second").unwrap();
+
+        driver.drive_send_once().unwrap();
+        driver.drive_send_once().unwrap();
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::Reject {
+                wire_seq: 0,
+                error: schema_mismatch_error("schema changed"),
+            });
+        assert_eq!(
+            driver.drive_receive_once().unwrap(),
+            DriveOutcome::Rejected {
+                fsn: 0,
+                wire_seq: 0
+            }
+        );
+        assert_eq!(
+            driver.receipt_status(first),
+            QwpReceiptStatus::Rejected { fsn: 0 }
+        );
+
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableOk {
+                wire_seq: 0,
+                table_seq_txns: table_seq_txns(&[("trades", 99)]),
+            });
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableOk {
+                wire_seq: 1,
+                table_seq_txns: table_seq_txns(&[("quotes", 20)]),
+            });
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableAck {
+                table_seq_txns: table_seq_txns(&[("quotes", 20)]),
+            });
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
+        assert_eq!(
+            driver.drive_receive_once().unwrap(),
+            DriveOutcome::Acked { wire_seq: 1 }
+        );
+        assert_eq!(
+            driver.receipt_status(first),
+            QwpReceiptStatus::Rejected { fsn: 0 }
+        );
+        assert_eq!(
+            driver.receipt_status(second),
+            QwpReceiptStatus::Acked { fsn: 1 }
+        );
+    }
+
+    #[test]
+    fn stale_durable_reject_for_resolved_frame_does_not_reblock_tracker() {
+        let mut driver = durable_driver(FakeOrderedServer::no_response());
+        let first = driver.try_submit(b"first").unwrap();
+        let second = driver.try_submit(b"second").unwrap();
+
+        driver.drive_send_once().unwrap();
+        driver.drive_send_once().unwrap();
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::Reject {
+                wire_seq: 0,
+                error: schema_mismatch_error("schema changed"),
+            });
+        assert_eq!(
+            driver.drive_receive_once().unwrap(),
+            DriveOutcome::Rejected {
+                fsn: 0,
+                wire_seq: 0
+            }
+        );
+        assert_eq!(
+            driver.receipt_status(first),
+            QwpReceiptStatus::Rejected { fsn: 0 }
+        );
+
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::Reject {
+                wire_seq: 0,
+                error: schema_mismatch_error("schema changed again"),
+            });
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
+        assert_eq!(
+            driver.receipt_status(first),
+            QwpReceiptStatus::Rejected { fsn: 0 }
+        );
+
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableOk {
+                wire_seq: 1,
+                table_seq_txns: table_seq_txns(&[("quotes", 20)]),
+            });
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableAck {
+                table_seq_txns: table_seq_txns(&[("quotes", 20)]),
+            });
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
+        assert_eq!(
+            driver.drive_receive_once().unwrap(),
+            DriveOutcome::Acked { wire_seq: 1 }
+        );
+        assert_eq!(
+            driver.receipt_status(second),
+            QwpReceiptStatus::Acked { fsn: 1 }
         );
     }
 
