@@ -41,7 +41,6 @@
 //! | `compression`      | `raw` / `zstd` / `auto` — `zstd`/`auto` require the `compression-zstd` feature (`raw`) |
 //! | `max_batch_rows`   | sent only when non-zero (`0` = server default)           |
 //! | `client_id`        | optional; sent only when set                             |
-//! | `durable_ack`      | `true`/`false` (`false`)                                 |
 //! | `target`           | `any`/`primary`/`replica` (default `any`)                |
 //! | `failover`         | `true`/`false` — mid-query reconnect on transport failure (`true`) |
 //! | `failover_max_attempts`        | retry attempts after a transport failure (`8`, must be `>= 1`); ignored when `failover=off` |
@@ -222,7 +221,6 @@ pub struct ReaderConfig {
     pub compression: Compression,
     pub max_batch_rows: u64,
     pub client_id: Option<String>,
-    pub durable_ack: bool,
     pub target: Target,
     /// Mid-query failover. When `true` and the transport fails after a
     /// `QUERY_REQUEST` has been submitted, the cursor reconnects to the
@@ -361,7 +359,6 @@ impl ReaderConfig {
         let mut compression = Compression::Raw;
         let mut max_batch_rows: u64 = 0;
         let mut client_id: Option<String> = None;
-        let mut durable_ack = false;
         let mut target = Target::Any;
         let mut failover = DEFAULT_FAILOVER_ENABLED;
         let mut failover_max_attempts: u32 = DEFAULT_FAILOVER_MAX_ATTEMPTS;
@@ -426,9 +423,6 @@ impl ReaderConfig {
                         return Err(fmt!(ConfigError, "\"client_id\" must not contain CR or LF"));
                     }
                     client_id = Some(val.to_string());
-                }
-                "durable_ack" => {
-                    durable_ack = parse_bool("durable_ack", val)?;
                 }
                 "target" => {
                     target = match val {
@@ -604,7 +598,6 @@ impl ReaderConfig {
             compression,
             max_batch_rows,
             client_id,
-            durable_ack,
             target,
             failover,
             failover_max_attempts,
@@ -656,9 +649,6 @@ impl ReaderConfig {
         ));
         if self.max_batch_rows > 0 {
             headers.push(("X-QWP-Max-Batch-Rows", self.max_batch_rows.to_string()));
-        }
-        if self.durable_ack {
-            headers.push(("X-QWP-Request-Durable-Ack", "true".to_string()));
         }
         if let Some(v) = self.auth.header_value() {
             headers.push(("Authorization", v));
@@ -876,7 +866,7 @@ mod tests {
     #[test]
     fn upgrade_headers_full_set() {
         let c = ReaderConfig::from_conf(
-            "qwp::addr=h:1;client_id=app1;max_batch_rows=1000;durable_ack=true;username=u;password=p",
+            "qwp::addr=h:1;client_id=app1;max_batch_rows=1000;username=u;password=p",
         )
         .unwrap();
         let h = c.upgrade_headers();
@@ -885,8 +875,8 @@ mod tests {
         assert!(names.contains(&"X-QWP-Client-Id"));
         assert!(names.contains(&"X-QWP-Accept-Encoding"));
         assert!(names.contains(&"X-QWP-Max-Batch-Rows"));
-        assert!(names.contains(&"X-QWP-Request-Durable-Ack"));
         assert!(names.contains(&"Authorization"));
+        assert!(!names.contains(&"X-QWP-Request-Durable-Ack"));
 
         // max_batch_rows omitted when 0.
         let c = ReaderConfig::from_conf("qwp::addr=h:1;max_batch_rows=0").unwrap();
@@ -977,15 +967,18 @@ mod tests {
     }
 
     #[test]
-    fn durable_ack_synonyms() {
-        for v in &["true", "on", "yes", "1"] {
-            let c = ReaderConfig::from_conf(format!("qwp::addr=h:1;durable_ack={};", v)).unwrap();
-            assert!(c.durable_ack, "{}", v);
-        }
-        for v in &["false", "off", "no", "0"] {
-            let c = ReaderConfig::from_conf(format!("qwp::addr=h:1;durable_ack={};", v)).unwrap();
-            assert!(!c.durable_ack, "{}", v);
-        }
+    fn durable_ack_key_rejected() {
+        // `durable_ack` is an ingress-spec carryover with no egress
+        // semantic — the key was removed from the egress connect string
+        // (spec §3 lists exactly four C->S headers; the corresponding
+        // X-QWP-Request-Durable-Ack header was also removed). A connect
+        // string still carrying the key now fails parsing rather than
+        // being silently honoured.
+        let err = ReaderConfig::from_conf("qwp::addr=h:1;durable_ack=true").unwrap_err();
+        assert!(
+            err.msg().to_lowercase().contains("durable_ack")
+                || err.msg().to_lowercase().contains("unknown")
+        );
     }
 
     #[test]

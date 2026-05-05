@@ -45,6 +45,7 @@ use tungstenite::client::IntoClientRequest;
 use tungstenite::handshake::HandshakeError;
 use tungstenite::handshake::client::generate_key;
 use tungstenite::http::{HeaderName, HeaderValue, Request, Uri};
+use tungstenite::protocol::WebSocketConfig;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{ClientRequestBuilder, Connector, Message, WebSocket};
 
@@ -68,11 +69,28 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 /// peer-friendliness.
 const CLOSE_TIMEOUT: Duration = Duration::from_millis(200);
 
+/// Per-batch wire-size ceiling we accept on the read side.
+///
+/// Spec §16 lists `Max RESULT_BATCH wire size: 16 MiB`. We pad a 4× margin
+/// (matching the `MAX_ZSTD_DECOMPRESSED` cap in `decoder.rs`) so legitimate
+/// frames near the spec ceiling never trip the guard, while a malformed or
+/// hostile server can't get the client to allocate gigabytes from a single
+/// `header.payload_length` value (which is itself a u32 — i.e. up to 4 GiB
+/// of raw wire bytes if left unbounded). Applied at two layers:
+///
+/// - `WebSocketConfig::max_message_size`, so tungstenite refuses to even
+///   buffer an oversized frame (defends against out-of-memory before any
+///   QWP parsing runs).
+/// - An explicit `header.payload_length` check in `read_frame`, so a
+///   future tungstenite default change can't silently raise our ceiling.
+const MAX_BATCH_WIRE_BYTES: usize = 64 * 1024 * 1024;
+
 /// Header key the server uses to advertise the negotiated QWP version.
 const HDR_VERSION: &str = "x-qwp-version";
 
-/// Header key carrying the server-selected payload encoding.
-#[allow(dead_code)] // used in TLS chunk follow-up for compression negotiation
+/// Header key carrying the server-selected payload encoding (per spec §3:
+/// `raw` / `identity` / `zstd[;level=N]`). Validated at handshake time so
+/// a missing-feature failure surfaces here, not on the first batch.
 const HDR_CONTENT_ENCODING: &str = "x-qwp-content-encoding";
 
 /// Sync WebSocket transport bound to a single QWP read connection.
@@ -121,8 +139,16 @@ impl WsTransport {
         let tcp = TcpStream::connect((endpoint.host.as_str(), endpoint.port))
             .map_err(|e| fmt!(SocketError, "could not connect to {}: {}", endpoint, e))?;
         let connector = build_client_config(config)?.map(Connector::Rustls);
-        let (socket, response) = tungstenite::client_tls_with_config(request, tcp, None, connector)
-            .map_err(map_handshake_error)?;
+        // Pin tungstenite's per-message size ceiling explicitly. Without
+        // this we inherit the library default (currently 64 MiB but
+        // unstable across versions); a defaulting drift would silently
+        // change the protocol-level cap we documented in
+        // `MAX_BATCH_WIRE_BYTES`. Pin it so the protocol cap and the
+        // transport cap are the same number.
+        let ws_config = WebSocketConfig::default().max_message_size(Some(MAX_BATCH_WIRE_BYTES));
+        let (socket, response) =
+            tungstenite::client_tls_with_config(request, tcp, Some(ws_config), connector)
+                .map_err(map_handshake_error)?;
 
         // Build the `WsTransport` struct *before* the version check so
         // any failure path (here or elsewhere) goes through `Drop for
@@ -130,7 +156,9 @@ impl WsTransport {
         // socket down cleanly. A bare `socket` drop closes the FD but
         // skips the courtesy Close — the server then sees a half-closed
         // TCP and has to wait for its read timeout to clean up.
-        let server_version = match read_version_header(response.headers()) {
+        let handshake_check = read_version_header(response.headers())
+            .and_then(|v| validate_content_encoding(response.headers()).map(|_| v));
+        let server_version = match handshake_check {
             Ok(v) => v,
             Err(e) => {
                 let mut transport = WsTransport {
@@ -224,6 +252,24 @@ impl WsTransport {
                             "header payload_length {} != actual {}",
                             header.payload_length,
                             bytes.len() - HEADER_LEN
+                        ));
+                    }
+                    // Belt-and-suspenders check: tungstenite's
+                    // `max_message_size` already guards the buffer, but
+                    // anchoring the protocol-level cap at the parser
+                    // makes the ceiling testable without standing up a
+                    // socket. Spec §16 caps RESULT_BATCH at 16 MiB; our
+                    // 4x-margin cap surfaces server bugs / wire corruption
+                    // as a clean ProtocolError instead of either a silent
+                    // multi-GiB allocation or a tungstenite-layer error
+                    // that's harder to map to "frame too large".
+                    if bytes.len() > MAX_BATCH_WIRE_BYTES {
+                        return Err(fmt!(
+                            LimitExceeded,
+                            "frame size {} bytes exceeds client cap {} (spec §16: \
+                             RESULT_BATCH max 16 MiB; client allows 4x margin)",
+                            bytes.len(),
+                            MAX_BATCH_WIRE_BYTES
                         ));
                     }
                     // Zero-copy slice: `Bytes` is ref-counted, so `slice` only
@@ -361,6 +407,62 @@ fn read_version_header(headers: &tungstenite::http::HeaderMap) -> Result<u8> {
     s.trim()
         .parse::<u8>()
         .map_err(|_| fmt!(HandshakeError, "X-QWP-Version {:?} is not a u8", s))
+}
+
+/// Validate the server's chosen body encoding against the features the
+/// client was actually built with.
+///
+/// Spec §3: the server echoes its choice in `X-QWP-Content-Encoding`
+/// (omitted means `raw`). Tokens are `name` or `name;param=value`; `raw`
+/// and `identity` are aliases for "no compression". The runtime guard
+/// inside `decoder.rs` already rejects a `FLAG_ZSTD` batch when the
+/// `compression-zstd` feature is off — but it surfaces only when the
+/// first compressed batch arrives, leaving the connection technically
+/// usable until then. Failing fast at handshake gives the operator a
+/// clear "this build can't talk to that server" error before any query
+/// runs, which is what spec §3 implies by negotiating up front.
+fn validate_content_encoding(headers: &tungstenite::http::HeaderMap) -> Result<()> {
+    let raw = match headers
+        .iter()
+        .find(|(name, _)| name.as_str().eq_ignore_ascii_case(HDR_CONTENT_ENCODING))
+    {
+        Some((_, v)) => v,
+        // Header absent => spec §3 default = `raw`. No constraint.
+        None => return Ok(()),
+    };
+    let s = raw.to_str().map_err(|_| {
+        fmt!(
+            HandshakeError,
+            "X-QWP-Content-Encoding header is not valid ASCII"
+        )
+    })?;
+    // Token = name `;` params... — only the name selects the codec.
+    let name = s.split(';').next().unwrap_or("").trim();
+    match name {
+        // `raw` and `identity` are spec-aliases for no compression.
+        "raw" | "identity" | "" => Ok(()),
+        "zstd" => {
+            #[cfg(feature = "compression-zstd")]
+            {
+                Ok(())
+            }
+            #[cfg(not(feature = "compression-zstd"))]
+            {
+                Err(fmt!(
+                    HandshakeError,
+                    "server selected X-QWP-Content-Encoding {:?} but this client was built \
+                     without the `compression-zstd` feature",
+                    s
+                ))
+            }
+        }
+        other => Err(fmt!(
+            HandshakeError,
+            "server selected X-QWP-Content-Encoding {:?} (unknown codec {:?})",
+            s,
+            other
+        )),
+    }
 }
 
 fn map_ws_error(e: tungstenite::Error, default_code: ErrorCode) -> Error {

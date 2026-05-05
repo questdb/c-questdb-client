@@ -1703,7 +1703,10 @@ mod tests {
         id_bytes.copy_from_slice(&patched[REQUEST_ID_OFFSET..REQUEST_ID_OFFSET + 8]);
         assert_eq!(i64::from_le_bytes(id_bytes), NEW_RID);
         // Body before and after the request_id span is byte-identical.
-        assert_eq!(&patched[..REQUEST_ID_OFFSET], &original[..REQUEST_ID_OFFSET]);
+        assert_eq!(
+            &patched[..REQUEST_ID_OFFSET],
+            &original[..REQUEST_ID_OFFSET]
+        );
         assert_eq!(
             &patched[REQUEST_ID_OFFSET + 8..],
             &original[REQUEST_ID_OFFSET + 8..]
@@ -1715,8 +1718,7 @@ mod tests {
         let _hold = patched.clone();
         let patched_again = patch_request_id(patched, OLD_RID);
         let mut id_bytes = [0u8; 8];
-        id_bytes
-            .copy_from_slice(&patched_again[REQUEST_ID_OFFSET..REQUEST_ID_OFFSET + 8]);
+        id_bytes.copy_from_slice(&patched_again[REQUEST_ID_OFFSET..REQUEST_ID_OFFSET + 8]);
         assert_eq!(i64::from_le_bytes(id_bytes), OLD_RID);
     }
 

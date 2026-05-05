@@ -500,16 +500,54 @@ fn decode_column(
         ColumnKind::Short => {
             DecodedColumn::Short(decode_fixed_non_nullable(r, parent, row_count, 2, "SHORT")?)
         }
-        ColumnKind::Int => DecodedColumn::Int(decode_fixed(r, parent, row_count, 4)?),
-        ColumnKind::Long => DecodedColumn::Long(decode_fixed(r, parent, row_count, 8)?),
-        ColumnKind::Float => DecodedColumn::Float(decode_fixed(r, parent, row_count, 4)?),
-        ColumnKind::Double => DecodedColumn::Double(decode_fixed(r, parent, row_count, 8)?),
+        ColumnKind::Int => DecodedColumn::Int(decode_fixed(
+            r,
+            parent,
+            row_count,
+            4,
+            Some(&null_sentinel::I32_LE),
+        )?),
+        ColumnKind::Long => DecodedColumn::Long(decode_fixed(
+            r,
+            parent,
+            row_count,
+            8,
+            Some(&null_sentinel::I64_LE),
+        )?),
+        ColumnKind::Float => DecodedColumn::Float(decode_fixed(
+            r,
+            parent,
+            row_count,
+            4,
+            Some(&null_sentinel::F32_NAN_LE),
+        )?),
+        ColumnKind::Double => DecodedColumn::Double(decode_fixed(
+            r,
+            parent,
+            row_count,
+            8,
+            Some(&null_sentinel::F64_NAN_LE),
+        )?),
         ColumnKind::Char => {
             DecodedColumn::Char(decode_fixed_non_nullable(r, parent, row_count, 2, "CHAR")?)
         }
-        ColumnKind::Ipv4 => DecodedColumn::Ipv4(decode_fixed(r, parent, row_count, 4)?),
-        ColumnKind::Uuid => DecodedColumn::Uuid(decode_fixed(r, parent, row_count, 16)?),
-        ColumnKind::Long256 => DecodedColumn::Long256(decode_fixed(r, parent, row_count, 32)?),
+        // IPv4 NULL sentinel is `0` per spec §11.5; zero-fill is correct,
+        // pass `None` to short-circuit the per-row sentinel copy.
+        ColumnKind::Ipv4 => DecodedColumn::Ipv4(decode_fixed(r, parent, row_count, 4, None)?),
+        ColumnKind::Uuid => DecodedColumn::Uuid(decode_fixed(
+            r,
+            parent,
+            row_count,
+            16,
+            Some(&null_sentinel::UUID_LE),
+        )?),
+        ColumnKind::Long256 => DecodedColumn::Long256(decode_fixed(
+            r,
+            parent,
+            row_count,
+            32,
+            Some(&null_sentinel::LONG256_LE),
+        )?),
 
         ColumnKind::Timestamp => {
             DecodedColumn::Timestamp(decode_temporal(r, parent, row_count, flags_byte)?)
@@ -678,7 +716,17 @@ fn decode_geohash(
         ));
     }
     let byte_width = precision_bits.div_ceil(8) as u8;
-    let buffer = densify_fixed(r, parent, row_count, byte_width as usize, validity)?;
+    // GEOHASH NULL sentinel per spec §11.5 is `-1` sign-extended across
+    // the column's storage width. `0xFF` repeated `byte_width` times.
+    let sentinel = &null_sentinel::GEOHASH_FF[..byte_width as usize];
+    let buffer = densify_fixed(
+        r,
+        parent,
+        row_count,
+        byte_width as usize,
+        validity,
+        Some(sentinel),
+    )?;
     Ok((buffer, byte_width, precision_bits as u8))
 }
 
@@ -700,19 +748,81 @@ fn decode_decimal_wide(
             crate::egress::binds::MAX_DECIMAL_SCALE
         ));
     }
-    let buffer = densify_fixed(r, parent, row_count, width, validity)?;
+    // DECIMAL64 NULL is `Long.MIN_VALUE` (spec §11.5). DECIMAL128 NULL is
+    // both halves `Long.MIN_VALUE` (server: `lo == LONG_NULL && hi ==
+    // LONG_NULL`); DECIMAL256 NULL is four halves `Long.MIN_VALUE`
+    // (server: `decimal128Sink.isNull()` over the full 32-byte sink).
+    // The 16/32-byte patterns are identical to UUID / LONG256 — every
+    // 8th byte 0x80, the rest 0x00.
+    let sentinel: &[u8] = match width {
+        8 => &null_sentinel::I64_LE,
+        16 => &null_sentinel::UUID_LE,
+        32 => &null_sentinel::LONG256_LE,
+        _ => unreachable!("DECIMAL width must be 8, 16, or 32"),
+    };
+    let buffer = densify_fixed(r, parent, row_count, width, validity, Some(sentinel))?;
     Ok((scale, buffer))
+}
+
+/// Per-type NULL sentinel patterns.
+///
+/// QWP egress §11.5 inherits QuestDB's in-engine NULL sentinels: NULL rows
+/// in dense column views carry these bit patterns, simultaneously with
+/// the row being marked NULL in the validity bitmap. Our decoder takes
+/// compact wire data (only non-null values) and densifies into a
+/// `row_count`-sized buffer; spec compliance means filling the null slots
+/// with these sentinels, not zero, so a user reading `value(row)` without
+/// first calling `is_null(row)` sees the same byte pattern they would have
+/// observed had the server pre-densified the column itself.
+mod null_sentinel {
+    /// `Numbers.INT_NULL = Integer.MIN_VALUE` (4 LE bytes).
+    pub const I32_LE: [u8; 4] = i32::MIN.to_le_bytes();
+    /// `Numbers.LONG_NULL = Long.MIN_VALUE` (8 LE bytes). Used by LONG,
+    /// DATE, TIMESTAMP, TIMESTAMP_NANOS, DECIMAL64.
+    pub const I64_LE: [u8; 8] = i64::MIN.to_le_bytes();
+    /// `Float.NaN` canonical quiet-NaN bit pattern (Java's `Double.NaN`
+    /// matches the IEEE 754 `0x7FC00000`).
+    pub const F32_NAN_LE: [u8; 4] = 0x7FC0_0000u32.to_le_bytes();
+    /// `Double.NaN` canonical quiet-NaN bit pattern (`0x7FF8_0000_0000_0000`).
+    pub const F64_NAN_LE: [u8; 8] = 0x7FF8_0000_0000_0000u64.to_le_bytes();
+    /// UUID NULL — both halves `Long.MIN_VALUE`. Layout: every 8th byte
+    /// is `0x80`, all others `0x00`.
+    pub const UUID_LE: [u8; 16] = [
+        0, 0, 0, 0, 0, 0, 0, 0x80, // low half
+        0, 0, 0, 0, 0, 0, 0, 0x80, // high half
+    ];
+    /// LONG256 NULL — four halves `Long.MIN_VALUE`. Same trailing-`0x80`
+    /// layout as UUID, repeated four times.
+    pub const LONG256_LE: [u8; 32] = [
+        0, 0, 0, 0, 0, 0, 0, 0x80, 0, 0, 0, 0, 0, 0, 0, 0x80, 0, 0, 0, 0, 0, 0, 0, 0x80, 0, 0, 0,
+        0, 0, 0, 0, 0x80,
+    ];
+    /// GEOHASH NULL — `-1` sign-extended across 1..=8 bytes. Slice to the
+    /// column's byte_width.
+    pub const GEOHASH_FF: [u8; 8] = [0xFF; 8];
 }
 
 /// Common helper: read `non_null × elem_size` compact bytes from `r` and
 /// write them into a `row_count × elem_size` dense buffer.
+///
+/// `null_sentinel`, when `Some`, must have length exactly `elem_size`. It
+/// pre-fills null slots so reading `value(row)` on a NULL row returns the
+/// QuestDB sentinel (per spec §11.5) instead of zero. `None` keeps the
+/// zero-fill path — used for types where the spec doesn't define a
+/// sentinel (e.g. SYMBOL, where the validity bit is the sole null
+/// indicator) or where the sentinel happens to be all-zero (IPv4).
 fn densify_fixed(
     r: &mut ByteReader<'_>,
     parent: &Bytes,
     row_count: usize,
     elem_size: usize,
     validity: Option<Bytes>,
+    null_sentinel: Option<&[u8]>,
 ) -> Result<ColumnBuffer> {
+    debug_assert!(
+        null_sentinel.is_none_or(|s| s.len() == elem_size),
+        "null_sentinel length must equal elem_size"
+    );
     let dense_len = row_count
         .checked_mul(elem_size)
         .ok_or_else(|| fmt!(ProtocolError, "fixed column size overflow"))?;
@@ -726,7 +836,7 @@ fn densify_fixed(
         Some(bitmap) => {
             let non_null = row_count - count_nulls(bitmap, row_count);
             let compact = r.read_bytes(non_null * elem_size)?;
-            let mut dense = vec![0u8; dense_len];
+            let mut dense = allocate_dense_with_sentinel(dense_len, elem_size, null_sentinel);
             let mut src = 0usize;
             for row in 0..row_count {
                 if !is_null_at(bitmap, row) {
@@ -740,6 +850,28 @@ fn densify_fixed(
                 validity,
             })
         }
+    }
+}
+
+/// Allocate a `dense_len`-byte buffer pre-filled with the per-element
+/// null sentinel, or zero when `sentinel` is `None` / all-zero.
+///
+/// All-zero sentinels short-circuit to `vec![0u8; dense_len]` so we don't
+/// pay the per-element copy when the type's spec sentinel is `0` (IPv4).
+fn allocate_dense_with_sentinel(
+    dense_len: usize,
+    elem_size: usize,
+    sentinel: Option<&[u8]>,
+) -> Vec<u8> {
+    match sentinel {
+        Some(s) if s.iter().any(|&b| b != 0) => {
+            let mut dense = vec![0u8; dense_len];
+            for chunk in dense.chunks_exact_mut(elem_size) {
+                chunk.copy_from_slice(s);
+            }
+            dense
+        }
+        _ => vec![0u8; dense_len],
     }
 }
 
@@ -867,15 +999,17 @@ fn decode_validity(
 }
 
 /// Read `non_null_count × elem_size` compact bytes from the wire and write
-/// them into a dense `row_count × elem_size` buffer, with null slots zeroed.
+/// them into a dense `row_count × elem_size` buffer. Null slots are filled
+/// with `null_sentinel` per spec §11.5 (or zero when `None`).
 fn decode_fixed(
     r: &mut ByteReader<'_>,
     parent: &Bytes,
     row_count: usize,
     elem_size: usize,
+    null_sentinel: Option<&[u8]>,
 ) -> Result<ColumnBuffer> {
     let validity = decode_validity(r, parent, row_count)?;
-    densify_fixed(r, parent, row_count, elem_size, validity)
+    densify_fixed(r, parent, row_count, elem_size, validity, null_sentinel)
 }
 
 /// Read and validate the `null_flag` byte for a column type the QWP spec
@@ -959,8 +1093,11 @@ fn decode_temporal(
     row_count: usize,
     flags_byte: u8,
 ) -> Result<ColumnBuffer> {
+    // TIMESTAMP / DATE / TIMESTAMP_NANOS share `Long.MIN_VALUE` as their
+    // QuestDB NULL sentinel (spec §11.5).
+    let sentinel = Some(&null_sentinel::I64_LE[..]);
     if flags_byte & flags::GORILLA == 0 {
-        return decode_fixed(r, parent, row_count, 8);
+        return decode_fixed(r, parent, row_count, 8, sentinel);
     }
 
     // Validity comes first under FLAG_GORILLA, same as every other column.
@@ -972,7 +1109,7 @@ fn decode_temporal(
 
     let disc = r.read_u8()?;
     match disc {
-        0x00 => densify_fixed(r, parent, row_count, 8, validity),
+        0x00 => densify_fixed(r, parent, row_count, 8, validity, sentinel),
         0x01 => decode_gorilla_temporal(r, row_count, non_null, validity),
         other => Err(fmt!(
             ProtocolError,
@@ -1012,16 +1149,17 @@ fn decode_gorilla_temporal(
     let consumed = decoder.bytes_consumed();
     r.advance(consumed)?;
 
-    // Densify into row_count × 8 with null slots zeroed. `checked_mul`
-    // mirrors the guard in `densify_fixed` — `row_count` comes from a
-    // wire varint that has no per-row size cap, so a 32-bit `usize`
-    // (or, more theoretically, a malformed frame on 64-bit) could wrap
-    // and produce an undersized buffer that the per-row write below
-    // then overruns.
+    // Densify into row_count × 8. Null slots get the QuestDB temporal
+    // NULL sentinel (`Long.MIN_VALUE`) per spec §11.5 — same as the
+    // non-Gorilla path. `checked_mul` mirrors the guard in
+    // `densify_fixed`: `row_count` comes from a wire varint that has no
+    // per-row size cap, so a 32-bit `usize` (or, more theoretically, a
+    // malformed frame on 64-bit) could wrap and produce an undersized
+    // buffer that the per-row write below then overruns.
     let dense_len = row_count
         .checked_mul(8)
         .ok_or_else(|| fmt!(ProtocolError, "gorilla temporal column size overflow"))?;
-    let mut dense = vec![0u8; dense_len];
+    let mut dense = allocate_dense_with_sentinel(dense_len, 8, Some(&null_sentinel::I64_LE));
     let mut next = 0usize;
     for row in 0..row_count {
         if !is_null_at_opt(&validity, row) {
@@ -1462,8 +1600,9 @@ mod tests {
         assert!(!c.is_null(2));
         assert!(!c.is_null(3));
         assert_eq!(c.value(0), 10);
-        // Row 1 is null; densified slot is zero per the decoder's contract.
-        assert_eq!(c.value(1), 0);
+        // Row 1 is null; densified slot carries the QuestDB LONG NULL
+        // sentinel (`Long.MIN_VALUE`) per spec §11.5, not zero.
+        assert_eq!(c.value(1), i64::MIN);
         assert_eq!(c.value(2), 30);
         assert_eq!(c.value(3), 40);
     }
@@ -1561,8 +1700,11 @@ mod tests {
         assert!(!c.is_null(2));
         assert!(!c.is_null(3));
         assert_eq!(c.value(0), 1.5);
-        // Densified zero in the null slot.
-        assert_eq!(c.value(1).to_bits(), 0u64);
+        // Spec §11.5: DOUBLE NULL is `Double.NaN` (canonical quiet-NaN
+        // bit pattern `0x7FF8_0000_0000_0000`). Compare bits — `NaN ==
+        // NaN` is always false in IEEE 754, so direct value comparison
+        // would silently pass for any NaN.
+        assert_eq!(c.value(1).to_bits(), 0x7FF8_0000_0000_0000u64);
         assert_eq!(c.value(2), 3.5);
         assert_eq!(c.value(3), 4.5);
     }
@@ -1582,7 +1724,8 @@ mod tests {
         let view = batch.column_view(0, &dict).unwrap();
         let ColumnView::Float(c) = view else { panic!() };
         assert_eq!(c.value(0), 1.5_f32);
-        assert_eq!(c.value(1).to_bits(), 0u32);
+        // Spec §11.5: FLOAT NULL is canonical quiet-NaN `0x7FC0_0000`.
+        assert_eq!(c.value(1).to_bits(), 0x7FC0_0000u32);
         assert_eq!(c.value(2), 3.5_f32);
         assert_eq!(c.value(3), 4.5_f32);
     }
@@ -1616,11 +1759,108 @@ mod tests {
             .map(|r| if c.is_null(r) { None } else { Some(c.value(r)) })
             .collect();
         assert_eq!(got, expected);
-        // Spot-check that null slots read as zero (dense buffer
-        // contract, not just `is_null` agreeing).
-        assert_eq!(c.value(1), 0);
-        assert_eq!(c.value(4), 0);
-        assert_eq!(c.value(7), 0);
+        // Spec §11.5: INT NULL is `Integer.MIN_VALUE`. Spot-check that
+        // null slots read as that sentinel (dense buffer contract, not
+        // just `is_null` agreeing).
+        assert_eq!(c.value(1), i32::MIN);
+        assert_eq!(c.value(4), i32::MIN);
+        assert_eq!(c.value(7), i32::MIN);
+    }
+
+    #[test]
+    fn null_sentinels_per_spec_11_5() {
+        // Locks the per-type NULL sentinel patterns from spec §11.5
+        // against drift. Each row 0 carries a real value; row 1 is NULL
+        // and must densify to the sentinel.
+        let bitmap = vec![0x02]; // bit 1 set => row 1 is NULL.
+
+        // UUID NULL: both halves Long.MIN_VALUE.
+        let mut uuid_vals = vec![0u8; 16];
+        uuid_vals[..8].copy_from_slice(&1i64.to_le_bytes());
+        uuid_vals[8..16].copy_from_slice(&2i64.to_le_bytes());
+        // LONG256 NULL: four halves Long.MIN_VALUE.
+        let mut long256_vals = vec![0u8; 32];
+        for chunk in 0..4 {
+            long256_vals[chunk * 8..chunk * 8 + 8]
+                .copy_from_slice(&((chunk + 1) as i64).to_le_bytes());
+        }
+
+        let cases: &[(ColumnKind, Vec<u8>, &[u8])] = &[
+            (ColumnKind::Int, le_i32s(&[7]), &i32::MIN.to_le_bytes()),
+            (ColumnKind::Long, le_i64s(&[7]), &i64::MIN.to_le_bytes()),
+            (
+                ColumnKind::Float,
+                le_f32s(&[1.5]),
+                &0x7FC0_0000u32.to_le_bytes(),
+            ),
+            (
+                ColumnKind::Double,
+                le_f64s(&[1.5]),
+                &0x7FF8_0000_0000_0000u64.to_le_bytes(),
+            ),
+            (
+                ColumnKind::Uuid,
+                uuid_vals,
+                &[0, 0, 0, 0, 0, 0, 0, 0x80, 0, 0, 0, 0, 0, 0, 0, 0x80],
+            ),
+            (
+                ColumnKind::Long256,
+                long256_vals,
+                &[
+                    0, 0, 0, 0, 0, 0, 0, 0x80, 0, 0, 0, 0, 0, 0, 0, 0x80, 0, 0, 0, 0, 0, 0, 0,
+                    0x80, 0, 0, 0, 0, 0, 0, 0, 0x80,
+                ],
+            ),
+        ];
+
+        for (kind, value_bytes, expected_null) in cases {
+            let (flags_byte, payload) = BatchBuilder::new(2)
+                .add_column("v", *kind, col_with_bitmap(&bitmap, value_bytes))
+                .build();
+            let mut dict = SymbolDict::new();
+            let mut reg = SchemaRegistry::new();
+            let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg)
+                .unwrap_or_else(|e| panic!("{:?}: {}", kind, e.msg()));
+            // Pull row 1's raw bytes via the appropriate ColumnView arm.
+            let view = batch.column_view(0, &dict).unwrap();
+            let null_bytes: Vec<u8> = match view {
+                ColumnView::Int(c) => c.value(1).to_le_bytes().to_vec(),
+                ColumnView::Long(c) => c.value(1).to_le_bytes().to_vec(),
+                ColumnView::Float(c) => c.value(1).to_bits().to_le_bytes().to_vec(),
+                ColumnView::Double(c) => c.value(1).to_bits().to_le_bytes().to_vec(),
+                ColumnView::Uuid(c) => c.value(1).to_vec(),
+                ColumnView::Long256(c) => c.value(1).to_vec(),
+                _ => panic!("unexpected view for {:?}", kind),
+            };
+            assert_eq!(
+                null_bytes, *expected_null,
+                "spec §11.5 NULL sentinel mismatch for {:?}: got {:02X?}, expected {:02X?}",
+                kind, null_bytes, expected_null
+            );
+        }
+
+        // Geohash uses byte_width-dependent sentinel = 0xFF * byte_width.
+        // GeohashColumn::value returns the row's bytes zero-extended to
+        // u64; for byte_width=1 a NULL row reads as 0xFF.
+        let mut geo_payload = vec![0x01]; // null_flag = bitmap follows
+        geo_payload.extend_from_slice(&[0x02]); // bitmap: row 1 null
+        geo_payload.push(8); // varint precision_bits = 8 -> byte_width = 1
+        geo_payload.push(0x12); // 1 non-null value
+        let (flags_byte, payload) = BatchBuilder::new(2)
+            .add_column("g", ColumnKind::Geohash, geo_payload)
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let ColumnView::Geohash(c) = batch.column_view(0, &dict).unwrap() else {
+            panic!()
+        };
+        assert_eq!(c.value(0), 0x12);
+        assert_eq!(
+            c.value(1),
+            0xFF,
+            "spec §11.5: GEOHASH NULL = 0xFF * byte_width"
+        );
     }
 
     #[test]
