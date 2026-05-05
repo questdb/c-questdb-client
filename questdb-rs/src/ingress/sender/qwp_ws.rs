@@ -28,7 +28,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -173,6 +173,7 @@ struct SyncQwpWsRunnerCore<T = BlockingQwpWsTransport> {
 struct BackpressureNotifier {
     lock: Mutex<()>,
     available: Condvar,
+    generation: AtomicU64,
 }
 
 #[cfg(test)]
@@ -236,6 +237,7 @@ where
     fn publish_replay_payload(&mut self, payload: &[u8]) -> crate::Result<u64> {
         let deadline = Instant::now().checked_add(self.append_deadline);
         loop {
+            let backpressure_generation = self.backpressure.generation();
             self.check_publication_open()?;
             if let Some(producer) = self.producer.as_mut() {
                 match producer.try_submit(payload) {
@@ -243,7 +245,9 @@ where
                     Err(err) => {
                         let err = DriverError::Queue(err);
                         if driver_error_is_backpressure(&err) {
-                            if !self.wait_for_publication_capacity(deadline) {
+                            if !self
+                                .wait_for_publication_capacity(backpressure_generation, deadline)
+                            {
                                 return Err(driver_error_to_error_without_state(
                                     DriverError::SubmitTimedOut,
                                 ));
@@ -263,7 +267,7 @@ where
             match submit_result {
                 Ok(receipt) => return Ok(receipt.fsn),
                 Err(err) if driver_error_is_backpressure(&err) => {
-                    if !self.wait_for_publication_capacity(deadline) {
+                    if !self.wait_for_publication_capacity(backpressure_generation, deadline) {
                         return Err(driver_error_to_error_without_state(
                             DriverError::SubmitTimedOut,
                         ));
@@ -344,6 +348,7 @@ where
         }
 
         loop {
+            let backpressure_generation = self.backpressure.generation();
             {
                 let mut store = self.lock_shared()?;
                 check_store_error(&store)?;
@@ -355,7 +360,7 @@ where
                 }
             }
 
-            if !self.wait_for_publication_capacity(deadline) {
+            if !self.wait_for_publication_capacity(backpressure_generation, deadline) {
                 return Err(error::fmt!(
                     SocketError,
                     "QWP/WebSocket close drain timed out before all published frames were acknowledged"
@@ -370,8 +375,8 @@ where
             .map_err(|_| error::fmt!(SocketError, "QWP/WebSocket runner state lock is poisoned"))
     }
 
-    fn wait_for_publication_capacity(&self, deadline: Option<Instant>) -> bool {
-        self.backpressure.wait_until(deadline)
+    fn wait_for_publication_capacity(&self, generation: u64, deadline: Option<Instant>) -> bool {
+        self.backpressure.wait_for_change(generation, deadline)
     }
 }
 
@@ -380,34 +385,53 @@ impl BackpressureNotifier {
         Self {
             lock: Mutex::new(()),
             available: Condvar::new(),
+            generation: AtomicU64::new(0),
         }
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
     fn notify_all(&self) {
+        let _guard = self.lock();
+        self.generation.fetch_add(1, Ordering::Release);
         self.available.notify_all();
     }
 
-    fn wait_until(&self, deadline: Option<Instant>) -> bool {
-        if backpressure_deadline_expired(deadline) {
-            return false;
+    fn wait_for_change(&self, generation: u64, deadline: Option<Instant>) -> bool {
+        let mut guard = self.lock();
+        while self.generation.load(Ordering::Acquire) == generation {
+            let Some(deadline) = deadline else {
+                guard = match self.available.wait(guard) {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                continue;
+            };
+            if backpressure_deadline_expired(Some(deadline)) {
+                return false;
+            }
+            let wait_for = deadline.saturating_duration_since(Instant::now());
+            if wait_for.is_zero() {
+                return false;
+            }
+            guard = match self.available.wait_timeout(guard, wait_for) {
+                Ok((guard, _)) => guard,
+                Err(poisoned) => {
+                    let (guard, _) = poisoned.into_inner();
+                    guard
+                }
+            };
         }
+        true
+    }
 
-        let wait_for = match deadline {
-            Some(deadline) => deadline
-                .saturating_duration_since(Instant::now())
-                .min(BACKPRESSURE_PARK),
-            None => BACKPRESSURE_PARK,
-        };
-        if wait_for.is_zero() {
-            return !backpressure_deadline_expired(deadline);
-        }
-
-        let guard = match self.lock.lock() {
+    fn lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        match self.lock.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
-        };
-        let _ = self.available.wait_timeout(guard, wait_for);
-        !backpressure_deadline_expired(deadline)
+        }
     }
 }
 
@@ -1607,6 +1631,24 @@ mod tests {
     use super::super::qwp_ws_queue::{OutboundFrameView, SentFrame, VolatileFrameQueue};
     use super::*;
     use std::sync::mpsc;
+
+    #[test]
+    fn backpressure_notifier_remembers_progress_before_wait() {
+        let notifier = BackpressureNotifier::new();
+        let generation = notifier.generation();
+
+        notifier.notify_all();
+
+        assert!(notifier.wait_for_change(generation, Some(Instant::now())));
+    }
+
+    #[test]
+    fn backpressure_notifier_deadline_expires_without_progress() {
+        let notifier = BackpressureNotifier::new();
+        let generation = notifier.generation();
+
+        assert!(!notifier.wait_for_change(generation, Some(Instant::now())));
+    }
 
     #[test]
     fn frame_short_payload_is_masked() {
