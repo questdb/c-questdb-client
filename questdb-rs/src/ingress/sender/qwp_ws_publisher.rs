@@ -32,9 +32,11 @@
 use crate::error;
 use crate::ingress::buffer::{QwpBuffer, QwpWsEncodeScratch, SymbolGlobalDict};
 
+#[cfg(test)]
+use super::qwp_ws_driver::DeliveryOutcome;
 use super::qwp_ws_driver::{
-    CloseOutcome, DeliveryOutcome, DriveOutcome, DriverError, ManualDriverPrototype,
-    ManualDriverTransport, PublicationLog, QwpWsPublicationStore, QwpWsSendCore,
+    CloseOutcome, DriveOutcome, DriverError, ManualDriverPrototype, ManualDriverTransport,
+    PublicationLog, QwpWsPublicationStore, QwpWsSendCore,
 };
 use super::qwp_ws_ownership::QwpWsSenderError;
 use super::qwp_ws_queue::QwpReceipt;
@@ -89,6 +91,7 @@ impl<Q: PublicationLog, T: ManualDriverTransport> QwpWsPublicationDriver<Q, T> {
         self.encoder.version()
     }
 
+    #[cfg(test)]
     pub(crate) fn try_submit_qwp(
         &mut self,
         buffer: &QwpBuffer,
@@ -114,6 +117,7 @@ impl<Q: PublicationLog, T: ManualDriverTransport> QwpWsPublicationDriver<Q, T> {
             .submit_with_drive_limit(payload, max_drive_steps)?)
     }
 
+    #[cfg(test)]
     pub(crate) fn drive_once(&mut self) -> Result<DriveOutcome, DriverError> {
         self.driver.drive_once()
     }
@@ -122,6 +126,7 @@ impl<Q: PublicationLog, T: ManualDriverTransport> QwpWsPublicationDriver<Q, T> {
         self.driver.drive_ready_once()
     }
 
+    #[cfg(test)]
     pub(crate) fn wait_steps(
         &mut self,
         receipt: QwpReceipt,
@@ -130,6 +135,7 @@ impl<Q: PublicationLog, T: ManualDriverTransport> QwpWsPublicationDriver<Q, T> {
         self.driver.wait_steps(receipt, max_drive_steps)
     }
 
+    #[cfg(test)]
     pub(crate) fn close_drain_steps(
         &mut self,
         max_drive_steps: usize,

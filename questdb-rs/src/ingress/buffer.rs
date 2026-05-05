@@ -42,8 +42,10 @@ pub use self::ilp::{ColumnName, TableName};
 pub(crate) use self::qwp::QwpBuffer;
 #[cfg(feature = "_sender-qwp-udp")]
 pub(crate) use self::qwp::QwpSendScratch;
+#[cfg(all(test, feature = "_sender-qwp-ws"))]
+pub(crate) use self::qwp::SchemaRegistry;
 #[cfg(feature = "_sender-qwp-ws")]
-pub(crate) use self::qwp::{QwpWsEncodeScratch, SchemaRegistry, SymbolGlobalDict};
+pub(crate) use self::qwp::{QwpWsEncodeScratch, SymbolGlobalDict};
 
 static NEXT_BOOKMARK_ORIGIN: AtomicU64 = AtomicU64::new(1);
 

@@ -56,7 +56,7 @@ use super::qwp_ws_ownership::QwpWsSenderError;
 use super::qwp_ws_publisher::{QwpWsPublicationDriver, QwpWsPublicationError, QwpWsReplayEncoder};
 use super::qwp_ws_queue::{
     LockFreeVolatileProducer, LockFreeVolatilePublicationLog, OutboundFrame, PendingPayload,
-    QwpReceipt, QwpReceiptStatus, VolatileFrameQueue, VolatileQueueOptions,
+    QwpReceipt, QwpReceiptStatus, VolatileQueueOptions,
 };
 use super::qwp_ws_sfa_slot::{SfaSlotOptions, SfaSlotQueue};
 
@@ -175,6 +175,7 @@ struct BackpressureNotifier {
     available: Condvar,
 }
 
+#[cfg(test)]
 const DEFAULT_APPEND_DEADLINE: Duration = Duration::from_secs(30);
 const BACKPRESSURE_PARK: Duration = Duration::from_micros(50);
 pub(crate) const DEFAULT_CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -183,6 +184,7 @@ impl<Q> SyncQwpWsRunner<Q>
 where
     Q: PublicationLog + Send + 'static,
 {
+    #[cfg(test)]
     fn start<T>(publisher: QwpWsPublicationDriver<Q, T>) -> Self
     where
         T: ManualDriverTransport + Send + 'static,
@@ -691,7 +693,7 @@ impl<Q> Drop for SyncQwpWsRunner<Q> {
 
 pub(crate) enum ConfiguredQwpWsQueue {
     Memory(LockFreeVolatilePublicationLog),
-    StoreAndForward(SfaSlotQueue),
+    StoreAndForward(Box<SfaSlotQueue>),
 }
 
 impl ConfiguredQwpWsQueue {
@@ -709,7 +711,7 @@ impl ConfiguredQwpWsQueue {
         let max_in_flight = *qwp_ws.max_in_flight;
 
         if let Some(sf_dir) = qwp_ws.sf_dir.as_ref() {
-            return Ok(Self::StoreAndForward(
+            return Ok(Self::StoreAndForward(Box::new(
                 SfaSlotQueue::open(SfaSlotOptions {
                     sf_dir: sf_dir.clone(),
                     sender_id: qwp_ws.sender_id.to_string(),
@@ -725,7 +727,7 @@ impl ConfiguredQwpWsQueue {
                         err
                     )
                 })?,
-            ));
+            )));
         }
 
         Ok(Self::Memory(
@@ -766,42 +768,44 @@ impl PublicationLog for ConfiguredQwpWsQueue {
     fn try_publish(&mut self, payload: &[u8]) -> Result<QwpReceipt, DriverError> {
         match self {
             Self::Memory(queue) => PublicationLog::try_publish(queue, payload),
-            Self::StoreAndForward(queue) => PublicationLog::try_publish(queue, payload),
+            Self::StoreAndForward(queue) => PublicationLog::try_publish(queue.as_mut(), payload),
         }
     }
 
     fn take_lock_free_producer(&mut self) -> Option<LockFreeVolatileProducer> {
         match self {
             Self::Memory(queue) => PublicationLog::take_lock_free_producer(queue),
-            Self::StoreAndForward(queue) => PublicationLog::take_lock_free_producer(queue),
+            Self::StoreAndForward(queue) => PublicationLog::take_lock_free_producer(queue.as_mut()),
         }
     }
 
     fn pending_payload_for_fsn(&self, fsn: u64) -> Result<Option<PendingPayload>, DriverError> {
         match self {
             Self::Memory(queue) => PublicationLog::pending_payload_for_fsn(queue, fsn),
-            Self::StoreAndForward(queue) => PublicationLog::pending_payload_for_fsn(queue, fsn),
+            Self::StoreAndForward(queue) => {
+                PublicationLog::pending_payload_for_fsn(queue.as_ref(), fsn)
+            }
         }
     }
 
     fn oldest_unresolved_fsn(&self) -> Option<u64> {
         match self {
             Self::Memory(queue) => PublicationLog::oldest_unresolved_fsn(queue),
-            Self::StoreAndForward(queue) => PublicationLog::oldest_unresolved_fsn(queue),
+            Self::StoreAndForward(queue) => PublicationLog::oldest_unresolved_fsn(queue.as_ref()),
         }
     }
 
     fn complete_through(&mut self, fsn: u64) -> Result<(), DriverError> {
         match self {
             Self::Memory(queue) => PublicationLog::complete_through(queue, fsn),
-            Self::StoreAndForward(queue) => PublicationLog::complete_through(queue, fsn),
+            Self::StoreAndForward(queue) => PublicationLog::complete_through(queue.as_mut(), fsn),
         }
     }
 
     fn reject_fsn(&mut self, fsn: u64) -> Result<QwpReceipt, DriverError> {
         match self {
             Self::Memory(queue) => PublicationLog::reject_fsn(queue, fsn),
-            Self::StoreAndForward(queue) => PublicationLog::reject_fsn(queue, fsn),
+            Self::StoreAndForward(queue) => PublicationLog::reject_fsn(queue.as_mut(), fsn),
         }
     }
 
@@ -815,28 +819,28 @@ impl PublicationLog for ConfiguredQwpWsQueue {
     fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus {
         match self {
             Self::Memory(queue) => PublicationLog::receipt_status(queue, receipt),
-            Self::StoreAndForward(queue) => PublicationLog::receipt_status(queue, receipt),
+            Self::StoreAndForward(queue) => PublicationLog::receipt_status(queue.as_ref(), receipt),
         }
     }
 
     fn published_fsn(&self) -> Option<u64> {
         match self {
             Self::Memory(queue) => PublicationLog::published_fsn(queue),
-            Self::StoreAndForward(queue) => PublicationLog::published_fsn(queue),
+            Self::StoreAndForward(queue) => PublicationLog::published_fsn(queue.as_ref()),
         }
     }
 
     fn completed_fsn(&self) -> Option<u64> {
         match self {
             Self::Memory(queue) => PublicationLog::completed_fsn(queue),
-            Self::StoreAndForward(queue) => PublicationLog::completed_fsn(queue),
+            Self::StoreAndForward(queue) => PublicationLog::completed_fsn(queue.as_ref()),
         }
     }
 
     fn max_in_flight(&self) -> usize {
         match self {
             Self::Memory(queue) => PublicationLog::max_in_flight(queue),
-            Self::StoreAndForward(queue) => PublicationLog::max_in_flight(queue),
+            Self::StoreAndForward(queue) => PublicationLog::max_in_flight(queue.as_ref()),
         }
     }
 }
@@ -866,6 +870,7 @@ pub(crate) fn write_binary_frame<W: Write>(
 /// Read one full WebSocket message into `out`. Reassembles fragmented frames.
 /// Replies to PING with PONG and treats CLOSE as an error. Returns the opcode
 /// of the first data frame (text/binary).
+#[cfg(test)]
 pub(crate) fn read_message<S: Read + Write>(
     stream: &mut S,
     scratch: &mut Vec<u8>,
@@ -906,6 +911,7 @@ pub(crate) enum WsMessageError {
 }
 
 impl WsMessageError {
+    #[cfg(test)]
     pub(crate) fn into_error(self) -> crate::Error {
         match self {
             Self::Close(close) => close.into_error(),
@@ -1348,7 +1354,7 @@ fn connect_blocking_transport_with_retry(
     let mut backoff = *qwp_ws.reconnect_initial_backoff;
     let mut last_error = None;
 
-    while deadline.map_or(true, |deadline| Instant::now() < deadline) {
+    while deadline.is_none_or(|deadline| Instant::now() < deadline) {
         attempts += 1;
         match BlockingQwpWsTransport::connect(
             host,
@@ -1598,7 +1604,7 @@ mod tests {
         DriverError, DriverEvent, ReconnectReason, TransportFailure, TransportResponse,
         TransportSendResult,
     };
-    use super::super::qwp_ws_queue::{OutboundFrameView, SentFrame};
+    use super::super::qwp_ws_queue::{OutboundFrameView, SentFrame, VolatileFrameQueue};
     use super::*;
     use std::sync::mpsc;
 

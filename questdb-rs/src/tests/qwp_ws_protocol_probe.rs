@@ -307,7 +307,7 @@ fn probe_ordered_reject_then_later_success(config: &ProbeConfig) -> ProbeResult<
         "bad frame should be reported as sequence 1"
     );
     assert!(
-        ok_sequences.iter().all(|sequence| *sequence <= 0),
+        ok_sequences.iter().all(|sequence| *sequence == 0),
         "server must not ACK beyond the bad frame before reporting it: {ok_sequences:?}"
     );
 
@@ -856,10 +856,9 @@ fn query_json(config: &ProbeConfig, sql: &str) -> ProbeResult<serde_json::Value>
     let body = response.into_body().read_to_vec()?;
     let value: serde_json::Value = serde_json::from_slice(&body)?;
     if let Some(error) = value.get("error").and_then(|err| err.as_str()) {
-        return Err(Box::new(IoError::new(
-            ErrorKind::Other,
-            format!("QuestDB query failed for {sql:?}: {error}"),
-        )));
+        return Err(Box::new(IoError::other(format!(
+            "QuestDB query failed for {sql:?}: {error}"
+        ))));
     }
     Ok(value)
 }

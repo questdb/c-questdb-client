@@ -172,6 +172,7 @@ impl SlotLock {
         let pid_path = slot_dir.join(LOCK_PID_FILE_NAME);
         let file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&lock_path)?;

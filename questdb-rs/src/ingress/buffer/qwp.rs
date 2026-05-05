@@ -73,7 +73,7 @@ const _: () = assert!(QWP_MESSAGE_HEADER_SIZE == 12);
 const _: () = assert!(MAX_ARRAY_DIMS <= u8::MAX as usize);
 
 pub(crate) const QWP_SCHEMA_MODE_FULL: u8 = 0x00;
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(all(test, feature = "_sender-qwp-ws"))]
 pub(crate) const QWP_SCHEMA_MODE_REFERENCE: u8 = 0x01;
 pub(crate) const QWP_TYPE_BOOLEAN: u8 = 0x01;
 pub(crate) const QWP_TYPE_DOUBLE: u8 = 0x07;
@@ -1861,6 +1861,7 @@ impl SymbolGlobalDict {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> u64 {
         self.next_id
     }
@@ -1934,14 +1935,14 @@ impl QwpWsEncodeScratch {
 /// Two tables that happen to have the same column shape may share an id — the
 /// server's registry stores the column set only, and the table name lives in
 /// the table header.
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(all(test, feature = "_sender-qwp-ws"))]
 #[derive(Debug, Default)]
 pub(crate) struct SchemaRegistry {
     map: std::collections::HashMap<Vec<u8>, u64>,
     next_id: u64,
 }
 
-#[cfg(feature = "_sender-qwp-ws")]
+#[cfg(all(test, feature = "_sender-qwp-ws"))]
 impl SchemaRegistry {
     #[allow(dead_code)]
     pub(crate) fn new() -> Self {
@@ -2003,6 +2004,7 @@ impl QwpBuffer {
     /// New symbols discovered while encoding are added to `global_dict` and
     /// recorded in the message's delta section so the server can mirror the
     /// dictionary state. The encoded payload lands in `scratch.message`.
+    #[cfg(test)]
     pub(crate) fn encode_ws_message(
         &self,
         scratch: &mut QwpWsEncodeScratch,
