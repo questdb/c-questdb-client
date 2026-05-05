@@ -30,7 +30,7 @@
 //! transport plus connection-local progress state and exposes the `&mut self`
 //! progress API used by tests and manual sender ownership.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 #[cfg(feature = "sync-sender-qwp-ws")]
 use std::io::Write;
 use std::sync::Arc;
@@ -203,10 +203,15 @@ pub(crate) struct QwpWsPublicationStore<Q = VolatileFrameQueue> {
     last_server_error: Option<QwpServerError>,
     rejected_frames: VecDeque<QwpRejectedFrame>,
     sender_errors: SenderErrorRing,
+    durable_ack: Option<DurableAckTracker>,
 }
 
 impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
     pub(crate) fn new(queue: Q, event_capacity: usize) -> Self {
+        Self::new_with_durable_ack(queue, event_capacity, false)
+    }
+
+    fn new_with_durable_ack(queue: Q, event_capacity: usize, durable_ack: bool) -> Self {
         Self {
             queue,
             events: DriverEventRing::new(event_capacity),
@@ -216,6 +221,7 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
             last_server_error: None,
             rejected_frames: VecDeque::new(),
             sender_errors: SenderErrorRing::new(event_capacity),
+            durable_ack: durable_ack.then(DurableAckTracker::new),
         }
     }
 
@@ -267,22 +273,41 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         response: TransportResponse,
     ) -> Result<DriveOutcome, DriverError> {
         match response {
-            TransportResponse::Ack { wire_seq } => {
-                let completed_before = self.queue.completed_fsn();
-                let fsn = send_cursor.fsn_for_wire_seq(wire_seq, WireResponseKind::Ack)?;
-                self.queue.complete_through(fsn)?;
-                send_cursor.ack_through(fsn);
-                let completed_after = self.queue.completed_fsn();
-                if completed_after > completed_before {
-                    self.push_event(DriverEvent::AckedThrough { fsn, wire_seq });
+            TransportResponse::Ack { wire_seq } => self.complete_ack_through(send_cursor, wire_seq),
+            TransportResponse::DurableOk {
+                wire_seq,
+                table_seq_txns,
+            } => {
+                if self.durable_ack.is_some() {
+                    self.apply_durable_ok(send_cursor, wire_seq, table_seq_txns)
+                } else {
+                    self.complete_ack_through(send_cursor, wire_seq)
                 }
-                Ok(DriveOutcome::Acked { wire_seq })
+            }
+            TransportResponse::DurableAck { table_seq_txns } => {
+                let Some(tracker) = self.durable_ack.as_mut() else {
+                    return Ok(DriveOutcome::Idle);
+                };
+                match tracker.apply_ack(table_seq_txns) {
+                    Some(completion) => self.complete_durable_through(send_cursor, completion),
+                    None => Ok(DriveOutcome::Idle),
+                }
             }
             TransportResponse::Reject { wire_seq, error } => {
                 let policy = server_error_policy(error.status);
                 let fsn = send_cursor.fsn_for_wire_seq(wire_seq, WireResponseKind::Reject)?;
-                if policy == QwpWsErrorPolicy::Halt {
-                    let sender_error = sender_error_for_qwp_error(&error, wire_seq, fsn, policy);
+                if policy == QwpWsErrorPolicy::Halt || self.durable_ack.is_some() {
+                    let applied_policy = if policy == QwpWsErrorPolicy::Halt {
+                        policy
+                    } else {
+                        // Durable drop-and-continue must enqueue an empty
+                        // placeholder behind preceding OKs. Until that path
+                        // exists, fail closed instead of trimming through
+                        // durable-pending frames.
+                        QwpWsErrorPolicy::Halt
+                    };
+                    let sender_error =
+                        sender_error_for_qwp_error(&error, wire_seq, fsn, applied_policy);
                     self.terminal_sender_error = Some(sender_error.clone());
                     self.sender_errors.push(sender_error);
                     self.last_server_error = Some(error.clone());
@@ -323,12 +348,71 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         }
     }
 
+    fn complete_ack_through(
+        &mut self,
+        send_cursor: &mut SendCursor,
+        wire_seq: u64,
+    ) -> Result<DriveOutcome, DriverError> {
+        let fsn = send_cursor.fsn_for_wire_seq(wire_seq, WireResponseKind::Ack)?;
+        self.complete_through(send_cursor, fsn, wire_seq)
+    }
+
+    fn apply_durable_ok(
+        &mut self,
+        send_cursor: &mut SendCursor,
+        wire_seq: u64,
+        table_seq_txns: Vec<TableSeqTxn>,
+    ) -> Result<DriveOutcome, DriverError> {
+        let fsn = send_cursor.fsn_for_wire_seq(wire_seq, WireResponseKind::Ack)?;
+        if self
+            .queue
+            .completed_fsn()
+            .is_some_and(|completed_fsn| fsn <= completed_fsn)
+        {
+            send_cursor.ack_through(fsn);
+            return Ok(DriveOutcome::Acked { wire_seq });
+        }
+        send_cursor.ack_through(fsn);
+        let tracker = self.durable_ack.as_mut().expect("durable ACK mode");
+        match tracker.enqueue_ok(wire_seq, fsn, table_seq_txns) {
+            Some(completion) => self.complete_durable_through(send_cursor, completion),
+            None => Ok(DriveOutcome::Idle),
+        }
+    }
+
+    fn complete_durable_through(
+        &mut self,
+        send_cursor: &mut SendCursor,
+        completion: DurableCompletion,
+    ) -> Result<DriveOutcome, DriverError> {
+        self.complete_through(send_cursor, completion.fsn, completion.wire_seq)
+    }
+
+    fn complete_through(
+        &mut self,
+        send_cursor: &mut SendCursor,
+        fsn: u64,
+        wire_seq: u64,
+    ) -> Result<DriveOutcome, DriverError> {
+        let completed_before = self.queue.completed_fsn();
+        self.queue.complete_through(fsn)?;
+        send_cursor.ack_through(fsn);
+        let completed_after = self.queue.completed_fsn();
+        if completed_after > completed_before {
+            self.push_event(DriverEvent::AckedThrough { fsn, wire_seq });
+        }
+        Ok(DriveOutcome::Acked { wire_seq })
+    }
+
     pub(crate) fn finish_reconnect_success(
         &mut self,
         send_cursor: &mut SendCursor,
         reason: ReconnectReason,
     ) -> DriveOutcome {
         send_cursor.restart(&self.queue);
+        if let Some(tracker) = self.durable_ack.as_mut() {
+            tracker.reset();
+        }
         self.push_event(DriverEvent::Reconnected { reason });
         DriveOutcome::Reconnected { reason }
     }
@@ -355,6 +439,17 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         }
         if matches!(status, QwpReceiptStatus::Published { .. })
             && let Some(wire_seq) = send_cursor.wire_seq_for_fsn(receipt.fsn)
+        {
+            return QwpReceiptStatus::Sent {
+                fsn: receipt.fsn,
+                wire_seq,
+            };
+        }
+        if matches!(status, QwpReceiptStatus::Published { .. })
+            && let Some(wire_seq) = self
+                .durable_ack
+                .as_ref()
+                .and_then(|tracker| tracker.pending_wire_seq_for_fsn(receipt.fsn))
         {
             return QwpReceiptStatus::Sent {
                 fsn: receipt.fsn,
@@ -691,6 +786,18 @@ impl<Q: PublicationLog, T: ManualDriverTransport> ManualDriverPrototype<Q, T> {
         let max_in_flight = queue.max_in_flight();
         Self {
             store: QwpWsPublicationStore::new(queue, event_capacity),
+            send_core: QwpWsSendCore::new(
+                transport,
+                max_in_flight,
+                ReconnectPolicy::no_backoff(Duration::MAX),
+            ),
+        }
+    }
+
+    fn from_queue_with_durable_ack(queue: Q, transport: T) -> Self {
+        let max_in_flight = queue.max_in_flight();
+        Self {
+            store: QwpWsPublicationStore::new_with_durable_ack(queue, DEFAULT_EVENT_CAPACITY, true),
             send_core: QwpWsSendCore::new(
                 transport,
                 max_in_flight,
@@ -1326,10 +1433,41 @@ fn decode_transport_response(
     }
 }
 
+fn decode_durable_transport_response(
+    payload: &[u8],
+) -> Result<Option<TransportResponse>, TransportFailure> {
+    let mut table_seq_txns = Vec::new();
+    let mut handler = |_, table: &str, seq_txn| {
+        table_seq_txns.push(TableSeqTxn {
+            table: table.to_string(),
+            seq_txn,
+        });
+        Ok(())
+    };
+    match codec::parse_pipelined_response_with_table_handler(payload, Some(&mut handler)) {
+        Ok(PipelinedResponse::Ok { sequence }) => Ok(Some(TransportResponse::DurableOk {
+            wire_seq: sequence,
+            table_seq_txns,
+        })),
+        Ok(PipelinedResponse::DurableAck) => {
+            Ok(Some(TransportResponse::DurableAck { table_seq_txns }))
+        }
+        Ok(PipelinedResponse::Error(error)) => {
+            let wire_seq = error.sequence;
+            let server_error = QwpServerError::from(error);
+            Ok(Some(TransportResponse::Reject {
+                wire_seq,
+                error: server_error,
+            }))
+        }
+        Err(err) => Err(TransportFailure::Terminal(err)),
+    }
+}
+
 #[cfg(feature = "sync-sender-qwp-ws")]
 impl ManualDriverTransport for BlockingQwpWsTransport {
     fn try_poll_response(&mut self) -> Result<Option<TransportResponse>, TransportFailure> {
-        if self.pending_wire_sequences.is_empty() {
+        if self.pending_wire_sequences.is_empty() && !*self.qwp_ws.request_durable_ack {
             return Ok(None);
         }
         match self.stream.can_read_without_blocking() {
@@ -1344,7 +1482,7 @@ impl ManualDriverTransport for BlockingQwpWsTransport {
     }
 
     fn poll_response(&mut self) -> Result<Option<TransportResponse>, TransportFailure> {
-        if self.pending_wire_sequences.is_empty() {
+        if self.pending_wire_sequences.is_empty() && !*self.qwp_ws.request_durable_ack {
             return Ok(None);
         }
 
@@ -1386,9 +1524,15 @@ impl ManualDriverTransport for BlockingQwpWsTransport {
             });
         }
 
-        let response = decode_transport_response(&self.recv)?;
+        let response = if *self.qwp_ws.request_durable_ack {
+            decode_durable_transport_response(&self.recv)?
+        } else {
+            decode_transport_response(&self.recv)?
+        };
         if let Some(
-            TransportResponse::Ack { wire_seq } | TransportResponse::Reject { wire_seq, .. },
+            TransportResponse::Ack { wire_seq }
+            | TransportResponse::DurableOk { wire_seq, .. }
+            | TransportResponse::Reject { wire_seq, .. },
         ) = &response
         {
             self.complete_pending_through(*wire_seq);
@@ -1671,6 +1815,13 @@ pub(crate) enum TransportResponse {
     Ack {
         wire_seq: u64,
     },
+    DurableOk {
+        wire_seq: u64,
+        table_seq_txns: Vec<TableSeqTxn>,
+    },
+    DurableAck {
+        table_seq_txns: Vec<TableSeqTxn>,
+    },
     Reject {
         wire_seq: u64,
         error: QwpServerError,
@@ -1691,6 +1842,107 @@ struct SenderErrorRing {
     errors: VecDeque<QwpWsSenderError>,
     capacity: usize,
     dropped_total: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TableSeqTxn {
+    pub(crate) table: String,
+    pub(crate) seq_txn: i64,
+}
+
+#[derive(Debug)]
+struct DurableAckTracker {
+    table_watermarks: HashMap<String, i64>,
+    pending: VecDeque<PendingDurableOk>,
+}
+
+#[derive(Debug)]
+struct PendingDurableOk {
+    wire_seq: u64,
+    fsn: u64,
+    table_seq_txns: Vec<TableSeqTxn>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DurableCompletion {
+    wire_seq: u64,
+    fsn: u64,
+}
+
+impl DurableAckTracker {
+    fn new() -> Self {
+        Self {
+            table_watermarks: HashMap::new(),
+            pending: VecDeque::new(),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.table_watermarks.clear();
+        self.pending.clear();
+    }
+
+    fn enqueue_ok(
+        &mut self,
+        wire_seq: u64,
+        fsn: u64,
+        table_seq_txns: Vec<TableSeqTxn>,
+    ) -> Option<DurableCompletion> {
+        self.pending.push_back(PendingDurableOk {
+            wire_seq,
+            fsn,
+            table_seq_txns,
+        });
+        self.drain_ready()
+    }
+
+    fn apply_ack(&mut self, table_seq_txns: Vec<TableSeqTxn>) -> Option<DurableCompletion> {
+        for entry in table_seq_txns {
+            match self.table_watermarks.get_mut(&entry.table) {
+                Some(current) if entry.seq_txn > *current => {
+                    *current = entry.seq_txn;
+                }
+                Some(_) => {}
+                None => {
+                    self.table_watermarks.insert(entry.table, entry.seq_txn);
+                }
+            }
+        }
+        self.drain_ready()
+    }
+
+    fn pending_wire_seq_for_fsn(&self, fsn: u64) -> Option<u64> {
+        self.pending
+            .iter()
+            .find(|entry| entry.fsn == fsn)
+            .map(|entry| entry.wire_seq)
+    }
+
+    fn drain_ready(&mut self) -> Option<DurableCompletion> {
+        let mut highest = None;
+        while self
+            .pending
+            .front()
+            .is_some_and(|entry| entry.is_covered_by(&self.table_watermarks))
+        {
+            let entry = self.pending.pop_front().unwrap();
+            highest = Some(DurableCompletion {
+                wire_seq: entry.wire_seq,
+                fsn: entry.fsn,
+            });
+        }
+        highest
+    }
+}
+
+impl PendingDurableOk {
+    fn is_covered_by(&self, table_watermarks: &HashMap<String, i64>) -> bool {
+        self.table_seq_txns.iter().all(|entry| {
+            table_watermarks
+                .get(&entry.table)
+                .is_some_and(|watermark| *watermark >= entry.seq_txn)
+        })
+    }
 }
 
 impl SenderErrorRing {
@@ -1895,6 +2147,23 @@ mod tests {
         ManualDriverPrototype::new(options(8, 1024, 4), server).unwrap()
     }
 
+    fn durable_driver(server: FakeOrderedServer) -> ManualDriverPrototype {
+        ManualDriverPrototype::from_queue_with_durable_ack(
+            VolatileFrameQueue::new(options(8, 1024, 4)).unwrap(),
+            server,
+        )
+    }
+
+    fn durable_driver_with_options(
+        options: VolatileQueueOptions,
+        server: FakeOrderedServer,
+    ) -> ManualDriverPrototype {
+        ManualDriverPrototype::from_queue_with_durable_ack(
+            VolatileFrameQueue::new(options).unwrap(),
+            server,
+        )
+    }
+
     fn driver_with_event_capacity(
         server: FakeOrderedServer,
         event_capacity: usize,
@@ -1943,17 +2212,38 @@ mod tests {
         payload
     }
 
+    fn qwp_durable_ack_payload(entries: &[(&str, i64)]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.push(codec::WS_STATUS_DURABLE_ACK);
+        append_table_seq_txns(&mut payload, entries);
+        payload
+    }
+
     fn qwp_ok_payload_with_table_entries(sequence: u64, entries: &[(&str, i64)]) -> Vec<u8> {
         let mut payload = Vec::new();
         payload.push(codec::WS_STATUS_OK);
         payload.extend_from_slice(&sequence.to_le_bytes());
+        append_table_seq_txns(&mut payload, entries);
+        payload
+    }
+
+    fn append_table_seq_txns(payload: &mut Vec<u8>, entries: &[(&str, i64)]) {
         payload.extend_from_slice(&(entries.len() as u16).to_le_bytes());
         for (table, seq_txn) in entries {
             payload.extend_from_slice(&(table.len() as u16).to_le_bytes());
             payload.extend_from_slice(table.as_bytes());
             payload.extend_from_slice(&seq_txn.to_le_bytes());
         }
-        payload
+    }
+
+    fn table_seq_txns(entries: &[(&str, i64)]) -> Vec<TableSeqTxn> {
+        entries
+            .iter()
+            .map(|(table, seq_txn)| TableSeqTxn {
+                table: (*table).to_string(),
+                seq_txn: *seq_txn,
+            })
+            .collect()
     }
 
     fn drain_events<Q: PublicationLog, T: ManualDriverTransport>(
@@ -2921,6 +3211,475 @@ mod tests {
         assert_eq!(
             alloc_count, 0,
             "Expected zero allocations for non-durable OK decode, got {alloc_count}"
+        );
+    }
+
+    #[test]
+    fn durable_decode_preserves_ok_and_durable_ack_table_entries() {
+        let ok_payload = qwp_ok_payload_with_table_entries(7, &[("table_a", 42)]);
+        assert_eq!(
+            decode_durable_transport_response(&ok_payload).unwrap(),
+            Some(TransportResponse::DurableOk {
+                wire_seq: 7,
+                table_seq_txns: table_seq_txns(&[("table_a", 42)])
+            })
+        );
+
+        let durable_ack_payload = qwp_durable_ack_payload(&[("table_a", 42), ("table_b", 99)]);
+        assert_eq!(
+            decode_durable_transport_response(&durable_ack_payload).unwrap(),
+            Some(TransportResponse::DurableAck {
+                table_seq_txns: table_seq_txns(&[("table_a", 42), ("table_b", 99)])
+            })
+        );
+    }
+
+    #[test]
+    fn durable_ok_releases_send_window_without_completing_receipt() {
+        let mut server = FakeOrderedServer::no_response();
+        server.push_response(TransportResponse::DurableOk {
+            wire_seq: 0,
+            table_seq_txns: table_seq_txns(&[("trades", 10)]),
+        });
+        let mut driver = durable_driver_with_options(options(4, 1024, 1), server);
+        let first = driver.try_submit(b"first").unwrap();
+        let second = driver.try_submit(b"second").unwrap();
+
+        assert!(matches!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Sent(_)
+        ));
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
+
+        assert_eq!(driver.acked_fsn(), None);
+        assert_eq!(
+            driver.receipt_status(first),
+            QwpReceiptStatus::Sent {
+                fsn: 0,
+                wire_seq: 0
+            }
+        );
+        assert_eq!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Sent(SentFrame {
+                fsn: 1,
+                wire_seq: 1,
+                payload_len: 6,
+            })
+        );
+        assert_eq!(
+            driver.receipt_status(second),
+            QwpReceiptStatus::Sent {
+                fsn: 1,
+                wire_seq: 1
+            }
+        );
+    }
+
+    #[test]
+    fn durable_ack_covering_pending_ok_advances_acked_fsn() {
+        let mut driver = durable_driver(FakeOrderedServer::no_response());
+        let receipt = driver.try_submit(b"payload").unwrap();
+
+        assert!(matches!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Sent(_)
+        ));
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableOk {
+                wire_seq: 0,
+                table_seq_txns: table_seq_txns(&[("trades", 10)]),
+            });
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
+
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableAck {
+                table_seq_txns: table_seq_txns(&[("trades", 10)]),
+            });
+        assert_eq!(
+            driver.drive_receive_once().unwrap(),
+            DriveOutcome::Acked { wire_seq: 0 }
+        );
+
+        assert_eq!(driver.acked_fsn(), Some(0));
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Acked { fsn: 0 }
+        );
+    }
+
+    #[test]
+    fn durable_ack_does_not_skip_earlier_pending_ok_gap() {
+        let mut driver = durable_driver(FakeOrderedServer::no_response());
+        let first = driver.try_submit(b"first").unwrap();
+        let second = driver.try_submit(b"second").unwrap();
+
+        assert!(matches!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Sent(SentFrame { wire_seq: 0, .. })
+        ));
+        assert!(matches!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Sent(SentFrame { wire_seq: 1, .. })
+        ));
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableOk {
+                wire_seq: 0,
+                table_seq_txns: table_seq_txns(&[("a", 10)]),
+            });
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableOk {
+                wire_seq: 1,
+                table_seq_txns: table_seq_txns(&[("b", 20)]),
+            });
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
+
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableAck {
+                table_seq_txns: table_seq_txns(&[("b", 20)]),
+            });
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
+        assert_eq!(driver.acked_fsn(), None);
+
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableAck {
+                table_seq_txns: table_seq_txns(&[("a", 10)]),
+            });
+        assert_eq!(
+            driver.drive_receive_once().unwrap(),
+            DriveOutcome::Acked { wire_seq: 1 }
+        );
+
+        assert_eq!(
+            driver.receipt_status(first),
+            QwpReceiptStatus::Acked { fsn: 0 }
+        );
+        assert_eq!(
+            driver.receipt_status(second),
+            QwpReceiptStatus::Acked { fsn: 1 }
+        );
+    }
+
+    #[test]
+    fn durable_empty_ok_waits_behind_prior_non_empty_ok() {
+        let mut driver = durable_driver(FakeOrderedServer::no_response());
+        let first = driver.try_submit(b"first").unwrap();
+        let second = driver.try_submit(b"second").unwrap();
+
+        driver.drive_send_once().unwrap();
+        driver.drive_send_once().unwrap();
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableOk {
+                wire_seq: 0,
+                table_seq_txns: table_seq_txns(&[("trades", 10)]),
+            });
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableOk {
+                wire_seq: 1,
+                table_seq_txns: Vec::new(),
+            });
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
+        assert_eq!(driver.acked_fsn(), None);
+
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableAck {
+                table_seq_txns: table_seq_txns(&[("trades", 10)]),
+            });
+        assert_eq!(
+            driver.drive_receive_once().unwrap(),
+            DriveOutcome::Acked { wire_seq: 1 }
+        );
+
+        assert_eq!(
+            driver.receipt_status(first),
+            QwpReceiptStatus::Acked { fsn: 0 }
+        );
+        assert_eq!(
+            driver.receipt_status(second),
+            QwpReceiptStatus::Acked { fsn: 1 }
+        );
+    }
+
+    #[test]
+    fn stale_durable_ack_watermark_does_not_move_tracker_backwards() {
+        let mut driver = durable_driver(FakeOrderedServer::no_response());
+        let first = driver.try_submit(b"first").unwrap();
+        let second = driver.try_submit(b"second").unwrap();
+
+        driver.drive_send_once().unwrap();
+        driver.drive_send_once().unwrap();
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableOk {
+                wire_seq: 0,
+                table_seq_txns: table_seq_txns(&[("trades", 10)]),
+            });
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableAck {
+                table_seq_txns: table_seq_txns(&[("trades", 10)]),
+            });
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
+        assert_eq!(
+            driver.drive_receive_once().unwrap(),
+            DriveOutcome::Acked { wire_seq: 0 }
+        );
+
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableOk {
+                wire_seq: 1,
+                table_seq_txns: table_seq_txns(&[("trades", 12)]),
+            });
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableAck {
+                table_seq_txns: table_seq_txns(&[("trades", 9)]),
+            });
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
+        assert_eq!(
+            driver.receipt_status(second),
+            QwpReceiptStatus::Sent {
+                fsn: 1,
+                wire_seq: 1
+            }
+        );
+
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableAck {
+                table_seq_txns: table_seq_txns(&[("trades", 12)]),
+            });
+        assert_eq!(
+            driver.drive_receive_once().unwrap(),
+            DriveOutcome::Acked { wire_seq: 1 }
+        );
+        assert_eq!(
+            driver.receipt_status(first),
+            QwpReceiptStatus::Acked { fsn: 0 }
+        );
+        assert_eq!(
+            driver.receipt_status(second),
+            QwpReceiptStatus::Acked { fsn: 1 }
+        );
+    }
+
+    #[test]
+    fn durable_ack_before_ok_drains_when_ok_later_arrives() {
+        let mut driver = durable_driver(FakeOrderedServer::no_response());
+        let receipt = driver.try_submit(b"payload").unwrap();
+
+        driver.drive_send_once().unwrap();
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableAck {
+                table_seq_txns: table_seq_txns(&[("trades", 10)]),
+            });
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
+
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableOk {
+                wire_seq: 0,
+                table_seq_txns: table_seq_txns(&[("trades", 10)]),
+            });
+        assert_eq!(
+            driver.drive_receive_once().unwrap(),
+            DriveOutcome::Acked { wire_seq: 0 }
+        );
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Acked { fsn: 0 }
+        );
+    }
+
+    #[test]
+    fn stale_durable_ok_after_completion_does_not_reblock_tracker() {
+        let mut driver = durable_driver(FakeOrderedServer::no_response());
+        let first = driver.try_submit(b"first").unwrap();
+        let second = driver.try_submit(b"second").unwrap();
+
+        driver.drive_send_once().unwrap();
+        driver.drive_send_once().unwrap();
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableOk {
+                wire_seq: 0,
+                table_seq_txns: table_seq_txns(&[("trades", 10)]),
+            });
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableAck {
+                table_seq_txns: table_seq_txns(&[("trades", 10)]),
+            });
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
+        assert_eq!(
+            driver.drive_receive_once().unwrap(),
+            DriveOutcome::Acked { wire_seq: 0 }
+        );
+
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableOk {
+                wire_seq: 0,
+                table_seq_txns: table_seq_txns(&[("trades", 99)]),
+            });
+        assert_eq!(
+            driver.drive_receive_once().unwrap(),
+            DriveOutcome::Acked { wire_seq: 0 }
+        );
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableOk {
+                wire_seq: 1,
+                table_seq_txns: table_seq_txns(&[("trades", 12)]),
+            });
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableAck {
+                table_seq_txns: table_seq_txns(&[("trades", 12)]),
+            });
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
+        assert_eq!(
+            driver.drive_receive_once().unwrap(),
+            DriveOutcome::Acked { wire_seq: 1 }
+        );
+
+        assert_eq!(
+            driver.receipt_status(first),
+            QwpReceiptStatus::Acked { fsn: 0 }
+        );
+        assert_eq!(
+            driver.receipt_status(second),
+            QwpReceiptStatus::Acked { fsn: 1 }
+        );
+    }
+
+    #[test]
+    fn durable_reconnect_clears_pending_ok_tracking_for_replay() {
+        let mut driver = durable_driver(FakeOrderedServer::no_response());
+        let receipt = driver.try_submit(b"payload").unwrap();
+
+        assert_eq!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Sent(SentFrame {
+                fsn: 0,
+                wire_seq: 0,
+                payload_len: 7,
+            })
+        );
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableOk {
+                wire_seq: 0,
+                table_seq_txns: table_seq_txns(&[("trades", 10)]),
+            });
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Sent {
+                fsn: 0,
+                wire_seq: 0
+            }
+        );
+
+        assert_eq!(
+            driver.store.finish_reconnect_success(
+                &mut driver.send_core.send_cursor,
+                ReconnectReason::Disconnect
+            ),
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::Disconnect
+            }
+        );
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Published { fsn: 0 }
+        );
+        assert_eq!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Sent(SentFrame {
+                fsn: 0,
+                wire_seq: 0,
+                payload_len: 7,
+            })
+        );
+    }
+
+    #[test]
+    fn durable_reject_and_continue_policy_fails_closed_until_ordered_drop_is_implemented() {
+        let mut driver = durable_driver(FakeOrderedServer::no_response());
+        let first = driver.try_submit(b"first").unwrap();
+        let second = driver.try_submit(b"second").unwrap();
+
+        driver.drive_send_once().unwrap();
+        driver.drive_send_once().unwrap();
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableOk {
+                wire_seq: 0,
+                table_seq_txns: table_seq_txns(&[("trades", 10)]),
+            });
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::Reject {
+                wire_seq: 1,
+                error: QwpServerError {
+                    status: codec::WS_STATUS_SCHEMA_MISMATCH,
+                    message: "schema changed".to_string(),
+                    error: Error::new(ErrorCode::InvalidApiCall, "schema changed"),
+                },
+            });
+
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Terminal);
+        assert_eq!(
+            driver.receipt_status(first),
+            QwpReceiptStatus::Terminal { fsn: 0 }
+        );
+        assert_eq!(
+            driver.receipt_status(second),
+            QwpReceiptStatus::Terminal { fsn: 1 }
+        );
+        assert_eq!(
+            driver.terminal_sender_error().map(|err| err.applied_policy),
+            Some(QwpWsErrorPolicy::Halt)
         );
     }
 

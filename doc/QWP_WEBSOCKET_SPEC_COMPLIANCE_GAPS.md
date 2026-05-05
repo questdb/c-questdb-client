@@ -2,9 +2,11 @@
 
 Date: 2026-05-05
 
-Status: audit handoff, updated after the first Rust implementation slice.
-Response parser completeness has been addressed in the current working tree;
-durable ACK behavior is still not implemented.
+Status: audit handoff, updated after the parser-completeness and internal
+durable-ACK-tracker implementation slices. Response parser completeness has
+been addressed in the current working tree; public durable ACK mode remains
+disabled while handshake validation, keepalive/read-loop behavior, and durable
+rejection handling are unfinished.
 
 This document records gaps found while comparing the Rust QWP/WebSocket
 Store-and-Forward implementation against the current QWP spec documents in:
@@ -63,7 +65,8 @@ new SF client spec.
 
 The largest missing areas are:
 
-- durable ACK mode,
+- public durable ACK enablement: upgrade echo validation, keepalive/read-loop
+  behavior, and durable rejection handling,
 - connect-string compatibility and strict key handling,
 - Java/spec close, retry, and orphan-drainer semantics,
 - several SFA disk-format/recovery details where the spec and Java reference
@@ -76,7 +79,7 @@ routing, CRC-last SFA append order, and recovery gap checks.
 
 ## Confirmed Rust Gaps
 
-### 1. Durable ACK mode is not implemented
+### 1. Public durable ACK mode is not enabled
 
 Spec requirements:
 
@@ -100,8 +103,21 @@ Rust state:
   upgrade response but does not check `X-QWP-Durable-Ack`.
 - `questdb-rs/src/ingress/sender/qwp_ws_codec.rs` parses OK and durable ACK
   table-watermark payloads.
-- `questdb-rs/src/ingress/sender/qwp_ws_driver.rs:270-274` trims on ordinary
-  OK.
+- `questdb-rs/src/ingress/sender/qwp_ws_driver.rs` now has an internal
+  durable ACK tracker: durable OK releases the send window without completing
+  the publication log, durable ACK watermarks drain consecutive covered OKs,
+  empty OKs wait behind earlier non-empty OKs, stale durable watermarks do not
+  move backwards, and reconnect clears pending durable state for replay.
+- The internal durable rejection path currently fails closed for
+  drop-and-continue server rejections. Before public enablement, this still
+  needs Java-compatible ordered empty-placeholder handling so a rejected batch
+  cannot trim through earlier durable-pending OKs.
+- Before public enablement, validate that durable-mode OK frames are emitted
+  per sent message, with table entries for that message. If the server can
+  coalesce/cumulate durable-mode OKs without emitting the skipped OK table
+  entries, the tracker needs an explicit protocol decision because it cannot
+  safely infer missing per-batch table watermarks.
+- The non-durable path still trims on ordinary OK.
 
 Java reference:
 
@@ -133,17 +149,18 @@ User exposure:
   watermark (`onAcked(ackedFsn)` in Java). In durable ACK mode that watermark
   advances only after durable ACK coverage, so user code does not need a
   separate durable-ack event stream.
-- Current Rust exposes only the config spellings: `request_durable_ack=off` is
-  accepted, `request_durable_ack=on` is rejected, and
-  `durable_ack_keepalive_interval_millis` is parsed but inert while durable
-  ACK is unsupported.
+- Current Rust exposes only the config spellings publicly:
+  `request_durable_ack=off` is accepted, `request_durable_ack=on` is rejected,
+  and `durable_ack_keepalive_interval_millis` is parsed but inert while public
+  durable ACK mode is disabled.
 
 Implementation direction:
 
 1. Validate durable ACK upgrade echo when requested.
-2. In durable mode, stash OK table watermarks and advance `acked_fsn` only when
-   durable ACK watermarks cover consecutive pending entries.
-3. Keep rejecting `request_durable_ack=on` until all of the above is true.
+2. Implement Java-compatible durable-mode drop-and-continue rejection handling.
+3. Implement durable keepalive PINGs and make the read loop keep polling while
+   durable confirmations are pending.
+4. Keep rejecting `request_durable_ack=on` until all of the above is true.
 
 ### 2. OK response parsing was incomplete (addressed)
 
@@ -155,25 +172,26 @@ Spec requirements:
 
 Previous Rust state:
 
-- `questdb-rs/src/ingress/sender/qwp_ws_codec.rs:324-329` accepts any OK frame
+- Before the parser-completeness slice, the Rust parser accepted any OK frame
   with only status plus 8-byte sequence.
-- It returns only `sequence`, dropping `tableCount` and table `seqTxn`
+- It returned only `sequence`, dropping `tableCount` and table `seqTxn`
   watermarks.
 
 Previous impact:
 
 - Truncated OK frames are accepted.
-- Durable ACK mode cannot be implemented correctly because the OK-side
-  per-table `seqTxn` data is missing.
+- Durable ACK mode could not be implemented correctly because the OK-side
+  per-table `seqTxn` data was missing.
 
 Current working-tree state:
 
 - OK parsing can expose parsed table entries through a callback.
 - OK requires status, sequence, and table count.
 - Table entry lengths and UTF-8 table names are validated.
-- The current non-durable driver path validates table-entry bytes without
-  allocating table-name strings. A callback parser exposes table watermarks to
-  future durable ACK mode only when the caller needs to retain them.
+- The non-durable driver path validates table-entry bytes without allocating
+  table-name strings.
+- The durable decode path retains parsed table watermarks for the internal
+  durable ACK tracker, but public durable ACK mode remains disabled.
 
 ### 3. Error response message length was not capped at 1024 (addressed)
 
@@ -183,8 +201,8 @@ Spec requirement:
 
 Previous Rust state:
 
-- `questdb-rs/src/ingress/sender/qwp_ws_codec.rs:345-364` accepts any `u16`
-  message length that fits in the received frame and is UTF-8.
+- Before the error-frame slice, the Rust parser accepted any `u16` message
+  length that fit in the received frame and was UTF-8.
 
 Current working-tree state:
 
@@ -242,7 +260,7 @@ Rust state:
   `max_schemas_per_connection`.
 - `questdb-rs/src/ingress.rs:561-563` accepts
   `durable_ack_keepalive_interval_millis` but it is behaviorally inert while
-  durable ACK is unsupported.
+  public durable ACK mode is disabled.
 - `questdb-rs/src/ingress.rs:565-567` parses `drain_orphans` and
   `max_background_drainers`, but enabled orphan draining is unsupported.
 - `questdb-rs/src/ingress.rs:569-572` rejects `error_inbox_capacity`.
@@ -619,9 +637,12 @@ new evidence:
 
 1. Resolve spec/reference mismatches first:
    `sf-initial.sfa`, unknown-key policy.
-2. Implement durable ACK mode behind the existing explicit rejection, using
-   the now-parsed OK and durable ACK table watermarks plus durable keepalive
-   PINGs.
+2. Finish public durable ACK enablement behind the existing explicit
+   rejection: validate upgrade echo, implement Java-compatible ordered
+   empty-placeholder handling for durable-mode drop-and-continue rejections,
+   implement durable keepalive PINGs/read-loop polling while durable
+   confirmations are pending, and validate the durable OK
+   emission/coalescing contract.
 3. Implement Java-compatible close semantics and then accept
    `close_flush_timeout_millis`.
 4. Implement ACK clamping and ACK-timeout reconnect.
