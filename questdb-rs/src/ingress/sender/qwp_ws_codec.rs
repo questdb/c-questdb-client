@@ -315,20 +315,52 @@ pub(super) enum PipelinedResponse {
     Error(PipelinedError),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PipelinedTableEntryKind {
+    Ok,
+    DurableAck,
+}
+
 pub(super) fn parse_pipelined_response(payload: &[u8]) -> crate::Result<PipelinedResponse> {
+    parse_pipelined_response_with_table_handler(payload, None)
+}
+
+type PipelinedTableEntryHandler<'a> =
+    &'a mut dyn FnMut(PipelinedTableEntryKind, &str, i64) -> crate::Result<()>;
+
+pub(super) fn parse_pipelined_response_with_table_handler(
+    payload: &[u8],
+    on_table_entry: Option<PipelinedTableEntryHandler<'_>>,
+) -> crate::Result<PipelinedResponse> {
     if payload.is_empty() {
         return Err(error::fmt!(SocketError, "Empty QWP response frame"));
     }
     let status = payload[0];
     match status {
         WS_STATUS_OK => {
-            if payload.len() < 1 + 8 {
+            if payload.len() < 1 + 8 + 2 {
                 return Err(error::fmt!(SocketError, "QWP OK response truncated"));
             }
             let seq = u64::from_le_bytes(payload[1..9].try_into().unwrap());
+            handle_table_seq_txn_entries(
+                payload,
+                9,
+                "QWP OK response",
+                PipelinedTableEntryKind::Ok,
+                on_table_entry,
+            )?;
             Ok(PipelinedResponse::Ok { sequence: seq })
         }
-        WS_STATUS_DURABLE_ACK => Ok(PipelinedResponse::DurableAck),
+        WS_STATUS_DURABLE_ACK => {
+            handle_table_seq_txn_entries(
+                payload,
+                1,
+                "QWP durable ACK response",
+                PipelinedTableEntryKind::DurableAck,
+                on_table_entry,
+            )?;
+            Ok(PipelinedResponse::DurableAck)
+        }
         _ => {
             let (sequence, msg) = parse_error_body(payload)?;
             let err = map_error_status(status, &msg);
@@ -342,12 +374,105 @@ pub(super) fn parse_pipelined_response(payload: &[u8]) -> crate::Result<Pipeline
     }
 }
 
+fn handle_table_seq_txn_entries(
+    payload: &[u8],
+    table_count_offset: usize,
+    context: &str,
+    kind: PipelinedTableEntryKind,
+    on_entry: Option<PipelinedTableEntryHandler<'_>>,
+) -> crate::Result<()> {
+    validate_table_seq_txn_entries(payload, table_count_offset, context)?;
+    if let Some(on_entry) = on_entry {
+        visit_table_seq_txn_entries(
+            payload,
+            table_count_offset,
+            context,
+            &mut |table, seq_txn| on_entry(kind, table, seq_txn),
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_table_seq_txn_entries(
+    payload: &[u8],
+    table_count_offset: usize,
+    context: &str,
+) -> crate::Result<()> {
+    visit_table_seq_txn_entries(payload, table_count_offset, context, &mut |_, _| Ok(()))
+}
+
+fn visit_table_seq_txn_entries(
+    payload: &[u8],
+    table_count_offset: usize,
+    context: &str,
+    on_entry: &mut impl FnMut(&str, i64) -> crate::Result<()>,
+) -> crate::Result<()> {
+    let table_count_end = table_count_offset
+        .checked_add(2)
+        .ok_or_else(|| error::fmt!(SocketError, "{context} table count offset overflow"))?;
+    if payload.len() < table_count_end {
+        return Err(error::fmt!(SocketError, "{context} truncated"));
+    }
+
+    let table_count = u16::from_le_bytes(
+        payload[table_count_offset..table_count_end]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let mut pos = table_count_end;
+    for _ in 0..table_count {
+        let name_len_end = pos
+            .checked_add(2)
+            .ok_or_else(|| error::fmt!(SocketError, "{context} table entry offset overflow"))?;
+        if payload.len() < name_len_end {
+            return Err(error::fmt!(SocketError, "{context} table entry truncated"));
+        }
+        let name_len = u16::from_le_bytes(payload[pos..name_len_end].try_into().unwrap()) as usize;
+        pos = name_len_end;
+        if name_len == 0 {
+            return Err(error::fmt!(SocketError, "{context} table name is empty"));
+        }
+
+        let name_end = pos
+            .checked_add(name_len)
+            .ok_or_else(|| error::fmt!(SocketError, "{context} table name length overflow"))?;
+        let seq_txn_end = name_end
+            .checked_add(8)
+            .ok_or_else(|| error::fmt!(SocketError, "{context} table entry length overflow"))?;
+        if payload.len() < seq_txn_end {
+            return Err(error::fmt!(SocketError, "{context} table entry truncated"));
+        }
+
+        let table = std::str::from_utf8(&payload[pos..name_end])
+            .map_err(|_| error::fmt!(SocketError, "{context} table name is not UTF-8"))?;
+        let seq_txn = i64::from_le_bytes(payload[name_end..seq_txn_end].try_into().unwrap());
+        on_entry(table, seq_txn)?;
+        pos = seq_txn_end;
+    }
+
+    if pos != payload.len() {
+        return Err(error::fmt!(
+            SocketError,
+            "{context} has trailing bytes after table entries"
+        ));
+    }
+
+    Ok(())
+}
+
 fn parse_error_body(payload: &[u8]) -> crate::Result<(u64, String)> {
     if payload.len() < 1 + 8 + 2 {
         return Err(error::fmt!(SocketError, "QWP error response truncated"));
     }
     let seq = u64::from_le_bytes(payload[1..9].try_into().unwrap());
     let msg_len = u16::from_le_bytes(payload[9..11].try_into().unwrap()) as usize;
+    if msg_len > 1024 {
+        return Err(error::fmt!(
+            SocketError,
+            "QWP error response message too long (declared {} bytes, max 1024)",
+            msg_len
+        ));
+    }
     let msg_end = 11usize
         .checked_add(msg_len)
         .ok_or_else(|| error::fmt!(SocketError, "QWP error response message length overflow"))?;
@@ -356,6 +481,12 @@ fn parse_error_body(payload: &[u8]) -> crate::Result<(u64, String)> {
             SocketError,
             "QWP error response truncated (declared {} bytes)",
             msg_len
+        ));
+    }
+    if payload.len() != msg_end {
+        return Err(error::fmt!(
+            SocketError,
+            "QWP error response has trailing bytes after message"
         ));
     }
     let msg = std::str::from_utf8(&payload[11..msg_end])
@@ -420,5 +551,172 @@ mod tests {
         let big = vec![0u8; 70_000];
         write_frame_to_buf(&mut out, true, WS_OPCODE_BINARY, &big, mask);
         assert_eq!(out[1] & 0x7F, 127);
+    }
+
+    #[test]
+    fn ok_response_requires_table_count() {
+        let mut payload = vec![WS_STATUS_OK];
+        payload.extend_from_slice(&7u64.to_le_bytes());
+
+        assert!(parse_pipelined_response(&payload).is_err());
+    }
+
+    #[test]
+    fn ok_response_parses_table_entries() {
+        let mut payload = vec![WS_STATUS_OK];
+        payload.extend_from_slice(&7u64.to_le_bytes());
+        append_table_entries(&mut payload, &[("table_a", 42), ("table_b", -7)]);
+
+        let mut table_seq_txns = Vec::new();
+        let mut handler = |kind, table: &str, seq_txn| {
+            table_seq_txns.push((kind, table.to_string(), seq_txn));
+            Ok(())
+        };
+        match parse_pipelined_response_with_table_handler(&payload, Some(&mut handler)).unwrap() {
+            PipelinedResponse::Ok { sequence } => {
+                assert_eq!(sequence, 7);
+                assert_eq!(
+                    table_seq_txns,
+                    vec![
+                        (PipelinedTableEntryKind::Ok, "table_a".to_string(), 42),
+                        (PipelinedTableEntryKind::Ok, "table_b".to_string(), -7),
+                    ]
+                );
+            }
+            _ => panic!("expected OK response"),
+        }
+    }
+
+    #[test]
+    fn non_durable_ok_response_validates_without_returning_table_entries() {
+        let mut payload = vec![WS_STATUS_OK];
+        payload.extend_from_slice(&7u64.to_le_bytes());
+        append_table_entries(&mut payload, &[("table_a", 42), ("table_b", -7)]);
+
+        match parse_pipelined_response(&payload).unwrap() {
+            PipelinedResponse::Ok { sequence } => assert_eq!(sequence, 7),
+            _ => panic!("expected OK response"),
+        }
+    }
+
+    #[test]
+    fn durable_ack_response_requires_table_count() {
+        assert!(parse_pipelined_response(&[WS_STATUS_DURABLE_ACK]).is_err());
+    }
+
+    #[test]
+    fn durable_ack_response_parses_table_entries() {
+        let mut payload = vec![WS_STATUS_DURABLE_ACK];
+        append_table_entries(&mut payload, &[("wal_table", 123)]);
+
+        let mut table_seq_txns = Vec::new();
+        let mut handler = |kind, table: &str, seq_txn| {
+            table_seq_txns.push((kind, table.to_string(), seq_txn));
+            Ok(())
+        };
+        match parse_pipelined_response_with_table_handler(&payload, Some(&mut handler)).unwrap() {
+            PipelinedResponse::DurableAck => {
+                assert_eq!(
+                    table_seq_txns,
+                    vec![(
+                        PipelinedTableEntryKind::DurableAck,
+                        "wal_table".to_string(),
+                        123
+                    )]
+                );
+            }
+            _ => panic!("expected durable ACK response"),
+        }
+    }
+
+    #[test]
+    fn table_entries_reject_trailing_bytes() {
+        let mut payload = vec![WS_STATUS_DURABLE_ACK];
+        append_table_entries(&mut payload, &[]);
+        payload.push(0);
+
+        assert!(parse_pipelined_response(&payload).is_err());
+    }
+
+    #[test]
+    fn table_entry_handler_is_not_called_for_structurally_invalid_payload() {
+        let mut payload = vec![WS_STATUS_DURABLE_ACK];
+        append_table_entries(&mut payload, &[("wal_table", 123)]);
+        payload.push(0);
+
+        let mut calls = 0;
+        let mut handler = |_, _: &str, _| {
+            calls += 1;
+            Ok(())
+        };
+        assert!(parse_pipelined_response_with_table_handler(&payload, Some(&mut handler)).is_err());
+        assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn table_entries_reject_non_utf8_names() {
+        let mut payload = vec![WS_STATUS_DURABLE_ACK];
+        payload.extend_from_slice(&1u16.to_le_bytes());
+        payload.extend_from_slice(&1u16.to_le_bytes());
+        payload.push(0xff);
+        payload.extend_from_slice(&1i64.to_le_bytes());
+
+        assert!(parse_pipelined_response(&payload).is_err());
+    }
+
+    #[test]
+    fn table_entries_reject_empty_names() {
+        let mut payload = vec![WS_STATUS_DURABLE_ACK];
+        payload.extend_from_slice(&1u16.to_le_bytes());
+        payload.extend_from_slice(&0u16.to_le_bytes());
+        payload.extend_from_slice(&1i64.to_le_bytes());
+
+        assert!(parse_pipelined_response(&payload).is_err());
+    }
+
+    #[test]
+    fn error_response_rejects_messages_over_1024_bytes() {
+        let mut payload = vec![WS_STATUS_INTERNAL_ERROR];
+        payload.extend_from_slice(&7u64.to_le_bytes());
+        payload.extend_from_slice(&1025u16.to_le_bytes());
+        payload.extend(std::iter::repeat(b'x').take(1025));
+
+        assert!(parse_pipelined_response(&payload).is_err());
+    }
+
+    #[test]
+    fn error_response_accepts_1024_byte_message() {
+        let mut payload = vec![WS_STATUS_INTERNAL_ERROR];
+        payload.extend_from_slice(&7u64.to_le_bytes());
+        payload.extend_from_slice(&1024u16.to_le_bytes());
+        payload.extend(std::iter::repeat(b'x').take(1024));
+
+        match parse_pipelined_response(&payload).unwrap() {
+            PipelinedResponse::Error(error) => {
+                assert_eq!(error.sequence, 7);
+                assert_eq!(error.message.len(), 1024);
+            }
+            _ => panic!("expected error response"),
+        }
+    }
+
+    #[test]
+    fn error_response_rejects_trailing_bytes() {
+        let mut payload = vec![WS_STATUS_INTERNAL_ERROR];
+        payload.extend_from_slice(&7u64.to_le_bytes());
+        payload.extend_from_slice(&3u16.to_le_bytes());
+        payload.extend_from_slice(b"bad");
+        payload.push(0);
+
+        assert!(parse_pipelined_response(&payload).is_err());
+    }
+
+    fn append_table_entries(payload: &mut Vec<u8>, entries: &[(&str, i64)]) {
+        payload.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for (table, seq_txn) in entries {
+            payload.extend_from_slice(&(table.len() as u16).to_le_bytes());
+            payload.extend_from_slice(table.as_bytes());
+            payload.extend_from_slice(&seq_txn.to_le_bytes());
+        }
     }
 }

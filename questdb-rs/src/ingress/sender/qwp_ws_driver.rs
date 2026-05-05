@@ -1943,6 +1943,19 @@ mod tests {
         payload
     }
 
+    fn qwp_ok_payload_with_table_entries(sequence: u64, entries: &[(&str, i64)]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.push(codec::WS_STATUS_OK);
+        payload.extend_from_slice(&sequence.to_le_bytes());
+        payload.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for (table, seq_txn) in entries {
+            payload.extend_from_slice(&(table.len() as u16).to_le_bytes());
+            payload.extend_from_slice(table.as_bytes());
+            payload.extend_from_slice(&seq_txn.to_le_bytes());
+        }
+        payload
+    }
+
     fn drain_events<Q: PublicationLog, T: ManualDriverTransport>(
         driver: &mut ManualDriverPrototype<Q, T>,
     ) -> Vec<DriverEvent> {
@@ -2883,6 +2896,32 @@ mod tests {
                 other => panic!("unexpected response: {other:?}"),
             }
         }
+    }
+
+    /// `cargo test --features sync-sender-qwp-ws --lib non_durable_ok_decode_with_table_entries_zero_alloc_after_warmup -- --ignored --test-threads=1`
+    #[test]
+    #[ignore = "uses the process-global allocation counter"]
+    fn non_durable_ok_decode_with_table_entries_zero_alloc_after_warmup() {
+        use crate::alloc_counter;
+
+        let payload = qwp_ok_payload_with_table_entries(7, &[("table_a", 42), ("table_b", -7)]);
+        assert!(matches!(
+            decode_transport_response(&payload).unwrap(),
+            Some(TransportResponse::Ack { wire_seq: 7 })
+        ));
+
+        alloc_counter::start_counting();
+        let response = decode_transport_response(&payload).unwrap();
+        let alloc_count = alloc_counter::stop_counting();
+
+        assert!(matches!(
+            response,
+            Some(TransportResponse::Ack { wire_seq: 7 })
+        ));
+        assert_eq!(
+            alloc_count, 0,
+            "Expected zero allocations for non-durable OK decode, got {alloc_count}"
+        );
     }
 
     #[test]
