@@ -49,8 +49,8 @@ use super::qwp_ws::{WsStream, establish_connection, write_binary_frame};
 use super::qwp_ws_codec::WS_OPCODE_BINARY;
 use super::qwp_ws_codec::{self as codec, PipelinedResponse};
 use super::qwp_ws_queue::{
-    LockFreePublishError, LockFreeVolatileProducer, LockFreeVolatilePublicationLog,
-    OutboundFrame, QueueError, QwpReceipt, QwpReceiptStatus, SentFrame, SharedPayload,
+    LockFreePublishError, LockFreeVolatileProducer, LockFreeVolatilePublicationLog, OutboundFrame,
+    OutboundFrameView, PendingPayload, QueueError, QwpReceipt, QwpReceiptStatus, SentFrame,
     VolatileFrameQueue, VolatileQueueOptions,
 };
 use super::qwp_ws_ownership::{QwpWsErrorCategory, QwpWsErrorPolicy, QwpWsSenderError};
@@ -448,7 +448,7 @@ impl<T: ManualDriverTransport> QwpWsSendCore<T> {
         outbound: OutboundFrame,
     ) -> (SentFrame, Result<TransportSendResult, TransportFailure>) {
         let frame = outbound.sent_frame();
-        let result = self.transport.send_frame(outbound);
+        let result = outbound.with_view(|view| self.transport.send_frame(view));
         (frame, result)
     }
 
@@ -1001,7 +1001,7 @@ pub(crate) trait PublicationLog {
     fn claim_lock_free_producer(&mut self) -> Option<LockFreeVolatileProducer> {
         None
     }
-    fn shared_payload_for_fsn(&self, fsn: u64) -> Result<Option<SharedPayload>, DriverError>;
+    fn pending_payload_for_fsn(&self, fsn: u64) -> Result<Option<PendingPayload>, DriverError>;
     fn oldest_unresolved_fsn(&self) -> Option<u64>;
     fn complete_through(&mut self, fsn: u64) -> Result<(), DriverError>;
     fn reject_fsn(&mut self, fsn: u64) -> Result<QwpReceipt, DriverError>;
@@ -1058,7 +1058,7 @@ impl SendCursor {
             }
         };
 
-        let Some(payload) = log.shared_payload_for_fsn(fsn)? else {
+        let Some(payload) = log.pending_payload_for_fsn(fsn)? else {
             return Ok(None);
         };
         Ok(Some(OutboundFrame {
@@ -1160,10 +1160,12 @@ pub(crate) trait ManualDriverTransport {
         self.poll_response()
     }
 
-    // The outbound payload may be a queue-owned view. Transports must write or
-    // copy it synchronously and must not retain the frame after returning.
-    fn send_frame(&mut self, frame: OutboundFrame)
-    -> Result<TransportSendResult, TransportFailure>;
+    // The outbound payload may borrow queue-owned storage and is valid only for
+    // this call. Transports must write it or copy it synchronously.
+    fn send_frame(
+        &mut self,
+        frame: OutboundFrameView<'_>,
+    ) -> Result<TransportSendResult, TransportFailure>;
 
     fn restart_connection(&mut self, _reason: ReconnectReason) -> Result<(), DriverError> {
         Ok(())
@@ -1354,11 +1356,11 @@ impl ManualDriverTransport for BlockingQwpWsTransport {
 
     fn send_frame(
         &mut self,
-        frame: OutboundFrame,
+        frame: OutboundFrameView<'_>,
     ) -> Result<TransportSendResult, TransportFailure> {
         #[cfg(test)]
         let sent_frame = frame.sent_frame();
-        write_binary_frame(&mut self.stream, &mut self.send_buf, frame.payload.as_ref()).map_err(
+        write_binary_frame(&mut self.stream, &mut self.send_buf, frame.payload).map_err(
             |io| {
                 TransportFailure::Disconnect(error::fmt!(
                     SocketError,
@@ -1401,8 +1403,8 @@ impl PublicationLog for VolatileFrameQueue {
         Ok(VolatileFrameQueue::try_submit(self, payload)?)
     }
 
-    fn shared_payload_for_fsn(&self, fsn: u64) -> Result<Option<SharedPayload>, DriverError> {
-        Ok(VolatileFrameQueue::shared_payload_for_fsn(self, fsn))
+    fn pending_payload_for_fsn(&self, fsn: u64) -> Result<Option<PendingPayload>, DriverError> {
+        Ok(VolatileFrameQueue::pending_payload_for_fsn(self, fsn))
     }
 
     fn oldest_unresolved_fsn(&self) -> Option<u64> {
@@ -1443,8 +1445,8 @@ impl PublicationLog for LockFreeVolatilePublicationLog {
         LockFreeVolatilePublicationLog::claim_producer(self)
     }
 
-    fn shared_payload_for_fsn(&self, fsn: u64) -> Result<Option<SharedPayload>, DriverError> {
-        Ok(LockFreeVolatilePublicationLog::shared_payload_for_fsn(
+    fn pending_payload_for_fsn(&self, fsn: u64) -> Result<Option<PendingPayload>, DriverError> {
+        Ok(LockFreeVolatilePublicationLog::pending_payload_for_fsn(
             self, fsn,
         ))
     }
@@ -1775,7 +1777,7 @@ impl ManualDriverTransport for FakeOrderedServer {
 
     fn send_frame(
         &mut self,
-        frame: OutboundFrame,
+        frame: OutboundFrameView<'_>,
     ) -> Result<TransportSendResult, TransportFailure> {
         let frame = frame.sent_frame();
         let wire_seq = frame.wire_seq;
@@ -1975,7 +1977,7 @@ mod tests {
 
         fn send_frame(
             &mut self,
-            frame: OutboundFrame,
+            frame: OutboundFrameView<'_>,
         ) -> Result<TransportSendResult, TransportFailure> {
             self.sent_frames.push(frame.sent_frame());
             self.sent_payloads.push(frame.payload.to_vec());

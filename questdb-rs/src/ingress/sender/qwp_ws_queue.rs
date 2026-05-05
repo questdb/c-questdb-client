@@ -31,18 +31,17 @@
 //! QWP payload bytes; the replay encoder is validated separately.
 
 use std::cell::UnsafeCell;
-use std::ops::Deref;
+use std::ptr;
+use std::slice;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
-#[derive(Clone)]
-pub(crate) struct SharedPayload {
-    storage: SharedPayloadStorage,
+pub(crate) struct PendingPayload {
+    storage: PendingPayloadStorage,
 }
 
-#[derive(Clone)]
-enum SharedPayloadStorage {
+enum PendingPayloadStorage {
     Owned(Arc<[u8]>),
     LockFreeQueue {
         queue: Arc<LockFreeVolatileFrameQueueInner>,
@@ -51,10 +50,10 @@ enum SharedPayloadStorage {
     },
 }
 
-impl SharedPayload {
-    pub(crate) fn copy_from_slice(payload: &[u8]) -> Self {
+impl PendingPayload {
+    pub(crate) fn owned(payload: Arc<[u8]>) -> Self {
         Self {
-            storage: SharedPayloadStorage::Owned(Arc::from(payload)),
+            storage: PendingPayloadStorage::Owned(payload),
         }
     }
 
@@ -64,48 +63,40 @@ impl SharedPayload {
         len: usize,
     ) -> Self {
         Self {
-            storage: SharedPayloadStorage::LockFreeQueue { queue, offset, len },
+            storage: PendingPayloadStorage::LockFreeQueue { queue, offset, len },
         }
     }
-}
 
-impl AsRef<[u8]> for SharedPayload {
-    fn as_ref(&self) -> &[u8] {
+    pub(crate) fn len(&self) -> usize {
         match &self.storage {
-            SharedPayloadStorage::Owned(payload) => payload.as_ref(),
-            SharedPayloadStorage::LockFreeQueue { queue, offset, len } => {
-                // SPSC invariant: published byte ranges are not reused until the
-                // runner completes their FSN. This view is used only for the
-                // synchronous send operation and is not stored by transports.
-                unsafe { &(&*queue.bytes.get())[*offset..*offset + *len] }
+            PendingPayloadStorage::Owned(payload) => payload.len(),
+            PendingPayloadStorage::LockFreeQueue { len, .. } => *len,
+        }
+    }
+
+    pub(crate) fn with_bytes<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
+        match &self.storage {
+            PendingPayloadStorage::Owned(payload) => f(payload.as_ref()),
+            PendingPayloadStorage::LockFreeQueue { queue, offset, len } => {
+                // SAFETY: `pending_payload_for_fsn` creates this payload only after
+                // observing a published slot. The SPSC protocol does not free or
+                // reuse published byte ranges until the runner completes their
+                // FSN, and `with_bytes` lends the slice only to the synchronous
+                // send callback.
+                let payload = unsafe { queue.bytes.slice(*offset, *len) };
+                f(payload)
             }
         }
     }
 }
 
-impl Deref for SharedPayload {
-    type Target = [u8];
-
-    fn deref(&self) -> &Self::Target {
-        self.as_ref()
-    }
-}
-
-impl std::fmt::Debug for SharedPayload {
+impl std::fmt::Debug for PendingPayload {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SharedPayload")
+        f.debug_struct("PendingPayload")
             .field("len", &self.len())
             .finish()
     }
 }
-
-impl PartialEq for SharedPayload {
-    fn eq(&self, other: &Self) -> bool {
-        self.as_ref() == other.as_ref()
-    }
-}
-
-impl Eq for SharedPayload {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct QwpReceipt {
@@ -145,14 +136,41 @@ pub(crate) struct SentFrame {
     pub(crate) payload_len: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct OutboundFrame {
     pub(crate) fsn: u64,
     pub(crate) wire_seq: u64,
-    pub(crate) payload: SharedPayload,
+    pub(crate) payload: PendingPayload,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OutboundFrameView<'a> {
+    pub(crate) fsn: u64,
+    pub(crate) wire_seq: u64,
+    pub(crate) payload: &'a [u8],
 }
 
 impl OutboundFrame {
+    pub(crate) fn sent_frame(&self) -> SentFrame {
+        SentFrame {
+            fsn: self.fsn,
+            wire_seq: self.wire_seq,
+            payload_len: self.payload.len(),
+        }
+    }
+
+    pub(crate) fn with_view<R>(&self, f: impl FnOnce(OutboundFrameView<'_>) -> R) -> R {
+        self.payload.with_bytes(|payload| {
+            f(OutboundFrameView {
+                fsn: self.fsn,
+                wire_seq: self.wire_seq,
+                payload,
+            })
+        })
+    }
+}
+
+impl OutboundFrameView<'_> {
     pub(crate) fn sent_frame(&self) -> SentFrame {
         SentFrame {
             fsn: self.fsn,
@@ -250,7 +268,7 @@ pub(crate) struct LockFreeVolatilePublicationLog {
 
 struct LockFreeVolatileFrameQueueInner {
     slots: Box<[LockFreeFrameSlot]>,
-    bytes: UnsafeCell<Box<[u8]>>,
+    bytes: LockFreeByteRing,
     max_bytes: usize,
     max_in_flight: usize,
     bytes_used: AtomicUsize,
@@ -263,6 +281,50 @@ struct LockFreeVolatileFrameQueueInner {
     publisher_state: AtomicU8,
     producer_claimed: AtomicBool,
     publish_active: AtomicBool,
+}
+
+struct LockFreeByteRing {
+    bytes: Box<[UnsafeCell<u8>]>,
+}
+
+impl LockFreeByteRing {
+    fn new(len: usize) -> Self {
+        let bytes = (0..len)
+            .map(|_| UnsafeCell::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self { bytes }
+    }
+
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    unsafe fn copy_from(&self, offset: usize, src: &[u8]) {
+        assert!(
+            offset
+                .checked_add(src.len())
+                .is_some_and(|end| end <= self.len())
+        );
+        // SAFETY: `UnsafeCell<u8>` has the same representation as `u8`.
+        // Callers guarantee that this exact byte range is not concurrently read
+        // or written through any other reference.
+        let dst = unsafe { self.bytes.as_ptr().add(offset).cast::<u8>() as *mut u8 };
+        // SAFETY: the caller checked the destination range and guarantees it is
+        // uniquely owned by the producer until the slot is published.
+        unsafe { ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len()) };
+    }
+
+    unsafe fn slice(&self, offset: usize, len: usize) -> &[u8] {
+        assert!(offset.checked_add(len).is_some_and(|end| end <= self.len()));
+        // SAFETY: `UnsafeCell<u8>` has the same representation as `u8`.
+        // Callers guarantee that the returned exact range is initialized and is
+        // not mutated while the returned slice is alive.
+        let ptr = unsafe { self.bytes.as_ptr().add(offset).cast::<u8>() };
+        // SAFETY: the caller checked the source range and guarantees it remains
+        // read-only for the lifetime of the returned slice.
+        unsafe { slice::from_raw_parts(ptr, len) }
+    }
 }
 
 struct LockFreeFrameSlot {
@@ -351,7 +413,7 @@ impl VolatileFrameQueue {
         let tail = self.slot_index(self.len);
         let slot = &mut self.slots[tail];
         slot.fsn = fsn;
-        slot.payload = Some(SharedPayload::copy_from_slice(payload));
+        slot.payload = Some(Arc::from(payload));
         slot.state = FrameState::Published;
 
         self.len += 1;
@@ -367,10 +429,14 @@ impl VolatileFrameQueue {
             .and_then(|slot| slot.payload.as_deref())
     }
 
-    pub(crate) fn shared_payload_for_fsn(&self, fsn: u64) -> Option<SharedPayload> {
+    pub(crate) fn pending_payload_for_fsn(&self, fsn: u64) -> Option<PendingPayload> {
         self.slot_for_fsn(fsn)
             .filter(|slot| !matches!(slot.state, FrameState::Free))
-            .and_then(|slot| slot.payload.clone())
+            .and_then(|slot| {
+                slot.payload
+                    .as_ref()
+                    .map(|payload| PendingPayload::owned(Arc::clone(payload)))
+            })
     }
 
     pub(crate) fn oldest_unresolved_fsn(&self) -> Option<u64> {
@@ -510,12 +576,12 @@ impl LockFreeVolatileFrameQueue {
                 state: AtomicU8::new(LOCK_FREE_SLOT_FREE),
             })
             .collect();
-        let bytes = vec![0; options.max_bytes].into_boxed_slice();
+        let bytes = LockFreeByteRing::new(options.max_bytes);
 
         Ok(Self {
             inner: Arc::new(LockFreeVolatileFrameQueueInner {
                 slots,
-                bytes: UnsafeCell::new(bytes),
+                bytes,
                 max_bytes: options.max_bytes,
                 max_in_flight: options.max_in_flight,
                 bytes_used: AtomicUsize::new(0),
@@ -564,7 +630,7 @@ impl LockFreeVolatileFrameQueue {
         self.try_submit_open(payload).map_err(Into::into)
     }
 
-    pub(crate) fn shared_payload_for_fsn(&self, fsn: u64) -> Option<SharedPayload> {
+    pub(crate) fn pending_payload_for_fsn(&self, fsn: u64) -> Option<PendingPayload> {
         if !self.fsn_is_published_and_unresolved(fsn) {
             return None;
         }
@@ -578,7 +644,7 @@ impl LockFreeVolatileFrameQueue {
 
         let offset = slot.offset.load(Ordering::Acquire);
         let len = slot.len.load(Ordering::Acquire);
-        Some(SharedPayload::lock_free_queue(
+        Some(PendingPayload::lock_free_queue(
             Arc::clone(&self.inner),
             offset,
             len,
@@ -727,10 +793,10 @@ impl LockFreeVolatileFrameQueue {
         }
 
         let reservation = self.reserve_byte_range(payload.len())?;
-        unsafe {
-            (&mut *self.inner.bytes.get())[reservation.offset..reservation.offset + payload.len()]
-                .copy_from_slice(payload);
-        }
+        // SAFETY: `reserve_byte_range` returns a range that does not overlap
+        // any unresolved published frame. The producer initializes this range
+        // before publishing the slot state.
+        unsafe { self.inner.bytes.copy_from(reservation.offset, payload) };
         slot.fsn.store(fsn, Ordering::Relaxed);
         slot.offset.store(reservation.offset, Ordering::Relaxed);
         slot.len.store(payload.len(), Ordering::Relaxed);
@@ -901,8 +967,8 @@ impl LockFreeVolatilePublicationLog {
         self.queue.terminalize_publication();
     }
 
-    pub(crate) fn shared_payload_for_fsn(&self, fsn: u64) -> Option<SharedPayload> {
-        self.queue.shared_payload_for_fsn(fsn)
+    pub(crate) fn pending_payload_for_fsn(&self, fsn: u64) -> Option<PendingPayload> {
+        self.queue.pending_payload_for_fsn(fsn)
     }
 
     pub(crate) fn oldest_unresolved_fsn(&self) -> Option<u64> {
@@ -959,7 +1025,7 @@ impl std::fmt::Debug for LockFreeVolatileFrameQueue {
 #[derive(Debug, Default)]
 struct FrameSlot {
     fsn: u64,
-    payload: Option<SharedPayload>,
+    payload: Option<Arc<[u8]>>,
     state: FrameState,
 }
 
@@ -994,6 +1060,11 @@ mod tests {
             max_in_flight,
         })
         .unwrap()
+    }
+
+    fn assert_pending_payload_eq(payload: Option<PendingPayload>, expected: &[u8]) {
+        let payload = payload.expect("expected pending payload");
+        payload.with_bytes(|bytes| assert_eq!(bytes, expected));
     }
 
     #[test]
@@ -1127,10 +1198,7 @@ mod tests {
         assert_eq!(first, QwpReceipt { fsn: 0 });
         assert_eq!(second, QwpReceipt { fsn: 1 });
         assert_eq!(queue.published_fsn(), Some(1));
-        assert_eq!(
-            queue.shared_payload_for_fsn(0).as_deref(),
-            Some(&b"first"[..])
-        );
+        assert_pending_payload_eq(queue.pending_payload_for_fsn(0), b"first");
         assert_eq!(
             queue.receipt_status(first),
             QwpReceiptStatus::Published { fsn: 0 }
@@ -1165,10 +1233,7 @@ mod tests {
 
         assert_eq!(second, QwpReceipt { fsn: 1 });
         assert_eq!(third, QwpReceipt { fsn: 2 });
-        assert_eq!(
-            queue.shared_payload_for_fsn(third.fsn).as_deref(),
-            Some(&b"fg"[..])
-        );
+        assert_pending_payload_eq(queue.pending_payload_for_fsn(third.fsn), b"fg");
         assert_eq!(queue.bytes_used(), 4);
     }
 
@@ -1204,18 +1269,28 @@ mod tests {
         queue.complete_through_fsn(first.fsn).unwrap();
         let third = producer.try_submit(b"cccc").unwrap();
 
-        assert_eq!(
-            queue.shared_payload_for_fsn(second.fsn).as_deref(),
-            Some(&b"bb"[..])
-        );
-        assert_eq!(
-            queue.shared_payload_for_fsn(third.fsn).as_deref(),
-            Some(&b"cccc"[..])
-        );
+        assert_pending_payload_eq(queue.pending_payload_for_fsn(second.fsn), b"bb");
+        assert_pending_payload_eq(queue.pending_payload_for_fsn(third.fsn), b"cccc");
         assert_eq!(queue.bytes_used(), 7);
 
         queue.complete_through_fsn(third.fsn).unwrap();
         assert_eq!(queue.bytes_used(), 0);
+    }
+
+    #[test]
+    fn lock_free_payload_view_survives_disjoint_publish() {
+        let queue = lock_free_queue(4, 64, 4);
+        let mut producer = queue.claim_producer().unwrap();
+
+        let first = producer.try_submit(b"first").unwrap();
+        let first_payload = queue.pending_payload_for_fsn(first.fsn).unwrap();
+
+        first_payload.with_bytes(|first_bytes| {
+            let second = producer.try_submit(b"second").unwrap();
+
+            assert_eq!(first_bytes, b"first");
+            assert_pending_payload_eq(queue.pending_payload_for_fsn(second.fsn), b"second");
+        });
     }
 
     #[test]
@@ -1240,10 +1315,7 @@ mod tests {
         );
         assert_eq!(queue.bytes_used(), 0);
         let fourth = producer.try_submit(b"dddddddd").unwrap();
-        assert_eq!(
-            queue.shared_payload_for_fsn(fourth.fsn).as_deref(),
-            Some(&b"dddddddd"[..])
-        );
+        assert_pending_payload_eq(queue.pending_payload_for_fsn(fourth.fsn), b"dddddddd");
     }
 
     /// Run with:

@@ -42,7 +42,7 @@ use std::path::{Path, PathBuf};
 use std::os::fd::AsRawFd;
 
 use super::qwp_ws_driver::{DriverError, PublicationLog};
-use super::qwp_ws_queue::{QwpReceipt, QwpReceiptStatus, SharedPayload};
+use super::qwp_ws_queue::{PendingPayload, QwpReceipt, QwpReceiptStatus};
 use super::qwp_ws_sfa_queue::{SfaFrameQueue, SfaQueueError, SfaQueueOptions};
 use crate::ingress::conf::{QWP_WS_DEFAULT_SENDER_ID, is_valid_qwp_ws_sender_id};
 
@@ -111,8 +111,8 @@ impl PublicationLog for SfaSlotQueue {
         Ok(self.queue.try_submit(payload)?)
     }
 
-    fn shared_payload_for_fsn(&self, fsn: u64) -> Result<Option<SharedPayload>, DriverError> {
-        Ok(self.queue.shared_payload_for_fsn(fsn))
+    fn pending_payload_for_fsn(&self, fsn: u64) -> Result<Option<PendingPayload>, DriverError> {
+        Ok(self.queue.pending_payload_for_fsn(fsn))
     }
 
     fn oldest_unresolved_fsn(&self) -> Option<u64> {

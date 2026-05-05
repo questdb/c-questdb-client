@@ -54,8 +54,8 @@ use super::qwp_ws_driver::{
 use super::qwp_ws_ownership::QwpWsSenderError;
 use super::qwp_ws_publisher::{QwpWsPublicationDriver, QwpWsPublicationError, QwpWsReplayEncoder};
 use super::qwp_ws_queue::{
-    LockFreeVolatileProducer, LockFreeVolatilePublicationLog, OutboundFrame, QwpReceipt,
-    QwpReceiptStatus, SharedPayload, VolatileFrameQueue, VolatileQueueOptions,
+    LockFreeVolatileProducer, LockFreeVolatilePublicationLog, OutboundFrame, PendingPayload,
+    QwpReceipt, QwpReceiptStatus, VolatileFrameQueue, VolatileQueueOptions,
 };
 use super::qwp_ws_sfa_slot::{SfaSlotOptions, SfaSlotQueue};
 
@@ -752,10 +752,10 @@ impl PublicationLog for ConfiguredQwpWsQueue {
         }
     }
 
-    fn shared_payload_for_fsn(&self, fsn: u64) -> Result<Option<SharedPayload>, DriverError> {
+    fn pending_payload_for_fsn(&self, fsn: u64) -> Result<Option<PendingPayload>, DriverError> {
         match self {
-            Self::Memory(queue) => PublicationLog::shared_payload_for_fsn(queue, fsn),
-            Self::StoreAndForward(queue) => PublicationLog::shared_payload_for_fsn(queue, fsn),
+            Self::Memory(queue) => PublicationLog::pending_payload_for_fsn(queue, fsn),
+            Self::StoreAndForward(queue) => PublicationLog::pending_payload_for_fsn(queue, fsn),
         }
     }
 
@@ -1591,7 +1591,7 @@ mod tests {
         DriverError, DriverEvent, ReconnectReason, TransportFailure, TransportResponse,
         TransportSendResult,
     };
-    use super::super::qwp_ws_queue::{OutboundFrame, SentFrame};
+    use super::super::qwp_ws_queue::{OutboundFrameView, SentFrame};
     use super::*;
     use std::sync::mpsc;
 
@@ -1737,7 +1737,7 @@ mod tests {
 
         fn send_frame(
             &mut self,
-            frame: OutboundFrame,
+            frame: OutboundFrameView<'_>,
         ) -> Result<TransportSendResult, TransportFailure> {
             let sent_frame = frame.sent_frame();
             if self.should_block_send {
@@ -1821,7 +1821,7 @@ mod tests {
 
         fn send_frame(
             &mut self,
-            frame: OutboundFrame,
+            frame: OutboundFrameView<'_>,
         ) -> Result<TransportSendResult, TransportFailure> {
             if self.should_fail_send {
                 self.should_fail_send = false;
@@ -1926,7 +1926,7 @@ mod tests {
 
         fn send_frame(
             &mut self,
-            frame: OutboundFrame,
+            frame: OutboundFrameView<'_>,
         ) -> Result<TransportSendResult, TransportFailure> {
             let sent_frame = frame.sent_frame();
             self.sent_frames.push(sent_frame);
@@ -2090,7 +2090,7 @@ mod tests {
 
         fn send_frame(
             &mut self,
-            frame: OutboundFrame,
+            frame: OutboundFrameView<'_>,
         ) -> Result<TransportSendResult, TransportFailure> {
             let sent_frame = frame.sent_frame();
             self.sent_frames.push(sent_frame);

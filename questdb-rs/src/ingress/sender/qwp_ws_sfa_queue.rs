@@ -35,12 +35,13 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error;
 
 use super::qwp_ws_driver::{DriverError, PublicationLog};
-use super::qwp_ws_queue::{QueueError, QwpReceipt, QwpReceiptStatus, SharedPayload};
+use super::qwp_ws_queue::{PendingPayload, QueueError, QwpReceipt, QwpReceiptStatus};
 use super::qwp_ws_sfa_segment::{
     FRAME_HEADER_SIZE, HEADER_SIZE, INITIAL_SEGMENT_FILE_NAME, SfaFrame, SfaSegment,
     SfaSegmentError, initial_segment_path, scan_file, spare_segment_path,
@@ -198,7 +199,7 @@ impl SfaFrameQueue {
             .next_fsn
             .checked_add(1)
             .ok_or(QueueError::SequenceOverflow)?;
-        let stored_payload = SharedPayload::copy_from_slice(payload);
+        let stored_payload: Arc<[u8]> = Arc::from(payload);
         self.append_to_active(stored_payload.as_ref())?;
 
         self.next_fsn = next_fsn;
@@ -281,8 +282,9 @@ impl SfaFrameQueue {
         self.frame_for_fsn(fsn).map(|frame| frame.payload.as_ref())
     }
 
-    pub(crate) fn shared_payload_for_fsn(&self, fsn: u64) -> Option<SharedPayload> {
-        self.frame_for_fsn(fsn).map(|frame| frame.payload.clone())
+    pub(crate) fn pending_payload_for_fsn(&self, fsn: u64) -> Option<PendingPayload> {
+        self.frame_for_fsn(fsn)
+            .map(|frame| PendingPayload::owned(Arc::clone(&frame.payload)))
     }
 
     pub(crate) fn oldest_unresolved_fsn(&self) -> Option<u64> {
@@ -479,8 +481,8 @@ impl PublicationLog for SfaFrameQueue {
         Ok(SfaFrameQueue::try_submit(self, payload)?)
     }
 
-    fn shared_payload_for_fsn(&self, fsn: u64) -> Result<Option<SharedPayload>, DriverError> {
-        Ok(SfaFrameQueue::shared_payload_for_fsn(self, fsn))
+    fn pending_payload_for_fsn(&self, fsn: u64) -> Result<Option<PendingPayload>, DriverError> {
+        Ok(SfaFrameQueue::pending_payload_for_fsn(self, fsn))
     }
 
     fn oldest_unresolved_fsn(&self) -> Option<u64> {
@@ -593,7 +595,7 @@ fn recover_segments(options: &SfaQueueOptions) -> Result<Option<RecoveredSegment
             validate_recovered_frame(frame, &mut bytes_used, options)?;
             frames.push_back(SfaQueuedFrame {
                 fsn: frame.fsn,
-                payload: SharedPayload::copy_from_slice(frame.payload.as_slice()),
+                payload: Arc::from(frame.payload.as_slice()),
             });
         }
     }
@@ -761,7 +763,7 @@ impl SfaSegmentMeta {
 #[derive(Debug)]
 struct SfaQueuedFrame {
     fsn: u64,
-    payload: SharedPayload,
+    payload: Arc<[u8]>,
 }
 
 #[cfg(test)]
