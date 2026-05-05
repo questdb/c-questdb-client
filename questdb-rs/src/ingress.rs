@@ -511,6 +511,8 @@ impl SenderBuilder {
                 #[cfg(feature = "_sender-qwp-udp")]
                 "multicast_ttl" => builder.multicast_ttl(parse_conf_value(key, val)?)?,
                 #[cfg(feature = "_sender-qwp-ws")]
+                "in_flight_window" => builder.in_flight_window(parse_conf_value(key, val)?)?,
+                #[cfg(feature = "_sender-qwp-ws")]
                 "max_in_flight" => builder.max_in_flight(parse_conf_value(key, val)?)?,
                 #[cfg(feature = "_sender-qwp-ws")]
                 "qwp_ws_progress" => builder.qwp_ws_progress(parse_qwp_ws_progress_value(val)?)?,
@@ -548,6 +550,26 @@ impl SenderBuilder {
                 }
                 #[cfg(feature = "_sender-qwp-ws")]
                 "close_flush_timeout_millis" => builder.reject_close_flush_timeout_millis()?,
+                #[cfg(feature = "_sender-qwp-ws")]
+                "request_durable_ack" => builder.request_durable_ack(val)?,
+                #[cfg(feature = "_sender-qwp-ws")]
+                "max_schemas_per_connection" => builder.reject_unsupported_qwp_ws_setting(
+                    "max_schemas_per_connection",
+                    "configurable schema limits are not implemented",
+                )?,
+                #[cfg(feature = "_sender-qwp-ws")]
+                "durable_ack_keepalive_interval_millis" => {
+                    builder.durable_ack_keepalive_interval_millis(val)?
+                }
+                #[cfg(feature = "_sender-qwp-ws")]
+                "drain_orphans" => builder.drain_orphans(val)?,
+                #[cfg(feature = "_sender-qwp-ws")]
+                "max_background_drainers" => builder.max_background_drainers(val)?,
+                #[cfg(feature = "_sender-qwp-ws")]
+                "error_inbox_capacity" => builder.reject_unsupported_qwp_ws_setting(
+                    "error_inbox_capacity",
+                    "Java-style async error inbox configuration is not implemented",
+                )?,
                 "protocol_version" => match val {
                     "1" => builder.protocol_version(ProtocolVersion::V1)?,
                     "2" => builder.protocol_version(ProtocolVersion::V2)?,
@@ -985,20 +1007,56 @@ impl SenderBuilder {
     /// `flush` calls may wait until the server acknowledges an earlier message.
     /// Smaller windows reduce client memory and bound the impact of a
     /// stuck server; larger windows increase throughput on high-RTT links.
-    pub fn max_in_flight(mut self, value: usize) -> Result<Self> {
+    pub fn max_in_flight(self, value: usize) -> Result<Self> {
+        self.set_qwp_ws_max_in_flight("max_in_flight", value)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn in_flight_window(mut self, value: i32) -> Result<Self> {
+        let Some(qwp_ws) = &mut self.qwp_ws else {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"in_flight_window\" setting is only supported for QWP/WebSocket."
+            ));
+        };
+        if value < 1 {
+            return Err(error::fmt!(
+                ConfigError,
+                "in-flight window size must be positive[size={value}]"
+            ));
+        }
+        if value == 1 {
+            return Err(error::fmt!(
+                ConfigError,
+                "WebSocket transport requires async mode (in_flight_window > 1)"
+            ));
+        }
+        let value = value as usize;
+        qwp_ws
+            .max_in_flight
+            .set_specified("in_flight_window", value)?;
+        Ok(self)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn set_qwp_ws_max_in_flight(
+        mut self,
+        setting_name: &'static str,
+        value: usize,
+    ) -> Result<Self> {
         if value == 0 {
             return Err(error::fmt!(
                 ConfigError,
-                "\"max_in_flight\" must be greater than 0."
+                "\"{setting_name}\" must be greater than 0."
             ));
         }
         let Some(qwp_ws) = &mut self.qwp_ws else {
             return Err(error::fmt!(
                 ConfigError,
-                "The \"max_in_flight\" setting is only supported for QWP/WebSocket."
+                "The \"{setting_name}\" setting is only supported for QWP/WebSocket."
             ));
         };
-        qwp_ws.max_in_flight.set_specified("max_in_flight", value)?;
+        qwp_ws.max_in_flight.set_specified(setting_name, value)?;
         Ok(self)
     }
 
@@ -1206,6 +1264,103 @@ impl SenderBuilder {
         Err(error::fmt!(
             ConfigError,
             "\"close_flush_timeout_millis\" is not supported by the Rust QWP/WebSocket sync sender yet; use Sender::close_drain() for explicit close-drain behavior."
+        ))
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn request_durable_ack(self, value: &str) -> Result<Self> {
+        if self.qwp_ws.is_none() {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"request_durable_ack\" setting is only supported for QWP/WebSocket."
+            ));
+        }
+        if value.eq_ignore_ascii_case("off") {
+            return Ok(self);
+        }
+        if value.eq_ignore_ascii_case("on") {
+            return self.reject_unsupported_qwp_ws_setting(
+                "request_durable_ack",
+                "durable ACK trimming is not implemented",
+            );
+        }
+
+        Err(error::fmt!(
+            ConfigError,
+            "invalid request_durable_ack [value={value}, allowed-values=[on, off]]"
+        ))
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn drain_orphans(self, value: &str) -> Result<Self> {
+        if self.qwp_ws.is_none() {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"drain_orphans\" setting is only supported for QWP/WebSocket."
+            ));
+        }
+        if value.eq_ignore_ascii_case("off") || value.eq_ignore_ascii_case("false") {
+            return Ok(self);
+        }
+        if value.eq_ignore_ascii_case("on") || value.eq_ignore_ascii_case("true") {
+            return self.reject_unsupported_qwp_ws_setting(
+                "drain_orphans",
+                "orphan slot draining is not implemented",
+            );
+        }
+
+        Err(error::fmt!(
+            ConfigError,
+            "invalid drain_orphans [value={value}, allowed-values=[on, off, true, false]]"
+        ))
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn durable_ack_keepalive_interval_millis(self, value: &str) -> Result<Self> {
+        if self.qwp_ws.is_none() {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"durable_ack_keepalive_interval_millis\" setting is only supported for QWP/WebSocket."
+            ));
+        }
+        let _: i64 = parse_conf_value("durable_ack_keepalive_interval_millis", value)?;
+        Ok(self)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn max_background_drainers(self, value: &str) -> Result<Self> {
+        if self.qwp_ws.is_none() {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"max_background_drainers\" setting is only supported for QWP/WebSocket."
+            ));
+        }
+        let value: i32 = parse_conf_value("max_background_drainers", value)?;
+        if value < 0 {
+            return Err(error::fmt!(
+                ConfigError,
+                "max_background_drainers must be >= 0: {value}"
+            ));
+        }
+        Ok(self)
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    fn reject_unsupported_qwp_ws_setting(
+        self,
+        setting_name: &'static str,
+        reason: &'static str,
+    ) -> Result<Self> {
+        if self.qwp_ws.is_none() {
+            return Err(error::fmt!(
+                ConfigError,
+                "The \"{setting_name}\" setting is only supported for QWP/WebSocket."
+            ));
+        }
+
+        Err(error::fmt!(
+            ConfigError,
+            "\"{setting_name}\" is not supported by the Rust QWP/WebSocket sync sender yet; {reason}."
         ))
     }
 

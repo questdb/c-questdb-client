@@ -2910,6 +2910,52 @@ mod tests {
     }
 
     #[test]
+    fn future_ack_wire_sequence_remains_protocol_error_instead_of_java_clamp() {
+        let mut driver = driver(FakeOrderedServer::scripted([FakeSendResult::AckWire {
+            wire_seq: 99,
+        }]));
+        let receipt = driver.try_submit(b"payload").unwrap();
+
+        assert_eq!(
+            driver.drive_once(),
+            Err(DriverError::Queue(QueueError::ProtocolAckBeyondSent {
+                wire_seq: 99,
+                last_sent_wire_seq: Some(0),
+            }))
+        );
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Sent {
+                fsn: 0,
+                wire_seq: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn future_reject_wire_sequence_remains_protocol_error_instead_of_java_clamp() {
+        let mut driver = driver(FakeOrderedServer::scripted([FakeSendResult::RejectWire {
+            wire_seq: 99,
+        }]));
+        let receipt = driver.try_submit(b"payload").unwrap();
+
+        assert_eq!(
+            driver.drive_once(),
+            Err(DriverError::Queue(QueueError::ProtocolRejectBeyondSent {
+                wire_seq: 99,
+                last_sent_wire_seq: Some(0),
+            }))
+        );
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Sent {
+                fsn: 0,
+                wire_seq: 0,
+            }
+        );
+    }
+
+    #[test]
     fn wait_drives_until_receipt_acked() {
         let mut driver = driver(FakeOrderedServer::ack_each_send());
         let receipt = driver.try_submit(b"payload").unwrap();

@@ -513,7 +513,8 @@ replay:
 
 - create and lock `<sf_dir>/<sender_id>/`,
 - create `sf-initial.sfa` with the Java segment header,
-- append frames as `[crc32c][payloadLen][payload]`,
+- append frames as `[crc32c][payloadLen][payload]` while writing
+  `payloadLen`, payload, and then CRC last as the commit marker,
 - publish receipt only after the complete frame is visible to the queue,
 - recover `.sfa` files after restart by scanning valid frames,
 - replay from the lowest retained FSN,
@@ -526,8 +527,8 @@ segments may have been removed. If a crash happens before trim, retained frames
 may replay again. That is the Java-compatible at-least-once model.
 
 Do not confuse Java's `.corrupt` recovery quarantine with dead-letter storage.
-`.corrupt` files preserve damaged segment files for postmortem recovery; they
-are not created for server-rejected batches.
+`.corrupt` files preserve empty torn segment files for postmortem recovery; they
+are not created for scan-failed side files or server-rejected batches.
 
 Validation target:
 
@@ -541,6 +542,13 @@ Validation target:
 - Rust can recover a Java-written `.sfa` slot.
 - Torn-tail recovery matches Java: stop at the first invalid frame and append
   from that offset.
+- Length+payload bytes without the CRC commit are treated as torn/uncommitted.
+- Empty live SFA submissions reject without consuming FSN, and recovered
+  zero-length payload frames are corrupt.
+- Bad side files are skipped without renaming or dropping valid contiguous
+  sibling segments.
+- A skipped middle file that creates a recovered FSN gap still fails recovery.
+- Non-empty torn tails are non-fatal but produce a structured diagnostic.
 - ACK/drop-and-continue rejection leaves no Rust-only completion marker on disk.
 - The public sync `Sender` path, not only the manual driver shell, can publish
   into `sf_dir`, survive a disconnect before ACK, recover retained work from the

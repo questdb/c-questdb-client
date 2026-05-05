@@ -660,6 +660,11 @@ so the next append overwrites it. Segment files are sorted by `base_seq`; the
 recovered ranges must be contiguous. The highest-base segment becomes active and
 older segments become sealed.
 
+Recovery is per-file best effort in the Java shape: a scan-failed `.sfa` side
+file is skipped without renaming and sibling files are still considered, but the
+recovered valid files must still form a contiguous FSN range. Non-empty torn
+tails recover their valid prefix and produce a structured diagnostic.
+
 The `.lock` file is part of the slot contract. A sender must hold an exclusive
 slot lock before it recovers, appends, rotates, or trims `.sfa` files. Two live
 writers in one slot would corrupt the FSN sequence and must fail at startup.
@@ -669,7 +674,8 @@ ACK cursor. Fully ACKed sealed segments may be closed and unlinked. Active
 segments are not rewritten to remove individual ACKed frames. Server
 drop-and-continue rejection advances the same ACK cursor for the rejected FSN and
 reports the rejection to the user; halt/terminal rejection leaves bytes in place.
-No rejection marker is written to disk.
+No rejection marker is written to disk. Unlike Java's logged best-effort unlink
+policy, Rust's fallible close/trim paths propagate unexpected cleanup failures.
 
 Public mode selection follows Java:
 
@@ -899,8 +905,8 @@ The Java client has no client-owned dead-letter file format for rejected
 batches. Its drop-and-continue path advances the acknowledged FSN so the
 existing Store-and-Forward trim path can forget the rejected bytes, and it
 delivers a structured `SenderError` to user code. Java's `.corrupt` files are a
-different mechanism: recovery quarantine for damaged `.sfa` segment files, not
-dead-letter storage for server-rejected batches.
+different mechanism: recovery quarantine for torn empty `.sfa` segment files,
+not dead-letter storage for server-rejected batches.
 
 Users that need durable dead-letter storage can implement it in their own
 producer/error-handling layer by joining the reported FSN span to their
@@ -1358,7 +1364,7 @@ Candidate config keys:
 
 | Key | Default | Meaning |
 |---|---|---|
-| `max_in_flight` | 128 | Sent but unresolved frames per connection. |
+| `max_in_flight` / `in_flight_window` | 128 | Sent but unresolved frames per connection; Java spelling requires `> 1`, while Rust `max_in_flight=1` remains a Rust-only mode. |
 | `max_frame_bytes` | existing QWP cap | Maximum encoded QWP frame. |
 | `sf_dir` | unset | Enables file-backed SF when set; otherwise memory mode. |
 | `sender_id` | `default` | Slot name under `sf_dir`. |
@@ -1372,28 +1378,43 @@ Candidate config keys:
 | `reconnect_initial_backoff_millis` | 100 | Initial reconnect backoff. |
 | `reconnect_max_backoff_millis` | 5000 | Backoff cap. |
 | `initial_connect_retry` | `false` | Retry initial connect with reconnect policy. |
-| `close_flush_timeout_millis` | 5000 | Default high-level close drain timeout. |
-| `drain_orphans` | `false` | Adopt sibling SF slots on startup. |
-| `max_background_drainers` | 4 | Cap concurrent orphan drainers. |
+| `close_flush_timeout_millis` | 5000 | Default high-level close drain timeout; current Rust rejects until configurable close-drain behavior exists. |
+| `request_durable_ack` | `off` | Request durable ACK watermarks; current Rust accepts `off` and rejects `on` until durable trimming exists. |
+| `max_schemas_per_connection` | server/client default | Java schema cap knob; current Rust rejects until configurable caps exist. |
+| `durable_ack_keepalive_interval_millis` | Java default | Durable ACK keepalive knob; current Rust parses Java's signed values, including `<= 0` disable values, as inert while durable ACK is disabled. |
+| `drain_orphans` | `false` | Adopt sibling SF slots on startup; current Rust accepts `off`/`false` and rejects `on`/`true` until orphan drainers exist. |
+| `max_background_drainers` | 4 | Cap concurrent orphan drainers; current Rust parses Java's signed int surface, rejects `< 0`, and otherwise treats it as inert while orphan draining is disabled. |
+| `error_inbox_capacity` | Java default | Java async error inbox sizing; current Rust rejects until that inbox exists. |
 
 Rust currently parses and validates the Java-compatible `sf_*` / `sender_id`
 config keys, including Java's size suffixes (`k`, `m`, `g`, `t` with optional
 trailing `b`) and reserved `sf_durability=flush|append` values. The public sync
-sender uses those keys to choose and size the volatile or SFA queue. The old
-Tokio async sender has been removed; future async support should be an explicit
-adapter over the same queue/driver core. The public sync path parses and applies
-duration/backoff reconnect keys plus boolean `initial_connect_retry` for startup
-retry. Java's newer `initial_connect_retry=sync` spelling is accepted as an
-alias for the current blocking startup retry behavior. Java's `async` spelling
-is rejected explicitly until the adapter behavior exists.
+sender uses those keys to choose and size the volatile or SFA queue. Java's
+`in_flight_window` spelling is accepted as an alias for Rust `max_in_flight`,
+but keeps Java's `in_flight_window > 1` validation; Rust's `max_in_flight=1`
+spelling remains available as a Rust-only mode.
+The old Tokio async sender has been removed; future async support should be an
+explicit adapter over the same queue/driver core. The public sync path parses
+and applies duration/backoff reconnect keys plus boolean `initial_connect_retry`
+for startup retry. Java's newer `initial_connect_retry=sync` spelling is
+accepted as an alias for the current blocking startup retry behavior. Java's
+`async` spelling is rejected explicitly until the adapter behavior exists.
 
-Rust recognizes `sf_append_deadline_millis` and rejects it explicitly because
-the current high-level `Sender::flush()` runner does not yet enforce
-Java-compatible local-capacity waiting. The key should be accepted only with
-behavioral tests proving that it controls local publication/backpressure, not
-server ACK waiting. `event_capacity` is not exposed yet. It belongs to the
-Java-like high-level runner design and should be added with behavioral tests
-before exposing asynchronous rejection observation.
+Rust recognizes `sf_append_deadline_millis`, `close_flush_timeout_millis`,
+`request_durable_ack`, `max_schemas_per_connection`,
+`durable_ack_keepalive_interval_millis`, `drain_orphans`,
+`max_background_drainers`, and `error_inbox_capacity`. It accepts disabled
+`request_durable_ack=off` and `drain_orphans=off|false` defaults, parses
+dependent no-op knobs `durable_ack_keepalive_interval_millis`, including Java's
+signed `<= 0` disable values, and `max_background_drainers`, using Java's signed
+int parsing and `< 0` rejection, and rejects the enabled or behavior-bearing
+forms until their behavior exists.
+`sf_append_deadline_millis` should be accepted only with behavioral tests proving
+that it controls local publication/backpressure, not server ACK waiting. Durable
+ACK opt-in must not be accepted before Java-compatible durable trimming exists.
+`event_capacity` is not
+exposed yet. It belongs to the Java-like high-level runner design and should be
+added with behavioral tests before exposing asynchronous rejection observation.
 
 ## Implementation progress
 

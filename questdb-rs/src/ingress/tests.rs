@@ -191,6 +191,28 @@ fn qwpws_progress_config_parses_manual_and_background() {
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 #[test]
+fn qwpws_config_accepts_java_in_flight_window_alias() {
+    let builder =
+        SenderBuilder::from_conf("qwpws::addr=localhost:9000;in_flight_window=7;").unwrap();
+    let qwp_ws = builder.qwp_ws.as_ref().unwrap();
+    assert_specified_eq(&qwp_ws.max_in_flight, 7usize);
+
+    assert_conf_err(
+        SenderBuilder::from_conf("qwpws::addr=localhost:9000;in_flight_window=1;"),
+        "WebSocket transport requires async mode (in_flight_window > 1)",
+    );
+    assert_conf_err(
+        SenderBuilder::from_conf("qwpws::addr=localhost:9000;in_flight_window=-1;"),
+        "in-flight window size must be positive[size=-1]",
+    );
+
+    let builder = SenderBuilder::from_conf("qwpws::addr=localhost:9000;max_in_flight=1;").unwrap();
+    let qwp_ws = builder.qwp_ws.as_ref().unwrap();
+    assert_specified_eq(&qwp_ws.max_in_flight, 1usize);
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
 fn qwpws_store_and_forward_size_suffixes_match_java_config_surface() {
     for (input, expected) in [
         ("64k", 64 * 1024_u64),
@@ -209,6 +231,30 @@ fn qwpws_store_and_forward_size_suffixes_match_java_config_surface() {
 #[cfg(feature = "sync-sender-qwp-ws")]
 #[test]
 fn qwpws_store_and_forward_config_rejects_invalid_java_keys() {
+    SenderBuilder::from_conf("qwpws::addr=localhost:9000;request_durable_ack=off;").unwrap();
+    SenderBuilder::from_conf(
+        "qwpws::addr=localhost:9000;request_durable_ack=off;durable_ack_keepalive_interval_millis=5000;",
+    )
+    .unwrap();
+    SenderBuilder::from_conf(
+        "qwpws::addr=localhost:9000;durable_ack_keepalive_interval_millis=5000;",
+    )
+    .unwrap();
+    SenderBuilder::from_conf("qwpws::addr=localhost:9000;durable_ack_keepalive_interval_millis=0;")
+        .unwrap();
+    SenderBuilder::from_conf(
+        "qwpws::addr=localhost:9000;durable_ack_keepalive_interval_millis=-1;",
+    )
+    .unwrap();
+    SenderBuilder::from_conf("qwpws::addr=localhost:9000;drain_orphans=off;").unwrap();
+    SenderBuilder::from_conf("qwpws::addr=localhost:9000;drain_orphans=false;").unwrap();
+    SenderBuilder::from_conf(
+        "qwpws::addr=localhost:9000;drain_orphans=false;max_background_drainers=2;",
+    )
+    .unwrap();
+    SenderBuilder::from_conf("qwpws::addr=localhost:9000;max_background_drainers=0;").unwrap();
+    SenderBuilder::from_conf("qwpws::addr=localhost:9000;max_background_drainers=2;").unwrap();
+
     assert_conf_err(
         SenderBuilder::from_conf("qwpws::addr=localhost:9000;sender_id=bad/id;"),
         "invalid sender_id [value=bad/id, allowed-chars=[A-Za-z0-9_-]]",
@@ -233,6 +279,38 @@ fn qwpws_store_and_forward_config_rejects_invalid_java_keys() {
         SenderBuilder::from_conf("qwpws::addr=localhost:9000;close_flush_timeout_millis=5000;"),
         "\"close_flush_timeout_millis\" is not supported by the Rust QWP/WebSocket sync sender yet; use Sender::close_drain() for explicit close-drain behavior.",
     );
+    assert_conf_err(
+        SenderBuilder::from_conf("qwpws::addr=localhost:9000;request_durable_ack=maybe;"),
+        "invalid request_durable_ack [value=maybe, allowed-values=[on, off]]",
+    );
+    assert_conf_err(
+        SenderBuilder::from_conf("qwpws::addr=localhost:9000;drain_orphans=maybe;"),
+        "invalid drain_orphans [value=maybe, allowed-values=[on, off, true, false]]",
+    );
+    assert_conf_err(
+        SenderBuilder::from_conf("qwpws::addr=localhost:9000;max_background_drainers=-1;"),
+        "max_background_drainers must be >= 0: -1",
+    );
+    for (conf, expected) in [
+        (
+            "qwpws::addr=localhost:9000;request_durable_ack=on;",
+            "\"request_durable_ack\" is not supported by the Rust QWP/WebSocket sync sender yet; durable ACK trimming is not implemented.",
+        ),
+        (
+            "qwpws::addr=localhost:9000;max_schemas_per_connection=1024;",
+            "\"max_schemas_per_connection\" is not supported by the Rust QWP/WebSocket sync sender yet; configurable schema limits are not implemented.",
+        ),
+        (
+            "qwpws::addr=localhost:9000;drain_orphans=on;",
+            "\"drain_orphans\" is not supported by the Rust QWP/WebSocket sync sender yet; orphan slot draining is not implemented.",
+        ),
+        (
+            "qwpws::addr=localhost:9000;error_inbox_capacity=64;",
+            "\"error_inbox_capacity\" is not supported by the Rust QWP/WebSocket sync sender yet; Java-style async error inbox configuration is not implemented.",
+        ),
+    ] {
+        assert_conf_err(SenderBuilder::from_conf(conf), expected);
+    }
 }
 
 #[cfg(all(feature = "sync-sender-qwp-ws", feature = "sync-sender-tcp"))]
@@ -253,6 +331,28 @@ fn qwpws_store_and_forward_config_is_websocket_only() {
     assert_conf_err(
         SenderBuilder::from_conf("tcp::addr=localhost:9009;qwp_ws_progress=manual;"),
         "The \"qwp_ws_progress\" setting is only supported for QWP/WebSocket.",
+    );
+    assert_conf_err(
+        SenderBuilder::from_conf("tcp::addr=localhost:9009;request_durable_ack=on;"),
+        "The \"request_durable_ack\" setting is only supported for QWP/WebSocket.",
+    );
+    assert_conf_err(
+        SenderBuilder::from_conf("tcp::addr=localhost:9009;request_durable_ack=off;"),
+        "The \"request_durable_ack\" setting is only supported for QWP/WebSocket.",
+    );
+    assert_conf_err(
+        SenderBuilder::from_conf("tcp::addr=localhost:9009;drain_orphans=off;"),
+        "The \"drain_orphans\" setting is only supported for QWP/WebSocket.",
+    );
+    assert_conf_err(
+        SenderBuilder::from_conf(
+            "tcp::addr=localhost:9009;durable_ack_keepalive_interval_millis=5000;",
+        ),
+        "The \"durable_ack_keepalive_interval_millis\" setting is only supported for QWP/WebSocket.",
+    );
+    assert_conf_err(
+        SenderBuilder::from_conf("tcp::addr=localhost:9009;max_background_drainers=2;"),
+        "The \"max_background_drainers\" setting is only supported for QWP/WebSocket.",
     );
 }
 

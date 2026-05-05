@@ -107,6 +107,7 @@ pub(crate) struct SfaFrameQueue {
     active: Option<SfaSegment>,
     sealed_segments: VecDeque<SfaSegmentMeta>,
     frames: VecDeque<SfaQueuedFrame>,
+    recovery_diagnostics: Vec<SfaRecoveryDiagnostic>,
     bytes_used: usize,
     max_frames: usize,
     max_bytes: usize,
@@ -126,15 +127,16 @@ impl SfaFrameQueue {
         fs::create_dir_all(&options.slot_dir)?;
 
         let recovered = recover_segments(&options)?;
+        let recovery_diagnostics = recovered.diagnostics;
         let (active, sealed_segments, frames, bytes_used, next_fsn, next_generation) =
-            match recovered {
-                Some(recovered) => (
-                    SfaSegment::open_existing(&recovered.active_path)?,
-                    recovered.sealed_segments,
-                    recovered.frames,
-                    recovered.bytes_used,
-                    recovered.next_fsn,
-                    recovered.next_generation,
+            match recovered.segments {
+                Some(segments) => (
+                    SfaSegment::open_existing(&segments.active_path)?,
+                    segments.sealed_segments,
+                    segments.frames,
+                    segments.bytes_used,
+                    segments.next_fsn,
+                    segments.next_generation,
                 ),
                 None => {
                     let active_path = initial_segment_path(&options.slot_dir);
@@ -162,6 +164,7 @@ impl SfaFrameQueue {
             active: Some(active),
             sealed_segments,
             frames,
+            recovery_diagnostics,
             bytes_used,
             max_frames: options.max_frames,
             max_bytes: options.max_bytes,
@@ -309,6 +312,10 @@ impl SfaFrameQueue {
 
     pub(crate) fn max_in_flight(&self) -> usize {
         self.max_in_flight
+    }
+
+    pub(crate) fn recovery_diagnostics(&self) -> &[SfaRecoveryDiagnostic] {
+        &self.recovery_diagnostics
     }
 
     fn validate_submit(&self, payload: &[u8]) -> Result<(), QueueError> {
@@ -529,14 +536,36 @@ struct RecoveredSegments {
 }
 
 #[derive(Debug)]
+struct RecoveredState {
+    segments: Option<RecoveredSegments>,
+    diagnostics: Vec<SfaRecoveryDiagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SfaRecoveryDiagnostic {
+    SkippedSegment {
+        path: PathBuf,
+        error: String,
+    },
+    NonEmptyTornTail {
+        path: PathBuf,
+        torn_tail_bytes: u64,
+        append_offset: u64,
+        file_size: u64,
+        frames_recovered: usize,
+    },
+}
+
+#[derive(Debug)]
 struct RecoveredSegment {
     path: PathBuf,
     base_seq: u64,
     frames: Vec<SfaFrame>,
 }
 
-fn recover_segments(options: &SfaQueueOptions) -> Result<Option<RecoveredSegments>, SfaQueueError> {
+fn recover_segments(options: &SfaQueueOptions) -> Result<RecoveredState, SfaQueueError> {
     let mut segments = Vec::new();
+    let mut diagnostics = Vec::new();
 
     for entry in fs::read_dir(&options.slot_dir)? {
         let entry = entry?;
@@ -545,7 +574,16 @@ fn recover_segments(options: &SfaQueueOptions) -> Result<Option<RecoveredSegment
             continue;
         }
 
-        let scan = scan_file(&path)?;
+        let scan = match scan_file(&path) {
+            Ok(scan) => scan,
+            Err(err) => {
+                diagnostics.push(SfaRecoveryDiagnostic::SkippedSegment {
+                    path: path.clone(),
+                    error: format!("{err:?}"),
+                });
+                continue;
+            }
+        };
         if scan.frames.is_empty() {
             if scan.torn_tail_bytes == 0 {
                 match fs::remove_file(&path) {
@@ -559,6 +597,16 @@ fn recover_segments(options: &SfaQueueOptions) -> Result<Option<RecoveredSegment
             continue;
         }
 
+        if scan.torn_tail_bytes > 0 {
+            diagnostics.push(SfaRecoveryDiagnostic::NonEmptyTornTail {
+                path: path.clone(),
+                torn_tail_bytes: scan.torn_tail_bytes,
+                append_offset: scan.append_offset,
+                file_size: scan.append_offset.saturating_add(scan.torn_tail_bytes),
+                frames_recovered: scan.frames.len(),
+            });
+        }
+
         segments.push(RecoveredSegment {
             path,
             base_seq: scan.header.base_seq,
@@ -567,7 +615,10 @@ fn recover_segments(options: &SfaQueueOptions) -> Result<Option<RecoveredSegment
     }
 
     if segments.is_empty() {
-        return Ok(None);
+        return Ok(RecoveredState {
+            segments: None,
+            diagnostics,
+        });
     }
 
     segments.sort_by_key(|segment| segment.base_seq);
@@ -604,14 +655,17 @@ fn recover_segments(options: &SfaQueueOptions) -> Result<Option<RecoveredSegment
         .and_then(|frame| frame.fsn.checked_add(1))
         .ok_or(QueueError::SequenceOverflow)?;
     let active_path = segments.last().unwrap().path.clone();
-    Ok(Some(RecoveredSegments {
-        active_path,
-        sealed_segments,
-        frames,
-        bytes_used,
-        next_fsn,
-        next_generation: scan_next_generation(&options.slot_dir)?,
-    }))
+    Ok(RecoveredState {
+        segments: Some(RecoveredSegments {
+            active_path,
+            sealed_segments,
+            frames,
+            bytes_used,
+            next_fsn,
+            next_generation: scan_next_generation(&options.slot_dir)?,
+        }),
+        diagnostics,
+    })
 }
 
 fn validate_options(options: &SfaQueueOptions) -> Result<(), SfaQueueError> {
@@ -839,6 +893,17 @@ mod tests {
         fs::write(path, bytes).unwrap();
     }
 
+    fn write_segment_with_one_frame(path: &Path, base_seq: u64, payload: &[u8]) {
+        let mut segment = SfaSegment::create(path, base_seq, 256, 0).unwrap();
+        segment.try_append(payload).unwrap();
+    }
+
+    fn write_bad_magic_segment(path: &Path) {
+        let mut bytes = vec![0u8; 64];
+        bytes[..4].copy_from_slice(&0xdead_beefu32.to_le_bytes());
+        fs::write(path, bytes).unwrap();
+    }
+
     fn decode_hex_fixture(hex: &str) -> Vec<u8> {
         let mut nibbles = Vec::new();
         for byte in hex.bytes() {
@@ -875,6 +940,19 @@ mod tests {
     }
 
     #[test]
+    fn empty_payload_is_rejected_without_consuming_fsn() {
+        let dir = TempDir::new().unwrap();
+        let mut queue = open(&dir);
+
+        assert!(matches!(
+            queue.try_submit(b""),
+            Err(SfaQueueError::Queue(QueueError::EmptyPayload))
+        ));
+
+        assert_eq!(queue.try_submit(b"payload").unwrap(), QwpReceipt { fsn: 0 });
+    }
+
+    #[test]
     fn recover_replays_payloads_from_committed_java_sfa_fixture() {
         let dir = TempDir::new().unwrap();
         fs::write(
@@ -891,6 +969,21 @@ mod tests {
         assert_eq!(queue.oldest_unresolved_fsn(), Some(42));
         assert_eq!(queue.payload_for_fsn(42), Some(&b"one"[..]));
         assert_eq!(queue.payload_for_fsn(43), Some(&b"two-two"[..]));
+    }
+
+    #[test]
+    fn recovery_rejects_empty_frame_payload() {
+        let dir = TempDir::new().unwrap();
+        write_segment_with_one_frame(&initial_segment_path(dir.path()), 0, b"");
+
+        let err = SfaFrameQueue::open(options(&dir)).unwrap_err();
+
+        assert!(matches!(
+            err,
+            SfaQueueError::CorruptSegments {
+                reason: "empty recovered frame payload",
+            }
+        ));
     }
 
     #[test]
@@ -951,6 +1044,84 @@ mod tests {
         assert_eq!(queue.payload_for_fsn(0), Some(&b"first"[..]));
         assert!(!spare_path.exists());
         assert!(corrupt_spare_path.exists());
+    }
+
+    #[test]
+    fn recovery_skips_bad_side_file_without_dropping_contiguous_frames() {
+        let dir = TempDir::new().unwrap();
+        let initial_path = initial_segment_path(dir.path());
+        let second_path = spare_segment_path(dir.path(), 0);
+        let bad_side_path = spare_segment_path(dir.path(), 99);
+        let bad_side_corrupt_path = corrupt_segment_path(&bad_side_path);
+
+        write_segment_with_one_frame(&initial_path, 0, b"first");
+        write_segment_with_one_frame(&second_path, 1, b"second");
+        write_bad_magic_segment(&bad_side_path);
+
+        let queue = open(&dir);
+
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue.payload_for_fsn(0), Some(&b"first"[..]));
+        assert_eq!(queue.payload_for_fsn(1), Some(&b"second"[..]));
+        assert!(bad_side_path.exists());
+        assert!(!bad_side_corrupt_path.exists());
+        assert!(matches!(
+            &queue.recovery_diagnostics()[..],
+            [SfaRecoveryDiagnostic::SkippedSegment { path, .. }]
+                if path == &bad_side_path
+        ));
+    }
+
+    #[test]
+    fn recovery_skips_bad_middle_file_but_preserves_gap_failure() {
+        let dir = TempDir::new().unwrap();
+        let initial_path = initial_segment_path(dir.path());
+        let bad_middle_path = spare_segment_path(dir.path(), 0);
+        let third_path = spare_segment_path(dir.path(), 1);
+
+        write_segment_with_one_frame(&initial_path, 0, b"first");
+        write_bad_magic_segment(&bad_middle_path);
+        write_segment_with_one_frame(&third_path, 2, b"third");
+
+        let err = SfaFrameQueue::open(options(&dir)).unwrap_err();
+
+        assert!(matches!(
+            err,
+            SfaQueueError::CorruptSegments {
+                reason: "non-contiguous recovered segment sequence",
+            }
+        ));
+        assert!(bad_middle_path.exists());
+        assert!(!corrupt_segment_path(&bad_middle_path).exists());
+    }
+
+    #[test]
+    fn recovery_records_non_empty_torn_tail_diagnostic() {
+        let dir = TempDir::new().unwrap();
+        let initial_path = initial_segment_path(dir.path());
+        fs::write(
+            &initial_path,
+            decode_hex_fixture(JAVA_TWO_FRAME_FIXTURE_HEX),
+        )
+        .unwrap();
+        let mut bytes = fs::read(&initial_path).unwrap();
+        bytes[44] ^= 0x01;
+        fs::write(&initial_path, bytes).unwrap();
+
+        let queue = open(&dir);
+
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.payload_for_fsn(42), Some(&b"one"[..]));
+        assert_eq!(
+            queue.recovery_diagnostics(),
+            &[SfaRecoveryDiagnostic::NonEmptyTornTail {
+                path: initial_path,
+                torn_tail_bytes: 29,
+                append_offset: 35,
+                file_size: 64,
+                frames_recovered: 1,
+            }]
+        );
     }
 
     #[test]

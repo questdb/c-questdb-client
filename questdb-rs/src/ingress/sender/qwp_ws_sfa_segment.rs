@@ -168,13 +168,11 @@ impl SfaSegment {
         let offset = self.append_offset;
         let payload_len = (payload.len() as u32).to_le_bytes();
         let crc = crc32c_update(crc32c_update(0, &payload_len), payload);
-        let mut frame_header = [0u8; FRAME_HEADER_SIZE];
-        frame_header[..4].copy_from_slice(&crc.to_le_bytes());
-        frame_header[4..].copy_from_slice(&payload_len);
-
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.write_all(&frame_header)?;
+        self.file.seek(SeekFrom::Start(offset + 4))?;
+        self.file.write_all(&payload_len)?;
         self.file.write_all(payload)?;
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.file.write_all(&crc.to_le_bytes())?;
         self.append_offset = frame_end;
         self.frame_count += 1;
         self.torn_tail_bytes = 0;
@@ -447,6 +445,27 @@ mod tests {
         assert_eq!(scan.append_offset, 35);
         assert_eq!(scan.torn_tail_bytes, 29);
         assert_eq!(scan.frames[0].payload, b"one");
+    }
+
+    #[test]
+    fn scan_treats_length_and_payload_without_crc_commit_as_torn() {
+        let dir = TempDir::new().unwrap();
+        let path = initial_segment_path(dir.path());
+        let mut segment = SfaSegment::create(&path, 42, 80, 1_234_567_890_123).unwrap();
+        assert_eq!(segment.try_append(b"one").unwrap(), Some(24));
+        let torn_offset = segment.append_offset() as usize;
+        drop(segment);
+
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[torn_offset + 4..torn_offset + 8].copy_from_slice(&3u32.to_le_bytes());
+        bytes[torn_offset + 8..torn_offset + 11].copy_from_slice(b"two");
+        fs::write(&path, bytes).unwrap();
+
+        let scan = scan_file(&path).unwrap();
+
+        assert_eq!(payloads(&scan), vec![b"one".to_vec()]);
+        assert_eq!(scan.append_offset, torn_offset as u64);
+        assert_eq!(scan.torn_tail_bytes, 80 - torn_offset as u64);
     }
 
     #[test]

@@ -194,6 +194,24 @@ qwp_ws: 115 passed, 10 ignored
 whitespace check passed
 ```
 
+Latest Java parity follow-up validation:
+
+```bash
+cargo test --manifest-path questdb-rs/Cargo.toml qwp_ws_sfa_segment --lib
+cargo test --manifest-path questdb-rs/Cargo.toml qwp_ws_sfa_queue --lib
+cargo test --manifest-path questdb-rs/Cargo.toml qwpws --lib
+cargo test --manifest-path questdb-rs/Cargo.toml future_ --lib
+```
+
+Observed result:
+
+```text
+qwp_ws_sfa_segment: 10 passed, 2 ignored
+qwp_ws_sfa_queue: 18 passed
+qwpws config/store-and-forward filter: 9 passed
+future_ protocol filter: 4 passed
+```
+
 ## What is implemented
 
 ### API and ownership shape
@@ -297,10 +315,13 @@ segment codec spike. It currently validates:
 
 - Java `SF01` header bytes,
 - Java frame envelope `[crc32c][payloadLen][payload]`,
+- Java-compatible commit-marker ordering: write `payloadLen`, then payload, then
+  CRC last,
 - CRC32C using Java's known `123456789` vector,
 - `sf-initial.sfa` and `sf-<generation:016x>.sfa` naming,
 - clean zero-tail recovery,
 - torn-tail detection on CRC mismatch,
+- length+payload bytes without a CRC commit recover as torn/uncommitted,
 - create/open/append cursor behavior for one segment.
 - ignored cross-client fixture where Java writes a segment Rust opens, Rust
   writes a segment Java opens, and torn-tail recovery agrees in both directions.
@@ -314,11 +335,20 @@ queue adapter behind the manual driver seam. It currently validates:
 
 - open/create of Java-compatible `.sfa` segments,
 - frame publication only after durable append succeeds,
+- empty live submissions are rejected without consuming an FSN, and recovered
+  zero-length payload frames are corrupt,
 - restart recovery as `Published` frames,
 - retained payload lookup from the oldest retained FSN,
 - segment rotation and recovery in FSN order,
+- per-file scan failures are best-effort skipped without renaming while
+  contiguous valid sibling segments still recover,
+- corrupt middle segments still fail when the remaining valid files expose a
+  recovered-FSN gap,
+- non-empty torn tails recover their valid prefix and record a structured
+  `SfaRecoveryDiagnostic::NonEmptyTornTail`,
 - resolved-frame trimming of fully completed sealed segments,
-- clean close removing fully drained `.sfa` files,
+- clean close removing fully drained `.sfa` files; unexpected unlink failures
+  remain visible through the fallible Rust close/trim paths,
 - close timeout retaining recoverable frames,
 - manual-driver replay of recovered `.sfa` frames,
 - real QuestDB replay of a recovered `.sfa` frame through
@@ -330,9 +360,19 @@ above that queue. It currently validates Java-compatible
 same-slot contention and distinct-slot coexistence.
 
 `SenderBuilder::from_conf` now parses and validates the Java-compatible SF
-config keys: `sf_dir`, `sender_id`, `sf_max_bytes`, `sf_max_total_bytes`, and
-`sf_durability`. The size parser mirrors Java's `k` / `m` / `g` / `t` suffixes,
-case-insensitive units, and optional trailing `b`.
+config keys: `sf_dir`, `sender_id`, `sf_max_bytes`, `sf_max_total_bytes`,
+`sf_durability`, and Java's `in_flight_window` spelling as an alias for Rust
+`max_in_flight`, with Java's `in_flight_window > 1` validation. The size parser
+mirrors Java's `k` / `m` / `g` / `t` suffixes, case-insensitive units, and
+optional trailing `b`. Disabled Java defaults `request_durable_ack=off` and
+`drain_orphans=off|false` are accepted as no-ops. Dependent Java knobs
+`durable_ack_keepalive_interval_millis` (including Java's signed `<= 0`
+disable values) and `max_background_drainers` (signed int with Java's `< 0`
+rejection) are parsed as inert settings while their parent features are
+disabled. Behavior-bearing Java settings that Rust cannot honor yet are rejected
+explicitly:
+`request_durable_ack=on`, `max_schemas_per_connection`,
+`drain_orphans=on|true`, and `error_inbox_capacity`.
 
 The public sync sender now uses config-derived queue selection:
 
@@ -353,6 +393,8 @@ cross-client fixture compiles a small Java helper into `/tmp` and uses the local
 Java client checkout from
 `QDB_JAVA_CLIENT_CORE` or
 `/home/jara/devel/oss/questdb-arrays/java-questdb-client/core`.
+Enabled orphan-drainer settings are intentionally rejected until Rust has a
+product scenario and behavioral tests for adopting sibling slots.
 
 ### Manual driver and transport seam
 
@@ -571,8 +613,9 @@ conversion before the real driver is wired through.
   `Sender::poll_qwp_ws_error()` diagnostics, with drop-count observation via
   `Sender::qwp_ws_errors_dropped()`.
   Remaining gaps are Java-compatible local backpressure
-  (`sf_append_deadline_millis`), close/drain timeout semantics, and FFI exposure
-  of the public structured diagnostics. The manual driver now has a
+  (`sf_append_deadline_millis`), Java-style configurable close/drain timeout
+  semantics, full durable ACK trimming, and FFI exposure of the public
+  structured diagnostics. The manual driver now has a
   Java-like `PublicationLog` boundary: local publication owns FSNs/payload
   retention, and the driver owns connection-local wire sequencing, in-flight
   state, ACK mapping, and reconnect replay cursor. The high-level runner should
@@ -580,9 +623,9 @@ conversion before the real driver is wired through.
   driver into a permanent background-runner core.
 - Java has no client-owned dead-letter file format for rejected batches. Rust v1
   should not add one. Java's `.corrupt` files are recovery quarantine for
-  damaged `.sfa` segments, not server-rejection dead letters; rejected batches
-  are reported through structured errors/events and forgotten via the normal
-  ACK/trim path.
+  empty torn `.sfa` segments, not generic scan-failed side files or
+  server-rejection dead letters; rejected batches are reported through
+  structured errors/events and forgotten via the normal ACK/trim path.
 - The v1 dense dictionary replay shape is correctness-first and can be expensive
   for long-running high-cardinality symbol workloads.
 - Reserved-but-unused symbol IDs from failed submit attempts are acceptable in
@@ -608,9 +651,10 @@ sender has been removed to keep one maintained QWP/WebSocket core.
 4. Finish Java-compatible high-level close/drain timeout wiring. Rust `Drop`
    cannot return errors, so keep `Sender::close_drain()` as the explicit
    fallible API shape before accepting `close_flush_timeout_millis`.
-5. Extend the public structured QWP/WebSocket diagnostics through FFI without
+5. Implement durable ACK trimming before accepting `request_durable_ack=on`.
+6. Extend the public structured QWP/WebSocket diagnostics through FFI without
    adding dead-letter files or mandatory callbacks.
-6. Wire the C ABI stubs to the real queue/driver core.
+7. Wire the C ABI stubs to the real queue/driver core.
 
 Do not start with C++/Python wrappers, orphan draining, SF compaction, or
 performance optimization. Future async support should be an explicit adapter
