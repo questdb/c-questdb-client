@@ -184,8 +184,7 @@ fn qwpws_progress_config_parses_manual_and_background() {
     assert_specified_eq(&qwp_ws.progress, QwpWsProgress::Manual);
 
     let builder =
-        SenderBuilder::from_conf("qwpws::addr=localhost:9000;qwp_ws_progress=background;")
-            .unwrap();
+        SenderBuilder::from_conf("qwpws::addr=localhost:9000;qwp_ws_progress=background;").unwrap();
     let qwp_ws = builder.qwp_ws.as_ref().unwrap();
     assert_specified_eq(&qwp_ws.progress, QwpWsProgress::Background);
 }

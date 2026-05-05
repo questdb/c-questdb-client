@@ -22,9 +22,9 @@
  *
  ******************************************************************************/
 
-use crate::{Error, ErrorCode, Result};
 #[cfg(feature = "_sender-qwp-ws")]
 use super::QwpWsProgress;
+use crate::{Error, ErrorCode, Result};
 use std::ops::Deref;
 #[cfg(feature = "_sender-qwp-ws")]
 use std::path::PathBuf;

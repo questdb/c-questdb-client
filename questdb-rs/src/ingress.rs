@@ -1013,9 +1013,7 @@ impl SenderBuilder {
                 "The \"qwp_ws_progress\" setting is only supported for QWP/WebSocket."
             ));
         };
-        qwp_ws
-            .progress
-            .set_specified("qwp_ws_progress", progress)?;
+        qwp_ws.progress.set_specified("qwp_ws_progress", progress)?;
         Ok(self)
     }
 

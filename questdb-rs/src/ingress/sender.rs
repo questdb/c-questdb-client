@@ -324,9 +324,7 @@ impl Sender {
             &self.handler,
             SyncProtocolHandler::SyncQwpWs(_) | SyncProtocolHandler::ManualQwpWs(_)
         ) {
-            return self
-                .flush_qwp_ws_buffer(buf, transactional)
-                .map(|_| ());
+            return self.flush_qwp_ws_buffer(buf, transactional).map(|_| ());
         }
 
         if !self.connected {

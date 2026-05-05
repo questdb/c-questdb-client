@@ -160,7 +160,11 @@ fn write_server_frame(
     stream.write_all(&frame)
 }
 
-fn write_server_close_frame(stream: &mut TcpStream, code: u16, reason: &str) -> std::io::Result<()> {
+fn write_server_close_frame(
+    stream: &mut TcpStream,
+    code: u16,
+    reason: &str,
+) -> std::io::Result<()> {
     let mut payload = Vec::new();
     payload.extend_from_slice(&code.to_be_bytes());
     payload.extend_from_slice(reason.as_bytes());
@@ -520,9 +524,11 @@ fn qwp_ws_manual_sender_can_pipeline_before_waiting() {
     assert_eq!(&frames[0][0..4], b"QWP1");
     assert_eq!(&frames[1][0..4], b"QWP1");
 
-    assert!(sender
-        .await_acked_fsn(second_fsn, Duration::from_secs(5))
-        .unwrap());
+    assert!(
+        sender
+            .await_acked_fsn(second_fsn, Duration::from_secs(5))
+            .unwrap()
+    );
     assert_eq!(sender.acked_fsn().unwrap(), Some(second_fsn));
 }
 
@@ -605,9 +611,11 @@ fn qwp_ws_manual_sender_advances_ack_watermark_across_rejections() {
     assert_eq!(second_fsn, 1);
     assert!(sender.drive_once().unwrap());
     assert!(sender.drive_once().unwrap());
-    assert!(sender
-        .await_acked_fsn(second_fsn, Duration::from_secs(5))
-        .unwrap());
+    assert!(
+        sender
+            .await_acked_fsn(second_fsn, Duration::from_secs(5))
+            .unwrap()
+    );
     assert_eq!(sender.acked_fsn().unwrap(), Some(second_fsn));
 
     let first_error = sender.poll_qwp_ws_error().unwrap().unwrap();
@@ -1102,16 +1110,15 @@ fn qwp_ws_schema_rejection_drops_and_sender_continues() {
 
     let received_frames = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(received_frames.len(), 2);
-    assert!(sender
-        .await_acked_fsn(second_fsn, Duration::from_secs(5))
-        .unwrap());
+    assert!(
+        sender
+            .await_acked_fsn(second_fsn, Duration::from_secs(5))
+            .unwrap()
+    );
 
     let qwp_error = sender.poll_qwp_ws_error().unwrap().unwrap();
     assert_eq!(qwp_error.category, QwpWsErrorCategory::SchemaMismatch);
-    assert_eq!(
-        qwp_error.applied_policy,
-        QwpWsErrorPolicy::DropAndContinue
-    );
+    assert_eq!(qwp_error.applied_policy, QwpWsErrorPolicy::DropAndContinue);
     assert_eq!(qwp_error.status, Some(QWP_STATUS_SCHEMA_MISMATCH));
     assert_eq!(qwp_error.message.as_deref(), Some("bad schema"));
     assert_eq!(qwp_error.message_sequence, Some(FIRST_WIRE_SEQUENCE));
@@ -1174,7 +1181,10 @@ fn qwp_ws_terminal_close_is_pollable_as_protocol_violation() {
     assert_eq!(close_error.applied_policy, QwpWsErrorPolicy::Halt);
     assert_eq!(close_error.status, None);
     assert_eq!(close_error.message_sequence, None);
-    assert_eq!(close_error.message.as_deref(), Some("ws-close[1002]: bad frame"));
+    assert_eq!(
+        close_error.message.as_deref(),
+        Some("ws-close[1002]: bad frame")
+    );
     assert_eq!(close_error.from_fsn, fsn);
     assert_eq!(close_error.to_fsn, fsn);
     assert_eq!(sender.poll_qwp_ws_error().unwrap(), None);
@@ -1186,12 +1196,12 @@ fn qwp_ws_terminal_close_is_pollable_as_protocol_violation() {
         "expected terminal close in empty flush message, got: {}",
         err.msg()
     );
-    assert!(buf.is_empty(), "empty terminal flush must leave buffer empty");
+    assert!(
+        buf.is_empty(),
+        "empty terminal flush must leave buffer empty"
+    );
 
-    buf.table("trades")
-        .unwrap()
-        .column_i64("qty", 2)
-        .unwrap();
+    buf.table("trades").unwrap().column_i64("qty", 2).unwrap();
     let err = sender.flush(&mut buf).unwrap_err();
     assert!(
         err.msg().contains("ws-close[1002]: bad frame"),
