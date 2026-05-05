@@ -553,11 +553,10 @@ fn recover_segments(options: &SfaQueueOptions) -> Result<Option<RecoveredSegment
                     Err(err) if err.kind() == io::ErrorKind::NotFound => {}
                     Err(err) => return Err(err.into()),
                 }
-                continue;
+            } else {
+                quarantine_segment(&path);
             }
-            return Err(SfaQueueError::CorruptSegments {
-                reason: "empty segment has torn tail",
-            });
+            continue;
         }
 
         segments.push(RecoveredSegment {
@@ -711,6 +710,26 @@ fn is_sfa_file(path: &Path) -> bool {
         .is_some_and(|name| name.ends_with(".sfa"))
 }
 
+fn corrupt_segment_path(path: &Path) -> PathBuf {
+    let mut path = path.as_os_str().to_os_string();
+    path.push(".corrupt");
+    PathBuf::from(path)
+}
+
+fn quarantine_segment(path: &Path) {
+    // Java's SegmentRing treats this quarantine as best-effort and keeps
+    // recovery live even if the rename fails. It also replaces an existing
+    // .corrupt file on Windows, so remove the target first before the
+    // platform-neutral Rust rename.
+    let corrupt_path = corrupt_segment_path(path);
+    match fs::remove_file(&corrupt_path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => {}
+    }
+    let _ = fs::rename(path, corrupt_path);
+}
+
 fn remove_all_sfa_files(slot_dir: &Path) -> Result<(), io::Error> {
     for entry in fs::read_dir(slot_dir)? {
         let entry = entry?;
@@ -812,6 +831,14 @@ mod tests {
             .count()
     }
 
+    fn write_empty_torn_segment(path: &Path, base_seq: u64, segment_size_bytes: u64) {
+        let segment = SfaSegment::create(path, base_seq, segment_size_bytes, 0).unwrap();
+        drop(segment);
+        let mut bytes = fs::read(path).unwrap();
+        bytes[HEADER_SIZE] = 0xca;
+        fs::write(path, bytes).unwrap();
+    }
+
     fn decode_hex_fixture(hex: &str) -> Vec<u8> {
         let mut nibbles = Vec::new();
         for byte in hex.bytes() {
@@ -883,6 +910,47 @@ mod tests {
                 reason: "recovered frame capacity exceeded",
             }
         ));
+    }
+
+    #[test]
+    fn recovery_quarantines_empty_torn_initial_segment_and_continues() {
+        let dir = TempDir::new().unwrap();
+        let initial_path = initial_segment_path(dir.path());
+        let corrupt_path = corrupt_segment_path(&initial_path);
+        fs::write(&corrupt_path, b"stale corrupt segment").unwrap();
+        write_empty_torn_segment(&initial_path, 0, 256);
+
+        let queue = open(&dir);
+
+        assert_eq!(queue.len(), 0);
+        assert!(initial_path.exists());
+        assert!(corrupt_path.exists());
+        let active_scan = scan_file(&initial_path).unwrap();
+        assert!(active_scan.frames.is_empty());
+        assert_eq!(active_scan.torn_tail_bytes, 0);
+        let corrupt_scan = scan_file(&corrupt_path).unwrap();
+        assert!(corrupt_scan.frames.is_empty());
+        assert!(corrupt_scan.torn_tail_bytes > 0);
+    }
+
+    #[test]
+    fn recovery_quarantines_empty_torn_spare_without_dropping_valid_frames() {
+        let dir = TempDir::new().unwrap();
+        let initial_path = initial_segment_path(dir.path());
+        let spare_path = spare_segment_path(dir.path(), 0);
+        let corrupt_spare_path = corrupt_segment_path(&spare_path);
+
+        let mut initial = SfaSegment::create(&initial_path, 0, 256, 0).unwrap();
+        initial.try_append(b"first").unwrap();
+        drop(initial);
+        write_empty_torn_segment(&spare_path, 99, 256);
+
+        let queue = open(&dir);
+
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.payload_for_fsn(0), Some(&b"first"[..]));
+        assert!(!spare_path.exists());
+        assert!(corrupt_spare_path.exists());
     }
 
     #[test]
