@@ -35,7 +35,7 @@ use std::ptr;
 use std::slice;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 pub(crate) struct PendingPayload {
     storage: PendingPayloadStorage,
@@ -223,19 +223,6 @@ pub(crate) enum QueueError {
     SequenceOverflow,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LockFreePublishError {
-    Queue(QueueError),
-    Terminal,
-    Closing,
-}
-
-impl From<QueueError> for LockFreePublishError {
-    fn from(value: QueueError) -> Self {
-        Self::Queue(value)
-    }
-}
-
 #[derive(Debug)]
 pub(crate) struct VolatileFrameQueue {
     slots: Vec<FrameSlot>,
@@ -278,9 +265,6 @@ struct LockFreeVolatileFrameQueueInner {
     published_upper: AtomicU64,
     completed_upper: AtomicU64,
     rejected_fsns: Mutex<Vec<u64>>,
-    publisher_state: AtomicU8,
-    producer_claimed: AtomicBool,
-    publish_active: AtomicBool,
 }
 
 struct LockFreeByteRing {
@@ -337,9 +321,6 @@ struct LockFreeFrameSlot {
 
 const LOCK_FREE_SLOT_FREE: u8 = 0;
 const LOCK_FREE_SLOT_PUBLISHED: u8 = 1;
-const LOCK_FREE_PUBLISHER_OPEN: u8 = 0;
-const LOCK_FREE_PUBLISHER_CLOSING: u8 = 1;
-const LOCK_FREE_PUBLISHER_TERMINAL: u8 = 2;
 
 // The log is deliberately SPSC: the sender thread owns the producer handle, and
 // the runner thread is the only consumer/completer. Slot payload access is gated
@@ -591,43 +572,18 @@ impl LockFreeVolatileFrameQueue {
                 published_upper: AtomicU64::new(0),
                 completed_upper: AtomicU64::new(0),
                 rejected_fsns: Mutex::new(Vec::new()),
-                publisher_state: AtomicU8::new(LOCK_FREE_PUBLISHER_OPEN),
-                producer_claimed: AtomicBool::new(false),
-                publish_active: AtomicBool::new(false),
             }),
         })
     }
 
-    pub(crate) fn claim_producer(&self) -> Option<LockFreeVolatileProducer> {
-        self.inner
-            .producer_claimed
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .ok()
-            .map(|_| LockFreeVolatileProducer {
-                queue: self.clone(),
-            })
+    fn producer(&self) -> LockFreeVolatileProducer {
+        LockFreeVolatileProducer {
+            queue: self.clone(),
+        }
     }
 
-    pub(crate) fn close_for_publication(&self) {
-        let _ = self.inner.publisher_state.compare_exchange(
-            LOCK_FREE_PUBLISHER_OPEN,
-            LOCK_FREE_PUBLISHER_CLOSING,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-        self.wait_for_active_publish();
-    }
-
-    pub(crate) fn terminalize_publication(&self) {
-        self.inner
-            .publisher_state
-            .store(LOCK_FREE_PUBLISHER_TERMINAL, Ordering::Release);
-        self.wait_for_active_publish();
-    }
-
-    fn try_submit(&self, payload: &[u8]) -> Result<QwpReceipt, LockFreePublishError> {
-        let _guard = self.enter_publish()?;
-        self.try_submit_open(payload).map_err(Into::into)
+    fn try_submit(&self, payload: &[u8]) -> Result<QwpReceipt, QueueError> {
+        self.try_submit_open(payload)
     }
 
     pub(crate) fn pending_payload_for_fsn(&self, fsn: u64) -> Option<PendingPayload> {
@@ -874,48 +830,10 @@ impl LockFreeVolatileFrameQueue {
             && fsn < self.inner.published_upper.load(Ordering::Acquire)
     }
 
-    fn enter_publish(&self) -> Result<PublishGuard<'_>, LockFreePublishError> {
-        match self.inner.publisher_state.load(Ordering::Acquire) {
-            LOCK_FREE_PUBLISHER_OPEN => {}
-            LOCK_FREE_PUBLISHER_CLOSING => return Err(LockFreePublishError::Closing),
-            LOCK_FREE_PUBLISHER_TERMINAL => return Err(LockFreePublishError::Terminal),
-            _ => return Err(LockFreePublishError::Terminal),
-        }
-
-        self.inner.publish_active.store(true, Ordering::Release);
-        match self.inner.publisher_state.load(Ordering::Acquire) {
-            LOCK_FREE_PUBLISHER_OPEN => Ok(PublishGuard {
-                active: &self.inner.publish_active,
-            }),
-            LOCK_FREE_PUBLISHER_CLOSING => {
-                self.inner.publish_active.store(false, Ordering::Release);
-                Err(LockFreePublishError::Closing)
-            }
-            LOCK_FREE_PUBLISHER_TERMINAL => {
-                self.inner.publish_active.store(false, Ordering::Release);
-                Err(LockFreePublishError::Terminal)
-            }
-            _ => {
-                self.inner.publish_active.store(false, Ordering::Release);
-                Err(LockFreePublishError::Terminal)
-            }
-        }
-    }
-
     fn slot_for_fsn(&self, fsn: u64) -> &LockFreeFrameSlot {
         let slot_index = (fsn % self.inner.slots.len() as u64) as usize;
         &self.inner.slots[slot_index]
     }
-
-    fn wait_for_active_publish(&self) {
-        while self.inner.publish_active.load(Ordering::Acquire) {
-            std::hint::spin_loop();
-        }
-    }
-}
-
-struct PublishGuard<'a> {
-    active: &'a AtomicBool,
 }
 
 struct ByteReservation {
@@ -923,17 +841,8 @@ struct ByteReservation {
     reserved_len: usize,
 }
 
-impl Drop for PublishGuard<'_> {
-    fn drop(&mut self) {
-        self.active.store(false, Ordering::Release);
-    }
-}
-
 impl LockFreeVolatileProducer {
-    pub(crate) fn try_submit(
-        &mut self,
-        payload: &[u8],
-    ) -> Result<QwpReceipt, LockFreePublishError> {
+    pub(crate) fn try_submit(&mut self, payload: &[u8]) -> Result<QwpReceipt, QueueError> {
         self.queue.try_submit(payload)
     }
 }
@@ -941,30 +850,19 @@ impl LockFreeVolatileProducer {
 impl LockFreeVolatilePublicationLog {
     pub(crate) fn new(options: VolatileQueueOptions) -> Result<Self, QueueError> {
         let queue = LockFreeVolatileFrameQueue::new(options)?;
-        let producer = queue.claim_producer();
+        let producer = Some(queue.producer());
         Ok(Self { queue, producer })
     }
 
-    pub(crate) fn claim_producer(&mut self) -> Option<LockFreeVolatileProducer> {
+    pub(crate) fn take_producer(&mut self) -> Option<LockFreeVolatileProducer> {
         self.producer.take()
     }
 
-    pub(crate) fn try_submit(
-        &mut self,
-        payload: &[u8],
-    ) -> Result<QwpReceipt, LockFreePublishError> {
+    pub(crate) fn try_submit(&mut self, payload: &[u8]) -> Result<QwpReceipt, QueueError> {
         let Some(producer) = self.producer.as_mut() else {
-            return Err(LockFreePublishError::Closing);
+            return Err(QueueError::NoUnsentFrame);
         };
         producer.try_submit(payload)
-    }
-
-    pub(crate) fn close_for_publication(&self) {
-        self.queue.close_for_publication();
-    }
-
-    pub(crate) fn terminalize_publication(&self) {
-        self.queue.terminalize_publication();
     }
 
     pub(crate) fn pending_payload_for_fsn(&self, fsn: u64) -> Option<PendingPayload> {
@@ -1190,7 +1088,7 @@ mod tests {
     #[test]
     fn lock_free_publish_returns_value_receipts_and_published_status() {
         let queue = lock_free_queue(4, 1024, 2);
-        let mut producer = queue.claim_producer().unwrap();
+        let mut producer = queue.producer();
 
         let first = producer.try_submit(b"first").unwrap();
         let second = producer.try_submit(b"second").unwrap();
@@ -1206,26 +1104,29 @@ mod tests {
     }
 
     #[test]
-    fn lock_free_queue_exposes_only_one_producer_handle() {
-        let queue = lock_free_queue(4, 1024, 2);
+    fn lock_free_publication_log_moves_single_producer_handle() {
+        let mut log = LockFreeVolatilePublicationLog::new(VolatileQueueOptions {
+            max_frames: 4,
+            max_bytes: 1024,
+            max_in_flight: 2,
+        })
+        .unwrap();
 
-        assert!(queue.claim_producer().is_some());
-        assert!(queue.claim_producer().is_none());
+        assert!(log.take_producer().is_some());
+        assert!(log.take_producer().is_none());
     }
 
     #[test]
     fn lock_free_queue_reuses_slots_after_completion() {
         let queue = lock_free_queue(2, 7, 2);
-        let mut producer = queue.claim_producer().unwrap();
+        let mut producer = queue.producer();
 
         let first = producer.try_submit(b"abc").unwrap();
         let second = producer.try_submit(b"de").unwrap();
 
         assert_eq!(
             producer.try_submit(b"fg"),
-            Err(LockFreePublishError::Queue(QueueError::FrameCapacityFull {
-                max_frames: 2
-            }))
+            Err(QueueError::FrameCapacityFull { max_frames: 2 })
         );
 
         queue.complete_through_fsn(first.fsn).unwrap();
@@ -1240,16 +1141,16 @@ mod tests {
     #[test]
     fn lock_free_queue_releases_byte_capacity_on_ack() {
         let queue = lock_free_queue(4, 5, 2);
-        let mut producer = queue.claim_producer().unwrap();
+        let mut producer = queue.producer();
 
         let first = producer.try_submit(b"abc").unwrap();
         assert_eq!(
             producer.try_submit(b"def"),
-            Err(LockFreePublishError::Queue(QueueError::ByteCapacityFull {
+            Err(QueueError::ByteCapacityFull {
                 payload_len: 3,
                 bytes_used: 3,
                 max_bytes: 5
-            }))
+            })
         );
 
         queue.complete_through_fsn(first.fsn).unwrap();
@@ -1262,7 +1163,7 @@ mod tests {
     #[test]
     fn lock_free_queue_wraps_payload_bytes_without_corruption() {
         let queue = lock_free_queue(4, 8, 4);
-        let mut producer = queue.claim_producer().unwrap();
+        let mut producer = queue.producer();
 
         let first = producer.try_submit(b"aaaaa").unwrap();
         let second = producer.try_submit(b"bb").unwrap();
@@ -1280,7 +1181,7 @@ mod tests {
     #[test]
     fn lock_free_payload_view_survives_disjoint_publish() {
         let queue = lock_free_queue(4, 64, 4);
-        let mut producer = queue.claim_producer().unwrap();
+        let mut producer = queue.producer();
 
         let first = producer.try_submit(b"first").unwrap();
         let first_payload = queue.pending_payload_for_fsn(first.fsn).unwrap();
@@ -1296,7 +1197,7 @@ mod tests {
     #[test]
     fn lock_free_reject_frees_wrapped_frame_and_byte_capacity() {
         let queue = lock_free_queue(4, 8, 4);
-        let mut producer = queue.claim_producer().unwrap();
+        let mut producer = queue.producer();
 
         let first = producer.try_submit(b"aaaaa").unwrap();
         let second = producer.try_submit(b"bb").unwrap();
@@ -1326,7 +1227,7 @@ mod tests {
         use crate::alloc_counter;
 
         let queue = lock_free_queue(4, 64, 4);
-        let mut producer = queue.claim_producer().unwrap();
+        let mut producer = queue.producer();
 
         for _ in 0..4 {
             let receipt = producer.try_submit(b"steady-state").unwrap();
@@ -1347,7 +1248,7 @@ mod tests {
     #[test]
     fn lock_free_reject_marks_receipt_rejected_and_completes_prior_frames() {
         let queue = lock_free_queue(4, 1024, 4);
-        let mut producer = queue.claim_producer().unwrap();
+        let mut producer = queue.producer();
 
         let first = producer.try_submit(b"first").unwrap();
         let second = producer.try_submit(b"second").unwrap();
@@ -1366,24 +1267,6 @@ mod tests {
         assert_eq!(
             queue.receipt_status(third),
             QwpReceiptStatus::Published { fsn: third.fsn }
-        );
-    }
-
-    #[test]
-    fn lock_free_queue_closing_and_terminal_reject_publication() {
-        let queue = lock_free_queue(4, 1024, 2);
-        let mut producer = queue.claim_producer().unwrap();
-
-        queue.close_for_publication();
-        assert_eq!(
-            producer.try_submit(b"payload"),
-            Err(LockFreePublishError::Closing)
-        );
-
-        queue.terminalize_publication();
-        assert_eq!(
-            producer.try_submit(b"payload"),
-            Err(LockFreePublishError::Terminal)
         );
     }
 

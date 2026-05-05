@@ -33,6 +33,8 @@
 use std::collections::VecDeque;
 #[cfg(feature = "sync-sender-qwp-ws")]
 use std::io::Write;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "sync-sender-qwp-ws")]
@@ -48,12 +50,12 @@ use super::qwp_ws::{WsStream, establish_connection, write_binary_frame};
 #[cfg(feature = "sync-sender-qwp-ws")]
 use super::qwp_ws_codec::WS_OPCODE_BINARY;
 use super::qwp_ws_codec::{self as codec, PipelinedResponse};
-use super::qwp_ws_queue::{
-    LockFreePublishError, LockFreeVolatileProducer, LockFreeVolatilePublicationLog, OutboundFrame,
-    OutboundFrameView, PendingPayload, QueueError, QwpReceipt, QwpReceiptStatus, SentFrame,
-    VolatileFrameQueue, VolatileQueueOptions,
-};
 use super::qwp_ws_ownership::{QwpWsErrorCategory, QwpWsErrorPolicy, QwpWsSenderError};
+use super::qwp_ws_queue::{
+    LockFreeVolatileProducer, LockFreeVolatilePublicationLog, OutboundFrame, OutboundFrameView,
+    PendingPayload, QueueError, QwpReceipt, QwpReceiptStatus, SentFrame, VolatileFrameQueue,
+    VolatileQueueOptions,
+};
 
 const DEFAULT_EVENT_CAPACITY: usize = 1024;
 
@@ -135,18 +137,72 @@ pub(crate) enum QwpWsReconnectProgress {
     Stopped,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PublicationState {
+    Open,
+    Closing,
+    Terminal,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PublicationLifecycle {
+    state: Arc<AtomicU8>,
+}
+
+const PUBLICATION_OPEN: u8 = 0;
+const PUBLICATION_CLOSING: u8 = 1;
+const PUBLICATION_TERMINAL: u8 = 2;
+
+impl PublicationState {
+    fn from_raw(state: u8) -> Self {
+        match state {
+            PUBLICATION_OPEN => Self::Open,
+            PUBLICATION_CLOSING => Self::Closing,
+            PUBLICATION_TERMINAL => Self::Terminal,
+            _ => Self::Terminal,
+        }
+    }
+}
+
+impl PublicationLifecycle {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(AtomicU8::new(PUBLICATION_OPEN)),
+        }
+    }
+
+    pub(crate) fn load(&self) -> PublicationState {
+        PublicationState::from_raw(self.state.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn begin_close(&self) {
+        let _ = self.state.compare_exchange(
+            PUBLICATION_OPEN,
+            PUBLICATION_CLOSING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn terminalize(&self) -> PublicationState {
+        PublicationState::from_raw(self.state.swap(PUBLICATION_TERMINAL, Ordering::AcqRel))
+    }
+
+    pub(crate) fn is_terminal(&self) -> bool {
+        self.load() == PublicationState::Terminal
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct QwpWsPublicationStore<Q = VolatileFrameQueue> {
     queue: Q,
     events: DriverEventRing,
-    terminal: bool,
-    terminal_fsn: Option<u64>,
+    lifecycle: PublicationLifecycle,
     terminal_error: Option<Error>,
     terminal_sender_error: Option<QwpWsSenderError>,
     last_server_error: Option<QwpServerError>,
     rejected_frames: VecDeque<QwpRejectedFrame>,
     sender_errors: SenderErrorRing,
-    closing: bool,
 }
 
 impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
@@ -154,38 +210,39 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         Self {
             queue,
             events: DriverEventRing::new(event_capacity),
-            terminal: false,
-            terminal_fsn: None,
+            lifecycle: PublicationLifecycle::new(),
             terminal_error: None,
             terminal_sender_error: None,
             last_server_error: None,
             rejected_frames: VecDeque::new(),
             sender_errors: SenderErrorRing::new(event_capacity),
-            closing: false,
         }
     }
 
+    pub(crate) fn lifecycle(&self) -> PublicationLifecycle {
+        self.lifecycle.clone()
+    }
+
     pub(crate) fn try_submit(&mut self, payload: &[u8]) -> Result<QwpReceipt, DriverError> {
-        if self.terminal {
-            return Err(DriverError::Terminal);
-        }
-        if self.closing {
-            return Err(DriverError::Closing);
+        match self.lifecycle.load() {
+            PublicationState::Open => {}
+            PublicationState::Closing => return Err(DriverError::Closing),
+            PublicationState::Terminal => return Err(DriverError::Terminal),
         }
         let receipt = self.queue.try_publish(payload)?;
         self.push_event(DriverEvent::Published { fsn: receipt.fsn });
         Ok(receipt)
     }
 
-    pub(crate) fn claim_lock_free_producer(&mut self) -> Option<LockFreeVolatileProducer> {
-        self.queue.claim_lock_free_producer()
+    pub(crate) fn take_lock_free_producer(&mut self) -> Option<LockFreeVolatileProducer> {
+        self.queue.take_lock_free_producer()
     }
 
     pub(crate) fn next_outbound_frame(
         &self,
         send_cursor: &mut SendCursor,
     ) -> Result<Option<OutboundFrame>, DriverError> {
-        if self.terminal {
+        if self.is_terminal() {
             return Ok(None);
         }
         send_cursor.next_outbound_frame(&self.queue)
@@ -277,17 +334,14 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
     }
 
     pub(crate) fn mark_terminal(&mut self, error: Option<Error>) {
-        if !self.terminal {
-            self.terminal = true;
-            self.queue.terminalize_publication();
-            self.terminal_fsn = self.queue.published_fsn();
+        if self.lifecycle.terminalize() != PublicationState::Terminal {
             self.terminal_error = error;
             self.push_event(DriverEvent::Terminal);
         }
     }
 
     pub(crate) fn is_terminal(&self) -> bool {
-        self.terminal
+        self.lifecycle.is_terminal()
     }
 
     pub(crate) fn receipt_status(
@@ -296,10 +350,7 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         receipt: QwpReceipt,
     ) -> QwpReceiptStatus {
         let status = self.queue.receipt_status(receipt);
-        if let Some(terminal_fsn) = self.terminal_fsn
-            && receipt.fsn <= terminal_fsn
-            && status.is_pending()
-        {
+        if self.is_terminal() && status.is_pending() {
             return QwpReceiptStatus::Terminal { fsn: receipt.fsn };
         }
         if matches!(status, QwpReceiptStatus::Published { .. })
@@ -328,8 +379,7 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
     }
 
     pub(crate) fn set_closing(&mut self) {
-        self.closing = true;
-        self.queue.close_for_publication();
+        self.lifecycle.begin_close();
     }
 
     pub(crate) fn all_published_receipts_resolved(&self) -> bool {
@@ -460,9 +510,9 @@ impl<T: ManualDriverTransport> QwpWsSendCore<T> {
     ) -> Result<QwpWsSendProgress, DriverError> {
         store.record_sent_frame(&mut self.send_cursor, frame)?;
         match send_result {
-            TransportSendResult::NoResponse => Ok(QwpWsSendProgress::Outcome(DriveOutcome::Sent(
-                frame,
-            ))),
+            TransportSendResult::NoResponse => {
+                Ok(QwpWsSendProgress::Outcome(DriveOutcome::Sent(frame)))
+            }
             TransportSendResult::Response(response) => store
                 .apply_response(&mut self.send_cursor, response)
                 .map(QwpWsSendProgress::Outcome),
@@ -472,9 +522,7 @@ impl<T: ManualDriverTransport> QwpWsSendCore<T> {
         }
     }
 
-    pub(crate) fn poll_response(
-        &mut self,
-    ) -> Result<Option<TransportResponse>, TransportFailure> {
+    pub(crate) fn poll_response(&mut self) -> Result<Option<TransportResponse>, TransportFailure> {
         self.transport.poll_response()
     }
 
@@ -948,9 +996,7 @@ impl<Q: PublicationLog, T: ManualDriverTransport> ManualDriverPrototype<Q, T> {
         self.store.is_terminal()
     }
 
-    pub(crate) fn into_parts(
-        self,
-    ) -> (QwpWsPublicationStore<Q>, QwpWsSendCore<T>) {
+    pub(crate) fn into_parts(self) -> (QwpWsPublicationStore<Q>, QwpWsSendCore<T>) {
         (self.store, self.send_core)
     }
 }
@@ -998,15 +1044,13 @@ fn double_duration(duration: Duration) -> Duration {
 
 pub(crate) trait PublicationLog {
     fn try_publish(&mut self, payload: &[u8]) -> Result<QwpReceipt, DriverError>;
-    fn claim_lock_free_producer(&mut self) -> Option<LockFreeVolatileProducer> {
+    fn take_lock_free_producer(&mut self) -> Option<LockFreeVolatileProducer> {
         None
     }
     fn pending_payload_for_fsn(&self, fsn: u64) -> Result<Option<PendingPayload>, DriverError>;
     fn oldest_unresolved_fsn(&self) -> Option<u64>;
     fn complete_through(&mut self, fsn: u64) -> Result<(), DriverError>;
     fn reject_fsn(&mut self, fsn: u64) -> Result<QwpReceipt, DriverError>;
-    fn close_for_publication(&self) {}
-    fn terminalize_publication(&self) {}
     fn close(&mut self) -> Result<(), DriverError> {
         Ok(())
     }
@@ -1309,33 +1353,31 @@ impl ManualDriverTransport for BlockingQwpWsTransport {
             &mut self.send_buf,
             &mut self.recv,
         )
-        .map_err(|err| {
-            match err {
-                super::qwp_ws::WsMessageError::Close(close) => {
-                    if let Some(close_code) = close.code
-                        && super::qwp_ws::is_terminal_ws_close_code(close_code)
-                    {
-                        return TransportFailure::ProtocolViolation {
-                            close_code: Some(close_code),
-                            reason: close.reason,
-                        };
-                    }
-                    TransportFailure::Disconnect(close.into_error())
+        .map_err(|err| match err {
+            super::qwp_ws::WsMessageError::Close(close) => {
+                if let Some(close_code) = close.code
+                    && super::qwp_ws::is_terminal_ws_close_code(close_code)
+                {
+                    return TransportFailure::ProtocolViolation {
+                        close_code: Some(close_code),
+                        reason: close.reason,
+                    };
                 }
-                super::qwp_ws::WsMessageError::ProtocolViolation(reason) => {
-                    TransportFailure::ProtocolViolation {
-                        close_code: None,
-                        reason,
-                    }
-                }
-                super::qwp_ws::WsMessageError::Error(err) => match err.code() {
-                    ErrorCode::SocketError => TransportFailure::Disconnect(err),
-                    ErrorCode::AuthError | ErrorCode::ProtocolVersionError => {
-                        TransportFailure::Terminal(err)
-                    }
-                    _ => TransportFailure::Terminal(err),
+                TransportFailure::Disconnect(close.into_error())
+            }
+            super::qwp_ws::WsMessageError::ProtocolViolation(reason) => {
+                TransportFailure::ProtocolViolation {
+                    close_code: None,
+                    reason,
                 }
             }
+            super::qwp_ws::WsMessageError::Error(err) => match err.code() {
+                ErrorCode::SocketError => TransportFailure::Disconnect(err),
+                ErrorCode::AuthError | ErrorCode::ProtocolVersionError => {
+                    TransportFailure::Terminal(err)
+                }
+                _ => TransportFailure::Terminal(err),
+            },
         })?;
         if opcode != WS_OPCODE_BINARY {
             return Err(TransportFailure::ProtocolViolation {
@@ -1360,15 +1402,13 @@ impl ManualDriverTransport for BlockingQwpWsTransport {
     ) -> Result<TransportSendResult, TransportFailure> {
         #[cfg(test)]
         let sent_frame = frame.sent_frame();
-        write_binary_frame(&mut self.stream, &mut self.send_buf, frame.payload).map_err(
-            |io| {
-                TransportFailure::Disconnect(error::fmt!(
-                    SocketError,
-                    "Could not send WebSocket frame: {}",
-                    io
-                ))
-            },
-        )?;
+        write_binary_frame(&mut self.stream, &mut self.send_buf, frame.payload).map_err(|io| {
+            TransportFailure::Disconnect(error::fmt!(
+                SocketError,
+                "Could not send WebSocket frame: {}",
+                io
+            ))
+        })?;
         self.stream.flush().map_err(|io| {
             TransportFailure::Disconnect(error::fmt!(
                 SocketError,
@@ -1438,11 +1478,11 @@ impl PublicationLog for VolatileFrameQueue {
 
 impl PublicationLog for LockFreeVolatilePublicationLog {
     fn try_publish(&mut self, payload: &[u8]) -> Result<QwpReceipt, DriverError> {
-        LockFreeVolatilePublicationLog::try_submit(self, payload).map_err(lock_free_publish_error)
+        Ok(LockFreeVolatilePublicationLog::try_submit(self, payload)?)
     }
 
-    fn claim_lock_free_producer(&mut self) -> Option<LockFreeVolatileProducer> {
-        LockFreeVolatilePublicationLog::claim_producer(self)
+    fn take_lock_free_producer(&mut self) -> Option<LockFreeVolatileProducer> {
+        LockFreeVolatilePublicationLog::take_producer(self)
     }
 
     fn pending_payload_for_fsn(&self, fsn: u64) -> Result<Option<PendingPayload>, DriverError> {
@@ -1465,14 +1505,6 @@ impl PublicationLog for LockFreeVolatilePublicationLog {
         Ok(LockFreeVolatilePublicationLog::reject_fsn(self, fsn)?)
     }
 
-    fn close_for_publication(&self) {
-        LockFreeVolatilePublicationLog::close_for_publication(self);
-    }
-
-    fn terminalize_publication(&self) {
-        LockFreeVolatilePublicationLog::terminalize_publication(self);
-    }
-
     fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus {
         LockFreeVolatilePublicationLog::receipt_status(self, receipt)
     }
@@ -1487,14 +1519,6 @@ impl PublicationLog for LockFreeVolatilePublicationLog {
 
     fn max_in_flight(&self) -> usize {
         LockFreeVolatilePublicationLog::max_in_flight(self)
-    }
-}
-
-pub(crate) fn lock_free_publish_error(err: LockFreePublishError) -> DriverError {
-    match err {
-        LockFreePublishError::Queue(err) => DriverError::Queue(err),
-        LockFreePublishError::Terminal => DriverError::Terminal,
-        LockFreePublishError::Closing => DriverError::Closing,
     }
 }
 
@@ -2019,10 +2043,7 @@ mod tests {
             })
         );
         let driver = publisher.into_driver();
-        assert_eq!(
-            driver.send_core.transport.sent_payloads,
-            vec![expected]
-        );
+        assert_eq!(driver.send_core.transport.sent_payloads, vec![expected]);
     }
 
     #[test]
@@ -2096,7 +2117,10 @@ mod tests {
 
         for _ in 0..4 {
             let receipt = publisher.try_submit_qwp(buffer.as_qwp().unwrap()).unwrap();
-            assert_eq!(publisher.wait_steps(receipt, 4).unwrap(), DeliveryOutcome::Acked);
+            assert_eq!(
+                publisher.wait_steps(receipt, 4).unwrap(),
+                DeliveryOutcome::Acked
+            );
         }
 
         alloc_counter::start_counting();
@@ -3217,6 +3241,18 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_terminalizes_when_store_terminalizes() {
+        let queue = VolatileFrameQueue::new(options(4, 1024, 2)).unwrap();
+        let mut store = QwpWsPublicationStore::new(queue, DEFAULT_EVENT_CAPACITY);
+        let lifecycle = store.lifecycle();
+
+        store.mark_terminal(Some(Error::new(ErrorCode::SocketError, "terminal")));
+
+        assert_eq!(lifecycle.load(), PublicationState::Terminal);
+        assert!(store.is_terminal());
+    }
+
+    #[test]
     fn close_drain_drives_until_all_published_receipts_resolve() {
         let mut driver = driver(FakeOrderedServer::ack_each_send());
         let first = driver.try_submit(b"first").unwrap();
@@ -3524,7 +3560,10 @@ mod tests {
     fn terminal_qwp_server_error_is_pollable_after_terminalization() {
         let mut driver = driver(FakeOrderedServer::no_response());
         let receipt = driver.try_submit(b"payload").unwrap();
-        assert!(matches!(driver.drive_once().unwrap(), DriveOutcome::Sent(_)));
+        assert!(matches!(
+            driver.drive_once().unwrap(),
+            DriveOutcome::Sent(_)
+        ));
         driver
             .send_core
             .transport
@@ -3589,11 +3628,13 @@ mod tests {
         assert_eq!(terminal_error.message_sequence, None);
         assert_eq!(terminal_error.from_fsn, 0);
         assert_eq!(terminal_error.to_fsn, 1);
-        assert!(terminal_error
-            .message
-            .as_deref()
-            .unwrap()
-            .contains("bad frame"));
+        assert!(
+            terminal_error
+                .message
+                .as_deref()
+                .unwrap()
+                .contains("bad frame")
+        );
 
         let error = driver.poll_sender_error().unwrap();
         assert_eq!(error.category, QwpWsErrorCategory::ProtocolViolation);
