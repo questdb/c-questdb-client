@@ -494,13 +494,19 @@ fn decode_column(
 ) -> Result<DecodedColumn> {
     Ok(match kind {
         ColumnKind::Boolean => DecodedColumn::Boolean(decode_boolean(r, parent, row_count)?),
-        ColumnKind::Byte => DecodedColumn::Byte(decode_fixed(r, parent, row_count, 1)?),
-        ColumnKind::Short => DecodedColumn::Short(decode_fixed(r, parent, row_count, 2)?),
+        ColumnKind::Byte => {
+            DecodedColumn::Byte(decode_fixed_non_nullable(r, parent, row_count, 1, "BYTE")?)
+        }
+        ColumnKind::Short => {
+            DecodedColumn::Short(decode_fixed_non_nullable(r, parent, row_count, 2, "SHORT")?)
+        }
         ColumnKind::Int => DecodedColumn::Int(decode_fixed(r, parent, row_count, 4)?),
         ColumnKind::Long => DecodedColumn::Long(decode_fixed(r, parent, row_count, 8)?),
         ColumnKind::Float => DecodedColumn::Float(decode_fixed(r, parent, row_count, 4)?),
         ColumnKind::Double => DecodedColumn::Double(decode_fixed(r, parent, row_count, 8)?),
-        ColumnKind::Char => DecodedColumn::Char(decode_fixed(r, parent, row_count, 2)?),
+        ColumnKind::Char => {
+            DecodedColumn::Char(decode_fixed_non_nullable(r, parent, row_count, 2, "CHAR")?)
+        }
         ColumnKind::Ipv4 => DecodedColumn::Ipv4(decode_fixed(r, parent, row_count, 4)?),
         ColumnKind::Uuid => DecodedColumn::Uuid(decode_fixed(r, parent, row_count, 16)?),
         ColumnKind::Long256 => DecodedColumn::Long256(decode_fixed(r, parent, row_count, 32)?),
@@ -872,34 +878,78 @@ fn decode_fixed(
     densify_fixed(r, parent, row_count, elem_size, validity)
 }
 
-/// QWP `BOOLEAN`: not nullable on the wire (validity always absent), values
-/// bit-packed into `ceil(row_count/8)` bytes. We expand to one byte per row
-/// so `FixedColumn<u8>` can address rows in O(1).
-fn decode_boolean(
+/// Read and validate the `null_flag` byte for a column type the QWP spec
+/// declares non-nullable on the wire (BOOLEAN, BYTE, SHORT, CHAR). Server
+/// always emits `0x00` for these (see QuestDB's `QwpResultBatchBuffer.
+/// appendCell` — only the `*OrNull` append paths can ever set `nullCount`,
+/// and BOOLEAN/BYTE/SHORT/CHAR don't go through them). Anything else means
+/// either a buggy server or wire corruption: reject loudly so the bytes
+/// don't get reinterpreted as values and shift every later column's
+/// interpretation by `bitmap_len`.
+fn expect_no_validity_flag(r: &mut ByteReader<'_>, kind: &str) -> Result<()> {
+    let null_flag = r.read_u8()?;
+    if null_flag != 0 {
+        return Err(fmt!(
+            ProtocolError,
+            "{} column has null_flag 0x{:02X}; spec requires 0x00 \
+             ({} is not nullable on the wire)",
+            kind,
+            null_flag,
+            kind
+        ));
+    }
+    Ok(())
+}
+
+/// Decode a fixed-width column type that the QWP spec declares non-nullable
+/// on the wire (BYTE, SHORT, CHAR). The wire layout is `null_flag=0x00`
+/// followed by `row_count × elem_size` raw bytes — no bitmap, no
+/// densification needed since every row carries a value.
+fn decode_fixed_non_nullable(
     r: &mut ByteReader<'_>,
     parent: &Bytes,
     row_count: usize,
+    elem_size: usize,
+    kind: &str,
 ) -> Result<ColumnBuffer> {
-    let validity = decode_validity(r, parent, row_count)?;
-    let non_null = match &validity {
-        None => row_count,
-        Some(bitmap) => row_count - count_nulls(bitmap, row_count),
-    };
-    let bit_bytes = non_null.div_ceil(8);
-    let bits = r.read_bytes(bit_bytes)?.to_vec();
+    expect_no_validity_flag(r, kind)?;
+    let byte_count = row_count.checked_mul(elem_size).ok_or_else(|| {
+        fmt!(
+            ProtocolError,
+            "{} column byte count overflow (row_count={}, elem_size={})",
+            kind,
+            row_count,
+            elem_size
+        )
+    })?;
+    let values = read_owned(r, parent, byte_count)?;
+    Ok(ColumnBuffer {
+        values,
+        validity: None,
+    })
+}
+
+/// QWP `BOOLEAN`: not nullable on the wire (the `null_flag` byte is always
+/// `0x00`, no bitmap follows), values bit-packed into `ceil(row_count/8)`
+/// bytes. We expand to one byte per row so `FixedColumn<u8>` can address
+/// rows in O(1).
+fn decode_boolean(
+    r: &mut ByteReader<'_>,
+    _parent: &Bytes,
+    row_count: usize,
+) -> Result<ColumnBuffer> {
+    expect_no_validity_flag(r, "BOOLEAN")?;
+    let bit_bytes = row_count.div_ceil(8);
+    let bits = r.read_bytes(bit_bytes)?;
 
     let mut dense = vec![0u8; row_count];
-    let mut src_bit = 0usize;
     for (row, slot) in dense.iter_mut().enumerate() {
-        if !is_null_at_opt(&validity, row) {
-            let b = bits[src_bit >> 3];
-            *slot = (b >> (src_bit & 7)) & 1;
-            src_bit += 1;
-        }
+        let b = bits[row >> 3];
+        *slot = (b >> (row & 7)) & 1;
     }
     Ok(ColumnBuffer {
         values: Bytes::from(dense),
-        validity,
+        validity: None,
     })
 }
 
@@ -1574,13 +1624,15 @@ mod tests {
     }
 
     #[test]
-    fn decode_short_with_nulls_densifies() {
-        // 4 rows; row 2 null. Wire: 3 i16 values, bitmap 0x04.
+    fn decode_short_no_nulls() {
+        // SHORT is non-nullable on the wire (QwpResultBatchBuffer.appendCell
+        // for TYPE_SHORT calls scratch.appendShort with no appendNull path).
+        // null_flag is always 0x00; values are straight-through i16 LE.
         let (flags_byte, payload) = BatchBuilder::new(4)
             .add_column(
                 "v",
                 ColumnKind::Short,
-                col_with_bitmap(&[0x04], &le_i16s(&[-1, -2, -3])),
+                col_no_nulls(&le_i16s(&[-1, -2, -3, 32767])),
             )
             .build();
         let mut dict = SymbolDict::new();
@@ -1590,19 +1642,23 @@ mod tests {
         let ColumnView::Short(c) = view else { panic!() };
         assert_eq!(c.value(0), -1);
         assert_eq!(c.value(1), -2);
-        assert_eq!(c.value(2), 0); // densified zero
-        assert!(c.is_null(2));
-        assert_eq!(c.value(3), -3);
+        assert_eq!(c.value(2), -3);
+        assert_eq!(c.value(3), 32767);
+        for r in 0..4 {
+            assert!(!c.is_null(r));
+        }
     }
 
     #[test]
-    fn decode_byte_with_nulls_densifies() {
-        // 5 rows; rows 0, 3 null (bitmap 0b0000_1001 = 0x09). 3 i8 values.
+    fn decode_byte_no_nulls() {
+        // BYTE is non-nullable on the wire (TYPE_BYTE -> scratch.appendByte,
+        // no appendNull path). null_flag is always 0x00; values are
+        // straight-through i8.
         let (flags_byte, payload) = BatchBuilder::new(5)
             .add_column(
                 "v",
                 ColumnKind::Byte,
-                col_with_bitmap(&[0x09], &[0x7F, 0x80, 0xFF]),
+                col_no_nulls(&[0x00, 0x7F, 0x80, 0xFF, 0x01]),
             )
             .build();
         let mut dict = SymbolDict::new();
@@ -1610,13 +1666,14 @@ mod tests {
         let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
         let view = batch.column_view(0, &dict).unwrap();
         let ColumnView::Byte(c) = view else { panic!() };
-        assert!(c.is_null(0));
-        assert!(c.is_null(3));
-        assert_eq!(c.value(0), 0); // densified zero
+        assert_eq!(c.value(0), 0);
         assert_eq!(c.value(1), 0x7F);
         assert_eq!(c.value(2), -128); // 0x80 as i8
-        assert_eq!(c.value(3), 0); // densified zero
-        assert_eq!(c.value(4), -1); // 0xFF as i8
+        assert_eq!(c.value(3), -1); // 0xFF as i8
+        assert_eq!(c.value(4), 1);
+        for r in 0..5 {
+            assert!(!c.is_null(r));
+        }
     }
 
     #[test]
@@ -1639,6 +1696,70 @@ mod tests {
         assert_eq!(c.value(2), 1);
         assert_eq!(c.value(3), 1);
         assert_eq!(c.value(4), 0);
+    }
+
+    #[test]
+    fn decode_boolean_rejects_validity_bitmap() {
+        assert_non_nullable_rejects_bitmap(
+            ColumnKind::Boolean,
+            "BOOLEAN",
+            // 5 rows of bit-packed values; bitmap claims all-non-null.
+            col_with_bitmap(&[0b0001_1111], &[0x0D]),
+        );
+    }
+
+    #[test]
+    fn decode_byte_rejects_validity_bitmap() {
+        // Server-side proof in QwpResultBatchBuffer.appendCell: TYPE_BYTE
+        // path calls scratch.appendByte unconditionally — never appendNull
+        // — so nullCount stays 0 and emitColumn always writes null_flag=0x00.
+        assert_non_nullable_rejects_bitmap(
+            ColumnKind::Byte,
+            "BYTE",
+            col_with_bitmap(&[0b0001_1111], &[1, 2, 3, 4, 5]),
+        );
+    }
+
+    #[test]
+    fn decode_short_rejects_validity_bitmap() {
+        // Same server-side guarantee as BYTE (scratch.appendShort).
+        assert_non_nullable_rejects_bitmap(
+            ColumnKind::Short,
+            "SHORT",
+            col_with_bitmap(&[0b0001_1111], &le_i16s(&[1, 2, 3, 4, 5])),
+        );
+    }
+
+    #[test]
+    fn decode_char_rejects_validity_bitmap() {
+        // Same server-side guarantee as BYTE (scratch.appendChar).
+        assert_non_nullable_rejects_bitmap(
+            ColumnKind::Char,
+            "CHAR",
+            col_with_bitmap(&[0b0001_1111], &le_u16s(&[b'a' as u16; 5])),
+        );
+    }
+
+    fn assert_non_nullable_rejects_bitmap(kind: ColumnKind, kind_name: &str, body: Vec<u8>) {
+        let (flags_byte, payload) = BatchBuilder::new(5).add_column("c", kind, body).build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ProtocolError);
+        assert!(
+            err.msg().contains(kind_name) && err.msg().contains("null_flag"),
+            "unexpected error message for {}: {}",
+            kind_name,
+            err.msg()
+        );
+    }
+
+    fn le_u16s(vs: &[u16]) -> Vec<u8> {
+        let mut o = Vec::new();
+        for v in vs {
+            o.extend_from_slice(&v.to_le_bytes());
+        }
+        o
     }
 
     /// Build a column-local SYMBOL column body: validity + dict + per-row ids.
