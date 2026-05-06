@@ -1095,8 +1095,7 @@ impl<'r> Cursor<'r> {
                         self.terminate_with_close();
                         return Err(err);
                     }
-                    self.last_batch = Some(b);
-                    let last = self.last_batch.as_ref().unwrap();
+                    let last = self.last_batch.insert(b);
                     // Re-lookup is infallible: existence was checked
                     // above and the registry isn't mutated in between.
                     let schema = self.reader.registry.get(schema_id).expect("schema present");
