@@ -49,6 +49,8 @@ pub(crate) enum SfaSegmentError {
     SizeTooSmall { size: u64 },
     BadMagic { actual: u32 },
     UnsupportedVersion { actual: u8 },
+    NonZeroFlags { actual: u8 },
+    NonZeroReserved { actual: u16 },
     NegativeBaseSeq { actual: i64 },
     BaseSeqTooLarge { base_seq: u64 },
     PayloadTooLarge { payload_len: usize },
@@ -225,6 +227,14 @@ pub(crate) fn scan_segment_bytes(bytes: &[u8]) -> Result<SfaSegmentScan, SfaSegm
     let version = bytes[4];
     if version != VERSION {
         return Err(SfaSegmentError::UnsupportedVersion { actual: version });
+    }
+    let flags = bytes[5];
+    if flags != 0 {
+        return Err(SfaSegmentError::NonZeroFlags { actual: flags });
+    }
+    let reserved = u16::from_le_bytes([bytes[6], bytes[7]]);
+    if reserved != 0 {
+        return Err(SfaSegmentError::NonZeroReserved { actual: reserved });
     }
 
     let base_seq_i64 = read_i64(bytes, 8);
@@ -502,6 +512,20 @@ mod tests {
         assert!(matches!(
             scan_segment_bytes(&bad_version),
             Err(SfaSegmentError::UnsupportedVersion { actual: 2 })
+        ));
+
+        let mut bad_flags = java_two_frame_fixture();
+        bad_flags[5] = 1;
+        assert!(matches!(
+            scan_segment_bytes(&bad_flags),
+            Err(SfaSegmentError::NonZeroFlags { actual: 1 })
+        ));
+
+        let mut bad_reserved = java_two_frame_fixture();
+        bad_reserved[6..8].copy_from_slice(&2u16.to_le_bytes());
+        assert!(matches!(
+            scan_segment_bytes(&bad_reserved),
+            Err(SfaSegmentError::NonZeroReserved { actual: 2 })
         ));
 
         let mut negative_base_seq = java_two_frame_fixture();

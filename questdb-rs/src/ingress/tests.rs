@@ -164,6 +164,16 @@ fn qwpws_store_and_forward_config_parses_java_keys() {
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 #[test]
+fn qwpws_config_accepts_spec_websocket_aliases() {
+    let plain = SenderBuilder::from_conf("ws::addr=localhost:9000;").unwrap();
+    assert_eq!(plain.protocol, Protocol::QwpWs);
+
+    let tls = SenderBuilder::from_conf("wss::addr=localhost:9000;").unwrap();
+    assert_eq!(tls.protocol, Protocol::QwpWss);
+}
+
+#[cfg(feature = "sync-sender-qwp-ws")]
+#[test]
 fn qwpws_store_and_forward_defaults_match_java() {
     let builder = SenderBuilder::from_conf("qwpws::addr=localhost:9000;").unwrap();
     let qwp_ws = builder.qwp_ws.as_ref().unwrap();

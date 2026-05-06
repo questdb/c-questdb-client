@@ -83,8 +83,9 @@ Rust currently has:
   Java's signed `<= 0` disable values, are supported; background-drainer knobs,
   using Java's signed int parsing and `< 0` rejection, are accepted as no-ops
   while orphan draining is disabled,
-- strict protocol-error handling for ACK/NACK wire sequences beyond the highest
-  sent frame,
+- Java/spec-style clamping for OK response wire sequences beyond the highest
+  sent frame, while rejection/error response wire sequences remain strict
+  protocol errors,
 - strict empty-payload rejection for live and recovered QWP/WebSocket replay
   payloads,
 - strict cleanup error propagation from Rust close/ACK-trim paths,
@@ -185,7 +186,8 @@ git diff --check
    keeping recovered-FSN gaps fatal.
 4. Done: add diagnostics for recovered non-empty torn tails.
 5. Done: audit Java configuration keys and reject unimplemented behavior keys.
-6. Done: record stricter Rust protocol choices and cover future ACK/NACK tests.
+6. Done: record OK ACK clamping plus still-strict rejection/error choices and
+   cover future response-sequence tests.
 7. Defer large operational features, especially orphan drainers and Java-style
    async initial connect, unless the user explicitly prioritizes them.
 
@@ -375,27 +377,33 @@ unlink failures is the clearer operator signal than silently leaving durable
 store files behind. Best-effort cleanup remains limited to Java-compatible
 empty-torn-segment quarantine paths.
 
-#### J17: Over-large ACK/NACK Handling
+#### J17: Over-large OK ACK and Rejection Handling
 
 Java clamps ACK/NACK wire sequence values to the highest sent sequence before
-trimming. Current reference lines:
+trimming or rejecting. Current reference lines:
 `CursorWebSocketSendLoop.java:1094-1108` and
 `CursorWebSocketSendLoop.java:1131-1141`.
 
-Rust resolves ACK/NACK wire sequence through `SendCursor::fsn_for_wire_seq` and
-currently treats unknown future wire sequence values as protocol errors.
-Current reference areas: `qwp_ws_driver.rs:271-275`,
-`qwp_ws_driver.rs:1052-1059`, and `qwp_ws_driver.rs:1168-1177`.
+Rust intentionally splits the behavior: OK responses, including durable-mode
+OKs, clamp unknown future wire sequence values to the highest sent sequence
+before completing or enqueueing frames; rejection/error responses remain strict
+protocol errors.
+Current reference areas: `QwpWsPublicationStore::apply_response`,
+`QwpWsPublicationStore::complete_ack_through`,
+`QwpWsPublicationStore::apply_durable_ok`, `SendCursor::ack_fsn_for_wire_seq`,
+and strict rejection handling through `SendCursor::fsn_for_wire_seq`.
 
-Expected fix shape:
+Validation shape:
 
-- Decide whether Rust should stay stricter or clamp for Java parity.
-- If matching Java, add tests for over-large OK ACK and over-large rejection
-  frames. Confirm no trim can advance past sent/published data.
+- Test over-large non-durable OK ACK and durable-mode OK responses clamp to the
+  highest sent sequence.
+- Test over-large rejection frames remain protocol errors.
+- Confirm no trim can advance past sent/published data.
 
-Decision: keep Rust stricter for v1. A future wire sequence from the server is a
-protocol error, not a clamp-to-highest-sent event. Tests cover both future OK ACK
-and future rejection frames and assert no receipt is resolved past what was sent.
+Decision: match Java/spec for ordinary OK ACKs and keep Rust strict for future
+rejection/error frames. Tests cover future OK ACK clamping, durable-mode OK
+clamping, and future rejection protocol errors, and assert no receipt is
+resolved past what was sent.
 
 #### J18: Configuration Surface Differences
 
@@ -565,7 +573,7 @@ Status values:
 | J13 | done | SFA diagnostics | Non-empty torn-tail warning | Java warns when valid recovered frames are followed by torn bytes; Rust now records a structured recovery diagnostic. | Re-read Java `MmapSegment.openExisting` torn-tail logging and Rust scan result handling. | Rust exposes a structured diagnostic without making valid-prefix recovery fatal. |
 | J14 | done | SFA recovery capacity / memory | Recover existing disk state under current caps | Java mmap recovery is more tolerant of already-existing disk state; Rust materializes payloads and applies current caps during startup. | Compare Java segment manager recovery with Rust recovered frame validation. | Decision recorded: Rust keeps strict v1 recovery caps until a larger mmap/streaming design is justified. |
 | J15 | done | Public config / protocol surface | Unsupported Java keys | Java parses more QWP/WebSocket behavior keys than Rust implements. | Re-read Java parser key list and Rust `ingress.rs` parser branches. | Rust explicitly rejects behavior-bearing Java keys it cannot honor, accepts no-op dependent knobs, and accepts `in_flight_window` as a Java-validated alias. |
-| J16 | done | Protocol response policy | Over-large ACK/NACK handling | Java clamps ACK/NACK to highest sent; Rust treats future wire sequence as protocol failure. | Re-read Java clamp branches and Rust `SendCursor` response resolution. | Decision recorded and tests cover strict failure for future OK ACK and rejection frames. |
+| J16 | done | Protocol response policy | Over-large OK/rejection handling | OK responses clamp over-large wire sequences to highest sent; rejection/error policy remains strict in Rust until Java/spec behavior is re-checked. | Re-read Java clamp branches and Rust `SendCursor` response resolution. | Rust clamps future non-durable and durable OK responses to highest sent, keeps future rejection frames as protocol errors, and tests both paths. |
 | J17 | deferred | Operational parity | Async initial connect and orphan drainers | These are large lifecycle features, not local bug fixes. | Re-read Java async startup and orphan drainer code before any implementation. | No partial implementation without a product scenario and behavioral tests. |
 
 ## Slice Notes
@@ -912,8 +920,9 @@ Evidence:
   without a stable never-connected vs connection-lost classification; enabled
   `drain_orphans` is rejected while `max_background_drainers` is parsed as an
   inert dependent knob; SFA recovery keeps current configured frame/byte/segment
-  caps; `SendCursor::fsn_for_wire_seq` treats future ACK/NACK sequences as
-  protocol errors.
+  caps; OK responses use `SendCursor::ack_fsn_for_wire_seq` to clamp future
+  wire sequences, while rejection/error responses still use strict
+  `SendCursor::fsn_for_wire_seq` resolution.
 - Validation: `cargo test --manifest-path questdb-rs/Cargo.toml future_ --lib`;
   source validation for reconnect classification, orphan drainers, and recovery
   capacity policy.

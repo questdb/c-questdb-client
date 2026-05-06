@@ -358,9 +358,9 @@ impl Protocol {
             #[cfg(feature = "_sender-qwp-udp")]
             "qwpudp" => Ok(Protocol::QwpUdp),
             #[cfg(feature = "_sender-qwp-ws")]
-            "qwpws" => Ok(Protocol::QwpWs),
+            "qwpws" | "ws" => Ok(Protocol::QwpWs),
             #[cfg(feature = "_sender-qwp-ws")]
-            "qwpwss" => Ok(Protocol::QwpWss),
+            "qwpwss" | "wss" => Ok(Protocol::QwpWss),
             _ => Err(error::fmt!(ConfigError, "Unsupported protocol: {}", schema)),
         }
     }
@@ -454,8 +454,8 @@ impl SenderBuilder {
     /// The format of the string is: `"http::addr=host:port;key=value;...;"`.
     ///
     /// Instead of `"http"`, you can also specify `"https"`, `"tcp"`, `"tcps"`,
-    /// `"qwpudp"`, `"qwpws"`, and `"qwpwss"` when the corresponding sender
-    /// features are enabled.
+    /// `"qwpudp"`, `"qwpws"`, `"qwpwss"`, and the QWP/WebSocket aliases
+    /// `"ws"` / `"wss"` when the corresponding sender features are enabled.
     ///
     /// We recommend HTTP for most cases because it provides more features, like
     /// reporting errors to the client and supporting transaction control. TCP can

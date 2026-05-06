@@ -296,7 +296,7 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
             }
             TransportResponse::Reject { wire_seq, error } => {
                 let policy = server_error_policy(error.status);
-                let fsn = send_cursor.fsn_for_wire_seq(wire_seq, WireResponseKind::Reject)?;
+                let fsn = send_cursor.reject_fsn_for_wire_seq(wire_seq)?;
                 if policy == QwpWsErrorPolicy::Halt {
                     let sender_error = sender_error_for_qwp_error(&error, wire_seq, fsn, policy);
                     self.terminal_sender_error = Some(sender_error.clone());
@@ -335,8 +335,8 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         send_cursor: &mut SendCursor,
         wire_seq: u64,
     ) -> Result<DriveOutcome, DriverError> {
-        let fsn = send_cursor.fsn_for_wire_seq(wire_seq, WireResponseKind::Ack)?;
-        self.complete_through(send_cursor, fsn, wire_seq)
+        let (fsn, ack_wire_seq) = send_cursor.ack_fsn_for_wire_seq(wire_seq)?;
+        self.complete_through(send_cursor, fsn, ack_wire_seq)
     }
 
     fn apply_durable_ok(
@@ -345,7 +345,7 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         wire_seq: u64,
         table_seq_txns: Vec<TableSeqTxn>,
     ) -> Result<DriveOutcome, DriverError> {
-        let fsn = send_cursor.fsn_for_wire_seq(wire_seq, WireResponseKind::Ack)?;
+        let (fsn, ack_wire_seq) = send_cursor.ack_fsn_for_wire_seq(wire_seq)?;
         if self.is_rejected_fsn(fsn) {
             send_cursor.ack_through(fsn);
             return Ok(DriveOutcome::Idle);
@@ -356,11 +356,13 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
             .is_some_and(|completed_fsn| fsn <= completed_fsn)
         {
             send_cursor.ack_through(fsn);
-            return Ok(DriveOutcome::Acked { wire_seq });
+            return Ok(DriveOutcome::Acked {
+                wire_seq: ack_wire_seq,
+            });
         }
         send_cursor.ack_through(fsn);
         let tracker = self.durable_ack.as_mut().expect("durable ACK mode");
-        tracker.enqueue_ok(wire_seq, fsn, table_seq_txns);
+        tracker.enqueue_ok(ack_wire_seq, fsn, table_seq_txns);
         self.complete_ready_durable(send_cursor)
     }
 
@@ -1380,29 +1382,39 @@ impl SendCursor {
         Ok(())
     }
 
-    fn fsn_for_wire_seq(&self, wire_seq: u64, kind: WireResponseKind) -> Result<u64, DriverError> {
+    fn reject_fsn_for_wire_seq(&self, wire_seq: u64) -> Result<u64, DriverError> {
         let Some(fsn_at_zero) = self.fsn_at_zero else {
-            return Err(DriverError::Queue(match kind {
-                WireResponseKind::Ack => QueueError::ProtocolAckWithoutConnection,
-                WireResponseKind::Reject => QueueError::ProtocolRejectWithoutConnection,
-            }));
+            return Err(DriverError::Queue(
+                QueueError::ProtocolRejectWithoutConnection,
+            ));
         };
         let last_sent_wire_seq = self.last_sent_wire_seq;
         if last_sent_wire_seq.is_none_or(|last_sent| wire_seq > last_sent) {
-            return Err(DriverError::Queue(match kind {
-                WireResponseKind::Ack => QueueError::ProtocolAckBeyondSent {
-                    wire_seq,
-                    last_sent_wire_seq,
-                },
-                WireResponseKind::Reject => QueueError::ProtocolRejectBeyondSent {
-                    wire_seq,
-                    last_sent_wire_seq,
-                },
+            return Err(DriverError::Queue(QueueError::ProtocolRejectBeyondSent {
+                wire_seq,
+                last_sent_wire_seq,
             }));
         }
         fsn_at_zero
             .checked_add(wire_seq)
             .ok_or(DriverError::Queue(QueueError::SequenceOverflow))
+    }
+
+    fn ack_fsn_for_wire_seq(&self, wire_seq: u64) -> Result<(u64, u64), DriverError> {
+        let Some(fsn_at_zero) = self.fsn_at_zero else {
+            return Err(DriverError::Queue(QueueError::ProtocolAckWithoutConnection));
+        };
+        let Some(last_sent_wire_seq) = self.last_sent_wire_seq else {
+            return Err(DriverError::Queue(QueueError::ProtocolAckBeyondSent {
+                wire_seq,
+                last_sent_wire_seq: None,
+            }));
+        };
+        let ack_wire_seq = wire_seq.min(last_sent_wire_seq);
+        let fsn = fsn_at_zero
+            .checked_add(ack_wire_seq)
+            .ok_or(DriverError::Queue(QueueError::SequenceOverflow))?;
+        Ok((fsn, ack_wire_seq))
     }
 
     fn ack_through(&mut self, acked_fsn: u64) {
@@ -1429,12 +1441,6 @@ impl SendCursor {
             .find(|frame| frame.fsn == fsn)
             .map(|frame| frame.wire_seq)
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum WireResponseKind {
-    Ack,
-    Reject,
 }
 
 pub(crate) trait ManualDriverTransport {
@@ -3736,6 +3742,47 @@ mod tests {
     }
 
     #[test]
+    fn future_durable_ok_wire_sequence_clamps_to_highest_sent_like_java() {
+        let mut driver = durable_driver(FakeOrderedServer::no_response());
+        let receipt = driver.try_submit(b"payload").unwrap();
+
+        assert!(matches!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Sent(SentFrame { wire_seq: 0, .. })
+        ));
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableOk {
+                wire_seq: 99,
+                table_seq_txns: table_seq_txns(&[("trades", 10)]),
+            });
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Sent {
+                fsn: 0,
+                wire_seq: 0
+            }
+        );
+
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableAck {
+                table_seq_txns: table_seq_txns(&[("trades", 10)]),
+            });
+        assert_eq!(
+            driver.drive_receive_once().unwrap(),
+            DriveOutcome::Acked { wire_seq: 0 }
+        );
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Acked { fsn: 0 }
+        );
+    }
+
+    #[test]
     fn durable_ack_does_not_skip_earlier_pending_ok_gap() {
         let mut driver = durable_driver(FakeOrderedServer::no_response());
         let first = driver.try_submit(b"first").unwrap();
@@ -4620,25 +4667,16 @@ mod tests {
     }
 
     #[test]
-    fn future_ack_wire_sequence_remains_protocol_error_instead_of_java_clamp() {
+    fn future_ack_wire_sequence_clamps_to_highest_sent_like_java() {
         let mut driver = driver(FakeOrderedServer::scripted([FakeSendResult::AckWire {
             wire_seq: 99,
         }]));
         let receipt = driver.try_submit(b"payload").unwrap();
 
-        assert_eq!(
-            driver.drive_once(),
-            Err(DriverError::Queue(QueueError::ProtocolAckBeyondSent {
-                wire_seq: 99,
-                last_sent_wire_seq: Some(0),
-            }))
-        );
+        assert_eq!(driver.drive_once(), Ok(DriveOutcome::Acked { wire_seq: 0 }));
         assert_eq!(
             driver.receipt_status(receipt),
-            QwpReceiptStatus::Sent {
-                fsn: 0,
-                wire_seq: 0,
-            }
+            QwpReceiptStatus::Acked { fsn: 0 }
         );
     }
 
@@ -5050,33 +5088,28 @@ mod tests {
     }
 
     #[test]
-    fn close_drain_error_keeps_sender_closing_and_existing_receipt_observable() {
+    fn close_drain_clamps_future_ack_and_drains() {
         let mut server = FakeOrderedServer::no_response();
         server.push_response(FakeServerResponse::Ack { wire_seq: 1 });
         let mut driver = driver(server);
         let receipt = driver.try_submit(b"payload").unwrap();
 
-        assert_eq!(
-            driver.close_drain_steps(2),
-            Err(DriverError::Queue(QueueError::ProtocolAckBeyondSent {
-                wire_seq: 1,
-                last_sent_wire_seq: Some(0),
-            }))
-        );
+        assert_eq!(driver.close_drain_steps(2).unwrap(), CloseOutcome::Drained);
 
         assert_eq!(driver.try_submit(b"next"), Err(DriverError::Closing));
         assert_eq!(
             driver.receipt_status(receipt),
-            QwpReceiptStatus::Sent {
-                fsn: 0,
-                wire_seq: 0
-            }
+            QwpReceiptStatus::Acked { fsn: 0 }
         );
         assert_eq!(
             drain_events(&mut driver),
             vec![
                 DriverEvent::Published { fsn: 0 },
                 DriverEvent::Sent {
+                    fsn: 0,
+                    wire_seq: 0,
+                },
+                DriverEvent::AckedThrough {
                     fsn: 0,
                     wire_seq: 0,
                 }

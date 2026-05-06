@@ -65,7 +65,7 @@ new SF client spec.
 
 The largest remaining areas are:
 
-- connect-string compatibility and strict key handling,
+- strict unknown-key handling,
 - Java/spec close, retry, and orphan-drainer semantics,
 - several SFA disk-format/recovery details where the spec and Java reference
   need to be reconciled before Rust should change behavior,
@@ -202,7 +202,7 @@ Current working-tree state:
 - Error frames must end exactly at `11 + msgLen`; trailing bytes are rejected.
 - Focused parser tests cover 1024 bytes, 1025 bytes, and trailing bytes.
 
-### 4. Connect-string scheme and key behavior diverge from the spec
+### 4. Unknown-key behavior diverges from the spec
 
 Spec requirements:
 
@@ -212,9 +212,9 @@ Spec requirements:
 
 Rust state:
 
-- `questdb-rs/src/ingress.rs:361-363` accepts `qwpws` / `qwpwss`, not
-  `ws` / `wss`.
-- `questdb-rs/src/ingress.rs:712-716` intentionally ignores unknown keys.
+- `questdb-rs/src/ingress.rs:361-363` accepts `qwpws` / `qwpwss` and the
+  spec aliases `ws` / `wss`.
+- `questdb-rs/src/ingress.rs:724-728` intentionally ignores unknown keys.
 
 Java reference:
 
@@ -223,8 +223,6 @@ Java reference:
 
 Open decision:
 
-- If the new spec is authoritative, Rust should add `ws` / `wss` aliases and
-  change unknown-key handling.
 - Because Java still ignores unknown keys, strict unknown-key rejection is a
   cross-client behavior change. It should probably be changed in Java and Rust
   together, or the spec should document a transition rule.
@@ -244,20 +242,20 @@ Spec references:
 
 Rust state:
 
-- `questdb-rs/src/ingress.rs:536` routes
+- `questdb-rs/src/ingress.rs:548` routes
   `sf_append_deadline_millis` to an explicit rejection.
-- `questdb-rs/src/ingress.rs:552` routes
+- `questdb-rs/src/ingress.rs:564` routes
   `close_flush_timeout_millis` to an explicit rejection.
-- `questdb-rs/src/ingress.rs:556-559` rejects
+- `questdb-rs/src/ingress.rs:568-571` rejects
   `max_schemas_per_connection`.
 - `durable_ack_keepalive_interval_millis` is implemented for public durable
   ACK mode; `<= 0` disables the idle PING.
-- `questdb-rs/src/ingress.rs:565-567` parses `drain_orphans` and
+- `questdb-rs/src/ingress.rs:577-579` parses `drain_orphans` and
   `max_background_drainers`, but enabled orphan draining is unsupported.
-- `questdb-rs/src/ingress.rs:569-572` rejects `error_inbox_capacity`.
-- `questdb-rs/src/ingress.rs:1925-1944` rejects
+- `questdb-rs/src/ingress.rs:581-584` rejects `error_inbox_capacity`.
+- `questdb-rs/src/ingress.rs:1948-1963` rejects
   `initial_connect_retry=async`.
-- `questdb-rs/src/ingress.rs:493-496` splits `addr` once on `:`, so it does
+- `questdb-rs/src/ingress.rs:505-508` splits `addr` once on `:`, so it does
   not store comma-separated multi-host addresses.
 
 Java reference:
@@ -312,7 +310,7 @@ Implementation direction:
   configurable timeout, skip modes, cleanup error preservation, and terminal
   error rethrow behavior.
 
-### 7. ACK handling is stricter than the spec for overlarge OK sequences
+### 7. Overlarge ordinary OK sequences are clamped
 
 Spec requirement:
 
@@ -322,18 +320,17 @@ Spec requirement:
 
 Rust state:
 
-- `questdb-rs/src/ingress/sender/qwp_ws_driver.rs:1391` rejects a
-  response sequence greater than the highest sent sequence.
+- Ordinary OK responses clamp a response sequence greater than the highest sent
+  sequence to the highest sent sequence before completing frames.
+- Error/NACK responses remain strict protocol errors when they name a future
+  sequence.
 
 Java reference:
 
 - `CursorWebSocketSendLoop.java` clamps with `Math.min(wireSeq, highestSent)`.
 
-Implementation direction:
+Remaining check:
 
-- Change non-durable OK handling to clamp future OK sequences.
-- Add tests for `sequence == highestSent`, `sequence > highestSent`, and
-  response before anything was sent.
 - Re-check error/NACK statuses separately. The spec explicitly calls out OK;
   Java may clamp server errors too.
 
@@ -447,7 +444,7 @@ Rust state:
 - `questdb-rs/src/ingress/sender.rs:628-641` exposes dropped-error counts.
 - `questdb-rs/src/ingress/sender/qwp_ws_driver.rs:60` uses a default capacity
   of 1024, not the spec's 256 default.
-- `questdb-rs/src/ingress.rs:569-572` rejects `error_inbox_capacity`.
+- `questdb-rs/src/ingress.rs:581-584` rejects `error_inbox_capacity`.
 
 Implementation direction:
 
@@ -481,7 +478,7 @@ Implementation direction:
 - Either implement Windows `LockFileEx` or document SF disk mode as unsupported
   on Windows and ensure the builder fails clearly.
 
-### 13. SFA header reserved fields are written but not validated
+### 13. SFA header reserved fields are validated
 
 Spec requirement:
 
@@ -489,17 +486,12 @@ Spec requirement:
 
 Rust state:
 
-- `questdb-rs/src/ingress/sender/qwp_ws_sfa_segment.rs:284-292` writes those
+- `questdb-rs/src/ingress/sender/qwp_ws_sfa_segment.rs:294-302` writes those
   fields as 0.
-- `questdb-rs/src/ingress/sender/qwp_ws_sfa_segment.rs:221-239` validates
-  magic, version, and non-negative `baseSeq`, but does not validate byte 5 or
-  bytes 6-7.
-
-Implementation direction:
-
-- Add header validation and tests for non-zero `flags` and `reserved`.
-- Decide whether non-zero reserved fields are fatal corruption or skipped side
-  files under the current recovery policy.
+- Segment scan now rejects non-zero `flags` and non-zero `reserved` fields
+  before accepting the segment header. Under the current recovery policy these
+  are treated like other segment scan failures: a bad side file can be skipped,
+  while a required segment that creates an FSN gap still fails recovery.
 
 ### 14. Fresh SFA filename conflicts with the current spec
 
@@ -517,7 +509,7 @@ Rust state:
   `INITIAL_SEGMENT_FILE_NAME = "sf-initial.sfa"`.
 - `questdb-rs/src/ingress/sender/qwp_ws_sfa_queue.rs:141-149` creates a fresh
   queue with `sf-initial.sfa`.
-- `questdb-rs/src/ingress/sender/qwp_ws_sfa_segment.rs:527-538` has a test
+- `questdb-rs/src/ingress/sender/qwp_ws_sfa_segment.rs:552-563` has a test
   that locks in the initial filename.
 
 Java reference:
@@ -636,13 +628,13 @@ new evidence:
    durable-ACK server.
 3. Implement Java-compatible close semantics and then accept
    `close_flush_timeout_millis`.
-4. Implement ACK clamping and ACK-timeout reconnect.
+4. Implement ACK-timeout reconnect.
 5. Decide Rust API shape for error dispatch/inbox and then support
    `error_inbox_capacity`.
 6. Add orphan scanner/drainers and `.failed`, then enable `drain_orphans=on`.
 7. Address lower-level SFA disk details:
-   header reserved-field validation, filename decision, empty-segment behavior,
-   and operator-visible recovery diagnostics.
+   filename decision, empty-segment behavior, and operator-visible recovery
+   diagnostics.
 8. Decide Windows SF support:
    implement `LockFileEx` or document/fail disk SF mode clearly on Windows.
 
