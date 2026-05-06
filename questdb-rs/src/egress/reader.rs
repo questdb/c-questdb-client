@@ -615,6 +615,21 @@ impl<'r> ReaderQuery<'r> {
     ///
     /// Mirrors the Java client's `onFailoverReset(newNode)` contract.
     ///
+    /// # Panics from the callback
+    ///
+    /// The callback is invoked synchronously from inside
+    /// [`Cursor::next_batch`] (specifically, from the failover-replay
+    /// path). If the callback panics, the unwind propagates through
+    /// `next_batch` to the caller. The cursor's [`Drop`] still runs,
+    /// which closes the WebSocket cleanly, so no resources are leaked
+    /// — but the `Cursor` is gone. There is no "swallow and resume"
+    /// behavior; treat a panicking callback as a bug and either
+    /// `catch_unwind` inside the callback yourself or ensure the
+    /// callback is panic-free. The C FFI binding wraps the callback in
+    /// `catch_unwind` + `abort()` (panics across the C boundary are
+    /// undefined behavior); the pure-Rust API leaves them as normal
+    /// unwinds.
+    ///
     /// ```no_run
     /// use std::sync::{Arc, Mutex};
     /// use questdb::egress::{FailoverEvent, Reader};
