@@ -131,6 +131,25 @@ impl From<ErrorCode> for line_reader_error_code {
     }
 }
 
+/// NULL-handle guard for opaque-handle FFI entry points whose contract
+/// disallows NULL. Calls match the policy already established in
+/// `mutate_query` (the bind path) — log and abort, rather than silently
+/// dereferencing into UB. Reserved for state-mutating cursor / reader
+/// operations where a NULL deref would corrupt the FFI lifecycle; cheap
+/// read-only stat getters keep the header's "NULL is UB" contract for
+/// ergonomics.
+macro_rules! null_check_handle {
+    ($ptr:expr, $fn_name:literal) => {
+        if $ptr.is_null() {
+            eprintln!(
+                "{}: NULL handle. This is a contract violation; aborting.",
+                $fn_name
+            );
+            std::process::abort();
+        }
+    };
+}
+
 macro_rules! reader_bubble {
     ($err_out:expr, $expression:expr) => {
         reader_bubble!($err_out, $expression, false)
@@ -1257,17 +1276,9 @@ where
     F: FnOnce(ReaderQuery<'static>) -> ReaderQuery<'static>,
 {
     unsafe {
-        // NULL handle is a contract violation. Match the existing
-        // `eprintln + abort` policy used for NULL `value` arguments in
-        // `bind_binary` / `bind_uuid` / `bind_decimal128` / etc., rather
-        // than silently dereferencing into UB.
-        if query.is_null() {
-            eprintln!(
-                "line_reader_query_bind_*: NULL query handle. \
-                 This is a contract violation; aborting."
-            );
-            std::process::abort();
-        }
+        // NULL handle is a contract violation; defer to the shared
+        // `null_check_handle!` policy.
+        null_check_handle!(query, "line_reader_query_bind_*");
         if (*query).deferred_err.is_some() {
             return;
         }
@@ -1640,6 +1651,7 @@ pub unsafe extern "C" fn line_reader_cursor_next_batch(
     err_out: *mut *mut line_reader_error,
 ) -> i32 {
     unsafe {
+        null_check_handle!(cursor, "line_reader_cursor_next_batch");
         let c = &mut *cursor;
         // `cursor_for_mut` clears `current_batch` (releasing the prior
         // BatchView's borrow on the cursor) and yields exclusive access
@@ -3137,6 +3149,7 @@ pub unsafe extern "C" fn line_reader_cursor_cancel(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
+        null_check_handle!(cursor, "line_reader_cursor_cancel");
         // Routes through `cursor_for_mut` to maintain the BatchView /
         // &mut Cursor exclusion invariant — see line_reader_cursor docs.
         // `cancel()` runs the drain loop which can panic (decoder paths);
@@ -3166,6 +3179,7 @@ pub unsafe extern "C" fn line_reader_cursor_add_credit(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
+        null_check_handle!(cursor, "line_reader_cursor_add_credit");
         // Routes through `cursor_for_mut` — see line_reader_cursor docs.
         // Catch any unwind out of `add_credit` to keep panics from crossing
         // the FFI boundary.
