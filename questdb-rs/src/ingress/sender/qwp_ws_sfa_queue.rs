@@ -1066,7 +1066,7 @@ mod tests {
         assert!(bad_side_path.exists());
         assert!(!bad_side_corrupt_path.exists());
         assert!(matches!(
-            &queue.recovery_diagnostics()[..],
+            queue.recovery_diagnostics(),
             [SfaRecoveryDiagnostic::SkippedSegment { path, .. }]
                 if path == &bad_side_path
         ));

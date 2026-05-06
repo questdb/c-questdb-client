@@ -49,7 +49,7 @@ use super::qwp_ws_driver::{
     BlockingQwpWsTransport, CloseOutcome, DriveOutcome, DriverError, ManualDriverPrototype,
     ManualDriverTransport, PublicationLifecycle, PublicationLog, PublicationState,
     QwpWsPublicationStore, QwpWsReconnectProgress, QwpWsSendCore, QwpWsSendProgress,
-    QwpWsTransportFailureAction, ReconnectPolicy, ReconnectReason, TransportFailure,
+    QwpWsTransportFailureAction, ReconnectPolicy, ReconnectReason, TransportFailure, TransportPoll,
     reconnect_error_is_terminal,
 };
 use super::qwp_ws_ownership::QwpWsSenderError;
@@ -80,35 +80,50 @@ impl WsStream {
         Ok(())
     }
 
-    pub(crate) fn can_read_without_blocking(&mut self) -> std::io::Result<bool> {
+    pub(crate) fn read_nonblocking_once(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        let guard = NonblockingModeGuard::new(self.tcp_stream())?;
+        let read = self.read(out);
+        let restore = guard.restore();
+        match (read, restore) {
+            (_, Err(err)) => Err(err),
+            (result, Ok(())) => result,
+        }
+    }
+
+    fn tcp_stream(&self) -> &TcpStream {
         match self {
-            WsStream::Plain(sock) => tcp_has_readable_bytes(sock),
-            WsStream::Tls(stream) => {
-                let tls_buffer_ready = match stream.conn.reader().into_first_chunk() {
-                    Ok(_) => true,
-                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => false,
-                    Err(err) => return Err(err),
-                };
-                if tls_buffer_ready {
-                    return Ok(true);
-                }
-                tcp_has_readable_bytes(stream.get_ref())
-            }
+            WsStream::Plain(sock) => sock,
+            WsStream::Tls(stream) => stream.get_ref(),
         }
     }
 }
 
-fn tcp_has_readable_bytes(sock: &TcpStream) -> std::io::Result<bool> {
-    sock.set_nonblocking(true)?;
-    let mut byte = [0u8; 1];
-    let peek_result = match sock.peek(&mut byte) {
-        Ok(_) => Ok(true),
-        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
-        Err(err) => Err(err),
-    };
-    match (peek_result, sock.set_nonblocking(false)) {
-        (_, Err(err)) => Err(err),
-        (result, Ok(())) => result,
+struct NonblockingModeGuard {
+    sock: TcpStream,
+    armed: bool,
+}
+
+impl NonblockingModeGuard {
+    fn new(sock: &TcpStream) -> std::io::Result<Self> {
+        let guard_sock = sock.try_clone()?;
+        sock.set_nonblocking(true)?;
+        Ok(Self {
+            sock: guard_sock,
+            armed: true,
+        })
+    }
+
+    fn restore(mut self) -> std::io::Result<()> {
+        self.armed = false;
+        self.sock.set_nonblocking(false)
+    }
+}
+
+impl Drop for NonblockingModeGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.sock.set_nonblocking(false);
+        }
     }
 }
 
@@ -461,9 +476,23 @@ where
             }
         };
 
-        match outbound {
+        let send_step = match outbound {
             Some(outbound) => self.finish_send(shared, stop, outbound),
             None => self.finish_receive(shared, stop),
+        };
+        if send_step == RunnerStep::Stop {
+            return RunnerStep::Stop;
+        }
+
+        let receive_step = self.drain_receive_ready(shared, stop);
+        if receive_step == RunnerStep::Stop {
+            return RunnerStep::Stop;
+        }
+
+        if send_step == RunnerStep::Continue || receive_step == RunnerStep::Continue {
+            RunnerStep::Continue
+        } else {
+            self.finish_keepalive(shared, stop)
         }
     }
 
@@ -512,21 +541,72 @@ where
         Q: PublicationLog,
     {
         match self.send_core.try_poll_response() {
-            Ok(Some(response)) => {
+            Ok(TransportPoll::Response(response)) => {
                 let mut store = match shared.lock() {
                     Ok(store) => store,
                     Err(_) => return RunnerStep::Stop,
                 };
                 match self.send_core.finish_response(&mut store, response) {
                     Ok(outcome) => {
-                        let step = step_from_drive_outcome(outcome);
+                        let step = if outcome == DriveOutcome::Idle {
+                            RunnerStep::Continue
+                        } else {
+                            step_from_drive_outcome(outcome)
+                        };
                         self.backpressure.notify_all();
                         step
                     }
                     Err(err) => self.store_driver_error(&mut store, err),
                 }
             }
-            Ok(None) => RunnerStep::Idle,
+            Ok(TransportPoll::Progress) => RunnerStep::Continue,
+            Ok(TransportPoll::Idle) => RunnerStep::Idle,
+            Err(failure) => self.apply_transport_failure(shared, stop, failure),
+        }
+    }
+
+    fn drain_receive_ready<Q>(
+        &mut self,
+        shared: &Arc<Mutex<QwpWsPublicationStore<Q>>>,
+        stop: &AtomicBool,
+    ) -> RunnerStep
+    where
+        Q: PublicationLog,
+    {
+        let mut step = RunnerStep::Idle;
+        loop {
+            match self.finish_receive(shared, stop) {
+                RunnerStep::Continue => step = RunnerStep::Continue,
+                RunnerStep::Idle => return step,
+                RunnerStep::Stop => return RunnerStep::Stop,
+            }
+        }
+    }
+
+    fn finish_keepalive<Q>(
+        &mut self,
+        shared: &Arc<Mutex<QwpWsPublicationStore<Q>>>,
+        stop: &AtomicBool,
+    ) -> RunnerStep
+    where
+        Q: PublicationLog,
+    {
+        let durable_ack_pending = {
+            let store = match shared.lock() {
+                Ok(store) => store,
+                Err(_) => return RunnerStep::Stop,
+            };
+            if store.is_terminal() {
+                return RunnerStep::Stop;
+            }
+            store.has_pending_durable_ack()
+        };
+        match self
+            .send_core
+            .send_durable_ack_keepalive_if_due(durable_ack_pending)
+        {
+            Ok(true) => RunnerStep::Idle,
+            Ok(false) => RunnerStep::Idle,
             Err(failure) => self.apply_transport_failure(shared, stop, failure),
         }
     }
@@ -628,6 +708,7 @@ where
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunnerStep {
     Idle,
     Continue,
@@ -641,7 +722,8 @@ fn step_from_drive_outcome(outcome: DriveOutcome) -> RunnerStep {
         DriveOutcome::Sent(_)
         | DriveOutcome::Acked { .. }
         | DriveOutcome::Rejected { .. }
-        | DriveOutcome::Reconnected { .. } => RunnerStep::Continue,
+        | DriveOutcome::Reconnected { .. }
+        | DriveOutcome::Progress => RunnerStep::Continue,
     }
 }
 
@@ -891,6 +973,15 @@ pub(crate) fn write_binary_frame<W: Write>(
     stream.write_all(out)
 }
 
+pub(crate) fn write_ping_frame<W: Write>(
+    stream: &mut W,
+    out: &mut Vec<u8>,
+    payload: &[u8],
+) -> std::io::Result<()> {
+    codec::write_frame_to_buf(out, true, WS_OPCODE_PING, payload, random_mask());
+    stream.write_all(out)
+}
+
 /// Read one full WebSocket message into `out`. Reassembles fragmented frames.
 /// Replies to PING with PONG and treats CLOSE as an error. Returns the opcode
 /// of the first data frame (text/binary).
@@ -947,6 +1038,7 @@ impl WsMessageError {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn read_message_with_close<S: Read + Write>(
     stream: &mut S,
     scratch: &mut Vec<u8>,
@@ -1009,11 +1101,301 @@ pub(crate) fn read_message_with_close<S: Read + Write>(
     }
 }
 
+pub(crate) struct WsFrameReader {
+    input: Vec<u8>,
+    read_pos: usize,
+    fragment_opcode: Option<u8>,
+    message: Vec<u8>,
+    #[cfg(test)]
+    max_message_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WsFrameRead {
+    Message { opcode: u8 },
+    Progress,
+    Idle,
+}
+
+impl WsFrameReader {
+    pub(crate) fn new() -> Self {
+        Self {
+            input: Vec::with_capacity(16 * 1024),
+            read_pos: 0,
+            fragment_opcode: None,
+            message: Vec::with_capacity(16 * 1024),
+            #[cfg(test)]
+            max_message_bytes: MAX_INBOUND_MESSAGE_BYTES,
+        }
+    }
+
+    pub(crate) fn with_initial_input(input: Vec<u8>) -> Self {
+        let mut reader = Self::new();
+        if !input.is_empty() {
+            reader.input = input;
+        }
+        reader
+    }
+
+    #[cfg(test)]
+    fn with_max_message_bytes_for_test(max_message_bytes: usize) -> Self {
+        let mut reader = Self::new();
+        reader.max_message_bytes = max_message_bytes;
+        reader
+    }
+
+    pub(crate) fn message(&self) -> &[u8] {
+        &self.message
+    }
+
+    pub(crate) fn clear_message(&mut self) {
+        self.message.clear();
+    }
+
+    pub(crate) fn try_read_one(
+        &mut self,
+        stream: &mut WsStream,
+        scratch: &mut Vec<u8>,
+    ) -> Result<WsFrameRead, WsMessageError> {
+        match self.try_parse_buffered_one(stream, scratch)? {
+            WsFrameRead::Idle => {}
+            read => return Ok(read),
+        }
+
+        let mut read_buf = [0u8; 8192];
+        match stream.read_nonblocking_once(&mut read_buf) {
+            Ok(0) => {
+                return Err(WsMessageError::Error(error::fmt!(
+                    SocketError,
+                    "WebSocket connection closed by server"
+                )));
+            }
+            Ok(n) => self.input.extend_from_slice(&read_buf[..n]),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                return Ok(WsFrameRead::Idle);
+            }
+            Err(err) => {
+                return Err(WsMessageError::Error(error::fmt!(
+                    SocketError,
+                    "Could not read WebSocket frame: {}",
+                    err
+                )));
+            }
+        }
+
+        self.try_parse_buffered_one(stream, scratch)
+    }
+
+    #[cfg(test)]
+    fn append_input_for_test(&mut self, input: &[u8]) {
+        self.input.extend_from_slice(input);
+    }
+
+    #[cfg(test)]
+    fn try_read_buffered_for_test<W: Write>(
+        &mut self,
+        writer: &mut W,
+        scratch: &mut Vec<u8>,
+    ) -> Result<WsFrameRead, WsMessageError> {
+        self.try_parse_buffered_one(writer, scratch)
+    }
+
+    fn try_parse_buffered_one<W: Write>(
+        &mut self,
+        writer: &mut W,
+        scratch: &mut Vec<u8>,
+    ) -> Result<WsFrameRead, WsMessageError> {
+        let Some(header) = self.peek_buffered_frame_header()? else {
+            return Ok(WsFrameRead::Idle);
+        };
+        match header.opcode {
+            WS_OPCODE_PING => {
+                let payload = self.payload_slice(header);
+                codec::write_frame_to_buf(scratch, true, WS_OPCODE_PONG, payload, random_mask());
+                writer.write_all(scratch).map_err(|io| {
+                    WsMessageError::Error(error::fmt!(
+                        SocketError,
+                        "Could not send WebSocket PONG: {}",
+                        io
+                    ))
+                })?;
+                self.consume_frame(header.frame_end);
+                Ok(WsFrameRead::Progress)
+            }
+            WS_OPCODE_PONG => {
+                self.consume_frame(header.frame_end);
+                Ok(WsFrameRead::Progress)
+            }
+            WS_OPCODE_CLOSE => {
+                let (code, reason) = codec::ws_close_details(self.payload_slice(header));
+                self.consume_frame(header.frame_end);
+                Err(WsMessageError::Close(WsCloseFrame { code, reason }))
+            }
+            WS_OPCODE_TEXT | WS_OPCODE_BINARY => {
+                if self.fragment_opcode.is_some() {
+                    return Err(WsMessageError::ProtocolViolation(
+                        "Unexpected new data frame mid-message".to_string(),
+                    ));
+                }
+                self.message.clear();
+                self.append_message_payload(header)?;
+                self.consume_frame(header.frame_end);
+                if header.fin {
+                    Ok(WsFrameRead::Message {
+                        opcode: header.opcode,
+                    })
+                } else {
+                    self.fragment_opcode = Some(header.opcode);
+                    Ok(WsFrameRead::Progress)
+                }
+            }
+            WS_OPCODE_CONTINUATION => {
+                let Some(opcode) = self.fragment_opcode else {
+                    return Err(WsMessageError::ProtocolViolation(
+                        "Continuation frame without prior data frame".to_string(),
+                    ));
+                };
+                self.append_message_payload(header)?;
+                self.consume_frame(header.frame_end);
+                if header.fin {
+                    self.fragment_opcode = None;
+                    Ok(WsFrameRead::Message { opcode })
+                } else {
+                    Ok(WsFrameRead::Progress)
+                }
+            }
+            other => Err(WsMessageError::ProtocolViolation(format!(
+                "Unknown WebSocket opcode: 0x{:x}",
+                other
+            ))),
+        }
+    }
+
+    fn peek_buffered_frame_header(&self) -> Result<Option<BufferedFrameHeader>, WsMessageError> {
+        let available = self.input.len().saturating_sub(self.read_pos);
+        if available < 2 {
+            return Ok(None);
+        }
+        let frame = &self.input[self.read_pos..];
+        let fin = (frame[0] & 0x80) != 0;
+        let opcode = frame[0] & 0x0F;
+        if frame[0] & WS_RSV_MASK != 0 {
+            return Err(WsMessageError::ProtocolViolation(
+                "WebSocket RSV bits are set but no extensions were negotiated".to_string(),
+            ));
+        }
+        let masked = (frame[1] & 0x80) != 0;
+        if masked {
+            return Err(WsMessageError::ProtocolViolation(
+                "WebSocket server frame must not be masked".to_string(),
+            ));
+        }
+
+        let len_short = frame[1] & 0x7F;
+        let (header_len, payload_len) = match len_short {
+            126 => {
+                if available < 4 {
+                    return Ok(None);
+                }
+                (4, u16::from_be_bytes([frame[2], frame[3]]) as u64)
+            }
+            127 => {
+                if available < 10 {
+                    return Ok(None);
+                }
+                (
+                    10,
+                    u64::from_be_bytes([
+                        frame[2], frame[3], frame[4], frame[5], frame[6], frame[7], frame[8],
+                        frame[9],
+                    ]),
+                )
+            }
+            n => (2, n as u64),
+        };
+
+        validate_payload_length_encoding(len_short, payload_len)?;
+        if payload_len > MAX_INBOUND_FRAME_BYTES {
+            return Err(WsMessageError::ProtocolViolation(format!(
+                "WebSocket frame too large: {} bytes",
+                payload_len
+            )));
+        }
+        let payload_len = usize::try_from(payload_len).map_err(|_| {
+            WsMessageError::ProtocolViolation(format!(
+                "WebSocket frame too large for this platform: {} bytes",
+                payload_len
+            ))
+        })?;
+        validate_control_frame_header(fin, opcode, payload_len)?;
+        let payload_start = self.read_pos + header_len;
+        let frame_end = payload_start.checked_add(payload_len).ok_or_else(|| {
+            WsMessageError::ProtocolViolation("WebSocket frame too large".to_string())
+        })?;
+        if self.input.len() < frame_end {
+            return Ok(None);
+        }
+        Ok(Some(BufferedFrameHeader {
+            fin,
+            opcode,
+            payload_start,
+            frame_end,
+        }))
+    }
+
+    fn payload_slice(&self, header: BufferedFrameHeader) -> &[u8] {
+        &self.input[header.payload_start..header.frame_end]
+    }
+
+    fn append_message_payload(
+        &mut self,
+        header: BufferedFrameHeader,
+    ) -> Result<(), WsMessageError> {
+        let payload = &self.input[header.payload_start..header.frame_end];
+        let new_len =
+            checked_message_len(self.message.len(), payload.len(), self.max_message_bytes())?;
+        self.message.extend_from_slice(payload);
+        debug_assert_eq!(self.message.len(), new_len);
+        Ok(())
+    }
+
+    fn max_message_bytes(&self) -> usize {
+        #[cfg(test)]
+        {
+            self.max_message_bytes
+        }
+        #[cfg(not(test))]
+        {
+            MAX_INBOUND_MESSAGE_BYTES
+        }
+    }
+
+    fn consume_frame(&mut self, frame_end: usize) {
+        self.read_pos = frame_end;
+        if self.read_pos == self.input.len() {
+            self.input.clear();
+            self.read_pos = 0;
+        } else if self.read_pos >= 4096 && self.read_pos * 2 >= self.input.len() {
+            self.input.drain(..self.read_pos);
+            self.read_pos = 0;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BufferedFrameHeader {
+    fin: bool,
+    opcode: u8,
+    payload_start: usize,
+    frame_end: usize,
+}
+
 pub(crate) fn is_terminal_ws_close_code(code: u16) -> bool {
     matches!(code, 1002 | 1003 | 1007 | 1008 | 1009 | 1010)
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg(test)]
 struct FrameHeader {
     fin: bool,
     opcode: u8,
@@ -1021,12 +1403,78 @@ struct FrameHeader {
 }
 
 const MAX_CONTROL_FRAME_PAYLOAD_BYTES: usize = 125;
+const MAX_INBOUND_MESSAGE_BYTES: usize = MAX_INBOUND_FRAME_BYTES as usize;
+const WS_RSV_MASK: u8 = 0x70;
 
+fn checked_message_len(
+    current_len: usize,
+    payload_len: usize,
+    max_message_bytes: usize,
+) -> Result<usize, WsMessageError> {
+    let new_len = current_len.checked_add(payload_len).ok_or_else(|| {
+        WsMessageError::ProtocolViolation("WebSocket message too large".to_string())
+    })?;
+    if new_len > max_message_bytes {
+        return Err(WsMessageError::ProtocolViolation(format!(
+            "WebSocket message too large: {} bytes",
+            new_len
+        )));
+    }
+    Ok(new_len)
+}
+
+fn validate_payload_length_encoding(len_short: u8, payload_len: u64) -> Result<(), WsMessageError> {
+    match len_short {
+        126 if payload_len <= 125 => Err(WsMessageError::ProtocolViolation(format!(
+            "WebSocket frame length uses non-minimal 16-bit encoding: {} bytes",
+            payload_len
+        ))),
+        127 if payload_len <= 0xffff => Err(WsMessageError::ProtocolViolation(format!(
+            "WebSocket frame length uses non-minimal 64-bit encoding: {} bytes",
+            payload_len
+        ))),
+        _ => Ok(()),
+    }
+}
+
+fn validate_control_frame_header(
+    fin: bool,
+    opcode: u8,
+    payload_len: usize,
+) -> Result<(), WsMessageError> {
+    if !matches!(opcode, WS_OPCODE_PING | WS_OPCODE_PONG | WS_OPCODE_CLOSE) {
+        return Ok(());
+    }
+    if !fin {
+        return Err(WsMessageError::ProtocolViolation(
+            "WebSocket control frame must not be fragmented".to_string(),
+        ));
+    }
+    if payload_len > MAX_CONTROL_FRAME_PAYLOAD_BYTES {
+        return Err(WsMessageError::ProtocolViolation(format!(
+            "WebSocket control frame too large: {} bytes",
+            payload_len
+        )));
+    }
+    if opcode == WS_OPCODE_CLOSE && payload_len == 1 {
+        return Err(WsMessageError::ProtocolViolation(
+            "WebSocket close frame payload length must be 0 or at least 2 bytes".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn read_frame_header<R: Read>(stream: &mut R) -> Result<FrameHeader, WsMessageError> {
     let mut hdr = [0u8; 2];
     read_exact_io(stream, &mut hdr, "WebSocket frame header").map_err(WsMessageError::Error)?;
     let fin = (hdr[0] & 0x80) != 0;
     let opcode = hdr[0] & 0x0F;
+    if hdr[0] & WS_RSV_MASK != 0 {
+        return Err(WsMessageError::ProtocolViolation(
+            "WebSocket RSV bits are set but no extensions were negotiated".to_string(),
+        ));
+    }
     let masked = (hdr[1] & 0x80) != 0;
     if masked {
         return Err(WsMessageError::ProtocolViolation(
@@ -1050,6 +1498,7 @@ fn read_frame_header<R: Read>(stream: &mut R) -> Result<FrameHeader, WsMessageEr
         n => n as u64,
     };
 
+    validate_payload_length_encoding(len_short, payload_len)?;
     if payload_len > MAX_INBOUND_FRAME_BYTES {
         return Err(WsMessageError::ProtocolViolation(format!(
             "WebSocket frame too large: {} bytes",
@@ -1063,6 +1512,7 @@ fn read_frame_header<R: Read>(stream: &mut R) -> Result<FrameHeader, WsMessageEr
             payload_len
         ))
     })?;
+    validate_control_frame_header(fin, opcode, payload_len)?;
     Ok(FrameHeader {
         fin,
         opcode,
@@ -1070,15 +1520,14 @@ fn read_frame_header<R: Read>(stream: &mut R) -> Result<FrameHeader, WsMessageEr
     })
 }
 
+#[cfg(test)]
 fn read_payload_into<R: Read>(
     stream: &mut R,
     out: &mut Vec<u8>,
     payload_len: usize,
 ) -> Result<(), WsMessageError> {
     let start = out.len();
-    let end = start.checked_add(payload_len).ok_or_else(|| {
-        WsMessageError::ProtocolViolation("WebSocket message too large".to_string())
-    })?;
+    let end = checked_message_len(start, payload_len, MAX_INBOUND_MESSAGE_BYTES)?;
     out.resize(end, 0);
     if payload_len > 0 {
         read_exact_io(stream, &mut out[start..end], "WebSocket frame payload")
@@ -1087,22 +1536,12 @@ fn read_payload_into<R: Read>(
     Ok(())
 }
 
+#[cfg(test)]
 fn read_control_frame_payload<'a, R: Read>(
     stream: &mut R,
     header: FrameHeader,
     payload: &'a mut [u8; MAX_CONTROL_FRAME_PAYLOAD_BYTES],
 ) -> Result<&'a [u8], WsMessageError> {
-    if !header.fin {
-        return Err(WsMessageError::ProtocolViolation(
-            "WebSocket control frame must not be fragmented".to_string(),
-        ));
-    }
-    if header.payload_len > MAX_CONTROL_FRAME_PAYLOAD_BYTES {
-        return Err(WsMessageError::ProtocolViolation(format!(
-            "WebSocket control frame too large: {} bytes",
-            header.payload_len
-        )));
-    }
     let payload = &mut payload[..header.payload_len];
     if !payload.is_empty() {
         read_exact_io(stream, payload, "WebSocket control frame payload")
@@ -1111,6 +1550,7 @@ fn read_control_frame_payload<'a, R: Read>(
     Ok(payload)
 }
 
+#[cfg(test)]
 fn read_exact_io<R: Read>(stream: &mut R, buf: &mut [u8], what: &str) -> crate::Result<()> {
     stream
         .read_exact(buf)
@@ -1127,7 +1567,7 @@ pub(crate) fn perform_upgrade<S: Read + Write>(
     max_version: u32,
     client_id: Option<&str>,
     request_durable_ack: bool,
-) -> crate::Result<u8> {
+) -> crate::Result<(u8, Vec<u8>)> {
     // RFC 6455 only requires a 16-byte random nonce that the client base64-
     // encodes. It is not a security boundary.
     let mut key_bytes = [0u8; 16];
@@ -1151,13 +1591,15 @@ pub(crate) fn perform_upgrade<S: Read + Write>(
         )
     })?;
 
-    let header_block = read_http_header_block(stream)?;
+    let (header_block, leftover) = read_http_header_block(stream)?;
     let parsed = codec::parse_http_header_block(&header_block)?;
     let expected_accept = codec::compute_accept(&key_b64);
-    codec::validate_upgrade_response(&parsed, &expected_accept)
+    let negotiated_version =
+        codec::validate_upgrade_response(&parsed, &expected_accept, request_durable_ack)?;
+    Ok((negotiated_version, leftover))
 }
 
-fn read_http_header_block<R: Read>(stream: &mut R) -> crate::Result<Vec<u8>> {
+fn read_http_header_block<R: Read>(stream: &mut R) -> crate::Result<(Vec<u8>, Vec<u8>)> {
     let mut buf = Vec::with_capacity(1024);
     let mut tmp = [0u8; 512];
     loop {
@@ -1172,8 +1614,9 @@ fn read_http_header_block<R: Read>(stream: &mut R) -> crate::Result<Vec<u8>> {
         }
         buf.extend_from_slice(&tmp[..n]);
         if let Some(pos) = codec::find_subsequence(&buf, b"\r\n\r\n") {
+            let leftover = buf.split_off(pos + 4);
             buf.truncate(pos);
-            return Ok(buf);
+            return Ok((buf, leftover));
         }
         if buf.len() > 8192 {
             return Err(error::fmt!(
@@ -1187,7 +1630,8 @@ fn read_http_header_block<R: Read>(stream: &mut R) -> crate::Result<Vec<u8>> {
 // ---------- connect ----------
 
 /// Establish a fresh QWP/WebSocket connection: TCP → optional TLS → HTTP
-/// upgrade. Returns the connected stream and the version the server picked.
+/// upgrade. Returns the connected stream, the version the server picked, and any
+/// WebSocket bytes read after the HTTP upgrade response.
 pub(crate) fn establish_connection(
     host: &str,
     port: &str,
@@ -1195,7 +1639,7 @@ pub(crate) fn establish_connection(
     tls_settings: Option<TlsSettings>,
     qwp_ws: &QwpWsConfig,
     auth_header: Option<&str>,
-) -> crate::Result<(WsStream, u8)> {
+) -> crate::Result<(WsStream, u8, Vec<u8>)> {
     use std::net::ToSocketAddrs;
 
     let connect_timeout = *qwp_ws.connect_timeout;
@@ -1258,7 +1702,7 @@ pub(crate) fn establish_connection(
     let client_id = qwp_ws.client_id.as_deref();
     let request_durable_ack = *qwp_ws.request_durable_ack;
 
-    let negotiated_version = perform_upgrade(
+    let (negotiated_version, leftover) = perform_upgrade(
         &mut stream,
         &host_header,
         auth_header,
@@ -1271,7 +1715,7 @@ pub(crate) fn establish_connection(
         .set_timeouts(Some(request_timeout), Some(request_timeout))
         .ok();
 
-    Ok((stream, negotiated_version))
+    Ok((stream, negotiated_version, leftover))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1331,6 +1775,7 @@ pub(crate) fn open_qwp_ws_publisher(
             *qwp_ws.reconnect_initial_backoff,
             *qwp_ws.reconnect_max_backoff,
         ),
+        *qwp_ws.request_durable_ack,
     );
 
     Ok(QwpWsPublicationDriver::new(driver, negotiated_version))
@@ -1448,7 +1893,8 @@ pub(crate) fn qwp_ws_drive_once(state: &mut ManualQwpWsHandlerState) -> crate::R
             DriveOutcome::Sent(_)
             | DriveOutcome::Acked { .. }
             | DriveOutcome::Rejected { .. }
-            | DriveOutcome::Reconnected { .. },
+            | DriveOutcome::Reconnected { .. }
+            | DriveOutcome::Progress,
         ) => Ok(true),
         Err(err) => Err(driver_error_to_error(&state.publisher, err)),
     }
@@ -1661,6 +2107,18 @@ mod tests {
     }
 
     #[test]
+    fn write_ping_frame_masks_client_ping() {
+        let mut stream = InMemoryWs::new(Vec::new());
+        let mut scratch = Vec::new();
+
+        write_ping_frame(&mut stream, &mut scratch, b"da").unwrap();
+
+        assert_eq!(stream.written[0], 0x80 | WS_OPCODE_PING);
+        assert_eq!(stream.written[1] & 0x80, 0x80);
+        assert_eq!(stream.written[1] & 0x7f, 2);
+    }
+
+    #[test]
     fn masked_server_frame_is_protocol_error() {
         let mut masked_frame = Vec::new();
         codec::write_frame_to_buf(&mut masked_frame, true, WS_OPCODE_BINARY, b"hello", [0; 4]);
@@ -1677,6 +2135,70 @@ mod tests {
             "got: {}",
             err.msg()
         );
+    }
+
+    #[test]
+    fn frame_reader_rejects_rsv_bits_without_extension() {
+        let mut frame = Vec::new();
+        append_server_frame(&mut frame, true, WS_OPCODE_BINARY, b"hello");
+        frame[0] |= 0x40;
+        let mut reader = WsFrameReader::new();
+        reader.append_input_for_test(&frame);
+        let mut written = Vec::new();
+        let mut scratch = Vec::new();
+
+        let err = reader
+            .try_read_buffered_for_test(&mut written, &mut scratch)
+            .unwrap_err();
+
+        assert_protocol_violation_contains(err, "RSV bits");
+    }
+
+    #[test]
+    fn frame_reader_rejects_one_byte_close_payload() {
+        let mut frame = Vec::new();
+        append_server_frame(&mut frame, true, WS_OPCODE_CLOSE, &[0x03]);
+        let mut reader = WsFrameReader::new();
+        reader.append_input_for_test(&frame);
+        let mut written = Vec::new();
+        let mut scratch = Vec::new();
+
+        let err = reader
+            .try_read_buffered_for_test(&mut written, &mut scratch)
+            .unwrap_err();
+
+        assert_protocol_violation_contains(err, "payload length must be 0 or at least 2 bytes");
+    }
+
+    #[test]
+    fn frame_reader_rejects_non_minimal_16_bit_payload_length() {
+        let frame = [0x80 | WS_OPCODE_BINARY, 126, 0, 125];
+        let mut reader = WsFrameReader::new();
+        reader.append_input_for_test(&frame);
+        let mut written = Vec::new();
+        let mut scratch = Vec::new();
+
+        let err = reader
+            .try_read_buffered_for_test(&mut written, &mut scratch)
+            .unwrap_err();
+
+        assert_protocol_violation_contains(err, "non-minimal 16-bit encoding");
+    }
+
+    #[test]
+    fn frame_reader_rejects_non_minimal_64_bit_payload_length() {
+        let mut frame = vec![0x80 | WS_OPCODE_BINARY, 127];
+        frame.extend_from_slice(&0xffffu64.to_be_bytes());
+        let mut reader = WsFrameReader::new();
+        reader.append_input_for_test(&frame);
+        let mut written = Vec::new();
+        let mut scratch = Vec::new();
+
+        let err = reader
+            .try_read_buffered_for_test(&mut written, &mut scratch)
+            .unwrap_err();
+
+        assert_protocol_violation_contains(err, "non-minimal 64-bit encoding");
     }
 
     struct InMemoryWs {
@@ -1710,6 +2232,69 @@ mod tests {
         }
     }
 
+    struct UpgradeResponseWithFrame {
+        written: Vec<u8>,
+        read: std::io::Cursor<Vec<u8>>,
+        payload: Vec<u8>,
+        response_built: bool,
+    }
+
+    impl UpgradeResponseWithFrame {
+        fn new(payload: &[u8]) -> Self {
+            Self {
+                written: Vec::new(),
+                read: std::io::Cursor::new(Vec::new()),
+                payload: payload.to_vec(),
+                response_built: false,
+            }
+        }
+
+        fn build_response(&mut self) {
+            let request = std::str::from_utf8(&self.written).unwrap();
+            let key = request
+                .split("\r\n")
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("sec-websocket-key")
+                        .then(|| value.trim())
+                })
+                .unwrap();
+            let accept = codec::compute_accept(key);
+            let mut response = format!(
+                "HTTP/1.1 101 Switching Protocols\r\n\
+                 Upgrade: websocket\r\n\
+                 Connection: Upgrade\r\n\
+                 Sec-WebSocket-Accept: {accept}\r\n\
+                 X-QWP-Version: 1\r\n\
+                 \r\n"
+            )
+            .into_bytes();
+            append_server_frame(&mut response, true, WS_OPCODE_BINARY, &self.payload);
+            self.read = std::io::Cursor::new(response);
+            self.response_built = true;
+        }
+    }
+
+    impl std::io::Read for UpgradeResponseWithFrame {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if !self.response_built {
+                self.build_response();
+            }
+            std::io::Read::read(&mut self.read, buf)
+        }
+    }
+
+    impl std::io::Write for UpgradeResponseWithFrame {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     fn append_server_frame(out: &mut Vec<u8>, fin: bool, opcode: u8, payload: &[u8]) {
         let fin_bit = if fin { 0x80 } else { 0x00 };
         out.push(fin_bit | (opcode & 0x0F));
@@ -1727,6 +2312,37 @@ mod tests {
     }
 
     #[test]
+    fn perform_upgrade_preserves_coalesced_websocket_frame() {
+        let mut stream = UpgradeResponseWithFrame::new(b"\x02\x00");
+
+        let (version, leftover) =
+            perform_upgrade(&mut stream, "localhost:9000", None, 1, None, false).unwrap();
+
+        assert_eq!(version, 1);
+        let mut reader = WsFrameReader::with_initial_input(leftover);
+        let mut written = Vec::new();
+        let mut scratch = Vec::new();
+        assert_eq!(
+            reader
+                .try_read_buffered_for_test(&mut written, &mut scratch)
+                .unwrap(),
+            WsFrameRead::Message {
+                opcode: WS_OPCODE_BINARY
+            }
+        );
+        assert_eq!(reader.message(), b"\x02\x00");
+    }
+
+    fn assert_protocol_violation_contains(err: WsMessageError, needle: &str) {
+        match err {
+            WsMessageError::ProtocolViolation(reason) => {
+                assert!(reason.contains(needle), "got: {reason}");
+            }
+            other => panic!("expected protocol violation, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn read_message_preserves_fragment_across_ping() {
         let mut frames = Vec::new();
         append_server_frame(&mut frames, false, WS_OPCODE_BINARY, b"hello ");
@@ -1741,6 +2357,141 @@ mod tests {
         assert_eq!(opcode, WS_OPCODE_BINARY);
         assert_eq!(out, b"hello world");
         assert!(!stream.written.is_empty());
+    }
+
+    #[test]
+    fn frame_reader_rejects_fragmented_message_over_aggregate_limit() {
+        let mut frames = Vec::new();
+        append_server_frame(&mut frames, false, WS_OPCODE_BINARY, b"abc");
+        append_server_frame(&mut frames, true, WS_OPCODE_CONTINUATION, b"def");
+        let mut reader = WsFrameReader::with_max_message_bytes_for_test(5);
+        reader.append_input_for_test(&frames);
+        let mut written = Vec::new();
+        let mut scratch = Vec::new();
+
+        assert_eq!(
+            reader
+                .try_read_buffered_for_test(&mut written, &mut scratch)
+                .unwrap(),
+            WsFrameRead::Progress
+        );
+        let err = reader
+            .try_read_buffered_for_test(&mut written, &mut scratch)
+            .unwrap_err();
+
+        assert_protocol_violation_contains(err, "WebSocket message too large: 6 bytes");
+        assert_eq!(reader.message(), b"abc");
+    }
+
+    #[test]
+    fn frame_reader_consumes_pong_then_buffered_binary_message() {
+        let mut frames = Vec::new();
+        append_server_frame(&mut frames, true, WS_OPCODE_PONG, b"");
+        append_server_frame(&mut frames, true, WS_OPCODE_BINARY, b"\x02\x00");
+        let mut reader = WsFrameReader::new();
+        reader.append_input_for_test(&frames);
+        let mut written = Vec::new();
+        let mut scratch = Vec::new();
+
+        assert_eq!(
+            reader
+                .try_read_buffered_for_test(&mut written, &mut scratch)
+                .unwrap(),
+            WsFrameRead::Progress
+        );
+        assert!(written.is_empty());
+        assert_eq!(
+            reader
+                .try_read_buffered_for_test(&mut written, &mut scratch)
+                .unwrap(),
+            WsFrameRead::Message {
+                opcode: WS_OPCODE_BINARY
+            }
+        );
+        assert_eq!(reader.message(), b"\x02\x00");
+    }
+
+    #[test]
+    fn frame_reader_answers_ping_and_returns_progress() {
+        let mut frame = Vec::new();
+        append_server_frame(&mut frame, true, WS_OPCODE_PING, b"p");
+        let mut reader = WsFrameReader::new();
+        reader.append_input_for_test(&frame);
+        let mut written = Vec::new();
+        let mut scratch = Vec::new();
+
+        assert_eq!(
+            reader
+                .try_read_buffered_for_test(&mut written, &mut scratch)
+                .unwrap(),
+            WsFrameRead::Progress
+        );
+        assert_eq!(written[0], 0x80 | WS_OPCODE_PONG);
+        assert_eq!(written[1] & 0x80, 0x80);
+        assert_eq!(written[1] & 0x7f, 1);
+    }
+
+    #[test]
+    fn frame_reader_preserves_incomplete_buffered_payload_until_complete() {
+        let mut frame = Vec::new();
+        append_server_frame(&mut frame, true, WS_OPCODE_BINARY, b"ok");
+        let mut reader = WsFrameReader::new();
+        reader.append_input_for_test(&frame[..3]);
+        let mut written = Vec::new();
+        let mut scratch = Vec::new();
+
+        assert_eq!(
+            reader
+                .try_read_buffered_for_test(&mut written, &mut scratch)
+                .unwrap(),
+            WsFrameRead::Idle
+        );
+        reader.append_input_for_test(&frame[3..]);
+        assert_eq!(
+            reader
+                .try_read_buffered_for_test(&mut written, &mut scratch)
+                .unwrap(),
+            WsFrameRead::Message {
+                opcode: WS_OPCODE_BINARY
+            }
+        );
+        assert_eq!(reader.message(), b"ok");
+    }
+
+    #[test]
+    fn frame_reader_compacts_consumed_small_frames() {
+        let mut frames = Vec::new();
+        for _ in 0..2500 {
+            append_server_frame(&mut frames, true, WS_OPCODE_PONG, b"");
+        }
+        append_server_frame(&mut frames, true, WS_OPCODE_BINARY, b"done");
+        let original_len = frames.len();
+        let mut reader = WsFrameReader::new();
+        reader.append_input_for_test(&frames);
+        let mut written = Vec::new();
+        let mut scratch = Vec::new();
+
+        for _ in 0..2500 {
+            assert_eq!(
+                reader
+                    .try_read_buffered_for_test(&mut written, &mut scratch)
+                    .unwrap(),
+                WsFrameRead::Progress
+            );
+        }
+        assert!(
+            reader.input.len() < original_len,
+            "reader did not compact consumed frames"
+        );
+        assert_eq!(
+            reader
+                .try_read_buffered_for_test(&mut written, &mut scratch)
+                .unwrap(),
+            WsFrameRead::Message {
+                opcode: WS_OPCODE_BINARY
+            }
+        );
+        assert_eq!(reader.message(), b"done");
     }
 
     /// Run with:
@@ -1786,8 +2537,8 @@ mod tests {
     }
 
     impl ManualDriverTransport for BlockingFirstSendTransport {
-        fn poll_response(&mut self) -> Result<Option<TransportResponse>, TransportFailure> {
-            Ok(None)
+        fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure> {
+            Ok(TransportPoll::Idle)
         }
 
         fn send_frame(
@@ -1870,8 +2621,8 @@ mod tests {
     }
 
     impl ManualDriverTransport for BlockingReconnectTransport {
-        fn poll_response(&mut self) -> Result<Option<TransportResponse>, TransportFailure> {
-            Ok(None)
+        fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure> {
+            Ok(TransportPoll::Idle)
         }
 
         fn send_frame(
@@ -1966,7 +2717,7 @@ mod tests {
     }
 
     impl ManualDriverTransport for SignalResponseTransport {
-        fn poll_response(&mut self) -> Result<Option<TransportResponse>, TransportFailure> {
+        fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure> {
             if self.terminal.try_recv().is_ok() {
                 return Err(TransportFailure::Terminal(crate::Error::new(
                     crate::ErrorCode::SocketError,
@@ -1974,9 +2725,11 @@ mod tests {
                 )));
             }
             if self.ack.try_recv().is_ok() {
-                return Ok(Some(TransportResponse::Ack { wire_seq: 0 }));
+                return Ok(TransportPoll::Response(TransportResponse::Ack {
+                    wire_seq: 0,
+                }));
             }
-            Ok(None)
+            Ok(TransportPoll::Idle)
         }
 
         fn send_frame(
@@ -2138,8 +2891,8 @@ mod tests {
     }
 
     impl ManualDriverTransport for ImmediateFailureReconnectTransport {
-        fn poll_response(&mut self) -> Result<Option<TransportResponse>, TransportFailure> {
-            Ok(None)
+        fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure> {
+            Ok(TransportPoll::Idle)
         }
 
         fn send_frame(

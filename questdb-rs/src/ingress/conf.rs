@@ -159,6 +159,7 @@ pub(crate) struct QwpWsConfig {
     pub(crate) client_id: ConfigSetting<Option<String>>,
     pub(crate) max_protocol_version: ConfigSetting<u32>,
     pub(crate) request_durable_ack: ConfigSetting<bool>,
+    pub(crate) durable_ack_keepalive_interval: ConfigSetting<std::time::Duration>,
     /// Maximum number of unacknowledged messages in flight on a single
     /// pipelined async sender. Matches the spec's per-connection cap.
     pub(crate) max_in_flight: ConfigSetting<usize>,
@@ -189,6 +190,9 @@ impl Default for QwpWsConfig {
             client_id: ConfigSetting::new_default(None),
             max_protocol_version: ConfigSetting::new_default(1),
             request_durable_ack: ConfigSetting::new_default(false),
+            durable_ack_keepalive_interval: ConfigSetting::new_default(
+                std::time::Duration::from_millis(200),
+            ),
             max_in_flight: ConfigSetting::new_default(128),
             reconnect_max_duration: ConfigSetting::new_default(std::time::Duration::from_secs(300)),
             reconnect_initial_backoff: ConfigSetting::new_default(

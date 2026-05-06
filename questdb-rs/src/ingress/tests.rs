@@ -232,8 +232,13 @@ fn qwpws_store_and_forward_size_suffixes_match_java_config_surface() {
 #[test]
 fn qwpws_store_and_forward_config_rejects_invalid_java_keys() {
     SenderBuilder::from_conf("qwpws::addr=localhost:9000;request_durable_ack=off;").unwrap();
+    SenderBuilder::from_conf("qwpws::addr=localhost:9000;request_durable_ack=on;").unwrap();
     SenderBuilder::from_conf(
         "qwpws::addr=localhost:9000;request_durable_ack=off;durable_ack_keepalive_interval_millis=5000;",
+    )
+    .unwrap();
+    SenderBuilder::from_conf(
+        "qwpws::addr=localhost:9000;request_durable_ack=on;durable_ack_keepalive_interval_millis=5000;",
     )
     .unwrap();
     SenderBuilder::from_conf(
@@ -292,10 +297,6 @@ fn qwpws_store_and_forward_config_rejects_invalid_java_keys() {
         "max_background_drainers must be >= 0: -1",
     );
     for (conf, expected) in [
-        (
-            "qwpws::addr=localhost:9000;request_durable_ack=on;",
-            "\"request_durable_ack\" is not supported by the Rust QWP/WebSocket sync sender yet; durable ACK trimming is not implemented.",
-        ),
         (
             "qwpws::addr=localhost:9000;max_schemas_per_connection=1024;",
             "\"max_schemas_per_connection\" is not supported by the Rust QWP/WebSocket sync sender yet; configurable schema limits are not implemented.",

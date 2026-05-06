@@ -46,7 +46,10 @@ use crate::ingress::tls::TlsSettings;
 use crate::{Error, ErrorCode};
 
 #[cfg(feature = "sync-sender-qwp-ws")]
-use super::qwp_ws::{WsStream, establish_connection, write_binary_frame};
+use super::qwp_ws::{
+    WsFrameRead, WsFrameReader, WsStream, establish_connection, write_binary_frame,
+    write_ping_frame,
+};
 #[cfg(feature = "sync-sender-qwp-ws")]
 use super::qwp_ws_codec::WS_OPCODE_BINARY;
 use super::qwp_ws_codec::{self as codec, PipelinedResponse};
@@ -437,6 +440,9 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         reason: ReconnectReason,
     ) -> DriveOutcome {
         send_cursor.restart(&self.queue);
+        if self.durable_ack.is_some() {
+            self.clear_unresolved_rejected_frames();
+        }
         if let Some(tracker) = self.durable_ack.as_mut() {
             tracker.reset();
         }
@@ -489,10 +495,26 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         status
     }
 
+    pub(crate) fn has_pending_durable_ack(&self) -> bool {
+        self.durable_ack
+            .as_ref()
+            .is_some_and(DurableAckTracker::has_pending)
+    }
+
     fn is_rejected_fsn(&self, fsn: u64) -> bool {
         self.rejected_frames
             .iter()
             .any(|rejected| rejected.fsn == fsn)
+    }
+
+    fn clear_unresolved_rejected_frames(&mut self) {
+        let queue = &self.queue;
+        self.rejected_frames.retain(|rejected| {
+            matches!(
+                queue.receipt_status(QwpReceipt { fsn: rejected.fsn }),
+                QwpReceiptStatus::Rejected { .. }
+            )
+        });
     }
 
     fn record_rejected_frame(
@@ -670,14 +692,16 @@ impl<T: ManualDriverTransport> QwpWsSendCore<T> {
         }
     }
 
-    pub(crate) fn poll_response(&mut self) -> Result<Option<TransportResponse>, TransportFailure> {
-        self.transport.poll_response()
+    pub(crate) fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure> {
+        self.transport.try_poll_response()
     }
 
-    pub(crate) fn try_poll_response(
+    pub(crate) fn send_durable_ack_keepalive_if_due(
         &mut self,
-    ) -> Result<Option<TransportResponse>, TransportFailure> {
-        self.transport.try_poll_response()
+        durable_ack_pending: bool,
+    ) -> Result<bool, TransportFailure> {
+        self.transport
+            .send_durable_ack_keepalive_if_due(durable_ack_pending)
     }
 
     pub(crate) fn finish_response<Q: PublicationLog>(
@@ -823,10 +847,15 @@ impl<Q: PublicationLog, T: ManualDriverTransport> ManualDriverPrototype<Q, T> {
         queue: Q,
         transport: T,
         reconnect_policy: ReconnectPolicy,
+        durable_ack: bool,
     ) -> Self {
         let max_in_flight = queue.max_in_flight();
         Self {
-            store: QwpWsPublicationStore::new(queue, DEFAULT_EVENT_CAPACITY),
+            store: QwpWsPublicationStore::new_with_durable_ack(
+                queue,
+                DEFAULT_EVENT_CAPACITY,
+                durable_ack,
+            ),
             send_core: QwpWsSendCore::new(transport, max_in_flight, reconnect_policy),
         }
     }
@@ -918,23 +947,34 @@ impl<Q: PublicationLog, T: ManualDriverTransport> ManualDriverPrototype<Q, T> {
             return Ok(DriveOutcome::Terminal);
         }
 
-        if let Some(outcome) = self.drive_send_available()? {
-            return Ok(outcome);
+        let mut outcome = DriveOutcome::Idle;
+        if let Some(send_outcome) = self.drive_send_available()? {
+            if send_outcome == DriveOutcome::Terminal {
+                return Ok(send_outcome);
+            }
+            if send_outcome != DriveOutcome::Idle {
+                outcome = send_outcome;
+            }
         }
 
-        self.drive_receive_once()
+        let receive = self.drive_receive_ready_until_idle()?;
+        if receive == DriveOutcome::Terminal {
+            return Ok(receive);
+        }
+        if receive != DriveOutcome::Idle
+            && (outcome == DriveOutcome::Idle || receive != DriveOutcome::Progress)
+        {
+            outcome = receive;
+        }
+
+        if outcome == DriveOutcome::Idle {
+            outcome = self.drive_durable_ack_keepalive_once()?;
+        }
+        Ok(outcome)
     }
 
     pub(crate) fn drive_ready_once(&mut self) -> Result<DriveOutcome, DriverError> {
-        if self.store.is_terminal() {
-            return Ok(DriveOutcome::Terminal);
-        }
-
-        if let Some(outcome) = self.drive_send_available()? {
-            return Ok(outcome);
-        }
-
-        self.drive_receive_ready_once()
+        self.drive_once()
     }
 
     pub(crate) fn drive_send_once(&mut self) -> Result<DriveOutcome, DriverError> {
@@ -950,23 +990,63 @@ impl<Q: PublicationLog, T: ManualDriverTransport> ManualDriverPrototype<Q, T> {
             return Ok(DriveOutcome::Terminal);
         }
 
-        let response = self.send_core.poll_response();
+        let response = self.send_core.try_poll_response();
         match response {
-            Ok(Some(response)) => self.send_core.finish_response(&mut self.store, response),
-            Ok(None) => Ok(DriveOutcome::Idle),
+            Ok(TransportPoll::Response(response)) => self.finish_polled_response(response),
+            Ok(TransportPoll::Progress) => Ok(DriveOutcome::Progress),
+            Ok(TransportPoll::Idle) => Ok(DriveOutcome::Idle),
             Err(failure) => self.apply_transport_failure(failure),
         }
     }
 
-    pub(crate) fn drive_receive_ready_once(&mut self) -> Result<DriveOutcome, DriverError> {
+    fn drive_receive_ready_until_idle(&mut self) -> Result<DriveOutcome, DriverError> {
         if self.store.is_terminal() {
             return Ok(DriveOutcome::Terminal);
         }
 
-        let response = self.send_core.try_poll_response();
-        match response {
-            Ok(Some(response)) => self.send_core.finish_response(&mut self.store, response),
-            Ok(None) => Ok(DriveOutcome::Idle),
+        let mut outcome = DriveOutcome::Idle;
+        loop {
+            match self.send_core.try_poll_response() {
+                Ok(TransportPoll::Response(response)) => {
+                    let response_outcome = self.finish_polled_response(response)?;
+                    if response_outcome == DriveOutcome::Terminal {
+                        return Ok(response_outcome);
+                    }
+                    if response_outcome != DriveOutcome::Idle {
+                        outcome = response_outcome;
+                    }
+                }
+                Ok(TransportPoll::Progress) => {
+                    if outcome == DriveOutcome::Idle {
+                        outcome = DriveOutcome::Progress;
+                    }
+                }
+                Ok(TransportPoll::Idle) => return Ok(outcome),
+                Err(failure) => return self.apply_transport_failure(failure),
+            }
+        }
+    }
+
+    fn finish_polled_response(
+        &mut self,
+        response: TransportResponse,
+    ) -> Result<DriveOutcome, DriverError> {
+        let outcome = self.send_core.finish_response(&mut self.store, response)?;
+        Ok(if outcome == DriveOutcome::Idle {
+            DriveOutcome::Progress
+        } else {
+            outcome
+        })
+    }
+
+    fn drive_durable_ack_keepalive_once(&mut self) -> Result<DriveOutcome, DriverError> {
+        let durable_ack_pending = self.store.has_pending_durable_ack();
+        match self
+            .send_core
+            .send_durable_ack_keepalive_if_due(durable_ack_pending)
+        {
+            Ok(true) => Ok(DriveOutcome::Idle),
+            Ok(false) => Ok(DriveOutcome::Idle),
             Err(failure) => self.apply_transport_failure(failure),
         }
     }
@@ -1358,10 +1438,13 @@ enum WireResponseKind {
 }
 
 pub(crate) trait ManualDriverTransport {
-    fn poll_response(&mut self) -> Result<Option<TransportResponse>, TransportFailure>;
+    fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure>;
 
-    fn try_poll_response(&mut self) -> Result<Option<TransportResponse>, TransportFailure> {
-        self.poll_response()
+    fn send_durable_ack_keepalive_if_due(
+        &mut self,
+        _durable_ack_pending: bool,
+    ) -> Result<bool, TransportFailure> {
+        Ok(false)
     }
 
     // The outbound payload may borrow queue-owned storage and is valid only for
@@ -1390,9 +1473,10 @@ pub(crate) struct BlockingQwpWsTransport {
     auth_header: Option<String>,
     negotiated_version: u8,
     stream: WsStream,
-    recv: Vec<u8>,
+    reader: WsFrameReader,
     send_buf: Vec<u8>,
     pending_wire_sequences: VecDeque<u64>,
+    last_durable_keepalive_ping: Option<Instant>,
     #[cfg(test)]
     sent_frames: Vec<SentFrame>,
 }
@@ -1409,7 +1493,7 @@ impl BlockingQwpWsTransport {
     ) -> crate::Result<Self> {
         let host = host.into();
         let port = port.into();
-        let (stream, negotiated_version) = establish_connection(
+        let (stream, negotiated_version, leftover) = establish_connection(
             &host,
             &port,
             use_tls,
@@ -1426,9 +1510,10 @@ impl BlockingQwpWsTransport {
             auth_header,
             negotiated_version,
             stream,
-            recv: Vec::new(),
+            reader: WsFrameReader::with_initial_input(leftover),
             send_buf: Vec::with_capacity(16 * 1024),
             pending_wire_sequences: VecDeque::new(),
+            last_durable_keepalive_ping: None,
             #[cfg(test)]
             sent_frames: Vec::new(),
         })
@@ -1439,7 +1524,7 @@ impl BlockingQwpWsTransport {
     }
 
     fn reconnect(&mut self) -> Result<(), DriverError> {
-        let (stream, negotiated_version) = establish_connection(
+        let (stream, negotiated_version, leftover) = establish_connection(
             &self.host,
             &self.port,
             self.use_tls,
@@ -1450,9 +1535,10 @@ impl BlockingQwpWsTransport {
         .map_err(DriverError::Transport)?;
         self.stream = stream;
         self.negotiated_version = negotiated_version;
-        self.recv.clear();
+        self.reader = WsFrameReader::with_initial_input(leftover);
         self.send_buf.clear();
         self.pending_wire_sequences.clear();
+        self.last_durable_keepalive_ping = None;
         Ok(())
     }
 
@@ -1519,58 +1605,48 @@ fn decode_durable_transport_response(
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 impl ManualDriverTransport for BlockingQwpWsTransport {
-    fn try_poll_response(&mut self) -> Result<Option<TransportResponse>, TransportFailure> {
+    fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure> {
         if self.pending_wire_sequences.is_empty() && !*self.qwp_ws.request_durable_ack {
-            return Ok(None);
+            return Ok(TransportPoll::Idle);
         }
-        match self.stream.can_read_without_blocking() {
-            Ok(true) => self.poll_response(),
-            Ok(false) => Ok(None),
-            Err(io) => Err(TransportFailure::Disconnect(error::fmt!(
-                SocketError,
-                "Could not check WebSocket readability: {}",
-                io
-            ))),
-        }
-    }
-
-    fn poll_response(&mut self) -> Result<Option<TransportResponse>, TransportFailure> {
-        if self.pending_wire_sequences.is_empty() && !*self.qwp_ws.request_durable_ack {
-            return Ok(None);
-        }
-
-        let opcode = super::qwp_ws::read_message_with_close(
-            &mut self.stream,
-            &mut self.send_buf,
-            &mut self.recv,
-        )
-        .map_err(|err| match err {
-            super::qwp_ws::WsMessageError::Close(close) => {
-                if let Some(close_code) = close.code
-                    && super::qwp_ws::is_terminal_ws_close_code(close_code)
-                {
-                    return TransportFailure::ProtocolViolation {
-                        close_code: Some(close_code),
-                        reason: close.reason,
-                    };
+        let read = self
+            .reader
+            .try_read_one(&mut self.stream, &mut self.send_buf)
+            .map_err(|err| match err {
+                super::qwp_ws::WsMessageError::Close(close) => {
+                    if let Some(close_code) = close.code
+                        && super::qwp_ws::is_terminal_ws_close_code(close_code)
+                    {
+                        return TransportFailure::ProtocolViolation {
+                            close_code: Some(close_code),
+                            reason: close.reason,
+                        };
+                    }
+                    TransportFailure::Disconnect(close.into_error())
                 }
-                TransportFailure::Disconnect(close.into_error())
-            }
-            super::qwp_ws::WsMessageError::ProtocolViolation(reason) => {
-                TransportFailure::ProtocolViolation {
-                    close_code: None,
-                    reason,
+                super::qwp_ws::WsMessageError::ProtocolViolation(reason) => {
+                    TransportFailure::ProtocolViolation {
+                        close_code: None,
+                        reason,
+                    }
                 }
-            }
-            super::qwp_ws::WsMessageError::Error(err) => match err.code() {
-                ErrorCode::SocketError => TransportFailure::Disconnect(err),
-                ErrorCode::AuthError | ErrorCode::ProtocolVersionError => {
-                    TransportFailure::Terminal(err)
-                }
-                _ => TransportFailure::Terminal(err),
-            },
-        })?;
+                super::qwp_ws::WsMessageError::Error(err) => match err.code() {
+                    ErrorCode::SocketError => TransportFailure::Disconnect(err),
+                    ErrorCode::AuthError | ErrorCode::ProtocolVersionError => {
+                        TransportFailure::Terminal(err)
+                    }
+                    _ => TransportFailure::Terminal(err),
+                },
+            })?;
+        let WsFrameRead::Message { opcode } = read else {
+            return Ok(match read {
+                WsFrameRead::Progress => TransportPoll::Progress,
+                WsFrameRead::Idle => TransportPoll::Idle,
+                WsFrameRead::Message { .. } => unreachable!(),
+            });
+        };
         if opcode != WS_OPCODE_BINARY {
+            self.reader.clear_message();
             return Err(TransportFailure::ProtocolViolation {
                 close_code: None,
                 reason: "QWP/WebSocket server response was not a binary frame".to_string(),
@@ -1578,10 +1654,12 @@ impl ManualDriverTransport for BlockingQwpWsTransport {
         }
 
         let response = if *self.qwp_ws.request_durable_ack {
-            decode_durable_transport_response(&self.recv)?
+            decode_durable_transport_response(self.reader.message())
         } else {
-            decode_transport_response(&self.recv)?
+            decode_transport_response(self.reader.message())
         };
+        self.reader.clear_message();
+        let response = response?;
         if let Some(
             TransportResponse::Ack { wire_seq }
             | TransportResponse::DurableOk { wire_seq, .. }
@@ -1590,7 +1668,45 @@ impl ManualDriverTransport for BlockingQwpWsTransport {
         {
             self.complete_pending_through(*wire_seq);
         }
-        Ok(response)
+        Ok(match response {
+            Some(response) => TransportPoll::Response(response),
+            None => TransportPoll::Progress,
+        })
+    }
+
+    fn send_durable_ack_keepalive_if_due(
+        &mut self,
+        durable_ack_pending: bool,
+    ) -> Result<bool, TransportFailure> {
+        if !durable_ack_pending || !*self.qwp_ws.request_durable_ack {
+            return Ok(false);
+        }
+        let interval = *self.qwp_ws.durable_ack_keepalive_interval;
+        if interval.is_zero() {
+            return Ok(false);
+        }
+        if self
+            .last_durable_keepalive_ping
+            .is_some_and(|sent_at| sent_at.elapsed() < interval)
+        {
+            return Ok(false);
+        }
+        write_ping_frame(&mut self.stream, &mut self.send_buf, b"").map_err(|io| {
+            TransportFailure::Disconnect(error::fmt!(
+                SocketError,
+                "Could not send WebSocket durable ACK keepalive PING: {}",
+                io
+            ))
+        })?;
+        self.stream.flush().map_err(|io| {
+            TransportFailure::Disconnect(error::fmt!(
+                SocketError,
+                "Could not flush WebSocket durable ACK keepalive PING: {}",
+                io
+            ))
+        })?;
+        self.last_durable_keepalive_ping = Some(Instant::now());
+        Ok(true)
     }
 
     fn send_frame(
@@ -1811,6 +1927,7 @@ pub(crate) enum DriveOutcome {
     Acked { wire_seq: u64 },
     Rejected { fsn: u64, wire_seq: u64 },
     Reconnected { reason: ReconnectReason },
+    Progress,
     Terminal,
 }
 
@@ -1861,6 +1978,13 @@ pub(crate) enum TransportFailure {
         close_code: Option<u16>,
         reason: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum TransportPoll {
+    Response(TransportResponse),
+    Progress,
+    Idle,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1945,6 +2069,10 @@ impl DurableAckTracker {
     fn reset(&mut self) {
         self.table_watermarks.clear();
         self.pending.clear();
+    }
+
+    fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
     }
 
     fn enqueue_ok(&mut self, wire_seq: u64, fsn: u64, table_seq_txns: Vec<TableSeqTxn>) {
@@ -2131,8 +2259,11 @@ impl FakeOrderedServer {
 }
 
 impl ManualDriverTransport for FakeOrderedServer {
-    fn poll_response(&mut self) -> Result<Option<TransportResponse>, TransportFailure> {
-        Ok(self.poll_responses.pop_front())
+    fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure> {
+        Ok(self
+            .poll_responses
+            .pop_front()
+            .map_or(TransportPoll::Idle, TransportPoll::Response))
     }
 
     fn send_frame(
@@ -2351,8 +2482,11 @@ mod tests {
     #[derive(Debug)]
     struct TestTransport {
         send_results: VecDeque<Result<TransportSendResult, TransportFailure>>,
-        poll_results: VecDeque<Result<Option<TransportResponse>, TransportFailure>>,
+        poll_results: VecDeque<Result<TransportPoll, TransportFailure>>,
+        keepalive_results: VecDeque<Result<bool, TransportFailure>>,
         restart_results: VecDeque<Result<(), DriverError>>,
+        keepalive_attempts: usize,
+        keepalive_pending_args: Vec<bool>,
         restart_attempts: usize,
         sent_frames: Vec<SentFrame>,
         sent_payloads: Vec<Vec<u8>>,
@@ -2365,7 +2499,10 @@ mod tests {
             Self {
                 send_results: send_results.into_iter().collect(),
                 poll_results: VecDeque::new(),
+                keepalive_results: VecDeque::new(),
                 restart_results: VecDeque::new(),
+                keepalive_attempts: 0,
+                keepalive_pending_args: Vec::new(),
                 restart_attempts: 0,
                 sent_frames: Vec::new(),
                 sent_payloads: Vec::new(),
@@ -2384,14 +2521,51 @@ mod tests {
             mut self,
             poll_results: impl IntoIterator<Item = Result<Option<TransportResponse>, TransportFailure>>,
         ) -> Self {
+            self.poll_results = poll_results
+                .into_iter()
+                .map(|result| {
+                    result.map(|response| {
+                        response.map_or(TransportPoll::Idle, TransportPoll::Response)
+                    })
+                })
+                .collect();
+            self
+        }
+
+        fn with_poll_events(
+            mut self,
+            poll_results: impl IntoIterator<Item = Result<TransportPoll, TransportFailure>>,
+        ) -> Self {
             self.poll_results = poll_results.into_iter().collect();
+            self
+        }
+
+        fn with_keepalive_results(
+            mut self,
+            keepalive_results: impl IntoIterator<Item = Result<bool, TransportFailure>>,
+        ) -> Self {
+            self.keepalive_results = keepalive_results.into_iter().collect();
             self
         }
     }
 
     impl ManualDriverTransport for TestTransport {
-        fn poll_response(&mut self) -> Result<Option<TransportResponse>, TransportFailure> {
-            self.poll_results.pop_front().unwrap_or(Ok(None))
+        fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure> {
+            self.poll_results
+                .pop_front()
+                .unwrap_or(Ok(TransportPoll::Idle))
+        }
+
+        fn send_durable_ack_keepalive_if_due(
+            &mut self,
+            durable_ack_pending: bool,
+        ) -> Result<bool, TransportFailure> {
+            self.keepalive_attempts += 1;
+            self.keepalive_pending_args.push(durable_ack_pending);
+            if !durable_ack_pending {
+                return Ok(false);
+            }
+            self.keepalive_results.pop_front().unwrap_or(Ok(false))
         }
 
         fn send_frame(
@@ -2850,7 +3024,7 @@ mod tests {
         );
 
         let receipt = driver.try_submit(b"qwp-payload").unwrap();
-        let outcome = driver.wait_steps(receipt, 4).unwrap();
+        let outcome = driver.wait_steps(receipt, 1024).unwrap();
 
         assert_eq!(outcome, DeliveryOutcome::Acked);
         assert_eq!(
@@ -2889,7 +3063,7 @@ mod tests {
         let mut publisher = QwpWsPublicationDriver::new(driver, 1);
 
         let receipt = publisher.try_submit_qwp(buffer.as_qwp().unwrap()).unwrap();
-        let outcome = publisher.wait_steps(receipt, 4).unwrap();
+        let outcome = publisher.wait_steps(receipt, 1024).unwrap();
 
         assert_eq!(outcome, DeliveryOutcome::Acked);
         assert_eq!(
@@ -2927,7 +3101,7 @@ mod tests {
 
         let first = driver.try_submit(b"qwp-payload-0").unwrap();
         let second = driver.try_submit(b"qwp-payload-1").unwrap();
-        let outcome = driver.wait_steps(second, 6).unwrap();
+        let outcome = driver.wait_steps(second, 1024).unwrap();
 
         assert_eq!(outcome, DeliveryOutcome::Acked);
         assert_eq!(
@@ -2978,7 +3152,7 @@ mod tests {
         );
 
         let receipt = driver.try_submit(b"qwp-secure-payload").unwrap();
-        let outcome = driver.wait_steps(receipt, 4).unwrap();
+        let outcome = driver.wait_steps(receipt, 1024).unwrap();
 
         assert_eq!(outcome, DeliveryOutcome::Acked);
         assert_eq!(
@@ -3143,6 +3317,7 @@ mod tests {
             VolatileFrameQueue::new(options(8, 1024, 4)).unwrap(),
             transport,
             ReconnectPolicy::no_backoff(Duration::from_secs(1)),
+            false,
         );
         let receipt = driver.try_submit(b"payload").unwrap();
 
@@ -3224,14 +3399,6 @@ mod tests {
         );
         let receipt = driver.try_submit(b"payload").unwrap();
 
-        assert_eq!(
-            driver.drive_once().unwrap(),
-            DriveOutcome::Sent(SentFrame {
-                fsn: 0,
-                wire_seq: 0,
-                payload_len: 7,
-            })
-        );
         assert_eq!(
             driver.drive_once().unwrap(),
             DriveOutcome::Reconnected {
@@ -3327,6 +3494,170 @@ mod tests {
     }
 
     #[test]
+    fn durable_pending_ok_triggers_ready_keepalive() {
+        let transport = TestTransport::scripted([Ok(TransportSendResult::NoResponse)])
+            .with_poll_results([
+                Ok(Some(TransportResponse::DurableOk {
+                    wire_seq: 0,
+                    table_seq_txns: table_seq_txns(&[("trades", 10)]),
+                })),
+                Ok(None),
+            ])
+            .with_keepalive_results([Ok(false), Ok(true)]);
+        let mut driver = ManualDriverPrototype::from_queue_with_durable_ack(
+            VolatileFrameQueue::new(options(8, 1024, 4)).unwrap(),
+            transport,
+        );
+        let receipt = driver.try_submit(b"payload").unwrap();
+
+        assert!(matches!(
+            driver.drive_ready_once().unwrap(),
+            DriveOutcome::Sent(_)
+        ));
+        assert_eq!(driver.drive_ready_once().unwrap(), DriveOutcome::Idle);
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Sent {
+                fsn: 0,
+                wire_seq: 0,
+            }
+        );
+
+        assert_eq!(driver.drive_ready_once().unwrap(), DriveOutcome::Idle);
+        assert_eq!(driver.send_core.transport.keepalive_attempts, 2);
+        assert_eq!(
+            driver.send_core.transport.keepalive_pending_args,
+            vec![true, true]
+        );
+    }
+
+    #[test]
+    fn durable_keepalive_disconnect_reports_reconnect() {
+        let transport = TestTransport::scripted([Ok(TransportSendResult::NoResponse)])
+            .with_poll_results([
+                Ok(Some(TransportResponse::DurableOk {
+                    wire_seq: 0,
+                    table_seq_txns: table_seq_txns(&[("trades", 10)]),
+                })),
+                Ok(None),
+            ])
+            .with_keepalive_results([Err(TransportFailure::Disconnect(fake_transport_error(
+                "keepalive disconnect",
+            )))])
+            .with_restart_results([Ok(())]);
+        let mut driver = ManualDriverPrototype::from_queue_with_durable_ack(
+            VolatileFrameQueue::new(options(8, 1024, 4)).unwrap(),
+            transport,
+        );
+        driver.try_submit(b"payload").unwrap();
+
+        assert!(matches!(
+            driver.drive_ready_once().unwrap(),
+            DriveOutcome::Sent(_)
+        ));
+        assert_eq!(
+            driver.drive_ready_once().unwrap(),
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::Disconnect
+            }
+        );
+        assert_eq!(driver.send_core.transport.keepalive_attempts, 1);
+        assert_eq!(driver.send_core.transport.restart_attempts, 1);
+    }
+
+    #[test]
+    fn durable_keepalive_terminal_failure_reports_terminal() {
+        let transport = TestTransport::scripted([Ok(TransportSendResult::NoResponse)])
+            .with_poll_results([
+                Ok(Some(TransportResponse::DurableOk {
+                    wire_seq: 0,
+                    table_seq_txns: table_seq_txns(&[("trades", 10)]),
+                })),
+                Ok(None),
+            ])
+            .with_keepalive_results([Err(TransportFailure::Terminal(fake_transport_error(
+                "terminal keepalive failure",
+            )))]);
+        let mut driver = ManualDriverPrototype::from_queue_with_durable_ack(
+            VolatileFrameQueue::new(options(8, 1024, 4)).unwrap(),
+            transport,
+        );
+        driver.try_submit(b"payload").unwrap();
+
+        assert!(matches!(
+            driver.drive_ready_once().unwrap(),
+            DriveOutcome::Sent(_)
+        ));
+        assert_eq!(driver.drive_ready_once().unwrap(), DriveOutcome::Terminal);
+        assert!(driver.is_terminal());
+        assert_eq!(driver.send_core.transport.keepalive_attempts, 1);
+    }
+
+    #[test]
+    fn consumed_durable_ok_is_progress_and_does_not_send_keepalive() {
+        let transport = TestTransport::scripted([Ok(TransportSendResult::NoResponse)])
+            .with_poll_results([
+                Ok(Some(TransportResponse::DurableOk {
+                    wire_seq: 0,
+                    table_seq_txns: table_seq_txns(&[("trades", 10)]),
+                })),
+                Ok(None),
+            ])
+            .with_keepalive_results([Ok(true)]);
+        let mut driver = ManualDriverPrototype::from_queue_with_durable_ack(
+            VolatileFrameQueue::new(options(8, 1024, 4)).unwrap(),
+            transport,
+        );
+        let receipt = driver.try_submit(b"payload").unwrap();
+
+        assert!(matches!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Sent(_)
+        ));
+        assert_eq!(driver.drive_ready_once().unwrap(), DriveOutcome::Progress);
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Sent {
+                fsn: 0,
+                wire_seq: 0,
+            }
+        );
+        assert_eq!(driver.send_core.transport.keepalive_attempts, 0);
+    }
+
+    #[test]
+    fn drive_ready_drains_control_progress_and_durable_ack_until_idle() {
+        let transport = TestTransport::scripted([Ok(TransportSendResult::NoResponse)])
+            .with_poll_events([
+                Ok(TransportPoll::Response(TransportResponse::DurableOk {
+                    wire_seq: 0,
+                    table_seq_txns: table_seq_txns(&[("trades", 10)]),
+                })),
+                Ok(TransportPoll::Progress),
+                Ok(TransportPoll::Response(TransportResponse::DurableAck {
+                    table_seq_txns: table_seq_txns(&[("trades", 10)]),
+                })),
+                Ok(TransportPoll::Idle),
+            ])
+            .with_keepalive_results([Ok(true)]);
+        let mut driver = ManualDriverPrototype::from_queue_with_durable_ack(
+            VolatileFrameQueue::new(options(8, 1024, 4)).unwrap(),
+            transport,
+        );
+        let receipt = driver.try_submit(b"payload").unwrap();
+
+        assert_eq!(
+            driver.drive_ready_once().unwrap(),
+            DriveOutcome::Acked { wire_seq: 0 }
+        );
+        assert!(matches!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Acked { fsn: 0 }
+        ));
+        assert_eq!(driver.send_core.transport.keepalive_attempts, 0);
+    }
+
+    #[test]
     fn durable_ok_releases_send_window_without_completing_receipt() {
         let mut server = FakeOrderedServer::no_response();
         server.push_response(TransportResponse::DurableOk {
@@ -3341,7 +3672,7 @@ mod tests {
             driver.drive_send_once().unwrap(),
             DriveOutcome::Sent(_)
         ));
-        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
 
         assert_eq!(driver.acked_fsn(), None);
         assert_eq!(
@@ -3384,7 +3715,7 @@ mod tests {
                 wire_seq: 0,
                 table_seq_txns: table_seq_txns(&[("trades", 10)]),
             });
-        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
 
         driver
             .send_core
@@ -3432,8 +3763,8 @@ mod tests {
                 wire_seq: 1,
                 table_seq_txns: table_seq_txns(&[("b", 20)]),
             });
-        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
-        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
 
         driver
             .send_core
@@ -3441,7 +3772,7 @@ mod tests {
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("b", 20)]),
             });
-        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert_eq!(driver.acked_fsn(), None);
 
         driver
@@ -3487,8 +3818,8 @@ mod tests {
                 wire_seq: 1,
                 table_seq_txns: Vec::new(),
             });
-        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
-        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert_eq!(driver.acked_fsn(), None);
 
         driver
@@ -3533,7 +3864,7 @@ mod tests {
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("trades", 10)]),
             });
-        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert_eq!(
             driver.drive_receive_once().unwrap(),
             DriveOutcome::Acked { wire_seq: 0 }
@@ -3546,14 +3877,14 @@ mod tests {
                 wire_seq: 1,
                 table_seq_txns: table_seq_txns(&[("trades", 12)]),
             });
-        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         driver
             .send_core
             .transport
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("trades", 9)]),
             });
-        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert_eq!(
             driver.receipt_status(second),
             QwpReceiptStatus::Sent {
@@ -3594,7 +3925,7 @@ mod tests {
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("trades", 10)]),
             });
-        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
 
         driver
             .send_core
@@ -3634,7 +3965,7 @@ mod tests {
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("trades", 10)]),
             });
-        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert_eq!(
             driver.drive_receive_once().unwrap(),
             DriveOutcome::Acked { wire_seq: 0 }
@@ -3664,7 +3995,7 @@ mod tests {
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("trades", 12)]),
             });
-        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert_eq!(
             driver.drive_receive_once().unwrap(),
             DriveOutcome::Acked { wire_seq: 1 }
@@ -3700,7 +4031,7 @@ mod tests {
                 wire_seq: 0,
                 table_seq_txns: table_seq_txns(&[("trades", 10)]),
             });
-        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert_eq!(
             driver.receipt_status(receipt),
             QwpReceiptStatus::Sent {
@@ -3733,6 +4064,204 @@ mod tests {
     }
 
     #[test]
+    fn durable_reconnect_clears_unresolved_reject_so_replayed_ok_can_complete() {
+        let mut driver = durable_driver(FakeOrderedServer::no_response());
+        let first = driver.try_submit(b"first").unwrap();
+        let second = driver.try_submit(b"second").unwrap();
+
+        driver.drive_send_once().unwrap();
+        driver.drive_send_once().unwrap();
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableOk {
+                wire_seq: 0,
+                table_seq_txns: table_seq_txns(&[("trades", 10)]),
+            });
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::Reject {
+                wire_seq: 1,
+                error: schema_mismatch_error("schema changed"),
+            });
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
+        assert_eq!(
+            driver.drive_receive_once().unwrap(),
+            DriveOutcome::Rejected {
+                fsn: 1,
+                wire_seq: 1
+            }
+        );
+        assert_eq!(
+            driver.receipt_status(second),
+            QwpReceiptStatus::Rejected { fsn: 1 }
+        );
+
+        assert_eq!(
+            driver.store.finish_reconnect_success(
+                &mut driver.send_core.send_cursor,
+                ReconnectReason::Disconnect
+            ),
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::Disconnect
+            }
+        );
+        assert_eq!(
+            driver.receipt_status(second),
+            QwpReceiptStatus::Published { fsn: 1 }
+        );
+
+        assert!(matches!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Sent(SentFrame { fsn: 0, .. })
+        ));
+        assert!(matches!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Sent(SentFrame { fsn: 1, .. })
+        ));
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableOk {
+                wire_seq: 0,
+                table_seq_txns: table_seq_txns(&[("trades", 10)]),
+            });
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableAck {
+                table_seq_txns: table_seq_txns(&[("trades", 10)]),
+            });
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableOk {
+                wire_seq: 1,
+                table_seq_txns: table_seq_txns(&[("quotes", 20)]),
+            });
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableAck {
+                table_seq_txns: table_seq_txns(&[("quotes", 20)]),
+            });
+
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
+        assert_eq!(
+            driver.drive_receive_once().unwrap(),
+            DriveOutcome::Acked { wire_seq: 0 }
+        );
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
+        assert_eq!(
+            driver.drive_receive_once().unwrap(),
+            DriveOutcome::Acked { wire_seq: 1 }
+        );
+        assert_eq!(
+            driver.receipt_status(first),
+            QwpReceiptStatus::Acked { fsn: 0 }
+        );
+        assert_eq!(
+            driver.receipt_status(second),
+            QwpReceiptStatus::Acked { fsn: 1 }
+        );
+        assert_eq!(driver.acked_fsn(), Some(1));
+    }
+
+    #[test]
+    fn durable_reconnect_clears_unresolved_reject_so_replayed_reject_can_complete() {
+        let mut driver = durable_driver(FakeOrderedServer::no_response());
+        let first = driver.try_submit(b"first").unwrap();
+        let second = driver.try_submit(b"second").unwrap();
+
+        driver.drive_send_once().unwrap();
+        driver.drive_send_once().unwrap();
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableOk {
+                wire_seq: 0,
+                table_seq_txns: table_seq_txns(&[("trades", 10)]),
+            });
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::Reject {
+                wire_seq: 1,
+                error: schema_mismatch_error("schema changed"),
+            });
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
+        assert_eq!(
+            driver.drive_receive_once().unwrap(),
+            DriveOutcome::Rejected {
+                fsn: 1,
+                wire_seq: 1
+            }
+        );
+
+        assert_eq!(
+            driver.store.finish_reconnect_success(
+                &mut driver.send_core.send_cursor,
+                ReconnectReason::Disconnect
+            ),
+            DriveOutcome::Reconnected {
+                reason: ReconnectReason::Disconnect
+            }
+        );
+
+        assert!(matches!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Sent(SentFrame { fsn: 0, .. })
+        ));
+        assert!(matches!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Sent(SentFrame { fsn: 1, .. })
+        ));
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableOk {
+                wire_seq: 0,
+                table_seq_txns: table_seq_txns(&[("trades", 10)]),
+            });
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableAck {
+                table_seq_txns: table_seq_txns(&[("trades", 10)]),
+            });
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::Reject {
+                wire_seq: 1,
+                error: schema_mismatch_error("schema changed again"),
+            });
+
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
+        assert_eq!(
+            driver.drive_receive_once().unwrap(),
+            DriveOutcome::Acked { wire_seq: 0 }
+        );
+        assert_eq!(
+            driver.drive_receive_once().unwrap(),
+            DriveOutcome::Rejected {
+                fsn: 1,
+                wire_seq: 1
+            }
+        );
+        assert_eq!(
+            driver.receipt_status(first),
+            QwpReceiptStatus::Acked { fsn: 0 }
+        );
+        assert_eq!(
+            driver.receipt_status(second),
+            QwpReceiptStatus::Rejected { fsn: 1 }
+        );
+        assert_eq!(driver.acked_fsn(), Some(1));
+    }
+
+    #[test]
     fn durable_reject_placeholder_waits_for_prior_durable_ok() {
         let mut driver = durable_driver(FakeOrderedServer::no_response());
         let first = driver.try_submit(b"first").unwrap();
@@ -3749,7 +4278,7 @@ mod tests {
                 wire_seq: 0,
                 table_seq_txns: table_seq_txns(&[("trades", 10)]),
             });
-        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         driver
             .send_core
             .transport
@@ -3808,8 +4337,8 @@ mod tests {
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("quotes", 20)]),
             });
-        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
-        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert_eq!(driver.acked_fsn(), None);
 
         driver
@@ -3876,7 +4405,7 @@ mod tests {
                 wire_seq: 3,
                 table_seq_txns: table_seq_txns(&[("quotes", 20)]),
             });
-        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert!(matches!(
             driver.drive_receive_once().unwrap(),
             DriveOutcome::Rejected {
@@ -3891,7 +4420,7 @@ mod tests {
                 wire_seq: 2
             }
         ));
-        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
 
         driver
             .send_core
@@ -3986,8 +4515,8 @@ mod tests {
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("quotes", 20)]),
             });
-        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
-        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert_eq!(
             driver.drive_receive_once().unwrap(),
             DriveOutcome::Acked { wire_seq: 1 }
@@ -4036,7 +4565,7 @@ mod tests {
                 wire_seq: 0,
                 error: schema_mismatch_error("schema changed again"),
             });
-        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert_eq!(
             driver.receipt_status(first),
             QwpReceiptStatus::Rejected { fsn: 0 }
@@ -4055,7 +4584,7 @@ mod tests {
             .push_response(TransportResponse::DurableAck {
                 table_seq_txns: table_seq_txns(&[("quotes", 20)]),
             });
-        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Idle);
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
         assert_eq!(
             driver.drive_receive_once().unwrap(),
             DriveOutcome::Acked { wire_seq: 1 }
@@ -4415,6 +4944,7 @@ mod tests {
                 Duration::from_millis(10),
                 Duration::from_millis(10),
             ),
+            false,
         );
         let first = driver.try_submit(b"first").unwrap();
         let second = driver.try_submit(b"second").unwrap();

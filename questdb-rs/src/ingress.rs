@@ -453,14 +453,16 @@ impl SenderBuilder {
     ///
     /// The format of the string is: `"http::addr=host:port;key=value;...;"`.
     ///
-    /// Instead of `"http"`, you can also specify `"https"`, `"tcp"`, and `"tcps"`.
+    /// Instead of `"http"`, you can also specify `"https"`, `"tcp"`, `"tcps"`,
+    /// `"qwpudp"`, `"qwpws"`, and `"qwpwss"` when the corresponding sender
+    /// features are enabled.
     ///
     /// We recommend HTTP for most cases because it provides more features, like
     /// reporting errors to the client and supporting transaction control. TCP can
     /// sometimes be faster in higher-latency networks, but misses a number of
     /// features.
     ///
-    /// The accepted keys match one-for-one with the methods on `SenderBuilder`.
+    /// Many accepted keys match one-for-one with the methods on `SenderBuilder`.
     /// For example, this is a valid configuration string:
     ///
     /// "https::addr=host:port;username=alice;password=secret;"
@@ -468,6 +470,16 @@ impl SenderBuilder {
     /// and there are matching methods [SenderBuilder::username] and
     /// [SenderBuilder::password]. The value of `addr=` is supplied directly to the
     /// `SenderBuilder` constructor, so there's no matching method for that.
+    ///
+    /// Some QWP/WebSocket configuration keys are accepted only through the
+    /// configuration string, primarily for compatibility with Java-style
+    /// configuration names and settings without a public Rust builder method.
+    /// These include `in_flight_window`, `sf_dir`, `sender_id`, `sf_max_bytes`,
+    /// `sf_max_total_bytes`, `sf_durability`, `sf_append_deadline_millis`,
+    /// `close_flush_timeout_millis`, `request_durable_ack`,
+    /// `durable_ack_keepalive_interval_millis`, `drain_orphans`,
+    /// `max_background_drainers`, `error_inbox_capacity`, and
+    /// `max_schemas_per_connection`.
     ///
     /// You can also load the configuration from an environment variable. See
     /// [`SenderBuilder::from_env`].
@@ -1268,21 +1280,24 @@ impl SenderBuilder {
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
-    fn request_durable_ack(self, value: &str) -> Result<Self> {
-        if self.qwp_ws.is_none() {
+    fn request_durable_ack(mut self, value: &str) -> Result<Self> {
+        let Some(qwp_ws) = &mut self.qwp_ws else {
             return Err(error::fmt!(
                 ConfigError,
                 "The \"request_durable_ack\" setting is only supported for QWP/WebSocket."
             ));
-        }
+        };
         if value.eq_ignore_ascii_case("off") {
+            qwp_ws
+                .request_durable_ack
+                .set_specified("request_durable_ack", false)?;
             return Ok(self);
         }
         if value.eq_ignore_ascii_case("on") {
-            return self.reject_unsupported_qwp_ws_setting(
-                "request_durable_ack",
-                "durable ACK trimming is not implemented",
-            );
+            qwp_ws
+                .request_durable_ack
+                .set_specified("request_durable_ack", true)?;
+            return Ok(self);
         }
 
         Err(error::fmt!(
@@ -1316,14 +1331,22 @@ impl SenderBuilder {
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
-    fn durable_ack_keepalive_interval_millis(self, value: &str) -> Result<Self> {
-        if self.qwp_ws.is_none() {
+    fn durable_ack_keepalive_interval_millis(mut self, value: &str) -> Result<Self> {
+        let Some(qwp_ws) = &mut self.qwp_ws else {
             return Err(error::fmt!(
                 ConfigError,
                 "The \"durable_ack_keepalive_interval_millis\" setting is only supported for QWP/WebSocket."
             ));
-        }
-        let _: i64 = parse_conf_value("durable_ack_keepalive_interval_millis", value)?;
+        };
+        let millis: i64 = parse_conf_value("durable_ack_keepalive_interval_millis", value)?;
+        let interval = if millis <= 0 {
+            Duration::ZERO
+        } else {
+            Duration::from_millis(millis as u64)
+        };
+        qwp_ws
+            .durable_ack_keepalive_interval
+            .set_specified("durable_ack_keepalive_interval_millis", interval)?;
         Ok(self)
     }
 

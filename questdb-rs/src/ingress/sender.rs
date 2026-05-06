@@ -537,6 +537,8 @@ impl Sender {
 
     /// Return the highest frame sequence number completed by server ACK or
     /// server-side reject-and-continue, or `None` if no frame has completed.
+    /// In QWP/WebSocket durable ACK mode, ordinary OK frames only release send
+    /// window pressure; this watermark advances after durable ACK coverage.
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn acked_fsn(&self) -> Result<Option<u64>> {
         match &self.handler {
@@ -553,9 +555,11 @@ impl Sender {
     /// `fsn`.
     ///
     /// The watermark advances on server ACKs and server-side
-    /// reject-and-continue responses. Returns `Ok(true)` if the watermark is
-    /// reached before `timeout`, and `Ok(false)` on timeout. In manual progress
-    /// mode this method also drives WebSocket progress while waiting.
+    /// reject-and-continue responses. In QWP/WebSocket durable ACK mode,
+    /// ordinary OK frames only release send window pressure; this waits for
+    /// durable ACK coverage. Returns `Ok(true)` if the watermark is reached
+    /// before `timeout`, and `Ok(false)` on timeout. In manual progress mode
+    /// this method also drives WebSocket progress while waiting.
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn await_acked_fsn(&mut self, fsn: u64, timeout: Duration) -> Result<bool> {
         if !matches!(

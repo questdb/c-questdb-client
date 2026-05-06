@@ -78,11 +78,11 @@ Rust currently has:
 - Java `in_flight_window` accepted as an alias for Rust `max_in_flight` while
   preserving Java's `in_flight_window > 1` validation,
 - explicit rejection for enabled or behavior-bearing Java QWP/WebSocket config
-  keys Rust cannot honor yet, including durable ACK opt-in, schema cap,
-  orphan draining, and async error inbox sizing; dependent durable-ACK
-  keepalive, including Java's signed `<= 0` disable values, and
-  background-drainer knobs, using Java's signed int parsing and `< 0` rejection,
-  are accepted as no-ops while their parent features are disabled,
+  keys Rust cannot honor yet, including schema cap, orphan draining, and async
+  error inbox sizing; durable ACK opt-in and durable-ACK keepalive, including
+  Java's signed `<= 0` disable values, are supported; background-drainer knobs,
+  using Java's signed int parsing and `< 0` rejection, are accepted as no-ops
+  while orphan draining is disabled,
 - strict protocol-error handling for ACK/NACK wire sequences beyond the highest
   sent frame,
 - strict empty-payload rejection for live and recovered QWP/WebSocket replay
@@ -180,7 +180,7 @@ git diff --check
 ### Fix Order
 
 1. Done: fix the SFA frame commit-marker write order.
-2. Done: reject durable ACK opt-in until Java-compatible durable trimming exists.
+2. Done: implement durable ACK opt-in with Java-compatible durable trimming.
 3. Done: align SFA recovery error policy for per-file scan failures while
    keeping recovered-FSN gaps fatal.
 4. Done: add diagnostics for recovered non-empty torn tails.
@@ -234,31 +234,24 @@ watermarks cover those batches. Current reference lines:
 `CursorWebSocketSendLoop.java:1088-1220`, especially the success branch that
 calls `enqueuePendingOk` / `drainPendingDurable` in durable mode.
 
-Rust has internal config/connection plumbing that would send
-`X-QWP-Request-Durable-Ack` if `QwpWsConfig.request_durable_ack` were set, but
-the public config parser now accepts `request_durable_ack=off` as Java's
-disabled default and rejects `request_durable_ack=on` until durable ACK trimming
-exists. Rust parses `STATUS_DURABLE_ACK`, but `decode_transport_response`
-returns `Ok(None)` for it, and ordinary OK ACKs complete queue frames
-immediately. Current reference lines:
-`qwp_ws_driver.rs:271-275` and `qwp_ws_driver.rs:1309-1316`.
+Rust now accepts `request_durable_ack=off|on`, sends
+`X-QWP-Request-Durable-Ack` when requested, requires the server durable-ACK echo,
+parses durable OK table coverage and `STATUS_DURABLE_ACK` watermarks, and in
+durable mode completes frames only after matching durable watermarks cover all
+prior pending OKs.
 
 Expected fix shape:
 
-- Short-term safe option chosen: accept the disabled `request_durable_ack=off`
-  default but reject durable ACK opt-in until durable ACK trimming is
-  implemented. This is better than silently reporting completion before durable
-  upload confirmation.
-- Full parity option: store OK-acked batches with their per-table seqTxn
+- Full parity option chosen: store OK-acked batches with their per-table seqTxn
   coverage, parse durable ACK table watermarks, trim only when all prior OK
   entries are durably covered, and keep ordinary non-durable ACK behavior
   unchanged.
 - Test both server upgrade without durable ACK confirmation and delayed durable
   ACK after OK.
 
-Result: done for the short-term safe option. `request_durable_ack=off` is a
-no-op and `request_durable_ack=on` is rejected. Full durable ACK trimming remains
-a future feature.
+Result: done. `request_durable_ack=off|on` is accepted, server upgrade echo is
+validated, and durable mode waits for durable ACK watermarks before completing
+frames.
 
 #### J12: SFA Recovery Error Policy
 
@@ -432,22 +425,21 @@ Current Java parser reference lines: `Sender.java:2607-2738`.
 Rust now accepts Java spelling `in_flight_window` as an alias for
 `max_in_flight` while rejecting `in_flight_window <= 1`, keeps SFA and reconnect
 keys, explicitly rejects `sf_append_deadline_millis`,
-`close_flush_timeout_millis`, `initial_connect_retry=async`, accepts disabled
-`request_durable_ack=off` and `drain_orphans=off|false`, parses dependent
-no-op knobs `durable_ack_keepalive_interval_millis` and
-`max_background_drainers`, accepts Java's signed `<= 0` keepalive disable values
-and signed-int background-drainer parsing, and rejects unimplemented Java
-behavior keys or enabled values: `request_durable_ack=on`,
-`max_schemas_per_connection`,
-`drain_orphans=on|true`, and `error_inbox_capacity`. Unknown non-QWPWS keys
-remain ignored for cross-client compatibility.
+`close_flush_timeout_millis`, `initial_connect_retry=async`, accepts
+`request_durable_ack=off|on` and `drain_orphans=off|false`, applies
+`durable_ack_keepalive_interval_millis`, accepts Java's signed `<= 0` keepalive
+disable values and signed-int background-drainer parsing, and rejects
+unimplemented Java behavior keys or enabled values:
+`max_schemas_per_connection`, `drain_orphans=on|true`, and
+`error_inbox_capacity`. Unknown non-QWPWS keys remain ignored for cross-client
+compatibility.
 
 Expected fix shape:
 
 - Do not silently ignore Java QWP/WebSocket keys that Rust does not implement.
 - Prefer explicit rejection for unimplemented behavior-bearing enabled values or
-  keys: `request_durable_ack=on`, `max_schemas_per_connection`,
-  `drain_orphans=on|true`, and `error_inbox_capacity`.
+  keys: `max_schemas_per_connection`, `drain_orphans=on|true`, and
+  `error_inbox_capacity`.
 - Java spelling `in_flight_window` is accepted as an alias for Rust
   `max_in_flight`, with Java's `> 1` validation preserved.
 - Keep existing explicit rejections for `sf_append_deadline_millis`,
@@ -568,7 +560,7 @@ Status values:
 | J8 | done | Public sync error surface | Frame-local server rejection behavior | Java treats schema/write rejections as drop-and-continue and exposes the server message. Rust should report the rejection without making the sender terminal. | Re-read Java `CursorWebSocketSendLoop` and `SenderError`; inspect Rust codec/driver/public flush path and existing coverage. | Public mock-server test rejects the first flush with schema mismatch, verifies the server message and error category, then successfully flushes a second frame on the same sender. |
 | J9 | partial | Public `Sender` semantics | Java-like local-publication flush | Java `Sender.flush()` publishes into the cursor engine and returns before ACK; Rust now has the local-publication runner slice and bounded post-flush diagnostics, but still rejects Java-configurable append-deadline backpressure. | Re-read Java `QwpWebSocketSender.flush()`, `CursorSendEngine.appendBlocking()`, Rust `flush_qwp_ws()`, `flush_and_keep()`, config parsing, and queue capacity semantics. | High-level Rust `Sender::flush()` / `flush_and_keep()` locally publish, pipeline before ACK, apply the current bounded append backpressure, and report later QWP/server-close diagnostics through a bounded pollable observer path. |
 | J10 | done | SFA disk format / crash recovery | CRC-last frame commit marker | Java writes SFA CRC last; Rust previously wrote CRC in the header before payload. | Re-read Java `MmapSegment.tryAppend` and Rust `qwp_ws_sfa_segment::append`. | Rust append order matches Java and recovery tests prove partial new frames are not committed. |
-| J11 | done | Durable ACK / trim semantics | `request_durable_ack` behavior | Java trims SFA only after durable ACK watermarks in durable mode; Rust currently completes on ordinary OK ACK and ignores durable ACK frames. | Re-read Java durable ACK connect check and send-loop durable tracking; re-read Rust codec/driver response handling. | Rust accepts `request_durable_ack=off` and rejects durable ACK config opt-in loudly until Java-compatible durable trimming is implemented. |
+| J11 | done | Durable ACK / trim semantics | `request_durable_ack` behavior | Java trims SFA only after durable ACK watermarks in durable mode. | Re-read Java durable ACK connect check and send-loop durable tracking; re-read Rust codec/driver response handling. | Rust accepts `request_durable_ack=off|on`, validates durable ACK upgrade echo, and completes durable-mode frames only after durable ACK watermarks cover prior pending OKs. |
 | J12 | done | SFA recovery policy | Java-compatible recovery skip/quarantine | Empty clean/torn segment handling is aligned; Rust now also skips per-file scan errors Java skips. | Re-read Java `SegmentRing.openExisting`, Java `MmapSegment.openExisting`, and Rust `recover_segments`. | Bad side files are skipped without renaming where Java skips them, while real recovered FSN gaps remain fatal. |
 | J13 | done | SFA diagnostics | Non-empty torn-tail warning | Java warns when valid recovered frames are followed by torn bytes; Rust now records a structured recovery diagnostic. | Re-read Java `MmapSegment.openExisting` torn-tail logging and Rust scan result handling. | Rust exposes a structured diagnostic without making valid-prefix recovery fatal. |
 | J14 | done | SFA recovery capacity / memory | Recover existing disk state under current caps | Java mmap recovery is more tolerant of already-existing disk state; Rust materializes payloads and applies current caps during startup. | Compare Java segment manager recovery with Rust recovered frame validation. | Decision recorded: Rust keeps strict v1 recovery caps until a larger mmap/streaming design is justified. |
@@ -868,8 +860,8 @@ Evidence:
 - Validation: source comparison only; documentation corrected to distinguish
   internal durable-ACK plumbing from public config support.
 Result:
-- superseded by later 2026-05-05 implementation slices below; durable ACK opt-in
-  is rejected explicitly and Java `in_flight_window` is accepted as a
+- superseded by later implementation slices below; durable ACK opt-in is now
+  accepted with durable trimming, and Java `in_flight_window` is accepted as a
   Java-validated alias.
 
 2026-05-05 - J10/J12/J13 - finish SFA crash-safety and recovery policy slice
@@ -899,13 +891,13 @@ Evidence:
   `max_schemas_per_connection`, `durable_ack_keepalive_interval_millis`,
   `drain_orphans`, `max_background_drainers`, and `error_inbox_capacity`.
 - Rust: `SenderBuilder::from_conf` now accepts `in_flight_window` as a
-  Java-validated alias for `max_in_flight`, accepts disabled
-  `request_durable_ack=off` and `drain_orphans=off|false`, parses dependent
-  no-op knobs, rejects enabled forms until the behavior exists, and rejects the
-  unimplemented Java behavior keys above instead of silently ignoring them.
+  Java-validated alias for `max_in_flight`, accepts `request_durable_ack=off|on`
+  and `drain_orphans=off|false`, applies durable ACK keepalive settings, parses
+  dependent orphan-drainer no-op knobs, and rejects the unimplemented Java
+  behavior keys above instead of silently ignoring them.
 - Validation: `cargo test --manifest-path questdb-rs/Cargo.toml qwpws --lib`.
 Result:
-- done for the safe public config surface. Full durable ACK behavior,
+- done for the safe public config surface. Durable ACK behavior is now present;
   configurable schema caps, orphan drainers, and Java-style async error inbox
   remain future features.
 

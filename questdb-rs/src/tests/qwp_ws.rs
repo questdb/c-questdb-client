@@ -39,6 +39,7 @@ use crate::ingress::{
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const FIRST_WIRE_SEQUENCE: u64 = 0;
 const QWP_STATUS_OK: u8 = 0x00;
+const QWP_STATUS_DURABLE_ACK: u8 = 0x02;
 const QWP_STATUS_SCHEMA_MISMATCH: u8 = 0x03;
 const QWP_STATUS_PARSE_ERROR: u8 = 0x05;
 
@@ -185,8 +186,39 @@ fn write_qwp_ok_response(stream: &mut TcpStream, wire_seq: u64) -> std::io::Resu
     let mut ok = Vec::new();
     ok.push(QWP_STATUS_OK);
     ok.extend_from_slice(&wire_seq.to_le_bytes());
-    ok.extend_from_slice(&0u16.to_le_bytes());
+    append_table_seq_txns(&mut ok, &[]);
     write_server_binary_frame(stream, &ok)
+}
+
+fn write_qwp_ok_response_with_table_entries(
+    stream: &mut TcpStream,
+    wire_seq: u64,
+    entries: &[(&str, i64)],
+) -> std::io::Result<()> {
+    let mut ok = Vec::new();
+    ok.push(QWP_STATUS_OK);
+    ok.extend_from_slice(&wire_seq.to_le_bytes());
+    append_table_seq_txns(&mut ok, entries);
+    write_server_binary_frame(stream, &ok)
+}
+
+fn write_qwp_durable_ack_response(
+    stream: &mut TcpStream,
+    entries: &[(&str, i64)],
+) -> std::io::Result<()> {
+    let mut ack = Vec::new();
+    ack.push(QWP_STATUS_DURABLE_ACK);
+    append_table_seq_txns(&mut ack, entries);
+    write_server_binary_frame(stream, &ack)
+}
+
+fn append_table_seq_txns(payload: &mut Vec<u8>, entries: &[(&str, i64)]) {
+    payload.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    for (table, seq_txn) in entries {
+        payload.extend_from_slice(&(table.len() as u16).to_le_bytes());
+        payload.extend_from_slice(table.as_bytes());
+        payload.extend_from_slice(&seq_txn.to_le_bytes());
+    }
 }
 
 fn write_qwp_error_response(
@@ -211,6 +243,13 @@ fn compute_accept(key_b64: &str) -> String {
 }
 
 fn upgrade_mock_stream(stream: &mut TcpStream) -> Vec<String> {
+    upgrade_mock_stream_with_durable_ack(stream, false)
+}
+
+fn upgrade_mock_stream_with_durable_ack(
+    stream: &mut TcpStream,
+    durable_ack_enabled: bool,
+) -> Vec<String> {
     let req_bytes = read_request_until_blank(stream).unwrap();
     let req = String::from_utf8_lossy(&req_bytes).to_string();
     let request_lines: Vec<String> = req
@@ -220,12 +259,18 @@ fn upgrade_mock_stream(stream: &mut TcpStream) -> Vec<String> {
         .collect();
     let key = parse_header(&req, "Sec-WebSocket-Key").expect("missing Sec-WebSocket-Key");
     let accept = compute_accept(&key);
+    let durable_ack_header = if durable_ack_enabled {
+        "X-QWP-Durable-Ack: enabled\r\n"
+    } else {
+        ""
+    };
     let response = format!(
         "HTTP/1.1 101 Switching Protocols\r\n\
          Upgrade: websocket\r\n\
          Connection: Upgrade\r\n\
          Sec-WebSocket-Accept: {accept}\r\n\
          X-QWP-Version: 1\r\n\
+         {durable_ack_header}\
          \r\n"
     );
     stream.write_all(response.as_bytes()).unwrap();
@@ -406,6 +451,100 @@ fn qwp_ws_round_trip_minimal_message() {
     // followed by varint(7) "ETH-USD"
     assert_eq!(payload[2], 0x07);
     assert_eq!(&payload[3..10], b"ETH-USD");
+}
+
+#[test]
+fn qwp_ws_durable_ack_requires_upgrade_echo() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (request_tx, request_rx) = mpsc::channel();
+
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let request_lines = upgrade_mock_stream(&mut stream);
+        request_tx.send(request_lines).unwrap();
+    });
+
+    let conf = format!("qwpws::addr=127.0.0.1:{port};request_durable_ack=on;");
+    let err = SenderBuilder::from_conf(conf).unwrap().build().unwrap_err();
+    assert!(
+        err.msg().contains("server did not enable durable ACK"),
+        "got: {}",
+        err.msg()
+    );
+
+    let request_lines = request_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(
+        request_lines
+            .iter()
+            .any(|line| line.eq_ignore_ascii_case("X-QWP-Request-Durable-Ack: true"))
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn qwp_ws_durable_ack_keepalive_ping_completes_pending_ok() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (ping_tx, ping_rx) = mpsc::channel();
+
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let request_lines = upgrade_mock_stream_with_durable_ack(&mut stream, true);
+        assert!(
+            request_lines
+                .iter()
+                .any(|line| line.eq_ignore_ascii_case("X-QWP-Request-Durable-Ack: true"))
+        );
+
+        let (_, opcode, payload) = read_frame(&mut stream).unwrap();
+        assert_eq!(opcode, 0x2);
+        assert_eq!(&payload[0..4], b"QWP1");
+        write_qwp_ok_response_with_table_entries(
+            &mut stream,
+            FIRST_WIRE_SEQUENCE,
+            &[("trades", 10)],
+        )
+        .unwrap();
+
+        loop {
+            let (_, opcode, payload) = read_frame(&mut stream).unwrap();
+            if opcode == 0x9 {
+                write_server_frame(&mut stream, 0xA, &payload, false).unwrap();
+                ping_tx.send(payload).unwrap();
+                break;
+            }
+        }
+
+        thread::sleep(Duration::from_millis(100));
+        write_qwp_durable_ack_response(&mut stream, &[("trades", 10)]).unwrap();
+    });
+
+    let conf = format!(
+        "qwpws::addr=127.0.0.1:{port};\
+         request_durable_ack=on;\
+         durable_ack_keepalive_interval_millis=1;"
+    );
+    let mut sender = SenderBuilder::from_conf(conf).unwrap().build().unwrap();
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .symbol("sym", "ETH-USD")
+        .unwrap()
+        .column_i64("qty", 7)
+        .unwrap()
+        .at_now()
+        .unwrap();
+
+    let fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
+
+    assert_eq!(ping_rx.recv_timeout(Duration::from_secs(5)).unwrap(), b"");
+    assert!(sender.await_acked_fsn(fsn, Duration::from_secs(5)).unwrap());
+    assert_eq!(sender.acked_fsn().unwrap(), Some(fsn));
+    server.join().unwrap();
 }
 
 #[test]
@@ -1719,8 +1858,13 @@ fn qwp_ws_from_conf_parses_java_reconnect_keys() {
                 reconnect_max_duration_millis=20000;\
                 reconnect_initial_backoff_millis=200;\
                 reconnect_max_backoff_millis=2000;\
-                initial_connect_retry=on;";
+                initial_connect_retry=on;\
+                request_durable_ack=on;\
+                durable_ack_keepalive_interval_millis=250;";
     SenderBuilder::from_conf(conf).unwrap();
+
+    let disabled_keepalive = "qwpws::addr=localhost:9000;durable_ack_keepalive_interval_millis=0;";
+    SenderBuilder::from_conf(disabled_keepalive).unwrap();
 
     let conf_sync = "qwpws::addr=localhost:9000;initial_connect_retry=sync;";
     SenderBuilder::from_conf(conf_sync).unwrap();

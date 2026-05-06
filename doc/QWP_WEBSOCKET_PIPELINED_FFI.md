@@ -1379,9 +1379,9 @@ Candidate config keys:
 | `reconnect_max_backoff_millis` | 5000 | Backoff cap. |
 | `initial_connect_retry` | `false` | Retry initial connect with reconnect policy. |
 | `close_flush_timeout_millis` | 5000 | Default high-level close drain timeout; current Rust rejects until configurable close-drain behavior exists. |
-| `request_durable_ack` | `off` | Request durable ACK watermarks; current Rust accepts `off` and rejects `on` until durable trimming exists. |
+| `request_durable_ack` | `off` | Request durable ACK watermarks; current Rust accepts `off` and `on`, and durable mode completes frames only after matching durable ACK watermarks. |
 | `max_schemas_per_connection` | server/client default | Java schema cap knob; current Rust rejects until configurable caps exist. |
-| `durable_ack_keepalive_interval_millis` | Java default | Durable ACK keepalive knob; current Rust parses Java's signed values, including `<= 0` disable values, as inert while durable ACK is disabled. |
+| `durable_ack_keepalive_interval_millis` | Java default | Durable ACK keepalive knob; current Rust parses Java's signed values, including `<= 0` disable values, and uses it for durable ACK keepalive pings. |
 | `drain_orphans` | `false` | Adopt sibling SF slots on startup; current Rust accepts `off`/`false` and rejects `on`/`true` until orphan drainers exist. |
 | `max_background_drainers` | 4 | Cap concurrent orphan drainers; current Rust parses Java's signed int surface, rejects `< 0`, and otherwise treats it as inert while orphan draining is disabled. |
 | `error_inbox_capacity` | Java default | Java async error inbox sizing; current Rust rejects until that inbox exists. |
@@ -1403,12 +1403,12 @@ accepted as an alias for the current blocking startup retry behavior. Java's
 Rust recognizes `sf_append_deadline_millis`, `close_flush_timeout_millis`,
 `request_durable_ack`, `max_schemas_per_connection`,
 `durable_ack_keepalive_interval_millis`, `drain_orphans`,
-`max_background_drainers`, and `error_inbox_capacity`. It accepts disabled
-`request_durable_ack=off` and `drain_orphans=off|false` defaults, parses
-dependent no-op knobs `durable_ack_keepalive_interval_millis`, including Java's
-signed `<= 0` disable values, and `max_background_drainers`, using Java's signed
-int parsing and `< 0` rejection, and rejects the enabled or behavior-bearing
-forms until their behavior exists.
+`max_background_drainers`, and `error_inbox_capacity`. It accepts
+`request_durable_ack=off|on` and `drain_orphans=off|false`, applies
+`durable_ack_keepalive_interval_millis` including Java's signed `<= 0` disable
+values, parses `max_background_drainers` with Java's signed int parsing and
+`< 0` rejection, and rejects the remaining enabled or behavior-bearing forms
+until their behavior exists.
 `sf_append_deadline_millis` should be accepted only with behavioral tests proving
 that it controls local publication/backpressure, not server ACK waiting. Durable
 ACK opt-in must not be accepted before Java-compatible durable trimming exists.

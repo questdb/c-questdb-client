@@ -230,6 +230,7 @@ pub(super) fn parse_http_header_block(block: &[u8]) -> crate::Result<ParsedHttpH
 pub(super) fn validate_upgrade_response(
     parsed: &ParsedHttpHeaders,
     expected_accept: &str,
+    request_durable_ack: bool,
 ) -> crate::Result<u8> {
     if parsed.status != 101 {
         return Err(error::fmt!(
@@ -248,6 +249,17 @@ pub(super) fn validate_upgrade_response(
             "WebSocket upgrade failed: missing or invalid Upgrade header"
         ));
     }
+    let connection_upgrade = parsed.headers.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("connection")
+            && v.split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+    });
+    if !connection_upgrade {
+        return Err(error::fmt!(
+            ProtocolVersionError,
+            "WebSocket upgrade failed: missing or invalid Connection header"
+        ));
+    }
     let accept_ok = parsed
         .headers
         .iter()
@@ -259,6 +271,17 @@ pub(super) fn validate_upgrade_response(
             ProtocolVersionError,
             "WebSocket upgrade failed: invalid Sec-WebSocket-Accept"
         ));
+    }
+    if request_durable_ack {
+        let durable_ack_enabled = parsed.headers.iter().any(|(k, v)| {
+            k.eq_ignore_ascii_case("x-qwp-durable-ack") && v.eq_ignore_ascii_case("enabled")
+        });
+        if !durable_ack_enabled {
+            return Err(error::fmt!(
+                ProtocolVersionError,
+                "WebSocket upgrade failed: server did not enable durable ACK"
+            ));
+        }
     }
     let version_str = parsed
         .headers
@@ -525,6 +548,61 @@ mod tests {
     }
 
     #[test]
+    fn upgrade_request_includes_durable_ack_opt_in_header_when_requested() {
+        let request = build_upgrade_request("localhost:9000", "key", None, 1, None, true);
+
+        assert!(request.contains("X-QWP-Request-Durable-Ack: true\r\n"));
+    }
+
+    #[test]
+    fn upgrade_response_requires_durable_ack_echo_when_requested() {
+        let expected_accept = "accept";
+        let mut parsed = valid_upgrade_headers(expected_accept);
+
+        validate_upgrade_response(&parsed, expected_accept, false).unwrap();
+        let err = validate_upgrade_response(&parsed, expected_accept, true).unwrap_err();
+        assert!(
+            err.msg().contains("server did not enable durable ACK"),
+            "got: {}",
+            err.msg()
+        );
+
+        parsed
+            .headers
+            .push(("X-QWP-Durable-Ack".to_string(), "enabled".to_string()));
+        validate_upgrade_response(&parsed, expected_accept, true).unwrap();
+    }
+
+    #[test]
+    fn upgrade_response_requires_connection_upgrade_header() {
+        let expected_accept = "accept";
+        let mut parsed = valid_upgrade_headers(expected_accept);
+        parsed
+            .headers
+            .retain(|(name, _)| !name.eq_ignore_ascii_case("connection"));
+
+        let err = validate_upgrade_response(&parsed, expected_accept, false).unwrap_err();
+        assert!(
+            err.msg().contains("missing or invalid Connection header"),
+            "got: {}",
+            err.msg()
+        );
+
+        parsed
+            .headers
+            .push(("Connection".to_string(), "keep-alive".to_string()));
+        let err = validate_upgrade_response(&parsed, expected_accept, false).unwrap_err();
+        assert!(
+            err.msg().contains("missing or invalid Connection header"),
+            "got: {}",
+            err.msg()
+        );
+
+        parsed.headers.last_mut().unwrap().1 = "keep-alive, Upgrade".to_string();
+        validate_upgrade_response(&parsed, expected_accept, false).unwrap();
+    }
+
+    #[test]
     fn frame_short_payload_round_trip() {
         let mut out = Vec::new();
         let mask = [0x12, 0x34, 0x56, 0x78];
@@ -679,7 +757,7 @@ mod tests {
         let mut payload = vec![WS_STATUS_INTERNAL_ERROR];
         payload.extend_from_slice(&7u64.to_le_bytes());
         payload.extend_from_slice(&1025u16.to_le_bytes());
-        payload.extend(std::iter::repeat(b'x').take(1025));
+        payload.extend(std::iter::repeat_n(b'x', 1025));
 
         assert!(parse_pipelined_response(&payload).is_err());
     }
@@ -689,7 +767,7 @@ mod tests {
         let mut payload = vec![WS_STATUS_INTERNAL_ERROR];
         payload.extend_from_slice(&7u64.to_le_bytes());
         payload.extend_from_slice(&1024u16.to_le_bytes());
-        payload.extend(std::iter::repeat(b'x').take(1024));
+        payload.extend(std::iter::repeat_n(b'x', 1024));
 
         match parse_pipelined_response(&payload).unwrap() {
             PipelinedResponse::Error(error) => {
@@ -717,6 +795,21 @@ mod tests {
             payload.extend_from_slice(&(table.len() as u16).to_le_bytes());
             payload.extend_from_slice(table.as_bytes());
             payload.extend_from_slice(&seq_txn.to_le_bytes());
+        }
+    }
+
+    fn valid_upgrade_headers(expected_accept: &str) -> ParsedHttpHeaders {
+        ParsedHttpHeaders {
+            status: 101,
+            headers: vec![
+                ("Upgrade".to_string(), "websocket".to_string()),
+                ("Connection".to_string(), "Upgrade".to_string()),
+                (
+                    "Sec-WebSocket-Accept".to_string(),
+                    expected_accept.to_string(),
+                ),
+                ("X-QWP-Version".to_string(), "1".to_string()),
+            ],
         }
     }
 }

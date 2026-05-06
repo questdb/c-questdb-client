@@ -364,15 +364,17 @@ config keys: `sf_dir`, `sender_id`, `sf_max_bytes`, `sf_max_total_bytes`,
 `sf_durability`, and Java's `in_flight_window` spelling as an alias for Rust
 `max_in_flight`, with Java's `in_flight_window > 1` validation. The size parser
 mirrors Java's `k` / `m` / `g` / `t` suffixes, case-insensitive units, and
-optional trailing `b`. Disabled Java defaults `request_durable_ack=off` and
-`drain_orphans=off|false` are accepted as no-ops. Dependent Java knobs
-`durable_ack_keepalive_interval_millis` (including Java's signed `<= 0`
-disable values) and `max_background_drainers` (signed int with Java's `< 0`
-rejection) are parsed as inert settings while their parent features are
-disabled. Behavior-bearing Java settings that Rust cannot honor yet are rejected
-explicitly:
-`request_durable_ack=on`, `max_schemas_per_connection`,
-`drain_orphans=on|true`, and `error_inbox_capacity`.
+optional trailing `b`. Java durable ACK settings `request_durable_ack=off` and
+`request_durable_ack=on` are accepted; `off` leaves durable ACK disabled, while
+`on` enables durable ACK mode and uses durable ACK watermarks before completing
+frames. Dependent Java knob
+`durable_ack_keepalive_interval_millis` is parsed with Java's signed `<= 0`
+disable values and drives durable ACK keepalive pings. `drain_orphans=off|false`
+is accepted as a no-op. `max_background_drainers` is parsed with Java's signed
+int surface and `< 0` rejection while orphan draining remains disabled.
+Behavior-bearing Java settings that Rust cannot honor yet are rejected
+explicitly: `max_schemas_per_connection`, `drain_orphans=on|true`, and
+`error_inbox_capacity`.
 
 The public sync sender now uses config-derived queue selection:
 
@@ -651,10 +653,9 @@ sender has been removed to keep one maintained QWP/WebSocket core.
 4. Finish Java-compatible high-level close/drain timeout wiring. Rust `Drop`
    cannot return errors, so keep `Sender::close_drain()` as the explicit
    fallible API shape before accepting `close_flush_timeout_millis`.
-5. Implement durable ACK trimming before accepting `request_durable_ack=on`.
-6. Extend the public structured QWP/WebSocket diagnostics through FFI without
+5. Extend the public structured QWP/WebSocket diagnostics through FFI without
    adding dead-letter files or mandatory callbacks.
-7. Wire the C ABI stubs to the real queue/driver core.
+6. Wire the C ABI stubs to the real queue/driver core.
 
 Do not start with C++/Python wrappers, orphan draining, SF compaction, or
 performance optimization. Future async support should be an explicit adapter
