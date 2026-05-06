@@ -45,6 +45,17 @@
 use crate::egress::error::{Result, fmt};
 use crate::egress::wire::varint;
 
+/// Hard cap on the connection-scoped SYMBOL dict's UTF-8 heap size in
+/// bytes. Mirrors `MAX_CONN_DICT_HEAP_BYTES` in the Java reference
+/// client. Well-behaved servers approaching this cap are expected to
+/// emit `CACHE_RESET(RESET_MASK_DICT)`; crossing it without a reset is
+/// a protocol violation and we error rather than grow without bound.
+pub(crate) const MAX_CONN_DICT_HEAP_BYTES: usize = 256 * 1024 * 1024;
+
+/// Hard cap on the connection-scoped SYMBOL dict entry count. Mirrors
+/// `MAX_CONN_DICT_SIZE` in the Java reference client.
+pub(crate) const MAX_CONN_DICT_SIZE: usize = 8_388_608;
+
 #[derive(Debug, Clone, Copy)]
 struct Entry {
     offset: u32,
@@ -182,6 +193,29 @@ impl SymbolDict {
                 e
             )
         })?;
+        if self.entries.len() >= MAX_CONN_DICT_SIZE {
+            return Err(fmt!(
+                ProtocolError,
+                "symbol dict full: {} entries (max {}); server must emit \
+                 CACHE_RESET(dict) before adding more",
+                self.entries.len(),
+                MAX_CONN_DICT_SIZE
+            ));
+        }
+        let new_heap = self
+            .arena
+            .len()
+            .checked_add(s.len())
+            .ok_or_else(|| fmt!(ProtocolError, "symbol dict heap overflow"))?;
+        if new_heap > MAX_CONN_DICT_HEAP_BYTES {
+            return Err(fmt!(
+                ProtocolError,
+                "symbol dict heap would reach {} bytes (max {}); server \
+                 must emit CACHE_RESET(dict) before adding more",
+                new_heap,
+                MAX_CONN_DICT_HEAP_BYTES
+            ));
+        }
         let offset = u32::try_from(self.arena.len())
             .map_err(|_| fmt!(ProtocolError, "symbol dict arena exceeds u32"))?;
         let len = u32::try_from(s.len())

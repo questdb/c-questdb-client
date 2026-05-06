@@ -74,6 +74,16 @@ use crate::egress::wire::header::flags;
 use crate::egress::wire::msg_kind::MsgKind;
 use bytes::Bytes;
 
+/// Per-batch caps mirrored from `java-questdb-client` (`QwpConstants.java`
+/// and `QwpResultBatchDecoder.java`). These cap wire-supplied counts and
+/// lengths before any `Vec::with_capacity` / `vec![..; n]` allocation so
+/// a hostile or corrupted varint can't trigger a multi-GiB up-front
+/// allocation and OOM the client before the bytes-too-short check fires.
+pub(crate) const MAX_ROWS_PER_BATCH: usize = 1_048_576;
+pub(crate) const MAX_COLUMNS_PER_TABLE: usize = 2048;
+pub(crate) const MAX_COLUMN_NAME_LENGTH: usize = 127;
+pub(crate) const MAX_TABLE_NAME_LENGTH: usize = 127;
+
 /// Take a zero-copy owned slice of `n` bytes from `parent` starting at the
 /// reader's current position, and advance the reader.
 fn read_owned(r: &mut ByteReader<'_>, parent: &Bytes, n: usize) -> Result<Bytes> {
@@ -390,22 +400,39 @@ pub fn decode_result_batch(
     }
 
     // Table block.
+    //
+    // The wire-supplied lengths and counts below are all sanity-capped
+    // against constants mirrored from the Java reference client. Without
+    // these, a hostile or corrupted varint could request a multi-GiB
+    // up-front allocation and OOM the client before any wire-length
+    // bounds check fires. The constants match `QwpConstants.java` /
+    // `QwpResultBatchDecoder.java` in `java-questdb-client`.
     let name_len = r.read_varint_usize()?;
+    if name_len > MAX_TABLE_NAME_LENGTH {
+        return Err(fmt!(
+            ProtocolError,
+            "table name length {} exceeds max {}",
+            name_len,
+            MAX_TABLE_NAME_LENGTH
+        ));
+    }
     r.read_bytes(name_len)?; // table name; ignored for query results
     let row_count = r.read_varint_usize()?;
+    if row_count > MAX_ROWS_PER_BATCH {
+        return Err(fmt!(
+            ProtocolError,
+            "table block declares {} rows; max supported is {}",
+            row_count,
+            MAX_ROWS_PER_BATCH
+        ));
+    }
     let col_count = r.read_varint_usize()?;
-    // Sanity-cap the wire-supplied column count before any code path
-    // turns it into a `Vec::with_capacity(col_count)` — without this
-    // a hostile or corrupted varint could request a multi-GiB up-front
-    // allocation and OOM the client before the bytes-too-short check
-    // ever runs. QuestDB's own table column cap is well under this.
-    const MAX_COLS: usize = 4096;
-    if col_count > MAX_COLS {
+    if col_count > MAX_COLUMNS_PER_TABLE {
         return Err(fmt!(
             ProtocolError,
             "table block declares {} columns; max supported is {}",
             col_count,
-            MAX_COLS
+            MAX_COLUMNS_PER_TABLE
         ));
     }
 

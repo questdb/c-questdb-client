@@ -42,8 +42,17 @@
 use std::collections::HashMap;
 
 use crate::egress::column_kind::ColumnKind;
+use crate::egress::decoder::MAX_COLUMN_NAME_LENGTH;
 use crate::egress::error::{Result, fmt};
 use crate::egress::wire::varint;
+
+/// Hard cap on registered schema ids per connection. Mirrors
+/// `MAX_SCHEMAS_PER_CONNECTION` in the Java reference client. A hostile
+/// or buggy server could otherwise stream `RESULT_BATCH` frames with
+/// monotonically increasing `schema_id` values and grow this map without
+/// bound; the soft `RESET_MASK_SCHEMAS` cap is meant to prevent this on
+/// well-behaved servers but the client must not depend on that.
+pub(crate) const MAX_SCHEMAS_PER_CONNECTION: usize = 65_535;
 
 /// A single column in a result schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,6 +196,21 @@ impl SchemaRegistry {
                 })
             }
             SchemaMode::Full => {
+                // Bound the per-connection schema map. A new schema id only
+                // counts if it isn't already registered; replacing an
+                // existing id is fine.
+                if !self.by_id.contains_key(&schema_id)
+                    && self.by_id.len() >= MAX_SCHEMAS_PER_CONNECTION
+                {
+                    return Err(fmt!(
+                        ProtocolError,
+                        "schema registry full: {} entries (max {}); \
+                         server must emit CACHE_RESET(schemas) before \
+                         registering new schemas",
+                        self.by_id.len(),
+                        MAX_SCHEMAS_PER_CONNECTION
+                    ));
+                }
                 // Clamp initial capacity by remaining bytes so a hostile
                 // `col_count` can't trigger an oversized allocation before
                 // the loop discovers the section is too short.
@@ -195,6 +219,15 @@ impl SchemaRegistry {
                 for i in 0..col_count {
                     let (name_len, n) = varint::decode_usize(&bytes[cursor..])?;
                     cursor += n;
+                    if name_len > MAX_COLUMN_NAME_LENGTH {
+                        return Err(fmt!(
+                            ProtocolError,
+                            "schema column {} name length {} exceeds max {}",
+                            i,
+                            name_len,
+                            MAX_COLUMN_NAME_LENGTH
+                        ));
+                    }
                     let name_end = cursor.checked_add(name_len).ok_or_else(|| {
                         fmt!(ProtocolError, "schema column {} name length overflow", i)
                     })?;
