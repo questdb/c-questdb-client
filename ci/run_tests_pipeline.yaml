@@ -145,3 +145,6 @@ stages:
           - script: |
               python3 system_test/test.py run --repo ./questdb -v
             displayName: "integration test"
+          - script: |
+              python3 system_test/test_egress_failover.py run --repo ./questdb -v
+            displayName: "egress integration test"
