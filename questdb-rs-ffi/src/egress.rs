@@ -363,7 +363,11 @@ pub unsafe extern "C" fn line_reader_from_conf(
     config: line_sender_utf8,
     err_out: *mut *mut line_reader_error,
 ) -> *mut line_reader {
-    unsafe {
+    // Wrap the entire body so allocator panics from `Box::into_raw`,
+    // `set_reader_err`, or any future fallible step can't unwind across
+    // the FFI boundary. Matches the policy used elsewhere in this file
+    // (`mutate_query`, `_query_execute`, `_cursor_next_batch`, etc.).
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
         // Re-validate UTF-8 (see `validated_utf8` for the rationale).
         let conf = match validated_utf8(&config) {
             Ok(s) => s,
@@ -372,17 +376,16 @@ pub unsafe extern "C" fn line_reader_from_conf(
                 return ptr::null_mut();
             }
         };
-        let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Reader::from_conf(conf)));
-        let reader_result = match result {
-            Ok(r) => r,
-            Err(_) => std::process::abort(),
-        };
+        let reader_result = Reader::from_conf(conf);
         let reader = reader_bubble!(err_out, reader_result, ptr::null_mut());
         Box::into_raw(Box::new(line_reader(
             UnsafeCell::new(reader),
             AtomicBool::new(false),
         )))
+    }));
+    match result {
+        Ok(p) => p,
+        Err(_) => std::process::abort(),
     }
 }
 
@@ -398,7 +401,9 @@ pub unsafe extern "C" fn line_reader_from_conf(
 pub unsafe extern "C" fn line_reader_from_env(
     err_out: *mut *mut line_reader_error,
 ) -> *mut line_reader {
-    unsafe {
+    // See `line_reader_from_conf` for the full-body `catch_unwind`
+    // rationale.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
         let conf = match std::env::var("QDB_CLIENT_CONF") {
             Ok(s) => s,
             Err(std::env::VarError::NotPresent) => {
@@ -419,17 +424,16 @@ pub unsafe extern "C" fn line_reader_from_env(
                 return ptr::null_mut();
             }
         };
-        let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Reader::from_conf(&conf)));
-        let reader_result = match result {
-            Ok(r) => r,
-            Err(_) => std::process::abort(),
-        };
+        let reader_result = Reader::from_conf(&conf);
         let reader = reader_bubble!(err_out, reader_result, ptr::null_mut());
         Box::into_raw(Box::new(line_reader(
             UnsafeCell::new(reader),
             AtomicBool::new(false),
         )))
+    }));
+    match result {
+        Ok(p) => p,
+        Err(_) => std::process::abort(),
     }
 }
 
