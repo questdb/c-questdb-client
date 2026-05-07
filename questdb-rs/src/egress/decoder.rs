@@ -1155,29 +1155,33 @@ fn decode_gorilla_temporal(
     non_null: usize,
     validity: Option<Bytes>,
 ) -> Result<ColumnBuffer> {
-    if non_null < 3 {
-        return Err(fmt!(
-            ProtocolError,
-            "Gorilla-encoded column must have non_null >= 3 (got {})",
-            non_null
-        ));
-    }
-    // Two i64 LE seed timestamps, then the bitstream.
-    let seed = r.read_bytes(16)?;
-    let first_ts = i64::from_le_bytes(seed[..8].try_into().unwrap());
-    let second_ts = i64::from_le_bytes(seed[8..16].try_into().unwrap());
-
-    let bitstream = r.remaining();
-    let mut decoder = crate::egress::gorilla::GorillaDecoder::new(first_ts, second_ts, bitstream);
-
+    // Spec note: a compliant server-side encoder shortcuts the
+    // `non_null < 3` cases to `disc=0x00` (raw) and never reaches the
+    // Gorilla branch with fewer than three values. We decode the
+    // degenerate cases anyway so a future server variant or rare
+    // flush pattern that emits Gorilla framing for very small columns
+    // doesn't surface as a hard `ProtocolError`. The natural Gorilla
+    // wire layout for `non_null < 3` is `min(non_null, 2)` bare seed
+    // timestamps with no bitstream — which is what we read below.
     let mut decoded = Vec::with_capacity(non_null);
-    decoded.push(first_ts);
-    decoded.push(second_ts);
-    for _ in 2..non_null {
-        decoded.push(decoder.decode_next()?);
+    if non_null >= 1 {
+        let bytes = r.read_bytes(8)?;
+        decoded.push(i64::from_le_bytes(bytes.try_into().unwrap()));
     }
-    let consumed = decoder.bytes_consumed();
-    r.advance(consumed)?;
+    if non_null >= 2 {
+        let bytes = r.read_bytes(8)?;
+        decoded.push(i64::from_le_bytes(bytes.try_into().unwrap()));
+    }
+    if non_null >= 3 {
+        let bitstream = r.remaining();
+        let mut decoder =
+            crate::egress::gorilla::GorillaDecoder::new(decoded[0], decoded[1], bitstream);
+        for _ in 2..non_null {
+            decoded.push(decoder.decode_next()?);
+        }
+        let consumed = decoder.bytes_consumed();
+        r.advance(consumed)?;
+    }
 
     // Densify into row_count × 8. Null slots get the QuestDB temporal
     // NULL sentinel (`Long.MIN_VALUE`) per spec §11.5 — same as the
@@ -2377,12 +2381,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_gorilla_with_too_few_non_null() {
-        // Gorilla requires non_null >= 3 (server shortcuts the 1-2 case to
-        // raw); fewer than 3 in the Gorilla branch is malformed.
+    fn decodes_gorilla_with_few_non_null() {
+        // Spec-compliant servers shortcut `non_null < 3` to disc=0x00
+        // (raw), so the Gorilla branch never runs in the live wire.
+        // The decoder is lenient anyway: it accepts the natural
+        // degenerate framing — `min(non_null, 2)` bare seed timestamps
+        // and no bitstream — so a future server variant doesn't
+        // surface as a hard ProtocolError.
         let mut col_data = vec![0x00u8]; // null_flag
         col_data.push(0x01); // gorilla discriminator
-        // 2 seed timestamps would be 16 bytes, but row_count=2 < 3.
         col_data.extend_from_slice(&0i64.to_le_bytes());
         col_data.extend_from_slice(&100i64.to_le_bytes());
         let (_, payload) = BatchBuilder::new(2)
@@ -2391,8 +2398,58 @@ mod tests {
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let err = decode_result_batch(&payload, flags::GORILLA, &mut dict, &mut reg).unwrap_err();
-        assert_eq!(err.code(), ErrorCode::ProtocolError);
+        let batch = decode_result_batch(&payload, flags::GORILLA, &mut dict, &mut reg).unwrap();
+        let view = batch.column_view(0, &dict).unwrap();
+        let ColumnView::TimestampNanos(c) = view else {
+            panic!("expected TimestampNanos column")
+        };
+        assert_eq!(c.value(0), 0);
+        assert_eq!(c.value(1), 100);
+    }
+
+    #[test]
+    fn decodes_gorilla_with_one_non_null() {
+        // Single seed timestamp, no bitstream. Bit set in the bitmap
+        // means NULL (per `is_null_at`), so 0b0000_0010 marks row 1
+        // null and row 0 non-null.
+        let mut col_data = vec![0x01u8, 0b0000_0010];
+        col_data.push(0x01); // gorilla discriminator
+        col_data.extend_from_slice(&42i64.to_le_bytes());
+        let (_, payload) = BatchBuilder::new(2)
+            .with_flags(flags::GORILLA)
+            .add_column("ts", ColumnKind::TimestampNanos, col_data)
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let batch = decode_result_batch(&payload, flags::GORILLA, &mut dict, &mut reg).unwrap();
+        let view = batch.column_view(0, &dict).unwrap();
+        let ColumnView::TimestampNanos(c) = view else {
+            panic!("expected TimestampNanos column")
+        };
+        assert!(!c.is_null(0));
+        assert_eq!(c.value(0), 42);
+        assert!(c.is_null(1));
+    }
+
+    #[test]
+    fn decodes_gorilla_with_zero_non_null() {
+        // Validity bitmap reports both rows null (bits 0 and 1 set);
+        // nothing is read from the column body beyond the discriminator.
+        let mut col_data = vec![0x01u8, 0b0000_0011];
+        col_data.push(0x01); // gorilla discriminator
+        let (_, payload) = BatchBuilder::new(2)
+            .with_flags(flags::GORILLA)
+            .add_column("ts", ColumnKind::TimestampNanos, col_data)
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let batch = decode_result_batch(&payload, flags::GORILLA, &mut dict, &mut reg).unwrap();
+        let view = batch.column_view(0, &dict).unwrap();
+        let ColumnView::TimestampNanos(c) = view else {
+            panic!("expected TimestampNanos column")
+        };
+        assert!(c.is_null(0));
+        assert!(c.is_null(1));
     }
 
     #[test]
