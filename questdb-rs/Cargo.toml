@@ -102,6 +102,14 @@ ring-crypto = ["dep:ring", "rustls/ring"]
 ## Allow skipping verification of insecure certificates.
 insecure-skip-verify = []
 
+## Enable rustls' `KeyLogFile`. When enabled, the client honors the
+## `SSLKEYLOGFILE` environment variable and writes per-session TLS
+## secrets to that path — letting Wireshark / tshark decrypt captures.
+## Off by default: an attacker with write access to the user's
+## environment (CI matrix, debug shell, container env, systemd unit)
+## could otherwise siphon secrets without any in-process opt-in.
+tls-key-log = []
+
 ## Enable code-generation in `build.rs` for additional tests.
 json_tests = ["bigdecimal"]
 

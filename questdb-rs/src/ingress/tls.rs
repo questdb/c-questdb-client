@@ -240,13 +240,18 @@ pub(crate) fn configure_tls(tls: TlsSettings) -> Result<Arc<rustls::ClientConfig
         }
     }
 
+    #[cfg_attr(
+        not(any(feature = "tls-key-log", feature = "insecure-skip-verify")),
+        allow(unused_mut)
+    )]
     let mut config = rustls::ClientConfig::builder()
         .with_root_certificates(root_store)
         .with_no_client_auth();
 
-    // TLS log file for debugging.
-    // Set the SSLKEYLOGFILE env variable to a writable location.
-    config.key_log = Arc::new(rustls::KeyLogFile::new());
+    #[cfg(feature = "tls-key-log")]
+    {
+        config.key_log = Arc::new(rustls::KeyLogFile::new());
+    }
 
     #[cfg(feature = "insecure-skip-verify")]
     if !verify_hostname {

@@ -222,10 +222,17 @@ pub(crate) fn build_client_config(
         }
     }
 
+    #[cfg_attr(
+        not(any(feature = "tls-key-log", feature = "insecure-skip-verify")),
+        allow(unused_mut)
+    )]
     let mut client_config = rustls::ClientConfig::builder()
         .with_root_certificates(root_store)
         .with_no_client_auth();
-    client_config.key_log = Arc::new(rustls::KeyLogFile::new());
+    #[cfg(feature = "tls-key-log")]
+    {
+        client_config.key_log = Arc::new(rustls::KeyLogFile::new());
+    }
 
     #[cfg(feature = "insecure-skip-verify")]
     if skip_verify {
