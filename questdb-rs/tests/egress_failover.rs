@@ -80,6 +80,7 @@ fn server_info_frame(role: ServerRole, node_id: &str, cluster_id: &str) -> Vec<u
         ServerRole::Replica => 0x02,
         ServerRole::PrimaryCatchup => 0x03,
         ServerRole::Other(b) => b,
+        _ => 0xFF,
     };
     let mut payload = vec![MSG_SERVER_INFO, role_byte];
     payload.extend_from_slice(&0u64.to_le_bytes()); // epoch

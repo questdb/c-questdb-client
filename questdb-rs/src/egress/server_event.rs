@@ -41,7 +41,12 @@ use bytes::Bytes;
 // ---------------------------------------------------------------------------
 
 /// QuestDB cluster role advertised by `SERVER_INFO` (v2+).
+///
+/// `#[non_exhaustive]` because new role bytes may be added in future
+/// protocol revisions; a future revision might also promote a known
+/// `Other(_)` byte to a named variant. Both should be additive.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum ServerRole {
     Standalone,
     Primary,

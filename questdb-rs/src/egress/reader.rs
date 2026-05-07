@@ -884,7 +884,11 @@ const CANCEL_DRAIN_READ_TIMEOUT: std::time::Duration = std::time::Duration::from
 
 /// Reason the stream ended. Surfaced via [`Cursor::terminal`] once
 /// `next_batch` returns `None`.
+///
+/// `#[non_exhaustive]` because future protocol revisions may add
+/// terminal kinds (e.g. server-side timeouts).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum Terminal {
     /// `RESULT_END` (`0x12`).
     End { final_seq: u64, total_rows: u64 },

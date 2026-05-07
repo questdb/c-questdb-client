@@ -29,8 +29,12 @@
 use crate::egress::error::{Result, fmt};
 
 /// Message kind code (uint8). `repr(u8)` keeps wire transcoding trivial.
+///
+/// `#[non_exhaustive]` because the QWP message-kind table is
+/// append-only across protocol revisions.
 #[repr(u8)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum MsgKind {
     /// Client → Server: initiate cursor with SQL + binds.
     QueryRequest = 0x10,
@@ -76,8 +80,12 @@ impl MsgKind {
 }
 
 /// QWP status codes carried by `QUERY_ERROR` (and surfaced to clients).
+///
+/// `#[non_exhaustive]` because the status table is append-only across
+/// protocol revisions.
 #[repr(u8)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum StatusCode {
     SchemaMismatch = 0x03,
     ParseError = 0x05,

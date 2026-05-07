@@ -81,6 +81,7 @@ const DEFAULT_TLS_PORT: &str = "9000";
 /// `Raw` is currently usable end-to-end because the decoder hasn't
 /// implemented zstd payload decompression yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Compression {
     Raw,
     Zstd,
@@ -101,6 +102,7 @@ impl Compression {
 /// Server-routing target hint. Drives both connect-time endpoint walking
 /// and mid-query failover endpoint selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Target {
     Any,
     Primary,
@@ -191,6 +193,7 @@ pub const MAX_FAILOVER_BACKOFF_MAX_MS: u64 = 60 * 60 * 1_000;
 
 /// TLS verification policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TlsVerify {
     On,
     /// Insecure-skip-verify; only honoured when the `insecure-skip-verify`

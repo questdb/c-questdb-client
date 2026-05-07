@@ -78,6 +78,7 @@ pub const MAX_DECIMAL_SCALE: i8 = 38;
 /// dimension header), so this exclusion may be lifted when the server
 /// implements them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SimpleNullKind {
     Boolean,
     Byte,
@@ -150,7 +151,12 @@ impl TryFrom<ColumnKind> for SimpleNullKind {
 /// (`$1`, `$2`, …). Types whose null wire encoding carries column-level
 /// metadata have dedicated `Null*` variants; everything else uses
 /// [`Bind::Null`].
+///
+/// `#[non_exhaustive]` so future bind types (e.g. when array binds are
+/// promoted out of the Phase 1 limitation) can be added without
+/// breaking exhaustive matches in user code.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum Bind {
     // --- Simple typed-NULL (column body is just the null section) ----------
     /// Typed NULL for any simple-null kind. The [`SimpleNullKind`] type

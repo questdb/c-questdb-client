@@ -127,6 +127,13 @@ impl From<ErrorCode> for line_reader_error_code {
             ErrorCode::LimitExceeded => line_reader_error_limit_exceeded,
             ErrorCode::ServerLimitExceeded => line_reader_error_server_limit_exceeded,
             ErrorCode::Cancelled => line_reader_error_cancelled,
+            // ErrorCode is `#[non_exhaustive]`. Any future variant added
+            // upstream that the C ABI hasn't been taught about falls
+            // back to ProtocolError so callers see *something* rather
+            // than a build failure when versions skew. Production builds
+            // should never hit this — both crates rebuild together
+            // in-workspace.
+            _ => line_reader_error_protocol_error,
         }
     }
 }
@@ -349,6 +356,23 @@ impl From<ColumnKind> for line_reader_column_kind {
             ColumnKind::Binary => line_reader_column_kind_binary,
             ColumnKind::Long256 => line_reader_column_kind_long256,
             ColumnKind::Ipv4 => line_reader_column_kind_ipv4,
+            // ColumnKind is `#[non_exhaustive]`. There's no semantic
+            // fallback for an unknown wire-type code on the C side —
+            // every column kind needs a paired C ABI mapping. This arm
+            // is a build-time guard: it fires only on a workspace
+            // version skew (a new ColumnKind variant added upstream
+            // without updating the FFI translation), which is
+            // impossible in same-workspace builds. Aborting is strictly
+            // safer than silently mapping to a wrong-typed C variant.
+            _ => {
+                eprintln!(
+                    "ColumnKind→C ABI: unknown variant {:?}; the FFI translation is out of sync \
+                     with the upstream enum. Aborting to prevent silent type confusion in the C \
+                     caller.",
+                    k
+                );
+                std::process::abort();
+            }
         }
     }
 }
@@ -736,6 +760,10 @@ pub unsafe extern "C" fn line_reader_server_info_role(
             ServerRole::Replica => line_reader_server_role_replica,
             ServerRole::PrimaryCatchup => line_reader_server_role_primary_catchup,
             ServerRole::Other(_) => line_reader_server_role_other,
+            // ServerRole is `#[non_exhaustive]`; future named variants
+            // not yet wired through to the C ABI surface as `_other`
+            // (matching the existing `Other(u8)` semantics).
+            _ => line_reader_server_role_other,
         }
     }
 }
@@ -758,6 +786,9 @@ pub unsafe extern "C" fn line_reader_server_info_role_byte(
             ServerRole::Replica => 2,
             ServerRole::PrimaryCatchup => 3,
             ServerRole::Other(b) => b,
+            // `#[non_exhaustive]` fallback: 0xFF matches the
+            // `Other(0xFF)` sentinel used elsewhere for unknown roles.
+            _ => 0xFF,
         }
     }
 }
@@ -3166,6 +3197,12 @@ pub unsafe extern "C" fn line_reader_cursor_terminal_kind(
             Some(Terminal::ExecDone { .. }) => {
                 line_reader_terminal_kind::line_reader_terminal_kind_exec_done
             }
+            // `Terminal` is `#[non_exhaustive]`. A new variant added
+            // upstream that the C ABI hasn't been taught about surfaces
+            // as `_none` rather than misrepresenting itself as End or
+            // ExecDone — callers reading per-variant fields would then
+            // see zeroed values rather than wrong values.
+            Some(_) => line_reader_terminal_kind::line_reader_terminal_kind_none,
         }
     }
 }

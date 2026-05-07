@@ -29,7 +29,11 @@
 use std::fmt::{Display, Formatter};
 
 /// Egress error category.
+///
+/// `#[non_exhaustive]` so new diagnostic categories can be added without
+/// breaking exhaustive matches in downstream code.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum ErrorCode {
     /// Bad URL, host, or interface in the connect string.
     CouldNotResolveAddr,

@@ -30,8 +30,13 @@
 use crate::egress::error::{Result, fmt};
 
 /// QWP wire type code.
+///
+/// `#[non_exhaustive]` because the QWP type table is append-only — new
+/// type codes may be added in future protocol revisions, and exhaustive
+/// matches in downstream code shouldn't break when that happens.
 #[repr(u8)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum ColumnKind {
     Boolean = 0x01,
     Byte = 0x02,
