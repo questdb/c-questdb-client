@@ -454,8 +454,29 @@ fn validate_content_encoding(headers: &tungstenite::http::HeaderMap) -> Result<(
             "X-QWP-Content-Encoding header is not valid ASCII"
         )
     })?;
-    // Token = name `;` params... — only the name selects the codec.
-    let name = s.split(';').next().unwrap_or("").trim();
+    // Token = name `;` params... — the name selects the codec; the
+    // params alter codec behaviour and the client must understand
+    // every one it accepts. The QWP egress spec defines no parameters
+    // at this revision, so any non-empty `param[=value]` is rejected
+    // up front rather than silently ignored — silently ignoring lets
+    // a server that emits e.g. `zstd;dict=<id>` progress past the
+    // handshake and only fail at first batch, after the user has
+    // already issued a query.
+    let mut parts = s.split(';');
+    let name = parts.next().unwrap_or("").trim();
+    for param in parts {
+        let param = param.trim();
+        if param.is_empty() {
+            continue;
+        }
+        return Err(fmt!(
+            HandshakeError,
+            "server selected X-QWP-Content-Encoding {:?} with unsupported parameter {:?} \
+             (this client revision recognises no codec parameters)",
+            s,
+            param
+        ));
+    }
     match name {
         // `raw` and `identity` are spec-aliases for no compression.
         "raw" | "identity" | "" => Ok(()),
@@ -573,9 +594,66 @@ mod tests {
     // questdb-rs/tests/egress_ws_integration.rs so they can spin up an
     // in-process tungstenite server.
 
+    use super::validate_content_encoding;
+    use crate::egress::error::ErrorCode;
+    use tungstenite::http::{HeaderMap, HeaderValue};
+
+    fn header_map(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("X-QWP-Content-Encoding", HeaderValue::from_str(value).unwrap());
+        h
+    }
+
     #[test]
     fn module_is_compilable() {
         // Sanity check: the `cfg(feature = "sync-reader-ws")` gate is open
         // when this test runs.
+    }
+
+    #[test]
+    fn content_encoding_absent_is_ok() {
+        validate_content_encoding(&HeaderMap::new()).unwrap();
+    }
+
+    #[test]
+    fn content_encoding_raw_is_ok() {
+        validate_content_encoding(&header_map("raw")).unwrap();
+        validate_content_encoding(&header_map("identity")).unwrap();
+    }
+
+    #[cfg(feature = "compression-zstd")]
+    #[test]
+    fn content_encoding_zstd_bare_is_ok() {
+        validate_content_encoding(&header_map("zstd")).unwrap();
+    }
+
+    #[cfg(feature = "compression-zstd")]
+    #[test]
+    fn content_encoding_zstd_with_unknown_param_rejected() {
+        for v in ["zstd;level=11", "zstd; dict=42", "zstd;foo=bar;baz=qux"] {
+            let err = validate_content_encoding(&header_map(v)).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::HandshakeError);
+            assert!(
+                err.msg().contains("unsupported parameter"),
+                "got: {}",
+                err.msg()
+            );
+        }
+    }
+
+    #[cfg(feature = "compression-zstd")]
+    #[test]
+    fn content_encoding_trailing_semicolon_is_ok() {
+        // Empty post-`;` segments are tolerated (whitespace / accidental
+        // trailing separator).
+        validate_content_encoding(&header_map("zstd;")).unwrap();
+        validate_content_encoding(&header_map("zstd; ; ")).unwrap();
+    }
+
+    #[test]
+    fn content_encoding_unknown_codec_rejected() {
+        let err = validate_content_encoding(&header_map("brotli")).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::HandshakeError);
+        assert!(err.msg().contains("unknown codec"), "got: {}", err.msg());
     }
 }
