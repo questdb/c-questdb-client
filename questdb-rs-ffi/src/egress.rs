@@ -1339,6 +1339,7 @@ pub unsafe extern "C" fn line_reader_query_execute(
                 Box::into_raw(Box::new(line_reader_cursor {
                     cursor: ManuallyDrop::new(cursor_static),
                     current_batch: None,
+                    column_view_cache: UnsafeCell::new(Vec::new()),
                     reader,
                 }))
             }
@@ -1722,6 +1723,25 @@ pub struct line_reader_cursor {
     /// for the same reason as `cursor`. See the struct-level safety note —
     /// this field MUST be `None` whenever `&mut self.cursor` is exposed.
     current_batch: Option<BatchView<'static>>,
+    /// Lazy per-column `ColumnView` cache. Sized to `column_count()` when
+    /// `current_batch` is set; cleared (drained) when the batch is dropped.
+    /// Avoids rebuilding the column-kind discriminant match and the
+    /// validity-bitmap length check on every per-row C getter call. The
+    /// stored views are laundered to `'static` for the same reason as
+    /// `cursor` / `current_batch`; the actual lifetime is bounded by the
+    /// owning batch.
+    ///
+    /// # Aliasing safety
+    ///
+    /// `UnsafeCell` is sound here because the cursor is single-threaded
+    /// by contract (see the thread-safety section in `line_reader.h`),
+    /// and the FFI getters serialise by virtue of being plain function
+    /// calls — no two getter invocations overlap. The Vec is pre-sized
+    /// at `next_batch` time and never grown mid-batch, so an `&` to a
+    /// slot returned by `get_column_view` is invalidated only by
+    /// `cursor_for_mut` (which the borrow checker prevents while any
+    /// `&` to the cursor is outstanding).
+    column_view_cache: UnsafeCell<Vec<Option<ColumnView<'static>>>>,
     /// Backpointer to the originating reader, used to clear its `active`
     /// flag on `_cursor_free`. Always non-NULL for a valid cursor.
     reader: *mut line_reader,
@@ -1735,6 +1755,11 @@ impl line_reader_cursor {
     /// instead of taking `&mut self.cursor` directly.
     fn cursor_for_mut(&mut self) -> &mut Cursor<'static> {
         self.current_batch = None;
+        // SAFETY: &mut self gives exclusive access; the column-view
+        // cache borrows from `current_batch`, which we just dropped.
+        unsafe {
+            (*self.column_view_cache.get()).clear();
+        }
         debug_assert!(self.current_batch.is_none());
         &mut self.cursor
     }
@@ -1762,11 +1787,13 @@ pub unsafe extern "C" fn line_reader_cursor_free(cursor: *mut line_reader_cursor
             return;
         }
         let mut boxed = Box::from_raw(cursor);
-        // Drop the borrowed BatchView before the cursor it borrows from.
-        // Wrapped in `panic_guard` because the cursor's Drop runs
-        // `close_in_place` which writes a Close frame and shuts down the
-        // TCP socket — any panic there would otherwise cross the FFI
-        // boundary.
+        // Drop the cached column views (they borrow from the batch) and
+        // then the BatchView (it borrows from the cursor) before the
+        // cursor itself. Wrapped in `panic_guard` because the cursor's
+        // Drop runs `close_in_place` which writes a Close frame and
+        // shuts down the TCP socket — any panic there would otherwise
+        // cross the FFI boundary.
+        (*boxed.column_view_cache.get()).clear();
         boxed.current_batch = None;
         ManuallyDrop::drop(&mut boxed.cursor);
         // Release the reader's active flag so a new query/cursor can be
@@ -1825,7 +1852,15 @@ pub unsafe extern "C" fn line_reader_cursor_next_batch(
         };
         match next {
             Ok(Some(batch_static)) => {
+                let col_count = batch_static.column_count();
                 c.current_batch = Some(batch_static);
+                // Pre-size the per-column view cache so column getters
+                // don't reallocate it mid-batch. `cursor_for_mut`
+                // (called by `next_batch`'s prelude) already cleared
+                // the previous batch's entries.
+                let cache = &mut *c.column_view_cache.get();
+                debug_assert!(cache.is_empty());
+                cache.resize_with(col_count, || None);
                 1
             }
             Ok(None) => 0,
@@ -3375,15 +3410,28 @@ pub unsafe extern "C" fn line_reader_cursor_get_geohash(
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// SAFETY: `cursor` must be a valid, non-null pointer to a `line_reader_cursor`
-/// and `err_out` must be a valid pointer. `'a` is bounded by the lifetime of
-/// the input reference, which prevents callers from extending the borrow past
-/// the cursor's `current_batch`.
+/// Lazily project the column at `col_idx` into a `ColumnView` and return a
+/// borrow of the cached projection. The first call for a given `col_idx`
+/// after `_cursor_next_batch` builds the view; subsequent calls hit the
+/// cache, skipping the discriminant match in `BatchView::column` and the
+/// validity-bitmap length check that goes with it.
+///
+/// SAFETY: `cursor` must be a valid, non-null pointer to a
+/// `line_reader_cursor` and `err_out` must be a valid pointer. The
+/// lifetime `'a` is bounded by the input borrow, which prevents the caller
+/// from outliving the cursor's `current_batch`. The internal lifetime
+/// launder is sound because (1) the cache is sized at `_cursor_next_batch`
+/// time and never grown again before the next `cursor_for_mut`, so an
+/// in-cache slot's address is stable for the lifetime of the batch; (2)
+/// `cursor_for_mut` is the only mutator that drains the cache, and the
+/// borrow checker prevents calling it while any `&` to the cursor is
+/// outstanding; (3) the FFI is documented as single-threaded per cursor,
+/// so no two getter calls overlap.
 unsafe fn get_column_view<'a>(
     cursor: &'a line_reader_cursor,
     col_idx: size_t,
     err_out: *mut *mut line_reader_error,
-) -> Option<ColumnView<'a>> {
+) -> Option<&'a ColumnView<'a>> {
     unsafe {
         let batch = match cursor.current_batch.as_ref() {
             Some(b) => b,
@@ -3408,13 +3456,24 @@ unsafe fn get_column_view<'a>(
             );
             return None;
         }
-        match batch.column(col_idx) {
-            Ok(v) => Some(v),
-            Err(e) => {
-                *err_out = Box::into_raw(Box::new(line_reader_error(e)));
-                None
+        let cache = &mut *cursor.column_view_cache.get();
+        if cache[col_idx].is_none() {
+            match batch.column(col_idx) {
+                Ok(view) => {
+                    let view_static: ColumnView<'static> = std::mem::transmute(view);
+                    cache[col_idx] = Some(view_static);
+                }
+                Err(e) => {
+                    *err_out = Box::into_raw(Box::new(line_reader_error(e)));
+                    return None;
+                }
             }
         }
+        let view_static: &'static ColumnView<'static> = cache[col_idx].as_ref().unwrap();
+        Some(std::mem::transmute::<
+            &'static ColumnView<'static>,
+            &'a ColumnView<'a>,
+        >(view_static))
     }
 }
 
