@@ -321,6 +321,20 @@ impl ReaderConfig {
                 };
                 (host, port_str)
             } else {
+                // Reject unbracketed multi-colon entries. `rsplit_once(':')`
+                // would otherwise treat `::1` as host=`::`, port=`1` and
+                // `2001:db8::1` as host=`2001:db8:`, port=`1` — surprising
+                // misparses for users who omit the required brackets on an
+                // IPv6 literal.
+                if entry.bytes().filter(|&b| b == b':').count() > 1 {
+                    return Err(fmt!(
+                        ConfigError,
+                        "addr entry {} contains multiple ':' — IPv6 literals \
+                         must be bracketed (e.g. [::1]:9000): {:?}",
+                        i,
+                        entry
+                    ));
+                }
                 match entry.rsplit_once(':') {
                     Some((h, p)) => (h.to_string(), p.to_string()),
                     None => (entry.to_string(), default_port.to_string()),
@@ -1188,6 +1202,35 @@ mod tests {
     fn ipv6_addr_garbage_after_bracket_rejected() {
         let err = ReaderConfig::from_conf("qwp::addr=[::1]junk").unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
+    }
+
+    #[test]
+    fn unbracketed_ipv6_rejected() {
+        for bad in [
+            "qwp::addr=::1",
+            "qwp::addr=::1:9000",
+            "qwp::addr=2001:db8::1",
+            "qwp::addr=fe80::1%eth0",
+            "qwp::addr=h1:9000,::1:9001",
+        ] {
+            let err = ReaderConfig::from_conf(bad).unwrap_err();
+            assert_eq!(
+                err.code(),
+                ErrorCode::ConfigError,
+                "expected reject for {bad:?}"
+            );
+            let msg = err.msg();
+            assert!(
+                msg.contains("multiple ':'") || msg.contains("bracketed"),
+                "expected diagnostic to mention bracketing, got {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn single_colon_host_port_still_accepted() {
+        let c = ReaderConfig::from_conf("qwp::addr=h1:9000").unwrap();
+        assert_eq!(c.addrs[0], Endpoint::new("h1", 9000));
     }
 
     #[test]
