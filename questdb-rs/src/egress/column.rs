@@ -48,6 +48,7 @@
 use std::marker::PhantomData;
 
 use crate::egress::column_kind::ColumnKind;
+use crate::egress::error::{Result, fmt};
 use crate::egress::symbol_dict::SymbolDict;
 
 // ---------------------------------------------------------------------------
@@ -67,14 +68,42 @@ pub enum Validity<'a> {
 }
 
 impl<'a> Validity<'a> {
-    pub fn from_bitmap(bytes: &'a [u8], row_count: usize) -> Self {
-        Validity::Bitmap { bytes, row_count }
+    /// Construct a bitmap-backed validity view.
+    ///
+    /// Returns `Err(InvalidApiCall)` if `bytes.len() < row_count.div_ceil(8)`
+    /// — a too-short bitmap would otherwise cause [`is_null`] to silently
+    /// report null rows as non-null (the bytes beyond the buffer end are
+    /// indistinguishable from "this row's bit is 0"). The decoder always
+    /// sizes the bitmap exactly to `row_count.div_ceil(8)`
+    /// (see `decode_validity`), so the error is unreachable from
+    /// crate-internal callers; the check exists so external callers can't
+    /// build a corrupt view and have it silently mis-report NULL rows.
+    pub fn from_bitmap(bytes: &'a [u8], row_count: usize) -> Result<Self> {
+        let needed = row_count.div_ceil(8);
+        if bytes.len() < needed {
+            return Err(fmt!(
+                InvalidApiCall,
+                "Validity::from_bitmap: bitmap is {} bytes but row_count={} needs at least {}",
+                bytes.len(),
+                row_count,
+                needed
+            ));
+        }
+        Ok(Validity::Bitmap { bytes, row_count })
     }
 
     pub fn has_nulls(&self) -> bool {
         matches!(self, Validity::Bitmap { .. })
     }
 
+    /// `true` if `row` is null. Out-of-range rows return `false` (matches
+    /// the column accessors' "row was never written" treatment).
+    ///
+    /// Bounds-checked: a [`Validity::Bitmap`](Self::Bitmap) constructed
+    /// directly (bypassing [`from_bitmap`](Self::from_bitmap)) with a
+    /// too-short bitmap reports `false` for the missing tail rather
+    /// than panicking. Constructor-validated values never trip the
+    /// fallback.
     pub fn is_null(&self, row: usize) -> bool {
         match self {
             Validity::None => false,
@@ -82,8 +111,10 @@ impl<'a> Validity<'a> {
                 if row >= *row_count {
                     return false;
                 }
-                let byte = bytes.get(row >> 3).copied().unwrap_or(0);
-                (byte >> (row & 7)) & 1 != 0
+                match bytes.get(row >> 3) {
+                    Some(byte) => (byte >> (row & 7)) & 1 != 0,
+                    None => false,
+                }
             }
         }
     }
@@ -1146,7 +1177,7 @@ mod tests {
         // 8 rows: row0=null, row1=valid, row2=null, row3..7=valid
         // bitmap byte: 0b0000_0101 = 0x05
         let bytes = [0x05];
-        let v = Validity::from_bitmap(&bytes, 8);
+        let v = Validity::from_bitmap(&bytes, 8).unwrap();
         assert!(v.is_null(0));
         assert!(!v.is_null(1));
         assert!(v.is_null(2));
@@ -1159,7 +1190,7 @@ mod tests {
     fn validity_bitmap_spans_bytes() {
         // 10 rows, only row 9 is null → byte 0 = 0, byte 1 = 0b0000_0010 = 0x02
         let bytes = [0x00, 0x02];
-        let v = Validity::from_bitmap(&bytes, 10);
+        let v = Validity::from_bitmap(&bytes, 10).unwrap();
         for r in 0..9 {
             assert!(!v.is_null(r));
         }
@@ -1167,23 +1198,50 @@ mod tests {
     }
 
     #[test]
-    fn validity_bitmap_short_buffer_does_not_panic() {
-        // Caller-supplied bitmap is shorter than ceil(row_count / 8); is_null
-        // must treat the missing tail as zero (not null) instead of panicking.
-        let bytes: [u8; 0] = [];
-        let v = Validity::from_bitmap(&bytes, 100);
+    fn validity_bitmap_exact_length_accepted() {
+        // The decoder always sizes the bitmap to ceil(row_count / 8).
+        // `from_bitmap` must accept exact-length buffers.
+        let bytes = [0x00u8; 13]; // ceil(100 / 8) = 13
+        let v = Validity::from_bitmap(&bytes, 100).unwrap();
         for r in 0..100 {
             assert!(!v.is_null(r));
         }
+    }
 
+    #[test]
+    fn validity_bitmap_short_rejected_in_constructor() {
+        // 100 rows need ceil(100 / 8) = 13 bytes; supplying 0 must
+        // surface InvalidApiCall up front rather than silently treat
+        // null rows as non-null.
+        let bytes: [u8; 0] = [];
+        let err = Validity::from_bitmap(&bytes, 100).unwrap_err();
+        assert_eq!(err.code(), crate::egress::ErrorCode::InvalidApiCall);
+        assert!(err.msg().contains("Validity::from_bitmap: bitmap is"));
+    }
+
+    #[test]
+    fn validity_bitmap_off_by_one_rejected() {
+        // 9 rows need 2 bytes; supplying 1 must surface InvalidApiCall.
         let bytes = [0xFFu8];
-        let v = Validity::from_bitmap(&bytes, 100);
-        for r in 0..8 {
-            assert!(v.is_null(r));
-        }
-        for r in 8..100 {
-            assert!(!v.is_null(r));
-        }
+        let err = Validity::from_bitmap(&bytes, 9).unwrap_err();
+        assert_eq!(err.code(), crate::egress::ErrorCode::InvalidApiCall);
+    }
+
+    #[test]
+    fn validity_bitmap_direct_construction_short_does_not_panic() {
+        // External code that bypasses `from_bitmap` and builds the
+        // variant literally with a too-short bitmap is technically
+        // outside the type's contract. `is_null` MUST NOT panic for
+        // this case; the missing tail is reported as "not null"
+        // (matching the pre-validation behavior of `bytes.get(...)`).
+        // Properly-constructed `Validity` values can never trip this
+        // path because `from_bitmap` rejects short bitmaps up front.
+        let bytes: [u8; 0] = [];
+        let v = Validity::Bitmap {
+            bytes: &bytes,
+            row_count: 100,
+        };
+        assert!(!v.is_null(50));
     }
 
     #[test]
@@ -1206,7 +1264,7 @@ mod tests {
         let raw = le_f64s(&[1.0, 2.0, 3.0, 4.0]);
         // row 1 null → bitmap 0b0000_0010 = 0x02
         let bm = [0x02];
-        let col = FixedColumn::<f64>::new(&raw, Validity::from_bitmap(&bm, 4));
+        let col = FixedColumn::<f64>::new(&raw, Validity::from_bitmap(&bm, 4).unwrap());
         let collected: Vec<_> = col.iter().collect();
         assert_eq!(collected, vec![Some(1.0), None, Some(3.0), Some(4.0)]);
     }
@@ -1260,7 +1318,7 @@ mod tests {
         // Codes are dense per row, with `0` (garbage) in the null slot.
         let codes = [0u32, 0, 1, 2];
         let bm = [0x02u8];
-        let col = SymbolColumn::new(&codes, Validity::from_bitmap(&bm, 4), &dict);
+        let col = SymbolColumn::new(&codes, Validity::from_bitmap(&bm, 4).unwrap(), &dict);
 
         assert_eq!(col.len(), 4);
         assert_eq!(col.resolve(0), Some("AAPL"));
@@ -1308,7 +1366,10 @@ mod tests {
     fn column_view_is_null_dispatches() {
         let raw = le_i64s(&[1, 2, 3]);
         let bm = [0x02u8]; // row 1 null
-        let v = ColumnView::Long(FixedColumn::<i64>::new(&raw, Validity::from_bitmap(&bm, 3)));
+        let v = ColumnView::Long(FixedColumn::<i64>::new(
+            &raw,
+            Validity::from_bitmap(&bm, 3).unwrap(),
+        ));
         assert!(!v.is_null(0));
         assert!(v.is_null(1));
         assert!(!v.is_null(2));

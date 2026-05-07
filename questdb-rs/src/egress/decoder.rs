@@ -216,51 +216,51 @@ impl DecodedBatch {
             .ok_or_else(|| fmt!(InvalidApiCall, "column index {} out of range", idx))?;
         Ok(match col {
             DecodedColumn::Boolean(b) => {
-                ColumnView::Boolean(FixedColumn::new(&b.values, validity_of(b, self.row_count)))
+                ColumnView::Boolean(FixedColumn::new(&b.values, validity_of(b, self.row_count)?))
             }
             DecodedColumn::Byte(b) => {
-                ColumnView::Byte(FixedColumn::new(&b.values, validity_of(b, self.row_count)))
+                ColumnView::Byte(FixedColumn::new(&b.values, validity_of(b, self.row_count)?))
             }
             DecodedColumn::Short(b) => {
-                ColumnView::Short(FixedColumn::new(&b.values, validity_of(b, self.row_count)))
+                ColumnView::Short(FixedColumn::new(&b.values, validity_of(b, self.row_count)?))
             }
             DecodedColumn::Int(b) => {
-                ColumnView::Int(FixedColumn::new(&b.values, validity_of(b, self.row_count)))
+                ColumnView::Int(FixedColumn::new(&b.values, validity_of(b, self.row_count)?))
             }
             DecodedColumn::Long(b) => {
-                ColumnView::Long(FixedColumn::new(&b.values, validity_of(b, self.row_count)))
+                ColumnView::Long(FixedColumn::new(&b.values, validity_of(b, self.row_count)?))
             }
             DecodedColumn::Float(b) => {
-                ColumnView::Float(FixedColumn::new(&b.values, validity_of(b, self.row_count)))
+                ColumnView::Float(FixedColumn::new(&b.values, validity_of(b, self.row_count)?))
             }
             DecodedColumn::Double(b) => {
-                ColumnView::Double(FixedColumn::new(&b.values, validity_of(b, self.row_count)))
+                ColumnView::Double(FixedColumn::new(&b.values, validity_of(b, self.row_count)?))
             }
             DecodedColumn::Timestamp(b) => {
-                ColumnView::Timestamp(FixedColumn::new(&b.values, validity_of(b, self.row_count)))
+                ColumnView::Timestamp(FixedColumn::new(&b.values, validity_of(b, self.row_count)?))
             }
             DecodedColumn::Date(b) => {
-                ColumnView::Date(FixedColumn::new(&b.values, validity_of(b, self.row_count)))
+                ColumnView::Date(FixedColumn::new(&b.values, validity_of(b, self.row_count)?))
             }
             DecodedColumn::TimestampNanos(b) => ColumnView::TimestampNanos(FixedColumn::new(
                 &b.values,
-                validity_of(b, self.row_count),
+                validity_of(b, self.row_count)?,
             )),
             DecodedColumn::Char(b) => {
-                ColumnView::Char(FixedColumn::new(&b.values, validity_of(b, self.row_count)))
+                ColumnView::Char(FixedColumn::new(&b.values, validity_of(b, self.row_count)?))
             }
             DecodedColumn::Ipv4(b) => {
-                ColumnView::Ipv4(FixedColumn::new(&b.values, validity_of(b, self.row_count)))
+                ColumnView::Ipv4(FixedColumn::new(&b.values, validity_of(b, self.row_count)?))
             }
             DecodedColumn::Uuid(b) => {
-                ColumnView::Uuid(UuidColumn::new(&b.values, validity_of(b, self.row_count)))
+                ColumnView::Uuid(UuidColumn::new(&b.values, validity_of(b, self.row_count)?))
             }
             DecodedColumn::Long256(b) => ColumnView::Long256(Long256Column::new(
                 &b.values,
-                validity_of(b, self.row_count),
+                validity_of(b, self.row_count)?,
             )),
             DecodedColumn::Decimal64 { buffer, scale } => ColumnView::Decimal64(
-                Decimal64Column::new(&buffer.values, validity_of(buffer, self.row_count), *scale),
+                Decimal64Column::new(&buffer.values, validity_of(buffer, self.row_count)?, *scale),
             ),
             DecodedColumn::Symbol {
                 codes,
@@ -270,7 +270,7 @@ impl DecodedBatch {
                 let active_dict = local_dict.as_ref().unwrap_or(dict);
                 ColumnView::Symbol(SymbolColumn::new(
                     codes,
-                    validity_from_opt(validity, self.row_count),
+                    validity_from_opt(validity, self.row_count)?,
                     active_dict,
                 ))
             }
@@ -286,7 +286,7 @@ impl DecodedBatch {
                 // `utf8` flag). Both invariants required by
                 // `VarcharColumn::new` therefore hold.
                 let view = unsafe {
-                    VarcharColumn::new(offsets, data, validity_from_opt(validity, self.row_count))
+                    VarcharColumn::new(offsets, data, validity_from_opt(validity, self.row_count)?)
                 };
                 ColumnView::Varchar(view)
             }
@@ -297,7 +297,7 @@ impl DecodedBatch {
             } => ColumnView::Binary(BinaryColumn::new(
                 offsets,
                 data,
-                validity_from_opt(validity, self.row_count),
+                validity_from_opt(validity, self.row_count)?,
             )),
             DecodedColumn::Geohash {
                 buffer,
@@ -307,39 +307,42 @@ impl DecodedBatch {
                 &buffer.values,
                 *byte_width,
                 *precision_bits,
-                validity_of(buffer, self.row_count),
+                validity_of(buffer, self.row_count)?,
             )),
             DecodedColumn::Decimal128 { buffer, scale } => ColumnView::Decimal128(
-                Decimal128Column::new(&buffer.values, validity_of(buffer, self.row_count), *scale),
+                Decimal128Column::new(&buffer.values, validity_of(buffer, self.row_count)?, *scale),
             ),
             DecodedColumn::Decimal256 { buffer, scale } => ColumnView::Decimal256(
-                Decimal256Column::new(&buffer.values, validity_of(buffer, self.row_count), *scale),
+                Decimal256Column::new(&buffer.values, validity_of(buffer, self.row_count)?, *scale),
             ),
             DecodedColumn::DoubleArray(b) => ColumnView::DoubleArray(DoubleArrayColumn::new(
                 &b.data_offsets,
                 &b.data,
                 &b.shapes,
                 &b.shape_offsets,
-                validity_from_opt(&b.validity, self.row_count),
+                validity_from_opt(&b.validity, self.row_count)?,
             )),
             DecodedColumn::LongArray(b) => ColumnView::LongArray(LongArrayColumn::new(
                 &b.data_offsets,
                 &b.data,
                 &b.shapes,
                 &b.shape_offsets,
-                validity_from_opt(&b.validity, self.row_count),
+                validity_from_opt(&b.validity, self.row_count)?,
             )),
         })
     }
 }
 
-fn validity_of<'a>(buf: &'a ColumnBuffer, row_count: usize) -> Validity<'a> {
+fn validity_of<'a>(buf: &'a ColumnBuffer, row_count: usize) -> Result<Validity<'a>> {
     validity_from_opt(&buf.validity, row_count)
 }
 
-fn validity_from_opt<'a>(validity: &'a Option<Bytes>, row_count: usize) -> Validity<'a> {
+fn validity_from_opt<'a>(
+    validity: &'a Option<Bytes>,
+    row_count: usize,
+) -> Result<Validity<'a>> {
     match validity {
-        None => Validity::None,
+        None => Ok(Validity::None),
         Some(bytes) => Validity::from_bitmap(bytes, row_count),
     }
 }
