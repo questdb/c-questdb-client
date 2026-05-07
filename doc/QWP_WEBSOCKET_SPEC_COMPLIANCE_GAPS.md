@@ -1,9 +1,11 @@
 # QWP/WebSocket spec compliance gaps
 
-Date: 2026-05-06
+Date: 2026-05-07
 
 Status: open-gap handoff. Completed implementation notes have been removed
-unless they still explain an unresolved spec/reference decision.
+unless they still explain an unresolved spec/reference decision. Refreshed
+after the post-lock-free SFA publication validation pass against Rust
+`b4310ddd89e75ce50adb8f0c4527c56c771080c7`.
 
 This document records gaps found while comparing the Rust QWP/WebSocket
 Store-and-Forward implementation against the current QWP spec documents in:
@@ -27,6 +29,7 @@ Primary spec documents read during the audit:
 
 - `/home/jara/devel/oss/questdb-arrays/docs/qwp/README.md`
 - `/home/jara/devel/oss/questdb-arrays/docs/qwp/sf-client.md`
+- `/home/jara/devel/oss/questdb-arrays/docs/qwp/failover.md`
 - `/home/jara/devel/oss/questdb-arrays/docs/qwp/wire-ingress.md`
 - `/home/jara/devel/oss/questdb-arrays/docs/qwp/wire-udp.md`
 - `/home/jara/devel/oss/questdb-arrays/docs/qwp/wire-egress.md`
@@ -76,6 +79,9 @@ The largest remaining areas are:
 - Java public API/config surface parity, including deprecated auth aliases,
   WebSocket auto-flush settings, builder methods, and callback-style progress
   handlers,
+- Rust public documentation/config-surface drift where `from_conf` docs and
+  older planning handoffs still describe behavior-bearing keys as accepted
+  before the behavior exists,
 - several SFA disk-format/recovery details where the spec and Java reference
   need to be reconciled before Rust should change behavior,
 - durable-mode OK coalescing/cumulation contract validation against the live
@@ -130,7 +136,7 @@ Java reference:
 Spec requirements:
 
 - `sf-client.md:107` says WebSocket transport options use `ws::` / `wss::`.
-- `wire-ingress.md:815` gives a durable ACK example using `ws::`.
+- `wire-ingress.md:825` gives a durable ACK example using `ws::`.
 - `sf-client.md:179-181` says the parser must reject unknown keys.
 
 Rust state:
@@ -162,6 +168,8 @@ Spec references:
 - `sf-client.md:141-148` lists durable ACK and error inbox keys.
 - `sf-client.md:174-175` lists `in_flight_window` and
   `max_schemas_per_connection`.
+- `failover.md:26-30` defines comma-separated and repeated `addr` keys as a
+  multi-host failover list and adds `auth_timeout_ms`.
 
 Rust state:
 
@@ -186,6 +194,11 @@ Rust state:
   `initial_connect_retry=async`.
 - `questdb-rs/src/ingress.rs:505-508` splits `addr` once on `:`, so it does
   not store comma-separated multi-host addresses.
+- `questdb-rs/src/ingress.rs:479-482` Rustdoc says `from_conf` accepts
+  `close_flush_timeout_millis`, `drain_orphans`,
+  `max_background_drainers`, `error_inbox_capacity`, and
+  `max_schemas_per_connection`, but some of those are rejected and
+  `drain_orphans=on` is explicitly unsupported.
 - Store-and-Forward builder setters such as `sf_dir`, `sender_id`,
   `sf_max_bytes`, `sf_max_total_bytes`, `sf_durability`, and durable ACK opt-in
   are currently config-string-only implementation details rather than public
@@ -213,6 +226,9 @@ Java reference:
 - `Sender.java:2709-2719` parses `drain_orphans`.
 - `Sender.java:2721-2726` parses `max_background_drainers`.
 - `Sender.java:2727-2732` parses `error_inbox_capacity`.
+- `Sender.java:1033` currently rejects WebSocket builders with more than one
+  address, so the failover spec's multi-host `addr` contract is not yet Java
+  reference behavior either.
 
 Implementation direction:
 
@@ -233,6 +249,12 @@ Implementation direction:
   rows/bytes/interval defaults, while Rust currently requires explicit user
   flush. Keep these rejected or ignored only if that remains the intended Rust
   API contract.
+- Fix Rust public docs when behavior remains intentionally unsupported. A
+  copy-pasteable `from_conf` contract that lists rejected keys is itself a
+  user-facing bug, separate from Java parity.
+- Treat multi-host `addr` and `auth_timeout_ms` as failover work, not a local
+  parser typo. Java and Rust both need an implementation decision before Rust
+  should claim full failover-spec support.
 
 ### 5. Default close semantics are not Java/spec compatible
 
@@ -244,15 +266,15 @@ Spec requirements:
 
 Rust state:
 
-- `questdb-rs/src/ingress.rs:1268-1279` rejects
+- `questdb-rs/src/ingress.rs:1273-1284` rejects
   `close_flush_timeout_millis`.
-- `questdb-rs/src/ingress/sender.rs:666-673` exposes explicit
+- `questdb-rs/src/ingress/sender.rs:681-688` exposes explicit
   `Sender::close_drain()`.
-- `questdb-rs/src/ingress/sender/qwp_ws.rs:335-369` implements runner
+- `questdb-rs/src/ingress/sender/qwp_ws.rs:382-417` implements runner
   close-drain logic, but timeout is returned as an error.
-- `questdb-rs/src/ingress/sender/qwp_ws.rs:791-797` runner `Drop` only stops
+- `questdb-rs/src/ingress/sender/qwp_ws.rs:925-931` runner `Drop` only stops
   and joins the runner thread.
-- `questdb-rs/src/ingress/sender/qwp_ws.rs:1973-1995` uses a fixed
+- `questdb-rs/src/ingress/sender/qwp_ws.rs:2176-2195` uses a fixed
   close-drain timeout where close-drain is explicitly called.
 
 Java reference:
@@ -262,6 +284,10 @@ Java reference:
   configured timeout.
 - `QwpWebSocketSender.java:1930-1962` defines the bounded close-drain loop and
   timeout error text.
+- Current Java does not literally match the current spec's `0` / `-1` wording:
+  `QwpWebSocketSender.java:786-788` can still surface an unsurfaced terminal
+  error before the `closeFlushTimeoutMillis > 0` drain gate at
+  `QwpWebSocketSender.java:797-799`.
 
 Implementation direction:
 
@@ -271,6 +297,9 @@ Implementation direction:
 - If accepting `close_flush_timeout_millis`, the behavior should match Java:
   configurable timeout, skip modes, cleanup error preservation, and terminal
   error rethrow behavior.
+- Resolve the Java/spec difference for disabled close-drain before copying the
+  spec wording into Rust. If Java is the reference, `0` / `-1` skip only the
+  wait-for-ACK drain, not the safety-net terminal-error check.
 
 ### 6. ACK-before-send and NACK clamping differ from Java
 
@@ -286,14 +315,18 @@ Rust state:
   sequence.
 - ACK before a send path has established `fsn_at_zero` / `last_sent_wire_seq`
   still reports `ProtocolAckWithoutConnection`.
+- `questdb-rs/src/ingress/sender/qwp_ws_driver.rs:1507-1518` rejects a
+  NACK/reject with `wire_seq > last_sent_wire_seq` as
+  `ProtocolRejectBeyondSent`.
 
 Java reference:
 
 - `CursorWebSocketSendLoop.java:1091-1121` clamps OK responses with
   `Math.min(wireSeq, highestSent)` and ignores an OK frame when
   `highestSent < 0`.
-- `CursorWebSocketSendLoop.java:1150-1161` applies the same high-sequence
-  clamp to NACK/server-rejection responses.
+- `CursorWebSocketSendLoop.java:1185-1214` applies the same high-sequence
+  clamp to NACK/server-rejection responses and handles pre-send rejections
+  without advancing the storage watermark.
 
 Implementation direction:
 
@@ -311,28 +344,35 @@ Spec requirements:
   enter reconnect.
 - `sf-client.md:592-595` says actual reconnect sleep is jittered in
   `[backoff, 2 * backoff)`.
+- `failover.md:168-172` says SF ingress uses equal-jitter
+  `[base, 2 * base)`.
 
 Rust state:
 
-- `questdb-rs/src/ingress/sender/qwp_ws_driver.rs` and
-  `questdb-rs/src/ingress/sender/qwp_ws.rs` use deterministic backoff.
+- `questdb-rs/src/ingress/sender/qwp_ws_driver.rs:803-811` doubles a
+  deterministic backoff after `sleep_before_retry(...)`.
+- `questdb-rs/src/ingress/sender/qwp_ws_driver.rs:1351-1366` sleeps exactly
+  that backoff, clamped only by the reconnect deadline.
+- `questdb-rs/src/ingress/sender/qwp_ws.rs:2045-2054` uses deterministic
+  sleeps for blocking initial-connect retry.
 - The current driver polls readable bytes and progress but does not maintain a
   sent-time ACK deadline that triggers reconnect.
-- `questdb-rs/src/ingress/sender/qwp_ws_driver.rs:1615-1617` returns
+- `questdb-rs/src/ingress/sender/qwp_ws_driver.rs:1737-1738` returns
   `TransportPoll::Idle` without reading the socket when no wire sequences are
   pending and durable ACK mode is off. This can defer server PING/PONG/CLOSE or
   stray response handling until another send happens.
-- `questdb-rs/src/ingress/sender/qwp_ws_driver.rs:751-754` treats generic
+- `questdb-rs/src/ingress/sender/qwp_ws_driver.rs:782-784` treats generic
   WebSocket protocol violations as terminal protocol errors.
-- `questdb-rs/src/ingress/sender/qwp_ws_driver.rs:1654-1659` treats completed
+- `questdb-rs/src/ingress/sender/qwp_ws_driver.rs:1776-1781` treats completed
   non-binary QWP responses as protocol violations.
 
 Java reference:
 
-- `CursorWebSocketSendLoop.java` has the current reference reconnect loop.
-  Verify current jitter behavior before copying the spec literally; the Java
-  grep during this audit showed deterministic `Math.min(... * 2, max)` growth,
-  so the spec and Java may not yet agree.
+- `CursorWebSocketSendLoop.java:624-638` uses
+  `ThreadLocalRandom.current().nextLong(backoffMillis)` and sleeps
+  `backoffMillis + jitter` for reconnect.
+- `CursorWebSocketSendLoop.java:811-821` uses the same equal-jitter shape for
+  blocking initial-connect retry.
 - `CursorWebSocketSendLoop.java:1010-1019` drains
   `client.tryReceiveFrame(...)` until idle whenever the loop polls receives.
 - `WebSocketClient.java:915-924` sends a close frame on WebSocket parser
@@ -351,8 +391,8 @@ Implementation direction:
 - Decide whether Rust's stricter terminal classification for malformed
   WebSocket frames and non-binary QWP responses is a deliberate safety policy
   or should follow Java's reconnect/ignore behavior.
-- Treat jitter as a spec/reference reconciliation item unless Java has already
-  changed.
+- Implement equal-jitter for reconnect and initial-connect retry if Rust is to
+  match the current spec and Java reference.
 
 ### 8. Orphan adoption and `.failed` are missing
 
@@ -392,9 +432,9 @@ Rust state:
 
 - `questdb-rs/src/ingress/sender/qwp_ws_ownership.rs:40-43` documents
   poll-based error observation.
-- `questdb-rs/src/ingress/sender.rs:592-608` exposes `poll_qwp_ws_error()`.
-- `questdb-rs/src/ingress/sender.rs:628-641` exposes dropped-error counts.
-- `questdb-rs/src/ingress/sender/qwp_ws_driver.rs:60` uses a default capacity
+- `questdb-rs/src/ingress/sender.rs:596-611` exposes `poll_qwp_ws_error()`.
+- `questdb-rs/src/ingress/sender.rs:632-643` exposes dropped-error counts.
+- `questdb-rs/src/ingress/sender/qwp_ws_driver.rs:66` uses a default capacity
   of 1024, not the spec's 256 default.
 - `questdb-rs/src/ingress.rs:581-584` rejects `error_inbox_capacity`.
 
@@ -418,9 +458,9 @@ Spec requirements:
 
 Rust state:
 
-- `questdb-rs/src/ingress/sender/qwp_ws_sfa_slot.rs:169-185` implements Unix
+- `questdb-rs/src/ingress/sender/qwp_ws_sfa_slot.rs:216-226` implements Unix
   `flock`.
-- `questdb-rs/src/ingress/sender/qwp_ws_sfa_slot.rs:188-192` returns
+- `questdb-rs/src/ingress/sender/qwp_ws_sfa_slot.rs:229-232` returns
   `SlotLockUnsupported` on non-Unix.
 - `.lock.pid` writing is best-effort in Rust; if the spec requires a hard
   diagnostic write on every successful acquisition, that is another small gap.
@@ -438,7 +478,7 @@ Spec requirement:
 
 Rust state:
 
-- `questdb-rs/src/ingress/sender/qwp_ws_sfa_segment.rs:294-302` writes those
+- `questdb-rs/src/ingress/sender/qwp_ws_sfa_segment.rs:659-667` writes those
   fields as 0.
 - Segment scan now rejects non-zero `flags` and non-zero `reserved` fields
   before accepting the segment header. Under the current recovery policy these
@@ -465,11 +505,11 @@ Spec requirement:
 
 Rust state:
 
-- `questdb-rs/src/ingress/sender/qwp_ws_sfa_segment.rs:41` defines
+- `questdb-rs/src/ingress/sender/qwp_ws_sfa_segment.rs:46` defines
   `INITIAL_SEGMENT_FILE_NAME = "sf-initial.sfa"`.
-- `questdb-rs/src/ingress/sender/qwp_ws_sfa_queue.rs:141-149` creates a fresh
+- `questdb-rs/src/ingress/sender/qwp_ws_sfa_queue.rs:278-285` creates a fresh
   queue with `sf-initial.sfa`.
-- `questdb-rs/src/ingress/sender/qwp_ws_sfa_segment.rs:552-563` has a test
+- `questdb-rs/src/ingress/sender/qwp_ws_sfa_segment.rs:946-958` has a test
   that locks in the initial filename.
 
 Java reference:
@@ -499,11 +539,11 @@ Spec text:
 
 Rust state:
 
-- `questdb-rs/src/ingress/sender/qwp_ws_sfa_queue.rs:577-585` records a
-  `SkippedSegment` diagnostic and continues when `scan_file()` fails.
-- `questdb-rs/src/ingress/sender/qwp_ws_sfa_queue.rs:587-597` removes clean
+- `questdb-rs/src/ingress/sender/qwp_ws_sfa_queue.rs:1277-1285` records a
+  `SkippedSegment` diagnostic and continues when `scan_file_metadata()` fails.
+- `questdb-rs/src/ingress/sender/qwp_ws_sfa_queue.rs:1287-1297` removes clean
   empty segments and quarantines empty torn segments.
-- `questdb-rs/src/ingress/sender/qwp_ws_sfa_queue.rs:687-701` still fails
+- `questdb-rs/src/ingress/sender/qwp_ws_sfa_queue.rs:1331-1332` still fails
   recovered-FSN gaps after sorting the remaining valid segments.
 
 Java reference:
@@ -530,7 +570,7 @@ Spec requirement:
 
 Rust state:
 
-- `questdb-rs/src/ingress/sender/qwp_ws_sfa_queue.rs:600-608` records
+- `questdb-rs/src/ingress/sender/qwp_ws_sfa_queue.rs:1305-1312` records
   structured diagnostics for non-empty torn tails.
 - There is no current Rust logging facade in this path, so the diagnostic is
   not obviously operator-visible unless callers inspect recovery diagnostics.
@@ -555,19 +595,50 @@ See gap 3. The current spec says unknown keys must be rejected, but current
 Java still ignores unknown keys unless malformed. If strict rejection is the
 new contract, Java and Rust should be changed together.
 
+### Multi-host failover is specified but not implemented in Java WebSocket
+
+See gap 4. `failover.md` defines comma-separated and repeated `addr` entries
+and `auth_timeout_ms`, but current Java WebSocket builders still reject more
+than one address. Rust also supports only one WebSocket address. Treat this as
+a spec/reference gap, not a Rust-only parser bug.
+
+### Disabled close-drain semantics differ between spec and Java
+
+See gap 5. The spec says `close_flush_timeout_millis=0` or `-1` skips the
+pre-drain `checkError()` path, but current Java still performs its safety-net
+terminal-error check before the drain-timeout gate. Resolve this before adding
+the key in Rust.
+
+### Local planning docs still contain stale append-deadline notes
+
+Current Rust parses and enforces `sf_append_deadline_millis` for QWP/WebSocket
+append backpressure. `doc/QWP_WEBSOCKET_DURABLE_SF_STORAGE.md` is current, but
+older planning documents still say the key is rejected or not governed:
+
+- `doc/QWP_WEBSOCKET_PIPELINED_FFI.md:1374`
+- `doc/QWP_WEBSOCKET_JAVA_PARITY_FOLLOWUP_PLAN.md:435`
+- `doc/QWP_WEBSOCKET_JAVA_PARITY_FOLLOWUP_PLAN.md:814-826`
+- `doc/QWP_WEBSOCKET_HANDOVER.md:650-651`
+
+Update or retire those notes before handing them to an implementation agent.
+
 ## Suggested Fix Order
 
 1. Finish Java sequence tolerance:
    ignore ACK-before-send and clamp future NACK/reject to highest sent.
 2. Resolve spec/reference mismatches that should not be Rust-only changes:
    `sf-initial.sfa`, unknown-key policy, and Rust-stricter SFA header
-   extension handling if Java intends to accept non-zero fields.
+   extension handling if Java intends to accept non-zero fields. Include the
+   disabled close-drain safety-net behavior before accepting
+   `close_flush_timeout_millis`.
 3. Validate the durable OK emission/coalescing contract against the live
    durable-ACK server.
+4. Fix user-facing Rust documentation drift around `from_conf` and retire stale
+   `sf_append_deadline_millis` notes in older planning docs.
 5. Implement Java-compatible close semantics and then accept
    `close_flush_timeout_millis`.
-6. Implement ACK-timeout reconnect, and decide idle receive/protocol-violation
-   classification parity with Java.
+6. Implement ACK-timeout reconnect plus Java/spec equal-jitter, and decide idle
+   receive/protocol-violation classification parity with Java.
 7. Decide Rust API shape for Java-facing config/API gaps:
    deprecated `user` / `pass` aliases, WebSocket auto-flush, progress/error
    callback parity versus polling, and then support `error_inbox_capacity` if
