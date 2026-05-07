@@ -60,6 +60,7 @@ use crate::egress::symbol_dict::SymbolDict;
 /// `Validity::None` means "no nulls for this column"; the column carries no
 /// bitmap on the wire and `is_null` always returns `false`.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub enum Validity<'a> {
     /// No row in this column is null.
     None,
@@ -1014,6 +1015,7 @@ impl<'a> LongArrayColumn<'a> {
 /// Decimal64/128/256, Geohash, Varchar, Binary, and DOUBLE_ARRAY /
 /// LONG_ARRAY.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub enum ColumnView<'a> {
     Boolean(FixedColumn<'a, u8>),
     Byte(FixedColumn<'a, i8>),
