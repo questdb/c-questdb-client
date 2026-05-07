@@ -654,20 +654,22 @@ LINEREADER_API void line_reader_query_bind_ipv4(
     line_reader_query*, uint32_t host_order);
 
 /**
- * Bind a DECIMAL128 mantissa as two limbs (`uint64_t` low + `int64_t` high)
- * plus column scale. The combined i128 value is
- * `(int128_t)((uint128_t)value_high << 64) | value_low`.
+ * Bind a DECIMAL128 mantissa as two limbs of the standard two's-complement
+ * `int128_t` representation, plus the column's `scale`.
  *
- * Negative mantissas use `int64_t` for the high limb so the sign is
- * preserved by sign-extension into the i128: e.g. the i128 value `-1`
- * is `(value_low = UINT64_MAX, value_high = -1)`. Always pass the high
- * limb as `int64_t` — using `uint64_t` would zero-extend and corrupt
- * negative values.
+ * `mantissa_lo` is the unsigned low 64 bits; `mantissa_hi` is the signed upper
+ * 64 bits. The combined i128 value is
+ * `(int128_t)((uint128_t)mantissa_hi << 64) | mantissa_lo`.
+ *
+ * The high limb is `int64_t` so the sign extends naturally into the i128:
+ * e.g. `int128_t = -1` is `(mantissa_lo = UINT64_MAX, mantissa_hi = -1)`.
+ * Always pass the high limb as `int64_t` — using `uint64_t` zero-extends
+ * and corrupts negative values.
  */
 LINEREADER_API void line_reader_query_bind_decimal128(
     line_reader_query*,
-    uint64_t value_low,
-    int64_t value_high,
+    uint64_t mantissa_lo,
+    int64_t mantissa_hi,
     int8_t scale);
 
 /** Bind a DECIMAL256 mantissa as 32 little-endian raw bytes plus column scale.

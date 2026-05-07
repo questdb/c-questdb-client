@@ -1564,17 +1564,24 @@ pub unsafe extern "C" fn line_reader_query_bind_ipv4(
     }
 }
 
-/// Bind a DECIMAL128 value as two i64 limbs (low/high) for the i128 mantissa.
+/// Bind a DECIMAL128 mantissa as two limbs of the standard two's-complement
+/// `i128` representation, plus the column's `scale`.
+///
+/// `mantissa_lo` is the unsigned low 64 bits; `mantissa_hi` is the **signed**
+/// upper 64 bits. The high limb is `i64` so the sign extends naturally into
+/// the i128 — `mantissa_lo = UINT64_MAX, mantissa_hi = -1` reconstructs `i128 = -1`.
+/// Passing the high limb as a zero-extended `u64` corrupts negative values;
+/// always cast through `int64_t` on the caller side.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_query_bind_decimal128(
     query: *mut line_reader_query,
-    value_low: u64,
-    value_high: i64,
+    mantissa_lo: u64,
+    mantissa_hi: i64,
     scale: i8,
 ) {
     unsafe {
-        let lo = value_low as u128;
-        let hi = (value_high as i128) as u128;
+        let lo = mantissa_lo as u128;
+        let hi = (mantissa_hi as i128) as u128;
         let combined = (hi << 64) | lo;
         let value = combined as i128;
         mutate_query(query, |q| q.bind_decimal128(value, scale));

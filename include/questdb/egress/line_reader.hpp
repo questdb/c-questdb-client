@@ -760,10 +760,19 @@ public:
         ::line_reader_query_bind_decimal64(_impl, v, scale);
         return *this;
     }
-    query& bind_decimal128(uint64_t low, int64_t high, int8_t scale)
+    /**
+     * Bind a `DECIMAL128` mantissa as two limbs of the standard
+     * two's-complement i128 representation, plus the column's `scale`.
+     *
+     * `mantissa_lo` is the unsigned low 64 bits; `mantissa_hi` is the
+     * signed upper 64 bits. `i128 = -1` is
+     * `(mantissa_lo = UINT64_MAX, mantissa_hi = -1)` — always cast the
+     * high limb through `int64_t` so the sign extends correctly.
+     */
+    query& bind_decimal128(uint64_t mantissa_lo, int64_t mantissa_hi, int8_t scale)
     {
         ensure_impl();
-        ::line_reader_query_bind_decimal128(_impl, low, high, scale);
+        ::line_reader_query_bind_decimal128(_impl, mantissa_lo, mantissa_hi, scale);
         return *this;
     }
     query& bind_decimal256(const std::array<uint8_t, 32>& bytes, int8_t scale)
