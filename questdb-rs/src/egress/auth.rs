@@ -79,29 +79,35 @@ impl AuthMode {
             ));
         }
         if basic_set {
+            let user = username.unwrap();
+            let pass = password.unwrap();
+            // The server splits the decoded credential on the first ':',
+            // so a ':' in the username silently re-partitions the pair
+            // (e.g. "admin:override" + "real" → user="admin",
+            // password="override:real"). Reject it client-side rather
+            // than ship a header whose meaning depends on which colon
+            // the server picks.
+            if user.contains(':') {
+                return Err(fmt!(
+                    AuthError,
+                    "Basic auth username must not contain ':'"
+                ));
+            }
+            reject_control_bytes(user, "Basic auth username")?;
+            reject_control_bytes(pass, "Basic auth password")?;
             return Ok(AuthMode::Basic {
-                username: username.unwrap().to_string(),
-                password: password.unwrap().to_string(),
+                username: user.to_string(),
+                password: pass.to_string(),
             });
         }
         if let Some(t) = token {
-            if t.contains('\n') || t.contains('\r') {
-                return Err(fmt!(
-                    AuthError,
-                    "Bearer token must not contain CR or LF characters"
-                ));
-            }
+            reject_control_bytes(t, "Bearer token")?;
             return Ok(AuthMode::Bearer {
                 token: t.to_string(),
             });
         }
         if let Some(v) = verbatim {
-            if v.contains('\n') || v.contains('\r') {
-                return Err(fmt!(
-                    AuthError,
-                    "verbatim auth value must not contain CR or LF characters"
-                ));
-            }
+            reject_control_bytes(v, "verbatim auth value")?;
             return Ok(AuthMode::Verbatim {
                 value: v.to_string(),
             });
@@ -122,6 +128,18 @@ impl AuthMode {
             AuthMode::Verbatim { value } => Some(value.clone()),
         }
     }
+}
+
+fn reject_control_bytes(s: &str, what: &str) -> Result<()> {
+    if let Some(b) = s.bytes().find(|&b| b < 0x20 || b == 0x7F) {
+        return Err(fmt!(
+            AuthError,
+            "{} must not contain control byte 0x{:02X}",
+            what,
+            b
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -183,5 +201,66 @@ mod tests {
     fn verbatim_with_cr_rejected() {
         let err = AuthMode::from_parts(None, None, None, Some("a\rb")).unwrap_err();
         assert_eq!(err.code(), ErrorCode::AuthError);
+    }
+
+    #[test]
+    fn basic_username_with_colon_rejected() {
+        let err =
+            AuthMode::from_parts(Some("admin:override"), Some("realpass"), None, None).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::AuthError);
+    }
+
+    #[test]
+    fn basic_username_with_control_byte_rejected() {
+        for bad in ["a\nb", "a\rb", "a\0b", "a\tb", "a\x7Fb", "a\x01b"] {
+            let err = AuthMode::from_parts(Some(bad), Some("p"), None, None).unwrap_err();
+            assert_eq!(
+                err.code(),
+                ErrorCode::AuthError,
+                "expected reject for {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn basic_password_with_control_byte_rejected() {
+        for bad in ["a\nb", "a\rb", "a\0b", "a\x7Fb", "a\x01b"] {
+            let err = AuthMode::from_parts(Some("u"), Some(bad), None, None).unwrap_err();
+            assert_eq!(
+                err.code(),
+                ErrorCode::AuthError,
+                "expected reject for {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn token_with_control_byte_rejected() {
+        for bad in ["a\0b", "a\x01b", "a\x7Fb"] {
+            let err = AuthMode::from_parts(None, None, Some(bad), None).unwrap_err();
+            assert_eq!(
+                err.code(),
+                ErrorCode::AuthError,
+                "expected reject for {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn verbatim_with_control_byte_rejected() {
+        for bad in ["a\0b", "a\x01b", "a\x7Fb"] {
+            let err = AuthMode::from_parts(None, None, None, Some(bad)).unwrap_err();
+            assert_eq!(
+                err.code(),
+                ErrorCode::AuthError,
+                "expected reject for {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn basic_high_bytes_accepted() {
+        let m = AuthMode::from_parts(Some("üser"), Some("päss"), None, None).unwrap();
+        assert!(matches!(m, AuthMode::Basic { .. }));
     }
 }
