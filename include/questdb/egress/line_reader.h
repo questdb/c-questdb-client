@@ -241,7 +241,7 @@ typedef struct line_reader_query line_reader_query;
  *
  * The `config` payload is re-validated as UTF-8 on entry; a hand-rolled
  * `line_sender_utf8` carrying invalid bytes (i.e. one not built via
- * `line_sender_utf8_init`) surfaces as `LINE_READER_ERROR_INVALID_UTF8`
+ * `line_sender_utf8_init`) surfaces as `line_reader_error_invalid_utf8`
  * instead of triggering undefined behaviour.
  *
  * @param[in] config UTF-8 config string.
@@ -259,10 +259,10 @@ line_reader* line_reader_from_conf(
  * the same format as `line_reader_from_conf`.
  *
  * Returns NULL and sets `*err_out` with one of:
- *   - `LINE_READER_ERROR_CONFIG_ERROR` — `QDB_CLIENT_CONF` is not set,
+ *   - `line_reader_error_config_error` — `QDB_CLIENT_CONF` is not set,
  *     or its value is set but malformed (the parser's error code is
  *     used for the latter).
- *   - `LINE_READER_ERROR_INVALID_UTF8` — `QDB_CLIENT_CONF` is set but
+ *   - `line_reader_error_invalid_utf8` — `QDB_CLIENT_CONF` is set but
  *     its bytes are not valid UTF-8.
  *
  * On success returns a non-NULL handle that must be released with
@@ -421,13 +421,25 @@ typedef struct line_reader_failover_event line_reader_failover_event;
  *    safe from inside the callback for the same aliasing reason.
  *
  *  - Throw a C++ exception, `longjmp`, or otherwise unwind out of the
- *    callback. The trampoline crosses the C → Rust boundary; unwinding
- *    through Rust frames is undefined behaviour. Catch all exceptions
- *    inside the callback (or use an error-flag the surrounding code
- *    polls).
+ *    callback. The trampoline crosses the C -> Rust boundary; unwinding
+ *    through Rust frames is undefined behaviour. The trampoline wraps
+ *    the user callback in `catch_unwind` and `abort()`s the process if
+ *    an unwind escapes — that is the safest containable response to a
+ *    boundary violation, but it terminates the entire process. Catch
+ *    all exceptions inside the callback (or use an error-flag the
+ *    surrounding code polls).
  *
- * The callback may freely touch `event` and `user_data`; both are owned
- * by the caller's logic, not by the in-flight cursor.
+ *  - Block indefinitely or perform long-running work. The callback
+ *    runs synchronously on the thread driving the in-flight cursor
+ *    operation; while it is executing, no batch is being read, no
+ *    CREDIT is being granted to the server, the WebSocket is held
+ *    open, and `line_reader_cursor_cancel` cannot make progress (the
+ *    cursor is single-threaded). Keep the callback bounded — clear an
+ *    accumulator, set a flag, signal a condition variable — and do
+ *    any heavy work outside the cursor's drive thread.
+ *
+ * The callback may freely touch `event` and `user_data`; both are
+ * owned by the caller's logic, not by the in-flight cursor.
  *
  * The callback runs on the thread driving the in-flight cursor
  * operation.
@@ -489,7 +501,7 @@ LINEREADER_API const line_reader_server_info* line_reader_failover_event_server_
  * Returns NULL and sets `*err_out` if a query or cursor against this
  * reader is already in flight (only one may be live per reader at a
  * time), or if `sql` carries invalid UTF-8 (re-validated on entry —
- * `LINE_READER_ERROR_INVALID_UTF8`). Server-side validation of the SQL
+ * `line_reader_error_invalid_utf8`). Server-side validation of the SQL
  * itself is deferred to `line_reader_query_execute`.
  *
  * @return Query handle, or NULL on error.
@@ -518,8 +530,8 @@ void line_reader_query_free(line_reader_query* query);
  * `*query_inout` is set to NULL so that a defensive
  * `line_reader_query_free(*query_inout)` becomes a no-op. Passing NULL
  * for `query_inout` itself, or for `*query_inout`, is a contract
- * violation: the call sets `*err_out` to `INVALID_API_CALL` and returns
- * NULL.
+ * violation: the call sets `*err_out` to
+ * `line_reader_error_invalid_api_call` and returns NULL.
  *
  * On success, ownership transfers to the returned cursor; on failure,
  * `*err_out` is set and NULL is returned.
@@ -538,7 +550,7 @@ line_reader_cursor* line_reader_query_execute(
  * is NOT pushed and every subsequent `_bind_*` call on the same query is
  * a no-op — the upstream builder is frozen. This keeps placeholder
  * indices stable: a caller that ignores the deferred error and continues
- * binding will get a clean `LINE_READER_ERROR_INVALID_UTF8` from
+ * binding will get a clean `line_reader_error_invalid_utf8` from
  * `_query_execute` rather than a confusing "wrong parameter type at $K"
  * caused by index drift. To recover, drop the query and rebuild. */
 
@@ -595,7 +607,7 @@ LINEREADER_API void line_reader_query_bind_geohash(
  *  The `v` payload is re-validated as UTF-8 on entry. This function returns
  *  void, so an invalid-UTF-8 contract violation is stored on the query and
  *  surfaced from `line_reader_query_execute` as
- *  `LINE_READER_ERROR_INVALID_UTF8` (first-error-wins; later binds and the
+ *  `line_reader_error_invalid_utf8` (first-error-wins; later binds and the
  *  builder state are not touched once a deferred error is set). */
 LINEREADER_API void line_reader_query_bind_varchar(
     line_reader_query*, line_sender_utf8 v);
@@ -699,6 +711,12 @@ LINEREADER_API void line_reader_query_initial_credit(
  * not needed. The callback fires on the thread driving
  * `line_reader_cursor_next_batch`, *before* any replayed batch arrives on
  * a new connection.
+ *
+ * See `line_reader_failover_callback` for the full reentrancy contract:
+ * the callback MUST NOT call back into the originating reader / query /
+ * cursor, MUST NOT throw or `longjmp` (an escaping unwind aborts the
+ * process), and MUST NOT block — it runs synchronously in the cursor's
+ * drive thread and stalls the whole stream while it executes.
  */
 LINEREADER_API void line_reader_query_on_failover_reset(
     line_reader_query* query,
@@ -796,8 +814,8 @@ bool line_reader_cursor_column_name(
 /////////// Per-kind getters (vertical-slice subset).
 //
 // All getters return a (value, is_null) pair for `(col_idx, row_idx)`. They
-// fail with `INVALID_API_CALL` if the column kind doesn't match, the cursor
-// has no loaded batch, or the indices are out of range.
+// fail with `line_reader_error_invalid_api_call` if the column kind doesn't
+// match, the cursor has no loaded batch, or the indices are out of range.
 
 /** Read a `BOOLEAN` value. */
 LINEREADER_API
