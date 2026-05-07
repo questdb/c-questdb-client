@@ -60,7 +60,7 @@ use super::qwp_ws_queue::{
     VolatileQueueOptions,
 };
 use super::qwp_ws_sfa_queue::{
-    SfaCleanupFailure, SfaStorageFinish, SfaStorageResult, SfaStorageStep,
+    SfaCleanupFailure, SfaProducer, SfaStorageFinish, SfaStorageResult, SfaStorageStep,
 };
 
 const DEFAULT_EVENT_CAPACITY: usize = 1024;
@@ -248,6 +248,10 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
 
     pub(crate) fn take_lock_free_producer(&mut self) -> Option<LockFreeVolatileProducer> {
         self.queue.take_lock_free_producer()
+    }
+
+    pub(crate) fn take_sfa_producer(&mut self) -> Option<SfaProducer> {
+        self.queue.take_sfa_producer()
     }
 
     pub(crate) fn next_outbound_frame(
@@ -1370,6 +1374,9 @@ fn double_duration(duration: Duration) -> Duration {
 pub(crate) trait PublicationLog {
     fn try_publish(&mut self, payload: &[u8]) -> Result<QwpReceipt, DriverError>;
     fn take_lock_free_producer(&mut self) -> Option<LockFreeVolatileProducer> {
+        None
+    }
+    fn take_sfa_producer(&mut self) -> Option<SfaProducer> {
         None
     }
     fn next_outbound_frame(

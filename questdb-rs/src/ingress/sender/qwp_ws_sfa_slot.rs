@@ -44,8 +44,8 @@ use std::os::fd::AsRawFd;
 use super::qwp_ws_driver::{DriverError, PublicationLog, SendCursor};
 use super::qwp_ws_queue::{OutboundFrame, PendingPayload, QwpReceipt, QwpReceiptStatus};
 use super::qwp_ws_sfa_queue::{
-    SfaCleanupFailure, SfaFrameQueue, SfaQueueError, SfaQueueOptions, SfaStorageFinish,
-    SfaStorageResult, SfaStorageStep,
+    SfaCleanupFailure, SfaFrameQueue, SfaProducer, SfaQueueError, SfaQueueOptions,
+    SfaStorageFinish, SfaStorageResult, SfaStorageStep,
 };
 use crate::ingress::conf::{QWP_WS_DEFAULT_SENDER_ID, is_valid_qwp_ws_sender_id};
 
@@ -110,6 +110,10 @@ impl Drop for SfaSlotQueue {
 impl PublicationLog for SfaSlotQueue {
     fn try_publish(&mut self, payload: &[u8]) -> Result<QwpReceipt, DriverError> {
         Ok(self.queue.try_submit(payload)?)
+    }
+
+    fn take_sfa_producer(&mut self) -> Option<SfaProducer> {
+        self.queue.take_producer()
     }
 
     fn next_outbound_frame(

@@ -97,6 +97,12 @@ pub(crate) struct SfaSegmentScan {
     pub(crate) torn_tail_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SfaAppend {
+    pub(crate) offset: u64,
+    pub(crate) frame_end: u64,
+}
+
 #[derive(Debug)]
 pub(crate) struct SfaSegment {
     file: File,
@@ -237,6 +243,20 @@ impl SfaSegment {
     }
 
     pub(crate) fn try_append(&mut self, payload: &[u8]) -> Result<Option<u64>, SfaSegmentError> {
+        let Some(appended) = self.try_append_at(self.append_offset, payload)? else {
+            return Ok(None);
+        };
+        self.append_offset = appended.frame_end;
+        self.frame_count += 1;
+        self.torn_tail_bytes = 0;
+        Ok(Some(appended.offset))
+    }
+
+    pub(crate) fn try_append_at(
+        &self,
+        append_offset: u64,
+        payload: &[u8],
+    ) -> Result<Option<SfaAppend>, SfaSegmentError> {
         if payload.len() > i32::MAX as usize {
             return Err(SfaSegmentError::PayloadTooLarge {
                 payload_len: payload.len(),
@@ -245,15 +265,14 @@ impl SfaSegment {
         let frame_len = (FRAME_HEADER_SIZE as u64)
             .checked_add(payload.len() as u64)
             .ok_or(SfaSegmentError::OffsetOverflow)?;
-        let frame_end = self
-            .append_offset
+        let frame_end = append_offset
             .checked_add(frame_len)
             .ok_or(SfaSegmentError::OffsetOverflow)?;
         if frame_end > self.size_bytes {
             return Ok(None);
         }
 
-        let offset_u64 = self.append_offset;
+        let offset_u64 = append_offset;
         let payload_len = (payload.len() as u32).to_le_bytes();
         let crc = crc32c_update(crc32c_update(0, &payload_len), payload);
         let offset = usize::try_from(offset_u64)
@@ -265,10 +284,10 @@ impl SfaSegment {
         self.mapping.copy_from(offset + 4, &payload_len);
         self.mapping.copy_from(offset + 8, payload);
         self.mapping.copy_from(offset, &crc.to_le_bytes());
-        self.append_offset = frame_end;
-        self.frame_count += 1;
-        self.torn_tail_bytes = 0;
-        Ok(Some(offset_u64))
+        Ok(Some(SfaAppend {
+            offset: offset_u64,
+            frame_end,
+        }))
     }
 
     pub(crate) fn rebase_empty(&mut self, base_seq: u64) -> Result<(), SfaSegmentError> {
@@ -292,22 +311,39 @@ impl SfaSegment {
     }
 
     pub(crate) fn frame_offset_for_fsn(&self, fsn: u64) -> Option<u64> {
+        self.frame_offset_for_fsn_with_limit(fsn, self.frame_count, self.append_offset)
+    }
+
+    pub(crate) fn frame_offset_for_fsn_with_limit(
+        &self,
+        fsn: u64,
+        frame_count: u64,
+        append_offset: u64,
+    ) -> Option<u64> {
         if fsn < self.header.base_seq {
             return None;
         }
         let frame_index = fsn.checked_sub(self.header.base_seq)?;
-        if frame_index >= self.frame_count {
+        if frame_index >= frame_count {
             return None;
         }
         let mut pos = HEADER_SIZE as u64;
         for _ in 0..frame_index {
-            pos = self.next_frame_offset(pos)?;
+            pos = self.next_frame_offset_with_limit(pos, append_offset)?;
         }
         Some(pos)
     }
 
     pub(crate) fn mapped_payload_at_offset(&self, offset: u64) -> Option<SfaMappedPayload> {
-        self.payload_at_offset(offset)
+        self.mapped_payload_at_offset_with_limit(offset, self.append_offset)
+    }
+
+    pub(crate) fn mapped_payload_at_offset_with_limit(
+        &self,
+        offset: u64,
+        append_offset: u64,
+    ) -> Option<SfaMappedPayload> {
+        self.payload_at_offset_with_limit(offset, append_offset)
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -341,8 +377,16 @@ impl SfaSegment {
     }
 
     fn payload_at_offset(&self, offset: u64) -> Option<SfaMappedPayload> {
+        self.payload_at_offset_with_limit(offset, self.append_offset)
+    }
+
+    fn payload_at_offset_with_limit(
+        &self,
+        offset: u64,
+        append_offset: u64,
+    ) -> Option<SfaMappedPayload> {
         let offset = usize::try_from(offset).ok()?;
-        let append_offset = usize::try_from(self.append_offset).ok()?;
+        let append_offset = usize::try_from(append_offset).ok()?;
         let frame_header_end = offset.checked_add(FRAME_HEADER_SIZE)?;
         if frame_header_end > append_offset {
             return None;
@@ -367,7 +411,11 @@ impl SfaSegment {
     }
 
     fn next_frame_offset(&self, offset: u64) -> Option<u64> {
-        let payload = self.payload_at_offset(offset)?;
+        self.next_frame_offset_with_limit(offset, self.append_offset)
+    }
+
+    fn next_frame_offset_with_limit(&self, offset: u64, append_offset: u64) -> Option<u64> {
+        let payload = self.payload_at_offset_with_limit(offset, append_offset)?;
         offset
             .checked_add(FRAME_HEADER_SIZE as u64)?
             .checked_add(payload.len as u64)

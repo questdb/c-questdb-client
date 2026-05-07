@@ -59,7 +59,7 @@ use super::qwp_ws_queue::{
     QwpReceipt, QwpReceiptStatus, VolatileQueueOptions,
 };
 use super::qwp_ws_sfa_queue::{
-    SfaCleanupFailure, SfaStorageFinish, SfaStorageResult, SfaStorageStep,
+    SfaCleanupFailure, SfaProducer, SfaStorageFinish, SfaStorageResult, SfaStorageStep,
 };
 use super::qwp_ws_sfa_slot::{SfaSlotOptions, SfaSlotQueue};
 
@@ -172,6 +172,7 @@ pub(crate) struct ManualQwpWsHandlerState {
 pub(crate) struct SyncQwpWsRunner<Q = ConfiguredQwpWsQueue> {
     shared: Arc<Mutex<QwpWsPublicationStore<Q>>>,
     producer: Option<LockFreeVolatileProducer>,
+    sfa_producer: Option<SfaProducer>,
     lifecycle: PublicationLifecycle,
     backpressure: Arc<BackpressureNotifier>,
     append_deadline: Duration,
@@ -222,6 +223,7 @@ where
         let (mut store, send_core) = publisher.into_runner_parts();
         let lifecycle = store.lifecycle();
         let producer = store.take_lock_free_producer();
+        let sfa_producer = store.take_sfa_producer();
         let shared = Arc::new(Mutex::new(store));
         let backpressure = Arc::new(BackpressureNotifier::new());
         let stop = Arc::new(AtomicBool::new(false));
@@ -247,6 +249,7 @@ where
         Self {
             shared,
             producer,
+            sfa_producer,
             lifecycle,
             backpressure,
             append_deadline,
@@ -265,6 +268,26 @@ where
                     Ok(receipt) => return Ok(receipt.fsn),
                     Err(err) => {
                         let err = DriverError::Queue(err);
+                        let backpressure = driver_error_backpressure_queue(&err);
+                        if backpressure.is_some() {
+                            if !self
+                                .wait_for_publication_capacity(backpressure_generation, deadline)
+                            {
+                                return Err(driver_error_to_error_without_state(
+                                    DriverError::SubmitTimedOut { backpressure },
+                                ));
+                            }
+                            continue;
+                        }
+                        return Err(driver_error_to_error_without_state(err));
+                    }
+                }
+            }
+            if let Some(producer) = self.sfa_producer.as_mut() {
+                match producer.try_submit(payload) {
+                    Ok(receipt) => return Ok(receipt.fsn),
+                    Err(err) => {
+                        let err: DriverError = err.into();
                         let backpressure = driver_error_backpressure_queue(&err);
                         if backpressure.is_some() {
                             if !self
@@ -992,6 +1015,13 @@ impl PublicationLog for ConfiguredQwpWsQueue {
         match self {
             Self::Memory(queue) => PublicationLog::take_lock_free_producer(queue),
             Self::StoreAndForward(queue) => PublicationLog::take_lock_free_producer(queue.as_mut()),
+        }
+    }
+
+    fn take_sfa_producer(&mut self) -> Option<SfaProducer> {
+        match self {
+            Self::Memory(queue) => PublicationLog::take_sfa_producer(queue),
+            Self::StoreAndForward(queue) => PublicationLog::take_sfa_producer(queue.as_mut()),
         }
     }
 
@@ -2270,12 +2300,14 @@ fn submit_timeout_error(backpressure: Option<super::qwp_ws_queue::QueueError>) -
 #[cfg(test)]
 mod tests {
     use super::super::qwp_ws_driver::{
-        DriverError, DriverEvent, ReconnectReason, TransportFailure, TransportResponse,
-        TransportSendResult,
+        DriverError, DriverEvent, FakeOrderedServer, ReconnectReason, TransportFailure,
+        TransportResponse, TransportSendResult,
     };
     use super::super::qwp_ws_queue::{OutboundFrameView, SentFrame, VolatileFrameQueue};
+    use super::super::qwp_ws_sfa_queue::{SfaFrameQueue, SfaQueueOptions};
     use super::*;
-    use std::sync::mpsc;
+    use std::sync::{Arc, mpsc};
+    use tempfile::TempDir;
 
     #[test]
     fn backpressure_notifier_remembers_progress_before_wait() {
@@ -2807,6 +2839,45 @@ mod tests {
         });
 
         release_send_tx.send(()).unwrap();
+        drop(runner);
+    }
+
+    #[test]
+    fn threaded_sfa_publication_does_not_take_shared_store_mutex() {
+        let dir = TempDir::new().unwrap();
+        let queue = SfaFrameQueue::open(SfaQueueOptions {
+            slot_dir: dir.path().to_path_buf(),
+            segment_size_bytes: 4096,
+            max_bytes: 8192,
+            max_in_flight: 1,
+        })
+        .unwrap();
+        let driver = ManualDriverPrototype::from_queue(queue, FakeOrderedServer::no_response());
+        let publisher = QwpWsPublicationDriver::new(driver, 1);
+        let mut runner =
+            SyncQwpWsRunner::start_with_append_deadline(publisher, Duration::from_secs(5));
+        let shared = Arc::clone(&runner.shared);
+        let guard = shared.lock().unwrap();
+
+        std::thread::scope(|scope| {
+            let (published_tx, published_rx) = mpsc::channel();
+            let runner = &mut runner;
+            let publish_thread = scope.spawn(move || {
+                let result = runner.publish_replay_payload(b"sfa-first");
+                let _ = published_tx.send(result);
+            });
+
+            assert_eq!(
+                published_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap()
+                    .unwrap(),
+                0
+            );
+            publish_thread.join().unwrap();
+        });
+
+        drop(guard);
         drop(runner);
     }
 

@@ -35,6 +35,8 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error;
@@ -130,7 +132,7 @@ pub(crate) struct SfaStorageFinish {
 
 #[derive(Debug)]
 pub(crate) struct SfaStorageCleanup {
-    segment: SfaSegment,
+    segment: Arc<SfaSharedSegment>,
     path: PathBuf,
 }
 
@@ -195,7 +197,7 @@ impl SfaStorageFinish {
 }
 
 impl SfaStorageCleanup {
-    fn new(segment: SfaSegment) -> Self {
+    fn new(segment: Arc<SfaSharedSegment>) -> Self {
         let path = segment.path().to_path_buf();
         Self { segment, path }
     }
@@ -216,21 +218,40 @@ impl SfaStorageCleanup {
 
 #[derive(Debug)]
 pub(crate) struct SfaFrameQueue {
+    engine: Arc<SfaEngine>,
+    producer: Option<SfaProducer>,
+    send_cursor: Option<SfaSendCursor>,
+}
+
+#[derive(Debug)]
+pub(crate) struct SfaProducer {
+    engine: Arc<SfaEngine>,
+    active: Arc<SfaSharedSegment>,
+    active_append_offset: u64,
+    active_frame_count: u64,
+    next_fsn: u64,
+}
+
+#[derive(Debug)]
+struct SfaEngine {
     slot_dir: PathBuf,
-    active: Option<SfaSegment>,
-    sealed_segments: VecDeque<SfaSegment>,
-    hot_spare: Option<SfaSegment>,
-    allocated_segment_bytes: u64,
-    recovery_diagnostics: Vec<SfaRecoveryDiagnostic>,
     max_bytes: usize,
     segment_size_bytes: u64,
-    next_fsn: u64,
-    published_fsn: Option<u64>,
-    completed_fsn: Option<u64>,
-    rejected_fsns: Vec<u64>,
     max_in_flight: usize,
+    state: Mutex<SfaEngineState>,
+    published_upper: AtomicU64,
+    completed_upper: AtomicU64,
+    rejected_fsns: Mutex<Vec<u64>>,
+}
+
+#[derive(Debug)]
+struct SfaEngineState {
+    active: Option<Arc<SfaSharedSegment>>,
+    sealed_segments: VecDeque<Arc<SfaSharedSegment>>,
+    hot_spare: Option<Arc<SfaSharedSegment>>,
+    allocated_segment_bytes: u64,
+    recovery_diagnostics: Vec<SfaRecoveryDiagnostic>,
     next_generation: u64,
-    send_cursor: Option<SfaSendCursor>,
     closed: bool,
 }
 
@@ -269,6 +290,12 @@ impl SfaFrameQueue {
                     )
                 }
             };
+        let active = Arc::new(SfaSharedSegment::new(active));
+        let sealed_segments = sealed_segments
+            .into_iter()
+            .map(SfaSharedSegment::new)
+            .map(Arc::new)
+            .collect();
         let mut hot_spare = None;
         let mut next_generation = next_generation;
         if can_allocate_segment(
@@ -277,145 +304,93 @@ impl SfaFrameQueue {
             options.max_bytes,
         ) {
             let path = next_segment_path(&options.slot_dir, &mut next_generation)?;
-            hot_spare = Some(SfaSegment::create_new(
+            hot_spare = Some(Arc::new(SfaSharedSegment::new(SfaSegment::create_new(
                 &path,
                 next_fsn,
                 options.segment_size_bytes,
                 unix_time_micros(),
-            )?);
+            )?)));
             allocated_segment_bytes = allocated_segment_bytes
                 .checked_add(options.segment_size_bytes)
                 .ok_or(QueueError::SequenceOverflow)?;
         }
 
-        let published_fsn = next_fsn.checked_sub(1);
-        let completed_fsn = first_unresolved_fsn_from_segments(&sealed_segments, &active)
-            .and_then(|fsn| fsn.checked_sub(1));
-
-        Ok(Self {
+        let first_unresolved =
+            first_unresolved_fsn_from_segments(&sealed_segments, &active).unwrap_or(next_fsn);
+        let active_append_offset = active.published_offset();
+        let active_frame_count = active.published_frame_count();
+        let engine = Arc::new(SfaEngine {
             slot_dir: options.slot_dir,
-            active: Some(active),
-            sealed_segments,
-            hot_spare,
-            allocated_segment_bytes,
-            recovery_diagnostics,
             max_bytes: options.max_bytes,
             segment_size_bytes: options.segment_size_bytes,
-            next_fsn,
-            published_fsn,
-            completed_fsn,
-            rejected_fsns: Vec::new(),
             max_in_flight: options.max_in_flight,
-            next_generation,
+            state: Mutex::new(SfaEngineState {
+                active: Some(Arc::clone(&active)),
+                sealed_segments,
+                hot_spare,
+                allocated_segment_bytes,
+                recovery_diagnostics,
+                next_generation,
+                closed: false,
+            }),
+            published_upper: AtomicU64::new(next_fsn),
+            completed_upper: AtomicU64::new(first_unresolved),
+            rejected_fsns: Mutex::new(Vec::new()),
+        });
+        let producer = Some(SfaProducer {
+            engine: Arc::clone(&engine),
+            active,
+            active_append_offset,
+            active_frame_count,
+            next_fsn,
+        });
+
+        Ok(Self {
+            engine,
+            producer,
             send_cursor: None,
-            closed: false,
         })
     }
 
     pub(crate) fn close(&mut self) -> Result<(), SfaQueueError> {
-        if self.closed {
-            return Ok(());
-        }
-
-        let fully_drained = self.all_published_frames_resolved();
-        self.sealed_segments.clear();
-        self.hot_spare.take();
-        self.active.take();
-        self.closed = true;
-
-        if fully_drained {
-            record_all_sfa_cleanup(&self.slot_dir, &mut self.recovery_diagnostics)?;
-        }
-        Ok(())
+        self.producer.take();
+        self.engine.close()
     }
 
     pub(crate) fn try_submit(&mut self, payload: &[u8]) -> Result<QwpReceipt, SfaQueueError> {
-        self.validate_submit(payload)?;
+        let Some(producer) = self.producer.as_mut() else {
+            return Err(SfaQueueError::Closed);
+        };
+        producer.try_submit(payload)
+    }
 
-        let fsn = self.next_fsn;
-        let next_fsn = self
-            .next_fsn
-            .checked_add(1)
-            .ok_or(QueueError::SequenceOverflow)?;
-        self.append_to_active(payload)?;
-
-        self.next_fsn = next_fsn;
-        self.published_fsn = Some(fsn);
-
-        Ok(QwpReceipt { fsn })
+    pub(crate) fn take_producer(&mut self) -> Option<SfaProducer> {
+        self.producer.take()
     }
 
     pub(crate) fn complete_through_fsn(&mut self, acked_fsn: u64) -> Result<(), SfaQueueError> {
-        if self
-            .completed_fsn
-            .is_some_and(|completed_fsn| acked_fsn <= completed_fsn)
-        {
-            return Ok(());
-        }
-        let Some(published_fsn) = self.published_fsn else {
-            return Err(QueueError::ProtocolAckedUnsentFrame { fsn: acked_fsn }.into());
-        };
-        if acked_fsn > published_fsn {
-            return Err(QueueError::ProtocolAckedUnsentFrame { fsn: acked_fsn }.into());
-        }
-
-        self.apply_ack_through(acked_fsn);
-        Ok(())
+        self.engine.complete_through_fsn(acked_fsn)
     }
 
     pub(crate) fn reject_fsn(&mut self, rejected_fsn: u64) -> Result<QwpReceipt, SfaQueueError> {
-        if self
-            .published_fsn
-            .is_none_or(|published_fsn| rejected_fsn > published_fsn)
-        {
-            return Err(QueueError::ProtocolRejectedUnsentFrame { fsn: rejected_fsn }.into());
-        }
-        if !self.is_unresolved_fsn(rejected_fsn) {
-            return Err(QueueError::ProtocolRejectedUnsentFrame { fsn: rejected_fsn }.into());
-        }
-
-        self.apply_rejection(rejected_fsn);
-        if !self.rejected_fsns.contains(&rejected_fsn) {
-            self.rejected_fsns.push(rejected_fsn);
-        }
-
-        Ok(QwpReceipt { fsn: rejected_fsn })
+        self.engine.reject_fsn(rejected_fsn)
     }
 
     pub(crate) fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus {
-        let fsn = receipt.fsn;
-        if self.rejected_fsns.contains(&fsn) {
-            return QwpReceiptStatus::Rejected { fsn };
-        }
-        if self
-            .completed_fsn
-            .is_some_and(|completed_fsn| fsn <= completed_fsn)
-        {
-            return QwpReceiptStatus::Acked { fsn };
-        }
-        if self
-            .published_fsn
-            .is_none_or(|published_fsn| fsn > published_fsn)
-        {
-            return QwpReceiptStatus::Unknown { fsn };
-        }
-
-        if self.is_unresolved_fsn(fsn) {
-            return QwpReceiptStatus::Published { fsn };
-        }
-
-        QwpReceiptStatus::Unknown { fsn }
-    }
-
-    pub(crate) fn payload_for_fsn(&self, fsn: u64) -> Option<&[u8]> {
-        self.segment_for_fsn(fsn)
-            .and_then(|segment| segment.payload_slice_for_fsn(fsn))
+        self.engine.receipt_status(receipt)
     }
 
     pub(crate) fn pending_payload_for_fsn(&self, fsn: u64) -> Option<PendingPayload> {
-        self.segment_for_fsn(fsn)
+        self.engine
+            .segment_for_fsn(fsn)
             .and_then(|segment| segment.payload_for_fsn(fsn))
             .map(PendingPayload::sfa_mapped)
+    }
+
+    #[cfg(test)]
+    fn payload_vec_for_fsn(&self, fsn: u64) -> Option<Vec<u8>> {
+        self.pending_payload_for_fsn(fsn)
+            .map(|payload| payload.with_bytes(|bytes| bytes.to_vec()))
     }
 
     pub(crate) fn next_outbound_frame(
@@ -462,29 +437,7 @@ impl SfaFrameQueue {
         &mut self,
         allow_create: bool,
     ) -> Result<Option<SfaStorageStep>, SfaQueueError> {
-        if self.closed {
-            return Ok(None);
-        }
-        if let Some(step) = self.take_one_acked_sealed_segment()? {
-            return Ok(Some(step));
-        }
-        if !allow_create || self.hot_spare.is_some() {
-            return Ok(None);
-        }
-        if !can_allocate_segment(
-            self.allocated_segment_bytes,
-            self.segment_size_bytes,
-            self.max_bytes,
-        ) {
-            return Ok(None);
-        }
-        let path = self.next_segment_path()?;
-        Ok(Some(SfaStorageStep::CreateHotSpare {
-            path,
-            base_seq: self.next_fsn,
-            size_bytes: self.segment_size_bytes,
-            created_us: unix_time_micros(),
-        }))
+        self.engine.take_storage_maintenance_step(allow_create)
     }
 
     pub(crate) fn finish_storage_maintenance(
@@ -492,58 +445,20 @@ impl SfaFrameQueue {
         result: SfaStorageResult,
         allow_install: bool,
     ) -> Result<SfaStorageFinish, SfaQueueError> {
-        match result {
-            SfaStorageResult::Trimmed { cleanup_failure } => {
-                if let Some(failure) = cleanup_failure {
-                    self.record_cleanup_failure(failure);
-                }
-                Ok(SfaStorageFinish::unchanged())
-            }
-            SfaStorageResult::HotSpareCreated { segment } => {
-                if allow_install
-                    && !self.closed
-                    && self.hot_spare.is_none()
-                    && segment.frame_count() == 0
-                    && segment.size_bytes() == self.segment_size_bytes
-                    && can_allocate_segment(
-                        self.allocated_segment_bytes,
-                        self.segment_size_bytes,
-                        self.max_bytes,
-                    )
-                {
-                    self.allocated_segment_bytes = self
-                        .allocated_segment_bytes
-                        .checked_add(self.segment_size_bytes)
-                        .ok_or(QueueError::SequenceOverflow)?;
-                    self.hot_spare = Some(segment);
-                    Ok(SfaStorageFinish::changed())
-                } else {
-                    Ok(SfaStorageFinish::cleanup(SfaStorageCleanup::new(segment)))
-                }
-            }
-        }
+        self.engine
+            .finish_storage_maintenance(result, allow_install)
     }
 
     pub(crate) fn record_cleanup_failure(&mut self, failure: SfaCleanupFailure) {
-        self.recovery_diagnostics
-            .push(SfaRecoveryDiagnostic::CleanupFailed {
-                path: failure.path,
-                error: failure.error,
-            });
+        self.engine.record_cleanup_failure(failure);
     }
 
     pub(crate) fn oldest_unresolved_fsn(&self) -> Option<u64> {
-        self.oldest_unresolved_fsn_from_watermark()
+        self.engine.oldest_unresolved_fsn()
     }
 
     pub(crate) fn len(&self) -> usize {
-        let Some(oldest) = self.oldest_unresolved_fsn() else {
-            return 0;
-        };
-        self.published_fsn
-            .and_then(|published| published.checked_sub(oldest))
-            .and_then(|delta| usize::try_from(delta.saturating_add(1)).ok())
-            .unwrap_or(usize::MAX)
+        self.engine.len()
     }
 
     pub(crate) fn bytes_used(&self) -> usize {
@@ -551,148 +466,19 @@ impl SfaFrameQueue {
     }
 
     pub(crate) fn published_fsn(&self) -> Option<u64> {
-        self.published_fsn
+        self.engine.published_fsn()
     }
 
     pub(crate) fn completed_fsn(&self) -> Option<u64> {
-        self.completed_fsn
+        self.engine.completed_fsn()
     }
 
     pub(crate) fn max_in_flight(&self) -> usize {
-        self.max_in_flight
+        self.engine.max_in_flight()
     }
 
-    pub(crate) fn recovery_diagnostics(&self) -> &[SfaRecoveryDiagnostic] {
-        &self.recovery_diagnostics
-    }
-
-    fn validate_submit(&self, payload: &[u8]) -> Result<(), QueueError> {
-        if payload.is_empty() {
-            return Err(QueueError::EmptyPayload);
-        }
-        let segment_payload_capacity = self.segment_payload_capacity();
-        if payload.len() > segment_payload_capacity {
-            return Err(QueueError::PayloadExceedsByteCapacity {
-                payload_len: payload.len(),
-                max_bytes: segment_payload_capacity,
-            });
-        }
-        Ok(())
-    }
-
-    fn append_to_active(&mut self, payload: &[u8]) -> Result<(), SfaQueueError> {
-        if self.active_mut()?.try_append(payload)?.is_some() {
-            return Ok(());
-        }
-
-        self.rotate_active()?;
-        if self.active_mut()?.try_append(payload)?.is_some() {
-            Ok(())
-        } else {
-            Err(QueueError::PayloadExceedsByteCapacity {
-                payload_len: payload.len(),
-                max_bytes: self.segment_payload_capacity(),
-            }
-            .into())
-        }
-    }
-
-    fn rotate_active(&mut self) -> Result<(), SfaQueueError> {
-        let active = self.active.take().ok_or(SfaQueueError::Closed)?;
-        if active.frame_count() == 0 {
-            self.active = Some(active);
-            return Err(SfaQueueError::CorruptSegments {
-                reason: "active segment filled before any frame was appended",
-            });
-        }
-
-        let Some(mut new_active) = self.hot_spare.take() else {
-            self.active = Some(active);
-            return Err(self.storage_backpressure_error().into());
-        };
-        if let Err(err) = new_active.rebase_empty(self.next_fsn) {
-            // `rebase_empty` validates before mutating the segment, so
-            // `new_active` is unchanged on the error path. Restore both halves
-            // so the queue stays operable instead of going permanently
-            // `Closed` with `allocated_segment_bytes` still counting both.
-            self.hot_spare = Some(new_active);
-            self.active = Some(active);
-            return Err(err.into());
-        }
-        self.sealed_segments.push_back(active);
-        self.active = Some(new_active);
-        Ok(())
-    }
-
-    fn next_segment_path(&mut self) -> Result<PathBuf, QueueError> {
-        next_segment_path(&self.slot_dir, &mut self.next_generation)
-    }
-
-    fn storage_backpressure_error(&self) -> QueueError {
-        if can_allocate_segment(
-            self.allocated_segment_bytes,
-            self.segment_size_bytes,
-            self.max_bytes,
-        ) {
-            QueueError::StorageSpareNotReady {
-                segment_size_bytes: self.segment_size_bytes,
-                allocated_segment_bytes: self.allocated_segment_bytes,
-                max_total_bytes: self.max_bytes as u64,
-            }
-        } else {
-            QueueError::StorageSegmentCapFull {
-                segment_size_bytes: self.segment_size_bytes,
-                allocated_segment_bytes: self.allocated_segment_bytes,
-                max_total_bytes: self.max_bytes as u64,
-            }
-        }
-    }
-
-    fn take_one_acked_sealed_segment(&mut self) -> Result<Option<SfaStorageStep>, SfaQueueError> {
-        let Some(acked_fsn) = self.completed_fsn else {
-            return Ok(None);
-        };
-
-        let Some(segment) = self.sealed_segments.front() else {
-            return Ok(None);
-        };
-        let last_fsn = segment.last_fsn().ok_or(SfaQueueError::CorruptSegments {
-            reason: "sealed segment has no frames",
-        })?;
-        if last_fsn > acked_fsn {
-            return Ok(None);
-        }
-        let segment = self.sealed_segments.pop_front().unwrap();
-        let segment_size_bytes = segment.size_bytes();
-
-        self.allocated_segment_bytes = self
-            .allocated_segment_bytes
-            .saturating_sub(segment_size_bytes);
-        Ok(Some(SfaStorageStep::Trim(SfaStorageCleanup::new(segment))))
-    }
-
-    fn apply_ack_through(&mut self, acked_fsn: u64) {
-        if self.is_unresolved_fsn(acked_fsn) {
-            self.completed_fsn = Some(acked_fsn);
-        }
-    }
-
-    fn apply_rejection(&mut self, rejected_fsn: u64) {
-        self.apply_ack_through(rejected_fsn);
-    }
-
-    fn segment_payload_capacity(&self) -> usize {
-        segment_payload_capacity(self.segment_size_bytes)
-    }
-
-    fn segment_for_fsn(&self, fsn: u64) -> Option<&SfaSegment> {
-        self.sealed_segments
-            .iter()
-            .chain(self.active.iter())
-            .find(|segment| {
-                fsn >= segment.header().base_seq
-                    && segment.last_fsn().is_some_and(|last_fsn| fsn <= last_fsn)
-            })
+    pub(crate) fn recovery_diagnostics(&self) -> Vec<SfaRecoveryDiagnostic> {
+        self.engine.recovery_diagnostics()
     }
 
     fn next_cursor_payload_for_fsn(
@@ -712,7 +498,7 @@ impl SfaFrameQueue {
                 self.send_cursor = None;
                 return Ok(None);
             };
-            if segment.header().base_seq != cursor.segment_base_seq {
+            if segment.base_seq() != cursor.segment_base_seq {
                 self.send_cursor = None;
                 return Ok(None);
             }
@@ -720,7 +506,7 @@ impl SfaFrameQueue {
                 self.send_cursor = None;
                 return Ok(None);
             };
-            (payload, segment.append_offset())
+            (payload, segment.published_offset())
         };
         let next_fsn = fsn.checked_add(1).ok_or(QueueError::SequenceOverflow)?;
         let next_offset = cursor
@@ -739,7 +525,7 @@ impl SfaFrameQueue {
             return None;
         }
         let segment = self.segment_at_position(cursor.segment)?;
-        (segment.header().base_seq == cursor.segment_base_seq).then_some(cursor)
+        (segment.base_seq() == cursor.segment_base_seq).then_some(cursor)
     }
 
     fn position_send_cursor_for_fsn(&self, fsn: u64) -> Option<SfaSendCursor> {
@@ -749,7 +535,7 @@ impl SfaFrameQueue {
         Some(SfaSendCursor {
             fsn,
             segment,
-            segment_base_seq: segment_ref.header().base_seq,
+            segment_base_seq: segment_ref.base_seq(),
             offset,
         })
     }
@@ -773,12 +559,12 @@ impl SfaFrameQueue {
             && let Some(next_segment) = self
                 .next_segment_position(cursor.segment)
                 .and_then(|segment| self.segment_at_position(segment).map(|s| (segment, s)))
-                .filter(|(_, segment)| segment.header().base_seq == next_fsn)
+                .filter(|(_, segment)| segment.base_seq() == next_fsn)
         {
             return SfaSendCursor {
                 fsn: next_fsn,
                 segment: next_segment.0,
-                segment_base_seq: next_segment.1.header().base_seq,
+                segment_base_seq: next_segment.1.base_seq(),
                 offset: HEADER_SIZE as u64,
             };
         }
@@ -791,83 +577,555 @@ impl SfaFrameQueue {
     }
 
     fn segment_position_for_fsn(&self, fsn: u64) -> Option<SfaCursorSegment> {
-        self.sealed_segments
+        let snapshot = self.engine.segments_snapshot();
+        snapshot
+            .sealed_segments
             .iter()
             .enumerate()
             .find(|(_, segment)| {
-                fsn >= segment.header().base_seq
+                fsn >= segment.base_seq()
                     && segment.last_fsn().is_some_and(|last_fsn| fsn <= last_fsn)
             })
             .map(|(index, _)| SfaCursorSegment::Sealed(index))
             .or_else(|| {
-                self.active
-                    .as_ref()
+                snapshot
+                    .active
                     .filter(|segment| {
-                        fsn >= segment.header().base_seq
+                        fsn >= segment.base_seq()
                             && segment.last_fsn().is_some_and(|last_fsn| fsn <= last_fsn)
                     })
                     .map(|_| SfaCursorSegment::Active)
             })
     }
 
-    fn segment_at_position(&self, segment: SfaCursorSegment) -> Option<&SfaSegment> {
+    fn segment_at_position(&self, segment: SfaCursorSegment) -> Option<Arc<SfaSharedSegment>> {
+        let snapshot = self.engine.segments_snapshot();
         match segment {
-            SfaCursorSegment::Sealed(index) => self.sealed_segments.get(index),
-            SfaCursorSegment::Active => self.active.as_ref(),
+            SfaCursorSegment::Sealed(index) => snapshot.sealed_segments.get(index).cloned(),
+            SfaCursorSegment::Active => snapshot.active,
         }
     }
 
     fn next_segment_position(&self, segment: SfaCursorSegment) -> Option<SfaCursorSegment> {
+        let snapshot = self.engine.segments_snapshot();
         match segment {
             SfaCursorSegment::Sealed(index) => {
-                if index + 1 < self.sealed_segments.len() {
+                if index + 1 < snapshot.sealed_segments.len() {
                     Some(SfaCursorSegment::Sealed(index + 1))
                 } else {
-                    self.active.as_ref().map(|_| SfaCursorSegment::Active)
+                    snapshot.active.map(|_| SfaCursorSegment::Active)
                 }
             }
             SfaCursorSegment::Active => None,
         }
     }
 
-    fn is_unresolved_fsn(&self, fsn: u64) -> bool {
-        let Some(oldest) = self.oldest_unresolved_fsn_from_watermark() else {
-            return false;
-        };
-        self.published_fsn
-            .is_some_and(|published| fsn >= oldest && fsn <= published)
+    #[cfg(test)]
+    fn sealed_segment_count(&self) -> usize {
+        self.engine.segments_snapshot().sealed_segments.len()
     }
 
-    fn oldest_unresolved_fsn_from_watermark(&self) -> Option<u64> {
-        let published = self.published_fsn?;
-        let oldest = match self.completed_fsn {
-            Some(completed) => completed.checked_add(1)?,
-            None => 0,
-        };
-        (oldest <= published).then_some(oldest)
+    #[cfg(test)]
+    fn allocated_segment_bytes(&self) -> u64 {
+        self.engine
+            .with_state(|state| state.allocated_segment_bytes)
     }
 
-    fn all_published_frames_resolved(&self) -> bool {
-        match self.published_fsn {
-            None => true,
-            Some(published_fsn) => self
-                .completed_fsn
-                .is_some_and(|completed_fsn| completed_fsn >= published_fsn),
+    #[cfg(test)]
+    fn hot_spare_installed(&self) -> bool {
+        self.engine.with_state(|state| state.hot_spare.is_some())
+    }
+
+    #[cfg(test)]
+    fn send_cursor_segment(&self) -> Option<SfaCursorSegment> {
+        self.send_cursor.map(|cursor| cursor.segment)
+    }
+}
+
+impl SfaProducer {
+    pub(crate) fn try_submit(&mut self, payload: &[u8]) -> Result<QwpReceipt, SfaQueueError> {
+        self.engine.validate_submit(payload)?;
+        let fsn = self.next_fsn;
+        let next_fsn = fsn.checked_add(1).ok_or(QueueError::SequenceOverflow)?;
+        if self.append_to_active(payload)? {
+            self.publish(next_fsn);
+            return Ok(QwpReceipt { fsn });
+        }
+
+        self.rotate_active()?;
+        if self.append_to_active(payload)? {
+            self.publish(next_fsn);
+            Ok(QwpReceipt { fsn })
+        } else {
+            Err(QueueError::PayloadExceedsByteCapacity {
+                payload_len: payload.len(),
+                max_bytes: self.engine.segment_payload_capacity(),
+            }
+            .into())
         }
     }
 
-    fn active_ref(&self) -> Result<&SfaSegment, SfaQueueError> {
-        self.active.as_ref().ok_or(SfaQueueError::Closed)
+    fn append_to_active(&mut self, payload: &[u8]) -> Result<bool, SfaQueueError> {
+        let Some(appended) = self
+            .active
+            .try_append_at(self.active_append_offset, payload)?
+        else {
+            return Ok(false);
+        };
+        self.active_append_offset = appended.frame_end;
+        self.active_frame_count = self
+            .active_frame_count
+            .checked_add(1)
+            .ok_or(QueueError::SequenceOverflow)?;
+        self.active
+            .publish(self.active_append_offset, self.active_frame_count);
+        Ok(true)
     }
 
-    fn active_mut(&mut self) -> Result<&mut SfaSegment, SfaQueueError> {
-        self.active.as_mut().ok_or(SfaQueueError::Closed)
+    fn publish(&mut self, next_fsn: u64) {
+        self.next_fsn = next_fsn;
+        self.engine
+            .published_upper
+            .store(next_fsn, Ordering::Release);
+    }
+
+    fn rotate_active(&mut self) -> Result<(), SfaQueueError> {
+        if self.active_frame_count == 0 {
+            return Err(SfaQueueError::CorruptSegments {
+                reason: "active segment filled before any frame was appended",
+            });
+        }
+
+        let mut state = self.engine.lock_state()?;
+        let active = state.active.as_ref().ok_or(SfaQueueError::Closed)?;
+        if !Arc::ptr_eq(active, &self.active) {
+            return Err(SfaQueueError::CorruptSegments {
+                reason: "producer active segment is not the engine active segment",
+            });
+        }
+        let Some(mut new_active) = state.hot_spare.take() else {
+            return Err(self.engine.storage_backpressure_error(&state).into());
+        };
+        if let Some(shared) = Arc::get_mut(&mut new_active) {
+            shared.rebase_empty(self.next_fsn)?;
+        } else {
+            state.hot_spare = Some(new_active);
+            return Err(SfaQueueError::CorruptSegments {
+                reason: "hot spare segment is shared before promotion",
+            });
+        }
+
+        let old_active = state.active.replace(Arc::clone(&new_active)).unwrap();
+        state.sealed_segments.push_back(old_active);
+        drop(state);
+
+        self.active = new_active;
+        self.active_append_offset = HEADER_SIZE as u64;
+        self.active_frame_count = 0;
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct SfaSegmentsSnapshot {
+    sealed_segments: Vec<Arc<SfaSharedSegment>>,
+    active: Option<Arc<SfaSharedSegment>>,
+}
+
+impl SfaEngine {
+    fn close(&self) -> Result<(), SfaQueueError> {
+        let fully_drained = self.all_published_frames_resolved();
+        let mut state = self.lock_state()?;
+        if state.closed {
+            return Ok(());
+        }
+        state.sealed_segments.clear();
+        state.hot_spare.take();
+        state.active.take();
+        state.closed = true;
+
+        if fully_drained {
+            record_all_sfa_cleanup(&self.slot_dir, &mut state.recovery_diagnostics)?;
+        }
+        Ok(())
+    }
+
+    fn validate_submit(&self, payload: &[u8]) -> Result<(), QueueError> {
+        if payload.is_empty() {
+            return Err(QueueError::EmptyPayload);
+        }
+        let segment_payload_capacity = self.segment_payload_capacity();
+        if payload.len() > segment_payload_capacity {
+            return Err(QueueError::PayloadExceedsByteCapacity {
+                payload_len: payload.len(),
+                max_bytes: segment_payload_capacity,
+            });
+        }
+        Ok(())
+    }
+
+    fn complete_through_fsn(&self, acked_fsn: u64) -> Result<(), SfaQueueError> {
+        let target_upper = acked_fsn
+            .checked_add(1)
+            .ok_or(QueueError::ProtocolAckedUnsentFrame { fsn: acked_fsn })?;
+        let completed = self.completed_upper.load(Ordering::Acquire);
+        if target_upper <= completed {
+            return Ok(());
+        }
+        let published = self.published_upper.load(Ordering::Acquire);
+        if target_upper > published {
+            return Err(QueueError::ProtocolAckedUnsentFrame { fsn: acked_fsn }.into());
+        }
+        self.completed_upper.store(target_upper, Ordering::Release);
+        Ok(())
+    }
+
+    fn reject_fsn(&self, rejected_fsn: u64) -> Result<QwpReceipt, SfaQueueError> {
+        if !self.is_unresolved_fsn(rejected_fsn) {
+            return Err(QueueError::ProtocolRejectedUnsentFrame { fsn: rejected_fsn }.into());
+        }
+        let target_upper = rejected_fsn
+            .checked_add(1)
+            .ok_or(QueueError::ProtocolRejectedUnsentFrame { fsn: rejected_fsn })?;
+        {
+            let mut rejected = self.lock_rejected_fsns()?;
+            if !rejected.contains(&rejected_fsn) {
+                rejected.push(rejected_fsn);
+            }
+        }
+        self.completed_upper.store(target_upper, Ordering::Release);
+        Ok(QwpReceipt { fsn: rejected_fsn })
+    }
+
+    fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus {
+        let fsn = receipt.fsn;
+        if let Ok(rejected) = self.rejected_fsns.lock()
+            && rejected.contains(&fsn)
+        {
+            return QwpReceiptStatus::Rejected { fsn };
+        }
+        if fsn < self.completed_upper.load(Ordering::Acquire) {
+            return QwpReceiptStatus::Acked { fsn };
+        }
+        if fsn >= self.published_upper.load(Ordering::Acquire) {
+            return QwpReceiptStatus::Unknown { fsn };
+        }
+        QwpReceiptStatus::Published { fsn }
+    }
+
+    fn segment_for_fsn(&self, fsn: u64) -> Option<Arc<SfaSharedSegment>> {
+        let snapshot = self.segments_snapshot();
+        snapshot
+            .sealed_segments
+            .into_iter()
+            .chain(snapshot.active)
+            .find(|segment| {
+                fsn >= segment.base_seq()
+                    && segment.last_fsn().is_some_and(|last_fsn| fsn <= last_fsn)
+            })
+    }
+
+    fn take_storage_maintenance_step(
+        &self,
+        allow_create: bool,
+    ) -> Result<Option<SfaStorageStep>, SfaQueueError> {
+        let mut state = self.lock_state()?;
+        if state.closed {
+            return Ok(None);
+        }
+        if let Some(step) = self.take_one_acked_sealed_segment(&mut state)? {
+            return Ok(Some(step));
+        }
+        if !allow_create || state.hot_spare.is_some() {
+            return Ok(None);
+        }
+        if !can_allocate_segment(
+            state.allocated_segment_bytes,
+            self.segment_size_bytes,
+            self.max_bytes,
+        ) {
+            return Ok(None);
+        }
+        let path = next_segment_path(&self.slot_dir, &mut state.next_generation)?;
+        Ok(Some(SfaStorageStep::CreateHotSpare {
+            path,
+            base_seq: self.published_upper.load(Ordering::Acquire),
+            size_bytes: self.segment_size_bytes,
+            created_us: unix_time_micros(),
+        }))
+    }
+
+    fn finish_storage_maintenance(
+        &self,
+        result: SfaStorageResult,
+        allow_install: bool,
+    ) -> Result<SfaStorageFinish, SfaQueueError> {
+        match result {
+            SfaStorageResult::Trimmed { cleanup_failure } => {
+                if let Some(failure) = cleanup_failure {
+                    self.record_cleanup_failure(failure);
+                }
+                Ok(SfaStorageFinish::unchanged())
+            }
+            SfaStorageResult::HotSpareCreated { segment } => {
+                let segment = Arc::new(SfaSharedSegment::new(segment));
+                let mut state = self.lock_state()?;
+                if allow_install
+                    && !state.closed
+                    && state.hot_spare.is_none()
+                    && segment.published_frame_count() == 0
+                    && segment.size_bytes() == self.segment_size_bytes
+                    && can_allocate_segment(
+                        state.allocated_segment_bytes,
+                        self.segment_size_bytes,
+                        self.max_bytes,
+                    )
+                {
+                    state.allocated_segment_bytes = state
+                        .allocated_segment_bytes
+                        .checked_add(self.segment_size_bytes)
+                        .ok_or(QueueError::SequenceOverflow)?;
+                    state.hot_spare = Some(segment);
+                    Ok(SfaStorageFinish::changed())
+                } else {
+                    Ok(SfaStorageFinish::cleanup(SfaStorageCleanup::new(segment)))
+                }
+            }
+        }
+    }
+
+    fn record_cleanup_failure(&self, failure: SfaCleanupFailure) {
+        if let Ok(mut state) = self.state.lock() {
+            state
+                .recovery_diagnostics
+                .push(SfaRecoveryDiagnostic::CleanupFailed {
+                    path: failure.path,
+                    error: failure.error,
+                });
+        }
+    }
+
+    fn oldest_unresolved_fsn(&self) -> Option<u64> {
+        let completed = self.completed_upper.load(Ordering::Acquire);
+        let published = self.published_upper.load(Ordering::Acquire);
+        (completed < published).then_some(completed)
+    }
+
+    fn len(&self) -> usize {
+        let completed = self.completed_upper.load(Ordering::Acquire);
+        let published = self.published_upper.load(Ordering::Acquire);
+        if completed >= published {
+            return 0;
+        }
+        usize::try_from(published - completed).unwrap_or(usize::MAX)
+    }
+
+    fn published_fsn(&self) -> Option<u64> {
+        self.published_upper.load(Ordering::Acquire).checked_sub(1)
+    }
+
+    fn completed_fsn(&self) -> Option<u64> {
+        self.completed_upper.load(Ordering::Acquire).checked_sub(1)
+    }
+
+    fn max_in_flight(&self) -> usize {
+        self.max_in_flight
+    }
+
+    fn recovery_diagnostics(&self) -> Vec<SfaRecoveryDiagnostic> {
+        self.with_state(|state| state.recovery_diagnostics.clone())
+    }
+
+    fn segment_payload_capacity(&self) -> usize {
+        segment_payload_capacity(self.segment_size_bytes)
+    }
+
+    fn storage_backpressure_error(&self, state: &SfaEngineState) -> QueueError {
+        if can_allocate_segment(
+            state.allocated_segment_bytes,
+            self.segment_size_bytes,
+            self.max_bytes,
+        ) {
+            QueueError::StorageSpareNotReady {
+                segment_size_bytes: self.segment_size_bytes,
+                allocated_segment_bytes: state.allocated_segment_bytes,
+                max_total_bytes: self.max_bytes as u64,
+            }
+        } else {
+            QueueError::StorageSegmentCapFull {
+                segment_size_bytes: self.segment_size_bytes,
+                allocated_segment_bytes: state.allocated_segment_bytes,
+                max_total_bytes: self.max_bytes as u64,
+            }
+        }
+    }
+
+    fn take_one_acked_sealed_segment(
+        &self,
+        state: &mut SfaEngineState,
+    ) -> Result<Option<SfaStorageStep>, SfaQueueError> {
+        let Some(acked_fsn) = self.completed_fsn() else {
+            return Ok(None);
+        };
+        let Some(segment) = state.sealed_segments.front() else {
+            return Ok(None);
+        };
+        let last_fsn = segment.last_fsn().ok_or(SfaQueueError::CorruptSegments {
+            reason: "sealed segment has no frames",
+        })?;
+        if last_fsn > acked_fsn {
+            return Ok(None);
+        }
+        let segment = state.sealed_segments.pop_front().unwrap();
+        state.allocated_segment_bytes = state
+            .allocated_segment_bytes
+            .saturating_sub(segment.size_bytes());
+        Ok(Some(SfaStorageStep::Trim(SfaStorageCleanup::new(segment))))
+    }
+
+    fn all_published_frames_resolved(&self) -> bool {
+        let published = self.published_upper.load(Ordering::Acquire);
+        let completed = self.completed_upper.load(Ordering::Acquire);
+        completed >= published
+    }
+
+    fn is_unresolved_fsn(&self, fsn: u64) -> bool {
+        let completed = self.completed_upper.load(Ordering::Acquire);
+        let published = self.published_upper.load(Ordering::Acquire);
+        fsn >= completed && fsn < published
+    }
+
+    fn segments_snapshot(&self) -> SfaSegmentsSnapshot {
+        self.with_state(|state| SfaSegmentsSnapshot {
+            sealed_segments: state.sealed_segments.iter().cloned().collect(),
+            active: state.active.as_ref().cloned(),
+        })
+    }
+
+    fn with_state<R>(&self, f: impl FnOnce(&SfaEngineState) -> R) -> R {
+        match self.state.lock() {
+            Ok(state) => f(&state),
+            Err(poisoned) => f(&poisoned.into_inner()),
+        }
+    }
+
+    fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, SfaEngineState>, SfaQueueError> {
+        self.state.lock().map_err(|_| SfaQueueError::Closed)
+    }
+
+    fn lock_rejected_fsns(&self) -> Result<std::sync::MutexGuard<'_, Vec<u64>>, SfaQueueError> {
+        self.rejected_fsns.lock().map_err(|_| SfaQueueError::Closed)
+    }
+}
+
+#[derive(Debug)]
+struct SfaSharedSegment {
+    segment: SfaSegment,
+    published_offset: AtomicU64,
+    published_frame_count: AtomicU64,
+}
+
+impl SfaSharedSegment {
+    fn new(segment: SfaSegment) -> Self {
+        Self {
+            published_offset: AtomicU64::new(segment.append_offset()),
+            published_frame_count: AtomicU64::new(segment.frame_count()),
+            segment,
+        }
+    }
+
+    fn try_append_at(
+        &self,
+        append_offset: u64,
+        payload: &[u8],
+    ) -> Result<Option<super::qwp_ws_sfa_segment::SfaAppend>, SfaSegmentError> {
+        self.segment.try_append_at(append_offset, payload)
+    }
+
+    fn publish(&self, append_offset: u64, frame_count: u64) {
+        // `published_offset` is the canonical byte-visibility barrier for the
+        // segment. The producer writes length, payload, and CRC first, then
+        // stores this offset with `Release`; readers `Acquire` it before
+        // interpreting bytes below the cursor.
+        self.published_frame_count
+            .store(frame_count, Ordering::Relaxed);
+        self.published_offset
+            .store(append_offset, Ordering::Release);
+    }
+
+    fn rebase_empty(&mut self, base_seq: u64) -> Result<(), SfaSegmentError> {
+        self.segment.rebase_empty(base_seq)?;
+        self.published_frame_count.store(0, Ordering::Relaxed);
+        self.published_offset
+            .store(HEADER_SIZE as u64, Ordering::Release);
+        Ok(())
+    }
+
+    fn payload_for_fsn(&self, fsn: u64) -> Option<super::qwp_ws_sfa_segment::SfaMappedPayload> {
+        let published_offset = self.published_offset();
+        let frame_count = self.published_frame_count_after_offset();
+        let offset =
+            self.segment
+                .frame_offset_for_fsn_with_limit(fsn, frame_count, published_offset)?;
+        self.segment
+            .mapped_payload_at_offset_with_limit(offset, published_offset)
+    }
+
+    fn mapped_payload_at_offset(
+        &self,
+        offset: u64,
+    ) -> Option<super::qwp_ws_sfa_segment::SfaMappedPayload> {
+        let published_offset = self.published_offset();
+        self.segment
+            .mapped_payload_at_offset_with_limit(offset, published_offset)
+    }
+
+    fn frame_offset_for_fsn(&self, fsn: u64) -> Option<u64> {
+        let published_offset = self.published_offset();
+        let frame_count = self.published_frame_count_after_offset();
+        self.segment
+            .frame_offset_for_fsn_with_limit(fsn, frame_count, published_offset)
+    }
+
+    fn last_fsn(&self) -> Option<u64> {
+        self.published_frame_count_after_offset()
+            .checked_sub(1)
+            .and_then(|last_index| self.base_seq().checked_add(last_index))
+    }
+
+    fn path(&self) -> &Path {
+        self.segment.path()
+    }
+
+    fn base_seq(&self) -> u64 {
+        self.segment.header().base_seq
+    }
+
+    fn published_offset(&self) -> u64 {
+        self.published_offset.load(Ordering::Acquire)
+    }
+
+    fn published_frame_count(&self) -> u64 {
+        self.published_frame_count.load(Ordering::Acquire)
+    }
+
+    fn published_frame_count_after_offset(&self) -> u64 {
+        let _ = self.published_offset();
+        self.published_frame_count()
+    }
+
+    fn size_bytes(&self) -> u64 {
+        self.segment.size_bytes()
     }
 }
 
 impl PublicationLog for SfaFrameQueue {
     fn try_publish(&mut self, payload: &[u8]) -> Result<QwpReceipt, DriverError> {
         Ok(SfaFrameQueue::try_submit(self, payload)?)
+    }
+
+    fn take_sfa_producer(&mut self) -> Option<SfaProducer> {
+        SfaFrameQueue::take_producer(self)
     }
 
     fn next_outbound_frame(
@@ -1239,13 +1497,13 @@ fn segment_payload_capacity(segment_size_bytes: u64) -> usize {
 }
 
 fn first_unresolved_fsn_from_segments(
-    sealed_segments: &VecDeque<SfaSegment>,
-    active: &SfaSegment,
+    sealed_segments: &VecDeque<Arc<SfaSharedSegment>>,
+    active: &Arc<SfaSharedSegment>,
 ) -> Option<u64> {
     sealed_segments
         .front()
-        .map(|segment| segment.header().base_seq)
-        .or_else(|| (active.frame_count() > 0).then(|| active.header().base_seq))
+        .map(|segment| segment.base_seq())
+        .or_else(|| (active.published_frame_count() > 0).then(|| active.base_seq()))
 }
 
 #[cfg(test)]
@@ -1390,8 +1648,11 @@ mod tests {
         assert_eq!(queue.published_fsn(), Some(43));
         assert_eq!(queue.completed_fsn(), Some(41));
         assert_eq!(queue.oldest_unresolved_fsn(), Some(42));
-        assert_eq!(queue.payload_for_fsn(42), Some(&b"one"[..]));
-        assert_eq!(queue.payload_for_fsn(43), Some(&b"two-two"[..]));
+        assert_eq!(queue.payload_vec_for_fsn(42).as_deref(), Some(&b"one"[..]));
+        assert_eq!(
+            queue.payload_vec_for_fsn(43).as_deref(),
+            Some(&b"two-two"[..])
+        );
     }
 
     #[test]
@@ -1421,8 +1682,11 @@ mod tests {
         let queue = SfaFrameQueue::open(options_with(&dir, 256, 1024, 4)).unwrap();
 
         assert_eq!(queue.len(), 2);
-        assert_eq!(queue.payload_for_fsn(42), Some(&b"one"[..]));
-        assert_eq!(queue.payload_for_fsn(43), Some(&b"two-two"[..]));
+        assert_eq!(queue.payload_vec_for_fsn(42).as_deref(), Some(&b"one"[..]));
+        assert_eq!(
+            queue.payload_vec_for_fsn(43).as_deref(),
+            Some(&b"two-two"[..])
+        );
     }
 
     #[test]
@@ -1461,7 +1725,7 @@ mod tests {
         let queue = open(&dir);
 
         assert_eq!(queue.len(), 1);
-        assert_eq!(queue.payload_for_fsn(0), Some(&b"first"[..]));
+        assert_eq!(queue.payload_vec_for_fsn(0).as_deref(), Some(&b"first"[..]));
         assert!(!spare_path.exists());
         assert!(corrupt_spare_path.exists());
     }
@@ -1481,12 +1745,16 @@ mod tests {
         let queue = open(&dir);
 
         assert_eq!(queue.len(), 2);
-        assert_eq!(queue.payload_for_fsn(0), Some(&b"first"[..]));
-        assert_eq!(queue.payload_for_fsn(1), Some(&b"second"[..]));
+        assert_eq!(queue.payload_vec_for_fsn(0).as_deref(), Some(&b"first"[..]));
+        assert_eq!(
+            queue.payload_vec_for_fsn(1).as_deref(),
+            Some(&b"second"[..])
+        );
         assert!(bad_side_path.exists());
         assert!(!bad_side_corrupt_path.exists());
+        let diagnostics = queue.recovery_diagnostics();
         assert!(matches!(
-            queue.recovery_diagnostics(),
+            diagnostics.as_slice(),
             [SfaRecoveryDiagnostic::SkippedSegment { path, .. }]
                 if path == &bad_side_path
         ));
@@ -1531,10 +1799,10 @@ mod tests {
         let queue = open(&dir);
 
         assert_eq!(queue.len(), 1);
-        assert_eq!(queue.payload_for_fsn(42), Some(&b"one"[..]));
+        assert_eq!(queue.payload_vec_for_fsn(42).as_deref(), Some(&b"one"[..]));
         assert_eq!(
             queue.recovery_diagnostics(),
-            &[SfaRecoveryDiagnostic::NonEmptyTornTail {
+            vec![SfaRecoveryDiagnostic::NonEmptyTornTail {
                 path: initial_path,
                 torn_tail_bytes: 29,
                 append_offset: 35,
@@ -1568,7 +1836,10 @@ mod tests {
         assert_eq!(sfa_file_count(dir.path()), 2);
 
         let recovered = open(&dir);
-        assert_eq!(recovered.payload_for_fsn(0), Some(&b"first"[..]));
+        assert_eq!(
+            recovered.payload_vec_for_fsn(0).as_deref(),
+            Some(&b"first"[..])
+        );
         assert_eq!(
             recovered.receipt_status(QwpReceipt { fsn: 0 }),
             QwpReceiptStatus::Published { fsn: 0 }
@@ -1609,7 +1880,10 @@ mod tests {
             recovered.receipt_status(first),
             QwpReceiptStatus::Published { fsn: 0 }
         );
-        assert_eq!(recovered.payload_for_fsn(0), Some(&b"first"[..]));
+        assert_eq!(
+            recovered.payload_vec_for_fsn(0).as_deref(),
+            Some(&b"first"[..])
+        );
     }
 
     #[test]
@@ -1627,8 +1901,11 @@ mod tests {
             queue.receipt_status(second),
             QwpReceiptStatus::Published { fsn: 1 }
         );
-        assert_eq!(queue.payload_for_fsn(0), Some(&b"first"[..]));
-        assert_eq!(queue.payload_for_fsn(1), Some(&b"second"[..]));
+        assert_eq!(queue.payload_vec_for_fsn(0).as_deref(), Some(&b"first"[..]));
+        assert_eq!(
+            queue.payload_vec_for_fsn(1).as_deref(),
+            Some(&b"second"[..])
+        );
     }
 
     #[test]
@@ -1640,14 +1917,14 @@ mod tests {
         submit_with_storage_maintenance(&mut queue, b"tri");
         submit_with_storage_maintenance(&mut queue, b"for");
 
-        assert_eq!(queue.sealed_segments.len(), 3);
+        assert_eq!(queue.sealed_segment_count(), 3);
 
         assert_eq!(
             pending_payload_vec(queue.next_cursor_payload_for_fsn(0).unwrap().unwrap()),
             b"one"
         );
         assert_eq!(
-            queue.send_cursor.unwrap().segment,
+            queue.send_cursor_segment().unwrap(),
             SfaCursorSegment::Sealed(1)
         );
         assert_eq!(
@@ -1655,14 +1932,17 @@ mod tests {
             b"two"
         );
         assert_eq!(
-            queue.send_cursor.unwrap().segment,
+            queue.send_cursor_segment().unwrap(),
             SfaCursorSegment::Sealed(2)
         );
         assert_eq!(
             pending_payload_vec(queue.next_cursor_payload_for_fsn(2).unwrap().unwrap()),
             b"tri"
         );
-        assert_eq!(queue.send_cursor.unwrap().segment, SfaCursorSegment::Active);
+        assert_eq!(
+            queue.send_cursor_segment().unwrap(),
+            SfaCursorSegment::Active
+        );
         assert_eq!(
             pending_payload_vec(queue.next_cursor_payload_for_fsn(3).unwrap().unwrap()),
             b"for"
@@ -1678,12 +1958,13 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let mut queue = SfaFrameQueue::open(options_with(&dir, 4096, 8192, 4)).unwrap();
+        let mut producer = queue.take_producer().unwrap();
         for _ in 0..4 {
-            queue.try_submit(b"steady-state").unwrap();
+            producer.try_submit(b"steady-state").unwrap();
         }
 
         alloc_counter::start_counting();
-        let receipt = queue.try_submit(b"steady-state").unwrap();
+        let receipt = producer.try_submit(b"steady-state").unwrap();
         let alloc_count = alloc_counter::stop_counting();
 
         assert_eq!(receipt, QwpReceipt { fsn: 4 });
@@ -1710,8 +1991,14 @@ mod tests {
         assert_eq!(scan_file(&second_path).unwrap().header.base_seq, 1);
 
         let recovered = SfaFrameQueue::open(options_with(&dir, 38, 1024, 4)).unwrap();
-        assert_eq!(recovered.payload_for_fsn(0), Some(&b"first"[..]));
-        assert_eq!(recovered.payload_for_fsn(1), Some(&b"second"[..]));
+        assert_eq!(
+            recovered.payload_vec_for_fsn(0).as_deref(),
+            Some(&b"first"[..])
+        );
+        assert_eq!(
+            recovered.payload_vec_for_fsn(1).as_deref(),
+            Some(&b"second"[..])
+        );
         assert_eq!(recovered.oldest_unresolved_fsn(), Some(0));
     }
 
@@ -1742,6 +2029,7 @@ mod tests {
 
         queue.try_submit(b"first").unwrap();
         queue.try_submit(b"second").unwrap();
+        assert_eq!(sfa_file_count(dir.path()), 2);
         assert!(matches!(
             queue.try_submit(b"third"),
             Err(SfaQueueError::Queue(QueueError::StorageSpareNotReady {
@@ -1750,9 +2038,58 @@ mod tests {
                 max_total_bytes: 114,
             }))
         ));
+        assert_eq!(sfa_file_count(dir.path()), 2);
 
         assert!(queue.maintain_storage().unwrap());
         assert_eq!(queue.try_submit(b"third").unwrap(), QwpReceipt { fsn: 2 });
+    }
+
+    #[test]
+    fn detached_producer_rotates_replays_and_trims_runner_owned_segments() {
+        let dir = TempDir::new().unwrap();
+        let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 114, 4)).unwrap();
+        let mut producer = queue.take_producer().unwrap();
+
+        assert_eq!(producer.try_submit(b"one").unwrap(), QwpReceipt { fsn: 0 });
+        assert_eq!(producer.try_submit(b"two").unwrap(), QwpReceipt { fsn: 1 });
+        assert!(matches!(
+            producer.try_submit(b"tri"),
+            Err(SfaQueueError::Queue(
+                QueueError::StorageSpareNotReady { .. }
+            ))
+        ));
+        assert_eq!(sfa_file_count(dir.path()), 2);
+
+        assert!(queue.maintain_storage().unwrap());
+        assert_eq!(producer.try_submit(b"tri").unwrap(), QwpReceipt { fsn: 2 });
+        assert_eq!(queue.published_fsn(), Some(2));
+        assert_eq!(queue.payload_vec_for_fsn(0).as_deref(), Some(&b"one"[..]));
+        assert_eq!(queue.payload_vec_for_fsn(1).as_deref(), Some(&b"two"[..]));
+        assert_eq!(queue.payload_vec_for_fsn(2).as_deref(), Some(&b"tri"[..]));
+
+        queue.complete_through_fsn(2).unwrap();
+        assert!(queue.maintain_storage().unwrap());
+        assert!(queue.maintain_storage().unwrap());
+        assert_eq!(queue.completed_fsn(), Some(2));
+        assert!(sfa_file_count(dir.path()) <= 2);
+    }
+
+    #[test]
+    fn active_segment_published_offset_is_the_payload_visibility_barrier() {
+        let dir = TempDir::new().unwrap();
+        let queue = SfaFrameQueue::open(options_with(&dir, 256, 512, 4)).unwrap();
+        let active = queue.engine.segments_snapshot().active.unwrap();
+
+        let appended = active
+            .try_append_at(HEADER_SIZE as u64, b"hidden")
+            .unwrap()
+            .unwrap();
+
+        assert!(active.mapped_payload_at_offset(appended.offset).is_none());
+
+        active.publish(appended.frame_end, 1);
+        let payload = active.mapped_payload_at_offset(appended.offset).unwrap();
+        payload.with_bytes(|bytes| assert_eq!(bytes, b"hidden"));
     }
 
     #[test]
@@ -1762,7 +2099,7 @@ mod tests {
         queue.try_submit(b"first").unwrap();
         queue.try_submit(b"second").unwrap();
         assert_eq!(sfa_file_count(dir.path()), 2);
-        assert_eq!(queue.allocated_segment_bytes, 76);
+        assert_eq!(queue.allocated_segment_bytes(), 76);
 
         let step = queue.take_storage_maintenance_step(true).unwrap().unwrap();
         assert!(!step.changes_queue_before_io());
@@ -1772,7 +2109,7 @@ mod tests {
         queue.close().unwrap();
         let finish = queue.finish_storage_maintenance(result, true).unwrap();
         assert!(!finish.did_change());
-        assert_eq!(queue.allocated_segment_bytes, 76);
+        assert_eq!(queue.allocated_segment_bytes(), 76);
 
         let cleanup = finish
             .into_cleanup()
@@ -1793,8 +2130,8 @@ mod tests {
         let finish = queue.finish_storage_maintenance(result, false).unwrap();
 
         assert!(!finish.did_change());
-        assert!(queue.hot_spare.is_none());
-        assert_eq!(queue.allocated_segment_bytes, 76);
+        assert!(!queue.hot_spare_installed());
+        assert_eq!(queue.allocated_segment_bytes(), 76);
         let cleanup = finish
             .into_cleanup()
             .expect("created spare should be abandoned");
@@ -1815,8 +2152,11 @@ mod tests {
         let mut queue = SfaFrameQueue::open(options_with(&dir, 38, 38, 4)).unwrap();
 
         assert_eq!(queue.len(), 2);
-        assert_eq!(queue.payload_for_fsn(0), Some(&b"first"[..]));
-        assert_eq!(queue.payload_for_fsn(1), Some(&b"second"[..]));
+        assert_eq!(queue.payload_vec_for_fsn(0).as_deref(), Some(&b"first"[..]));
+        assert_eq!(
+            queue.payload_vec_for_fsn(1).as_deref(),
+            Some(&b"second"[..])
+        );
         assert!(matches!(
             queue.try_submit(b"third"),
             Err(SfaQueueError::Queue(QueueError::StorageSegmentCapFull {
@@ -1926,7 +2266,10 @@ mod tests {
 
         assert_eq!(sfa_file_count(dir.path()), 2);
         let recovered = open(&dir);
-        assert_eq!(recovered.payload_for_fsn(0), Some(&b"first"[..]));
+        assert_eq!(
+            recovered.payload_vec_for_fsn(0).as_deref(),
+            Some(&b"first"[..])
+        );
     }
 
     #[test]
