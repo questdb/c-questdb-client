@@ -444,10 +444,19 @@ pub fn decode_result_batch(
         (dec.schema_id, dec.bytes_consumed)
     };
     r.advance(schema_bytes)?;
-    let schema_cols = registry
-        .get(schema_id)
-        .expect("schema must be present after decode_section")
-        .len();
+    // `decode_section` registers the schema before returning Ok; the lookup
+    // below cannot fail under the current implementation. We still propagate
+    // a `ProtocolError` rather than `.expect()` so a future refactor of
+    // `decode_section` can't silently turn an internal-invariant violation
+    // into a process-abort across the FFI boundary.
+    let schema = registry.get(schema_id).ok_or_else(|| {
+        fmt!(
+            ProtocolError,
+            "schema {} missing from registry after decode_section",
+            schema_id
+        )
+    })?;
+    let schema_cols = schema.len();
     if schema_cols != col_count {
         return Err(fmt!(
             ProtocolError,
@@ -461,13 +470,7 @@ pub fn decode_result_batch(
     // Pull out the schema columns by value to avoid borrowing the registry
     // while we mutate it (we don't, in this loop, but borrow-check isn't
     // smart enough about the early consumed-by-decode_section call).
-    let kinds: Vec<ColumnKind> = registry
-        .get(schema_id)
-        .expect("schema present")
-        .columns()
-        .iter()
-        .map(|c| c.kind)
-        .collect();
+    let kinds: Vec<ColumnKind> = schema.columns().iter().map(|c| c.kind).collect();
 
     let mut columns = Vec::with_capacity(col_count);
     let connection_dict_size = dict.len();
