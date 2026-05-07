@@ -150,6 +150,25 @@ impl SymbolDict {
             ));
         }
 
+        // Upfront cap on delta_count: a corrupt batch with delta_count
+        // = u64::MAX would otherwise iterate up to MAX_CONN_DICT_SIZE
+        // (8M) times — burning real CPU on per-entry varint decode +
+        // UTF-8 validation + heap-size checks — before push_one finally
+        // refuses to grow past the soft cap. Reject the malformed
+        // count up front against the headroom remaining in the dict.
+        let headroom = (MAX_CONN_DICT_SIZE - self.entries.len()) as u64;
+        if delta_count > headroom {
+            return Err(fmt!(
+                ProtocolError,
+                "symbol dict delta_count={} exceeds remaining capacity {} \
+                 (current entries={}, max={})",
+                delta_count,
+                headroom,
+                self.entries.len(),
+                MAX_CONN_DICT_SIZE
+            ));
+        }
+
         let snapshot_entries = self.entries.len();
         let snapshot_arena = self.arena.len();
         let result: Result<usize> = (|| {
@@ -370,6 +389,32 @@ mod tests {
         let bytes = build_delta(0, &[]);
         let consumed = d.apply_delta_from_bytes(&bytes).unwrap();
         assert_eq!(consumed, bytes.len());
+        assert_eq!(d.len(), 0);
+    }
+
+    #[test]
+    fn delta_count_exceeding_capacity_rejected_upfront() {
+        // A corrupt batch with `delta_count = u64::MAX` must fail fast,
+        // not iterate up to MAX_CONN_DICT_SIZE times burning CPU on
+        // per-entry varint decode + UTF-8 + heap-size checks.
+        let mut d = SymbolDict::new();
+        let mut bytes = Vec::new();
+        encode_u64(0, &mut bytes); // delta_start
+        encode_u64(u64::MAX, &mut bytes); // delta_count
+        // No entries follow: if the cap weren't enforced upfront, the
+        // first iteration would error on truncated entry-length varint
+        // — which is also a ProtocolError but only after the loop has
+        // started. We can't directly observe iteration count, but we
+        // can pin the error message: the upfront cap surfaces
+        // "exceeds remaining capacity", the per-entry path surfaces
+        // "truncated".
+        let err = d.apply_delta_from_bytes(&bytes).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ProtocolError);
+        assert!(
+            err.msg().contains("exceeds remaining capacity"),
+            "expected upfront-cap rejection, got: {}",
+            err.msg()
+        );
         assert_eq!(d.len(), 0);
     }
 
