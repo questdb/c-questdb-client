@@ -1227,6 +1227,43 @@ TEST_CASE("mock: WebSocket upgrade rejected with 401 surfaces a connect-time err
 }
 
 // ---------------------------------------------------------------------------
+// Multi-endpoint walk where every endpoint rejects 401 produces a
+// single aggregated AuthError that names every endpoint that refused
+// the credentials. Pins the per-endpoint telemetry path added so a
+// heterogeneous-cluster credential drift can't hide behind a generic
+// "auth failed" message.
+// ---------------------------------------------------------------------------
+TEST_CASE("mock: multi-addr walk aggregates per-endpoint 401 rejections")
+{
+    qm::MockServer srv1({{qm::ActionReject401{}}});
+    qm::MockServer srv2({{qm::ActionReject401{}}});
+    const std::string conf =
+        "qwp::addr=" + srv1.addr() + "," + srv2.addr() + ";";
+    line_sender_utf8 c{conf.size(), conf.c_str()};
+    line_reader_error* err = nullptr;
+    line_reader* r = line_reader_from_conf(c, &err);
+    REQUIRE(r == nullptr);
+    REQUIRE(err != nullptr);
+    // Either AuthError (both endpoints actually replied 401) or
+    // HandshakeError (race on one endpoint surfacing as a different
+    // class). The aggregated-message check below is the part that
+    // actually pins the new behaviour.
+    const auto code = line_reader_error_get_code(err);
+    CHECK((code == line_reader_error_auth_error
+        || code == line_reader_error_handshake_error));
+    size_t mlen = 0;
+    const char* msg = line_reader_error_msg(err, &mlen);
+    const std::string m{msg, mlen};
+    if (code == line_reader_error_auth_error)
+    {
+        // The aggregated diagnostic mentions both endpoint addresses.
+        CHECK(m.find(srv1.addr()) != std::string::npos);
+        CHECK(m.find(srv2.addr()) != std::string::npos);
+    }
+    line_reader_error_free(err);
+}
+
+// ---------------------------------------------------------------------------
 // CACHE_RESET frame mid-stream — the reader must consume it and continue
 // (it invalidates the symbol/schema caches; not a fatal event). Exercises
 // ActionSendCacheReset.

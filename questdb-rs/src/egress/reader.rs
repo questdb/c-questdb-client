@@ -129,6 +129,13 @@ pub struct Reader {
     /// Diagnostic: nanoseconds spent in `decode_frame()` since connect.
     /// Saturates at `u64::MAX`.
     decode_ns: AtomicU64,
+    /// Per-endpoint auth rejections observed during the initial-connect
+    /// walk before this endpoint accepted us. Stays empty when the
+    /// first endpoint in `cfg.addrs` accepts. Surfaced via
+    /// [`Self::auth_rejections_during_connect`] so operators can
+    /// telemeter heterogeneous-cluster credential drift without having
+    /// to reach for a process-wide logger.
+    auth_rejections_during_connect: Vec<(Endpoint, String)>,
 }
 
 impl Reader {
@@ -167,11 +174,24 @@ impl Reader {
         let cfg = Arc::new(cfg.clone());
         let mut last_transport_err: Option<Error> = None;
         let mut last_role_mismatch: Option<Error> = None;
-        let mut last_auth_err: Option<Error> = None;
+        // Per-endpoint auth rejections collected across the walk. The
+        // walk treats `AuthError` as soft (heterogeneous-cluster /
+        // partial-credential-rotation scenarios), but a single
+        // misconfigured node serving 401 was previously invisible: the
+        // connection silently succeeded against another endpoint and
+        // the rejection left no trace. Collect them per-endpoint so
+        // that on exhaustion the surfaced error names every endpoint
+        // that rejected auth, and on the success path the count is
+        // available via [`Reader::auth_rejections_during_connect`] for
+        // operators who want to telemeter this.
+        let mut auth_rejections: Vec<(Endpoint, String)> = Vec::new();
 
         for idx in 0..cfg.addrs.len() {
             match Self::connect_endpoint(&cfg, idx) {
-                Ok(reader) => return Ok(reader),
+                Ok(mut reader) => {
+                    reader.auth_rejections_during_connect = auth_rejections;
+                    return Ok(reader);
+                }
                 Err(e) => match e.code() {
                     // Keep the most-recent (richest) role-mismatch
                     // message; keep walking the address list past it
@@ -183,10 +203,10 @@ impl Reader {
                     // problem, but not always — heterogeneous clusters
                     // (mixed-version nodes, partial credential rotation)
                     // can have one endpoint reject auth while another
-                    // accepts. Walk past it and surface it on exhaustion
-                    // only if no later endpoint succeeded.
+                    // accepts. Walk past it but record per-endpoint so
+                    // we can surface every rejection on exhaustion.
                     ErrorCode::AuthError => {
-                        last_auth_err = Some(e);
+                        auth_rejections.push((cfg.addrs[idx].clone(), e.msg().to_string()));
                     }
                     // Truly identical-on-every-endpoint failures: bad
                     // connect-string parse, wholly unsupported server
@@ -204,8 +224,20 @@ impl Reader {
         // Surface the most diagnostic error we saw. Auth-rejected tells
         // the user *what to fix* (credentials), so it ranks above a
         // role mismatch (which ranks above a generic transport flop).
-        if let Some(e) = last_auth_err {
-            return Err(e);
+        // Aggregate every auth rejection so the user sees which
+        // endpoints refused them rather than just one.
+        if !auth_rejections.is_empty() {
+            let detail = auth_rejections
+                .iter()
+                .map(|(ep, msg)| format!("  - {ep}: {msg}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Err(fmt!(
+                AuthError,
+                "all {} endpoint(s) rejected the supplied credentials:\n{}",
+                auth_rejections.len(),
+                detail
+            ));
         }
         if let Some(e) = last_role_mismatch {
             return Err(e);
@@ -240,6 +272,7 @@ impl Reader {
             credit_granted_total: AtomicU64::new(0),
             read_ns: AtomicU64::new(0),
             decode_ns: AtomicU64::new(0),
+            auth_rejections_during_connect: Vec::new(),
         };
         if reader.transport_mut()?.server_version() >= 2 {
             reader.consume_server_info()?;
@@ -481,6 +514,22 @@ impl Reader {
     /// mid-query failover.
     pub fn server_version(&self) -> Result<u8> {
         Ok(self.transport_ref()?.server_version())
+    }
+
+    /// Per-endpoint auth rejections observed during the initial connect
+    /// walk before the accepted endpoint took us. Empty when the first
+    /// configured endpoint accepted the credentials, or when no endpoint
+    /// rejected on `AuthError` (`401`/`403`-equivalent).
+    ///
+    /// Surfaces a heterogeneous-cluster credential drift that the walk
+    /// otherwise absorbs silently: a single misconfigured node serving
+    /// `401` while the rest accept the supplied credentials. Operators
+    /// who care about this telemetry can read this slice after a
+    /// successful `from_config` and forward it to whatever logger their
+    /// embedding application uses; the library itself does not emit
+    /// anything (it has no logging dependency).
+    pub fn auth_rejections_during_connect(&self) -> &[(Endpoint, String)] {
+        &self.auth_rejections_during_connect
     }
 
     /// Connection-scoped symbol dictionary.
