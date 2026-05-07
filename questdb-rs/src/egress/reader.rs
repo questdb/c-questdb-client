@@ -1472,8 +1472,47 @@ impl<'r> Cursor<'r> {
     /// outstanding window than the per-batch auto-replenishment would
     /// give them, or when initial_credit was 0 but the user changes
     /// their mind mid-stream.
+    ///
+    /// Mirrors [`Self::next_batch`]'s failover policy: a transport-
+    /// class write failure on the current connection triggers a
+    /// reconnect-and-replay cycle (when the connect string declares
+    /// failover endpoints), after which the credit frame is re-sent
+    /// on the new connection so the user's grant is preserved. If the
+    /// reconnect fails or the failure is not failover-eligible
+    /// (auth/config/protocol), the cursor is torn down so a follow-up
+    /// `next_batch` sees a dead cursor instead of silently failing
+    /// over.
     pub fn add_credit(&mut self, additional_bytes: u64) -> Result<()> {
-        self.send_credit_frame(additional_bytes)
+        if self.done {
+            return Err(fmt!(
+                InvalidApiCall,
+                "cursor is terminal; add_credit not allowed"
+            ));
+        }
+        let first_err = match self.send_credit_frame(additional_bytes) {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        if self.cancelling
+            || !self.reader.cfg.failover
+            || !is_failover_eligible(first_err.code())
+        {
+            self.terminate_with_close();
+            return Err(first_err);
+        }
+        self.failover_reconnect_and_replay(first_err)?;
+        // Replay succeeded; the user's grant intent applies to the new
+        // request now in flight. Re-send on the new connection. If
+        // *that* fails too, treat it as a sticky terminal failure
+        // rather than recurse into another failover cycle — one cycle
+        // per user call keeps the latency bound predictable.
+        match self.send_credit_frame(additional_bytes) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.terminate_with_close();
+                Err(e)
+            }
+        }
     }
 
     fn send_credit_frame(&mut self, additional_bytes: u64) -> Result<()> {
