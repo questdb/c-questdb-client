@@ -621,9 +621,11 @@ pub unsafe extern "C" fn line_reader_reset_timing(reader: *mut line_reader) {
 }
 
 /// Get the negotiated QWP server version (1..=`HIGHEST_KNOWN_VERSION`).
-/// Returns false and sets `*err_out` if the connection is not established
-/// (no `SERVER_INFO` received yet). Returns `false` for a NULL handle
-/// (defense-in-depth — passing NULL is a contract violation).
+///
+/// Returns `false` and sets `*err_out` on failure: the connection is not
+/// established yet (no `SERVER_INFO` received), or the `reader` handle is
+/// NULL (a contract violation we surface as `InvalidApiCall` instead of
+/// dereferencing).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_server_version(
     reader: *const line_reader,
@@ -632,6 +634,13 @@ pub unsafe extern "C" fn line_reader_server_version(
 ) -> bool {
     unsafe {
         if reader.is_null() {
+            if !err_out.is_null() {
+                set_reader_err(
+                    err_out,
+                    ErrorCode::InvalidApiCall,
+                    "line_reader_server_version called with NULL reader handle",
+                );
+            }
             return false;
         }
         match (*(*reader).0.get()).server_version() {
@@ -3028,32 +3037,8 @@ pub unsafe extern "C" fn line_reader_cursor_column_validity(
     })
 }
 
-fn column_view_validity<'a>(view: &ColumnView<'a>) -> Validity<'a> {
-    match view {
-        ColumnView::Boolean(c) => c.validity(),
-        ColumnView::Byte(c) => c.validity(),
-        ColumnView::Short(c) => c.validity(),
-        ColumnView::Int(c) => c.validity(),
-        ColumnView::Long(c) => c.validity(),
-        ColumnView::Float(c) => c.validity(),
-        ColumnView::Double(c) => c.validity(),
-        ColumnView::Symbol(c) => c.validity(),
-        ColumnView::Timestamp(c) => c.validity(),
-        ColumnView::Date(c) => c.validity(),
-        ColumnView::Uuid(c) => c.validity(),
-        ColumnView::Long256(c) => c.validity(),
-        ColumnView::TimestampNanos(c) => c.validity(),
-        ColumnView::Decimal64(c) => c.validity(),
-        ColumnView::Char(c) => c.validity(),
-        ColumnView::Ipv4(c) => c.validity(),
-        ColumnView::Varchar(c) => c.validity(),
-        ColumnView::Binary(c) => c.validity(),
-        ColumnView::Geohash(c) => c.validity(),
-        ColumnView::Decimal128(c) => c.validity(),
-        ColumnView::Decimal256(c) => c.validity(),
-        ColumnView::DoubleArray(c) => c.validity(),
-        ColumnView::LongArray(c) => c.validity(),
-    }
+fn column_view_validity<'a>(view: &'a ColumnView<'a>) -> Validity<'a> {
+    view.validity()
 }
 
 // ---------------------------------------------------------------------------
@@ -3509,6 +3494,30 @@ mod tests {
     fn close_is_null_idempotent() {
         unsafe {
             line_reader_close(ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn server_version_null_handle_sets_err_out() {
+        unsafe {
+            let mut version: u8 = 0xFF;
+            let mut err: *mut line_reader_error = ptr::null_mut();
+            let ok = line_reader_server_version(ptr::null(), &mut version, &mut err);
+            assert!(!ok);
+            assert!(!err.is_null(), "err_out must be set on NULL handle");
+            let code = line_reader_error_get_code(err) as u32;
+            let want = line_reader_error_code::line_reader_error_invalid_api_call as u32;
+            assert_eq!(code, want);
+            line_reader_error_free(err);
+        }
+    }
+
+    #[test]
+    fn server_version_null_handle_with_null_err_out_does_not_segv() {
+        unsafe {
+            let mut version: u8 = 0xFF;
+            let ok = line_reader_server_version(ptr::null(), &mut version, ptr::null_mut());
+            assert!(!ok);
         }
     }
 

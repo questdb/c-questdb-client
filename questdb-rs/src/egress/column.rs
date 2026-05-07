@@ -1135,6 +1135,34 @@ impl ColumnView<'_> {
             ColumnView::LongArray(c) => c.is_null(row),
         }
     }
+
+    pub fn validity<'b>(&'b self) -> Validity<'b> {
+        match self {
+            ColumnView::Boolean(c) => c.validity(),
+            ColumnView::Byte(c) => c.validity(),
+            ColumnView::Short(c) => c.validity(),
+            ColumnView::Int(c) => c.validity(),
+            ColumnView::Long(c) => c.validity(),
+            ColumnView::Float(c) => c.validity(),
+            ColumnView::Double(c) => c.validity(),
+            ColumnView::Symbol(c) => c.validity(),
+            ColumnView::Timestamp(c) => c.validity(),
+            ColumnView::Date(c) => c.validity(),
+            ColumnView::Uuid(c) => c.validity(),
+            ColumnView::Long256(c) => c.validity(),
+            ColumnView::TimestampNanos(c) => c.validity(),
+            ColumnView::Decimal64(c) => c.validity(),
+            ColumnView::Char(c) => c.validity(),
+            ColumnView::Ipv4(c) => c.validity(),
+            ColumnView::Varchar(c) => c.validity(),
+            ColumnView::Binary(c) => c.validity(),
+            ColumnView::Geohash(c) => c.validity(),
+            ColumnView::Decimal128(c) => c.validity(),
+            ColumnView::Decimal256(c) => c.validity(),
+            ColumnView::DoubleArray(c) => c.validity(),
+            ColumnView::LongArray(c) => c.validity(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

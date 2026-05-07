@@ -318,8 +318,13 @@ LINEREADER_API uint64_t line_reader_decode_ns(const line_reader*);
 LINEREADER_API void line_reader_reset_timing(line_reader*);
 
 /**
- * Get the negotiated QWP server version. Returns false and sets `*err_out`
- * if the connection is not established yet.
+ * Get the negotiated QWP server version.
+ *
+ * Returns `false` and sets `*err_out` on failure: the connection is not
+ * established yet (no `SERVER_INFO` received), or the `reader` handle is
+ * NULL (surfaced as `line_reader_error_invalid_api_call` rather than
+ * dereferenced). On success returns `true` and writes the version to
+ * `*out_version`.
  */
 LINEREADER_API
 bool line_reader_server_version(
