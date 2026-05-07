@@ -53,53 +53,59 @@ use crate::line_sender_utf8;
 pub struct line_reader_error(Error);
 
 /// Category of egress error. Mirrors `questdb::egress::ErrorCode`.
+///
+/// Discriminants are explicit and append-only — must stay in lockstep
+/// with `line_reader_error_code` in `include/questdb/egress/line_reader.h`.
+/// Inserting a new variant in the middle would silently renumber later
+/// ones across recompiles and break ABI for any shared-library consumer
+/// holding a previously-built header.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub enum line_reader_error_code {
     /// Bad URL, host, or interface in the connect string.
-    line_reader_error_could_not_resolve_addr,
+    line_reader_error_could_not_resolve_addr = 0,
     /// Bad configuration string or builder argument.
-    line_reader_error_config_error,
+    line_reader_error_config_error = 1,
     /// Methods called in the wrong order (e.g. `execute` while a cursor is live).
-    line_reader_error_invalid_api_call,
+    line_reader_error_invalid_api_call = 2,
     /// Network-level failure (connect, read, write, close).
-    line_reader_error_socket_error,
+    line_reader_error_socket_error = 3,
     /// TLS handshake failure.
-    line_reader_error_tls_error,
+    line_reader_error_tls_error = 4,
     /// HTTP-upgrade or WebSocket handshake failure.
-    line_reader_error_handshake_error,
+    line_reader_error_handshake_error = 5,
     /// Authentication or authorization failure.
-    line_reader_error_auth_error,
+    line_reader_error_auth_error = 6,
     /// Server returned an unsupported QWP version, encoding, or capability.
-    line_reader_error_unsupported_server,
+    line_reader_error_unsupported_server = 7,
     /// All endpoints connected but none advertised a role matching the
     /// configured `target` filter.
-    line_reader_error_role_mismatch,
+    line_reader_error_role_mismatch = 8,
     /// Wire-format violation: bad magic, truncated frame, unknown
     /// discriminant, invalid varint, schema/symbol-dict reference miss, etc.
-    line_reader_error_protocol_error,
+    line_reader_error_protocol_error = 9,
     /// String or symbol field was not valid UTF-8.
-    line_reader_error_invalid_utf8,
+    line_reader_error_invalid_utf8 = 10,
     /// Bind parameter index, count, or value rejected client-side.
-    line_reader_error_invalid_bind,
+    line_reader_error_invalid_bind = 11,
     /// Invalid timestamp value.
-    line_reader_error_invalid_timestamp,
+    line_reader_error_invalid_timestamp = 12,
     /// Invalid decimal value.
-    line_reader_error_invalid_decimal,
+    line_reader_error_invalid_decimal = 13,
     /// Server-reported QWP `SCHEMA_MISMATCH` (status `0x03`).
-    line_reader_error_server_schema_mismatch,
+    line_reader_error_server_schema_mismatch = 14,
     /// Server-reported QWP `PARSE_ERROR` (status `0x05`).
-    line_reader_error_server_parse_error,
+    line_reader_error_server_parse_error = 15,
     /// Server-reported QWP `INTERNAL_ERROR` (status `0x06`).
-    line_reader_error_server_internal_error,
+    line_reader_error_server_internal_error = 16,
     /// Server-reported QWP `SECURITY_ERROR` (status `0x08`).
-    line_reader_error_server_security_error,
+    line_reader_error_server_security_error = 17,
     /// Client-side limit hit (e.g. an array row exceeds the configured cap).
-    line_reader_error_limit_exceeded,
+    line_reader_error_limit_exceeded = 18,
     /// Server-reported QWP `LIMIT_EXCEEDED` (status `0x0B`).
-    line_reader_error_server_limit_exceeded,
+    line_reader_error_server_limit_exceeded = 19,
     /// Query was cancelled (locally or via server `CANCELLED` status `0x0A`).
-    line_reader_error_cancelled,
+    line_reader_error_cancelled = 20,
 }
 
 impl From<ErrorCode> for line_reader_error_code {
