@@ -38,8 +38,7 @@
 
 use std::net::Ipv4Addr;
 
-use crate::egress::binds::{Bind, check_bindable, encode_bind};
-use crate::egress::column_kind::ColumnKind;
+use crate::egress::binds::{Bind, SimpleNullKind, check_bindable, encode_bind};
 use crate::egress::error::{Result, fmt};
 use crate::egress::wire::msg_kind::MsgKind;
 use crate::egress::wire::varint;
@@ -122,7 +121,7 @@ impl QueryRequestBuilder {
         self
     }
 
-    pub fn bind_null(self, kind: ColumnKind) -> Self {
+    pub fn bind_null(self, kind: SimpleNullKind) -> Self {
         self.bind(Bind::Null(kind))
     }
     pub fn bind_bool(self, v: bool) -> Self {
@@ -268,7 +267,7 @@ mod tests {
             .request_id(1)
             .bind_i64(42)
             .bind_varchar("hi")
-            .bind_null(ColumnKind::Boolean)
+            .bind_null(SimpleNullKind::Boolean)
             .build()
             .unwrap();
         let mut buf = Vec::new();
@@ -326,9 +325,13 @@ mod tests {
 
     #[test]
     fn unsupported_bind_kind_rejected() {
-        // Symbol bind not yet supported.
+        // Server rejects IPv4 binds entirely (per Java reference, see
+        // `check_bindable`). The simple-null variant `Bind::Null(SimpleNullKind::Ipv4)`
+        // wire-encodes successfully but `build()` must surface the
+        // server-side rejection client-side so the user sees a clear
+        // `InvalidBind` rather than a generic server `QUERY_ERROR`.
         let err = QueryRequest::builder("X")
-            .bind(Bind::Null(ColumnKind::Symbol))
+            .bind(Bind::Null(SimpleNullKind::Ipv4))
             .build()
             .unwrap_err();
         assert_eq!(err.code(), ErrorCode::InvalidBind);

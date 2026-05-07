@@ -46,9 +46,8 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 
-use crate::egress::binds::Bind;
+use crate::egress::binds::{Bind, SimpleNullKind};
 use crate::egress::column::ColumnView;
-use crate::egress::column_kind::ColumnKind;
 use crate::egress::config::{Endpoint, ReaderConfig, Target};
 use crate::egress::decoder::DecodedBatch;
 use crate::egress::error::{Error, ErrorCode, Result, fmt};
@@ -677,7 +676,7 @@ impl<'r> ReaderQuery<'r> {
         self
     }
 
-    bind_method!(bind_null, kind: ColumnKind);
+    bind_method!(bind_null, kind: SimpleNullKind);
     bind_method!(bind_bool, v: bool);
     bind_method!(bind_i8, v: i8);
     bind_method!(bind_i16, v: i16);

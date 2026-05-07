@@ -40,7 +40,7 @@ use libc::{c_char, c_void, size_t};
 
 use questdb::egress::{
     BatchView, ColumnKind, ColumnView, Cursor, Error, ErrorCode, FailoverEvent, Reader,
-    ReaderQuery, ServerInfo, ServerRole, Terminal, Validity,
+    ReaderQuery, ServerInfo, ServerRole, SimpleNullKind, Terminal, Validity,
 };
 
 use crate::line_sender_utf8;
@@ -1215,26 +1215,45 @@ pub unsafe extern "C" fn line_reader_query_free(query: *mut line_reader_query) {
 
 /// Consume the query and return a streaming cursor.
 ///
-/// The query handle is freed by this call regardless of outcome — on
-/// success ownership transfers to the returned cursor; on failure the
-/// handle is freed and `*err_out` is set. Either way, do NOT pass the
-/// query pointer to `_query_free` or any other function afterwards.
+/// `query_inout` is a pointer to the caller's `line_reader_query*`
+/// variable. On entry, `*query_inout` is the query to consume; on exit,
+/// `*query_inout` is set to NULL — regardless of success or failure — so
+/// a subsequent `line_reader_query_free(*query_inout)` is a safe no-op
+/// (the query handle is consumed by this call). Passing NULL for
+/// `query_inout` itself, or for `*query_inout`, is a contract violation;
+/// the function returns NULL with `InvalidApiCall` set.
+///
+/// On success, ownership of the query transfers to the returned cursor;
+/// on failure `*err_out` is set and NULL is returned.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_query_execute(
-    query: *mut line_reader_query,
+    query_inout: *mut *mut line_reader_query,
     err_out: *mut *mut line_reader_error,
 ) -> *mut line_reader_cursor {
     unsafe {
         // Defense-in-depth: `Box::from_raw(null)` is officially UB —
         // strictly worse than a SIGSEGV. Reject NULL early instead.
+        if query_inout.is_null() {
+            set_reader_err(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "line_reader_query_execute called with NULL query_inout",
+            );
+            return ptr::null_mut();
+        }
+        let query = *query_inout;
         if query.is_null() {
             set_reader_err(
                 err_out,
                 ErrorCode::InvalidApiCall,
-                "line_reader_query_execute called with NULL query",
+                "line_reader_query_execute called with NULL *query_inout",
             );
             return ptr::null_mut();
         }
+        // Null the caller's local now: the query is consumed regardless of
+        // outcome. A subsequent `line_reader_query_free(*query_inout)` is
+        // then a NULL no-op.
+        *query_inout = ptr::null_mut();
         let mut boxed = Box::from_raw(query);
         let q: ReaderQuery<'static> = ManuallyDrop::take(&mut boxed.inner);
         let reader = boxed.reader;
@@ -1543,16 +1562,40 @@ pub unsafe extern "C" fn line_reader_query_bind_decimal256(
 }
 
 /// Bind a typed NULL for one of the simple column kinds (numeric, temporal,
-/// UUID, etc). For VARCHAR / BINARY / DECIMAL* / GEOHASH use the dedicated
-/// `_null_*` variants since those carry extra column metadata.
+/// UUID, IPv4, LONG256, CHAR). For VARCHAR / BINARY / DECIMAL\* / GEOHASH
+/// use the dedicated `_null_*` variants since those carry extra column
+/// metadata. Passing a kind not in the simple-null set (e.g. SYMBOL,
+/// VARCHAR, DECIMAL64, DOUBLE_ARRAY) stashes an `InvalidBind` deferred
+/// error on the query that surfaces from `_query_execute`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_query_bind_null(
     query: *mut line_reader_query,
     kind: line_reader_column_kind,
 ) {
     unsafe {
+        // NULL-handle guard before any deferred_err deref below.
+        null_check_handle!(query, "line_reader_query_bind_null");
         let k = column_kind_from_c(kind);
-        mutate_query(query, |q| q.bind_null(k));
+        match SimpleNullKind::try_from(k) {
+            Ok(s) => mutate_query(query, |q| q.bind_null(s)),
+            Err(invalid) => {
+                // Don't touch the upstream builder — leaving the bind
+                // unposted keeps later bind indices stable. Stash the
+                // error so `_query_execute` surfaces it. First-error-
+                // wins so the original cause isn't masked.
+                if (*query).deferred_err.is_none() {
+                    (*query).deferred_err = Some(Error::new(
+                        ErrorCode::InvalidBind,
+                        format!(
+                            "line_reader_query_bind_null: kind {} is not a simple-null kind; \
+                             use the dedicated line_reader_query_bind_null_{{varchar,binary,decimal64,decimal128,decimal256,geohash}} \
+                             entry point",
+                            invalid.name()
+                        ),
+                    ));
+                }
+            }
+        }
     }
 }
 

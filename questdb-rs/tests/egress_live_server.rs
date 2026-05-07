@@ -1309,12 +1309,12 @@ fn bind_in_where_clause_filters_rows() {
 
 #[test]
 fn bind_typed_null_long() {
-    use questdb::egress::column_kind::ColumnKind;
+    use questdb::egress::SimpleNullKind;
     let srv = server();
     let mut reader = make_reader(srv);
     let mut cur = reader
         .query("select $1::long as v")
-        .bind_null(ColumnKind::Long)
+        .bind_null(SimpleNullKind::Long)
         .execute()
         .expect("execute");
     let view = cur.next_batch().expect("next").expect("Some");

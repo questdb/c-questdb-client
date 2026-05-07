@@ -61,6 +61,89 @@ use crate::egress::wire::varint;
 /// from the server.
 pub const MAX_DECIMAL_SCALE: i8 = 38;
 
+/// Column kinds whose null wire encoding is the simple no-args form
+/// `[type_code, null_flag=0x01, bitmap=0x01]` — no column-level
+/// metadata, no offsets array. Acts as the type-system constraint on
+/// [`Bind::Null`]: kinds excluded here either need extra metadata
+/// (DECIMAL\* scale, GEOHASH precision_bits) or have a different null
+/// layout (VARCHAR, BINARY) and use a dedicated `Null*` variant.
+///
+/// SYMBOL is also excluded: per the QWP egress spec (§6 "Bind
+/// parameters"), compliant clients send symbol binds as STRING /
+/// VARCHAR — there is no need for a SYMBOL wire type code on the bind
+/// path (the server is lenient and accepts it for now, but the spec
+/// instructs clients not to emit it). DOUBLE_ARRAY / LONG_ARRAY are
+/// excluded because the Phase 1 server rejects array binds with "not
+/// yet supported"; the spec describes the eventual encoding (per-row
+/// dimension header), so this exclusion may be lifted when the server
+/// implements them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimpleNullKind {
+    Boolean,
+    Byte,
+    Short,
+    Int,
+    Long,
+    Float,
+    Double,
+    Timestamp,
+    TimestampNanos,
+    Date,
+    Uuid,
+    Long256,
+    Char,
+    Ipv4,
+}
+
+impl SimpleNullKind {
+    /// The corresponding [`ColumnKind`].
+    pub fn as_column_kind(self) -> ColumnKind {
+        match self {
+            SimpleNullKind::Boolean => ColumnKind::Boolean,
+            SimpleNullKind::Byte => ColumnKind::Byte,
+            SimpleNullKind::Short => ColumnKind::Short,
+            SimpleNullKind::Int => ColumnKind::Int,
+            SimpleNullKind::Long => ColumnKind::Long,
+            SimpleNullKind::Float => ColumnKind::Float,
+            SimpleNullKind::Double => ColumnKind::Double,
+            SimpleNullKind::Timestamp => ColumnKind::Timestamp,
+            SimpleNullKind::TimestampNanos => ColumnKind::TimestampNanos,
+            SimpleNullKind::Date => ColumnKind::Date,
+            SimpleNullKind::Uuid => ColumnKind::Uuid,
+            SimpleNullKind::Long256 => ColumnKind::Long256,
+            SimpleNullKind::Char => ColumnKind::Char,
+            SimpleNullKind::Ipv4 => ColumnKind::Ipv4,
+        }
+    }
+}
+
+impl TryFrom<ColumnKind> for SimpleNullKind {
+    type Error = ColumnKind;
+
+    /// Returns the input kind in `Err` when it's not a simple-null kind, so
+    /// the caller can build a context-rich error message pointing at the
+    /// dedicated variant the user needed.
+    fn try_from(k: ColumnKind) -> std::result::Result<Self, Self::Error> {
+        Ok(match k {
+            ColumnKind::Boolean => SimpleNullKind::Boolean,
+            ColumnKind::Byte => SimpleNullKind::Byte,
+            ColumnKind::Short => SimpleNullKind::Short,
+            ColumnKind::Int => SimpleNullKind::Int,
+            ColumnKind::Long => SimpleNullKind::Long,
+            ColumnKind::Float => SimpleNullKind::Float,
+            ColumnKind::Double => SimpleNullKind::Double,
+            ColumnKind::Timestamp => SimpleNullKind::Timestamp,
+            ColumnKind::TimestampNanos => SimpleNullKind::TimestampNanos,
+            ColumnKind::Date => SimpleNullKind::Date,
+            ColumnKind::Uuid => SimpleNullKind::Uuid,
+            ColumnKind::Long256 => SimpleNullKind::Long256,
+            ColumnKind::Char => SimpleNullKind::Char,
+            ColumnKind::Ipv4 => SimpleNullKind::Ipv4,
+            other => return Err(other),
+        })
+    }
+}
+
 /// Typed bind value.
 ///
 /// Position is implicit in the order binds are emitted into a `QUERY_REQUEST`
@@ -70,10 +153,11 @@ pub const MAX_DECIMAL_SCALE: i8 = 38;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Bind {
     // --- Simple typed-NULL (column body is just the null section) ----------
-    /// Typed NULL for any "simple" type: BOOLEAN, BYTE, SHORT, INT, LONG,
-    /// FLOAT, DOUBLE, TIMESTAMP, TIMESTAMP_NANOS, DATE, UUID, IPv4,
-    /// LONG256, CHAR.
-    Null(ColumnKind),
+    /// Typed NULL for any simple-null kind. The [`SimpleNullKind`] type
+    /// statically excludes kinds (VARCHAR / BINARY / DECIMAL\* / GEOHASH)
+    /// whose null wire encoding requires column-level metadata, so an
+    /// invalid `Bind::Null` is unrepresentable.
+    Null(SimpleNullKind),
     /// Typed NULL for VARCHAR (offsets array length-1 even with no values).
     NullVarchar,
     /// Typed NULL for BINARY (same offsets-array reason).
@@ -149,7 +233,7 @@ impl Bind {
     /// QWP type code this bind serializes to.
     pub fn kind(&self) -> ColumnKind {
         match self {
-            Bind::Null(k) => *k,
+            Bind::Null(s) => s.as_column_kind(),
             Bind::NullVarchar => ColumnKind::Varchar,
             Bind::NullBinary => ColumnKind::Binary,
             Bind::NullDecimal64 { .. } => ColumnKind::Decimal64,
@@ -195,32 +279,12 @@ impl Bind {
 
 /// Append the wire encoding of `bind` to `out`.
 pub fn encode_bind(bind: &Bind, out: &mut Vec<u8>) -> Result<()> {
-    // `Bind::Null(k)` only encodes the simple no-args null body. For kinds
-    // whose null wire encoding requires column-level metadata (DECIMAL*
-    // scale, GEOHASH precision_bits) — or whose null layout differs from a
-    // bare `[type, 0x01, 0x01]` (VARCHAR / BINARY) — emitting `Bind::Null(k)`
-    // would silently produce wire bytes that desynchronise the server's
-    // bind decoder. Reject early, point at the dedicated variant.
-    if let Bind::Null(k) = bind {
-        let dedicated = match k {
-            ColumnKind::Varchar => Some("Bind::NullVarchar"),
-            ColumnKind::Binary => Some("Bind::NullBinary"),
-            ColumnKind::Decimal64 => Some("Bind::NullDecimal64 { scale }"),
-            ColumnKind::Decimal128 => Some("Bind::NullDecimal128 { scale }"),
-            ColumnKind::Decimal256 => Some("Bind::NullDecimal256 { scale }"),
-            ColumnKind::Geohash => Some("Bind::NullGeohash { precision_bits }"),
-            _ => None,
-        };
-        if let Some(variant) = dedicated {
-            return Err(fmt!(
-                InvalidBind,
-                "Bind::Null({}) is invalid: this kind needs column-level metadata on the wire; use {} instead",
-                k.name(),
-                variant
-            ));
-        }
-    }
-
+    // `Bind::Null(SimpleNullKind)` only encodes the simple no-args null body
+    // `[type, null_flag=0x01, bitmap=0x01]`. The `SimpleNullKind` enum
+    // statically excludes kinds whose null wire encoding requires
+    // column-level metadata (DECIMAL\* scale, GEOHASH precision_bits) or
+    // whose null layout differs from a bare null section (VARCHAR /
+    // BINARY) — those route through dedicated `Null*` variants.
     out.push(bind.kind().as_u8());
 
     let null = bind.is_null();
@@ -300,15 +364,17 @@ pub fn encode_bind(bind: &Bind, out: &mut Vec<u8>) -> Result<()> {
         }
         Bind::Uuid(b) => out.extend_from_slice(b),
         Bind::Long256(b) => out.extend_from_slice(b),
-        // The Java reference server rejects IPv4, BINARY, SYMBOL, and
-        // arrays as bind values (see `check_bindable` below). Both
-        // `Bind::Ipv4` and `Bind::Binary` arms here are reachable only
-        // if the bind-set is encoded without going through
-        // `QueryRequestBuilder::build` (which calls `check_bindable`).
-        // We keep wire encodings here for completeness and forward
-        // compatibility — if the server later relaxes its rejection
-        // list, just drop the offending kind from `check_bindable` and
-        // the encoder is already correct.
+        // The Phase 1 server rejects IPv4 and BINARY bind type codes
+        // outright (no decoder case → "unsupported wire type"), and
+        // rejects array binds with "not yet supported in Phase 1". The
+        // server accepts SYMBOL leniently (spec §6) but compliant
+        // clients send STRING / VARCHAR. `check_bindable` surfaces all
+        // of these client-side. The `Bind::Ipv4` / `Bind::Binary` arms
+        // below are reachable only if the bind-set is encoded without
+        // going through `QueryRequestBuilder::build` — we keep the wire
+        // encoding for completeness and forward compatibility, so when
+        // the server lifts a restriction the encoder is already
+        // correct.
         Bind::Ipv4(addr) => out.extend_from_slice(&u32::from(*addr).to_le_bytes()),
         Bind::Decimal64 { value, .. } => out.extend_from_slice(&value.to_le_bytes()),
         Bind::Decimal128 { value, .. } => out.extend_from_slice(&value.to_le_bytes()),
@@ -342,13 +408,31 @@ fn write_varlen_offsets(byte_lens: &[usize], out: &mut Vec<u8>) -> Result<()> {
     Ok(())
 }
 
-/// Reject bind kinds the server doesn't accept as bind values.
+/// Reject bind kinds whose wire type code the Phase 1 server doesn't
+/// decode. Surfacing the rejection client-side avoids ambiguous server
+/// errors (the server's QUERY_ERROR for these arrives with
+/// `request_id=0`, breaking correlation).
 ///
-/// Per the Java reference client (`QwpBindValues.java:252-253`), the
-/// server-side bind decoder does not accept SYMBOL, BINARY, IPv4, or
-/// any array type as bind values. Surfacing the rejection client-side
-/// avoids ambiguous server errors (the server's QUERY_ERROR for these
-/// arrives with `request_id=0`, breaking correlation).
+/// Reference: `core/src/main/java/io/questdb/cutlass/qwp/server/egress/QwpEgressRequestDecoder.java`
+/// `decodeBind` switch.
+///
+/// - **BINARY (0x17), IPv4 (0x18)**: no decoder case — fall into the
+///   `default ->` arm with "unsupported wire type".
+/// - **DOUBLE_ARRAY (0x11), LONG_ARRAY (0x12)**: explicit case throwing
+///   "ARRAY bind parameters not yet supported in Phase 1 egress". The
+///   QWP spec (§6 "Bind parameters") describes the eventual array bind
+///   encoding (per-row dimension header), so this is a Phase 1
+///   limitation that may be lifted server-side.
+/// - **SYMBOL (0x09)** is listed defensively. The Phase 1 server
+///   currently accepts SYMBOL bind type codes leniently, dispatching
+///   them to `BindVariableService.setStr` (spec §6 "Server leniency
+///   note"). However, the spec instructs compliant clients to send
+///   STRING / VARCHAR for symbol binds — and a future server revision
+///   may tighten this to reject SYMBOL bind type codes. The Rust
+///   `Bind` enum has no `Symbol(_)` value variant, and
+///   [`SimpleNullKind`] excludes Symbol, so this arm is unreachable
+///   through the typed API; it stays here as a defense against any
+///   future code path that might synthesise a SYMBOL-kinded `Bind`.
 pub fn check_bindable(kind: ColumnKind) -> Result<()> {
     match kind {
         ColumnKind::Symbol
@@ -380,7 +464,7 @@ mod tests {
     #[test]
     fn simple_null_layout() {
         // type_code=Long(0x05), null_flag=0x01, bitmap=0x01
-        assert_eq!(enc(Bind::Null(ColumnKind::Long)), vec![0x05, 0x01, 0x01]);
+        assert_eq!(enc(Bind::Null(SimpleNullKind::Long)), vec![0x05, 0x01, 0x01]);
     }
 
     #[test]
@@ -702,13 +786,14 @@ mod tests {
     }
 
     #[test]
-    fn null_bind_rejects_kinds_with_column_args() {
+    fn simple_null_kind_try_from_rejects_kinds_with_column_args() {
         // Each of these kinds requires column-level metadata in its null wire
-        // body (DECIMAL* scale, GEOHASH precision_bits) or a different null
-        // layout (VARCHAR / BINARY skip the offsets array on null). Using the
-        // generic `Bind::Null(k)` constructor would silently emit the wrong
-        // bytes; encode_bind must reject and direct the user to the dedicated
-        // variant.
+        // body (DECIMAL\* scale, GEOHASH precision_bits) or a different null
+        // layout (VARCHAR / BINARY skip the offsets array on null) — they
+        // route through dedicated `Null*` variants and must NOT be
+        // representable as `Bind::Null(SimpleNullKind)`. Same for SYMBOL /
+        // DOUBLE_ARRAY / LONG_ARRAY which the server rejects entirely as
+        // bind values.
         for kind in [
             ColumnKind::Varchar,
             ColumnKind::Binary,
@@ -716,13 +801,14 @@ mod tests {
             ColumnKind::Decimal128,
             ColumnKind::Decimal256,
             ColumnKind::Geohash,
+            ColumnKind::Symbol,
+            ColumnKind::DoubleArray,
+            ColumnKind::LongArray,
         ] {
-            let mut out = Vec::new();
-            let err = encode_bind(&Bind::Null(kind), &mut out).unwrap_err();
-            assert_eq!(err.code(), crate::egress::ErrorCode::InvalidBind);
+            let r = SimpleNullKind::try_from(kind);
             assert!(
-                out.is_empty(),
-                "encode_bind must not write any bytes on rejection (kind={})",
+                r.is_err(),
+                "{} must not convert to SimpleNullKind",
                 kind.name()
             );
         }
@@ -731,26 +817,27 @@ mod tests {
     #[test]
     fn null_bind_accepts_simple_kinds() {
         for kind in [
-            ColumnKind::Boolean,
-            ColumnKind::Byte,
-            ColumnKind::Short,
-            ColumnKind::Int,
-            ColumnKind::Long,
-            ColumnKind::Float,
-            ColumnKind::Double,
-            ColumnKind::Timestamp,
-            ColumnKind::TimestampNanos,
-            ColumnKind::Date,
-            ColumnKind::Uuid,
-            ColumnKind::Long256,
-            ColumnKind::Char,
-            ColumnKind::Ipv4,
+            SimpleNullKind::Boolean,
+            SimpleNullKind::Byte,
+            SimpleNullKind::Short,
+            SimpleNullKind::Int,
+            SimpleNullKind::Long,
+            SimpleNullKind::Float,
+            SimpleNullKind::Double,
+            SimpleNullKind::Timestamp,
+            SimpleNullKind::TimestampNanos,
+            SimpleNullKind::Date,
+            SimpleNullKind::Uuid,
+            SimpleNullKind::Long256,
+            SimpleNullKind::Char,
+            SimpleNullKind::Ipv4,
         ] {
             let mut out = Vec::new();
-            encode_bind(&Bind::Null(kind), &mut out)
-                .unwrap_or_else(|_| panic!("Bind::Null({}) should encode", kind.name()));
+            encode_bind(&Bind::Null(kind), &mut out).unwrap_or_else(|_| {
+                panic!("Bind::Null({}) should encode", kind.as_column_kind().name())
+            });
             // Simple null layout: [type, null_flag=0x01, bitmap=0x01]
-            assert_eq!(out, vec![kind.as_u8(), 0x01, 0x01]);
+            assert_eq!(out, vec![kind.as_column_kind().as_u8(), 0x01, 0x01]);
         }
     }
 
