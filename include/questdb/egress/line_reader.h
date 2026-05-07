@@ -47,16 +47,24 @@ extern "C" {
 // that, the four handle types have different thread-mobility rules:
 //
 //   `line_reader`         — may be migrated between threads (no concurrent
-//                           access). Internal state is held in an
-//                           `AtomicBool` with `Acquire`/`Release`
-//                           ordering, so the library does not require the
-//                           caller to add an extra fence on transfer; the
-//                           AtomicBool's release-store on each
-//                           query/cursor lifecycle event pairs with the
-//                           acquire-load on the next operation. Concurrent
-//                           operations from two threads are still
-//                           undefined behaviour — only sequential migration
-//                           is supported.
+//                           access). The caller MUST establish a
+//                           happens-before edge on every transfer — the
+//                           reader's internal state is non-atomic and the
+//                           library does not insert a fence for you. A
+//                           pthread mutex hand-off, a thread spawn/join,
+//                           or a `std::atomic` with release/acquire on
+//                           the handle pointer are all sufficient. The
+//                           library does maintain an internal AtomicBool
+//                           that guards the reader-vs-query/cursor
+//                           lifecycle and pairs Release with Acquire on
+//                           every lifecycle event, but that pairing is an
+//                           implementation detail — it cannot publish the
+//                           reader's state on the very first migration
+//                           after `_from_conf` / `_from_env` (no
+//                           lifecycle event has happened yet). Concurrent
+//                           operations from two threads are always
+//                           undefined behaviour — only sequential
+//                           migration is supported.
 //
 //   `line_reader_query`   — MUST stay on the thread that created it.
 //   `line_reader_cursor`     The query/cursor wraps an internal failover
