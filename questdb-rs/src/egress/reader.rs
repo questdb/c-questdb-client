@@ -1574,16 +1574,25 @@ impl Drop for Cursor<'_> {
         // the WS, and reusing the Reader for a new query would let the
         // next cursor pick them up and trip the request_id check.
         //
-        // Tear down the WebSocket so the server stops streaming and
-        // releases request-scoped resources. Subsequent operations on
-        // this Reader will fail at the transport layer — the user must
-        // open a fresh Reader to recover.
+        // Send a best-effort CANCEL frame before tearing the WebSocket
+        // down. Without this, the server keeps streaming `RESULT_BATCH`
+        // frames for the abandoned request until it observes the WS
+        // close — holding dictionary + schema + flow-control state for
+        // a request the user no longer cares about. The CANCEL gets the
+        // server to release that state immediately. `try_write_cancel`
+        // tightens the write timeout so a stuck peer can't hold this
+        // dropping thread for the full `WRITE_TIMEOUT`, and swallows
+        // every error: Drop has nowhere to surface them.
+        //
+        // Defensive: while the cursor invariant says transport is
+        // `Some` whenever `cursor_active` is true (the failover
+        // paths clear `cursor_active` whenever they leave the
+        // transport `None`), `Drop` should never panic.
         if self.reader.cursor_active {
-            // Defensive: while the cursor invariant says transport is
-            // `Some` whenever `cursor_active` is true (the failover
-            // paths clear `cursor_active` whenever they leave the
-            // transport `None`), `Drop` should never panic.
             if let Some(t) = self.reader.transport.as_mut() {
+                if !self.cancelling {
+                    t.try_write_cancel(self.request_id);
+                }
                 t.close_in_place();
             }
             self.reader.cursor_active = false;

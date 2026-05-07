@@ -53,6 +53,7 @@ use crate::egress::config::ReaderConfig;
 use crate::egress::error::{Error, ErrorCode, Result, fmt};
 use crate::egress::tls::build_client_config;
 use crate::egress::wire::header::{FrameHeader, HEADER_LEN};
+use crate::egress::wire::MsgKind;
 
 /// Per-write upper bound applied to the underlying `TcpStream` after a
 /// successful handshake. Caps any single `write()` syscall — including
@@ -318,6 +319,23 @@ impl WsTransport {
     /// sleep had a chance to start.
     pub fn close_in_place(&mut self) {
         teardown_inplace(&mut self.socket);
+    }
+
+    /// Best-effort CANCEL frame, tightly bounded for use from Drop.
+    ///
+    /// Tightens the write timeout to `CLOSE_TIMEOUT` first so an
+    /// unresponsive peer can't hold the dropping thread for the full
+    /// `WRITE_TIMEOUT` (60 s). All errors are swallowed: this runs
+    /// after the user has already abandoned the cursor, so reporting a
+    /// failure has nowhere to go. The caller must follow up with
+    /// `close_in_place` (or rely on `WsTransport::Drop`) to actually
+    /// tear the socket down — this method only sends the frame.
+    pub fn try_write_cancel(&mut self, request_id: i64) {
+        set_tcp_write_timeout(self.socket.get_mut(), Some(CLOSE_TIMEOUT));
+        let mut payload = Vec::with_capacity(9);
+        payload.push(MsgKind::Cancel.as_u8());
+        payload.extend_from_slice(&request_id.to_le_bytes());
+        let _ = self.socket.send(Message::Binary(Bytes::from(payload)));
     }
 }
 
