@@ -217,7 +217,18 @@ pub(crate) fn build_client_config(
                     )
                 })?;
                 let der_certs = load_pem_file(Path::new(path))?;
-                root_store.add_parsable_certificates(der_certs);
+                let total = der_certs.len();
+                let (added, ignored) = root_store.add_parsable_certificates(der_certs);
+                if added == 0 {
+                    return Err(fmt!(
+                        TlsError,
+                        "No valid certificates found in tls_roots {:?} \
+                         ({} parsed, {} rejected by rustls)",
+                        path,
+                        total,
+                        ignored
+                    ));
+                }
             }
         }
     }
@@ -242,4 +253,65 @@ pub(crate) fn build_client_config(
     }
 
     Ok(Some(Arc::new(client_config)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::egress::config::ReaderConfig;
+    use crate::egress::error::ErrorCode;
+    use std::io::Write;
+
+    fn config_with_roots(path: &str) -> ReaderConfig {
+        ReaderConfig::from_conf(&format!(
+            "qwps::addr=h:9000;tls_ca=pem_file;tls_roots={path}"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn pem_file_empty_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.pem");
+        std::fs::File::create(&path).unwrap();
+        let cfg = config_with_roots(path.to_str().unwrap());
+        let err = build_client_config(&cfg).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::TlsError);
+        assert!(
+            err.msg().contains("No valid certificates"),
+            "got: {}",
+            err.msg()
+        );
+    }
+
+    #[test]
+    fn pem_file_all_invalid_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("garbage.pem");
+        let mut f = std::fs::File::create(&path).unwrap();
+        // A syntactically valid PEM block whose body is not a valid DER
+        // certificate. `pem_reader_iter` parses it; rustls then rejects
+        // the bytes — so `added == 0 && ignored > 0`.
+        writeln!(
+            f,
+            "-----BEGIN CERTIFICATE-----\nbm90LWEtY2VydA==\n-----END CERTIFICATE-----"
+        )
+        .unwrap();
+        let cfg = config_with_roots(path.to_str().unwrap());
+        let err = build_client_config(&cfg).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::TlsError);
+        assert!(
+            err.msg().contains("rejected by rustls"),
+            "got: {}",
+            err.msg()
+        );
+    }
+
+    #[test]
+    fn pem_file_missing_rejected() {
+        let cfg = config_with_roots("/this/path/does/not/exist.pem");
+        let err = build_client_config(&cfg).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::TlsError);
+        assert!(err.msg().contains("Could not open"), "got: {}", err.msg());
+    }
 }
