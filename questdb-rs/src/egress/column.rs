@@ -153,7 +153,16 @@ pub struct FixedColumn<'a, T: FixedWidth> {
 }
 
 impl<'a, T: FixedWidth> FixedColumn<'a, T> {
-    pub fn new(raw: &'a [u8], validity: Validity<'a>) -> Self {
+    /// Construct a borrowed view over decoder-produced bytes.
+    ///
+    /// `pub(crate)` because the constructor accepts raw wire-format
+    /// bytes whose length invariants (multiple of `T::SIZE`, validity
+    /// bitmap matching `len()`) are only `debug_assert!`-checked. In
+    /// release builds, an out-of-spec input causes silent garbage or
+    /// out-of-bounds panics from `value()` — exposing it as a safe
+    /// `pub fn` would let external callers trip both. The decoder
+    /// upholds the invariants by construction.
+    pub(crate) fn new(raw: &'a [u8], validity: Validity<'a>) -> Self {
         debug_assert_eq!(
             raw.len() % T::SIZE,
             0,
@@ -244,7 +253,9 @@ pub struct FixedBytesColumn<'a, const N: usize> {
 }
 
 impl<'a, const N: usize> FixedBytesColumn<'a, N> {
-    pub fn new(raw: &'a [u8], validity: Validity<'a>) -> Self {
+    /// `pub(crate)` for the same reason as [`FixedColumn::new`]: the
+    /// `raw.len() % N == 0` invariant is `debug_assert!`-only.
+    pub(crate) fn new(raw: &'a [u8], validity: Validity<'a>) -> Self {
         debug_assert_eq!(raw.len() % N, 0);
         Self { raw, validity }
     }
@@ -305,7 +316,12 @@ pub struct SymbolColumn<'a> {
 }
 
 impl<'a> SymbolColumn<'a> {
-    pub fn new(codes: &'a [u32], validity: Validity<'a>, dict: &'a SymbolDict) -> Self {
+    /// `pub(crate)`: callers must supply `codes` whose entries are all
+    /// less than `dict.len()` (decoder-enforced via the post-decode
+    /// dict-bounds check). A safe `pub fn` would let external callers
+    /// build a column where `resolve()` silently returns `None` for
+    /// non-null rows — masking wire corruption as SQL NULL.
+    pub(crate) fn new(codes: &'a [u32], validity: Validity<'a>, dict: &'a SymbolDict) -> Self {
         Self {
             codes,
             validity,
@@ -361,7 +377,9 @@ pub struct Decimal64Column<'a> {
 }
 
 impl<'a> Decimal64Column<'a> {
-    pub fn new(raw: &'a [u8], validity: Validity<'a>, scale: i8) -> Self {
+    /// `pub(crate)`: wraps a `FixedColumn<i64>`; same wire-bytes
+    /// invariants apply.
+    pub(crate) fn new(raw: &'a [u8], validity: Validity<'a>, scale: i8) -> Self {
         Self {
             values: FixedColumn::new(raw, validity),
             scale,
@@ -459,7 +477,11 @@ impl<'a> VarcharColumn<'a> {
     /// The decoder upholds this invariant by validating the concatenated
     /// `data` buffer once at decode time and only emitting offsets at
     /// codepoint boundaries.
-    pub unsafe fn new(offsets: &'a [u32], data: &'a [u8], validity: Validity<'a>) -> Self {
+    pub(crate) unsafe fn new(
+        offsets: &'a [u32],
+        data: &'a [u8],
+        validity: Validity<'a>,
+    ) -> Self {
         Self {
             inner: VarlenLayout {
                 offsets,
@@ -516,7 +538,11 @@ pub struct BinaryColumn<'a> {
 }
 
 impl<'a> BinaryColumn<'a> {
-    pub fn new(offsets: &'a [u32], data: &'a [u8], validity: Validity<'a>) -> Self {
+    /// `pub(crate)`: callers must supply monotonically-non-decreasing
+    /// `offsets` ending at `data.len()`, with `offsets.len() == row_count + 1`
+    /// (or matching the no-null fast path the decoder uses). Out-of-spec
+    /// inputs cause `value()` to read garbage or panic.
+    pub(crate) fn new(offsets: &'a [u32], data: &'a [u8], validity: Validity<'a>) -> Self {
         Self {
             inner: VarlenLayout {
                 offsets,
@@ -580,7 +606,14 @@ pub struct GeohashColumn<'a> {
 }
 
 impl<'a> GeohashColumn<'a> {
-    pub fn new(raw: &'a [u8], byte_width: u8, precision_bits: u8, validity: Validity<'a>) -> Self {
+    /// `pub(crate)`: the `byte_width` ∈ 1..=8 and `raw.len() % byte_width
+    /// == 0` invariants are `debug_assert!`-only.
+    pub(crate) fn new(
+        raw: &'a [u8],
+        byte_width: u8,
+        precision_bits: u8,
+        validity: Validity<'a>,
+    ) -> Self {
         debug_assert!((1..=8).contains(&byte_width));
         debug_assert_eq!(raw.len() % byte_width as usize, 0);
         Self {
@@ -651,7 +684,9 @@ pub struct Decimal128Column<'a> {
 }
 
 impl<'a> Decimal128Column<'a> {
-    pub fn new(raw: &'a [u8], validity: Validity<'a>, scale: i8) -> Self {
+    /// `pub(crate)`: `raw.len() % 16 == 0` invariant is
+    /// `debug_assert!`-only.
+    pub(crate) fn new(raw: &'a [u8], validity: Validity<'a>, scale: i8) -> Self {
         debug_assert_eq!(raw.len() % 16, 0);
         Self {
             raw,
@@ -710,7 +745,9 @@ pub struct Decimal256Column<'a> {
 }
 
 impl<'a> Decimal256Column<'a> {
-    pub fn new(raw: &'a [u8], validity: Validity<'a>, scale: i8) -> Self {
+    /// `pub(crate)`: `raw.len() % 32 == 0` invariant is
+    /// `debug_assert!`-only.
+    pub(crate) fn new(raw: &'a [u8], validity: Validity<'a>, scale: i8) -> Self {
         debug_assert_eq!(raw.len() % 32, 0);
         Self {
             raw,
@@ -809,7 +846,13 @@ pub struct DoubleArrayColumn<'a> {
 }
 
 impl<'a> DoubleArrayColumn<'a> {
-    pub fn new(
+    /// `pub(crate)`: the four-buffer layout (data_offsets,
+    /// shape_offsets, shapes, data) must be internally consistent —
+    /// `data_offsets`/`shape_offsets` non-decreasing, terminating at
+    /// `data.len()`/`shapes.len()`, and matching the validity bitmap's
+    /// row count. Out-of-spec inputs cause `element()` / `shape()` to
+    /// return garbage or panic.
+    pub(crate) fn new(
         data_offsets: &'a [u32],
         data: &'a [u8],
         shapes: &'a [u32],
@@ -877,7 +920,9 @@ pub struct LongArrayColumn<'a> {
 }
 
 impl<'a> LongArrayColumn<'a> {
-    pub fn new(
+    /// `pub(crate)`: see [`DoubleArrayColumn::new`] — same four-buffer
+    /// invariants apply.
+    pub(crate) fn new(
         data_offsets: &'a [u32],
         data: &'a [u8],
         shapes: &'a [u32],
