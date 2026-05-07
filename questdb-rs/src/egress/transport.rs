@@ -37,7 +37,7 @@
 //! duplicate that gate (clippy::duplicated_attributes) without
 //! changing what's compiled.
 
-use std::net::{Shutdown, TcpStream};
+use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -137,8 +137,34 @@ impl WsTransport {
         // `tls_roots` / `tls_verify` knobs) to tungstenite. Going
         // through `tungstenite::connect()` would force the built-in
         // webpki-roots config and bypass any of the user's TLS knobs.
-        let tcp = TcpStream::connect((endpoint.host.as_str(), endpoint.port))
-            .map_err(|e| fmt!(SocketError, "could not connect to {}: {}", endpoint, e))?;
+        //
+        // Resolve and connect as separate steps so a name-resolution
+        // failure surfaces as `CouldNotResolveAddr` (distinct from a
+        // connect-time `SocketError`). `TcpStream::connect((host, port))`
+        // collapses both into a single `io::Error` whose `kind()` is
+        // `Other` — losing the user-actionable distinction.
+        let mut addrs = (endpoint.host.as_str(), endpoint.port)
+            .to_socket_addrs()
+            .map_err(|e| {
+                fmt!(
+                    CouldNotResolveAddr,
+                    "could not resolve {}: {}",
+                    endpoint,
+                    e
+                )
+            })?;
+        let tcp = match addrs.next() {
+            Some(addr) => TcpStream::connect(addr).map_err(|e| {
+                fmt!(SocketError, "could not connect to {}: {}", endpoint, e)
+            })?,
+            None => {
+                return Err(fmt!(
+                    CouldNotResolveAddr,
+                    "name resolution returned no addresses for {}",
+                    endpoint
+                ));
+            }
+        };
         let connector = build_client_config(config)?.map(Connector::Rustls);
         // Pin tungstenite's per-message size ceiling explicitly. Without
         // this we inherit the library default (currently 64 MiB but

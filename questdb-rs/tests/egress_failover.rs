@@ -144,6 +144,13 @@ enum Action {
     /// synchronously with "Connection reset by peer", letting tests
     /// reliably exercise paths that depend on a failed write.
     AbortiveRst,
+    /// Override the `x-qwp-version` value injected into the WS upgrade
+    /// response. Detected before `accept_hdr` runs (like `Reject401`),
+    /// so it parameterises the handshake itself rather than running as
+    /// a script step. Default is `2`. Used to drive the
+    /// `UnsupportedServer` path in `transport.rs` by negotiating a
+    /// version higher than `config.max_version`.
+    HandshakeVersion(u8),
 }
 
 /// Behaviour for a single accepted connection.
@@ -289,12 +296,25 @@ fn run_script(stream: TcpStream, script: Script, captured_requests: Arc<Mutex<Ve
         return;
     }
 
-    let mut ws = match accept_hdr(stream, |_req: &Request, mut resp: Response| {
-        // Inject the X-QWP-Version response header so the client's
-        // handshake validator is happy. Always negotiate v2 in tests
-        // (matches what we send in SERVER_INFO).
-        resp.headers_mut()
-            .insert("x-qwp-version", HeaderValue::from_static("2"));
+    // Pick the `x-qwp-version` to advertise. Default is "2" (matches
+    // SERVER_INFO frames the helpers build); a `HandshakeVersion(v)`
+    // action anywhere in the script overrides it so tests can drive
+    // the version-mismatch path in `WsTransport::connect_to`.
+    let handshake_version: String = script
+        .iter()
+        .find_map(|a| match a {
+            Action::HandshakeVersion(v) => Some(v.to_string()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "2".to_string());
+    let handshake_version_for_closure = handshake_version.clone();
+
+    let mut ws = match accept_hdr(stream, move |_req: &Request, mut resp: Response| {
+        // Inject the X-QWP-Version response header. By default we
+        // negotiate v2 to match the SERVER_INFO frames the helpers
+        // build; a `HandshakeVersion(v)` script entry overrides it.
+        let header = HeaderValue::from_str(&handshake_version_for_closure).unwrap();
+        resp.headers_mut().insert("x-qwp-version", header);
         Ok(resp)
     }) {
         Ok(ws) => ws,
@@ -345,6 +365,8 @@ fn run_script(stream: TcpStream, script: Script, captured_requests: Arc<Mutex<Ve
                 drop(ws);
                 return;
             }
+            // Already consumed before the WS upgrade; nothing to do here.
+            Action::HandshakeVersion(_) => {}
         }
     }
 }
@@ -2042,4 +2064,62 @@ fn failover_constants_reexported_at_egress_root() {
         DEFAULT_FAILOVER_BACKOFF_INITIAL_MS
     );
     assert_eq!(cfg.failover_backoff_max_ms, DEFAULT_FAILOVER_BACKOFF_MAX_MS);
+}
+
+/// Server negotiates a higher QWP version than the client supports.
+/// `WsTransport::connect_to` (transport.rs) compares the
+/// `x-qwp-version` upgrade header against `config.max_version` and
+/// returns `UnsupportedServer` on mismatch — pin that path so a
+/// client built against today's QWP1/QWP2 doesn't silently start
+/// talking to a future incompatible server. The test also disables
+/// failover so we observe the *direct* error rather than a wrapped
+/// "all endpoints exhausted" surface.
+#[test]
+fn unsupported_server_version_surfaces_unsupported_server() {
+    let srv = MockServer::start(vec![vec![
+        // 99 is comfortably above any version the current client
+        // advertises; the trigger is `server_version > max_version`.
+        Action::HandshakeVersion(99),
+    ]]);
+    let conf = format!("qwp::addr={};failover=off", srv.url());
+    let err = match Reader::from_conf(&conf) {
+        Ok(_) => panic!("connect must reject a higher-than-max QWP version"),
+        Err(e) => e,
+    };
+    assert_eq!(
+        err.code(),
+        ErrorCode::UnsupportedServer,
+        "version mismatch must surface UnsupportedServer; got {:?}: {}",
+        err.code(),
+        err.msg()
+    );
+    assert!(
+        err.msg().contains("99"),
+        "error message should mention the negotiated version 99: {}",
+        err.msg()
+    );
+}
+
+/// Connect-string addr with an unresolvable hostname must surface
+/// `CouldNotResolveAddr`. Uses the reserved `.invalid` TLD (RFC 6761)
+/// so the test is deterministic on every host without depending on
+/// negative DNS caching. `failover=off` strips the failover wrapper
+/// so the error code is the direct one.
+#[test]
+fn unresolvable_host_surfaces_could_not_resolve_addr() {
+    // RFC 6761 guarantees `.invalid` is never resolvable. Subdomain
+    // padding keeps it out of any local /etc/hosts override that
+    // might intercept a bare label.
+    let conf = "qwp::addr=does-not-exist.qwp-test.invalid:9009;failover=off";
+    let err = match Reader::from_conf(conf) {
+        Ok(_) => panic!("connect must fail when DNS does not resolve"),
+        Err(e) => e,
+    };
+    assert_eq!(
+        err.code(),
+        ErrorCode::CouldNotResolveAddr,
+        "unresolvable host must surface CouldNotResolveAddr; got {:?}: {}",
+        err.code(),
+        err.msg()
+    );
 }
