@@ -646,8 +646,23 @@ impl Sender {
     /// Drive one QWP/WebSocket progress step when the sender was built with
     /// [`QwpWsProgress::Manual`].
     ///
-    /// This sends at most one queued frame or polls one ready response. It
-    /// returns `Ok(false)` when no progress is immediately available.
+    /// One call performs, in order:
+    /// - send at most one queued frame;
+    /// - drain all ready response frames from the transport (acks, durable
+    ///   acks, rejects), applying their effects on local store state;
+    /// - perform at most one bounded storage-maintenance step (provision a
+    ///   missing hot spare or trim one fully-acked sealed segment) when
+    ///   Store-and-Forward is configured;
+    /// - send a durable-ACK keepalive only if nothing above produced
+    ///   progress and one is due.
+    ///
+    /// Returns `Ok(true)` if any of those steps produced progress and
+    /// `Ok(false)` when the call was idle. Manual schedulers should keep
+    /// calling `drive_once` until it returns `false` before parking, since the
+    /// receive drain and storage maintenance are paced one unit per call:
+    /// hot-spare provisioning and segment trim each take their own call, so a
+    /// large ACK can free segment-cap headroom over several `drive_once`
+    /// turns.
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn drive_once(&mut self) -> Result<bool> {
         match &mut self.handler {

@@ -29,6 +29,8 @@
 //! payload, and the publication driver publishes those bytes to the driver's
 //! queue.
 
+use std::time::Duration;
+
 use crate::error;
 use crate::ingress::buffer::{QwpBuffer, QwpWsEncodeScratch, SymbolGlobalDict};
 
@@ -103,10 +105,10 @@ impl<Q: PublicationLog, T: ManualDriverTransport> QwpWsPublicationDriver<Q, T> {
         Ok(self.driver.try_submit(payload)?)
     }
 
-    pub(crate) fn submit_qwp_with_drive_limit(
+    pub(crate) fn submit_qwp_with_append_deadline(
         &mut self,
         buffer: &QwpBuffer,
-        max_drive_steps: usize,
+        append_deadline: Duration,
     ) -> Result<QwpReceipt, QwpWsPublicationError> {
         let payload = self
             .encoder
@@ -114,7 +116,7 @@ impl<Q: PublicationLog, T: ManualDriverTransport> QwpWsPublicationDriver<Q, T> {
             .map_err(QwpWsPublicationError::Encode)?;
         Ok(self
             .driver
-            .submit_with_drive_limit(payload, max_drive_steps)?)
+            .submit_with_drive_deadline(payload, append_deadline)?)
     }
 
     #[cfg(test)]

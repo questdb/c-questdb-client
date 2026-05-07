@@ -149,7 +149,8 @@ fn qwpws_store_and_forward_config_parses_java_keys() {
          sender_id=primary-1;\
          sf_max_bytes=64mb;\
          sf_max_total_bytes=4G;\
-         sf_durability=memory;",
+         sf_durability=memory;\
+         sf_append_deadline_millis=1234;",
     )
     .unwrap();
 
@@ -160,6 +161,7 @@ fn qwpws_store_and_forward_config_parses_java_keys() {
     assert_specified_eq(&qwp_ws.sf_max_bytes, 64 * 1024 * 1024_u64);
     assert_specified_eq(&qwp_ws.sf_max_total_bytes, Some(4 * 1024 * 1024 * 1024_u64));
     assert_specified_eq(&qwp_ws.sf_durability, conf::SfDurability::Memory);
+    assert_specified_eq(&qwp_ws.sf_append_deadline, Duration::from_millis(1234));
 }
 
 #[cfg(feature = "sync-sender-qwp-ws")]
@@ -182,6 +184,7 @@ fn qwpws_store_and_forward_defaults_match_java() {
     assert_defaulted_eq(&qwp_ws.sf_max_bytes, 4 * 1024 * 1024_u64);
     assert_defaulted_eq(&qwp_ws.sf_max_total_bytes, None);
     assert_defaulted_eq(&qwp_ws.sf_durability, conf::SfDurability::Memory);
+    assert_defaulted_eq(&qwp_ws.sf_append_deadline, Duration::from_secs(30));
     assert_defaulted_eq(&qwp_ws.progress, QwpWsProgress::Background);
 }
 
@@ -286,9 +289,10 @@ fn qwpws_store_and_forward_config_rejects_invalid_java_keys() {
         SenderBuilder::from_conf("qwpws::addr=localhost:9000;qwp_ws_progress=sync;"),
         "invalid qwp_ws_progress [value=sync, allowed-values=[background, manual]]",
     );
+    SenderBuilder::from_conf("qwpws::addr=localhost:9000;sf_append_deadline_millis=1234;").unwrap();
     assert_conf_err(
-        SenderBuilder::from_conf("qwpws::addr=localhost:9000;sf_append_deadline_millis=1234;"),
-        "\"sf_append_deadline_millis\" is not supported by the Rust QWP/WebSocket sync sender yet; local-publication backpressure is not implemented.",
+        SenderBuilder::from_conf("qwpws::addr=localhost:9000;sf_append_deadline_millis=0;"),
+        "\"sf_append_deadline_millis\" must be greater than 0.",
     );
     assert_conf_err(
         SenderBuilder::from_conf("qwpws::addr=localhost:9000;close_flush_timeout_millis=5000;"),

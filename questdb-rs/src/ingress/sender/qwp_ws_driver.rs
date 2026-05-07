@@ -59,6 +59,9 @@ use super::qwp_ws_queue::{
     PendingPayload, QueueError, QwpReceipt, QwpReceiptStatus, SentFrame, VolatileFrameQueue,
     VolatileQueueOptions,
 };
+use super::qwp_ws_sfa_queue::{
+    SfaCleanupFailure, SfaStorageFinish, SfaStorageResult, SfaStorageStep,
+};
 
 const DEFAULT_EVENT_CAPACITY: usize = 1024;
 
@@ -187,7 +190,7 @@ impl PublicationLifecycle {
         );
     }
 
-    fn terminalize(&self) -> PublicationState {
+    pub(crate) fn terminalize(&self) -> PublicationState {
         PublicationState::from_raw(self.state.swap(PUBLICATION_TERMINAL, Ordering::AcqRel))
     }
 
@@ -248,13 +251,13 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
     }
 
     pub(crate) fn next_outbound_frame(
-        &self,
+        &mut self,
         send_cursor: &mut SendCursor,
     ) -> Result<Option<OutboundFrame>, DriverError> {
         if self.is_terminal() {
             return Ok(None);
         }
-        send_cursor.next_outbound_frame(&self.queue)
+        self.queue.next_outbound_frame(send_cursor)
     }
 
     pub(crate) fn record_sent_frame(
@@ -441,6 +444,7 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         send_cursor: &mut SendCursor,
         reason: ReconnectReason,
     ) -> DriveOutcome {
+        self.queue.restart_send_cursor();
         send_cursor.restart(&self.queue);
         if self.durable_ack.is_some() {
             self.clear_unresolved_rejected_frames();
@@ -501,6 +505,28 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         self.durable_ack
             .as_ref()
             .is_some_and(DurableAckTracker::has_pending)
+    }
+
+    pub(crate) fn take_storage_maintenance_step(
+        &mut self,
+    ) -> Result<Option<SfaStorageStep>, DriverError> {
+        self.queue
+            .take_storage_maintenance_step(self.lifecycle.load() == PublicationState::Open)
+    }
+
+    pub(crate) fn finish_storage_maintenance(
+        &mut self,
+        result: SfaStorageResult,
+    ) -> Result<SfaStorageFinish, DriverError> {
+        self.queue
+            .finish_storage_maintenance(result, self.lifecycle.load() == PublicationState::Open)
+    }
+
+    pub(crate) fn record_storage_cleanup_failure(
+        &mut self,
+        failure: SfaCleanupFailure,
+    ) -> Result<(), DriverError> {
+        self.queue.record_storage_cleanup_failure(failure)
     }
 
     fn is_rejected_fsn(&self, fsn: u64) -> bool {
@@ -660,7 +686,7 @@ impl<T: ManualDriverTransport> QwpWsSendCore<T> {
 
     pub(crate) fn next_outbound_frame<Q: PublicationLog>(
         &mut self,
-        store: &QwpWsPublicationStore<Q>,
+        store: &mut QwpWsPublicationStore<Q>,
     ) -> Result<Option<OutboundFrame>, DriverError> {
         store.next_outbound_frame(&mut self.send_cursor)
     }
@@ -907,15 +933,23 @@ impl<Q: PublicationLog, T: ManualDriverTransport> ManualDriverPrototype<Q, T> {
             match self.store.try_submit(payload) {
                 Ok(receipt) => return Ok(receipt),
                 Err(DriverError::Queue(
-                    QueueError::FrameCapacityFull { .. } | QueueError::ByteCapacityFull { .. },
+                    QueueError::FrameCapacityFull { .. }
+                    | QueueError::ByteCapacityFull { .. }
+                    | QueueError::StorageSpareNotReady { .. }
+                    | QueueError::StorageSegmentCapFull { .. },
                 )) if drive_steps < max_drive_steps => {
                     self.drive_once()?;
                     drive_steps += 1;
                 }
                 Err(DriverError::Queue(
-                    QueueError::FrameCapacityFull { .. } | QueueError::ByteCapacityFull { .. },
+                    err @ (QueueError::FrameCapacityFull { .. }
+                    | QueueError::ByteCapacityFull { .. }
+                    | QueueError::StorageSpareNotReady { .. }
+                    | QueueError::StorageSegmentCapFull { .. }),
                 )) => {
-                    return Err(DriverError::SubmitTimedOut);
+                    return Err(DriverError::SubmitTimedOut {
+                        backpressure: Some(err),
+                    });
                 }
                 Err(
                     err @ (DriverError::Queue(
@@ -935,11 +969,40 @@ impl<Q: PublicationLog, T: ManualDriverTransport> ManualDriverPrototype<Q, T> {
                     )
                     | DriverError::Transport(_)
                     | DriverError::Storage(_)
-                    | DriverError::SubmitTimedOut
+                    | DriverError::SubmitTimedOut { .. }
                     | DriverError::Terminal
                     | DriverError::Closing
                     | DriverError::UnknownReceipt { .. }),
                 ) => return Err(err),
+            }
+        }
+    }
+
+    pub(crate) fn submit_with_drive_deadline(
+        &mut self,
+        payload: &[u8],
+        append_deadline: Duration,
+    ) -> Result<QwpReceipt, DriverError> {
+        let deadline = Instant::now().checked_add(append_deadline);
+        loop {
+            if self.store.is_terminal() {
+                return Err(DriverError::Terminal);
+            }
+            match self.store.try_submit(payload) {
+                Ok(receipt) => return Ok(receipt),
+                Err(err) => {
+                    let Some(backpressure) = driver_backpressure_queue(&err) else {
+                        return Err(err);
+                    };
+                    if drive_deadline_expired(deadline) {
+                        return Err(DriverError::SubmitTimedOut {
+                            backpressure: Some(backpressure),
+                        });
+                    }
+                    if self.drive_once()? == DriveOutcome::Idle {
+                        sleep_until_drive_deadline(deadline);
+                    }
+                }
             }
         }
     }
@@ -969,6 +1032,10 @@ impl<Q: PublicationLog, T: ManualDriverTransport> ManualDriverPrototype<Q, T> {
             outcome = receive;
         }
 
+        if self.drive_storage_once()? && outcome == DriveOutcome::Idle {
+            outcome = DriveOutcome::Progress;
+        }
+
         if outcome == DriveOutcome::Idle {
             outcome = self.drive_durable_ack_keepalive_once()?;
         }
@@ -977,6 +1044,22 @@ impl<Q: PublicationLog, T: ManualDriverTransport> ManualDriverPrototype<Q, T> {
 
     pub(crate) fn drive_ready_once(&mut self) -> Result<DriveOutcome, DriverError> {
         self.drive_once()
+    }
+
+    fn drive_storage_once(&mut self) -> Result<bool, DriverError> {
+        let Some(step) = self.store.take_storage_maintenance_step()? else {
+            return Ok(false);
+        };
+        let changed_before_io = step.changes_queue_before_io();
+        let result = step.perform()?;
+        let finish = self.store.finish_storage_maintenance(result)?;
+        let changed = changed_before_io || finish.did_change();
+        if let Some(cleanup) = finish.into_cleanup()
+            && let Some(failure) = cleanup.perform()
+        {
+            self.store.record_storage_cleanup_failure(failure)?;
+        }
+        Ok(changed)
     }
 
     pub(crate) fn drive_send_once(&mut self) -> Result<DriveOutcome, DriverError> {
@@ -1054,7 +1137,7 @@ impl<Q: PublicationLog, T: ManualDriverTransport> ManualDriverPrototype<Q, T> {
     }
 
     fn drive_send_available(&mut self) -> Result<Option<DriveOutcome>, DriverError> {
-        let Some(outbound) = self.send_core.next_outbound_frame(&self.store)? else {
+        let Some(outbound) = self.send_core.next_outbound_frame(&mut self.store)? else {
             return Ok(None);
         };
 
@@ -1289,7 +1372,46 @@ pub(crate) trait PublicationLog {
     fn take_lock_free_producer(&mut self) -> Option<LockFreeVolatileProducer> {
         None
     }
+    fn next_outbound_frame(
+        &mut self,
+        send_cursor: &mut SendCursor,
+    ) -> Result<Option<OutboundFrame>, DriverError>
+    where
+        Self: Sized,
+    {
+        let Some((fsn, wire_seq)) = send_cursor.peek_next_frame(self)? else {
+            return Ok(None);
+        };
+        let Some(payload) = self.pending_payload_for_fsn(fsn)? else {
+            return Ok(None);
+        };
+        Ok(Some(OutboundFrame {
+            fsn,
+            wire_seq,
+            payload,
+        }))
+    }
     fn pending_payload_for_fsn(&self, fsn: u64) -> Result<Option<PendingPayload>, DriverError>;
+    fn restart_send_cursor(&mut self) {}
+    fn take_storage_maintenance_step(
+        &mut self,
+        _allow_create: bool,
+    ) -> Result<Option<SfaStorageStep>, DriverError> {
+        Ok(None)
+    }
+    fn finish_storage_maintenance(
+        &mut self,
+        _result: SfaStorageResult,
+        _allow_install: bool,
+    ) -> Result<SfaStorageFinish, DriverError> {
+        Ok(SfaStorageFinish::unchanged())
+    }
+    fn record_storage_cleanup_failure(
+        &mut self,
+        _failure: SfaCleanupFailure,
+    ) -> Result<(), DriverError> {
+        Ok(())
+    }
     fn oldest_unresolved_fsn(&self) -> Option<u64>;
     fn complete_through(&mut self, fsn: u64) -> Result<(), DriverError>;
     fn reject_fsn(&mut self, fsn: u64) -> Result<QwpReceipt, DriverError>;
@@ -1324,10 +1446,10 @@ impl SendCursor {
         }
     }
 
-    fn next_outbound_frame<Q: PublicationLog>(
+    pub(crate) fn peek_next_frame<Q: PublicationLog>(
         &mut self,
         log: &Q,
-    ) -> Result<Option<OutboundFrame>, DriverError> {
+    ) -> Result<Option<(u64, u64)>, DriverError> {
         if self.in_flight.len() >= self.max_in_flight {
             return Ok(None);
         }
@@ -1344,14 +1466,7 @@ impl SendCursor {
             }
         };
 
-        let Some(payload) = log.pending_payload_for_fsn(fsn)? else {
-            return Ok(None);
-        };
-        Ok(Some(OutboundFrame {
-            fsn,
-            wire_seq: self.next_wire_seq,
-            payload,
-        }))
+        Ok(Some((fsn, self.next_wire_seq)))
     }
 
     fn commit_sent(&mut self, frame: SentFrame) -> Result<(), DriverError> {
@@ -1846,7 +1961,7 @@ pub(crate) enum DriverError {
     Queue(QueueError),
     Transport(Error),
     Storage(Error),
-    SubmitTimedOut,
+    SubmitTimedOut { backpressure: Option<QueueError> },
     Terminal,
     Closing,
     UnknownReceipt { fsn: u64 },
@@ -1945,6 +2060,36 @@ pub(crate) enum DriverEvent {
     Rejected { fsn: u64, wire_seq: u64 },
     Reconnected { reason: ReconnectReason },
     Terminal,
+}
+
+fn driver_backpressure_queue(err: &DriverError) -> Option<QueueError> {
+    match err {
+        DriverError::Queue(
+            err @ (QueueError::FrameCapacityFull { .. }
+            | QueueError::ByteCapacityFull { .. }
+            | QueueError::StorageSpareNotReady { .. }
+            | QueueError::StorageSegmentCapFull { .. }),
+        ) => Some(*err),
+        _ => None,
+    }
+}
+
+fn drive_deadline_expired(deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|deadline| deadline <= Instant::now())
+}
+
+fn sleep_until_drive_deadline(deadline: Option<Instant>) {
+    let sleep_for = match deadline {
+        Some(deadline) => {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return;
+            }
+            remaining.min(Duration::from_millis(10))
+        }
+        None => Duration::from_millis(10),
+    };
+    std::thread::sleep(sleep_for);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2311,6 +2456,51 @@ impl ManualDriverTransport for FakeOrderedServer {
                 TransportFailure::Terminal(fake_transport_error("fake terminal failure")),
             ),
         })
+    }
+
+    fn sent_frames(&self) -> &[SentFrame] {
+        &self.sent_frames
+    }
+}
+
+#[derive(Debug)]
+struct DelayedPollAckServer {
+    polls_before_ack: usize,
+    ack_sent: bool,
+    sent_frames: Vec<SentFrame>,
+}
+
+impl DelayedPollAckServer {
+    fn new(polls_before_ack: usize) -> Self {
+        Self {
+            polls_before_ack,
+            ack_sent: false,
+            sent_frames: Vec::new(),
+        }
+    }
+}
+
+impl ManualDriverTransport for DelayedPollAckServer {
+    fn try_poll_response(&mut self) -> Result<TransportPoll, TransportFailure> {
+        if self.sent_frames.is_empty() || self.ack_sent {
+            return Ok(TransportPoll::Idle);
+        }
+        if self.polls_before_ack > 0 {
+            self.polls_before_ack -= 1;
+            return Ok(TransportPoll::Idle);
+        }
+        self.ack_sent = true;
+        Ok(TransportPoll::Response(TransportResponse::Ack {
+            wire_seq: self.sent_frames[0].wire_seq,
+        }))
+    }
+
+    fn send_frame(
+        &mut self,
+        frame: OutboundFrameView<'_>,
+    ) -> Result<TransportSendResult, TransportFailure> {
+        self.sent_frames.push(frame.sent_frame());
+        Ok(TransportSendResult::NoResponse)
     }
 
     fn sent_frames(&self) -> &[SentFrame] {
@@ -3241,8 +3431,47 @@ mod tests {
 
         assert_eq!(
             driver.submit_with_drive_limit(b"second", 1),
-            Err(DriverError::SubmitTimedOut)
+            Err(DriverError::SubmitTimedOut {
+                backpressure: Some(QueueError::FrameCapacityFull { max_frames: 1 })
+            })
         );
+    }
+
+    #[test]
+    fn blocking_submit_deadline_continues_past_fixed_step_budget() {
+        let queue = VolatileFrameQueue::new(options(1, 1024, 1)).unwrap();
+        let mut driver = ManualDriverPrototype::from_queue(queue, DelayedPollAckServer::new(20));
+        let first = driver.try_submit(b"first").unwrap();
+
+        let second = driver
+            .submit_with_drive_deadline(b"second", Duration::from_secs(2))
+            .unwrap();
+
+        assert_eq!(
+            driver.receipt_status(first),
+            QwpReceiptStatus::Acked { fsn: 0 }
+        );
+        assert_eq!(
+            driver.receipt_status(second),
+            QwpReceiptStatus::Published { fsn: 1 }
+        );
+        assert_eq!(driver.sent_frames().len(), 1);
+    }
+
+    #[test]
+    fn blocking_submit_deadline_can_expire_before_driving() {
+        let mut driver =
+            ManualDriverPrototype::new(options(1, 1024, 1), FakeOrderedServer::no_response())
+                .unwrap();
+        driver.try_submit(b"first").unwrap();
+
+        assert_eq!(
+            driver.submit_with_drive_deadline(b"second", Duration::ZERO),
+            Err(DriverError::SubmitTimedOut {
+                backpressure: Some(QueueError::FrameCapacityFull { max_frames: 1 })
+            })
+        );
+        assert!(driver.sent_frames().is_empty());
     }
 
     #[test]

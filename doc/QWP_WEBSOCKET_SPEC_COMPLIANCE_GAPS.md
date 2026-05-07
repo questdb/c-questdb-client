@@ -1,12 +1,9 @@
 # QWP/WebSocket spec compliance gaps
 
-Date: 2026-05-05
+Date: 2026-05-06
 
-Status: audit handoff, updated after the parser-completeness, internal
-durable-ACK-tracker, and public durable-ACK enablement slices. Response parser
-completeness, durable ACK upgrade echo validation, durable OK tracking, durable
-ACK trimming, and durable keepalive PINGs are implemented in the current
-working tree.
+Status: open-gap handoff. Completed implementation notes have been removed
+unless they still explain an unresolved spec/reference decision.
 
 This document records gaps found while comparing the Rust QWP/WebSocket
 Store-and-Forward implementation against the current QWP spec documents in:
@@ -52,9 +49,16 @@ Primary Rust files inspected:
 Primary Java reference files inspected:
 
 - `/home/jara/devel/oss/questdb-arrays/java-questdb-client/core/src/main/java/io/questdb/client/Sender.java`
+- `/home/jara/devel/oss/questdb-arrays/java-questdb-client/core/src/main/java/io/questdb/client/SenderProgressHandler.java`
+- `/home/jara/devel/oss/questdb-arrays/java-questdb-client/core/src/main/java/io/questdb/client/cutlass/http/client/WebSocketClient.java`
+- `/home/jara/devel/oss/questdb-arrays/java-questdb-client/core/src/main/java/io/questdb/client/cutlass/http/client/WebSocketFrameHandler.java`
+- `/home/jara/devel/oss/questdb-arrays/java-questdb-client/core/src/main/java/io/questdb/client/cutlass/qwp/client/QwpWebSocketSender.java`
+- `/home/jara/devel/oss/questdb-arrays/java-questdb-client/core/src/main/java/io/questdb/client/cutlass/qwp/client/WebSocketResponse.java`
+- `/home/jara/devel/oss/questdb-arrays/java-questdb-client/core/src/main/java/io/questdb/client/cutlass/qwp/client/sf/cursor/BackgroundDrainer.java`
 - `/home/jara/devel/oss/questdb-arrays/java-questdb-client/core/src/main/java/io/questdb/client/cutlass/qwp/client/sf/cursor/CursorSendEngine.java`
 - `/home/jara/devel/oss/questdb-arrays/java-questdb-client/core/src/main/java/io/questdb/client/cutlass/qwp/client/sf/cursor/CursorWebSocketSendLoop.java`
 - `/home/jara/devel/oss/questdb-arrays/java-questdb-client/core/src/main/java/io/questdb/client/cutlass/qwp/client/sf/cursor/MmapSegment.java`
+- `/home/jara/devel/oss/questdb-arrays/java-questdb-client/core/src/main/java/io/questdb/client/cutlass/qwp/client/sf/cursor/OrphanScanner.java`
 - `/home/jara/devel/oss/questdb-arrays/java-questdb-client/core/src/main/java/io/questdb/client/cutlass/qwp/client/sf/cursor/SegmentManager.java`
 
 ## Summary
@@ -67,51 +71,21 @@ The largest remaining areas are:
 
 - strict unknown-key handling,
 - Java/spec close, retry, and orphan-drainer semantics,
+- remaining Java wire-sequence tolerance around ACK-before-send and
+  NACK/reject high-sequence clamping,
+- Java public API/config surface parity, including deprecated auth aliases,
+  WebSocket auto-flush settings, builder methods, and callback-style progress
+  handlers,
 - several SFA disk-format/recovery details where the spec and Java reference
   need to be reconciled before Rust should change behavior,
 - durable-mode OK coalescing/cumulation contract validation against the live
   server if the protocol ever permits skipped per-message OK table entries.
 
-Several core pieces already look aligned: single-producer queue ownership,
-FSN/wire-sequence mapping, strict in-order replay, self-sufficient replay
-encoding, non-durable status policy mapping, terminal WebSocket close-code
-routing, CRC-last SFA append order, and recovery gap checks.
-
 ## Confirmed Rust Gaps
 
-### 1. Public durable ACK mode is implemented; durable OK coalescing remains a protocol assumption
-
-Spec requirements:
-
-- `sf-client.md:141` says `request_durable_ack` opts in to durable ACK and
-  OK frames no longer advance the trim watermark.
-- `sf-client.md:432-441` requires the client to validate
-  `X-QWP-Durable-Ack: enabled` in the 101 response and fail loudly if absent.
-- `sf-client.md:483-488` says durable mode trims only from
-  `STATUS_DURABLE_ACK`.
-- `sf-client.md:499-527` defines durable ACK table-watermark payloads and the
-  drain loop.
-- `wire-ingress.md:787-798` repeats the same handshake and trim rule.
+### 1. Durable OK coalescing remains a protocol assumption
 
 Rust state:
-
-- `request_durable_ack=on` is accepted from the connect string.
-- `durable_ack_keepalive_interval_millis` is stored; `<= 0` disables the idle
-  durable-ACK PING.
-- The upgrade request sends `X-QWP-Request-Durable-Ack: true` when requested.
-- The upgrade response must include `X-QWP-Durable-Ack: enabled`; Rust fails
-  the connection instead of silently downgrading.
-- OK and durable ACK table-watermark payloads are parsed.
-- Durable OK releases the send window without completing the publication log.
-- Durable ACK watermarks drain consecutive covered OKs.
-- The background/manual ready loop sends a WebSocket PING while durable
-  confirmations are pending and the keepalive interval has elapsed.
-- Empty OKs wait behind earlier non-empty OKs, stale durable watermarks do not
-  move backwards, durable drop-and-continue rejections enqueue ordered empty
-  placeholders, and reconnect clears pending durable state for replay.
-- The non-durable path still trims on ordinary OK.
-
-Remaining protocol assumption:
 
 - Rust assumes durable-mode OK frames are emitted per sent message, with table
   entries for that message. If the server can coalesce/cumulate durable-mode
@@ -123,86 +97,35 @@ Java reference:
 
 - `CursorWebSocketSendLoop.java` has `durableAckMode`,
   `durableTableWatermarks`, `pendingDurable`, and durable trim counters.
-- `Sender.java:1758` documents durable ACK opt-in.
-- `Sender.java:2614-2625` parses `request_durable_ack=on|off` from the
-  connect string.
-- `Sender.java:2669-2675` parses
-  `durable_ack_keepalive_interval_millis`.
 - `SenderProgressHandler.java:33-45` documents the user-visible progress
   watermark: `ackedFsn` is the highest FSN now durable on the server side. In
   durable ACK mode this is the durable-ack-driven watermark, not the ordinary
   OK watermark.
 
-User exposure:
-
-- Durable ACK is exposed as an opt-in connection mode, not as a raw
-  per-`STATUS_DURABLE_ACK` callback API.
-- Users enable it with `request_durable_ack=on` in the connect string or
-  `requestDurableAck(true)` on the Java builder.
-- Users can tune idle durable-ACK flushing with
-  `durable_ack_keepalive_interval_millis` or
-  `durableAckKeepaliveIntervalMillis(...)`.
-- If the server does not confirm support with `X-QWP-Durable-Ack: enabled`,
-  the connect attempt must fail loudly. The client must not silently downgrade
-  to ordinary OK trimming.
-- Applications observe durable completion through the existing progress/ack
-  watermark (`onAcked(ackedFsn)` in Java). In durable ACK mode that watermark
-  advances only after durable ACK coverage, so user code does not need a
-  separate durable-ack event stream.
-- Rust exposes durable ACK publicly through the connect string:
-  `request_durable_ack=on|off` and
-  `durable_ack_keepalive_interval_millis=<millis>`.
-
-### 2. OK response parsing was incomplete (addressed)
-
-Spec requirements:
-
-- `wire-ingress.md:692-704` says OK response is `11+` bytes:
-  status, sequence, tableCount, and repeated table entries.
-- `sf-client.md:454-466` gives the same layout.
-
-Previous Rust state:
-
-- Before the parser-completeness slice, the Rust parser accepted any OK frame
-  with only status plus 8-byte sequence.
-- It returned only `sequence`, dropping `tableCount` and table `seqTxn`
-  watermarks.
-
-Previous impact:
-
-- Truncated OK frames are accepted.
-- Durable ACK mode could not be implemented correctly because the OK-side
-  per-table `seqTxn` data was missing.
-
-Current working-tree state:
-
-- OK parsing can expose parsed table entries through a callback.
-- OK requires status, sequence, and table count.
-- Table entry lengths and UTF-8 table names are validated.
-- The non-durable driver path validates table-entry bytes without allocating
-  table-name strings.
-- The durable decode path retains parsed table watermarks for the internal
-  durable ACK tracker, and public durable ACK mode uses those watermarks for
-  durable trimming.
-
-### 3. Error response message length was not capped at 1024 (addressed)
+### 2. Error response parsing is stricter than Java's live receive path
 
 Spec requirement:
 
 - `sf-client.md:641-649` says error `msgLen` is `uint16 LE (<= 1024)`.
 
-Previous Rust state:
-
-- Before the error-frame slice, the Rust parser accepted any `u16` message
-  length that fit in the received frame and was UTF-8.
-
-Current working-tree state:
+Rust state:
 
 - `msgLen > 1024` is rejected before UTF-8 conversion.
 - Error frames must end exactly at `11 + msgLen`; trailing bytes are rejected.
-- Focused parser tests cover 1024 bytes, 1025 bytes, and trailing bytes.
 
-### 4. Unknown-key behavior diverges from the spec
+Java reference:
+
+- The Rust behavior is spec-strict, but Java's live Store-and-Forward receive
+  path is more permissive today. `CursorWebSocketSendLoop.java:1086` calls
+  `WebSocketResponse.readFrom(...)` directly, and
+  `WebSocketResponse.java:286-300` accepts error frames when the received
+  length is at least `offset + msgLen`; it does not enforce the 1024-byte cap,
+  exact end-of-frame, or UTF-8 validity on this path.
+- Treat this as a Java/spec reconciliation item before relaxing Rust. The Rust
+  parser should not loosen without an explicit cross-client decision because
+  the current Rust behavior matches the documented wire contract.
+
+### 3. Unknown-key behavior diverges from the spec
 
 Spec requirements:
 
@@ -227,7 +150,7 @@ Open decision:
   cross-client behavior change. It should probably be changed in Java and Rust
   together, or the spec should document a transition rule.
 
-### 5. Several normative config keys are rejected or inert
+### 4. Several normative config keys and Java API surfaces are rejected, inert, or config-only
 
 Spec references:
 
@@ -242,14 +165,20 @@ Spec references:
 
 Rust state:
 
-- `questdb-rs/src/ingress.rs:548` routes
-  `sf_append_deadline_millis` to an explicit rejection.
+- `questdb-rs/src/ingress.rs:515-517` recognizes `username`, `password`, and
+  token keys. Deprecated Java aliases `user` and `pass` are not recognized and
+  therefore fall through to the unknown-key ignore path at
+  `questdb-rs/src/ingress.rs:724-728`.
+- `questdb-rs/src/ingress.rs:182-200` rejects `auto_flush_rows` and
+  `auto_flush_bytes`; `auto_flush_interval` is not recognized and falls
+  through to the unknown-key ignore path.
+- `sf_append_deadline_millis` is parsed and stored for QWP/WebSocket append
+  backpressure; the background runner uses it separately from
+  `request_timeout`.
 - `questdb-rs/src/ingress.rs:564` routes
   `close_flush_timeout_millis` to an explicit rejection.
 - `questdb-rs/src/ingress.rs:568-571` rejects
   `max_schemas_per_connection`.
-- `durable_ack_keepalive_interval_millis` is implemented for public durable
-  ACK mode; `<= 0` disables the idle PING.
 - `questdb-rs/src/ingress.rs:577-579` parses `drain_orphans` and
   `max_background_drainers`, but enabled orphan draining is unsupported.
 - `questdb-rs/src/ingress.rs:581-584` rejects `error_inbox_capacity`.
@@ -257,9 +186,27 @@ Rust state:
   `initial_connect_retry=async`.
 - `questdb-rs/src/ingress.rs:505-508` splits `addr` once on `:`, so it does
   not store comma-separated multi-host addresses.
+- Store-and-Forward builder setters such as `sf_dir`, `sender_id`,
+  `sf_max_bytes`, `sf_max_total_bytes`, `sf_durability`, and durable ACK opt-in
+  are currently config-string-only implementation details rather than public
+  Rust builder methods.
+- Durable completion observation is pull/wait based:
+  `Sender::acked_fsn()` and `Sender::await_acked_fsn(...)`. There is no
+  Java-style callback registration surface.
 
 Java reference:
 
+- `Sender.java:2445-2465` parses deprecated `user` / `pass` aliases and
+  `Sender.java:2764-2768` applies them to HTTP/WebSocket auth.
+- `Sender.java:619-621` defines WebSocket-specific auto-flush defaults and
+  `Sender.java:2536-2581` parses `auto_flush_rows`,
+  `auto_flush_interval`, and `auto_flush_bytes`.
+- `Sender.java:1767` exposes `requestDurableAck(boolean)`.
+- `SenderProgressHandler.java:27-38` defines callback-style ACK progress
+  observation.
+- `Sender.java:1841`, `Sender.java:1940`, `Sender.java:2074`, and
+  `Sender.java:2103` expose builder methods for Store-and-Forward directory,
+  close timeout, append deadline, and orphan draining.
 - `Sender.java:2663-2668` parses `close_flush_timeout_millis`.
 - `Sender.java:2688-2701` accepts `initial_connect_retry=async`.
 - `Sender.java:2703-2708` parses `sf_append_deadline_millis`.
@@ -279,8 +226,15 @@ Implementation direction:
 - For `error_inbox_capacity`, decide whether Rust should expose Java-style
   callback dispatch or preserve poll-based Rust ergonomics with a compatible
   capacity knob.
+- Decide whether Rust should support the deprecated `user` / `pass` aliases as
+  compatibility aliases. Because unknown keys are ignored, the current behavior
+  is a silent authentication misconfiguration rather than a loud parser error.
+- Auto-flush parity is larger than accepting the keys: Java WebSocket has
+  rows/bytes/interval defaults, while Rust currently requires explicit user
+  flush. Keep these rejected or ignored only if that remains the intended Rust
+  API contract.
 
-### 6. Default close semantics are not Java/spec compatible
+### 5. Default close semantics are not Java/spec compatible
 
 Spec requirements:
 
@@ -290,16 +244,24 @@ Spec requirements:
 
 Rust state:
 
-- `questdb-rs/src/ingress.rs:1255-1268` rejects
+- `questdb-rs/src/ingress.rs:1268-1279` rejects
   `close_flush_timeout_millis`.
-- `questdb-rs/src/ingress/sender.rs:662-669` exposes explicit
+- `questdb-rs/src/ingress/sender.rs:666-673` exposes explicit
   `Sender::close_drain()`.
 - `questdb-rs/src/ingress/sender/qwp_ws.rs:335-369` implements runner
   close-drain logic, but timeout is returned as an error.
-- `questdb-rs/src/ingress/sender/qwp_ws.rs:709-715` runner `Drop` only stops
+- `questdb-rs/src/ingress/sender/qwp_ws.rs:791-797` runner `Drop` only stops
   and joins the runner thread.
-- `questdb-rs/src/ingress/sender/qwp_ws.rs:1527-1548` uses a fixed close-drain
-  timeout where close-drain is explicitly called.
+- `questdb-rs/src/ingress/sender/qwp_ws.rs:1973-1995` uses a fixed
+  close-drain timeout where close-drain is explicitly called.
+
+Java reference:
+
+- `QwpWebSocketSender.java:745-799` implements public `close()` by flushing
+  pending rows, surfacing unsurfaced terminal errors, and draining up to the
+  configured timeout.
+- `QwpWebSocketSender.java:1930-1962` defines the bounded close-drain loop and
+  timeout error text.
 
 Implementation direction:
 
@@ -310,7 +272,7 @@ Implementation direction:
   configurable timeout, skip modes, cleanup error preservation, and terminal
   error rethrow behavior.
 
-### 7. Overlarge ordinary OK sequences are clamped
+### 6. ACK-before-send and NACK clamping differ from Java
 
 Spec requirement:
 
@@ -320,21 +282,28 @@ Spec requirement:
 
 Rust state:
 
-- Ordinary OK responses clamp a response sequence greater than the highest sent
-  sequence to the highest sent sequence before completing frames.
 - Error/NACK responses remain strict protocol errors when they name a future
   sequence.
+- ACK before a send path has established `fsn_at_zero` / `last_sent_wire_seq`
+  still reports `ProtocolAckWithoutConnection`.
 
 Java reference:
 
-- `CursorWebSocketSendLoop.java` clamps with `Math.min(wireSeq, highestSent)`.
+- `CursorWebSocketSendLoop.java:1091-1121` clamps OK responses with
+  `Math.min(wireSeq, highestSent)` and ignores an OK frame when
+  `highestSent < 0`.
+- `CursorWebSocketSendLoop.java:1150-1161` applies the same high-sequence
+  clamp to NACK/server-rejection responses.
 
-Remaining check:
+Implementation direction:
 
-- Re-check error/NACK statuses separately. The spec explicitly calls out OK;
-  Java may clamp server errors too.
+- Implement the remaining Java tolerance in one sequence-mapping slice:
+  ignore ACK-before-send, clamp future NACK/reject to highest sent, and keep
+  monotonic completion so no unsent frame can be marked resolved.
+- This is a Java parity target even though the spec text explicitly calls out
+  only ordinary OK.
 
-### 8. Reconnect timing and ACK-timeout behavior are incomplete
+### 7. Reconnect timing, idle receive, and ACK-timeout behavior are incomplete
 
 Spec requirements:
 
@@ -349,6 +318,14 @@ Rust state:
   `questdb-rs/src/ingress/sender/qwp_ws.rs` use deterministic backoff.
 - The current driver polls readable bytes and progress but does not maintain a
   sent-time ACK deadline that triggers reconnect.
+- `questdb-rs/src/ingress/sender/qwp_ws_driver.rs:1615-1617` returns
+  `TransportPoll::Idle` without reading the socket when no wire sequences are
+  pending and durable ACK mode is off. This can defer server PING/PONG/CLOSE or
+  stray response handling until another send happens.
+- `questdb-rs/src/ingress/sender/qwp_ws_driver.rs:751-754` treats generic
+  WebSocket protocol violations as terminal protocol errors.
+- `questdb-rs/src/ingress/sender/qwp_ws_driver.rs:1654-1659` treats completed
+  non-binary QWP responses as protocol violations.
 
 Java reference:
 
@@ -356,53 +333,28 @@ Java reference:
   Verify current jitter behavior before copying the spec literally; the Java
   grep during this audit showed deterministic `Math.min(... * 2, max)` growth,
   so the spec and Java may not yet agree.
+- `CursorWebSocketSendLoop.java:1010-1019` drains
+  `client.tryReceiveFrame(...)` until idle whenever the loop polls receives.
+- `WebSocketClient.java:915-924` sends a close frame on WebSocket parser
+  errors and throws; `CursorWebSocketSendLoop.java:1016-1018` routes that
+  through `fail(...)`, which can enter reconnect handling when the reconnect
+  factory exists.
+- `WebSocketClient.java:972-978` dispatches text frames to the handler, and
+  `WebSocketFrameHandler.java:90-92` ignores text frames by default.
 
 Implementation direction:
 
 - Treat ACK-timeout reconnect as a real runtime behavior gap.
+- Decide whether idle non-durable receive pumping should follow Java exactly.
+  It is behavior-visible for server CLOSE/PING/PONG and malformed stray frames
+  received after the last pending ACK.
+- Decide whether Rust's stricter terminal classification for malformed
+  WebSocket frames and non-binary QWP responses is a deliberate safety policy
+  or should follow Java's reconnect/ignore behavior.
 - Treat jitter as a spec/reference reconciliation item unless Java has already
   changed.
 
-### 9. Durable ACK keepalive PING is implemented
-
-Spec requirements:
-
-- `sf-client.md:540-557` requires client WebSocket PING while durable
-  confirmations are pending and the keepalive interval is positive.
-
-Reference clarification:
-
-- `wire-ingress.md` now matches `sf-client.md` and says opted-in clients
-  should send WebSocket PINGs while durable confirmations are pending and
-  there is no organic outbound traffic.
-- Vlad Ilyushchenko clarified on 2026-05-05 that this behavior is
-  intentional: without client PING, the server may not emit durable ACKs
-  unless organic traffic arrives.
-
-Rust state:
-
-- `questdb-rs/src/ingress/sender/qwp_ws.rs:1211` replies to incoming PING with
-  PONG.
-- Rust sends empty outbound WebSocket PINGs while durable confirmations are
-  pending and the configured interval has elapsed since the last durable-ACK
-  keepalive PING.
-- The public in-process WebSocket test covers: `request_durable_ack=on`,
-  required upgrade echo, durable OK pending state, outbound PING, server PONG,
-  delayed durable ACK completion, and `acked_fsn` advancement.
-
-Java reference:
-
-- `CursorWebSocketSendLoop.java:938-941` calls
-  `sendDurableAckKeepaliveIfDue()` when durable mode is enabled, pending
-  durable entries exist, and the interval elapsed.
-- `CursorWebSocketSendLoop.java:1027-1033` documents why Java sends PINGs.
-
-Remaining check:
-
-- Validate against the live server once a durable-ACK-capable server is
-  available in CI/manual probes.
-
-### 10. Orphan adoption and `.failed` are missing
+### 8. Orphan adoption and `.failed` are missing
 
 Spec requirements:
 
@@ -427,7 +379,7 @@ Implementation direction:
 - Implement `.failed` before enabling background drainers; otherwise failed
   orphan attempts will be retried blindly.
 
-### 11. Error inbox and default error-handler behavior differ
+### 9. Error inbox and default error-handler behavior differ
 
 Spec requirements:
 
@@ -455,7 +407,7 @@ Implementation direction:
 - Add actual logging for the default path if the spec remains strict about
   non-silence.
 
-### 12. Slot locking is Unix-only
+### 10. Slot locking is Unix-only
 
 Spec requirements:
 
@@ -478,7 +430,7 @@ Implementation direction:
 - Either implement Windows `LockFileEx` or document SF disk mode as unsupported
   on Windows and ensure the builder fails clearly.
 
-### 13. SFA header reserved fields are validated
+### 11. SFA header validation is stricter than Java
 
 Spec requirement:
 
@@ -493,7 +445,15 @@ Rust state:
   are treated like other segment scan failures: a bad side file can be skipped,
   while a required segment that creates an FSN gap still fails recovery.
 
-### 14. Fresh SFA filename conflicts with the current spec
+Java reference divergence:
+
+- `MmapSegment.java:226-246` validates magic, version, and non-negative
+  `baseSeq`, but currently does not reject non-zero `flags` or `reserved`.
+- This makes Rust stricter than Java for malformed segment headers. Treat it
+  as intentional spec hardening unless Java decides to preserve non-zero
+  header extensions.
+
+### 12. Fresh SFA filename conflicts with the current spec
 
 Spec requirement:
 
@@ -526,7 +486,7 @@ Open decision:
 - If Java remains authoritative for now, update the spec wording to say fresh
   initial active segments may still be `sf-initial.sfa`.
 
-### 15. Recovery behavior for corrupt or empty side files needs a spec decision
+### 13. Recovery behavior for corrupt or empty side files needs a spec decision
 
 Spec text:
 
@@ -562,7 +522,7 @@ Open decision:
   Rust can discard an empty segment and create a new baseSeq 0 segment if no
   non-empty files remain.
 
-### 16. Torn-tail diagnostics are not operator-visible
+### 14. Torn-tail diagnostics are not operator-visible
 
 Spec requirement:
 
@@ -585,57 +545,38 @@ Implementation direction:
 
 ### `sf-initial.sfa` is a spec/reference mismatch
 
-See gap 14. Current Java and Rust both create `sf-initial.sfa` for a fresh
+See gap 12. Current Java and Rust both create `sf-initial.sfa` for a fresh
 slot, while the spec says it is legacy recovery input. Resolve this before
 changing Rust alone.
 
-### Durable ACK keepalive text has been reconciled in `wire-ingress.md`
-
-See gap 9. `sf-client.md`, `wire-ingress.md`, and current Java now agree that
-durable ACK clients should send WebSocket PINGs while durable confirmations
-are pending and no organic outbound traffic is available.
-
 ### Unknown-key rejection conflicts with Java
 
-See gap 4. The current spec says unknown keys must be rejected, but current
+See gap 3. The current spec says unknown keys must be rejected, but current
 Java still ignores unknown keys unless malformed. If strict rejection is the
 new contract, Java and Rust should be changed together.
 
-## Areas That Look Aligned
-
-These areas were checked during the audit and should not be reopened without
-new evidence:
-
-- SPSC queue ownership and termination safety are coherent for the current
-  single-sender API.
-- FSN/wire sequence mapping and strict in-order send match the SF model.
-- Replay frames are self-sufficient: Rust replay encoding emits dense symbol
-  dictionaries from id 0 and full schema.
-- Non-durable status-to-policy mapping matches the spec categories.
-- Terminal WebSocket close-code routing matches the spec terminal-code set.
-- OK, durable ACK, and error response payload parsing now validates required
-  fixed fields, table-entry structure, bounded error messages, and trailing
-  bytes.
-- SFA append order is length, payload, CRC last, then queue publication.
-- Torn-tail detection logic and recovered-segment sort/gap checks are aligned
-  with the intended recovery model.
-
 ## Suggested Fix Order
 
-1. Resolve spec/reference mismatches first:
-   `sf-initial.sfa`, unknown-key policy.
-2. Validate the durable OK emission/coalescing contract against the live
+1. Finish Java sequence tolerance:
+   ignore ACK-before-send and clamp future NACK/reject to highest sent.
+2. Resolve spec/reference mismatches that should not be Rust-only changes:
+   `sf-initial.sfa`, unknown-key policy, and Rust-stricter SFA header
+   extension handling if Java intends to accept non-zero fields.
+3. Validate the durable OK emission/coalescing contract against the live
    durable-ACK server.
-3. Implement Java-compatible close semantics and then accept
+5. Implement Java-compatible close semantics and then accept
    `close_flush_timeout_millis`.
-4. Implement ACK-timeout reconnect.
-5. Decide Rust API shape for error dispatch/inbox and then support
-   `error_inbox_capacity`.
-6. Add orphan scanner/drainers and `.failed`, then enable `drain_orphans=on`.
-7. Address lower-level SFA disk details:
+6. Implement ACK-timeout reconnect, and decide idle receive/protocol-violation
+   classification parity with Java.
+7. Decide Rust API shape for Java-facing config/API gaps:
+   deprecated `user` / `pass` aliases, WebSocket auto-flush, progress/error
+   callback parity versus polling, and then support `error_inbox_capacity` if
+   applicable.
+8. Add orphan scanner/drainers and `.failed`, then enable `drain_orphans=on`.
+9. Address lower-level SFA disk details:
    filename decision, empty-segment behavior, and operator-visible recovery
    diagnostics.
-8. Decide Windows SF support:
+10. Decide Windows SF support:
    implement `LockFileEx` or document/fail disk SF mode clearly on Windows.
 
 Each fix should start with a failing regression or golden fixture. For any

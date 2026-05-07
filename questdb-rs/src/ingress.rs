@@ -545,7 +545,9 @@ impl SenderBuilder {
                     builder.store_and_forward_durability(parse_sf_durability_value(val)?)?
                 }
                 #[cfg(feature = "_sender-qwp-ws")]
-                "sf_append_deadline_millis" => builder.reject_sf_append_deadline_millis()?,
+                "sf_append_deadline_millis" => builder.store_and_forward_append_deadline(
+                    Duration::from_millis(parse_conf_value(key, val)?),
+                )?,
                 #[cfg(feature = "_sender-qwp-ws")]
                 "reconnect_max_duration_millis" => builder
                     .reconnect_max_duration(Duration::from_millis(parse_conf_value(key, val)?))?,
@@ -1176,20 +1178,23 @@ impl SenderBuilder {
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
-    fn reject_sf_append_deadline_millis(self) -> Result<Self> {
-        if self.qwp_ws.is_none() {
+    fn store_and_forward_append_deadline(mut self, value: Duration) -> Result<Self> {
+        if value.is_zero() {
+            return Err(error::fmt!(
+                ConfigError,
+                "\"sf_append_deadline_millis\" must be greater than 0."
+            ));
+        }
+        let Some(qwp_ws) = &mut self.qwp_ws else {
             return Err(error::fmt!(
                 ConfigError,
                 "The \"sf_append_deadline_millis\" setting is only supported for QWP/WebSocket."
             ));
-        }
-
-        // TODO(qwp-ws): accept this Java key once local-publication backpressure
-        // enforces the configured append deadline.
-        Err(error::fmt!(
-            ConfigError,
-            "\"sf_append_deadline_millis\" is not supported by the Rust QWP/WebSocket sync sender yet; local-publication backpressure is not implemented."
-        ))
+        };
+        qwp_ws
+            .sf_append_deadline
+            .set_specified("sf_append_deadline_millis", value)?;
+        Ok(self)
     }
 
     #[cfg(feature = "_sender-qwp-ws")]

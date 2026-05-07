@@ -49,14 +49,17 @@ use super::qwp_ws_driver::{
     BlockingQwpWsTransport, CloseOutcome, DriveOutcome, DriverError, ManualDriverPrototype,
     ManualDriverTransport, PublicationLifecycle, PublicationLog, PublicationState,
     QwpWsPublicationStore, QwpWsReconnectProgress, QwpWsSendCore, QwpWsSendProgress,
-    QwpWsTransportFailureAction, ReconnectPolicy, ReconnectReason, TransportFailure, TransportPoll,
-    reconnect_error_is_terminal,
+    QwpWsTransportFailureAction, ReconnectPolicy, ReconnectReason, SendCursor, TransportFailure,
+    TransportPoll, reconnect_error_is_terminal,
 };
 use super::qwp_ws_ownership::QwpWsSenderError;
 use super::qwp_ws_publisher::{QwpWsPublicationDriver, QwpWsPublicationError, QwpWsReplayEncoder};
 use super::qwp_ws_queue::{
     LockFreeVolatileProducer, LockFreeVolatilePublicationLog, OutboundFrame, PendingPayload,
     QwpReceipt, QwpReceiptStatus, VolatileQueueOptions,
+};
+use super::qwp_ws_sfa_queue::{
+    SfaCleanupFailure, SfaStorageFinish, SfaStorageResult, SfaStorageStep,
 };
 use super::qwp_ws_sfa_slot::{SfaSlotOptions, SfaSlotQueue};
 
@@ -163,7 +166,7 @@ pub(crate) struct SyncQwpWsHandlerState {
 
 pub(crate) struct ManualQwpWsHandlerState {
     publisher: SyncQwpWsPublisher,
-    max_drive_steps: usize,
+    append_deadline: Duration,
 }
 
 pub(crate) struct SyncQwpWsRunner<Q = ConfiguredQwpWsQueue> {
@@ -182,6 +185,7 @@ pub(crate) struct SyncQwpWsRunner<Q = ConfiguredQwpWsQueue> {
 struct SyncQwpWsRunnerCore<T = BlockingQwpWsTransport> {
     send_core: QwpWsSendCore<T>,
     backpressure: Arc<BackpressureNotifier>,
+    lifecycle: PublicationLifecycle,
 }
 
 #[derive(Debug)]
@@ -224,10 +228,12 @@ where
         let thread_shared = Arc::clone(&shared);
         let thread_backpressure = Arc::clone(&backpressure);
         let thread_stop = Arc::clone(&stop);
+        let thread_lifecycle = lifecycle.clone();
         let thread = thread::spawn(move || {
             let mut core = SyncQwpWsRunnerCore {
                 send_core,
                 backpressure: thread_backpressure,
+                lifecycle: thread_lifecycle,
             };
             while !thread_stop.load(Ordering::Acquire) {
                 match core.drive_step(&thread_shared, &thread_stop) {
@@ -259,12 +265,13 @@ where
                     Ok(receipt) => return Ok(receipt.fsn),
                     Err(err) => {
                         let err = DriverError::Queue(err);
-                        if driver_error_is_backpressure(&err) {
+                        let backpressure = driver_error_backpressure_queue(&err);
+                        if backpressure.is_some() {
                             if !self
                                 .wait_for_publication_capacity(backpressure_generation, deadline)
                             {
                                 return Err(driver_error_to_error_without_state(
-                                    DriverError::SubmitTimedOut,
+                                    DriverError::SubmitTimedOut { backpressure },
                                 ));
                             }
                             continue;
@@ -284,7 +291,9 @@ where
                 Err(err) if driver_error_is_backpressure(&err) => {
                     if !self.wait_for_publication_capacity(backpressure_generation, deadline) {
                         return Err(driver_error_to_error_without_state(
-                            DriverError::SubmitTimedOut,
+                            DriverError::SubmitTimedOut {
+                                backpressure: driver_error_backpressure_queue(&err),
+                            },
                         ));
                     }
                 }
@@ -465,12 +474,12 @@ where
         let outbound = {
             let mut store = match shared.lock() {
                 Ok(store) => store,
-                Err(_) => return RunnerStep::Stop,
+                Err(_) => return self.handle_poisoned_lock(),
             };
             if store.is_terminal() {
                 return RunnerStep::Stop;
             }
-            match self.send_core.next_outbound_frame(&store) {
+            match self.send_core.next_outbound_frame(&mut store) {
                 Ok(outbound) => outbound,
                 Err(err) => return self.store_driver_error(&mut store, err),
             }
@@ -489,7 +498,15 @@ where
             return RunnerStep::Stop;
         }
 
-        if send_step == RunnerStep::Continue || receive_step == RunnerStep::Continue {
+        let storage_step = self.finish_storage_maintenance(shared);
+        if storage_step == RunnerStep::Stop {
+            return RunnerStep::Stop;
+        }
+
+        if send_step == RunnerStep::Continue
+            || receive_step == RunnerStep::Continue
+            || storage_step == RunnerStep::Continue
+        {
             RunnerStep::Continue
         } else {
             self.finish_keepalive(shared, stop)
@@ -510,7 +527,7 @@ where
             Ok(send_result) => {
                 let mut store = match shared.lock() {
                     Ok(store) => store,
-                    Err(_) => return RunnerStep::Stop,
+                    Err(_) => return self.handle_poisoned_lock(),
                 };
                 match self
                     .send_core
@@ -544,7 +561,7 @@ where
             Ok(TransportPoll::Response(response)) => {
                 let mut store = match shared.lock() {
                     Ok(store) => store,
-                    Err(_) => return RunnerStep::Stop,
+                    Err(_) => return self.handle_poisoned_lock(),
                 };
                 match self.send_core.finish_response(&mut store, response) {
                     Ok(outcome) => {
@@ -594,7 +611,7 @@ where
         let durable_ack_pending = {
             let store = match shared.lock() {
                 Ok(store) => store,
-                Err(_) => return RunnerStep::Stop,
+                Err(_) => return self.handle_poisoned_lock(),
             };
             if store.is_terminal() {
                 return RunnerStep::Stop;
@@ -611,6 +628,85 @@ where
         }
     }
 
+    fn finish_storage_maintenance<Q>(
+        &mut self,
+        shared: &Arc<Mutex<QwpWsPublicationStore<Q>>>,
+    ) -> RunnerStep
+    where
+        Q: PublicationLog,
+    {
+        let task = {
+            let mut store = match shared.lock() {
+                Ok(store) => store,
+                Err(_) => return self.handle_poisoned_lock(),
+            };
+            if store.is_terminal() {
+                return RunnerStep::Stop;
+            }
+            match store.take_storage_maintenance_step() {
+                Ok(task) => task,
+                Err(err) => return self.store_driver_error(&mut store, err),
+            }
+        };
+
+        let Some(task) = task else {
+            return RunnerStep::Idle;
+        };
+        let changed_before_io = task.changes_queue_before_io();
+        if changed_before_io {
+            self.backpressure.notify_all();
+        }
+
+        let result = match task.perform() {
+            Ok(result) => result,
+            Err(err) => {
+                let mut store = match shared.lock() {
+                    Ok(store) => store,
+                    Err(_) => return self.handle_poisoned_lock(),
+                };
+                return self.store_driver_error(&mut store, err.into());
+            }
+        };
+
+        let (finish, terminal) = {
+            let mut store = match shared.lock() {
+                Ok(store) => store,
+                Err(_) => return self.handle_poisoned_lock(),
+            };
+            match store.finish_storage_maintenance(result) {
+                Ok(finish) => {
+                    let terminal = store.is_terminal();
+                    (finish, terminal)
+                }
+                Err(err) => return self.store_driver_error(&mut store, err),
+            }
+        };
+
+        let changed = changed_before_io || finish.did_change();
+        if changed {
+            self.backpressure.notify_all();
+        }
+        if let Some(cleanup) = finish.into_cleanup()
+            && let Some(failure) = cleanup.perform()
+        {
+            let mut store = match shared.lock() {
+                Ok(store) => store,
+                Err(_) => return self.handle_poisoned_lock(),
+            };
+            if let Err(err) = store.record_storage_cleanup_failure(failure) {
+                return self.store_driver_error(&mut store, err);
+            }
+        }
+
+        if terminal {
+            RunnerStep::Stop
+        } else if changed {
+            RunnerStep::Continue
+        } else {
+            RunnerStep::Idle
+        }
+    }
+
     fn apply_transport_failure<Q>(
         &mut self,
         shared: &Arc<Mutex<QwpWsPublicationStore<Q>>>,
@@ -623,7 +719,7 @@ where
         let action = {
             let mut store = match shared.lock() {
                 Ok(store) => store,
-                Err(_) => return RunnerStep::Stop,
+                Err(_) => return self.handle_poisoned_lock(),
             };
             self.send_core.transport_failure_action(&mut store, failure)
         };
@@ -659,7 +755,7 @@ where
             Ok(QwpWsReconnectProgress::Reconnected { reason }) => {
                 let mut store = match shared.lock() {
                     Ok(store) => store,
-                    Err(_) => return RunnerStep::Stop,
+                    Err(_) => return self.handle_poisoned_lock(),
                 };
                 let outcome = self.send_core.finish_reconnect_success(&mut store, reason);
                 step_from_drive_outcome(outcome)
@@ -669,7 +765,7 @@ where
             Err(err) => {
                 let mut store = match shared.lock() {
                     Ok(store) => store,
-                    Err(_) => return RunnerStep::Stop,
+                    Err(_) => return self.handle_poisoned_lock(),
                 };
                 self.store_driver_error(&mut store, err)
             }
@@ -700,9 +796,24 @@ where
     {
         let mut store = match shared.lock() {
             Ok(store) => store,
-            Err(_) => return RunnerStep::Stop,
+            Err(_) => return self.handle_poisoned_lock(),
         };
         store.mark_terminal(Some(err));
+        self.backpressure.notify_all();
+        RunnerStep::Stop
+    }
+
+    /// Handle a poisoned shared-store lock.
+    ///
+    /// Reaches the same observable end-state as `mark_store_terminal` without
+    /// re-entering the poisoned mutex: flips the lifecycle to `Terminal` via
+    /// its own atomic, and wakes condvar waiters so any `publish_replay_payload`
+    /// blocked on append-deadline backpressure observes the terminal state on
+    /// its next loop iteration instead of timing out per submit. The store's
+    /// `terminal_error` is left unset; publishers see a generic terminal error
+    /// rather than a runner-specific one, but they fail fast.
+    fn handle_poisoned_lock(&self) -> RunnerStep {
+        self.lifecycle.terminalize();
         self.backpressure.notify_all();
         RunnerStep::Stop
     }
@@ -813,7 +924,6 @@ impl ConfiguredQwpWsQueue {
         }
 
         let max_bytes = usize_from_config("sf_max_total_bytes", qwp_ws.sf_max_total_bytes())?;
-        let max_frames = configured_max_frames(qwp_ws)?;
         let max_in_flight = *qwp_ws.max_in_flight;
 
         if let Some(sf_dir) = qwp_ws.sf_dir.as_ref() {
@@ -822,7 +932,6 @@ impl ConfiguredQwpWsQueue {
                     sf_dir: sf_dir.clone(),
                     sender_id: qwp_ws.sender_id.to_string(),
                     segment_size_bytes: *qwp_ws.sf_max_bytes,
-                    max_frames,
                     max_bytes,
                     max_in_flight,
                 })
@@ -836,6 +945,7 @@ impl ConfiguredQwpWsQueue {
             )));
         }
 
+        let max_frames = configured_max_frames(qwp_ws)?;
         Ok(Self::Memory(
             LockFreeVolatilePublicationLog::new(VolatileQueueOptions {
                 max_frames,
@@ -885,11 +995,71 @@ impl PublicationLog for ConfiguredQwpWsQueue {
         }
     }
 
+    fn next_outbound_frame(
+        &mut self,
+        send_cursor: &mut SendCursor,
+    ) -> Result<Option<OutboundFrame>, DriverError> {
+        match self {
+            Self::Memory(queue) => PublicationLog::next_outbound_frame(queue, send_cursor),
+            Self::StoreAndForward(queue) => {
+                PublicationLog::next_outbound_frame(queue.as_mut(), send_cursor)
+            }
+        }
+    }
+
     fn pending_payload_for_fsn(&self, fsn: u64) -> Result<Option<PendingPayload>, DriverError> {
         match self {
             Self::Memory(queue) => PublicationLog::pending_payload_for_fsn(queue, fsn),
             Self::StoreAndForward(queue) => {
                 PublicationLog::pending_payload_for_fsn(queue.as_ref(), fsn)
+            }
+        }
+    }
+
+    fn restart_send_cursor(&mut self) {
+        match self {
+            Self::Memory(queue) => PublicationLog::restart_send_cursor(queue),
+            Self::StoreAndForward(queue) => PublicationLog::restart_send_cursor(queue.as_mut()),
+        }
+    }
+
+    fn take_storage_maintenance_step(
+        &mut self,
+        allow_create: bool,
+    ) -> Result<Option<SfaStorageStep>, DriverError> {
+        match self {
+            Self::Memory(queue) => {
+                PublicationLog::take_storage_maintenance_step(queue, allow_create)
+            }
+            Self::StoreAndForward(queue) => {
+                PublicationLog::take_storage_maintenance_step(queue.as_mut(), allow_create)
+            }
+        }
+    }
+
+    fn finish_storage_maintenance(
+        &mut self,
+        result: SfaStorageResult,
+        allow_install: bool,
+    ) -> Result<SfaStorageFinish, DriverError> {
+        match self {
+            Self::Memory(queue) => {
+                PublicationLog::finish_storage_maintenance(queue, result, allow_install)
+            }
+            Self::StoreAndForward(queue) => {
+                PublicationLog::finish_storage_maintenance(queue.as_mut(), result, allow_install)
+            }
+        }
+    }
+
+    fn record_storage_cleanup_failure(
+        &mut self,
+        failure: SfaCleanupFailure,
+    ) -> Result<(), DriverError> {
+        match self {
+            Self::Memory(queue) => PublicationLog::record_storage_cleanup_failure(queue, failure),
+            Self::StoreAndForward(queue) => {
+                PublicationLog::record_storage_cleanup_failure(queue.as_mut(), failure)
             }
         }
     }
@@ -1733,7 +1903,10 @@ pub(crate) fn connect_qwp_ws(
     Ok(SyncProtocolHandler::SyncQwpWs(Box::new(
         SyncQwpWsHandlerState {
             encoder: QwpWsReplayEncoder::new(negotiated_version),
-            runner: SyncQwpWsRunner::start_with_append_deadline(publisher, *qwp_ws.request_timeout),
+            runner: SyncQwpWsRunner::start_with_append_deadline(
+                publisher,
+                *qwp_ws.sf_append_deadline,
+            ),
         },
     )))
 }
@@ -1750,7 +1923,7 @@ pub(crate) fn open_manual_qwp_ws(
     let publisher = open_qwp_ws_publisher(host, port, use_tls, tls_settings, qwp_ws, auth_header)?;
     Ok(ManualQwpWsHandlerState {
         publisher,
-        max_drive_steps: max_flush_drive_steps(qwp_ws),
+        append_deadline: *qwp_ws.sf_append_deadline,
     })
 }
 
@@ -1877,7 +2050,7 @@ pub(crate) fn flush_qwp_ws_manual(
 ) -> crate::Result<Option<u64>> {
     let receipt = state
         .publisher
-        .submit_qwp_with_drive_limit(buffer, state.max_drive_steps)
+        .submit_qwp_with_append_deadline(buffer, state.append_deadline)
         .map_err(|err| match err {
             QwpWsPublicationError::Encode(err) => err,
             QwpWsPublicationError::Driver(err) => driver_error_to_error(&state.publisher, err),
@@ -2012,10 +2185,6 @@ fn qwp_ws_manual_terminal_error<T>(state: &ManualQwpWsHandlerState) -> crate::Re
         .unwrap_or_else(|| error::fmt!(SocketError, "QWP/WebSocket sender is terminal")))
 }
 
-pub(crate) fn max_flush_drive_steps(qwp_ws: &QwpWsConfig) -> usize {
-    (*qwp_ws.max_in_flight).saturating_add(4).max(16)
-}
-
 fn double_duration(duration: Duration) -> Duration {
     duration.checked_mul(2).unwrap_or(Duration::MAX)
 }
@@ -2045,10 +2214,7 @@ fn driver_error_to_error_without_state(err: DriverError) -> crate::Error {
             "QWP/WebSocket queue rejected publication: {:?}",
             err
         ),
-        DriverError::SubmitTimedOut => error::fmt!(
-            SocketError,
-            "QWP/WebSocket flush timed out waiting for local queue capacity"
-        ),
+        DriverError::SubmitTimedOut { backpressure } => submit_timeout_error(backpressure),
         DriverError::Terminal => error::fmt!(SocketError, "QWP/WebSocket sender is terminal"),
         DriverError::Closing => error::fmt!(InvalidApiCall, "QWP/WebSocket sender is closing"),
         DriverError::UnknownReceipt { fsn } => error::fmt!(
@@ -2059,13 +2225,46 @@ fn driver_error_to_error_without_state(err: DriverError) -> crate::Error {
 }
 
 fn driver_error_is_backpressure(err: &DriverError) -> bool {
-    matches!(
-        err,
+    driver_error_backpressure_queue(err).is_some()
+}
+
+fn driver_error_backpressure_queue(err: &DriverError) -> Option<super::qwp_ws_queue::QueueError> {
+    use super::qwp_ws_queue::QueueError;
+    match err {
         DriverError::Queue(
-            super::qwp_ws_queue::QueueError::FrameCapacityFull { .. }
-                | super::qwp_ws_queue::QueueError::ByteCapacityFull { .. }
-        )
-    )
+            err @ (QueueError::FrameCapacityFull { .. }
+            | QueueError::ByteCapacityFull { .. }
+            | QueueError::StorageSpareNotReady { .. }
+            | QueueError::StorageSegmentCapFull { .. }),
+        ) => Some(*err),
+        _ => None,
+    }
+}
+
+fn submit_timeout_error(backpressure: Option<super::qwp_ws_queue::QueueError>) -> crate::Error {
+    use super::qwp_ws_queue::QueueError;
+    match backpressure {
+        Some(QueueError::StorageSpareNotReady {
+            segment_size_bytes,
+            allocated_segment_bytes,
+            max_total_bytes,
+        }) => error::fmt!(
+            SocketError,
+            "QWP/WebSocket Store-and-Forward append timed out waiting for a prepared segment spare [segment_size_bytes={segment_size_bytes}, allocated_segment_bytes={allocated_segment_bytes}, max_total_bytes={max_total_bytes}]"
+        ),
+        Some(QueueError::StorageSegmentCapFull {
+            segment_size_bytes,
+            allocated_segment_bytes,
+            max_total_bytes,
+        }) => error::fmt!(
+            SocketError,
+            "QWP/WebSocket Store-and-Forward append timed out waiting for ACK-driven segment trim; increase sf_max_total_bytes or drive pending acknowledgements [segment_size_bytes={segment_size_bytes}, allocated_segment_bytes={allocated_segment_bytes}, max_total_bytes={max_total_bytes}]"
+        ),
+        _ => error::fmt!(
+            SocketError,
+            "QWP/WebSocket flush timed out waiting for local queue capacity"
+        ),
+    }
 }
 
 #[cfg(test)]

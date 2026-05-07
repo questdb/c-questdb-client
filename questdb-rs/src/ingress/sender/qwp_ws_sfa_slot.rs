@@ -41,9 +41,12 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 
-use super::qwp_ws_driver::{DriverError, PublicationLog};
-use super::qwp_ws_queue::{PendingPayload, QwpReceipt, QwpReceiptStatus};
-use super::qwp_ws_sfa_queue::{SfaFrameQueue, SfaQueueError, SfaQueueOptions};
+use super::qwp_ws_driver::{DriverError, PublicationLog, SendCursor};
+use super::qwp_ws_queue::{OutboundFrame, PendingPayload, QwpReceipt, QwpReceiptStatus};
+use super::qwp_ws_sfa_queue::{
+    SfaCleanupFailure, SfaFrameQueue, SfaQueueError, SfaQueueOptions, SfaStorageFinish,
+    SfaStorageResult, SfaStorageStep,
+};
 use crate::ingress::conf::{QWP_WS_DEFAULT_SENDER_ID, is_valid_qwp_ws_sender_id};
 
 pub(crate) const DEFAULT_SENDER_ID: &str = QWP_WS_DEFAULT_SENDER_ID;
@@ -56,7 +59,6 @@ pub(crate) struct SfaSlotOptions {
     pub(crate) sf_dir: PathBuf,
     pub(crate) sender_id: String,
     pub(crate) segment_size_bytes: u64,
-    pub(crate) max_frames: usize,
     pub(crate) max_bytes: usize,
     pub(crate) max_in_flight: usize,
 }
@@ -78,7 +80,6 @@ impl SfaSlotQueue {
         let queue = SfaFrameQueue::open(SfaQueueOptions {
             slot_dir,
             segment_size_bytes: options.segment_size_bytes,
-            max_frames: options.max_frames,
             max_bytes: options.max_bytes,
             max_in_flight: options.max_in_flight,
         })?;
@@ -111,8 +112,44 @@ impl PublicationLog for SfaSlotQueue {
         Ok(self.queue.try_submit(payload)?)
     }
 
+    fn next_outbound_frame(
+        &mut self,
+        send_cursor: &mut SendCursor,
+    ) -> Result<Option<OutboundFrame>, DriverError> {
+        PublicationLog::next_outbound_frame(&mut self.queue, send_cursor)
+    }
+
     fn pending_payload_for_fsn(&self, fsn: u64) -> Result<Option<PendingPayload>, DriverError> {
         Ok(self.queue.pending_payload_for_fsn(fsn))
+    }
+
+    fn restart_send_cursor(&mut self) {
+        self.queue.restart_send_cursor();
+    }
+
+    fn take_storage_maintenance_step(
+        &mut self,
+        allow_create: bool,
+    ) -> Result<Option<SfaStorageStep>, DriverError> {
+        Ok(self.queue.take_storage_maintenance_step(allow_create)?)
+    }
+
+    fn finish_storage_maintenance(
+        &mut self,
+        result: SfaStorageResult,
+        allow_install: bool,
+    ) -> Result<SfaStorageFinish, DriverError> {
+        Ok(self
+            .queue
+            .finish_storage_maintenance(result, allow_install)?)
+    }
+
+    fn record_storage_cleanup_failure(
+        &mut self,
+        failure: SfaCleanupFailure,
+    ) -> Result<(), DriverError> {
+        self.queue.record_cleanup_failure(failure);
+        Ok(())
     }
 
     fn oldest_unresolved_fsn(&self) -> Option<u64> {
@@ -256,7 +293,6 @@ mod tests {
             sf_dir: sf_dir.to_path_buf(),
             sender_id: sender_id.to_owned(),
             segment_size_bytes: 256,
-            max_frames: 16,
             max_bytes: 1024,
             max_in_flight: 4,
         }

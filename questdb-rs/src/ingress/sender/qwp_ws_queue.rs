@@ -37,12 +37,15 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
+use super::qwp_ws_sfa_segment::SfaMappedPayload;
+
 pub(crate) struct PendingPayload {
     storage: PendingPayloadStorage,
 }
 
 enum PendingPayloadStorage {
     Owned(Arc<[u8]>),
+    SfaMapped(SfaMappedPayload),
     LockFreeQueue {
         queue: Arc<LockFreeVolatileFrameQueueInner>,
         offset: usize,
@@ -54,6 +57,12 @@ impl PendingPayload {
     pub(crate) fn owned(payload: Arc<[u8]>) -> Self {
         Self {
             storage: PendingPayloadStorage::Owned(payload),
+        }
+    }
+
+    pub(crate) fn sfa_mapped(payload: SfaMappedPayload) -> Self {
+        Self {
+            storage: PendingPayloadStorage::SfaMapped(payload),
         }
     }
 
@@ -70,6 +79,7 @@ impl PendingPayload {
     pub(crate) fn len(&self) -> usize {
         match &self.storage {
             PendingPayloadStorage::Owned(payload) => payload.len(),
+            PendingPayloadStorage::SfaMapped(payload) => payload.len(),
             PendingPayloadStorage::LockFreeQueue { len, .. } => *len,
         }
     }
@@ -77,6 +87,7 @@ impl PendingPayload {
     pub(crate) fn with_bytes<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
         match &self.storage {
             PendingPayloadStorage::Owned(payload) => f(payload.as_ref()),
+            PendingPayloadStorage::SfaMapped(payload) => payload.with_bytes(f),
             PendingPayloadStorage::LockFreeQueue { queue, offset, len } => {
                 // SAFETY: `pending_payload_for_fsn` creates this payload only after
                 // observing a published slot. The SPSC protocol does not free or
@@ -195,6 +206,16 @@ pub(crate) enum QueueError {
         payload_len: usize,
         bytes_used: usize,
         max_bytes: usize,
+    },
+    StorageSpareNotReady {
+        segment_size_bytes: u64,
+        allocated_segment_bytes: u64,
+        max_total_bytes: u64,
+    },
+    StorageSegmentCapFull {
+        segment_size_bytes: u64,
+        allocated_segment_bytes: u64,
+        max_total_bytes: u64,
     },
     MaxInFlightReached {
         max_in_flight: usize,

@@ -178,6 +178,7 @@ pub(crate) struct QwpWsConfig {
     pub(crate) sf_max_bytes: ConfigSetting<u64>,
     pub(crate) sf_max_total_bytes: ConfigSetting<Option<u64>>,
     pub(crate) sf_durability: ConfigSetting<SfDurability>,
+    pub(crate) sf_append_deadline: ConfigSetting<std::time::Duration>,
     pub(crate) progress: ConfigSetting<QwpWsProgress>,
 }
 
@@ -205,6 +206,7 @@ impl Default for QwpWsConfig {
             sf_max_bytes: ConfigSetting::new_default(QWP_WS_DEFAULT_SF_SEGMENT_BYTES),
             sf_max_total_bytes: ConfigSetting::new_default(None),
             sf_durability: ConfigSetting::new_default(SfDurability::Memory),
+            sf_append_deadline: ConfigSetting::new_default(std::time::Duration::from_secs(30)),
             progress: ConfigSetting::new_default(QwpWsProgress::Background),
         }
     }

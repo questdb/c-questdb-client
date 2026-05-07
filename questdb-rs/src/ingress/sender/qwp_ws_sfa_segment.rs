@@ -31,16 +31,19 @@
 //! sequences, or server rejection policy.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io;
 use std::path::{Path, PathBuf};
+use std::ptr;
+use std::slice;
+use std::sync::Arc;
+
+use memmap2::{MmapMut, MmapOptions};
 
 pub(crate) const FILE_MAGIC: u32 = 0x3130_4653; // 'SF01' in little-endian bytes.
 pub(crate) const VERSION: u8 = 1;
 pub(crate) const HEADER_SIZE: usize = 24;
 pub(crate) const FRAME_HEADER_SIZE: usize = 8;
 pub(crate) const INITIAL_SEGMENT_FILE_NAME: &str = "sf-initial.sfa";
-
-const CRC32C_POLY_REFLECTED: u32 = 0x82f6_3b78;
 
 #[derive(Debug)]
 pub(crate) enum SfaSegmentError {
@@ -53,6 +56,7 @@ pub(crate) enum SfaSegmentError {
     NonZeroReserved { actual: u16 },
     NegativeBaseSeq { actual: i64 },
     BaseSeqTooLarge { base_seq: u64 },
+    SizeTooLargeForPlatform { size: u64 },
     PayloadTooLarge { payload_len: usize },
     OffsetOverflow,
 }
@@ -77,6 +81,15 @@ pub(crate) struct SfaFrame {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SfaSegmentMetadataScan {
+    pub(crate) header: SfaSegmentHeader,
+    pub(crate) frame_count: u64,
+    pub(crate) append_offset: u64,
+    pub(crate) torn_tail_bytes: u64,
+    pub(crate) first_empty_payload_fsn: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SfaSegmentScan {
     pub(crate) header: SfaSegmentHeader,
     pub(crate) frames: Vec<SfaFrame>,
@@ -87,6 +100,7 @@ pub(crate) struct SfaSegmentScan {
 #[derive(Debug)]
 pub(crate) struct SfaSegment {
     file: File,
+    mapping: Arc<SfaSegmentMapping>,
     path: PathBuf,
     size_bytes: u64,
     header: SfaSegmentHeader,
@@ -95,12 +109,61 @@ pub(crate) struct SfaSegment {
     torn_tail_bytes: u64,
 }
 
+pub(crate) struct SfaMappedPayload {
+    mapping: Arc<SfaSegmentMapping>,
+    offset: usize,
+    len: usize,
+}
+
+struct SfaSegmentMapping {
+    // Field declaration order matters: `_mmap` must drop before any field that
+    // reads through `base`. Today `base`/`len` carry no drop glue, but if a
+    // future field gains one it must be declared *above* `_mmap` so munmap
+    // runs last.
+    //
+    // `_mmap` is owned solely to keep the OS mapping alive (its Drop calls
+    // munmap). All byte access goes through `base`; we deliberately never
+    // re-borrow `MmapMut` after construction. Re-borrowing would synthesise a
+    // transient `&MmapMut` / `&mut MmapMut` covering the full mapping, which
+    // is aliasing UB once this struct is shared via Arc — even when the byte
+    // ranges touched by concurrent callers are disjoint.
+    _mmap: MmapMut,
+    base: *mut u8,
+    len: usize,
+}
+
+// SAFETY: `MmapMut` is itself `Send + Sync`. Concurrent access through `base`
+// is coordinated by callers: the publisher only writes ranges past the segment
+// append offset, while readers only read ranges below the published offset, so
+// the bytes touched are disjoint and use raw-pointer provenance.
+unsafe impl Send for SfaSegmentMapping {}
+unsafe impl Sync for SfaSegmentMapping {}
+
 impl SfaSegment {
     pub(crate) fn create(
         path: impl AsRef<Path>,
         base_seq: u64,
         size_bytes: u64,
         created_us: u64,
+    ) -> Result<Self, SfaSegmentError> {
+        Self::create_inner(path, base_seq, size_bytes, created_us, false)
+    }
+
+    pub(crate) fn create_new(
+        path: impl AsRef<Path>,
+        base_seq: u64,
+        size_bytes: u64,
+        created_us: u64,
+    ) -> Result<Self, SfaSegmentError> {
+        Self::create_inner(path, base_seq, size_bytes, created_us, true)
+    }
+
+    fn create_inner(
+        path: impl AsRef<Path>,
+        base_seq: u64,
+        size_bytes: u64,
+        created_us: u64,
+        create_new: bool,
     ) -> Result<Self, SfaSegmentError> {
         let min_size = (HEADER_SIZE + FRAME_HEADER_SIZE + 1) as u64;
         if size_bytes < min_size {
@@ -109,22 +172,38 @@ impl SfaSegment {
         validate_base_seq(base_seq)?;
 
         let path = path.as_ref();
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .read(true)
-            .write(true)
-            .open(path)?;
-        file.set_len(size_bytes)?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(true);
+        if create_new {
+            options.create_new(true);
+        } else {
+            options.create(true).truncate(true);
+        }
+        let file = options.open(path)?;
+        if let Err(err) = file.set_len(size_bytes) {
+            if create_new {
+                let _ = fs::remove_file(path);
+            }
+            return Err(err.into());
+        }
+        let mapping = match map_file_mut(&file, size_bytes) {
+            Ok(mapping) => mapping,
+            Err(err) => {
+                if create_new {
+                    let _ = fs::remove_file(path);
+                }
+                return Err(err);
+            }
+        };
         let header = SfaSegmentHeader {
             base_seq,
             created_us,
         };
-        file.seek(SeekFrom::Start(0))?;
-        file.write_all(&encode_header(header))?;
+        mapping.copy_from(0, &encode_header(header));
 
         Ok(Self {
             file,
+            mapping,
             path: path.to_path_buf(),
             size_bytes,
             header,
@@ -136,16 +215,23 @@ impl SfaSegment {
 
     pub(crate) fn open_existing(path: impl AsRef<Path>) -> Result<Self, SfaSegmentError> {
         let path = path.as_ref();
-        let bytes = fs::read(path)?;
-        let scan = scan_segment_bytes(&bytes)?;
         let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let size_bytes = file.metadata()?.len();
+        if size_bytes < HEADER_SIZE as u64 {
+            return Err(SfaSegmentError::FileTooShort {
+                size: size_bytes as usize,
+            });
+        }
+        let mapping = map_file_mut(&file, size_bytes)?;
+        let scan = mapping.with_full_slice(scan_segment_metadata_bytes)?;
         Ok(Self {
             file,
+            mapping,
             path: path.to_path_buf(),
-            size_bytes: bytes.len() as u64,
+            size_bytes,
             header: scan.header,
             append_offset: scan.append_offset,
-            frame_count: scan.frames.len() as u64,
+            frame_count: scan.frame_count,
             torn_tail_bytes: scan.torn_tail_bytes,
         })
     }
@@ -167,18 +253,61 @@ impl SfaSegment {
             return Ok(None);
         }
 
-        let offset = self.append_offset;
+        let offset_u64 = self.append_offset;
         let payload_len = (payload.len() as u32).to_le_bytes();
         let crc = crc32c_update(crc32c_update(0, &payload_len), payload);
-        self.file.seek(SeekFrom::Start(offset + 4))?;
-        self.file.write_all(&payload_len)?;
-        self.file.write_all(payload)?;
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.write_all(&crc.to_le_bytes())?;
+        let offset = usize::try_from(offset_u64)
+            .map_err(|_| SfaSegmentError::SizeTooLargeForPlatform { size: offset_u64 })?;
+        let _ =
+            usize::try_from(frame_end).map_err(|_| SfaSegmentError::SizeTooLargeForPlatform {
+                size: self.size_bytes,
+            })?;
+        self.mapping.copy_from(offset + 4, &payload_len);
+        self.mapping.copy_from(offset + 8, payload);
+        self.mapping.copy_from(offset, &crc.to_le_bytes());
         self.append_offset = frame_end;
         self.frame_count += 1;
         self.torn_tail_bytes = 0;
-        Ok(Some(offset))
+        Ok(Some(offset_u64))
+    }
+
+    pub(crate) fn rebase_empty(&mut self, base_seq: u64) -> Result<(), SfaSegmentError> {
+        validate_base_seq(base_seq)?;
+        if self.frame_count != 0 || self.append_offset != HEADER_SIZE as u64 {
+            return Err(SfaSegmentError::OffsetOverflow);
+        }
+        self.header.base_seq = base_seq;
+        self.mapping.copy_from(8, &base_seq.to_le_bytes());
+        Ok(())
+    }
+
+    pub(crate) fn payload_slice_for_fsn(&self, fsn: u64) -> Option<&[u8]> {
+        let payload = self.payload_for_fsn(fsn)?;
+        Some(self.mapping.slice(payload.offset, payload.len))
+    }
+
+    pub(crate) fn payload_for_fsn(&self, fsn: u64) -> Option<SfaMappedPayload> {
+        let offset = self.frame_offset_for_fsn(fsn)?;
+        self.mapped_payload_at_offset(offset)
+    }
+
+    pub(crate) fn frame_offset_for_fsn(&self, fsn: u64) -> Option<u64> {
+        if fsn < self.header.base_seq {
+            return None;
+        }
+        let frame_index = fsn.checked_sub(self.header.base_seq)?;
+        if frame_index >= self.frame_count {
+            return None;
+        }
+        let mut pos = HEADER_SIZE as u64;
+        for _ in 0..frame_index {
+            pos = self.next_frame_offset(pos)?;
+        }
+        Some(pos)
+    }
+
+    pub(crate) fn mapped_payload_at_offset(&self, offset: u64) -> Option<SfaMappedPayload> {
+        self.payload_at_offset(offset)
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -193,12 +322,128 @@ impl SfaSegment {
         self.append_offset
     }
 
+    pub(crate) fn size_bytes(&self) -> u64 {
+        self.size_bytes
+    }
+
     pub(crate) fn frame_count(&self) -> u64 {
         self.frame_count
     }
 
     pub(crate) fn torn_tail_bytes(&self) -> u64 {
         self.torn_tail_bytes
+    }
+
+    pub(crate) fn last_fsn(&self) -> Option<u64> {
+        self.frame_count
+            .checked_sub(1)
+            .and_then(|last_index| self.header.base_seq.checked_add(last_index))
+    }
+
+    fn payload_at_offset(&self, offset: u64) -> Option<SfaMappedPayload> {
+        let offset = usize::try_from(offset).ok()?;
+        let append_offset = usize::try_from(self.append_offset).ok()?;
+        let frame_header_end = offset.checked_add(FRAME_HEADER_SIZE)?;
+        if frame_header_end > append_offset {
+            return None;
+        }
+        let payload_len = self
+            .mapping
+            .with_slice(offset + 4, 4, |bytes| read_i32(bytes, 0));
+        if payload_len < 0 {
+            return None;
+        }
+        let payload_len = payload_len as usize;
+        let payload_start = frame_header_end;
+        let payload_end = payload_start.checked_add(payload_len)?;
+        if payload_end > append_offset {
+            return None;
+        }
+        Some(SfaMappedPayload {
+            mapping: Arc::clone(&self.mapping),
+            offset: payload_start,
+            len: payload_len,
+        })
+    }
+
+    fn next_frame_offset(&self, offset: u64) -> Option<u64> {
+        let payload = self.payload_at_offset(offset)?;
+        offset
+            .checked_add(FRAME_HEADER_SIZE as u64)?
+            .checked_add(payload.len as u64)
+    }
+}
+
+impl SfaMappedPayload {
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(crate) fn with_bytes<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
+        self.mapping.with_slice(self.offset, self.len, f)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn to_vec(&self) -> Vec<u8> {
+        self.with_bytes(|bytes| bytes.to_vec())
+    }
+}
+
+impl std::fmt::Debug for SfaMappedPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SfaMappedPayload")
+            .field("offset", &self.offset)
+            .field("len", &self.len)
+            .finish()
+    }
+}
+
+impl SfaSegmentMapping {
+    fn new(mut mmap: MmapMut) -> Self {
+        let len = mmap.len();
+        // Take the raw pointer once, while `self` is uniquely owned. After this
+        // point the cached `base` is the only access path, so no further
+        // `&MmapMut` / `&mut MmapMut` is ever materialised — the pointer's
+        // provenance covers the whole mapping for the lifetime of `_mmap`.
+        let base = mmap.as_mut_ptr();
+        Self {
+            _mmap: mmap,
+            base,
+            len,
+        }
+    }
+
+    fn copy_from(&self, offset: usize, src: &[u8]) {
+        assert!(
+            offset
+                .checked_add(src.len())
+                .is_some_and(|end| end <= self.len)
+        );
+        // SAFETY: callers only write ranges that are not concurrently read or
+        // written. Published payload ranges are immutable; append writes
+        // length/payload before publishing the CRC and advancing the segment
+        // append offset. All access goes through the cached raw pointer, so
+        // disjoint concurrent reads via `slice` are sound.
+        unsafe {
+            ptr::copy_nonoverlapping(src.as_ptr(), self.base.add(offset), src.len());
+        }
+    }
+
+    fn with_slice<R>(&self, offset: usize, len: usize, f: impl FnOnce(&[u8]) -> R) -> R {
+        f(self.slice(offset, len))
+    }
+
+    fn slice(&self, offset: usize, len: usize) -> &[u8] {
+        assert!(offset.checked_add(len).is_some_and(|end| end <= self.len));
+        // SAFETY: the returned slice covers a published immutable range. The
+        // queue may append to disjoint offsets through `copy_from` while this
+        // slice is alive; both paths use raw-pointer provenance and never
+        // re-borrow the `MmapMut`, so the disjoint accesses do not alias.
+        unsafe { slice::from_raw_parts(self.base.add(offset) as *const u8, len) }
+    }
+
+    fn with_full_slice<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
+        self.with_slice(0, self.len, f)
     }
 }
 
@@ -215,7 +460,74 @@ pub(crate) fn scan_file(path: impl AsRef<Path>) -> Result<SfaSegmentScan, SfaSeg
     scan_segment_bytes(&bytes)
 }
 
+pub(crate) fn scan_file_metadata(
+    path: impl AsRef<Path>,
+) -> Result<SfaSegmentMetadataScan, SfaSegmentError> {
+    let file = File::open(path)?;
+    let size_bytes = file.metadata()?.len();
+    if size_bytes < HEADER_SIZE as u64 {
+        return Err(SfaSegmentError::FileTooShort {
+            size: usize::try_from(size_bytes).unwrap_or(usize::MAX),
+        });
+    }
+    let len = usize::try_from(size_bytes)
+        .map_err(|_| SfaSegmentError::SizeTooLargeForPlatform { size: size_bytes })?;
+    // SAFETY: this read-only mapping is used only for a synchronous metadata
+    // scan while the SFA slot lock prevents another writer from mutating files
+    // in this slot.
+    let mmap = unsafe {
+        MmapOptions::new()
+            .len(len)
+            .map(&file)
+            .map_err(SfaSegmentError::Io)?
+    };
+    scan_segment_metadata_bytes(&mmap)
+}
+
+pub(crate) fn scan_segment_metadata_bytes(
+    bytes: &[u8],
+) -> Result<SfaSegmentMetadataScan, SfaSegmentError> {
+    let raw = scan_segment_bytes_inner(bytes, |_, _, _, _| Ok(()))?;
+    Ok(SfaSegmentMetadataScan {
+        header: raw.header,
+        frame_count: raw.frame_count,
+        append_offset: raw.append_offset,
+        torn_tail_bytes: raw.torn_tail_bytes,
+        first_empty_payload_fsn: raw.first_empty_payload_fsn,
+    })
+}
+
 pub(crate) fn scan_segment_bytes(bytes: &[u8]) -> Result<SfaSegmentScan, SfaSegmentError> {
+    let mut frames = Vec::new();
+    let raw = scan_segment_bytes_inner(bytes, |fsn, offset, _payload_len, payload| {
+        frames.push(SfaFrame {
+            fsn,
+            offset,
+            payload: payload.to_vec(),
+        });
+        Ok(())
+    })?;
+
+    Ok(SfaSegmentScan {
+        header: raw.header,
+        frames,
+        append_offset: raw.append_offset,
+        torn_tail_bytes: raw.torn_tail_bytes,
+    })
+}
+
+struct RawSegmentScan {
+    header: SfaSegmentHeader,
+    frame_count: u64,
+    append_offset: u64,
+    torn_tail_bytes: u64,
+    first_empty_payload_fsn: Option<u64>,
+}
+
+fn scan_segment_bytes_inner(
+    bytes: &[u8],
+    mut on_frame: impl FnMut(u64, u64, usize, &[u8]) -> Result<(), SfaSegmentError>,
+) -> Result<RawSegmentScan, SfaSegmentError> {
     if bytes.len() < HEADER_SIZE {
         return Err(SfaSegmentError::FileTooShort { size: bytes.len() });
     }
@@ -248,7 +560,8 @@ pub(crate) fn scan_segment_bytes(bytes: &[u8]) -> Result<SfaSegmentScan, SfaSegm
         created_us: read_u64(bytes, 16),
     };
 
-    let mut frames = Vec::new();
+    let mut frame_count = 0u64;
+    let mut first_empty_payload_fsn = None;
     let mut pos = HEADER_SIZE;
     while pos + FRAME_HEADER_SIZE <= bytes.len() {
         let crc_read = read_u32(bytes, pos);
@@ -273,21 +586,25 @@ pub(crate) fn scan_segment_bytes(bytes: &[u8]) -> Result<SfaSegmentScan, SfaSegm
 
         let fsn = header
             .base_seq
-            .checked_add(frames.len() as u64)
+            .checked_add(frame_count)
             .ok_or(SfaSegmentError::OffsetOverflow)?;
-        frames.push(SfaFrame {
-            fsn,
-            offset: pos as u64,
-            payload: bytes[pos + FRAME_HEADER_SIZE..frame_end].to_vec(),
-        });
+        let payload = &bytes[pos + FRAME_HEADER_SIZE..frame_end];
+        if payload_len == 0 && first_empty_payload_fsn.is_none() {
+            first_empty_payload_fsn = Some(fsn);
+        }
+        on_frame(fsn, pos as u64, payload_len, payload)?;
+        frame_count = frame_count
+            .checked_add(1)
+            .ok_or(SfaSegmentError::OffsetOverflow)?;
         pos = frame_end;
     }
 
-    Ok(SfaSegmentScan {
+    Ok(RawSegmentScan {
         header,
-        frames,
+        frame_count,
         append_offset: pos as u64,
         torn_tail_bytes: detect_torn_tail(bytes, pos),
+        first_empty_payload_fsn,
     })
 }
 
@@ -326,18 +643,30 @@ fn detect_torn_tail(bytes: &[u8], last_good: usize) -> u64 {
 }
 
 fn crc32c_update(seed: u32, bytes: &[u8]) -> u32 {
-    let mut crc = !seed;
-    for byte in bytes {
-        crc ^= u32::from(*byte);
-        for _ in 0..8 {
-            if crc & 1 == 1 {
-                crc = (crc >> 1) ^ CRC32C_POLY_REFLECTED;
-            } else {
-                crc >>= 1;
-            }
-        }
+    crc32c::crc32c_append(seed, bytes)
+}
+
+fn map_file_mut(file: &File, size_bytes: u64) -> Result<Arc<SfaSegmentMapping>, SfaSegmentError> {
+    let len = usize::try_from(size_bytes)
+        .map_err(|_| SfaSegmentError::SizeTooLargeForPlatform { size: size_bytes })?;
+    // SAFETY: SFA slot locking prevents another client process from mutating
+    // this segment while it is mapped by this queue. This module owns all writes
+    // through the mapping and validates published offsets before reading bytes.
+    unsafe {
+        let mmap = MmapOptions::new()
+            .len(len)
+            .map_mut(file)
+            .map_err(SfaSegmentError::Io)?;
+        Ok(Arc::new(SfaSegmentMapping::new(mmap)))
     }
-    !crc
+}
+
+impl std::fmt::Debug for SfaSegmentMapping {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SfaSegmentMapping")
+            .field("len", &self.len)
+            .finish()
+    }
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> u32 {
@@ -443,6 +772,24 @@ mod tests {
         assert_eq!(segment.append_offset(), 50);
         assert_eq!(segment.frame_count(), 2);
         assert_eq!(segment.torn_tail_bytes(), 0);
+    }
+
+    #[test]
+    fn metadata_scan_counts_frames_without_payload_results() {
+        let fixture = java_two_frame_fixture();
+        let scan = scan_segment_metadata_bytes(&fixture).unwrap();
+
+        assert_eq!(
+            scan.header,
+            SfaSegmentHeader {
+                base_seq: 42,
+                created_us: 1_234_567_890_123,
+            }
+        );
+        assert_eq!(scan.frame_count, 2);
+        assert_eq!(scan.append_offset, 50);
+        assert_eq!(scan.torn_tail_bytes, 0);
+        assert_eq!(scan.first_empty_payload_fsn, None);
     }
 
     #[test]

@@ -423,7 +423,6 @@ fn sfa_options(sf_dir: &Path) -> SfaSlotOptions {
         sf_dir: sf_dir.to_path_buf(),
         sender_id: "default".to_string(),
         segment_size_bytes: 64 * 1024,
-        max_frames: 8,
         max_bytes: 64 * 1024,
         max_in_flight: 4,
     }
