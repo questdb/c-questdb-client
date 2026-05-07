@@ -153,6 +153,14 @@ impl Reader {
     /// Mid-query failover (via [`Cursor::next_batch`]) is what uses
     /// `failover_backoff_*` to space retries.
     pub fn from_config(cfg: &ReaderConfig) -> Result<Self> {
+        // Re-run cap and consistency checks. `from_conf` validated at
+        // parse time, but `ReaderConfig`'s `pub` fields can be mutated
+        // post-parse (`#[non_exhaustive]` blocks struct-literal
+        // construction, not field assignment), so a caller could
+        // otherwise sneak a `failover_backoff_max_ms = u64::MAX` past
+        // the parse-time hard cap and induce multi-day `thread::sleep`s
+        // during a failover storm.
+        cfg.validate()?;
         // Single deep clone at the API boundary. Every subsequent
         // reconnect attempt — initial walk, mid-query failover, inner
         // replay cycle — shares the same allocation via `Arc::clone`.

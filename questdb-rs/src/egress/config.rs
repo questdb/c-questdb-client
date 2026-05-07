@@ -542,43 +542,6 @@ impl ReaderConfig {
             }
         }
 
-        if failover_max_attempts == 0 {
-            return Err(fmt!(
-                ConfigError,
-                "\"failover_max_attempts\" must be >= 1 (use \"failover=off\" to disable failover entirely)"
-            ));
-        }
-        if failover_max_attempts > MAX_FAILOVER_MAX_ATTEMPTS {
-            return Err(fmt!(
-                ConfigError,
-                "\"failover_max_attempts\" {} exceeds the hard cap of {}",
-                failover_max_attempts,
-                MAX_FAILOVER_MAX_ATTEMPTS
-            ));
-        }
-        if failover_backoff_initial_ms == 0 {
-            return Err(fmt!(
-                ConfigError,
-                "\"failover_backoff_initial_ms\" must be > 0"
-            ));
-        }
-        if failover_backoff_max_ms < failover_backoff_initial_ms {
-            return Err(fmt!(
-                ConfigError,
-                "\"failover_backoff_max_ms\" ({}) must be >= \"failover_backoff_initial_ms\" ({})",
-                failover_backoff_max_ms,
-                failover_backoff_initial_ms
-            ));
-        }
-        if failover_backoff_max_ms > MAX_FAILOVER_BACKOFF_MAX_MS {
-            return Err(fmt!(
-                ConfigError,
-                "\"failover_backoff_max_ms\" {} exceeds the hard cap of {} (1 hour)",
-                failover_backoff_max_ms,
-                MAX_FAILOVER_BACKOFF_MAX_MS
-            ));
-        }
-
         // tls_* knobs only make sense with TLS scheme.
         if !tls && (tls_roots.is_some() || tls_ca_explicit) {
             return Err(fmt!(
@@ -607,7 +570,7 @@ impl ReaderConfig {
             auth_verbatim.as_deref(),
         )?;
 
-        Ok(ReaderConfig {
+        let cfg = ReaderConfig {
             addrs,
             tls,
             path,
@@ -624,7 +587,78 @@ impl ReaderConfig {
             tls_verify,
             tls_ca,
             tls_roots,
-        })
+        };
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Re-run the cap and consistency checks that `from_conf` enforces.
+    ///
+    /// `ReaderConfig`'s knobs are `pub` for ergonomics — callers can
+    /// build one programmatically or tweak a parsed config before
+    /// handing it to [`Reader::from_config`](crate::egress::Reader::from_config).
+    /// `#[non_exhaustive]` blocks struct-literal construction but does
+    /// not block field-mutation, so a malicious or careless caller could
+    /// otherwise set `failover_backoff_max_ms = u64::MAX` after parse
+    /// and bypass the parse-time hard cap. `Reader::from_config` calls
+    /// this defensively before opening any socket.
+    pub fn validate(&self) -> Result<()> {
+        if self.addrs.is_empty() {
+            return Err(fmt!(ConfigError, "\"addr\" parameter is empty"));
+        }
+        if self.addrs.len() > MAX_ADDRS {
+            return Err(fmt!(
+                ConfigError,
+                "\"addr\" list length {} exceeds the hard cap of {}",
+                self.addrs.len(),
+                MAX_ADDRS
+            ));
+        }
+        if !(1..=HIGHEST_KNOWN_VERSION).contains(&self.max_version) {
+            return Err(fmt!(
+                ConfigError,
+                "\"max_version\" must be in 1..={} (got {})",
+                HIGHEST_KNOWN_VERSION,
+                self.max_version
+            ));
+        }
+        if self.failover_max_attempts == 0 {
+            return Err(fmt!(
+                ConfigError,
+                "\"failover_max_attempts\" must be >= 1 (use \"failover=off\" to disable failover entirely)"
+            ));
+        }
+        if self.failover_max_attempts > MAX_FAILOVER_MAX_ATTEMPTS {
+            return Err(fmt!(
+                ConfigError,
+                "\"failover_max_attempts\" {} exceeds the hard cap of {}",
+                self.failover_max_attempts,
+                MAX_FAILOVER_MAX_ATTEMPTS
+            ));
+        }
+        if self.failover_backoff_initial_ms == 0 {
+            return Err(fmt!(
+                ConfigError,
+                "\"failover_backoff_initial_ms\" must be > 0"
+            ));
+        }
+        if self.failover_backoff_max_ms < self.failover_backoff_initial_ms {
+            return Err(fmt!(
+                ConfigError,
+                "\"failover_backoff_max_ms\" ({}) must be >= \"failover_backoff_initial_ms\" ({})",
+                self.failover_backoff_max_ms,
+                self.failover_backoff_initial_ms
+            ));
+        }
+        if self.failover_backoff_max_ms > MAX_FAILOVER_BACKOFF_MAX_MS {
+            return Err(fmt!(
+                ConfigError,
+                "\"failover_backoff_max_ms\" {} exceeds the hard cap of {} (1 hour)",
+                self.failover_backoff_max_ms,
+                MAX_FAILOVER_BACKOFF_MAX_MS
+            ));
+        }
+        Ok(())
     }
 
     /// Read-only view of the parsed endpoint list. The list is populated
@@ -1240,5 +1274,68 @@ mod tests {
         // a regression for the predominant non-IPv6 path users see.
         let c = ReaderConfig::from_conf("qwp::addr=db-a:9000;path=/exec").unwrap();
         assert_eq!(c.url_for(0), "ws://db-a:9000/exec");
+    }
+
+    #[test]
+    fn validate_accepts_parsed_default_config() {
+        let c = ReaderConfig::from_conf("qwp::addr=h:9000").unwrap();
+        c.validate().expect("a freshly-parsed config must validate");
+    }
+
+    #[test]
+    fn validate_rejects_post_parse_backoff_overflow() {
+        let mut c = ReaderConfig::from_conf("qwp::addr=h:9000").unwrap();
+        c.failover_backoff_max_ms = u64::MAX;
+        let err = c.validate().unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+        assert!(
+            err.msg().contains("failover_backoff_max_ms"),
+            "got: {}",
+            err.msg()
+        );
+    }
+
+    #[test]
+    fn validate_rejects_post_parse_max_attempts_overflow() {
+        let mut c = ReaderConfig::from_conf("qwp::addr=h:9000").unwrap();
+        c.failover_max_attempts = MAX_FAILOVER_MAX_ATTEMPTS + 1;
+        let err = c.validate().unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+    }
+
+    #[test]
+    fn validate_rejects_post_parse_max_attempts_zero() {
+        let mut c = ReaderConfig::from_conf("qwp::addr=h:9000").unwrap();
+        c.failover_max_attempts = 0;
+        let err = c.validate().unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+    }
+
+    #[test]
+    fn validate_rejects_post_parse_backoff_zero_initial() {
+        let mut c = ReaderConfig::from_conf("qwp::addr=h:9000").unwrap();
+        c.failover_backoff_initial_ms = 0;
+        let err = c.validate().unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+    }
+
+    #[test]
+    fn validate_rejects_post_parse_backoff_inversion() {
+        let mut c = ReaderConfig::from_conf("qwp::addr=h:9000").unwrap();
+        c.failover_backoff_initial_ms = 1000;
+        c.failover_backoff_max_ms = 50;
+        let err = c.validate().unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+    }
+
+    #[test]
+    fn validate_rejects_post_parse_max_version_out_of_range() {
+        let mut c = ReaderConfig::from_conf("qwp::addr=h:9000").unwrap();
+        c.max_version = 0;
+        let err = c.validate().unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+        c.max_version = HIGHEST_KNOWN_VERSION + 1;
+        let err = c.validate().unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
     }
 }
