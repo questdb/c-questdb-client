@@ -337,10 +337,7 @@ fn validity_of<'a>(buf: &'a ColumnBuffer, row_count: usize) -> Result<Validity<'
     validity_from_opt(&buf.validity, row_count)
 }
 
-fn validity_from_opt<'a>(
-    validity: &'a Option<Bytes>,
-    row_count: usize,
-) -> Result<Validity<'a>> {
+fn validity_from_opt<'a>(validity: &'a Option<Bytes>, row_count: usize) -> Result<Validity<'a>> {
     match validity {
         None => Ok(Validity::None),
         Some(bytes) => Validity::from_bitmap(bytes, row_count),

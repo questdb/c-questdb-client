@@ -470,7 +470,10 @@ mod tests {
     #[test]
     fn simple_null_layout() {
         // type_code=Long(0x05), null_flag=0x01, bitmap=0x01
-        assert_eq!(enc(Bind::Null(SimpleNullKind::Long)), vec![0x05, 0x01, 0x01]);
+        assert_eq!(
+            enc(Bind::Null(SimpleNullKind::Long)),
+            vec![0x05, 0x01, 0x01]
+        );
     }
 
     #[test]

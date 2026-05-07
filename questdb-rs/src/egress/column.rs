@@ -508,11 +508,7 @@ impl<'a> VarcharColumn<'a> {
     /// The decoder upholds this invariant by validating the concatenated
     /// `data` buffer once at decode time and only emitting offsets at
     /// codepoint boundaries.
-    pub(crate) unsafe fn new(
-        offsets: &'a [u32],
-        data: &'a [u8],
-        validity: Validity<'a>,
-    ) -> Self {
+    pub(crate) unsafe fn new(offsets: &'a [u32], data: &'a [u8], validity: Validity<'a>) -> Self {
         Self {
             inner: VarlenLayout {
                 offsets,
