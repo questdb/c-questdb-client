@@ -2240,6 +2240,168 @@ TEST_CASE("mock: target=primary against replica-only endpoint surfaces role_mism
 }
 
 // ---------------------------------------------------------------------------
+// Malformed-frame coverage. Exercises the `protocol_error` paths inside
+// the WS frame parser and the RESULT_BATCH decoder by hand-crafting
+// frames the friendly builders refuse to emit. Uses `ActionSendRaw`
+// (otherwise dead code in this suite — the friendly builders cover the
+// happy path). Each test connects, executes a no-op query, and asserts
+// `next_batch()` surfaces `line_reader_error_protocol_error` with the
+// cursor torn down.
+// ---------------------------------------------------------------------------
+
+namespace
+{
+
+void run_malformed_batch(
+    qm::Script script,
+    ::line_reader_error_code expected = line_reader_error_protocol_error)
+{
+    qm::MockServer srv({std::move(script)});
+    // Disable failover. ProtocolError is failover-eligible by default,
+    // so the client would otherwise reconnect to the (now scriptless)
+    // mock and hang. Disabling makes the malformed-frame error
+    // surface directly on `next_batch`.
+    const std::string conf =
+        "qwp::addr=" + srv.addr() + ";failover=off;";
+    questdb::egress::reader reader{
+        questdb::ingress::utf8_view{conf}};
+    auto cur = reader.execute("select 1"_utf8);
+    bool threw = false;
+    try
+    {
+        cur.next_batch();
+        FAIL("expected error from malformed frame");
+    }
+    catch (const questdb::egress::line_reader_error& e)
+    {
+        threw = true;
+        CHECK(e.code() == expected);
+    }
+    CHECK(threw);
+}
+
+} // anonymous namespace
+
+TEST_CASE("mock: protocol_error — header.payload_length lies (claims more bytes than sent)")
+{
+    // Build a valid-looking RESULT_BATCH then overwrite the 4-byte
+    // payload_length in the header with a value larger than the actual
+    // payload. transport.rs::read_frame's mismatch check fires.
+    qm::ColumnSpec c{
+        "v", qm::COL_INT, qm::fixed_column_bytes(1, pack_le<int32_t>({0}))};
+    qm::Script s = {
+        qm::ActionSendServerInfo{},
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendBuilt{[c](int64_t rid) {
+            auto f = qm::result_batch_frame(rid, 0, 1, 1, {c});
+            // Bump declared payload_length by 1024 — the actual bytes
+            // are unchanged, so the frame parser sees a mismatch.
+            uint32_t plen = uint32_t(f[8]) | (uint32_t(f[9]) << 8) |
+                (uint32_t(f[10]) << 16) | (uint32_t(f[11]) << 24);
+            uint32_t bumped = plen + 1024;
+            f[8] = uint8_t(bumped);
+            f[9] = uint8_t(bumped >> 8);
+            f[10] = uint8_t(bumped >> 16);
+            f[11] = uint8_t(bumped >> 24);
+            return f;
+        }},
+        qm::ActionSendResultEnd{},
+    };
+    run_malformed_batch(s);
+}
+
+TEST_CASE("mock: protocol_error — RESULT_BATCH carries an unknown column kind")
+{
+    // Column kind 0xFE is reserved/undefined in the spec. Schema
+    // decoder rejects unknown discriminants.
+    qm::ColumnSpec c{
+        "v",
+        /*kind=*/0xFE,
+        qm::fixed_column_bytes(1, pack_le<int32_t>({0}))};
+    qm::Script s = {
+        qm::ActionSendServerInfo{},
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendBuilt{[c](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 1, 1, {c});
+        }},
+        qm::ActionSendResultEnd{},
+    };
+    run_malformed_batch(s);
+}
+
+TEST_CASE("mock: invalid_utf8 — RESULT_BATCH column name is not valid UTF-8")
+{
+    // Non-UTF-8 column name bytes (lone 0xFF — illegal start byte).
+    // Schema decoder validates column names as UTF-8 and surfaces a
+    // dedicated `invalid_utf8` code (not the generic `protocol_error`).
+    qm::ColumnSpec c{
+        std::string{'\xFF', '\xFE', '\xFD'},
+        qm::COL_INT,
+        qm::fixed_column_bytes(1, pack_le<int32_t>({0}))};
+    qm::Script s = {
+        qm::ActionSendServerInfo{},
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendBuilt{[c](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 1, 1, {c});
+        }},
+        qm::ActionSendResultEnd{},
+    };
+    run_malformed_batch(s, line_reader_error_invalid_utf8);
+}
+
+TEST_CASE("mock: protocol_error — over-long varint in batch_seq")
+{
+    // A u64 LEB128 is at most 10 bytes. Send 11+ continuation bytes
+    // for the `batch_seq` field; the varint decoder errors on
+    // truncated/over-long input.
+    qm::Script s = {
+        qm::ActionSendServerInfo{},
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendBuilt{[](int64_t rid) {
+            std::vector<uint8_t> p;
+            p.push_back(qm::MSG_RESULT_BATCH);
+            for (int i = 0; i < 8; ++i)
+                p.push_back(uint8_t(rid >> (i * 8)));
+            // 12 continuation bytes then a terminator — invalid varint
+            // (max valid u64 LEB128 is 10 bytes).
+            for (int i = 0; i < 12; ++i)
+                p.push_back(0xFF);
+            p.push_back(0x00);
+            return qm::framed(2, 0, 1, p);
+        }},
+        qm::ActionSendResultEnd{},
+    };
+    run_malformed_batch(s);
+}
+
+// Wire `ActionSendRaw` into a regression test so the action variant
+// stops being dead code: a future refactor that drops it would
+// silently lose a piece of public test infrastructure. Frames that
+// don't depend on the dynamic request_id (SERVER_INFO, CACHE_RESET)
+// are the natural fit for ActionSendRaw; request-bound frames use
+// ActionSendBuilt.
+TEST_CASE("mock: ActionSendRaw delivers a hand-built SERVER_INFO frame")
+{
+    auto si =
+        qm::server_info_frame(qm::ROLE_PRIMARY, "raw-cluster", "raw-node");
+    qm::Script s = {
+        qm::ActionSendRaw{si},
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendBuilt{
+            [](int64_t rid) { return qm::result_end_frame(rid); }},
+    };
+    qm::MockServer srv({s});
+    auto reader = connect_to(srv);
+    auto info = reader.server_info();
+    REQUIRE(static_cast<bool>(info));
+    CHECK(info.role_byte() == qm::ROLE_PRIMARY);
+    CHECK(info.cluster_id() == "raw-cluster");
+    CHECK(info.node_id() == "raw-node");
+    auto cur = reader.execute("select 1"_utf8);
+    CHECK_FALSE(cur.next_batch());
+}
+
+// ---------------------------------------------------------------------------
 // Coverage gaps documented but not yet asserted in this suite — left as
 // breadcrumbs for the next contributor:
 //
