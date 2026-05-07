@@ -17,7 +17,6 @@ path = "../questdb-rs"
 default-features = false
 features = [
     "ring-crypto",
-    "insecure-skip-verify",
     "tls-webpki-certs",
     "tls-native-certs",
     "sync-sender",
@@ -41,6 +40,13 @@ confstr-ffi = ["dep:questdb-confstr-ffi"]
 # dependency. The in-tree CMake build enables it via
 # `corrosion_import_crate(FEATURES sync-reader-ws ...)`.
 sync-reader-ws = ["questdb-rs/sync-reader-ws", "questdb-rs/compression-zstd"]
+# Compile in support for the `tls_verify=unsafe_off` connect-string knob.
+# Off by default: a shipped C ABI binary should not silently allow
+# downstream callers to disable certificate verification. Distributions
+# that need the escape hatch (test harnesses, MITM debuggers) opt in via
+# `--features insecure-skip-verify`; the in-tree CMake build exposes a
+# `QUESTDB_ENABLE_INSECURE_SKIP_VERIFY` option (also off by default).
+insecure-skip-verify = ["questdb-rs/insecure-skip-verify"]
 
 # Abort on panic. A panic that unwinds across the C FFI boundary is
 # undefined behaviour, and this crate's surface is too wide to wrap every

@@ -1605,17 +1605,43 @@ pub unsafe extern "C" fn line_sender_opts_auth_timeout(
 ///
 /// For testing consider specifying a path to a `.pem` file instead via
 /// the `tls_roots` setting.
+///
+/// On builds without the `insecure-skip-verify` Cargo feature, calling
+/// this with `verify=false` returns an `InvalidApiCall` error and leaves
+/// the options unchanged. `verify=true` is a no-op (verification is the
+/// default).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_opts_tls_verify(
     opts: *mut line_sender_opts,
     verify: bool,
     err_out: *mut *mut line_sender_error,
 ) -> bool {
-    unsafe { upd_opts!(opts, err_out, tls_verify, verify) }
+    #[cfg(feature = "insecure-skip-verify")]
+    {
+        unsafe { upd_opts!(opts, err_out, tls_verify, verify) }
+    }
+    #[cfg(not(feature = "insecure-skip-verify"))]
+    {
+        let _ = opts;
+        if verify {
+            true
+        } else {
+            unsafe {
+                set_err_out(
+                    err_out,
+                    ErrorCode::InvalidApiCall,
+                    "tls_verify=false requires the \"insecure-skip-verify\" \
+                     Cargo feature, which this build was compiled without"
+                        .to_string(),
+                );
+            }
+            false
+        }
+    }
 }
 
 /// Specify where to find the certificate authority used to validate
-/// the validate the server's TLS certificate.
+/// the server's TLS certificate.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_sender_opts_tls_ca(
     opts: *mut line_sender_opts,

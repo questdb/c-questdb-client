@@ -54,18 +54,33 @@ if(QUESTDB_TESTS_AND_EXAMPLES AND NOT QUESTDB_ENABLE_READER)
         "the line_reader_* examples and tests would fail to link without it.")
 endif()
 
+# Compile in the `tls_verify=false` (sender) / `tls_verify=unsafe_off`
+# (egress reader) escape hatch. ON by default to preserve the legacy
+# behaviour of the shipped C ABI; security-conscious distributions can
+# flip it OFF (`-DQUESTDB_ENABLE_INSECURE_SKIP_VERIFY=OFF`) to harden
+# the resulting library — `line_sender_opts_tls_verify` then disappears
+# from the symbol table and `tls_verify=unsafe_off` in a connect string
+# is rejected at parse time.
+option(
+    QUESTDB_ENABLE_INSECURE_SKIP_VERIFY
+    "Compile in support for tls_verify off. Allows downstream code to disable TLS certificate verification at runtime."
+    ON)
+
 # Build static and dynamic lib written in Rust by invoking `cargo`.
 # Imports `questdb_client` target.
 add_subdirectory(corrosion)
+set(QUESTDB_CARGO_FEATURES "")
 if(QUESTDB_ENABLE_READER)
+    list(APPEND QUESTDB_CARGO_FEATURES sync-reader-ws)
+endif()
+if(QUESTDB_ENABLE_INSECURE_SKIP_VERIFY)
+    list(APPEND QUESTDB_CARGO_FEATURES insecure-skip-verify)
+endif()
+if(QUESTDB_CARGO_FEATURES)
     corrosion_import_crate(
         MANIFEST_PATH questdb-rs-ffi/Cargo.toml
-        LOCKED   # Use `Cargo.lock`
-        # Opt in to the egress reader. The Cargo.toml default is empty
-        # (so external consumers don't silently grow the surface) — the
-        # in-tree build enables it here so the line_reader_* examples and
-        # tests link.
-        FEATURES sync-reader-ws)
+        LOCKED
+        FEATURES ${QUESTDB_CARGO_FEATURES})
 else()
     corrosion_import_crate(
         MANIFEST_PATH questdb-rs-ffi/Cargo.toml
