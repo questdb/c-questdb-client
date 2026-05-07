@@ -74,8 +74,6 @@ The largest remaining areas are:
 
 - strict unknown-key handling,
 - Java/spec close, retry, and orphan-drainer semantics,
-- remaining Java wire-sequence tolerance around ACK-before-send and
-  NACK/reject high-sequence clamping,
 - Java public API/config surface parity, including deprecated auth aliases,
   WebSocket auto-flush settings, builder methods, and callback-style progress
   handlers,
@@ -301,42 +299,7 @@ Implementation direction:
   spec wording into Rust. If Java is the reference, `0` / `-1` skip only the
   wait-for-ACK drain, not the safety-net terminal-error check.
 
-### 6. ACK-before-send and NACK clamping differ from Java
-
-Spec requirement:
-
-- `sf-client.md:472-474` says ordinary OK trim computes
-  `fsnAtZero + min(sequence, nextWireSeq - 1)` to defend against a buggy or
-  malicious server reporting a future wire sequence.
-
-Rust state:
-
-- Error/NACK responses remain strict protocol errors when they name a future
-  sequence.
-- ACK before a send path has established `fsn_at_zero` / `last_sent_wire_seq`
-  still reports `ProtocolAckWithoutConnection`.
-- `questdb-rs/src/ingress/sender/qwp_ws_driver.rs:1507-1518` rejects a
-  NACK/reject with `wire_seq > last_sent_wire_seq` as
-  `ProtocolRejectBeyondSent`.
-
-Java reference:
-
-- `CursorWebSocketSendLoop.java:1091-1121` clamps OK responses with
-  `Math.min(wireSeq, highestSent)` and ignores an OK frame when
-  `highestSent < 0`.
-- `CursorWebSocketSendLoop.java:1185-1214` applies the same high-sequence
-  clamp to NACK/server-rejection responses and handles pre-send rejections
-  without advancing the storage watermark.
-
-Implementation direction:
-
-- Implement the remaining Java tolerance in one sequence-mapping slice:
-  ignore ACK-before-send, clamp future NACK/reject to highest sent, and keep
-  monotonic completion so no unsent frame can be marked resolved.
-- This is a Java parity target even though the spec text explicitly calls out
-  only ordinary OK.
-
-### 7. Reconnect timing, idle receive, and ACK-timeout behavior are incomplete
+### 6. Reconnect timing, idle receive, and ACK-timeout behavior are incomplete
 
 Spec requirements:
 
@@ -394,7 +357,7 @@ Implementation direction:
 - Implement equal-jitter for reconnect and initial-connect retry if Rust is to
   match the current spec and Java reference.
 
-### 8. Orphan adoption and `.failed` are missing
+### 7. Orphan adoption and `.failed` are missing
 
 Spec requirements:
 
@@ -419,7 +382,7 @@ Implementation direction:
 - Implement `.failed` before enabling background drainers; otherwise failed
   orphan attempts will be retried blindly.
 
-### 9. Error inbox and default error-handler behavior differ
+### 8. Error inbox and default error-handler behavior differ
 
 Spec requirements:
 
@@ -447,7 +410,7 @@ Implementation direction:
 - Add actual logging for the default path if the spec remains strict about
   non-silence.
 
-### 10. Slot locking is Unix-only
+### 9. Slot locking is Unix-only
 
 Spec requirements:
 
@@ -470,7 +433,7 @@ Implementation direction:
 - Either implement Windows `LockFileEx` or document SF disk mode as unsupported
   on Windows and ensure the builder fails clearly.
 
-### 11. SFA header validation is stricter than Java
+### 10. SFA header validation is stricter than Java
 
 Spec requirement:
 
@@ -493,7 +456,7 @@ Java reference divergence:
   as intentional spec hardening unless Java decides to preserve non-zero
   header extensions.
 
-### 12. Fresh SFA filename conflicts with the current spec
+### 11. Fresh SFA filename conflicts with the current spec
 
 Spec requirement:
 
@@ -526,7 +489,7 @@ Open decision:
 - If Java remains authoritative for now, update the spec wording to say fresh
   initial active segments may still be `sf-initial.sfa`.
 
-### 13. Recovery behavior for corrupt or empty side files needs a spec decision
+### 12. Recovery behavior for corrupt or empty side files needs a spec decision
 
 Spec text:
 
@@ -562,7 +525,7 @@ Open decision:
   Rust can discard an empty segment and create a new baseSeq 0 segment if no
   non-empty files remain.
 
-### 14. Torn-tail diagnostics are not operator-visible
+### 13. Torn-tail diagnostics are not operator-visible
 
 Spec requirement:
 
@@ -624,30 +587,28 @@ Update or retire those notes before handing them to an implementation agent.
 
 ## Suggested Fix Order
 
-1. Finish Java sequence tolerance:
-   ignore ACK-before-send and clamp future NACK/reject to highest sent.
-2. Resolve spec/reference mismatches that should not be Rust-only changes:
+1. Resolve spec/reference mismatches that should not be Rust-only changes:
    `sf-initial.sfa`, unknown-key policy, and Rust-stricter SFA header
    extension handling if Java intends to accept non-zero fields. Include the
    disabled close-drain safety-net behavior before accepting
    `close_flush_timeout_millis`.
-3. Validate the durable OK emission/coalescing contract against the live
+2. Validate the durable OK emission/coalescing contract against the live
    durable-ACK server.
-4. Fix user-facing Rust documentation drift around `from_conf` and retire stale
+3. Fix user-facing Rust documentation drift around `from_conf` and retire stale
    `sf_append_deadline_millis` notes in older planning docs.
-5. Implement Java-compatible close semantics and then accept
+4. Implement Java-compatible close semantics and then accept
    `close_flush_timeout_millis`.
-6. Implement ACK-timeout reconnect plus Java/spec equal-jitter, and decide idle
+5. Implement ACK-timeout reconnect plus Java/spec equal-jitter, and decide idle
    receive/protocol-violation classification parity with Java.
-7. Decide Rust API shape for Java-facing config/API gaps:
+6. Decide Rust API shape for Java-facing config/API gaps:
    deprecated `user` / `pass` aliases, WebSocket auto-flush, progress/error
    callback parity versus polling, and then support `error_inbox_capacity` if
    applicable.
-8. Add orphan scanner/drainers and `.failed`, then enable `drain_orphans=on`.
-9. Address lower-level SFA disk details:
+7. Add orphan scanner/drainers and `.failed`, then enable `drain_orphans=on`.
+8. Address lower-level SFA disk details:
    filename decision, empty-segment behavior, and operator-visible recovery
    diagnostics.
-10. Decide Windows SF support:
+9. Decide Windows SF support:
    implement `LockFileEx` or document/fail disk SF mode clearly on Windows.
 
 Each fix should start with a failing regression or golden fixture. For any

@@ -303,7 +303,10 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
             }
             TransportResponse::Reject { wire_seq, error } => {
                 let policy = server_error_policy(error.status);
-                let fsn = send_cursor.reject_fsn_for_wire_seq(wire_seq)?;
+                let Some((fsn, effect_wire_seq)) = send_cursor.reject_fsn_for_wire_seq(wire_seq)?
+                else {
+                    return Ok(self.record_presend_reject(wire_seq, error, policy));
+                };
                 if policy == QwpWsErrorPolicy::Halt {
                     let sender_error = sender_error_for_qwp_error(&error, wire_seq, fsn, policy);
                     self.terminal_sender_error = Some(sender_error.clone());
@@ -312,17 +315,28 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
                     self.mark_terminal(Some(error.error.clone()));
                     return Ok(DriveOutcome::Terminal);
                 }
+                if self.reject_target_already_accounted(fsn) {
+                    self.record_reject_error(fsn, wire_seq, error, policy);
+                    return Ok(DriveOutcome::Idle);
+                }
                 if self.durable_ack.is_some() {
-                    return self.apply_durable_reject(send_cursor, wire_seq, fsn, error, policy);
+                    return self.apply_durable_reject(
+                        send_cursor,
+                        wire_seq,
+                        effect_wire_seq,
+                        fsn,
+                        error,
+                        policy,
+                    );
                 }
 
                 let receipt = self.queue.reject_fsn(fsn)?;
                 send_cursor.ack_through(fsn);
                 self.record_rejected_frame(receipt.fsn, wire_seq, error, policy);
-                if wire_seq > 0 {
+                if effect_wire_seq > 0 {
                     self.push_event(DriverEvent::AckedThrough {
                         fsn: receipt.fsn - 1,
-                        wire_seq: wire_seq - 1,
+                        wire_seq: effect_wire_seq - 1,
                     });
                 }
                 self.push_event(DriverEvent::Rejected {
@@ -342,7 +356,9 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         send_cursor: &mut SendCursor,
         wire_seq: u64,
     ) -> Result<DriveOutcome, DriverError> {
-        let (fsn, ack_wire_seq) = send_cursor.ack_fsn_for_wire_seq(wire_seq)?;
+        let Some((fsn, ack_wire_seq)) = send_cursor.ack_fsn_for_wire_seq(wire_seq)? else {
+            return Ok(DriveOutcome::Idle);
+        };
         self.complete_through(send_cursor, fsn, ack_wire_seq)
     }
 
@@ -352,7 +368,9 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         wire_seq: u64,
         table_seq_txns: Vec<TableSeqTxn>,
     ) -> Result<DriveOutcome, DriverError> {
-        let (fsn, ack_wire_seq) = send_cursor.ack_fsn_for_wire_seq(wire_seq)?;
+        let Some((fsn, ack_wire_seq)) = send_cursor.ack_fsn_for_wire_seq(wire_seq)? else {
+            return Ok(DriveOutcome::Idle);
+        };
         if self.is_rejected_fsn(fsn) {
             send_cursor.ack_through(fsn);
             return Ok(DriveOutcome::Idle);
@@ -377,23 +395,16 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         &mut self,
         send_cursor: &mut SendCursor,
         wire_seq: u64,
+        effect_wire_seq: u64,
         fsn: u64,
         error: QwpServerError,
         policy: QwpWsErrorPolicy,
     ) -> Result<DriveOutcome, DriverError> {
         send_cursor.ack_through(fsn);
-        if self.is_rejected_fsn(fsn)
-            || self
-                .queue
-                .completed_fsn()
-                .is_some_and(|completed_fsn| fsn <= completed_fsn)
-        {
-            return Ok(DriveOutcome::Idle);
-        }
         self.record_rejected_frame(fsn, wire_seq, error, policy);
         self.push_event(DriverEvent::Rejected { fsn, wire_seq });
         let tracker = self.durable_ack.as_mut().expect("durable ACK mode");
-        tracker.enqueue_rejected(wire_seq, fsn);
+        tracker.enqueue_rejected(effect_wire_seq, fsn);
         self.complete_ready_durable(send_cursor)?;
         Ok(DriveOutcome::Rejected { fsn, wire_seq })
     }
@@ -564,6 +575,56 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
             wire_seq,
             error,
         });
+    }
+
+    fn record_reject_error(
+        &mut self,
+        fsn: u64,
+        wire_seq: u64,
+        error: QwpServerError,
+        policy: QwpWsErrorPolicy,
+    ) {
+        self.sender_errors
+            .push(sender_error_for_qwp_error(&error, wire_seq, fsn, policy));
+        self.last_server_error = Some(error);
+    }
+
+    fn reject_target_already_accounted(&self, fsn: u64) -> bool {
+        self.is_rejected_fsn(fsn)
+            || self
+                .durable_ack
+                .as_ref()
+                .is_some_and(|tracker| tracker.pending_wire_seq_for_fsn(fsn).is_some())
+            || self
+                .queue
+                .completed_fsn()
+                .is_some_and(|completed_fsn| fsn <= completed_fsn)
+    }
+
+    fn record_presend_reject(
+        &mut self,
+        wire_seq: u64,
+        error: QwpServerError,
+        policy: QwpWsErrorPolicy,
+    ) -> DriveOutcome {
+        let from_fsn = self
+            .queue
+            .completed_fsn()
+            .map_or(0, |fsn| fsn.saturating_add(1));
+        let to_fsn = self.queue.published_fsn().unwrap_or(from_fsn).max(from_fsn);
+        let sender_error =
+            sender_error_for_qwp_error_span(&error, wire_seq, from_fsn, to_fsn, policy);
+        if policy == QwpWsErrorPolicy::Halt {
+            self.terminal_sender_error = Some(sender_error.clone());
+            self.sender_errors.push(sender_error);
+            self.last_server_error = Some(error.clone());
+            self.mark_terminal(Some(error.error.clone()));
+            DriveOutcome::Terminal
+        } else {
+            self.sender_errors.push(sender_error);
+            self.last_server_error = Some(error);
+            DriveOutcome::Idle
+        }
     }
 
     pub(crate) fn delivery_status(
@@ -1504,39 +1565,32 @@ impl SendCursor {
         Ok(())
     }
 
-    fn reject_fsn_for_wire_seq(&self, wire_seq: u64) -> Result<u64, DriverError> {
+    fn reject_fsn_for_wire_seq(&self, wire_seq: u64) -> Result<Option<(u64, u64)>, DriverError> {
         let Some(fsn_at_zero) = self.fsn_at_zero else {
-            return Err(DriverError::Queue(
-                QueueError::ProtocolRejectWithoutConnection,
-            ));
-        };
-        let last_sent_wire_seq = self.last_sent_wire_seq;
-        if last_sent_wire_seq.is_none_or(|last_sent| wire_seq > last_sent) {
-            return Err(DriverError::Queue(QueueError::ProtocolRejectBeyondSent {
-                wire_seq,
-                last_sent_wire_seq,
-            }));
-        }
-        fsn_at_zero
-            .checked_add(wire_seq)
-            .ok_or(DriverError::Queue(QueueError::SequenceOverflow))
-    }
-
-    fn ack_fsn_for_wire_seq(&self, wire_seq: u64) -> Result<(u64, u64), DriverError> {
-        let Some(fsn_at_zero) = self.fsn_at_zero else {
-            return Err(DriverError::Queue(QueueError::ProtocolAckWithoutConnection));
+            return Ok(None);
         };
         let Some(last_sent_wire_seq) = self.last_sent_wire_seq else {
-            return Err(DriverError::Queue(QueueError::ProtocolAckBeyondSent {
-                wire_seq,
-                last_sent_wire_seq: None,
-            }));
+            return Ok(None);
+        };
+        let effect_wire_seq = wire_seq.min(last_sent_wire_seq);
+        let fsn = fsn_at_zero
+            .checked_add(effect_wire_seq)
+            .ok_or(DriverError::Queue(QueueError::SequenceOverflow))?;
+        Ok(Some((fsn, effect_wire_seq)))
+    }
+
+    fn ack_fsn_for_wire_seq(&self, wire_seq: u64) -> Result<Option<(u64, u64)>, DriverError> {
+        let Some(fsn_at_zero) = self.fsn_at_zero else {
+            return Ok(None);
+        };
+        let Some(last_sent_wire_seq) = self.last_sent_wire_seq else {
+            return Ok(None);
         };
         let ack_wire_seq = wire_seq.min(last_sent_wire_seq);
         let fsn = fsn_at_zero
             .checked_add(ack_wire_seq)
             .ok_or(DriverError::Queue(QueueError::SequenceOverflow))?;
-        Ok((fsn, ack_wire_seq))
+        Ok(Some((fsn, ack_wire_seq)))
     }
 
     fn ack_through(&mut self, acked_fsn: u64) {
@@ -2033,14 +2087,24 @@ fn sender_error_for_qwp_error(
     fsn: u64,
     applied_policy: QwpWsErrorPolicy,
 ) -> QwpWsSenderError {
+    sender_error_for_qwp_error_span(error, wire_seq, fsn, fsn, applied_policy)
+}
+
+fn sender_error_for_qwp_error_span(
+    error: &QwpServerError,
+    wire_seq: u64,
+    from_fsn: u64,
+    to_fsn: u64,
+    applied_policy: QwpWsErrorPolicy,
+) -> QwpWsSenderError {
     QwpWsSenderError {
         category: server_error_category(error.status),
         applied_policy,
         status: Some(error.status),
         message: (!error.message.is_empty()).then(|| error.message.clone()),
         message_sequence: Some(wire_seq),
-        from_fsn: fsn,
-        to_fsn: fsn,
+        from_fsn,
+        to_fsn,
     }
 }
 
@@ -4019,6 +4083,191 @@ mod tests {
     }
 
     #[test]
+    fn future_durable_reject_wire_sequence_clamps_tracker_to_highest_sent_like_java() {
+        let mut driver = durable_driver(FakeOrderedServer::no_response());
+        let first = driver.try_submit(b"first").unwrap();
+        let second = driver.try_submit(b"second").unwrap();
+
+        driver.drive_send_once().unwrap();
+        driver.drive_send_once().unwrap();
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableOk {
+                wire_seq: 0,
+                table_seq_txns: table_seq_txns(&[("trades", 10)]),
+            });
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::Reject {
+                wire_seq: 99,
+                error: schema_mismatch_error("schema changed"),
+            });
+
+        assert_eq!(
+            driver.drive_receive_once().unwrap(),
+            DriveOutcome::Rejected {
+                fsn: 1,
+                wire_seq: 99
+            }
+        );
+        assert_eq!(
+            driver.receipt_status(first),
+            QwpReceiptStatus::Sent {
+                fsn: 0,
+                wire_seq: 0
+            }
+        );
+        assert_eq!(
+            driver.receipt_status(second),
+            QwpReceiptStatus::Rejected { fsn: 1 }
+        );
+
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableAck {
+                table_seq_txns: table_seq_txns(&[("trades", 10)]),
+            });
+        assert_eq!(
+            driver.drive_receive_once().unwrap(),
+            DriveOutcome::Acked { wire_seq: 1 }
+        );
+        assert_eq!(
+            driver.receipt_status(first),
+            QwpReceiptStatus::Acked { fsn: 0 }
+        );
+        assert_eq!(
+            driver.receipt_status(second),
+            QwpReceiptStatus::Rejected { fsn: 1 }
+        );
+
+        let error = driver.poll_sender_error().unwrap();
+        assert_eq!(error.message_sequence, Some(99));
+        assert_eq!(error.from_fsn, 1);
+        assert_eq!(error.to_fsn, 1);
+    }
+
+    #[test]
+    fn late_future_durable_reject_for_acked_frame_reports_error_without_reblocking_tracker() {
+        let mut driver = durable_driver(FakeOrderedServer::no_response());
+        let receipt = driver.try_submit(b"payload").unwrap();
+
+        assert!(matches!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Sent(SentFrame { fsn: 0, .. })
+        ));
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableOk {
+                wire_seq: 0,
+                table_seq_txns: table_seq_txns(&[("trades", 10)]),
+            });
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableAck {
+                table_seq_txns: table_seq_txns(&[("trades", 10)]),
+            });
+        assert_eq!(
+            driver.drive_receive_once().unwrap(),
+            DriveOutcome::Acked { wire_seq: 0 }
+        );
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Acked { fsn: 0 }
+        );
+        assert_eq!(driver.poll_sender_error(), None);
+
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::Reject {
+                wire_seq: 99,
+                error: schema_mismatch_error("late schema mismatch"),
+            });
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Acked { fsn: 0 }
+        );
+
+        let error = driver.poll_sender_error().unwrap();
+        assert_eq!(error.applied_policy, QwpWsErrorPolicy::DropAndContinue);
+        assert_eq!(error.message_sequence, Some(99));
+        assert_eq!(error.from_fsn, 0);
+        assert_eq!(error.to_fsn, 0);
+    }
+
+    #[test]
+    fn future_durable_reject_for_pending_ok_reports_error_without_duplicate_tracker_entry() {
+        let mut driver = durable_driver(FakeOrderedServer::no_response());
+        let receipt = driver.try_submit(b"payload").unwrap();
+
+        assert!(matches!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Sent(SentFrame { fsn: 0, .. })
+        ));
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableOk {
+                wire_seq: 99,
+                table_seq_txns: table_seq_txns(&[("trades", 10)]),
+            });
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Sent {
+                fsn: 0,
+                wire_seq: 0
+            }
+        );
+
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::Reject {
+                wire_seq: 99,
+                error: schema_mismatch_error("late schema mismatch"),
+            });
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Sent {
+                fsn: 0,
+                wire_seq: 0
+            }
+        );
+
+        let error = driver.poll_sender_error().unwrap();
+        assert_eq!(error.applied_policy, QwpWsErrorPolicy::DropAndContinue);
+        assert_eq!(error.message_sequence, Some(99));
+        assert_eq!(error.from_fsn, 0);
+        assert_eq!(error.to_fsn, 0);
+
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::DurableAck {
+                table_seq_txns: table_seq_txns(&[("trades", 10)]),
+            });
+        assert_eq!(
+            driver.drive_receive_once().unwrap(),
+            DriveOutcome::Acked { wire_seq: 0 }
+        );
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Acked { fsn: 0 }
+        );
+        assert_eq!(driver.poll_sender_error(), None);
+    }
+
+    #[test]
     fn durable_ack_does_not_skip_earlier_pending_ok_gap() {
         let mut driver = durable_driver(FakeOrderedServer::no_response());
         let first = driver.try_submit(b"first").unwrap();
@@ -4777,6 +5026,9 @@ mod tests {
             driver.receipt_status(first),
             QwpReceiptStatus::Rejected { fsn: 0 }
         );
+        let first_error = driver.poll_sender_error().unwrap();
+        assert_eq!(first_error.message_sequence, Some(0));
+        assert_eq!(first_error.message.as_deref(), Some("schema changed"));
 
         driver
             .send_core
@@ -4840,6 +5092,9 @@ mod tests {
             driver.receipt_status(first),
             QwpReceiptStatus::Rejected { fsn: 0 }
         );
+        let first_error = driver.poll_sender_error().unwrap();
+        assert_eq!(first_error.message_sequence, Some(0));
+        assert_eq!(first_error.message.as_deref(), Some("schema changed"));
 
         driver
             .send_core
@@ -4853,6 +5108,9 @@ mod tests {
             driver.receipt_status(first),
             QwpReceiptStatus::Rejected { fsn: 0 }
         );
+        let stale_error = driver.poll_sender_error().unwrap();
+        assert_eq!(stale_error.message_sequence, Some(0));
+        assert_eq!(stale_error.message.as_deref(), Some("schema changed again"));
 
         driver
             .send_core
@@ -4917,7 +5175,7 @@ mod tests {
     }
 
     #[test]
-    fn future_reject_wire_sequence_remains_protocol_error_instead_of_java_clamp() {
+    fn future_reject_wire_sequence_clamps_to_highest_sent_like_java() {
         let mut driver = driver(FakeOrderedServer::scripted([FakeSendResult::RejectWire {
             wire_seq: 99,
         }]));
@@ -4925,18 +5183,67 @@ mod tests {
 
         assert_eq!(
             driver.drive_once(),
-            Err(DriverError::Queue(QueueError::ProtocolRejectBeyondSent {
+            Ok(DriveOutcome::Rejected {
+                fsn: 0,
                 wire_seq: 99,
-                last_sent_wire_seq: Some(0),
-            }))
+            })
         );
         assert_eq!(
             driver.receipt_status(receipt),
-            QwpReceiptStatus::Sent {
-                fsn: 0,
-                wire_seq: 0,
-            }
+            QwpReceiptStatus::Rejected { fsn: 0 }
         );
+        assert_eq!(driver.acked_fsn(), Some(0));
+
+        let error = driver.poll_sender_error().unwrap();
+        assert_eq!(error.applied_policy, QwpWsErrorPolicy::DropAndContinue);
+        assert_eq!(error.message_sequence, Some(99));
+        assert_eq!(error.from_fsn, 0);
+        assert_eq!(error.to_fsn, 0);
+    }
+
+    #[test]
+    fn late_future_reject_for_acked_frame_reports_error_without_changing_receipt() {
+        let mut driver = driver(FakeOrderedServer::no_response());
+        let receipt = driver.try_submit(b"payload").unwrap();
+
+        assert!(matches!(
+            driver.drive_send_once().unwrap(),
+            DriveOutcome::Sent(SentFrame { fsn: 0, .. })
+        ));
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::Ack { wire_seq: 0 });
+        assert_eq!(
+            driver.drive_receive_once().unwrap(),
+            DriveOutcome::Acked { wire_seq: 0 }
+        );
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Acked { fsn: 0 }
+        );
+        assert_eq!(driver.poll_sender_error(), None);
+
+        driver
+            .send_core
+            .transport
+            .push_response(TransportResponse::Reject {
+                wire_seq: 99,
+                error: schema_mismatch_error("late schema mismatch"),
+            });
+        assert_eq!(driver.drive_receive_once().unwrap(), DriveOutcome::Progress);
+
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Acked { fsn: 0 }
+        );
+        assert_eq!(driver.acked_fsn(), Some(0));
+
+        let error = driver.poll_sender_error().unwrap();
+        assert_eq!(error.applied_policy, QwpWsErrorPolicy::DropAndContinue);
+        assert_eq!(error.message_sequence, Some(99));
+        assert_eq!(error.from_fsn, 0);
+        assert_eq!(error.to_fsn, 0);
     }
 
     #[test]
@@ -5752,21 +6059,79 @@ mod tests {
     }
 
     #[test]
-    fn drive_receive_once_reports_response_before_connection_as_protocol_error() {
+    fn drive_receive_once_ignores_ack_before_send_like_java() {
         let mut server = FakeOrderedServer::no_response();
         server.push_response(FakeServerResponse::Ack { wire_seq: 0 });
         let mut driver = driver(server);
         let receipt = driver.try_submit(b"payload").unwrap();
 
-        assert_eq!(
-            driver.drive_receive_once(),
-            Err(DriverError::Queue(QueueError::ProtocolAckWithoutConnection))
-        );
+        assert_eq!(driver.drive_receive_once(), Ok(DriveOutcome::Progress));
 
         assert_eq!(
             driver.receipt_status(receipt),
             QwpReceiptStatus::Published { fsn: 0 }
         );
+        assert_eq!(driver.acked_fsn(), None);
+        assert_eq!(driver.poll_sender_error(), None);
+    }
+
+    #[test]
+    fn drive_receive_once_reports_presend_drop_reject_without_ack_advance_like_java() {
+        let mut server = FakeOrderedServer::no_response();
+        server.push_response(FakeServerResponse::Reject {
+            wire_seq: 42,
+            error: schema_mismatch_error("pre-send schema mismatch"),
+        });
+        let mut driver = driver(server);
+        let receipt = driver.try_submit(b"payload").unwrap();
+
+        assert_eq!(driver.drive_receive_once(), Ok(DriveOutcome::Progress));
+
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Published { fsn: 0 }
+        );
+        assert_eq!(driver.acked_fsn(), None);
+        assert_eq!(driver.terminal_sender_error(), None);
+
+        let error = driver.poll_sender_error().unwrap();
+        assert_eq!(error.category, QwpWsErrorCategory::SchemaMismatch);
+        assert_eq!(error.applied_policy, QwpWsErrorPolicy::DropAndContinue);
+        assert_eq!(error.status, Some(codec::WS_STATUS_SCHEMA_MISMATCH));
+        assert_eq!(error.message.as_deref(), Some("pre-send schema mismatch"));
+        assert_eq!(error.message_sequence, Some(42));
+        assert_eq!(error.from_fsn, 0);
+        assert_eq!(error.to_fsn, 0);
+    }
+
+    #[test]
+    fn drive_receive_once_terminalizes_presend_halt_reject_without_ack_advance_like_java() {
+        let mut server = FakeOrderedServer::no_response();
+        server.push_response(FakeServerResponse::Reject {
+            wire_seq: 7,
+            error: QwpServerError {
+                status: codec::WS_STATUS_PARSE_ERROR,
+                message: "bad pre-send payload".to_string(),
+                error: error::fmt!(InvalidApiCall, "QWP parse error: bad pre-send payload"),
+            },
+        });
+        let mut driver = driver(server);
+        let receipt = driver.try_submit(b"payload").unwrap();
+
+        assert_eq!(driver.drive_receive_once(), Ok(DriveOutcome::Terminal));
+
+        assert_eq!(
+            driver.receipt_status(receipt),
+            QwpReceiptStatus::Terminal { fsn: 0 }
+        );
+        assert_eq!(driver.acked_fsn(), None);
+
+        let terminal_error = driver.terminal_sender_error().unwrap();
+        assert_eq!(terminal_error.category, QwpWsErrorCategory::ParseError);
+        assert_eq!(terminal_error.applied_policy, QwpWsErrorPolicy::Halt);
+        assert_eq!(terminal_error.message_sequence, Some(7));
+        assert_eq!(terminal_error.from_fsn, 0);
+        assert_eq!(terminal_error.to_fsn, 0);
     }
 
     #[test]
