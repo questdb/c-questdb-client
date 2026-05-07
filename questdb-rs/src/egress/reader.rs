@@ -1550,10 +1550,7 @@ impl<'r> Cursor<'r> {
             Ok(()) => return Ok(()),
             Err(e) => e,
         };
-        if self.cancelling
-            || !self.reader.cfg.failover
-            || !is_failover_eligible(first_err.code())
-        {
+        if self.cancelling || !self.reader.cfg.failover || !is_failover_eligible(first_err.code()) {
             self.terminate_with_close();
             return Err(first_err);
         }

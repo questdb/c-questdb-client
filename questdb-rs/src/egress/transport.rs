@@ -52,8 +52,8 @@ use tungstenite::{ClientRequestBuilder, Connector, Message, WebSocket};
 use crate::egress::config::ReaderConfig;
 use crate::egress::error::{Error, ErrorCode, Result, fmt};
 use crate::egress::tls::build_client_config;
-use crate::egress::wire::header::{FrameHeader, HEADER_LEN};
 use crate::egress::wire::MsgKind;
+use crate::egress::wire::header::{FrameHeader, HEADER_LEN};
 
 /// Per-write upper bound applied to the underlying `TcpStream` after a
 /// successful handshake. Caps any single `write()` syscall — including
@@ -600,7 +600,10 @@ mod tests {
 
     fn header_map(value: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
-        h.insert("X-QWP-Content-Encoding", HeaderValue::from_str(value).unwrap());
+        h.insert(
+            "X-QWP-Content-Encoding",
+            HeaderValue::from_str(value).unwrap(),
+        );
         h
     }
 
