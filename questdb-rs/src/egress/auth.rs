@@ -88,10 +88,7 @@ impl AuthMode {
             // than ship a header whose meaning depends on which colon
             // the server picks.
             if user.contains(':') {
-                return Err(fmt!(
-                    AuthError,
-                    "Basic auth username must not contain ':'"
-                ));
+                return Err(fmt!(AuthError, "Basic auth username must not contain ':'"));
             }
             reject_control_bytes(user, "Basic auth username")?;
             reject_control_bytes(pass, "Basic auth password")?;
