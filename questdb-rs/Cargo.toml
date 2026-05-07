@@ -24,10 +24,11 @@ dns-lookup = "3.0.0"
 base64ct = { version = "1.7", features = ["alloc"] }
 ryu = { version = "1.0" }
 itoa = "1.0"
-# Used in the QWP egress decoder for zero-copy slicing of frame payloads.
-# Re-exported by `tungstenite` but referenced unconditionally here so the
-# decoder compiles regardless of which transport features are enabled.
-bytes = "1.7"
+# Used in the QWP egress decoder for zero-copy slicing of frame
+# payloads. Pulled in transitively via the `_egress` feature so a
+# sender-only build (`--no-default-features --features sync-sender`)
+# does not download or compile this crate.
+bytes = { version = "1.7", optional = true }
 aws-lc-rs = { version = "1.13", optional = true }
 ring = { version = "0.17.14", optional = true }
 rustls-pki-types = "1.12.0"
@@ -140,7 +141,7 @@ live-server-tests = ["sync-reader-ws", "compression-zstd", "sync-sender-http"]
 _sender-tcp = []
 _sender-http = []
 _sync-sender = []
-_egress = []
+_egress = ["dep:bytes"]
 
 ## Enable all cross-compatible features.
 ## The `aws-lc-crypto` and `ring-crypto` features are mutually exclusive,
