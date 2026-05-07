@@ -1591,16 +1591,12 @@ inline cursor reader::execute(::questdb::ingress::utf8_view sql)
 inline cursor query::execute()
 {
     ensure_impl();
-    auto* h = _impl;
     auto cb = std::move(_callback); // transfer to cursor (or drop on error)
     ::line_reader_error* c_err = nullptr;
-    auto* c = ::line_reader_query_execute(h, &c_err);
-    // The C call consumes `h` regardless of outcome; clear `_impl` only
-    // after the call returns so an exception unwinding from `from_c`
-    // would still leave a defined state, and a future C-side change that
-    // could fail before consuming the handle wouldn't leave us with a
-    // double-free.
-    _impl = nullptr;
+    // The C call consumes `_impl` regardless of outcome and sets it to
+    // NULL on return — so a subsequent `~query()` calling `_query_free`
+    // is a NULL no-op without us having to clear `_impl` explicitly here.
+    auto* c = ::line_reader_query_execute(&_impl, &c_err);
     if (!c) throw line_reader_error::from_c(c_err);
     cursor result{c};
     result._failover_callback = std::move(cb);

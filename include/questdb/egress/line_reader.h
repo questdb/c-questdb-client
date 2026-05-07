@@ -503,9 +503,9 @@ line_reader_query* line_reader_query_new(
 /**
  * Free a query without executing it. Idempotent on NULL.
  *
- * Use this only on the error path; `line_reader_query_execute` consumes
- * the query and frees the handle on success AND failure (do NOT call
- * `_query_free` after `_query_execute`).
+ * Safe to call on the error path even after `_query_execute`:
+ * `_query_execute` nulls the caller's `line_reader_query*` on
+ * consumption, so `_query_free(query)` afterwards is a NULL no-op.
  */
 LINEREADER_API
 void line_reader_query_free(line_reader_query* query);
@@ -513,14 +513,20 @@ void line_reader_query_free(line_reader_query* query);
 /**
  * Consume the query and return a streaming cursor.
  *
- * The query handle is freed by this call regardless of outcome — on
- * success ownership transfers to the returned cursor; on failure the
- * handle is freed and `*err_out` is set. Either way, do NOT pass the
- * `query` pointer to `_query_free` or any other function afterwards.
+ * `query_inout` is the address of the caller's `line_reader_query*`
+ * variable. The query is consumed regardless of outcome; on return,
+ * `*query_inout` is set to NULL so that a defensive
+ * `line_reader_query_free(*query_inout)` becomes a no-op. Passing NULL
+ * for `query_inout` itself, or for `*query_inout`, is a contract
+ * violation: the call sets `*err_out` to `INVALID_API_CALL` and returns
+ * NULL.
+ *
+ * On success, ownership transfers to the returned cursor; on failure,
+ * `*err_out` is set and NULL is returned.
  */
 LINEREADER_API
 line_reader_cursor* line_reader_query_execute(
-    line_reader_query* query,
+    line_reader_query** query_inout,
     line_reader_error** err_out);
 
 /* Bind parameters. All `line_reader_query_bind_*` functions append a bind

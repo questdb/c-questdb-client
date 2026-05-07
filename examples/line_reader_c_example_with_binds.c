@@ -30,8 +30,8 @@ int main(int argc, const char* argv[])
     line_reader_query_bind_i32(query, 7);
     line_reader_query_bind_varchar(query, QDB_UTF8_LITERAL("widgets"));
 
-    cursor = line_reader_query_execute(query, &err);
-    query = NULL; /* execute consumed and freed the query handle */
+    cursor = line_reader_query_execute(&query, &err);
+    /* `query` is now NULL — `_query_execute` consumed it. */
     if (!cursor)
         goto on_error;
 

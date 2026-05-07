@@ -25,8 +25,8 @@ int main(int argc, const char* argv[])
     query = line_reader_query_new(reader, sql, &err);
     if (!query)
         goto on_error;
-    cursor = line_reader_query_execute(query, &err);
-    query = NULL; /* consumed by execute, regardless of outcome */
+    cursor = line_reader_query_execute(&query, &err);
+    /* `query` is now NULL — `_query_execute` consumed it. */
     if (!cursor)
         goto on_error;
 
