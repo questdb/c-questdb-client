@@ -798,9 +798,15 @@ bool line_reader_cursor_column_kind(
 
 /**
  * Borrowed UTF-8 column name for the column at `col_idx` in the current
- * batch's schema. The string is NOT null-terminated; use `*out_len`. The
- * pointer is valid for the cursor's lifetime (schemas referenced by
- * `RESULT_BATCH` frames are pinned in the per-connection registry).
+ * batch's schema. The string is NOT null-terminated; use `*out_len`.
+ *
+ * The pointer is borrowed from the currently-loaded batch and is invalidated
+ * by any subsequent call to `line_reader_cursor_next_batch`,
+ * `line_reader_cursor_cancel`, or `line_reader_cursor_free` on this cursor.
+ * Mid-query failover (transparently triggered by `line_reader_cursor_next_batch`)
+ * also invalidates the pointer, because the per-connection schema registry
+ * is replaced with the reconnected endpoint's. Re-derive the pointer from
+ * `line_reader_cursor_column_name` on every batch — do not cache it.
  *
  * @param[in] cursor Cursor with a loaded batch.
  * @param[in] col_idx Column index in `[0, column_count)`.

@@ -1032,7 +1032,12 @@ public:
 
     /**
      * Borrowed UTF-8 column name for `col_idx` in the current batch's
-     * schema. Valid for the cursor's lifetime.
+     * schema.
+     *
+     * The returned `string_view` is invalidated by `next_batch()`,
+     * `cancel()`, cursor destruction, and mid-query failover (which can
+     * be triggered transparently by `next_batch()`). Do not cache it
+     * across batches — re-derive on every batch.
      *
      * @throws line_reader_error if no batch is loaded or `col_idx` is out
      *         of range.
