@@ -37,7 +37,7 @@ use rand::RngCore;
 
 use crate::error;
 use crate::ingress::SyncProtocolHandler;
-use crate::ingress::buffer::QwpBuffer;
+use crate::ingress::buffer::QwpWsColumnarBuffer;
 use crate::ingress::conf::{QwpWsConfig, SfDurability};
 use crate::ingress::tls::{TlsSettings, configure_tls};
 
@@ -2110,19 +2110,21 @@ fn connect_blocking_transport_with_retry(
 /// the frame is locally accepted. A sender-owned runner advances WebSocket I/O.
 pub(crate) fn flush_qwp_ws(
     state: &mut SyncQwpWsHandlerState,
-    buffer: &QwpBuffer,
+    buffer: &QwpWsColumnarBuffer,
+    max_buf_size: usize,
 ) -> crate::Result<Option<u64>> {
-    let payload = state.encoder.encode(buffer)?;
+    let payload = state.encoder.encode_with_max_size(buffer, max_buf_size)?;
     state.runner.publish_replay_payload(payload).map(Some)
 }
 
 pub(crate) fn flush_qwp_ws_manual(
     state: &mut ManualQwpWsHandlerState,
-    buffer: &QwpBuffer,
+    buffer: &QwpWsColumnarBuffer,
+    max_buf_size: usize,
 ) -> crate::Result<Option<u64>> {
     let receipt = state
         .publisher
-        .submit_qwp_with_append_deadline(buffer, state.append_deadline)
+        .submit_qwp_with_append_deadline(buffer, state.append_deadline, max_buf_size)
         .map_err(|err| match err {
             QwpWsPublicationError::Encode(err) => err,
             QwpWsPublicationError::Driver(err) => driver_error_to_error(&state.publisher, err),

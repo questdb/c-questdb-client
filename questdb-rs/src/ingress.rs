@@ -30,7 +30,9 @@ use crate::error::{self, Result, fmt};
 use crate::ingress::conf::ConfigSetting;
 use core::time::Duration;
 use std::collections::HashMap;
-use std::fmt::{Debug, Display, Formatter, Write};
+#[cfg(feature = "_sync-sender")]
+use std::fmt::Write;
+use std::fmt::{Debug, Display, Formatter};
 
 use std::ops::Deref;
 use std::path::PathBuf;
@@ -1473,6 +1475,7 @@ impl SenderBuilder {
     ///
     /// For ILP this applies to the exact pending byte length.
     /// For QWP/UDP this applies to the buffer size hint exposed by [`Buffer::len`].
+    /// For QWP/WebSocket this applies to the encoded replay message size.
     pub fn max_buf_size(mut self, value: usize) -> Result<Self> {
         let min = 1024;
         if value < min {

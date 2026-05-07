@@ -45,7 +45,7 @@ pub(crate) use self::qwp::QwpSendScratch;
 #[cfg(all(test, feature = "_sender-qwp-ws"))]
 pub(crate) use self::qwp::SchemaRegistry;
 #[cfg(feature = "_sender-qwp-ws")]
-pub(crate) use self::qwp::{QwpWsEncodeScratch, SymbolGlobalDict};
+pub(crate) use self::qwp::{QwpWsColumnarBuffer, QwpWsEncodeScratch, SymbolGlobalDict};
 
 static NEXT_BOOKMARK_ORIGIN: AtomicU64 = AtomicU64::new(1);
 
@@ -183,6 +183,9 @@ enum BufferInner {
 
     #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
     Qwp(Box<QwpBuffer>),
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    QwpWs(Box<QwpWsColumnarBuffer>),
 }
 
 /// A reusable row buffer.
@@ -223,11 +226,20 @@ impl Buffer {
         }
     }
 
+    #[cfg(feature = "_sender-qwp-ws")]
+    pub(crate) fn qwp_ws_with_max_name_len(max_name_len: usize) -> Self {
+        Self {
+            inner: BufferInner::QwpWs(Box::new(QwpWsColumnarBuffer::new(max_name_len))),
+        }
+    }
+
     pub(crate) fn as_ilp(&self) -> Option<&IlpBuffer> {
         match &self.inner {
             BufferInner::Ilp(inner) => Some(inner),
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(_) => None,
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(_) => None,
         }
     }
 
@@ -236,6 +248,18 @@ impl Buffer {
         match &self.inner {
             BufferInner::Ilp(_) => None,
             BufferInner::Qwp(inner) => Some(inner.as_ref()),
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(_) => None,
+        }
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    pub(crate) fn as_qwp_ws(&self) -> Option<&QwpWsColumnarBuffer> {
+        match &self.inner {
+            BufferInner::Ilp(_) => None,
+            #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
+            BufferInner::Qwp(_) => None,
+            BufferInner::QwpWs(inner) => Some(inner.as_ref()),
         }
     }
 
@@ -250,6 +274,8 @@ impl Buffer {
             BufferInner::Ilp(inner) => inner.protocol_version(),
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(_) => ProtocolVersion::V1,
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(_) => ProtocolVersion::V1,
         }
     }
 
@@ -265,18 +291,24 @@ impl Buffer {
             BufferInner::Ilp(inner) => inner.reserve(additional),
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => inner.reserve(additional),
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => inner.reserve(additional),
         }
     }
 
     /// Returns the current buffered size.
     ///
     /// For ILP buffers this is the exact serialized byte count. For QWP/UDP
-    /// buffers this is the size hint used for flush planning.
+    /// buffers this is the size hint used for flush planning. For QWP/WebSocket
+    /// buffers this is only a local size hint; the sender enforces
+    /// `max_buf_size` against the encoded replay message.
     pub fn len(&self) -> usize {
         match &self.inner {
             BufferInner::Ilp(inner) => inner.len(),
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => inner.len(),
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => inner.len(),
         }
     }
 
@@ -289,6 +321,8 @@ impl Buffer {
             BufferInner::Ilp(inner) => inner.row_count(),
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => inner.row_count(),
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => inner.row_count(),
         }
     }
 
@@ -302,6 +336,8 @@ impl Buffer {
             BufferInner::Ilp(inner) => inner.transactional(),
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(_) => false,
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(_) => false,
         }
     }
 
@@ -311,6 +347,8 @@ impl Buffer {
             BufferInner::Ilp(inner) => inner.is_empty(),
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => inner.is_empty(),
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => inner.is_empty(),
         }
     }
 
@@ -324,6 +362,8 @@ impl Buffer {
             BufferInner::Ilp(inner) => inner.capacity(),
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => inner.capacity(),
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => inner.capacity(),
         }
     }
 
@@ -336,6 +376,8 @@ impl Buffer {
             BufferInner::Ilp(inner) => inner.as_bytes(),
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => inner.as_bytes(),
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => inner.as_bytes(),
         }
     }
 
@@ -349,6 +391,8 @@ impl Buffer {
             BufferInner::Ilp(inner) => inner.set_marker(),
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => inner.set_marker(),
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => inner.set_marker(),
         }
     }
 
@@ -361,6 +405,8 @@ impl Buffer {
             BufferInner::Ilp(inner) => inner.bookmark(),
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => inner.bookmark(),
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => inner.bookmark(),
         }
     }
 
@@ -371,6 +417,8 @@ impl Buffer {
             BufferInner::Ilp(inner) => inner.rewind_to_bookmark(bookmark),
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => inner.rewind_to_bookmark(bookmark),
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => inner.rewind_to_bookmark(bookmark),
         }
     }
 
@@ -380,6 +428,8 @@ impl Buffer {
             BufferInner::Ilp(inner) => inner.clear_bookmark(bookmark),
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => inner.clear_bookmark(bookmark),
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => inner.clear_bookmark(bookmark),
         }
     }
 
@@ -395,6 +445,8 @@ impl Buffer {
             BufferInner::Ilp(inner) => inner.rewind_to_marker(),
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => inner.rewind_to_marker(),
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => inner.rewind_to_marker(),
         }
     }
 
@@ -405,6 +457,8 @@ impl Buffer {
             BufferInner::Ilp(inner) => inner.clear_marker(),
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => inner.clear_marker(),
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => inner.clear_marker(),
         }
     }
 
@@ -414,6 +468,8 @@ impl Buffer {
             BufferInner::Ilp(inner) => inner.clear(),
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => inner.clear(),
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => inner.clear(),
         }
     }
 
@@ -427,6 +483,8 @@ impl Buffer {
             BufferInner::Ilp(inner) => inner.check_can_flush(),
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => inner.check_can_flush(),
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => inner.check_can_flush(),
         }
     }
 
@@ -445,6 +503,10 @@ impl Buffer {
             }
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => {
+                inner.table(name)?;
+            }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
                 inner.table(name)?;
             }
         }
@@ -466,6 +528,10 @@ impl Buffer {
             }
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => {
+                inner.symbol(name, value)?;
+            }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
                 inner.symbol(name, value)?;
             }
         }
@@ -498,6 +564,10 @@ impl Buffer {
             }
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => {
+                inner.column_bool(name, value)?;
+            }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
                 inner.column_bool(name, value)?;
             }
         }
@@ -535,6 +605,10 @@ impl Buffer {
             BufferInner::Qwp(inner) => {
                 inner.column_i64(name, value)?;
             }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
+                inner.column_i64(name, value)?;
+            }
         }
         Ok(self)
     }
@@ -564,6 +638,10 @@ impl Buffer {
             }
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => {
+                inner.column_f64(name, value)?;
+            }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
                 inner.column_f64(name, value)?;
             }
         }
@@ -596,6 +674,10 @@ impl Buffer {
             }
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => {
+                inner.column_str(name, value)?;
+            }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
                 inner.column_str(name, value)?;
             }
         }
@@ -638,6 +720,10 @@ impl Buffer {
             }
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => {
+                inner.column_dec(name, value)?;
+            }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
                 inner.column_dec(name, value)?;
             }
         }
@@ -683,6 +769,10 @@ impl Buffer {
             BufferInner::Qwp(inner) => {
                 inner.column_arr(name, view)?;
             }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
+                inner.column_arr(name, view)?;
+            }
         }
         Ok(self)
     }
@@ -725,6 +815,10 @@ impl Buffer {
             BufferInner::Qwp(inner) => {
                 inner.column_ts(name, value)?;
             }
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => {
+                inner.column_ts(name, value)?;
+            }
         }
         Ok(self)
     }
@@ -757,6 +851,8 @@ impl Buffer {
             BufferInner::Ilp(inner) => inner.at(timestamp),
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => inner.at(timestamp),
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => inner.at(timestamp),
         }
     }
 
@@ -770,6 +866,8 @@ impl Buffer {
             BufferInner::Ilp(inner) => inner.at_now(),
             #[cfg(any(feature = "_sender-qwp-udp", feature = "_sender-qwp-ws"))]
             BufferInner::Qwp(inner) => inner.at_now(),
+            #[cfg(feature = "_sender-qwp-ws")]
+            BufferInner::QwpWs(inner) => inner.at_now(),
         }
     }
 }

@@ -62,7 +62,7 @@ fn rust_replay_payloads() -> (Vec<u8>, Vec<u8>) {
     let mut scratch = QwpWsEncodeScratch::new();
     let mut global_dict = SymbolGlobalDict::new();
 
-    let mut first = Buffer::new_qwp();
+    let mut first = Buffer::qwp_ws_with_max_name_len(127);
     for idx in 0..SYMBOL_COUNT {
         let sym = format!("SYM_{idx:03}");
         first
@@ -78,13 +78,13 @@ fn rust_replay_payloads() -> (Vec<u8>, Vec<u8>) {
             .unwrap();
     }
     first
-        .as_qwp()
+        .as_qwp_ws()
         .unwrap()
         .encode_ws_replay_message(&mut scratch, &mut global_dict, 1)
         .unwrap();
     let first_payload = scratch.message.clone();
 
-    let mut second = Buffer::new_qwp();
+    let mut second = Buffer::qwp_ws_with_max_name_len(127);
     second
         .table("trades")
         .unwrap()
@@ -97,7 +97,7 @@ fn rust_replay_payloads() -> (Vec<u8>, Vec<u8>) {
         .at(TimestampNanos::new(BASE_TS_NANOS + 1_000))
         .unwrap();
     second
-        .as_qwp()
+        .as_qwp_ws()
         .unwrap()
         .encode_ws_replay_message(&mut scratch, &mut global_dict, 1)
         .unwrap();

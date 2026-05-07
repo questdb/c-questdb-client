@@ -37,7 +37,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
-#[cfg(feature = "sync-sender-qwp-ws")]
 use crate::error;
 #[cfg(feature = "sync-sender-qwp-ws")]
 use crate::ingress::conf::QwpWsConfig;
@@ -2863,8 +2862,43 @@ mod tests {
         )
     }
 
+    const QWP_WS_COLUMNAR_BENCH_BATCH_SIZE: usize = 1000;
+
+    fn qwp_ws_columnar_bench_rows() -> usize {
+        std::env::var("QWP_WS_COLUMNAR_BENCH_ROWS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|rows| *rows > 0)
+            .unwrap_or(20_000_000)
+    }
+
+    fn fill_qwp_ws_columnar_benchmark_batch(buffer: &mut Buffer, batch_idx: usize, rows: usize) {
+        let symbols = [
+            "SYM000", "SYM001", "SYM002", "SYM003", "SYM004", "SYM005", "SYM006", "SYM007",
+        ];
+        let venues = ["ldn", "nyc", "ams", "fra", "sin", "hkg", "tyo", "sfo"];
+        for row_idx in 0..rows {
+            let seq = (batch_idx * QWP_WS_COLUMNAR_BENCH_BATCH_SIZE + row_idx) as i64;
+            buffer
+                .table("trades")
+                .unwrap()
+                .symbol("sym", symbols[row_idx & 7])
+                .unwrap()
+                .column_i64("qty", seq)
+                .unwrap()
+                .column_f64("px", 100.0 + (seq & 1023) as f64)
+                .unwrap()
+                .column_str("venue", venues[row_idx & 7])
+                .unwrap()
+                .column_ts("event_ts", TimestampNanos::new(seq))
+                .unwrap()
+                .at(TimestampNanos::new(seq))
+                .unwrap();
+        }
+    }
+
     fn qwp_buffer(sym: &str, qty: i64, ts: i64) -> Buffer {
-        let mut buffer = Buffer::new_qwp();
+        let mut buffer = Buffer::qwp_ws_with_max_name_len(127);
         buffer
             .table("trades")
             .unwrap()
@@ -2883,7 +2917,7 @@ mod tests {
         let mut scratch = QwpWsEncodeScratch::new();
         let mut global_dict = SymbolGlobalDict::new();
         buffer
-            .as_qwp()
+            .as_qwp_ws()
             .unwrap()
             .encode_ws_replay_message(&mut scratch, &mut global_dict, 1)
             .unwrap();
@@ -3072,7 +3106,9 @@ mod tests {
         );
         let mut publisher = QwpWsPublicationDriver::new(driver, 1);
 
-        let receipt = publisher.try_submit_qwp(buffer.as_qwp().unwrap()).unwrap();
+        let receipt = publisher
+            .try_submit_qwp(buffer.as_qwp_ws().unwrap())
+            .unwrap();
         let outcome = publisher.drive_once().unwrap();
 
         assert_eq!(receipt, QwpReceipt { fsn: 0 });
@@ -3090,7 +3126,7 @@ mod tests {
 
     #[test]
     fn publisher_rejects_empty_buffer_without_publication() {
-        let buffer = Buffer::new_qwp();
+        let buffer = Buffer::qwp_ws_with_max_name_len(127);
         let driver = ManualDriverPrototype::from_queue(
             VolatileFrameQueue::new(options(8, 4096, 4)).unwrap(),
             TestTransport::scripted([]),
@@ -3098,7 +3134,7 @@ mod tests {
         let mut publisher = QwpWsPublicationDriver::new(driver, 1);
 
         let err = publisher
-            .try_submit_qwp(buffer.as_qwp().unwrap())
+            .try_submit_qwp(buffer.as_qwp_ws().unwrap())
             .unwrap_err();
 
         match err {
@@ -3126,9 +3162,11 @@ mod tests {
         );
         let mut publisher = QwpWsPublicationDriver::new(driver, 1);
 
-        let first_receipt = publisher.try_submit_qwp(first.as_qwp().unwrap()).unwrap();
+        let first_receipt = publisher
+            .try_submit_qwp(first.as_qwp_ws().unwrap())
+            .unwrap();
         let err = publisher
-            .try_submit_qwp(second.as_qwp().unwrap())
+            .try_submit_qwp(second.as_qwp_ws().unwrap())
             .unwrap_err();
         assert!(matches!(
             err,
@@ -3141,7 +3179,9 @@ mod tests {
             DeliveryOutcome::Acked
         );
 
-        let third_receipt = publisher.try_submit_qwp(third.as_qwp().unwrap()).unwrap();
+        let third_receipt = publisher
+            .try_submit_qwp(third.as_qwp_ws().unwrap())
+            .unwrap();
         assert_eq!(third_receipt, QwpReceipt { fsn: 1 });
     }
 
@@ -3158,7 +3198,9 @@ mod tests {
         let mut publisher = QwpWsPublicationDriver::new(driver, 1);
 
         for _ in 0..4 {
-            let receipt = publisher.try_submit_qwp(buffer.as_qwp().unwrap()).unwrap();
+            let receipt = publisher
+                .try_submit_qwp(buffer.as_qwp_ws().unwrap())
+                .unwrap();
             assert_eq!(
                 publisher.wait_steps(receipt, 4).unwrap(),
                 DeliveryOutcome::Acked
@@ -3166,13 +3208,62 @@ mod tests {
         }
 
         alloc_counter::start_counting();
-        let receipt = publisher.try_submit_qwp(buffer.as_qwp().unwrap()).unwrap();
+        let receipt = publisher
+            .try_submit_qwp(buffer.as_qwp_ws().unwrap())
+            .unwrap();
         let alloc_count = alloc_counter::stop_counting();
 
         assert_eq!(receipt, QwpReceipt { fsn: 4 });
         assert_eq!(
             alloc_count, 0,
             "Expected zero allocations for warmed QWP/WebSocket memory publication, got {alloc_count}"
+        );
+    }
+
+    /// Run with:
+    /// `cargo test --release --manifest-path questdb-rs/Cargo.toml --features sync-sender-qwp-ws qwp_ws_columnar_memory_publication_benchmark --lib -- --ignored --nocapture --test-threads=1`
+    #[test]
+    #[ignore = "performance benchmark"]
+    fn qwp_ws_columnar_memory_publication_benchmark() {
+        let rows = qwp_ws_columnar_bench_rows();
+        let batches = rows.div_ceil(QWP_WS_COLUMNAR_BENCH_BATCH_SIZE);
+        let mut buffer = Buffer::qwp_ws_with_max_name_len(127);
+        let queue = LockFreeVolatilePublicationLog::new(options(8, 1 << 20, 4)).unwrap();
+        let driver = ManualDriverPrototype::from_queue(queue, FakeOrderedServer::ack_each_send());
+        let mut publisher = QwpWsPublicationDriver::new(driver, 1);
+
+        fill_qwp_ws_columnar_benchmark_batch(&mut buffer, 0, QWP_WS_COLUMNAR_BENCH_BATCH_SIZE);
+        let receipt = publisher
+            .try_submit_qwp(buffer.as_qwp_ws().unwrap())
+            .unwrap();
+        assert_eq!(
+            publisher.wait_steps(receipt, 4).unwrap(),
+            DeliveryOutcome::Acked
+        );
+        buffer.clear();
+
+        let started = std::time::Instant::now();
+        let mut published_rows = 0usize;
+        for batch_idx in 0..batches {
+            let rows_in_batch = (rows - published_rows).min(QWP_WS_COLUMNAR_BENCH_BATCH_SIZE);
+            fill_qwp_ws_columnar_benchmark_batch(&mut buffer, batch_idx, rows_in_batch);
+            let receipt = publisher
+                .try_submit_qwp(buffer.as_qwp_ws().unwrap())
+                .unwrap();
+            assert_eq!(
+                publisher.wait_steps(receipt, 4).unwrap(),
+                DeliveryOutcome::Acked
+            );
+            buffer.clear();
+            published_rows += rows_in_batch;
+        }
+        let elapsed = started.elapsed();
+        eprintln!(
+            "qwp_ws_columnar_memory_publication_benchmark rows={} batch_size={} end_to_end_ms={} rows_per_sec={:.2}",
+            rows,
+            QWP_WS_COLUMNAR_BENCH_BATCH_SIZE,
+            elapsed.as_millis(),
+            rows as f64 / elapsed.as_secs_f64()
         );
     }
 
@@ -3535,7 +3626,9 @@ mod tests {
         );
         let mut publisher = QwpWsPublicationDriver::new(driver, 1);
 
-        let receipt = publisher.try_submit_qwp(buffer.as_qwp().unwrap()).unwrap();
+        let receipt = publisher
+            .try_submit_qwp(buffer.as_qwp_ws().unwrap())
+            .unwrap();
         let outcome = publisher.wait_steps(receipt, 1024).unwrap();
 
         assert_eq!(outcome, DeliveryOutcome::Acked);

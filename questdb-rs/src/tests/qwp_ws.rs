@@ -34,7 +34,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::ingress::{
-    Protocol, QwpWsErrorCategory, QwpWsErrorPolicy, QwpWsProgress, SenderBuilder,
+    Buffer, Protocol, QwpWsEncodeScratch, QwpWsErrorCategory, QwpWsErrorPolicy, QwpWsProgress,
+    SenderBuilder, SymbolGlobalDict,
 };
 
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -408,6 +409,35 @@ fn spawn_upgrade_only_server() -> u16 {
     port
 }
 
+fn qwp_ws_replay_encoded_len(buf: &Buffer) -> usize {
+    let mut scratch = QwpWsEncodeScratch::new();
+    let mut global_dict = SymbolGlobalDict::new();
+    buf.as_qwp_ws()
+        .unwrap()
+        .encode_ws_replay_message(&mut scratch, &mut global_dict, 1)
+        .unwrap();
+    scratch.message.len()
+}
+
+fn no_symbol_frame_at_local_hint_overcount_boundary(max: usize) -> Buffer {
+    for len in 0..max {
+        let mut buf = Buffer::qwp_ws_with_max_name_len(127);
+        let note = "x".repeat(len);
+        buf.table("trades")
+            .unwrap()
+            .column_str("note", note.as_str())
+            .unwrap()
+            .at_now()
+            .unwrap();
+
+        let encoded_len = qwp_ws_replay_encoded_len(&buf);
+        if buf.len() > max && encoded_len <= max {
+            return buf;
+        }
+    }
+    panic!("no QWP/WS size-boundary frame found for max={max}");
+}
+
 fn spawn_manual_orphan_drain_server() -> (u16, mpsc::Receiver<Vec<u8>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -524,6 +554,66 @@ fn qwp_ws_round_trip_minimal_message() {
     // followed by varint(7) "ETH-USD"
     assert_eq!(payload[2], 0x07);
     assert_eq!(&payload[3..10], b"ETH-USD");
+}
+
+#[test]
+fn qwp_ws_max_buf_size_allows_frame_when_encoded_replay_len_fits() {
+    let max = 1024;
+    let (port, rx) = spawn_mock_server();
+    let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+        .max_buf_size(max)
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut buf = no_symbol_frame_at_local_hint_overcount_boundary(max);
+    let local_hint = buf.len();
+    let encoded_len = qwp_ws_replay_encoded_len(&buf);
+    assert!(local_hint > max, "local_hint={local_hint}, max={max}");
+    assert!(encoded_len <= max, "encoded_len={encoded_len}, max={max}");
+
+    sender.flush(&mut buf).unwrap();
+
+    let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let frame = result.received_frames.first().expect("frame received");
+    assert_eq!(frame.len(), encoded_len);
+    assert!(frame.len() <= max);
+}
+
+#[test]
+fn qwp_ws_max_buf_size_rejects_frame_when_replay_schema_ids_make_encoded_len_exceed_limit() {
+    let mut buf = Buffer::qwp_ws_with_max_name_len(127);
+    for idx in 0..131 {
+        buf.table(format!("t{idx}").as_str())
+            .unwrap()
+            .column_i64(format!("c{idx}").as_str(), idx)
+            .unwrap()
+            .at_now()
+            .unwrap();
+    }
+    let local_hint = buf.len();
+    let encoded_len = qwp_ws_replay_encoded_len(&buf);
+    assert!(local_hint >= 1024, "local_hint={local_hint}");
+    assert!(
+        encoded_len > local_hint,
+        "encoded_len={encoded_len}, local_hint={local_hint}"
+    );
+
+    let port = spawn_upgrade_only_server();
+    let err = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+        .max_buf_size(local_hint)
+        .unwrap()
+        .build()
+        .unwrap()
+        .flush(&mut buf)
+        .unwrap_err();
+    assert_eq!(err.code(), crate::ErrorCode::InvalidApiCall);
+    assert_eq!(
+        err.msg(),
+        format!(
+            "Could not flush buffer: QWP/WebSocket encoded message size of {encoded_len} exceeds maximum configured allowed size of {local_hint} bytes."
+        )
+    );
+    assert!(!buf.is_empty());
 }
 
 #[test]

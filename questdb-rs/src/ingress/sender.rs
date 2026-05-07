@@ -228,7 +228,7 @@ impl Sender {
             &self.handler,
             SyncProtocolHandler::SyncQwpWs(_) | SyncProtocolHandler::ManualQwpWs(_)
         ) {
-            return Buffer::qwp_with_max_name_len(self.max_name_len);
+            return Buffer::qwp_ws_with_max_name_len(self.max_name_len);
         }
 
         Buffer::with_max_name_len(self.protocol_version, self.max_name_len)
@@ -251,23 +251,15 @@ impl Sender {
             _ => unreachable!("QWP/WebSocket handler was checked above"),
         }
 
-        let qwp = buf.as_qwp().ok_or_else(|| {
+        let qwp = buf.as_qwp_ws().ok_or_else(|| {
             error::fmt!(
                 InvalidApiCall,
-                "QWP/WebSocket sender requires a QWP buffer created by `Sender::new_buffer()`."
+                "QWP/WebSocket sender requires a QWP/WebSocket buffer created by `Sender::new_buffer()`."
             )
         })?;
         qwp.check_can_flush()?;
         if qwp.is_empty() {
             return Ok(None);
-        }
-        if qwp.len() > self.max_buf_size {
-            return Err(error::fmt!(
-                InvalidApiCall,
-                "Could not flush buffer: QWP buffer size hint of {} exceeds maximum configured allowed size of {} bytes.",
-                qwp.len(),
-                self.max_buf_size
-            ));
         }
         if transactional {
             return Err(error::fmt!(
@@ -277,8 +269,10 @@ impl Sender {
         }
 
         let result = match &mut self.handler {
-            SyncProtocolHandler::SyncQwpWs(state) => flush_qwp_ws(state, qwp),
-            SyncProtocolHandler::ManualQwpWs(state) => flush_qwp_ws_manual(state, qwp),
+            SyncProtocolHandler::SyncQwpWs(state) => flush_qwp_ws(state, qwp, self.max_buf_size),
+            SyncProtocolHandler::ManualQwpWs(state) => {
+                flush_qwp_ws_manual(state, qwp, self.max_buf_size)
+            }
             _ => unreachable!("QWP/WebSocket handler was checked above"),
         };
         if result

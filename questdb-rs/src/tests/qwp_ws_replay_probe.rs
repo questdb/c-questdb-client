@@ -171,7 +171,7 @@ fn build_replay_payloads(
     let mut scratch = QwpWsEncodeScratch::new();
     let mut global_dict = SymbolGlobalDict::new();
 
-    let mut first = Buffer::new_qwp();
+    let mut first = Buffer::qwp_ws_with_max_name_len(127);
     for idx in 0..SYMBOL_COUNT {
         let sym = format!("SYM_{idx:03}");
         first
@@ -182,14 +182,14 @@ fn build_replay_payloads(
             .at(TimestampNanos::new(BASE_TS_NANOS + idx as i64))?;
     }
     first
-        .as_qwp()
+        .as_qwp_ws()
         .unwrap()
         .encode_ws_replay_message(&mut scratch, &mut global_dict, 1)?;
     let first_payload = scratch.message.clone();
     let first_metrics = payload_metrics(&first_payload)?;
     assert_replay_metrics("first payload", &first_metrics, SYMBOL_COUNT as u64);
 
-    let mut second = Buffer::new_qwp();
+    let mut second = Buffer::qwp_ws_with_max_name_len(127);
     second
         .table(table)?
         .symbol("sym", "SYM_009")?
@@ -197,7 +197,7 @@ fn build_replay_payloads(
         .column_f64("px", 999.5)?
         .at(TimestampNanos::new(BASE_TS_NANOS + 1_000))?;
     second
-        .as_qwp()
+        .as_qwp_ws()
         .unwrap()
         .encode_ws_replay_message(&mut scratch, &mut global_dict, 1)?;
     let second_payload = scratch.message.clone();

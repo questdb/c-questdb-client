@@ -86,7 +86,7 @@ fn qwp_ws_publication_driver_submit_waits_and_row_is_queryable() -> TestResult {
     let driver = ManualDriverPrototype::from_queue(queue, transport);
     let mut publisher = QwpWsPublicationDriver::new(driver, 1);
 
-    let mut buffer = Buffer::new_qwp();
+    let mut buffer = Buffer::qwp_ws_with_max_name_len(127);
     buffer
         .table(table.as_str())?
         .symbol("sym", "SYM_PUBLICATION")?
@@ -95,9 +95,11 @@ fn qwp_ws_publication_driver_submit_waits_and_row_is_queryable() -> TestResult {
         .at(TimestampNanos::new(1_700_000_000_000_000_042))?;
 
     let receipt = publisher
-        .try_submit_qwp(buffer.as_qwp().unwrap())
+        .try_submit_qwp(buffer.as_qwp_ws().unwrap())
         .map_err(proto_err)?;
-    let outcome = publisher.wait_steps(receipt, 8).map_err(proto_err)?;
+    let outcome = publisher
+        .wait_for(receipt, Duration::from_secs(10))
+        .map_err(proto_err)?;
 
     assert_eq!(outcome, DeliveryOutcome::Acked);
     let count = wait_for_count(&config, &table, 1, Duration::from_secs(10))?;
@@ -184,13 +186,15 @@ fn qwp_ws_publication_driver_reconnect_replays_only_unacked_rows() -> TestResult
     let first = build_row(&table, "SYM_RECONNECT_ACKED", 10, 100.5, 10)?;
     let second = build_row(&table, "SYM_RECONNECT_REPLAYED", 20, 200.5, 20)?;
     let first_receipt = publisher
-        .try_submit_qwp(first.as_qwp().unwrap())
+        .try_submit_qwp(first.as_qwp_ws().unwrap())
         .map_err(proto_err)?;
     let second_receipt = publisher
-        .try_submit_qwp(second.as_qwp().unwrap())
+        .try_submit_qwp(second.as_qwp_ws().unwrap())
         .map_err(proto_err)?;
 
-    let second_outcome = publisher.wait_steps(second_receipt, 16).map_err(proto_err);
+    let second_outcome = publisher
+        .wait_for(second_receipt, Duration::from_secs(10))
+        .map_err(proto_err);
     let proxy_result = proxy.join();
     assert_eq!(second_outcome?, DeliveryOutcome::Acked);
     assert_eq!(
@@ -243,7 +247,7 @@ fn qwp_ws_sfa_recovered_frame_is_delivered_and_cleaned_up() -> TestResult {
         let row = build_row(&table, "SYM_SFA_REPLAYED", 77, 777.5, 77)?;
 
         publisher
-            .try_submit_qwp(row.as_qwp().unwrap())
+            .try_submit_qwp(row.as_qwp_ws().unwrap())
             .map_err(proto_err)?
     };
     assert_eq!(
@@ -262,7 +266,9 @@ fn qwp_ws_sfa_recovered_frame_is_delivered_and_cleaned_up() -> TestResult {
     let mut publisher = QwpWsPublicationDriver::new(driver, 1);
 
     assert_eq!(
-        publisher.wait_steps(receipt, 8).map_err(proto_err)?,
+        publisher
+            .wait_for(receipt, Duration::from_secs(10))
+            .map_err(proto_err)?,
         DeliveryOutcome::Acked
     );
     assert_eq!(
@@ -377,7 +383,7 @@ fn qwp_ws_public_sender_sfa_recovers_after_unacked_disconnect() -> TestResult {
 }
 
 fn build_row(table: &str, sym: &str, qty: i64, px: f64, ts_offset: i64) -> ProbeResult<Buffer> {
-    let mut buffer = Buffer::new_qwp();
+    let mut buffer = Buffer::qwp_ws_with_max_name_len(127);
     write_row(&mut buffer, table, sym, qty, px, ts_offset)?;
     Ok(buffer)
 }
