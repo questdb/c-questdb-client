@@ -46,6 +46,9 @@ mod qwp_ws_driver;
 mod qwp_ws_ownership;
 
 #[cfg(feature = "_sender-qwp-ws")]
+mod qwp_ws_orphan;
+
+#[cfg(feature = "_sender-qwp-ws")]
 mod qwp_ws_publisher;
 
 #[cfg(feature = "_sender-qwp-ws")]

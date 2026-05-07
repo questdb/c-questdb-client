@@ -99,8 +99,10 @@ Remaining gaps tracked by this document:
 
 - Close-drain parity with Java's default `close_flush_timeout_millis` is still
   out of scope for this slice.
-- Orphan draining (`drain_orphans=on`) and `sf_durability=flush`/`append` stay
-  rejected; see `doc/QWP_WEBSOCKET_ORPHAN_DRAINING_TODO.md` and Slice 9.
+- Orphan draining has a first runtime slice; remaining diagnostics, integration
+  tests, shutdown semantics, and Windows support are tracked in
+  `doc/QWP_WEBSOCKET_ORPHAN_DRAINING_TODO.md`.
+- `sf_durability=flush`/`append` stay rejected; see Slice 9.
 - Windows slot locking is still unsupported; the queue/driver APIs avoid Unix
   assumptions so it can be added without a redesign.
 - Trim and close cleanup diagnostics (Slice 7) should be re-audited end to end
@@ -678,14 +680,12 @@ Close:
 - Cleanup unlink failures after successful close/unmap are diagnostics, not
   delivery failures.
 
-### Slice 8: Add orphan lifecycle later
+### Slice 8: Orphan lifecycle follow-up
 
-Do not enable `drain_orphans=on` as part of the primary storage slice.
-
-Track the follow-up in `doc/QWP_WEBSOCKET_ORPHAN_DRAINING_TODO.md`. That work
-needs separate lifecycle design for `.failed` sentinels, sibling slot scans,
-drainer lock acquisition, drainer reconnect policy, failure reporting, and
-shutdown behavior for active drainers.
+The first runtime slice for `drain_orphans=on` exists now. Remaining follow-up
+work lives in `doc/QWP_WEBSOCKET_ORPHAN_DRAINING_TODO.md`: Java-style
+diagnostics, real replay integration tests, background pool close behavior, and
+Windows slot locking.
 
 ### Slice 9: Consider fsync modes last
 
@@ -926,7 +926,6 @@ Done when:
 
 Deferred after these milestones:
 
-- orphan draining;
 - `sf_durability=flush/append`;
 - Windows slot locking;
 - Java close-timeout public behavior;
@@ -949,7 +948,7 @@ Deferred after these milestones:
 10. Align trim cleanup behavior with Java logging/diagnostics.
 11. Update `doc/QWP_WEBSOCKET_SPEC_COMPLIANCE_GAPS.md` by removing the completed
    storage-capacity item and narrowing any remaining close/orphan/fsync items.
-12. Only later implement orphan drainers and fsync durability modes.
+12. Only later implement fsync durability modes.
 
 ## Later Performance Work
 
@@ -977,7 +976,6 @@ server ACK timing.
 - Do not hide progress pumping inside the primitive append path.
 - Do not add a durable SFA file-backed scratch/replay path.
 - Do not enable `sf_durability=flush` or `append`.
-- Do not enable `drain_orphans=on`.
 - Do not solve Windows slot locking.
 - Do not make Java close timeout parity part of the storage-accounting patch.
 - Do not change WebSocket wire response parsing.

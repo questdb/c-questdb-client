@@ -310,14 +310,15 @@ fn qwpws_store_and_forward_config_rejects_invalid_java_keys() {
         SenderBuilder::from_conf("qwpws::addr=localhost:9000;max_background_drainers=-1;"),
         "max_background_drainers must be >= 0: -1",
     );
+    SenderBuilder::from_conf("qwpws::addr=localhost:9000;drain_orphans=on;").unwrap();
+    SenderBuilder::from_conf(
+        "qwpws::addr=localhost:9000;drain_orphans=true;max_background_drainers=0;",
+    )
+    .unwrap();
     for (conf, expected) in [
         (
             "qwpws::addr=localhost:9000;max_schemas_per_connection=1024;",
             "\"max_schemas_per_connection\" is not supported by the Rust QWP/WebSocket sync sender yet; configurable schema limits are not implemented.",
-        ),
-        (
-            "qwpws::addr=localhost:9000;drain_orphans=on;",
-            "\"drain_orphans\" is not supported by the Rust QWP/WebSocket sync sender yet; orphan slot draining is not implemented.",
         ),
         (
             "qwpws::addr=localhost:9000;error_inbox_capacity=64;",

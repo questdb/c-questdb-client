@@ -90,6 +90,17 @@ impl SfaSlotQueue {
         })
     }
 
+    pub(crate) fn open_replay_only_existing(
+        options: SfaQueueOptions,
+    ) -> Result<Self, SfaQueueError> {
+        let lock = SlotLock::acquire_existing(options.slot_dir.clone())?;
+        let queue = SfaFrameQueue::open_replay_only(options)?;
+        Ok(Self {
+            queue,
+            lock: Some(lock),
+        })
+    }
+
     pub(crate) fn close(&mut self) -> Result<(), SfaQueueError> {
         let result = self.queue.close();
         self.lock.take();
@@ -203,6 +214,18 @@ impl SlotLock {
         Self::lock_file(slot_dir)
     }
 
+    fn acquire_existing(slot_dir: PathBuf) -> Result<Self, SfaQueueError> {
+        validate_slot_dir(&slot_dir)?;
+        if !slot_dir.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("SFA slot directory does not exist: {}", slot_dir.display()),
+            )
+            .into());
+        }
+        Self::lock_file(slot_dir)
+    }
+
     fn slot_dir(&self) -> &Path {
         &self.slot_dir
     }
@@ -302,6 +325,15 @@ mod tests {
         }
     }
 
+    fn queue_options(slot_dir: PathBuf) -> SfaQueueOptions {
+        SfaQueueOptions {
+            slot_dir,
+            segment_size_bytes: 256,
+            max_bytes: 1024,
+            max_in_flight: 4,
+        }
+    }
+
     #[test]
     fn sender_id_validation_matches_java_slot_name_rules() {
         for valid in ["default", "primary", "A_z-09"] {
@@ -328,6 +360,19 @@ mod tests {
         assert!(slot_dir.join(LOCK_FILE_NAME).exists());
         assert!(slot_dir.join(LOCK_PID_FILE_NAME).exists());
         assert!(initial_segment_path(&slot_dir).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replay_only_existing_open_does_not_create_missing_slot() {
+        let temp = TempDir::new().unwrap();
+        let slot_dir = temp.path().join("sf-root").join("orphan");
+
+        let err =
+            SfaSlotQueue::open_replay_only_existing(queue_options(slot_dir.clone())).unwrap_err();
+
+        assert!(matches!(err, SfaQueueError::Io(_)));
+        assert!(!slot_dir.exists());
     }
 
     #[cfg(unix)]

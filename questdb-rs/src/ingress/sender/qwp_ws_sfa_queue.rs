@@ -238,6 +238,7 @@ struct SfaEngine {
     max_bytes: usize,
     segment_size_bytes: u64,
     max_in_flight: usize,
+    allow_segment_creation: bool,
     state: Mutex<SfaEngineState>,
     published_upper: AtomicU64,
     completed_upper: AtomicU64,
@@ -324,6 +325,7 @@ impl SfaFrameQueue {
             max_bytes: options.max_bytes,
             segment_size_bytes: options.segment_size_bytes,
             max_in_flight: options.max_in_flight,
+            allow_segment_creation: true,
             state: Mutex::new(SfaEngineState {
                 active: Some(Arc::clone(&active)),
                 sealed_segments,
@@ -348,6 +350,60 @@ impl SfaFrameQueue {
         Ok(Self {
             engine,
             producer,
+            send_cursor: None,
+        })
+    }
+
+    pub(crate) fn open_replay_only(options: SfaQueueOptions) -> Result<Self, SfaQueueError> {
+        validate_options(&options)?;
+        let recovered = recover_segments(&options)?;
+        if recovered.segments.is_none() && recovered.has_skipped_segments() {
+            return Err(SfaQueueError::CorruptSegments {
+                reason: "replay-only recovery found only skipped SFA segments",
+            });
+        }
+        let recovery_diagnostics = recovered.diagnostics;
+        let (active, sealed_segments, next_fsn, allocated_segment_bytes) = match recovered.segments
+        {
+            Some(segments) => (
+                Some(Arc::new(SfaSharedSegment::new(segments.active))),
+                segments
+                    .sealed_segments
+                    .into_iter()
+                    .map(SfaSharedSegment::new)
+                    .map(Arc::new)
+                    .collect(),
+                segments.next_fsn,
+                segments.allocated_segment_bytes,
+            ),
+            None => (None, VecDeque::new(), 0, 0),
+        };
+        let first_unresolved =
+            first_unresolved_fsn_from_optional_segments(&sealed_segments, active.as_ref())
+                .unwrap_or(next_fsn);
+        let engine = Arc::new(SfaEngine {
+            slot_dir: options.slot_dir,
+            max_bytes: options.max_bytes,
+            segment_size_bytes: options.segment_size_bytes,
+            max_in_flight: options.max_in_flight,
+            allow_segment_creation: false,
+            state: Mutex::new(SfaEngineState {
+                active,
+                sealed_segments,
+                hot_spare: None,
+                allocated_segment_bytes,
+                recovery_diagnostics,
+                next_generation: 0,
+                closed: false,
+            }),
+            published_upper: AtomicU64::new(next_fsn),
+            completed_upper: AtomicU64::new(first_unresolved),
+            rejected_fsns: Mutex::new(Vec::new()),
+        });
+
+        Ok(Self {
+            engine,
+            producer: None,
             send_cursor: None,
         })
     }
@@ -836,7 +892,7 @@ impl SfaEngine {
         if let Some(step) = self.take_one_acked_sealed_segment(&mut state)? {
             return Ok(Some(step));
         }
-        if !allow_create || state.hot_spare.is_some() {
+        if !allow_create || !self.allow_segment_creation || state.hot_spare.is_some() {
             return Ok(None);
         }
         if !can_allocate_segment(
@@ -871,6 +927,7 @@ impl SfaEngine {
                 let segment = Arc::new(SfaSharedSegment::new(segment));
                 let mut state = self.lock_state()?;
                 if allow_install
+                    && self.allow_segment_creation
                     && !state.closed
                     && state.hot_spare.is_none()
                     && segment.published_frame_count() == 0
@@ -1221,6 +1278,14 @@ struct RecoveredState {
     diagnostics: Vec<SfaRecoveryDiagnostic>,
 }
 
+impl RecoveredState {
+    fn has_skipped_segments(&self) -> bool {
+        self.diagnostics
+            .iter()
+            .any(|diagnostic| matches!(diagnostic, SfaRecoveryDiagnostic::SkippedSegment { .. }))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SfaRecoveryDiagnostic {
     SkippedSegment {
@@ -1500,10 +1565,20 @@ fn first_unresolved_fsn_from_segments(
     sealed_segments: &VecDeque<Arc<SfaSharedSegment>>,
     active: &Arc<SfaSharedSegment>,
 ) -> Option<u64> {
+    first_unresolved_fsn_from_optional_segments(sealed_segments, Some(active))
+}
+
+fn first_unresolved_fsn_from_optional_segments(
+    sealed_segments: &VecDeque<Arc<SfaSharedSegment>>,
+    active: Option<&Arc<SfaSharedSegment>>,
+) -> Option<u64> {
     sealed_segments
         .front()
         .map(|segment| segment.base_seq())
-        .or_else(|| (active.published_frame_count() > 0).then(|| active.base_seq()))
+        .or_else(|| {
+            active
+                .and_then(|active| (active.published_frame_count() > 0).then(|| active.base_seq()))
+        })
 }
 
 #[cfg(test)]
@@ -1583,6 +1658,107 @@ mod tests {
         let mut bytes = vec![0u8; 64];
         bytes[..4].copy_from_slice(&0xdead_beefu32.to_le_bytes());
         fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn replay_only_empty_queue_creates_no_segments_or_producer() {
+        let dir = TempDir::new().unwrap();
+
+        let mut queue = SfaFrameQueue::open_replay_only(options(&dir)).unwrap();
+
+        assert!(queue.producer.is_none());
+        assert_eq!(queue.published_fsn(), None);
+        assert_eq!(queue.completed_fsn(), None);
+        assert_eq!(sfa_file_count(dir.path()), 0);
+        assert!(matches!(
+            queue.try_submit(b"abc"),
+            Err(SfaQueueError::Closed)
+        ));
+        assert!(!queue.maintain_storage().unwrap());
+        queue.close().unwrap();
+        assert_eq!(sfa_file_count(dir.path()), 0);
+    }
+
+    #[test]
+    fn replay_only_replays_and_cleans_recovered_frames_without_spares() {
+        let dir = TempDir::new().unwrap();
+        let initial = initial_segment_path(dir.path());
+        write_segment_with_one_frame(&initial, 0, b"abc");
+
+        let mut queue = SfaFrameQueue::open_replay_only(options(&dir)).unwrap();
+
+        assert!(queue.producer.is_none());
+        assert_eq!(queue.published_fsn(), Some(0));
+        assert_eq!(queue.completed_fsn(), None);
+        assert_eq!(sfa_file_count(dir.path()), 1);
+        assert_eq!(queue.payload_vec_for_fsn(0).as_deref(), Some(&b"abc"[..]));
+        assert!(!queue.maintain_storage().unwrap());
+
+        queue.complete_through_fsn(0).unwrap();
+        assert_eq!(queue.completed_fsn(), Some(0));
+        queue.close().unwrap();
+        assert_eq!(sfa_file_count(dir.path()), 0);
+    }
+
+    #[test]
+    fn replay_only_skips_bad_side_file_without_dropping_contiguous_frames() {
+        let dir = TempDir::new().unwrap();
+        let initial_path = initial_segment_path(dir.path());
+        let second_path = spare_segment_path(dir.path(), 0);
+        let bad_side_path = spare_segment_path(dir.path(), 99);
+
+        write_segment_with_one_frame(&initial_path, 0, b"first");
+        write_segment_with_one_frame(&second_path, 1, b"second");
+        write_bad_magic_segment(&bad_side_path);
+
+        let queue = SfaFrameQueue::open_replay_only(options(&dir)).unwrap();
+
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue.payload_vec_for_fsn(0).as_deref(), Some(&b"first"[..]));
+        assert_eq!(
+            queue.payload_vec_for_fsn(1).as_deref(),
+            Some(&b"second"[..])
+        );
+        assert!(bad_side_path.exists());
+        assert!(matches!(
+            queue.recovery_diagnostics().as_slice(),
+            [SfaRecoveryDiagnostic::SkippedSegment { path, .. }]
+                if path == &bad_side_path
+        ));
+    }
+
+    #[test]
+    fn replay_only_skipped_middle_file_preserves_gap_failure() {
+        let dir = TempDir::new().unwrap();
+        let initial_path = initial_segment_path(dir.path());
+        let bad_middle_path = spare_segment_path(dir.path(), 0);
+        let third_path = spare_segment_path(dir.path(), 1);
+
+        write_segment_with_one_frame(&initial_path, 0, b"first");
+        write_bad_magic_segment(&bad_middle_path);
+        write_segment_with_one_frame(&third_path, 2, b"third");
+
+        let err = SfaFrameQueue::open_replay_only(options(&dir)).unwrap_err();
+
+        assert!(matches!(
+            err,
+            SfaQueueError::CorruptSegments {
+                reason: "non-contiguous recovered segment sequence",
+            }
+        ));
+        assert!(bad_middle_path.exists());
+    }
+
+    #[test]
+    fn replay_only_skipped_segment_is_not_treated_as_drained() {
+        let dir = TempDir::new().unwrap();
+        let bad_path = initial_segment_path(dir.path());
+        write_bad_magic_segment(&bad_path);
+
+        let err = SfaFrameQueue::open_replay_only(options(&dir)).unwrap_err();
+
+        assert!(matches!(err, SfaQueueError::CorruptSegments { .. }));
+        assert!(bad_path.exists());
     }
 
     fn decode_hex_fixture(hex: &str) -> Vec<u8> {

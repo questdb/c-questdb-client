@@ -5,7 +5,8 @@ Date: 2026-05-07
 Status: open-gap handoff. Completed implementation notes have been removed
 unless they still explain an unresolved spec/reference decision. Refreshed
 after the post-lock-free SFA publication validation pass against Rust
-`b4310ddd89e75ce50adb8f0c4527c56c771080c7`.
+`b4310ddd89e75ce50adb8f0c4527c56c771080c7`, with the in-progress orphan
+draining implementation noted where relevant.
 
 This document records gaps found while comparing the Rust QWP/WebSocket
 Store-and-Forward implementation against the current QWP spec documents in:
@@ -42,6 +43,7 @@ Primary Rust files inspected:
 - `questdb-rs/src/ingress/sender/qwp_ws.rs`
 - `questdb-rs/src/ingress/sender/qwp_ws_codec.rs`
 - `questdb-rs/src/ingress/sender/qwp_ws_driver.rs`
+- `questdb-rs/src/ingress/sender/qwp_ws_orphan.rs`
 - `questdb-rs/src/ingress/sender/qwp_ws_publisher.rs`
 - `questdb-rs/src/ingress/sender/qwp_ws_queue.rs`
 - `questdb-rs/src/ingress/sender/qwp_ws_sfa_queue.rs`
@@ -73,7 +75,9 @@ new SF client spec.
 The largest remaining areas are:
 
 - strict unknown-key handling,
-- Java/spec close, retry, and orphan-drainer semantics,
+- Java/spec close and retry semantics,
+- orphan-drainer diagnostics, integration validation, shutdown behavior, and
+  Windows lock support,
 - Java public API/config surface parity, including deprecated auth aliases,
   WebSocket auto-flush settings, builder methods, and callback-style progress
   handlers,
@@ -185,8 +189,9 @@ Rust state:
   `close_flush_timeout_millis` to an explicit rejection.
 - `questdb-rs/src/ingress.rs:568-571` rejects
   `max_schemas_per_connection`.
-- `questdb-rs/src/ingress.rs:577-579` parses `drain_orphans` and
-  `max_background_drainers`, but enabled orphan draining is unsupported.
+- `drain_orphans` and `max_background_drainers` are now parsed and wired to the
+  Rust orphan-drainer runtime when `sf_dir` is configured. This is no longer an
+  inert config surface.
 - `questdb-rs/src/ingress.rs:581-584` rejects `error_inbox_capacity`.
 - `questdb-rs/src/ingress.rs:1948-1963` rejects
   `initial_connect_retry=async`.
@@ -195,8 +200,7 @@ Rust state:
 - `questdb-rs/src/ingress.rs:479-482` Rustdoc says `from_conf` accepts
   `close_flush_timeout_millis`, `drain_orphans`,
   `max_background_drainers`, `error_inbox_capacity`, and
-  `max_schemas_per_connection`, but some of those are rejected and
-  `drain_orphans=on` is explicitly unsupported.
+  `max_schemas_per_connection`, but some of those are rejected.
 - Store-and-Forward builder setters such as `sf_dir`, `sender_id`,
   `sf_max_bytes`, `sf_max_total_bytes`, `sf_durability`, and durable ACK opt-in
   are currently config-string-only implementation details rather than public
@@ -357,7 +361,7 @@ Implementation direction:
 - Implement equal-jitter for reconnect and initial-connect retry if Rust is to
   match the current spec and Java reference.
 
-### 7. Orphan adoption and `.failed` are missing
+### 7. Orphan adoption exists, but diagnostics, integration coverage, shutdown, and Windows support are incomplete
 
 Spec requirements:
 
@@ -369,18 +373,44 @@ Spec requirements:
 
 Rust state:
 
-- `questdb-rs/src/ingress.rs:1295-1316` accepts `drain_orphans=off/false` and
-  rejects `on/true`.
-- `questdb-rs/src/ingress.rs:1331-1345` parses
-  `max_background_drainers` but it is inert without drainers.
-- No Rust orphan scanner, background drainer, or `.failed` sentinel path was
-  found in the inspected source.
+- `questdb-rs/src/ingress.rs` now accepts `drain_orphans=on/true` for
+  QWP/WebSocket and rejects the key for non-QWP transports.
+- `questdb-rs/src/ingress.rs` now parses `max_background_drainers`; `0`
+  disables drainer launch.
+- `questdb-rs/src/ingress/sender/qwp_ws_orphan.rs` scans sibling slots, skips
+  the foreground `sender_id`, skips `.failed`, requires at least one `.sfa`
+  file, writes `.failed` for terminal setup/recovery/connect/wire failures, and
+  drives replay-only SFA queues.
+- Background mode starts a bounded orphan pool after the foreground sender
+  opens. Manual mode drives orphan work through the application-owned
+  `drive_once()` pump.
+- Orphan replay trims on ordinary OKs, matching Java's
+  `BackgroundDrainer`/`CursorWebSocketSendLoop` constructor, even if the
+  WebSocket upgrade reused a foreground config that requested durable ACKs.
+
+Remaining gaps:
+
+- Java logs scanner/drainer lifecycle events. Rust currently has no equivalent
+  operator-visible diagnostics beyond `.failed`.
+- Java's `BackgroundDrainerPool.close()` requests stop and waits briefly. Rust
+  currently sets a stop flag and does not block foreground close on worker
+  completion.
+- Manual-mode replay integration over a separate WebSocket connection is now
+  covered. Background-mode replay, shutdown, and failure-path integration tests
+  are still missing.
+- Windows slot locking is still missing in the shared SFA slot layer, so orphan
+  draining remains Unix-only in practice.
 
 Implementation direction:
 
-- Keep `drain_orphans=on` rejected until the scanner/drainer lifecycle exists.
-- Implement `.failed` before enabling background drainers; otherwise failed
-  orphan attempts will be retried blindly.
+- Add Java-style diagnostics before treating orphan draining as operator-ready.
+- Add background-mode integration tests that create an orphan slot with
+  payloads, open a different foreground sender with `drain_orphans=on`, and
+  verify the orphan payload is replayed and cleaned.
+- Decide whether Rust should add a bounded wait for background drainer shutdown
+  or keep the current non-blocking foreground close behavior as a deliberate
+  Rust deviation.
+- Implement Windows `LockFileEx` support in the shared slot-lock layer.
 
 ### 8. Error inbox and default error-handler behavior differ
 
@@ -604,7 +634,8 @@ Update or retire those notes before handing them to an implementation agent.
    deprecated `user` / `pass` aliases, WebSocket auto-flush, progress/error
    callback parity versus polling, and then support `error_inbox_capacity` if
    applicable.
-7. Add orphan scanner/drainers and `.failed`, then enable `drain_orphans=on`.
+7. Finish orphan-drainer follow-up: diagnostics, replay integration tests,
+   shutdown policy, and Windows slot-lock support.
 8. Address lower-level SFA disk details:
    filename decision, empty-segment behavior, and operator-visible recovery
    diagnostics.

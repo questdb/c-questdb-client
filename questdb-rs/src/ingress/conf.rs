@@ -123,6 +123,8 @@ pub(crate) const QWP_WS_DEFAULT_SF_SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
 pub(crate) const QWP_WS_DEFAULT_SF_MEMORY_MAX_TOTAL_BYTES: u64 = 128 * 1024 * 1024;
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) const QWP_WS_DEFAULT_SF_DISK_MAX_TOTAL_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) const QWP_WS_DEFAULT_MAX_BACKGROUND_DRAINERS: usize = 4;
 
 #[cfg(feature = "_sender-qwp-ws")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,6 +181,8 @@ pub(crate) struct QwpWsConfig {
     pub(crate) sf_max_total_bytes: ConfigSetting<Option<u64>>,
     pub(crate) sf_durability: ConfigSetting<SfDurability>,
     pub(crate) sf_append_deadline: ConfigSetting<std::time::Duration>,
+    pub(crate) drain_orphans: ConfigSetting<bool>,
+    pub(crate) max_background_drainers: ConfigSetting<usize>,
     pub(crate) progress: ConfigSetting<QwpWsProgress>,
 }
 
@@ -207,6 +211,10 @@ impl Default for QwpWsConfig {
             sf_max_total_bytes: ConfigSetting::new_default(None),
             sf_durability: ConfigSetting::new_default(SfDurability::Memory),
             sf_append_deadline: ConfigSetting::new_default(std::time::Duration::from_secs(30)),
+            drain_orphans: ConfigSetting::new_default(false),
+            max_background_drainers: ConfigSetting::new_default(
+                QWP_WS_DEFAULT_MAX_BACKGROUND_DRAINERS,
+            ),
             progress: ConfigSetting::new_default(QwpWsProgress::Background),
         }
     }

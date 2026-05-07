@@ -1,31 +1,48 @@
-# QWP/WebSocket Orphan Draining TODO
+# QWP/WebSocket Orphan Draining Notes
 
-Status: follow-up after segment-backed durable Store-and-Forward storage.
+Status: first Rust runtime slice implemented. Keep this file as the handoff for
+remaining orphan-draining follow-ups and Java-parity caveats.
 
-This document tracks the Java-parity work needed to implement
-`drain_orphans=on` in the Rust QWP/WebSocket sender. It is intentionally
-separate from `QWP_WEBSOCKET_DURABLE_SF_STORAGE.md`: orphan draining depends on
-segment-backed SFA recovery, slot locking, ACK watermarks, reconnect handling,
-and cleanup semantics being correct first.
+This document tracks `drain_orphans=on` in the Rust QWP/WebSocket sender. It is
+separate from `QWP_WEBSOCKET_DURABLE_SF_STORAGE.md` because orphan draining
+depends on segment-backed SFA recovery, slot locking, ACK watermarks, reconnect
+handling, and cleanup semantics.
 
 ## Current Rust State
 
-Rust does not drain orphan slots today.
+Implemented:
 
-- `questdb-rs/src/ingress.rs` accepts `drain_orphans=off` and
-  `drain_orphans=false`.
-- `drain_orphans=on` and `drain_orphans=true` are rejected with an unsupported
-  QWP/WebSocket message.
-- `max_background_drainers` is parsed and validated as `>= 0`, but has no
-  runtime effect while orphan draining is disabled.
-- TCP/UDP configurations still reject both keys as QWP/WebSocket-only.
+- `questdb-rs/src/ingress.rs` accepts `drain_orphans=off/false/on/true`.
+- `max_background_drainers` is parsed, rejects negative values, and `0`
+  disables drainer launch.
+- TCP/UDP configurations reject both keys as QWP/WebSocket-only.
+- `questdb-rs/src/ingress/sender/qwp_ws_orphan.rs` scans sibling slot
+  directories, skips the foreground `sender_id`, skips `.failed`, and requires
+  at least one `.sfa` file.
+- Orphan drainers acquire the orphan slot lock through the SFA slot layer. A
+  locked slot is skipped without `.failed`.
+- Replay-only SFA open recovers existing segments but creates no initial
+  segment, no hot spare, and no producer.
+- Recovery/setup/connect/wire failures write a best-effort `.failed` sentinel.
+- Already-drained orphan slots close without networking.
+- Background mode starts a bounded drainer pool after the foreground sender has
+  opened successfully.
+- Manual mode exposes orphan progress through the same application-owned
+  `drive_once()` pump. Publication does not secretly run orphan maintenance.
 
-Keep that behavior until this TODO is implemented. Do not silently accept
-`drain_orphans=on` before real orphan adoption exists.
+Still incomplete or intentionally different:
+
+- There is no Java-style operator logging for scanner/drainer lifecycle events
+  yet. `.failed` is currently the only durable operator-visible artifact.
+- Background worker shutdown is best-effort. Rust sets a stop flag and does not
+  block foreground close waiting for a stale orphan connection attempt.
+- Rust has manual orphan driving; Java only has automatic background drainers.
+- Windows slot locking is still unsupported because the shared SFA slot lock is
+  Unix-only today.
 
 ## Java Reference
 
-The reference behavior is in the Java client under:
+Reference behavior lives in the Java client under:
 
 - `/home/jara/devel/oss/questdb-arrays/java-questdb-client/core/src/main/java/io/questdb/client/Sender.java`
   - builder defaults: `drainOrphans=false`,
@@ -43,7 +60,9 @@ The reference behavior is in the Java client under:
 - `/home/jara/devel/oss/questdb-arrays/java-questdb-client/core/src/main/java/io/questdb/client/cutlass/qwp/client/QwpWebSocketSender.java`
   - `startOrphanDrainers(...)` creates a bounded drainer pool when the orphan
     list is non-empty and `max_background_drainers > 0`;
-  - each candidate slot gets a `BackgroundDrainer`.
+  - each candidate slot gets a `BackgroundDrainer`;
+  - drainers reuse `buildAndConnect()`, so the WebSocket upgrade uses the
+    foreground durable-ACK request flag.
 - `/home/jara/devel/oss/questdb-arrays/java-questdb-client/core/src/main/java/io/questdb/client/cutlass/qwp/client/sf/cursor/BackgroundDrainer.java`
   - one drainer per orphan slot;
   - acquires the slot lock through `CursorSendEngine`;
@@ -53,129 +72,94 @@ The reference behavior is in the Java client under:
     `publishedFsn`;
   - writes `.failed` on terminal setup, connect, reconnect, recovery, or wire
     failure.
+- `/home/jara/devel/oss/questdb-arrays/java-questdb-client/core/src/main/java/io/questdb/client/cutlass/qwp/client/sf/cursor/CursorWebSocketSendLoop.java`
+  - the constructor used by `BackgroundDrainer` sets `durableAckMode=false`;
+  - orphan trim is therefore OK-driven even when the WebSocket connection
+    factory requested durable ACKs.
 - `/home/jara/devel/oss/questdb-arrays/java-questdb-client/core/src/main/java/io/questdb/client/cutlass/qwp/client/sf/cursor/BackgroundDrainerPool.java`
   - bounded pool, one pool per foreground sender;
   - concurrent execution capped by `max_background_drainers`;
   - excess candidates queue inside the pool;
   - close requests active drainers to stop and waits briefly.
 
-## Target Rust Semantics
+## Rust Semantics
 
-Implement Java-like semantics unless an item below explicitly says otherwise.
-
-- `drain_orphans=on` is only meaningful when `sf_dir` is configured. Java
-  accepts the setting without `sf_dir`, but the startup path has no sibling
-  slots to scan and launches no drainers.
+- `drain_orphans=on` is only meaningful when `sf_dir` is configured. Without
+  `sf_dir`, there are no sibling slots to scan and no drainers launch.
 - The foreground sender never adopts its own slot.
 - Candidate orphan slot:
   - child directory under `sf_dir`;
   - child name is not the foreground `sender_id`;
   - contains at least one `.sfa` file;
   - does not contain `.failed`.
-- Scanner does not decide ownership. It only finds candidates. Lock acquisition
-  in the drainer decides whether this process can own the slot.
+- Scanner does not decide ownership. Lock acquisition in the drainer decides
+  whether this process can own the slot.
 - If another process or drainer holds the orphan slot lock, skip the slot
   without creating `.failed`.
 - Each drainer uses a separate WebSocket connection and its own QWP/WebSocket
-  receive/send loop. Do not multiplex orphan traffic over the foreground
+  receive/send loop. It does not multiplex orphan traffic over the foreground
   sender connection.
 - Drainers are read-only with respect to the orphan slot's durable data: they
   recover existing `.sfa` files and replay unacked frames, but never append new
-  application frames.
+  application frames or create storage.
 - The target is the recovered `published_fsn` snapshot captured at drainer
   startup. A drainer succeeds when recovered `acked_fsn >= target_fsn`.
+- Orphan replay uses ordinary OK-driven trim, matching Java's
+  `BackgroundDrainer` send-loop constructor. The connection setup still uses
+  the foreground QWP/WebSocket config, including durable-ACK upgrade opt-in.
 - On terminal setup, recovery, initial connect, reconnect-budget, auth, or wire
   failure, write a `.failed` sentinel in the orphan slot before exiting.
 - `.failed` is an operator-visible stop sign. Future scans skip the slot until
   an operator removes the sentinel.
 - `max_background_drainers=0` disables launching drainers even when
-  `drain_orphans=on`, matching Java's `startOrphanDrainers(...)` early return.
-- Closing the foreground sender must close the drainer pool and request active
-  drainers to stop. Stopping due to foreground close should release locks and
-  must not write `.failed` by itself.
+  `drain_orphans=on`.
+- Closing the foreground sender requests active background drainers to stop.
+  Stopping due to foreground close should release locks and must not write
+  `.failed` by itself.
 
 ## Design Constraints
 
 - Keep publication fast. Foreground publication must not scan sibling slots or
   perform orphan cleanup.
 - Start orphan scanning only after the foreground sender has acquired its own
-  slot lock. This preserves the Java ordering and avoids adopting this sender's
+  slot lock. This preserves Java ordering and avoids adopting this sender's
   slot during startup.
 - In automated Rust mode, orphan drainers may run on background threads because
   the feature is explicitly background adoption of another sender's slot.
-- In manual mode, do not introduce hidden maintenance from publication. If
-  Rust supports orphan draining in manual mode, the application-owned pump must
-  drive it explicitly and the one-pump-owner rule still applies.
+- In manual mode, orphan draining is driven only by the application-owned
+  `drive_once()` path. There is no hidden maintenance from publication.
 - Do not share mutable queue state between the foreground SFA queue and orphan
   drainers. Treat each orphan slot as a separate recovered queue.
 - Reuse the foreground reconnect classification and terminal-failure policy
   where possible, but keep foreground and orphan errors distinguishable.
 - `.failed` creation is best-effort. Failure to write the sentinel should be
   diagnostic, not a reason to corrupt or delete the orphan data.
-- Windows support is not optional long-term. The first implementation may follow
-  the current Unix-only slot-locking support, but orphan draining must not bake
-  in assumptions that make Windows adoption harder later. Keep slot locking,
-  directory scanning, sentinel creation, and mapped-file handling behind narrow
-  helpers that can grow Windows implementations.
+- Windows support is not optional long-term. Keep slot locking, directory
+  scanning, sentinel creation, and mapped-file handling behind helpers that can
+  grow Windows implementations.
 
-## Implementation Checklist
+## Remaining Work
 
-1. Add runtime QWP/WebSocket config fields for:
-   - `drain_orphans: bool`;
-   - `max_background_drainers: usize`.
-2. Preserve current validation:
-   - reject these keys for non-QWP/WebSocket protocols;
-   - reject negative `max_background_drainers`;
-   - keep `drain_orphans=on` unsupported until the full runtime path exists.
-3. Add an orphan scanner:
-   - scan `sf_dir` children once;
-   - skip missing `sf_dir`;
-   - log or otherwise surface enumeration failures;
-   - exclude current `sender_id`;
-   - require at least one `.sfa`;
-   - skip `.failed`.
-4. Add `.failed` sentinel helpers:
-   - constant name `.failed`;
-   - idempotent marker creation with short human-readable reason;
-   - scanner exclusion test.
-5. Add a read-only orphan recovery/drain engine:
-   - acquire the orphan slot lock;
-   - distinguish "already locked" from terminal recovery failures;
-   - recover published and acknowledged FSN;
-   - expose a segment cursor over unacked frames;
-   - forbid appending.
-6. Add the drainer loop:
-   - establish a separate WebSocket connection;
-   - send orphan frames from the recovered cursor;
-   - receive durable ACKs through the same QWP/WebSocket pump used by the
-     foreground sender;
-   - stop when `acked_fsn >= target_fsn`;
-   - map terminal failures to `.failed`.
-7. Add a bounded drainer pool:
-   - cap concurrent drainers by `max_background_drainers`;
-   - queue excess candidates behind the concurrency cap;
-   - close by requesting active drainers to stop and waiting for lock release.
-8. Hook startup:
-   - after foreground slot lock acquisition and successful connection;
-   - scan once;
-   - launch drainers if `drain_orphans=on`, `sf_dir` is set, candidates exist,
-     and `max_background_drainers > 0`.
-9. Hook shutdown:
-   - foreground sender close closes the drainer pool;
-   - stopped drainers release locks;
-   - stopped-by-owner-close is not a failed orphan.
-10. Add diagnostics:
-   - number of candidates found;
+1. Add Java-style diagnostics:
+   - candidates found;
    - slots skipped because locked;
    - successful drain with target and acknowledged FSN;
    - `.failed` reason;
-   - pool close timeout, if any.
+   - background close stop/timeout behavior.
+2. Add background-mode integration coverage with real orphan payload replay over
+   a separate WebSocket connection.
+3. Add explicit background-pool tests for concurrency capping and shutdown
+   races.
+4. Decide whether Rust should add a bounded wait on background drainer close.
+   The current implementation deliberately does not block foreground close.
+5. Implement Windows slot locking in the shared SFA slot layer.
 
 ## Required Tests
 
+Covered by the first runtime slice:
+
 - Config:
-  - `drain_orphans=off/false` still accepted;
-  - `drain_orphans=on/true` accepted only after runtime implementation lands;
+  - `drain_orphans=off/false/on/true` accepted for QWP/WebSocket;
   - invalid boolean values rejected;
   - non-QWP/WebSocket protocols reject both keys;
   - `max_background_drainers=-1` rejected;
@@ -186,35 +170,32 @@ Implement Java-like semantics unless an item below explicitly says otherwise.
   - child without `.sfa` excluded;
   - child with `.sfa` included;
   - child with `.failed` excluded;
-  - `.failed` marker is idempotent.
-- Locking:
+  - `.failed` marker is written with a reason.
+- Locking and replay-only open:
   - locked orphan slot skipped without `.failed`;
-  - unlocked orphan slot acquired and released;
-  - foreground slot is never adopted.
-- Drain success:
-  - recovered orphan frames replayed over a separate connection;
-  - durable ACKs advance `acked_fsn`;
-  - success when `acked_fsn >= target_fsn`;
-  - drained files are cleaned up according to the normal close-drain cleanup
-    rules.
-- Failure:
-  - recovery failure writes `.failed`;
-  - initial connect failure writes `.failed`;
-  - terminal reconnect/auth/wire failure writes `.failed`;
-  - foreground close stops active drainers without writing `.failed`.
-- Pool:
-  - concurrency capped by `max_background_drainers`;
-  - excess slots are not run concurrently above the cap;
-  - closing the pool races safely with in-flight submission.
-- Integration:
-  - create data with one `sender_id`, open another with `drain_orphans=on`,
-    and verify orphan data is delivered;
-  - `.failed` orphan remains untouched until the sentinel is removed.
+  - replay-only open does not create a missing slot;
+  - replay-only empty slot creates no segments or producer;
+  - skipped/corrupt segments are not treated as drained.
+- Manual orphan driving:
+  - already-drained slot is consumed without network;
+  - locked slot is skipped without `.failed`;
+  - recovery failure writes `.failed` without deleting the bad `.sfa`;
+  - recovered orphan frames replay over a separate connection;
+  - ordinary OK advances the orphan to completion and removes drained `.sfa`
+    files.
 
-## Non-Goals For The First Storage Slice
+Still needed:
 
-- Do not implement orphan draining before segment-backed SFA storage and ACK
-  recovery are correct.
+- Background-mode recovered orphan frames replayed over a separate connection.
+- Durable-ACK opt-in interaction covered by an integration test.
+- Initial connect failure writes `.failed`.
+- Terminal reconnect/auth/wire failure writes `.failed`.
+- Foreground close stops active drainers without writing `.failed`.
+- Background concurrency capped by `max_background_drainers`.
+- `.failed` orphan remains untouched until the sentinel is removed.
+
+## Non-Goals
+
 - Do not add best-effort foreground fallback draining from publication.
 - Do not silently delete orphan directories that do not match the candidate
   rules.
@@ -222,6 +203,3 @@ Implement Java-like semantics unless an item below explicitly says otherwise.
 - Do not share the foreground WebSocket connection with drainers.
 - Do not treat the current Unix-only slot-locking limitation as the final
   platform story. Windows support is deferred, not rejected.
-- Do not make the first Rust implementation more aggressive than Java. If Rust
-  intentionally diverges, document the difference in the parity gaps doc before
-  enabling the feature.

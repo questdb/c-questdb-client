@@ -52,6 +52,9 @@ use super::qwp_ws_driver::{
     QwpWsTransportFailureAction, ReconnectPolicy, ReconnectReason, SendCursor, TransportFailure,
     TransportPoll, reconnect_error_is_terminal,
 };
+use super::qwp_ws_orphan::{
+    ManualOrphanDrainers, OrphanDrainerConfig, OrphanDrainerPool, scan_orphan_slots,
+};
 use super::qwp_ws_ownership::QwpWsSenderError;
 use super::qwp_ws_publisher::{QwpWsPublicationDriver, QwpWsPublicationError, QwpWsReplayEncoder};
 use super::qwp_ws_queue::{
@@ -162,10 +165,12 @@ pub(crate) type SyncQwpWsPublisher =
 pub(crate) struct SyncQwpWsHandlerState {
     encoder: QwpWsReplayEncoder,
     runner: SyncQwpWsRunner,
+    orphan_pool: Option<OrphanDrainerPool>,
 }
 
 pub(crate) struct ManualQwpWsHandlerState {
     publisher: SyncQwpWsPublisher,
+    orphan_drainers: Option<ManualOrphanDrainers>,
     append_deadline: Duration,
 }
 
@@ -1927,18 +1932,41 @@ pub(crate) fn connect_qwp_ws(
     qwp_ws: &QwpWsConfig,
     auth_header: Option<String>,
 ) -> crate::Result<SyncProtocolHandler> {
+    let orphan_config = OrphanDrainerConfig::new(
+        host,
+        port,
+        use_tls,
+        tls_settings.clone(),
+        qwp_ws,
+        auth_header.clone(),
+    );
     let publisher = open_qwp_ws_publisher(host, port, use_tls, tls_settings, qwp_ws, auth_header)?;
     let negotiated_version = publisher.version();
+    let runner = SyncQwpWsRunner::start_with_append_deadline(publisher, *qwp_ws.sf_append_deadline);
+    let orphan_candidates = orphan_candidates(qwp_ws);
+    let orphan_pool = OrphanDrainerPool::start(
+        orphan_candidates,
+        *qwp_ws.max_background_drainers,
+        orphan_config,
+    );
 
     Ok(SyncProtocolHandler::SyncQwpWs(Box::new(
         SyncQwpWsHandlerState {
             encoder: QwpWsReplayEncoder::new(negotiated_version),
-            runner: SyncQwpWsRunner::start_with_append_deadline(
-                publisher,
-                *qwp_ws.sf_append_deadline,
-            ),
+            runner,
+            orphan_pool,
         },
     )))
+}
+
+fn orphan_candidates(qwp_ws: &QwpWsConfig) -> Vec<std::path::PathBuf> {
+    if !*qwp_ws.drain_orphans {
+        return Vec::new();
+    }
+    let Some(sf_dir) = qwp_ws.sf_dir.as_ref() else {
+        return Vec::new();
+    };
+    scan_orphan_slots(sf_dir, qwp_ws.sender_id.as_str())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1950,9 +1978,23 @@ pub(crate) fn open_manual_qwp_ws(
     qwp_ws: &QwpWsConfig,
     auth_header: Option<String>,
 ) -> crate::Result<ManualQwpWsHandlerState> {
+    let orphan_config = OrphanDrainerConfig::new(
+        host,
+        port,
+        use_tls,
+        tls_settings.clone(),
+        qwp_ws,
+        auth_header.clone(),
+    );
     let publisher = open_qwp_ws_publisher(host, port, use_tls, tls_settings, qwp_ws, auth_header)?;
+    let orphan_drainers = ManualOrphanDrainers::new(
+        orphan_candidates(qwp_ws),
+        *qwp_ws.max_background_drainers,
+        orphan_config,
+    );
     Ok(ManualQwpWsHandlerState {
         publisher,
+        orphan_drainers,
         append_deadline: *qwp_ws.sf_append_deadline,
     })
 }
@@ -2089,7 +2131,7 @@ pub(crate) fn flush_qwp_ws_manual(
 }
 
 pub(crate) fn qwp_ws_drive_once(state: &mut ManualQwpWsHandlerState) -> crate::Result<bool> {
-    match state.publisher.drive_ready_once() {
+    let foreground_progress = match state.publisher.drive_ready_once() {
         Ok(DriveOutcome::Idle) => Ok(false),
         Ok(DriveOutcome::Terminal) => qwp_ws_manual_terminal_error(state),
         Ok(
@@ -2100,7 +2142,12 @@ pub(crate) fn qwp_ws_drive_once(state: &mut ManualQwpWsHandlerState) -> crate::R
             | DriveOutcome::Progress,
         ) => Ok(true),
         Err(err) => Err(driver_error_to_error(&state.publisher, err)),
-    }
+    }?;
+    let orphan_progress = state
+        .orphan_drainers
+        .as_mut()
+        .is_some_and(ManualOrphanDrainers::drive_once);
+    Ok(foreground_progress || orphan_progress)
 }
 
 pub(crate) fn qwp_ws_published_fsn_background(
@@ -2173,8 +2220,14 @@ pub(crate) fn qwp_ws_sender_errors_dropped_manual(
     Ok(state.publisher.sender_errors_dropped_total())
 }
 
-pub(crate) fn qwp_ws_close_drain_background(state: &SyncQwpWsHandlerState) -> crate::Result<()> {
-    state.runner.close_drain(DEFAULT_CLOSE_DRAIN_TIMEOUT)
+pub(crate) fn qwp_ws_close_drain_background(
+    state: &mut SyncQwpWsHandlerState,
+) -> crate::Result<()> {
+    let result = state.runner.close_drain(DEFAULT_CLOSE_DRAIN_TIMEOUT);
+    if let Some(mut orphan_pool) = state.orphan_pool.take() {
+        orphan_pool.close();
+    }
+    result
 }
 
 pub(crate) fn qwp_ws_close_drain_manual(state: &mut ManualQwpWsHandlerState) -> crate::Result<()> {

@@ -28,9 +28,10 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::Path;
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::ingress::{
     Protocol, QwpWsErrorCategory, QwpWsErrorPolicy, QwpWsProgress, SenderBuilder,
@@ -127,6 +128,33 @@ fn write_server_binary_frame(stream: &mut TcpStream, payload: &[u8]) -> std::io:
     }
     frame.extend_from_slice(payload);
     stream.write_all(&frame)
+}
+
+fn perform_server_upgrade(stream: &mut TcpStream) -> std::io::Result<Vec<String>> {
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+
+    let req_bytes = read_request_until_blank(stream)?;
+    let req = String::from_utf8_lossy(&req_bytes).to_string();
+    let request_lines: Vec<String> = req
+        .split("\r\n")
+        .take_while(|l| !l.is_empty())
+        .map(String::from)
+        .collect();
+
+    let key = parse_header(&req, "Sec-WebSocket-Key").expect("missing Sec-WebSocket-Key");
+    let accept = compute_accept(&key);
+
+    let response = format!(
+        "HTTP/1.1 101 Switching Protocols\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Accept: {accept}\r\n\
+         X-QWP-Version: 1\r\n\
+         \r\n"
+    );
+    stream.write_all(response.as_bytes())?;
+    Ok(request_lines)
 }
 
 fn write_server_frame(
@@ -347,33 +375,7 @@ fn spawn_mock_server() -> (u16, mpsc::Receiver<MockResult>) {
 
     thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        stream
-            .set_write_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-
-        let req_bytes = read_request_until_blank(&mut stream).unwrap();
-        let req = String::from_utf8_lossy(&req_bytes).to_string();
-        let request_lines: Vec<String> = req
-            .split("\r\n")
-            .take_while(|l| !l.is_empty())
-            .map(String::from)
-            .collect();
-
-        let key = parse_header(&req, "Sec-WebSocket-Key").expect("missing Sec-WebSocket-Key");
-        let accept = compute_accept(&key);
-
-        let response = format!(
-            "HTTP/1.1 101 Switching Protocols\r\n\
-             Upgrade: websocket\r\n\
-             Connection: Upgrade\r\n\
-             Sec-WebSocket-Accept: {accept}\r\n\
-             X-QWP-Version: 1\r\n\
-             \r\n"
-        );
-        stream.write_all(response.as_bytes()).unwrap();
+        let request_lines = perform_server_upgrade(&mut stream).unwrap();
 
         let mut received_frames = Vec::new();
         let (_fin, _opcode, payload) = read_frame(&mut stream).unwrap();
@@ -391,6 +393,77 @@ fn spawn_mock_server() -> (u16, mpsc::Receiver<MockResult>) {
     });
 
     (port, rx)
+}
+
+fn spawn_upgrade_only_server() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut stream).unwrap();
+        thread::sleep(Duration::from_millis(50));
+    });
+
+    port
+}
+
+fn spawn_manual_orphan_drain_server() -> (u16, mpsc::Receiver<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut foreground, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut foreground).unwrap();
+
+        let (mut orphan, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut orphan).unwrap();
+        let (_fin, _opcode, payload) = read_frame(&mut orphan).unwrap();
+        write_qwp_ok_response(&mut orphan, FIRST_WIRE_SEQUENCE).unwrap();
+        tx.send(payload).unwrap();
+
+        thread::sleep(Duration::from_millis(50));
+    });
+
+    (port, rx)
+}
+
+fn spawn_stalled_background_orphan_drain_server() -> (u16, mpsc::Receiver<Vec<u8>>, mpsc::Sender<()>)
+{
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (mut foreground, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut foreground).unwrap();
+
+        let (mut orphan, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut orphan).unwrap();
+        let (_fin, _opcode, payload) = read_frame(&mut orphan).unwrap();
+        tx.send(payload).unwrap();
+
+        // Keep the orphan connection open until the test releases it. A
+        // regression that waits for stalled orphan work would block close.
+        let _ = release_rx.recv_timeout(Duration::from_secs(6));
+    });
+
+    (port, rx, release_tx)
+}
+
+fn slot_has_sfa_file(slot_dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(slot_dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".sfa"))
+    })
 }
 
 // ---------- tests ----------
@@ -806,6 +879,149 @@ fn qwp_ws_store_and_forward_config_opens_java_slot_layout() {
 
     let _ = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert!(sf_dir.path().join("primary").join(".lock").exists());
+}
+
+#[test]
+fn qwp_ws_manual_orphan_drainer_replays_sibling_slot() {
+    let seed_port = spawn_upgrade_only_server();
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    let seed_conf = format!(
+        "qwpws::addr=127.0.0.1:{seed_port};qwp_ws_progress=manual;\
+         sf_dir={};sender_id=orphan;sf_max_bytes=256;sf_max_total_bytes=1024;",
+        sf_dir.path().display()
+    );
+    let mut seed_sender = SenderBuilder::from_conf(&seed_conf)
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut seed_buf = seed_sender.new_buffer();
+    seed_buf
+        .table("orphaned")
+        .unwrap()
+        .symbol("src", "old")
+        .unwrap()
+        .column_i64("value", 42)
+        .unwrap()
+        .at_now()
+        .unwrap();
+
+    seed_sender.flush(&mut seed_buf).unwrap();
+    drop(seed_sender);
+
+    let (port, rx) = spawn_manual_orphan_drain_server();
+    let drain_conf = format!(
+        "qwpws::addr=127.0.0.1:{port};qwp_ws_progress=manual;\
+         sf_dir={};sender_id=primary;drain_orphans=on;\
+         max_background_drainers=1;sf_max_bytes=256;sf_max_total_bytes=1024;",
+        sf_dir.path().display()
+    );
+    let mut sender = SenderBuilder::from_conf(&drain_conf)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let mut orphan_payload = None;
+    for _ in 0..20 {
+        let _ = sender.drive_once().unwrap();
+        if let Ok(payload) = rx.try_recv() {
+            orphan_payload = Some(payload);
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let payload = orphan_payload.expect("orphan payload was not replayed");
+    assert!(!payload.is_empty());
+    let orphan_slot = sf_dir.path().join("orphan");
+    for _ in 0..20 {
+        let _ = sender.drive_once().unwrap();
+        if !slot_has_sfa_file(&orphan_slot) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!slot_has_sfa_file(&orphan_slot));
+    assert!(!sf_dir.path().join("primary").join(".failed").exists());
+    assert!(!orphan_slot.join(".failed").exists());
+}
+
+#[test]
+fn qwp_ws_background_orphan_close_is_bounded_and_leaves_orphan_recoverable() {
+    let seed_port = spawn_upgrade_only_server();
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    let seed_conf = format!(
+        "qwpws::addr=127.0.0.1:{seed_port};qwp_ws_progress=manual;\
+         sf_dir={};sender_id=orphan;sf_max_bytes=256;sf_max_total_bytes=1024;",
+        sf_dir.path().display()
+    );
+    let mut seed_sender = SenderBuilder::from_conf(&seed_conf)
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut seed_buf = seed_sender.new_buffer();
+    seed_buf
+        .table("orphaned")
+        .unwrap()
+        .symbol("src", "old")
+        .unwrap()
+        .column_i64("value", 42)
+        .unwrap()
+        .at_now()
+        .unwrap();
+
+    seed_sender.flush(&mut seed_buf).unwrap();
+    drop(seed_sender);
+    let orphan_slot = sf_dir.path().join("orphan");
+    assert!(slot_has_sfa_file(&orphan_slot));
+
+    let (port, rx, release_stalled_orphan) = spawn_stalled_background_orphan_drain_server();
+    let drain_conf = format!(
+        "qwpws::addr=127.0.0.1:{port};\
+         sf_dir={};sender_id=primary;drain_orphans=on;\
+         max_background_drainers=1;sf_max_bytes=256;sf_max_total_bytes=1024;",
+        sf_dir.path().display()
+    );
+    let mut sender = SenderBuilder::from_conf(&drain_conf)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let orphan_payload = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(!orphan_payload.is_empty());
+
+    let started = Instant::now();
+    sender.close_drain().unwrap();
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "background orphan shutdown took {elapsed:?}"
+    );
+    assert!(!orphan_slot.join(".failed").exists());
+
+    release_stalled_orphan.send(()).unwrap();
+
+    let (recover_port, recover_rx) = spawn_mock_server();
+    let recover_conf = format!(
+        "qwpws::addr=127.0.0.1:{recover_port};\
+         sf_dir={};sender_id=orphan;sf_max_bytes=256;sf_max_total_bytes=1024;",
+        sf_dir.path().display()
+    );
+    let retry_deadline = Instant::now() + Duration::from_secs(5);
+    let mut recover_sender = loop {
+        match SenderBuilder::from_conf(&recover_conf).unwrap().build() {
+            Ok(sender) => break sender,
+            Err(err) if Instant::now() < retry_deadline => {
+                let _ = err;
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) => panic!("orphan slot was not reusable after close: {err}"),
+        }
+    };
+    recover_sender.close_drain().unwrap();
+    let recovered = recover_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(recovered.received_frames.len(), 1);
+    assert!(!recovered.received_frames[0].is_empty());
 }
 
 #[test]

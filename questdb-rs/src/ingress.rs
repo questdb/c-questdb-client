@@ -1312,21 +1312,20 @@ impl SenderBuilder {
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
-    fn drain_orphans(self, value: &str) -> Result<Self> {
-        if self.qwp_ws.is_none() {
+    fn drain_orphans(mut self, value: &str) -> Result<Self> {
+        let Some(qwp_ws) = &mut self.qwp_ws else {
             return Err(error::fmt!(
                 ConfigError,
                 "The \"drain_orphans\" setting is only supported for QWP/WebSocket."
             ));
-        }
+        };
         if value.eq_ignore_ascii_case("off") || value.eq_ignore_ascii_case("false") {
+            qwp_ws.drain_orphans.set_specified("drain_orphans", false)?;
             return Ok(self);
         }
         if value.eq_ignore_ascii_case("on") || value.eq_ignore_ascii_case("true") {
-            return self.reject_unsupported_qwp_ws_setting(
-                "drain_orphans",
-                "orphan slot draining is not implemented",
-            );
+            qwp_ws.drain_orphans.set_specified("drain_orphans", true)?;
+            return Ok(self);
         }
 
         Err(error::fmt!(
@@ -1356,13 +1355,13 @@ impl SenderBuilder {
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
-    fn max_background_drainers(self, value: &str) -> Result<Self> {
-        if self.qwp_ws.is_none() {
+    fn max_background_drainers(mut self, value: &str) -> Result<Self> {
+        let Some(qwp_ws) = &mut self.qwp_ws else {
             return Err(error::fmt!(
                 ConfigError,
                 "The \"max_background_drainers\" setting is only supported for QWP/WebSocket."
             ));
-        }
+        };
         let value: i32 = parse_conf_value("max_background_drainers", value)?;
         if value < 0 {
             return Err(error::fmt!(
@@ -1370,6 +1369,9 @@ impl SenderBuilder {
                 "max_background_drainers must be >= 0: {value}"
             ));
         }
+        qwp_ws
+            .max_background_drainers
+            .set_specified("max_background_drainers", value as usize)?;
         Ok(self)
     }
 

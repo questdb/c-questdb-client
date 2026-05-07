@@ -34,7 +34,7 @@ use std::collections::{HashMap, VecDeque};
 #[cfg(feature = "sync-sender-qwp-ws")]
 use std::io::Write;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "sync-sender-qwp-ws")]
@@ -141,6 +141,20 @@ pub(crate) enum QwpWsReconnectProgress {
     Reconnected { reason: ReconnectReason },
     Terminal(Error),
     Stopped,
+}
+
+enum Controlled<T> {
+    Value(T),
+    Stopped,
+}
+
+impl<T> Controlled<T> {
+    fn map<U>(self, f: impl FnOnce(T) -> U) -> Controlled<U> {
+        match self {
+            Controlled::Value(value) => Controlled::Value(f(value)),
+            Controlled::Stopped => Controlled::Stopped,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1073,23 +1087,42 @@ impl<Q: PublicationLog, T: ManualDriverTransport> ManualDriverPrototype<Q, T> {
     }
 
     pub(crate) fn drive_once(&mut self) -> Result<DriveOutcome, DriverError> {
+        match self.drive_once_controlled(None)? {
+            Controlled::Value(outcome) => Ok(outcome),
+            Controlled::Stopped => Ok(DriveOutcome::Terminal),
+        }
+    }
+
+    fn drive_once_controlled(
+        &mut self,
+        stop: Option<&AtomicBool>,
+    ) -> Result<Controlled<DriveOutcome>, DriverError> {
+        if stop_requested(stop) {
+            return Ok(Controlled::Stopped);
+        }
         if self.store.is_terminal() {
-            return Ok(DriveOutcome::Terminal);
+            return Ok(Controlled::Value(DriveOutcome::Terminal));
         }
 
         let mut outcome = DriveOutcome::Idle;
-        if let Some(send_outcome) = self.drive_send_available()? {
+        if let Some(send_outcome) = match self.drive_send_available_controlled(stop)? {
+            Controlled::Value(outcome) => outcome,
+            Controlled::Stopped => return Ok(Controlled::Stopped),
+        } {
             if send_outcome == DriveOutcome::Terminal {
-                return Ok(send_outcome);
+                return Ok(Controlled::Value(send_outcome));
             }
             if send_outcome != DriveOutcome::Idle {
                 outcome = send_outcome;
             }
         }
 
-        let receive = self.drive_receive_ready_until_idle()?;
+        let receive = match self.drive_receive_ready_until_idle_controlled(stop)? {
+            Controlled::Value(outcome) => outcome,
+            Controlled::Stopped => return Ok(Controlled::Stopped),
+        };
         if receive == DriveOutcome::Terminal {
-            return Ok(receive);
+            return Ok(Controlled::Value(receive));
         }
         if receive != DriveOutcome::Idle
             && (outcome == DriveOutcome::Idle || receive != DriveOutcome::Progress)
@@ -1097,14 +1130,20 @@ impl<Q: PublicationLog, T: ManualDriverTransport> ManualDriverPrototype<Q, T> {
             outcome = receive;
         }
 
+        if stop_requested(stop) {
+            return Ok(Controlled::Stopped);
+        }
         if self.drive_storage_once()? && outcome == DriveOutcome::Idle {
             outcome = DriveOutcome::Progress;
         }
 
         if outcome == DriveOutcome::Idle {
-            outcome = self.drive_durable_ack_keepalive_once()?;
+            outcome = match self.drive_durable_ack_keepalive_once_controlled(stop)? {
+                Controlled::Value(outcome) => outcome,
+                Controlled::Stopped => return Ok(Controlled::Stopped),
+            };
         }
-        Ok(outcome)
+        Ok(Controlled::Value(outcome))
     }
 
     pub(crate) fn drive_ready_once(&mut self) -> Result<DriveOutcome, DriverError> {
@@ -1150,17 +1189,33 @@ impl<Q: PublicationLog, T: ManualDriverTransport> ManualDriverPrototype<Q, T> {
     }
 
     fn drive_receive_ready_until_idle(&mut self) -> Result<DriveOutcome, DriverError> {
+        match self.drive_receive_ready_until_idle_controlled(None)? {
+            Controlled::Value(outcome) => Ok(outcome),
+            Controlled::Stopped => Ok(DriveOutcome::Terminal),
+        }
+    }
+
+    fn drive_receive_ready_until_idle_controlled(
+        &mut self,
+        stop: Option<&AtomicBool>,
+    ) -> Result<Controlled<DriveOutcome>, DriverError> {
+        if stop_requested(stop) {
+            return Ok(Controlled::Stopped);
+        }
         if self.store.is_terminal() {
-            return Ok(DriveOutcome::Terminal);
+            return Ok(Controlled::Value(DriveOutcome::Terminal));
         }
 
         let mut outcome = DriveOutcome::Idle;
         loop {
+            if stop_requested(stop) {
+                return Ok(Controlled::Stopped);
+            }
             match self.send_core.try_poll_response() {
                 Ok(TransportPoll::Response(response)) => {
                     let response_outcome = self.finish_polled_response(response)?;
                     if response_outcome == DriveOutcome::Terminal {
-                        return Ok(response_outcome);
+                        return Ok(Controlled::Value(response_outcome));
                     }
                     if response_outcome != DriveOutcome::Idle {
                         outcome = response_outcome;
@@ -1171,8 +1226,8 @@ impl<Q: PublicationLog, T: ManualDriverTransport> ManualDriverPrototype<Q, T> {
                         outcome = DriveOutcome::Progress;
                     }
                 }
-                Ok(TransportPoll::Idle) => return Ok(outcome),
-                Err(failure) => return self.apply_transport_failure(failure),
+                Ok(TransportPoll::Idle) => return Ok(Controlled::Value(outcome)),
+                Err(failure) => return self.apply_transport_failure_controlled(failure, stop),
             }
         }
     }
@@ -1190,35 +1245,64 @@ impl<Q: PublicationLog, T: ManualDriverTransport> ManualDriverPrototype<Q, T> {
     }
 
     fn drive_durable_ack_keepalive_once(&mut self) -> Result<DriveOutcome, DriverError> {
+        match self.drive_durable_ack_keepalive_once_controlled(None)? {
+            Controlled::Value(outcome) => Ok(outcome),
+            Controlled::Stopped => Ok(DriveOutcome::Terminal),
+        }
+    }
+
+    fn drive_durable_ack_keepalive_once_controlled(
+        &mut self,
+        stop: Option<&AtomicBool>,
+    ) -> Result<Controlled<DriveOutcome>, DriverError> {
+        if stop_requested(stop) {
+            return Ok(Controlled::Stopped);
+        }
         let durable_ack_pending = self.store.has_pending_durable_ack();
         match self
             .send_core
             .send_durable_ack_keepalive_if_due(durable_ack_pending)
         {
-            Ok(true) => Ok(DriveOutcome::Idle),
-            Ok(false) => Ok(DriveOutcome::Idle),
-            Err(failure) => self.apply_transport_failure(failure),
+            Ok(true) | Ok(false) => Ok(Controlled::Value(DriveOutcome::Idle)),
+            Err(failure) => self.apply_transport_failure_controlled(failure, stop),
         }
     }
 
     fn drive_send_available(&mut self) -> Result<Option<DriveOutcome>, DriverError> {
+        match self.drive_send_available_controlled(None)? {
+            Controlled::Value(outcome) => Ok(outcome),
+            Controlled::Stopped => Ok(Some(DriveOutcome::Terminal)),
+        }
+    }
+
+    fn drive_send_available_controlled(
+        &mut self,
+        stop: Option<&AtomicBool>,
+    ) -> Result<Controlled<Option<DriveOutcome>>, DriverError> {
+        if stop_requested(stop) {
+            return Ok(Controlled::Stopped);
+        }
         let Some(outbound) = self.send_core.next_outbound_frame(&mut self.store)? else {
-            return Ok(None);
+            return Ok(Controlled::Value(None));
         };
 
         let (frame, send_result) = self.send_core.send_frame(outbound);
         let send_result = match send_result {
             Ok(result) => result,
-            Err(failure) => return self.apply_transport_failure(failure).map(Some),
+            Err(failure) => {
+                return Ok(self
+                    .apply_transport_failure_controlled(failure, stop)?
+                    .map(Some));
+            }
         };
         match self
             .send_core
             .finish_send_result(&mut self.store, frame, send_result)?
         {
-            QwpWsSendProgress::Outcome(outcome) => Ok(Some(outcome)),
-            QwpWsSendProgress::TransportFailure(failure) => {
-                self.apply_transport_failure(failure).map(Some)
-            }
+            QwpWsSendProgress::Outcome(outcome) => Ok(Controlled::Value(Some(outcome))),
+            QwpWsSendProgress::TransportFailure(failure) => Ok(self
+                .apply_transport_failure_controlled(failure, stop)?
+                .map(Some)),
         }
     }
 
@@ -1293,6 +1377,55 @@ impl<Q: PublicationLog, T: ManualDriverTransport> ManualDriverPrototype<Q, T> {
         }
     }
 
+    pub(crate) fn close_drain_ready_step(&mut self) -> Result<CloseStepOutcome, DriverError> {
+        self.close_drain_ready_step_controlled(None)
+    }
+
+    pub(crate) fn close_drain_ready_step_with_stop(
+        &mut self,
+        stop: &AtomicBool,
+    ) -> Result<CloseStepOutcome, DriverError> {
+        self.close_drain_ready_step_controlled(Some(stop))
+    }
+
+    fn close_drain_ready_step_controlled(
+        &mut self,
+        stop: Option<&AtomicBool>,
+    ) -> Result<CloseStepOutcome, DriverError> {
+        self.store.set_closing();
+
+        if stop_requested(stop) {
+            return Ok(CloseStepOutcome::Stopped);
+        }
+        if self.store.is_terminal() {
+            return Ok(CloseStepOutcome::Terminal);
+        }
+        if self.store.all_published_receipts_resolved() {
+            self.store.close_queue()?;
+            return Ok(CloseStepOutcome::Drained);
+        }
+
+        let outcome = match self.drive_once_controlled(stop)? {
+            Controlled::Value(outcome) => outcome,
+            Controlled::Stopped => return Ok(CloseStepOutcome::Stopped),
+        };
+        if outcome == DriveOutcome::Terminal {
+            return Ok(CloseStepOutcome::Terminal);
+        }
+        if self.store.is_terminal() {
+            return Ok(CloseStepOutcome::Terminal);
+        }
+        if self.store.all_published_receipts_resolved() {
+            self.store.close_queue()?;
+            return Ok(CloseStepOutcome::Drained);
+        }
+        if outcome == DriveOutcome::Idle {
+            Ok(CloseStepOutcome::Idle)
+        } else {
+            Ok(CloseStepOutcome::Progress)
+        }
+    }
+
     pub(crate) fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus {
         self.send_core.receipt_status(&self.store, receipt)
     }
@@ -1345,6 +1478,17 @@ impl<Q: PublicationLog, T: ManualDriverTransport> ManualDriverPrototype<Q, T> {
         &mut self,
         failure: TransportFailure,
     ) -> Result<DriveOutcome, DriverError> {
+        match self.apply_transport_failure_controlled(failure, None)? {
+            Controlled::Value(outcome) => Ok(outcome),
+            Controlled::Stopped => Ok(DriveOutcome::Terminal),
+        }
+    }
+
+    fn apply_transport_failure_controlled(
+        &mut self,
+        failure: TransportFailure,
+        stop: Option<&AtomicBool>,
+    ) -> Result<Controlled<DriveOutcome>, DriverError> {
         match self
             .send_core
             .transport_failure_action(&mut self.store, failure)
@@ -1352,10 +1496,10 @@ impl<Q: PublicationLog, T: ManualDriverTransport> ManualDriverPrototype<Q, T> {
             QwpWsTransportFailureAction::Reconnect {
                 reason,
                 initial_error,
-            } => self.reconnect_with_policy(reason, initial_error),
+            } => self.reconnect_with_policy_controlled(reason, initial_error, stop),
             QwpWsTransportFailureAction::Terminal(error) => {
                 self.store.mark_terminal(Some(error));
-                Ok(DriveOutcome::Terminal)
+                Ok(Controlled::Value(DriveOutcome::Terminal))
             }
         }
     }
@@ -1365,20 +1509,33 @@ impl<Q: PublicationLog, T: ManualDriverTransport> ManualDriverPrototype<Q, T> {
         reason: ReconnectReason,
         initial_error: Error,
     ) -> Result<DriveOutcome, DriverError> {
+        match self.reconnect_with_policy_controlled(reason, initial_error, None)? {
+            Controlled::Value(outcome) => Ok(outcome),
+            Controlled::Stopped => Ok(DriveOutcome::Terminal),
+        }
+    }
+
+    fn reconnect_with_policy_controlled(
+        &mut self,
+        reason: ReconnectReason,
+        initial_error: Error,
+        stop: Option<&AtomicBool>,
+    ) -> Result<Controlled<DriveOutcome>, DriverError> {
         match self.send_core.reconnect_transport_with_policy(
             reason,
             initial_error,
-            || false,
-            sleep_before_reconnect,
+            || stop_requested(stop),
+            |deadline, backoff| sleep_before_reconnect_controlled(deadline, backoff, stop),
         )? {
-            QwpWsReconnectProgress::Reconnected { reason } => Ok(self
-                .send_core
-                .finish_reconnect_success(&mut self.store, reason)),
+            QwpWsReconnectProgress::Reconnected { reason } => Ok(Controlled::Value(
+                self.send_core
+                    .finish_reconnect_success(&mut self.store, reason),
+            )),
             QwpWsReconnectProgress::Terminal(error) => {
                 self.store.mark_terminal(Some(error));
-                Ok(DriveOutcome::Terminal)
+                Ok(Controlled::Value(DriveOutcome::Terminal))
             }
-            QwpWsReconnectProgress::Stopped => Ok(DriveOutcome::Terminal),
+            QwpWsReconnectProgress::Stopped => Ok(Controlled::Stopped),
         }
     }
 
@@ -1409,6 +1566,10 @@ fn reconnect_deadline_expired(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|deadline| Instant::now() >= deadline)
 }
 
+fn stop_requested(stop: Option<&AtomicBool>) -> bool {
+    stop.is_some_and(|stop| stop.load(Ordering::Acquire))
+}
+
 fn sleep_before_reconnect(deadline: Option<Instant>, backoff: Duration) -> bool {
     if backoff.is_zero() {
         return !reconnect_deadline_expired(deadline);
@@ -1426,6 +1587,42 @@ fn sleep_before_reconnect(deadline: Option<Instant>, backoff: Duration) -> bool 
     };
     std::thread::sleep(sleep_for);
     !reconnect_deadline_expired(deadline)
+}
+
+fn sleep_before_reconnect_controlled(
+    deadline: Option<Instant>,
+    backoff: Duration,
+    stop: Option<&AtomicBool>,
+) -> bool {
+    let Some(stop) = stop else {
+        return sleep_before_reconnect(deadline, backoff);
+    };
+    if stop.load(Ordering::Acquire) {
+        return false;
+    }
+    if backoff.is_zero() {
+        return !reconnect_deadline_expired(deadline) && !stop.load(Ordering::Acquire);
+    }
+
+    let sleep_for = match deadline {
+        Some(deadline) => {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            backoff.min(remaining)
+        }
+        None => backoff,
+    };
+    let sleep_start = Instant::now();
+    while !stop.load(Ordering::Acquire) {
+        let remaining = sleep_for.saturating_sub(sleep_start.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(50)));
+    }
+    !stop.load(Ordering::Acquire) && !reconnect_deadline_expired(deadline)
 }
 
 fn double_duration(duration: Duration) -> Duration {
@@ -2182,6 +2379,15 @@ pub(crate) enum CloseOutcome {
     Drained,
     Timeout,
     Terminal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CloseStepOutcome {
+    Drained,
+    Terminal,
+    Progress,
+    Idle,
+    Stopped,
 }
 
 #[derive(Debug, Clone, PartialEq)]
