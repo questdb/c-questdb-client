@@ -34,8 +34,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::ingress::{
-    Buffer, Protocol, QwpWsEncodeScratch, QwpWsErrorCategory, QwpWsErrorPolicy, QwpWsProgress,
-    SenderBuilder, SymbolGlobalDict,
+    Buffer, ColumnName, Protocol, QwpWsEncodeScratch, QwpWsErrorCategory, QwpWsErrorPolicy,
+    QwpWsProgress, SenderBuilder, SymbolGlobalDict, TableName, TimestampNanos,
 };
 
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -44,6 +44,9 @@ const QWP_STATUS_OK: u8 = 0x00;
 const QWP_STATUS_DURABLE_ACK: u8 = 0x02;
 const QWP_STATUS_SCHEMA_MISMATCH: u8 = 0x03;
 const QWP_STATUS_PARSE_ERROR: u8 = 0x05;
+const QWP_WS_PUBLIC_BENCH_DEFAULT_ROWS: usize = 20_000_000;
+const QWP_WS_PUBLIC_BENCH_DEFAULT_BATCH_SIZE: usize = 1000;
+const QWP_WS_PUBLIC_BENCH_DEFAULT_IN_FLIGHT: usize = 128;
 
 // ---------- mock server ----------
 
@@ -396,6 +399,48 @@ fn spawn_mock_server() -> (u16, mpsc::Receiver<MockResult>) {
     (port, rx)
 }
 
+fn spawn_ack_each_frame_server() -> (u16, thread::JoinHandle<usize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        perform_server_upgrade(&mut stream).unwrap();
+
+        let mut next_wire_seq = FIRST_WIRE_SEQUENCE;
+        let mut binary_frames = 0usize;
+        loop {
+            match read_frame(&mut stream) {
+                Ok((_fin, 0x2, _payload)) => {
+                    write_qwp_ok_response(&mut stream, next_wire_seq).unwrap();
+                    next_wire_seq += 1;
+                    binary_frames += 1;
+                }
+                Ok((_fin, 0x8, _payload)) => break,
+                Ok((_fin, 0x9, payload)) => {
+                    write_server_frame(&mut stream, 0xA, &payload, false).unwrap();
+                }
+                Ok((_fin, _opcode, _payload)) => {}
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::UnexpectedEof
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::BrokenPipe
+                    ) =>
+                {
+                    break;
+                }
+                Err(err) => panic!("benchmark ACK server failed to read frame: {err}"),
+            }
+        }
+        binary_frames
+    });
+
+    (port, handle)
+}
+
 fn spawn_upgrade_only_server() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -417,6 +462,175 @@ fn qwp_ws_replay_encoded_len(buf: &Buffer) -> usize {
         .encode_ws_replay_message(&mut scratch, &mut global_dict, 1)
         .unwrap();
     scratch.message.len()
+}
+
+fn qwp_ws_public_bench_env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn qwp_ws_public_bench_env_bool(name: &str) -> bool {
+    matches!(
+        std::env::var(name).as_deref(),
+        Ok("1" | "on" | "true" | "yes")
+    )
+}
+
+#[derive(Clone, Copy)]
+enum QwpWsPublicBenchWorkload {
+    Base,
+    Numeric,
+    Symbol,
+    String,
+    Full,
+}
+
+impl QwpWsPublicBenchWorkload {
+    fn from_env() -> Self {
+        match std::env::var("QWP_WS_PUBLIC_BENCH_WORKLOAD")
+            .unwrap_or_else(|_| "full".to_string())
+            .as_str()
+        {
+            "base" => Self::Base,
+            "numeric" => Self::Numeric,
+            "symbol" => Self::Symbol,
+            "string" => Self::String,
+            "full" => Self::Full,
+            other => panic!("unknown QWP_WS_PUBLIC_BENCH_WORKLOAD: {other}"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Base => "base",
+            Self::Numeric => "numeric",
+            Self::Symbol => "symbol",
+            Self::String => "string",
+            Self::Full => "full",
+        }
+    }
+}
+
+fn fill_qwp_ws_public_benchmark_batch(
+    buffer: &mut Buffer,
+    workload: QwpWsPublicBenchWorkload,
+    prevalidated_names: bool,
+    batch_idx: usize,
+    batch_size: usize,
+    rows_in_batch: usize,
+) {
+    const SYMBOLS: [&str; 8] = [
+        "SYM000", "SYM001", "SYM002", "SYM003", "SYM004", "SYM005", "SYM006", "SYM007",
+    ];
+    const VENUES: [&str; 8] = ["ldn", "nyc", "ams", "fra", "sin", "hkg", "tyo", "sfo"];
+
+    for row_idx in 0..rows_in_batch {
+        let seq = (batch_idx * batch_size + row_idx) as i64;
+        match workload {
+            QwpWsPublicBenchWorkload::Base => {
+                bench_table(buffer, prevalidated_names).unwrap();
+                bench_qty(buffer, prevalidated_names, seq).unwrap();
+                buffer.at(TimestampNanos::new(seq)).unwrap();
+            }
+            QwpWsPublicBenchWorkload::Numeric => {
+                bench_table(buffer, prevalidated_names).unwrap();
+                bench_qty(buffer, prevalidated_names, seq).unwrap();
+                bench_px(buffer, prevalidated_names, 100.0 + (seq & 1023) as f64).unwrap();
+                buffer.at(TimestampNanos::new(seq)).unwrap();
+            }
+            QwpWsPublicBenchWorkload::Symbol => {
+                bench_table(buffer, prevalidated_names).unwrap();
+                bench_symbol(buffer, prevalidated_names, SYMBOLS[row_idx & 7]).unwrap();
+                bench_qty(buffer, prevalidated_names, seq).unwrap();
+                buffer.at(TimestampNanos::new(seq)).unwrap();
+            }
+            QwpWsPublicBenchWorkload::String => {
+                bench_table(buffer, prevalidated_names).unwrap();
+                bench_qty(buffer, prevalidated_names, seq).unwrap();
+                bench_venue(buffer, prevalidated_names, VENUES[row_idx & 7]).unwrap();
+                buffer.at(TimestampNanos::new(seq)).unwrap();
+            }
+            QwpWsPublicBenchWorkload::Full => {
+                bench_table(buffer, prevalidated_names).unwrap();
+                bench_symbol(buffer, prevalidated_names, SYMBOLS[row_idx & 7]).unwrap();
+                bench_qty(buffer, prevalidated_names, seq).unwrap();
+                bench_px(buffer, prevalidated_names, 100.0 + (seq & 1023) as f64).unwrap();
+                bench_venue(buffer, prevalidated_names, VENUES[row_idx & 7]).unwrap();
+                bench_event_ts(buffer, prevalidated_names, TimestampNanos::new(seq)).unwrap();
+                buffer.at(TimestampNanos::new(seq)).unwrap();
+            }
+        }
+    }
+}
+
+fn bench_table(buffer: &mut Buffer, prevalidated_names: bool) -> crate::Result<&mut Buffer> {
+    if prevalidated_names {
+        buffer.table(TableName::new_unchecked("trades"))
+    } else {
+        buffer.table("trades")
+    }
+}
+
+fn bench_symbol<'a>(
+    buffer: &'a mut Buffer,
+    prevalidated_names: bool,
+    value: &str,
+) -> crate::Result<&'a mut Buffer> {
+    if prevalidated_names {
+        buffer.symbol(ColumnName::new_unchecked("sym"), value)
+    } else {
+        buffer.symbol("sym", value)
+    }
+}
+
+fn bench_qty(
+    buffer: &mut Buffer,
+    prevalidated_names: bool,
+    value: i64,
+) -> crate::Result<&mut Buffer> {
+    if prevalidated_names {
+        buffer.column_i64(ColumnName::new_unchecked("qty"), value)
+    } else {
+        buffer.column_i64("qty", value)
+    }
+}
+
+fn bench_px(
+    buffer: &mut Buffer,
+    prevalidated_names: bool,
+    value: f64,
+) -> crate::Result<&mut Buffer> {
+    if prevalidated_names {
+        buffer.column_f64(ColumnName::new_unchecked("px"), value)
+    } else {
+        buffer.column_f64("px", value)
+    }
+}
+
+fn bench_venue<'a>(
+    buffer: &'a mut Buffer,
+    prevalidated_names: bool,
+    value: &str,
+) -> crate::Result<&'a mut Buffer> {
+    if prevalidated_names {
+        buffer.column_str(ColumnName::new_unchecked("venue"), value)
+    } else {
+        buffer.column_str("venue", value)
+    }
+}
+
+fn bench_event_ts(
+    buffer: &mut Buffer,
+    prevalidated_names: bool,
+    value: TimestampNanos,
+) -> crate::Result<&mut Buffer> {
+    if prevalidated_names {
+        buffer.column_ts(ColumnName::new_unchecked("event_ts"), value)
+    } else {
+        buffer.column_ts("event_ts", value)
+    }
 }
 
 fn no_symbol_frame_at_local_hint_overcount_boundary(max: usize) -> Buffer {
@@ -738,6 +952,115 @@ fn qwp_ws_sender_fsn_watermarks_and_close_drain_work_in_background_mode() {
 
     let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(result.received_frames.len(), 1);
+}
+
+/// Run with:
+/// `QWP_WS_PUBLIC_BENCH_ROWS=20000000 cargo test --release --manifest-path questdb-rs/Cargo.toml --features sync-sender-qwp-ws qwp_ws_public_sender_batch_throughput_benchmark --lib -- --ignored --nocapture --test-threads=1`
+#[test]
+#[ignore = "performance benchmark"]
+fn qwp_ws_public_sender_batch_throughput_benchmark() {
+    let rows =
+        qwp_ws_public_bench_env_usize("QWP_WS_PUBLIC_BENCH_ROWS", QWP_WS_PUBLIC_BENCH_DEFAULT_ROWS);
+    let batch_size = qwp_ws_public_bench_env_usize(
+        "QWP_WS_PUBLIC_BENCH_BATCH_SIZE",
+        QWP_WS_PUBLIC_BENCH_DEFAULT_BATCH_SIZE,
+    );
+    let in_flight = qwp_ws_public_bench_env_usize(
+        "QWP_WS_PUBLIC_BENCH_IN_FLIGHT",
+        QWP_WS_PUBLIC_BENCH_DEFAULT_IN_FLIGHT,
+    );
+    let workload = QwpWsPublicBenchWorkload::from_env();
+    let prevalidated_names = qwp_ws_public_bench_env_bool("QWP_WS_PUBLIC_BENCH_PREVALIDATED_NAMES");
+    assert!(rows > 0);
+    assert!(batch_size > 0);
+    assert!(in_flight > 1);
+
+    let (port, server) = spawn_ack_each_frame_server();
+    let conf = format!("qwpws::addr=127.0.0.1:{port};in_flight_window={in_flight};");
+    let mut sender = SenderBuilder::from_conf(conf).unwrap().build().unwrap();
+    let mut buffer = sender.new_buffer();
+
+    fill_qwp_ws_public_benchmark_batch(
+        &mut buffer,
+        workload,
+        prevalidated_names,
+        0,
+        batch_size,
+        batch_size,
+    );
+    sender.flush(&mut buffer).unwrap();
+
+    let started = Instant::now();
+    let mut build_elapsed = Duration::ZERO;
+    let mut flush_elapsed = Duration::ZERO;
+    let mut published_rows = 0usize;
+    let mut batch_idx = 0usize;
+    while published_rows < rows {
+        let rows_in_batch = (rows - published_rows).min(batch_size);
+
+        let build_started = Instant::now();
+        fill_qwp_ws_public_benchmark_batch(
+            &mut buffer,
+            workload,
+            prevalidated_names,
+            batch_idx,
+            batch_size,
+            rows_in_batch,
+        );
+        build_elapsed += build_started.elapsed();
+
+        let flush_started = Instant::now();
+        sender.flush(&mut buffer).unwrap();
+        flush_elapsed += flush_started.elapsed();
+
+        published_rows += rows_in_batch;
+        batch_idx += 1;
+    }
+
+    let close_started = Instant::now();
+    sender.close_drain().unwrap();
+    let close_elapsed = close_started.elapsed();
+    let elapsed = started.elapsed();
+    drop(sender);
+
+    let binary_frames = server.join().unwrap();
+    let expected_frames = rows.div_ceil(batch_size) + 1;
+    assert_eq!(binary_frames, expected_frames);
+
+    eprintln!(
+        "qwp_ws_public_sender_batch_throughput workload={} prevalidated_names={} rows={} batch_size={} in_flight_window={} frames={} total_ms={} build_ms={} flush_ms={} close_ms={} rows_per_sec={:.2}",
+        workload.as_str(),
+        prevalidated_names,
+        rows,
+        batch_size,
+        in_flight,
+        binary_frames,
+        elapsed.as_millis(),
+        build_elapsed.as_millis(),
+        flush_elapsed.as_millis(),
+        close_elapsed.as_millis(),
+        rows as f64 / elapsed.as_secs_f64()
+    );
+    eprintln!(
+        "qwp_ws_public_sender_batch_build workload={} prevalidated_names={} rows={} batch_size={} in_flight_window={} elapsed_ms={} rows_per_sec={:.2}",
+        workload.as_str(),
+        prevalidated_names,
+        rows,
+        batch_size,
+        in_flight,
+        build_elapsed.as_millis(),
+        rows as f64 / build_elapsed.as_secs_f64()
+    );
+    eprintln!(
+        "qwp_ws_public_sender_batch_flush workload={} prevalidated_names={} rows={} batch_size={} in_flight_window={} elapsed_ms={} rows_per_sec={:.2}",
+        workload.as_str(),
+        prevalidated_names,
+        rows,
+        batch_size,
+        in_flight,
+        flush_elapsed.as_millis(),
+        rows as f64 / flush_elapsed.as_secs_f64()
+    );
 }
 
 #[test]

@@ -492,9 +492,10 @@ impl Buffer {
     ///
     /// Every row must begin with a table name. See [`Buffer`] for the full call
     /// sequence.
+    #[inline(always)]
     pub fn table<'a, N>(&mut self, name: N) -> crate::Result<&mut Self>
     where
-        N: TryInto<TableName<'a>>,
+        N: AsRef<str> + TryInto<TableName<'a>>,
         Error: From<N::Error>,
     {
         match &mut self.inner {
@@ -516,9 +517,10 @@ impl Buffer {
     /// Adds a symbol column to the current row.
     ///
     /// All symbol columns must be recorded before any non-symbol columns.
+    #[inline(always)]
     pub fn symbol<'a, N, S>(&mut self, name: N, value: S) -> crate::Result<&mut Self>
     where
-        N: TryInto<ColumnName<'a>>,
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
         S: AsRef<str>,
         Error: From<N::Error>,
     {
@@ -541,7 +543,7 @@ impl Buffer {
     /// Adds a symbol column if `value` is `Some`; otherwise leaves the row unchanged.
     pub fn symbol_opt<'a, N, S>(&mut self, name: N, value: Option<S>) -> crate::Result<&mut Self>
     where
-        N: TryInto<ColumnName<'a>>,
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
         S: AsRef<str>,
         Error: From<N::Error>,
     {
@@ -555,7 +557,7 @@ impl Buffer {
     /// Adds a boolean column to the current row.
     pub fn column_bool<'a, N>(&mut self, name: N, value: bool) -> crate::Result<&mut Self>
     where
-        N: TryInto<ColumnName<'a>>,
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
         Error: From<N::Error>,
     {
         match &mut self.inner {
@@ -581,7 +583,7 @@ impl Buffer {
         value: Option<bool>,
     ) -> crate::Result<&mut Self>
     where
-        N: TryInto<ColumnName<'a>>,
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
         Error: From<N::Error>,
     {
         if let Some(value) = value {
@@ -592,9 +594,10 @@ impl Buffer {
     }
 
     /// Adds an integer column to the current row.
+    #[inline(always)]
     pub fn column_i64<'a, N>(&mut self, name: N, value: i64) -> crate::Result<&mut Self>
     where
-        N: TryInto<ColumnName<'a>>,
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
         Error: From<N::Error>,
     {
         match &mut self.inner {
@@ -616,7 +619,7 @@ impl Buffer {
     /// Adds an integer column if `value` is `Some`; otherwise leaves the row unchanged.
     pub fn column_i64_opt<'a, N>(&mut self, name: N, value: Option<i64>) -> crate::Result<&mut Self>
     where
-        N: TryInto<ColumnName<'a>>,
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
         Error: From<N::Error>,
     {
         if let Some(value) = value {
@@ -627,9 +630,10 @@ impl Buffer {
     }
 
     /// Adds a floating-point column to the current row.
+    #[inline(always)]
     pub fn column_f64<'a, N>(&mut self, name: N, value: f64) -> crate::Result<&mut Self>
     where
-        N: TryInto<ColumnName<'a>>,
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
         Error: From<N::Error>,
     {
         match &mut self.inner {
@@ -651,7 +655,7 @@ impl Buffer {
     /// Adds a floating-point column if `value` is `Some`; otherwise leaves the row unchanged.
     pub fn column_f64_opt<'a, N>(&mut self, name: N, value: Option<f64>) -> crate::Result<&mut Self>
     where
-        N: TryInto<ColumnName<'a>>,
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
         Error: From<N::Error>,
     {
         if let Some(value) = value {
@@ -662,9 +666,10 @@ impl Buffer {
     }
 
     /// Adds a string column to the current row.
+    #[inline(always)]
     pub fn column_str<'a, N, S>(&mut self, name: N, value: S) -> crate::Result<&mut Self>
     where
-        N: TryInto<ColumnName<'a>>,
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
         S: AsRef<str>,
         Error: From<N::Error>,
     {
@@ -691,7 +696,7 @@ impl Buffer {
         value: Option<S>,
     ) -> crate::Result<&mut Self>
     where
-        N: TryInto<ColumnName<'a>>,
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
         S: AsRef<str>,
         Error: From<N::Error>,
     {
@@ -709,7 +714,7 @@ impl Buffer {
     /// nullable DECIMAL256 columns on the wire.
     pub fn column_dec<'a, N, S>(&mut self, name: N, value: S) -> crate::Result<&mut Self>
     where
-        N: TryInto<ColumnName<'a>>,
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
         S: TryInto<DecimalView<'a>>,
         Error: From<N::Error>,
         Error: From<S::Error>,
@@ -737,7 +742,7 @@ impl Buffer {
         value: Option<S>,
     ) -> crate::Result<&mut Self>
     where
-        N: TryInto<ColumnName<'a>>,
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
         S: TryInto<DecimalView<'a>>,
         Error: From<N::Error>,
         Error: From<S::Error>,
@@ -756,7 +761,7 @@ impl Buffer {
     /// supports `f64` arrays.
     pub fn column_arr<'a, N, T, D>(&mut self, name: N, view: &T) -> crate::Result<&mut Self>
     where
-        N: TryInto<ColumnName<'a>>,
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
         T: NdArrayView<D>,
         D: ArrayElement + ArrayElementSealed,
         Error: From<N::Error>,
@@ -785,7 +790,7 @@ impl Buffer {
         value: Option<&T>,
     ) -> crate::Result<&mut Self>
     where
-        N: TryInto<ColumnName<'a>>,
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
         T: NdArrayView<D>,
         D: ArrayElement + ArrayElementSealed,
         Error: From<N::Error>,
@@ -800,9 +805,10 @@ impl Buffer {
     /// Adds a timestamp column to the current row.
     ///
     /// Accepts either microsecond or nanosecond timestamps.
+    #[inline(always)]
     pub fn column_ts<'a, N, T>(&mut self, name: N, value: T) -> crate::Result<&mut Self>
     where
-        N: TryInto<ColumnName<'a>>,
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
         T: TryInto<Timestamp>,
         Error: From<N::Error>,
         Error: From<T::Error>,
@@ -826,7 +832,7 @@ impl Buffer {
     /// Adds a timestamp column if `value` is `Some`; otherwise leaves the row unchanged.
     pub fn column_ts_opt<'a, N, T>(&mut self, name: N, value: Option<T>) -> crate::Result<&mut Self>
     where
-        N: TryInto<ColumnName<'a>>,
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
         T: TryInto<Timestamp>,
         Error: From<N::Error>,
         Error: From<T::Error>,
@@ -842,6 +848,7 @@ impl Buffer {
     ///
     /// After this call you may begin the next row with [`Buffer::table`] or
     /// flush the buffer. Accepts either microsecond or nanosecond timestamps.
+    #[inline(always)]
     pub fn at<T>(&mut self, timestamp: T) -> crate::Result<()>
     where
         T: TryInto<Timestamp>,
@@ -861,6 +868,7 @@ impl Buffer {
     ///
     /// This is not equivalent to calling [`Buffer::at`] with the current client
     /// time.
+    #[inline(always)]
     pub fn at_now(&mut self) -> crate::Result<()> {
         match &mut self.inner {
             BufferInner::Ilp(inner) => inner.at_now(),

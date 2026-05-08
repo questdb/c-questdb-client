@@ -31,6 +31,8 @@ use crate::ingress::ndarr::{self, ArrayElementSealed};
 use crate::ingress::{ArrayElement, MAX_ARRAY_DIMS, NdArrayView, Timestamp};
 use std::collections::hash_map::RandomState;
 use std::fmt::Debug;
+#[cfg(feature = "_sender-qwp-ws")]
+use std::hash::BuildHasherDefault;
 use std::hash::{BuildHasher, Hash, Hasher};
 
 use super::ilp::{ColumnName, TableName};
@@ -1242,6 +1244,7 @@ impl QwpBuffer {
         Ok(())
     }
 
+    #[inline(always)]
     pub(crate) fn table<'a, N>(&mut self, name: N) -> crate::Result<&mut Self>
     where
         N: TryInto<TableName<'a>>,
@@ -1266,6 +1269,7 @@ impl QwpBuffer {
         Ok(self)
     }
 
+    #[inline(always)]
     pub(crate) fn symbol<'a, N, S>(&mut self, name: N, value: S) -> crate::Result<&mut Self>
     where
         N: TryInto<ColumnName<'a>>,
@@ -1286,6 +1290,7 @@ impl QwpBuffer {
         Ok(self)
     }
 
+    #[inline(always)]
     pub(crate) fn column_bool<'a, N>(&mut self, name: N, value: bool) -> crate::Result<&mut Self>
     where
         N: TryInto<ColumnName<'a>>,
@@ -1304,6 +1309,7 @@ impl QwpBuffer {
         Ok(self)
     }
 
+    #[inline(always)]
     pub(crate) fn column_i64<'a, N>(&mut self, name: N, value: i64) -> crate::Result<&mut Self>
     where
         N: TryInto<ColumnName<'a>>,
@@ -1322,6 +1328,7 @@ impl QwpBuffer {
         Ok(self)
     }
 
+    #[inline(always)]
     pub(crate) fn column_f64<'a, N>(&mut self, name: N, value: f64) -> crate::Result<&mut Self>
     where
         N: TryInto<ColumnName<'a>>,
@@ -1340,6 +1347,7 @@ impl QwpBuffer {
         Ok(self)
     }
 
+    #[inline(always)]
     pub(crate) fn column_str<'a, N, S>(&mut self, name: N, value: S) -> crate::Result<&mut Self>
     where
         N: TryInto<ColumnName<'a>>,
@@ -1407,6 +1415,7 @@ impl QwpBuffer {
         Ok(self)
     }
 
+    #[inline(always)]
     pub(crate) fn column_ts<'a, N, T>(&mut self, name: N, value: T) -> crate::Result<&mut Self>
     where
         N: TryInto<ColumnName<'a>>,
@@ -1432,6 +1441,7 @@ impl QwpBuffer {
         Ok(self)
     }
 
+    #[inline(always)]
     pub(crate) fn at<T>(&mut self, timestamp: T) -> crate::Result<()>
     where
         T: TryInto<Timestamp>,
@@ -1453,6 +1463,7 @@ impl QwpBuffer {
         self.commit_current_row(Some(to_designated_ts(timestamp)))
     }
 
+    #[inline(always)]
     pub(crate) fn at_now(&mut self) -> crate::Result<()> {
         self.check_op(Op::At)?;
         self.commit_current_row(None)
@@ -1840,6 +1851,143 @@ struct QwpWsMarker {
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
+type QwpWsSymbolHashMap<V> =
+    std::collections::HashMap<Vec<u8>, V, BuildHasherDefault<QwpWsSymbolHasher>>;
+
+#[cfg(feature = "_sender-qwp-ws")]
+const QWP_WS_SYMBOL_HASH_OFFSET: u64 = 0xcbf29ce484222325;
+
+#[cfg(feature = "_sender-qwp-ws")]
+const QWP_WS_SYMBOL_HASH_PRIME: u64 = 0x100000001b3;
+
+#[cfg(feature = "_sender-qwp-ws")]
+fn qwp_ws_symbol_hash(bytes: &[u8]) -> u64 {
+    qwp_ws_symbol_hash_with_seed(QWP_WS_SYMBOL_HASH_OFFSET, bytes)
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+fn qwp_ws_symbol_hash_with_seed(mut hash: u64, bytes: &[u8]) -> u64 {
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(QWP_WS_SYMBOL_HASH_PRIME);
+    }
+    hash
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+#[derive(Clone, Debug)]
+struct QwpWsSymbolHasher(u64);
+
+#[cfg(feature = "_sender-qwp-ws")]
+impl Default for QwpWsSymbolHasher {
+    fn default() -> Self {
+        Self(QWP_WS_SYMBOL_HASH_OFFSET)
+    }
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+impl Hasher for QwpWsSymbolHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        self.0 = qwp_ws_symbol_hash_with_seed(self.0, bytes);
+    }
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+type QwpWsLocalSymbolHashMap =
+    std::collections::HashMap<u64, QwpWsLocalSymbolBucket, BuildHasherDefault<QwpWsU64Hasher>>;
+
+#[cfg(feature = "_sender-qwp-ws")]
+#[derive(Clone, Debug, Default)]
+struct QwpWsU64Hasher(u64);
+
+#[cfg(feature = "_sender-qwp-ws")]
+impl Hasher for QwpWsU64Hasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let mut value = 0u64;
+        for (shift, &byte) in bytes.iter().take(8).enumerate() {
+            value |= u64::from(byte) << (shift * 8);
+        }
+        self.0 = value;
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value;
+    }
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+#[derive(Clone, Debug)]
+enum QwpWsLocalSymbolBucket {
+    One(u32),
+    Many(Vec<u32>),
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+#[derive(Clone, Debug, Default)]
+struct QwpWsLocalSymbolLookup {
+    buckets: QwpWsLocalSymbolHashMap,
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+impl QwpWsLocalSymbolLookup {
+    fn reserve(&mut self, additional: usize) {
+        self.buckets.reserve(additional);
+    }
+
+    fn clear(&mut self) {
+        self.buckets.clear();
+    }
+
+    fn get(&self, hash: u64, bytes: &[u8], dict: &[QwpWsSymbolEntry], data: &[u8]) -> Option<u32> {
+        match self.buckets.get(&hash)? {
+            QwpWsLocalSymbolBucket::One(local_id) => symbol_entry_bytes(dict, data, *local_id)
+                .filter(|stored| *stored == bytes)
+                .map(|_| *local_id),
+            QwpWsLocalSymbolBucket::Many(local_ids) => {
+                local_ids.iter().copied().find(|&local_id| {
+                    symbol_entry_bytes(dict, data, local_id).is_some_and(|stored| stored == bytes)
+                })
+            }
+        }
+    }
+
+    fn insert(&mut self, hash: u64, local_id: u32) {
+        use std::collections::hash_map::Entry;
+
+        match self.buckets.entry(hash) {
+            Entry::Vacant(entry) => {
+                entry.insert(QwpWsLocalSymbolBucket::One(local_id));
+            }
+            Entry::Occupied(mut entry) => match entry.get_mut() {
+                QwpWsLocalSymbolBucket::One(existing) => {
+                    let existing = *existing;
+                    *entry.get_mut() = QwpWsLocalSymbolBucket::Many(vec![existing, local_id]);
+                }
+                QwpWsLocalSymbolBucket::Many(local_ids) => local_ids.push(local_id),
+            },
+        }
+    }
+
+    fn retain_local_ids_below(&mut self, dict_len: usize) {
+        self.buckets.retain(|_, bucket| match bucket {
+            QwpWsLocalSymbolBucket::One(local_id) => (*local_id as usize) < dict_len,
+            QwpWsLocalSymbolBucket::Many(local_ids) => {
+                local_ids.retain(|local_id| (*local_id as usize) < dict_len);
+                !local_ids.is_empty()
+            }
+        });
+    }
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
 #[derive(Clone, Debug)]
 struct QwpWsSnapshot {
     tables: Vec<QwpWsTableBuffer>,
@@ -1865,58 +2013,13 @@ struct QwpWsTableRollbackMark {
     in_progress_column_count: usize,
     column_access_cursor: usize,
     columns_len: usize,
-    column_marks: Vec<QwpWsColumnRollbackMark>,
-}
-
-#[cfg(feature = "_sender-qwp-ws")]
-#[derive(Clone, Debug)]
-struct QwpWsColumnRollbackMark {
-    last_written_row: Option<u32>,
-    non_null_count: u32,
-    values: QwpWsColumnValuesMark,
-}
-
-#[cfg(feature = "_sender-qwp-ws")]
-#[derive(Clone, Debug)]
-enum QwpWsColumnValuesMark {
-    Bool {
-        cells_len: usize,
-    },
-    I64 {
-        cells_len: usize,
-    },
-    F64 {
-        cells_len: usize,
-    },
-    TimestampMicros {
-        cells_len: usize,
-    },
-    TimestampNanos {
-        cells_len: usize,
-    },
-    String {
-        cells_len: usize,
-        data_len: usize,
-    },
-    Symbol {
-        cells_len: usize,
-        dict_len: usize,
-        data_len: usize,
-    },
-    Decimal {
-        cells_len: usize,
-        decimal_scale: u8,
-    },
-    DoubleArray {
-        cells_len: usize,
-        data_len: usize,
-    },
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
 #[derive(Clone, Debug)]
 struct QwpWsTableBuffer {
     table_name: Vec<u8>,
+    packed_table_name: u64,
     row_count: u32,
     in_progress: bool,
     in_progress_column_count: usize,
@@ -1930,6 +2033,8 @@ struct QwpWsTableBuffer {
 #[derive(Clone, Debug)]
 struct QwpWsColumnBuffer {
     name: Vec<u8>,
+    lower_ascii_name: Vec<u8>,
+    packed_lower_ascii_name: u64,
     kind: ColumnKind,
     last_written_row: Option<u32>,
     non_null_count: u32,
@@ -1961,7 +2066,7 @@ enum QwpWsColumnValues {
     Symbol {
         cells: Vec<QwpWsSymbolCell>,
         dict: Vec<QwpWsSymbolEntry>,
-        lookup: std::collections::HashMap<Vec<u8>, u32>,
+        lookup: QwpWsLocalSymbolLookup,
         data: Vec<u8>,
     },
     Decimal {
@@ -1994,6 +2099,7 @@ struct QwpWsSliceCell {
 struct QwpWsSymbolCell {
     row_idx: u32,
     local_id: u32,
+    is_new: bool,
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -2004,10 +2110,65 @@ struct QwpWsSymbolEntry {
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
+fn symbol_entry_bytes<'a>(
+    dict: &[QwpWsSymbolEntry],
+    data: &'a [u8],
+    local_id: u32,
+) -> Option<&'a [u8]> {
+    let entry = dict.get(local_id as usize)?;
+    let start = entry.offset as usize;
+    let end = entry.offset.checked_add(entry.len)? as usize;
+    data.get(start..end)
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
 #[derive(Clone, Copy, Debug)]
 struct QwpWsDecimalCell {
     row_idx: u32,
     value: Option<StoredQwpDecimal>,
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+fn pop_value_cell_for_row<T: Copy>(cells: &mut Vec<QwpWsCell<T>>, row_idx: u32) -> bool {
+    if cells.last().is_some_and(|cell| cell.row_idx == row_idx) {
+        cells.pop();
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+fn pop_slice_cell_for_row(cells: &mut Vec<QwpWsSliceCell>, row_idx: u32) -> Option<QwpWsSliceCell> {
+    if cells.last().is_some_and(|cell| cell.row_idx == row_idx) {
+        cells.pop()
+    } else {
+        None
+    }
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+fn pop_symbol_cell_for_row(
+    cells: &mut Vec<QwpWsSymbolCell>,
+    row_idx: u32,
+) -> Option<QwpWsSymbolCell> {
+    if cells.last().is_some_and(|cell| cell.row_idx == row_idx) {
+        cells.pop()
+    } else {
+        None
+    }
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+fn pop_decimal_cell_for_row(
+    cells: &mut Vec<QwpWsDecimalCell>,
+    row_idx: u32,
+) -> Option<QwpWsDecimalCell> {
+    if cells.last().is_some_and(|cell| cell.row_idx == row_idx) {
+        cells.pop()
+    } else {
+        None
+    }
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -2114,7 +2275,8 @@ impl QwpWsColumnarBuffer {
             cap += table.table_name.capacity();
             cap += table.columns.capacity() * std::mem::size_of::<QwpWsColumnBuffer>();
             for column in &table.columns {
-                cap += column.name.capacity() + column.capacity();
+                cap +=
+                    column.name.capacity() + column.lower_ascii_name.capacity() + column.capacity();
             }
         }
         cap
@@ -2215,36 +2377,42 @@ impl QwpWsColumnarBuffer {
         Ok(())
     }
 
+    #[inline(always)]
     pub(crate) fn table<'a, N>(&mut self, name: N) -> crate::Result<&mut Self>
     where
-        N: TryInto<TableName<'a>>,
+        N: AsRef<str> + TryInto<TableName<'a>>,
         Error: From<N::Error>,
     {
-        let name: TableName<'a> = match name.try_into() {
-            Ok(name) => name,
-            Err(err) => {
-                self.rollback_current_row();
-                return Err(err.into());
-            }
-        };
-        if let Err(err) = self.validate_max_name_len(name.as_ref()) {
-            self.rollback_current_row();
-            return Err(err);
-        }
         self.check_op(Op::Table)?;
 
         let table_bytes = name.as_ref().as_bytes();
         let tables_len_before = self.tables.len();
         let current_table_idx_before = self.current_table_idx;
         let state_before = self.state;
-        let idx = if let Some(current_idx) = self.current_table_idx {
-            if self.tables[current_idx].table_name == table_bytes {
+        let idx = match self.current_table_idx {
+            Some(current_idx)
+                if names_equal_packed(
+                    &self.tables[current_idx].table_name,
+                    self.tables[current_idx].packed_table_name,
+                    table_bytes,
+                ) =>
+            {
                 current_idx
-            } else {
-                self.lookup_or_create_table(table_bytes)?
             }
-        } else {
-            self.lookup_or_create_table(table_bytes)?
+            _ => {
+                let name = match name.try_into() {
+                    Ok(name) => name,
+                    Err(err) => {
+                        self.rollback_current_row();
+                        return Err(err.into());
+                    }
+                };
+                if let Err(err) = self.validate_max_name_len(name.as_ref()) {
+                    self.rollback_current_row();
+                    return Err(err);
+                }
+                self.lookup_or_create_table(name.as_ref().as_bytes())?
+            }
         };
         self.current_table_idx = Some(idx);
 
@@ -2273,9 +2441,10 @@ impl QwpWsColumnarBuffer {
         Ok(idx)
     }
 
+    #[inline(always)]
     pub(crate) fn symbol<'a, N, S>(&mut self, name: N, value: S) -> crate::Result<&mut Self>
     where
-        N: TryInto<ColumnName<'a>>,
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
         S: AsRef<str>,
         Error: From<N::Error>,
     {
@@ -2287,9 +2456,10 @@ impl QwpWsColumnarBuffer {
         Ok(self)
     }
 
+    #[inline(always)]
     pub(crate) fn column_bool<'a, N>(&mut self, name: N, value: bool) -> crate::Result<&mut Self>
     where
-        N: TryInto<ColumnName<'a>>,
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
         Error: From<N::Error>,
     {
         self.append_named_value(name, ColumnKind::Bool, |column, row_idx| {
@@ -2299,9 +2469,10 @@ impl QwpWsColumnarBuffer {
         Ok(self)
     }
 
+    #[inline(always)]
     pub(crate) fn column_i64<'a, N>(&mut self, name: N, value: i64) -> crate::Result<&mut Self>
     where
-        N: TryInto<ColumnName<'a>>,
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
         Error: From<N::Error>,
     {
         self.append_named_value(name, ColumnKind::I64, |column, row_idx| {
@@ -2311,9 +2482,10 @@ impl QwpWsColumnarBuffer {
         Ok(self)
     }
 
+    #[inline(always)]
     pub(crate) fn column_f64<'a, N>(&mut self, name: N, value: f64) -> crate::Result<&mut Self>
     where
-        N: TryInto<ColumnName<'a>>,
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
         Error: From<N::Error>,
     {
         self.append_named_value(name, ColumnKind::F64, |column, row_idx| {
@@ -2323,9 +2495,10 @@ impl QwpWsColumnarBuffer {
         Ok(self)
     }
 
+    #[inline(always)]
     pub(crate) fn column_str<'a, N, S>(&mut self, name: N, value: S) -> crate::Result<&mut Self>
     where
-        N: TryInto<ColumnName<'a>>,
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
         S: AsRef<str>,
         Error: From<N::Error>,
     {
@@ -2339,7 +2512,7 @@ impl QwpWsColumnarBuffer {
 
     pub(crate) fn column_dec<'a, N, S>(&mut self, name: N, value: S) -> crate::Result<&mut Self>
     where
-        N: TryInto<ColumnName<'a>>,
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
         S: TryInto<DecimalView<'a>>,
         Error: From<N::Error>,
         Error: From<S::Error>,
@@ -2369,7 +2542,7 @@ impl QwpWsColumnarBuffer {
     #[allow(private_bounds)]
     pub(crate) fn column_arr<'a, N, T, D>(&mut self, name: N, view: &T) -> crate::Result<&mut Self>
     where
-        N: TryInto<ColumnName<'a>>,
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
         T: NdArrayView<D>,
         D: ArrayElement + ArrayElementSealed,
         Error: From<N::Error>,
@@ -2389,9 +2562,10 @@ impl QwpWsColumnarBuffer {
         Ok(self)
     }
 
+    #[inline(always)]
     pub(crate) fn column_ts<'a, N, T>(&mut self, name: N, value: T) -> crate::Result<&mut Self>
     where
-        N: TryInto<ColumnName<'a>>,
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
         T: TryInto<Timestamp>,
         Error: From<N::Error>,
         Error: From<T::Error>,
@@ -2422,6 +2596,7 @@ impl QwpWsColumnarBuffer {
         Ok(self)
     }
 
+    #[inline(always)]
     pub(crate) fn at<T>(&mut self, timestamp: T) -> crate::Result<()>
     where
         T: TryInto<Timestamp>,
@@ -2447,11 +2622,13 @@ impl QwpWsColumnarBuffer {
         self.commit_current_row()
     }
 
+    #[inline(always)]
     pub(crate) fn at_now(&mut self) -> crate::Result<()> {
         self.check_op(Op::At)?;
         self.commit_current_row()
     }
 
+    #[inline(always)]
     fn append_named_value<'a, N, F>(
         &mut self,
         name: N,
@@ -2459,7 +2636,7 @@ impl QwpWsColumnarBuffer {
         append: F,
     ) -> crate::Result<()>
     where
-        N: TryInto<ColumnName<'a>>,
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
         Error: From<N::Error>,
         F: FnOnce(&mut QwpWsColumnBuffer, u32) -> crate::Result<()>,
     {
@@ -2469,42 +2646,35 @@ impl QwpWsColumnarBuffer {
             Op::Column
         };
         self.check_op(op)?;
-        let name: ColumnName<'a> = match name.try_into() {
-            Ok(name) => name,
-            Err(err) => {
-                self.rollback_current_row();
-                return Err(err.into());
-            }
-        };
-        if let Err(err) = self.validate_max_name_len(name.as_ref()) {
-            self.rollback_current_row();
-            return Err(err);
-        }
-        self.append_column_value(name.as_ref().as_bytes(), kind, append)
+        self.append_column_value(name, kind, append)
     }
 
+    #[inline(always)]
     fn append_designated_ts(&mut self, ts: DesignatedTs) -> crate::Result<()> {
         match ts {
-            DesignatedTs::Micros(value) => {
-                self.append_column_value(b"", ColumnKind::TimestampMicros, |column, row_idx| {
-                    column.append_timestamp_micros(row_idx, value)
-                })
-            }
-            DesignatedTs::Nanos(value) => {
-                self.append_column_value(b"", ColumnKind::TimestampNanos, |column, row_idx| {
-                    column.append_timestamp_nanos(row_idx, value)
-                })
-            }
+            DesignatedTs::Micros(value) => self.append_column_value(
+                ColumnName::new_unchecked(""),
+                ColumnKind::TimestampMicros,
+                |column, row_idx| column.append_timestamp_micros(row_idx, value),
+            ),
+            DesignatedTs::Nanos(value) => self.append_column_value(
+                ColumnName::new_unchecked(""),
+                ColumnKind::TimestampNanos,
+                |column, row_idx| column.append_timestamp_nanos(row_idx, value),
+            ),
         }
     }
 
-    fn append_column_value<F>(
+    #[inline(always)]
+    fn append_column_value<'a, N, F>(
         &mut self,
-        name: &[u8],
+        name: N,
         kind: ColumnKind,
         append: F,
     ) -> crate::Result<()>
     where
+        N: AsRef<str> + TryInto<ColumnName<'a>>,
+        Error: From<N::Error>,
         F: FnOnce(&mut QwpWsColumnBuffer, u32) -> crate::Result<()>,
     {
         let Some(table_idx) = self.current_table_idx else {
@@ -2513,17 +2683,68 @@ impl QwpWsColumnarBuffer {
                 "table() must be called before adding columns"
             ));
         };
-        let table = &mut self.tables[table_idx];
-        let row_idx = table.row_count;
-        let col_idx = match table.lookup_or_create_column(name, kind) {
-            Ok(idx) => idx,
+        match self.tables[table_idx].lookup_column(name.as_ref().as_bytes()) {
+            Ok(Some(idx)) => {
+                self.append_resolved_column_value(
+                    table_idx,
+                    idx,
+                    name.as_ref().as_bytes(),
+                    kind,
+                    append,
+                )?;
+            }
+            Ok(None) => {
+                let name: ColumnName<'a> = match name.try_into() {
+                    Ok(name) => name,
+                    Err(err) => {
+                        self.rollback_current_row();
+                        return Err(err.into());
+                    }
+                };
+                if let Err(err) = self.validate_max_name_len(name.as_ref()) {
+                    self.rollback_current_row();
+                    return Err(err);
+                }
+                match self.tables[table_idx].create_column(name.as_ref().as_bytes(), kind) {
+                    Ok(idx) => {
+                        self.append_resolved_column_value(
+                            table_idx,
+                            idx,
+                            name.as_ref().as_bytes(),
+                            kind,
+                            append,
+                        )?;
+                    }
+                    Err(err) => {
+                        self.rollback_current_row();
+                        return Err(err);
+                    }
+                }
+            }
             Err(err) => {
                 self.rollback_current_row();
                 return Err(err);
             }
-        };
+        }
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn append_resolved_column_value<F>(
+        &mut self,
+        table_idx: usize,
+        col_idx: usize,
+        type_mismatch_name: &[u8],
+        kind: ColumnKind,
+        append: F,
+    ) -> crate::Result<()>
+    where
+        F: FnOnce(&mut QwpWsColumnBuffer, u32) -> crate::Result<()>,
+    {
+        let table = &mut self.tables[table_idx];
+        let row_idx = table.row_count;
         if table.columns[col_idx].kind != kind {
-            let err = batched_type_change_error_ws(name);
+            let err = batched_type_change_error_ws(type_mismatch_name);
             self.rollback_current_row();
             return Err(err);
         }
@@ -2541,6 +2762,7 @@ impl QwpWsColumnarBuffer {
         Ok(())
     }
 
+    #[inline(always)]
     fn commit_current_row(&mut self) -> crate::Result<()> {
         let Some(table_idx) = self.current_table_idx else {
             return Err(error::fmt!(
@@ -2777,6 +2999,7 @@ impl QwpWsTableBuffer {
     fn new(table_name: &[u8]) -> Self {
         Self {
             table_name: table_name.to_vec(),
+            packed_table_name: packed_name(table_name),
             row_count: 0,
             in_progress: false,
             in_progress_column_count: 0,
@@ -2805,17 +3028,12 @@ impl QwpWsTableBuffer {
             in_progress_column_count: self.in_progress_column_count,
             column_access_cursor: self.column_access_cursor,
             columns_len: self.columns.len(),
-            column_marks: self
-                .columns
-                .iter()
-                .map(QwpWsColumnBuffer::rollback_mark)
-                .collect(),
         }
     }
 
     fn restore(&mut self, mark: QwpWsTableRollbackMark) {
-        for (column, column_mark) in self.columns.iter_mut().zip(mark.column_marks) {
-            column.restore(column_mark);
+        for column in &mut self.columns[..mark.columns_len] {
+            column.rollback_row(mark.row_count);
         }
         self.columns.truncate(mark.columns_len);
         self.row_count = mark.row_count;
@@ -2826,19 +3044,29 @@ impl QwpWsTableBuffer {
         self.rebuild_column_lookup();
     }
 
-    fn lookup_or_create_column(&mut self, name: &[u8], kind: ColumnKind) -> crate::Result<usize> {
+    #[inline(always)]
+    fn lookup_column(&mut self, name: &[u8]) -> crate::Result<Option<usize>> {
         if self.column_access_cursor < self.columns.len()
-            && names_equal_ignore_case(&self.columns[self.column_access_cursor].name, name)
+            && names_equal_lower_ascii(
+                &self.columns[self.column_access_cursor].lower_ascii_name,
+                self.columns[self.column_access_cursor].packed_lower_ascii_name,
+                name,
+            )
         {
-            return Ok(self.column_access_cursor);
+            return Ok(Some(self.column_access_cursor));
         }
 
         let lookup_key = column_lookup_key(name)?;
         if let Some(&idx) = self.column_lookup.get(&lookup_key) {
-            return Ok(idx);
+            return Ok(Some(idx));
         }
 
+        Ok(None)
+    }
+
+    fn create_column(&mut self, name: &[u8], kind: ColumnKind) -> crate::Result<usize> {
         checked_qwp_push_index(self.columns.len(), "QWP/WS column count")?;
+        let lookup_key = column_lookup_key(name)?;
         let idx = self.columns.len();
         self.columns.push(QwpWsColumnBuffer::new(name, kind));
         self.column_lookup.insert(lookup_key, idx);
@@ -2860,6 +3088,8 @@ impl QwpWsColumnBuffer {
     fn new(name: &[u8], kind: ColumnKind) -> Self {
         Self {
             name: name.to_vec(),
+            lower_ascii_name: lowercase_ascii_bytes(name),
+            packed_lower_ascii_name: packed_lower_ascii_name(name),
             kind,
             last_written_row: None,
             non_null_count: 0,
@@ -2883,6 +3113,7 @@ impl QwpWsColumnBuffer {
                 dict,
                 lookup,
                 data,
+                ..
             } => {
                 cells.reserve(rows);
                 dict.reserve(rows);
@@ -2907,18 +3138,14 @@ impl QwpWsColumnBuffer {
         self.values.capacity()
     }
 
-    fn rollback_mark(&self) -> QwpWsColumnRollbackMark {
-        QwpWsColumnRollbackMark {
-            last_written_row: self.last_written_row,
-            non_null_count: self.non_null_count,
-            values: self.values.rollback_mark(),
+    fn rollback_row(&mut self, row_idx: u32) {
+        if self.last_written_row != Some(row_idx) {
+            return;
         }
-    }
-
-    fn restore(&mut self, mark: QwpWsColumnRollbackMark) {
-        self.last_written_row = mark.last_written_row;
-        self.non_null_count = mark.non_null_count;
-        self.values.restore(mark.values);
+        if self.values.rollback_row(row_idx) {
+            self.non_null_count -= 1;
+        }
+        self.last_written_row = None;
     }
 
     fn uses_null_bitmap(&self, row_count: usize) -> bool {
@@ -3010,18 +3237,23 @@ impl QwpWsColumnBuffer {
             return Err(type_mismatch_error_ws(&self.name));
         };
         let bytes = value.as_bytes();
-        let local_id = if let Some(&local_id) = lookup.get(bytes) {
-            local_id
+        let hash = qwp_ws_symbol_hash(bytes);
+        let (local_id, is_new) = if let Some(local_id) = lookup.get(hash, bytes, dict, data) {
+            (local_id, false)
         } else {
             let local_id = checked_qwp_push_index(dict.len(), "QWP/WS symbol dictionary length")?;
             let offset = QwpBuffer::checked_arena_offset(data.len(), bytes.len(), "QWP/WS symbol")?;
             let len = checked_qwp_u32(bytes.len(), "QWP/WS symbol length")?;
             data.extend_from_slice(bytes);
             dict.push(QwpWsSymbolEntry { offset, len });
-            lookup.insert(bytes.to_vec(), local_id);
-            local_id
+            lookup.insert(hash, local_id);
+            (local_id, true)
         };
-        cells.push(QwpWsSymbolCell { row_idx, local_id });
+        cells.push(QwpWsSymbolCell {
+            row_idx,
+            local_id,
+            is_new,
+        });
         self.increment_non_null()?;
         Ok(())
     }
@@ -3106,7 +3338,7 @@ impl QwpWsColumnValues {
             ColumnKind::Symbol => Self::Symbol {
                 cells: Vec::new(),
                 dict: Vec::new(),
-                lookup: std::collections::HashMap::new(),
+                lookup: QwpWsLocalSymbolLookup::default(),
                 data: Vec::new(),
             },
             ColumnKind::Decimal => Self::Decimal {
@@ -3177,116 +3409,61 @@ impl QwpWsColumnValues {
         }
     }
 
-    fn rollback_mark(&self) -> QwpWsColumnValuesMark {
+    fn rollback_row(&mut self, row_idx: u32) -> bool {
         match self {
-            Self::Bool { cells } => QwpWsColumnValuesMark::Bool {
-                cells_len: cells.len(),
-            },
-            Self::I64 { cells } => QwpWsColumnValuesMark::I64 {
-                cells_len: cells.len(),
-            },
-            Self::F64 { cells } => QwpWsColumnValuesMark::F64 {
-                cells_len: cells.len(),
-            },
-            Self::TimestampMicros { cells } => QwpWsColumnValuesMark::TimestampMicros {
-                cells_len: cells.len(),
-            },
-            Self::TimestampNanos { cells } => QwpWsColumnValuesMark::TimestampNanos {
-                cells_len: cells.len(),
-            },
-            Self::String { cells, data } => QwpWsColumnValuesMark::String {
-                cells_len: cells.len(),
-                data_len: data.len(),
-            },
+            Self::Bool { cells } => pop_value_cell_for_row(cells, row_idx),
+            Self::I64 { cells } => pop_value_cell_for_row(cells, row_idx),
+            Self::F64 { cells } => pop_value_cell_for_row(cells, row_idx),
+            Self::TimestampMicros { cells } => pop_value_cell_for_row(cells, row_idx),
+            Self::TimestampNanos { cells } => pop_value_cell_for_row(cells, row_idx),
+            Self::String { cells, data } | Self::DoubleArray { cells, data } => {
+                if let Some(cell) = pop_slice_cell_for_row(cells, row_idx) {
+                    data.truncate(cell.offset as usize);
+                    true
+                } else {
+                    false
+                }
+            }
             Self::Symbol {
-                cells, dict, data, ..
-            } => QwpWsColumnValuesMark::Symbol {
-                cells_len: cells.len(),
-                dict_len: dict.len(),
-                data_len: data.len(),
-            },
+                cells,
+                dict,
+                lookup,
+                data,
+            } => {
+                let Some(cell) = pop_symbol_cell_for_row(cells, row_idx) else {
+                    return false;
+                };
+                if cell.is_new
+                    && let Some(entry) = dict.pop()
+                {
+                    debug_assert_eq!(cell.local_id as usize, dict.len());
+                    data.truncate(entry.offset as usize);
+                    lookup.retain_local_ids_below(dict.len());
+                }
+                true
+            }
             Self::Decimal {
                 cells,
                 decimal_scale,
-            } => QwpWsColumnValuesMark::Decimal {
-                cells_len: cells.len(),
-                decimal_scale: *decimal_scale,
-            },
-            Self::DoubleArray { cells, data } => QwpWsColumnValuesMark::DoubleArray {
-                cells_len: cells.len(),
-                data_len: data.len(),
-            },
-        }
-    }
-
-    fn restore(&mut self, mark: QwpWsColumnValuesMark) {
-        match (self, mark) {
-            (Self::Bool { cells }, QwpWsColumnValuesMark::Bool { cells_len }) => {
-                cells.truncate(cells_len)
+            } => {
+                let Some(cell) = pop_decimal_cell_for_row(cells, row_idx) else {
+                    return false;
+                };
+                if cell.value.is_some() {
+                    if cells.is_empty() {
+                        *decimal_scale = 0;
+                    } else {
+                        *decimal_scale = cells
+                            .iter()
+                            .filter_map(|cell| cell.value.map(|value| value.scale))
+                            .max()
+                            .unwrap_or(0);
+                    }
+                    true
+                } else {
+                    false
+                }
             }
-            (Self::I64 { cells }, QwpWsColumnValuesMark::I64 { cells_len }) => {
-                cells.truncate(cells_len)
-            }
-            (Self::F64 { cells }, QwpWsColumnValuesMark::F64 { cells_len }) => {
-                cells.truncate(cells_len)
-            }
-            (
-                Self::TimestampMicros { cells },
-                QwpWsColumnValuesMark::TimestampMicros { cells_len },
-            ) => cells.truncate(cells_len),
-            (
-                Self::TimestampNanos { cells },
-                QwpWsColumnValuesMark::TimestampNanos { cells_len },
-            ) => cells.truncate(cells_len),
-            (
-                Self::String { cells, data },
-                QwpWsColumnValuesMark::String {
-                    cells_len,
-                    data_len,
-                },
-            )
-            | (
-                Self::DoubleArray { cells, data },
-                QwpWsColumnValuesMark::DoubleArray {
-                    cells_len,
-                    data_len,
-                },
-            ) => {
-                cells.truncate(cells_len);
-                data.truncate(data_len);
-            }
-            (
-                Self::Symbol {
-                    cells,
-                    dict,
-                    lookup,
-                    data,
-                },
-                QwpWsColumnValuesMark::Symbol {
-                    cells_len,
-                    dict_len,
-                    data_len,
-                },
-            ) => {
-                cells.truncate(cells_len);
-                dict.truncate(dict_len);
-                data.truncate(data_len);
-                lookup.retain(|_, local_id| (*local_id as usize) < dict_len);
-            }
-            (
-                Self::Decimal {
-                    cells,
-                    decimal_scale,
-                },
-                QwpWsColumnValuesMark::Decimal {
-                    cells_len,
-                    decimal_scale: mark_scale,
-                },
-            ) => {
-                cells.truncate(cells_len);
-                *decimal_scale = mark_scale;
-            }
-            _ => {}
         }
     }
 
@@ -3492,6 +3669,64 @@ impl QwpWsColumnValues {
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
+fn lowercase_ascii_bytes(name: &[u8]) -> Vec<u8> {
+    name.iter().map(|byte| byte.to_ascii_lowercase()).collect()
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+#[inline(always)]
+fn packed_name(name: &[u8]) -> u64 {
+    if name.len() > 8 {
+        return 0;
+    }
+    let mut packed = 0u64;
+    for (index, byte) in name.iter().enumerate() {
+        packed |= u64::from(*byte) << (index * 8);
+    }
+    packed
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+#[inline(always)]
+fn packed_lower_ascii_name(name: &[u8]) -> u64 {
+    if name.len() > 8 {
+        return 0;
+    }
+    let mut packed = 0u64;
+    for (index, byte) in name.iter().enumerate() {
+        packed |= u64::from(byte.to_ascii_lowercase()) << (index * 8);
+    }
+    packed
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+#[inline(always)]
+fn names_equal_packed(left: &[u8], packed_left: u64, right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    if right.len() <= 8 {
+        return packed_left == packed_name(right);
+    }
+    left == right
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
+#[inline(always)]
+fn names_equal_lower_ascii(left_lower: &[u8], packed_left_lower: u64, right: &[u8]) -> bool {
+    if left_lower.len() != right.len() {
+        return false;
+    }
+    if right.len() <= 8 {
+        return packed_left_lower == packed_lower_ascii_name(right);
+    }
+    left_lower
+        .iter()
+        .zip(right)
+        .all(|(&left, &right)| left == right.to_ascii_lowercase())
+}
+
+#[cfg(feature = "_sender-qwp-ws")]
 fn column_lookup_key(name: &[u8]) -> crate::Result<String> {
     let name = std::str::from_utf8(name).map_err(|err| {
         error::fmt!(
@@ -3501,17 +3736,6 @@ fn column_lookup_key(name: &[u8]) -> crate::Result<String> {
         )
     })?;
     Ok(name.to_lowercase())
-}
-
-#[cfg(feature = "_sender-qwp-ws")]
-fn names_equal_ignore_case(left: &[u8], right: &[u8]) -> bool {
-    if left.eq_ignore_ascii_case(right) {
-        return true;
-    }
-    match (std::str::from_utf8(left), std::str::from_utf8(right)) {
-        (Ok(left), Ok(right)) => left.to_lowercase() == right.to_lowercase(),
-        _ => false,
-    }
 }
 
 #[cfg(feature = "_sender-qwp-ws")]
@@ -3550,7 +3774,7 @@ const QWP_FLAG_DELTA_SYMBOL_DICT: u8 = 0x08;
 #[cfg(feature = "_sender-qwp-ws")]
 #[derive(Debug, Default)]
 pub(crate) struct SymbolGlobalDict {
-    map: std::collections::HashMap<Vec<u8>, u64>,
+    map: QwpWsSymbolHashMap<u64>,
     entries: Vec<Vec<u8>>,
     next_id: u64,
 }
@@ -3566,7 +3790,7 @@ pub(crate) struct SymbolGlobalDictMark {
 impl SymbolGlobalDict {
     pub(crate) fn new() -> Self {
         Self {
-            map: std::collections::HashMap::new(),
+            map: QwpWsSymbolHashMap::default(),
             entries: Vec::new(),
             next_id: 0,
         }
@@ -5406,6 +5630,40 @@ mod tests {
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_local_symbol_lookup_handles_hash_collisions() {
+        let mut lookup = QwpWsLocalSymbolLookup::default();
+        let mut dict = Vec::new();
+        let mut data = Vec::new();
+        let forced_hash = 7;
+
+        let alpha_offset = data.len() as u32;
+        data.extend_from_slice(b"alpha");
+        dict.push(QwpWsSymbolEntry {
+            offset: alpha_offset,
+            len: 5,
+        });
+        lookup.insert(forced_hash, 0);
+
+        let beta_offset = data.len() as u32;
+        data.extend_from_slice(b"beta");
+        dict.push(QwpWsSymbolEntry {
+            offset: beta_offset,
+            len: 4,
+        });
+        lookup.insert(forced_hash, 1);
+
+        assert_eq!(lookup.get(forced_hash, b"alpha", &dict, &data), Some(0));
+        assert_eq!(lookup.get(forced_hash, b"beta", &dict, &data), Some(1));
+        assert_eq!(lookup.get(forced_hash, b"gamma", &dict, &data), None);
+
+        lookup.retain_local_ids_below(1);
+
+        assert_eq!(lookup.get(forced_hash, b"alpha", &dict, &data), Some(0));
+        assert_eq!(lookup.get(forced_hash, b"beta", &dict, &data), None);
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
     fn decode_single_i64_column_ws_replay(message: &[u8]) -> Vec<(String, String, Vec<i64>)> {
         let (_, _, mut pos) = ws_delta_entries(message);
         let table_count = u16::from_le_bytes([message[6], message[7]]) as usize;
@@ -5434,6 +5692,46 @@ mod tests {
         }
         assert_eq!(pos, message.len());
         tables
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[derive(Clone, Copy)]
+    struct PanicTableName(&'static str);
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    impl AsRef<str> for PanicTableName {
+        fn as_ref(&self) -> &str {
+            self.0
+        }
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    impl<'a> TryFrom<PanicTableName> for TableName<'a> {
+        type Error = crate::Error;
+
+        fn try_from(_: PanicTableName) -> crate::Result<Self> {
+            panic!("existing QWP/WS table names must not be revalidated")
+        }
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[derive(Clone, Copy)]
+    struct PanicColumnName(&'static str);
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    impl AsRef<str> for PanicColumnName {
+        fn as_ref(&self) -> &str {
+            self.0
+        }
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    impl<'a> TryFrom<PanicColumnName> for ColumnName<'a> {
+        type Error = crate::Error;
+
+        fn try_from(_: PanicColumnName) -> crate::Result<Self> {
+            panic!("existing QWP/WS column names must not be revalidated")
+        }
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
@@ -7103,6 +7401,61 @@ mod tests {
 
     #[cfg(feature = "_sender-qwp-ws")]
     #[test]
+    fn qwp_ws_columnar_existing_names_skip_validation() {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+
+        buf.table("trades")
+            .unwrap()
+            .column_i64("a", 1)
+            .unwrap()
+            .column_i64("b", 2)
+            .unwrap()
+            .at_now()
+            .unwrap();
+
+        buf.table(PanicTableName("trades"))
+            .unwrap()
+            .column_i64(PanicColumnName("b"), 3)
+            .unwrap()
+            .column_i64(PanicColumnName("a"), 4)
+            .unwrap()
+            .at_now()
+            .unwrap();
+
+        assert_eq!(buf.row_count(), 2);
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_new_names_still_validate_and_rollback() {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        let mut scratch = QwpWsEncodeScratch::new();
+        let mut global_dict = SymbolGlobalDict::new();
+
+        let err = buf.table("bad?").unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidName);
+
+        buf.table("trades").unwrap();
+        let err = buf.column_i64("bad?", 1).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidName);
+
+        buf.table("trades")
+            .unwrap()
+            .column_i64("qty", 3)
+            .unwrap()
+            .at_now()
+            .unwrap();
+        buf.encode_ws_replay_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
+            .unwrap();
+
+        assert_eq!(
+            decode_single_i64_column_ws_replay(&scratch.message),
+            vec![("trades".to_owned(), "qty".to_owned(), vec![3])]
+        );
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
     fn qwp_ws_columnar_duplicate_column_with_different_type_errors() {
         let mut buf = QwpWsColumnarBuffer::new(127);
         let mut scratch = QwpWsEncodeScratch::new();
@@ -7129,6 +7482,45 @@ mod tests {
             decode_single_i64_column_ws_replay(&scratch.message),
             vec![("trades".to_owned(), "qty".to_owned(), vec![3])]
         );
+    }
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    #[test]
+    fn qwp_ws_columnar_rollback_removes_new_symbol_from_current_row() {
+        let mut buf = QwpWsColumnarBuffer::new(127);
+        let mut scratch = QwpWsEncodeScratch::new();
+        let mut global_dict = SymbolGlobalDict::new();
+
+        buf.table("trades")
+            .unwrap()
+            .symbol("sym", "ETH-USD")
+            .unwrap()
+            .column_i64("qty", 1)
+            .unwrap()
+            .at_now()
+            .unwrap();
+
+        buf.table("trades")
+            .unwrap()
+            .symbol("sym", "ROLLBACK")
+            .unwrap();
+        let err = buf.column_bool("qty", true).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidApiCall);
+
+        buf.table("trades")
+            .unwrap()
+            .symbol("sym", "BTC-USD")
+            .unwrap()
+            .column_i64("qty", 2)
+            .unwrap()
+            .at_now()
+            .unwrap();
+
+        buf.encode_ws_replay_message(&mut scratch, &mut global_dict, QWP_VERSION_1)
+            .unwrap();
+
+        let (_, entries, _) = ws_delta_entries(&scratch.message);
+        assert_eq!(entries, vec![b"ETH-USD".to_vec(), b"BTC-USD".to_vec()]);
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
