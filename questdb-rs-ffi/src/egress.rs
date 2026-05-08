@@ -1201,15 +1201,21 @@ pub unsafe extern "C" fn line_reader_query_new(
         // Going through the cell's raw pointer tags this borrow as
         // `SharedReadWrite`, compatible with those temporary `&Reader`s.
         let r: &mut Reader = &mut *(*reader).0.get();
-        // Defense-in-depth: catch any unwind out of `r.query(sql_str)` and
-        // abort, mirroring the policy in `_query_execute` and
-        // `mutate_query`. Upstream `Reader::query` is in practice
-        // infallible (it just builds a small `ReaderQuery` struct), but a
-        // future change or a custom allocator that unwinds on OOM would
-        // otherwise (a) propagate a Rust panic across the FFI boundary
-        // into C — instant UB — and (b) leave the `active` flag stuck
-        // `true` (no query was produced, but the early-claim of the flag
-        // wouldn't be undone). Aborting is strictly safer.
+        // Defense-in-depth: catch any unwind out of `r.query(sql_str)`
+        // AND the wrapper allocation that publishes the result, then
+        // abort. Upstream `Reader::query` is in practice infallible
+        // (it just builds a small `ReaderQuery` struct), and the
+        // default Rust allocator aborts on OOM rather than unwinds —
+        // but a future change, a custom unwinding allocator, or a
+        // panic in `Box::new` for any other reason would otherwise
+        // (a) propagate a Rust panic across the FFI boundary into C
+        // — instant UB — and (b) leave the `active` flag stuck `true`
+        // (no query was produced, but the early-claim of the flag
+        // wouldn't be undone). Aborting is strictly safer. Including
+        // the `Box::into_raw(Box::new(...))` inside the guarded
+        // closure closes the allocation gap left by the previous
+        // narrower `catch_unwind` that wrapped only the upstream
+        // call.
         //
         // The lifetime launder happens INSIDE the closure: a `FnMut`
         // closure cannot return a borrow of a variable it captured, so
@@ -1224,17 +1230,16 @@ pub unsafe extern "C" fn line_reader_query_new(
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let q = r.query(sql_str);
             let q_static: ReaderQuery<'static> = std::mem::transmute(q);
-            q_static
+            Box::into_raw(Box::new(line_reader_query {
+                inner: ManuallyDrop::new(q_static),
+                reader,
+                deferred_err: None,
+            }))
         }));
-        let q_static = match result {
-            Ok(q) => q,
+        match result {
+            Ok(p) => p,
             Err(_) => std::process::abort(),
-        };
-        Box::into_raw(Box::new(line_reader_query {
-            inner: ManuallyDrop::new(q_static),
-            reader,
-            deferred_err: None,
-        }))
+        }
     }
 }
 
@@ -1319,38 +1324,45 @@ pub unsafe extern "C" fn line_reader_query_execute(
             return ptr::null_mut();
         }
 
-        // Defense-in-depth: catch any unwind out of `q.execute()` and
-        // abort, mirroring the policy in `mutate_query`. `q` was moved
-        // out of the now-dead `Box<line_reader_query>` via
+        // Defense-in-depth: catch any unwind out of `q.execute()` AND
+        // out of the wrapper allocations that publish either the
+        // cursor handle or the error envelope. `q` was moved out of
+        // the now-dead `Box<line_reader_query>` via
         // `ManuallyDrop::take`, so an unwind would otherwise (a) leave
-        // the reader's `active` flag stuck `true` (no cursor produced,
-        // no Err arm taken to clear it) and (b) propagate a Rust panic
-        // across the FFI boundary into C — instant UB. Aborting is
-        // strictly safer.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| q.execute()));
-        let result = match result {
-            Ok(r) => r,
-            Err(_) => std::process::abort(),
-        };
-        match result {
-            Ok(cursor) => {
-                // Active flag stays set; ownership transfers to the cursor.
-                let cursor_static: Cursor<'static> = std::mem::transmute(cursor);
-                Box::into_raw(Box::new(line_reader_cursor {
-                    cursor: ManuallyDrop::new(cursor_static),
-                    current_batch: None,
-                    column_view_cache: UnsafeCell::new(Vec::new()),
-                    reader,
-                }))
-            }
-            Err(e) => {
-                // Query gone, no cursor produced — release the active flag.
-                if !reader.is_null() {
-                    (*reader).1.store(false, Ordering::Release);
+        // the reader's `active` flag stuck `true` on the success-arm
+        // path (no cursor produced, no Err arm taken to clear it) and
+        // (b) propagate a Rust panic across the FFI boundary into C
+        // — instant UB. Including both the success-side
+        // `Box::into_raw(Box::new(line_reader_cursor { .. }))` and the
+        // error-side `Box::into_raw(Box::new(line_reader_error(..)))`
+        // inside the guarded closure closes the two allocation gaps
+        // left by the previous narrower `catch_unwind` that wrapped
+        // only `q.execute()`.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            match q.execute() {
+                Ok(cursor) => {
+                    // Active flag stays set; ownership transfers to the cursor.
+                    let cursor_static: Cursor<'static> = std::mem::transmute(cursor);
+                    Box::into_raw(Box::new(line_reader_cursor {
+                        cursor: ManuallyDrop::new(cursor_static),
+                        current_batch: None,
+                        column_view_cache: UnsafeCell::new(Vec::new()),
+                        reader,
+                    }))
                 }
-                *err_out = Box::into_raw(Box::new(line_reader_error(e)));
-                ptr::null_mut()
+                Err(e) => {
+                    // Query gone, no cursor produced — release the active flag.
+                    if !reader.is_null() {
+                        (*reader).1.store(false, Ordering::Release);
+                    }
+                    *err_out = Box::into_raw(Box::new(line_reader_error(e)));
+                    ptr::null_mut()
+                }
             }
+        }));
+        match result {
+            Ok(p) => p,
+            Err(_) => std::process::abort(),
         }
     }
 }
