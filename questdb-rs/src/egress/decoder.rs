@@ -2408,7 +2408,9 @@ mod tests {
     fn zstd_frame_without_content_size_is_protocol_error() {
         use std::io::Write;
         let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 0).unwrap();
-        encoder.write_all(b"some bytes that will never be read").unwrap();
+        encoder
+            .write_all(b"some bytes that will never be read")
+            .unwrap();
         let body = encoder.finish().expect("zstd encode");
         // Sanity-check that the encoder really did omit FCS — if a
         // future zstd-rs default flips, this assertion catches it

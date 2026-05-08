@@ -427,10 +427,10 @@ fn reject_upgrade(mut stream: TcpStream, captured_auth: &Arc<Mutex<Vec<Option<St
 fn parse_authorization_header(buf: &[u8]) -> Option<String> {
     let text = std::str::from_utf8(buf).ok()?;
     for line in text.split("\r\n") {
-        if let Some((name, value)) = line.split_once(':') {
-            if name.eq_ignore_ascii_case("authorization") {
-                return Some(value.trim().to_string());
-            }
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case("authorization")
+        {
+            return Some(value.trim().to_string());
         }
     }
     None
