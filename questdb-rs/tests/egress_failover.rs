@@ -184,6 +184,14 @@ struct MockServer {
     /// SQL identity. One entry per accepted connection that read a
     /// QUERY_REQUEST; preserves arrival order.
     captured_requests: Arc<Mutex<Vec<Vec<u8>>>>,
+    /// Captures the inbound `Authorization` header value (if any) of
+    /// every WS upgrade request the server saw — one entry per
+    /// accepted connection, preserving arrival order. `None` means
+    /// the header was absent on that connection. Pinned-to-bytes
+    /// regression coverage for the auth modes (Basic/Bearer/verbatim):
+    /// a future change that drops or reformats the outgoing header
+    /// would surface as a captured-value mismatch here.
+    captured_auth: Arc<Mutex<Vec<Option<String>>>>,
 }
 
 impl MockServer {
@@ -201,6 +209,8 @@ impl MockServer {
         let workers_clone = Arc::clone(&workers);
         let captured_requests: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
         let captured_clone_outer = Arc::clone(&captured_requests);
+        let captured_auth: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_auth_outer = Arc::clone(&captured_auth);
 
         // The listener thread spawns a per-connection worker and
         // stashes its `JoinHandle` so `MockServer::Drop` can join
@@ -227,8 +237,10 @@ impl MockServer {
                     }
                 };
                 let captured_clone_inner = Arc::clone(&captured_clone_outer);
-                let worker =
-                    thread::spawn(move || run_script(stream, script, captured_clone_inner));
+                let captured_auth_inner = Arc::clone(&captured_auth_outer);
+                let worker = thread::spawn(move || {
+                    run_script(stream, script, captured_clone_inner, captured_auth_inner)
+                });
                 workers_clone.lock().unwrap().push(worker);
             }
         });
@@ -246,6 +258,7 @@ impl MockServer {
             handle: Some(handle),
             workers,
             captured_requests,
+            captured_auth,
         }
     }
 
@@ -263,6 +276,13 @@ impl MockServer {
     /// cursor — no QWP1 header (only server frames carry that).
     fn captured_requests(&self) -> Vec<Vec<u8>> {
         self.captured_requests.lock().unwrap().clone()
+    }
+
+    /// Snapshot of the inbound `Authorization` header (if any) for
+    /// every accepted connection, in arrival order. `None` entries
+    /// mean the header was absent on that connection.
+    fn captured_auth_headers(&self) -> Vec<Option<String>> {
+        self.captured_auth.lock().unwrap().clone()
     }
 }
 
@@ -288,11 +308,16 @@ impl Drop for MockServer {
 /// the script to completion. Errors are swallowed — the test asserts
 /// against the client side, not the mock side.
 #[allow(clippy::result_large_err)] // Closure signature is fixed by tungstenite::accept_hdr.
-fn run_script(stream: TcpStream, script: Script, captured_requests: Arc<Mutex<Vec<Vec<u8>>>>) {
+fn run_script(
+    stream: TcpStream,
+    script: Script,
+    captured_requests: Arc<Mutex<Vec<Vec<u8>>>>,
+    captured_auth: Arc<Mutex<Vec<Option<String>>>>,
+) {
     // Decide upfront if this connection wants to reject the upgrade.
     let reject = script.iter().any(|a| matches!(a, Action::Reject401));
     if reject {
-        reject_upgrade(stream);
+        reject_upgrade(stream, &captured_auth);
         return;
     }
 
@@ -309,7 +334,15 @@ fn run_script(stream: TcpStream, script: Script, captured_requests: Arc<Mutex<Ve
         .unwrap_or_else(|| "2".to_string());
     let handshake_version_for_closure = handshake_version.clone();
 
-    let mut ws = match accept_hdr(stream, move |_req: &Request, mut resp: Response| {
+    let captured_auth_for_closure = Arc::clone(&captured_auth);
+    let mut ws = match accept_hdr(stream, move |req: &Request, mut resp: Response| {
+        // Capture the inbound Authorization header (if any) so tests
+        // can pin the wire-level bytes the client emitted.
+        let auth = req
+            .headers()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok().map(|s| s.to_string()));
+        captured_auth_for_closure.lock().unwrap().push(auth);
         // Inject the X-QWP-Version response header. By default we
         // negotiate v2 to match the SERVER_INFO frames the helpers
         // build; a `HandshakeVersion(v)` script entry overrides it.
@@ -374,15 +407,33 @@ fn run_script(stream: TcpStream, script: Script, captured_requests: Arc<Mutex<Ve
 /// Tungstenite-based HTTP error reply (avoids depending on the WS
 /// upgrade machinery for the 401 path). We hand-roll a minimal HTTP
 /// response since the real auth-error path on the client side just
-/// inspects the status code.
-fn reject_upgrade(mut stream: TcpStream) {
-    let mut buf = [0u8; 1024];
-    // Drain the request line + headers (best-effort). We don't actually
-    // parse them — just need to consume so the client sees the
-    // response after its request hits the wire.
-    let _ = stream.read(&mut buf);
+/// inspects the status code. The drained request bytes are scanned
+/// for an `Authorization:` header so even the 401-path tests can
+/// assert what the client put on the wire.
+fn reject_upgrade(mut stream: TcpStream, captured_auth: &Arc<Mutex<Vec<Option<String>>>>) {
+    let mut buf = [0u8; 4096];
+    let n = stream.read(&mut buf).unwrap_or(0);
+    let auth = parse_authorization_header(&buf[..n]);
+    captured_auth.lock().unwrap().push(auth);
     let _ = stream
         .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+}
+
+/// Best-effort scan of a raw HTTP request preamble for the
+/// `Authorization:` header value. Case-insensitive on the field name
+/// (per RFC 7230); trims surrounding whitespace from the value.
+/// Returns `None` if the header is absent or the buffer was truncated
+/// before the header line ended.
+fn parse_authorization_header(buf: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(buf).ok()?;
+    for line in text.split("\r\n") {
+        if let Some((name, value)) = line.split_once(':') {
+            if name.eq_ignore_ascii_case("authorization") {
+                return Some(value.trim().to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Pump frames from the client until a QUERY_REQUEST (msg_kind 0x10)
@@ -2121,5 +2172,106 @@ fn unresolvable_host_surfaces_could_not_resolve_addr() {
         "unresolvable host must surface CouldNotResolveAddr; got {:?}: {}",
         err.code(),
         err.msg()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// On-wire `Authorization` header coverage
+//
+// Pin the exact bytes the client emits for each auth mode so a
+// regression in `AuthMode::header_value()` (or in the WebSocket
+// upgrade glue that copies it onto the request) cannot pass
+// silently. The unit tests in `egress::auth` cover the formatter in
+// isolation; the tests below cover the path from connect-string ->
+// upgrade-request bytes that actually hit the socket.
+// ---------------------------------------------------------------------------
+
+/// Run a single happy-path query against a local mock and return the
+/// `Authorization` header value the mock observed on the WS upgrade.
+/// Panics if no connection (and therefore no captured value) was
+/// recorded — every test that calls this expects exactly one accept.
+fn capture_auth_header_for_conf(conf_suffix: &str) -> Option<String> {
+    let srv = MockServer::start(vec![happy_script(ServerRole::Standalone, "n0")]);
+    let conf = format!("qwp::addr={};{}", srv.url(), conf_suffix);
+    let mut reader = Reader::from_conf(&conf).expect("connect");
+    let mut cursor = reader.query("select 1").execute().expect("execute");
+    // Drain to terminal so the test only returns once the upgrade
+    // request has definitely been seen by the mock.
+    while cursor.next_batch().expect("next_batch").is_some() {}
+    drop(cursor);
+    drop(reader);
+    let captured = srv.captured_auth_headers();
+    assert_eq!(
+        captured.len(),
+        1,
+        "expected exactly one accepted connection, got {}: {:?}",
+        captured.len(),
+        captured
+    );
+    captured.into_iter().next().unwrap()
+}
+
+/// Basic auth: `username` + `password` must serialise on the wire as
+/// `Basic base64(user:pass)`. The base64 here is `admin:quest`.
+#[test]
+fn basic_auth_header_emitted_on_wire() {
+    let header = capture_auth_header_for_conf("username=admin;password=quest");
+    assert_eq!(header.as_deref(), Some("Basic YWRtaW46cXVlc3Q="));
+}
+
+/// Bearer/OIDC: `token=...` must serialise as `Bearer <token>`.
+#[test]
+fn bearer_auth_header_emitted_on_wire() {
+    let header = capture_auth_header_for_conf("token=eyJhbGciOi.payload.sig");
+    assert_eq!(header.as_deref(), Some("Bearer eyJhbGciOi.payload.sig"));
+}
+
+/// Verbatim escape hatch: `auth=<value>` must serialise the value
+/// unchanged (no scheme prefix added by the client).
+#[test]
+fn verbatim_auth_header_emitted_on_wire() {
+    let header = capture_auth_header_for_conf("auth=Custom abc123");
+    assert_eq!(header.as_deref(), Some("Custom abc123"));
+}
+
+/// No auth knobs in the connect string -> no `Authorization` header
+/// on the wire. Pins the absence so a future regression that defaults
+/// to some sentinel value (empty `Basic`, "Bearer ", etc.) cannot
+/// pass silently.
+#[test]
+fn no_auth_means_no_authorization_header() {
+    let srv = MockServer::start(vec![happy_script(ServerRole::Standalone, "n0")]);
+    let conf = format!("qwp::addr={}", srv.url());
+    let mut reader = Reader::from_conf(&conf).expect("connect");
+    let mut cursor = reader.query("select 1").execute().expect("execute");
+    while cursor.next_batch().expect("next_batch").is_some() {}
+    drop(cursor);
+    drop(reader);
+    let captured = srv.captured_auth_headers();
+    assert_eq!(captured, vec![None]);
+}
+
+/// 401-path coverage: even when the server rejects the upgrade, the
+/// client must still have put the `Authorization` header on the wire
+/// (otherwise the auth failure tells us nothing). Hand-rolled
+/// `reject_upgrade` parses the raw HTTP preamble for the header so
+/// this assertion holds without going through `accept_hdr`.
+#[test]
+fn auth_header_is_emitted_before_401_rejection() {
+    let srv = MockServer::start(vec![vec![Action::Reject401]]);
+    let conf = format!(
+        "qwp::addr={};username=admin;password=quest;failover=off",
+        srv.url()
+    );
+    let err = match Reader::from_conf(&conf) {
+        Err(e) => e,
+        Ok(_) => panic!("Reject401 mock must surface as a connect error"),
+    };
+    assert_eq!(err.code(), ErrorCode::AuthError);
+    let captured = srv.captured_auth_headers();
+    assert_eq!(
+        captured,
+        vec![Some("Basic YWRtaW46cXVlc3Q=".to_string())],
+        "client must still have emitted the Authorization header even though the server rejected the upgrade"
     );
 }
