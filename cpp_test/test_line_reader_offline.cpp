@@ -100,6 +100,132 @@ TEST_CASE("error accessors are NULL-safe (M-13)")
 }
 
 // ---------------------------------------------------------------------------
+// NULL-safe accessor regression suite.
+//
+// The library documents two NULL policies on the FFI surface:
+//
+//   1. "Idempotent on NULL" — the various `_free` / `_close` paths and
+//      the error accessors. Tested above.
+//   2. "Returns a documented sentinel on NULL" — the reader stat getters,
+//      every `line_reader_server_info_*` accessor, and every
+//      `line_reader_failover_event_*` accessor. Their guard is a cheap
+//      `is_null()` check; a regression that drops the guard would cause
+//      a SIGSEGV here rather than returning the documented sentinel.
+//
+// Functions in the third bucket — "NULL is UB" (cursor / query lifecycle
+// ops, every `line_reader_cursor_get_*`, the bind family) — are NOT
+// exercised here. Their guard, when present, is `process::abort()`, which
+// can't be observed from a doctest TEST_CASE without subprocess isolation.
+// The C header explicitly forbids NULL on those entry points.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("reader stat / accessor getters return documented sentinels on NULL")
+{
+    CHECK(line_reader_bytes_received(nullptr) == 0);
+    CHECK(line_reader_credit_granted_total(nullptr) == 0);
+    CHECK(line_reader_read_ns(nullptr) == 0);
+    CHECK(line_reader_decode_ns(nullptr) == 0);
+
+    // Mutating no-op: must not crash, no observable state change.
+    line_reader_reset_timing(nullptr);
+
+    {
+        // _server_version: returns false, populates *err_out when err_out
+        // is non-NULL.
+        line_reader_error* err = nullptr;
+        uint8_t version = 0xAB;
+        bool ok = line_reader_server_version(nullptr, &version, &err);
+        CHECK_FALSE(ok);
+        REQUIRE(err != nullptr);
+        CHECK(line_reader_error_get_code(err) ==
+              line_reader_error_invalid_api_call);
+        line_reader_error_free(err);
+    }
+    {
+        // _server_version with err_out itself NULL: must not write
+        // through the NULL pointer.
+        uint8_t version = 0xAB;
+        bool ok = line_reader_server_version(nullptr, &version, nullptr);
+        CHECK_FALSE(ok);
+    }
+
+    CHECK(line_reader_current_server_info(nullptr) == nullptr);
+
+    {
+        const char* host_buf = reinterpret_cast<const char*>(0x1);
+        size_t host_len = 999;
+        line_reader_current_addr_host(nullptr, &host_buf, &host_len);
+        CHECK(host_buf == nullptr);
+        CHECK(host_len == 0);
+    }
+
+    CHECK(line_reader_current_addr_port(nullptr) == 0);
+}
+
+TEST_CASE("server_info accessors return documented sentinels on NULL")
+{
+    CHECK(line_reader_server_info_role(nullptr) ==
+          line_reader_server_role_other);
+    CHECK(line_reader_server_info_role_byte(nullptr) == 0xFF);
+    CHECK(line_reader_server_info_epoch(nullptr) == 0);
+    CHECK(line_reader_server_info_capabilities(nullptr) == 0);
+    CHECK(line_reader_server_info_server_wall_ns(nullptr) == 0);
+
+    {
+        const char* buf = reinterpret_cast<const char*>(0x1);
+        size_t len = 999;
+        line_reader_server_info_cluster_id(nullptr, &buf, &len);
+        CHECK(buf == nullptr);
+        CHECK(len == 0);
+    }
+    {
+        const char* buf = reinterpret_cast<const char*>(0x1);
+        size_t len = 999;
+        line_reader_server_info_node_id(nullptr, &buf, &len);
+        CHECK(buf == nullptr);
+        CHECK(len == 0);
+    }
+}
+
+TEST_CASE("failover_event accessors return documented sentinels on NULL")
+{
+    {
+        const char* buf = reinterpret_cast<const char*>(0x1);
+        size_t len = 999;
+        line_reader_failover_event_failed_host(nullptr, &buf, &len);
+        CHECK(buf == nullptr);
+        CHECK(len == 0);
+    }
+    CHECK(line_reader_failover_event_failed_port(nullptr) == 0);
+
+    {
+        const char* buf = reinterpret_cast<const char*>(0x1);
+        size_t len = 999;
+        line_reader_failover_event_new_host(nullptr, &buf, &len);
+        CHECK(buf == nullptr);
+        CHECK(len == 0);
+    }
+    CHECK(line_reader_failover_event_new_port(nullptr) == 0);
+    CHECK(line_reader_failover_event_new_request_id(nullptr) == 0);
+    CHECK(line_reader_failover_event_attempts(nullptr) == 0);
+    CHECK(line_reader_failover_event_elapsed_ns(nullptr) == 0);
+
+    // _trigger_code mirrors `_error_get_code(NULL)`: same sentinel.
+    CHECK(line_reader_failover_event_trigger_code(nullptr) ==
+          line_reader_error_invalid_api_call);
+
+    {
+        const char* buf = reinterpret_cast<const char*>(0x1);
+        size_t len = 999;
+        line_reader_failover_event_trigger_msg(nullptr, &buf, &len);
+        CHECK(buf == nullptr);
+        CHECK(len == 0);
+    }
+
+    CHECK(line_reader_failover_event_server_info(nullptr) == nullptr);
+}
+
+// ---------------------------------------------------------------------------
 // `line_reader_from_conf` rejection paths — exercise the ConfigError surface.
 // ---------------------------------------------------------------------------
 
