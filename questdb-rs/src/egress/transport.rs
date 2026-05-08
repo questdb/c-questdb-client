@@ -586,10 +586,46 @@ fn map_ws_error_during_handshake(e: tungstenite::Error) -> Error {
         T::Url(U::UnableToConnect(_)) => ErrorCode::SocketError,
         T::Url(_) => ErrorCode::ConfigError,
         T::Tls(_) => ErrorCode::TlsError,
+        // Tungstenite-with-rustls reports cert validation / handshake
+        // failures via its `Io` variant (rustls wraps its own errors
+        // in `io::Error`). Peel the IO jacket so cert problems don't
+        // get misclassified as `SocketError` — failover keeps walking
+        // on `SocketError`, but a TLS-class failure (untrusted cert,
+        // hostname mismatch, protocol version mismatch) is a config
+        // problem the user has to fix, not a transient one to retry.
+        T::Io(io_err) if is_tls_io_error(io_err) => ErrorCode::TlsError,
         T::Io(_) => ErrorCode::SocketError,
         _ => ErrorCode::HandshakeError,
     };
     Error::new(code, format!("WebSocket handshake failed: {}", msg))
+}
+
+/// Best-effort classifier: does this `io::Error` actually carry a
+/// rustls TLS failure underneath? Rustls returns its errors via
+/// `io::Error::other(rustls::Error)` (or wraps them in
+/// `ErrorKind::InvalidData` for cert-validation failures), so
+/// downcasting through `get_ref()` is the canonical way to recover
+/// the TLS classification. Falls back to a substring check on the
+/// rendered message for older tungstenite/rustls combinations that
+/// don't preserve the source chain.
+fn is_tls_io_error(e: &std::io::Error) -> bool {
+    if let Some(src) = e.get_ref() {
+        if src.downcast_ref::<rustls::Error>().is_some() {
+            return true;
+        }
+        // Walk the chain — some rustls errors are double-wrapped
+        // (e.g. `io::Error -> io::Error -> rustls::Error`) by the
+        // tungstenite TLS adapter.
+        let mut cur: Option<&(dyn std::error::Error + 'static)> = src.source();
+        while let Some(s) = cur {
+            if s.downcast_ref::<rustls::Error>().is_some() {
+                return true;
+            }
+            cur = s.source();
+        }
+    }
+    let msg = e.to_string();
+    msg.contains("invalid peer certificate") || msg.contains("rustls")
 }
 
 #[allow(dead_code)]
