@@ -1168,11 +1168,17 @@ fn backoff_caps_at_max_ms() {
     let start = Instant::now();
     let _ = cursor.next_batch();
     let elapsed = start.elapsed();
-    // Generous upper bound: a working cap finishes in ~150ms+dials;
-    // a broken cap (no `.min`) would take ~2.5s. 800ms is well below
-    // the uncapped figure but well above any realistic capped run.
+    // A working cap totals ~150 ms of backoff plus the 8 dial round-
+    // trips; an uncapped run would total ~2.55 s of backoff alone
+    // (10+20+40+80+160+320+640+1280) plus dials. The 2 s threshold
+    // sits well below the uncapped *backoff floor* and well above any
+    // realistic capped run — including the slack a loaded CI runner
+    // can add to each dial. Tightening this threshold has bitten us
+    // before on busy CI hosts (a previous 800 ms cap regressed at
+    // 841 ms with the cap correctly applied), so prefer wide head-
+    // room over narrow precision here.
     assert!(
-        elapsed < Duration::from_millis(800),
+        elapsed < Duration::from_millis(2000),
         "elapsed {:?} suggests the backoff cap is not being applied",
         elapsed
     );
