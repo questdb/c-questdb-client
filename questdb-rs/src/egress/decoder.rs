@@ -2363,6 +2363,142 @@ mod tests {
         assert_eq!(err.code(), ErrorCode::ProtocolError);
     }
 
+    /// Splice a custom zstd body onto a 0-row RESULT_BATCH prefix.
+    /// Returns the full FLAG_ZSTD payload ready for `decode_result_batch`.
+    #[cfg(feature = "compression-zstd")]
+    fn zstd_payload_with_body(body: &[u8]) -> Bytes {
+        let (_, raw) = BatchBuilder::new(0).build();
+        let prefix_len = {
+            let mut r = ByteReader::new(&raw);
+            r.read_u8().unwrap();
+            r.read_i64_le().unwrap();
+            r.read_varint_u64().unwrap();
+            raw.len() - r.remaining().len()
+        };
+        let mut out = raw[..prefix_len].to_vec();
+        out.extend_from_slice(body);
+        Bytes::from(out)
+    }
+
+    /// Hand-roll a zstd frame whose Frame_Header_Descriptor declares
+    /// an explicit 8-byte Frame_Content_Size set to `forged`. The
+    /// frame body is a single empty raw "last" block — enough for
+    /// `get_frame_content_size` to parse but cheap enough that we
+    /// never actually have to decompress 64+ MiB.
+    #[cfg(feature = "compression-zstd")]
+    fn forged_fcs_zstd_frame(forged: u64) -> Vec<u8> {
+        let mut frame = vec![0x28, 0xB5, 0x2F, 0xFD]; // magic
+        // FHD: FCS_flag=3 (8-byte FCS), Single_Segment_flag=1, no
+        // Content_Checksum, no Dictionary_ID -> 0xC0 | 0x20 = 0xE0.
+        // Single_Segment=1 means the Window_Descriptor byte is omitted.
+        frame.push(0xE0);
+        frame.extend_from_slice(&forged.to_le_bytes());
+        // One last raw block of size 0: header bits 23..3 = 0,
+        // bits 2..1 = 0 (raw), bit 0 = 1 (last) -> 0x01 0x00 0x00.
+        frame.extend_from_slice(&[0x01, 0x00, 0x00]);
+        frame
+    }
+
+    /// FLAG_ZSTD body whose zstd frame omits the Frame_Content_Size.
+    /// `zstd::stream::write::Encoder` does not write FCS unless the
+    /// caller invokes `set_pledged_src_size`, so this exercises the
+    /// `Ok(None)` arm of `get_frame_content_size`.
+    #[cfg(feature = "compression-zstd")]
+    #[test]
+    fn zstd_frame_without_content_size_is_protocol_error() {
+        use std::io::Write;
+        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 0).unwrap();
+        encoder.write_all(b"some bytes that will never be read").unwrap();
+        let body = encoder.finish().expect("zstd encode");
+        // Sanity-check that the encoder really did omit FCS — if a
+        // future zstd-rs default flips, this assertion catches it
+        // before the test produces a misleading false-pass.
+        assert!(
+            matches!(zstd::zstd_safe::get_frame_content_size(&body), Ok(None)),
+            "zstd::Encoder default must produce a frame without FCS; \
+             header bytes: {:02x?}",
+            &body[..body.len().min(16)]
+        );
+
+        let payload = zstd_payload_with_body(&body);
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let err = decode_result_batch(&payload, flags::ZSTD, &mut dict, &mut reg).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ProtocolError);
+        assert!(
+            err.msg().contains("missing content size"),
+            "expected missing-content-size message, got: {}",
+            err.msg()
+        );
+    }
+
+    /// FLAG_ZSTD body whose frame header advertises a content size
+    /// just above the 64 MiB cap. The decoder must reject before
+    /// allocating any decompression buffer.
+    #[cfg(feature = "compression-zstd")]
+    #[test]
+    fn zstd_frame_exceeding_cap_is_limit_exceeded() {
+        let oversized = MAX_ZSTD_DECOMPRESSED + 1;
+        let frame = forged_fcs_zstd_frame(oversized);
+        // Sanity-check that get_frame_content_size sees what we forged.
+        assert_eq!(
+            zstd::zstd_safe::get_frame_content_size(&frame).ok(),
+            Some(Some(oversized)),
+            "forged FCS bytes must round-trip through zstd"
+        );
+
+        let payload = zstd_payload_with_body(&frame);
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let err = decode_result_batch(&payload, flags::ZSTD, &mut dict, &mut reg).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::LimitExceeded);
+        assert!(
+            err.msg().contains("exceeds client cap"),
+            "expected cap-exceeded message, got: {}",
+            err.msg()
+        );
+    }
+
+    /// FLAG_ZSTD body whose frame header advertises a content size
+    /// that disagrees with the actual decompressed length. zstd's own
+    /// validator catches the mismatch first; the decoder maps it to
+    /// `ProtocolError`. Pins coverage of the post-decompress failure
+    /// arm so a future refactor that drops zstd's internal check is
+    /// still caught by *some* layer.
+    #[cfg(feature = "compression-zstd")]
+    #[test]
+    fn zstd_frame_with_size_mismatch_is_protocol_error() {
+        use std::io::Write;
+        // Lie to zstd: claim 100 bytes, then write fewer. The encoder
+        // writes the pledged size into the FCS but does not enforce
+        // the byte count on `finish()`.
+        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 0).unwrap();
+        encoder.set_pledged_src_size(Some(100)).ok();
+        encoder.write_all(b"only ten!!").unwrap(); // 10 bytes, not 100
+        let body = match encoder.finish() {
+            Ok(b) => b,
+            Err(_) => {
+                // Some zstd versions enforce the pledge on finish; if
+                // so, this test cannot synthesise the mismatch and we
+                // skip rather than false-pass. The defensive
+                // post-decompress check at decoder.rs:1429 is then
+                // verified only by code review.
+                return;
+            }
+        };
+        // Sanity: the FCS must say 100 even though we wrote 10.
+        assert_eq!(
+            zstd::zstd_safe::get_frame_content_size(&body).ok(),
+            Some(Some(100))
+        );
+
+        let payload = zstd_payload_with_body(&body);
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let err = decode_result_batch(&payload, flags::ZSTD, &mut dict, &mut reg).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ProtocolError);
+    }
+
     #[test]
     fn rejects_unknown_temporal_discriminator() {
         // 1 timestamp column, gorilla flag, but an unknown discriminator

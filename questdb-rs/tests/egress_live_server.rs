@@ -2753,19 +2753,20 @@ fn zstd_compressed_multi_batch() {
     assert!(batch_count >= TOTAL / PER_BATCH);
     assert_eq!(first_value, Some(0));
     assert_eq!(last_value, Some(TOTAL as i64 - 1));
-    // With compression=zstd negotiated and 5000 rows of monotonic-int
-    // data (highly compressible), at least some batches usually arrive
-    // zstd-encoded. The server's heuristic isn't guaranteed though —
-    // small batches or a tight time budget can keep frames raw — so
-    // surface a 0-count as a soft warning rather than failing the
-    // test, since the FLAG_ZSTD decode path itself is exercised
-    // independently by the encoder unit tests.
-    if compressed_batches == 0 {
-        eprintln!(
-            "[zstd_compressed_multi_batch] WARNING: no batches arrived with \
-             FLAG_ZSTD set; FLAG_ZSTD decode path was not exercised this run"
-        );
-    }
+    // 5000 rows of monotonic-int + scaled-double data is highly
+    // compressible; with `compression=zstd` negotiated, at least some
+    // batches must arrive FLAG_ZSTD-encoded. Hard-assert so a server-
+    // side regression (or a heuristic change that silently disables
+    // compression on this shape) cannot turn this test into a no-op.
+    // The FLAG_ZSTD decode path is also exercised independently by
+    // the decoder unit tests in `decoder::tests::zstd_*`.
+    assert!(
+        compressed_batches > 0,
+        "expected at least one batch to arrive with FLAG_ZSTD set; \
+         got {} batches with {} compressed",
+        batch_count,
+        compressed_batches
+    );
     assert!(matches!(cursor.terminal(), Some(Terminal::End { .. })));
 }
 
