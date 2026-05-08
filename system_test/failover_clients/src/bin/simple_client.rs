@@ -25,9 +25,7 @@ fn main() {
     let conf = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "qwp::addr=localhost:9000".into());
-    let sql: String = std::env::args()
-        .nth(2)
-        .unwrap_or_else(|| "SELECT 1".into());
+    let sql: String = std::env::args().nth(2).unwrap_or_else(|| "SELECT 1".into());
 
     let mut reader = Reader::from_conf(&conf).expect("connect");
     eprintln!(

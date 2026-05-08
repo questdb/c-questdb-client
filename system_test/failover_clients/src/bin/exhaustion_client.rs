@@ -47,9 +47,7 @@ fn main() {
     let conf = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "qwp::addr=localhost:9000".into());
-    let sql: String = std::env::args()
-        .nth(2)
-        .unwrap_or_else(|| "select 1".into());
+    let sql: String = std::env::args().nth(2).unwrap_or_else(|| "select 1".into());
 
     let mut reader = Reader::from_conf(&conf).expect("connect");
     eprintln!(
@@ -107,11 +105,7 @@ fn main() {
                 "next_batch returned Ok after every endpoint was killed".into(),
             ),
             Err(e) => {
-                eprintln!(
-                    "exhausted_code={:?} exhausted_msg={}",
-                    e.code(),
-                    e.msg()
-                );
+                eprintln!("exhausted_code={:?} exhausted_msg={}", e.code(), e.msg());
                 e.code()
             }
         }

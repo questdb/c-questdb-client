@@ -3061,7 +3061,7 @@ pub unsafe extern "C" fn line_reader_cursor_column_validity(
             Some(v) => v,
             None => return false,
         };
-        let validity = column_view_validity(&view);
+        let validity = column_view_validity(view);
         // A `Validity::None` wire variant and an empty bitmap both mean
         // "no nulls present"; surface both as a NULL pointer so the
         // documented "out_buf == NULL ⇔ no nulls" contract holds.

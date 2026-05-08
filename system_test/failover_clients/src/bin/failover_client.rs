@@ -43,9 +43,7 @@ fn main() {
     let conf = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "qwp::addr=localhost:9000".into());
-    let sql: String = std::env::args()
-        .nth(2)
-        .unwrap_or_else(|| "SELECT 1".into());
+    let sql: String = std::env::args().nth(2).unwrap_or_else(|| "SELECT 1".into());
 
     let mut reader = Reader::from_conf(&conf).expect("connect");
     eprintln!(
@@ -96,7 +94,10 @@ fn main() {
 
     let mut line = String::new();
     let stdin = std::io::stdin();
-    stdin.lock().read_line(&mut line).expect("read stdin signal");
+    stdin
+        .lock()
+        .read_line(&mut line)
+        .expect("read stdin signal");
 
     // Phase 3: drain the remaining batches. The auto-replenish CREDIT
     // frame queued during Phase 1's `next_batch` call may have failed

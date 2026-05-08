@@ -114,6 +114,16 @@ stages:
               cd tls_proxy
               cargo clippy --all-targets --all-features -- -D warnings
             displayName: "tls_proxy: clippy"
+          - script: |
+              cd system_test
+              cd failover_clients
+              cargo fmt --all -- --check
+            displayName: "failover_clients: fmt"
+          - script: |
+              cd system_test
+              cd failover_clients
+              cargo clippy --all-targets --all-features -- -D warnings
+            displayName: "failover_clients: clippy"
       - job: TestVsQuestDBMaster
         displayName: "Vs QuestDB 'master'"
         pool:

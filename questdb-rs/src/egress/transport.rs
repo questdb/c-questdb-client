@@ -145,18 +145,10 @@ impl WsTransport {
         // `Other` — losing the user-actionable distinction.
         let mut addrs = (endpoint.host.as_str(), endpoint.port)
             .to_socket_addrs()
-            .map_err(|e| {
-                fmt!(
-                    CouldNotResolveAddr,
-                    "could not resolve {}: {}",
-                    endpoint,
-                    e
-                )
-            })?;
+            .map_err(|e| fmt!(CouldNotResolveAddr, "could not resolve {}: {}", endpoint, e))?;
         let tcp = match addrs.next() {
-            Some(addr) => TcpStream::connect(addr).map_err(|e| {
-                fmt!(SocketError, "could not connect to {}: {}", endpoint, e)
-            })?,
+            Some(addr) => TcpStream::connect(addr)
+                .map_err(|e| fmt!(SocketError, "could not connect to {}: {}", endpoint, e))?,
             None => {
                 return Err(fmt!(
                     CouldNotResolveAddr,
