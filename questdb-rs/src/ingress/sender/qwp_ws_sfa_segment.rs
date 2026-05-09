@@ -105,9 +105,9 @@ pub(crate) struct SfaAppend {
 
 #[derive(Debug)]
 pub(crate) struct SfaSegment {
-    file: File,
+    file: Option<File>,
     mapping: Arc<SfaSegmentMapping>,
-    path: PathBuf,
+    path: Option<PathBuf>,
     size_bytes: u64,
     header: SfaSegmentHeader,
     append_offset: u64,
@@ -164,6 +164,31 @@ impl SfaSegment {
         Self::create_inner(path, base_seq, size_bytes, created_us, true)
     }
 
+    pub(crate) fn create_memory(
+        base_seq: u64,
+        size_bytes: u64,
+        created_us: u64,
+    ) -> Result<Self, SfaSegmentError> {
+        validate_new_segment_args(base_seq, size_bytes)?;
+        let mapping = map_anon_mut(size_bytes)?;
+        let header = SfaSegmentHeader {
+            base_seq,
+            created_us,
+        };
+        mapping.copy_from(0, &encode_header(header));
+
+        Ok(Self {
+            file: None,
+            mapping,
+            path: None,
+            size_bytes,
+            header,
+            append_offset: HEADER_SIZE as u64,
+            frame_count: 0,
+            torn_tail_bytes: 0,
+        })
+    }
+
     fn create_inner(
         path: impl AsRef<Path>,
         base_seq: u64,
@@ -171,11 +196,7 @@ impl SfaSegment {
         created_us: u64,
         create_new: bool,
     ) -> Result<Self, SfaSegmentError> {
-        let min_size = (HEADER_SIZE + FRAME_HEADER_SIZE + 1) as u64;
-        if size_bytes < min_size {
-            return Err(SfaSegmentError::SizeTooSmall { size: size_bytes });
-        }
-        validate_base_seq(base_seq)?;
+        validate_new_segment_args(base_seq, size_bytes)?;
 
         let path = path.as_ref();
         let mut options = OpenOptions::new();
@@ -208,9 +229,9 @@ impl SfaSegment {
         mapping.copy_from(0, &encode_header(header));
 
         Ok(Self {
-            file,
+            file: Some(file),
             mapping,
-            path: path.to_path_buf(),
+            path: Some(path.to_path_buf()),
             size_bytes,
             header,
             append_offset: HEADER_SIZE as u64,
@@ -231,9 +252,9 @@ impl SfaSegment {
         let mapping = map_file_mut(&file, size_bytes)?;
         let scan = mapping.with_full_slice(scan_segment_metadata_bytes)?;
         Ok(Self {
-            file,
+            file: Some(file),
             mapping,
-            path: path.to_path_buf(),
+            path: Some(path.to_path_buf()),
             size_bytes,
             header: scan.header,
             append_offset: scan.append_offset,
@@ -346,8 +367,8 @@ impl SfaSegment {
         self.payload_at_offset_with_limit(offset, append_offset)
     }
 
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
+    pub(crate) fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
     }
 
     pub(crate) fn header(&self) -> SfaSegmentHeader {
@@ -675,6 +696,14 @@ fn validate_base_seq(base_seq: u64) -> Result<(), SfaSegmentError> {
     }
 }
 
+fn validate_new_segment_args(base_seq: u64, size_bytes: u64) -> Result<(), SfaSegmentError> {
+    let min_size = (HEADER_SIZE + FRAME_HEADER_SIZE + 1) as u64;
+    if size_bytes < min_size {
+        return Err(SfaSegmentError::SizeTooSmall { size: size_bytes });
+    }
+    validate_base_seq(base_seq)
+}
+
 fn detect_torn_tail(bytes: &[u8], last_good: usize) -> u64 {
     if last_good >= bytes.len() {
         return 0;
@@ -707,6 +736,13 @@ fn map_file_mut(file: &File, size_bytes: u64) -> Result<Arc<SfaSegmentMapping>, 
             .map_err(SfaSegmentError::Io)?;
         Ok(Arc::new(SfaSegmentMapping::new(mmap)))
     }
+}
+
+fn map_anon_mut(size_bytes: u64) -> Result<Arc<SfaSegmentMapping>, SfaSegmentError> {
+    let len = usize::try_from(size_bytes)
+        .map_err(|_| SfaSegmentError::SizeTooLargeForPlatform { size: size_bytes })?;
+    let mmap = MmapMut::map_anon(len).map_err(SfaSegmentError::Io)?;
+    Ok(Arc::new(SfaSegmentMapping::new(mmap)))
 }
 
 impl std::fmt::Debug for SfaSegmentMapping {
@@ -806,6 +842,22 @@ mod tests {
 
         let bytes = fs::read(path).unwrap();
         assert_eq!(bytes, fixture);
+    }
+
+    #[test]
+    fn create_memory_and_append_uses_same_segment_layout() {
+        let mut segment = SfaSegment::create_memory(42, 64, 1_234_567_890_123).unwrap();
+
+        assert_eq!(segment.path(), None);
+        assert_eq!(segment.try_append(b"one").unwrap(), Some(24));
+        assert_eq!(segment.try_append(b"two-two").unwrap(), Some(35));
+        assert_eq!(segment.append_offset(), 50);
+        assert_eq!(segment.frame_count(), 2);
+
+        let scan = segment.mapping.with_full_slice(scan_segment_bytes).unwrap();
+        assert_eq!(payloads(&scan), vec![b"one".to_vec(), b"two-two".to_vec()]);
+        assert_eq!(scan.append_offset, 50);
+        assert_eq!(scan.torn_tail_bytes, 0);
     }
 
     #[test]

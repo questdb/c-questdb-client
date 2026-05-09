@@ -54,12 +54,12 @@ use super::qwp_ws_codec::WS_OPCODE_BINARY;
 use super::qwp_ws_codec::{self as codec, PipelinedResponse};
 use super::qwp_ws_ownership::{QwpWsErrorCategory, QwpWsErrorPolicy, QwpWsSenderError};
 use super::qwp_ws_queue::{
-    LockFreeVolatileProducer, LockFreeVolatilePublicationLog, OutboundFrame, OutboundFrameView,
-    PendingPayload, QueueError, QwpReceipt, QwpReceiptStatus, SentFrame, VolatileFrameQueue,
-    VolatileQueueOptions,
+    OutboundFrame, OutboundFrameView, PendingPayload, QueueError, QwpReceipt, QwpReceiptStatus,
+    SentFrame,
 };
 use super::qwp_ws_sfa_queue::{
-    SfaCleanupFailure, SfaProducer, SfaStorageFinish, SfaStorageResult, SfaStorageStep,
+    SfaCleanupFailure, SfaFrameQueue, SfaMemoryQueueOptions, SfaProducer, SfaStorageFinish,
+    SfaStorageResult, SfaStorageStep,
 };
 
 const DEFAULT_EVENT_CAPACITY: usize = 1024;
@@ -106,7 +106,7 @@ impl ReconnectPolicy {
 }
 
 #[derive(Debug)]
-pub(crate) struct ManualDriverPrototype<Q = VolatileFrameQueue, T = FakeOrderedServer> {
+pub(crate) struct ManualDriverPrototype<Q = SfaFrameQueue, T = FakeOrderedServer> {
     store: QwpWsPublicationStore<Q>,
     send_core: QwpWsSendCore<T>,
 }
@@ -213,7 +213,7 @@ impl PublicationLifecycle {
 }
 
 #[derive(Debug)]
-pub(crate) struct QwpWsPublicationStore<Q = VolatileFrameQueue> {
+pub(crate) struct QwpWsPublicationStore<Q = SfaFrameQueue> {
     queue: Q,
     events: DriverEventRing,
     lifecycle: PublicationLifecycle,
@@ -259,12 +259,8 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         Ok(receipt)
     }
 
-    pub(crate) fn take_lock_free_producer(&mut self) -> Option<LockFreeVolatileProducer> {
-        self.queue.take_lock_free_producer()
-    }
-
-    pub(crate) fn take_sfa_producer(&mut self) -> Option<SfaProducer> {
-        self.queue.take_sfa_producer()
+    pub(crate) fn take_producer(&mut self) -> Option<SfaProducer> {
+        self.queue.take_producer()
     }
 
     pub(crate) fn next_outbound_frame(
@@ -918,12 +914,12 @@ impl<T: ManualDriverTransport> QwpWsSendCore<T> {
     }
 }
 
-impl ManualDriverPrototype<VolatileFrameQueue> {
+impl ManualDriverPrototype<SfaFrameQueue> {
     pub(crate) fn new(
-        options: VolatileQueueOptions,
+        options: SfaMemoryQueueOptions,
         server: FakeOrderedServer,
     ) -> Result<Self, DriverError> {
-        let queue = VolatileFrameQueue::new(options)?;
+        let queue = SfaFrameQueue::open_memory(options)?;
         let max_in_flight = queue.max_in_flight();
         Ok(Self {
             store: QwpWsPublicationStore::new(queue, DEFAULT_EVENT_CAPACITY),
@@ -1013,6 +1009,7 @@ impl<Q: PublicationLog, T: ManualDriverTransport> ManualDriverPrototype<Q, T> {
                 Err(DriverError::Queue(
                     QueueError::FrameCapacityFull { .. }
                     | QueueError::ByteCapacityFull { .. }
+                    | QueueError::MaxInFlightReached { .. }
                     | QueueError::StorageSpareNotReady { .. }
                     | QueueError::StorageSegmentCapFull { .. },
                 )) if drive_steps < max_drive_steps => {
@@ -1022,6 +1019,7 @@ impl<Q: PublicationLog, T: ManualDriverTransport> ManualDriverPrototype<Q, T> {
                 Err(DriverError::Queue(
                     err @ (QueueError::FrameCapacityFull { .. }
                     | QueueError::ByteCapacityFull { .. }
+                    | QueueError::MaxInFlightReached { .. }
                     | QueueError::StorageSpareNotReady { .. }
                     | QueueError::StorageSegmentCapFull { .. }),
                 )) => {
@@ -1034,7 +1032,6 @@ impl<Q: PublicationLog, T: ManualDriverTransport> ManualDriverPrototype<Q, T> {
                         QueueError::InvalidCapacity
                         | QueueError::EmptyPayload
                         | QueueError::PayloadExceedsByteCapacity { .. }
-                        | QueueError::MaxInFlightReached { .. }
                         | QueueError::NoUnsentFrame
                         | QueueError::ProtocolAckWithoutConnection
                         | QueueError::ProtocolAckBeyondSent { .. }
@@ -1630,10 +1627,7 @@ fn double_duration(duration: Duration) -> Duration {
 
 pub(crate) trait PublicationLog {
     fn try_publish(&mut self, payload: &[u8]) -> Result<QwpReceipt, DriverError>;
-    fn take_lock_free_producer(&mut self) -> Option<LockFreeVolatileProducer> {
-        None
-    }
-    fn take_sfa_producer(&mut self) -> Option<SfaProducer> {
+    fn take_producer(&mut self) -> Option<SfaProducer> {
         None
     }
     fn next_outbound_frame(
@@ -2129,90 +2123,6 @@ impl ManualDriverTransport for BlockingQwpWsTransport {
     }
 }
 
-impl PublicationLog for VolatileFrameQueue {
-    fn try_publish(&mut self, payload: &[u8]) -> Result<QwpReceipt, DriverError> {
-        Ok(VolatileFrameQueue::try_submit(self, payload)?)
-    }
-
-    fn pending_payload_for_fsn(&self, fsn: u64) -> Result<Option<PendingPayload>, DriverError> {
-        Ok(VolatileFrameQueue::pending_payload_for_fsn(self, fsn))
-    }
-
-    fn oldest_unresolved_fsn(&self) -> Option<u64> {
-        VolatileFrameQueue::oldest_unresolved_fsn(self)
-    }
-
-    fn complete_through(&mut self, fsn: u64) -> Result<(), DriverError> {
-        Ok(VolatileFrameQueue::complete_through_fsn(self, fsn)?)
-    }
-
-    fn reject_fsn(&mut self, fsn: u64) -> Result<QwpReceipt, DriverError> {
-        Ok(VolatileFrameQueue::reject_fsn(self, fsn)?)
-    }
-
-    fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus {
-        VolatileFrameQueue::receipt_status(self, receipt)
-    }
-
-    fn published_fsn(&self) -> Option<u64> {
-        VolatileFrameQueue::published_fsn(self)
-    }
-
-    fn completed_fsn(&self) -> Option<u64> {
-        VolatileFrameQueue::completed_fsn(self)
-    }
-
-    fn max_in_flight(&self) -> usize {
-        VolatileFrameQueue::max_in_flight(self)
-    }
-}
-
-impl PublicationLog for LockFreeVolatilePublicationLog {
-    fn try_publish(&mut self, payload: &[u8]) -> Result<QwpReceipt, DriverError> {
-        Ok(LockFreeVolatilePublicationLog::try_submit(self, payload)?)
-    }
-
-    fn take_lock_free_producer(&mut self) -> Option<LockFreeVolatileProducer> {
-        LockFreeVolatilePublicationLog::take_producer(self)
-    }
-
-    fn pending_payload_for_fsn(&self, fsn: u64) -> Result<Option<PendingPayload>, DriverError> {
-        Ok(LockFreeVolatilePublicationLog::pending_payload_for_fsn(
-            self, fsn,
-        ))
-    }
-
-    fn oldest_unresolved_fsn(&self) -> Option<u64> {
-        LockFreeVolatilePublicationLog::oldest_unresolved_fsn(self)
-    }
-
-    fn complete_through(&mut self, fsn: u64) -> Result<(), DriverError> {
-        Ok(LockFreeVolatilePublicationLog::complete_through_fsn(
-            self, fsn,
-        )?)
-    }
-
-    fn reject_fsn(&mut self, fsn: u64) -> Result<QwpReceipt, DriverError> {
-        Ok(LockFreeVolatilePublicationLog::reject_fsn(self, fsn)?)
-    }
-
-    fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus {
-        LockFreeVolatilePublicationLog::receipt_status(self, receipt)
-    }
-
-    fn published_fsn(&self) -> Option<u64> {
-        LockFreeVolatilePublicationLog::published_fsn(self)
-    }
-
-    fn completed_fsn(&self) -> Option<u64> {
-        LockFreeVolatilePublicationLog::completed_fsn(self)
-    }
-
-    fn max_in_flight(&self) -> usize {
-        LockFreeVolatilePublicationLog::max_in_flight(self)
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum DriverError {
     Queue(QueueError),
@@ -2334,6 +2244,7 @@ fn driver_backpressure_queue(err: &DriverError) -> Option<QueueError> {
         DriverError::Queue(
             err @ (QueueError::FrameCapacityFull { .. }
             | QueueError::ByteCapacityFull { .. }
+            | QueueError::MaxInFlightReached { .. }
             | QueueError::StorageSpareNotReady { .. }
             | QueueError::StorageSegmentCapFull { .. }),
         ) => Some(*err),
@@ -2822,12 +2733,20 @@ mod tests {
     #[cfg(feature = "sync-sender-qwp-ws")]
     use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
-    fn options(max_frames: usize, max_bytes: usize, max_in_flight: usize) -> VolatileQueueOptions {
-        VolatileQueueOptions {
-            max_frames,
+    fn options(
+        _max_frames: usize,
+        max_bytes: usize,
+        max_in_flight: usize,
+    ) -> SfaMemoryQueueOptions {
+        SfaMemoryQueueOptions {
+            segment_size_bytes: 256,
             max_bytes,
             max_in_flight,
         }
+    }
+
+    fn memory_queue(options: SfaMemoryQueueOptions) -> SfaFrameQueue {
+        SfaFrameQueue::open_memory(options).unwrap()
     }
 
     fn driver(server: FakeOrderedServer) -> ManualDriverPrototype {
@@ -2836,19 +2755,16 @@ mod tests {
 
     fn durable_driver(server: FakeOrderedServer) -> ManualDriverPrototype {
         ManualDriverPrototype::from_queue_with_durable_ack(
-            VolatileFrameQueue::new(options(8, 1024, 4)).unwrap(),
+            memory_queue(options(8, 1024, 4)),
             server,
         )
     }
 
     fn durable_driver_with_options(
-        options: VolatileQueueOptions,
+        options: SfaMemoryQueueOptions,
         server: FakeOrderedServer,
     ) -> ManualDriverPrototype {
-        ManualDriverPrototype::from_queue_with_durable_ack(
-            VolatileFrameQueue::new(options).unwrap(),
-            server,
-        )
+        ManualDriverPrototype::from_queue_with_durable_ack(memory_queue(options), server)
     }
 
     fn driver_with_event_capacity(
@@ -2856,7 +2772,7 @@ mod tests {
         event_capacity: usize,
     ) -> ManualDriverPrototype {
         ManualDriverPrototype::from_queue_with_event_capacity(
-            VolatileFrameQueue::new(options(8, 1024, 4)).unwrap(),
+            memory_queue(options(8, 1024, 4)),
             server,
             event_capacity,
         )
@@ -3101,7 +3017,7 @@ mod tests {
         let buffer = qwp_buffer("SYM_001", 7, 1_000);
         let expected = replay_payload(&buffer);
         let driver = ManualDriverPrototype::from_queue(
-            VolatileFrameQueue::new(options(8, 4096, 4)).unwrap(),
+            memory_queue(options(8, 4096, 4)),
             TestTransport::scripted([Ok(TransportSendResult::NoResponse)]),
         );
         let mut publisher = QwpWsPublicationDriver::new(driver, 1);
@@ -3128,7 +3044,7 @@ mod tests {
     fn publisher_rejects_empty_buffer_without_publication() {
         let buffer = Buffer::qwp_ws_with_max_name_len(127);
         let driver = ManualDriverPrototype::from_queue(
-            VolatileFrameQueue::new(options(8, 4096, 4)).unwrap(),
+            memory_queue(options(8, 4096, 4)),
             TestTransport::scripted([]),
         );
         let mut publisher = QwpWsPublicationDriver::new(driver, 1);
@@ -3155,7 +3071,7 @@ mod tests {
         let second = qwp_buffer("SYM_002", 2, 2_000);
         let third = qwp_buffer("SYM_003", 3, 3_000);
         let driver = ManualDriverPrototype::from_queue(
-            VolatileFrameQueue::new(options(1, 4096, 1)).unwrap(),
+            memory_queue(options(1, 4096, 1)),
             TestTransport::scripted([Ok(TransportSendResult::Response(TransportResponse::Ack {
                 wire_seq: 0,
             }))]),
@@ -3170,8 +3086,8 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            QwpWsPublicationError::Driver(DriverError::Queue(QueueError::FrameCapacityFull {
-                max_frames: 1
+            QwpWsPublicationError::Driver(DriverError::Queue(QueueError::MaxInFlightReached {
+                max_in_flight: 1
             }))
         ));
         assert_eq!(
@@ -3186,14 +3102,14 @@ mod tests {
     }
 
     /// Run with:
-    /// `cargo test --features sync-sender-qwp-ws --lib publisher_lock_free_memory_zero_alloc_after_warmup -- --ignored --test-threads=1`
+    /// `cargo test --features sync-sender-qwp-ws --lib publisher_memory_sfa_zero_alloc_after_warmup -- --ignored --test-threads=1`
     #[test]
     #[ignore]
-    fn publisher_lock_free_memory_zero_alloc_after_warmup() {
+    fn publisher_memory_sfa_zero_alloc_after_warmup() {
         use crate::alloc_counter;
 
         let buffer = qwp_buffer("SYM_001", 7, 1_000);
-        let queue = LockFreeVolatilePublicationLog::new(options(8, 4096, 4)).unwrap();
+        let queue = memory_queue(options(8, 4096, 4));
         let driver = ManualDriverPrototype::from_queue(queue, FakeOrderedServer::ack_each_send());
         let mut publisher = QwpWsPublicationDriver::new(driver, 1);
 
@@ -3228,7 +3144,7 @@ mod tests {
         let rows = qwp_ws_columnar_bench_rows();
         let batches = rows.div_ceil(QWP_WS_COLUMNAR_BENCH_BATCH_SIZE);
         let mut buffer = Buffer::qwp_ws_with_max_name_len(127);
-        let queue = LockFreeVolatilePublicationLog::new(options(8, 1 << 20, 4)).unwrap();
+        let queue = memory_queue(options(8, 1 << 20, 4));
         let driver = ManualDriverPrototype::from_queue(queue, FakeOrderedServer::ack_each_send());
         let mut publisher = QwpWsPublicationDriver::new(driver, 1);
 
@@ -3492,10 +3408,8 @@ mod tests {
         .with_poll_results([Err(TransportFailure::Terminal(fake_transport_error(
             "should not poll",
         )))]);
-        let mut driver = ManualDriverPrototype::from_queue(
-            VolatileFrameQueue::new(options(8, 1024, 2)).unwrap(),
-            transport,
-        );
+        let mut driver =
+            ManualDriverPrototype::from_queue(memory_queue(options(8, 1024, 2)), transport);
         let first = driver.try_submit(b"first").unwrap();
         let second = driver.try_submit(b"second").unwrap();
 
@@ -3553,10 +3467,8 @@ mod tests {
             TestTransport::scripted([Ok(TransportSendResult::Response(TransportResponse::Ack {
                 wire_seq: 0,
             }))]);
-        let mut driver = ManualDriverPrototype::from_queue(
-            VolatileFrameQueue::new(options(8, 1024, 2)).unwrap(),
-            transport,
-        );
+        let mut driver =
+            ManualDriverPrototype::from_queue(memory_queue(options(8, 1024, 2)), transport);
         let receipt = driver.try_submit(b"payload").unwrap();
 
         assert_eq!(
@@ -3582,10 +3494,8 @@ mod tests {
             None,
         )
         .unwrap();
-        let mut driver = ManualDriverPrototype::from_queue(
-            VolatileFrameQueue::new(options(8, 1024, 4)).unwrap(),
-            transport,
-        );
+        let mut driver =
+            ManualDriverPrototype::from_queue(memory_queue(options(8, 1024, 4)), transport);
 
         let receipt = driver.try_submit(b"qwp-payload").unwrap();
         let outcome = driver.wait_steps(receipt, 1024).unwrap();
@@ -3620,10 +3530,8 @@ mod tests {
             None,
         )
         .unwrap();
-        let driver = ManualDriverPrototype::from_queue(
-            VolatileFrameQueue::new(options(8, 4096, 4)).unwrap(),
-            transport,
-        );
+        let driver =
+            ManualDriverPrototype::from_queue(memory_queue(options(8, 4096, 4)), transport);
         let mut publisher = QwpWsPublicationDriver::new(driver, 1);
 
         let receipt = publisher
@@ -3660,10 +3568,8 @@ mod tests {
             None,
         )
         .unwrap();
-        let mut driver = ManualDriverPrototype::from_queue(
-            VolatileFrameQueue::new(options(8, 1024, 4)).unwrap(),
-            transport,
-        );
+        let mut driver =
+            ManualDriverPrototype::from_queue(memory_queue(options(8, 1024, 4)), transport);
 
         let first = driver.try_submit(b"qwp-payload-0").unwrap();
         let second = driver.try_submit(b"qwp-payload-1").unwrap();
@@ -3712,10 +3618,8 @@ mod tests {
             None,
         )
         .unwrap();
-        let mut driver = ManualDriverPrototype::from_queue(
-            VolatileFrameQueue::new(options(8, 1024, 4)).unwrap(),
-            transport,
-        );
+        let mut driver =
+            ManualDriverPrototype::from_queue(memory_queue(options(8, 1024, 4)), transport);
 
         let receipt = driver.try_submit(b"qwp-secure-payload").unwrap();
         let outcome = driver.wait_steps(receipt, 1024).unwrap();
@@ -3802,14 +3706,14 @@ mod tests {
         assert_eq!(
             driver.submit_with_drive_limit(b"second", 1),
             Err(DriverError::SubmitTimedOut {
-                backpressure: Some(QueueError::FrameCapacityFull { max_frames: 1 })
+                backpressure: Some(QueueError::MaxInFlightReached { max_in_flight: 1 })
             })
         );
     }
 
     #[test]
     fn blocking_submit_deadline_continues_past_fixed_step_budget() {
-        let queue = VolatileFrameQueue::new(options(1, 1024, 1)).unwrap();
+        let queue = memory_queue(options(1, 1024, 1));
         let mut driver = ManualDriverPrototype::from_queue(queue, DelayedPollAckServer::new(20));
         let first = driver.try_submit(b"first").unwrap();
 
@@ -3838,7 +3742,7 @@ mod tests {
         assert_eq!(
             driver.submit_with_drive_deadline(b"second", Duration::ZERO),
             Err(DriverError::SubmitTimedOut {
-                backpressure: Some(QueueError::FrameCapacityFull { max_frames: 1 })
+                backpressure: Some(QueueError::MaxInFlightReached { max_in_flight: 1 })
             })
         );
         assert!(driver.sent_frames().is_empty());
@@ -3861,7 +3765,12 @@ mod tests {
                 .unwrap();
         driver.try_submit(b"a").unwrap();
         driver.try_submit(b"b").unwrap();
-        let third = driver.try_submit(b"c").unwrap();
+        assert!(matches!(
+            driver.try_submit(b"c"),
+            Err(DriverError::Queue(QueueError::MaxInFlightReached {
+                max_in_flight: 2
+            }))
+        ));
 
         assert!(matches!(
             driver.drive_once().unwrap(),
@@ -3872,10 +3781,6 @@ mod tests {
             DriveOutcome::Sent(_)
         ));
         assert_eq!(driver.drive_once().unwrap(), DriveOutcome::Idle);
-        assert_eq!(
-            driver.receipt_status(third),
-            QwpReceiptStatus::Published { fsn: 2 }
-        );
     }
 
     #[test]
@@ -3919,7 +3824,7 @@ mod tests {
             Ok(()),
         ]);
         let mut driver = ManualDriverPrototype::from_queue_with_reconnect_policy(
-            VolatileFrameQueue::new(options(8, 1024, 4)).unwrap(),
+            memory_queue(options(8, 1024, 4)),
             transport,
             ReconnectPolicy::no_backoff(Duration::from_secs(1)),
             false,
@@ -3961,10 +3866,8 @@ mod tests {
         let transport = TestTransport::scripted([Err(TransportFailure::Disconnect(
             fake_transport_error("write failed"),
         ))]);
-        let mut driver = ManualDriverPrototype::from_queue(
-            VolatileFrameQueue::new(options(8, 1024, 4)).unwrap(),
-            transport,
-        );
+        let mut driver =
+            ManualDriverPrototype::from_queue(memory_queue(options(8, 1024, 4)), transport);
         let receipt = driver.try_submit(b"payload").unwrap();
 
         assert_eq!(
@@ -3998,10 +3901,8 @@ mod tests {
             .with_poll_results([Err(TransportFailure::Disconnect(fake_transport_error(
                 "poll failed",
             )))]);
-        let mut driver = ManualDriverPrototype::from_queue(
-            VolatileFrameQueue::new(options(8, 1024, 4)).unwrap(),
-            transport,
-        );
+        let mut driver =
+            ManualDriverPrototype::from_queue(memory_queue(options(8, 1024, 4)), transport);
         let receipt = driver.try_submit(b"payload").unwrap();
 
         assert_eq!(
@@ -4110,7 +4011,7 @@ mod tests {
             ])
             .with_keepalive_results([Ok(false), Ok(true)]);
         let mut driver = ManualDriverPrototype::from_queue_with_durable_ack(
-            VolatileFrameQueue::new(options(8, 1024, 4)).unwrap(),
+            memory_queue(options(8, 1024, 4)),
             transport,
         );
         let receipt = driver.try_submit(b"payload").unwrap();
@@ -4151,7 +4052,7 @@ mod tests {
             )))])
             .with_restart_results([Ok(())]);
         let mut driver = ManualDriverPrototype::from_queue_with_durable_ack(
-            VolatileFrameQueue::new(options(8, 1024, 4)).unwrap(),
+            memory_queue(options(8, 1024, 4)),
             transport,
         );
         driver.try_submit(b"payload").unwrap();
@@ -4184,7 +4085,7 @@ mod tests {
                 "terminal keepalive failure",
             )))]);
         let mut driver = ManualDriverPrototype::from_queue_with_durable_ack(
-            VolatileFrameQueue::new(options(8, 1024, 4)).unwrap(),
+            memory_queue(options(8, 1024, 4)),
             transport,
         );
         driver.try_submit(b"payload").unwrap();
@@ -4210,7 +4111,7 @@ mod tests {
             ])
             .with_keepalive_results([Ok(true)]);
         let mut driver = ManualDriverPrototype::from_queue_with_durable_ack(
-            VolatileFrameQueue::new(options(8, 1024, 4)).unwrap(),
+            memory_queue(options(8, 1024, 4)),
             transport,
         );
         let receipt = driver.try_submit(b"payload").unwrap();
@@ -4246,7 +4147,7 @@ mod tests {
             ])
             .with_keepalive_results([Ok(true)]);
         let mut driver = ManualDriverPrototype::from_queue_with_durable_ack(
-            VolatileFrameQueue::new(options(8, 1024, 4)).unwrap(),
+            memory_queue(options(8, 1024, 4)),
             transport,
         );
         let receipt = driver.try_submit(b"payload").unwrap();
@@ -4269,7 +4170,7 @@ mod tests {
             wire_seq: 0,
             table_seq_txns: table_seq_txns(&[("trades", 10)]),
         });
-        let mut driver = durable_driver_with_options(options(4, 1024, 1), server);
+        let mut driver = durable_driver_with_options(options(4, 1024, 2), server);
         let first = driver.try_submit(b"first").unwrap();
         let second = driver.try_submit(b"second").unwrap();
 
@@ -5817,7 +5718,7 @@ mod tests {
             "reconnect failed once",
         )))]);
         let mut driver = ManualDriverPrototype::from_queue_with_reconnect_policy(
-            VolatileFrameQueue::new(options(8, 1024, 4)).unwrap(),
+            memory_queue(options(8, 1024, 4)),
             transport,
             ReconnectPolicy::bounded(
                 Duration::from_millis(1),
@@ -5879,7 +5780,7 @@ mod tests {
 
     #[test]
     fn lifecycle_terminalizes_when_store_terminalizes() {
-        let queue = VolatileFrameQueue::new(options(4, 1024, 2)).unwrap();
+        let queue = memory_queue(options(4, 1024, 2));
         let mut store = QwpWsPublicationStore::new(queue, DEFAULT_EVENT_CAPACITY);
         let lifecycle = store.lifecycle();
 

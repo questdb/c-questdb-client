@@ -58,6 +58,13 @@ pub(crate) struct SfaQueueOptions {
     pub(crate) max_in_flight: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SfaMemoryQueueOptions {
+    pub(crate) segment_size_bytes: u64,
+    pub(crate) max_bytes: usize,
+    pub(crate) max_in_flight: usize,
+}
+
 #[derive(Debug)]
 pub(crate) enum SfaQueueError {
     Queue(QueueError),
@@ -107,7 +114,7 @@ impl From<SfaQueueError> for DriverError {
 pub(crate) enum SfaStorageStep {
     Trim(SfaStorageCleanup),
     CreateHotSpare {
-        path: PathBuf,
+        path: Option<PathBuf>,
         base_seq: u64,
         size_bytes: u64,
         created_us: u64,
@@ -133,7 +140,7 @@ pub(crate) struct SfaStorageFinish {
 #[derive(Debug)]
 pub(crate) struct SfaStorageCleanup {
     segment: Arc<SfaSharedSegment>,
-    path: PathBuf,
+    path: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -158,7 +165,10 @@ impl SfaStorageStep {
                 size_bytes,
                 created_us,
             } => {
-                let segment = SfaSegment::create_new(&path, base_seq, size_bytes, created_us)?;
+                let segment = match path {
+                    Some(path) => SfaSegment::create_new(&path, base_seq, size_bytes, created_us)?,
+                    None => SfaSegment::create_memory(base_seq, size_bytes, created_us)?,
+                };
                 Ok(SfaStorageResult::HotSpareCreated { segment })
             }
         }
@@ -198,13 +208,14 @@ impl SfaStorageFinish {
 
 impl SfaStorageCleanup {
     fn new(segment: Arc<SfaSharedSegment>) -> Self {
-        let path = segment.path().to_path_buf();
+        let path = segment.path().map(Path::to_path_buf);
         Self { segment, path }
     }
 
     pub(crate) fn perform(self) -> Option<SfaCleanupFailure> {
         let path = self.path;
         drop(self.segment);
+        let path = path?;
         match fs::remove_file(&path) {
             Ok(()) => None,
             Err(err) if err.kind() == io::ErrorKind::NotFound => None,
@@ -234,7 +245,7 @@ pub(crate) struct SfaProducer {
 
 #[derive(Debug)]
 struct SfaEngine {
-    slot_dir: PathBuf,
+    slot_dir: Option<PathBuf>,
     max_bytes: usize,
     segment_size_bytes: u64,
     max_in_flight: usize,
@@ -273,9 +284,10 @@ impl SfaFrameQueue {
                     segments.allocated_segment_bytes,
                 ),
                 None => {
-                    if (options.max_bytes as u64) < options.segment_size_bytes {
-                        return Err(QueueError::InvalidCapacity.into());
-                    }
+                    validate_publishable_segment_capacity(
+                        options.segment_size_bytes,
+                        options.max_bytes,
+                    )?;
                     let active_path = initial_segment_path(&options.slot_dir);
                     (
                         SfaSegment::create(
@@ -321,7 +333,7 @@ impl SfaFrameQueue {
         let active_append_offset = active.published_offset();
         let active_frame_count = active.published_frame_count();
         let engine = Arc::new(SfaEngine {
-            slot_dir: options.slot_dir,
+            slot_dir: Some(options.slot_dir),
             max_bytes: options.max_bytes,
             segment_size_bytes: options.segment_size_bytes,
             max_in_flight: options.max_in_flight,
@@ -344,6 +356,70 @@ impl SfaFrameQueue {
             active,
             active_append_offset,
             active_frame_count,
+            next_fsn,
+        });
+
+        Ok(Self {
+            engine,
+            producer,
+            send_cursor: None,
+        })
+    }
+
+    pub(crate) fn open_memory(options: SfaMemoryQueueOptions) -> Result<Self, SfaQueueError> {
+        validate_memory_options(&options)?;
+
+        let active = Arc::new(SfaSharedSegment::new(SfaSegment::create_memory(
+            0,
+            options.segment_size_bytes,
+            unix_time_micros(),
+        )?));
+        let next_fsn = 0;
+        let mut allocated_segment_bytes = options.segment_size_bytes;
+        let mut hot_spare = None;
+        let mut next_generation = 0u64;
+        if can_allocate_segment(
+            allocated_segment_bytes,
+            options.segment_size_bytes,
+            options.max_bytes,
+        ) {
+            next_generation = next_generation
+                .checked_add(1)
+                .ok_or(QueueError::SequenceOverflow)?;
+            hot_spare = Some(Arc::new(SfaSharedSegment::new(SfaSegment::create_memory(
+                next_fsn,
+                options.segment_size_bytes,
+                unix_time_micros(),
+            )?)));
+            allocated_segment_bytes = allocated_segment_bytes
+                .checked_add(options.segment_size_bytes)
+                .ok_or(QueueError::SequenceOverflow)?;
+        }
+
+        let engine = Arc::new(SfaEngine {
+            slot_dir: None,
+            max_bytes: options.max_bytes,
+            segment_size_bytes: options.segment_size_bytes,
+            max_in_flight: options.max_in_flight,
+            allow_segment_creation: true,
+            state: Mutex::new(SfaEngineState {
+                active: Some(Arc::clone(&active)),
+                sealed_segments: VecDeque::new(),
+                hot_spare,
+                allocated_segment_bytes,
+                recovery_diagnostics: Vec::new(),
+                next_generation,
+                closed: false,
+            }),
+            published_upper: AtomicU64::new(next_fsn),
+            completed_upper: AtomicU64::new(next_fsn),
+            rejected_fsns: Mutex::new(Vec::new()),
+        });
+        let producer = Some(SfaProducer {
+            engine: Arc::clone(&engine),
+            active,
+            active_append_offset: HEADER_SIZE as u64,
+            active_frame_count: 0,
             next_fsn,
         });
 
@@ -382,7 +458,7 @@ impl SfaFrameQueue {
             first_unresolved_fsn_from_optional_segments(&sealed_segments, active.as_ref())
                 .unwrap_or(next_fsn);
         let engine = Arc::new(SfaEngine {
-            slot_dir: options.slot_dir,
+            slot_dir: Some(options.slot_dir),
             max_bytes: options.max_bytes,
             segment_size_bytes: options.segment_size_bytes,
             max_in_flight: options.max_in_flight,
@@ -550,14 +626,7 @@ impl SfaFrameQueue {
         };
 
         let (payload, segment_append_offset) = {
-            let Some(segment) = self.segment_at_position(cursor.segment) else {
-                self.send_cursor = None;
-                return Ok(None);
-            };
-            if segment.base_seq() != cursor.segment_base_seq {
-                self.send_cursor = None;
-                return Ok(None);
-            }
+            let segment = Arc::clone(&cursor.segment);
             let Some(payload) = segment.mapped_payload_at_offset(cursor.offset) else {
                 self.send_cursor = None;
                 return Ok(None);
@@ -576,22 +645,19 @@ impl SfaFrameQueue {
     }
 
     fn reusable_send_cursor(&self, fsn: u64) -> Option<SfaSendCursor> {
-        let cursor = self.send_cursor?;
+        let cursor = self.send_cursor.clone()?;
         if cursor.fsn != fsn {
             return None;
         }
-        let segment = self.segment_at_position(cursor.segment)?;
-        (segment.base_seq() == cursor.segment_base_seq).then_some(cursor)
+        Some(cursor)
     }
 
     fn position_send_cursor_for_fsn(&self, fsn: u64) -> Option<SfaSendCursor> {
-        let segment = self.segment_position_for_fsn(fsn)?;
-        let segment_ref = self.segment_at_position(segment)?;
-        let offset = segment_ref.frame_offset_for_fsn(fsn)?;
+        let segment = self.engine.segment_for_fsn(fsn)?;
+        let offset = segment.frame_offset_for_fsn(fsn)?;
         Some(SfaSendCursor {
             fsn,
             segment,
-            segment_base_seq: segment_ref.base_seq(),
             offset,
         })
     }
@@ -612,15 +678,12 @@ impl SfaFrameQueue {
         }
 
         if next_offset == segment_append_offset
-            && let Some(next_segment) = self
-                .next_segment_position(cursor.segment)
-                .and_then(|segment| self.segment_at_position(segment).map(|s| (segment, s)))
-                .filter(|(_, segment)| segment.base_seq() == next_fsn)
+            && let Some(next_segment) = self.engine.next_segment_after(&cursor.segment)
+            && next_segment.base_seq() == next_fsn
         {
             return SfaSendCursor {
                 fsn: next_fsn,
-                segment: next_segment.0,
-                segment_base_seq: next_segment.1.base_seq(),
+                segment: next_segment,
                 offset: HEADER_SIZE as u64,
             };
         }
@@ -629,50 +692,6 @@ impl SfaFrameQueue {
             fsn: next_fsn,
             offset: next_offset,
             ..cursor
-        }
-    }
-
-    fn segment_position_for_fsn(&self, fsn: u64) -> Option<SfaCursorSegment> {
-        let snapshot = self.engine.segments_snapshot();
-        snapshot
-            .sealed_segments
-            .iter()
-            .enumerate()
-            .find(|(_, segment)| {
-                fsn >= segment.base_seq()
-                    && segment.last_fsn().is_some_and(|last_fsn| fsn <= last_fsn)
-            })
-            .map(|(index, _)| SfaCursorSegment::Sealed(index))
-            .or_else(|| {
-                snapshot
-                    .active
-                    .filter(|segment| {
-                        fsn >= segment.base_seq()
-                            && segment.last_fsn().is_some_and(|last_fsn| fsn <= last_fsn)
-                    })
-                    .map(|_| SfaCursorSegment::Active)
-            })
-    }
-
-    fn segment_at_position(&self, segment: SfaCursorSegment) -> Option<Arc<SfaSharedSegment>> {
-        let snapshot = self.engine.segments_snapshot();
-        match segment {
-            SfaCursorSegment::Sealed(index) => snapshot.sealed_segments.get(index).cloned(),
-            SfaCursorSegment::Active => snapshot.active,
-        }
-    }
-
-    fn next_segment_position(&self, segment: SfaCursorSegment) -> Option<SfaCursorSegment> {
-        let snapshot = self.engine.segments_snapshot();
-        match segment {
-            SfaCursorSegment::Sealed(index) => {
-                if index + 1 < snapshot.sealed_segments.len() {
-                    Some(SfaCursorSegment::Sealed(index + 1))
-                } else {
-                    snapshot.active.map(|_| SfaCursorSegment::Active)
-                }
-            }
-            SfaCursorSegment::Active => None,
         }
     }
 
@@ -693,8 +712,10 @@ impl SfaFrameQueue {
     }
 
     #[cfg(test)]
-    fn send_cursor_segment(&self) -> Option<SfaCursorSegment> {
-        self.send_cursor.map(|cursor| cursor.segment)
+    fn send_cursor_segment_base_seq(&self) -> Option<u64> {
+        self.send_cursor
+            .as_ref()
+            .map(|cursor| cursor.segment.base_seq())
     }
 }
 
@@ -800,8 +821,8 @@ impl SfaEngine {
         state.active.take();
         state.closed = true;
 
-        if fully_drained {
-            record_all_sfa_cleanup(&self.slot_dir, &mut state.recovery_diagnostics)?;
+        if fully_drained && let Some(slot_dir) = self.slot_dir.as_deref() {
+            record_all_sfa_cleanup(slot_dir, &mut state.recovery_diagnostics)?;
         }
         Ok(())
     }
@@ -809,6 +830,13 @@ impl SfaEngine {
     fn validate_submit(&self, payload: &[u8]) -> Result<(), QueueError> {
         if payload.is_empty() {
             return Err(QueueError::EmptyPayload);
+        }
+        let completed = self.completed_upper.load(Ordering::Acquire);
+        let published = self.published_upper.load(Ordering::Acquire);
+        if published.saturating_sub(completed) >= self.max_in_flight as u64 {
+            return Err(QueueError::MaxInFlightReached {
+                max_in_flight: self.max_in_flight,
+            });
         }
         let segment_payload_capacity = self.segment_payload_capacity();
         if payload.len() > segment_payload_capacity {
@@ -870,15 +898,42 @@ impl SfaEngine {
     }
 
     fn segment_for_fsn(&self, fsn: u64) -> Option<Arc<SfaSharedSegment>> {
-        let snapshot = self.segments_snapshot();
-        snapshot
-            .sealed_segments
-            .into_iter()
-            .chain(snapshot.active)
-            .find(|segment| {
-                fsn >= segment.base_seq()
-                    && segment.last_fsn().is_some_and(|last_fsn| fsn <= last_fsn)
-            })
+        self.with_state(|state| {
+            state
+                .sealed_segments
+                .iter()
+                .chain(state.active.iter())
+                .find(|segment| {
+                    fsn >= segment.base_seq()
+                        && segment.last_fsn().is_some_and(|last_fsn| fsn <= last_fsn)
+                })
+                .cloned()
+        })
+    }
+
+    fn next_segment_after(&self, current: &Arc<SfaSharedSegment>) -> Option<Arc<SfaSharedSegment>> {
+        let current_base_seq = current.base_seq();
+        self.with_state(|state| {
+            if state
+                .active
+                .as_ref()
+                .is_some_and(|active| Arc::ptr_eq(active, current))
+            {
+                return None;
+            }
+            state
+                .sealed_segments
+                .iter()
+                .find(|segment| segment.base_seq() > current_base_seq)
+                .cloned()
+                .or_else(|| {
+                    state
+                        .active
+                        .as_ref()
+                        .filter(|segment| segment.base_seq() > current_base_seq)
+                        .cloned()
+                })
+        })
     }
 
     fn take_storage_maintenance_step(
@@ -902,7 +957,16 @@ impl SfaEngine {
         ) {
             return Ok(None);
         }
-        let path = next_segment_path(&self.slot_dir, &mut state.next_generation)?;
+        let path = match self.slot_dir.as_deref() {
+            Some(slot_dir) => Some(next_segment_path(slot_dir, &mut state.next_generation)?),
+            None => {
+                state.next_generation = state
+                    .next_generation
+                    .checked_add(1)
+                    .ok_or(QueueError::SequenceOverflow)?;
+                None
+            }
+        };
         Ok(Some(SfaStorageStep::CreateHotSpare {
             path,
             base_seq: self.published_upper.load(Ordering::Acquire),
@@ -1150,7 +1214,7 @@ impl SfaSharedSegment {
             .and_then(|last_index| self.base_seq().checked_add(last_index))
     }
 
-    fn path(&self) -> &Path {
+    fn path(&self) -> Option<&Path> {
         self.segment.path()
     }
 
@@ -1181,7 +1245,7 @@ impl PublicationLog for SfaFrameQueue {
         Ok(SfaFrameQueue::try_submit(self, payload)?)
     }
 
-    fn take_sfa_producer(&mut self) -> Option<SfaProducer> {
+    fn take_producer(&mut self) -> Option<SfaProducer> {
         SfaFrameQueue::take_producer(self)
     }
 
@@ -1305,18 +1369,11 @@ pub(crate) enum SfaRecoveryDiagnostic {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct SfaSendCursor {
     fsn: u64,
-    segment: SfaCursorSegment,
-    segment_base_seq: u64,
     offset: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SfaCursorSegment {
-    Sealed(usize),
-    Active,
+    segment: Arc<SfaSharedSegment>,
 }
 
 #[derive(Debug)]
@@ -1436,6 +1493,33 @@ fn validate_options(options: &SfaQueueOptions) -> Result<(), SfaQueueError> {
             size: options.segment_size_bytes,
         }
         .into());
+    }
+    Ok(())
+}
+
+fn validate_memory_options(options: &SfaMemoryQueueOptions) -> Result<(), SfaQueueError> {
+    if options.max_bytes == 0 || options.max_in_flight == 0 {
+        return Err(QueueError::InvalidCapacity.into());
+    }
+    if options.segment_size_bytes < (HEADER_SIZE + FRAME_HEADER_SIZE + 1) as u64 {
+        return Err(SfaSegmentError::SizeTooSmall {
+            size: options.segment_size_bytes,
+        }
+        .into());
+    }
+    validate_publishable_segment_capacity(options.segment_size_bytes, options.max_bytes)?;
+    Ok(())
+}
+
+fn validate_publishable_segment_capacity(
+    segment_size_bytes: u64,
+    max_bytes: usize,
+) -> Result<(), SfaQueueError> {
+    let min_publishable_bytes = segment_size_bytes
+        .checked_mul(2)
+        .ok_or(QueueError::InvalidCapacity)?;
+    if (max_bytes as u64) < min_publishable_bytes {
+        return Err(QueueError::InvalidCapacity.into());
     }
     Ok(())
 }
@@ -1614,6 +1698,18 @@ mod tests {
         }
     }
 
+    fn memory_options(
+        segment_size_bytes: u64,
+        max_bytes: usize,
+        max_in_flight: usize,
+    ) -> SfaMemoryQueueOptions {
+        SfaMemoryQueueOptions {
+            segment_size_bytes,
+            max_bytes,
+            max_in_flight,
+        }
+    }
+
     fn open(dir: &TempDir) -> SfaFrameQueue {
         SfaFrameQueue::open(options(dir)).unwrap()
     }
@@ -1628,6 +1724,10 @@ mod tests {
                 Err(err) => panic!("unexpected SFA submit error: {err:?}"),
             }
         }
+    }
+
+    fn memory_queue() -> SfaFrameQueue {
+        SfaFrameQueue::open_memory(memory_options(48, 144, 4)).unwrap()
     }
 
     fn pending_payload_vec(payload: PendingPayload) -> Vec<u8> {
@@ -1658,6 +1758,96 @@ mod tests {
         let mut bytes = vec![0u8; 64];
         bytes[..4].copy_from_slice(&0xdead_beefu32.to_le_bytes());
         fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn memory_queue_appends_and_reads_payloads_through_sfa_frames() {
+        let mut queue = memory_queue();
+
+        let first = queue.try_submit(b"first").unwrap();
+        let second = queue.try_submit(b"second").unwrap();
+
+        assert_eq!(first, QwpReceipt { fsn: 0 });
+        assert_eq!(second, QwpReceipt { fsn: 1 });
+        assert_eq!(queue.payload_vec_for_fsn(0).as_deref(), Some(&b"first"[..]));
+        assert_eq!(
+            queue.payload_vec_for_fsn(1).as_deref(),
+            Some(&b"second"[..])
+        );
+        assert_eq!(
+            queue.receipt_status(first),
+            QwpReceiptStatus::Published { fsn: 0 }
+        );
+    }
+
+    #[test]
+    fn memory_queue_rejects_capacity_without_hot_spare_room() {
+        assert!(matches!(
+            SfaFrameQueue::open_memory(memory_options(48, 48, 4)),
+            Err(SfaQueueError::Queue(QueueError::InvalidCapacity))
+        ));
+        assert!(matches!(
+            SfaFrameQueue::open_memory(memory_options(48, 95, 4)),
+            Err(SfaQueueError::Queue(QueueError::InvalidCapacity))
+        ));
+
+        let queue = SfaFrameQueue::open_memory(memory_options(48, 96, 4)).unwrap();
+        assert!(queue.hot_spare_installed());
+        assert_eq!(queue.allocated_segment_bytes(), 96);
+    }
+
+    #[test]
+    fn memory_queue_rotates_and_trims_without_filesystem_cleanup() {
+        let mut queue = SfaFrameQueue::open_memory(memory_options(48, 96, 8)).unwrap();
+
+        let first = queue.try_submit(b"abcdefghij").unwrap();
+        let second = queue.try_submit(b"klmnopqrst").unwrap();
+
+        assert_eq!(first.fsn, 0);
+        assert_eq!(second.fsn, 1);
+        assert_eq!(queue.sealed_segment_count(), 1);
+        assert_eq!(queue.allocated_segment_bytes(), 96);
+        assert!(matches!(
+            queue.try_submit(b"uvwxyz1234"),
+            Err(SfaQueueError::Queue(QueueError::StorageSegmentCapFull {
+                segment_size_bytes: 48,
+                allocated_segment_bytes: 96,
+                max_total_bytes: 96,
+            }))
+        ));
+
+        queue.complete_through_fsn(first.fsn).unwrap();
+        assert!(queue.maintain_storage().unwrap());
+        assert_eq!(queue.sealed_segment_count(), 0);
+        assert_eq!(queue.allocated_segment_bytes(), 48);
+        assert!(!queue.hot_spare_installed());
+
+        assert!(matches!(
+            queue.try_submit(b"uvwxyz1234"),
+            Err(SfaQueueError::Queue(
+                QueueError::StorageSpareNotReady { .. }
+            ))
+        ));
+        assert!(queue.maintain_storage().unwrap());
+        let third = queue.try_submit(b"uvwxyz1234").unwrap();
+        assert_eq!(third.fsn, 2);
+    }
+
+    #[test]
+    fn memory_queue_backpressures_at_max_in_flight_before_capacity() {
+        let mut queue = SfaFrameQueue::open_memory(memory_options(128, 256, 2)).unwrap();
+
+        queue.try_submit(b"first").unwrap();
+        queue.try_submit(b"second").unwrap();
+
+        assert!(matches!(
+            queue.try_submit(b"third"),
+            Err(SfaQueueError::Queue(QueueError::MaxInFlightReached {
+                max_in_flight: 2
+            }))
+        ));
+        queue.complete_through_fsn(0).unwrap();
+        assert_eq!(queue.try_submit(b"third").unwrap().fsn, 2);
     }
 
     #[test]
@@ -2099,26 +2289,17 @@ mod tests {
             pending_payload_vec(queue.next_cursor_payload_for_fsn(0).unwrap().unwrap()),
             b"one"
         );
-        assert_eq!(
-            queue.send_cursor_segment().unwrap(),
-            SfaCursorSegment::Sealed(1)
-        );
+        assert_eq!(queue.send_cursor_segment_base_seq().unwrap(), 1);
         assert_eq!(
             pending_payload_vec(queue.next_cursor_payload_for_fsn(1).unwrap().unwrap()),
             b"two"
         );
-        assert_eq!(
-            queue.send_cursor_segment().unwrap(),
-            SfaCursorSegment::Sealed(2)
-        );
+        assert_eq!(queue.send_cursor_segment_base_seq().unwrap(), 2);
         assert_eq!(
             pending_payload_vec(queue.next_cursor_payload_for_fsn(2).unwrap().unwrap()),
             b"tri"
         );
-        assert_eq!(
-            queue.send_cursor_segment().unwrap(),
-            SfaCursorSegment::Active
-        );
+        assert_eq!(queue.send_cursor_segment_base_seq().unwrap(), 3);
         assert_eq!(
             pending_payload_vec(queue.next_cursor_payload_for_fsn(3).unwrap().unwrap()),
             b"for"
@@ -2133,7 +2314,7 @@ mod tests {
         use crate::alloc_counter;
 
         let dir = TempDir::new().unwrap();
-        let mut queue = SfaFrameQueue::open(options_with(&dir, 4096, 8192, 4)).unwrap();
+        let mut queue = SfaFrameQueue::open(options_with(&dir, 4096, 8192, 8)).unwrap();
         let mut producer = queue.take_producer().unwrap();
         for _ in 0..4 {
             producer.try_submit(b"steady-state").unwrap();
@@ -2148,6 +2329,69 @@ mod tests {
             alloc_count, 0,
             "Expected zero allocations for warmed SFA tiny-frame publication, got {alloc_count}"
         );
+    }
+
+    /// Run with:
+    /// `cargo test --features sync-sender-qwp-ws --lib sfa_memory_tiny_frame_publish_zero_alloc_after_warmup -- --ignored --test-threads=1`
+    #[test]
+    #[ignore = "uses the process-global allocation counter"]
+    fn sfa_memory_tiny_frame_publish_zero_alloc_after_warmup() {
+        use crate::alloc_counter;
+
+        let mut queue = SfaFrameQueue::open_memory(memory_options(4096, 8192, 8)).unwrap();
+        let mut producer = queue.take_producer().unwrap();
+        for _ in 0..4 {
+            producer.try_submit(b"steady-state").unwrap();
+        }
+
+        alloc_counter::start_counting();
+        let receipt = producer.try_submit(b"steady-state").unwrap();
+        let alloc_count = alloc_counter::stop_counting();
+
+        assert_eq!(receipt, QwpReceipt { fsn: 4 });
+        assert_eq!(
+            alloc_count, 0,
+            "Expected zero allocations for warmed memory SFA tiny-frame publication, got {alloc_count}"
+        );
+    }
+
+    /// Run with:
+    /// `cargo test --features sync-sender-qwp-ws --lib sfa_send_cursor_after_rotation_zero_alloc_after_warmup -- --ignored --test-threads=1`
+    #[test]
+    #[ignore = "uses the process-global allocation counter"]
+    fn sfa_send_cursor_after_rotation_zero_alloc_after_warmup() {
+        use crate::alloc_counter;
+
+        let mut queue = SfaFrameQueue::open_memory(memory_options(38, 38 * 8, 8)).unwrap();
+        submit_with_storage_maintenance(&mut queue, b"one");
+        submit_with_storage_maintenance(&mut queue, b"two");
+        submit_with_storage_maintenance(&mut queue, b"tri");
+        submit_with_storage_maintenance(&mut queue, b"for");
+        assert_eq!(queue.sealed_segment_count(), 3);
+
+        assert_eq!(
+            pending_payload_vec(queue.next_cursor_payload_for_fsn(0).unwrap().unwrap()),
+            b"one"
+        );
+
+        alloc_counter::start_counting();
+        let second = queue.next_cursor_payload_for_fsn(1).unwrap().unwrap();
+        let sealed_alloc_count = alloc_counter::stop_counting();
+        assert_eq!(
+            sealed_alloc_count, 0,
+            "Expected zero allocations when sending from the next sealed segment, got {sealed_alloc_count}"
+        );
+        assert_eq!(pending_payload_vec(second), b"two");
+
+        alloc_counter::start_counting();
+        let third = queue.next_cursor_payload_for_fsn(2).unwrap().unwrap();
+        let transition_alloc_count = alloc_counter::stop_counting();
+        assert_eq!(
+            transition_alloc_count, 0,
+            "Expected zero allocations when advancing from sealed to active segment, got {transition_alloc_count}"
+        );
+        assert_eq!(pending_payload_vec(third), b"tri");
+        assert_eq!(queue.send_cursor_segment_base_seq(), Some(3));
     }
 
     #[test]
@@ -2176,6 +2420,29 @@ mod tests {
             Some(&b"second"[..])
         );
         assert_eq!(recovered.oldest_unresolved_fsn(), Some(0));
+    }
+
+    #[test]
+    fn fresh_disk_queue_rejects_capacity_without_hot_spare_room() {
+        let one_segment_dir = TempDir::new().unwrap();
+        assert!(matches!(
+            SfaFrameQueue::open(options_with(&one_segment_dir, 48, 48, 4)),
+            Err(SfaQueueError::Queue(QueueError::InvalidCapacity))
+        ));
+        assert_eq!(sfa_file_count(one_segment_dir.path()), 0);
+
+        let undersized_dir = TempDir::new().unwrap();
+        assert!(matches!(
+            SfaFrameQueue::open(options_with(&undersized_dir, 48, 95, 4)),
+            Err(SfaQueueError::Queue(QueueError::InvalidCapacity))
+        ));
+        assert_eq!(sfa_file_count(undersized_dir.path()), 0);
+
+        let publishable_dir = TempDir::new().unwrap();
+        let queue = SfaFrameQueue::open(options_with(&publishable_dir, 48, 96, 4)).unwrap();
+        assert!(queue.hot_spare_installed());
+        assert_eq!(queue.allocated_segment_bytes(), 96);
+        assert_eq!(sfa_file_count(publishable_dir.path()), 2);
     }
 
     #[test]

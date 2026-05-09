@@ -72,7 +72,7 @@ pub(crate) mod qwp_ws_test_support {
         BlockingQwpWsTransport, CloseOutcome, DeliveryOutcome, ManualDriverPrototype,
     };
     pub(crate) use super::qwp_ws_publisher::QwpWsPublicationDriver;
-    pub(crate) use super::qwp_ws_queue::{VolatileFrameQueue, VolatileQueueOptions};
+    pub(crate) use super::qwp_ws_sfa_queue::{SfaFrameQueue, SfaMemoryQueueOptions};
     pub(crate) use super::qwp_ws_sfa_slot::{SfaSlotOptions, SfaSlotQueue};
 
     pub(crate) fn connect_blocking_transport(

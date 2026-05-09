@@ -44,8 +44,8 @@ use std::os::fd::AsRawFd;
 use super::qwp_ws_driver::{DriverError, PublicationLog, SendCursor};
 use super::qwp_ws_queue::{OutboundFrame, PendingPayload, QwpReceipt, QwpReceiptStatus};
 use super::qwp_ws_sfa_queue::{
-    SfaCleanupFailure, SfaFrameQueue, SfaProducer, SfaQueueError, SfaQueueOptions,
-    SfaStorageFinish, SfaStorageResult, SfaStorageStep,
+    SfaCleanupFailure, SfaFrameQueue, SfaMemoryQueueOptions, SfaProducer, SfaQueueError,
+    SfaQueueOptions, SfaStorageFinish, SfaStorageResult, SfaStorageStep,
 };
 use crate::ingress::conf::{QWP_WS_DEFAULT_SENDER_ID, is_valid_qwp_ws_sender_id};
 
@@ -90,6 +90,11 @@ impl SfaSlotQueue {
         })
     }
 
+    pub(crate) fn open_memory(options: SfaMemoryQueueOptions) -> Result<Self, SfaQueueError> {
+        let queue = SfaFrameQueue::open_memory(options)?;
+        Ok(Self { queue, lock: None })
+    }
+
     pub(crate) fn open_replay_only_existing(
         options: SfaQueueOptions,
     ) -> Result<Self, SfaQueueError> {
@@ -123,7 +128,7 @@ impl PublicationLog for SfaSlotQueue {
         Ok(self.queue.try_submit(payload)?)
     }
 
-    fn take_sfa_producer(&mut self) -> Option<SfaProducer> {
+    fn take_producer(&mut self) -> Option<SfaProducer> {
         self.queue.take_producer()
     }
 

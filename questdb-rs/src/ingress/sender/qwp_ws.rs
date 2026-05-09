@@ -49,21 +49,16 @@ use super::qwp_ws_driver::{
     BlockingQwpWsTransport, CloseOutcome, DriveOutcome, DriverError, ManualDriverPrototype,
     ManualDriverTransport, PublicationLifecycle, PublicationLog, PublicationState,
     QwpWsPublicationStore, QwpWsReconnectProgress, QwpWsSendCore, QwpWsSendProgress,
-    QwpWsTransportFailureAction, ReconnectPolicy, ReconnectReason, SendCursor, TransportFailure,
-    TransportPoll, reconnect_error_is_terminal,
+    QwpWsTransportFailureAction, ReconnectPolicy, ReconnectReason, TransportFailure, TransportPoll,
+    reconnect_error_is_terminal,
 };
 use super::qwp_ws_orphan::{
     ManualOrphanDrainers, OrphanDrainerConfig, OrphanDrainerPool, scan_orphan_slots,
 };
 use super::qwp_ws_ownership::QwpWsSenderError;
 use super::qwp_ws_publisher::{QwpWsPublicationDriver, QwpWsPublicationError, QwpWsReplayEncoder};
-use super::qwp_ws_queue::{
-    LockFreeVolatileProducer, LockFreeVolatilePublicationLog, OutboundFrame, PendingPayload,
-    QwpReceipt, QwpReceiptStatus, VolatileQueueOptions,
-};
-use super::qwp_ws_sfa_queue::{
-    SfaCleanupFailure, SfaProducer, SfaStorageFinish, SfaStorageResult, SfaStorageStep,
-};
+use super::qwp_ws_queue::OutboundFrame;
+use super::qwp_ws_sfa_queue::{SfaMemoryQueueOptions, SfaProducer};
 use super::qwp_ws_sfa_slot::{SfaSlotOptions, SfaSlotQueue};
 
 // ---------- transport ----------
@@ -159,8 +154,7 @@ impl Write for WsStream {
 
 // ---------- handler state ----------
 
-pub(crate) type SyncQwpWsPublisher =
-    QwpWsPublicationDriver<ConfiguredQwpWsQueue, BlockingQwpWsTransport>;
+pub(crate) type SyncQwpWsPublisher = QwpWsPublicationDriver<SfaSlotQueue, BlockingQwpWsTransport>;
 
 pub(crate) struct SyncQwpWsHandlerState {
     encoder: QwpWsReplayEncoder,
@@ -174,10 +168,9 @@ pub(crate) struct ManualQwpWsHandlerState {
     append_deadline: Duration,
 }
 
-pub(crate) struct SyncQwpWsRunner<Q = ConfiguredQwpWsQueue> {
+pub(crate) struct SyncQwpWsRunner<Q = SfaSlotQueue> {
     shared: Arc<Mutex<QwpWsPublicationStore<Q>>>,
-    producer: Option<LockFreeVolatileProducer>,
-    sfa_producer: Option<SfaProducer>,
+    producer: Option<SfaProducer>,
     lifecycle: PublicationLifecycle,
     backpressure: Arc<BackpressureNotifier>,
     append_deadline: Duration,
@@ -227,8 +220,7 @@ where
     {
         let (mut store, send_core) = publisher.into_runner_parts();
         let lifecycle = store.lifecycle();
-        let producer = store.take_lock_free_producer();
-        let sfa_producer = store.take_sfa_producer();
+        let producer = store.take_producer();
         let shared = Arc::new(Mutex::new(store));
         let backpressure = Arc::new(BackpressureNotifier::new());
         let stop = Arc::new(AtomicBool::new(false));
@@ -254,7 +246,6 @@ where
         Self {
             shared,
             producer,
-            sfa_producer,
             lifecycle,
             backpressure,
             append_deadline,
@@ -269,26 +260,6 @@ where
             let backpressure_generation = self.backpressure.generation();
             self.check_publication_open()?;
             if let Some(producer) = self.producer.as_mut() {
-                match producer.try_submit(payload) {
-                    Ok(receipt) => return Ok(receipt.fsn),
-                    Err(err) => {
-                        let err = DriverError::Queue(err);
-                        let backpressure = driver_error_backpressure_queue(&err);
-                        if backpressure.is_some() {
-                            if !self
-                                .wait_for_publication_capacity(backpressure_generation, deadline)
-                            {
-                                return Err(driver_error_to_error_without_state(
-                                    DriverError::SubmitTimedOut { backpressure },
-                                ));
-                            }
-                            continue;
-                        }
-                        return Err(driver_error_to_error_without_state(err));
-                    }
-                }
-            }
-            if let Some(producer) = self.sfa_producer.as_mut() {
                 match producer.try_submit(payload) {
                     Ok(receipt) => return Ok(receipt.fsn),
                     Err(err) => {
@@ -936,67 +907,47 @@ impl<Q> Drop for SyncQwpWsRunner<Q> {
     }
 }
 
-pub(crate) enum ConfiguredQwpWsQueue {
-    Memory(LockFreeVolatilePublicationLog),
-    StoreAndForward(Box<SfaSlotQueue>),
-}
-
-impl ConfiguredQwpWsQueue {
-    fn open(qwp_ws: &QwpWsConfig) -> crate::Result<Self> {
-        if *qwp_ws.sf_durability != SfDurability::Memory {
-            let durability = qwp_ws.sf_durability.as_conf_value();
-            return Err(error::fmt!(
-                ConfigError,
-                "sf_durability={durability} is not yet supported (deferred follow-up; use sf_durability=memory)"
-            ));
-        }
-
-        let max_bytes = usize_from_config("sf_max_total_bytes", qwp_ws.sf_max_total_bytes())?;
-        let max_in_flight = *qwp_ws.max_in_flight;
-
-        if let Some(sf_dir) = qwp_ws.sf_dir.as_ref() {
-            return Ok(Self::StoreAndForward(Box::new(
-                SfaSlotQueue::open(SfaSlotOptions {
-                    sf_dir: sf_dir.clone(),
-                    sender_id: qwp_ws.sender_id.to_string(),
-                    segment_size_bytes: *qwp_ws.sf_max_bytes,
-                    max_bytes,
-                    max_in_flight,
-                })
-                .map_err(|err| {
-                    error::fmt!(
-                        SocketError,
-                        "Could not open QWP/WebSocket Store-and-Forward queue: {:?}",
-                        err
-                    )
-                })?,
-            )));
-        }
-
-        let max_frames = configured_max_frames(qwp_ws)?;
-        Ok(Self::Memory(
-            LockFreeVolatilePublicationLog::new(VolatileQueueOptions {
-                max_frames,
-                max_bytes,
-                max_in_flight,
-            })
-            .map_err(|err| {
-                error::fmt!(
-                    ConfigError,
-                    "Invalid QWP/WebSocket memory queue configuration: {:?}",
-                    err
-                )
-            })?,
-        ))
+fn open_configured_qwp_ws_queue(qwp_ws: &QwpWsConfig) -> crate::Result<SfaSlotQueue> {
+    if *qwp_ws.sf_durability != SfDurability::Memory {
+        let durability = qwp_ws.sf_durability.as_conf_value();
+        return Err(error::fmt!(
+            ConfigError,
+            "sf_durability={durability} is not yet supported (deferred follow-up; use sf_durability=memory)"
+        ));
     }
-}
 
-fn configured_max_frames(qwp_ws: &QwpWsConfig) -> crate::Result<usize> {
-    let max_total_bytes = qwp_ws.sf_max_total_bytes();
-    let segment_bytes = (*qwp_ws.sf_max_bytes).max(1);
-    let frames_by_bytes = max_total_bytes.div_ceil(segment_bytes).max(1);
-    let frames = frames_by_bytes.max(*qwp_ws.max_in_flight as u64);
-    usize_from_config("computed QWP/WebSocket max_frames", frames)
+    let max_bytes = usize_from_config("sf_max_total_bytes", qwp_ws.sf_max_total_bytes())?;
+    let max_in_flight = *qwp_ws.max_in_flight;
+
+    if let Some(sf_dir) = qwp_ws.sf_dir.as_ref() {
+        return SfaSlotQueue::open(SfaSlotOptions {
+            sf_dir: sf_dir.clone(),
+            sender_id: qwp_ws.sender_id.to_string(),
+            segment_size_bytes: *qwp_ws.sf_max_bytes,
+            max_bytes,
+            max_in_flight,
+        })
+        .map_err(|err| {
+            error::fmt!(
+                SocketError,
+                "Could not open QWP/WebSocket Store-and-Forward queue: {:?}",
+                err
+            )
+        });
+    }
+
+    SfaSlotQueue::open_memory(SfaMemoryQueueOptions {
+        segment_size_bytes: *qwp_ws.sf_max_bytes,
+        max_bytes,
+        max_in_flight,
+    })
+    .map_err(|err| {
+        error::fmt!(
+            ConfigError,
+            "Invalid QWP/WebSocket memory SFA queue configuration: {:?}",
+            err
+        )
+    })
 }
 
 fn usize_from_config(name: &str, value: u64) -> crate::Result<usize> {
@@ -1006,154 +957,6 @@ fn usize_from_config(name: &str, value: u64) -> crate::Result<usize> {
             "{name} value is too large for this platform [value={value}]"
         )
     })
-}
-
-impl PublicationLog for ConfiguredQwpWsQueue {
-    fn try_publish(&mut self, payload: &[u8]) -> Result<QwpReceipt, DriverError> {
-        match self {
-            Self::Memory(queue) => PublicationLog::try_publish(queue, payload),
-            Self::StoreAndForward(queue) => PublicationLog::try_publish(queue.as_mut(), payload),
-        }
-    }
-
-    fn take_lock_free_producer(&mut self) -> Option<LockFreeVolatileProducer> {
-        match self {
-            Self::Memory(queue) => PublicationLog::take_lock_free_producer(queue),
-            Self::StoreAndForward(queue) => PublicationLog::take_lock_free_producer(queue.as_mut()),
-        }
-    }
-
-    fn take_sfa_producer(&mut self) -> Option<SfaProducer> {
-        match self {
-            Self::Memory(queue) => PublicationLog::take_sfa_producer(queue),
-            Self::StoreAndForward(queue) => PublicationLog::take_sfa_producer(queue.as_mut()),
-        }
-    }
-
-    fn next_outbound_frame(
-        &mut self,
-        send_cursor: &mut SendCursor,
-    ) -> Result<Option<OutboundFrame>, DriverError> {
-        match self {
-            Self::Memory(queue) => PublicationLog::next_outbound_frame(queue, send_cursor),
-            Self::StoreAndForward(queue) => {
-                PublicationLog::next_outbound_frame(queue.as_mut(), send_cursor)
-            }
-        }
-    }
-
-    fn pending_payload_for_fsn(&self, fsn: u64) -> Result<Option<PendingPayload>, DriverError> {
-        match self {
-            Self::Memory(queue) => PublicationLog::pending_payload_for_fsn(queue, fsn),
-            Self::StoreAndForward(queue) => {
-                PublicationLog::pending_payload_for_fsn(queue.as_ref(), fsn)
-            }
-        }
-    }
-
-    fn restart_send_cursor(&mut self) {
-        match self {
-            Self::Memory(queue) => PublicationLog::restart_send_cursor(queue),
-            Self::StoreAndForward(queue) => PublicationLog::restart_send_cursor(queue.as_mut()),
-        }
-    }
-
-    fn take_storage_maintenance_step(
-        &mut self,
-        allow_create: bool,
-    ) -> Result<Option<SfaStorageStep>, DriverError> {
-        match self {
-            Self::Memory(queue) => {
-                PublicationLog::take_storage_maintenance_step(queue, allow_create)
-            }
-            Self::StoreAndForward(queue) => {
-                PublicationLog::take_storage_maintenance_step(queue.as_mut(), allow_create)
-            }
-        }
-    }
-
-    fn finish_storage_maintenance(
-        &mut self,
-        result: SfaStorageResult,
-        allow_install: bool,
-    ) -> Result<SfaStorageFinish, DriverError> {
-        match self {
-            Self::Memory(queue) => {
-                PublicationLog::finish_storage_maintenance(queue, result, allow_install)
-            }
-            Self::StoreAndForward(queue) => {
-                PublicationLog::finish_storage_maintenance(queue.as_mut(), result, allow_install)
-            }
-        }
-    }
-
-    fn record_storage_cleanup_failure(
-        &mut self,
-        failure: SfaCleanupFailure,
-    ) -> Result<(), DriverError> {
-        match self {
-            Self::Memory(queue) => PublicationLog::record_storage_cleanup_failure(queue, failure),
-            Self::StoreAndForward(queue) => {
-                PublicationLog::record_storage_cleanup_failure(queue.as_mut(), failure)
-            }
-        }
-    }
-
-    fn oldest_unresolved_fsn(&self) -> Option<u64> {
-        match self {
-            Self::Memory(queue) => PublicationLog::oldest_unresolved_fsn(queue),
-            Self::StoreAndForward(queue) => PublicationLog::oldest_unresolved_fsn(queue.as_ref()),
-        }
-    }
-
-    fn complete_through(&mut self, fsn: u64) -> Result<(), DriverError> {
-        match self {
-            Self::Memory(queue) => PublicationLog::complete_through(queue, fsn),
-            Self::StoreAndForward(queue) => PublicationLog::complete_through(queue.as_mut(), fsn),
-        }
-    }
-
-    fn reject_fsn(&mut self, fsn: u64) -> Result<QwpReceipt, DriverError> {
-        match self {
-            Self::Memory(queue) => PublicationLog::reject_fsn(queue, fsn),
-            Self::StoreAndForward(queue) => PublicationLog::reject_fsn(queue.as_mut(), fsn),
-        }
-    }
-
-    fn close(&mut self) -> Result<(), DriverError> {
-        match self {
-            Self::Memory(queue) => PublicationLog::close(queue),
-            Self::StoreAndForward(queue) => Ok(queue.close()?),
-        }
-    }
-
-    fn receipt_status(&self, receipt: QwpReceipt) -> QwpReceiptStatus {
-        match self {
-            Self::Memory(queue) => PublicationLog::receipt_status(queue, receipt),
-            Self::StoreAndForward(queue) => PublicationLog::receipt_status(queue.as_ref(), receipt),
-        }
-    }
-
-    fn published_fsn(&self) -> Option<u64> {
-        match self {
-            Self::Memory(queue) => PublicationLog::published_fsn(queue),
-            Self::StoreAndForward(queue) => PublicationLog::published_fsn(queue.as_ref()),
-        }
-    }
-
-    fn completed_fsn(&self) -> Option<u64> {
-        match self {
-            Self::Memory(queue) => PublicationLog::completed_fsn(queue),
-            Self::StoreAndForward(queue) => PublicationLog::completed_fsn(queue.as_ref()),
-        }
-    }
-
-    fn max_in_flight(&self) -> usize {
-        match self {
-            Self::Memory(queue) => PublicationLog::max_in_flight(queue),
-            Self::StoreAndForward(queue) => PublicationLog::max_in_flight(queue.as_ref()),
-        }
-    }
 }
 
 // ---------- minimal SHA-1 for Sec-WebSocket-Accept ----------
@@ -2008,7 +1811,7 @@ pub(crate) fn open_qwp_ws_publisher(
     qwp_ws: &QwpWsConfig,
     auth_header: Option<String>,
 ) -> crate::Result<SyncQwpWsPublisher> {
-    let queue = ConfiguredQwpWsQueue::open(qwp_ws)?;
+    let queue = open_configured_qwp_ws_queue(qwp_ws)?;
     let transport =
         connect_blocking_transport(host, port, use_tls, tls_settings, qwp_ws, auth_header)?;
     let negotiated_version = transport.negotiated_version();
@@ -2319,6 +2122,7 @@ fn driver_error_backpressure_queue(err: &DriverError) -> Option<super::qwp_ws_qu
         DriverError::Queue(
             err @ (QueueError::FrameCapacityFull { .. }
             | QueueError::ByteCapacityFull { .. }
+            | QueueError::MaxInFlightReached { .. }
             | QueueError::StorageSpareNotReady { .. }
             | QueueError::StorageSegmentCapFull { .. }),
         ) => Some(*err),
@@ -2358,11 +2162,20 @@ mod tests {
         DriverError, DriverEvent, FakeOrderedServer, ReconnectReason, TransportFailure,
         TransportResponse, TransportSendResult,
     };
-    use super::super::qwp_ws_queue::{OutboundFrameView, SentFrame, VolatileFrameQueue};
-    use super::super::qwp_ws_sfa_queue::{SfaFrameQueue, SfaQueueOptions};
+    use super::super::qwp_ws_queue::{OutboundFrameView, SentFrame};
+    use super::super::qwp_ws_sfa_queue::{SfaFrameQueue, SfaMemoryQueueOptions, SfaQueueOptions};
     use super::*;
     use std::sync::{Arc, mpsc};
     use tempfile::TempDir;
+
+    fn memory_queue(max_bytes: usize, max_in_flight: usize) -> SfaFrameQueue {
+        SfaFrameQueue::open_memory(SfaMemoryQueueOptions {
+            segment_size_bytes: 256,
+            max_bytes,
+            max_in_flight,
+        })
+        .unwrap()
+    }
 
     #[test]
     fn backpressure_notifier_remembers_progress_before_wait() {
@@ -2852,12 +2665,7 @@ mod tests {
     fn threaded_runner_accepts_publication_while_transport_send_is_blocked() {
         let (send_started_tx, send_started_rx) = mpsc::channel();
         let (release_send_tx, release_send_rx) = mpsc::channel();
-        let queue = VolatileFrameQueue::new(VolatileQueueOptions {
-            max_frames: 2,
-            max_bytes: 1024,
-            max_in_flight: 1,
-        })
-        .unwrap();
+        let queue = memory_queue(1024, 2);
         let transport = BlockingFirstSendTransport {
             send_started: send_started_tx,
             release_send: release_send_rx,
@@ -2984,12 +2792,7 @@ mod tests {
         let (send_started_tx, send_started_rx) = mpsc::channel();
         let (reconnect_started_tx, reconnect_started_rx) = mpsc::channel();
         let (release_reconnect_tx, release_reconnect_rx) = mpsc::channel();
-        let queue = VolatileFrameQueue::new(VolatileQueueOptions {
-            max_frames: 2,
-            max_bytes: 1024,
-            max_in_flight: 1,
-        })
-        .unwrap();
+        let queue = memory_queue(1024, 2);
         let transport = BlockingReconnectTransport {
             send_started: send_started_tx,
             reconnect_started: reconnect_started_tx,
@@ -3073,16 +2876,11 @@ mod tests {
     }
 
     #[test]
-    fn threaded_runner_waits_for_ack_when_lock_free_publication_is_backpressured() {
+    fn threaded_runner_waits_for_ack_when_sfa_publication_is_backpressured() {
         let (sent_tx, sent_rx) = mpsc::channel();
         let (ack_tx, ack_rx) = mpsc::channel();
         let (_terminal_tx, terminal_rx) = mpsc::channel();
-        let queue = LockFreeVolatilePublicationLog::new(VolatileQueueOptions {
-            max_frames: 1,
-            max_bytes: 1024,
-            max_in_flight: 1,
-        })
-        .unwrap();
+        let queue = memory_queue(1024, 1);
         let transport = SignalResponseTransport {
             sent_frame: sent_tx,
             ack: ack_rx,
@@ -3120,16 +2918,11 @@ mod tests {
     }
 
     #[test]
-    fn threaded_runner_times_out_when_lock_free_publication_stays_backpressured() {
+    fn threaded_runner_times_out_when_sfa_publication_stays_backpressured() {
         let (sent_tx, sent_rx) = mpsc::channel();
         let (_ack_tx, ack_rx) = mpsc::channel();
         let (_terminal_tx, terminal_rx) = mpsc::channel();
-        let queue = LockFreeVolatilePublicationLog::new(VolatileQueueOptions {
-            max_frames: 1,
-            max_bytes: 1024,
-            max_in_flight: 1,
-        })
-        .unwrap();
+        let queue = memory_queue(1024, 1);
         let transport = SignalResponseTransport {
             sent_frame: sent_tx,
             ack: ack_rx,
@@ -3159,12 +2952,7 @@ mod tests {
         let (sent_tx, sent_rx) = mpsc::channel();
         let (_ack_tx, ack_rx) = mpsc::channel();
         let (terminal_tx, terminal_rx) = mpsc::channel();
-        let queue = LockFreeVolatilePublicationLog::new(VolatileQueueOptions {
-            max_frames: 1,
-            max_bytes: 1024,
-            max_in_flight: 1,
-        })
-        .unwrap();
+        let queue = memory_queue(1024, 1);
         let transport = SignalResponseTransport {
             sent_frame: sent_tx,
             ack: ack_rx,
@@ -3252,12 +3040,7 @@ mod tests {
     fn threaded_runner_records_immediate_transport_failure_as_sent_before_reconnect() {
         let (reconnect_started_tx, reconnect_started_rx) = mpsc::channel();
         let (release_reconnect_tx, release_reconnect_rx) = mpsc::channel();
-        let queue = VolatileFrameQueue::new(VolatileQueueOptions {
-            max_frames: 2,
-            max_bytes: 1024,
-            max_in_flight: 1,
-        })
-        .unwrap();
+        let queue = memory_queue(1024, 2);
         let transport = ImmediateFailureReconnectTransport {
             reconnect_started: reconnect_started_tx,
             release_reconnect: release_reconnect_rx,
@@ -3283,13 +3066,10 @@ mod tests {
         };
         assert_eq!(
             events,
-            vec![
-                DriverEvent::Published { fsn: 0 },
-                DriverEvent::Sent {
-                    fsn: 0,
-                    wire_seq: 0,
-                },
-            ]
+            vec![DriverEvent::Sent {
+                fsn: 0,
+                wire_seq: 0,
+            }]
         );
 
         release_reconnect_tx.send(()).unwrap();

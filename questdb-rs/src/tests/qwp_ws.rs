@@ -1295,6 +1295,31 @@ fn qwp_ws_store_and_forward_config_opens_java_slot_layout() {
 }
 
 #[test]
+fn qwp_ws_store_and_forward_rejects_one_segment_total_capacity() {
+    let sf_dir = tempfile::TempDir::new().unwrap();
+    let conf = format!(
+        "qwpws::addr=127.0.0.1:1;sf_dir={};sender_id=primary;\
+         sf_max_bytes=256;sf_max_total_bytes=256;",
+        sf_dir.path().display()
+    );
+
+    let err = SenderBuilder::from_conf(conf).unwrap().build().unwrap_err();
+    assert_eq!(err.code(), crate::ErrorCode::SocketError);
+    assert!(
+        err.msg().contains("Store-and-Forward queue") && err.msg().contains("InvalidCapacity"),
+        "got: {}",
+        err.msg()
+    );
+    assert!(
+        !sf_dir
+            .path()
+            .join("primary")
+            .join("sf-initial.sfa")
+            .exists()
+    );
+}
+
+#[test]
 fn qwp_ws_manual_orphan_drainer_replays_sibling_slot() {
     let seed_port = spawn_upgrade_only_server();
     let sf_dir = tempfile::TempDir::new().unwrap();

@@ -2,8 +2,11 @@
 
 Date: 2026-04-28
 
-Status: validation note for Step 5 of
-`doc/QWP_WEBSOCKET_VALIDATION_PLAN.md`.
+Status: historical validation note for Step 5 of
+`doc/QWP_WEBSOCKET_VALIDATION_PLAN.md`. The volatile queues described here have
+been removed. Current memory-mode QWP/WebSocket publication uses memory-backed
+`SfaFrameQueue` / `SfaSlotQueue` segments, sharing the same cursor mechanics as
+file-backed SFA mode.
 
 ## Prototype scope
 

@@ -36,8 +36,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ingress::qwp_ws_test_support::{
-    CloseOutcome, DeliveryOutcome, ManualDriverPrototype, QwpWsPublicationDriver, SfaSlotOptions,
-    SfaSlotQueue, VolatileFrameQueue, VolatileQueueOptions, connect_blocking_transport,
+    CloseOutcome, DeliveryOutcome, ManualDriverPrototype, QwpWsPublicationDriver, SfaFrameQueue,
+    SfaMemoryQueueOptions, SfaSlotOptions, SfaSlotQueue, connect_blocking_transport,
 };
 use crate::ingress::{Buffer, QwpWsProgress, SenderBuilder, TimestampNanos};
 use tempfile::TempDir;
@@ -49,6 +49,15 @@ type ProxyResult<T> = std::io::Result<T>;
 
 const QWP_STATUS_OK: u8 = 0x00;
 const QWP_STATUS_DURABLE_ACK: u8 = 0x02;
+
+fn memory_queue() -> ProbeResult<SfaFrameQueue> {
+    SfaFrameQueue::open_memory(SfaMemoryQueueOptions {
+        segment_size_bytes: 64 * 1024,
+        max_bytes: 128 * 1024,
+        max_in_flight: 4,
+    })
+    .map_err(proto_err)
+}
 
 #[derive(Clone, Debug)]
 struct ProbeConfig {
@@ -77,12 +86,7 @@ fn qwp_ws_publication_driver_submit_waits_and_row_is_queryable() -> TestResult {
         config.qwp_ws_port.to_string(),
         config.auth_header.clone(),
     )?;
-    let queue = VolatileFrameQueue::new(VolatileQueueOptions {
-        max_frames: 8,
-        max_bytes: 64 * 1024,
-        max_in_flight: 4,
-    })
-    .map_err(proto_err)?;
+    let queue = memory_queue()?;
     let driver = ManualDriverPrototype::from_queue(queue, transport);
     let mut publisher = QwpWsPublicationDriver::new(driver, 1);
 
@@ -174,12 +178,7 @@ fn qwp_ws_publication_driver_reconnect_replays_only_unacked_rows() -> TestResult
         proxy.port.to_string(),
         config.auth_header.clone(),
     )?;
-    let queue = VolatileFrameQueue::new(VolatileQueueOptions {
-        max_frames: 8,
-        max_bytes: 64 * 1024,
-        max_in_flight: 4,
-    })
-    .map_err(proto_err)?;
+    let queue = memory_queue()?;
     let driver = ManualDriverPrototype::from_queue(queue, transport);
     let mut publisher = QwpWsPublicationDriver::new(driver, 1);
 

@@ -2,8 +2,11 @@
 
 Date: 2026-04-28
 
-Status: validation note for Step 8 of
-`doc/QWP_WEBSOCKET_VALIDATION_PLAN.md`.
+Status: historical validation note for Step 8 of
+`doc/QWP_WEBSOCKET_VALIDATION_PLAN.md`. The current implementation no longer
+uses the journal prototype described here; QWP/WebSocket publication now uses
+the Java-compatible SFA cursor engine in both memory-backed and file-backed
+modes.
 
 ## Prototype scope
 
