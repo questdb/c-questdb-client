@@ -151,6 +151,21 @@ impl Reader {
         Self::from_config(&cfg)
     }
 
+    /// Open a new connection from the config string stored in the
+    /// `QDB_CLIENT_CONF` environment variable. Format matches [`Reader::from_conf`].
+    pub fn from_env() -> Result<Self> {
+        let conf = std::env::var("QDB_CLIENT_CONF").map_err(|e| match e {
+            std::env::VarError::NotPresent => {
+                fmt!(ConfigError, "Environment variable QDB_CLIENT_CONF not set.")
+            }
+            std::env::VarError::NotUnicode(_) => fmt!(
+                InvalidUtf8,
+                "Environment variable QDB_CLIENT_CONF is set but its value is not valid UTF-8."
+            ),
+        })?;
+        Self::from_conf(conf)
+    }
+
     /// Walk `cfg.addrs` in order, opening each endpoint and eagerly
     /// consuming the v2 `SERVER_INFO` frame. Accepts the first endpoint
     /// whose role matches `cfg.target`. Returns:
