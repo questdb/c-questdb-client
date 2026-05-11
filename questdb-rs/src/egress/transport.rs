@@ -546,30 +546,40 @@ fn validate_content_encoding(headers: &tungstenite::http::HeaderMap) -> Result<(
     // message tidy (no trailing parameter noise).
     let mut parts = s.split(';');
     let name = parts.next().unwrap_or("").trim();
-    match name {
+    // RFC 7231 §3.1.2.1: "All content-codings are case-insensitive."
+    // A standards-compliant server or any transparent proxy along
+    // the path may rewrite the casing (`Zstd`, `ZSTD`, `Identity`).
+    // Compare ignoring ASCII case so the handshake doesn't fail on
+    // capitalisation alone. The original (preserved-case) `name`
+    // still flows into the unknown-codec error message so the
+    // diagnostic mirrors what the server actually emitted.
+    if name.eq_ignore_ascii_case("raw")
+        || name.eq_ignore_ascii_case("identity")
+        || name.is_empty()
+    {
         // `raw` and `identity` are spec-aliases for no compression.
-        "raw" | "identity" | "" => Ok(()),
-        "zstd" => {
-            #[cfg(feature = "compression-zstd")]
-            {
-                Ok(())
-            }
-            #[cfg(not(feature = "compression-zstd"))]
-            {
-                Err(fmt!(
-                    HandshakeError,
-                    "server selected X-QWP-Content-Encoding {:?} but this client was built \
-                     without the `compression-zstd` feature",
-                    s
-                ))
-            }
+        Ok(())
+    } else if name.eq_ignore_ascii_case("zstd") {
+        #[cfg(feature = "compression-zstd")]
+        {
+            Ok(())
         }
-        other => Err(fmt!(
+        #[cfg(not(feature = "compression-zstd"))]
+        {
+            Err(fmt!(
+                HandshakeError,
+                "server selected X-QWP-Content-Encoding {:?} but this client was built \
+                 without the `compression-zstd` feature",
+                s
+            ))
+        }
+    } else {
+        Err(fmt!(
             HandshakeError,
             "server selected X-QWP-Content-Encoding {:?} (unknown codec {:?})",
             s,
-            other
-        )),
+            name
+        ))
     }
 }
 
@@ -853,6 +863,42 @@ mod tests {
         let err = validate_content_encoding(&header_map("brotli")).unwrap_err();
         assert_eq!(err.code(), ErrorCode::HandshakeError);
         assert!(err.msg().contains("unknown codec"), "got: {}", err.msg());
+    }
+
+    /// RFC 7231 §3.1.2.1: content codings are case-insensitive. A
+    /// server (or transparent proxy that rewrites the response
+    /// headers) sending mixed- or upper-case codec names must not
+    /// trip the handshake — the codec choice is identical, only the
+    /// spelling differs.
+    #[test]
+    fn content_encoding_codec_name_is_case_insensitive() {
+        validate_content_encoding(&header_map("RAW")).unwrap();
+        validate_content_encoding(&header_map("Raw")).unwrap();
+        validate_content_encoding(&header_map("IDENTITY")).unwrap();
+        validate_content_encoding(&header_map("Identity")).unwrap();
+    }
+
+    #[cfg(feature = "compression-zstd")]
+    #[test]
+    fn content_encoding_zstd_case_insensitive() {
+        validate_content_encoding(&header_map("ZSTD")).unwrap();
+        validate_content_encoding(&header_map("Zstd")).unwrap();
+        validate_content_encoding(&header_map("zStd")).unwrap();
+        // Mixed case on the codec name with a lowercase parameter
+        // (the parameter side is server-state and isn't matched on).
+        validate_content_encoding(&header_map("Zstd;level=3")).unwrap();
+    }
+
+    #[cfg(not(feature = "compression-zstd"))]
+    #[test]
+    fn content_encoding_zstd_case_insensitive_rejected_without_feature() {
+        // A client built without `compression-zstd` must reject `Zstd`
+        // / `ZSTD` the same way it rejects `zstd` — the rejection
+        // logic must not silently accept the mixed-case form.
+        let err = validate_content_encoding(&header_map("ZSTD")).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::HandshakeError);
+        let err = validate_content_encoding(&header_map("Zstd")).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::HandshakeError);
     }
 
     #[test]
