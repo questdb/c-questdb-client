@@ -51,13 +51,19 @@ from fixture import (
     install_questdb,
     install_questdb_from_repo,
     list_questdb_releases,
-    AUTH)
+    AUTH,
+    HTTP_AUTH)
 import subprocess
 from decimal import Decimal
 
 QDB_FIXTURE: QuestDbFixtureBase = None
 TLS_PROXY_FIXTURE: TlsProxyFixture = None
 BUILD_MODE = None
+QWP_WS_SMOKE_TLS = False
+
+SUITE_MATRIX = 'matrix'
+SUITE_QWP_WS_SMOKE = 'qwp_ws_smoke'
+SUITE_QWP_WS_RESTART = 'qwp_ws_restart'
 
 # The first QuestDB version that supports array types.
 FIRST_ARRAYS_RELEASE = (8, 3, 3)
@@ -99,20 +105,25 @@ def _iter_tests(suite):
             yield test
 
 
-def _is_qwp_ws_restart_test(test):
-    return test.__class__.__name__ == 'TestQwpWsRestart'
+def _suite_kind(test):
+    class_name = test.__class__.__name__
+    if class_name == 'TestQwpWsSender':
+        return SUITE_QWP_WS_SMOKE
+    if class_name == 'TestQwpWsRestart':
+        return SUITE_QWP_WS_RESTART
+    return SUITE_MATRIX
 
 
-def _select_qwp_ws_restart_tests(include_restart):
+def _select_tests(suite_kind):
     suite = unittest.TestSuite()
     for test in _iter_tests(_load_requested_suite()):
-        if _is_qwp_ws_restart_test(test) == include_restart:
+        if _suite_kind(test) == suite_kind:
             suite.addTest(test)
     return suite
 
 
-def _run_selected_tests(include_qwp_ws_restart):
-    suite = _select_qwp_ws_restart_tests(include_qwp_ws_restart)
+def _run_selected_tests(suite_kind):
+    suite = _select_tests(suite_kind)
     if suite.countTestCases() == 0:
         return True
     program = _parse_unittest_args()
@@ -1423,39 +1434,18 @@ class TestSender(unittest.TestCase):
             yaml.safe_load(f)
 
 
-class TestQwpWsRestart(unittest.TestCase):
-    ROWS_PER_PHASE = 500
-    ROWS_PER_RECOVERY_EPOCH = 5000
-    CONTINUOUS_BOUNCES = 3
-    CONTINUOUS_BATCH_ROWS = 25
-    MULTI_EPOCH_ROWS = (500, 997, 1499)
+class QwpWsTestSupport:
     BASE_TS_US = 1_700_000_000_000_000
     TS_STEP_US = 1_000
 
-    def setUp(self):
-        self._require_restart_fixture()
-        test_name = self.id()
-        QDB_FIXTURE.http_sql_query(
-            f'select * from long_sequence(1) -- >>>>>>>>> BEGIN PYTHON UNIT TEST: {test_name}')
-
-    def tearDown(self):
-        if isinstance(QDB_FIXTURE, QuestDbFixture) and QDB_FIXTURE._proc:
-            test_name = self.id()
-            QDB_FIXTURE.http_sql_query(
-                f'select * from long_sequence(1) -- <<<<<<<<< END PYTHON UNIT TEST: {test_name}')
-
-    def _require_restart_fixture(self):
+    @staticmethod
+    def _require_qwp_ws_protocol():
         if not hasattr(qls.Protocol, 'QWPWS'):
-            self.skipTest('QWP/WebSocket protocol is not exposed by the system-test shim')
-        if not isinstance(QDB_FIXTURE, QuestDbFixture):
-            self.skipTest('QWP/WebSocket restart tests require a managed QuestDB fixture')
-        if QDB_FIXTURE.auth:
-            self.skipTest('QWP/WebSocket restart tests run without auth')
-        if QDB_FIXTURE.http:
-            self.skipTest('QWP/WebSocket restart tests run outside the HTTP ILP matrix')
+            raise unittest.SkipTest(
+                'QWP/WebSocket protocol is not exposed by the system-test shim')
 
     @staticmethod
-    def _create_restart_table(table_name):
+    def _create_qwp_ws_table(table_name):
         sql_query(
             f'CREATE TABLE "{table_name}" '
             '(id LONG, val DOUBLE, ts TIMESTAMP) '
@@ -1463,10 +1453,11 @@ class TestQwpWsRestart(unittest.TestCase):
             'DEDUP UPSERT KEYS(ts, id)')
 
     @staticmethod
-    def _sender_conf(sender_id, sf_dir, port=None, **settings):
+    def _sender_conf(sender_id, sf_dir, port=None, scheme='qwpws', host=None, **settings):
+        host = QDB_FIXTURE.host if host is None else host
         port = QDB_FIXTURE.http_server_port if port is None else port
         conf = [
-            f'qwpws::addr={QDB_FIXTURE.host}:{port};',
+            f'{scheme}::addr={host}:{port};',
             f'sender_id={sender_id};',
             f'sf_dir={sf_dir};']
         for key, value in settings.items():
@@ -1497,8 +1488,10 @@ class TestQwpWsRestart(unittest.TestCase):
         except qls.SenderError as e:
             if sender is not None:
                 sender.close(False)
+            root_dir = getattr(QDB_FIXTURE, '_root_dir', None)
             if (
-                    QDB_FIXTURE._root_dir.name != 'repo' and
+                    root_dir is not None and
+                    root_dir.name != 'repo' and
                     self._is_unsupported_qwp_ws_fixture_error(e)):
                 self.skipTest(f'QWP/WebSocket is not supported by this QuestDB fixture: {e}')
             raise
@@ -1559,6 +1552,137 @@ class TestQwpWsRestart(unittest.TestCase):
             f'Timed out waiting for aggregates from {query!r}; '
             f'last_resp={last_resp!r}; last_error={last_error!r}')
 
+
+class TestQwpWsSender(QwpWsTestSupport, unittest.TestCase):
+    ROWS = 3
+
+    def setUp(self):
+        self._require_smoke_fixture()
+        test_name = self.id()
+        QDB_FIXTURE.http_sql_query(
+            f'select * from long_sequence(1) -- >>>>>>>>> BEGIN PYTHON UNIT TEST: {test_name}')
+
+    def tearDown(self):
+        if isinstance(QDB_FIXTURE, QuestDbFixture) and QDB_FIXTURE._proc:
+            test_name = self.id()
+            QDB_FIXTURE.http_sql_query(
+                f'select * from long_sequence(1) -- <<<<<<<<< END PYTHON UNIT TEST: {test_name}')
+
+    def _require_smoke_fixture(self):
+        self._require_qwp_ws_protocol()
+        if not isinstance(QDB_FIXTURE, QuestDbFixture):
+            self.skipTest('QWP/WebSocket smoke tests require a managed QuestDB fixture')
+        if QDB_FIXTURE.auth:
+            self.skipTest('QWP/WebSocket smoke tests use HTTP auth, not line TCP auth')
+        if QWP_WS_SMOKE_TLS and TLS_PROXY_FIXTURE is None:
+            self.skipTest('QWP/WebSocket TLS smoke tests require a TLS proxy fixture')
+
+    @staticmethod
+    def _variant_name():
+        auth_name = 'http_auth' if getattr(QDB_FIXTURE, 'http_auth', False) else 'plain'
+        tls_name = 'tls' if QWP_WS_SMOKE_TLS else 'no_tls'
+        return f'{auth_name}_{tls_name}'
+
+    def _sender_conf_for_variant(self, sender_id, sf_dir, include_auth=True):
+        scheme = 'qwpws'
+        host = QDB_FIXTURE.host
+        port = QDB_FIXTURE.http_server_port
+        settings = {
+            'reconnect_max_duration_millis': 30000,
+            'close_flush_timeout_millis': 30000,
+        }
+        if QWP_WS_SMOKE_TLS:
+            scheme = 'qwpwss'
+            host = 'localhost'
+            port = TLS_PROXY_FIXTURE.listen_port
+            settings['tls_roots'] = str(Project().tls_certs_dir / 'server_rootCA.pem')
+        if include_auth and getattr(QDB_FIXTURE, 'http_auth', False):
+            settings['username'] = HTTP_AUTH['username']
+            settings['password'] = HTTP_AUTH['password']
+        return self._sender_conf(
+            sender_id,
+            sf_dir,
+            port=port,
+            scheme=scheme,
+            host=host,
+            **settings)
+
+    def _assert_missing_auth_rejected(self, sender_id, sf_dir):
+        if not getattr(QDB_FIXTURE, 'http_auth', False):
+            return
+        sender = qls.Sender.from_conf(self._sender_conf_for_variant(
+            sender_id,
+            sf_dir,
+            include_auth=False))
+        try:
+            with self.assertRaisesRegex(
+                    qls.SenderError,
+                    r'(?i)(401|403|unauthor|forbidden|auth)'):
+                sender.connect()
+        finally:
+            sender.close(False)
+
+    def test_single_batch_round_trip(self):
+        table_name = 'qwp_ws_smoke_' + uuid.uuid4().hex[:8]
+        self._create_qwp_ws_table(table_name)
+        sender_id = 'smoke-' + self._variant_name() + '-' + uuid.uuid4().hex[:8]
+
+        with tempfile.TemporaryDirectory(prefix='qwp-ws-smoke-') as sf_dir:
+            sender = self._connect_sender(self._sender_conf_for_variant(
+                sender_id,
+                sf_dir))
+            try:
+                if not QWP_WS_SMOKE_TLS:
+                    self._assert_missing_auth_rejected(sender_id + '-noauth', sf_dir)
+                self._write_rows(sender, table_name, 0, self.ROWS)
+                sender.flush()
+                sender.close_drain()
+            finally:
+                sender.close(False)
+
+            self.assertEqual(
+                self._sfa_file_count(sf_dir, sender_id),
+                0,
+                'close-drained QWP/WebSocket smoke sender left SFA frame files behind')
+
+        self._retry_assert_aggregates(
+            table_name,
+            expected_count=self.ROWS,
+            expected_distinct_id=self.ROWS,
+            expected_min_id=0,
+            expected_max_id=self.ROWS - 1)
+
+
+class TestQwpWsRestart(QwpWsTestSupport, unittest.TestCase):
+    ROWS_PER_PHASE = 500
+    ROWS_PER_RECOVERY_EPOCH = 5000
+    CONTINUOUS_BOUNCES = 3
+    CONTINUOUS_BATCH_ROWS = 25
+    MULTI_EPOCH_ROWS = (500, 997, 1499)
+
+    def setUp(self):
+        self._require_restart_fixture()
+        test_name = self.id()
+        QDB_FIXTURE.http_sql_query(
+            f'select * from long_sequence(1) -- >>>>>>>>> BEGIN PYTHON UNIT TEST: {test_name}')
+
+    def tearDown(self):
+        if isinstance(QDB_FIXTURE, QuestDbFixture) and QDB_FIXTURE._proc:
+            test_name = self.id()
+            QDB_FIXTURE.http_sql_query(
+                f'select * from long_sequence(1) -- <<<<<<<<< END PYTHON UNIT TEST: {test_name}')
+
+    def _require_restart_fixture(self):
+        self._require_qwp_ws_protocol()
+        if not isinstance(QDB_FIXTURE, QuestDbFixture):
+            self.skipTest('QWP/WebSocket restart tests require a managed QuestDB fixture')
+        if QDB_FIXTURE.auth:
+            self.skipTest('QWP/WebSocket restart tests run without auth')
+        if getattr(QDB_FIXTURE, 'http_auth', False):
+            self.skipTest('QWP/WebSocket restart tests run without HTTP auth')
+        if QDB_FIXTURE.http:
+            self.skipTest('QWP/WebSocket restart tests run outside the HTTP ILP matrix')
+
     def _write_server_accepted_unacked_qwp_frame_then_restart(
             self,
             table_name,
@@ -1614,7 +1738,7 @@ class TestQwpWsRestart(unittest.TestCase):
 
     def test_same_sender_survives_server_restart(self):
         table_name = 'qwp_ws_restart_' + uuid.uuid4().hex[:8]
-        self._create_restart_table(table_name)
+        self._create_qwp_ws_table(table_name)
         sender_id = 's2-' + uuid.uuid4().hex[:12]
 
         with tempfile.TemporaryDirectory(prefix='qwp-ws-s2-') as sf_dir:
@@ -1649,7 +1773,7 @@ class TestQwpWsRestart(unittest.TestCase):
 
     def test_reconnect_gives_up_after_cap(self):
         table_name = 'qwp_ws_cap_' + uuid.uuid4().hex[:8]
-        self._create_restart_table(table_name)
+        self._create_qwp_ws_table(table_name)
         sender_id = 's1-' + uuid.uuid4().hex[:12]
         observed_error = None
 
@@ -1704,7 +1828,7 @@ class TestQwpWsRestart(unittest.TestCase):
 
     def test_new_sender_recovers_from_sf_dir(self):
         table_name = 'qwp_ws_recover_' + uuid.uuid4().hex[:8]
-        self._create_restart_table(table_name)
+        self._create_qwp_ws_table(table_name)
         sender_id = 's3-' + uuid.uuid4().hex[:12]
 
         with tempfile.TemporaryDirectory(prefix='qwp-ws-s3-') as sf_dir:
@@ -1746,7 +1870,7 @@ class TestQwpWsRestart(unittest.TestCase):
 
     def test_sender_pushes_continuously_while_server_bounces(self):
         table_name = 'qwp_ws_bounce_' + uuid.uuid4().hex[:8]
-        self._create_restart_table(table_name)
+        self._create_qwp_ws_table(table_name)
         sender_id = 's4-' + uuid.uuid4().hex[:12]
         stop_producer = threading.Event()
         rows_produced = 0
@@ -1854,7 +1978,7 @@ class TestQwpWsRestart(unittest.TestCase):
 
     def test_fuzz_multiple_restarts_new_sender(self):
         table_name = 'qwp_ws_multi_' + uuid.uuid4().hex[:8]
-        self._create_restart_table(table_name)
+        self._create_qwp_ws_table(table_name)
         sender_id = 's5-' + uuid.uuid4().hex[:12]
         expected_count = 0
 
@@ -2873,10 +2997,12 @@ def run_with_fixtures(args):
     global QDB_FIXTURE
     global TLS_PROXY_FIXTURE
     global BUILD_MODE
+    global QWP_WS_SMOKE_TLS
 
     latest_protocol = sorted(list(qls.ProtocolVersion))[-1]
-    run_matrix_suite = _select_qwp_ws_restart_tests(False).countTestCases() > 0
-    run_restart_suite = _select_qwp_ws_restart_tests(True).countTestCases() > 0
+    run_matrix_suite = _select_tests(SUITE_MATRIX).countTestCases() > 0
+    run_qwp_ws_smoke_suite = _select_tests(SUITE_QWP_WS_SMOKE).countTestCases() > 0
+    run_qwp_ws_restart_suite = _select_tests(SUITE_QWP_WS_RESTART).countTestCases() > 0
 
     for questdb_dir in iter_versions(args):
         if run_matrix_suite:
@@ -2912,19 +3038,54 @@ def run_with_fixtures(args):
                         TLS_PROXY_FIXTURE.start()
                         try:
                             QDB_FIXTURE.drop_all_tables()
-                            if not _run_selected_tests(False):
+                            if not _run_selected_tests(SUITE_MATRIX):
                                 sys.exit(1)
                         finally:
                             if TLS_PROXY_FIXTURE:
                                 TLS_PROXY_FIXTURE.stop()
+                                TLS_PROXY_FIXTURE = None
                 finally:
                     QDB_FIXTURE.stop()
 
-        if run_restart_suite:
+        if run_qwp_ws_smoke_suite:
+            for http_auth in (False, True):
+                QDB_FIXTURE = QuestDbFixture(
+                    questdb_dir,
+                    auth=False,
+                    http_auth=http_auth,
+                    qwp_udp=False)
+                TLS_PROXY_FIXTURE = None
+                try:
+                    sys.stderr.write(
+                        f'>>>> STARTING {questdb_dir} [qwp_ws_smoke http_auth={http_auth}] <<<<\n')
+                    QDB_FIXTURE.start()
+                    BUILD_MODE = qls.BuildMode.CONF
+                    QDB_FIXTURE.http = False
+                    QDB_FIXTURE.protocol_version = latest_protocol
+                    for tls in (False, True):
+                        QWP_WS_SMOKE_TLS = tls
+                        if tls:
+                            TLS_PROXY_FIXTURE = TlsProxyFixture(QDB_FIXTURE.http_server_port)
+                            TLS_PROXY_FIXTURE.start()
+                        try:
+                            sys.stderr.write(
+                                f'>>>> Running tests [suite=qwp_ws_smoke http_auth={http_auth}, tls={tls}]\n')
+                            QDB_FIXTURE.drop_all_tables()
+                            if not _run_selected_tests(SUITE_QWP_WS_SMOKE):
+                                sys.exit(1)
+                        finally:
+                            if TLS_PROXY_FIXTURE:
+                                TLS_PROXY_FIXTURE.stop()
+                                TLS_PROXY_FIXTURE = None
+                            QWP_WS_SMOKE_TLS = False
+                finally:
+                    QDB_FIXTURE.stop()
+
+        if run_qwp_ws_restart_suite:
             QDB_FIXTURE = QuestDbFixture(
                 questdb_dir,
                 auth=False,
-                qwp_udp=bool(getattr(args, 'repo', None)))
+                qwp_udp=False)
             TLS_PROXY_FIXTURE = None
             try:
                 sys.stderr.write(f'>>>> STARTING {questdb_dir} [qwp_ws_restart] <<<<\n')
@@ -2933,7 +3094,7 @@ def run_with_fixtures(args):
                 QDB_FIXTURE.http = False
                 QDB_FIXTURE.protocol_version = latest_protocol
                 QDB_FIXTURE.drop_all_tables()
-                if not _run_selected_tests(True):
+                if not _run_selected_tests(SUITE_QWP_WS_RESTART):
                     sys.exit(1)
             finally:
                 QDB_FIXTURE.stop()

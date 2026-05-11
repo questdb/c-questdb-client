@@ -42,6 +42,7 @@ import urllib.parse
 import urllib.error
 import concurrent.futures
 import threading
+import base64
 from pprint import pformat
 
 AUTH_TXT = """admin ec-p-256-sha256 fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac
@@ -53,6 +54,10 @@ AUTH = dict(
     token="5UjEMuA0Pj5pjK8a-fa24dyIf-Es5mYny3oE_Wmus48",
     token_x="fLKYEaoEb9lrn3nkwLDA-M_xnuFOdSt9y0Z7_vWSHLU",
     token_y="Dt5tbS1dEDMSYfym3fgMv0B99szno-dFc1rYF9t0aac")
+
+HTTP_AUTH = dict(
+    username="admin",
+    password="quest")
 
 CA_PATH = (pathlib.Path(__file__).parent.parent /
            'tls_certs' / 'server_rootCA.pem')
@@ -245,13 +250,26 @@ class QuestDbFixtureBase:
         """Print the QuestDB log to stderr."""
         sys.stderr.write('questdb log output skipped.\n')
 
+    def http_headers(self):
+        if not getattr(self, 'http_auth', False):
+            return {}
+        credentials = (
+            f'{HTTP_AUTH["username"]}:{HTTP_AUTH["password"]}'
+            .encode('utf-8'))
+        encoded = base64.b64encode(credentials).decode('ascii')
+        return {'Authorization': f'Basic {encoded}'}
+
     def http_sql_query(self, sql_query):
         url = (
                 f'http://{self.host}:{self.http_server_port}/exec?' +
                 urllib.parse.urlencode({'query': sql_query}))
         buf = None
         try:
-            resp = urllib.request.urlopen(url, timeout=5)
+            req = urllib.request.Request(
+                url,
+                headers=self.http_headers(),
+                method='GET')
+            resp = urllib.request.urlopen(req, timeout=5)
             buf = resp.read()
         except urllib.error.HTTPError as http_error:
             buf = http_error.read()
@@ -355,13 +373,15 @@ class QuestDbExternalFixture(QuestDbFixtureBase):
             auth,
             protocol_version,
             qwp_udp=False,
-            qwp_udp_port=None):
+            qwp_udp_port=None,
+            http_auth=False):
         self.host = host
         self.line_tcp_port = line_tcp_port
         self.http_server_port = http_server_port
         self.version = version
         self.http = http
         self.auth = auth
+        self.http_auth = http_auth
         self.protocol_version = protocol_version
         self.qwp_udp = qwp_udp
         self.qwp_udp_port = qwp_udp_port
@@ -375,7 +395,8 @@ class QuestDbFixture(QuestDbFixtureBase):
             wrap_tls=False,
             http=False,
             protocol_version=None,
-            qwp_udp=False):
+            qwp_udp=False,
+            http_auth=False):
         self._root_dir = root_dir
         self.version = _parse_version(self._root_dir.name)
         self._data_dir = self._root_dir / 'data'
@@ -400,6 +421,7 @@ class QuestDbFixture(QuestDbFixtureBase):
             auth_txt_path = self._conf_dir / 'auth.txt'
             with open(auth_txt_path, 'w', encoding='utf-8') as auth_file:
                 auth_file.write(AUTH_TXT)
+        self.http_auth = http_auth
         self.http = http
         self.protocol_version = protocol_version
         self.qwp_udp = qwp_udp
@@ -417,6 +439,11 @@ class QuestDbFixture(QuestDbFixtureBase):
         if self.qwp_udp and self.qwp_udp_port is None:
             self.qwp_udp_port = discover_avail_udp_port()
         auth_config = 'line.tcp.auth.db.path=conf/auth.txt' if self.auth else ''
+        http_auth_config = (
+            f'http.user={HTTP_AUTH["username"]}\n'
+            '                '
+            f'http.password={HTTP_AUTH["password"]}'
+            if self.http_auth else '')
         ilp_over_http_config = 'line.http.enabled=true' if self.http else ''
         qwp_udp_enabled = 'true' if self.qwp_udp else 'false'
         qwp_udp_bind = (
@@ -441,6 +468,7 @@ class QuestDbFixture(QuestDbFixtureBase):
                 cairo.commit.lag=100
                 line.tcp.commit.interval.fraction=0.1
                 {auth_config}
+                {http_auth_config}
                 {ilp_over_http_config}
                 ''').lstrip('\n'))
 
@@ -457,7 +485,9 @@ class QuestDbFixture(QuestDbFixtureBase):
             '-m', 'io.questdb/io.questdb.ServerMain',
             '-d', str(self._data_dir)]
         sys.stderr.write(
-            f'Starting QuestDB: {launch_args!r} (auth: {self.auth}, http: {self.http}, qwp_udp: {self.qwp_udp})\n')
+            f'Starting QuestDB: {launch_args!r} '
+            f'(auth: {self.auth}, http_auth: {self.http_auth}, '
+            f'http: {self.http}, qwp_udp: {self.qwp_udp})\n')
         self._log = open(self._log_path, 'ab')
         try:
             self._proc = subprocess.Popen(
@@ -473,6 +503,7 @@ class QuestDbFixture(QuestDbFixtureBase):
                     raise RuntimeError('QuestDB died during startup.')
                 req = urllib.request.Request(
                     f'http://127.0.0.1:{self.http_server_port}/ping',
+                    headers=self.http_headers(),
                     method='GET')
                 try:
                     resp = urllib.request.urlopen(req, timeout=1)
