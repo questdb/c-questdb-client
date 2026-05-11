@@ -1698,9 +1698,19 @@ impl<'r> Cursor<'r> {
     /// and the transport are always left coherent — no half-cooked
     /// cursors that rely on `Drop` to clean up, and no stale frames
     /// left buffered for a follow-up `Reader::query()` to pick up.
+    ///
+    /// `take()` + explicit `drop` matches `reconnect_with_failover`'s
+    /// pattern: `close_in_place` issues the WS Close frame but leaves
+    /// the `WsTransport` (and its TCP `FD` + tungstenite read/write
+    /// buffers) alive until the value is dropped. Leaving the dead
+    /// transport in `self.reader.transport = Some(_)` would pin the
+    /// FD and several MiB of buffers until the entire `Reader` is
+    /// dropped — a bounded but real leak per terminated cursor.
+    /// Taking ownership and dropping here releases both immediately.
     fn terminate_with_close(&mut self) {
-        if let Some(t) = self.reader.transport.as_mut() {
+        if let Some(mut t) = self.reader.transport.take() {
             t.close_in_place();
+            drop(t);
         }
         self.reader.cursor_active = false;
         self.done = true;
