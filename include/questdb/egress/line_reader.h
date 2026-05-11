@@ -250,7 +250,7 @@ typedef struct line_reader_query line_reader_query;
  * Construct a reader from a QuestDB config string.
  *
  * The config string follows the same format as the Rust `ReaderConfig::from_conf`
- * API (e.g. `"http::addr=localhost:9000;"`). On success returns a non-NULL handle
+ * API (e.g. `"qwp::addr=localhost:9000;"`). On success returns a non-NULL handle
  * that must be released with `line_reader_close`. On failure returns NULL and
  * sets `*err_out`.
  *
