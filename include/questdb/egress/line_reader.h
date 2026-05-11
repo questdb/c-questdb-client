@@ -758,14 +758,15 @@ LINEREADER_API void line_reader_query_on_failover_reset(
 /**
  * Free the cursor and release its resources. Drops any in-flight batch
  * view; if the stream has not reached its terminal (the cursor was
- * abandoned mid-stream), tears down the underlying WebSocket transport
- * (bounded by ~200ms) so the server stops streaming and releases
- * request-scoped state. On a fully-drained cursor the reader's
- * connection is preserved and reused for the next query. No CANCEL
- * frame is sent — the server learns about a mid-stream abort only when
- * the socket goes away. Call `line_reader_cursor_cancel` first if you
- * need a cooperative cancellation handshake before the connection is
- * closed. Idempotent on NULL.
+ * abandoned mid-stream), sends a best-effort CANCEL frame (bounded by
+ * the WS write timeout, errors swallowed) and then tears down the
+ * underlying WebSocket transport (bounded by ~200ms) so the server
+ * promptly stops streaming and releases request-scoped state. On a
+ * fully-drained cursor the reader's connection is preserved and reused
+ * for the next query and no CANCEL is sent. Call
+ * `line_reader_cursor_cancel` first if you need a synchronous
+ * cancellation that surfaces errors and drains pending frames before
+ * the connection is closed. Idempotent on NULL.
  *
  * Naming note: aligns with `line_reader_query_free` / `line_reader_error_free`
  * (and ingress `line_sender_buffer_free` / `_opts_free`) — the persistent
