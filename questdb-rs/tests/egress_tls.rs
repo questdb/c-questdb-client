@@ -384,6 +384,105 @@ fn qwp_plain_client_against_tls_server_fails() {
     );
 }
 
+/// `tls_ca=os_roots`: same self-signed mock server, but the client
+/// trusts only the OS-native root store. The test CA isn't there, so
+/// the handshake must reach the TLS layer (not error out at parse) and
+/// fail with `TlsError`. Pins that `tls_ca=os_roots` actually wires
+/// `rustls_native_certs::load_native_certs` into the rustls config — a
+/// regression that silently fell back to webpki roots would still fail
+/// with `TlsError` here (so this test alone doesn't fully disambiguate
+/// os_roots vs webpki_roots), but a regression that bypassed cert
+/// validation entirely would surface as `Ok(_)` and the test would
+/// catch it.
+#[cfg(feature = "tls-native-certs")]
+#[test]
+fn qwps_handshake_fails_against_unknown_ca_with_os_roots() {
+    let srv = TlsMockServer::start();
+    let conf = format!("qwps::addr={};tls_ca=os_roots;failover=off", srv.url());
+    let err = match Reader::from_conf(&conf) {
+        Err(e) => e,
+        Ok(_) => panic!(
+            "tls_ca=os_roots must reject the self-signed test cert \
+             (cert is not in any OS root store)"
+        ),
+    };
+    assert_eq!(
+        err.code(),
+        ErrorCode::TlsError,
+        "untrusted self-signed cert under tls_ca=os_roots must surface as \
+         TlsError; got {:?}: {}",
+        err.code(),
+        err.msg()
+    );
+}
+
+/// `tls_ca=webpki_and_os_roots`: union of both default stores. The
+/// test CA is in neither, so the handshake must fail with `TlsError`.
+/// Pins that combined-roots mode reaches the TLS verifier rather than
+/// being misconfigured as a no-op (which would `Ok(_)`).
+#[cfg(all(feature = "tls-webpki-certs", feature = "tls-native-certs"))]
+#[test]
+fn qwps_handshake_fails_against_unknown_ca_with_webpki_and_os_roots() {
+    let srv = TlsMockServer::start();
+    let conf = format!(
+        "qwps::addr={};tls_ca=webpki_and_os_roots;failover=off",
+        srv.url()
+    );
+    let err = match Reader::from_conf(&conf) {
+        Err(e) => e,
+        Ok(_) => panic!(
+            "tls_ca=webpki_and_os_roots must reject the self-signed test cert \
+             (cert is in neither store)"
+        ),
+    };
+    assert_eq!(
+        err.code(),
+        ErrorCode::TlsError,
+        "untrusted self-signed cert under tls_ca=webpki_and_os_roots must \
+         surface as TlsError; got {:?}: {}",
+        err.code(),
+        err.msg()
+    );
+}
+
+/// `tls_verify=unsafe_off`: cert verification disabled entirely. Same
+/// untrusted self-signed cert that fails under every other `tls_ca`
+/// mode must now connect cleanly. This is the targeted regression
+/// guard the wider TLS suite needed: if a refactor accidentally wires
+/// the WebPKI verifier (or any real verifier) in place of
+/// `NoCertificateVerification` on `unsafe_off`, the handshake
+/// would fail with `TlsError` and this test would catch it. Run
+/// end-to-end (connect + execute + RESULT_END) so we exercise the
+/// post-handshake path too.
+#[cfg(feature = "insecure-skip-verify")]
+#[test]
+fn qwps_unsafe_off_skips_verification_against_untrusted_cert() {
+    let srv = TlsMockServer::start();
+    let conf = format!("qwps::addr={};tls_verify=unsafe_off;failover=off", srv.url());
+    let mut reader = Reader::from_conf(&conf).expect(
+        "tls_verify=unsafe_off must accept any cert; if this errored, the \
+         NoCertificateVerification verifier was not wired in",
+    );
+    {
+        let mut cursor = reader
+            .query("select 1")
+            .execute()
+            .expect("execute over unsafe_off TLS");
+        let batch = cursor.next_batch().expect("next_batch over unsafe_off TLS");
+        assert!(
+            batch.is_none(),
+            "RESULT_END terminal returns no batch view"
+        );
+        assert!(cursor.terminal().is_some());
+    }
+    drop(reader);
+    assert_eq!(
+        srv.accepts(),
+        1,
+        "exactly one TLS connection accepted under unsafe_off"
+    );
+}
+
 /// Cert/key fixtures must exist before any test runs — fail loudly
 /// here rather than producing a confusing `ConfigError` from
 /// `tls_roots=<missing path>` later.
