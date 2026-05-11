@@ -272,7 +272,21 @@ impl Reader {
     /// surfaced so the tracker can classify identically to a `421`
     /// upgrade reject.
     fn connect_endpoint(cfg: &ReaderConfig, idx: usize) -> Result<TransportSession> {
-        let mut transport = WsTransport::connect_to(cfg, idx)?;
+        let mut transport = WsTransport::connect_to(cfg, idx).map_err(|e| {
+            // Prepend the endpoint so a connect/handshake/auth failure
+            // names the host it came from. Without this, aggregated
+            // multi-endpoint diagnostics surface only the tungstenite
+            // message ("HTTP error: 401") with no way to tell which
+            // endpoint refused.
+            let endpoint = &cfg.addrs[idx];
+            let annotated =
+                Error::new(e.code(), format!("endpoint {}: {}", endpoint, e.msg()));
+            if let Some(r) = e.upgrade_reject() {
+                annotated.with_upgrade_reject(r.clone())
+            } else {
+                annotated
+            }
+        })?;
         let server_info = if transport.server_version() >= 2 {
             Some(read_server_info_frame(
                 &mut transport,

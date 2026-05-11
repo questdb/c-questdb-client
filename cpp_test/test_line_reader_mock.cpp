@@ -1256,9 +1256,12 @@ TEST_CASE("mock: multi-addr walk aggregates per-endpoint 401 rejections")
     const std::string m{msg, mlen};
     if (code == line_reader_error_auth_error)
     {
-        // The aggregated diagnostic mentions both endpoint addresses.
+        // AuthError is terminal on the first 401: credentials are
+        // cluster-wide, so retrying every host would flood server logs
+        // without recovery (matches the Java reference's
+        // QwpQueryClient.connect() which rethrows on QwpAuthFailedException
+        // immediately). The diagnostic names the endpoint that refused.
         CHECK(m.find(srv1.addr()) != std::string::npos);
-        CHECK(m.find(srv2.addr()) != std::string::npos);
     }
     line_reader_error_free(err);
 }
