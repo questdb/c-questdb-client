@@ -34,9 +34,11 @@
 #include <questdb/egress/line_reader.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <string>
+#include <thread>
 
 using namespace questdb::ingress::literals;
 namespace qm = qwp_mock;
@@ -651,6 +653,79 @@ TEST_CASE("mock: cursor::cancel writes MSG_CANCEL and surfaces Cancelled")
             saw_cancel = true;
     CHECK(saw_cancel);
     (void)threw;
+}
+
+// ---------------------------------------------------------------------------
+// Cursor::Drop without prior cancel() must still emit MSG_CANCEL.
+//
+// Regression guard for commit 3bd0f56: `Cursor::Drop` sends a
+// best-effort CANCEL frame BEFORE tearing the WS down so the server
+// releases request-scoped state (dictionary, schema, flow-control
+// budget) promptly. Without this, a regression would have the server
+// keep emitting RESULT_BATCH frames for an abandoned request until it
+// observes the eventual WS close — which the existing live test
+// `dropping_live_cursor_closes_connection` would NOT catch (it asserts
+// the next query fails after drop; that holds whether or not a CANCEL
+// was sent, since the WS close already breaks the next query).
+// ---------------------------------------------------------------------------
+
+TEST_CASE("mock: dropping cursor without draining writes MSG_CANCEL on the wire")
+{
+    qm::ColumnSpec c{
+        "v", qm::COL_INT, qm::fixed_column_bytes(1, pack_le<int32_t>({42}))};
+    // Script: serve one batch, then `AwaitClientFrame{MSG_CANCEL}`.
+    // The Await action blocks the worker thread until CANCEL arrives;
+    // if the regression returns (no CANCEL, only WS close), the Await
+    // would not be satisfied — but `captured_requests()` still tells
+    // the test body what actually landed on the wire, so we assert
+    // on it directly rather than relying on script-side blocking.
+    qm::Script s = {
+        qm::ActionSendServerInfo{},
+        qm::ActionAwaitQueryRequest{},
+        qm::ActionSendBuilt{[c](int64_t rid) {
+            return qm::result_batch_frame(rid, 0, 1, 1, {c});
+        }},
+        qm::ActionAwaitClientFrame{qm::MSG_CANCEL},
+    };
+    qm::MockServer srv({s});
+    auto reader = connect_to(srv);
+    {
+        auto cur = reader.execute("select v"_utf8);
+        // Consume the single batch — `cursor_active` stays true since
+        // no terminal has arrived yet. Without this, the cursor never
+        // observes a frame and the Drop path's invariants are
+        // exercised against an idle stream rather than a live one.
+        REQUIRE(cur.next_batch());
+        // Drop the cursor here (end-of-scope) WITHOUT calling cancel()
+        // or draining to RESULT_END. `Cursor::Drop` must emit CANCEL.
+    }
+
+    // The mock's worker thread captures frames on a separate thread.
+    // Poll for the CANCEL to appear so we don't race the worker.
+    // 2 s is generous — `Cursor::Drop` writes the CANCEL via
+    // `try_write_cancel` (bounded by `CLOSE_TIMEOUT = 200ms`) before
+    // tearing the WS down, so the byte is on the kernel TX queue
+    // synchronously when the destructor returns; the mock's
+    // `read_until_kind` reads it within microseconds.
+    bool saw_cancel = false;
+    auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        auto reqs = srv.captured_requests();
+        for (const auto& r : reqs)
+        {
+            if (!r.empty() && r[0] == qm::MSG_CANCEL)
+            {
+                saw_cancel = true;
+                break;
+            }
+        }
+        if (saw_cancel)
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    CHECK(saw_cancel);
 }
 
 // ---------------------------------------------------------------------------
