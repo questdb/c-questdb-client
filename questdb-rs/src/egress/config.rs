@@ -555,9 +555,7 @@ impl ReaderConfig {
                     max_batch_rows = parse_value("max_batch_rows", val)?;
                 }
                 "client_id" => {
-                    if val.contains('\n') || val.contains('\r') {
-                        return Err(fmt!(ConfigError, "\"client_id\" must not contain CR or LF"));
-                    }
+                    reject_crlf("client_id", val)?;
                     client_id = Some(val.to_string());
                 }
                 "target" => {
@@ -636,9 +634,7 @@ impl ReaderConfig {
                     // (zone-blind). Reject CR/LF — these are headers /
                     // log values and embedding control bytes risks
                     // injection downstream.
-                    if val.contains('\n') || val.contains('\r') {
-                        return Err(fmt!(ConfigError, "\"zone\" must not contain CR or LF"));
-                    }
+                    reject_crlf("zone", val)?;
                     let trimmed = val.trim();
                     zone = if trimmed.is_empty() {
                         None
@@ -840,6 +836,20 @@ impl ReaderConfig {
                 MAX_SERVER_INFO_TIMEOUT_MS
             ));
         }
+        // String fields & auth aren't covered by the numeric/range
+        // checks above. Without these re-checks, a caller who built
+        // `cfg` via `from_conf` (clean) and then mutated `client_id`,
+        // `zone`, or `auth` (the struct's fields are `pub`) could
+        // smuggle CRLF / control bytes into the WS upgrade headers
+        // and inject downstream — `#[non_exhaustive]` blocks struct
+        // literal construction but does not block field assignment.
+        if let Some(id) = &self.client_id {
+            reject_crlf("client_id", id)?;
+        }
+        if let Some(z) = &self.zone {
+            reject_crlf("zone", z)?;
+        }
+        self.auth.validate()?;
         Ok(())
     }
 
@@ -968,6 +978,24 @@ fn parse_bool(name: &str, raw: &str) -> Result<bool> {
             raw
         )),
     }
+}
+
+/// Reject a CR (0x0D) or LF (0x0A) in `val`. Used by parse-time
+/// handling of `client_id` and `zone` and re-applied by `validate()`
+/// so that post-parse field mutation (the `pub` fields on
+/// `ReaderConfig` allow it) can't smuggle CRLF into the WS upgrade
+/// headers — header injection would otherwise be a one-liner from a
+/// caller who built a config programmatically and then assigned a
+/// hostile value.
+fn reject_crlf(name: &str, val: &str) -> Result<()> {
+    if val.contains('\n') || val.contains('\r') {
+        return Err(fmt!(
+            ConfigError,
+            "\"{}\" must not contain CR or LF",
+            name
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1678,5 +1706,116 @@ mod tests {
         c.max_version = HIGHEST_KNOWN_VERSION + 1;
         let err = c.validate().unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
+    }
+
+    // ---------------------------------------------------------------
+    // Post-parse string-field mutation: the parse-time CRLF /
+    // control-byte guards must be re-applied by `validate()` so that
+    // a hostile or careless caller can't bypass them by mutating the
+    // `pub` fields after a clean `from_conf`. The threat is HTTP
+    // header injection into the WS upgrade.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn validate_rejects_post_parse_client_id_with_crlf() {
+        // Clean parse, then mutate to inject a CRLF + a forged
+        // Authorization line into the X-QuestDB-Client-Id header.
+        let mut c = ReaderConfig::from_conf("qwp::addr=h:9000").unwrap();
+        c.client_id = Some("foo\r\nAuthorization: Bearer attacker".into());
+        let err = c.validate().unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+        assert!(
+            err.msg().contains("client_id"),
+            "error message must name the offending field; got: {}",
+            err.msg()
+        );
+        // Bare LF and bare CR both rejected.
+        c.client_id = Some("foo\nbar".into());
+        assert_eq!(c.validate().unwrap_err().code(), ErrorCode::ConfigError);
+        c.client_id = Some("foo\rbar".into());
+        assert_eq!(c.validate().unwrap_err().code(), ErrorCode::ConfigError);
+    }
+
+    #[test]
+    fn validate_rejects_post_parse_zone_with_crlf() {
+        let mut c = ReaderConfig::from_conf("qwp::addr=h:9000").unwrap();
+        c.zone = Some("eu-west-1a\r\nX-Injected: 1".into());
+        let err = c.validate().unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+        assert!(err.msg().contains("zone"));
+    }
+
+    #[test]
+    fn validate_rejects_post_parse_verbatim_auth_with_control_bytes() {
+        // Verbatim is the highest-risk variant: the value flows
+        // unchanged into the `Authorization` header. The parse-time
+        // `reject_control_bytes` lives in `AuthMode::from_parts`; the
+        // `pub` `auth` field on ReaderConfig lets a caller skip that
+        // path entirely.
+        let mut c = ReaderConfig::from_conf("qwp::addr=h:9000").unwrap();
+        c.auth = AuthMode::Verbatim {
+            value: "Bearer xx\r\nX-Injected: 1".into(),
+        };
+        let err = c.validate().unwrap_err();
+        assert_eq!(err.code(), ErrorCode::AuthError);
+        // Bare LF likewise.
+        c.auth = AuthMode::Verbatim {
+            value: "Bearer\nyy".into(),
+        };
+        assert_eq!(c.validate().unwrap_err().code(), ErrorCode::AuthError);
+    }
+
+    #[test]
+    fn validate_rejects_post_parse_bearer_token_with_control_bytes() {
+        let mut c = ReaderConfig::from_conf("qwp::addr=h:9000").unwrap();
+        c.auth = AuthMode::Bearer {
+            token: "abc\r\ndef".into(),
+        };
+        let err = c.validate().unwrap_err();
+        assert_eq!(err.code(), ErrorCode::AuthError);
+    }
+
+    #[test]
+    fn validate_rejects_post_parse_basic_auth_with_control_bytes() {
+        let mut c = ReaderConfig::from_conf("qwp::addr=h:9000").unwrap();
+        c.auth = AuthMode::Basic {
+            username: "user\nfoo".into(),
+            password: "pw".into(),
+        };
+        assert_eq!(c.validate().unwrap_err().code(), ErrorCode::AuthError);
+        c.auth = AuthMode::Basic {
+            username: "user".into(),
+            password: "pw\r\nX-Injected: 1".into(),
+        };
+        assert_eq!(c.validate().unwrap_err().code(), ErrorCode::AuthError);
+    }
+
+    #[test]
+    fn validate_rejects_post_parse_basic_username_with_colon() {
+        // The colon-in-username check ships in `from_parts` because
+        // the server splits credentials on the first ':'. The same
+        // hazard re-emerges if the caller assigns a Basic AuthMode
+        // directly to the parsed config.
+        let mut c = ReaderConfig::from_conf("qwp::addr=h:9000").unwrap();
+        c.auth = AuthMode::Basic {
+            username: "admin:override".into(),
+            password: "real".into(),
+        };
+        let err = c.validate().unwrap_err();
+        assert_eq!(err.code(), ErrorCode::AuthError);
+    }
+
+    #[test]
+    fn validate_accepts_post_parse_clean_string_fields() {
+        // Sanity counterpart: clean string fields after a clean parse
+        // must still pass — the new validate hooks must not be
+        // overzealous.
+        let mut c = ReaderConfig::from_conf("qwp::addr=h:9000").unwrap();
+        c.client_id = Some("benign-id".into());
+        c.zone = Some("eu-west-1a".into());
+        c.auth = AuthMode::Bearer {
+            token: "benign.token.value".into(),
+        };
+        c.validate().expect("clean string fields must validate");
     }
 }

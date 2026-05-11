@@ -112,6 +112,32 @@ impl AuthMode {
         Ok(AuthMode::None)
     }
 
+    /// Re-run [`from_parts`](Self::from_parts)' per-variant content
+    /// checks against a constructed `AuthMode`. Used by
+    /// [`ReaderConfig::validate`](crate::egress::ReaderConfig::validate)
+    /// as a defensive recheck against post-parse field mutation:
+    /// `ReaderConfig::auth` is `pub`, so a caller can replace the
+    /// parsed `AuthMode` with one whose contents were never validated
+    /// (e.g. a `Verbatim` value carrying CRLF, smuggling an
+    /// `Authorization`/header into the WS upgrade). Catching that
+    /// here keeps the parse-time guards and the connect-time guards
+    /// in lockstep.
+    pub(crate) fn validate(&self) -> Result<()> {
+        match self {
+            AuthMode::None => Ok(()),
+            AuthMode::Basic { username, password } => {
+                if username.contains(':') {
+                    return Err(fmt!(AuthError, "Basic auth username must not contain ':'"));
+                }
+                reject_control_bytes(username, "Basic auth username")?;
+                reject_control_bytes(password, "Basic auth password")?;
+                Ok(())
+            }
+            AuthMode::Bearer { token } => reject_control_bytes(token, "Bearer token"),
+            AuthMode::Verbatim { value } => reject_control_bytes(value, "verbatim auth value"),
+        }
+    }
+
     /// Render the `Authorization` header value, if any.
     pub fn header_value(&self) -> Option<String> {
         match self {
