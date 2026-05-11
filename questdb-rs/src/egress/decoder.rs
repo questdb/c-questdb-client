@@ -4113,16 +4113,12 @@ mod tests {
             .add_column("l", ColumnKind::Long, col_no_nulls(&le_i64s(&[])))
             .add_column("d", ColumnKind::Double, col_no_nulls(&le_f64s(&[])))
             .add_column("s", ColumnKind::Varchar, varchar_col_no_nulls(&[]))
-            .add_column(
-                "b",
-                ColumnKind::Binary,
-                {
-                    // Same shape as varchar: one trailing offset, no data.
-                    let mut out = vec![0x00u8];
-                    out.extend_from_slice(&0u32.to_le_bytes());
-                    out
-                },
-            )
+            .add_column("b", ColumnKind::Binary, {
+                // Same shape as varchar: one trailing offset, no data.
+                let mut out = vec![0x00u8];
+                out.extend_from_slice(&0u32.to_le_bytes());
+                out
+            })
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();

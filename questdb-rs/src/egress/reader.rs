@@ -2529,8 +2529,14 @@ mod tests {
                 break;
             }
         }
-        assert!(saw_low, "expected at least one draw < 10 out of 10k samples");
-        assert!(saw_high, "expected at least one draw >= 90 out of 10k samples");
+        assert!(
+            saw_low,
+            "expected at least one draw < 10 out of 10k samples"
+        );
+        assert!(
+            saw_high,
+            "expected at least one draw >= 90 out of 10k samples"
+        );
     }
 
     /// Truth-table coverage for the silent-duplicate guard.

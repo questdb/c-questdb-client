@@ -2039,11 +2039,7 @@ pub unsafe extern "C" fn line_reader_cursor_column_name(
 ) -> bool {
     unsafe {
         if cursor.is_null() {
-            set_reader_err(
-                err_out,
-                ErrorCode::InvalidApiCall,
-                "cursor handle is NULL",
-            );
+            set_reader_err(err_out, ErrorCode::InvalidApiCall, "cursor handle is NULL");
             return false;
         }
         let batch = match (*cursor).current_batch.as_ref() {
@@ -3635,11 +3631,7 @@ unsafe fn get_column_view<'a>(
         // (*cursor)`. Surfaces as a clean `InvalidApiCall` so the
         // caller sees what they did wrong.
         if cursor.is_null() {
-            set_reader_err(
-                err_out,
-                ErrorCode::InvalidApiCall,
-                "cursor handle is NULL",
-            );
+            set_reader_err(err_out, ErrorCode::InvalidApiCall, "cursor handle is NULL");
             return None;
         }
         let cursor = &*cursor;
@@ -3855,7 +3847,11 @@ mod tests {
         unsafe {
             let mut a: u64 = 1;
             let mut b: u64 = 2;
-            assert!(!line_reader_cursor_terminal_end(ptr::null(), &mut a, &mut b));
+            assert!(!line_reader_cursor_terminal_end(
+                ptr::null(),
+                &mut a,
+                &mut b
+            ));
             assert_eq!(a, 0);
             assert_eq!(b, 0);
 
@@ -3882,14 +3878,8 @@ mod tests {
             let mut value: i64 = 0;
             let mut is_null: bool = false;
             let mut err: *mut line_reader_error = ptr::null_mut();
-            let ok = line_reader_cursor_get_i64(
-                ptr::null(),
-                0,
-                0,
-                &mut value,
-                &mut is_null,
-                &mut err,
-            );
+            let ok =
+                line_reader_cursor_get_i64(ptr::null(), 0, 0, &mut value, &mut is_null, &mut err);
             assert!(!ok);
             assert!(!err.is_null(), "err_out must be set on NULL cursor");
             let code = line_reader_error_get_code(err) as u32;

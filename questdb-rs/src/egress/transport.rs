@@ -553,9 +553,7 @@ fn validate_content_encoding(headers: &tungstenite::http::HeaderMap) -> Result<(
     // capitalisation alone. The original (preserved-case) `name`
     // still flows into the unknown-codec error message so the
     // diagnostic mirrors what the server actually emitted.
-    if name.eq_ignore_ascii_case("raw")
-        || name.eq_ignore_ascii_case("identity")
-        || name.is_empty()
+    if name.eq_ignore_ascii_case("raw") || name.eq_ignore_ascii_case("identity") || name.is_empty()
     {
         // `raw` and `identity` are spec-aliases for no compression.
         Ok(())

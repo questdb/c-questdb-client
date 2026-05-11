@@ -926,7 +926,10 @@ fn pre_batch_failover_without_callback_still_replays() {
         matches!(&outcome, Ok(None)),
         "failover before any batch is delivered must replay transparently \
          (no callback required); got {:?}",
-        outcome.as_ref().map(|_| ()).map_err(|e| (e.code(), e.msg().to_string()))
+        outcome
+            .as_ref()
+            .map(|_| ())
+            .map_err(|e| (e.code(), e.msg().to_string()))
     );
     assert_eq!(
         cursor.failover_resets(),
@@ -1282,7 +1285,9 @@ fn failover_suppressed_when_drop_arrives_during_cancel_drain() {
         0,
         "cancellation must NOT trigger failover; failover_resets stayed at 0 \
          (cancel result: {:?})",
-        cancel_result.as_ref().map_err(|e| (e.code(), e.msg().to_string())),
+        cancel_result
+            .as_ref()
+            .map_err(|e| (e.code(), e.msg().to_string())),
     );
     // If the cancel returned an error, it must be a transport-class
     // surface — never a failover-budget surface. The bench against
@@ -1292,10 +1297,7 @@ fn failover_suppressed_when_drop_arrives_during_cancel_drain() {
         Ok(()) => {}
         Err(e) => {
             assert!(
-                matches!(
-                    e.code(),
-                    ErrorCode::SocketError | ErrorCode::ProtocolError
-                ),
+                matches!(e.code(), ErrorCode::SocketError | ErrorCode::ProtocolError),
                 "cancel during drain must surface as a transport error, not \
                  a failover surface; got {:?}: {}",
                 e.code(),

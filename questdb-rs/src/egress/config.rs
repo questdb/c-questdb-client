@@ -1031,11 +1031,7 @@ fn parse_bool(name: &str, raw: &str) -> Result<bool> {
 /// hostile value.
 fn reject_crlf(name: &str, val: &str) -> Result<()> {
     if val.contains('\n') || val.contains('\r') {
-        return Err(fmt!(
-            ConfigError,
-            "\"{}\" must not contain CR or LF",
-            name
-        ));
+        return Err(fmt!(ConfigError, "\"{}\" must not contain CR or LF", name));
     }
     Ok(())
 }
