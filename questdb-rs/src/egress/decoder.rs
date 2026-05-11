@@ -685,6 +685,14 @@ fn decode_array(r: &mut ByteReader<'_>, parent: &Bytes, row_count: usize) -> Res
         for d in 0..n_dims {
             let dim_bytes = r.read_bytes(4)?;
             let dim = u32::from_le_bytes(dim_bytes.try_into().unwrap());
+            if dim == 0 {
+                return Err(fmt!(
+                    ProtocolError,
+                    "array row {} has dim {} == 0 (must be >= 1)",
+                    row,
+                    d
+                ));
+            }
             shapes.push(dim);
             total = total.checked_mul(dim as u64).ok_or_else(|| {
                 fmt!(
