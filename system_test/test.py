@@ -1473,13 +1473,33 @@ class TestQwpWsRestart(unittest.TestCase):
             conf.append(f'{key}={value};')
         return ''.join(conf)
 
+    @staticmethod
+    def _is_unsupported_qwp_ws_fixture_error(error):
+        message = str(error).lower()
+        unsupported_markers = (
+            'unsupported protocol',
+            'unknown protocol',
+            'unknown scheme',
+            'missing endpoint',
+            'endpoint not found',
+            'websocket upgrade failed: http status 404',
+            'websocket upgrade failed: http status 405',
+            'websocket upgrade failed: http status 501',
+        )
+        return any(marker in message for marker in unsupported_markers)
+
     def _connect_sender(self, conf):
-        sender = qls.Sender.from_conf(conf)
+        sender = None
         try:
+            sender = qls.Sender.from_conf(conf)
             sender.connect()
             sender._buffer = qls.Buffer.from_sender(sender._impl)
         except qls.SenderError as e:
-            if QDB_FIXTURE._root_dir.name != 'repo':
+            if sender is not None:
+                sender.close(False)
+            if (
+                    QDB_FIXTURE._root_dir.name != 'repo' and
+                    self._is_unsupported_qwp_ws_fixture_error(e)):
                 self.skipTest(f'QWP/WebSocket is not supported by this QuestDB fixture: {e}')
             raise
         return sender
