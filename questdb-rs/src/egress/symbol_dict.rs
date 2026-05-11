@@ -156,7 +156,16 @@ impl SymbolDict {
         // UTF-8 validation + heap-size checks — before push_one finally
         // refuses to grow past the soft cap. Reject the malformed
         // count up front against the headroom remaining in the dict.
-        let headroom = (MAX_CONN_DICT_SIZE - self.entries.len()) as u64;
+        //
+        // `saturating_sub` is defensive: `push_one` rejects every path
+        // that would let `entries.len()` exceed `MAX_CONN_DICT_SIZE`,
+        // so this subtraction can't actually underflow today. But a
+        // future refactor introducing a new write path that misses the
+        // cap would otherwise silently underflow in release mode
+        // (wrapping to a huge `headroom`) and disable this very guard.
+        // Saturating to 0 keeps the guard correct even under that bug:
+        // any positive `delta_count` would then be rejected.
+        let headroom = MAX_CONN_DICT_SIZE.saturating_sub(self.entries.len()) as u64;
         if delta_count > headroom {
             return Err(fmt!(
                 ProtocolError,
