@@ -24,6 +24,7 @@ dns-lookup = "3.0.0"
 base64ct = { version = "1.7", features = ["alloc"] }
 ryu = { version = "1.0" }
 itoa = "1.0"
+log = "0.4"
 aws-lc-rs = { version = "1.13", optional = true }
 ring = { version = "0.17.14", optional = true }
 rustls-pki-types = "1.12.0"

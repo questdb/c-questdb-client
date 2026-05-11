@@ -70,6 +70,9 @@ pub enum ErrorCode {
     /// Error sent back from the server during flush.
     ServerFlushError,
 
+    /// QWP/WebSocket server rejection or terminal protocol violation.
+    ServerRejection,
+
     /// Bad configuration.
     ConfigError,
 
@@ -88,6 +91,8 @@ pub enum ErrorCode {
 pub struct Error {
     code: ErrorCode,
     msg: String,
+    #[cfg(feature = "_sender-qwp-ws")]
+    qwp_ws_rejection: Option<Box<crate::ingress::QwpWsSenderError>>,
 }
 
 impl Error {
@@ -96,7 +101,16 @@ impl Error {
         Error {
             code,
             msg: msg.into(),
+            #[cfg(feature = "_sender-qwp-ws")]
+            qwp_ws_rejection: None,
         }
+    }
+
+    /// Attach a structured QWP/WebSocket rejection to this error.
+    #[cfg(feature = "_sender-qwp-ws")]
+    pub fn with_qwp_ws_rejection(mut self, rejection: crate::ingress::QwpWsSenderError) -> Self {
+        self.qwp_ws_rejection = Some(Box::new(rejection));
+        self
     }
 
     #[cfg(feature = "sync-sender-http")]
@@ -132,6 +146,13 @@ impl Error {
     /// Get the string message of this error.
     pub fn msg(&self) -> &str {
         &self.msg
+    }
+
+    /// Return the structured QWP/WebSocket rejection that made this error
+    /// terminal, if one is available.
+    #[cfg(feature = "_sender-qwp-ws")]
+    pub fn qwp_ws_rejection(&self) -> Option<&crate::ingress::QwpWsSenderError> {
+        self.qwp_ws_rejection.as_deref()
     }
 }
 

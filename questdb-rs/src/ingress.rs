@@ -448,6 +448,9 @@ pub struct SenderBuilder {
 
     #[cfg(feature = "_sender-qwp-ws")]
     qwp_ws: Option<conf::QwpWsConfig>,
+
+    #[cfg(feature = "_sender-qwp-ws")]
+    qwp_ws_error_handler: QwpWsErrorHandler,
 }
 
 impl SenderBuilder {
@@ -828,7 +831,24 @@ impl SenderBuilder {
             } else {
                 None
             },
+
+            #[cfg(feature = "_sender-qwp-ws")]
+            qwp_ws_error_handler: QwpWsErrorHandler::log_default(),
         }
+    }
+
+    /// Install a producer-thread handler for structured QWP/WebSocket server
+    /// diagnostics.
+    ///
+    /// The handler runs synchronously from sender API calls such as `flush`.
+    /// It must not call methods on the same sender.
+    #[cfg(feature = "_sender-qwp-ws")]
+    pub fn qwp_ws_error_handler<F>(mut self, handler: F) -> Result<Self>
+    where
+        F: Fn(&QwpWsSenderError) + Send + Sync + 'static,
+    {
+        self.qwp_ws_error_handler = QwpWsErrorHandler::new(handler);
+        Ok(self)
     }
 
     /// Select local outbound interface.
@@ -1938,6 +1958,8 @@ impl SenderBuilder {
             self.protocol,
             protocol_version,
             max_name_len,
+            #[cfg(feature = "_sender-qwp-ws")]
+            self.qwp_ws_error_handler.clone(),
         );
 
         Ok(sender)

@@ -222,6 +222,7 @@ pub(crate) struct QwpWsPublicationStore<Q = SfaFrameQueue> {
     last_server_error: Option<QwpServerError>,
     rejected_frames: VecDeque<QwpRejectedFrame>,
     sender_errors: SenderErrorRing,
+    sender_error_notifications: SenderErrorRing,
     durable_ack: Option<DurableAckTracker>,
 }
 
@@ -240,6 +241,7 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
             last_server_error: None,
             rejected_frames: VecDeque::new(),
             sender_errors: SenderErrorRing::new(event_capacity),
+            sender_error_notifications: SenderErrorRing::new(event_capacity),
             durable_ack: durable_ack.then(DurableAckTracker::new),
         }
     }
@@ -319,9 +321,12 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
                 if policy == QwpWsErrorPolicy::Halt {
                     let sender_error = sender_error_for_qwp_error(&error, wire_seq, fsn, policy);
                     self.terminal_sender_error = Some(sender_error.clone());
-                    self.sender_errors.push(sender_error);
+                    self.push_sender_error(sender_error.clone());
                     self.last_server_error = Some(error.clone());
-                    self.mark_terminal(Some(error.error.clone()));
+                    self.mark_terminal(Some(server_rejection_error(
+                        error.error.clone(),
+                        sender_error,
+                    )));
                     return Ok(DriveOutcome::Terminal);
                 }
                 if self.reject_target_already_accounted(fsn) {
@@ -561,8 +566,7 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         policy: QwpWsErrorPolicy,
     ) {
         self.last_server_error = Some(error.clone());
-        self.sender_errors
-            .push(sender_error_for_qwp_error(&error, wire_seq, fsn, policy));
+        self.push_sender_error(sender_error_for_qwp_error(&error, wire_seq, fsn, policy));
         if self.sender_errors.capacity == 0 {
             return;
         }
@@ -583,8 +587,7 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
         error: QwpServerError,
         policy: QwpWsErrorPolicy,
     ) {
-        self.sender_errors
-            .push(sender_error_for_qwp_error(&error, wire_seq, fsn, policy));
+        self.push_sender_error(sender_error_for_qwp_error(&error, wire_seq, fsn, policy));
         self.last_server_error = Some(error);
     }
 
@@ -640,12 +643,15 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
             sender_error_for_qwp_error_span(&error, wire_seq, from_fsn, to_fsn, policy);
         if policy == QwpWsErrorPolicy::Halt {
             self.terminal_sender_error = Some(sender_error.clone());
-            self.sender_errors.push(sender_error);
+            self.push_sender_error(sender_error.clone());
             self.last_server_error = Some(error.clone());
-            self.mark_terminal(Some(error.error.clone()));
+            self.mark_terminal(Some(server_rejection_error(
+                error.error.clone(),
+                sender_error,
+            )));
             DriveOutcome::Terminal
         } else {
-            self.sender_errors.push(sender_error);
+            self.push_sender_error(sender_error);
             self.last_server_error = Some(error);
             DriveOutcome::Idle
         }
@@ -716,12 +722,20 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
             to_fsn,
         };
         self.terminal_sender_error = Some(sender_error.clone());
-        self.sender_errors.push(sender_error);
-        error::fmt!(SocketError, "QWP/WebSocket protocol violation: {message}")
+        self.push_sender_error(sender_error.clone());
+        error::fmt!(
+            ServerRejection,
+            "QWP/WebSocket protocol violation: {message}"
+        )
+        .with_qwp_ws_rejection(sender_error)
     }
 
     pub(crate) fn poll_sender_error(&mut self) -> Option<QwpWsSenderError> {
         self.sender_errors.pop()
+    }
+
+    pub(crate) fn poll_sender_error_notification(&mut self) -> Option<QwpWsSenderError> {
+        self.sender_error_notifications.pop()
     }
 
     pub(crate) fn sender_errors_dropped_total(&self) -> u64 {
@@ -756,6 +770,11 @@ impl<Q: PublicationLog> QwpWsPublicationStore<Q> {
 
     fn push_event(&mut self, event: DriverEvent) {
         self.events.push(event);
+    }
+
+    fn push_sender_error(&mut self, error: QwpWsSenderError) {
+        self.sender_errors.push(error.clone());
+        self.sender_error_notifications.push(error);
     }
 }
 
@@ -1474,6 +1493,10 @@ impl<Q: PublicationLog, T: ManualDriverTransport> ManualDriverPrototype<Q, T> {
 
     pub(crate) fn poll_sender_error(&mut self) -> Option<QwpWsSenderError> {
         self.store.poll_sender_error()
+    }
+
+    pub(crate) fn poll_sender_error_notification(&mut self) -> Option<QwpWsSenderError> {
+        self.store.poll_sender_error_notification()
     }
 
     pub(crate) fn sender_errors_dropped_total(&self) -> u64 {
@@ -2229,6 +2252,11 @@ fn sender_error_for_qwp_error_span(
         from_fsn,
         to_fsn,
     }
+}
+
+fn server_rejection_error(error: Error, sender_error: QwpWsSenderError) -> Error {
+    Error::new(ErrorCode::ServerRejection, error.msg().to_string())
+        .with_qwp_ws_rejection(sender_error)
 }
 
 fn fake_transport_error(message: &'static str) -> Error {
@@ -6280,6 +6308,28 @@ mod tests {
     }
 
     #[test]
+    fn sender_error_notification_does_not_consume_pollable_error() {
+        let mut driver = driver(FakeOrderedServer::scripted([FakeSendResult::RejectWire {
+            wire_seq: 0,
+        }]));
+        let receipt = driver.try_submit(b"payload").unwrap();
+
+        assert_eq!(
+            driver.wait_steps(receipt, 1).unwrap(),
+            DeliveryOutcome::Completed
+        );
+
+        let notification = driver.poll_sender_error_notification().unwrap();
+        assert_eq!(notification.category, QwpWsErrorCategory::SchemaMismatch);
+        assert_eq!(
+            notification.applied_policy,
+            QwpWsErrorPolicy::DropAndContinue
+        );
+        assert_eq!(driver.poll_sender_error(), Some(notification));
+        assert_eq!(driver.poll_sender_error_notification(), None);
+    }
+
+    #[test]
     fn terminal_qwp_server_error_is_pollable_after_terminalization() {
         let mut driver = driver(FakeOrderedServer::no_response());
         let receipt = driver.try_submit(b"payload").unwrap();
@@ -6313,6 +6363,10 @@ mod tests {
         assert_eq!(terminal_error.message_sequence, Some(0));
         assert_eq!(terminal_error.from_fsn, 0);
         assert_eq!(terminal_error.to_fsn, 0);
+
+        let latched_error = driver.terminal_error().unwrap();
+        assert_eq!(latched_error.code(), ErrorCode::ServerRejection);
+        assert_eq!(latched_error.qwp_ws_rejection(), Some(terminal_error));
 
         let error = driver.poll_sender_error().unwrap();
         assert_eq!(error.category, QwpWsErrorCategory::ParseError);

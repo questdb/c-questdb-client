@@ -29,6 +29,7 @@
 #include <cstddef>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -80,6 +81,9 @@ enum class line_sender_error_code
 
     /** Error sent back from the server during flush. */
     server_flush_error,
+
+    /** QWP/WebSocket server rejection or terminal protocol violation. */
+    server_rejection,
 
     /** Bad configuration. */
     config_error,
@@ -152,6 +156,27 @@ struct qwp_ws_error
     uint64_t from_fsn;
     uint64_t to_fsn;
 };
+
+inline qwp_ws_error qwp_ws_error_from_view(
+    const ::line_sender_qwpws_error_view& view)
+{
+    return qwp_ws_error{
+        static_cast<qwp_ws_error_category>(
+            static_cast<int>(view.category)),
+        static_cast<qwp_ws_error_policy>(
+            static_cast<int>(view.applied_policy)),
+        view.has_status
+            ? std::optional<uint8_t>{view.status}
+            : std::optional<uint8_t>{},
+        std::string{
+            view.message ? view.message : "",
+            view.message ? view.message_len : 0},
+        view.has_message_sequence
+            ? std::optional<uint64_t>{view.message_sequence}
+            : std::optional<uint64_t>{},
+        view.from_fsn,
+        view.to_fsn};
+}
 
 enum class protocol_version
 {
@@ -240,20 +265,7 @@ private:
         line_sender_qwpws_error_view view{};
         if (::line_sender_error_qwpws_get_view(owned_err.get(), &view))
         {
-            qwp_ws_diagnostic = qwp_ws_error{
-                static_cast<qwp_ws_error_category>(
-                    static_cast<int>(view.category)),
-                static_cast<qwp_ws_error_policy>(
-                    static_cast<int>(view.applied_policy)),
-                view.has_status ? std::optional<uint8_t>{view.status}
-                                : std::nullopt,
-                view.message ? std::string{view.message, view.message_len}
-                             : std::string{},
-                view.has_message_sequence
-                    ? std::optional<uint64_t>{view.message_sequence}
-                    : std::nullopt,
-                view.from_fsn,
-                view.to_fsn};
+            qwp_ws_diagnostic = qwp_ws_error_from_view(view);
         }
 
         return line_sender_error{code, msg, std::move(qwp_ws_diagnostic)};

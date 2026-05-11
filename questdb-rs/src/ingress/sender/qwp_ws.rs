@@ -346,6 +346,11 @@ where
         Ok(store.poll_sender_error())
     }
 
+    fn poll_sender_error_notification(&self) -> crate::Result<Option<QwpWsSenderError>> {
+        let mut store = self.lock_shared()?;
+        Ok(store.poll_sender_error_notification())
+    }
+
     fn terminal_sender_error(&self) -> crate::Result<Option<QwpWsSenderError>> {
         let store = self.lock_shared()?;
         Ok(store.terminal_sender_error().cloned())
@@ -2081,10 +2086,22 @@ pub(crate) fn qwp_ws_poll_sender_error_background(
     state.runner.poll_sender_error()
 }
 
+pub(crate) fn qwp_ws_poll_sender_error_notification_background(
+    state: &SyncQwpWsHandlerState,
+) -> crate::Result<Option<QwpWsSenderError>> {
+    state.runner.poll_sender_error_notification()
+}
+
 pub(crate) fn qwp_ws_poll_sender_error_manual(
     state: &mut ManualQwpWsHandlerState,
 ) -> crate::Result<Option<QwpWsSenderError>> {
     Ok(state.publisher.poll_sender_error())
+}
+
+pub(crate) fn qwp_ws_poll_sender_error_notification_manual(
+    state: &mut ManualQwpWsHandlerState,
+) -> crate::Result<Option<QwpWsSenderError>> {
+    Ok(state.publisher.poll_sender_error_notification())
 }
 
 pub(crate) fn qwp_ws_terminal_sender_error_background(

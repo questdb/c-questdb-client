@@ -33,6 +33,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::ErrorCode;
 use crate::ingress::{
     Buffer, ColumnName, Protocol, QwpWsEncodeScratch, QwpWsErrorCategory, QwpWsErrorPolicy,
     QwpWsProgress, SenderBuilder, SymbolGlobalDict, TableName, TimestampNanos,
@@ -1792,6 +1793,7 @@ fn read_schema_mode_and_id(frame: &[u8]) -> (u8, u64) {
 fn qwp_ws_server_error_response_is_surfaced() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
+    let (error_tx, error_rx) = mpsc::channel();
 
     thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
@@ -1828,6 +1830,10 @@ fn qwp_ws_server_error_response_is_surfaced() {
     });
 
     let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+        .qwp_ws_error_handler(move |error| {
+            error_tx.send(error.clone()).unwrap();
+        })
+        .unwrap()
         .build()
         .unwrap();
     let mut buf = sender.new_buffer();
@@ -1851,15 +1857,25 @@ fn qwp_ws_server_error_response_is_surfaced() {
         .at_now()
         .unwrap();
     let err = sender.flush(&mut buf).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::ServerRejection);
     assert!(
         err.msg().contains("bad column"),
         "expected server error in message, got: {}",
         err.msg()
     );
+    assert_eq!(
+        err.qwp_ws_rejection().map(|error| error.category),
+        Some(QwpWsErrorCategory::ParseError)
+    );
     assert!(
         !buf.is_empty(),
         "terminal async error must not clear a newly prepared buffer"
     );
+
+    let callback_error = error_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(callback_error.category, QwpWsErrorCategory::ParseError);
+    assert_eq!(callback_error.applied_policy, QwpWsErrorPolicy::Halt);
+    assert_eq!(callback_error.from_fsn, first_fsn);
 
     let qwp_error = sender.poll_qwp_ws_error().unwrap().unwrap();
     assert_eq!(qwp_error.category, QwpWsErrorCategory::ParseError);
@@ -1878,6 +1894,7 @@ fn qwp_ws_schema_rejection_drops_and_sender_continues() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::channel();
+    let (error_tx, error_rx) = mpsc::channel();
 
     thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
@@ -1922,6 +1939,10 @@ fn qwp_ws_schema_rejection_drops_and_sender_continues() {
     });
 
     let mut sender = SenderBuilder::new(Protocol::QwpWs, "127.0.0.1", port)
+        .qwp_ws_error_handler(move |error| {
+            error_tx.send(error.clone()).unwrap();
+        })
+        .unwrap()
         .build()
         .unwrap();
     let mut buf = sender.new_buffer();
@@ -1953,6 +1974,15 @@ fn qwp_ws_schema_rejection_drops_and_sender_continues() {
             .await_acked_fsn(second_fsn, Duration::from_secs(5))
             .unwrap()
     );
+    sender.flush(&mut buf).unwrap();
+
+    let callback_error = error_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(callback_error.category, QwpWsErrorCategory::SchemaMismatch);
+    assert_eq!(
+        callback_error.applied_policy,
+        QwpWsErrorPolicy::DropAndContinue
+    );
+    assert_eq!(callback_error.from_fsn, first_fsn);
 
     let qwp_error = sender.poll_qwp_ws_error().unwrap().unwrap();
     assert_eq!(qwp_error.category, QwpWsErrorCategory::SchemaMismatch);

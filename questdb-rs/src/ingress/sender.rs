@@ -147,6 +147,8 @@ pub struct Sender {
     protocol: Protocol,
     protocol_version: ProtocolVersion,
     max_name_len: usize,
+    #[cfg(feature = "_sender-qwp-ws")]
+    qwp_ws_error_handler: QwpWsErrorHandler,
 }
 
 impl Debug for Sender {
@@ -163,6 +165,7 @@ impl Sender {
         protocol: Protocol,
         protocol_version: ProtocolVersion,
         max_name_len: usize,
+        #[cfg(feature = "_sender-qwp-ws")] qwp_ws_error_handler: QwpWsErrorHandler,
     ) -> Self {
         Self {
             descr,
@@ -172,6 +175,8 @@ impl Sender {
             protocol,
             protocol_version,
             max_name_len,
+            #[cfg(feature = "_sender-qwp-ws")]
+            qwp_ws_error_handler,
         }
     }
 
@@ -235,6 +240,25 @@ impl Sender {
     }
 
     #[cfg(feature = "sync-sender-qwp-ws")]
+    fn drain_qwp_ws_error_notifications(&mut self) -> Result<()> {
+        loop {
+            let error = match &mut self.handler {
+                SyncProtocolHandler::SyncQwpWs(state) => {
+                    qwp_ws_poll_sender_error_notification_background(state)?
+                }
+                SyncProtocolHandler::ManualQwpWs(state) => {
+                    qwp_ws_poll_sender_error_notification_manual(state)?
+                }
+                _ => return Ok(()),
+            };
+            let Some(error) = error else {
+                return Ok(());
+            };
+            self.qwp_ws_error_handler.handle(&error);
+        }
+    }
+
+    #[cfg(feature = "sync-sender-qwp-ws")]
     fn flush_qwp_ws_buffer(&mut self, buf: &Buffer, transactional: bool) -> Result<Option<u64>> {
         if !matches!(
             &self.handler,
@@ -246,10 +270,21 @@ impl Sender {
             ));
         }
         match &self.handler {
-            SyncProtocolHandler::SyncQwpWs(state) => qwp_ws_check_error_background(state)?,
-            SyncProtocolHandler::ManualQwpWs(state) => qwp_ws_check_error_manual(state)?,
+            SyncProtocolHandler::SyncQwpWs(state) => {
+                if let Err(err) = qwp_ws_check_error_background(state) {
+                    let _ = self.drain_qwp_ws_error_notifications();
+                    return Err(err);
+                }
+            }
+            SyncProtocolHandler::ManualQwpWs(state) => {
+                if let Err(err) = qwp_ws_check_error_manual(state) {
+                    let _ = self.drain_qwp_ws_error_notifications();
+                    return Err(err);
+                }
+            }
             _ => unreachable!("QWP/WebSocket handler was checked above"),
         }
+        self.drain_qwp_ws_error_notifications()?;
 
         let qwp = buf.as_qwp_ws().ok_or_else(|| {
             error::fmt!(
@@ -691,13 +726,21 @@ impl Sender {
                 "close_drain is only supported for QWP/WebSocket senders."
             )),
         };
+        let drain_result = if matches!(
+            &self.handler,
+            SyncProtocolHandler::SyncQwpWs(_) | SyncProtocolHandler::ManualQwpWs(_)
+        ) {
+            self.drain_qwp_ws_error_notifications()
+        } else {
+            Ok(())
+        };
         if result
             .as_ref()
             .is_err_and(|err| matches!(err.code(), crate::ErrorCode::SocketError))
         {
             self.connected = false;
         }
-        result
+        result.and(drain_result)
     }
 
     /// Tell whether the sender is no longer usable and must be dropped.

@@ -902,11 +902,13 @@ public:
 
     opts(const opts& other) noexcept
         : _impl{other._impl ? ::line_sender_opts_clone(other._impl) : nullptr}
+        , _qwp_ws_error_handler{other._qwp_ws_error_handler}
     {
     }
 
     opts(opts&& other) noexcept
         : _impl{other._impl}
+        , _qwp_ws_error_handler{std::move(other._qwp_ws_error_handler)}
     {
         other._impl = nullptr;
     }
@@ -918,6 +920,7 @@ public:
             reset();
             _impl =
                 other._impl ? ::line_sender_opts_clone(other._impl) : nullptr;
+            _qwp_ws_error_handler = other._qwp_ws_error_handler;
         }
         return *this;
     }
@@ -928,6 +931,7 @@ public:
         {
             reset();
             _impl = other._impl;
+            _qwp_ws_error_handler = std::move(other._qwp_ws_error_handler);
             other._impl = nullptr;
         }
         return *this;
@@ -998,6 +1002,25 @@ public:
             static_cast<int>(progress));
         line_sender_error::wrapped_call(
             ::line_sender_opts_qwpws_progress, _impl, c_progress);
+        return *this;
+    }
+
+    /**
+     * Install a QWP/WebSocket server-diagnostic callback. The callback runs
+     * synchronously from sender API calls such as `flush` and must not call
+     * methods on the same sender.
+     */
+    opts& qwp_ws_error_handler(
+        std::function<void(const qwp_ws_error&)> handler)
+    {
+        _qwp_ws_error_handler =
+            std::make_shared<std::function<void(const qwp_ws_error&)>>(
+                std::move(handler));
+        line_sender_error::wrapped_call(
+            ::line_sender_opts_qwpws_error_handler,
+            _impl,
+            &opts::qwp_ws_error_trampoline,
+            _qwp_ws_error_handler.get());
         return *this;
     }
 
@@ -1219,6 +1242,18 @@ private:
     {
     }
 
+    static void qwp_ws_error_trampoline(
+        void* user_data,
+        const ::line_sender_qwpws_error_view* view) noexcept
+    {
+        auto* handler =
+            static_cast<std::function<void(const qwp_ws_error&)>*>(user_data);
+        if (handler && view)
+        {
+            (*handler)(qwp_ws_error_from_view(*view));
+        }
+    }
+
     void reset() noexcept
     {
         if (_impl)
@@ -1231,6 +1266,8 @@ private:
     friend class line_sender;
 
     ::line_sender_opts* _impl;
+    std::shared_ptr<std::function<void(const qwp_ws_error&)>>
+        _qwp_ws_error_handler;
 };
 
 /**
@@ -1291,6 +1328,7 @@ public:
     line_sender(const opts& opts)
         : _impl{
               line_sender_error::wrapped_call(::line_sender_build, opts._impl)}
+        , _qwp_ws_error_handler{opts._qwp_ws_error_handler}
     {
     }
 
@@ -1298,6 +1336,7 @@ public:
 
     line_sender(line_sender&& other) noexcept
         : _impl{other._impl}
+        , _qwp_ws_error_handler{std::move(other._qwp_ws_error_handler)}
     {
         other._impl = nullptr;
     }
@@ -1310,6 +1349,7 @@ public:
         {
             close();
             _impl = other._impl;
+            _qwp_ws_error_handler = std::move(other._qwp_ws_error_handler);
             other._impl = nullptr;
         }
         return *this;
@@ -1603,21 +1643,7 @@ public:
             decltype(&::line_sender_qwpws_error_free)>
             owned_error{c_error, ::line_sender_qwpws_error_free};
         const auto view = ::line_sender_qwpws_error_get_view(owned_error.get());
-        qwp_ws_error error{
-            static_cast<qwp_ws_error_category>(
-                static_cast<int>(view.category)),
-            static_cast<qwp_ws_error_policy>(
-                static_cast<int>(view.applied_policy)),
-            view.has_status ? std::optional<uint8_t>{view.status}
-                            : std::nullopt,
-            view.message ? std::string{view.message, view.message_len}
-                         : std::string{},
-            view.has_message_sequence
-                ? std::optional<uint64_t>{view.message_sequence}
-                : std::nullopt,
-            view.from_fsn,
-            view.to_fsn};
-        return error;
+        return qwp_ws_error_from_view(view);
     }
 
     /**
@@ -1704,6 +1730,8 @@ private:
     }
 
     ::line_sender* _impl;
+    std::shared_ptr<std::function<void(const qwp_ws_error&)>>
+        _qwp_ws_error_handler;
 };
 
 } // namespace questdb::ingress

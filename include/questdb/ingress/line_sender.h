@@ -85,6 +85,9 @@ typedef enum line_sender_error_code
     /** Error sent back from the server during flush. */
     line_sender_error_server_flush_error,
 
+    /** QWP/WebSocket server rejection or terminal protocol violation. */
+    line_sender_error_server_rejection,
+
     /** Bad configuration. */
     line_sender_error_config_error,
 
@@ -924,6 +927,17 @@ typedef struct line_sender_qwpws_error_view
 } line_sender_qwpws_error_view;
 
 /**
+ * QWP/WebSocket server-diagnostic callback.
+ *
+ * The callback runs synchronously from sender API calls such as
+ * `line_sender_flush`. The `event` view is valid only for the duration of the
+ * callback call. The callback must not call methods on the same sender.
+ */
+typedef void (*line_sender_qwpws_error_cb)(
+    void* user_data,
+    const line_sender_qwpws_error_view* event);
+
+/**
  * Accumulates parameters for a new `line_sender` object.
  */
 typedef struct line_sender_opts line_sender_opts;
@@ -1045,6 +1059,18 @@ LINESENDER_API
 bool line_sender_opts_qwpws_progress(
     line_sender_opts* opts,
     line_sender_qwpws_progress progress,
+    line_sender_error** err_out);
+
+/**
+ * Install a QWP/WebSocket server-diagnostic callback. Passing NULL restores the
+ * default C callback, which writes one structured line to stderr per
+ * diagnostic.
+ */
+LINESENDER_API
+bool line_sender_opts_qwpws_error_handler(
+    line_sender_opts* opts,
+    line_sender_qwpws_error_cb cb,
+    void* user_data,
     line_sender_error** err_out);
 
 /**

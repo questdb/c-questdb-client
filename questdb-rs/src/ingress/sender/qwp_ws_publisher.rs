@@ -246,6 +246,10 @@ impl<Q: PublicationLog, T: ManualDriverTransport> QwpWsPublicationDriver<Q, T> {
         self.driver.poll_sender_error()
     }
 
+    pub(crate) fn poll_sender_error_notification(&mut self) -> Option<QwpWsSenderError> {
+        self.driver.poll_sender_error_notification()
+    }
+
     pub(crate) fn sender_errors_dropped_total(&self) -> u64 {
         self.driver.sender_errors_dropped_total()
     }

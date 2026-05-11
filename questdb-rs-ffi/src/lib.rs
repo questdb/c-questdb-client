@@ -24,7 +24,7 @@
 
 #![allow(non_camel_case_types, clippy::missing_safety_doc)]
 
-use libc::{c_char, size_t};
+use libc::{c_char, c_void, size_t};
 use questdb::ingress::DecimalView;
 use std::ascii;
 use std::boxed::Box;
@@ -226,6 +226,9 @@ pub enum line_sender_error_code {
     /// Error sent back from the server during flush.
     line_sender_error_server_flush_error,
 
+    /// QWP/WebSocket server rejection or terminal protocol violation.
+    line_sender_error_server_rejection,
+
     /// Bad configuration.
     line_sender_error_config_error,
 
@@ -259,6 +262,9 @@ impl From<ErrorCode> for line_sender_error_code {
             }
             ErrorCode::ServerFlushError => {
                 line_sender_error_code::line_sender_error_server_flush_error
+            }
+            ErrorCode::ServerRejection => {
+                line_sender_error_code::line_sender_error_server_rejection
             }
             ErrorCode::ConfigError => line_sender_error_code::line_sender_error_config_error,
             ErrorCode::ArrayError => line_sender_error_code::line_sender_error_array_error,
@@ -519,7 +525,10 @@ unsafe fn set_err_out_from_sender_error(
     if err_out.is_null() {
         return;
     }
-    let qwp_ws_error = sender.qwp_ws_terminal_error().ok().flatten();
+    let qwp_ws_error = err
+        .qwp_ws_rejection()
+        .cloned()
+        .or_else(|| sender.qwp_ws_terminal_error().ok().flatten());
     unsafe { set_err_out_from_error_with_qwpws(err_out, err, qwp_ws_error) };
 }
 
@@ -1627,6 +1636,7 @@ pub unsafe extern "C" fn line_sender_opts_from_conf(
     unsafe {
         let config = config.as_str();
         let builder = bubble_err_to_c!(err_out, SenderBuilder::from_conf(config), ptr::null_mut());
+        let builder = with_c_qwp_ws_default_error_handler(builder);
         Box::into_raw(Box::new(line_sender_opts(builder)))
     }
 }
@@ -1639,6 +1649,7 @@ pub unsafe extern "C" fn line_sender_opts_from_env(
 ) -> *mut line_sender_opts {
     unsafe {
         let builder = bubble_err_to_c!(err_out, SenderBuilder::from_env(), ptr::null_mut());
+        let builder = with_c_qwp_ws_default_error_handler(builder);
         Box::into_raw(Box::new(line_sender_opts(builder)))
     }
 }
@@ -1659,6 +1670,7 @@ pub unsafe extern "C" fn line_sender_opts_new(
         Ok(builder) => builder,
         Err(_) => return ptr::null_mut(),
     };
+    let builder = with_c_qwp_ws_default_error_handler(builder);
     Box::into_raw(Box::new(line_sender_opts(builder)))
 }
 
@@ -1675,6 +1687,7 @@ pub unsafe extern "C" fn line_sender_opts_new_service(
         Ok(builder) => builder,
         Err(_) => return ptr::null_mut(),
     };
+    let builder = with_c_qwp_ws_default_error_handler(builder);
     Box::into_raw(Box::new(line_sender_opts(builder)))
 }
 
@@ -1749,6 +1762,47 @@ pub unsafe extern "C" fn line_sender_opts_qwpws_progress(
             }
         };
         upd_opts!(opts, err_out, qwp_ws_progress, progress)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn line_sender_opts_qwpws_error_handler(
+    opts: *mut line_sender_opts,
+    cb: line_sender_qwpws_error_cb,
+    user_data: *mut c_void,
+    err_out: *mut *mut line_sender_error,
+) -> bool {
+    qwpws_catch_bool(err_out, || unsafe {
+        if opts.is_null() {
+            set_err_out(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "line_sender_opts_qwpws_error_handler requires non-NULL opts".to_string(),
+            );
+            return false;
+        }
+        let builder_ref: &mut SenderBuilder = &mut (*opts).0;
+        let current = builder_ref.clone();
+        let new_builder = match cb {
+            Some(cb) => {
+                let user_data = user_data as usize;
+                current.qwp_ws_error_handler(move |error| {
+                    let view = qwp_ws_sender_error_view(error);
+                    cb(user_data as *mut c_void, &view);
+                })
+            }
+            None => current.qwp_ws_error_handler(c_default_qwp_ws_error_handler),
+        };
+        match new_builder {
+            Ok(new_builder) => {
+                *builder_ref = new_builder;
+                true
+            }
+            Err(err) => {
+                set_err_out_from_error(err_out, err);
+                false
+            }
+        }
     })
 }
 
@@ -2164,6 +2218,41 @@ fn qwp_ws_sender_error_view(error: &QwpWsSenderError) -> line_sender_qwpws_error
     }
 }
 
+fn c_default_qwp_ws_error_handler(error: &QwpWsSenderError) {
+    let level = if error.applied_policy == RustQwpWsErrorPolicy::Halt {
+        "ERROR"
+    } else {
+        "WARN"
+    };
+    let status = error
+        .status
+        .map(|status| format!("0x{status:02x}"))
+        .unwrap_or_else(|| "none".to_string());
+    let sequence = error
+        .message_sequence
+        .map(|sequence| sequence.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    eprintln!(
+        "[questdb {level}] QWP/WebSocket server rejected batch category={:?} policy={:?} status={} fsn=[{},{}] seq={} msg={}",
+        error.category,
+        error.applied_policy,
+        status,
+        error.from_fsn,
+        error.to_fsn,
+        sequence,
+        error.message.as_deref().unwrap_or("")
+    );
+}
+
+fn with_c_qwp_ws_default_error_handler(builder: SenderBuilder) -> SenderBuilder {
+    builder
+        .qwp_ws_error_handler(c_default_qwp_ws_error_handler)
+        .expect("installing C default QWP/WebSocket error handler must not fail")
+}
+
+pub type line_sender_qwpws_error_cb =
+    Option<unsafe extern "C" fn(*mut c_void, *const line_sender_qwpws_error_view)>;
+
 impl line_sender_qwpws_fsn {
     fn from_option(fsn: Option<u64>) -> Self {
         Self {
@@ -2322,6 +2411,7 @@ pub unsafe extern "C" fn line_sender_from_conf(
             builder.user_agent(concat!("questdb/c/", env!("CARGO_PKG_VERSION"))),
             ptr::null_mut()
         );
+        let builder = with_c_qwp_ws_default_error_handler(builder);
         let sender = bubble_err_to_c!(err_out, builder.build(), ptr::null_mut());
         Box::into_raw(Box::new(line_sender(sender)))
     }
@@ -2347,6 +2437,7 @@ pub unsafe extern "C" fn line_sender_from_env(
             builder.user_agent(concat!("questdb/c/", env!("CARGO_PKG_VERSION"))),
             ptr::null_mut()
         );
+        let builder = with_c_qwp_ws_default_error_handler(builder);
         let sender = bubble_err_to_c!(err_out, builder.build(), ptr::null_mut());
         Box::into_raw(Box::new(line_sender(sender)))
     }

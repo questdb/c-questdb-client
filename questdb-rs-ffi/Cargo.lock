@@ -231,6 +231,7 @@ dependencies = [
  "indoc",
  "itoa",
  "libc",
+ "log",
  "memmap2",
  "questdb-confstr",
  "rand",

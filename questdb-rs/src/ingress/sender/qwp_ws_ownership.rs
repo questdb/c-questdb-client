@@ -24,6 +24,9 @@
 
 //! QWP/WebSocket progress ownership.
 
+use std::fmt;
+use std::sync::Arc;
+
 /// Controls whether a QWP/WebSocket [`crate::ingress::Sender`] starts its
 /// background progress runner or requires the caller to drive progress.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +64,80 @@ pub struct QwpWsSenderError {
     pub from_fsn: u64,
     /// Inclusive upper bound of the affected frame sequence number span.
     pub to_fsn: u64,
+}
+
+/// Producer-thread callback invoked for structured QWP/WebSocket server
+/// diagnostics.
+///
+/// The callback runs synchronously from sender API calls such as
+/// [`crate::ingress::Sender::flush`]. It must not call back into the same
+/// sender.
+#[derive(Clone)]
+pub struct QwpWsErrorHandler {
+    handler: Arc<dyn Fn(&QwpWsSenderError) + Send + Sync>,
+}
+
+impl QwpWsErrorHandler {
+    /// Create a handler from a closure.
+    pub fn new<F>(handler: F) -> Self
+    where
+        F: Fn(&QwpWsSenderError) + Send + Sync + 'static,
+    {
+        Self {
+            handler: Arc::new(handler),
+        }
+    }
+
+    pub(crate) fn log_default() -> Self {
+        Self::new(default_qwp_ws_error_handler)
+    }
+
+    pub(crate) fn handle(&self, error: &QwpWsSenderError) {
+        (self.handler)(error);
+    }
+}
+
+impl fmt::Debug for QwpWsErrorHandler {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("QwpWsErrorHandler { .. }")
+    }
+}
+
+fn default_qwp_ws_error_handler(error: &QwpWsSenderError) {
+    let status = error
+        .status
+        .map(|status| format!("0x{status:02x}"))
+        .unwrap_or_else(|| "none".to_string());
+    let sequence = error
+        .message_sequence
+        .map(|sequence| sequence.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let message = error.message.as_deref().unwrap_or("");
+    if error.applied_policy == QwpWsErrorPolicy::Halt {
+        log::error!(
+            target: "questdb::ingress",
+            "QWP/WebSocket server rejected batch [category={:?}, policy={:?}, status={}, fsn=[{},{}], seq={}, msg={}]",
+            error.category,
+            error.applied_policy,
+            status,
+            error.from_fsn,
+            error.to_fsn,
+            sequence,
+            message
+        );
+    } else {
+        log::warn!(
+            target: "questdb::ingress",
+            "QWP/WebSocket server rejected batch [category={:?}, policy={:?}, status={}, fsn=[{},{}], seq={}, msg={}]",
+            error.category,
+            error.applied_policy,
+            status,
+            error.from_fsn,
+            error.to_fsn,
+            sequence,
+            message
+        );
+    }
 }
 
 /// Server-distinguishable QWP/WebSocket error category.
