@@ -53,6 +53,7 @@ use crate::egress::decoder::DecodedBatch;
 use crate::egress::error::{Error, ErrorCode, Result, fmt};
 use crate::egress::query_request::{QueryRequest, QueryRequestBuilder};
 use crate::egress::schema::{Schema, SchemaRegistry};
+use crate::egress::decoder::ZstdScratch;
 use crate::egress::server_event::{ServerEvent, ServerInfo, ServerRole, decode_frame};
 use crate::egress::symbol_dict::SymbolDict;
 use crate::egress::transport::WsTransport;
@@ -136,6 +137,11 @@ pub struct Reader {
     /// telemeter heterogeneous-cluster credential drift without having
     /// to reach for a process-wide logger.
     auth_rejections_during_connect: Vec<(Endpoint, String)>,
+    /// Reusable zstd decompressor + output buffer. Keeps a persistent
+    /// `ZSTD_DCtx` across batches (so we don't pay context init per
+    /// `RESULT_BATCH`) and a `Vec<u8>` whose allocation is reused as
+    /// successive frames decompress through it.
+    zstd_scratch: ZstdScratch,
 }
 
 impl Reader {
@@ -273,6 +279,7 @@ impl Reader {
             read_ns: AtomicU64::new(0),
             decode_ns: AtomicU64::new(0),
             auth_rejections_during_connect: Vec::new(),
+            zstd_scratch: ZstdScratch::new(),
         };
         if reader.transport_mut()?.server_version() >= 2 {
             reader.consume_server_info()?;
@@ -489,7 +496,13 @@ impl Reader {
             HEADER_LEN as u64 + header.payload_length as u64,
             Ordering::Relaxed,
         );
-        let event = decode_frame(header, &payload, &mut self.dict, &mut self.registry)?;
+        let event = decode_frame(
+            header,
+            &payload,
+            &mut self.dict,
+            &mut self.registry,
+            &mut self.zstd_scratch,
+        )?;
         match event {
             ServerEvent::ServerInfo(info) => {
                 self.server_info = Some(info);
@@ -1103,6 +1116,7 @@ impl<'r> Cursor<'r> {
                 &payload,
                 &mut self.reader.dict,
                 &mut self.reader.registry,
+                &mut self.reader.zstd_scratch,
             );
             // Account for decode time on both arms — the error path is
             // rare and terminal, but skipping the sample makes the

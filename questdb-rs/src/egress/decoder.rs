@@ -356,6 +356,7 @@ pub fn decode_result_batch(
     flags_byte: u8,
     dict: &mut SymbolDict,
     registry: &mut SchemaRegistry,
+    zstd_scratch: &mut ZstdScratch,
 ) -> Result<DecodedBatch> {
     let mut r = ByteReader::new(payload);
 
@@ -376,10 +377,11 @@ pub fn decode_result_batch(
     // `body` is the parent Bytes used by per-column decoders for zero-copy
     // slicing — either a slice into `payload` (no compression) or a
     // freshly-owned Bytes wrapping the decompressed Vec.
+    let _ = &zstd_scratch;
     let body: Bytes = if flags_byte & flags::ZSTD != 0 {
         #[cfg(feature = "compression-zstd")]
         {
-            Bytes::from(zstd_decompress_body(r.remaining())?)
+            zstd_decompress_body(r.remaining(), zstd_scratch)?
         }
         #[cfg(not(feature = "compression-zstd"))]
         {
@@ -1394,13 +1396,34 @@ fn decode_decimal64(
 #[cfg(feature = "compression-zstd")]
 const MAX_ZSTD_DECOMPRESSED: u64 = 64 * 1024 * 1024;
 
+/// Per-connection scratch state for zstd batch decompression.
+///
+/// Holds a persistent `Decompressor` (so the ZSTD_DCtx isn't recreated
+/// per batch) and a reusable output buffer (so we don't allocate a fresh
+/// `Vec<u8>` for every decompressed frame). Always exists so the decode
+/// API doesn't need feature-gated signatures; the fields inside are
+/// only populated when `compression-zstd` is on.
+#[derive(Default)]
+pub struct ZstdScratch {
+    #[cfg(feature = "compression-zstd")]
+    decompressor: Option<zstd::bulk::Decompressor<'static>>,
+    #[cfg(feature = "compression-zstd")]
+    buffer: Vec<u8>,
+}
+
+impl ZstdScratch {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 /// Decompress a single zstd frame containing the body of a
 /// `RESULT_BATCH`. The frame header must declare a content size
 /// (`ZSTD_c_contentSizeFlag` is on by default in the server encoder);
 /// rejecting "unknown" content size keeps decode-bomb amplification
 /// closed.
 #[cfg(feature = "compression-zstd")]
-fn zstd_decompress_body(compressed: &[u8]) -> Result<Vec<u8>> {
+fn zstd_decompress_body(compressed: &[u8], scratch: &mut ZstdScratch) -> Result<Bytes> {
     let size = match zstd::zstd_safe::get_frame_content_size(compressed) {
         Ok(Some(n)) => n,
         Ok(None) => {
@@ -1432,17 +1455,30 @@ fn zstd_decompress_body(compressed: &[u8]) -> Result<Vec<u8>> {
         )
     })?;
 
-    let decompressed = zstd::bulk::decompress(compressed, usize_size)
+    let decompressor = match scratch.decompressor.as_mut() {
+        Some(d) => d,
+        None => {
+            scratch.decompressor = Some(
+                zstd::bulk::Decompressor::new()
+                    .map_err(|e| fmt!(ProtocolError, "zstd decompressor init failed: {}", e))?,
+            );
+            scratch.decompressor.as_mut().unwrap()
+        }
+    };
+    scratch.buffer.clear();
+    scratch.buffer.reserve(usize_size);
+    let written = decompressor
+        .decompress_to_buffer(compressed, &mut scratch.buffer)
         .map_err(|e| fmt!(ProtocolError, "zstd decompress failed: {}", e))?;
-    if decompressed.len() != usize_size {
+    if written != usize_size {
         return Err(fmt!(
             ProtocolError,
             "zstd decompressed size {} != frame content size {}",
-            decompressed.len(),
+            written,
             size
         ));
     }
-    Ok(decompressed)
+    Ok(Bytes::copy_from_slice(&scratch.buffer[..usize_size]))
 }
 
 fn count_nulls(bitmap: &[u8], row_count: usize) -> usize {
@@ -1605,7 +1641,7 @@ mod tests {
 
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
         assert_eq!(batch.row_count, 3);
         assert_eq!(batch.columns.len(), 1);
 
@@ -1634,7 +1670,7 @@ mod tests {
 
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
         let view = batch.column_view(0, &dict).unwrap();
         let ColumnView::Long(c) = view else { panic!() };
         assert!(!c.is_null(0));
@@ -1661,7 +1697,7 @@ mod tests {
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
         let view = batch.column_view(0, &dict).unwrap();
         let ColumnView::Long(c) = view else { panic!() };
         let expected: Vec<Option<i64>> = vec![
@@ -1732,7 +1768,7 @@ mod tests {
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
         let view = batch.column_view(0, &dict).unwrap();
         let ColumnView::Double(c) = view else {
             panic!()
@@ -1762,7 +1798,7 @@ mod tests {
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
         let view = batch.column_view(0, &dict).unwrap();
         let ColumnView::Float(c) = view else { panic!() };
         assert_eq!(c.value(0), 1.5_f32);
@@ -1784,7 +1820,7 @@ mod tests {
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
         let view = batch.column_view(0, &dict).unwrap();
         let ColumnView::Int(c) = view else { panic!() };
         let expected: Vec<Option<i32>> = vec![
@@ -1861,7 +1897,7 @@ mod tests {
                 .build();
             let mut dict = SymbolDict::new();
             let mut reg = SchemaRegistry::new();
-            let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg)
+            let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg, &mut ZstdScratch::new())
                 .unwrap_or_else(|e| panic!("{:?}: {}", kind, e.msg()));
             // Pull row 1's raw bytes via the appropriate ColumnView arm.
             let view = batch.column_view(0, &dict).unwrap();
@@ -1893,7 +1929,7 @@ mod tests {
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
         let ColumnView::Geohash(c) = batch.column_view(0, &dict).unwrap() else {
             panic!()
         };
@@ -1919,7 +1955,7 @@ mod tests {
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
         let view = batch.column_view(0, &dict).unwrap();
         let ColumnView::Short(c) = view else { panic!() };
         assert_eq!(c.value(0), -1);
@@ -1945,7 +1981,7 @@ mod tests {
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
         let view = batch.column_view(0, &dict).unwrap();
         let ColumnView::Byte(c) = view else { panic!() };
         assert_eq!(c.value(0), 0);
@@ -1967,7 +2003,7 @@ mod tests {
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
         let view = batch.column_view(0, &dict).unwrap();
         let ColumnView::Boolean(c) = view else {
             panic!()
@@ -2026,7 +2062,7 @@ mod tests {
         let (flags_byte, payload) = BatchBuilder::new(5).add_column("c", kind, body).build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap_err();
+        let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap_err();
         assert_eq!(err.code(), ErrorCode::ProtocolError);
         assert!(
             err.msg().contains(kind_name) && err.msg().contains("null_flag"),
@@ -2078,7 +2114,7 @@ mod tests {
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
         // Connection dict stays empty — column-local mode doesn't touch it.
         assert_eq!(dict.len(), 0);
 
@@ -2101,7 +2137,7 @@ mod tests {
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
 
         let view = batch.column_view(0, &dict).unwrap();
         let ColumnView::Symbol(s) = view else {
@@ -2127,7 +2163,7 @@ mod tests {
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
 
         let ColumnView::Symbol(a) = batch.column_view(0, &dict).unwrap() else {
             panic!()
@@ -2150,7 +2186,7 @@ mod tests {
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap_err();
+        let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap_err();
         assert_eq!(err.code(), ErrorCode::ProtocolError);
         assert!(err.msg().contains("out of range"));
     }
@@ -2165,7 +2201,7 @@ mod tests {
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap_err();
+        let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap_err();
         assert_eq!(err.code(), ErrorCode::ProtocolError);
     }
 
@@ -2180,7 +2216,7 @@ mod tests {
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap_err();
+        let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap_err();
         assert_eq!(err.code(), ErrorCode::ProtocolError);
         assert!(err.msg().contains("out of range"));
     }
@@ -2201,7 +2237,7 @@ mod tests {
 
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
         assert_eq!(dict.len(), 2);
 
         let view = batch.column_view(0, &dict).unwrap();
@@ -2226,7 +2262,7 @@ mod tests {
 
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
         let view = batch.column_view(0, &dict).unwrap();
         let ColumnView::Decimal64(d) = view else {
             panic!()
@@ -2258,7 +2294,7 @@ mod tests {
 
             let mut dict = SymbolDict::new();
             let mut reg = SchemaRegistry::new();
-            let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap_err();
+            let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap_err();
             assert_eq!(err.code(), crate::egress::ErrorCode::ProtocolError);
             assert!(
                 err.msg().contains("decimal scale"),
@@ -2278,7 +2314,7 @@ mod tests {
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap_err();
+        let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap_err();
         assert_eq!(err.code(), crate::egress::ErrorCode::ProtocolError);
     }
 
@@ -2292,7 +2328,7 @@ mod tests {
             .with_schema_id(7)
             .add_column("v", ColumnKind::Long, col_no_nulls(&le_i64s(&[1, 2])))
             .build();
-        decode_result_batch(&p1, f1, &mut dict, &mut reg).unwrap();
+        decode_result_batch(&p1, f1, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
         assert!(reg.get(7).is_some());
 
         // Second batch references id 7. We still need the column metadata
@@ -2303,7 +2339,7 @@ mod tests {
             .with_schema_ref(7)
             .add_column("v", ColumnKind::Long, col_no_nulls(&le_i64s(&[42])))
             .build();
-        let b2 = decode_result_batch(&p2, f2, &mut dict, &mut reg).unwrap();
+        let b2 = decode_result_batch(&p2, f2, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
         assert_eq!(b2.schema_id, 7);
         let view = b2.column_view(0, &dict).unwrap();
         let ColumnView::Long(c) = view else { panic!() };
@@ -2341,7 +2377,7 @@ mod tests {
 
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let batch = decode_result_batch(&zstd_payload, flags::ZSTD, &mut dict, &mut reg).unwrap();
+        let batch = decode_result_batch(&zstd_payload, flags::ZSTD, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
         assert_eq!(batch.row_count, 3);
         let view = batch.column_view(0, &dict).unwrap();
         let ColumnView::Long(c) = view else { panic!() };
@@ -2367,7 +2403,7 @@ mod tests {
         let payload = Bytes::from(payload);
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let err = decode_result_batch(&payload, flags::ZSTD, &mut dict, &mut reg).unwrap_err();
+        let err = decode_result_batch(&payload, flags::ZSTD, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap_err();
         assert_eq!(err.code(), ErrorCode::ProtocolError);
     }
 
@@ -2433,7 +2469,7 @@ mod tests {
         let payload = zstd_payload_with_body(&body);
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let err = decode_result_batch(&payload, flags::ZSTD, &mut dict, &mut reg).unwrap_err();
+        let err = decode_result_batch(&payload, flags::ZSTD, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap_err();
         assert_eq!(err.code(), ErrorCode::ProtocolError);
         assert!(
             err.msg().contains("missing content size"),
@@ -2460,7 +2496,7 @@ mod tests {
         let payload = zstd_payload_with_body(&frame);
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let err = decode_result_batch(&payload, flags::ZSTD, &mut dict, &mut reg).unwrap_err();
+        let err = decode_result_batch(&payload, flags::ZSTD, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap_err();
         assert_eq!(err.code(), ErrorCode::LimitExceeded);
         assert!(
             err.msg().contains("exceeds client cap"),
@@ -2505,7 +2541,7 @@ mod tests {
         let payload = zstd_payload_with_body(&body);
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let err = decode_result_batch(&payload, flags::ZSTD, &mut dict, &mut reg).unwrap_err();
+        let err = decode_result_batch(&payload, flags::ZSTD, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap_err();
         assert_eq!(err.code(), ErrorCode::ProtocolError);
     }
 
@@ -2521,7 +2557,7 @@ mod tests {
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let err = decode_result_batch(&payload, flags::GORILLA, &mut dict, &mut reg).unwrap_err();
+        let err = decode_result_batch(&payload, flags::GORILLA, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap_err();
         assert_eq!(err.code(), ErrorCode::ProtocolError);
         assert!(err.msg().to_lowercase().contains("discriminator"));
     }
@@ -2544,7 +2580,7 @@ mod tests {
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let batch = decode_result_batch(&payload, flags::GORILLA, &mut dict, &mut reg).unwrap();
+        let batch = decode_result_batch(&payload, flags::GORILLA, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
         let view = batch.column_view(0, &dict).unwrap();
         let ColumnView::TimestampNanos(c) = view else {
             panic!("expected TimestampNanos column")
@@ -2567,7 +2603,7 @@ mod tests {
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let batch = decode_result_batch(&payload, flags::GORILLA, &mut dict, &mut reg).unwrap();
+        let batch = decode_result_batch(&payload, flags::GORILLA, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
         let view = batch.column_view(0, &dict).unwrap();
         let ColumnView::TimestampNanos(c) = view else {
             panic!("expected TimestampNanos column")
@@ -2589,7 +2625,7 @@ mod tests {
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let batch = decode_result_batch(&payload, flags::GORILLA, &mut dict, &mut reg).unwrap();
+        let batch = decode_result_batch(&payload, flags::GORILLA, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
         let view = batch.column_view(0, &dict).unwrap();
         let ColumnView::TimestampNanos(c) = view else {
             panic!("expected TimestampNanos column")
@@ -2611,7 +2647,7 @@ mod tests {
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let batch = decode_result_batch(&payload, flags::GORILLA, &mut dict, &mut reg).unwrap();
+        let batch = decode_result_batch(&payload, flags::GORILLA, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
         let view = batch.column_view(0, &dict).unwrap();
         let ColumnView::TimestampNanos(c) = view else {
             panic!()
@@ -2690,7 +2726,7 @@ mod tests {
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let batch = decode_result_batch(&payload, flags::GORILLA, &mut dict, &mut reg).unwrap();
+        let batch = decode_result_batch(&payload, flags::GORILLA, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
         let view = batch.column_view(0, &dict).unwrap();
         let ColumnView::TimestampNanos(c) = view else {
             panic!()
@@ -2734,7 +2770,7 @@ mod tests {
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
         let view = batch.column_view(0, &dict).unwrap();
         let ColumnView::DoubleArray(c) = view else {
             panic!()
@@ -2760,7 +2796,7 @@ mod tests {
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
         let view = batch.column_view(0, &dict).unwrap();
         let ColumnView::LongArray(c) = view else {
             panic!()
@@ -2785,7 +2821,7 @@ mod tests {
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap_err();
+        let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap_err();
         assert_eq!(err.code(), ErrorCode::ProtocolError);
     }
 
@@ -2800,7 +2836,7 @@ mod tests {
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap_err();
+        let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap_err();
         assert_eq!(err.code(), ErrorCode::LimitExceeded);
     }
 
@@ -2844,7 +2880,7 @@ mod tests {
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
         let view = batch.column_view(0, &dict).unwrap();
         let ColumnView::Varchar(c) = view else {
             panic!()
@@ -2868,7 +2904,7 @@ mod tests {
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
         let view = batch.column_view(0, &dict).unwrap();
         let ColumnView::Varchar(c) = view else {
             panic!()
@@ -2894,7 +2930,7 @@ mod tests {
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap_err();
+        let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap_err();
         assert_eq!(err.code(), ErrorCode::InvalidUtf8);
     }
 
@@ -2915,7 +2951,7 @@ mod tests {
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap_err();
+        let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap_err();
         assert_eq!(err.code(), ErrorCode::InvalidUtf8);
     }
 
@@ -2932,7 +2968,7 @@ mod tests {
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
         let view = batch.column_view(0, &dict).unwrap();
         let ColumnView::Binary(c) = view else {
             panic!()
@@ -2954,7 +2990,7 @@ mod tests {
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
         let view = batch.column_view(0, &dict).unwrap();
         let ColumnView::Binary(c) = view else {
             panic!()
@@ -2975,7 +3011,7 @@ mod tests {
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap_err();
+        let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap_err();
         assert_eq!(err.code(), ErrorCode::ProtocolError);
     }
 
@@ -2998,7 +3034,7 @@ mod tests {
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
         let view = batch.column_view(0, &dict).unwrap();
         let ColumnView::Geohash(c) = view else {
             panic!()
@@ -3025,7 +3061,7 @@ mod tests {
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
         let view = batch.column_view(0, &dict).unwrap();
         let ColumnView::Geohash(c) = view else {
             panic!()
@@ -3048,7 +3084,7 @@ mod tests {
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap_err();
+        let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap_err();
         assert_eq!(err.code(), ErrorCode::ProtocolError);
     }
 
@@ -3061,7 +3097,7 @@ mod tests {
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
         let view = batch.column_view(0, &dict).unwrap();
         let ColumnView::Decimal128(c) = view else {
             panic!()
@@ -3083,7 +3119,7 @@ mod tests {
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
         let view = batch.column_view(0, &dict).unwrap();
         let ColumnView::Decimal256(c) = view else {
             panic!()
@@ -3104,7 +3140,7 @@ mod tests {
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
         let view = batch.column_view(0, &dict).unwrap();
         let ColumnView::Varchar(c) = view else {
             panic!()
@@ -3126,7 +3162,7 @@ mod tests {
         let payload = Bytes::from(bytes_vec);
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap_err();
+        let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap_err();
         assert_eq!(err.code(), ErrorCode::ProtocolError);
         assert!(err.msg().contains("trailing"));
     }
@@ -3139,7 +3175,7 @@ mod tests {
         payload.truncate(payload.len() - 4); // chop value bytes
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap_err();
+        let err = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap_err();
         assert_eq!(err.code(), ErrorCode::ProtocolError);
     }
 
@@ -3161,7 +3197,7 @@ mod tests {
             .build();
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg).unwrap();
+        let batch = decode_result_batch(&payload, flags_byte, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
         assert_eq!(batch.columns.len(), 2);
         let ColumnView::Long(a) = batch.column_view(0, &dict).unwrap() else {
             panic!()

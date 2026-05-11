@@ -26,7 +26,7 @@
 //! dispatcher. RESULT_BATCH (`0x11`) decoding lives in
 //! [`crate::egress::decoder`]; everything else is here.
 
-use crate::egress::decoder::{DecodedBatch, decode_result_batch};
+use crate::egress::decoder::{DecodedBatch, ZstdScratch, decode_result_batch};
 use crate::egress::error::{Result, fmt};
 use crate::egress::schema::SchemaRegistry;
 use crate::egress::symbol_dict::SymbolDict;
@@ -134,6 +134,7 @@ pub fn decode_frame(
     payload: &Bytes,
     dict: &mut SymbolDict,
     registry: &mut SchemaRegistry,
+    zstd_scratch: &mut ZstdScratch,
 ) -> Result<ServerEvent> {
     if payload.is_empty() {
         return Err(fmt!(ProtocolError, "frame payload is empty"));
@@ -164,6 +165,7 @@ pub fn decode_frame(
             header.flags,
             dict,
             registry,
+            zstd_scratch,
         )?)),
         MsgKind::ResultEnd => decode_result_end(payload),
         MsgKind::QueryError => decode_query_error(payload),
@@ -344,7 +346,7 @@ mod tests {
         let payload = build_result_end(42, 7, 1_000);
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let event = decode_frame(header(payload.len()), &payload, &mut dict, &mut reg).unwrap();
+        let event = decode_frame(header(payload.len()), &payload, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
         match event {
             ServerEvent::End {
                 request_id,
@@ -375,7 +377,7 @@ mod tests {
         let payload = build_query_error(9, StatusCode::ParseError, "bad SQL");
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let event = decode_frame(header(payload.len()), &payload, &mut dict, &mut reg).unwrap();
+        let event = decode_frame(header(payload.len()), &payload, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
         match event {
             ServerEvent::Error {
                 request_id,
@@ -397,7 +399,7 @@ mod tests {
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
         let err =
-            decode_frame(header(truncated.len()), &truncated, &mut dict, &mut reg).unwrap_err();
+            decode_frame(header(truncated.len()), &truncated, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap_err();
         assert_eq!(err.code(), ErrorCode::ProtocolError);
     }
 
@@ -411,7 +413,7 @@ mod tests {
         let p = Bytes::from(p);
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let err = decode_frame(header(p.len()), &p, &mut dict, &mut reg).unwrap_err();
+        let err = decode_frame(header(p.len()), &p, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap_err();
         assert_eq!(err.code(), ErrorCode::InvalidUtf8);
     }
 
@@ -426,7 +428,7 @@ mod tests {
         let p = Bytes::from(p);
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let event = decode_frame(header(p.len()), &p, &mut dict, &mut reg).unwrap();
+        let event = decode_frame(header(p.len()), &p, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
         match event {
             ServerEvent::ExecDone {
                 request_id,
@@ -455,7 +457,7 @@ mod tests {
         reg.insert(1, crate::egress::schema::Schema::new());
 
         let payload = build_cache_reset(0x01);
-        let event = decode_frame(header(payload.len()), &payload, &mut dict, &mut reg).unwrap();
+        let event = decode_frame(header(payload.len()), &payload, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
         assert!(matches!(event, ServerEvent::CacheReset { mask: 0x01 }));
         assert_eq!(dict.len(), 0);
         assert_eq!(reg.len(), 1);
@@ -469,7 +471,7 @@ mod tests {
         reg.insert(1, crate::egress::schema::Schema::new());
 
         let payload = build_cache_reset(0x02);
-        decode_frame(header(payload.len()), &payload, &mut dict, &mut reg).unwrap();
+        decode_frame(header(payload.len()), &payload, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
         assert_eq!(dict.len(), 1);
         assert_eq!(reg.len(), 0);
     }
@@ -482,7 +484,7 @@ mod tests {
         reg.insert(1, crate::egress::schema::Schema::new());
 
         let payload = build_cache_reset(0x03);
-        decode_frame(header(payload.len()), &payload, &mut dict, &mut reg).unwrap();
+        decode_frame(header(payload.len()), &payload, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
         assert_eq!(dict.len(), 0);
         assert_eq!(reg.len(), 0);
     }
@@ -501,7 +503,7 @@ mod tests {
 
         // 0x83 = bit 0 (DICT) + bit 1 (SCHEMAS) + bit 7 (reserved future).
         let payload = build_cache_reset(0x83);
-        let event = decode_frame(header(payload.len()), &payload, &mut dict, &mut reg).unwrap();
+        let event = decode_frame(header(payload.len()), &payload, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
         assert!(matches!(event, ServerEvent::CacheReset { mask: 0x83 }));
         assert_eq!(
             dict.len(),
@@ -535,7 +537,7 @@ mod tests {
         let payload = build_server_info(0x01, "cluster-A", "node-1");
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let event = decode_frame(header(payload.len()), &payload, &mut dict, &mut reg).unwrap();
+        let event = decode_frame(header(payload.len()), &payload, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
         let ServerEvent::ServerInfo(info) = event else {
             panic!()
         };
@@ -552,7 +554,7 @@ mod tests {
         let payload = build_server_info(0x55, "c", "n");
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let event = decode_frame(header(payload.len()), &payload, &mut dict, &mut reg).unwrap();
+        let event = decode_frame(header(payload.len()), &payload, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
         let ServerEvent::ServerInfo(info) = event else {
             panic!()
         };
@@ -566,7 +568,7 @@ mod tests {
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
         let empty = Bytes::new();
-        let err = decode_frame(header(0), &empty, &mut dict, &mut reg).unwrap_err();
+        let err = decode_frame(header(0), &empty, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap_err();
         assert_eq!(err.code(), ErrorCode::ProtocolError);
     }
 
@@ -575,7 +577,7 @@ mod tests {
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
         let p = Bytes::from(vec![0xAA]);
-        let err = decode_frame(header(1), &p, &mut dict, &mut reg).unwrap_err();
+        let err = decode_frame(header(1), &p, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap_err();
         assert_eq!(err.code(), ErrorCode::ProtocolError);
     }
 
@@ -589,7 +591,7 @@ mod tests {
             let mut dict = SymbolDict::new();
             let mut reg = SchemaRegistry::new();
             let p = Bytes::from(vec![k]);
-            let err = decode_frame(header(1), &p, &mut dict, &mut reg).unwrap_err();
+            let err = decode_frame(header(1), &p, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap_err();
             assert_eq!(err.code(), ErrorCode::ProtocolError);
             assert!(err.msg().contains("client-only"));
         }
@@ -603,7 +605,7 @@ mod tests {
         let payload = Bytes::from(bytes_vec);
         let mut dict = SymbolDict::new();
         let mut reg = SchemaRegistry::new();
-        let err = decode_frame(header(payload.len()), &payload, &mut dict, &mut reg).unwrap_err();
+        let err = decode_frame(header(payload.len()), &payload, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap_err();
         assert_eq!(err.code(), ErrorCode::ProtocolError);
     }
 
