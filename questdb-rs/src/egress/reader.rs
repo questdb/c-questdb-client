@@ -2264,8 +2264,6 @@ mod tests {
             UnsupportedServer,
             InvalidUtf8,
             InvalidBind,
-            InvalidTimestamp,
-            InvalidDecimal,
             ServerSchemaMismatch,
             ServerParseError,
             ServerInternalError,

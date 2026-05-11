@@ -74,14 +74,12 @@ pub enum ErrorCode {
     InvalidUtf8,
 
     /// Bind parameter index, count, or value rejected client-side
-    /// (before the QUERY_REQUEST hits the wire).
+    /// (before the QUERY_REQUEST hits the wire). Covers timestamp /
+    /// decimal / geohash range failures alongside everything else
+    /// caught at bind time — the egress path has no separate
+    /// `InvalidTimestamp` / `InvalidDecimal` because every reachable
+    /// client-side validation flows through bind encoding.
     InvalidBind,
-
-    /// Invalid timestamp value.
-    InvalidTimestamp,
-
-    /// Invalid decimal value.
-    InvalidDecimal,
 
     /// Server-reported QWP `SCHEMA_MISMATCH` (status `0x03`).
     ServerSchemaMismatch,

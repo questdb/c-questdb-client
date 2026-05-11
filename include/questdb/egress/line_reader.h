@@ -156,12 +156,15 @@ typedef enum line_reader_error_code
     /** String or symbol field was not valid UTF-8. */
     line_reader_error_invalid_utf8 = 10,
     /** Bind parameter index, count, or value rejected client-side
-     *  (before the QUERY_REQUEST hits the wire). */
+     *  (before the QUERY_REQUEST hits the wire). Covers timestamp /
+     *  decimal / geohash range failures too — every reachable
+     *  client-side validation flows through bind encoding. */
     line_reader_error_invalid_bind = 11,
-    /** Invalid timestamp value. */
-    line_reader_error_invalid_timestamp = 12,
-    /** Invalid decimal value. */
-    line_reader_error_invalid_decimal = 13,
+    /* Values 12 and 13 are intentionally reserved (formerly
+     * `invalid_timestamp` / `invalid_decimal`, removed before
+     * release because no egress path ever emitted them). Do not
+     * reuse without ABI co-ordination — Cython / external consumers
+     * may have cached the prior numbering. */
     /** Server-reported QWP `SCHEMA_MISMATCH` (status `0x03`). */
     line_reader_error_server_schema_mismatch = 14,
     /** Server-reported QWP `PARSE_ERROR` (status `0x05`). */

@@ -87,12 +87,15 @@ pub enum line_reader_error_code {
     line_reader_error_protocol_error = 9,
     /// String or symbol field was not valid UTF-8.
     line_reader_error_invalid_utf8 = 10,
-    /// Bind parameter index, count, or value rejected client-side.
+    /// Bind parameter index, count, or value rejected client-side
+    /// (covers timestamp / decimal / geohash range failures too —
+    /// see `ErrorCode::InvalidBind` on the Rust side).
     line_reader_error_invalid_bind = 11,
-    /// Invalid timestamp value.
-    line_reader_error_invalid_timestamp = 12,
-    /// Invalid decimal value.
-    line_reader_error_invalid_decimal = 13,
+    // Values 12 and 13 are intentionally reserved (formerly
+    // `invalid_timestamp` / `invalid_decimal`, removed before
+    // release because no egress path ever emitted them). Do not
+    // reuse without ABI co-ordination — Cython / external consumers
+    // may have cached the prior numbering.
     /// Server-reported QWP `SCHEMA_MISMATCH` (status `0x03`).
     line_reader_error_server_schema_mismatch = 14,
     /// Server-reported QWP `PARSE_ERROR` (status `0x05`).
@@ -125,8 +128,6 @@ impl From<ErrorCode> for line_reader_error_code {
             ErrorCode::ProtocolError => line_reader_error_protocol_error,
             ErrorCode::InvalidUtf8 => line_reader_error_invalid_utf8,
             ErrorCode::InvalidBind => line_reader_error_invalid_bind,
-            ErrorCode::InvalidTimestamp => line_reader_error_invalid_timestamp,
-            ErrorCode::InvalidDecimal => line_reader_error_invalid_decimal,
             ErrorCode::ServerSchemaMismatch => line_reader_error_server_schema_mismatch,
             ErrorCode::ServerParseError => line_reader_error_server_parse_error,
             ErrorCode::ServerInternalError => line_reader_error_server_internal_error,
@@ -3690,8 +3691,6 @@ mod tests {
             ErrorCode::ProtocolError,
             ErrorCode::InvalidUtf8,
             ErrorCode::InvalidBind,
-            ErrorCode::InvalidTimestamp,
-            ErrorCode::InvalidDecimal,
             ErrorCode::ServerSchemaMismatch,
             ErrorCode::ServerParseError,
             ErrorCode::ServerInternalError,
