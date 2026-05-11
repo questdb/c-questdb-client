@@ -171,12 +171,41 @@ macro_rules! reader_bubble {
         match $expression {
             Ok(value) => value,
             Err(err) => {
-                let err_ptr = Box::into_raw(Box::new(line_reader_error(err)));
-                *$err_out = err_ptr;
+                // Routes through `write_err_box` so a caller passing
+                // `err_out == NULL` swallows the report instead of
+                // SIGSEGV-ing on the diagnostic write — same NULL
+                // contract every fallible entry point already
+                // applies via `set_reader_err`.
+                write_err_box($err_out, err);
                 return $sentinel;
             }
         }
     };
+}
+
+/// Write an error envelope through `err_out`, swallowing the report
+/// when the caller passed `NULL`.
+///
+/// The header documents `err_out` as required-non-NULL on every
+/// fallible entry point, so a NULL here is technically a contract
+/// violation — but the upstream callers reach this helper from their
+/// own NULL-handle defensive arms (`reader.is_null()` /
+/// `query_inout.is_null()` / `*query_inout.is_null()`), which exist
+/// precisely so that callers misusing the API get a clean
+/// `InvalidApiCall` error rather than a SIGSEGV. Without the NULL
+/// check below, a caller that violated *both* the handle contract
+/// AND the err_out contract would lose the defensive recovery and
+/// crash on the diagnostic write itself — masking the original
+/// violation. Centralising the guard here makes every call site
+/// (including the 20+ in the bind-helper macros) safe by
+/// construction; future call sites cannot forget it.
+unsafe fn write_err_box(err_out: *mut *mut line_reader_error, err: Error) {
+    if err_out.is_null() {
+        return;
+    }
+    unsafe {
+        *err_out = Box::into_raw(Box::new(line_reader_error(err)));
+    }
 }
 
 unsafe fn set_reader_err(
@@ -184,10 +213,7 @@ unsafe fn set_reader_err(
     code: ErrorCode,
     msg: impl Into<String>,
 ) {
-    let err = line_reader_error(Error::new(code, msg.into()));
-    unsafe {
-        *err_out = Box::into_raw(Box::new(err));
-    }
+    unsafe { write_err_box(err_out, Error::new(code, msg.into())) }
 }
 
 /// Panic-boundary helper for `extern "C"` entry points. Catches any unwind
@@ -437,7 +463,7 @@ pub unsafe extern "C" fn line_reader_from_conf(
         let conf = match validated_utf8(&config) {
             Ok(s) => s,
             Err(e) => {
-                *err_out = Box::into_raw(Box::new(line_reader_error(e)));
+                write_err_box(err_out, e);
                 return ptr::null_mut();
             }
         };
@@ -649,7 +675,7 @@ pub unsafe extern "C" fn line_reader_server_version(
                 true
             }
             Err(e) => {
-                *err_out = Box::into_raw(Box::new(line_reader_error(e)));
+                write_err_box(err_out, e);
                 false
             }
         }
@@ -1190,7 +1216,7 @@ pub unsafe extern "C" fn line_reader_query_new(
                 // Release the active flag we just claimed: no query was
                 // produced, so the reader must be available again.
                 (*reader).1.store(false, Ordering::Release);
-                *err_out = Box::into_raw(Box::new(line_reader_error(e)));
+                write_err_box(err_out, e);
                 return ptr::null_mut();
             }
         };
@@ -1320,7 +1346,7 @@ pub unsafe extern "C" fn line_reader_query_execute(
             if !reader.is_null() {
                 (*reader).1.store(false, Ordering::Release);
             }
-            *err_out = Box::into_raw(Box::new(line_reader_error(e)));
+            write_err_box(err_out, e);
             return ptr::null_mut();
         }
 
@@ -1355,7 +1381,7 @@ pub unsafe extern "C" fn line_reader_query_execute(
                     if !reader.is_null() {
                         (*reader).1.store(false, Ordering::Release);
                     }
-                    *err_out = Box::into_raw(Box::new(line_reader_error(e)));
+                    write_err_box(err_out, e);
                     ptr::null_mut()
                 }
             }
@@ -1877,7 +1903,7 @@ pub unsafe extern "C" fn line_reader_cursor_next_batch(
             }
             Ok(None) => 0,
             Err(e) => {
-                *err_out = Box::into_raw(Box::new(line_reader_error(e)));
+                write_err_box(err_out, e);
                 -1
             }
         }
@@ -3331,7 +3357,7 @@ pub unsafe extern "C" fn line_reader_cursor_cancel(
         match res {
             Ok(()) => true,
             Err(e) => {
-                *err_out = Box::into_raw(Box::new(line_reader_error(e)));
+                write_err_box(err_out, e);
                 false
             }
         }
@@ -3362,7 +3388,7 @@ pub unsafe extern "C" fn line_reader_cursor_add_credit(
         match res {
             Ok(()) => true,
             Err(e) => {
-                *err_out = Box::into_raw(Box::new(line_reader_error(e)));
+                write_err_box(err_out, e);
                 false
             }
         }
@@ -3476,7 +3502,7 @@ unsafe fn get_column_view<'a>(
                     cache[col_idx] = Some(view_static);
                 }
                 Err(e) => {
-                    *err_out = Box::into_raw(Box::new(line_reader_error(e)));
+                    write_err_box(err_out, e);
                     return None;
                 }
             }
