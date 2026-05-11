@@ -158,9 +158,15 @@ impl From<ErrorCode> for line_reader_error_code {
 /// disallows NULL. Calls match the policy already established in
 /// `mutate_query` (the bind path) — log and abort, rather than silently
 /// dereferencing into UB. Reserved for state-mutating cursor / reader
-/// operations where a NULL deref would corrupt the FFI lifecycle; cheap
-/// read-only stat getters keep the header's "NULL is UB" contract for
-/// ergonomics.
+/// operations where a NULL deref would corrupt the FFI lifecycle.
+///
+/// Read-only cursor / reader getters take a softer path: they NULL-check
+/// inline and return a benign sentinel (`0` / `NULL` / `false` / zeroed
+/// out-params) rather than aborting. This matches the reader-side stat
+/// getters' long-standing convention (`line_reader_bytes_received` et
+/// al.) and avoids inviting a SIGSEGV inside `match (*cursor)` when a
+/// caller learns the reader getters tolerate NULL and extends that
+/// habit to cursor getters.
 macro_rules! null_check_handle {
     ($ptr:expr, $fn_name:literal) => {
         if $ptr.is_null() {
@@ -1963,10 +1969,14 @@ pub unsafe extern "C" fn line_reader_cursor_next_batch(
     }
 }
 
-/// Number of rows in the current batch. Returns `0` when no batch is loaded.
+/// Number of rows in the current batch. Returns `0` when no batch is loaded
+/// or for a NULL cursor handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_cursor_row_count(cursor: *const line_reader_cursor) -> size_t {
     unsafe {
+        if cursor.is_null() {
+            return 0;
+        }
         match (*cursor).current_batch.as_ref() {
             Some(b) => b.row_count(),
             None => 0,
@@ -1974,12 +1984,16 @@ pub unsafe extern "C" fn line_reader_cursor_row_count(cursor: *const line_reader
     }
 }
 
-/// Number of columns in the current batch. Returns `0` when no batch is loaded.
+/// Number of columns in the current batch. Returns `0` when no batch is
+/// loaded or for a NULL cursor handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_cursor_column_count(
     cursor: *const line_reader_cursor,
 ) -> size_t {
     unsafe {
+        if cursor.is_null() {
+            return 0;
+        }
         match (*cursor).current_batch.as_ref() {
             Some(b) => b.column_count(),
             None => 0,
@@ -1998,7 +2012,7 @@ pub unsafe extern "C" fn line_reader_cursor_column_kind(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
-        let view = match get_column_view(&*cursor, col_idx, err_out) {
+        let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
         };
@@ -2024,6 +2038,14 @@ pub unsafe extern "C" fn line_reader_cursor_column_name(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
+        if cursor.is_null() {
+            set_reader_err(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "cursor handle is NULL",
+            );
+            return false;
+        }
         let batch = match (*cursor).current_batch.as_ref() {
             Some(b) => b,
             None => {
@@ -2077,7 +2099,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_bool(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
-        let view = match get_column_view(&*cursor, col_idx, err_out) {
+        let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
         };
@@ -2116,7 +2138,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_i64(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
-        let view = match get_column_view(&*cursor, col_idx, err_out) {
+        let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
         };
@@ -2159,7 +2181,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_f64(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
-        let view = match get_column_view(&*cursor, col_idx, err_out) {
+        let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
         };
@@ -2195,7 +2217,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_i8(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
-        let view = match get_column_view(&*cursor, col_idx, err_out) {
+        let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
         };
@@ -2231,7 +2253,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_i16(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
-        let view = match get_column_view(&*cursor, col_idx, err_out) {
+        let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
         };
@@ -2271,7 +2293,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_i32(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
-        let view = match get_column_view(&*cursor, col_idx, err_out) {
+        let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
         };
@@ -2311,7 +2333,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_ipv4(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
-        let view = match get_column_view(&*cursor, col_idx, err_out) {
+        let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
         };
@@ -2347,7 +2369,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_f32(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
-        let view = match get_column_view(&*cursor, col_idx, err_out) {
+        let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
         };
@@ -2383,7 +2405,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_char(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
-        let view = match get_column_view(&*cursor, col_idx, err_out) {
+        let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
         };
@@ -2420,7 +2442,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_uuid(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
-        let view = match get_column_view(&*cursor, col_idx, err_out) {
+        let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
         };
@@ -2460,7 +2482,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_long256(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
-        let view = match get_column_view(&*cursor, col_idx, err_out) {
+        let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
         };
@@ -2504,7 +2526,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_varchar(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
-        let view = match get_column_view(&*cursor, col_idx, err_out) {
+        let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
         };
@@ -2551,7 +2573,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_binary(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
-        let view = match get_column_view(&*cursor, col_idx, err_out) {
+        let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
         };
@@ -2599,7 +2621,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_symbol(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
-        let view = match get_column_view(&*cursor, col_idx, err_out) {
+        let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
         };
@@ -2645,7 +2667,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_decimal64(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
-        let view = match get_column_view(&*cursor, col_idx, err_out) {
+        let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
         };
@@ -2685,7 +2707,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_decimal128(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
-        let view = match get_column_view(&*cursor, col_idx, err_out) {
+        let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
         };
@@ -2727,7 +2749,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_decimal256(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
-        let view = match get_column_view(&*cursor, col_idx, err_out) {
+        let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
         };
@@ -2817,7 +2839,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_double_array(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
-        let view = match get_column_view(&*cursor, col_idx, err_out) {
+        let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
         };
@@ -2924,7 +2946,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_double_array_element(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
-        let view = match get_column_view(&*cursor, col_idx, err_out) {
+        let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
         };
@@ -2983,7 +3005,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_long_array(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
-        let view = match get_column_view(&*cursor, col_idx, err_out) {
+        let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
         };
@@ -3083,7 +3105,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_long_array_element(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
-        let view = match get_column_view(&*cursor, col_idx, err_out) {
+        let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
         };
@@ -3148,7 +3170,7 @@ pub unsafe extern "C" fn line_reader_cursor_column_validity(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
-        let view = match get_column_view(&*cursor, col_idx, err_out) {
+        let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
         };
@@ -3179,9 +3201,15 @@ fn column_view_validity<'a>(view: &'a ColumnView<'a>) -> Validity<'a> {
 // ---------------------------------------------------------------------------
 
 /// Cursor's request_id (assigned at `execute()` and refreshed on failover).
+/// Returns `0` for a NULL handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_cursor_request_id(cursor: *const line_reader_cursor) -> i64 {
-    unsafe { (*cursor).cursor.request_id() }
+    unsafe {
+        if cursor.is_null() {
+            return 0;
+        }
+        (*cursor).cursor.request_id()
+    }
 }
 
 /// Cumulative bytes of CREDIT this cursor has granted the server. Pulls
@@ -3200,20 +3228,31 @@ pub unsafe extern "C" fn line_reader_cursor_request_id(cursor: *const line_reade
 pub unsafe extern "C" fn line_reader_cursor_credit_granted_total(
     cursor: *const line_reader_cursor,
 ) -> u64 {
-    unsafe { (*cursor).cursor.credit_granted_total() }
+    unsafe {
+        if cursor.is_null() {
+            return 0;
+        }
+        (*cursor).cursor.credit_granted_total()
+    }
 }
 
 /// Number of successful failover resets observed by this cursor since
-/// `execute()`.
+/// `execute()`. Returns `0` for a NULL handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_cursor_failover_resets(
     cursor: *const line_reader_cursor,
 ) -> u32 {
-    unsafe { (*cursor).cursor.failover_resets() }
+    unsafe {
+        if cursor.is_null() {
+            return 0;
+        }
+        (*cursor).cursor.failover_resets()
+    }
 }
 
 /// Host of the endpoint the cursor is currently connected to. Borrowed;
-/// invalidated on failover or close.
+/// invalidated on failover or close. For a NULL handle, writes an empty
+/// `(NULL, 0)` pair.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_cursor_current_addr_host(
     cursor: *const line_reader_cursor,
@@ -3221,30 +3260,49 @@ pub unsafe extern "C" fn line_reader_cursor_current_addr_host(
     out_len: *mut size_t,
 ) {
     unsafe {
+        if cursor.is_null() {
+            *out_buf = ptr::null();
+            *out_len = 0;
+            return;
+        }
         let ep = (*cursor).cursor.current_addr();
         *out_buf = ep.host.as_ptr() as *const c_char;
         *out_len = ep.host.len();
     }
 }
 
+/// Port of the endpoint the cursor is currently connected to. Returns `0`
+/// for a NULL handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_cursor_current_addr_port(
     cursor: *const line_reader_cursor,
 ) -> u16 {
-    unsafe { (*cursor).cursor.current_addr().port }
+    unsafe {
+        if cursor.is_null() {
+            return 0;
+        }
+        (*cursor).cursor.current_addr().port
+    }
 }
 
 /// `request_id` from the most recently decoded batch's frame header. Only
 /// meaningful after a successful `next_batch` and before the next call.
 ///
 /// Returns true and writes `*out_request_id` if a batch is currently loaded.
-/// Returns false and zeroes the output if no batch is loaded.
+/// Returns false and zeroes the output if no batch is loaded or the cursor
+/// handle is NULL.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_cursor_batch_request_id(
     cursor: *const line_reader_cursor,
     out_request_id: *mut i64,
 ) -> bool {
     unsafe {
+        if cursor.is_null() {
+            if !out_request_id.is_null() {
+                *out_request_id = 0;
+            }
+            return false;
+        }
         match (*cursor).current_batch.as_ref() {
             Some(b) => {
                 *out_request_id = b.request_id();
@@ -3262,13 +3320,20 @@ pub unsafe extern "C" fn line_reader_cursor_batch_request_id(
 /// within a single cursor lifecycle on the same connection).
 ///
 /// Returns true and writes `*out_batch_seq` if a batch is currently loaded.
-/// Returns false and zeroes the output if no batch is loaded.
+/// Returns false and zeroes the output if no batch is loaded or the cursor
+/// handle is NULL.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_cursor_batch_seq(
     cursor: *const line_reader_cursor,
     out_batch_seq: *mut u64,
 ) -> bool {
     unsafe {
+        if cursor.is_null() {
+            if !out_batch_seq.is_null() {
+                *out_batch_seq = 0;
+            }
+            return false;
+        }
         match (*cursor).current_batch.as_ref() {
             Some(b) => {
                 *out_batch_seq = b.batch_seq();
@@ -3285,13 +3350,20 @@ pub unsafe extern "C" fn line_reader_cursor_batch_seq(
 /// Per-batch wire flags from the current batch's frame header.
 ///
 /// Returns true and writes `*out_flags` if a batch is currently loaded.
-/// Returns false and zeroes the output if no batch is loaded.
+/// Returns false and zeroes the output if no batch is loaded or the cursor
+/// handle is NULL.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_cursor_batch_flags(
     cursor: *const line_reader_cursor,
     out_flags: *mut u8,
 ) -> bool {
     unsafe {
+        if cursor.is_null() {
+            if !out_flags.is_null() {
+                *out_flags = 0;
+            }
+            return false;
+        }
         match (*cursor).current_batch.as_ref() {
             Some(b) => {
                 *out_flags = b.flags();
@@ -3319,12 +3391,16 @@ pub enum line_reader_terminal_kind {
     line_reader_terminal_kind_exec_done = 2,
 }
 
-/// Discriminant of the cursor's terminal frame, if observed.
+/// Discriminant of the cursor's terminal frame, if observed. Returns
+/// `_kind_none` for a NULL handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_cursor_terminal_kind(
     cursor: *const line_reader_cursor,
 ) -> line_reader_terminal_kind {
     unsafe {
+        if cursor.is_null() {
+            return line_reader_terminal_kind::line_reader_terminal_kind_none;
+        }
         match (*cursor).cursor.terminal() {
             None => line_reader_terminal_kind::line_reader_terminal_kind_none,
             Some(Terminal::End { .. }) => line_reader_terminal_kind::line_reader_terminal_kind_end,
@@ -3343,7 +3419,7 @@ pub unsafe extern "C" fn line_reader_cursor_terminal_kind(
 
 /// If the cursor's terminal is `RESULT_END`, set `*out_final_seq` and
 /// `*out_total_rows` and return true. Otherwise zeroes both outputs and
-/// returns false.
+/// returns false. NULL handle also zeroes the outputs and returns false.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_cursor_terminal_end(
     cursor: *const line_reader_cursor,
@@ -3351,6 +3427,15 @@ pub unsafe extern "C" fn line_reader_cursor_terminal_end(
     out_total_rows: *mut u64,
 ) -> bool {
     unsafe {
+        if cursor.is_null() {
+            if !out_final_seq.is_null() {
+                *out_final_seq = 0;
+            }
+            if !out_total_rows.is_null() {
+                *out_total_rows = 0;
+            }
+            return false;
+        }
         match (*cursor).cursor.terminal() {
             Some(Terminal::End {
                 final_seq,
@@ -3371,7 +3456,7 @@ pub unsafe extern "C" fn line_reader_cursor_terminal_end(
 
 /// If the cursor's terminal is `EXEC_DONE`, set `*out_op_type` and
 /// `*out_rows_affected` and return true. Otherwise zeroes both outputs and
-/// returns false.
+/// returns false. NULL handle also zeroes the outputs and returns false.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn line_reader_cursor_terminal_exec_done(
     cursor: *const line_reader_cursor,
@@ -3379,6 +3464,15 @@ pub unsafe extern "C" fn line_reader_cursor_terminal_exec_done(
     out_rows_affected: *mut u64,
 ) -> bool {
     unsafe {
+        if cursor.is_null() {
+            if !out_op_type.is_null() {
+                *out_op_type = 0;
+            }
+            if !out_rows_affected.is_null() {
+                *out_rows_affected = 0;
+            }
+            return false;
+        }
         match (*cursor).cursor.terminal() {
             Some(Terminal::ExecDone {
                 op_type,
@@ -3481,7 +3575,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_geohash(
     err_out: *mut *mut line_reader_error,
 ) -> bool {
     unsafe {
-        let view = match get_column_view(&*cursor, col_idx, err_out) {
+        let view = match get_column_view(cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
         };
@@ -3529,11 +3623,26 @@ pub unsafe extern "C" fn line_reader_cursor_get_geohash(
 /// outstanding; (3) the FFI is documented as single-threaded per cursor,
 /// so no two getter calls overlap.
 unsafe fn get_column_view<'a>(
-    cursor: &'a line_reader_cursor,
+    cursor: *const line_reader_cursor,
     col_idx: size_t,
     err_out: *mut *mut line_reader_error,
 ) -> Option<&'a ColumnView<'a>> {
     unsafe {
+        // NULL guard at the helper instead of every caller — the
+        // header contract disallows NULL but defense-in-depth matches
+        // the reader-side stat getters (`line_reader_bytes_received`
+        // et al.) and keeps the FFI from SIGSEGV-ing inside a `match
+        // (*cursor)`. Surfaces as a clean `InvalidApiCall` so the
+        // caller sees what they did wrong.
+        if cursor.is_null() {
+            set_reader_err(
+                err_out,
+                ErrorCode::InvalidApiCall,
+                "cursor handle is NULL",
+            );
+            return None;
+        }
+        let cursor = &*cursor;
         let batch = match cursor.current_batch.as_ref() {
             Some(b) => b,
             None => {
@@ -3688,6 +3797,161 @@ mod tests {
         }
     }
 
+    /// Pure-return cursor getters MUST return a benign sentinel on a
+    /// NULL handle — never SIGSEGV inside `(*cursor)`. Each variant
+    /// here would have previously dereferenced unconditionally.
+    #[test]
+    fn cursor_pure_return_getters_tolerate_null_handle() {
+        unsafe {
+            assert_eq!(line_reader_cursor_row_count(ptr::null()), 0);
+            assert_eq!(line_reader_cursor_column_count(ptr::null()), 0);
+            assert_eq!(line_reader_cursor_request_id(ptr::null()), 0);
+            assert_eq!(line_reader_cursor_credit_granted_total(ptr::null()), 0);
+            assert_eq!(line_reader_cursor_failover_resets(ptr::null()), 0);
+            assert_eq!(line_reader_cursor_current_addr_port(ptr::null()), 0);
+            assert_eq!(
+                line_reader_cursor_terminal_kind(ptr::null()) as u32,
+                line_reader_terminal_kind::line_reader_terminal_kind_none as u32,
+            );
+        }
+    }
+
+    /// `_current_addr_host` writes `(NULL, 0)` to its out-params on a
+    /// NULL handle (matching `line_reader_current_addr_host`).
+    #[test]
+    fn cursor_current_addr_host_null_handle_zeroes_out() {
+        unsafe {
+            let mut buf: *const c_char = 0x1usize as *const c_char; // poison
+            let mut len: size_t = 0xDEADBEEF;
+            line_reader_cursor_current_addr_host(ptr::null(), &mut buf, &mut len);
+            assert!(buf.is_null());
+            assert_eq!(len, 0);
+        }
+    }
+
+    /// `batch_*` getters return false and zero their out-param on a
+    /// NULL handle.
+    #[test]
+    fn cursor_batch_getters_null_handle_return_false_and_zero() {
+        unsafe {
+            let mut rid: i64 = 0x1234_5678_9ABC_DEF0;
+            assert!(!line_reader_cursor_batch_request_id(ptr::null(), &mut rid));
+            assert_eq!(rid, 0);
+
+            let mut seq: u64 = 0xABCD;
+            assert!(!line_reader_cursor_batch_seq(ptr::null(), &mut seq));
+            assert_eq!(seq, 0);
+
+            let mut flags: u8 = 0xFF;
+            assert!(!line_reader_cursor_batch_flags(ptr::null(), &mut flags));
+            assert_eq!(flags, 0);
+        }
+    }
+
+    /// `terminal_end` / `terminal_exec_done` return false and zero
+    /// every out-param on a NULL handle.
+    #[test]
+    fn cursor_terminal_getters_null_handle_return_false_and_zero() {
+        unsafe {
+            let mut a: u64 = 1;
+            let mut b: u64 = 2;
+            assert!(!line_reader_cursor_terminal_end(ptr::null(), &mut a, &mut b));
+            assert_eq!(a, 0);
+            assert_eq!(b, 0);
+
+            let mut op: u8 = 0xFF;
+            let mut rows: u64 = 0xFEED;
+            assert!(!line_reader_cursor_terminal_exec_done(
+                ptr::null(),
+                &mut op,
+                &mut rows
+            ));
+            assert_eq!(op, 0);
+            assert_eq!(rows, 0);
+        }
+    }
+
+    /// Getters that take `err_out` route NULL handle through the
+    /// standard `InvalidApiCall` error surface (mirroring
+    /// `line_reader_server_version`). Pin one representative —
+    /// `_get_i64`, because it funnels through `get_column_view` where
+    /// the central NULL guard lives.
+    #[test]
+    fn cursor_get_i64_null_handle_sets_err_out() {
+        unsafe {
+            let mut value: i64 = 0;
+            let mut is_null: bool = false;
+            let mut err: *mut line_reader_error = ptr::null_mut();
+            let ok = line_reader_cursor_get_i64(
+                ptr::null(),
+                0,
+                0,
+                &mut value,
+                &mut is_null,
+                &mut err,
+            );
+            assert!(!ok);
+            assert!(!err.is_null(), "err_out must be set on NULL cursor");
+            let code = line_reader_error_get_code(err) as u32;
+            let want = line_reader_error_code::line_reader_error_invalid_api_call as u32;
+            assert_eq!(code, want);
+            line_reader_error_free(err);
+        }
+    }
+
+    /// Same shape but with `err_out == NULL` — the helper must not
+    /// SIGSEGV on the diagnostic write.
+    #[test]
+    fn cursor_get_i64_null_handle_with_null_err_out_does_not_segv() {
+        unsafe {
+            let mut value: i64 = 0;
+            let mut is_null: bool = false;
+            let ok = line_reader_cursor_get_i64(
+                ptr::null(),
+                0,
+                0,
+                &mut value,
+                &mut is_null,
+                ptr::null_mut(),
+            );
+            assert!(!ok);
+        }
+    }
+
+    /// `_column_kind` and `_column_name` both go through paths that
+    /// touch the cursor; pin the NULL contract on both.
+    #[test]
+    fn cursor_column_kind_and_name_null_handle_set_err_out() {
+        unsafe {
+            // column_kind
+            let mut kind = line_reader_column_kind::line_reader_column_kind_boolean;
+            let mut err: *mut line_reader_error = ptr::null_mut();
+            let ok = line_reader_cursor_column_kind(ptr::null(), 0, &mut kind, &mut err);
+            assert!(!ok);
+            assert!(!err.is_null());
+            assert_eq!(
+                line_reader_error_get_code(err) as u32,
+                line_reader_error_code::line_reader_error_invalid_api_call as u32,
+            );
+            line_reader_error_free(err);
+
+            // column_name
+            let mut name_buf: *const c_char = ptr::null();
+            let mut name_len: size_t = 0;
+            let mut err2: *mut line_reader_error = ptr::null_mut();
+            let ok2 = line_reader_cursor_column_name(
+                ptr::null(),
+                0,
+                &mut name_buf,
+                &mut name_len,
+                &mut err2,
+            );
+            assert!(!ok2);
+            assert!(!err2.is_null());
+            line_reader_error_free(err2);
+        }
+    }
+
     #[test]
     fn u128_saturating_cast() {
         assert_eq!(u128_to_u64_sat(0u128), 0u64);
@@ -3719,6 +3983,7 @@ mod tests {
             ErrorCode::LimitExceeded,
             ErrorCode::ServerLimitExceeded,
             ErrorCode::Cancelled,
+            ErrorCode::FailoverWouldDuplicate,
         ];
         for code in codes {
             let c: line_reader_error_code = code.into();
