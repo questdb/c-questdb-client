@@ -1584,7 +1584,14 @@ impl<'r> Cursor<'r> {
         // way, swallowing the error here gives the user the truthful
         // signal: the cancellation request was delivered.
         if self.credit_enabled {
-            let _ = self.send_credit_frame(1);
+            // No-accounting variant: this 1-byte nudge exists only to
+            // unstick a credit-suspended server so it can deliver the
+            // QUERY_ERROR for our CANCEL. Bumping
+            // `stats.credit_granted_total` here would violate the
+            // counter's documented purpose ("cancel doesn't continue
+            // topping up the server's budget"). See
+            // `write_credit_frame_raw`.
+            let _ = self.write_credit_frame_raw(1);
         }
 
         // Drain until any terminal frame (RESULT_END / EXEC_DONE /
@@ -1665,6 +1672,21 @@ impl<'r> Cursor<'r> {
     }
 
     fn send_credit_frame(&mut self, additional_bytes: u64) -> Result<()> {
+        self.write_credit_frame_raw(additional_bytes)?;
+        self.reader
+            .stats
+            .credit_granted_total
+            .fetch_add(additional_bytes, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Wire-only CREDIT emit, **without** bumping
+    /// `stats.credit_granted_total`. Used by `cancel()`'s wake nudge so
+    /// the counter's documented invariant — "`cancel()` doesn't
+    /// continue topping up the server's budget" — holds exactly,
+    /// without a "modulo the 1-byte cancel nudge" caveat. Every other
+    /// CREDIT path goes through `send_credit_frame` and is accounted for.
+    fn write_credit_frame_raw(&mut self, additional_bytes: u64) -> Result<()> {
         let mut payload = Vec::with_capacity(16);
         payload.push(MsgKind::Credit.as_u8());
         payload.extend_from_slice(&self.request_id.to_le_bytes());
@@ -1672,10 +1694,6 @@ impl<'r> Cursor<'r> {
         self.reader
             .transport_mut()?
             .write_message(Bytes::from(payload))?;
-        self.reader
-            .stats
-            .credit_granted_total
-            .fetch_add(additional_bytes, Ordering::Relaxed);
         Ok(())
     }
 
