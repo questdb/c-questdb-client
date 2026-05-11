@@ -232,22 +232,28 @@ pub const DEFAULT_FAILOVER_BACKOFF_MAX_MS: u64 = 1_000;
 
 /// Hard upper bound on `failover_max_attempts`. Defensive: at the
 /// minute-scale this is far past where extending the retry budget
-/// stops being useful, and combined with [`MAX_ADDRS`] it keeps the
-/// address-rotation arithmetic
-/// `(failed_idx + 1 + attempt as usize) % n` safely inside `usize`
-/// on 32-bit targets. Java doesn't cap explicitly; this cap is well
-/// above any realistic config.
+/// stops being useful, and combined with [`MAX_ADDRS`] it bounds the
+/// worst-case dial count and wall-clock the failover cycle can
+/// consume. With `walk_via_tracker` doing at most
+/// `addr_count × 2` picks per outer attempt (the round-attempted
+/// walk plus one fall-through reset walk per failover.md §11.9.3),
+/// the dial ceiling per `next_batch` is
+/// `(MAX_FAILOVER_MAX_ATTEMPTS + 1) × MAX_ADDRS × 2 ≈ 2.1M`. Java
+/// doesn't cap explicitly; this cap is well above any realistic
+/// config.
 pub const MAX_FAILOVER_MAX_ATTEMPTS: u32 = 1024;
 
 /// Hard upper bound on the parsed address-list length. Real connect
 /// strings target a single cluster (a handful of endpoints); this
-/// cap exists so the address-rotation arithmetic in
-/// [`crate::egress::Reader::reconnect_with_failover`]
-/// (`(failed_idx + 1 + attempt as usize) % n`) is provably free of
-/// `usize` overflow on 32-bit targets given
-/// [`MAX_FAILOVER_MAX_ATTEMPTS`]. Without this cap the "32-bit
-/// safety" claim was a soft assertion that nothing actually
-/// enforced.
+/// cap exists so the [`HostHealthTracker`]'s per-host state arrays
+/// (state × zone × host classification bits) and the
+/// `walk_via_tracker` dial budget per outer failover attempt stay
+/// bounded by a constant rather than user input. Combined with
+/// [`MAX_FAILOVER_MAX_ATTEMPTS`] it pins the worst-case behaviour of
+/// the whole failover cycle — see that constant's docstring for the
+/// arithmetic.
+///
+/// [`HostHealthTracker`]: crate::egress::tracker::HostHealthTracker
 pub const MAX_ADDRS: usize = 1024;
 
 /// Hard upper bound on `failover_backoff_max_ms`. Caps a misconfigured

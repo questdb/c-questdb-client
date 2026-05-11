@@ -2215,21 +2215,25 @@ fn failover_callback_runs_before_replayed_read() {
 
 #[test]
 fn rotation_wraps_to_index_zero_when_failed_is_last() {
-    // Pins the wrap path of `(failed_idx + 1 + attempt) % n`.
+    // Pins the tracker's "lowest-index Unknown host" pick when the
+    // failed endpoint is the last entry in the addr list — the
+    // historically-buggy wrap case.
     //
     // Topology: 4 servers, parsed in order S0, S1, S2, S3. We force
     // initial connect to land on S3 (idx 3) by making S0..S2 reject
-    // their first connect. Then S3 drops mid-query. With `n = 4` and
-    // `failed_idx = 3`, the very first failover dial is
-    // `(3 + 1 + 0) % 4 == 0` — i.e. S0. So:
+    // their first connect. Then S3 drops mid-query. The tracker now
+    // sees: S0/S1/S2 = TransportError (from the initial walk), S3 =
+    // TransportError (just demoted by the mid-stream failure). All
+    // hosts share the same priority tier, so the tie-breaker is the
+    // address-list index — which puts S0 first. So:
     //
-    //   * If the rotation arithmetic is correct, S0's *second* accept
-    //     receives the dial and answers happily; the cursor terminates
-    //     bound to S0.
-    //   * If the rotation skipped S0 (e.g. wrapped to a different
-    //     index), the cursor would land on S1 or S2 (both still
-    //     dead), the failover budget would exhaust, and the
-    //     final-endpoint assertion would fail.
+    //   * If the pick is correct, S0's *second* accept receives the
+    //     dial and answers happily; the cursor terminates bound to S0.
+    //   * If a regression in the tracker picks a different host (e.g.
+    //     biased toward higher indices, or skips S0 in favour of S1),
+    //     the cursor would land on S1 or S2 (both still dead), the
+    //     failover budget would exhaust, and the final-endpoint
+    //     assertion would fail.
     //
     // `failover_max_attempts=1` (so `attempts_total=2`) keeps the
     // budget tight: only ONE failover dial is permitted to land,

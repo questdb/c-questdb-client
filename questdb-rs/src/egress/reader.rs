@@ -154,12 +154,13 @@ pub struct Reader {
     /// successive frames decompress through it.
     zstd_scratch: ZstdScratch,
     /// Per-client host-health tracker shared across the initial connect
-    /// and every mid-query reconnect. Replaces the old
-    /// `(failed_idx + 1 + attempt) % N` rotation with the
-    /// failover.md §2 priority lattice; see [`HostHealthTracker`].
-    /// Classifications accumulate across Executes; only the
-    /// round-attempted bits reset between walks. Lives on the Reader so
-    /// long-lived clients converge on the healthiest endpoint over time.
+    /// and every mid-query reconnect. Implements the failover.md §2
+    /// priority lattice — endpoints are picked by (state tier × zone
+    /// tier × index), not by round-robin rotation; see
+    /// [`HostHealthTracker`]. Classifications accumulate across
+    /// Executes; only the round-attempted bits reset between walks.
+    /// Lives on the Reader so long-lived clients converge on the
+    /// healthiest endpoint over time.
     tracker: HostHealthTracker,
     /// Per-Reader PRNG for failover backoff jitter. Egress backoff
     /// uses **full-jitter** `[0, base)` per failover.md §3.1 — a
