@@ -203,6 +203,22 @@ pub const DEFAULT_AUTH_TIMEOUT_MS: u64 = 15_000;
 /// knob for something other than its documented purpose.
 pub const MAX_AUTH_TIMEOUT_MS: u64 = 60 * 60 * 1_000;
 
+/// Default per-host upper bound on the **post-upgrade `SERVER_INFO`
+/// frame read**, in milliseconds. Failover.md §1.1 calls for a
+/// separate hard-coded 5 s budget on this frame alone (distinct from
+/// `auth_timeout_ms`, which covers only the HTTP upgrade response).
+/// Matches the Java reference's `DEFAULT_SERVER_INFO_TIMEOUT_MS`.
+///
+/// The frame is short (≤ ~64 KiB), and the server is supposed to
+/// write it into the same kernel send buffer as the upgrade response,
+/// so on a healthy connection the frame is already in the client's
+/// recv buffer by the time this wait starts.
+pub const DEFAULT_SERVER_INFO_TIMEOUT_MS: u64 = 5_000;
+
+/// Hard upper bound on `server_info_timeout_ms`. Same hour cap as
+/// `auth_timeout_ms` — beyond it the user is misusing the knob.
+pub const MAX_SERVER_INFO_TIMEOUT_MS: u64 = 60 * 60 * 1_000;
+
 /// Default wall-clock budget per `Execute()`-driven failover round,
 /// in milliseconds. Failover.md §11.9.1 / §7. `0` means unbounded.
 pub const DEFAULT_FAILOVER_MAX_DURATION_MS: u64 = 30_000;
@@ -282,9 +298,18 @@ pub struct ReaderConfig {
     /// milliseconds. Bounds the "TCP accepts but server never replies"
     /// blackhole that the OS connect timeout misses. Does NOT cover TCP
     /// connect, TLS handshake, or the post-upgrade `SERVER_INFO` frame
-    /// read (those use the OS default / hardcoded defaults). Failover.md
-    /// §1.1.
+    /// read (those use the OS default / [`Self::server_info_timeout_ms`]
+    /// respectively). Failover.md §1.1.
     pub auth_timeout_ms: u64,
+    /// Per-host upper bound on the post-upgrade `SERVER_INFO` (`0x18`)
+    /// frame read, in milliseconds. Bounds the case where the server
+    /// accepts the WS upgrade (HTTP 101) but never sends the
+    /// `SERVER_INFO` binary frame — without this, the connect would
+    /// stall indefinitely after `auth_timeout_ms` has already passed.
+    /// Failover.md §1.1 specifies a separate 5 s budget; the knob is
+    /// programmatic-only (not a connect-string key) so it tracks the
+    /// Java reference's `withServerInfoTimeout` surface.
+    pub server_info_timeout_ms: u64,
     /// Client's zone identifier — opaque case-insensitive string (e.g.
     /// `eu-west-1a`, `dc-amsterdam`). When set, the host-health tracker
     /// prefers endpoints whose server-advertised `zone_id` matches
@@ -428,6 +453,7 @@ impl ReaderConfig {
         let mut failover_backoff_max_ms: u64 = DEFAULT_FAILOVER_BACKOFF_MAX_MS;
         let mut failover_max_duration_ms: u64 = DEFAULT_FAILOVER_MAX_DURATION_MS;
         let mut auth_timeout_ms: u64 = DEFAULT_AUTH_TIMEOUT_MS;
+        let server_info_timeout_ms: u64 = DEFAULT_SERVER_INFO_TIMEOUT_MS;
         let mut zone: Option<String> = None;
         let mut tls_verify = TlsVerify::On;
         let mut tls_ca = default_tls_ca();
@@ -654,6 +680,7 @@ impl ReaderConfig {
             failover_backoff_max_ms,
             failover_max_duration_ms,
             auth_timeout_ms,
+            server_info_timeout_ms,
             zone,
             auth,
             tls_verify,
@@ -755,6 +782,20 @@ impl ReaderConfig {
                 "\"auth_timeout_ms\" {} exceeds the hard cap of {} (1 hour)",
                 self.auth_timeout_ms,
                 MAX_AUTH_TIMEOUT_MS
+            ));
+        }
+        if self.server_info_timeout_ms == 0 {
+            return Err(fmt!(
+                ConfigError,
+                "\"server_info_timeout_ms\" must be > 0"
+            ));
+        }
+        if self.server_info_timeout_ms > MAX_SERVER_INFO_TIMEOUT_MS {
+            return Err(fmt!(
+                ConfigError,
+                "\"server_info_timeout_ms\" {} exceeds the hard cap of {} (1 hour)",
+                self.server_info_timeout_ms,
+                MAX_SERVER_INFO_TIMEOUT_MS
             ));
         }
         Ok(())
@@ -1337,6 +1378,53 @@ mod tests {
         let err = ReaderConfig::from_conf(&conf).unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
         assert!(err.msg().contains("exceeds the hard cap"));
+    }
+
+    // --- server_info_timeout_ms (programmatic-only; not parsed from connect-string) ---
+
+    #[test]
+    fn server_info_timeout_defaults_to_5s() {
+        let c = ReaderConfig::from_conf("qwp::addr=h:1").unwrap();
+        assert_eq!(c.server_info_timeout_ms, DEFAULT_SERVER_INFO_TIMEOUT_MS);
+        assert_eq!(DEFAULT_SERVER_INFO_TIMEOUT_MS, 5_000);
+    }
+
+    #[test]
+    fn server_info_timeout_is_not_parsed_from_connect_string() {
+        // Java parity: `withServerInfoTimeout` is programmatic-only. The
+        // connect-string key MUST be rejected (covered by the generic
+        // "unknown config key" branch) so a user typo doesn't get
+        // silently ignored.
+        let err = ReaderConfig::from_conf("qwp::addr=h:1;server_info_timeout_ms=1000").unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+        assert!(err.msg().contains("Unknown config key"), "msg: {}", err.msg());
+    }
+
+    #[test]
+    fn server_info_timeout_zero_rejected_by_validate() {
+        // Programmatic mutation past the default — `validate()` is the
+        // safety net before `Reader::from_config` opens any socket.
+        let mut c = ReaderConfig::from_conf("qwp::addr=h:1").unwrap();
+        c.server_info_timeout_ms = 0;
+        let err = c.validate().unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+        assert!(err.msg().contains("server_info_timeout_ms"));
+    }
+
+    #[test]
+    fn server_info_timeout_above_cap_rejected_by_validate() {
+        let mut c = ReaderConfig::from_conf("qwp::addr=h:1").unwrap();
+        c.server_info_timeout_ms = MAX_SERVER_INFO_TIMEOUT_MS + 1;
+        let err = c.validate().unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ConfigError);
+        assert!(err.msg().contains("exceeds the hard cap"));
+    }
+
+    #[test]
+    fn server_info_timeout_at_cap_accepted() {
+        let mut c = ReaderConfig::from_conf("qwp::addr=h:1").unwrap();
+        c.server_info_timeout_ms = MAX_SERVER_INFO_TIMEOUT_MS;
+        c.validate().unwrap();
     }
 
     #[test]

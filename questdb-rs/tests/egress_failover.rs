@@ -2830,6 +2830,96 @@ fn auth_timeout_does_not_fire_within_budget() {
     while cursor.next_batch().expect("next_batch").is_some() {}
 }
 
+/// `server_info_timeout_ms` bounds the post-upgrade `SERVER_INFO`
+/// read per failover.md §1.1. A server that accepts the WS upgrade
+/// (HTTP 101) but then never sends the `SERVER_INFO` binary frame
+/// MUST surface a transport-class failure within the configured
+/// budget, not stall the connect indefinitely.
+///
+/// The mock's script holds the connection open for 800ms WITHOUT
+/// emitting `SendServerInfo`, so the upgrade completes (advertised
+/// `x-qwp-version: 2`) but the post-upgrade read on the client side
+/// has no SERVER_INFO frame to consume. With
+/// `server_info_timeout_ms=100`, the client should give up within
+/// ~150ms and surface a failover-eligible transport error.
+#[test]
+fn server_info_timeout_bounds_post_upgrade_stall() {
+    use questdb::egress::ReaderConfig;
+
+    // The implicit `handshake_version = "2"` advertises v2, which
+    // triggers `read_server_info_frame` on the client side. The
+    // script has no `SendServerInfo` action, so the server just
+    // sleeps after the upgrade and never writes the frame.
+    let srv = MockServer::start(vec![vec![Action::Sleep(Duration::from_millis(800))]]);
+    // `server_info_timeout_ms` is programmatic-only; build the cfg
+    // via `from_conf` and override the field before opening the
+    // Reader. Matches the Java reference's `withServerInfoTimeout`
+    // surface.
+    let mut cfg = ReaderConfig::from_conf(format!(
+        "qwp::addr={};failover=off",
+        srv.url()
+    ))
+    .expect("conf parse");
+    cfg.server_info_timeout_ms = 100;
+
+    let started = std::time::Instant::now();
+    let err = match questdb::egress::Reader::from_config(&cfg) {
+        Ok(_) => panic!("post-upgrade stall must surface as a connect error"),
+        Err(e) => e,
+    };
+    let elapsed = started.elapsed();
+    // Tight upper bound: well below the 800ms server hold. If the
+    // timeout weren't applied, the client would wait for the mock's
+    // full 800ms drop (or longer on slower CI).
+    assert!(
+        elapsed < Duration::from_millis(400),
+        "server_info_timeout_ms=100 must bound the SERVER_INFO stall well under the mock's 800ms hold; \
+         got elapsed={:?}, error: {} {:?}",
+        elapsed,
+        err.msg(),
+        err.code()
+    );
+    // OS-dependent classification (Linux WouldBlock vs macOS TimedOut)
+    // — both render via tungstenite as `Error::Io` → `SocketError`,
+    // but a clean WS close would surface as `SocketError` or
+    // `ProtocolError`. Accept any failover-eligible transport-class
+    // code.
+    assert!(
+        matches!(
+            err.code(),
+            ErrorCode::SocketError | ErrorCode::ProtocolError | ErrorCode::HandshakeError
+        ),
+        "post-upgrade timeout must surface as a transport-class error; got {:?}: {}",
+        err.code(),
+        err.msg()
+    );
+}
+
+/// Counterpart: a SERVER_INFO frame that arrives well within the
+/// configured budget MUST NOT trip the timeout. Pins the
+/// don't-fire-prematurely side of the knob.
+#[test]
+fn server_info_timeout_does_not_fire_within_budget() {
+    use questdb::egress::ReaderConfig;
+
+    let srv = MockServer::start(vec![happy_script(ServerRole::Standalone, "n0")]);
+    let mut cfg = ReaderConfig::from_conf(format!(
+        "qwp::addr={};failover=off",
+        srv.url()
+    ))
+    .expect("conf parse");
+    cfg.server_info_timeout_ms = 5_000;
+
+    let mut reader = questdb::egress::Reader::from_config(&cfg)
+        .expect("connect must succeed within budget");
+    // Sanity: post-SERVER_INFO reads must NOT be subject to the
+    // deadline — `read_server_info_frame` clears the deadline on the
+    // way out, so subsequent batch reads can legitimately block for
+    // as long as the query takes to execute.
+    let mut cursor = reader.query("select 1").execute().expect("execute");
+    while cursor.next_batch().expect("next_batch").is_some() {}
+}
+
 /// `zone=` populates `ReaderConfig.zone`, which then drives
 /// `HostHealthTracker::new`. Without an end-to-end multi-cycle test
 /// it's hard to observe the priority lattice's zone dimension from

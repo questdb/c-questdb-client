@@ -277,7 +277,10 @@ impl Reader {
     fn connect_endpoint(cfg: &ReaderConfig, idx: usize) -> Result<TransportSession> {
         let mut transport = WsTransport::connect_to(cfg, idx)?;
         let server_info = if transport.server_version() >= 2 {
-            Some(read_server_info_frame(&mut transport)?)
+            Some(read_server_info_frame(
+                &mut transport,
+                Duration::from_millis(cfg.server_info_timeout_ms),
+            )?)
         } else {
             None
         };
@@ -2036,8 +2039,31 @@ fn walk_via_tracker(
 /// never carries symbols, schemas, or compressed payload — those state
 /// machines only kick in once the Reader is assembled and starts
 /// pulling `RESULT_BATCH` frames.
-fn read_server_info_frame(transport: &mut WsTransport) -> Result<ServerInfo> {
-    let (header, payload) = transport.read_frame()?;
+///
+/// Bounded by `timeout` (sourced from
+/// [`ReaderConfig::server_info_timeout_ms`], default 5 s per
+/// failover.md §1.1). The `auth_timeout_ms` knob covers the HTTP
+/// upgrade-response read only, and a server that accepts the upgrade
+/// but then never sends the `SERVER_INFO` binary frame would
+/// otherwise stall the connect indefinitely. The timeout is applied
+/// as a TCP read deadline; on expiry the underlying read surfaces as
+/// an `io::ErrorKind::WouldBlock` / `TimedOut` and tungstenite
+/// renders it as `Error::Io` — which the transport mapper classifies
+/// as `SocketError` (failover-eligible so the walk continues to the
+/// next host).
+///
+/// The deadline is cleared on the way out so subsequent
+/// `Cursor::next_batch` reads (which can legitimately block for as
+/// long as the server takes to plan and execute the query) aren't
+/// subject to it.
+fn read_server_info_frame(
+    transport: &mut WsTransport,
+    timeout: Duration,
+) -> Result<ServerInfo> {
+    transport.set_read_timeout(Some(timeout));
+    let result = transport.read_frame();
+    transport.set_read_timeout(None);
+    let (header, payload) = result?;
     let mut dict = SymbolDict::new();
     let mut registry = SchemaRegistry::new();
     let mut zstd_scratch = ZstdScratch::new();
