@@ -503,14 +503,20 @@ fn read_version_header(headers: &tungstenite::http::HeaderMap) -> Result<u8> {
 /// client was actually built with.
 ///
 /// Spec §3: the server echoes its choice in `X-QWP-Content-Encoding`
-/// (omitted means `raw`). Tokens are `name` or `name;param=value`; `raw`
-/// and `identity` are aliases for "no compression". The runtime guard
-/// inside `decoder.rs` already rejects a `FLAG_ZSTD` batch when the
-/// `compression-zstd` feature is off — but it surfaces only when the
-/// first compressed batch arrives, leaving the connection technically
-/// usable until then. Failing fast at handshake gives the operator a
-/// clear "this build can't talk to that server" error before any query
-/// runs, which is what spec §3 implies by negotiating up front.
+/// (omitted means `raw`). Tokens are `name` or `name;param=value`;
+/// `raw` and `identity` are aliases for "no compression"; for `zstd`
+/// the spec example explicitly shows the server emitting
+/// `zstd;level=3`, where the level is a server-side encoder setting
+/// (the zstd bitstream is self-describing on the decompress side, so
+/// the client doesn't need the level to decode).
+///
+/// The check fails fast at handshake when the server selected a codec
+/// this client build can't handle (e.g. `zstd` against a binary built
+/// without the `compression-zstd` feature) so the operator sees a
+/// clear "this build can't talk to that server" error before any
+/// query runs. Parameters attached to a recognised codec are
+/// tolerated and ignored: they're server-side state, and the
+/// runtime decoder pulls everything it needs from the frame itself.
 fn validate_content_encoding(headers: &tungstenite::http::HeaderMap) -> Result<()> {
     let raw = match headers
         .iter()
@@ -527,28 +533,19 @@ fn validate_content_encoding(headers: &tungstenite::http::HeaderMap) -> Result<(
         )
     })?;
     // Token = name `;` params... — the name selects the codec; the
-    // params alter codec behaviour and the client must understand
-    // every one it accepts. The QWP egress spec defines no parameters
-    // at this revision, so any non-empty `param[=value]` is rejected
-    // up front rather than silently ignored — silently ignoring lets
-    // a server that emits e.g. `zstd;dict=<id>` progress past the
-    // handshake and only fail at first batch, after the user has
-    // already issued a query.
+    // params are codec-scoped server-side state. The QuestDB server
+    // emits e.g. `zstd;level=3` per spec §3 example. We do not act on
+    // the parameter at decode time (zstd's bitstream carries its own
+    // header), so tolerating unknown parameters on a recognised codec
+    // is safe and forward-compatible — a future spec revision that
+    // adds e.g. `zstd;dict=<id>` will still let this client decode
+    // its way through every batch whose dict happens to be the
+    // default.
+    //
+    // Splitting off the codec name keeps the unknown-codec error
+    // message tidy (no trailing parameter noise).
     let mut parts = s.split(';');
     let name = parts.next().unwrap_or("").trim();
-    for param in parts {
-        let param = param.trim();
-        if param.is_empty() {
-            continue;
-        }
-        return Err(fmt!(
-            HandshakeError,
-            "server selected X-QWP-Content-Encoding {:?} with unsupported parameter {:?} \
-             (this client revision recognises no codec parameters)",
-            s,
-            param
-        ));
-    }
     match name {
         // `raw` and `identity` are spec-aliases for no compression.
         "raw" | "identity" | "" => Ok(()),
@@ -821,16 +818,29 @@ mod tests {
 
     #[cfg(feature = "compression-zstd")]
     #[test]
-    fn content_encoding_zstd_with_unknown_param_rejected() {
-        for v in ["zstd;level=11", "zstd; dict=42", "zstd;foo=bar;baz=qux"] {
-            let err = validate_content_encoding(&header_map(v)).unwrap_err();
-            assert_eq!(err.code(), ErrorCode::HandshakeError);
-            assert!(
-                err.msg().contains("unsupported parameter"),
-                "got: {}",
-                err.msg()
-            );
-        }
+    fn content_encoding_zstd_with_level_parameter_is_ok() {
+        // Spec §3 example: server echoes `zstd;level=3`. The `level`
+        // is server-side encoder state — the decompressor pulls
+        // everything it needs from the frame header — so the client
+        // must accept and ignore it.
+        validate_content_encoding(&header_map("zstd;level=3")).unwrap();
+        validate_content_encoding(&header_map("zstd; level=3")).unwrap();
+        validate_content_encoding(&header_map("zstd;level=1")).unwrap();
+        validate_content_encoding(&header_map("zstd;level=9")).unwrap();
+    }
+
+    #[cfg(feature = "compression-zstd")]
+    #[test]
+    fn content_encoding_zstd_with_unknown_parameter_is_ok() {
+        // Future-compat: parameters not defined at this spec revision
+        // (e.g. `dict=<id>`) MUST NOT block the handshake. Server-side
+        // parameters are tolerated unconditionally on a recognised
+        // codec — the decoder reads what it needs from the frame.
+        validate_content_encoding(&header_map("zstd;dict=42")).unwrap();
+        validate_content_encoding(&header_map("zstd;foo=bar;baz=qux")).unwrap();
+        // Even an out-of-spec level value is informational and
+        // tolerated — the server has already clamped on the wire side.
+        validate_content_encoding(&header_map("zstd;level=99")).unwrap();
     }
 
     #[cfg(feature = "compression-zstd")]
@@ -845,6 +855,15 @@ mod tests {
     #[test]
     fn content_encoding_unknown_codec_rejected() {
         let err = validate_content_encoding(&header_map("brotli")).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::HandshakeError);
+        assert!(err.msg().contains("unknown codec"), "got: {}", err.msg());
+    }
+
+    #[test]
+    fn content_encoding_unknown_codec_with_parameters_still_rejected() {
+        // The codec name itself is unknown — the parameter tail
+        // doesn't rescue it.
+        let err = validate_content_encoding(&header_map("brotli;q=1.0")).unwrap_err();
         assert_eq!(err.code(), ErrorCode::HandshakeError);
         assert!(err.msg().contains("unknown codec"), "got: {}", err.msg());
     }
