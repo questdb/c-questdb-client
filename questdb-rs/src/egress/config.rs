@@ -77,23 +77,38 @@ const DEFAULT_TLS_PORT: &str = "9000";
 
 /// Compression negotiation vocabulary.
 ///
-/// `Auto` advertises both `zstd,raw`; `Raw` advertises only `raw`. Only
-/// `Raw` is currently usable end-to-end because the decoder hasn't
-/// implemented zstd payload decompression yet.
+/// Drives the `X-QWP-Accept-Encoding` header the client sends on the
+/// WebSocket upgrade ([`Self::header_token`] returns the wire token).
+/// The server picks one codec from the advertised set and echoes its
+/// choice back in `X-QWP-Content-Encoding`; subsequent `RESULT_BATCH`
+/// frames are tagged with `FLAG_ZSTD` (or not) accordingly.
+///
+/// All three variants are usable end-to-end when the client is built
+/// with the `compression-zstd` feature (which `almost-all-features`
+/// turns on by default). Without that feature, `Zstd` / `Auto` still
+/// compile but the decoder rejects any `FLAG_ZSTD` batch the server
+/// sends back with [`ErrorCode::UnsupportedServer`] — surface the
+/// error to the operator rather than silently mis-decoding a
+/// compressed payload as raw wire bytes.
+///
+/// [`ErrorCode::UnsupportedServer`]: crate::egress::ErrorCode::UnsupportedServer
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Compression {
     /// Advertise `raw` only — every `RESULT_BATCH` body is
-    /// uncompressed wire bytes.
+    /// uncompressed wire bytes. Works on every client build (no
+    /// `compression-zstd` dependency).
     Raw,
     /// Advertise `zstd` only — the server must send compressed
     /// batches and the client must be built with the
-    /// `compression-zstd` feature.
+    /// `compression-zstd` feature to decode them.
     Zstd,
-    /// Advertise both `zstd,raw` — the server picks. The client
-    /// must be built with the `compression-zstd` feature to decode
-    /// the compressed branch; without it, the decoder rejects
-    /// `FLAG_ZSTD` batches with `UnsupportedServer`.
+    /// Advertise both `zstd,raw` — the server picks. The decoder
+    /// handles either path. If the client was built without the
+    /// `compression-zstd` feature and the server still selects
+    /// `zstd`, the decoder rejects the first `FLAG_ZSTD` batch with
+    /// `UnsupportedServer`; the operator's recovery is to enable the
+    /// feature or pin `Compression::Raw`.
     Auto,
 }
 
