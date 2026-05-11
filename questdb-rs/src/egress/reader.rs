@@ -66,6 +66,34 @@ use crate::egress::wire::varint;
 // Reader
 // ---------------------------------------------------------------------------
 
+/// Diagnostic counters shared between a [`Reader`] and its FFI handle.
+///
+/// Held by the Reader via [`Arc`] so the FFI surface can clone it once
+/// at handle-construction time and serve stat reads thereafter without
+/// touching the `UnsafeCell<Reader>` that holds the Reader. That
+/// decouples counter reads from the Reader's borrow stack: a stat
+/// getter no longer synthesises a `&Reader` while a laundered
+/// `&mut Reader` (held by an in-flight `ReaderQuery` / `Cursor`) is
+/// still on the stack — eliminating the aliasing question entirely.
+///
+/// All four counters are `Relaxed` — pure counters with no associated
+/// happens-before requirement.
+#[derive(Debug, Default)]
+pub struct ReaderStats {
+    /// Total wire bytes (frame header + payload) read off the
+    /// transport since this connection was opened.
+    pub bytes_received: AtomicU64,
+    /// Total bytes granted to the server via CREDIT (`0x15`) frames
+    /// since this connection was opened.
+    pub credit_granted_total: AtomicU64,
+    /// Nanoseconds spent in `transport.read_frame()` since this
+    /// connection was opened. Saturates at `u64::MAX`.
+    pub read_ns: AtomicU64,
+    /// Nanoseconds spent in `decode_frame()` since this connection
+    /// was opened. Saturates at `u64::MAX`.
+    pub decode_ns: AtomicU64,
+}
+
 /// Per-connection reader. Owns the WebSocket transport and the
 /// connection-scoped symbol dictionary + schema registry.
 pub struct Reader {
@@ -100,37 +128,26 @@ pub struct Reader {
     /// Captured eagerly during connect so multi-addr role filtering
     /// can dismiss endpoints whose role doesn't match `target`.
     server_info: Option<ServerInfo>,
-    /// Total wire bytes (header + payload) consumed since connect.
-    /// Updated on every frame the reader pulls off the transport.
+    /// Diagnostic counters (`bytes_received`, `credit_granted_total`,
+    /// `read_ns`, `decode_ns`) shared with the FFI handle via `Arc` so
+    /// that monitoring-thread stat reads can be served without ever
+    /// touching the `UnsafeCell<Reader>` that the FFI uses to hold this
+    /// `Reader`. Decoupling the counters from the Reader's borrow stack
+    /// removes the aliasing question of "what happens when a stat
+    /// getter synthesises a `&Reader` while a laundered `&mut Reader`
+    /// is in flight": the stat getter doesn't touch the Reader at all.
     ///
-    /// Atomic to keep this counter and the three siblings below
-    /// (`credit_granted_total`, `read_ns`, `decode_ns`) race-free with
-    /// the cursor mutation loop. The one-thread-at-a-time rule that
-    /// governs the rest of the Reader API is intentionally relaxed for
-    /// these four counters and `reset_timing`: their getters take
-    /// `&self`, touch only atomics, and may be invoked concurrently
-    /// from a monitoring thread while another thread is driving a
-    /// cursor. Every other accessor (`current_addr`, `server_info`,
-    /// `server_version`) reads non-atomic state and remains bound by
-    /// the one-thread-at-a-time contract — racing them with an
-    /// in-flight cursor is undefined behaviour. `Relaxed` is
-    /// sufficient: these are pure counters with no associated
-    /// happens-before requirement on other state.
-    bytes_received: AtomicU64,
-    /// Total bytes granted to the server via CREDIT (`0x15`) frames
-    /// since connect. Sums every per-batch auto-replenishment, every
-    /// `Cursor::add_credit` call, and the cancel-time wake nudge. Used
-    /// by tests to catch regressions where cancel keeps topping up the
-    /// budget while draining frames it intends to discard.
-    credit_granted_total: AtomicU64,
-    /// Diagnostic: nanoseconds spent in `transport.read_frame()` since
-    /// connect. Useful for splitting "wait on the socket" from "decode
-    /// CPU" in throughput benchmarks. Saturates at `u64::MAX`
-    /// (~584 years) to avoid wrap-around.
-    read_ns: AtomicU64,
-    /// Diagnostic: nanoseconds spent in `decode_frame()` since connect.
-    /// Saturates at `u64::MAX`.
-    decode_ns: AtomicU64,
+    /// The one-thread-at-a-time rule that governs the rest of the
+    /// Reader API is intentionally relaxed for these counters and
+    /// `reset_timing`: their getters take `&self`, touch only atomics,
+    /// and may be invoked concurrently from a monitoring thread while
+    /// another thread is driving a cursor. Every other accessor
+    /// (`current_addr`, `server_info`, `server_version`) reads
+    /// non-atomic state and remains bound by the one-thread-at-a-time
+    /// contract — racing them with an in-flight cursor is undefined
+    /// behaviour. `Relaxed` is sufficient: these are pure counters with
+    /// no associated happens-before requirement on other state.
+    stats: Arc<ReaderStats>,
     /// Reusable zstd decompressor + output buffer. Keeps a persistent
     /// `ZSTD_DCtx` across batches (so we don't pay context init per
     /// `RESULT_BATCH`) and a `Vec<u8>` whose allocation is reused as
@@ -252,10 +269,7 @@ impl Reader {
             next_request_id: 1,
             cursor_active: false,
             server_info: walk.session.server_info,
-            bytes_received: AtomicU64::new(0),
-            credit_granted_total: AtomicU64::new(0),
-            read_ns: AtomicU64::new(0),
-            decode_ns: AtomicU64::new(0),
+            stats: Arc::new(ReaderStats::default()),
             zstd_scratch: ZstdScratch::new(),
             tracker,
             failover_rng: FailoverRng::new(),
@@ -547,7 +561,7 @@ impl Reader {
     /// since this connection was opened. Useful for benchmarking the
     /// effective throughput a query produces.
     pub fn bytes_received(&self) -> u64 {
-        self.bytes_received.load(Ordering::Relaxed)
+        self.stats.bytes_received.load(Ordering::Relaxed)
     }
 
     /// Total bytes granted to the server via CREDIT (`0x15`) frames
@@ -556,25 +570,35 @@ impl Reader {
     /// that `Cursor::cancel()` doesn't continue topping up the server's
     /// budget while draining frames it's about to discard.
     pub fn credit_granted_total(&self) -> u64 {
-        self.credit_granted_total.load(Ordering::Relaxed)
+        self.stats.credit_granted_total.load(Ordering::Relaxed)
     }
 
     /// Diagnostic accumulator (nanoseconds): time spent in
     /// `transport.read_frame()`. Saturates at `u64::MAX` (~584 years).
     /// Reset to zero by [`Reader::reset_timing`].
     pub fn read_ns(&self) -> u64 {
-        self.read_ns.load(Ordering::Relaxed)
+        self.stats.read_ns.load(Ordering::Relaxed)
     }
     /// Diagnostic accumulator (nanoseconds): time spent in
     /// `decode_frame()`. Saturates at `u64::MAX`.
     /// Reset to zero by [`Reader::reset_timing`].
     pub fn decode_ns(&self) -> u64 {
-        self.decode_ns.load(Ordering::Relaxed)
+        self.stats.decode_ns.load(Ordering::Relaxed)
     }
     /// Reset both `read_ns` and `decode_ns` accumulators to zero.
     pub fn reset_timing(&self) {
-        self.read_ns.store(0, Ordering::Relaxed);
-        self.decode_ns.store(0, Ordering::Relaxed);
+        self.stats.read_ns.store(0, Ordering::Relaxed);
+        self.stats.decode_ns.store(0, Ordering::Relaxed);
+    }
+
+    /// Borrow the shared diagnostic counters. The FFI clones this at
+    /// `line_reader_from_conf` time so its stat getters can read the
+    /// counters without touching the `UnsafeCell<Reader>` that holds
+    /// this Reader — eliminating the aliasing question of "what
+    /// happens when a stat getter synthesises a `&Reader` while a
+    /// laundered `&mut Reader` is in flight."
+    pub fn stats(&self) -> &Arc<ReaderStats> {
+        &self.stats
     }
 
     /// `SERVER_INFO` (`0x18`) captured at connect time, when negotiated
@@ -1087,7 +1111,7 @@ impl<'r> Cursor<'r> {
     /// callers holding the cursor's mutable borrow on the reader can
     /// still observe the connection-level CREDIT-bytes counter.
     pub fn credit_granted_total(&self) -> u64 {
-        self.reader.credit_granted_total.load(Ordering::Relaxed)
+        self.reader.stats.credit_granted_total.load(Ordering::Relaxed)
     }
 
     /// Advance the cursor by one batch. Returns `Ok(None)` when the stream
@@ -1166,7 +1190,7 @@ impl<'r> Cursor<'r> {
             // Account for decode time on both arms — the error path is
             // rare and terminal, but skipping the sample makes the
             // metric subtly biased toward "successful decodes are slow."
-            self.reader.decode_ns.fetch_add(
+            self.reader.stats.decode_ns.fetch_add(
                 u64::try_from(t1.elapsed().as_nanos()).unwrap_or(u64::MAX),
                 Ordering::Relaxed,
             );
@@ -1324,12 +1348,13 @@ impl<'r> Cursor<'r> {
     ) -> Result<(crate::egress::wire::header::FrameHeader, bytes::Bytes)> {
         let t0 = std::time::Instant::now();
         let (header, payload) = self.reader.transport_mut()?.read_frame()?;
-        self.reader.read_ns.fetch_add(
+        self.reader.stats.read_ns.fetch_add(
             u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
         let wire_bytes = HEADER_LEN as u64 + header.payload_length as u64;
         self.reader
+            .stats
             .bytes_received
             .fetch_add(wire_bytes, Ordering::Relaxed);
         Ok((header, payload))
@@ -1648,6 +1673,7 @@ impl<'r> Cursor<'r> {
             .transport_mut()?
             .write_message(Bytes::from(payload))?;
         self.reader
+            .stats
             .credit_granted_total
             .fetch_add(additional_bytes, Ordering::Relaxed);
         Ok(())
@@ -2072,6 +2098,32 @@ fn map_server_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `ReaderStats` lives behind `Arc` so the FFI handle can clone it
+    /// once and read counters without touching the `UnsafeCell<Reader>`
+    /// that owns the Reader. This test pins the contract that writes
+    /// through one clone are observable through any other — the
+    /// premise the FFI relies on for `_bytes_received` / `_read_ns` /
+    /// etc. to return up-to-date values without crossing the cell.
+    #[test]
+    fn reader_stats_arc_clones_share_storage() {
+        let stats = Arc::new(ReaderStats::default());
+        let alias = Arc::clone(&stats);
+        stats.bytes_received.fetch_add(42, Ordering::Relaxed);
+        stats.credit_granted_total.fetch_add(7, Ordering::Relaxed);
+        stats.read_ns.fetch_add(1_000, Ordering::Relaxed);
+        stats.decode_ns.fetch_add(500, Ordering::Relaxed);
+        assert_eq!(alias.bytes_received.load(Ordering::Relaxed), 42);
+        assert_eq!(alias.credit_granted_total.load(Ordering::Relaxed), 7);
+        assert_eq!(alias.read_ns.load(Ordering::Relaxed), 1_000);
+        assert_eq!(alias.decode_ns.load(Ordering::Relaxed), 500);
+        // Reset via the inner Reader's API is visible through the
+        // FFI's clone too (the contract of `line_reader_reset_timing`).
+        alias.read_ns.store(0, Ordering::Relaxed);
+        alias.decode_ns.store(0, Ordering::Relaxed);
+        assert_eq!(stats.read_ns.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.decode_ns.load(Ordering::Relaxed), 0);
+    }
 
     /// Anchors `REQUEST_ID_OFFSET` to the actual `QueryRequest::encode`
     /// output. The failover-replay path in `Cursor::failover_reconnect_and_replay`

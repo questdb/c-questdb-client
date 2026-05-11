@@ -34,13 +34,14 @@ use std::mem::ManuallyDrop;
 use std::net::Ipv4Addr;
 use std::ptr;
 use std::slice;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use libc::{c_char, c_void, size_t};
 
 use questdb::egress::{
     BatchView, ColumnKind, ColumnView, Cursor, Error, ErrorCode, FailoverEvent, Reader,
-    ReaderQuery, ServerInfo, ServerRole, SimpleNullKind, Terminal, Validity,
+    ReaderQuery, ReaderStats, ServerInfo, ServerRole, SimpleNullKind, Terminal, Validity,
 };
 
 use crate::line_sender_utf8;
@@ -417,16 +418,23 @@ impl From<ColumnKind> for line_reader_column_kind {
 ///
 /// The `Reader` lives inside an `UnsafeCell` so that the lifetime-laundered
 /// `&mut Reader` held by an in-flight `ReaderQuery<'static>` / `Cursor<'static>`
-/// can coexist with shared reborrows synthesised by the read-only stat
-/// getters (`_bytes_received`, `_credit_granted_total`, `_read_ns`,
-/// `_decode_ns`, `_server_version`, `_current_server_info`,
+/// can coexist with shared reborrows synthesised by the non-counter
+/// stat/info getters (`_server_version`, `_current_server_info`,
 /// `_current_addr_*`). All references to the inner `Reader` are derived
-/// from `UnsafeCell::get()`, so under Stacked/Tree Borrows they receive
-/// the `SharedReadWrite` tag rather than `Unique` — making the temporary
-/// `&Reader` synthesised by a stat getter compatible with the laundered
-/// `&mut Reader` borrow inside the query/cursor. Without the cell, those
-/// two would alias the same memory and be instant aliasing UB regardless
-/// of the program being single-threaded.
+/// from `UnsafeCell::get()`, intentionally without ever creating a
+/// `&mut Reader` outside the FFI's own laundering path. The non-counter
+/// getters are still bound by the one-thread-at-a-time contract, so
+/// they cannot race with the laundered `&mut Reader` even in principle.
+///
+/// The counter getters (`_bytes_received`, `_credit_granted_total`,
+/// `_read_ns`, `_decode_ns`, `_reset_timing`) go through a separate
+/// `Arc<ReaderStats>` field, NOT through the cell. That decouples the
+/// counter accesses from the Reader's borrow stack — a monitoring
+/// thread reading the counters never touches the `UnsafeCell`, so the
+/// laundered `&mut Reader` inside an in-flight query/cursor is
+/// unaffected (no `&Reader` synthesised, no Stacked-Borrows pop). The
+/// `Arc` is cloned once at handle construction; both the FFI and the
+/// inner `Reader` hold strong references to the same counters.
 ///
 /// `active` still tracks whether a `line_reader_query` or `line_reader_cursor`
 /// has taken a laundered `&mut Reader` out of the cell. While `active` is
@@ -441,7 +449,12 @@ impl From<ColumnKind> for line_reader_column_kind {
 /// happens-before edge — sees a consistent view of the flag even on
 /// weakly-ordered targets. Access uses `Acquire`/`Release` so the flag's
 /// state pairs with the reader-mutating operation that flipped it.
-pub struct line_reader(UnsafeCell<Reader>, AtomicBool);
+///
+/// Field `.2` is a clone of the inner `Reader::stats()` `Arc`. Stat
+/// getters read from here and never touch `.0`, so a monitoring
+/// thread firing a stat getter while another thread is driving a
+/// cursor cannot disturb the cursor's laundered `&mut Reader`.
+pub struct line_reader(UnsafeCell<Reader>, AtomicBool, Arc<ReaderStats>);
 
 /// Construct a reader from a QuestDB config string.
 ///
@@ -469,9 +482,11 @@ pub unsafe extern "C" fn line_reader_from_conf(
         };
         let reader_result = Reader::from_conf(conf);
         let reader = reader_bubble!(err_out, reader_result, ptr::null_mut());
+        let stats = Arc::clone(reader.stats());
         Box::into_raw(Box::new(line_reader(
             UnsafeCell::new(reader),
             AtomicBool::new(false),
+            stats,
         )))
     }));
     match result {
@@ -517,9 +532,11 @@ pub unsafe extern "C" fn line_reader_from_env(
         };
         let reader_result = Reader::from_conf(&conf);
         let reader = reader_bubble!(err_out, reader_result, ptr::null_mut());
+        let stats = Arc::clone(reader.stats());
         Box::into_raw(Box::new(line_reader(
             UnsafeCell::new(reader),
             AtomicBool::new(false),
+            stats,
         )))
     }));
     match result {
@@ -594,7 +611,15 @@ pub unsafe extern "C" fn line_reader_bytes_received(reader: *const line_reader) 
         if reader.is_null() {
             return 0;
         }
-        (*(*reader).0.get()).bytes_received()
+        // Project to the `Arc<ReaderStats>` field via `addr_of!` so we
+        // never synthesise an intermediate `&line_reader` reborrow —
+        // doing so would cover the `UnsafeCell<Reader>` field and
+        // disturb the laundered `&mut Reader` held by any in-flight
+        // `ReaderQuery` / `Cursor` under Stacked Borrows. The explicit
+        // `&Arc<ReaderStats>` borrow below covers only the Arc field,
+        // which lives at a distinct offset and is unrelated to the cell.
+        let stats: &Arc<ReaderStats> = &*std::ptr::addr_of!((*reader).2);
+        stats.bytes_received.load(Ordering::Relaxed)
     }
 }
 
@@ -606,7 +631,8 @@ pub unsafe extern "C" fn line_reader_credit_granted_total(reader: *const line_re
         if reader.is_null() {
             return 0;
         }
-        (*(*reader).0.get()).credit_granted_total()
+        let stats: &Arc<ReaderStats> = &*std::ptr::addr_of!((*reader).2);
+        stats.credit_granted_total.load(Ordering::Relaxed)
     }
 }
 
@@ -618,7 +644,8 @@ pub unsafe extern "C" fn line_reader_read_ns(reader: *const line_reader) -> u64 
         if reader.is_null() {
             return 0;
         }
-        (*(*reader).0.get()).read_ns()
+        let stats: &Arc<ReaderStats> = &*std::ptr::addr_of!((*reader).2);
+        stats.read_ns.load(Ordering::Relaxed)
     }
 }
 
@@ -630,7 +657,8 @@ pub unsafe extern "C" fn line_reader_decode_ns(reader: *const line_reader) -> u6
         if reader.is_null() {
             return 0;
         }
-        (*(*reader).0.get()).decode_ns()
+        let stats: &Arc<ReaderStats> = &*std::ptr::addr_of!((*reader).2);
+        stats.decode_ns.load(Ordering::Relaxed)
     }
 }
 
@@ -642,7 +670,9 @@ pub unsafe extern "C" fn line_reader_reset_timing(reader: *mut line_reader) {
         if reader.is_null() {
             return;
         }
-        (*(*reader).0.get()).reset_timing()
+        let stats: &Arc<ReaderStats> = &*std::ptr::addr_of!((*reader).2);
+        stats.read_ns.store(0, Ordering::Relaxed);
+        stats.decode_ns.store(0, Ordering::Relaxed);
     }
 }
 
