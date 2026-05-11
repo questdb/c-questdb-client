@@ -133,11 +133,44 @@ class ProtocolVersion(Enum):
         return self.value[0].value == other.value[0].value
 
 
+class QwpWsErrorCategory(Enum):
+    SCHEMA_MISMATCH = 0
+    PARSE_ERROR = 1
+    INTERNAL_ERROR = 2
+    SECURITY_ERROR = 3
+    WRITE_ERROR = 4
+    PROTOCOL_VIOLATION = 5
+    UNKNOWN = 6
+
+    @classmethod
+    def from_int(cls, value: int):
+        for member in cls:
+            if member.value == value:
+                return member
+        return cls.UNKNOWN
+
+
+class QwpWsErrorPolicy(Enum):
+    DROP_AND_CONTINUE = 0
+    HALT = 1
+
+    @classmethod
+    def from_int(cls, value: int):
+        for member in cls:
+            if member.value == value:
+                return member
+        return cls.HALT
+
+
 class c_line_sender_opts(ctypes.Structure):
     pass
 
 
 class c_line_sender_error(ctypes.Structure):
+    pass
+
+
+class c_line_sender_qwpws_error(ctypes.Structure):
     pass
 
 
@@ -148,6 +181,8 @@ c_line_sender_buffer_p = ctypes.POINTER(c_line_sender_buffer)
 c_line_sender_opts_p = ctypes.POINTER(c_line_sender_opts)
 c_line_sender_error_p = ctypes.POINTER(c_line_sender_error)
 c_line_sender_error_p_p = ctypes.POINTER(c_line_sender_error_p)
+c_line_sender_qwpws_error_p = ctypes.POINTER(c_line_sender_qwpws_error)
+c_line_sender_qwpws_error_p_p = ctypes.POINTER(c_line_sender_qwpws_error_p)
 c_uint8_p = ctypes.POINTER(c_uint8)
 c_double_p = ctypes.POINTER(c_double)
 
@@ -168,6 +203,24 @@ class c_line_sender_table_name(ctypes.Structure):
 class line_sender_buffer_view(ctypes.Structure):
     _fields_ = [("len", c_size_t),
                 ("buf", c_uint8_p)]
+
+
+class line_sender_qwpws_fsn(ctypes.Structure):
+    _fields_ = [("has_value", c_bool),
+                ("value", c_uint64)]
+
+
+class line_sender_qwpws_error_view(ctypes.Structure):
+    _fields_ = [("category", c_int),
+                ("applied_policy", c_int),
+                ("has_status", c_bool),
+                ("status", c_uint8),
+                ("has_message_sequence", c_bool),
+                ("message_sequence", c_uint64),
+                ("from_fsn", c_uint64),
+                ("to_fsn", c_uint64),
+                ("message", c_void_p),
+                ("message_len", c_size_t)]
 
 
 c_line_sender_table_name_p = ctypes.POINTER(c_line_sender_table_name)
@@ -562,6 +615,58 @@ def _setup_cdll():
         c_size_t,
         c_line_sender_p)
     set_sig(
+        dll.line_sender_qwpws_flush_and_get_fsn,
+        c_bool,
+        c_line_sender_p,
+        c_line_sender_buffer_p,
+        ctypes.POINTER(line_sender_qwpws_fsn),
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_qwpws_published_fsn,
+        c_bool,
+        c_line_sender_p,
+        ctypes.POINTER(line_sender_qwpws_fsn),
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_qwpws_acked_fsn,
+        c_bool,
+        c_line_sender_p,
+        ctypes.POINTER(line_sender_qwpws_fsn),
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_qwpws_await_acked_fsn,
+        c_bool,
+        c_line_sender_p,
+        c_uint64,
+        c_uint64,
+        ctypes.POINTER(c_bool),
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_qwpws_poll_error,
+        c_bool,
+        c_line_sender_p,
+        c_line_sender_qwpws_error_p_p,
+        c_line_sender_error_p_p)
+    set_sig(
+        dll.line_sender_qwpws_error_get_view,
+        line_sender_qwpws_error_view,
+        c_line_sender_qwpws_error_p)
+    set_sig(
+        dll.line_sender_error_qwpws_get_view,
+        c_bool,
+        c_line_sender_error_p,
+        ctypes.POINTER(line_sender_qwpws_error_view))
+    set_sig(
+        dll.line_sender_qwpws_error_free,
+        None,
+        c_line_sender_qwpws_error_p)
+    set_sig(
+        dll.line_sender_qwpws_errors_dropped,
+        c_bool,
+        c_line_sender_p,
+        ctypes.POINTER(c_uint64),
+        c_line_sender_error_p_p)
+    set_sig(
         dll.line_sender_qwpws_close_drain,
         c_bool,
         c_line_sender_p,
@@ -578,9 +683,66 @@ _PY_DLL.PyBytes_FromStringAndSize.restype = ctypes.py_object
 _PY_DLL.PyBytes_FromStringAndSize.argtypes = [ctypes.c_char_p, ctypes.c_ssize_t]
 
 
+class QwpWsError:
+    def __init__(
+            self,
+            category: QwpWsErrorCategory,
+            applied_policy: QwpWsErrorPolicy,
+            status: Optional[int],
+            message_sequence: Optional[int],
+            from_fsn: int,
+            to_fsn: int,
+            message: str):
+        self.category = category
+        self.applied_policy = applied_policy
+        self.status = status
+        self.message_sequence = message_sequence
+        self.from_fsn = from_fsn
+        self.to_fsn = to_fsn
+        self.message = message
+
+    def __repr__(self):
+        return (
+            'QwpWsError('
+            f'category={self.category}, '
+            f'applied_policy={self.applied_policy}, '
+            f'status={self.status}, '
+            f'message_sequence={self.message_sequence}, '
+            f'from_fsn={self.from_fsn}, '
+            f'to_fsn={self.to_fsn}, '
+            f'message={self.message!r})')
+
+
 class SenderError(Exception):
     """An error whilst using the line sender."""
-    pass
+    def __init__(self, message: str, qwp_ws_error: Optional[QwpWsError] = None):
+        super().__init__(message)
+        self.qwp_ws_error = qwp_ws_error
+
+
+def _qwpws_error_view_to_py(view):
+    if view.message and view.message_len:
+        message = _PY_DLL.PyUnicode_FromKindAndData(
+            1,  # PyUnicode_1BYTE_KIND
+            c_void_p(view.message),
+            c_ssize_t(view.message_len))
+    else:
+        message = ''
+    return QwpWsError(
+        QwpWsErrorCategory.from_int(view.category),
+        QwpWsErrorPolicy.from_int(view.applied_policy),
+        view.status if view.has_status else None,
+        view.message_sequence if view.has_message_sequence else None,
+        view.from_fsn,
+        view.to_fsn,
+        message)
+
+
+def _qwpws_error_from_sender_error(err_p):
+    view = line_sender_qwpws_error_view()
+    if _DLL.line_sender_error_qwpws_get_view(err_p, ctypes.byref(view)):
+        return _qwpws_error_view_to_py(view)
+    return None
 
 
 def _c_err_to_py(err_p):
@@ -591,7 +753,7 @@ def _c_err_to_py(err_p):
             1,  # PyUnicode_1BYTE_KIND
             msg_p,
             c_ssize_t(c_len.value))
-        return SenderError(py_msg)
+        return SenderError(py_msg, _qwpws_error_from_sender_error(err_p))
     finally:
         _DLL.line_sender_error_free(err_p)
 
@@ -1087,6 +1249,76 @@ class Sender:
             if buffer is self._buffer:
                 self._buffer.clear()
             raise
+
+    def flush_and_get_fsn(self, buffer: Optional[Buffer] = None) -> Optional[int]:
+        buffer = buffer or self._buffer
+        self._check_connected()
+        fsn = line_sender_qwpws_fsn()
+        _error_wrapped_call(
+            _DLL.line_sender_qwpws_flush_and_get_fsn,
+            self._impl,
+            buffer._impl,
+            ctypes.byref(fsn))
+        if fsn.has_value:
+            return fsn.value
+        return None
+
+    def published_fsn(self) -> Optional[int]:
+        self._check_connected()
+        fsn = line_sender_qwpws_fsn()
+        _error_wrapped_call(
+            _DLL.line_sender_qwpws_published_fsn,
+            self._impl,
+            ctypes.byref(fsn))
+        if fsn.has_value:
+            return fsn.value
+        return None
+
+    def acked_fsn(self) -> Optional[int]:
+        self._check_connected()
+        fsn = line_sender_qwpws_fsn()
+        _error_wrapped_call(
+            _DLL.line_sender_qwpws_acked_fsn,
+            self._impl,
+            ctypes.byref(fsn))
+        if fsn.has_value:
+            return fsn.value
+        return None
+
+    def await_acked_fsn(self, fsn: int, timeout_millis: int) -> bool:
+        self._check_connected()
+        reached = c_bool(False)
+        _error_wrapped_call(
+            _DLL.line_sender_qwpws_await_acked_fsn,
+            self._impl,
+            c_uint64(fsn),
+            c_uint64(timeout_millis),
+            ctypes.byref(reached))
+        return bool(reached.value)
+
+    def poll_qwp_ws_error(self) -> Optional[QwpWsError]:
+        self._check_connected()
+        qwp_error = c_line_sender_qwpws_error_p()
+        _error_wrapped_call(
+            _DLL.line_sender_qwpws_poll_error,
+            self._impl,
+            ctypes.byref(qwp_error))
+        if not qwp_error:
+            return None
+        try:
+            view = _DLL.line_sender_qwpws_error_get_view(qwp_error)
+            return _qwpws_error_view_to_py(view)
+        finally:
+            _DLL.line_sender_qwpws_error_free(qwp_error)
+
+    def qwp_ws_errors_dropped(self) -> int:
+        self._check_connected()
+        dropped = c_uint64(0)
+        _error_wrapped_call(
+            _DLL.line_sender_qwpws_errors_dropped,
+            self._impl,
+            ctypes.byref(dropped))
+        return dropped.value
 
     def close(self, flush=True):
         if self._impl and not _DLL.line_sender_must_close(self._impl) and flush:

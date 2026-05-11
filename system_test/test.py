@@ -63,7 +63,9 @@ QWP_WS_SMOKE_TLS = False
 
 SUITE_MATRIX = 'matrix'
 SUITE_QWP_WS_SMOKE = 'qwp_ws_smoke'
+SUITE_QWP_WS_PROTOCOL = 'qwp_ws_protocol'
 SUITE_QWP_WS_RESTART = 'qwp_ws_restart'
+QWP_WS_STATUS_SCHEMA_MISMATCH = 0x03
 
 # The first QuestDB version that supports array types.
 FIRST_ARRAYS_RELEASE = (8, 3, 3)
@@ -109,6 +111,8 @@ def _suite_kind(test):
     class_name = test.__class__.__name__
     if class_name == 'TestQwpWsSender':
         return SUITE_QWP_WS_SMOKE
+    if class_name == 'TestQwpWsProtocol':
+        return SUITE_QWP_WS_PROTOCOL
     if class_name == 'TestQwpWsRestart':
         return SUITE_QWP_WS_RESTART
     return SUITE_MATRIX
@@ -1552,6 +1556,31 @@ class QwpWsTestSupport:
             f'Timed out waiting for aggregates from {query!r}; '
             f'last_resp={last_resp!r}; last_error={last_error!r}')
 
+    def _retry_query_rows(self, query, expected_rows, timeout_sec=30):
+        deadline = time.monotonic() + timeout_sec
+        last_resp = None
+        last_error = None
+        while time.monotonic() < deadline:
+            try:
+                last_resp = sql_query(query)
+                if len(last_resp.get('dataset') or []) >= expected_rows:
+                    return last_resp
+            except Exception as e:
+                last_error = e
+            time.sleep(0.05)
+        self.fail(
+            f'Timed out waiting for {expected_rows} rows from {query!r}; '
+            f'last_resp={last_resp!r}; last_error={last_error!r}')
+
+    def _retry_poll_qwp_ws_error(self, sender, timeout_sec=10):
+        deadline = time.monotonic() + timeout_sec
+        while time.monotonic() < deadline:
+            error = sender.poll_qwp_ws_error()
+            if error is not None:
+                return error
+            time.sleep(0.05)
+        self.fail('Timed out waiting for QWP/WebSocket diagnostic')
+
 
 class TestQwpWsSender(QwpWsTestSupport, unittest.TestCase):
     ROWS = 3
@@ -1651,6 +1680,157 @@ class TestQwpWsSender(QwpWsTestSupport, unittest.TestCase):
             expected_distinct_id=self.ROWS,
             expected_min_id=0,
             expected_max_id=self.ROWS - 1)
+
+
+class TestQwpWsProtocol(QwpWsTestSupport, unittest.TestCase):
+    def setUp(self):
+        self._require_protocol_fixture()
+        test_name = self.id()
+        QDB_FIXTURE.http_sql_query(
+            f'select * from long_sequence(1) -- >>>>>>>>> BEGIN PYTHON UNIT TEST: {test_name}')
+
+    def tearDown(self):
+        if isinstance(QDB_FIXTURE, QuestDbFixture) and QDB_FIXTURE._proc:
+            test_name = self.id()
+            QDB_FIXTURE.http_sql_query(
+                f'select * from long_sequence(1) -- <<<<<<<<< END PYTHON UNIT TEST: {test_name}')
+
+    def _require_protocol_fixture(self):
+        self._require_qwp_ws_protocol()
+        if not isinstance(QDB_FIXTURE, QuestDbFixture):
+            self.skipTest('QWP/WebSocket protocol tests require a managed QuestDB fixture')
+        if QDB_FIXTURE.auth:
+            self.skipTest('QWP/WebSocket protocol tests run without line TCP auth')
+        if getattr(QDB_FIXTURE, 'http_auth', False):
+            self.skipTest('QWP/WebSocket protocol tests run without HTTP auth')
+        if QDB_FIXTURE.http:
+            self.skipTest('QWP/WebSocket protocol tests run outside the HTTP ILP matrix')
+
+    def _connect_protocol_sender(self, sender_id, sf_dir, **settings):
+        conf_settings = {
+            'reconnect_max_duration_millis': 30000,
+            'close_flush_timeout_millis': 30000,
+        }
+        conf_settings.update(settings)
+        return self._connect_sender(self._sender_conf(
+            sender_id,
+            sf_dir,
+            **conf_settings))
+
+    def test_schema_evolution_across_batches(self):
+        table_name = 'qwp_ws_schema_' + uuid.uuid4().hex[:8]
+        sender_id = 'proto-schema-' + uuid.uuid4().hex[:8]
+
+        with tempfile.TemporaryDirectory(prefix='qwp-ws-schema-') as sf_dir:
+            sender = self._connect_protocol_sender(sender_id, sf_dir)
+            try:
+                (sender
+                 .table(table_name)
+                 .symbol('host', 'r1')
+                 .at_micros(self.BASE_TS_US))
+                first_fsn = sender.flush_and_get_fsn()
+                self.assertEqual(first_fsn, 0)
+
+                (sender
+                 .table(table_name)
+                 .symbol('host', 'r2')
+                 .column('qty', 2)
+                 .column('note', 'two')
+                 .at_micros(self.BASE_TS_US + self.TS_STEP_US))
+                second_fsn = sender.flush_and_get_fsn()
+                self.assertEqual(second_fsn, 1)
+
+                (sender
+                 .table(table_name)
+                 .symbol('host', 'r3')
+                 .column('note', 'three')
+                 .at_micros(self.BASE_TS_US + 2 * self.TS_STEP_US))
+                third_fsn = sender.flush_and_get_fsn()
+                self.assertEqual(third_fsn, 2)
+
+                self.assertTrue(sender.await_acked_fsn(third_fsn, 30000))
+                sender.close_drain()
+            finally:
+                sender.close(False)
+
+            self.assertEqual(
+                self._sfa_file_count(sf_dir, sender_id),
+                0,
+                'close-drained QWP/WebSocket schema sender left SFA frame files behind')
+
+        resp = self._retry_query_rows(
+            f"select host, qty, note from '{table_name}' order by host",
+            3,
+            timeout_sec=30)
+        self.assertEqual(
+            resp['dataset'],
+            [
+                ['r1', None, None],
+                ['r2', 2, 'two'],
+                ['r3', None, 'three'],
+            ])
+
+    def test_schema_rejection_drops_and_sender_continues(self):
+        table_name = 'qwp_ws_reject_' + uuid.uuid4().hex[:8]
+        sql_query(
+            f'CREATE TABLE "{table_name}" '
+            '(id LONG, px DOUBLE, bad LONG, ts TIMESTAMP) '
+            'TIMESTAMP(ts) PARTITION BY DAY WAL')
+        sender_id = 'proto-reject-' + uuid.uuid4().hex[:8]
+
+        with tempfile.TemporaryDirectory(prefix='qwp-ws-reject-') as sf_dir:
+            sender = self._connect_protocol_sender(sender_id, sf_dir)
+            try:
+                (sender
+                 .table(table_name)
+                 .column('id', 0)
+                 .column('px', 10.5)
+                 .at_micros(self.BASE_TS_US))
+                first_fsn = sender.flush_and_get_fsn()
+
+                (sender
+                 .table(table_name)
+                 .column('id', 1)
+                 .column('bad', 'not-a-long')
+                 .at_micros(self.BASE_TS_US + self.TS_STEP_US))
+                rejected_fsn = sender.flush_and_get_fsn()
+
+                (sender
+                 .table(table_name)
+                 .column('id', 2)
+                 .column('px', 20.5)
+                 .at_micros(self.BASE_TS_US + 2 * self.TS_STEP_US))
+                final_fsn = sender.flush_and_get_fsn()
+
+                self.assertEqual((first_fsn, rejected_fsn, final_fsn), (0, 1, 2))
+                self.assertTrue(sender.await_acked_fsn(final_fsn, 30000))
+                diagnostic = self._retry_poll_qwp_ws_error(sender)
+                self.assertEqual(diagnostic.category, qls.QwpWsErrorCategory.SCHEMA_MISMATCH)
+                self.assertEqual(diagnostic.applied_policy, qls.QwpWsErrorPolicy.DROP_AND_CONTINUE)
+                self.assertEqual(diagnostic.status, QWP_WS_STATUS_SCHEMA_MISMATCH)
+                self.assertEqual(diagnostic.from_fsn, rejected_fsn)
+                self.assertEqual(diagnostic.to_fsn, rejected_fsn)
+                self.assertIsNone(sender.poll_qwp_ws_error())
+                self.assertEqual(sender.qwp_ws_errors_dropped(), 0)
+                sender.close_drain()
+            finally:
+                sender.close(False)
+
+            self.assertEqual(
+                self._sfa_file_count(sf_dir, sender_id),
+                0,
+                'close-drained rejection sender left SFA frame files behind')
+
+        resp = self._retry_query_rows(
+            f"select id, px from '{table_name}' order by id",
+            2,
+            timeout_sec=30)
+        self.assertEqual(
+            resp['dataset'],
+            [
+                [0, 10.5],
+                [2, 20.5],
+            ])
 
 
 class TestQwpWsRestart(QwpWsTestSupport, unittest.TestCase):
@@ -3002,6 +3182,7 @@ def run_with_fixtures(args):
     latest_protocol = sorted(list(qls.ProtocolVersion))[-1]
     run_matrix_suite = _select_tests(SUITE_MATRIX).countTestCases() > 0
     run_qwp_ws_smoke_suite = _select_tests(SUITE_QWP_WS_SMOKE).countTestCases() > 0
+    run_qwp_ws_protocol_suite = _select_tests(SUITE_QWP_WS_PROTOCOL).countTestCases() > 0
     run_qwp_ws_restart_suite = _select_tests(SUITE_QWP_WS_RESTART).countTestCases() > 0
 
     for questdb_dir in iter_versions(args):
@@ -3080,6 +3261,24 @@ def run_with_fixtures(args):
                             QWP_WS_SMOKE_TLS = False
                 finally:
                     QDB_FIXTURE.stop()
+
+        if run_qwp_ws_protocol_suite:
+            QDB_FIXTURE = QuestDbFixture(
+                questdb_dir,
+                auth=False,
+                qwp_udp=False)
+            TLS_PROXY_FIXTURE = None
+            try:
+                sys.stderr.write(f'>>>> STARTING {questdb_dir} [qwp_ws_protocol] <<<<\n')
+                QDB_FIXTURE.start()
+                BUILD_MODE = qls.BuildMode.CONF
+                QDB_FIXTURE.http = False
+                QDB_FIXTURE.protocol_version = latest_protocol
+                QDB_FIXTURE.drop_all_tables()
+                if not _run_selected_tests(SUITE_QWP_WS_PROTOCOL):
+                    sys.exit(1)
+            finally:
+                QDB_FIXTURE.stop()
 
         if run_qwp_ws_restart_suite:
             QDB_FIXTURE = QuestDbFixture(
