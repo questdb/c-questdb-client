@@ -104,11 +104,64 @@ pub enum ErrorCode {
     Cancelled,
 }
 
+/// Upgrade-time topology rejection carried alongside an `Error`.
+///
+/// Populated when the server rejects the WebSocket upgrade with HTTP `421`
+/// plus an `X-QuestDB-Role` header (per failover.md §5), or when a v2
+/// `SERVER_INFO` advertises a role that does not match the configured
+/// `target=` filter. The host-health tracker (when present) reads this to
+/// decide whether the host is in `TransientReject` (`PRIMARY_CATCHUP`) or
+/// `TopologyReject` (every other role byte) and to update zone tier from
+/// the optional `X-QuestDB-Zone` / `SERVER_INFO.zone_id`.
+///
+/// `role_byte` is the raw `SERVER_INFO.role` byte from wire-egress.md §11.8
+/// (`0x00`=STANDALONE, `0x01`=PRIMARY, `0x02`=REPLICA, `0x03`=PRIMARY_CATCHUP);
+/// unrecognised values are carried through verbatim so a future role
+/// addition is observable to operators even on an older client build.
+/// `role_name` is the ASCII token actually seen on the wire (uppercased for
+/// the four named roles; the literal header value when the byte is unknown);
+/// it is kept so diagnostics surface what the server *said*, not what the
+/// client decided to call it. `zone` is `Some` only when the server
+/// advertised one (via `SERVER_INFO.zone_id` gated on `CAP_ZONE`, or the
+/// `X-QuestDB-Zone` upgrade header).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpgradeReject {
+    pub role_byte: u8,
+    pub role_name: String,
+    pub zone: Option<String>,
+}
+
+impl UpgradeReject {
+    pub fn new(role_byte: u8, role_name: impl Into<String>, zone: Option<String>) -> Self {
+        Self {
+            role_byte,
+            role_name: role_name.into(),
+            zone,
+        }
+    }
+
+    /// True when the server-advertised role is `PRIMARY_CATCHUP` —
+    /// a transient state (promotion in flight) that the tracker should
+    /// classify as recoverable. Every other role byte is topological
+    /// (won't recover without operator intervention or topology change).
+    /// Per failover.md §6: any non-empty `X-QuestDB-Role` value other
+    /// than `PRIMARY_CATCHUP` is conservatively treated as topological,
+    /// including unrecognised tokens.
+    pub fn is_transient(&self) -> bool {
+        self.role_byte == 0x03
+            || self.role_name.eq_ignore_ascii_case("PRIMARY_CATCHUP")
+    }
+}
+
 /// Egress error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error {
     code: ErrorCode,
     msg: String,
+    /// Set only for upgrade-time role rejections (HTTP `421 +
+    /// X-QuestDB-Role`) and target-filter mismatches against
+    /// `SERVER_INFO`. `None` for every other error.
+    upgrade_reject: Option<UpgradeReject>,
 }
 
 impl Error {
@@ -116,7 +169,17 @@ impl Error {
         Error {
             code,
             msg: msg.into(),
+            upgrade_reject: None,
         }
+    }
+
+    /// Builder: attach `UpgradeReject` to a freshly-constructed error.
+    /// Used by the upgrade-reject and target-mismatch sites so the
+    /// host-health tracker can later read the role + zone without
+    /// re-parsing the HTTP response.
+    pub fn with_upgrade_reject(mut self, reject: UpgradeReject) -> Error {
+        self.upgrade_reject = Some(reject);
+        self
     }
 
     pub fn code(&self) -> ErrorCode {
@@ -125,6 +188,14 @@ impl Error {
 
     pub fn msg(&self) -> &str {
         &self.msg
+    }
+
+    /// Server-advertised role + zone carried alongside this error. `Some`
+    /// when the error originated from an HTTP `421 + X-QuestDB-Role`
+    /// upgrade reject or a `SERVER_INFO` role / `target=` filter mismatch;
+    /// `None` for all other failure paths.
+    pub fn upgrade_reject(&self) -> Option<&UpgradeReject> {
+        self.upgrade_reject.as_ref()
     }
 }
 
@@ -165,5 +236,42 @@ mod tests {
     fn display_matches_msg() {
         let err = Error::new(ErrorCode::SocketError, "boom");
         assert_eq!(format!("{}", err), "boom");
+    }
+
+    #[test]
+    fn upgrade_reject_round_trips() {
+        let r = UpgradeReject::new(0x03, "PRIMARY_CATCHUP", Some("eu-west-1a".into()));
+        let err = Error::new(ErrorCode::RoleMismatch, "rejected").with_upgrade_reject(r.clone());
+        assert_eq!(err.code(), ErrorCode::RoleMismatch);
+        assert_eq!(err.upgrade_reject(), Some(&r));
+        assert!(r.is_transient());
+    }
+
+    #[test]
+    fn upgrade_reject_default_is_none() {
+        let err = Error::new(ErrorCode::SocketError, "x");
+        assert!(err.upgrade_reject().is_none());
+    }
+
+    #[test]
+    fn upgrade_reject_topological_for_non_catchup_roles() {
+        // STANDALONE / PRIMARY / REPLICA / unknown all classify as
+        // topological (won't recover without topology change). The header
+        // parser matches PRIMARY_CATCHUP case-insensitively per spec §5.
+        for (byte, name) in [
+            (0x00, "STANDALONE"),
+            (0x01, "PRIMARY"),
+            (0x02, "REPLICA"),
+            (0x99, "FUTURE_ROLE"),
+        ] {
+            let r = UpgradeReject::new(byte, name, None);
+            assert!(!r.is_transient(), "role {} should be topological", name);
+        }
+    }
+
+    #[test]
+    fn upgrade_reject_is_transient_case_insensitive() {
+        let r = UpgradeReject::new(0x99, "primary_catchup", None);
+        assert!(r.is_transient(), "case-insensitive match per spec §5");
     }
 }

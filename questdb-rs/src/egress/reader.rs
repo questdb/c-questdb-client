@@ -50,7 +50,7 @@ use crate::egress::binds::{Bind, SimpleNullKind};
 use crate::egress::column::ColumnView;
 use crate::egress::config::{Endpoint, ReaderConfig, Target};
 use crate::egress::decoder::DecodedBatch;
-use crate::egress::error::{Error, ErrorCode, Result, fmt};
+use crate::egress::error::{Error, ErrorCode, Result, UpgradeReject, fmt};
 use crate::egress::query_request::{QueryRequest, QueryRequestBuilder};
 use crate::egress::schema::{Schema, SchemaRegistry};
 use crate::egress::decoder::ZstdScratch;
@@ -302,6 +302,12 @@ impl Reader {
         if !matches!(cfg.target, Target::Any) {
             match reader.server_info.as_ref() {
                 None => {
+                    // v1 negotiated; per failover.md §5 every host's zone
+                    // tier stays `Unknown` and `target=primary|replica`
+                    // produces `TopologyReject`. Surface a plain
+                    // `RoleMismatch` without `UpgradeReject` — there's no
+                    // wire role to attach, and the tracker treats the
+                    // absence as v1-pinned-topological.
                     return Err(fmt!(
                         RoleMismatch,
                         "endpoint {} negotiated v1 and cannot supply a role for target={:?}",
@@ -310,14 +316,27 @@ impl Reader {
                     ));
                 }
                 Some(info) if !target_matches(cfg.target, info.role) => {
-                    return Err(fmt!(
-                        RoleMismatch,
-                        "endpoint {} role={:?} cluster={:?} does not match target={:?}",
-                        idx,
-                        info.role,
-                        info.cluster_id,
-                        cfg.target
-                    ));
+                    // v2 advertised a role that doesn't match `target=`.
+                    // Attach `UpgradeReject` carrying the advertised role
+                    // and zone so the future host-health tracker can
+                    // classify identically to a 421+role response — same
+                    // semantics, same data payload, regardless of which
+                    // surface the rejection arrived on.
+                    let role = info.role;
+                    let role_name = role.as_str();
+                    let reject = UpgradeReject::new(
+                        role.as_u8(),
+                        role_name.clone(),
+                        info.zone_id.clone(),
+                    );
+                    return Err(Error::new(
+                        ErrorCode::RoleMismatch,
+                        format!(
+                            "endpoint {} role={} cluster={:?} does not match target={:?}",
+                            idx, role_name, info.cluster_id, cfg.target,
+                        ),
+                    )
+                    .with_upgrade_reject(reject));
                 }
                 _ => {}
             }

@@ -32,6 +32,7 @@ use crate::egress::schema::SchemaRegistry;
 use crate::egress::symbol_dict::SymbolDict;
 use crate::egress::wire::ByteReader;
 use crate::egress::wire::cache_reset::{resets_dict, resets_schemas};
+use crate::egress::wire::capabilities::has_zone;
 use crate::egress::wire::header::FrameHeader;
 use crate::egress::wire::msg_kind::{MsgKind, StatusCode};
 use bytes::Bytes;
@@ -66,6 +67,32 @@ impl ServerRole {
             other => ServerRole::Other(other),
         }
     }
+
+    /// ASCII token used on the wire (matches `X-QuestDB-Role` header
+    /// values and the spec's role enum names). Forward-compat
+    /// `Other(_)` is rendered as `UNKNOWN(<byte>)` so the byte is still
+    /// recoverable from a log line.
+    pub fn as_str(self) -> String {
+        match self {
+            ServerRole::Standalone => "STANDALONE".to_string(),
+            ServerRole::Primary => "PRIMARY".to_string(),
+            ServerRole::Replica => "REPLICA".to_string(),
+            ServerRole::PrimaryCatchup => "PRIMARY_CATCHUP".to_string(),
+            ServerRole::Other(b) => format!("UNKNOWN({})", b),
+        }
+    }
+
+    /// Raw wire byte. `from_u8(self.as_u8()) == self` for every variant
+    /// (round-trip-safe, including `Other(_)`).
+    pub fn as_u8(self) -> u8 {
+        match self {
+            ServerRole::Standalone => 0x00,
+            ServerRole::Primary => 0x01,
+            ServerRole::Replica => 0x02,
+            ServerRole::PrimaryCatchup => 0x03,
+            ServerRole::Other(b) => b,
+        }
+    }
 }
 
 /// Body of a `SERVER_INFO` frame.
@@ -77,6 +104,12 @@ pub struct ServerInfo {
     pub server_wall_ns: i64,
     pub cluster_id: String,
     pub node_id: String,
+    /// Optional zone identifier, present iff the server set `CAP_ZONE` in
+    /// `capabilities`. Free-form, opaque, case-insensitively compared to
+    /// the client's `zone=` connect-string knob (failover.md §2). `None`
+    /// on every server that does not advertise `CAP_ZONE` — including
+    /// v2.0 servers whose `capabilities` is hard-zero.
+    pub zone_id: Option<String>,
 }
 
 /// Single decoded server message.
@@ -263,6 +296,19 @@ fn decode_server_info(payload: &[u8]) -> Result<ServerEvent> {
     let server_wall_ns = r.read_i64_le()?;
     let cluster_id = read_u16_string(&mut r, "cluster_id")?;
     let node_id = read_u16_string(&mut r, "node_id")?;
+    // `zone_id` is the only currently-defined trailing field, gated on
+    // CAP_ZONE (wire-egress.md §11.8). A v2.0 server with capabilities=0
+    // never enters this branch and the byte layout matches the original
+    // v2.0 spec. Future trailing fields will key off their own capability
+    // bits the same way; unknown bits are silently ignored so a v2.0
+    // client reading a v2.1+ server tolerates new fields it doesn't know
+    // how to parse — those bytes get caught by `expect_eof` below until
+    // this client learns to consume them.
+    let zone_id = if has_zone(capabilities) {
+        Some(read_u16_string(&mut r, "zone_id")?)
+    } else {
+        None
+    };
     expect_eof(&r, "SERVER_INFO")?;
     Ok(ServerEvent::ServerInfo(ServerInfo {
         role,
@@ -271,6 +317,7 @@ fn decode_server_info(payload: &[u8]) -> Result<ServerEvent> {
         server_wall_ns,
         cluster_id,
         node_id,
+        zone_id,
     }))
 }
 
@@ -520,15 +567,31 @@ mod tests {
     // --- SERVER_INFO --------------------------------------------------------
 
     fn build_server_info(role: u8, cluster: &str, node: &str) -> Bytes {
+        build_server_info_with(role, 0, cluster, node, None)
+    }
+
+    /// Like `build_server_info` but parameterised over `capabilities` and
+    /// the optional trailing `zone_id`. Used to drive the CAP_ZONE path.
+    fn build_server_info_with(
+        role: u8,
+        capabilities: u32,
+        cluster: &str,
+        node: &str,
+        zone: Option<&str>,
+    ) -> Bytes {
         let mut p = vec![MsgKind::ServerInfo.as_u8()];
         p.push(role);
         p.extend_from_slice(&7u64.to_le_bytes()); // epoch
-        p.extend_from_slice(&0u32.to_le_bytes()); // capabilities
+        p.extend_from_slice(&capabilities.to_le_bytes());
         p.extend_from_slice(&123_456_789i64.to_le_bytes()); // server_wall_ns
         p.extend_from_slice(&(cluster.len() as u16).to_le_bytes());
         p.extend_from_slice(cluster.as_bytes());
         p.extend_from_slice(&(node.len() as u16).to_le_bytes());
         p.extend_from_slice(node.as_bytes());
+        if let Some(z) = zone {
+            p.extend_from_slice(&(z.len() as u16).to_le_bytes());
+            p.extend_from_slice(z.as_bytes());
+        }
         Bytes::from(p)
     }
 
@@ -547,6 +610,7 @@ mod tests {
         assert_eq!(info.server_wall_ns, 123_456_789);
         assert_eq!(info.cluster_id, "cluster-A");
         assert_eq!(info.node_id, "node-1");
+        assert_eq!(info.zone_id, None, "CAP_ZONE=0 leaves zone_id absent");
     }
 
     #[test]
@@ -559,6 +623,63 @@ mod tests {
             panic!()
         };
         assert_eq!(info.role, ServerRole::Other(0x55));
+    }
+
+    #[test]
+    fn decode_server_info_with_cap_zone_reads_zone_id() {
+        // CAP_ZONE bit set → trailing zone_id is mandatory per §11.8.
+        let payload = build_server_info_with(
+            0x01,
+            crate::egress::wire::CAP_ZONE,
+            "cluster-A",
+            "node-1",
+            Some("eu-west-1a"),
+        );
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let event = decode_frame(header(payload.len()), &payload, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap();
+        let ServerEvent::ServerInfo(info) = event else {
+            panic!()
+        };
+        assert_eq!(info.capabilities & crate::egress::wire::CAP_ZONE, crate::egress::wire::CAP_ZONE);
+        assert_eq!(info.zone_id.as_deref(), Some("eu-west-1a"));
+    }
+
+    #[test]
+    fn cap_zone_set_but_zone_id_missing_is_protocol_error() {
+        // The server claims CAP_ZONE but omits the trailing field. Decode
+        // must fail rather than swallow the inconsistency — a server bug
+        // that ships uninitialised state should surface, not be silently
+        // tolerated.
+        let payload = build_server_info_with(
+            0x01,
+            crate::egress::wire::CAP_ZONE,
+            "c",
+            "n",
+            None, // no trailing zone_id despite CAP_ZONE
+        );
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let err = decode_frame(header(payload.len()), &payload, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ProtocolError);
+    }
+
+    #[test]
+    fn unknown_capabilities_bit_with_trailing_bytes_is_protocol_error() {
+        // A future capability bit gates further trailing fields. A v2.0
+        // client that doesn't understand the bit MUST still reject
+        // unknown trailing bytes (caught by `expect_eof`) rather than
+        // silently ignoring them — the server is supposed to omit
+        // trailers behind bits the negotiated revision didn't define.
+        let mut payload = build_server_info(0x01, "c", "n").to_vec();
+        // Patch capabilities to a known-zero word — the trailing bytes
+        // below should then surface as `SERVER_INFO has N trailing bytes`.
+        payload.extend_from_slice(&[0xDE, 0xAD]);
+        let payload = Bytes::from(payload);
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let err = decode_frame(header(payload.len()), &payload, &mut dict, &mut reg, &mut ZstdScratch::new()).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::ProtocolError);
     }
 
     // --- Dispatcher edge cases ---------------------------------------------

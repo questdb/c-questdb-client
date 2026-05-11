@@ -50,7 +50,7 @@ use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{ClientRequestBuilder, Connector, Message, WebSocket};
 
 use crate::egress::config::ReaderConfig;
-use crate::egress::error::{Error, ErrorCode, Result, fmt};
+use crate::egress::error::{Error, ErrorCode, Result, UpgradeReject, fmt};
 use crate::egress::tls::build_client_config;
 use crate::egress::wire::MsgKind;
 use crate::egress::wire::header::{FrameHeader, HEADER_LEN};
@@ -93,6 +93,19 @@ const HDR_VERSION: &str = "x-qwp-version";
 /// `raw` / `identity` / `zstd[;level=N]`). Validated at handshake time so
 /// a missing-feature failure surfaces here, not on the first batch.
 const HDR_CONTENT_ENCODING: &str = "x-qwp-content-encoding";
+
+/// Header key carrying the server's cluster role on a `421` upgrade
+/// reject (failover.md §5). The value SHOULD be one of
+/// `STANDALONE` / `PRIMARY` / `REPLICA` / `PRIMARY_CATCHUP`; the client
+/// matches `PRIMARY_CATCHUP` case-insensitively and treats every other
+/// non-empty value as topological.
+const HDR_ROLE: &str = "x-questdb-role";
+
+/// Optional header on a `421` upgrade reject identifying the server's
+/// zone. Compared case-insensitively against the client's `zone=`
+/// connect-string knob. Absent (or empty after trimming) leaves the
+/// host's zone tier as `Unknown`.
+const HDR_ZONE: &str = "x-questdb-zone";
 
 /// Sync WebSocket transport bound to a single QWP read connection.
 pub struct WsTransport {
@@ -203,8 +216,16 @@ impl WsTransport {
             // Drop runs the graceful Close (set_tcp_write_timeout above
             // ensures we don't block forever on a misbehaving peer).
             drop(transport);
+            // Per failover.md §6 (2026-05-08 change): version-out-of-range
+            // is per-endpoint transient, not cluster-wide terminal. One
+            // mid-rolling-upgrade node speaking a newer version while
+            // peers haven't caught up MUST NOT lock the client out of
+            // compatible siblings. Surface as `HandshakeError` so the
+            // failover walk treats it as a transport-class transient and
+            // keeps trying other endpoints; if every peer disagrees the
+            // round-exhaustion error surfaces the version detail.
             return Err(fmt!(
-                UnsupportedServer,
+                HandshakeError,
                 "server negotiated QWP version {} but client advertised max {}",
                 server_version,
                 config.max_version
@@ -580,12 +601,38 @@ fn map_handshake_error(
 fn map_ws_error_during_handshake(e: tungstenite::Error) -> Error {
     use tungstenite::error::{Error as T, UrlError as U};
     let msg = e.to_string();
+    // 421 carries an `X-QuestDB-Role` upgrade-reject (failover.md §5).
+    // Handled out-of-line so the mapped Error can attach `UpgradeReject`.
+    if let T::Http(resp) = &e
+        && resp.status().as_u16() == 421
+        && let Some(reject) = parse_upgrade_reject(resp.headers())
+    {
+        return Error::new(
+            ErrorCode::RoleMismatch,
+            format!(
+                "server rejected WebSocket upgrade with 421 + X-QuestDB-Role={} \
+                 (zone={:?}); host is in {} state",
+                reject.role_name,
+                reject.zone,
+                if reject.is_transient() {
+                    "transient (PRIMARY_CATCHUP)"
+                } else {
+                    "topological"
+                },
+            ),
+        )
+        .with_upgrade_reject(reject);
+    }
     let code = match &e {
         T::Http(resp) => {
             let status = resp.status().as_u16();
             if status == 401 || status == 403 {
                 ErrorCode::AuthError
             } else {
+                // Covers 421-without-role-header, 404, 503, 426, and every
+                // other 4xx/5xx that isn't 401/403. Per failover.md §6 all
+                // of these are transient/per-endpoint — `HandshakeError`
+                // is failover-eligible.
                 ErrorCode::HandshakeError
             }
         }
@@ -610,6 +657,61 @@ fn map_ws_error_during_handshake(e: tungstenite::Error) -> Error {
     };
     Error::new(code, format!("WebSocket handshake failed: {}", msg))
 }
+
+/// Extract `X-QuestDB-Role` (and the optional `X-QuestDB-Zone`) from a
+/// `421` upgrade reject response. Returns `None` when the role header is
+/// absent or empty after trimming — that case degrades to a generic
+/// transient transport error per failover.md §5, letting the failover
+/// walk continue without recording a topology classification.
+///
+/// Header lookup is case-insensitive (RFC 7230); whitespace around the
+/// value is trimmed. The role value is uppercased to match the spec's
+/// enum tokens (`PRIMARY_CATCHUP` etc.), which gives us a stable
+/// `role_name` field regardless of whether the server emits mixed case.
+fn parse_upgrade_reject(headers: &tungstenite::http::HeaderMap) -> Option<UpgradeReject> {
+    let role_raw = lookup_header(headers, HDR_ROLE)?;
+    let role_trimmed = role_raw.trim();
+    if role_trimmed.is_empty() {
+        return None;
+    }
+    let role_name = role_trimmed.to_ascii_uppercase();
+    let role_byte = match role_name.as_str() {
+        "STANDALONE" => 0x00,
+        "PRIMARY" => 0x01,
+        "REPLICA" => 0x02,
+        "PRIMARY_CATCHUP" => 0x03,
+        // Unrecognised token: keep the wire bytes (uppercased) so the
+        // operator can see exactly what the server said. The `role_byte`
+        // is set to `0xFF` as a sentinel for "byte is unknown"; the
+        // tracker still classifies via `is_transient()`, which inspects
+        // the case-insensitive name. See failover.md §5.
+        _ => 0xFF,
+    };
+    let zone = lookup_header(headers, HDR_ZONE).and_then(|v| {
+        let trimmed = v.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
+    Some(UpgradeReject::new(role_byte, role_name, zone))
+}
+
+/// Case-insensitive single-header lookup that decodes the value as
+/// ASCII. Returns `None` on missing header or non-ASCII value (the
+/// HTTP/1.1 wire form for these headers is ASCII; we don't try to
+/// rescue mojibake).
+fn lookup_header<'h>(
+    headers: &'h tungstenite::http::HeaderMap,
+    name: &str,
+) -> Option<&'h str> {
+    headers
+        .iter()
+        .find(|(n, _)| n.as_str().eq_ignore_ascii_case(name))
+        .and_then(|(_, v)| v.to_str().ok())
+}
+
 
 /// Best-effort classifier: does this `io::Error` actually carry a
 /// rustls TLS failure underneath? Rustls returns its errors via

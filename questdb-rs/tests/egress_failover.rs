@@ -132,6 +132,16 @@ enum Action {
     Sleep(Duration),
     /// Reject the WS upgrade with a 401 Unauthorized.
     Reject401,
+    /// Reject the WS upgrade with a 421 Misdirected Request. The optional
+    /// `role` value populates `X-QuestDB-Role`; the optional `zone`
+    /// populates `X-QuestDB-Zone`. Drives the failover.md §5 path that
+    /// the client parses into `UpgradeReject`. `role=None` exercises the
+    /// "421 without role header" branch (transient transport error,
+    /// failover keeps walking).
+    Reject421 {
+        role: Option<String>,
+        zone: Option<String>,
+    },
     /// Send a single WS binary message verbatim. Lets a script deliver
     /// a malformed/corrupt frame and assert the client's decode-error
     /// path (which is deliberately not failover-eligible).
@@ -315,9 +325,17 @@ fn run_script(
     captured_auth: Arc<Mutex<Vec<Option<String>>>>,
 ) {
     // Decide upfront if this connection wants to reject the upgrade.
-    let reject = script.iter().any(|a| matches!(a, Action::Reject401));
-    if reject {
+    let reject401 = script.iter().any(|a| matches!(a, Action::Reject401));
+    if reject401 {
         reject_upgrade(stream, &captured_auth);
+        return;
+    }
+    let reject421 = script.iter().find_map(|a| match a {
+        Action::Reject421 { role, zone } => Some((role.clone(), zone.clone())),
+        _ => None,
+    });
+    if let Some((role, zone)) = reject421 {
+        reject_upgrade_421(stream, role.as_deref(), zone.as_deref(), &captured_auth);
         return;
     }
 
@@ -359,6 +377,7 @@ fn run_script(
     for action in script {
         match action {
             Action::Reject401 => unreachable!("handled above"),
+            Action::Reject421 { .. } => unreachable!("handled above"),
             Action::SendServerInfo { role, node_id } => {
                 let frame = server_info_frame(role, &node_id, "test-cluster");
                 if ws.send(Message::Binary(frame.into())).is_err() {
@@ -417,6 +436,33 @@ fn reject_upgrade(mut stream: TcpStream, captured_auth: &Arc<Mutex<Vec<Option<St
     captured_auth.lock().unwrap().push(auth);
     let _ = stream
         .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+}
+
+/// Same shape as `reject_upgrade` but emits a 421 Misdirected Request
+/// with optional `X-QuestDB-Role` / `X-QuestDB-Zone` headers. Drives the
+/// client's failover.md §5 upgrade-reject parser. The drained request
+/// is still inspected for the Authorization header so 421-path tests
+/// can assert credential bytes the same way 401-path tests do.
+fn reject_upgrade_421(
+    mut stream: TcpStream,
+    role: Option<&str>,
+    zone: Option<&str>,
+    captured_auth: &Arc<Mutex<Vec<Option<String>>>>,
+) {
+    let mut buf = [0u8; 4096];
+    let n = stream.read(&mut buf).unwrap_or(0);
+    let auth = parse_authorization_header(&buf[..n]);
+    captured_auth.lock().unwrap().push(auth);
+    let mut response =
+        String::from("HTTP/1.1 421 Misdirected Request\r\nContent-Length: 0\r\nConnection: close\r\n");
+    if let Some(r) = role {
+        response.push_str(&format!("X-QuestDB-Role: {}\r\n", r));
+    }
+    if let Some(z) = zone {
+        response.push_str(&format!("X-QuestDB-Zone: {}\r\n", z));
+    }
+    response.push_str("\r\n");
+    let _ = stream.write_all(response.as_bytes());
 }
 
 /// Best-effort scan of a raw HTTP request preamble for the
@@ -2126,13 +2172,14 @@ fn failover_constants_reexported_at_egress_root() {
 /// Server negotiates a higher QWP version than the client supports.
 /// `WsTransport::connect_to` (transport.rs) compares the
 /// `x-qwp-version` upgrade header against `config.max_version` and
-/// returns `UnsupportedServer` on mismatch — pin that path so a
-/// client built against today's QWP1/QWP2 doesn't silently start
-/// talking to a future incompatible server. The test also disables
+/// returns a failover-eligible `HandshakeError` per failover.md §6
+/// (2026-05-08 reclassification): version-out-of-range is per-endpoint
+/// transient, not cluster-wide terminal, because rolling upgrades will
+/// transiently have peers on different versions. The test disables
 /// failover so we observe the *direct* error rather than a wrapped
 /// "all endpoints exhausted" surface.
 #[test]
-fn unsupported_server_version_surfaces_unsupported_server() {
+fn unsupported_server_version_surfaces_handshake_error() {
     let srv = MockServer::start(vec![vec![
         // 99 is comfortably above any version the current client
         // advertises; the trigger is `server_version > max_version`.
@@ -2145,8 +2192,8 @@ fn unsupported_server_version_surfaces_unsupported_server() {
     };
     assert_eq!(
         err.code(),
-        ErrorCode::UnsupportedServer,
-        "version mismatch must surface UnsupportedServer; got {:?}: {}",
+        ErrorCode::HandshakeError,
+        "version mismatch must surface HandshakeError (failover-eligible); got {:?}: {}",
         err.code(),
         err.msg()
     );
@@ -2280,4 +2327,137 @@ fn auth_header_is_emitted_before_401_rejection() {
         vec![Some("Basic YWRtaW46cXVlc3Q=".to_string())],
         "client must still have emitted the Authorization header even though the server rejected the upgrade"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 421 upgrade-reject parsing (failover.md §5)
+// ---------------------------------------------------------------------------
+
+/// 421 + `X-QuestDB-Role: PRIMARY_CATCHUP` must surface as
+/// `RoleMismatch` with an `UpgradeReject` whose `is_transient()` is
+/// true. The host-health tracker (step 2 of the failover work) will key
+/// `RecordRoleReject(idx, transient=true)` off this.
+#[test]
+fn upgrade_421_with_primary_catchup_surfaces_transient_role_mismatch() {
+    let srv = MockServer::start(vec![vec![Action::Reject421 {
+        role: Some("PRIMARY_CATCHUP".into()),
+        zone: Some("eu-west-1a".into()),
+    }]]);
+    let conf = format!("qwp::addr={};failover=off", srv.url());
+    let err = match Reader::from_conf(&conf) {
+        Ok(_) => panic!("421 + X-QuestDB-Role must surface as RoleMismatch"),
+        Err(e) => e,
+    };
+    assert_eq!(
+        err.code(),
+        ErrorCode::RoleMismatch,
+        "421 + X-QuestDB-Role must surface as RoleMismatch; got {:?}: {}",
+        err.code(),
+        err.msg()
+    );
+    let reject = err
+        .upgrade_reject()
+        .expect("UpgradeReject must be attached to the 421-derived error");
+    assert_eq!(reject.role_byte, 0x03);
+    assert_eq!(reject.role_name, "PRIMARY_CATCHUP");
+    assert_eq!(reject.zone.as_deref(), Some("eu-west-1a"));
+    assert!(reject.is_transient(), "PRIMARY_CATCHUP must classify transient");
+}
+
+/// 421 + `X-QuestDB-Role: REPLICA` must surface as `RoleMismatch` with
+/// `is_transient() == false` (topological). The tracker will record
+/// this as `TopologyReject` and walk to the next host.
+#[test]
+fn upgrade_421_with_replica_role_surfaces_topological_role_mismatch() {
+    let srv = MockServer::start(vec![vec![Action::Reject421 {
+        role: Some("REPLICA".into()),
+        zone: None,
+    }]]);
+    let conf = format!("qwp::addr={};failover=off", srv.url());
+    let err = match Reader::from_conf(&conf) {
+        Ok(_) => panic!("421 + REPLICA role must surface as RoleMismatch"),
+        Err(e) => e,
+    };
+    assert_eq!(err.code(), ErrorCode::RoleMismatch);
+    let reject = err.upgrade_reject().expect("UpgradeReject expected");
+    assert_eq!(reject.role_byte, 0x02);
+    assert_eq!(reject.role_name, "REPLICA");
+    assert_eq!(reject.zone, None);
+    assert!(!reject.is_transient(), "REPLICA must classify topological");
+}
+
+/// 421 without the `X-QuestDB-Role` header degrades to a generic
+/// transient transport error per failover.md §5 — failover walks past
+/// it like any other transport-class failure. The error code therefore
+/// must be `HandshakeError` (failover-eligible), and no `UpgradeReject`
+/// is attached.
+#[test]
+fn upgrade_421_without_role_header_is_generic_handshake_error() {
+    let srv = MockServer::start(vec![vec![Action::Reject421 {
+        role: None,
+        zone: None,
+    }]]);
+    let conf = format!("qwp::addr={};failover=off", srv.url());
+    let err = match Reader::from_conf(&conf) {
+        Ok(_) => panic!("421 with no role header still rejects connect"),
+        Err(e) => e,
+    };
+    assert_eq!(
+        err.code(),
+        ErrorCode::HandshakeError,
+        "421-without-role must surface as a generic transient HandshakeError; got {:?}: {}",
+        err.code(),
+        err.msg()
+    );
+    assert!(
+        err.upgrade_reject().is_none(),
+        "no UpgradeReject when X-QuestDB-Role header is absent"
+    );
+}
+
+/// 421 + an unrecognised role token still produces `RoleMismatch` —
+/// the wire bytes are preserved verbatim (uppercased) and the
+/// classification falls back to topological. Defensive: a future role
+/// addition we haven't taught the client about must not crash, and
+/// must not be silently treated as transient (conservatism per
+/// failover.md §6).
+#[test]
+fn upgrade_421_with_unknown_role_classifies_topological() {
+    let srv = MockServer::start(vec![vec![Action::Reject421 {
+        role: Some("future_role_we_dont_know".into()),
+        zone: None,
+    }]]);
+    let conf = format!("qwp::addr={};failover=off", srv.url());
+    let err = match Reader::from_conf(&conf) {
+        Ok(_) => panic!("unknown 421 role still rejects"),
+        Err(e) => e,
+    };
+    assert_eq!(err.code(), ErrorCode::RoleMismatch);
+    let reject = err.upgrade_reject().expect("UpgradeReject expected");
+    assert_eq!(reject.role_byte, 0xFF, "unknown role byte sentinel");
+    assert_eq!(reject.role_name, "FUTURE_ROLE_WE_DONT_KNOW");
+    assert!(!reject.is_transient());
+}
+
+/// `target=primary` connected to a SERVER_INFO advertising REPLICA must
+/// produce `RoleMismatch` with `UpgradeReject` populated from the
+/// SERVER_INFO bytes — uniform tracker input regardless of whether the
+/// rejection arrived on the upgrade (`421+role`) or in the post-upgrade
+/// `SERVER_INFO` frame. `target=primary` is `Target::Primary`, so the
+/// `target_matches` filter rejects the REPLICA role.
+#[test]
+fn server_info_target_mismatch_attaches_upgrade_reject() {
+    let srv = MockServer::start(vec![happy_script(ServerRole::Replica, "node-r1")]);
+    let conf = format!("qwp::addr={};target=primary;failover=off", srv.url());
+    let err = match Reader::from_conf(&conf) {
+        Ok(_) => panic!("target=primary against REPLICA must reject"),
+        Err(e) => e,
+    };
+    assert_eq!(err.code(), ErrorCode::RoleMismatch);
+    let reject = err
+        .upgrade_reject()
+        .expect("SERVER_INFO target mismatch must attach UpgradeReject");
+    assert_eq!(reject.role_byte, 0x02);
+    assert_eq!(reject.role_name, "REPLICA");
+    assert!(!reject.is_transient());
 }
