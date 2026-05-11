@@ -83,8 +83,17 @@ const DEFAULT_TLS_PORT: &str = "9000";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Compression {
+    /// Advertise `raw` only — every `RESULT_BATCH` body is
+    /// uncompressed wire bytes.
     Raw,
+    /// Advertise `zstd` only — the server must send compressed
+    /// batches and the client must be built with the
+    /// `compression-zstd` feature.
     Zstd,
+    /// Advertise both `zstd,raw` — the server picks. The client
+    /// must be built with the `compression-zstd` feature to decode
+    /// the compressed branch; without it, the decoder rejects
+    /// `FLAG_ZSTD` batches with `UnsupportedServer`.
     Auto,
 }
 
@@ -104,8 +113,16 @@ impl Compression {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Target {
+    /// Accept any endpoint, regardless of role. The default.
     Any,
+    /// Connect only to endpoints whose `SERVER_INFO.role` is
+    /// `PRIMARY`, `PRIMARY_CATCHUP`, or `STANDALONE` (single-node
+    /// OSS counts as PRIMARY per the Java reference). Suitable for
+    /// followers that must observe a writer's perspective.
     Primary,
+    /// Connect only to endpoints whose `SERVER_INFO.role` is
+    /// `REPLICA`. Suitable for read-scaling clients that prefer
+    /// followers and tolerate replication lag.
     Replica,
 }
 
@@ -120,7 +137,15 @@ pub enum Target {
 /// the underlying `Vec<Endpoint>` directly to avoid extra clones.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Endpoint {
+    /// Host portion of the endpoint. Stored verbatim from the
+    /// connect string — no DNS resolution. For IPv6 literals this
+    /// is the bare address (`"::1"`), not the bracketed form;
+    /// [`Display`](std::fmt::Display) re-introduces brackets when
+    /// the host contains a `:`.
     pub host: String,
+    /// TCP port. The connect-string parser defaults this to `9000`
+    /// for both `qwp://` and `qwps://` schemes if the address omits
+    /// `:<port>`.
     pub port: u16,
 }
 
@@ -156,12 +181,32 @@ impl std::fmt::Display for Endpoint {
     }
 }
 
-/// Default failover knobs. Match the Java `QwpQueryClient` reference
-/// (`DEFAULT_FAILOVER_*` constants) so connect strings behave the same
-/// in either client.
+// ---------------------------------------------------------------------------
+// Default failover knobs. Match the Java `QwpQueryClient` reference
+// (`DEFAULT_FAILOVER_*` constants) so connect strings behave the same
+// in either client.
+// ---------------------------------------------------------------------------
+
+/// Failover-on by default: a connect string that doesn't say
+/// `failover=off` retries transport-class failures across the
+/// configured `addr=` list.
 pub const DEFAULT_FAILOVER_ENABLED: bool = true;
+
+/// Default cap on the number of `connect_endpoint` attempts per
+/// `Execute()`-driven failover round before the cursor surfaces a
+/// terminal error. Capped by [`MAX_FAILOVER_MAX_ATTEMPTS`].
 pub const DEFAULT_FAILOVER_MAX_ATTEMPTS: u32 = 8;
+
+/// Default initial backoff (milliseconds) before the first
+/// failover retry. Per failover.md §3.1 the actual sleep is drawn
+/// uniformly from `[0, base)` (full jitter); this value is the
+/// `base` for attempt 1. Capped by [`MAX_FAILOVER_BACKOFF_MAX_MS`].
 pub const DEFAULT_FAILOVER_BACKOFF_INITIAL_MS: u64 = 50;
+
+/// Default upper bound (milliseconds) on the per-attempt backoff
+/// `base` after exponential growth. Beyond this the schedule
+/// saturates rather than doubling further. Capped by
+/// [`MAX_FAILOVER_BACKOFF_MAX_MS`].
 pub const DEFAULT_FAILOVER_BACKOFF_MAX_MS: u64 = 1_000;
 
 /// Hard upper bound on `failover_max_attempts`. Defensive: at the

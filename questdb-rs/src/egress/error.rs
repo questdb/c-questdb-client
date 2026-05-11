@@ -176,6 +176,11 @@ pub struct Error {
 }
 
 impl Error {
+    /// Construct an [`Error`] from a category and a human-readable
+    /// message. `upgrade_reject` and `server_info` are `None` —
+    /// attach them with [`Error::with_upgrade_reject`] /
+    /// [`Error::with_server_info`] if available. The message is taken
+    /// verbatim; format it with `format!` at the call site.
     pub fn new<S: Into<String>>(code: ErrorCode, msg: S) -> Error {
         Error {
             code,
@@ -203,10 +208,17 @@ impl Error {
         self
     }
 
+    /// Diagnostic category for this error. Stable across releases —
+    /// new variants may be added (`ErrorCode` is `#[non_exhaustive]`),
+    /// but existing ones aren't renamed or repurposed.
     pub fn code(&self) -> ErrorCode {
         self.code
     }
 
+    /// Human-readable diagnostic message. Format and contents are
+    /// **not** part of the stable API — pattern-matching on the
+    /// string is unsupported; use [`Error::code`] for programmatic
+    /// classification.
     pub fn msg(&self) -> &str {
         &self.msg
     }
