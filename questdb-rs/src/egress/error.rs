@@ -142,7 +142,15 @@ pub enum ErrorCode {
 /// client decided to call it. `zone` is `Some` only when the server
 /// advertised one (via `SERVER_INFO.zone_id` gated on `CAP_ZONE`, or the
 /// `X-QuestDB-Zone` upgrade header).
+///
+/// `#[non_exhaustive]` so future fields (a structured replay-hint, a
+/// retry-after value, a cluster-ID tag — anything the failover.md spec
+/// might extend `421` reject headers with) can be added without
+/// breaking downstream struct-literal construction or exhaustive
+/// destructuring. Use [`UpgradeReject::new`] to construct from
+/// external code.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct UpgradeReject {
     pub role_byte: u8,
     pub role_name: String,

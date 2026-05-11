@@ -135,7 +135,13 @@ pub enum Target {
 /// / `.1` accessors. Cheap to clone (small `String` plus `u16`); the
 /// few hot paths that build many of these per failover go through
 /// the underlying `Vec<Endpoint>` directly to avoid extra clones.
+///
+/// `#[non_exhaustive]` so future fields (e.g. a TLS-SNI override or a
+/// resolved-`SocketAddr` cache) can be added without breaking
+/// downstream struct-literal construction or exhaustive destructuring.
+/// Use [`Endpoint::new`] to construct from external code.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct Endpoint {
     /// Host portion of the endpoint. Stored verbatim from the
     /// connect string — no DNS resolution. For IPv6 literals this
