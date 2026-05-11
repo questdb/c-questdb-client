@@ -330,6 +330,23 @@ pub fn encode_bind(bind: &Bind, out: &mut Vec<u8>) -> Result<()> {
                     precision_bits
                 ));
             }
+            if let Bind::Geohash {
+                value,
+                precision_bits,
+            } = bind
+            {
+                // `precision_bits` is in 1..=60, so the shift is always
+                // well-defined; reject any high bits that would be
+                // silently dropped by the wire encoding below.
+                if value >> precision_bits != 0 {
+                    return Err(fmt!(
+                        InvalidBind,
+                        "geohash value 0x{:X} has bits set above precision_bits {}",
+                        value,
+                        precision_bits
+                    ));
+                }
+            }
             varint::encode_u64(*precision_bits as u64, out);
         }
         // VARCHAR/BINARY: (non_null + 1) × u32_le offsets array — only
@@ -702,6 +719,20 @@ mod tests {
             &Bind::Geohash {
                 value: 0,
                 precision_bits: 0,
+            },
+            &mut out,
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), crate::egress::ErrorCode::InvalidBind);
+    }
+
+    #[test]
+    fn geohash_value_above_precision_rejected() {
+        let mut out = Vec::new();
+        let err = encode_bind(
+            &Bind::Geohash {
+                value: u64::MAX,
+                precision_bits: 8,
             },
             &mut out,
         )
