@@ -157,7 +157,7 @@ impl QueryRequestBuilder {
     pub fn bind_date_millis(self, v: i64) -> Self {
         self.bind(Bind::DateMillis(v))
     }
-    pub fn bind_uuid_bytes(self, v: [u8; 16]) -> Self {
+    pub fn bind_uuid(self, v: [u8; 16]) -> Self {
         self.bind(Bind::Uuid(v))
     }
     pub fn bind_long256(self, v: [u8; 32]) -> Self {

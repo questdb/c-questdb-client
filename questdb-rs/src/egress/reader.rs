@@ -757,7 +757,7 @@ impl<'r> ReaderQuery<'r> {
     bind_method!(bind_timestamp_micros, v: i64);
     bind_method!(bind_timestamp_nanos, v: i64);
     bind_method!(bind_date_millis, v: i64);
-    bind_method!(bind_uuid_bytes, v: [u8; 16]);
+    bind_method!(bind_uuid, v: [u8; 16]);
     bind_method!(bind_long256, v: [u8; 32]);
     bind_method!(bind_char, v: u16);
     bind_method!(bind_ipv4, v: Ipv4Addr);

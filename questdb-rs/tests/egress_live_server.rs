@@ -1430,7 +1430,7 @@ fn bind_uuid_passthrough() {
     ];
     let mut cur = reader
         .query("select $1::uuid as v")
-        .bind_uuid_bytes(bytes)
+        .bind_uuid(bytes)
         .execute()
         .expect("execute");
     let view = cur.next_batch().expect("next").expect("Some");
