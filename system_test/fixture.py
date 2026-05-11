@@ -411,9 +411,11 @@ class QuestDbFixture(QuestDbFixtureBase):
             sys.stderr.write('\n\n')
 
     def start(self):
-        ports = discover_avail_ports(3)
-        self.http_server_port, self.line_tcp_port, self.pg_port = ports
-        self.qwp_udp_port = discover_avail_udp_port() if self.qwp_udp else None
+        if self.http_server_port is None:
+            ports = discover_avail_ports(3)
+            self.http_server_port, self.line_tcp_port, self.pg_port = ports
+        if self.qwp_udp and self.qwp_udp_port is None:
+            self.qwp_udp_port = discover_avail_udp_port()
         auth_config = 'line.tcp.auth.db.path=conf/auth.txt' if self.auth else ''
         ilp_over_http_config = 'line.http.enabled=true' if self.http else ''
         qwp_udp_enabled = 'true' if self.qwp_udp else 'false'

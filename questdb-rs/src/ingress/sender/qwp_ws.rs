@@ -160,12 +160,14 @@ pub(crate) struct SyncQwpWsHandlerState {
     encoder: QwpWsReplayEncoder,
     runner: SyncQwpWsRunner,
     orphan_pool: Option<OrphanDrainerPool>,
+    close_drain_timeout: Duration,
 }
 
 pub(crate) struct ManualQwpWsHandlerState {
     publisher: SyncQwpWsPublisher,
     orphan_drainers: Option<ManualOrphanDrainers>,
     append_deadline: Duration,
+    close_drain_timeout: Duration,
 }
 
 pub(crate) struct SyncQwpWsRunner<Q = SfaSlotQueue> {
@@ -197,7 +199,6 @@ struct BackpressureNotifier {
 #[cfg(test)]
 const DEFAULT_APPEND_DEADLINE: Duration = Duration::from_secs(30);
 const BACKPRESSURE_PARK: Duration = Duration::from_micros(50);
-pub(crate) const DEFAULT_CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl<Q> SyncQwpWsRunner<Q>
 where
@@ -359,6 +360,9 @@ where
         let deadline = Instant::now().checked_add(timeout);
         self.lifecycle.begin_close();
         self.backpressure.notify_all();
+        if timeout.is_zero() {
+            return Ok(());
+        }
         {
             let mut store = self.lock_shared()?;
             check_store_error(&store)?;
@@ -1758,6 +1762,7 @@ pub(crate) fn connect_qwp_ws(
             encoder: QwpWsReplayEncoder::new(negotiated_version),
             runner,
             orphan_pool,
+            close_drain_timeout: *qwp_ws.close_flush_timeout,
         },
     )))
 }
@@ -1799,6 +1804,7 @@ pub(crate) fn open_manual_qwp_ws(
         publisher,
         orphan_drainers,
         append_deadline: *qwp_ws.sf_append_deadline,
+        close_drain_timeout: *qwp_ws.close_flush_timeout,
     })
 }
 
@@ -2028,7 +2034,7 @@ pub(crate) fn qwp_ws_sender_errors_dropped_manual(
 pub(crate) fn qwp_ws_close_drain_background(
     state: &mut SyncQwpWsHandlerState,
 ) -> crate::Result<()> {
-    let result = state.runner.close_drain(DEFAULT_CLOSE_DRAIN_TIMEOUT);
+    let result = state.runner.close_drain(state.close_drain_timeout);
     if let Some(mut orphan_pool) = state.orphan_pool.take() {
         orphan_pool.close();
     }
@@ -2036,7 +2042,11 @@ pub(crate) fn qwp_ws_close_drain_background(
 }
 
 pub(crate) fn qwp_ws_close_drain_manual(state: &mut ManualQwpWsHandlerState) -> crate::Result<()> {
-    let deadline = Instant::now().checked_add(DEFAULT_CLOSE_DRAIN_TIMEOUT);
+    if state.close_drain_timeout.is_zero() {
+        state.publisher.begin_close();
+        return Ok(());
+    }
+    let deadline = Instant::now().checked_add(state.close_drain_timeout);
     loop {
         match state.publisher.close_drain_ready_once() {
             Ok(CloseOutcome::Drained) => return Ok(()),

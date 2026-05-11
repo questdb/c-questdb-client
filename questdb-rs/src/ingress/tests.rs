@@ -243,7 +243,7 @@ fn qwpws_store_and_forward_size_suffixes_match_java_config_surface() {
 
 #[cfg(feature = "sync-sender-qwp-ws")]
 #[test]
-fn qwpws_store_and_forward_config_rejects_invalid_java_keys() {
+fn qwpws_store_and_forward_config_accepts_and_rejects_java_keys() {
     SenderBuilder::from_conf("qwpws::addr=localhost:9000;request_durable_ack=off;").unwrap();
     SenderBuilder::from_conf("qwpws::addr=localhost:9000;request_durable_ack=on;").unwrap();
     SenderBuilder::from_conf(
@@ -294,10 +294,15 @@ fn qwpws_store_and_forward_config_rejects_invalid_java_keys() {
         SenderBuilder::from_conf("qwpws::addr=localhost:9000;sf_append_deadline_millis=0;"),
         "\"sf_append_deadline_millis\" must be greater than 0.",
     );
-    assert_conf_err(
-        SenderBuilder::from_conf("qwpws::addr=localhost:9000;close_flush_timeout_millis=5000;"),
-        "\"close_flush_timeout_millis\" is not supported by the Rust QWP/WebSocket sync sender yet; use Sender::close_drain() for explicit close-drain behavior.",
-    );
+    for (input, expected) in [(-42, 0), (-1, 0), (0, 0), (5000, 5000), (120000, 120000)] {
+        let conf = format!("qwpws::addr=localhost:9000;close_flush_timeout_millis={input};");
+        let builder = SenderBuilder::from_conf(conf).unwrap();
+        let qwp_ws = builder.qwp_ws.as_ref().unwrap();
+        assert_specified_eq(
+            &qwp_ws.close_flush_timeout,
+            std::time::Duration::from_millis(expected as u64),
+        );
+    }
     assert_conf_err(
         SenderBuilder::from_conf("qwpws::addr=localhost:9000;request_durable_ack=maybe;"),
         "invalid request_durable_ack [value=maybe, allowed-values=[on, off]]",

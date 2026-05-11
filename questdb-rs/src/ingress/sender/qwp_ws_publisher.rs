@@ -213,6 +213,10 @@ impl<Q: PublicationLog, T: ManualDriverTransport> QwpWsPublicationDriver<Q, T> {
         self.driver.close_drain_ready_once()
     }
 
+    pub(crate) fn begin_close(&mut self) {
+        self.driver.set_closing();
+    }
+
     #[cfg(test)]
     pub(crate) fn sent_frames(&self) -> &[SentFrame] {
         self.driver.sent_frames()

@@ -954,6 +954,51 @@ fn qwp_ws_sender_fsn_watermarks_and_close_drain_work_in_background_mode() {
     assert_eq!(result.received_frames.len(), 1);
 }
 
+#[test]
+fn qwp_ws_close_flush_timeout_minus_one_skips_close_drain_wait() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (frame_tx, frame_rx) = mpsc::channel();
+
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        upgrade_mock_stream(&mut stream);
+        let (_fin, _opcode, payload) = read_frame(&mut stream).unwrap();
+        frame_tx.send(payload).unwrap();
+        thread::sleep(Duration::from_millis(500));
+    });
+
+    let conf = format!("qwpws::addr=127.0.0.1:{port};close_flush_timeout_millis=-1;");
+    let mut sender = SenderBuilder::from_conf(&conf).unwrap().build().unwrap();
+    let mut buf = sender.new_buffer();
+    buf.table("trades")
+        .unwrap()
+        .column_i64("qty", 7)
+        .unwrap()
+        .at_now()
+        .unwrap();
+
+    let fsn = sender.flush_and_get_fsn(&mut buf).unwrap().unwrap();
+    assert_eq!(fsn, 0);
+    let frame = frame_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(&frame[0..4], b"QWP1");
+
+    let started = Instant::now();
+    sender.close_drain().unwrap();
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "close_drain waited despite close_flush_timeout_millis=-1"
+    );
+    drop(sender);
+    server.join().unwrap();
+}
+
 /// Run with:
 /// `QWP_WS_PUBLIC_BENCH_ROWS=20000000 cargo test --release --manifest-path questdb-rs/Cargo.toml --features sync-sender-qwp-ws qwp_ws_public_sender_batch_throughput_benchmark --lib -- --ignored --nocapture --test-threads=1`
 #[test]
@@ -2513,6 +2558,7 @@ fn qwp_ws_from_conf_parses_java_reconnect_keys() {
                 reconnect_initial_backoff_millis=200;\
                 reconnect_max_backoff_millis=2000;\
                 initial_connect_retry=on;\
+                close_flush_timeout_millis=120000;\
                 request_durable_ack=on;\
                 durable_ack_keepalive_interval_millis=250;";
     SenderBuilder::from_conf(conf).unwrap();

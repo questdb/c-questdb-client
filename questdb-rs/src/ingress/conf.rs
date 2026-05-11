@@ -125,6 +125,9 @@ pub(crate) const QWP_WS_DEFAULT_SF_MEMORY_MAX_TOTAL_BYTES: u64 = 128 * 1024 * 10
 pub(crate) const QWP_WS_DEFAULT_SF_DISK_MAX_TOTAL_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 #[cfg(feature = "_sender-qwp-ws")]
 pub(crate) const QWP_WS_DEFAULT_MAX_BACKGROUND_DRAINERS: usize = 4;
+#[cfg(feature = "_sender-qwp-ws")]
+pub(crate) const QWP_WS_DEFAULT_CLOSE_DRAIN_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5);
 
 #[cfg(feature = "_sender-qwp-ws")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,6 +178,8 @@ pub(crate) struct QwpWsConfig {
     /// Whether the initial connect should use the reconnect policy. Default
     /// false, matching Java's fail-fast startup behavior.
     pub(crate) initial_connect_retry: ConfigSetting<bool>,
+    /// Bounded wait used by Sender::close_drain().
+    pub(crate) close_flush_timeout: ConfigSetting<std::time::Duration>,
     pub(crate) sf_dir: ConfigSetting<Option<PathBuf>>,
     pub(crate) sender_id: ConfigSetting<String>,
     pub(crate) sf_max_bytes: ConfigSetting<u64>,
@@ -205,6 +210,7 @@ impl Default for QwpWsConfig {
             ),
             reconnect_max_backoff: ConfigSetting::new_default(std::time::Duration::from_secs(5)),
             initial_connect_retry: ConfigSetting::new_default(false),
+            close_flush_timeout: ConfigSetting::new_default(QWP_WS_DEFAULT_CLOSE_DRAIN_TIMEOUT),
             sf_dir: ConfigSetting::new_default(None),
             sender_id: ConfigSetting::new_default(QWP_WS_DEFAULT_SENDER_ID.to_owned()),
             sf_max_bytes: ConfigSetting::new_default(QWP_WS_DEFAULT_SF_SEGMENT_BYTES),

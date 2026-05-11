@@ -34,8 +34,12 @@ import datetime
 import argparse
 import unittest
 import itertools
+import inspect
 import numpy as np
 import time
+import tempfile
+import socket
+import threading
 import questdb_line_sender as qls
 import uuid
 from fixture import (
@@ -69,6 +73,199 @@ def retry_check_table(*args, **kwargs):
 
 def sql_query(query: str):
     return QDB_FIXTURE.http_sql_query(query)
+
+
+class _ParsedUnittestProgram(unittest.TestProgram):
+    def runTests(self):
+        pass
+
+
+def _parse_unittest_args():
+    return _ParsedUnittestProgram(
+        module=sys.modules[__name__],
+        argv=sys.argv,
+        exit=False)
+
+
+def _load_requested_suite():
+    return _parse_unittest_args().test
+
+
+def _iter_tests(suite):
+    for test in suite:
+        if isinstance(test, unittest.TestSuite):
+            yield from _iter_tests(test)
+        else:
+            yield test
+
+
+def _is_qwp_ws_restart_test(test):
+    return test.__class__.__name__ == 'TestQwpWsRestart'
+
+
+def _select_qwp_ws_restart_tests(include_restart):
+    suite = unittest.TestSuite()
+    for test in _iter_tests(_load_requested_suite()):
+        if _is_qwp_ws_restart_test(test) == include_restart:
+            suite.addTest(test)
+    return suite
+
+
+def _run_selected_tests(include_qwp_ws_restart):
+    suite = _select_qwp_ws_restart_tests(include_qwp_ws_restart)
+    if suite.countTestCases() == 0:
+        return True
+    program = _parse_unittest_args()
+    if program.catchbreak:
+        unittest.installHandler()
+
+    runner_args = {
+        'verbosity': program.verbosity,
+        'failfast': program.failfast,
+        'buffer': program.buffer,
+        'warnings': program.warnings,
+    }
+    runner_params = inspect.signature(unittest.TextTestRunner).parameters
+    if 'tb_locals' in runner_params:
+        runner_args['tb_locals'] = getattr(program, 'tb_locals', False)
+    if 'durations' in runner_params:
+        runner_args['durations'] = getattr(program, 'durations', None)
+    runner = unittest.TextTestRunner(**runner_args)
+    return runner.run(suite).wasSuccessful()
+
+
+def _read_exact(sock, byte_count, pending=b''):
+    if len(pending) >= byte_count:
+        return pending[:byte_count], pending[byte_count:]
+
+    chunks = [pending] if pending else []
+    remaining = byte_count - len(pending)
+    while remaining:
+        chunk = sock.recv(remaining)
+        if not chunk:
+            raise ConnectionError(
+                f'unexpected EOF while reading {byte_count} bytes')
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b''.join(chunks), b''
+
+
+def _read_until_headers(sock):
+    data = bytearray()
+    marker = b'\r\n\r\n'
+    while marker not in data:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise ConnectionError('unexpected EOF while reading HTTP headers')
+        data.extend(chunk)
+    header_end = data.index(marker) + len(marker)
+    return bytes(data[:header_end]), bytes(data[header_end:])
+
+
+def _read_ws_frame(sock, pending=b''):
+    raw_parts = []
+    header, pending = _read_exact(sock, 2, pending)
+    raw_parts.append(header)
+    length = header[1] & 0x7f
+    masked = (header[1] & 0x80) != 0
+    if length == 126:
+        length_bytes, pending = _read_exact(sock, 2, pending)
+        raw_parts.append(length_bytes)
+        length = int.from_bytes(length_bytes, 'big')
+    elif length == 127:
+        length_bytes, pending = _read_exact(sock, 8, pending)
+        raw_parts.append(length_bytes)
+        length = int.from_bytes(length_bytes, 'big')
+
+    mask = b''
+    if masked:
+        mask, pending = _read_exact(sock, 4, pending)
+        raw_parts.append(mask)
+    payload, pending = _read_exact(sock, length, pending)
+    raw_parts.append(payload)
+    if masked:
+        decoded_payload = bytes(byte ^ mask[index % 4]
+                                for index, byte in enumerate(payload))
+    else:
+        decoded_payload = payload
+    return b''.join(raw_parts), decoded_payload, pending
+
+
+class QwpWsDropAckProxy:
+    def __init__(self, target_host, target_port):
+        self._target_host = target_host
+        self._target_port = target_port
+        self._listener = None
+        self._thread = None
+        self._error = None
+        self.port = None
+
+    def start(self):
+        self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listener.bind(('127.0.0.1', 0))
+        self._listener.listen(1)
+        self._listener.settimeout(10)
+        self.port = self._listener.getsockname()[1]
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def close(self):
+        if self._listener is not None:
+            self._listener.close()
+            self._listener = None
+
+    def is_alive(self):
+        return self._thread is not None and self._thread.is_alive()
+
+    def join(self, timeout=10):
+        self._thread.join(timeout)
+        if self.is_alive():
+            self.close()
+            raise TimeoutError(
+                'timed out waiting for QWP/WebSocket drop-frame proxy')
+        if self._error is not None:
+            raise self._error
+
+    def _run(self):
+        try:
+            self._run_inner()
+        except BaseException as e:
+            self._error = e
+        finally:
+            self.close()
+
+    def _run_inner(self):
+        with self._listener:
+            client, _ = self._listener.accept()
+            self._listener = None
+        with client:
+            client.settimeout(10)
+            with socket.create_connection(
+                    (self._target_host, self._target_port),
+                    timeout=10) as upstream:
+                upstream.settimeout(10)
+                request, pending_client = _read_until_headers(client)
+                upstream.sendall(request)
+                response, _ = _read_until_headers(upstream)
+                status_line = response.split(b'\r\n', 1)[0]
+                if b' 101 ' not in status_line:
+                    raise RuntimeError(
+                        f'expected WebSocket upgrade, got {status_line!r}')
+                client.sendall(response)
+
+                client_frame, payload, _ = _read_ws_frame(client, pending_client)
+                if not payload.startswith(b'QWP1'):
+                    raise RuntimeError(
+                        'expected first WebSocket payload to be a QWP frame')
+                upstream.sendall(client_frame)
+
+                _, server_payload, _ = _read_ws_frame(upstream)
+                if not server_payload:
+                    raise RuntimeError('expected non-empty QWP server response')
+                if server_payload[0] not in (0x00, 0x02):
+                    raise RuntimeError(
+                        f'expected QWP OK/ACK response, got status 0x{server_payload[0]:02x}')
 
 
 # Valid keys, but not registered with the QuestDB fixture.
@@ -1226,6 +1423,451 @@ class TestSender(unittest.TestCase):
             yaml.safe_load(f)
 
 
+class TestQwpWsRestart(unittest.TestCase):
+    ROWS_PER_PHASE = 500
+    ROWS_PER_RECOVERY_EPOCH = 5000
+    CONTINUOUS_BOUNCES = 3
+    CONTINUOUS_BATCH_ROWS = 25
+    MULTI_EPOCH_ROWS = (500, 997, 1499)
+    BASE_TS_US = 1_700_000_000_000_000
+    TS_STEP_US = 1_000
+
+    def setUp(self):
+        self._require_restart_fixture()
+        test_name = self.id()
+        QDB_FIXTURE.http_sql_query(
+            f'select * from long_sequence(1) -- >>>>>>>>> BEGIN PYTHON UNIT TEST: {test_name}')
+
+    def tearDown(self):
+        if isinstance(QDB_FIXTURE, QuestDbFixture) and QDB_FIXTURE._proc:
+            test_name = self.id()
+            QDB_FIXTURE.http_sql_query(
+                f'select * from long_sequence(1) -- <<<<<<<<< END PYTHON UNIT TEST: {test_name}')
+
+    def _require_restart_fixture(self):
+        if not hasattr(qls.Protocol, 'QWPWS'):
+            self.skipTest('QWP/WebSocket protocol is not exposed by the system-test shim')
+        if not isinstance(QDB_FIXTURE, QuestDbFixture):
+            self.skipTest('QWP/WebSocket restart tests require a managed QuestDB fixture')
+        if QDB_FIXTURE.auth:
+            self.skipTest('QWP/WebSocket restart tests run without auth')
+        if QDB_FIXTURE.http:
+            self.skipTest('QWP/WebSocket restart tests run outside the HTTP ILP matrix')
+
+    @staticmethod
+    def _create_restart_table(table_name):
+        sql_query(
+            f'CREATE TABLE "{table_name}" '
+            '(id LONG, val DOUBLE, ts TIMESTAMP) '
+            'TIMESTAMP(ts) PARTITION BY DAY WAL '
+            'DEDUP UPSERT KEYS(ts, id)')
+
+    @staticmethod
+    def _sender_conf(sender_id, sf_dir, port=None, **settings):
+        port = QDB_FIXTURE.http_server_port if port is None else port
+        conf = [
+            f'qwpws::addr={QDB_FIXTURE.host}:{port};',
+            f'sender_id={sender_id};',
+            f'sf_dir={sf_dir};']
+        for key, value in settings.items():
+            conf.append(f'{key}={value};')
+        return ''.join(conf)
+
+    def _connect_sender(self, conf):
+        sender = qls.Sender.from_conf(conf)
+        try:
+            sender.connect()
+            sender._buffer = qls.Buffer.from_sender(sender._impl)
+        except qls.SenderError as e:
+            if QDB_FIXTURE._root_dir.name != 'repo':
+                self.skipTest(f'QWP/WebSocket is not supported by this QuestDB fixture: {e}')
+            raise
+        return sender
+
+    def _write_rows(self, sender, table_name, first_id, count):
+        for row_id in range(first_id, first_id + count):
+            (sender
+             .table(table_name)
+             .column('id', row_id)
+             .column('val', row_id * 0.5)
+             .at_micros(self.BASE_TS_US + row_id * self.TS_STEP_US))
+
+    def _write_row(self, sender, table_name, row_id):
+        self._write_rows(sender, table_name, row_id, 1)
+
+    @staticmethod
+    def _sfa_file_count(sf_dir, sender_id):
+        slot_dir = pathlib.Path(sf_dir) / sender_id
+        if not slot_dir.exists():
+            return 0
+        return sum(
+            1 for path in slot_dir.iterdir()
+            if path.name.endswith('.sfa'))
+
+    def _retry_assert_aggregates(
+            self,
+            table_name,
+            expected_count,
+            expected_distinct_id,
+            expected_min_id=None,
+            expected_max_id=None,
+            timeout_sec=30):
+        deadline = time.monotonic() + timeout_sec
+        query = (
+            f"select count(), count_distinct(id), min(id), max(id) "
+            f"from '{table_name}'")
+        last_resp = None
+        last_error = None
+        while time.monotonic() < deadline:
+            try:
+                last_resp = sql_query(query)
+                row = last_resp['dataset'][0]
+                count = int(row[0])
+                distinct_id = int(row[1])
+                min_id = None if row[2] is None else int(row[2])
+                max_id = None if row[3] is None else int(row[3])
+                if (
+                        count == expected_count and
+                        distinct_id == expected_distinct_id and
+                        (expected_min_id is None or min_id == expected_min_id) and
+                        (expected_max_id is None or max_id == expected_max_id)):
+                    return last_resp
+            except Exception as e:
+                last_error = e
+            time.sleep(0.05)
+        self.fail(
+            f'Timed out waiting for aggregates from {query!r}; '
+            f'last_resp={last_resp!r}; last_error={last_error!r}')
+
+    def _write_server_accepted_unacked_qwp_frame_then_restart(
+            self,
+            table_name,
+            sender_id,
+            sf_dir,
+            first_id,
+            count):
+        proxy = QwpWsDropAckProxy(
+            QDB_FIXTURE.host,
+            QDB_FIXTURE.http_server_port)
+        proxy.start()
+        sender = None
+        server_stopped = False
+        try:
+            sender = self._connect_sender(self._sender_conf(
+                sender_id,
+                sf_dir,
+                port=proxy.port,
+                reconnect_max_duration_millis=120000,
+                close_flush_timeout_millis=0))
+            self._write_rows(sender, table_name, first_id, count)
+            sender.flush()
+            proxy.join()
+            QDB_FIXTURE.stop()
+            server_stopped = True
+        finally:
+            if sender is not None:
+                sender.close(False)
+            if proxy.is_alive():
+                proxy.close()
+            if server_stopped:
+                QDB_FIXTURE.start()
+
+        self.assertGreater(
+            self._sfa_file_count(sf_dir, sender_id),
+            0,
+            'server-accepted unacked QWP frame did not leave recoverable SFA files')
+
+    def _recover_sf_dir(self, sender_id, sf_dir):
+        sender = self._connect_sender(self._sender_conf(
+            sender_id,
+            sf_dir,
+            reconnect_max_duration_millis=120000,
+            close_flush_timeout_millis=120000))
+        try:
+            sender.close_drain()
+        finally:
+            sender.close(False)
+        self.assertEqual(
+            self._sfa_file_count(sf_dir, sender_id),
+            0,
+            'close-drained recovery sender left SFA frame files behind')
+
+    def test_same_sender_survives_server_restart(self):
+        table_name = 'qwp_ws_restart_' + uuid.uuid4().hex[:8]
+        self._create_restart_table(table_name)
+        sender_id = 's2-' + uuid.uuid4().hex[:12]
+
+        with tempfile.TemporaryDirectory(prefix='qwp-ws-s2-') as sf_dir:
+            sender = self._connect_sender(self._sender_conf(
+                sender_id,
+                sf_dir,
+                reconnect_max_duration_millis=120000,
+                close_flush_timeout_millis=120000))
+            try:
+                self._write_rows(sender, table_name, 0, self.ROWS_PER_PHASE)
+                sender.flush()
+
+                QDB_FIXTURE.stop()
+                QDB_FIXTURE.start()
+
+                self._write_rows(
+                    sender,
+                    table_name,
+                    self.ROWS_PER_PHASE,
+                    self.ROWS_PER_PHASE)
+                sender.flush()
+                sender.close_drain()
+            finally:
+                sender.close(False)
+
+        self._retry_assert_aggregates(
+            table_name,
+            expected_count=self.ROWS_PER_PHASE * 2,
+            expected_distinct_id=self.ROWS_PER_PHASE * 2,
+            expected_min_id=0,
+            expected_max_id=self.ROWS_PER_PHASE * 2 - 1)
+
+    def test_reconnect_gives_up_after_cap(self):
+        table_name = 'qwp_ws_cap_' + uuid.uuid4().hex[:8]
+        self._create_restart_table(table_name)
+        sender_id = 's1-' + uuid.uuid4().hex[:12]
+        observed_error = None
+        observed_error_after = None
+
+        with tempfile.TemporaryDirectory(prefix='qwp-ws-s1-') as sf_dir:
+            sender = self._connect_sender(self._sender_conf(
+                sender_id,
+                sf_dir,
+                reconnect_max_duration_millis=500,
+                reconnect_initial_backoff_millis=10,
+                reconnect_max_backoff_millis=50,
+                close_flush_timeout_millis=0))
+            server_stopped = False
+            try:
+                self._write_row(sender, table_name, 0)
+                sender.flush()
+                self._retry_assert_aggregates(
+                    table_name,
+                    expected_count=1,
+                    expected_distinct_id=1,
+                    expected_min_id=0,
+                    expected_max_id=0)
+
+                QDB_FIXTURE.stop()
+                server_stopped = True
+                outage_started = time.monotonic()
+                deadline = time.monotonic() + 5
+                attempt = 0
+                while time.monotonic() < deadline:
+                    attempt += 1
+                    try:
+                        self._write_row(sender, table_name, 1)
+                        sender.flush()
+                    except qls.SenderError as e:
+                        observed_error = e
+                        observed_error_after = time.monotonic() - outage_started
+                        break
+                    time.sleep(0.05)
+
+                self.assertIsNotNone(
+                    observed_error,
+                    'sender did not surface reconnect-cap failure within 5 seconds')
+                self.assertRegex(
+                    str(observed_error),
+                    r'(?i)(reconnect|connect|terminal|refused)')
+                self.assertGreaterEqual(
+                    observed_error_after,
+                    0.35,
+                    'sender surfaced an error too quickly to prove that the '
+                    'configured reconnect cap was exercised')
+            finally:
+                sender.close(False)
+                if server_stopped:
+                    QDB_FIXTURE.start()
+
+        self._retry_assert_aggregates(
+            table_name,
+            expected_count=1,
+            expected_distinct_id=1,
+            expected_min_id=0,
+            expected_max_id=0)
+
+    def test_new_sender_recovers_from_sf_dir(self):
+        table_name = 'qwp_ws_recover_' + uuid.uuid4().hex[:8]
+        self._create_restart_table(table_name)
+        sender_id = 's3-' + uuid.uuid4().hex[:12]
+
+        with tempfile.TemporaryDirectory(prefix='qwp-ws-s3-') as sf_dir:
+            self._write_server_accepted_unacked_qwp_frame_then_restart(
+                table_name,
+                sender_id,
+                sf_dir,
+                0,
+                self.ROWS_PER_RECOVERY_EPOCH)
+
+            second = self._connect_sender(self._sender_conf(
+                sender_id,
+                sf_dir,
+                reconnect_max_duration_millis=120000,
+                close_flush_timeout_millis=120000))
+            try:
+                self._write_rows(
+                    second,
+                    table_name,
+                    self.ROWS_PER_RECOVERY_EPOCH,
+                    self.ROWS_PER_RECOVERY_EPOCH)
+                second.flush()
+                second.close_drain()
+            finally:
+                second.close(False)
+
+            expected_count = self.ROWS_PER_RECOVERY_EPOCH * 2
+            self._retry_assert_aggregates(
+                table_name,
+                expected_count=expected_count,
+                expected_distinct_id=expected_count,
+                expected_min_id=0,
+                expected_max_id=expected_count - 1,
+                timeout_sec=60)
+            self.assertEqual(
+                self._sfa_file_count(sf_dir, sender_id),
+                0,
+                'close-drained recovery sender left SFA frame files behind')
+
+    def test_sender_pushes_continuously_while_server_bounces(self):
+        table_name = 'qwp_ws_bounce_' + uuid.uuid4().hex[:8]
+        self._create_restart_table(table_name)
+        sender_id = 's4-' + uuid.uuid4().hex[:12]
+        stop_producer = threading.Event()
+        rows_produced = 0
+        producer_error = []
+
+        def producer(sf_dir):
+            nonlocal rows_produced
+            sender = None
+            next_id = 0
+            try:
+                sender = self._connect_sender(self._sender_conf(
+                    sender_id,
+                    sf_dir,
+                    reconnect_max_duration_millis=120000,
+                    close_flush_timeout_millis=120000))
+                while not stop_producer.is_set():
+                    batch_first_id = next_id
+                    self._write_rows(
+                        sender,
+                        table_name,
+                        batch_first_id,
+                        self.CONTINUOUS_BATCH_ROWS)
+                    next_id += self.CONTINUOUS_BATCH_ROWS
+                    sender.flush()
+                    rows_produced = next_id
+                    time.sleep(0.002)
+                sender.close_drain()
+            except BaseException as e:
+                producer_error.append(e)
+            finally:
+                if sender is not None:
+                    sender.close(False)
+
+        with tempfile.TemporaryDirectory(prefix='qwp-ws-s4-') as sf_dir:
+            producer_thread = threading.Thread(
+                target=producer,
+                args=(sf_dir,),
+                name='qwp-ws-restart-producer',
+                daemon=True)
+            producer_thread.start()
+            try:
+                startup_deadline = time.monotonic() + 5
+                while (
+                        rows_produced == 0 and
+                        not producer_error and
+                        time.monotonic() < startup_deadline):
+                    time.sleep(0.01)
+                if producer_error:
+                    raise AssertionError(
+                        'producer failed before first server bounce') from producer_error[0]
+                self.assertGreater(
+                    rows_produced,
+                    0,
+                    'producer did not flush an initial batch before first bounce')
+                for bounce_index in range(self.CONTINUOUS_BOUNCES):
+                    rows_before_stop = rows_produced
+                    QDB_FIXTURE.stop()
+                    time.sleep(0.05)
+                    QDB_FIXTURE.start()
+                    rows_at_restart = rows_produced
+                    restart_deadline = time.monotonic() + 10
+                    while (
+                            rows_produced <= rows_at_restart and
+                            not producer_error and
+                            time.monotonic() < restart_deadline):
+                        time.sleep(0.01)
+                    if producer_error:
+                        raise AssertionError(
+                            f'producer failed after server restart #{bounce_index + 1}') from producer_error[0]
+                    self.assertGreater(
+                        rows_produced,
+                        rows_at_restart,
+                        f'producer did not flush any rows after restart #{bounce_index + 1} completed')
+                    self.assertGreater(
+                        rows_produced,
+                        rows_before_stop,
+                        f'producer did not flush any rows after bounce #{bounce_index + 1} began')
+                    time.sleep(0.2)
+                time.sleep(0.2)
+            finally:
+                stop_producer.set()
+                producer_thread.join(180)
+
+            self.assertFalse(
+                producer_thread.is_alive(),
+                f'producer did not finish within 180s '
+                f'(rows_produced={rows_produced})')
+            if producer_error:
+                raise AssertionError(
+                    'producer must not surface failures across server bounces '
+                    f'(rows_produced={rows_produced})') from producer_error[0]
+            self.assertGreater(rows_produced, 0, 'producer wrote zero rows')
+
+            self._retry_assert_aggregates(
+                table_name,
+                expected_count=rows_produced,
+                expected_distinct_id=rows_produced,
+                expected_min_id=0,
+                expected_max_id=rows_produced - 1,
+                timeout_sec=60)
+            self.assertEqual(
+                self._sfa_file_count(sf_dir, sender_id),
+                0,
+                'close-drained continuous sender left SFA frame files behind')
+
+    def test_fuzz_multiple_restarts_new_sender(self):
+        table_name = 'qwp_ws_multi_' + uuid.uuid4().hex[:8]
+        self._create_restart_table(table_name)
+        sender_id = 's5-' + uuid.uuid4().hex[:12]
+        expected_count = 0
+
+        with tempfile.TemporaryDirectory(prefix='qwp-ws-s5-') as sf_dir:
+            for rows_in_epoch in self.MULTI_EPOCH_ROWS:
+                self._write_server_accepted_unacked_qwp_frame_then_restart(
+                    table_name,
+                    sender_id,
+                    sf_dir,
+                    expected_count,
+                    rows_in_epoch)
+                expected_count += rows_in_epoch
+
+                self._recover_sf_dir(sender_id, sf_dir)
+                self._retry_assert_aggregates(
+                    table_name,
+                    expected_count=expected_count,
+                    expected_distinct_id=expected_count,
+                    expected_min_id=0,
+                    expected_max_id=expected_count - 1,
+                    timeout_sec=60)
+
+
 class TestQwpUdpSender(unittest.TestCase):
     def setUp(self):
         test_name = self.id()
@@ -2223,46 +2865,68 @@ def run_with_fixtures(args):
     global BUILD_MODE
 
     latest_protocol = sorted(list(qls.ProtocolVersion))[-1]
-    for questdb_dir, auth in itertools.product(iter_versions(args), (False, True)):
-        QDB_FIXTURE = QuestDbFixture(
-            questdb_dir,
-            auth=auth,
-            qwp_udp=bool(getattr(args, 'repo', None)))
-        TLS_PROXY_FIXTURE = None
-        try:
-            sys.stderr.write(f'>>>> STARTING {questdb_dir} [auth={auth}] <<<<\n')
-            QDB_FIXTURE.start()
-            for http, protocol_version, build_mode in itertools.product(
-                    (False, True),  # http
-                    [None] + list(qls.ProtocolVersion),  # None is for `auto`
-                    list(qls.BuildMode)):
-                if (build_mode in (qls.BuildMode.API, qls.BuildMode.ENV)) and (protocol_version != latest_protocol):
-                    continue
-                if http and auth:
-                    continue
-                if auth and (protocol_version != latest_protocol):
-                    continue
-                sys.stderr.write(
-                    f'>>>> Running tests [auth={auth}, http={http}, build_mode={build_mode}, protocol_version={protocol_version}]\n')
-                # Read the version _after_ a first start so it can rely
-                # on the live one from the `select build` query.
-                BUILD_MODE = build_mode
-                QDB_FIXTURE.http = http
-                QDB_FIXTURE.protocol_version = protocol_version
-                port_to_proxy = QDB_FIXTURE.http_server_port \
-                    if http else QDB_FIXTURE.line_tcp_port
-                TLS_PROXY_FIXTURE = TlsProxyFixture(port_to_proxy)
-                TLS_PROXY_FIXTURE.start()
+    run_matrix_suite = _select_qwp_ws_restart_tests(False).countTestCases() > 0
+    run_restart_suite = _select_qwp_ws_restart_tests(True).countTestCases() > 0
+
+    for questdb_dir in iter_versions(args):
+        if run_matrix_suite:
+            for auth in (False, True):
+                QDB_FIXTURE = QuestDbFixture(
+                    questdb_dir,
+                    auth=auth,
+                    qwp_udp=bool(getattr(args, 'repo', None)))
+                TLS_PROXY_FIXTURE = None
                 try:
-                    QDB_FIXTURE.drop_all_tables()
-                    test_prog = unittest.TestProgram(exit=False)
-                    if not test_prog.result.wasSuccessful():
-                        sys.exit(1)
+                    sys.stderr.write(f'>>>> STARTING {questdb_dir} [auth={auth}] <<<<\n')
+                    QDB_FIXTURE.start()
+                    for http, protocol_version, build_mode in itertools.product(
+                            (False, True),  # http
+                            [None] + list(qls.ProtocolVersion),  # None is for `auto`
+                            list(qls.BuildMode)):
+                        if (build_mode in (qls.BuildMode.API, qls.BuildMode.ENV)) and (protocol_version != latest_protocol):
+                            continue
+                        if http and auth:
+                            continue
+                        if auth and (protocol_version != latest_protocol):
+                            continue
+                        sys.stderr.write(
+                            f'>>>> Running tests [auth={auth}, http={http}, build_mode={build_mode}, protocol_version={protocol_version}]\n')
+                        # Read the version _after_ a first start so it can rely
+                        # on the live one from the `select build` query.
+                        BUILD_MODE = build_mode
+                        QDB_FIXTURE.http = http
+                        QDB_FIXTURE.protocol_version = protocol_version
+                        port_to_proxy = QDB_FIXTURE.http_server_port \
+                            if http else QDB_FIXTURE.line_tcp_port
+                        TLS_PROXY_FIXTURE = TlsProxyFixture(port_to_proxy)
+                        TLS_PROXY_FIXTURE.start()
+                        try:
+                            QDB_FIXTURE.drop_all_tables()
+                            if not _run_selected_tests(False):
+                                sys.exit(1)
+                        finally:
+                            if TLS_PROXY_FIXTURE:
+                                TLS_PROXY_FIXTURE.stop()
                 finally:
-                    if TLS_PROXY_FIXTURE:
-                        TLS_PROXY_FIXTURE.stop()
-        finally:
-            QDB_FIXTURE.stop()
+                    QDB_FIXTURE.stop()
+
+        if run_restart_suite:
+            QDB_FIXTURE = QuestDbFixture(
+                questdb_dir,
+                auth=False,
+                qwp_udp=bool(getattr(args, 'repo', None)))
+            TLS_PROXY_FIXTURE = None
+            try:
+                sys.stderr.write(f'>>>> STARTING {questdb_dir} [qwp_ws_restart] <<<<\n')
+                QDB_FIXTURE.start()
+                BUILD_MODE = qls.BuildMode.CONF
+                QDB_FIXTURE.http = False
+                QDB_FIXTURE.protocol_version = latest_protocol
+                QDB_FIXTURE.drop_all_tables()
+                if not _run_selected_tests(True):
+                    sys.exit(1)
+            finally:
+                QDB_FIXTURE.stop()
 
 
 def run(args, show_help=False):

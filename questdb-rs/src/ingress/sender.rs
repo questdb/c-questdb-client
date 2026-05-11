@@ -678,9 +678,9 @@ impl Sender {
     /// Stop accepting new QWP/WebSocket publications and wait for all already
     /// published frames to complete.
     ///
-    /// This uses the current built-in close-drain timeout. The Java-compatible
-    /// `close_flush_timeout_millis` config key is still rejected until Rust
-    /// exposes configurable close-drain timeout semantics.
+    /// The wait is bounded by the QWP/WebSocket `close_flush_timeout_millis`
+    /// setting. Its default is 5000 ms, matching the Java sender. Values less
+    /// than or equal to zero skip the wait.
     #[cfg(feature = "sync-sender-qwp-ws")]
     pub fn close_drain(&mut self) -> Result<()> {
         let result = match &mut self.handler {

@@ -565,7 +565,7 @@ impl SenderBuilder {
                     builder.initial_connect_retry(parse_initial_connect_retry_value(val)?)?
                 }
                 #[cfg(feature = "_sender-qwp-ws")]
-                "close_flush_timeout_millis" => builder.reject_close_flush_timeout_millis()?,
+                "close_flush_timeout_millis" => builder.close_flush_timeout_millis(val)?,
                 #[cfg(feature = "_sender-qwp-ws")]
                 "request_durable_ack" => builder.request_durable_ack(val)?,
                 #[cfg(feature = "_sender-qwp-ws")]
@@ -1272,18 +1272,23 @@ impl SenderBuilder {
     }
 
     #[cfg(feature = "_sender-qwp-ws")]
-    fn reject_close_flush_timeout_millis(self) -> Result<Self> {
-        if self.qwp_ws.is_none() {
+    fn close_flush_timeout_millis(mut self, value: &str) -> Result<Self> {
+        let Some(qwp_ws) = &mut self.qwp_ws else {
             return Err(error::fmt!(
                 ConfigError,
                 "The \"close_flush_timeout_millis\" setting is only supported for QWP/WebSocket."
             ));
-        }
-
-        Err(error::fmt!(
-            ConfigError,
-            "\"close_flush_timeout_millis\" is not supported by the Rust QWP/WebSocket sync sender yet; use Sender::close_drain() for explicit close-drain behavior."
-        ))
+        };
+        let millis: i64 = parse_conf_value("close_flush_timeout_millis", value)?;
+        let timeout = if millis <= 0 {
+            Duration::ZERO
+        } else {
+            Duration::from_millis(millis as u64)
+        };
+        qwp_ws
+            .close_flush_timeout
+            .set_specified("close_flush_timeout_millis", timeout)?;
+        Ok(self)
     }
 
     #[cfg(feature = "_sender-qwp-ws")]

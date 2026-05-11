@@ -1479,8 +1479,10 @@ bool line_sender_qwpws_errors_dropped(
 
 /**
  * Stop accepting new QWP/WebSocket publications and wait for already-published
- * frames to resolve. Timeout and terminal failure are reported through
- * `err_out`.
+ * frames to resolve. The timeout is configured with the QWP/WebSocket
+ * `close_flush_timeout_millis` config key; the default is 5000 ms, and values
+ * less than or equal to 0 configure a zero-timeout fast close. Timeout and
+ * terminal failure are reported through `err_out`.
  */
 LINESENDER_API
 bool line_sender_qwpws_close_drain(

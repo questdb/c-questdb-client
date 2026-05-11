@@ -1635,7 +1635,10 @@ public:
 
     /**
      * Stop accepting new QWP/WebSocket publications and wait for already
-     * published frames to resolve. Throws on timeout or terminal failure.
+     * published frames to resolve. The timeout is configured with
+     * `close_flush_timeout_millis`; the default is 5000 ms, and values less
+     * than or equal to 0 configure a zero-timeout fast close. Throws on
+     * timeout or terminal failure.
      */
     void close_drain()
     {

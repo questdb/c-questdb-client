@@ -85,6 +85,8 @@ class Protocol(Enum):
     HTTP = (c_line_sender_protocol(2), 'http')
     HTTPS = (c_line_sender_protocol(3), 'https')
     QWPUDP = (c_line_sender_protocol(4), 'qwpudp')
+    QWPWS = (c_line_sender_protocol(5), 'qwpws')
+    QWPWSS = (c_line_sender_protocol(6), 'qwpwss')
 
     @classmethod
     def from_int(cls, value: c_line_sender_protocol):
@@ -559,6 +561,11 @@ def _setup_cdll():
         dll.line_sender_get_max_name_len,
         c_size_t,
         c_line_sender_p)
+    set_sig(
+        dll.line_sender_qwpws_close_drain,
+        c_bool,
+        c_line_sender_p,
+        c_line_sender_error_p_p)
     return dll
 
 
@@ -921,7 +928,7 @@ class Sender:
             port: Union[str, int],
             **kwargs):
 
-        if protocol in (Protocol.TCPS, Protocol.HTTPS):
+        if protocol in (Protocol.TCPS, Protocol.HTTPS, Protocol.QWPWSS):
             if host == '127.0.0.1':
                 host = 'localhost'  # for TLS connections we need a hostname
 
@@ -943,6 +950,15 @@ class Sender:
 
         self._conf = ''.join(self._conf)
         self._opts = opts
+
+    @classmethod
+    def from_conf(cls, conf: str):
+        sender = cls.__new__(cls)
+        sender._build_mode = BuildMode.CONF
+        sender._impl = None
+        sender._conf = conf
+        sender._opts = None
+        return sender
 
     @property
     def buffer(self):
@@ -1078,6 +1094,12 @@ class Sender:
         if self._impl:
             _DLL.line_sender_close(self._impl)
             self._impl = None
+
+    def close_drain(self):
+        self._check_connected()
+        _error_wrapped_call(
+            _DLL.line_sender_qwpws_close_drain,
+            self._impl)
 
     def __exit__(self, exc_type, _exc_val, _exc_tb):
         self.close(not exc_type)

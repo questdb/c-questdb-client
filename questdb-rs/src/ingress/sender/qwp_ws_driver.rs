@@ -1008,6 +1008,10 @@ impl<Q: PublicationLog, T: ManualDriverTransport> ManualDriverPrototype<Q, T> {
         self.store.try_submit(payload)
     }
 
+    pub(crate) fn set_closing(&mut self) {
+        self.store.set_closing();
+    }
+
     pub(crate) fn submit_with_drive_limit(
         &mut self,
         payload: &[u8],
