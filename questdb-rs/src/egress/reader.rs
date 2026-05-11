@@ -279,8 +279,7 @@ impl Reader {
             // message ("HTTP error: 401") with no way to tell which
             // endpoint refused.
             let endpoint = &cfg.addrs[idx];
-            let annotated =
-                Error::new(e.code(), format!("endpoint {}: {}", endpoint, e.msg()));
+            let annotated = Error::new(e.code(), format!("endpoint {}: {}", endpoint, e.msg()));
             if let Some(r) = e.upgrade_reject() {
                 annotated.with_upgrade_reject(r.clone())
             } else {
