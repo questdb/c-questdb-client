@@ -2371,4 +2371,71 @@ mod tests {
             );
         }
     }
+
+    /// `base = 0` MUST return 0 without touching the splitmix state.
+    /// A backoff of zero is the documented "sleep is a no-op" sentinel
+    /// and the caller passes it whenever `failover_backoff_initial_ms`
+    /// has been driven to zero by repeated doubling under saturation.
+    #[test]
+    fn full_jitter_ms_zero_base_returns_zero() {
+        let mut rng = FailoverRng::new();
+        for _ in 0..32 {
+            assert_eq!(rng.full_jitter_ms(0), 0);
+        }
+    }
+
+    /// Every draw lies in `[0, base)` — the full-jitter contract from
+    /// failover.md §3.1. This is the discriminator against the
+    /// equal-jitter variant `[base, 2*base)` used by SF ingress: a
+    /// regression that swapped the implementation would produce draws
+    /// >= `base` on the first iteration. 10k samples per base across
+    /// several bases (powers of two, near-`u32::MAX`, and primes that
+    /// exercise the `% base` reduction) catches both off-by-one and
+    /// signed/unsigned mix-ups.
+    #[test]
+    fn full_jitter_ms_draws_are_in_range() {
+        let mut rng = FailoverRng::new();
+        for &base in &[1u64, 2, 80, 100, 1_000, 65_537, u32::MAX as u64] {
+            for _ in 0..10_000 {
+                let d = rng.full_jitter_ms(base);
+                assert!(
+                    d < base,
+                    "full_jitter_ms({}) returned {}, which is >= base \
+                     (full-jitter draws must be in [0, base))",
+                    base,
+                    d
+                );
+            }
+        }
+    }
+
+    /// The draws span the full `[0, base)` range, not a clamped sub-
+    /// interval. With `base = 100` and 10k samples drawn from a
+    /// Splitmix64-derived uniform, statistical guarantees are
+    /// effectively certain: P(no sample < 10) = (0.9)^10000 ≈ 10^-457,
+    /// and likewise for >= 90. A regression to a constant or a
+    /// half-range clamp would fail one of the two assertions
+    /// deterministically. This replaces the prior wall-clock-based
+    /// `failover_backoff_uses_full_jitter` test, which had to drown
+    /// scheduler noise out of an integration measurement.
+    #[test]
+    fn full_jitter_ms_distribution_covers_full_range() {
+        let mut rng = FailoverRng::new();
+        let mut saw_low = false;
+        let mut saw_high = false;
+        for _ in 0..10_000 {
+            let d = rng.full_jitter_ms(100);
+            if d < 10 {
+                saw_low = true;
+            }
+            if d >= 90 {
+                saw_high = true;
+            }
+            if saw_low && saw_high {
+                break;
+            }
+        }
+        assert!(saw_low, "expected at least one draw < 10 out of 10k samples");
+        assert!(saw_high, "expected at least one draw >= 90 out of 10k samples");
+    }
 }

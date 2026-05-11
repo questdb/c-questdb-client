@@ -2891,26 +2891,40 @@ fn mid_stream_demote_happens_before_walk_picks_next() {
 /// within roughly the configured timeout — not wait indefinitely.
 #[test]
 fn auth_timeout_bounds_upgrade_stall() {
-    // 300ms stall in the mock; 100ms client timeout. The client should
-    // surface within ~100-200ms, well under the 300ms stall ceiling.
-    let srv = MockServer::start(vec![vec![Action::StallUpgrade(Duration::from_millis(300))]]);
-    let conf = format!("qwp::addr={};failover=off;auth_timeout_ms=100", srv.url());
+    // 1.5s stall in the mock; 200ms client timeout. The contract being
+    // tested is "the read is bounded" — what would regress is the
+    // timeout not being applied at all, in which case the client
+    // would wait the full mock stall. Pick a large gap between the
+    // timeout and the stall so the assertion still discriminates on
+    // a heavily loaded CI host (where syscall jitter + scheduler
+    // delay can occasionally add hundreds of ms to a 100ms operation).
+    let stall = Duration::from_millis(1_500);
+    let timeout_ms = 200u64;
+    let srv = MockServer::start(vec![vec![Action::StallUpgrade(stall)]]);
+    let conf = format!(
+        "qwp::addr={};failover=off;auth_timeout_ms={}",
+        srv.url(),
+        timeout_ms
+    );
     let started = std::time::Instant::now();
     let err = match Reader::from_conf(&conf) {
         Ok(_) => panic!("upgrade-stall mock must surface as a connect error"),
         Err(e) => e,
     };
     let elapsed = started.elapsed();
-    // Allow generous slack for CI jitter — the contract is "bounded",
-    // not "exactly 100ms". The hard ceiling is the 300ms stall: if
-    // the timeout weren't applied, the client would wait the full
-    // stall duration. Pin elapsed < 250ms so the assertion catches a
-    // regression that leaves the read unbounded.
+    // Ceiling sits well below the 1.5s stall and well above the 200ms
+    // configured timeout. Even with ~800ms of CI overhead piled on top
+    // of the read deadline, the test still discriminates a working
+    // timeout from a missing one (which would surface at the full stall).
+    let ceiling = Duration::from_millis(1_000);
     assert!(
-        elapsed < Duration::from_millis(250),
-        "auth_timeout_ms=100 must bound the upgrade stall well under the mock's 300ms hold; \
-         got elapsed={:?}, error: {} {:?}",
+        elapsed < ceiling,
+        "auth_timeout_ms={} must bound the upgrade stall well under the mock's {:?} hold; \
+         got elapsed={:?} (ceiling={:?}), error: {} {:?}",
+        timeout_ms,
+        stall,
         elapsed,
+        ceiling,
         err.msg(),
         err.code()
     );
@@ -3061,86 +3075,6 @@ fn zone_unset_on_server_does_not_block_connect() {
     let conf = format!("qwp::addr={};zone=eu-west-1a", srv.url());
     let reader = Reader::from_conf(&conf).expect("connect must succeed without server zone");
     assert_eq!(reader.current_addr().port, srv.addr.port());
-}
-
-// ---------------------------------------------------------------------------
-// Full-jitter + failover_max_duration_ms deadline (step 4)
-// ---------------------------------------------------------------------------
-
-/// Full-jitter draws are uniform in `[0, base)`, so running the same
-/// failover schedule N times should produce a noticeable spread in
-/// elapsed time. A regression to deterministic backoff would
-/// collapse the spread to ~0. Drawing 5 samples is enough to surface
-/// the spread without being CI-flaky; we assert max-min > some
-/// fraction of the schedule's mean.
-#[test]
-fn failover_backoff_uses_full_jitter() {
-    // Schedule: initial=80ms, max=80ms, max_attempts=2.
-    // Two sleeps between attempts; each draws uniform[0, 80).
-    // Per-run total sleep variance is high — variance across 5 runs
-    // gives us deterministic-vs-jittered discrimination.
-    fn run_once() -> Duration {
-        let srv_a = MockServer::start(vec![
-            drop_after_query_script(ServerRole::Standalone, "a"),
-            drop_at_connect_script(),
-        ]);
-        let srv_b = MockServer::start(vec![drop_at_connect_script()]);
-        let conf = format!(
-            "qwp::addr={};failover_max_attempts=2;failover_backoff_initial_ms=80;failover_backoff_max_ms=80",
-            build_addr_list(&[&srv_a, &srv_b])
-        );
-        let mut reader = Reader::from_conf(&conf).expect("connect");
-        let mut cursor = reader.query("select 1").execute().expect("execute");
-        let start = Instant::now();
-        let _ = cursor.next_batch();
-        start.elapsed()
-    }
-    let samples: Vec<Duration> = (0..5).map(|_| run_once()).collect();
-    let min = samples.iter().min().copied().unwrap();
-    let max = samples.iter().max().copied().unwrap();
-    let spread = max.saturating_sub(min);
-    // Deterministic backoff would give spread ~= scheduler noise,
-    // typically < 20ms. With full-jitter uniform[0, 80) drawn twice,
-    // expected spread across 5 samples is on the order of 40-60ms.
-    // Assert spread > 25ms — generous enough to be CI-stable, tight
-    // enough that a regression to constant backoff fails this.
-    assert!(
-        spread > Duration::from_millis(25),
-        "full-jitter must produce variance across runs; samples={:?}, spread={:?}",
-        samples,
-        spread
-    );
-}
-
-/// Sleep within a single attempt is drawn from `[0, base)`, NEVER
-/// from `[base, 2*base)` (the equal-jitter variant used by SF
-/// ingress per failover.md §3.1). Pin the upper bound: with
-/// initial=max=100ms and 3 sleeps, total can be at most ~300ms.
-/// If equal-jitter snuck in by mistake, expected total ~450ms.
-#[test]
-fn failover_backoff_full_jitter_bounds_total_sleep() {
-    let srv = MockServer::start(vec![
-        drop_after_query_script(ServerRole::Standalone, "x"),
-        drop_at_connect_script(),
-    ]);
-    let conf = format!(
-        "qwp::addr={};failover_max_attempts=3;failover_backoff_initial_ms=100;failover_backoff_max_ms=100",
-        srv.url()
-    );
-    let mut reader = Reader::from_conf(&conf).expect("connect");
-    let mut cursor = reader.query("select 1").execute().expect("execute");
-    let start = Instant::now();
-    let _ = cursor.next_batch();
-    let elapsed = start.elapsed();
-    // 3 sleeps × 100ms ceiling = 300ms theoretical upper. Allow
-    // 400ms ceiling for dial overhead + scheduler noise.
-    // Equal-jitter would push expected total ≥ 3 × 100 = 300ms (the
-    // base), with upper bound 600ms.
-    assert!(
-        elapsed < Duration::from_millis(400),
-        "elapsed {:?} suggests sleeps draw above the full-jitter [0, base) range",
-        elapsed
-    );
 }
 
 /// `failover_max_duration_ms` bounds the wall-clock wait in
