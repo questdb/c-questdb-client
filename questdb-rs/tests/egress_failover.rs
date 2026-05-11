@@ -590,16 +590,90 @@ fn build_addr_list(servers: &[&MockServer]) -> String {
         .join(",")
 }
 
-/// Reserve a loopback port via `:0`, capture its address, then drop
-/// the listener. The returned `host:port` will refuse subsequent
-/// connects on the test host — far more reliable than hard-coding
-/// "port 1" (which Docker bridge networks and userspace TCP stacks
-/// can legitimately bind).
-fn reserve_then_close_addr() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
-    let addr = listener.local_addr().expect("local_addr");
-    drop(listener);
-    format!("{}", addr)
+/// Loopback address that reliably rejects every connection attempt
+/// for the lifetime of this guard.
+///
+/// Replaces the previously-flaky "bind `:0`, capture address, drop
+/// the listener" idiom. That idiom has a race window on macOS (and
+/// to a lesser extent every OS): between `drop(listener)` and the
+/// test's eventual connect, the kernel can hand the just-freed
+/// ephemeral port to ANY other process binding `:0` — including
+/// other tests in the same `cargo test` invocation. When that
+/// happens the test sees a successful connect (or a totally
+/// unrelated reply) instead of the refusal it requires, and the
+/// failover assertion goes red for no real reason.
+///
+/// This guard holds the port via a long-lived `TcpListener` for the
+/// whole test, accepting every incoming connection on a background
+/// thread only to immediately drop it with `SO_LINGER=0` — sending
+/// a TCP RST so the client's WS-upgrade read surfaces
+/// `ConnectionReset`, which the egress transport maps to
+/// `SocketError`. Same observable behaviour as a refused connect
+/// from the egress code's perspective; no race window.
+struct DeadEndpoint {
+    addr: SocketAddr,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl DeadEndpoint {
+    fn new() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
+        let addr = listener.local_addr().expect("local_addr");
+        // Nonblocking accept so the worker thread can poll the
+        // shutdown flag between connection attempts.
+        listener
+            .set_nonblocking(true)
+            .expect("set_nonblocking on listener");
+
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown_thread = Arc::clone(&shutdown);
+        let handle = thread::spawn(move || {
+            while !shutdown_thread.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((sock, _peer)) => {
+                        // Linger=0 → kernel sends RST (not FIN) on
+                        // close. Matches the `Action::AbortiveRst`
+                        // pattern in this same file: go via
+                        // `socket2::SockRef` because `TcpStream`'s
+                        // own `set_linger` only landed recently and
+                        // the rest of the file is on the older API.
+                        let _ = socket2::SockRef::from(&sock)
+                            .set_linger(Some(Duration::from_secs(0)));
+                        drop(sock);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self {
+            addr,
+            shutdown,
+            handle: Some(handle),
+        }
+    }
+
+    /// `host:port` for use in a connect string.
+    fn url(&self) -> String {
+        self.addr.to_string()
+    }
+}
+
+impl Drop for DeadEndpoint {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        // Tickle the listener so the next nonblocking `accept` returns
+        // an `Ok` and the worker thread re-checks the shutdown flag
+        // without waiting for the polling tick.
+        let _ = TcpStream::connect(self.addr);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -957,12 +1031,14 @@ fn mid_query_auth_failure_not_retried() {
 fn initial_connect_walks_all_endpoints() {
     // First endpoint is unreachable, second is healthy. The initial
     // walk should surface the healthy endpoint instead of failing on
-    // the first refused connect. Use a freshly-released loopback
-    // port (vs hard-coded "port 1") — port 1 can be legitimately
-    // bound on Docker bridge networks and userspace TCP stacks.
-    let dead_addr = reserve_then_close_addr();
+    // the first refused connect. `DeadEndpoint` holds the loopback
+    // port for the test's lifetime so the OS can't reassign it to
+    // another process between setup and the failover machinery's
+    // connect attempt (the race that made the prior
+    // `reserve_then_close_addr` helper flake on macOS).
+    let dead = DeadEndpoint::new();
     let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);
-    let conf = format!("qwp::addr={},{}", dead_addr, srv_b.url());
+    let conf = format!("qwp::addr={},{}", dead.url(), srv_b.url());
     let mut reader = Reader::from_conf(&conf).expect("walk past unreachable");
     assert_eq!(
         reader.current_addr().port,
@@ -1514,12 +1590,12 @@ fn unable_to_connect_classifies_as_socket_error() {
     // short-circuit on a refused port and never walk past it.
     //
     // This test exercises the reclassification directly: connect to
-    // a freshly-released loopback port (single endpoint, so no walk
-    // can mask the result) and assert the surfaced code is
+    // a guaranteed-rejecting loopback port (single endpoint, so no
+    // walk can mask the result) and assert the surfaced code is
     // `SocketError`. A regression flipping it back to `ConfigError`
     // — or to anything non-failover-eligible — goes red here.
-    let dead_addr = reserve_then_close_addr();
-    let conf = format!("qwp::addr={}", dead_addr);
+    let dead = DeadEndpoint::new();
+    let conf = format!("qwp::addr={}", dead.url());
     let err = match Reader::from_conf(&conf) {
         Err(e) => e,
         Ok(_) => panic!("connecting to a closed port must error"),
