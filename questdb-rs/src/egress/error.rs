@@ -153,8 +153,16 @@ impl UpgradeReject {
 }
 
 /// Egress error.
+///
+/// The payload lives behind a `Box` so `Result<T, Error>` stays
+/// pointer-sized on the happy path. The `ServerInfo` + diagnostic
+/// strings push the inner struct over the 128-byte threshold that
+/// `clippy::result_large_err` (rightly) complains about.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Error {
+pub struct Error(Box<ErrorInner>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ErrorInner {
     code: ErrorCode,
     msg: String,
     /// Set only for upgrade-time role rejections (HTTP `421 +
@@ -182,12 +190,12 @@ impl Error {
     /// [`Error::with_server_info`] if available. The message is taken
     /// verbatim; format it with `format!` at the call site.
     pub fn new<S: Into<String>>(code: ErrorCode, msg: S) -> Error {
-        Error {
+        Error(Box::new(ErrorInner {
             code,
             msg: msg.into(),
             upgrade_reject: None,
             server_info: None,
-        }
+        }))
     }
 
     /// Builder: attach `UpgradeReject` to a freshly-constructed error.
@@ -195,7 +203,7 @@ impl Error {
     /// host-health tracker can later read the role + zone without
     /// re-parsing the HTTP response.
     pub fn with_upgrade_reject(mut self, reject: UpgradeReject) -> Error {
-        self.upgrade_reject = Some(reject);
+        self.0.upgrade_reject = Some(reject);
         self
     }
 
@@ -204,7 +212,7 @@ impl Error {
     /// path. Lets diagnostics name the cluster/node that refused, on top
     /// of the role/zone already on `upgrade_reject`.
     pub fn with_server_info(mut self, info: ServerInfo) -> Error {
-        self.server_info = Some(info);
+        self.0.server_info = Some(info);
         self
     }
 
@@ -212,7 +220,7 @@ impl Error {
     /// new variants may be added (`ErrorCode` is `#[non_exhaustive]`),
     /// but existing ones aren't renamed or repurposed.
     pub fn code(&self) -> ErrorCode {
-        self.code
+        self.0.code
     }
 
     /// Human-readable diagnostic message. Format and contents are
@@ -220,7 +228,7 @@ impl Error {
     /// string is unsupported; use [`Error::code`] for programmatic
     /// classification.
     pub fn msg(&self) -> &str {
-        &self.msg
+        &self.0.msg
     }
 
     /// Server-advertised role + zone carried alongside this error. `Some`
@@ -228,7 +236,7 @@ impl Error {
     /// upgrade reject or a `SERVER_INFO` role / `target=` filter mismatch;
     /// `None` for all other failure paths.
     pub fn upgrade_reject(&self) -> Option<&UpgradeReject> {
-        self.upgrade_reject.as_ref()
+        self.0.upgrade_reject.as_ref()
     }
 
     /// Full last-observed `SERVER_INFO` carried alongside this error.
@@ -239,13 +247,13 @@ impl Error {
     /// `target=`" (this is `Some`) from "all endpoints unreachable"
     /// (this is `None`).
     pub fn server_info(&self) -> Option<&ServerInfo> {
-        self.server_info.as_ref()
+        self.0.server_info.as_ref()
     }
 }
 
 impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.msg)
+        f.write_str(&self.0.msg)
     }
 }
 

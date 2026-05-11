@@ -3389,7 +3389,8 @@ mod tests {
         // bookkeeping is exercised: 1100-1000=100 -> dod 100-100=0
         // (1-bit), then 100-110 -> dod -10 (9-bit), etc.
         let timestamps: [i64; 6] = [1_000, 1_100, 1_200, 1_310, 1_405, 1_488];
-        let cases: &[(ColumnKind, fn(ColumnView<'_>) -> Vec<i64>)] = &[
+        type Extract = fn(ColumnView<'_>) -> Vec<i64>;
+        let cases: &[(ColumnKind, Extract)] = &[
             (ColumnKind::Timestamp, |v| {
                 let ColumnView::Timestamp(c) = v else {
                     panic!("expected ColumnView::Timestamp")
