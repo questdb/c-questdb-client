@@ -472,18 +472,19 @@ pub fn decode_result_batch(
         ));
     }
 
-    // Pull out the schema columns by value to avoid borrowing the registry
-    // while we mutate it (we don't, in this loop, but borrow-check isn't
-    // smart enough about the early consumed-by-decode_section call).
-    let kinds: Vec<ColumnKind> = schema.columns().iter().map(|c| c.kind).collect();
-
+    // The shared borrow of `registry` via `schema` lives until the end
+    // of this batch decode; `decode_column` below takes neither
+    // `registry` nor `dict`, so iterating `schema.columns()` directly
+    // is borrow-check clean and avoids a per-batch `Vec<ColumnKind>`
+    // allocation that scales with column count.
     let mut columns = Vec::with_capacity(col_count);
     let connection_dict_size = dict.len();
-    for (i, kind) in kinds.iter().enumerate() {
+    for (i, col_meta) in schema.columns().iter().enumerate() {
+        let kind = col_meta.kind;
         let col = decode_column(
             &mut r,
             &body,
-            *kind,
+            kind,
             row_count,
             flags_byte,
             connection_dict_size,
