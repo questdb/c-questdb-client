@@ -151,6 +151,13 @@ pub struct Reader {
     /// round-attempted bits reset between walks. Lives on the Reader so
     /// long-lived clients converge on the healthiest endpoint over time.
     tracker: HostHealthTracker,
+    /// Per-Reader PRNG for failover backoff jitter. Egress backoff
+    /// uses **full-jitter** `[0, base)` per failover.md §3.1 — a
+    /// query client is single-user and benefits from the lowest
+    /// expected recovery time. Lives on the Reader so the state
+    /// persists across reconnect cycles within a single Reader's
+    /// lifetime.
+    failover_rng: FailoverRng,
 }
 
 impl Reader {
@@ -254,6 +261,7 @@ impl Reader {
             auth_rejections_during_connect: walk.auth_rejections,
             zstd_scratch: ZstdScratch::new(),
             tracker,
+            failover_rng: FailoverRng::new(),
         })
     }
 
@@ -341,6 +349,18 @@ impl Reader {
         let attempts_total = cfg.failover_max_attempts.saturating_add(1);
         let mut backoff_ms = cfg.failover_backoff_initial_ms;
         let mut last_err: Option<Error> = None;
+        // Failover.md §11.9.1 wall-clock budget. `0` is the documented
+        // "unbounded" sentinel — translate to `None` so the inner
+        // arithmetic doesn't have to deal with a special case.
+        let deadline: Option<std::time::Instant> = if cfg.failover_max_duration_ms == 0 {
+            None
+        } else {
+            Some(
+                std::time::Instant::now()
+                    + Duration::from_millis(cfg.failover_max_duration_ms),
+            )
+        };
+        let mut deadline_exhausted = false;
         // Spec invariant (failover.md §2.3): mid-stream demote MUST run
         // before the next `begin_round(forget=true)` — reversing the
         // order would let sticky-Healthy preserve the just-failed host
@@ -366,7 +386,29 @@ impl Reader {
         let mut total_dials: u32 = 0;
         for attempt in 0..attempts_total {
             if attempt > 0 {
-                std::thread::sleep(Duration::from_millis(backoff_ms));
+                // Failover.md §11.9 + §3.1: full-jitter `[0, base)`.
+                // Single-user egress benefits from the lowest expected
+                // recovery time; thundering-herd damping isn't a
+                // concern at one client per workload.
+                let jittered_ms = self.failover_rng.full_jitter_ms(backoff_ms);
+                // §11.9.1 deadline interplay: the sleep is clamped to
+                // `deadline - now`. If `now >= deadline`, the failover
+                // budget is exhausted — exit without sleeping or
+                // walking again. Per spec, the deadline check gates
+                // failover eligibility (not total Execute wall-clock).
+                let sleep_dur = match deadline {
+                    Some(dl) => match dl.checked_duration_since(std::time::Instant::now()) {
+                        Some(remaining) if !remaining.is_zero() => {
+                            std::cmp::min(Duration::from_millis(jittered_ms), remaining)
+                        }
+                        _ => {
+                            deadline_exhausted = true;
+                            break;
+                        }
+                    },
+                    None => Duration::from_millis(jittered_ms),
+                };
+                std::thread::sleep(sleep_dur);
                 backoff_ms = backoff_ms
                     .saturating_mul(2)
                     .min(cfg.failover_backoff_max_ms);
@@ -414,6 +456,18 @@ impl Reader {
                     }
                 },
             }
+        }
+        if deadline_exhausted {
+            let last_msg = last_err
+                .as_ref()
+                .map(|e| e.msg().to_string())
+                .unwrap_or_else(|| "<no error captured>".to_string());
+            return Err(fmt!(
+                SocketError,
+                "failover wall-clock budget exhausted (failover_max_duration_ms={}); last error: {}",
+                cfg.failover_max_duration_ms,
+                last_msg
+            ));
         }
         Err(last_err.unwrap_or_else(|| {
             fmt!(
@@ -1745,6 +1799,66 @@ fn prefer_over_trigger(code: ErrorCode) -> bool {
             | ErrorCode::HandshakeError
             | ErrorCode::TlsError
     )
+}
+
+/// Splitmix64 PRNG state for failover backoff jitter. Lives on the
+/// `Reader`; each instance gets a distinct seed at construction time.
+/// Splitmix64 is the simplest non-trivial 64-bit generator with good
+/// statistical properties for this use case (uniform draws over small
+/// integer ranges); avoids pulling `rand` into the `sync-reader-ws`
+/// feature.
+///
+/// The state is mutated on every draw. Splitmix64 is full-period
+/// (cycles through all 2^64 values), so deterministic seeding is fine
+/// — the only requirement is that draws within a single reconnect
+/// round are uncorrelated.
+#[derive(Debug)]
+pub(crate) struct FailoverRng {
+    state: u64,
+}
+
+impl FailoverRng {
+    /// Seed from process time + a per-process monotonic counter so two
+    /// Readers built in the same nanosecond still get distinct streams.
+    pub(crate) fn new() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let bump = COUNTER.fetch_add(1, Ordering::Relaxed);
+        // XOR-mix the two so neither's alone determines the seed —
+        // SystemTime can be coarse on some platforms; the counter
+        // alone would make collisions across processes likely.
+        Self {
+            state: now_ns ^ bump.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+        }
+    }
+
+    /// Splitmix64 step. Returns a uniformly-distributed `u64`.
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Full-jitter draw per failover.md §3.1: `FullJitter(base) =
+    /// uniform_long[0, base)`. Returns the random milliseconds to
+    /// sleep before the next reconnect attempt. `base = 0` returns 0
+    /// (sleeping for zero is a no-op).
+    pub(crate) fn full_jitter_ms(&mut self, base: u64) -> u64 {
+        if base == 0 {
+            return 0;
+        }
+        // Modulo is safe: the bias for tiny `base` against the 2^64
+        // value space is far below the resolution we care about for a
+        // backoff jitter (sub-microsecond bias on a millisecond
+        // schedule).
+        self.next_u64() % base
+    }
 }
 
 /// Per the Java reference (`QwpQueryClient.matchesTarget`):

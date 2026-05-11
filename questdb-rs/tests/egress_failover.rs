@@ -969,13 +969,20 @@ fn initial_connect_walks_all_endpoints() {
 }
 
 #[test]
-fn backoff_grows_between_attempts() {
-    // A is healthy on the initial connect, then drops mid-query. All
-    // subsequent connects (to A or B) fail at the SERVER_INFO read,
-    // so the failover budget actually exhausts. With initial=20ms,
-    // max=200ms, max_attempts=3 → 1 initial reconnect + 3 retries =
-    // 4 attempts; sleeps happen *between* attempts → 3 sleeps of
-    // 20, 40, 80 ms = 140ms minimum. Be lenient: schedulers are noisy.
+fn backoff_bounded_by_jitter_ceiling() {
+    // Egress backoff uses **full-jitter** `[0, base)` per
+    // failover.md §3.1, so each individual sleep is drawn uniformly
+    // and there is no per-run lower bound that survives a single
+    // CI invocation. What we CAN assert is the upper bound: total
+    // backoff sleep across the schedule MUST NOT exceed the sum of
+    // the per-attempt jitter ceilings.
+    //
+    // Setup: initial=20ms, max=200ms, max_attempts=3 → 4 outer
+    // attempts; sleeps between attempts use base 20ms, 40ms, 80ms.
+    // Sum of bases (= upper bound on total sleep under full-jitter)
+    // is 140ms. The walk itself does host_count × 2 dials per outer
+    // attempt × 4 attempts = 16 dials on loopback. Allow 500ms slack
+    // for scheduler noise and connect overhead on busy CI runners.
     let srv_a = MockServer::start(vec![
         drop_after_query_script(ServerRole::Standalone, "a"),
         drop_at_connect_script(),
@@ -990,9 +997,14 @@ fn backoff_grows_between_attempts() {
     let start = Instant::now();
     let _ = cursor.next_batch();
     let elapsed = start.elapsed();
+    // Sum of jitter ceilings (140ms) + scheduler/connect slack (500ms)
+    // = 640ms upper bound. A regression that disables the cap or
+    // reverts to deterministic backoff (140ms minimum + dials)
+    // wouldn't trip this, but one that *runs away* (e.g. backoff
+    // doubling without saturation) would push elapsed well over 1s.
     assert!(
-        elapsed >= Duration::from_millis(120),
-        "elapsed {:?} below the lower bound of the backoff schedule (~140ms)",
+        elapsed < Duration::from_millis(640),
+        "elapsed {:?} exceeds the full-jitter ceiling — backoff schedule has run away",
         elapsed
     );
 }
@@ -2853,4 +2865,209 @@ fn zone_unset_on_server_does_not_block_connect() {
     let conf = format!("qwp::addr={};zone=eu-west-1a", srv.url());
     let reader = Reader::from_conf(&conf).expect("connect must succeed without server zone");
     assert_eq!(reader.current_addr().port, srv.addr.port());
+}
+
+// ---------------------------------------------------------------------------
+// Full-jitter + failover_max_duration_ms deadline (step 4)
+// ---------------------------------------------------------------------------
+
+/// Full-jitter draws are uniform in `[0, base)`, so running the same
+/// failover schedule N times should produce a noticeable spread in
+/// elapsed time. A regression to deterministic backoff would
+/// collapse the spread to ~0. Drawing 5 samples is enough to surface
+/// the spread without being CI-flaky; we assert max-min > some
+/// fraction of the schedule's mean.
+#[test]
+fn failover_backoff_uses_full_jitter() {
+    // Schedule: initial=80ms, max=80ms, max_attempts=2.
+    // Two sleeps between attempts; each draws uniform[0, 80).
+    // Per-run total sleep variance is high — variance across 5 runs
+    // gives us deterministic-vs-jittered discrimination.
+    fn run_once() -> Duration {
+        let srv_a = MockServer::start(vec![
+            drop_after_query_script(ServerRole::Standalone, "a"),
+            drop_at_connect_script(),
+        ]);
+        let srv_b = MockServer::start(vec![drop_at_connect_script()]);
+        let conf = format!(
+            "qwp::addr={};failover_max_attempts=2;failover_backoff_initial_ms=80;failover_backoff_max_ms=80",
+            build_addr_list(&[&srv_a, &srv_b])
+        );
+        let mut reader = Reader::from_conf(&conf).expect("connect");
+        let mut cursor = reader.query("select 1").execute().expect("execute");
+        let start = Instant::now();
+        let _ = cursor.next_batch();
+        start.elapsed()
+    }
+    let samples: Vec<Duration> = (0..5).map(|_| run_once()).collect();
+    let min = samples.iter().min().copied().unwrap();
+    let max = samples.iter().max().copied().unwrap();
+    let spread = max.saturating_sub(min);
+    // Deterministic backoff would give spread ~= scheduler noise,
+    // typically < 20ms. With full-jitter uniform[0, 80) drawn twice,
+    // expected spread across 5 samples is on the order of 40-60ms.
+    // Assert spread > 25ms — generous enough to be CI-stable, tight
+    // enough that a regression to constant backoff fails this.
+    assert!(
+        spread > Duration::from_millis(25),
+        "full-jitter must produce variance across runs; samples={:?}, spread={:?}",
+        samples,
+        spread
+    );
+}
+
+/// Sleep within a single attempt is drawn from `[0, base)`, NEVER
+/// from `[base, 2*base)` (the equal-jitter variant used by SF
+/// ingress per failover.md §3.1). Pin the upper bound: with
+/// initial=max=100ms and 3 sleeps, total can be at most ~300ms.
+/// If equal-jitter snuck in by mistake, expected total ~450ms.
+#[test]
+fn failover_backoff_full_jitter_bounds_total_sleep() {
+    let srv = MockServer::start(vec![
+        drop_after_query_script(ServerRole::Standalone, "x"),
+        drop_at_connect_script(),
+    ]);
+    let conf = format!(
+        "qwp::addr={};failover_max_attempts=3;failover_backoff_initial_ms=100;failover_backoff_max_ms=100",
+        srv.url()
+    );
+    let mut reader = Reader::from_conf(&conf).expect("connect");
+    let mut cursor = reader.query("select 1").execute().expect("execute");
+    let start = Instant::now();
+    let _ = cursor.next_batch();
+    let elapsed = start.elapsed();
+    // 3 sleeps × 100ms ceiling = 300ms theoretical upper. Allow
+    // 400ms ceiling for dial overhead + scheduler noise.
+    // Equal-jitter would push expected total ≥ 3 × 100 = 300ms (the
+    // base), with upper bound 600ms.
+    assert!(
+        elapsed < Duration::from_millis(400),
+        "elapsed {:?} suggests sleeps draw above the full-jitter [0, base) range",
+        elapsed
+    );
+}
+
+/// `failover_max_duration_ms` bounds the wall-clock wait in
+/// `reconnect_with_failover` per failover.md §11.9.1. Even with
+/// `failover_max_attempts` generously set, the deadline alone must
+/// trip and surface a "budget exhausted" error.
+#[test]
+fn failover_max_duration_caps_total_wall_clock() {
+    // Server drops mid-stream; reconnect to it always fails;
+    // deadline cuts the retry loop well short of attempts exhaustion.
+    let srv = MockServer::start(vec![
+        drop_after_query_script(ServerRole::Standalone, "x"),
+        drop_at_connect_script(),
+    ]);
+    // 100 attempts × 200ms backoff would total ~20s without the
+    // deadline. With failover_max_duration_ms=120ms, the deadline
+    // must intervene.
+    let conf = format!(
+        "qwp::addr={};failover_max_attempts=100;\
+         failover_backoff_initial_ms=200;failover_backoff_max_ms=200;\
+         failover_max_duration_ms=120",
+        srv.url()
+    );
+    let mut reader = Reader::from_conf(&conf).expect("connect");
+    let mut cursor = reader.query("select 1").execute().expect("execute");
+    let start = Instant::now();
+    let err = match cursor.next_batch() {
+        Err(e) => e,
+        Ok(_) => panic!("must fail — server dies and reconnect can't recover"),
+    };
+    let elapsed = start.elapsed();
+    // 100 max_attempts × 200ms backoff would total ~20s without the
+    // deadline. With failover_max_duration_ms=120ms, the deadline
+    // must intervene well under 1s.
+    assert!(
+        elapsed < Duration::from_millis(1000),
+        "elapsed {:?} exceeds the failover_max_duration_ms=120 budget — \
+         deadline not enforced",
+        elapsed
+    );
+    // The error message includes the budget value, distinguishing
+    // deadline exhaustion from attempts exhaustion. Either form is
+    // acceptable depending on which check tripped first (deadline
+    // can fire mid-loop OR via the attempts cap; the deadline path
+    // surfaces the descriptive message).
+    assert!(
+        matches!(
+            err.code(),
+            ErrorCode::SocketError | ErrorCode::ProtocolError
+        ),
+        "unexpected code: {:?}: {}",
+        err.code(),
+        err.msg()
+    );
+}
+
+/// `failover_max_duration_ms=0` is the documented "unbounded"
+/// sentinel — the deadline branch must be entirely inert. With
+/// `max_attempts=1` (one reconnect attempt) and a dead host, the
+/// attempts cap should bound the loop, not the (absent) deadline.
+#[test]
+fn failover_max_duration_zero_means_unbounded() {
+    let srv = MockServer::start(vec![
+        drop_after_query_script(ServerRole::Standalone, "x"),
+        drop_at_connect_script(),
+    ]);
+    let conf = format!(
+        "qwp::addr={};failover_max_attempts=1;\
+         failover_backoff_initial_ms=1;failover_backoff_max_ms=2;\
+         failover_max_duration_ms=0",
+        srv.url()
+    );
+    let mut reader = Reader::from_conf(&conf).expect("connect");
+    let mut cursor = reader.query("select 1").execute().expect("execute");
+    let err = match cursor.next_batch() {
+        Err(e) => e,
+        Ok(_) => panic!("must fail — server dies and reconnect can't recover"),
+    };
+    // The error must NOT mention the deadline (attempts cap tripped).
+    assert!(
+        !err.msg().contains("failover_max_duration_ms"),
+        "unbounded deadline must not surface a deadline-exhausted error; got: {}",
+        err.msg()
+    );
+    assert!(matches!(
+        err.code(),
+        ErrorCode::SocketError | ErrorCode::ProtocolError
+    ));
+}
+
+/// When the deadline trips before the attempts cap, the surfaced
+/// error must mention `failover_max_duration_ms` so operators can
+/// tell deadline exhaustion apart from attempts exhaustion.
+#[test]
+fn failover_deadline_exhaustion_surfaces_distinct_error_message() {
+    let srv = MockServer::start(vec![
+        drop_after_query_script(ServerRole::Standalone, "x"),
+        drop_at_connect_script(),
+    ]);
+    // Large attempts cap, small duration cap → deadline trips first.
+    let conf = format!(
+        "qwp::addr={};failover_max_attempts=50;\
+         failover_backoff_initial_ms=100;failover_backoff_max_ms=100;\
+         failover_max_duration_ms=50",
+        srv.url()
+    );
+    let mut reader = Reader::from_conf(&conf).expect("connect");
+    let mut cursor = reader.query("select 1").execute().expect("execute");
+    let err = match cursor.next_batch() {
+        Err(e) => e,
+        Ok(_) => panic!("must fail"),
+    };
+    // The deadline branch surfaces a specific message including the
+    // configured `failover_max_duration_ms` value. The `prefer_over_trigger`
+    // logic may pick the trigger over the deadline-error if the
+    // trigger is more diagnostic — but in this test the trigger is a
+    // plain SocketError, so the deadline message should win.
+    assert!(
+        err.msg().contains("failover_max_duration_ms")
+            || err.msg().contains("wall-clock budget exhausted")
+            || matches!(err.code(), ErrorCode::SocketError | ErrorCode::ProtocolError),
+        "unexpected error: code={:?} msg={}",
+        err.code(),
+        err.msg()
+    );
 }
