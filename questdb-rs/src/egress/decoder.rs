@@ -1169,26 +1169,7 @@ fn decode_gorilla_temporal(
     // doesn't surface as a hard `ProtocolError`. The natural Gorilla
     // wire layout for `non_null < 3` is `min(non_null, 2)` bare seed
     // timestamps with no bitstream — which is what we read below.
-    let mut decoded = Vec::with_capacity(non_null);
-    if non_null >= 1 {
-        let bytes = r.read_bytes(8)?;
-        decoded.push(i64::from_le_bytes(bytes.try_into().unwrap()));
-    }
-    if non_null >= 2 {
-        let bytes = r.read_bytes(8)?;
-        decoded.push(i64::from_le_bytes(bytes.try_into().unwrap()));
-    }
-    if non_null >= 3 {
-        let bitstream = r.remaining();
-        let mut decoder =
-            crate::egress::gorilla::GorillaDecoder::new(decoded[0], decoded[1], bitstream);
-        for _ in 2..non_null {
-            decoded.push(decoder.decode_next()?);
-        }
-        let consumed = decoder.bytes_consumed();
-        r.advance(consumed)?;
-    }
-
+    //
     // Densify into row_count × 8. Null slots get the QuestDB temporal
     // NULL sentinel (`Long.MIN_VALUE`) per spec §11.5 — same as the
     // non-Gorilla path. `checked_mul` mirrors the guard in
@@ -1200,14 +1181,54 @@ fn decode_gorilla_temporal(
         .checked_mul(8)
         .ok_or_else(|| fmt!(ProtocolError, "gorilla temporal column size overflow"))?;
     let mut dense = allocate_dense_with_sentinel(dense_len, 8, Some(&null_sentinel::I64_LE));
-    let mut next = 0usize;
+
+    // Read up to two bare seed timestamps. They fill the first one or
+    // two non-null rows; the remaining non-null rows (if any) come
+    // from the Gorilla bitstream decoder below.
+    let mut seeds = [0i64; 2];
+    let seed_count = non_null.min(2);
+    for seed in seeds.iter_mut().take(seed_count) {
+        *seed = i64::from_le_bytes(r.read_bytes(8)?.try_into().unwrap());
+    }
+
+    let mut decoder = if non_null >= 3 {
+        Some(crate::egress::gorilla::GorillaDecoder::new(
+            seeds[0],
+            seeds[1],
+            r.remaining(),
+        ))
+    } else {
+        None
+    };
+
+    // Single pass: walk the validity bitmap and write each decoded
+    // value directly into its dense slot. Avoids the intermediate
+    // `Vec<i64>` and second densify copy of the older two-pass version.
+    let mut filled = 0usize;
     for row in 0..row_count {
-        if !is_null_at_opt(&validity, row) {
-            let v = decoded[next];
-            dense[row * 8..row * 8 + 8].copy_from_slice(&v.to_le_bytes());
-            next += 1;
+        if is_null_at_opt(&validity, row) {
+            continue;
+        }
+        let v = if filled < seed_count {
+            seeds[filled]
+        } else {
+            // `non_null > seed_count` here implies `non_null >= 3`,
+            // so `decoder` was built above.
+            decoder
+                .as_mut()
+                .expect("Gorilla decoder is Some when non_null > seed_count")
+                .decode_next()?
+        };
+        dense[row * 8..row * 8 + 8].copy_from_slice(&v.to_le_bytes());
+        filled += 1;
+        if filled == non_null {
+            break;
         }
     }
+    if let Some(d) = decoder {
+        r.advance(d.bytes_consumed())?;
+    }
+
     Ok(ColumnBuffer {
         values: Bytes::from(dense),
         validity,
