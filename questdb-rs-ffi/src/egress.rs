@@ -218,14 +218,27 @@ unsafe fn set_reader_err(
     unsafe { write_err_box(err_out, Error::new(code, msg.into())) }
 }
 
-/// Panic-boundary helper for `extern "C"` entry points. Catches any unwind
-/// from `f` and aborts the process — Rust panics escaping into C are UB.
-/// Used by every entry point that calls upstream Rust code (decoder, drop
-/// chains, allocator paths) where a panic is not currently reachable but a
-/// future refactor could newly expose one. Mirrors the inline
-/// `catch_unwind(AssertUnwindSafe(...))` pattern already used by
-/// `_from_conf`, `_from_env`, `_query_new`, `_query_execute`, `mutate_query`,
-/// and `_cursor_next_batch`.
+/// Panic-boundary helper for `extern "C"` entry points whose body
+/// could plausibly unwind. Catches any panic from `f` and aborts the
+/// process — Rust panics escaping into C are UB.
+///
+/// **Scope:** reserve this for entry points that run code that *can*
+/// panic — decoder drives, transport drives, allocator-heavy paths,
+/// and `Drop` chains. Today: `_from_conf`, `_from_env`, `_query_new`,
+/// `_query_execute`, `mutate_query`, `_cursor_next_batch` (those six
+/// are inline `catch_unwind` blocks, predate this helper) plus
+/// `_close`, `_query_free`, `_cursor_free` (which go through this
+/// wrapper because their `Drop` chains run `close_in_place` and the
+/// tungstenite write paths that can theoretically panic on allocator
+/// failure).
+///
+/// **Explicitly do NOT wrap per-row / per-column accessors** —
+/// `line_reader_cursor_get_*`, `line_reader_cursor_column_*`. Those
+/// run pure pointer arithmetic and integer compares against an
+/// already-decoded `ColumnView`, are statically panic-free in release
+/// for any input that passes their bounds checks, and are called once
+/// per (row, col) on Cython scan loops where the `catch_unwind` frame
+/// shows up at the top of profiles.
 #[inline]
 fn panic_guard<R>(f: impl FnOnce() -> R) -> R {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
@@ -1976,14 +1989,14 @@ pub unsafe extern "C" fn line_reader_cursor_column_kind(
     out_kind: *mut line_reader_column_kind,
     err_out: *mut *mut line_reader_error,
 ) -> bool {
-    panic_guard(|| unsafe {
+    unsafe {
         let view = match get_column_view(&*cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
         };
         *out_kind = view.kind().into();
         true
-    })
+    }
 }
 
 /// Borrowed UTF-8 column name for the column at `col_idx` in the current
@@ -2002,7 +2015,7 @@ pub unsafe extern "C" fn line_reader_cursor_column_name(
     out_len: *mut size_t,
     err_out: *mut *mut line_reader_error,
 ) -> bool {
-    panic_guard(|| unsafe {
+    unsafe {
         let batch = match (*cursor).current_batch.as_ref() {
             Some(b) => b,
             None => {
@@ -2034,7 +2047,7 @@ pub unsafe extern "C" fn line_reader_cursor_column_name(
                 false
             }
         }
-    })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2055,7 +2068,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_bool(
     out_is_null: *mut bool,
     err_out: *mut *mut line_reader_error,
 ) -> bool {
-    panic_guard(|| unsafe {
+    unsafe {
         let view = match get_column_view(&*cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -2078,7 +2091,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_bool(
         *out_is_null = is_null;
         *out_value = !is_null && col.value(row_idx) != 0;
         true
-    })
+    }
 }
 
 /// Read an `LONG` / `TIMESTAMP` (μs) / `DATE` (ms) / `TIMESTAMP_NANOS` (ns)
@@ -2094,7 +2107,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_i64(
     out_is_null: *mut bool,
     err_out: *mut *mut line_reader_error,
 ) -> bool {
-    panic_guard(|| unsafe {
+    unsafe {
         let view = match get_column_view(&*cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -2124,7 +2137,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_i64(
         *out_is_null = is_null;
         *out_value = if is_null { 0 } else { col.value(row_idx) };
         true
-    })
+    }
 }
 
 /// Read a `DOUBLE` value at `(col_idx, row_idx)`.
@@ -2137,7 +2150,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_f64(
     out_is_null: *mut bool,
     err_out: *mut *mut line_reader_error,
 ) -> bool {
-    panic_guard(|| unsafe {
+    unsafe {
         let view = match get_column_view(&*cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -2160,7 +2173,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_f64(
         *out_is_null = is_null;
         *out_value = if is_null { 0.0 } else { col.value(row_idx) };
         true
-    })
+    }
 }
 
 /// Read a `BYTE` (signed 8-bit) value.
@@ -2173,7 +2186,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_i8(
     out_is_null: *mut bool,
     err_out: *mut *mut line_reader_error,
 ) -> bool {
-    panic_guard(|| unsafe {
+    unsafe {
         let view = match get_column_view(&*cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -2196,7 +2209,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_i8(
         *out_is_null = is_null;
         *out_value = if is_null { 0 } else { col.value(row_idx) };
         true
-    })
+    }
 }
 
 /// Read a `SHORT` (signed 16-bit) value.
@@ -2209,7 +2222,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_i16(
     out_is_null: *mut bool,
     err_out: *mut *mut line_reader_error,
 ) -> bool {
-    panic_guard(|| unsafe {
+    unsafe {
         let view = match get_column_view(&*cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -2232,7 +2245,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_i16(
         *out_is_null = is_null;
         *out_value = if is_null { 0 } else { col.value(row_idx) };
         true
-    })
+    }
 }
 
 /// Read an `INT` (signed 32-bit) value. Rejects `IPV4` columns —
@@ -2249,7 +2262,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_i32(
     out_is_null: *mut bool,
     err_out: *mut *mut line_reader_error,
 ) -> bool {
-    panic_guard(|| unsafe {
+    unsafe {
         let view = match get_column_view(&*cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -2272,7 +2285,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_i32(
         *out_is_null = is_null;
         *out_value = if is_null { 0 } else { col.value(row_idx) };
         true
-    })
+    }
 }
 
 /// Read an `IPV4` value as an unsigned 32-bit integer in the conventional
@@ -2289,7 +2302,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_ipv4(
     out_is_null: *mut bool,
     err_out: *mut *mut line_reader_error,
 ) -> bool {
-    panic_guard(|| unsafe {
+    unsafe {
         let view = match get_column_view(&*cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -2312,7 +2325,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_ipv4(
         *out_is_null = is_null;
         *out_value = if is_null { 0 } else { col.value(row_idx) };
         true
-    })
+    }
 }
 
 /// Read a `FLOAT` (32-bit) value.
@@ -2325,7 +2338,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_f32(
     out_is_null: *mut bool,
     err_out: *mut *mut line_reader_error,
 ) -> bool {
-    panic_guard(|| unsafe {
+    unsafe {
         let view = match get_column_view(&*cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -2348,7 +2361,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_f32(
         *out_is_null = is_null;
         *out_value = if is_null { 0.0 } else { col.value(row_idx) };
         true
-    })
+    }
 }
 
 /// Read a `CHAR` value (a 16-bit UTF-16 code unit, per QuestDB semantics).
@@ -2361,7 +2374,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_char(
     out_is_null: *mut bool,
     err_out: *mut *mut line_reader_error,
 ) -> bool {
-    panic_guard(|| unsafe {
+    unsafe {
         let view = match get_column_view(&*cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -2384,7 +2397,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_char(
         *out_is_null = is_null;
         *out_value = if is_null { 0 } else { col.value(row_idx) };
         true
-    })
+    }
 }
 
 /// Read a `UUID` value as 16 raw bytes. `out_value` must point to at least
@@ -2398,7 +2411,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_uuid(
     out_is_null: *mut bool,
     err_out: *mut *mut line_reader_error,
 ) -> bool {
-    panic_guard(|| unsafe {
+    unsafe {
         let view = match get_column_view(&*cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -2425,7 +2438,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_uuid(
             ptr::copy_nonoverlapping(col.value(row_idx).as_ptr(), out_value, 16);
         }
         true
-    })
+    }
 }
 
 /// Read a `LONG256` value as 32 raw little-endian bytes.
@@ -2438,7 +2451,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_long256(
     out_is_null: *mut bool,
     err_out: *mut *mut line_reader_error,
 ) -> bool {
-    panic_guard(|| unsafe {
+    unsafe {
         let view = match get_column_view(&*cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -2465,7 +2478,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_long256(
             ptr::copy_nonoverlapping(col.value(row_idx).as_ptr(), out_value, 32);
         }
         true
-    })
+    }
 }
 
 /// Read a `VARCHAR` value as a borrowed UTF-8 byte slice. The returned
@@ -2482,7 +2495,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_varchar(
     out_is_null: *mut bool,
     err_out: *mut *mut line_reader_error,
 ) -> bool {
-    panic_guard(|| unsafe {
+    unsafe {
         let view = match get_column_view(&*cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -2514,7 +2527,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_varchar(
             }
         }
         true
-    })
+    }
 }
 
 /// Read a `BINARY` value as a borrowed byte slice. Same lifetime contract
@@ -2529,7 +2542,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_binary(
     out_is_null: *mut bool,
     err_out: *mut *mut line_reader_error,
 ) -> bool {
-    panic_guard(|| unsafe {
+    unsafe {
         let view = match get_column_view(&*cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -2561,7 +2574,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_binary(
             }
         }
         true
-    })
+    }
 }
 
 /// Read a `SYMBOL` value as a UTF-8 byte slice resolved through the
@@ -2577,7 +2590,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_symbol(
     out_is_null: *mut bool,
     err_out: *mut *mut line_reader_error,
 ) -> bool {
-    panic_guard(|| unsafe {
+    unsafe {
         let view = match get_column_view(&*cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -2609,7 +2622,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_symbol(
             }
         }
         true
-    })
+    }
 }
 
 /// Read a `DECIMAL64` mantissa plus the column's scale.
@@ -2623,7 +2636,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_decimal64(
     out_is_null: *mut bool,
     err_out: *mut *mut line_reader_error,
 ) -> bool {
-    panic_guard(|| unsafe {
+    unsafe {
         let view = match get_column_view(&*cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -2647,7 +2660,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_decimal64(
         *out_mantissa = if is_null { 0 } else { col.value(row_idx) };
         *out_scale = col.scale();
         true
-    })
+    }
 }
 
 /// Read a `DECIMAL128` mantissa as `u64` low + `i64` high (the upper 64 bits
@@ -2663,7 +2676,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_decimal128(
     out_is_null: *mut bool,
     err_out: *mut *mut line_reader_error,
 ) -> bool {
-    panic_guard(|| unsafe {
+    unsafe {
         let view = match get_column_view(&*cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -2690,7 +2703,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_decimal128(
         *out_high = (bits >> 64) as i64;
         *out_scale = col.scale();
         true
-    })
+    }
 }
 
 /// Read a `DECIMAL256` mantissa as 32 raw little-endian bytes plus column scale.
@@ -2705,7 +2718,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_decimal256(
     out_is_null: *mut bool,
     err_out: *mut *mut line_reader_error,
 ) -> bool {
-    panic_guard(|| unsafe {
+    unsafe {
         let view = match get_column_view(&*cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -2733,7 +2746,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_decimal256(
         }
         *out_scale = col.scale();
         true
-    })
+    }
 }
 
 /// Borrowed view over a single `DOUBLE_ARRAY` row.
@@ -2795,7 +2808,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_double_array(
     out_is_null: *mut bool,
     err_out: *mut *mut line_reader_error,
 ) -> bool {
-    panic_guard(|| unsafe {
+    unsafe {
         let view = match get_column_view(&*cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -2880,7 +2893,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_double_array(
         (*out_view).element_count = raw.len() / 8;
         *out_is_null = false;
         true
-    })
+    }
 }
 
 /// Read a single `f64` element at flat row-major index `flat_idx` of a
@@ -2902,7 +2915,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_double_array_element(
     out_is_null: *mut bool,
     err_out: *mut *mut line_reader_error,
 ) -> bool {
-    panic_guard(|| unsafe {
+    unsafe {
         let view = match get_column_view(&*cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -2948,7 +2961,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_double_array_element(
                 false
             }
         }
-    })
+    }
 }
 
 /// Read a `LONG_ARRAY` row into a borrowed view.
@@ -2961,7 +2974,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_long_array(
     out_is_null: *mut bool,
     err_out: *mut *mut line_reader_error,
 ) -> bool {
-    panic_guard(|| unsafe {
+    unsafe {
         let view = match get_column_view(&*cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -3041,7 +3054,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_long_array(
         (*out_view).element_count = raw.len() / 8;
         *out_is_null = false;
         true
-    })
+    }
 }
 
 /// Read a single `i64` element of a `LONG_ARRAY` row.
@@ -3061,7 +3074,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_long_array_element(
     out_is_null: *mut bool,
     err_out: *mut *mut line_reader_error,
 ) -> bool {
-    panic_guard(|| unsafe {
+    unsafe {
         let view = match get_column_view(&*cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -3107,7 +3120,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_long_array_element(
                 false
             }
         }
-    })
+    }
 }
 
 /// Get the raw validity bitmap for a column in the current batch.
@@ -3126,7 +3139,7 @@ pub unsafe extern "C" fn line_reader_cursor_column_validity(
     out_len: *mut size_t,
     err_out: *mut *mut line_reader_error,
 ) -> bool {
-    panic_guard(|| unsafe {
+    unsafe {
         let view = match get_column_view(&*cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -3146,7 +3159,7 @@ pub unsafe extern "C" fn line_reader_cursor_column_validity(
             }
         }
         true
-    })
+    }
 }
 
 fn column_view_validity<'a>(view: &'a ColumnView<'a>) -> Validity<'a> {
@@ -3459,7 +3472,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_geohash(
     out_is_null: *mut bool,
     err_out: *mut *mut line_reader_error,
 ) -> bool {
-    panic_guard(|| unsafe {
+    unsafe {
         let view = match get_column_view(&*cursor, col_idx, err_out) {
             Some(v) => v,
             None => return false,
@@ -3483,7 +3496,7 @@ pub unsafe extern "C" fn line_reader_cursor_get_geohash(
         *out_value = if is_null { 0 } else { col.value(row_idx) };
         *out_precision_bits = col.precision_bits();
         true
-    })
+    }
 }
 
 // ---------------------------------------------------------------------------
