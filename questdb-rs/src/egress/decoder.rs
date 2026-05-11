@@ -4030,6 +4030,315 @@ mod tests {
         assert_eq!(b.value(1), 2.5);
     }
 
+    // -----------------------------------------------------------------
+    // Coverage backfill (PR #140 review items #3, #4, #11).
+    //
+    // The decoder's existing tests overwhelmingly cover the common
+    // row-counts (1..1000) and value-sizes (a few bytes). The edge
+    // cases below add coverage that would otherwise only fire under
+    // live-server workloads — and only then if the server happens to
+    // emit the exact shape.
+    // -----------------------------------------------------------------
+
+    /// `row_count == 0` RESULT_BATCH for a fixed-width column. The
+    /// decoder still walks its per-column path, so densification, the
+    /// validity bitmap allocation (`div_ceil(0, 8) == 0` bytes), and
+    /// the column-view constructor all need to handle the empty case
+    /// without an off-by-one. Pin the result_end-style "no rows but
+    /// schema present" shape that a live query against an empty table
+    /// would produce.
+    #[test]
+    fn decode_zero_row_batch_long() {
+        let (flags_byte, payload) = BatchBuilder::new(0)
+            .add_column("v", ColumnKind::Long, col_no_nulls(&le_i64s(&[])))
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let batch = decode_result_batch(
+            &payload,
+            flags_byte,
+            &mut dict,
+            &mut reg,
+            &mut ZstdScratch::new(),
+        )
+        .unwrap();
+        assert_eq!(batch.row_count, 0);
+        assert_eq!(batch.columns.len(), 1);
+        let ColumnView::Long(c) = batch.column_view(0, &dict).unwrap() else {
+            panic!()
+        };
+        assert_eq!(c.len(), 0);
+    }
+
+    /// Same zero-row case but for VARCHAR, which is the variable-width
+    /// path. Wire emits the single trailing offset `[0u32]` (`non_null + 1`
+    /// = 1 entries) with no data. The decoder's dense-offset rebuild
+    /// must produce a `[0u32]` array of length `row_count + 1 = 1` and
+    /// not deref into an empty offsets slice.
+    #[test]
+    fn decode_zero_row_batch_varchar() {
+        let (flags_byte, payload) = BatchBuilder::new(0)
+            .add_column("s", ColumnKind::Varchar, varchar_col_no_nulls(&[]))
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let batch = decode_result_batch(
+            &payload,
+            flags_byte,
+            &mut dict,
+            &mut reg,
+            &mut ZstdScratch::new(),
+        )
+        .unwrap();
+        assert_eq!(batch.row_count, 0);
+        let ColumnView::Varchar(c) = batch.column_view(0, &dict).unwrap() else {
+            panic!()
+        };
+        assert_eq!(c.len(), 0);
+        // Dense offsets must include the trailing sentinel; iterating
+        // 0..len() yields no slices but the slice indexing math is
+        // exercised via `offsets()[0..1]`.
+        assert_eq!(c.offsets(), &[0u32]);
+    }
+
+    /// Zero rows across a mix of column kinds — every per-kind decode
+    /// arm must short-circuit cleanly on `row_count == 0`. A regression
+    /// in any one arm (e.g. a stray `unwrap()` on `bitmap.last()`)
+    /// would fail this test even though the single-column variants
+    /// above might still pass.
+    #[test]
+    fn decode_zero_row_batch_multi_kind() {
+        let (flags_byte, payload) = BatchBuilder::new(0)
+            .add_column("i", ColumnKind::Int, col_no_nulls(&le_i32s(&[])))
+            .add_column("l", ColumnKind::Long, col_no_nulls(&le_i64s(&[])))
+            .add_column("d", ColumnKind::Double, col_no_nulls(&le_f64s(&[])))
+            .add_column("s", ColumnKind::Varchar, varchar_col_no_nulls(&[]))
+            .add_column(
+                "b",
+                ColumnKind::Binary,
+                {
+                    // Same shape as varchar: one trailing offset, no data.
+                    let mut out = vec![0x00u8];
+                    out.extend_from_slice(&0u32.to_le_bytes());
+                    out
+                },
+            )
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let batch = decode_result_batch(
+            &payload,
+            flags_byte,
+            &mut dict,
+            &mut reg,
+            &mut ZstdScratch::new(),
+        )
+        .unwrap();
+        assert_eq!(batch.row_count, 0);
+        assert_eq!(batch.columns.len(), 5);
+        for col_idx in 0..5 {
+            let v = batch.column_view(col_idx, &dict).unwrap();
+            // The view's row count is what the public API exposes for
+            // iteration; every kind must agree it has zero rows.
+            let len = match v {
+                ColumnView::Int(c) => c.len(),
+                ColumnView::Long(c) => c.len(),
+                ColumnView::Double(c) => c.len(),
+                ColumnView::Varchar(c) => c.len(),
+                ColumnView::Binary(c) => c.len(),
+                _ => unreachable!(),
+            };
+            assert_eq!(len, 0, "column {} reported non-zero rows", col_idx);
+        }
+    }
+
+    /// Multi-MiB VARCHAR value. Verifies the `u32` offset arithmetic
+    /// (offsets, data length, cumulative bytes) holds at sizes the
+    /// short-string tests above don't exercise. 2 MiB is large enough
+    /// to surface any silent `u16` truncation or `i32` overflow in the
+    /// decode path while keeping the test under the transport's 64 MiB
+    /// cap (which would be applied at the transport layer, not here).
+    #[test]
+    fn decode_varchar_multi_mb_value() {
+        let big = "x".repeat(2 * 1024 * 1024); // 2 MiB of 'x' (ASCII = 1 byte/char)
+        let (flags_byte, payload) = BatchBuilder::new(1)
+            .add_column(
+                "s",
+                ColumnKind::Varchar,
+                varchar_col_no_nulls(&[big.as_str()]),
+            )
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let batch = decode_result_batch(
+            &payload,
+            flags_byte,
+            &mut dict,
+            &mut reg,
+            &mut ZstdScratch::new(),
+        )
+        .unwrap();
+        let ColumnView::Varchar(c) = batch.column_view(0, &dict).unwrap() else {
+            panic!()
+        };
+        assert_eq!(c.len(), 1);
+        let v = c.value(0).expect("non-null");
+        // Avoid printing 2 MiB on failure — compare length + sample
+        // first/last byte. A regression that truncated would either
+        // fail the length or the boundary sample.
+        assert_eq!(v.len(), big.len());
+        assert_eq!(v.as_bytes()[0], b'x');
+        assert_eq!(v.as_bytes()[v.len() - 1], b'x');
+    }
+
+    /// Multi-MiB BINARY value across two rows. The second value is
+    /// distinct from the first so a regression that reuses the same
+    /// offset across rows would fail the byte-level sample check.
+    #[test]
+    fn decode_binary_multi_mb_value() {
+        let big_a = vec![0xABu8; 2 * 1024 * 1024];
+        let big_b = vec![0xCDu8; 1024 * 1024 + 7];
+        let mut col = vec![0x00u8]; // null_flag = 0
+        // offsets: [0, len_a, len_a + len_b]
+        let off_a: u32 = big_a.len() as u32;
+        let off_b: u32 = (big_a.len() + big_b.len()) as u32;
+        col.extend_from_slice(&0u32.to_le_bytes());
+        col.extend_from_slice(&off_a.to_le_bytes());
+        col.extend_from_slice(&off_b.to_le_bytes());
+        col.extend_from_slice(&big_a);
+        col.extend_from_slice(&big_b);
+        let (flags_byte, payload) = BatchBuilder::new(2)
+            .add_column("b", ColumnKind::Binary, col)
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let batch = decode_result_batch(
+            &payload,
+            flags_byte,
+            &mut dict,
+            &mut reg,
+            &mut ZstdScratch::new(),
+        )
+        .unwrap();
+        let ColumnView::Binary(c) = batch.column_view(0, &dict).unwrap() else {
+            panic!()
+        };
+        assert_eq!(c.len(), 2);
+        let v0 = c.value(0).expect("non-null");
+        let v1 = c.value(1).expect("non-null");
+        assert_eq!(v0.len(), big_a.len());
+        assert_eq!(v0[0], 0xAB);
+        assert_eq!(v0[v0.len() - 1], 0xAB);
+        assert_eq!(v1.len(), big_b.len());
+        assert_eq!(v1[0], 0xCD);
+        assert_eq!(v1[v1.len() - 1], 0xCD);
+    }
+
+    /// Zero-length BINARY value (`is_null = false`, `len = 0`) MUST
+    /// round-trip as a non-null empty slice, distinct from a `NULL` row.
+    /// Mirrors the varchar `decode_varchar_no_nulls` empty-string case
+    /// (`""` round-trips as `Some("")`); the BINARY variant of the same
+    /// shape had no test coverage before.
+    #[test]
+    fn decode_binary_empty_value_distinct_from_null() {
+        // 3 rows: empty, NULL, two-byte value.
+        // bitmap: row 1 is NULL → 0b0000_0010 = 0x02
+        let mut col = vec![0x01u8]; // null_flag = 1 (bitmap present)
+        col.push(0x02); // bitmap byte
+        // Offsets for the 2 non-null rows + trailing = [0, 0, 2]
+        // (row 0 has zero-length value, row 2 has 2-byte value).
+        col.extend_from_slice(&0u32.to_le_bytes());
+        col.extend_from_slice(&0u32.to_le_bytes());
+        col.extend_from_slice(&2u32.to_le_bytes());
+        col.extend_from_slice(&[0xAA, 0xBB]);
+        let (flags_byte, payload) = BatchBuilder::new(3)
+            .add_column("b", ColumnKind::Binary, col)
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let batch = decode_result_batch(
+            &payload,
+            flags_byte,
+            &mut dict,
+            &mut reg,
+            &mut ZstdScratch::new(),
+        )
+        .unwrap();
+        let ColumnView::Binary(c) = batch.column_view(0, &dict).unwrap() else {
+            panic!()
+        };
+        assert_eq!(c.len(), 3);
+        // Empty non-null binary: Some(&[]). Note Some, not None.
+        let v0 = c.value(0);
+        assert!(
+            matches!(v0, Some(s) if s.is_empty()),
+            "zero-length non-null binary must be Some(empty slice), not None: got {:?}",
+            v0
+        );
+        // NULL row: None.
+        assert_eq!(c.value(1), None);
+        assert!(c.is_null(1));
+        // Sanity on row 2.
+        assert_eq!(c.value(2), Some(&[0xAA, 0xBB][..]));
+    }
+
+    /// SYMBOL column with a column-local dict large enough that the
+    /// code stream uses multi-byte LEB128. Codes ≥ 128 require 2 bytes
+    /// of varint; codes ≥ 16,384 require 3 bytes. The decoder enforces
+    /// `dict_size <= row_count` (each code in the stream picks one
+    /// dict entry), so we build N = 17,000 rows referencing a 17,000-
+    /// entry dict and verify the boundary codes 0 / 127 / 128 /
+    /// 16,383 / 16,384 / 16,999 all resolve correctly. This exercises
+    /// `decode_codes_no_nulls`'s fast-path branch selection at every
+    /// width boundary in one shot.
+    ///
+    /// 17,000 short entries × ~8 bytes ≈ 140 KB of dict on the wire
+    /// plus ≤ 51 KB of codes — well under any cap — but big enough
+    /// that a regression to a `u8`-code path or a 1-byte-only varint
+    /// reader would fail.
+    #[test]
+    fn decode_symbol_column_large_dict_multibyte_codes() {
+        const N: usize = 17_000;
+        // Build the dict and a code stream of length N where the
+        // boundary codes appear at known row indices for assertion.
+        // Default: row i → code i (forces every dict entry to be
+        // referenced at least once and gives a stable mapping).
+        let dict_entries: Vec<String> = (0..N).map(|i| format!("s{}", i)).collect();
+        let dict_refs: Vec<&str> = dict_entries.iter().map(String::as_str).collect();
+        let codes_per_row: Vec<u64> = (0..N as u64).collect();
+        let col = symbol_column_local(None, &dict_refs, &codes_per_row);
+        let (flags_byte, payload) = BatchBuilder::new(N)
+            .add_column("s", ColumnKind::Symbol, col)
+            .build();
+        let mut dict = SymbolDict::new();
+        let mut reg = SchemaRegistry::new();
+        let batch = decode_result_batch(
+            &payload,
+            flags_byte,
+            &mut dict,
+            &mut reg,
+            &mut ZstdScratch::new(),
+        )
+        .unwrap();
+        let ColumnView::Symbol(s) = batch.column_view(0, &dict).unwrap() else {
+            panic!()
+        };
+        // Spot-check boundary codes spanning the 1-, 2-, and 3-byte
+        // LEB128 widths. Walking all 17k rows would catch the same
+        // regressions but inflates test output on failure.
+        for &code in &[0u64, 127, 128, 16_383, 16_384, 16_999] {
+            let row = code as usize;
+            let expected = format!("s{}", code);
+            assert_eq!(
+                s.resolve(row),
+                Some(expected.as_str()),
+                "row {} (code {}) misresolved — multi-byte LEB128 boundary regression",
+                row,
+                code
+            );
+        }
+    }
+
     // Unused references silenced by binding to `_` in tests where they exist
     // only for symmetry.
     #[allow(dead_code)]

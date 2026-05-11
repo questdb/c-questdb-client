@@ -50,6 +50,7 @@ use tungstenite::{Message, WebSocket, accept_hdr};
 const MAGIC: [u8; 4] = *b"QWP1";
 const MSG_QUERY_REQUEST: u8 = 0x10;
 const MSG_RESULT_END: u8 = 0x12;
+const MSG_CANCEL: u8 = 0x14;
 const MSG_CACHE_RESET: u8 = 0x17;
 const MSG_SERVER_INFO: u8 = 0x18;
 
@@ -120,6 +121,16 @@ enum Action {
     SendServerInfo { role: ServerRole, node_id: String },
     /// Block until a QUERY_REQUEST arrives from the client.
     AwaitQueryRequest,
+    /// Block until a CANCEL frame (msg_kind `0x14`) arrives from the
+    /// client. Used to pin the precise moment in a script where the
+    /// client has finished writing its CANCEL — testing cancel-drain
+    /// behavior needs to be sure CANCEL landed on the wire before the
+    /// server arranges the next action (e.g. drop). Non-CANCEL frames
+    /// (CREDIT especially) are silently skipped so the test is robust
+    /// to auto-credit replenishment between QUERY_REQUEST and CANCEL.
+    /// The captured request_id semantics are unchanged — CANCEL has
+    /// no separate id to track on the wire.
+    AwaitClientCancel,
     /// Reply with RESULT_END (using the request_id from the most-recent
     /// AwaitQueryRequest).
     SendResultEnd,
@@ -411,6 +422,11 @@ fn run_script(
                     None => return,
                 }
             }
+            Action::AwaitClientCancel => {
+                if !read_until_client_cancel(&mut ws) {
+                    return;
+                }
+            }
             Action::SendResultEnd => {
                 let rid = last_request_id.expect("AwaitQueryRequest before SendResultEnd");
                 let frame = result_end_frame(rid);
@@ -509,6 +525,23 @@ fn parse_authorization_header(buf: &[u8]) -> Option<String> {
 /// bytes (msg_kind + body) to `captured` so tests can inspect what
 /// the cursor actually sent. Client→server frames are bare payloads
 /// (no QWP1 header), so the request_id is at offset 1.
+/// Read incoming binary frames until a CANCEL (msg_kind `0x14`) is
+/// observed. Non-CANCEL frames (CREDIT, anything else the client
+/// happens to emit before tearing down) are silently consumed so the
+/// caller is robust to the auto-credit replenishment that lives in
+/// the client's `next_batch` loop. Returns `true` on CANCEL receipt,
+/// `false` if the socket dies first.
+fn read_until_client_cancel(ws: &mut WebSocket<TcpStream>) -> bool {
+    loop {
+        match ws.read() {
+            Ok(Message::Binary(b)) if !b.is_empty() && b[0] == MSG_CANCEL => return true,
+            Ok(Message::Binary(_)) | Ok(Message::Text(_)) => continue,
+            Ok(Message::Ping(_)) | Ok(Message::Pong(_)) | Ok(Message::Frame(_)) => continue,
+            Ok(Message::Close(_)) | Err(_) => return false,
+        }
+    }
+}
+
 fn read_until_query_request(
     ws: &mut WebSocket<TcpStream>,
     captured: &Arc<Mutex<Vec<Vec<u8>>>>,
@@ -1189,6 +1222,93 @@ fn cancelling_cursor_does_not_failover_on_drop() {
         "cancellation must not trigger failover; B should never be dialed"
     );
     assert_eq!(srv_a.accepts(), 1, "exactly one initial connect to A");
+}
+
+/// Tighter version of `cancelling_cursor_does_not_failover_on_drop`
+/// that pins the precise wire ordering: the client MUST write its
+/// CANCEL frame before the server drops, so the cursor enters the
+/// drain loop with `cancelling=true` already set. A subsequent drop
+/// then traverses the read-error → "is_failover_eligible? yes, but
+/// cancelling=true" short-circuit in `Cursor::next_batch`.
+///
+/// Stronger than the prior test by:
+///   1. Synchronising on receipt of CANCEL via `AwaitClientCancel`
+///      instead of an open-loop `Sleep` (the sleep approach can race
+///      under heavy CI load — the drop fires before CANCEL lands and
+///      the test exercises a different code path than advertised).
+///   2. Asserting `failover_resets() == 0` directly on the cursor —
+///      not just "B was never dialed" (which is a weaker proxy:
+///      single-endpoint configs would mask a regression).
+///   3. Asserting the cancel call surfaced a transport-class error
+///      (or a clean Ok if STATUS_CANCELLED happened to land before
+///      the drop); never a failover-flavored error like
+///      `FailoverExhausted`.
+#[test]
+fn failover_suppressed_when_drop_arrives_during_cancel_drain() {
+    let srv_a = MockServer::start(vec![vec![
+        Action::SendServerInfo {
+            role: ServerRole::Standalone,
+            node_id: "a".into(),
+        },
+        Action::AwaitQueryRequest,
+        // Block until the client has flushed CANCEL onto the wire.
+        // After this, `cursor.cancel()` has set `cancelling=true` and
+        // is parked in the drain reading frames.
+        Action::AwaitClientCancel,
+        // Drop the socket. The client's drain read fails with a
+        // transport-class error; failover MUST stay disabled because
+        // `cancelling=true`.
+        Action::HardDrop,
+    ]]);
+    // Tripwire endpoint: if failover ever activates despite the
+    // cancellation, the client would dial this. We assert it stays
+    // untouched.
+    let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);
+    let conf = format!(
+        "qwp::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=2",
+        build_addr_list(&[&srv_a, &srv_b])
+    );
+    let mut reader = Reader::from_conf(&conf).expect("connect to A");
+    let mut cursor = reader.query("select 1").execute().expect("execute");
+
+    let cancel_result = cursor.cancel();
+
+    // The failover counter is the direct test of the contract: a
+    // failover-suppressed cancel-drain MUST NOT increment it. Stronger
+    // than checking server B's accept count because it would catch a
+    // single-endpoint regression too (where there's no B to dial).
+    assert_eq!(
+        cursor.failover_resets(),
+        0,
+        "cancellation must NOT trigger failover; failover_resets stayed at 0 \
+         (cancel result: {:?})",
+        cancel_result.as_ref().map_err(|e| (e.code(), e.msg().to_string())),
+    );
+    // If the cancel returned an error, it must be a transport-class
+    // surface — never a failover-budget surface. The bench against
+    // the unusual race where STATUS_CANCELLED lands before the drop
+    // remains Ok, and that's fine.
+    match cancel_result {
+        Ok(()) => {}
+        Err(e) => {
+            assert!(
+                matches!(
+                    e.code(),
+                    ErrorCode::SocketError | ErrorCode::ProtocolError
+                ),
+                "cancel during drain must surface as a transport error, not \
+                 a failover surface; got {:?}: {}",
+                e.code(),
+                e.msg()
+            );
+        }
+    }
+    drop(cursor);
+    assert_eq!(
+        srv_b.accepts(),
+        0,
+        "tripwire endpoint must remain untouched — no failover dial fired"
+    );
 }
 
 #[test]
