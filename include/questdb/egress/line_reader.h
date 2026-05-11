@@ -180,6 +180,17 @@ typedef enum line_reader_error_code
     line_reader_error_server_limit_exceeded = 19,
     /** Query was cancelled (locally or via server `CANCELLED` status `0x0A`). */
     line_reader_error_cancelled = 20,
+    /** Mid-query failover was eligible but at least one batch had
+     *  already been delivered to the caller and no
+     *  `on_failover_reset` callback was installed; replay would
+     *  silently double-deliver rows already consumed, so the cursor
+     *  was terminated instead. Install a failover-reset callback via
+     *  `line_reader_query_on_failover_reset` (and discard partial
+     *  state on each invocation) to opt in to replays, or re-execute
+     *  the query from scratch when this code surfaces. Initial-
+     *  connect failover (before any batch is yielded) is unaffected
+     *  and remains transparent. */
+    line_reader_error_failover_would_duplicate = 21,
 } line_reader_error_code;
 
 /**

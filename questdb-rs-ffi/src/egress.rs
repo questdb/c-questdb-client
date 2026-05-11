@@ -110,6 +110,13 @@ pub enum line_reader_error_code {
     line_reader_error_server_limit_exceeded = 19,
     /// Query was cancelled (locally or via server `CANCELLED` status `0x0A`).
     line_reader_error_cancelled = 20,
+    /// Mid-query failover was eligible but at least one batch had already
+    /// been delivered to the caller and no `on_failover_reset` callback
+    /// was installed; replay would silently double-deliver rows already
+    /// consumed, so the cursor was terminated instead. Install
+    /// `line_reader_query_on_failover_reset` to opt in to replays, or
+    /// re-execute the query from scratch.
+    line_reader_error_failover_would_duplicate = 21,
 }
 
 impl From<ErrorCode> for line_reader_error_code {
@@ -135,6 +142,7 @@ impl From<ErrorCode> for line_reader_error_code {
             ErrorCode::LimitExceeded => line_reader_error_limit_exceeded,
             ErrorCode::ServerLimitExceeded => line_reader_error_server_limit_exceeded,
             ErrorCode::Cancelled => line_reader_error_cancelled,
+            ErrorCode::FailoverWouldDuplicate => line_reader_error_failover_would_duplicate,
             // ErrorCode is `#[non_exhaustive]`. Any future variant added
             // upstream that the C ABI hasn't been taught about falls
             // back to ProtocolError so callers see *something* rather

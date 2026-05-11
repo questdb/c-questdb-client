@@ -855,6 +855,58 @@ fn mid_query_close_triggers_failover() {
     );
 }
 
+/// Pre-batch-delivery mid-query failover is transparent even WITHOUT
+/// an `on_failover_reset` callback.
+///
+/// The new silent-duplicate guard (`FailoverWouldDuplicate`) only
+/// triggers once at least one batch has been yielded — at that point
+/// replay would silently double-deliver rows. Failover that fires
+/// before any data has reached the caller poses no such hazard and
+/// must continue to replay transparently. This regression test pins
+/// that boundary: same setup as `mid_query_close_triggers_failover`,
+/// but no callback installed, and the cursor must still terminate
+/// cleanly via the replayed RESULT_END from server B.
+///
+/// (The data-delivered-with-no-callback branch — where the guard
+/// fires — is unit-tested via `would_silently_duplicate_truth_table`
+/// in `src/egress/reader.rs`. Exercising it as an integration test
+/// would require the Rust mock to emit a synthetic RESULT_BATCH; the
+/// Rust mock has no helper for that yet — only the C++ mock does.)
+#[test]
+fn pre_batch_failover_without_callback_still_replays() {
+    let srv_a = MockServer::start(vec![drop_after_query_script(ServerRole::Standalone, "a")]);
+    let srv_b = MockServer::start(vec![happy_script(ServerRole::Standalone, "b")]);
+    let conf = format!(
+        "qwp::addr={};failover_backoff_initial_ms=1;failover_backoff_max_ms=10",
+        build_addr_list(&[&srv_a, &srv_b])
+    );
+
+    let mut reader = Reader::from_conf(&conf).expect("connect to A");
+    assert_eq!(reader.current_addr().port, srv_a.addr.port());
+
+    // NO on_failover_reset callback. With data not yet delivered, the
+    // guard must not fire and failover must replay against B as before.
+    let mut cursor = reader.query("select 1").execute().expect("execute");
+
+    let outcome = cursor.next_batch();
+    assert!(
+        matches!(&outcome, Ok(None)),
+        "failover before any batch is delivered must replay transparently \
+         (no callback required); got {:?}",
+        outcome.as_ref().map(|_| ()).map_err(|e| (e.code(), e.msg().to_string()))
+    );
+    assert_eq!(
+        cursor.failover_resets(),
+        1,
+        "exactly one reset — to server B — must have been recorded"
+    );
+    assert_eq!(
+        cursor.current_addr().port,
+        srv_b.addr.port(),
+        "cursor must be bound to the failover target after replay"
+    );
+}
+
 #[test]
 fn failover_disabled_surfaces_socket_error() {
     let srv_a = MockServer::start(vec![drop_after_query_script(ServerRole::Standalone, "a")]);

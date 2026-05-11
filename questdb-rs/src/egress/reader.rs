@@ -747,6 +747,15 @@ impl<'r> ReaderQuery<'r> {
     /// restarts from `batch_seq=0` against the new endpoint with a
     /// fresh `request_id`.
     ///
+    /// **Installing this callback is the caller's opt-in to "I will
+    /// handle replay-after-data-delivered correctly."** Without it,
+    /// [`Cursor::next_batch`] refuses to fail over once any batch has
+    /// been yielded — returning
+    /// [`ErrorCode::FailoverWouldDuplicate`](crate::egress::ErrorCode::FailoverWouldDuplicate)
+    /// instead — to avoid silently doubling up rows in the caller's
+    /// accumulator. Initial-connect failover (before any batch is
+    /// yielded) is transparent and does not require this callback.
+    ///
     /// Calling this method twice on the same `ReaderQuery` **replaces**
     /// the previous closure — only the most recent callback is invoked.
     ///
@@ -967,6 +976,7 @@ impl<'r> ReaderQuery<'r> {
             encoded_request,
             on_failover_reset: self.on_failover_reset,
             failover_resets: 0,
+            data_delivered: false,
             _not_send: std::marker::PhantomData,
         })
     }
@@ -1068,6 +1078,17 @@ pub struct Cursor<'r> {
     /// since `execute()`. Useful for tests and for asserting the
     /// query did not silently restart under the user's feet.
     failover_resets: u32,
+    /// Sticky: set the first time a `RESULT_BATCH` is yielded to the
+    /// caller and never reset. Drives the safety check in
+    /// [`Cursor::next_batch`] that refuses mid-query failover when no
+    /// [`ReaderQuery::on_failover_reset`] callback is installed —
+    /// silently replaying after the caller already received rows
+    /// would deliver duplicates the caller has no way to detect.
+    /// Distinct from `last_batch.is_some()`, which is cleared at the
+    /// start of every replay; this flag must NOT reset, because the
+    /// hazard is "the caller saw data at some point during this
+    /// query," not "on the current connection."
+    data_delivered: bool,
     /// `true` when the QUERY_REQUEST set `initial_credit > 0`. The
     /// cursor then auto-emits a CREDIT (`0x15`) frame after each
     /// RESULT_BATCH consumed, replenishing the server's per-request
@@ -1120,15 +1141,29 @@ impl<'r> Cursor<'r> {
     /// has terminated (success). `QUERY_ERROR` becomes `Err`.
     ///
     /// On a transport-level failure (socket close, TLS error, WS
-    /// framing error), the cursor will silently reconnect to the
-    /// next address in the configured list (with exponential backoff
-    /// and a bounded retry budget — see `failover_*` config keys),
-    /// replay the `QUERY_REQUEST` with a fresh `request_id`, and
-    /// resume from `batch_seq=0` on the new connection. The user-
-    /// side handler is notified before any replayed batches arrive
-    /// via the [`ReaderQuery::on_failover_reset`] callback. If
-    /// failover is disabled (`failover=off`) or the retry budget is
-    /// exhausted, the failure is surfaced as the underlying error.
+    /// framing error), the cursor will reconnect to the next address
+    /// in the configured list (with exponential backoff and a bounded
+    /// retry budget — see `failover_*` config keys), replay the
+    /// `QUERY_REQUEST` with a fresh `request_id`, and resume from
+    /// `batch_seq=0` on the new connection. The user-side handler is
+    /// notified before any replayed batches arrive via the
+    /// [`ReaderQuery::on_failover_reset`] callback. If failover is
+    /// disabled (`failover=off`) or the retry budget is exhausted,
+    /// the failure is surfaced as the underlying error.
+    ///
+    /// **Silent-duplicate guard.** If a batch has already been
+    /// yielded to the caller and no `on_failover_reset` callback was
+    /// installed, the cursor refuses to fail over and returns
+    /// [`ErrorCode::FailoverWouldDuplicate`](crate::egress::ErrorCode::FailoverWouldDuplicate)
+    /// instead. Replay would otherwise re-deliver rows the caller
+    /// already consumed — with no signal — because the server
+    /// restarts streaming from `batch_seq=0` on the new connection.
+    /// Install the callback (and discard partial state on each
+    /// invocation) to opt in to seeing replays; otherwise re-execute
+    /// the query from scratch when this error fires. Failover that
+    /// happens before the first batch is yielded — including initial
+    /// connect failover — is unaffected and remains transparent.
+    ///
     /// Decode errors (malformed payload, schema-ref miss, zstd
     /// corruption) are NOT routed through failover — they bubble up
     /// immediately and terminate the cursor, since reconnecting
@@ -1168,6 +1203,34 @@ impl<'r> Cursor<'r> {
                         // cursors that defer cleanup to `Reader::Drop`.
                         self.terminate_with_close();
                         return Err(e);
+                    }
+                    // Silent-duplicate guard. If at least one batch was
+                    // already yielded to the caller and they didn't
+                    // install an `on_failover_reset` callback, replay
+                    // would deliver those rows again with no signal —
+                    // see `ErrorCode::FailoverWouldDuplicate`. The
+                    // exact-once contract is "rows surface to the
+                    // caller at most once unless they explicitly
+                    // opt in to seeing replays."
+                    //
+                    // The trigger error `e` is preserved in the message
+                    // so the caller still learns *why* the cursor died;
+                    // diagnostics shouldn't get worse just because we
+                    // re-classified the surface.
+                    if would_silently_duplicate(
+                        self.data_delivered,
+                        self.on_failover_reset.is_some(),
+                    ) {
+                        let err = fmt!(
+                            FailoverWouldDuplicate,
+                            "mid-query failover would replay rows already delivered to the caller \
+                             (no on_failover_reset callback installed); cursor terminated. \
+                             Trigger: {} ({:?})",
+                            e.msg(),
+                            e.code()
+                        );
+                        self.terminate_with_close();
+                        return Err(err);
                     }
                     self.failover_reconnect_and_replay(e)?;
                     continue;
@@ -1256,6 +1319,12 @@ impl<'r> Cursor<'r> {
                         return Err(err);
                     }
                     let last = self.last_batch.insert(b);
+                    // Latch sticky `data_delivered` BEFORE yielding the
+                    // batch view — a subsequent failover-eligible read
+                    // error must see the latch already set, since by
+                    // that point the caller has consumed at least one
+                    // row from this query.
+                    self.data_delivered = true;
                     // Re-lookup is infallible: existence was checked
                     // above and the registry isn't mutated in between.
                     let schema = self.reader.registry.get(schema_id).expect("schema present");
@@ -1818,6 +1887,23 @@ impl<'c> BatchView<'c> {
 /// endpoint, but not failures that signal a hard problem (auth, bad
 /// SQL, malformed binds, role-mismatch on a single-node config) which
 /// would just bounce off every endpoint identically.
+/// Predicate gating the silent-duplicate guard in
+/// [`Cursor::next_batch`]: returns `true` when a mid-query failover
+/// would silently re-deliver rows the caller has already consumed.
+///
+/// Replay restarts at `batch_seq=0` against the new endpoint, so the
+/// caller's accumulator would see every previously-yielded row again.
+/// The opt-in for "I will discard partial state on each replay" is
+/// installing [`ReaderQuery::on_failover_reset`]; without that
+/// callback, the only safe response is to terminate the cursor and
+/// let the caller re-execute from scratch.
+///
+/// Extracted as a free function so the truth table is unit-testable
+/// without needing a live transport.
+fn would_silently_duplicate(data_delivered: bool, has_failover_reset_callback: bool) -> bool {
+    data_delivered && !has_failover_reset_callback
+}
+
 fn is_failover_eligible(code: ErrorCode) -> bool {
     matches!(
         code,
@@ -2437,5 +2523,30 @@ mod tests {
         }
         assert!(saw_low, "expected at least one draw < 10 out of 10k samples");
         assert!(saw_high, "expected at least one draw >= 90 out of 10k samples");
+    }
+
+    /// Truth-table coverage for the silent-duplicate guard.
+    ///
+    /// The four input combinations cover every reachable cursor state
+    /// at the moment a failover-eligible transport error fires:
+    ///
+    /// | data_delivered | callback installed | refuses replay? |
+    /// |----------------|--------------------|-----------------|
+    /// | false          | false              | no — initial-connect-style failover, transparent |
+    /// | false          | true               | no — caller will be notified anyway |
+    /// | true           | false              | **YES** — silent duplicates would otherwise reach the caller |
+    /// | true           | true               | no — caller opted in to replays |
+    ///
+    /// A regression that flipped the predicate (e.g. inverted the
+    /// callback check or removed the data-delivered latch) would fail
+    /// at least one row of this matrix.
+    #[test]
+    fn would_silently_duplicate_truth_table() {
+        // No data yet — failover is always safe, regardless of callback.
+        assert!(!would_silently_duplicate(false, false));
+        assert!(!would_silently_duplicate(false, true));
+        // Data already delivered — only the callback unlocks replay.
+        assert!(would_silently_duplicate(true, false));
+        assert!(!would_silently_duplicate(true, true));
     }
 }

@@ -93,8 +93,9 @@ enum class error_code : int
     server_internal_error  = ::line_reader_error_server_internal_error,
     server_security_error  = ::line_reader_error_server_security_error,
     limit_exceeded         = ::line_reader_error_limit_exceeded,
-    server_limit_exceeded  = ::line_reader_error_server_limit_exceeded,
-    cancelled              = ::line_reader_error_cancelled,
+    server_limit_exceeded     = ::line_reader_error_server_limit_exceeded,
+    cancelled                 = ::line_reader_error_cancelled,
+    failover_would_duplicate  = ::line_reader_error_failover_would_duplicate,
 };
 
 /**

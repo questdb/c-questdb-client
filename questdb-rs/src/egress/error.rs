@@ -102,6 +102,24 @@ pub enum ErrorCode {
 
     /// Query was cancelled (locally or via server `CANCELLED` status `0x0A`).
     Cancelled,
+
+    /// Mid-query failover was eligible but at least one batch had already
+    /// been delivered to the caller, and the cursor's
+    /// [`on_failover_reset`](crate::egress::ReaderQuery::on_failover_reset)
+    /// callback was not installed.
+    ///
+    /// Failover replays `QUERY_REQUEST` from `batch_seq=0` on the new
+    /// endpoint, which means any rows the caller already consumed would
+    /// be re-delivered. Without the callback, the caller has no signal
+    /// that this happened and would silently merge duplicates into its
+    /// result set. Rather than do that, the cursor terminates with this
+    /// error: the caller must either install `on_failover_reset` (and
+    /// discard partial state on each invocation) or run the query
+    /// again from scratch.
+    ///
+    /// Surfaced only mid-query — initial connect failover (before any
+    /// batch is yielded) does not raise this and behaves transparently.
+    FailoverWouldDuplicate,
 }
 
 /// Upgrade-time topology rejection carried alongside an `Error`.
