@@ -59,9 +59,9 @@ pub(crate) mod schema;
 pub(crate) mod server_event;
 pub(crate) mod symbol_dict;
 #[cfg(feature = "sync-reader-ws")]
-pub(crate) mod tracker;
-#[cfg(feature = "sync-reader-ws")]
 pub(crate) mod tls;
+#[cfg(feature = "sync-reader-ws")]
+pub(crate) mod tracker;
 #[cfg(feature = "sync-reader-ws")]
 pub(crate) mod transport;
 pub mod wire;

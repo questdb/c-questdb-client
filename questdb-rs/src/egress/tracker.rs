@@ -57,7 +57,6 @@ pub enum HostState {
     TopologyReject,
 }
 
-
 /// Zone classification relative to the client's configured `zone=`. See
 /// failover.md §2. When the client zone is unset or `target=primary`,
 /// every host's tier collapses to `Same`, degenerating selection to
@@ -73,7 +72,6 @@ pub enum ZoneTier {
     /// Server advertised a different zone.
     Other,
 }
-
 
 /// Per-client bookkeeping for the configured endpoint list.
 ///

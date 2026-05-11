@@ -148,8 +148,7 @@ impl UpgradeReject {
     /// than `PRIMARY_CATCHUP` is conservatively treated as topological,
     /// including unrecognised tokens.
     pub fn is_transient(&self) -> bool {
-        self.role_byte == 0x03
-            || self.role_name.eq_ignore_ascii_case("PRIMARY_CATCHUP")
+        self.role_byte == 0x03 || self.role_name.eq_ignore_ascii_case("PRIMARY_CATCHUP")
     }
 }
 

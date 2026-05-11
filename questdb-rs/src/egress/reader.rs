@@ -50,13 +50,13 @@ use crate::egress::binds::{Bind, SimpleNullKind};
 use crate::egress::column::ColumnView;
 use crate::egress::config::{Endpoint, ReaderConfig, Target};
 use crate::egress::decoder::DecodedBatch;
+use crate::egress::decoder::ZstdScratch;
 use crate::egress::error::{Error, ErrorCode, Result, UpgradeReject, fmt};
-use crate::egress::tracker::HostHealthTracker;
 use crate::egress::query_request::{QueryRequest, QueryRequestBuilder};
 use crate::egress::schema::{Schema, SchemaRegistry};
-use crate::egress::decoder::ZstdScratch;
 use crate::egress::server_event::{ServerEvent, ServerInfo, ServerRole, decode_frame};
 use crate::egress::symbol_dict::SymbolDict;
+use crate::egress::tracker::HostHealthTracker;
 use crate::egress::transport::{CLOSE_TIMEOUT, WRITE_TIMEOUT, WsTransport};
 use crate::egress::wire::header::HEADER_LEN;
 use crate::egress::wire::msg_kind::MsgKind;
@@ -306,11 +306,8 @@ impl Reader {
                     // surface the rejection arrived on.
                     let role = info.role;
                     let role_name = role.as_str();
-                    let reject = UpgradeReject::new(
-                        role.as_u8(),
-                        role_name.clone(),
-                        info.zone_id.clone(),
-                    );
+                    let reject =
+                        UpgradeReject::new(role.as_u8(), role_name.clone(), info.zone_id.clone());
                     return Err(Error::new(
                         ErrorCode::RoleMismatch,
                         format!(
@@ -355,10 +352,7 @@ impl Reader {
         let deadline: Option<std::time::Instant> = if cfg.failover_max_duration_ms == 0 {
             None
         } else {
-            Some(
-                std::time::Instant::now()
-                    + Duration::from_millis(cfg.failover_max_duration_ms),
-            )
+            Some(std::time::Instant::now() + Duration::from_millis(cfg.failover_max_duration_ms))
         };
         let mut deadline_exhausted = false;
         // Spec invariant (failover.md §2.3): mid-stream demote MUST run
@@ -556,7 +550,6 @@ impl Reader {
         self.read_ns.store(0, Ordering::Relaxed);
         self.decode_ns.store(0, Ordering::Relaxed);
     }
-
 
     /// `SERVER_INFO` (`0x18`) captured at connect time, when negotiated
     /// version >= 2. `None` for v1 servers.
@@ -2008,10 +2001,7 @@ fn walk_via_tracker(
 /// `Cursor::next_batch` reads (which can legitimately block for as
 /// long as the server takes to plan and execute the query) aren't
 /// subject to it.
-fn read_server_info_frame(
-    transport: &mut WsTransport,
-    timeout: Duration,
-) -> Result<ServerInfo> {
+fn read_server_info_frame(transport: &mut WsTransport, timeout: Duration) -> Result<ServerInfo> {
     transport.set_read_timeout(Some(timeout));
     let result = transport.read_frame();
     transport.set_read_timeout(None);
@@ -2019,7 +2009,13 @@ fn read_server_info_frame(
     let mut dict = SymbolDict::new();
     let mut registry = SchemaRegistry::new();
     let mut zstd_scratch = ZstdScratch::new();
-    let event = decode_frame(header, &payload, &mut dict, &mut registry, &mut zstd_scratch)?;
+    let event = decode_frame(
+        header,
+        &payload,
+        &mut dict,
+        &mut registry,
+        &mut zstd_scratch,
+    )?;
     match event {
         ServerEvent::ServerInfo(info) => Ok(info),
         other => Err(fmt!(

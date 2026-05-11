@@ -721,16 +721,12 @@ fn parse_upgrade_reject(headers: &tungstenite::http::HeaderMap) -> Option<Upgrad
 /// ASCII. Returns `None` on missing header or non-ASCII value (the
 /// HTTP/1.1 wire form for these headers is ASCII; we don't try to
 /// rescue mojibake).
-fn lookup_header<'h>(
-    headers: &'h tungstenite::http::HeaderMap,
-    name: &str,
-) -> Option<&'h str> {
+fn lookup_header<'h>(headers: &'h tungstenite::http::HeaderMap, name: &str) -> Option<&'h str> {
     headers
         .iter()
         .find(|(n, _)| n.as_str().eq_ignore_ascii_case(name))
         .and_then(|(_, v)| v.to_str().ok())
 }
-
 
 /// Best-effort classifier: does this `io::Error` actually carry a
 /// rustls TLS failure underneath? Rustls returns its errors via

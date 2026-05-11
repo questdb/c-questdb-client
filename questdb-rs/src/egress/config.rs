@@ -785,10 +785,7 @@ impl ReaderConfig {
             ));
         }
         if self.server_info_timeout_ms == 0 {
-            return Err(fmt!(
-                ConfigError,
-                "\"server_info_timeout_ms\" must be > 0"
-            ));
+            return Err(fmt!(ConfigError, "\"server_info_timeout_ms\" must be > 0"));
         }
         if self.server_info_timeout_ms > MAX_SERVER_INFO_TIMEOUT_MS {
             return Err(fmt!(
@@ -1331,10 +1328,7 @@ mod tests {
 
     #[test]
     fn auth_timeout_above_cap_rejected() {
-        let conf = format!(
-            "qwp::addr=h:1;auth_timeout_ms={}",
-            MAX_AUTH_TIMEOUT_MS + 1
-        );
+        let conf = format!("qwp::addr=h:1;auth_timeout_ms={}", MAX_AUTH_TIMEOUT_MS + 1);
         let err = ReaderConfig::from_conf(&conf).unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
         assert!(err.msg().contains("exceeds the hard cap"));
@@ -1356,8 +1350,7 @@ mod tests {
 
     #[test]
     fn failover_max_duration_parses() {
-        let c =
-            ReaderConfig::from_conf("qwp::addr=h:1;failover_max_duration_ms=60000").unwrap();
+        let c = ReaderConfig::from_conf("qwp::addr=h:1;failover_max_duration_ms=60000").unwrap();
         assert_eq!(c.failover_max_duration_ms, 60_000);
     }
 
@@ -1397,7 +1390,11 @@ mod tests {
         // silently ignored.
         let err = ReaderConfig::from_conf("qwp::addr=h:1;server_info_timeout_ms=1000").unwrap_err();
         assert_eq!(err.code(), ErrorCode::ConfigError);
-        assert!(err.msg().contains("Unknown config key"), "msg: {}", err.msg());
+        assert!(
+            err.msg().contains("Unknown config key"),
+            "msg: {}",
+            err.msg()
+        );
     }
 
     #[test]

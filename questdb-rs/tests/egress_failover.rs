@@ -474,8 +474,9 @@ fn reject_upgrade_421(
     let n = stream.read(&mut buf).unwrap_or(0);
     let auth = parse_authorization_header(&buf[..n]);
     captured_auth.lock().unwrap().push(auth);
-    let mut response =
-        String::from("HTTP/1.1 421 Misdirected Request\r\nContent-Length: 0\r\nConnection: close\r\n");
+    let mut response = String::from(
+        "HTTP/1.1 421 Misdirected Request\r\nContent-Length: 0\r\nConnection: close\r\n",
+    );
     if let Some(r) = role {
         response.push_str(&format!("X-QuestDB-Role: {}\r\n", r));
     }
@@ -868,7 +869,11 @@ fn attempts_exhausted_surfaces_error() {
         srv_a.accepts(),
         srv_b.accepts()
     );
-    assert_eq!(srv_a.accepts(), 7, "A receives the initial + 2 dials per outer attempt");
+    assert_eq!(
+        srv_a.accepts(),
+        7,
+        "A receives the initial + 2 dials per outer attempt"
+    );
     assert_eq!(srv_b.accepts(), 6, "B receives 2 dials per outer attempt");
 }
 
@@ -2429,7 +2434,10 @@ fn upgrade_421_with_primary_catchup_surfaces_transient_role_mismatch() {
     assert_eq!(reject.role_byte, 0x03);
     assert_eq!(reject.role_name, "PRIMARY_CATCHUP");
     assert_eq!(reject.zone.as_deref(), Some("eu-west-1a"));
-    assert!(reject.is_transient(), "PRIMARY_CATCHUP must classify transient");
+    assert!(
+        reject.is_transient(),
+        "PRIMARY_CATCHUP must classify transient"
+    );
 }
 
 /// 421 + `X-QuestDB-Role: REPLICA` must surface as `RoleMismatch` with
@@ -2563,10 +2571,7 @@ fn tracker_prefers_unknown_over_transport_error_on_reconnect() {
     // for B at initial), C=happy. Tracker should land on A initially,
     // then on mid-stream failure pick C over B because B is in
     // TransportError state (from initial walk) while C is Unknown.
-    let srv_a = MockServer::start(vec![drop_after_query_script(
-        ServerRole::Standalone,
-        "a",
-    )]);
+    let srv_a = MockServer::start(vec![drop_after_query_script(ServerRole::Standalone, "a")]);
     let srv_b = MockServer::start(vec![drop_at_connect_script()]);
     let srv_c = MockServer::start(vec![happy_script(ServerRole::Standalone, "c")]);
     let conf = format!(
@@ -2575,7 +2580,11 @@ fn tracker_prefers_unknown_over_transport_error_on_reconnect() {
         build_addr_list(&[&srv_a, &srv_b, &srv_c])
     );
     let mut reader = Reader::from_conf(&conf).expect("initial connect to A");
-    assert_eq!(reader.current_addr().port, srv_a.addr.port(), "initial walks to A");
+    assert_eq!(
+        reader.current_addr().port,
+        srv_a.addr.port(),
+        "initial walks to A"
+    );
     // Initial walk dials only A (succeeds first). B and C should not
     // have been dialled yet.
     assert_eq!(srv_a.accepts(), 1);
@@ -2584,7 +2593,10 @@ fn tracker_prefers_unknown_over_transport_error_on_reconnect() {
 
     let mut cursor = reader.query("select 1").execute().expect("execute");
     assert!(
-        cursor.next_batch().expect("must complete after rotating off A").is_none(),
+        cursor
+            .next_batch()
+            .expect("must complete after rotating off A")
+            .is_none(),
         "cursor must complete via reconnect"
     );
     drop(cursor);
@@ -2600,8 +2612,16 @@ fn tracker_prefers_unknown_over_transport_error_on_reconnect() {
     );
     // B got one failover dial (Unknown < TransportError on A).
     // C got one successful dial.
-    assert_eq!(srv_b.accepts(), 1, "B should have been dialled once on reconnect");
-    assert_eq!(srv_c.accepts(), 1, "C should have been dialled once on reconnect");
+    assert_eq!(
+        srv_b.accepts(),
+        1,
+        "B should have been dialled once on reconnect"
+    );
+    assert_eq!(
+        srv_c.accepts(),
+        1,
+        "C should have been dialled once on reconnect"
+    );
 }
 
 /// Failover.md §11.9.3 fall-through reset: when the first walk
@@ -2729,8 +2749,16 @@ fn initial_connect_does_not_run_fall_through_reset() {
     );
     // Exactly one dial per host: initial walk visits each Unknown
     // host once and exits. No reset-then-rewalk.
-    assert_eq!(srv_a.accepts(), 1, "A dialled exactly once during initial walk");
-    assert_eq!(srv_b.accepts(), 1, "B dialled exactly once during initial walk");
+    assert_eq!(
+        srv_a.accepts(),
+        1,
+        "A dialled exactly once during initial walk"
+    );
+    assert_eq!(
+        srv_b.accepts(),
+        1,
+        "B dialled exactly once during initial walk"
+    );
 }
 
 /// Failover.md §2.1 invariant: `record_mid_stream_failure` must
@@ -2789,13 +2817,8 @@ fn mid_stream_demote_happens_before_walk_picks_next() {
 fn auth_timeout_bounds_upgrade_stall() {
     // 300ms stall in the mock; 100ms client timeout. The client should
     // surface within ~100-200ms, well under the 300ms stall ceiling.
-    let srv = MockServer::start(vec![vec![Action::StallUpgrade(
-        Duration::from_millis(300),
-    )]]);
-    let conf = format!(
-        "qwp::addr={};failover=off;auth_timeout_ms=100",
-        srv.url()
-    );
+    let srv = MockServer::start(vec![vec![Action::StallUpgrade(Duration::from_millis(300))]]);
+    let conf = format!("qwp::addr={};failover=off;auth_timeout_ms=100", srv.url());
     let started = std::time::Instant::now();
     let err = match Reader::from_conf(&conf) {
         Ok(_) => panic!("upgrade-stall mock must surface as a connect error"),
@@ -2838,10 +2861,7 @@ fn auth_timeout_does_not_fire_within_budget() {
     // No stall — the mock answers the upgrade promptly. `auth_timeout_ms`
     // should not interfere with a normal connect.
     let srv = MockServer::start(vec![happy_script(ServerRole::Standalone, "n0")]);
-    let conf = format!(
-        "qwp::addr={};failover=off;auth_timeout_ms=5000",
-        srv.url()
-    );
+    let conf = format!("qwp::addr={};failover=off;auth_timeout_ms=5000", srv.url());
     let mut reader = Reader::from_conf(&conf).expect("connect must succeed within budget");
     // Sanity: cursor still works after the upgrade clears the
     // `auth_timeout_ms` read deadline.
@@ -2874,11 +2894,8 @@ fn server_info_timeout_bounds_post_upgrade_stall() {
     // via `from_conf` and override the field before opening the
     // Reader. Matches the Java reference's `withServerInfoTimeout`
     // surface.
-    let mut cfg = ReaderConfig::from_conf(format!(
-        "qwp::addr={};failover=off",
-        srv.url()
-    ))
-    .expect("conf parse");
+    let mut cfg = ReaderConfig::from_conf(format!("qwp::addr={};failover=off", srv.url()))
+        .expect("conf parse");
     cfg.server_info_timeout_ms = 100;
 
     let started = std::time::Instant::now();
@@ -2922,15 +2939,12 @@ fn server_info_timeout_does_not_fire_within_budget() {
     use questdb::egress::ReaderConfig;
 
     let srv = MockServer::start(vec![happy_script(ServerRole::Standalone, "n0")]);
-    let mut cfg = ReaderConfig::from_conf(format!(
-        "qwp::addr={};failover=off",
-        srv.url()
-    ))
-    .expect("conf parse");
+    let mut cfg = ReaderConfig::from_conf(format!("qwp::addr={};failover=off", srv.url()))
+        .expect("conf parse");
     cfg.server_info_timeout_ms = 5_000;
 
-    let mut reader = questdb::egress::Reader::from_config(&cfg)
-        .expect("connect must succeed within budget");
+    let mut reader =
+        questdb::egress::Reader::from_config(&cfg).expect("connect must succeed within budget");
     // Sanity: post-SERVER_INFO reads must NOT be subject to the
     // deadline — `read_server_info_frame` clears the deadline on the
     // way out, so subsequent batch reads can legitimately block for
@@ -2949,10 +2963,7 @@ fn server_info_timeout_does_not_fire_within_budget() {
 #[test]
 fn zone_knob_is_compatible_with_v2_server_without_cap_zone() {
     let srv = MockServer::start(vec![happy_script(ServerRole::Primary, "p0")]);
-    let conf = format!(
-        "qwp::addr={};zone=eu-west-1a;target=primary",
-        srv.url()
-    );
+    let conf = format!("qwp::addr={};zone=eu-west-1a;target=primary", srv.url());
     // `target=primary` collapses every host's zone tier to `Same`
     // regardless of the client's `zone=` — writers follow the master
     // across zones (failover.md §2). So a server without CAP_ZONE
@@ -3174,7 +3185,10 @@ fn failover_deadline_exhaustion_surfaces_distinct_error_message() {
     assert!(
         err.msg().contains("failover_max_duration_ms")
             || err.msg().contains("wall-clock budget exhausted")
-            || matches!(err.code(), ErrorCode::SocketError | ErrorCode::ProtocolError),
+            || matches!(
+                err.code(),
+                ErrorCode::SocketError | ErrorCode::ProtocolError
+            ),
         "unexpected error: code={:?} msg={}",
         err.code(),
         err.msg()
